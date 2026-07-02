@@ -113,9 +113,11 @@ rt::TwoLevelScene RenderWorldToTwoLevelScene(const RenderWorld& world) {
     const uint32_t default_mat_id = static_cast<uint32_t>(scene.materials.size());
     scene.materials.push_back(rt::Material{});  // neutral default
 
-    // Decoded image textures + the HDR environment ride the scene (host copies;
-    // the CUDA backend uploads them once per BuildScene). Both empty by default.
-    scene.textures = world.textures.Images();
+    // Decoded image textures ride the scene as a shared, owning view (no per-frame
+    // deep copy); its version lets the CUDA backend reuse the device residency. The
+    // HDR environment rides by value. Both empty/disabled by default.
+    scene.textures = world.textures.ImagesShared();
+    scene.texture_version = world.textures.Version();
     scene.environment = world.environment;
 
     // Instances: 1:1 with RenderWorld instances using each instance's LIVE

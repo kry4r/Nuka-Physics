@@ -73,6 +73,11 @@ RenderTiming TakeRenderTiming() {
     return out;
 }
 
+// Count of texture-texel H2D uploads (BuildScene is host-serial, so a plain counter
+// suffices). A reused device residency does NOT bump it; a fresh upload does.
+uint64_t g_texture_upload_events = 0u;
+uint64_t DebugTextureUploadCount() { return g_texture_upload_events; }
+
 namespace {
 
 constexpr uint32_t kBlockDim = 16u;
@@ -317,26 +322,48 @@ struct FrameTlasView {
 
 }  // namespace
 
-// Opaque impl: the per-mesh BLAS devices (built once) + the persistent render
-// context (AOV scratch + TLAS buffers reused/refit across frames) + the scene's
-// image textures and HDR environment (uploaded once; static across frames).
-struct TwoLevelSceneDevice::Impl {
-    std::vector<BlasDevice> meshes;
-    RtRenderContext rt;
-
+// Device residency for the (static) image textures + HDR environment texels: the
+// per-texture texel buffers, the DevTexture descriptor table, and the equirect env
+// buffer. A content `version` + `env_key` gate reuse across BuildScene calls; the
+// env yaw/intensity are light per-build scalars kept on the scene device, not here.
+struct TextureEnvResidency {
     std::vector<OwnedBuffer> texture_texel_bufs;  // one texel buffer per texture
     OwnedBuffer d_textures;                        // DevTexture descriptor table
     uint32_t texture_count = 0u;
 
     OwnedBuffer d_env_texels;                      // equirect linear RGB, or empty
     uint32_t env_width = 0u, env_height = 0u;
-    float env_yaw = 0.0f, env_intensity = 1.0f;
+
+    uint64_t version = 0u;   // TwoLevelScene::texture_version this was built from
+    uint64_t env_key = 0u;   // fingerprint of the env texel-buffer identity
+};
+
+// Opaque impl: the per-mesh BLAS devices (built once) + the persistent render
+// context (AOV scratch + TLAS buffers reused/refit across frames) + a shared handle
+// to the device-resident textures/env (owned jointly with the backend's cache).
+struct TwoLevelSceneDevice::Impl {
+    std::vector<BlasDevice> meshes;
+    RtRenderContext rt;
+
+    std::shared_ptr<TextureEnvResidency> tex_env;  // shared with the backend cache
+    float env_yaw = 0.0f, env_intensity = 1.0f;    // light per-build scalars
 };
 
 TwoLevelSceneDevice::TwoLevelSceneDevice() : impl_(std::make_unique<Impl>()) {}
 TwoLevelSceneDevice::~TwoLevelSceneDevice() = default;
 TwoLevelSceneDevice::TwoLevelSceneDevice(TwoLevelSceneDevice&&) noexcept = default;
 TwoLevelSceneDevice& TwoLevelSceneDevice::operator=(TwoLevelSceneDevice&&) noexcept = default;
+
+// The backend-held cache is just the shared residency handle; FreeScene dropping a
+// scene device leaves this reference intact so the next build reuses the residency.
+struct TextureEnvCache::Impl {
+    std::shared_ptr<TextureEnvResidency> residency;
+};
+
+TextureEnvCache::TextureEnvCache() : impl_(std::make_unique<Impl>()) {}
+TextureEnvCache::~TextureEnvCache() = default;
+TextureEnvCache::TextureEnvCache(TextureEnvCache&&) noexcept = default;
+TextureEnvCache& TextureEnvCache::operator=(TextureEnvCache&&) noexcept = default;
 
 namespace {
 
@@ -572,10 +599,58 @@ FrameTlasView EnsureFrameTlas(TwoLevelSceneDevice::Impl* impl, const TwoLevelSce
     return out;
 }
 
+// A cheap fingerprint of the environment texel-buffer identity (dims + size). An
+// unchanged HDRI keeps the same key; a swapped map almost always differs.
+uint64_t EnvKey(const EnvironmentMap& env) {
+    if (!env.Enabled()) return 0u;
+    return (static_cast<uint64_t>(env.width) * 73856093ull) ^
+           (static_cast<uint64_t>(env.height) * 19349663ull) ^
+           (static_cast<uint64_t>(env.texels.size()) * 83492791ull);
+}
+
+// Upload one scene's image textures + HDR environment into a FRESH device residency
+// (the static, ~hundreds-of-MB H2D). Untextured/env-less parts stay empty (the null
+// fallback). Bumps the upload counter once when texture texels are actually sent.
+std::shared_ptr<TextureEnvResidency> UploadTextureEnvResidency(const TwoLevelScene& scene,
+                                                               const RtContext& ctx) {
+    auto res = std::make_shared<TextureEnvResidency>();
+    const std::vector<rt::Texture>* texs = scene.textures.get();
+    std::vector<DevTexture> dev_tex;
+    if (texs != nullptr) {
+        dev_tex.reserve(texs->size());
+        for (const rt::Texture& t : *texs) {
+            DevTexture d;
+            if (!t.Empty()) {
+                res->texture_texel_bufs.push_back(UploadOwned(ctx.device_bt, t.texels));
+                d.texels = static_cast<const float*>(res->texture_texel_bufs.back().Data());
+                d.width = t.width;
+                d.height = t.height;
+                d.channels = t.channels;
+                d.srgb = t.srgb;
+            }
+            dev_tex.push_back(d);
+        }
+    }
+    if (!dev_tex.empty()) {
+        res->d_textures = UploadOwned(ctx.device_bt, dev_tex);
+        ++g_texture_upload_events;
+    }
+    res->texture_count = static_cast<uint32_t>(dev_tex.size());
+    if (scene.environment.Enabled()) {
+        res->d_env_texels = UploadOwned(ctx.device_bt, scene.environment.texels);
+        res->env_width = scene.environment.width;
+        res->env_height = scene.environment.height;
+    }
+    res->version = scene.texture_version;
+    res->env_key = EnvKey(scene.environment);
+    return res;
+}
+
 }  // namespace
 
 TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
-                                       phi::Backend* backend) {
+                                       phi::Backend* backend,
+                                       TextureEnvCache* tex_env_cache) {
     if (scene.instances.size() > kMaxInstances) {
         throw std::runtime_error(
             "BuildTwoLevelScene: instance_count exceeds kMaxInstances (1<<12); "
@@ -589,39 +664,37 @@ TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
     (void)cudaSetDevice(ctx.device_id);
 
     TwoLevelSceneDevice device;
-    device.GetImpl()->meshes.reserve(scene.meshes.size());
+    TwoLevelSceneDevice::Impl* impl = device.GetImpl();
+    impl->meshes.reserve(scene.meshes.size());
     for (const auto& mesh : scene.meshes) {
-        device.GetImpl()->meshes.push_back(BuildBlas(mesh, ctx));
+        impl->meshes.push_back(BuildBlas(mesh, ctx));
     }
 
-    // Upload the scene's image textures + HDR environment ONCE (static across
-    // frames). An untextured scene uploads nothing (the tracer's null fallback).
-    TwoLevelSceneDevice::Impl* impl = device.GetImpl();
-    std::vector<DevTexture> dev_tex;
-    dev_tex.reserve(scene.textures.size());
-    for (const rt::Texture& t : scene.textures) {
-        DevTexture d;
-        if (!t.Empty()) {
-            impl->texture_texel_bufs.push_back(UploadOwned(ctx.device_bt, t.texels));
-            d.texels = static_cast<const float*>(impl->texture_texel_bufs.back().Data());
-            d.width = t.width;
-            d.height = t.height;
-            d.channels = t.channels;
-            d.srgb = t.srgb;
+    // Textures + HDR environment are static across frames. With a persistent cache a
+    // per-frame rebuild REUSES the device residency while the content version + env
+    // fingerprint are unchanged; only a real change re-uploads. A textured scene with
+    // no library stamp (version 0) never reuses -- distinct such scenes can't be told
+    // apart -- so it uploads every build (the prior behavior). No cache => same.
+    const bool has_tex = scene.textures && !scene.textures->empty();
+    const bool version_reusable = !has_tex || scene.texture_version != 0u;
+    std::shared_ptr<TextureEnvResidency> residency;
+    if (tex_env_cache != nullptr) {
+        TextureEnvCache::Impl* cache = tex_env_cache->GetImpl();
+        if (version_reusable && cache->residency &&
+            cache->residency->version == scene.texture_version &&
+            cache->residency->env_key == EnvKey(scene.environment)) {
+            residency = cache->residency;  // reuse device buffers, skip the H2D
+        } else {
+            residency = UploadTextureEnvResidency(scene, ctx);
+            cache->residency = residency;
         }
-        dev_tex.push_back(d);
+    } else {
+        residency = UploadTextureEnvResidency(scene, ctx);
     }
-    if (!dev_tex.empty()) {
-        impl->d_textures = UploadOwned(ctx.device_bt, dev_tex);
-    }
-    impl->texture_count = static_cast<uint32_t>(dev_tex.size());
-    if (scene.environment.Enabled()) {
-        impl->d_env_texels = UploadOwned(ctx.device_bt, scene.environment.texels);
-        impl->env_width = scene.environment.width;
-        impl->env_height = scene.environment.height;
-        impl->env_yaw = scene.environment.yaw;
-        impl->env_intensity = scene.environment.intensity;
-    }
+    impl->tex_env = std::move(residency);
+    impl->env_yaw = scene.environment.yaw;
+    impl->env_intensity = scene.environment.intensity;
+
     cudaStreamSynchronize(ctx.stream);
     return device;
 }
@@ -800,12 +873,13 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     sky.sky_intensity = opt.sky_intensity;
     sky.transmit_bounces = opt.transmit_bounces;
     sky.smooth_normals = opt.smooth_normals ? 1u : 0u;
-    // HDR environment (uploaded once at BuildTwoLevelScene): the equirect radiance
-    // replaces the procedural gradient dome; absent => null (byte-unchanged).
-    if (impl->d_env_texels.Data() != nullptr && impl->env_width > 0u) {
-        sky.env_texels = static_cast<const float*>(impl->d_env_texels.Data());
-        sky.env_width = impl->env_width;
-        sky.env_height = impl->env_height;
+    // HDR environment (device-resident, uploaded/reused via the texture-env cache):
+    // the equirect radiance replaces the procedural gradient dome; absent => null.
+    const TextureEnvResidency* te = impl->tex_env.get();
+    if (te != nullptr && te->d_env_texels.Data() != nullptr && te->env_width > 0u) {
+        sky.env_texels = static_cast<const float*>(te->d_env_texels.Data());
+        sky.env_width = te->env_width;
+        sky.env_height = te->env_height;
         sky.env_yaw = impl->env_yaw;
         sky.env_intensity = impl->env_intensity;
     }
@@ -828,8 +902,8 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
 
     // The FP32 beauty kernel launch lives in two_level_render_beauty.cu.
     const DevTexture* textures =
-        impl->texture_count > 0u
-            ? static_cast<const DevTexture*>(impl->d_textures.Data())
+        (te != nullptr && te->texture_count > 0u)
+            ? static_cast<const DevTexture*>(te->d_textures.Data())
             : nullptr;
     LaunchBeautyKernel(camera, frame.tlas_nodes, frame.inst_count, frame.instances,
                        frame.materials, textures, scene.light, sky, opt.samples,
