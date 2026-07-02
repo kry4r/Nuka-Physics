@@ -85,6 +85,20 @@ class _Entity:
     material: Optional[object] = None
     surface: Optional[object] = None
     contact_radius: Optional[float] = None
+    render: Optional[object] = None  # materials.RenderAppearance
+
+
+@_dc.dataclass(frozen=True)
+class Environment:
+    """The scene's beauty backdrop: an equirect ``hdri`` path lighting the sky +
+    ambient (``""`` keeps the procedural studio sky), its ``yaw_deg`` /
+    ``intensity``, and ``use_scene_materials`` (render with the AUTHORED
+    materials instead of the studio hero palette)."""
+
+    hdri: str = ""
+    yaw_deg: float = 0.0
+    intensity: float = 1.0
+    use_scene_materials: bool = True
 
 
 _MEDIA_MORPHS = (_morphs.Grid, _morphs.TetSphere, _morphs.FluidBox,
@@ -99,16 +113,35 @@ class Scene:
     def __init__(self, options: Optional[SimOptions] = None) -> None:
         self.options = options if options is not None else SimOptions()
         self._entities: List[_Entity] = []
+        self._environment: Optional[Environment] = None
 
     def add_entity(self, morph, material=None, surface=None, *,
-                   contact_radius: Optional[float] = None) -> "Scene":
+                   contact_radius: Optional[float] = None,
+                   render=None) -> "Scene":
         """Add one authored entity (a ``morph`` plus its optional ``material`` /
         ``surface``). The robot is an ``NKS`` morph; a cloth/tet/fluid medium is a
         ``Grid`` / ``TetSphere`` / ``FluidBox`` with its ``materials`` +
         ``surfaces``; a rigid primitive is a ``Box`` / ``Sphere`` / ``Capsule`` /
-        ``Plane`` / ``Ground`` with a ``materials.Rigid``. Returns ``self``.
+        ``Plane`` / ``Ground`` with a ``materials.Rigid``. ``render`` binds a
+        ``materials.Render`` appearance (flat PBR + image maps) to the entity's
+        beauty look. Returns ``self``.
         """
-        self._entities.append(_Entity(morph, material, surface, contact_radius))
+        if render is not None and not isinstance(render, _materials.RenderAppearance):
+            raise TypeError(
+                "Scene.add_entity: render must be a materials.Render appearance; "
+                f"got {type(render).__name__}")
+        self._entities.append(_Entity(morph, material, surface, contact_radius,
+                                      render))
+        return self
+
+    def set_environment(self, hdri: str = "", yaw_deg: float = 0.0,
+                        intensity: float = 1.0,
+                        use_scene_materials: bool = True) -> "Scene":
+        """Set the beauty environment: an equirect ``.hdr`` path backing the sky +
+        ambient light (``""`` keeps the procedural studio sky), its rotation /
+        intensity, and the authored-materials render policy. Returns ``self``."""
+        self._environment = Environment(hdri, float(yaw_deg), float(intensity),
+                                        bool(use_scene_materials))
         return self
 
     def build(self, device) -> "_nuka.World":
@@ -133,7 +166,11 @@ class Scene:
                 f"{type(unknown[0].morph).__name__} (use morphs.NKS / Grid / "
                 "TetSphere / FluidBox / GranularBed / Box / Sphere / Capsule / "
                 "Plane / Ground)")
-        if tets or fluids or grans or rigids:
+        # Any authored appearance / environment routes to the general builder path
+        # (the SceneBuilder carries the material + environment records).
+        appearance = self._environment is not None or any(
+            e.render is not None for e in self._entities)
+        if tets or fluids or grans or rigids or appearance:
             return self._build_general(device, scenes, grids, tets, fluids + grans,
                                        rigids)
         return self._build_coupled(device, scenes, grids)
@@ -205,10 +242,24 @@ class Scene:
 
         builder = _nuka.SceneBuilder.create(base_path)
         try:
+            # Authored render materials first (rigids bind by name, media by id).
+            material_ids = {}
+            for e in self._entities:
+                r = e.render
+                if r is not None and r.name not in material_ids:
+                    material_ids[r.name] = builder.add_material(
+                        **r.add_material_kwargs())
+            if self._environment is not None:
+                env = self._environment
+                import os
+                builder.set_environment(
+                    hdri=os.path.abspath(env.hdri) if env.hdri else "",
+                    yaw_deg=env.yaw_deg, intensity=env.intensity,
+                    use_scene_materials=env.use_scene_materials)
             for e in rigids:
                 self._add_rigid(builder, e)
             for e in media:
-                self._add_media(builder, e)
+                self._add_media(builder, e, material_ids)
             gx, gy, gz = (float(c) for c in o.gravity)
             world = builder.build(
                 device, env_count=int(o.env_count), dt=float(o.dt),
@@ -248,9 +299,11 @@ class Scene:
         kw.update(mat.rigid_kwargs())
         if morph.FORCE_STATIC:
             kw["static"] = True
+        if e.render is not None:
+            kw["material"] = e.render.name
         builder.add_rigid_primitive(kind=_PRIMITIVE[morph.PRIMITIVE], **kw)
 
-    def _add_media(self, builder, e) -> None:
+    def _add_media(self, builder, e, material_ids=None) -> None:
         morph = e.morph
         kind = morph.MEDIA_KIND
         mat = (e.material if e.material is not None
@@ -275,8 +328,10 @@ class Scene:
                     f"Scene.build: a {kind} medium got an incompatible surface "
                     f"{type(surf).__name__}")
             kw.update(surf.media_kwargs())
+        if e.render is not None and material_ids:
+            kw["render_material_id"] = material_ids[e.render.name]
         builder.add_media(kind=_MEDIA_KIND[kind],
                           method=_MEDIA_METHOD[mat.MEDIA_METHOD], **kw)
 
 
-__all__ = ["Scene", "SimOptions"]
+__all__ = ["Scene", "SimOptions", "Environment"]

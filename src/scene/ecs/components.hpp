@@ -72,10 +72,16 @@ struct RenderMaterial {
     float ior          = 1.0f;       // refractive index (water ~1.33)
     float absorption[3]{0.0f, 0.0f, 0.0f};  // per-metre Beer-Lambert extinction
 
-    // .nka TEXB texture references (chunk path strings).
-    std::string tex_albedo;
-    std::string tex_normal;
-    std::string tex_metallic_roughness;
+    // Image-file PBR texture maps (file paths; empty => untextured flat PBR).
+    // Consumed by the offline beauty tracer: albedo is sRGB and multiplies
+    // base_color, roughness/normal are linear. uv_scale tiles the maps (tiles per
+    // world metre under triplanar; per UV unit otherwise); triplanar projects the
+    // maps in world space for geometry without UVs (boxes/terrain/particle skins).
+    std::string albedo_map;
+    std::string roughness_map;
+    std::string normal_map;
+    float uv_scale  = 1.0f;
+    bool  triplanar = true;
 };
 
 // -- per-entity components ---------------------------------------------------

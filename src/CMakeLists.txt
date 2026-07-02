@@ -128,6 +128,9 @@ set(NUKA_PUBLIC_HEADERS
 
 add_library(nuka_render STATIC
     render/render_world.cpp
+    # Host image decode (stb_image) -> rt::Texture / rt::EnvironmentMap for the
+    # offline beauty texture + HDR-environment pipeline. ZERO CUDA.
+    render/texture_image.cpp
     # The ONE general particle-set -> deformed render surface mesh (cloth now,
     # tet/fluid later). Pure host, ZERO CUDA: it lives in nuka_render so a demo
     # gets a deforming surface from live particles with no CUDA dependency.
@@ -272,6 +275,8 @@ target_link_libraries(nuka_render
     PUBLIC
         nuka_scene
         Vulkan::Vulkan
+    PRIVATE
+        nuka_stb
 )
 
 nuka_set_warnings(nuka_render)

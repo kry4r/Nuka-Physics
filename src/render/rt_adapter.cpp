@@ -33,6 +33,12 @@ rt::BlasMesh MeshToBlas(const MeshGeometry& geo) {
     if (has_normals) {
         blas.tri_normals.reserve(tri_count);
     }
+    // Per-vertex UVs feed the beauty texture path; absent => triplanar fallback.
+    const bool has_uvs = geo.uvs.size() == (geo.positions.size() / 3u) * 2u &&
+                         !geo.uvs.empty();
+    if (has_uvs) {
+        blas.tri_uvs.reserve(tri_count);
+    }
     for (uint32_t t = 0; t < tri_count; ++t) {
         const uint32_t i0 = geo.indices[t * 3u + 0u];
         const uint32_t i1 = geo.indices[t * 3u + 1u];
@@ -53,13 +59,21 @@ rt::BlasMesh MeshToBlas(const MeshGeometry& geo) {
             };
             blas.tri_normals.push_back({nrm(i0), nrm(i1), nrm(i2)});
         }
+        if (has_uvs) {
+            const auto uv = [&geo](uint32_t i) -> math::Vec3 {
+                return {geo.uvs[i * 2u + 0u], geo.uvs[i * 2u + 1u], 0.0f};
+            };
+            blas.tri_uvs.push_back({uv(i0), uv(i1), uv(i2)});
+        }
     }
     return blas;
 }
 
 // scene::RenderMaterial -> rt::Material (Lambert+GGX). base_color.rgb -> albedo,
-// metallic/roughness pass through, emissive -> emission.
-rt::Material RenderMaterialToRt(const scene::RenderMaterial& m) {
+// metallic/roughness pass through, emissive -> emission. Texture map paths resolve
+// to device texture indices via the world's decoded TextureLibrary (-1 => none).
+rt::Material RenderMaterialToRt(const scene::RenderMaterial& m,
+                               const TextureLibrary& textures) {
     rt::Material out;
     out.albedo = {m.base_color[0], m.base_color[1], m.base_color[2]};
     out.metallic = m.metallic;
@@ -69,6 +83,11 @@ rt::Material RenderMaterialToRt(const scene::RenderMaterial& m) {
     out.ior = m.ior;
     out.absorption = {m.absorption[0], m.absorption[1], m.absorption[2]};
     out.sheen = m.sheen;
+    out.albedo_tex = textures.Resolve(m.albedo_map, true);
+    out.roughness_tex = textures.Resolve(m.roughness_map, false);
+    out.normal_tex = textures.Resolve(m.normal_map, false);
+    out.uv_scale = m.uv_scale > 0.0f ? m.uv_scale : 1.0f;
+    out.triplanar = m.triplanar ? 1u : 0u;
     return out;
 }
 
@@ -89,10 +108,17 @@ rt::TwoLevelScene RenderWorldToTwoLevelScene(const RenderWorld& world) {
     // that reference no / out-of-range material.
     scene.materials.reserve(world.materials.size() + 1u);
     for (const scene::RenderMaterial& m : world.materials) {
-        scene.materials.push_back(RenderMaterialToRt(m));
+        scene.materials.push_back(RenderMaterialToRt(m, world.textures));
     }
     const uint32_t default_mat_id = static_cast<uint32_t>(scene.materials.size());
     scene.materials.push_back(rt::Material{});  // neutral default
+
+    // Decoded image textures ride the scene as a shared, owning view (no per-frame
+    // deep copy); its version lets the CUDA backend reuse the device residency. The
+    // HDR environment rides by value. Both empty/disabled by default.
+    scene.textures = world.textures.ImagesShared();
+    scene.texture_version = world.textures.Version();
+    scene.environment = world.environment;
 
     // Instances: 1:1 with RenderWorld instances using each instance's LIVE
     // world_xform. blas_id == mesh_id (the 1:1 mesh map above). Resolve material.

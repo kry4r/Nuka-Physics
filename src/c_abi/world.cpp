@@ -512,10 +512,17 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             return NUKA_RESULT_NOT_SUPPORTED;
         }
         // Build + insert the live world (the shared record-assembly path).
-        return nuka::c_abi::FinishWorldCreate(
+        const nuka_result_t made = nuka::c_abi::FinishWorldCreate(
             std::move(prepared.model), std::move(prepared.scene),
             std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
             desc->env_count, prepared.control_mode, prepared.gravity, out);
+        if (made == NUKA_RESULT_OK) {
+            if (auto* rec = nuka::c_abi::WorldTable().Get(*out)) {
+                rec->scene_dir =
+                    std::filesystem::path(desc->scene_path).parent_path().string();
+            }
+        }
+        return made;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
@@ -596,8 +603,11 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             particles->solver_vel_iters, particles->solver_pos_iters,
             particles->solver_contact_margin, particles->solver_max_pairs);
         if (result == NUKA_RESULT_OK) {
-            if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
+            if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr) {
                 record->particle_surfaces = std::move(media_surfaces);
+                record->scene_dir =
+                    std::filesystem::path(desc->scene_path).parent_path().string();
+            }
         }
         return result;
     } catch (const std::bad_alloc&) {

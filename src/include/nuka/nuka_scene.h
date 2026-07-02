@@ -184,7 +184,52 @@ typedef struct nuka_rigid_primitive_desc_t {
     uint32_t is_static;   // 1 => static (inv_mass 0); 0 => movable (PLANE forces 1).
     float    mass;        // body mass kg when movable (<= 0 => 1.0). Ignored if static.
     float    friction;    // per-shape Coulomb mu (< 0 => inherit the material default).
+    // Render material NAME (from nuka_scene_add_material). Non-empty adds a
+    // visual-only twin shape carrying it (the imported-scene visual-geom pattern)
+    // so the primitive renders with that appearance. NULL/"" => collision-only.
+    const char* material_name;
 } nuka_rigid_primitive_desc_t;
+
+// An authored render material (appearance only; physics friction rides the shape).
+// Image maps are file paths (PNG/JPG; the albedo map is sRGB, roughness/normal are
+// linear; normal maps are tangent-space GL). uv_scale tiles the maps; triplanar 1
+// projects them in body-local space so primitives need no authored UVs.
+typedef struct nuka_render_material_desc_t {
+    const char* name;           // unique material key (required, non-empty).
+    float    base_color[4];     // rgba multiplier; all-zero reads as opaque white.
+    float    metallic;          // [0,1].
+    float    roughness;         // (0,1]; <= 0 => 0.5.
+    float    sheen;             // grazing sheen weight (fabric luster).
+    const char* albedo_map;     // sRGB base-color map path; NULL/"" => none.
+    const char* roughness_map;  // linear roughness map path; NULL/"" => none.
+    const char* normal_map;     // tangent-space normal map path; NULL/"" => none.
+    float    uv_scale;          // map tiles per metre (triplanar) / per UV unit; <= 0 => 1.
+    uint32_t triplanar;         // 1 => body-local triplanar projection (the no-UV default).
+} nuka_render_material_desc_t;
+
+// Add an authored render material to the built scene (a scene MaterialRecord,
+// persisted by nuka_scene_save). `out_material_id` (optional) receives the record
+// id usable as nuka_media_desc_t.render_material_id. Returns INVALID_ARG on a
+// NULL desc / empty name.
+nuka_result_t nuka_scene_add_material(nuka_scene_handle scene,
+                                      const nuka_render_material_desc_t* desc,
+                                      uint32_t* out_material_id);
+
+// Scene-level HDR environment + material policy for the offline beauty render.
+// `hdri` is an equirectangular .hdr (or LDR image) path backing the sky +
+// ambient light; NULL/"" keeps the procedural studio sky. `use_scene_materials`
+// 1 renders instances with their AUTHORED materials instead of the studio hero
+// palette (0 = the legacy studio look).
+typedef struct nuka_environment_desc_t {
+    const char* hdri;
+    float    yaw_deg;             // rotation about world +Z.
+    float    intensity;           // radiance scale; <= 0 => 1.
+    uint32_t use_scene_materials;
+} nuka_environment_desc_t;
+
+// Set the built scene's environment record (persisted by nuka_scene_save).
+nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
+                                         const nuka_environment_desc_t* desc);
 
 // What a medium IS (solver routing) and HOW it solves (one method per medium).
 // The legal (kind x method) set is enforced by the SAME cook validator: cloth =

@@ -661,3 +661,111 @@ TEST(RenderWorldRtBeauty, OpaqueSmoothNormalsAlterShading) {
     EXPECT_GT(diff, n / 100u)
         << "smooth_normals must alter opaque shading (faceting removed) vs the flat arm";
 }
+
+// A 2-channel (grey+alpha) albedo texture must sample as grey on the device --
+// channel 0 replicated to RGB -- and never read past its buffer's last texel. A
+// white base material makes the albedo AOV equal the sampled texture value.
+TEST(RenderWorldRt, TwoChannelTextureSamplesAsGreyNoOverread) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr) << "no CUDA RT backend available";
+
+    // 4x4 constant grey+alpha: ch0 = the truth grey, ch1 = a decoy alpha the old
+    // sampler mis-read as G (and over-read B one float past the last texel).
+    constexpr float kGrey = 0.6f, kAlpha = 0.15f;
+    rt::Texture tex;
+    tex.width = 4u; tex.height = 4u; tex.channels = 2u; tex.srgb = 0u;
+    tex.texels.resize(4u * 4u * 2u);
+    for (uint32_t t = 0; t < 16u; ++t) {
+        tex.texels[t * 2u + 0u] = kGrey;
+        tex.texels[t * 2u + 1u] = kAlpha;
+    }
+
+    rt::TwoLevelScene scene;
+    scene.meshes.push_back(BoxBlas({0.6f, 0.6f, 0.6f}));
+    rt::Material m; m.albedo = {1.0f, 1.0f, 1.0f}; m.metallic = 0.0f; m.roughness = 0.6f;
+    m.albedo_tex = 0; m.triplanar = 1u; m.uv_scale = 1.0f;
+    scene.materials = {m, rt::Material{}};
+    scene.instances.push_back({0u, {{0.0f, 1.5f, 0.6f}, math::Quat::Identity()}, 0u});
+    scene.textures = std::make_shared<std::vector<rt::Texture>>(std::vector<rt::Texture>{tex});
+    scene.light.directional = false;
+    scene.light.position = {-1.5f, -2.0f, 2.5f};
+    scene.light.color = {1.0f, 0.98f, 0.95f};
+    scene.light.intensity = 4.0f;
+
+    const rt::PinholeCamera camera = RefractCamera();
+    const rt::BeautyOptions opt = FixedBeauty();
+    render::RtSceneHandle* h = backend->BuildScene(scene);
+    ASSERT_NE(h, nullptr);
+    const rt::Framebuffer fb = backend->TraceBeautyToHost(h, scene, camera, opt);
+    backend->FreeScene(h);
+
+    size_t hits = 0, grey_ok = 0;
+    for (size_t i = 0; i < fb.prim.size(); ++i) {
+        if (fb.prim[i] == rt::kNoPrim) continue;
+        ++hits;
+        const float r = fb.albedo[i * 3 + 0];
+        const float gg = fb.albedo[i * 3 + 1];
+        const float bb = fb.albedo[i * 3 + 2];
+        if (std::fabs(r - kGrey) < 1e-4f && std::fabs(gg - kGrey) < 1e-4f &&
+            std::fabs(bb - kGrey) < 1e-4f) ++grey_ok;
+    }
+    std::printf("TWO_CHANNEL_ALBEDO_HITS=%zu GREY_OK=%zu (decoy_alpha=%.3f)\n",
+                hits, grey_ok, static_cast<double>(kAlpha));
+    ASSERT_GT(hits, 0u) << "the textured box must cover some pixels";
+    EXPECT_EQ(grey_ok, hits)
+        << "2-channel albedo must sample as grey (ch0 replicated), not (grey,alpha,overread)";
+}
+
+// The backend's TextureEnvCache uploads the static texel set ONCE: three builds of
+// the same content re-upload zero times, the residency survives FreeScene, and a
+// reused build renders byte-identical to an independent no-cache fresh upload.
+TEST(RenderWorldRt, TextureEnvCacheReusesResidencyAcrossBuilds) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr) << "no CUDA RT backend available";
+
+    rt::Texture tex;
+    tex.width = 16u; tex.height = 16u; tex.channels = 3u; tex.srgb = 0u;
+    tex.texels.assign(16u * 16u * 3u, 0.5f);
+
+    rt::TwoLevelScene scene;
+    scene.meshes.push_back(BoxBlas({0.6f, 0.6f, 0.6f}));
+    rt::Material m; m.albedo = {1.0f, 1.0f, 1.0f}; m.metallic = 0.0f; m.roughness = 0.6f;
+    m.albedo_tex = 0; m.triplanar = 1u; m.uv_scale = 1.0f;
+    scene.materials = {m, rt::Material{}};
+    scene.instances.push_back({0u, {{0.0f, 1.5f, 0.6f}, math::Quat::Identity()}, 0u});
+    scene.textures = std::make_shared<std::vector<rt::Texture>>(std::vector<rt::Texture>{tex});
+    scene.texture_version = 0xC0FFEEu;  // a stable library-style content stamp
+
+    const uint64_t before = rt::DebugTextureUploadCount();
+    render::RtSceneHandle* h0 = backend->BuildScene(scene);
+    const uint64_t after1 = rt::DebugTextureUploadCount();
+    render::RtSceneHandle* h1 = backend->BuildScene(scene);
+    render::RtSceneHandle* h2 = backend->BuildScene(scene);
+    const uint64_t after3 = rt::DebugTextureUploadCount();
+    std::printf("TEXTURE_UPLOADS delta_build1=%llu delta_build2n3=%llu\n",
+                static_cast<unsigned long long>(after1 - before),
+                static_cast<unsigned long long>(after3 - after1));
+    EXPECT_EQ(after1 - before, 1u) << "first build uploads the texture set exactly once";
+    EXPECT_EQ(after3 - after1, 0u) << "reused residency must not re-upload (build 2 + 3)";
+
+    // The reused residency still renders, and byte-matches an independent no-cache
+    // fresh upload of the same texels (the cache never perturbs the image).
+    const rt::PinholeCamera camera = RefractCamera();
+    const rt::BeautyOptions opt = FixedBeauty();
+    const rt::Framebuffer cached = backend->TraceBeautyToHost(h2, scene, camera, opt);
+    ASSERT_GT(HitPixels(cached), 0u);
+    rt::TwoLevelSceneDevice fresh = rt::BuildTwoLevelScene(scene, nullptr, nullptr);
+    const rt::Framebuffer no_cache = rt::RenderBeauty(fresh, scene, camera, opt, nullptr);
+    EXPECT_TRUE(FramebuffersByteEqual(cached, no_cache));
+
+    backend->FreeScene(h0);
+    backend->FreeScene(h1);
+    backend->FreeScene(h2);
+
+    // FreeScene must NOT drop the cache: a build after all frees still reuses.
+    const uint64_t after_free = rt::DebugTextureUploadCount();
+    render::RtSceneHandle* h3 = backend->BuildScene(scene);
+    EXPECT_EQ(rt::DebugTextureUploadCount() - after_free, 0u)
+        << "cache survives FreeScene (residency shared with the backend, not the handle)";
+    backend->FreeScene(h3);
+}

@@ -43,10 +43,11 @@ SceneIR::SceneIR(const SceneIR& other)
       contact_pairs_(other.contact_pairs_),
       initial_state_(other.initial_state_),
       settle_(other.settle_),
-      terrain_(other.terrain_) {
-    // initial_state_ / settle_ / terrain_ are authored metadata, NOT projected
-    // from records, so they must be copied explicitly (RebuildFacade only
-    // rebuilds the tree/ECS from records and would otherwise drop them).
+      terrain_(other.terrain_),
+      environment_(other.environment_) {
+    // initial_state_ / settle_ / terrain_ / environment_ are authored metadata,
+    // NOT projected from records, so they must be copied explicitly (RebuildFacade
+    // only rebuilds the tree/ECS from records and would otherwise drop them).
     RebuildFacade();
 }
 
@@ -69,6 +70,7 @@ SceneIR& SceneIR::operator=(const SceneIR& other) {
     initial_state_ = other.initial_state_;   // authored metadata (not from records)
     settle_        = other.settle_;
     terrain_       = other.terrain_;
+    environment_   = other.environment_;
     RebuildFacade();
     return *this;
 }
@@ -836,6 +838,11 @@ void SceneIR::ProjectMaterial(const MaterialRecord& rec) {
     rm.absorption[0] = rec.absorption.x;
     rm.absorption[1] = rec.absorption.y;
     rm.absorption[2] = rec.absorption.z;
+    rm.albedo_map    = rec.albedo_map;
+    rm.roughness_map = rec.roughness_map;
+    rm.normal_map    = rec.normal_map;
+    rm.uv_scale      = rec.uv_scale;
+    rm.triplanar     = rec.triplanar;
 
     PhysicsMaterial pm;
     if (rec.friction_mu >= 0.0f) {

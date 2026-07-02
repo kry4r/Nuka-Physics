@@ -60,6 +60,15 @@ struct TriangleNormals {
     math::Vec3 n2;
 };
 
+// Per-vertex texture coordinates for ONE triangle (only x,y used; z ignored),
+// parallel to BlasMesh::triangles. Consumed ONLY by the beauty texture path;
+// empty => the tracer falls back to world-space triplanar projection.
+struct TriangleUVs {
+    math::Vec3 uv0;
+    math::Vec3 uv1;
+    math::Vec3 uv2;
+};
+
 // One UNIQUE mesh's primitives in its OWN LOCAL space (p13 declaration-order
 // layout: all triangles first, then spheres, then SDFs). A BLAS is built over
 // these ONCE. The per-prim material_id fields are UNUSED in G1-A (material is
@@ -73,6 +82,8 @@ struct BlasMesh {
     std::vector<SpherePrim> spheres;
     std::vector<SdfPrim> sdfs;
     std::vector<TriangleNormals> tri_normals;
+    // Per-triangle UVs (beauty texture path); empty => triplanar. 1:1 with triangles.
+    std::vector<TriangleUVs> tri_uvs;
 };
 
 // One placed instance: which unique mesh (blas_id indexes TwoLevelScene::meshes),
@@ -92,7 +103,41 @@ struct TwoLevelScene {
     std::vector<Material> materials;
     Light light;
     AmbientTerm ambient;
+    // Image textures referenced by Material::*_tex indices, carried as a shared
+    // owning view so the per-frame scene never deep-copies the static texel set.
+    // `texture_version` stamps the content; the device backend's TextureEnvCache
+    // reuses its H2D residency while the stamp is unchanged. Null/empty/disabled =>
+    // flat materials + procedural sky (byte-identical default for an untextured scene).
+    std::shared_ptr<const std::vector<Texture>> textures;
+    uint64_t texture_version = 0u;
+    EnvironmentMap environment;
 };
+
+// Cross-BuildScene device residency for the (static) image textures + HDR
+// environment. A persistent backend holds ONE; successive builds over the same
+// content (matched by TwoLevelScene::texture_version + the env fingerprint) reuse
+// the device buffers instead of re-uploading. Move-only, opaque (impl in the .cu).
+// A null cache (the default) keeps the prior behavior: every build uploads.
+class TextureEnvCache {
+public:
+    TextureEnvCache();
+    ~TextureEnvCache();
+    TextureEnvCache(const TextureEnvCache&) = delete;
+    TextureEnvCache& operator=(const TextureEnvCache&) = delete;
+    TextureEnvCache(TextureEnvCache&&) noexcept;
+    TextureEnvCache& operator=(TextureEnvCache&&) noexcept;
+
+    struct Impl;  // defined in the .cu
+    Impl* GetImpl() { return impl_.get(); }
+    const Impl* GetImpl() const { return impl_.get(); }
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+// Count of texture-texel H2D uploads across all BuildTwoLevelScene calls (a test/
+// forensics probe). Reused residency does NOT increment it; a fresh upload does.
+uint64_t DebugTextureUploadCount();
 
 // Which host AOV channels RenderBeauty copies back from the device. The kernel
 // always WRITES every channel (determinism unchanged); this only gates the D2H
@@ -177,7 +222,8 @@ struct RtDeviceAovs {
 // selects the device + stream the BLAS uploads run on; null falls back to the
 // registry's first device on its own backend.
 TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
-                                       phi::Backend* backend = nullptr);
+                                       phi::Backend* backend = nullptr,
+                                       TextureEnvCache* tex_env_cache = nullptr);
 
 // Surface ONE SensorBlasRef per built mesh (indexed by blas_id) so the batched
 // sensor path reuses the SAME once-built BLAS. Additive; the trace path unchanged.
