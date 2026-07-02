@@ -14,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -292,6 +293,11 @@ EmbeddedSkin EmbedSurfaceInTetCage(const std::vector<math::Vec3>& skin_rest,
                                    const std::vector<math::Vec3>& tet_rest,
                                    const std::vector<TetMeshTet>& tets,
                                    uint32_t* out_extrapolated) {
+    // An empty cage cannot bind a skin vertex; fail loudly, never index tets[0].
+    if (!skin_rest.empty() && (tets.empty() || tet_rest.empty())) {
+        throw std::invalid_argument(
+            "EmbedSurfaceInTetCage: empty tet cage for a non-empty skin");
+    }
     EmbeddedSkin e;
     e.triangles = skin_tris;
     e.binds.resize(skin_rest.size());
