@@ -1,7 +1,7 @@
 #pragma once
 // ---------------------------------------------------------------------------
 // nuka::runtime::app::viewer::CameraController -- the interactive orbit/pan/zoom
-// camera for the M8.5 viewer (T3).
+// camera for the windowed viewer.
 //
 // It holds a spherical orbit state (yaw / pitch / distance) around a focus
 // `target` and turns it into a render::RasterOptions camera OVERRIDE
@@ -35,7 +35,7 @@ namespace nuka::runtime::app::viewer {
 namespace window = nuka::render::window;
 
 // ---------------------------------------------------------------------------
-// Ray -- a world-space pick ray (origin + unit direction). VIEW-1 picker math.
+// Ray -- a world-space pick ray (origin + unit direction).
 // Pure value type; no Vulkan/CUDA. Built from the resolved camera basis so it
 // matches the raster renderer's right-handed LookAt convention EXACTLY (forward
 // = normalize(target-eye), right = forward x up, true-up = right x forward).
@@ -93,13 +93,13 @@ public:
     float      Pitch() const { return pitch_; }
     float      Distance() const { return distance_; }
 
-    // ---- picker math (VIEW-1; pure host, no Vulkan) ------------------------
+    // ---- picker math (pure host, no Vulkan) --------------------------------
     // Build the world-space pick ray through pixel (px, py) of a viewport of
     // (width, height) px. (px, py) is in window coords (origin top-left, +y
     // DOWN, the xcb/ImGui convention). The ray uses the SAME camera basis +
     // fov the renderer's LookAt/Perspective use, so a screen click unprojects
     // onto the geometry the user sees. width/height/fov degenerate -> a forward
-    // ray from the eye. Deterministic (no time input) for the GATE-B record.
+    // ray from the eye. Deterministic (no time input) for the recorded UI.
     Ray ScreenRay(float px, float py, uint32_t width, uint32_t height) const;
 
     // Intersect `ray` with the plane through `plane_point` whose normal is

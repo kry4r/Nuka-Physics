@@ -1,7 +1,7 @@
 #pragma once
 // ---------------------------------------------------------------------------
 // nuka::render::window -- the thin self-written windowing / Vulkan-surface
-// backend (M8.5 T2, Decision D1 = self-written xcb, NOT GLFW).
+// backend (self-written xcb on Linux; GLFW on Windows).
 //
 // This is the SURFACE SOURCE for the swapchain present path
 // (vulkan_present_renderer). It is deliberately tiny: create a window, create a
@@ -38,7 +38,7 @@ using WindowVkInstance = VkInstance_T*;
 using WindowVkSurface  = void*;  // reinterpret to VkSurfaceKHR in the .cpp
 
 // ---------------------------------------------------------------------------
-// WindowEvent -- the minimal-but-real input the viewer (T3) consumes. One flat
+// WindowEvent -- the minimal-but-real input the viewer consumes. One flat
 // POD per platform event; the viewer maps these onto the CommandQueue (play/
 // pause/camera) + ImGui io. Kept small on purpose (this is a showcase viewer,
 // not a game-engine input system).
@@ -52,6 +52,8 @@ struct WindowEvent {
         MouseButton,    // button + pressed
         Key,            // key (raw keycode) + keysym (resolved) + pressed
         Scroll,         // scroll_delta carries wheel ticks (+up / -down)
+        FocusLost,      // keyboard focus left the window (releases are lost:
+                        // consumers must reset any latched modifier/drag state)
     };
     Type     type = Type::None;
     uint32_t width = 0;

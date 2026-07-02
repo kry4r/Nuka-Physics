@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// nuka::runtime::app::viewer::CameraController -- implementation (M8.5 T3).
+// nuka::runtime::app::viewer::CameraController -- implementation.
 //
 // Pure host C++/math: orbit/pan/zoom -> RasterOptions camera override. NO Vulkan,
 // NO ImGui, NO CUDA. See camera_controller.hpp for the control mapping.
@@ -31,6 +31,13 @@ bool CameraController::HandleEvent(const window::WindowEvent& ev, bool allow_dra
                 shift_down_ = ev.pressed;
                 return false;
             }
+            return false;
+        }
+        case Type::FocusLost: {
+            // Releases are lost across a focus switch: drop latched state.
+            shift_down_ = false;
+            orbiting_ = false;
+            panning_ = false;
             return false;
         }
         case Type::MouseButton: {
