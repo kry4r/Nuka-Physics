@@ -71,8 +71,8 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
     bridge->scene = std::make_unique<nuka::render::StudioScene>(
         nuka::render::BuildStudioScene(record->scene->Ecs(), cooked.scene_map,
                                        topologies, width, height));
-    // The authored media materials (G5): a valid render_material_id overrides the
-    // studio default on its deforming surface / instanced-sphere skin.
+    // A medium's authored render_material_id, when valid, overrides the studio
+    // default on its deforming surface / instanced-sphere skin.
     for (std::size_t i = 0; i < topology_material.size(); ++i) {
         if (topology_material[i] != 0xFFFFFFFFu) {
             nuka::render::SetStudioSurfaceMaterial(*bridge->scene,

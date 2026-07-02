@@ -518,6 +518,34 @@ TEST(MpmGranular, CapsuleFootprintPersists) {
         << "the surrounding bed must not collapse";
 }
 
+// Cohesion gate: the 15-deg column that slumps dry HOLDS its full height with a
+// strong dp_cohesion (~10x the gravity pressure). A sign/scale error in the
+// apex shift (tr - c0) would collapse or blow up the bound pile.
+TEST(MpmGranular, CohesionBindsTheColumn) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    Backend b = GetBackend();
+    constexpr uint32_t kSteps = 600u;
+
+    cook::MpmCookInput dry_in = BuildColumnInput(15.0f, 4.0f);
+    cook::MpmCookInput coh_in = BuildColumnInput(15.0f, 4.0f);
+    coh_in.material.dp_cohesion = 2.0e4f;
+
+    const PileStats dry = RunPile(b, std::move(dry_in), kSteps);
+    const PileStats coh = RunPile(b, std::move(coh_in), kSteps);
+
+    std::fprintf(stderr,
+                 "[granular cohesion] dry15: h=%.4f r=%.4f | coh15: h=%.4f "
+                 "r=%.4f esc=%u (H0=%.4f)\n",
+                 dry.h_max, dry.r_spread, coh.h_max, coh.r_spread, coh.escape,
+                 kColHeight);
+
+    ASSERT_TRUE(dry.finite && coh.finite);
+    EXPECT_EQ(0u, coh.escape) << "the bound column must not eject particles";
+    EXPECT_LT(dry.h_max, 0.5f * kColHeight) << "dry 15-deg column must slump";
+    EXPECT_GT(coh.h_max, 0.8f * kColHeight) << "cohesion must hold the column";
+    EXPECT_LT(coh.r_spread, dry.r_spread) << "the bound column spreads less";
+}
+
 // Determinism: the granular constitutive stays on the deterministic gather path
 // (particle positions + F byte-identical run-to-run).
 TEST(MpmGranular, CollapseByteIdenticalRunToRun) {
