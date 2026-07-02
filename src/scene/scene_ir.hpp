@@ -191,6 +191,29 @@ struct MaterialRecord {
     // Resolved into the per-shape cooked μ at cook time when a shape does not
     // carry an explicit per-shape override (see cooker.cpp precedence). (v0.8 C1a)
     float friction_mu                      = 1.0f;
+
+    // Image-file PBR maps (paths, resolved against the .nks dir at load). Empty
+    // (default) reconstructs the identical untextured RenderMaterial. uv_scale
+    // tiles the maps; triplanar projects them in body-local space for geometry
+    // without authored UVs (boxes / terrain / particle surfaces).
+    std::string albedo_map;
+    std::string roughness_map;
+    std::string normal_map;
+    float uv_scale                         = 1.0f;
+    bool  triplanar                        = true;
+};
+
+// Scene-level HDR environment backing the offline beauty render (equirect
+// background + sky-dome light). `hdri` empty (default) keeps the procedural
+// studio sky. `use_scene_materials` renders instances with their AUTHORED
+// materials instead of the studio hero palette override (default false keeps
+// every existing scene's beauty frames unchanged). Authored metadata like
+// initial_state/terrain: never cooked.
+struct EnvironmentRecord {
+    std::string hdri;                      // path, resolved against the .nks dir
+    float yaw_deg                          = 0.0f;
+    float intensity                        = 1.0f;
+    bool  use_scene_materials              = false;
 };
 
 struct CameraRecord {
@@ -519,6 +542,8 @@ public:
     SceneInitialState&           InitialStateMut() { return initial_state_; }
     const cook::SettleSpec&      Settle() const { return settle_; }
     cook::SettleSpec&            SettleMut() { return settle_; }
+    const EnvironmentRecord&     Environment() const { return environment_; }
+    EnvironmentRecord&           EnvironmentMut() { return environment_; }
 
     // -- facade: structural world (M2b) -------------------------------------
     // The scene TREE and the ECS Registry built by the Add* write-through. The
@@ -576,6 +601,7 @@ private:
     SceneInitialState  initial_state_;
     cook::SettleSpec   settle_;
     std::vector<TerrainRecord> terrain_;
+    EnvironmentRecord  environment_;
 
     // -- facade state -------------------------------------------------------
     SceneGraph tree_;

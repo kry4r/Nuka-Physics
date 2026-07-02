@@ -149,6 +149,10 @@ struct WorldRecord {
     // RETAINED so the sensor attach builds the per-env visual binding from one cook.
     std::unique_ptr<nuka::scene::SceneIR> scene;
 
+    // Directory of the scene file this world loaded from (empty for in-memory built
+    // scenes). Relative material-map / hdri paths resolve against it at render time.
+    std::string scene_dir;
+
     // The batched camera sensor (lazily built by attach). Declared AFTER `world` so
     // it is destroyed BEFORE the World/backend drop. Null until a sensor is attached.
     std::unique_ptr<SensorAttachment> sensor;
