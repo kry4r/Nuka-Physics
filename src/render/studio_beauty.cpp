@@ -13,6 +13,7 @@
 #include "render/rt_adapter.hpp"
 #include "render/rt_backend.hpp"
 #include "render/rt_framebuffer_to_report.hpp"
+#include "scene/ecs/registry.hpp"
 
 #include <cstdint>
 #include <string>
@@ -44,6 +45,46 @@ MeshGeometry MakeFloorGeo(float half, float z) {
             g.positions.insert(g.positions.end(), {xs[xi], ys[yi], z});
     g.indices.insert(g.indices.end(), {0u, 1u, 3u, 0u, 3u, 2u});
     return g;
+}
+
+// Bake every particle in [first, first+count) into one mesh of radius-r octahedra
+// (6 verts / 8 tris each; the beauty tracer's smooth normals round them off).
+MeshGeometry BakeParticleSpheres(const std::vector<Vec3>& pos, uint32_t first,
+                                 uint32_t count, float r) {
+    MeshGeometry g;
+    const uint32_t total = static_cast<uint32_t>(pos.size());
+    const uint32_t lo = first < total ? first : total;
+    const uint32_t n = (count == 0u) ? (total - lo)
+                                     : (count < total - lo ? count : total - lo);
+    static const float kV[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                   {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    static const uint32_t kF[8][3] = {{0, 2, 4}, {2, 1, 4}, {1, 3, 4}, {3, 0, 4},
+                                      {2, 0, 5}, {1, 2, 5}, {3, 1, 5}, {0, 3, 5}};
+    g.positions.reserve(static_cast<size_t>(n) * 18u);
+    g.indices.reserve(static_cast<size_t>(n) * 24u);
+    for (uint32_t i = 0; i < n; ++i) {
+        const Vec3& p = pos[lo + i];
+        const uint32_t base = i * 6u;
+        for (int v = 0; v < 6; ++v) {
+            g.positions.insert(g.positions.end(),
+                               {p.x + r * kV[v][0], p.y + r * kV[v][1],
+                                p.z + r * kV[v][2]});
+        }
+        for (const auto& f : kF)
+            g.indices.insert(g.indices.end(), {base + f[0], base + f[1], base + f[2]});
+    }
+    return g;
+}
+
+// Append one scene Registry render material to the studio palette; kNoId when the
+// id is unset/unknown (the caller keeps its studio default then).
+uint32_t InternSceneMaterial(StudioScene& s, const scene::Registry& registry,
+                             uint32_t scene_material_id) {
+    if (scene_material_id == kNoId) return kNoId;
+    const scene::RenderMaterial* m = registry.GetRenderMaterial(scene_material_id);
+    if (m == nullptr) return kNoId;
+    s.world.materials.push_back(*m);
+    return static_cast<uint32_t>(s.world.materials.size() - 1u);
 }
 
 }  // namespace
@@ -154,10 +195,42 @@ StudioScene BuildStudioScene(const scene::Registry& registry,
     return s;
 }
 
+void SetStudioSurfaceMaterial(StudioScene& scene, const scene::Registry& registry,
+                              std::size_t surface_index, uint32_t scene_material_id) {
+    if (surface_index >= scene.surfaces.size()) return;
+    const uint32_t slot = InternSceneMaterial(scene, registry, scene_material_id);
+    if (slot != kNoId) scene.surfaces[surface_index].material_id = slot;
+}
+
+void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
+                           uint32_t scene_material_id, float radius,
+                           uint32_t first, uint32_t count) {
+    StudioScene::ParticleSkin sk;
+    sk.radius = radius > 0.0f ? radius : 0.005f;
+    sk.first = first;
+    sk.count = count;
+    uint32_t slot = InternSceneMaterial(scene, registry, scene_material_id);
+    if (slot == kNoId) {
+        // Neutral matte granite grey (the default granular grain look).
+        scene.world.materials.push_back(Mk(0.42f, 0.385f, 0.34f, 0.0f, 0.85f));
+        slot = static_cast<uint32_t>(scene.world.materials.size() - 1u);
+    }
+    sk.material_id = slot;
+    scene.particle_skins.push_back(sk);
+}
+
 void PublishStudioScene(StudioScene& scene,
                         const std::vector<Transform>& link_pose,
-                        const std::vector<Vec3>& particle_pos) {
+                        const std::vector<Vec3>& particle_pos,
+                        const std::vector<Transform>& body_pose) {
     for (uint32_t i = 0; i < scene.link_instance_count; ++i) {
+        const PoseSource& ps = scene.world.instances[i].pose_source;
+        if (ps.kind == PoseSource::Kind::Body) {   // a free rigid body's visual.
+            if (ps.row < body_pose.size())
+                scene.world.instances[i].world_xform =
+                    body_pose[ps.row] * scene.visual_local[i];
+            continue;
+        }
         const uint32_t lk = scene.link_of_instance[i];
         if (lk < link_pose.size())
             scene.world.instances[i].world_xform = link_pose[lk] * scene.visual_local[i];
@@ -182,6 +255,27 @@ void PublishStudioScene(StudioScene& scene,
             surf.instance = scene.world.instances.size() - 1u;
         } else {
             scene.world.meshes.ReplaceGeometry(surf.mesh_id, std::move(mesh));
+        }
+    }
+
+    // Re-bake every instanced-sphere particle skin from the live positions.
+    for (std::size_t si = 0; si < scene.particle_skins.size(); ++si) {
+        StudioScene::ParticleSkin& sk = scene.particle_skins[si];
+        MeshGeometry mesh =
+            BakeParticleSpheres(particle_pos, sk.first, sk.count, sk.radius);
+        if (mesh.positions.empty()) continue;
+        if (sk.mesh_id == kNoId) {
+            sk.mesh_id = scene.world.meshes.InternPrimitive(
+                "particle_skin" + std::to_string(si), [&] { return mesh; });
+            RenderInstance ci;
+            ci.mesh_id = sk.mesh_id;
+            ci.render_material_id = sk.material_id;
+            ci.world_xform = Transform::Identity();
+            ci.pose_source.kind = PoseSource::Kind::Static;
+            scene.world.instances.push_back(ci);
+            sk.instance = scene.world.instances.size() - 1u;
+        } else {
+            scene.world.meshes.ReplaceGeometry(sk.mesh_id, std::move(mesh));
         }
     }
 }

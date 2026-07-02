@@ -86,8 +86,9 @@ class SoftXpbdMaterial:
 @_dc.dataclass(frozen=True)
 class MpmMaterial:
     """MLS-MPM parameters -> the mpm_* media block. ``model_kind`` 0 corotated,
-    2 neo-hookean, 3 weakly-compressible fluid; ``MEDIA_KIND`` (soft_tet / fluid)
-    is set by the factory so the scene assembler can match it to the morph."""
+    2 neo-hookean, 3 weakly-compressible fluid, 4 granular Drucker-Prager;
+    ``MEDIA_KIND`` (soft_tet / fluid / granular) is set by the factory so the
+    scene assembler can match it to the morph."""
 
     MEDIA_METHOD = "mlsmpm"
 
@@ -104,6 +105,8 @@ class MpmMaterial:
     floor_normal: Tuple[float, float, float]
     floor_d: float
     floor_friction: float
+    dp_friction: float = 0.0
+    dp_cohesion: float = 0.0
 
     @property
     def MEDIA_KIND(self) -> str:
@@ -113,6 +116,8 @@ class MpmMaterial:
         return dict(
             mpm_youngs=float(self.youngs), mpm_poisson=float(self.poisson),
             mpm_density=float(self.density), mpm_model_kind=float(self.model_kind),
+            mpm_dp_friction=float(self.dp_friction),
+            mpm_dp_cohesion=float(self.dp_cohesion),
             mpm_bulk_modulus=float(self.bulk_modulus),
             mpm_tait_gamma=float(self.tait_gamma),
             mpm_viscosity=float(self.viscosity), mpm_dx=float(self.dx),
@@ -229,6 +234,31 @@ class Fluid:
                            floor_normal, floor_d, floor_friction)
 
 
+class Granular:
+    """Granular constitutive models: ``Granular.MPM`` (Drucker-Prager sand)."""
+
+    @staticmethod
+    def MPM(youngs: float = 3.0e5, poisson: float = 0.3, density: float = 1600.0,
+            friction_angle: float = 35.0, cohesion: float = 0.0, dx: float = 0.01,
+            substeps: int = 30,
+            floor_normal: Tuple[float, float, float] = (0.0, 0.0, 1.0),
+            floor_d: float = 0.0, floor_friction: float = 0.5) -> MpmMaterial:
+        """An MLS-MPM Drucker-Prager granular medium (``model_kind`` 4):
+        ``friction_angle`` deg sets the repose slope, ``cohesion`` Pa the tensile
+        bind (0 = dry sand), ``youngs`` / ``poisson`` the elastic predictor,
+        ``density`` kg/m^3, grid cell ``dx`` m, ``substeps`` per step."""
+        if dx <= 0.0:
+            raise ValueError("Granular.MPM: dx must be > 0 (the background grid cell)")
+        if substeps < 1:
+            raise ValueError("Granular.MPM: substeps must be >= 1")
+        if not 0.0 <= friction_angle < 90.0:
+            raise ValueError("Granular.MPM: friction_angle must be in [0, 90) deg")
+        return MpmMaterial("granular", youngs, poisson, density, 4.0,
+                           0.0, 0.0, 0.0, dx, substeps,
+                           floor_normal, floor_d, floor_friction,
+                           dp_friction=friction_angle, dp_cohesion=cohesion)
+
+
 @_dc.dataclass(frozen=True)
 class RigidMaterial:
     """A rigid primitive's physics bag -> the add_rigid_primitive kwargs.
@@ -253,5 +283,5 @@ def Rigid(friction: float = -1.0, mass: float = 1.0,
 
 __all__ = [
     "Cloth", "ClothMaterial", "Soft", "SoftXpbdMaterial", "MpmMaterial",
-    "Fluid", "FluidPbfMaterial", "Rigid", "RigidMaterial",
+    "Fluid", "FluidPbfMaterial", "Granular", "Rigid", "RigidMaterial",
 ]

@@ -44,6 +44,12 @@ namespace {
 namespace m = ::nuka::math;
 constexpr uint32_t kBlockSize = 128u;
 
+// Smallest node mass the momentum->velocity divide is float-stable for. A node
+// reached only by denormal-tiny stencil-weight products (a particle sitting at an
+// exact cell center rounds one axis weight to ~eps^2) otherwise divides by a
+// denormal -> inf/NaN velocity that G2P then spreads. Such a node holds no matter.
+constexpr float kMinNodeMass = 1.0e-30f;
+
 // MLS-MPM material-table row stride (f32 per row). Must match
 // MpmMaterial::kValueCount: youngs poisson density dp_friction dp_cohesion
 // model_kind | bulk_modulus tait_gamma viscosity.
@@ -220,6 +226,84 @@ __device__ __forceinline__ void FirstPiola(const float* F, float mu, float lambd
     const float coef = lambda * (J - 1.0f) * J;
     for (int k = 0; k < 9; ++k)
         P[k] = 2.0f * mu * (F[k] - R[k]) + coef * FinvT[k];
+}
+
+// Elastic Hencky-strain cap: sand's recoverable strain is a few percent; anything
+// past it is absorbed plastically (grain rearrangement). This BOUNDS the stress a
+// degenerate rim/impact F can emit (the fluid J-floor's philosophy), so a
+// near-massless boundary node never receives a runaway kick.
+constexpr float kSandHenckyCap = 0.15f;
+
+// Granular Kirchhoff stress (Klar et al. 2016, "Drucker-Prager Elastoplasticity for
+// Sand Animation"): Hencky (log-strain) St.-Venant-Kirchhoff elasticity on the stored
+// elastic F. tau = U diag(2*mu*eps + lambda*tr(eps)) U^T, eps_i = ln(sig_i). This IS
+// the P*F^T the MLS node force wants; the reflection sign in U cancels in the product.
+__device__ __forceinline__ void GranularKirchhoff(const float* F, float mu,
+                                                  float lambda, float* stress) {
+    float U[9], sig[3], V[9];
+    Svd3(F, U, sig, V);
+    float eps[3];
+    for (int i = 0; i < 3; ++i) {
+        eps[i] = logf(fmaxf(fabsf(sig[i]), 1.0e-6f));
+        eps[i] = fminf(fmaxf(eps[i], -kSandHenckyCap), kSandHenckyCap);
+    }
+    const float tr = eps[0] + eps[1] + eps[2];
+    float tau[3];
+    for (int i = 0; i < 3; ++i) tau[i] = 2.0f * mu * eps[i] + lambda * tr;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            stress[r * 3 + c] = U[r * 3 + 0] * tau[0] * U[c * 3 + 0] +
+                                U[r * 3 + 1] * tau[1] * U[c * 3 + 1] +
+                                U[r * 3 + 2] * tau[2] * U[c * 3 + 2];
+}
+
+// Drucker-Prager return map on the trial elastic F (Klar et al. 2016, Box 3). Projects
+// the principal Hencky strains onto the yield cone: expansion past the cohesion apex ->
+// stress-free apex (discards the volumetric plastic strain, the standard sand model, no
+// hardening/volume-correction here), shear past the cone -> radial return, inside ->
+// elastic. friction_deg = internal friction angle (deg), cohesion = a stress that
+// shifts the apex into tension. cohesion 0 recovers the cohesionless sand map.
+__device__ __forceinline__ void SandReturnMap(float* F, float mu, float lambda,
+                                             float friction_deg, float cohesion) {
+    float U[9], sig[3], V[9];
+    Svd3(F, U, sig, V);
+    float eps[3], sgn[3];
+    for (int i = 0; i < 3; ++i) {
+        sgn[i] = sig[i] < 0.0f ? -1.0f : 1.0f;
+        eps[i] = logf(fmaxf(fabsf(sig[i]), 1.0e-6f));
+    }
+    const float tr = eps[0] + eps[1] + eps[2];
+    const float kappa = 3.0f * lambda + 2.0f * mu;             // d*lambda + 2*mu, d=3.
+    const float c0 = kappa > 1.0e-9f ? cohesion / kappa : 0.0f;  // apex tensile strain.
+    float dev[3];
+    for (int i = 0; i < 3; ++i) dev[i] = eps[i] - tr * (1.0f / 3.0f);
+    const float devn = sqrtf(dev[0] * dev[0] + dev[1] * dev[1] + dev[2] * dev[2]);
+    const float sinp = sinf(friction_deg * 0.017453292519943295f);
+    const float alpha = 1.632993161855452f * sinp / fmaxf(3.0f - sinp, 1.0e-6f);
+    const float tr_shift = tr - c0;
+    float en[3];
+    if (devn < 1.0e-12f || tr_shift > 0.0f) {
+        for (int i = 0; i < 3; ++i) en[i] = c0 * (1.0f / 3.0f);  // return to the apex.
+    } else {
+        const float dgamma = devn + (kappa / (2.0f * mu)) * tr_shift * alpha;
+        if (dgamma <= 0.0f) {
+            for (int i = 0; i < 3; ++i) en[i] = eps[i];           // inside the cone.
+        } else {
+            const float inv = 1.0f / devn;                        // radial return.
+            for (int i = 0; i < 3; ++i) en[i] = eps[i] - dgamma * dev[i] * inv;
+        }
+    }
+    float s2[3];
+    for (int i = 0; i < 3; ++i) {
+        // Cap the STORED elastic strain: the overflow is plastic densification, so
+        // the state the next substep stresses can never spiral (bounded restoring).
+        en[i] = fminf(fmaxf(en[i], -kSandHenckyCap), kSandHenckyCap);
+        s2[i] = sgn[i] * expf(en[i]);
+    }
+    float US[9];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) US[r * 3 + c] = U[r * 3 + c] * s2[c];
+    Mat3MulT(US, V, F);  // F = US * V^T = U diag(s2) V^T.
 }
 
 // Quadratic B-spline base node + the 3 per-axis weights. The particle sits in the
@@ -424,7 +508,16 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                             }
                             const float* F = part_F + static_cast<size_t>(p) * 9u;
                             float stress[9];
-                            if (kind > 2.5f) {  // weakly-compressible fluid (kind 3).
+                            if (kind > 3.5f) {  // granular Drucker-Prager (kind 4).
+                                // Hencky elastic Kirchhoff stress off the stored elastic
+                                // F; the DP plastic return is applied in the F-update.
+                                const float denom =
+                                    (1.0f + poisson) * (1.0f - 2.0f * poisson);
+                                const float mu = youngs / (2.0f * (1.0f + poisson));
+                                const float lambda =
+                                    (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
+                                GranularKirchhoff(F, mu, lambda, stress);
+                            } else if (kind > 2.5f) {  // weakly-compressible fluid (kind 3).
                                 // Kirchhoff stress J*sigma = -p*J*I, Tait EOS, no tension;
                                 // optional viscosity J*mu*(C+C^T) from the live affine C.
                                 // J is floored in the F-update, so the unclamped Tait
@@ -488,7 +581,7 @@ __global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total_nodes) return;
     const float mi = mass[i];
-    if (mi <= 0.0f) { velocity[i] = m::Vec3::Zero(); return; }
+    if (mi < kMinNodeMass) { velocity[i] = m::Vec3::Zero(); return; }
     m::Vec3 v = momentum[i] * (1.0f / mi) + gravity * dt;  // symplectic Euler kick.
     // Static-plane BC: a node at/below the plane gets a no-penetration normal cut +
     // Coulomb friction on the tangential component against the removed normal impulse.
@@ -574,7 +667,7 @@ __global__ void MpmGridBodyProjectKernel(
     body_dp[i] = m::Vec3::Zero();
     body_owner[i] = ~0u;
     const float mi = mass[i];
-    if (mi <= 0.0f) return;
+    if (mi < kMinNodeMass) return;
     const uint32_t env = i / nodes_per_env;
     const uint32_t local = i % nodes_per_env;
     const int32_t nx = static_cast<int32_t>(local % dims_x);
@@ -832,7 +925,8 @@ __global__ void MpmG2PGatherKernel(uint32_t particle_count,
 }
 
 // --- F-update: elastic F^{n+1} = (I + dt*C) F^n; fluid (kind 3) tracks volume off the
-// divergence J *= (1 + dt*tr C), keeping F = cbrt(J)*I (no shear-driven inversion).
+// divergence J *= (1 + dt*tr C), keeping F = cbrt(J)*I (no shear-driven inversion);
+// granular (kind 4) predicts the elastic F then Drucker-Prager return-maps it (plastic).
 __global__ void MpmUpdateFKernel(uint32_t particle_count, float dt,
                                  const float* __restrict__ part_C,
                                  const uint32_t* __restrict__ part_mat,
@@ -844,13 +938,26 @@ __global__ void MpmUpdateFKernel(uint32_t particle_count, float dt,
     if (p >= particle_count) return;
     const float* C = part_C + static_cast<size_t>(p) * 9u;
     float* F = part_F + static_cast<size_t>(p) * 9u;
-    float kind = 0.0f;
+    float kind = 0.0f, youngs = 0.0f, poisson = 0.0f, dpf = 0.0f, dpc = 0.0f;
     if (part_mat != nullptr && material_table != nullptr) {
         const uint32_t mid = part_mat[p];
-        if (mid < material_count) kind = material_table[static_cast<size_t>(mid) *
-                                                        kMpmMatStride + 5u];
+        if (mid < material_count) {
+            const float* mr = material_table + static_cast<size_t>(mid) * kMpmMatStride;
+            youngs = mr[0]; poisson = mr[1]; dpf = mr[3]; dpc = mr[4]; kind = mr[5];
+        }
     }
-    if (kind > 2.5f) {  // fluid: volume-only update J *= (1 + dt*tr C), F = cbrt(J)*I.
+    if (kind > 3.5f) {  // granular: elastic predictor then Drucker-Prager return map.
+        float IpdtC[9];
+        for (int k = 0; k < 9; ++k) IpdtC[k] = dt * C[k];
+        IpdtC[0] += 1.0f; IpdtC[4] += 1.0f; IpdtC[8] += 1.0f;
+        float Fn[9];
+        for (int k = 0; k < 9; ++k) Fn[k] = F[k];
+        Mat3Mul(IpdtC, Fn, F);  // trial elastic F = (I + dt*C) * F^n.
+        const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
+        const float mu = youngs / (2.0f * (1.0f + poisson));
+        const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
+        SandReturnMap(F, mu, lambda, dpf, dpc);
+    } else if (kind > 2.5f) {  // fluid: volume-only update J *= (1 + dt*tr C), F = cbrt(J)*I.
         // Shear leaves a fluid's volume unchanged, so track J off the divergence tr(C);
         // no det of the full affine map => no shear-driven inversion at a hard impact.
         const float Jraw = Mat3Det(F) * (1.0f + dt * (C[0] + C[4] + C[8]));

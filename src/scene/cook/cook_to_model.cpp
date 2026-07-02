@@ -1467,12 +1467,27 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
                                         m.method == Method::MlsMpm; break;
             case Kind::Fluid:   legal = m.method == Method::Pbf ||
                                         m.method == Method::MlsMpm; break;
+            case Kind::Granular: legal = m.method == Method::MlsMpm; break;
         }
         if (!legal) {
             throw std::runtime_error(
                 "ValidateMedia: illegal medium (kind x method) -- cloth must solve "
                 "with XPBD, a tet-soft body with XPBD or MLS-MPM, a fluid with PBF or "
-                "MLS-MPM");
+                "MLS-MPM, a granular bed with MLS-MPM only");
+        }
+        // model_kind 4 (Drucker-Prager) and Kind::Granular imply each other: no
+        // sand-tagged fluid/soft body and no granular bed cooking as another model.
+        const float mk = m.mpm.model_kind;
+        const bool dp_kind = mk > 3.5f && mk < 4.5f;
+        if (dp_kind && m.kind != Kind::Granular) {
+            throw std::runtime_error(
+                "ValidateMedia: mpm model_kind 4 (Drucker-Prager) requires a "
+                "Granular medium");
+        }
+        if (m.kind == Kind::Granular && mk != 0.0f && !dp_kind) {
+            throw std::runtime_error(
+                "ValidateMedia: a Granular medium is Drucker-Prager (mpm model_kind "
+                "4 or unset); it cannot declare another constitutive");
         }
         if (m.method == Method::MlsMpm) ++n_mpm; else ++n_non_mpm;
         if (m.kind == Kind::Fluid && m.method == Method::Pbf) ++n_pbf_fluid;
@@ -1758,8 +1773,19 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     std::vector<MediaRenderSurface> surfaces;
     if (media.empty()) return surfaces;
     // A lone MLS-MPM medium is its own ParticleMode (a dense sample, not the lattice
-    // vertices), so no boundary-triangle surface indexes its cooked particle set.
+    // vertices), so no boundary-triangle surface indexes its cooked particle set; it
+    // renders as instanced particle spheres over the whole field instead.
     if (media.size() == 1u && media.front().method == MediaRecord::Method::MlsMpm) {
+        const MediaRecord& m = media.front();
+        float sp = 0.0f;
+        if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
+        else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
+        if (sp > 0.0f) {
+            MediaRenderSurface s;
+            s.particle_radius = 0.5f * sp;  // half the sampling lattice spacing.
+            s.render_material_id = m.render_material_id;
+            surfaces.push_back(std::move(s));
+        }
         return surfaces;
     }
     // Cloth + soft-tet concatenate into the soft slice in media order; track the
@@ -1793,6 +1819,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             s.normal_offset = m.render_skin.normal_offset;
             s.smooth_iters = m.render_skin.smooth_iters;
             s.smooth_lambda = m.render_skin.smooth_lambda;
+            s.render_material_id = m.render_material_id;
             surfaces.push_back(std::move(s));
         }
         base += verts;
@@ -1954,7 +1981,10 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     math::Vec3 lo{0.0f, 0.0f, 0.0f}, hi{0.0f, 0.0f, 0.0f};  // geometry AABB.
     float vol0 = 0.0f;                                       // per-particle sampling volume.
 
-    if (media.kind == MediaRecord::Kind::Fluid) {
+    if (media.kind == MediaRecord::Kind::Fluid ||
+        media.kind == MediaRecord::Kind::Granular) {
+        // A granular bed samples the SAME box lattice as a fluid; only the
+        // constitutive (model_kind 4, Drucker-Prager) differs.
         const MediaRecord::FluidBox& b = media.fluid_box;
         if (b.spacing > 0.0f && b.max.x > b.min.x && b.max.y > b.min.y &&
             b.max.z > b.min.z) {
@@ -1989,7 +2019,10 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     in.material.density = density;
     in.material.dp_friction = mp.dp_friction;
     in.material.dp_cohesion = mp.dp_cohesion;
-    in.material.model_kind = mp.model_kind;
+    // A Granular medium IS the Drucker-Prager constitutive; pin model_kind so an
+    // unset/default material field cannot silently cook a granular bed as elastic.
+    in.material.model_kind =
+        media.kind == MediaRecord::Kind::Granular ? 4.0f : mp.model_kind;
     in.material.bulk_modulus = mp.bulk_modulus;
     in.material.tait_gamma = mp.tait_gamma;
     in.material.viscosity = mp.viscosity;
@@ -2027,7 +2060,7 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
         float sp = 0.0f;
         if (m.kind == MediaRecord::Kind::Cloth) sp = m.cloth_grid.spacing;
         else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
-        else if (m.kind == MediaRecord::Kind::Fluid) sp = m.fluid_box.spacing;
+        else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
         if (sp > 0.0f) d_min = (d_min > 0.0f) ? std::min(d_min, sp) : sp;
     }
     return d_min;

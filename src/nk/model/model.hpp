@@ -238,9 +238,10 @@ struct ModelMaterialBucket {
 struct MpmMaterial {
     static constexpr uint32_t kValueCount = 9u;  // f32 count of this POD (table stride).
     float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
+    // dp_friction = internal friction angle (deg); dp_cohesion = cohesion stress (Pa).
     float dp_friction = 0.0f, dp_cohesion = 0.0f;
     // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean,
-    // 3 = weakly-compressible fluid (Tait EOS).
+    // 3 = weakly-compressible fluid (Tait EOS), 4 = granular Drucker-Prager sand.
     float model_kind = 0.0f;
     float bulk_modulus = 0.0f, tait_gamma = 0.0f, viscosity = 0.0f;
 };
