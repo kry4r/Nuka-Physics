@@ -282,9 +282,9 @@ struct MediaMpmMaterial {
     float youngs       = 0.0f;
     float poisson      = 0.0f;
     float density      = 0.0f;
-    float dp_friction  = 0.0f;
-    float dp_cohesion  = 0.0f;
-    float model_kind   = 0.0f;   // 0 corotated, 2 neo-hookean, 3 weakly-compressible fluid
+    float dp_friction  = 0.0f;   // granular internal friction angle (deg).
+    float dp_cohesion  = 0.0f;   // granular cohesion stress (Pa; 0 = cohesionless).
+    float model_kind   = 0.0f;   // 0 corotated, 2 neo-hookean, 3 fluid, 4 granular DP
     float bulk_modulus = 0.0f;
     float tait_gamma   = 0.0f;
     float viscosity    = 0.0f;
@@ -311,7 +311,8 @@ struct MediaRecord {
     MediaId     id = kInvalidMedia;
 
     // WHAT it is (solver routing) and HOW it solves (one method per medium).
-    enum class Kind   : uint8_t { Cloth, SoftTet, Fluid };
+    // Granular is an MLS-MPM Drucker-Prager sand/gravel bed (box geometry, model_kind 4).
+    enum class Kind   : uint8_t { Cloth, SoftTet, Fluid, Granular };
     enum class Method : uint8_t { Xpbd, Pbf, MlsMpm };
     Kind   kind   = Kind::Cloth;
     Method method = Method::Xpbd;
@@ -330,6 +331,8 @@ struct MediaRecord {
         uint32_t   cells = 0u;
         float      cell_len = 0.0f;
     };
+    // A box of particles sampled on a uniform lattice; the geometry for a Fluid
+    // (PBF/MPM) and a Granular (MPM sand/gravel) medium alike.
     struct FluidBox {
         math::Vec3 min{0.0f, 0.0f, 0.0f};
         math::Vec3 max{0.0f, 0.0f, 0.0f};

@@ -8,7 +8,8 @@ routes by the authored entity set:
 
 * a scene of exactly one ``NKS`` + (optionally) one cloth ``Grid`` and nothing
   else takes the ``create_coupled_from_scene`` fast path;
-* any scene that adds a ``TetSphere`` / ``FluidBox`` medium or a rigid primitive
+* any scene that adds a ``TetSphere`` / ``FluidBox`` / ``GranularBed`` medium or
+  a rigid primitive
   (``Box`` / ``Sphere`` / ``Capsule`` / ``Plane`` / ``Ground``) builds through
   ``nuka.SceneBuilder`` (base = the ``NKS`` path if present, else empty), one
   ``add_rigid_primitive`` / ``add_media`` per entity, then ``build``.
@@ -33,14 +34,15 @@ from . import surfaces as _surfaces
 # String token -> binding constant (the assembler is the only place the builder
 # codes are resolved; the param bags stay binding-free).
 _MEDIA_KIND = {"cloth": _nuka.MEDIA_CLOTH, "soft_tet": _nuka.MEDIA_SOFT_TET,
-               "fluid": _nuka.MEDIA_FLUID}
+               "fluid": _nuka.MEDIA_FLUID, "granular": _nuka.MEDIA_GRANULAR}
 _MEDIA_METHOD = {"xpbd": _nuka.MEDIA_METHOD_XPBD, "pbf": _nuka.MEDIA_METHOD_PBF,
                  "mlsmpm": _nuka.MEDIA_METHOD_MLSMPM}
 _PRIMITIVE = {"plane": _nuka.PRIMITIVE_PLANE, "box": _nuka.PRIMITIVE_BOX,
               "sphere": _nuka.PRIMITIVE_SPHERE, "capsule": _nuka.PRIMITIVE_CAPSULE}
 _DEFAULT_MEDIA_MATERIAL = {"cloth": _materials.Cloth.XPBD,
                            "soft_tet": _materials.Soft.XPBD,
-                           "fluid": _materials.Fluid.PBF}
+                           "fluid": _materials.Fluid.PBF,
+                           "granular": _materials.Granular.MPM}
 
 
 @_dc.dataclass
@@ -85,7 +87,8 @@ class _Entity:
     contact_radius: Optional[float] = None
 
 
-_MEDIA_MORPHS = (_morphs.Grid, _morphs.TetSphere, _morphs.FluidBox)
+_MEDIA_MORPHS = (_morphs.Grid, _morphs.TetSphere, _morphs.FluidBox,
+                 _morphs.GranularBed)
 _RIGID_MORPHS = (_morphs.Box, _morphs.Sphere, _morphs.Capsule, _morphs.Plane,
                  _morphs.Ground)
 
@@ -117,6 +120,8 @@ class Scene:
         grids = [e for e in self._entities if isinstance(e.morph, _morphs.Grid)]
         tets = [e for e in self._entities if isinstance(e.morph, _morphs.TetSphere)]
         fluids = [e for e in self._entities if isinstance(e.morph, _morphs.FluidBox)]
+        grans = [e for e in self._entities
+                 if isinstance(e.morph, _morphs.GranularBed)]
         rigids = [e for e in self._entities
                   if isinstance(e.morph, _RIGID_MORPHS)]
         unknown = [e for e in self._entities
@@ -126,9 +131,11 @@ class Scene:
             raise TypeError(
                 "Scene.build: unsupported morph "
                 f"{type(unknown[0].morph).__name__} (use morphs.NKS / Grid / "
-                "TetSphere / FluidBox / Box / Sphere / Capsule / Plane / Ground)")
-        if tets or fluids or rigids:
-            return self._build_general(device, scenes, grids, tets, fluids, rigids)
+                "TetSphere / FluidBox / GranularBed / Box / Sphere / Capsule / "
+                "Plane / Ground)")
+        if tets or fluids or grans or rigids:
+            return self._build_general(device, scenes, grids, tets, fluids + grans,
+                                       rigids)
         return self._build_coupled(device, scenes, grids)
 
     # -- the cloth fast path (one NKS + optional one cloth Grid) --------------
@@ -257,6 +264,10 @@ class Scene:
         kw.update(mat.media_material_kwargs())
         surf = e.surface
         if surf is not None:
+            if kind == "granular":
+                raise TypeError(
+                    "Scene.build: a granular medium renders as particles and "
+                    "takes no surface")
             ok = (isinstance(surf, _surfaces.ClothSurface) if kind == "cloth"
                   else isinstance(surf, _surfaces.SoftSurface))
             if not ok:

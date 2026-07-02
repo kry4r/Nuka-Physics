@@ -188,13 +188,15 @@ typedef struct nuka_rigid_primitive_desc_t {
 
 // What a medium IS (solver routing) and HOW it solves (one method per medium).
 // The legal (kind x method) set is enforced by the SAME cook validator: cloth =
-// XPBD; soft-tet = XPBD or MLS-MPM; fluid = PBF or MLS-MPM. An illegal pair is
+// XPBD; soft-tet = XPBD or MLS-MPM; fluid = PBF or MLS-MPM; granular = MLS-MPM
+// only (Drucker-Prager). An illegal pair is
 // rejected LOUDLY (INVALID_ARG) at nuka_scene_add_media; an MPM + XPBD/PBF mix is
 // rejected at cook (nuka_world_create_from_built_scene).
 typedef enum nuka_media_kind_t {
     NUKA_MEDIA_CLOTH    = 0,
     NUKA_MEDIA_SOFT_TET = 1,
-    NUKA_MEDIA_FLUID    = 2
+    NUKA_MEDIA_FLUID    = 2,
+    NUKA_MEDIA_GRANULAR = 3   /* Drucker-Prager sand/gravel bed (MLS-MPM only). */
 } nuka_media_kind_t;
 
 typedef enum nuka_media_method_t {
@@ -224,7 +226,7 @@ typedef struct nuka_media_desc_t {
     float    tet_radius;
     uint32_t tet_cells;
     float    tet_cell_len;
-    // FLUID: an AABB box [fluid_min, fluid_max] sampled at fluid_spacing.
+    // FLUID / GRANULAR: an AABB box [fluid_min, fluid_max] sampled at fluid_spacing.
     float    fluid_min[3];
     float    fluid_max[3];
     float    fluid_spacing;
@@ -252,7 +254,8 @@ typedef struct nuka_media_desc_t {
     float    pbf_walls_max[3];
     float    pbf_floor_z;
     uint32_t pbf_boundary_layers;
-    // MLS-MPM (soft-tet / fluid). model_kind 0 corotated, 2 neo-hookean, 3 fluid.
+    // MLS-MPM (soft-tet / fluid / granular). model_kind 0 corotated, 2 neo-hookean,
+    // 3 fluid, 4 granular Drucker-Prager (dp_friction deg, dp_cohesion Pa).
     float    mpm_youngs;
     float    mpm_poisson;
     float    mpm_density;

@@ -92,6 +92,7 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
         case NUKA_MEDIA_CLOTH:    m.kind = Kind::Cloth; break;
         case NUKA_MEDIA_SOFT_TET: m.kind = Kind::SoftTet; break;
         case NUKA_MEDIA_FLUID:    m.kind = Kind::Fluid; break;
+        case NUKA_MEDIA_GRANULAR: m.kind = Kind::Granular; break;
         default: return false;
     }
     switch (d.method) {
