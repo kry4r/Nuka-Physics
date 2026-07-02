@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -89,13 +90,17 @@ cook::MpmCookInput BuildConeInput(float friction_deg, float model_kind) {
     cook::MpmCookInput in;
     const float pdx = kDx * 0.5f;
     const float H = kConeR * std::tan(kConeSlope * static_cast<float>(M_PI) / 180.0f);
-    for (float z = pdx; z <= H + 1e-5f; z += pdx) {
-        const float rz = kConeR * (1.0f - z / H);
+    const char* shape = std::getenv("NUKA_CONE_SHAPE");
+    const bool cyl = shape != nullptr && shape[0] == 'c' && shape[1] == 'y';
+    const bool disc = shape != nullptr && shape[0] == 'd';
+    const float top = disc ? 0.02f : H;
+    for (float z = pdx; z <= top + 1e-5f; z += pdx) {
+        const float rz = (cyl || disc) ? kConeR : kConeR * (1.0f - z / H);
         for (float x = -kConeR; x <= kConeR + 1e-5f; x += pdx)
             for (float y = -kConeR; y <= kConeR + 1e-5f; y += pdx)
                 if (x * x + y * y <= rz * rz) in.positions.push_back(Vec3{x, y, z});
     }
-    FillMaterialAndGrid(in, friction_deg, model_kind, H);
+    FillMaterialAndGrid(in, friction_deg, model_kind, top);
     return in;
 }
 
@@ -533,6 +538,98 @@ TEST(MpmGranular, CollapseByteIdenticalRunToRun) {
         << "granular particle positions differ run-to-run";
     EXPECT_EQ(0, std::memcmp(fa.data(), fb.data(), fa.size() * sizeof(float)))
         << "granular particle F differs run-to-run";
+}
+
+// Manual diagnostic: step one cone (env NUKA_CONE_KIND / NUKA_CONE_FRICTION)
+// and report the first non-finite step, the max speed, and the escape bit.
+TEST(MpmGranular, DISABLED_ConeProbe) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    Backend b = GetBackend();
+    const char* ek = std::getenv("NUKA_CONE_KIND");
+    const char* ef = std::getenv("NUKA_CONE_FRICTION");
+    const float kind = ek ? std::strtof(ek, nullptr) : 4.0f;
+    const float fric = ef ? std::strtof(ef, nullptr) : 35.0f;
+    cook::MpmCookInput ci = BuildConeInput(fric, kind);
+    const char* ed = std::getenv("NUKA_CONE_DTDIV");   // substep-granular forensics.
+    const uint32_t dtdiv = ed ? static_cast<uint32_t>(std::atoi(ed)) : 0u;
+    if (dtdiv > 0u) ci.substeps = 1u;
+    std::fprintf(stderr, "[cone probe] cook n=%zu p705=(%g %g %g) inv_mass705=%g "
+                 "vol0_705=%g\n", ci.positions.size(),
+                 ci.positions.size() > 705 ? ci.positions[705].x : -1.0f,
+                 ci.positions.size() > 705 ? ci.positions[705].y : -1.0f,
+                 ci.positions.size() > 705 ? ci.positions[705].z : -1.0f,
+                 ci.inv_mass.size() > 705 ? ci.inv_mass[705] : -1.0f,
+                 ci.vol0.size() > 705 ? ci.vol0[705] : -1.0f);
+    nk::Model m = BuildPileModel(std::move(ci));
+    const uint32_t P = m.capacities.particles_per_env;
+    std::vector<float> F0(static_cast<size_t>(P) * 9u, 0.0f);
+    nk::Pipeline::SolverConfig cfg = Cfg();
+    if (dtdiv > 0u) cfg.dt /= static_cast<float>(dtdiv);
+    nk::World w(std::move(m), 1u, b.dev, b.backend, cfg);
+    ASSERT_TRUE(w.Ready());
+    std::vector<Vec3> pos(P), vel(P);
+    w.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(), P * sizeof(Vec3));
+    w.GetData().DownloadField(nk::FieldId::ParticleF, F0.data(),
+                              F0.size() * sizeof(float));
+    std::fprintf(stderr, "[cone probe] pre pos705=(%g %g %g) F705=[%g %g %g %g %g %g "
+                 "%g %g %g]\n", pos[705].x, pos[705].y, pos[705].z, F0[705*9+0],
+                 F0[705*9+1], F0[705*9+2], F0[705*9+3], F0[705*9+4], F0[705*9+5],
+                 F0[705*9+6], F0[705*9+7], F0[705*9+8]);
+    for (uint32_t i = 0; i < P; ++i)
+        if (!std::isfinite(pos[i].x) || !std::isfinite(pos[i].y) ||
+            !std::isfinite(pos[i].z))
+            std::fprintf(stderr, "[cone probe] PRE-STEP nonfinite i=%u (%g %g %g)\n",
+                         i, pos[i].x, pos[i].y, pos[i].z);
+    const uint32_t watch = [] {
+        const char* ew = std::getenv("NUKA_CONE_WATCH");
+        return ew ? static_cast<uint32_t>(std::atoi(ew)) : 705u;
+    }();
+    for (uint32_t s = 0; s < 600u; ++s) {
+        w.Step();
+        if (dtdiv > 0u) {
+            w.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(),
+                                      P * sizeof(Vec3));
+            w.GetData().DownloadField(nk::FieldId::ParticleVel, vel.data(),
+                                      P * sizeof(Vec3));
+            w.GetData().DownloadField(nk::FieldId::ParticleF, F0.data(),
+                                      F0.size() * sizeof(float));
+            const float* Fw = F0.data() + static_cast<size_t>(watch) * 9u;
+            std::fprintf(stderr, "[sub %u] p=(%.6g %.6g %.6g) v=(%.4g %.4g %.4g) "
+                         "F=[%.4g %.4g %.4g; %.4g %.4g %.4g; %.4g %.4g %.4g]\n",
+                         s, pos[watch].x, pos[watch].y, pos[watch].z, vel[watch].x,
+                         vel[watch].y, vel[watch].z, Fw[0], Fw[1], Fw[2], Fw[3],
+                         Fw[4], Fw[5], Fw[6], Fw[7], Fw[8]);
+            if (!std::isfinite(pos[watch].z) || !std::isfinite(vel[watch].z) ||
+                s > 60u) break;
+            continue;
+        }
+        if (s % 10u != 0u && s != 599u) continue;
+        w.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(), P * sizeof(Vec3));
+        w.GetData().DownloadField(nk::FieldId::ParticleVel, vel.data(), P * sizeof(Vec3));
+        uint32_t es = 0u;
+        w.GetData().DownloadField(nk::FieldId::EnvStatus, &es, sizeof(uint32_t));
+        float vmax = 0.0f, zmax = -1e9f;
+        bool fin = true;
+        for (uint32_t i = 0; i < P; ++i) {
+            fin = fin && std::isfinite(pos[i].x) && std::isfinite(pos[i].z) &&
+                  std::isfinite(vel[i].z);
+            vmax = std::max(vmax, std::sqrt(vel[i].LengthSq()));
+            zmax = std::max(zmax, pos[i].z);
+        }
+        std::fprintf(stderr, "[cone probe] step=%u P=%u vmax=%.3f zmax=%.4f "
+                     "status=0x%x finite=%d\n", s, P, vmax, zmax, es, fin ? 1 : 0);
+        if (!fin) {
+            for (uint32_t i = 0; i < P; ++i)
+                if (!std::isfinite(pos[i].z) || !std::isfinite(pos[i].x)) {
+                    std::fprintf(stderr, "[cone probe] first bad i=%u pos=(%g %g %g) "
+                                 "vel=(%g %g %g)\n", i, pos[i].x, pos[i].y, pos[i].z,
+                                 vel[i].x, vel[i].y, vel[i].z);
+                    break;
+                }
+            break;
+        }
+    }
+    SUCCEED();
 }
 
 // Throughput probe (manual; run with --gtest_also_run_disabled_tests). ~200k
