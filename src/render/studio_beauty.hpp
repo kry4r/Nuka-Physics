@@ -47,9 +47,21 @@ struct StudioScene {
         std::size_t instance = ~std::size_t(0);      // its RenderInstance index.
     };
 
+    // A surface-less particle medium's render skin: every particle in [first,
+    // first+count) (count 0 = the whole field) bakes into ONE instanced-sphere
+    // mesh rebuilt each frame (granular grains; also an MPM-fluid debug view).
+    struct ParticleSkin {
+        float       radius = 0.0f;
+        uint32_t    material_id = kNoId;         // resolved render material slot.
+        uint32_t    first = 0u, count = 0u;
+        uint32_t    mesh_id = kNoId;
+        std::size_t instance = ~std::size_t(0);
+    };
+
     RenderWorld world;
     RasterOptions options;  // studio lighting/sky/floor; the caller sets camera_* each frame.
     std::vector<DeformingSurface> surfaces;      // one per cooked particle medium (empty => none).
+    std::vector<ParticleSkin> particle_skins;    // instanced-sphere media (empty => none).
     std::vector<uint32_t> link_of_instance;      // per link-posed instance -> link index.
     std::vector<math::Transform> visual_local;   // per link-posed instance -> physics->visual offset.
     uint32_t link_instance_count = 0u;           // [0, link_instance_count) follow a link pose.
@@ -70,9 +82,22 @@ StudioScene BuildStudioScene(const scene::Registry& registry,
                              const runtime::soft::SurfaceTopology& surface_topology,
                              uint32_t width, uint32_t height);
 
+// Bind medium `surface_index`'s authored scene render material (a Registry material
+// id) over the studio default. Call after BuildStudioScene, before the first Publish.
+void SetStudioSurfaceMaterial(StudioScene& scene, const scene::Registry& registry,
+                              std::size_t surface_index, uint32_t scene_material_id);
+
+// Register a per-particle instanced-sphere skin (a surface-less particle medium).
+// `scene_material_id` kNoId/invalid falls back to a neutral granular material;
+// `count` 0 covers the whole particle field.
+void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
+                           uint32_t scene_material_id, float radius,
+                           uint32_t first, uint32_t count);
+
 // Refresh per-frame: each link-posed instance's world_xform = link_pose[link] o
 // visual_local; every particle surface is rebuilt from `particle_pos` in place (the
-// stable per-surface mesh, so the mesh table never grows across frames).
+// stable per-surface mesh, so the mesh table never grows across frames); every
+// particle skin re-bakes its instanced-sphere mesh from the live positions.
 void PublishStudioScene(StudioScene& scene,
                         const std::vector<math::Transform>& link_pose,
                         const std::vector<math::Vec3>& particle_pos);
