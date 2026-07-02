@@ -172,6 +172,54 @@ TEST(TeleopMapping, CommandReachesController) {
     EXPECT_FLOAT_EQ(ctrl.cmd[1], 0.0f);
 }
 
+// THE zero-command contract: a gated tick yields the ZERO command and the viewer
+// still SENDS it, so a robot walking on a held key stops the frame the gate takes
+// the keyboard instead of latching the last command.
+TEST(TeleopMapping, GatedTickSendsZeroCommandEveryFrame) {
+    viewer::ViewerUiState ui = MakeUi(0);
+    ui.teleop_lin = 1.5f;
+    RecordingController ctrl;
+
+    // Frame 1: enabled + W held -> the robot walks.
+    viewer::TeleopKeys fwd; fwd.fwd = true;
+    viewer::TeleopResult r = viewer::ApplyTeleop(true, fwd, ui, 0);
+    ctrl.SetCommandVector(r.command, 3);
+    ASSERT_FLOAT_EQ(ctrl.cmd[0], 1.5f);
+
+    // Frame 2: the gate takes the keyboard (W release will never arrive). The
+    // producer must still send, and what it sends must be ZERO.
+    r = viewer::ApplyTeleop(/*enabled=*/false, fwd, ui, 0);
+    EXPECT_FALSE(r.command_active);
+    EXPECT_FLOAT_EQ(r.command[0], 0.0f);
+    EXPECT_FLOAT_EQ(r.command[1], 0.0f);
+    EXPECT_FLOAT_EQ(r.command[2], 0.0f);
+    ctrl.SetCommandVector(r.command, 3);
+    EXPECT_EQ(ctrl.calls, 2);
+    EXPECT_FLOAT_EQ(ctrl.cmd[0], 0.0f) << "robot must stop, not keep the last command";
+}
+
+// The persistent baseline (--teleop-cmd / a script): with no keys the command IS
+// the baseline; keys add on top; a gated tick is still the zero command.
+TEST(TeleopMapping, BaselineCommandPersistsAndKeysAdd) {
+    viewer::ViewerUiState ui = MakeUi(0);
+    ui.teleop_lin = 1.0f;
+    ui.teleop_cmd_base[0] = 0.6f;
+    ui.teleop_cmd_base[2] = -0.2f;
+
+    viewer::TeleopKeys none;
+    viewer::TeleopResult r = viewer::ApplyTeleop(true, none, ui, 0);
+    EXPECT_FLOAT_EQ(r.command[0], 0.6f) << "baseline must persist with no keys";
+    EXPECT_FLOAT_EQ(r.command[2], -0.2f);
+    EXPECT_TRUE(r.command_active);
+
+    viewer::TeleopKeys fwd; fwd.fwd = true;
+    r = viewer::ApplyTeleop(true, fwd, ui, 0);
+    EXPECT_FLOAT_EQ(r.command[0], 1.6f) << "keys add on top of the baseline";
+
+    r = viewer::ApplyTeleop(/*enabled=*/false, fwd, ui, 0);
+    EXPECT_FLOAT_EQ(r.command[0], 0.0f) << "a gated tick is the zero command";
+}
+
 // The default SceneController ignores commands (no command sink) -- the general base
 // safely no-ops so a teleop producer never assumes a consumer.
 TEST(TeleopMapping, DefaultControllerHasNoCommandSink) {

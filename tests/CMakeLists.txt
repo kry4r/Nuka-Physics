@@ -529,6 +529,39 @@ gtest_discover_tests(nuka_editor_spawn_roundtrip_test
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "full")
 
+# Editor delete-preservation gate: SceneIR::RemoveBodySubtree keeps every
+# unrelated record (joints/actuators/sensors/pairs/ICs) with exact remaps (pure
+# host), and the live spawn->delete->re-cook->Save round-trip on go2 preserves
+# joints + scripts + excludes byte-identically. Also pins the /script node
+# delete, the reparent-onto-a-shape guard, and the transactional re-cook.
+add_executable(nuka_editor_delete_preserve_test
+    scenario/editor_delete_preserve.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_edits.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
+)
+add_dependencies(nuka_editor_delete_preserve_test nuka_codegen)
+target_include_directories(nuka_editor_delete_preserve_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_editor_delete_preserve_test
+    PRIVATE
+        nuka_app
+        nuka_scene_cook
+        nuka_render
+        nuka_nk
+        nuka_phi2
+        nuka_runtime
+        nuka_import
+        nuka_cooker
+        nuka_articulation_gpu
+        nuka_collision_gpu
+        nuka_core
+        nuka_phi
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_editor_delete_preserve_test
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES LABELS "full")
+
 # Editor true-physics-Reset round-trip gate: cook a real EditorScene (articulation +
 # the soft / cloth / fluid demo media), evolve it, fire ResetEditorScenePhysics, and
 # assert the authored qpos / root / particle state returns with zeroed velocities and
