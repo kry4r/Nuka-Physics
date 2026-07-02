@@ -53,7 +53,7 @@ struct Material {
 struct Texture {
     uint32_t width = 0u;
     uint32_t height = 0u;
-    uint32_t channels = 0u;   // 1 (grey), 3 (rgb) or 4 (rgba)
+    uint32_t channels = 0u;   // 1/2 (grey; ch0 replicated), 3 (rgb) or 4 (rgba)
     uint32_t srgb = 0u;       // 1 => decode sRGB->linear on sample
     std::vector<float> texels;
     bool Empty() const { return width == 0u || height == 0u || texels.empty(); }
