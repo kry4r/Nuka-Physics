@@ -304,66 +304,22 @@ std::string AddBoxChild(EditorScene& es, const std::string& parent_path) {
 std::string DeleteSubtree(EditorScene& es, const std::string& path) {
     const auto node = es.scene.Tree().NodeOf(path);
     if (!node) return "";
-    const scene::BodyId root = BodyOfEntity(es.scene, node->entity);
-    if (root == scene::kInvalidBody) return "";  // only body subtrees delete
+    const std::string parent_path =
+        node->parent.lock() ? es.scene.Tree().PathOf(node->parent.lock()) : std::string();
 
-    // The deleted set: the root body + every transitive child (parent_id chain).
-    std::vector<bool> del(es.scene.RigidBodyCount(), false);
-    del[root] = true;
-    for (bool more = true; more;) {
-        more = false;
-        for (scene::BodyId i = 0; i < es.scene.RigidBodyCount(); ++i) {
-            const scene::BodyId p = es.scene.GetBody(i).parent_id;
-            if (!del[i] && p != scene::kInvalidBody && p < del.size() && del[p]) {
-                del[i] = true;
-                more = true;
-            }
+    // A /script node deletes as its one record (never cooked -> no physics change).
+    for (size_t i = 0; i < es.scene.ScriptCount(); ++i) {
+        const auto sid = static_cast<scene::ScriptId>(i);
+        if (es.scene.EntityOfScript(sid) == node->entity) {
+            return es.scene.RemoveScript(sid) ? parent_path : "";
         }
     }
 
-    // Articulated removal (joints / sensors / settled IC referencing the subtree)
-    // needs a reviewed cross-table remap; decline rather than risk a silent miswire.
-    for (size_t j = 0; j < es.scene.JointCount(); ++j) {
-        const scene::JointRecord& jr = es.scene.GetJoint(static_cast<scene::JointId>(j));
-        if ((jr.parent_body != scene::kInvalidBody && jr.parent_body < del.size() &&
-             del[jr.parent_body]) ||
-            (jr.child_body != scene::kInvalidBody && jr.child_body < del.size() &&
-             del[jr.child_body]))
-            return "";
-    }
-    if (!es.scene.InitialState().empty()) return "";
-
-    // Rebuild the authority without the deleted bodies / their shapes: replay kept
-    // bodies in id order (parents first) with an old->new remap; metadata verbatim.
-    const std::string parent_path =
-        node->parent.lock() ? es.scene.Tree().PathOf(node->parent.lock()) : std::string();
-    scene::SceneIR out;
-    std::vector<scene::BodyId> remap(es.scene.RigidBodyCount(), scene::kInvalidBody);
-    for (scene::BodyId i = 0; i < es.scene.RigidBodyCount(); ++i) {
-        if (del[i]) continue;
-        scene::RigidBodyRecord b = es.scene.GetBody(i);
-        if (b.parent_id != scene::kInvalidBody) b.parent_id = remap[b.parent_id];
-        b.id = scene::kInvalidBody;  // AddRigidBody assigns the dense id
-        remap[i] = out.AddRigidBody(b);
-    }
-    for (size_t i = 0; i < es.scene.MaterialCount(); ++i)
-        out.AddMaterial(es.scene.GetMaterial(static_cast<scene::MaterialId>(i)));
-    for (scene::ShapeId i = 0; i < es.scene.ShapeCount(); ++i) {
-        scene::CollisionShapeRecord s = es.scene.GetShape(i);
-        if (s.body_id != scene::kInvalidBody && s.body_id < del.size() && del[s.body_id])
-            continue;
-        if (s.body_id != scene::kInvalidBody) s.body_id = remap[s.body_id];
-        s.id = 0;
-        out.AddCollisionShape(s);
-    }
-    for (size_t i = 0; i < es.scene.MediaCount(); ++i)
-        out.AddMedia(es.scene.GetMedia(static_cast<scene::MediaId>(i)));
-    for (size_t i = 0; i < es.scene.TerrainCount(); ++i)
-        out.AddTerrain(es.scene.GetTerrain(static_cast<scene::TerrainId>(i)));
-    out.SettleMut() = es.scene.Settle();
-
-    es.scene = std::move(out);
-    return parent_path;
+    // A body subtree deletes through the ONE general SceneIR remover: joints /
+    // actuators / sensors / pairs / touched ICs go with it, everything else persists.
+    const scene::BodyId root = BodyOfEntity(es.scene, node->entity);
+    if (root == scene::kInvalidBody) return "";
+    return es.scene.RemoveBodySubtree(root) ? parent_path : "";
 }
 
 std::string ReparentNode(EditorScene& es, const std::string& path,
@@ -389,7 +345,20 @@ std::string ReparentNode(EditorScene& es, const std::string& path,
         if (!pnode) return "";
         new_parent = BodyOfEntity(es.scene, pnode->entity);
         if (new_parent == b) return "";  // no self-parenting
-        if (new_parent == scene::kInvalidBody) group_prefix = new_parent_path;
+        // Only a body or a PURE group can adopt: a shape/media/script node's name
+        // as a group prefix would mint a same-named phantom group. Decline.
+        if (new_parent == scene::kInvalidBody) {
+            const scene::EntityId pe = pnode->entity;
+            for (scene::ShapeId i = 0; i < es.scene.ShapeCount(); ++i)
+                if (es.scene.EntityOfShape(i) == pe) return "";
+            for (scene::MediaId i = 0; i < es.scene.MediaCount(); ++i)
+                if (es.scene.EntityOfMedia(i) == pe) return "";
+            for (size_t i = 0; i < es.scene.ScriptCount(); ++i)
+                if (es.scene.EntityOfScript(static_cast<scene::ScriptId>(i)) == pe) return "";
+            for (size_t i = 0; i < es.scene.JointCount(); ++i)
+                if (es.scene.EntityOfJoint(static_cast<scene::JointId>(i)) == pe) return "";
+            group_prefix = new_parent_path;
+        }
     }
 
     // Reject a cycle: the new parent must not be b or one of b's descendants.

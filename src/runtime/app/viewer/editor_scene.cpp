@@ -53,27 +53,30 @@ nk::Pipeline::SolverConfig DefaultCfg(float dt) {
 
 }  // namespace
 
-// Cook es.scene (the editable authority) into es.world / sim / caps / terrain. Used
-// by the initial load and by a re-cook after a structural tree edit. Tears the old
-// sim down before the world it references; the caller WaitIdle's first.
+// Cook es.scene (the editable authority) into es.world / sim / caps / terrain.
+// TRANSACTIONAL: the new World is built + Ready-checked FIRST; only then are the
+// old sim/world swapped out, so a failed cook leaves the editor steppable.
 bool CookSceneInto(EditorScene& es, nuka::phi::Device* device,
                    nuka::phi::Backend* backend, float dt) {
     if (!(dt > 1e-6f)) dt = 1.0f / 240.0f;
     nuka::scene::SceneIR light = LightCookCopy(es.scene);
-    // The full-scene orchestrator: rigid/articulation cook + the media-list cook that
-    // turns soft / cloth / fluid records into particles (a no-op for media-free
-    // scenes, so go2 / h1 cook byte-identically). The SAME path the C-ABI builder uses.
+    // The full-scene orchestrator (rigid/articulation + media cook) -- the SAME
+    // path the C-ABI builder uses; media-free scenes cook byte-identically.
     cook::CookToModelResult cooked = cook::CookSceneToModel(light, 1, {});
     render::RenderWorld render_world =
         render::BuildRenderWorld(light.Ecs(), cooked.scene_map);
 
-    es.sim.reset();    // references world + publisher; drop before the world
+    const nk::ModelCapacities caps = cooked.model.capacities;  // pre-move copy
+    nuka::terrain::HeightField terrain = std::move(cooked.terrain);
+    auto world = std::make_unique<nk::World>(std::move(cooked.model), 1u, device,
+                                             backend, DefaultCfg(dt));
+    if (!world || !world->Ready()) return false;  // old world/sim untouched
+
+    es.sim.reset();    // references the old world + publisher; drop before it
     es.world.reset();
-    es.caps = cooked.model.capacities;        // copy BEFORE the model is moved
-    es.terrain = std::move(cooked.terrain);   // retained for height-scan obs
-    es.world = std::make_unique<nk::World>(std::move(cooked.model), 1u, device,
-                                           backend, DefaultCfg(dt));
-    if (!es.world || !es.world->Ready()) return false;
+    es.caps = caps;
+    es.terrain = std::move(terrain);   // retained for height-scan obs
+    es.world = std::move(world);
     es.sim = std::make_unique<nuka::runtime::app::Simulation>(
         *es.world, es.publisher, std::move(render_world));
     return true;
@@ -118,8 +121,8 @@ std::unique_ptr<EditorScene> LoadEditorScene(const std::string& path,
 
 bool RecookEditorScene(EditorScene& es, nuka::phi::Device* device,
                        nuka::phi::Backend* backend, float dt) {
-    // Re-cook from the (mutated) authority. On failure es.world/sim are left reset;
-    // the caller surfaces it and leaves the editor without a steppable world.
+    // Re-cook from the (mutated) authority. On failure (throw or not-Ready) the
+    // OLD world/sim stay live; the caller surfaces the error and keeps stepping.
     try {
         return CookSceneInto(es, device, backend, dt);
     } catch (const std::exception& e) {

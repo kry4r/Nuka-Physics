@@ -107,17 +107,42 @@ EditOp MakeMaterialOp(EditorScene* es, std::string path,
 EditOp MakeStructuralOp(EditorScene* es, EntityRecordIndex* idx,
                         nuka::phi::Device* device, nuka::phi::Backend* backend,
                         float dt, scene::SceneIR before, scene::SceneIR after) {
-    // Restore a snapshot into the authority, re-cook the world from it, and rebuild
-    // the entity->record index (entity ids re-project, so the index is stale).
+    // Restore a snapshot into the authority + re-cook + rebuild the record index.
+    // A failed re-cook keeps the OLD world, so the authority rolls back with it.
     auto restore = [es, idx, device, backend, dt](const scene::SceneIR& snap) {
+        scene::SceneIR prior = es->scene;
         es->scene = snap;
-        if (!RecookEditorScene(*es, device, backend, dt))
-            std::fprintf(stderr, "[nuka_editor] undo re-cook failed\n");
+        if (!RecookEditorScene(*es, device, backend, dt)) {
+            es->scene = std::move(prior);
+            std::fprintf(stderr,
+                         "[nuka_editor] undo/redo re-cook failed; edit left in place\n");
+        }
         idx->Build(es->scene);
     };
     EditOp op;
     op.apply  = [restore, snap = std::move(after)]()  { restore(snap); };
     op.revert = [restore, snap = std::move(before)]() { restore(snap); };
+    return op;
+}
+
+EditOp MakeRenameOp(EditorScene* es, std::string path_before, std::string path_after) {
+    // Rename is NON-structural: names never reach the cooked model, so revert /
+    // redo re-apply the leaf through RenameNode with no re-cook.
+    const auto leaf = [](const std::string& p) {
+        const size_t s = p.rfind('/');
+        return (s == std::string::npos) ? p : p.substr(s + 1);
+    };
+    EditOp op;
+    op.apply = [es, path_before, path_after, leaf]() {
+        if (RenameNode(*es, path_before, leaf(path_after)).empty())
+            std::fprintf(stderr, "[nuka_editor] redo rename failed at '%s'\n",
+                         path_before.c_str());
+    };
+    op.revert = [es, path_before, path_after, leaf]() {
+        if (RenameNode(*es, path_after, leaf(path_before)).empty())
+            std::fprintf(stderr, "[nuka_editor] undo rename failed at '%s'\n",
+                         path_after.c_str());
+    };
     return op;
 }
 

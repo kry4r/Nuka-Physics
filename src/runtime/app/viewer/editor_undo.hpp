@@ -77,13 +77,18 @@ EditOp MakeMaterialOp(EditorScene* es, std::string path,
                       const nuka::scene::RenderMaterial& before,
                       const nuka::scene::RenderMaterial& after);
 
-// A structural edit (add / delete / rename / reparent): the simplest correct
-// general revert is a SceneIR snapshot. revert restores `before`, redo restores
-// `after`, each re-cooking the world (RecookEditorScene) + rebuilding `idx`. The
-// caller WaitIdle's before invoking undo/redo (the re-cook contract).
+// A structural edit (add / delete / reparent): the simplest correct general
+// revert is a SceneIR snapshot. revert restores `before`, redo restores `after`,
+// each re-cooking the world (RecookEditorScene) + rebuilding `idx`. The caller
+// WaitIdle's before invoking undo/redo (the re-cook contract).
 EditOp MakeStructuralOp(EditorScene* es, EntityRecordIndex* idx,
                         nuka::phi::Device* device, nuka::phi::Backend* backend,
                         float dt, nuka::scene::SceneIR before,
                         nuka::scene::SceneIR after);
+
+// A rename between tree paths: revert / redo re-apply the other path's leaf via
+// RenameNode. Non-structural -- no re-cook, so undo never resets physics.
+EditOp MakeRenameOp(EditorScene* es, std::string path_before,
+                    std::string path_after);
 
 }  // namespace nuka::runtime::app::viewer
