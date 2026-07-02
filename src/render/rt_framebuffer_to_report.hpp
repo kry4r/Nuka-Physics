@@ -22,8 +22,11 @@ namespace nuka::render {
 // `background` paints the pixels whose primary ray missed all geometry; those
 // pixels are NOT counted in non_background_pixel_count. The tonemap + sRGB
 // encode mirror the raster shader so the GPU-RT and lavapipe outputs read
-// consistently.
+// consistently. `keep_miss_color` true tonemaps the traced radiance for miss
+// pixels too (an HDR environment backdrop) instead of painting `background`;
+// false (default) is byte-identical to today.
 VulkanOffscreenReport FramebufferToReport(const rt::Framebuffer& frame,
-                                          VulkanRgba8 background);
+                                          VulkanRgba8 background,
+                                          bool keep_miss_color = false);
 
 }  // namespace nuka::render

@@ -109,7 +109,8 @@ struct ResolvedPose {
     std::shared_ptr<scene::SceneNode> physics_node; // the frame visual_local is relative to (may be null)
 };
 
-ResolvedPose ResolvePoseSource(const scene::SceneMap& map,
+ResolvedPose ResolvePoseSource(const scene::Registry& registry,
+                               const scene::SceneMap& map,
                                const std::shared_ptr<scene::SceneNode>& visual_node) {
     ResolvedPose out;
     // A link ancestor anywhere up the chain drives the pose; a body_row is only
@@ -132,10 +133,15 @@ ResolvedPose ResolvePoseSource(const scene::SceneMap& map,
             return out;
         }
         if (!have_body && ref->body_row != scene::SceneMap::kNoRow) {
-            body.kind = PoseSource::Kind::Body;
-            body.row  = ref->body_row;
-            body_node = n;
-            have_body = true;
+            // A STATIC body never moves: its visuals stay pinned at the bind pose
+            // (its BodyPose row is not integrated, so following it would misplace).
+            const auto* rb = registry.Get<scene::RigidBodyComponent>(n->entity);
+            if (rb == nullptr || !rb->kinematic) {
+                body.kind = PoseSource::Kind::Body;
+                body.row  = ref->body_row;
+                body_node = n;
+                have_body = true;
+            }
         }
     }
     if (have_body) {
@@ -328,6 +334,19 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
     // (a non-empty set suppresses them: a mesh's proxy is a redundant wrong-sized occluder).
     std::unordered_set<scene::EntityId, scene::EntityIdHash> has_visual_mesh;
 
+    // Bodies whose subtree carries ANY visual (mesh or primitive): their collision
+    // proxies are redundant coplanar occluders and are skipped per-body.
+    std::unordered_set<const scene::SceneNode*> body_has_visual;
+    auto nearest_body_node = [&](scene::EntityId e) -> const scene::SceneNode* {
+        for (auto n = registry.NodeOf(e); n; n = n->parent.lock()) {
+            if (n->entity != scene::kInvalidEntity &&
+                registry.Has<scene::RigidBodyComponent>(n->entity)) {
+                return n.get();
+            }
+        }
+        return nullptr;
+    };
+
     // -- emit one RenderInstance per renderable entity -----------------------
     auto build_common = [&](scene::EntityId e, uint32_t mesh_id, uint32_t material_id) {
         RenderInstance inst;
@@ -336,7 +355,7 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
         inst.render_material_id = material_id;
 
         const std::shared_ptr<scene::SceneNode> node = registry.NodeOf(e);
-        const ResolvedPose rp = ResolvePoseSource(map, node);
+        const ResolvedPose rp = ResolvePoseSource(registry, map, node);
         inst.pose_source = rp.source;
         // visual_local = transform from the physics frame down to the visual node
         // (Decision D1). With no physics ancestor, this collapses to identity and
@@ -390,6 +409,9 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                     default:
                         return;
                 }
+                if (const scene::SceneNode* b = nearest_body_node(e)) {
+                    body_has_visual.insert(b);
+                }
                 build_common(e, prim_mesh_id, resolve_material(vis.render_material_id));
                 return;
             }
@@ -403,6 +425,9 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                     file->LoadChunk(scene::NkaTagMesh(), vis.mesh.index)));
             });
             has_visual_mesh.insert(e);  // a real mesh loaded -> proxies now redundant
+            if (const scene::SceneNode* b = nearest_body_node(e)) {
+                body_has_visual.insert(b);
+            }
             build_common(e, mesh_id, resolve_material(vis.render_material_id));
         });
 
@@ -412,6 +437,13 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
     if (has_visual_mesh.empty())
     registry.ForEach<scene::CollisionShapeComponent>(
         [&](scene::EntityId e, const scene::CollisionShapeComponent& cs) {
+            // The shape's own body already shows a visual: its proxy would be a
+            // redundant coplanar occluder (z-fight with the authored appearance).
+            if (const scene::SceneNode* b = nearest_body_node(e)) {
+                if (body_has_visual.count(b) != 0u) {
+                    return;
+                }
+            }
             uint32_t mesh_id;
             switch (cs.kind) {
                 case CK::Box:
@@ -460,7 +492,7 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
             rc.near_clip            = cam.near_clip;
             rc.far_clip             = cam.far_clip;
             const auto node = registry.NodeOf(e);
-            const ResolvedPose rp = ResolvePoseSource(map, node);
+            const ResolvedPose rp = ResolvePoseSource(registry, map, node);
             rc.pose_source = rp.source;
             // The CameraComponent.local_transform is the camera's offset within
             // its own node; fold it into the visual_local so a body-attached
@@ -482,7 +514,7 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
             rl.color     = light.color;
             rl.intensity = light.intensity;
             const auto node = registry.NodeOf(e);
-            const ResolvedPose rp = ResolvePoseSource(map, node);
+            const ResolvedPose rp = ResolvePoseSource(registry, map, node);
             rl.pose_source = rp.source;
             const math::Transform node_local =
                 (rp.physics_node ? LocalRelativeTo(registry, node, rp.physics_node)
