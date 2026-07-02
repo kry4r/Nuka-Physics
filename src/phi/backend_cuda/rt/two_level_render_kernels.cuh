@@ -82,7 +82,7 @@ struct DevBlas {
 };
 
 // Device view of ONE image texture: a flat texel buffer + dims + colorspace flag.
-// channels 1 (grey, replicated to rgb) or >=3 (rgb). srgb 1 => linearise on read.
+// channels <3 (grey/grey+alpha -> ch0 replicated) or >=3 (rgb). srgb 1 => linearise.
 struct DevTexture {
     const float* texels = nullptr;
     uint32_t width = 0u;
@@ -126,8 +126,8 @@ NUKA_RT_HD inline Vec3 BilinearFetch3(const float* texels, uint32_t w, uint32_t 
     }
     const auto texel = [&](int x, int y) -> Vec3 {
         const size_t i = (static_cast<size_t>(y) * w + static_cast<size_t>(x)) * channels;
-        if (channels == 1u) {
-            const float g = texels[i];
+        if (channels < 3u) {
+            const float g = texels[i];  // grey / grey+alpha: replicate channel 0
             return Vec3{g, g, g};
         }
         return Vec3{texels[i], texels[i + 1u], texels[i + 2u]};

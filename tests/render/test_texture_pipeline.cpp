@@ -58,6 +58,20 @@ TEST(TexturePipeline, DecodesPngWithColorspaceFlag) {
     EXPECT_TRUE(LoadTexture("/nonexistent/nope.png", true).Empty());
 }
 
+TEST(TexturePipeline, DecodesTwoChannelGreyAlphaAsTwoChannels) {
+    // stb req_comp=0 returns 2 channels for a grey+alpha image; the loader stores
+    // them faithfully (channel 1 is a decoy the device sampler must NOT read as G/B).
+    const std::vector<uint8_t> ga = {200, 40, 200, 40};  // 2x1: ch0=grey, ch1=alpha
+    const std::string path = std::string(::testing::TempDir()) + "tex_grey_alpha.png";
+    ASSERT_EQ(stbi_write_png(path.c_str(), 2, 1, 2, ga.data(), 2 * 2), 1);
+    const nuka::rt::Texture tex = LoadTexture(path, /*srgb=*/false);
+    ASSERT_FALSE(tex.Empty());
+    EXPECT_EQ(tex.channels, 2u);
+    ASSERT_EQ(tex.texels.size(), 4u);
+    EXPECT_NEAR(tex.texels[0], 200.0f / 255.0f, 1e-6f);  // ch0 grey
+    EXPECT_NEAR(tex.texels[1], 40.0f / 255.0f, 1e-6f);   // ch1 alpha decoy
+}
+
 TEST(TexturePipeline, LibraryDedupesByPathAndColorspace) {
     const std::vector<uint8_t> rgb(2 * 2 * 3, 200);
     const std::string path = WriteTestPng("tex_dedupe.png", 2, 2, rgb);
