@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
-// nuka::render::window -- xcb + headless surface backend implementation (M8.5 T2).
+// nuka::render::window -- xcb + headless surface backend implementation.
 //
-// Self-written, thin (Decision D1). The xcb backend opens an X connection
+// Self-written, thin. The xcb backend opens an X connection
 // ($DISPLAY -- under Xvfb here), creates a window, and produces a VkSurfaceKHR via
 // vkCreateXcbSurfaceKHR. The headless backend (VK_EXT_headless_surface) is created
 // only when the loader exports vkCreateHeadlessSurfaceEXT (NOT on the 1.2.131
@@ -92,7 +92,7 @@ public:
             XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY |
                 XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |
                 XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
-                XCB_EVENT_MASK_POINTER_MOTION,
+                XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_FOCUS_CHANGE,
         };
         xcb_create_window(connection_, XCB_COPY_FROM_PARENT, window_, screen_->root,
                           0, 0, static_cast<uint16_t>(width_), static_cast<uint16_t>(height_),
@@ -219,6 +219,14 @@ public:
                     ev.key = kp->detail;  // RAW keycode (kept for any keycode-level consumer)
                     ev.keysym = ResolveKeysym(kp->detail);  // keymap-independent (XK_*)
                     ev.pressed = (kind == XCB_KEY_PRESS);
+                    out.push_back(ev);
+                    break;
+                }
+                case XCB_FOCUS_OUT: {
+                    // Key releases sent to the newly focused window are lost;
+                    // consumers reset latched modifier / drag state on this.
+                    WindowEvent ev;
+                    ev.type = WindowEvent::Type::FocusLost;
                     out.push_back(ev);
                     break;
                 }
