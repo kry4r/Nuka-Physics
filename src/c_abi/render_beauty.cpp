@@ -51,8 +51,10 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
     const cook::CookToModelResult cooked = cook::CookToModel(*record->scene, 1);
 
     // Each cooked medium's render surface (triangles + skin) drives one deforming
-    // instance; the skin params ride the medium's authored MediaRenderSkin.
+    // instance; the skin params ride the medium's authored MediaRenderSkin. A
+    // surface-less record (particle_radius > 0) becomes an instanced-sphere skin.
     std::vector<nuka::runtime::soft::SurfaceTopology> topologies;
+    std::vector<uint32_t> topology_material;   // authored id per pushed topology.
     topologies.reserve(record->particle_surfaces.size());
     for (const cook::MediaRenderSurface& s : record->particle_surfaces) {
         if (s.triangles.empty()) continue;
@@ -62,12 +64,28 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
         topo.smooth_iters = s.smooth_iters;
         topo.smooth_lambda = s.smooth_lambda;
         topologies.push_back(std::move(topo));
+        topology_material.push_back(s.render_material_id);
     }
 
     auto bridge = std::make_unique<BeautyRender>();
     bridge->scene = std::make_unique<nuka::render::StudioScene>(
         nuka::render::BuildStudioScene(record->scene->Ecs(), cooked.scene_map,
                                        topologies, width, height));
+    // The authored media materials (G5): a valid render_material_id overrides the
+    // studio default on its deforming surface / instanced-sphere skin.
+    for (std::size_t i = 0; i < topology_material.size(); ++i) {
+        if (topology_material[i] != 0xFFFFFFFFu) {
+            nuka::render::SetStudioSurfaceMaterial(*bridge->scene,
+                                                   record->scene->Ecs(), i,
+                                                   topology_material[i]);
+        }
+    }
+    for (const cook::MediaRenderSurface& s : record->particle_surfaces) {
+        if (!s.triangles.empty() || s.particle_radius <= 0.0f) continue;
+        nuka::render::AddStudioParticleSkin(*bridge->scene, record->scene->Ecs(),
+                                            s.render_material_id, s.particle_radius,
+                                            s.particle_first, s.particle_count);
+    }
     if (bridge->scene->world.instances.empty()) {
         return NUKA_RESULT_NOT_SUPPORTED;  // no renderable visual geometry.
     }
@@ -141,7 +159,8 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
         }
         std::vector<nuka::math::Vec3> particle_pos(particle_count,
                                                    nuka::math::Vec3::Zero());
-        if (particle_count > 0u && !studio.surfaces.empty() &&
+        if (particle_count > 0u &&
+            (!studio.surfaces.empty() || !studio.particle_skins.empty()) &&
             record->world->FieldPtr(nuka::nk::FieldId::ParticlePos) != nullptr) {
             data.DownloadField(nuka::nk::FieldId::ParticlePos, particle_pos.data(),
                                static_cast<uint64_t>(particle_count) *
