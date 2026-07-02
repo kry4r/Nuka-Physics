@@ -44,6 +44,12 @@ namespace {
 namespace m = ::nuka::math;
 constexpr uint32_t kBlockSize = 128u;
 
+// Smallest node mass the momentum->velocity divide is float-stable for. A node
+// reached only by denormal-tiny stencil-weight products (a particle sitting at an
+// exact cell center rounds one axis weight to ~eps^2) otherwise divides by a
+// denormal -> inf/NaN velocity that G2P then spreads. Such a node holds no matter.
+constexpr float kMinNodeMass = 1.0e-30f;
+
 // MLS-MPM material-table row stride (f32 per row). Must match
 // MpmMaterial::kValueCount: youngs poisson density dp_friction dp_cohesion
 // model_kind | bulk_modulus tait_gamma viscosity.
@@ -222,6 +228,12 @@ __device__ __forceinline__ void FirstPiola(const float* F, float mu, float lambd
         P[k] = 2.0f * mu * (F[k] - R[k]) + coef * FinvT[k];
 }
 
+// Elastic Hencky-strain cap: sand's recoverable strain is a few percent; anything
+// past it is absorbed plastically (grain rearrangement). This BOUNDS the stress a
+// degenerate rim/impact F can emit (the fluid J-floor's philosophy), so a
+// near-massless boundary node never receives a runaway kick.
+constexpr float kSandHenckyCap = 0.15f;
+
 // Granular Kirchhoff stress (Klar et al. 2016, "Drucker-Prager Elastoplasticity for
 // Sand Animation"): Hencky (log-strain) St.-Venant-Kirchhoff elasticity on the stored
 // elastic F. tau = U diag(2*mu*eps + lambda*tr(eps)) U^T, eps_i = ln(sig_i). This IS
@@ -231,7 +243,10 @@ __device__ __forceinline__ void GranularKirchhoff(const float* F, float mu,
     float U[9], sig[3], V[9];
     Svd3(F, U, sig, V);
     float eps[3];
-    for (int i = 0; i < 3; ++i) eps[i] = logf(fmaxf(fabsf(sig[i]), 1.0e-6f));
+    for (int i = 0; i < 3; ++i) {
+        eps[i] = logf(fmaxf(fabsf(sig[i]), 1.0e-6f));
+        eps[i] = fminf(fmaxf(eps[i], -kSandHenckyCap), kSandHenckyCap);
+    }
     const float tr = eps[0] + eps[1] + eps[2];
     float tau[3];
     for (int i = 0; i < 3; ++i) tau[i] = 2.0f * mu * eps[i] + lambda * tr;
@@ -279,7 +294,12 @@ __device__ __forceinline__ void SandReturnMap(float* F, float mu, float lambda,
         }
     }
     float s2[3];
-    for (int i = 0; i < 3; ++i) s2[i] = sgn[i] * expf(en[i]);
+    for (int i = 0; i < 3; ++i) {
+        // Cap the STORED elastic strain: the overflow is plastic densification, so
+        // the state the next substep stresses can never spiral (bounded restoring).
+        en[i] = fminf(fmaxf(en[i], -kSandHenckyCap), kSandHenckyCap);
+        s2[i] = sgn[i] * expf(en[i]);
+    }
     float US[9];
     for (int r = 0; r < 3; ++r)
         for (int c = 0; c < 3; ++c) US[r * 3 + c] = U[r * 3 + c] * s2[c];
@@ -561,7 +581,7 @@ __global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total_nodes) return;
     const float mi = mass[i];
-    if (mi <= 0.0f) { velocity[i] = m::Vec3::Zero(); return; }
+    if (mi < kMinNodeMass) { velocity[i] = m::Vec3::Zero(); return; }
     m::Vec3 v = momentum[i] * (1.0f / mi) + gravity * dt;  // symplectic Euler kick.
     // Static-plane BC: a node at/below the plane gets a no-penetration normal cut +
     // Coulomb friction on the tangential component against the removed normal impulse.
@@ -647,7 +667,7 @@ __global__ void MpmGridBodyProjectKernel(
     body_dp[i] = m::Vec3::Zero();
     body_owner[i] = ~0u;
     const float mi = mass[i];
-    if (mi <= 0.0f) return;
+    if (mi < kMinNodeMass) return;
     const uint32_t env = i / nodes_per_env;
     const uint32_t local = i % nodes_per_env;
     const int32_t nx = static_cast<int32_t>(local % dims_x);
