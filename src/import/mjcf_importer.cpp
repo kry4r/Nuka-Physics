@@ -362,7 +362,8 @@ bool MjcfSensorType(const std::string& tag, scene::SensorType& out) {
     if (tag == "force" || tag == "torque") { out = scene::SensorType::ForceTorque; return true; }
     if (tag == "touch") { out = scene::SensorType::Contact; return true; }
     if (tag == "framepos" || tag == "framequat" ||
-        tag == "framelinvel" || tag == "frameangvel") {
+        tag == "framelinvel" || tag == "frameangvel" ||
+        tag == "framexaxis" || tag == "frameyaxis" || tag == "framezaxis") {
         out = scene::SensorType::FramePose; return true;
     }
     if (tag == "jointpos" || tag == "jointvel") {
@@ -494,6 +495,13 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         }
         if (const char* diag = inertial->Attribute("diaginertia")) {
             rec.inertia = ParseVec3(diag);
+        } else if (const char* full = inertial->Attribute("fullinertia")) {
+            // fullinertia = [Ixx Iyy Izz Ixy Ixz Iyz]; keep the diagonal (the
+            // off-diagonal products are dropped -- the record carries a diagonal).
+            float v[6] = {1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+            if (ParseFloatList(full, v, 6) >= 3) {
+                rec.inertia = math::Vec3{v[0], v[1], v[2]};
+            }
         }
     }
 
