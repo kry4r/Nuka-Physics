@@ -118,18 +118,25 @@ StudioScene BuildStudioScene(const scene::Registry& registry,
     }
     s.link_instance_count = static_cast<uint32_t>(ninst);
 
-    // Premium studio material palette (the studio hero look).
-    s.world.materials.clear();
-    constexpr uint32_t kMatShell = 0u, kMatMetal = 1u, kMatFoot = 2u, kMatAccent = 3u;
-    constexpr uint32_t kMatCloth = 4u, kMatFloor = 5u;
-    s.world.materials.push_back(Mk(0.072f, 0.076f, 0.085f, 0.05f, 0.55f));  // 0 shell charcoal
-    s.world.materials.push_back(Mk(0.090f, 0.096f, 0.110f, 0.85f, 0.34f));  // 1 dark gunmetal
-    s.world.materials.push_back(Mk(0.045f, 0.045f, 0.050f, 0.04f, 0.72f));  // 2 dark rubber foot
-    s.world.materials.push_back(Mk(0.16f, 0.180f, 0.225f, 0.65f, 0.30f));   // 3 cool steel accent
+    // Record each instance's AUTHORED material id, then APPEND the premium studio
+    // palette (the hero look) after the authored table. The role override below
+    // points every instance at the palette; UseAuthoredSceneMaterials rebinds.
+    s.authored_material_of_instance.assign(ninst, kNoId);
+    for (std::size_t i = 0; i < ninst; ++i) {
+        const uint32_t m = s.world.instances[i].render_material_id;
+        if (m < s.world.materials.size()) s.authored_material_of_instance[i] = m;
+    }
+    const uint32_t base = static_cast<uint32_t>(s.world.materials.size());
+    const uint32_t kMatShell = base + 0u, kMatMetal = base + 1u, kMatFoot = base + 2u;
+    const uint32_t kMatAccent = base + 3u, kMatCloth = base + 4u, kMatFloor = base + 5u;
+    s.world.materials.push_back(Mk(0.072f, 0.076f, 0.085f, 0.05f, 0.55f));  // shell charcoal
+    s.world.materials.push_back(Mk(0.090f, 0.096f, 0.110f, 0.85f, 0.34f));  // dark gunmetal
+    s.world.materials.push_back(Mk(0.045f, 0.045f, 0.050f, 0.04f, 0.72f));  // dark rubber foot
+    s.world.materials.push_back(Mk(0.16f, 0.180f, 0.225f, 0.65f, 0.30f));   // cool steel accent
     // Deep crimson matte fabric: a saturated dielectric at fabric roughness with a
     // faint grazing sheen for velvet quality, not a glossy glint.
-    s.world.materials.push_back(Mk(0.400f, 0.035f, 0.060f, 0.00f, 0.58f, 0.6f));  // 4 crimson silk
-    s.world.materials.push_back(Mk(0.190f, 0.196f, 0.210f, 0.02f, 0.82f));  // 5 studio floor
+    s.world.materials.push_back(Mk(0.400f, 0.035f, 0.060f, 0.00f, 0.58f, 0.6f));  // crimson silk
+    s.world.materials.push_back(Mk(0.190f, 0.196f, 0.210f, 0.02f, 0.82f));  // studio floor
     s.world.default_material_id = kMatShell;
 
     // Each cooked medium with a triangulated surface becomes one deforming instance;
@@ -200,6 +207,14 @@ void SetStudioSurfaceMaterial(StudioScene& scene, const scene::Registry& registr
     if (surface_index >= scene.surfaces.size()) return;
     const uint32_t slot = InternSceneMaterial(scene, registry, scene_material_id);
     if (slot != kNoId) scene.surfaces[surface_index].material_id = slot;
+}
+
+void UseAuthoredSceneMaterials(StudioScene& scene) {
+    const std::size_t n = scene.authored_material_of_instance.size();
+    for (std::size_t i = 0; i < n && i < scene.world.instances.size(); ++i) {
+        const uint32_t m = scene.authored_material_of_instance[i];
+        if (m != kNoId) scene.world.instances[i].render_material_id = m;
+    }
 }
 
 void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,

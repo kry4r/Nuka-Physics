@@ -65,6 +65,10 @@ struct StudioScene {
     std::vector<uint32_t> link_of_instance;      // per link-posed instance -> link index.
     std::vector<math::Transform> visual_local;   // per link-posed instance -> physics->visual offset.
     uint32_t link_instance_count = 0u;           // [0, link_instance_count) follow a link pose.
+
+    // Each build-time instance's AUTHORED scene material id (kNoId = none). The
+    // studio palette overrides these by default; UseAuthoredSceneMaterials rebinds.
+    std::vector<uint32_t> authored_material_of_instance;
 };
 
 // Build the studio scene from a cooked scene's ECS + SceneMap. `surface_topologies`
@@ -86,6 +90,11 @@ StudioScene BuildStudioScene(const scene::Registry& registry,
 // id) over the studio default. Call after BuildStudioScene, before the first Publish.
 void SetStudioSurfaceMaterial(StudioScene& scene, const scene::Registry& registry,
                               std::size_t surface_index, uint32_t scene_material_id);
+
+// Rebind every instance that carries an AUTHORED scene material back to it (the
+// studio hero palette stays only where the scene authored nothing). Call after
+// BuildStudioScene when the scene opts in (EnvironmentRecord.use_scene_materials).
+void UseAuthoredSceneMaterials(StudioScene& scene);
 
 // Register a per-particle instanced-sphere skin (a surface-less particle medium).
 // `scene_material_id` kNoId/invalid falls back to a neutral granular material;
