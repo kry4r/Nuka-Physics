@@ -238,6 +238,7 @@ struct BlasDevice {
     OwnedBuffer d_prims;
     OwnedBuffer d_tri_v0, d_tri_v1, d_tri_v2;
     OwnedBuffer d_tri_n0, d_tri_n1, d_tri_n2;  // smooth per-vertex normals (beauty)
+    OwnedBuffer d_tri_uv0, d_tri_uv1, d_tri_uv2;  // per-vertex UVs (beauty textures)
     OwnedBuffer d_sph_c, d_sph_r;
     OwnedBuffer d_sdf_hdr, d_sdf_aabb, d_sdf_eps, d_sdf_iters;
     // SDF cell arrays (one buffer per SDF; their device pointers are baked into
@@ -317,10 +318,19 @@ struct FrameTlasView {
 }  // namespace
 
 // Opaque impl: the per-mesh BLAS devices (built once) + the persistent render
-// context (AOV scratch + TLAS buffers reused/refit across frames).
+// context (AOV scratch + TLAS buffers reused/refit across frames) + the scene's
+// image textures and HDR environment (uploaded once; static across frames).
 struct TwoLevelSceneDevice::Impl {
     std::vector<BlasDevice> meshes;
     RtRenderContext rt;
+
+    std::vector<OwnedBuffer> texture_texel_bufs;  // one texel buffer per texture
+    OwnedBuffer d_textures;                        // DevTexture descriptor table
+    uint32_t texture_count = 0u;
+
+    OwnedBuffer d_env_texels;                      // equirect linear RGB, or empty
+    uint32_t env_width = 0u, env_height = 0u;
+    float env_yaw = 0.0f, env_intensity = 1.0f;
 };
 
 TwoLevelSceneDevice::TwoLevelSceneDevice() : impl_(std::make_unique<Impl>()) {}
@@ -456,6 +466,26 @@ BlasDevice BuildBlas(const BlasMesh& mesh, const RtContext& ctx) {
         out.view.tri_n2 = static_cast<const Vec3*>(out.d_tri_n2.Data());
     }
 
+    // Per-vertex UVs (beauty texture path) mirror the smooth-normal pattern:
+    // absent => null view pointers and the tracer's triplanar fallback.
+    if (mesh.tri_uvs.size() == mesh.triangles.size() && !mesh.tri_uvs.empty()) {
+        std::vector<Vec3> uv0, uv1, uv2;
+        uv0.reserve(mesh.tri_uvs.size());
+        uv1.reserve(mesh.tri_uvs.size());
+        uv2.reserve(mesh.tri_uvs.size());
+        for (const auto& tu : mesh.tri_uvs) {
+            uv0.push_back(tu.uv0);
+            uv1.push_back(tu.uv1);
+            uv2.push_back(tu.uv2);
+        }
+        out.d_tri_uv0 = UploadOwned(bt, uv0);
+        out.d_tri_uv1 = UploadOwned(bt, uv1);
+        out.d_tri_uv2 = UploadOwned(bt, uv2);
+        out.view.tri_uv0 = static_cast<const Vec3*>(out.d_tri_uv0.Data());
+        out.view.tri_uv1 = static_cast<const Vec3*>(out.d_tri_uv1.Data());
+        out.view.tri_uv2 = static_cast<const Vec3*>(out.d_tri_uv2.Data());
+    }
+
     // Build the BLAS over the LOCAL per-prim AABBs (retain the tree).
     OwnedBuffer d_boxes = UploadOwned(bt, aabbs);
     const auto* dev_boxes = static_cast<const collision::AABB*>(d_boxes.Data());
@@ -562,6 +592,35 @@ TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
     device.GetImpl()->meshes.reserve(scene.meshes.size());
     for (const auto& mesh : scene.meshes) {
         device.GetImpl()->meshes.push_back(BuildBlas(mesh, ctx));
+    }
+
+    // Upload the scene's image textures + HDR environment ONCE (static across
+    // frames). An untextured scene uploads nothing (the tracer's null fallback).
+    TwoLevelSceneDevice::Impl* impl = device.GetImpl();
+    std::vector<DevTexture> dev_tex;
+    dev_tex.reserve(scene.textures.size());
+    for (const rt::Texture& t : scene.textures) {
+        DevTexture d;
+        if (!t.Empty()) {
+            impl->texture_texel_bufs.push_back(UploadOwned(ctx.device_bt, t.texels));
+            d.texels = static_cast<const float*>(impl->texture_texel_bufs.back().Data());
+            d.width = t.width;
+            d.height = t.height;
+            d.channels = t.channels;
+            d.srgb = t.srgb;
+        }
+        dev_tex.push_back(d);
+    }
+    if (!dev_tex.empty()) {
+        impl->d_textures = UploadOwned(ctx.device_bt, dev_tex);
+    }
+    impl->texture_count = static_cast<uint32_t>(dev_tex.size());
+    if (scene.environment.Enabled()) {
+        impl->d_env_texels = UploadOwned(ctx.device_bt, scene.environment.texels);
+        impl->env_width = scene.environment.width;
+        impl->env_height = scene.environment.height;
+        impl->env_yaw = scene.environment.yaw;
+        impl->env_intensity = scene.environment.intensity;
     }
     cudaStreamSynchronize(ctx.stream);
     return device;
@@ -741,6 +800,15 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     sky.sky_intensity = opt.sky_intensity;
     sky.transmit_bounces = opt.transmit_bounces;
     sky.smooth_normals = opt.smooth_normals ? 1u : 0u;
+    // HDR environment (uploaded once at BuildTwoLevelScene): the equirect radiance
+    // replaces the procedural gradient dome; absent => null (byte-unchanged).
+    if (impl->d_env_texels.Data() != nullptr && impl->env_width > 0u) {
+        sky.env_texels = static_cast<const float*>(impl->d_env_texels.Data());
+        sky.env_width = impl->env_width;
+        sky.env_height = impl->env_height;
+        sky.env_yaw = impl->env_yaw;
+        sky.env_intensity = impl->env_intensity;
+    }
     // Sun disc in the environment: a crisp glint for reflective/transmissive surfaces.
     // Zero radiance keeps the sky byte-identical for every other caller.
     sky.sun_radiance = opt.sun_disc_radiance;
@@ -759,9 +827,13 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     }
 
     // The FP32 beauty kernel launch lives in two_level_render_beauty.cu.
+    const DevTexture* textures =
+        impl->texture_count > 0u
+            ? static_cast<const DevTexture*>(impl->d_textures.Data())
+            : nullptr;
     LaunchBeautyKernel(camera, frame.tlas_nodes, frame.inst_count, frame.instances,
-                       frame.materials, scene.light, sky, opt.samples, opt.seed, dst,
-                       ctx.stream);
+                       frame.materials, textures, scene.light, sky, opt.samples,
+                       opt.seed, dst, ctx.stream);
     CheckCuda(cudaGetLastError(), "RenderBeautyKernel launch");
 }
 
