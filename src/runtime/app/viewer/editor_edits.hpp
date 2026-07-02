@@ -116,14 +116,12 @@ std::string SpawnPrimitive(EditorScene& es, PrimitiveKind kind,
 // SpawnPrimitive (the single general spawn entry). Returns the new node's path.
 std::string AddBoxChild(EditorScene& es, const std::string& parent_path);
 
-// Remove the body subtree rooted at `path` (its bodies + shapes + the joints that
-// touch them) by rebuilding the authority without them. Returns the parent path to
-// reselect, or "" when `path` is not a body node.
+// Remove the subtree at `path` via the general SceneIR removers (body subtree or
+// /script node). Returns the parent path to reselect, "" when `path` backs neither.
 std::string DeleteSubtree(EditorScene& es, const std::string& path);
 
-// Move the body subtree at `path` under the body / group at `new_parent_path` ("" ->
-// scene root), preserving its world pose. Returns the node's new path, or "" when
-// `path` is not a body, the move is a cycle, or the body is jointed / settled.
+// Move the body subtree at `path` under the body / pure group at `new_parent_path`
+// ("" -> root), pose preserved. "" when declined (non-body / cycle / bad parent).
 std::string ReparentNode(EditorScene& es, const std::string& path,
                          const std::string& new_parent_path);
 
