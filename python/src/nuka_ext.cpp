@@ -1321,7 +1321,8 @@ public:
                    const std::vector<float>& pbf_walls_min,
                    const std::vector<float>& pbf_walls_max, float pbf_floor_z,
                    uint32_t pbf_boundary_layers, float mpm_youngs,
-                   float mpm_poisson, float mpm_density, float mpm_model_kind,
+                   float mpm_poisson, float mpm_density, float mpm_dp_friction,
+                   float mpm_dp_cohesion, float mpm_model_kind,
                    float mpm_bulk_modulus, float mpm_tait_gamma, float mpm_viscosity,
                    float mpm_dx, uint32_t mpm_substeps,
                    const std::vector<float>& mpm_floor_normal, float mpm_floor_d,
@@ -1372,6 +1373,8 @@ public:
         d.mpm_youngs = mpm_youngs;
         d.mpm_poisson = mpm_poisson;
         d.mpm_density = mpm_density;
+        d.mpm_dp_friction = mpm_dp_friction;
+        d.mpm_dp_cohesion = mpm_dp_cohesion;
         d.mpm_model_kind = mpm_model_kind;
         d.mpm_bulk_modulus = mpm_bulk_modulus;
         d.mpm_tait_gamma = mpm_tait_gamma;
@@ -1469,10 +1472,11 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("PRIMITIVE_CAPSULE") = uint32_t{3};
     // SceneBuilder.add_media(kind=...) / (method=...) codes (nuka_media_kind_t /
     // nuka_media_method_t). Legal pairs: cloth=XPBD; soft_tet=XPBD|MLSMPM;
-    // fluid=PBF|MLSMPM (an illegal pair raises at add_media).
+    // fluid=PBF|MLSMPM; granular=MLSMPM (an illegal pair raises at add_media).
     m.attr("MEDIA_CLOTH") = uint32_t{0};
     m.attr("MEDIA_SOFT_TET") = uint32_t{1};
     m.attr("MEDIA_FLUID") = uint32_t{2};
+    m.attr("MEDIA_GRANULAR") = uint32_t{3};
     m.attr("MEDIA_METHOD_XPBD") = uint32_t{0};
     m.attr("MEDIA_METHOD_PBF") = uint32_t{1};
     m.attr("MEDIA_METHOD_MLSMPM") = uint32_t{2};
@@ -2448,7 +2452,8 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("pbf_walls_max") = std::vector<float>{},
              nb::arg("pbf_floor_z") = 0.0f, nb::arg("pbf_boundary_layers") = 0u,
              nb::arg("mpm_youngs") = 0.0f, nb::arg("mpm_poisson") = 0.0f,
-             nb::arg("mpm_density") = 0.0f, nb::arg("mpm_model_kind") = 0.0f,
+             nb::arg("mpm_density") = 0.0f, nb::arg("mpm_dp_friction") = 0.0f,
+             nb::arg("mpm_dp_cohesion") = 0.0f, nb::arg("mpm_model_kind") = 0.0f,
              nb::arg("mpm_bulk_modulus") = 0.0f, nb::arg("mpm_tait_gamma") = 0.0f,
              nb::arg("mpm_viscosity") = 0.0f, nb::arg("mpm_dx") = 0.0f,
              nb::arg("mpm_substeps") = 0u,
@@ -2458,7 +2463,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("skin_smooth_lambda") = 0.5f,
              nb::arg("render_material_id") = uint32_t{0xFFFFFFFFu},
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
-             "FLUID); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind selects "
+             "FLUID/GRANULAR); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind selects "
              "the geometry block (cloth_*/tet_*/fluid_*); method selects the "
              "material block (xpbd_*/pbf_*/mpm_*). Material scalars at 0 take the "
              "cook's own defaults. An illegal (kind x method) pair raises here; an "
