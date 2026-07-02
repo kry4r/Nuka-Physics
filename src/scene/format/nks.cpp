@@ -668,6 +668,12 @@ Value SaveRenderMaterial(const MaterialRecord& m) {
     if (m.absorption.x != 0.0f || m.absorption.y != 0.0f || m.absorption.z != 0.0f) {
         o.Set("absorption", Vec3Json(m.absorption));
     }
+    // Image-map fields, emitted only when non-default (same no-churn discipline).
+    if (!m.albedo_map.empty()) o.Set("albedo_map", Value::Str(m.albedo_map));
+    if (!m.roughness_map.empty()) o.Set("roughness_map", Value::Str(m.roughness_map));
+    if (!m.normal_map.empty()) o.Set("normal_map", Value::Str(m.normal_map));
+    if (m.uv_scale != 1.0f) o.Set("uv_scale", Value::Float(m.uv_scale));
+    if (!m.triplanar) o.Set("triplanar", Value::Bool(false));
     return o;
 }
 
@@ -979,6 +985,26 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
         root.Set("scripts", std::move(scripts));
     }
 
+    // -- environment (HDR beauty backdrop + material policy) -----------------
+    // Emitted only when authored so an environment-free scene's bytes are
+    // unchanged.
+    if (!scene.Environment().hdri.empty() || scene.Environment().use_scene_materials) {
+        Value env = Value::Object();
+        if (!scene.Environment().hdri.empty()) {
+            env.Set("hdri", Value::Str(scene.Environment().hdri));
+        }
+        if (scene.Environment().yaw_deg != 0.0f) {
+            env.Set("yaw_deg", Value::Float(scene.Environment().yaw_deg));
+        }
+        if (scene.Environment().intensity != 1.0f) {
+            env.Set("intensity", Value::Float(scene.Environment().intensity));
+        }
+        if (scene.Environment().use_scene_materials) {
+            env.Set("use_scene_materials", Value::Bool(true));
+        }
+        root.Set("environment", std::move(env));
+    }
+
     // -- M7 metadata: initial_state / settle (only when present) ------------
     // Emitted only when authored so a scene without IC/settle is unchanged (the
     // existing SecondSaveByteIdentical fixtures stay byte-equal). A legacy
@@ -1055,6 +1081,11 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 if (const Value* tr = rm.Find("transmission")) rec.transmission = tr->AsFloat();
                 if (const Value* io = rm.Find("ior")) rec.ior = io->AsFloat();
                 if (const Value* ab = rm.Find("absorption")) rec.absorption = Vec3FromJson(*ab);
+                if (const Value* am = rm.Find("albedo_map")) rec.albedo_map = am->AsString();
+                if (const Value* rg = rm.Find("roughness_map")) rec.roughness_map = rg->AsString();
+                if (const Value* nm = rm.Find("normal_map")) rec.normal_map = nm->AsString();
+                if (const Value* us = rm.Find("uv_scale")) rec.uv_scale = us->AsFloat();
+                if (const Value* tp = rm.Find("triplanar")) rec.triplanar = tp->AsBool();
                 if (phys) {
                     if (const Value* pm = phys->Find(kv.first)) {
                         rec.friction_mu = pm->At("static_friction").AsFloat();
@@ -1542,6 +1573,19 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.image_elevation_z = f(tv, "image_elevation_z", rec.image_elevation_z);
             scene.AddTerrain(std::move(rec));
         }
+    }
+
+    // -- environment (HDR beauty backdrop) -----------------------------------
+    // Absent keys keep the record default; an absent section keeps the
+    // procedural studio sky (backward-compatible).
+    if (const Value* env = root.Find("environment")) {
+        EnvironmentRecord rec;
+        if (const Value* hp = env->Find("hdri")) rec.hdri = hp->AsString();
+        if (const Value* yv = env->Find("yaw_deg")) rec.yaw_deg = yv->AsFloat();
+        if (const Value* iv = env->Find("intensity")) rec.intensity = iv->AsFloat();
+        if (const Value* um = env->Find("use_scene_materials"))
+            rec.use_scene_materials = um->AsBool();
+        scene.EnvironmentMut() = std::move(rec);
     }
 
     // -- scripts (/script nodes) --------------------------------------------

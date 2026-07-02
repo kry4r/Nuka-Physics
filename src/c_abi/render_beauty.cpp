@@ -18,11 +18,14 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "render/studio_beauty.hpp"
+#include "render/texture_image.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_ir.hpp"
 
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <string>
 #include <vector>
 
 namespace nuka::c_abi {
@@ -36,6 +39,15 @@ BeautyRender::~BeautyRender() = default;
 namespace {
 
 namespace cook = nuka::scene::cook;
+
+// Resolve an authored (possibly relative) asset path against the scene file's
+// directory; empty stays empty, absolute passes through, no-dir uses the cwd.
+std::string ResolveScenePath(const std::string& path, const std::string& scene_dir) {
+    if (path.empty() || scene_dir.empty()) return path;
+    const std::filesystem::path p(path);
+    if (p.is_absolute()) return path;
+    return (std::filesystem::path(scene_dir) / p).string();
+}
 
 // Build the world's beauty render bridge: cook the retained scene to recover the
 // EntityId<->row SceneMap, build the shared studio scene (with the world's retained
@@ -88,6 +100,25 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
     }
     if (bridge->scene->world.instances.empty()) {
         return NUKA_RESULT_NOT_SUPPORTED;  // no renderable visual geometry.
+    }
+
+    // The scene's authored render appearance: the material policy, each material's
+    // image maps (paths resolved against the scene dir), and the HDR environment.
+    const nuka::scene::EnvironmentRecord& env = record->scene->Environment();
+    if (env.use_scene_materials) {
+        nuka::render::UseAuthoredSceneMaterials(*bridge->scene);
+    }
+    for (nuka::scene::RenderMaterial& m : bridge->scene->world.materials) {
+        m.albedo_map = ResolveScenePath(m.albedo_map, record->scene_dir);
+        m.roughness_map = ResolveScenePath(m.roughness_map, record->scene_dir);
+        m.normal_map = ResolveScenePath(m.normal_map, record->scene_dir);
+    }
+    nuka::render::DecodeMaterialTextures(bridge->scene->world);
+    if (!env.hdri.empty()) {
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        bridge->scene->world.environment = nuka::render::LoadEnvironment(
+            ResolveScenePath(env.hdri, record->scene_dir), env.yaw_deg * kDegToRad,
+            env.intensity);
     }
     bridge->renderer = std::make_unique<nuka::render::StudioRtRenderer>();
     if (!bridge->renderer->ok()) {

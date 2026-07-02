@@ -1278,7 +1278,8 @@ public:
     void add_rigid_primitive(uint32_t kind, const std::vector<float>& dims,
                              const std::vector<float>& pos,
                              const std::vector<float>& quat, bool is_static,
-                             float mass, float friction) {
+                             float mass, float friction,
+                             const std::string& material) {
         if (dims.size() > 3) {
             throw std::runtime_error("add_rigid_primitive: dims must be <= 3 floats");
         }
@@ -1298,8 +1299,54 @@ public:
         d.is_static = is_static ? 1u : 0u;
         d.mass = mass;
         d.friction = friction;
+        d.material_name = material.empty() ? nullptr : material.c_str();
         check(nuka_scene_add_rigid_primitive(h_, &d),
               "nuka_scene_add_rigid_primitive");
+    }
+
+    // One authored render material; returns the material id (usable as add_media's
+    // render_material_id). Image maps are file paths; "" => none.
+    uint32_t add_material(const std::string& name,
+                          const std::vector<float>& base_color, float metallic,
+                          float roughness, float sheen,
+                          const std::string& albedo_map,
+                          const std::string& roughness_map,
+                          const std::string& normal_map, float uv_scale,
+                          bool triplanar) {
+        if (!base_color.empty() && base_color.size() != 3 && base_color.size() != 4) {
+            throw std::runtime_error(
+                "add_material: base_color must be 3 or 4 floats (r,g,b[,a])");
+        }
+        nuka_render_material_desc_t d{};
+        d.name = name.c_str();
+        d.base_color[3] = 1.0f;
+        for (size_t i = 0; i < base_color.size() && i < 4; ++i)
+            d.base_color[i] = base_color[i];
+        if (base_color.empty()) {
+            d.base_color[0] = d.base_color[1] = d.base_color[2] = 1.0f;
+        }
+        d.metallic = metallic;
+        d.roughness = roughness;
+        d.sheen = sheen;
+        d.albedo_map = albedo_map.empty() ? nullptr : albedo_map.c_str();
+        d.roughness_map = roughness_map.empty() ? nullptr : roughness_map.c_str();
+        d.normal_map = normal_map.empty() ? nullptr : normal_map.c_str();
+        d.uv_scale = uv_scale;
+        d.triplanar = triplanar ? 1u : 0u;
+        uint32_t id = 0u;
+        check(nuka_scene_add_material(h_, &d, &id), "nuka_scene_add_material");
+        return id;
+    }
+
+    // The scene's HDR environment + material policy for the beauty render.
+    void set_environment(const std::string& hdri, float yaw_deg, float intensity,
+                         bool use_scene_materials) {
+        nuka_environment_desc_t d{};
+        d.hdri = hdri.empty() ? nullptr : hdri.c_str();
+        d.yaw_deg = yaw_deg;
+        d.intensity = intensity;
+        d.use_scene_materials = use_scene_materials ? 1u : 0u;
+        check(nuka_scene_set_environment(h_, &d), "nuka_scene_set_environment");
     }
 
     // One media record. kind (MEDIA_*) selects the geometry block read; method
@@ -2423,12 +2470,35 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("pos") = std::vector<float>{},
              nb::arg("quat") = std::vector<float>{}, nb::arg("static") = false,
              nb::arg("mass") = 1.0f, nb::arg("friction") = -1.0f,
+             nb::arg("material") = std::string(),
              "Add a rigid collision primitive (one body + one shape). kind is a "
              "PRIMITIVE_* code (PLANE/BOX/SPHERE/CAPSULE). dims by kind: BOX "
              "[hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]; PLANE []. pos "
              "[x,y,z], quat [w,x,y,z] (empty quat => identity). PLANE is always "
              "static. friction < 0 (default) inherits the material mu; >= 0 is an "
-             "explicit per-shape override.")
+             "explicit per-shape override. material names an add_material render "
+             "material; non-empty adds a visual twin so the primitive renders "
+             "with that appearance.")
+        .def("add_material", &SceneBuilder::add_material, nb::arg("name"),
+             nb::arg("base_color") = std::vector<float>{},
+             nb::arg("metallic") = 0.0f, nb::arg("roughness") = 0.5f,
+             nb::arg("sheen") = 0.0f, nb::arg("albedo_map") = std::string(),
+             nb::arg("roughness_map") = std::string(),
+             nb::arg("normal_map") = std::string(), nb::arg("uv_scale") = 1.0f,
+             nb::arg("triplanar") = true,
+             "Add an authored render material; returns its material id (usable as "
+             "add_media's render_material_id). base_color [r,g,b[,a]] multiplies "
+             "the albedo map (default white). albedo_map (sRGB) / roughness_map / "
+             "normal_map (tangent GL) are image file paths; \"\" => untextured. "
+             "uv_scale tiles the maps (tiles/metre under triplanar); triplanar "
+             "projects in body-local space so primitives need no authored UVs.")
+        .def("set_environment", &SceneBuilder::set_environment,
+             nb::arg("hdri") = std::string(), nb::arg("yaw_deg") = 0.0f,
+             nb::arg("intensity") = 1.0f, nb::arg("use_scene_materials") = true,
+             "Set the scene's beauty environment: an equirect .hdr path backing "
+             "the sky + ambient light (\"\" keeps the procedural studio sky), its "
+             "yaw/intensity, and whether the render uses the scene's AUTHORED "
+             "materials (default True) instead of the studio hero palette.")
         .def("add_media", &SceneBuilder::add_media, nb::arg("kind"),
              nb::arg("method"), nb::arg("cloth_nx") = 0u, nb::arg("cloth_ny") = 0u,
              nb::arg("cloth_spacing") = 0.0f,

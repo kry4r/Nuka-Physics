@@ -66,6 +66,12 @@ struct DevBlas {
     const Vec3* tri_n1 = nullptr;
     const Vec3* tri_n2 = nullptr;
 
+    // Per-vertex texture coordinates (x,y used), parallel to the triangle prims.
+    // nullptr => the beauty texture path falls back to world-space triplanar.
+    const Vec3* tri_uv0 = nullptr;
+    const Vec3* tri_uv1 = nullptr;
+    const Vec3* tri_uv2 = nullptr;
+
     const Vec3* sph_center = nullptr;
     const float* sph_radius = nullptr;
 
@@ -74,6 +80,78 @@ struct DevBlas {
     const float* sdf_eps = nullptr;
     const int* sdf_iters = nullptr;
 };
+
+// Device view of ONE image texture: a flat texel buffer + dims + colorspace flag.
+// channels <3 (grey/grey+alpha -> ch0 replicated) or >=3 (rgb). srgb 1 => linearise.
+struct DevTexture {
+    const float* texels = nullptr;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint32_t channels = 0u;
+    uint32_t srgb = 0u;
+};
+
+// sRGB EOTF -> linear for one channel (the sampler-side decode of albedo maps).
+NUKA_RT_HD inline float SrgbToLinear(float s) {
+    return s <= 0.04045f ? s * (1.0f / 12.92f)
+                         : powf((s + 0.055f) * (1.0f / 1.055f), 2.4f);
+}
+
+// Bilinear fetch of an RGB triplet from a flat texel buffer: u wraps (repeat),
+// v wraps or clamps. channels 1 replicates grey; >=3 reads rgb.
+NUKA_RT_HD inline Vec3 BilinearFetch3(const float* texels, uint32_t w, uint32_t h,
+                                      uint32_t channels, float u, float v,
+                                      bool clamp_v) {
+    u = u - floorf(u);
+    if (clamp_v) {
+        v = fminf(1.0f, fmaxf(0.0f, v));
+    } else {
+        v = v - floorf(v);
+    }
+    const float fx = u * static_cast<float>(w) - 0.5f;
+    const float fy = v * static_cast<float>(h) - 0.5f;
+    const float flx = floorf(fx), fly = floorf(fy);
+    const float ax = fx - flx, ay = fy - fly;
+    int x0 = static_cast<int>(flx), y0 = static_cast<int>(fly);
+    const int wi = static_cast<int>(w), hi = static_cast<int>(h);
+    x0 = ((x0 % wi) + wi) % wi;
+    const int x1 = (x0 + 1) % wi;
+    int y1;
+    if (clamp_v) {
+        y0 = y0 < 0 ? 0 : (y0 >= hi ? hi - 1 : y0);
+        y1 = y0 + 1 >= hi ? hi - 1 : y0 + 1;
+    } else {
+        y0 = ((y0 % hi) + hi) % hi;
+        y1 = (y0 + 1) % hi;
+    }
+    const auto texel = [&](int x, int y) -> Vec3 {
+        const size_t i = (static_cast<size_t>(y) * w + static_cast<size_t>(x)) * channels;
+        if (channels < 3u) {
+            const float g = texels[i];  // grey / grey+alpha: replicate channel 0
+            return Vec3{g, g, g};
+        }
+        return Vec3{texels[i], texels[i + 1u], texels[i + 2u]};
+    };
+    const Vec3 t00 = texel(x0, y0), t10 = texel(x1, y0);
+    const Vec3 t01 = texel(x0, y1), t11 = texel(x1, y1);
+    const float w00 = (1.0f - ax) * (1.0f - ay), w10 = ax * (1.0f - ay);
+    const float w01 = (1.0f - ax) * ay, w11 = ax * ay;
+    return Vec3{t00.x * w00 + t10.x * w10 + t01.x * w01 + t11.x * w11,
+                t00.y * w00 + t10.y * w10 + t01.y * w01 + t11.y * w11,
+                t00.z * w00 + t10.z * w10 + t01.z * w01 + t11.z * w11};
+}
+
+// Sample one DevTexture at repeat-wrapped (u,v); sRGB-flagged maps linearise after
+// the bilinear filter (the standard software-sampler approximation). An unbound
+// texture samples neutral white (a multiplicative no-op).
+NUKA_RT_HD inline Vec3 SampleTexture(const DevTexture& t, float u, float v) {
+    if (t.texels == nullptr) return Vec3{1.0f, 1.0f, 1.0f};
+    Vec3 c = BilinearFetch3(t.texels, t.width, t.height, t.channels, u, v, false);
+    if (t.srgb != 0u) {
+        c = Vec3{SrgbToLinear(c.x), SrgbToLinear(c.y), SrgbToLinear(c.z)};
+    }
+    return c;
+}
 
 // One placed instance, device-side: its rigid transform, a view of its (shared)
 // BLAS geometry + retained tree, and the global ids the leaf packs / shades.
@@ -155,6 +233,13 @@ struct BeautyParams {
     // crisp specular glint. sun_dir points toward the sun; radiance is its disc color.
     Vec3 sun_dir, sun_radiance;
     float sun_cos_radius;       // cos of the disc half-angle; <= 0 disables the disc
+
+    // Equirect HDR environment map (linear RGB, row 0 = zenith). null (default) =>
+    // the procedural gradient sky above, byte-identical for every existing caller.
+    const float* env_texels = nullptr;
+    uint32_t env_width = 0u, env_height = 0u;
+    float env_yaw = 0.0f;        // rotation about world +Z (radians)
+    float env_intensity = 1.0f;
 };
 
 // AOV destination pointers for ONE frame (raw device pointers). null skips that
@@ -427,6 +512,170 @@ __device__ __forceinline__ Vec3 SmoothWorldNormal(const DevInstance* __restrict_
     return Vec3{nw.x * inv, nw.y * inv, nw.z * inv};
 }
 
+// Triplanar blend weights from the (unit) local normal, biased (^4) so plane
+// transitions stay tight; normalized to sum 1.
+NUKA_RT_HD inline Vec3 TriplanarWeights(const Vec3& n) {
+    float wx = n.x * n.x, wy = n.y * n.y, wz = n.z * n.z;
+    wx *= wx; wy *= wy; wz *= wz;
+    const float s = wx + wy + wz;
+    const float inv = s > 1.0e-12f ? 1.0f / s : 1.0f;
+    return Vec3{wx * inv, wy * inv, wz * inv};
+}
+
+// Triplanar color sample: blend the X/Y/Z plane projections of `tex` at local
+// point p (tiled `scale` times per metre) by the normal-derived weights.
+NUKA_RT_HD inline Vec3 SampleTriplanarColor(const DevTexture& tex, const Vec3& p,
+                                            float scale, const Vec3& w) {
+    Vec3 acc{0.0f, 0.0f, 0.0f};
+    if (w.x > 1.0e-4f) {
+        const Vec3 c = SampleTexture(tex, p.y * scale, p.z * scale);
+        acc.x += c.x * w.x; acc.y += c.y * w.x; acc.z += c.z * w.x;
+    }
+    if (w.y > 1.0e-4f) {
+        const Vec3 c = SampleTexture(tex, p.x * scale, p.z * scale);
+        acc.x += c.x * w.y; acc.y += c.y * w.y; acc.z += c.z * w.y;
+    }
+    if (w.z > 1.0e-4f) {
+        const Vec3 c = SampleTexture(tex, p.x * scale, p.y * scale);
+        acc.x += c.x * w.z; acc.y += c.y * w.z; acc.z += c.z * w.z;
+    }
+    return acc;
+}
+
+// Tangent-space normal fetch: rgb in [0,1] -> [-1,1]^3 (GL convention, +Y up).
+// An unbound texture samples the neutral up normal (a perturbation no-op).
+NUKA_RT_HD inline Vec3 SampleNormalMap(const DevTexture& tex, float u, float v) {
+    if (tex.texels == nullptr) return Vec3{0.0f, 0.0f, 1.0f};
+    const Vec3 s = BilinearFetch3(tex.texels, tex.width, tex.height, tex.channels,
+                                  u, v, false);
+    return Vec3{2.0f * s.x - 1.0f, 2.0f * s.y - 1.0f, 2.0f * s.z - 1.0f};
+}
+
+// Triplanar whiteout-blend normal perturbation about the local normal n at local
+// point p. Each plane injects the base normal's tangent components (Golus blend);
+// the weighted sum is renormalized. Mirroring on the negative faces is accepted.
+NUKA_RT_HD inline Vec3 TriplanarNormal(const DevTexture& tex, const Vec3& p,
+                                       float scale, const Vec3& n, const Vec3& w) {
+    Vec3 acc{0.0f, 0.0f, 0.0f};
+    if (w.x > 1.0e-4f) {  // X plane: uv = (y, z)
+        const Vec3 t = SampleNormalMap(tex, p.y * scale, p.z * scale);
+        acc.x += fabsf(t.z) * n.x * w.x;
+        acc.y += (t.x + n.y) * w.x;
+        acc.z += (t.y + n.z) * w.x;
+    }
+    if (w.y > 1.0e-4f) {  // Y plane: uv = (x, z)
+        const Vec3 t = SampleNormalMap(tex, p.x * scale, p.z * scale);
+        acc.x += (t.x + n.x) * w.y;
+        acc.y += fabsf(t.z) * n.y * w.y;
+        acc.z += (t.y + n.z) * w.y;
+    }
+    if (w.z > 1.0e-4f) {  // Z plane: uv = (x, y)
+        const Vec3 t = SampleNormalMap(tex, p.x * scale, p.y * scale);
+        acc.x += (t.x + n.x) * w.z;
+        acc.y += (t.y + n.y) * w.z;
+        acc.z += fabsf(t.z) * n.z * w.z;
+    }
+    const float len2 = acc.x * acc.x + acc.y * acc.y + acc.z * acc.z;
+    if (len2 <= 1.0e-12f) return n;
+    const float inv = 1.0f / sqrtf(len2);
+    return Vec3{acc.x * inv, acc.y * inv, acc.z * inv};
+}
+
+// Enrich `mat` (albedo/roughness multiply their maps, glTF-style) and return the
+// texture-perturbed WORLD shading normal at the winning prim. `full` false samples
+// the albedo only (GI bounces). Authored triangle UVs are used when the material
+// asks (triplanar==0) and the mesh ships them; everything else projects triplanar
+// in INSTANCE-LOCAL space, so maps stick to moving bodies. BEAUTY-ONLY; a null
+// `textures` or an untextured material returns n_world with `mat` untouched.
+__device__ __forceinline__ Vec3 ApplyMaterialTextures(
+    const DevInstance* __restrict__ instances,
+    const DevTexture* __restrict__ textures,
+    uint32_t packed_prim, const Vec3& hit_world, float bu, float bv,
+    const Vec3& n_world, Material* mat, bool full) {
+    if (textures == nullptr) return n_world;
+    const bool want_albedo = mat->albedo_tex >= 0;
+    const bool want_rough = full && mat->roughness_tex >= 0;
+    const bool want_normal = full && mat->normal_tex >= 0;
+    if (!want_albedo && !want_rough && !want_normal) return n_world;
+
+    uint32_t inst, local_prim;
+    UnpackPrimId(packed_prim, &inst, &local_prim);
+    const DevInstance& I = instances[inst];
+    const DevBlas& b = I.blas;
+    const DevPrim p = b.prims[local_prim];
+    const float scale = mat->uv_scale;
+
+    // Authored-UV arm: a triangle whose mesh ships per-vertex UVs, triplanar off.
+    if (mat->triplanar == 0u && b.tri_uv0 != nullptr &&
+        p.kind == static_cast<uint32_t>(PrimKind::Triangle)) {
+        const Vec3 uv0 = b.tri_uv0[p.sub], uv1 = b.tri_uv1[p.sub], uv2 = b.tri_uv2[p.sub];
+        const float w0 = 1.0f - bu - bv;
+        const float u = (w0 * uv0.x + bu * uv1.x + bv * uv2.x) * scale;
+        const float v = (w0 * uv0.y + bu * uv1.y + bv * uv2.y) * scale;
+        if (want_albedo) {
+            const Vec3 c = SampleTexture(textures[mat->albedo_tex], u, v);
+            mat->albedo = Vec3{mat->albedo.x * c.x, mat->albedo.y * c.y,
+                               mat->albedo.z * c.z};
+        }
+        if (want_rough) {
+            const Vec3 r = SampleTexture(textures[mat->roughness_tex], u, v);
+            mat->roughness = fminf(1.0f, fmaxf(0.02f, mat->roughness * r.x));
+        }
+        if (want_normal) {
+            // Tangent frame from the local edges + UV deltas, rotated to world.
+            const Vec3 e1{b.tri_v1[p.sub].x - b.tri_v0[p.sub].x,
+                          b.tri_v1[p.sub].y - b.tri_v0[p.sub].y,
+                          b.tri_v1[p.sub].z - b.tri_v0[p.sub].z};
+            const Vec3 e2{b.tri_v2[p.sub].x - b.tri_v0[p.sub].x,
+                          b.tri_v2[p.sub].y - b.tri_v0[p.sub].y,
+                          b.tri_v2[p.sub].z - b.tri_v0[p.sub].z};
+            const float du1 = uv1.x - uv0.x, dv1 = uv1.y - uv0.y;
+            const float du2 = uv2.x - uv0.x, dv2 = uv2.y - uv0.y;
+            const float det = du1 * dv2 - du2 * dv1;
+            if (fabsf(det) > 1.0e-12f) {
+                const float r = 1.0f / det;
+                const Vec3 t_l{(e1.x * dv2 - e2.x * dv1) * r,
+                               (e1.y * dv2 - e2.y * dv1) * r,
+                               (e1.z * dv2 - e2.z * dv1) * r};
+                const Vec3 b_l{(e2.x * du1 - e1.x * du2) * r,
+                               (e2.y * du1 - e1.y * du2) * r,
+                               (e2.z * du1 - e1.z * du2) * r};
+                const Vec3 T = QuatRotate(I.transform.rotation, t_l);
+                const Vec3 B = QuatRotate(I.transform.rotation, b_l);
+                const Vec3 t = SampleNormalMap(textures[mat->normal_tex], u, v);
+                const Vec3 nn{T.x * t.x + B.x * t.y + n_world.x * t.z,
+                              T.y * t.x + B.y * t.y + n_world.y * t.z,
+                              T.z * t.x + B.z * t.y + n_world.z * t.z};
+                const float l2 = nn.x * nn.x + nn.y * nn.y + nn.z * nn.z;
+                if (l2 > 1.0e-12f) {
+                    const float inv = 1.0f / sqrtf(l2);
+                    return Vec3{nn.x * inv, nn.y * inv, nn.z * inv};
+                }
+            }
+        }
+        return n_world;
+    }
+
+    // Triplanar arm (instance-local space): boxes/terrain/spheres/deforming
+    // surfaces need no authored UVs. Local point + normal via the ray transform.
+    Vec3 p_l, n_l;
+    TransformRayToLocal(I.transform, hit_world, n_world, &p_l, &n_l);
+    const Vec3 w = TriplanarWeights(n_l);
+    if (want_albedo) {
+        const Vec3 c = SampleTriplanarColor(textures[mat->albedo_tex], p_l, scale, w);
+        mat->albedo = Vec3{mat->albedo.x * c.x, mat->albedo.y * c.y, mat->albedo.z * c.z};
+    }
+    if (want_rough) {
+        const Vec3 r = SampleTriplanarColor(textures[mat->roughness_tex], p_l, scale, w);
+        mat->roughness = fminf(1.0f, fmaxf(0.02f, mat->roughness * r.x));
+    }
+    if (want_normal) {
+        const Vec3 n_p = TriplanarNormal(textures[mat->normal_tex], p_l, scale, n_l, w);
+        return QuatRotate(I.transform.rotation, n_p);
+    }
+    return n_world;
+}
+
 // ---------------------------------------------------------------------------
 // SHARED beauty shade: the single-camera beauty TU and the batched sensor TU both
 // call these (the ONE-path move -- one shading model, two callers). RtMath2Pi /
@@ -476,10 +725,33 @@ NUKA_RT_HD inline Vec3 SampleCone(const Vec3& L, float ang, float u1, float u2) 
                                    t.z * x + b.z * y + L.z * cos_t});
 }
 
-// Procedural sky + ground dome along a ray direction (the miss shader). Smooth
-// horizon blend; below-horizon fades to a neutral ground fill so bounce rays that
-// escape downward still pick up plausible fill instead of pure black.
+// Procedural sky + ground dome along a ray direction (the miss shader). With an
+// environment map bound, the equirect HDR radiance replaces the gradient dome
+// (yaw-rotated about +Z, scaled by intensity); the sun-disc add stays on top.
 NUKA_RT_HD inline Vec3 SkyColor(const Vec3& dir, const BeautyParams& sky) {
+    if (sky.env_texels != nullptr) {
+        // Equirect: u from the yaw-rotated azimuth, v from the polar angle (row 0
+        // = zenith). Bilinear, u wraps, v clamps at the poles.
+        const float phi = atan2f(dir.y, dir.x) + sky.env_yaw;
+        const float u = phi * (1.0f / RtMath2Pi()) + 0.5f;
+        const float ct = fmaxf(-1.0f, fminf(1.0f, dir.z));
+        const float v = acosf(ct) * (1.0f / RtMathPi());
+        Vec3 c = BilinearFetch3(sky.env_texels, sky.env_width, sky.env_height, 3u,
+                                u, v, true);
+        c.x *= sky.env_intensity; c.y *= sky.env_intensity; c.z *= sky.env_intensity;
+        if (sky.sun_cos_radius > 0.0f) {
+            const float cd = dir.x * sky.sun_dir.x + dir.y * sky.sun_dir.y +
+                             dir.z * sky.sun_dir.z;
+            if (cd > sky.sun_cos_radius) {
+                const float edge = 1.0f - sky.sun_cos_radius;
+                const float t = edge > 1.0e-6f
+                    ? fminf(1.0f, (cd - sky.sun_cos_radius) / (0.1f * edge)) : 1.0f;
+                c.x += sky.sun_radiance.x * t; c.y += sky.sun_radiance.y * t;
+                c.z += sky.sun_radiance.z * t;
+            }
+        }
+        return c;
+    }
     Vec3 c;
     if (dir.z >= 0.0f) {
         const float up = dir.z;   // 0 horizon .. 1 zenith
@@ -550,7 +822,8 @@ static __device__ __noinline__ Vec3 TraceEnv(const LbvhNode* __restrict__ tlas_n
                                        const DevInstance* __restrict__ instances,
                                        const Material* __restrict__ materials,
                                        const Light& light, const BeautyParams& sky,
-                                       const Vec3& ro, const Vec3& rd) {
+                                       const Vec3& ro, const Vec3& rd,
+                                       const DevTexture* __restrict__ textures = nullptr) {
     const float eps = 1.0e-3f;
     float bt; uint32_t bp;
     ClosestHit<float>(tlas_nodes, tlas_leaf_count, instances, ro, rd, eps, &bt, &bp);
@@ -558,7 +831,7 @@ static __device__ __noinline__ Vec3 TraceEnv(const LbvhNode* __restrict__ tlas_n
         return SkyColor(rd, sky);
     }
     uint32_t bi, blp; UnpackPrimId(bp, &bi, &blp);
-    const Material bmat = materials[instances[bi].material_id];
+    Material bmat = materials[instances[bi].material_id];
     Vec3 bn; float bu, bv;
     ReconstructHit<float>(instances, bp, ro, rd, &bn, &bu, &bv);
     bn = SmoothWorldNormal(instances, bp, bu, bv, bn);
@@ -570,6 +843,7 @@ static __device__ __noinline__ Vec3 TraceEnv(const LbvhNode* __restrict__ tlas_n
         return Vec3{s.x * bmat.albedo.x, s.y * bmat.albedo.y, s.z * bmat.albedo.z};
     }
     const Vec3 bhit{ro.x + bt * rd.x, ro.y + bt * rd.y, ro.z + bt * rd.z};
+    ApplyMaterialTextures(instances, textures, bp, bhit, bu, bv, bnf, &bmat, false);
     return ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, materials, light, sky, bhit,
                           bnf, bmat);
 }
@@ -612,7 +886,8 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
                                   const Material* __restrict__ materials,
                                   Light light, BeautyParams sky, const Vec3& hit,
                                   const Vec3& Ng, const Vec3& V, const Material& mat,
-                                  Rng* rng) {
+                                  Rng* rng,
+                                  const DevTexture* __restrict__ textures = nullptr) {
     (void)rng;  // dielectric interfaces are evaluated deterministically (no jitter).
     const float eps = 1.0e-3f;
     const Vec3 i{-V.x, -V.y, -V.z};  // incident travel direction (into the surface)
@@ -632,7 +907,7 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
     const Vec3 rdir = RtNormalize<float>(Reflect(i, Nf));
     const Vec3 ro_r{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
     const Vec3 refl = TraceEnv(tlas_nodes, tlas_leaf_count, instances, materials, light, sky,
-                               ro_r, rdir);
+                               ro_r, rdir, textures);
 
     Vec3 tdir;
     if (!Refract(i, Nf, eta, &tdir)) {
@@ -663,7 +938,7 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
             thr.z *= expf(-mat.absorption.z * bt);
         }
         uint32_t hi, hlp; UnpackPrimId(bp, &hi, &hlp);
-        const Material hmat = materials[instances[hi].material_id];
+        Material hmat = materials[instances[hi].material_id];
         Vec3 hn; float hu, hv;
         ReconstructHit<float>(instances, bp, ro, rd, &hn, &hu, &hv);
         hn = SmoothWorldNormal(instances, bp, hu, hv, hn);
@@ -672,6 +947,7 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
             // Hit an opaque body inside/behind the medium -> shade and stop.
             const float hnv = hn.x * (-rd.x) + hn.y * (-rd.y) + hn.z * (-rd.z);
             const Vec3 hnf = (hnv < 0.0f) ? Vec3{-hn.x, -hn.y, -hn.z} : hn;
+            ApplyMaterialTextures(instances, textures, bp, hpt, hu, hv, hnf, &hmat, false);
             const Vec3 sh = ShadeEnvOpaque(tlas_nodes, tlas_leaf_count, instances, materials,
                                            light, sky, hpt, hnf, hmat);
             transmitted = Vec3{thr.x * sh.x, thr.y * sh.y, thr.z * sh.z};
@@ -711,7 +987,8 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
                                   const Material* __restrict__ materials,
                                   Light light, BeautyParams sky, const Vec3& hit,
                                   const Vec3& Nf, const Vec3& V, const Material& mat,
-                                  Rng* rng) {
+                                  Rng* rng,
+                                  const DevTexture* __restrict__ textures = nullptr) {
     // Sun direction (toward the light) + a finite angular size -> penumbra.
     Vec3 Ls;
     if (light.directional) {
@@ -779,7 +1056,11 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
         ClosestHit<float>(tlas_nodes, tlas_leaf_count, instances, ro, d, eps, &bt, &bp,
                           sky.ao_radius);
         if (bp == kNoPrim || bt >= sky.ao_radius) {
-            const Vec3 s = SkyColor(d, sky);
+            Vec3 s = SkyColor(d, sky);
+            if (sky.env_texels != nullptr) {
+                // Firefly clamp: an HDR sun texel hit by a single indirect ray.
+                s.x = fminf(s.x, 16.0f); s.y = fminf(s.y, 16.0f); s.z = fminf(s.z, 16.0f);
+            }
             indirect.x += s.x * sky.sky_intensity;
             indirect.y += s.y * sky.sky_intensity;
             indirect.z += s.z * sky.sky_intensity;
@@ -791,8 +1072,10 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
         const float bnv = bn.x * (-d.x) + bn.y * (-d.y) + bn.z * (-d.z);
         Vec3 bnf = (bnv < 0.0f) ? Vec3{-bn.x, -bn.y, -bn.z} : bn;
         uint32_t bi, blp; UnpackPrimId(bp, &bi, &blp);
-        const Material bmat = materials[instances[bi].material_id];
+        Material bmat = materials[instances[bi].material_id];
         const Vec3 bhit{ro.x + bt * d.x, ro.y + bt * d.y, ro.z + bt * d.z};
+        // Textured bounce albedo so a textured floor color-bleeds correctly.
+        ApplyMaterialTextures(instances, textures, bp, bhit, bu, bv, bnf, &bmat, false);
         const Vec3 bso{bhit.x + bnf.x * eps, bhit.y + bnf.y * eps, bhit.z + bnf.z * eps};
         const bool bshadow =
             AnyOccluder<float>(tlas_nodes, tlas_leaf_count, instances, bso, Ls, eps,
@@ -813,21 +1096,6 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
                 direct.z + mat.albedo.z * indirect.z};
 }
 
-// Opaque smooth shading: face-forward the per-vertex smooth normal, then ShadeBeauty.
-// __noinline__ isolates this off the flat opaque arm so that path stays byte-exact.
-template <typename Rng>
-__device__ __noinline__ Vec3 ShadeBeautySmooth(
-    const LbvhNode* __restrict__ tlas_nodes, uint32_t tlas_leaf_count,
-    const DevInstance* __restrict__ instances, const Material* __restrict__ materials,
-    Light light, BeautyParams sky, const Vec3& hit, const Vec3& rd, uint32_t bp,
-    float u, float v, const Vec3& n, const Vec3& V, const Material& mat, Rng* rng) {
-    const Vec3 sn = SmoothWorldNormal(instances, bp, u, v, n);
-    const float snv = sn.x * (-rd.x) + sn.y * (-rd.y) + sn.z * (-rd.z);
-    const Vec3 Nf = (snv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
-    return ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials, light, sky,
-                       hit, Nf, V, mat, rng);
-}
-
 // Filmic ACES-ish tonemap of one linear channel (Narkowicz 2015 fit), clamped to
 // [0,1]. Applied per-channel to the averaged fidelity color when tonemap is on.
 NUKA_RT_HD inline float TonemapAces(float x) {
@@ -845,6 +1113,7 @@ void LaunchBeautyKernel(const PinholeCamera& camera,
                         uint32_t tlas_leaf_count,
                         const DevInstance* instances,
                         const Material* materials,
+                        const DevTexture* textures,
                         const Light& light,
                         const BeautyParams& sky,
                         uint32_t samples,

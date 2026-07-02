@@ -61,7 +61,9 @@ public:
 
     RtSceneHandle* BuildScene(const rt::TwoLevelScene& scene) override {
         auto handle = std::make_unique<RtSceneHandle>();
-        handle->device = rt::BuildTwoLevelScene(scene, backend_);
+        // The persistent texture-env cache survives FreeScene, so a per-frame
+        // rebuild over unchanged textures reuses the device residency (no re-upload).
+        handle->device = rt::BuildTwoLevelScene(scene, backend_, &tex_env_cache_);
         return handle.release();
     }
 
@@ -91,6 +93,8 @@ public:
 
 private:
     phi::Backend* backend_ = nullptr;
+    // Device-resident textures/env shared across every BuildScene on this backend.
+    rt::TextureEnvCache tex_env_cache_;
 };
 
 }  // namespace

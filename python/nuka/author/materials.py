@@ -281,7 +281,54 @@ def Rigid(friction: float = -1.0, mass: float = 1.0,
     return RigidMaterial(static=static, mass=mass, friction=friction)
 
 
+@_dc.dataclass(frozen=True)
+class RenderAppearance:
+    """A render (appearance) material: flat PBR scalars plus optional image maps.
+
+    ``albedo_map`` (sRGB) multiplies ``base_color``; ``roughness_map`` (linear)
+    multiplies ``roughness``; ``normal_map`` is a tangent-space GL normal map.
+    ``uv_scale`` tiles the maps (tiles per metre under ``triplanar``); triplanar
+    projects the maps in body-local space so no authored UVs are needed."""
+
+    name: str
+    base_color: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    metallic: float = 0.0
+    roughness: float = 1.0
+    sheen: float = 0.0
+    albedo_map: str = ""
+    roughness_map: str = ""
+    normal_map: str = ""
+    uv_scale: float = 1.0
+    triplanar: bool = True
+
+    def add_material_kwargs(self) -> dict:
+        import os
+        def ap(p: str) -> str:
+            return os.path.abspath(p) if p else ""
+        return dict(
+            name=self.name, base_color=[float(c) for c in self.base_color],
+            metallic=float(self.metallic), roughness=float(self.roughness),
+            sheen=float(self.sheen), albedo_map=ap(self.albedo_map),
+            roughness_map=ap(self.roughness_map), normal_map=ap(self.normal_map),
+            uv_scale=float(self.uv_scale), triplanar=bool(self.triplanar),
+        )
+
+
+def Render(name: str, base_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+           metallic: float = 0.0, roughness: float = 1.0, sheen: float = 0.0,
+           albedo_map: str = "", roughness_map: str = "", normal_map: str = "",
+           uv_scale: float = 1.0, triplanar: bool = True) -> RenderAppearance:
+    """An appearance material for any entity (rigid primitive or medium). Image
+    maps are file paths (PNG/JPG); empty strings keep the flat PBR scalars."""
+    if not name:
+        raise ValueError("materials.Render: name must be non-empty")
+    return RenderAppearance(name, base_color, metallic, roughness, sheen,
+                            albedo_map, roughness_map, normal_map, uv_scale,
+                            triplanar)
+
+
 __all__ = [
     "Cloth", "ClothMaterial", "Soft", "SoftXpbdMaterial", "MpmMaterial",
     "Fluid", "FluidPbfMaterial", "Granular", "Rigid", "RigidMaterial",
+    "Render", "RenderAppearance",
 ]

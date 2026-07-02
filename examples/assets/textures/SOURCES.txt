@@ -1,0 +1,29 @@
+Nuka-Physics renderer texture/HDRI assets
+Source: Poly Haven (https://polyhaven.com) — all assets CC0 (public domain).
+Downloaded directly from Poly Haven CDN (https://dl.polyhaven.org). No proxy.
+Map set per material: albedo (diffuse), roughness, normal (GL, "nor_gl").
+
+=== wood_planks/  (asset: wood_planks, 2K JPG, CC0) ===
+albedo.jpg     2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/wood_planks/wood_planks_diff_2k.jpg      CC0
+roughness.jpg  2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/wood_planks/wood_planks_rough_2k.jpg     CC0
+normal.jpg     2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/wood_planks/wood_planks_nor_gl_2k.jpg    CC0
+
+=== gravel/  (asset: gravel_floor, 1K JPG, CC0 — 1K chosen: 2K would blow 35MB budget) ===
+albedo.jpg     1K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_floor/gravel_floor_diff_1k.jpg    CC0
+roughness.jpg  1K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_floor/gravel_floor_rough_1k.jpg   CC0
+normal.jpg     1K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_floor/gravel_floor_nor_gl_1k.jpg  CC0
+
+=== fabric/  (asset: fabric_pattern_07, 2K JPG, CC0 — albedo = col_1 base color) ===
+albedo.jpg     2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/fabric_pattern_07/fabric_pattern_07_col_1_2k.jpg  CC0
+roughness.jpg  2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/fabric_pattern_07/fabric_pattern_07_rough_2k.jpg  CC0
+normal.jpg     2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/fabric_pattern_07/fabric_pattern_07_nor_gl_2k.jpg  CC0
+
+=== dirt/  (asset: brown_mud, 2K JPG, CC0) ===
+albedo.jpg     2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/brown_mud/brown_mud_diff_2k.jpg    CC0
+roughness.jpg  2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/brown_mud/brown_mud_rough_2k.jpg   CC0
+normal.jpg     2K  https://dl.polyhaven.org/file/ph-assets/Textures/jpg/2k/brown_mud/brown_mud_nor_gl_2k.jpg  CC0
+
+=== hdri/  (asset: kloofendal_43d_clear, 2K Radiance .hdr, CC0 — clear outdoor sky) ===
+sky_2k.hdr     2K  https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/kloofendal_43d_clear_2k.hdr  CC0
+
+All files are real Poly Haven downloads (no procedural fallback needed).

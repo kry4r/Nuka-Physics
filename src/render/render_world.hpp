@@ -32,11 +32,14 @@
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
+#include "rt/material.hpp"   // rt::Texture / rt::EnvironmentMap (decoded, backend-agnostic)
 #include "scene/asset/asset_ref.hpp"
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/entity.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -206,6 +209,81 @@ struct RenderLight {
 };
 
 // ---------------------------------------------------------------------------
+// TextureLibrary - deduplicated store of decoded image textures, keyed by file
+// path (+ colorspace, so the same file can serve as an sRGB albedo and a linear
+// data map). Materials reference a texture by its id (index into `Images()`);
+// RenderWorldToTwoLevelScene resolves each material's map paths through Resolve.
+// ---------------------------------------------------------------------------
+class TextureLibrary {
+public:
+    TextureLibrary() = default;
+    // Copies deep-copy the texel set so two libraries stay independent; the shared
+    // storage exists only to hand out a zero-copy, owning view (ImagesShared).
+    TextureLibrary(const TextureLibrary& o)
+        : images_(std::make_shared<std::vector<rt::Texture>>(*o.images_)),
+          key_to_id_(o.key_to_id_),
+          version_(o.version_) {}
+    TextureLibrary& operator=(const TextureLibrary& o) {
+        if (this != &o) {
+            images_ = std::make_shared<std::vector<rt::Texture>>(*o.images_);
+            key_to_id_ = o.key_to_id_;
+            version_ = o.version_;
+        }
+        return *this;
+    }
+    TextureLibrary(TextureLibrary&&) noexcept = default;
+    TextureLibrary& operator=(TextureLibrary&&) noexcept = default;
+
+    uint32_t Count() const { return static_cast<uint32_t>(images_->size()); }
+    const std::vector<rt::Texture>& Images() const { return *images_; }
+
+    // An owning, shareable view of the decoded texel set: the per-frame scene holds
+    // this instead of deep-copying, and it keeps the texels alive on its own.
+    std::shared_ptr<const std::vector<rt::Texture>> ImagesShared() const { return images_; }
+
+    // Monotone content stamp: bumps on every successful Intern so a device backend
+    // can tell an unchanged texture set (skip the H2D re-upload) from a changed one.
+    uint64_t Version() const { return version_; }
+
+    // Decode+intern `path` at the given colorspace (via the decoder callback, run at
+    // most once per distinct path+srgb). Returns the texture id, or kNoId when the
+    // path is empty or the decode yields an empty image (untextured -> no-op).
+    template <class Decoder>
+    uint32_t Intern(const std::string& path, bool srgb, Decoder&& decode) {
+        if (path.empty()) return kNoId;
+        const std::string key = (srgb ? "s:" : "l:") + path;
+        auto it = key_to_id_.find(key);
+        if (it != key_to_id_.end()) return it->second;
+        rt::Texture tex = decode(path, srgb);
+        if (tex.Empty()) return kNoId;
+        const uint32_t id = static_cast<uint32_t>(images_->size());
+        images_->push_back(std::move(tex));
+        key_to_id_.emplace(key, id);
+        version_ = NextTextureVersion();
+        return id;
+    }
+
+    // Id of an already-interned path+colorspace, or kNoId. -1 mapping for rt::Material.
+    int Resolve(const std::string& path, bool srgb) const {
+        if (path.empty()) return -1;
+        auto it = key_to_id_.find((srgb ? "s:" : "l:") + path);
+        return it == key_to_id_.end() ? -1 : static_cast<int>(it->second);
+    }
+
+private:
+    // Process-global monotone source so distinct intern events get distinct,
+    // never-aliasing stamps (each inline-fn local static is one across all TUs).
+    static uint64_t NextTextureVersion() {
+        static std::atomic<uint64_t> counter{0};
+        return counter.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+    std::shared_ptr<std::vector<rt::Texture>>  images_ =
+        std::make_shared<std::vector<rt::Texture>>();
+    std::unordered_map<std::string, uint32_t>  key_to_id_;
+    uint64_t                                   version_ = 0u;
+};
+
+// ---------------------------------------------------------------------------
 // RenderWorld - the full backend-agnostic render scene.
 // ---------------------------------------------------------------------------
 struct RenderWorld {
@@ -221,6 +299,12 @@ struct RenderWorld {
     std::vector<scene::RenderMaterial> materials;  // indexed by render_material_id
     std::vector<RenderCamera>          cameras;
     std::vector<RenderLight>           lights;
+
+    // Decoded PBR image textures the materials reference by path, and the HDR
+    // environment map (both beauty-only). Empty/disabled by default => flat
+    // materials + procedural sky (byte-identical to a scene authored without them).
+    TextureLibrary                     textures;
+    rt::EnvironmentMap                 environment;
 
     // The default render material applied when an instance references no material
     // (render_material_id == kNoId). Lives at the end of `materials` after build.
@@ -260,5 +344,11 @@ struct RenderWorld {
 // signature -- no separate SceneGraph argument.
 // ---------------------------------------------------------------------------
 RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::SceneMap& map);
+
+// Decode every material's image-texture map paths (albedo/roughness/normal) into
+// `world.textures` ONCE (deduped by path+colorspace). Idempotent; safe to call more
+// than once. A material with no map paths contributes nothing (byte-identical to a
+// world without textures). The HDR environment is decoded separately by the caller.
+void DecodeMaterialTextures(RenderWorld& world);
 
 }  // namespace nuka::render

@@ -231,6 +231,14 @@ add_library(nuka_sha256 INTERFACE)
 target_include_directories(nuka_sha256 SYSTEM INTERFACE
     ${CMAKE_SOURCE_DIR}/external/sha256)
 
+# --- stb_image / stb_image_write: image decode for the beauty texture pipeline
+# Public-domain single-header decoders under external/stb/ (see the license text
+# at the foot of each header). Header-only INTERFACE target; ONE TU
+# (render/texture_image.cpp) defines STB_IMAGE_IMPLEMENTATION.
+add_library(nuka_stb INTERFACE)
+target_include_directories(nuka_stb SYSTEM INTERFACE
+    ${CMAKE_SOURCE_DIR}/external)
+
 # --- Dear ImGui (M8.5 T1): the realtime viewport UI --------------------------
 # Vendored COPIED sources under external/imgui/ (mirror external/vhacd; NOT a
 # submodule) at the pinned tag v1.92.8-docking (see external/imgui/NUKA_VENDOR.md
