@@ -231,18 +231,23 @@ uint32_t DebugOverlay::AppendColliders(nk::World& world,
     char key[96];
     for (uint32_t i = 0; i < shapes.size(); ++i) {
         const auto& sh = shapes[i];
-        const bool has_body = (i < bodies);
+        // Resolve the owning body through the row's own body_id (shape rows are
+        // NOT 1:1 with body rows); body_id < 0 == static (ground / heightfield).
+        const uint32_t bid = (sh.body_id >= 0) ? static_cast<uint32_t>(sh.body_id)
+                                               : ~uint32_t(0);
+        const bool has_body = bid < bodies;
         const bool is_link =
-            has_body && i < body_to_link.size() && body_to_link[i] != ~uint32_t(0);
+            has_body && bid < body_to_link.size() && body_to_link[bid] != ~uint32_t(0);
         Transform pose = Transform::Identity();
         if (is_link) {
-            const uint32_t l = body_to_link[i];
+            const uint32_t l = body_to_link[bid];
             if (l < link_poses_.size()) pose = link_poses_[l];
             if (l < link_geom_local.size()) pose = pose * link_geom_local[l];
         } else if (has_body) {
-            pose = body_poses_[i];
+            pose = body_poses_[bid];
         }
-        const bool is_static = has_body ? (!is_link && body_inv_mass_[i] == 0.0f) : true;
+        const bool is_static =
+            has_body ? (!is_link && body_inv_mass_[bid] == 0.0f) : true;
         const uint32_t mat = is_static ? mat_static_ : mat_dynamic_;
         uint32_t mesh_id = render::kNoId;
         switch (sh.kind) {
