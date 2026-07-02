@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// nuka::runtime::app::viewer::ImGuiLayer -- the custom-beautified viewer UI (T3).
+// nuka::runtime::app::viewer::ImGuiLayer -- the custom-beautified viewer UI.
 //
 // Records the docked panel UI each frame. Consumes the vendored Dear ImGui as a
 // SYSTEM include (so its warnings stay out of -Werror and it is outside the
@@ -334,7 +334,7 @@ void ImGuiLayer::EnableDocking() {
     // The dock layout is built programmatically each session (BuildDefaultDockLayout)
     // -> do NOT persist/read imgui.ini (it would otherwise be written to the cwd and
     // its stale dock state would fight the programmatic layout). Disabling it also
-    // keeps the GATE-B composite + windowed run side-effect-free.
+    // keeps the deterministic composite + windowed run side-effect-free.
     io.IniFilename = nullptr;
 }
 
@@ -620,11 +620,11 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     ImGui::End();
 
     // ======================================================================
-    // DRIVE PANEL (VIEW-2) -- a GENERIC per-DOF drive-target editor. One slider
+    // DRIVE PANEL -- a GENERIC per-DOF drive-target editor. One slider
     // per DOF; moving a slider latches drive_dirty[d] so the viewer uploads ONLY
     // that DOF into FieldId::DriveTarget (env-major). NEVER a hardcoded grasp /
-    // choreography table (OD-7 / highest directive). With a FIXED ui_state this
-    // records deterministically (GATE-B / R12).
+    // choreography table (a flat per-DOF editor, never scene-specific). With a
+    // FIXED ui_state this records deterministically.
     // ======================================================================
     if (ImGui::Begin("Drive")) {
         SectionHeader("Drive Targets");
@@ -656,7 +656,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
 
         // -- Teleop: keyboard -> the SAME per-DOF drive seam + a policy command. The
         // viewer reads the keys + applies it BETWEEN frames (never here); this section
-        // only edits the plain ui_state so it records deterministically (GATE-B). ----
+        // only edits the plain ui_state so it records deterministically. ------------
         ImGui::Dummy(ImVec2(0.0f, 10.0f));
         SectionHeader("Teleop (keyboard)");
         ImGui::Checkbox("enable##teleop", &ui_state.teleop_enabled);

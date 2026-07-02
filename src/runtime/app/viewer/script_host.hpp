@@ -64,6 +64,10 @@ public:
     // Forget every registered lifecycle script (called on unload / before reload).
     void ClearScripts();
 
+    // Forget ONE registered lifecycle script (a deleted /script node); no-op for
+    // an unknown id.
+    void UnregisterScript(uint64_t stable_id);
+
     // Registered lifecycle-script count (editor / test introspection).
     size_t ScriptCount() const;
 

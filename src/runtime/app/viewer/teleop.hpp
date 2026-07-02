@@ -31,18 +31,14 @@ struct TeleopKeys {
 };
 
 // One teleop tick's locomotion command, handed to a command-consuming controller.
-// command_active latches when any move/yaw key is held; the command is sent every
-// frame regardless (zero on release stops the robot).
+// The producer sends it EVERY frame; a gated tick is all-zero (stops the robot).
 struct TeleopResult {
     bool  command_active = false;
     float command[3]     = {0.0f, 0.0f, 0.0f};  // vx, vy, wyaw
 };
 
-// Apply one frame of teleop to `ui`. When `enabled` is false (toggle off OR ImGui
-// owns the keyboard) NOTHING changes -- the gate is a first-class parameter so it is
-// directly testable. `dof_count` bounds DOF selection + the nudge (0 -> no per-DOF
-// effect). The selected DOF's drive target is nudged by ui.teleop_step and drive_dirty
-// latched, so the viewer's existing per-DOF UploadField loop uploads it.
+// One teleop tick. Gated (`enabled` false) => ui untouched + the ZERO command (still
+// sent every frame, so a gate/release stops the robot); enabled => base + held keys.
 inline TeleopResult ApplyTeleop(bool enabled, const TeleopKeys& keys,
                                 ViewerUiState& ui, uint32_t dof_count) {
     TeleopResult out;
@@ -67,8 +63,9 @@ inline TeleopResult ApplyTeleop(bool enabled, const TeleopKeys& keys,
         }
     }
 
-    // Locomotion command (continuous; zero on release stops the robot).
-    float vx = 0.0f, vy = 0.0f, wz = 0.0f;
+    // Locomotion command: the persistent baseline plus the held keys (all keys
+    // released -> back to the baseline, which is zero unless a CLI/script set it).
+    float vx = ui.teleop_cmd_base[0], vy = ui.teleop_cmd_base[1], wz = ui.teleop_cmd_base[2];
     if (keys.fwd)      vx += ui.teleop_lin;
     if (keys.back)     vx -= ui.teleop_lin;
     if (keys.strafe_l) vy += ui.teleop_lin;

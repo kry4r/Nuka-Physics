@@ -109,32 +109,33 @@ public:
     // here is unconditional (the viewer always renders); the G5 offscreen bypass
     // does not apply because no offscreen draw is issued. `out_intents` (optional)
     // receives the resolved ViewerControl dispatch from the command queue.
-    // `do_step` may be set false to publish without advancing physics (a paused
-    // viewport that still re-frames / re-publishes on env change). Returns the
-    // step health (true when do_step==false).
-    bool FramePublish(InputIntents* out_intents = nullptr, bool do_step = true) {
+    // `do_step` false publishes without advancing physics (a paused viewport that
+    // still re-frames on env change); `step_count` runs that many fixed-dt steps
+    // when stepping (the speed transport). Returns the step health (true if idle).
+    bool FramePublish(InputIntents* out_intents = nullptr, bool do_step = true,
+                      uint32_t step_count = 1u) {
         last_frame_rendered_ = false;
         // Drain the queue. When the caller does not want the intents back we still
         // need the MoveEntity payloads to apply the drag, so drain into a local.
         InputIntents local;
         InputIntents* intents = out_intents ? out_intents : &local;
         input_system_.Run(command_queue_, intents);
-        // VIEW-4: apply drag-to-move LIVE through the general path (entity ->
-        // nk::Data::UploadField) BEFORE the step so it perturbs THIS frame. Never
-        // touches the SceneIR / .nks (R13).
+        // Apply drag-to-move LIVE through the general path (entity ->
+        // nk::Data::UploadField) BEFORE the step; never touches the SceneIR/.nks.
         for (const MoveEntity& m : intents->move_entities) {
             ApplyMoveEntity(world_, render_world_, env_index_, m);
         }
-        // VIEW-6: honor a QUEUED StepOnce in the SAME frame it is pushed. The
-        // queue is drained ABOVE (inside Run), so `intents->step_once` is known
-        // before the step decision -- fold it in so an out-of-band StepOnce no
-        // longer lags one frame behind the in-UI Step button.
-        const bool step_now = do_step || intents->step_once;
-        // General control hook: a SceneController writes drive/force targets via the
-        // Data seam BEFORE the step it governs (it owns its own decimation).
-        if (controller_ != nullptr && step_now) controller_->OnStep(world_, env_index_);
+        // A QUEUED StepOnce is honored in the SAME frame it is pushed (the queue
+        // drained above), so an out-of-band step never lags the UI button.
+        uint32_t steps = do_step ? step_count : 0u;
+        if (intents->step_once && steps == 0u) steps = 1u;
         bool step_ok = true;
-        if (step_now) step_ok = sim_system_.Run(world_, planned_);
+        for (uint32_t s = 0; s < steps; ++s) {
+            // The general per-step control hook runs BEFORE the step it governs
+            // (a controller owns its own decimation, counted in steps).
+            if (controller_ != nullptr) controller_->OnStep(world_, env_index_);
+            step_ok = sim_system_.Run(world_, planned_) && step_ok;
+        }
         transform_sync_system_.Run(*publisher_, world_, env_index_, render_world_);
         return step_ok;
     }
