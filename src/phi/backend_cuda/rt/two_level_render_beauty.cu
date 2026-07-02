@@ -61,6 +61,7 @@ RenderBeautyKernel(PinholeCamera camera,
                                    uint32_t tlas_leaf_count,
                                    const DevInstance* __restrict__ instances,
                                    const Material* __restrict__ materials,
+                                   const DevTexture* __restrict__ textures,
                                    Light light, BeautyParams sky, uint32_t samples,
                                    uint32_t base_seed,
                                    float* __restrict__ out_color,
@@ -102,7 +103,7 @@ RenderBeautyKernel(PinholeCamera camera,
         const float nv = n.x * (-ray.dir.x) + n.y * (-ray.dir.y) + n.z * (-ray.dir.z);
         const Vec3 Nf = (nv < 0.0f) ? Vec3{-n.x, -n.y, -n.z} : n;
         uint32_t inst, lp; UnpackPrimId(bp, &inst, &lp);
-        const Material mat = materials[instances[inst].material_id];
+        Material mat = materials[instances[inst].material_id];
         const Vec3 hit{ray.origin.x + bt * ray.dir.x, ray.origin.y + bt * ray.dir.y,
                        ray.origin.z + bt * ray.dir.z};
         const Vec3 Vv = RtNormalize<Real>(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
@@ -114,14 +115,21 @@ RenderBeautyKernel(PinholeCamera camera,
             const float tv = sn.x * (-ray.dir.x) + sn.y * (-ray.dir.y) + sn.z * (-ray.dir.z);
             const Vec3 Nt = (tv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
             col = ShadeTransmissive(tlas_nodes, tlas_leaf_count, instances, materials,
-                                    light, sky, hit, Nt, Vv, mat, &rng);
-        } else if (sky.smooth_normals != 0u) {
-            // Opaque smooth arm: gated, isolated wrapper -> the flat else below is byte-exact.
-            col = ShadeBeautySmooth(tlas_nodes, tlas_leaf_count, instances, materials,
-                                    light, sky, hit, ray.dir, bp, u, v, n, Vv, mat, &rng);
+                                    light, sky, hit, Nt, Vv, mat, &rng, textures);
         } else {
+            // Opaque arm: optional smooth normal, then the material's image maps
+            // (albedo/roughness/normal) enrich the shade at this hit.
+            Vec3 Nsh = Nf;
+            if (sky.smooth_normals != 0u) {
+                const Vec3 sn = SmoothWorldNormal(instances, bp, u, v, n);
+                const float snv = sn.x * (-ray.dir.x) + sn.y * (-ray.dir.y) +
+                                  sn.z * (-ray.dir.z);
+                Nsh = (snv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
+            }
+            Nsh = ApplyMaterialTextures(instances, textures, bp, hit, u, v, Nsh,
+                                        &mat, true);
             col = ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials,
-                              light, sky, hit, Nf, Vv, mat, &rng);
+                              light, sky, hit, Nsh, Vv, mat, &rng, textures);
         }
         // Height/distance fog toward the sky-horizon: blend by 1-exp(-density*t).
         if (sky.fog_density > 0.0f) {
@@ -171,6 +179,7 @@ void LaunchBeautyKernel(const PinholeCamera& camera,
                         uint32_t tlas_leaf_count,
                         const DevInstance* instances,
                         const Material* materials,
+                        const DevTexture* textures,
                         const Light& light,
                         const BeautyParams& sky,
                         uint32_t samples,
@@ -181,9 +190,9 @@ void LaunchBeautyKernel(const PinholeCamera& camera,
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
                     (camera.height + kBlockDim - 1u) / kBlockDim);
     RenderBeautyKernel<<<grid, block, 0, stream>>>(
-        camera, tlas_nodes, tlas_leaf_count, instances, materials, light, sky,
-        samples, base_seed, dst.color, dst.depth, dst.normal, dst.albedo, dst.uv,
-        dst.prim);
+        camera, tlas_nodes, tlas_leaf_count, instances, materials, textures, light,
+        sky, samples, base_seed, dst.color, dst.depth, dst.normal, dst.albedo,
+        dst.uv, dst.prim);
 }
 
 }  // namespace nuka::rt
