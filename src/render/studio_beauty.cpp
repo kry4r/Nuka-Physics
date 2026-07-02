@@ -221,8 +221,16 @@ void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
 
 void PublishStudioScene(StudioScene& scene,
                         const std::vector<Transform>& link_pose,
-                        const std::vector<Vec3>& particle_pos) {
+                        const std::vector<Vec3>& particle_pos,
+                        const std::vector<Transform>& body_pose) {
     for (uint32_t i = 0; i < scene.link_instance_count; ++i) {
+        const PoseSource& ps = scene.world.instances[i].pose_source;
+        if (ps.kind == PoseSource::Kind::Body) {   // a free rigid body's visual.
+            if (ps.row < body_pose.size())
+                scene.world.instances[i].world_xform =
+                    body_pose[ps.row] * scene.visual_local[i];
+            continue;
+        }
         const uint32_t lk = scene.link_of_instance[i];
         if (lk < link_pose.size())
             scene.world.instances[i].world_xform = link_pose[lk] * scene.visual_local[i];

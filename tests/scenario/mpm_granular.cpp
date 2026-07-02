@@ -32,6 +32,8 @@
 #include "phi/op_schema.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
 #include "scene/cook/cook_to_model.hpp"
+#include "scene/format/nks.hpp"
+#include "scene/scene_ir.hpp"
 
 namespace {
 
@@ -428,9 +430,13 @@ TEST(MpmGranular, ConeReposeTracksFriction) {
     // Fluid control: the cone flattens out (no static flank).
     EXPECT_LT(fluid.angle_deg, 8.0f) << "a fluid holds no repose angle";
     EXPECT_LT(fluid.h_max, 0.5f * H) << "the fluid cone must collapse";
-    // Elastic control: the cone freezes near its authored shape.
+    // Elastic control: the cone freezes near its authored shape. (The 98th-pct
+    // height probe reads ~0.77*H even on the pristine cone -- the apex thins to a
+    // single particle -- so the height bound is on the probe's own scale.)
     EXPECT_GT(elast.angle_deg, 24.0f) << "the elastic cone must keep its flank";
-    EXPECT_GT(elast.h_max, 0.85f * H) << "the elastic cone must keep its height";
+    EXPECT_GT(elast.h_max, 0.70f * H) << "the elastic cone must keep its height";
+    EXPECT_GT(sand35.h_max, 0.95f * elast.h_max)
+        << "35-deg sand must hold the cone as the elastic control does";
 }
 
 // Gate b: a capsule pressed into the sand bed and lifted leaves a crater that
@@ -538,6 +544,71 @@ TEST(MpmGranular, CollapseByteIdenticalRunToRun) {
         << "granular particle positions differ run-to-run";
     EXPECT_EQ(0, std::memcmp(fa.data(), fb.data(), fa.size() * sizeof(float)))
         << "granular particle F differs run-to-run";
+}
+
+// Host-only data-model gate: Granular x MlsMpm validates + roundtrips through
+// .nks with its DP material; every other granular pairing / cross-declaration
+// is rejected LOUDLY.
+TEST(MpmGranular, ValidatorAndNksRoundtrip) {
+    namespace ns = nuka::scene;
+    auto make = [](ns::MediaRecord::Kind k, ns::MediaRecord::Method me,
+                   float model_kind) {
+        ns::MediaRecord m;
+        m.name = "bed";
+        m.kind = k;
+        m.method = me;
+        m.fluid_box.min = Vec3{-0.8f, -0.45f, 0.0f};
+        m.fluid_box.max = Vec3{0.8f, 0.45f, 0.035f};
+        m.fluid_box.spacing = 0.005f;
+        m.mpm.youngs = 3.0e5f;
+        m.mpm.poisson = 0.3f;
+        m.mpm.density = 1600.0f;
+        m.mpm.dp_friction = 35.0f;
+        m.mpm.dp_cohesion = 12.0f;
+        m.mpm.model_kind = model_kind;
+        m.mpm.dx = 0.01f;
+        m.mpm.substeps = 30u;
+        return m;
+    };
+    using K = ns::MediaRecord::Kind;
+    using Me = ns::MediaRecord::Method;
+    EXPECT_NO_THROW(cook::ValidateMedia({make(K::Granular, Me::MlsMpm, 4.0f)}));
+    EXPECT_NO_THROW(cook::ValidateMedia({make(K::Granular, Me::MlsMpm, 0.0f)}));
+    EXPECT_THROW(cook::ValidateMedia({make(K::Granular, Me::Xpbd, 4.0f)}),
+                 std::runtime_error);
+    EXPECT_THROW(cook::ValidateMedia({make(K::Granular, Me::Pbf, 4.0f)}),
+                 std::runtime_error);
+    EXPECT_THROW(cook::ValidateMedia({make(K::Fluid, Me::MlsMpm, 4.0f)}),
+                 std::runtime_error) << "model_kind 4 demands a Granular medium";
+    EXPECT_THROW(cook::ValidateMedia({make(K::Granular, Me::MlsMpm, 3.0f)}),
+                 std::runtime_error) << "a granular bed cannot declare fluid";
+
+    // The cook pins model_kind 4 even when the material field is left unset.
+    const cook::MpmCookInput cooked =
+        cook::BuildMpmInput(make(K::Granular, Me::MlsMpm, 0.0f));
+    EXPECT_EQ(4.0f, cooked.material.model_kind);
+    EXPECT_EQ(35.0f, cooked.material.dp_friction);
+    EXPECT_GT(cooked.positions.size(), 100u) << "the box lattice must sample";
+
+    // .nks roundtrip: kind string + the DP material survive save/load.
+    ns::SceneIR scene;
+    scene.AddMedia(make(K::Granular, Me::MlsMpm, 4.0f));
+    char tmpl[] = "/tmp/nks_granular_XXXXXX";
+    char* dir = ::mkdtemp(tmpl);
+    ASSERT_NE(nullptr, dir);
+    const std::string path = std::string(dir) + "/granular.nks";
+    ns::nks::Save(scene, path);
+    const ns::SceneIR loaded = ns::nks::Load(path);
+    ASSERT_EQ(1u, loaded.Media().size());
+    const ns::MediaRecord& r = loaded.Media().front();
+    EXPECT_EQ(K::Granular, r.kind);
+    EXPECT_EQ(Me::MlsMpm, r.method);
+    EXPECT_EQ(35.0f, r.mpm.dp_friction);
+    EXPECT_EQ(12.0f, r.mpm.dp_cohesion);
+    EXPECT_EQ(4.0f, r.mpm.model_kind);
+    EXPECT_EQ(0.005f, r.fluid_box.spacing);
+    std::remove(path.c_str());
+    ::rmdir(dir);
 }
 
 // Manual diagnostic: step one cone (env NUKA_CONE_KIND / NUKA_CONE_FRICTION)

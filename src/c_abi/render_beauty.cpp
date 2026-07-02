@@ -167,7 +167,17 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
                                    sizeof(nuka::math::Vec3));
         }
 
-        nuka::render::PublishStudioScene(studio, link_pose, particle_pos);
+        const uint32_t body_count = model.capacities.bodies_per_env;
+        std::vector<nuka::math::Transform> body_pose(
+            body_count, nuka::math::Transform::Identity());
+        if (body_count > 0u &&
+            record->world->FieldPtr(nuka::nk::FieldId::BodyPose) != nullptr) {
+            data.DownloadField(nuka::nk::FieldId::BodyPose, body_pose.data(),
+                               static_cast<uint64_t>(body_count) *
+                                   sizeof(nuka::math::Transform));
+        }
+
+        nuka::render::PublishStudioScene(studio, link_pose, particle_pos, body_pose);
 
         // Drive the camera + image size; trace the offline beauty frame to host.
         nuka::render::RasterOptions& o = studio.options;
