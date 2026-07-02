@@ -240,6 +240,9 @@ void PublishStudioScene(StudioScene& scene,
                         const std::vector<Transform>& body_pose) {
     for (uint32_t i = 0; i < scene.link_instance_count; ++i) {
         const PoseSource& ps = scene.world.instances[i].pose_source;
+        if (ps.kind == PoseSource::Kind::Static) {
+            continue;  // pinned at its bind pose (a static scene body's visual).
+        }
         if (ps.kind == PoseSource::Kind::Body) {   // a free rigid body's visual.
             if (ps.row < body_pose.size())
                 scene.world.instances[i].world_xform =
@@ -374,7 +377,10 @@ VulkanOffscreenReport StudioRtRenderer::Render(const RenderWorld& world,
         fb = im.backend->TraceBeautyToHost(im.handle, im.scene, cam, im.BeautyFromOptions(options));
     else
         fb = im.backend->TraceToHost(im.handle, im.scene, cam);
-    return FramebufferToReport(fb, options.background);
+    // An HDR environment IS the backdrop: keep the traced radiance on miss pixels
+    // (no environment => the flat background fill, byte-identical to today).
+    return FramebufferToReport(fb, options.background,
+                               im.beauty && world.environment.Enabled());
 }
 
 }  // namespace nuka::render

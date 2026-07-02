@@ -3293,6 +3293,27 @@ if(CMAKE_CUDA_COMPILER)
     # are the nuka_perf_test gtest binaries, see tools/perf/run_perf_baseline.py.)
 endif()
 
+# --- Beauty texture pipeline (host: stb decode + texture library + adapter) --
+# Gates the untextured no-op (an old material maps to identical rt::Material
+# data) + the textured plumbing (decode, dedupe, UV ride-along, miss-color
+# report). Pure host; no CUDA, no Vulkan.
+add_executable(nuka_texture_pipeline_test
+    render/test_texture_pipeline.cpp
+)
+target_include_directories(nuka_texture_pipeline_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(nuka_texture_pipeline_test
+    PRIVATE
+        nuka_render
+        nuka_import
+        nuka_stb
+        GTest::gtest_main
+)
+gtest_discover_tests(nuka_texture_pipeline_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    PROPERTIES LABELS "fast_full")
+
 # --- Vulkan renderer tests -------------------------------------------------
 if(NK_BUILD_VULKAN_VALIDATION)
     add_executable(nuka_render_test

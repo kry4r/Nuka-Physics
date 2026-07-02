@@ -39,7 +39,8 @@ uint8_t Encode(float linear) {
 }  // namespace
 
 VulkanOffscreenReport FramebufferToReport(const rt::Framebuffer& frame,
-                                          VulkanRgba8 background) {
+                                          VulkanRgba8 background,
+                                          bool keep_miss_color) {
     VulkanOffscreenReport rep;
     rep.width = frame.width;
     rep.height = frame.height;
@@ -51,14 +52,14 @@ VulkanOffscreenReport FramebufferToReport(const rt::Framebuffer& frame,
     size_t non_bg = 0;
     for (size_t p = 0; p < pixels; ++p) {
         const bool hit = have_prim && frame.prim[p] != kRtNoPrim;
-        if (hit && have_color) {
+        if ((hit || keep_miss_color) && have_color) {
             VulkanRgba8 px;
             px.r = Encode(frame.color[p * 3u + 0u]);
             px.g = Encode(frame.color[p * 3u + 1u]);
             px.b = Encode(frame.color[p * 3u + 2u]);
             px.a = 255u;
             rep.pixels[p] = px;
-            ++non_bg;
+            if (hit) ++non_bg;
         } else {
             rep.pixels[p] = background;
         }
