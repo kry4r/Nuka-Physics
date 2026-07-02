@@ -95,12 +95,14 @@ void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
                            uint32_t first, uint32_t count);
 
 // Refresh per-frame: each link-posed instance's world_xform = link_pose[link] o
-// visual_local; every particle surface is rebuilt from `particle_pos` in place (the
-// stable per-surface mesh, so the mesh table never grows across frames); every
-// particle skin re-bakes its instanced-sphere mesh from the live positions.
+// visual_local (a free-BODY instance poses from body_pose[row] instead); every
+// particle surface is rebuilt from `particle_pos` in place (the stable per-surface
+// mesh, so the mesh table never grows across frames); every particle skin re-bakes
+// its instanced-sphere mesh from the live positions.
 void PublishStudioScene(StudioScene& scene,
                         const std::vector<math::Transform>& link_pose,
-                        const std::vector<math::Vec3>& particle_pos);
+                        const std::vector<math::Vec3>& particle_pos,
+                        const std::vector<math::Transform>& body_pose = {});
 
 // The offline CUDA path-tracer over a StudioScene's RenderWorld. Rebuilds the BLAS
 // each frame (the surface deforms) and traces to a host RGBA8 report. ok() is false
