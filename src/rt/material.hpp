@@ -13,6 +13,7 @@
 #include "math/vec3.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace nuka::rt {
 
@@ -34,6 +35,41 @@ struct Material {
     // Grazing retroreflective sheen weight (silk/satin), beauty-only. 0 (default) is a
     // strict no-op: ShadeDirect ignores it and ShadeBeauty skips the term byte-exactly.
     float sheen = 0.0f;
+
+    // Image-texture references (index into TwoLevelScene::textures; -1 == none) and
+    // their UV controls. Consumed ONLY by the beauty path: albedo replaces base
+    // color (sRGB->linear), roughness scales the scalar, normal perturbs the shading
+    // normal (tangent space). All -1 (default) is a strict no-op opaque flat surface.
+    int   albedo_tex    = -1;
+    int   roughness_tex = -1;
+    int   normal_tex    = -1;
+    float uv_scale      = 1.0f;    // tiles per world metre (triplanar) or per UV unit
+    uint32_t triplanar  = 1u;      // 1 => world-space triplanar for no-UV geometry
+};
+
+// One decoded image texture (host). texels are row-major, `channels` floats per
+// texel in [0,1]; `srgb` flags an albedo image the sampler linearises. A separate
+// device upload (BuildTwoLevelScene) mirrors these into a flat buffer + descriptor.
+struct Texture {
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint32_t channels = 0u;   // 1 (grey), 3 (rgb) or 4 (rgba)
+    uint32_t srgb = 0u;       // 1 => decode sRGB->linear on sample
+    std::vector<float> texels;
+    bool Empty() const { return width == 0u || height == 0u || texels.empty(); }
+};
+
+// An equirectangular (lat-long) HDR environment map: the miss shader's radiance +
+// the sky-dome light. `texels` are linear RGB (3/texel), possibly HDR (>1). yaw
+// rotates it about the world up axis; intensity scales it. Disabled => the
+// procedural sky gradient is used (byte-identical to a scene with no environment).
+struct EnvironmentMap {
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    std::vector<float> texels;   // width*height*3, linear radiance
+    float yaw = 0.0f;            // rotation about +Z (radians)
+    float intensity = 1.0f;
+    bool Enabled() const { return width > 0u && height > 0u && !texels.empty(); }
 };
 
 // One analytic light. directional == true: `direction` is the (unit) direction

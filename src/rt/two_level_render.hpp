@@ -60,6 +60,15 @@ struct TriangleNormals {
     math::Vec3 n2;
 };
 
+// Per-vertex texture coordinates for ONE triangle (only x,y used; z ignored),
+// parallel to BlasMesh::triangles. Consumed ONLY by the beauty texture path;
+// empty => the tracer falls back to world-space triplanar projection.
+struct TriangleUVs {
+    math::Vec3 uv0;
+    math::Vec3 uv1;
+    math::Vec3 uv2;
+};
+
 // One UNIQUE mesh's primitives in its OWN LOCAL space (p13 declaration-order
 // layout: all triangles first, then spheres, then SDFs). A BLAS is built over
 // these ONCE. The per-prim material_id fields are UNUSED in G1-A (material is
@@ -73,6 +82,8 @@ struct BlasMesh {
     std::vector<SpherePrim> spheres;
     std::vector<SdfPrim> sdfs;
     std::vector<TriangleNormals> tri_normals;
+    // Per-triangle UVs (beauty texture path); empty => triplanar. 1:1 with triangles.
+    std::vector<TriangleUVs> tri_uvs;
 };
 
 // One placed instance: which unique mesh (blas_id indexes TwoLevelScene::meshes),
@@ -92,6 +103,11 @@ struct TwoLevelScene {
     std::vector<Material> materials;
     Light light;
     AmbientTerm ambient;
+    // Image textures referenced by Material::*_tex indices, and the HDR environment
+    // map (beauty path). Empty/disabled => flat materials + procedural sky (the
+    // byte-identical default for every scene authored without textures).
+    std::vector<Texture> textures;
+    EnvironmentMap environment;
 };
 
 // Which host AOV channels RenderBeauty copies back from the device. The kernel

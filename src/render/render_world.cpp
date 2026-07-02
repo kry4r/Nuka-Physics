@@ -19,6 +19,8 @@
 
 #include "render/render_world.hpp"
 
+#include "render/texture_image.hpp"
+
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "render/mesh_normals.hpp"
@@ -491,6 +493,14 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
         });
 
     return world;
+}
+
+void DecodeMaterialTextures(RenderWorld& world) {
+    for (const scene::RenderMaterial& m : world.materials) {
+        world.textures.Intern(m.albedo_map, true, &LoadTexture);
+        world.textures.Intern(m.roughness_map, false, &LoadTexture);
+        world.textures.Intern(m.normal_map, false, &LoadTexture);
+    }
 }
 
 }  // namespace nuka::render
