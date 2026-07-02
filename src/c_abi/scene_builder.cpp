@@ -249,12 +249,97 @@ nuka_result_t nuka_scene_add_rigid_primitive(
         // friction < 0 keeps the inherit-material sentinel; >= 0 is an explicit
         // per-shape override (the SAME precedence the cooker resolves).
         if (desc->friction >= 0.0f) shape.friction_mu = desc->friction;
+
+        // An authored render material adds a VISUAL-ONLY twin shape carrying it
+        // (contype/conaffinity 0 -- the imported-scene visual-geom pattern), so
+        // the primitive renders with that appearance. No material => today's
+        // collision-only record, byte-identical.
+        nscene::MaterialId material_id = nscene::kInvalidMaterial;
+        if (desc->material_name != nullptr && desc->material_name[0] != '\0') {
+            for (const nscene::MaterialRecord& m : sr->scene->Materials()) {
+                if (m.name == desc->material_name) { material_id = m.id; break; }
+            }
+            if (material_id == nscene::kInvalidMaterial) {
+                return NUKA_RESULT_INVALID_ARG;  // unknown material name (add first).
+            }
+        }
+        nscene::CollisionShapeRecord visual;
+        if (material_id != nscene::kInvalidMaterial) {
+            visual = shape;
+            visual.name = std::string(kind_name) + "_visual_" +
+                          std::to_string(sr->scene->ShapeCount() + 1u);
+            visual.contype = 0;
+            visual.conaffinity = 0;
+            visual.material_id = material_id;
+        }
         sr->scene->AddCollisionShape(std::move(shape));
+        if (material_id != nscene::kInvalidMaterial) {
+            sr->scene->AddCollisionShape(std::move(visual));
+        }
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
         return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_scene_add_material(nuka_scene_handle scene,
+                                      const nuka_render_material_desc_t* desc,
+                                      uint32_t* out_material_id) {
+    if (desc == nullptr || desc->name == nullptr || desc->name[0] == '\0') {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    try {
+        nscene::MaterialRecord rec;
+        rec.name = desc->name;
+        // An all-zero base color reads as opaque white (the zero-init ergonomic
+        // default; a black material authors an explicit tiny non-zero color).
+        const bool zero_color = desc->base_color[0] == 0.0f &&
+                                desc->base_color[1] == 0.0f &&
+                                desc->base_color[2] == 0.0f &&
+                                desc->base_color[3] == 0.0f;
+        rec.base_color = zero_color
+            ? nmath::Vec3{1.0f, 1.0f, 1.0f}
+            : nmath::Vec3{desc->base_color[0], desc->base_color[1], desc->base_color[2]};
+        rec.alpha = zero_color ? 1.0f : desc->base_color[3];
+        rec.metallic = desc->metallic;
+        rec.roughness = desc->roughness > 0.0f ? desc->roughness : 0.5f;
+        rec.sheen = desc->sheen;
+        if (desc->albedo_map != nullptr) rec.albedo_map = desc->albedo_map;
+        if (desc->roughness_map != nullptr) rec.roughness_map = desc->roughness_map;
+        if (desc->normal_map != nullptr) rec.normal_map = desc->normal_map;
+        rec.uv_scale = desc->uv_scale > 0.0f ? desc->uv_scale : 1.0f;
+        rec.triplanar = desc->triplanar != 0u;
+        const nscene::MaterialId id = sr->scene->AddMaterial(std::move(rec));
+        if (out_material_id != nullptr) *out_material_id = id;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
+                                         const nuka_environment_desc_t* desc) {
+    if (desc == nullptr) return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    try {
+        nscene::EnvironmentRecord rec;
+        if (desc->hdri != nullptr) rec.hdri = desc->hdri;
+        rec.yaw_deg = desc->yaw_deg;
+        rec.intensity = desc->intensity > 0.0f ? desc->intensity : 1.0f;
+        rec.use_scene_materials = desc->use_scene_materials != 0u;
+        sr->scene->EnvironmentMut() = std::move(rec);
+        return NUKA_RESULT_OK;
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
