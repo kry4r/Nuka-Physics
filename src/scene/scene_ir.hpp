@@ -440,6 +440,14 @@ public:
     // is C1c.
     void AddContactPair(ContactPairOverride pair);
 
+    // Remove the body subtree at `root` + every record referencing it; survivors
+    // re-densify with all cross-references remapped. False when `root` is invalid.
+    bool RemoveBodySubtree(BodyId root);
+
+    // Remove one script record (ids re-densify, facade re-projects). False when
+    // `id` is invalid.
+    bool RemoveScript(ScriptId id);
+
     // -- counts -------------------------------------------------------------
     size_t RigidBodyCount() const;
     size_t JointCount()     const;

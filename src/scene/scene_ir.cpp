@@ -4,6 +4,8 @@
 
 #include "scene/scene_ir.hpp"
 
+#include <cstddef>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -262,6 +264,210 @@ void SceneIR::AddExcludePair(BodyId a, BodyId b) {
 void SceneIR::AddContactPair(ContactPairOverride pair) {
     // Stored verbatim in authoring order; no dedup / merge here (that is C1c).
     contact_pairs_.push_back(pair);
+}
+
+bool SceneIR::RemoveBodySubtree(BodyId root) {
+    if (root >= bodies_.size()) {
+        return false;
+    }
+
+    // Deleted set: the root + every transitive parent_id descendant.
+    std::vector<bool> del(bodies_.size(), false);
+    del[root] = true;
+    for (bool more = true; more;) {
+        more = false;
+        for (size_t i = 0; i < bodies_.size(); ++i) {
+            const BodyId p = bodies_[i].parent_id;
+            if (!del[i] && p != kInvalidBody && p < del.size() && del[p]) {
+                del[i] = true;
+                more = true;
+            }
+        }
+    }
+
+    // Deleted body names, captured before compaction (the IC-key match below).
+    std::vector<std::string> deleted_names;
+    for (size_t i = 0; i < bodies_.size(); ++i) {
+        if (del[i]) deleted_names.push_back(bodies_[i].name);
+    }
+
+    // Compact bodies; old->new id map (kInvalidBody for deleted).
+    std::vector<BodyId> body_map(bodies_.size(), kInvalidBody);
+    {
+        std::vector<RigidBodyRecord> kept;
+        kept.reserve(bodies_.size());
+        for (size_t i = 0; i < bodies_.size(); ++i) {
+            if (del[i]) continue;
+            body_map[i] = static_cast<BodyId>(kept.size());
+            kept.push_back(std::move(bodies_[i]));
+        }
+        for (size_t i = 0; i < kept.size(); ++i) {
+            kept[i].id = static_cast<BodyId>(i);
+            if (kept[i].parent_id != kInvalidBody) {
+                kept[i].parent_id = body_map[kept[i].parent_id];
+            }
+        }
+        bodies_ = std::move(kept);
+    }
+    const auto body_deleted = [&](BodyId b) {
+        return b != kInvalidBody && (b >= body_map.size() || body_map[b] == kInvalidBody);
+    };
+    const auto remap_body = [&](BodyId b) {
+        return (b == kInvalidBody) ? kInvalidBody : body_map[b];
+    };
+
+    // Compact shapes (drop those on deleted bodies); old->new shape id map.
+    std::vector<ShapeId> shape_map(shapes_.size(), kInvalidShape);
+    {
+        std::vector<CollisionShapeRecord> kept;
+        kept.reserve(shapes_.size());
+        for (size_t i = 0; i < shapes_.size(); ++i) {
+            if (body_deleted(shapes_[i].body_id)) continue;
+            shape_map[i] = static_cast<ShapeId>(kept.size());
+            kept.push_back(std::move(shapes_[i]));
+        }
+        for (size_t i = 0; i < kept.size(); ++i) {
+            kept[i].id = static_cast<ShapeId>(i);
+            kept[i].body_id = remap_body(kept[i].body_id);
+        }
+        shapes_ = std::move(kept);
+    }
+
+    // Compact joints (drop those touching a deleted body); old->new joint id map.
+    std::vector<JointId> joint_map(joints_.size(), kInvalidJoint);
+    {
+        std::vector<JointRecord> kept;
+        kept.reserve(joints_.size());
+        for (size_t i = 0; i < joints_.size(); ++i) {
+            if (body_deleted(joints_[i].parent_body) ||
+                body_deleted(joints_[i].child_body)) {
+                continue;
+            }
+            joint_map[i] = static_cast<JointId>(kept.size());
+            kept.push_back(std::move(joints_[i]));
+        }
+        for (size_t i = 0; i < kept.size(); ++i) {
+            kept[i].id = static_cast<JointId>(i);
+            kept[i].parent_body = remap_body(kept[i].parent_body);
+            kept[i].child_body = remap_body(kept[i].child_body);
+        }
+        joints_ = std::move(kept);
+    }
+
+    // Actuators on a removed joint drop; survivors remap the joint reference.
+    {
+        std::vector<ActuatorRecord> kept;
+        kept.reserve(actuators_.size());
+        for (auto& a : actuators_) {
+            if (a.joint_id != kInvalidJoint &&
+                (a.joint_id >= joint_map.size() || joint_map[a.joint_id] == kInvalidJoint)) {
+                continue;
+            }
+            if (a.joint_id != kInvalidJoint) a.joint_id = joint_map[a.joint_id];
+            a.id = static_cast<ActuatorId>(kept.size());
+            kept.push_back(std::move(a));
+        }
+        actuators_ = std::move(kept);
+    }
+
+    // Body-mounted sensors on a deleted body drop; survivors remap. Link/Base
+    // mounts are articulation-indexed (a cook product) and pass through.
+    {
+        std::vector<SensorDesc> kept;
+        kept.reserve(sensors_.size());
+        for (auto& s : sensors_) {
+            if (s.mount == MountFrame::Body && body_deleted(s.mount_index)) continue;
+            if (s.mount == MountFrame::Body && s.mount_index != kInvalidBody) {
+                s.mount_index = body_map[s.mount_index];
+            }
+            s.id = static_cast<SensorId>(kept.size());
+            kept.push_back(std::move(s));
+        }
+        sensors_ = std::move(kept);
+    }
+
+    // A camera / light attached to a deleted body belongs to the subtree: drop.
+    {
+        std::vector<CameraRecord> kept;
+        for (auto& c : cameras_) {
+            if (body_deleted(c.attached_body)) continue;
+            c.attached_body = remap_body(c.attached_body);
+            c.id = static_cast<CameraId>(kept.size());
+            kept.push_back(std::move(c));
+        }
+        cameras_ = std::move(kept);
+    }
+    {
+        std::vector<LightRecord> kept;
+        for (auto& l : lights_) {
+            if (body_deleted(l.attached_body)) continue;
+            l.attached_body = remap_body(l.attached_body);
+            l.id = static_cast<LightId>(kept.size());
+            kept.push_back(std::move(l));
+        }
+        lights_ = std::move(kept);
+    }
+
+    // Exclude pairs touching a deleted body drop; survivors remap+re-canonicalize.
+    {
+        std::vector<std::pair<BodyId, BodyId>> kept;
+        for (const auto& p : exclude_pairs_) {
+            if (body_deleted(p.first) || body_deleted(p.second)) continue;
+            BodyId a = remap_body(p.first), b = remap_body(p.second);
+            if (b < a) std::swap(a, b);
+            kept.emplace_back(a, b);
+        }
+        exclude_pairs_ = std::move(kept);
+    }
+
+    // Contact-pair overrides touching a deleted shape drop; survivors remap.
+    {
+        const auto shape_deleted = [&](ShapeId s) {
+            return s != kInvalidShape &&
+                   (s >= shape_map.size() || shape_map[s] == kInvalidShape);
+        };
+        std::vector<ContactPairOverride> kept;
+        for (auto p : contact_pairs_) {
+            if (shape_deleted(p.geom1) || shape_deleted(p.geom2)) continue;
+            if (p.geom1 != kInvalidShape) p.geom1 = shape_map[p.geom1];
+            if (p.geom2 != kInvalidShape) p.geom2 = shape_map[p.geom2];
+            kept.push_back(p);
+        }
+        contact_pairs_ = std::move(kept);
+    }
+
+    // Drop the settled IC of any articulation the removal touched (its key is a
+    // path-prefix of a deleted body's record name); untouched entries persist.
+    for (auto it = initial_state_.begin(); it != initial_state_.end();) {
+        bool touched = false;
+        for (const std::string& n : deleted_names) {
+            if (n == it->first ||
+                (n.size() > it->first.size() &&
+                 n.compare(0, it->first.size(), it->first) == 0 &&
+                 n[it->first.size()] == '/')) {
+                touched = true;
+                break;
+            }
+        }
+        it = touched ? initial_state_.erase(it) : std::next(it);
+    }
+
+    // Materials / media / terrain / settle / scripts are body-independent and
+    // persist verbatim (a script's dangling parent_path re-projects at root).
+    RebuildFacade();
+    return true;
+}
+
+bool SceneIR::RemoveScript(ScriptId id) {
+    if (id >= scripts_.size()) {
+        return false;
+    }
+    scripts_.erase(scripts_.begin() + static_cast<std::ptrdiff_t>(id));
+    for (size_t i = 0; i < scripts_.size(); ++i) {
+        scripts_[i].id = static_cast<ScriptId>(i);
+    }
+    RebuildFacade();
+    return true;
 }
 
 size_t SceneIR::RigidBodyCount() const { return bodies_.size(); }
