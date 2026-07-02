@@ -210,6 +210,7 @@ const char* MediaKindName(MediaRecord::Kind k) {
         case MediaRecord::Kind::Cloth:   return "cloth";
         case MediaRecord::Kind::SoftTet: return "soft_tet";
         case MediaRecord::Kind::Fluid:   return "fluid";
+        case MediaRecord::Kind::Granular: return "granular";
     }
     return "cloth";
 }
@@ -217,6 +218,7 @@ MediaRecord::Kind MediaKindFromName(const std::string& s) {
     if (s == "cloth") return MediaRecord::Kind::Cloth;
     if (s == "soft_tet") return MediaRecord::Kind::SoftTet;
     if (s == "fluid") return MediaRecord::Kind::Fluid;
+    if (s == "granular") return MediaRecord::Kind::Granular;
     throw std::runtime_error("nks: unknown media kind '" + s + "'");
 }
 

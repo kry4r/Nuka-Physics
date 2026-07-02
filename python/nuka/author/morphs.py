@@ -2,7 +2,7 @@
 
 A morph carries GEOMETRY, never physics behavior. ``NKS`` names a cooked scene
 file (the robot/world); the media lattices are ``Grid`` (cloth), ``TetSphere``
-(solid soft body) and ``FluidBox``; the rigid primitives are ``Box`` / ``Sphere``
+(solid soft body), ``FluidBox`` and ``GranularBed``; the rigid primitives are ``Box`` / ``Sphere``
 / ``Capsule`` / ``Plane`` / ``Ground``. The constitutive material + the surface
 are attached at ``Scene.add_entity`` and the per-step choreography lives in
 ``nuka.author.control``. A media morph exposes the geometry block of
@@ -111,6 +111,23 @@ class FluidBox:
 
 
 @_dc.dataclass(frozen=True)
+class GranularBed:
+    """A granular (sand/gravel) bed: the AABB ``[min, max]`` sampled on a uniform
+    ``spacing`` lattice. Pair with a ``materials.Granular.MPM`` (Drucker-Prager)."""
+
+    MEDIA_KIND = "granular"
+
+    min: Tuple[float, float, float]
+    max: Tuple[float, float, float]
+    spacing: float
+
+    def media_geometry_kwargs(self) -> dict:
+        return dict(fluid_min=[float(c) for c in self.min],
+                    fluid_max=[float(c) for c in self.max],
+                    fluid_spacing=float(self.spacing))
+
+
+@_dc.dataclass(frozen=True)
 class Box:
     """A rigid box of ``half_extents`` (x,y,z), at ``pos`` with orientation ``quat``
     (w,x,y,z). Movable/static + friction/mass come from a ``materials.Rigid``."""
@@ -187,6 +204,6 @@ class Ground:
 
 
 __all__ = [
-    "NKS", "Grid", "TetSphere", "FluidBox",
+    "NKS", "Grid", "TetSphere", "FluidBox", "GranularBed",
     "Box", "Sphere", "Capsule", "Plane", "Ground",
 ]

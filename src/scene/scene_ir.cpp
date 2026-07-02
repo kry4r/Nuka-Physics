@@ -582,6 +582,7 @@ SystemKindComponent::K SystemKindFromMediaKind(MediaRecord::Kind kind) {
         case MediaRecord::Kind::Cloth:   return SystemKindComponent::Cloth;
         case MediaRecord::Kind::SoftTet: return SystemKindComponent::Soft;
         case MediaRecord::Kind::Fluid:   return SystemKindComponent::Fluid;
+        case MediaRecord::Kind::Granular: return SystemKindComponent::Soft;
     }
     return SystemKindComponent::Soft;
 }
