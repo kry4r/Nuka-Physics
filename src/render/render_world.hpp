@@ -37,7 +37,9 @@
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/entity.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -214,8 +216,34 @@ struct RenderLight {
 // ---------------------------------------------------------------------------
 class TextureLibrary {
 public:
-    uint32_t Count() const { return static_cast<uint32_t>(images_.size()); }
-    const std::vector<rt::Texture>& Images() const { return images_; }
+    TextureLibrary() = default;
+    // Copies deep-copy the texel set so two libraries stay independent; the shared
+    // storage exists only to hand out a zero-copy, owning view (ImagesShared).
+    TextureLibrary(const TextureLibrary& o)
+        : images_(std::make_shared<std::vector<rt::Texture>>(*o.images_)),
+          key_to_id_(o.key_to_id_),
+          version_(o.version_) {}
+    TextureLibrary& operator=(const TextureLibrary& o) {
+        if (this != &o) {
+            images_ = std::make_shared<std::vector<rt::Texture>>(*o.images_);
+            key_to_id_ = o.key_to_id_;
+            version_ = o.version_;
+        }
+        return *this;
+    }
+    TextureLibrary(TextureLibrary&&) noexcept = default;
+    TextureLibrary& operator=(TextureLibrary&&) noexcept = default;
+
+    uint32_t Count() const { return static_cast<uint32_t>(images_->size()); }
+    const std::vector<rt::Texture>& Images() const { return *images_; }
+
+    // An owning, shareable view of the decoded texel set: the per-frame scene holds
+    // this instead of deep-copying, and it keeps the texels alive on its own.
+    std::shared_ptr<const std::vector<rt::Texture>> ImagesShared() const { return images_; }
+
+    // Monotone content stamp: bumps on every successful Intern so a device backend
+    // can tell an unchanged texture set (skip the H2D re-upload) from a changed one.
+    uint64_t Version() const { return version_; }
 
     // Decode+intern `path` at the given colorspace (via the decoder callback, run at
     // most once per distinct path+srgb). Returns the texture id, or kNoId when the
@@ -228,9 +256,10 @@ public:
         if (it != key_to_id_.end()) return it->second;
         rt::Texture tex = decode(path, srgb);
         if (tex.Empty()) return kNoId;
-        const uint32_t id = static_cast<uint32_t>(images_.size());
-        images_.push_back(std::move(tex));
+        const uint32_t id = static_cast<uint32_t>(images_->size());
+        images_->push_back(std::move(tex));
         key_to_id_.emplace(key, id);
+        version_ = NextTextureVersion();
         return id;
     }
 
@@ -242,8 +271,16 @@ public:
     }
 
 private:
-    std::vector<rt::Texture>                   images_;
+    // Process-global monotone source so distinct intern events get distinct,
+    // never-aliasing stamps (each inline-fn local static is one across all TUs).
+    static uint64_t NextTextureVersion() {
+        static std::atomic<uint64_t> counter{0};
+        return counter.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+    std::shared_ptr<std::vector<rt::Texture>>  images_ =
+        std::make_shared<std::vector<rt::Texture>>();
     std::unordered_map<std::string, uint32_t>  key_to_id_;
+    uint64_t                                   version_ = 0u;
 };
 
 // ---------------------------------------------------------------------------

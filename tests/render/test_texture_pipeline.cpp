@@ -112,7 +112,7 @@ TEST(TexturePipeline, UntexturedMaterialMapsAsAlways) {
     EXPECT_FLOAT_EQ(rt0.albedo.x, 0.25f);
     EXPECT_FLOAT_EQ(rt0.roughness, 0.4f);
     EXPECT_FLOAT_EQ(rt0.metallic, 0.9f);
-    EXPECT_TRUE(scene.textures.empty());
+    EXPECT_TRUE(scene.textures && scene.textures->empty());
     EXPECT_FALSE(scene.environment.Enabled());
 }
 
@@ -146,9 +146,10 @@ TEST(TexturePipeline, TexturedMaterialResolvesAndUvsRide) {
     EXPECT_EQ(rt0.roughness_tex, -1);
     EXPECT_FLOAT_EQ(rt0.uv_scale, 3.0f);
     EXPECT_EQ(rt0.triplanar, 0u);
-    ASSERT_EQ(scene.textures.size(), 2u);
-    EXPECT_EQ(scene.textures[rt0.albedo_tex].srgb, 1u);   // albedo decodes sRGB
-    EXPECT_EQ(scene.textures[rt0.normal_tex].srgb, 0u);   // normal stays linear
+    ASSERT_TRUE(scene.textures);
+    ASSERT_EQ(scene.textures->size(), 2u);
+    EXPECT_EQ((*scene.textures)[rt0.albedo_tex].srgb, 1u);   // albedo decodes sRGB
+    EXPECT_EQ((*scene.textures)[rt0.normal_tex].srgb, 0u);   // normal stays linear
     ASSERT_EQ(scene.meshes.size(), 1u);
     ASSERT_EQ(scene.meshes[0].tri_uvs.size(), 1u);
     EXPECT_FLOAT_EQ(scene.meshes[0].tri_uvs[0].uv1.x, 1.0f);

@@ -686,7 +686,7 @@ TEST(RenderWorldRt, TwoChannelTextureSamplesAsGreyNoOverread) {
     m.albedo_tex = 0; m.triplanar = 1u; m.uv_scale = 1.0f;
     scene.materials = {m, rt::Material{}};
     scene.instances.push_back({0u, {{0.0f, 1.5f, 0.6f}, math::Quat::Identity()}, 0u});
-    scene.textures = {tex};
+    scene.textures = std::make_shared<std::vector<rt::Texture>>(std::vector<rt::Texture>{tex});
     scene.light.directional = false;
     scene.light.position = {-1.5f, -2.0f, 2.5f};
     scene.light.color = {1.0f, 0.98f, 0.95f};
@@ -714,4 +714,58 @@ TEST(RenderWorldRt, TwoChannelTextureSamplesAsGreyNoOverread) {
     ASSERT_GT(hits, 0u) << "the textured box must cover some pixels";
     EXPECT_EQ(grey_ok, hits)
         << "2-channel albedo must sample as grey (ch0 replicated), not (grey,alpha,overread)";
+}
+
+// The backend's TextureEnvCache uploads the static texel set ONCE: three builds of
+// the same content re-upload zero times, the residency survives FreeScene, and a
+// reused build renders byte-identical to an independent no-cache fresh upload.
+TEST(RenderWorldRt, TextureEnvCacheReusesResidencyAcrossBuilds) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr) << "no CUDA RT backend available";
+
+    rt::Texture tex;
+    tex.width = 16u; tex.height = 16u; tex.channels = 3u; tex.srgb = 0u;
+    tex.texels.assign(16u * 16u * 3u, 0.5f);
+
+    rt::TwoLevelScene scene;
+    scene.meshes.push_back(BoxBlas({0.6f, 0.6f, 0.6f}));
+    rt::Material m; m.albedo = {1.0f, 1.0f, 1.0f}; m.metallic = 0.0f; m.roughness = 0.6f;
+    m.albedo_tex = 0; m.triplanar = 1u; m.uv_scale = 1.0f;
+    scene.materials = {m, rt::Material{}};
+    scene.instances.push_back({0u, {{0.0f, 1.5f, 0.6f}, math::Quat::Identity()}, 0u});
+    scene.textures = std::make_shared<std::vector<rt::Texture>>(std::vector<rt::Texture>{tex});
+    scene.texture_version = 0xC0FFEEu;  // a stable library-style content stamp
+
+    const uint64_t before = rt::DebugTextureUploadCount();
+    render::RtSceneHandle* h0 = backend->BuildScene(scene);
+    const uint64_t after1 = rt::DebugTextureUploadCount();
+    render::RtSceneHandle* h1 = backend->BuildScene(scene);
+    render::RtSceneHandle* h2 = backend->BuildScene(scene);
+    const uint64_t after3 = rt::DebugTextureUploadCount();
+    std::printf("TEXTURE_UPLOADS delta_build1=%llu delta_build2n3=%llu\n",
+                static_cast<unsigned long long>(after1 - before),
+                static_cast<unsigned long long>(after3 - after1));
+    EXPECT_EQ(after1 - before, 1u) << "first build uploads the texture set exactly once";
+    EXPECT_EQ(after3 - after1, 0u) << "reused residency must not re-upload (build 2 + 3)";
+
+    // The reused residency still renders, and byte-matches an independent no-cache
+    // fresh upload of the same texels (the cache never perturbs the image).
+    const rt::PinholeCamera camera = RefractCamera();
+    const rt::BeautyOptions opt = FixedBeauty();
+    const rt::Framebuffer cached = backend->TraceBeautyToHost(h2, scene, camera, opt);
+    ASSERT_GT(HitPixels(cached), 0u);
+    rt::TwoLevelSceneDevice fresh = rt::BuildTwoLevelScene(scene, nullptr, nullptr);
+    const rt::Framebuffer no_cache = rt::RenderBeauty(fresh, scene, camera, opt, nullptr);
+    EXPECT_TRUE(FramebuffersByteEqual(cached, no_cache));
+
+    backend->FreeScene(h0);
+    backend->FreeScene(h1);
+    backend->FreeScene(h2);
+
+    // FreeScene must NOT drop the cache: a build after all frees still reuses.
+    const uint64_t after_free = rt::DebugTextureUploadCount();
+    render::RtSceneHandle* h3 = backend->BuildScene(scene);
+    EXPECT_EQ(rt::DebugTextureUploadCount() - after_free, 0u)
+        << "cache survives FreeScene (residency shared with the backend, not the handle)";
+    backend->FreeScene(h3);
 }
