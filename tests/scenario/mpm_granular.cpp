@@ -712,7 +712,7 @@ TEST(MpmGranular, DISABLED_Throughput200k) {
     m.capacities.env_count = 1u;
     cook::MpmCookInput in;
     const float pdx = kDx * 0.5f;
-    const float half = 0.25f, top = 0.05f;   // 100 x 100 x 20 lattice = 200k.
+    const float half = 0.25f, top = 0.10f;   // 100 x 100 x 20 lattice = 200k.
     for (float x = -half; x < half - 1e-5f; x += pdx)
         for (float y = -half; y < half - 1e-5f; y += pdx)
             for (float z = pdx; z <= top + 1e-5f; z += pdx)
