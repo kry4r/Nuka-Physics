@@ -52,9 +52,11 @@ TRUNK = "base/trunk_assembly"
 
 # A big flat heightfield spanning the walkway (physics ground); tuned to cover
 # x in [-1.5, 8.5], y in [-2.0, 2.5] so every zone stands on it.
+# The physics heightfield sits 3 cm BELOW the visual dirt slab (top +0.002) so it
+# never z-fights the slab in the render; the duck's capsule feet rest on the slab.
 TERRAIN = {
     "name": "ground", "nrow": 100, "ncol": 45, "cell": 0.1,
-    "origin": [-1.5, -2.0, 0.0], "base_z": 0.0, "grade_x": 0.0, "grade_y": 0.0,
+    "origin": [-1.5, -2.0, 0.0], "base_z": -0.03, "grade_x": 0.0, "grade_y": 0.0,
     "ring_rise": 0.0, "ring_width": 0.0, "ring_platform": 0.0, "ring_count": 0,
     "bump_height": 0.0, "bump_cell": 0.0, "feature_cell": 0.0,
     "feature_margin": 0.0, "feature_seed": 0, "curric_levels": 0,
@@ -124,10 +126,13 @@ def build(args):
     b.add_material("rope_cord", base_color=[0.28, 0.20, 0.13], roughness=0.9)
 
     # -- duck head + trunk colliders (they ship visual-only) -------------------
-    b.add_collision_shape(HEAD, nuka.PRIMITIVE_SPHERE, dims=[0.045],
-                          pos=[0.02, 0.0, 0.03], friction=0.8)
-    b.add_collision_shape(TRUNK, nuka.PRIMITIVE_BOX, dims=[0.04, 0.035, 0.04],
-                          pos=[0.0, 0.0, 0.035], friction=0.8)
+    # Kept small + separated (head-sphere bottom well above trunk-box top) so the
+    # two added colliders never touch each other -- otherwise their mutual push
+    # extends the neck and lifts the head off the body.
+    b.add_collision_shape(HEAD, nuka.PRIMITIVE_SPHERE, dims=[0.04],
+                          pos=[0.02, 0.0, 0.0], friction=0.8)
+    b.add_collision_shape(TRUNK, nuka.PRIMITIVE_BOX, dims=[0.04, 0.035, 0.028],
+                          pos=[0.0, 0.0, -0.005], friction=0.8)
 
     # -- visual ground: a large dirt slab whose TOP sits just above the physics
     # heightfield, so it reads as the textured walkway and fills to the horizon
