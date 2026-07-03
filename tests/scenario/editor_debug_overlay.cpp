@@ -172,11 +172,17 @@ std::vector<Expected> ExpectedColliders(nuka::nk::World& w) {
         const bool has_body = (i < bodies);
         const bool is_link = has_body && i < b2l.size() && b2l[i] != ~uint32_t(0);
         e.is_static = has_body ? (!is_link && invm[i] == 0.0f) : true;
-        // A link reads LinkPose o link_geom_local; a free body reads BodyPose.
+        // A link reads LinkPose o its geom offset (proxy rows carry their own);
+        // a free body reads BodyPose.
         if (is_link) {
             const uint32_t l = b2l[i];
             if (l < lposes.size()) e.pose = lposes[l];
-            if (l < lgl.size()) e.pose = e.pose * lgl[l];
+            const auto& cl = w.GetModel().body_collidable_link;
+            if (i < cl.size() && cl[i] != ~uint32_t(0)) {
+                e.pose = e.pose * w.GetModel().body_collidable_local[i];
+            } else if (l < lgl.size()) {
+                e.pose = e.pose * lgl[l];
+            }
         } else if (has_body) {
             e.pose = poses[i];
         }
