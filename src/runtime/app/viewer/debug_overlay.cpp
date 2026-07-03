@@ -242,7 +242,13 @@ uint32_t DebugOverlay::AppendColliders(nk::World& world,
         if (is_link) {
             const uint32_t l = body_to_link[bid];
             if (l < link_poses_.size()) pose = link_poses_[l];
-            if (l < link_geom_local.size()) pose = pose * link_geom_local[l];
+            // A proxy collidable carries its own geom offset; the primary uses the link's.
+            const auto& coll_link = model.body_collidable_link;
+            if (bid < coll_link.size() && coll_link[bid] != ~uint32_t(0)) {
+                pose = pose * model.body_collidable_local[bid];
+            } else if (l < link_geom_local.size()) {
+                pose = pose * link_geom_local[l];
+            }
         } else if (has_body) {
             pose = body_poses_[bid];
         }
