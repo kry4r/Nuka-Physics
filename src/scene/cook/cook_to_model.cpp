@@ -1090,11 +1090,15 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
 
         // Snapshot the pre-proxy exclusion partners of a body row (inheritance).
         const std::vector<uint64_t> base_excludes = model.excluded_pairs;
-        auto add_exclude = [&](uint32_t a, uint32_t b) {
+        auto pair_key = [](uint32_t a, uint32_t b) {
             const uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
-            model.excluded_pairs.push_back(
-                (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+            return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
         };
+        auto add_exclude = [&](uint32_t a, uint32_t b) {
+            model.excluded_pairs.push_back(pair_key(a, b));
+        };
+        std::vector<uint64_t> base_sorted = base_excludes;
+        std::sort(base_sorted.begin(), base_sorted.end());
 
         for (uint32_t i = 0; i < proxy_count; ++i) {
             const ProxyCollidableSpec& px = link_proxies[i];
@@ -1134,8 +1138,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 model.body_init[row].inv_inertia = math::Vec3::Zero();
             }
 
-            // Exclusions: never contact the owner body, its excluded partners
-            // (filterparent inheritance), or a sibling collidable of the same link.
+            // Exclusions: never contact the owner body, its excluded partners, a
+            // same-link sibling, or a proxy whose owner bodies are excluded partners.
             add_exclude(row, px.owner_body);
             for (uint64_t key : base_excludes) {
                 const uint32_t lo = static_cast<uint32_t>(key >> 32);
@@ -1144,7 +1148,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 else if (hi == px.owner_body) add_exclude(row, lo);
             }
             for (uint32_t j = 0; j < i; ++j) {
-                if (link_proxies[j].owner_link == px.owner_link) {
+                const ProxyCollidableSpec& pj = link_proxies[j];
+                if (pj.owner_link == px.owner_link ||
+                    std::binary_search(base_sorted.begin(), base_sorted.end(),
+                                       pair_key(px.owner_body, pj.owner_body))) {
                     add_exclude(row, base + j);
                 }
             }
