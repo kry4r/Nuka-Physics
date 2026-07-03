@@ -75,6 +75,86 @@ int ParseFloatList(const char* text, float* out, int count) {
     return n;
 }
 
+// Build a unit quaternion (w-first) from a row-major rotation matrix whose
+// columns are orthonormal axes. Shepperd's method; matches
+// articulation_state RotationMatrixFromQuat so R = V reconstructs R*diag*R^T.
+math::Quat QuatFromMatrix(const double m[3][3]) {
+    const double tr = m[0][0] + m[1][1] + m[2][2];
+    math::Quat q;
+    if (tr > 0.0) {
+        const double s = std::sqrt(tr + 1.0) * 2.0;
+        q.w = static_cast<float>(0.25 * s);
+        q.x = static_cast<float>((m[2][1] - m[1][2]) / s);
+        q.y = static_cast<float>((m[0][2] - m[2][0]) / s);
+        q.z = static_cast<float>((m[1][0] - m[0][1]) / s);
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        const double s = std::sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+        q.w = static_cast<float>((m[2][1] - m[1][2]) / s);
+        q.x = static_cast<float>(0.25 * s);
+        q.y = static_cast<float>((m[0][1] + m[1][0]) / s);
+        q.z = static_cast<float>((m[0][2] + m[2][0]) / s);
+    } else if (m[1][1] > m[2][2]) {
+        const double s = std::sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+        q.w = static_cast<float>((m[0][2] - m[2][0]) / s);
+        q.x = static_cast<float>((m[0][1] + m[1][0]) / s);
+        q.y = static_cast<float>(0.25 * s);
+        q.z = static_cast<float>((m[1][2] + m[2][1]) / s);
+    } else {
+        const double s = std::sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+        q.w = static_cast<float>((m[1][0] - m[0][1]) / s);
+        q.x = static_cast<float>((m[0][2] + m[2][0]) / s);
+        q.y = static_cast<float>((m[1][2] + m[2][1]) / s);
+        q.z = static_cast<float>(0.25 * s);
+    }
+    return q.Normalized();
+}
+
+// Diagonalize a symmetric inertia tensor [Ixx Iyy Izz Ixy Ixz Iyz] (MuJoCo
+// fullinertia, body frame) into principal moments + a body->principal rotation
+// whose matrix columns are the principal axes. Jacobi sweeps (proper rotations,
+// det +1), so the returned rotation feeds inertial_transform directly.
+void DiagonalizeInertia(const float full[6], math::Vec3& diag, math::Quat& rot) {
+    double a[3][3] = {
+        {full[0], full[3], full[4]},
+        {full[3], full[1], full[5]},
+        {full[4], full[5], full[2]},
+    };
+    double v[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};  // eigenvector columns.
+    for (int sweep = 0; sweep < 32; ++sweep) {
+        const double off =
+            std::abs(a[0][1]) + std::abs(a[0][2]) + std::abs(a[1][2]);
+        if (off < 1e-20) break;
+        for (int p = 0; p < 2; ++p) {
+            for (int q = p + 1; q < 3; ++q) {
+                if (std::abs(a[p][q]) < 1e-300) continue;
+                const double theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                const double t = (theta >= 0.0 ? 1.0 : -1.0) /
+                                 (std::abs(theta) + std::sqrt(theta * theta + 1.0));
+                const double c = 1.0 / std::sqrt(t * t + 1.0);
+                const double s = t * c;
+                for (int k = 0; k < 3; ++k) {
+                    const double akp = a[k][p], akq = a[k][q];
+                    a[k][p] = c * akp - s * akq;
+                    a[k][q] = s * akp + c * akq;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const double apk = a[p][k], aqk = a[q][k];
+                    a[p][k] = c * apk - s * aqk;
+                    a[q][k] = s * apk + c * aqk;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const double vkp = v[k][p], vkq = v[k][q];
+                    v[k][p] = c * vkp - s * vkq;
+                    v[k][q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    diag = math::Vec3{static_cast<float>(a[0][0]), static_cast<float>(a[1][1]),
+                      static_cast<float>(a[2][2])};
+    rot = QuatFromMatrix(v);
+}
+
 struct MjcfJointDefaults {
     scene::JointType type = scene::JointType::Revolute;
     math::Vec3 axis = {0.0f, 1.0f, 0.0f};
@@ -82,6 +162,7 @@ struct MjcfJointDefaults {
     float upper_limit = 3.14159f;
     float damping = 0.0f;
     float armature = 0.0f;
+    float frictionloss = 0.0f;
 };
 
 struct MjcfGeneralDefaults {
@@ -237,6 +318,7 @@ void ApplyJointDefault(tinyxml2::XMLElement* joint_elem, MjcfDefaultClass* defau
                defaults->joint.upper_limit);
     joint_elem->QueryFloatAttribute("damping", &defaults->joint.damping);
     joint_elem->QueryFloatAttribute("armature", &defaults->joint.armature);
+    joint_elem->QueryFloatAttribute("frictionloss", &defaults->joint.frictionloss);
 }
 
 void ApplyGeneralDefault(tinyxml2::XMLElement* general_elem, MjcfDefaultClass* defaults) {
@@ -496,10 +578,19 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         if (const char* diag = inertial->Attribute("diaginertia")) {
             rec.inertia = ParseVec3(diag);
         } else if (const char* full = inertial->Attribute("fullinertia")) {
-            // fullinertia = [Ixx Iyy Izz Ixy Ixz Iyz]; keep the diagonal (the
-            // off-diagonal products are dropped -- the record carries a diagonal).
+            // fullinertia = [Ixx Iyy Izz Ixy Ixz Iyz] in the body frame.
+            // Diagonalize to principal moments + a body->principal rotation
+            // (MuJoCo semantics); the rotation folds into the inertial frame so
+            // the FULL tensor is physical (RotateDiagonalInertia rebuilds it).
             float v[6] = {1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f};
-            if (ParseFloatList(full, v, 6) >= 3) {
+            const int n = ParseFloatList(full, v, 6);
+            if (n >= 6) {
+                math::Vec3 principal;
+                math::Quat rot;
+                DiagonalizeInertia(v, principal, rot);
+                rec.inertia = principal;
+                rec.inertial_transform.rotation = rot;
+            } else if (n >= 3) {
                 rec.inertia = math::Vec3{v[0], v[1], v[2]};
             }
         }
@@ -698,6 +789,10 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         jrec.upper_limit = defaults.joint.upper_limit;
         jrec.damping = defaults.joint.damping;
         jrec.armature = defaults.joint.armature;
+        jrec.frictionloss = defaults.joint.frictionloss;
+        // A joint's own frictionloss attr overrides the resolved class default
+        // (QueryFloatAttribute writes only on success -> absent leaves the default).
+        joint->QueryFloatAttribute("frictionloss", &jrec.frictionloss);
         if (joint->Attribute("type")) {
             jrec.type = MjcfJointType(joint->Attribute("type"));
         }

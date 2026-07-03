@@ -90,6 +90,7 @@ struct ArticulationDeviceState {
     float* tau = nullptr;
     float* joint_damping = nullptr;
     float* joint_armature = nullptr;
+    float* joint_frictionloss = nullptr;
     float* joint_diagonal = nullptr;
     float* joint_force = nullptr;
     math::Vec3* joint_axis = nullptr;
@@ -256,6 +257,7 @@ inline ArticulationDeviceState MakeArticulationDeviceState(
     s.tau = data.tau;
     s.joint_damping = model.joint_damping;
     s.joint_armature = model.joint_armature;
+    s.joint_frictionloss = model.joint_frictionloss;
     s.joint_diagonal = data.joint_diagonal;
     s.joint_force = data.joint_force;
     s.joint_axis = model.joint_axis;

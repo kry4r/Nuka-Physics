@@ -819,3 +819,25 @@ fields:
   - {name: island_quads,       dtype: u32, per: row_slot,     arena: scratch, owner: data, elem: 4}
   - {name: island_count,       dtype: u32, per: scalar, count: "1",                     arena: scratch, owner: data}
   - {name: island_cub_temp,    dtype: u8,  per: scalar, count: "island_cub_temp_bytes", arena: scratch, owner: data}
+
+  # =========================================================================
+  # Joint dry friction (MuJoCo frictionloss). Per-link constant torque bound that
+  # opposes joint velocity, applied by the articulation velocity solve as a
+  # saturating, velocity-projecting term (implicit-friendly: never reverses qdot).
+  # 0 for every joint that does not author frictionloss -> byte-inert. APPENDED
+  # LAST so every pre-existing arena offset is byte-stable.
+  # =========================================================================
+  - {name: joint_frictionloss, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
+
+  # =========================================================================
+  # Per-body EXTRA-collidable link binding (multi-geom bodies/links). A body row
+  # that is a COLLIDABLE PROXY (an extra collision geom of an articulation link
+  # beyond the one folded into the link's own body row) carries the TEMPLATE-local
+  # source link in body_collidable_link and the geom's link-local offset in
+  # body_collidable_local; SyncLinkBodyPose then poses body_pose[row] =
+  # link_pose[link] o local for it. A non-proxy row carries ~0u (skip), so every
+  # single-geom scene is a no-op -> byte-identical. APPENDED LAST so every
+  # pre-existing arena offset is byte-stable.
+  # =========================================================================
+  - {name: body_collidable_link,  dtype: u32,       per: body, arena: persistent, owner: model}
+  - {name: body_collidable_local, dtype: transform, per: body, arena: persistent, owner: model}

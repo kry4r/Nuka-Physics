@@ -424,6 +424,10 @@ ArticulationHostState BuildArticulationHostState(
             result.tau.push_back(0.0f);
             result.joint_damping.push_back(topology.joint_dampings[local_link]);
             result.joint_armature.push_back(topology.joint_armatures[local_link]);
+            result.joint_frictionloss.push_back(
+                local_link < topology.joint_frictionlosses.size()
+                    ? topology.joint_frictionlosses[local_link]
+                    : 0.0f);
             result.joint_diagonal.push_back(0.0f);
             result.joint_force.push_back(0.0f);
             result.joint_axis.push_back(topology.joint_axes[local_link]);

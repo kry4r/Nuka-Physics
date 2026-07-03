@@ -124,6 +124,7 @@ struct JointRecord {
     float armature                         = 0.0f;
     float stiffness                        = 0.0f;
     float initial_position                 = 0.0f;
+    float frictionloss                     = 0.0f;   // MuJoCo joint dry friction
 };
 
 // Render-camera intrinsics carried inside a Camera/Depth SensorDesc. Width/height

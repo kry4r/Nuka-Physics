@@ -790,6 +790,7 @@ add_executable(nuka_import_test
     # importers (mjcf / urdf / usd / usdc / mesh)
     import/test_mjcf_importer.cpp
     import/test_mjcf_contact_filtering.cpp
+    import/test_inertia_friction.cpp
     import/test_urdf_importer.cpp
     import/test_usd_importer.cpp
     import/test_usd_mesh_geometry.cpp
@@ -1256,6 +1257,7 @@ if(CMAKE_CUDA_COMPILER)
         # broadphase -> cvx GJK/EPA narrowphase -> the unified contact buffer;
         # asserts contacts detected, <=4 pts, no NaN, retained (a,b) ids, tangent
         # basis (C4), and two-run byte-identity (the new path's own D1).
+        scenario/multi_geom_cook.cpp
         scenario/pairdriven_narrowphase.cpp
         # General contact pipeline Phase 1B: the PairDriven SOLVER + INTEGRATION gate.
         # Free x free (two boxes collide + symmetric momentum exchange), free x static
