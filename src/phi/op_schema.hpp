@@ -350,6 +350,11 @@ struct BuildSolveIslandsParams {
 struct MpmStepParams {
     uint32_t particle_count;     // total env-major particles (0 => inert no-op)
     uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
+    // MpmXpbd: the per-env MPM slice count [0, mpm_particles_per_env). The transfer
+    // kernels iterate this sub-slice, remapping thread -> (env, mpm_local) ->
+    // global = env*particles_per_env + mpm_local. 0 => the whole per-env block is MPM
+    // (single-MPM mode; then mpm_count == particle_count -> byte-identical launches).
+    uint32_t mpm_particles_per_env;
     uint32_t env_count;
     uint32_t nodes_per_env;      // per-env grid node count (mpm_grid_nodes_per_env)
     uint32_t grid_dims[3];       // per-env node resolution (nx, ny, nz)
@@ -514,6 +519,10 @@ struct NarrowphaseBodyParticleParams {
     // pos_source) so a fast fluid particle brakes within one step instead of lagging.
     uint32_t fluid_pos_source;    // 1 == fluid slice reads pbf_predicted_pos
     uint32_t n_soft_particles;    // per-env soft/fluid split (fluid is [n_soft, P))
+    // MpmXpbd: the first env-local particle that generates body rows. The MPM slice
+    // [0, particle_row_base) couples via the grid, NOT rows, so its reserved slots
+    // are zeroed (inactive) and it emits no manifold. 0 for every other mode.
+    uint32_t particle_row_base;
     // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
     // cooperatively); 0 == one thread per particle (analytic-only collider worlds,
     // no wide hull to split). BOTH paths are byte-identical; set by the cook-time max
@@ -657,6 +666,10 @@ inline constexpr uint32_t kParticleModeSoftFluid = 4u;
 // MLS-MPM continuum medium: the particle set is advanced by the P2G ->
 // grid-update -> G2P transfer loop (a new ParticleMode value, not a step branch).
 inline constexpr uint32_t kParticleModeMpm = 5u;
+// MPM + XPBD co-residence: an MLS-MPM slice [0, n_mpm) advanced by the transfer
+// loop and an XPBD slice [n_mpm, per_env) advanced by predict/project/finalize, in
+// ONE Model. Each slice scopes its own ops; the two couple on the shared seam.
+inline constexpr uint32_t kParticleModeMpmXpbd = 6u;
 
 // Common particle launch geometry (the views are pure pointer aggregates, so
 // every particle op carries its counts). particle_count == total env-major
@@ -694,6 +707,9 @@ struct ParticlePredictParams {
     // n_soft. 0 for the single-system modes (unused).
     uint32_t n_soft_particles; // per-env soft count (split index)
     uint32_t particles_per_env;// per-env particle stride
+    // MpmXpbd: the per-env MPM slice count. The XPBD predict SKIPS the low slice
+    // [0, n_mpm) (the transfer loop owns it); 0 for every non-MpmXpbd mode.
+    uint32_t n_mpm_particles;
 };
 
 struct XpbdProjectParams {
@@ -779,6 +795,9 @@ struct ParticleFinalizeParams {
     // Split-impulse position pass active: carry the per-particle pseudo velocity
     // onto the final position (non-penetration push-out). 0 leaves it byte-identical.
     uint32_t pos_pass;
+    // MpmXpbd: the per-env MPM slice count. The XPBD finalize SKIPS the low slice
+    // [0, n_mpm) (the transfer loop set its final pos/vel); 0 for non-MpmXpbd.
+    uint32_t n_mpm_particles;
 };
 
 // Cross-system — cross-system particle-particle CONTACT (the op-ified
