@@ -87,6 +87,9 @@ struct ModelView {
     uint32_t* bend_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_bend_colors*2
     uint32_t* vol_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_vol_colors*2
     uint32_t* sm_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_sm_colors*2
+    float* joint_frictionloss = nullptr;  // per:link arena:persistent owner:model flags:[param]
+    uint32_t* body_collidable_link = nullptr;  // per:body arena:persistent owner:model
+    ::nuka::math::Transform* body_collidable_local = nullptr;  // per:body arena:persistent owner:model
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena

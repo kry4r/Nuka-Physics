@@ -307,6 +307,11 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::JointArmature:
             StampPerLink(dst, a.joint_armature, L, E, sizeof(float));
             break;
+        case FieldId::JointFrictionloss:
+            // MuJoCo joint dry friction bound. Empty for scenes that author no
+            // frictionloss -> StampPerLink leaves the section zero -> byte-inert.
+            StampPerLink(dst, a.joint_frictionloss, L, E, sizeof(float));
+            break;
         case FieldId::ArticulationLinkCount: {
             // K entries per replica (one per co-resident articulation). The per-dog
             // link counts come from a.articulation_link_count; the per-replica term
@@ -731,6 +736,37 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        case FieldId::BodyCollidableLink: {
+            // Multi-geom collidable proxy source link (template-local, tiled
+            // env-major). Default ~0u == "not a proxy" (link 0 is a valid root, so
+            // an unpopulated row must NOT read as link 0). Empty template -> all
+            // ~0u -> the proxy pose pass is a no-op (single-geom scenes unchanged).
+            const uint32_t B = capacities.bodies_per_env;
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t b = 0; b < B; ++b) {
+                    p[static_cast<size_t>(e) * B + b] =
+                        (b < body_collidable_link.size()) ? body_collidable_link[b]
+                                                          : ~uint32_t(0);
+                }
+            }
+            break;
+        }
+        case FieldId::BodyCollidableLocal: {
+            // Proxy geom link-local offset (tiled env-major). Only read when the
+            // paired body_collidable_link != ~0u, so an unpopulated row's bytes are
+            // never used; a short/empty template leaves the trailing rows zero.
+            const uint32_t B = capacities.bodies_per_env;
+            auto* p = reinterpret_cast<math::Transform*>(dst);
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t b = 0; b < B; ++b) {
+                    if (b < body_collidable_local.size()) {
+                        p[static_cast<size_t>(e) * B + b] = body_collidable_local[b];
+                    }
+                }
+            }
+            break;
+        }
         case FieldId::Heights: {
             // H1 (general contact pipeline Phase 0): the GLOBAL flat heightfield
             // grid pool. EMPTY for every current scene (the cook fill is H2, Phase
@@ -772,9 +808,12 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         // General contact pipeline Phase 0 (R3 inverse tables + H1 height grid).
         case FieldId::BodyToLink:            v.body_to_link = static_cast<uint32_t*>(p); break;
         case FieldId::BodyToArticulation:    v.body_to_articulation = static_cast<uint32_t*>(p); break;
+        case FieldId::BodyCollidableLink:    v.body_collidable_link = static_cast<uint32_t*>(p); break;
+        case FieldId::BodyCollidableLocal:   v.body_collidable_local = static_cast<math::Transform*>(p); break;
         case FieldId::Heights:               v.heights = static_cast<float*>(p); break;
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
+        case FieldId::JointFrictionloss:     v.joint_frictionloss = static_cast<float*>(p); break;
         case FieldId::ArticulationLinkCount: v.articulation_link_count = static_cast<uint32_t*>(p); break;
         case FieldId::ArticulationLinkOffset:v.articulation_link_offset = static_cast<uint32_t*>(p); break;
         case FieldId::FootShape:             v.foot_shape = static_cast<float*>(p); break;
@@ -948,6 +987,8 @@ void MoveModelMembers(Model& dst, Model&& src) {
     // reaction). Moved here so the PairDriven cook's registry survives into World.
     dst.body_to_link = std::move(src.body_to_link);
     dst.body_to_articulation = std::move(src.body_to_articulation);
+    dst.body_collidable_link = std::move(src.body_collidable_link);
+    dst.body_collidable_local = std::move(src.body_collidable_local);
     dst.heightfields = std::move(src.heightfields);
     dst.heightfield_heights = std::move(src.heightfield_heights);
     // MLS-MPM material table: MISSING here dropped it on every move, so the World

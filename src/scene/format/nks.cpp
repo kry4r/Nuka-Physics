@@ -451,6 +451,7 @@ Value SaveJoint(const JointRecord& j) {
     o.Set("armature", Value::Float(j.armature));
     o.Set("stiffness", Value::Float(j.stiffness));
     o.Set("initial_position", Value::Float(j.initial_position));
+    o.Set("frictionloss", Value::Float(j.frictionloss));
     return o;
 }
 
@@ -1257,6 +1258,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.armature = j->At("armature").AsFloat();
             rec.stiffness = j->At("stiffness").AsFloat();
             rec.initial_position = j->At("initial_position").AsFloat();
+            // Backward-compatible: a pre-frictionloss .nks lacks the key -> 0.
+            if (const Value* fl = j->Find("frictionloss")) rec.frictionloss = fl->AsFloat();
             scene.AddJoint(std::move(rec));
         };
         for (const BodyNode& bn : body_nodes) {

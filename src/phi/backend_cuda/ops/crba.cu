@@ -425,6 +425,24 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
         }
     }
 
+    // MuJoCo joint dry friction (frictionloss): remove a bounded friction impulse
+    // frictionloss*dt from each scalar joint DOF via the diagonal admittance
+    // Minv[k][k], never reversing the velocity (max(0,..) => dissipative, non-
+    // oscillating). frictionloss==0 -> dv_max 0 -> qdot unchanged (byte-identical
+    // for scenes that author none); base (floating-root) DOFs carry no joint friction.
+    if (state.joint_frictionloss != nullptr && dt > 0.0f) {
+        for (uint32_t k = 0u; k < dof; ++k) {
+            if (dof_to_component[k] != kInvalidLink) continue;  // base DOFs: no joint friction.
+            const float fl = state.joint_frictionloss[dof_to_link[k]];
+            if (fl <= 0.0f) continue;
+            const float minv_kk = Minv[static_cast<size_t>(k) * dof_stride + k];
+            const float dv_max = fl * dt * minv_kk;
+            const float q = qdot_work[k];
+            const float mag = fabsf(q) - dv_max;
+            qdot_work[k] = (mag > 0.0f) ? (q > 0.0f ? mag : -mag) : 0.0f;
+        }
+    }
+
     // Write the corrected velocity back for every DOF (same as the solve kernel's
     // write-back): base DOFs -> link_velocity[root].v[component], scalar joint DOFs
     // -> state.qdot[link].

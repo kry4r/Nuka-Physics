@@ -59,6 +59,16 @@ constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
 // FusedFoot foot count) so the contact buffer grows with the cooked geometry.
 constexpr uint32_t kCandidatePairsPerCollidable = 4u;
 
+// One EXTRA collision geom of an articulation link (beyond the first, which folds
+// into the link's own body row via link_geom). Materialized into an appended
+// collidable body row so a link owns multiple collidables (multi-geom feet).
+struct ProxyCollidableSpec {
+    uint32_t owner_link  = ~0u;  // template-local link (pose source).
+    uint32_t owner_body  = ~0u;  // owner body row (exclusion inheritance).
+    uint32_t owner_artic = ~0u;  // template-local articulation.
+    uint32_t shape_row   = ~0u;  // cooked ModelShape / blob shape index.
+};
+
 // resolve the AUTHORED initial-condition for the cooked articulation
 // (the settle product, controller ruling R4: BAKED). Two sources, in priority:
 // (1) the InitialStateComponent set on the articulation root entity by
@@ -283,6 +293,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // an EMPTY body_init, so SeedInitialState skips the body block entirely).
     std::vector<uint8_t> body_is_articulation_link(blob.body_count, 0u);
 
+    // EXTRA link collision geoms (2nd+ primitive per link) -> appended collidable
+    // body rows (materialized after the model is built). Empty for single-geom links.
+    std::vector<ProxyCollidableSpec> link_proxies;
+
     // 4. Articulation template(s). transcribed the SINGLE-ENV
     // BuildArticulationHostState product 1:1; the multi-articulation
     // foundation transcribes the FULL set of co-resident topologies (K Go2 in
@@ -311,6 +325,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         m.link_inertial_frame = host.link_inertial_frame;
         m.joint_damping = host.joint_damping;
         m.joint_armature = host.joint_armature;
+        m.joint_frictionloss = host.joint_frictionloss;
         m.initial_q = host.q;                  // per LINK (scalar slot / link)
         m.initial_link_pose = host.link_pose;  // cook rest pose
         m.base_pose = host.base_pose.empty() ? math::Transform::Identity()
@@ -477,7 +492,18 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 continue;  // body is not an articulation link.
             }
             if (m.link_geom_kind[owner_link] != 0u) {
-                continue;  // keep the FIRST primitive for this link (deterministic).
+                // The link already carries its FIRST primitive (folded into its own
+                // body row). This 2nd+ primitive becomes an appended collidable
+                // PROXY row so the link owns multiple collidables (multi-geom feet).
+                ProxyCollidableSpec px;
+                px.owner_link = owner_link;
+                px.owner_body = body;
+                px.owner_artic = body < model.body_to_articulation.size()
+                                     ? model.body_to_articulation[body]
+                                     : ~uint32_t(0);
+                px.shape_row = shape;
+                link_proxies.push_back(px);
+                continue;
             }
             m.link_geom_kind[owner_link] = static_cast<uint32_t>(st) + 1u;
             const float radius = shape < blob.shapes.radii.size()
@@ -1027,6 +1053,127 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         }
         CookTerrainIntoModel(model, hf, cap.bodies_per_env);
         result.terrain = std::move(hf);
+    }
+
+    // Multi-geom collidable proxies: each EXTRA link collision primitive becomes
+    // its own appended collidable body row. Reuses the whole broadphase ->
+    // narrowphase -> assembly (a proxy resolves to its owner link via body_to_link)
+    // + SyncLinkBodyPose's proxy-pose pass. Empty for single-geom links -> the
+    // block is skipped and every existing scene is byte-identical.
+    if (!link_proxies.empty()) {
+        const uint32_t base = cap.bodies_per_env;   // rows before proxies.
+        const uint32_t proxy_count = static_cast<uint32_t>(link_proxies.size());
+        const uint32_t final_bodies = base + proxy_count;
+
+        // Grow every per-body table to the final row count. body_collidable_link/
+        // local default to ~0u/identity for the pre-proxy rows (not proxies).
+        model.body_collidable_link.assign(final_bodies, ~uint32_t(0));
+        model.body_collidable_local.assign(final_bodies, math::Transform::Identity());
+        model.body_to_link.resize(final_bodies, ~uint32_t(0));
+        model.body_to_articulation.resize(final_bodies, ~uint32_t(0));
+        // Preserve any TRAILING static shape rows (a non-terrain scene appends the
+        // ground plane at index bodies_per_env, one past the leaves); the proxies
+        // take the new leaf slots [base, base+proxy_count) and the static rows
+        // shift after them (terrain scenes have none here -> a no-op).
+        std::vector<nk::Model::PairDrivenShape> trailing_static;
+        if (model.shape_table_rows.size() > base) {
+            trailing_static.assign(model.shape_table_rows.begin() + base,
+                                   model.shape_table_rows.end());
+        }
+        model.shape_table_rows.resize(final_bodies);
+        if (!model.body_init.empty()) {
+            model.body_init.resize(final_bodies, nk::Model::BodyInit{});
+        }
+        if (!model.body_material_bucket.empty()) {
+            model.body_material_bucket.resize(final_bodies, 0u);
+        }
+
+        // Snapshot the pre-proxy exclusion partners of a body row (inheritance).
+        const std::vector<uint64_t> base_excludes = model.excluded_pairs;
+        auto pair_key = [](uint32_t a, uint32_t b) {
+            const uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+            return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+        };
+        auto add_exclude = [&](uint32_t a, uint32_t b) {
+            model.excluded_pairs.push_back(pair_key(a, b));
+        };
+        std::vector<uint64_t> base_sorted = base_excludes;
+        std::sort(base_sorted.begin(), base_sorted.end());
+
+        for (uint32_t i = 0; i < proxy_count; ++i) {
+            const ProxyCollidableSpec& px = link_proxies[i];
+            const uint32_t row = base + i;
+            const nk::ModelShape& sh = model.shapes[px.shape_row];
+
+            // shape_table row for the proxy collidable (primitive from the cook).
+            nk::Model::PairDrivenShape prow;
+            prow.kind = sh.kind;
+            prow.params[0] = sh.radius;
+            prow.params[1] = sh.half_height;
+            prow.params[2] = sh.half_extents.z;
+            if (sh.kind == static_cast<uint8_t>(ShapeType::Box)) {
+                prow.params[0] = sh.half_extents.x;
+                prow.params[1] = sh.half_extents.y;
+                prow.params[2] = sh.half_extents.z;
+            }
+            prow.contype = px.shape_row < blob.contact_params.contypes.size()
+                               ? blob.contact_params.contypes[px.shape_row] : 1u;
+            prow.conaffinity = px.shape_row < blob.contact_params.conaffinities.size()
+                                   ? blob.contact_params.conaffinities[px.shape_row] : 1u;
+            prow.sdf_grid = ~0u;
+            prow.body_id = static_cast<int32_t>(row);
+            prow.group = 0u;
+            model.shape_table_rows[row] = prow;
+
+            // Inverse maps (reaction -> owner link) + pose binding + material + freeze.
+            model.body_to_link[row] = px.owner_link;
+            model.body_to_articulation[row] = px.owner_artic;
+            model.body_collidable_link[row] = px.owner_link;
+            model.body_collidable_local[row] = sh.local_transform;
+            if (row < model.body_material_bucket.size()) {
+                model.body_material_bucket[row] = sh.material_bucket;
+            }
+            if (row < model.body_init.size()) {
+                model.body_init[row].inv_mass = 0.0f;
+                model.body_init[row].inv_inertia = math::Vec3::Zero();
+            }
+
+            // Exclusions: never contact the owner body, its excluded partners, a
+            // same-link sibling, or a proxy whose owner bodies are excluded partners.
+            add_exclude(row, px.owner_body);
+            for (uint64_t key : base_excludes) {
+                const uint32_t lo = static_cast<uint32_t>(key >> 32);
+                const uint32_t hi = static_cast<uint32_t>(key & 0xFFFFFFFFu);
+                if (lo == px.owner_body) add_exclude(row, hi);
+                else if (hi == px.owner_body) add_exclude(row, lo);
+            }
+            for (uint32_t j = 0; j < i; ++j) {
+                const ProxyCollidableSpec& pj = link_proxies[j];
+                if (pj.owner_link == px.owner_link ||
+                    std::binary_search(base_sorted.begin(), base_sorted.end(),
+                                       pair_key(px.owner_body, pj.owner_body))) {
+                    add_exclude(row, base + j);
+                }
+            }
+        }
+
+        std::sort(model.excluded_pairs.begin(), model.excluded_pairs.end());
+        model.excluded_pairs.erase(
+            std::unique(model.excluded_pairs.begin(), model.excluded_pairs.end()),
+            model.excluded_pairs.end());
+
+        // Re-append the preserved trailing static rows AFTER the proxy leaves, so a
+        // non-terrain scene's ground plane keeps its one-past-the-leaves position.
+        for (const auto& t : trailing_static) model.shape_table_rows.push_back(t);
+
+        // Grow the capacities: the new leaves join the LBVH + candidate budget.
+        // Body<->body only; a coupled world's disjoint body<->particle reserve is
+        // sized separately (multi-geom feet do not co-occur with particles today).
+        cap.bodies_per_env = final_bodies;
+        cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
+        cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
+        cap.max_contacts_per_env += proxy_count * kCandidatePairsPerCollidable;
+        cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
     }
 
     return result;
