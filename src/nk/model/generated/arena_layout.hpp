@@ -267,6 +267,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 4, 1, 16, 0},  // island_quads
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // island_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // island_cub_temp
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // joint_frictionloss
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 1, 4, 0},  // body_collidable_link
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 7, 28, 0},  // body_collidable_local
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

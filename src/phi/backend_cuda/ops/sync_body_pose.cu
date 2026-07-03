@@ -68,6 +68,29 @@ __global__ void SyncLinkBodyPoseKernel(
     body_pose[gb] = world;
 }
 
+// One thread per (env x body). A COLLIDABLE PROXY body row (an extra collision
+// geom of an articulation link) carries its source template-local link in
+// body_collidable_link (~0u == not a proxy) and the geom's link-local offset in
+// body_collidable_local; pose it from the source link's FK world pose. Multiple
+// proxies per link give a link multiple collidables (multi-geom feet). Non-proxy
+// rows (~0u) are skipped, so a single-geom world writes nothing here (no-op).
+__global__ void SyncProxyCollidablePoseKernel(
+    const math::Transform* __restrict__ link_pose,          // FK world poses (env*L)
+    const uint32_t* __restrict__ body_collidable_link,      // template-local link, or ~0u
+    const math::Transform* __restrict__ body_collidable_local,  // geom offset in the link frame
+    uint32_t total_bodies,                                   // env_count * bodies_per_env
+    uint32_t links_per_env,
+    uint32_t bodies_per_env,
+    math::Transform* __restrict__ body_pose) {
+    const uint32_t gb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gb >= total_bodies) return;
+    const uint32_t link_local = body_collidable_link[gb];
+    if (link_local == ~uint32_t(0) || link_local >= links_per_env) return;  // not a proxy.
+    const uint32_t env = gb / bodies_per_env;
+    const uint32_t gl = env * links_per_env + link_local;
+    body_pose[gb] = amf::ComposeTransformHD(link_pose[gl], body_collidable_local[gb]);
+}
+
 Status OpSyncLinkBodyPose(const ModelView& model, const DataView& data,
                           const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const SyncLinkBodyPoseParams*>(params);
@@ -90,6 +113,21 @@ Status OpSyncLinkBodyPose(const ModelView& model, const DataView& data,
                static_cast<const math::Transform*>(model.link_geom_local),
                total, p->links_per_env, p->bodies_per_env,
                static_cast<math::Transform*>(data.body_pose));
+    // Extra collidable proxies (multi-geom feet): pose the appended proxy body
+    // rows from their source link. A no-op when the model authored none (every
+    // body_collidable_link == ~0u), so single-geom worlds are byte-untouched.
+    if (model.body_collidable_link != nullptr &&
+        model.body_collidable_local != nullptr) {
+        const uint32_t total_bodies = p->env_count * p->bodies_per_env;
+        const uint32_t body_blocks = (total_bodies + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(SyncProxyCollidablePoseKernel, dim3(body_blocks), dim3(kBlockSize),
+                   0u, stream,
+                   static_cast<const math::Transform*>(data.link_pose),
+                   static_cast<const uint32_t*>(model.body_collidable_link),
+                   static_cast<const math::Transform*>(model.body_collidable_local),
+                   total_bodies, p->links_per_env, p->bodies_per_env,
+                   static_cast<math::Transform*>(data.body_pose));
+    }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

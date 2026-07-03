@@ -228,6 +228,9 @@ enum class FieldId : uint16_t {
     IslandQuads,  // island_quads (per:row_slot arena:scratch owner:data elem:4)
     IslandCount,  // island_count (per:scalar arena:scratch owner:data count:1)
     IslandCubTemp,  // island_cub_temp (per:scalar arena:scratch owner:data count:island_cub_temp_bytes)
+    JointFrictionloss,  // joint_frictionloss (per:link arena:persistent owner:model flags:[param])
+    BodyCollidableLink,  // body_collidable_link (per:body arena:persistent owner:model)
+    BodyCollidableLocal,  // body_collidable_local (per:body arena:persistent owner:model)
     Count
 };
 
