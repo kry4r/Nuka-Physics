@@ -294,6 +294,73 @@ nuka_result_t nuka_scene_set_local(nuka_scene_handle scene, const char* path,
 }
 
 // ---------------------------------------------------------------------------
+// add_collision_shape (attach a geom to an EXISTING body node by path)
+// ---------------------------------------------------------------------------
+nuka_result_t nuka_scene_add_collision_shape(
+    nuka_scene_handle scene, const char* node_path,
+    const nuka_collision_shape_desc_t* desc) {
+    if (node_path == nullptr || desc == nullptr) return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* r = SceneTable().Get(scene);
+    if (r == nullptr || !r->scene) return NUKA_RESULT_NULL_HANDLE;
+    nuka::scene::ShapeType type;
+    switch (desc->kind) {
+        case NUKA_PRIMITIVE_BOX:     type = nuka::scene::ShapeType::Box; break;
+        case NUKA_PRIMITIVE_SPHERE:  type = nuka::scene::ShapeType::Sphere; break;
+        case NUKA_PRIMITIVE_CAPSULE: type = nuka::scene::ShapeType::Capsule; break;
+        default: return NUKA_RESULT_INVALID_ARG;  // PLANE is not a body-attached geom.
+    }
+    if (type == nuka::scene::ShapeType::Sphere && desc->dims[0] <= 0.0f)
+        return NUKA_RESULT_INVALID_ARG;
+    if (type == nuka::scene::ShapeType::Capsule &&
+        (desc->dims[0] <= 0.0f || desc->dims[1] <= 0.0f))
+        return NUKA_RESULT_INVALID_ARG;
+    if (type == nuka::scene::ShapeType::Box &&
+        (desc->dims[0] <= 0.0f || desc->dims[1] <= 0.0f || desc->dims[2] <= 0.0f))
+        return NUKA_RESULT_INVALID_ARG;
+    try {
+        nuka::scene::SceneIR& s = *r->scene;
+        const PathRecords ids = ResolvePathRecords(s, node_path);
+        if (ids.body == nuka::scene::kInvalidBody) {
+            return NUKA_RESULT_FILE_NOT_FOUND;  // no body node at `node_path`.
+        }
+        nuka::scene::CollisionShapeRecord shape;
+        shape.body_id = ids.body;
+        shape.name = "added_shape_" + std::to_string(s.ShapeCount());
+        shape.type = type;
+        if (type == nuka::scene::ShapeType::Box) {
+            shape.half_extents =
+                nuka::math::Vec3{desc->dims[0], desc->dims[1], desc->dims[2]};
+        } else if (type == nuka::scene::ShapeType::Sphere) {
+            shape.radius = desc->dims[0];
+        } else {
+            shape.radius = desc->dims[0];
+            shape.half_height = desc->dims[1];
+        }
+        // Local pose in the target body frame; an all-zero quat reads as identity.
+        nuka::math::Transform local = nuka::math::Transform::Identity();
+        local.position = nuka::math::Vec3{desc->pos[0], desc->pos[1], desc->pos[2]};
+        const float qn = desc->quat[0] * desc->quat[0] + desc->quat[1] * desc->quat[1] +
+                         desc->quat[2] * desc->quat[2] + desc->quat[3] * desc->quat[3];
+        if (qn > 1.0e-12f) {
+            local.rotation = nuka::math::Quat{desc->quat[0], desc->quat[1],
+                                              desc->quat[2], desc->quat[3]};
+        }
+        shape.local_transform = local;
+        if (desc->friction >= 0.0f) shape.friction_mu = desc->friction;
+        shape.contype = desc->contype;
+        shape.conaffinity = desc->conaffinity;
+        s.AddCollisionShape(std::move(shape));
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        return nuka::c_abi::MapExceptionToResult(e);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // set_physics_material (regex over shape paths)
 // ---------------------------------------------------------------------------
 nuka_result_t nuka_scene_set_physics_material(nuka_scene_handle scene,
