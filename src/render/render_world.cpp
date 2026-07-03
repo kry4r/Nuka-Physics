@@ -133,10 +133,12 @@ ResolvedPose ResolvePoseSource(const scene::Registry& registry,
             return out;
         }
         if (!have_body && ref->body_row != scene::SceneMap::kNoRow) {
-            // A STATIC body never moves: its visuals stay pinned at the bind pose
-            // (its BodyPose row is not integrated, so following it would misplace).
+            // Only the body node itself (which carries the RigidBodyComponent) drives
+            // the pose: a child shape/visual node has no rb and must not short-circuit
+            // here with its own (possibly cross-wired) body_row. A STATIC (kinematic)
+            // body keeps its bind pose -- its BodyPose row is not integrated.
             const auto* rb = registry.Get<scene::RigidBodyComponent>(n->entity);
-            if (rb == nullptr || !rb->kinematic) {
+            if (rb != nullptr && !rb->kinematic) {
                 body.kind = PoseSource::Kind::Body;
                 body.row  = ref->body_row;
                 body_node = n;
