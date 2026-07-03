@@ -1462,6 +1462,77 @@ public:
             solver_contact_margin, solver_max_pairs, baumgarte_max_velocity);
     }
 
+    // Attach one collision shape to an EXISTING body node (by derived tree path):
+    // an imported articulation link (e.g. a robot head/trunk shipped visual-only)
+    // gains a colliding geom without editing the source asset. dims by kind: BOX
+    // [hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]. pos/quat are the shape's
+    // LOCAL pose in the body frame (empty quat => identity). contype/conaffinity
+    // default 1 (colliding).
+    void add_collision_shape(const std::string& node_path, uint32_t kind,
+                             const std::vector<float>& dims,
+                             const std::vector<float>& pos,
+                             const std::vector<float>& quat, float friction,
+                             uint32_t contype, uint32_t conaffinity) {
+        if (dims.size() > 3) {
+            throw std::runtime_error("add_collision_shape: dims must be <= 3 floats");
+        }
+        if (!pos.empty() && pos.size() != 3) {
+            throw std::runtime_error("add_collision_shape: pos must be 3 floats (x,y,z)");
+        }
+        if (!quat.empty() && quat.size() != 4) {
+            throw std::runtime_error(
+                "add_collision_shape: quat must be 4 floats (w,x,y,z)");
+        }
+        nuka_collision_shape_desc_t d{};
+        d.kind = kind;
+        for (size_t i = 0; i < dims.size() && i < 3; ++i) d.dims[i] = dims[i];
+        for (size_t i = 0; i < pos.size() && i < 3; ++i) d.pos[i] = pos[i];
+        for (size_t i = 0; i < quat.size() && i < 4; ++i) d.quat[i] = quat[i];
+        d.friction = friction;
+        d.contype = contype;
+        d.conaffinity = conaffinity;
+        check(nuka_scene_add_collision_shape(h_, node_path.c_str(), &d),
+              "nuka_scene_add_collision_shape");
+    }
+
+    // Graft `addon`'s scene into this one at a placement (pos [x,y,z] + quat
+    // [w,x,y,z] in this scene's frame), via the SAME scene::Compose the generic
+    // editor uses. `attach_at` is an optional node-path PREFIX that disambiguates
+    // the addon's names in the merged scene (each addon root keeps its OWN
+    // hierarchy). This authors a jointed sub-assembly (a rope / ragdoll / any
+    // imported articulation fragment): import it as a SceneBuilder and compose it
+    // -- the importer supplies correct joint frames + link inertia.
+    void compose(SceneBuilder* addon, const std::vector<float>& pos,
+                 const std::vector<float>& quat, const std::string& attach_at) {
+        if (addon == nullptr) {
+            throw std::runtime_error("SceneBuilder.compose: addon is None");
+        }
+        if (!pos.empty() && pos.size() != 3) {
+            throw std::runtime_error("SceneBuilder.compose: pos must be 3 floats (x,y,z)");
+        }
+        if (!quat.empty() && quat.size() != 4) {
+            throw std::runtime_error(
+                "SceneBuilder.compose: quat must be 4 floats (w,x,y,z)");
+        }
+        float p[3] = {0.0f, 0.0f, 0.0f};
+        float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        for (size_t i = 0; i < pos.size() && i < 3; ++i) p[i] = pos[i];
+        for (size_t i = 0; i < quat.size() && i < 4; ++i) q[i] = quat[i];
+        check(nuka_scene_compose(h_, addon->h_, pos.empty() ? nullptr : p,
+                                 quat.empty() ? nullptr : q,
+                                 attach_at.empty() ? nullptr : attach_at.c_str()),
+              "nuka_scene_compose");
+    }
+
+    // Persist the built scene to `nks_path` (+ a sibling <base>.nka) via the .nks
+    // writer -- the SAME self-contained format nuka_scene_load reads back. Rigid
+    // primitives, media records, render materials, the environment, terrain, and
+    // any composed articulation all round-trip, so the saved file cooks through the
+    // built-scene path (SceneBuilder.create(path).build()).
+    void save(const std::string& nks_path) {
+        check(nuka_scene_save(h_, nks_path.c_str()), "nuka_scene_save");
+    }
+
     void destroy() {
         if (h_ != nullptr) {
             nuka_scene_destroy(h_);
@@ -2561,6 +2632,33 @@ NB_MODULE(_nuka_ext, m) {
              "takes). gravity_* default 0 => standard Earth. The solver_* / "
              "baumgarte_max_velocity SolverConfig overrides default 0 => engine "
              "default => byte-identical to a defaults-only built scene.")
+        .def("add_collision_shape", &SceneBuilder::add_collision_shape,
+             nb::arg("node_path"), nb::arg("kind"),
+             nb::arg("dims") = std::vector<float>{},
+             nb::arg("pos") = std::vector<float>{},
+             nb::arg("quat") = std::vector<float>{}, nb::arg("friction") = -1.0f,
+             nb::arg("contype") = 1u, nb::arg("conaffinity") = 1u,
+             "Attach a collision shape to the body at derived tree path node_path. "
+             "kind is a PRIMITIVE_* code (BOX/SPHERE/CAPSULE). dims by kind: BOX "
+             "[hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]. pos/quat are the "
+             "shape's LOCAL pose in the body frame (empty quat => identity). Use it "
+             "to give an imported link (a robot head/trunk shipped visual-only) a "
+             "colliding geom without editing the source asset.")
+        .def("compose", &SceneBuilder::compose, nb::arg("addon"),
+             nb::arg("pos") = std::vector<float>{},
+             nb::arg("quat") = std::vector<float>{},
+             nb::arg("attach_at") = std::string(),
+             "Graft another SceneBuilder's scene into this one at a placement (pos "
+             "[x,y,z], quat [w,x,y,z]; empty => identity). attach_at is an optional "
+             "node-path name PREFIX for the addon (disambiguates duplicate names). "
+             "Author a jointed sub-assembly by importing the fragment (e.g. a "
+             "revolute-chain rope .usda) as a SceneBuilder and composing it -- the "
+             "importer supplies correct joint frames + link inertia.")
+        .def("save", &SceneBuilder::save, nb::arg("nks_path"),
+             "Persist the built scene to nks_path (+ a sibling .nka). The .nks is "
+             "self-contained: rigid primitives, media, render materials, the "
+             "environment, terrain, and composed articulations all round-trip and "
+             "cook back through SceneBuilder.create(path).build().")
         .def("destroy", &SceneBuilder::destroy, "Destroy the scene-builder handle.")
         .def("__enter__", [](SceneBuilder& b) -> SceneBuilder& { return b; })
         .def("__exit__",

@@ -337,6 +337,32 @@ nuka_scene_handle nuka_scene_create(const char* base_scene_path);
 nuka_result_t nuka_scene_add_rigid_primitive(nuka_scene_handle scene,
                                              const nuka_rigid_primitive_desc_t* desc);
 
+// A collision shape attached to an EXISTING body node (addressed by derived tree
+// path). `kind` is BOX/SPHERE/CAPSULE (PLANE is invalid here); dims by kind as in
+// nuka_rigid_primitive_desc_t. pos[3]/quat[4] are the shape's LOCAL pose in the
+// target body frame (all-zero quat => identity). friction < 0 inherits the
+// material default. contype/conaffinity default 1 (a colliding geom); 0/0 makes a
+// visual-only geom.
+typedef struct nuka_collision_shape_desc_t {
+    uint32_t kind;         // nuka_primitive_kind_t (BOX/SPHERE/CAPSULE).
+    float    dims[3];      // half-extents / radius / (radius,half_height) by kind.
+    float    pos[3];       // local position in the target body frame.
+    float    quat[4];      // local orientation (w,x,y,z); all-zero => identity.
+    float    friction;     // per-shape Coulomb mu (< 0 => inherit material default).
+    uint32_t contype;      // MuJoCo contype bitmask (1 => colliding; 0 => visual-only).
+    uint32_t conaffinity;  // MuJoCo conaffinity bitmask.
+} nuka_collision_shape_desc_t;
+
+// Attach one collision shape to the body at derived tree path `node_path` (the
+// SAME AddCollisionShape record the file cook reads), so an imported articulation
+// link (e.g. a robot head/trunk that ships visual-only) gains a colliding geom
+// WITHOUT editing the source asset. Returns NULL_HANDLE on a bad handle,
+// INVALID_ARG on a NULL/unknown-kind desc, FILE_NOT_FOUND if no body node matches
+// `node_path`.
+nuka_result_t nuka_scene_add_collision_shape(nuka_scene_handle scene,
+                                             const char* node_path,
+                                             const nuka_collision_shape_desc_t* desc);
+
 // Add a media record (cloth / soft-tet / fluid) to the built scene via
 // SceneIR::AddMedia. The single record's (kind x method) legality is checked
 // immediately by the cook's ValidateMedia -> INVALID_ARG on an illegal pair (the
