@@ -114,3 +114,59 @@ TEST(MultiGeomCook, ExtraGeomBecomesProxyRow) {
     ASSERT_FALSE(two.shape_table_rows.empty());
     EXPECT_EQ(two.shape_table_rows.back().body_id, -1);
 }
+
+// Proxies of two links whose bodies are filter-excluded (parent-child) must be
+// excluded from EACH OTHER, not only from the two owner body rows.
+TEST(MultiGeomCook, CrossLinkProxiesInheritPairExclusion) {
+    scene::SceneIR s;
+
+    scene::RigidBodyRecord base;
+    base.name = "base";
+    base.is_static = true;
+    const scene::BodyId base_id = s.AddRigidBody(base);
+
+    scene::BodyId prev = base_id;
+    for (int k = 0; k < 2; ++k) {
+        scene::RigidBodyRecord link;
+        link.name = k == 0 ? "linkA" : "linkB";
+        link.parent_id = prev;
+        link.mass = 1.0f;
+        link.inertia = Vec3{0.01f, 0.01f, 0.01f};
+        link.local_transform.position = Vec3{0.0f, 0.0f, 0.2f};
+        const scene::BodyId link_id = s.AddRigidBody(link);
+
+        scene::JointRecord j;
+        j.name = k == 0 ? "jA" : "jB";
+        j.parent_body = prev;
+        j.child_body = link_id;
+        j.type = scene::JointType::Revolute;
+        j.axis = Vec3{0.0f, 0.0f, 1.0f};
+        s.AddJoint(j);
+        prev = link_id;
+
+        for (int i = 0; i < 2; ++i) {
+            scene::CollisionShapeRecord c;
+            c.body_id = link_id;
+            c.type = scene::ShapeType::Capsule;
+            c.radius = 0.02f;
+            c.half_height = 0.015f;
+            c.local_transform.position = Vec3{0.03f * static_cast<float>(i), 0.0f, -0.05f};
+            s.AddCollisionShape(c);
+        }
+    }
+
+    const nuka::nk::Model m = Cook(s);
+
+    std::vector<uint32_t> proxies;
+    for (uint32_t r = 0; r < m.body_collidable_link.size(); ++r) {
+        if (m.body_collidable_link[r] != ~uint32_t(0)) proxies.push_back(r);
+    }
+    ASSERT_EQ(proxies.size(), 2u);
+    ASSERT_NE(m.body_to_link[proxies[0]], m.body_to_link[proxies[1]]);
+
+    const uint64_t key = (static_cast<uint64_t>(proxies[0]) << 32) |
+                         static_cast<uint64_t>(proxies[1]);
+    bool excluded = false;
+    for (uint64_t k : m.excluded_pairs) if (k == key) excluded = true;
+    EXPECT_TRUE(excluded) << "parent-child link proxies must inherit the pair filter";
+}
