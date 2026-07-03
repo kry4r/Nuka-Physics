@@ -114,9 +114,15 @@ def build(args):
     b = nuka.SceneBuilder.create(BDX)
 
     # -- render materials (appearance only; friction rides the shapes) ---------
-    wood = b.add_material("wood_planks", **tex("wood_planks", uv_scale=2.5))
-    gravel = b.add_material("gravel", **tex("gravel", uv_scale=6.0))
-    dirt = b.add_material("dirt", **tex("dirt", uv_scale=3.0))
+    # base_color tints double as the flat fallback when a large ground primitive's
+    # albedo map does not bind in the beauty render (keeps the floor dirt-brown,
+    # never bare grey).
+    wood = b.add_material("wood_planks", base_color=[0.55, 0.40, 0.26],
+                          **tex("wood_planks", uv_scale=2.5))
+    gravel = b.add_material("gravel", base_color=[0.62, 0.55, 0.42],
+                            **tex("gravel", uv_scale=6.0))
+    dirt = b.add_material("dirt", base_color=[0.30, 0.24, 0.18], roughness=1.0,
+                          **tex("dirt", uv_scale=3.0))
     fabric = b.add_material("fabric", base_color=[0.72, 0.34, 0.30], sheen=0.5,
                             **tex("fabric", uv_scale=5.0))
     stone = b.add_material("stone", base_color=[0.42, 0.40, 0.38], roughness=0.85)
@@ -137,7 +143,7 @@ def build(args):
     # -- visual ground: a large dirt slab whose TOP sits just above the physics
     # heightfield, so it reads as the textured walkway and fills to the horizon
     # (a finite ground would let the HDRI's grey lower hemisphere show past its rim) -
-    b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[16.0, 16.0, 0.06],
+    b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[14.0, 11.0, 0.06],
                           pos=[3.0, 0.0, -0.058], static=True, material="dirt")
 
     # -- Zone A: stairs rising behind the spawn to a top platform --------------
@@ -218,15 +224,18 @@ def build(args):
                               pos=[cx, cy, s + 0.002], static=True, material="crate")
 
     # -- environment ----------------------------------------------------------
-    b.set_environment(hdri=f"{TEX}/hdri/sky_2k.hdr", yaw_deg=-35.0, intensity=1.05,
+    b.set_environment(hdri=f"{TEX}/hdri/sky_2k.hdr", yaw_deg=-35.0, intensity=0.85,
                       use_scene_materials=True)
 
     b.save(OUT)
     b.destroy()
 
-    # -- declarative terrain (big flat heightfield) + a visible rope skin ------
+    # -- ground + a visible rope skin -----------------------------------------
+    # No heightfield terrain: the dirt slab (a static box) IS the ground the feet
+    # rest on, and an untextured heightfield would render as a bare grey plane
+    # drawn OVER the slab (the render layers terrain above rigid instances).
     doc = json.load(open(OUT))
-    doc["terrain"] = [TERRAIN]
+    doc["terrain"] = []
     # The composed rope ships collision-only capsules (the USD importer binds no
     # material); give them a render_material_id so the collision-primitive fallback
     # renders a dark cord + a wood block instead of bare grey.
