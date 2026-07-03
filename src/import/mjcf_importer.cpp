@@ -157,7 +157,8 @@ void DiagonalizeInertia(const float full[6], math::Vec3& diag, math::Quat& rot) 
 
 struct MjcfJointDefaults {
     scene::JointType type = scene::JointType::Revolute;
-    math::Vec3 axis = {0.0f, 1.0f, 0.0f};
+    // MJCF spec default joint axis is +Z when the attribute is omitted.
+    math::Vec3 axis = {0.0f, 0.0f, 1.0f};
     float lower_limit = -3.14159f;
     float upper_limit = 3.14159f;
     float damping = 0.0f;
