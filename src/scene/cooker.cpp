@@ -427,6 +427,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     blob.joints.dampings.reserve(joints.size());
     blob.joints.armatures.reserve(joints.size());
     blob.joints.initial_positions.reserve(joints.size());
+    blob.joints.frictionlosses.reserve(joints.size());
 
     for (const auto& j : joints) {
         blob.joints.types.push_back(j.type);
@@ -440,6 +441,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         blob.joints.dampings.push_back(j.damping);
         blob.joints.armatures.push_back(j.armature);
         blob.joints.initial_positions.push_back(j.initial_position);
+        blob.joints.frictionlosses.push_back(j.frictionloss);
     }
 
     const auto& shapes = scene.Shapes();

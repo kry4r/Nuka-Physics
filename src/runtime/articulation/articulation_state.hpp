@@ -110,6 +110,7 @@ struct ArticulationCookedTopology {
     std::vector<float> initial_positions;
     std::vector<float> joint_dampings;
     std::vector<float> joint_armatures;
+    std::vector<float> joint_frictionlosses;
     std::vector<float> masses;
     std::vector<math::Vec3> inertias;
 };
@@ -136,6 +137,7 @@ struct ArticulationHostState {
     std::vector<float> tau;
     std::vector<float> joint_damping;
     std::vector<float> joint_armature;
+    std::vector<float> joint_frictionloss;
     std::vector<float> joint_diagonal;
     std::vector<float> joint_force;
     std::vector<math::Vec3> joint_axis;

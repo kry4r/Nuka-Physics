@@ -32,22 +32,44 @@ HOME = {
     "right_knee": 1.379, "right_ankle": -0.796,
 }
 
-# Sole capsules in the foot body frame (home-stance sole AABB; axis horizontal).
-CAPSULE = {
-    "type": "capsule", "half_extents": [0.5, 0.5, 0.5],
-    "radius": 0.02064934, "half_height": 0.0309066065,
-    "material_id": 4294967295, "contype": 1, "conaffinity": 1,
-    "collision_group": 0, "solref": [0.02, 1.0],
-    "solimp": [0.9, 0.95, 0.001, 0.5, 2.0], "friction_mu": 1.0,
-    "priority": 0, "solmix": 1.0, "margin": 0.0, "gap": 0.0, "condim": 3,
-    "decompose_mode": "auto", "decompose_max_pieces": 32,
-}
-FOOT_CAP_LOCAL = {  # foot body name -> capsule local pose.
-    "foot_assembly": {"pos": [0.0134650022, -0.0181903541, 0.019052133],
-                      "quat": [-0.50000006, 0.50000006, 0.5, 0.5]},
-    "foot_assembly_2": {"pos": [0.0134650022, -0.0181903541, 0.0190521181],
-                        "quat": [0.50000006, -0.50000006, -0.5, -0.5]},
-}
+# Sole contact = a 4-BALL support polygon per foot (toe/heel x left/right), so the
+# foot has a real support area and the CoP can travel fore-aft for toe-off -- the
+# single sole capsule was a LINE contact and could not push. The engine now cooks
+# every collision geom on a link (extra ones become collidable proxy body rows), so
+# all four balls are live. Foot-body frame (FK-calibrated at home): +X = forward
+# (fore-aft), +Y = up (sole normal), +-Z = lateral. Ball bottoms sit at the sole
+# plane (the old capsule's lowest point), preserving the stand height.
+BALL_R = 0.013
+L_FORE = 0.026   # fore-aft half-separation (foot-local +X).
+L_LAT = 0.013    # lateral half-separation (foot-local +-Z).
+SOLE_CENTER = [0.0134650022, -0.0181903541, 0.019052133]  # old capsule center.
+OLD_CAP_R = 0.02064934
+BALL_UP = SOLE_CENTER[1] - OLD_CAP_R + BALL_R  # ball center Y so its bottom == sole.
+
+
+def _foot_balls():
+    """Four sole balls at the foot footprint corners (tree order fixed)."""
+    balls = []
+    for i, (sf, sl) in enumerate([(1, 1), (1, -1), (-1, 1), (-1, -1)]):
+        pos = [SOLE_CENTER[0] + sf * L_FORE, BALL_UP, SOLE_CENTER[2] + sl * L_LAT]
+        balls.append({
+            "name": "foot_contact" if i == 0 else f"foot_contact_{i}",
+            "collision_shape": {
+                "type": "sphere", "half_extents": [0.5, 0.5, 0.5],
+                "radius": BALL_R, "half_height": 0.5,
+                "material_id": 4294967295, "contype": 1, "conaffinity": 1,
+                "collision_group": 0, "solref": [0.02, 1.0],
+                "solimp": [0.9, 0.95, 0.001, 0.5, 2.0], "friction_mu": 1.0,
+                "priority": 0, "solmix": 1.0, "margin": 0.0, "gap": 0.0, "condim": 3,
+                "decompose_mode": "auto", "decompose_max_pieces": 32,
+                "local": {"pos": pos, "quat": [1.0, 0.0, 0.0, 0.0]},
+            },
+            "children": [],
+        })
+    return balls
+
+
+FOOT_BODIES = ("foot_assembly", "foot_assembly_2")
 
 FLAT_GROUND = {
     "name": "ground", "nrow": 21, "ncol": 21, "cell": 0.1,
@@ -77,12 +99,8 @@ def edit(node):
     if shape and "foot_bottom_tpu" in name and shape.get("contype") == 1:
         shape["contype"] = 0   # mesh sole -> visual only (EPA dead band).
         shape["conaffinity"] = 0
-    if name in FOOT_CAP_LOCAL:
-        node.setdefault("children", []).append({
-            "name": "foot_contact",
-            "collision_shape": dict(CAPSULE, local=FOOT_CAP_LOCAL[name]),
-            "children": [],
-        })
+    if name in FOOT_BODIES:
+        node.setdefault("children", []).extend(_foot_balls())
     edit(node.get("children", []))
 
 

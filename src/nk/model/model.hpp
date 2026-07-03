@@ -133,6 +133,7 @@ struct ModelArticulation {
     std::vector<float>            link_inertia_spatial;  // 36 floats / link (flat)
     std::vector<float>            joint_damping;
     std::vector<float>            joint_armature;
+    std::vector<float>            joint_frictionloss;    // MuJoCo joint dry friction bound
     std::vector<float>            initial_q;             // per LINK (scalar slot per link)
     std::vector<math::Transform>  initial_link_pose;     // cook rest pose per link
     // M4 (union family): the SETTLED initial velocity state (the legacy
@@ -553,6 +554,15 @@ public:
     // (tiled env-major, template-local values). INERT in Phase 0.
     std::vector<uint32_t>    body_to_link;          // template-local link, or ~0u.
     std::vector<uint32_t>    body_to_articulation;  // template-local artic, or ~0u.
+
+    // Multi-geom collidable proxies: a body row that is an EXTRA collision geom of
+    // an articulation link (beyond the one folded into the link's own body row).
+    // body_collidable_link[row] = the TEMPLATE-local source link to pose from (~0u
+    // when the row is NOT a proxy), body_collidable_local[row] = the geom's
+    // link-local offset. SyncLinkBodyPose poses body_pose[row] = link_pose[link] o
+    // local for proxy rows. All ~0u for single-geom scenes -> byte-identical.
+    std::vector<uint32_t>       body_collidable_link;   // template-local link, or ~0u.
+    std::vector<math::Transform> body_collidable_local; // geom offset in the link frame.
 
     // H1 (general contact pipeline Phase 0): cooked heightfield collidables + the
     // flat height grid that backs the `heights[]` field. EMPTY for every current

@@ -244,6 +244,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::IslandQuads, DlpackDtype::kU32, 2, false, false},  // island_quads
     {FieldId::IslandCount, DlpackDtype::kU32, 1, false, false},  // island_count
     {FieldId::IslandCubTemp, DlpackDtype::kU8, 1, false, false},  // island_cub_temp
+    {FieldId::JointFrictionloss, DlpackDtype::kF32, 1, false, false},  // joint_frictionloss
+    {FieldId::BodyCollidableLink, DlpackDtype::kU32, 1, false, false},  // body_collidable_link
+    {FieldId::BodyCollidableLocal, DlpackDtype::kF32, 2, false, false},  // body_collidable_local
 };
 
 } // namespace nuka::nk

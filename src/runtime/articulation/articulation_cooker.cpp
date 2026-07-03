@@ -172,6 +172,7 @@ std::vector<ArticulationCookedTopology> CookArticulations(const scene::CookedBlo
                 topology.initial_positions.push_back(0.0f);
                 topology.joint_dampings.push_back(0.0f);
                 topology.joint_armatures.push_back(0.0f);
+                topology.joint_frictionlosses.push_back(0.0f);
             } else {
                 const scene::BodyId parent = blob.joints.parent_bodies[incoming_joint];
                 const auto parent_it = local_link_for_body.find(parent);
@@ -193,6 +194,8 @@ std::vector<ArticulationCookedTopology> CookArticulations(const scene::CookedBlo
                     FloatOrDefault(blob.joints.dampings, incoming_joint, 0.0f));
                 topology.joint_armatures.push_back(
                     FloatOrDefault(blob.joints.armatures, incoming_joint, 0.0f));
+                topology.joint_frictionlosses.push_back(
+                    FloatOrDefault(blob.joints.frictionlosses, incoming_joint, 0.0f));
             }
 
             visited[body] = 1u;

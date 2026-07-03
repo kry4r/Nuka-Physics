@@ -36,6 +36,7 @@ struct CookedJointTable {
     std::vector<float>      dampings;
     std::vector<float>      armatures;
     std::vector<float>      initial_positions;
+    std::vector<float>      frictionlosses;
 };
 
 // Sentinel: a shape row that carries no convex-hull geometry.
