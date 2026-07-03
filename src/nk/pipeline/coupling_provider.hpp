@@ -35,6 +35,9 @@ struct CouplingBuildCtx {
     uint32_t coupled_internal = 0u;
     uint32_t particle_count = 0u;
     uint32_t n_soft = 0u;
+    // MpmXpbd: the per-env MPM slice count [0, n_mpm) (0 for every other mode). The
+    // MpmStep scopes to it; the XPBD ops + body<->particle rows scope to [n_mpm, P).
+    uint32_t n_mpm = 0u;
     float    dt = 0.0f;
     float    gravity[3] = {0.0f, 0.0f, 0.0f};  // world gravity (the MPM grid kick).
     float    contact_margin = 0.0f;

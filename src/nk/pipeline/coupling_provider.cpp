@@ -52,6 +52,10 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
          ctx.particle_mode == phi::kParticleModeSoftFluid)
             ? 1u : 0u;
     p_np_body_particle.n_soft_particles = ctx.n_soft;
+    // MpmXpbd: the MPM slice [0, n_mpm) couples via the grid, not rows, so it
+    // generates no body<->particle manifold; only [n_mpm, P) (the cloth) makes rows.
+    // 0 for every other mode -> the whole particle range makes rows (byte-identical).
+    p_np_body_particle.particle_row_base = ctx.n_mpm;
     // Warp-per-particle only pays off when a collider has a WIDE hull whose
     // SupportHull scan dominates; an analytic-only collider world (box/sphere/
     // plane walls) keeps thread-per-particle so 31 lanes don't idle. The
@@ -97,6 +101,9 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
     phi::MpmStepParams& p = *ctx.p_mpm_step;
     p.particle_count = ctx.particle_count;
     p.particles_per_env = ctx.particles_per_env;
+    // MpmXpbd scopes the transfer to the MPM slice [0, n_mpm); a lone MPM medium runs
+    // the whole per-env block (n_mpm 0 -> OpMpmStep treats it as particles_per_env).
+    p.mpm_particles_per_env = ctx.n_mpm;
     p.env_count = ctx.env_count;
     p.nodes_per_env = model.capacities.mpm_grid_nodes_per_env;
     p.grid_dims[0] = mp.mpm_grid_dims[0];
@@ -155,6 +162,7 @@ void RowCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {
     p_part_finalize.rest_density = model.particles.pbf_rest_density;
     p_part_finalize.n_soft_particles = ctx.n_soft;
     p_part_finalize.particles_per_env = ctx.particles_per_env;
+    p_part_finalize.n_mpm_particles = ctx.n_mpm;
     // Carry the split-impulse pseudo velocity onto the final particle position
     // only when the position pass is active (the same predicate IntegratePosition
     // uses for bodies); else the pseudo pointer is null -> byte-identical.

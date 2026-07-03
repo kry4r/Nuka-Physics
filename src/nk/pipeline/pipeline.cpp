@@ -40,7 +40,9 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     // A cooked MLS-MPM medium (mode == Mpm + a sized grid). Gates the MpmStep emit
     // build-time so a non-MPM world's op list is byte-identical (no MpmStep OpCall).
     const bool has_mpm =
-        has_particles && model.particles.mode == Model::ParticleMode::Mpm &&
+        has_particles &&
+        (model.particles.mode == Model::ParticleMode::Mpm ||
+         model.particles.mode == Model::ParticleMode::MpmXpbd) &&
         cap.mpm_grid_nodes_per_env > 0u;
     // gate the contact pipeline (SyncLinkBodyPose / broadphase / narrowphase)
     // on actual contact capacity. For every cooked-with-contacts world this equals
@@ -147,16 +149,22 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         : mp.mode == Model::ParticleMode::Coupled ? phi::kParticleModeCoupled
         : mp.mode == Model::ParticleMode::SoftFluid ? phi::kParticleModeSoftFluid
         : mp.mode == Model::ParticleMode::Mpm ? phi::kParticleModeMpm
+        : mp.mode == Model::ParticleMode::MpmXpbd ? phi::kParticleModeMpmXpbd
                                                   : phi::kParticleModeNone;
     // SoftFluid: the per-env [soft | fluid] split + stride (0 elsewhere).
     const uint32_t n_soft = mp.mode == Model::ParticleMode::SoftFluid
                                 ? mp.n_soft_particles : 0u;
+    // MpmXpbd: the per-env MPM slice count [0, n_mpm) (0 elsewhere). The XPBD ops
+    // skip it; the MpmStep scopes to it; the body<->particle rows start above it.
+    const uint32_t n_mpm = mp.mode == Model::ParticleMode::MpmXpbd
+                               ? mp.n_mpm_particles : 0u;
     const uint32_t per_env_particles = cap.particles_per_env;
     // Per-env soft-particle count selecting which per-system mu a particle side
     // reads: SoftFluid the explicit split, Xpbd all-soft, Pbf all-fluid, Coupled by type.
     const uint32_t friction_n_soft =
         mp.mode == Model::ParticleMode::SoftFluid ? mp.n_soft_particles
         : mp.mode == Model::ParticleMode::Xpbd ? per_env_particles
+        : mp.mode == Model::ParticleMode::MpmXpbd ? per_env_particles
         : mp.mode == Model::ParticleMode::Pbf ? 0u
         : mp.mode == Model::ParticleMode::Coupled
               ? (mp.coupled_internal == Model::CoupledInternal::Pbf ? 0u
@@ -195,6 +203,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     coupling_ctx.coupled_internal = coupled_internal;
     coupling_ctx.particle_count = particle_count;
     coupling_ctx.n_soft = n_soft;
+    coupling_ctx.n_mpm = n_mpm;
     coupling_ctx.dt = cfg.dt;
     coupling_ctx.gravity[0] = cfg.gravity[0];
     coupling_ctx.gravity[1] = cfg.gravity[1];
@@ -233,6 +242,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_part_predict_.coupled_internal = coupled_internal;
         p_part_predict_.n_soft_particles = n_soft;
         p_part_predict_.particles_per_env = per_env_particles;
+        p_part_predict_.n_mpm_particles = n_mpm;
         add(phi::NkOp::ParticlePredict, &p_part_predict_);
     }
 

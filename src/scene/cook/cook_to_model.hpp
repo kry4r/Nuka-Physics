@@ -276,6 +276,16 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
                             const XpbdCookInput& soft, const PbfCookInput& fluid,
                             const SoftFluidContactInput& contact = {});
 
+// Two-system cook: stage BOTH an MLS-MPM medium AND an XPBD (cloth/tet) set
+// co-resident into ONE Model with a contiguous [mpm | xpbd] layout (MPM occupies
+// [0, n_mpm), the XPBD set [n_mpm, particles_per_env)). The XPBD constraint indices
+// are rebased by n_mpm; the MPM continuum fields stay sized to the MPM slice.
+// Mode = ParticleMode::MpmXpbd. STRICT SUPERSET: an MPM-only cook (soft empty) is
+// byte-identical to CookMpmParticles, an XPBD-only cook (mpm empty) to
+// CookXpbdParticles, each plus the same body<->particle contact setup.
+void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
+                 const XpbdCookInput& soft, const SoftFluidContactInput& contact = {});
+
 // ---------------------------------------------------------------------------
 // Media records -> particle cook. The per-medium builders read a scene
 // MediaRecord and reuse the SAME constraint/lattice cookers

@@ -149,9 +149,15 @@ __global__ void XpbdPredictKernel(uint32_t particle_count,
                                   math::Vec3* __restrict__ v_pre,
                                   const float* __restrict__ inv_masses,
                                   math::Vec3 gravity,
-                                  float dt) {
+                                  float dt,
+                                  uint32_t mpm_per_env, uint32_t per_env) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particle_count) {
+        return;
+    }
+    // MpmXpbd: skip the MPM slice [0, n_mpm) per env (the transfer loop owns it). The
+    // condition short-circuits for a pure-Xpbd world (mpm_per_env 0) -> byte-identical.
+    if (mpm_per_env != 0u && (i % per_env) < mpm_per_env) {
         return;
     }
     const math::Vec3 p = positions[i];
@@ -494,9 +500,15 @@ __global__ void XpbdCorrectKernel(uint32_t particle_count,
                                   const math::Vec3* __restrict__ v_pre,
                                   const math::Vec3* __restrict__ pseudo_vel,
                                   const float* __restrict__ inv_masses,
-                                  float dt) {
+                                  float dt,
+                                  uint32_t mpm_per_env, uint32_t per_env) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particle_count) {
+        return;
+    }
+    // MpmXpbd: skip the MPM slice [0, n_mpm) (the transfer loop set its final pos/vel).
+    // Short-circuits for a pure-Xpbd world (mpm_per_env 0) -> byte-identical.
+    if (mpm_per_env != 0u && (i % per_env) < mpm_per_env) {
         return;
     }
     if (inv_masses[i] <= 0.0f) {
@@ -1178,11 +1190,15 @@ Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
     if (p->mode == kParticleModeMpm) return Status::Ok;  // MPM advances via its own transfer ops
     const uint32_t blocks = (p->particle_count + kBlockSize - 1u) / kBlockSize;
     const math::Vec3 g{p->gravity[0], p->gravity[1], p->gravity[2]};
-    if (p->mode == kParticleModeXpbd) {
+    if (p->mode == kParticleModeXpbd || p->mode == kParticleModeMpmXpbd) {
+        // MpmXpbd runs the XPBD predict over its slice [n_mpm, P); the MPM slice
+        // [0, n_mpm) is skipped in-kernel (mpm_per_env 0 for pure Xpbd => byte-id).
+        const uint32_t mpm_pe =
+            p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
         LaunchCuda(XpbdPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, data.particle_pos, data.particle_prev_pos,
                    data.particle_vel, data.particle_v_pre, data.particle_inv_mass,
-                   g, p->dt);
+                   g, p->dt, mpm_pe, p->particles_per_env);
     } else if (p->mode == kParticleModeCoupled) {
         LaunchCuda(CoupledPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->particle_count, data.particle_pos, data.particle_prev_pos,
@@ -1381,10 +1397,15 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
     const math::Vec3* pseudo_vel =
         p->pos_pass != 0u ? static_cast<const math::Vec3*>(data.particle_pseudo_vel)
                           : nullptr;
-    if (p->mode == kParticleModeXpbd) {
+    if (p->mode == kParticleModeXpbd || p->mode == kParticleModeMpmXpbd) {
+        // MpmXpbd finalizes the XPBD slice [n_mpm, P); the MPM slice is skipped
+        // in-kernel (mpm_per_env 0 for pure Xpbd => byte-identical XpbdCorrect).
+        const uint32_t mpm_pe =
+            p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
         LaunchCuda(XpbdCorrectKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, data.particle_pos, data.particle_prev_pos, data.particle_vel,
-                   data.particle_v_pre, pseudo_vel, data.particle_inv_mass, p->dt);
+                   data.particle_v_pre, pseudo_vel, data.particle_inv_mass, p->dt,
+                   mpm_pe, p->particles_per_env);
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
     if (p->mode == kParticleModeCoupled) {

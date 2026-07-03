@@ -369,18 +369,31 @@ __global__ void MpmClearBodyReactionKernel(uint32_t total_bodies, m::Vec3* react
 }
 
 // --- cell key (the particle's base-node cell, env-offset) -------------------
-__global__ void MpmCellKeysKernel(uint32_t particle_count,
+// Map an MPM-slice thread t in [0, mpm_count) to (env, global particle index). The
+// MPM slice is [0, mpm_per_env) inside each Ppe-strided env, so global = env*Ppe +
+// (t - env*mpm_per_env). For a lone MPM medium mpm_per_env == Ppe -> global == t
+// (byte-identical to the old contiguous [0, Np) launch).
+__device__ __forceinline__ uint32_t MpmSliceGlobal(uint32_t t, uint32_t mpm_per_env,
+                                                   uint32_t ppe, uint32_t& env_out) {
+    const uint32_t env = t / mpm_per_env;
+    env_out = env;
+    return env * ppe + (t - env * mpm_per_env);
+}
+
+__global__ void MpmCellKeysKernel(uint32_t mpm_count,
                                   const m::Vec3* __restrict__ pos,
-                                  uint32_t particles_per_env, float inv_dx,
+                                  uint32_t particles_per_env, uint32_t mpm_per_env,
+                                  float inv_dx,
                                   m::Vec3 origin, uint32_t dims_x, uint32_t dims_y,
                                   uint32_t dims_z, uint32_t cells_per_env,
                                   uint32_t* __restrict__ keys,
                                   uint32_t* __restrict__ idx,
                                   uint32_t* __restrict__ env_status) {
-    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= particle_count) return;
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= mpm_count) return;
+    uint32_t env = 0u;
+    const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env);
     const m::Vec3 xp = pos[p];
-    const uint32_t env = p / particles_per_env;
     const float gx = (xp.x - origin.x) * inv_dx;
     const float gy = (xp.y - origin.y) * inv_dx;
     const float gz = (xp.z - origin.z) * inv_dx;
@@ -407,8 +420,8 @@ __global__ void MpmCellKeysKernel(uint32_t particle_count,
     const uint32_t local = (static_cast<uint32_t>(cz) * dims_y +
                             static_cast<uint32_t>(cy)) * dims_x +
                            static_cast<uint32_t>(cx);
-    keys[p] = env * cells_per_env + local;
-    idx[p] = p;
+    keys[t] = env * cells_per_env + local;
+    idx[t] = p;
 }
 
 // --- P2G deterministic gather (one thread per grid node) --------------------
@@ -865,8 +878,9 @@ __global__ void MpmArticReactDepositKernel(
 // v_p = sum_i N_i v_i; C_p = (4/dx^2) sum_i N_i v_i (x_i - x_p)^T (the MLS fit).
 // Advects x_p += dt*v_p and writes the recovered v_p DIRECTLY into particle_vel
 // (the MPM particle's final velocity — no finalize dv-compose).
-__global__ void MpmG2PGatherKernel(uint32_t particle_count,
-                                   uint32_t particles_per_env, uint32_t nodes_per_env,
+__global__ void MpmG2PGatherKernel(uint32_t mpm_count,
+                                   uint32_t particles_per_env, uint32_t mpm_per_env,
+                                   uint32_t nodes_per_env,
                                    uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
                                    float inv_dx, float dx, float dt, m::Vec3 origin,
                                    const float* __restrict__ inv_mass,
@@ -874,9 +888,10 @@ __global__ void MpmG2PGatherKernel(uint32_t particle_count,
                                    m::Vec3* __restrict__ part_pos,
                                    m::Vec3* __restrict__ part_vel,
                                    float* __restrict__ part_C) {
-    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= particle_count) return;
-    const uint32_t env = p / particles_per_env;
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= mpm_count) return;
+    uint32_t env = 0u;
+    const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env);
     const m::Vec3 xp = part_pos[p];
     const Bspline wxs = QuadWeights((xp.x - origin.x) * inv_dx);
     const Bspline wys = QuadWeights((xp.y - origin.y) * inv_dx);
@@ -927,15 +942,18 @@ __global__ void MpmG2PGatherKernel(uint32_t particle_count,
 // --- F-update: elastic F^{n+1} = (I + dt*C) F^n; fluid (kind 3) tracks volume off the
 // divergence J *= (1 + dt*tr C), keeping F = cbrt(J)*I (no shear-driven inversion);
 // granular (kind 4) predicts the elastic F then Drucker-Prager return-maps it (plastic).
-__global__ void MpmUpdateFKernel(uint32_t particle_count, float dt,
+__global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
                                  const float* __restrict__ part_C,
                                  const uint32_t* __restrict__ part_mat,
                                  const float* __restrict__ material_table,
                                  uint32_t material_count, uint32_t particles_per_env,
+                                 uint32_t mpm_per_env,
                                  float* __restrict__ part_F,
                                  uint32_t* __restrict__ env_status) {
-    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= particle_count) return;
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= mpm_count) return;
+    uint32_t env_unused = 0u;
+    const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env_unused);
     const float* C = part_C + static_cast<size_t>(p) * 9u;
     float* F = part_F + static_cast<size_t>(p) * 9u;
     float kind = 0.0f, youngs = 0.0f, poisson = 0.0f, dpf = 0.0f, dpc = 0.0f;
@@ -1000,26 +1018,29 @@ inline MpmScratch PartitionScratch(void* base, uint32_t Np) {
 // each kernel launch a barrier (the launch boundary is the inter-phase barrier).
 void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                    const DataView& data, float dt_sub, uint32_t Np, uint32_t Ppe,
+                   uint32_t mpm_pe, uint32_t mpm_count,
                    uint32_t cpe, uint32_t total_nodes, float inv_dx,
                    const m::Vec3& origin, cudaStream_t stream) {
     const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
-    const uint32_t pblocks = (Np + kBlockSize - 1u) / kBlockSize;
+    // The particle-iterating kernels + the sort span the MPM sub-slice only
+    // (mpm_count == Np for a lone MPM medium, so this is byte-identical there).
+    const uint32_t pblocks = (mpm_count + kBlockSize - 1u) / kBlockSize;
     LaunchCuda(MpmGridClearKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
                total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
                data.grid_force);
-    LaunchCuda(MpmCellKeysKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
-               data.particle_pos, Ppe, inv_dx, origin, p.grid_dims[0], p.grid_dims[1],
-               p.grid_dims[2], cpe, data.mpm_grid_cell_key, data.mpm_grid_part_idx,
-               data.env_status);
-    MpmScratch sc = PartitionScratch(data.mpm_sort_scratch, Np);
+    LaunchCuda(MpmCellKeysKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
+               mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
+               p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], cpe,
+               data.mpm_grid_cell_key, data.mpm_grid_part_idx, data.env_status);
+    MpmScratch sc = PartitionScratch(data.mpm_sort_scratch, mpm_count);
     (void)cub::DeviceRadixSort::SortPairs(
         sc.sort_temp, sc.sort_temp_bytes, data.mpm_grid_cell_key, sc.keys_out,
-        data.mpm_grid_part_idx, sc.idx_out, static_cast<int>(Np), 0, 32, stream);
+        data.mpm_grid_part_idx, sc.idx_out, static_cast<int>(mpm_count), 0, 32, stream);
     LaunchCuda(MpmP2GGatherKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
                total_nodes, data.particle_pos, data.particle_inv_mass,
                data.particle_vel, data.particle_C, data.particle_F,
                data.particle_vol0, data.particle_material_id, data.mpm_material_table,
-               p.material_count, sc.keys_out, sc.idx_out, Np, Ppe, p.nodes_per_env,
+               p.material_count, sc.keys_out, sc.idx_out, mpm_count, Ppe, p.nodes_per_env,
                cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx,
                dt_sub, origin, data.grid_mass, data.grid_momentum);
     const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
@@ -1050,14 +1071,14 @@ void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                    data.body_linear_velocity, data.body_angular_velocity,
                    data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
-    LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
-               Ppe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
-               inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
+    LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
+               mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
+               p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
                data.grid_velocity, data.particle_pos, data.particle_vel,
                data.particle_C);
-    LaunchCuda(MpmUpdateFKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, Np,
+    LaunchCuda(MpmUpdateFKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, mpm_count,
                dt_sub, data.particle_C, data.particle_material_id,
-               data.mpm_material_table, p.material_count, Ppe, data.particle_F,
+               data.mpm_material_table, p.material_count, Ppe, mpm_pe, data.particle_F,
                data.env_status);
 }
 
@@ -1067,8 +1088,8 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     if (p == nullptr) return Status::Failed;
     // Defensive inertness (the build-time add() gate already keeps this op off a
     // non-MPM op list): nothing to do without MPM particles / a grid / a cell size.
-    if (p->mode != kParticleModeMpm || p->particle_count == 0u ||
-        p->nodes_per_env == 0u || p->dx <= 0.0f) {
+    if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmXpbd) ||
+        p->particle_count == 0u || p->nodes_per_env == 0u || p->dx <= 0.0f) {
         return Status::Ok;
     }
     const uint64_t total_nodes64 =
@@ -1083,10 +1104,17 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         return Status::Failed;
     const uint32_t Np = p->particle_count;
     const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
+    // The MPM sub-slice [0, mpm_pe) per env. 0 => the whole per-env block is MPM (a
+    // lone MPM medium; then mpm_count == Np, byte-identical to the contiguous launch).
+    const uint32_t mpm_pe =
+        (p->mpm_particles_per_env == 0u || p->mpm_particles_per_env > Ppe)
+            ? Ppe : p->mpm_particles_per_env;
+    const uint32_t mpm_count = mpm_pe * p->env_count;
     // LOUD invariants: the count fits the per-env footprint + cub's int num_items.
     if (static_cast<uint64_t>(Np) >
         static_cast<uint64_t>(Ppe) * p->env_count) return Status::Failed;
-    if (static_cast<uint64_t>(Np) > static_cast<uint64_t>(INT_MAX)) return Status::Failed;
+    if (static_cast<uint64_t>(mpm_count) > static_cast<uint64_t>(INT_MAX))
+        return Status::Failed;
     const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
     const float inv_dx = 1.0f / p->dx;
@@ -1110,8 +1138,8 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
                    stream, tb, data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
     for (uint32_t s = 0; s < substeps; ++s) {
-        LaunchSubstep(*p, model, data, dt_sub, Np, Ppe, cpe, total_nodes, inv_dx,
-                      origin, stream);
+        LaunchSubstep(*p, model, data, dt_sub, Np, Ppe, mpm_pe, mpm_count, cpe,
+                      total_nodes, inv_dx, origin, stream);
     }
     // Articulated-link deposit: the link rows' net grid reaction (summed over the
     // substeps above) becomes delta-qdot via M^-1 J^T into the per-articulation

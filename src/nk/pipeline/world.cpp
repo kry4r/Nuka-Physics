@@ -227,9 +227,12 @@ bool World::SeedInitialState() {
             return false;
         }
         // MLS-MPM per-particle continuum seed (F=identity, vol0, material_id),
-        // gated mode==Mpm so a non-MPM world writes EXACTLY today's bytes (the new
-        // fields stay at their 0-byte segments). C is the arena zero default.
-        if (mp.mode == Model::ParticleMode::Mpm) {
+        // gated to the MPM modes so a non-MPM world writes EXACTLY today's bytes (the
+        // new fields stay at their 0-byte segments). C is the arena zero default. For
+        // MpmXpbd initial_F/vol0/material_id are sized to the MPM slice [0, n_mpm), so
+        // the loop's identity/0 fallback fills the XPBD slice (unused by the transfer).
+        if (mp.mode == Model::ParticleMode::Mpm ||
+            mp.mode == Model::ParticleMode::MpmXpbd) {
             std::vector<float> F(static_cast<size_t>(P) * E * 9u, 0.0f);
             std::vector<float> vol0(static_cast<size_t>(P) * E, 0.0f);
             std::vector<uint32_t> mat(static_cast<size_t>(P) * E, 0u);
