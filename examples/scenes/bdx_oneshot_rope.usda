@@ -1,0 +1,216 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Xform "anchor" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        bool physics:kinematicEnabled = true
+        float physics:mass = 0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+    def Xform "link_0" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.02
+        float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.02700
+            uniform token axis = "Z"
+        }
+    }
+    def Xform "link_1" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.02
+        float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.02700
+            uniform token axis = "Z"
+        }
+    }
+    def Xform "link_2" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.02
+        float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.02700
+            uniform token axis = "Z"
+        }
+    }
+    def Xform "link_3" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.02
+        float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.02700
+            uniform token axis = "Z"
+        }
+    }
+    def Xform "link_4" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.02
+        float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.02700
+            uniform token axis = "Z"
+        }
+    }
+    def Xform "link_5" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.02
+        float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.02700
+            uniform token axis = "Z"
+        }
+    }
+    def Xform "link_6" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.02
+        float3 physics:diagonalInertia = (8e-6, 8e-6, 1e-6)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.02700
+            uniform token axis = "Z"
+        }
+    }
+    def Xform "yoke" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.03
+        float3 physics:diagonalInertia = (5e-5, 3e-5, 5e-5)
+        double3 xformOp:translate = (0, 0, -0.04300)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Capsule "leg_p" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.10323
+            uniform token axis = "Z"
+            double3 xformOp:translate = (0.0, 0.05500, -0.02300)
+            float3 xformOp:rotateXYZ = (-112.694, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+        def Capsule "leg_n" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double radius = 0.008
+            double height = 0.10323
+            uniform token axis = "Z"
+            double3 xformOp:translate = (0.0, -0.05500, -0.02300)
+            float3 xformOp:rotateXYZ = (112.694, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+    }
+    def Xform "slab" ( prepend apiSchemas = ["PhysicsRigidBodyAPI","PhysicsMassAPI"] )
+    {
+        bool physics:rigidBodyEnabled = true
+        float physics:mass = 0.6
+        float3 physics:diagonalInertia = (0.003265, 0.000970, 0.002545)
+        double3 xformOp:translate = (0, 0, -0.11100)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Cube "geom" ( prepend apiSchemas = ["PhysicsCollisionAPI"] )
+        {
+            double size = 2.0
+            float3 xformOp:scale = (0.025, 0.11, 0.065)
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+        }
+    }
+    def PhysicsRevoluteJoint "j_anchor" {
+        rel physics:body0 = </World/anchor>
+        rel physics:body1 = </World/link_0>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsRevoluteJoint "j_1" {
+        rel physics:body0 = </World/link_0>
+        rel physics:body1 = </World/link_1>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsRevoluteJoint "j_2" {
+        rel physics:body0 = </World/link_1>
+        rel physics:body1 = </World/link_2>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsRevoluteJoint "j_3" {
+        rel physics:body0 = </World/link_2>
+        rel physics:body1 = </World/link_3>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsRevoluteJoint "j_4" {
+        rel physics:body0 = </World/link_3>
+        rel physics:body1 = </World/link_4>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsRevoluteJoint "j_5" {
+        rel physics:body0 = </World/link_4>
+        rel physics:body1 = </World/link_5>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsRevoluteJoint "j_6" {
+        rel physics:body0 = </World/link_5>
+        rel physics:body1 = </World/link_6>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsRevoluteJoint "j_yoke" {
+        rel physics:body0 = </World/link_6>
+        rel physics:body1 = </World/yoke>
+        token physics:axis = "Y"
+        float physics:lowerLimit = -175
+        float physics:upperLimit = 175
+    }
+    def PhysicsFixedJoint "j_slab" {
+        rel physics:body0 = </World/yoke>
+        rel physics:body1 = </World/slab>
+    }
+}
