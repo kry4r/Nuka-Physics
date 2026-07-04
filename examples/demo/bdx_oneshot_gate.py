@@ -141,9 +141,9 @@ def stage_settle(args):
         over = int(np.sum(c[:, 2] > A.LINTEL_Z[1] - 0.01))
         print(f"[settle] cloth min_z {cmin:.3f} max_z {cmax:.3f} "
               f"nodes above lintel top {over}/{c.shape[0]}")
-        if not (0.18 <= cmin <= 0.34):
+        if not (0.18 + A.SCENE_LIFT <= cmin <= 0.34 + A.SCENE_LIFT):
             ok = False
-            print("  !! curtain hem out of the hang band [0.18,0.34]")
+            print("  !! curtain hem out of the hang band")
         if over < A.CLOTH_NY - 4:
             ok = False
             print("  !! the pinned line lost nodes (curtain fell)")
@@ -172,7 +172,7 @@ def stage_settle(args):
         # 5. slab hangs at rest at head height.
         slab = links[-1]  # the rope articulation's last link (slab, fixed to yoke).
         print(f"[settle] slab pose {slab[:3].round(3)}")
-        if not (0.20 < slab[2] < 0.45) or abs(slab[0] - A.BEAM_X) > 0.05:
+        if not (0.20 + A.SCENE_LIFT < slab[2] < 0.45 + A.SCENE_LIFT) or abs(slab[0] - A.BEAM_X) > 0.05:
             ok = False
             print("  !! slab not hanging under the beam")
 

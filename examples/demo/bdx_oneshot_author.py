@@ -51,6 +51,7 @@ TRUNK = "base/trunk_assembly"
 # -- shared stage coordinates (gate / choreo / preview import these) -----------
 SPAWN = [-0.20, 0.0, 0.31]          # duck base anchor on the platform (top 0.10).
 BASE_OVER_FLOOR = 0.21              # duck base anchor height over the floor it stands on.
+SCENE_LIFT = 0.05                   # sit the scene above the render's z=0 studio disc.
 PLATFORM_TOP = 0.10
 STEP_TOP = 0.05                     # the ONE intermediate step (two risers of 0.05).
 STEP_X = (0.10, 0.26)               # step tread span; ground (z=0) beyond.
@@ -66,7 +67,7 @@ ZONE_C = (2.45, 3.05, 0.20)         # x0, x1, half-y for the small-object cluste
 BEAM_X, BEAM_Z = 3.75, 0.79         # portal frame plane and beam centre height.
 ROPE_SEG, ROPE_LINKS = 0.043, 7
 SLAB_HALF = (0.025, 0.11, 0.065)    # x thickness, y width, z height (slab hangs ~0.27).
-WALL_Y, WALL_TOP = 0.55, 0.80       # wall inner faces / height.
+WALL_Y, WALL_TOP = 0.55, 0.46       # wall inner faces / height (low: let sky in).
 
 
 def tex(name, **kw):
@@ -95,10 +96,10 @@ def add_materials(b):
                                  **tex("gravel", uv_scale=8.0))
     m["fabric"] = b.add_material("fabric_curtain", base_color=[0.74, 0.32, 0.26],
                                  sheen=0.5, **tex("fabric", uv_scale=5.0))
-    m["stone"] = b.add_material("stone", base_color=[0.45, 0.43, 0.40],
-                                roughness=0.85)
-    m["metal"] = b.add_material("metal", base_color=[0.58, 0.58, 0.62],
-                                metallic=0.9, roughness=0.35)
+    m["stone"] = b.add_material("stone", base_color=[0.20, 0.17, 0.14],
+                                roughness=0.95)
+    m["metal"] = b.add_material("metal", base_color=[0.55, 0.56, 0.60],
+                                metallic=0.9, roughness=0.3)
     m["cord"] = b.add_material("rope_cord", base_color=[0.28, 0.20, 0.13],
                                roughness=0.9)
     m["crate"] = b.add_material("crate", base_color=[0.50, 0.36, 0.22],
@@ -155,6 +156,8 @@ def build(args):
     # -- floor: one big base slab (top -0.03) + packed-earth plates (top 0.00)
     # everywhere EXCEPT the gravel tray span, which stays 3 cm deep ------------
     sbox(b, [3.75, 1.5, 0.06], [2.25, 0.0, -0.09], "dirt")
+    # a wide apron below the walk plates (and tray floor) hides the studio disc.
+    sbox(b, [11.0, 8.0, 0.015], [4.0, 0.0, -0.06], "dirt")
     tx0, tx1, ty, tz = TROUGH
     sbox(b, [(tx0 + 1.5) * 0.5, 1.5, 0.015], [(tx0 - 1.5) * 0.5, 0.0, -0.015], "dirt")
     sbox(b, [(6.0 - tx1) * 0.5, 1.5, 0.015], [(6.0 + tx1) * 0.5, 0.0, -0.015], "dirt")
@@ -186,72 +189,68 @@ def build(args):
         b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[pr],
                               pos=[px, py, tz + pr], mass=0.05, friction=0.9,
                               material="stone")
-    # sparse rigid cobbles thinning out toward Zone C (the D02->D03 transition).
-    rng = random.Random(11)
-    cob = []
-    for _ in range(10):
-        r = rng.uniform(0.008, 0.014)
-        for _ in range(40):
-            x, y = rng.uniform(2.32, 2.44), rng.uniform(-0.25, 0.25)
-            if all((x - px) ** 2 + (y - py) ** 2 > (r + pe + 0.004) ** 2
-                   for px, py, pe in cob):
-                cob.append((x, y, r))
-                b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r],
-                                      pos=[x, y, r + 0.002], mass=0.02,
-                                      friction=0.9, material="stone")
-                break
-
-    # -- Zone C: the micro-object cluster (rejection-sampled: overlapping spawns
-    # grind for hundreds of steps then eject a part at m/s) ---------------------
+    # rigid cobbles thinning toward Zone C plus the dense micro-object cluster.
+    # ONE rejection sampler + ONE placed list spaces every free body so it beds
+    # down isolated (a clustered pile of gram-scale parts never fully quiesces).
     cx0, cx1, cy = ZONE_C
     rng = random.Random(7)
-    placed = []
+    placed = [(px, py, pr)]
 
-    def free_spot(extent):
-        for _ in range(60):
-            x, y = rng.uniform(cx0, cx1), rng.uniform(-cy, cy)
-            if all((x - px) ** 2 + (y - py) ** 2 > (extent + pe + 0.004) ** 2
-                   for px, py, pe in placed):
+    def free_spot(extent, x0, x1, y0, y1, margin=0.013, tries=110):
+        for _ in range(tries):
+            x, y = rng.uniform(x0, x1), rng.uniform(y0, y1)
+            if all((x - qx) ** 2 + (y - qy) ** 2 > (extent + qe + margin) ** 2
+                   for qx, qy, qe in placed):
                 placed.append((x, y, extent))
                 return x, y
         return None, None
 
+    for _ in range(10):  # sparse rounded stone cobbles on the D02->D03 transition
+        r = rng.uniform(0.009, 0.014)
+        x, y = free_spot(r, 2.32, 2.42, -0.25, 0.25)
+        if x is None:
+            continue
+        b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, y, r],
+                              mass=0.04, friction=0.9, material="stone")
+
     for _ in range(int(args.rocks)):
         kind = rng.random()
-        if kind < 0.40:      # pebble
-            r = rng.uniform(0.008, 0.015)
-            x, y = free_spot(r)
+        if kind < 0.40:      # pebble: a rounded stone; the analytic sphere-vs-floor
+                             # contact beds cleaner than a small box manifold
+            r = rng.uniform(0.010, 0.016)
+            x, y = free_spot(r, cx0, cx1, -cy, cy)
             if x is None:
                 continue
             b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, y, r],
-                                  mass=0.01, friction=0.9, material="stone")
-        elif kind < 0.65:    # bolt
-            r = rng.uniform(0.0035, 0.0045)
-            x, y = free_spot(0.012)
+                                  mass=0.03, friction=0.9, material="stone")
+        elif kind < 0.65:    # bolt/screw: a faceted metal prism (real hardware is
+                             # faceted, not a smooth cylinder) resting on a face
+            hl = rng.uniform(0.011, 0.015)
+            hw = 0.005
+            x, y = free_spot(math.hypot(hl, hw), cx0, cx1, -cy, cy)
             if x is None:
                 continue
-            # Lie flat at a random in-plane heading (spin the +Y axis about Z);
-            # the sole rests at z=r, no floor penetration at spawn.
+            # Spun about +z it stays flat on a face -> a clean face contact.
             a = rng.uniform(0.0, math.pi)
-            b.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[r, 0.005],
-                                  pos=[x, y, r],
-                                  quat=[math.cos(a), 0.0, 0.0, math.sin(a)],
-                                  mass=0.005, friction=0.8, material="metal")
-        elif kind < 0.85:    # washer
-            e = rng.uniform(0.006, 0.009)
-            x, y = free_spot(e * 1.42)
+            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[hl, hw, hw],
+                                  pos=[x, y, hw],
+                                  quat=[math.cos(a * 0.5), 0.0, 0.0, math.sin(a * 0.5)],
+                                  mass=0.028, friction=0.8, material="metal")
+        elif kind < 0.85:    # washer: a flat metal square (thick enough to bed flat)
+            e = rng.uniform(0.008, 0.012)
+            x, y = free_spot(e * 1.42, cx0, cx1, -cy, cy)
             if x is None:
                 continue
-            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, 0.0018],
-                                  pos=[x, y, 0.002], mass=0.002, friction=0.8,
+            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, 0.003],
+                                  pos=[x, y, 0.003], mass=0.016, friction=0.8,
                                   material="metal")
-        else:                # nut
-            e = rng.uniform(0.004, 0.0055)
-            x, y = free_spot(e * 1.42)
+        else:                # nut: a small squat metal block
+            e = rng.uniform(0.006, 0.008)
+            x, y = free_spot(e * 1.42, cx0, cx1, -cy, cy)
             if x is None:
                 continue
-            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, e * 0.7],
-                                  pos=[x, y, e * 0.7], mass=0.003, friction=0.8,
+            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, e * 0.75],
+                                  pos=[x, y, e * 0.75], mass=0.02, friction=0.8,
                                   material="metal")
 
     # -- Zone D: portal frame + rope chain + V-yoke + stone slab ----------------
@@ -266,21 +265,20 @@ def build(args):
     rope.destroy()
 
     # -- dressing: walls / studs / crates / barrel / tool board -----------------
+    # The camera side (-y) is left open (the classic open fourth wall); the far
+    # (+y) plank wall + studs + a low back wall carry the workshop backdrop.
     wz = [-0.03, WALL_TOP]
     wh, wc = (wz[1] - wz[0]) * 0.5, (wz[0] + wz[1]) * 0.5
     sbox(b, [(4.6 + 0.3) * 0.5, 0.03, wh], [(4.6 - 0.3) * 0.5, WALL_Y + 0.03, wc], "wood_planks")
-    sbox(b, [(3.15 + 0.3) * 0.5, 0.03, wh], [(3.15 - 0.3) * 0.5, -WALL_Y - 0.03, wc], "wood_planks")
-    sbox(b, [0.03, 0.61, wh], [-0.66, 0.0, wc], "wood_planks")
+    sbox(b, [0.03, 0.61, wh], [-0.66, 0.32, wc], "wood_planks")
     for sx in (-0.15, 0.75, 1.65, 2.55, 3.45, 4.35):
-        sbox(b, [0.04, 0.04, 0.40], [sx, WALL_Y - 0.04, 0.37], "wood_planks")
-        if sx <= 3.05:
-            sbox(b, [0.04, 0.04, 0.40], [sx, -WALL_Y + 0.04, 0.37], "wood_planks")
+        sbox(b, [0.04, 0.04, 0.245], [sx, WALL_Y - 0.04, 0.215], "wood_planks")
     for (cx, cy2, s) in [(0.62, 0.44, 0.10), (1.30, 0.46, 0.08),
                          (2.40, 0.45, 0.12), (4.35, 0.42, 0.13)]:
         sbox(b, [s, s, s], [cx, cy2, s], "crate")
     b.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[0.06, 0.075],
                           pos=[4.05, -0.42, 0.135], static=True, material="crate")
-    sbox(b, [0.25, 0.008, 0.15], [2.55, WALL_Y - 0.012, 0.45], "board")
+    sbox(b, [0.25, 0.008, 0.13], [2.55, WALL_Y - 0.012, 0.30], "board")
 
     # -- media (both records live in the .nks; ONE MpmXpbd cook) ----------------
     if not args.no_cloth:
@@ -288,7 +286,7 @@ def build(args):
     if not args.no_gravel:
         add_granular(b, mat_ids["gravel"], spacing=args.gravel_spacing)
 
-    b.set_environment(hdri=f"{TEX}/hdri/sky_2k.hdr", yaw_deg=-35.0, intensity=0.9,
+    b.set_environment(hdri=f"{TEX}/hdri/sky_2k.hdr", yaw_deg=-35.0, intensity=1.3,
                       use_scene_materials=True)
     b.save(args.out)
     b.destroy()
@@ -322,6 +320,19 @@ def post_process(out):
             walk(c)
 
     walk(doc["tree"])
+    # lift the whole scene above the render's z=0 studio-floor disc so the dirt
+    # floor renders instead of Z-fighting it (a uniform, physics-invariant shift).
+    for node in doc["tree"]:
+        tr = node.get("transform")
+        if tr and len(tr.get("pos", [])) == 3:
+            tr["pos"][2] += SCENE_LIFT
+    for m in doc["media"]:
+        if m["kind"] == "cloth":
+            m["cloth_grid"]["origin"][2] += SCENE_LIFT
+        elif m["kind"] == "granular":
+            m["fluid_box"]["min"][2] += SCENE_LIFT
+            m["fluid_box"]["max"][2] += SCENE_LIFT
+            m["mpm"]["floor_d"] += SCENE_LIFT
     with open(out, "w") as f:
         json.dump(doc, f)
 
