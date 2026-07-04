@@ -326,7 +326,7 @@ def post_process(out):
         tr = node.get("transform")
         if tr and len(tr.get("pos", [])) == 3:
             tr["pos"][2] += SCENE_LIFT
-    for m in doc["media"]:
+    for m in doc.get("media", []):
         if m["kind"] == "cloth":
             m["cloth_grid"]["origin"][2] += SCENE_LIFT
         elif m["kind"] == "granular":
