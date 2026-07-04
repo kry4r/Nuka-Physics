@@ -60,7 +60,7 @@ CLOTH_SPACING = 0.02
 CLOTH_NX, CLOTH_NY = 17, 28         # 17 nodes along x (0.32 hang run), 28 across y.
 CLOTH_ORIGIN = [0.175, 0.0, 0.572]  # +x edge line over the lintel top (the pin).
 TROUGH = (0.95, 2.25, 0.35, -0.03)  # x0, x1, half-y, floor z (flush tray).
-GRAVEL_SPACING = 0.008
+GRAVEL_SPACING = 0.009
 PROBE_PEBBLE = (1.60, 0.06, 0.02)   # x, y, radius -- half-buried on the walk line.
 ZONE_C = (2.45, 3.05, 0.20)         # x0, x1, half-y for the small-object cluster.
 BEAM_X, BEAM_Z = 3.75, 0.79         # portal frame plane and beam centre height.
@@ -130,7 +130,7 @@ def add_granular(b, gravel_id, spacing=GRAVEL_SPACING):
                 fluid_max=[tx1 - 0.02, ty - 0.02, 0.004],
                 fluid_spacing=spacing, mpm_model_kind=4.0, mpm_dp_friction=34.0,
                 mpm_dp_cohesion=0.0, mpm_density=1600.0, mpm_youngs=3.0e5,
-                mpm_poisson=0.3, mpm_dx=max(2.0 * spacing, 0.02), mpm_substeps=25,
+                mpm_poisson=0.3, mpm_dx=max(2.0 * spacing, 0.02), mpm_substeps=14,
                 mpm_floor_normal=[0.0, 0.0, 1.0], mpm_floor_d=tz,
                 mpm_floor_friction=0.7, render_material_id=gravel_id)
 
@@ -188,36 +188,65 @@ def build(args):
                               material="stone")
     # sparse rigid cobbles thinning out toward Zone C (the D02->D03 transition).
     rng = random.Random(11)
+    cob = []
     for _ in range(10):
         r = rng.uniform(0.008, 0.014)
-        b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r],
-                              pos=[rng.uniform(2.32, 2.44),
-                                   rng.uniform(-0.25, 0.25), r + 0.002], mass=0.02,
-                              friction=0.9, material="stone")
+        for _ in range(40):
+            x, y = rng.uniform(2.32, 2.44), rng.uniform(-0.25, 0.25)
+            if all((x - px) ** 2 + (y - py) ** 2 > (r + pe + 0.004) ** 2
+                   for px, py, pe in cob):
+                cob.append((x, y, r))
+                b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r],
+                                      pos=[x, y, r + 0.002], mass=0.02,
+                                      friction=0.9, material="stone")
+                break
 
-    # -- Zone C: the micro-object cluster ---------------------------------------
+    # -- Zone C: the micro-object cluster (rejection-sampled: overlapping spawns
+    # grind for hundreds of steps then eject a part at m/s) ---------------------
     cx0, cx1, cy = ZONE_C
     rng = random.Random(7)
+    placed = []
+
+    def free_spot(extent):
+        for _ in range(60):
+            x, y = rng.uniform(cx0, cx1), rng.uniform(-cy, cy)
+            if all((x - px) ** 2 + (y - py) ** 2 > (extent + pe + 0.004) ** 2
+                   for px, py, pe in placed):
+                placed.append((x, y, extent))
+                return x, y
+        return None, None
+
     for _ in range(int(args.rocks)):
-        x, y = rng.uniform(cx0, cx1), rng.uniform(-cy, cy)
         kind = rng.random()
         if kind < 0.40:      # pebble
             r = rng.uniform(0.008, 0.015)
+            x, y = free_spot(r)
+            if x is None:
+                continue
             b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, y, r],
                                   mass=0.01, friction=0.9, material="stone")
         elif kind < 0.65:    # bolt
             r = rng.uniform(0.0035, 0.0045)
+            x, y = free_spot(0.012)
+            if x is None:
+                continue
             b.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[r, 0.005],
                                   pos=[x, y, r],
                                   quat=[0.707, 0.707, 0.0, 0.0], mass=0.005,
                                   friction=0.8, material="metal")
         elif kind < 0.85:    # washer
             e = rng.uniform(0.006, 0.009)
+            x, y = free_spot(e * 1.42)
+            if x is None:
+                continue
             b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, 0.0018],
                                   pos=[x, y, 0.002], mass=0.002, friction=0.8,
                                   material="metal")
         else:                # nut
             e = rng.uniform(0.004, 0.0055)
+            x, y = free_spot(e * 1.42)
+            if x is None:
+                continue
             b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, e * 0.7],
                                   pos=[x, y, e * 0.7], mass=0.003, friction=0.8,
                                   material="metal")
