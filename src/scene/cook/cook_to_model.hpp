@@ -208,11 +208,11 @@ void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
                            const XpbdCookInput& in, const MpmCookInput& mpm);
 
 // LOUD cook-time validation of a media list against the (kind x method) legal set
-// (cloth = XPBD; tet-soft = XPBD or MLS-MPM; fluid = PBF or MLS-MPM) plus the rule
-// that an MLS-MPM medium may not co-reside with an XPBD/PBF medium and a Model holds
-// at most one PBF fluid slice / one MLS-MPM medium. Throws std::runtime_error on an
-// illegal pair or mix; an empty list and the all-XPBD/PBF legal cases pass (so every
-// existing scene cooks byte-identically). The single call site is CookSceneMedia.
+// (cloth = XPBD; tet-soft = XPBD or MLS-MPM; fluid = PBF or MLS-MPM) plus the rules
+// that an MLS-MPM medium may not co-reside with a PBF medium (XPBD is legal) and a
+// Model holds at most one PBF fluid slice / one MLS-MPM medium. Throws on an illegal
+// pair or mix; an empty list and the existing legal cases pass (so every existing
+// scene cooks byte-identically). The single call site is CookSceneMedia.
 void ValidateMedia(const std::vector<MediaRecord>& media);
 
 struct PbfCookInput {
@@ -275,6 +275,16 @@ struct SoftFluidContactInput {
 void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
                             const XpbdCookInput& soft, const PbfCookInput& fluid,
                             const SoftFluidContactInput& contact = {});
+
+// Two-system cook: stage BOTH an MLS-MPM medium AND an XPBD (cloth/tet) set
+// co-resident into ONE Model with a contiguous [mpm | xpbd] layout (MPM occupies
+// [0, n_mpm), the XPBD set [n_mpm, particles_per_env)). The XPBD constraint indices
+// are rebased by n_mpm; the MPM continuum fields stay sized to the MPM slice.
+// Mode = ParticleMode::MpmXpbd. STRICT SUPERSET: an MPM-only cook (soft empty) is
+// byte-identical to CookMpmParticles, an XPBD-only cook (mpm empty) to
+// CookXpbdParticles, each plus the same body<->particle contact setup.
+void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
+                 const XpbdCookInput& soft, const SoftFluidContactInput& contact = {});
 
 // ---------------------------------------------------------------------------
 // Media records -> particle cook. The per-medium builders read a scene

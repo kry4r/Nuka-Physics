@@ -423,6 +423,10 @@ __global__ void NarrowphaseBodyParticleKernel(
         }
     }
     if (N == 0u) return;  // uniform per-warp.
+    // MpmXpbd: the MPM slice [0, particle_row_base) couples via the grid, not rows.
+    // Its reserved slots are zeroed inactive above; it emits no manifold. Uniform per
+    // warp (all lanes share pi). 0 for every other mode -> no particle is skipped.
+    if (pi < pp.particle_row_base) return;
 
     const uint32_t global_particle = env * pp.particles_per_env + pi;
     // The fluid slice [n_soft, P) under PBF/SoftFluid reads the predicted position
