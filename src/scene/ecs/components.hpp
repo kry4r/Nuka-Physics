@@ -110,6 +110,9 @@ struct CollisionShapeComponent {
     float    params[4]{0.0f, 0.0f, 0.0f, 0.0f};
     AssetRef cooked;                          // hull / SDF reference into .nka
     uint32_t physics_material_id = ~uint32_t(0);
+    // Authored render material for a collision-only body's proxy visual (a body
+    // that ships no VisualMeshComponent). kNoSlot => the shared default appearance.
+    uint32_t render_material_id  = ~uint32_t(0);
     uint32_t group = 0;                       // replaces magic handles 7000/8500/9000+
     uint32_t mask  = 0;
 };

@@ -3,9 +3,10 @@
 //
 // BuildRenderWorld walks the ECS Registry for every renderable entity. The
 // authored appearance is the VisualMeshComponent's real .nka MESH triangles;
-// CollisionShapeComponents are rendered as primitive tessellations ONLY in a
-// scene that has no visual meshes at all (a pure-collision / synthetic scene),
-// so a mesh-bearing robot is not occluded by its physics proxies. It resolves
+// a CollisionShapeComponent renders as a primitive tessellation (in its authored
+// render material) ONLY as a per-body fallback -- when NO visual on that body's
+// subtree already carries the appearance, so a mesh-bearing body is not occluded
+// by its own physics proxies while a collision-only body still shows up. It resolves
 // each instance's PBR material, its cached visual_local offset
 // (the composed node chain from the physics-bound ancestor down to the visual
 // node, Decision D1), and its pose source (LinkPose/BodyPose/Static, resolved
@@ -332,12 +333,8 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
         return component_material_id;
     };
 
-    // Collision primitives render only as a fallback when NO real visual mesh loaded
-    // (a non-empty set suppresses them: a mesh's proxy is a redundant wrong-sized occluder).
-    std::unordered_set<scene::EntityId, scene::EntityIdHash> has_visual_mesh;
-
     // Bodies whose subtree carries ANY visual (mesh or primitive): their collision
-    // proxies are redundant coplanar occluders and are skipped per-body.
+    // proxies are skipped per-body, so only a collision-only body shows its proxy.
     std::unordered_set<const scene::SceneNode*> body_has_visual;
     auto nearest_body_node = [&](scene::EntityId e) -> const scene::SceneNode* {
         for (auto n = registry.NodeOf(e); n; n = n->parent.lock()) {
@@ -376,7 +373,7 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
         [&](scene::EntityId e, const scene::VisualMeshComponent& vis) {
             if (vis.mesh.Empty() || vis.mesh.fourcc != scene::NkaTagMesh()) {
                 // No bound MESH: tessellate a renderable visual primitive from its
-                // params (does NOT mark has_visual_mesh, so pure-collision render holds).
+                // params; marks body_has_visual so the collision proxy is skipped.
                 using PK = scene::VisualMeshComponent::PrimKind;
                 if (vis.prim_kind == PK::None) {
                     // Still asset-gated / non-renderable: skip (no misleading cube).
@@ -426,17 +423,15 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 return FromNkaMesh(scene::DecodeMesh(
                     file->LoadChunk(scene::NkaTagMesh(), vis.mesh.index)));
             });
-            has_visual_mesh.insert(e);  // a real mesh loaded -> proxies now redundant
             if (const scene::SceneNode* b = nearest_body_node(e)) {
                 body_has_visual.insert(b);
             }
             build_common(e, mesh_id, resolve_material(vis.render_material_id));
         });
 
-    // Collision-proxy fallback (only when no visual mesh loaded): box/sphere/capsule
-    // tessellate from params; hull/SDF carry no host geometry and are skipped.
+    // Collision-proxy fallback, per body: box/sphere/capsule tessellate from params
+    // for a body with no visual of its own; hull/SDF carry no host geometry.
     using CK = scene::CollisionShapeComponent::Kind;
-    if (has_visual_mesh.empty())
     registry.ForEach<scene::CollisionShapeComponent>(
         [&](scene::EntityId e, const scene::CollisionShapeComponent& cs) {
             // The shape's own body already shows a visual: its proxy would be a
@@ -451,6 +446,8 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 case CK::Box:
                 case CK::Plane: {
                     const float hx = cs.params[0], hy = cs.params[1], hz = cs.params[2];
+                    // An unbounded plane (zero extent) has no finite box proxy.
+                    if (cs.kind == CK::Plane && (hx <= 0.0f || hy <= 0.0f)) return;
                     mesh_id = world.meshes.InternPrimitive(
                         PrimKey("box", hx, hy, hz),
                         [&]() { return MakeBox(hx, hy, hz); });
@@ -479,10 +476,9 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                     return;
                 }
             }
-            // CollisionShapeComponent carries only a PHYSICS material id, not a
-            // render material; collision-primitive instances use the shared
-            // default render material.
-            build_common(e, mesh_id, world.default_material_id);
+            // Honor the shape's authored render material; unset falls back to the
+            // shared default grey (resolve_material handles the kNoSlot sentinel).
+            build_common(e, mesh_id, resolve_material(cs.render_material_id));
         });
 
     // -- cameras -------------------------------------------------------------

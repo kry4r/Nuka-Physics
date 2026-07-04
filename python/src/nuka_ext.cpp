@@ -1340,12 +1340,17 @@ public:
 
     // The scene's HDR environment + material policy for the beauty render.
     void set_environment(const std::string& hdri, float yaw_deg, float intensity,
-                         bool use_scene_materials) {
+                         bool use_scene_materials, bool ibl_full_fill,
+                         float exposure_ev, float grade, float sun_disc) {
         nuka_environment_desc_t d{};
         d.hdri = hdri.empty() ? nullptr : hdri.c_str();
         d.yaw_deg = yaw_deg;
         d.intensity = intensity;
         d.use_scene_materials = use_scene_materials ? 1u : 0u;
+        d.ibl_full_fill = ibl_full_fill ? 1u : 0u;
+        d.exposure_ev = exposure_ev;
+        d.grade = grade;
+        d.sun_disc = sun_disc;
         check(nuka_scene_set_environment(h_, &d), "nuka_scene_set_environment");
     }
 
@@ -2577,10 +2582,15 @@ NB_MODULE(_nuka_ext, m) {
         .def("set_environment", &SceneBuilder::set_environment,
              nb::arg("hdri") = std::string(), nb::arg("yaw_deg") = 0.0f,
              nb::arg("intensity") = 1.0f, nb::arg("use_scene_materials") = true,
+             nb::arg("ibl_full_fill") = false, nb::arg("exposure_ev") = 0.0f,
+             nb::arg("grade") = 0.0f, nb::arg("sun_disc") = 0.0f,
              "Set the scene's beauty environment: an equirect .hdr path backing "
              "the sky + ambient light (\"\" keeps the procedural studio sky), its "
              "yaw/intensity, and whether the render uses the scene's AUTHORED "
-             "materials (default True) instead of the studio hero palette.")
+             "materials (default True) instead of the studio hero palette. The "
+             "opt-in look levers (all neutral by default): ibl_full_fill lights the "
+             "env-miss fill at `intensity`; exposure_ev/grade are the post exposure "
+             "and contrast/saturation grade; sun_disc adds a crisp sky sun disc.")
         .def("add_media", &SceneBuilder::add_media, nb::arg("kind"),
              nb::arg("method"), nb::arg("cloth_nx") = 0u, nb::arg("cloth_ny") = 0u,
              nb::arg("cloth_spacing") = 0.0f,

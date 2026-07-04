@@ -344,7 +344,11 @@ struct StudioRtRenderer::Impl {
         b.sky_ground = {opts.ground_color[0], opts.ground_color[1], opts.ground_color[2]};
         b.fog_color = {opts.fog_color[0], opts.fog_color[1], opts.fog_color[2]};
         b.fog_density = opts.fog_density;
-        b.sky_intensity = 0.30f;
+        // Env-miss indirect fill scale + optional sky sun disc (both opt-in via
+        // RasterOptions; the 0.30 / zero defaults keep the prior look byte-exact).
+        b.sky_intensity = opts.beauty_sky_fill;
+        b.sun_disc_radiance = Vec3{opts.beauty_sun_disc[0], opts.beauty_sun_disc[1],
+                                   opts.beauty_sun_disc[2]};
         b.download = rt::AovDownloadMask{};
         b.download.depth = false; b.download.normal = false;
         b.download.albedo = false; b.download.uv = false;
@@ -378,9 +382,10 @@ VulkanOffscreenReport StudioRtRenderer::Render(const RenderWorld& world,
     else
         fb = im.backend->TraceToHost(im.handle, im.scene, cam);
     // An HDR environment IS the backdrop: keep the traced radiance on miss pixels
-    // (no environment => the flat background fill, byte-identical to today).
+    // (no environment => the flat background fill). Exposure/grade post is opt-in.
     return FramebufferToReport(fb, options.background,
-                               im.beauty && world.environment.Enabled());
+                               im.beauty && world.environment.Enabled(),
+                               options.beauty_exposure_ev, options.beauty_grade);
 }
 
 }  // namespace nuka::render

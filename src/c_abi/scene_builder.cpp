@@ -343,6 +343,10 @@ nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
         rec.yaw_deg = desc->yaw_deg;
         rec.intensity = desc->intensity > 0.0f ? desc->intensity : 1.0f;
         rec.use_scene_materials = desc->use_scene_materials != 0u;
+        rec.ibl_full_fill = desc->ibl_full_fill != 0u;
+        rec.exposure_ev = desc->exposure_ev;
+        rec.grade = desc->grade;
+        rec.sun_disc = desc->sun_disc;
         sr->scene->EnvironmentMut() = std::move(rec);
         return NUKA_RESULT_OK;
     } catch (...) {
