@@ -343,11 +343,17 @@ struct MediaRecord {
 
     // Procedural geometry (one populated per kind); a baked .obj/.nka mesh
     // medium references its chunk via `baked` instead.
+    // Which node set is pinned (inv_mass 0): none (a free drape), the perimeter
+    // (a taut membrane), or ONE grid edge (a hung curtain / flag).
+    enum class ClothPin : uint8_t { FromFree = 0, None, Perimeter,
+                                    EdgeX0, EdgeX1, EdgeY0, EdgeY1 };
     struct ClothGrid {
         uint32_t   nx = 0u, ny = 0u;
         float      spacing = 0.0f;
         math::Vec3 origin{0.0f, 0.0f, 0.0f};
         bool       free = false;
+        // FromFree defers to the legacy `free` flag; any other value overrides it.
+        ClothPin   pin = ClothPin::FromFree;
     };
     struct TetSphere {
         math::Vec3 center{0.0f, 0.0f, 0.0f};

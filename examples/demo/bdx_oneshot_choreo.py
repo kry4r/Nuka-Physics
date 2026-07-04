@@ -158,12 +158,18 @@ def run_probes(args):
 
         # -- probe 2: persistent footprints in the gravel ----------------------
         g0 = gravel(w)
-        spots = [(1.35, 0.0), (1.80, 0.0)]
-        pre = [surface_z(g0, sx, sy) for sx, sy in spots]
+        spots = []
         d.glide(1.35, 0.25, sink=-0.010)
+        for foot in (5, 14):  # actual sole spots at the stomp moment
+            lp = link_poses(w)[foot]
+            spots.append((float(lp[0]), float(lp[1])))
         d.dip(0.014, 160)
         d.glide(1.80, 0.25, sink=-0.010)
+        for foot in (5, 14):
+            lp = link_poses(w)[foot]
+            spots.append((float(lp[0]), float(lp[1])))
         d.dip(0.014, 160)
+        pre = [surface_z(g0, sx, sy) for sx, sy in spots]
         d.glide(2.32, 0.30, sink=0.0)
         d.hold(720)  # 3 s persistence
         g1 = gravel(w)

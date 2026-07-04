@@ -527,6 +527,7 @@ Value SaveMedia(const MediaRecord& m) {
     cg.Set("spacing", Value::Float(m.cloth_grid.spacing));
     cg.Set("origin", Vec3Json(m.cloth_grid.origin));
     cg.Set("free", Value::Bool(m.cloth_grid.free));
+    cg.Set("pin", Value::Int(static_cast<int64_t>(m.cloth_grid.pin)));
     o.Set("cloth_grid", std::move(cg));
 
     Value ts = Value::Object();
@@ -1477,6 +1478,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.cloth_grid.spacing = f(*cg, "spacing", rec.cloth_grid.spacing);
                 rec.cloth_grid.origin = v3(*cg, "origin", rec.cloth_grid.origin);
                 rec.cloth_grid.free = b(*cg, "free", rec.cloth_grid.free);
+                rec.cloth_grid.pin = static_cast<MediaRecord::ClothPin>(
+                    u(*cg, "pin", static_cast<uint32_t>(rec.cloth_grid.pin)));
             }
             if (const Value* ts = mv.Find("tet_sphere")) {
                 rec.tet_sphere.center = v3(*ts, "center", rec.tet_sphere.center);

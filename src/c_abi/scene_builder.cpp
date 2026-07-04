@@ -108,6 +108,11 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
     m.cloth_grid.origin = nmath::Vec3{d.cloth_origin[0], d.cloth_origin[1],
                                       d.cloth_origin[2]};
     m.cloth_grid.free = (d.cloth_free != 0u);
+    if (d.cloth_pin >
+        static_cast<uint32_t>(nscene::MediaRecord::ClothPin::EdgeY1)) {
+        return false;
+    }
+    m.cloth_grid.pin = static_cast<nscene::MediaRecord::ClothPin>(d.cloth_pin);
     m.tet_sphere.center = nmath::Vec3{d.tet_center[0], d.tet_center[1],
                                       d.tet_center[2]};
     m.tet_sphere.radius = d.tet_radius;
