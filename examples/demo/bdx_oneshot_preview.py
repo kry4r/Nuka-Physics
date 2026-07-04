@@ -48,43 +48,51 @@ def main():
         Image.fromarray(np.ascontiguousarray(img)).save(path)
         print(f"[preview] {path}", flush=True)
 
+    L = A.SCENE_LIFT
     with nuka.Device.create(0) as dev:
         w = C.build_world(dev, args.scene)
         d = C.Driver(w)
-        d.hold(500)  # drape forms, gravel compacts, slab stills.
+        d.hold(320)  # drape forms, gravel compacts, slab stills.
 
-        # S0 establish: duck on the platform, seen diagonally through the door.
-        shoot(w, "S0_establish", (-0.55, -0.70, 0.32), (0.30, 0.0, 0.25))
-        shoot(w, "S6_overhead_debug", (2.0, 0.0, 5.0), (2.0, 0.0001, 0.0), fov=55.0)
+        # S0 establish: duck on the platform looking down the whole corridor.
+        shoot(w, "S0_establish", (-0.52, -0.85, 0.46 + L), (1.1, 0.0, 0.16 + L),
+              fov=48.0)
+        shoot(w, "S6_overhead_debug", (2.0, 0.0, 4.5), (2.0, 0.0001, 0.0 + L), fov=60.0)
 
-        # S1: on the step, head pushing the curtain up (D01).
-        d.glide(0.20, 0.15)
-        d.hold(60)
-        shoot(w, "S1_stairs_door_cloth", (0.60, -0.50, 0.20), (0.28, 0.0, 0.32))
+        # S1: head emerging through the door having lifted the curtain (D01).
+        d.glide(0.32, 0.35)
+        d.hold(50)
+        shoot(w, "S1_stairs_door_cloth", (0.72, -0.54, 0.30 + L), (0.30, 0.0, 0.34 + L),
+              fov=40.0)
 
         # S2: mid-gravel with a stomped print behind (D02).
-        d.glide(0.60, 0.15)
-        d.glide(1.35, 0.25, sink=-0.010)
-        d.dip(0.014, 160)
-        d.glide(1.62, 0.25, sink=-0.010)
-        d.hold(80)
-        shoot(w, "S2_gravel_lowtrack", (1.62, -0.52, 0.10), (1.55, 0.10, 0.05))
+        d.glide(0.90, 0.6)
+        d.glide(1.35, 0.5, sink=-0.010)
+        d.dip(0.014, 150)
+        d.glide(1.62, 0.5, sink=-0.010)
+        d.hold(70)
+        shoot(w, "S2_gravel_lowtrack", (1.50, -0.60, 0.16 + L), (1.66, 0.08, 0.12 + L),
+              fov=44.0)
 
-        # S3: macro on the feet amid the micro objects (D03).
-        d.glide(2.30, 0.3)
-        d.glide(2.72, 0.5)
-        d.hold(60)
-        shoot(w, "S3_smallparts_macro", (2.82, -0.34, 0.10), (2.70, 0.0, 0.05),
+        # S3: macro on a foot amid the micro objects, a stomp kicking them (D03).
+        d.glide(2.30, 0.7)
+        d.glide(2.66, 0.3)
+        d.dip(0.02, 90)
+        d.hold(40)
+        shoot(w, "S3_smallparts_macro", (2.98, -0.40, 0.17 + L), (2.60, 0.0, 0.11 + L),
+              fov=46.0)
+
+        # S4: head strikes the hanging slab then eases back so it swings clear (D04).
+        d.glide(3.62, 0.7)
+        d.glide(3.80, 0.3)
+        d.glide(3.71, 0.5)
+        d.hold(32)
+        shoot(w, "S4_slab_strike", (3.30, -0.80, 0.30 + L), (3.78, 0.0, 0.30 + L),
               fov=45.0)
 
-        # S4: head against the hanging slab (D04); slab nudged mid-contact.
-        d.glide(3.60, 0.5)
-        d.glide(3.82, 0.3)
-        d.hold(30)
-        shoot(w, "S4_slab_strike", (3.42, -0.85, 0.34), (3.80, 0.0, 0.40))
-
         # S5: reverse wide back down the corridor.
-        shoot(w, "S5_reverse_depth", (4.42, 0.42, 0.28), (3.55, 0.0, 0.30))
+        shoot(w, "S5_reverse_depth", (4.62, -0.52, 0.36 + L), (3.2, 0.05, 0.20 + L),
+              fov=46.0)
         w.destroy()
 
 

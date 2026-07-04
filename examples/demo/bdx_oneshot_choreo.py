@@ -24,10 +24,10 @@ N_CLOTH = A.CLOTH_NX * A.CLOTH_NY
 
 def z_floor(x):
     if x < A.STEP_X[0]:
-        return A.PLATFORM_TOP
+        return A.PLATFORM_TOP + A.SCENE_LIFT
     if x < A.STEP_X[1]:
-        return A.STEP_TOP
-    return 0.0
+        return A.STEP_TOP + A.SCENE_LIFT
+    return A.SCENE_LIFT
 
 
 class Driver:
@@ -152,7 +152,7 @@ def run_probes(args):
         if lift < 0.06:
             ok = False
             print("  !! cloth lift < 0.06")
-        if not (0.16 <= hem_after <= 0.40):
+        if not (0.16 + A.SCENE_LIFT <= hem_after <= 0.40 + A.SCENE_LIFT):
             ok = False
             print("  !! curtain lost after the pass (hem out of band)")
 
@@ -185,8 +185,8 @@ def run_probes(args):
         # -- probe 3: micro objects kicked > 0.3 m/s, then at rest -------------
         b0 = bodies(w)
         micro = ((b0[:, 0] > 2.35) & (b0[:, 0] < 3.15) &
-                 (np.abs(b0[:, 1]) < 0.3) & (b0[:, 2] < 0.06) &
-                 (b0[:, 2] > -0.05))
+                 (np.abs(b0[:, 1]) < 0.3) & (b0[:, 2] < 0.06 + A.SCENE_LIFT) &
+                 (b0[:, 2] > -0.05 + A.SCENE_LIFT))
         kicked = np.zeros(b0.shape[0], dtype=bool)
         vmax = [0.0]
 
@@ -199,7 +199,7 @@ def run_probes(args):
         d.hold(500)
         vend = np.linalg.norm(body_vels(w), axis=1)
         bend = bodies(w)
-        sunk = int(np.sum(micro & (bend[:, 2] < -0.02)))
+        sunk = int(np.sum(micro & (bend[:, 2] < -0.02 + A.SCENE_LIFT)))
         print(f"[choreo] kicked {int(kicked.sum())} objects >0.3 m/s "
               f"(peak {vmax[0]:.2f}); rest max|v| {float(vend[micro].max()):.3f}; "
               f"sunk-through {sunk}")
@@ -250,10 +250,11 @@ def _twosink_run(dev, scene):
     # place the base so the LEFT foot lands on the pebble centre.
     bx = px - (float(foot0[0]) - d.pos[0])
     by = py - (float(foot0[1]) - d.pos[1])
-    d.set_base(bx, by, A.BASE_OVER_FLOOR + 0.06)
+    d.set_base(bx, by, A.BASE_OVER_FLOOR + 0.06 + A.SCENE_LIFT)
     d.hold(200)
     trace = []
-    z0, z1, n = A.BASE_OVER_FLOOR + 0.06, A.BASE_OVER_FLOOR - 0.018, 160
+    z0 = A.BASE_OVER_FLOOR + 0.06 + A.SCENE_LIFT
+    z1, n = A.BASE_OVER_FLOOR - 0.018 + A.SCENE_LIFT, 160
     for i in range(n):
         d.set_base(bx, by, z0 + (z1 - z0) * (i + 1) / n)
         w.step()
