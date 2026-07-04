@@ -583,16 +583,71 @@ TEST(GjkEpaConvex, HullVsCapsulePrimitive) {
     const auto va = BoxVerts(he);
     const ConvexHullView A = MakeHull(va, Vec3{0.0f, 0.0f, 0.0f});
     // Capsule radius 0.25, half-height 0.5 (axis = local Y), centered at
-    // (0.65,0,0): its nearest surface point is the radius-0.25 sphere swept along
-    // Y; closest approach to the box +X face (x=0.5) is at x = 0.65-0.25 = 0.40 <
-    // 0.5 -> overlap 0.10 along +X. (Capsule has no flat face -> 1-pt witness.)
+    // (0.65,0,0): closest approach to the box +X face is x=0.65-0.25=0.40 -> overlap
+    // 0.10 along +X. A capsule is a segment inflated by radius, so it takes the
+    // monotone closest-feature path (CapsuleConvex): 2 SYMMETRIC endpoint points, so
+    // a resting capsule has torque-free support -- not the off-centre 1-pt EPA witness.
     const PrimParams B = MakeCapsulePrim(0.25f, 0.5f, Vec3{0.65f, 0.0f, 0.0f});
     const ContactManifold m = Route(ShapeType::ConvexHull, &A, PrimParams{},
                                     ShapeType::Capsule, nullptr, B);
-    ASSERT_EQ(m.point_count, 1u) << "capsule side has no face -> 1-pt witness";
-    EXPECT_NEAR(m.points[0].penetration, 0.10f, kTol);
-    // sep dir for A (hull) = -X (hull pushes away from the capsule on +X).
-    EXPECT_TRUE(Vec3Near(m.points[0].normal, Vec3{-1.0f, 0.0f, 0.0f}, 1.0e-2f));
+    ASSERT_EQ(m.point_count, 2u) << "capsule endpoints -> 2 symmetric points";
+    Vec3 psum{0.0f, 0.0f, 0.0f};
+    for (uint32_t i = 0; i < m.point_count; ++i) {
+        EXPECT_NEAR(m.points[i].penetration, 0.10f, kTol);
+        // sep dir for A (hull) = -X (hull pushes away from the capsule on +X).
+        EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{-1.0f, 0.0f, 0.0f}, 1.0e-2f));
+        psum += m.points[i].position;
+    }
+    // Two contact points symmetric about the capsule axis midplane (y ~ 0).
+    EXPECT_NEAR(psum.y * 0.5f, 0.0f, kTol);
+}
+
+// The capsule-on-box resting posture that surfaced the ejection bug: a flat capsule
+// on a large plate must get 2 symmetric +Z points with the TRUE depth (r - gap),
+// monotone as it descends -- a single off-centre over-deep witness injected a torque
+// that tumbled a light capsule through the plate.
+TEST(GjkEpaConvex, CapsuleRestingOnBoxIsSymmetricAndMonotone) {
+    const PrimParams box = MakeBoxPrim(Vec3{2.0f, 2.0f, 0.1f}, Vec3{0.0f, 0.0f, -0.1f});
+    const float r = 0.05f, hh = 0.08f;  // top face z = 0
+    float prev = -1.0f;
+    for (float pen : {0.002f, 0.01f, 0.03f, 0.049f}) {
+        const PrimParams cap = MakeCapsulePrim(r, hh, Vec3{0.3f, -0.2f, r - pen});
+        const ContactManifold m = Route(ShapeType::Capsule, nullptr, cap,
+                                        ShapeType::Box, nullptr, box);
+        ASSERT_EQ(m.point_count, 2u) << "flat capsule -> 2 endpoint points";
+        Vec3 armsum{0.0f, 0.0f, 0.0f};
+        for (uint32_t i = 0; i < m.point_count; ++i) {
+            EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, 0.0f, 1.0f}, 1.0e-2f));
+            EXPECT_NEAR(m.points[i].penetration, pen, 2.0e-4f);  // TRUE depth, no over-report
+            armsum += (m.points[i].position - cap.frame.t);
+        }
+        EXPECT_NEAR(armsum.x, 0.0f, 1.0e-4f);  // symmetric -> torque-free
+        EXPECT_NEAR(armsum.y, 0.0f, 1.0e-4f);
+        EXPECT_GT(m.points[0].penetration, prev);  // monotone in descent
+        prev = m.points[0].penetration;
+    }
+}
+
+// A capsule pushed BELOW the box top (endpoints inside the upper half) must still get
+// a SYMMETRIC +Z manifold (shallowest face exit), not an off-centre EPA witness --
+// this is the deep-case that a rocking bolt dips into; an EPA torque there pumped it
+// through the plate.
+TEST(GjkEpaConvex, CapsuleSunkIntoBoxUpperHalfExitsUpSymmetric) {
+    const PrimParams box = MakeBoxPrim(Vec3{2.0f, 2.0f, 0.1f}, Vec3{0.0f, 0.0f, -0.1f});
+    const float r = 0.05f, hh = 0.08f;             // box top z=0, midplane z=-0.1
+    const PrimParams cap = MakeCapsulePrim(r, hh, Vec3{0.2f, -0.1f, -0.02f});  // 2cm below top
+    const ContactManifold m = Route(ShapeType::Capsule, nullptr, cap,
+                                    ShapeType::Box, nullptr, box);
+    ASSERT_EQ(m.point_count, 2u) << "sunk capsule -> 2 endpoint points";
+    Vec3 armsum{0.0f, 0.0f, 0.0f};
+    for (uint32_t i = 0; i < m.point_count; ++i) {
+        EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, 0.0f, 1.0f}, 1.0e-2f))
+            << "must exit UP (not the far/side face)";
+        EXPECT_NEAR(m.points[i].penetration, r + 0.02f, 1.0e-3f);  // radius + inside depth
+        armsum += (m.points[i].position - cap.frame.t);
+    }
+    EXPECT_NEAR(armsum.x, 0.0f, 1.0e-4f);          // symmetric -> torque-free
+    EXPECT_NEAR(armsum.y, 0.0f, 1.0e-4f);
 }
 
 // ===========================================================================

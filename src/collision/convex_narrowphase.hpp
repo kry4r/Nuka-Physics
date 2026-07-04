@@ -1231,12 +1231,236 @@ NUKA_CVX_HD inline void SphereHull(const amf::PrimParams& sphere,
 }
 
 // ---------------------------------------------------------------------------
+// CAPSULE x CONVEX (box/hull) -- monotone closest-feature, NOT through EPA.
+// ---------------------------------------------------------------------------
+// A capsule is a segment inflated by a radius, so its Minkowski difference has the
+// SAME curved shallow-penetration cap that breaks EPA for a sphere (SphereHull):
+// EPA collapses a resting capsule's line contact to ONE off-centre witness with an
+// over-reported depth, and that single point's lever arm injects a spurious torque
+// that tumbles a light capsule through the surface. The robust form is SphereHull
+// generalized to a SEGMENT core: each capsule ENDPOINT is a sphere query against the
+// convex (closest feature when outside, shallowest exit when inside), emitting up to
+// 2 SYMMETRIC points so a flat capsule rests torque-free and a capsule pushed into
+// the surface exits cleanly. A capsule bridging (neither end contacts) samples its
+// centre. This holds at ALL depths, so the capsule never falls into the EPA band.
+//
+// ClosestBetweenProxies -- general GJK-distance between two convex cores, with a
+// barycentric witness on each side. Generalizes ClosestHullToPoint to two proxies.
+struct ProxyDist {
+    Vec3  wa{0, 0, 0};   // closest point on A's core (world)
+    Vec3  wb{0, 0, 0};   // closest point on B's core (world)
+    float dist = 0.0f;   // |wa - wb|
+};
+
+// Recover the per-body closest points from the kept CSO simplex (n=1..3) by the
+// SAME barycentric weights that place `p` in the simplex (the standard witness).
+NUKA_CVX_HD inline void MinkWitness(const MinkPoint* s, int n, Vec3 p,
+                                    Vec3* wa, Vec3* wb) {
+    if (n <= 1) { *wa = s[0].a; *wb = s[0].b; return; }
+    if (n == 2) {
+        const Vec3 e = s[1].v - s[0].v;
+        const float t2 = e.Dot(e);
+        float u = t2 > 1.0e-20f ? (p - s[0].v).Dot(e) / t2 : 0.0f;
+        u = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
+        *wa = s[0].a + (s[1].a - s[0].a) * u;
+        *wb = s[0].b + (s[1].b - s[0].b) * u;
+        return;
+    }
+    const Vec3 v0 = s[1].v - s[0].v, v1 = s[2].v - s[0].v, v2 = p - s[0].v;
+    const float d00 = v0.Dot(v0), d01 = v0.Dot(v1), d11 = v1.Dot(v1);
+    const float d20 = v2.Dot(v0), d21 = v2.Dot(v1);
+    const float den = d00 * d11 - d01 * d01;
+    float bv = 0.0f, bw = 0.0f;
+    if (den > 1.0e-20f) { bv = (d11 * d20 - d01 * d21) / den;
+                          bw = (d00 * d21 - d01 * d20) / den; }
+    const float bu = 1.0f - bv - bw;
+    *wa = s[0].a * bu + s[1].a * bv + s[2].a * bw;
+    *wb = s[0].b * bu + s[1].b * bv + s[2].b * bw;
+}
+
+// GJK-distance between two convex support-proxy CORES. Assumes the cores are
+// SEPARATED (the caller runs a boolean GjkIntersect first for the deep case).
+NUKA_CVX_HD inline ProxyDist ClosestBetweenProxies(const SupportProxy& A,
+                                                   const SupportProxy& B) {
+    ProxyDist res;
+    MinkPoint s[4];
+    Vec3 dir = A.Center() - B.Center();
+    if (dir.Dot(dir) < kGjkDistEps) dir = Vec3::UnitX();
+    s[0] = SupportMink(A, B, dir);
+    int n = 1;
+    Vec3 closest = s[0].v;
+    for (int it = 0; it < kGjkDistMaxIter; ++it) {
+        Vec3 vv[4];
+        for (int i = 0; i < n; ++i) vv[i] = s[i].v;
+        SubSimplex sub;
+        if (n == 1) { sub.closest = vv[0]; sub.keep[0] = 0; sub.nkeep = 1; }
+        else if (n == 2) sub = ReduceSegment(vv, 0, 1);
+        else if (n == 3) sub = ReduceTriangle(vv, 0, 1, 2);
+        else {
+            float best = 3.4e38f; SubSimplex bs;
+            const int tri[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+            for (int f = 0; f < 4; ++f) {
+                const SubSimplex t = ReduceTriangle(vv, tri[f][0], tri[f][1], tri[f][2]);
+                const float d2 = t.closest.Dot(t.closest);
+                if (d2 < best) { best = d2; bs = t; }  // strict -> lowest face index
+            }
+            sub = bs;
+        }
+        closest = sub.closest;
+        MinkPoint keep[4];
+        for (int i = 0; i < sub.nkeep; ++i) keep[i] = s[sub.keep[i]];
+        for (int i = 0; i < sub.nkeep; ++i) s[i] = keep[i];
+        n = sub.nkeep;
+        const float cd2 = closest.Dot(closest);
+        if (cd2 < kGjkDistEps) break;  // degenerate: cores touch (caught by boolean GJK)
+        const float cd = sqrtf(cd2);
+        const Vec3 sdir = -closest / cd;
+        const MinkPoint np = SupportMink(A, B, sdir);
+        const float improve = np.v.Dot(sdir) - closest.Dot(sdir);
+        if (improve <= kGjkDistTol + kGjkDistRelTol * cd) break;  // converged
+        bool dup = false;
+        for (int i = 0; i < n; ++i)
+            if (amf::Len(np.v - s[i].v) < 1.0e-9f) { dup = true; break; }
+        if (dup) break;
+        if (n >= 4) break;
+        s[n] = np; ++n;
+    }
+    MinkWitness(s, n, closest, &res.wa, &res.wb);
+    res.dist = amf::Len(closest);
+    return res;
+}
+
+// Radius of a rounded proxy (sphere/capsule); 0 for a polytope (box/hull).
+NUKA_CVX_HD inline float ProxyRadius(const SupportProxy& p) {
+    if (p.kind == SupportKind::Sphere || p.kind == SupportKind::Capsule)
+        return p.prim->radius;
+    return 0.0f;
+}
+
+// A point q inflated by radius r vs a convex `other` (box/hull): the surface contact
+// point, the outward separation normal, and penetration. OUTSIDE -> exact monotone
+// closest feature; INSIDE -> shallowest surface exit (box: exact per-face; hull: a
+// support-direction scan). This is the robust sphere-vs-convex query applied to a
+// capsule endpoint, so it never enters the EPA shallow/deep torque band.
+NUKA_CVX_HD inline bool InflatedPointConvex(const SupportProxy& other, Vec3 q, float r,
+                                            Vec3* pos, Vec3* nrm, float* pen) {
+    // BOX: exact OBB clamp (outside) / shallowest face exit (inside). No GJK, so the
+    // inside/outside decision is robust (a point-proxy boolean GJK is fragile here).
+    if (other.kind == SupportKind::Box) {
+        const amf::PrimFrame& f = other.prim->frame;
+        const Vec3 he = other.prim->half_extents;
+        const Vec3 loc = f.WorldToLocal(q);
+        // On-surface counts as inside so the boundary takes the face-normal exit
+        // (the outside clamp normal is degenerate when q sits exactly on a face).
+        const bool inside = (loc.x >= -he.x && loc.x <= he.x) &&
+                            (loc.y >= -he.y && loc.y <= he.y) &&
+                            (loc.z >= -he.z && loc.z <= he.z);
+        if (!inside) {
+            const Vec3 cl{loc.x < -he.x ? -he.x : (loc.x > he.x ? he.x : loc.x),
+                          loc.y < -he.y ? -he.y : (loc.y > he.y ? he.y : loc.y),
+                          loc.z < -he.z ? -he.z : (loc.z > he.z ? he.z : loc.z)};
+            const Vec3 wb = f.LocalToWorld(cl);
+            const float p = r - amf::Len(q - wb);
+            if (p <= 0.0f) return false;              // separated -> no contact
+            *nrm = amf::Norm(q - wb, Vec3::UnitY());
+            *pos = wb; *pen = p;
+            return true;
+        }
+        float best = 3.4e38f; int ax = 0; float sgn = 1.0f;
+        for (int k = 0; k < 3; ++k) {
+            const float lc = amf::Comp(loc, k), hk = amf::Comp(he, k);
+            const float gap = hk - (lc < 0.0f ? -lc : lc);
+            if (gap < best) { best = gap; ax = k; sgn = lc >= 0.0f ? 1.0f : -1.0f; }
+        }
+        if (best < 0.0f) best = 0.0f;
+        *nrm = f.Axis(ax) * sgn;
+        *pos = q - *nrm * best; *pen = r + best;
+        return true;
+    }
+    // HULL: boolean GJK for inside/outside; closest feature outside, support scan inside.
+    amf::PrimParams ps{};
+    ps.frame.t = q; ps.radius = 0.0f;
+    SupportProxy pp; pp.kind = SupportKind::Sphere; pp.prim = &ps;
+    if (!GjkIntersect(pp, other).intersect) {
+        const ProxyDist d = ClosestBetweenProxies(pp, other);
+        const float p = r - d.dist;
+        if (p <= 0.0f) return false;
+        *nrm = amf::Norm(q - d.wb, Vec3::UnitY());
+        *pos = d.wb; *pen = p;
+        return true;
+    }
+    const Vec3 probe[6] = {Vec3::UnitX(), {-1, 0, 0}, Vec3::UnitY(),
+                           {0, -1, 0}, Vec3::UnitZ(), {0, 0, -1}};
+    float best = 3.4e38f; Vec3 bn = Vec3::UnitY();
+    for (int k = 0; k < 6; ++k) {
+        uint32_t idx = 0u;
+        const Vec3 sv = other.Support(probe[k], &idx);
+        const float gap = (sv - q).Dot(probe[k]);
+        if (gap < best) { best = gap; bn = probe[k]; }
+    }
+    if (best < 0.0f) best = 0.0f;
+    *nrm = bn; *pos = q - bn * best; *pen = r + best;
+    return true;
+}
+
+// Capsule x box/hull manifold: the SphereHull EPA-bypass generalized to a segment.
+// Each capsule ENDPOINT is a robust sphere query (InflatedPointConvex, inside AND
+// outside), giving up to 2 SYMMETRIC points so a flat capsule rests torque-free and
+// one pushed into the surface exits without the EPA off-centre torque that tumbled a
+// light capsule through the plate. A capsule bridging (neither end contacts) samples
+// its centre. `cap_is_a` selects the manifold side; NEVER defers to EPA (no capsule
+// shallow/deep dead band remains).
+NUKA_CVX_HD inline bool CapsuleConvex(const SupportProxy& cap,
+                                      const SupportProxy& other, bool cap_is_a,
+                                      ContactManifold* out) {
+    out->Clear();
+    const float r = ProxyRadius(cap);       // capsule radius (the other core is 0)
+    const Vec3 axis = cap.prim->frame.cy;   // capsule local Y in world
+    const Vec3 ends[2] = {cap.prim->frame.t + axis * cap.prim->half_height,
+                          cap.prim->frame.t - axis * cap.prim->half_height};
+    int nemit = 0;
+    for (int k = 0; k < 2; ++k) {
+        Vec3 pos, nrm; float pen;
+        if (!InflatedPointConvex(other, ends[k], r, &pos, &nrm, &pen)) continue;
+        ContactPoint pt;
+        pt.position = pos;
+        pt.normal = cap_is_a ? nrm : Vec3{-nrm.x, -nrm.y, -nrm.z};
+        pt.penetration = pen;
+        pt.stable_key = static_cast<uint64_t>(k);
+        out->AddPoint(pt); ++nemit;
+    }
+    if (nemit == 0) {
+        // Bridging: neither end contacts -> sample the capsule centre.
+        Vec3 pos, nrm; float pen;
+        if (InflatedPointConvex(other, cap.prim->frame.t, r, &pos, &nrm, &pen)) {
+            ContactPoint pt;
+            pt.position = pos;
+            pt.normal = cap_is_a ? nrm : Vec3{-nrm.x, -nrm.y, -nrm.z};
+            pt.penetration = pen;
+            pt.stable_key = 2ull;
+            out->AddPoint(pt);
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // TOP-LEVEL: convex narrowphase for two proxies. normal = sep dir for A.
 // ---------------------------------------------------------------------------
+// A capsule side vs a box/hull takes the robust closest-feature path (CapsuleConvex,
+// handled at all depths); every other convex pair takes the boolean-GJK -> EPA path.
+// TrianglePrism (heightfield) is intentionally NOT rerouted -- capsule x heightfield
+// keeps the EPA path (its own contact regime), unchanged.
 NUKA_CVX_HD inline void ConvexNarrowphase(const SupportProxy& A,
                                           const SupportProxy& B,
                                           ContactManifold* out) {
     out->Clear();
+    const bool a_cap = A.kind == SupportKind::Capsule;
+    const bool b_cap = B.kind == SupportKind::Capsule;
+    const bool a_poly = A.kind == SupportKind::Box || A.kind == SupportKind::Hull;
+    const bool b_poly = B.kind == SupportKind::Box || B.kind == SupportKind::Hull;
+    if (a_cap && b_poly) { if (CapsuleConvex(A, B, true, out)) return; }
+    else if (b_cap && a_poly) { if (CapsuleConvex(B, A, false, out)) return; }
     const GjkResult gjk = GjkIntersect(A, B);
     if (!gjk.intersect) return;  // separated -> no contact
     const EpaResult epa = EpaExpand(A, B, gjk);
