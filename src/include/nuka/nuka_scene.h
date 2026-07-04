@@ -231,6 +231,7 @@ typedef struct nuka_environment_desc_t {
     float    exposure_ev;         // post exposure in stops (0 => no-op).
     float    grade;               // post contrast/saturation strength (0 => identity).
     float    sun_disc;            // sky sun-disc radiance scale (0 => off).
+    uint32_t specular_env;        // 1 => opaque arm Cook-Torrance + env reflection (0 => off).
 } nuka_environment_desc_t;
 
 // Set the built scene's environment record (persisted by nuka_scene_save).
@@ -240,14 +241,15 @@ nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
 // What a medium IS (solver routing) and HOW it solves (one method per medium).
 // The legal (kind x method) set is enforced by the SAME cook validator: cloth =
 // XPBD; soft-tet = XPBD or MLS-MPM; fluid = PBF or MLS-MPM; granular = MLS-MPM
-// only (Drucker-Prager). An illegal pair is
+// only (Drucker-Prager); cable = XPBD. An illegal pair is
 // rejected LOUDLY (INVALID_ARG) at nuka_scene_add_media; an MPM + XPBD/PBF mix is
 // rejected at cook (nuka_world_create_from_built_scene).
 typedef enum nuka_media_kind_t {
     NUKA_MEDIA_CLOTH    = 0,
     NUKA_MEDIA_SOFT_TET = 1,
     NUKA_MEDIA_FLUID    = 2,
-    NUKA_MEDIA_GRANULAR = 3   /* Drucker-Prager sand/gravel bed (MLS-MPM only). */
+    NUKA_MEDIA_GRANULAR = 3,  /* Drucker-Prager sand/gravel bed (MLS-MPM only). */
+    NUKA_MEDIA_CABLE    = 4   /* XPBD inextensible distance chain / rope (XPBD only). */
 } nuka_media_kind_t;
 
 typedef enum nuka_media_method_t {
@@ -281,9 +283,28 @@ typedef struct nuka_media_desc_t {
     uint32_t tet_cells;
     float    tet_cell_len;
     // FLUID / GRANULAR: an AABB box [fluid_min, fluid_max] sampled at fluid_spacing.
+    // fluid_position_jitter (fraction of the half-spacing; 0 => the exact lattice)
+    // breaks the perfect grid so gravel/debris does not render as a waffle.
     float    fluid_min[3];
     float    fluid_max[3];
     float    fluid_spacing;
+    float    fluid_position_jitter;
+    // CABLE: an XPBD distance chain of cable_segments links (cable_segments+1
+    // particles) from cable_start to cable_end; cable_radius is the render bead +
+    // contact size. cable_pin: 0 anchor(start), 1 loaded end, 2 both, 3 none;
+    // cable_bend 1 adds skip-one stiffness rows. An optional rigid slab welded to the
+    // loaded end (a shape-match cluster): cable_slab_half_extents all > 0 => present,
+    // cable_slab_mass per corner (0 => the cable particle mass), stiffness in [0,1].
+    float    cable_start[3];
+    float    cable_end[3];
+    uint32_t cable_segments;
+    float    cable_radius;
+    uint32_t cable_pin;
+    uint32_t cable_bend;
+    float    cable_slab_half_extents[3];
+    float    cable_slab_mass;
+    float    cable_slab_stiffness;
+    uint32_t cable_slab_render_material_id;  // ~0u => inherit the medium material.
 
     // -- constitutive material (the block matching `method`) -----------------
     // XPBD (cloth uses distance+bend; soft-tet uses distance+volume).
@@ -324,11 +345,20 @@ typedef struct nuka_media_desc_t {
     float    mpm_floor_normal[3];
     float    mpm_floor_d;
     float    mpm_floor_friction;
+    // Extra +z grid headroom (m) so kicked/lofted MPM debris does not trip the +z
+    // escape clip. 0 => today's motion headroom.
+    float    mpm_loft_headroom;
 
     // -- render skin (surface bake metadata; consumed downstream, not the cook) -
     float    skin_normal_offset;
     uint32_t skin_smooth_iters;
     float    skin_smooth_lambda;
+    // Instanced-sphere grain look (granular/MPM/cable-bead skins): analytic spheres
+    // (skin_grain_round!=0) vs octahedra, plus per-grain radius/albedo scatter. 0 =>
+    // uniform octahedra.
+    uint32_t skin_grain_round;
+    float    skin_grain_radius_jitter;
+    float    skin_grain_tint_jitter;
     uint32_t render_material_id;     // ~0u (0xFFFFFFFF) => none.
 } nuka_media_desc_t;
 
@@ -377,8 +407,40 @@ nuka_result_t nuka_scene_add_collision_shape(nuka_scene_handle scene,
 // immediately by the cook's ValidateMedia -> INVALID_ARG on an illegal pair (the
 // cross-medium MPM+XPBD/PBF mix is checked at cook). Returns NULL_HANDLE on a bad
 // handle, INVALID_ARG on a NULL / unknown-kind / unknown-method / illegal-pair desc.
+// out_media_id (optional) receives the new record's MediaId (the target for
+// nuka_scene_add_mpm_fill).
 nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
-                                   const nuka_media_desc_t* desc);
+                                   const nuka_media_desc_t* desc,
+                                   uint32_t* out_media_id);
+
+// One heterogeneous MLS-MPM sub-fill: a sub-box region [min,max] sampled at spacing
+// (position_jitter breaks the lattice) with its OWN constitutive material. Appended to
+// an existing box MLS-MPM medium; the medium's mpm block supplies the shared grid
+// scalars (dx / substeps / floor / loft). render_material_id ~0u => inherit the medium.
+typedef struct nuka_mpm_fill_desc_t {
+    float    min[3];
+    float    max[3];
+    float    spacing;
+    float    position_jitter;
+    float    youngs;
+    float    poisson;
+    float    density;
+    float    dp_friction;
+    float    dp_cohesion;
+    float    model_kind;
+    float    bulk_modulus;
+    float    tait_gamma;
+    float    viscosity;
+    uint32_t render_material_id;
+} nuka_mpm_fill_desc_t;
+
+// Append a heterogeneous fill to the box MLS-MPM medium `media_id` (from
+// nuka_scene_add_media's out_media_id). The base bed (the medium's fluid_box + mpm)
+// stays fill 0; each appended fill gets a distinct per-particle material id and the
+// grid AABB grows to the union. Returns NULL_HANDLE on a bad handle, INVALID_ARG on a
+// NULL desc or an out-of-range media_id.
+nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id,
+                                      const nuka_mpm_fill_desc_t* desc);
 
 // Optional nk::Pipeline::SolverConfig overrides for the built-scene world (1:1 with
 // the coupled desc's solver_* block, applied through the SAME FinishWorldCreate). A
@@ -392,6 +454,10 @@ typedef struct nuka_built_scene_options_t {
     float    solver_contact_margin;  // speculative contact band, m (0.0 => 0.0).
     uint32_t solver_max_pairs;       // broadphase pair-stream capacity (0 => engine default).
     float    baumgarte_max_velocity; // contact recovery push-out bound, m/s (0.0 => model default).
+    // Bake a per-link SDF from each link's VISUAL mesh (CookToModelOptions::bake_link_sdf)
+    // so particle/MPM contact rides the true silhouette (a foot engages the MPM grid BC).
+    // 0 (default) leaves every existing cook byte-identical.
+    uint32_t bake_link_sdf;
 } nuka_built_scene_options_t;
 
 // Cook the built scene's SceneIR via the SAME cook::CookSceneToModel a file scene

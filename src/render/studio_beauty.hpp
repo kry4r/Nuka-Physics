@@ -56,6 +56,11 @@ struct StudioScene {
         uint32_t    first = 0u, count = 0u;
         uint32_t    mesh_id = kNoId;
         std::size_t instance = ~std::size_t(0);
+        // Grain look: analytic spheres vs octahedra, plus deterministic per-grain
+        // radius/albedo jitter (all 0/false => today's uniform octahedra).
+        bool        round = false;
+        float       radius_jitter = 0.0f;
+        float       tint_jitter = 0.0f;
     };
 
     RenderWorld world;
@@ -98,10 +103,14 @@ void UseAuthoredSceneMaterials(StudioScene& scene);
 
 // Register a per-particle instanced-sphere skin (a surface-less particle medium).
 // `scene_material_id` kNoId/invalid falls back to a neutral granular material;
-// `count` 0 covers the whole particle field.
+// `count` 0 covers the whole particle field. `round` swaps the octahedron grains for
+// analytic spheres; `radius_jitter`/`tint_jitter` add deterministic per-grain scatter
+// (all default => today's uniform octahedra, byte-identical).
 void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
                            uint32_t scene_material_id, float radius,
-                           uint32_t first, uint32_t count);
+                           uint32_t first, uint32_t count,
+                           bool round = false, float radius_jitter = 0.0f,
+                           float tint_jitter = 0.0f);
 
 // Refresh per-frame: each link-posed instance's world_xform = link_pose[link] o
 // visual_local (a free-BODY instance poses from body_pose[row] instead); every

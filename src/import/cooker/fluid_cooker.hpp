@@ -58,6 +58,11 @@ struct FluidBoxSpec {
     // (mass = rest_density * spacing^3); it does NOT affect the sampled positions.
     // Must be > 0.
     float rest_density = 1000.0f;
+
+    // Break the perfect lattice: offset each cell center by a deterministic
+    // per-index hash draw in [-j*half, +j*half]^3 (half = 0.5*spacing), keyed by
+    // (ix,iy,iz) so two cooks stay byte-identical. 0 (default) => the exact lattice.
+    float position_jitter = 0.0f;
 };
 
 // Number of lattice particles the box spec cooks to PER AXIS (n = floor(L/s)) and

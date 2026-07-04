@@ -245,6 +245,7 @@ struct BlasDevice {
     OwnedBuffer d_tri_n0, d_tri_n1, d_tri_n2;  // smooth per-vertex normals (beauty)
     OwnedBuffer d_tri_uv0, d_tri_uv1, d_tri_uv2;  // per-vertex UVs (beauty textures)
     OwnedBuffer d_sph_c, d_sph_r;
+    OwnedBuffer d_sph_col;  // per-sphere albedo tint (beauty grain scatter)
     OwnedBuffer d_sdf_hdr, d_sdf_aabb, d_sdf_eps, d_sdf_iters;
     // SDF cell arrays (one buffer per SDF; their device pointers are baked into
     // the uploaded SparseSdfDevice headers).
@@ -405,12 +406,17 @@ BlasDevice BuildBlas(const BlasMesh& mesh, const RtContext& ctx) {
 
     std::vector<Vec3> sph_center;
     std::vector<float> sph_radius;
-    for (const auto& s : mesh.spheres) {
+    std::vector<Vec3> sph_color;
+    const bool has_sph_colors = mesh.sphere_colors.size() == mesh.spheres.size() &&
+                                !mesh.spheres.empty();
+    for (size_t si = 0; si < mesh.spheres.size(); ++si) {
+        const auto& s = mesh.spheres[si];
         aabbs.push_back(SphAabb(s));
         prims.push_back({static_cast<uint32_t>(PrimKind::Sphere),
                          static_cast<uint32_t>(sph_center.size())});
         sph_center.push_back(s.center);
         sph_radius.push_back(s.radius);
+        if (has_sph_colors) sph_color.push_back(mesh.sphere_colors[si]);
     }
 
     std::vector<runtime::sdf::SparseSdfDevice> sdf_hdrs;
@@ -481,6 +487,13 @@ BlasDevice BuildBlas(const BlasMesh& mesh, const RtContext& ctx) {
     out.view.sdf_aabb = static_cast<const collision::AABB*>(out.d_sdf_aabb.Data());
     out.view.sdf_eps = static_cast<const float*>(out.d_sdf_eps.Data());
     out.view.sdf_iters = static_cast<const int*>(out.d_sdf_iters.Data());
+
+    // Per-sphere albedo tints ride the same present-or-null pattern: absent leaves
+    // sph_color null and the grains shade at their flat material albedo.
+    if (has_sph_colors) {
+        out.d_sph_col = UploadOwned(bt, sph_color);
+        out.view.sph_color = static_cast<const Vec3*>(out.d_sph_col.Data());
+    }
 
     // Upload smooth normals + point the view at them ONLY when present; absent =>
     // the tri_n* view pointers stay null (the flat-normal byte-exact fallback).
@@ -873,6 +886,8 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
     sky.sky_intensity = opt.sky_intensity;
     sky.transmit_bounces = opt.transmit_bounces;
     sky.smooth_normals = opt.smooth_normals ? 1u : 0u;
+    // Beauty-only Cook-Torrance + env reflection; the sensor/golden paths never set it.
+    sky.specular_env = opt.specular_env ? 1u : 0u;
     // HDR environment (device-resident, uploaded/reused via the texture-env cache):
     // the equirect radiance replaces the procedural gradient dome; absent => null.
     const TextureEnvResidency* te = impl->tex_env.get();

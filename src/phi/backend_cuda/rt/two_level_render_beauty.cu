@@ -104,6 +104,16 @@ RenderBeautyKernel(PinholeCamera camera,
         const Vec3 Nf = (nv < 0.0f) ? Vec3{-n.x, -n.y, -n.z} : n;
         uint32_t inst, lp; UnpackPrimId(bp, &inst, &lp);
         Material mat = materials[instances[inst].material_id];
+        // Per-grain scatter tint: a hit sphere carrying a baked color multiplies the
+        // material albedo. No-op unless the BLAS ships sphere colors (default null).
+        if (instances[inst].blas.sph_color != nullptr) {
+            const DevPrim gp = instances[inst].blas.prims[lp];
+            if (gp.kind == static_cast<uint32_t>(PrimKind::Sphere)) {
+                const Vec3 gc = instances[inst].blas.sph_color[gp.sub];
+                mat.albedo = Vec3{mat.albedo.x * gc.x, mat.albedo.y * gc.y,
+                                  mat.albedo.z * gc.z};
+            }
+        }
         const Vec3 hit{ray.origin.x + bt * ray.dir.x, ray.origin.y + bt * ray.dir.y,
                        ray.origin.z + bt * ray.dir.z};
         const Vec3 Vv = RtNormalize<Real>(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});

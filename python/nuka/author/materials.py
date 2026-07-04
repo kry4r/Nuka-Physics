@@ -1,8 +1,9 @@
 """Constitutive materials for the authoring facade.
 
 A material is a parameter bag that also SELECTS the solver method for its medium:
-``Cloth.XPBD`` (cloth, XPBD), ``Soft.XPBD`` / ``Soft.MPM`` (tet soft body),
-``Fluid.PBF`` / ``Fluid.MPM`` (fluid), and ``Rigid`` (a rigid primitive). Each
+``Cloth.XPBD`` (cloth, XPBD), ``Cable.XPBD`` (rope, XPBD), ``Soft.XPBD`` /
+``Soft.MPM`` (tet soft body), ``Fluid.PBF`` / ``Fluid.MPM`` (fluid), and ``Rigid``
+(a rigid primitive). Each
 maps onto the ``SceneBuilder.add_media`` / ``add_rigid_primitive`` kwargs through a
 small ``*_kwargs`` method (mirroring ``ClothMaterial.cook_kwargs``) and declares
 the medium ``MEDIA_KIND`` it solves + the ``MEDIA_METHOD`` it uses, so the scene
@@ -61,6 +62,47 @@ class Cloth:
 
 
 @_dc.dataclass(frozen=True)
+class CableMaterial:
+    """XPBD cable (rope) parameters -> the xpbd_* media block. ``distance_alpha`` 0
+    is an inextensible chain; ``bend_alpha`` is the skip-one compliance used when the
+    cable's ``bend`` is on. The optional slab weld reuses the same particle pool."""
+
+    MEDIA_KIND = "cable"
+    MEDIA_METHOD = "xpbd"
+
+    mass: float
+    friction: float
+    distance_alpha: float
+    bend_alpha: float
+    iters: int
+
+    def media_material_kwargs(self) -> dict:
+        return dict(
+            xpbd_particle_mass=float(self.mass),
+            xpbd_friction=float(self.friction),
+            xpbd_distance_alpha=float(self.distance_alpha),
+            xpbd_bend_alpha=float(self.bend_alpha),
+            xpbd_iters=int(self.iters),
+        )
+
+
+class Cable:
+    """Cable (rope) constitutive models. ``Cable.XPBD(...)`` builds an XPBD material."""
+
+    @staticmethod
+    def XPBD(mass: float = 0.05, friction: float = 0.4,
+             distance_alpha: float = 0.0, bend_alpha: float = 1.0e-3,
+             iters: int = 32) -> CableMaterial:
+        """An XPBD rope: per-bead ``mass`` kg, contact ``friction``,
+        ``distance_alpha`` stretch compliance (0 = inextensible), ``bend_alpha`` the
+        skip-one bend compliance (applied when the cable ``bend`` is on), and
+        ``iters`` solver iterations."""
+        if iters < 1:
+            raise ValueError("Cable.XPBD: iters must be >= 1")
+        return CableMaterial(mass, friction, distance_alpha, bend_alpha, iters)
+
+
+@_dc.dataclass(frozen=True)
 class SoftXpbdMaterial:
     """XPBD tet-soft parameters -> the xpbd_* media block (distance + volume)."""
 
@@ -107,6 +149,8 @@ class MpmMaterial:
     floor_friction: float
     dp_friction: float = 0.0
     dp_cohesion: float = 0.0
+    # Extra +z grid headroom (m) so kicked/lofted debris stays inside the grid.
+    loft_headroom: float = 0.0
 
     @property
     def MEDIA_KIND(self) -> str:
@@ -125,7 +169,19 @@ class MpmMaterial:
             mpm_floor_normal=[float(c) for c in self.floor_normal],
             mpm_floor_d=float(self.floor_d),
             mpm_floor_friction=float(self.floor_friction),
+            mpm_loft_headroom=float(self.loft_headroom),
         )
+
+    def fill_kwargs(self) -> dict:
+        """The CONSTITUTIVE-only kwargs for ``SceneBuilder.add_mpm_fill`` (a
+        heterogeneous sub-fill). The grid scalars (dx / substeps / floor / loft) come
+        from the base medium, so they are omitted here."""
+        return dict(
+            youngs=float(self.youngs), poisson=float(self.poisson),
+            density=float(self.density), dp_friction=float(self.dp_friction),
+            dp_cohesion=float(self.dp_cohesion), model_kind=float(self.model_kind),
+            bulk_modulus=float(self.bulk_modulus), tait_gamma=float(self.tait_gamma),
+            viscosity=float(self.viscosity))
 
 
 class Soft:
@@ -149,18 +205,21 @@ class Soft:
             tait_gamma: float = 0.0, viscosity: float = 0.0, dx: float = 0.02,
             substeps: int = 20,
             floor_normal: Tuple[float, float, float] = (0.0, 0.0, 1.0),
-            floor_d: float = 0.0, floor_friction: float = 0.4) -> MpmMaterial:
+            floor_d: float = 0.0, floor_friction: float = 0.4,
+            loft_headroom: float = 0.0) -> MpmMaterial:
         """An MLS-MPM continuum solid: ``model_kind`` 0 corotated / 2 neo-hookean,
         ``youngs`` / ``poisson`` elasticity, ``density`` kg/m^3, grid cell ``dx`` m,
         ``substeps`` per step, and a separating floor at ``floor_normal . x =
-        floor_d``. ``dx`` must be > 0 for the background grid."""
+        floor_d``. ``dx`` must be > 0 for the background grid. ``loft_headroom`` m
+        raises the +z grid ceiling for lofted motion."""
         if dx <= 0.0:
             raise ValueError("Soft.MPM: dx must be > 0 (the background grid cell)")
         if substeps < 1:
             raise ValueError("Soft.MPM: substeps must be >= 1")
         return MpmMaterial("soft_tet", youngs, poisson, density, model_kind,
                            bulk_modulus, tait_gamma, viscosity, dx, substeps,
-                           floor_normal, floor_d, floor_friction)
+                           floor_normal, floor_d, floor_friction,
+                           loft_headroom=loft_headroom)
 
 
 @_dc.dataclass(frozen=True)
@@ -220,18 +279,21 @@ class Fluid:
             tait_gamma: float = 7.0, viscosity: float = 0.4, dx: float = 0.011,
             substeps: int = 40,
             floor_normal: Tuple[float, float, float] = (0.0, 0.0, 1.0),
-            floor_d: float = 0.0, floor_friction: float = 0.0) -> MpmMaterial:
+            floor_d: float = 0.0, floor_friction: float = 0.0,
+            loft_headroom: float = 0.0) -> MpmMaterial:
         """A weakly-compressible MLS-MPM fluid (``model_kind`` 3, Tait EOS):
         ``density`` rho0, ``bulk_modulus`` K (sound speed sqrt(K/rho0)),
         ``tait_gamma`` EOS exponent, ``viscosity`` damping, grid cell ``dx`` m,
-        ``substeps`` per step, and a free-slip floor BC."""
+        ``substeps`` per step, and a free-slip floor BC. ``loft_headroom`` m raises
+        the +z grid ceiling for lofted motion."""
         if dx <= 0.0:
             raise ValueError("Fluid.MPM: dx must be > 0 (the background grid cell)")
         if substeps < 1:
             raise ValueError("Fluid.MPM: substeps must be >= 1")
         return MpmMaterial("fluid", 0.0, 0.0, density, 3.0, bulk_modulus,
                            tait_gamma, viscosity, dx, substeps,
-                           floor_normal, floor_d, floor_friction)
+                           floor_normal, floor_d, floor_friction,
+                           loft_headroom=loft_headroom)
 
 
 class Granular:
@@ -242,11 +304,13 @@ class Granular:
             friction_angle: float = 35.0, cohesion: float = 0.0, dx: float = 0.01,
             substeps: int = 30,
             floor_normal: Tuple[float, float, float] = (0.0, 0.0, 1.0),
-            floor_d: float = 0.0, floor_friction: float = 0.5) -> MpmMaterial:
+            floor_d: float = 0.0, floor_friction: float = 0.5,
+            loft_headroom: float = 0.0) -> MpmMaterial:
         """An MLS-MPM Drucker-Prager granular medium (``model_kind`` 4):
         ``friction_angle`` deg sets the repose slope, ``cohesion`` Pa the tensile
         bind (0 = dry sand), ``youngs`` / ``poisson`` the elastic predictor,
-        ``density`` kg/m^3, grid cell ``dx`` m, ``substeps`` per step."""
+        ``density`` kg/m^3, grid cell ``dx`` m, ``substeps`` per step.
+        ``loft_headroom`` m raises the +z grid ceiling for foot-lofted debris."""
         if dx <= 0.0:
             raise ValueError("Granular.MPM: dx must be > 0 (the background grid cell)")
         if substeps < 1:
@@ -256,7 +320,8 @@ class Granular:
         return MpmMaterial("granular", youngs, poisson, density, 4.0,
                            0.0, 0.0, 0.0, dx, substeps,
                            floor_normal, floor_d, floor_friction,
-                           dp_friction=friction_angle, dp_cohesion=cohesion)
+                           dp_friction=friction_angle, dp_cohesion=cohesion,
+                           loft_headroom=loft_headroom)
 
 
 @_dc.dataclass(frozen=True)
@@ -328,7 +393,7 @@ def Render(name: str, base_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 
 
 __all__ = [
-    "Cloth", "ClothMaterial", "Soft", "SoftXpbdMaterial", "MpmMaterial",
-    "Fluid", "FluidPbfMaterial", "Granular", "Rigid", "RigidMaterial",
-    "Render", "RenderAppearance",
+    "Cloth", "ClothMaterial", "Cable", "CableMaterial", "Soft",
+    "SoftXpbdMaterial", "MpmMaterial", "Fluid", "FluidPbfMaterial", "Granular",
+    "Rigid", "RigidMaterial", "Render", "RenderAppearance",
 ]
