@@ -1241,6 +1241,8 @@ if(CMAKE_CUDA_COMPILER)
         scenario/cook_settle_determinism.cpp
         scenario/nk_particle_equivalence.cpp
         scenario/nk_soft_fluid_coresidence.cpp
+        scenario/nk_mpm_xpbd_coresidence.cpp
+        scenario/cloth_on_box.cpp
         # Multi-articulation co-residence + GENERAL-PATH collision: K Go2
         # articulations co-resident in ONE env of ONE general nk::World. Proves K
         # articulations co-step finite + INDEPENDENT, AND collide via the GENERAL

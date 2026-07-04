@@ -1639,10 +1639,13 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
         if (m.method == Method::MlsMpm) ++n_mpm; else ++n_non_mpm;
         if (m.kind == Kind::Fluid && m.method == Method::Pbf) ++n_pbf_fluid;
     }
-    if (n_mpm > 0u && n_non_mpm > 0u) {
+    // An MLS-MPM medium may co-reside with XPBD (cloth/tet) media in the MpmXpbd
+    // [mpm | xpbd] layout, but NOT with a PBF fluid: MPM owns the env-private grid
+    // and PBF its own neighbor grid, so the two grids cannot share one Model.
+    if (n_mpm > 0u && n_pbf_fluid > 0u) {
         throw std::runtime_error(
-            "ValidateMedia: an MLS-MPM medium may not co-reside with an XPBD/PBF "
-            "medium in one Model (MPM is its own ParticleMode)");
+            "ValidateMedia: an MLS-MPM medium may not co-reside with a PBF fluid in "
+            "one Model (each owns a background grid); pair MPM with XPBD media only");
     }
     if (n_pbf_fluid > 1u) {
         throw std::runtime_error(
@@ -1820,6 +1823,98 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
 }
 
 // ---------------------------------------------------------------------------
+// Two-system cook: MLS-MPM (bulk/granular/fluid) + XPBD (cloth/tet) co-resident in
+// ONE Model with a contiguous [mpm | xpbd] layout. MPM occupies [0, n_mpm), the
+// XPBD set [n_mpm, particles_per_env). MpmStep scopes to the MPM slice; the XPBD
+// predict/project/finalize + the body<->particle rows to the XPBD slice.
+// ---------------------------------------------------------------------------
+
+void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
+                 const XpbdCookInput& soft, const SoftFluidContactInput& contact) {
+    const uint32_t envs = env_count > 0 ? env_count : 1u;
+    nk::ModelCapacities& cap = model.capacities;
+    if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+    // The body<->body budget before any particle growth; the final reserve recomputes
+    // from this for the full [mpm|xpbd] count so no slice is double-counted.
+    const uint32_t rigid_base = cap.max_contacts_per_env;
+
+    const uint32_t n_mpm = static_cast<uint32_t>(mpm.positions.size());
+    const uint32_t n_xpbd = static_cast<uint32_t>(soft.positions.size());
+    // STRICT-SUPERSET fast paths: a one-medium co-residence cook is byte-identical to
+    // the single-medium cook plus the same body<->particle contact setup.
+    if (n_xpbd == 0u) {
+        CookMpmParticles(model, env_count, mpm);
+        ApplyParticleBodyContact(model.particles, contact);
+        return;
+    }
+    if (n_mpm == 0u) {
+        CookXpbdParticles(model, env_count, soft);
+        ApplyParticleBodyContact(model.particles, contact);
+        return;
+    }
+
+    // 1) Cook the MPM set: it lands in [0, n_mpm) with F/vol0/material_id, the
+    // env-private grid, and the material table (mode = Mpm, particles_per_env = n_mpm).
+    CookMpmParticles(model, env_count, mpm);
+    nk::Model::ModelParticles& mp = model.particles;
+
+    // 2) Cook the XPBD set into a scratch Model (reuses the de-interleave / shape-
+    // match flatten / aero-area cookers verbatim), then APPEND its particles and its
+    // constraint SoA with every particle index REBASED by n_mpm (the cloth verts land
+    // at [n_mpm, P)). The MPM continuum fields stay sized to the MPM slice; the seed's
+    // identity/0 fallback fills the XPBD slice (never read by the transfer loop).
+    nk::Model xtmp;
+    CookXpbdParticles(xtmp, env_count, soft);
+    const nk::Model::ModelParticles& xp = xtmp.particles;
+    mp.initial_pos.insert(mp.initial_pos.end(), xp.initial_pos.begin(),
+                          xp.initial_pos.end());
+    mp.initial_vel.insert(mp.initial_vel.end(), xp.initial_vel.begin(),
+                          xp.initial_vel.end());
+    mp.inv_mass.insert(mp.inv_mass.end(), xp.inv_mass.begin(), xp.inv_mass.end());
+    for (uint32_t v : xp.dist_a) mp.dist_a.push_back(v + n_mpm);
+    for (uint32_t v : xp.dist_b) mp.dist_b.push_back(v + n_mpm);
+    mp.dist_rest = xp.dist_rest;
+    mp.dist_alpha = xp.dist_alpha;
+    for (uint32_t v : xp.bend_particles) mp.bend_particles.push_back(v + n_mpm);
+    mp.bend_gradients = xp.bend_gradients;
+    mp.bend_alpha = xp.bend_alpha;
+    for (uint32_t v : xp.vol_particles) mp.vol_particles.push_back(v + n_mpm);
+    mp.vol_rest6 = xp.vol_rest6;
+    mp.vol_alpha = xp.vol_alpha;
+    // Shape-match: the CSR offsets/sizes/centroids are pool-local (the MPM slice has
+    // none, so the appended pool starts at 0); only the member particle indices rebase.
+    mp.sm_cluster_offset = xp.sm_cluster_offset;
+    mp.sm_cluster_size = xp.sm_cluster_size;
+    mp.sm_stiffness = xp.sm_stiffness;
+    mp.sm_rest_centroid = xp.sm_rest_centroid;
+    for (uint32_t v : xp.sm_particles) mp.sm_particles.push_back(v + n_mpm);
+    mp.sm_rest_q = xp.sm_rest_q;
+    mp.sm_mass = xp.sm_mass;
+    for (uint32_t v : xp.aero_tri_verts) mp.aero_tri_verts.push_back(v + n_mpm);
+    mp.aero_tri_area = xp.aero_tri_area;
+    mp.aero_drag_normal = xp.aero_drag_normal;
+    mp.aero_drag_tangent = xp.aero_drag_tangent;
+    mp.aero_drag_max_dv = xp.aero_drag_max_dv;
+    mp.xpbd_iters = xp.xpbd_iters;
+    mp.soft_friction = xp.soft_friction;
+
+    // 3) The body<->particle cloth contact radius + the co-residence schema.
+    ApplyParticleBodyContact(mp, contact);
+    mp.mode = nk::Model::ParticleMode::MpmXpbd;
+    mp.n_mpm_particles = n_mpm;
+    cap.particles_per_env = n_mpm + n_xpbd;
+    cap.dist_cons_per_env = xtmp.capacities.dist_cons_per_env;
+    cap.bend_cons_per_env = xtmp.capacities.bend_cons_per_env;
+    cap.vol_cons_per_env  = xtmp.capacities.vol_cons_per_env;
+    cap.shape_match_slots_per_env   = xtmp.capacities.shape_match_slots_per_env;
+    cap.shape_match_members_per_env = xtmp.capacities.shape_match_members_per_env;
+    cap.aero_tris_per_env = xtmp.capacities.aero_tris_per_env;
+    // Reserve the disjoint body<->particle slot block over the FULL [mpm|xpbd] count
+    // (recomputed from rigid_base, overriding the MPM cook's inner growth).
+    GrowContactBudgetForParticles(cap, rigid_base);
+}
+
+// ---------------------------------------------------------------------------
 // Media records -> particle cook (the per-medium builders + the list dispatch).
 // ---------------------------------------------------------------------------
 
@@ -1935,10 +2030,34 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         }
         return surfaces;
     }
-    // Cloth + soft-tet concatenate into the soft slice in media order; track the
-    // running particle base exactly as AppendSoftMedium does (fluid is skipped).
-    uint32_t base = 0u;
+    // MpmXpbd: the MLS-MPM medium renders as instanced spheres over its low slice
+    // [0, n_mpm); the XPBD (cloth/tet) media then triangulate [n_mpm, P). A lone MPM
+    // medium already returned above, so an MPM here means the co-resident layout.
+    const MediaRecord* mpm_medium = nullptr;
     for (const MediaRecord& m : media) {
+        if (m.method == MediaRecord::Method::MlsMpm) { mpm_medium = &m; break; }
+    }
+    uint32_t base = 0u;
+    if (mpm_medium != nullptr) {
+        const uint32_t n_mpm =
+            static_cast<uint32_t>(BuildMpmInput(*mpm_medium).positions.size());
+        const float sp = mpm_medium->kind == MediaRecord::Kind::SoftTet
+                             ? mpm_medium->tet_sphere.cell_len
+                             : mpm_medium->fluid_box.spacing;
+        if (sp > 0.0f && n_mpm > 0u) {
+            MediaRenderSurface s;
+            s.particle_radius = 0.5f * sp;
+            s.particle_first = 0u;
+            s.particle_count = n_mpm;
+            s.render_material_id = mpm_medium->render_material_id;
+            surfaces.push_back(std::move(s));
+        }
+        base = n_mpm;  // the XPBD slice starts above the MPM slice.
+    }
+    // Cloth + soft-tet concatenate into the XPBD slice in media order; track the
+    // running particle base exactly as AppendSoftMedium does (fluid/MPM skipped).
+    for (const MediaRecord& m : media) {
+        if (m.method == MediaRecord::Method::MlsMpm) continue;  // its sphere surface is above.
         std::vector<uint32_t> tris;
         uint32_t verts = 0u;
         if (m.kind == MediaRecord::Kind::Cloth) {
@@ -2259,21 +2378,20 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     if (media.empty()) return;  // no media -> ParticleMode::None (byte-identical).
     ValidateMedia(media);
 
-    // MLS-MPM is its own ParticleMode; ValidateMedia guarantees a lone MPM medium with
-    // no XPBD/PBF co-resident, so it routes through CookSoftBodyParticles (Mpm branch).
-    if (media.size() == 1u && media.front().method == MediaRecord::Method::MlsMpm) {
-        XpbdCookInput soft_mpm;
-        soft_mpm.solver = nk::Model::ParticleMode::Mpm;  // the cook dispatch selector.
-        CookSoftBodyParticles(model, env_count, soft_mpm, BuildMpmInput(media.front()));
-        return;
+    // The single MLS-MPM medium, if any (ValidateMedia guarantees at most one and no
+    // PBF fluid co-resident with it).
+    const MediaRecord* mpm_medium = nullptr;
+    for (const MediaRecord& m : media) {
+        if (m.method == MediaRecord::Method::MlsMpm) { mpm_medium = &m; break; }
     }
 
-    // XPBD soft (cloth + tet-soft, concatenated) + the one PBF fluid, unioned into the
-    // [soft | fluid] slice. Past the MPM gate every medium is XPBD/PBF (ValidateMedia).
+    // XPBD soft (cloth + tet-soft, concatenated) + the one PBF fluid. The MLS-MPM
+    // medium is handled by its own composer below (skipped here).
     XpbdCookInput soft;
     PbfCookInput fluid;
     bool have_soft = false, have_fluid = false;
     for (const MediaRecord& m : media) {
+        if (m.method == MediaRecord::Method::MlsMpm) continue;
         if (m.kind == MediaRecord::Kind::Cloth) {
             AppendSoftMedium(soft, BuildClothXpbdInput(m));
             have_soft = true;
@@ -2285,10 +2403,24 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
             have_fluid = true;
         }
     }
-    if (!have_soft && !have_fluid) return;
 
     SoftFluidContactInput contact;
     contact.contact_d_min = CrossContactDMin(media, particle_contact_radius);
+
+    if (mpm_medium != nullptr) {
+        // An MLS-MPM medium co-resides with XPBD media in the [mpm | xpbd] layout, or
+        // stands alone as its own ParticleMode. No PBF fluid co-resides (ValidateMedia).
+        if (have_soft) {
+            CookMpmXpbd(model, env_count, BuildMpmInput(*mpm_medium), soft, contact);
+        } else {
+            XpbdCookInput soft_mpm;
+            soft_mpm.solver = nk::Model::ParticleMode::Mpm;  // the cook dispatch selector.
+            CookSoftBodyParticles(model, env_count, soft_mpm, BuildMpmInput(*mpm_medium));
+        }
+        return;
+    }
+
+    if (!have_soft && !have_fluid) return;
     CookSoftFluidParticles(model, env_count, soft, fluid, contact);
 }
 
