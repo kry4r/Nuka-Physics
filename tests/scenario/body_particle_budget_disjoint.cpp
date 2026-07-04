@@ -373,8 +373,8 @@ TEST(BodyParticleBudget, CAbiTerrainRecomputeReappliesParticleReserve) {
 
     // Replay the c_abi terrain recompute (world.cpp): appending one static
     // heightfield collidable raises the LBVH leaf count, then the rigid contact
-    // budget is recomputed as (dynamic_bodies + 1 static) * 4 candidate slots.
-    constexpr uint32_t kCandidatePairsPerCollidable = 4u;
+    // budget is recomputed as (dynamic_bodies + 1 static) * the shared slot rate.
+    constexpr uint32_t kCandidatePairsPerCollidable = 8u;
     constexpr uint32_t kStaticCollidables = 1u;
     const uint32_t orig_bodies = bodies;  // bodies_per_env BEFORE the heightfield.
     const uint32_t dynamic_collidables = orig_bodies + kStaticCollidables;
