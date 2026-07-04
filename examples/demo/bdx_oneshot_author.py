@@ -57,8 +57,8 @@ STEP_X = (0.10, 0.26)               # step tread span; ground (z=0) beyond.
 DOOR_X = 0.30                       # door frame plane (over the stair bottom).
 LINTEL_Z = (0.48, 0.56)             # lintel bottom/top faces.
 CLOTH_SPACING = 0.02
-CLOTH_NX, CLOTH_NY = 26, 28         # 26 nodes along x (drape run), 28 across y.
-CLOTH_ORIGIN = [0.23, 0.0, 0.58]    # flat above the lintel; falls into the drape.
+CLOTH_NX, CLOTH_NY = 17, 28         # 17 nodes along x (0.32 hang run), 28 across y.
+CLOTH_ORIGIN = [0.175, 0.0, 0.572]  # +x edge line over the lintel top (the pin).
 TROUGH = (0.95, 2.25, 0.35, -0.03)  # x0, x1, half-y, floor z (flush tray).
 GRAVEL_SPACING = 0.008
 PROBE_PEBBLE = (1.60, 0.06, 0.02)   # x, y, radius -- half-buried on the walk line.
@@ -109,14 +109,16 @@ def add_materials(b):
 
 
 def add_cloth(b, fabric_id):
-    """The D01 curtain: a FREE cloth sheet cooked flat just above the lintel; it
-    falls, wraps the beam, and hangs by contact + friction (front run 0.28 to
-    z~0.28, back run 0.14)."""
+    """The D01 curtain: its +x node line is pinned over the lintel top (the
+    general edge-pin mode); the sheet swings down and hangs to z~0.27, free to
+    billow, be lifted by the passing head, and swing back. A pure friction drape
+    provably slips off (the folding overhangs yank the sheet off the beam)."""
     b.add_media(nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_XPBD,
                 cloth_nx=CLOTH_NX, cloth_ny=CLOTH_NY, cloth_spacing=CLOTH_SPACING,
-                cloth_origin=list(CLOTH_ORIGIN), cloth_free=True,
+                cloth_origin=list(CLOTH_ORIGIN), cloth_pin=nuka.CLOTH_PIN_EDGE_X1,
                 xpbd_particle_mass=0.003, xpbd_friction=1.0,
                 xpbd_bend_alpha=0.02, xpbd_iters=30,
+                xpbd_aero_normal=0.8, xpbd_aero_tangent=0.2, xpbd_aero_max_dv=0.5,
                 render_material_id=fabric_id)
 
 
@@ -189,8 +191,8 @@ def build(args):
     for _ in range(10):
         r = rng.uniform(0.008, 0.014)
         b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r],
-                              pos=[rng.uniform(tx1 + 0.03, 2.44),
-                                   rng.uniform(-0.25, 0.25), r], mass=0.02,
+                              pos=[rng.uniform(2.32, 2.44),
+                                   rng.uniform(-0.25, 0.25), r + 0.002], mass=0.02,
                               friction=0.9, material="stone")
 
     # -- Zone C: the micro-object cluster ---------------------------------------

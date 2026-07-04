@@ -1955,10 +1955,13 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
     const float mass =
         media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
     in.inv_mass.assign(rest.size(), 1.0f / mass);
-    // free == false pins the whole perimeter (a taut membrane); free leaves every
-    // particle dynamic (a free drape).
-    if (!g.free) {
-        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+    // Pin set: None (a free drape), Perimeter (a taut membrane), or one grid
+    // edge (a hung curtain); the FromFree default defers to the legacy flag.
+    using Pin = MediaRecord::ClothPin;
+    Pin pin = g.pin;
+    if (pin == Pin::FromFree) pin = g.free ? Pin::None : Pin::Perimeter;
+    const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+    if (pin == Pin::Perimeter) {
         for (uint32_t k = 0u; k < nx; ++k) {
             in.inv_mass[idx(k, 0u)] = 0.0f;
             in.inv_mass[idx(k, last_j)] = 0.0f;
@@ -1967,6 +1970,12 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
             in.inv_mass[idx(0u, k)] = 0.0f;
             in.inv_mass[idx(last_i, k)] = 0.0f;
         }
+    } else if (pin == Pin::EdgeX0 || pin == Pin::EdgeX1) {
+        const uint32_t i = pin == Pin::EdgeX0 ? 0u : last_i;
+        for (uint32_t k = 0u; k < ny; ++k) in.inv_mass[idx(i, k)] = 0.0f;
+    } else if (pin == Pin::EdgeY0 || pin == Pin::EdgeY1) {
+        const uint32_t j = pin == Pin::EdgeY0 ? 0u : last_j;
+        for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
     }
     for (const auto& dc : cs.distance) {
         in.distance.push_back(
@@ -2322,7 +2331,14 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
                        float particle_contact_radius) {
     float d_min = 2.0f * particle_contact_radius;
     if (d_min > 0.0f) return d_min;
+    // An MLS-MPM medium couples to bodies via the grid and emits NO body<->particle
+    // rows, so it must not shrink the row diameter of a co-resident row-making set.
+    bool any_row_media = false;
     for (const MediaRecord& m : media) {
+        if (m.method != MediaRecord::Method::MlsMpm) { any_row_media = true; break; }
+    }
+    for (const MediaRecord& m : media) {
+        if (any_row_media && m.method == MediaRecord::Method::MlsMpm) continue;
         float sp = 0.0f;
         if (m.kind == MediaRecord::Kind::Cloth) sp = m.cloth_grid.spacing;
         else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;

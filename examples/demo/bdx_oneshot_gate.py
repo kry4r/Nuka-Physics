@@ -135,19 +135,18 @@ def stage_settle(args):
             ok = False
             print("  !! a static prop moved")
 
-        # 2. curtain: draped on the lintel, hem near z~0.28, nothing fallen.
+        # 2. curtain: hung from the pinned line over the lintel, hem near z~0.27.
         c = cloth_slice(w)
         cmin, cmax = float(c[:, 2].min()), float(c[:, 2].max())
         over = int(np.sum(c[:, 2] > A.LINTEL_Z[1] - 0.01))
         print(f"[settle] cloth min_z {cmin:.3f} max_z {cmax:.3f} "
               f"nodes above lintel top {over}/{c.shape[0]}")
-        if not (0.20 <= cmin <= 0.34):
+        if not (0.18 <= cmin <= 0.34):
             ok = False
-            print("  !! curtain hem out of the drape band [0.20,0.34] "
-                  "(slid off or hung up)")
-        if over < 80:
+            print("  !! curtain hem out of the hang band [0.18,0.34]")
+        if over < A.CLOTH_NY - 4:
             ok = False
-            print("  !! too little fabric left on the beam (drape lost)")
+            print("  !! the pinned line lost nodes (curtain fell)")
 
         # 3. gravel: settled in the tray, no escape, no NaN.
         g = mpm_slice(w)
@@ -161,10 +160,12 @@ def stage_settle(args):
             ok = False
             print("  !! gravel NaN / escape")
 
-        # 4. micro objects at rest.
-        maxv = float(np.abs(vels).max())
-        print(f"[settle] max |body linear velocity| {maxv:.4f} m/s")
-        if maxv > 0.05:
+        # 4. micro objects at rest (report the worst body for triage).
+        speeds = np.linalg.norm(vels, axis=1)
+        worst = int(np.argmax(speeds))
+        print(f"[settle] max |body v| {speeds[worst]:.4f} m/s at body {worst} "
+              f"pos {bods[worst, :3].round(3)}")
+        if speeds[worst] > 0.05:
             ok = False
             print("  !! a free body is still moving after settle")
 

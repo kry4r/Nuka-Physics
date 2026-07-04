@@ -54,7 +54,7 @@ def main():
         d.hold(500)  # drape forms, gravel compacts, slab stills.
 
         # S0 establish: duck on the platform, seen diagonally through the door.
-        shoot(w, "S0_establish", (-0.55, -0.78, 0.32), (0.30, 0.0, 0.25))
+        shoot(w, "S0_establish", (-0.55, -0.70, 0.32), (0.30, 0.0, 0.25))
         shoot(w, "S6_overhead_debug", (2.0, 0.0, 5.0), (2.0, 0.0001, 0.0), fov=55.0)
 
         # S1: on the step, head pushing the curtain up (D01).

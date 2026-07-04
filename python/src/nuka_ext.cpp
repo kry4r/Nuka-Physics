@@ -1354,6 +1354,7 @@ public:
     void add_media(uint32_t kind, uint32_t method, uint32_t cloth_nx,
                    uint32_t cloth_ny, float cloth_spacing,
                    const std::vector<float>& cloth_origin, bool cloth_free,
+                   uint32_t cloth_pin,
                    const std::vector<float>& tet_center, float tet_radius,
                    uint32_t tet_cells, float tet_cell_len,
                    const std::vector<float>& fluid_min,
@@ -1391,6 +1392,7 @@ public:
         d.cloth_spacing = cloth_spacing;
         vec3(cloth_origin, d.cloth_origin, "cloth_origin");
         d.cloth_free = cloth_free ? 1u : 0u;
+        d.cloth_pin = cloth_pin;
         vec3(tet_center, d.tet_center, "tet_center");
         d.tet_radius = tet_radius;
         d.tet_cells = tet_cells;
@@ -1598,6 +1600,15 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("MEDIA_METHOD_XPBD") = uint32_t{0};
     m.attr("MEDIA_METHOD_PBF") = uint32_t{1};
     m.attr("MEDIA_METHOD_MLSMPM") = uint32_t{2};
+    // SceneBuilder.add_media(cloth_pin=...) pin-set codes (MediaRecord::ClothPin):
+    // which cloth node set cooks with inv_mass 0.
+    m.attr("CLOTH_PIN_FROM_FREE") = uint32_t{0};
+    m.attr("CLOTH_PIN_NONE") = uint32_t{1};
+    m.attr("CLOTH_PIN_PERIMETER") = uint32_t{2};
+    m.attr("CLOTH_PIN_EDGE_X0") = uint32_t{3};
+    m.attr("CLOTH_PIN_EDGE_X1") = uint32_t{4};
+    m.attr("CLOTH_PIN_EDGE_Y0") = uint32_t{5};
+    m.attr("CLOTH_PIN_EDGE_Y1") = uint32_t{6};
 
     // v0.5 p04 N1 sim-to-real sensor-noise kinds (the int values
     // World.set_sensor_noise(kind=...) accepts). NONE (0, default) clears the
@@ -2574,7 +2585,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("method"), nb::arg("cloth_nx") = 0u, nb::arg("cloth_ny") = 0u,
              nb::arg("cloth_spacing") = 0.0f,
              nb::arg("cloth_origin") = std::vector<float>{},
-             nb::arg("cloth_free") = false,
+             nb::arg("cloth_free") = false, nb::arg("cloth_pin") = 0u,
              nb::arg("tet_center") = std::vector<float>{},
              nb::arg("tet_radius") = 0.0f, nb::arg("tet_cells") = 0u,
              nb::arg("tet_cell_len") = 0.0f,

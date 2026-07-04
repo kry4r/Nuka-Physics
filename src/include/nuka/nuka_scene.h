@@ -265,6 +265,9 @@ typedef struct nuka_media_desc_t {
     float    cloth_spacing;
     float    cloth_origin[3];
     uint32_t cloth_free;         // 1 => free drape; 0 => perimeter pinned.
+    // Pin-set override (scene::MediaRecord::ClothPin): 0 defers to cloth_free;
+    // 1 none, 2 perimeter, 3..6 pin ONE grid edge (x0/x1/y0/y1) -- a hung curtain.
+    uint32_t cloth_pin;
     // SOFT_TET: a sphere tet-lattice at tet_center, tet_radius, tet_cells cells
     // per axis, tet_cell_len cell edge.
     float    tet_center[3];
