@@ -57,7 +57,9 @@ constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
 // Per-collidable candidate-pair budget for the general LBVH broadphase: the
 // per-env candidate-slot capacity == collidable_count * this. Named (not a baked
 // FusedFoot foot count) so the contact buffer grows with the cooked geometry.
-constexpr uint32_t kCandidatePairsPerCollidable = 4u;
+// Overflow drops candidates in atomicAdd race order (a nondeterministically
+// vanishing contact), so the budget carries headroom over the uniform estimate.
+constexpr uint32_t kCandidatePairsPerCollidable = 8u;
 
 // One EXTRA collision geom of an articulation link (beyond the first, which folds
 // into the link's own body row via link_geom). Materialized into an appended
@@ -949,6 +951,14 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                     max_sq = std::max(max_sq, c.LengthSq());
                 }
                 row.params[0] = std::sqrt(max_sq);
+                // params[1..3]: per-axis origin-symmetric grid bound, so the
+                // broadphase AABB is a rotated box, not a bound-radius cube.
+                row.params[1] = std::max(std::fabs(g.origin.x),
+                                         std::fabs(g.origin.x + ex));
+                row.params[2] = std::max(std::fabs(g.origin.y),
+                                         std::fabs(g.origin.y + ey));
+                row.params[3] = std::max(std::fabs(g.origin.z),
+                                         std::fabs(g.origin.z + ez));
                 // Populate the orphaned ModelShape.sdf_index for this body's rows.
                 for (nk::ModelShape& msh : model.shapes)
                     if (msh.body_row == b) msh.sdf_index = gi;
@@ -974,6 +984,18 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             }
             model.excluded_pairs.push_back(
                 (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+        // Two immovable bodies can never produce a reaction row; exclude their
+        // pairs so static set dressing does not consume the candidate budget.
+        for (uint32_t i = 0; i + 1u < cap.bodies_per_env; ++i) {
+            if (i >= blob.bodies.is_static.size() || !blob.bodies.is_static[i])
+                continue;
+            for (uint32_t j = i + 1u; j < cap.bodies_per_env; ++j) {
+                if (j >= blob.bodies.is_static.size() || !blob.bodies.is_static[j])
+                    continue;
+                model.excluded_pairs.push_back(
+                    (static_cast<uint64_t>(i) << 32) | static_cast<uint64_t>(j));
+            }
         }
         std::sort(model.excluded_pairs.begin(), model.excluded_pairs.end());
         model.excluded_pairs.erase(
@@ -1358,8 +1380,8 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 
     nk::ModelCapacities& cap = model.capacities;
     // bodies_per_env (the LBVH leaf count) now includes the static terrain collidable;
-    // the CONTACT budget is the dynamic collidables (+1 static) at 4 candidate slots
-    // each -- the SAME rule the body cook uses (the heightfield replaced the plane).
+    // the CONTACT budget is the dynamic collidables (+1 static) at the shared
+    // per-collidable slot rate -- the SAME rule the body cook uses.
     cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
     cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
     constexpr uint32_t kStaticCollidables = 1u;
