@@ -67,7 +67,7 @@ def test_compose_and_save():
         rope = os.path.join(d, "rope.usda")
         out = os.path.join(d, "c.nks")
         write_rope_usda(rope, n_links=4, seg=0.05, radius=0.01,
-                        block=(0.05, 0.04, 0.02, 0.2))
+                        yoke=(0.06, 0.03, 0.02), slab=(0.05, 0.04, 0.02, 0.2))
         base = nuka.SceneBuilder.create(BDX)
         addon = nuka.SceneBuilder.create(rope)
         base.compose(addon, pos=[1.0, 0.0, 0.6], attach_at="rope")
