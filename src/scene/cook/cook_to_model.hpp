@@ -208,11 +208,11 @@ void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
                            const XpbdCookInput& in, const MpmCookInput& mpm);
 
 // LOUD cook-time validation of a media list against the (kind x method) legal set
-// (cloth = XPBD; tet-soft = XPBD or MLS-MPM; fluid = PBF or MLS-MPM) plus the rule
-// that an MLS-MPM medium may not co-reside with an XPBD/PBF medium and a Model holds
-// at most one PBF fluid slice / one MLS-MPM medium. Throws std::runtime_error on an
-// illegal pair or mix; an empty list and the all-XPBD/PBF legal cases pass (so every
-// existing scene cooks byte-identically). The single call site is CookSceneMedia.
+// (cloth = XPBD; tet-soft = XPBD or MLS-MPM; fluid = PBF or MLS-MPM) plus the rules
+// that an MLS-MPM medium may not co-reside with a PBF medium (XPBD is legal) and a
+// Model holds at most one PBF fluid slice / one MLS-MPM medium. Throws on an illegal
+// pair or mix; an empty list and the existing legal cases pass (so every existing
+// scene cooks byte-identically). The single call site is CookSceneMedia.
 void ValidateMedia(const std::vector<MediaRecord>& media);
 
 struct PbfCookInput {
