@@ -103,7 +103,16 @@ def stage_settle(args):
     with nuka.Device.create(0) as dev:
         w = build_world(dev, args.scene)
         n_cloth = A.CLOTH_NX * A.CLOTH_NY
-        static0 = bodies(w)
+        # identify the static set empirically: bodies that do not move at all over
+        # an early window (statics never move; links/free bodies jitter at once).
+        for _ in range(5):
+            w.step()
+        probe0 = bodies(w)
+        for _ in range(5):
+            w.step()
+        static_mask = (np.linalg.norm(bodies(w)[:, :3] - probe0[:, :3], axis=1)
+                       < 1e-7)
+        static0 = probe0
 
         for i in range(args.steps):
             w.step()
@@ -116,12 +125,15 @@ def stage_settle(args):
         bods, vels = bodies(w), body_vel(w)
         links = link_poses(w)
 
-        # 1. static props: zero drift (door frame, beam, walls -- everything static).
-        drift = np.abs(bods[:, :3] - static0[:, :3])
-        moving_allowance = np.ones(bods.shape[0], dtype=bool)
-        # free bodies (micro objects, probe pebble, cobbles) may settle a little.
-        stat_drift = float(drift.max())
-        print(f"[settle] max body drift {stat_drift:.4f} m (free bodies included)")
+        # 1. static props: zero drift over the whole settle.
+        drift = np.linalg.norm(bods[:, :3] - static0[:, :3], axis=1)
+        stat_drift = float(drift[static_mask].max())
+        print(f"[settle] statics n={int(static_mask.sum())} max drift "
+              f"{stat_drift:.6f} m; movable max drift "
+              f"{float(drift[~static_mask].max()):.4f} m")
+        if stat_drift > 1e-5:
+            ok = False
+            print("  !! a static prop moved")
 
         # 2. curtain: draped on the lintel, hem near z~0.28, nothing fallen.
         c = cloth_slice(w)
