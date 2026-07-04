@@ -807,13 +807,18 @@ nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
         return NUKA_RESULT_NOT_SUPPORTED;  // no cooked articulation retained.
     }
     try {
-        // Cooked link -> its body row. The host mirror covers articulation 0 (the
-        // co-residence case mirrors only the first dog, the existing host limitation).
-        const auto& topo = record->articulation_host.articulations.front();
-        if (link_index >= topo.link_bodies.size()) {
+        // Cooked link -> its body row. link_index spans EVERY cooked articulation
+        // (env-concatenated order), so resolve it by cumulative link ranges.
+        const auto& artics = record->articulation_host.articulations;
+        size_t k = 0u, local = link_index;
+        while (k < artics.size() && local >= artics[k].link_bodies.size()) {
+            local -= artics[k].link_bodies.size();
+            ++k;
+        }
+        if (k >= artics.size()) {
             return NUKA_RESULT_INVALID_ARG;
         }
-        const nuka::scene::BodyId body = topo.link_bodies[link_index];
+        const nuka::scene::BodyId body = artics[k].link_bodies[local];
         const nuka::scene::SceneIR& scene = *record->scene;
 
         // The DOF name is the joint whose CHILD is this link's body (the actuated
