@@ -58,8 +58,8 @@ STEP_X = (0.10, 0.26)               # step tread span; ground (z=0) beyond.
 DOOR_X = 0.30                       # door frame plane (over the stair bottom).
 LINTEL_Z = (0.48, 0.56)             # lintel bottom/top faces.
 CLOTH_SPACING = 0.02
-CLOTH_NX, CLOTH_NY = 17, 28         # 17 nodes along x (0.32 hang run), 28 across y.
-CLOTH_ORIGIN = [0.175, 0.0, 0.572]  # +x edge line over the lintel top (the pin).
+CLOTH_NX, CLOTH_NY = 26, 28         # 26 along x (0.50 span straddling the lintel), 28 across y.
+CLOTH_ORIGIN = [0.24, 0.0, 0.572]  # grid CENTER over the lintel (the cook centers on origin).
 TROUGH = (0.95, 2.25, 0.35, -0.03)  # x0, x1, half-y, floor z (flush tray).
 GRAVEL_SPACING = 0.009
 PROBE_PEBBLE = (1.60, 0.06, 0.02)   # x, y, radius -- half-buried on the walk line.
@@ -110,10 +110,11 @@ def add_materials(b):
 
 
 def add_cloth(b, fabric_id):
-    """The D01 curtain: its +x node line is pinned over the lintel top (the
-    general edge-pin mode); the sheet swings down and hangs to z~0.27, free to
-    billow, be lifted by the passing head, and swing back. A pure friction drape
-    provably slips off (the folding overhangs yank the sheet off the beam)."""
+    """The doorway curtain: a fabric sheet centered over the lintel so it straddles
+    the top rail. Its +x (back) edge is pinned behind the rail so the sheet cannot
+    slip off the thin beam, while the long free front flap drapes down through the
+    opening -- lifted by the passing head and swinging back (a pure friction straddle
+    folds and yanks itself off)."""
     b.add_media(nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_XPBD,
                 cloth_nx=CLOTH_NX, cloth_ny=CLOTH_NY, cloth_spacing=CLOTH_SPACING,
                 cloth_origin=list(CLOTH_ORIGIN), cloth_pin=nuka.CLOTH_PIN_EDGE_X1,
@@ -286,8 +287,11 @@ def build(args):
     if not args.no_gravel:
         add_granular(b, mat_ids["gravel"], spacing=args.gravel_spacing)
 
+    # Opt into the beauty look levers: env-miss fill at the HDRI intensity (fills the
+    # crushed shadows), slight exposure tame + filmic grade, and a crisp sky sun disc.
     b.set_environment(hdri=f"{TEX}/hdri/sky_2k.hdr", yaw_deg=-35.0, intensity=1.3,
-                      use_scene_materials=True)
+                      use_scene_materials=True, ibl_full_fill=True,
+                      exposure_ev=-0.3, grade=0.35, sun_disc=0.8)
     b.save(args.out)
     b.destroy()
     post_process(args.out)

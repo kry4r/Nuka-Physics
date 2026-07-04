@@ -225,6 +225,12 @@ typedef struct nuka_environment_desc_t {
     float    yaw_deg;             // rotation about world +Z.
     float    intensity;           // radiance scale; <= 0 => 1.
     uint32_t use_scene_materials;
+    // Offline beauty look levers; all-zero (the zero-init default) preserves the
+    // current look. ibl_full_fill lights the env-miss fill at `intensity`.
+    uint32_t ibl_full_fill;       // 0 => dim procedural-sky fill (default).
+    float    exposure_ev;         // post exposure in stops (0 => no-op).
+    float    grade;               // post contrast/saturation strength (0 => identity).
+    float    sun_disc;            // sky sun-disc radiance scale (0 => off).
 } nuka_environment_desc_t;
 
 // Set the built scene's environment record (persisted by nuka_scene_save).

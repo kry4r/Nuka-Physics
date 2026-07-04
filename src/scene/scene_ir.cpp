@@ -1001,6 +1001,9 @@ void SceneIR::ProjectShape(const CollisionShapeRecord& rec) {
         cs.kind = KindFromShapeType(rec.type);
         FillShapeParams(rec, cs.params);
         cs.physics_material_id = phys_id;
+        // Carry the render material so a collision-only body (no visual twin)
+        // renders its proxy in the authored appearance, not the default grey.
+        cs.render_material_id = render_id;
         cs.group = rec.contype;
         cs.mask  = rec.conaffinity;
         ecs_.Add(entity, std::move(cs));

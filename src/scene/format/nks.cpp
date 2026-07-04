@@ -990,19 +990,33 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     // -- environment (HDR beauty backdrop + material policy) -----------------
     // Emitted only when authored so an environment-free scene's bytes are
     // unchanged.
-    if (!scene.Environment().hdri.empty() || scene.Environment().use_scene_materials) {
+    const auto& envr = scene.Environment();
+    if (!envr.hdri.empty() || envr.use_scene_materials || envr.ibl_full_fill ||
+        envr.exposure_ev != 0.0f || envr.grade != 0.0f || envr.sun_disc != 0.0f) {
         Value env = Value::Object();
-        if (!scene.Environment().hdri.empty()) {
-            env.Set("hdri", Value::Str(scene.Environment().hdri));
+        if (!envr.hdri.empty()) {
+            env.Set("hdri", Value::Str(envr.hdri));
         }
-        if (scene.Environment().yaw_deg != 0.0f) {
-            env.Set("yaw_deg", Value::Float(scene.Environment().yaw_deg));
+        if (envr.yaw_deg != 0.0f) {
+            env.Set("yaw_deg", Value::Float(envr.yaw_deg));
         }
-        if (scene.Environment().intensity != 1.0f) {
-            env.Set("intensity", Value::Float(scene.Environment().intensity));
+        if (envr.intensity != 1.0f) {
+            env.Set("intensity", Value::Float(envr.intensity));
         }
-        if (scene.Environment().use_scene_materials) {
+        if (envr.use_scene_materials) {
             env.Set("use_scene_materials", Value::Bool(true));
+        }
+        if (envr.ibl_full_fill) {
+            env.Set("ibl_full_fill", Value::Bool(true));
+        }
+        if (envr.exposure_ev != 0.0f) {
+            env.Set("exposure_ev", Value::Float(envr.exposure_ev));
+        }
+        if (envr.grade != 0.0f) {
+            env.Set("grade", Value::Float(envr.grade));
+        }
+        if (envr.sun_disc != 0.0f) {
+            env.Set("sun_disc", Value::Float(envr.sun_disc));
         }
         root.Set("environment", std::move(env));
     }
@@ -1591,6 +1605,11 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
         if (const Value* iv = env->Find("intensity")) rec.intensity = iv->AsFloat();
         if (const Value* um = env->Find("use_scene_materials"))
             rec.use_scene_materials = um->AsBool();
+        if (const Value* ff = env->Find("ibl_full_fill"))
+            rec.ibl_full_fill = ff->AsBool();
+        if (const Value* ev = env->Find("exposure_ev")) rec.exposure_ev = ev->AsFloat();
+        if (const Value* gr = env->Find("grade")) rec.grade = gr->AsFloat();
+        if (const Value* sd = env->Find("sun_disc")) rec.sun_disc = sd->AsFloat();
         scene.EnvironmentMut() = std::move(rec);
     }
 

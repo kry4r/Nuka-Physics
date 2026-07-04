@@ -215,6 +215,13 @@ struct EnvironmentRecord {
     float yaw_deg                          = 0.0f;
     float intensity                        = 1.0f;
     bool  use_scene_materials              = false;
+
+    // Offline beauty look levers (opt-in; neutral defaults keep existing beauty
+    // frames byte-identical). render_beauty maps each onto the studio tracer.
+    bool  ibl_full_fill                    = false;  // env-miss fill at `intensity`, not the dim sky
+    float exposure_ev                      = 0.0f;   // post exposure in stops
+    float grade                            = 0.0f;   // post filmic contrast/saturation strength
+    float sun_disc                         = 0.0f;   // sky sun-disc radiance scale, keyed to the key light
 };
 
 struct CameraRecord {
