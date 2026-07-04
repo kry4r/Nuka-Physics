@@ -57,9 +57,7 @@ constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
 // Per-collidable candidate-pair budget for the general LBVH broadphase: the
 // per-env candidate-slot capacity == collidable_count * this. Named (not a baked
 // FusedFoot foot count) so the contact buffer grows with the cooked geometry.
-// Overflow drops candidates in atomicAdd race order (a nondeterministically
-// vanishing contact), so the budget carries headroom over the uniform estimate.
-constexpr uint32_t kCandidatePairsPerCollidable = 8u;
+constexpr uint32_t kCandidatePairsPerCollidable = 4u;
 
 // One EXTRA collision geom of an articulation link (beyond the first, which folds
 // into the link's own body row via link_geom). Materialized into an appended
