@@ -11,7 +11,7 @@ Layout (world metres, +z up):
   B  x in [0.9, 2.3]: a full-lane gravel bed -- an MLS-MPM Drucker-Prager granular
      medium filling a shallow flush tray dug into the dirt floor, dirt shoulder
      ramps all around, one half-buried probe pebble on the walk line;
-  C  x in [2.3, 3.2]: ~45 tiny free rigid bodies (pebbles, bolts, washers, nuts)
+  C  x in [2.3, 3.2]: ~45 tiny free rigid bodies (pebbles, bolts, bearings)
      scattered dense on the lane for the macro kick beat;
   D  x in [3.2, 4.6]: a portal frame at x=3.75 hanging a stone slab at duck-head
      height from a revolute-Y rope chain + rigid V-yoke (two capsule legs on ONE
@@ -216,16 +216,18 @@ def build(args):
                 return x, y
         return None, None
 
+    # Sphere/capsule only: a mm-scale free box slowly sinks through a static box
+    # top (shallow-penetration dead band) and is later ground out sideways.
     for _ in range(int(args.rocks)):
         kind = rng.random()
-        if kind < 0.40:      # pebble
+        if kind < 0.45:      # pebble
             r = rng.uniform(0.008, 0.015)
             x, y = free_spot(r)
             if x is None:
                 continue
             b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, y, r],
                                   mass=0.01, friction=0.9, material="stone")
-        elif kind < 0.65:    # bolt
+        elif kind < 0.75:    # bolt / screw
             r = rng.uniform(0.0035, 0.0045)
             x, y = free_spot(0.012)
             if x is None:
@@ -234,22 +236,13 @@ def build(args):
                                   pos=[x, y, r],
                                   quat=[0.707, 0.707, 0.0, 0.0], mass=0.005,
                                   friction=0.8, material="metal")
-        elif kind < 0.85:    # washer
-            e = rng.uniform(0.006, 0.009)
-            x, y = free_spot(e * 1.42)
+        else:                # nut / ball bearing
+            r = rng.uniform(0.004, 0.0055)
+            x, y = free_spot(r)
             if x is None:
                 continue
-            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, 0.0018],
-                                  pos=[x, y, 0.002], mass=0.002, friction=0.8,
-                                  material="metal")
-        else:                # nut
-            e = rng.uniform(0.004, 0.0055)
-            x, y = free_spot(e * 1.42)
-            if x is None:
-                continue
-            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, e * 0.7],
-                                  pos=[x, y, e * 0.7], mass=0.003, friction=0.8,
-                                  material="metal")
+            b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, y, r],
+                                  mass=0.003, friction=0.8, material="metal")
 
     # -- Zone D: portal frame + rope chain + V-yoke + stone slab ----------------
     for sy in (1.0, -1.0):
