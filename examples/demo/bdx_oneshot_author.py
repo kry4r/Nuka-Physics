@@ -230,10 +230,13 @@ def build(args):
             x, y = free_spot(0.012)
             if x is None:
                 continue
+            # Lie flat at a random in-plane heading (spin the +Y axis about Z);
+            # the sole rests at z=r, no floor penetration at spawn.
+            a = rng.uniform(0.0, math.pi)
             b.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[r, 0.005],
                                   pos=[x, y, r],
-                                  quat=[0.707, 0.707, 0.0, 0.0], mass=0.005,
-                                  friction=0.8, material="metal")
+                                  quat=[math.cos(a), 0.0, 0.0, math.sin(a)],
+                                  mass=0.005, friction=0.8, material="metal")
         elif kind < 0.85:    # washer
             e = rng.uniform(0.006, 0.009)
             x, y = free_spot(e * 1.42)
