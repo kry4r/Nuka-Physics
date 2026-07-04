@@ -96,7 +96,9 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
         if (!s.triangles.empty() || s.particle_radius <= 0.0f) continue;
         nuka::render::AddStudioParticleSkin(*bridge->scene, record->scene->Ecs(),
                                             s.render_material_id, s.particle_radius,
-                                            s.particle_first, s.particle_count);
+                                            s.particle_first, s.particle_count,
+                                            s.grain_round != 0u, s.grain_radius_jitter,
+                                            s.grain_tint_jitter);
     }
     if (bridge->scene->world.instances.empty()) {
         return NUKA_RESULT_NOT_SUPPORTED;  // no renderable visual geometry.
@@ -230,6 +232,7 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
         o.beauty_sun_disc[2] = env.sun_disc * o.sun_color[2];
         o.beauty_exposure_ev = env.exposure_ev;
         o.beauty_grade = env.grade;
+        o.beauty_specular_env = env.specular_env;
         record->beauty->renderer->SetBeauty(true, spp != 0u ? spp : 16u);
         const nuka::render::VulkanOffscreenReport report =
             record->beauty->renderer->Render(studio.world, o);

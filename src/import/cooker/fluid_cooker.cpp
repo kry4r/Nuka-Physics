@@ -30,6 +30,18 @@ uint32_t AxisCount(float length, float spacing) {
 bool SpecValid(const FluidBoxSpec& spec) {
     return spec.spacing > 0.0f && spec.rest_density > 0.0f;
 }
+
+// Deterministic per-cell jitter in [-1,1) keyed by (ix,iy,iz,axis) -- reproducible
+// (no RNG/time) so two cooks of the same spec yield a byte-identical particle set.
+float CellJitterUnit(uint32_t ix, uint32_t iy, uint32_t iz, uint32_t axis) {
+    uint32_t h = 0x9E3779B9u;
+    h ^= ix + 0x9E3779B9u + (h << 6) + (h >> 2);
+    h ^= iy + 0x9E3779B9u + (h << 6) + (h >> 2);
+    h ^= iz + 0x9E3779B9u + (h << 6) + (h >> 2);
+    h ^= axis + 0x9E3779B9u + (h << 6) + (h >> 2);
+    h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
+    return static_cast<float>(h) * (2.0f / 4294967296.0f) - 1.0f;
+}
 }  // namespace
 
 FluidLatticeCounts FluidBoxLatticeCounts(const FluidBoxSpec& spec) {
@@ -65,14 +77,24 @@ PbfParticleSet CookFluidBox(const FluidBoxSpec& spec) {
 
     const float s = spec.spacing;
     const float half = 0.5f * s;
+    // Jitter amplitude (0 => the exact lattice; the loop then adds no offset, so an
+    // unjittered spec stays byte-identical to the cell-centered fill).
+    const float amp = spec.position_jitter > 0.0f ? spec.position_jitter * half : 0.0f;
     // Cell-centered fill, x fastest -> deterministic byte-identical order.
     for (uint32_t iz = 0u; iz < counts.nz; ++iz) {
-        const float z = spec.min_corner.z + (static_cast<float>(iz) * s) + half;
+        const float z0 = spec.min_corner.z + (static_cast<float>(iz) * s) + half;
         for (uint32_t iy = 0u; iy < counts.ny; ++iy) {
-            const float y = spec.min_corner.y + (static_cast<float>(iy) * s) + half;
+            const float y0 = spec.min_corner.y + (static_cast<float>(iy) * s) + half;
             for (uint32_t ix = 0u; ix < counts.nx; ++ix) {
-                const float x = spec.min_corner.x + (static_cast<float>(ix) * s) + half;
-                out.positions.push_back(Vec3{x, y, z});
+                const float x0 = spec.min_corner.x + (static_cast<float>(ix) * s) + half;
+                if (amp > 0.0f) {
+                    out.positions.push_back(Vec3{
+                        x0 + amp * CellJitterUnit(ix, iy, iz, 0u),
+                        y0 + amp * CellJitterUnit(ix, iy, iz, 1u),
+                        z0 + amp * CellJitterUnit(ix, iy, iz, 2u)});
+                } else {
+                    out.positions.push_back(Vec3{x0, y0, z0});
+                }
             }
         }
     }

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Scripted pose-driven traverse of the bdx_oneshot corridor + coupling probes.
+"""Scripted traverse of the bdx_oneshot corridor + coupling probes.
 
-The duck's base anchor is static, so the traverse drags it along the walkway by
-uploading BASE_POSE each step while the PD stance holds; every coupling response
-(cloth lift, gravel imprint, kicked objects, slab swing, joint reactions) is real
-solver output. Probes report PASS/FAIL numbers for the acceptance gate; the same
-driver positions the duck for the beauty stations.
+The base glides along the walkway (BASE_POSE each step) for camera control while a
+recorded forward-walk cycle drives the leg joints, phase-locked to distance travelled
+so the feet plant instead of skating. Every coupling response (cloth lift, gravel
+imprint, kicked objects, slab swing, joint reactions) is real solver output; probes
+report PASS/FAIL numbers and the same driver positions the duck for the beauty stations.
 """
 
 from __future__ import annotations
@@ -21,6 +21,22 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 OUT = os.path.join(REPO, "examples", "scenes", "bdx_oneshot.nks")
 N_CLOTH = A.CLOTH_NX * A.CLOTH_NY
 
+DT = 1.0 / 240.0                    # demo world step; the base glide runs at this rate.
+CONTROL_DT = 0.02                   # frame period the recorded walk cycle was sampled at.
+WALK_TRAJ = os.environ.get(
+    "BDX_WALK_TRAJ",
+    "/data/xtzhang25/_work/activate/out/bdx_walk_v6/traj/bdx_walk_v6_traj.npz")
+
+
+def load_walk_cycle(path=WALK_TRAJ):
+    """Recorded forward-walk DRIVE_TARGET cycle, its DOF names, and net metres/frame."""
+    z = np.load(path, allow_pickle=True)
+    drive = np.ascontiguousarray(z["drive_target"], dtype=np.float32)
+    names = [str(s) for s in z["dof_names"]]
+    base = np.asarray(z["base_pose"], dtype=np.float32)
+    dx = (float(base[-1, 0]) - float(base[0, 0])) / max(1, len(base) - 1)
+    return drive, names, dx
+
 
 def z_floor(x):
     if x < A.STEP_X[0]:
@@ -31,21 +47,67 @@ def z_floor(x):
 
 
 class Driver:
-    """Base-pose drag driver over one cooked world."""
+    """Glides the base along the path while replaying a recorded walk cycle on the legs."""
+
+    RAMP_STEPS = 60                 # steps to ease the drive from stand pose into the cycle.
 
     def __init__(self, w):
         self.w = w
         self.base = np.asarray(w.download_field(nuka.Field.BASE_POSE),
                                dtype=np.float32).copy()
         self.pos = list(self.base[:3])
+        cycle, cnames, self.cycle_dx = load_walk_cycle()
+        self.n_frames = cycle.shape[0]
+        col = np.array([cnames.index(n) for n in w.dof_names()], dtype=np.int64)
+        self.wcycle = np.ascontiguousarray(cycle[:, col])  # cycle reordered to cooked DOFs
+        self.stand = np.asarray(w.download_field(nuka.Field.DRIVE_TARGET),
+                                dtype=np.float32).copy()
+        self.drive = self.stand.copy()
+        self.phase = 0.0
+        self.ramp = 0.0
+        self._set_servo_gains()
+        self._root_zero = np.zeros(6, np.float32)
+
+    def _set_servo_gains(self):
+        # sts3215 position servo the walk policy drove: kp 13.37, kd 0, force +-3.23 N.m.
+        blc = self.stand.size
+        kp = np.zeros(blc, np.float32); kp[1:] = 13.37
+        fl = np.zeros(blc, np.float32); fl[1:] = 3.23
+        self.w.upload_field(nuka.Field.DRIVE_STIFFNESS, kp)
+        self.w.upload_field(nuka.Field.DRIVE_DAMPING, np.zeros(blc, np.float32))
+        self.w.upload_field(nuka.Field.DRIVE_FORCE_LIMIT, fl)
+
+    def _apply_cycle(self):
+        """Blend the current phase's cycle pose into the actuated drive slots and push it."""
+        p = self.phase % self.n_frames
+        f0 = int(p)
+        f1 = (f0 + 1) % self.n_frames
+        a = p - f0
+        row = (1.0 - a) * self.wcycle[f0] + a * self.wcycle[f1]
+        self.drive = (1.0 - self.ramp) * self.stand + self.ramp * row
+        self.drive[0] = self.stand[0]  # root link is inert under the PD drive.
+        self.w.upload_field(nuka.Field.DRIVE_TARGET,
+                            np.ascontiguousarray(self.drive, dtype=np.float32))
+
+    def _drive_step(self, fwd):
+        """Advance the phase by forward distance (natural cadence when parked), drive, step."""
+        if abs(fwd) > 1e-9:
+            self.phase += fwd / self.cycle_dx
+        else:
+            self.phase += DT / CONTROL_DT
+        if self.ramp < 1.0:
+            self.ramp = min(1.0, self.ramp + 1.0 / self.RAMP_STEPS)
+        self._apply_cycle()
+        self.w.step()
 
     def set_base(self, x, y, z):
         self.base[0], self.base[1], self.base[2] = x, y, z
         self.w.upload_field(nuka.Field.BASE_POSE, np.ascontiguousarray(self.base))
+        self.w.upload_field(nuka.Field.LINK_VELOCITY, self._root_zero)  # kill drag jitter
         self.pos = [x, y, z]
 
-    def glide(self, x1, speed, dt=1.0 / 240.0, sink=0.0, y=0.0, on_step=None):
-        """Drag the base to x1 at `speed`, tracking the floor height + `sink`."""
+    def glide(self, x1, speed, dt=DT, sink=0.0, y=0.0, on_step=None):
+        """Drag the base to x1 at `speed`; legs step in proportion to distance travelled."""
         x = self.pos[0]
         n = max(1, int(abs(x1 - x) / (speed * dt)))
         for i in range(n):
@@ -54,8 +116,9 @@ class Driver:
             zi = z_floor(xi) + A.BASE_OVER_FLOOR + sink
             # blend z over 6 cm so a floor break never teleports the duck.
             ahead = z_floor(xi + 0.06) + A.BASE_OVER_FLOOR + sink
+            fwd = xi - self.pos[0]
             self.set_base(xi, y, min(zi, 0.5 * (zi + ahead)))
-            self.w.step()
+            self._drive_step(fwd)
             if on_step:
                 on_step(xi)
 
@@ -65,14 +128,17 @@ class Driver:
         h = max(1, steps // 2)
         for i in range(h):
             self.set_base(x, y, z0 - dz * (i + 1) / h)
-            self.w.step()
+            self._drive_step(0.0)
         for i in range(h):
             self.set_base(x, y, z0 - dz * (1.0 - (i + 1) / h))
-            self.w.step()
+            self._drive_step(0.0)
 
     def hold(self, steps):
+        # re-pin the base so the cycling legs march in place instead of walking off.
+        x, y, z = self.pos
         for _ in range(steps):
-            self.w.step()
+            self.set_base(x, y, z)
+            self._drive_step(0.0)
 
 
 def particles(w):
@@ -123,7 +189,7 @@ def slab_angle(links):
 
 def build_world(dev, scene=OUT):
     b = nuka.SceneBuilder.create(scene)
-    w = b.build(dev, env_count=1, dt=1.0 / 240.0, control_mode=0)
+    w = b.build(dev, env_count=1, dt=DT, control_mode=0, bake_link_sdf=True)
     b.destroy()
     return w
 

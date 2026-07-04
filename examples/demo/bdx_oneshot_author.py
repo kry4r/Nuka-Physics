@@ -9,22 +9,24 @@ Layout (world metres, +z up):
      carries a fabric curtain DRAPED over it (a free XPBD cloth held by contact +
      friction, nothing pinned);
   B  x in [0.9, 2.3]: a full-lane gravel bed -- an MLS-MPM Drucker-Prager granular
-     medium filling a shallow flush tray dug into the dirt floor, dirt shoulder
-     ramps all around, one half-buried probe pebble on the walk line;
-  C  x in [2.3, 3.2]: ~45 tiny free rigid bodies (pebbles, bolts, washers, nuts)
-     scattered dense on the lane for the macro kick beat;
-  D  x in [3.2, 4.6]: a portal frame at x=3.75 hanging a stone slab at duck-head
-     height from a revolute-Y rope chain + rigid V-yoke (two capsule legs on ONE
-     link) -- reads as a two-rope suspension, topologically a tree.
+     medium filling a shallow flush tray dug into the dirt floor, round-grain skin,
+     dirt shoulder ramps all around, one half-buried probe pebble on the walk line;
+  C  x in [2.3, 3.2]: a thin light foot-loftable MLS-MPM debris fill appended to the
+     Zone B bed on the SAME grid -- coarse grains the passing foot sweeps and lofts;
+  D  x in [3.2, 4.6]: a portal frame at x=3.75 hanging an XPBD cord pinned under the
+     beam with a rigid stone slab welded to its loaded end, dangling at duck-head
+     height so the head strikes it and it swings in the x-z plane.
 
-Dressing: plank walls both sides + a back wall, wall studs, crates/barrel off the
-walk line, a tool board, HDRI sky light. The duck (bdx_stand.nks) spawns on the
-platform; its head + trunk gain colliding geoms via add_collision_shape.
+Dressing: plank walls both sides, a raised back-drop wall + far-end wall, overhead
+rafters, wall studs, crates/barrels/shelves off the walk line, a tool board, HDRI
+sky light. The duck (bdx_stand.nks) spawns on the platform; its head + trunk gain
+colliding geoms via add_collision_shape.
 
-Both media (cloth XPBD + gravel MLS-MPM) are DECLARED in the saved .nks and cook
-together into one world (ParticleMode::MpmXpbd).
+The media (cloth XPBD + gravel/debris MLS-MPM + cable XPBD) are DECLARED in the
+saved .nks and cook together into one world (ParticleMode::MpmXpbd). Build with
+``bake_link_sdf=True`` so the duck feet gain visual-mesh SDFs and loft the debris.
 
-Run (repo root): python examples/demo/bdx_oneshot_author.py [--rocks 45]
+Run (repo root): python examples/demo/bdx_oneshot_author.py
 """
 
 from __future__ import annotations
@@ -33,16 +35,14 @@ import argparse
 import json
 import math
 import os
-import random
 
 import nuka
-from bdx_oneshot_rope import write_rope_usda
+from nuka import materials, morphs, surfaces
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEX = os.path.join(REPO, "examples", "assets", "textures")
 BDX = os.path.join(REPO, "examples", "scenes", "bdx_stand.nks")
 OUT = os.path.join(REPO, "examples", "scenes", "bdx_oneshot.nks")
-ROPE_USDA = os.path.join(REPO, "examples", "scenes", "bdx_oneshot_rope.usda")
 
 HEAD = ("base/trunk_assembly/neck_pitch_assembly/head_pitch_to_yaw/"
         "neck_yaw_assembly/head_assembly")
@@ -56,18 +56,32 @@ PLATFORM_TOP = 0.10
 STEP_TOP = 0.05                     # the ONE intermediate step (two risers of 0.05).
 STEP_X = (0.10, 0.26)               # step tread span; ground (z=0) beyond.
 DOOR_X = 0.30                       # door frame plane (over the stair bottom).
-LINTEL_Z = (0.48, 0.56)             # lintel bottom/top faces.
+LINTEL_Z = (0.48, 0.56)            # lintel bottom/top faces.
 CLOTH_SPACING = 0.02
 CLOTH_NX, CLOTH_NY = 26, 28         # 26 along x (0.50 span straddling the lintel), 28 across y.
 CLOTH_ORIGIN = [0.24, 0.0, 0.572]  # grid CENTER over the lintel (the cook centers on origin).
-TROUGH = (0.95, 2.25, 0.35, -0.03)  # x0, x1, half-y, floor z (flush tray).
+TROUGH = (0.95, 2.25, 0.35, -0.03)  # gravel fill x0, x1, half-y, floor z.
+RECESS_X1 = 3.05                    # flush dirt recess spans [x0, RECESS_X1]: the debris
+                                    # shares the ONE MLS-MPM floor and reads on-ground.
 GRAVEL_SPACING = 0.009
 PROBE_PEBBLE = (1.60, 0.06, 0.02)   # x, y, radius -- half-buried on the walk line.
-ZONE_C = (2.45, 3.05, 0.20)         # x0, x1, half-y for the small-object cluster.
+BED_JITTER = 0.5                    # de-lattice the gravel so it never reads as a waffle.
+LOFT_HEADROOM = 1.0                 # +z grid ceiling (m) so kicked debris has room.
+ZONE_C = (2.47, 3.03, 0.18)         # x0, x1, half-y for the MPM debris fill.
+DEBRIS_DZ = (0.006, 0.062)          # ~2 grain layers so the surface stacks above the floor.
+DEBRIS_SPACING = 0.026              # fine debris grains: small render radius, less half-sink.
+DEBRIS_JITTER = 0.5
 BEAM_X, BEAM_Z = 3.75, 0.79         # portal frame plane and beam centre height.
-ROPE_SEG, ROPE_LINKS = 0.043, 7
-SLAB_HALF = (0.025, 0.11, 0.065)    # x thickness, y width, z height (slab hangs ~0.27).
-WALL_Y, WALL_TOP = 0.55, 0.46       # wall inner faces / height (low: let sky in).
+CABLE_ANCHOR_Z = 0.745             # pinned bead just under the beam bottom face.
+CABLE_END_Z = 0.44                 # loaded end == slab top; slab bottom ~0.29 at head height.
+CABLE_SEGMENTS, CABLE_RADIUS = 14, 0.011
+SLAB_HALF = (0.065, 0.11, 0.075)    # hanging stone: thin across travel, wide y, tall z.
+WALL_Y, WALL_TOP = 0.55, 0.46       # near-side wall inner face / height (low: let sky in).
+BACKDROP_Y, BACKDROP_TOP = 0.62, 0.85  # raised +y back-drop that blocks the sky horizon.
+FAR_WALL_X = 4.72                   # far-end wall closing the +x horizon.
+SCRIM_Y = -1.7                      # distant back wall well behind the -y camera lane.
+SCRIM_TOP = 1.1                     # distant enclosure height that caps the open-side sky.
+SCRIM_X = (-1.5, 5.7)              # -y back wall x-span, past both corridor ends.
 
 
 def tex(name, **kw):
@@ -96,12 +110,17 @@ def add_materials(b):
                                  **tex("gravel", uv_scale=8.0))
     m["fabric"] = b.add_material("fabric_curtain", base_color=[0.74, 0.32, 0.26],
                                  sheen=0.5, **tex("fabric", uv_scale=5.0))
+    # Stone / metal tuned mid-low roughness so the specular env reflection reads.
     m["stone"] = b.add_material("stone", base_color=[0.20, 0.17, 0.14],
-                                roughness=0.95)
+                                roughness=0.5, metallic=0.05)
     m["metal"] = b.add_material("metal", base_color=[0.55, 0.56, 0.60],
-                                metallic=0.9, roughness=0.3)
-    m["cord"] = b.add_material("rope_cord", base_color=[0.28, 0.20, 0.13],
-                               roughness=0.9)
+                                metallic=0.92, roughness=0.26)
+    m["slab_stone"] = b.add_material("slab_stone", base_color=[0.26, 0.24, 0.22],
+                                     metallic=0.25, roughness=0.45)
+    m["debris"] = b.add_material("debris", base_color=[0.30, 0.29, 0.27],
+                                 metallic=0.15, roughness=0.7)
+    m["cord"] = b.add_material("rope_cord", base_color=[0.24, 0.17, 0.11],
+                               roughness=0.85)
     m["crate"] = b.add_material("crate", base_color=[0.50, 0.36, 0.22],
                                 **tex("wood_planks", uv_scale=4.0))
     m["board"] = b.add_material("board", base_color=[0.35, 0.26, 0.16],
@@ -113,8 +132,7 @@ def add_cloth(b, fabric_id):
     """The doorway curtain: a fabric sheet centered over the lintel so it straddles
     the top rail. Its +x (back) edge is pinned behind the rail so the sheet cannot
     slip off the thin beam, while the long free front flap drapes down through the
-    opening -- lifted by the passing head and swinging back (a pure friction straddle
-    folds and yanks itself off)."""
+    opening -- lifted by the passing head and swinging back."""
     b.add_media(nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_XPBD,
                 cloth_nx=CLOTH_NX, cloth_ny=CLOTH_NY, cloth_spacing=CLOTH_SPACING,
                 cloth_origin=list(CLOTH_ORIGIN), cloth_pin=nuka.CLOTH_PIN_EDGE_X1,
@@ -124,17 +142,57 @@ def add_cloth(b, fabric_id):
                 render_material_id=fabric_id)
 
 
-def add_granular(b, gravel_id, spacing=GRAVEL_SPACING):
-    """The D02 gravel: an MLS-MPM Drucker-Prager bed filling the flush tray."""
+def add_granular(b, mats, spacing=GRAVEL_SPACING):
+    """The Zone B gravel bed (base MLS-MPM Drucker-Prager fill) plus the Zone C
+    light debris as a heterogeneous sub-fill on the SAME grid. The base material
+    owns the shared grid scalars (dx / substeps / floor / loft headroom); the fill
+    carries only its own constitutive, and the round-grain skin propagates to it."""
     tx0, tx1, ty, tz = TROUGH
-    b.add_media(nuka.MEDIA_GRANULAR, nuka.MEDIA_METHOD_MLSMPM,
-                fluid_min=[tx0 + 0.02, -ty + 0.02, tz + 0.002],
-                fluid_max=[tx1 - 0.02, ty - 0.02, 0.004],
-                fluid_spacing=spacing, mpm_model_kind=4.0, mpm_dp_friction=34.0,
-                mpm_dp_cohesion=0.0, mpm_density=1600.0, mpm_youngs=3.0e5,
-                mpm_poisson=0.3, mpm_dx=max(2.0 * spacing, 0.02), mpm_substeps=14,
-                mpm_floor_normal=[0.0, 0.0, 1.0], mpm_floor_d=tz,
-                mpm_floor_friction=0.7, render_material_id=gravel_id)
+    bed = morphs.GranularBed(min=(tx0 + 0.02, -ty + 0.02, tz + 0.002),
+                             max=(tx1 - 0.02, ty - 0.02, 0.004),
+                             spacing=spacing, position_jitter=BED_JITTER)
+    base_mat = materials.Granular.MPM(youngs=3.0e5, poisson=0.3, density=1600.0,
+                                      friction_angle=34.0, cohesion=0.0,
+                                      dx=max(2.0 * spacing, 0.02), substeps=14,
+                                      floor_normal=(0.0, 0.0, 1.0), floor_d=tz,
+                                      floor_friction=0.7,
+                                      loft_headroom=LOFT_HEADROOM)
+    grains = surfaces.Grains(round=True, radius_jitter=0.25, tint_jitter=0.15)
+    kw = bed.media_geometry_kwargs()
+    kw.update(base_mat.media_material_kwargs())
+    kw.update(grains.media_kwargs())
+    kw["render_material_id"] = mats["gravel"]
+    media_id = b.add_media(kind=nuka.MEDIA_GRANULAR,
+                           method=nuka.MEDIA_METHOD_MLSMPM, **kw)
+
+    cx0, cx1, cy = ZONE_C
+    dz0, dz1 = DEBRIS_DZ
+    debris_mat = materials.Granular.MPM(youngs=1.5e5, poisson=0.3, density=600.0,
+                                        friction_angle=22.0, cohesion=0.0)
+    fill = morphs.MpmFill(min=(cx0, -cy, tz + dz0), max=(cx1, cy, tz + dz1),
+                          spacing=DEBRIS_SPACING, material=debris_mat,
+                          position_jitter=DEBRIS_JITTER)
+    fkw = fill.fill_geometry_kwargs()
+    fkw.update(debris_mat.fill_kwargs())
+    fkw["render_material_id"] = mats["debris"]
+    b.add_mpm_fill(media_id, **fkw)
+
+
+def add_cable(b, mats):
+    """The D04 hanging stone: an inextensible XPBD cord pinned under the beam with a
+    rigid stone slab welded to its loaded end. The slab's top face sits at the cord
+    end and hangs downward, dangling at duck-head height for the head-strike swing."""
+    cord = materials.Cable.XPBD(mass=0.04, friction=0.4, distance_alpha=0.0,
+                                bend_alpha=1.0e-3, iters=32)
+    slab = morphs.CableSlab(half_extents=SLAB_HALF, mass=0.075, stiffness=1.0)
+    cable = morphs.Cable(start=(BEAM_X, 0.0, CABLE_ANCHOR_Z),
+                         end=(BEAM_X, 0.0, CABLE_END_Z), segments=CABLE_SEGMENTS,
+                         radius=CABLE_RADIUS, pin="start", bend=False, slab=slab)
+    kw = cable.media_geometry_kwargs()
+    kw.update(cord.media_material_kwargs())
+    kw["render_material_id"] = mats["cord"]
+    kw["cable_slab_render_material_id"] = mats["slab_stone"]
+    b.add_media(kind=nuka.MEDIA_CABLE, method=nuka.MEDIA_METHOD_XPBD, **kw)
 
 
 def sbox(b, half, pos, mat, quat=None, friction=0.9):
@@ -155,21 +213,22 @@ def build(args):
                           pos=[0.0, 0.0, -0.005], friction=0.8)
 
     # -- floor: one big base slab (top -0.03) + packed-earth plates (top 0.00)
-    # everywhere EXCEPT the gravel tray span, which stays 3 cm deep ------------
+    # everywhere EXCEPT the gravel+debris recess span, which stays 3 cm deep ----
     sbox(b, [3.75, 1.5, 0.06], [2.25, 0.0, -0.09], "dirt")
-    # a wide apron below the walk plates (and tray floor) hides the studio disc.
+    # a wide apron below the walk plates (and recess floor) hides the studio disc.
     sbox(b, [11.0, 8.0, 0.015], [4.0, 0.0, -0.06], "dirt")
     tx0, tx1, ty, tz = TROUGH
+    rx1 = RECESS_X1
     sbox(b, [(tx0 + 1.5) * 0.5, 1.5, 0.015], [(tx0 - 1.5) * 0.5, 0.0, -0.015], "dirt")
-    sbox(b, [(6.0 - tx1) * 0.5, 1.5, 0.015], [(6.0 + tx1) * 0.5, 0.0, -0.015], "dirt")
-    for sy in (1.0, -1.0):  # tray side strips keep the lane walls' footing level
+    sbox(b, [(6.0 - rx1) * 0.5, 1.5, 0.015], [(6.0 + rx1) * 0.5, 0.0, -0.015], "dirt")
+    for sy in (1.0, -1.0):  # recess side strips keep the lane walls' footing level
         cy = sy * (ty + 1.5) * 0.5
-        sbox(b, [(tx1 - tx0) * 0.5, (1.5 - ty) * 0.5, 0.015], [(tx0 + tx1) * 0.5, cy, -0.015], "dirt")
-    # dirt shoulder ramps: the tray rim reads as ground, not a planter box.
+        sbox(b, [(rx1 - tx0) * 0.5, (1.5 - ty) * 0.5, 0.015], [(tx0 + rx1) * 0.5, cy, -0.015], "dirt")
+    # dirt shoulder ramps: the recess rim reads as ground, not a planter box.
     sbox(b, [0.05, ty, 0.006], [tx0 + 0.03, 0.0, -0.013], "dirt", quat=yrot(12))
-    sbox(b, [0.05, ty, 0.006], [tx1 - 0.03, 0.0, -0.013], "dirt", quat=yrot(-12))
-    sbox(b, [(tx1 - tx0) * 0.5, 0.05, 0.006], [(tx0 + tx1) * 0.5, ty + 0.01, -0.013], "dirt", quat=xrot(10))
-    sbox(b, [(tx1 - tx0) * 0.5, 0.05, 0.006], [(tx0 + tx1) * 0.5, -ty - 0.01, -0.013], "dirt", quat=xrot(-10))
+    sbox(b, [0.05, ty, 0.006], [rx1 - 0.03, 0.0, -0.013], "dirt", quat=yrot(-12))
+    sbox(b, [(rx1 - tx0) * 0.5, 0.05, 0.006], [(tx0 + rx1) * 0.5, ty + 0.01, -0.013], "dirt", quat=xrot(10))
+    sbox(b, [(rx1 - tx0) * 0.5, 0.05, 0.006], [(tx0 + rx1) * 0.5, -ty - 0.01, -0.013], "dirt", quat=xrot(-10))
 
     # -- Zone A: platform + two descending risers + stringers + door -----------
     sbox(b, [0.35, 0.45, 0.05], [-0.25, 0.0, PLATFORM_TOP * 0.5], "wood_planks")
@@ -183,149 +242,98 @@ def build(args):
         sbox(b, [0.04, 0.04, 0.275], [DOOR_X, sy * 0.38, 0.275], "wood_planks")
     sbox(b, [0.04, 0.45, (lz1 - lz0) * 0.5], [DOOR_X, 0.0, (lz0 + lz1) * 0.5],
          "wood_planks", friction=1.2)  # lintel: high friction holds the drape
+    for sy in (1.0, -1.0):  # metal post hinges (specular hardware, clear of the drape)
+        sbox(b, [0.05, 0.015, 0.03], [DOOR_X, sy * 0.34, 0.30], "metal")
 
-    # -- Zone B: the probe pebble half-buried on the walk line -----------------
+    # -- Zone B: probe pebble half-buried in the gravel + rounded cobbles on the
+    # gravel->debris transition (rigid stones bedding into the MPM medium) ------
     px, py, pr = PROBE_PEBBLE
     if not args.no_pebble:
         b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[pr],
                               pos=[px, py, tz + pr], mass=0.05, friction=0.9,
                               material="stone")
-    # rigid cobbles thinning toward Zone C plus the dense micro-object cluster.
-    # ONE rejection sampler + ONE placed list spaces every free body so it beds
-    # down isolated (a clustered pile of gram-scale parts never fully quiesces).
-    cx0, cx1, cy = ZONE_C
-    rng = random.Random(7)
-    placed = [(px, py, pr)]
-
-    def free_spot(extent, x0, x1, y0, y1, margin=0.013, tries=110):
-        for _ in range(tries):
-            x, y = rng.uniform(x0, x1), rng.uniform(y0, y1)
-            if all((x - qx) ** 2 + (y - qy) ** 2 > (extent + qe + margin) ** 2
-                   for qx, qy, qe in placed):
-                placed.append((x, y, extent))
-                return x, y
-        return None, None
-
-    for _ in range(10):  # sparse rounded stone cobbles on the D02->D03 transition
-        r = rng.uniform(0.009, 0.014)
-        x, y = free_spot(r, 2.32, 2.42, -0.25, 0.25)
-        if x is None:
-            continue
-        b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, y, r],
+    for i in range(8):  # sparse rounded cobbles thinning toward Zone C
+        r = 0.010 + 0.0006 * i
+        x = 2.30 + 0.016 * i
+        yy = 0.16 * math.sin(2.3 * i)
+        b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, yy, tz + r],
                               mass=0.04, friction=0.9, material="stone")
 
-    for _ in range(int(args.rocks)):
-        kind = rng.random()
-        if kind < 0.40:      # pebble: a rounded stone; the analytic sphere-vs-floor
-                             # contact beds cleaner than a small box manifold
-            r = rng.uniform(0.010, 0.016)
-            x, y = free_spot(r, cx0, cx1, -cy, cy)
-            if x is None:
-                continue
-            b.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[r], pos=[x, y, r],
-                                  mass=0.03, friction=0.9, material="stone")
-        elif kind < 0.65:    # bolt/screw: a faceted metal prism (real hardware is
-                             # faceted, not a smooth cylinder) resting on a face
-            hl = rng.uniform(0.011, 0.015)
-            hw = 0.005
-            x, y = free_spot(math.hypot(hl, hw), cx0, cx1, -cy, cy)
-            if x is None:
-                continue
-            # Spun about +z it stays flat on a face -> a clean face contact.
-            a = rng.uniform(0.0, math.pi)
-            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[hl, hw, hw],
-                                  pos=[x, y, hw],
-                                  quat=[math.cos(a * 0.5), 0.0, 0.0, math.sin(a * 0.5)],
-                                  mass=0.028, friction=0.8, material="metal")
-        elif kind < 0.85:    # washer: a flat metal square (thick enough to bed flat)
-            e = rng.uniform(0.008, 0.012)
-            x, y = free_spot(e * 1.42, cx0, cx1, -cy, cy)
-            if x is None:
-                continue
-            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, 0.003],
-                                  pos=[x, y, 0.003], mass=0.016, friction=0.8,
-                                  material="metal")
-        else:                # nut: a small squat metal block
-            e = rng.uniform(0.006, 0.008)
-            x, y = free_spot(e * 1.42, cx0, cx1, -cy, cy)
-            if x is None:
-                continue
-            b.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[e, e, e * 0.75],
-                                  pos=[x, y, e * 0.75], mass=0.02, friction=0.8,
-                                  material="metal")
-
-    # -- Zone D: portal frame + rope chain + V-yoke + stone slab ----------------
+    # -- Zone D: portal frame (the cord + slab are added with the media below) --
     for sy in (1.0, -1.0):
         sbox(b, [0.04, 0.04, 0.415], [BEAM_X, sy * 0.50, 0.415], "wood_planks")
     sbox(b, [0.05, 0.55, 0.04], [BEAM_X, 0.0, BEAM_Z], "wood_planks")
-    write_rope_usda(ROPE_USDA, n_links=ROPE_LINKS, seg=ROPE_SEG, radius=0.008,
-                    link_mass=0.02, yoke=(SLAB_HALF[1], 0.046, 0.03),
-                    slab=(*SLAB_HALF, 0.6))
-    rope = nuka.SceneBuilder.create(ROPE_USDA)
-    b.compose(rope, pos=[BEAM_X, 0.0, BEAM_Z], attach_at="rope")
-    rope.destroy()
 
-    # -- dressing: walls / studs / crates / barrel / tool board -----------------
-    # The camera side (-y) is left open (the classic open fourth wall); the far
-    # (+y) plank wall + studs + a low back wall carry the workshop backdrop.
+    # -- dressing: enclose so no framing sees dirt-to-horizon. A distant -y scrim +
+    # taller -x/+x ends sit behind the camera lane; +y keeps its low wall + back-drop.
     wz = [-0.03, WALL_TOP]
     wh, wc = (wz[1] - wz[0]) * 0.5, (wz[0] + wz[1]) * 0.5
     sbox(b, [(4.6 + 0.3) * 0.5, 0.03, wh], [(4.6 - 0.3) * 0.5, WALL_Y + 0.03, wc], "wood_planks")
-    sbox(b, [0.03, 0.61, wh], [-0.66, 0.32, wc], "wood_planks")
     for sx in (-0.15, 0.75, 1.65, 2.55, 3.45, 4.35):
         sbox(b, [0.04, 0.04, 0.245], [sx, WALL_Y - 0.04, 0.215], "wood_planks")
+    bh, bcz = (BACKDROP_TOP + 0.03) * 0.5, (BACKDROP_TOP - 0.03) * 0.5
+    sbox(b, [(FAR_WALL_X + 0.3) * 0.5, 0.03, bh], [(FAR_WALL_X - 0.3) * 0.5, BACKDROP_Y, bcz], "wood_planks")
+    # distant -y back wall + taller/wider -x and +x ends: cap the open-side sky from
+    # behind the lane (SCRIM_Y is well past every camera, so nothing clips the near field).
+    sh, scz = (SCRIM_TOP + 0.03) * 0.5, (SCRIM_TOP - 0.03) * 0.5
+    ey = (0.9 - SCRIM_Y) * 0.5, (0.9 + SCRIM_Y) * 0.5
+    sbox(b, [(SCRIM_X[1] - SCRIM_X[0]) * 0.5, 0.04, sh], [(SCRIM_X[0] + SCRIM_X[1]) * 0.5, SCRIM_Y, scz], "wood_planks")
+    sbox(b, [0.03, ey[0], sh], [FAR_WALL_X, ey[1], scz], "wood_planks")   # +x end
+    sbox(b, [0.03, ey[0], sh], [-0.68, ey[1], scz], "wood_planks")        # -x end
+    for (cx, cs) in [(-0.4, 0.16), (2.1, 0.19), (4.3, 0.17)]:  # distant -y silhouettes for depth
+        sbox(b, [cs, cs, cs], [cx, SCRIM_Y + 0.24, cs], "crate")
+    for rx in (0.5, 1.7, 2.9, 4.1):  # overhead rafters break the open sky
+        sbox(b, [0.04, 0.62, 0.04], [rx, 0.03, 0.80], "wood_planks")
+    # midground clutter off the walk line (all on the +y side, behind the action).
     for (cx, cy2, s) in [(0.62, 0.44, 0.10), (1.30, 0.46, 0.08),
-                         (2.40, 0.45, 0.12), (4.35, 0.42, 0.13)]:
+                         (2.40, 0.45, 0.12), (4.35, 0.42, 0.13),
+                         (0.15, 0.45, 0.09), (3.30, 0.45, 0.10)]:
         sbox(b, [s, s, s], [cx, cy2, s], "crate")
-    b.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[0.06, 0.075],
-                          pos=[4.05, -0.42, 0.135], static=True, material="crate")
-    sbox(b, [0.25, 0.008, 0.13], [2.55, WALL_Y - 0.012, 0.30], "board")
+    sbox(b, [0.08, 0.08, 0.05], [3.30, 0.45, 0.25], "crate")  # a stacked crate
+    for (sx, sz) in [(4.30, 0.14), (4.30, 0.30)]:  # a far-corner shelf (two boards)
+        sbox(b, [0.22, 0.02, 0.01], [sx, 0.47, sz], "board")
+    for (bx, by) in [(4.05, -0.42), (1.90, 0.47)]:  # barrels
+        b.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[0.06, 0.075],
+                              pos=[bx, by, 0.135], static=True, material="crate")
+    sbox(b, [0.25, 0.008, 0.13], [2.55, WALL_Y - 0.012, 0.30], "board")  # tool board
 
-    # -- media (both records live in the .nks; ONE MpmXpbd cook) ----------------
+    # -- media (all records live in the .nks; ONE MpmXpbd cook) -----------------
     if not args.no_cloth:
         add_cloth(b, mat_ids["fabric"])
     if not args.no_gravel:
-        add_granular(b, mat_ids["gravel"], spacing=args.gravel_spacing)
+        add_granular(b, mat_ids, spacing=args.gravel_spacing)
+    add_cable(b, mat_ids)
 
-    # Opt into the beauty look levers: env-miss fill at the HDRI intensity (fills the
-    # crushed shadows), slight exposure tame + filmic grade, and a crisp sky sun disc.
+    # Beauty look levers: env-miss fill at the HDRI intensity, tamed exposure +
+    # filmic grade, a softer sky sun disc, and Cook-Torrance specular env reflection.
     b.set_environment(hdri=f"{TEX}/hdri/sky_2k.hdr", yaw_deg=-35.0, intensity=1.3,
                       use_scene_materials=True, ibl_full_fill=True,
-                      exposure_ev=-0.3, grade=0.35, sun_disc=0.8)
+                      exposure_ev=0.0, grade=0.25, sun_disc=0.6, specular_env=True)
     b.save(args.out)
     b.destroy()
     post_process(args.out)
-    print(f"[oneshot] wrote {args.out} ({args.rocks} micro objects; media: "
-          f"cloth={not args.no_cloth} gravel={not args.no_gravel})")
+    print(f"[oneshot] wrote {args.out} (media: cloth={not args.no_cloth} "
+          f"gravel+debris={not args.no_gravel} cable=True)")
 
 
 def post_process(out):
-    """Declarative touches on the saved .nks: duck spawn on the platform, no
-    heightfield (the dirt floor boxes ARE the ground), and a render skin for the
-    composed rope (importer collision capsules ship no material)."""
+    """Declarative touches on the saved .nks: spawn the duck on the platform, drop
+    the heightfield (the dirt boxes ARE the ground), and lift the whole scene above
+    the render's z=0 studio disc (a uniform, physics-invariant z shift)."""
     doc = json.load(open(out))
     doc["terrain"] = []
-    mats = list(doc["render_materials"].keys())
-    cord, stone = mats.index("rope_cord"), mats.index("stone")
 
     def walk(node):
         if isinstance(node, list):
             for c in node:
                 walk(c)
             return
-        name = node.get("name", "")
-        if name == "base" and "rigid_body" in node:
+        if node.get("name") == "base" and "rigid_body" in node:
             node["transform"]["pos"] = list(SPAWN)
-        if name.startswith("rope"):
-            cs = node.get("collision_shape")
-            if cs is not None:
-                cs["material_id"] = stone if cs.get("type") == "box" else cord
         for c in node.get("children", []):
             walk(c)
 
     walk(doc["tree"])
-    # lift the whole scene above the render's z=0 studio-floor disc so the dirt
-    # floor renders instead of Z-fighting it (a uniform, physics-invariant shift).
     for node in doc["tree"]:
         tr = node.get("transform")
         if tr and len(tr.get("pos", [])) == 3:
@@ -337,13 +345,18 @@ def post_process(out):
             m["fluid_box"]["min"][2] += SCENE_LIFT
             m["fluid_box"]["max"][2] += SCENE_LIFT
             m["mpm"]["floor_d"] += SCENE_LIFT
+            for fl in m.get("mpm_fills", []):
+                fl["box"]["min"][2] += SCENE_LIFT
+                fl["box"]["max"][2] += SCENE_LIFT
+        elif m["kind"] == "cable":
+            m["cable_line"]["start"][2] += SCENE_LIFT
+            m["cable_line"]["end"][2] += SCENE_LIFT
     with open(out, "w") as f:
         json.dump(doc, f)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rocks", type=int, default=45)
     ap.add_argument("--gravel-spacing", type=float, default=GRAVEL_SPACING)
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--no-cloth", action="store_true")

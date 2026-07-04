@@ -93,6 +93,7 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
         case NUKA_MEDIA_SOFT_TET: m.kind = Kind::SoftTet; break;
         case NUKA_MEDIA_FLUID:    m.kind = Kind::Fluid; break;
         case NUKA_MEDIA_GRANULAR: m.kind = Kind::Granular; break;
+        case NUKA_MEDIA_CABLE:    m.kind = Kind::Cable; break;
         default: return false;
     }
     switch (d.method) {
@@ -121,6 +122,22 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
     m.fluid_box.min = nmath::Vec3{d.fluid_min[0], d.fluid_min[1], d.fluid_min[2]};
     m.fluid_box.max = nmath::Vec3{d.fluid_max[0], d.fluid_max[1], d.fluid_max[2]};
     m.fluid_box.spacing = d.fluid_spacing;
+    m.fluid_box.position_jitter = d.fluid_position_jitter;
+    m.cable_line.start = nmath::Vec3{d.cable_start[0], d.cable_start[1], d.cable_start[2]};
+    m.cable_line.end = nmath::Vec3{d.cable_end[0], d.cable_end[1], d.cable_end[2]};
+    m.cable_line.segments = d.cable_segments;
+    m.cable_line.radius = d.cable_radius;
+    if (d.cable_pin >
+        static_cast<uint32_t>(nscene::MediaRecord::CableLine::Pin::None)) {
+        return false;
+    }
+    m.cable_line.pin = static_cast<nscene::MediaRecord::CableLine::Pin>(d.cable_pin);
+    m.cable_line.bend = (d.cable_bend != 0u);
+    m.cable_line.slab.half_extents = nmath::Vec3{d.cable_slab_half_extents[0],
+        d.cable_slab_half_extents[1], d.cable_slab_half_extents[2]};
+    m.cable_line.slab.mass = d.cable_slab_mass;
+    m.cable_line.slab.stiffness = d.cable_slab_stiffness;
+    m.cable_line.slab.render_material_id = d.cable_slab_render_material_id;
     // Constitutive material (one block read per method).
     m.xpbd.particle_mass = d.xpbd_particle_mass;
     m.xpbd.friction = d.xpbd_friction;
@@ -158,10 +175,14 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
                                      d.mpm_floor_normal[2]};
     m.mpm.floor_d = d.mpm_floor_d;
     m.mpm.floor_friction = d.mpm_floor_friction;
+    m.mpm.loft_headroom = d.mpm_loft_headroom;
     // Render skin.
     m.render_skin.normal_offset = d.skin_normal_offset;
     m.render_skin.smooth_iters = d.skin_smooth_iters;
     m.render_skin.smooth_lambda = d.skin_smooth_lambda;
+    m.render_skin.grain_round = d.skin_grain_round;
+    m.render_skin.grain_radius_jitter = d.skin_grain_radius_jitter;
+    m.render_skin.grain_tint_jitter = d.skin_grain_tint_jitter;
     m.render_material_id = d.render_material_id;
     *out = std::move(m);
     return true;
@@ -347,6 +368,7 @@ nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
         rec.exposure_ev = desc->exposure_ev;
         rec.grade = desc->grade;
         rec.sun_disc = desc->sun_disc;
+        rec.specular_env = desc->specular_env != 0u;
         sr->scene->EnvironmentMut() = std::move(rec);
         return NUKA_RESULT_OK;
     } catch (...) {
@@ -355,7 +377,8 @@ nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
 }
 
 nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
-                                   const nuka_media_desc_t* desc) {
+                                   const nuka_media_desc_t* desc,
+                                   uint32_t* out_media_id) {
     if (desc == nullptr) return NUKA_RESULT_INVALID_ARG;
     SceneRecord* sr = SceneTable().Get(scene);
     if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
@@ -368,13 +391,54 @@ nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
         // (a single-record list; the cross-medium MPM+XPBD/PBF mix is caught at cook).
         cook::ValidateMedia(std::vector<nscene::MediaRecord>{media});
         media.name = "media_" + std::to_string(sr->scene->MediaCount());
-        sr->scene->AddMedia(std::move(media));
+        const nscene::MediaId id = sr->scene->AddMedia(std::move(media));
+        if (out_media_id != nullptr) *out_media_id = id;
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception&) {
         // ValidateMedia throws on an illegal pair -> a caller error (LOUD).
         return NUKA_RESULT_INVALID_ARG;
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id,
+                                      const nuka_mpm_fill_desc_t* desc) {
+    if (desc == nullptr) return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount()) return NUKA_RESULT_INVALID_ARG;
+    try {
+        nscene::MediaRecord& rec = sr->scene->GetMediaMut(media_id);
+        // Fills append only to a box MLS-MPM medium (fluid / granular).
+        const bool box_mpm =
+            rec.method == nscene::MediaRecord::Method::MlsMpm &&
+            (rec.kind == nscene::MediaRecord::Kind::Fluid ||
+             rec.kind == nscene::MediaRecord::Kind::Granular);
+        if (!box_mpm) return NUKA_RESULT_INVALID_ARG;
+        nscene::MediaRecord::MpmFill fl;
+        fl.box.min = nmath::Vec3{desc->min[0], desc->min[1], desc->min[2]};
+        fl.box.max = nmath::Vec3{desc->max[0], desc->max[1], desc->max[2]};
+        fl.box.spacing = desc->spacing;
+        fl.box.position_jitter = desc->position_jitter;
+        fl.material.youngs = desc->youngs;
+        fl.material.poisson = desc->poisson;
+        fl.material.density = desc->density;
+        fl.material.dp_friction = desc->dp_friction;
+        fl.material.dp_cohesion = desc->dp_cohesion;
+        fl.material.model_kind = desc->model_kind;
+        fl.material.bulk_modulus = desc->bulk_modulus;
+        fl.material.tait_gamma = desc->tait_gamma;
+        fl.material.viscosity = desc->viscosity;
+        fl.render_material_id = desc->render_material_id;
+        rec.mpm_fills.push_back(std::move(fl));
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
@@ -406,8 +470,14 @@ nuka_result_t nuka_world_create_from_built_scene(
         // CookToModel (CookSceneMedia is a no-op on empty media). The handle keeps
         // ownership; the cook consumes a copy.
         nscene::SceneIR built = *sr->scene;
+        // Opt-in per-link visual-mesh SDF bake (a foot then engages the MPM grid BC);
+        // default off keeps every existing built-scene cook byte-identical.
+        cook::CookToModelOptions cook_opts;
+        if (options != nullptr && options->bake_link_sdf != 0u) {
+            cook_opts.bake_link_sdf = true;
+        }
         cook::CookToModelResult cooked = cook::CookSceneToModel(
-            built, static_cast<int>(desc->env_count), cook::CookToModelOptions{});
+            built, static_cast<int>(desc->env_count), cook_opts);
 
         // The SHARED post-cook step (drive_mode + optional heightfield + gravity).
         nuka::terrain::HeightField cooked_terrain;

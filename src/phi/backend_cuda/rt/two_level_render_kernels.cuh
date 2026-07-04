@@ -75,6 +75,10 @@ struct DevBlas {
     const Vec3* sph_center = nullptr;
     const float* sph_radius = nullptr;
 
+    // Per-sphere albedo tint multiplier (beauty grain scatter), parallel to the
+    // sphere prims. nullptr => untinted (byte-identical default).
+    const Vec3* sph_color = nullptr;
+
     const runtime::sdf::SparseSdfDevice* sdf_hdr = nullptr;
     const collision::AABB* sdf_aabb = nullptr;
     const float* sdf_eps = nullptr;
@@ -240,6 +244,10 @@ struct BeautyParams {
     uint32_t env_width = 0u, env_height = 0u;
     float env_yaw = 0.0f;        // rotation about world +Z (radians)
     float env_intensity = 1.0f;
+
+    // 1 => opaque beauty arm shades Cook-Torrance (chromatic F0 + Smith G) + a roughness
+    // env reflection ray. 0 (default; sensor/golden never set it) => achromatic D-only.
+    uint32_t specular_env = 0u;
 };
 
 // AOV destination pointers for ONE frame (raw device pointers). null skips that
@@ -1024,12 +1032,36 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
     const float alpha = fmaxf(1.0e-3f, mat.roughness * mat.roughness);
     const float a2 = alpha * alpha;
     const float dterm = NoH * NoH * (a2 - 1.0f) + 1.0f;
-    const float spec = (a2 / (RtMathPi() * dterm * dterm)) * (0.04f + mat.metallic);
 
     const float kd = (1.0f - mat.metallic) * (1.0f / RtMathPi());
-    Vec3 direct{light_col.x * (mat.albedo.x * kd + spec) * NoL * vis,
-                light_col.y * (mat.albedo.y * kd + spec) * NoL * vis,
-                light_col.z * (mat.albedo.z * kd + spec) * NoL * vis};
+    Vec3 direct;
+    if (sky.specular_env == 0u) {
+        // Achromatic D-only highlight -- the sensor/golden byte-identical arm.
+        const float spec = (a2 / (RtMathPi() * dterm * dterm)) * (0.04f + mat.metallic);
+        direct = Vec3{light_col.x * (mat.albedo.x * kd + spec) * NoL * vis,
+                      light_col.y * (mat.albedo.y * kd + spec) * NoL * vis,
+                      light_col.z * (mat.albedo.z * kd + spec) * NoL * vis};
+    } else {
+        // Cook-Torrance: GGX D * height-correlated Smith V * chromatic Fresnel-Schlick
+        // (F0 = lerp(0.04, albedo, metallic)) on top of the metallic-scaled Lambert.
+        const float NoV = fmaxf(1.0e-4f, Nf.x * V.x + Nf.y * V.y + Nf.z * V.z);
+        const float VoH = fmaxf(0.0f, V.x * H.x + V.y * H.y + V.z * H.z);
+        const float D = a2 / (RtMathPi() * dterm * dterm);
+        const float ggxv = NoL * sqrtf(NoV * NoV * (1.0f - a2) + a2);
+        const float ggxl = NoV * sqrtf(NoL * NoL * (1.0f - a2) + a2);
+        const float Vis = 0.5f / fmaxf(1.0e-6f, ggxv + ggxl);
+        const float m = 1.0f - VoH;
+        const float fpow = (m * m) * (m * m) * m;  // (1 - VoH)^5
+        const float dv = D * Vis;
+        const Vec3 f0{0.04f + (mat.albedo.x - 0.04f) * mat.metallic,
+                      0.04f + (mat.albedo.y - 0.04f) * mat.metallic,
+                      0.04f + (mat.albedo.z - 0.04f) * mat.metallic};
+        const Vec3 F{f0.x + (1.0f - f0.x) * fpow, f0.y + (1.0f - f0.y) * fpow,
+                     f0.z + (1.0f - f0.z) * fpow};
+        direct = Vec3{light_col.x * (mat.albedo.x * kd + dv * F.x) * NoL * vis,
+                      light_col.y * (mat.albedo.y * kd + dv * F.y) * NoL * vis,
+                      light_col.z * (mat.albedo.z * kd + dv * F.z) * NoL * vis};
+    }
 
     // Silk/satin sheen: a sun-lit grazing-angle Fresnel lobe (tinted toward the base
     // hue) for fold luster. Gated off at sheen==0 so non-sheen materials are byte-exact.
@@ -1091,9 +1123,38 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
     indirect.x *= inv_m; indirect.y *= inv_m; indirect.z *= inv_m;
 
     // Indirect modulates the surface albedo (Lambert response to ambient/bounce).
-    return Vec3{direct.x + mat.albedo.x * indirect.x,
-                direct.y + mat.albedo.y * indirect.y,
-                direct.z + mat.albedo.z * indirect.z};
+    if (sky.specular_env == 0u) {
+        return Vec3{direct.x + mat.albedo.x * indirect.x,
+                    direct.y + mat.albedo.y * indirect.y,
+                    direct.z + mat.albedo.z * indirect.z};
+    }
+    // Beauty specular env: one roughness-jittered mirror ray weighted by grazing
+    // Fresnel; metals drop the diffuse indirect (km) so they read as metal, not plastic.
+    const float rNoV = fmaxf(1.0e-4f, Nf.x * V.x + Nf.y * V.y + Nf.z * V.z);
+    const float rm = 1.0f - rNoV;
+    const float rpow = (rm * rm) * (rm * rm) * rm;  // (1 - NoV)^5
+    const Vec3 rf0{0.04f + (mat.albedo.x - 0.04f) * mat.metallic,
+                   0.04f + (mat.albedo.y - 0.04f) * mat.metallic,
+                   0.04f + (mat.albedo.z - 0.04f) * mat.metallic};
+    const Vec3 Fr{rf0.x + (1.0f - rf0.x) * rpow, rf0.y + (1.0f - rf0.y) * rpow,
+                  rf0.z + (1.0f - rf0.z) * rpow};
+    const Vec3 rbase = RtNormalize<float>(Reflect(Vec3{-V.x, -V.y, -V.z}, Nf));
+    const float refl_ang = fminf(0.6f, alpha);  // roughness^2 -> glossy cone half-angle
+    Vec3 rdir = SampleCone(rbase, refl_ang, rng->NextF(), rng->NextF());
+    if (rdir.x * Nf.x + rdir.y * Nf.y + rdir.z * Nf.z <= 0.0f) rdir = rbase;
+    Vec3 renv = TraceEnv(tlas_nodes, tlas_leaf_count, instances, materials, light,
+                         sky, sorigin, rdir, textures);
+    // Firefly clamp: a jittered reflection ray can hit the HDR sun; cap it by
+    // luminance so one hot sample can't speckle, keeping the reflection hue/look.
+    const float rlum = 0.2126f * renv.x + 0.7152f * renv.y + 0.0722f * renv.z;
+    if (rlum > 16.0f) {
+        const float rs = 16.0f / rlum;
+        renv.x *= rs; renv.y *= rs; renv.z *= rs;
+    }
+    const float km = 1.0f - mat.metallic;
+    return Vec3{direct.x + mat.albedo.x * indirect.x * km + Fr.x * renv.x,
+                direct.y + mat.albedo.y * indirect.y * km + Fr.y * renv.y,
+                direct.z + mat.albedo.z * indirect.z * km + Fr.z * renv.z};
 }
 
 // Filmic ACES-ish tonemap of one linear channel (Narkowicz 2015 fit), clamped to

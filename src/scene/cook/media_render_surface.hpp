@@ -31,6 +31,12 @@ struct MediaRenderSurface {
     float    particle_radius = 0.0f;
     uint32_t particle_first = 0u;
     uint32_t particle_count = 0u;
+
+    // Grain look for the instanced-sphere skin: analytic spheres vs octahedra, plus
+    // deterministic per-grain radius/albedo scatter (all 0/false => uniform octahedra).
+    uint32_t grain_round = 0u;
+    float    grain_radius_jitter = 0.0f;
+    float    grain_tint_jitter = 0.0f;
 };
 
 }  // namespace nuka::scene::cook
