@@ -922,41 +922,13 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 }
             }
 
-            // Per-body VISUAL-mesh SDF: a primitive-authored body with a baked
-            // silhouette SDF gets its collision row switched to kShapeSdfMesh +
-            // sdf_grid bound, so rigid tier-select AND the particle switch route to
-            // the SDF. params[0] becomes the grid's bound radius (max |corner| in
-            // the body frame) so the broadphase AABB covers the true silhouette,
-            // not the inset primitive (else cloth within the SDF gets culled).
+            // Bind each visual-mesh silhouette SDF to the collidable's sdf_grid (lane 7:
+            // MLS-MPM grid BC + particle query); the rigid kind/params stay the primitive.
             for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
                 if (b >= sdf.body_sdf_indices.size()) break;
                 const uint32_t gi = sdf.body_sdf_indices[b];
                 if (gi == kNoSdf || b >= model.shape_table_rows.size()) continue;
-                nk::Model::PairDrivenShape& row = model.shape_table_rows[b];
-                row.sdf_grid = gi;
-                row.kind = static_cast<uint8_t>(
-                    ::nuka::collision::kShapeSdfMesh);
-                const nk::Model::SdfGrid& g = model.sdf_grids[gi];
-                float max_sq = 0.0f;
-                const float ex = static_cast<float>(g.dims[0]) * g.voxel_size;
-                const float ey = static_cast<float>(g.dims[1]) * g.voxel_size;
-                const float ez = static_cast<float>(g.dims[2]) * g.voxel_size;
-                for (int corner = 0; corner < 8; ++corner) {
-                    const math::Vec3 c{
-                        g.origin.x + ((corner & 1) ? ex : 0.0f),
-                        g.origin.y + ((corner & 2) ? ey : 0.0f),
-                        g.origin.z + ((corner & 4) ? ez : 0.0f)};
-                    max_sq = std::max(max_sq, c.LengthSq());
-                }
-                row.params[0] = std::sqrt(max_sq);
-                // params[1..3]: per-axis origin-symmetric grid bound, so the
-                // broadphase AABB is a rotated box, not a bound-radius cube.
-                row.params[1] = std::max(std::fabs(g.origin.x),
-                                         std::fabs(g.origin.x + ex));
-                row.params[2] = std::max(std::fabs(g.origin.y),
-                                         std::fabs(g.origin.y + ey));
-                row.params[3] = std::max(std::fabs(g.origin.z),
-                                         std::fabs(g.origin.z + ez));
+                model.shape_table_rows[b].sdf_grid = gi;
                 // Populate the orphaned ModelShape.sdf_index for this body's rows.
                 for (nk::ModelShape& msh : model.shapes)
                     if (msh.body_row == b) msh.sdf_index = gi;
