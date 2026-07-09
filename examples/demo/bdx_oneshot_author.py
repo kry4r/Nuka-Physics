@@ -69,7 +69,7 @@ BED_JITTER = 0.5                    # de-lattice the gravel so it never reads as
 LOFT_HEADROOM = 1.0                 # +z grid ceiling (m) so kicked debris has room.
 ZONE_C = (2.47, 3.03, 0.18)         # x0, x1, half-y for the MPM debris fill.
 DEBRIS_DZ = (0.006, 0.062)          # ~2 grain layers so the surface stacks above the floor.
-DEBRIS_SPACING = 0.026              # fine debris grains: small render radius, less half-sink.
+DEBRIS_SPACING = 0.018              # fine debris grains: small render radius, less half-sink.
 DEBRIS_JITTER = 0.5
 BEAM_X, BEAM_Z = 3.75, 0.79         # portal frame plane and beam centre height.
 CABLE_ANCHOR_Z = 0.745             # pinned bead just under the beam bottom face.
@@ -117,8 +117,8 @@ def add_materials(b):
                                 metallic=0.92, roughness=0.26)
     m["slab_stone"] = b.add_material("slab_stone", base_color=[0.26, 0.24, 0.22],
                                      metallic=0.25, roughness=0.45)
-    m["debris"] = b.add_material("debris", base_color=[0.30, 0.29, 0.27],
-                                 metallic=0.15, roughness=0.7)
+    m["debris"] = b.add_material("debris", base_color=[0.22, 0.21, 0.19],
+                                 metallic=0.8, roughness=0.6)
     m["cord"] = b.add_material("rope_cord", base_color=[0.24, 0.17, 0.11],
                                roughness=0.85)
     m["crate"] = b.add_material("crate", base_color=[0.50, 0.36, 0.22],

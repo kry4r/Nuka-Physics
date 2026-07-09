@@ -69,12 +69,18 @@ class Driver:
         self._root_zero = np.zeros(6, np.float32)
 
     def _set_servo_gains(self):
-        # sts3215 position servo the walk policy drove: kp 13.37, kd 0, force +-3.23 N.m.
+        # sts3215 position servo the walk policy drove: kp 13.37, kd 0, force +-3.23.
+        # A soft servo lags the fast distance-locked replay target and the stride
+        # collapses; env overrides stiffen it so the recorded gait tracks crisply.
+        kp_v = float(os.environ.get("BDX_REPLAY_KP", "13.37"))
+        kd_v = float(os.environ.get("BDX_REPLAY_KD", "0.0"))
+        fl_v = float(os.environ.get("BDX_REPLAY_FORCE", "3.23"))
         blc = self.stand.size
-        kp = np.zeros(blc, np.float32); kp[1:] = 13.37
-        fl = np.zeros(blc, np.float32); fl[1:] = 3.23
+        kp = np.zeros(blc, np.float32); kp[1:] = kp_v
+        kd = np.zeros(blc, np.float32); kd[1:] = kd_v
+        fl = np.zeros(blc, np.float32); fl[1:] = fl_v
         self.w.upload_field(nuka.Field.DRIVE_STIFFNESS, kp)
-        self.w.upload_field(nuka.Field.DRIVE_DAMPING, np.zeros(blc, np.float32))
+        self.w.upload_field(nuka.Field.DRIVE_DAMPING, kd)
         self.w.upload_field(nuka.Field.DRIVE_FORCE_LIMIT, fl)
 
     def _apply_cycle(self):
