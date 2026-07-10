@@ -400,12 +400,17 @@ __global__ void NarrowphaseBodyParticleKernel(
     const uint32_t pi = gid - env * pp.particles_per_env;  // env-local particle
     const uint32_t N = pp.bodies_per_env;
 
-    // Reserved contact-slot sub-range for THIS particle: a fixed (non-atomic)
-    // function of the particle index, so the body<->particle slot stream is bit-D1
-    // by construction and lands in a deterministic sub-range relative to the rigid
-    // slots [0, pair_count). Initialize all reserved slots to inactive first. The
-    // sub-range is fixed per particle -> lane 0 writing it is byte-identical.
-    const uint32_t slot0 = pp.particle_slot_base + pi * pp.cands_per_particle;
+    // MpmXpbd: the MPM slice [0, particle_row_base) couples via the grid, not rows,
+    // and owns NO reserved slots (the cook exempts it from the budget). Uniform per
+    // warp (all lanes share pi). 0 for every other mode -> no particle is skipped.
+    if (pi < pp.particle_row_base) return;
+
+    // Reserved contact-slot sub-range for THIS row-making particle: a fixed
+    // (non-atomic) function of its rank above particle_row_base, so the slot stream
+    // is bit-D1 by construction and lands in a deterministic sub-range relative to
+    // the rigid slots [0, pair_count). Initialize all reserved slots to inactive.
+    const uint32_t slot0 = pp.particle_slot_base +
+                           (pi - pp.particle_row_base) * pp.cands_per_particle;
     if (lane == 0u) {
         for (uint32_t k = 0u; k < pp.cands_per_particle; ++k) {
             const uint32_t slot = slot0 + k;
@@ -423,10 +428,6 @@ __global__ void NarrowphaseBodyParticleKernel(
         }
     }
     if (N == 0u) return;  // uniform per-warp.
-    // MpmXpbd: the MPM slice [0, particle_row_base) couples via the grid, not rows.
-    // Its reserved slots are zeroed inactive above; it emits no manifold. Uniform per
-    // warp (all lanes share pi). 0 for every other mode -> no particle is skipped.
-    if (pi < pp.particle_row_base) return;
 
     const uint32_t global_particle = env * pp.particles_per_env + pi;
     // The fluid slice [n_soft, P) under PBF/SoftFluid reads the predicted position

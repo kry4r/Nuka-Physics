@@ -52,13 +52,21 @@ public:
         uint32_t fold_drive_damping = 1;      // CRBA folds dt*C -> (M+dt*C)^-1
     };
 
+    // Demand mask for pure-readout ops: a readout writes an output field no other
+    // op consumes, so it is emitted only when a consumer requested that field.
+    enum ReadoutDemand : uint32_t {
+        kReadoutContactWrench = 1u << 0,  // ContactForce + LinkContactWrench
+    };
+
     // `device` (optional) enables the ggml-style capability query (§3.1
     // supports_op): an op the backend has no implementation for is NOT emitted
     // (M3b: the M5 broadphase + NarrowphaseSdf and M6 particle ops). This keeps
     // Step() all-Ok and the CUDA-graph plan capturable while later milestones
     // light the ops up — the op order itself stays the §3.2 fixed order.
+    // `readout_demand` ORs ReadoutDemand bits (World turns them on when a
+    // consumer first requests the corresponding output field).
     void Build(const Model& model, const SolverConfig& cfg,
-               phi::Device* device = nullptr);
+               phi::Device* device = nullptr, uint32_t readout_demand = 0u);
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }
     size_t Size() const { return calls_.size(); }

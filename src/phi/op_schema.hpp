@@ -495,8 +495,9 @@ struct NarrowphaseHeightfieldParams {
 // pattern: insertion-sorted, capped at max_candidates, N<2 direct-scan fallback),
 // and for each candidate body runs the sphere-vs-shape manifold (the particle is a
 // SPHERE of its radius on the ONE path). The manifold is written into the
-// particle's RESERVED contact-slot sub-range [slot_base + pi*cands_per_particle,
-// ...+cands_per_particle) so the body<->particle slots occupy a DETERMINISTIC
+// particle's RESERVED contact-slot sub-range [slot_base +
+// (pi - particle_row_base)*cands_per_particle, ...+cands_per_particle) so the
+// body<->particle slots occupy a DETERMINISTIC
 // sub-range relative to the racy rigid-rigid slots within each env block; the
 // per-particle base is a fixed (non-atomic) function of the particle index, so the
 // stream is bit-D1 by construction (no sort). Side A == the particle (global id +
@@ -520,8 +521,8 @@ struct NarrowphaseBodyParticleParams {
     uint32_t fluid_pos_source;    // 1 == fluid slice reads pbf_predicted_pos
     uint32_t n_soft_particles;    // per-env soft/fluid split (fluid is [n_soft, P))
     // MpmXpbd: the first env-local particle that generates body rows. The MPM slice
-    // [0, particle_row_base) couples via the grid, NOT rows, so its reserved slots
-    // are zeroed (inactive) and it emits no manifold. 0 for every other mode.
+    // [0, particle_row_base) couples via the grid, NOT rows; it owns no reserved
+    // slots (the cook exempts it from the budget). 0 for every other mode.
     uint32_t particle_row_base;
     // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
     // cooperatively); 0 == one thread per particle (analytic-only collider worlds,

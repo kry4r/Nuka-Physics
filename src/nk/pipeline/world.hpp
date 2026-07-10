@@ -99,6 +99,8 @@ public:
     phi::Status DispatchOp(phi::NkOp op, const void* params);
 
     // Device pointer of a field (model- or data-owned); null if absent/unbuilt.
+    // Requesting a readout-produced field (LinkContactWrench / ContactForce)
+    // turns the producing op on: pipeline rebuilt, plan recaptured next step.
     void* FieldPtr(FieldId id) const;
     template <class T> T* FieldPtr(FieldId id) const { return static_cast<T*>(FieldPtr(id)); }
 
@@ -123,9 +125,16 @@ private:
     // device snapshot the Reset path restores. Called once from the ctor.
     bool SeedInitialState();
 
+    // First external request for a readout output: emit the producing op from
+    // now on (rebuild pipeline, drop the plan) + backfill it from the last solve.
+    void DemandReadout(FieldId id);
+
     Model           model_;
     Data            data_;
     Pipeline        pipeline_;
+    Pipeline::SolverConfig cfg_{};
+    phi::Device*    device_ = nullptr;
+    uint32_t        readout_demand_ = 0;
     phi::Backend*   backend_ = nullptr;
     phi::ModelView  model_view_{};
     phi::DataView   data_view_{};
