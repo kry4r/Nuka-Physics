@@ -267,10 +267,15 @@ TEST(CouplingProviderOpList, RigidOnlyEmitsNoCouplingOps) {
 
 // The row provider's emission points: NarrowphaseBodyParticle between Sdf and the
 // tangent basis; ParticleFinalize then ParticleParticleContact after IntegratePos.
+// ReadoutContactWrench is demand-gated: absent by default, last when demanded.
 TEST(CouplingProviderOpList, RowProviderEmitsAtCanonicalPositions) {
     nk::Model m = BuildSoftFluid();
+    nk::Pipeline p0;
+    p0.Build(m, Cfg(), nullptr);
+    EXPECT_EQ(IndexOf(OpSequence(p0), nphi::NkOp::ReadoutContactWrench), -1)
+        << "undemanded readout must not be emitted";
     nk::Pipeline p;
-    p.Build(m, Cfg(), nullptr);
+    p.Build(m, Cfg(), nullptr, nk::Pipeline::kReadoutContactWrench);
     const std::vector<nphi::NkOp> seq = OpSequence(p);
 
     const int sdf = IndexOf(seq, nphi::NkOp::NarrowphaseSdf);

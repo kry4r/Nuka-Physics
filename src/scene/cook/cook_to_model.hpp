@@ -101,7 +101,10 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 // particles_per_env == 0 (the reserve is then 0). The c_abi terrain cook recomputes
 // the rigid base after appending terrain collidables and re-applies this so a world
 // with BOTH terrain and particles keeps the rigid + particle slot ranges disjoint.
-void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base);
+// `row_exempt` = per-env particles that never emit body rows (the grid-coupled MPM
+// slice under MpmXpbd); they reserve no slots.
+void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
+                                   uint32_t row_exempt = 0u);
 
 // ---------------------------------------------------------------------------
 // particle cook (the design "粒子 XPBD/PBF"). Stage an XPBD soft body or a

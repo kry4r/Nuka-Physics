@@ -13,7 +13,7 @@ namespace nuka::nk {
 
 World::World(Model model, uint32_t env_count, phi::Device* device,
              phi::Backend* backend, const Pipeline::SolverConfig& cfg)
-    : model_(std::move(model)), backend_(backend) {
+    : model_(std::move(model)), cfg_(cfg), device_(device), backend_(backend) {
     if (device == nullptr || backend == nullptr) {
         return;
     }
@@ -67,7 +67,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
 
     // 3. Build the per-step pipeline (OpCall list, §3.2 order; the device's
     // supports_op capability query drops not-yet-implemented ops).
-    pipeline_.Build(model_, cfg, device);
+    pipeline_.Build(model_, cfg_, device, readout_demand_);
 
     ready_ = true;
 
@@ -512,10 +512,37 @@ phi::Status World::DispatchOp(phi::NkOp op, const void* params) {
     return phi::BackendDispatch(backend_, model_view_, data_view_, call);
 }
 
+void World::DemandReadout(FieldId id) {
+    uint32_t bit = 0u;
+    if (id == FieldId::LinkContactWrench || id == FieldId::ContactForce) {
+        bit = Pipeline::kReadoutContactWrench;
+    }
+    if (bit == 0u || (readout_demand_ & bit) != 0u) {
+        return;
+    }
+    readout_demand_ |= bit;
+    pipeline_.Build(model_, cfg_, device_, readout_demand_);
+    // The op set changed: drop the captured plan so StepPlanned re-captures.
+    if (plan_ != nullptr && backend_ != nullptr) {
+        phi::BackendPlanFree(backend_, plan_);
+        plan_ = nullptr;
+    }
+    // Backfill from the last solved rows (pure readout over unchanged inputs =>
+    // the same bytes a step-time emission would have produced).
+    for (const phi::OpCall& call : pipeline_.Calls()) {
+        if (call.op == phi::NkOp::ReadoutContactWrench) {
+            phi::BackendDispatch(backend_, model_view_, data_view_, call);
+            break;
+        }
+    }
+}
+
 void* World::FieldPtr(FieldId id) const {
     if (!ready_) {
         return nullptr;
     }
+    // Readout outputs are produced on demand: the first request turns the op on.
+    const_cast<World*>(this)->DemandReadout(id);
     const FieldLayout& lay = LayoutOf(id);
     if (lay.owner == FieldOwner::Model) {
         // Resolve from the model device buffer via its segment table.
