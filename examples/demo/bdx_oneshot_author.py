@@ -32,6 +32,7 @@ Run (repo root): python examples/demo/bdx_oneshot_author.py
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -43,6 +44,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 TEX = os.path.join(REPO, "examples", "assets", "textures")
 BDX = os.path.join(REPO, "examples", "scenes", "bdx_stand.nks")
 OUT = os.path.join(REPO, "examples", "scenes", "bdx_oneshot.nks")
+TRAINING_COARSE_OUT = os.path.join(
+    REPO, "examples", "scenes", "bdx_oneshot_training_coarse.nks")
 
 HEAD = ("base/trunk_assembly/neck_pitch_assembly/head_pitch_to_yaw/"
         "neck_yaw_assembly/head_assembly")
@@ -63,7 +66,7 @@ CLOTH_ORIGIN = [0.24, 0.0, 0.572]  # grid CENTER over the lintel (the cook cente
 TROUGH = (0.95, 2.25, 0.35, -0.03)  # gravel fill x0, x1, half-y, floor z.
 RECESS_X1 = 3.05                    # flush dirt recess spans [x0, RECESS_X1]: the debris
                                     # shares the ONE MLS-MPM floor and reads on-ground.
-GRAVEL_SPACING = 0.009
+GRAVEL_SPACING = 0.013
 PROBE_PEBBLE = (1.60, 0.06, 0.02)   # x, y, radius -- half-buried on the walk line.
 BED_JITTER = 0.5                    # de-lattice the gravel so it never reads as a waffle.
 LOFT_HEADROOM = 1.0                 # +z grid ceiling (m) so kicked debris has room.
@@ -82,6 +85,41 @@ FAR_WALL_X = 4.72                   # far-end wall closing the +x horizon.
 SCRIM_Y = -1.7                      # distant back wall well behind the -y camera lane.
 SCRIM_TOP = 1.1                     # distant enclosure height that caps the open-side sky.
 SCRIM_X = (-1.5, 5.7)              # -y back wall x-span, past both corridor ends.
+
+
+@dataclasses.dataclass(frozen=True)
+class GranularProfile:
+    gravel_spacing: float
+    debris_spacing: float
+    substeps: int
+    loft_headroom: float
+
+    @property
+    def dx(self):
+        return max(2.0 * self.gravel_spacing, 0.02)
+
+
+_GRANULAR_PROFILES = {
+    "fine": GranularProfile(
+        gravel_spacing=GRAVEL_SPACING,
+        debris_spacing=DEBRIS_SPACING,
+        substeps=14,
+        loft_headroom=LOFT_HEADROOM,
+    ),
+    "training-coarse": GranularProfile(
+        gravel_spacing=0.026,
+        debris_spacing=0.026,
+        substeps=7,
+        loft_headroom=0.15,
+    ),
+}
+
+
+def granular_profile(name):
+    try:
+        return _GRANULAR_PROFILES[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown granular profile: {name}") from exc
 
 
 def tex(name, **kw):
@@ -142,7 +180,7 @@ def add_cloth(b, fabric_id):
                 render_material_id=fabric_id)
 
 
-def add_granular(b, mats, spacing=GRAVEL_SPACING):
+def add_granular(b, mats, profile):
     """The Zone B gravel bed (base MLS-MPM Drucker-Prager fill) plus the Zone C
     light debris as a heterogeneous sub-fill on the SAME grid. The base material
     owns the shared grid scalars (dx / substeps / floor / loft headroom); the fill
@@ -150,13 +188,14 @@ def add_granular(b, mats, spacing=GRAVEL_SPACING):
     tx0, tx1, ty, tz = TROUGH
     bed = morphs.GranularBed(min=(tx0 + 0.02, -ty + 0.02, tz + 0.002),
                              max=(tx1 - 0.02, ty - 0.02, 0.004),
-                             spacing=spacing, position_jitter=BED_JITTER)
+                             spacing=profile.gravel_spacing,
+                             position_jitter=BED_JITTER)
     base_mat = materials.Granular.MPM(youngs=3.0e5, poisson=0.3, density=1600.0,
                                       friction_angle=34.0, cohesion=0.0,
-                                      dx=max(2.0 * spacing, 0.02), substeps=14,
+                                      dx=profile.dx, substeps=profile.substeps,
                                       floor_normal=(0.0, 0.0, 1.0), floor_d=tz,
                                       floor_friction=0.7,
-                                      loft_headroom=LOFT_HEADROOM)
+                                      loft_headroom=profile.loft_headroom)
     grains = surfaces.Grains(round=True, radius_jitter=0.25, tint_jitter=0.15)
     kw = bed.media_geometry_kwargs()
     kw.update(base_mat.media_material_kwargs())
@@ -170,7 +209,7 @@ def add_granular(b, mats, spacing=GRAVEL_SPACING):
     debris_mat = materials.Granular.MPM(youngs=1.5e5, poisson=0.3, density=600.0,
                                         friction_angle=22.0, cohesion=0.0)
     fill = morphs.MpmFill(min=(cx0, -cy, tz + dz0), max=(cx1, cy, tz + dz1),
-                          spacing=DEBRIS_SPACING, material=debris_mat,
+                          spacing=profile.debris_spacing, material=debris_mat,
                           position_jitter=DEBRIS_JITTER)
     fkw = fill.fill_geometry_kwargs()
     fkw.update(debris_mat.fill_kwargs())
@@ -202,6 +241,10 @@ def sbox(b, half, pos, mat, quat=None, friction=0.9):
 
 
 def build(args):
+    profile = granular_profile(getattr(args, "profile", "fine"))
+    spacing_override = getattr(args, "gravel_spacing", None)
+    if spacing_override is not None:
+        profile = dataclasses.replace(profile, gravel_spacing=spacing_override)
     b = nuka.SceneBuilder.create(BDX)
     mat_ids = add_materials(b)
 
@@ -301,7 +344,7 @@ def build(args):
     if not args.no_cloth:
         add_cloth(b, mat_ids["fabric"])
     if not args.no_gravel:
-        add_granular(b, mat_ids, spacing=args.gravel_spacing)
+        add_granular(b, mat_ids, profile)
     add_cable(b, mat_ids)
 
     # Beauty look levers: env-miss fill at the HDRI intensity, tamed exposure +
@@ -312,8 +355,9 @@ def build(args):
     b.save(args.out)
     b.destroy()
     post_process(args.out)
-    print(f"[oneshot] wrote {args.out} (media: cloth={not args.no_cloth} "
-          f"gravel+debris={not args.no_gravel} cable=True)")
+    print(f"[oneshot] wrote {args.out} (profile={getattr(args, 'profile', 'fine')} "
+          f"media: cloth={not args.no_cloth} gravel+debris={not args.no_gravel} "
+          "cable=True)")
 
 
 def post_process(out):
@@ -357,12 +401,15 @@ def post_process(out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gravel-spacing", type=float, default=GRAVEL_SPACING)
-    ap.add_argument("--out", default=OUT)
+    ap.add_argument("--profile", choices=sorted(_GRANULAR_PROFILES), default="fine")
+    ap.add_argument("--gravel-spacing", type=float)
+    ap.add_argument("--out")
     ap.add_argument("--no-cloth", action="store_true")
     ap.add_argument("--no-gravel", action="store_true")
     ap.add_argument("--no-pebble", action="store_true")
     args = ap.parse_args()
+    if args.out is None:
+        args.out = TRAINING_COARSE_OUT if args.profile == "training-coarse" else OUT
     build(args)
 
 
