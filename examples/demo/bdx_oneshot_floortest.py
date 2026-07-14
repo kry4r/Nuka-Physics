@@ -5,11 +5,14 @@ Stands with a bigger pair budget -> the 77-body broadphase starved the foot
 contacts. Still falls -> the co-resident cook drops articulation x rigid contact."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import nuka
 from nuka.tasks import bdx_obs as B
 
-CORRIDOR = "/data/xtzhang25/_work/activate/agent-a79c434fcb3e6c705/examples/scenes/bdx_oneshot.nks"
+REPO = Path(__file__).resolve().parents[2]
+CORRIDOR = str(REPO / "examples" / "scenes" / "bdx_oneshot.nks")
 
 
 def drop_test(tag, steps=90, decim=5, **buildkw):

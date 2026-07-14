@@ -164,3 +164,18 @@ skipped, zero failures.  The elastic, fluid and granular MPM gates, dynamic vs
 static island byte-identity, cloth FNV and the Go2 owner canary all retained
 their frozen values.  `solver_arena_profile` is a reusable whole-pipeline
 executable and is not registered as a unit test.
+
+### Main-worktree consolidation verification
+
+After all feature worktrees were merged into `windows-editor`, the scene was
+re-authored from `/root/Nuka-Physics` and rebuilt in the independent
+`/data/xtzhang25/_work/activate/build-main-consolidated` tree.  A fresh formal
+performance run (20 warmup, 10 samples × 10 steps, physical GPU1) measured
+13.69 / 26.82 / 69.58 ms per step at N=1/64/256.  The N=256 process used about
+4.73 GiB of CUDA memory by the probe's delta metric.  The 600-step coarse-media
+pipeline retained zero NaN, zero grid escape and zero lane escape.
+
+The same fresh build reproduced all three eight-step SHA-256 values above,
+cloth FNV `777503423208024307`, Go2 owner value `0.923080623`, and the granular
+cone/footprint/cohesion values.  The full scenario pipeline again reported
+102 passed / one asset-gated skip / zero failures.

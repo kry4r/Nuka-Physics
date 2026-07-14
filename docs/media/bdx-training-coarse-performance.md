@@ -46,22 +46,27 @@ authored `top_z=0.500`；向上取整后的最后网格节点为 z=0.540。600-s
 的局部颗粒/足印细节无法与电影 fine scene 等价。训练保留相同床体 AABB、
 Drucker-Prager 材料、地面与刚体耦合语义；视觉电影必须继续选择 fine scene。
 
-## Fine scene 不变证明
+## Fine scene 与主干重授权证明
 
-实现前后哈希均为：
+2026-07-14 收敛 worktree 后，fine/coarse 场景均从 `/root/Nuka-Physics`
+重新 author。`.nks` 内贴图绝对路径因此从旧 worktree 根改为主干根，文件哈希会
+合理变化；几何 `.nka` 与 granular profile 保持不变。当前主干哈希为：
 
 | 文件 | SHA-256 |
 |---|---|
-| `bdx_oneshot.nks` | `a3bf4ee2740d7c3ffd6d63438e4a915a8cf2abdb58948cd6c84e39dd55e03d63` |
+| `bdx_oneshot.nks` | `fde9bfd530b6e81cf767bdab3dc940a67e6a2f1730519471ae6020657254449c` |
 | `bdx_oneshot.nka` | `5d7a271add6b798be3df83f0b67682ba738f58524cb129ba2812315b10906812` |
+| `bdx_oneshot_training_coarse.nks` | `9ed3995f54395e14a1b24dd3da5b184ea3ea1b397c216eb7d8f082d45d96ec00` |
+| `bdx_oneshot_training_coarse.nka` | `5d7a271add6b798be3df83f0b67682ba738f58524cb129ba2812315b10906812` |
 
-`bdx_oneshot_profile_test.py` 每次运行固定检查这两个哈希和 fine profile 参数。
-coarse `.nka` 与 fine `.nka` 也具有相同 SHA-256；它复用相同电影几何资产，
-差异位于独立 `.nks` 的 granular authoring 参数。最终验证还运行：
+coarse `.nka` 与 fine `.nka` 具有相同 SHA-256；它复用相同电影几何资产，
+差异仅位于独立 `.nks` 的 granular authoring 参数。验证使用可重复服用的
+author → load → build → 600-step stability/performance pipeline，不保留 host-only
+单元测试。主干派生的 `bdx_oneshot_{rt,nomedia}` 与 `corridor_nomedia` 也各自配有
+同 basename `.nka`，五个入口均通过 `SceneBuilder.create`。
 
-```bash
-git diff --exit-code 6ea559d -- examples/scenes/bdx_oneshot.nks examples/scenes/bdx_oneshot.nka
-```
+主干重新 author 后，8-step 物理状态三 SHA 仍逐位等于冻结值，证明路径迁移没有
+改变求解结果。
 
 ## 稳定性
 
