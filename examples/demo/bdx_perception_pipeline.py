@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Reusable structured-observation gate for the BDX depth policy.
+
+This is a pipeline/scenario check, not a unit test.  It creates the real cooked
+corridor, mounts the real head camera, exercises its lower-rate frame cadence,
+builds the rl_games fusion network, and proves that the zero visual residual starts
+from the supplied blind actor exactly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+
+import torch
+import torch.nn.functional as F
+
+from nuka.rl_games.bdx_perception_network import BdxDepthFusionNetwork
+from nuka.tasks import bdx_obs as B
+from nuka.tasks.bdx_perception import CORRIDOR_SCENE, make_env
+
+
+def _checkpoint_actor(checkpoint: str, obs: torch.Tensor) -> torch.Tensor:
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)["model"]
+    plain = {
+        (key[len("_orig_mod."):] if key.startswith("_orig_mod.") else key): value
+        for key, value in state.items()
+    }
+    dev = obs.device
+    x = torch.clamp(
+        (obs.float() - plain["running_mean_std.running_mean"].to(dev).float())
+        / torch.sqrt(
+            plain["running_mean_std.running_var"].to(dev).float() + 1.0e-5),
+        -5.0,
+        5.0,
+    )
+    for index in (0, 2, 4):
+        x = F.elu(F.linear(
+            x,
+            plain[f"a2c_network.actor_mlp.{index}.weight"].to(dev),
+            plain[f"a2c_network.actor_mlp.{index}.bias"].to(dev),
+        ))
+    return F.linear(
+        x,
+        plain["a2c_network.mu.weight"].to(dev),
+        plain["a2c_network.mu.bias"].to(dev),
+    )
+
+
+def run(args) -> dict:
+    started = time.perf_counter()
+    env = make_env(
+        args.envs,
+        scene=args.scene,
+        seed=args.seed,
+        fixed_command=True,
+        command=(0.15, 0.0, 0.0),
+        push_enable=False,
+        sensor={
+            "width": args.width,
+            "height": args.height,
+            "update_period": args.update_period,
+        },
+    )
+    try:
+        obs, _ = env.reset(seed=args.seed)
+        shapes = {key: list(value.shape) for key, value in obs.items()}
+        dtypes = {key: str(value.dtype) for key, value in obs.items()}
+        expected = {
+            "proprio": [args.envs, B.BDX_OBS_DIM],
+            "depth": [args.envs, 1, args.height, args.width],
+            "depth_age": [args.envs, 1],
+        }
+        if shapes != expected:
+            raise RuntimeError(f"observation shapes {shapes} != {expected}")
+        if obs["depth"].dtype != torch.float16:
+            raise RuntimeError(f"depth rollout dtype is {obs['depth'].dtype}, not fp16")
+        if not bool(torch.isfinite(obs["depth"]).all()):
+            raise RuntimeError("normalized depth contains non-finite values")
+        if float(obs["depth"].min()) < 0.0 or float(obs["depth"].max()) > 1.0:
+            raise RuntimeError("normalized depth escaped [0,1]")
+
+        input_shape = {
+            "proprio": (B.BDX_OBS_DIM,),
+            "depth": (1, args.height, args.width),
+            "depth_age": (1,),
+        }
+        network = BdxDepthFusionNetwork(
+            {
+                "depth_latent_dim": args.latent_dim,
+                "proprio_units": [512, 256, 128],
+                "bootstrap_checkpoint": args.checkpoint,
+            },
+            actions_num=B.BDX_ACTION_DIM,
+            input_shape=input_shape,
+            value_size=1,
+            num_seqs=args.envs,
+        ).to(env._dev).eval()
+        with torch.no_grad():
+            mu, logstd, value, _ = network({"obs": obs})
+            blind_mu = _checkpoint_actor(args.checkpoint, obs["proprio"])
+        parity = float((mu - blind_mu).abs().max())
+        if parity != 0.0:
+            raise RuntimeError(
+                f"zero visual residual changed the blind actor (max |delta|={parity})")
+
+        ages = [float(obs["depth_age"][0, 0])]
+        rewards = []
+        actions = mu.clamp(-1.0, 1.0)
+        for _ in range(args.steps):
+            obs, reward, terminated, truncated, _ = env.step(actions)
+            ages.append(float(obs["depth_age"][0, 0]))
+            rewards.append(float(reward.mean()))
+            with torch.no_grad():
+                actions = network({"obs": obs})[0].clamp(-1.0, 1.0)
+            if bool((terminated | truncated).any()):
+                # A reset forces a fresh frame; the env's stale-frame invariant is
+                # checked by the zero age below.
+                if float(obs["depth_age"].max()) != 0.0:
+                    raise RuntimeError("an autoreset observation retained a stale frame")
+
+        control_dt = env.dt * env.decimation
+        expected_ages = [
+            (step % args.update_period) * control_dt
+            for step in range(args.steps + 1)
+        ]
+        age_error = max(abs(a - b) for a, b in zip(ages, expected_ages))
+        if age_error > 1.0e-6:
+            raise RuntimeError(
+                f"camera age cadence {ages} != expected {expected_ages}")
+
+        depth_bytes = (
+            args.horizon * args.envs * args.width * args.height * 2)
+        result = {
+            "scene": args.scene,
+            "envs": args.envs,
+            "observation_shapes": shapes,
+            "observation_dtypes": dtypes,
+            "policy_encoding": {
+                "depth_pixels": args.width * args.height,
+                "depth_latent": args.latent_dim,
+                "proprio": B.BDX_OBS_DIM,
+                "frame_age": 1,
+                "fused_input": args.latent_dim + B.BDX_OBS_DIM + 1,
+            },
+            "rollout_depth_mib": depth_bytes / (1024.0 * 1024.0),
+            "blind_bootstrap_max_abs": parity,
+            "frame_ages_s": ages,
+            "frame_age_max_error": age_error,
+            "depth_min": float(obs["depth"].min()),
+            "depth_max": float(obs["depth"].max()),
+            "mu_shape": list(mu.shape),
+            "logstd_shape": list(logstd.shape),
+            "value_shape": list(value.shape),
+            "mean_rewards": rewards,
+            "elapsed_s": time.perf_counter() - started,
+        }
+        return result
+    finally:
+        env.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scene", default=CORRIDOR_SCENE)
+    parser.add_argument(
+        "--checkpoint",
+        default=("/data/xtzhang25/_work/activate/out/bdx_walk_v9/nn/"
+                 "last_bdx_walk_v9_ep_2000_rew_447.30893.pth"),
+    )
+    parser.add_argument("--envs", type=int, default=8)
+    parser.add_argument("--width", type=int, default=128)
+    parser.add_argument("--height", type=int, default=96)
+    parser.add_argument("--update-period", type=int, default=2)
+    parser.add_argument("--latent-dim", type=int, default=96)
+    parser.add_argument("--horizon", type=int, default=24)
+    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=11)
+    args = parser.parse_args()
+    if min(args.envs, args.width, args.height, args.update_period,
+           args.latent_dim, args.horizon, args.steps) <= 0:
+        parser.error("all numeric arguments must be positive")
+    print(json.dumps(run(args), sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -141,6 +141,8 @@ class BdxWalkEnv:
                  push_enable: bool = False,
                  push_interval_range=(5.0, 10.0), push_magnitude_range=(0.1, 1.0),
                  terrain: "dict | None" = None,
+                 use_scene_builder: bool = False,
+                 scene_build_kwargs: "dict | None" = None,
                  **_ignored) -> None:
         self.num_envs = int(num_envs)
         self.decimation = int(decimation)
@@ -179,8 +181,21 @@ class BdxWalkEnv:
                 self._device, terrain_scene, self.num_envs, self.dt,
                 **geom["sampler_kwargs"])
         else:
-            self._world = nuka.World.create_from_scene(
-                self._device, scene, self.num_envs, self.dt)
+            if use_scene_builder:
+                # The general built-scene entry supports the complete rigid+media
+                # one-shot scene.  It is opt-in so the established flat/terrain
+                # training entry remains byte-identical.
+                builder = nuka.SceneBuilder.create(scene)
+                try:
+                    build_kw = dict(scene_build_kwargs or {})
+                    self._world = builder.build(
+                        self._device, env_count=self.num_envs, dt=self.dt,
+                        control_mode=0, **build_kw)
+                finally:
+                    builder.destroy()
+            else:
+                self._world = nuka.World.create_from_scene(
+                    self._device, scene, self.num_envs, self.dt)
         if int(self._world.action_dim) != len(B.LEG_JOINTS) + len(B.HEAD_JOINTS):
             raise RuntimeError(
                 f"BdxWalkEnv expects a 14-DOF duck; got action_dim={self._world.action_dim}")

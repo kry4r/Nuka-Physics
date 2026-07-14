@@ -14,6 +14,14 @@ Usage::
 
 from __future__ import annotations
 
+from rl_games.algos_torch import model_builder
+
+from .bdx_perception_network import BdxDepthFusionBuilder
 from .vecenv import NukaVecEnv, register
 
-__all__ = ["NukaVecEnv", "register"]
+# rl_games resolves custom networks through this process-global registry.  Keep
+# registration beside the env registration so one ``import nuka.rl_games`` wires
+# the complete structured-observation pipeline.
+model_builder.register_network("bdx_depth_fusion", BdxDepthFusionBuilder)
+
+__all__ = ["NukaVecEnv", "BdxDepthFusionBuilder", "register"]
