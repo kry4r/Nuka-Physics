@@ -57,6 +57,7 @@ def run(args) -> dict:
         fixed_command=True,
         command=(0.15, 0.0, 0.0),
         push_enable=False,
+        spawn_x_range=(args.spawn_x_low, args.spawn_x_high),
         sensor={
             "width": args.width,
             "height": args.height,
@@ -65,6 +66,11 @@ def run(args) -> dict:
     )
     try:
         obs, _ = env.reset(seed=args.seed)
+        spawn_x = env._obs.base_pos()[:, 0].detach().clone()
+        if (float(spawn_x.min()) < args.spawn_x_low
+                or float(spawn_x.max()) > args.spawn_x_high):
+            raise RuntimeError(
+                f"spawn x escaped [{args.spawn_x_low},{args.spawn_x_high}]")
         shapes = {key: list(value.shape) for key, value in obs.items()}
         dtypes = {key: str(value.dtype) for key, value in obs.items()}
         expected = {
@@ -80,6 +86,13 @@ def run(args) -> dict:
             raise RuntimeError("normalized depth contains non-finite values")
         if float(obs["depth"].min()) < 0.0 or float(obs["depth"].max()) > 1.0:
             raise RuntimeError("normalized depth escaped [0,1]")
+        cross_env_depth_delta = 0.0
+        if args.envs > 1:
+            cross_env_depth_delta = float(
+                (obs["depth"][0] - obs["depth"][1]).abs().max())
+            if float((spawn_x[0] - spawn_x[1]).abs()) > 1.0e-5 \
+                    and cross_env_depth_delta == 0.0:
+                raise RuntimeError("different reset poses produced identical depth")
 
         input_shape = {
             "proprio": (B.BDX_OBS_DIM,),
@@ -148,8 +161,11 @@ def run(args) -> dict:
             "blind_bootstrap_max_abs": parity,
             "frame_ages_s": ages,
             "frame_age_max_error": age_error,
+            "spawn_x_min": float(spawn_x.min()),
+            "spawn_x_max": float(spawn_x.max()),
             "depth_min": float(obs["depth"].min()),
             "depth_max": float(obs["depth"].max()),
+            "cross_env_depth_max_abs": cross_env_depth_delta,
             "mu_shape": list(mu.shape),
             "logstd_shape": list(logstd.shape),
             "value_shape": list(value.shape),
@@ -177,10 +193,14 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=24)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--spawn-x-low", type=float, default=-0.32)
+    parser.add_argument("--spawn-x-high", type=float, default=-0.12)
     args = parser.parse_args()
     if min(args.envs, args.width, args.height, args.update_period,
            args.latent_dim, args.horizon, args.steps) <= 0:
         parser.error("all numeric arguments must be positive")
+    if not args.spawn_x_low < args.spawn_x_high:
+        parser.error("--spawn-x-low must be smaller than --spawn-x-high")
     print(json.dumps(run(args), sort_keys=True), flush=True)
 
 
