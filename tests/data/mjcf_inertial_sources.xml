@@ -1,0 +1,12 @@
+<mujoco model="mjcf_inertial_sources">
+  <worldbody>
+    <body name="empty_wrapper">
+      <body name="explicit_inertial">
+        <inertial pos="0.01 0.02 0.03" mass="2.5" diaginertia="0.1 0.2 0.3"/>
+      </body>
+      <body name="geom_only">
+        <geom type="box" size="0.1 0.2 0.3" density="500"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

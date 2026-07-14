@@ -561,6 +561,10 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     scene::RigidBodyRecord rec;
     rec.name = body_name;
     rec.parent_id = parent_id;
+    // Missing <inertial> stays massless until geom-derived inertia is supported;
+    // never leak the SceneIR construction placeholder into imported physics.
+    rec.mass = 0.0f;
+    rec.inertia = math::Vec3::Zero();
     if (const char* pos_attr = body_elem->Attribute("pos")) {
         rec.local_transform.position = ParseVec3(pos_attr);
     }
