@@ -70,6 +70,10 @@ params:
       termination_tilt_deg: 60.0
       command: [0.15, 0.0, 0.0]
       fixed_command: true
+      # Vary distance-to-edge so a fixed gait phase/timer cannot solve the drop.
+      # The whole rigid corridor is unchanged; only the reset base x moves on the
+      # broad raised start platform.
+      spawn_x_range: [-0.32, -0.12]
       push_enable: false
       sigma_lin: 0.01
       sigma_ang: 0.01

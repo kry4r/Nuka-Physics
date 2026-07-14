@@ -65,6 +65,7 @@ class BdxPerceptionEnv(BdxWalkEnv):
     def __init__(self, scene: str = CORRIDOR_SCENE, num_envs: int = 256, *,
                  sensor: "dict | None" = None, **kwargs) -> None:
         cfg = dict(sensor or {})
+        spawn_x_range = kwargs.pop("spawn_x_range", None)
         self.depth_width = int(cfg.get("width", 128))
         self.depth_height = int(cfg.get("height", 96))
         self.depth_update_period = int(cfg.get("update_period", 2))
@@ -95,6 +96,14 @@ class BdxPerceptionEnv(BdxWalkEnv):
         kwargs.setdefault("use_scene_builder", True)
         kwargs.setdefault("scene_build_kwargs", {"bake_link_sdf": True})
         super().__init__(scene, num_envs, **kwargs)
+
+        self.spawn_x_range = (
+            None if spawn_x_range is None
+            else tuple(float(v) for v in spawn_x_range))
+        if self.spawn_x_range is not None:
+            if (len(self.spawn_x_range) != 2
+                    or not self.spawn_x_range[0] < self.spawn_x_range[1]):
+                raise ValueError("spawn_x_range must be [low, high] with low < high")
 
         matches = self._world.dof_index(self.mount_joint_pattern)
         if len(matches) != 1:
@@ -163,6 +172,33 @@ class BdxPerceptionEnv(BdxWalkEnv):
             flush=True,
         )
 
+    def _randomize_spawn_x(self, mask: "torch.Tensor | None") -> None:
+        """Translate the articulation on the start platform, environment unchanged.
+
+        Moving only the reset pose varies time-to-edge without authoring a second
+        corridor or changing collision geometry.  LinkPose is translated alongside
+        BasePose so the head camera's first post-reset frame is immediately coherent;
+        the next physics step recomputes the same FK from the new base state.
+        """
+        if self.spawn_x_range is None:
+            return
+        if mask is None:
+            mask = torch.ones(
+                self.num_envs, dtype=torch.bool, device=self._dev)
+        count = int(mask.sum().item())
+        if count == 0:
+            return
+        lo, hi = self.spawn_x_range
+        target = (
+            torch.rand(count, generator=self._generator, device=self._dev)
+            * (hi - lo) + lo)
+        base_pose = self._obs._base_pose
+        link_pose = self._obs._pose
+        delta = target - base_pose[mask, 0]
+        base_pose[mask, 0] = target
+        link_pose[mask, :, 0] += delta.unsqueeze(1)
+        nuka.sync()
+
     def _structured_obs(self, proprio: torch.Tensor, *, force: bool = False):
         update = force or (self._sensor_tick % self.depth_update_period == 0)
         if update:
@@ -203,6 +239,11 @@ class BdxPerceptionEnv(BdxWalkEnv):
 
     def reset(self, *, seed=None, options=None):
         proprio, info = super().reset(seed=seed, options=options)
+        self._randomize_spawn_x(None)
+        if self.spawn_x_range is not None:
+            proprio = self._obs.compute_obs(
+                self.command, self.last_action,
+                self._ref.phase_features(self.phase_i))
         self._sensor_tick = 0
         return self._structured_obs(proprio, force=True), info
 
@@ -210,7 +251,15 @@ class BdxPerceptionEnv(BdxWalkEnv):
         proprio, reward, terminated, truncated, info = super().step(actions)
         self._sensor_tick += 1
         # A reset env must not inherit the previous episode's last camera frame.
-        force = bool((terminated | truncated).any())
+        done = terminated | truncated
+        force = bool(done.any())
+        if force and self.spawn_x_range is not None:
+            self._randomize_spawn_x(done)
+            fresh = self._obs.compute_obs(
+                self.command, self.last_action,
+                self._ref.phase_features(self.phase_i))
+            proprio = proprio.clone()
+            proprio[done] = fresh[done]
         obs = self._structured_obs(proprio, force=force)
         return obs, reward, terminated, truncated, info
 
