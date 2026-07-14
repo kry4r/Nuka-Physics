@@ -93,8 +93,8 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
     return false;
 }
 
-// Capture the transitional diffsim/noise host mirror from the SAME cook the
-// legacy create used (CookArticulations -> BuildArticulationHostState over the
+// Capture the transitional diffsim/noise host mirror from the SAME SceneIR the
+// live model consumed (CookArticulations -> BuildArticulationHostState over the
 // FIRST articulation, single-env). This reproduces topo.masses/inertias/
 // inertial_frames + joint_armature + link_inertia BYTE-IDENTICALLY, so
 // BuildMassParams (diffsim) / ResolveLinkInertiaParams (DR + set_link_mass) /
@@ -102,7 +102,20 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
 // live device inertia is the nk arena's LinkInertia field; set_link_mass / DR
 // write THAT in place (world.cpp does not own a legacy ArticulationDeviceBuffers).
 void CaptureArticulationHostMirror(const scene::SceneIR& scene, WorldRecord* record) {
-    const scene::CookedBlob blob = scene::CookScene(scene);
+    // The mirror consumes ONLY body/joint/inertial tables. Running the legacy
+    // one-argument CookScene here used to re-run V-HACD and bake a sparse SDF for
+    // every convex piece even though neither product reaches the mirror. On the
+    // BDX corridor that dead second cook materialized 893 unique SDFs / 1.149 GB
+    // of transient host storage after the live PairDriven model had correctly
+    // opted out of piece SDFs. Use the same general stage gates as the live cook:
+    // they change only collision-geometry products, never the body/joint tables
+    // BuildArticulationHostState reads. Link-visual SDFs are likewise unnecessary
+    // here; the live model already owns the opt-in copy used by MPM coupling.
+    scene::CookSceneOptions mirror_options;
+    mirror_options.bake_sdf = false;
+    mirror_options.general_single_hull = true;
+    mirror_options.bake_link_sdf = false;
+    const scene::CookedBlob blob = scene::CookScene(scene, mirror_options);
     const std::vector<articulation::ArticulationCookedTopology> arts =
         articulation::CookArticulations(blob);
     if (arts.empty()) {
