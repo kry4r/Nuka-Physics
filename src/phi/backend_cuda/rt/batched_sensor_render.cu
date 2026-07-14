@@ -207,6 +207,7 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                          uint32_t height,
                                          FidelityParams fid,
                                          BeautyParams sky,
+                                         uint32_t aov_mask,
                                          float* __restrict__ out_color,
                                          float* __restrict__ out_depth,
                                          float* __restrict__ out_normal,
@@ -225,13 +226,6 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
 
     const PinholeCamera camera = cameras[cam];
     const Ray ray = camera.GenerateRay(px, py);
-
-    // Per-env appearance: light/ambient by env, materials env-offset by env*M.
-    // DR off -> these tables are base replicas, so the bytes match the env-shared
-    // look exactly (ONE path: always read BY ENV).
-    const Light light = lights[env];
-    const AmbientTerm ambient = ambients[env];
-    const Material* env_mats = materials + static_cast<uint64_t>(env) * material_count;
 
     // Env-offset TLAS node slice + env-offset instance slice (TLAS leaf .left is
     // env-local, so the env instance slice resolves it directly).
@@ -256,67 +250,95 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
     Vec3 albedo{0.0f, 0.0f, 0.0f};
     uint32_t prim_id = kNoPrim;
 
+    // DEPTH/PRIM need only the primary closest hit. Hit reconstruction is needed
+    // for NORMAL/ALBEDO/COLOR; material + lighting tables are read only by the
+    // channels that consume them. The default all-AOV mask follows the exact
+    // legacy arithmetic below.
+    const bool need_details =
+        (aov_mask & (kSensorAovColor | kSensorAovNormal | kSensorAovAlbedo)) != 0u;
+    const bool need_material =
+        (aov_mask & (kSensorAovColor | kSensorAovAlbedo)) != 0u;
+    const bool need_color = (aov_mask & kSensorAovColor) != 0u;
+    const Material* env_mats = nullptr;
+    Light light{};
+    AmbientTerm ambient{};
+    if (need_material) {
+        env_mats = materials + static_cast<uint64_t>(env) * material_count;
+    }
+    if (need_color) {
+        light = lights[env];
+        ambient = ambients[env];
+    }
+
     if (best_prim != kNoPrim) {
         depth = best_t;
         prim_id = best_prim;
 
-        uint32_t inst, local_prim;
-        UnpackPrimId(best_prim, &inst, &local_prim);
-        const uint32_t material_id = env_inst[inst].material_id;
+        if (need_details) {
+            uint32_t inst, local_prim;
+            UnpackPrimId(best_prim, &inst, &local_prim);
 
-        Vec3 n;
-        float uv_u, uv_v;
-        ReconstructHit<float>(env_inst, best_prim, ray.origin, ray.dir, &n, &uv_u, &uv_v);
-        normal = n;
-        const Material mat = env_mats[material_id];
-        albedo = mat.albedo;
+            Vec3 n;
+            float uv_u, uv_v;
+            ReconstructHit<float>(env_inst, best_prim, ray.origin, ray.dir, &n, &uv_u, &uv_v);
+            normal = n;
+            Material mat{};
+            if (need_material) {
+                const uint32_t material_id = env_inst[inst].material_id;
+                mat = env_mats[material_id];
+                albedo = mat.albedo;
+            }
 
-        const Vec3 hit{ray.origin.x + best_t * ray.dir.x,
-                       ray.origin.y + best_t * ray.dir.y,
-                       ray.origin.z + best_t * ray.dir.z};
-        const Vec3 V = RtNormalize<float>(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
-        Vec3 L;
-        float light_dist;
-        if (light.directional) {
-            L = RtNormalize<float>(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
-            light_dist = RtMissDepth();
-        } else {
-            const Vec3 to{light.position.x - hit.x, light.position.y - hit.y,
-                          light.position.z - hit.z};
-            L = RtNormalize<float>(to);
-            light_dist = sqrtf(to.x * to.x + to.y * to.y + to.z * to.z);
+            if (need_color) {
+                const Vec3 hit{ray.origin.x + best_t * ray.dir.x,
+                               ray.origin.y + best_t * ray.dir.y,
+                               ray.origin.z + best_t * ray.dir.z};
+                const Vec3 V = RtNormalize<float>(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
+                Vec3 L;
+                float light_dist;
+                if (light.directional) {
+                    L = RtNormalize<float>(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
+                    light_dist = RtMissDepth();
+                } else {
+                    const Vec3 to{light.position.x - hit.x, light.position.y - hit.y,
+                                  light.position.z - hit.z};
+                    L = RtNormalize<float>(to);
+                    light_dist = sqrtf(to.x * to.x + to.y * to.y + to.z * to.z);
+                }
+
+                // One hard shadow ray through the SAME nest (sensor profile: 1
+                // shadow, no AO/GI/MSAA). Depth/prim-only never enters this arm.
+                Vec3 ns = n;
+                const float nv = n.x * V.x + n.y * V.y + n.z * V.z;
+                if (nv < 0.0f) {
+                    ns = Vec3{-n.x, -n.y, -n.z};
+                }
+                const float shadow_eps = 1.0e-3f;
+                const Vec3 sorigin{hit.x + ns.x * shadow_eps,
+                                   hit.y + ns.y * shadow_eps,
+                                   hit.z + ns.z * shadow_eps};
+                int lit = 1;
+                float st;
+                uint32_t sp;
+                ClosestHit<float>(env_nodes, leaves_per_env, env_inst, sorigin, L,
+                                  shadow_eps, &st, &sp);
+                if (sp != kNoPrim && st < light_dist - shadow_eps) {
+                    lit = 0;
+                }
+
+                const Vec3 light_col{light.color.x * light.intensity,
+                                     light.color.y * light.intensity,
+                                     light.color.z * light.intensity};
+                color = ShadeDirect(n, V, L, light_col, mat, lit, ambient.color);
+            }
         }
-
-        // One hard shadow ray through the SAME nest (sensor profile: 1 shadow,
-        // no AO/GI/MSAA). Offset along the viewer-faced normal to avoid acne.
-        Vec3 ns = n;
-        const float nv = n.x * V.x + n.y * V.y + n.z * V.z;
-        if (nv < 0.0f) {
-            ns = Vec3{-n.x, -n.y, -n.z};
-        }
-        const float shadow_eps = 1.0e-3f;
-        const Vec3 sorigin{hit.x + ns.x * shadow_eps, hit.y + ns.y * shadow_eps,
-                           hit.z + ns.z * shadow_eps};
-        int lit = 1;
-        float st;
-        uint32_t sp;
-        ClosestHit<float>(env_nodes, leaves_per_env, env_inst, sorigin, L, shadow_eps,
-                          &st, &sp);
-        if (sp != kNoPrim && st < light_dist - shadow_eps) {
-            lit = 0;
-        }
-
-        const Vec3 light_col{light.color.x * light.intensity,
-                             light.color.y * light.intensity,
-                             light.color.z * light.intensity};
-        color = ShadeDirect(n, V, L, light_col, mat, lit, ambient.color);
     }
 
     // Opt-in beauty shade: accumulate spp jittered samples through the SHARED
     // beauty shade (the single-camera look) and average. The center sample's AOVs
     // above are kept; only color is replaced. Seeded per (ray, sample) -> two-run
     // byte-exact. Misses sample the sky dome instead of staying black.
-    if (fid.enabled != 0u) {
+    if (need_color && fid.enabled != 0u) {
         const uint32_t S = fid.spp < 1u ? 1u : fid.spp;
         Vec3 accum{0.0f, 0.0f, 0.0f};
         for (uint32_t s = 0; s < S; ++s) {
@@ -359,17 +381,71 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
         }
     }
 
-    out_color[gid * 3u + 0u] = color.x;
-    out_color[gid * 3u + 1u] = color.y;
-    out_color[gid * 3u + 2u] = color.z;
-    out_depth[gid] = depth;
-    out_normal[gid * 3u + 0u] = normal.x;
-    out_normal[gid * 3u + 1u] = normal.y;
-    out_normal[gid * 3u + 2u] = normal.z;
-    out_albedo[gid * 3u + 0u] = albedo.x;
-    out_albedo[gid * 3u + 1u] = albedo.y;
-    out_albedo[gid * 3u + 2u] = albedo.z;
-    out_prim[gid] = prim_id;
+    if ((aov_mask & kSensorAovColor) != 0u) {
+        out_color[gid * 3u + 0u] = color.x;
+        out_color[gid * 3u + 1u] = color.y;
+        out_color[gid * 3u + 2u] = color.z;
+    }
+    if ((aov_mask & kSensorAovDepth) != 0u) out_depth[gid] = depth;
+    if ((aov_mask & kSensorAovNormal) != 0u) {
+        out_normal[gid * 3u + 0u] = normal.x;
+        out_normal[gid * 3u + 1u] = normal.y;
+        out_normal[gid * 3u + 2u] = normal.z;
+    }
+    if ((aov_mask & kSensorAovAlbedo) != 0u) {
+        out_albedo[gid * 3u + 0u] = albedo.x;
+        out_albedo[gid * 3u + 1u] = albedo.y;
+        out_albedo[gid * 3u + 2u] = albedo.z;
+    }
+    if ((aov_mask & kSensorAovPrim) != 0u) out_prim[gid] = prim_id;
+}
+
+// Dedicated primary-hit camera path. Keeping this as a separate kernel is
+// intentional: a runtime branch inside BatchedSensorTraceKernel still carries the
+// full shading register footprint and throttles occupancy. DEPTH|PRIM therefore
+// compiles to only ray generation + closest hit + clip + selected stores.
+__global__ void BatchedSensorPrimaryHitKernel(
+    const PinholeCamera* __restrict__ cameras,
+    const LbvhNode* __restrict__ tlas_nodes,
+    uint32_t leaves_per_env,
+    const DevInstance* __restrict__ instances,
+    uint32_t num_cameras,
+    uint32_t sensors_per_env,
+    uint32_t width,
+    uint32_t height,
+    uint32_t aov_mask,
+    float* __restrict__ out_depth,
+    uint32_t* __restrict__ out_prim) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t pix_per_cam = width * height;
+    const uint64_t total = static_cast<uint64_t>(num_cameras) * pix_per_cam;
+    if (static_cast<uint64_t>(gid) >= total) return;
+
+    const uint32_t cam = gid / pix_per_cam;
+    const uint32_t env = cam / sensors_per_env;
+    const uint32_t p = gid % pix_per_cam;
+    const uint32_t px = p % width;
+    const uint32_t py = p / width;
+    const PinholeCamera camera = cameras[cam];
+    const Ray ray = camera.GenerateRay(px, py);
+
+    const LbvhNode* env_nodes =
+        tlas_nodes + static_cast<uint64_t>(env) * (2u * leaves_per_env - 1u);
+    const DevInstance* env_inst =
+        instances + static_cast<uint64_t>(env) * leaves_per_env;
+
+    float depth;
+    uint32_t prim_id;
+    ClosestHit<float>(env_nodes, leaves_per_env, env_inst, ray.origin, ray.dir,
+                      0.0f, &depth, &prim_id);
+    if (prim_id != kNoPrim &&
+        (depth < camera.near_clip || depth > camera.far_clip)) {
+        prim_id = kNoPrim;
+    }
+    if (prim_id == kNoPrim) depth = RtMissDepth();
+
+    if ((aov_mask & kSensorAovDepth) != 0u) out_depth[gid] = depth;
+    if ((aov_mask & kSensorAovPrim) != 0u) out_prim[gid] = prim_id;
 }
 
 // One thread per GLOBAL lidar ray over [num_lidars*az*el]: flat gid -> (lidar,
@@ -455,6 +531,10 @@ struct BatchedSensorSceneDevice::Impl {
     // Opt-in shading fidelity. Default (Enabled()==false) -> the trace takes the
     // exact cheap-shade arithmetic (byte-identical to today).
     rt::SensorFidelityConfig fid_cfg;
+
+    // Selected camera outputs. Default is the legacy all-AOV tensor; setters
+    // normalize public mask==0 to this value.
+    uint32_t aov_mask = kSensorAovAll;
 
     // Scatter outputs + batched TLAS (sized to E*M / E*(2M-1)); *_b track each
     // allocation's byte size so growth-only realloc is honest across steps.
@@ -733,15 +813,30 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     const uint64_t num_cameras = static_cast<uint64_t>(env_count) * s;
     const uint64_t rays = num_cameras * width * height;
 
-    EnsureBytes(impl->d_color, impl->col_b, bt, rays * 3u * sizeof(float));
-    EnsureBytes(impl->d_depth, impl->dep_b, bt, rays * sizeof(float));
-    EnsureBytes(impl->d_normal, impl->nrm_b, bt, rays * 3u * sizeof(float));
-    EnsureBytes(impl->d_albedo, impl->alb_b, bt, rays * 3u * sizeof(float));
-    EnsureBytes(impl->d_prim, impl->prim_b, bt, rays * sizeof(uint32_t));
+    const uint32_t aov_mask = impl->aov_mask;
+    if ((aov_mask & kSensorAovColor) != 0u) {
+        EnsureBytes(impl->d_color, impl->col_b, bt, rays * 3u * sizeof(float));
+    }
+    if ((aov_mask & kSensorAovDepth) != 0u) {
+        EnsureBytes(impl->d_depth, impl->dep_b, bt, rays * sizeof(float));
+    }
+    if ((aov_mask & kSensorAovNormal) != 0u) {
+        EnsureBytes(impl->d_normal, impl->nrm_b, bt, rays * 3u * sizeof(float));
+    }
+    if ((aov_mask & kSensorAovAlbedo) != 0u) {
+        EnsureBytes(impl->d_albedo, impl->alb_b, bt, rays * 3u * sizeof(float));
+    }
+    if ((aov_mask & kSensorAovPrim) != 0u) {
+        EnsureBytes(impl->d_prim, impl->prim_b, bt, rays * sizeof(uint32_t));
+    }
 
     // Per-env material/light/ambient tables (refilled on an env-count change; DR
     // off -> base replicas). The trace reads these BY ENV -- the ONE path.
-    EnsureEnvAppearanceTables(impl, ctx, env_count, false);
+    const bool need_appearance =
+        (aov_mask & (kSensorAovColor | kSensorAovAlbedo)) != 0u;
+    if (need_appearance) {
+        EnsureEnvAppearanceTables(impl, ctx, env_count, false);
+    }
 
     // 1+2) Scatter + batched LBVH build/refit (the ONE topology path lidar reuses).
     EnsureEnvTopology(impl, ctx, fk, env_count);
@@ -749,26 +844,38 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     auto* d_nodes = static_cast<LbvhNode*>(impl->d_tlas_nodes.Data());
 
     // 3) ONE flat trace over [E*S*H*W] into the persistent (E,S,H,W,ch) AOV tensor.
-    //    Materials/light/ambient resolved BY ENV from the per-env tables. The
-    //    fidelity params gate the shade: disabled -> the exact cheap arithmetic.
-    FidelityParams fid;
-    BeautyParams sky;
-    BuildFidelityParams(impl->fid_cfg, &fid, &sky);
+    // DEPTH|PRIM selects a separately compiled primary-hit kernel so it carries no
+    // shading register footprint. Any appearance AOV uses the general shade path.
     const uint32_t grid = static_cast<uint32_t>((rays + kBlockSize - 1u) / kBlockSize);
-    phi::LaunchCuda(BatchedSensorTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
-                    ctx.stream, cameras_device, d_nodes, m, d_instances,
-                    static_cast<const Material*>(impl->d_materials_env.Data()),
-                    impl->material_count,
-                    static_cast<const Light*>(impl->d_light_env.Data()),
-                    static_cast<const AmbientTerm*>(impl->d_ambient_env.Data()),
-                    static_cast<uint32_t>(num_cameras), s,
-                    width, height, fid, sky,
-                    static_cast<float*>(impl->d_color.Data()),
-                    static_cast<float*>(impl->d_depth.Data()),
-                    static_cast<float*>(impl->d_normal.Data()),
-                    static_cast<float*>(impl->d_albedo.Data()),
-                    static_cast<uint32_t*>(impl->d_prim.Data()));
-    CheckCuda(cudaGetLastError(), "BatchedSensorTraceKernel launch");
+    const bool primary_only =
+        (aov_mask & ~(kSensorAovDepth | kSensorAovPrim)) == 0u;
+    if (primary_only) {
+        phi::LaunchCuda(BatchedSensorPrimaryHitKernel, dim3(grid),
+                        dim3(kBlockSize), 0u, ctx.stream, cameras_device, d_nodes,
+                        m, d_instances, static_cast<uint32_t>(num_cameras), s,
+                        width, height, aov_mask,
+                        static_cast<float*>(impl->d_depth.Data()),
+                        static_cast<uint32_t*>(impl->d_prim.Data()));
+        CheckCuda(cudaGetLastError(), "BatchedSensorPrimaryHitKernel launch");
+    } else {
+        FidelityParams fid;
+        BeautyParams sky;
+        BuildFidelityParams(impl->fid_cfg, &fid, &sky);
+        phi::LaunchCuda(BatchedSensorTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
+                        ctx.stream, cameras_device, d_nodes, m, d_instances,
+                        static_cast<const Material*>(impl->d_materials_env.Data()),
+                        impl->material_count,
+                        static_cast<const Light*>(impl->d_light_env.Data()),
+                        static_cast<const AmbientTerm*>(impl->d_ambient_env.Data()),
+                        static_cast<uint32_t>(num_cameras), s,
+                        width, height, fid, sky, aov_mask,
+                        static_cast<float*>(impl->d_color.Data()),
+                        static_cast<float*>(impl->d_depth.Data()),
+                        static_cast<float*>(impl->d_normal.Data()),
+                        static_cast<float*>(impl->d_albedo.Data()),
+                        static_cast<uint32_t*>(impl->d_prim.Data()));
+        CheckCuda(cudaGetLastError(), "BatchedSensorTraceKernel launch");
+    }
     impl->aov_rays = rays;
 }
 
@@ -809,6 +916,16 @@ void SetSensorFidelity(BatchedSensorSceneDevice& device,
     BeautyParams sky;
     BuildFidelityParams(cfg, &fp, &sky);
     impl->fid_cfg = cfg;
+}
+
+void SetSensorAovMask(BatchedSensorSceneDevice& device, uint32_t mask) {
+    BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
+    const uint32_t effective = mask == 0u ? kSensorAovAll : mask;
+    if ((effective & ~kSensorAovAll) != 0u) {
+        throw std::runtime_error(
+            "SetSensorAovMask: mask contains bits outside COLOR..PRIM");
+    }
+    impl->aov_mask = effective;
 }
 
 void RenderSensorsMounted(BatchedSensorSceneDevice& device,
@@ -962,24 +1079,34 @@ void RenderLidarsMounted(BatchedSensorSceneDevice& device,
 }
 
 const float* SensorColorDevice(const BatchedSensorSceneDevice& device) {
-    return static_cast<const float*>(
-        const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_color.Data());
+    auto* impl = const_cast<BatchedSensorSceneDevice&>(device).GetImpl();
+    return (impl->aov_mask & kSensorAovColor) != 0u
+               ? static_cast<const float*>(impl->d_color.Data())
+               : nullptr;
 }
 const float* SensorDepthDevice(const BatchedSensorSceneDevice& device) {
-    return static_cast<const float*>(
-        const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_depth.Data());
+    auto* impl = const_cast<BatchedSensorSceneDevice&>(device).GetImpl();
+    return (impl->aov_mask & kSensorAovDepth) != 0u
+               ? static_cast<const float*>(impl->d_depth.Data())
+               : nullptr;
 }
 const float* SensorNormalDevice(const BatchedSensorSceneDevice& device) {
-    return static_cast<const float*>(
-        const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_normal.Data());
+    auto* impl = const_cast<BatchedSensorSceneDevice&>(device).GetImpl();
+    return (impl->aov_mask & kSensorAovNormal) != 0u
+               ? static_cast<const float*>(impl->d_normal.Data())
+               : nullptr;
 }
 const float* SensorAlbedoDevice(const BatchedSensorSceneDevice& device) {
-    return static_cast<const float*>(
-        const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_albedo.Data());
+    auto* impl = const_cast<BatchedSensorSceneDevice&>(device).GetImpl();
+    return (impl->aov_mask & kSensorAovAlbedo) != 0u
+               ? static_cast<const float*>(impl->d_albedo.Data())
+               : nullptr;
 }
 const uint32_t* SensorPrimDevice(const BatchedSensorSceneDevice& device) {
-    return static_cast<const uint32_t*>(
-        const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->d_prim.Data());
+    auto* impl = const_cast<BatchedSensorSceneDevice&>(device).GetImpl();
+    return (impl->aov_mask & kSensorAovPrim) != 0u
+               ? static_cast<const uint32_t*>(impl->d_prim.Data())
+               : nullptr;
 }
 
 uint32_t SensorsPerEnv(const BatchedSensorSceneDevice& device) {

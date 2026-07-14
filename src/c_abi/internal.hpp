@@ -110,6 +110,10 @@ struct SensorAttachment {
     // Opt-in shading fidelity (default -> cheap shade). Retained so a re-attach
     // re-applies it onto the rebuilt sensor scene.
     nuka::rt::SensorFidelityConfig fidelity;
+    // Camera AOV selection (0 => legacy all-AOV profile). Retained across a
+    // camera/lidar re-attach so an observation pipeline does not silently fall
+    // back to the expensive shaded path.
+    uint32_t aov_mask = 0u;
     SensorAttachment();     // out-of-line (the SensorDesc vector member is incomplete here).
     ~SensorAttachment();    // defined in c_abi/sensor.cpp (FreeSensorScene then backend).
     SensorAttachment(SensorAttachment&&) = delete;

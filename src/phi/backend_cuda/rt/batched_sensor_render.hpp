@@ -44,6 +44,20 @@ struct LidarSensor;
 // color3 + depth1 + normal3 + albedo3. The obs reads color+depth+prim.
 inline constexpr uint32_t kSensorFloatChannels = 10u;
 
+// Device AOV selection. Bit positions intentionally match nuka_sensor_channel_t
+// for COLOR..PRIM; RANGE is a separate lidar tensor and is not part of this mask.
+// A public/configured mask of 0 is normalized to kSensorAovAll for backwards
+// compatibility. DEPTH|PRIM is the primary-hit-only profile: no hit
+// reconstruction, material fetch, shadow ray, or direct shading.
+inline constexpr uint32_t kSensorAovColor  = 1u << 0u;
+inline constexpr uint32_t kSensorAovDepth  = 1u << 1u;
+inline constexpr uint32_t kSensorAovNormal = 1u << 2u;
+inline constexpr uint32_t kSensorAovAlbedo = 1u << 3u;
+inline constexpr uint32_t kSensorAovPrim   = 1u << 4u;
+inline constexpr uint32_t kSensorAovAll =
+    kSensorAovColor | kSensorAovDepth | kSensorAovNormal |
+    kSensorAovAlbedo | kSensorAovPrim;
+
 // Persistent device state for an N-env replicated-scene sensor render. BLAS once;
 // the TLAS nodes + scatter buffers + AOV tensor are sized lazily, reused per step.
 class BatchedSensorSceneDevice {
@@ -110,6 +124,12 @@ void SetRenderDr(BatchedSensorSceneDevice& device, const RenderDrConfig& cfg,
 // Caps spp/samples LOUDLY. Stored on the device; applies to the next render.
 void SetSensorFidelity(BatchedSensorSceneDevice& device,
                        const SensorFidelityConfig& cfg);
+
+// Select which camera AOV planes the next render produces. mask==0 restores the
+// legacy all-AOV profile. Unknown bits are rejected loudly. Omitted planes expose
+// null accessors, so a caller cannot accidentally consume stale data after a mask
+// change. The selected path is general across every sensor scene.
+void SetSensorAovMask(BatchedSensorSceneDevice& device, uint32_t mask);
 
 // ONE step driven by the stored mount table: scatter cameras (fk * local_offset
 // for every env x sensor) into the persistent camera buffer, then RenderSensorsBatched

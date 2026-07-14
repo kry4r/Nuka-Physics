@@ -165,6 +165,8 @@ struct SensorDesc {
     math::Transform local_offset           = math::Transform::Identity();
     CameraIntrinsics cam;
     LidarPattern lidar;
+    // Bit positions match camera channels COLOR..PRIM (bits 0..4). Zero means
+    // the backwards-compatible all-AOV profile. RANGE is a separate lidar tensor.
     uint32_t aov_mask                      = 0;
     uint32_t update_period                 = 1;
     float sample_rate_hz                   = 0.0f;

@@ -75,6 +75,7 @@ from ._nuka_ext import (  # noqa: F401
     CABLE_PIN_NONE,
     # Device-resident batched camera sensor: the AOV plane + the mount frame.
     SensorChannel,
+    SensorAov,
     SensorMount,
 )
 

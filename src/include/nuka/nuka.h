@@ -717,6 +717,20 @@ typedef enum nuka_sensor_channel_t {
     NUKA_SENSOR_CHANNEL_RANGE = 5
 } nuka_sensor_channel_t;
 
+// Camera AOV selection bits. Bit positions intentionally match
+// nuka_sensor_channel_t for COLOR..PRIM; RANGE is a separate lidar tensor. Pass
+// 0 to nuka_world_set_sensor_aov_mask to restore the legacy all-AOV profile.
+typedef enum nuka_sensor_aov_t {
+    NUKA_SENSOR_AOV_COLOR  = 1u << NUKA_SENSOR_CHANNEL_COLOR,
+    NUKA_SENSOR_AOV_DEPTH  = 1u << NUKA_SENSOR_CHANNEL_DEPTH,
+    NUKA_SENSOR_AOV_NORMAL = 1u << NUKA_SENSOR_CHANNEL_NORMAL,
+    NUKA_SENSOR_AOV_ALBEDO = 1u << NUKA_SENSOR_CHANNEL_ALBEDO,
+    NUKA_SENSOR_AOV_PRIM   = 1u << NUKA_SENSOR_CHANNEL_PRIM,
+    NUKA_SENSOR_AOV_ALL = NUKA_SENSOR_AOV_COLOR | NUKA_SENSOR_AOV_DEPTH |
+                          NUKA_SENSOR_AOV_NORMAL | NUKA_SENSOR_AOV_ALBEDO |
+                          NUKA_SENSOR_AOV_PRIM
+} nuka_sensor_aov_t;
+
 // Build the world's batched sensor scene from its cooked visual instances (the
 // per-env visual template, replicated across envs) and attach a camera mounted on
 // `mount_frame`[mount_index] offset by `local_offset` (px,py,pz, qw,qx,qy,qz).
@@ -739,6 +753,15 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
 // world's backend stream (no host round-trip), driven by the world's LIVE link
 // poses. Call after step() and after nuka_world_attach_camera_sensor.
 nuka_result_t nuka_world_render_sensors(nuka_world_handle world);
+
+// Select which camera AOV planes subsequent renders produce. mask is a bitwise
+// OR of nuka_sensor_aov_t; mask==0 restores all planes. DEPTH|PRIM takes the
+// primary-hit-only fast path (no hit reconstruction, materials, shadow ray, or
+// shading). Omitted channels return NOT_SUPPORTED from get_sensor_view instead of
+// exposing stale data. INVALID_ARG on unknown bits; NOT_SUPPORTED without a
+// camera attachment.
+nuka_result_t nuka_world_set_sensor_aov_mask(nuka_world_handle world,
+                                              uint32_t mask);
 
 // Zero-copy device view into the AOV tensor after nuka_world_render_sensors:
 // `channel` selects the plane (see nuka_sensor_channel_t). out->device_ptr is the
