@@ -247,7 +247,9 @@ static uint32_t RowExemptParticles(const nk::Model& model) {
 // Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
 // body<->body budget) for body<->particle rows; idempotent, byte-identical when 0.
 // `row_exempt` = per-env particles that never emit body rows (a grid-coupled MPM
-// slice under MpmXpbd) and therefore reserve no slots.
+// slice under MpmXpbd) and therefore reserve no slots. Every reserved particle
+// slot is sphere-vs-body and uses the same one-point/five-row footprint in every
+// particle mode; rigid slots retain the four-point/twenty-row worst case.
 void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
                                    uint32_t row_exempt) {
     if (rigid_base == 0u) return;  // no body contacts -> no body<->particle rows.
@@ -257,15 +259,16 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
         static_cast<uint64_t>(row_particles) *
         collision::gpu::kBodyParticleContactSlotsPerParticle;
     const uint64_t total = static_cast<uint64_t>(rigid_base) + reserve;
-    if (total > 0xFFFFFFFFull ||
-        total * nk::kPairDrivenRowsPerSlot > 0xFFFFFFFFull) {
+    const uint64_t rows =
+        static_cast<uint64_t>(rigid_base) * nk::kPairDrivenRowsPerSlot +
+        reserve * nk::kPairDrivenParticleRowsPerSlot;
+    if (total > 0xFFFFFFFFull || rows > 0xFFFFFFFFull) {
         throw std::runtime_error(
             "CookToModel: body<->particle contact budget overflows u32 "
             "(too many particles for the per-env contact slot block)");
     }
     cap.max_contacts_per_env = static_cast<uint32_t>(total);
-    cap.max_rows_per_env =
-        cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    cap.max_rows_per_env = static_cast<uint32_t>(rows);
 }
 
 namespace {

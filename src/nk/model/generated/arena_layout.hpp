@@ -252,6 +252,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // mpm_grid_cell_key
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // mpm_grid_part_idx
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // mpm_sort_scratch
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // mpm_particle_stress
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mpm_material_table
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_body_dp
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_body_owner

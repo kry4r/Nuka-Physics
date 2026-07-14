@@ -102,7 +102,8 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 // the rigid base after appending terrain collidables and re-applies this so a world
 // with BOTH terrain and particles keeps the rigid + particle slot ranges disjoint.
 // `row_exempt` = per-env particles that never emit body rows (the grid-coupled MPM
-// slice under MpmXpbd); they reserve no slots.
+// slice under MpmXpbd); they reserve no slots. Every remaining body-particle slot
+// has the provider-wide one-point/five-row footprint, independent of solver mode.
 void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
                                    uint32_t row_exempt = 0u);
 

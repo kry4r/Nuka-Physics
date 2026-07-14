@@ -196,10 +196,12 @@ TEST(BodyParticleBudget, RigidContactSurvivesManyParticles) {
     const uint32_t total = m.capacities.max_contacts_per_env;
     EXPECT_EQ(total, rigid_cap + parts * kSlotsPerParticle)
         << "cook did not grow max_contacts_per_env additively";
-    EXPECT_EQ(m.capacities.max_rows_per_env, total * nk::kPairDrivenRowsPerSlot);
+    EXPECT_EQ(m.capacities.max_rows_per_env,
+              rigid_cap * nk::kPairDrivenRowsPerSlot +
+                  parts * kSlotsPerParticle * nk::kPairDrivenParticleRowsPerSlot);
 
     const uint32_t rows_per_env = m.capacities.max_rows_per_env;
-    const uint32_t rows_per_slot = nk::kPairDrivenRowsPerSlot;
+    const uint32_t rigid_rows = rigid_cap * nk::kPairDrivenRowsPerSlot;
 
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
     ASSERT_TRUE(w.Ready());
@@ -216,7 +218,10 @@ TEST(BodyParticleBudget, RigidContactSurvivesManyParticles) {
     for (uint32_t row = 0u; row < rows_per_env; ++row) {
         const RowSides rs = DecodeRow(s.urows, row);
         if (!rs.active) continue;
-        const uint32_t slot = row / rows_per_slot;
+        const uint32_t slot = row < rigid_rows
+            ? row / nk::kPairDrivenRowsPerSlot
+            : rigid_cap +
+                  (row - rigid_rows) / nk::kPairDrivenParticleRowsPerSlot;
         const bool a_part = rs.a_kind == nk::kNkSideParticle;
         const bool b_part = rs.b_kind == nk::kNkSideParticle;
         if (a_part || b_part) {
@@ -339,7 +344,8 @@ TEST(BodyParticleBudget, SoftFluidCookGrowsAdditivelyNoDoubleCount) {
     EXPECT_EQ(cap.max_contacts_per_env, 8u + 5u * kSlotsPerParticle)
         << "SoftFluid cook double-counted the soft slice in the contact budget";
     EXPECT_EQ(cap.max_rows_per_env,
-              cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot);
+              8u * nk::kPairDrivenRowsPerSlot +
+                  5u * kSlotsPerParticle * nk::kPairDrivenParticleRowsPerSlot);
 }
 
 // The c_abi terrain cook path RECOMPUTES the rigid contact budget after appending a
@@ -405,7 +411,8 @@ TEST(BodyParticleBudget, CAbiTerrainRecomputeReappliesParticleReserve) {
     EXPECT_EQ(cap.max_contacts_per_env, terrain_rigid_base + parts * kSlotsPerParticle)
         << "the terrain recompute did not re-apply the body<->particle reserve";
     EXPECT_EQ(cap.max_rows_per_env,
-              cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot);
+              terrain_rigid_base * nk::kPairDrivenRowsPerSlot +
+                  parts * kSlotsPerParticle * nk::kPairDrivenParticleRowsPerSlot);
     EXPECT_GT(cap.max_contacts_per_env, terrain_rigid_base)
         << "the particle slot sub-range is empty -> particles would overlap rigid";
 
