@@ -39,9 +39,17 @@ const char* NkOpName(int op) {
         case 10: return "LbvhQueryPairs"; case 11: return "ParticleGridBuild";
         case 12: return "NarrowphasePrimitives"; case 13: return "NarrowphaseSdf";
         case 14: return "ContactTangentBasis"; case 15: return "AssembleRows";
-        case 16: return "SolveRowsBlockIsland"; case 24: return "ReadoutContactWrench";
-        case 33: return "SyncLinkBodyPose"; case 35: return "NarrowphaseHeightfield";
-        case 36: return "BuildSolveIslands";
+        case 16: return "SolveRowsBlockIsland";
+        case 17: return "ParticleAeroDrag"; case 18: return "ParticlePredict";
+        case 19: return "XpbdProject"; case 20: return "PbfDensityLambda";
+        case 21: return "PbfApplyDelta"; case 22: return "ParticleFinalize";
+        case 23: return "MpmStep"; case 24: return "ReadoutContactWrench";
+        case 25: return "ExportObs"; case 26: return "ResetEnvs";
+        case 27: return "SnapshotState"; case 28: return "RestoreState";
+        case 29: return "RandomizeMaterialBuckets"; case 30: return "RandomizeBodyParams";
+        case 31: return "StepBackward"; case 32: return "ParticleParticleContact";
+        case 33: return "SyncLinkBodyPose"; case 34: return "NarrowphaseBodyParticle";
+        case 35: return "NarrowphaseHeightfield"; case 36: return "BuildSolveIslands";
         default: return "op";
     }
 }

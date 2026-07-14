@@ -393,8 +393,9 @@ struct MpmStepParams {
     uint32_t artics_per_env;     // co-resident articulations per env (>=1 when artic).
 };
 
-// Byte size of the pre-allocated mpm_sort_scratch field (the P2G deterministic-
-// gather cub radix sort temp + the sorted key/idx out buffers, 256B-aligned).
+// Byte size of the pre-allocated mpm_sort_scratch field (the deterministic P2G
+// particle sort, active-node select, and body-reaction node sort share one cub
+// temp + sorted key/idx output pair, 256B-aligned).
 // Host-callable (defined in mpm.cu) so World sizes the field before allocation
 // -> no mid-capture cudaMalloc. 0 for 0 particles.
 uint64_t MpmSortScratchBytes(uint32_t particle_count);
@@ -574,6 +575,10 @@ struct AssembleRowsParams {
     uint32_t family;            // kContactFamily*
     uint32_t union_slot_count;  // union slots per env
     uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
+    // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
+    // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
+    // Equal to union_slot_count when the model has no body-particle reserve.
+    uint32_t full_row_slot_count;
     uint32_t bodies_per_env;
     uint32_t base_link_count;   // links per env (replica stride)
     float    solref[2];         // merged contact solref (union family)

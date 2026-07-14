@@ -164,6 +164,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::MpmGridCellKey:      v.mpm_grid_cell_key = static_cast<uint32_t*>(p); break;
         case FieldId::MpmGridPartIdx:      v.mpm_grid_part_idx = static_cast<uint32_t*>(p); break;
         case FieldId::MpmSortScratch:      v.mpm_sort_scratch = static_cast<uint8_t*>(p); break;
+        case FieldId::MpmParticleStress:   v.mpm_particle_stress = static_cast<float*>(p); break;
         case FieldId::MpmMaterialTable:    v.mpm_material_table = static_cast<float*>(p); break;
         case FieldId::GridBodyDp:          v.grid_body_dp = static_cast<math::Vec3*>(p); break;
         case FieldId::GridBodyOwner:       v.grid_body_owner = static_cast<uint32_t*>(p); break;

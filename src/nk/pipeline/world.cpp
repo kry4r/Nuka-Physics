@@ -4,6 +4,8 @@
 
 #include "nk/pipeline/world.hpp"
 
+#include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "nk/solve/schedule.hpp"
@@ -23,13 +25,39 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
 
     // Size the particle-grid sort/scan scratch so ParticleGridBuild captures into
     // the graph (no mid-capture cudaMalloc); 0 for a particle-free world (inert).
-    model_.capacities.grid_sort_scratch_bytes = phi::GridSortScratchBytes(
-        model_.capacities.particles_per_env * model_.capacities.env_count);
+    const bool runs_pbf =
+        model_.particles.mode == Model::ParticleMode::Pbf ||
+        model_.particles.mode == Model::ParticleMode::SoftFluid ||
+        (model_.particles.mode == Model::ParticleMode::Coupled &&
+         model_.particles.coupled_internal == Model::CoupledInternal::Pbf);
+    const uint32_t particle_grid_count = runs_pbf
+        ? model_.capacities.particles_per_env * model_.capacities.env_count : 0u;
+    model_.capacities.grid_sort_scratch_bytes =
+        phi::GridSortScratchBytes(particle_grid_count);
 
     // Size the MLS-MPM P2G deterministic-gather scratch the same way; 0 for a
     // non-MPM world (zero-byte segment, byte-inert).
-    model_.capacities.mpm_grid_sort_scratch_bytes = phi::MpmSortScratchBytes(
-        model_.capacities.particles_per_env * model_.capacities.env_count);
+    const uint32_t mpm_per_env =
+        model_.particles.mode == Model::ParticleMode::Mpm
+            ? model_.capacities.particles_per_env
+        : model_.particles.mode == Model::ParticleMode::MpmXpbd
+            ? model_.particles.n_mpm_particles : 0u;
+    const uint64_t mpm_particle_sort_count =
+        static_cast<uint64_t>(mpm_per_env) * model_.capacities.env_count;
+    // The same workspace also compacts active P2G nodes and, when dynamic bodies
+    // are enabled, stably groups projected nodes by owner for the reaction gather.
+    // Both node phases need capacity for the full env-private grid.
+    const uint64_t mpm_node_sort_count = mpm_per_env > 0u
+        ? static_cast<uint64_t>(model_.capacities.mpm_grid_nodes_per_env) *
+              model_.capacities.env_count
+        : 0u;
+    const uint64_t mpm_sort_count =
+        mpm_particle_sort_count > mpm_node_sort_count
+            ? mpm_particle_sort_count : mpm_node_sort_count;
+    model_.capacities.mpm_grid_sort_scratch_bytes =
+        mpm_sort_count <= static_cast<uint64_t>(std::numeric_limits<int>::max())
+            ? phi::MpmSortScratchBytes(static_cast<uint32_t>(mpm_sort_count))
+            : 0u;  // CUB sort/select expose an int num_items contract.
 
     // Size the dynamic-island cub radix-sort scratch (BuildSolveIslands) over the
     // total row capacity so the sort captures into the graph; 0 if no rows (inert).

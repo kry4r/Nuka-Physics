@@ -20,11 +20,15 @@
 // ---------------------------------------------------------------------------
 
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 
 #include <cuda_runtime.h>
 
+#include <cub/device/device_select.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/iterator/counting_input_iterator.cuh>
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -44,6 +48,114 @@ namespace {
 namespace m = ::nuka::math;
 constexpr uint32_t kBlockSize = 128u;
 
+// Opt-in stage timer for the reusable end-to-end solver profiler. Production is
+// a true no-op unless NUKA_MPM_TIMING is set; profiling uses ordinary Step(), not
+// CUDA-graph capture, and reports each substage amortized per World::Step.
+enum class MpmStage : uint32_t {
+    GridPrepare,
+    CellKeys,
+    RadixSort,
+    CellRanges,
+    ActiveSelect,
+    Stress,
+    P2G,
+    GridUpdate,
+    BodyProject,
+    BodySort,
+    BodyReact,
+    G2P,
+    UpdateF,
+    ArticDeposit,
+    Count,
+};
+
+struct MpmProfiler {
+    static constexpr uint32_t kCount = static_cast<uint32_t>(MpmStage::Count);
+    double ms[kCount] = {0.0};
+    unsigned long long calls[kCount] = {0};
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end = nullptr;
+    long step = 0;
+    long warmup = 0;
+    unsigned long long measured_steps = 0;
+    bool on = false;
+    bool active = false;
+    bool initialized = false;
+
+    static MpmProfiler& Get() {
+        static MpmProfiler profiler;
+        return profiler;
+    }
+
+    static const char* Name(uint32_t stage) {
+        constexpr const char* names[kCount] = {
+            "grid_prepare", "cell_keys", "radix_sort", "cell_ranges",
+            "active_select", "stress", "p2g_gather", "grid_update", "body_project",
+            "body_sort", "body_react", "g2p_gather", "update_F", "artic_deposit"};
+        return names[stage];
+    }
+
+    void Ensure() {
+        if (initialized) return;
+        initialized = true;
+        const char* enabled = std::getenv("NUKA_MPM_TIMING");
+        on = enabled != nullptr && enabled[0] != '0';
+        const char* warm = std::getenv("NUKA_MPM_TIMING_WARMUP");
+        if (warm != nullptr) warmup = std::atol(warm);
+        if (!on) return;
+        if (cudaEventCreate(&begin) != cudaSuccess ||
+            cudaEventCreate(&end) != cudaSuccess) {
+            on = false;
+            return;
+        }
+        std::atexit(&MpmProfiler::Dump);
+    }
+
+    void BeginStep() {
+        Ensure();
+        if (!on) return;
+        ++step;
+        active = step > warmup;
+        if (active) ++measured_steps;
+    }
+
+    void Start(MpmStage stage, cudaStream_t stream) {
+        if (!active) return;
+        (void)stage;
+        (void)cudaEventRecord(begin, stream);
+    }
+
+    void Stop(MpmStage stage, cudaStream_t stream) {
+        if (!active) return;
+        (void)cudaEventRecord(end, stream);
+        (void)cudaEventSynchronize(end);
+        float elapsed = 0.0f;
+        (void)cudaEventElapsedTime(&elapsed, begin, end);
+        const uint32_t index = static_cast<uint32_t>(stage);
+        ms[index] += static_cast<double>(elapsed);
+        ++calls[index];
+    }
+
+    static void Dump() {
+        MpmProfiler& profiler = Get();
+        if (profiler.measured_steps == 0) return;
+        std::printf("\n[NUKA_MPM_TIMING] MpmStep GPU stages (steps=%llu, warmup=%ld)\n",
+                    profiler.measured_steps, profiler.warmup);
+        std::printf("  %-18s %10s %10s %12s\n", "stage", "ms/step", "ms/call",
+                    "calls");
+        double total = 0.0;
+        for (uint32_t i = 0; i < kCount; ++i) {
+            if (profiler.calls[i] == 0) continue;
+            total += profiler.ms[i];
+            std::printf("  %-18s %10.3f %10.4f %12llu\n", Name(i),
+                        profiler.ms[i] / profiler.measured_steps,
+                        profiler.ms[i] / profiler.calls[i], profiler.calls[i]);
+        }
+        std::printf("  %-18s %10.3f\n", "TOTAL/step", total / profiler.measured_steps);
+        std::fflush(stdout);
+    }
+};
+
 // Smallest node mass the momentum->velocity divide is float-stable for. A node
 // reached only by denormal-tiny stencil-weight products (a particle sitting at an
 // exact cell center rounds one axis weight to ~eps^2) otherwise divides by a
@@ -62,22 +174,44 @@ inline __host__ uint64_t AlignScratch(uint64_t v) {
     return (v + (kScratchAlign - 1u)) & ~(kScratchAlign - 1u);
 }
 
+// CUB keeps the original keys while ordering only the requested bit range.
+// Particle-cell keys occupy [0,total_cells); body owners occupy
+// [0,total_bodies), while ~0u is the inactive sentinel. Enough low bits to
+// represent the inclusive maximum therefore preserve the exact unsigned order
+// and avoid passes over high bits that carry no information.
+inline __host__ int RadixBitsInclusive(uint32_t max_key) {
+    int bits = 0;
+    do {
+        ++bits;
+        max_key >>= 1u;
+    } while (max_key != 0u);
+    return bits;
+}
+
 // 256B-aligned partition of mpm_sort_scratch [cub temp | keys-out | idx-out].
-// Sizes the segment (World construct) and partitions it (the op) identically.
+// P2G particle sorting, active-node selection, and body-reaction node sorting use
+// it sequentially. World sizes the segment for the larger item count; every phase
+// uses that common layout so cub temp can never overlap live sorted-particle output.
 struct MpmSortScratchLayout {
     uint64_t temp_bytes = 0u;     // cub radix-sort temp-storage region size.
     uint64_t keys_off   = 0u;     // byte offset of the sorted-keys out buffer.
     uint64_t idx_off    = 0u;     // byte offset of the sorted-idx out buffer.
     uint64_t total      = 0u;     // full segment byte size.
-    explicit MpmSortScratchLayout(uint32_t particle_count) {
-        const int n = static_cast<int>(particle_count);
+    explicit MpmSortScratchLayout(uint32_t item_count) {
+        const int n = static_cast<int>(item_count);
         size_t sort_bytes = 0u;
         (void)cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
             nullptr, sort_bytes, static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), n);
-        temp_bytes = sort_bytes;
-        const uint64_t nbytes = static_cast<uint64_t>(particle_count) * sizeof(uint32_t);
+        size_t select_bytes = 0u;
+        cub::CountingInputIterator<uint32_t> node_ids(0u);
+        (void)cub::DeviceSelect::Flagged(
+            nullptr, select_bytes, node_ids, static_cast<const uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+            n);
+        temp_bytes = sort_bytes > select_bytes ? sort_bytes : select_bytes;
+        const uint64_t nbytes = static_cast<uint64_t>(item_count) * sizeof(uint32_t);
         keys_off = AlignScratch(temp_bytes);
         idx_off  = AlignScratch(keys_off + nbytes);
         total    = AlignScratch(idx_off + nbytes);
@@ -338,18 +472,6 @@ __device__ __forceinline__ int64_t NodeId(uint32_t env, int32_t ix, int32_t iy,
     return static_cast<int64_t>(env) * nodes_per_env + local;
 }
 
-// --- grid clear -------------------------------------------------------------
-__global__ void MpmGridClearKernel(uint32_t total_nodes, float* mass,
-                                   m::Vec3* momentum, m::Vec3* velocity,
-                                   m::Vec3* force) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total_nodes) return;
-    mass[i] = 0.0f;
-    momentum[i] = m::Vec3::Zero();
-    velocity[i] = m::Vec3::Zero();
-    force[i] = m::Vec3::Zero();
-}
-
 // Clear THIS op's grid-escape status bit per env (order-independent across ops).
 __global__ void MpmClearEscapeBitKernel(uint32_t* env_status, uint32_t env_count) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
@@ -380,6 +502,70 @@ __device__ __forceinline__ uint32_t MpmSliceGlobal(uint32_t t, uint32_t mpm_per_
     return env * ppe + (t - env * mpm_per_env);
 }
 
+// Constitutive stress is a particle property during one substep. Precompute the
+// same row-major Kirchhoff stress the gather formerly rebuilt for every destination
+// node; storing/reloading f32 preserves the exact values while retiring ~27 repeated
+// SVD/polar evaluations per interior particle.
+__global__ void MpmPrecomputeStressKernel(
+    uint32_t mpm_count, uint32_t particles_per_env, uint32_t mpm_per_env,
+    const float* __restrict__ part_C, const float* __restrict__ part_F,
+    const float* __restrict__ part_vol0, const uint32_t* __restrict__ part_mat,
+    const float* __restrict__ material_table, uint32_t material_count,
+    float* __restrict__ particle_stress) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= mpm_count) return;
+    uint32_t env_unused = 0u;
+    const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env_unused);
+    float* stress = particle_stress + static_cast<size_t>(p) * 9u;
+    const float vol0 = part_vol0 != nullptr ? part_vol0[p] : 0.0f;
+    if (part_F == nullptr || vol0 <= 0.0f) {
+        for (int k = 0; k < 9; ++k) stress[k] = 0.0f;
+        return;
+    }
+    const uint32_t mid = part_mat != nullptr ? part_mat[p] : 0u;
+    float youngs = 0.0f, poisson = 0.0f, kind = 0.0f;
+    float bulk = 0.0f, tait_gamma = 0.0f, visc = 0.0f;
+    if (material_table != nullptr && mid < material_count) {
+        const float* mr = material_table + static_cast<size_t>(mid) * kMpmMatStride;
+        youngs = mr[0]; poisson = mr[1]; kind = mr[5];
+        bulk = mr[6]; tait_gamma = mr[7]; visc = mr[8];
+    }
+    const float* F = part_F + static_cast<size_t>(p) * 9u;
+    if (kind > 3.5f) {
+        const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
+        const float mu = youngs / (2.0f * (1.0f + poisson));
+        const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
+        GranularKirchhoff(F, mu, lambda, stress);
+    } else if (kind > 2.5f) {
+        const float J = Mat3Det(F);
+        const float pr = fmaxf(bulk * (powf(J, -tait_gamma) - 1.0f), 0.0f);
+        const float diag = -pr * J;
+        stress[0] = diag; stress[1] = 0.0f; stress[2] = 0.0f;
+        stress[3] = 0.0f; stress[4] = diag; stress[5] = 0.0f;
+        stress[6] = 0.0f; stress[7] = 0.0f; stress[8] = diag;
+        if (visc > 0.0f && part_C != nullptr) {
+            const float* C = part_C + static_cast<size_t>(p) * 9u;
+            const float Jv = J * visc;
+            stress[0] += Jv * 2.0f * C[0];
+            stress[4] += Jv * 2.0f * C[4];
+            stress[8] += Jv * 2.0f * C[8];
+            const float s01 = Jv * (C[1] + C[3]);
+            const float s02 = Jv * (C[2] + C[6]);
+            const float s12 = Jv * (C[5] + C[7]);
+            stress[1] += s01; stress[3] += s01;
+            stress[2] += s02; stress[6] += s02;
+            stress[5] += s12; stress[7] += s12;
+        }
+    } else {
+        const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
+        const float mu = youngs / (2.0f * (1.0f + poisson));
+        const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
+        float P[9];
+        FirstPiola(F, mu, lambda, kind, P);
+        Mat3MulT(P, F, stress);
+    }
+}
+
 __global__ void MpmCellKeysKernel(uint32_t mpm_count,
                                   const m::Vec3* __restrict__ pos,
                                   uint32_t particles_per_env, uint32_t mpm_per_env,
@@ -388,6 +574,8 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
                                   uint32_t dims_z, uint32_t cells_per_env,
                                   uint32_t* __restrict__ keys,
                                   uint32_t* __restrict__ idx,
+                                  uint32_t nodes_per_env,
+                                  uint32_t* __restrict__ active_node_flags,
                                   uint32_t* __restrict__ env_status) {
     const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= mpm_count) return;
@@ -422,6 +610,50 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
                            static_cast<uint32_t>(cx);
     keys[t] = env * cells_per_env + local;
     idx[t] = p;
+    // Mark exactly the 3^3 node stencil this particle can contribute to. Races
+    // only write the same flag value; atomicExch makes the idempotence explicit.
+    const uint32_t dims[3] = {dims_x, dims_y, dims_z};
+    for (int32_t a = 0; a < 3; ++a) {
+        for (int32_t b = 0; b < 3; ++b) {
+            for (int32_t c = 0; c < 3; ++c) {
+                const int64_t node =
+                    NodeId(env, bx + a, by + b, bz + c, dims, nodes_per_env);
+                if (node >= 0) atomicExch(&active_node_flags[node], 1u);
+            }
+        }
+    }
+}
+
+// Sparse-P2G preparation. The gather writes only active nodes, so clear the mass
+// field first; every active node overwrites momentum in P2G, while inactive nodes
+// take GridUpdate's mass==0 branch and never consume stale momentum. GridUpdate
+// subsequently overwrites every velocity. grid_body_owner is unused until
+// BodyProject and serves as the active-node flags.
+__global__ void MpmGridPrepareKernel(uint32_t total_nodes,
+                                     float* __restrict__ grid_mass,
+                                     uint32_t* __restrict__ active_node_flags,
+                                     uint32_t* __restrict__ cell_start) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_nodes) return;
+    grid_mass[i] = 0.0f;
+    active_node_flags[i] = 0u;
+    cell_start[i] = ~0u;
+}
+
+// Convert the stable cell-key sort to an O(1) lookup table. Exactly one sorted
+// position owns each run boundary, so the writes are race-free and the stored
+// [start,end) interval preserves the original stable particle order.
+__global__ void MpmBuildCellRangesKernel(
+    uint32_t particle_count, const uint32_t* __restrict__ sorted_keys,
+    uint32_t total_cells, uint32_t* __restrict__ cell_start,
+    uint32_t* __restrict__ cell_end) {
+    const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= particle_count) return;
+    const uint32_t key = sorted_keys[s];
+    if (key >= total_cells) return;
+    if (s == 0u || sorted_keys[s - 1u] != key) cell_start[key] = s;
+    if (s + 1u == particle_count || sorted_keys[s + 1u] != key)
+        cell_end[key] = s + 1u;
 }
 
 // --- P2G deterministic gather (one thread per grid node) --------------------
@@ -431,26 +663,29 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
 // with __fadd_rn -> bit-reproducible run-to-run (NO atomics). Accumulates mass +
 // APIC momentum + the constitutive node force -N_i*V0*(4/dx^2)*P(F)*F^T*(x_i-x_p).
 __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
+                                   const uint32_t* __restrict__ active_nodes,
+                                   const uint32_t* __restrict__ active_node_count,
                                    const m::Vec3* __restrict__ pos,
                                    const float* __restrict__ inv_mass,
                                    const m::Vec3* __restrict__ vel,
                                    const float* __restrict__ part_C,
-                                   const float* __restrict__ part_F,
                                    const float* __restrict__ part_vol0,
-                                   const uint32_t* __restrict__ part_mat,
-                                   const float* __restrict__ material_table,
-                                   uint32_t material_count,
-                                   const uint32_t* __restrict__ sorted_keys,
+                                   const float* __restrict__ particle_stress,
                                    const uint32_t* __restrict__ sorted_idx,
-                                   uint32_t particle_count, uint32_t particles_per_env,
+                                   const uint32_t* __restrict__ cell_start,
+                                   const uint32_t* __restrict__ cell_end,
+                                   uint32_t particle_count, uint32_t mpm_particles_per_env,
                                    uint32_t nodes_per_env, uint32_t cells_per_env,
                                    uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
                                    float inv_dx, float dx, float dt, m::Vec3 origin,
                                    float* __restrict__ grid_mass,
                                    m::Vec3* __restrict__ grid_momentum) {
-    const uint32_t node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= total_nodes) return;
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= total_nodes || slot >= *active_node_count) return;
+    const uint32_t node = active_nodes[slot];
     const uint32_t env = node / nodes_per_env;
+    const uint32_t env_begin = env * mpm_particles_per_env;
+    const uint32_t env_end = min(env_begin + mpm_particles_per_env, particle_count);
     const uint32_t local = node % nodes_per_env;
     const int32_t nx = static_cast<int32_t>(local % dims_x);
     const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
@@ -474,13 +709,10 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                                      static_cast<uint32_t>(cy)) * dims_x +
                                     static_cast<uint32_t>(cx);
                 const uint32_t key = env * cells_per_env + ck;
-                // Binary-search the lower bound of `key` in the sorted stream.
-                uint32_t lo = 0u, hi = particle_count;
-                while (lo < hi) {
-                    const uint32_t mid = lo + ((hi - lo) >> 1);
-                    if (sorted_keys[mid] < key) lo = mid + 1u; else hi = mid;
-                }
-                for (uint32_t s = lo; s < particle_count && sorted_keys[s] == key; ++s) {
+                const uint32_t begin = cell_start[key];
+                if (begin == ~0u) continue;
+                const uint32_t end = min(cell_end[key], env_end);
+                for (uint32_t s = max(begin, env_begin); s < end; ++s) {
                     const uint32_t p = sorted_idx[s];
                     const float wp = (inv_mass[p] > 0.0f) ? (1.0f / inv_mass[p]) : 0.0f;
                     if (wp <= 0.0f) continue;
@@ -507,61 +739,11 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                     mom.z = __fadd_rn(mom.z, wm * (vp.z + cterm.z));
                     // Constitutive node-momentum impulse dt * f_i folded into momentum,
                     // f_i = -w * V0 * (4/dx^2) * P(F) F^T (x_i - x_p).
-                    if (part_F != nullptr && part_vol0 != nullptr && dt > 0.0f) {
+                    if (particle_stress != nullptr && part_vol0 != nullptr && dt > 0.0f) {
                         const float vol0 = part_vol0[p];
                         if (vol0 > 0.0f) {
-                            const uint32_t mid = part_mat != nullptr ? part_mat[p] : 0u;
-                            float youngs = 0.0f, poisson = 0.0f, kind = 0.0f;
-                            float bulk = 0.0f, tait_gamma = 0.0f, visc = 0.0f;
-                            if (material_table != nullptr && mid < material_count) {
-                                const float* mr = material_table +
-                                                  static_cast<size_t>(mid) * kMpmMatStride;
-                                youngs = mr[0]; poisson = mr[1]; kind = mr[5];
-                                bulk = mr[6]; tait_gamma = mr[7]; visc = mr[8];
-                            }
-                            const float* F = part_F + static_cast<size_t>(p) * 9u;
-                            float stress[9];
-                            if (kind > 3.5f) {  // granular Drucker-Prager (kind 4).
-                                // Hencky elastic Kirchhoff stress off the stored elastic
-                                // F; the DP plastic return is applied in the F-update.
-                                const float denom =
-                                    (1.0f + poisson) * (1.0f - 2.0f * poisson);
-                                const float mu = youngs / (2.0f * (1.0f + poisson));
-                                const float lambda =
-                                    (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
-                                GranularKirchhoff(F, mu, lambda, stress);
-                            } else if (kind > 2.5f) {  // weakly-compressible fluid (kind 3).
-                                // Kirchhoff stress J*sigma = -p*J*I, Tait EOS, no tension;
-                                // optional viscosity J*mu*(C+C^T) from the live affine C.
-                                // J is floored in the F-update, so the unclamped Tait
-                                // pressure stays finite and the restoring force is strong.
-                                const float J = Mat3Det(F);
-                                const float pr = fmaxf(
-                                    bulk * (powf(J, -tait_gamma) - 1.0f), 0.0f);
-                                const float diag = -pr * J;
-                                stress[0] = diag; stress[1] = 0.0f; stress[2] = 0.0f;
-                                stress[3] = 0.0f; stress[4] = diag; stress[5] = 0.0f;
-                                stress[6] = 0.0f; stress[7] = 0.0f; stress[8] = diag;
-                                if (visc > 0.0f) {
-                                    const float Jv = J * visc;
-                                    stress[0] += Jv * 2.0f * C[0];
-                                    stress[4] += Jv * 2.0f * C[4];
-                                    stress[8] += Jv * 2.0f * C[8];
-                                    const float s01 = Jv * (C[1] + C[3]);
-                                    const float s02 = Jv * (C[2] + C[6]);
-                                    const float s12 = Jv * (C[5] + C[7]);
-                                    stress[1] += s01; stress[3] += s01;
-                                    stress[2] += s02; stress[6] += s02;
-                                    stress[5] += s12; stress[7] += s12;
-                                }
-                            } else {  // fixed-corotated / Neo-Hookean elastic.
-                                const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
-                                const float mu = youngs / (2.0f * (1.0f + poisson));
-                                const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
-                                float P[9];
-                                FirstPiola(F, mu, lambda, kind, P);
-                                Mat3MulT(P, F, stress);  // P * F^T (Cauchy-stress-like).
-                            }
+                            const float* stress =
+                                particle_stress + static_cast<size_t>(p) * 9u;
                             const float coef = -w * vol0 * stress_scale;
                             mom.x = __fadd_rn(mom.x, dt * coef * (stress[0] * dpos.x +
                                               stress[1] * dpos.y + stress[2] * dpos.z));
@@ -692,12 +874,13 @@ __global__ void MpmGridBodyProjectKernel(
     uint32_t best_body = ~0u;
     float best_phi = band;
     m::Vec3 best_n = m::Vec3::Zero();
+    bool saw_one_way_body = false;
     for (uint32_t bl = 0u; bl < bodies_per_env; ++bl) {
         const uint32_t grid = ShapeSdfGrid(shape_table, bl);
         if (grid == ~0u) {
-            // Collidable body with no cooked SDF imposes no grid BC: raise a bit.
-            if (ShapeContype(shape_table, bl) != 0u && env_status != nullptr)
-                atomicOr(&env_status[env], kEnvStatusMpmOneWayBody);
+            // The status is a bit, so one atomic per active node is identical to
+            // issuing the same OR once for every non-SDF collidable body.
+            saw_one_way_body |= ShapeContype(shape_table, bl) != 0u;
             continue;
         }
         const m::Transform xf = body_pose[env * bodies_per_env + bl];
@@ -714,6 +897,8 @@ __global__ void MpmGridBodyProjectKernel(
         best_body = env * bodies_per_env + bl;
         best_n = gw * (1.0f / gl);
     }
+    if (saw_one_way_body && env_status != nullptr)
+        atomicOr(&env_status[env], kEnvStatusMpmOneWayBody);
     if (best_body == ~0u) return;
     // Body surface velocity at the node: v_b + w_b x (xi - body_origin).
     const m::Vec3 xb = body_pose[best_body].position;
@@ -742,17 +927,29 @@ __global__ void MpmGridBodyProjectKernel(
     }
 }
 
+// grid_mass is dead after body projection in this substep (G2P reads velocity only),
+// so its equally sized/aligned u32 storage becomes the stable-sort node-id input.
+// The next substep's P2G overwrites every mass element before it is read again.
+__global__ void MpmInitNodeIdsKernel(uint32_t total_nodes,
+                                     uint32_t* __restrict__ node_ids) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total_nodes) node_ids[i] = i;
+}
+
 // Per-body deterministic gather of -dp / -(x-xb)xdp over the nodes it owns. A
 // free-rigid body applies the impulse inline; an articulation-link body (cooked
 // inv_mass==0) stores the linear+angular reaction for the per-articulation deposit.
 __global__ void MpmGridBodyReactKernel(
-    uint32_t total_bodies, uint32_t bodies_per_env, uint32_t nodes_per_env,
+    uint32_t total_bodies, uint32_t bodies_per_env, uint32_t total_nodes,
+    uint32_t nodes_per_env,
     uint32_t dims_x, uint32_t dims_y, float dx, m::Vec3 origin,
     const m::Transform* __restrict__ body_pose,
     const float* __restrict__ body_inv_mass,
     const m::Vec3* __restrict__ body_inv_inertia,
     const uint32_t* __restrict__ body_to_link,
-    const m::Vec3* __restrict__ body_dp, const uint32_t* __restrict__ body_owner,
+    const m::Vec3* __restrict__ body_dp,
+    const uint32_t* __restrict__ sorted_body_owner,
+    const uint32_t* __restrict__ sorted_node_id,
     m::Vec3* __restrict__ body_lin_vel, m::Vec3* __restrict__ body_ang_vel,
     m::Vec3* __restrict__ body_reaction, m::Vec3* __restrict__ body_ang_reaction) {
     const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -764,12 +961,19 @@ __global__ void MpmGridBodyReactKernel(
     if (im <= 0.0f && !is_link) return;
     const uint32_t env = b / bodies_per_env;
     const m::Vec3 xb = body_pose[b].position;
-    const uint64_t base = static_cast<uint64_t>(env) * nodes_per_env;
+    const uint32_t base = env * nodes_per_env;
     m::Vec3 dp_sum = m::Vec3::Zero();   // sum of node momentum changes this body caused.
     m::Vec3 tq_sum = m::Vec3::Zero();   // sum of (x-xb) x dp.
-    for (uint32_t local = 0u; local < nodes_per_env; ++local) {
-        const uint64_t node = base + local;
-        if (body_owner[node] != b) continue;
+    // CUB radix sort is stable. Its input node ids are 0..total_nodes-1, so equal
+    // owner keys retain the exact ascending node order of the old full-grid scan.
+    uint32_t lo = 0u, hi = total_nodes;
+    while (lo < hi) {
+        const uint32_t mid = lo + ((hi - lo) >> 1);
+        if (sorted_body_owner[mid] < b) lo = mid + 1u; else hi = mid;
+    }
+    for (uint32_t s = lo; s < total_nodes && sorted_body_owner[s] == b; ++s) {
+        const uint32_t node = sorted_node_id[s];
+        const uint32_t local = node - base;
         const m::Vec3 dp = body_dp[node];
         const int32_t nx = static_cast<int32_t>(local % dims_x);
         const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
@@ -1014,47 +1218,90 @@ inline MpmScratch PartitionScratch(void* base, uint32_t Np) {
     return s;
 }
 
-// One MLS-MPM substep: clear -> P2G(force) -> grid update + BC -> G2P -> F-update,
-// each kernel launch a barrier (the launch boundary is the inter-phase barrier).
+// One MLS-MPM substep: sparse P2G(force) -> grid update + BC -> G2P -> F-update.
 void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                    const DataView& data, float dt_sub, uint32_t Np, uint32_t Ppe,
                    uint32_t mpm_pe, uint32_t mpm_count,
                    uint32_t cpe, uint32_t total_nodes, float inv_dx,
                    const m::Vec3& origin, cudaStream_t stream) {
+    MpmProfiler& profiler = MpmProfiler::Get();
     const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
-    // The particle-iterating kernels + the sort span the MPM sub-slice only
-    // (mpm_count == Np for a lone MPM medium, so this is byte-identical there).
+    // The particle-iterating kernels span the MPM sub-slice only. Sort/select share
+    // one layout sized for the larger of the particle stream and the full grid.
     const uint32_t pblocks = (mpm_count + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(MpmGridClearKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-               total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
-               data.grid_force);
+    const uint32_t sort_count = mpm_count > total_nodes ? mpm_count : total_nodes;
+    MpmScratch sc = PartitionScratch(data.mpm_sort_scratch, sort_count);
+    // grid_body_dp is raw 3*u32-per-node scratch until BodyProject overwrites it:
+    // [active node ids | cell starts | cell ends].
+    uint32_t* grid_node_scratch = reinterpret_cast<uint32_t*>(data.grid_body_dp);
+    uint32_t* active_nodes = grid_node_scratch;
+    uint32_t* cell_start = grid_node_scratch + total_nodes;
+    uint32_t* cell_end = grid_node_scratch + 2ull * total_nodes;
+    profiler.Start(MpmStage::GridPrepare, stream);
+    LaunchCuda(MpmGridPrepareKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
+               total_nodes, data.grid_mass, data.grid_body_owner, cell_start);
+    profiler.Stop(MpmStage::GridPrepare, stream);
+    profiler.Start(MpmStage::CellKeys, stream);
     LaunchCuda(MpmCellKeysKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
                mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
                p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], cpe,
-               data.mpm_grid_cell_key, data.mpm_grid_part_idx, data.env_status);
-    MpmScratch sc = PartitionScratch(data.mpm_sort_scratch, mpm_count);
+               data.mpm_grid_cell_key, data.mpm_grid_part_idx, p.nodes_per_env,
+               data.grid_body_owner, data.env_status);
+    profiler.Stop(MpmStage::CellKeys, stream);
+    profiler.Start(MpmStage::RadixSort, stream);
+    const uint32_t total_cells = cpe * p.env_count;
     (void)cub::DeviceRadixSort::SortPairs(
         sc.sort_temp, sc.sort_temp_bytes, data.mpm_grid_cell_key, sc.keys_out,
-        data.mpm_grid_part_idx, sc.idx_out, static_cast<int>(mpm_count), 0, 32, stream);
+        data.mpm_grid_part_idx, sc.idx_out, static_cast<int>(mpm_count), 0,
+        RadixBitsInclusive(total_cells - 1u), stream);
+    profiler.Stop(MpmStage::RadixSort, stream);
+    profiler.Start(MpmStage::CellRanges, stream);
+    LaunchCuda(MpmBuildCellRangesKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
+               mpm_count, sc.keys_out, total_nodes, cell_start, cell_end);
+    profiler.Stop(MpmStage::CellRanges, stream);
+    // The particle key input is dead after radix sort, so lane 0 stores the
+    // selected-count scalar.
+    uint32_t* active_node_count = data.mpm_grid_cell_key;
+    cub::CountingInputIterator<uint32_t> active_id_iter(0u);
+    size_t select_temp_bytes = sc.sort_temp_bytes;
+    profiler.Start(MpmStage::ActiveSelect, stream);
+    (void)cub::DeviceSelect::Flagged(
+        sc.sort_temp, select_temp_bytes, active_id_iter, data.grid_body_owner,
+        active_nodes, active_node_count, static_cast<int>(total_nodes), stream);
+    profiler.Stop(MpmStage::ActiveSelect, stream);
+    profiler.Start(MpmStage::Stress, stream);
+    LaunchCuda(MpmPrecomputeStressKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
+               mpm_count, Ppe, mpm_pe, data.particle_C, data.particle_F,
+               data.particle_vol0, data.particle_material_id,
+               data.mpm_material_table, p.material_count,
+               data.mpm_particle_stress);
+    profiler.Stop(MpmStage::Stress, stream);
+    profiler.Start(MpmStage::P2G, stream);
     LaunchCuda(MpmP2GGatherKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-               total_nodes, data.particle_pos, data.particle_inv_mass,
-               data.particle_vel, data.particle_C, data.particle_F,
-               data.particle_vol0, data.particle_material_id, data.mpm_material_table,
-               p.material_count, sc.keys_out, sc.idx_out, mpm_count, Ppe, p.nodes_per_env,
+               total_nodes, active_nodes, active_node_count,
+               data.particle_pos, data.particle_inv_mass,
+               data.particle_vel, data.particle_C, data.particle_vol0,
+               data.mpm_particle_stress, sc.idx_out, cell_start, cell_end,
+               mpm_count, mpm_pe,
+               p.nodes_per_env,
                cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx,
                dt_sub, origin, data.grid_mass, data.grid_momentum);
+    profiler.Stop(MpmStage::P2G, stream);
     const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
     const m::Vec3 pn{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
+    profiler.Start(MpmStage::GridUpdate, stream);
     LaunchCuda(MpmGridUpdateKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
                total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx,
                origin, g, dt_sub, pn, p.plane_d, p.plane_mu, data.grid_mass,
                data.grid_momentum, data.grid_velocity);
+    profiler.Stop(MpmStage::GridUpdate, stream);
     // Dynamic-body grid BC + two-way reaction (between grid-update and G2P). The
     // BITE disables ONLY these kernels (the static-plane BC above stays on).
     if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u &&
         p.bodies_per_env > 0u) {
         const uint32_t total_bodies = p.bodies_per_env * p.env_count;
         const uint32_t bblocks = (total_bodies + kBlockSize - 1u) / kBlockSize;
+        profiler.Start(MpmStage::BodyProject, stream);
         LaunchCuda(MpmGridBodyProjectKernel, dim3(nblocks), dim3(kBlockSize), 0u,
                    stream, total_nodes, p.nodes_per_env, p.grid_dims[0],
                    p.grid_dims[1], p.dx, origin, p.bodies_per_env, p.body_mu,
@@ -1063,29 +1310,48 @@ void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                    model.sdf_cell_count, model.sdf_cell_keys, model.sdf_cell_values,
                    model.sdf_cell_gradients, data.grid_mass, data.grid_velocity,
                    data.grid_body_dp, data.grid_body_owner, data.env_status);
+        profiler.Stop(MpmStage::BodyProject, stream);
+        uint32_t* body_node_ids = reinterpret_cast<uint32_t*>(data.grid_mass);
+        profiler.Start(MpmStage::BodySort, stream);
+        LaunchCuda(MpmInitNodeIdsKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
+                   total_nodes, body_node_ids);
+        (void)cub::DeviceRadixSort::SortPairs(
+            sc.sort_temp, sc.sort_temp_bytes, data.grid_body_owner,
+            sc.keys_out, body_node_ids, sc.idx_out, static_cast<int>(total_nodes), 0,
+            RadixBitsInclusive(total_bodies), stream);
+        profiler.Stop(MpmStage::BodySort, stream);
+        profiler.Start(MpmStage::BodyReact, stream);
         LaunchCuda(MpmGridBodyReactKernel, dim3(bblocks), dim3(kBlockSize), 0u,
-                   stream, total_bodies, p.bodies_per_env, p.nodes_per_env,
+                   stream, total_bodies, p.bodies_per_env, total_nodes,
+                   p.nodes_per_env,
                    p.grid_dims[0], p.grid_dims[1], p.dx, origin,
                    data.body_pose, data.body_inv_mass, data.body_inv_inertia,
-                   model.body_to_link, data.grid_body_dp, data.grid_body_owner,
+                   model.body_to_link, data.grid_body_dp, sc.keys_out, sc.idx_out,
                    data.body_linear_velocity, data.body_angular_velocity,
                    data.mpm_body_reaction, data.mpm_body_ang_reaction);
+        profiler.Stop(MpmStage::BodyReact, stream);
     }
+    profiler.Start(MpmStage::G2P, stream);
     LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
                mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
                p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
                data.grid_velocity, data.particle_pos, data.particle_vel,
                data.particle_C);
+    profiler.Stop(MpmStage::G2P, stream);
+    profiler.Start(MpmStage::UpdateF, stream);
     LaunchCuda(MpmUpdateFKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, mpm_count,
                dt_sub, data.particle_C, data.particle_material_id,
                data.mpm_material_table, p.material_count, Ppe, mpm_pe, data.particle_F,
                data.env_status);
+    profiler.Stop(MpmStage::UpdateF, stream);
 }
 
 Status OpMpmStep(const ModelView& model, const DataView& data,
                  const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const MpmStepParams*>(params);
     if (p == nullptr) return Status::Failed;
+    MpmProfiler& profiler = MpmProfiler::Get();
+    profiler.BeginStep();
     // Defensive inertness (the build-time add() gate already keeps this op off a
     // non-MPM op list): nothing to do without MPM particles / a grid / a cell size.
     if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmXpbd) ||
@@ -1098,7 +1364,7 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         static_cast<uint64_t>(p->grid_dims[0]) * p->grid_dims[1] * p->grid_dims[2];
     if (cells_per_env == 0u) return Status::Ok;
     // LOUD overflow: the env-offset node/cell key + total-body launch must fit u32.
-    if (total_nodes64 > 0xFFFFFFFFull) return Status::Failed;
+    if (total_nodes64 > static_cast<uint64_t>(INT_MAX)) return Status::Failed;
     if (cells_per_env * p->env_count > 0xFFFFFFFFull) return Status::Failed;
     if (static_cast<uint64_t>(p->bodies_per_env) * p->env_count > 0xFFFFFFFFull)
         return Status::Failed;
@@ -1109,12 +1375,13 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     const uint32_t mpm_pe =
         (p->mpm_particles_per_env == 0u || p->mpm_particles_per_env > Ppe)
             ? Ppe : p->mpm_particles_per_env;
-    const uint32_t mpm_count = mpm_pe * p->env_count;
+    const uint64_t mpm_count64 =
+        static_cast<uint64_t>(mpm_pe) * p->env_count;
     // LOUD invariants: the count fits the per-env footprint + cub's int num_items.
     if (static_cast<uint64_t>(Np) >
         static_cast<uint64_t>(Ppe) * p->env_count) return Status::Failed;
-    if (static_cast<uint64_t>(mpm_count) > static_cast<uint64_t>(INT_MAX))
-        return Status::Failed;
+    if (mpm_count64 > static_cast<uint64_t>(INT_MAX)) return Status::Failed;
+    const uint32_t mpm_count = static_cast<uint32_t>(mpm_count64);
     const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
     const float inv_dx = 1.0f / p->dx;
@@ -1154,11 +1421,13 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         const nkops::ArticulationDeviceState state =
             nkops::MakeArticulationDeviceState(model, data, total_links, p->artic_count);
         const uint32_t ablocks = (p->artic_count + kBlockSize - 1u) / kBlockSize;
+        profiler.Start(MpmStage::ArticDeposit, stream);
         LaunchCuda(MpmArticReactDepositKernel, dim3(ablocks), dim3(kBlockSize), 0u,
                    stream, state, p->artic_count, p->artics_per_env, p->bodies_per_env,
                    p->base_link_count, p->max_dof, data.body_pose, model.body_to_link,
                    data.mpm_body_reaction, data.mpm_body_ang_reaction, data.m_inv,
                    data.qdot_flat);
+        profiler.Stop(MpmStage::ArticDeposit, stream);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
@@ -1166,7 +1435,8 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
 }  // namespace
 
 uint64_t MpmSortScratchBytes(uint32_t particle_count) {
-    if (particle_count == 0u) return 0u;
+    if (particle_count == 0u || particle_count > static_cast<uint32_t>(INT_MAX))
+        return 0u;
     return MpmSortScratchLayout(particle_count).total;
 }
 

@@ -3318,6 +3318,30 @@ target_link_libraries(nuka_texture_pipeline_test
 gtest_discover_tests(nuka_texture_pipeline_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "fast_full")
 
+# Reusable whole-solver capacity probe: real scene cook/upload plus exact
+# Model/Data arena segments and the emitted op list (not a local unit test).
+add_executable(nuka_solver_arena_profile
+    ${CMAKE_SOURCE_DIR}/examples/demo/solver_arena_profile.cpp
+)
+add_dependencies(nuka_solver_arena_profile nuka_codegen)
+target_compile_definitions(nuka_solver_arena_profile
+    PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(nuka_solver_arena_profile
+    PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+target_link_libraries(nuka_solver_arena_profile
+    PRIVATE
+        nuka_scene_cook
+        nuka_nk
+        nuka_phi2
+        nuka_runtime
+        nuka_import
+        nuka_cooker
+        nuka_articulation_gpu
+        nuka_collision_gpu
+        nuka_core
+        nuka_phi
+)
+
 # --- Vulkan renderer tests -------------------------------------------------
 if(NK_BUILD_VULKAN_VALIDATION)
     add_executable(nuka_render_test

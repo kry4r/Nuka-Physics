@@ -117,3 +117,50 @@ pipeline test; no local unit test was added.
 - `CoupledWorldCAbi`: 6/8 passed; the same two pre-existing coupling tests fail
   with byte-identical metrics on the baseline and fixed builds.  This change
   neither introduces nor fixes those stored reds.
+
+## 2026-07-14 full-solver follow-up
+
+After the host/SDF fixed cost was removed, the same reusable coarse-scene
+pipeline exposed replicated row and MPM work as the real batched bottlenecks.
+The follow-up keeps one provider/path and preserves each component's original
+ascending Gauss-Seidel order:
+
+- rigid contact slots retain the four-point/20-row footprint, while the general
+  sphere body-particle provider reserves its exact one-point/five-row footprint;
+- MPM gathers only active stencil nodes, builds direct cell ranges, precomputes
+  constitutive stress once per particle/substep, and stably groups body reaction
+  nodes using only the significant radix bits;
+- rigid/particle-only dynamic islands run their unchanged serial sweep in one
+  thread per component, with the live prefix interleaved across CTAs; components
+  touching an articulation stay on the existing warp kernel;
+- live articulation rows clear their own Jacobian slices before the unchanged
+  fixed-order accumulation, instead of clearing two dense row-capacity arrays;
+- unused particle-grid, MPM-only and retired grid-force buffers are zero-byte.
+
+Short GPU1 profiles use the same `.nks -> cook -> upload -> Step` executable,
+32 velocity iterations, four position iterations and eight steps.  These are
+short diagnostic samples rather than a long throughput claim.
+
+| envs | original coarse baseline | final | speedup |
+|---:|---:|---:|---:|
+| 1 | 29.83 ms/step | 12.41 ms/step | 2.40x |
+| 64 | 98.84 ms/step | 23.59 ms/step | 4.19x |
+| 256 | 312.90 ms/step | 63.49 ms/step | 4.93x |
+
+Final N=256 top stages were MPM 24.17 ms, row assembly 12.03 ms,
+row solve 11.75 ms and XPBD projection about 8.1 ms.  Model+Data arena size is
+4,390,843,648 bytes at N=256, versus about 11.23 GB before compact row storage.
+
+The eight-step BDX state remained byte-identical:
+
+```text
+particle_pos 95b30dd9f9a52a198f22a03d9276637d9bdc512db6b4a3a5ae9b487cff36ff7c
+particle_vel 69ae2be5cc643cae69e48ab75eb23dde36c3f38bc3a6f912d34450b680c2ec09
+link_pose    faee5e272126dd9d8915f9dbf0ebdf9f3c99cd8a7ed70ce0f93f864c4d217c65
+```
+
+Final validation ran 103 scenario cases: 102 passed, one H1 asset-gated case
+skipped, zero failures.  The elastic, fluid and granular MPM gates, dynamic vs
+static island byte-identity, cloth FNV and the Go2 owner canary all retained
+their frozen values.  `solver_arena_profile` is a reusable whole-pipeline
+executable and is not registered as a unit test.

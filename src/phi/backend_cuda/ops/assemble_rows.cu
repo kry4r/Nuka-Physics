@@ -100,7 +100,8 @@ __forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
 // own dof_stride-wide output slice. No atomics, no cross-contact aliasing.
 // (The union family launches this over ROW slots — same kernel, the per-slot
 // inputs are gathered per row; an inactive row carries the kInvalidLink
-// sentinel and is skipped, leaving its memset-zero J row.)
+// sentinel and is skipped. Consumers gate on the current row side before reading
+// J, so only a live articulation row needs initialization.)
 // C3 (general contact pipeline) — CONTACT POINT/NORMAL FRAME DECISION.
 // The unified contact buffer (the FUSED contact_*, the union ucontact_*, and the
 // general PairDriven manifold) stores the contact POINT in WORLD space and the
@@ -137,10 +138,15 @@ __global__ void ComputeContactChainJacobianKernel(
     const math::Vec3 normal = NormalizeOrUp(contact_normal_world[contact]);
     float* const out_row = out_chain_jacobian + static_cast<size_t>(contact) * dof_stride;
 
+    // AccumulateChainJointForce uses +=. Zero exactly the live articulation row
+    // here instead of clearing both dense rows_per_env x dof arrays every step;
+    // inactive and rigid/particle rows are never consumed by the gated K4 kernels.
+    for (uint32_t k = 0u; k < dof_stride; ++k) out_row[k] = 0.0f;
+
     // Walk from the contact's link up to the root, emitting each ancestor joint's
     // column via the shared chain-J builder. The scalar-direction column is the
     // wrench (f=normal, tau=0) case; the deposit path feeds it a full wrench. The
-    // out_row slice is zeroed by the launcher, so the helper's += writes once.
+    // out_row slice is zeroed above, so the helper's += writes once.
     uint32_t link = contact_link;
     while (link != kInvalidLink) {
         if (JointDofCount(state.joint_type[link]) != 0u) {
@@ -395,6 +401,10 @@ __global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
 constexpr uint32_t kPdPtsPerSlot = nk::kPairDrivenPtsPerSlot;   // 4
 constexpr uint32_t kPdSpokes     = nk::kPairDrivenSpokesPerPt;  // 4
 constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 20
+constexpr uint32_t kPdParticlePtsPerSlot =
+    nk::kPairDrivenParticlePtsPerSlot;                           // 1
+constexpr uint32_t kPdParticleRowsPerSlot =
+    nk::kPairDrivenParticleRowsPerSlot;                          // 5
 
 // Resolve a contact side -> reaction side. The side-kind TAG (nk::kUContactSide*)
 // is consulted FIRST: it declares whether `index` is a body-local collidable row
@@ -508,6 +518,7 @@ __global__ void EmitPairDrivenRowsKernel(
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt, float baumgarte_max_velocity,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
+    uint32_t full_row_slot_count,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
     uint32_t* __restrict__ row_cj_link, math::Vec3* __restrict__ row_cj_point,
@@ -521,7 +532,14 @@ __global__ void EmitPairDrivenRowsKernel(
     if (gid >= total) return;
     const uint32_t env = gid / slot_count;
     const uint32_t slot = gid - env * slot_count;
-    const uint32_t base = env * rows_per_env + slot * kPdRowsPerSlot;
+    const bool compact_particle_slot = slot >= full_row_slot_count;
+    const uint32_t points_per_slot =
+        compact_particle_slot ? kPdParticlePtsPerSlot : kPdPtsPerSlot;
+    const uint32_t base = env * rows_per_env +
+        (compact_particle_slot
+             ? full_row_slot_count * kPdRowsPerSlot +
+                   (slot - full_row_slot_count) * kPdParticleRowsPerSlot
+             : slot * kPdRowsPerSlot);
 
     const uint32_t n_active = ucontact_count[gid];
 
@@ -594,11 +612,11 @@ __global__ void EmitPairDrivenRowsKernel(
     const float kFltMaxLocal = kFltMax;
 
     uint32_t active_rows = 0u;
-    for (uint32_t p = 0u; p < kPdPtsPerSlot; ++p) {
+    for (uint32_t p = 0u; p < points_per_slot; ++p) {
         const bool live = p < n_active && p < 4u;
         const size_t mp = static_cast<size_t>(gid) * 4u + p;
         const uint32_t normal_row = base + p;          // pts normal rows first.
-        const uint32_t spoke_base = base + kPdPtsPerSlot + p * kPdSpokes;
+        const uint32_t spoke_base = base + points_per_slot + p * kPdSpokes;
 
         math::Vec3 n{0, 0, 1};
         math::Vec3 point{0, 0, 0};
@@ -629,7 +647,7 @@ __global__ void EmitPairDrivenRowsKernel(
                                                     dt, /*refsafe=*/true);
                 row.flags = nk::nk_row_flags::kActive;
                 row.group_first = base;
-                row.group_normal_count = kPdPtsPerSlot;
+                row.group_normal_count = points_per_slot;
                 row.env = env;
                 // Cap aref so the target separating velocity aref*dt <=
                 // baumgarte_max_velocity (+inf default => byte-identical): bounded recovery.
@@ -671,7 +689,7 @@ __global__ void EmitPairDrivenRowsKernel(
                 const math::Vec3 dir = spokes[k & 3u];
                 row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kFriction;
                 row.group_first = base;
-                row.group_normal_count = kPdPtsPerSlot;
+                row.group_normal_count = points_per_slot;
                 row.env = env;
                 row.rhs = 0.0f;
                 row.compliance_alpha = 0.0f;
@@ -833,6 +851,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->baumgarte_max_velocity,
                    p->env_count, p->union_slot_count, p->rows_per_env,
+                   p->full_row_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,
@@ -842,13 +861,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
 
     if (has_artic) {
         // K3: chain Jacobians for side A AND side B (the SAME multi-artic kernel,
-        // fed each side's per-row link/point/dir gather). Zero both outputs first.
-        const size_t jbytes =
-            static_cast<size_t>(total_rows) * p->max_dof * sizeof(float);
-        if (cudaMemsetAsync(data.chain_jacobian, 0, jbytes, stream) != cudaSuccess ||
-            cudaMemsetAsync(data.chain_jacobian_b, 0, jbytes, stream) != cudaSuccess) {
-            return Status::Failed;
-        }
+        // fed each side's per-row link/point/dir gather). Each live articulation
+        // row clears its own slice before the fixed-order += walk.
         const ArticulationDeviceState state = MakeArticulationDeviceState(
             model, data, p->total_link_count, p->articulation_count);
         const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;

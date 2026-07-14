@@ -467,6 +467,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // shared params layout.)
         p_assemble_.union_slot_count = cap.max_contacts_per_env;
         p_assemble_.rows_per_env = cap.max_rows_per_env;
+        // Layout follows the slot provider, not the particle solver mode: rigid
+        // candidates are 4-point manifolds, the reserved sphere-particle tail is
+        // one point. With no reserve rigid_cap == the full slot stride.
+        p_assemble_.full_row_slot_count = rigid_cap;
         p_assemble_.bodies_per_env = cap.bodies_per_env;
         p_assemble_.base_link_count = base_link_count;
         for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.contact_solref[k];
