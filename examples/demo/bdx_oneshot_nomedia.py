@@ -6,14 +6,22 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from pathlib import Path
 
 import numpy as np
 import nuka
 from nuka.tasks import bdx_obs as B
 
-SCENES = os.path.dirname(
-    "/data/xtzhang25/_work/activate/agent-a79c434fcb3e6c705/examples/scenes/")
+REPO = Path(__file__).resolve().parents[2]
+SCENES = str(REPO / "examples" / "scenes")
 SRC = os.path.join(SCENES, "bdx_oneshot.nks")
+SRC_ASSET = os.path.join(SCENES, "bdx_oneshot.nka")
+
+
+def pair_asset(scene_path):
+    """Pair a derived .nks with the canonical packed mesh asset it references."""
+    shutil.copyfile(SRC_ASSET, os.path.splitext(scene_path)[0] + ".nka")
 
 
 def try_create(tag, path):
@@ -46,6 +54,7 @@ def main():
     # 1: unmodified re-dump next to the original (isolates the round-trip itself).
     p_same = os.path.join(SCENES, "bdx_oneshot_rt.nks")
     json.dump(doc, open(p_same, "w"))
+    pair_asset(p_same)
     b = try_create("REDUMP", p_same)
     if b is not None:
         b.destroy()
@@ -56,6 +65,12 @@ def main():
     doc2["media"] = []
     p_nm = os.path.join(SCENES, "bdx_oneshot_nomedia.nks")
     json.dump(doc2, open(p_nm, "w"))
+    pair_asset(p_nm)
+    # Keep the rigid-corridor training alias in lockstep with the diagnostic
+    # no-media scene; both are generated from the same canonical declaration.
+    p_corridor = os.path.join(SCENES, "corridor_nomedia.nks")
+    json.dump(doc2, open(p_corridor, "w"))
+    pair_asset(p_corridor)
     print(f"[nomedia] stripped {n} media", flush=True)
     b2 = try_create("NOMEDIA", p_nm)
     if b2 is not None:
