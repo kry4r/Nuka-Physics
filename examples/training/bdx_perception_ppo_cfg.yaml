@@ -64,7 +64,7 @@ params:
       scene: examples/scenes/corridor_nomedia.nks
       dt: 0.005
       decimation: 4
-      episode_length_s: 40.0
+      episode_length_s: 20.0
       resample_time_s: 40.0
       termination_height: 0.10
       termination_tilt_deg: 60.0
@@ -80,6 +80,11 @@ params:
       forward_progress_scale: 15.0
       progress_milestones: [0.35, 0.65, 1.2]
       progress_milestone_bonus: 2.0
+      # Episodic task contract: reaching the goal is a successful termination, not
+      # an endless alive-reward tail.  Values are relative to each randomized spawn.
+      success_progress_m: 1.2
+      success_bonus: 100.0
+      fall_penalty: 20.0
       push_enable: false
       sigma_lin: 0.01
       sigma_ang: 0.01

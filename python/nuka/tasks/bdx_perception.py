@@ -72,14 +72,27 @@ class BdxPerceptionEnv(BdxWalkEnv):
             float(v) for v in kwargs.pop("progress_milestones", ()))
         self.progress_milestone_bonus = float(
             kwargs.pop("progress_milestone_bonus", 0.0))
-        if self.forward_progress_scale < 0.0:
+        self.success_progress_m = float(kwargs.pop("success_progress_m", 0.0))
+        self.success_bonus = float(kwargs.pop("success_bonus", 0.0))
+        self.fall_penalty = float(kwargs.pop("fall_penalty", 0.0))
+        if not math.isfinite(self.forward_progress_scale) \
+                or self.forward_progress_scale < 0.0:
             raise ValueError("forward_progress_scale must be non-negative")
-        if self.progress_milestone_bonus < 0.0:
+        if not math.isfinite(self.progress_milestone_bonus) \
+                or self.progress_milestone_bonus < 0.0:
             raise ValueError("progress_milestone_bonus must be non-negative")
-        if (any(v <= 0.0 for v in self.progress_milestones)
+        if (any(not math.isfinite(v) or v <= 0.0
+                for v in self.progress_milestones)
                 or any(b <= a for a, b in zip(
                     self.progress_milestones, self.progress_milestones[1:]))):
             raise ValueError("progress_milestones must be positive and increasing")
+        if not math.isfinite(self.success_progress_m) \
+                or self.success_progress_m < 0.0:
+            raise ValueError("success_progress_m must be non-negative")
+        if not math.isfinite(self.success_bonus) or self.success_bonus < 0.0:
+            raise ValueError("success_bonus must be non-negative")
+        if not math.isfinite(self.fall_penalty) or self.fall_penalty < 0.0:
+            raise ValueError("fall_penalty must be non-negative")
         self.depth_width = int(cfg.get("width", 128))
         self.depth_height = int(cfg.get("height", 96))
         self.depth_update_period = int(cfg.get("update_period", 2))
@@ -155,6 +168,8 @@ class BdxPerceptionEnv(BdxWalkEnv):
         self._milestone_values = torch.as_tensor(
             self.progress_milestones, dtype=torch.float32,
             device=self._dev).unsqueeze(0)
+        self._last_success = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self._dev)
 
         proprio_one = spaces.Box(
             low=-B.OBS_CLIP, high=B.OBS_CLIP,
@@ -205,6 +220,15 @@ class BdxPerceptionEnv(BdxWalkEnv):
             self._episode_start_x[mask] = x[mask]
             self._episode_max_progress[mask] = 0.0
             self._milestones_reached[mask] = False
+
+    def compute_terminated(self) -> "torch.Tensor":
+        physical_fall = super().compute_terminated()
+        self._last_success.zero_()
+        if self.success_progress_m > 0.0:
+            progress = self._obs.base_pos()[:, 0] - self._episode_start_x
+            self._last_success.copy_(
+                (progress >= self.success_progress_m) & ~physical_fall)
+        return physical_fall | self._last_success
 
     def _randomize_spawn_x(self, mask: "torch.Tensor | None") -> None:
         """Translate the articulation on the start platform, environment unchanged.
@@ -279,12 +303,22 @@ class BdxPerceptionEnv(BdxWalkEnv):
                 self.command, self.last_action,
                 self._ref.phase_features(self.phase_i))
         self._reset_progress_state(None)
+        self._last_success.zero_()
         self._sensor_tick = 0
         return self._structured_obs(proprio, force=True), info
 
     def step(self, actions: torch.Tensor):
         previous_x = self._obs.base_pos()[:, 0].clone()
         proprio, reward, terminated, truncated, info = super().step(actions)
+        success = self._last_success.clone()
+        if self.success_bonus > 0.0:
+            reward = reward + success.to(reward.dtype) * self.success_bonus
+        fall = terminated & ~success
+        if self.fall_penalty > 0.0:
+            reward = reward - fall.to(reward.dtype) * self.fall_penalty
+        info = dict(info)
+        info["success"] = success
+        info["fall"] = fall
         self._sensor_tick += 1
         # A reset env must not inherit the previous episode's last camera frame.
         done = terminated | truncated
@@ -317,6 +351,7 @@ class BdxPerceptionEnv(BdxWalkEnv):
             proprio[done] = fresh[done]
         if force:
             self._reset_progress_state(done)
+            self._last_success[done] = False
         obs = self._structured_obs(proprio, force=force)
         return obs, reward, terminated, truncated, info
 

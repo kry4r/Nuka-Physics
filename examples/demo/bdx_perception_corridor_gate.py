@@ -82,6 +82,9 @@ def run(args) -> dict:
         episode_length_s=args.seconds + 1.0,
         push_enable=False,
         spawn_x_range=(args.spawn_x_low, args.spawn_x_high),
+        success_progress_m=args.success_progress_m,
+        success_bonus=0.0,
+        fall_penalty=0.0,
         sensor={
             "width": args.width,
             "height": args.height,
@@ -97,6 +100,7 @@ def run(args) -> dict:
 
         active = torch.ones(args.envs, dtype=torch.bool, device=env._dev)
         ever_fell = torch.zeros_like(active)
+        ever_succeeded = torch.zeros_like(active)
         max_x = spawn_x.clone()
         last_x = spawn_x.clone()
         vx_sum = torch.zeros(args.envs, device=env._dev)
@@ -131,11 +135,17 @@ def run(args) -> dict:
                     action_zero_abs_max[active], delta[active].amax(dim=1))
 
                 actions = normal_mu if args.drive_depth == "normal" else zero_mu
-                obs, _, terminated, truncated, _ = env.step(actions)
+                obs, _, terminated, truncated, info = env.step(actions)
                 any_nonfinite |= not all(
                     bool(torch.isfinite(value).all()) for value in obs.values())
+                success = active & info["success"]
+                if bool(success.any()):
+                    goal_x = spawn_x + args.success_progress_m
+                    max_x[success] = torch.maximum(max_x[success], goal_x[success])
+                    last_x[success] = goal_x[success]
+                ever_succeeded |= success
                 done = active & (terminated | truncated)
-                ever_fell |= active & terminated
+                ever_fell |= active & info["fall"]
                 active &= ~done
 
         valid = sample_count > 0
@@ -172,6 +182,8 @@ def run(args) -> dict:
             "reach_x": args.reach_x,
             "reach_rate": float(reached.float().mean()),
             "fall_rate": float(ever_fell.float().mean()),
+            "success_progress_m": args.success_progress_m,
+            "success_rate": float(ever_succeeded.float().mean()),
             "survival_rate": float(active.float().mean()),
             "mean_vx": float(per_env_vx.mean()),
             "mean_first_episode_s": float((sample_count * control_dt).mean()),
@@ -187,6 +199,7 @@ def run(args) -> dict:
                 result["normal_vs_zero_action_mean_abs"]
                 >= args.min_action_depth_delta),
             "fall_rate": result["fall_rate"] <= args.max_fall_rate,
+            "success_rate": result["success_rate"] >= args.min_success_rate,
             "two_step_clear_rate": (
                 result["two_step_clear_rate"] >= args.min_two_step_rate),
             "reach_rate": result["reach_rate"] >= args.min_reach_rate,
@@ -217,10 +230,12 @@ def main() -> int:
     parser.add_argument("--first-clear-x", type=float, default=0.15)
     parser.add_argument("--two-step-clear-x", type=float, default=0.45)
     parser.add_argument("--reach-x", type=float, default=0.90)
+    parser.add_argument("--success-progress-m", type=float, default=1.20)
     parser.add_argument("--min-action-depth-delta", type=float, default=1.0e-4)
     parser.add_argument("--max-fall-rate", type=float, default=0.10)
     parser.add_argument("--min-two-step-rate", type=float, default=0.90)
     parser.add_argument("--min-reach-rate", type=float, default=0.80)
+    parser.add_argument("--min-success-rate", type=float, default=0.80)
     parser.add_argument("--min-mean-vx", type=float, default=0.12)
     parser.add_argument(
         "--enforce", action="store_true",
@@ -233,6 +248,8 @@ def main() -> int:
         parser.error("--spawn-x-low must be smaller than --spawn-x-high")
     if not args.first_clear_x < args.two_step_clear_x < args.reach_x:
         parser.error("clearance thresholds must be strictly increasing")
+    if args.success_progress_m < 0.0:
+        parser.error("--success-progress-m must be non-negative")
     result = run(args)
     print(json.dumps(result, sort_keys=True), flush=True)
     return 0 if not args.enforce or all(result["gates"].values()) else 3

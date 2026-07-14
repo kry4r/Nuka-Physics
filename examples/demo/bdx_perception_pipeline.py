@@ -66,6 +66,9 @@ def run(args) -> dict:
         forward_progress_scale=args.forward_progress_scale,
         progress_milestones=args.progress_milestones,
         progress_milestone_bonus=args.progress_milestone_bonus,
+        success_progress_m=0.5 if args.force_success_reset else 0.0,
+        success_bonus=100.0,
+        fall_penalty=20.0,
         sensor={
             "width": args.width,
             "height": args.height,
@@ -131,7 +134,9 @@ def run(args) -> dict:
         expected_ages = [0.0]
         rewards = []
         autoreset_count = 0
+        success_autoreset_count = 0
         progress_reset_max_error = 0.0
+        success_primed = False
         actions = mu.clamp(-1.0, 1.0)
         for _ in range(args.steps):
             # Prime the episodic accumulators immediately before the forced
@@ -143,12 +148,24 @@ def run(args) -> dict:
             if about_to_truncate:
                 env._episode_max_progress.fill_(123.0)
                 env._milestones_reached.fill_(True)
-            obs, reward, terminated, truncated, _ = env.step(actions)
+            if args.force_success_reset and not success_primed:
+                env._episode_start_x.copy_(
+                    env._obs.base_pos()[:, 0] - env.success_progress_m - 1.0)
+                success_primed = True
+            obs, reward, terminated, truncated, info = env.step(actions)
             ages.append(float(obs["depth_age"][0, 0]))
             rewards.append(float(reward.mean()))
             with torch.no_grad():
                 actions = network({"obs": obs})[0].clamp(-1.0, 1.0)
             done = terminated | truncated
+            success = info["success"]
+            if bool(success.any()):
+                success_autoreset_count += int(success.sum())
+                if bool((success & ~terminated).any()) \
+                        or bool((success & truncated).any()):
+                    raise RuntimeError("success was not a clean task termination")
+                if float(reward[success].min()) < env.success_bonus:
+                    raise RuntimeError("success bonus was not applied before autoreset")
             if bool(done.any()):
                 autoreset_count += int(done.sum())
                 # A reset forces a fresh frame; the env's stale-frame invariant is
@@ -174,6 +191,8 @@ def run(args) -> dict:
 
         if args.episode_steps and autoreset_count == 0:
             raise RuntimeError("short-episode gate did not exercise autoreset")
+        if args.force_success_reset and success_autoreset_count == 0:
+            raise RuntimeError("success gate did not exercise success autoreset")
         age_error = max(abs(a - b) for a, b in zip(ages, expected_ages))
         if age_error > 1.0e-6:
             raise RuntimeError(
@@ -200,6 +219,7 @@ def run(args) -> dict:
             "frame_ages_s": ages,
             "frame_age_max_error": age_error,
             "autoreset_count": autoreset_count,
+            "success_autoreset_count": success_autoreset_count,
             "progress_reset_max_error": progress_reset_max_error,
             "spawn_x_min": float(spawn_x.min()),
             "spawn_x_max": float(spawn_x.max()),
@@ -235,6 +255,9 @@ def main() -> None:
     parser.add_argument(
         "--episode-steps", type=int, default=0,
         help="force this many control steps per episode and require autoreset")
+    parser.add_argument(
+        "--force-success-reset", action="store_true",
+        help="force one goal completion and verify success autoreset semantics")
     parser.add_argument("--forward-progress-scale", type=float, default=15.0)
     parser.add_argument(
         "--progress-milestones", type=float, nargs="+",
@@ -253,6 +276,8 @@ def main() -> None:
         parser.error("--episode-steps must be non-negative")
     if args.episode_steps and args.steps < args.episode_steps:
         parser.error("--steps must reach --episode-steps")
+    if args.episode_steps and args.force_success_reset:
+        parser.error("choose either a time-limit reset or a success reset gate")
     print(json.dumps(run(args), sort_keys=True), flush=True)
 
 
