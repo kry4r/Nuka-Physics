@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -90,6 +91,44 @@ void AddBox(nk::Model& m, const Vec3& pos, const Vec3& vel, float half,
     sh.contype = 1u; sh.conaffinity = 1u; sh.sdf_grid = ~0u;
     sh.body_id = body_id;
     sh.group = 0u;
+    m.shape_table_rows.push_back(sh);
+}
+
+constexpr uint32_t kKindCapsule = 1u;  // collision::ShapeKind Capsule
+
+// A capsule (radius, half_height; axis = local Y) lying flat at yaw `yaw_z`.
+void AddCapsule(nk::Model& m, const Vec3& pos, float radius, float half_height,
+                float yaw_z, float mass, int32_t body_id) {
+    nk::Model::BodyInit bi;
+    bi.pose = Transform::Identity();
+    bi.pose.position = pos;
+    bi.pose.rotation = nuka::math::Quat::FromAxisAngle(Vec3{0, 0, 1}, yaw_z);
+    bi.inv_mass = mass > 0.0f ? 1.0f / mass : 0.0f;
+    // Small light body -> large inv-inertia, so a spurious contact torque would
+    // tumble it hard (the ejection signature); the fix keeps it torque-free.
+    const float ii = mass > 0.0f ? 1.0f / (mass * radius * radius) : 0.0f;
+    bi.inv_inertia = Vec3{ii, ii, ii};
+    m.body_init.push_back(bi);
+    nk::Model::PairDrivenShape sh;
+    sh.kind = kKindCapsule;
+    sh.params[0] = radius; sh.params[1] = half_height; sh.params[2] = radius;
+    sh.contype = 1u; sh.conaffinity = 1u; sh.sdf_grid = ~0u;
+    sh.body_id = body_id; sh.group = 0u;
+    m.shape_table_rows.push_back(sh);
+}
+
+// A large static box (immovable plate); top face at pos.z + half_z.
+void AddStaticBox(nk::Model& m, const Vec3& pos, const Vec3& half, int32_t body_id) {
+    nk::Model::BodyInit bi;
+    bi.pose = Transform::Identity();
+    bi.pose.position = pos;
+    bi.inv_mass = 0.0f; bi.inv_inertia = Vec3{0, 0, 0};
+    m.body_init.push_back(bi);
+    nk::Model::PairDrivenShape sh;
+    sh.kind = kKindBox;
+    sh.params[0] = half.x; sh.params[1] = half.y; sh.params[2] = half.z;
+    sh.contype = 1u; sh.conaffinity = 1u; sh.sdf_grid = ~0u;
+    sh.body_id = body_id; sh.group = 0u;
     m.shape_table_rows.push_back(sh);
 }
 
@@ -259,4 +298,74 @@ TEST(PairDrivenSolve, TwoRunsByteIdentical) {
     EXPECT_TRUE(same(a.lin, c.lin)) << "body velocity differs across runs";
     EXPECT_TRUE(same(a.pose, c.pose)) << "body pose differs across runs";
     EXPECT_TRUE(same(a.lambda, c.lambda)) << "contact lambda differs across runs";
+}
+
+// --- capsule/box pile on a static plate settles (no ejection) ----------------
+// The general reproduction of the ejection bug: small light capsules (bolts) lying
+// flat on a box plate, in a dense multi-contact island. Capsule x box was the ONE
+// EPA-path resting contact, and its single off-centre over-deep witness injected a
+// torque that tumbled a light capsule through the plate and flung it at m/s. The
+// closest-feature manifold (2 symmetric endpoint points, true depth) keeps the pile
+// at rest. If this bug returns, a body tunnels the plate and ejects.
+TEST(PairDrivenSolve, CapsuleBoxPileSettlesNoEject) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    Backend b = GetBackend();
+
+    nk::Model m;
+    AddStaticBox(m, Vec3{0, 0, -0.5f}, Vec3{1.0f, 1.0f, 0.5f}, 0);  // plate top z=0
+    const float r = 0.02f, hh = 0.03f;
+    int32_t id = 1;
+    // A 3x3 raft of flat bolts at assorted yaws resting at z=r. Grid pitch 0.14 >
+    // 2*(hh+r)=0.10, so no capsule overlaps another at spawn (a bolt is a bolt on a
+    // plate -- the resting posture that surfaced the bug, no spawn penetration).
+    const float yaw[9] = {0.0f, 0.7f, 1.4f, 2.1f, 2.8f, 0.35f, 1.05f, 1.75f, 2.45f};
+    int k = 0;
+    for (int ix = 0; ix < 3; ++ix)
+        for (int iy = 0; iy < 3; ++iy) {
+            const Vec3 p{-0.14f + 0.14f * ix, -0.14f + 0.14f * iy, r};
+            AddCapsule(m, p, r, hh, yaw[k++], 0.02f, id++);
+        }
+    // A few small boxes (nuts/washers) on a separate row, clear of the bolts.
+    AddBox(m, Vec3{-0.14f, 0.34f, 0.015f}, Vec3{0, 0, 0}, 0.015f, 0.02f, id++);
+    AddBox(m, Vec3{0.0f, 0.34f, 0.015f}, Vec3{0, 0, 0}, 0.015f, 0.02f, id++);
+    AddBox(m, Vec3{0.14f, 0.34f, 0.02f}, Vec3{0, 0, 0}, 0.02f, 0.02f, id++);
+
+    FinishBodyModel(m);
+    const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
+    m.capacities.max_contacts_per_env = 96u;
+    m.capacities.max_rows_per_env = 96u * nk::kPairDrivenRowsPerSlot;
+
+    nk::Pipeline::SolverConfig cfg = Cfg(-9.81f);
+    cfg.max_pairs = 192u;
+    nk::World w(std::move(m), 1u, b.dev, b.backend, cfg);
+    ASSERT_TRUE(w.Ready());
+    float worst_v = 0.0f;
+    for (uint32_t s = 0; s < 400u; ++s) {
+        ASSERT_TRUE(w.Step().AllOk()) << s;
+        if (s >= 350u) {  // settled window
+            const Snapshot sn = Download(w, bodies, m.capacities.max_rows_per_env);
+            for (uint32_t i = 1; i < bodies; ++i)
+                worst_v = std::max(worst_v, std::sqrt(sn.lin[i].Dot(sn.lin[i])));
+        }
+    }
+    const Snapshot snap = Download(w, bodies, m.capacities.max_rows_per_env);
+    ASSERT_TRUE(snap.ok);
+    float min_z = 1e9f, max_xy = 0.0f;
+    bool finite = true;
+    for (uint32_t i = 1; i < bodies; ++i) {
+        const Vec3 p = snap.pose[i].position;
+        finite &= std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+        min_z = std::min(min_z, p.z);
+        max_xy = std::max(max_xy, std::max(std::abs(p.x), std::abs(p.y)));
+    }
+    std::fprintf(stderr, "[pd capsule-pile] bodies=%u min_z=%.4f max_xy=%.4f worst_v=%.4f\n",
+                 bodies, min_z, max_xy, worst_v);
+    // The EPA torque bug tunnelled a bolt through the plate and flung it at metres/s
+    // (min_z << 0, max_xy >> cluster, worst_v ~ 5). The closest-feature manifold keeps
+    // every bolt ON the plate, in the cluster, and sub-launch. (A residual ~0.5 m/s
+    // jitter of these 20 g bolts is a dense light-body settling debt, NOT ejection.)
+    EXPECT_TRUE(finite) << "a body position went NaN/inf";
+    EXPECT_GT(min_z, -0.03f) << "a body tunnelled through the plate (穿模/eject)";
+    EXPECT_LT(max_xy, 0.6f) << "a body was flung out of the cluster (ejection)";
+    EXPECT_LT(worst_v, 1.5f) << "a body launched off the pile (ejection, not jitter)";
 }

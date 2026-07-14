@@ -84,6 +84,9 @@ struct BlasMesh {
     std::vector<TriangleNormals> tri_normals;
     // Per-triangle UVs (beauty texture path); empty => triplanar. 1:1 with triangles.
     std::vector<TriangleUVs> tri_uvs;
+    // Per-sphere albedo tint multiplier (beauty grain scatter), 1:1 with spheres;
+    // empty => untinted (byte-identical to a mesh that ships none).
+    std::vector<math::Vec3> sphere_colors;
 };
 
 // One placed instance: which unique mesh (blas_id indexes TwoLevelScene::meshes),
@@ -177,6 +180,10 @@ struct BeautyOptions {
     // Sun disc baked into the sky so reflective/transmissive surfaces show a crisp
     // specular glint. Zero radiance (default) leaves the sky byte-identical.
     math::Vec3 sun_disc_radiance{0.0f, 0.0f, 0.0f};
+
+    // Opt-in: the opaque arm shades Cook-Torrance + casts an env reflection ray.
+    // false (default) keeps the achromatic highlight, byte-identical for the sensor path.
+    bool specular_env = false;
 
     // Host-download gate (default all => byte-unchanged). RenderBeautyToAovs and
     // the device-resident path ignore it; only the host RenderBeauty copy uses it.

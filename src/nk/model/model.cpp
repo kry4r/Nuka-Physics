@@ -62,6 +62,22 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    // MPM transfer scratch is absent from pure XPBD/PBF worlds. The MPM op is not
+    // emitted there, so these per-particle buffers must stay byte-inert just like
+    // the scalar CUB workspace that owns their lifetime.
+    if (mpm_grid_sort_scratch_bytes == 0u &&
+        (id == FieldId::MpmGridCellKey || id == FieldId::MpmGridPartIdx ||
+         id == FieldId::MpmParticleStress)) {
+        return 0u;
+    }
+    // The particle-neighbor grid is absent in XPBD/MPM worlds. Its op is inert
+    // there (cell_size==0), so none of these per-particle CSR fields is consumed.
+    if (grid_sort_scratch_bytes == 0u &&
+        (id == FieldId::GridCellKey || id == FieldId::GridParticleIdx ||
+         id == FieldId::GridNeighborOffset || id == FieldId::GridNeighborCount ||
+         id == FieldId::GridNeighborIdx)) {
+        return 0u;
+    }
     if (lay.per == FieldPer::Scalar) {
         // The one symbolic per:scalar field in M3a is mat_buckets (num_buckets*8),
         // a GLOBAL table (not env-replicated). Any other scalar field defaults to
@@ -130,8 +146,11 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // MLS-MPM background grid node fields: per-env nodes x env_count (the keys
         // are env-offset, so each env owns a private node span). 0 for a non-MPM world.
         // grid_body_dp/grid_body_owner share the per-node extent (the body-BC handoff).
+        if (id == FieldId::GridForce) {
+            return 0u;  // retired force buffer; P2G folds force into momentum.
+        }
         if (id == FieldId::GridMass || id == FieldId::GridMomentum ||
-            id == FieldId::GridVelocity || id == FieldId::GridForce ||
+            id == FieldId::GridVelocity ||
             id == FieldId::GridBodyDp || id == FieldId::GridBodyOwner) {
             return static_cast<uint64_t>(mpm_grid_nodes_per_env) *
                    static_cast<uint64_t>(env_count);

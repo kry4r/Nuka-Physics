@@ -2,7 +2,8 @@
 
 A morph carries GEOMETRY, never physics behavior. ``NKS`` names a cooked scene
 file (the robot/world); the media lattices are ``Grid`` (cloth), ``TetSphere``
-(solid soft body), ``FluidBox`` and ``GranularBed``; the rigid primitives are ``Box`` / ``Sphere``
+(solid soft body), ``FluidBox``, ``GranularBed`` and ``Cable`` (an XPBD rope, with
+an optional ``CableSlab`` weight); the rigid primitives are ``Box`` / ``Sphere``
 / ``Capsule`` / ``Plane`` / ``Ground``. The constitutive material + the surface
 are attached at ``Scene.add_entity`` and the per-step choreography lives in
 ``nuka.author.control``. A media morph exposes the geometry block of
@@ -14,7 +15,7 @@ geometry block of ``SceneBuilder.add_rigid_primitive``
 from __future__ import annotations
 
 import dataclasses as _dc
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as _np
 
@@ -94,37 +95,130 @@ class TetSphere:
 
 
 @_dc.dataclass(frozen=True)
+class MpmFill:
+    """A heterogeneous MLS-MPM sub-fill of a ``GranularBed`` / ``FluidBox``: the AABB
+    ``[min, max]`` sampled at ``spacing`` (``position_jitter`` breaks the lattice) with
+    its OWN ``material`` (a ``materials`` MPM constitutive; the base bed supplies the
+    shared grid scalars). ``render`` optionally shades this fill distinctly."""
+
+    min: Tuple[float, float, float]
+    max: Tuple[float, float, float]
+    spacing: float
+    material: object
+    position_jitter: float = 0.0
+    render: Optional[object] = None
+
+    def fill_geometry_kwargs(self) -> dict:
+        return dict(box_min=[float(c) for c in self.min],
+                    box_max=[float(c) for c in self.max],
+                    spacing=float(self.spacing),
+                    position_jitter=float(self.position_jitter))
+
+
+@_dc.dataclass(frozen=True)
 class FluidBox:
     """A fluid volume: the AABB ``[min, max]`` sampled on a uniform ``spacing``
-    lattice. Pair with a ``materials.Fluid`` (PBF or MLS-MPM)."""
+    lattice (``position_jitter`` breaks the perfect grid). Pair with a
+    ``materials.Fluid`` (PBF or MLS-MPM). ``fills`` appends heterogeneous MLS-MPM
+    sub-regions (each its own material) onto this base bed."""
 
     MEDIA_KIND = "fluid"
 
     min: Tuple[float, float, float]
     max: Tuple[float, float, float]
     spacing: float
+    position_jitter: float = 0.0
+    fills: Tuple[MpmFill, ...] = ()
 
     def media_geometry_kwargs(self) -> dict:
         return dict(fluid_min=[float(c) for c in self.min],
                     fluid_max=[float(c) for c in self.max],
-                    fluid_spacing=float(self.spacing))
+                    fluid_spacing=float(self.spacing),
+                    fluid_position_jitter=float(self.position_jitter))
 
 
 @_dc.dataclass(frozen=True)
 class GranularBed:
     """A granular (sand/gravel) bed: the AABB ``[min, max]`` sampled on a uniform
-    ``spacing`` lattice. Pair with a ``materials.Granular.MPM`` (Drucker-Prager)."""
+    ``spacing`` lattice (``position_jitter`` breaks the perfect grid). Pair with a
+    ``materials.Granular.MPM`` (Drucker-Prager). ``fills`` appends heterogeneous MLS-MPM
+    sub-regions (e.g. foot-lofted light debris) each with its own material."""
 
     MEDIA_KIND = "granular"
 
     min: Tuple[float, float, float]
     max: Tuple[float, float, float]
     spacing: float
+    position_jitter: float = 0.0
+    fills: Tuple[MpmFill, ...] = ()
 
     def media_geometry_kwargs(self) -> dict:
         return dict(fluid_min=[float(c) for c in self.min],
                     fluid_max=[float(c) for c in self.max],
-                    fluid_spacing=float(self.spacing))
+                    fluid_spacing=float(self.spacing),
+                    fluid_position_jitter=float(self.position_jitter))
+
+
+@_dc.dataclass(frozen=True)
+class CableSlab:
+    """The rigid weight welded to a cable's loaded end: a box of ``half_extents``
+    (cooked as one shape-match rigid cluster), ``mass`` per corner (``0`` => the
+    cable particle mass), and shape-match ``stiffness`` in [0,1] (``0`` => rigid)."""
+
+    half_extents: Tuple[float, float, float]
+    mass: float = 0.0
+    stiffness: float = 1.0
+
+
+@_dc.dataclass(frozen=True)
+class Cable:
+    """An XPBD rope: an inextensible distance chain of ``segments`` links
+    (``segments+1`` particles) from ``start`` to ``end``, drawn as ``radius``-m
+    beads. ``pin`` picks the kinematic endpoint(s) (``start`` anchor / ``end`` /
+    ``both`` / ``none``); ``bend`` adds skip-one stiffness rows; an optional ``slab``
+    (``CableSlab``) hangs a rigid weight off the loaded end. Pair with a
+    ``materials.Cable.XPBD``. Maps to the ``cable_*`` add_media kwargs."""
+
+    MEDIA_KIND = "cable"
+
+    start: Tuple[float, float, float]
+    end: Tuple[float, float, float]
+    segments: int
+    radius: float
+    pin: str = "start"
+    bend: bool = False
+    slab: Optional[CableSlab] = None
+
+    _PIN = {"start": 0, "end": 1, "both": 2, "none": 3}
+
+    def media_geometry_kwargs(self) -> dict:
+        if self.pin not in Cable._PIN:
+            raise ValueError(
+                f"Cable.pin must be start/end/both/none; got {self.pin!r}")
+        if int(self.segments) < 1 or float(self.radius) <= 0.0:
+            raise ValueError("Cable needs segments >= 1 and radius > 0")
+        kw = dict(
+            cable_start=[float(c) for c in self.start],
+            cable_end=[float(c) for c in self.end],
+            cable_segments=int(self.segments), cable_radius=float(self.radius),
+            cable_pin=int(Cable._PIN[self.pin]), cable_bend=bool(self.bend))
+        if self.slab is not None:
+            kw.update(
+                cable_slab_half_extents=[float(c) for c in self.slab.half_extents],
+                cable_slab_mass=float(self.slab.mass),
+                cable_slab_stiffness=float(self.slab.stiffness))
+        return kw
+
+    def rest_positions(self) -> "_np.ndarray":
+        """The ``(segments+1, 3)`` chain rest samples (``start`` -> ``end``); index 0
+        is the ``start`` endpoint. Slab corners (if any) are appended by the cook but
+        are not returned here. The control layer uploads these into
+        ``PARTICLE_POSITION`` (with a park/release offset)."""
+        n = int(self.segments) + 1
+        t = (_np.arange(n, dtype=_np.float32) / float(self.segments))[:, None]
+        s = _np.asarray(self.start, dtype=_np.float32)[None, :]
+        e = _np.asarray(self.end, dtype=_np.float32)[None, :]
+        return (1.0 - t) * s + t * e
 
 
 @_dc.dataclass(frozen=True)
@@ -204,6 +298,6 @@ class Ground:
 
 
 __all__ = [
-    "NKS", "Grid", "TetSphere", "FluidBox", "GranularBed",
-    "Box", "Sphere", "Capsule", "Plane", "Ground",
+    "NKS", "Grid", "TetSphere", "FluidBox", "GranularBed", "MpmFill", "Cable",
+    "CableSlab", "Box", "Sphere", "Capsule", "Plane", "Ground",
 ]

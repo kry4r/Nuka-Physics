@@ -393,8 +393,9 @@ struct MpmStepParams {
     uint32_t artics_per_env;     // co-resident articulations per env (>=1 when artic).
 };
 
-// Byte size of the pre-allocated mpm_sort_scratch field (the P2G deterministic-
-// gather cub radix sort temp + the sorted key/idx out buffers, 256B-aligned).
+// Byte size of the pre-allocated mpm_sort_scratch field (the deterministic P2G
+// particle sort, active-node select, and body-reaction node sort share one cub
+// temp + sorted key/idx output pair, 256B-aligned).
 // Host-callable (defined in mpm.cu) so World sizes the field before allocation
 // -> no mid-capture cudaMalloc. 0 for 0 particles.
 uint64_t MpmSortScratchBytes(uint32_t particle_count);
@@ -495,8 +496,9 @@ struct NarrowphaseHeightfieldParams {
 // pattern: insertion-sorted, capped at max_candidates, N<2 direct-scan fallback),
 // and for each candidate body runs the sphere-vs-shape manifold (the particle is a
 // SPHERE of its radius on the ONE path). The manifold is written into the
-// particle's RESERVED contact-slot sub-range [slot_base + pi*cands_per_particle,
-// ...+cands_per_particle) so the body<->particle slots occupy a DETERMINISTIC
+// particle's RESERVED contact-slot sub-range [slot_base +
+// (pi - particle_row_base)*cands_per_particle, ...+cands_per_particle) so the
+// body<->particle slots occupy a DETERMINISTIC
 // sub-range relative to the racy rigid-rigid slots within each env block; the
 // per-particle base is a fixed (non-atomic) function of the particle index, so the
 // stream is bit-D1 by construction (no sort). Side A == the particle (global id +
@@ -520,8 +522,8 @@ struct NarrowphaseBodyParticleParams {
     uint32_t fluid_pos_source;    // 1 == fluid slice reads pbf_predicted_pos
     uint32_t n_soft_particles;    // per-env soft/fluid split (fluid is [n_soft, P))
     // MpmXpbd: the first env-local particle that generates body rows. The MPM slice
-    // [0, particle_row_base) couples via the grid, NOT rows, so its reserved slots
-    // are zeroed (inactive) and it emits no manifold. 0 for every other mode.
+    // [0, particle_row_base) couples via the grid, NOT rows; it owns no reserved
+    // slots (the cook exempts it from the budget). 0 for every other mode.
     uint32_t particle_row_base;
     // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
     // cooperatively); 0 == one thread per particle (analytic-only collider worlds,
@@ -573,6 +575,10 @@ struct AssembleRowsParams {
     uint32_t family;            // kContactFamily*
     uint32_t union_slot_count;  // union slots per env
     uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
+    // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
+    // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
+    // Equal to union_slot_count when the model has no body-particle reserve.
+    uint32_t full_row_slot_count;
     uint32_t bodies_per_env;
     uint32_t base_link_count;   // links per env (replica stride)
     float    solref[2];         // merged contact solref (union family)

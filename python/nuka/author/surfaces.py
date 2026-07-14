@@ -55,8 +55,27 @@ class SoftSurface:
                     skin_smooth_lambda=float(self.smooth_lambda))
 
 
-# The public surface names (``surfaces.Cloth(...)`` / ``surfaces.Soft(...)``).
+@_dc.dataclass(frozen=True)
+class GrainSkin:
+    """The instanced-sphere grain look for a particle medium (granular / MPM /
+    cable beads): ``round`` swaps the octahedron grains for analytic spheres
+    (perfectly round at any zoom, cheaper BLAS), and ``radius_jitter`` /
+    ``tint_jitter`` add deterministic per-grain radius + albedo scatter. All
+    0/False (default) keeps today's uniform octahedra (render byte-identical)."""
+
+    round: bool = False
+    radius_jitter: float = 0.0
+    tint_jitter: float = 0.0
+
+    def media_kwargs(self) -> dict:
+        return dict(skin_grain_round=1 if self.round else 0,
+                    skin_grain_radius_jitter=float(self.radius_jitter),
+                    skin_grain_tint_jitter=float(self.tint_jitter))
+
+
+# The public surface names (``surfaces.Cloth`` / ``surfaces.Soft`` / ``surfaces.Grains``).
 Cloth = ClothSurface
 Soft = SoftSurface
+Grains = GrainSkin
 
-__all__ = ["Cloth", "ClothSurface", "Soft", "SoftSurface"]
+__all__ = ["Cloth", "ClothSurface", "Soft", "SoftSurface", "Grains", "GrainSkin"]

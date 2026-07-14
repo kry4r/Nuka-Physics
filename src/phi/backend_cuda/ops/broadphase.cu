@@ -185,10 +185,18 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
                                   math::Vec3{r, r + s.p[1], r}); break;
         case kKindBox:        he = RotAbs(xf.rotation,
                                   math::Vec3{s.p[0], s.p[1], s.p[2]}); break;
-        // Hull / SDF mesh: conservative BOUND-RADIUS sphere (p[0] = the cooked
-        // max |vertex| — rotation-invariant, so no RotAbs needed).
-        case kKindConvexHull:
-        case kKindSdfMesh:    r = s.p[0]; he = {r, r, r}; break;
+        // Hull: conservative BOUND-RADIUS sphere (p[0] = the cooked max |vertex|
+        // — rotation-invariant, so no RotAbs needed).
+        case kKindConvexHull: r = s.p[0]; he = {r, r, r}; break;
+        // SDF mesh: p[1..3] = the cooked per-axis grid bound (a rotated box);
+        // a cook without the stamp falls back to the p[0] bound-radius cube.
+        case kKindSdfMesh:
+            if (s.p[1] > 0.0f && s.p[2] > 0.0f && s.p[3] > 0.0f) {
+                he = RotAbs(xf.rotation, math::Vec3{s.p[1], s.p[2], s.p[3]});
+            } else {
+                r = s.p[0]; he = {r, r, r};
+            }
+            break;
         // B3 (general contact pipeline Phase 2): the heightfield static collidable.
         // A big FINITE local box spanning the full grid footprint + its z-range so
         // the field is ONE big leaf in the LBVH and any overlapping body yields a

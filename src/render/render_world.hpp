@@ -69,8 +69,16 @@ struct MeshGeometry {
     std::vector<float>    uvs;        // u,v   per vertex (empty => none)
     std::vector<uint32_t> indices;    // triangle indices (3 per triangle)
 
+    // Analytic sphere primitives (rounder + cheaper than tessellated grains). One
+    // sphere = 3 center floats + 1 radius, plus an optional r,g,b albedo tint.
+    // Empty => a pure triangle mesh (byte-identical to a mesh that ships none).
+    std::vector<float>    sphere_centers;  // x,y,z per sphere
+    std::vector<float>    sphere_radii;    // radius per sphere
+    std::vector<float>    sphere_colors;   // r,g,b tint per sphere (empty => untinted)
+
     uint32_t VertexCount() const { return static_cast<uint32_t>(positions.size() / 3); }
     uint32_t TriangleCount() const { return static_cast<uint32_t>(indices.size() / 3); }
+    uint32_t SphereCount() const { return static_cast<uint32_t>(sphere_radii.size()); }
     bool     Empty() const { return positions.empty() || indices.empty(); }
 };
 

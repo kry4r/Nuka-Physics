@@ -356,7 +356,7 @@ public:
         float terrain_grid_height_max, float gravity_x, float gravity_y,
         float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
-        float baumgarte_max_velocity) {
+        float baumgarte_max_velocity, bool bake_link_sdf) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_built_scene: invalid device");
         }
@@ -401,6 +401,7 @@ public:
         opts.solver_contact_margin = solver_contact_margin;
         opts.solver_max_pairs = solver_max_pairs;
         opts.baumgarte_max_velocity = baumgarte_max_velocity;
+        opts.bake_link_sdf = bake_link_sdf ? 1u : 0u;
 
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_built_scene(device->raw(), &desc, scene_h,
@@ -1340,24 +1341,33 @@ public:
 
     // The scene's HDR environment + material policy for the beauty render.
     void set_environment(const std::string& hdri, float yaw_deg, float intensity,
-                         bool use_scene_materials) {
+                         bool use_scene_materials, bool ibl_full_fill,
+                         float exposure_ev, float grade, float sun_disc,
+                         bool specular_env) {
         nuka_environment_desc_t d{};
         d.hdri = hdri.empty() ? nullptr : hdri.c_str();
         d.yaw_deg = yaw_deg;
         d.intensity = intensity;
         d.use_scene_materials = use_scene_materials ? 1u : 0u;
+        d.ibl_full_fill = ibl_full_fill ? 1u : 0u;
+        d.exposure_ev = exposure_ev;
+        d.grade = grade;
+        d.sun_disc = sun_disc;
+        d.specular_env = specular_env ? 1u : 0u;
         check(nuka_scene_set_environment(h_, &d), "nuka_scene_set_environment");
     }
 
     // One media record. kind (MEDIA_*) selects the geometry block read; method
     // (MEDIA_METHOD_*) selects the material block. Illegal (kind x method) raises.
-    void add_media(uint32_t kind, uint32_t method, uint32_t cloth_nx,
+    uint32_t add_media(uint32_t kind, uint32_t method, uint32_t cloth_nx,
                    uint32_t cloth_ny, float cloth_spacing,
                    const std::vector<float>& cloth_origin, bool cloth_free,
+                   uint32_t cloth_pin,
                    const std::vector<float>& tet_center, float tet_radius,
                    uint32_t tet_cells, float tet_cell_len,
                    const std::vector<float>& fluid_min,
                    const std::vector<float>& fluid_max, float fluid_spacing,
+                   float fluid_position_jitter, float mpm_loft_headroom,
                    float xpbd_particle_mass, float xpbd_friction,
                    float xpbd_distance_alpha, float xpbd_bend_alpha,
                    float xpbd_volume_alpha, uint32_t xpbd_iters,
@@ -1375,7 +1385,14 @@ public:
                    const std::vector<float>& mpm_floor_normal, float mpm_floor_d,
                    float mpm_floor_friction, float skin_normal_offset,
                    uint32_t skin_smooth_iters, float skin_smooth_lambda,
-                   uint32_t render_material_id) {
+                   uint32_t skin_grain_round, float skin_grain_radius_jitter,
+                   float skin_grain_tint_jitter, uint32_t render_material_id,
+                   const std::vector<float>& cable_start,
+                   const std::vector<float>& cable_end, uint32_t cable_segments,
+                   float cable_radius, uint32_t cable_pin, bool cable_bend,
+                   const std::vector<float>& cable_slab_half_extents,
+                   float cable_slab_mass, float cable_slab_stiffness,
+                   uint32_t cable_slab_render_material_id) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1391,6 +1408,7 @@ public:
         d.cloth_spacing = cloth_spacing;
         vec3(cloth_origin, d.cloth_origin, "cloth_origin");
         d.cloth_free = cloth_free ? 1u : 0u;
+        d.cloth_pin = cloth_pin;
         vec3(tet_center, d.tet_center, "tet_center");
         d.tet_radius = tet_radius;
         d.tet_cells = tet_cells;
@@ -1398,6 +1416,7 @@ public:
         vec3(fluid_min, d.fluid_min, "fluid_min");
         vec3(fluid_max, d.fluid_max, "fluid_max");
         d.fluid_spacing = fluid_spacing;
+        d.fluid_position_jitter = fluid_position_jitter;
         d.xpbd_particle_mass = xpbd_particle_mass;
         d.xpbd_friction = xpbd_friction;
         d.xpbd_distance_alpha = xpbd_distance_alpha;
@@ -1431,11 +1450,58 @@ public:
         vec3(mpm_floor_normal, d.mpm_floor_normal, "mpm_floor_normal");
         d.mpm_floor_d = mpm_floor_d;
         d.mpm_floor_friction = mpm_floor_friction;
+        d.mpm_loft_headroom = mpm_loft_headroom;
         d.skin_normal_offset = skin_normal_offset;
         d.skin_smooth_iters = skin_smooth_iters;
         d.skin_smooth_lambda = skin_smooth_lambda;
+        d.skin_grain_round = skin_grain_round;
+        d.skin_grain_radius_jitter = skin_grain_radius_jitter;
+        d.skin_grain_tint_jitter = skin_grain_tint_jitter;
         d.render_material_id = render_material_id;
-        check(nuka_scene_add_media(h_, &d), "nuka_scene_add_media");
+        vec3(cable_start, d.cable_start, "cable_start");
+        vec3(cable_end, d.cable_end, "cable_end");
+        d.cable_segments = cable_segments;
+        d.cable_radius = cable_radius;
+        d.cable_pin = cable_pin;
+        d.cable_bend = cable_bend ? 1u : 0u;
+        vec3(cable_slab_half_extents, d.cable_slab_half_extents,
+             "cable_slab_half_extents");
+        d.cable_slab_mass = cable_slab_mass;
+        d.cable_slab_stiffness = cable_slab_stiffness;
+        d.cable_slab_render_material_id = cable_slab_render_material_id;
+        uint32_t media_id = 0u;
+        check(nuka_scene_add_media(h_, &d, &media_id), "nuka_scene_add_media");
+        return media_id;
+    }
+
+    // Append a heterogeneous MLS-MPM sub-fill (a sub-box region + its own
+    // constitutive) to the box MLS-MPM medium `media_id` (the add_media return). min/
+    // max are the sub-box corners; the medium's mpm block supplies the shared grid.
+    void add_mpm_fill(uint32_t media_id, const std::vector<float>& box_min,
+                      const std::vector<float>& box_max, float spacing,
+                      float position_jitter, float youngs, float poisson,
+                      float density, float dp_friction, float dp_cohesion,
+                      float model_kind, float bulk_modulus, float tait_gamma,
+                      float viscosity, uint32_t render_material_id) {
+        if (box_min.size() != 3 || box_max.size() != 3) {
+            throw std::runtime_error(
+                "add_mpm_fill: box_min / box_max must be 3 floats each");
+        }
+        nuka_mpm_fill_desc_t d{};
+        for (int i = 0; i < 3; ++i) { d.min[i] = box_min[i]; d.max[i] = box_max[i]; }
+        d.spacing = spacing;
+        d.position_jitter = position_jitter;
+        d.youngs = youngs;
+        d.poisson = poisson;
+        d.density = density;
+        d.dp_friction = dp_friction;
+        d.dp_cohesion = dp_cohesion;
+        d.model_kind = model_kind;
+        d.bulk_modulus = bulk_modulus;
+        d.tait_gamma = tait_gamma;
+        d.viscosity = viscosity;
+        d.render_material_id = render_material_id;
+        check(nuka_scene_add_mpm_fill(h_, media_id, &d), "nuka_scene_add_mpm_fill");
     }
 
     // Cook the built scene to a live nk::World on `device` (the SAME cook + record
@@ -1449,7 +1515,7 @@ public:
                  float terrain_grid_height_max, float gravity_x, float gravity_y,
                  float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
                  float solver_contact_margin, uint32_t solver_max_pairs,
-                 float baumgarte_max_velocity) {
+                 float baumgarte_max_velocity, bool bake_link_sdf) {
         if (device == nullptr) {
             throw std::runtime_error("SceneBuilder.build: device is None");
         }
@@ -1459,7 +1525,79 @@ public:
             heightfield_cell, terrain_step_height, terrain_step_width,
             terrain_platform_width, terrain_grid_width, terrain_grid_height_max,
             gravity_x, gravity_y, gravity_z, solver_vel_iters, solver_pos_iters,
-            solver_contact_margin, solver_max_pairs, baumgarte_max_velocity);
+            solver_contact_margin, solver_max_pairs, baumgarte_max_velocity,
+            bake_link_sdf);
+    }
+
+    // Attach one collision shape to an EXISTING body node (by derived tree path):
+    // an imported articulation link (e.g. a robot head/trunk shipped visual-only)
+    // gains a colliding geom without editing the source asset. dims by kind: BOX
+    // [hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]. pos/quat are the shape's
+    // LOCAL pose in the body frame (empty quat => identity). contype/conaffinity
+    // default 1 (colliding).
+    void add_collision_shape(const std::string& node_path, uint32_t kind,
+                             const std::vector<float>& dims,
+                             const std::vector<float>& pos,
+                             const std::vector<float>& quat, float friction,
+                             uint32_t contype, uint32_t conaffinity) {
+        if (dims.size() > 3) {
+            throw std::runtime_error("add_collision_shape: dims must be <= 3 floats");
+        }
+        if (!pos.empty() && pos.size() != 3) {
+            throw std::runtime_error("add_collision_shape: pos must be 3 floats (x,y,z)");
+        }
+        if (!quat.empty() && quat.size() != 4) {
+            throw std::runtime_error(
+                "add_collision_shape: quat must be 4 floats (w,x,y,z)");
+        }
+        nuka_collision_shape_desc_t d{};
+        d.kind = kind;
+        for (size_t i = 0; i < dims.size() && i < 3; ++i) d.dims[i] = dims[i];
+        for (size_t i = 0; i < pos.size() && i < 3; ++i) d.pos[i] = pos[i];
+        for (size_t i = 0; i < quat.size() && i < 4; ++i) d.quat[i] = quat[i];
+        d.friction = friction;
+        d.contype = contype;
+        d.conaffinity = conaffinity;
+        check(nuka_scene_add_collision_shape(h_, node_path.c_str(), &d),
+              "nuka_scene_add_collision_shape");
+    }
+
+    // Graft `addon`'s scene into this one at a placement (pos [x,y,z] + quat
+    // [w,x,y,z] in this scene's frame), via the SAME scene::Compose the generic
+    // editor uses. `attach_at` is an optional node-path PREFIX that disambiguates
+    // the addon's names in the merged scene (each addon root keeps its OWN
+    // hierarchy). This authors a jointed sub-assembly (a rope / ragdoll / any
+    // imported articulation fragment): import it as a SceneBuilder and compose it
+    // -- the importer supplies correct joint frames + link inertia.
+    void compose(SceneBuilder* addon, const std::vector<float>& pos,
+                 const std::vector<float>& quat, const std::string& attach_at) {
+        if (addon == nullptr) {
+            throw std::runtime_error("SceneBuilder.compose: addon is None");
+        }
+        if (!pos.empty() && pos.size() != 3) {
+            throw std::runtime_error("SceneBuilder.compose: pos must be 3 floats (x,y,z)");
+        }
+        if (!quat.empty() && quat.size() != 4) {
+            throw std::runtime_error(
+                "SceneBuilder.compose: quat must be 4 floats (w,x,y,z)");
+        }
+        float p[3] = {0.0f, 0.0f, 0.0f};
+        float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        for (size_t i = 0; i < pos.size() && i < 3; ++i) p[i] = pos[i];
+        for (size_t i = 0; i < quat.size() && i < 4; ++i) q[i] = quat[i];
+        check(nuka_scene_compose(h_, addon->h_, pos.empty() ? nullptr : p,
+                                 quat.empty() ? nullptr : q,
+                                 attach_at.empty() ? nullptr : attach_at.c_str()),
+              "nuka_scene_compose");
+    }
+
+    // Persist the built scene to `nks_path` (+ a sibling <base>.nka) via the .nks
+    // writer -- the SAME self-contained format nuka_scene_load reads back. Rigid
+    // primitives, media records, render materials, the environment, terrain, and
+    // any composed articulation all round-trip, so the saved file cooks through the
+    // built-scene path (SceneBuilder.create(path).build()).
+    void save(const std::string& nks_path) {
+        check(nuka_scene_save(h_, nks_path.c_str()), "nuka_scene_save");
     }
 
     void destroy() {
@@ -1519,14 +1657,30 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("PRIMITIVE_CAPSULE") = uint32_t{3};
     // SceneBuilder.add_media(kind=...) / (method=...) codes (nuka_media_kind_t /
     // nuka_media_method_t). Legal pairs: cloth=XPBD; soft_tet=XPBD|MLSMPM;
-    // fluid=PBF|MLSMPM; granular=MLSMPM (an illegal pair raises at add_media).
+    // fluid=PBF|MLSMPM; granular=MLSMPM; cable=XPBD (an illegal pair raises at add_media).
     m.attr("MEDIA_CLOTH") = uint32_t{0};
     m.attr("MEDIA_SOFT_TET") = uint32_t{1};
     m.attr("MEDIA_FLUID") = uint32_t{2};
     m.attr("MEDIA_GRANULAR") = uint32_t{3};
+    m.attr("MEDIA_CABLE") = uint32_t{4};
     m.attr("MEDIA_METHOD_XPBD") = uint32_t{0};
     m.attr("MEDIA_METHOD_PBF") = uint32_t{1};
     m.attr("MEDIA_METHOD_MLSMPM") = uint32_t{2};
+    // SceneBuilder.add_media(cloth_pin=...) pin-set codes (MediaRecord::ClothPin):
+    // which cloth node set cooks with inv_mass 0.
+    m.attr("CLOTH_PIN_FROM_FREE") = uint32_t{0};
+    m.attr("CLOTH_PIN_NONE") = uint32_t{1};
+    m.attr("CLOTH_PIN_PERIMETER") = uint32_t{2};
+    m.attr("CLOTH_PIN_EDGE_X0") = uint32_t{3};
+    m.attr("CLOTH_PIN_EDGE_X1") = uint32_t{4};
+    m.attr("CLOTH_PIN_EDGE_Y0") = uint32_t{5};
+    m.attr("CLOTH_PIN_EDGE_Y1") = uint32_t{6};
+    // SceneBuilder.add_media(cable_pin=...) codes (MediaRecord::CableLine::Pin):
+    // which cable endpoint(s) cook kinematic (inv_mass 0).
+    m.attr("CABLE_PIN_START") = uint32_t{0};
+    m.attr("CABLE_PIN_END") = uint32_t{1};
+    m.attr("CABLE_PIN_BOTH") = uint32_t{2};
+    m.attr("CABLE_PIN_NONE") = uint32_t{3};
 
     // v0.5 p04 N1 sim-to-real sensor-noise kinds (the int values
     // World.set_sensor_noise(kind=...) accepts). NONE (0, default) clears the
@@ -2495,21 +2649,32 @@ NB_MODULE(_nuka_ext, m) {
         .def("set_environment", &SceneBuilder::set_environment,
              nb::arg("hdri") = std::string(), nb::arg("yaw_deg") = 0.0f,
              nb::arg("intensity") = 1.0f, nb::arg("use_scene_materials") = true,
+             nb::arg("ibl_full_fill") = false, nb::arg("exposure_ev") = 0.0f,
+             nb::arg("grade") = 0.0f, nb::arg("sun_disc") = 0.0f,
+             nb::arg("specular_env") = false,
              "Set the scene's beauty environment: an equirect .hdr path backing "
              "the sky + ambient light (\"\" keeps the procedural studio sky), its "
              "yaw/intensity, and whether the render uses the scene's AUTHORED "
-             "materials (default True) instead of the studio hero palette.")
+             "materials (default True) instead of the studio hero palette. The "
+             "opt-in look levers (all neutral by default): ibl_full_fill lights the "
+             "env-miss fill at `intensity`; exposure_ev/grade are the post exposure "
+             "and contrast/saturation grade; sun_disc adds a crisp sky sun disc; "
+             "specular_env shades opaque surfaces Cook-Torrance + casts a roughness "
+             "env reflection ray (metal/stone/wet realism).")
         .def("add_media", &SceneBuilder::add_media, nb::arg("kind"),
              nb::arg("method"), nb::arg("cloth_nx") = 0u, nb::arg("cloth_ny") = 0u,
              nb::arg("cloth_spacing") = 0.0f,
              nb::arg("cloth_origin") = std::vector<float>{},
-             nb::arg("cloth_free") = false,
+             nb::arg("cloth_free") = false, nb::arg("cloth_pin") = 0u,
              nb::arg("tet_center") = std::vector<float>{},
              nb::arg("tet_radius") = 0.0f, nb::arg("tet_cells") = 0u,
              nb::arg("tet_cell_len") = 0.0f,
              nb::arg("fluid_min") = std::vector<float>{},
              nb::arg("fluid_max") = std::vector<float>{},
-             nb::arg("fluid_spacing") = 0.0f, nb::arg("xpbd_particle_mass") = 0.0f,
+             nb::arg("fluid_spacing") = 0.0f,
+             nb::arg("fluid_position_jitter") = 0.0f,
+             nb::arg("mpm_loft_headroom") = 0.0f,
+             nb::arg("xpbd_particle_mass") = 0.0f,
              nb::arg("xpbd_friction") = 0.6f, nb::arg("xpbd_distance_alpha") = 0.0f,
              nb::arg("xpbd_bend_alpha") = 0.0f, nb::arg("xpbd_volume_alpha") = 0.0f,
              nb::arg("xpbd_iters") = 0u, nb::arg("xpbd_aero_normal") = 0.0f,
@@ -2531,13 +2696,38 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("mpm_floor_d") = 0.0f, nb::arg("mpm_floor_friction") = 0.4f,
              nb::arg("skin_normal_offset") = 0.0f, nb::arg("skin_smooth_iters") = 0u,
              nb::arg("skin_smooth_lambda") = 0.5f,
+             nb::arg("skin_grain_round") = 0u,
+             nb::arg("skin_grain_radius_jitter") = 0.0f,
+             nb::arg("skin_grain_tint_jitter") = 0.0f,
              nb::arg("render_material_id") = uint32_t{0xFFFFFFFFu},
+             nb::arg("cable_start") = std::vector<float>{},
+             nb::arg("cable_end") = std::vector<float>{},
+             nb::arg("cable_segments") = 0u, nb::arg("cable_radius") = 0.0f,
+             nb::arg("cable_pin") = 0u, nb::arg("cable_bend") = false,
+             nb::arg("cable_slab_half_extents") = std::vector<float>{},
+             nb::arg("cable_slab_mass") = 0.0f,
+             nb::arg("cable_slab_stiffness") = 0.0f,
+             nb::arg("cable_slab_render_material_id") = uint32_t{0xFFFFFFFFu},
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
-             "FLUID/GRANULAR); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind selects "
-             "the geometry block (cloth_*/tet_*/fluid_*); method selects the "
-             "material block (xpbd_*/pbf_*/mpm_*). Material scalars at 0 take the "
-             "cook's own defaults. An illegal (kind x method) pair raises here; an "
-             "MPM + XPBD/PBF mix raises at build().")
+             "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind "
+             "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
+             "material block (xpbd_*/pbf_*/mpm_*). A cable is XPBD: cable_start/end + "
+             "cable_segments links, cable_radius bead size, cable_pin endpoint, optional "
+             "cable_slab_* rigid weight welded to the loaded end. Material scalars at 0 take "
+             "the cook's own defaults. An illegal (kind x method) pair raises here; an "
+             "MPM + XPBD/PBF mix raises at build(). Returns the new record's media id.")
+        .def("add_mpm_fill", &SceneBuilder::add_mpm_fill, nb::arg("media_id"),
+             nb::arg("box_min"), nb::arg("box_max"), nb::arg("spacing"),
+             nb::arg("position_jitter") = 0.0f, nb::arg("youngs") = 0.0f,
+             nb::arg("poisson") = 0.0f, nb::arg("density") = 0.0f,
+             nb::arg("dp_friction") = 0.0f, nb::arg("dp_cohesion") = 0.0f,
+             nb::arg("model_kind") = 0.0f, nb::arg("bulk_modulus") = 0.0f,
+             nb::arg("tait_gamma") = 0.0f, nb::arg("viscosity") = 0.0f,
+             nb::arg("render_material_id") = uint32_t{0xFFFFFFFFu},
+             "Append a heterogeneous MLS-MPM sub-fill (a [box_min,box_max] sub-box at "
+             "`spacing`, position_jitter breaking the lattice, with its own "
+             "constitutive) to the box MLS-MPM medium `media_id` (the add_media return). "
+             "The base bed stays fill 0; the grid AABB grows to the union.")
         .def("build", &SceneBuilder::build, nb::arg("device"),
              nb::arg("env_count") = 1u, nb::arg("dt") = 1.0f / 240.0f,
              nb::arg("control_mode") = 0u, nb::arg("determinism") = 0u,
@@ -2552,6 +2742,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
              nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
              nb::arg("baumgarte_max_velocity") = 0.0f,
+             nb::arg("bake_link_sdf") = false,
              nb::rv_policy::take_ownership,
              "Cook the built scene to a live nuka.World on `device` via the SAME "
              "CookSceneToModel + record assembly a file scene uses (rigid + media, "
@@ -2561,6 +2752,33 @@ NB_MODULE(_nuka_ext, m) {
              "takes). gravity_* default 0 => standard Earth. The solver_* / "
              "baumgarte_max_velocity SolverConfig overrides default 0 => engine "
              "default => byte-identical to a defaults-only built scene.")
+        .def("add_collision_shape", &SceneBuilder::add_collision_shape,
+             nb::arg("node_path"), nb::arg("kind"),
+             nb::arg("dims") = std::vector<float>{},
+             nb::arg("pos") = std::vector<float>{},
+             nb::arg("quat") = std::vector<float>{}, nb::arg("friction") = -1.0f,
+             nb::arg("contype") = 1u, nb::arg("conaffinity") = 1u,
+             "Attach a collision shape to the body at derived tree path node_path. "
+             "kind is a PRIMITIVE_* code (BOX/SPHERE/CAPSULE). dims by kind: BOX "
+             "[hx,hy,hz]; SPHERE [r]; CAPSULE [r,half_height]. pos/quat are the "
+             "shape's LOCAL pose in the body frame (empty quat => identity). Use it "
+             "to give an imported link (a robot head/trunk shipped visual-only) a "
+             "colliding geom without editing the source asset.")
+        .def("compose", &SceneBuilder::compose, nb::arg("addon"),
+             nb::arg("pos") = std::vector<float>{},
+             nb::arg("quat") = std::vector<float>{},
+             nb::arg("attach_at") = std::string(),
+             "Graft another SceneBuilder's scene into this one at a placement (pos "
+             "[x,y,z], quat [w,x,y,z]; empty => identity). attach_at is an optional "
+             "node-path name PREFIX for the addon (disambiguates duplicate names). "
+             "Author a jointed sub-assembly by importing the fragment (e.g. a "
+             "revolute-chain rope .usda) as a SceneBuilder and composing it -- the "
+             "importer supplies correct joint frames + link inertia.")
+        .def("save", &SceneBuilder::save, nb::arg("nks_path"),
+             "Persist the built scene to nks_path (+ a sibling .nka). The .nks is "
+             "self-contained: rigid primitives, media, render materials, the "
+             "environment, terrain, and composed articulations all round-trip and "
+             "cook back through SceneBuilder.create(path).build().")
         .def("destroy", &SceneBuilder::destroy, "Destroy the scene-builder handle.")
         .def("__enter__", [](SceneBuilder& b) -> SceneBuilder& { return b; })
         .def("__exit__",
