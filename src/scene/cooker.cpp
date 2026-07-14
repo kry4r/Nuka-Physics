@@ -49,6 +49,14 @@ import::cooker::DecomposeMode ToCookerMode(DecomposeMode mode) {
     return import::cooker::DecomposeMode::Auto;
 }
 
+// Exact identity test: identity-local shapes skip the geometry bake below, so
+// their cooked bytes (hulls, SDF cache keys) are untouched.
+bool IsIdentityLocal(const math::Transform& t) {
+    return t.position.x == 0.0f && t.position.y == 0.0f && t.position.z == 0.0f &&
+           t.rotation.w == 1.0f && t.rotation.x == 0.0f &&
+           t.rotation.y == 0.0f && t.rotation.z == 0.0f;
+}
+
 // Append one convex hull (vertices/indices/volume) into the cooked geometry
 // table and return its index.
 uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
@@ -175,11 +183,19 @@ void CookLinkVisualSdfs(const SceneIR& scene, CookedBlob& blob) {
         return s.contype != 0u || s.conaffinity != 0u;
     };
     std::vector<uint32_t> body_collide_shape(blob.body_count, ~0u);
+    // Bake anchor = the frame the runtime poses the body row in: the body's FIRST
+    // bounded-primitive shape's local frame, identity for a mesh-collided body.
+    std::vector<uint32_t> body_anchor_shape(blob.body_count, ~0u);
     for (uint32_t i = 0; i < shapes.size(); ++i) {
         const CollisionShapeRecord& s = shapes[i];
         if (s.body_id >= blob.body_count) continue;
         if (collides(s) && body_collide_shape[s.body_id] == ~uint32_t(0))
             body_collide_shape[s.body_id] = i;
+        const bool is_primitive = s.type == ShapeType::Sphere ||
+                                  s.type == ShapeType::Box ||
+                                  s.type == ShapeType::Capsule;
+        if (is_primitive && body_anchor_shape[s.body_id] == ~uint32_t(0))
+            body_anchor_shape[s.body_id] = i;
     }
 
     // Solid fill (scoped here) so a deep interior point has a signed value+gradient
@@ -196,10 +212,12 @@ void CookLinkVisualSdfs(const SceneIR& scene, CookedBlob& blob) {
     for (uint32_t b = 0; b < blob.body_count; ++b) {
         const uint32_t cs = body_collide_shape[b];
         if (cs == ~uint32_t(0)) continue;
-        // Express every visual geom on this body in the collision primitive's local
-        // frame (the frame the runtime poses the body row in) and concatenate. The
-        // index buffer is rebased per geom into the merged vertex pool.
-        const math::Transform to_collision = shapes[cs].local_transform.Inverse();
+        // Express every visual geom on this body in the runtime body-row frame
+        // (see body_anchor_shape) and concatenate; indices rebase into the pool.
+        const uint32_t anchor = body_anchor_shape[b];
+        const math::Transform to_collision =
+            anchor != ~uint32_t(0) ? shapes[anchor].local_transform.Inverse()
+                                   : math::Transform::Identity();
         std::vector<float> verts;
         std::vector<uint32_t> idx;
         for (uint32_t i = 0; i < shapes.size(); ++i) {
@@ -485,7 +503,27 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
             continue;
         }
 
-        import::cooker::DecomposeMode mode = ToCookerMode(s.decompose_mode);
+        // Bake a colliding mesh's authored local pose into its geometry: cooked
+        // convex pieces are consumed as BODY-frame data (no local-pose lane).
+        const bool shape_collides = (s.contype != 0u) || (s.conaffinity != 0u);
+        CollisionShapeRecord baked;
+        const CollisionShapeRecord* rowp = &s;
+        if (shape_collides && !IsIdentityLocal(s.local_transform)) {
+            baked = s;
+            for (size_t v = 0; v + 2 < baked.mesh_vertices.size(); v += 3) {
+                const math::Vec3 p = s.local_transform.TransformPoint(
+                    {baked.mesh_vertices[v + 0], baked.mesh_vertices[v + 1],
+                     baked.mesh_vertices[v + 2]});
+                baked.mesh_vertices[v + 0] = p.x;
+                baked.mesh_vertices[v + 1] = p.y;
+                baked.mesh_vertices[v + 2] = p.z;
+            }
+            baked.local_transform = math::Transform::Identity();
+            rowp = &baked;
+        }
+        const CollisionShapeRecord& r = *rowp;
+
+        import::cooker::DecomposeMode mode = ToCookerMode(r.decompose_mode);
 
         // L-RECON-B: the GENERAL cvx narrowphase wants ONE convex hull per mesh,
         // not V-HACD's N concave pieces. When single-hull is requested, collapse
@@ -502,8 +540,8 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
             // Treat the source mesh as a single convex piece (store its own
             // geometry as one ConvexHull; no V-HACD run).
             const uint32_t geom_index = AppendConvexGeometry(
-                blob.convex_geometry, s.mesh_vertices, s.mesh_indices, 0.0f);
-            PushShapeRow(blob.shapes, blob.contact_params, s,
+                blob.convex_geometry, r.mesh_vertices, r.mesh_indices, 0.0f);
+            PushShapeRow(blob.shapes, blob.contact_params, r,
                          ShapeType::ConvexHull, geom_index, resolved_friction);
             continue;
         }
@@ -513,13 +551,13 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         // (p06): identical (mesh, params) reuse a prior decomposition instead of
         // re-running the 0.5-5s V-HACD.
         import::cooker::ConvexDecompositionParams params;
-        params.max_pieces = s.decompose_max_pieces;
+        params.max_pieces = r.decompose_max_pieces;
         bool decompose_hit = false;
         const auto result = import::cooker::DecomposeMeshCached(
-            s.mesh_vertices.data(),
-            static_cast<uint32_t>(s.mesh_vertices.size() / 3),
-            s.mesh_indices.data(),
-            static_cast<uint32_t>(s.mesh_indices.size() / 3),
+            r.mesh_vertices.data(),
+            static_cast<uint32_t>(r.mesh_vertices.size() / 3),
+            r.mesh_indices.data(),
+            static_cast<uint32_t>(r.mesh_indices.size() / 3),
             params,
             kDecomposeCacheDir,
             &decompose_hit);
@@ -529,8 +567,8 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
             // Decomposition failed: fall back to passing the mesh through as a
             // single ConvexHull carrying its own geometry (never drop the shape).
             const uint32_t geom_index = AppendConvexGeometry(
-                blob.convex_geometry, s.mesh_vertices, s.mesh_indices, 0.0f);
-            PushShapeRow(blob.shapes, blob.contact_params, s,
+                blob.convex_geometry, r.mesh_vertices, r.mesh_indices, 0.0f);
+            PushShapeRow(blob.shapes, blob.contact_params, r,
                          ShapeType::ConvexHull, geom_index, resolved_friction);
             continue;
         }
@@ -538,7 +576,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         for (const auto& piece : result.pieces) {
             const uint32_t geom_index = AppendConvexGeometry(
                 blob.convex_geometry, piece.vertices, piece.indices, piece.volume);
-            PushShapeRow(blob.shapes, blob.contact_params, s,
+            PushShapeRow(blob.shapes, blob.contact_params, r,
                          ShapeType::ConvexHull, geom_index, resolved_friction);
         }
     }

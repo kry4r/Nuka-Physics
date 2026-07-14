@@ -789,6 +789,7 @@ add_executable(nuka_import_test
     scene/test_filter_precedence.cpp
     # importers (mjcf / urdf / usd / usdc / mesh)
     import/test_mjcf_importer.cpp
+    import/test_mjcf_mass_pipeline.cpp
     import/test_mjcf_contact_filtering.cpp
     import/test_inertia_friction.cpp
     import/test_urdf_importer.cpp

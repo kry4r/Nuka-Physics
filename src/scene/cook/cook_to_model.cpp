@@ -696,41 +696,19 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         smap.Bind(ent, ref);
     }
 
-    // 7b. — movable rigid-body body_init (pose + inv_mass + inv_inertia),
-    // so a generic .nks-cooked MOVABLE cup falls/rests under gravity instead
-    // of being frozen at the arena's zero-init Identity (inv_mass 0). Matches
-    // BuildNkUnionModel's cup body_init fill (pose/inv_mass/inv_inertia from
-    // the body record) so the generic path agrees with the union path.
-    //
-    // GUARD (the no-regression contract): body_init stays EMPTY unless the
-    // scene has >=1 genuinely-MOVABLE FREE rigid body (a body row that is not
-    // an articulation link, not static, with mass > 0 / inv_mass > 0). For
-    // every existing golden/scene (articulation-only feet, particle, the
-    // coupled_grasp_soft static box wall) no such body exists -> body_init
-    // stays empty -> SeedInitialState skips the body block -> BYTE-IDENTICAL.
-    //
-    // When a movable free body IS present, body_init is sized to ALL body
-    // rows (env-major layout: SeedInitialState indexes body_init[b]); every
-    // row gets its cooked world pose, but STATIC and ARTICULATION-LINK rows
-    // keep inv_mass / inv_inertia 0 (the body integrate arms remain no-ops
-    // for them, so the articulation is untouched). Only the free movable
-    // bodies carry a non-zero inv_mass and so respond to gravity + contacts.
+    // 7b. Seed body_init for every non-link body row: only link rows are re-posed
+    // each step, so an unseeded static/free collidable would sit at the zero pose.
     {
-        bool any_movable_free = false;
+        bool any_free_body = false;
         for (uint32_t b = 0; b < blob.body_count; ++b) {
             const bool is_link = b < body_is_articulation_link.size() &&
                                  body_is_articulation_link[b] != 0u;
-            const bool is_static = b < blob.bodies.is_static.size() &&
-                                   blob.bodies.is_static[b] != 0u;
-            const float inv_mass = b < blob.bodies.inv_masses.size()
-                                       ? blob.bodies.inv_masses[b]
-                                       : 0.0f;
-            if (!is_link && !is_static && inv_mass > 0.0f) {
-                any_movable_free = true;
+            if (!is_link) {
+                any_free_body = true;
                 break;
             }
         }
-        if (any_movable_free) {
+        if (any_free_body) {
             model.body_init.assign(blob.body_count, nk::Model::BodyInit{});
             for (uint32_t b = 0; b < blob.body_count; ++b) {
                 nk::Model::BodyInit& bi = model.body_init[b];
