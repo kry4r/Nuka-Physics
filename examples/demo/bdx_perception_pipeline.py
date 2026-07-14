@@ -50,6 +50,11 @@ def _checkpoint_actor(checkpoint: str, obs: torch.Tensor) -> torch.Tensor:
 
 def run(args) -> dict:
     started = time.perf_counter()
+    env_kwargs = {}
+    if args.episode_steps:
+        # BdxWalkEnv rounds seconds to control steps.  Make the scenario short
+        # enough to exercise its real autoreset path without a long rollout.
+        env_kwargs["episode_length_s"] = args.episode_steps * 0.005 * 4
     env = make_env(
         args.envs,
         scene=args.scene,
@@ -58,11 +63,15 @@ def run(args) -> dict:
         command=(0.15, 0.0, 0.0),
         push_enable=False,
         spawn_x_range=(args.spawn_x_low, args.spawn_x_high),
+        forward_progress_scale=args.forward_progress_scale,
+        progress_milestones=args.progress_milestones,
+        progress_milestone_bonus=args.progress_milestone_bonus,
         sensor={
             "width": args.width,
             "height": args.height,
             "update_period": args.update_period,
         },
+        **env_kwargs,
     )
     try:
         obs, _ = env.reset(seed=args.seed)
@@ -119,25 +128,52 @@ def run(args) -> dict:
                 f"zero visual residual changed the blind actor (max |delta|={parity})")
 
         ages = [float(obs["depth_age"][0, 0])]
+        expected_ages = [0.0]
         rewards = []
+        autoreset_count = 0
+        progress_reset_max_error = 0.0
         actions = mu.clamp(-1.0, 1.0)
         for _ in range(args.steps):
+            # Prime the episodic accumulators immediately before the forced
+            # truncation.  This makes the reset check meaningful even when the
+            # short rollout has not naturally reached a distance milestone.
+            about_to_truncate = bool(
+                args.episode_steps
+                and (env.episode_step + 1 >= env.max_episode_length).all())
+            if about_to_truncate:
+                env._episode_max_progress.fill_(123.0)
+                env._milestones_reached.fill_(True)
             obs, reward, terminated, truncated, _ = env.step(actions)
             ages.append(float(obs["depth_age"][0, 0]))
             rewards.append(float(reward.mean()))
             with torch.no_grad():
                 actions = network({"obs": obs})[0].clamp(-1.0, 1.0)
-            if bool((terminated | truncated).any()):
+            done = terminated | truncated
+            if bool(done.any()):
+                autoreset_count += int(done.sum())
                 # A reset forces a fresh frame; the env's stale-frame invariant is
                 # checked by the zero age below.
                 if float(obs["depth_age"].max()) != 0.0:
                     raise RuntimeError("an autoreset observation retained a stale frame")
+                start_error = float((
+                    env._episode_start_x[done]
+                    - env._obs.base_pos()[done, 0]
+                ).abs().max())
+                max_progress = float(env._episode_max_progress[done].abs().max())
+                reached = bool(env._milestones_reached[done].any())
+                progress_reset_max_error = max(
+                    progress_reset_max_error, start_error, max_progress)
+                if start_error != 0.0 or max_progress != 0.0 or reached:
+                    raise RuntimeError(
+                        "an autoreset retained episodic progress state: "
+                        f"start_error={start_error} max_progress={max_progress} "
+                        f"milestone_reached={reached}")
+            expected_ages.append(
+                0.0 if bool(done.any()) else
+                (env._sensor_tick % args.update_period) * (env.dt * env.decimation))
 
-        control_dt = env.dt * env.decimation
-        expected_ages = [
-            (step % args.update_period) * control_dt
-            for step in range(args.steps + 1)
-        ]
+        if args.episode_steps and autoreset_count == 0:
+            raise RuntimeError("short-episode gate did not exercise autoreset")
         age_error = max(abs(a - b) for a, b in zip(ages, expected_ages))
         if age_error > 1.0e-6:
             raise RuntimeError(
@@ -151,16 +187,20 @@ def run(args) -> dict:
             "observation_shapes": shapes,
             "observation_dtypes": dtypes,
             "policy_encoding": {
-                "depth_pixels": args.width * args.height,
+                "raw_depth_pixels": args.width * args.height,
                 "depth_latent": args.latent_dim,
-                "proprio": B.BDX_OBS_DIM,
-                "frame_age": 1,
-                "fused_input": args.latent_dim + B.BDX_OBS_DIM + 1,
+                "visual_adapter_input": args.latent_dim + 1,
+                "raw_proprio": B.BDX_OBS_DIM,
+                "proprio_latent": 128,
+                "policy_fused_state": 128,
+                "fusion": "additive_visual_residual",
             },
             "rollout_depth_mib": depth_bytes / (1024.0 * 1024.0),
             "blind_bootstrap_max_abs": parity,
             "frame_ages_s": ages,
             "frame_age_max_error": age_error,
+            "autoreset_count": autoreset_count,
+            "progress_reset_max_error": progress_reset_max_error,
             "spawn_x_min": float(spawn_x.min()),
             "spawn_x_max": float(spawn_x.max()),
             "depth_min": float(obs["depth"].min()),
@@ -192,6 +232,14 @@ def main() -> None:
     parser.add_argument("--latent-dim", type=int, default=96)
     parser.add_argument("--horizon", type=int, default=24)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument(
+        "--episode-steps", type=int, default=0,
+        help="force this many control steps per episode and require autoreset")
+    parser.add_argument("--forward-progress-scale", type=float, default=15.0)
+    parser.add_argument(
+        "--progress-milestones", type=float, nargs="+",
+        default=(0.35, 0.65, 1.2))
+    parser.add_argument("--progress-milestone-bonus", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--spawn-x-low", type=float, default=-0.32)
     parser.add_argument("--spawn-x-high", type=float, default=-0.12)
@@ -201,6 +249,10 @@ def main() -> None:
         parser.error("all numeric arguments must be positive")
     if not args.spawn_x_low < args.spawn_x_high:
         parser.error("--spawn-x-low must be smaller than --spawn-x-high")
+    if args.episode_steps < 0:
+        parser.error("--episode-steps must be non-negative")
+    if args.episode_steps and args.steps < args.episode_steps:
+        parser.error("--steps must reach --episode-steps")
     print(json.dumps(run(args), sort_keys=True), flush=True)
 
 
