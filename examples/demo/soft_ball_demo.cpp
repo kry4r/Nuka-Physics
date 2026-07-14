@@ -76,14 +76,14 @@ constexpr uint32_t kKindPlane = nuka::collision::kShapePlane;
 // Soft ball geometry: a sphere rest-lattice (cells clipped to a radius) split into
 // the parity-alternating 5 tets per cell. ~0.10 m radius, light, dropped onto z=0.
 constexpr float kBallRadius = 0.10f;
-constexpr uint32_t kCells = 8u;             // grid cells per axis spanning the sphere.
+constexpr uint32_t kCells = 12u;            // grid cells per axis spanning the sphere (coarse cage; smooth skin pass).
 constexpr float kCellLen = 2.0f * kBallRadius / static_cast<float>(kCells);
-constexpr float kDropHeight = 0.50f;        // ball center starts this far above 0.
+constexpr float kDropHeight = 0.16f;        // ball center starts this far above 0 (gentle drop, calm recovery).
 constexpr float kParticleMass = 0.01f;      // 10 g per vertex (light soft body).
-constexpr float kContactDMin = 0.030f;      // particle sphere radius = d_min/2 = 0.015.
+constexpr float kContactDMin = 0.020f;      // particle sphere radius = d_min/2 = 0.010; seats the surface on the floor.
 constexpr float kRadius = kContactDMin * 0.5f;   // body<->particle sphere radius.
 constexpr uint16_t kXpbdIters = 40u;
-constexpr float kVolAlpha = 1.0e-5f;        // firmer volume: squash on impact, recover height.
+constexpr float kVolAlpha = 1.5e-6f;        // bouncy-but-stable volume: squash, lift off, settle round.
 constexpr uint32_t kFloorBody = 0u;         // only collidable is the ground plane.
 
 // ---- CLI ------------------------------------------------------------------
@@ -128,8 +128,8 @@ cook::XpbdCookInput BuildBallInput(const soft::TetLattice& lat, float center_z) 
     for (Vec3& p : init) p.z += center_z;
 
     soft::TetMeshTopologyOptions opts;
-    opts.distance_compliance_alpha = 0.0f;     // stiff edges (shape skeleton).
-    opts.volume_compliance_alpha = kVolAlpha;  // modest volume -> visible squash.
+    opts.distance_compliance_alpha = 3.0e-6f;  // soft, dissipative edges -> stable jelly that rounds back.
+    opts.volume_compliance_alpha = kVolAlpha;  // bouncy-but-stable volume -> squash, lift, settle round.
     opts.emit_distance_constraints = true;
     soft::XpbdConstraintSet cs;
     soft::BuildTetMeshConstraints(lat.rest, lat.tets, opts, cs);
@@ -197,7 +197,7 @@ nk::Pipeline::SolverConfig Cfg() {
     cfg.dt = 1.0f / 240.0f;
     cfg.gravity[0] = 0.0f; cfg.gravity[1] = 0.0f; cfg.gravity[2] = -9.81f;
     cfg.contact_margin = 0.0f;
-    cfg.vel_iters = 32u; cfg.pos_iters = 4u;
+    cfg.vel_iters = 32u; cfg.pos_iters = 8u;
     cfg.max_pairs = 64u;
     return cfg;
 }
@@ -226,6 +226,19 @@ float MinZ(const std::vector<Vec3>& pos, uint32_t n) {
     float lo = 1.0e9f;
     for (uint32_t i = 0; i < n; ++i) lo = std::min(lo, pos[i].z);
     return lo;
+}
+
+// Vertical-to-horizontal extent ratio (1 == round; <1 squashed; >1 stretched).
+float Sphericity(const std::vector<Vec3>& pos, uint32_t n) {
+    float zlo = 1e9f, zhi = -1e9f, xlo = 1e9f, xhi = -1e9f, ylo = 1e9f, yhi = -1e9f;
+    for (uint32_t i = 0; i < n; ++i) {
+        zlo = std::min(zlo, pos[i].z); zhi = std::max(zhi, pos[i].z);
+        xlo = std::min(xlo, pos[i].x); xhi = std::max(xhi, pos[i].x);
+        ylo = std::min(ylo, pos[i].y); yhi = std::max(yhi, pos[i].y);
+    }
+    const float vert = zhi - zlo;
+    const float horiz = 0.5f * ((xhi - xlo) + (yhi - ylo));
+    return horiz > 1e-6f ? vert / horiz : 1.0f;
 }
 
 // Mean per-tet signed volume over the live positions (rest -> live ratio = squash).
@@ -417,7 +430,11 @@ render::RenderWorld BuildFrame(const soft::SurfaceTopology& topo,
         rw.instances.push_back(inst);
     };
     add(ball_mesh, 0u, Transform::Identity());   // ball verts are world-space.
-    add(floor_mesh, 1u, Transform::Identity());  // floor top coincides with z=0.
+    // Seat the visible floor a hair below the contact plane so the bottom skin
+    // reads as a clean resting silhouette, never a serrated floor-clip fringe.
+    Transform floor_xf = Transform::Identity();
+    floor_xf.position.z = -0.010f;
+    add(floor_mesh, 1u, floor_xf);
     return rw;
 }
 
@@ -467,9 +484,13 @@ int main(int argc, char** argv) {
                                       P * sizeof(Vec3));
     };
     // The cage particle indices ARE the embedded skin's global vertex indices;
-    // deform the smooth skin from the live cage each frame, then render the skin.
+    // deform the smooth skin from the live cage each frame, then a light Laplacian
+    // pass removes coarse-cage corrugation from the contact rim (smooth jelly skin).
     std::vector<Vec3> skin_pos;
-    auto deform_skin = [&]() { soft::DeformEmbeddedSkin(skin, pos, skin_pos); };
+    auto deform_skin = [&]() {
+        soft::DeformEmbeddedSkin(skin, pos, skin_pos);
+        soft::SmoothSurface(topo.triangles, 4u, 0.40f, skin_pos);
+    };
 
     const cook::XpbdCookInput rest_in = BuildBallInput(lat, kDropHeight);
     const float rest_extent = Extent(rest_in.positions, n_soft);
@@ -503,6 +524,10 @@ int main(int argc, char** argv) {
             download_pos();
             min_extent_during = std::min(min_extent_during, Extent(pos, n_soft));
             min_volume_during = std::min(min_volume_during, MeanTetVolume(pos, lat.tets));
+            if (s % 10u == 0u)
+                std::printf("  [arc] s=%3u extent=%.4f min_z=%.4f vol=%.6f rows=%u\n",
+                            s, Extent(pos, n_soft), MinZ(pos, n_soft),
+                            MeanTetVolume(pos, lat.tets), active_now);
         }
         download_pos();
         const float landed_min_z = MinZ(pos, n_soft);
@@ -602,13 +627,13 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(args.out_dir);
     std::filesystem::create_directories(args.png_dir);
 
-    // The drop, the slam, the settle: ~210 steps (0.9 s) covers airborne ->
+    // The drop, the slam, the settle: ~260 steps (1.1 s) covers airborne ->
     // max-squash -> rebound -> settle, the clean window the cage stays coherent in.
-    constexpr uint32_t kSteps = 210u;
+    constexpr uint32_t kSteps = 260u;
     uint32_t written = 0u, render_step = 0u;
     size_t first_nonbg = 0u, last_nonbg = 0u;
     int squash_frame = -1, recovered_frame = static_cast<int>(kSteps) - 1;
-    constexpr int kAirborneFrame = 40;
+    int airborne_frame = 0;
 
     auto render_frame = [&](const std::string* png) {
         download_pos();
@@ -670,34 +695,59 @@ int main(int argc, char** argv) {
         nk::Model mp = BuildScene(lat, kDropHeight, /*floor_present=*/true);
         nk::World wp(std::move(mp), 1u, dev, backend, Cfg());
         std::vector<Vec3> pp(P, Vec3::Zero());
-        std::vector<float> ext_of(kSteps, 0.0f), minz_of(kSteps, 0.0f);
+        std::vector<float> ext_of(kSteps, 0.0f), minz_of(kSteps, 0.0f), sph_of(kSteps, 1.0f);
         for (uint32_t s = 0; s < kSteps; ++s) {
             wp.Step();
             wp.GetData().DownloadField(nk::FieldId::ParticlePos, pp.data(), P * sizeof(Vec3));
             ext_of[s] = Extent(pp, n_soft);
             minz_of[s] = MinZ(pp, n_soft);
+            sph_of[s] = Sphericity(pp, n_soft);
         }
+        // First contact = the first frame the ball reaches the floor; the dramatic
+        // hero squash is the deepest compression of that FIRST impact (not a late
+        // jiggle), seated (min_z >= 0) so no bottom pokes below the floor.
+        uint32_t first_contact = 0u;
+        while (first_contact < kSteps && minz_of[first_contact] > 0.02f) ++first_contact;
+        const uint32_t sq_hi = std::min(kSteps, first_contact + 60u);
         float min_extent = 1.0e9f;
-        for (uint32_t s = 0; s < kSteps; ++s)
-            if (ext_of[s] < min_extent) { min_extent = ext_of[s]; squash_frame = static_cast<int>(s); }
-        // Recovered = the most-lifted (highest min_z) frame just after the squash,
-        // where the volume constraint is restoring the shape with little bounce jitter.
-        const uint32_t lo = static_cast<uint32_t>(squash_frame) + 1u;
-        const uint32_t hi = std::min(kSteps, static_cast<uint32_t>(squash_frame) + 140u);
-        float best_lift = -1.0e9f;
-        for (uint32_t s = lo; s < hi; ++s)
-            if (minz_of[s] > best_lift) { best_lift = minz_of[s]; recovered_frame = static_cast<int>(s); }
+        for (uint32_t s = first_contact; s < sq_hi; ++s)
+            if (minz_of[s] >= -0.001f && ext_of[s] < min_extent) {
+                min_extent = ext_of[s]; squash_frame = static_cast<int>(s);
+            }
+        if (squash_frame < 0) {  // fallback: global deepest seated frame.
+            for (uint32_t s = 0; s < kSteps; ++s)
+                if (ext_of[s] < min_extent) { min_extent = ext_of[s]; squash_frame = static_cast<int>(s); }
+        }
+        // Airborne = the highest still-falling frame before the squash (clearly in
+        // the air), so the drop reads even when the drop height is small.
+        float best_air = -1.0e9f;
+        for (int s = 0; s < squash_frame; ++s)
+            if (minz_of[s] > best_air) { best_air = minz_of[s]; airborne_frame = s; }
+        // Recovered = a SETTLED frame in the back half: round (sphericity ~1, not a
+        // stretched vertical wobble), seated cleanly (min_z >= 0), and CALM (low
+        // frame-to-frame sphericity change), so it reads as a resting jelly blob.
+        const uint32_t lo = std::max(static_cast<uint32_t>(squash_frame) + 1u, kSteps / 2u);
+        float best_settle = -1.0e9f;
+        for (uint32_t s = lo + 1u; s < kSteps; ++s) {
+            if (minz_of[s] < -0.001f) continue;                  // skip penetrating frames
+            const float round = 1.0f - std::fabs(sph_of[s] - 1.0f);   // 1 == perfectly round
+            const float seated = 1.0f - std::min(1.0f, std::fabs(minz_of[s]) / 0.03f);
+            const float calm = 1.0f - std::min(1.0f, std::fabs(sph_of[s] - sph_of[s - 1u]) / 0.05f);
+            const float score = round + 0.4f * seated + 0.6f * calm;
+            if (score > best_settle) { best_settle = score; recovered_frame = static_cast<int>(s); }
+        }
         std::printf("[soft_ball_demo] hero frames: airborne=%d squash=%d (extent=%.4f) "
-                    "recovered=%d (extent=%.4f min_z=%.4f) rest=%.4f\n",
-                    kAirborneFrame, squash_frame, min_extent, recovered_frame,
-                    ext_of[recovered_frame], minz_of[recovered_frame], rest_extent);
+                    "recovered=%d (extent=%.4f sph=%.3f min_z=%.4f) rest=%.4f\n",
+                    airborne_frame, squash_frame, min_extent, recovered_frame,
+                    ext_of[recovered_frame], sph_of[recovered_frame],
+                    minz_of[recovered_frame], rest_extent);
     }
 
     for (uint32_t s = 0; s < kSteps; ++s) {
         world.Step();
         const std::string* png = nullptr;
         std::string png_path;
-        if (static_cast<int>(s) == kAirborneFrame) { png_path = args.png_dir + "/01_airborne.png"; png = &png_path; }
+        if (static_cast<int>(s) == airborne_frame) { png_path = args.png_dir + "/01_airborne.png"; png = &png_path; }
         else if (static_cast<int>(s) == squash_frame) { png_path = args.png_dir + "/02_squash.png"; png = &png_path; }
         else if (static_cast<int>(s) == recovered_frame) { png_path = args.png_dir + "/03_recovered.png"; png = &png_path; }
         if ((render_step % args.stride) == 0u || png) render_frame(png);
