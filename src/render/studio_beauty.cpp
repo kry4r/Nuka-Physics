@@ -47,15 +47,61 @@ MeshGeometry MakeFloorGeo(float half, float z) {
     return g;
 }
 
-// Bake every particle in [first, first+count) into one mesh of radius-r octahedra
-// (6 verts / 8 tris each; the beauty tracer's smooth normals round them off).
+// Deterministic 32-bit integer hash (index-keyed, stable across frames) -> [0,1).
+// `salt` decorrelates the radius / value / hue channels of one grain.
+float GrainHash01(uint32_t key, uint32_t salt) {
+    uint32_t x = key ^ (salt * 0x9e3779b9u);
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return static_cast<float>(x >> 8) * (1.0f / 16777216.0f);
+}
+
+// Per-grain radius scale in [1-amp, 1+amp) (clamped positive) from the global index.
+float GrainRadiusScale(uint32_t g, float amp) {
+    if (amp <= 0.0f) return 1.0f;
+    const float s = 1.0f + amp * (2.0f * GrainHash01(g, 1u) - 1.0f);
+    return s < 0.05f ? 0.05f : s;
+}
+
+// Per-grain albedo tint multiplier: a shared value (brightness) shift plus small
+// per-channel hue offsets, both scaled by `amp`. amp 0 => neutral white.
+Vec3 GrainTint(uint32_t g, float amp) {
+    if (amp <= 0.0f) return Vec3{1.0f, 1.0f, 1.0f};
+    const float dv = amp * (2.0f * GrainHash01(g, 2u) - 1.0f);
+    const float hr = 0.5f * amp * (2.0f * GrainHash01(g, 3u) - 1.0f);
+    const float hg = 0.5f * amp * (2.0f * GrainHash01(g, 4u) - 1.0f);
+    const float hb = 0.5f * amp * (2.0f * GrainHash01(g, 5u) - 1.0f);
+    auto pos = [](float x) { return x < 0.0f ? 0.0f : x; };
+    return Vec3{pos(1.0f + dv + hr), pos(1.0f + dv + hg), pos(1.0f + dv + hb)};
+}
+
+// Bake every particle in [first, first+count) into one skin. `round` emits analytic
+// spheres (perfectly round, cheaper BLAS); otherwise radius-r octahedra (6 verts / 8
+// tris, rounded by smooth normals). `radius_jitter`/`tint_jitter` add deterministic
+// per-grain variation (both 0 + round false => today's uniform octahedra).
 MeshGeometry BakeParticleSpheres(const std::vector<Vec3>& pos, uint32_t first,
-                                 uint32_t count, float r) {
+                                 uint32_t count, float r, bool round,
+                                 float radius_jitter, float tint_jitter) {
     MeshGeometry g;
     const uint32_t total = static_cast<uint32_t>(pos.size());
     const uint32_t lo = first < total ? first : total;
     const uint32_t n = (count == 0u) ? (total - lo)
                                      : (count < total - lo ? count : total - lo);
+    if (round) {
+        g.sphere_centers.reserve(static_cast<size_t>(n) * 3u);
+        g.sphere_radii.reserve(n);
+        if (tint_jitter > 0.0f) g.sphere_colors.reserve(static_cast<size_t>(n) * 3u);
+        for (uint32_t i = 0; i < n; ++i) {
+            const Vec3& p = pos[lo + i];
+            const uint32_t gi = lo + i;
+            g.sphere_centers.insert(g.sphere_centers.end(), {p.x, p.y, p.z});
+            g.sphere_radii.push_back(r * GrainRadiusScale(gi, radius_jitter));
+            if (tint_jitter > 0.0f) {
+                const Vec3 t = GrainTint(gi, tint_jitter);
+                g.sphere_colors.insert(g.sphere_colors.end(), {t.x, t.y, t.z});
+            }
+        }
+        return g;
+    }
     static const float kV[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                                    {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
     static const uint32_t kF[8][3] = {{0, 2, 4}, {2, 1, 4}, {1, 3, 4}, {3, 0, 4},
@@ -65,10 +111,11 @@ MeshGeometry BakeParticleSpheres(const std::vector<Vec3>& pos, uint32_t first,
     for (uint32_t i = 0; i < n; ++i) {
         const Vec3& p = pos[lo + i];
         const uint32_t base = i * 6u;
+        const float rp = r * GrainRadiusScale(lo + i, radius_jitter);
         for (int v = 0; v < 6; ++v) {
             g.positions.insert(g.positions.end(),
-                               {p.x + r * kV[v][0], p.y + r * kV[v][1],
-                                p.z + r * kV[v][2]});
+                               {p.x + rp * kV[v][0], p.y + rp * kV[v][1],
+                                p.z + rp * kV[v][2]});
         }
         for (const auto& f : kF)
             g.indices.insert(g.indices.end(), {base + f[0], base + f[1], base + f[2]});
@@ -219,11 +266,15 @@ void UseAuthoredSceneMaterials(StudioScene& scene) {
 
 void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
                            uint32_t scene_material_id, float radius,
-                           uint32_t first, uint32_t count) {
+                           uint32_t first, uint32_t count, bool round,
+                           float radius_jitter, float tint_jitter) {
     StudioScene::ParticleSkin sk;
     sk.radius = radius > 0.0f ? radius : 0.005f;
     sk.first = first;
     sk.count = count;
+    sk.round = round;
+    sk.radius_jitter = radius_jitter;
+    sk.tint_jitter = tint_jitter;
     uint32_t slot = InternSceneMaterial(scene, registry, scene_material_id);
     if (slot == kNoId) {
         // Neutral matte granite grey (the default granular grain look).
@@ -280,8 +331,9 @@ void PublishStudioScene(StudioScene& scene,
     for (std::size_t si = 0; si < scene.particle_skins.size(); ++si) {
         StudioScene::ParticleSkin& sk = scene.particle_skins[si];
         MeshGeometry mesh =
-            BakeParticleSpheres(particle_pos, sk.first, sk.count, sk.radius);
-        if (mesh.positions.empty()) continue;
+            BakeParticleSpheres(particle_pos, sk.first, sk.count, sk.radius, sk.round,
+                                sk.radius_jitter, sk.tint_jitter);
+        if (mesh.positions.empty() && mesh.sphere_centers.empty()) continue;
         if (sk.mesh_id == kNoId) {
             sk.mesh_id = scene.world.meshes.InternPrimitive(
                 "particle_skin" + std::to_string(si), [&] { return mesh; });
@@ -344,7 +396,12 @@ struct StudioRtRenderer::Impl {
         b.sky_ground = {opts.ground_color[0], opts.ground_color[1], opts.ground_color[2]};
         b.fog_color = {opts.fog_color[0], opts.fog_color[1], opts.fog_color[2]};
         b.fog_density = opts.fog_density;
-        b.sky_intensity = 0.30f;
+        // Env-miss indirect fill scale + optional sky sun disc (both opt-in via
+        // RasterOptions; the 0.30 / zero defaults keep the prior look byte-exact).
+        b.sky_intensity = opts.beauty_sky_fill;
+        b.sun_disc_radiance = Vec3{opts.beauty_sun_disc[0], opts.beauty_sun_disc[1],
+                                   opts.beauty_sun_disc[2]};
+        b.specular_env = opts.beauty_specular_env;
         b.download = rt::AovDownloadMask{};
         b.download.depth = false; b.download.normal = false;
         b.download.albedo = false; b.download.uv = false;
@@ -378,9 +435,10 @@ VulkanOffscreenReport StudioRtRenderer::Render(const RenderWorld& world,
     else
         fb = im.backend->TraceToHost(im.handle, im.scene, cam);
     // An HDR environment IS the backdrop: keep the traced radiance on miss pixels
-    // (no environment => the flat background fill, byte-identical to today).
+    // (no environment => the flat background fill). Exposure/grade post is opt-in.
     return FramebufferToReport(fb, options.background,
-                               im.beauty && world.environment.Enabled());
+                               im.beauty && world.environment.Enabled(),
+                               options.beauty_exposure_ev, options.beauty_grade);
 }
 
 }  // namespace nuka::render

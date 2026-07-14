@@ -29,7 +29,7 @@ void Pipeline::AddOp(phi::NkOp op, const void* params, phi::Device* device) {
 }
 
 void Pipeline::Build(const Model& model, const SolverConfig& cfg,
-                     phi::Device* device) {
+                     phi::Device* device, uint32_t readout_demand) {
     calls_.clear();
     const ModelCapacities& cap = model.capacities;
 
@@ -76,8 +76,13 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const uint32_t max_dof          = cap.dofs_per_env;
     // rigid_cap recovers the pre-particle budget the cook grew from, so rigid keeps
     // [0, rigid_cap) and particles the top range; particle-free -> rigid_cap == total.
+    // The MpmXpbd MPM slice couples via the grid and reserves no slots — the SAME
+    // exemption GrowContactBudgetForParticles applies, so the recovery matches.
+    const uint32_t row_exempt_particles =
+        model.particles.mode == Model::ParticleMode::MpmXpbd
+            ? model.particles.n_mpm_particles : 0u;
     const uint32_t particle_reserve =
-        has_particles ? cap.particles_per_env *
+        has_particles ? (cap.particles_per_env - row_exempt_particles) *
                             collision::gpu::kBodyParticleContactSlotsPerParticle
                       : 0u;
     const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve;
@@ -462,6 +467,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // shared params layout.)
         p_assemble_.union_slot_count = cap.max_contacts_per_env;
         p_assemble_.rows_per_env = cap.max_rows_per_env;
+        // Layout follows the slot provider, not the particle solver mode: rigid
+        // candidates are 4-point manifolds, the reserved sphere-particle tail is
+        // one point. With no reserve rigid_cap == the full slot stride.
+        p_assemble_.full_row_slot_count = rigid_cap;
         p_assemble_.bodies_per_env = cap.bodies_per_env;
         p_assemble_.base_link_count = base_link_count;
         for (int k = 0; k < 2; ++k) p_assemble_.solref[k] = model.contact_solref[k];
@@ -617,10 +626,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     // ReadoutContactWrench: the general per-env contact-wrench readout over the
-    // unified PairDriven contact buffer (removed the !is_union gate — the
-    // UnionCsr family that suppressed this op is gone; the path is always
-    // PairDriven now).
-    if (has_articulation || has_bodies) {
+    // unified PairDriven contact buffer. Pure readout — emitted only when a
+    // consumer demanded its output fields (World flips the bit on first request
+    // and rebuilds; unconsumed worlds skip the full row scan every step).
+    if ((readout_demand & kReadoutContactWrench) != 0u &&
+        (has_articulation || has_bodies)) {
         p_readout_.dt = cfg.dt;
         p_readout_.env_count = env_count;
         p_readout_.base_link_count = base_link_count;

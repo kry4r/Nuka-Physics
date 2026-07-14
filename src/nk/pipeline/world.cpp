@@ -4,6 +4,8 @@
 
 #include "nk/pipeline/world.hpp"
 
+#include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "nk/solve/schedule.hpp"
@@ -13,7 +15,7 @@ namespace nuka::nk {
 
 World::World(Model model, uint32_t env_count, phi::Device* device,
              phi::Backend* backend, const Pipeline::SolverConfig& cfg)
-    : model_(std::move(model)), backend_(backend) {
+    : model_(std::move(model)), cfg_(cfg), device_(device), backend_(backend) {
     if (device == nullptr || backend == nullptr) {
         return;
     }
@@ -23,13 +25,39 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
 
     // Size the particle-grid sort/scan scratch so ParticleGridBuild captures into
     // the graph (no mid-capture cudaMalloc); 0 for a particle-free world (inert).
-    model_.capacities.grid_sort_scratch_bytes = phi::GridSortScratchBytes(
-        model_.capacities.particles_per_env * model_.capacities.env_count);
+    const bool runs_pbf =
+        model_.particles.mode == Model::ParticleMode::Pbf ||
+        model_.particles.mode == Model::ParticleMode::SoftFluid ||
+        (model_.particles.mode == Model::ParticleMode::Coupled &&
+         model_.particles.coupled_internal == Model::CoupledInternal::Pbf);
+    const uint32_t particle_grid_count = runs_pbf
+        ? model_.capacities.particles_per_env * model_.capacities.env_count : 0u;
+    model_.capacities.grid_sort_scratch_bytes =
+        phi::GridSortScratchBytes(particle_grid_count);
 
     // Size the MLS-MPM P2G deterministic-gather scratch the same way; 0 for a
     // non-MPM world (zero-byte segment, byte-inert).
-    model_.capacities.mpm_grid_sort_scratch_bytes = phi::MpmSortScratchBytes(
-        model_.capacities.particles_per_env * model_.capacities.env_count);
+    const uint32_t mpm_per_env =
+        model_.particles.mode == Model::ParticleMode::Mpm
+            ? model_.capacities.particles_per_env
+        : model_.particles.mode == Model::ParticleMode::MpmXpbd
+            ? model_.particles.n_mpm_particles : 0u;
+    const uint64_t mpm_particle_sort_count =
+        static_cast<uint64_t>(mpm_per_env) * model_.capacities.env_count;
+    // The same workspace also compacts active P2G nodes and, when dynamic bodies
+    // are enabled, stably groups projected nodes by owner for the reaction gather.
+    // Both node phases need capacity for the full env-private grid.
+    const uint64_t mpm_node_sort_count = mpm_per_env > 0u
+        ? static_cast<uint64_t>(model_.capacities.mpm_grid_nodes_per_env) *
+              model_.capacities.env_count
+        : 0u;
+    const uint64_t mpm_sort_count =
+        mpm_particle_sort_count > mpm_node_sort_count
+            ? mpm_particle_sort_count : mpm_node_sort_count;
+    model_.capacities.mpm_grid_sort_scratch_bytes =
+        mpm_sort_count <= static_cast<uint64_t>(std::numeric_limits<int>::max())
+            ? phi::MpmSortScratchBytes(static_cast<uint32_t>(mpm_sort_count))
+            : 0u;  // CUB sort/select expose an int num_items contract.
 
     // Size the dynamic-island cub radix-sort scratch (BuildSolveIslands) over the
     // total row capacity so the sort captures into the graph; 0 if no rows (inert).
@@ -67,7 +95,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
 
     // 3. Build the per-step pipeline (OpCall list, §3.2 order; the device's
     // supports_op capability query drops not-yet-implemented ops).
-    pipeline_.Build(model_, cfg, device);
+    pipeline_.Build(model_, cfg_, device, readout_demand_);
 
     ready_ = true;
 
@@ -512,10 +540,37 @@ phi::Status World::DispatchOp(phi::NkOp op, const void* params) {
     return phi::BackendDispatch(backend_, model_view_, data_view_, call);
 }
 
+void World::DemandReadout(FieldId id) {
+    uint32_t bit = 0u;
+    if (id == FieldId::LinkContactWrench || id == FieldId::ContactForce) {
+        bit = Pipeline::kReadoutContactWrench;
+    }
+    if (bit == 0u || (readout_demand_ & bit) != 0u) {
+        return;
+    }
+    readout_demand_ |= bit;
+    pipeline_.Build(model_, cfg_, device_, readout_demand_);
+    // The op set changed: drop the captured plan so StepPlanned re-captures.
+    if (plan_ != nullptr && backend_ != nullptr) {
+        phi::BackendPlanFree(backend_, plan_);
+        plan_ = nullptr;
+    }
+    // Backfill from the last solved rows (pure readout over unchanged inputs =>
+    // the same bytes a step-time emission would have produced).
+    for (const phi::OpCall& call : pipeline_.Calls()) {
+        if (call.op == phi::NkOp::ReadoutContactWrench) {
+            phi::BackendDispatch(backend_, model_view_, data_view_, call);
+            break;
+        }
+    }
+}
+
 void* World::FieldPtr(FieldId id) const {
     if (!ready_) {
         return nullptr;
     }
+    // Readout outputs are produced on demand: the first request turns the op on.
+    const_cast<World*>(this)->DemandReadout(id);
     const FieldLayout& lay = LayoutOf(id);
     if (lay.owner == FieldOwner::Model) {
         // Resolve from the model device buffer via its segment table.

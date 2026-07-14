@@ -66,6 +66,25 @@ rt::BlasMesh MeshToBlas(const MeshGeometry& geo) {
             blas.tri_uvs.push_back({uv(i0), uv(i1), uv(i2)});
         }
     }
+    // Analytic spheres: copy centers/radii, and (when present) the parallel per-
+    // sphere albedo tints. Absent tints leave sphere_colors empty (untinted).
+    const uint32_t sph_count = geo.SphereCount();
+    const bool has_sph_colors =
+        geo.sphere_colors.size() == static_cast<size_t>(sph_count) * 3u && sph_count > 0u;
+    blas.spheres.reserve(sph_count);
+    if (has_sph_colors) blas.sphere_colors.reserve(sph_count);
+    for (uint32_t s = 0; s < sph_count; ++s) {
+        rt::SpherePrim sp;
+        sp.center = {geo.sphere_centers[s * 3u + 0u], geo.sphere_centers[s * 3u + 1u],
+                     geo.sphere_centers[s * 3u + 2u]};
+        sp.radius = geo.sphere_radii[s];
+        blas.spheres.push_back(sp);
+        if (has_sph_colors) {
+            blas.sphere_colors.push_back({geo.sphere_colors[s * 3u + 0u],
+                                          geo.sphere_colors[s * 3u + 1u],
+                                          geo.sphere_colors[s * 3u + 2u]});
+        }
+    }
     return blas;
 }
 

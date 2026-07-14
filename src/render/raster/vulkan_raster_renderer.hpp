@@ -167,6 +167,15 @@ struct RasterOptions {
     float       camera_near         = 0.05f;
     float       camera_far          = 1000.0f;
 
+    // ----- OFFLINE BEAUTY LOOK LEVERS (studio path tracer only) --------------
+    // Neutral defaults keep every existing beauty frame byte-identical; the demo
+    // render entry raises them per the scene's authored environment levers.
+    float       beauty_sky_fill     = 0.30f;               // env-miss indirect fill scale
+    float       beauty_sun_disc[3]  = {0.0f, 0.0f, 0.0f};  // sky sun-disc radiance (0 = off)
+    float       beauty_exposure_ev  = 0.0f;                // post exposure in stops
+    float       beauty_grade        = 0.0f;                // post contrast/saturation strength
+    bool        beauty_specular_env = false;               // Cook-Torrance + env reflection (opaque arm)
+
     // ----- BEAUTY (M8.5 T4b): grounded look + hero framing -------------------
     // A tasteful ground plane the robot sits on (a large dark disc with a soft
     // radial fade toward the horizon), drawn RENDERER-SIDE under the scene at the

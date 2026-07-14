@@ -215,6 +215,14 @@ struct EnvironmentRecord {
     float yaw_deg                          = 0.0f;
     float intensity                        = 1.0f;
     bool  use_scene_materials              = false;
+
+    // Offline beauty look levers (opt-in; neutral defaults keep existing beauty
+    // frames byte-identical). render_beauty maps each onto the studio tracer.
+    bool  ibl_full_fill                    = false;  // env-miss fill at `intensity`, not the dim sky
+    float exposure_ev                      = 0.0f;   // post exposure in stops
+    float grade                            = 0.0f;   // post filmic contrast/saturation strength
+    float sun_disc                         = 0.0f;   // sky sun-disc radiance scale, keyed to the key light
+    bool  specular_env                     = false;  // opaque arm: Cook-Torrance + env reflection ray
 };
 
 struct CameraRecord {
@@ -317,6 +325,9 @@ struct MediaMpmMaterial {
     math::Vec3 floor_normal{0.0f, 0.0f, 1.0f};
     float      floor_d        = 0.0f;
     float      floor_friction = 0.4f;
+    // Extra +z grid headroom (m) above the sampled box so kicked/lofted debris does
+    // not trip the +z escape clip. 0 (default) keeps today's motion headroom.
+    float      loft_headroom  = 0.0f;
 };
 
 // Render-skin metadata for surface baking. The cloth fields mirror the particle
@@ -326,6 +337,12 @@ struct MediaRenderSkin {
     uint32_t smooth_iters  = 0u;     // Laplacian relaxation passes (render-only)
     float    smooth_lambda = 0.5f;   // per-pass blend weight in [0,1]
     AssetRef skin_mesh;              // embedded tet skin chunk; empty => particle surface
+    // Instanced-sphere grain look (granular/MPM/cable-bead skins): analytic spheres
+    // vs octahedra, plus deterministic per-grain radius/albedo scatter. All 0/false
+    // (default) => today's uniform octahedra, byte-identical.
+    uint32_t grain_round         = 0u;
+    float    grain_radius_jitter = 0.0f;
+    float    grain_tint_jitter   = 0.0f;
 };
 
 // A first-class media entry: WHAT it is (kind), HOW it solves (method),
@@ -336,18 +353,26 @@ struct MediaRecord {
 
     // WHAT it is (solver routing) and HOW it solves (one method per medium).
     // Granular is an MLS-MPM Drucker-Prager sand/gravel bed (box geometry, model_kind 4).
-    enum class Kind   : uint8_t { Cloth, SoftTet, Fluid, Granular };
+    // Cable is an XPBD inextensible distance chain (rope), optionally weighted by a
+    // shape-match rigid slab welded to its loaded end.
+    enum class Kind   : uint8_t { Cloth, SoftTet, Fluid, Granular, Cable };
     enum class Method : uint8_t { Xpbd, Pbf, MlsMpm };
     Kind   kind   = Kind::Cloth;
     Method method = Method::Xpbd;
 
     // Procedural geometry (one populated per kind); a baked .obj/.nka mesh
     // medium references its chunk via `baked` instead.
+    // Which node set is pinned (inv_mass 0): none (a free drape), the perimeter
+    // (a taut membrane), or ONE grid edge (a hung curtain / flag).
+    enum class ClothPin : uint8_t { FromFree = 0, None, Perimeter,
+                                    EdgeX0, EdgeX1, EdgeY0, EdgeY1 };
     struct ClothGrid {
         uint32_t   nx = 0u, ny = 0u;
         float      spacing = 0.0f;
         math::Vec3 origin{0.0f, 0.0f, 0.0f};
         bool       free = false;
+        // FromFree defers to the legacy `free` flag; any other value overrides it.
+        ClothPin   pin = ClothPin::FromFree;
     };
     struct TetSphere {
         math::Vec3 center{0.0f, 0.0f, 0.0f};
@@ -361,10 +386,47 @@ struct MediaRecord {
         math::Vec3 min{0.0f, 0.0f, 0.0f};
         math::Vec3 max{0.0f, 0.0f, 0.0f};
         float      spacing = 0.0f;
+        // Lattice-break jitter (fraction of the half-spacing; deterministic per cell).
+        // 0 (default) => the exact lattice, byte-identical.
+        float      position_jitter = 0.0f;
+    };
+    // A cable / rope: an XPBD distance chain of `segments` links (segments+1
+    // particles) from `start` to `end`; `radius` is the render bead + contact size.
+    struct CableLine {
+        // Which endpoint(s) are kinematic (inv_mass 0): the anchor, the loaded end,
+        // both, or none (a free-falling chain).
+        enum class Pin : uint8_t { Start = 0, End, Both, None };
+        // An optional rigid slab welded to the loaded end: a box of `half_extents`
+        // cooked as ONE shape-match cluster (id 9); all-zero extents => a bare cable.
+        struct Slab {
+            math::Vec3 half_extents{0.0f, 0.0f, 0.0f};
+            float      mass = 0.0f;       // per-corner mass (0 => the cable mass).
+            float      stiffness = 1.0f;  // shape-match goal-pull fraction in [0,1].
+            uint32_t   render_material_id = kInvalidMaterial;
+        };
+        math::Vec3 start{0.0f, 0.0f, 0.0f};
+        math::Vec3 end{0.0f, 0.0f, 0.0f};
+        uint32_t   segments = 0u;
+        float      radius = 0.0f;
+        Pin        pin = Pin::Start;
+        bool       bend = false;  // skip-one distance rows for a little stiffness.
+        Slab       slab{};
+    };
+    // A heterogeneous MLS-MPM sub-fill: a sub-box region sampled with its OWN
+    // constitutive material (the medium's `mpm` block still supplies the shared grid
+    // scalars: dx / substeps / floor / loft). Fills APPEND to the base bed
+    // (fluid_box + mpm), each getting a distinct per-particle material id; the grid
+    // AABB is the union. Empty (default) => a single homogeneous bed, byte-identical.
+    struct MpmFill {
+        FluidBox         box{};
+        MediaMpmMaterial material{};   // constitutive only; grid scalars ignored here.
+        uint32_t         render_material_id = kInvalidMaterial;  // ~0u => inherit medium.
     };
     ClothGrid cloth_grid{};
     TetSphere tet_sphere{};
     FluidBox  fluid_box{};
+    CableLine cable_line{};
+    std::vector<MpmFill> mpm_fills{};
     AssetRef  baked;            // .nka tet/cloth chunk; empty => procedural.
 
     MediaXpbdMaterial xpbd{};

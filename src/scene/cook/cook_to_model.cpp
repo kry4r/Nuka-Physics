@@ -234,25 +234,41 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
     return static_cast<uint32_t>(out.size() / 3u) - start;
 }
 
+// Per-env particles that never emit body rows: the grid-coupled MPM slice under
+// MpmXpbd. 0 for every other mode (their whole particle set reserves slots).
+static uint32_t RowExemptParticles(const nk::Model& model) {
+    return model.particles.mode == nk::Model::ParticleMode::MpmXpbd
+               ? model.particles.n_mpm_particles
+               : 0u;
+}
+
 }  // namespace
 
 // Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
 // body<->body budget) for body<->particle rows; idempotent, byte-identical when 0.
-void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base) {
+// `row_exempt` = per-env particles that never emit body rows (a grid-coupled MPM
+// slice under MpmXpbd) and therefore reserve no slots. Every reserved particle
+// slot is sphere-vs-body and uses the same one-point/five-row footprint in every
+// particle mode; rigid slots retain the four-point/twenty-row worst case.
+void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
+                                   uint32_t row_exempt) {
     if (rigid_base == 0u) return;  // no body contacts -> no body<->particle rows.
+    const uint32_t row_particles =
+        row_exempt < cap.particles_per_env ? cap.particles_per_env - row_exempt : 0u;
     const uint64_t reserve =
-        static_cast<uint64_t>(cap.particles_per_env) *
+        static_cast<uint64_t>(row_particles) *
         collision::gpu::kBodyParticleContactSlotsPerParticle;
     const uint64_t total = static_cast<uint64_t>(rigid_base) + reserve;
-    if (total > 0xFFFFFFFFull ||
-        total * nk::kPairDrivenRowsPerSlot > 0xFFFFFFFFull) {
+    const uint64_t rows =
+        static_cast<uint64_t>(rigid_base) * nk::kPairDrivenRowsPerSlot +
+        reserve * nk::kPairDrivenParticleRowsPerSlot;
+    if (total > 0xFFFFFFFFull || rows > 0xFFFFFFFFull) {
         throw std::runtime_error(
             "CookToModel: body<->particle contact budget overflows u32 "
             "(too many particles for the per-env contact slot block)");
     }
     cap.max_contacts_per_env = static_cast<uint32_t>(total);
-    cap.max_rows_per_env =
-        cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    cap.max_rows_per_env = static_cast<uint32_t>(rows);
 }
 
 namespace {
@@ -922,33 +938,13 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 }
             }
 
-            // Per-body VISUAL-mesh SDF: a primitive-authored body with a baked
-            // silhouette SDF gets its collision row switched to kShapeSdfMesh +
-            // sdf_grid bound, so rigid tier-select AND the particle switch route to
-            // the SDF. params[0] becomes the grid's bound radius (max |corner| in
-            // the body frame) so the broadphase AABB covers the true silhouette,
-            // not the inset primitive (else cloth within the SDF gets culled).
+            // Bind each visual-mesh silhouette SDF to the collidable's sdf_grid (lane 7:
+            // MLS-MPM grid BC + particle query); the rigid kind/params stay the primitive.
             for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
                 if (b >= sdf.body_sdf_indices.size()) break;
                 const uint32_t gi = sdf.body_sdf_indices[b];
                 if (gi == kNoSdf || b >= model.shape_table_rows.size()) continue;
-                nk::Model::PairDrivenShape& row = model.shape_table_rows[b];
-                row.sdf_grid = gi;
-                row.kind = static_cast<uint8_t>(
-                    ::nuka::collision::kShapeSdfMesh);
-                const nk::Model::SdfGrid& g = model.sdf_grids[gi];
-                float max_sq = 0.0f;
-                const float ex = static_cast<float>(g.dims[0]) * g.voxel_size;
-                const float ey = static_cast<float>(g.dims[1]) * g.voxel_size;
-                const float ez = static_cast<float>(g.dims[2]) * g.voxel_size;
-                for (int corner = 0; corner < 8; ++corner) {
-                    const math::Vec3 c{
-                        g.origin.x + ((corner & 1) ? ex : 0.0f),
-                        g.origin.y + ((corner & 2) ? ey : 0.0f),
-                        g.origin.z + ((corner & 4) ? ez : 0.0f)};
-                    max_sq = std::max(max_sq, c.LengthSq());
-                }
-                row.params[0] = std::sqrt(max_sq);
+                model.shape_table_rows[b].sdf_grid = gi;
                 // Populate the orphaned ModelShape.sdf_index for this body's rows.
                 for (nk::ModelShape& msh : model.shapes)
                     if (msh.body_row == b) msh.sdf_index = gi;
@@ -974,6 +970,18 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             }
             model.excluded_pairs.push_back(
                 (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+        // Two immovable bodies can never produce a reaction row; exclude their
+        // pairs so static set dressing does not consume the candidate budget.
+        for (uint32_t i = 0; i + 1u < cap.bodies_per_env; ++i) {
+            if (i >= blob.bodies.is_static.size() || !blob.bodies.is_static[i])
+                continue;
+            for (uint32_t j = i + 1u; j < cap.bodies_per_env; ++j) {
+                if (j >= blob.bodies.is_static.size() || !blob.bodies.is_static[j])
+                    continue;
+                model.excluded_pairs.push_back(
+                    (static_cast<uint64_t>(i) << 32) | static_cast<uint64_t>(j));
+            }
         }
         std::sort(model.excluded_pairs.begin(), model.excluded_pairs.end());
         model.excluded_pairs.erase(
@@ -1358,8 +1366,8 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 
     nk::ModelCapacities& cap = model.capacities;
     // bodies_per_env (the LBVH leaf count) now includes the static terrain collidable;
-    // the CONTACT budget is the dynamic collidables (+1 static) at 4 candidate slots
-    // each -- the SAME rule the body cook uses (the heightfield replaced the plane).
+    // the CONTACT budget is the dynamic collidables (+1 static) at the shared
+    // per-collidable slot rate -- the SAME rule the body cook uses.
     cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
     cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
     constexpr uint32_t kStaticCollidables = 1u;
@@ -1369,7 +1377,7 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
     cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
     // A coupled world (terrain AND particles) keeps the body<->particle slot reserve
     // disjoint above the rigid base -- no-op when particles_per_env == 0.
-    GrowContactBudgetForParticles(cap, rigid_base);
+    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
     return body_row;
 }
 
@@ -1503,7 +1511,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     cap.aero_tris_per_env = an;
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget
     // (no-op when there are no body contacts -> particle-only cooks byte-identical).
-    GrowContactBudgetForParticles(cap, rigid_base);
+    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
     // n_soft_particles is left at its default (0); it is only consulted for the
     // SoftFluid mode (CookSoftFluidParticles sets it). The single-system Xpbd
     // ops ignore it (mode-gated), so the device-staged bytes are unaffected.
@@ -1542,23 +1550,38 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     }
     mp.initial_vol0 = in.vol0;
     if (mp.initial_vol0.size() != n) mp.initial_vol0.assign(n, in.dx * in.dx * in.dx);
-    mp.initial_material_id.assign(n, 0u);
 
-    // The single cooked material (id 0). The constitutive branch reads it later.
-    // Reject kind 1 loudly: granular Drucker-Prager would silently run as elastic.
-    if (in.material.model_kind > 0.5f && in.material.model_kind < 1.5f) {
-        throw std::runtime_error(
-            "CookMpmParticles: granular Drucker-Prager MPM (model_kind == 1) is not "
-            "yet implemented");
+    // Convert one cook material row -> the model POD; reject kind 1 loudly (granular
+    // Drucker-Prager would silently run as elastic). The F-update branch reads it later.
+    auto to_material = [](const MpmMaterialInput& mi) {
+        if (mi.model_kind > 0.5f && mi.model_kind < 1.5f) {
+            throw std::runtime_error(
+                "CookMpmParticles: granular Drucker-Prager MPM (model_kind == 1) is "
+                "not yet implemented");
+        }
+        nk::MpmMaterial m;
+        m.youngs = mi.youngs; m.poisson = mi.poisson; m.density = mi.density;
+        m.dp_friction = mi.dp_friction; m.dp_cohesion = mi.dp_cohesion;
+        m.model_kind = mi.model_kind; m.bulk_modulus = mi.bulk_modulus;
+        m.tait_gamma = mi.tait_gamma; m.viscosity = mi.viscosity;
+        return m;
+    };
+    if (in.materials.empty()) {
+        // Homogeneous cook: one material, id 0 for every particle.
+        mp.initial_material_id.assign(n, 0u);
+        model.mpm_materials = {to_material(in.material)};
+        cap.mpm_material_count = 1u;
+    } else {
+        // Heterogeneous cook: N material rows + the per-particle index into them.
+        model.mpm_materials.clear();
+        model.mpm_materials.reserve(in.materials.size());
+        for (const MpmMaterialInput& mi : in.materials) {
+            model.mpm_materials.push_back(to_material(mi));
+        }
+        cap.mpm_material_count = static_cast<uint32_t>(in.materials.size());
+        if (in.material_id.size() == n) mp.initial_material_id = in.material_id;
+        else mp.initial_material_id.assign(n, 0u);
     }
-    nk::MpmMaterial m0;
-    m0.youngs = in.material.youngs; m0.poisson = in.material.poisson;
-    m0.density = in.material.density; m0.dp_friction = in.material.dp_friction;
-    m0.dp_cohesion = in.material.dp_cohesion; m0.model_kind = in.material.model_kind;
-    m0.bulk_modulus = in.material.bulk_modulus; m0.tait_gamma = in.material.tait_gamma;
-    m0.viscosity = in.material.viscosity;
-    model.mpm_materials = {m0};
-    cap.mpm_material_count = 1u;
 
     // Env-private dense grid sizing (the node product, loud u32 overflow guard).
     const uint64_t nodes64 = static_cast<uint64_t>(in.grid_dims[0]) *
@@ -1585,7 +1608,7 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     cap.particles_per_env = static_cast<uint32_t>(n);
     // Reuse the SAME disjoint body<->particle slot reserve as the XPBD cook so
     // coupling stays one-path (no-op when there are no body contacts).
-    GrowContactBudgetForParticles(cap, rigid_base);
+    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
 }
 
 void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
@@ -1615,12 +1638,13 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
             case Kind::Fluid:   legal = m.method == Method::Pbf ||
                                         m.method == Method::MlsMpm; break;
             case Kind::Granular: legal = m.method == Method::MlsMpm; break;
+            case Kind::Cable:   legal = m.method == Method::Xpbd; break;
         }
         if (!legal) {
             throw std::runtime_error(
                 "ValidateMedia: illegal medium (kind x method) -- cloth must solve "
                 "with XPBD, a tet-soft body with XPBD or MLS-MPM, a fluid with PBF or "
-                "MLS-MPM, a granular bed with MLS-MPM only");
+                "MLS-MPM, a granular bed with MLS-MPM only, a cable with XPBD only");
         }
         // model_kind 4 (Drucker-Prager) and Kind::Granular imply each other: no
         // sand-tagged fluid/soft body and no granular bed cooking as another model.
@@ -1635,6 +1659,14 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
             throw std::runtime_error(
                 "ValidateMedia: a Granular medium is Drucker-Prager (mpm model_kind "
                 "4 or unset); it cannot declare another constitutive");
+        }
+        // Heterogeneous fills append box sub-regions with per-fill materials; they are
+        // meaningful only for a box-sampled MLS-MPM medium (fluid / granular).
+        if (!m.mpm_fills.empty() &&
+            !(m.method == Method::MlsMpm &&
+              (m.kind == Kind::Fluid || m.kind == Kind::Granular))) {
+            throw std::runtime_error(
+                "ValidateMedia: mpm_fills require a box MLS-MPM medium (fluid or granular)");
         }
         if (m.method == Method::MlsMpm) ++n_mpm; else ++n_non_mpm;
         if (m.kind == Kind::Fluid && m.method == Method::Pbf) ++n_pbf_fluid;
@@ -1703,7 +1735,7 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     cap.max_grid_cells = in.grid_dims[0] * in.grid_dims[1] * in.grid_dims[2];
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget
     // (no-op when there are no body contacts -> particle-only cooks byte-identical).
-    GrowContactBudgetForParticles(cap, rigid_base);
+    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
 }
 
 // Wire the body<->particle contact radius + cross-system non-penetration co-step
@@ -1819,7 +1851,7 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
         fluid.grid_dims[0] * fluid.grid_dims[1] * fluid.grid_dims[2];
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget for
     // the FULL union (recomputed from rigid_base, overriding the inner soft growth).
-    GrowContactBudgetForParticles(cap, rigid_base);
+    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
 }
 
 // ---------------------------------------------------------------------------
@@ -1911,12 +1943,63 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     cap.aero_tris_per_env = xtmp.capacities.aero_tris_per_env;
     // Reserve the disjoint body<->particle slot block over the FULL [mpm|xpbd] count
     // (recomputed from rigid_base, overriding the MPM cook's inner growth).
-    GrowContactBudgetForParticles(cap, rigid_base);
+    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
 }
 
 // ---------------------------------------------------------------------------
 // Media records -> particle cook (the per-medium builders + the list dispatch).
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// The particle layout of a cable medium: `chain` = segments+1 rope beads; `slab` =
+// the 8 rigid-cluster box corners (0 when the slab extents are absent). {0,0} when
+// the geometry is absent (segments < 1 or radius <= 0) -- no particles cook then.
+struct CableLayout { uint32_t chain = 0u; uint32_t slab = 0u; };
+
+CableLayout CableParticleLayout(const MediaRecord& media) {
+    const MediaRecord::CableLine& c = media.cable_line;
+    CableLayout out;
+    if (c.segments < 1u || c.radius <= 0.0f) return out;
+    out.chain = c.segments + 1u;
+    const math::Vec3& he = c.slab.half_extents;
+    if (he.x > 0.0f && he.y > 0.0f && he.z > 0.0f) out.slab = 8u;
+    return out;
+}
+
+// The 8 slab box corners (index k = ix | iy<<1 | iz<<2 over {0,1}^3), placed so the
+// top face center sits at the cable's loaded end (the box hangs downward from it).
+std::array<math::Vec3, 8> CableSlabCorners(const MediaRecord::CableLine& c) {
+    const math::Vec3& he = c.slab.half_extents;
+    const math::Vec3 center = c.end - math::Vec3{0.0f, 0.0f, he.z};  // top face at end.
+    std::array<math::Vec3, 8> corners{};
+    for (uint32_t k = 0u; k < 8u; ++k) {
+        const float sx = (k & 1u) ? 1.0f : -1.0f;
+        const float sy = (k & 2u) ? 1.0f : -1.0f;
+        const float sz = (k & 4u) ? 1.0f : -1.0f;
+        corners[k] = center + math::Vec3{sx * he.x, sy * he.y, sz * he.z};
+    }
+    return corners;
+}
+
+// The 12 triangles (2 per face, outward CCW winding) of the slab box over its 8
+// corners; `base` offsets the corner indices into the global particle pool.
+std::vector<uint32_t> CableSlabBoxTriangles(uint32_t base) {
+    static const uint32_t faces[6][4] = {
+        {0u, 4u, 6u, 2u}, {1u, 3u, 7u, 5u},   // -X, +X
+        {0u, 1u, 5u, 4u}, {2u, 6u, 7u, 3u},   // -Y, +Y
+        {0u, 2u, 3u, 1u}, {4u, 5u, 7u, 6u},   // -Z, +Z
+    };
+    std::vector<uint32_t> tris;
+    tris.reserve(36u);
+    for (const auto& f : faces) {
+        tris.insert(tris.end(), {base + f[0], base + f[1], base + f[2]});
+        tris.insert(tris.end(), {base + f[0], base + f[2], base + f[3]});
+    }
+    return tris;
+}
+
+}  // namespace
 
 XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
     XpbdCookInput in;
@@ -1955,10 +2038,13 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
     const float mass =
         media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
     in.inv_mass.assign(rest.size(), 1.0f / mass);
-    // free == false pins the whole perimeter (a taut membrane); free leaves every
-    // particle dynamic (a free drape).
-    if (!g.free) {
-        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+    // Pin set: None (a free drape), Perimeter (a taut membrane), or one grid
+    // edge (a hung curtain); the FromFree default defers to the legacy flag.
+    using Pin = MediaRecord::ClothPin;
+    Pin pin = g.pin;
+    if (pin == Pin::FromFree) pin = g.free ? Pin::None : Pin::Perimeter;
+    const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+    if (pin == Pin::Perimeter) {
         for (uint32_t k = 0u; k < nx; ++k) {
             in.inv_mass[idx(k, 0u)] = 0.0f;
             in.inv_mass[idx(k, last_j)] = 0.0f;
@@ -1967,6 +2053,12 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
             in.inv_mass[idx(0u, k)] = 0.0f;
             in.inv_mass[idx(last_i, k)] = 0.0f;
         }
+    } else if (pin == Pin::EdgeX0 || pin == Pin::EdgeX1) {
+        const uint32_t i = pin == Pin::EdgeX0 ? 0u : last_i;
+        for (uint32_t k = 0u; k < ny; ++k) in.inv_mass[idx(i, k)] = 0.0f;
+    } else if (pin == Pin::EdgeY0 || pin == Pin::EdgeY1) {
+        const uint32_t j = pin == Pin::EdgeY0 ? 0u : last_j;
+        for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
     }
     for (const auto& dc : cs.distance) {
         in.distance.push_back(
@@ -2010,6 +2102,63 @@ std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media) {
     return tris;
 }
 
+namespace {
+// The ordered box-fill list of a heterogeneous MLS-MPM Fluid/Granular medium: the
+// base bed (fluid_box + the medium's material/render id) then each mpm_fill (its own
+// material; render id inherits the medium when unset). Both the cook sampler and the
+// render-surface builder walk THIS so their per-fill particle layouts agree.
+struct MpmBoxFill {
+    MediaRecord::FluidBox box;
+    MediaMpmMaterial      material;
+    uint32_t              render_material_id;
+};
+std::vector<MpmBoxFill> MpmBoxFills(const MediaRecord& media) {
+    std::vector<MpmBoxFill> fills;
+    fills.reserve(1u + media.mpm_fills.size());
+    fills.push_back({media.fluid_box, media.mpm, media.render_material_id});
+    for (const MediaRecord::MpmFill& f : media.mpm_fills) {
+        fills.push_back({f.box, f.material,
+                         f.render_material_id != kInvalidMaterial
+                             ? f.render_material_id : media.render_material_id});
+    }
+    return fills;
+}
+
+// Copy a medium's authored grain-scatter render-skin params onto an instanced-sphere
+// skin (all default => uniform octahedra, byte-identical).
+void ApplyGrainSkin(MediaRenderSurface& s, const MediaRenderSkin& rs) {
+    s.grain_round = rs.grain_round;
+    s.grain_radius_jitter = rs.grain_radius_jitter;
+    s.grain_tint_jitter = rs.grain_tint_jitter;
+}
+
+// One instanced-sphere skin PER fill (base bed then each mpm_fill), each with its own
+// radius + render material, over the fill's slice of the MPM particle block. Returns
+// the total MPM particle count so the caller advances the running base. Heterogeneous
+// media only; a homogeneous medium keeps its single-skin path.
+uint32_t AppendMpmFillSurfaces(std::vector<MediaRenderSurface>& out,
+                               const MediaRecord& media, uint32_t base) {
+    uint32_t first = base;
+    for (const MpmBoxFill& f : MpmBoxFills(media)) {
+        import::cooker::FluidBoxSpec spec;
+        spec.min_corner = f.box.min;
+        spec.max_corner = f.box.max;
+        spec.spacing = f.box.spacing;
+        const uint32_t cnt = import::cooker::FluidBoxLatticeCounts(spec).total;
+        if (cnt == 0u) continue;  // empty sub-box: no particles, no skin (cook skips it too).
+        MediaRenderSurface s;
+        s.particle_radius = 0.5f * f.box.spacing;
+        s.particle_first = first;
+        s.particle_count = cnt;
+        s.render_material_id = f.render_material_id;
+        ApplyGrainSkin(s, media.render_skin);
+        out.push_back(std::move(s));
+        first += cnt;
+    }
+    return first - base;
+}
+}  // namespace
+
 std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     const std::vector<MediaRecord>& media) {
     std::vector<MediaRenderSurface> surfaces;
@@ -2019,6 +2168,10 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     // renders as instanced particle spheres over the whole field instead.
     if (media.size() == 1u && media.front().method == MediaRecord::Method::MlsMpm) {
         const MediaRecord& m = media.front();
+        if (!m.mpm_fills.empty()) {  // heterogeneous bed: one skin per fill.
+            AppendMpmFillSurfaces(surfaces, m, 0u);
+            return surfaces;
+        }
         float sp = 0.0f;
         if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
         else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
@@ -2026,6 +2179,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             MediaRenderSurface s;
             s.particle_radius = 0.5f * sp;  // half the sampling lattice spacing.
             s.render_material_id = m.render_material_id;
+            ApplyGrainSkin(s, m.render_skin);
             surfaces.push_back(std::move(s));
         }
         return surfaces;
@@ -2039,25 +2193,55 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     }
     uint32_t base = 0u;
     if (mpm_medium != nullptr) {
-        const uint32_t n_mpm =
-            static_cast<uint32_t>(BuildMpmInput(*mpm_medium).positions.size());
-        const float sp = mpm_medium->kind == MediaRecord::Kind::SoftTet
-                             ? mpm_medium->tet_sphere.cell_len
-                             : mpm_medium->fluid_box.spacing;
-        if (sp > 0.0f && n_mpm > 0u) {
-            MediaRenderSurface s;
-            s.particle_radius = 0.5f * sp;
-            s.particle_first = 0u;
-            s.particle_count = n_mpm;
-            s.render_material_id = mpm_medium->render_material_id;
-            surfaces.push_back(std::move(s));
+        if (!mpm_medium->mpm_fills.empty()) {  // heterogeneous bed: one skin per fill.
+            base = AppendMpmFillSurfaces(surfaces, *mpm_medium, 0u);
+        } else {
+            const uint32_t n_mpm =
+                static_cast<uint32_t>(BuildMpmInput(*mpm_medium).positions.size());
+            const float sp = mpm_medium->kind == MediaRecord::Kind::SoftTet
+                                 ? mpm_medium->tet_sphere.cell_len
+                                 : mpm_medium->fluid_box.spacing;
+            if (sp > 0.0f && n_mpm > 0u) {
+                MediaRenderSurface s;
+                s.particle_radius = 0.5f * sp;
+                s.particle_first = 0u;
+                s.particle_count = n_mpm;
+                s.render_material_id = mpm_medium->render_material_id;
+                ApplyGrainSkin(s, mpm_medium->render_skin);
+                surfaces.push_back(std::move(s));
+            }
+            base = n_mpm;  // the XPBD slice starts above the MPM slice.
         }
-        base = n_mpm;  // the XPBD slice starts above the MPM slice.
     }
     // Cloth + soft-tet concatenate into the XPBD slice in media order; track the
     // running particle base exactly as AppendSoftMedium does (fluid/MPM skipped).
     for (const MediaRecord& m : media) {
         if (m.method == MediaRecord::Method::MlsMpm) continue;  // its sphere surface is above.
+        // Cable: the rope renders as an instanced bead tube over its chain range; the
+        // optional welded slab renders as a triangulated rigid box over its 8 corners.
+        if (m.kind == MediaRecord::Kind::Cable) {
+            const CableLayout cl = CableParticleLayout(m);
+            if (cl.chain > 0u) {
+                MediaRenderSurface beads;
+                beads.particle_radius = m.cable_line.radius;
+                beads.particle_first = base;
+                beads.particle_count = cl.chain;
+                beads.render_material_id = m.render_material_id;
+                ApplyGrainSkin(beads, m.render_skin);
+                surfaces.push_back(std::move(beads));
+            }
+            if (cl.slab == 8u) {
+                MediaRenderSurface box;
+                box.triangles = CableSlabBoxTriangles(base + cl.chain);
+                box.render_material_id =
+                    m.cable_line.slab.render_material_id != kInvalidMaterial
+                        ? m.cable_line.slab.render_material_id
+                        : m.render_material_id;
+                surfaces.push_back(std::move(box));
+            }
+            base += cl.chain + cl.slab;
+            continue;
+        }
         std::vector<uint32_t> tris;
         uint32_t verts = 0u;
         if (m.kind == MediaRecord::Kind::Cloth) {
@@ -2135,6 +2319,74 @@ XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
     return in;
 }
 
+XpbdCookInput BuildCableXpbdInput(const MediaRecord& media) {
+    XpbdCookInput in;
+    const MediaRecord::CableLine& c = media.cable_line;
+    const CableLayout layout = CableParticleLayout(media);
+    if (layout.chain == 0u) return in;  // no cable (absent geometry).
+
+    // Chain particles: segments+1 samples linearly interpolated start -> end.
+    const uint32_t np = layout.chain;
+    const float seg = static_cast<float>(c.segments);
+    for (uint32_t i = 0u; i < np; ++i) {
+        const float t = static_cast<float>(i) / seg;
+        in.positions.push_back(c.start * (1.0f - t) + c.end * t);
+    }
+    const float mass =
+        media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
+    in.inv_mass.assign(np, 1.0f / mass);
+    // Pin the authored endpoint(s) kinematic (inv_mass 0); the default hangs the
+    // anchor and leaves the loaded end free to carry a weight.
+    using Pin = MediaRecord::CableLine::Pin;
+    if (c.pin == Pin::Start || c.pin == Pin::Both) in.inv_mass[0] = 0.0f;
+    if (c.pin == Pin::End || c.pin == Pin::Both) in.inv_mass[np - 1u] = 0.0f;
+
+    // One distance row per link (alpha 0 == inextensible unless a stretch compliance
+    // is authored); optional skip-one rows add a little bending stiffness.
+    const float d_alpha = media.xpbd.distance_alpha;
+    for (uint32_t i = 0u; i + 1u < np; ++i) {
+        in.distance.push_back(
+            {i, i + 1u, (in.positions[i + 1u] - in.positions[i]).Length(), d_alpha});
+    }
+    if (c.bend) {
+        const float b_alpha = media.xpbd.bend_alpha;
+        for (uint32_t i = 0u; i + 2u < np; ++i) {
+            in.distance.push_back({i, i + 2u,
+                (in.positions[i + 2u] - in.positions[i]).Length(), b_alpha});
+        }
+    }
+
+    // Optional rigid slab welded to the loaded end: 8 box corners as ONE shape-match
+    // cluster (id 9), the 4 top corners distance-welded (alpha 0) to the end particle.
+    if (layout.slab == 8u) {
+        const std::array<math::Vec3, 8> corners = CableSlabCorners(c);
+        const float slab_mass = c.slab.mass > 0.0f ? c.slab.mass : mass;
+        const uint32_t base = np;  // slab corners follow the chain in the pool.
+        CookShapeMatchCluster cluster;
+        // Goal-pull fraction in [0,1]; 0 (an unset desc) defaults to a rigid slab.
+        cluster.stiffness = c.slab.stiffness > 0.0f ? c.slab.stiffness : 1.0f;
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            in.positions.push_back(corners[k]);
+            in.inv_mass.push_back(1.0f / slab_mass);
+            cluster.particle.push_back(base + k);
+            cluster.rest_positions.push_back(corners[k]);
+            cluster.cluster_mass.push_back(slab_mass);
+        }
+        in.shape_match.push_back(std::move(cluster));
+        const uint32_t end_p = np - 1u;
+        for (uint32_t k = 4u; k < 8u; ++k) {  // the 4 top corners (iz == 1).
+            in.distance.push_back({end_p, base + k,
+                (corners[k] - in.positions[end_p]).Length(), 0.0f});
+        }
+    }
+
+    in.velocities.assign(in.positions.size(), math::Vec3::Zero());
+    in.solver_iterations =
+        static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
+    in.friction = media.xpbd.friction;
+    return in;
+}
+
 // Append the pinned-boundary container (floor slab + side-wall ring) for a confined PBF
 // pool, then fill in.inv_mass (free fluid = 1/mass, every boundary particle pinned 0).
 static void AppendFluidConfinement(PbfCookInput& in, const MediaRecord& media) {
@@ -2189,6 +2441,7 @@ PbfCookInput BuildFluidPbfInput(const MediaRecord& media) {
     spec.max_corner = b.max;
     spec.spacing = b.spacing;
     spec.rest_density = media.pbf.rest_density > 0.0f ? media.pbf.rest_density : 1000.0f;
+    spec.position_jitter = b.position_jitter;
     const runtime::fluid::PbfParticleSet box = import::cooker::CookFluidBox(spec);
 
     in.positions = box.positions;
@@ -2240,7 +2493,80 @@ PbfCookInput BuildFluidPbfInput(const MediaRecord& media) {
     return in;
 }
 
+// Heterogeneous MLS-MPM cook: sample each box fill (base bed + mpm_fills) with its
+// own constitutive, tag the particles with a per-fill material id, and size the grid
+// to the UNION of the sub-boxes. The medium's mpm block supplies the shared grid
+// scalars (dx / substeps / floor / loft). Fluid/Granular (box) media only.
+static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
+    MpmCookInput in;
+    const MediaMpmMaterial& grid = media.mpm;
+    bool have = false;
+    math::Vec3 lo{0.0f, 0.0f, 0.0f}, hi{0.0f, 0.0f, 0.0f};  // union AABB over sub-boxes.
+    for (const MpmBoxFill& f : MpmBoxFills(media)) {
+        const MediaRecord::FluidBox& b = f.box;
+        if (!(b.spacing > 0.0f && b.max.x > b.min.x && b.max.y > b.min.y &&
+              b.max.z > b.min.z)) continue;  // empty/invalid sub-box: contributes nothing.
+        const float density = f.material.density > 0.0f ? f.material.density : 1000.0f;
+        import::cooker::FluidBoxSpec spec;
+        spec.min_corner = b.min;
+        spec.max_corner = b.max;
+        spec.spacing = b.spacing;
+        spec.rest_density = density;
+        spec.position_jitter = b.position_jitter;
+        const std::vector<math::Vec3> pos = import::cooker::CookFluidBox(spec).positions;
+        if (pos.empty()) continue;  // sub-box smaller than one cell: no particles.
+        const uint32_t mid = static_cast<uint32_t>(in.materials.size());
+        const float vol0 = b.spacing * b.spacing * b.spacing;
+        const float inv_m = vol0 > 0.0f ? 1.0f / (density * vol0) : 0.0f;
+        for (const math::Vec3& p : pos) {
+            in.positions.push_back(p);
+            in.velocities.push_back(math::Vec3::Zero());
+            in.inv_mass.push_back(inv_m);
+            in.vol0.push_back(vol0);
+            in.material_id.push_back(mid);
+        }
+        MpmMaterialInput mi;
+        mi.youngs = f.material.youngs; mi.poisson = f.material.poisson;
+        mi.density = density; mi.dp_friction = f.material.dp_friction;
+        mi.dp_cohesion = f.material.dp_cohesion;
+        // A Granular medium IS Drucker-Prager; pin so an unset field cannot cook elastic.
+        mi.model_kind = media.kind == MediaRecord::Kind::Granular
+                            ? 4.0f : f.material.model_kind;
+        mi.bulk_modulus = f.material.bulk_modulus; mi.tait_gamma = f.material.tait_gamma;
+        mi.viscosity = f.material.viscosity;
+        in.materials.push_back(mi);
+        if (!have) { lo = b.min; hi = b.max; have = true; }
+        else {
+            lo = math::Vec3{std::min(lo.x, b.min.x), std::min(lo.y, b.min.y),
+                            std::min(lo.z, b.min.z)};
+            hi = math::Vec3{std::max(hi.x, b.max.x), std::max(hi.y, b.max.y),
+                            std::max(hi.z, b.max.z)};
+        }
+    }
+    in.dx = grid.dx;
+    in.substeps = grid.substeps;
+    in.floor_normal = grid.floor_normal;
+    in.floor_d = grid.floor_d;
+    in.floor_friction = grid.floor_friction;
+    if (grid.dx > 0.0f && have) {
+        const float margin = 4.0f * grid.dx;
+        const float base_z = std::min(lo.z, grid.floor_d) - margin;
+        const float top_z =
+            hi.z + (hi.z - lo.z) + margin + std::max(0.0f, grid.loft_headroom);
+        in.grid_origin = math::Vec3{lo.x - margin, lo.y - margin, base_z};
+        auto cells = [&](float extent) {
+            return static_cast<uint32_t>(std::ceil(extent / grid.dx)) + 1u;
+        };
+        in.grid_dims[0] = cells((hi.x - lo.x) + 2.0f * margin);
+        in.grid_dims[1] = cells((hi.y - lo.y) + 2.0f * margin);
+        in.grid_dims[2] = cells(top_z - base_z);
+    }
+    return in;
+}
+
 MpmCookInput BuildMpmInput(const MediaRecord& media) {
+    // A heterogeneous bed (>= one mpm_fill) samples each sub-box with its own material.
+    if (!media.mpm_fills.empty()) return BuildMpmInputFills(media);
     MpmCookInput in;
     const MediaMpmMaterial& mp = media.mpm;
     const float density = mp.density > 0.0f ? mp.density : 1000.0f;
@@ -2259,6 +2585,7 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
             spec.max_corner = b.max;
             spec.spacing = b.spacing;
             spec.rest_density = density;
+            spec.position_jitter = b.position_jitter;
             in.positions = import::cooker::CookFluidBox(spec).positions;
             vol0 = b.spacing * b.spacing * b.spacing;
             lo = b.min;
@@ -2302,7 +2629,9 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     if (mp.dx > 0.0f) {
         const float margin = 4.0f * mp.dx;
         const float base_z = std::min(lo.z, mp.floor_d) - margin;
-        const float top_z = hi.z + (hi.z - lo.z) + margin;
+        // loft_headroom (0 by default) raises the +z ceiling for kicked/lofted debris.
+        const float top_z =
+            hi.z + (hi.z - lo.z) + margin + std::max(0.0f, mp.loft_headroom);
         in.grid_origin = math::Vec3{lo.x - margin, lo.y - margin, base_z};
         auto cells = [&](float extent) {
             return static_cast<uint32_t>(std::ceil(extent / mp.dx)) + 1u;
@@ -2322,10 +2651,18 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
                        float particle_contact_radius) {
     float d_min = 2.0f * particle_contact_radius;
     if (d_min > 0.0f) return d_min;
+    // An MLS-MPM medium couples to bodies via the grid and emits NO body<->particle
+    // rows, so it must not shrink the row diameter of a co-resident row-making set.
+    bool any_row_media = false;
     for (const MediaRecord& m : media) {
+        if (m.method != MediaRecord::Method::MlsMpm) { any_row_media = true; break; }
+    }
+    for (const MediaRecord& m : media) {
+        if (any_row_media && m.method == MediaRecord::Method::MlsMpm) continue;
         float sp = 0.0f;
         if (m.kind == MediaRecord::Kind::Cloth) sp = m.cloth_grid.spacing;
         else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
+        else if (m.kind == MediaRecord::Kind::Cable) sp = 2.0f * m.cable_line.radius;
         else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
         if (sp > 0.0f) d_min = (d_min > 0.0f) ? std::min(d_min, sp) : sp;
     }
@@ -2397,6 +2734,9 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
             have_soft = true;
         } else if (m.kind == MediaRecord::Kind::SoftTet) {
             AppendSoftMedium(soft, BuildSoftTetXpbdInput(m));
+            have_soft = true;
+        } else if (m.kind == MediaRecord::Kind::Cable) {
+            AppendSoftMedium(soft, BuildCableXpbdInput(m));
             have_soft = true;
         } else {  // Fluid (PBF; ValidateMedia guarantees at most one).
             fluid = BuildFluidPbfInput(m);

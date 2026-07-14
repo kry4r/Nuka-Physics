@@ -186,6 +186,8 @@ add_custom_command(
         "${CMAKE_SOURCE_DIR}/tools/codegen/schema/row_v0_1.yaml"
         "${CMAKE_SOURCE_DIR}/tools/codegen/schema/collidable_v0_1.yaml"
         "${CMAKE_SOURCE_DIR}/tools/codegen/regen.py"
+        "${CMAKE_SOURCE_DIR}/tools/codegen/fields/gen_fields.py"
+        "${CMAKE_SOURCE_DIR}/src/nk/model/fields.yaml"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Regenerating row class CUDA kernels from IR"
     VERBATIM

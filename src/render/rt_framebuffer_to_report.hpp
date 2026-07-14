@@ -24,9 +24,13 @@ namespace nuka::render {
 // encode mirror the raster shader so the GPU-RT and lavapipe outputs read
 // consistently. `keep_miss_color` true tonemaps the traced radiance for miss
 // pixels too (an HDR environment backdrop) instead of painting `background`;
-// false (default) is byte-identical to today.
+// false (default) is byte-identical to today. `exposure_ev` (stops) pre-scales
+// the linear radiance and `grade` (0 => identity) applies a gentle filmic
+// contrast/saturation BEFORE the ACES encode; the 0/0 defaults are a strict no-op.
 VulkanOffscreenReport FramebufferToReport(const rt::Framebuffer& frame,
                                           VulkanRgba8 background,
-                                          bool keep_miss_color = false);
+                                          bool keep_miss_color = false,
+                                          float exposure_ev = 0.0f,
+                                          float grade = 0.0f);
 
 }  // namespace nuka::render

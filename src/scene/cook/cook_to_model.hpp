@@ -101,7 +101,11 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 // particles_per_env == 0 (the reserve is then 0). The c_abi terrain cook recomputes
 // the rigid base after appending terrain collidables and re-applies this so a world
 // with BOTH terrain and particles keeps the rigid + particle slot ranges disjoint.
-void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base);
+// `row_exempt` = per-env particles that never emit body rows (the grid-coupled MPM
+// slice under MpmXpbd); they reserve no slots. Every remaining body-particle slot
+// has the provider-wide one-point/five-row footprint, independent of solver mode.
+void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
+                                   uint32_t row_exempt = 0u);
 
 // ---------------------------------------------------------------------------
 // particle cook (the design "粒子 XPBD/PBF"). Stage an XPBD soft body or a
@@ -180,7 +184,11 @@ struct MpmCookInput {
     std::vector<math::Vec3> velocities;    // per-particle initial velocity
     std::vector<float>      inv_mass;      // 1/mass (0 == pinned)
     std::vector<float>      vol0;           // per-particle sampling-lattice volume
-    MpmMaterialInput        material;       // appended to model.mpm_materials (id 0)
+    MpmMaterialInput        material;       // single-material cook: appended as id 0
+    // Heterogeneous cook: N material rows + a per-particle material index into them.
+    // Empty (default) => the single `material` above, all particles id 0 (byte-identical).
+    std::vector<MpmMaterialInput> materials;
+    std::vector<uint32_t>         material_id;
     math::Vec3 grid_origin{0.0f, 0.0f, 0.0f};  // world corner of node (0,0,0)
     uint32_t   grid_dims[3] = {0u, 0u, 0u};    // per-env node resolution
     float      dx = 0.0f;                       // uniform node spacing (> 0).
@@ -304,6 +312,13 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media);
 // Build the XPBD cook input for a tet-soft MediaRecord from its sphere rest-lattice
 // (soft::BuildSphereTetLattice + BuildTetMeshConstraints). Empty when extent absent.
 XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media);
+
+// Build the XPBD cook input for a cable MediaRecord: a distance chain of segments+1
+// particles from start to end (inextensible unless distance_alpha > 0), the pinned
+// endpoint(s) kinematic, an optional bend (skip-one) row set, and an optional rigid
+// slab (a shape-match cluster welded to the loaded end). Empty when segments < 1 or
+// radius <= 0. Mirrors BuildClothXpbdInput; slab corners follow the chain particles.
+XpbdCookInput BuildCableXpbdInput(const MediaRecord& media);
 
 // Build the MLS-MPM cook input for a tet-soft / fluid MediaRecord: particles sampled
 // from the geometry (sphere lattice / CookFluidBox), material + grid from MediaMpmMaterial.

@@ -71,6 +71,14 @@ inline constexpr uint32_t kPairDrivenSpokesPerPt = 4u;
 inline constexpr uint32_t kPairDrivenRowsPerSlot =
     kPairDrivenPtsPerSlot * (1u + kPairDrivenSpokesPerPt);  // 20
 
+// A body<->particle provider models every particle as a sphere and therefore
+// emits at most one manifold point, independent of the particle solver mode.
+// Its reserved slot range uses this exact footprint; rigid candidate slots keep
+// the four-point worst case above.
+inline constexpr uint32_t kPairDrivenParticlePtsPerSlot = 1u;
+inline constexpr uint32_t kPairDrivenParticleRowsPerSlot =
+    kPairDrivenParticlePtsPerSlot * (1u + kPairDrivenSpokesPerPt);  // 5
+
 struct NkRowSide {
     uint32_t   kind  = kNkSideStatic;  // kNkSide* dispatch code
     uint32_t   index = ~0u;            // rigid: GLOBAL body row; artic: art index
