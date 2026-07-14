@@ -74,6 +74,12 @@ params:
       # The whole rigid corridor is unchanged; only the reset base x moves on the
       # broad raised start platform.
       spawn_x_range: [-0.32, -0.12]
+      # Reward progress relative to each randomized spawn (not absolute scene x).
+      # 0.35/0.65 m roughly bracket one/two-step traversal, while 1.2 m rewards
+      # entering the next interaction zone. Each bonus is once per episode.
+      forward_progress_scale: 15.0
+      progress_milestones: [0.35, 0.65, 1.2]
+      progress_milestone_bonus: 2.0
       push_enable: false
       sigma_lin: 0.01
       sigma_ang: 0.01
@@ -83,7 +89,7 @@ params:
         torques: -1.0e-3
         action_rate: -0.3
         stand_still: -0.2
-        alive: 20.0
+        alive: 10.0
         imitation: 1.0
       sensor:
         width: 128

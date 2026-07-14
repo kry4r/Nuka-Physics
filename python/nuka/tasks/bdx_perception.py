@@ -66,6 +66,20 @@ class BdxPerceptionEnv(BdxWalkEnv):
                  sensor: "dict | None" = None, **kwargs) -> None:
         cfg = dict(sensor or {})
         spawn_x_range = kwargs.pop("spawn_x_range", None)
+        self.forward_progress_scale = float(
+            kwargs.pop("forward_progress_scale", 0.0))
+        self.progress_milestones = tuple(
+            float(v) for v in kwargs.pop("progress_milestones", ()))
+        self.progress_milestone_bonus = float(
+            kwargs.pop("progress_milestone_bonus", 0.0))
+        if self.forward_progress_scale < 0.0:
+            raise ValueError("forward_progress_scale must be non-negative")
+        if self.progress_milestone_bonus < 0.0:
+            raise ValueError("progress_milestone_bonus must be non-negative")
+        if (any(v <= 0.0 for v in self.progress_milestones)
+                or any(b <= a for a, b in zip(
+                    self.progress_milestones, self.progress_milestones[1:]))):
+            raise ValueError("progress_milestones must be positive and increasing")
         self.depth_width = int(cfg.get("width", 128))
         self.depth_height = int(cfg.get("height", 96))
         self.depth_update_period = int(cfg.get("update_period", 2))
@@ -132,6 +146,15 @@ class BdxPerceptionEnv(BdxWalkEnv):
             self.num_envs, 1, dtype=torch.float32, device=self._dev)
         self._sensor_tick = 0
         self._control_dt = self.dt * self.decimation
+        self._episode_start_x = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self._dev)
+        self._episode_max_progress = torch.zeros_like(self._episode_start_x)
+        self._milestones_reached = torch.zeros(
+            self.num_envs, len(self.progress_milestones),
+            dtype=torch.bool, device=self._dev)
+        self._milestone_values = torch.as_tensor(
+            self.progress_milestones, dtype=torch.float32,
+            device=self._dev).unsqueeze(0)
 
         proprio_one = spaces.Box(
             low=-B.OBS_CLIP, high=B.OBS_CLIP,
@@ -171,6 +194,17 @@ class BdxPerceptionEnv(BdxWalkEnv):
             f"frame={rollout_mib:.1f}MiB fp16",
             flush=True,
         )
+
+    def _reset_progress_state(self, mask: "torch.Tensor | None") -> None:
+        x = self._obs.base_pos()[:, 0]
+        if mask is None:
+            self._episode_start_x.copy_(x)
+            self._episode_max_progress.zero_()
+            self._milestones_reached.zero_()
+        else:
+            self._episode_start_x[mask] = x[mask]
+            self._episode_max_progress[mask] = 0.0
+            self._milestones_reached[mask] = False
 
     def _randomize_spawn_x(self, mask: "torch.Tensor | None") -> None:
         """Translate the articulation on the start platform, environment unchanged.
@@ -244,15 +278,36 @@ class BdxPerceptionEnv(BdxWalkEnv):
             proprio = self._obs.compute_obs(
                 self.command, self.last_action,
                 self._ref.phase_features(self.phase_i))
+        self._reset_progress_state(None)
         self._sensor_tick = 0
         return self._structured_obs(proprio, force=True), info
 
     def step(self, actions: torch.Tensor):
+        previous_x = self._obs.base_pos()[:, 0].clone()
         proprio, reward, terminated, truncated, info = super().step(actions)
         self._sensor_tick += 1
         # A reset env must not inherit the previous episode's last camera frame.
         done = terminated | truncated
         force = bool(done.any())
+        active = ~done
+        current_x = self._obs.base_pos()[:, 0]
+        if self.forward_progress_scale > 0.0:
+            # Bound one-step credit so a collision impulse cannot manufacture a
+            # large reward by launching the base forward.
+            dx = torch.clamp(current_x - previous_x, -0.02, 0.02)
+            reward = reward + (
+                self.forward_progress_scale * dx * active.to(dx.dtype))
+        if self.progress_milestones and self.progress_milestone_bonus > 0.0:
+            progress = torch.clamp_min(current_x - self._episode_start_x, 0.0)
+            self._episode_max_progress[active] = torch.maximum(
+                self._episode_max_progress[active], progress[active])
+            crossed = self._episode_max_progress.unsqueeze(1) >= self._milestone_values
+            new_crossings = crossed & ~self._milestones_reached
+            new_crossings &= active.unsqueeze(1)
+            reward = reward + (
+                new_crossings.sum(dim=1).to(reward.dtype)
+                * self.progress_milestone_bonus)
+            self._milestones_reached |= new_crossings
         if force and self.spawn_x_range is not None:
             self._randomize_spawn_x(done)
             fresh = self._obs.compute_obs(
@@ -260,6 +315,8 @@ class BdxPerceptionEnv(BdxWalkEnv):
                 self._ref.phase_features(self.phase_i))
             proprio = proprio.clone()
             proprio[done] = fresh[done]
+        if force:
+            self._reset_progress_state(done)
         obs = self._structured_obs(proprio, force=force)
         return obs, reward, terminated, truncated, info
 
