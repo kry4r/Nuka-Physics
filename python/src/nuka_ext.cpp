@@ -654,6 +654,11 @@ public:
         check(nuka_world_render_sensors(h_), "nuka_world_render_sensors");
     }
 
+    void set_sensor_aov_mask(uint32_t mask) {
+        check(nuka_world_set_sensor_aov_mask(h_, mask),
+              "nuka_world_set_sensor_aov_mask");
+    }
+
     nuka_buffer_view_t get_sensor_view(nuka_sensor_channel_t channel) const {
         nuka_buffer_view_t view{};
         check(nuka_world_get_sensor_view(h_, channel, &view),
@@ -1750,6 +1755,18 @@ NB_MODULE(_nuka_ext, m) {
         .value("RANGE", NUKA_SENSOR_CHANNEL_RANGE)
         .export_values();
 
+    // Bitwise camera-output selection for World.set_sensor_aov_mask. Zero means
+    // the backwards-compatible all-AOV profile; RANGE remains a separate lidar
+    // tensor and therefore has no bit here.
+    nb::enum_<nuka_sensor_aov_t>(m, "SensorAov", nb::is_arithmetic())
+        .value("COLOR", NUKA_SENSOR_AOV_COLOR)
+        .value("DEPTH", NUKA_SENSOR_AOV_DEPTH)
+        .value("NORMAL", NUKA_SENSOR_AOV_NORMAL)
+        .value("ALBEDO", NUKA_SENSOR_AOV_ALBEDO)
+        .value("PRIM", NUKA_SENSOR_AOV_PRIM)
+        .value("ALL", NUKA_SENSOR_AOV_ALL)
+        .export_values();
+
     // Which FK frame a camera mounts on for World.attach_camera_sensor.
     nb::enum_<nuka_sensor_mount_t>(m, "SensorMount")
         .value("LINK", NUKA_SENSOR_MOUNT_LINK)
@@ -2236,6 +2253,11 @@ NB_MODULE(_nuka_ext, m) {
              "device AOV tensor IN PLACE on the world's backend stream (no host "
              "download), driven by the live link poses. Call after step() and after "
              "attach_camera_sensor.")
+        .def("set_sensor_aov_mask", &World::set_sensor_aov_mask, nb::arg("mask"),
+             "Select camera output planes with SensorAov bits. mask=0 restores "
+             "COLOR|DEPTH|NORMAL|ALBEDO|PRIM. DEPTH|PRIM uses the primary-hit-only "
+             "fast path and omitted get_sensor_view channels raise NOT_SUPPORTED. "
+             "The selection persists across camera/lidar rebuilds.")
         .def(
             "get_sensor_view",
             [](nb::handle self, nuka_sensor_channel_t channel) -> nb::object {

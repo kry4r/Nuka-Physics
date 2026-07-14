@@ -240,9 +240,11 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         // keeps the per-env appearance (the fresh tables get the same randomization).
         nuka::rt::RenderDrConfig carry_dr;
         nuka::rt::SensorFidelityConfig carry_fid;
+        uint32_t carry_aov_mask = 0u;
         if (record->sensor) {
             carry_dr = record->sensor->render_dr;
             carry_fid = record->sensor->fidelity;
+            carry_aov_mask = record->sensor->aov_mask;
         }
 
         // Install the rebuilt attachment (the old handle frees through its backend
@@ -256,6 +258,7 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         attach->rendered = false;
         attach->render_dr = carry_dr;
         attach->fidelity = carry_fid;
+        attach->aov_mask = carry_aov_mask;
         // Carry the lidar fan dims forward (the lidar set is unchanged by a camera
         // attach); the backend's RangeShape is filled only after a lidar render, so
         // read the fan from the carried lidar descs directly.
@@ -274,6 +277,7 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         if (carry_fid.Enabled()) {
             attach->backend->SetSensorFidelity(attach->handle, carry_fid);
         }
+        attach->backend->SetSensorAovMask(attach->handle, carry_aov_mask);
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -330,6 +334,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
         uint32_t carry_w = 0u, carry_h = 0u;
         nuka::rt::RenderDrConfig carry_dr;
         nuka::rt::SensorFidelityConfig carry_fid;
+        uint32_t carry_aov_mask = 0u;
         if (record->sensor) {
             std::vector<nuka::scene::SensorDesc> prev_cams, prev_lidars;
             nuka::c_abi::SplitSensors(record->sensor->sensors, &prev_cams, &prev_lidars);
@@ -338,6 +343,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
             carry_h = record->sensor->height;
             carry_dr = record->sensor->render_dr;
             carry_fid = record->sensor->fidelity;
+            carry_aov_mask = record->sensor->aov_mask;
         }
         desc.sensors.push_back(nuka::c_abi::MakeLidarSensorDesc(
             mount_frame, mount_index, local_offset, az_count, el_count, az_min, az_max,
@@ -357,6 +363,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
         attach->rendered = false;
         attach->render_dr = carry_dr;
         attach->fidelity = carry_fid;
+        attach->aov_mask = carry_aov_mask;
         attach->lidar_az = az_count;
         attach->lidar_el = el_count;
         attach->lidars_per_env = 1u;
@@ -367,6 +374,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
         if (carry_fid.Enabled()) {
             attach->backend->SetSensorFidelity(attach->handle, carry_fid);
         }
+        attach->backend->SetSensorAovMask(attach->handle, carry_aov_mask);
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -411,6 +419,40 @@ nuka_result_t nuka_world_render_sensors(nuka_world_handle world) {
         s.backend->RenderSensors(s.handle, fk, w.EnvCount(), s.width, s.height);
         s.backend->RenderLidars(s.handle, fk, w.EnvCount());
         s.rendered = true;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_set_sensor_aov_mask(nuka_world_handle world,
+                                              uint32_t mask) {
+    if ((mask & ~static_cast<uint32_t>(NUKA_SENSOR_AOV_ALL)) != 0u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!record->world || !record->sensor || record->sensor->handle == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+
+    try {
+        nuka::c_abi::SensorAttachment& s = *record->sensor;
+        s.aov_mask = mask;
+        for (nuka::scene::SensorDesc& sd : s.sensors) {
+            if (sd.type != nuka::scene::SensorType::Lidar &&
+                sd.type != nuka::scene::SensorType::RangeScan) {
+                sd.aov_mask = mask;
+            }
+        }
+        s.backend->SetSensorAovMask(s.handle, mask);
+        s.rendered = false;
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
@@ -659,6 +701,7 @@ nuka_result_t nuka_world_set_camera_intrinsics(
         if (s.fidelity.Enabled()) {
             s.backend->SetSensorFidelity(s.handle, s.fidelity);
         }
+        s.backend->SetSensorAovMask(s.handle, s.aov_mask);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

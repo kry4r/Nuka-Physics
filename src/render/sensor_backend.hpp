@@ -150,6 +150,10 @@ public:
     virtual void SetSensorFidelity(SensorSceneHandle* handle,
                                    const rt::SensorFidelityConfig& cfg) = 0;
 
+    // Select camera AOV outputs. mask==0 means the legacy all-AOV profile;
+    // bit positions match COLOR..PRIM in nuka_sensor_channel_t.
+    virtual void SetSensorAovMask(SensorSceneHandle* handle, uint32_t mask) = 0;
+
     // Release a sensor scene handle built by this backend.
     virtual void FreeSensorScene(SensorSceneHandle* handle) = 0;
 };

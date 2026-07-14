@@ -71,6 +71,16 @@ public:
         handle->scene = rt::BuildBatchedSensorScene(cuda_desc, backend_);
         if (!cams.empty()) {
             rt::SetSensorMounts(handle->scene, cams);
+            // A camera with the default mask requests the backwards-compatible
+            // full tensor. Otherwise the shared tensor produces the union of the
+            // explicitly requested planes across camera mounts.
+            uint32_t aov_mask = 0u;
+            bool default_all = false;
+            for (const scene::SensorDesc& cam : cams) {
+                default_all = default_all || cam.aov_mask == 0u;
+                aov_mask |= cam.aov_mask;
+            }
+            rt::SetSensorAovMask(handle->scene, default_all ? 0u : aov_mask);
             handle->has_cameras = true;
         }
         if (!lidars.empty()) {
@@ -143,6 +153,10 @@ public:
     void SetSensorFidelity(SensorSceneHandle* handle,
                            const rt::SensorFidelityConfig& cfg) override {
         rt::SetSensorFidelity(handle->scene, cfg);
+    }
+
+    void SetSensorAovMask(SensorSceneHandle* handle, uint32_t mask) override {
+        rt::SetSensorAovMask(handle->scene, mask);
     }
 
     void FreeSensorScene(SensorSceneHandle* handle) override { delete handle; }
