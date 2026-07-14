@@ -149,8 +149,10 @@ TetLattice BuildSphereTetLattice(const math::Vec3& center, float radius,
     const float span = static_cast<float>(cells) * cell_len;
     const math::Vec3 origin{center.x - 0.5f * span, center.y - 0.5f * span,
                             center.z - 0.5f * span};
-    // Keep a cell only when ALL 8 corners are inside the radius (the cell lies
-    // fully within the sphere), so the kept solid has a watertight boundary.
+    // Keep a cell when ANY corner is inside the radius (the cell overlaps the
+    // sphere). The kept solid CIRCUMSCRIBES the sphere, so a radius-R render skin
+    // embeds fully inside the cage (no extrapolated, hull-snapped skin vertices),
+    // and the boundary stays a single watertight closed shell.
     const float r2 = radius * radius;
     auto inside_cell = [&](const math::Vec3& cell_center) {
         const float h = 0.5f * cell_len;
@@ -160,9 +162,9 @@ TetLattice BuildSphereTetLattice(const math::Vec3& center, float radius,
                     const float dx = cell_center.x + sx * h - center.x;
                     const float dy = cell_center.y + sy * h - center.y;
                     const float dz = cell_center.z + sz * h - center.z;
-                    if (dx * dx + dy * dy + dz * dz > r2) return false;
+                    if (dx * dx + dy * dy + dz * dz <= r2) return true;
                 }
-        return true;
+        return false;
     };
     uint32_t c3[3] = {cells, cells, cells};
     return BuildTetLattice(origin, c3, cell_len, inside_cell);
@@ -331,7 +333,16 @@ EmbeddedSkin EmbedSurfaceInTetCage(const std::vector<math::Vec3>& skin_rest,
             }
         }
         const uint32_t pick = contained ? best_tet : bary_tet;
-        if (!contained) ++extrapolated;
+        if (!contained) {
+            // Clamp the extrapolated bary into the tet (>=0, renormalized) so the
+            // vertex tracks the nearest in-tet point; negative weights would amplify
+            // the host tet's deformation into spikes under a hard contact squash.
+            ++extrapolated;
+            float sum = 0.0f;
+            for (int j = 0; j < 4; ++j) { best_bary[j] = std::max(0.0f, best_bary[j]); sum += best_bary[j]; }
+            const float inv = sum > 1e-12f ? 1.0f / sum : 0.0f;
+            for (int j = 0; j < 4; ++j) best_bary[j] *= inv;
+        }
         SkinVertexBind& b = e.binds[s];
         for (int j = 0; j < 4; ++j) {
             b.vi[j] = tets[pick].v[j];

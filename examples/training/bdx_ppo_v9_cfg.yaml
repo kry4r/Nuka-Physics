@@ -1,0 +1,143 @@
+# rl_games (1.6.5) PPO config for the Nuka BDX (open_duck_mini_v2) TERRAIN walk.
+#
+# v9 fine-tunes the v8 flat walker (ep1600) onto DESCENDING-STEP terrain via the
+# GENERAL heightfield terrain + TerrainCurriculum the Go2 terrain training uses (no
+# BDX-specific solver/terrain path): a curric_levels x 3 (stairs/pit/boxes) tile
+# grid where per-env difficulty ramps the step height flat -> step_height, plus a
+# survival + radial-traversal promotion curriculum and terrain-relative termination.
+# Blind (obs 44 unchanged) so it warm-starts from the v8 checkpoint. Velocity
+# tracking is boosted (tracking_lin_vel 5 -> 8) and the command is forward-biased so
+# the duck traverses the tile it spawns facing. Launch: train_go2_ppo.py --cfg this
+# --checkpoint <v8 ep1600.pth> --reset-progress --experiment-name bdx_walk_v9.
+params:
+  seed: 1
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  config:
+    name: bdx_walk_v9
+    full_experiment_name: bdx_walk_v9
+    env_name: nuka_bdx
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: True
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    reward_shaper:
+      scale_value: 1.0
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1e-3
+    lr_schedule: adaptive
+    kl_threshold: 0.01
+    score_to_win: 100000
+    max_epochs: 2000
+    save_best_after: 100
+    save_frequency: 100
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 24
+    num_actors: 4096
+    minibatch_size: 24576
+    mini_epochs: 5
+    critic_coef: 1.0
+    clip_value: True
+    bounds_loss_coef: 0.005
+
+    env_config:
+      dt: 0.005
+      decimation: 4
+      # 20 s episodes (shorter than v8's 30 s) so the terrain curriculum turns over
+      # faster; the command is held the WHOLE episode (sustained walk).
+      episode_length_s: 20.0
+      resample_time_s: 20.0
+      # Terrain-RELATIVE height kill: (base_z - local_surface) < 0.10 (an absolute
+      # kill would false-terminate a duck descending into a pit / down steps).
+      termination_height: 0.10
+      termination_tilt_deg: 60.0
+      command: [0.15, 0.0, 0.0]
+      fixed_command: false
+      # Push perturbations force step-out recoveries (kept from v8).
+      push_enable: true
+      # FORWARD-BIASED command: the duck spawns facing the tile centre, so a forward
+      # tracking command drives it to traverse the feature (descend the pit / cross
+      # the boxes / climb the stairs). vx caps at 0.18 (the reference gait reaches the
+      # 0.22 bin); the zero-command prob still trains standing.
+      command_ranges:
+        lin_vel_x: [0.0, 0.18]
+        lin_vel_y: [-0.1, 0.1]
+        ang_vel_yaw: [-0.4, 0.4]
+      sigma_lin: 0.01
+      sigma_ang: 0.01
+      # Playground imitation recipe with tracking_lin_vel raised 5 -> 8 (fix the ~43%
+      # forward-velocity tracking; the reference gait already anchors the stride, this
+      # adds direct forward pressure). Other weights are the proven v8 set.
+      reward_scales:
+        tracking_lin_vel: 8.0
+        tracking_ang_vel: 6.0
+        torques: -1.0e-3
+        action_rate: -0.3
+        stand_still: -0.2
+        alive: 20.0
+        imitation: 1.0
+      # DESCENDING-STEP terrain curriculum (general infra, reused from Go2). The world
+      # cooks a curric_levels x 3 tile grid; per-env difficulty selects the spawn tile
+      # ROW so the per-step height ramps 0 -> step_height with the promotion curriculum.
+      terrain:
+        enable: true
+        curriculum_grid: true
+        curric_levels: 10          # rows: row0 flat -> row9 full step_height.
+        tile_size: 3.0             # per-tile edge (m); the duck traverses toward centre.
+        heightfield_cell: 0.1      # heightfield resolution (m).
+        # Procedural cook geometry. step_height is the MAX per-step rise (top row);
+        # the corridor's 5 cm down-step sits at difficulty ~0.71, reached mid-curriculum.
+        step_height: 0.07
+        step_width: 0.22           # step tread width (m).
+        platform_width: 0.5        # central platform / pit-floor edge (m).
+        grid_width: 0.25           # RandomBoxes cell edge (m).
+        grid_height_max: 0.07      # RandomBoxes max per-cell rise (m).
+        ground_height: 0.0
+        # DESCENT-RICH type mix {1:stairs, 2:pit, 3:boxes}: 20% stairs (ascent
+        # robustness), 40% pit (pure descent), 40% boxes (mixed up/down steps).
+        type_distribution: {1: 1.0, 2: 2.0, 3: 2.0}
+        # Curriculum: cold-start flat, climb on survival + radial traversal, demote on
+        # a fall. Gates tuned for the slow duck (~0.1 m/s): a 0.4 m net approach to the
+        # tile centre = descend ~2 steps; survive 0.75 of a 20 s episode.
+        start_difficulty: 0.0
+        difficulty_step: 0.1
+        survive_frac: 0.75
+        promote_progress_m: 0.4
+        promote_path_m: 3.0
+        demote_on_fall: true
+        # Footprint half-span (m) for the terrain-relative height kill (duck-sized).
+        support_span: 0.12
