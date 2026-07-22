@@ -43,6 +43,7 @@ from nuka import materials, morphs, surfaces
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEX = os.path.join(REPO, "examples", "assets", "textures")
 BDX = os.path.join(REPO, "examples", "scenes", "bdx_stand.nks")
+GO2 = os.path.join(REPO, "examples", "scenes", "go2.nks")
 OUT = os.path.join(REPO, "examples", "scenes", "bdx_oneshot.nks")
 TRAINING_COARSE_OUT = os.path.join(
     REPO, "examples", "scenes", "bdx_oneshot_training_coarse.nks")
@@ -53,6 +54,16 @@ TRUNK = "base/trunk_assembly"
 
 # -- shared stage coordinates (gate / choreo / preview import these) -----------
 SPAWN = [-0.20, 0.0, 0.31]          # duck base anchor on the platform (top 0.10).
+GO2_SPAWN = [-0.20, 0.0, 0.40]      # Go2 root before the uniform scene lift.
+GO2_CROUCH = {
+    "FL_hip_joint": 0.1, "FL_thigh_joint": 0.8, "FL_calf_joint": -1.5,
+    "FR_hip_joint": -0.1, "FR_thigh_joint": 0.8, "FR_calf_joint": -1.5,
+    "RL_hip_joint": 0.1, "RL_thigh_joint": 1.0, "RL_calf_joint": -1.5,
+    "RR_hip_joint": -0.1, "RR_thigh_joint": 1.0, "RR_calf_joint": -1.5,
+}
+GO2_FOOT_NAMES = ("FL", "FR", "RL", "RR")
+GO2_FOOT_RADIUS = 0.022
+GO2_FOOT_LOCAL = [0.0, 0.0, -0.213]
 BASE_OVER_FLOOR = 0.21              # duck base anchor height over the floor it stands on.
 SCENE_LIFT = 0.05                   # sit the scene above the render's z=0 studio disc.
 PLATFORM_TOP = 0.10
@@ -245,15 +256,18 @@ def build(args):
     spacing_override = getattr(args, "gravel_spacing", None)
     if spacing_override is not None:
         profile = dataclasses.replace(profile, gravel_spacing=spacing_override)
-    b = nuka.SceneBuilder.create(BDX)
+    robot = getattr(args, "robot", "bdx")
+    if robot not in ("bdx", "go2"):
+        raise ValueError(f"unknown robot {robot!r}")
+    spawn = SPAWN if robot == "bdx" else GO2_SPAWN
+    b = nuka.SceneBuilder.create(BDX if robot == "bdx" else GO2)
     mat_ids = add_materials(b)
 
-    # -- duck head + trunk colliders (shipped visual-only; keep the two geoms
-    # separated or their mutual push extends the neck) -------------------------
-    b.add_collision_shape(HEAD, nuka.PRIMITIVE_SPHERE, dims=[0.04],
-                          pos=[0.02, 0.0, 0.0], friction=0.8)
-    b.add_collision_shape(TRUNK, nuka.PRIMITIVE_BOX, dims=[0.04, 0.035, 0.028],
-                          pos=[0.0, 0.0, -0.005], friction=0.8)
+    if robot == "bdx":
+        b.add_collision_shape(HEAD, nuka.PRIMITIVE_SPHERE, dims=[0.04],
+                              pos=[0.02, 0.0, 0.0], friction=0.8)
+        b.add_collision_shape(TRUNK, nuka.PRIMITIVE_BOX, dims=[0.04, 0.035, 0.028],
+                              pos=[0.0, 0.0, -0.005], friction=0.8)
 
     # -- floor: one big base slab (top -0.03) + packed-earth plates (top 0.00)
     # everywhere EXCEPT the gravel+debris recess span, which stays 3 cm deep ----
@@ -354,18 +368,54 @@ def build(args):
                       exposure_ev=0.0, grade=0.25, sun_disc=0.6, specular_env=True)
     b.save(args.out)
     b.destroy()
-    post_process(args.out)
-    print(f"[oneshot] wrote {args.out} (profile={getattr(args, 'profile', 'fine')} "
+    post_process(args.out, spawn, robot)
+    print(f"[oneshot] wrote {args.out} robot={robot} "
+          f"(profile={getattr(args, 'profile', 'fine')} "
           f"media: cloth={not args.no_cloth} gravel+debris={not args.no_gravel} "
           "cable=True)")
 
 
-def post_process(out):
-    """Declarative touches on the saved .nks: spawn the duck on the platform, drop
-    the heightfield (the dirt boxes ARE the ground), and lift the whole scene above
-    the render's z=0 studio disc (a uniform, physics-invariant z shift)."""
+def _set_go2_crouch(node):
+    count = 0
+    joint = node.get("joint")
+    if joint and joint.get("name") in GO2_CROUCH:
+        joint["initial_position"] = GO2_CROUCH[joint["name"]]
+        count += 1
+    for child in node.get("children", []):
+        count += _set_go2_crouch(child)
+    return count
+
+
+def _fix_go2_feet(node):
+    count = 0
+    shape = node.get("collision_shape")
+    if node.get("name") in GO2_FOOT_NAMES and shape:
+        shape["type"] = "sphere"
+        shape["radius"] = GO2_FOOT_RADIUS
+        shape["half_extents"] = [GO2_FOOT_RADIUS] * 3
+        shape["half_height"] = GO2_FOOT_RADIUS
+        shape["local"] = {
+            "pos": list(GO2_FOOT_LOCAL),
+            "quat": [1.0, 0.0, 0.0, 0.0],
+        }
+        count += 1
+    for child in node.get("children", []):
+        count += _fix_go2_feet(child)
+    return count
+
+
+def post_process(out, spawn=SPAWN, robot="bdx"):
+    """Apply robot spawn details and the uniform scene lift to the saved NKS."""
     doc = json.load(open(out))
     doc["terrain"] = []
+
+    if robot == "go2":
+        feet = sum(_fix_go2_feet(node) for node in doc["tree"])
+        joints = sum(_set_go2_crouch(node) for node in doc["tree"])
+        assert feet == len(GO2_FOOT_NAMES), \
+            f"expected {len(GO2_FOOT_NAMES)} Go2 feet, rewrote {feet}"
+        assert joints == len(GO2_CROUCH), \
+            f"expected {len(GO2_CROUCH)} Go2 joints, set {joints}"
 
     def walk(node):
         if isinstance(node, list):
@@ -373,7 +423,7 @@ def post_process(out):
                 walk(c)
             return
         if node.get("name") == "base" and "rigid_body" in node:
-            node["transform"]["pos"] = list(SPAWN)
+            node["transform"]["pos"] = list(spawn)
         for c in node.get("children", []):
             walk(c)
 
@@ -401,6 +451,7 @@ def post_process(out):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--robot", choices=("bdx", "go2"), default="bdx")
     ap.add_argument("--profile", choices=sorted(_GRANULAR_PROFILES), default="fine")
     ap.add_argument("--gravel-spacing", type=float)
     ap.add_argument("--out")
@@ -409,7 +460,13 @@ def main():
     ap.add_argument("--no-pebble", action="store_true")
     args = ap.parse_args()
     if args.out is None:
-        args.out = TRAINING_COARSE_OUT if args.profile == "training-coarse" else OUT
+        if args.robot == "go2":
+            args.out = os.path.join(REPO, "examples", "scenes",
+                                    "go2_oneshot_training_coarse.nks" if
+                                    args.profile == "training-coarse" else
+                                    "go2_oneshot.nks")
+        else:
+            args.out = TRAINING_COARSE_OUT if args.profile == "training-coarse" else OUT
     build(args)
 
 

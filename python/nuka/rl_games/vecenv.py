@@ -50,6 +50,8 @@ from ..tasks.h1_stand import make_env as make_h1_stand_env
 from ..tasks.go2_handstand import make_env as make_handstand_env
 from ..tasks.bdx_locomotion import make_env as make_bdx_env
 from ..tasks.bdx_perception import make_env as make_bdx_perception_env
+from ..tasks.bdx_corridor import make_env as make_bdx_corridor_teacher_env
+from ..tasks.go2_corridor import make_env as make_go2_corridor_teacher_env
 
 
 _ENV_FACTORIES = {
@@ -58,6 +60,8 @@ _ENV_FACTORIES = {
     "nuka_go2_handstand": make_handstand_env,
     "nuka_bdx": make_bdx_env,
     "nuka_bdx_perception": make_bdx_perception_env,
+    "nuka_bdx_corridor_teacher": make_bdx_corridor_teacher_env,
+    "nuka_go2_corridor_teacher": make_go2_corridor_teacher_env,
 }
 
 

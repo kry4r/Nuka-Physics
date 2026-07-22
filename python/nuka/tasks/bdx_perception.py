@@ -28,12 +28,8 @@ from gymnasium import spaces
 
 import nuka
 from . import bdx_obs as B
+from .bdx_corridor import CORRIDOR_SCENE, CorridorTaskMixin
 from .bdx_locomotion import BdxWalkEnv
-
-
-# Match the rest of the training stack: launch from the repository root.  Deriving
-# the repo from __file__ is wrong for a staged/installed Python package.
-CORRIDOR_SCENE = "examples/scenes/corridor_nomedia.nks"
 
 # The shipped duck's head-link axes are not camera axes.  This mount first rolls
 # camera +Y onto world-up, then pitches the optical -Z axis 20 degrees downward.
@@ -54,7 +50,7 @@ def _enum_value(value) -> int:
     return int(value.value) if hasattr(value, "value") else int(value)
 
 
-class BdxPerceptionEnv(BdxWalkEnv):
+class BdxPerceptionEnv(CorridorTaskMixin, BdxWalkEnv):
     """BDX locomotion with a lower-rate head depth camera.
 
     ``sensor`` is a plain mapping so it can be authored directly in an rl_games
@@ -65,34 +61,7 @@ class BdxPerceptionEnv(BdxWalkEnv):
     def __init__(self, scene: str = CORRIDOR_SCENE, num_envs: int = 256, *,
                  sensor: "dict | None" = None, **kwargs) -> None:
         cfg = dict(sensor or {})
-        spawn_x_range = kwargs.pop("spawn_x_range", None)
-        self.forward_progress_scale = float(
-            kwargs.pop("forward_progress_scale", 0.0))
-        self.progress_milestones = tuple(
-            float(v) for v in kwargs.pop("progress_milestones", ()))
-        self.progress_milestone_bonus = float(
-            kwargs.pop("progress_milestone_bonus", 0.0))
-        self.success_progress_m = float(kwargs.pop("success_progress_m", 0.0))
-        self.success_bonus = float(kwargs.pop("success_bonus", 0.0))
-        self.fall_penalty = float(kwargs.pop("fall_penalty", 0.0))
-        if not math.isfinite(self.forward_progress_scale) \
-                or self.forward_progress_scale < 0.0:
-            raise ValueError("forward_progress_scale must be non-negative")
-        if not math.isfinite(self.progress_milestone_bonus) \
-                or self.progress_milestone_bonus < 0.0:
-            raise ValueError("progress_milestone_bonus must be non-negative")
-        if (any(not math.isfinite(v) or v <= 0.0
-                for v in self.progress_milestones)
-                or any(b <= a for a, b in zip(
-                    self.progress_milestones, self.progress_milestones[1:]))):
-            raise ValueError("progress_milestones must be positive and increasing")
-        if not math.isfinite(self.success_progress_m) \
-                or self.success_progress_m < 0.0:
-            raise ValueError("success_progress_m must be non-negative")
-        if not math.isfinite(self.success_bonus) or self.success_bonus < 0.0:
-            raise ValueError("success_bonus must be non-negative")
-        if not math.isfinite(self.fall_penalty) or self.fall_penalty < 0.0:
-            raise ValueError("fall_penalty must be non-negative")
+        self._pop_corridor_kwargs(kwargs)
         self.depth_width = int(cfg.get("width", 128))
         self.depth_height = int(cfg.get("height", 96))
         self.depth_update_period = int(cfg.get("update_period", 2))
@@ -124,13 +93,7 @@ class BdxPerceptionEnv(BdxWalkEnv):
         kwargs.setdefault("scene_build_kwargs", {"bake_link_sdf": True})
         super().__init__(scene, num_envs, **kwargs)
 
-        self.spawn_x_range = (
-            None if spawn_x_range is None
-            else tuple(float(v) for v in spawn_x_range))
-        if self.spawn_x_range is not None:
-            if (len(self.spawn_x_range) != 2
-                    or not self.spawn_x_range[0] < self.spawn_x_range[1]):
-                raise ValueError("spawn_x_range must be [low, high] with low < high")
+        self._finalize_spawn_range()
 
         matches = self._world.dof_index(self.mount_joint_pattern)
         if len(matches) != 1:
@@ -159,17 +122,7 @@ class BdxPerceptionEnv(BdxWalkEnv):
             self.num_envs, 1, dtype=torch.float32, device=self._dev)
         self._sensor_tick = 0
         self._control_dt = self.dt * self.decimation
-        self._episode_start_x = torch.zeros(
-            self.num_envs, dtype=torch.float32, device=self._dev)
-        self._episode_max_progress = torch.zeros_like(self._episode_start_x)
-        self._milestones_reached = torch.zeros(
-            self.num_envs, len(self.progress_milestones),
-            dtype=torch.bool, device=self._dev)
-        self._milestone_values = torch.as_tensor(
-            self.progress_milestones, dtype=torch.float32,
-            device=self._dev).unsqueeze(0)
-        self._last_success = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self._dev)
+        self._init_progress_state()
 
         proprio_one = spaces.Box(
             low=-B.OBS_CLIP, high=B.OBS_CLIP,
@@ -210,52 +163,11 @@ class BdxPerceptionEnv(BdxWalkEnv):
             flush=True,
         )
 
-    def _reset_progress_state(self, mask: "torch.Tensor | None") -> None:
-        x = self._obs.base_pos()[:, 0]
-        if mask is None:
-            self._episode_start_x.copy_(x)
-            self._episode_max_progress.zero_()
-            self._milestones_reached.zero_()
-        else:
-            self._episode_start_x[mask] = x[mask]
-            self._episode_max_progress[mask] = 0.0
-            self._milestones_reached[mask] = False
+    def _reset_obs_clock(self) -> None:
+        self._sensor_tick = 0
 
-    def compute_terminated(self) -> "torch.Tensor":
-        physical_fall = super().compute_terminated()
-        self._last_success.zero_()
-        if self.success_progress_m > 0.0:
-            progress = self._obs.base_pos()[:, 0] - self._episode_start_x
-            self._last_success.copy_(
-                (progress >= self.success_progress_m) & ~physical_fall)
-        return physical_fall | self._last_success
-
-    def _randomize_spawn_x(self, mask: "torch.Tensor | None") -> None:
-        """Translate the articulation on the start platform, environment unchanged.
-
-        Moving only the reset pose varies time-to-edge without authoring a second
-        corridor or changing collision geometry.  LinkPose is translated alongside
-        BasePose so the head camera's first post-reset frame is immediately coherent;
-        the next physics step recomputes the same FK from the new base state.
-        """
-        if self.spawn_x_range is None:
-            return
-        if mask is None:
-            mask = torch.ones(
-                self.num_envs, dtype=torch.bool, device=self._dev)
-        count = int(mask.sum().item())
-        if count == 0:
-            return
-        lo, hi = self.spawn_x_range
-        target = (
-            torch.rand(count, generator=self._generator, device=self._dev)
-            * (hi - lo) + lo)
-        base_pose = self._obs._base_pose
-        link_pose = self._obs._pose
-        delta = target - base_pose[mask, 0]
-        base_pose[mask, 0] = target
-        link_pose[mask, :, 0] += delta.unsqueeze(1)
-        nuka.sync()
+    def _advance_obs_clock(self) -> None:
+        self._sensor_tick += 1
 
     def _structured_obs(self, proprio: torch.Tensor, *, force: bool = False):
         update = force or (self._sensor_tick % self.depth_update_period == 0)
@@ -294,67 +206,6 @@ class BdxPerceptionEnv(BdxWalkEnv):
             "depth": self._depth,
             "depth_age": self._depth_age,
         }
-
-    def reset(self, *, seed=None, options=None):
-        proprio, info = super().reset(seed=seed, options=options)
-        self._randomize_spawn_x(None)
-        if self.spawn_x_range is not None:
-            proprio = self._obs.compute_obs(
-                self.command, self.last_action,
-                self._ref.phase_features(self.phase_i))
-        self._reset_progress_state(None)
-        self._last_success.zero_()
-        self._sensor_tick = 0
-        return self._structured_obs(proprio, force=True), info
-
-    def step(self, actions: torch.Tensor):
-        previous_x = self._obs.base_pos()[:, 0].clone()
-        proprio, reward, terminated, truncated, info = super().step(actions)
-        success = self._last_success.clone()
-        if self.success_bonus > 0.0:
-            reward = reward + success.to(reward.dtype) * self.success_bonus
-        fall = terminated & ~success
-        if self.fall_penalty > 0.0:
-            reward = reward - fall.to(reward.dtype) * self.fall_penalty
-        info = dict(info)
-        info["success"] = success
-        info["fall"] = fall
-        self._sensor_tick += 1
-        # A reset env must not inherit the previous episode's last camera frame.
-        done = terminated | truncated
-        force = bool(done.any())
-        active = ~done
-        current_x = self._obs.base_pos()[:, 0]
-        if self.forward_progress_scale > 0.0:
-            # Bound one-step credit so a collision impulse cannot manufacture a
-            # large reward by launching the base forward.
-            dx = torch.clamp(current_x - previous_x, -0.02, 0.02)
-            reward = reward + (
-                self.forward_progress_scale * dx * active.to(dx.dtype))
-        if self.progress_milestones and self.progress_milestone_bonus > 0.0:
-            progress = torch.clamp_min(current_x - self._episode_start_x, 0.0)
-            self._episode_max_progress[active] = torch.maximum(
-                self._episode_max_progress[active], progress[active])
-            crossed = self._episode_max_progress.unsqueeze(1) >= self._milestone_values
-            new_crossings = crossed & ~self._milestones_reached
-            new_crossings &= active.unsqueeze(1)
-            reward = reward + (
-                new_crossings.sum(dim=1).to(reward.dtype)
-                * self.progress_milestone_bonus)
-            self._milestones_reached |= new_crossings
-        if force and self.spawn_x_range is not None:
-            self._randomize_spawn_x(done)
-            fresh = self._obs.compute_obs(
-                self.command, self.last_action,
-                self._ref.phase_features(self.phase_i))
-            proprio = proprio.clone()
-            proprio[done] = fresh[done]
-        if force:
-            self._reset_progress_state(done)
-            self._last_success[done] = False
-        obs = self._structured_obs(proprio, force=force)
-        return obs, reward, terminated, truncated, info
-
 
 def make_env(num_envs: int, *, device=None, scene: str = CORRIDOR_SCENE,
              **kwargs) -> BdxPerceptionEnv:
