@@ -91,6 +91,7 @@ class Go2LocomotionEnv(NukaGymEnv):
     def __init__(self, scene: str, num_envs: int, *,
                  fixed_command: bool = False, terrain: "dict | None" = None,
                  gait_mode: str = "walk",
+                 enable_contact_rewards: bool = True,
                  contact_family: int = 0,
                  heightfield_terrain_type: int = 0,
                  heightfield_nrow: int = 0,
@@ -103,6 +104,7 @@ class Go2LocomotionEnv(NukaGymEnv):
         # walker. Stored before super().__init__ (which does NOT take it) so it is
         # available when the Go2Reward is constructed below.
         self._gait_mode = str(gait_mode)
+        self._enable_contact_rewards = bool(enable_contact_rewards)
         # ----------------------------------------------------------------------
         # TERRAIN CURRICULUM (Go2-on-stairs Phase 2b). ``terrain`` is the yaml
         # ``config.env_config.terrain`` block (or None => terrain DISABLED, the
@@ -688,8 +690,12 @@ class Go2LocomotionEnv(NukaGymEnv):
         #     LINK_CONTACT_WRENCH at each foot's owning CALF link. |Fz|>1N == loaded.
         #   collision_count: (N,) # of penalised links (thigh/calf/base) clipping
         #     BELOW the local terrain surface (the kinematic terrain-clip proxy).
-        foot_contact_fz = self._wrench_view[:, self._foot_link_slot, 2]  # (N,4)
-        collision_count = self._collision_count()                        # (N,)
+        if self._enable_contact_rewards:
+            foot_contact_fz = self._wrench_view[:, self._foot_link_slot, 2]  # (N,4)
+            collision_count = self._collision_count()                        # (N,)
+        else:
+            foot_contact_fz = None
+            collision_count = None
         # Swing-foot clearance height (computed only when the active reward weights
         # it -- climb gait -- so walk/trot pay no cost and stay byte-identical).
         foot_height_above = (
@@ -1036,7 +1042,7 @@ class Go2LocomotionEnv(NukaGymEnv):
             d.update(n_term=0, n_trunc=0)
 
 
-def make_env(num_envs: int, *, device=None, **kw) -> Go2LocomotionEnv:
+def make_env(num_envs: int, *, device=None, scene=None, **kw) -> Go2LocomotionEnv:
     """Construct the Go2 locomotion env on the shipped go2_locomotion scene.
 
     Parameters mirror :class:`NukaGymEnv` (``dt``, ``decimation``, ``command``,
@@ -1044,5 +1050,5 @@ def make_env(num_envs: int, *, device=None, **kw) -> Go2LocomotionEnv:
     ``seed``). ``device`` is an open ``nuka.Device`` (created+owned by the env if
     ``None``). The scene is fixed to ``examples/scenes/go2_locomotion.usda`` (a
     byte-identical copy of the proven go2_float flat-ground floating-base scene)."""
-    scene = G._go2_scene_path()
+    scene = scene or G._go2_scene_path()
     return Go2LocomotionEnv(scene, num_envs, device=device, **kw)
