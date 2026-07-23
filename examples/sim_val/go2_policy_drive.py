@@ -91,6 +91,7 @@ import nuka
 # Constants / contract
 # ---------------------------------------------------------------------------
 SCENE = "/root/Nuka-Physics/examples/scenes/go2_float.usda"
+CONTACT_FAMILY = 1  # explicit flat heightfield on the general contact path
 POLICY = "/root/third_party/go2_pr62/motion.pt"
 GOLDEN = "/root/third_party/go2_pr62/golden_io.json"
 GO2_BLC = 13  # base_link_count: slot 0 = root, slots 1..12 = actuated leg joints
@@ -154,12 +155,16 @@ PD_KP, PD_KD, PD_FORCE = 60.0, 4.0, 24.0
 
 
 def make_world(dev, env_count, dt=None):
-    """Create the go2_float world at physics dt (default = module DT = 0.001, the
-    sub-stepped policy config; pass dt=0.005 for the native-dt characterization).
-    Passing dt is mandatory (the binding defaults to 1/240). See the timing note above
-    for why the policy rollout sub-steps to dt=0.001 (the soft-gain integration limit,
-    NOT the #42 seating bug, which is fixed)."""
-    return nuka.World.create_from_scene(dev, SCENE, env_count, DT if dt is None else dt)
+    """Create the go2_float world at the native policy physics rate.
+
+    The optional ``dt`` is used by the separate native-dt characterization. The
+    flat ground is authored by the general heightfield contact family because
+    create_from_scene no longer injects a floor.
+    """
+    return nuka.World.create_from_scene(
+        dev, SCENE, env_count, DT if dt is None else dt,
+        contact_family=CONTACT_FAMILY,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,35 +582,30 @@ def write_targets_urdf(w, urdf_from_nuka_slot, target_urdf):
         tgt[:, 1:GO2_BLC] = torch.from_numpy(target_nuka).to(tgt.device)
 
 
-def warm_start(w, urdf_from_nuka_slot, warm_seconds=0.2):
-    """The C ABI cannot set initial JOINT_POSITION; the scene cooks to a near-
-    symmetric crouch (hip 0, thigh +0.8, calf -1.5), but the policy default is
-    ASYMMETRIC (hip +/-0.1, thigh 0.8 front / 1.0 rear). So drive the policy default
-    at the policy gains (Kp=20/Kd=0.5) for `warm_seconds` of SIM TIME to bring q
-    toward default and qd -> 0 BEFORE starting the policy loop.
+def warm_start(w, urdf_from_nuka_slot, settle_seconds=0.8):
+    """Reset to the policy default, physically seat it, then restore policy gains.
 
-    TIME-BASED (not a fixed step count) ON PURPOSE: the open-loop soft-gain hold of
-    a FLOATING base is posturally unstable (it slowly topples at ANY dt -- it is NOT
-    a damping/integration bug; the closed-loop policy is what keeps the robot up). A
-    dt-independent step count therefore warm-starts 5x longer in wall-clock at the
-    native dt=0.005 (200 steps = 1.0 s) than at the sub-stepped dt=0.001 (0.2 s), and
-    that extra 0.8 s of open-loop hold is enough to topple the start to ~22 deg before
-    the policy ever engages -- a harness artifact, not a physics result. Pinning the
-    warm-up to a fixed 0.2 s of SIM TIME makes the native-dt and sub-stepped rollouts
-    apples-to-apples (both hand the policy the same lightly-sagged upright start).
-
-    NOTE: legged_gym RESETS dof_pos = default exactly at training t=0, but the Nuka
-    C ABI cannot teleport initial q; here we instead HOLD against gravity at the soft
-    policy Kp=20, which settles to a steady sag (~ tau_grav/Kp on the load-bearing
-    calf). So the policy takes over from a mildly OFF-default state -- a robustness
-    check, not a faithful reproduction of the training reset. Returns (q_urdf,
-    qd_urdf)."""
-    n_steps = max(1, int(round(warm_seconds / DT)))
+    This mirrors the training env's writable DLPack joint reset. A temporary
+    Kp=60/Kd=4 hold seats the feet on the explicit flat heightfield without a
+    free-fall transient; the policy still takes over at its Kp=20/Kd=0.5 contract.
+    """
+    nuka_slot_for_urdf = np.empty(12, dtype=np.int64)
+    for slot_j in range(12):
+        nuka_slot_for_urdf[urdf_from_nuka_slot[slot_j]] = slot_j
+    default_nuka = DEFAULT_ANGLES[nuka_slot_for_urdf]
+    q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
+    qd = torch.from_dlpack(w.buffer_view(nuka.JOINT_VELOCITY))
+    q[:, 1:GO2_BLC] = torch.from_numpy(default_nuka).to(q.device)
+    qd[:, 1:GO2_BLC] = 0.0
     set_gains_and_targets_default(
-        w, urdf_from_nuka_slot, KP, KD, FORCE_LIMIT_URDF, DEFAULT_ANGLES
+        w, urdf_from_nuka_slot, PD_KP, PD_KD,
+        FORCE_LIMIT_URDF, DEFAULT_ANGLES,
     )
-    w.step_n(n_steps)
+    w.step_n(max(1, int(round(settle_seconds / DT))))
     nuka.sync()
+    set_gains_and_targets_default(
+        w, urdf_from_nuka_slot, KP, KD, FORCE_LIMIT_URDF, DEFAULT_ANGLES,
+    )
     q_urdf, qd_urdf, *_ = read_state_urdf(w, urdf_from_nuka_slot)
     return q_urdf, qd_urdf
 
@@ -619,24 +619,18 @@ def d4_d5_warmstart(ladder: Ladder, dev, policy, urdf_from_nuka_slot) -> None:
         (q_u, qd_u, blv, bav, pg, base_z, tilt) = read_state_urdf(
             w, urdf_from_nuka_slot
         )
-        # D4: after warm-start the robot is UPRIGHT and SETTLED. At the soft policy
-        # Kp=20, HOLDING against gravity (we can't teleport q to default via the C ABI)
-        # settles to a sizeable steady sag (~ tau_grav/Kp), so the gate is on
-        # UPRIGHT+SETTLED (low tilt, low qd, held height), NOT on q==default. The
-        # policy then takes over from this off-default state (a robustness check, not a
-        # faithful reproduction of legged_gym's exact-default reset).
+        # D4 requires a physically seated upright state before policy takeover.
         dq = q_u - DEFAULT_ANGLES
         max_dq = float(np.abs(dq).max())
         max_qd = float(np.abs(qd_u).max())
-        d4_ok = tilt < 20.0 and max_qd < 1.5 and base_z > 0.30 and max_dq < 0.8
+        d4_ok = tilt < 5.0 and max_qd < 0.1 and base_z > 0.28 and max_dq < 0.15
         ladder.record(
             "D4",
             d4_ok,
-            f"warm-start (1.0 s @ Kp=20, HOLD not teleport): UPRIGHT+SETTLED gate -- "
-            f"tilt={tilt:.2f} deg (<20), max|qd|={max_qd:.4f} rad/s (<1.5), "
-            f"base_z={base_z:.4f} m (>0.30); max|q-default|={max_dq:.4f} rad "
-            f"(soft-Kp gravity sag held against gravity, <0.8); "
-            f"q_urdf={np.round(q_u,3).tolist()}",
+            f"default-pose reset + 0.8 s physical seat: UPRIGHT+SETTLED gate -- "
+            f"tilt={tilt:.2f} deg (<5), max|qd|={max_qd:.4f} rad/s (<0.1), "
+            f"base_z={base_z:.4f} m (>0.28); max|q-default|={max_dq:.4f} rad "
+            f"(<0.15); q_urdf={np.round(q_u,3).tolist()}",
         )
 
         # D5: build the LIVE obs (cmd=[0.5,0,0], last_action=0) and run the policy.
@@ -796,14 +790,10 @@ def classify(out: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Native-dt characterization: self-document the SEPARATE dt=0.005 findings so this
-# harness does not hide the gap behind the sub-stepped walk above.
+# Native-dt characterization: self-document the separate dt=0.005 regression gate.
 # ---------------------------------------------------------------------------
 def native_dt_characterization(dev, policy, urdf_from_nuka_slot, env_count=64):
-    """At the NATIVE training dt=0.005 (decim 4), confirm BOTH engine fixes hold: (A)
-    the PD stance HOLDS (the #42 seating fix); (B) the soft-gain POLICY now WALKS rather
-    than flailing (the #43 implicit-joint-damping fix). Pre-#43 (B) flailed (tilt->110
-    deg) and forced dt=0.001 sub-stepping; a flail here now would be a REGRESSION."""
+    """At native dt=0.005 (decim 4), confirm the PD stance and policy remain stable."""
     dt_n, dec_n = 0.005, 4
     print("\n" + "-" * 78)
     print(f"NATIVE-DT CHARACTERIZATION @ dt={dt_n} (decim {dec_n}) -- honest self-doc "
@@ -825,7 +815,7 @@ def native_dt_characterization(dev, policy, urdf_from_nuka_slot, env_count=64):
     # (B) soft-gain policy at native dt -> should FLAIL.
     cmd = np.array([[0.5, 0.0, 0.0]], np.float32)
     with make_world(dev, env_count, dt=dt_n) as w:
-        warm_start(w, urdf_from_nuka_slot)  # 200 steps @ 0.005 ~ 1 s
+        warm_start(w, urdf_from_nuka_slot)
         last_action = np.zeros((1, 12), np.float32)
         tilt_max, nan_seen = 0.0, False
         for _ in range(150):
@@ -913,7 +903,6 @@ def main() -> int:
                 smoke_ok = False
                 print(f"  4096 smoke FAILED: {e}", flush=True)
 
-            # Self-document the native-dt gap (PD holds; soft-gain policy flails).
             native = native_dt_characterization(dev, policy, perm)
 
     finally:
@@ -957,8 +946,7 @@ def main() -> int:
     print(f"  4096 smoke finite: {smoke_ok}")
     if native is not None:
         print()
-        print("NATIVE-DT (0.005) SELF-DOC -- the headline WALK above is sub-stepped "
-              "(dt=0.001); at native dt:")
+        print("NATIVE-DT (0.005) SELF-DOC -- separate native-rate characterization:")
         print(f"  PD stance:    tilt {native['pd_tilt']:.2f} deg -> "
               f"{'HOLDS (#42 fix)' if native['pd_hold'] else 'COLLAPSED'}")
         print(f"  soft policy:  max tilt {native['policy_tilt_max']:.1f} deg -> "

@@ -118,6 +118,8 @@ params:
       # all-negative reward -> only_positive_rewards zeroed it -> value head collapsed.
       command: [0.5, 0.0, 0.0]
       fixed_command: false
+      # Flat ground is an explicit general heightfield, not an implicit world floor.
+      contact_family: 1
 
       # GAIT MODE (Go2 pronk/bound skill). DEFAULT 'walk' => byte-identical to the
       # proven flat walker (the reward dict, termination, obs are all unchanged).
