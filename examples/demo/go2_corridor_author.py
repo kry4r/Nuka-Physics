@@ -26,7 +26,6 @@ OUT_NKA = "examples/scenes/corridor_go2.nka"
 NO_MATERIAL = 4294967295          # sentinel: "use the default material".
 SPAWN_X = -0.2                    # start platform centre (profile top 0.15 m).
 PLATFORM_TOP = 0.15              # corridor start-platform top (scene ground truth).
-GO2_STANCE = 0.30               # cooked-crouch trunk height above the feet.
 
 # Cook the go2 subtree at the legged_gym default crouch (the env resets to it) so
 # the feet spawn on the ground, not the straight-leg cook height. go2.nks joint
@@ -129,6 +128,8 @@ def main():
 
     robot = copy.deepcopy(go2["tree"][0])
     assert robot.get("name") == "base", "go2 robot root is not 'base'"
+    reset_clearance = float(robot["transform"]["pos"][2])
+    assert reset_clearance > 0.0, "go2 reset base clearance must be positive"
     n_feet = _fix_feet(robot)
     assert n_feet == len(FOOT_NAMES), \
         f"expected {len(FOOT_NAMES)} foot colliders, rewrote {n_feet}"
@@ -137,7 +138,8 @@ def main():
         f"expected {len(CROUCH)} joints, set {n_crouch}"
     _offset_material_ids(robot, offset)
     _remap_mesh_nka(robot, "go2", "corridor_go2")
-    robot["transform"]["pos"] = [SPAWN_X, 0.0, PLATFORM_TOP + GO2_STANCE]
+    # Preserve the flat task's reset clearance above the local support surface.
+    robot["transform"]["pos"] = [SPAWN_X, 0.0, PLATFORM_TOP + reset_clearance]
 
     out = dict(cor)
     out["render_materials"] = new_render
@@ -153,6 +155,7 @@ def main():
     shutil.copyfile(GO2_NKA, OUT_NKA)
     print(f"[author] {CORRIDOR_SRC} + {GO2_SRC} -> {OUT_NKS}")
     print(f"[author] robot base pos={robot['transform']['pos']} "
+          f"reset_clearance={reset_clearance} "
           f"materials={len(new_render)} (corridor {offset} + go2 "
           f"{len(go2['render_materials'])}) sensors stripped; "
           f".nka {GO2_NKA} -> {OUT_NKA} ({os.path.getsize(OUT_NKA)} bytes)")
