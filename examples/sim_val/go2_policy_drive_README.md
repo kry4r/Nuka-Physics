@@ -4,36 +4,31 @@
 **Run:** `export CUDA_VISIBLE_DEVICES=0; /root/miniconda3/envs/nuka-v03/bin/python examples/sim_val/go2_policy_drive.py`
 **Date:** 2026-05-30 · branch `v03`
 
-## TL;DR — verdict (qualified; read the qualification)
+## Current mainline rerun
 
-The real trained Go2 policy (`motion.pt`, 48→12 MLP) driven in-the-loop on Nuka
-produces clean, command-tracking **WALKING — but only when the physics is sub-stepped
-to dt=0.001** (decimation 20; the policy itself still runs at 50 Hz, matching
-training). At that config it tracks the commanded 0.5 m/s forward, upright and stable,
-cross-validated by two independent buffers. **At the NATIVE training dt=0.005 the
-policy FLAILS** — that is a real, separately-characterized limitation, not swept under
-the rug (§5).
+The current general-contact path requires an explicit ground source. This harness
+uses `contact_family=1` to cook a flat heightfield at z=0; `go2_float.usda` does not
+contain an authored floor and `create_from_scene` no longer injects one.
 
-Two distinct findings came out of this task; do **not** conflate them:
+The external `motion.pt` policy now passes the complete D0-D5 ladder and walks at the
+native training rate (`dt=0.005`, decimation 4, policy 50 Hz). The run below used the
+same current source tree and GPU build, with no PPO training or policy changes.
 
-| # | finding | status |
-|---|---|---|
-| **#42** | the c_abi/nanobind **PD stance** collapsed at dt≥0.002 (deep 0.03 m foot seating) | **FIXED** (engine: seat 0.03→0.002 m); stance now holds at every dt incl. native 0.005 |
-| **#41** | the **learned policy** (soft gains Kp=20/Kd=0.5) flails at native dt=0.005 | **OPEN** mechanism; mitigated by sub-stepping physics to dt=0.001 |
+| metric | value |
+|---|---|
+| diagnostic ladder D0-D5 | **ALL PASS** |
+| Nuka<->URDF joint permutation | **identity `[0..11]`** |
+| policy forward velocity | `+0.5020 m/s` (last 50, command `0.5`) |
+| independent world-position velocity | `+0.4931 m/s` over 6 s |
+| policy tilt | mean `3.49 deg`, max `5.76 deg` |
+| PD baseline | tilt mean `0.30 deg`, base z `0.3048 m` |
+| 4096-env smoke | finite, no NaN |
 
-| metric | value | note |
-|---|---|---|
-| diagnostic ladder D0–D5 | **ALL PASS** | conventions proven before any rollout |
-| Nuka↔URDF joint permutation | **identity `[0..11]`** | quadrant + cooked-q signature (hard gate) |
-| **walk** fwd vel (LINK_VELOCITY, body x) | **+0.51 m/s** (last-50) | cmd 0.5, **@ dt=0.001** |
-| **walk** fwd vel (LINK_POSE, world px) | **+0.49 m/s** (dx +2.95 m / 6 s) | independent cross-check, agrees |
-| **walk** tilt / height | mean 3.8° (max 6.2°) / z 0.423 m | upright, **@ dt=0.001** |
-| native-dt PD stance (Kp=60/Kd=4) | z 0.432 m, tilt 0.22° | **HOLDS @ dt=0.005** (the #42 fix) |
-| native-dt soft-gain policy | max tilt 56° | **FLAILS @ dt=0.005** (the open limit) |
-| 4096-env policy smoke | finite, no NaN | production env count runs |
+**STATUS: flat Go2 locomotion baseline is valid again; corridor teacher training
+results remain separate and still fail their traversal gate.**
 
-**STATUS: conventions + engine fix DONE; policy walks only sub-stepped; native-dt
-policy stability OPEN.**
+The sections below retain the earlier #41/#42 characterization for provenance; their
+pre-general-contact numbers are historical and are not the current baseline verdict.
 
 ## 1. Conventions (the contract), proven in rung D0
 
@@ -51,8 +46,8 @@ against the golden (`/root/third_party/go2_pr62/golden_io.json`) in **D0**:
 - **velocity frame:** base lin/ang vel read directly from `LINK_VELOCITY` root slot
   (omega-first, already BODY frame, no lag) — no world→body rotation.
 - **projected_gravity:** `quat_rotate_inverse(base_quat_wxyz, [0,0,-1])`.
-- **control rate:** policy 50 Hz. Physics dt = **0.001 s**, decimation **20** (=50 Hz)
-  for the rollout. See §5 for why 0.001 (not training's 0.005).
+- **control rate:** policy 50 Hz. Current baseline physics dt = **0.005 s**,
+  decimation **4** (=50 Hz), with an explicit flat heightfield contact source.
 
 ## 2. Nuka↔URDF joint permutation — identity `[0..11]`
 
@@ -83,6 +78,8 @@ Established in **D1**, strongest last:
   base_z 0.380. Soft-Kp sag max|q−default| ≈ 0.45 rad (held against gravity, not the
   training teleport-reset — a robustness offset the policy recovers from).
 - **D5** live obs → policy → 12 finite actions; obs[12:24] live-matches (q−default).
+
+## Historical #41/#42 characterization (superseded by current rerun)
 
 ## 4. THE #42 ENGINE FIX — c_abi foot seating 0.03 → 0.002 m (PD stance)
 

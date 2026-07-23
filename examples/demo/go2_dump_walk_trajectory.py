@@ -26,10 +26,10 @@ poses, so the C++ renderer can drive the go2.nks visual meshes directly from the
 recorded kinematics (pose-replay) OR re-simulate from the recorded DriveTargets
 (physics-replay). Both are provided; see the file layout below.
 
-GROUND: the unified world detects feet against the IMPLICIT ground plane at
-model.ground_height = 0 (src/c_abi/world.cpp:168). go2_float.usda authors NO
-explicit ground; the base starts at z=0.445 and settles to ~0.30 as the feet seat
-on z=0. The C++ replay must render a ground plane at WORLD z = 0.
+GROUND: the harness requests contact_family=1, which cooks an explicit flat
+heightfield at z=0 on the general contact path. go2_float.usda authors no ground;
+the base starts at z=0.445 and settles to ~0.30 as the feet seat on z=0. The C++
+replay must render a ground plane at WORLD z = 0.
 
 THE DUMP (what the C++ tool reads)
 ----------------------------------
