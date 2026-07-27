@@ -13,19 +13,23 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 import nuka
+import bdx_oneshot_author as A
+from nuka.rl_games.go2_policy import (
+    actor_mu,
+    load_contract,
+    plain_model_state,
+    postprocess_action,
+)
 from nuka.tasks import go2_obs as G
 from nuka.tasks.bdx_corridor import (
     CorridorHeightProfile,
     PRIV_HEIGHT_CLAMP,
     TEACHER_PROFILE_OFFSETS,
 )
-
-from bdx_oneshot_film import camera_at
-
+from nuka.tasks.go2_corridor import slab_gate
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_SCENE = os.path.join(REPO, "examples", "scenes", "go2_oneshot.nks")
@@ -33,6 +37,27 @@ RL_GAMES_DT = 0.005
 RL_GAMES_DECIMATION = 4
 TORCHSCRIPT_DT = 0.001
 TORCHSCRIPT_DECIMATION = 20
+
+
+def camera_at(x: float):
+    """Clear Go2-scale side tracking shot.
+
+    Center the whole quadruped instead of inheriting the BDX macro camera, while
+    retaining enough lead room to see cloth, MPM deformation, and the slab before
+    contact.  The open -y side of the widened workshop provides an unobstructed
+    dolly lane.
+    """
+    slab_focus = max(0.0, min(1.0, (float(x) - 3.15) / 0.55))
+    slab_focus = slab_focus * slab_focus * (3.0 - 2.0 * slab_focus)
+    # Pull the dolly backwards and farther out as Go2 enters the slab portal.
+    # Without this offset the near portal post crosses the optical axis and
+    # hides the head/slab contact in an otherwise physically valid rollout.
+    eye = np.array((float(x) - 0.12 - 0.65 * slab_focus,
+                    -1.58 - 0.25 * slab_focus,
+                    0.70 + 0.14 * slab_focus), dtype=np.float32)
+    look = np.array((float(x) + 0.18, 0.0,
+                     0.31 + 0.10 * slab_focus), dtype=np.float32)
+    return eye, look, 50.0 + 4.0 * slab_focus
 
 
 @dataclass(frozen=True)
@@ -57,22 +82,22 @@ def load_rl_games_actor(path: str, device: torch.device) -> Policy:
     if not isinstance(checkpoint, dict) or "model" not in checkpoint:
         raise ValueError("checkpoint is not an rl_games model dictionary")
     state = {
-        key.removeprefix("_orig_mod."): (
-            value.to(device) if torch.is_tensor(value) else value)
-        for key, value in checkpoint["model"].items()
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in plain_model_state(checkpoint).items()
     }
-    obs_dim = int(state["running_mean_std.running_mean"].numel())
+    contract = load_contract(checkpoint)
+    obs_dim = int(state["a2c_network.actor_mlp.0.weight"].shape[1])
     reward = float(checkpoint.get("last_mean_rewards", float("nan")))
     return Policy(
         actor=state,
         policy_format="rl_games",
-        provenance="in-house rl_games checkpoint",
+        provenance=contract.provenance,
         obs_dim=obs_dim,
         epoch=int(checkpoint.get("epoch", -1)),
         reward=reward if np.isfinite(reward) else None,
         physics_dt=RL_GAMES_DT,
         decimation=RL_GAMES_DECIMATION,
-        action_postprocess="deterministic mu clamped to [-1, 1]",
+        action_postprocess=contract.action_postprocess,
     )
 
 
@@ -123,29 +148,32 @@ def load_policy(path: str, device: torch.device, policy_format: str) -> Policy:
         "could not auto-detect checkpoint format; " + "; ".join(errors))
 
 
-def actor_mu(state: dict[str, torch.Tensor], obs: torch.Tensor) -> torch.Tensor:
-    mean = state["running_mean_std.running_mean"].float()
-    var = state["running_mean_std.running_var"].float()
-    x = ((obs.float() - mean) / torch.sqrt(var + 1.0e-5)).clamp(-5.0, 5.0)
-    for index in (0, 2, 4):
-        x = F.elu(F.linear(
-            x,
-            state[f"a2c_network.actor_mlp.{index}.weight"],
-            state[f"a2c_network.actor_mlp.{index}.bias"],
-        ))
-    return F.linear(
-        x,
-        state["a2c_network.mu.weight"],
-        state["a2c_network.mu.bias"],
-    ).clamp(-1.0, 1.0)
-
-
-def policy_action(policy: Policy, obs: torch.Tensor) -> torch.Tensor:
+def policy_action(policy: Policy, obs: torch.Tensor, *, sample: bool = False,
+                  generator: torch.Generator | None = None) -> torch.Tensor:
     with torch.inference_mode():
         if policy.policy_format == "torchscript":
+            if sample:
+                raise ValueError("action sampling requires an rl_games checkpoint")
             action = policy.actor(obs.float())
         else:
-            action = actor_mu(policy.actor, obs)
+            contract = load_contract({
+                "nuka_go2_policy": {
+                    "action_postprocess": policy.action_postprocess,
+                    "normalize_input": (
+                        "running_mean_std.running_mean" in policy.actor),
+                    "provenance": policy.provenance,
+                }
+            })
+            action = actor_mu(
+                policy.actor, obs,
+                normalize_input=contract.normalize_input)
+            if sample:
+                logstd = policy.actor["a2c_network.sigma"].float()
+                noise = torch.randn(
+                    action.shape, dtype=action.dtype, device=action.device,
+                    generator=generator)
+                action = action + noise * logstd.exp().unsqueeze(0)
+            action = postprocess_action(action, contract)
     if not torch.is_tensor(action) or action.ndim != 2:
         raise ValueError("policy must return a rank-2 action tensor")
     return action
@@ -174,14 +202,18 @@ def set_hold_gains(world, obs_builder: G.Go2ObsBuilder, kp: float, kd: float) ->
 
 
 def privileged_obs(proprio: torch.Tensor, world, profile: CorridorHeightProfile,
-                   offsets: torch.Tensor) -> torch.Tensor:
+                   offsets: torch.Tensor, *, include_slab_gate: bool = False
+                   ) -> torch.Tensor:
     pose = torch.from_dlpack(world.buffer_view(nuka.ARTICULATION_LINK_POSE))
     base_x = pose[:, 0, 0:1]
     base_z = pose[:, 0, 2:3]
     h_base = profile.heights_at(base_x)
     h_offsets = profile.heights_at(base_x + offsets)
     priv = torch.cat((base_z - h_base, h_offsets - h_base), dim=1)
-    return torch.cat((proprio, priv.clamp(-PRIV_HEIGHT_CLAMP, PRIV_HEIGHT_CLAMP)), dim=1)
+    priv = priv.clamp(-PRIV_HEIGHT_CLAMP, PRIV_HEIGHT_CLAMP)
+    if include_slab_gate:
+        priv = torch.cat((priv, slab_gate(base_x)), dim=1)
+    return torch.cat((proprio, priv), dim=1)
 
 
 def build_world(device, scene: str, physics_dt: float):
@@ -214,8 +246,21 @@ def run(args: argparse.Namespace) -> dict:
             f"output directory contains an existing frame: {old_frame}")
     dev_t = torch.device("cuda")
     policy = load_policy(args.checkpoint, dev_t, args.policy_format)
+    recovery_policy = (
+        load_policy(args.recovery_checkpoint, dev_t, args.recovery_policy_format)
+        if args.recovery_checkpoint else None)
+    if recovery_policy is not None and (
+            recovery_policy.physics_dt != policy.physics_dt
+            or recovery_policy.decimation != policy.decimation):
+        raise ValueError(
+            "primary and recovery policies must use the same physics timing")
+    action_generator = None
+    if args.sample_actions:
+        if policy.policy_format != "rl_games":
+            raise ValueError("--sample-actions requires an rl_games checkpoint")
+        action_generator = torch.Generator(device=dev_t).manual_seed(args.seed)
     obs_dim = policy.obs_dim
-    if obs_dim not in (48, 65):
+    if obs_dim not in (48, 65, 66):
         raise ValueError(f"unsupported actor observation dimension {obs_dim}")
     policy_info = {
         "policy_format": policy.policy_format,
@@ -224,6 +269,12 @@ def run(args: argparse.Namespace) -> dict:
         "physics_dt": policy.physics_dt,
         "decimation": policy.decimation,
         "control_period_s": policy.control_dt,
+        "action_mode": "sample" if args.sample_actions else "mean",
+        "seed": args.seed,
+        "recovery_checkpoint": args.recovery_checkpoint,
+        "recovery_x": args.recovery_x if recovery_policy is not None else None,
+        "recovery_blend_m": (
+            args.recovery_blend_m if recovery_policy is not None else None),
     }
     print(json.dumps(policy_info, sort_keys=True), flush=True)
     started = time.perf_counter()
@@ -233,8 +284,12 @@ def run(args: argparse.Namespace) -> dict:
             obs_builder = G.Go2ObsBuilder(device, world)
             obs_builder.apply_pd_gains()
             set_default_pose(world, obs_builder)
+            needs_profile = (
+                obs_dim in (65, 66)
+                or (recovery_policy is not None
+                    and recovery_policy.obs_dim in (65, 66)))
             profile = (CorridorHeightProfile(args.scene, dev_t)
-                       if obs_dim == 65 else None)
+                       if needs_profile else None)
             offsets = torch.as_tensor(
                 TEACHER_PROFILE_OFFSETS, dtype=torch.float32, device=dev_t)
             command = torch.zeros(1, 3, device=dev_t)
@@ -249,6 +304,21 @@ def run(args: argparse.Namespace) -> dict:
             nuka.sync()
 
             base0 = obs_builder.base_pos()[0].detach().clone()
+            particles0 = particle_snapshot(world)
+            cloth_count = A.CLOTH_NX * A.CLOTH_NY
+            # Particle layout is MPM, then cloth, then cable beads + 8 slab
+            # corners.  Derive the cable size from the authored segment count.
+            cable_count = A.CABLE_SEGMENTS + 1 + 8
+            cloth_end = particles0.shape[0] - cable_count
+            cloth_start = cloth_end - cloth_count
+            cloth0 = (particles0[cloth_start:cloth_end].copy()
+                      if cloth_start >= 0
+                      else np.empty((0, 3), dtype=np.float32))
+            slab0 = (particles0[-8:].mean(axis=0) if cable_count >= 8
+                     else np.zeros(3, dtype=np.float32))
+            cloth_max_displacement = 0.0
+            slab_max_displacement = 0.0
+            slab_max_dx = 0.0
             start_x = float(base0[0])
             frames = 0
             ctrl_steps = 0
@@ -261,18 +331,57 @@ def run(args: argparse.Namespace) -> dict:
             fell = False
             stopped = False
             stop_step = None
+            recovery_activated = False
+            recovery_max_alpha = 0.0
+            pause_started_step = None
+            pause_completed = False
+            pause_steps = int(round(args.pause_seconds / policy.control_dt))
             tail_steps = int(round(args.tail_seconds / policy.control_dt))
             total_steps = int(round(args.seconds / policy.control_dt)) + tail_steps
             for step in range(total_steps):
                 if not stopped:
-                    ramp = min(1.0, (ctrl_steps + 1) / max(1, args.command_ramp))
-                    command[:, 0] = args.command_vx * ramp
+                    x_before_command = float(obs_builder.base_pos()[0, 0])
+                    if (args.pause_x is not None and pause_started_step is None
+                            and x_before_command >= args.pause_x):
+                        pause_started_step = ctrl_steps
+                    pausing = (
+                        pause_started_step is not None and not pause_completed
+                        and ctrl_steps - pause_started_step < pause_steps)
+                    if pausing:
+                        command.zero_()
+                    else:
+                        if pause_started_step is not None:
+                            pause_completed = True
+                        ramp = min(
+                            1.0, (ctrl_steps + 1) / max(1, args.command_ramp))
+                        command[:, 0] = args.command_vx * ramp
                 else:
                     command.zero_()
                 proprio = obs_builder.compute_obs(command, last_action)
-                policy_obs = (privileged_obs(proprio, world, profile, offsets)
-                              if obs_dim == 65 else proprio)
-                action = policy_action(policy, policy_obs)
+                policy_obs = (privileged_obs(
+                    proprio, world, profile, offsets,
+                    include_slab_gate=(obs_dim == 66))
+                              if obs_dim in (65, 66) else proprio)
+                action = policy_action(
+                    policy, policy_obs, sample=args.sample_actions,
+                    generator=action_generator)
+                if recovery_policy is not None:
+                    recovery_obs = (privileged_obs(
+                        proprio, world, profile, offsets,
+                        include_slab_gate=(recovery_policy.obs_dim == 66))
+                                    if recovery_policy.obs_dim in (65, 66)
+                                    else proprio)
+                    recovery_action = policy_action(
+                        recovery_policy, recovery_obs, sample=False)
+                    x_before = float(obs_builder.base_pos()[0, 0])
+                    blend = max(args.recovery_blend_m, 1.0e-6)
+                    alpha = max(0.0, min(
+                        1.0, (x_before - args.recovery_x) / blend))
+                    alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                    if alpha > 0.0:
+                        recovery_activated = True
+                        recovery_max_alpha = max(recovery_max_alpha, alpha)
+                        action = action * (1.0 - alpha) + recovery_action * alpha
                 last_action = obs_builder.write_action(action)
                 world.step_n(policy.decimation)
                 nuka.sync()
@@ -297,6 +406,23 @@ def run(args: argparse.Namespace) -> dict:
                 trace.append({"t": sim_t, "x": x, "y": float(bp[1]),
                               "z": z, "tilt_deg": tilt,
                               "vx": float(base_vel[0])})
+                # Sparse live interaction probes: track peak cloth deflection and
+                # slab swing, not merely their final (possibly returned) poses.
+                if step % 10 == 0:
+                    live_particles = particle_snapshot(world)
+                    if (cloth0.size and
+                            live_particles.shape[0] == particles0.shape[0]):
+                        live_cloth = live_particles[cloth_start:cloth_end]
+                        cloth_max_displacement = max(
+                            cloth_max_displacement,
+                            float(np.linalg.norm(
+                                live_cloth - cloth0, axis=1).max()))
+                    if live_particles.shape[0] >= 8:
+                        slab_delta = live_particles[-8:].mean(axis=0) - slab0
+                        slab_max_displacement = max(
+                            slab_max_displacement,
+                            float(np.linalg.norm(slab_delta)))
+                        slab_max_dx = max(slab_max_dx, abs(float(slab_delta[0])))
                 if not stopped and x >= args.x_end:
                     stopped = True
                     stop_step = step
@@ -322,6 +448,28 @@ def run(args: argparse.Namespace) -> dict:
             particle_finite = bool(
                 np.isfinite(particles).all()) if particles.size else True
             finite &= particle_finite
+            mpm_moved_count = 0
+            mpm_lofted_count = 0
+            mpm_max_displacement = 0.0
+            mpm_center_mean_displacement = 0.0
+            if (particles0.shape == particles.shape and
+                    cloth_start > 0):
+                p0_mpm = particles0[:cloth_start]
+                p1_mpm = particles[:cloth_start]
+                lane = ((p0_mpm[:, 0] >= A.TROUGH[0] - 0.02) &
+                        (p0_mpm[:, 0] <= A.RECESS_X1 + 0.02) &
+                        (np.abs(p0_mpm[:, 1]) <= A.GO2_LANE_HALF_Y + 0.05))
+                delta = p1_mpm - p0_mpm
+                displacement = np.linalg.norm(delta, axis=1)
+                if np.any(lane):
+                    lane_disp = displacement[lane]
+                    mpm_moved_count = int(np.sum(lane_disp > 0.005))
+                    mpm_lofted_count = int(np.sum(delta[lane, 2] > 0.010))
+                    mpm_max_displacement = float(lane_disp.max())
+                center = lane & (np.abs(p0_mpm[:, 1]) < 0.28)
+                if np.any(center):
+                    mpm_center_mean_displacement = float(
+                        displacement[center].mean())
             trace_path = os.path.join(args.outdir, "trajectory.json")
             max_x = max((row["x"] for row in trace), default=start_x)
             result = {
@@ -331,6 +479,14 @@ def run(args: argparse.Namespace) -> dict:
                 "checkpoint_reward": policy.reward,
                 **policy_info,
                 "obs_dim": obs_dim,
+                "recovery_obs_dim": (
+                    recovery_policy.obs_dim if recovery_policy is not None else None),
+                "recovery_activated": recovery_activated,
+                "recovery_max_alpha": recovery_max_alpha,
+                "pause_x": args.pause_x,
+                "pause_seconds": args.pause_seconds,
+                "pause_triggered": pause_started_step is not None,
+                "pause_completed": pause_completed,
                 "settle_seconds": args.settle_seconds,
                 "settle_physics_steps": settle_steps,
                 "start_x": start_x,
@@ -345,6 +501,13 @@ def run(args: argparse.Namespace) -> dict:
                 "frames": frames,
                 "particle_count": int(particles.shape[0]),
                 "particle_finite": particle_finite,
+                "cloth_max_displacement": cloth_max_displacement,
+                "mpm_moved_count_gt_5mm": mpm_moved_count,
+                "mpm_lofted_count_gt_10mm": mpm_lofted_count,
+                "mpm_max_displacement": mpm_max_displacement,
+                "mpm_center_mean_displacement": mpm_center_mean_displacement,
+                "slab_max_displacement": slab_max_displacement,
+                "slab_max_dx": slab_max_dx,
                 "finite": finite,
                 "fell": fell,
                 "stages": reached,
@@ -372,13 +535,24 @@ def main() -> int:
         default="auto",
         help=("checkpoint format (default: auto); TorchScript uses physics "
               "dt=0.001/decimation=20, rl_games uses dt=0.005/decimation=4"))
+    parser.add_argument("--recovery-checkpoint")
+    parser.add_argument(
+        "--recovery-policy-format",
+        choices=("auto", "rl_games", "torchscript"), default="auto")
+    parser.add_argument("--recovery-x", type=float, default=2.90)
+    parser.add_argument("--recovery-blend-m", type=float, default=0.30)
+    parser.add_argument("--pause-x", type=float)
+    parser.add_argument("--pause-seconds", type=float, default=0.0)
     parser.add_argument("--scene", default=DEFAULT_SCENE)
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--seconds", type=float, default=18.0)
     parser.add_argument("--tail-seconds", type=float, default=2.0)
     parser.add_argument("--command-vx", type=float, default=0.4)
     parser.add_argument("--command-ramp", type=int, default=30)
-    parser.add_argument("--x-end", type=float, default=4.05)
+    parser.add_argument("--sample-actions", action="store_true",
+                        help="sample the rl_games Gaussian policy with a fixed seed")
+    parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--x-end", type=float, default=4.10)
     parser.add_argument(
         "--settle-seconds", type=float, default=0.8,
         help="physical high-gain settling duration in simulated seconds")
@@ -396,6 +570,8 @@ def main() -> int:
         parser.error("seconds must be positive and tail-seconds non-negative")
     if args.settle_seconds < 0.0:
         parser.error("settle-seconds must be non-negative")
+    if args.pause_seconds < 0.0:
+        parser.error("pause-seconds must be non-negative")
     result = run(args)
     return 0 if result["success"] else 3
 

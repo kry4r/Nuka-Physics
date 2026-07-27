@@ -1,0 +1,78 @@
+# Corrected-render/SDF full-media continuation.  The source Go2 mesh mapping is
+# now shared by beauty rendering and bake_link_sdf, so this stage deliberately
+# re-learns the real gravel/debris reactions rather than the old misbound SDF.
+params:
+  seed: 31
+  algo: {name: a2c_continuous}
+  model: {name: continuous_a2c_logstd}
+  network:
+    name: actor_critic
+    separate: True
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init: {name: default}
+        sigma_init: {name: const_initializer, val: -4.0}
+        fixed_sigma: True
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer: {name: default}
+      regularizer: {name: None}
+  config:
+    name: go2_corridor_teacher_v12_corrected_mpm
+    full_experiment_name: go2_corridor_teacher_v12_corrected_mpm
+    env_name: nuka_go2_corridor_teacher
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: False
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    clip_actions: False
+    nuka_go2_prior_adapter_only: False
+    nuka_go2_actor_head_only: False
+    nuka_go2_freeze_sigma: True
+    reward_shaper: {scale_value: 1.0}
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1.0e-7
+    lr_schedule: constant
+    kl_threshold: 0.01
+    score_to_win: 100000
+    max_epochs: 30
+    save_best_after: 4
+    save_frequency: 5
+    grad_norm: 0.5
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.05
+    horizon_length: 48
+    num_actors: 64
+    minibatch_size: 768
+    mini_epochs: 1
+    critic_coef: 1.0
+    clip_value: True
+    bounds_loss_coef: 0.0
+    env_config:
+      scene: examples/scenes/go2_oneshot_training_coarse.nks
+      use_scene_builder: true
+      scene_build_kwargs: {bake_link_sdf: true}
+      command: [0.50, 0.0, 0.0]
+      fixed_command: True
+      enable_contact_rewards: false
+      termination_height: 0.08
+      termination_tilt_deg: 120.0
+      episode_length_s: 24.0
+      spawn_x_windows: [[-0.47, -0.43, 0.35], [0.82, 0.92, 0.35], [2.05, 2.18, 0.25], [3.05, 3.18, 0.05]]
+      time_penalty: 0.06
+      forward_progress_scale: 100.0
+      progress_milestones: [0.25, 0.45, 0.65, 0.85, 1.05, 1.25, 1.45, 1.65, 1.85, 2.05, 2.25, 2.45, 2.65, 2.85, 3.05, 3.25, 3.45, 3.65, 3.85, 4.05, 4.20, 4.30, 4.35]
+      progress_milestone_bonus: 12.0
+      success_x: 3.90
+      success_progress_m: 0.0
+      success_bonus: 600.0
+      fall_penalty: 30.0

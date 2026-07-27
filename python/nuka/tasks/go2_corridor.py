@@ -30,6 +30,14 @@ from .bdx_corridor import (
 
 
 CORRIDOR_SCENE = "examples/scenes/corridor_go2.nks"
+SLAB_GATE_X0 = 3.00
+SLAB_GATE_X1 = 3.40
+
+
+def slab_gate(base_x: torch.Tensor) -> torch.Tensor:
+    """Smooth stage feature that is exactly zero before the hanging-panel zone."""
+    u = ((base_x - SLAB_GATE_X0) / (SLAB_GATE_X1 - SLAB_GATE_X0)).clamp(0.0, 1.0)
+    return u * u * (3.0 - 2.0 * u)
 
 
 class Go2CorridorTeacherEnv(CorridorTaskMixin, Go2LocomotionEnv):
@@ -42,6 +50,7 @@ class Go2CorridorTeacherEnv(CorridorTaskMixin, Go2LocomotionEnv):
 
     def __init__(self, scene: str = CORRIDOR_SCENE, num_envs: int = 1024,
                  **kwargs) -> None:
+        self.use_slab_gate_obs = bool(kwargs.pop("slab_gate_obs", False))
         self._pop_corridor_kwargs(kwargs)
         super().__init__(scene, num_envs, **kwargs)
         # The mixin + profile use ``self._dev``; the Go2 host names it differently.
@@ -53,7 +62,8 @@ class Go2CorridorTeacherEnv(CorridorTaskMixin, Go2LocomotionEnv):
         # Sample along world +x: the corridor command is a fixed yaw-0 forward walk.
         self._priv_offsets = torch.as_tensor(
             TEACHER_PROFILE_OFFSETS, dtype=torch.float32, device=self._dev)
-        self.privileged_dim = 1 + int(self._priv_offsets.numel())
+        self.privileged_dim = (
+            1 + int(self._priv_offsets.numel()) + int(self.use_slab_gate_obs))
         obs_dim = G.GO2_OBS_DIM + self.privileged_dim
         self.teacher_obs_dim = obs_dim
 
@@ -84,6 +94,8 @@ class Go2CorridorTeacherEnv(CorridorTaskMixin, Go2LocomotionEnv):
         h_off = self._profile.heights_at(base_x + self._priv_offsets)  # (N,16)
         priv = torch.cat((base_z - h_base, h_off - h_base), dim=1)
         priv = priv.clamp(-PRIV_HEIGHT_CLAMP, PRIV_HEIGHT_CLAMP)
+        if self.use_slab_gate_obs:
+            priv = torch.cat((priv, slab_gate(base_x)), dim=1)
         return torch.cat((proprio, priv), dim=1)
 
 

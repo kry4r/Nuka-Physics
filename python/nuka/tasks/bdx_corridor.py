@@ -120,8 +120,15 @@ class CorridorTaskMixin:
         self.progress_milestone_bonus = float(
             kwargs.pop("progress_milestone_bonus", 0.0))
         self.success_progress_m = float(kwargs.pop("success_progress_m", 0.0))
+        success_x = kwargs.pop("success_x", None)
+        self.success_x = None if success_x is None else float(success_x)
         self.success_bonus = float(kwargs.pop("success_bonus", 0.0))
         self.fall_penalty = float(kwargs.pop("fall_penalty", 0.0))
+        self.time_penalty = float(kwargs.pop("time_penalty", 0.0))
+        self.lateral_position_penalty_scale = float(
+            kwargs.pop("lateral_position_penalty_scale", 0.0))
+        self.lateral_velocity_penalty_scale = float(
+            kwargs.pop("lateral_velocity_penalty_scale", 0.0))
         if not math.isfinite(self.forward_progress_scale) \
                 or self.forward_progress_scale < 0.0:
             raise ValueError("forward_progress_scale must be non-negative")
@@ -136,10 +143,22 @@ class CorridorTaskMixin:
         if not math.isfinite(self.success_progress_m) \
                 or self.success_progress_m < 0.0:
             raise ValueError("success_progress_m must be non-negative")
+        if self.success_x is not None and not math.isfinite(self.success_x):
+            raise ValueError("success_x must be finite")
         if not math.isfinite(self.success_bonus) or self.success_bonus < 0.0:
             raise ValueError("success_bonus must be non-negative")
         if not math.isfinite(self.fall_penalty) or self.fall_penalty < 0.0:
             raise ValueError("fall_penalty must be non-negative")
+        if not math.isfinite(self.time_penalty) or self.time_penalty < 0.0:
+            raise ValueError("time_penalty must be non-negative")
+        if (not math.isfinite(self.lateral_position_penalty_scale)
+                or self.lateral_position_penalty_scale < 0.0):
+            raise ValueError(
+                "lateral_position_penalty_scale must be non-negative")
+        if (not math.isfinite(self.lateral_velocity_penalty_scale)
+                or self.lateral_velocity_penalty_scale < 0.0):
+            raise ValueError(
+                "lateral_velocity_penalty_scale must be non-negative")
 
     def _finalize_spawn_range(self) -> None:
         self.spawn_x_range = (
@@ -222,7 +241,10 @@ class CorridorTaskMixin:
     def compute_terminated(self) -> "torch.Tensor":
         physical_fall = super().compute_terminated()
         self._last_success.zero_()
-        if self.success_progress_m > 0.0:
+        if self.success_x is not None:
+            self._last_success.copy_(
+                (self._obs.base_pos()[:, 0] >= self.success_x) & ~physical_fall)
+        elif self.success_progress_m > 0.0:
             progress = self._obs.base_pos()[:, 0] - self._episode_start_x
             self._last_success.copy_(
                 (progress >= self.success_progress_m) & ~physical_fall)
@@ -301,12 +323,29 @@ class CorridorTaskMixin:
         force = bool(done.any())
         active = ~done
         current_x = self._obs.base_pos()[:, 0]
+        if self.time_penalty > 0.0:
+            reward = reward - (
+                self.time_penalty * active.to(reward.dtype))
         if self.forward_progress_scale > 0.0:
             # Bound one-step credit so a collision impulse cannot manufacture a
             # large reward by launching the base forward.
             dx = torch.clamp(current_x - previous_x, -0.02, 0.02)
             reward = reward + (
                 self.forward_progress_scale * dx * active.to(dx.dtype))
+        if self.lateral_position_penalty_scale > 0.0:
+            # Keep the robot centred on the obstacle line.  This is especially
+            # important at the hanging panel: an off-centre forehead strike
+            # generates a large roll moment even when forward progress is good.
+            base_y = torch.clamp(self._obs.base_pos()[:, 1], -1.0, 1.0)
+            reward = reward - (
+                self.lateral_position_penalty_scale * base_y.square()
+                * active.to(base_y.dtype))
+        if self.lateral_velocity_penalty_scale > 0.0:
+            lateral_speed = torch.clamp(
+                self._obs.base_lin_vel()[:, 1], -3.0, 3.0)
+            reward = reward - (
+                self.lateral_velocity_penalty_scale * lateral_speed.square()
+                * active.to(lateral_speed.dtype))
         if self.progress_milestones and self.progress_milestone_bonus > 0.0:
             progress = torch.clamp_min(current_x - self._episode_start_x, 0.0)
             self._episode_max_progress[active] = torch.maximum(

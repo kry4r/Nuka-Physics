@@ -1,0 +1,81 @@
+# Focused recovery continuation for the Go2-sized lightweight hanging panel.
+# Most resets start immediately before the panel; a strict 65-degree fall gate
+# and centre-line shaping train a square forehead strike instead of a lateral
+# glancing blow that rolls the robot after otherwise-good forward progress.
+params:
+  seed: 41
+  algo: {name: a2c_continuous}
+  model: {name: continuous_a2c_logstd}
+  network:
+    name: actor_critic
+    separate: True
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init: {name: default}
+        sigma_init: {name: const_initializer, val: -4.0}
+        fixed_sigma: True
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer: {name: default}
+      regularizer: {name: None}
+  config:
+    name: go2_corridor_teacher_v14_centered_light_slab
+    full_experiment_name: go2_corridor_teacher_v14_centered_light_slab
+    env_name: nuka_go2_corridor_teacher
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: False
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    clip_actions: False
+    nuka_go2_prior_adapter_only: False
+    nuka_go2_actor_head_only: True
+    nuka_go2_freeze_sigma: True
+    reward_shaper: {scale_value: 1.0}
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 3.0e-9
+    lr_schedule: constant
+    kl_threshold: 0.01
+    score_to_win: 100000
+    max_epochs: 20
+    save_best_after: 2
+    save_frequency: 2
+    grad_norm: 0.25
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.03
+    horizon_length: 48
+    num_actors: 64
+    minibatch_size: 768
+    mini_epochs: 1
+    critic_coef: 1.0
+    clip_value: True
+    bounds_loss_coef: 0.0
+    env_config:
+      scene: examples/scenes/go2_oneshot_training_coarse.nks
+      use_scene_builder: true
+      scene_build_kwargs: {bake_link_sdf: true}
+      command: [0.50, 0.0, 0.0]
+      fixed_command: True
+      enable_contact_rewards: false
+      termination_height: 0.18
+      termination_tilt_deg: 65.0
+      episode_length_s: 12.0
+      spawn_x_windows: [[-0.47, -0.43, 0.10], [2.85, 3.02, 0.15], [3.08, 3.20, 0.75]]
+      time_penalty: 0.08
+      forward_progress_scale: 100.0
+      lateral_position_penalty_scale: 8.0
+      lateral_velocity_penalty_scale: 2.0
+      progress_milestones: [0.15, 0.30, 0.45, 0.60, 0.75, 0.90]
+      progress_milestone_bonus: 16.0
+      success_x: 3.90
+      success_progress_m: 0.0
+      success_bonus: 1000.0
+      fall_penalty: 100.0

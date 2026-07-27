@@ -1,0 +1,91 @@
+# Go2 privileged corridor teacher warm-started from the proven external gait.
+#
+# The imported actor emits raw O(1-3) joint offsets. Keep the source deployment
+# contract: no running input normalizer and no rl_games [-1,1] action clipping.
+# Actor and critic are separate so privileged columns can learn without sharing
+# critic gradients through the imported gait trunk.
+params:
+  seed: 11
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: True
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: -2.0
+        fixed_sigma: True
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  config:
+    name: go2_corridor_teacher_v3
+    full_experiment_name: go2_corridor_teacher_v3
+    env_name: nuka_go2_corridor_teacher
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: False
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    clip_actions: False
+    # Preserve the proven 48-d gait while the new privileged terrain columns learn.
+    nuka_go2_prior_adapter_only: True
+    reward_shaper:
+      scale_value: 1.0
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1.0e-4
+    # The adapter has only 17 privileged input columns; adaptive KL scheduling can
+    # otherwise raise 1e-4 to 1e-2 while the frozen gait keeps KL deceptively low.
+    lr_schedule: constant
+    kl_threshold: 0.01
+    score_to_win: 100000
+    max_epochs: 1500
+    save_best_after: 20
+    save_frequency: 50
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.1
+    horizon_length: 24
+    num_actors: 1024
+    minibatch_size: 6144
+    mini_epochs: 2
+    critic_coef: 1.0
+    clip_value: True
+    bounds_loss_coef: 0.0
+
+    env_config:
+      scene: examples/scenes/corridor_go2.nks
+      command: [0.5, 0.0, 0.0]
+      fixed_command: True
+      enable_contact_rewards: false
+      termination_height: 0.18
+      termination_tilt_deg: 120.0
+      episode_length_s: 20.0
+      spawn_x_range: [-0.55, -0.35]
+      forward_progress_scale: 15.0
+      progress_milestones: [0.35, 0.65, 1.4, 2.7, 3.5, 4.1, 4.65]
+      progress_milestone_bonus: 2.0
+      success_progress_m: 4.65
+      success_bonus: 100.0
+      fall_penalty: 20.0
