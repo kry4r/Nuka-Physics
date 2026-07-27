@@ -17,9 +17,8 @@ AGPL (inbound = outbound); there is no separate CLA at this time.
 
 ## Architecture
 
-Before proposing larger changes, read the architecture docs:
-
-- Architecture docs: [`docs/architecture/`](docs/architecture/)
+Before proposing larger changes, read the
+[architecture overview](docs/concepts/architecture.md).
 
 ## Building
 

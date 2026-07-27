@@ -125,7 +125,7 @@ with nuka.Device.create(0) as device:
 
 ## Documentation
 
-[Getting started](docs/getting-started.md) · [Architecture](docs/concepts/architecture.md) · [Differentiable simulation](docs/concepts/diff-sim.md) · [Isaac Lab compatibility](docs/concepts/isaaclab-compat.md) · [Go2 locomotion](docs/examples/go2_locomotion.md) · [System identification](docs/examples/system_identification.md)
+[Getting started](docs/getting-started.md) · [Architecture](docs/concepts/architecture.md) · [Isaac Lab compatibility](docs/concepts/isaaclab-compat.md)
 
 ## License
 

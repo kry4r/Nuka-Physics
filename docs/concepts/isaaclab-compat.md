@@ -1,101 +1,125 @@
-# Migrating from Isaac Lab
+# Isaac Lab compatibility
 
-Nuka targets the **RL-training subset** of an Isaac Lab / Isaac Gym workflow: a
-batched, GPU-resident vectorized environment that exposes observations and
-accepts actions through zero-copy tensors. This page maps the concepts and is
-honest about where parity is partial.
+Nuka provides the RL-training subset of an Isaac Lab manager-based workflow: a
+GPU-resident vectorized simulation, zero-copy tensors, composable MDP terms,
+masked reset, and a Gymnasium-compatible step loop.
 
-This is a **subset mapping, not a drop-in replacement.** Nuka does not reimplement
-the Isaac Lab Python API surface; it provides the equivalent capabilities for the
-parts that matter for on-GPU RL and adds differentiability and strong determinism
-on top.
+It is a migration layer, not a replacement for Omniverse Kit or the full Isaac
+Lab API.
 
 ## Concept mapping
 
-| Isaac Lab / Isaac Gym | Nuka equivalent |
-|------------------------|-----------------|
-| Simulation context / device | `nuka.Device.create(0)` |
-| Vectorized env (N parallel) | `nuka.World.create_from_scene(dev, scene, env_count=N)` — one cooked template, all envs on one GPU |
-| Scene / USD stage | `.usda` (text USD), MJCF (`.xml`), or URDF imported by the cooker (no OpenUSD SDK; no binary USD) |
-| Per-env reset / autoreset | `world.reset()` (all envs) / `world.reset_envs(env_ids)` (masked) |
-| Step | `world.step()` / `world.step_n(n)` |
-| Observation / state tensors | `world.buffer_view(field)` → zero-copy DLPack → `torch.from_dlpack(...)` |
-| Action application (PD targets) | write into `DRIVE_TARGET` slots `[1:]` (zero-copy in place) |
-| rl_games / gym vec-env adapter | shipped — see `examples/training/train_go2_ppo.py` |
+| Isaac Lab concept | Nuka equivalent |
+|---|---|
+| Simulation context | `nuka.isaaclab_compat.SimulationContext` |
+| Manager-based environment | `ManagerBasedRLEnv` + `ManagerBasedRLEnvCfg` |
+| Parallel scene instances | One `nuka.World` with `num_envs=N` |
+| Observation terms | `ObservationTerm` / `ObservationManager` |
+| Reward terms | `RewardTerm` / `RewardManager` |
+| Terminations and timeouts | `TerminationTerm` / `TerminationManager` |
+| Action processing | `ActionTerm` / `ActionManager` |
+| Command source | `CommandManager` |
+| Per-environment reset | `world.reset_envs(env_ids)` |
+| Tensor state access | `world.buffer_view(field)` via DLPack |
 
-## Zero-copy tensor interop
+## Simulation context
 
-Engine buffers are exposed as DLPack-capable CUDA arrays that alias the device
-memory with **no copy**. Both PyTorch and JAX consume them:
+`SimulationContext` owns a `nuka.Device` and `nuka.World` unless an existing
+device is supplied:
+
+```python
+from nuka.isaaclab_compat import SimulationContext
+
+sim = SimulationContext(
+    scene_path="examples/scenes/go2_locomotion.usda",
+    num_envs=4096,
+    dt=0.005,
+)
+try:
+    sim.step(4)
+    sim.sync()
+    sim.reset_envs([0, 7, 42])
+finally:
+    sim.close()
+```
+
+The compatibility package depends on PyTorch, but plain `import nuka` does not.
+
+## Zero-copy tensors
+
+State and drive buffers stay in CUDA memory:
 
 ```python
 import torch
-q   = torch.from_dlpack(world.buffer_view(nuka.JOINT_POSITION))   # zero-copy view
-tgt = torch.from_dlpack(world.buffer_view(nuka.DRIVE_TARGET))
-tgt[:, 1:].copy_(policy_actions)                                  # write actions in place
+import nuka
+
+q = torch.from_dlpack(world.buffer_view(nuka.JOINT_POSITION))
+target = torch.from_dlpack(world.buffer_view(nuka.DRIVE_TARGET))
+target[:, 1:].copy_(policy_actions)
 world.step()
 ```
 
-Key layout note that trips up newcomers: the `DRIVE_TARGET` / `JOINT_POSITION`
-buffers are `base_link_count` wide. **Slot 0 is the (inert) root link**; the
-actuated joints a policy controls occupy slots `[1:]`. So `action_dim ==
-base_link_count - 1` (12 for Go2), and you write a policy's
-`(env_count, action_dim)` tensor into `tgt[:, 1:]`.
+The tensors alias live engine memory. Slot `0` is the root; policy-controlled
+joints occupy slots `[1:]`. To keep PyTorch and physics on the same stream,
+create the device with `stream_ptr=nuka.torch_stream_ptr()`.
 
-To share ordering between torch ops and physics without explicit syncs, pin the
-engine to torch's current CUDA stream:
+## Manager-based environments
+
+`ManagerBasedRLEnvCfg` collects simulation timing and lists of term objects:
 
 ```python
-dev = nuka.Device.create(0, stream_ptr=nuka.torch_stream_ptr())
+from nuka.isaaclab_compat import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
+
+cfg = ManagerBasedRLEnvCfg(
+    scene_path="examples/scenes/go2_locomotion.usda",
+    num_envs=4096,
+    sim_dt=0.005,
+    decimation=4,
+    episode_length_s=20.0,
+    obs_terms=observation_terms,
+    reward_terms=reward_terms,
+    termination_terms=termination_terms,
+    action_term=action_term,
+)
+
+with ManagerBasedRLEnv(cfg) as env:
+    obs, info = env.reset()
+    obs, reward, terminated, truncated, info = env.step(actions)
 ```
 
-## What is compatible
+Term callbacks receive the environment and operate on CUDA tensors. The step
+order is action processing, `decimation` physics steps, observation/reward/
+termination evaluation, then masked autoreset.
 
-- **Large batched env counts on a single GPU** (4096+ for Go2), one cooked
-  template shared across all envs.
-- **Zero-copy observation/action tensors** for PyTorch *and* JAX.
-- **A working rl_games PPO pipeline** (the Go2 locomotion task) and a gymnasium
-  vec-env + engine-side per-env reset primitive.
-- **MJCF and URDF import** (the most common robot description formats), plus text
-  USD.
+## Supported migration surface
 
-## What differs (be aware)
+- Single-GPU batched environments and per-environment reset
+- Gymnasium five-value `step()` results
+- Manager-style observation, reward, termination, action, and command terms
+- Zero-copy PyTorch state and action buffers
+- rl_games integration through `examples/training/train_go2_ppo.py`
+- MJCF, URDF, text USD, and cooked NKS scene sources
 
-- **Strong determinism by default.** Isaac Lab / PhysX runs are not bit-exact
-  across runs; Nuka's D1 default is. (A D2 weak-determinism toggle is reserved at
-  the C ABI.) If you depend on the *exact* PhysX numerics, expect different —
-  though deterministic — results.
-- **Differentiability.** Nuka exposes a full analytical adjoint through rigid +
-  articulated dynamics (PhysX / Isaac Lab are not differentiable). This is a
-  *capability Nuka adds*, not a parity item — see [diff-sim](diff-sim.md). The
-  differentiable rollout path is single-env and contact-free in v0.5; the
-  floating-base orientation channel and d/dM, d/dJ contact channels are v0.7.
-- **No OpenUSD SDK.** Scene import is text USD (`.usda`), MJCF, and URDF only.
-  Binary `.usdc` / `.usdz` and the full OpenUSD stage API are not supported.
-- **Rendering.** Nuka ships an *optional* C++ offscreen Vulkan renderer; it is
-  not in the Python runtime. There is no Omniverse/RTX viewport. Sensors (IMU,
-  joint, lidar) run on GPU; RGB/depth/tactile/F-T sensors are v0.7.
-- **Physics breadth.** v0.5 is rigid + articulated only. Soft body, fluid, and
-  cross-system coupling are v0.7 (see the
-  [master plan](../plans/2026-05-28-nuka-physics-master-plan.md) §7).
-- **No Python-only deployment.** Nuka is a C++ engine with a stable C ABI; it is
-  designed to embed in a C++ host as well as drive from Python.
+## Important differences
 
-## Migrating an RL task — checklist
+- Nuka does not include Omniverse Kit, an RTX viewport, extensions, or the
+  complete Isaac Lab configuration hierarchy.
+- Physics results are Nuka's deterministic CUDA dynamics, not PhysX numerics.
+- Text USD is supported; binary `.usdc` and `.usdz` are not.
+- The manager compatibility layer is focused on RL. Scene authoring and beauty
+  rendering use `nuka.author` and `World.render_beauty` directly.
+- `ManagerBasedRLEnv` is intentionally small. Project-specific observations,
+  rewards, resets, curricula, and randomization remain task code.
 
-1. Convert the robot to MJCF / URDF / `.usda` (no binary USD).
-2. Replace the sim-context + vec-env construction with
-   `nuka.Device.create` + `nuka.World.create_from_scene(..., env_count=N)`.
-3. Replace observation reads with `torch.from_dlpack(world.buffer_view(field))`.
-4. Replace action application with an in-place `copy_` into `DRIVE_TARGET[:, 1:]`.
-5. Wire reset to `world.reset_envs(env_ids)` for the masked-autoreset path.
-6. Use the rl_games adapter in `examples/training/` as the reference integration.
+## Migration checklist
 
-## Compared to Brax / MJX
-
-Brax and MJX are differentiable, GPU-based RL simulators — closer to Nuka's
-diff-sim than Isaac Lab is. The distinction: Nuka uses a **full analytical
-reverse-mode adjoint** through Featherstone dynamics, whereas Brax's contact
-gradient is a **stop-gradient** approximation. Nuka also guarantees **strong
-(D1) bit-exact determinism**, which the JAX-XLA-based simulators do not promise
-across runs/hardware.
+1. Export the robot or scene as MJCF, URDF, text USD, or NKS.
+2. Replace the simulation context with `SimulationContext` or configure a
+   `ManagerBasedRLEnv`.
+3. Port observation, reward, termination, and action functions into term
+   callbacks that operate on CUDA tensors.
+4. Replace PhysX tensor access with DLPack views from `world.buffer_view(...)`.
+5. Write actions into `DRIVE_TARGET[:, 1:]` or provide an `ActionTerm`.
+6. Use `world.reset_envs(env_ids)` for masked reset behavior.
+7. Validate observation ordering, joint ordering, control rate, and reset
+   semantics before reusing an existing policy.
