@@ -1,79 +1,119 @@
-# Architecture overview
+# Architecture
 
-This is the high-level map of Nuka Physics. For the runtime internals see
-[Runtime overview](../architecture/runtime-overview.md); for the long-term
-architecture and version roadmap see the
-[master plan](../plans/2026-05-28-nuka-physics-master-plan.md).
+Nuka Physics is a C++/CUDA engine with a stable C ABI and thin Python bindings.
+Scenes are compiled once, simulation state remains on the GPU, and a fixed
+operation schedule advances one or thousands of environments.
 
-## Design stance
+![Nuka Physics architecture](../media/nuka-architecture.png)
 
-- **GPU-resident, CUDA-only production backend.** Simulation state lives on the
-  GPU and steps on the GPU. CUDA is the preferred and default production physics
-  backend, selected through the PHI (Platform Hardware Interface) layer.
-  High-level production APIs do **not** silently fall back to CPU; the CPU path
-  exists only as a reference/validation stepper and must be explicitly opted into
-  at the API boundary. There is no CPU production physics path.
-- **Strong (D1) determinism by default.** No floating-point atomics, fixed
-  reduction order in every physics path → bit-exact two-run reproducibility. A
-  physics-smell lint enforces the no-float-atomics rule on every PR. An opt-in
-  weak-determinism (D2) toggle is reserved at the C ABI for workloads that would
-  trade reproducibility for speed.
-- **Batched-by-template.** One cooked `WorldTemplate` is shared across thousands
-  of environments (e.g. 4096 Go2) on a single GPU, with GPU-resident broadphase,
-  contact generation, constraint solve, Featherstone ABA, and PD drives.
-- **Differentiable by construction.** The forward physics has a paired analytical
-  reverse-mode adjoint (see [diff-sim](diff-sim.md)).
+## Design rules
 
-## Layered modules
+- **GPU-resident production path.** CUDA owns simulation state and execution.
+  CPU implementations are reference and validation tools, never a silent
+  production fallback.
+- **D1 determinism.** Physics kernels use fixed ordering and avoid
+  floating-point atomics so identical inputs reproduce bit-for-bit.
+- **Batched by model.** Immutable cooked tables are shared while each
+  environment owns independent mutable state.
+- **One contact architecture.** Rigid, articulated, particle, deformable, and
+  continuum systems meet at shared contact-row and body-reaction boundaries.
+- **Explicit ownership.** Authoring, cooking, execution, readout, and rendering
+  are separate layers with narrow data contracts.
 
-| Layer | Modules | Description |
-|-------|---------|-------------|
-| **Core / Math** | `core`, `math` | Spatial algebra, vectors, quaternions, transforms |
-| **Scene** | `scene`, `import` | Scene IR, cooker, SceneGraph pipeline; MJCF / URDF / text-USD importers |
-| **Runtime** | `runtime`, `rigid`, `articulation` | CUDA single/batched world containers, batched contact/joint/drive solve, integrator, Featherstone ABA, PD drives |
-| **Collision** | `collision` | Broadphase (sweep-and-prune), narrow-phase (GJK/SAT), raycasting |
-| **Constraints / Solver** | `constraint`, `solver` | CSR universal constraint rows, contact manifolds, PGS solver |
-| **Diff-sim** | `diffsim` | Tape, gradient checkpointing, reverse-mode step adjoint, IFT contact gradient, self-written deterministic CG solver |
-| **Sensors** | `sensor` | CUDA single-world + batched IMU / state / lidar query paths (CPU helpers are reference-only) |
-| **PHI** | `phi` | GPU abstraction / backend selection layer (CUDA backend) |
-| **Rendering** *(optional)* | `render`, `apps`, `debug_draw` | Vulkan offscreen renderer + debug-draw overlays. Not part of the shipped Python runtime |
+## Scene to GPU
 
-## Scene import
+```text
+NKS / MJCF / URDF / text USD
+              |
+              v
+           SceneIR
+              |
+              v
+       CookSceneToModel
+        /            \
+  nk::Model        SceneMap
+      |                |
+      v                v
+  nk::World       RenderWorld
+      |
+      v
+  nk::Pipeline -> ordered PHI operations -> GPU state
+```
 
-Scenes import from three text formats:
+1. Importers normalize source formats into `scene::SceneIR`.
+2. `scene::cook::CookSceneToModel` resolves bodies, articulations, shapes,
+   media, materials, terrain, and capacities into immutable `nk::Model` tables.
+3. `SceneMap` preserves the relationship between authored entities and cooked
+   rows for rendering and tooling.
+4. `nk::World` uploads the model, allocates the mutable `nk::Data` arena, seeds
+   initial state, and owns the executable `nk::Pipeline`.
+5. PHI dispatches the fixed operation list to the CUDA backend.
 
-- **MJCF** (`.xml`) and **URDF** — parsed via tinyxml2 (statically linked).
-- **Text USD** (`.usda`) — parsed by a **hand-written, standard-library-only**
-  parser.
+`.nks` is the scene manifest used by current demos; paired `.nka` files carry
+packed assets. MJCF, URDF, and text USD can also enter the
+same cooker. Binary `.usdc` and `.usdz` are not supported.
 
-There is **no OpenUSD SDK dependency**, and **no binary `.usdc` / `.usdz`**
-support. The importers compile a scene into a SceneGraph / PhysicsWorld /
-RenderScene representation, which the cooker turns into the immutable
-`WorldTemplate` that batched simulation shares. See
-[Scene compiler pipeline](../architecture/scene-compiler.md).
+## Simulation pipeline
 
-## The constraint-row spine
+The exact operation list is derived from the cooked model, but the data flow is
+stable:
 
-All constraints (Featherstone joint, contact, drive) compile to a single
-CSR-like universal row format and run through a class-blind scheduler. The same
-row format carries the adjoint kernel identity, so the reverse pass is a property
-of the row catalog, not a parallel code path. This is the design hub that v0.7+
-extends with XPBD soft, PBF fluid, and cross-system coupling rows — see the
-master plan §3 (Rounds 3–7).
+```text
+state
+  -> broadphase / candidate pairs
+  -> narrowphase / contact streams
+  -> universal constraint and coupling rows
+  -> deterministic scheduling and solve
+  -> articulation and particle/continuum updates
+  -> integration
+  -> sensors, tensor views, and rendering
+```
 
-## What is and isn't here in v0.5
+Rigid and articulated dynamics use the same model and world as XPBD cloth,
+soft bodies, cables, PBF fluid, and MLS-MPM media. A `CouplingProvider` connects
+cross-system contacts to the shared row scheduler and body-side reaction sink;
+media-specific constitutive updates remain inside their own operators.
 
-- **Shipped:** rigid + articulated dynamics, batched RL forward sim, full
-  analytical adjoint through rigid + Featherstone, IFT contact gradient,
-  tape + checkpointing, sim-to-real noise (N1 + N2), self-written deterministic
-  sparse solver, PyTorch + JAX interop.
-- **Roadmap (v0.7+):** soft body (XPBD), fluid (PBF), rigid↔soft↔fluid coupling,
-  SDF cooker + Newton contact, LBVH broadphase, RGB/depth/tactile/F-T sensors.
+## Core objects
 
-## Embedding
+| Object | Responsibility |
+|---|---|
+| `scene::SceneIR` | Canonical authoring representation produced by importers and composition |
+| `nk::Model` | Immutable cooked tables, capacities, topology, materials, and schedules |
+| `nk::Data` | Mutable device arena for poses, velocities, rows, particles, grids, and readouts |
+| `nk::Pipeline` | Fixed ordered list of backend operations for one model |
+| `nk::World` | Lifetime boundary combining model, data, pipeline, stepping, reset, and buffer access |
+| `phi::Device` / `phi::OpCall` | Backend-neutral device ownership and operation dispatch |
+| `SceneMap` / `RenderWorld` | Authored-to-cooked mapping and render-facing scene state |
 
-Nuka is a C++ engine with a stable C ABI and nanobind Python bindings. It is
-designed to embed directly in a C++ host (the engine library is `libnuka`),
-rather than being a Python-only framework. The Python package is a thin
-re-export layer over the `_nuka_ext` extension. See the master plan §3 Round 8
-for the ABI / binding shape.
+## Repository map
+
+| Area | Modules |
+|---|---|
+| Engine model and execution | `src/nk`, `src/phi`, `src/runtime` |
+| Scene import and cooking | `src/scene`, `src/import` |
+| Contacts and solve | `src/collision`, `src/constraint`, `src/solver` |
+| Differentiation and generated kernels | `src/diffsim`, `src/codegen` |
+| Sensors and rendering | `src/sensor`, `src/render`, `src/rt` |
+| Stable integration boundary | `src/include/nuka`, `src/c_abi` |
+| Python bindings and authoring | `python/nuka`, `python/nuka/author` |
+| RL adapters and tasks | `python/nuka/gym`, `python/nuka/isaaclab_compat`, `python/nuka/tasks` |
+
+## Public integration layers
+
+- The C ABI in `src/include/nuka` is the stable embedding surface.
+- Nanobind exposes device, world, scene-builder, sensor, rendering, and buffer
+  APIs through `python/nuka`.
+- DLPack aliases engine buffers into PyTorch or JAX without host copies.
+- `nuka.author.Scene` is the high-level simulation assembler. Geometry,
+  constitutive material, appearance, and control remain separate inputs.
+- `nuka.gym` and `nuka.isaaclab_compat` build RL environments on the same world
+  and buffer contracts; they do not implement a second simulator.
+
+## Extending the engine
+
+New formats should terminate at `SceneIR`. New physical systems should declare
+their model/data storage, emit pipeline operations, and join the shared contact
+and coupling contracts. New backends implement PHI operations without changing
+the public world API. Scene-specific solver branches and implicit CPU fallback
+are outside the architecture.
