@@ -1,164 +1,132 @@
 # Nuka Physics
 
-<p align="center"><b>GPU-resident · bit-deterministic · differentiable CUDA physics for robotics &amp; large-scale RL.</b><br>
-<sub>Self-written end to end — no external physics or rendering SDK.</sub></p>
+<p align="center">
+  <strong>GPU-resident, bit-deterministic, differentiable CUDA physics.</strong><br>
+  One general solver for articulated robots, rigid bodies, cloth, soft bodies, and fluids.
+</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-AGPL--3.0%20%7C%20Commercial-blue" alt="license">
-  <img src="https://img.shields.io/badge/CUDA-12.8-76b900" alt="cuda">
-  <img src="https://img.shields.io/badge/platform-Linux-555" alt="platform">
-  <img src="https://img.shields.io/badge/determinism-D1%20bit--exact-success" alt="determinism">
+  <img src="https://img.shields.io/badge/CUDA-12.8-76b900" alt="CUDA 12.8">
+  <img src="https://img.shields.io/badge/determinism-D1%20bit--exact-222222" alt="D1 bit-exact determinism">
+  <img src="https://img.shields.io/badge/platform-Linux-555555" alt="Linux">
+  <img src="https://img.shields.io/badge/license-AGPL--3.0%20%7C%20Commercial-cd3c32" alt="AGPL-3.0 or Commercial">
 </p>
 
 <table align="center" width="100%">
 <tr>
 <td colspan="2" align="center">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots climbing procedural terrain"></a>
-  <br><sub>10 RL-trained Go2 <b>climb / descend / cross</b> procedural terrain on <b>one general contact solver</b> — self-written CUDA path tracer. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">▶ full 1080p video</a></sub>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots crossing procedural terrain"></a>
+  <br><b>Go2 Terrain</b> · RL locomotion on one general contact solver · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">1080p video</a>
 </td>
 </tr>
 <tr>
 <td colspan="2" align="center">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4"><img src="docs/media/go2_cloth_drape.gif" width="100%" alt="A square cloth drops from the air and drapes over a standing Go2 quadruped"></a>
-  <br><sub>A free square cloth flutters down through the air and <b>drapes over a standing Go2</b> — conforming to trunk, legs and feet through the <b>same general body↔particle solver</b> a foot uses on the ground, two-way, no clip-through. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">▶ full 1080p video</a></sub>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4"><img src="docs/media/go2_cloth_drape.gif" width="100%" alt="Cloth draping over a Go2 quadruped"></a>
+  <br><b>Cloth × Go2</b> · Two-way body-particle coupling · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">1080p video</a>
 </td>
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="A rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
-  <br><sub>A rigid Stanford bunny plunges into a <b>two-way MLS-MPM water pool</b> — crown splash, central jet, radiating ripples, then sinks. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">▶ full 1080p video</a></sub>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="Rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
+  <br><b>Bunny × Water</b> · Two-way MLS-MPM coupling · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">video</a>
 </td>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4"><img src="docs/media/jelly_ball_drop.gif" width="100%" alt="An MLS-MPM elastic jelly ball drops and squashes"></a>
-  <br><sub>An <b>MLS-MPM elastic jelly ball</b> drops, squashes, and rebounds — soft continuum two-way coupled to the ground on the <b>same general solver</b>, deterministic. <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">▶ full video</a></sub>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4"><img src="docs/media/jelly_ball_drop.gif" width="100%" alt="MLS-MPM elastic jelly ball dropping and rebounding"></a>
+  <br><b>Elastic Jelly</b> · Deterministic MLS-MPM · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">video</a>
 </td>
 </tr>
 </table>
 
 ## Why Nuka
 
-- **One GPU, thousands of articulated envs.** The same cooked world template steps thousands of environments GPU-resident — the substrate for large-scale RL.
-- **Strong (D1) determinism.** No FP atomics, fixed reduction order everywhere — re-running from the same inputs reproduces results *byte-for-byte* (enforced by a physics-smell lint on every PR).
-- **Differentiable.** A real analytical reverse-mode adjoint through rigid + articulated (Featherstone) dynamics — not a stop-gradient contact approximation. `jax.grad` and `loss.backward()` agree to engine round-off.
-- **One general contact path.** Robot↔ground and robot↔object are the same contact problem and run the same solver — no per-scene fast-paths.
-- **Self-written, no SDK.** CUDA solver, hand-written MJCF/URDF/USD importers, and a self-written CUDA two-level path tracer for offline beauty.
+- **GPU-resident at scale.** One cooked world template drives thousands of independent environments on one GPU.
+- **D1 deterministic.** Fixed reduction order and no floating-point atomics produce byte-for-byte repeatable runs.
+- **Differentiable.** Analytical reverse-mode adjoints cover rigid and articulated dynamics with PyTorch and JAX interop.
+- **One contact path.** Robot-ground, robot-object, rigid-particle, and continuum coupling share the same solver architecture.
+- **Self-written stack.** CUDA physics, importers, Vulkan rendering, and a CUDA path tracer, with no external physics or rendering SDK.
 
 ## Architecture
 
-```
- scene (.usda/.xml/.urdf/.nks)
-   → SceneIR  (compose · edit · settle)
-   → CookToModel  → nk::Model   (cooked constant tables, one general contact family)
-   → nk::World    (GPU-resident: Model uploaded once, Data arena, solve schedule)
-   → Pipeline     (fixed-order op list: AABB → LBVH → narrowphase → rows → solve → integrate)
-   → Step  (CUDA backend, PHI dispatch)        → Render  (Vulkan raster · CUDA path tracer)
-```
+<p align="center">
+  <img src="docs/media/nuka-architecture.png" width="100%" alt="Nuka Physics architecture: scene sources compile into a GPU-resident world, flow through one general contact path, and feed learning, sensors, and rendering">
+</p>
 
-| Module | Role |
-|---|---|
-| `nk` | Engine core — `Model` (cooked tables), `Data` (device arena), `Pipeline`, `World` (steppable), solve schedule (islands/coloring) |
-| `phi` | Backend abstraction + `backend_cuda` (all CUDA op kernels + the RT path) |
-| `collision` / `constraint` | LBVH broadphase, GJK/EPA + heightfield narrowphase, contact-row data model |
-| `scene` | Scene IR, ECS, `.nks`/`.nka` formats, `CookToModel`, terrain/heightfield |
-| `import` | MJCF / URDF / text-USD importers + cookers (XPBD, fluid, SDF) |
-| `diffsim` | Reverse-mode adjoint: tape, checkpointing, ABA-reverse, IFT contact gradient, self-written sparse solvers |
-| `render` / `rt` | Vulkan rasterizer (realtime) + CUDA two-level path tracer (offline beauty) |
-| `codegen` | Generated forward/adjoint kernels (XPBD distance/bend/volume/shape-match, Cosserat, SDF) |
-| `sensor` | Contact-wrench/ray/state sensors + Philox sim-to-real noise |
-
-**Pillars in code:** D1 determinism · self-written (no external SDK) · multi-backend PHI (CUDA today) · differentiable · ONE general contact path.
-
-## What works today
-
-| System | Status | Notes |
+| Layer | Core modules | Responsibility |
 |---|---|---|
-| Articulated multibody (Featherstone / ABA) | **Production** | drives the 4096-env Go2; CRBA/ABA, multi-articulation co-residence |
-| Rigid + general contact | **Production** | LBVH → narrowphase → block-island PGS + split-impulse; MJX-parity tested |
-| Terrain / heightfield + RL locomotion | **Production** | the climbing demo above; height-scan obs, PPO-trained |
-| Soft body — XPBD (distance/bend/volume/shape-match) | Functional | cloth + 3D tet; two-way coupled to rigid through the general solver; Cosserat rods forward-only (no adjoint yet); tested |
-| Fluid — Position-Based Fluids | Functional | density/viscosity/surface-tension; two-way coupled to rigid (foot-splash); tested |
-| MLS-MPM (material point method) | Functional | grid + APIC transfer + elastic + weakly-compressible **fluid** constitutive (Tait EOS); two-way rigid↔grid coupling on the same general path (the jelly-ball and bunny-in-water demos above); deterministic; granular (sand) in progress |
-| Rigid/articulation ↔ soft / fluid / cloth (two-way) | Functional | the general row solver emits rigid↔particle coupling rows — a foot pushes cloth, splashes fluid, dents a tet; one path; tested |
-| Differentiable sim (rigid + articulated) | Functional | analytical adjoint — **contact-free** path |
-| Rendering | Functional | Vulkan raster + self-written CUDA path tracer (sun/shadow/AO/GI/sky) |
-| RL / training | Functional | rl_games PPO, gym + Isaac-Lab-compat, zero-copy DLPack (torch/JAX) |
-| Scene import | Functional | MJCF, URDF, text-USD (hand-written, no OpenUSD) |
-| Sim-to-real noise | Functional | Philox4x32 sensor noise + domain randomization (off by default) |
+| Authoring | `scene`, `import` | NKS, MJCF, URDF, and text-USD → SceneIR → cooked model |
+| Simulation | `nk`, `collision`, `constraint` | GPU world, broadphase, narrowphase, universal rows, deterministic solve |
+| Systems | `diffsim`, `sensor`, `codegen` | Reverse-mode adjoint, sensor queries, generated forward/adjoint kernels |
+| Platform | `phi`, `render`, `rt` | CUDA backend, Vulkan raster, CUDA path tracer |
 
-## Toward rigid–soft–fluid coupling + multibody
+## Capabilities
 
-The north star is **one general solver that couples rigid, soft, fluid, and articulated multibody two-way**. Honest distance today:
+| System | Status |
+|---|---|
+| Rigid + articulated dynamics (Featherstone / ABA) | Production |
+| General contact + terrain / heightfields | Production |
+| XPBD cloth and soft bodies | Functional |
+| PBF fluid and MLS-MPM continuum | Functional |
+| Two-way rigid / articulation / particle coupling | Functional |
+| Differentiable rigid + articulated simulation | Functional, contact-free |
+| Batched RL, PyTorch, JAX, DLPack | Functional |
+| Vulkan raster + CUDA path tracing | Functional |
 
-- ✅ **Rigid + multibody, unified.** One general PGS path resolves rigid + articulation + static sides in a single kernel (MJX-parity). This pillar is *done*.
-- ✅ **Soft (XPBD cloth + 3D tet), fluid (PBF), and an MLS-MPM continuum lane step and co-reside** in one `nk::World` (shared step, density-scope isolation).
-- ✅ **Rigid/articulation ↔ soft / fluid / cloth is two-way through the one solver.** The general row assembly emits rigid↔particle coupling rows, so a foot pushes cloth, splashes fluid, and dents a tet *through the solver*. MLS-MPM couples as a first-class peer: a `CouplingProvider` funnels both contact-rows and grid-transfer into one body-side reaction sink, deterministically.
-- 🟡 **Coupled demo videos:** soft-ball slam ✅, bunny-in-water ✅, and cloth-onto-Go2 ✅ shipped (above); Go2-on-sand in progress. **MLS-MPM granular (sand)** is the next constitutive model.
-- ❌ **Differentiability does not extend through contact / coupling** yet.
+## Quick Start
 
-**Remaining gap:** add the MLS-MPM granular (Drucker–Prager) model for sand, land the polished coupled demo videos, then extend the adjoint through contact. The rigid + multibody + coupling spine is in; soft, fluid, and MPM all couple to it through the one path.
-
-## Roadmap
-
-- [x] Articulated multibody + general rigid contact (one solver)
-- [x] Terrain / heightfield locomotion + in-engine RL
-- [x] Soft (XPBD) and fluid (PBF) standalone + co-residence
-- [x] Self-written CUDA path-tracer beauty render
-- [x] **Rigid ↔ soft / fluid / cloth two-way coupling in the general solver** + rigid-coupling tests
-- [x] MLS-MPM (grid + APIC + elastic) two-way coupled to rigid on the one path
-- [ ] MLS-MPM granular (sand) + polished coupled demo videos (soft-slam · cloth-drape · water-pool · Go2-on-sand)
-- [ ] Differentiable contact (d/dM, d/dJ) + floating-base orientation channel
-- [ ] RT renderer speedup — denoiser + FP32 beauty TU (OptiX under evaluation)
-- [ ] Second PHI backend (multi-backend beyond CUDA)
-- [ ] PyPI wheel (`pip install nuka-physics`)
-
-## Quick start
-
-Built on **Linux** with **CUDA 12.8** and **g++-10**; a CUDA GPU is required for the production physics path.
+Linux, CUDA 12.8, g++-10, and a CUDA-capable GPU are required.
 
 ```bash
 export CC=gcc-10 CXX=g++-10
-cmake -S . -B build-cuda128 -DNK_BUILD_TESTS=ON -DNK_REQUIRE_CUDA=ON -DNK_PHYSICS_BACKEND=CUDA
+cmake -S . -B build-cuda128 \
+  -DNK_BUILD_TESTS=ON \
+  -DNK_REQUIRE_CUDA=ON \
+  -DNK_PHYSICS_BACKEND=CUDA
 cmake --build build-cuda128 -j
 pip install -e python
 ```
 
-**Train Go2 locomotion (forward sim):**
 ```bash
+# Train Go2 locomotion across 4096 environments
 CUDA_VISIBLE_DEVICES=0 python examples/training/train_go2_ppo.py --num_actors 4096
 ```
 
-**Backprop through the simulator** (link-mass gradient; the full example is [system identification](docs/examples/system_identification.md)):
+Differentiable rollout:
+
 ```python
-import torch, nuka
+import torch
+import nuka
 from nuka.autograd import differentiable_rollout
 
-with nuka.Device.create(0) as dev:
-    world = nuka.World.create_from_scene(dev, "examples/scenes/go2_system_id.usda", 1)
-    world.set_gravity_z(-9.81)
-    tape = nuka.Tape.create(world, checkpoint_interval=3, max_tape_entries=4096,
-                            max_checkpoints=512, recompute_on_backward=1)
-    mass = torch.nn.Parameter(torch.tensor([0.9], device="cuda"))   # one thigh link
+with nuka.Device.create(0) as device:
+    world = nuka.World.create_from_scene(
+        device, "examples/scenes/go2_system_id.usda", 1
+    )
+    tape = nuka.Tape.create(world, checkpoint_interval=3)
+    mass = torch.nn.Parameter(torch.tensor([0.9], device="cuda"))
     actions = torch.zeros(30, world.base_link_count - 1, device="cuda")
-    obs = differentiable_rollout(world, tape, actions, params=mass,
-                                 param_link_indices=[2], obs="qdot")
-    obs.pow(2).mean().backward()
-    print("dLoss/dmass =", mass.grad.item())
-    tape.destroy(); world.destroy()
+    obs = differentiable_rollout(
+        world,
+        tape,
+        actions,
+        params=mass,
+        param_link_indices=[2],
+        obs="qdot",
+    )
+    obs.square().mean().backward()
+    tape.destroy()
+    world.destroy()
 ```
-The differentiable path is single-env and contact-free; build a fresh world+tape per evaluation (cheap).
+
+## Next
+
+- MLS-MPM granular materials and polished coupled scenes
+- Differentiable contact and coupling
+- A second PHI backend and packaged Python wheels
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) · [Architecture](docs/concepts/architecture.md) · [Differentiable simulation](docs/concepts/diff-sim.md) · [Migrating from Isaac Lab](docs/concepts/isaaclab-compat.md)
-- Examples: [Go2 locomotion](docs/examples/go2_locomotion.md) · [System identification](docs/examples/system_identification.md)
-- Deep dives: [runtime](docs/architecture/runtime-overview.md) · [diff-sim tape](docs/architecture/diffsim-tape.md) · [scene compiler](docs/architecture/scene-compiler.md)
+[Getting started](docs/getting-started.md) · [Architecture](docs/concepts/architecture.md) · [Differentiable simulation](docs/concepts/diff-sim.md) · [Isaac Lab compatibility](docs/concepts/isaaclab-compat.md) · [Go2 locomotion](docs/examples/go2_locomotion.md) · [System identification](docs/examples/system_identification.md)
 
-## Scene import
+## License
 
-Imports **MJCF** (`.xml`), **URDF**, and **text USD** (`.usda`). The `.usda` parser is hand-written using only the C++ standard library — no OpenUSD dependency, no binary `.usdc`/`.usdz`. See [NOTICE](NOTICE).
-
-## Contributing &amp; License
-
-Contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Security: [SECURITY.md](SECURITY.md).
-
-**Dual-licensed: [AGPL-3.0](LICENSE) (open source) or a commercial license** for closed-source / proprietary use. See [LICENSING.md](LICENSING.md) and [NOTICE](NOTICE).
+Nuka Physics is dual-licensed under [AGPL-3.0](LICENSE) or a [commercial license](LICENSING.md). See [NOTICE](NOTICE), [CONTRIBUTING.md](CONTRIBUTING.md), and [SECURITY.md](SECURITY.md).
