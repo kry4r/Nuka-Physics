@@ -1,0 +1,88 @@
+# Media-on continuation for the final Go2 one-shot scene.  The coarse scene keeps
+# the same XPBD cloth, MLS-MPM gravel/debris, and XPBD cable/slab interactions as
+# the beauty scene while reducing granular particle density/substeps for PPO.
+params:
+  seed: 11
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: True
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: -2.0
+        fixed_sigma: True
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  config:
+    name: go2_corridor_teacher_v5_media
+    full_experiment_name: go2_corridor_teacher_v5_media
+    env_name: nuka_go2_corridor_teacher
+    multi_gpu: False
+    mixed_precision: False
+    normalize_input: False
+    normalize_value: True
+    normalize_advantage: True
+    value_bootstrap: True
+    use_smooth_clamp: True
+    clip_actions: False
+    nuka_go2_prior_adapter_only: False
+    reward_shaper:
+      scale_value: 1.0
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 1.0e-5
+    lr_schedule: constant
+    kl_threshold: 0.01
+    score_to_win: 100000
+    max_epochs: 300
+    save_best_after: 10
+    save_frequency: 25
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.1
+    horizon_length: 24
+    num_actors: 64
+    minibatch_size: 768
+    mini_epochs: 2
+    critic_coef: 1.0
+    clip_value: True
+    bounds_loss_coef: 0.0
+
+    env_config:
+      scene: examples/scenes/go2_oneshot_training_coarse.nks
+      use_scene_builder: true
+      scene_build_kwargs: {bake_link_sdf: true}
+      command: [0.50, 0.0, 0.0]
+      fixed_command: True
+      enable_contact_rewards: false
+      termination_height: 0.14
+      termination_tilt_deg: 100.0
+      episode_length_s: 24.0
+      spawn_x_range: [-0.47, -0.43]
+      forward_progress_scale: 30.0
+      progress_milestones: [0.35, 0.65, 0.9, 1.2, 1.8, 2.6, 3.4, 4.3]
+      progress_milestone_bonus: 8.0
+      success_x: 3.90
+      success_progress_m: 0.0
+      success_bonus: 200.0
+      fall_penalty: 20.0

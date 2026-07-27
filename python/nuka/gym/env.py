@@ -68,6 +68,12 @@ class NukaGymEnv:
         byte-identical to the legacy path). The per-env terrain TYPE/DIFFICULTY are
         written separately via the engine ``ENV_TERRAIN_TYPE``/``ENV_TERRAIN_DIFFICULTY``
         buffer views (see :class:`~nuka.tasks.go2_locomotion.Go2LocomotionEnv`).
+    use_scene_builder : bool
+        Build through :class:`nuka.SceneBuilder` instead of the legacy
+        ``World.create_from_scene`` entry. Required for complete rigid+media NKS
+        scenes; false by default so established rigid/terrain runs are unchanged.
+    scene_build_kwargs : dict | None
+        Extra keyword arguments forwarded to ``SceneBuilder.build``.
     """
 
     metadata = {"render_modes": []}
@@ -86,6 +92,8 @@ class NukaGymEnv:
         episode_length_s: float = 20.0,
         seed: int | None = None,
         terrain_create: "dict | None" = None,
+        use_scene_builder: bool = False,
+        scene_build_kwargs: "dict | None" = None,
     ) -> None:
         self.num_envs = int(num_envs)
         self.decimation = int(decimation)
@@ -106,9 +114,22 @@ class NukaGymEnv:
         # kwargs all default to 0.0 in the binding == flat). This is purely additive:
         # the flat training path passes nothing and is unaffected.
         terrain_kw = dict(terrain_create) if terrain_create else {}
-        self._world = nuka.World.create_from_scene(
-            self._device, scene, self.num_envs, self.dt, **terrain_kw
-        )
+        if use_scene_builder:
+            if terrain_kw:
+                raise ValueError(
+                    "use_scene_builder and terrain_create are mutually exclusive")
+            builder = nuka.SceneBuilder.create(scene)
+            try:
+                build_kw = dict(scene_build_kwargs or {})
+                self._world = builder.build(
+                    self._device, env_count=self.num_envs, dt=self.dt,
+                    control_mode=0, **build_kw)
+            finally:
+                builder.destroy()
+        else:
+            self._world = nuka.World.create_from_scene(
+                self._device, scene, self.num_envs, self.dt, **terrain_kw
+            )
         assert self._world.action_dim == G.GO2_ACTION_DIM, (
             f"NukaGymEnv expects a 12-DOF Go2 (action_dim=12), got "
             f"{self._world.action_dim}"

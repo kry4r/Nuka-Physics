@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import yaml
 
@@ -123,6 +124,92 @@ class StdoutAlgoObserver(DefaultAlgoObserver):
         print(f"[metrics] observer attached (writer={'real' if self._shim._writer else 'none'}; "
               f"terrain_curriculum={'on' if self._curriculum is not None else 'off'})",
               flush=True)
+        self._actor_adapter_hooks = []
+        prior_adapter_only = bool(
+            algo.config.get("nuka_go2_prior_adapter_only", False))
+        actor_head_only = bool(algo.config.get("nuka_go2_actor_head_only", False))
+        last_obs_adapter_only = bool(
+            algo.config.get("nuka_go2_last_obs_adapter_only", False))
+        if sum((prior_adapter_only, actor_head_only, last_obs_adapter_only)) > 1:
+            raise RuntimeError(
+                "Go2 adapter/head training modes are mutually exclusive")
+        if bool(algo.config.get("nuka_go2_freeze_sigma", False)):
+            sigma = None
+            for name, param in algo.model.named_parameters():
+                if name == "a2c_network.sigma":
+                    param.requires_grad_(False)
+                    sigma = param
+                    break
+            if sigma is None:
+                raise RuntimeError("nuka_go2_freeze_sigma requested but sigma is missing")
+            print("[go2_policy] frozen fixed action sigma", flush=True)
+        if actor_head_only:
+            frozen = []
+            trainable_head = []
+            for name, param in algo.model.named_parameters():
+                if name.startswith("a2c_network.actor_mlp."):
+                    param.requires_grad_(False)
+                    frozen.append(name)
+                elif name.startswith("a2c_network.mu."):
+                    trainable_head.append(name)
+            if not frozen or not trainable_head:
+                raise RuntimeError(
+                    "nuka_go2_actor_head_only could not find actor body/mu head")
+            print(
+                f"[go2_policy] actor-head-only: froze {len(frozen)} actor-body "
+                f"parameters; train {trainable_head}; critic remains trainable",
+                flush=True,
+            )
+        if last_obs_adapter_only:
+            actor_first = None
+            frozen = []
+            for name, param in algo.model.named_parameters():
+                if name == "a2c_network.actor_mlp.0.weight":
+                    actor_first = param
+                elif (name.startswith("a2c_network.actor_mlp.")
+                      or name.startswith("a2c_network.mu.")
+                      or name == "a2c_network.sigma"):
+                    param.requires_grad_(False)
+                    frozen.append(name)
+            if actor_first is None or actor_first.shape[1] < 2:
+                raise RuntimeError(
+                    "last-observation adapter mode requires actor first-layer input")
+            mask = actor_first.new_zeros(actor_first.shape)
+            mask[:, -1] = 1.0
+            self._actor_adapter_hooks.append(
+                actor_first.register_hook(lambda grad, m=mask: grad * m))
+            print(
+                f"[go2_slab_adapter] train only actor input column "
+                f"{actor_first.shape[1] - 1}; freeze {len(frozen)} gait "
+                "parameters; critic remains trainable",
+                flush=True,
+            )
+        if prior_adapter_only:
+            from nuka.tasks.go2_obs import GO2_OBS_DIM
+
+            actor_first = None
+            frozen = []
+            for name, param in algo.model.named_parameters():
+                if name == "a2c_network.actor_mlp.0.weight":
+                    actor_first = param
+                elif (name.startswith("a2c_network.actor_mlp.")
+                      or name.startswith("a2c_network.mu.")
+                      or name == "a2c_network.sigma"):
+                    param.requires_grad_(False)
+                    frozen.append(name)
+            if actor_first is None or actor_first.shape[1] <= GO2_OBS_DIM:
+                raise RuntimeError(
+                    "prior adapter mode requires an expanded Go2 actor input")
+            mask = actor_first.new_zeros(actor_first.shape)
+            mask[:, GO2_OBS_DIM:] = 1.0
+            self._actor_adapter_hooks.append(
+                actor_first.register_hook(lambda grad, m=mask: grad * m))
+            print(
+                f"[go2_prior_adapter] train actor first-layer columns "
+                f"{GO2_OBS_DIM}:{actor_first.shape[1]}; freeze "
+                f"{len(frozen)} gait parameters; critic remains trainable",
+                flush=True,
+            )
 
     def after_print_stats(self, frame, epoch_num, total_time):
         super().after_print_stats(frame, epoch_num, total_time)
@@ -268,6 +355,43 @@ def _apply_overrides(params: dict, args: argparse.Namespace) -> dict:
     return params
 
 
+def _deployment_contract(checkpoint_path: str) -> dict | None:
+    """Copy only deployment behavior from a warm-start checkpoint."""
+    import torch
+
+    from nuka.rl_games.go2_policy import CONTRACT_KEY, load_contract
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if CONTRACT_KEY not in checkpoint:
+        return None
+    source = load_contract(checkpoint)
+    return {
+        "version": 1,
+        "provenance": f"rl_games fine-tune from: {source.provenance}",
+        "normalize_input": source.normalize_input,
+        "action_postprocess": source.action_postprocess,
+    }
+
+
+def _annotate_saved_checkpoints(train_dir: str, experiment_name: str,
+                                contract: dict | None) -> int:
+    """Persist the deployment contract that rl_games otherwise discards."""
+    if contract is None:
+        return 0
+    import torch
+
+    from nuka.rl_games.go2_policy import CONTRACT_KEY
+
+    nn_dir = Path(train_dir) / experiment_name / "nn"
+    count = 0
+    for path in sorted(nn_dir.glob("*.pth")):
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint[CONTRACT_KEY] = dict(contract)
+        torch.save(checkpoint, path)
+        count += 1
+    return count
+
+
 def main(argv=None) -> int:
     args = _build_argparser().parse_args(argv)
 
@@ -288,6 +412,8 @@ def main(argv=None) -> int:
     params = _apply_overrides(params, args)
 
     cfg = params["config"]
+    deployment_contract = (
+        _deployment_contract(args.checkpoint) if args.checkpoint else None)
     print(f"[train_go2_ppo] env_name={cfg['env_name']} num_actors={cfg['num_actors']} "
           f"horizon={cfg['horizon_length']} minibatch={cfg['minibatch_size']} "
           f"mini_epochs={cfg['mini_epochs']} max_epochs={cfg['max_epochs']} "
@@ -319,6 +445,12 @@ def main(argv=None) -> int:
         print(f"[train_go2_ppo] WARM-START from checkpoint {args.checkpoint}",
               flush=True)
     runner.run(run_args)
+    annotated = _annotate_saved_checkpoints(
+        cfg.get("train_dir", "runs"), cfg["full_experiment_name"],
+        deployment_contract)
+    if annotated:
+        print(f"[train_go2_ppo] annotated deployment contract on "
+              f"{annotated} checkpoint(s)", flush=True)
     print("[train_go2_ppo] run() returned cleanly.", flush=True)
     return 0
 

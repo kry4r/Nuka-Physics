@@ -21,41 +21,32 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
+from nuka.rl_games.go2_policy import (
+    actor_mu,
+    load_contract,
+    plain_model_state,
+    postprocess_action,
+)
 from nuka.tasks import go2_obs as G
 from nuka.tasks.go2_corridor import CORRIDOR_SCENE, make_env
 
 
-def _load_teacher_actor(path: str):
+def _load_teacher_actor(path: str, device):
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    state = {}
-    for key, value in checkpoint["model"].items():
-        if key.startswith("_orig_mod."):
-            key = key[len("_orig_mod."):]
-        state[key] = value
+    state = {
+        key: value.to(device) if torch.is_tensor(value) else value
+        for key, value in plain_model_state(checkpoint).items()
+    }
+    contract = load_contract(checkpoint)
     epoch = checkpoint.get("epoch")
     reward = checkpoint.get("last_mean_rewards")
     return (
         state,
+        contract,
         None if epoch is None else int(epoch),
         None if reward is None else float(reward),
     )
-
-
-def _teacher_mu(state: dict, obs: torch.Tensor, dev) -> torch.Tensor:
-    mean = state["running_mean_std.running_mean"].to(dev).float()
-    var = state["running_mean_std.running_var"].to(dev).float()
-    x = torch.clamp((obs.float() - mean) / torch.sqrt(var + 1.0e-5), -5.0, 5.0)
-    for index in (0, 2, 4):
-        x = F.elu(F.linear(
-            x,
-            state[f"a2c_network.actor_mlp.{index}.weight"].to(dev),
-            state[f"a2c_network.actor_mlp.{index}.bias"].to(dev)))
-    return F.linear(
-        x,
-        state["a2c_network.mu.weight"].to(dev),
-        state["a2c_network.mu.bias"].to(dev))
 
 
 def run(args) -> dict:
@@ -83,7 +74,12 @@ def run(args) -> dict:
         **spawn_kwargs,
     )
     try:
-        state, epoch, checkpoint_reward = _load_teacher_actor(args.checkpoint)
+        state, contract, epoch, checkpoint_reward = _load_teacher_actor(
+            args.checkpoint, env._dev)
+        obs_dim = int(state["a2c_network.actor_mlp.0.weight"].shape[1])
+        if obs_dim != env.teacher_obs_dim:
+            raise ValueError(
+                f"checkpoint obs dim {obs_dim}, expected {env.teacher_obs_dim}")
         # Ablation replaces the forward height-profile block with its flat-ground
         # value (all step differences zero), keeping proprio + local trunk clearance.
         priv_start = G.GO2_OBS_DIM + 1
@@ -114,10 +110,20 @@ def run(args) -> dict:
                 vx_sum[active] += vx[active]
                 sample_count[active] += 1.0
 
-                normal_mu = _teacher_mu(state, obs, env._dev).clamp(-1.0, 1.0)
+                normal_mu = postprocess_action(
+                    actor_mu(
+                        state, obs,
+                        normalize_input=contract.normalize_input),
+                    contract,
+                )
                 zero_obs = obs.clone()
                 zero_obs[:, priv_start:] = 0.0
-                zero_mu = _teacher_mu(state, zero_obs, env._dev).clamp(-1.0, 1.0)
+                zero_mu = postprocess_action(
+                    actor_mu(
+                        state, zero_obs,
+                        normalize_input=contract.normalize_input),
+                    contract,
+                )
                 delta = (normal_mu - zero_mu).abs()
                 action_zero_abs_sum[active] += delta[active].mean(dim=1)
                 action_zero_abs_max[active] = torch.maximum(
@@ -147,11 +153,15 @@ def run(args) -> dict:
         first_clear = max_x >= args.first_clear_x
         two_step_clear = max_x >= args.two_step_clear_x
         reached = max_x >= args.reach_x
+        best_env = int(max_x.argmax().item())
         result = {
             "policy": "teacher",
             "checkpoint": args.checkpoint,
             "checkpoint_epoch": epoch,
             "checkpoint_reward": checkpoint_reward,
+            "policy_provenance": contract.provenance,
+            "normalize_input": contract.normalize_input,
+            "action_postprocess": contract.action_postprocess,
             "drive_depth": args.drive_depth,
             "spawn_window": bool(args.spawn_window),
             "seed": args.seed,
@@ -162,6 +172,11 @@ def run(args) -> dict:
             "spawn_x_min": float(spawn_x.min()),
             "spawn_x_max": float(spawn_x.max()),
             "furthest_x": float(max_x.max()),
+            "best_env": best_env,
+            "best_spawn_x": float(spawn_x[best_env]),
+            "best_last_x": float(last_x[best_env]),
+            "best_fell": bool(ever_fell[best_env]),
+            "best_succeeded": bool(ever_succeeded[best_env]),
             "mean_max_x": float(max_x.mean()),
             "median_max_x": float(max_x.median()),
             "mean_progress": float((max_x - spawn_x).mean()),
@@ -209,8 +224,8 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--command-vx", type=float, default=0.4)
-    parser.add_argument("--spawn-x-low", type=float, default=-0.32)
-    parser.add_argument("--spawn-x-high", type=float, default=-0.12)
+    parser.add_argument("--spawn-x-low", type=float, default=-0.55)
+    parser.add_argument("--spawn-x-high", type=float, default=-0.35)
     parser.add_argument("--termination-height", type=float, default=0.25)
     parser.add_argument("--termination-tilt-deg", type=float, default=60.0)
     parser.add_argument("--drive-depth", choices=("normal", "zero"), default="normal")
@@ -222,8 +237,8 @@ def main() -> int:
     # at x=0.10 and x=0.26.  They are policy gates, not collision geometry.
     parser.add_argument("--first-clear-x", type=float, default=0.15)
     parser.add_argument("--two-step-clear-x", type=float, default=0.45)
-    parser.add_argument("--reach-x", type=float, default=0.90)
-    parser.add_argument("--success-progress-m", type=float, default=1.20)
+    parser.add_argument("--reach-x", type=float, default=4.05)
+    parser.add_argument("--success-progress-m", type=float, default=4.65)
     parser.add_argument("--min-action-depth-delta", type=float, default=1.0e-4)
     parser.add_argument("--max-fall-rate", type=float, default=0.10)
     parser.add_argument("--min-two-step-rate", type=float, default=0.90)
