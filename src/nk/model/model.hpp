@@ -19,6 +19,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "nk/contact/contact_profile.hpp"
 #include "phi/backend.hpp"   // phi::ModelView, BufferType, Buffer (forward + wrappers)
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/generated/arena_layout.hpp"
@@ -45,6 +46,7 @@ struct ModelCapacities {
     uint32_t bodies_per_env  = 0;   // movable rigid body count / env.
     uint32_t max_contacts_per_env = 0;  // contact-slot capacity / env.
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
+    uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
     uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
     uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
     uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
@@ -134,6 +136,9 @@ struct ModelArticulation {
     std::vector<float>            joint_damping;
     std::vector<float>            joint_armature;
     std::vector<float>            joint_frictionloss;    // MuJoCo joint dry friction bound
+    std::vector<float>            joint_limit_lower;
+    std::vector<float>            joint_limit_upper;
+    std::vector<uint8_t>          joint_limit_flags;     // bit0 lower, bit1 upper
     std::vector<float>            initial_q;             // per LINK (scalar slot per link)
     std::vector<math::Transform>  initial_link_pose;     // cook rest pose per link
     // M4 (union family): the SETTLED initial velocity state (the legacy
@@ -211,27 +216,25 @@ struct ModelShape {
     uint32_t         sdf_index = ~uint32_t(0);
 };
 
-// Named lanes of a physics-material bucket row (the per-shape contact contract).
-// Positional indices into ModelMaterialBucket::values; kBucketSlotCount is the
-// row width (mat_buckets device field = num_buckets x kBucketSlotCount, plan §3.3).
-enum BucketSlot : uint32_t {
-    kBucketStaticMu    = 0u,  // static friction μs
-    kBucketDynamicMu   = 1u,  // dynamic friction μd
-    kBucketRestitution = 2u,  // restitution (cooked from the authored material)
-    kBucketTimeconst   = 3u,  // solref[0] (contact timeconst)
-    kBucketDampratio   = 4u,  // solref[1] (contact dampratio)
-    kBucketDensity     = 5u,  // material density
-    kBucketMargin      = 6u,  // contact margin
-    kBucketReserved    = 7u,  // reserved lane
-    kBucketSlotCount   = 8u,  // row width (== values[] extent)
+// Compatibility aliases for hand-built models. Production contact reads the
+// complete ContactProfileV1 record through the represented collidable.
+inline constexpr uint32_t kBucketStaticMu = kContactProfileMu1;
+inline constexpr uint32_t kBucketDynamicMu = kContactProfileMu2;
+inline constexpr uint32_t kBucketDensity = kContactProfileFlags;
+
+struct ModelMaterialBucket {
+    static constexpr uint32_t kValueCount = kContactProfileWordCount;
+    float values[kValueCount];
+
+    ModelMaterialBucket() { PackContactProfile(ContactProfileV1{}, values); }
+    explicit ModelMaterialBucket(const ContactProfileV1& profile) {
+        PackContactProfile(profile, values);
+    }
+    ContactProfileV1 Profile() const { return UnpackContactProfile(values); }
 };
 
-// A physics-material bucket row (kBucketSlotCount floats; lanes named by
-// BucketSlot). The mat_buckets device field is num_buckets x kBucketSlotCount.
-struct ModelMaterialBucket {
-    static constexpr uint32_t kValueCount = kBucketSlotCount;  // floats per row.
-    float values[kValueCount] = {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 1000.0f, 0.005f, 0.0f};
-};
+bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
+                                         ModelMaterialBucket* canonical);
 
 // One MLS-MPM material: elastic moduli + Drucker-Prager params + weakly-compressible
 // fluid params, indexed by the per-particle material id. model_kind selects which
@@ -533,6 +536,7 @@ public:
         // a NO-OP for a hull-free scene (go2: every row keeps the default 0).
         uint32_t   hull_vert_offset = 0; // base vertex index into hull_verts/3.
         uint32_t   hull_vert_count  = 0; // vertex count (0 == not a hull row).
+        uint32_t   contact_profile_index = 0; // ContactProfileV1 table row.
     };
     std::vector<PairDrivenShape> shape_table_rows;
     std::vector<float>           samp_points;     // xyz packed.

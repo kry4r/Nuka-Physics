@@ -114,6 +114,8 @@ private:
     phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};
     phi::BuildSolveIslandsParams      p_islands_{};  // dynamic CC solve schedule
+    phi::ContactWarmStartParams       p_warm_start_prepare_{};
+    phi::ContactWarmStartParams       p_warm_start_commit_{};
     phi::SolveRowsBlockIslandParams   p_solve_{};
     phi::AeroDragParams               p_aero_drag_{};
     phi::ParticlePredictParams        p_part_predict_{};

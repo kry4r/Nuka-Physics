@@ -90,7 +90,7 @@ fields:
   # per co-resident dog at m_inv[articulation*max_dof^2]). K==1 collapses to env_dof2.
   - {name: m_inv,         dtype: f32,       per: articulation_dof2, arena: scratch, owner: data}
   - {name: particle_pos,  dtype: vec3,      per: particle,     arena: persistent, owner: data,  flags: [diff]}
-  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*8", arena: persistent, owner: data, flags: [param]}
+  - {name: mat_buckets,   dtype: f32,       per: scalar, count: "num_buckets*16", arena: persistent, owner: data, flags: [param]}
   - {name: mat_index,     dtype: u32,       per: body,         arena: persistent, owner: data,  flags: [param]}
   - {name: link_contact_wrench, dtype: spatial6, per: link,    arena: scratch,    owner: data,  flags: [readout]}
 
@@ -226,7 +226,7 @@ fields:
   # indexing textually identical).
   - {name: contact_tangent1,dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
   - {name: contact_tangent2,dtype: vec3, per: contact_slot,  arena: scratch, owner: data}
-  - {name: contact_material,dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
+  - {name: contact_material,dtype: u64,  per: contact_slot,  arena: scratch, owner: data}
   # Per-contact chain Jacobians (legacy jac_normal_/jac_tangent1_/jac_tangent2_,
   # [slot * dof_stride] row-major) + per-contact effective masses (legacy
   # meff_*_). per:slot_dof = max_contacts_per_env x dofs_per_env.
@@ -334,7 +334,7 @@ fields:
   # is its live length (a scalar staged into mat-bucket-style header — kept as a
   # 1-row table so the op reads the count device-side without a host param).
   # =========================================================================
-  - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*12",      arena: persistent, owner: model}
+  - {name: shape_table,      dtype: f32, per: scalar, count: "max_bodies_total*13",      arena: persistent, owner: model}
   - {name: excluded_pairs,   dtype: u64, per: scalar, count: "max_excluded_pairs",       arena: persistent, owner: model}
 
   # =========================================================================
@@ -847,3 +847,39 @@ fields:
   # =========================================================================
   - {name: body_collidable_link,  dtype: u32,       per: body, arena: persistent, owner: model}
   - {name: body_collidable_local, dtype: transform, per: body, arena: persistent, owner: model}
+
+  # Canonical contact identity for the shared narrowphase-to-solver boundary.
+  - {name: ucontact_id_pair, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_id_feature, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
+
+  # Contact warm-start state. Persistent across steps and explicitly cleared by
+  # reset/restore; each contact point stores one normal and two signed tangential impulses.
+  - {name: contact_cache_pair, dtype: u64, per: contact_slot, arena: persistent, owner: data, elem: 4}
+  - {name: contact_cache_feature, dtype: u64, per: contact_slot, arena: persistent, owner: data, elem: 4}
+  - {name: contact_cache_lambda, dtype: f32, per: contact_slot, arena: persistent, owner: data, elem: 12}
+  - {name: contact_cache_normal, dtype: vec3, per: contact_slot, arena: persistent, owner: data, elem: 4}
+  - {name: contact_cache_tangent1, dtype: vec3, per: contact_slot, arena: persistent, owner: data, elem: 4}
+  - {name: contact_cache_tangent2, dtype: vec3, per: contact_slot, arena: persistent, owner: data, elem: 4}
+  - {name: contact_cache_material, dtype: u64, per: contact_slot, arena: persistent, owner: data, elem: 4}
+  - {name: contact_cache_age, dtype: u32, per: contact_slot, arena: persistent, owner: data, elem: 4}
+
+  # Scratch snapshot and ownership masks for deterministic parallel cache rebuild.
+  - {name: contact_cache_snapshot_pair, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_snapshot_feature, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_snapshot_lambda, dtype: f32, per: contact_slot, arena: scratch, owner: data, elem: 12}
+  - {name: contact_cache_snapshot_normal, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_snapshot_tangent1, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_snapshot_tangent2, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_snapshot_material, dtype: u64, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_snapshot_age, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_current_owner, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: contact_cache_old_keep, dtype: u32, per: contact_slot, arena: scratch, owner: data, elem: 4}
+
+  # Authored one-sided articulation bounds and independent solver telemetry.
+  - {name: joint_limit_lower, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
+  - {name: joint_limit_upper, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
+  - {name: joint_limit_flags, dtype: u8,  per: link, arena: persistent, owner: model, flags: [param]}
+  - {name: joint_limit_impulse, dtype: f32, per: link, arena: scratch, owner: data, elem: 2, flags: [readout]}
+  - {name: actuator_effort_requested, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
+  - {name: actuator_effort, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
+  - {name: actuator_saturated, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}

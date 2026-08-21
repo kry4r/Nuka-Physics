@@ -24,6 +24,8 @@
 #include <cuda_runtime.h>
 
 #include "constraint/solref_solimp.hpp"  // ComputeCompliantRow (HD)
+#include "nk/contact/contact_profile.hpp"
+#include "scene/contact_filter.hpp"
 #include "math/cuda_vec_ops.cuh"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
@@ -40,28 +42,63 @@ using namespace ::nuka::phi::nkops;
 constexpr uint32_t kInvalidLink = ~0u;
 constexpr float kFltMax = 3.402823466e+38f;
 
-// Per-shape material lives in mat_buckets (8 f32/bucket) keyed per body row by
-// mat_index. Lane meaning mirrors ModelMaterialBucket (cook side):
-// [0]=static mu [1]=dynamic mu [2]=restitution [3]=solref timeconst
-// [4]=solref dampratio [5]=density [6]=sdf cell [7]=reserved.
-constexpr uint32_t kMatBucketStride = 8u;
-constexpr uint32_t kMatLaneFriction = 0u;
-constexpr uint32_t kMatLaneSolref0 = 3u;
-constexpr uint32_t kMatLaneSolref1 = 4u;
+// ContactProfileV1 is a packed mutable table. Cook and world upload validate it;
+// assembly consumes the canonical 16-word records through each collidable row.
+constexpr uint64_t kContactProfileHashDomain = 0x4e554b4150524f46ull;
 
-// Model-default friction for a side with no authored material (static ground /
-// unwired tables). Matches the cook's MuJoCo default so default scenes stay at
-// the prior global mu=1.0.
-constexpr float kDefaultMaterialFriction = 1.0f;
+__device__ scene::ContactParamsIn DefaultProfile(float mu, float solref0,
+                                                  float solref1,
+                                                  const float* solimp) {
+    scene::ContactParamsIn out;
+    out.mu1 = mu;
+    out.mu2 = mu;
+    out.solref[0] = solref0;
+    out.solref[1] = solref1;
+    for (uint32_t i = 0u; i < 5u; ++i) out.solimp[i] = solimp[i];
+    return out;
+}
 
-// Combined per-contact material params (the two shapes' authored materials mixed
-// per the MuJoCo solmix=max convention). Defaults = the model-level defaults, so
-// a contact with no authored material is numerically unchanged.
-struct PairMaterial {
-    float mu;
-    float solref0;
-    float solref1;
-};
+__device__ scene::ContactParamsIn ReadContactProfile(
+    const float* table, uint32_t count, uint32_t index,
+    const scene::ContactParamsIn& fallback) {
+    if (table == nullptr || index >= count) return fallback;
+    const float* w = table + static_cast<size_t>(index) * nk::kContactProfileWordCount;
+    if (__float_as_uint(w[nk::kContactProfileSchema]) != nk::kContactProfileSchemaVersion ||
+        (__float_as_uint(w[nk::kContactProfileFlags]) & ~nk::kContactProfileSupportedFlags) != 0u)
+        return fallback;
+    scene::ContactParamsIn out;
+    out.mu1 = w[nk::kContactProfileMu1];
+    out.mu2 = w[nk::kContactProfileMu2];
+    out.solref[0] = w[nk::kContactProfileSolref0];
+    out.solref[1] = w[nk::kContactProfileSolref1];
+    for (uint32_t i = 0u; i < 5u; ++i) out.solimp[i] = w[nk::kContactProfileSolimp0 + i];
+    out.solmix = w[nk::kContactProfileSolmix];
+    out.margin = w[nk::kContactProfileMargin];
+    out.gap = w[nk::kContactProfileGap];
+    out.priority = static_cast<int32_t>(__float_as_uint(w[nk::kContactProfilePriority]));
+    out.condim = static_cast<uint8_t>(__float_as_uint(w[nk::kContactProfileCondim]));
+    return out;
+}
+
+__device__ uint64_t HashContactProfileWord(uint64_t hash, uint32_t word) {
+    hash ^= static_cast<uint64_t>(word);
+    hash *= 0x100000001b3ull;
+    return hash;
+}
+
+__device__ uint64_t HashMergedContactProfile(const scene::MergedContactParams& p) {
+    uint64_t hash = kContactProfileHashDomain;
+    hash = HashContactProfileWord(hash, nk::kContactProfileSchemaVersion);
+    hash = HashContactProfileWord(hash, nk::kContactProfileFlagRefsafe);
+    hash = HashContactProfileWord(hash, __float_as_uint(p.mu1));
+    hash = HashContactProfileWord(hash, __float_as_uint(p.mu2));
+    for (uint32_t i = 0u; i < 2u; ++i) hash = HashContactProfileWord(hash, __float_as_uint(p.solref[i]));
+    for (uint32_t i = 0u; i < 5u; ++i) hash = HashContactProfileWord(hash, __float_as_uint(p.solimp[i]));
+    hash = HashContactProfileWord(hash, __float_as_uint(p.margin));
+    hash = HashContactProfileWord(hash, __float_as_uint(p.gap));
+    hash = HashContactProfileWord(hash, p.condim);
+    return hash == 0u ? 0x9e3779b97f4a7c15ull : hash;
+}
 
 namespace mg = ::nuka::math::gpu;
 using mg::Cross;
@@ -281,14 +318,6 @@ __forceinline__ __device__ math::Vec3 NormalizedHostExpr(math::Vec3 v) {
     return {v.x / len, v.y / len, v.z / len};
 }
 
-// row_builder.cpp ChooseTangent, host expressions verbatim.
-__forceinline__ __device__ math::Vec3 ChooseTangentDev(math::Vec3 n) {
-    if (fabsf(n.x) < 0.9f) {
-        return NormalizedHostExpr(n.Cross(math::Vec3{1.0f, 0.0f, 0.0f}));
-    }
-    return NormalizedHostExpr(n.Cross(math::Vec3{0.0f, 1.0f, 0.0f}));
-}
-
 // K1: per-(env x dof) flat prefix-sum qdot pack — the legacy host pack loop
 // (link_velocity[root].v[i] for base DOFs, qdot[link] for scalar joints) via
 // the cooked dof maps.
@@ -396,15 +425,15 @@ __global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
 
 // Per-slot layout (FIXED worst case, mirroring the union per-manifold layout) —
 // the SHARED constants from nk_row.hpp so the cook (row budget), the schedule, and
-// this assembly all agree. kPdPtsPerSlot manifold points, each expanding to 1
-// normal row + kPdSpokes friction-spoke rows (+t0,-t0,+t1,-t1).
+// this assembly all agree. Each point expands to one block normal and two
+// tangent rows; the normal row performs the analytic cone projection.
 constexpr uint32_t kPdPtsPerSlot = nk::kPairDrivenPtsPerSlot;   // 4
-constexpr uint32_t kPdSpokes     = nk::kPairDrivenSpokesPerPt;  // 4
-constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 20
+constexpr uint32_t kPdTangentRows = nk::kPairDrivenTangentRowsPerPt; // 2
+constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 12
 constexpr uint32_t kPdParticlePtsPerSlot =
     nk::kPairDrivenParticlePtsPerSlot;                           // 1
 constexpr uint32_t kPdParticleRowsPerSlot =
-    nk::kPairDrivenParticleRowsPerSlot;                          // 5
+    nk::kPairDrivenParticleRowsPerSlot;                          // 3
 
 // Resolve a contact side -> reaction side. The side-kind TAG (nk::kUContactSide*)
 // is consulted FIRST: it declares whether `index` is a body-local collidable row
@@ -455,51 +484,18 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
     return kNkSideArtic;
 }
 
-// One side's authored material (friction + solref) from mat_buckets/mat_index, or
-// the model defaults when the side has no body-row material (static collidable /
-// out-of-range / unwired tables) -- so default-material scenes stay unchanged.
-__device__ void ReadSideMaterial(const float* mat_buckets, const uint32_t* mat_index,
-                                 uint32_t num_buckets,
-                                 uint32_t env, uint32_t local_body,
-                                 uint32_t bodies_per_env, int32_t body_id,
-                                 float def_mu, float def_solref0, float def_solref1,
-                                 float* out_mu, float* out_solref0, float* out_solref1) {
-    *out_mu = def_mu; *out_solref0 = def_solref0; *out_solref1 = def_solref1;
-    if (mat_buckets == nullptr || mat_index == nullptr || num_buckets == 0u ||
-        body_id < 0 || local_body >= bodies_per_env) {
-        return;  // static / no authored materials / unwired -> model defaults.
-    }
-    const uint32_t bucket = mat_index[env * bodies_per_env + local_body];
-    if (bucket >= num_buckets) return;  // out-of-range bucket -> model defaults.
-    const size_t b = static_cast<size_t>(bucket) * kMatBucketStride;
-    *out_mu = mat_buckets[b + kMatLaneFriction];
-    *out_solref0 = mat_buckets[b + kMatLaneSolref0];
-    *out_solref1 = mat_buckets[b + kMatLaneSolref1];
-}
-
-// Per-particle-SYSTEM friction: the [soft|fluid] split is the first n_soft of each
-// per_env block, so (global id % per_env) < n_soft picks soft mu else fluid mu.
-__device__ void ReadParticleSideMaterial(uint32_t global_particle_id,
-                                         uint32_t n_soft, uint32_t per_env,
-                                         float soft_mu, float fluid_mu,
-                                         float def_solref0, float def_solref1,
-                                         float* out_mu, float* out_solref0,
-                                         float* out_solref1) {
-    const uint32_t local = per_env > 0u ? (global_particle_id % per_env)
-                                        : global_particle_id;
-    *out_mu = (local < n_soft) ? soft_mu : fluid_mu;
-    *out_solref0 = def_solref0;
-    *out_solref1 = def_solref1;
-}
+// Particle systems have no collidable profile row, so they use the canonical
+// model defaults with only their authored per-system isotropic friction replaced.
 
 // One thread per (env x candidate slot). Emits the slot's NkRow block from the
-// unified manifold. Reuses ComputeCompliantRow + ChooseTangentDev (the union
-// math). Side A is the candidate's a-collidable, side B its b-collidable; the
-// chain-J gathers (row_cj_*, row_cj_*_b) carry the per-side artic link/point/dir.
+// unified manifold. Uses ComputeCompliantRow and the canonical tangent basis
+// shared with warm-start persistence; side A/B are the candidate collidables.
 __global__ void EmitPairDrivenRowsKernel(
     const uint32_t* __restrict__ ucontact_count,
     const math::Vec3* __restrict__ ucontact_point,
     const math::Vec3* __restrict__ ucontact_normal,
+    const math::Vec3* __restrict__ ucontact_tangent1,
+    const math::Vec3* __restrict__ ucontact_tangent2,
     const float* __restrict__ ucontact_depth,
     const uint32_t* __restrict__ ucontact_a,
     const uint32_t* __restrict__ ucontact_b,
@@ -510,8 +506,8 @@ __global__ void EmitPairDrivenRowsKernel(
     const uint32_t* __restrict__ body_to_link,
     const uint32_t* __restrict__ body_to_articulation,
     const float* __restrict__ mat_buckets,
-    const uint32_t* __restrict__ mat_index,
     uint32_t num_material_buckets,
+    uint64_t* __restrict__ contact_material,
     uint32_t n_soft_particles, uint32_t particles_per_env,
     float particle_soft_friction, float particle_fluid_friction,
     float solref0, float solref1,
@@ -550,16 +546,23 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t local_a = ~0u, local_b = ~0u;
     uint32_t side_kind_a = nk::kUContactSideBody, side_kind_b = nk::kUContactSideBody;
     int32_t bid_a = -1, bid_b = -1;
+    uint32_t profile_a = 0u, profile_b = 0u;
     if (n_active > 0u) {
         local_a = ucontact_a[static_cast<size_t>(gid) * 4u];
         local_b = ucontact_b[static_cast<size_t>(gid) * 4u];
         side_kind_a = ucontact_a_kind[static_cast<size_t>(gid) * 4u];
         side_kind_b = ucontact_b_kind[static_cast<size_t>(gid) * 4u];
         // body_id only meaningful for a body-local index (material read below).
-        bid_a = (side_kind_a == nk::kUContactSideBody)
-                    ? LoadPrimShape(shape_table, local_a).body_id : -1;
-        bid_b = (side_kind_b == nk::kUContactSideBody)
-                    ? LoadPrimShape(shape_table, local_b).body_id : -1;
+        if (side_kind_a == nk::kUContactSideBody) {
+            const PrimShapeDev shape = LoadPrimShape(shape_table, local_a);
+            bid_a = shape.body_id;
+            profile_a = shape.contact_profile_index;
+        }
+        if (side_kind_b == nk::kUContactSideBody) {
+            const PrimShapeDev shape = LoadPrimShape(shape_table, local_b);
+            bid_b = shape.body_id;
+            profile_b = shape.contact_profile_index;
+        }
         kind_a = ResolvePairSide(side_kind_a, bid_a, body_to_link,
                                  body_to_articulation, env, local_a, bodies_per_env,
                                  base_link_count, artics_per_env, &art_a, &link_a,
@@ -580,35 +583,31 @@ __global__ void EmitPairDrivenRowsKernel(
     if (kind_a == kNkSideRigid) com_a = body_pose[idx_a].position;
     if (kind_b == kNkSideRigid) com_b = body_pose[idx_b].position;
 
-    // Per-contact material mixed by MuJoCo solmix=max (friction max, solref min).
-    // A particle side reads per-system mu; the body branch is byte-unchanged.
-    float mu_a, sr0_a, sr1_a, mu_b, sr0_b, sr1_b;
+    const float default_solimp[5] = {solimp0, solimp1, solimp2, solimp3, solimp4};
+    const scene::ContactParamsIn default_profile =
+        DefaultProfile(1.0f, solref0, solref1, default_solimp);
+    scene::ContactParamsIn side_a = ReadContactProfile(
+        mat_buckets, num_material_buckets, profile_a, default_profile);
+    scene::ContactParamsIn side_b = ReadContactProfile(
+        mat_buckets, num_material_buckets, profile_b, default_profile);
     if (kind_a == kNkSideParticle) {
-        ReadParticleSideMaterial(part_a, n_soft_particles, particles_per_env,
-                                 particle_soft_friction, particle_fluid_friction,
-                                 solref0, solref1, &mu_a, &sr0_a, &sr1_a);
-    } else {
-        ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_a,
-                         bodies_per_env, bid_a, kDefaultMaterialFriction, solref0,
-                         solref1, &mu_a, &sr0_a, &sr1_a);
+        const uint32_t local = particles_per_env > 0u ? part_a % particles_per_env : part_a;
+        const float mu = local < n_soft_particles ? particle_soft_friction
+                                                   : particle_fluid_friction;
+        side_a = DefaultProfile(mu, solref0, solref1, default_solimp);
     }
     if (kind_b == kNkSideParticle) {
-        ReadParticleSideMaterial(part_b, n_soft_particles, particles_per_env,
-                                 particle_soft_friction, particle_fluid_friction,
-                                 solref0, solref1, &mu_b, &sr0_b, &sr1_b);
-    } else {
-        ReadSideMaterial(mat_buckets, mat_index, num_material_buckets, env, local_b,
-                         bodies_per_env, bid_b, kDefaultMaterialFriction, solref0,
-                         solref1, &mu_b, &sr0_b, &sr1_b);
+        const uint32_t local = particles_per_env > 0u ? part_b % particles_per_env : part_b;
+        const float mu = local < n_soft_particles ? particle_soft_friction
+                                                   : particle_fluid_friction;
+        side_b = DefaultProfile(mu, solref0, solref1, default_solimp);
     }
-    PairMaterial mat;
-    mat.mu = fmaxf(mu_a, mu_b);
-    mat.solref0 = fminf(sr0_a, sr0_b);  // smaller timeconst == stiffer
-    mat.solref1 = fmaxf(sr1_a, sr1_b);
-
-    const float solref[2] = {mat.solref0, mat.solref1};
-    const float solimp[5] = {solimp0, solimp1, solimp2, solimp3, solimp4};
-    const float mu = mat.mu;  // per-contact friction coefficient (cone bound).
+    const scene::MergedContactParams merged = scene::MergeContactParams(side_a, side_b);
+    const float* solref = merged.solref;
+    const float* solimp = merged.solimp;
+    const float mu1 = merged.mu1;
+    const float mu2 = merged.mu2;
+    contact_material[gid] = n_active > 0u ? HashMergedContactProfile(merged) : 0u;
     const float kFltMaxLocal = kFltMax;
 
     uint32_t active_rows = 0u;
@@ -616,7 +615,8 @@ __global__ void EmitPairDrivenRowsKernel(
         const bool live = p < n_active && p < 4u;
         const size_t mp = static_cast<size_t>(gid) * 4u + p;
         const uint32_t normal_row = base + p;          // pts normal rows first.
-        const uint32_t spoke_base = base + points_per_slot + p * kPdSpokes;
+        const uint32_t tangent1_row = base + points_per_slot + p;
+        const uint32_t tangent2_row = base + 2u * points_per_slot + p;
 
         math::Vec3 n{0, 0, 1};
         math::Vec3 point{0, 0, 0};
@@ -624,8 +624,8 @@ __global__ void EmitPairDrivenRowsKernel(
         if (live) {
             n = NormalizedHostExpr(ucontact_normal[mp]);
             point = ucontact_point[mp];
-            t0 = ChooseTangentDev(n);
-            t1v = NormalizedHostExpr(n.Cross(t0));
+            t0 = ucontact_tangent1[mp];
+            t1v = ucontact_tangent2[mp];
         }
 
         // ---- normal row ------------------------------------------------------
@@ -646,6 +646,7 @@ __global__ void EmitPairDrivenRowsKernel(
                                                     /*vel=*/0.0f, /*invweight=*/1.0f,
                                                     dt, /*refsafe=*/true);
                 row.flags = nk::nk_row_flags::kActive;
+                if (merged.condim == 3u) row.flags |= nk::nk_row_flags::kBlockNormal;
                 row.group_first = base;
                 row.group_normal_count = points_per_slot;
                 row.env = env;
@@ -655,7 +656,8 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.compliance_alpha = compliant.R;
                 row.lower = 0.0f;
                 row.upper = kFltMaxLocal;
-                row.mu = mu;
+                row.mu = mu1;
+                row.reserved[0] = mu2;
                 row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = n;
                 row.b.kind = kind_b; row.b.index = idx_b;
                 row.b.jlin = math::Vec3{-n.x, -n.y, -n.z};
@@ -674,28 +676,28 @@ __global__ void EmitPairDrivenRowsKernel(
             urows[rs] = row;
         }
 
-        // ---- friction spokes -------------------------------------------------
-        for (uint32_t k = 0u; k < kPdSpokes; ++k) {
-            const uint32_t rs = spoke_base + k;
+        // ---- tangent rows ----------------------------------------------------
+        const uint32_t tangent_rows[2] = {tangent1_row, tangent2_row};
+        const math::Vec3 tangent_dirs[2] = {t0, t1v};
+        for (uint32_t k = 0u; k < kPdTangentRows; ++k) {
+            const uint32_t rs = tangent_rows[k];
             NkRow row{};
             lambda[rs] = 0.0f;
-            row_penetration[rs] = 0.0f;  // friction rows skip the position pass.
+            row_penetration[rs] = 0.0f;
             row_cj_link[rs] = kInvalidLink;
             row_cj_link_b[rs] = kInvalidLink;
-            if (live) {
-                const math::Vec3 spokes[4] = {
-                    t0, math::Vec3{-t0.x, -t0.y, -t0.z},
-                    t1v, math::Vec3{-t1v.x, -t1v.y, -t1v.z}};
-                const math::Vec3 dir = spokes[k & 3u];
-                row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kFriction;
+            if (live && merged.condim == 3u) {
+                const math::Vec3 dir = tangent_dirs[k];
+                row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kBlockTangent;
                 row.group_first = base;
                 row.group_normal_count = points_per_slot;
                 row.env = env;
                 row.rhs = 0.0f;
                 row.compliance_alpha = 0.0f;
-                row.lower = 0.0f;
-                row.upper = 0.0f;  // overridden in-kernel (pyramid bound).
-                row.mu = mu;
+                row.lower = -kFltMaxLocal;
+                row.upper = kFltMaxLocal;
+                row.mu = mu1;
+                row.reserved[0] = mu2;
                 row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = dir;
                 row.b.kind = kind_b; row.b.index = idx_b;
                 row.b.jlin = math::Vec3{-dir.x, -dir.y, -dir.z};
@@ -715,6 +717,77 @@ __global__ void EmitPairDrivenRowsKernel(
         }
     }
     if (active_rows > 0u) atomicAdd(&row_count[env], active_rows);
+}
+
+// Stable per-link lower/upper slots appended after the contact footprint.
+// A scalar joint bound is a one-sided row with J = +/-e_joint.
+__global__ void EmitJointLimitRowsKernel(
+    ArticulationDeviceState state,
+    const float* __restrict__ lower_limits,
+    const float* __restrict__ upper_limits,
+    const uint8_t* __restrict__ limit_flags,
+    float dt, float baumgarte_max_velocity,
+    uint32_t env_count, uint32_t base_link_count,
+    uint32_t rows_per_env, uint32_t contact_rows_per_env,
+    uint32_t dof_stride,
+    NkRow* __restrict__ urows,
+    float* __restrict__ lambda,
+    float* __restrict__ chain_jacobian,
+    uint32_t* __restrict__ row_cj_link,
+    uint32_t* __restrict__ row_cj_link_b,
+    float* __restrict__ row_penetration,
+    uint32_t* __restrict__ row_count) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) return;
+    const uint32_t env = link / base_link_count;
+    if (env >= env_count) return;
+    const uint32_t local_link = link - env * base_link_count;
+    const bool scalar_joint = JointDofCount(state.joint_type[link]) == 1u;
+    const uint8_t authored = limit_flags != nullptr ? limit_flags[link] : 0u;
+    const uint32_t articulation = scalar_joint
+                                      ? state.link_to_articulation[link] : ~0u;
+    uint32_t dof = 0u;
+    if (scalar_joint) {
+        const uint32_t offset = state.articulation_link_offset[articulation];
+        dof = LocalDofIndexDevice(state, offset, link);
+    }
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        const uint32_t rs = env * rows_per_env + contact_rows_per_env +
+                            local_link * 2u + side;
+        NkRow row{};
+        row_cj_link[rs] = kInvalidLink;
+        row_cj_link_b[rs] = kInvalidLink;
+        row_penetration[rs] = 0.0f;
+        float* const J = chain_jacobian + static_cast<size_t>(rs) * dof_stride;
+        for (uint32_t k = 0u; k < dof_stride; ++k) J[k] = 0.0f;
+        const uint8_t bit = static_cast<uint8_t>(1u << side);
+        if (scalar_joint && (authored & bit) != 0u && dt > 0.0f) {
+            const float sign = side == 0u ? 1.0f : -1.0f;
+            const float bound = side == 0u ? lower_limits[link] : upper_limits[link];
+            const float signed_distance =
+                side == 0u ? state.q[link] - bound : bound - state.q[link];
+            const float target_velocity = -signed_distance / dt;
+            const float capped_velocity =
+                fminf(target_velocity, baumgarte_max_velocity);
+            row.flags = nk::nk_row_flags::kActive |
+                        (side == 0u ? nk::nk_row_flags::kJointLimitLower
+                                    : nk::nk_row_flags::kJointLimitUpper);
+            row.group_first = rs;
+            row.group_normal_count = 1u;
+            row.env = env;
+            row.rhs = capped_velocity / dt;
+            row.lower = 0.0f;
+            row.upper = kFltMax;
+            row.a.kind = kNkSideArtic;
+            row.a.index = articulation;
+            J[dof] = sign;
+            row_penetration[rs] = fmaxf(-signed_distance, 0.0f);
+            atomicAdd(&row_count[env], 1u);
+        } else {
+            lambda[rs] = 0.0f;
+        }
+        urows[rs] = row;
+    }
 }
 
 // K4a-B: w_b = M^-1 J_b^T per articulation SIDE-B row . Mirrors
@@ -742,10 +815,98 @@ __global__ void ComputeRowMinvJtBKernel(const NkRow* __restrict__ urows,
     row_minv_jt_b[gid] = acc;
 }
 
-// K4b PairDriven: per-row effective mass over BOTH arms with the CORRECT arrays
-// (side A: chain_jacobian/row_minv_jt; side B artic: chain_jacobian_b/row_minv_jt_b).
+__device__ float PairDrivenSideCoupling(
+    const NkRowSide& lhs, uint32_t lhs_side, uint32_t lhs_row,
+    const NkRowSide& rhs, uint32_t rhs_side, uint32_t rhs_row,
+    const float* __restrict__ chain_jacobian,
+    const float* __restrict__ row_minv_jt,
+    const float* __restrict__ chain_jacobian_b,
+    const float* __restrict__ row_minv_jt_b,
+    const float* __restrict__ body_inv_mass,
+    const math::Vec3* __restrict__ body_inv_inertia,
+    const float* __restrict__ particle_inv_mass, uint32_t dof_stride) {
+    if (lhs.kind != rhs.kind || lhs.index != rhs.index) return 0.0f;
+    switch (lhs.kind) {
+        case kNkSideRigid: {
+            const float im = body_inv_mass[lhs.index];
+            const math::Vec3 ii = body_inv_inertia[lhs.index];
+            return im * Dot3(lhs.jlin, rhs.jlin) +
+                   lhs.jang.x * rhs.jang.x * ii.x +
+                   lhs.jang.y * rhs.jang.y * ii.y +
+                   lhs.jang.z * rhs.jang.z * ii.z;
+        }
+        case kNkSideArtic: {
+            const float* const J = (lhs_side == 0u ? chain_jacobian
+                                                   : chain_jacobian_b) +
+                                   static_cast<size_t>(lhs_row) * dof_stride;
+            const float* const w = (rhs_side == 0u ? row_minv_jt
+                                                   : row_minv_jt_b) +
+                                   static_cast<size_t>(rhs_row) * dof_stride;
+            float coupling = 0.0f;
+            for (uint32_t r = 0u; r < dof_stride; ++r) coupling += J[r] * w[r];
+            return coupling;
+        }
+        case kNkSideParticle:
+            return particle_inv_mass != nullptr
+                       ? particle_inv_mass[lhs.index] * Dot3(lhs.jlin, rhs.jlin)
+                       : 0.0f;
+        default:
+            return 0.0f;
+    }
+}
+
+__device__ float PairDrivenRowCoupling(
+    const NkRow& lhs, uint32_t lhs_row, const NkRow& rhs, uint32_t rhs_row,
+    const float* __restrict__ chain_jacobian,
+    const float* __restrict__ row_minv_jt,
+    const float* __restrict__ chain_jacobian_b,
+    const float* __restrict__ row_minv_jt_b,
+    const float* __restrict__ body_inv_mass,
+    const math::Vec3* __restrict__ body_inv_inertia,
+    const float* __restrict__ particle_inv_mass, uint32_t dof_stride) {
+    const NkRowSide lhs_sides[2] = {lhs.a, lhs.b};
+    const NkRowSide rhs_sides[2] = {rhs.a, rhs.b};
+    float coupling = 0.0f;
+    for (uint32_t i = 0u; i < 2u; ++i) {
+        for (uint32_t j = 0u; j < 2u; ++j) {
+            coupling += PairDrivenSideCoupling(
+                lhs_sides[i], i, lhs_row, rhs_sides[j], j, rhs_row,
+                chain_jacobian, row_minv_jt, chain_jacobian_b, row_minv_jt_b,
+                body_inv_mass, body_inv_inertia, particle_inv_mass, dof_stride);
+        }
+    }
+    return coupling;
+}
+
+__device__ void StoreContactBlockInverse(NkRow* normal, float k00, float k01,
+                                         float k02, float k11, float k12,
+                                         float k22) {
+    const float c00 = k11 * k22 - k12 * k12;
+    const float c01 = k02 * k12 - k01 * k22;
+    const float c02 = k01 * k12 - k02 * k11;
+    const float c11 = k00 * k22 - k02 * k02;
+    const float c12 = k01 * k02 - k00 * k12;
+    const float c22 = k00 * k11 - k01 * k01;
+    const float determinant = k00 * c00 + k01 * c01 + k02 * c02;
+    const float scale = fmaxf(fmaxf(k00, k11), k22);
+    const float threshold = 1.0e-12f * scale * scale * scale;
+    if (!(determinant > threshold) || !isfinite(determinant)) {
+        for (uint32_t i = 1u; i < 7u; ++i) normal->reserved[i] = 0.0f;
+        return;
+    }
+    const float inv_det = 1.0f / determinant;
+    normal->reserved[1] = c00 * inv_det;
+    normal->reserved[2] = c01 * inv_det;
+    normal->reserved[3] = c02 * inv_det;
+    normal->reserved[4] = c11 * inv_det;
+    normal->reserved[5] = c12 * inv_det;
+    normal->reserved[6] = c22 * inv_det;
+}
+
+// Computes scalar masses for every row and the full symmetric ContactBlock3
+// inverse on each normal owner.
 __global__ void ComputeRowMeffPairDrivenKernel(
-    const NkRow* __restrict__ urows,
+    NkRow* __restrict__ urows,
     const float* __restrict__ chain_jacobian,
     const float* __restrict__ row_minv_jt,
     const float* __restrict__ chain_jacobian_b,
@@ -756,53 +917,429 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     uint32_t total_rows, uint32_t dof_stride, float* __restrict__ row_meff) {
     const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
     if (rs >= total_rows) return;
-    // Inactive rows (the ~99%) bail on a 4-byte flags load instead of the full
-    // 128-byte struct; same row_meff=0 result.
-    if (!(urows[rs].flags & nk::nk_row_flags::kActive)) { row_meff[rs] = 0.0f; return; }
-    const NkRow row = urows[rs];
-    float diagonal = 0.0f;
-    for (int s = 0; s < 2; ++s) {
-        const NkRowSide& sd = (s == 0) ? row.a : row.b;
-        switch (sd.kind) {
-            case kNkSideRigid: {
-                const float im = body_inv_mass[sd.index];
-                const math::Vec3 ii = body_inv_inertia[sd.index];
-                diagonal += im * Dot3(sd.jlin, sd.jlin);
-                diagonal += sd.jang.x * sd.jang.x * ii.x;
-                diagonal += sd.jang.y * sd.jang.y * ii.y;
-                diagonal += sd.jang.z * sd.jang.z * ii.z;
-                break;
-            }
-            case kNkSideArtic: {
-                const float* const J = ((s == 0) ? chain_jacobian : chain_jacobian_b) +
-                                       static_cast<size_t>(rs) * dof_stride;
-                const float* const w = ((s == 0) ? row_minv_jt : row_minv_jt_b) +
-                                       static_cast<size_t>(rs) * dof_stride;
-                float denom = 0.0f;
-                for (uint32_t r = 0u; r < dof_stride; ++r) denom += J[r] * w[r];
-                diagonal += denom;
-                break;
-            }
-            case kNkSideParticle:
-                // Point-mass arm: inv_mass*|jlin|^2 (no angular term).
-                diagonal += particle_inv_mass != nullptr
-                                ? particle_inv_mass[sd.index] * Dot3(sd.jlin, sd.jlin)
-                                : 0.0f;
-                break;
-            default: break;
-        }
+    if (!(urows[rs].flags & nk::nk_row_flags::kActive)) {
+        row_meff[rs] = 0.0f;
+        return;
     }
+    NkRow& row = urows[rs];
+    float diagonal = PairDrivenRowCoupling(
+        row, rs, row, rs, chain_jacobian, row_minv_jt, chain_jacobian_b,
+        row_minv_jt_b, body_inv_mass, body_inv_inertia, particle_inv_mass,
+        dof_stride);
     diagonal += row.compliance_alpha;
     row_meff[rs] = diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
+    if (!(row.flags & nk::nk_row_flags::kBlockNormal)) return;
+
+    const uint32_t point = (rs - row.group_first) % row.group_normal_count;
+    const uint32_t tangent1_row = row.group_first + row.group_normal_count + point;
+    const uint32_t tangent2_row = row.group_first + 2u * row.group_normal_count + point;
+    const NkRow& tangent1 = urows[tangent1_row];
+    const NkRow& tangent2 = urows[tangent2_row];
+    if (!(tangent1.flags & nk::nk_row_flags::kBlockTangent) ||
+        !(tangent2.flags & nk::nk_row_flags::kBlockTangent)) {
+        for (uint32_t i = 1u; i < 7u; ++i) row.reserved[i] = 0.0f;
+        return;
+    }
+    const float k00 = diagonal;
+    const float k11 = PairDrivenRowCoupling(
+        tangent1, tangent1_row, tangent1, tangent1_row, chain_jacobian,
+        row_minv_jt, chain_jacobian_b, row_minv_jt_b, body_inv_mass,
+        body_inv_inertia, particle_inv_mass, dof_stride) + tangent1.compliance_alpha;
+    const float k22 = PairDrivenRowCoupling(
+        tangent2, tangent2_row, tangent2, tangent2_row, chain_jacobian,
+        row_minv_jt, chain_jacobian_b, row_minv_jt_b, body_inv_mass,
+        body_inv_inertia, particle_inv_mass, dof_stride) + tangent2.compliance_alpha;
+    const float k01 = 0.5f * (
+        PairDrivenRowCoupling(row, rs, tangent1, tangent1_row, chain_jacobian,
+                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
+                              body_inv_mass, body_inv_inertia, particle_inv_mass,
+                              dof_stride) +
+        PairDrivenRowCoupling(tangent1, tangent1_row, row, rs, chain_jacobian,
+                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
+                              body_inv_mass, body_inv_inertia, particle_inv_mass,
+                              dof_stride));
+    const float k02 = 0.5f * (
+        PairDrivenRowCoupling(row, rs, tangent2, tangent2_row, chain_jacobian,
+                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
+                              body_inv_mass, body_inv_inertia, particle_inv_mass,
+                              dof_stride) +
+        PairDrivenRowCoupling(tangent2, tangent2_row, row, rs, chain_jacobian,
+                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
+                              body_inv_mass, body_inv_inertia, particle_inv_mass,
+                              dof_stride));
+    const float k12 = 0.5f * (
+        PairDrivenRowCoupling(tangent1, tangent1_row, tangent2, tangent2_row,
+                              chain_jacobian, row_minv_jt, chain_jacobian_b,
+                              row_minv_jt_b, body_inv_mass, body_inv_inertia,
+                              particle_inv_mass, dof_stride) +
+        PairDrivenRowCoupling(tangent2, tangent2_row, tangent1, tangent1_row,
+                              chain_jacobian, row_minv_jt, chain_jacobian_b,
+                              row_minv_jt_b, body_inv_mass, body_inv_inertia,
+                              particle_inv_mass, dof_stride));
+    StoreContactBlockInverse(&row, k00, k01, k02, k11, k12, k22);
+}
+
+__device__ bool ContactRowOffsets(uint32_t env, uint32_t slot, uint32_t point,
+                                  uint32_t rows_per_env,
+                                  uint32_t full_row_slot_count,
+                                  uint32_t* normal_row, uint32_t* tangent1_row,
+                                  uint32_t* tangent2_row) {
+    const bool compact = slot >= full_row_slot_count;
+    const uint32_t points_per_slot =
+        compact ? kPdParticlePtsPerSlot : kPdPtsPerSlot;
+    if (point >= points_per_slot) return false;
+    const uint32_t base = env * rows_per_env +
+        (compact
+             ? full_row_slot_count * kPdRowsPerSlot +
+                   (slot - full_row_slot_count) * kPdParticleRowsPerSlot
+             : slot * kPdRowsPerSlot);
+    *normal_row = base + point;
+    *tangent1_row = base + points_per_slot + point;
+    *tangent2_row = base + 2u * points_per_slot + point;
+    return true;
+}
+
+__device__ bool IsCurrentContactPoint(
+    const uint32_t* __restrict__ ucontact_count, uint32_t point_index);
+
+__global__ void PrepareContactWarmStartKernel(
+    const uint32_t* __restrict__ ucontact_count,
+    const uint64_t* __restrict__ current_pair,
+    const uint64_t* __restrict__ current_feature,
+    const math::Vec3* __restrict__ current_normal,
+    const math::Vec3* __restrict__ current_tangent1,
+    const math::Vec3* __restrict__ current_tangent2,
+    const uint64_t* __restrict__ current_material,
+    const uint64_t* __restrict__ cache_pair,
+    const uint64_t* __restrict__ cache_feature,
+    const float* __restrict__ cache_lambda,
+    const math::Vec3* __restrict__ cache_normal,
+    const math::Vec3* __restrict__ cache_tangent1,
+    const math::Vec3* __restrict__ cache_tangent2,
+    const uint64_t* __restrict__ cache_material,
+    const uint32_t* __restrict__ cache_age,
+    uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
+    uint32_t full_row_slot_count, uint32_t decay_steps,
+    float* __restrict__ lambda) {
+    const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t points_per_env = slot_count * 4u;
+    if (point_index >= env_count * points_per_env) return;
+    const uint32_t env = point_index / points_per_env;
+    const uint32_t local_point = point_index - env * points_per_env;
+    const uint32_t slot = local_point / 4u;
+    const uint32_t point = local_point & 3u;
+    const uint32_t contact_slot = env * slot_count + slot;
+    if (point >= ucontact_count[contact_slot]) return;
+
+    const uint64_t pair = current_pair[point_index];
+    const uint64_t feature = current_feature[point_index];
+    const uint64_t material = current_material[contact_slot];
+    const uint32_t begin = env * points_per_env;
+    const uint32_t end = begin + points_per_env;
+    for (uint32_t i = begin; i < point_index; ++i) {
+        if (!IsCurrentContactPoint(ucontact_count, i)) continue;
+        if (current_pair[i] == pair && current_feature[i] == feature &&
+            current_material[i / 4u] == material) return;
+    }
+    uint32_t match = ~0u;
+    for (uint32_t i = begin; i < end; ++i) {
+        if (cache_pair[i] == pair && cache_feature[i] == feature &&
+            cache_material[i] == material && cache_age[i] < decay_steps) {
+            match = i;
+            break;
+        }
+    }
+    if (match == ~0u) return;
+    const math::Vec3 n = current_normal[point_index];
+    if (n.Dot(cache_normal[match]) <= 0.25f) return;
+
+    uint32_t normal_row = 0u;
+    uint32_t tangent1_row = 0u;
+    uint32_t tangent2_row = 0u;
+    if (!ContactRowOffsets(env, slot, point, rows_per_env,
+                           full_row_slot_count, &normal_row, &tangent1_row,
+                           &tangent2_row)) return;
+    const float normal_impulse = fmaxf(cache_lambda[match * 3u], 0.0f);
+    const math::Vec3 old_tangent_impulse =
+        cache_tangent1[match] * cache_lambda[match * 3u + 1u] +
+        cache_tangent2[match] * cache_lambda[match * 3u + 2u];
+    const float tangent1 = old_tangent_impulse.Dot(current_tangent1[point_index]);
+    const float tangent2 = old_tangent_impulse.Dot(current_tangent2[point_index]);
+    lambda[normal_row] = normal_impulse;
+    lambda[tangent1_row] = tangent1;
+    lambda[tangent2_row] = tangent2;
+}
+
+__device__ void ClearContactCachePoint(
+    uint32_t point_index, uint64_t* cache_pair, uint64_t* cache_feature,
+    float* cache_lambda, math::Vec3* cache_normal,
+    math::Vec3* cache_tangent1, math::Vec3* cache_tangent2,
+    uint64_t* cache_material, uint32_t* cache_age) {
+    cache_pair[point_index] = 0u;
+    cache_feature[point_index] = 0u;
+    cache_lambda[point_index * 3u + 0u] = 0.0f;
+    cache_lambda[point_index * 3u + 1u] = 0.0f;
+    cache_lambda[point_index * 3u + 2u] = 0.0f;
+    cache_normal[point_index] = {0.0f, 0.0f, 0.0f};
+    cache_tangent1[point_index] = {0.0f, 0.0f, 0.0f};
+    cache_tangent2[point_index] = {0.0f, 0.0f, 0.0f};
+    cache_material[point_index] = 0u;
+    cache_age[point_index] = 0u;
+}
+
+__device__ bool IsCurrentContactPoint(
+    const uint32_t* __restrict__ ucontact_count, uint32_t point_index) {
+    const uint32_t point = point_index & 3u;
+    return point < ucontact_count[point_index / 4u];
+}
+
+__global__ void SnapshotContactCacheKernel(
+    uint32_t point_count,
+    const uint64_t* __restrict__ cache_pair,
+    const uint64_t* __restrict__ cache_feature,
+    const float* __restrict__ cache_lambda,
+    const math::Vec3* __restrict__ cache_normal,
+    const math::Vec3* __restrict__ cache_tangent1,
+    const math::Vec3* __restrict__ cache_tangent2,
+    const uint64_t* __restrict__ cache_material,
+    const uint32_t* __restrict__ cache_age,
+    uint64_t* __restrict__ snapshot_pair,
+    uint64_t* __restrict__ snapshot_feature,
+    float* __restrict__ snapshot_lambda,
+    math::Vec3* __restrict__ snapshot_normal,
+    math::Vec3* __restrict__ snapshot_tangent1,
+    math::Vec3* __restrict__ snapshot_tangent2,
+    uint64_t* __restrict__ snapshot_material,
+    uint32_t* __restrict__ snapshot_age) {
+    const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (point_index >= point_count) return;
+    snapshot_pair[point_index] = cache_pair[point_index];
+    snapshot_feature[point_index] = cache_feature[point_index];
+    for (uint32_t k = 0u; k < 3u; ++k)
+        snapshot_lambda[point_index * 3u + k] = cache_lambda[point_index * 3u + k];
+    snapshot_normal[point_index] = cache_normal[point_index];
+    snapshot_tangent1[point_index] = cache_tangent1[point_index];
+    snapshot_tangent2[point_index] = cache_tangent2[point_index];
+    snapshot_material[point_index] = cache_material[point_index];
+    snapshot_age[point_index] = cache_age[point_index];
+}
+
+__device__ bool SameContactKey(uint64_t pair_a, uint64_t feature_a,
+                               uint64_t material_a, uint64_t pair_b,
+                               uint64_t feature_b, uint64_t material_b) {
+    return pair_a == pair_b && feature_a == feature_b && material_a == material_b;
+}
+
+__global__ void MarkContactCacheRebuildKernel(
+    const uint32_t* __restrict__ ucontact_count,
+    const uint64_t* __restrict__ current_pair,
+    const uint64_t* __restrict__ current_feature,
+    const uint64_t* __restrict__ current_material,
+    const uint64_t* __restrict__ snapshot_pair,
+    const uint64_t* __restrict__ snapshot_feature,
+    const uint64_t* __restrict__ snapshot_material,
+    const uint32_t* __restrict__ snapshot_age,
+    uint32_t env_count, uint32_t slot_count, uint32_t decay_steps,
+    uint32_t* __restrict__ current_owner,
+    uint32_t* __restrict__ old_keep) {
+    const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t points_per_env = slot_count * 4u;
+    if (point_index >= env_count * points_per_env) return;
+    const uint32_t begin = (point_index / points_per_env) * points_per_env;
+    const uint32_t end = begin + points_per_env;
+
+    bool owner = IsCurrentContactPoint(ucontact_count, point_index);
+    const uint64_t material = current_material[point_index / 4u];
+    for (uint32_t i = begin; owner && i < point_index; ++i) {
+        if (!IsCurrentContactPoint(ucontact_count, i)) continue;
+        if (SameContactKey(current_pair[i], current_feature[i],
+                           current_material[i / 4u], current_pair[point_index],
+                           current_feature[point_index], material)) owner = false;
+    }
+    current_owner[point_index] = owner ? 1u : 0u;
+
+    bool keep = snapshot_pair[point_index] != 0u && decay_steps != 0u &&
+                snapshot_age[point_index] + 1u < decay_steps;
+    for (uint32_t i = begin; keep && i < point_index; ++i) {
+        if (SameContactKey(snapshot_pair[i], snapshot_feature[i], snapshot_material[i],
+                           snapshot_pair[point_index], snapshot_feature[point_index],
+                           snapshot_material[point_index])) keep = false;
+    }
+    for (uint32_t i = begin; keep && i < end; ++i) {
+        if (!IsCurrentContactPoint(ucontact_count, i)) continue;
+        if (SameContactKey(current_pair[i], current_feature[i],
+                           current_material[i / 4u], snapshot_pair[point_index],
+                           snapshot_feature[point_index],
+                           snapshot_material[point_index])) keep = false;
+    }
+    old_keep[point_index] = keep ? 1u : 0u;
+}
+
+__global__ void RebuildContactCacheKernel(
+    const uint64_t* __restrict__ current_pair,
+    const uint64_t* __restrict__ current_feature,
+    const math::Vec3* __restrict__ current_normal,
+    const math::Vec3* __restrict__ current_tangent1,
+    const math::Vec3* __restrict__ current_tangent2,
+    const uint64_t* __restrict__ current_material,
+    const float* __restrict__ lambda,
+    const uint64_t* __restrict__ snapshot_pair,
+    const uint64_t* __restrict__ snapshot_feature,
+    const float* __restrict__ snapshot_lambda,
+    const math::Vec3* __restrict__ snapshot_normal,
+    const math::Vec3* __restrict__ snapshot_tangent1,
+    const math::Vec3* __restrict__ snapshot_tangent2,
+    const uint64_t* __restrict__ snapshot_material,
+    const uint32_t* __restrict__ snapshot_age,
+    const uint32_t* __restrict__ current_owner,
+    const uint32_t* __restrict__ old_keep,
+    uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
+    uint32_t full_row_slot_count,
+    uint64_t* __restrict__ cache_pair,
+    uint64_t* __restrict__ cache_feature,
+    float* __restrict__ cache_lambda,
+    math::Vec3* __restrict__ cache_normal,
+    math::Vec3* __restrict__ cache_tangent1,
+    math::Vec3* __restrict__ cache_tangent2,
+    uint64_t* __restrict__ cache_material,
+    uint32_t* __restrict__ cache_age) {
+    const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t points_per_env = slot_count * 4u;
+    if (point_index >= env_count * points_per_env) return;
+    const uint32_t env = point_index / points_per_env;
+    const uint32_t local_point = point_index - env * points_per_env;
+    const uint32_t slot = local_point / 4u;
+    const uint32_t point = local_point & 3u;
+    const uint32_t begin = env * points_per_env;
+    const uint32_t end = begin + points_per_env;
+
+    if (current_owner[point_index] != 0u) {
+        uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
+        if (ContactRowOffsets(env, slot, point, rows_per_env,
+                              full_row_slot_count, &normal_row, &tangent1_row,
+                              &tangent2_row)) {
+            cache_pair[point_index] = current_pair[point_index];
+            cache_feature[point_index] = current_feature[point_index];
+            cache_lambda[point_index * 3u] = fmaxf(lambda[normal_row], 0.0f);
+            cache_lambda[point_index * 3u + 1u] = lambda[tangent1_row];
+            cache_lambda[point_index * 3u + 2u] = lambda[tangent2_row];
+            cache_normal[point_index] = current_normal[point_index];
+            cache_tangent1[point_index] = current_tangent1[point_index];
+            cache_tangent2[point_index] = current_tangent2[point_index];
+            cache_material[point_index] = current_material[point_index / 4u];
+            cache_age[point_index] = 0u;
+            return;
+        }
+    }
+
+    uint32_t free_rank = 0u;
+    for (uint32_t i = begin; i < point_index; ++i)
+        if (current_owner[i] == 0u) ++free_rank;
+    uint32_t source = ~0u;
+    uint32_t old_rank = 0u;
+    for (uint32_t i = begin; i < end; ++i) {
+        if (old_keep[i] == 0u) continue;
+        if (old_rank++ == free_rank) {
+            source = i;
+            break;
+        }
+    }
+    if (source != ~0u) {
+        cache_pair[point_index] = snapshot_pair[source];
+        cache_feature[point_index] = snapshot_feature[source];
+        for (uint32_t k = 0u; k < 3u; ++k)
+            cache_lambda[point_index * 3u + k] = snapshot_lambda[source * 3u + k];
+        cache_normal[point_index] = snapshot_normal[source];
+        cache_tangent1[point_index] = snapshot_tangent1[source];
+        cache_tangent2[point_index] = snapshot_tangent2[source];
+        cache_material[point_index] = snapshot_material[source];
+        cache_age[point_index] = snapshot_age[source] + 1u;
+        return;
+    }
+    ClearContactCachePoint(point_index, cache_pair, cache_feature, cache_lambda,
+                           cache_normal, cache_tangent1, cache_tangent2,
+                           cache_material, cache_age);
+}
+
+Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
+                          const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ContactWarmStartParams*>(params);
+    if (p == nullptr) return Status::Failed;
+    const uint32_t point_count = p->env_count * p->slot_count * 4u;
+    if (point_count == 0u) return Status::Ok;
+    constexpr uint32_t kBlock = 128u;
+    const uint32_t blocks = (point_count + kBlock - 1u) / kBlock;
+    if (p->phase == 0u) {
+        LaunchCuda(PrepareContactWarmStartKernel, dim3(blocks), dim3(kBlock), 0u,
+                   stream, data.ucontact_count, data.ucontact_id_pair,
+                   data.ucontact_id_feature, data.ucontact_normal,
+                   data.ucontact_tangent1, data.ucontact_tangent2,
+                   data.contact_material, data.contact_cache_pair,
+                   data.contact_cache_feature, data.contact_cache_lambda,
+                   data.contact_cache_normal, data.contact_cache_tangent1,
+                   data.contact_cache_tangent2, data.contact_cache_material,
+                   data.contact_cache_age, p->env_count, p->slot_count,
+                   p->rows_per_env, p->full_row_slot_count, p->decay_steps,
+                   data.lambda);
+    } else {
+        LaunchCuda(SnapshotContactCacheKernel, dim3(blocks), dim3(kBlock), 0u,
+                   stream, point_count, data.contact_cache_pair,
+                   data.contact_cache_feature, data.contact_cache_lambda,
+                   data.contact_cache_normal, data.contact_cache_tangent1,
+                   data.contact_cache_tangent2, data.contact_cache_material,
+                   data.contact_cache_age, data.contact_cache_snapshot_pair,
+                   data.contact_cache_snapshot_feature,
+                   data.contact_cache_snapshot_lambda,
+                   data.contact_cache_snapshot_normal,
+                   data.contact_cache_snapshot_tangent1,
+                   data.contact_cache_snapshot_tangent2,
+                   data.contact_cache_snapshot_material,
+                   data.contact_cache_snapshot_age);
+        LaunchCuda(MarkContactCacheRebuildKernel, dim3(blocks), dim3(kBlock), 0u,
+                   stream, data.ucontact_count, data.ucontact_id_pair,
+                   data.ucontact_id_feature, data.contact_material,
+                   data.contact_cache_snapshot_pair,
+                   data.contact_cache_snapshot_feature,
+                   data.contact_cache_snapshot_material,
+                   data.contact_cache_snapshot_age, p->env_count,
+                   p->slot_count, p->decay_steps,
+                   data.contact_cache_current_owner,
+                   data.contact_cache_old_keep);
+        LaunchCuda(RebuildContactCacheKernel, dim3(blocks), dim3(kBlock), 0u,
+                   stream, data.ucontact_id_pair, data.ucontact_id_feature,
+                   data.ucontact_normal, data.ucontact_tangent1,
+                   data.ucontact_tangent2, data.contact_material, data.lambda,
+                   data.contact_cache_snapshot_pair,
+                   data.contact_cache_snapshot_feature,
+                   data.contact_cache_snapshot_lambda,
+                   data.contact_cache_snapshot_normal,
+                   data.contact_cache_snapshot_tangent1,
+                   data.contact_cache_snapshot_tangent2,
+                   data.contact_cache_snapshot_material,
+                   data.contact_cache_snapshot_age,
+                   data.contact_cache_current_owner,
+                   data.contact_cache_old_keep, p->env_count, p->slot_count,
+                   p->rows_per_env, p->full_row_slot_count,
+                   data.contact_cache_pair, data.contact_cache_feature,
+                   data.contact_cache_lambda, data.contact_cache_normal,
+                   data.contact_cache_tangent1, data.contact_cache_tangent2,
+                   data.contact_cache_material, data.contact_cache_age);
+    }
+    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
 Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                                 const AssembleRowsParams* p, cudaStream_t stream) {
-    if (p->env_count == 0u || p->union_slot_count == 0u || p->rows_per_env == 0u) {
+    if (p->env_count == 0u || p->rows_per_env == 0u) {
         return Status::Ok;
     }
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t total_rows = p->env_count * p->rows_per_env;
+    if (cudaMemsetAsync(data.row_count, 0,
+                        static_cast<size_t>(p->env_count) * sizeof(uint32_t),
+                        stream) != cudaSuccess) {
+        return Status::Failed;
+    }
     const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;
     const uint32_t artics_per_env =
         (p->articulation_count > 0u && p->env_count > 0u)
@@ -825,14 +1362,16 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    artics_per_env, data.qdot_flat);
     }
 
-    // K2: emit the pair-driven rows .
-    {
+    // K2: emit the pair-driven contact rows.
+    if (p->union_slot_count > 0u) {
         const uint32_t total = p->env_count * p->union_slot_count;
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    static_cast<const uint32_t*>(data.ucontact_count),
                    static_cast<const math::Vec3*>(data.ucontact_point),
                    static_cast<const math::Vec3*>(data.ucontact_normal),
+                   static_cast<const math::Vec3*>(data.ucontact_tangent1),
+                   static_cast<const math::Vec3*>(data.ucontact_tangent2),
                    static_cast<const float*>(data.ucontact_depth),
                    static_cast<const uint32_t*>(data.ucontact_a),
                    static_cast<const uint32_t*>(data.ucontact_b),
@@ -843,8 +1382,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.body_to_link),
                    static_cast<const uint32_t*>(model.body_to_articulation),
                    static_cast<const float*>(data.mat_buckets),
-                   static_cast<const uint32_t*>(data.mat_index),
-                   p->num_material_buckets,
+                   p->num_material_buckets, data.contact_material,
                    p->n_soft_particles, p->particles_per_env,
                    p->particle_soft_friction, p->particle_fluid_friction,
                    p->solref[0], p->solref[1],
@@ -857,6 +1395,23 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,
                    data.row_cj_link_b, data.row_cj_point_b, data.row_cj_dir_b,
                    data.row_count, data.row_penetration);
+    }
+
+    if (has_artic &&
+        p->rows_per_env >= p->contact_rows_per_env + p->base_link_count * 2u) {
+        const ArticulationDeviceState state = MakeArticulationDeviceState(
+            model, data, p->total_link_count, p->articulation_count);
+        const uint32_t limit_blocks =
+            (p->total_link_count + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(EmitJointLimitRowsKernel, dim3(limit_blocks), dim3(kBlockSize),
+                   0u, stream, state, model.joint_limit_lower,
+                   model.joint_limit_upper, model.joint_limit_flags,
+                   p->dt, p->baumgarte_max_velocity, p->env_count,
+                   p->base_link_count, p->rows_per_env,
+                   p->contact_rows_per_env, p->max_dof,
+                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
+                   data.chain_jacobian, data.row_cj_link,
+                   data.row_cj_link_b, data.row_penetration, data.row_count);
     }
 
     if (has_artic) {
@@ -898,7 +1453,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     {
         const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(ComputeRowMeffPairDrivenKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                   stream, reinterpret_cast<const NkRow*>(data.urows),
+                   stream, reinterpret_cast<NkRow*>(data.urows),
                    static_cast<const float*>(data.chain_jacobian),
                    static_cast<const float*>(data.row_minv_jt),
                    static_cast<const float*>(data.chain_jacobian_b),
@@ -1007,6 +1562,7 @@ Status OpAssembleRows(const ModelView& model, const DataView& data,
 
 void RegisterNkAssembleRowsOps() {
     SetCudaOp(NkOp::AssembleRows, &OpAssembleRows);
+    SetCudaOp(NkOp::ContactWarmStart, &OpContactWarmStart);
 }
 
 } // namespace nuka::phi

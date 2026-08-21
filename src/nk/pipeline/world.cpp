@@ -128,11 +128,14 @@ bool World::SeedInitialState() {
     restore_params_.total_link_count = L * E;
     restore_params_.env_count = E;
     restore_params_.row_slot_count = cap.max_rows_per_env * E;
+    restore_params_.contact_slot_count = cap.max_contacts_per_env * E;
     restore_params_.total_body_count = total_body_count;
     restore_params_.total_particle_count = total_particle_count;
     reset_params_.count = 0;
+    reset_params_.env_count = E;
     reset_params_.base_link_count = L;
     reset_params_.lambda_stride = cap.max_rows_per_env;
+    reset_params_.contact_slot_count = cap.max_contacts_per_env;
     // WP1 multi-articulation: reset addresses GLOBAL articulations (K per env). The
     // ResetEnvs id-bound guard checks `env >= articulation_count`, so this must be
     // the TOTAL co-resident articulation count. At K==1 this is E (unchanged).
@@ -314,12 +317,16 @@ bool World::SeedInitialState() {
     // sit below the L==0 early return, silently skipping the bucket seed for
     // any world without an articulation — the M5-binding-bug class.)
     if (cap.num_material_buckets > 0 && !model_.material_buckets.empty()) {
-        std::vector<float> host(static_cast<size_t>(cap.num_material_buckets) * 8u, 0.0f);
+        const uint32_t stride = ModelMaterialBucket::kValueCount;
+        std::vector<float> host(static_cast<size_t>(cap.num_material_buckets) * stride,
+                                0.0f);
         for (uint32_t b = 0; b < cap.num_material_buckets &&
                              b < model_.material_buckets.size(); ++b) {
-            for (int k = 0; k < 8; ++k) {
-                host[static_cast<size_t>(b) * 8u + static_cast<size_t>(k)] =
-                    model_.material_buckets[b].values[k];
+            ModelMaterialBucket canonical;
+            if (!CanonicalizeContactProfileForUpload(model_.material_buckets[b], &canonical))
+                return false;
+            for (uint32_t k = 0u; k < stride; ++k) {
+                host[static_cast<size_t>(b) * stride + k] = canonical.values[k];
             }
         }
         if (!data_.UploadField(FieldId::MatBuckets, host.data(),

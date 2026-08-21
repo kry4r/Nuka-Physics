@@ -28,7 +28,7 @@
 
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_radix_sort.cuh>
-#include <cub/iterator/counting_input_iterator.cuh>
+#include <thrust/iterator/counting_iterator.h>
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -205,7 +205,7 @@ struct MpmSortScratchLayout {
             static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), n);
         size_t select_bytes = 0u;
-        cub::CountingInputIterator<uint32_t> node_ids(0u);
+        thrust::counting_iterator<uint32_t> node_ids(0u);
         (void)cub::DeviceSelect::Flagged(
             nullptr, select_bytes, node_ids, static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
@@ -1262,7 +1262,7 @@ void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
     // The particle key input is dead after radix sort, so lane 0 stores the
     // selected-count scalar.
     uint32_t* active_node_count = data.mpm_grid_cell_key;
-    cub::CountingInputIterator<uint32_t> active_id_iter(0u);
+    thrust::counting_iterator<uint32_t> active_id_iter(0u);
     size_t select_temp_bytes = sc.sort_temp_bytes;
     profiler.Start(MpmStage::ActiveSelect, stream);
     (void)cub::DeviceSelect::Flagged(

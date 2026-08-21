@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <utility>
 
@@ -19,12 +20,35 @@ constexpr uint64_t kAlign = 256;  // CUDA buffer-type alignment (BufferTypeAlign
 
 uint64_t AlignUp(uint64_t v) { return (v + (kAlign - 1)) & ~(kAlign - 1); }
 
+float CanonicalZero(float value) { return value == 0.0f ? 0.0f : value; }
+
 // Spatial inertia is a 6x6 matrix; derive its float/byte extent from Mat36 so the
 // staging loop cannot drift from the device record (replaces bare 36/144).
 constexpr size_t kSpatialInertiaFloats = sizeof(Mat36) / sizeof(float);
 constexpr size_t kSpatialInertiaBytes  = sizeof(Mat36);
 
 }  // namespace
+
+bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
+                                         ModelMaterialBucket* canonical) {
+    if (canonical == nullptr) return false;
+    ContactProfileV1 p = source.Profile();
+    if (p.schema_version != kContactProfileSchemaVersion ||
+        (p.flags & ~kContactProfileSupportedFlags) != 0u ||
+        (p.condim != 1u && p.condim != 3u)) return false;
+    float* values[] = {&p.mu1, &p.mu2, &p.solref[0], &p.solref[1],
+                       &p.solimp[0], &p.solimp[1], &p.solimp[2],
+                       &p.solimp[3], &p.solimp[4], &p.solmix,
+                       &p.margin, &p.gap};
+    for (float* value : values) {
+        if (!std::isfinite(*value)) return false;
+        *value = CanonicalZero(*value);
+    }
+    if (p.mu1 < 0.0f || p.mu2 < 0.0f || p.margin != 0.0f || p.gap != 0.0f)
+        return false;
+    *canonical = ModelMaterialBucket(p);
+    return true;
+}
 
 uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
     switch (per) {
@@ -327,9 +351,16 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, a.joint_armature, L, E, sizeof(float));
             break;
         case FieldId::JointFrictionloss:
-            // MuJoCo joint dry friction bound. Empty for scenes that author no
-            // frictionloss -> StampPerLink leaves the section zero -> byte-inert.
             StampPerLink(dst, a.joint_frictionloss, L, E, sizeof(float));
+            break;
+        case FieldId::JointLimitLower:
+            StampPerLink(dst, a.joint_limit_lower, L, E, sizeof(float));
+            break;
+        case FieldId::JointLimitUpper:
+            StampPerLink(dst, a.joint_limit_upper, L, E, sizeof(float));
+            break;
+        case FieldId::JointLimitFlags:
+            StampPerLink(dst, a.joint_limit_flags, L, E, sizeof(uint8_t));
             break;
         case FieldId::ArticulationLinkCount: {
             // K entries per replica (one per co-resident articulation). The per-dog
@@ -417,6 +448,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                 put_u32(b + 9, sh.group);
                 put_u32(b + 10, sh.hull_vert_offset);
                 put_u32(b + 11, sh.hull_vert_count);
+                put_u32(b + 12, sh.contact_profile_index);
             }
             break;
         }
@@ -833,6 +865,9 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
         case FieldId::JointFrictionloss:     v.joint_frictionloss = static_cast<float*>(p); break;
+        case FieldId::JointLimitLower:       v.joint_limit_lower = static_cast<float*>(p); break;
+        case FieldId::JointLimitUpper:       v.joint_limit_upper = static_cast<float*>(p); break;
+        case FieldId::JointLimitFlags:       v.joint_limit_flags = static_cast<uint8_t*>(p); break;
         case FieldId::ArticulationLinkCount: v.articulation_link_count = static_cast<uint32_t*>(p); break;
         case FieldId::ArticulationLinkOffset:v.articulation_link_offset = static_cast<uint32_t*>(p); break;
         case FieldId::FootShape:             v.foot_shape = static_cast<float*>(p); break;

@@ -1418,6 +1418,7 @@ if(CMAKE_CUDA_COMPILER)
     add_library(nuka SHARED
         c_abi/device.cpp
         c_abi/world.cpp
+        c_abi/checkpoint.cpp
         c_abi/buffer.cpp
         c_abi/error.cpp
         c_abi/diffsim.cpp
@@ -1519,6 +1520,7 @@ if(CMAKE_CUDA_COMPILER)
         VERSION ${PROJECT_VERSION}
         SOVERSION ${PROJECT_VERSION_MAJOR}
         PUBLIC_HEADER "${NUKA_PUBLIC_HEADERS}"
+        WINDOWS_EXPORT_ALL_SYMBOLS ON
     )
 
     nuka_set_warnings(nuka)

@@ -53,6 +53,7 @@
 #include "collision/convex_narrowphase.hpp"    // cvx:: GJK/EPA/face-clip + prism
 #include "collision/shape_kind.hpp"            // nuka::collision::ShapeKind
 #include "math/transform.hpp"
+#include "nk/contact/contact_identity.hpp"
 #include "nk/model/generated/views.hpp"        // ModelView / DataView
 #include "nk/solve/nk_row.hpp"                  // kUContactSideBody (side-kind tag)
 #include "phi/backend_cuda/launch.cuh"
@@ -473,6 +474,8 @@ __global__ void NarrowphaseHeightfieldKernel(
     uint32_t* __restrict__ ucontact_a_kind,
     uint32_t* __restrict__ ucontact_b_kind,
     uint32_t* __restrict__ ucontact_gen,
+    uint64_t* __restrict__ ucontact_id_pair,
+    uint64_t* __restrict__ ucontact_id_feature,
     uint32_t* __restrict__ contact_count) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = hp.env_count * hp.slot_stride;
@@ -622,11 +625,29 @@ __global__ void NarrowphaseHeightfieldKernel(
             ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_gen[at] = 1u;
+            ::nuka::nk::CanonicalContactDescriptor descriptor;
+            descriptor.a.handle = conv_local;
+            descriptor.b.handle = hf_local;
+            descriptor.local_point_a =
+                ::nuka::phi::nkops::PrimInverseTransformPoint(
+                    xconv, out4[i].pos);
+            descriptor.local_point_b =
+                ::nuka::phi::nkops::PrimInverseTransformPoint(
+                    xhf, out4[i].pos);
+            descriptor.normal = out4[i].nrm;
+            descriptor.feature_a = ::nuka::nk::kContactFeatureUnavailable;
+            descriptor.feature_b = out4[i].feat;
+            descriptor.manifold_slot = i;
+            const ::nuka::nk::ContactId id = ::nuka::nk::MakeContactId(descriptor);
+            ucontact_id_pair[at] = id.pair;
+            ucontact_id_feature[at] = id.feature;
         } else {
             upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
             ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
             ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_id_pair[at] = 0u;
+            ucontact_id_feature[at] = 0u;
         }
     }
     if (kept > 0 && contact_count != nullptr) {
@@ -657,7 +678,8 @@ Status OpNarrowphaseHeightfield(const ModelView& model, const DataView& data,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,
-               data.ucontact_gen, data.contact_count);
+               data.ucontact_gen, data.ucontact_id_pair,
+               data.ucontact_id_feature, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

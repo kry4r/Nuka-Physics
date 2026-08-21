@@ -121,7 +121,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_depth
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 3, 12, 0},  // contact_tangent1
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 3, 12, 0},  // contact_tangent2
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_material
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 8, 0},  // contact_material
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::SlotDof, 1, 1, 4, 0},  // jac_normal
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::SlotDof, 1, 1, 4, 0},  // jac_tangent1
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::SlotDof, 1, 1, 4, 0},  // jac_tangent2
@@ -271,6 +271,33 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // joint_frictionloss
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 1, 4, 0},  // body_collidable_link
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 7, 28, 0},  // body_collidable_local
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // ucontact_id_pair
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // ucontact_id_feature
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_pair
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_feature
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 12, 1, 48, 0},  // contact_cache_lambda
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_normal
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_tangent1
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_tangent2
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_material
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // contact_cache_age
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_snapshot_pair
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_snapshot_feature
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 12, 1, 48, 0},  // contact_cache_snapshot_lambda
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_snapshot_normal
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_snapshot_tangent1
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_snapshot_tangent2
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_snapshot_material
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // contact_cache_snapshot_age
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // contact_cache_current_owner
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // contact_cache_old_keep
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // joint_limit_lower
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // joint_limit_upper
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 1, 0},  // joint_limit_flags
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 2, 1, 8, 0},  // joint_limit_impulse
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_effort_requested
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_effort
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_saturated
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

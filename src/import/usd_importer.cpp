@@ -69,6 +69,8 @@ struct UsdPrim {
     std::string decompose_mode;          // nuka:decompose token
     int decompose_max_pieces = 32;       // nuka:decompose:max_pieces
     bool has_initial_position = false;
+    bool has_lower_limit = false;
+    bool has_upper_limit = false;
     float initial_position = 0.0f;
     float lower_limit = -3.14159f;
     float upper_limit = 3.14159f;
@@ -438,8 +440,12 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     if (line.find("nuka:decompose:max_pieces") == std::string::npos) {
         (void)ParseTokenValue(line, "nuka:decompose", prim.decompose_mode);
     }
-    (void)ParseFloatValue(line, "physics:lowerLimit", prim.lower_limit);
-    (void)ParseFloatValue(line, "physics:upperLimit", prim.upper_limit);
+    if (ParseFloatValue(line, "physics:lowerLimit", prim.lower_limit)) {
+        prim.has_lower_limit = true;
+    }
+    if (ParseFloatValue(line, "physics:upperLimit", prim.upper_limit)) {
+        prim.has_upper_limit = true;
+    }
     if (ParseFloatValue(line, "nuka:initialPosition", prim.initial_position)) {
         prim.has_initial_position = true;
     }
@@ -1127,6 +1133,8 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         }
         joint.lower_limit = prim.lower_limit;
         joint.upper_limit = prim.upper_limit;
+        joint.has_lower_limit = prim.has_lower_limit;
+        joint.has_upper_limit = prim.has_upper_limit;
         const scene::JointId joint_id = scene.AddJoint(std::move(joint));
         joint_map[prim.path] = joint_id;
     }

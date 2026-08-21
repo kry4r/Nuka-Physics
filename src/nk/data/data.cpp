@@ -6,6 +6,8 @@
 
 #include "nk/model/model.hpp"   // ModelCapacities
 
+#include <algorithm>
+
 namespace nuka::nk {
 
 namespace {
@@ -79,7 +81,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactDepth:        v.contact_depth = static_cast<float*>(p); break;
         case FieldId::ContactTangent1:     v.contact_tangent1 = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactTangent2:     v.contact_tangent2 = static_cast<math::Vec3*>(p); break;
-        case FieldId::ContactMaterial:     v.contact_material = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactMaterial:     v.contact_material = static_cast<uint64_t*>(p); break;
         case FieldId::JacNormal:           v.jac_normal = static_cast<float*>(p); break;
         case FieldId::JacTangent1:         v.jac_tangent1 = static_cast<float*>(p); break;
         case FieldId::JacTangent2:         v.jac_tangent2 = static_cast<float*>(p); break;
@@ -96,6 +98,26 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::UcontactA:           v.ucontact_a = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactB:           v.ucontact_b = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactGen:         v.ucontact_gen = static_cast<uint32_t*>(p); break;
+        case FieldId::UcontactIdPair:      v.ucontact_id_pair = static_cast<uint64_t*>(p); break;
+        case FieldId::UcontactIdFeature:   v.ucontact_id_feature = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactCachePair:    v.contact_cache_pair = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactCacheFeature: v.contact_cache_feature = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactCacheLambda: v.contact_cache_lambda = static_cast<float*>(p); break;
+        case FieldId::ContactCacheNormal: v.contact_cache_normal = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactCacheTangent1: v.contact_cache_tangent1 = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactCacheTangent2: v.contact_cache_tangent2 = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactCacheMaterial: v.contact_cache_material = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactCacheAge:     v.contact_cache_age = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactCacheSnapshotPair: v.contact_cache_snapshot_pair = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactCacheSnapshotFeature: v.contact_cache_snapshot_feature = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactCacheSnapshotLambda: v.contact_cache_snapshot_lambda = static_cast<float*>(p); break;
+        case FieldId::ContactCacheSnapshotNormal: v.contact_cache_snapshot_normal = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactCacheSnapshotTangent1: v.contact_cache_snapshot_tangent1 = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactCacheSnapshotTangent2: v.contact_cache_snapshot_tangent2 = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactCacheSnapshotMaterial: v.contact_cache_snapshot_material = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactCacheSnapshotAge: v.contact_cache_snapshot_age = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactCacheCurrentOwner: v.contact_cache_current_owner = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactCacheOldKeep: v.contact_cache_old_keep = static_cast<uint32_t*>(p); break;
         // Per-slot side-kind tag for each ucontact_a/ucontact_b index (a body-local
         // collidable row vs a global particle id); the assembly resolves the side
         // by this tag before the shape_table body-row lookup.
@@ -206,6 +228,10 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::EnvTerrainType:      v.env_terrain_type = static_cast<uint32_t*>(p); break;
         case FieldId::EnvTerrainDifficulty: v.env_terrain_difficulty = static_cast<float*>(p); break;
         case FieldId::JointF:              v.joint_f = static_cast<float*>(p); break;
+        case FieldId::JointLimitImpulse:   v.joint_limit_impulse = static_cast<float*>(p); break;
+        case FieldId::ActuatorEffortRequested: v.actuator_effort_requested = static_cast<float*>(p); break;
+        case FieldId::ActuatorEffort:      v.actuator_effort = static_cast<float*>(p); break;
+        case FieldId::ActuatorSaturated:   v.actuator_saturated = static_cast<float*>(p); break;
         default: break;  // model-owned field id: not a DataView member.
     }
 }
@@ -234,42 +260,41 @@ void Data::FillView(phi::DataView* out_view) const {
     }
 }
 
-bool Data::Snapshot() {
-    phi::Buffer* p = arena_.PersistentBuffer();
-    if (p == nullptr) {
-        return false;
-    }
-    // Sum the Persistent segments' span (offset 0 .. last segment end). The arena
-    // buffer is exactly arena_bytes_[Persistent]; copy the whole buffer span the
-    // segments cover. We reconstruct the span from the segment table.
+uint64_t Data::PersistentByteSize() const {
     uint64_t span = 0;
-    for (const Arena::Segment& s : arena_.Segments()) {
-        if (s.arena == 0) {  // Persistent
-            const uint64_t end = s.offset + s.bytes;
-            if (end > span) span = end;
+    for (const Arena::Segment& segment : arena_.Segments()) {
+        if (segment.arena == 0u) {
+            span = std::max(span, segment.offset + segment.bytes);
         }
     }
-    if (span == 0) {
-        // An empty Persistent arena is still allocated at the arena alignment
-        // (Arena::Allocate rounds 0 up to kAlign); download exactly that span.
-        constexpr uint64_t kEmptyArenaSnapshotBytes = 256;
-        snapshot_persistent_.assign(kEmptyArenaSnapshotBytes, 0u);
-        phi::BufferDownload(p, snapshot_persistent_.data(), 0,
-                            kEmptyArenaSnapshotBytes);
-        return true;
+    return span == 0u ? 256u : span;
+}
+
+bool Data::DownloadPersistent(std::vector<uint8_t>* out) const {
+    phi::Buffer* buffer = arena_.PersistentBuffer();
+    if (buffer == nullptr || out == nullptr) {
+        return false;
     }
-    snapshot_persistent_.assign(span, 0u);
-    phi::BufferDownload(p, snapshot_persistent_.data(), 0, span);
+    out->assign(PersistentByteSize(), 0u);
+    phi::BufferDownload(buffer, out->data(), 0, out->size());
     return true;
 }
 
-bool Data::Restore() {
-    phi::Buffer* p = arena_.PersistentBuffer();
-    if (p == nullptr || snapshot_persistent_.empty()) {
+bool Data::UploadPersistent(const std::vector<uint8_t>& bytes) const {
+    phi::Buffer* buffer = arena_.PersistentBuffer();
+    if (buffer == nullptr || bytes.size() != PersistentByteSize()) {
         return false;
     }
-    phi::BufferUpload(p, snapshot_persistent_.data(), 0, snapshot_persistent_.size());
+    phi::BufferUpload(buffer, bytes.data(), 0, bytes.size());
     return true;
+}
+
+bool Data::Snapshot() {
+    return DownloadPersistent(&snapshot_persistent_);
+}
+
+bool Data::Restore() {
+    return UploadPersistent(snapshot_persistent_);
 }
 
 } // namespace nuka::nk

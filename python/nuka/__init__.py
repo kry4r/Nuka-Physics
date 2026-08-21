@@ -30,6 +30,7 @@ from ._nuka_ext import (  # noqa: F401
     Device,
     Field,
     World,
+    StateCheckpoint,
     Tape,
     # Built-scene authoring: program rigid primitives + TAGGED media records, then
     # build() cooks them through the SAME CookSceneToModel a file scene uses (the
@@ -184,6 +185,11 @@ ENV_TERRAIN_DIFFICULTY = Field.ENV_TERRAIN_DIFFICULTY
 # in every control mode (gravcomp / computed-torque / RL residual). Writable
 # zero-copy; same layout/slot map as DRIVE_TARGET.
 JOINT_FEEDFORWARD = Field.JOINT_FEEDFORWARD
+# Constraint and actuator diagnostics are separate per-link readout surfaces.
+JOINT_LIMIT_IMPULSE = Field.JOINT_LIMIT_IMPULSE
+ACTUATOR_EFFORT_REQUESTED = Field.ACTUATOR_EFFORT_REQUESTED
+ACTUATOR_EFFORT = Field.ACTUATOR_EFFORT
+ACTUATOR_SATURATED = Field.ACTUATOR_SATURATED
 
 # ARTICULATION_LINK_POSE element = 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first).
 LINK_POSE_FLOATS = 7
@@ -301,6 +307,10 @@ __all__ = [
     "CONTACT_FORCE",
     "CONTACT_LINK",
     "JOINT_FEEDFORWARD",
+    "JOINT_LIMIT_IMPULSE",
+    "ACTUATOR_EFFORT_REQUESTED",
+    "ACTUATOR_EFFORT",
+    "ACTUATOR_SATURATED",
     "CONTROL_MODE_PD_POSITION",
     "CONTROL_MODE_TORQUE",
     "CONTROL_MODE_VELOCITY",

@@ -15,12 +15,9 @@
 
 namespace nuka::phi::nkops {
 
-// Canonical shape_table row stride (packed f32 / body row). GREW 8 -> 10 (R1
-// body_id/group) -> 12 (L-RECON-D hull slice). The SINGLE source of truth shared
-// by every shape_table reader (LoadPrimShape, broadphase LoadShape) AND the model
-// builder (model.cpp ShapeTable staging / fields.yaml max_bodies_total*12) — adding
-// a lane bumps THIS one constant; the static_assert below pins the struct to it.
-inline constexpr uint32_t kShapeTableRowStride = 12u;
+// Canonical shape_table row stride (packed f32 / body row). The appended lane
+// owns the represented collidable's ContactProfileV1 table index.
+inline constexpr uint32_t kShapeTableRowStride = 13u;
 
 // Device-side shape_table record. R1 GREW it 8 -> 10 packed f32 / body row
 // (Model::PairDrivenShape staging in StageModelField(ShapeTable)). params:
@@ -37,7 +34,8 @@ struct PrimShapeDev {
     int32_t  body_id;     // owning body row, or -1 == static (R1).
     uint32_t group;       // signed collision-group filter key (R1).
     uint32_t hull_vert_offset;  // base vertex index into hull_verts/3 (L-RECON-D).
-    uint32_t hull_vert_count;   // vertex count, 0 == not a hull row (L-RECON-D).
+    uint32_t hull_vert_count;   // vertex count, 0 == not a hull row.
+    uint32_t contact_profile_index; // ContactProfileV1 table row.
 };
 // All 12 lanes are 4-byte scalars, so the packed row is exactly the stride; this
 // guards against a lane addition that forgets to bump kShapeTableRowStride.
@@ -57,6 +55,7 @@ __forceinline__ __device__ PrimShapeDev LoadPrimShape(const float* table,
     s.group = __float_as_uint(q[9]);
     s.hull_vert_offset = __float_as_uint(q[10]);
     s.hull_vert_count = __float_as_uint(q[11]);
+    s.contact_profile_index = __float_as_uint(q[12]);
     return s;
 }
 
@@ -66,6 +65,15 @@ __forceinline__ __device__ math::Vec3 PrimRotate(math::Quat q, math::Vec3 v) {
     const math::Vec3 qv{q.x, q.y, q.z};
     const math::Vec3 t = 2.0f * qv.Cross(v);
     return v + q.w * t + qv.Cross(t);
+}
+
+__forceinline__ __device__ math::Vec3 PrimInverseTransformPoint(
+    const math::Transform& transform, math::Vec3 world_point) {
+    const math::Vec3 v = world_point - transform.position;
+    const math::Vec3 qv{-transform.rotation.x, -transform.rotation.y,
+                        -transform.rotation.z};
+    const math::Vec3 t = 2.0f * qv.Cross(v);
+    return v + transform.rotation.w * t + qv.Cross(t);
 }
 
 // Pair-driven narrowphase launcher (contacts_foot.cu dispatches here for the

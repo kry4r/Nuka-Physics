@@ -98,7 +98,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactDepth, DlpackDtype::kF32, 1, false, false},  // contact_depth
     {FieldId::ContactTangent1, DlpackDtype::kF32, 2, false, false},  // contact_tangent1
     {FieldId::ContactTangent2, DlpackDtype::kF32, 2, false, false},  // contact_tangent2
-    {FieldId::ContactMaterial, DlpackDtype::kU32, 1, false, false},  // contact_material
+    {FieldId::ContactMaterial, DlpackDtype::kU64, 1, false, false},  // contact_material
     {FieldId::JacNormal, DlpackDtype::kF32, 1, false, false},  // jac_normal
     {FieldId::JacTangent1, DlpackDtype::kF32, 1, false, false},  // jac_tangent1
     {FieldId::JacTangent2, DlpackDtype::kF32, 1, false, false},  // jac_tangent2
@@ -248,6 +248,33 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::JointFrictionloss, DlpackDtype::kF32, 1, false, false},  // joint_frictionloss
     {FieldId::BodyCollidableLink, DlpackDtype::kU32, 1, false, false},  // body_collidable_link
     {FieldId::BodyCollidableLocal, DlpackDtype::kF32, 2, false, false},  // body_collidable_local
+    {FieldId::UcontactIdPair, DlpackDtype::kU64, 2, false, false},  // ucontact_id_pair
+    {FieldId::UcontactIdFeature, DlpackDtype::kU64, 2, false, false},  // ucontact_id_feature
+    {FieldId::ContactCachePair, DlpackDtype::kU64, 2, false, false},  // contact_cache_pair
+    {FieldId::ContactCacheFeature, DlpackDtype::kU64, 2, false, false},  // contact_cache_feature
+    {FieldId::ContactCacheLambda, DlpackDtype::kF32, 2, false, false},  // contact_cache_lambda
+    {FieldId::ContactCacheNormal, DlpackDtype::kF32, 2, false, false},  // contact_cache_normal
+    {FieldId::ContactCacheTangent1, DlpackDtype::kF32, 2, false, false},  // contact_cache_tangent1
+    {FieldId::ContactCacheTangent2, DlpackDtype::kF32, 2, false, false},  // contact_cache_tangent2
+    {FieldId::ContactCacheMaterial, DlpackDtype::kU64, 2, false, false},  // contact_cache_material
+    {FieldId::ContactCacheAge, DlpackDtype::kU32, 2, false, false},  // contact_cache_age
+    {FieldId::ContactCacheSnapshotPair, DlpackDtype::kU64, 2, false, false},  // contact_cache_snapshot_pair
+    {FieldId::ContactCacheSnapshotFeature, DlpackDtype::kU64, 2, false, false},  // contact_cache_snapshot_feature
+    {FieldId::ContactCacheSnapshotLambda, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_lambda
+    {FieldId::ContactCacheSnapshotNormal, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_normal
+    {FieldId::ContactCacheSnapshotTangent1, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_tangent1
+    {FieldId::ContactCacheSnapshotTangent2, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_tangent2
+    {FieldId::ContactCacheSnapshotMaterial, DlpackDtype::kU64, 2, false, false},  // contact_cache_snapshot_material
+    {FieldId::ContactCacheSnapshotAge, DlpackDtype::kU32, 2, false, false},  // contact_cache_snapshot_age
+    {FieldId::ContactCacheCurrentOwner, DlpackDtype::kU32, 2, false, false},  // contact_cache_current_owner
+    {FieldId::ContactCacheOldKeep, DlpackDtype::kU32, 2, false, false},  // contact_cache_old_keep
+    {FieldId::JointLimitLower, DlpackDtype::kF32, 1, false, false},  // joint_limit_lower
+    {FieldId::JointLimitUpper, DlpackDtype::kF32, 1, false, false},  // joint_limit_upper
+    {FieldId::JointLimitFlags, DlpackDtype::kU8, 1, false, false},  // joint_limit_flags
+    {FieldId::JointLimitImpulse, DlpackDtype::kF32, 2, false, true},  // joint_limit_impulse
+    {FieldId::ActuatorEffortRequested, DlpackDtype::kF32, 1, false, true},  // actuator_effort_requested
+    {FieldId::ActuatorEffort, DlpackDtype::kF32, 1, false, true},  // actuator_effort
+    {FieldId::ActuatorSaturated, DlpackDtype::kF32, 1, false, true},  // actuator_saturated
 };
 
 } // namespace nuka::nk

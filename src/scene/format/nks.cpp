@@ -449,6 +449,8 @@ Value SaveJoint(const JointRecord& j) {
     o.Set("child_frame", TransformJson(j.child_frame));
     o.Set("lower_limit", Value::Float(j.lower_limit));
     o.Set("upper_limit", Value::Float(j.upper_limit));
+    o.Set("has_lower_limit", Value::Bool(j.has_lower_limit));
+    o.Set("has_upper_limit", Value::Bool(j.has_upper_limit));
     o.Set("damping", Value::Float(j.damping));
     o.Set("armature", Value::Float(j.armature));
     o.Set("stiffness", Value::Float(j.stiffness));
@@ -1318,6 +1320,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.child_frame = TransformFromJson(j->At("child_frame"));
             rec.lower_limit = j->At("lower_limit").AsFloat();
             rec.upper_limit = j->At("upper_limit").AsFloat();
+            if (const Value* p = j->Find("has_lower_limit")) rec.has_lower_limit = p->AsBool();
+            if (const Value* p = j->Find("has_upper_limit")) rec.has_upper_limit = p->AsBool();
             rec.damping = j->At("damping").AsFloat();
             rec.armature = j->At("armature").AsFloat();
             rec.stiffness = j->At("stiffness").AsFloat();

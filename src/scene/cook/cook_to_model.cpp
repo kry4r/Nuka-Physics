@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 #include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
@@ -142,49 +143,33 @@ bool ResolveAuthoredIC(const SceneIR& scene, uint32_t root_body, uint32_t link_c
     return false;
 }
 
-// Resolve the cooked per-shape restitution (producer side of the per-material
-// contact contract). FLAG: CookedContactParamTable (another agent's file) has no
-// restitution lane yet, so this returns the spec default 0 (default-material
-// scenes stay numerically unchanged). Replace the body with
-// blob.contact_params.restitutions[shape_row] once that upstream lane lands.
-float ResolveShapeRestitution(const CookedBlob& /*blob*/, uint32_t /*shape_row*/) {
-    return 0.0f;
-}
-
-// Find or append a material bucket matching the cooked contact-param row `i`.
-// Returns the bucket index. Dedup is by exact float equality (cook is
-// deterministic, so identical authored params give bit-identical bucket rows).
+// Find or append a canonical profile matching cooked contact row `shape_row`.
 uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
                    std::vector<nk::ModelMaterialBucket>& buckets) {
-    nk::ModelMaterialBucket row;
-    if (shape_row < blob.contact_params.frictions.size()) {
-        row.values[nk::kBucketStaticMu]  = blob.contact_params.frictions[shape_row];
-        row.values[nk::kBucketDynamicMu] = blob.contact_params.frictions[shape_row];
-    }
-    // Per-shape restitution into the named lane (producer side of the
-    // per-material contact contract). The cooked blob carries no restitution lane
-    // yet (CookedContactParamTable, another agent's file), so this resolves to the
-    // bucket default 0 until that upstream lane lands -- see the FLAG in the cook.
-    row.values[nk::kBucketRestitution] = ResolveShapeRestitution(blob, shape_row);
-    // Compliant params: solref timeconst/dampratio into the named lanes.
-    if (shape_row < blob.contact_params.solref0.size()) {
-        row.values[nk::kBucketTimeconst] = blob.contact_params.solref0[shape_row];
-    }
-    if (shape_row < blob.contact_params.solref1.size()) {
-        row.values[nk::kBucketDampratio] = blob.contact_params.solref1[shape_row];
-    }
-    if (shape_row < blob.contact_params.margins.size()) {
-        row.values[nk::kBucketMargin] = blob.contact_params.margins[shape_row];
+    nk::ContactProfileV1 profile;
+    const auto& cp = blob.contact_params;
+    if (shape_row < cp.frictions.size()) profile.mu1 = profile.mu2 = cp.frictions[shape_row];
+    if (shape_row < cp.solref0.size()) profile.solref[0] = cp.solref0[shape_row];
+    if (shape_row < cp.solref1.size()) profile.solref[1] = cp.solref1[shape_row];
+    if (shape_row * 5u + 4u < cp.solimp.size())
+        for (uint32_t i = 0u; i < 5u; ++i) profile.solimp[i] = cp.solimp[shape_row * 5u + i];
+    if (shape_row < cp.solmix.size()) profile.solmix = cp.solmix[shape_row];
+    if (shape_row < cp.margins.size()) profile.margin = cp.margins[shape_row];
+    if (shape_row < cp.gaps.size()) profile.gap = cp.gaps[shape_row];
+    if (shape_row < cp.priorities.size()) profile.priority = cp.priorities[shape_row];
+    if (shape_row < cp.condims.size()) profile.condim = cp.condims[shape_row];
+
+    nk::ModelMaterialBucket source(profile), row;
+    if (!nk::CanonicalizeContactProfileForUpload(source, &row)) {
+        throw std::runtime_error(
+            "CookToModel: contact profile requires finite values, nonnegative friction, "
+            "condim 1/3, and zero margin/gap");
     }
     for (uint32_t b = 0; b < buckets.size(); ++b) {
-        bool same = true;
-        for (uint32_t k = 0; k < nk::ModelMaterialBucket::kValueCount; ++k) {
-            if (buckets[b].values[k] != row.values[k]) { same = false; break; }
-        }
-        if (same) return b;
+        if (std::memcmp(buckets[b].values, row.values, sizeof(row.values)) == 0) return b;
     }
     buckets.push_back(row);
-    return static_cast<uint32_t>(buckets.size() - 1);
+    return static_cast<uint32_t>(buckets.size() - 1u);
 }
 
 // SAMP cook : build the SDF sampling-point set for one convex-hull
@@ -242,6 +227,15 @@ static uint32_t RowExemptParticles(const nk::Model& model) {
                : 0u;
 }
 
+static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
+    const uint64_t total_rows =
+        contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env);
+    if (total_rows > 0xFFFFFFFFull) {
+        throw std::runtime_error("CookToModel: row capacity overflows u32");
+    }
+    cap.max_rows_per_env = static_cast<uint32_t>(total_rows);
+}
+
 }  // namespace
 
 // Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
@@ -268,7 +262,7 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
             "(too many particles for the per-env contact slot block)");
     }
     cap.max_contacts_per_env = static_cast<uint32_t>(total);
-    cap.max_rows_per_env = static_cast<uint32_t>(rows);
+    SetRowCapacity(cap, rows);
 }
 
 namespace {
@@ -285,6 +279,10 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
 
     // 1. Drive the existing cook (the heavy lifting: V-HACD / SDF / filters).
     const CookedBlob blob = CookScene(scene, cook_options);
+    if (!blob.filter_policy.explicit_pairs.empty()) {
+        throw std::runtime_error(
+            "CookToModel: PairDriven explicit contact pairs require source-shape provenance");
+    }
 
     // 2. Articulation topology (kinematic tree) from the cooked joints/bodies.
     const std::vector<runtime::articulation::ArticulationCookedTopology> arts =
@@ -342,6 +340,42 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         m.joint_damping = host.joint_damping;
         m.joint_armature = host.joint_armature;
         m.joint_frictionloss = host.joint_frictionloss;
+        m.joint_limit_lower.assign(m.link_count, 0.0f);
+        m.joint_limit_upper.assign(m.link_count, 0.0f);
+        m.joint_limit_flags.assign(m.link_count, 0u);
+        for (uint32_t link = 0; link < m.link_count; ++link) {
+            const BodyId child = link < host.link_body.size()
+                                     ? host.link_body[link] : kInvalidBody;
+            for (uint32_t joint = 0; joint < blob.joint_count; ++joint) {
+                if (joint >= blob.joints.child_bodies.size() ||
+                    blob.joints.child_bodies[joint] != child) {
+                    continue;
+                }
+                if (joint < blob.joints.lower_limits.size()) {
+                    m.joint_limit_lower[link] = blob.joints.lower_limits[joint];
+                }
+                if (joint < blob.joints.upper_limits.size()) {
+                    m.joint_limit_upper[link] = blob.joints.upper_limits[joint];
+                }
+                if (joint < blob.joints.limit_flags.size()) {
+                    m.joint_limit_flags[link] = blob.joints.limit_flags[joint];
+                }
+                break;
+            }
+        }
+        for (uint32_t link = 0; link < m.link_count; ++link) {
+            const uint8_t flags = m.joint_limit_flags[link];
+            if (((flags & 1u) != 0u && !std::isfinite(m.joint_limit_lower[link])) ||
+                ((flags & 2u) != 0u && !std::isfinite(m.joint_limit_upper[link])) ||
+                ((flags & 3u) == 3u &&
+                 m.joint_limit_lower[link] > m.joint_limit_upper[link])) {
+                throw std::runtime_error("CookToModel: invalid authored joint limit");
+            }
+        }
+        cap.joint_limit_rows_per_env =
+            std::any_of(m.joint_limit_flags.begin(), m.joint_limit_flags.end(),
+                        [](uint8_t flags) { return flags != 0u; })
+                ? m.link_count * 2u : 0u;
         m.initial_q = host.q;                  // per LINK (scalar slot / link)
         m.initial_link_pose = host.link_pose;  // cook rest pose
         m.base_pose = host.base_pose.empty() ? math::Transform::Identity()
@@ -547,8 +581,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         }
 
         // Hold drives (legacy BuildHoldDriveTargets 1:1): targets = cooked q;
-        // Position actuators seed stiffness = gain, damping = 2*sqrt(gain),
-        // force limits from the actuator table.
+        // Position actuators seed hold gains; every actuator routes its effort limit.
         nk::ModelHoldDrives& d = model.hold_drives;
         // Hold the SETTLED stance (m.initial_q) when an IC was authored, else the
         // cook-rest q (== host.q): m.initial_q is host.q verbatim when no IC,
@@ -559,8 +592,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         d.force_limits.assign(m.link_count, 0.0f);
         for (uint32_t act = 0; act < blob.actuator_count; ++act) {
             if (act >= blob.actuators.joint_ids.size() ||
-                act >= blob.actuators.types.size() ||
-                blob.actuators.types[act] != ActuatorType::Position) {
+                act >= blob.actuators.types.size()) {
                 continue;
             }
             const JointId joint = blob.actuators.joint_ids[act];
@@ -585,7 +617,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             const float force_limit = act < blob.actuators.force_limits.size()
                                           ? std::max(blob.actuators.force_limits[act], 0.0f)
                                           : 0.0f;
-            if (gain > 0.0f) {
+            if (blob.actuators.types[act] == ActuatorType::Position && gain > 0.0f) {
                 d.stiffness[link] = gain;
                 d.damping[link] = 2.0f * std::sqrt(gain);  // DefaultDriveDamping.
             }
@@ -617,6 +649,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // 5. Shapes -> ModelShape rows + material buckets. Track the SOURCE shape ->
     // first cooked row + piece count for the SceneMap binding.
     model.shapes.reserve(blob.shape_count);
+    model.material_buckets.emplace_back(nk::ContactProfileV1{});
     std::vector<uint32_t> body_first_bucket(blob.body_count, 0u);
     std::vector<uint8_t>  body_has_shape(blob.body_count, 0u);
     for (uint32_t s = 0; s < blob.shape_count; ++s) {
@@ -755,8 +788,9 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_contacts_per_env =
             cap.bodies_per_env > 0u ? collidables * kCandidatePairsPerCollidable
                                     : 0u;
-        cap.max_rows_per_env =
-            cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+        SetRowCapacity(cap,
+                       static_cast<uint64_t>(cap.max_contacts_per_env) *
+                           nk::kPairDrivenRowsPerSlot);
     }
     // Contacts-OFF dynamics world (the general-path equivalent of the legacy
     // single-env enable_contacts==false): zero the per-env contact/candidate
@@ -768,7 +802,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // overload's row-budget resize a no-op (it guards on max_contacts_per_env > 0).
     if (!enable_contacts) {
         cap.max_contacts_per_env = 0u;
-        cap.max_rows_per_env     = 0u;
+        SetRowCapacity(cap, 0u);
     }
 
     // 10. — pair-driven generalized-collision + SDF main-path staging (plan
@@ -865,6 +899,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             // these lanes; a later pass wire them in the general path).
             row.body_id = static_cast<int32_t>(sh.body_row);
             row.group = 0u;
+            row.contact_profile_index = sh.material_bucket;
         }
 
         // SDF grids: mirror the cooked CookedSdfTable into the Model SDF tables;
@@ -999,6 +1034,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             ground.sdf_grid = ~0u;
             ground.body_id = -1;   // STATIC: no owning body, no reaction side.
             ground.group = 0u;
+            ground.contact_profile_index = 0u;
             model.shape_table_rows.push_back(ground);
         }
         // Grow the shape_table capacity to cover the appended static row(s). Only
@@ -1109,6 +1145,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             prow.sdf_grid = ~0u;
             prow.body_id = static_cast<int32_t>(row);
             prow.group = 0u;
+            prow.contact_profile_index = sh.material_bucket;
             model.shape_table_rows[row] = prow;
 
             // Inverse maps (reaction -> owner link) + pose binding + material + freeze.
@@ -1159,7 +1196,9 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
         cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
         cap.max_contacts_per_env += proxy_count * kCandidatePairsPerCollidable;
-        cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+        SetRowCapacity(cap,
+                       static_cast<uint64_t>(cap.max_contacts_per_env) *
+                           nk::kPairDrivenRowsPerSlot);
     }
 
     return result;
@@ -1259,8 +1298,11 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
     // kPairDrivenRowsPerSlot NkRows. The schedule + the assembly both read this.
     nk::ModelCapacities& cap = model.capacities;
     if (cap.max_contacts_per_env > 0u) {
-        cap.max_rows_per_env =
-            cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+        SetRowCapacity(cap,
+                       static_cast<uint64_t>(cap.max_contacts_per_env) *
+                           nk::kPairDrivenRowsPerSlot);
+    } else {
+        SetRowCapacity(cap, 0u);
     }
     return result;
 }
@@ -1352,7 +1394,9 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
     const uint32_t rigid_base =
         (orig_bodies + kStaticCollidables) * kCandidatePairsPerCollidable;
     cap.max_contacts_per_env = rigid_base;
-    cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    SetRowCapacity(cap,
+                   static_cast<uint64_t>(cap.max_contacts_per_env) *
+                       nk::kPairDrivenRowsPerSlot);
     // A coupled world (terrain AND particles) keeps the body<->particle slot reserve
     // disjoint above the rigid base -- no-op when particles_per_env == 0.
     GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));

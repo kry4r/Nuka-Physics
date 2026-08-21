@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/solve/nk_row.hpp"
 
 namespace {
 
@@ -87,12 +89,7 @@ nk::Model BuildTwoBodyPairDrivenModel() {
     cap.bodies_per_env = 2u;
     cap.max_bodies_total = 2u;            // shape_table stride == bodies_per_env.
     cap.max_contacts_per_env = kSlots;    // candidate slot capacity / unified buffer.
-    cap.max_rows_per_env = 0u;            // NO solver: has_contacts == false so
-                                          // AssembleRows/SolveRows are NOT added.
-                                          // The general PairDriven assembly is S5
-                                          // (Phase 1B); this is a DETECTION-only gate.
-                                          // (The FUSED assembly fallback would corrupt
-                                          // state if run on the PairDriven buffer.)
+    cap.max_rows_per_env = kSlots * nk::kPairDrivenRowsPerSlot;
 
     model.contact_family = nk::ContactFamily::PairDriven;
 
@@ -139,6 +136,7 @@ nk::Model BuildTwoBodyPairDrivenModel() {
 // byte-compare two runs.
 struct ContactStream {
     bool ok = false;
+    uint32_t failure_stage = 0u;
     uint32_t total_points = 0u;
     std::vector<uint32_t> count;       // [kSlots]
     std::vector<Vec3>     point;       // [kSlots*4]
@@ -147,6 +145,12 @@ struct ContactStream {
     std::vector<uint32_t> a;           // [kSlots*4]
     std::vector<uint32_t> b;           // [kSlots*4]
     std::vector<uint32_t> gen;         // [kSlots*4]
+    std::vector<uint64_t> id_pair;     // [kSlots*4]
+    std::vector<uint64_t> id_feature;  // [kSlots*4]
+    std::vector<uint64_t> cache_pair;  // persistent cache [kSlots*4]
+    std::vector<uint64_t> cache_feature;
+    std::vector<float> cache_lambda;   // [kSlots*4*3]
+    std::vector<float> lambda;         // [rows]
     std::vector<Vec3>     tangent1;    // [kSlots*4]
     std::vector<Vec3>     tangent2;    // [kSlots*4]
     std::vector<uint32_t> contact_count;  // [env]
@@ -155,11 +159,11 @@ struct ContactStream {
 ContactStream RunOnce() {
     ContactStream s;
     Backend b = GetBackend();
-    if (b.backend == nullptr) return s;
+    if (b.backend == nullptr) { s.failure_stage = 1u; return s; }
     nk::World world(BuildTwoBodyPairDrivenModel(), 1u, b.dev, b.backend,
                     PairDrivenConfig());
-    if (!world.Ready()) return s;
-    if (!world.Step().AllOk()) return s;
+    if (!world.Ready()) { s.failure_stage = 2u; return s; }
+    if (!world.Step().AllOk()) { s.failure_stage = 3u; return s; }
 
     const uint32_t pts = kSlots * 4u;
     s.count.assign(kSlots, 0u);
@@ -169,6 +173,12 @@ ContactStream RunOnce() {
     s.a.assign(pts, 0u);
     s.b.assign(pts, 0u);
     s.gen.assign(pts, 0u);
+    s.id_pair.assign(pts, 0u);
+    s.id_feature.assign(pts, 0u);
+    s.cache_pair.assign(pts, 0u);
+    s.cache_feature.assign(pts, 0u);
+    s.cache_lambda.assign(pts * 3u, 0.0f);
+    s.lambda.assign(kSlots * nk::kPairDrivenRowsPerSlot, 0.0f);
     s.tangent1.assign(pts, Vec3::Zero());
     s.tangent2.assign(pts, Vec3::Zero());
     s.contact_count.assign(1u, 0u);
@@ -189,13 +199,25 @@ ContactStream RunOnce() {
                         s.b.size() * sizeof(uint32_t)) &&
         d.DownloadField(nk::FieldId::UcontactGen, s.gen.data(),
                         s.gen.size() * sizeof(uint32_t)) &&
+        d.DownloadField(nk::FieldId::UcontactIdPair, s.id_pair.data(),
+                        s.id_pair.size() * sizeof(uint64_t)) &&
+        d.DownloadField(nk::FieldId::UcontactIdFeature, s.id_feature.data(),
+                        s.id_feature.size() * sizeof(uint64_t)) &&
+        d.DownloadField(nk::FieldId::ContactCachePair, s.cache_pair.data(),
+                        s.cache_pair.size() * sizeof(uint64_t)) &&
+        d.DownloadField(nk::FieldId::ContactCacheFeature, s.cache_feature.data(),
+                        s.cache_feature.size() * sizeof(uint64_t)) &&
+        d.DownloadField(nk::FieldId::ContactCacheLambda, s.cache_lambda.data(),
+                        s.cache_lambda.size() * sizeof(float)) &&
+        d.DownloadField(nk::FieldId::Lambda, s.lambda.data(),
+                        s.lambda.size() * sizeof(float)) &&
         d.DownloadField(nk::FieldId::UcontactTangent1, s.tangent1.data(),
                         s.tangent1.size() * sizeof(Vec3)) &&
         d.DownloadField(nk::FieldId::UcontactTangent2, s.tangent2.data(),
                         s.tangent2.size() * sizeof(Vec3)) &&
         d.DownloadField(nk::FieldId::ContactCount, s.contact_count.data(),
                         s.contact_count.size() * sizeof(uint32_t));
-    if (!dl) return s;
+    if (!dl) { s.failure_stage = 4u; return s; }
     for (uint32_t i = 0; i < kSlots; ++i) s.total_points += s.count[i];
     s.ok = true;
     return s;
@@ -205,6 +227,14 @@ bool Finite(const Vec3& v) {
     return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 
+uint32_t FirstCachedPoint(const std::vector<uint64_t>& pair,
+                          const std::vector<uint64_t>& feature) {
+    for (uint32_t i = 0u; i < pair.size(); ++i) {
+        if (pair[i] != 0u && feature[i] != 0u) return i;
+    }
+    return ~0u;
+}
+
 }  // namespace
 
 // --- The detection gate -----------------------------------------------------
@@ -212,7 +242,9 @@ TEST(PairDrivenNarrowphase, CvxDetectsOverlapWithIdsAndTangents) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
 
     const ContactStream s = RunOnce();
-    ASSERT_TRUE(s.ok) << "the PairDriven narrowphase world failed to build/step/download";
+    ASSERT_TRUE(s.ok) << "the PairDriven narrowphase world failed at stage "
+                      << s.failure_stage
+                      << " (1=backend, 2=ready, 3=step, 4=download)";
 
     // (1) CONTACTS DETECTED: the overlapping capsule x box produced >0 contacts
     // through the cvx GJK/EPA fallback (the analytic ladder does NOT handle
@@ -246,6 +278,10 @@ TEST(PairDrivenNarrowphase, CvxDetectsOverlapWithIdsAndTangents) {
                 << ca << "," << cb << ")";
             // gen is the constant ACTIVE marker (1) for emitted points.
             EXPECT_EQ(s.gen[at], 1u) << "active point must carry gen==1";
+            EXPECT_NE(s.id_pair[at], 0u) << "active point must carry a pair id";
+            EXPECT_NE(s.id_feature[at], 0u) << "active point must carry a feature id";
+            EXPECT_EQ(s.cache_pair[at], s.id_pair[at]);
+            EXPECT_EQ(s.cache_feature[at], s.id_feature[at]);
 
             // (5) NORMAL is a unit separation dir for side A; depth is a plausible
             // shallow positive penetration (the bodies overlap ~0.03 m).
@@ -263,6 +299,18 @@ TEST(PairDrivenNarrowphase, CvxDetectsOverlapWithIdsAndTangents) {
             EXPECT_NEAR(t2.Dot(s.normal[at]), 0.0f, 1.0e-3f) << "t2 not perp to n";
             EXPECT_NEAR(t1.Dot(t2), 0.0f, 1.0e-3f) << "t1,t2 not orthogonal";
         }
+        for (uint32_t i = n; i < 4u; ++i) {
+            const size_t at = static_cast<size_t>(slot) * 4u + i;
+            EXPECT_EQ(s.id_pair[at], 0u) << "inactive point must clear pair id";
+            EXPECT_EQ(s.id_feature[at], 0u) << "inactive point must clear feature id";
+        }
+    }
+    for (uint32_t slot = 0; slot < kSlots; ++slot) {
+        for (uint32_t i = s.count[slot]; i < 4u; ++i) {
+            const size_t at = static_cast<size_t>(slot) * 4u + i;
+            EXPECT_EQ(s.id_pair[at], 0u) << "inactive point must clear pair id";
+            EXPECT_EQ(s.id_feature[at], 0u) << "inactive point must clear feature id";
+        }
     }
     EXPECT_GT(inspected, 0u) << "no active manifold points were inspected";
 }
@@ -273,7 +321,9 @@ TEST(PairDrivenNarrowphase, TwoRunsByteIdentical) {
 
     const ContactStream a = RunOnce();
     const ContactStream b = RunOnce();
-    ASSERT_TRUE(a.ok && b.ok);
+    ASSERT_TRUE(a.ok && b.ok)
+        << "PairDriven runs failed at stages " << a.failure_stage << " and "
+        << b.failure_stage;
     ASSERT_GT(a.total_points, 0u);
 
     auto SameBytes = [](const auto& x, const auto& y) -> bool {
@@ -290,7 +340,178 @@ TEST(PairDrivenNarrowphase, TwoRunsByteIdentical) {
     EXPECT_TRUE(SameBytes(a.a, b.a)) << "ucontact_a differs across runs";
     EXPECT_TRUE(SameBytes(a.b, b.b)) << "ucontact_b differs across runs";
     EXPECT_TRUE(SameBytes(a.gen, b.gen)) << "ucontact_gen differs across runs";
+    EXPECT_TRUE(SameBytes(a.id_pair, b.id_pair)) << "ucontact_id_pair differs across runs";
+    EXPECT_TRUE(SameBytes(a.id_feature, b.id_feature))
+        << "ucontact_id_feature differs across runs";
+    EXPECT_TRUE(SameBytes(a.cache_pair, b.cache_pair))
+        << "contact_cache_pair differs across runs";
+    EXPECT_TRUE(SameBytes(a.cache_feature, b.cache_feature))
+        << "contact_cache_feature differs across runs";
+    EXPECT_TRUE(SameBytes(a.cache_lambda, b.cache_lambda))
+        << "contact_cache_lambda differs across runs";
     EXPECT_TRUE(SameBytes(a.tangent1, b.tangent1)) << "ucontact_tangent1 differs across runs";
     EXPECT_TRUE(SameBytes(a.tangent2, b.tangent2)) << "ucontact_tangent2 differs across runs";
     EXPECT_EQ(a.total_points, b.total_points);
+}
+
+TEST(PairDrivenNarrowphase, ContactBlock3LambdasStayInsideCone) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    const ContactStream s = RunOnce();
+    ASSERT_TRUE(s.ok);
+    uint32_t checked = 0u;
+    for (uint32_t slot = 0u; slot < kSlots; ++slot) {
+        for (uint32_t point = 0u; point < s.count[slot]; ++point) {
+            const uint32_t base = slot * nk::kPairDrivenRowsPerSlot;
+            const float n = std::max(s.lambda[base + point], 0.0f);
+            const float t1 = s.lambda[base + nk::kPairDrivenPtsPerSlot + point];
+            const float t2 = s.lambda[base + 2u * nk::kPairDrivenPtsPerSlot + point];
+            const float radial = std::sqrt(t1 * t1 + t2 * t2);
+            EXPECT_GE(n, 0.0f);
+            EXPECT_LE(radial, 0.8f * n + 1.0e-5f)
+                << "contact point escaped the isotropic friction cone";
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 0u);
+}
+
+TEST(PairDrivenNarrowphase, WarmStartCacheSeedsRowsAndVelocity) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    Backend b = GetBackend();
+    nk::Pipeline::SolverConfig cfg = PairDrivenConfig();
+    cfg.vel_iters = 0u;
+    nk::World world(BuildTwoBodyPairDrivenModel(), 1u, b.dev, b.backend, cfg);
+    ASSERT_TRUE(world.Ready());
+    ASSERT_TRUE(world.Step().AllOk());
+
+    constexpr uint32_t kPoints = kSlots * 4u;
+    std::vector<uint64_t> pair(kPoints, 0u);
+    std::vector<uint64_t> feature(kPoints, 0u);
+    std::vector<float> cache_lambda(kPoints * 3u, 0.0f);
+    nk::Data& data = world.GetData();
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCachePair, pair.data(),
+                                   pair.size() * sizeof(uint64_t)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCacheFeature, feature.data(),
+                                   feature.size() * sizeof(uint64_t)));
+    uint32_t cached_point = FirstCachedPoint(pair, feature);
+    ASSERT_NE(cached_point, ~0u);
+    constexpr float kSeedImpulse = 0.125f;
+    cache_lambda[cached_point * 3u] = kSeedImpulse;
+    ASSERT_TRUE(data.UploadField(nk::FieldId::ContactCacheLambda,
+                                 cache_lambda.data(),
+                                 cache_lambda.size() * sizeof(float)));
+
+    ASSERT_TRUE(world.Step().AllOk());
+    std::vector<uint64_t> current_pair(kPoints, 0u);
+    std::vector<uint64_t> current_feature(kPoints, 0u);
+    std::vector<float> rows(kSlots * nk::kPairDrivenRowsPerSlot, 0.0f);
+    std::vector<Vec3> velocity(2u, Vec3::Zero());
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::UcontactIdPair,
+                                   current_pair.data(),
+                                   current_pair.size() * sizeof(uint64_t)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::UcontactIdFeature,
+                                   current_feature.data(),
+                                   current_feature.size() * sizeof(uint64_t)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::Lambda, rows.data(),
+                                   rows.size() * sizeof(float)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::BodyLinearVelocity,
+                                   velocity.data(),
+                                   velocity.size() * sizeof(Vec3)));
+
+    uint32_t current_point = ~0u;
+    for (uint32_t i = 0u; i < kPoints; ++i) {
+        if (current_pair[i] == pair[cached_point] &&
+            current_feature[i] == feature[cached_point]) {
+            current_point = i;
+            break;
+        }
+    }
+    ASSERT_NE(current_point, ~0u);
+    const uint32_t slot = current_point / 4u;
+    const uint32_t point = current_point & 3u;
+    const uint32_t normal_row = slot * nk::kPairDrivenRowsPerSlot + point;
+    EXPECT_FLOAT_EQ(rows[normal_row], kSeedImpulse);
+    EXPECT_GT(velocity[1].Dot(velocity[1]), 1.0e-6f)
+        << "cached impulse was not applied to the movable body";
+}
+
+TEST(PairDrivenNarrowphase, WarmStartInvalidatesAndResetsDeterministically) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    Backend b = GetBackend();
+    nk::Pipeline::SolverConfig cfg = PairDrivenConfig();
+    cfg.vel_iters = 0u;
+    nk::World world(BuildTwoBodyPairDrivenModel(), 1u, b.dev, b.backend, cfg);
+    ASSERT_TRUE(world.Ready());
+    ASSERT_TRUE(world.Step().AllOk());
+
+    constexpr uint32_t kPoints = kSlots * 4u;
+    constexpr uint32_t kRows = kSlots * nk::kPairDrivenRowsPerSlot;
+    nk::Data& data = world.GetData();
+    std::vector<uint64_t> pair(kPoints, 0u), feature(kPoints, 0u);
+    std::vector<Vec3> normal(kPoints, Vec3::Zero());
+    std::vector<uint32_t> material(kPoints, 0u), age(kPoints, 0u);
+    std::vector<float> cache_lambda(kPoints * 3u, 0.0f), rows(kRows, 0.0f);
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCachePair, pair.data(),
+                                   pair.size() * sizeof(uint64_t)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCacheFeature, feature.data(),
+                                   feature.size() * sizeof(uint64_t)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCacheNormal, normal.data(),
+                                   normal.size() * sizeof(Vec3)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCacheMaterial,
+                                   material.data(),
+                                   material.size() * sizeof(uint32_t)));
+    const uint32_t point_index = FirstCachedPoint(pair, feature);
+    ASSERT_NE(point_index, ~0u);
+    const uint32_t normal_row = (point_index / 4u) *
+                                    nk::kPairDrivenRowsPerSlot +
+                                (point_index & 3u);
+
+    cache_lambda[point_index * 3u] = 0.125f;
+    normal[point_index] = normal[point_index] * -1.0f;
+    ASSERT_TRUE(data.UploadField(nk::FieldId::ContactCacheLambda,
+                                 cache_lambda.data(),
+                                 cache_lambda.size() * sizeof(float)));
+    ASSERT_TRUE(data.UploadField(nk::FieldId::ContactCacheNormal, normal.data(),
+                                 normal.size() * sizeof(Vec3)));
+    ASSERT_TRUE(world.Step().AllOk());
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::Lambda, rows.data(),
+                                   rows.size() * sizeof(float)));
+    EXPECT_FLOAT_EQ(rows[normal_row], 0.0f) << "flipped normal reused cache";
+
+    cache_lambda.assign(kPoints * 3u, 0.0f);
+    cache_lambda[point_index * 3u] = 0.125f;
+    material[point_index] ^= 0x1u;
+    ASSERT_TRUE(data.UploadField(nk::FieldId::ContactCacheLambda,
+                                 cache_lambda.data(),
+                                 cache_lambda.size() * sizeof(float)));
+    ASSERT_TRUE(data.UploadField(nk::FieldId::ContactCacheMaterial,
+                                 material.data(),
+                                 material.size() * sizeof(uint32_t)));
+    ASSERT_TRUE(world.Step().AllOk());
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::Lambda, rows.data(),
+                                   rows.size() * sizeof(float)));
+    EXPECT_FLOAT_EQ(rows[normal_row], 0.0f) << "changed material reused cache";
+
+    std::vector<Transform> pose(2u, Transform::Identity());
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::BodyPose, pose.data(),
+                                   pose.size() * sizeof(Transform)));
+    pose[1].position.x = 2.0f;
+    ASSERT_TRUE(data.UploadField(nk::FieldId::BodyPose, pose.data(),
+                                 pose.size() * sizeof(Transform)));
+    ASSERT_TRUE(world.Step().AllOk());
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCachePair, pair.data(),
+                                   pair.size() * sizeof(uint64_t)));
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCacheAge, age.data(),
+                                   age.size() * sizeof(uint32_t)));
+    EXPECT_NE(pair[point_index], 0u);
+    EXPECT_EQ(age[point_index], 1u);
+    ASSERT_TRUE(world.Step().AllOk());
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCachePair, pair.data(),
+                                   pair.size() * sizeof(uint64_t)));
+    EXPECT_EQ(pair[point_index], 0u) << "expired contact cache was not cleared";
+
+    ASSERT_EQ(world.Reset({0u}), nphi::Status::Ok);
+    ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCachePair, pair.data(),
+                                   pair.size() * sizeof(uint64_t)));
+    for (uint64_t id : pair) EXPECT_EQ(id, 0u);
 }
