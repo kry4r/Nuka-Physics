@@ -33,6 +33,7 @@ struct CookedJointTable {
     std::vector<math::Transform> child_frames;
     std::vector<float>      lower_limits;
     std::vector<float>      upper_limits;
+    std::vector<uint8_t>    limit_flags;  // bit0 lower, bit1 upper
     std::vector<float>      dampings;
     std::vector<float>      armatures;
     std::vector<float>      initial_positions;

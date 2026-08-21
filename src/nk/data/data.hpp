@@ -43,6 +43,12 @@ public:
     // class). The device op forms land in M3b; these give World a working
     // host-mediated path now (BufferI download/upload). Returns false if
     // unallocated.
+    // Capture or restore the complete persistent arena. This is the production
+    // checkpoint boundary for all cross-step state, including warm-start caches.
+    uint64_t PersistentByteSize() const;
+    bool DownloadPersistent(std::vector<uint8_t>* out) const;
+    bool UploadPersistent(const std::vector<uint8_t>& bytes) const;
+
     bool Snapshot();
     bool Restore();
     bool HasSnapshot() const { return !snapshot_persistent_.empty(); }

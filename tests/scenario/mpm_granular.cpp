@@ -20,6 +20,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <numbers>
 #include <vector>
 
 #include "math/transform.hpp"
@@ -91,7 +93,7 @@ void FillMaterialAndGrid(cook::MpmCookInput& in, float friction_deg,
 cook::MpmCookInput BuildConeInput(float friction_deg, float model_kind) {
     cook::MpmCookInput in;
     const float pdx = kDx * 0.5f;
-    const float H = kConeR * std::tan(kConeSlope * static_cast<float>(M_PI) / 180.0f);
+    const float H = kConeR * std::tan(kConeSlope * std::numbers::pi_v<float> / 180.0f);
     const char* shape = std::getenv("NUKA_CONE_SHAPE");
     const bool cyl = shape != nullptr && shape[0] == 'c' && shape[1] == 'y';
     const bool disc = shape != nullptr && shape[0] == 'd';
@@ -231,7 +233,8 @@ PileStats RunPile(Backend b, cook::MpmCookInput in, uint32_t steps) {
     }
     if (nn >= 2 && (nn * srr - sr * sr) > 1e-12) {
         const double slope = (nn * srz - sr * sz) / (nn * srr - sr * sr);
-        st.angle_deg = static_cast<float>(std::atan(-slope) * 180.0 / M_PI);
+        st.angle_deg = static_cast<float>(
+            std::atan(-slope) * 180.0 / std::numbers::pi_v<double>);
     }
     return st;
 }
@@ -398,7 +401,7 @@ TEST(MpmGranular, ConeReposeTracksFriction) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
     constexpr uint32_t kSteps = 600u;   // 2.5 s settle.
-    const float H = kConeR * std::tan(kConeSlope * static_cast<float>(M_PI) / 180.0f);
+    const float H = kConeR * std::tan(kConeSlope * std::numbers::pi_v<float> / 180.0f);
 
     const PileStats sand35 = RunPile(b, BuildConeInput(35.0f, 4.0f), kSteps);
     const PileStats sand15 = RunPile(b, BuildConeInput(15.0f, 4.0f), kSteps);
@@ -621,12 +624,13 @@ TEST(MpmGranular, ValidatorAndNksRoundtrip) {
     // .nks roundtrip: kind string + the DP material survive save/load.
     ns::SceneIR scene;
     scene.AddMedia(make(K::Granular, Me::MlsMpm, 4.0f));
-    char tmpl[] = "/tmp/nks_granular_XXXXXX";
-    char* dir = ::mkdtemp(tmpl);
-    ASSERT_NE(nullptr, dir);
-    const std::string path = std::string(dir) + "/granular.nks";
-    ns::nks::Save(scene, path);
-    const ns::SceneIR loaded = ns::nks::Load(path);
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() /
+                                      ("nks_granular_" + std::to_string(unique));
+    ASSERT_TRUE(std::filesystem::create_directories(dir));
+    const std::filesystem::path path = dir / "granular.nks";
+    ns::nks::Save(scene, path.string());
+    const ns::SceneIR loaded = ns::nks::Load(path.string());
     ASSERT_EQ(1u, loaded.Media().size());
     const ns::MediaRecord& r = loaded.Media().front();
     EXPECT_EQ(K::Granular, r.kind);
@@ -635,8 +639,7 @@ TEST(MpmGranular, ValidatorAndNksRoundtrip) {
     EXPECT_EQ(12.0f, r.mpm.dp_cohesion);
     EXPECT_EQ(4.0f, r.mpm.model_kind);
     EXPECT_EQ(0.005f, r.fluid_box.spacing);
-    std::remove(path.c_str());
-    ::rmdir(dir);
+    std::filesystem::remove_all(dir);
 }
 
 // Manual diagnostic: step one cone (env NUKA_CONE_KIND / NUKA_CONE_FRICTION)

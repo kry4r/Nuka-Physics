@@ -316,13 +316,25 @@ scene::SceneIR LoadUrdf(const std::string& path) {
             }
         }
 
-        // <limit lower="..." upper="..."/>
+        float effort_limit = 0.0f;
+        // <limit lower="..." upper="..." effort="..."/>
         if (auto* limit = joint->FirstChildElement("limit")) {
-            limit->QueryFloatAttribute("lower", &jrec.lower_limit);
-            limit->QueryFloatAttribute("upper", &jrec.upper_limit);
+            jrec.has_lower_limit =
+                limit->QueryFloatAttribute("lower", &jrec.lower_limit) == tinyxml2::XML_SUCCESS;
+            jrec.has_upper_limit =
+                limit->QueryFloatAttribute("upper", &jrec.upper_limit) == tinyxml2::XML_SUCCESS;
+            (void)limit->QueryFloatAttribute("effort", &effort_limit);
         }
 
-        scene.AddJoint(std::move(jrec));
+        const scene::JointId joint_id = scene.AddJoint(std::move(jrec));
+        if (effort_limit > 0.0f) {
+            scene::ActuatorRecord actuator;
+            actuator.name = joint_name + "_effort";
+            actuator.type = scene::ActuatorType::Motor;
+            actuator.joint_id = joint_id;
+            actuator.force_limit = effort_limit;
+            scene.AddActuator(std::move(actuator));
+        }
     }
 
     return scene;

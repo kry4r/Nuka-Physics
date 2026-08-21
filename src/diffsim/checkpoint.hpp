@@ -48,6 +48,18 @@ namespace nuka::diffsim {
 
 namespace articulation = nuka::runtime::articulation;
 
+struct ContactWarmStartDeviceState {
+    uint32_t point_count = 0u;
+    const uint64_t* pair = nullptr;
+    const uint64_t* feature = nullptr;
+    const float* lambda = nullptr;       // 3 floats per point
+    const nuka::math::Vec3* normal = nullptr;
+    const nuka::math::Vec3* tangent1 = nullptr;
+    const nuka::math::Vec3* tangent2 = nullptr;
+    const uint64_t* material = nullptr;
+    const uint32_t* age = nullptr;
+};
+
 // The per-checkpoint device storage (one contiguous block per buffer, sliced by
 // slot). Plus the host-side record of which forward step each slot snapshots.
 class CheckpointManager {
@@ -60,7 +72,8 @@ public:
     // slot_count*3 / env (== kMaxFootContactsPerEnv*3) when contacts land.
     CheckpointManager(cudaStream_t stream, int device_id,
                       uint32_t max_checkpoints, uint32_t articulation_count,
-                      uint32_t total_link_count, uint32_t lambda_width = 0u);
+                      uint32_t total_link_count, uint32_t lambda_width = 0u,
+                      uint32_t contact_point_count = 0u);
 
     uint32_t Capacity() const { return max_checkpoints_; }
     uint32_t Count() const { return count_; }
@@ -74,7 +87,8 @@ public:
     // capacity is exceeded. Slots are filled in increasing step order, so the
     // step->slot map is monotone (NearestCheckpointBefore exploits that).
     uint32_t Capture(const articulation::ArticulationDeviceState& state,
-                     uint32_t step_index, const float* lambda_device = nullptr);
+                     uint32_t step_index, const float* lambda_device = nullptr,
+                     const ContactWarmStartDeviceState* contact_cache = nullptr);
 
     // Restores slot `slot`'s snapshot back into `state` (D2D copy of base_pose /
     // link_velocity / q / qdot) and, if `lambda_device` is non-null and the slot
@@ -83,7 +97,8 @@ public:
     // derived buffers). D1: flat contiguous D2D copies.
     void Restore(uint32_t slot,
                  const articulation::ArticulationDeviceState& state,
-                 float* lambda_device = nullptr) const;
+                 float* lambda_device = nullptr,
+                 const ContactWarmStartDeviceState* contact_cache = nullptr) const;
 
     // The forward step a slot snapshots.
     uint32_t StepOf(uint32_t slot) const { return slot_steps_[slot]; }
@@ -104,6 +119,7 @@ private:
     uint32_t articulation_count_ = 0u;
     uint32_t total_link_count_ = 0u;
     uint32_t lambda_width_ = 0u;
+    uint32_t contact_point_count_ = 0u;
     uint32_t count_ = 0u;
 
     // Contiguous per-buffer storage; slot s lives at offset s*width.
@@ -112,6 +128,14 @@ private:
     phi::Buffer* q_ = nullptr;             // float[max_checkpoints * total_link_count]
     phi::Buffer* qdot_ = nullptr;          // float[max_checkpoints * total_link_count]
     phi::Buffer* lambda_ = nullptr;        // float[max_checkpoints * lambda_width] (R2)
+    phi::Buffer* contact_pair_ = nullptr;
+    phi::Buffer* contact_feature_ = nullptr;
+    phi::Buffer* contact_lambda_ = nullptr;
+    phi::Buffer* contact_normal_ = nullptr;
+    phi::Buffer* contact_tangent1_ = nullptr;
+    phi::Buffer* contact_tangent2_ = nullptr;
+    phi::Buffer* contact_material_ = nullptr;
+    phi::Buffer* contact_age_ = nullptr;
 
     std::vector<uint32_t> slot_steps_;  // host: slot -> forward step index
 };

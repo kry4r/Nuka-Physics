@@ -41,6 +41,7 @@
 #include "collision/lbvh_node.cuh"             // LbvhNode (arena tree traversal)
 #include "collision/shape_kind.hpp"            // nuka::collision::ShapeKind
 #include "math/transform.hpp"
+#include "nk/contact/contact_identity.hpp"
 #include "nk/model/generated/views.hpp"        // ModelView / DataView
 #include "nk/solve/nk_row.hpp"                  // kUContactSide* (side-kind tags)
 #include "phi/backend_cuda/launch.cuh"
@@ -389,6 +390,8 @@ __global__ void NarrowphaseBodyParticleKernel(
     uint32_t* __restrict__ ucontact_a_kind,
     uint32_t* __restrict__ ucontact_b_kind,
     uint32_t* __restrict__ ucontact_gen,
+    uint64_t* __restrict__ ucontact_id_pair,
+    uint64_t* __restrict__ ucontact_id_feature,
     uint32_t* __restrict__ contact_count,
     uint32_t* __restrict__ env_status) {
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -424,6 +427,8 @@ __global__ void NarrowphaseBodyParticleKernel(
                 ucontact_a_kind[cell + i] = ::nuka::nk::kUContactSideBody;
                 ucontact_b_kind[cell + i] = ::nuka::nk::kUContactSideBody;
                 ucontact_gen[cell + i] = 0u;
+                ucontact_id_pair[cell + i] = 0u;
+                ucontact_id_feature[cell + i] = 0u;
             }
         }
     }
@@ -590,6 +595,26 @@ __global__ void NarrowphaseBodyParticleKernel(
                         ucontact_a_kind[scell + i] = ::nuka::nk::kUContactSideParticle;
                         ucontact_b_kind[scell + i] = ::nuka::nk::kUContactSideBody;
                         ucontact_gen[scell + i] = 1u;
+                        ::nuka::nk::CanonicalContactDescriptor descriptor;
+                        descriptor.a.type =
+                            ::nuka::constraint::CollidableType::Particle;
+                        descriptor.a.handle = global_particle;
+                        descriptor.b.handle = body;
+                        descriptor.local_point_a = m.points[i].position - center;
+                        descriptor.local_point_b =
+                            ::nuka::phi::nkops::PrimInverseTransformPoint(
+                                xb, m.points[i].position);
+                        descriptor.normal = m.points[i].normal;
+                        const uint32_t feature = m.points[i].stable_key == 0u
+                            ? ::nuka::nk::kContactFeatureUnavailable
+                            : static_cast<uint32_t>(m.points[i].stable_key);
+                        descriptor.feature_a = feature;
+                        descriptor.feature_b = feature;
+                        descriptor.manifold_slot = i;
+                        const ::nuka::nk::ContactId id =
+                            ::nuka::nk::MakeContactId(descriptor);
+                        ucontact_id_pair[scell + i] = id.pair;
+                        ucontact_id_feature[scell + i] = id.feature;
                     }
                 }
                 emitted_points += n;
@@ -641,6 +666,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
                    data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                    data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                    data.ucontact_a_kind, data.ucontact_b_kind, data.ucontact_gen,
+                   data.ucontact_id_pair, data.ucontact_id_feature,
                    data.contact_count, data.env_status);
     };
     if (warp) launch(&NarrowphaseBodyParticleKernel<true>);

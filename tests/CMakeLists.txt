@@ -851,6 +851,7 @@ gtest_discover_tests(nuka_collision_test
 # --- Constraint tests ------------------------------------------------------
 add_executable(nuka_constraint_test
     constraint/test_contact_manifold.cpp
+    constraint/test_contact_identity.cpp
     constraint/test_csr_row_layout.cpp
 )
 
@@ -1414,6 +1415,40 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_scenario_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
+
+    add_executable(nuka_contact_identity_cuda_test
+        scenario/pairdriven_narrowphase.cpp
+    )
+    add_dependencies(nuka_contact_identity_cuda_test nuka_codegen)
+    target_include_directories(nuka_contact_identity_cuda_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_contact_identity_cuda_test
+        PRIVATE
+            nuka_nk
+            nuka_phi2
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_contact_identity_cuda_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        TEST_PREFIX "ContactIdentityCuda."
+        PROPERTIES LABELS "fast_full")
+
+    add_executable(nuka_pairdriven_solve_cuda_test
+        scenario/pairdriven_solve.cpp
+    )
+    add_dependencies(nuka_pairdriven_solve_cuda_test nuka_codegen)
+    target_include_directories(nuka_pairdriven_solve_cuda_test
+        PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_pairdriven_solve_cuda_test
+        PRIVATE
+            nuka_nk
+            nuka_phi2
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_pairdriven_solve_cuda_test
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        TEST_PREFIX "PairDrivenSolveCuda."
+        PROPERTIES LABELS "fast_full")
 
     # --- CouplingProvider op-list identity (the body↔particle row provider) -----
     # Pure-host structural proof: builds a cooked-Model matrix through

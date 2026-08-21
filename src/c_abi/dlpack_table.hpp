@@ -67,6 +67,7 @@ struct DlpackFieldRow {
 // static_assert in articulation_types.cuh already pins sizeof(Transform)==28).
 inline constexpr uint32_t kStrideF32   = static_cast<uint32_t>(sizeof(float));        // 4
 inline constexpr uint32_t kStrideU32   = static_cast<uint32_t>(sizeof(uint32_t));     // 4
+inline constexpr uint32_t kStrideF32x2 = static_cast<uint32_t>(2u * sizeof(float));   // 8
 inline constexpr uint32_t kStrideVec3  = static_cast<uint32_t>(3u * sizeof(float));   // 12
 inline constexpr uint32_t kStrideSpat6 = static_cast<uint32_t>(6u * sizeof(float));   // 24
 inline constexpr uint32_t kStridePose  = static_cast<uint32_t>(7u * sizeof(float));   // 28
@@ -142,27 +143,25 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     //    cooked rigid SoA (per:body; empty view on a body-free world). ---------------
     {NUKA_FIELD_BODY_LINEAR_VELOCITY,   kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyLinearVelocity},
     {NUKA_FIELD_BODY_ANGULAR_VELOCITY,  kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyAngularVelocity},
+    {NUKA_FIELD_JOINT_LIMIT_IMPULSE,    kStrideF32x2, kWireDtypeF32, nk::FieldId::JointLimitImpulse},
+    {NUKA_FIELD_ACTUATOR_EFFORT_REQUESTED, kStrideF32, kWireDtypeF32, nk::FieldId::ActuatorEffortRequested},
+    {NUKA_FIELD_ACTUATOR_EFFORT,        kStrideF32,   kWireDtypeF32, nk::FieldId::ActuatorEffort},
+    {NUKA_FIELD_ACTUATOR_SATURATED,     kStrideF32,   kWireDtypeF32, nk::FieldId::ActuatorSaturated},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
-// The table must cover exactly the 27 public fields (0..26), one row each, in
-// integer order. BODY_ANGULAR_VELOCITY == 26 is the highest public field; the count
-// is one past it. (Append-only: bump this together with a new trailing row.)
-// Fields 0..19 are byte-pinned by the RL contract; fields 20/21 are the Go2-on-
-// stairs per-env terrain controls; field 22 is the unified-actuator feed-forward
-// joint force; fields 23/24 are the coupled-world particle position/velocity; fields
-// 25/26 are the per-body linear/angular velocity (all appended, never reordered).
-static_assert(kDlpackFieldCount == 27u,
-              "dlpack_table must hold exactly the 27 public state fields");
+// The table covers the append-only public field range through actuator telemetry.
+static_assert(kDlpackFieldCount == 31u,
+              "dlpack_table must hold exactly the 31 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_PARTICLE_VELOCITY) == 24,
               "public field enum range changed — review the RL binary contract");
-static_assert(static_cast<int>(NUKA_FIELD_BODY_ANGULAR_VELOCITY) == 26,
+static_assert(static_cast<int>(NUKA_FIELD_ACTUATOR_SATURATED) == 30,
               "public field enum range changed — review the RL binary contract");
 
 // Resolve a public field's canonical descriptor. Returns nullptr if the field

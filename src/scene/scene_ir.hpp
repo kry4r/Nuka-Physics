@@ -120,6 +120,8 @@ struct JointRecord {
     math::Transform child_frame            = math::Transform::Identity();
     float lower_limit                      = -3.14159f;
     float upper_limit                      =  3.14159f;
+    bool has_lower_limit                   = false;
+    bool has_upper_limit                   = false;
     float damping                          = 0.0f;
     float armature                         = 0.0f;
     float stiffness                        = 0.0f;

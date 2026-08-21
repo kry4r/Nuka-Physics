@@ -11,6 +11,7 @@ extern "C" {
 typedef struct nuka_device_t* nuka_device_handle;
 typedef struct nuka_world_t* nuka_world_handle;
 typedef struct nuka_buffer_t* nuka_buffer_handle;
+typedef struct nuka_checkpoint_t* nuka_checkpoint_handle;
 
 // Per-env contact-slot count for the per-contact enumeration fields
 // (NUKA_FIELD_CONTACT_POINTS / _NORMAL / _FORCE / _LINK). A caller sizes those
@@ -300,6 +301,15 @@ nuka_result_t nuka_world_reset(nuka_world_handle world);
 nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
                                     const uint32_t* env_ids,
                                     uint32_t count);
+
+// Checkpoints capture the complete persistent arena and validate world ownership.
+nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
+                                            nuka_checkpoint_handle* out);
+nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
+                                            nuka_checkpoint_handle checkpoint);
+void nuka_checkpoint_destroy(nuka_checkpoint_handle checkpoint);
+// Hashes persistent simulation bytes plus host step/config state in fixed order.
+nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash);
 
 typedef enum nuka_state_field_t {
     NUKA_FIELD_RIGID_BODY_TRANSFORM = 0,
@@ -599,15 +609,20 @@ typedef enum nuka_state_field_t {
     // world resolves an empty view (element_count == 0). Written via
     // nuka_world_upload_field to park a free body (e.g. the water-demo bunny hold).
     NUKA_FIELD_BODY_LINEAR_VELOCITY = 25,
-    NUKA_FIELD_BODY_ANGULAR_VELOCITY = 26
+    NUKA_FIELD_BODY_ANGULAR_VELOCITY = 26,
+    // READ: lower/upper joint-limit impulse per link, stored as two float32 values.
+    NUKA_FIELD_JOINT_LIMIT_IMPULSE = 27,
+    // READ: requested effort, saturated actuator effort, and a float32 0/1 clamp flag.
+    NUKA_FIELD_ACTUATOR_EFFORT_REQUESTED = 28,
+    NUKA_FIELD_ACTUATOR_EFFORT = 29,
+    NUKA_FIELD_ACTUATOR_SATURATED = 30
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {
     void* device_ptr;
     size_t element_count;
     uint32_t element_stride_bytes;
-    // Element scalar type: 0 == float32 (every field except CONTACT_LINK), 1 ==
-    // uint32 (CONTACT_LINK only -- the per-slot owning global link index).
+    // Element scalar type: 0 == float32, 1 == uint32.
     uint8_t dtype;
 } nuka_buffer_view_t;
 

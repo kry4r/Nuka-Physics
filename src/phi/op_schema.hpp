@@ -40,8 +40,8 @@ namespace nuka::phi {
 // readers) replaces the bare literals so a lane addition bumps ONE constant.
 // ---------------------------------------------------------------------------
 // shape_table packed f32 / body row {kind, p0..p3, contype, conaffinity,
-// sdf_grid, body_id, group, hull_vert_offset, hull_vert_count}.
-inline constexpr uint32_t kShapeTableRowStride = 12u;
+// sdf_grid, body_id, group, hull_vert_offset, hull_vert_count, contact_profile_index}.
+inline constexpr uint32_t kShapeTableRowStride = 13u;
 // SDF header packed f32 / grid {origin.xyz, voxel_size, dims.xyz, cell_offset}.
 inline constexpr uint32_t kSdfHeaderStride = 8u;
 
@@ -164,8 +164,9 @@ enum class NkOp : uint16_t {
                             // PairDriven-family-gated. APPENDED after the prior ops
                             // (stable NkOp values; execution order is the pipeline's,
                             // not the enum value).
+    ContactWarmStart,       // ContactId-indexed warm-start prepare/commit.
 
-    Count                  // sentinel: number of ops (NOT an op)
+    Count                    // sentinel: number of ops (NOT an op)
 };
 
 // ---------------------------------------------------------------------------
@@ -575,6 +576,7 @@ struct AssembleRowsParams {
     uint32_t family;            // kContactFamily*
     uint32_t union_slot_count;  // union slots per env
     uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
+    uint32_t contact_rows_per_env; // fixed contact footprint before joint-limit rows
     // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
     // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
     // Equal to union_slot_count when the model has no body-particle reserve.
@@ -613,6 +615,7 @@ struct SolveRowsBlockIslandParams {
     uint32_t env_count;
     uint32_t articulation_count;
     uint32_t rows_per_env;       // row slots per env (union family)
+    uint32_t contact_rows_per_env; // fixed contact footprint before joint-limit rows
     uint32_t base_link_count;    // links per env (qdot scatter)
     uint32_t total_body_count;   // env-major rigid body count
     // Fused-family legacy knobs (Model properties; unused by the union family):
@@ -856,8 +859,10 @@ struct ExportObsParams {
 // is how many leading entries are valid.
 struct ResetEnvsParams {
     uint32_t count;
+    uint32_t env_count;
     uint32_t base_link_count;
     uint32_t lambda_stride;     // row slots per env (== max_rows_per_env)
+    uint32_t contact_slot_count;// contact slots per env (cache clear span)
     uint32_t articulation_count;
     // movable rigid-body restore arm. body_count is the PER-ENV body
     // stride (bodies_per_env); ResetEnvsKernel restores each reset env's body
@@ -905,6 +910,7 @@ struct RestoreStateParams {
     uint32_t total_link_count;
     uint32_t env_count;
     uint32_t row_slot_count;    // env_count * max_rows_per_env (lambda clear)
+    uint32_t contact_slot_count;// env_count * max_contacts_per_env (cache clear)
     // env-major total movable rigid-body count (bodies_per_env*env_count).
     // OpRestoreState appends the body_pose/lin/ang snapshot->live copies after
     // the articulation restore. 0 => no bodies (articulation restore unchanged).
@@ -913,6 +919,15 @@ struct RestoreStateParams {
     // appends the particle pos/prev_pos/vel snapshot->live copies; 0 => no particle
     // slice (restore byte-identical to a particle-free world).
     uint32_t total_particle_count;
+};
+
+struct ContactWarmStartParams {
+    uint32_t phase;              // 0 = prepare rows, 1 = commit solved blocks
+    uint32_t env_count;
+    uint32_t slot_count;         // contact slots per env
+    uint32_t rows_per_env;
+    uint32_t full_row_slot_count;
+    uint32_t decay_steps;        // absent contacts expire after this many steps
 };
 
 // --- domain randomization -----------------------------------------------

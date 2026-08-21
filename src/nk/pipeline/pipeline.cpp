@@ -11,6 +11,7 @@
 #include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/model.hpp"
+#include "nk/solve/nk_row.hpp"
 
 namespace nuka::nk {
 
@@ -86,6 +87,9 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
                             collision::gpu::kBodyParticleContactSlotsPerParticle
                       : 0u;
     const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve;
+    const uint32_t contact_rows_per_env =
+        rigid_cap * kPairDrivenRowsPerSlot +
+        particle_reserve * kPairDrivenParticleRowsPerSlot;
     // The per-ARTICULATION contact-slot stride the contact detection/assembly/solve
     // share, DATA-DRIVEN from the cooked geometry: the cook sizes max_contacts_per_env
     // from the collidable count, so the stride is the per-articulation quotient
@@ -467,6 +471,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         // shared params layout.)
         p_assemble_.union_slot_count = cap.max_contacts_per_env;
         p_assemble_.rows_per_env = cap.max_rows_per_env;
+        p_assemble_.contact_rows_per_env = contact_rows_per_env;
         // Layout follows the slot provider, not the particle solver mode: rigid
         // candidates are 4-point manifolds, the reserved sphere-particle tail is
         // one point. With no reserve rigid_cap == the full slot stride.
@@ -483,7 +488,18 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.particle_soft_friction = mp.soft_friction;
         p_assemble_.particle_fluid_friction = mp.fluid_friction;
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
+        if (family == phi::kContactFamilyPairDriven) {
+            p_warm_start_prepare_.phase = 0u;
+            p_warm_start_prepare_.env_count = env_count;
+            p_warm_start_prepare_.slot_count = cap.max_contacts_per_env;
+            p_warm_start_prepare_.rows_per_env = cap.max_rows_per_env;
+            p_warm_start_prepare_.full_row_slot_count = rigid_cap;
+            p_warm_start_prepare_.decay_steps = 2u;
+        }
         add(phi::NkOp::AssembleRows, &p_assemble_);
+        if (family == phi::kContactFamilyPairDriven) {
+            add(phi::NkOp::ContactWarmStart, &p_warm_start_prepare_);
+        }
     }
 
     if (has_particles) {
@@ -569,6 +585,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_solve_.env_count = env_count;
         p_solve_.articulation_count = articulation_cnt;
         p_solve_.rows_per_env = cap.max_rows_per_env;
+        p_solve_.contact_rows_per_env = contact_rows_per_env;
         p_solve_.base_link_count = base_link_count;
         p_solve_.total_body_count = cap.bodies_per_env * env_count;
         p_solve_.friction_coefficient = model.friction_coefficient;
@@ -602,6 +619,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_islands_.particles_per_env = cap.particles_per_env;
         add(phi::NkOp::BuildSolveIslands, &p_islands_);
         add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
+        if (family == phi::kContactFamilyPairDriven) {
+            p_warm_start_commit_ = p_warm_start_prepare_;
+            p_warm_start_commit_.phase = 1u;
+            add(phi::NkOp::ContactWarmStart, &p_warm_start_commit_);
+        }
     }
 
     if (has_articulation || has_bodies) {

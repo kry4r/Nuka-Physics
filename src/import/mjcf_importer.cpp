@@ -52,6 +52,14 @@ void ParseRange(const char* text, float& lower, float& upper) {
     ss >> lower >> upper;
 }
 
+int ParseLimited(const char* text, int fallback) {
+    if (text == nullptr) return fallback;
+    const std::string value(text);
+    if (value == "true" || value == "1") return 1;
+    if (value == "false" || value == "0") return 0;
+    return -1;
+}
+
 // Fill up to `count` floats from a whitespace-separated MuJoCo list into `out`,
 // assigning out[i] ONLY for entries that successfully extract. Entries beyond
 // what the text provides are LEFT UNCHANGED (so a partial solref="0.01" keeps
@@ -161,6 +169,8 @@ struct MjcfJointDefaults {
     math::Vec3 axis = {0.0f, 0.0f, 1.0f};
     float lower_limit = -3.14159f;
     float upper_limit = 3.14159f;
+    bool has_range = false;
+    int limited = -1;  // -1 auto, 0 false, 1 true
     float damping = 0.0f;
     float armature = 0.0f;
     float frictionloss = 0.0f;
@@ -314,9 +324,14 @@ void ApplyJointDefault(tinyxml2::XMLElement* joint_elem, MjcfDefaultClass* defau
     if (const char* axis = joint_elem->Attribute("axis")) {
         defaults->joint.axis = ParseVec3(axis);
     }
-    ParseRange(joint_elem->Attribute("range"),
-               defaults->joint.lower_limit,
-               defaults->joint.upper_limit);
+    if (joint_elem->Attribute("range")) {
+        ParseRange(joint_elem->Attribute("range"),
+                   defaults->joint.lower_limit,
+                   defaults->joint.upper_limit);
+        defaults->joint.has_range = true;
+    }
+    defaults->joint.limited =
+        ParseLimited(joint_elem->Attribute("limited"), defaults->joint.limited);
     joint_elem->QueryFloatAttribute("damping", &defaults->joint.damping);
     joint_elem->QueryFloatAttribute("armature", &defaults->joint.armature);
     joint_elem->QueryFloatAttribute("frictionloss", &defaults->joint.frictionloss);
@@ -792,6 +807,8 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         jrec.axis = defaults.joint.axis;
         jrec.lower_limit = defaults.joint.lower_limit;
         jrec.upper_limit = defaults.joint.upper_limit;
+        bool has_range = defaults.joint.has_range;
+        int limited = defaults.joint.limited;
         jrec.damping = defaults.joint.damping;
         jrec.armature = defaults.joint.armature;
         jrec.frictionloss = defaults.joint.frictionloss;
@@ -807,7 +824,14 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         if (const char* pos_attr = joint->Attribute("pos")) {
             jrec.parent_frame.position = ParseVec3(pos_attr);
         }
-        ParseRange(joint->Attribute("range"), jrec.lower_limit, jrec.upper_limit);
+        if (joint->Attribute("range")) {
+            ParseRange(joint->Attribute("range"), jrec.lower_limit, jrec.upper_limit);
+            has_range = true;
+        }
+        limited = ParseLimited(joint->Attribute("limited"), limited);
+        const bool limits_enabled = has_range && limited != 0;
+        jrec.has_lower_limit = limits_enabled;
+        jrec.has_upper_limit = limits_enabled;
 
         const scene::JointId joint_id = scene.AddJoint(std::move(jrec));
         context.joint_ids[scene.GetJoint(joint_id).name] = joint_id;

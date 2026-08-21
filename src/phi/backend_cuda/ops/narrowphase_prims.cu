@@ -24,6 +24,7 @@
 #include "collision/convex_narrowphase.hpp"    // cvx:: GJK/EPA/face-clip (G5)
 #include "collision/shape_kind.hpp"            // nuka::collision::ShapeKind (R2)
 #include "math/transform.hpp"
+#include "nk/contact/contact_identity.hpp"
 #include "nk/solve/nk_row.hpp"                  // kUContactSideBody (side-kind tag)
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
@@ -173,6 +174,8 @@ __global__ void PairDrivenNarrowphaseKernel(
     uint32_t* __restrict__ ucontact_a_kind,         // per-side index-kind tag
     uint32_t* __restrict__ ucontact_b_kind,
     uint32_t* __restrict__ ucontact_gen,
+    uint64_t* __restrict__ ucontact_id_pair,
+    uint64_t* __restrict__ ucontact_id_feature,
     uint32_t* __restrict__ contact_count) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * slot_stride;
@@ -218,11 +221,30 @@ __global__ void PairDrivenNarrowphaseKernel(
             ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_gen[at] = gen;
+            ::nuka::nk::CanonicalContactDescriptor descriptor;
+            descriptor.a.handle = a;
+            descriptor.b.handle = b;
+            descriptor.local_point_a = PrimInverseTransformPoint(
+                body_pose[env * bodies_per_env + a], m.points[i].position);
+            descriptor.local_point_b = PrimInverseTransformPoint(
+                body_pose[env * bodies_per_env + b], m.points[i].position);
+            descriptor.normal = m.points[i].normal;
+            const uint32_t feature = m.points[i].stable_key == 0u
+                ? ::nuka::nk::kContactFeatureUnavailable
+                : static_cast<uint32_t>(m.points[i].stable_key);
+            descriptor.feature_a = feature;
+            descriptor.feature_b = feature;
+            descriptor.manifold_slot = i;
+            const ::nuka::nk::ContactId id = ::nuka::nk::MakeContactId(descriptor);
+            ucontact_id_pair[at] = id.pair;
+            ucontact_id_feature[at] = id.feature;
         } else {
             upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
             ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
             ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_id_pair[at] = 0u;
+            ucontact_id_feature[at] = 0u;
         }
     }
     if (n > 0u && contact_count != nullptr) {
@@ -267,7 +289,8 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,
-               data.ucontact_gen, data.contact_count);
+               data.ucontact_gen, data.ucontact_id_pair,
+               data.ucontact_id_feature, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

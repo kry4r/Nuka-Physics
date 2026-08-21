@@ -26,13 +26,15 @@ CheckpointManager::CheckpointManager(cudaStream_t stream, int device_id,
                                      uint32_t max_checkpoints,
                                      uint32_t articulation_count,
                                      uint32_t total_link_count,
-                                     uint32_t lambda_width)
+                                     uint32_t lambda_width,
+                                     uint32_t contact_point_count)
     : stream_(stream),
       device_id_(device_id),
       max_checkpoints_(max_checkpoints),
       articulation_count_(articulation_count),
       total_link_count_(total_link_count),
-      lambda_width_(lambda_width) {
+      lambda_width_(lambda_width),
+      contact_point_count_(contact_point_count) {
     if (max_checkpoints_ == 0u) {
         throw std::invalid_argument(
             "nuka::diffsim::CheckpointManager: max_checkpoints == 0");
@@ -55,6 +57,16 @@ CheckpointManager::CheckpointManager(cudaStream_t stream, int device_id,
     if (lambda_width_ > 0u) {
         lambda_ = phi::BufferAlloc(bt, mc * lambda_width_ * sizeof(float));
     }
+    if (contact_point_count_ > 0u) {
+        contact_pair_ = phi::BufferAlloc(bt, mc * contact_point_count_ * sizeof(uint64_t));
+        contact_feature_ = phi::BufferAlloc(bt, mc * contact_point_count_ * sizeof(uint64_t));
+        contact_lambda_ = phi::BufferAlloc(bt, mc * contact_point_count_ * 3u * sizeof(float));
+        contact_normal_ = phi::BufferAlloc(bt, mc * contact_point_count_ * sizeof(nuka::math::Vec3));
+        contact_tangent1_ = phi::BufferAlloc(bt, mc * contact_point_count_ * sizeof(nuka::math::Vec3));
+        contact_tangent2_ = phi::BufferAlloc(bt, mc * contact_point_count_ * sizeof(nuka::math::Vec3));
+        contact_material_ = phi::BufferAlloc(bt, mc * contact_point_count_ * sizeof(uint64_t));
+        contact_age_ = phi::BufferAlloc(bt, mc * contact_point_count_ * sizeof(uint32_t));
+    }
     slot_steps_.reserve(max_checkpoints_);
 }
 
@@ -64,6 +76,14 @@ CheckpointManager::~CheckpointManager() {
     if (q_ != nullptr) { phi::BufferFree(q_); }
     if (qdot_ != nullptr) { phi::BufferFree(qdot_); }
     if (lambda_ != nullptr) { phi::BufferFree(lambda_); }
+    if (contact_pair_ != nullptr) { phi::BufferFree(contact_pair_); }
+    if (contact_feature_ != nullptr) { phi::BufferFree(contact_feature_); }
+    if (contact_lambda_ != nullptr) { phi::BufferFree(contact_lambda_); }
+    if (contact_normal_ != nullptr) { phi::BufferFree(contact_normal_); }
+    if (contact_tangent1_ != nullptr) { phi::BufferFree(contact_tangent1_); }
+    if (contact_tangent2_ != nullptr) { phi::BufferFree(contact_tangent2_); }
+    if (contact_material_ != nullptr) { phi::BufferFree(contact_material_); }
+    if (contact_age_ != nullptr) { phi::BufferFree(contact_age_); }
 }
 
 void CheckpointManager::Reset() {
@@ -73,7 +93,8 @@ void CheckpointManager::Reset() {
 
 uint32_t CheckpointManager::Capture(
     const articulation::ArticulationDeviceState& state, uint32_t step_index,
-    const float* lambda_device) {
+    const float* lambda_device,
+    const ContactWarmStartDeviceState* contact_cache) {
     if (count_ >= max_checkpoints_) {
         throw std::runtime_error(
             "nuka::diffsim::CheckpointManager::Capture: max_checkpoints "
@@ -131,6 +152,55 @@ uint32_t CheckpointManager::Capture(
                   "Capture lambda (R2 warm-start)");
     }
 
+    if (contact_point_count_ > 0u) {
+        const size_t off = static_cast<size_t>(slot) * contact_point_count_;
+        auto copy_or_zero = [&](phi::Buffer* dst, const void* src, size_t bytes,
+                                const char* what) {
+            void* dst_ptr = static_cast<uint8_t*>(phi::BufferBase(dst)) +
+                            off * (bytes / contact_point_count_);
+            if (src != nullptr) {
+                CheckCuda(cudaMemcpyAsync(dst_ptr, src, bytes,
+                                          cudaMemcpyDeviceToDevice, stream), what);
+            } else {
+                CheckCuda(cudaMemsetAsync(dst_ptr, 0, bytes, stream), what);
+            }
+        };
+        const bool complete = contact_cache != nullptr &&
+                              contact_cache->point_count == contact_point_count_ &&
+                              contact_cache->pair != nullptr &&
+                              contact_cache->feature != nullptr &&
+                              contact_cache->lambda != nullptr &&
+                              contact_cache->normal != nullptr &&
+                              contact_cache->tangent1 != nullptr &&
+                              contact_cache->tangent2 != nullptr &&
+                              contact_cache->material != nullptr &&
+                              contact_cache->age != nullptr;
+        copy_or_zero(contact_pair_, complete ? contact_cache->pair : nullptr,
+                     static_cast<size_t>(contact_point_count_) * sizeof(uint64_t),
+                     "Capture contact pair");
+        copy_or_zero(contact_feature_, complete ? contact_cache->feature : nullptr,
+                     static_cast<size_t>(contact_point_count_) * sizeof(uint64_t),
+                     "Capture contact feature");
+        copy_or_zero(contact_lambda_, complete ? contact_cache->lambda : nullptr,
+                     static_cast<size_t>(contact_point_count_) * 3u * sizeof(float),
+                     "Capture contact lambda");
+        copy_or_zero(contact_normal_, complete ? contact_cache->normal : nullptr,
+                     static_cast<size_t>(contact_point_count_) * sizeof(nuka::math::Vec3),
+                     "Capture contact normal");
+        copy_or_zero(contact_tangent1_, complete ? contact_cache->tangent1 : nullptr,
+                     static_cast<size_t>(contact_point_count_) * sizeof(nuka::math::Vec3),
+                     "Capture contact tangent1");
+        copy_or_zero(contact_tangent2_, complete ? contact_cache->tangent2 : nullptr,
+                     static_cast<size_t>(contact_point_count_) * sizeof(nuka::math::Vec3),
+                     "Capture contact tangent2");
+        copy_or_zero(contact_material_, complete ? contact_cache->material : nullptr,
+                     static_cast<size_t>(contact_point_count_) * sizeof(uint64_t),
+                     "Capture contact material");
+        copy_or_zero(contact_age_, complete ? contact_cache->age : nullptr,
+                     static_cast<size_t>(contact_point_count_) * sizeof(uint32_t),
+                     "Capture contact age");
+    }
+
     slot_steps_.push_back(step_index);
     count_ += 1u;
     return slot;
@@ -138,7 +208,8 @@ uint32_t CheckpointManager::Capture(
 
 void CheckpointManager::Restore(
     uint32_t slot, const articulation::ArticulationDeviceState& state,
-    float* lambda_device) const {
+    float* lambda_device,
+    const ContactWarmStartDeviceState* contact_cache) const {
     if (slot >= count_) {
         throw std::out_of_range(
             "nuka::diffsim::CheckpointManager::Restore: slot out of range");
@@ -188,6 +259,55 @@ void CheckpointManager::Restore(
                                       sizeof(float),
                                   cudaMemcpyDeviceToDevice, stream),
                   "Restore lambda (R2 warm-start)");
+    }
+
+    if (contact_point_count_ > 0u) {
+        const bool complete = contact_cache != nullptr &&
+                              contact_cache->point_count == contact_point_count_ &&
+                              contact_cache->pair != nullptr &&
+                              contact_cache->feature != nullptr &&
+                              contact_cache->lambda != nullptr &&
+                              contact_cache->normal != nullptr &&
+                              contact_cache->tangent1 != nullptr &&
+                              contact_cache->tangent2 != nullptr &&
+                              contact_cache->material != nullptr &&
+                              contact_cache->age != nullptr;
+        if (!complete) {
+            throw std::invalid_argument(
+                "nuka::diffsim::CheckpointManager::Restore: incomplete contact cache state");
+        }
+        const size_t off = static_cast<size_t>(slot) * contact_point_count_;
+        auto copy = [&](phi::Buffer* src, void* dst, size_t bytes,
+                        const char* what) {
+            const auto* src_ptr = static_cast<const uint8_t*>(phi::BufferBase(src)) +
+                                  off * (bytes / contact_point_count_);
+            CheckCuda(cudaMemcpyAsync(dst, src_ptr, bytes,
+                                      cudaMemcpyDeviceToDevice, stream), what);
+        };
+        copy(contact_pair_, const_cast<uint64_t*>(contact_cache->pair),
+             static_cast<size_t>(contact_point_count_) * sizeof(uint64_t),
+             "Restore contact pair");
+        copy(contact_feature_, const_cast<uint64_t*>(contact_cache->feature),
+             static_cast<size_t>(contact_point_count_) * sizeof(uint64_t),
+             "Restore contact feature");
+        copy(contact_lambda_, const_cast<float*>(contact_cache->lambda),
+             static_cast<size_t>(contact_point_count_) * 3u * sizeof(float),
+             "Restore contact lambda");
+        copy(contact_normal_, const_cast<nuka::math::Vec3*>(contact_cache->normal),
+             static_cast<size_t>(contact_point_count_) * sizeof(nuka::math::Vec3),
+             "Restore contact normal");
+        copy(contact_tangent1_, const_cast<nuka::math::Vec3*>(contact_cache->tangent1),
+             static_cast<size_t>(contact_point_count_) * sizeof(nuka::math::Vec3),
+             "Restore contact tangent1");
+        copy(contact_tangent2_, const_cast<nuka::math::Vec3*>(contact_cache->tangent2),
+             static_cast<size_t>(contact_point_count_) * sizeof(nuka::math::Vec3),
+             "Restore contact tangent2");
+        copy(contact_material_, const_cast<uint64_t*>(contact_cache->material),
+             static_cast<size_t>(contact_point_count_) * sizeof(uint64_t),
+             "Restore contact material");
+        copy(contact_age_, const_cast<uint32_t*>(contact_cache->age),
+             static_cast<size_t>(contact_point_count_) * sizeof(uint32_t),
+             "Restore contact age");
     }
 }
 

@@ -29,6 +29,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "nk/contact/contact_identity.hpp"
 #include "nk/solve/nk_row.hpp"                  // kUContactSideBody (side-kind tag)
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
@@ -77,9 +78,9 @@ __device__ sdf::SparseSdfDevice LoadSdfGrid(const float* headers,
 // tie-break (the deterministic fixed order). out_* are the 4-slot ucontact
 // arrays for ONE contact slot (gid).
 __device__ void DeepestKInsert(math::Vec3 point, math::Vec3 normal, float depth,
-                               uint32_t /*sample_id*/, uint32_t k,
+                               uint32_t sample_id, uint32_t k,
                                math::Vec3* pt, math::Vec3* nm, float* dp,
-                               uint32_t* count) {
+                               uint32_t* feature, uint32_t* count) {
     uint32_t n = *count;
     // Find the insertion position (descending depth). Equal-depth ties keep the
     // earlier-inserted sample (sample index ascending) — stable insert.
@@ -90,8 +91,10 @@ __device__ void DeepestKInsert(math::Vec3 point, math::Vec3 normal, float depth,
     uint32_t last = (n < k) ? n : (k - 1u);
     for (uint32_t i = last; i > pos; --i) {
         pt[i] = pt[i - 1u]; nm[i] = nm[i - 1u]; dp[i] = dp[i - 1u];
+        feature[i] = feature[i - 1u];
     }
     pt[pos] = point; nm[pos] = normal; dp[pos] = depth;
+    feature[pos] = sample_id;
     *count = (n < k) ? (n + 1u) : k;
 }
 
@@ -150,8 +153,7 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
     const sdf::SparseSdfDevice sdf_grid = LoadSdfGrid(
         sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads, grid);
 
-    // Per-slot deepest-K manifold accumulators (k <= 4).
-    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4];
+    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4]; uint32_t feature[4];
     uint32_t kept = 0u;
 
     for (uint32_t s = 0u; s < scnt; ++s) {
@@ -177,7 +179,7 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
         // Contact point: the sample, pushed back onto the surface along n.
         const math::Vec3 cp{world.x - n.x * depth, world.y - n.y * depth,
                             world.z - n.z * depth};
-        DeepestKInsert(cp, n, depth, s, k, pt, nm, dp, &kept);
+        DeepestKInsert(cp, n, depth, s, k, pt, nm, dp, feature, &kept);
     }
 
     ucount[out_gid] = kept;
@@ -227,6 +229,8 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint32_t* __restrict__ ucontact_a_kind,
                                     uint32_t* __restrict__ ucontact_b_kind,
                                     uint32_t* __restrict__ ucontact_gen,
+                                    uint64_t* __restrict__ ucontact_id_pair,
+                                    uint64_t* __restrict__ ucontact_id_feature,
                                     uint32_t* __restrict__ contact_count) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * slot_stride;
@@ -265,7 +269,7 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
         sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads, grid);
 
     const uint32_t kk = (k > 4u) ? 4u : k;
-    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4];
+    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4]; uint32_t feature[4];
     uint32_t kept = 0u;
     for (uint32_t s = 0u; s < scnt; ++s) {
         const math::Vec3 local{samp_points[(soff + s) * 3u + 0u],
@@ -285,7 +289,7 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
             : math::Vec3{0.0f, 0.0f, 1.0f};
         const math::Vec3 cp{world.x - n.x * depth, world.y - n.y * depth,
                             world.z - n.z * depth};
-        DeepestKInsert(cp, n, depth, s, kk, pt, nm, dp, &kept);
+        DeepestKInsert(cp, n, depth, s, kk, pt, nm, dp, feature, &kept);
     }
 
     ucount[gid] = kept;
@@ -298,11 +302,27 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
             ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_gen[at] = 1u;
+            ::nuka::nk::CanonicalContactDescriptor descriptor;
+            descriptor.a.handle = sample_body;
+            descriptor.b.handle = target_body;
+            descriptor.local_point_a =
+                ::nuka::phi::nkops::PrimInverseTransformPoint(sxf, pt[i]);
+            descriptor.local_point_b =
+                ::nuka::phi::nkops::PrimInverseTransformPoint(txf, pt[i]);
+            descriptor.normal = nm[i];
+            descriptor.feature_a = feature[i];
+            descriptor.feature_b = ::nuka::nk::kContactFeatureUnavailable;
+            descriptor.manifold_slot = i;
+            const ::nuka::nk::ContactId id = ::nuka::nk::MakeContactId(descriptor);
+            ucontact_id_pair[at] = id.pair;
+            ucontact_id_feature[at] = id.feature;
         } else {
             upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
             ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
             ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_id_pair[at] = 0u;
+            ucontact_id_feature[at] = 0u;
         }
     }
     if (kept > 0u && contact_count != nullptr) {
@@ -350,7 +370,8 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,
-               data.ucontact_gen, data.contact_count);
+               data.ucontact_gen, data.ucontact_id_pair,
+               data.ucontact_id_feature, data.contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

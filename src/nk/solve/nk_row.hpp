@@ -55,21 +55,25 @@ inline constexpr uint32_t kUContactSideBody     = 0u;  // index = body-local row
 inline constexpr uint32_t kUContactSideParticle = 1u;  // index = global particle
 
 namespace nk_row_flags {
-inline constexpr uint32_t kActive   = 1u << 0;  // slot live this step (watermark)
-inline constexpr uint32_t kFriction = 1u << 1;  // pyramid spoke (vs normal row)
+inline constexpr uint32_t kActive       = 1u << 0;
+inline constexpr uint32_t kFriction     = 1u << 1;  // legacy, non-production
+inline constexpr uint32_t kBlockNormal  = 1u << 2;
+inline constexpr uint32_t kBlockTangent = 1u << 3;
+inline constexpr uint32_t kJointLimitLower = 1u << 4;
+inline constexpr uint32_t kJointLimitUpper = 1u << 5;
+inline constexpr uint32_t kJointLimit = kJointLimitLower | kJointLimitUpper;
 }  // namespace nk_row_flags
 
 // General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-
 // slot row layout the assembly (EmitPairDrivenRowsKernel) emits and the cook sizes
 // max_rows_per_env by. Each candidate slot expands to kPdPtsPerSlot manifold points
-// (cvx caps at 4), each point -> 1 normal row + kPdSpokesPerPt friction spokes
-// (+t0,-t0,+t1,-t1; condim-3 pyramid). rows_per_slot == pts*(1+spokes). Shared
-// between the cook (host) and the assembly (device) so the schedule, the assembly,
-// and the row budget all agree on the layout.
+// (cvx caps at 4), each point -> one block normal plus two tangent rows.
+// The normal row owns the analytic cone projection; tangent rows carry their
+// Jacobians so the same island/reaction path sees all three directions.
 inline constexpr uint32_t kPairDrivenPtsPerSlot = 4u;
-inline constexpr uint32_t kPairDrivenSpokesPerPt = 4u;
+inline constexpr uint32_t kPairDrivenTangentRowsPerPt = 2u;
 inline constexpr uint32_t kPairDrivenRowsPerSlot =
-    kPairDrivenPtsPerSlot * (1u + kPairDrivenSpokesPerPt);  // 20
+    kPairDrivenPtsPerSlot * (1u + kPairDrivenTangentRowsPerPt);  // 12
 
 // A body<->particle provider models every particle as a sphere and therefore
 // emits at most one manifold point, independent of the particle solver mode.
@@ -77,7 +81,7 @@ inline constexpr uint32_t kPairDrivenRowsPerSlot =
 // the four-point worst case above.
 inline constexpr uint32_t kPairDrivenParticlePtsPerSlot = 1u;
 inline constexpr uint32_t kPairDrivenParticleRowsPerSlot =
-    kPairDrivenParticlePtsPerSlot * (1u + kPairDrivenSpokesPerPt);  // 5
+    kPairDrivenParticlePtsPerSlot * (1u + kPairDrivenTangentRowsPerPt);  // 3
 
 struct NkRowSide {
     uint32_t   kind  = kNkSideStatic;  // kNkSide* dispatch code
@@ -95,8 +99,8 @@ struct NkRow {
     float    compliance_alpha = 0.0f;  // R
     float    lower = 0.0f;
     float    upper = 0.0f;
-    float    mu = 0.0f;                // friction coefficient (cone bound)
-    float    reserved[7] = {};
+    float    mu = 0.0f;                // first tangent cone coefficient
+    float    reserved[7] = {};         // [0] = second tangent coefficient
     NkRowSide a;
     NkRowSide b;
 };

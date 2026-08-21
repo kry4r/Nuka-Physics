@@ -237,10 +237,9 @@ struct WorldRecord {
     // field: derived from the current enum maximum so adding a field never leaves
     // it silently out of range (the old hardcoded 16 rejected terrain fields).
     static constexpr uint32_t kNoiseFieldCount =
-        static_cast<uint32_t>(NUKA_FIELD_JOINT_FEEDFORWARD) + 1u;
-    // JOINT_FEEDFORWARD is the highest field enumerator; a new field above it must
-    // bump this anchor so kNoiseFieldCount still covers the whole enum.
-    static_assert(NUKA_FIELD_JOINT_FEEDFORWARD >= NUKA_FIELD_ENV_TERRAIN_DIFFICULTY,
+        static_cast<uint32_t>(NUKA_FIELD_ACTUATOR_SATURATED) + 1u;
+    static_assert(NUKA_FIELD_ACTUATOR_SATURATED >=
+                      NUKA_FIELD_ENV_TERRAIN_DIFFICULTY,
                   "kNoiseFieldCount must derive from the maximum field enum");
     nuka::sensor::noise::SensorNoiseConfig noise_config[kNoiseFieldCount];
     uint64_t noise_seq[kNoiseFieldCount] = {};

@@ -42,7 +42,8 @@ constexpr float kContactSolmixMinVal = 1e-15f;
 struct ContactParamsIn {
     int32_t priority    = 0;
     uint8_t condim      = 3;
-    float   friction_mu = 1.0f;
+    union { float friction_mu = 1.0f; float mu1; };
+    float   mu2         = 1.0f;
     float   solref[2]   = {0.02f, 1.0f};
     float   solimp[5]   = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
     float   solmix      = 1.0f;
@@ -54,7 +55,8 @@ struct ContactParamsIn {
 // those are consumed during the merge).
 struct MergedContactParams {
     uint8_t condim      = 3;
-    float   friction_mu = 1.0f;
+    union { float friction_mu = 1.0f; float mu1; };
+    float   mu2         = 1.0f;
     float   solref[2]   = {0.02f, 1.0f};
     float   solimp[5]   = {0.9f, 0.95f, 0.001f, 0.5f, 2.0f};
     float   margin      = 0.0f;
@@ -109,6 +111,7 @@ NUKA_CF_HD inline MergedContactParams MergeContactParams(const ContactParamsIn& 
         const ContactParamsIn& w = (A.priority > B.priority) ? A : B;
         out.condim      = w.condim;
         out.friction_mu = w.friction_mu;
+        out.mu2         = w.mu2;
         out.solref[0]   = w.solref[0];
         out.solref[1]   = w.solref[1];
         for (int i = 0; i < 5; ++i) out.solimp[i] = w.solimp[i];
@@ -120,6 +123,7 @@ NUKA_CF_HD inline MergedContactParams MergeContactParams(const ContactParamsIn& 
     // Equal priority => combine.
     out.condim      = (A.condim > B.condim) ? A.condim : B.condim;
     out.friction_mu = CfMaxF(A.friction_mu, B.friction_mu);
+    out.mu2         = CfMaxF(A.mu2, B.mu2);
 
     // solmix weight (MuJoCo mj_contactParam four-way). mix weights A.
     const bool a_ok = A.solmix >= kContactSolmixMinVal;

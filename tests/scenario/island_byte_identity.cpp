@@ -43,6 +43,15 @@ std::filesystem::path Go2FloatScenePath() {
 }
 bool HaveAsset() { return std::filesystem::exists(Go2FloatScenePath()); }
 
+void SetForceStaticIslands(const char* value) {
+#ifdef _WIN32
+    _putenv_s("NUKA_FORCE_STATIC_ISLANDS", value != nullptr ? value : "");
+#else
+    if (value != nullptr) setenv("NUKA_FORCE_STATIC_ISLANDS", value, 1);
+    else unsetenv("NUKA_FORCE_STATIC_ISLANDS");
+#endif
+}
+
 // K floating-base go2 composed at distinct X into ONE env template via the GENERAL
 // PairDriven family. spacing < trunk width -> the trunks overlap and contact.
 nk::Model CookKFloatDogs(uint32_t k, float spacing) {
@@ -111,7 +120,7 @@ template <typename Perturb>
 std::vector<uint8_t> RunScenario(bool force_static, uint32_t k, float spacing,
                                  uint32_t env_count, uint32_t steps,
                                  Perturb perturb) {
-    setenv("NUKA_FORCE_STATIC_ISLANDS", force_static ? "1" : "0", 1);
+    SetForceStaticIslands(force_static ? "1" : "0");
     Backend b = GetBackend();
     nk::Model model = CookKFloatDogs(k, spacing);
     const uint32_t artics_total = model.capacities.articulations_per_env * env_count;
@@ -142,7 +151,7 @@ TEST(IslandByteIdentity, ContactThenSeparateMatchesStaticSchedule) {
     auto noop = [](std::vector<float>&) {};
     const std::vector<uint8_t> dyn = RunScenario(false, 3u, 0.12f, 1u, 160u, noop);
     const std::vector<uint8_t> sta = RunScenario(true, 3u, 0.12f, 1u, 160u, noop);
-    unsetenv("NUKA_FORCE_STATIC_ISLANDS");
+    SetForceStaticIslands(nullptr);
     ASSERT_EQ(dyn.size(), sta.size());
     EXPECT_EQ(std::memcmp(dyn.data(), sta.data(), dyn.size()), 0)
         << "dynamic island solve diverged from the static schedule after a "
@@ -168,7 +177,7 @@ TEST(IslandByteIdentity, MultiEnvMixedContactMatchesStaticSchedule) {
     };
     const std::vector<uint8_t> dyn = RunScenario(false, k, 0.12f, env_count, 160u, perturb);
     const std::vector<uint8_t> sta = RunScenario(true, k, 0.12f, env_count, 160u, perturb);
-    unsetenv("NUKA_FORCE_STATIC_ISLANDS");
+    SetForceStaticIslands(nullptr);
     ASSERT_EQ(dyn.size(), sta.size());
     EXPECT_EQ(std::memcmp(dyn.data(), sta.data(), dyn.size()), 0)
         << "dynamic island solve diverged from the static schedule in a multi-env "

@@ -122,6 +122,30 @@ private:
     nuka_device_handle h_ = nullptr;
 };
 
+class StateCheckpoint {
+public:
+    static StateCheckpoint* capture(nuka_world_handle world) {
+        nuka_checkpoint_handle checkpoint = nullptr;
+        check(nuka_world_checkpoint_capture(world, &checkpoint),
+              "nuka_world_checkpoint_capture");
+        return new StateCheckpoint(checkpoint);
+    }
+
+    void close() {
+        if (h_ != nullptr) {
+            nuka_checkpoint_destroy(h_);
+            h_ = nullptr;
+        }
+    }
+    ~StateCheckpoint() { close(); }
+
+    nuka_checkpoint_handle raw() const { return h_; }
+
+private:
+    explicit StateCheckpoint(nuka_checkpoint_handle checkpoint) : h_(checkpoint) {}
+    nuka_checkpoint_handle h_ = nullptr;
+};
+
 // ---------------------------------------------------------------------------
 // World wrapper (RAII)
 // ---------------------------------------------------------------------------
@@ -445,6 +469,22 @@ public:
     void reset() { check(nuka_world_reset(h_), "nuka_world_reset"); }
     void reset_envs(const uint32_t* ids, uint32_t count) {
         check(nuka_world_reset_envs(h_, ids, count), "nuka_world_reset_envs");
+    }
+
+    StateCheckpoint* capture_checkpoint() {
+        return StateCheckpoint::capture(h_);
+    }
+    void restore_checkpoint(StateCheckpoint* checkpoint) {
+        if (checkpoint == nullptr || checkpoint->raw() == nullptr) {
+            throw std::runtime_error("restore_checkpoint: invalid checkpoint");
+        }
+        check(nuka_world_checkpoint_restore(h_, checkpoint->raw()),
+              "nuka_world_checkpoint_restore");
+    }
+    uint64_t state_hash() const {
+        uint64_t hash = 0u;
+        check(nuka_world_state_hash(h_, &hash), "nuka_world_state_hash");
+        return hash;
     }
 
     // v0.5 p04 §4 PARAMETER spine: set one articulation link's scalar mass at
@@ -1741,6 +1781,10 @@ NB_MODULE(_nuka_ext, m) {
         // empty view on a body-free world. Writable via upload_field to park a body.
         .value("BODY_LINEAR_VELOCITY", NUKA_FIELD_BODY_LINEAR_VELOCITY)
         .value("BODY_ANGULAR_VELOCITY", NUKA_FIELD_BODY_ANGULAR_VELOCITY)
+        .value("JOINT_LIMIT_IMPULSE", NUKA_FIELD_JOINT_LIMIT_IMPULSE)
+        .value("ACTUATOR_EFFORT_REQUESTED", NUKA_FIELD_ACTUATOR_EFFORT_REQUESTED)
+        .value("ACTUATOR_EFFORT", NUKA_FIELD_ACTUATOR_EFFORT)
+        .value("ACTUATOR_SATURATED", NUKA_FIELD_ACTUATOR_SATURATED)
         .export_values();
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
@@ -1787,6 +1831,18 @@ NB_MODULE(_nuka_ext, m) {
         .def("__enter__", [](Device& d) -> Device& { return d; })
         .def("__exit__",
              [](Device& d, nb::object, nb::object, nb::object) { d.close(); },
+             nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
+
+    nb::class_<StateCheckpoint>(m, "StateCheckpoint")
+        .def("close", &StateCheckpoint::close, "Destroy the checkpoint handle.")
+        .def("__enter__", [](StateCheckpoint& checkpoint) -> StateCheckpoint& {
+            return checkpoint;
+        })
+        .def("__exit__",
+             [](StateCheckpoint& checkpoint, nb::object, nb::object, nb::object) {
+                 checkpoint.close();
+             },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none());
 
@@ -1930,6 +1986,14 @@ NB_MODULE(_nuka_ext, m) {
             "masked RL autoreset path). env_ids: a 1-D int array (numpy / torch / "
             "list) of env indices in [0, env_count). Un-listed envs are left "
             "byte-for-byte unchanged. GPU-only, D1-deterministic.")
+        .def("capture_checkpoint", &World::capture_checkpoint,
+             nb::rv_policy::take_ownership,
+             "Capture all persistent simulation state, including warm-start caches.")
+        .def("restore_checkpoint", &World::restore_checkpoint,
+             nb::arg("checkpoint"),
+             "Restore a checkpoint captured from this world.")
+        .def("state_hash", &World::state_hash,
+             "Return the deterministic 64-bit hash of persistent world state.")
         .def("destroy", &World::destroy, "Destroy the world.")
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)

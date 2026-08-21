@@ -691,11 +691,20 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
                                        const float* drive_damping,
                                        const float* drive_force_limits,
                                        const float* joint_feedforward,
+                                       float* actuator_effort_requested,
+                                       float* actuator_effort,
+                                       float* actuator_saturated,
                                        uint32_t mode,
                                        bool defer_velocity_damping) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count ||
-        state.joint_type[link] == ArticulationJointType::Fixed) {
+    if (link >= state.total_link_count) {
+        return;
+    }
+    if (state.joint_type[link] == ArticulationJointType::Fixed) {
+        actuator_effort_requested[link] = 0.0f;
+        actuator_effort[link] = 0.0f;
+        actuator_saturated[link] = 0.0f;
+        state.tau[link] = 0.0f;
         return;
     }
     const float u = drive_targets[link];
@@ -738,6 +747,7 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
 
     // Effort saturation (symmetric today; T3 generalizes to asymmetric). A
     // non-positive limit means "unlimited", matching every historical kernel.
+    const float requested_effort = tau;
     if (drive_force_limits != nullptr) {
         const float limit = drive_force_limits[link];
         if (limit > 0.0f) {
@@ -745,13 +755,11 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
         }
     }
 
-    // T3 feed-forward: add the user-supplied direct joint force AFTER actuator
-    // saturation (MuJoCo qfrc_applied -- a user force, not an actuator output, so
-    // it is not clamped by the actuator force-range). Additive in EVERY preset
-    // (gravcomp / computed-torque / RL residual). The guard makes a default (0)
-    // joint_f a TRUE no-op: `jf != 0.0f` is false for +0.0 AND -0.0, so the store
-    // is byte-IDENTICAL to the pre-T3 drive when no feed-forward is written (the
-    // D1 guarantee). A non-null check keeps it safe on a model without the field.
+    actuator_effort_requested[link] = requested_effort;
+    actuator_effort[link] = tau;
+    actuator_saturated[link] = requested_effort != tau ? 1.0f : 0.0f;
+
+    // Direct generalized force is independent of actuator saturation.
     if (joint_feedforward != nullptr) {
         const float jf = joint_feedforward[link];
         if (jf != 0.0f) {
@@ -968,6 +976,9 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
                static_cast<const float*>(data.drive_damping),
                static_cast<const float*>(data.drive_force_limit),
                static_cast<const float*>(data.joint_f),
+               data.actuator_effort_requested,
+               data.actuator_effort,
+               data.actuator_saturated,
                p->mode,
                p->defer_velocity_damping != 0u);
     return LaunchOk(stream);

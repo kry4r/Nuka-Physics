@@ -146,11 +146,26 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
     out_link_wrench[out + 5u] = torque.z;
 }
 
+__device__ void ClearWarmStartPoint(
+    uint32_t point_index, uint64_t* cache_pair, uint64_t* cache_feature,
+    float* cache_lambda, Vec3* cache_normal, Vec3* cache_tangent1,
+    Vec3* cache_tangent2, uint64_t* cache_material, uint32_t* cache_age) {
+    cache_pair[point_index] = 0u;
+    cache_feature[point_index] = 0u;
+    for (uint32_t k = 0u; k < 3u; ++k) cache_lambda[point_index * 3u + k] = 0.0f;
+    cache_normal[point_index] = {0.0f, 0.0f, 0.0f};
+    cache_tangent1[point_index] = {0.0f, 0.0f, 0.0f};
+    cache_tangent2[point_index] = {0.0f, 0.0f, 0.0f};
+    cache_material[point_index] = 0u;
+    cache_age[point_index] = 0u;
+}
+
 // --- p03 ResetEnvsKernel (per-env RL-autoreset primitive, verbatim) ----------
 
 __global__ void ResetEnvsKernel(ArticulationDeviceState state,
                                  const uint32_t* env_ids,
                                  uint32_t id_count,
+                                 uint32_t env_count,
                                  uint32_t base_link_count,
                                  uint32_t lambda_stride,
                                  const Transform* snapshot_base_pose,
@@ -158,6 +173,15 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
                                  const float* snapshot_q,
                                  const float* snapshot_qdot,
                                  float* lambda,
+                                 uint32_t contact_slot_count,
+                                 uint64_t* contact_cache_pair,
+                                 uint64_t* contact_cache_feature,
+                                 float* contact_cache_lambda,
+                                 Vec3* contact_cache_normal,
+                                 Vec3* contact_cache_tangent1,
+                                 Vec3* contact_cache_tangent2,
+                                 uint64_t* contact_cache_material,
+                                 uint32_t* contact_cache_age,
                                  // M7 T1: movable rigid-body restore arm (body
                                  // slice [env*body_count, +body_count), env-major
                                  // — matches SeedInitialState's e*B+b body fill).
@@ -206,8 +230,8 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
         return;
     }
     const uint32_t env = env_ids[slot];
-    if (env >= state.articulation_count) {
-        return;  // defensive: host rejects OOB ids, but never OOB-write here.
+    if (env >= env_count) {
+        return;
     }
     const uint32_t link_begin = env * base_link_count;
     // Per-env Philox key: seed XOR (episode << 32) so distinct episodes /seeds
@@ -240,6 +264,16 @@ __global__ void ResetEnvsKernel(ArticulationDeviceState state,
     }
     for (uint32_t i = threadIdx.x; i < lambda_stride; i += blockDim.x) {
         lambda[env * lambda_stride + i] = 0.0f;
+    }
+    if (contact_cache_pair != nullptr) {
+        const uint32_t cache_begin = env * contact_slot_count * 4u;
+        const uint32_t cache_end = cache_begin + contact_slot_count * 4u;
+        for (uint32_t i = cache_begin + threadIdx.x; i < cache_end; i += blockDim.x) {
+            ClearWarmStartPoint(i, contact_cache_pair, contact_cache_feature,
+                                 contact_cache_lambda, contact_cache_normal,
+                                 contact_cache_tangent1, contact_cache_tangent2,
+                                 contact_cache_material, contact_cache_age);
+        }
     }
     // M7 T1: restore this env's body slice (pose + linear/angular velocity) from
     // the snapshot. body_count == 0 (no bodies) skips the loop entirely, keeping
@@ -396,12 +430,16 @@ Status OpResetEnvs(const ModelView& model, const DataView& data,
     LaunchCuda(ResetEnvsKernel, dim3(p->count), dim3(kResetBlock), 0u, stream,
                state,
                static_cast<const uint32_t*>(data.reset_env_ids),
-               p->count, p->base_link_count, p->lambda_stride,
+               p->count, p->env_count, p->base_link_count, p->lambda_stride,
                static_cast<const Transform*>(data.snapshot_base_pose),
                reinterpret_cast<const LinkSpatialVel*>(data.snapshot_link_velocity),
                static_cast<const float*>(data.snapshot_q),
                static_cast<const float*>(data.snapshot_qdot),
-               data.lambda,
+               data.lambda, p->contact_slot_count,
+               data.contact_cache_pair, data.contact_cache_feature,
+               data.contact_cache_lambda, data.contact_cache_normal,
+               data.contact_cache_tangent1, data.contact_cache_tangent2,
+               data.contact_cache_material, data.contact_cache_age,
                // M7 T1: movable rigid-body restore arm.
                p->body_count,
                static_cast<Transform*>(data.body_pose),
@@ -551,9 +589,28 @@ Status OpRestoreState(const ModelView& /*model*/, const DataView& data,
                         stream) != cudaSuccess) {
         return Status::Failed;
     }
-    // M7 T1: APPEND the movable rigid-body restore (snapshot -> live, env-major
-    // total body count). Strictly additive — the articulation restore above is
-    // untouched. Bodies carry no qddot/tau accumulator, so nothing to clear.
+    if (p->contact_slot_count > 0u) {
+        const size_t points = static_cast<size_t>(p->contact_slot_count) * 4u;
+        if (cudaMemsetAsync(data.contact_cache_pair, 0,
+                            points * sizeof(uint64_t), stream) != cudaSuccess ||
+            cudaMemsetAsync(data.contact_cache_feature, 0,
+                            points * sizeof(uint64_t), stream) != cudaSuccess ||
+            cudaMemsetAsync(data.contact_cache_lambda, 0,
+                            points * 3u * sizeof(float), stream) != cudaSuccess ||
+            cudaMemsetAsync(data.contact_cache_normal, 0,
+                            points * sizeof(Vec3), stream) != cudaSuccess ||
+            cudaMemsetAsync(data.contact_cache_tangent1, 0,
+                            points * sizeof(Vec3), stream) != cudaSuccess ||
+            cudaMemsetAsync(data.contact_cache_tangent2, 0,
+                            points * sizeof(Vec3), stream) != cudaSuccess ||
+            cudaMemsetAsync(data.contact_cache_material, 0,
+                            points * sizeof(uint64_t), stream) != cudaSuccess ||
+            cudaMemsetAsync(data.contact_cache_age, 0,
+                            points * sizeof(uint32_t), stream) != cudaSuccess) {
+            return Status::Failed;
+        }
+    }
+    // Restore the movable rigid-body snapshot after clearing carried contact state.
     const size_t nb = p->total_body_count;
     if (nb > 0u &&
         (cudaMemcpyAsync(data.body_pose, data.snapshot_body_pose,

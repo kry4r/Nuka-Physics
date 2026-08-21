@@ -50,6 +50,7 @@ const char* NkOpName(int op) {
         case 31: return "StepBackward"; case 32: return "ParticleParticleContact";
         case 33: return "SyncLinkBodyPose"; case 34: return "NarrowphaseBodyParticle";
         case 35: return "NarrowphaseHeightfield"; case 36: return "BuildSolveIslands";
+        case 37: return "ContactWarmStart";
         default: return "op";
     }
 }
