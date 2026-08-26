@@ -35,37 +35,17 @@
   <br><b>Elastic Jelly</b> · Deterministic MLS-MPM · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">video</a>
 </td>
 </tr>
-</table>
-
-## Go2 Skill Replay
-
-The Go2 skill cases run pretrained TorchScript policies directly through the
-Nuka CUDA physics path and use the real Go2 mesh in the CUDA RT renderer.
-
-<table align="center" width="100%">
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="docs/media/nuka_go2_backflip.mp4"><img src="docs/media/nuka_go2_backflip.png" width="100%" alt="Nuka Go2 double backflip replay"></a>
-  <br><b>Go2 Double Backflip</b> · Nuka single-environment PD replay · <a href="docs/media/nuka_go2_backflip.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4"><img src="docs/media/nuka_go2_backflip.gif" width="100%" alt="Go2 performing a double backflip in Nuka"></a>
+  <br><b>Go2 Double Backflip</b> · TorchScript inference in Nuka · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
-  <a href="docs/media/nuka_go2_front_handstand.mp4"><img src="docs/media/nuka_go2_front_handstand.png" width="100%" alt="Nuka Go2 front-handstand policy replay"></a>
-  <br><b>Go2 Front-Handstand Replay</b> · Nuka single-environment policy replay · <a href="docs/media/nuka_go2_front_handstand.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4"><img src="docs/media/nuka_go2_front_handstand.gif" width="100%" alt="Go2 performing a handstand in Nuka"></a>
+  <br><b>Go2 Handstand</b> · TorchScript inference in Nuka · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4">1080p video</a>
 </td>
 </tr>
 </table>
-
-Run either case with the project-local TorchScript artifacts:
-
-```bash
-PYTHONPATH=python python examples/demo/go2_skill_infer.py \
-  --task backflip --out out/go2_reference_backflip.bin
-PYTHONPATH=python python examples/demo/go2_skill_infer.py \
-  --task handstand --out out/go2_reference_handstand.bin
-```
-
-The model files are in [`examples/models`](examples/models). See
-[`examples/models/README.md`](examples/models/README.md) for the replay contract.
 
 ## Why Nuka
 
