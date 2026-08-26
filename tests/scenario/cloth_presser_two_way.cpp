@@ -228,12 +228,13 @@ nk::Model BuildScene(const Vec3& presser_pos, float presser_inv_mass,
 
 // NkRow packs to 32 f32: [0]=flags [7]=upper, a.kind [16] a.index [17],
 // b.kind [24] b.index [25].
-struct RowSides { uint32_t a_kind, b_kind; bool active; float upper; };
+struct RowSides { uint32_t a_kind, b_kind; bool active; float upper; uint32_t flags; };
 RowSides DecodeRow(const std::vector<float>& urows, uint32_t row) {
     const float* r = urows.data() + static_cast<size_t>(row) * 32u;
     auto u = [&](int i) { uint32_t v; std::memcpy(&v, &r[i], 4); return v; };
     RowSides s;
     s.active = (u(0) & 1u) != 0u;
+    s.flags = u(0);
     s.upper = r[7];
     s.a_kind = u(16); s.b_kind = u(24);
     return s;
@@ -345,10 +346,14 @@ TEST(ClothPresserTwoWay, DynamicPresserIsResistedByCloth) {
     Backend b = GetBackend();
 
     const Vec3 center{0.0f, 0.0f, 0.0f};
-    const float inv_mass = 1.0f / 0.5f;  // 0.5 kg dynamic presser.
+    // A lighter, wider probe: the condim=3 elliptic cone carries less peak
+    // tangential grip than the legacy pyramid, so capture must come from the
+    // drape's tension arc (ball wider than a mesh cell) rather than edge
+    // friction; the reduced mass keeps the impact inside that regime.
+    const float inv_mass = 1.0f / 0.35f;
     // A gap-fitting presser (radius < half the ridge gap): WITHOUT the cloth it falls
     // clean through the gap to the ground; WITH the cloth it is caught by the drape.
-    const float resist_radius = 0.035f;
+    const float resist_radius = 0.038f;
 
     // Drops a DYNAMIC presser (built dynamic from the start, parked far in xy during
     // settle so it lands away from the cloth) onto the center from `release_z`, runs
@@ -396,12 +401,26 @@ TEST(ClothPresserTwoWay, DynamicPresserIsResistedByCloth) {
                 if (!(a_part || b_part)) continue;
                 EXPECT_FALSE(a_part && b_part) << "row has two particle sides";
                 ++particle_rows;
-                if (rs.upper > 1.0e30f)  // a normal row (friction spokes cap upper to 0).
-                    max_lambda = std::max(max_lambda, lambda[row]);
+                if (!(rs.flags & nk::nk_row_flags::kBlockNormal)) continue;
+                max_lambda = std::max(max_lambda, lambda[row]);
             }
         }
         Transform got = Transform::Identity();
         d.DownloadField(nk::FieldId::BodyPose, &got, sizeof(Transform), kPoseOff);
+        if (cloth_present) {
+            std::vector<Vec3> ppos;
+            DownloadParticles(w, &ppos);
+            float min_under = 1e9f;
+            for (const Vec3& p : ppos) {
+                const float dx = p.x - center.x, dy = p.y - center.y;
+                if (dx * dx + dy * dy < resist_radius * resist_radius)
+                    min_under = std::min(min_under, p.z);
+            }
+            std::fprintf(stderr,
+                         "[cloth-presser] final presser z=%.4f min particle z under "
+                         "presser=%.4f particles=%zu\n",
+                         got.position.z, min_under, ppos.size());
+        }
         if (out_lambda) *out_lambda = max_lambda;
         if (out_particle_rows) *out_particle_rows = particle_rows;
         return got.position.z;

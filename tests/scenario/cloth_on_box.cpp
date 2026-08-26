@@ -91,11 +91,10 @@ void AddBox(nk::Model& m, const Vec3& pos, float half, int32_t body_id,
 
 // Finish the capacities + cook the cloth on top of an already-populated body set.
 void FinishModel(nk::Model& m, const cook::XpbdCookInput& cloth) {
-    nk::ModelMaterialBucket mb;
-    for (float& v : mb.values) v = 0.0f;
-    mb.values[nk::kBucketStaticMu] = 0.8f;
-    mb.values[nk::kBucketDynamicMu] = 0.8f;
-    mb.values[nk::kBucketDensity] = 1000.0f;
+    nk::ContactProfileV1 profile{};
+    profile.mu1 = 0.8f;
+    profile.mu2 = 0.8f;
+    nk::ModelMaterialBucket mb(profile);
     m.material_buckets = {mb};
     m.body_material_bucket.assign(m.body_init.size(), 0u);
     m.capacities.num_material_buckets = 1u;

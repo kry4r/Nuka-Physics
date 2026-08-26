@@ -93,6 +93,11 @@ struct ModelCapacities {
     // temp over the total row capacity; sized at World construct, 0 == no rows).
     uint64_t island_cub_temp_bytes = 0;
 
+    // Byte size of the pair_sort_scratch field (the LbvhQueryPairs canonicalizing
+    // radix sort over the rigid slot capacity; sized at World construct,
+    // 0 == non-PairDriven world -> the emitted stream stays as-is).
+    uint64_t pair_sort_scratch_bytes = 0;
+
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
     uint32_t mpm_grid_nodes_per_env = 0;

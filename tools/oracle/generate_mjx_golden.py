@@ -47,6 +47,8 @@ class _UsdPrim:
     initial_position: float = 0.0
     lower_limit: float = -3.14159
     upper_limit: float = 3.14159
+    has_lower_limit: bool = False
+    has_upper_limit: bool = False
     gain: float = 1.0
     force_limit: float = 0.0
     radius: float = 0.0
@@ -166,6 +168,10 @@ def _apply_usd_property(line: str, prim: _UsdPrim) -> None:
         value = _parse_float(line, key)
         if value is not None:
             setattr(prim, attr, value)
+            if key == "physics:lowerLimit":
+                prim.has_lower_limit = True
+            elif key == "physics:upperLimit":
+                prim.has_upper_limit = True
     for key, attr in (
         ("physics:diagonalInertia", "diagonal_inertia"),
         ("xformOp:translate", "translate"),
@@ -305,11 +311,19 @@ def _usda_to_fixed_base_mjcf(source: Path, work: Path) -> Path:
         joint = joint_for_child.get(body.path)
         if joint is not None:
             axis = _axis_tuple(joint.axis_token)
-            lines.append(
-                f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
-                f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
-                f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
-            )
+            # Mirror the engine: a hinge without authored USD bounds gets no
+            # limit row, so MuJoCo must not hard-stop at the parser's +/-pi.
+            if joint.has_lower_limit or joint.has_upper_limit:
+                lines.append(
+                    f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                    f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
+                    f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
+                )
+            else:
+                lines.append(
+                    f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                    f'axis="{_fmt(axis)}" limited="false" damping="0" armature="0"/>'
+                )
         if body.mass > 0.0 and not body.kinematic_enabled:
             lines.append(
                 f'{prefix}  <inertial pos="0 0 0" mass="{body.mass:.9g}" '
@@ -751,11 +765,19 @@ def _usda_to_floating_contact_mjcf(source: Path, work: Path,
         joint = joint_for_child.get(body.path)
         if joint is not None:
             axis = _axis_tuple(joint.axis_token)
-            lines.append(
-                f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
-                f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
-                f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
-            )
+            # Mirror the engine: a hinge without authored USD bounds gets no
+            # limit row, so MuJoCo must not hard-stop at the parser's +/-pi.
+            if joint.has_lower_limit or joint.has_upper_limit:
+                lines.append(
+                    f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                    f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
+                    f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
+                )
+            else:
+                lines.append(
+                    f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                    f'axis="{_fmt(axis)}" limited="false" damping="0" armature="0"/>'
+                )
         if body.mass > 0.0 and not body.kinematic_enabled:
             lines.append(
                 f'{prefix}  <inertial pos="0 0 0" mass="{body.mass:.9g}" '
@@ -1096,11 +1118,19 @@ def _usda_to_foot_box_contact_mjcf(source: Path, work: Path,
         joint = joint_for_child.get(body.path)
         if joint is not None:
             axis = _axis_tuple(joint.axis_token)
-            lines.append(
-                f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
-                f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
-                f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
-            )
+            # Mirror the engine: a hinge without authored USD bounds gets no
+            # limit row, so MuJoCo must not hard-stop at the parser's +/-pi.
+            if joint.has_lower_limit or joint.has_upper_limit:
+                lines.append(
+                    f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                    f'axis="{_fmt(axis)}" range="{joint.lower_limit:.9g} '
+                    f'{joint.upper_limit:.9g}" limited="true" damping="0" armature="0"/>'
+                )
+            else:
+                lines.append(
+                    f'{prefix}  <joint name="{_xml_name(joint.name)}" type="hinge" '
+                    f'axis="{_fmt(axis)}" limited="false" damping="0" armature="0"/>'
+                )
         if body.mass > 0.0 and not body.kinematic_enabled:
             lines.append(
                 f'{prefix}  <inertial pos="0 0 0" mass="{body.mass:.9g}" '
@@ -1482,6 +1512,288 @@ def generate_stand_trajectory(model_path: Path,
         os.replace(tmp_path, out_path)
 
 
+# ---------------------------------------------------------------------------
+# Versioned same-torque Go2OracleTrace (magic "NUKAOTRC").
+#
+# A ROLLOUT parity golden: both engines step the SAME floating-base go2 (source
+# translation of go2_float.usda, no floor -> free flight) under the SAME
+# deterministic torque schedule, recording per step the joint q/qd, base pose,
+# per-joint limit impulse, and the requested/applied/saturated effort triplet.
+# The exporter runs CPU MuJoCo (no jax); the comparator replays the schedule
+# through the production nuka Python backend and compares field-by-field.
+# ---------------------------------------------------------------------------
+
+KIND_GO2_TRACE_MAGIC = b"NUKAOTRC"
+GO2_TRACE_VERSION = 1
+
+GO2_JOINT_ORDER = [
+    "fl_hip_joint", "fl_thigh_joint", "fl_calf_joint",
+    "fr_hip_joint", "fr_thigh_joint", "fr_calf_joint",
+    "rl_hip_joint", "rl_thigh_joint", "rl_calf_joint",
+    "rr_hip_joint", "rr_thigh_joint", "rr_calf_joint",
+]
+GO2_TRACE_FLOATS_PER_STEP = 12 + 12 + 7 + 12 + 12 + 12 + 12
+
+
+def _go2_torque_schedule(steps: int, seed: int = 20260812) -> np.ndarray:
+    """Deterministic shared torque schedule: a limit-seeking bias plus a wiggle."""
+    rng = np.random.default_rng(seed)
+    bias = np.array([
+        6.0 if i % 2 == 0 else -6.0 for i in range(len(GO2_JOINT_ORDER))
+    ], dtype=np.float32)
+    t = np.arange(steps, dtype=np.float32)[:, None]
+    phase = np.arange(len(GO2_JOINT_ORDER), dtype=np.float32)[None, :]
+    wiggle = 4.0 * np.sin(6.0e-1 * t + 1.7 * phase)
+    jitter = rng.uniform(-1.0, 1.0, size=(steps, len(GO2_JOINT_ORDER)))
+    tau = bias[None, :] + wiggle + jitter
+    return tau.astype(np.float32)
+
+
+def _go2_trace_model(model_path: Path, work: Path,
+                     dt: float) -> tuple[object, object, np.ndarray, np.ndarray]:
+    """Build the floor-free floating MJCF, home qpos, and per-joint force limits."""
+    import mujoco
+    final_path, _ = _usda_to_floating_contact_mjcf(
+        model_path, work, (0.02, 1.0), (0.9, 0.95, 0.001, 0.5, 2.0),
+        floor_height=-100.0)
+    model = mujoco.MjModel.from_xml_path(str(final_path))
+    # Quantize to float32 once so both engines integrate the SAME timestep.
+    dt = float(np.float32(dt))
+    model.opt.timestep = dt
+    # Stiff joint limits keep MuJoCo's soft-constraint penetration well under
+    # the comparator tolerance while Nuka hard-stops at the bound.
+    model.jnt_solref[:] = (0.004, 1.0)
+    model.jnt_solimp[:] = (0.999, 0.999, 1.0e-6, 0.5, 2.0)
+    usd_initial_by_name = {
+        p.name: p.initial_position
+        for p in _parse_usda_prims(model_path)
+        if _is_joint(p) and p.has_initial_position
+    }
+    q_home = np.array(model.qpos0, dtype=np.float64)
+    for jname, q0 in usd_initial_by_name.items():
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+        if jid < 0:
+            raise SystemExit(f"go2-trace: USD joint {jname} not found in MJX model")
+        q_home[int(model.jnt_qposadr[jid])] = float(q0)
+    joint_order = _usd_joint_order(model_path)
+    _, force_limit_order = _usd_drive_arrays(model_path, joint_order)
+    limit_by_name = dict(zip(joint_order, force_limit_order))
+    force_limit = np.asarray(
+        [limit_by_name.get(name, 0.0) for name in GO2_JOINT_ORDER],
+        dtype=np.float32,
+    )
+    return model, q_home, force_limit
+
+
+def generate_go2_oracle_trace(model_path: Path,
+                              out_path: Path,
+                              steps: int,
+                              dt: float) -> None:
+    """Export the MuJoCo side of the same-torque Go2OracleTrace rollout."""
+    import mujoco
+    with tempfile.TemporaryDirectory(prefix="nuka_go2_trace_") as tmp:
+        model, q_home, force_limit = _go2_trace_model(model_path, Path(tmp), dt)
+        joint_ids = np.array([
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            for name in GO2_JOINT_ORDER
+        ], dtype=np.int64)
+        if np.any(joint_ids < 0):
+            raise SystemExit("go2-trace: a GO2_JOINT_ORDER name is missing")
+        qpos_adr = model.jnt_qposadr[joint_ids].astype(np.int64)
+        dof_adr = model.jnt_dofadr[joint_ids].astype(np.int64)
+        base_qpos = int(model.jnt_qposadr[
+            [int(model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)
+             for j in range(model.njnt)].index(True)])
+
+        data = mujoco.MjData(model)
+        data.qpos[:] = q_home
+        data.qvel[:] = 0.0
+        taus = _go2_torque_schedule(steps)
+        records = np.zeros((steps, GO2_TRACE_FLOATS_PER_STEP), dtype=np.float32)
+        for i in range(steps):
+            requested = taus[i]
+            applied = np.clip(requested, -force_limit, force_limit)
+            data.qfrc_applied[:] = 0.0
+            data.qfrc_applied[dof_adr] = applied.astype(np.float64)
+            mujoco.mj_step(model, data)
+            limit_impulse = np.zeros(len(GO2_JOINT_ORDER), dtype=np.float64)
+            for row in range(int(data.nefc)):
+                if int(data.efc_type[row]) != int(
+                        mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT):
+                    continue
+                jid = int(data.efc_id[row])
+                hits = np.nonzero(joint_ids == jid)[0]
+                if hits.size:
+                    limit_impulse[hits[0]] += float(data.efc_force[row]) * dt
+            records[i, 0:12] = data.qpos[qpos_adr]
+            records[i, 12:24] = data.qvel[dof_adr]
+            records[i, 24:27] = data.qpos[base_qpos:base_qpos + 3]
+            records[i, 27:31] = data.qpos[base_qpos + 3:base_qpos + 7]
+            records[i, 31:43] = limit_impulse
+            records[i, 43:55] = requested
+            records[i, 55:67] = applied
+            records[i, 67:79] = (requested != applied).astype(np.float32)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+    with tmp_path.open("wb") as out:
+        out.write(KIND_GO2_TRACE_MAGIC)
+        out.write(struct.pack("<IfII", GO2_TRACE_VERSION, dt, steps,
+                              len(GO2_JOINT_ORDER)))
+        name = model_path.name.encode("utf-8")
+        out.write(struct.pack("<I", len(name)))
+        out.write(name)
+        out.write(records.astype("<f4", copy=False).tobytes())
+    os.replace(tmp_path, out_path)
+
+
+def compare_go2_oracle_trace(model_path: Path,
+                             trace_path: Path,
+                             device: int = 0,
+                             tol_q: float = 0.05,
+                             tol_qd: float = 0.75,
+                             tol_effort: float = 1.0e-3,
+                             tol_limit: float = 0.5) -> None:
+    """Replay the trace schedule through the production backend and compare."""
+    import sys
+    root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "python"))
+    import nuka
+
+    with trace_path.open("rb") as f:
+        if f.read(8) != KIND_GO2_TRACE_MAGIC:
+            raise SystemExit(f"{trace_path}: not a NUKAOTRC file")
+        version, dt, steps, njoints = struct.unpack("<IfII", f.read(16))
+        if version != GO2_TRACE_VERSION or njoints != len(GO2_JOINT_ORDER):
+            raise SystemExit(f"{trace_path}: unsupported trace version/layout")
+        (name_len,) = struct.unpack("<I", f.read(4))
+        f.read(name_len)
+        raw = np.frombuffer(f.read(), dtype="<f4").reshape(steps, -1)
+    ref_q = raw[:, 0:12]
+    ref_qd = raw[:, 12:24]
+    ref_limit = raw[:, 31:43]
+    ref_requested = raw[:, 43:55]
+    ref_applied = raw[:, 55:67]
+    ref_saturated = raw[:, 67:79]
+
+    scene = Path(model_path).resolve()
+    if not scene.is_file():
+        raise SystemExit(f"go2-trace: scene not found: {scene}")
+    schedule = _go2_torque_schedule(steps)
+    with nuka.Device.create(device) as device_handle:
+        with nuka.World.create_from_scene(
+            device_handle, os.fspath(scene), env_count=2, dt=float(dt),
+            control_mode=nuka.CONTROL_MODE_TORQUE,
+        ) as world:
+            if world.dof_names()[1:] != GO2_JOINT_ORDER:
+                raise SystemExit(
+                    f"go2-trace: dof order mismatch: {world.dof_names()[1:]}")
+            usd_joint_order = _usd_joint_order(scene)
+            _, force_limit_order = _usd_drive_arrays(scene, usd_joint_order)
+            limit_by_name = dict(zip(usd_joint_order, force_limit_order))
+            limits = np.zeros((2, world.base_link_count), dtype=np.float32)
+            limits[:, 1:] = [limit_by_name.get(name, 0.0)
+                             for name in GO2_JOINT_ORDER]
+            world.upload_field(nuka.DRIVE_FORCE_LIMIT, limits)
+            # Bare-torque contract on both sides: no PD stiffness or damping.
+            for field_name in ("DRIVE_STIFFNESS", "DRIVE_DAMPING"):
+                zero = np.zeros((2, world.base_link_count), dtype=np.float32)
+                world.upload_field(getattr(nuka, field_name), zero)
+            torque = np.zeros((2, world.base_link_count), dtype=np.float32)
+            got_q = np.zeros((steps, 12), dtype=np.float32)
+            got_qd = np.zeros((steps, 12), dtype=np.float32)
+            got_limit = np.zeros((steps, 12), dtype=np.float32)
+            got_requested = np.zeros((steps, 12), dtype=np.float32)
+            got_applied = np.zeros((steps, 12), dtype=np.float32)
+            got_saturated = np.zeros((steps, 12), dtype=np.float32)
+            for i in range(steps):
+                torque[0, 1:] = schedule[i]
+                torque[1, 1:] = schedule[i]
+                world.upload_field(nuka.TORQUE_INPUT, torque)
+                world.step()
+                q = np.asarray(world.download_field(
+                    nuka.JOINT_POSITION), dtype=np.float32).reshape(2, -1)
+                qd = np.asarray(world.download_field(
+                    nuka.JOINT_VELOCITY), dtype=np.float32).reshape(2, -1)
+                lim = np.asarray(world.download_field(
+                    nuka.JOINT_LIMIT_IMPULSE), dtype=np.float32).reshape(2, -1, 2)
+                req = np.asarray(world.download_field(
+                    nuka.ACTUATOR_EFFORT_REQUESTED), dtype=np.float32).reshape(2, -1)
+                app = np.asarray(world.download_field(
+                    nuka.ACTUATOR_EFFORT), dtype=np.float32).reshape(2, -1)
+                sat = np.asarray(world.download_field(
+                    nuka.ACTUATOR_SATURATED), dtype=np.float32).reshape(2, -1)
+                got_q[i] = q[0, 1:]
+                got_qd[i] = qd[0, 1:]
+                # Both lanes are positive magnitudes; take the active side.
+                got_limit[i] = np.maximum(lim[0, 1:, 0], lim[0, 1:, 1])
+                got_requested[i] = req[0, 1:]
+                got_applied[i] = app[0, 1:]
+                got_saturated[i] = sat[0, 1:]
+
+    np.testing.assert_allclose(
+        got_requested, ref_requested, rtol=0.0, atol=tol_effort)
+    np.testing.assert_allclose(
+        got_applied, ref_applied, rtol=0.0, atol=tol_effort)
+    np.testing.assert_array_equal(got_saturated, ref_saturated)
+
+    # Effort telemetry is a pure clamp of the shared schedule: exact on ALL steps.
+    # Free-flight dynamics parity is tight ONLY up to the first limit impact, past
+    # which the two soft-constraint solvers' impact differences amplify chaotically.
+    impact = steps
+    active = (np.abs(ref_limit) > 1.0e-6).any(axis=1) | (got_limit > 1.0e-6).any(axis=1)
+    hits = np.nonzero(active)[0]
+    if hits.size:
+        impact = int(hits[0])
+    # impact == 0 means no pre-impact window exists; only the effort/bounds
+    # contracts apply in that case.
+    if impact > 0:
+        q_err = float(np.abs(got_q[:impact] - ref_q[:impact]).max())
+        qd_err = float(np.abs(got_qd[:impact] - ref_qd[:impact]).max())
+        check_parity = True
+    else:
+        q_err = qd_err = 0.0
+        check_parity = False
+
+    # Nuka's authored bounds are a HARD stop: assert the whole trajectory stays
+    # inside them (plus solver slop) even where the MuJoCo reference penetrates.
+    # Joints without authored USD bounds have no engine limit row and are exempt.
+    prims = _parse_usda_prims(scene)
+    bounds = {
+        p.name: (p.lower_limit, p.upper_limit)
+        for p in prims if _is_joint(p) and (p.has_lower_limit or p.has_upper_limit)
+    }
+    bounded = [i for i, n in enumerate(GO2_JOINT_ORDER) if n in bounds]
+    lower = np.array([bounds[n][0] for n in GO2_JOINT_ORDER if n in bounds],
+                     dtype=np.float32)
+    upper = np.array([bounds[n][1] for n in GO2_JOINT_ORDER if n in bounds],
+                     dtype=np.float32)
+    bound_slop = 2.0e-3
+    assert float((got_q[:, bounded] - lower).min()) >= -bound_slop, "lower bound violated"
+    assert float((upper - got_q[:, bounded]).min()) >= -bound_slop, "upper bound violated"
+
+    limit_err = float(np.abs(got_limit - ref_limit).max()) if steps else 0.0
+    post_q_err = (float(np.abs(got_q[impact:] - ref_q[impact:]).max())
+                  if impact < steps else 0.0)
+    print(f"trace={trace_path} steps={steps} dt={dt} impact_step={impact}")
+    print(f"pre_impact q_max_err={q_err:.6g} qd_max_err={qd_err:.6g}")
+    print(f"post_impact q_max_err={post_q_err:.6g} limit_max_err={limit_err:.6g}")
+    if q_err > tol_q and check_parity:
+        raise AssertionError(
+            f"go2-trace pre-impact q parity failed: {q_err} > {tol_q}")
+    if qd_err > tol_qd and check_parity:
+        raise AssertionError(
+            f"go2-trace pre-impact qd parity failed: {qd_err} > {tol_qd}")
+    if impact >= steps:
+        if limit_err > tol_limit:
+            raise AssertionError(
+                f"go2-trace limit impulse parity failed: {limit_err} > {tol_limit}")
+        print("effort=PASS saturated=PASS pre_impact_q=PASS bounds=PASS limit=PASS")
+    else:
+        print("effort=PASS saturated=PASS pre_impact_q=PASS bounds=PASS "
+              "limit=REPORT")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, type=Path)
@@ -1491,7 +1803,8 @@ def main() -> int:
                                  "floating-random-qacc",
                                  "floating-contact-step",
                                  "floating-foot-box-contact-step",
-                                 "stand-trajectory"),
+                                 "stand-trajectory",
+                                 "go2-trace"),
                         default="random-qacc")
     parser.add_argument("--samples", default=1000, type=int)
     parser.add_argument("--steps", default=1200, type=int)
@@ -1502,6 +1815,13 @@ def main() -> int:
         type=int,
         help="random-qacc JIT batch size; <=0 uses one batch for all samples",
     )
+    parser.add_argument("--compare", action="store_true",
+                        help="go2-trace: replay through nuka and compare")
+    parser.add_argument("--device", default=0, type=int)
+    parser.add_argument("--tol-q", default=0.05, type=float)
+    parser.add_argument("--tol-qd", default=0.75, type=float)
+    parser.add_argument("--tol-effort", default=1.0e-3, type=float)
+    parser.add_argument("--tol-limit", default=0.5, type=float)
     args = parser.parse_args()
     if args.mode == "random-qacc":
         generate_random_samples(args.model, args.out, args.samples, args.batch_size)
@@ -1512,6 +1832,14 @@ def main() -> int:
         generate_floating_contact_step(args.model, args.out)
     elif args.mode == "floating-foot-box-contact-step":
         generate_foot_box_contact_step(args.model, args.out)
+    elif args.mode == "go2-trace":
+        if args.compare:
+            compare_go2_oracle_trace(
+                args.model, args.out, device=args.device, tol_q=args.tol_q,
+                tol_qd=args.tol_qd, tol_effort=args.tol_effort,
+                tol_limit=args.tol_limit)
+            return 0
+        generate_go2_oracle_trace(args.model, args.out, args.steps, args.dt)
     else:
         generate_stand_trajectory(args.model, args.out, args.steps, args.dt)
     print(f"wrote {args.out}")

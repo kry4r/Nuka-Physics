@@ -443,13 +443,16 @@ __device__ __forceinline__ void SandReturnMap(float* F, float mu, float lambda,
 // Quadratic B-spline base node + the 3 per-axis weights. The particle sits in the
 // stencil [base, base+2]; fx is the particle offset from base in cell units.
 struct Bspline {
-    int32_t base;
+    int64_t base;
     float   w[3];
 };
 __device__ __forceinline__ Bspline QuadWeights(float gx) {
     // base = floor(gx - 0.5); fx in [0.5, 1.5) is the offset from base.
     Bspline b;
-    b.base = static_cast<int32_t>(floorf(gx - 0.5f));
+    // Non-finite coords saturate floor's float->int cast at INT_MAX, which would
+    // overflow the 32-bit stencil math below; park them on a node every bounds
+    // check rejects.
+    b.base = isfinite(gx) ? static_cast<int64_t>(floorf(gx - 0.5f)) : -0x40000000;
     const float fx = gx - static_cast<float>(b.base);
     b.w[0] = 0.5f * (1.5f - fx) * (1.5f - fx);
     const float d = fx - 1.0f;
@@ -459,16 +462,20 @@ __device__ __forceinline__ Bspline QuadWeights(float gx) {
 }
 
 // Per-env grid node id from integer node coords (env-offset for env-private grids).
-__device__ __forceinline__ int64_t NodeId(uint32_t env, int32_t ix, int32_t iy,
-                                          int32_t iz, const uint32_t dims[3],
+// Coordinates are 64-bit: callers add stencil offsets to values that can saturate
+// near INT_MAX, and 32-bit signed overflow would corrupt both the bounds check
+// and the address math.
+__device__ __forceinline__ int64_t NodeId(uint32_t env, int64_t ix, int64_t iy,
+                                          int64_t iz, const uint32_t dims[3],
                                           uint32_t nodes_per_env) {
-    if (ix < 0 || iy < 0 || iz < 0 || ix >= static_cast<int32_t>(dims[0]) ||
-        iy >= static_cast<int32_t>(dims[1]) || iz >= static_cast<int32_t>(dims[2])) {
+    if (ix < 0 || iy < 0 || iz < 0 ||
+        ix >= static_cast<int64_t>(dims[0]) ||
+        iy >= static_cast<int64_t>(dims[1]) ||
+        iz >= static_cast<int64_t>(dims[2])) {
         return -1;
     }
-    const uint32_t local = (static_cast<uint32_t>(iz) * dims[1] +
-                            static_cast<uint32_t>(iy)) * dims[0] +
-                           static_cast<uint32_t>(ix);
+    const uint32_t local = static_cast<uint32_t>(
+        (iz * dims[1] + iy) * dims[0] + ix);
     return static_cast<int64_t>(env) * nodes_per_env + local;
 }
 
@@ -585,12 +592,14 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
     const float gx = (xp.x - origin.x) * inv_dx;
     const float gy = (xp.y - origin.y) * inv_dx;
     const float gz = (xp.z - origin.z) * inv_dx;
-    const int32_t bx = static_cast<int32_t>(floorf(gx - 0.5f));
-    const int32_t by = static_cast<int32_t>(floorf(gy - 0.5f));
-    const int32_t bz = static_cast<int32_t>(floorf(gz - 0.5f));
+    // Non-finite or out-of-float-range coords are UB in the float->int cast;
+    // detect before converting and park the particle on the escape path.
+    const bool nonfinite = !isfinite(gx) || !isfinite(gy) || !isfinite(gz);
+    const int64_t bx = nonfinite ? 0 : static_cast<int64_t>(floorf(gx - 0.5f));
+    const int64_t by = nonfinite ? 0 : static_cast<int64_t>(floorf(gy - 0.5f));
+    const int64_t bz = nonfinite ? 0 : static_cast<int64_t>(floorf(gz - 0.5f));
     // Walled x/y faces + plane floor contain a pressed particle (flag only a base off
     // the grid there); the open +z top flags a stencil clip (base+2 past the ceiling).
-    const bool nonfinite = !isfinite(gx) || !isfinite(gy) || !isfinite(gz);
     const int64_t bx64 = bx, by64 = by, bz64 = bz;
     const bool escaped = nonfinite ||
                          bx64 < 0 || bx64 >= static_cast<int64_t>(dims_x) ||
@@ -599,23 +608,22 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
     if (escaped && env_status != nullptr) {
         atomicOr(&env_status[env], kEnvStatusMpmGridEscape);
     }
-    const int32_t cx = bx < 0 ? 0 : (bx >= static_cast<int32_t>(dims_x) ?
-                                     static_cast<int32_t>(dims_x) - 1 : bx);
-    const int32_t cy = by < 0 ? 0 : (by >= static_cast<int32_t>(dims_y) ?
-                                     static_cast<int32_t>(dims_y) - 1 : by);
-    const int32_t cz = bz < 0 ? 0 : (bz >= static_cast<int32_t>(dims_z) ?
-                                     static_cast<int32_t>(dims_z) - 1 : bz);
-    const uint32_t local = (static_cast<uint32_t>(cz) * dims_y +
-                            static_cast<uint32_t>(cy)) * dims_x +
-                           static_cast<uint32_t>(cx);
+    const int64_t cx = bx < 0 ? 0 : (bx >= static_cast<int64_t>(dims_x) ?
+                                     static_cast<int64_t>(dims_x) - 1 : bx);
+    const int64_t cy = by < 0 ? 0 : (by >= static_cast<int64_t>(dims_y) ?
+                                     static_cast<int64_t>(dims_y) - 1 : by);
+    const int64_t cz = bz < 0 ? 0 : (bz >= static_cast<int64_t>(dims_z) ?
+                                     static_cast<int64_t>(dims_z) - 1 : bz);
+    const uint32_t local = static_cast<uint32_t>(
+        (cz * dims_y + cy) * dims_x + cx);
     keys[t] = env * cells_per_env + local;
     idx[t] = p;
     // Mark exactly the 3^3 node stencil this particle can contribute to. Races
     // only write the same flag value; atomicExch makes the idempotence explicit.
     const uint32_t dims[3] = {dims_x, dims_y, dims_z};
-    for (int32_t a = 0; a < 3; ++a) {
-        for (int32_t b = 0; b < 3; ++b) {
-            for (int32_t c = 0; c < 3; ++c) {
+    for (int64_t a = 0; a < 3; ++a) {
+        for (int64_t b = 0; b < 3; ++b) {
+            for (int64_t c = 0; c < 3; ++c) {
                 const int64_t node =
                     NodeId(env, bx + a, by + b, bz + c, dims, nodes_per_env);
                 if (node >= 0) atomicExch(&active_node_flags[node], 1u);
@@ -720,7 +728,7 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                     const Bspline wxs = QuadWeights((xp.x - origin.x) * inv_dx);
                     const Bspline wys = QuadWeights((xp.y - origin.y) * inv_dx);
                     const Bspline wzs = QuadWeights((xp.z - origin.z) * inv_dx);
-                    const int32_t ox = nx - wxs.base, oy = ny - wys.base,
+                    const int64_t ox = nx - wxs.base, oy = ny - wys.base,
                                   oz = nz - wzs.base;
                     if (ox < 0 || ox > 2 || oy < 0 || oy > 2 || oz < 0 || oz > 2) continue;
                     const float w = wxs.w[ox] * wys.w[oy] * wzs.w[oz];
@@ -1103,10 +1111,10 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
     m::Vec3 vp = m::Vec3::Zero();
     float C[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     const uint32_t dims[3] = {dims_x, dims_y, dims_z};
-    for (int32_t a = 0; a < 3; ++a) {
-        for (int32_t b = 0; b < 3; ++b) {
-            for (int32_t c = 0; c < 3; ++c) {
-                const int32_t ix = wxs.base + a, iy = wys.base + b, iz = wzs.base + c;
+    for (int64_t a = 0; a < 3; ++a) {
+        for (int64_t b = 0; b < 3; ++b) {
+            for (int64_t c = 0; c < 3; ++c) {
+                const int64_t ix = wxs.base + a, iy = wys.base + b, iz = wzs.base + c;
                 const int64_t id = NodeId(env, ix, iy, iz, dims, nodes_per_env);
                 if (id < 0) continue;
                 const float w = wxs.w[a] * wys.w[b] * wzs.w[c];
@@ -1429,7 +1437,16 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
                    data.qdot_flat);
         profiler.Stop(MpmStage::ArticDeposit, stream);
     }
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    // Launch-config errors surface here, but async kernel faults only after the
+    // stream drains; sync once per MPM step outside graph capture so failures
+    // are loud, not sticky (a capturing stream must never be synchronized).
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture == cudaStreamCaptureStatusNone) {
+        if (cudaStreamSynchronize(stream) != cudaSuccess) return Status::Failed;
+        return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    }
+    return Status::Ok;
 }
 
 }  // namespace

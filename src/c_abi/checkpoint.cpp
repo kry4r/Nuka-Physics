@@ -15,6 +15,8 @@ namespace nuka::c_abi {
 struct WorldCheckpointRecord {
     nuka_world_handle owner = nullptr;
     std::vector<uint8_t> persistent;
+    std::vector<runtime::articulation::LinkSpatialInertia> link_inertia;
+    std::vector<float> joint_armature;
     uint32_t simulated_step_count = 0u;
     runtime::WorldStepOptions step_options;
     uint32_t sparse_solver_backend = 0u;
@@ -64,6 +66,8 @@ void CopyHostState(const WorldRecord& source, WorldCheckpointRecord* target) {
     target->simulated_step_count = source.simulated_step_count;
     target->step_options = source.step_options;
     target->sparse_solver_backend = source.sparse_solver_backend;
+    target->link_inertia = source.articulation_host.link_inertia;
+    target->joint_armature = source.articulation_host.joint_armature;
     for (uint32_t i = 0u; i < WorldRecord::kNoiseFieldCount; ++i) {
         target->noise_config[i] = source.noise_config[i];
         target->noise_seq[i] = source.noise_seq[i];
@@ -90,6 +94,8 @@ void RestoreHostState(const WorldCheckpointRecord& source, WorldRecord* target) 
     target->dr_nominal_joint_armature = source.dr_nominal_joint_armature;
     target->dr_nominal_gravity_z = source.dr_nominal_gravity_z;
     target->dr_nominal_friction = source.dr_nominal_friction;
+    target->articulation_host.link_inertia = source.link_inertia;
+    target->articulation_host.joint_armature = source.joint_armature;
     target->last_invariant_violations.clear();
     target->invariant_sampler.Reset();
 }
@@ -139,6 +145,10 @@ void HashHostState(uint64_t* hash, const WorldRecord& record) {
     HashFloatVector(hash, record.dr_nominal_joint_armature);
     HashValue(hash, record.dr_nominal_gravity_z);
     HashValue(hash, record.dr_nominal_friction);
+    HashFloatVector(hash, record.articulation_host.joint_armature);
+    for (const auto& inertia : record.articulation_host.link_inertia) {
+        HashBytes(hash, &inertia, sizeof(inertia));
+    }
 }
 
 }  // namespace

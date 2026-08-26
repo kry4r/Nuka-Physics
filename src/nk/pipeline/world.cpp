@@ -64,6 +64,21 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     model_.capacities.island_cub_temp_bytes = phi::IslandSortScratchBytes(
         model_.capacities.max_rows_per_env * model_.capacities.env_count);
 
+    // Size the broadphase pair-stream canonicalization scratch (LbvhQueryPairs)
+    // over the rigid candidate-slot capacity; 0 for a non-PairDriven world (the
+    // op early-exits there, so the segment stays zero-byte / byte-inert).
+    const bool runs_pair_driven =
+        model_.contact_family == ContactFamily::PairDriven;
+    const uint64_t pair_sort_slots =
+        runs_pair_driven ? static_cast<uint64_t>(
+            model_.capacities.max_contacts_per_env) * model_.capacities.env_count : 0u;
+    model_.capacities.pair_sort_scratch_bytes =
+        (pair_sort_slots > 0u &&
+         pair_sort_slots <= static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            ? phi::PairSortScratchBytes(static_cast<uint32_t>(pair_sort_slots),
+                                        model_.capacities.env_count)
+            : 0u;  // CUB sort/scan expose an int num_items contract.
+
     // The init-time buffer type (stream-less default-stream device type — fine
     // for the one-shot Model upload + Arena alloc, per the plan's note).
     phi::BufferType* bt = phi::DeviceBufferType(device);

@@ -18,6 +18,8 @@
 // ---------------------------------------------------------------------------
 
 #include "phi/backend.hpp"
+#include <atomic>
+#include <chrono>
 #include "render/render_world.hpp"
 #include "runtime/app/simulation.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"
@@ -55,10 +57,16 @@ uint64_t FnvBytes(const void* data, size_t n, uint64_t h = 1469598103934665603ul
 class TempDir {
 public:
     TempDir() {
-        char tmpl[] = "/tmp/editor_spawn_XXXXXX";
-        char* p = ::mkdtemp(tmpl);
-        if (!p) throw std::runtime_error("mkdtemp failed");
-        path_ = p;
+        static std::atomic<unsigned long long> seq{0ull};
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        fs::path candidate = fs::temp_directory_path() /
+            ("nuka_test_" + std::to_string(stamp) + "_" +
+             std::to_string(seq++));
+        if (!fs::create_directory(candidate)) {
+            throw std::runtime_error("temp dir create failed");
+        }
+        path_ = candidate;
     }
     ~TempDir() { std::error_code ec; fs::remove_all(path_, ec); }
     fs::path File(const std::string& n) const { return path_ / n; }

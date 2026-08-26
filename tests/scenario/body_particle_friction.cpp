@@ -101,9 +101,10 @@ nk::Model BuildModel(float soft_mu, float fluid_mu) {
     // particle's mu under max -- the honest reading is that a fluid slides only when
     // the foot is itself low-friction; here both boxes are held at the same mu so the
     // ONLY difference between the two contacts is the per-system particle mu.)
-    nk::ModelMaterialBucket smooth;
-    for (float& v : smooth.values) v = 0.0f;        // mu_s = mu_d = 0 (frictionless foot).
-    smooth.values[nk::kBucketDensity] = 1000.0f;    // keep a sane density lane.
+    nk::ContactProfileV1 smooth_profile{};
+    smooth_profile.mu1 = 0.0f;    // frictionless foot (mu_s = mu_d = 0).
+    smooth_profile.mu2 = 0.0f;
+    nk::ModelMaterialBucket smooth(smooth_profile);
     m.material_buckets = {smooth};
     m.body_material_bucket = {0u, 0u};              // both boxes -> bucket 0.
     m.capacities.num_material_buckets = 1u;
@@ -194,7 +195,8 @@ RowSides DecodeRow(const std::vector<float>& urows, uint32_t row) {
     RowSides s;
     s.flags = u(0);
     s.active = (s.flags & nk::nk_row_flags::kActive) != 0u;
-    s.friction = (s.flags & nk::nk_row_flags::kFriction) != 0u;
+    s.friction = (s.flags & (nk::nk_row_flags::kFriction |
+                             nk::nk_row_flags::kBlockTangent)) != 0u;
     s.a_kind = u(16); s.a_index = u(17);
     s.b_kind = u(24); s.b_index = u(25);
     return s;

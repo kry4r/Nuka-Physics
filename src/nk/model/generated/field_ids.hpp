@@ -259,6 +259,7 @@ enum class FieldId : uint16_t {
     ActuatorEffortRequested,  // actuator_effort_requested (per:link arena:scratch owner:data flags:[readout])
     ActuatorEffort,  // actuator_effort (per:link arena:scratch owner:data flags:[readout])
     ActuatorSaturated,  // actuator_saturated (per:link arena:scratch owner:data flags:[readout])
+    PairSortScratch,  // pair_sort_scratch (per:scalar arena:scratch owner:data count:pair_sort_scratch_bytes)
     Count
 };
 

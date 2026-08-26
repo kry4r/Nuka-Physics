@@ -273,6 +273,7 @@ __all__ = [
     "CABLE_PIN_END",
     "CABLE_PIN_BOTH",
     "CABLE_PIN_NONE",
+    "StateCheckpoint",
     "MEDIA_METHOD_XPBD",
     "MEDIA_METHOD_PBF",
     "MEDIA_METHOD_MLSMPM",

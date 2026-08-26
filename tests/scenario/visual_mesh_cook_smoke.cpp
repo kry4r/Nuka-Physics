@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
-// visual_mesh_cook_smoke -- M8.5 T5 gate for the VISUAL-MESH COOK.
+// visual_mesh_cook_smoke -- VISUAL-MESH COOK smoke gate.
 // ---------------------------------------------------------------------------
 // The beauty enabler: robots must render as REAL triangle geometry, not 5cm
-// placeholder boxes. The producer gaps closed in T5 are:
+// placeholder boxes. The producer capabilities covered are:
 //   (1) nks.cpp routes a VISUAL-only geom's triangles to a .nka MESH chunk (vs
 //       the CMSH chunk a colliding mesh uses) and emits a MESH AssetRef on the
 //       visual_mesh node; Load decodes it + records the resolved ref.
@@ -20,6 +20,8 @@
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
 
 #include "import/mjcf_importer.hpp"
 #include "render/render_world.hpp"
@@ -46,10 +48,16 @@ const std::string kH1Mjcf =
 class TempDir {
 public:
     TempDir() {
-        char tmpl[] = "/tmp/visual_mesh_cook_XXXXXX";
-        char* p = ::mkdtemp(tmpl);
-        if (!p) throw std::runtime_error("mkdtemp failed");
-        path_ = p;
+        static std::atomic<unsigned long long> seq{0ull};
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        fs::path candidate = fs::temp_directory_path() /
+            ("nuka_test_" + std::to_string(stamp) + "_" +
+             std::to_string(seq++));
+        if (!fs::create_directory(candidate)) {
+            throw std::runtime_error("temp dir create failed");
+        }
+        path_ = candidate;
     }
     ~TempDir() {
         std::error_code ec;
@@ -145,7 +153,7 @@ TEST(VisualMeshCook, H1WithHandRendersRealMeshes) {
 }
 
 // The committed examples/scenes/go2.nks (if present) loads and renders real
-// meshes -- this is the scene the T3 viewer can point at for the beauty showcase.
+// meshes -- this is the scene the viewer can point at for the beauty showcase.
 TEST(VisualMeshCook, CommittedGo2SceneRendersRealMeshes) {
     const std::string committed = "examples/scenes/go2.nks";
     if (!fs::exists(committed)) GTEST_SKIP() << "committed go2.nks not present";

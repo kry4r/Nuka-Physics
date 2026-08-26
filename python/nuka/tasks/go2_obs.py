@@ -33,6 +33,8 @@ symmetric on obs-in (q/qd -> URDF order) and action-out (URDF -> Nuka slots).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -213,7 +215,10 @@ def _go2_scene_path() -> str:
     # flat-ground floating-base Go2 scene) -- a dedicated, non-symlink locomotion
     # asset so the training task owns its scene. Identical content => identity
     # joint permutation => the golden obs-oracle / permutation tests stay green.
-    return "/root/Nuka-Physics/examples/scenes/go2_locomotion.usda"
+    # Resolved against the package tree so any checkout location works.
+    here = Path(__file__).resolve()
+    repo = here.parents[3]
+    return str(repo / "examples" / "scenes" / "go2_locomotion.usda")
 
 
 # ---------------------------------------------------------------------------
@@ -383,3 +388,61 @@ class Go2ObsBuilder:
         pg = self.projected_gravity()
         cos_up = (-pg[:, 2]).clamp(-1.0, 1.0)
         return torch.rad2deg(torch.arccos(cos_up))
+
+
+class Go2TorqueObs(Go2ObsBuilder):
+    """Same permutation / 48-dim obs, but actions are DIRECT JOINT TORQUES.
+
+    For worlds created with ``control_mode=1`` (engine torque preset): the
+    action write maps ``[-1,1]^12 -> tau = a * effort_limit`` (URDF order) into
+    TORQUE_INPUT; OpApplyDrives consumes it as ``tau = u`` and saturates at the
+    per-joint force limit -- policy torque is the ONLY control source. The PD
+    gains are inert in this preset (the DRIVE_FORCE_LIMIT they upload is not).
+    Subclasses may override :meth:`compose_extra` to append command blocks.
+    """
+
+    def __init__(self, device, world) -> None:
+        super().__init__(device, world)
+        # TORQUE_INPUT aliases the DriveTarget buffer in the T1 unified actuator;
+        # in torque mode its contents are consumed as Nm.
+        self._tau_view = torch.from_dlpack(world.buffer_view(nuka.TORQUE_INPUT))
+
+    def compose_extra(self) -> torch.Tensor:
+        """(N, extra_dim) appended after the base 48 dims; default none."""
+        return None
+
+    def compute_obs(self, command: torch.Tensor, last_action: torch.Tensor) -> torch.Tensor:
+        q_urdf = self.q_urdf()
+        qd_urdf = self.qd_urdf()
+        parts = [
+            self.base_lin_vel() * S_LIN_VEL,
+            self.base_ang_vel() * S_ANG_VEL,
+            self.projected_gravity(),
+            torch.zeros_like(command),   # no velocity command in torque skills
+            (q_urdf - self.default_angles) * S_DOF_POS,
+            qd_urdf * S_DOF_VEL,
+            last_action,
+        ]
+        extra = self.compose_extra()
+        if extra is not None:
+            parts.append(extra)
+        obs = torch.cat(parts, dim=-1)
+        return obs.clamp_(-OBS_CLIP, OBS_CLIP)
+
+    def write_action(self, action: torch.Tensor) -> torch.Tensor:
+        action = action.clamp(-ACTION_SPACE_LIMIT, ACTION_SPACE_LIMIT)
+        tau_urdf = action * self.force_limit_urdf          # (N,12) Nm, URDF order
+        self._tau_view[:, 1:GO2_BLC] = tau_urdf.index_select(1, self.nuka_slot_for_urdf)
+        return action
+
+    def state_finite(self) -> torch.Tensor:
+        """(N,) bool -- ALL state reads finite (q / qd / base vel / base quat).
+
+        Termination MUST gate on this, not just projected gravity: a solver
+        explosion can poison any state slice while pg stays finite, and a single
+        NaN obs reaching the policy poisons the whole PPO update."""
+        return (torch.isfinite(self.q_urdf()).all(-1)
+                & torch.isfinite(self.qd_urdf()).all(-1)
+                & torch.isfinite(self.base_lin_vel()).all(-1)
+                & torch.isfinite(self.base_ang_vel()).all(-1)
+                & torch.isfinite(self.base_quat_wxyz()).all(-1))

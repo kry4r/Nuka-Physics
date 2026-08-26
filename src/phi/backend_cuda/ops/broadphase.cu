@@ -95,6 +95,49 @@ struct GridSortScratchLayout {
         total    = AlignScratch(idx_off + nbytes);
     }
 };
+
+// 256B-aligned partition of pair_sort_scratch [cub temp | keys-in | keys-out |
+// slot perms | pair snapshot]. Sizes the segment (World construct) and
+// partitions it (the op) identically. The canonicalizing sort turns the
+// atomicAdd race order of EnvQueryPairsKernel into a pure function of the pair
+// ids, so contact slots, row slots, GS sweep order, and the warm-start cache
+// are all deterministic run-to-run.
+struct PairSortScratchLayout {
+    uint64_t temp_bytes = 0u;   // cub temp-storage region size (max of sort/scan).
+    uint64_t keys_in_off = 0u;  // byte offset of the unsorted u64 keys.
+    uint64_t keys_out_off = 0u; // byte offset of the sorted u64 keys.
+    uint64_t perms_in_off = 0u; // byte offset of the unsorted u32 source slots.
+    uint64_t perms_out_off = 0u;// byte offset of the sorted u32 source slots.
+    uint64_t snap_off = 0u;     // byte offset of the pair snapshot (2 u32/slot).
+    uint64_t clamp_off = 0u;    // byte offset of the clamped per-env counts.
+    uint64_t prefix_off = 0u;   // byte offset of the per-env live-count prefix.
+    uint64_t total = 0u;        // full segment byte size.
+    explicit PairSortScratchLayout(uint32_t sort_slots, uint32_t env_count) {
+        const int n = static_cast<int>(sort_slots);
+        size_t sort_bytes = 0u;
+        (void)cub::DeviceRadixSort::SortPairs<uint64_t, uint32_t>(
+            nullptr, sort_bytes, static_cast<const uint64_t*>(nullptr),
+            static_cast<uint64_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), n);
+        size_t scan_bytes = 0u;
+        (void)cub::DeviceScan::ExclusiveScan(
+            nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
+            static_cast<uint32_t*>(nullptr), NkScanSumOp{}, 0u,
+            static_cast<int>(env_count));
+        temp_bytes = sort_bytes > scan_bytes ? sort_bytes : scan_bytes;
+        const uint64_t kbytes = static_cast<uint64_t>(sort_slots) * sizeof(uint64_t);
+        const uint64_t pbytes = static_cast<uint64_t>(sort_slots) * sizeof(uint32_t);
+        const uint64_t ebytes = static_cast<uint64_t>(env_count) * sizeof(uint32_t);
+        keys_in_off = AlignScratch(temp_bytes);
+        keys_out_off = AlignScratch(keys_in_off + kbytes);
+        perms_in_off = AlignScratch(keys_out_off + kbytes);
+        perms_out_off = AlignScratch(perms_in_off + pbytes);
+        snap_off = AlignScratch(perms_out_off + pbytes);
+        clamp_off = AlignScratch(snap_off + 2u * kbytes);
+        prefix_off = AlignScratch(clamp_off + ebytes);
+        total = AlignScratch(prefix_off + ebytes);
+    }
+};
 // env_status diagnostic bits (kEnvStatus*) are shared in op_schema.hpp so the
 // broadphase, particle-grid, and CRBA ops agree on the readout layout.
 // The per-particle neighbor cap is the canonical cg::kParticleGridMaxNeighbors.
@@ -383,6 +426,73 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
     }
 }
 
+// Canonicalization pass 1: flatten each env's live pair slots into a u64 sort
+// key over GLOBAL collidable ids (env-major -> one global sort is env-major),
+// snapshot the pairs being sorted, and park dead slots at the key sentinel.
+// The perm stores the LINEAR source slot id (env*stride + slot) because the
+// global sort compacts live entries across env boundaries.
+__global__ void PairSortFillKernel(uint32_t env_count, uint32_t slot_cap,
+                                   uint32_t slot_stride,
+                                   const uint32_t* __restrict__ counts,
+                                   const uint32_t* __restrict__ pairs,
+                                   uint32_t bodies_per_env,
+                                   uint64_t* __restrict__ keys,
+                                   uint32_t* __restrict__ perms,
+                                   uint32_t* __restrict__ snap) {
+    const uint64_t f = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t total = static_cast<uint64_t>(env_count) * slot_cap;
+    if (f >= total) return;
+    const uint32_t env = static_cast<uint32_t>(f / slot_cap);
+    const uint32_t slot = static_cast<uint32_t>(f - env * slot_cap);
+    const uint32_t live = min(counts[env], slot_cap);
+    const size_t at = (static_cast<size_t>(env) * slot_stride + slot) * 2u;
+    if (slot >= live) {
+        keys[f] = 0xFFFFFFFFFFFFFFFFull;
+        perms[f] = 0u;
+        return;
+    }
+    const uint32_t a = pairs[at + 0];
+    const uint32_t b = pairs[at + 1];
+    snap[at + 0] = a;
+    snap[at + 1] = b;
+    // Emission guarantees a < b, so the packed key is already canonical; global
+    // ids keep every env's segment contiguous and ascending under one sort.
+    const uint64_t ga = static_cast<uint64_t>(env) * bodies_per_env + a;
+    const uint64_t gb = static_cast<uint64_t>(env) * bodies_per_env + b;
+    keys[f] = (ga << 32) | gb;
+    perms[f] = static_cast<uint32_t>(at / 2u);
+}
+
+// Prefix of the per-env clamped live counts: dst_env's sorted entries occupy
+// [prefix[dst_env], prefix[dst_env] + min(count,cap)) of the global order.
+__global__ void PairClampCountsKernel(const uint32_t* __restrict__ counts,
+                                      uint32_t slot_cap, uint32_t* __restrict__ clamped) {
+    const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    clamped[e] = min(counts[e], slot_cap);
+}
+
+// Canonicalization pass 2: the stable sort ranked every live entry by pair id
+// globally; recover the destination env from the key itself and its slot from
+// the per-env prefix, then copy through the snapshot (dead slots past the
+// watermark stay stale -- never consumed).
+__global__ void PairSortScatterKernel(
+    uint32_t env_count, uint32_t slot_cap,
+    const uint64_t* __restrict__ keys_out, const uint32_t* __restrict__ perms,
+    const uint32_t* __restrict__ prefix, uint32_t slot_stride,
+    uint32_t bodies_per_env, const uint32_t* __restrict__ snap,
+    uint32_t* __restrict__ pairs) {
+    const uint64_t f = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (f >= static_cast<uint64_t>(env_count) * slot_cap) return;
+    if (keys_out[f] == 0xFFFFFFFFFFFFFFFFull) return;
+    const uint64_t ga = keys_out[f] >> 32;
+    const uint32_t dst_env = static_cast<uint32_t>(ga / bodies_per_env);
+    const uint32_t dst_slot = static_cast<uint32_t>(f) - prefix[dst_env];
+    const size_t dst_at = (static_cast<size_t>(dst_env) * slot_stride + dst_slot) * 2u;
+    const size_t src_at = static_cast<size_t>(perms[f]) * 2u;
+    pairs[dst_at + 0] = snap[src_at + 0];
+    pairs[dst_at + 1] = snap[src_at + 1];
+}
+
 // --- ParticleGridBuild (CSR neighbors) --------------------------------------
 // Cell keys are ENV-OFFSET (key = env*cells_per_env + local key) so each env
 // owns a private cell span: env-major replicated particles occupy identical
@@ -554,6 +664,51 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
                static_cast<const uint64_t*>(model.excluded_pairs),
                p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
                data.candidate_pairs, data.pair_count, data.env_status);
+    // Canonicalize the emitted stream: the atomicAdd slot claim above orders
+    // pairs by warp-scheduling race, which would leak into contact slots, row
+    // slots, the GS sweep order, and the warm-start match as last-ULP float
+    // noise. One stable radix sort over global pair ids makes the stream a pure
+    // function of the ids (the repo determinism model: integer-only atomics,
+    // radix stable_sort, sorted compact output).
+    const uint64_t sort_slots64 =
+        static_cast<uint64_t>(E) * p->rigid_slot_cap;
+    if (sort_slots64 > 0u) {
+        if (sort_slots64 > 0xFFFFFFFFull || data.pair_sort_scratch == nullptr) {
+            return Status::Failed;  // LOUD: no silent nondeterministic fallback.
+        }
+        const uint32_t sort_slots = static_cast<uint32_t>(sort_slots64);
+        const PairSortScratchLayout sl(sort_slots, E);
+        char* sbase = reinterpret_cast<char*>(data.pair_sort_scratch);
+        void* sort_temp = sbase;
+        uint64_t* keys_in = reinterpret_cast<uint64_t*>(sbase + sl.keys_in_off);
+        uint64_t* keys_out = reinterpret_cast<uint64_t*>(sbase + sl.keys_out_off);
+        uint32_t* perms_in = reinterpret_cast<uint32_t*>(sbase + sl.perms_in_off);
+        uint32_t* perms_out = reinterpret_cast<uint32_t*>(sbase + sl.perms_out_off);
+        uint32_t* snap = reinterpret_cast<uint32_t*>(sbase + sl.snap_off);
+        uint32_t* clamped = reinterpret_cast<uint32_t*>(sbase + sl.clamp_off);
+        uint32_t* prefix = reinterpret_cast<uint32_t*>(sbase + sl.prefix_off);
+        size_t temp_bytes = static_cast<size_t>(sl.temp_bytes);
+        const uint32_t blocks = static_cast<uint32_t>(
+            (sort_slots64 + kBlockSize - 1u) / kBlockSize);
+        LaunchCuda(PairSortFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   E, p->rigid_slot_cap, p->max_contacts_per_env, data.pair_count,
+                   data.candidate_pairs, N, keys_in, perms_in, snap);
+        (void)cub::DeviceRadixSort::SortPairs(
+            sort_temp, temp_bytes, keys_in, keys_out, perms_in, perms_out,
+            static_cast<int>(sort_slots), 0, 64, stream);
+        {
+            const uint32_t eb = (E + kBlockSize - 1u) / kBlockSize;
+            LaunchCuda(PairClampCountsKernel, dim3(eb), dim3(kBlockSize), 0u,
+                       stream, data.pair_count, p->rigid_slot_cap, clamped);
+            size_t scan_bytes = static_cast<size_t>(sl.temp_bytes);
+            (void)cub::DeviceScan::ExclusiveScan(
+                sort_temp, scan_bytes, clamped, prefix, NkScanSumOp{}, 0u,
+                static_cast<int>(E), stream);
+        }
+        LaunchCuda(PairSortScatterKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   E, p->rigid_slot_cap, keys_out, perms_out, prefix,
+                   p->max_contacts_per_env, N, snap, data.candidate_pairs);
+    }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -653,6 +808,13 @@ uint64_t GridSortScratchBytes(uint32_t particle_count) {
         return 0u;
     }
     return GridSortScratchLayout(particle_count).total;
+}
+
+uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count) {
+    if (total_sort_slots == 0u || env_count == 0u) {
+        return 0u;
+    }
+    return PairSortScratchLayout(total_sort_slots, env_count).total;
 }
 
 void RegisterNkBroadphaseOps() {

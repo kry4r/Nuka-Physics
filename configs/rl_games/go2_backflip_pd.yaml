@@ -1,0 +1,76 @@
+params:
+  seed: 42
+  algo:
+    name: a2c_continuous
+  model:
+    name: continuous_a2c
+  network:
+    name: actor_critic
+    space:
+      continuous:
+        use_spectral_norm: false
+        mu_activation: "None"
+        sigma_activation: "None"
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 1.0
+        fixed_sigma: true
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      initializer:
+        name: default
+      regularizer:
+        name: none
+
+  config:
+    name: go2_backflip
+    env_name: nuka_go2_backflip
+    # PD-target-offset action space (nominal + 0.5*action rad); the published
+    # Go2 flip pipelines all use this parameterization instead of raw torque.
+    env_config:
+      action_mode: pd
+    device: cuda:0
+    full_experiment_name: go2_backflip_pd_v3
+    num_actors: 256
+    horizon_length: 24
+    minibatch_size: 1536
+    epochs: 5
+    learning_rate: 3e-4
+    lr_schedule: adaptive
+    clip_value: 1.0
+    mini_epochs: 5
+    normalize_advantage: true
+    score_to_win: 1000000000.0
+    max_epochs: -1
+    max_frames: -1
+    mixed_precision: false
+    torch_compile: false
+    adv_rms_momentum: null
+    kl_threshold: 0.008
+    e_clip: 0.2
+    gamma: 0.995
+    tau: 0.95
+    grad_norm: 1.0
+    bounds_loss_coef: 0.0001
+    entropy_coef: 0.01
+    critic_coef: 1.0
+    normalize_input: true
+    # Raw-value regression: backflip returns start near zero, which collapses
+    # the value normalizer's variance estimate and explodes the normalized
+    # targets (inf critic loss -> NaN grads). Rewards are bounded by design.
+    normalize_value: false
+    truncate_grads: true
+    value_bootstrap: true
+    clip_actions: false
+    reward_shaper:
+      scale_value: 1.0
+    save_best_after: 50
+    save_frequency: 50
+    print_stats: 1
+    max_agent_steps: 3000000000
+    time_limit: 0
+    player:
+      games_num: 8

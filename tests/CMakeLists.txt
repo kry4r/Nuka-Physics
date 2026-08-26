@@ -3495,7 +3495,19 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
-    # The body<->particle coupling headline clip: a real XPBD cloth draped over two
+    add_executable(nuka_go2_skill_video_cuda
+        ${CMAKE_SOURCE_DIR}/examples/demo/go2_skill_video_cuda.cpp
+    )
+    add_dependencies(nuka_go2_skill_video_cuda nuka_codegen)
+    target_compile_definitions(nuka_go2_skill_video_cuda PRIVATE
+        NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(nuka_go2_skill_video_cuda PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_go2_skill_video_cuda PRIVATE
+        nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
+        nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
+        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+
     # ridges, pressed + released by a rigid sphere on the ONE general row solver.
     # Unlike the pose-replay video tools this one STEPS nk::World on CUDA (settle +
     # the scripted press) and renders the live deforming cloth offscreen. Links the

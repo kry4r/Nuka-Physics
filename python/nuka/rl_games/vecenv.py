@@ -48,6 +48,8 @@ from rl_games.common import env_configurations as _env_configurations
 from ..tasks.go2_locomotion import make_env as make_go2_env
 from ..tasks.h1_stand import make_env as make_h1_stand_env
 from ..tasks.go2_handstand import make_env as make_handstand_env
+from ..tasks.go2_front_handstand import make_env as make_front_handstand_env
+from ..tasks.go2_backflip import make_env as make_backflip_env
 from ..tasks.bdx_locomotion import make_env as make_bdx_env
 from ..tasks.bdx_perception import make_env as make_bdx_perception_env
 from ..tasks.bdx_corridor import make_env as make_bdx_corridor_teacher_env
@@ -58,6 +60,8 @@ _ENV_FACTORIES = {
     "nuka_go2": make_go2_env,
     "nuka_h1_stand": make_h1_stand_env,
     "nuka_go2_handstand": make_handstand_env,
+    "nuka_go2_front_handstand": make_front_handstand_env,
+    "nuka_go2_backflip": make_backflip_env,
     "nuka_bdx": make_bdx_env,
     "nuka_bdx_perception": make_bdx_perception_env,
     "nuka_bdx_corridor_teacher": make_bdx_corridor_teacher_env,

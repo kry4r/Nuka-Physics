@@ -283,6 +283,7 @@ struct DataView {
     float* actuator_effort_requested = nullptr;  // per:link arena:scratch owner:data flags:[readout]
     float* actuator_effort = nullptr;  // per:link arena:scratch owner:data flags:[readout]
     float* actuator_saturated = nullptr;  // per:link arena:scratch owner:data flags:[readout]
+    uint8_t* pair_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:pair_sort_scratch_bytes
 };
 
 } // namespace nuka::phi

@@ -28,6 +28,8 @@
 // ---------------------------------------------------------------------------
 
 #include "import/mjcf_importer.hpp"
+#include <atomic>
+#include <chrono>
 #include "import/usd_importer.hpp"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
@@ -354,10 +356,16 @@ Composed ComposeAll() {
 class TempDir {
 public:
     TempDir() {
-        char tmpl[] = "/tmp/nks_compose_h1_cup_XXXXXX";
-        char* p = ::mkdtemp(tmpl);
-        if (!p) throw std::runtime_error("mkdtemp failed");
-        path_ = p;
+        static std::atomic<unsigned long long> seq{0ull};
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        fs::path candidate = fs::temp_directory_path() /
+            ("nuka_test_" + std::to_string(stamp) + "_" +
+             std::to_string(seq++));
+        if (!fs::create_directory(candidate)) {
+            throw std::runtime_error("temp dir create failed");
+        }
+        path_ = candidate;
     }
     ~TempDir() {
         std::error_code ec;
