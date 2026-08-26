@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// M7 T3 gate: examples/scenes/h1_cup_table.nks roundtrip + content exposure.
+// examples/scenes/h1_cup_table.nks roundtrip + content exposure.
 // ---------------------------------------------------------------------------
 // Load the committed scene (H1 via imports + cup body + table body +
 // initial_state + settle), then:
@@ -14,11 +14,13 @@
 // (GraspConfig removed); this fixture proves it still LOADS + re-saves
 // byte-identically with the grasp block silently skipped.
 //
-// This does NOT weaken scene_roundtrip's own equality gates; it is an additive,
-// scene-specific coverage of the M7 sections on a real authored file.
+// This does NOT weaken scene_roundtrip's own equality gates; it is an
+// additive, scene-specific coverage on a real authored file.
 // ---------------------------------------------------------------------------
 
 #include "scene/format/nks.hpp"
+#include <atomic>
+#include <chrono>
 #include "scene/scene_ir.hpp"
 
 #include <gtest/gtest.h>
@@ -46,10 +48,16 @@ bool SceneAvailable() {
 class TempDir {
 public:
     TempDir() {
-        char tmpl[] = "/tmp/nks_grasp_XXXXXX";
-        char* p = ::mkdtemp(tmpl);
-        if (!p) throw std::runtime_error("mkdtemp failed");
-        path_ = p;
+        static std::atomic<unsigned long long> seq{0ull};
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        fs::path candidate = fs::temp_directory_path() /
+            ("nuka_test_" + std::to_string(stamp) + "_" +
+             std::to_string(seq++));
+        if (!fs::create_directory(candidate)) {
+            throw std::runtime_error("temp dir create failed");
+        }
+        path_ = candidate;
     }
     ~TempDir() {
         std::error_code ec;

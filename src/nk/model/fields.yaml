@@ -883,3 +883,10 @@ fields:
   - {name: actuator_effort_requested, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
   - {name: actuator_effort, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
   - {name: actuator_saturated, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
+
+  # Broadphase pair-stream canonicalization scratch: the cub radix sort inputs/
+  # outputs (u64 global pair key -> u32 slot permutation) plus the pair snapshot
+  # the scatter pass reads back, all sized at World construct so the sort never
+  # cudaMallocs mid graph capture. Zero bytes for a non-PairDriven world ->
+  # zero-byte segment (byte-inert). APPENDED LAST.
+  - {name: pair_sort_scratch, dtype: u8, per: scalar, count: "pair_sort_scratch_bytes", arena: scratch, owner: data}

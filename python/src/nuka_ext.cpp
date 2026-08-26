@@ -1988,12 +1988,17 @@ NB_MODULE(_nuka_ext, m) {
             "byte-for-byte unchanged. GPU-only, D1-deterministic.")
         .def("capture_checkpoint", &World::capture_checkpoint,
              nb::rv_policy::take_ownership,
-             "Capture all persistent simulation state, including warm-start caches.")
+             "Capture all persistent simulation state, including warm-start caches. "
+             "Also snapshots host step/noise/DR state and the link-inertia/"
+             "armature mirror (all rewound by restore_checkpoint).")
         .def("restore_checkpoint", &World::restore_checkpoint,
              nb::arg("checkpoint"),
-             "Restore a checkpoint captured from this world.")
+             "Restore a checkpoint captured from this world: rewinds device bytes "
+             "plus the host step counter, options, noise/DR state, and the "
+             "link-inertia/armature mirror.")
         .def("state_hash", &World::state_hash,
-             "Return the deterministic 64-bit hash of persistent world state.")
+             "Return the deterministic 64-bit hash of the world: persistent "
+             "simulation bytes plus host step/config/noise/DR state.")
         .def("destroy", &World::destroy, "Destroy the world.")
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)

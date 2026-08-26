@@ -73,8 +73,10 @@ else()
     INSTALL_RPATH "${NUKA_BUILD_DIR}/src;${CUDA_LIB_DIR}")
 endif()
 
-# Install the extension and, on Windows, its adjacent engine runtime.
+# Install the extension and, on Windows, its adjacent engine runtime + the CUDA
+# runtime DLL so `import nuka` works on machines without the toolkit on PATH.
 install(TARGETS _nuka_ext LIBRARY DESTINATION nuka RUNTIME DESTINATION nuka)
 if(WIN32)
   install(FILES "${NUKA_RUNTIME}" DESTINATION nuka)
+  install(FILES "$<TARGET_FILE:CUDA::cudart>" DESTINATION nuka)
 endif()

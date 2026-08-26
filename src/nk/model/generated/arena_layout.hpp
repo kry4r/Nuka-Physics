@@ -298,6 +298,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_effort_requested
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_effort
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_saturated
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // pair_sort_scratch
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

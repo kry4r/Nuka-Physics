@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// M2c scenario gate: .nks / .nka scene roundtrip fidelity.
+// .nks / .nka scene roundtrip fidelity.
 // ---------------------------------------------------------------------------
 // Import (MJCF/USD) -> Compose -> Save(.nks + .nka) -> Load -> assert the loaded
 // SceneIR is structurally + cook-identical to the original, and a second Save is
@@ -9,6 +9,8 @@
 // ---------------------------------------------------------------------------
 
 #include "import/mjcf_importer.hpp"
+#include <atomic>
+#include <chrono>
 #include "import/urdf_importer.hpp"
 #include "import/usd_importer.hpp"
 #include "scene/asset/nka.hpp"
@@ -55,10 +57,16 @@ bool HeavyAssetsAvailable() {
 class TempDir {
 public:
     TempDir() {
-        char tmpl[] = "/tmp/nks_roundtrip_XXXXXX";
-        char* p = ::mkdtemp(tmpl);
-        if (!p) throw std::runtime_error("mkdtemp failed");
-        path_ = p;
+        static std::atomic<unsigned long long> seq{0ull};
+        const auto stamp =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        fs::path candidate = fs::temp_directory_path() /
+            ("nuka_test_" + std::to_string(stamp) + "_" +
+             std::to_string(seq++));
+        if (!fs::create_directory(candidate)) {
+            throw std::runtime_error("temp dir create failed");
+        }
+        path_ = candidate;
     }
     ~TempDir() {
         std::error_code ec;
@@ -217,7 +225,7 @@ TEST(SceneRoundtrip, MinimalAlwaysOn) {
     const std::string nks = tmp.File("minimal.nks").string();
     nks::Save(orig, nks);
 
-    // Format-shape pin (§3.7): the saved JSON root must carry a nested "tree"
+    // Format-shape pin: the saved JSON root must carry a nested "tree"
     // section and the split material sections, and must NOT carry the old flat
     // "bodies" record array (the deviation this change removed).
     {
@@ -225,7 +233,7 @@ TEST(SceneRoundtrip, MinimalAlwaysOn) {
         const std::string text((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>());
         const json::Value root = json::Value::Parse(text);
-        EXPECT_TRUE(root.Has("tree")) << "saved .nks lacks the §3.7 \"tree\" section";
+        EXPECT_TRUE(root.Has("tree")) << "saved .nks lacks the \"tree\" section";
         EXPECT_TRUE(root.Find("tree")->IsArray()) << "\"tree\" must be a node array";
         EXPECT_TRUE(root.Has("physics_materials"));
         EXPECT_TRUE(root.Has("render_materials"));
@@ -356,7 +364,7 @@ TEST(SceneRoundtrip, OverrideLayer) {
     }
 }
 
-// 4b. Facade write-through after DIRECT record mutation (pins the M2b
+// Facade write-through after DIRECT record mutation (pins the
 //     divergence fix): mutating a record via Get*Mut must be reflected by the
 //     facade on its next read, with no manual rebuild. A collision shape whose
 //     contype/conaffinity is flipped to 0/0 must re-project from

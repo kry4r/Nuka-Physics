@@ -327,6 +327,12 @@ uint64_t GridSortScratchBytes(uint32_t particle_count);
 // no mid-capture cudaMalloc. 0 for 0 rows.
 uint64_t IslandSortScratchBytes(uint32_t total_rows);
 
+// Byte size of the pre-allocated pair_sort_scratch the LbvhQueryPairs op draws its
+// canonicalizing cub radix sort (u64 key -> u32 slot perm) + per-env prefix + pair
+// snapshot from. Host-callable (defined in broadphase.cu) so the World sizes the
+// field BEFORE allocation -> no mid-capture cudaMalloc. 0 for empty inputs.
+uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count);
+
 // Dynamic solve-island build (connected components over the active contact rows).
 // All launch geometry is a fixed function of the capacities (graph-capturable); the
 // op partitions the rows by union-find each step and emits the device schedule the

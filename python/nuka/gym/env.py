@@ -68,6 +68,16 @@ class NukaGymEnv:
         byte-identical to the legacy path). The per-env terrain TYPE/DIFFICULTY are
         written separately via the engine ``ENV_TERRAIN_TYPE``/``ENV_TERRAIN_DIFFICULTY``
         buffer views (see :class:`~nuka.tasks.go2_locomotion.Go2LocomotionEnv`).
+    control_mode : int
+        Engine drive preset (create_from_scene ``control_mode``): 0 = PD position
+        (legacy default, actions are DRIVE_TARGET offsets), 1 = direct torque
+        (actions are TORQUE_INPUT Nm, effort-saturated by DRIVE_FORCE_LIMIT).
+        Default 0 keeps every existing task byte-identical.
+    obs_builder_factory : callable | None
+        ``(device, world) -> obs builder``; defaults to the shared
+        :class:`~nuka.tasks.go2_obs.Go2ObsBuilder`. Tasks that need a different
+        actuation/obs composition (e.g. direct torque + command block) supply a
+        subclass; the step/autoreset loop stays shared.
     use_scene_builder : bool
         Build through :class:`nuka.SceneBuilder` instead of the legacy
         ``World.create_from_scene`` entry. Required for complete rigid+media NKS
@@ -92,6 +102,8 @@ class NukaGymEnv:
         episode_length_s: float = 20.0,
         seed: int | None = None,
         terrain_create: "dict | None" = None,
+        control_mode: int = 0,
+        obs_builder_factory=None,
         use_scene_builder: bool = False,
         scene_build_kwargs: "dict | None" = None,
     ) -> None:
@@ -128,7 +140,8 @@ class NukaGymEnv:
                 builder.destroy()
         else:
             self._world = nuka.World.create_from_scene(
-                self._device, scene, self.num_envs, self.dt, **terrain_kw
+                self._device, scene, self.num_envs, self.dt,
+                control_mode=int(control_mode), **terrain_kw
             )
         assert self._world.action_dim == G.GO2_ACTION_DIM, (
             f"NukaGymEnv expects a 12-DOF Go2 (action_dim=12), got "
@@ -136,8 +149,12 @@ class NukaGymEnv:
         )
 
         # On-GPU obs builder (discovers the joint permutation on a throwaway
-        # world; does NOT step our persistent world).
-        self._obs = G.Go2ObsBuilder(self._device, self._world)
+        # world; does NOT step our persistent world). A task may inject a subclass
+        # (different actuation / extra obs block); everything else is shared.
+        if obs_builder_factory is not None:
+            self._obs = obs_builder_factory(self._device, self._world)
+        else:
+            self._obs = G.Go2ObsBuilder(self._device, self._world)
         self._obs.apply_pd_gains()
 
         # gym spaces.

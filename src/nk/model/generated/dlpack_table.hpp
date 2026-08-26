@@ -275,6 +275,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ActuatorEffortRequested, DlpackDtype::kF32, 1, false, true},  // actuator_effort_requested
     {FieldId::ActuatorEffort, DlpackDtype::kF32, 1, false, true},  // actuator_effort
     {FieldId::ActuatorSaturated, DlpackDtype::kF32, 1, false, true},  // actuator_saturated
+    {FieldId::PairSortScratch, DlpackDtype::kU8, 1, false, false},  // pair_sort_scratch
 };
 
 } // namespace nuka::nk
