@@ -27,6 +27,7 @@ namespace nuka::import {
 struct MeshGeometry {
     std::vector<float>    vertices;  // x,y,z triples (file order, no dedup)
     std::vector<float>    normals;   // x,y,z per-vertex normals, 1:1 with vertices (may be empty)
+    std::vector<float>    uvs;       // u,v per-vertex coordinates, 1:1 with vertices (may be empty)
     std::vector<uint32_t> indices;   // triangle indices (3 per triangle)
 
     /// Number of vertices (vertices.size() / 3).
@@ -46,11 +47,12 @@ struct MeshGeometry {
 /// Throws std::runtime_error on a missing or malformed/truncated file.
 MeshGeometry LoadStl(const std::string& path);
 
-/// Load a Wavefront OBJ file (v / f lines). Faces may be `f a b c`,
-/// `f a/t b/t c/t`, `f a//n b//n c//n`, and polygons with >3 vertices are fan
-/// triangulated (v0, v_i, v_{i+1}). OBJ indices are 1-based; negative indices
-/// are relative to the current vertex count. vt/vn/mtllib/usemtl/g/o/s are
-/// ignored for geometry purposes.
+/// Load a Wavefront OBJ file (v / vt / vn / f). Faces may be `f a b c`,
+/// `f a/t b/t c/t`, `f a//n b//n c//n`, and `f a/t/n b/t/n c/t/n`; polygons
+/// with >3 vertices are fan triangulated (v0, v_i, v_{i+1}). OBJ indices are
+/// 1-based; negative indices are relative to the current declaration count.
+/// Position/UV/normal seams are expanded into deterministic per-corner vertices.
+/// mtllib/usemtl/g/o/s are ignored.
 ///
 /// Throws std::runtime_error on a missing or malformed file.
 MeshGeometry LoadObj(const std::string& path);

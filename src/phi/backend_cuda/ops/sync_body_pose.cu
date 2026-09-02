@@ -69,26 +69,38 @@ __global__ void SyncLinkBodyPoseKernel(
 }
 
 // One thread per (env x body). A COLLIDABLE PROXY body row (an extra collision
-// geom of an articulation link) carries its source template-local link in
-// body_collidable_link (~0u == not a proxy) and the geom's link-local offset in
-// body_collidable_local; pose it from the source link's FK world pose. Multiple
-// proxies per link give a link multiple collidables (multi-geom feet). Non-proxy
-// rows (~0u) are skipped, so a single-geom world writes nothing here (no-op).
+// shape of a multi-collidable owner) carries its pose source in either
+// body_collidable_link (template-local articulation link) or body_collidable_body
+// (template-local free-rigid body row), plus the shape's owner-local offset in
+// body_collidable_local; pose it from the owner's world pose. Multiple proxies per
+// owner give it multiple collidables. Non-proxy rows (~0u in both) are skipped, so
+// a single-collidable world writes nothing here (no-op).
+// A body-owned proxy reads body_pose[owner]: an owner is never itself a proxy, so
+// no thread in this launch writes the row another thread reads.
 __global__ void SyncProxyCollidablePoseKernel(
-    const math::Transform* __restrict__ link_pose,          // FK world poses (env*L)
+    const math::Transform* __restrict__ link_pose,          // FK world poses (env*L), may be null
     const uint32_t* __restrict__ body_collidable_link,      // template-local link, or ~0u
-    const math::Transform* __restrict__ body_collidable_local,  // geom offset in the link frame
+    const math::Transform* __restrict__ body_collidable_local,  // shape offset in the owner frame
+    const uint32_t* __restrict__ body_collidable_body,      // template-local body row, or ~0u
     uint32_t total_bodies,                                   // env_count * bodies_per_env
     uint32_t links_per_env,
     uint32_t bodies_per_env,
     math::Transform* __restrict__ body_pose) {
     const uint32_t gb = blockIdx.x * blockDim.x + threadIdx.x;
     if (gb >= total_bodies) return;
-    const uint32_t link_local = body_collidable_link[gb];
-    if (link_local == ~uint32_t(0) || link_local >= links_per_env) return;  // not a proxy.
     const uint32_t env = gb / bodies_per_env;
-    const uint32_t gl = env * links_per_env + link_local;
-    body_pose[gb] = amf::ComposeTransformHD(link_pose[gl], body_collidable_local[gb]);
+    const uint32_t link_local = body_collidable_link[gb];
+    if (link_local != ~uint32_t(0)) {
+        if (link_pose == nullptr || link_local >= links_per_env) return;
+        const uint32_t gl = env * links_per_env + link_local;
+        body_pose[gb] = amf::ComposeTransformHD(link_pose[gl], body_collidable_local[gb]);
+        return;
+    }
+    if (body_collidable_body == nullptr) return;
+    const uint32_t body_local = body_collidable_body[gb];
+    if (body_local == ~uint32_t(0) || body_local >= bodies_per_env) return;  // not a proxy.
+    const uint32_t owner = env * bodies_per_env + body_local;
+    body_pose[gb] = amf::ComposeTransformHD(body_pose[owner], body_collidable_local[gb]);
 }
 
 Status OpSyncLinkBodyPose(const ModelView& model, const DataView& data,
@@ -96,26 +108,27 @@ Status OpSyncLinkBodyPose(const ModelView& model, const DataView& data,
     const auto* p = static_cast<const SyncLinkBodyPoseParams*>(params);
     if (p == nullptr) return Status::Failed;
     if (p->family != kContactFamilyPairDriven) return Status::Ok;  // early-exit.
-    if (p->env_count == 0u || p->links_per_env == 0u ||
-        p->bodies_per_env == 0u) {
-        return Status::Ok;
+    if (p->env_count == 0u || p->bodies_per_env == 0u) return Status::Ok;
+    if (data.body_pose == nullptr) return Status::Ok;  // nothing to sync.
+    // Link pass: pose each link's own collidable body row from FK. Skipped by a
+    // world with no articulation (links_per_env == 0) -- its body-proxy rows below
+    // still need posing.
+    if (data.link_pose != nullptr && model.link_body != nullptr &&
+        p->links_per_env > 0u) {
+        const uint32_t total = p->env_count * p->links_per_env;
+        const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(SyncLinkBodyPoseKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   static_cast<const math::Transform*>(data.link_pose),
+                   static_cast<const uint32_t*>(model.link_body),
+                   static_cast<const uint32_t*>(model.link_geom_kind),
+                   static_cast<const math::Transform*>(model.link_geom_local),
+                   total, p->links_per_env, p->bodies_per_env,
+                   static_cast<math::Transform*>(data.body_pose));
     }
-    if (data.link_pose == nullptr || model.link_body == nullptr ||
-        data.body_pose == nullptr) {
-        return Status::Ok;  // nothing to sync.
-    }
-    const uint32_t total = p->env_count * p->links_per_env;
-    const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(SyncLinkBodyPoseKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               static_cast<const math::Transform*>(data.link_pose),
-               static_cast<const uint32_t*>(model.link_body),
-               static_cast<const uint32_t*>(model.link_geom_kind),
-               static_cast<const math::Transform*>(model.link_geom_local),
-               total, p->links_per_env, p->bodies_per_env,
-               static_cast<math::Transform*>(data.body_pose));
-    // Extra collidable proxies (multi-geom feet): pose the appended proxy body
-    // rows from their source link. A no-op when the model authored none (every
-    // body_collidable_link == ~0u), so single-geom worlds are byte-untouched.
+    // Extra collidable proxies (multi-collidable owners): pose the appended proxy
+    // body rows from their owner link or owner body row. A no-op when the model
+    // authored none (every binding == ~0u), so single-collidable worlds are
+    // byte-untouched.
     if (model.body_collidable_link != nullptr &&
         model.body_collidable_local != nullptr) {
         const uint32_t total_bodies = p->env_count * p->bodies_per_env;
@@ -125,6 +138,7 @@ Status OpSyncLinkBodyPose(const ModelView& model, const DataView& data,
                    static_cast<const math::Transform*>(data.link_pose),
                    static_cast<const uint32_t*>(model.body_collidable_link),
                    static_cast<const math::Transform*>(model.body_collidable_local),
+                   static_cast<const uint32_t*>(model.body_collidable_body),
                    total_bodies, p->links_per_env, p->bodies_per_env,
                    static_cast<math::Transform*>(data.body_pose));
     }

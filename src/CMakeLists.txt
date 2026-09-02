@@ -1175,8 +1175,9 @@ if(CMAKE_CUDA_COMPILER)
         # path; shares this lib's --fmad=false so the fk*cvl compose is byte-exact.
         phi/backend_cuda/rt/sensor_scatter.cu
         # Batched N-env sensor render: ONE batched LBVH build over per-env TLASes +
-        # ONE flat trace over [E*H*W] rays (FP32 cheap-shade) into a (N,H,W,ch)
-        # device tensor. Reuses the shared traversal nest + the batched LBVH build.
+        # ONE flat trace over [E*H*W] rays (persistent high-quality RGB/AOV path)
+        # into a (N,H,W,ch) device tensor. Reuses the shared traversal nest + the
+        # batched LBVH build.
         phi/backend_cuda/rt/batched_sensor_render.cu
         # M11 RT-1/RT-3 (§3.10): the CONCRETE CUDA impl of render::RtBackendI.
         # Host C++ (no kernel launch) that WRAPS BuildTwoLevelScene/RenderFrame;

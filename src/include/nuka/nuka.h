@@ -186,6 +186,13 @@ typedef struct nuka_world_desc_t {
     uint32_t curric_levels;          // # difficulty rows (0 => no curriculum grid).
     uint32_t curric_types;           // # feature columns.
     float    terrain_feature_cell;   // curriculum tile edge, m (0 => 6.0).
+    // SolverConfig overrides (1:1 with nk::Pipeline::SolverConfig). Each 0 keeps the
+    // engine default, so a zero-initialized desc takes today's code path unchanged.
+    uint32_t solver_vel_iters;             // 0 => 32.
+    uint32_t solver_pos_iters;             // 0 => 4.
+    float    solver_contact_margin;        // 0.0 => cooked default; speculative margin, m.
+    uint32_t solver_max_pairs;             // 0 => bodies_per_env * 4 broadphase emit cap.
+    float    solver_baumgarte_max_velocity;// 0.0 => cooked model default.
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -615,7 +622,15 @@ typedef enum nuka_state_field_t {
     // READ: requested effort, saturated actuator effort, and a float32 0/1 clamp flag.
     NUKA_FIELD_ACTUATOR_EFFORT_REQUESTED = 28,
     NUKA_FIELD_ACTUATOR_EFFORT = 29,
-    NUKA_FIELD_ACTUATOR_SATURATED = 30
+    NUKA_FIELD_ACTUATOR_SATURATED = 30,
+    // WRITE (per-env). Optional world-frame OSC orientation target as a
+    // W-first quaternion. A near-zero quaternion keeps the original 3D
+    // position-only TASK_TARGET behavior.
+    NUKA_FIELD_TASK_ROTATION_TARGET = 31,
+    // WRITE (per-env). Rigid local frame on osc_task_link, represented as
+    // [px,py,pz,qw,qx,qy,qz]. A near-zero quaternion means identity rotation;
+    // the translation still selects an offset point such as a gripper site.
+    NUKA_FIELD_TASK_LOCAL_POSE = 32
 } nuka_state_field_t;
 
 typedef struct nuka_buffer_view_t {
@@ -707,8 +722,9 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
 // ---------------------------------------------------------------------------
 // Device-resident batched camera sensor: S cameras per env (each on its own mount)
 // rendered into a single (env_count, sensors_per_env, height, width, channels)
-// device tensor (no host download). The same RT tracer at a cheap sensor profile;
-// the obs is read zero-copy via nuka_world_get_sensor_view + torch.from_dlpack.
+// device tensor (no host download). The persistent high-quality RT sensor trace
+// produces the observation; it is read zero-copy via
+// nuka_world_get_sensor_view + torch.from_dlpack.
 // With one camera per env the tensor collapses to (env_count, height, width, ch).
 // ---------------------------------------------------------------------------
 
@@ -874,21 +890,17 @@ nuka_result_t nuka_world_set_render_randomization(
     nuka_world_handle world, const nuka_render_dr_desc_t* desc);
 
 // ---------------------------------------------------------------------------
-// Sensor RGB shading fidelity: the batched sensor RGB shades flat (1 spp, 1 hard
-// shadow) -- low sim2real value for a vision policy. This opt-in profile lifts it
-// to the single-camera beauty look (MSAA spp + soft sun shadow + ambient occlusion
-// + one-bounce GI + procedural sky + tonemap) in the SAME trace, gated on the
-// profile. The DEFAULT profile (the all-zero desc / a NULL desc) is the cheap shade
-// -> the AOV bytes are unchanged. Deterministic + seeded: the stochastic samples
-// derive from Philox(seed, env, sensor, pixel, sample), so the same seed yields the
-// same bytes. depth/normal/albedo/prim always come from the center ray. TEXTURES
-// are out of scope (a UV-plumbing follow-on); this is lighting/shading + AA only.
+// Sensor RGB shading: the batched sensor always uses the high-quality path
+// (textured materials + MSAA + soft sun shadow + AO/GI + ACES + sRGB) in the
+// SAME persistent trace. The profile controls quality/sample counts and the
+// atmosphere; it is no longer an opt-in cheap-vs-beauty switch. Deterministic +
+// seeded: stochastic samples derive from Philox(seed, env, sensor, pixel, sample).
+// depth/normal/albedo/prim always come from the center ray.
 // ---------------------------------------------------------------------------
 
-// The opt-in shading-fidelity profile. The all-zero value (spp==0 reads as 1) is
-// the cheap shade (a byte no-op). spp / shadow_samples / ao_samples are capped
-// LOUDLY (INVALID_ARG over the cap). ao_radius/sun_angular_radius default to the
-// single-camera beauty values when zero is passed with the corresponding axis on.
+// High-quality sensor profile. A NULL descriptor or an all-zero descriptor uses
+// the defaults below. spp / shadow_samples / ao_samples are capped LOUDLY
+// (INVALID_ARG over the cap).
 typedef struct nuka_sensor_fidelity_desc_t {
     uint32_t spp;                /* jittered sub-pixel samples per pixel (MSAA); 0->1 */
     uint32_t shadow_samples;     /* soft-shadow rays across the sun disc; 0/1 -> hard */
@@ -897,17 +909,18 @@ typedef struct nuka_sensor_fidelity_desc_t {
     uint32_t ao_samples;         /* hemisphere rays when ao_enabled */
     float ao_radius;             /* AO ray max distance (world units) */
     int gi_enabled;              /* add the one-bounce diffuse GI term on AO rays */
-    int tonemap_enabled;         /* ACES-ish filmic tonemap of the averaged color */
+    int tonemap_enabled;         /* ACES-ish filmic tonemap of averaged color */
     float sky_intensity;         /* scales the sky-dome ambient (0 -> uses default) */
     float fog_density;           /* per-metre height/distance fog extinction (0=off) */
     uint64_t seed;               /* Philox key; the recorded deterministic state */
+    int srgb_enabled;            /* encode linear color to the RGB sensor contract */
 } nuka_sensor_fidelity_desc_t;
 
-// Record the opt-in shading-fidelity profile on the attached sensor. A NULL desc
-// (or an all-zero / spp<=1 + everything-off desc) restores the cheap shade -> the
-// AOV bytes are unchanged. Requires a camera attached (the sensor scene owns the
-// state). Idempotent for a fixed seed; safe to re-call per reset. INVALID_ARG if a
-// sample count is over its cap. NOT_SUPPORTED if no camera is attached.
+// Record the high-quality sensor profile on the attached sensor. A NULL desc or
+// an all-zero desc selects the default high-quality settings. A nonzero descriptor
+// may tune samples and lighting, but the sensor always uses the beauty path.
+// Requires a camera attached. Idempotent for a fixed seed; safe per reset.
+// INVALID_ARG if a sample count is over its cap; NOT_SUPPORTED without a camera.
 nuka_result_t nuka_world_set_sensor_fidelity(
     nuka_world_handle world, const nuka_sensor_fidelity_desc_t* desc);
 

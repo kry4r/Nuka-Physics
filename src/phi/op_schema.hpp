@@ -67,6 +67,7 @@ inline constexpr uint32_t kEnvStatusMpmOneWayBody    = 1u << 4;
 enum class NkOp : uint16_t {
     // --- articulated-body dynamics --------------------------------------
     ApplyDrives,           // PD / motor drives -> generalized forces
+    ApplyOscDrives,        // 6D operational-space torque from free ABA + M^-1
     AbaForward,            // Featherstone ABA forward dynamics (q,qd -> qdd)
     IntegrateVelocity,     // qd += qdd * dt
     FkWorldPoses,          // forward kinematics -> per-link world poses
@@ -193,6 +194,13 @@ struct ApplyDrivesParams {
     // world's LaunchApplyTorqueDriveKernels port: tau = clamp(drive_target,
     // +/-drive_force_limit) — drive_target carries the per-link torque).
     uint32_t mode;
+};
+
+struct ApplyOscDrivesParams {
+    uint32_t max_dof;
+    uint32_t articulation_count;
+    uint32_t total_link_count;
+    uint32_t task_link;  // articulation-local link index
 };
 
 struct AbaForwardParams {

@@ -11,7 +11,7 @@
 
 namespace nuka::nk {
 
-struct Model;
+class Model;
 
 class XpbdColoring {
 public:

@@ -522,6 +522,7 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
             world.lights.push_back(rl);
         });
 
+    DecodeMaterialTextures(world);
     return world;
 }
 

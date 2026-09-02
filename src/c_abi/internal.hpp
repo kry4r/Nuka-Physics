@@ -107,12 +107,11 @@ struct SensorAttachment {
     // Per-env appearance DR (disabled -> base replicas). Retained so a re-attach
     // (which rebuilds the sensor scene) re-applies it onto the fresh tables.
     nuka::rt::RenderDrConfig render_dr;
-    // Opt-in shading fidelity (default -> cheap shade). Retained so a re-attach
-    // re-applies it onto the rebuilt sensor scene.
+    // Default high-quality sensor shading (textured materials + MSAA + soft shadow +
+    // AO/GI + ACES + sRGB). Retained so a re-attach reapplies the profile.
     nuka::rt::SensorFidelityConfig fidelity;
-    // Camera AOV selection (0 => legacy all-AOV profile). Retained across a
-    // camera/lidar re-attach so an observation pipeline does not silently fall
-    // back to the expensive shaded path.
+    // Camera AOV selection (0 => the default all-AOV profile). Retained across a
+    // camera/lidar re-attach so an observation pipeline keeps its selected planes.
     uint32_t aov_mask = 0u;
     SensorAttachment();     // out-of-line (the SensorDesc vector member is incomplete here).
     ~SensorAttachment();    // defined in c_abi/sensor.cpp (FreeSensorScene then backend).
@@ -324,7 +323,8 @@ nuka_result_t FinishWorldCreate(
     nuka::terrain::HeightField&& cooked_terrain, DeviceRecord* device_record,
     float fixed_dt, uint32_t env_count,
     runtime::articulation::ControlMode control_mode,
-    const nuka::math::Vec3& gravity, nuka_world_handle* out,
+    const nuka::math::Vec3& gravity, uint32_t osc_task_link,
+    nuka_world_handle* out,
     uint32_t solver_vel_iters = 0u, uint32_t solver_pos_iters = 0u,
     float solver_contact_margin = 0.0f, uint32_t solver_max_pairs = 0u);
 

@@ -1,0 +1,14 @@
+{
+  "checkpoint": "ases200q2/Isaac_panda_pick_cube_pi05_20251126_100645",
+  "revision": "50de12d0f98da229f39cb058562345aed4fb8b71",
+  "camera_key": "observation.images.camera_1",
+  "camera_source_shape_chw": [3, 480, 640],
+  "camera_model_shape_hw": [224, 224],
+  "state_dim": 8,
+  "action_dim": 8,
+  "action_semantics": "absolute Panda joint position: 7 arm plus 1 symmetric gripper command",
+  "chunk_size": 50,
+  "flow_steps": 10,
+  "preprocess_mode": "HOST_COMPAT",
+  "generated_scene": ".nuka-assets/generated/panda/panda_pick_place.xml"
+}

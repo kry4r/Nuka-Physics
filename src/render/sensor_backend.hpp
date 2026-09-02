@@ -144,9 +144,8 @@ public:
     virtual void SetRenderDr(SensorSceneHandle* handle, const rt::RenderDrConfig& cfg,
                              uint32_t env_count) = 0;
 
-    // Record the opt-in shading-fidelity profile (spp / soft shadow / AO / GI /
-    // tonemap). The DEFAULT config (Enabled()==false) keeps the cheap-shade
-    // arithmetic -> the AOV bytes are unchanged. Caps spp/samples LOUDLY.
+    // Record the default high-quality sensor profile (textured materials + MSAA +
+    // soft shadow + AO/GI + ACES + sRGB). Caps spp/samples LOUDLY.
     virtual void SetSensorFidelity(SensorSceneHandle* handle,
                                    const rt::SensorFidelityConfig& cfg) = 0;
 

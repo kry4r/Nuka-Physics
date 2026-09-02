@@ -130,48 +130,66 @@ MeshGeometry ParseAsciiStl(const std::vector<char>& buf, const std::string& path
 }
 
 // ---- OBJ -----------------------------------------------------------------
-// Parse the leading integer of an OBJ face token ("12", "12/3", "12//4",
-// "12/3/4", or negative). Returns the 0-based index resolved against the
-// current vertex count. Throws on a malformed / out-of-range reference.
-std::uint32_t ParseObjFaceIndex(const std::string& tok,
-                                std::size_t vertex_count,
-                                const std::string& path) {
-    // Take the substring up to the first '/'.
-    const std::size_t slash = tok.find('/');
-    const std::string num = (slash == std::string::npos) ? tok : tok.substr(0, slash);
-    if (num.empty()) {
-        throw std::runtime_error("mesh-loader: OBJ face missing vertex index: " + path);
-    }
+// Parse one OBJ index component. Positive indices are 1-based; negative
+// indices are relative to the declaration count active when the face appears.
+int ParseObjIndex(const std::string& num, std::size_t count,
+                  const std::string& path, const char* kind) {
+    if (num.empty()) return -1;
     long raw = 0;
     try {
         std::size_t consumed = 0;
         raw = std::stol(num, &consumed);
         if (consumed != num.size()) {
-            throw std::runtime_error("mesh-loader: OBJ non-integer face index '" +
-                                     num + "': " + path);
+            throw std::runtime_error("mesh-loader: OBJ non-integer " +
+                                     std::string(kind) + " index '" + num + "': " + path);
         }
     } catch (const std::invalid_argument&) {
-        throw std::runtime_error("mesh-loader: OBJ non-integer face index '" +
-                                 num + "': " + path);
+        throw std::runtime_error("mesh-loader: OBJ non-integer " +
+                                 std::string(kind) + " index '" + num + "': " + path);
     } catch (const std::out_of_range&) {
-        throw std::runtime_error("mesh-loader: OBJ face index out of range '" +
-                                 num + "': " + path);
+        throw std::runtime_error("mesh-loader: OBJ " + std::string(kind) +
+                                 " index out of range '" + num + "': " + path);
     }
-
-    long zero_based = 0;
-    if (raw > 0) {
-        zero_based = raw - 1;                       // 1-based -> 0-based
-    } else if (raw < 0) {
-        zero_based = static_cast<long>(vertex_count) + raw;  // relative
-    } else {
-        throw std::runtime_error("mesh-loader: OBJ face index 0 is invalid: " + path);
+    if (raw == 0) {
+        throw std::runtime_error("mesh-loader: OBJ " + std::string(kind) +
+                                 " index 0 is invalid: " + path);
     }
-
-    if (zero_based < 0 || zero_based >= static_cast<long>(vertex_count)) {
-        throw std::runtime_error("mesh-loader: OBJ face index out of bounds: " + path);
+    const long zero_based = raw > 0 ? raw - 1 : static_cast<long>(count) + raw;
+    if (zero_based < 0 || zero_based >= static_cast<long>(count)) {
+        throw std::runtime_error("mesh-loader: OBJ " + std::string(kind) +
+                                 " index out of bounds: " + path);
     }
-    return static_cast<std::uint32_t>(zero_based);
+    return static_cast<int>(zero_based);
 }
+
+struct ObjFaceVertex {
+    int vertex = -1;
+    int texcoord = -1;
+    int normal = -1;
+};
+
+ObjFaceVertex ParseObjFaceVertex(const std::string& token,
+                                 std::size_t vertex_count,
+                                 std::size_t texcoord_count,
+                                 std::size_t normal_count,
+                                 const std::string& path) {
+    ObjFaceVertex out;
+    const std::size_t first = token.find('/');
+    out.vertex = ParseObjIndex(
+        first == std::string::npos ? token : token.substr(0, first), vertex_count, path, "vertex");
+    if (first == std::string::npos) return out;
+
+    const std::size_t second = token.find('/', first + 1);
+    const std::string uv = token.substr(first + 1,
+                                       second == std::string::npos ? std::string::npos
+                                                                    : second - first - 1);
+    out.texcoord = ParseObjIndex(uv, texcoord_count, path, "texture");
+    if (second != std::string::npos) {
+        out.normal = ParseObjIndex(token.substr(second + 1), normal_count, path, "normal");
+    }
+    return out;
+}
+
 
 } // namespace
 
@@ -197,68 +215,114 @@ MeshGeometry LoadObj(const std::string& path) {
     const std::vector<char> buf = ReadAllBytes(path);
     std::istringstream in(std::string(buf.data(), buf.size()));
 
-    MeshGeometry g;
+    std::vector<float> positions;
+    std::vector<float> texcoords;
+    std::vector<float> normals;
+    std::vector<std::vector<ObjFaceVertex>> faces;
     std::string line;
+    bool complete_face_uvs = true;
+    bool saw_face = false;
     while (std::getline(in, line)) {
-        // Strip a trailing CR (CRLF files).
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream ls(line);
         std::string tag;
-        if (!(ls >> tag)) {
-            continue;  // blank line
-        }
+        if (!(ls >> tag)) continue;
         if (tag == "v") {
             float x = 0.f, y = 0.f, z = 0.f;
             if (!(ls >> x >> y >> z)) {
                 throw std::runtime_error("mesh-loader: OBJ malformed vertex: " + path);
             }
-            g.vertices.push_back(x);
-            g.vertices.push_back(y);
-            g.vertices.push_back(z);
+            positions.push_back(x); positions.push_back(y); positions.push_back(z);
+        } else if (tag == "vt") {
+            float u = 0.f, v = 0.f;
+            if (!(ls >> u >> v)) {
+                throw std::runtime_error("mesh-loader: OBJ malformed texture coordinate: " + path);
+            }
+            texcoords.push_back(u); texcoords.push_back(v);
         } else if (tag == "vn") {
-            // Authored per-vertex normal (x,y,z triple, declaration order). Most
-            // exported OBJs declare one vn per v with matching indices (a/t/n with
-            // n==v), so file-order vn aligns 1:1 with v; faces are still indexed by
-            // the vertex slot. A vn-less OBJ leaves g.normals empty (zero-fill).
             float nx = 0.f, ny = 0.f, nz = 0.f;
             if (!(ls >> nx >> ny >> nz)) {
                 throw std::runtime_error("mesh-loader: OBJ malformed normal: " + path);
             }
-            g.normals.push_back(nx);
-            g.normals.push_back(ny);
-            g.normals.push_back(nz);
+            normals.push_back(nx); normals.push_back(ny); normals.push_back(nz);
         } else if (tag == "f") {
-            // Collect all face vertex tokens, then fan-triangulate.
-            std::vector<std::uint32_t> face;
-            const std::size_t vc = g.vertices.size() / 3;
-            std::string ftok;
-            while (ls >> ftok) {
-                face.push_back(ParseObjFaceIndex(ftok, vc, path));
+            std::vector<ObjFaceVertex> face;
+            std::string token;
+            while (ls >> token) {
+                ObjFaceVertex corner = ParseObjFaceVertex(
+                    token, positions.size() / 3u, texcoords.size() / 2u,
+                    normals.size() / 3u, path);
+                if (corner.vertex < 0) {
+                    throw std::runtime_error("mesh-loader: OBJ face missing vertex index: " + path);
+                }
+                face.push_back(corner);
             }
             if (face.size() < 3) {
-                throw std::runtime_error("mesh-loader: OBJ face with < 3 vertices: " +
-                                         path);
+                throw std::runtime_error("mesh-loader: OBJ face with < 3 vertices: " + path);
             }
-            for (std::size_t i = 1; i + 1 < face.size(); ++i) {
-                g.indices.push_back(face[0]);
-                g.indices.push_back(face[i]);
-                g.indices.push_back(face[i + 1]);
+            saw_face = true;
+            for (const ObjFaceVertex& corner : face) {
+                complete_face_uvs = complete_face_uvs && corner.texcoord >= 0;
             }
+            faces.push_back(std::move(face));
         }
-        // vt / mtllib / usemtl / g / o / s / # and others: ignored (vn handled).
     }
 
-    if (g.vertices.empty()) {
+    if (positions.empty()) {
         throw std::runtime_error("mesh-loader: OBJ has no vertices: " + path);
     }
-    // Authored normals carry through only when they align 1:1 with vertices (one
-    // vn per v in declaration order, the common export). Any mismatch -> drop
-    // them so EncodeMesh zero-fills and the render side synthesizes.
-    if (g.normals.size() != g.vertices.size()) {
-        g.normals.clear();
+
+    MeshGeometry g;
+    if (!saw_face || !complete_face_uvs) {
+        // Preserve the legacy no-UV representation exactly: positions and
+        // declaration-order normals remain shared by the original indices.
+        g.vertices = std::move(positions);
+        g.normals = std::move(normals);
+        for (const auto& face : faces) {
+            for (std::size_t i = 1; i + 1 < face.size(); ++i) {
+                g.indices.push_back(static_cast<std::uint32_t>(face[0].vertex));
+                g.indices.push_back(static_cast<std::uint32_t>(face[i].vertex));
+                g.indices.push_back(static_cast<std::uint32_t>(face[i + 1].vertex));
+            }
+        }
+    } else {
+        // OBJ stores position, UV, and normal indices independently. Expand
+        // face corners so UV seams cannot corrupt the shared position stream.
+        bool complete_normals = !normals.empty();
+        auto append_corner = [&](const ObjFaceVertex& corner) -> std::uint32_t {
+            const std::size_t v = static_cast<std::size_t>(corner.vertex);
+            g.vertices.push_back(positions[v * 3u]);
+            g.vertices.push_back(positions[v * 3u + 1u]);
+            g.vertices.push_back(positions[v * 3u + 2u]);
+            if (corner.texcoord >= 0) {
+                const std::size_t uv = static_cast<std::size_t>(corner.texcoord);
+                g.uvs.push_back(texcoords[uv * 2u]);
+                g.uvs.push_back(texcoords[uv * 2u + 1u]);
+            } else {
+                g.uvs.push_back(0.0f);
+                g.uvs.push_back(0.0f);
+            }
+            if (corner.normal >= 0) {
+                const std::size_t n = static_cast<std::size_t>(corner.normal);
+                g.normals.push_back(normals[n * 3u]);
+                g.normals.push_back(normals[n * 3u + 1u]);
+                g.normals.push_back(normals[n * 3u + 2u]);
+            } else {
+                complete_normals = false;
+            }
+            return static_cast<std::uint32_t>(g.vertices.size() / 3u - 1u);
+        };
+        for (const auto& face : faces) {
+            for (std::size_t i = 1; i + 1 < face.size(); ++i) {
+                g.indices.push_back(append_corner(face[0]));
+                g.indices.push_back(append_corner(face[i]));
+                g.indices.push_back(append_corner(face[i + 1]));
+            }
+        }
+        if (!complete_normals) g.normals.clear();
     }
+
+    if (g.normals.size() != g.vertices.size()) g.normals.clear();
     return g;
 }
 

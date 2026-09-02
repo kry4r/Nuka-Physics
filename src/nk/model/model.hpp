@@ -462,10 +462,12 @@ public:
     // L1-b: the FUSED runtime path is deleted; PairDriven is the general default.
     // (The FusedFoot enum value is retained but dead until the L1-d enum collapse.)
     ContactFamily contact_family = ContactFamily::PairDriven;
-    // Drive mode the ApplyDrives op runs (0 = position PD hold drive, the M3
-    // batched articulated path; 1 = direct torque drive, the union world's
-    // LaunchApplyTorqueDriveKernels path — drive_target carries the torque).
+    // Drive mode the articulation pipeline runs. OSC (4) uses a dedicated
+    // free-dynamics/CRBA/task-drive schedule; the other values retain the
+    // affine position/torque presets.
     uint32_t drive_mode = 0;
+    // Articulation-local task link selected by nuka_world_desc_t::osc_task_link.
+    uint32_t osc_task_link = 0;
     std::vector<float>     hull_verts;    // mesh-local hull verts (xyz packed).
     // The ONE general path's contact-compliance defaults (solref/solimp). The
     // PairDriven row emitter (EmitPairDrivenRows) feeds these to ComputeCompliantRow.
@@ -572,14 +574,16 @@ public:
     std::vector<uint32_t>    body_to_link;          // template-local link, or ~0u.
     std::vector<uint32_t>    body_to_articulation;  // template-local artic, or ~0u.
 
-    // Multi-geom collidable proxies: a body row that is an EXTRA collision geom of
-    // an articulation link (beyond the one folded into the link's own body row).
-    // body_collidable_link[row] = the TEMPLATE-local source link to pose from (~0u
-    // when the row is NOT a proxy), body_collidable_local[row] = the geom's
-    // link-local offset. SyncLinkBodyPose poses body_pose[row] = link_pose[link] o
-    // local for proxy rows. All ~0u for single-geom scenes -> byte-identical.
+    // Multi-collidable proxies: a body row that is an EXTRA collision shape of an
+    // owner (an articulation link, or a free-rigid body). The pose source is
+    // body_collidable_link[row] (template-local link) OR body_collidable_body[row]
+    // (template-local body row); both ~0u when the row is NOT a proxy.
+    // body_collidable_local[row] = the shape's owner-local offset. SyncLinkBodyPose
+    // poses body_pose[row] = owner_pose o local. All ~0u for a single-collidable
+    // scene -> byte-identical.
     std::vector<uint32_t>       body_collidable_link;   // template-local link, or ~0u.
-    std::vector<math::Transform> body_collidable_local; // geom offset in the link frame.
+    std::vector<math::Transform> body_collidable_local; // shape offset in the owner frame.
+    std::vector<uint32_t>       body_collidable_body;   // template-local body row, or ~0u.
 
     // H1 (general contact pipeline Phase 0): cooked heightfield collidables + the
     // flat height grid that backs the `heights[]` field. EMPTY for every current

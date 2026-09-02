@@ -345,20 +345,16 @@ struct MeshSink {
     // NORMALS: this sink threads authored normals when the record carries them.
     // An EMPTY `normals` argument writes a zero-filled normal stream (the render
     // side synthesizes normals from positions at load); a NON-EMPTY argument
-    // round-trips the authored normals verbatim. The argument defaults to empty
-    // so a record with no normals produces byte-identical .nka output.
-    // CASCADE FLAG: SaveShape now passes CollisionShapeRecord.mesh_normals here and
-    // LoadObj parses `vn`, but the importer copy MeshGeometry.normals ->
-    // record.mesh_normals lives in mjcf_importer.cpp (not owned) and is still
-    // missing -- until that line lands, mesh_normals is empty and the .nka bytes
-    // are byte-identical. Once wired, a non-empty stream CHANGES the cooked .nka
-    // (D1 visual-mesh goldens move; owner regenerates).
+    // round-trips the authored normals verbatim. UVs follow the same rule and
+    // are required for authored OBJ texture layouts.
     std::string AddVisualMesh(const std::vector<float>& verts,
                               const std::vector<uint32_t>& indices,
-                              const std::vector<float>& normals = {}) {
+                              const std::vector<float>& normals = {},
+                              const std::vector<float>& uvs = {}) {
         NkaMesh mesh;
         mesh.positions = verts;
         mesh.normals = normals;
+        mesh.uvs = uvs;
         mesh.indices = indices;
         const std::vector<uint8_t> payload = EncodeMesh(mesh);
         const uint64_t hash = NkaContentHash(payload);
@@ -415,7 +411,7 @@ Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink, bool is_visual) {
     if (!s.mesh_vertices.empty() && !s.mesh_indices.empty()) {
         o.Set("mesh", Value::Str(is_visual
                                      ? sink.AddVisualMesh(s.mesh_vertices, s.mesh_indices,
-                                                          s.mesh_normals)
+                                                          s.mesh_normals, s.mesh_uvs)
                                      : sink.AddCollisionMesh(s.mesh_vertices, s.mesh_indices)));
     }
     return o;
@@ -1282,6 +1278,14 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                         std::any_of(m.normals.begin(), m.normals.end(),
                                     [](float n) { return n != 0.0f; })) {
                         rec.mesh_normals = m.normals;
+                    }
+                    // The fixed MESH stream is zero-filled when the source had
+                    // no UVs; only retain a non-zero authored stream so a legacy
+                    // untextured mesh keeps the triplanar fallback.
+                    if (!m.uvs.empty() &&
+                        std::any_of(m.uvs.begin(), m.uvs.end(),
+                                    [](float uv) { return uv != 0.0f; })) {
+                        rec.mesh_uvs = m.uvs;
                     }
                     AssetRef resolved = ref;
                     resolved.nka_path = nka_path;

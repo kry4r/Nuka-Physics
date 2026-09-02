@@ -451,6 +451,7 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
                                     int32_t body_id,
                                     const uint32_t* body_to_link,
                                     const uint32_t* body_to_articulation,
+                                    const uint32_t* body_collidable_body,
                                     uint32_t env, uint32_t index,
                                     uint32_t bodies_per_env, uint32_t base_link_count,
                                     uint32_t artics_per_env,
@@ -466,9 +467,17 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
     if (side_kind != nk::kUContactSideBody) {
         return kNkSideStatic;  // unknown channel: no reaction here.
     }
-    const uint32_t local_body = index;
+    uint32_t local_body = index;
     if (body_id < 0) {
         return kNkSideStatic;  // static ground / heightfield collidable.
+    }
+    // A body-owned collidable PROXY row carries no mass or dynamics state of its
+    // own: redirect to the owner body row so the reaction lands on the owner's
+    // inv_mass and lever arm. A link-owned proxy leaves this ~0u and resolves
+    // through body_to_link below (unchanged).
+    if (body_collidable_body != nullptr && local_body < bodies_per_env) {
+        const uint32_t owner = body_collidable_body[local_body];
+        if (owner != ~0u && owner < bodies_per_env) local_body = owner;
     }
     const uint32_t tmpl_link = (local_body < bodies_per_env)
                                    ? body_to_link[local_body] : ~0u;
@@ -505,6 +514,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ shape_table,
     const uint32_t* __restrict__ body_to_link,
     const uint32_t* __restrict__ body_to_articulation,
+    const uint32_t* __restrict__ body_collidable_body,
     const float* __restrict__ mat_buckets,
     uint32_t num_material_buckets,
     uint64_t* __restrict__ contact_material,
@@ -564,11 +574,13 @@ __global__ void EmitPairDrivenRowsKernel(
             profile_b = shape.contact_profile_index;
         }
         kind_a = ResolvePairSide(side_kind_a, bid_a, body_to_link,
-                                 body_to_articulation, env, local_a, bodies_per_env,
+                                 body_to_articulation, body_collidable_body,
+                                 env, local_a, bodies_per_env,
                                  base_link_count, artics_per_env, &art_a, &link_a,
                                  &body_a, &part_a);
         kind_b = ResolvePairSide(side_kind_b, bid_b, body_to_link,
-                                 body_to_articulation, env, local_b, bodies_per_env,
+                                 body_to_articulation, body_collidable_body,
+                                 env, local_b, bodies_per_env,
                                  base_link_count, artics_per_env, &art_b, &link_b,
                                  &body_b, &part_b);
     }
@@ -1381,6 +1393,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(model.shape_table),
                    static_cast<const uint32_t*>(model.body_to_link),
                    static_cast<const uint32_t*>(model.body_to_articulation),
+                   static_cast<const uint32_t*>(model.body_collidable_body),
                    static_cast<const float*>(data.mat_buckets),
                    p->num_material_buckets, data.contact_material,
                    p->n_soft_particles, p->particles_per_env,

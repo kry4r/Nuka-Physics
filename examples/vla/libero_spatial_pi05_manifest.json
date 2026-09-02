@@ -1,0 +1,54 @@
+{
+  "demo": "examples/demo/libero_pi05_play.py",
+  "task": {
+    "suite": "libero_spatial",
+    "index": 2,
+    "language": "pick up the black bowl from table center and place it on the plate",
+    "bddl": ".nuka_cache/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate.bddl"
+  },
+  "checkpoint": {
+    "repo_id": "lerobot/pi05_libero_finetuned_v044",
+    "revision": "8e174154ef5f6c60a8da12ae99c303d8963138c1",
+    "model_file": ".nuka_cache/pi05-libero/model.safetensors",
+    "model_size_bytes": 7473096344,
+    "model_sha256": "877b3ec1130548b69af7f8aeef3ec9d3fc7738040f0b9beb490857ec970997ae",
+    "parameter_count": 3616757520,
+    "tokenizer": ".nuka_cache/paligemma-tokenizer"
+  },
+  "scene": {
+    "generator": "tools/assets/convert_libero_pi05.py",
+    "xml": ".nuka-assets/generated/libero/libero_spatial_black_bowl.xml",
+    "cooked": ".nuka-assets/generated/libero/libero_spatial_black_bowl.nks",
+    "robot_source": ".nuka-assets/src/mujoco_menagerie/franka_emika_panda/panda.xml",
+    "libero_source_revision": "8f1084e3132a39270c3a13ebe37270a43ece2a01"
+  },
+  "observation_contract": {
+    "observation.images.image": [3, 256, 256],
+    "observation.images.image2": [3, 256, 256],
+    "observation.state": [8],
+    "state_layout": [
+      "eef_x",
+      "eef_y",
+      "eef_z",
+      "eef_axis_angle_x",
+      "eef_axis_angle_y",
+      "eef_axis_angle_z",
+      "left_gripper_qpos",
+      "right_gripper_qpos"
+    ],
+    "nuka_sensor_resolution": [360, 360],
+    "orientation_adapter": "vertical mirror on both Nuka sensor streams before the LeRobot LIBERO processor's H/W 180-degree flip",
+  },
+  "action_contract": {
+    "shape": [7],
+    "layout": ["dx", "dy", "dz", "dax", "day", "daz", "gripper"],
+    "position_scale_m": 0.05,
+    "rotation_scale_rad": 0.5,
+    "gripper_open": -1.0,
+    "gripper_closed": 1.0,
+    "policy_rate_hz": 20,
+    "chunk_size": 50,
+    "executed_actions_per_query": 10,
+    "nuka_adapter": "native 6D operational-space torque control"
+  }
+}

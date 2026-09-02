@@ -90,6 +90,7 @@ struct ModelView {
     float* joint_frictionloss = nullptr;  // per:link arena:persistent owner:model flags:[param]
     uint32_t* body_collidable_link = nullptr;  // per:body arena:persistent owner:model
     ::nuka::math::Transform* body_collidable_local = nullptr;  // per:body arena:persistent owner:model
+    uint32_t* body_collidable_body = nullptr;  // per:body arena:persistent owner:model
     float* joint_limit_lower = nullptr;  // per:link arena:persistent owner:model flags:[param]
     float* joint_limit_upper = nullptr;  // per:link arena:persistent owner:model flags:[param]
     uint8_t* joint_limit_flags = nullptr;  // per:link arena:persistent owner:model flags:[param]
@@ -284,6 +285,9 @@ struct DataView {
     float* actuator_effort = nullptr;  // per:link arena:scratch owner:data flags:[readout]
     float* actuator_saturated = nullptr;  // per:link arena:scratch owner:data flags:[readout]
     uint8_t* pair_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:pair_sort_scratch_bytes
+    ::nuka::math::Vec3* task_target = nullptr;  // per:env arena:persistent owner:data flags:[param]
+    ::nuka::math::Quat* task_rotation_target = nullptr;  // per:env arena:persistent owner:data flags:[param]
+    ::nuka::math::Transform* task_local_pose = nullptr;  // per:env arena:persistent owner:data flags:[param]
 };
 
 } // namespace nuka::phi

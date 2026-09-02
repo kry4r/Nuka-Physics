@@ -51,6 +51,11 @@ _deps/
 # Keyed by input content hash; safe to delete (re-cooked on demand).
 .nuka_cache/
 
+# Spec 05 external assets/checkpoints. Manifests and fetch scripts are tracked;
+# downloaded meshes, motions, model weights, rollout frames, and metrics are not.
+.nuka-assets/
+*.safetensors
+
 # IDE / editor
 .idea/
 .vscode/

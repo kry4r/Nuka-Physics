@@ -1,0 +1,15 @@
+{
+  "asset": "Unitree G1 EDU 29DoF mode 15",
+  "license": "BSD-3-Clause (Unitree asset), Apache-2.0 (mjlab wrapper)",
+  "g1_moves_revision": "475fdae98dcf18f96ebd3d0566d12fdefbaf2f0f",
+  "mjlab_revision": "e788f2932ecee6dda58a0adb1ee81beaa7c5e5f6",
+  "runtime_source": ".nuka-assets/src/g1-moves/mjlab/src/mjlab/asset_zoo/robots/unitree_g1/xmls/g1.xml",
+  "mode15_urdf": ".nuka-assets/src/unitree_ros/robots/g1_description/g1_29dof_mode_15.urdf",
+  "mode15_urdf_sha256": "80fc328761b0d0a502d675106c234eceabb70fa09c9f7d5cbcb40c2955629bac",
+  "generated_scene": ".nuka-assets/generated/g1/g1_dance_stage.xml",
+  "runtime_bundle": ".nuka-assets/generated/g1/g1_dance_stage.nks + g1_dance_stage.nka",
+  "generator": "tools/assets/convert_embodied_assets.py",
+  "collision_contract": "One thin box collider per foot for Nuka sim2sim stability; disabled source proxy capsules are removed so beauty rendering contains only the real G1 meshes.",
+  "expected_base_link_count": 30,
+  "expected_action_dim": 29
+}

@@ -7,9 +7,9 @@
 // THE KERNEL is RenderFrameKernel (two_level_render.cu) generalized to a flat
 // global ray index over cameras: cam = gid/(H*W), env = cam/S; it rebases the
 // TLAS node slice (env*(2M-1)) + the DevInstance slice (env*M) per env (the scene
-// is env-shared) and reuses the SAME ClosestHit / ReconstructHit / ShadeDirect
+// is env-shared) and reuses the SAME ClosestHit / ReconstructHit / beauty-shade
 // nest, instantiated Real=float (the FP32 sensor cost). The single-camera FP64
-// golden path is untouched -- this is an additive cheap-shade profile, NOT a branch.
+// golden path is untouched -- this is the persistent high-quality batched path.
 //
 // The TLAS leaf `.left` is the env-LOCAL instance index (the batched build's leaf
 // payload), so `instances + env*M` resolves it directly; the prim_id pack uses an
@@ -95,12 +95,12 @@ __device__ inline float DrClamp(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Device mirror of the fidelity flags the trace branches on (sky/sample params
-// travel in BeautyParams; spp/samples are host-capped before launch).
+// Device mirror of the quality flags. Sky and sample parameters travel in
+// BeautyParams; spp/samples are host-capped before launch.
 struct FidelityParams {
     uint32_t spp;
-    uint32_t enabled;  // 0 -> the exact cheap-shade arithmetic (byte no-op)
     uint32_t tonemap;
+    uint32_t srgb;
     uint64_t seed;
 };
 
@@ -182,22 +182,32 @@ __global__ void FillEnvLightsKernel(Light base_light, AmbientTerm base_ambient,
     out_ambient[env] = a;
 }
 
-// One thread per GLOBAL ray over [num_cameras*H*W]: flat gid -> (camera, px, py).
+__device__ inline uint32_t SensorPixelIndex(uint32_t work, uint32_t width,
+                                             uint32_t height) {
+    if ((width & 7u) != 0u || (height & 7u) != 0u) return work;
+    const uint32_t tile_width = width / 8u;
+    const uint32_t tile = work / 64u;
+    const uint32_t lane = work & 63u;
+    const uint32_t tile_x = tile % tile_width;
+    const uint32_t tile_y = tile / tile_width;
+    const uint32_t px = tile_x * 8u + (lane & 7u);
+    const uint32_t py = tile_y * 8u + (lane >> 3u);
+    return py * width + px;
+}
+
 // Cameras are env-major (cameras[env*S+s]); the env owning a camera is cam/S, and
 // the TLAS node + instance + material slices index by env (the scene is env-shared
 // -- only cameras fan out). One writer per pixel, no atomics -> FP32-deterministic
 // byte-exact per tile. S==1 collapses cam==env, byte-identical to one cam per env.
 //
-// fid.enabled==0 takes the EXACT cheap-shade arithmetic (1 spp, 1 hard shadow,
-// ShadeDirect) -> the AOV bytes are unchanged. fid.enabled!=0 accumulates spp
-// jittered samples through the shared beauty shade (soft shadow / AO / GI per the
-// sky params) and averages into color; depth/normal/albedo/prim ALWAYS come from
-// the center ray, so only color changes under fidelity.
+// Every color pixel runs the shared beauty shade. The center ray's depth/normal/
+// albedo/prim remain stable AOVs; only RGB uses the sampled quality path.
 __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ cameras,
                                          const LbvhNode* __restrict__ tlas_nodes,
                                          uint32_t leaves_per_env,
                                          const DevInstance* __restrict__ instances,
                                          const Material* __restrict__ materials,
+                                         const DevTexture* __restrict__ textures,
                                          uint32_t material_count,
                                          const Light* __restrict__ lights,
                                          const AmbientTerm* __restrict__ ambients,
@@ -213,16 +223,19 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                          float* __restrict__ out_normal,
                                          float* __restrict__ out_albedo,
                                          uint32_t* __restrict__ out_prim) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t work = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t pix_per_cam = width * height;
     const uint64_t total = static_cast<uint64_t>(num_cameras) * pix_per_cam;
-    if (static_cast<uint64_t>(gid) >= total) return;
+    if (static_cast<uint64_t>(work) >= total) return;
 
-    const uint32_t cam = gid / pix_per_cam;
+    const uint32_t cam = work / pix_per_cam;
+    const uint32_t p = work % pix_per_cam;
+    const uint32_t local_p = SensorPixelIndex(p, width, height);
+    const uint32_t px = local_p % width;
+    const uint32_t py = local_p / width;
+    const uint32_t gid = cam * pix_per_cam + local_p;
     const uint32_t env = cam / sensors_per_env;
-    const uint32_t p = gid % pix_per_cam;
-    const uint32_t px = p % width;
-    const uint32_t py = p / width;
+
 
     const PinholeCamera camera = cameras[cam];
     const Ray ray = camera.GenerateRay(px, py);
@@ -261,13 +274,11 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
     const bool need_color = (aov_mask & kSensorAovColor) != 0u;
     const Material* env_mats = nullptr;
     Light light{};
-    AmbientTerm ambient{};
     if (need_material) {
         env_mats = materials + static_cast<uint64_t>(env) * material_count;
     }
     if (need_color) {
         light = lights[env];
-        ambient = ambients[env];
     }
 
     if (best_prim != kNoPrim) {
@@ -286,59 +297,25 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
             if (need_material) {
                 const uint32_t material_id = env_inst[inst].material_id;
                 mat = env_mats[material_id];
+                if (need_color || (aov_mask & kSensorAovAlbedo) != 0u) {
+                    const Vec3 hit{ray.origin.x + best_t * ray.dir.x,
+                                   ray.origin.y + best_t * ray.dir.y,
+                                   ray.origin.z + best_t * ray.dir.z};
+                    ApplyMaterialTextures(env_inst, textures, best_prim, hit, uv_u, uv_v,
+                                          n, &mat, true);
+                }
                 albedo = mat.albedo;
             }
 
-            if (need_color) {
-                const Vec3 hit{ray.origin.x + best_t * ray.dir.x,
-                               ray.origin.y + best_t * ray.dir.y,
-                               ray.origin.z + best_t * ray.dir.z};
-                const Vec3 V = RtNormalize<float>(Vec3{-ray.dir.x, -ray.dir.y, -ray.dir.z});
-                Vec3 L;
-                float light_dist;
-                if (light.directional) {
-                    L = RtNormalize<float>(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
-                    light_dist = RtMissDepth();
-                } else {
-                    const Vec3 to{light.position.x - hit.x, light.position.y - hit.y,
-                                  light.position.z - hit.z};
-                    L = RtNormalize<float>(to);
-                    light_dist = sqrtf(to.x * to.x + to.y * to.y + to.z * to.z);
-                }
-
-                // One hard shadow ray through the SAME nest (sensor profile: 1
-                // shadow, no AO/GI/MSAA). Depth/prim-only never enters this arm.
-                Vec3 ns = n;
-                const float nv = n.x * V.x + n.y * V.y + n.z * V.z;
-                if (nv < 0.0f) {
-                    ns = Vec3{-n.x, -n.y, -n.z};
-                }
-                const float shadow_eps = 1.0e-3f;
-                const Vec3 sorigin{hit.x + ns.x * shadow_eps,
-                                   hit.y + ns.y * shadow_eps,
-                                   hit.z + ns.z * shadow_eps};
-                int lit = 1;
-                float st;
-                uint32_t sp;
-                ClosestHit<float>(env_nodes, leaves_per_env, env_inst, sorigin, L,
-                                  shadow_eps, &st, &sp);
-                if (sp != kNoPrim && st < light_dist - shadow_eps) {
-                    lit = 0;
-                }
-
-                const Vec3 light_col{light.color.x * light.intensity,
-                                     light.color.y * light.intensity,
-                                     light.color.z * light.intensity};
-                color = ShadeDirect(n, V, L, light_col, mat, lit, ambient.color);
-            }
+            // RGB is evaluated below by the default quality path. Keeping the
+            // center-ray reconstruction above makes non-color AOVs inexpensive.
         }
     }
 
-    // Opt-in beauty shade: accumulate spp jittered samples through the SHARED
-    // beauty shade (the single-camera look) and average. The center sample's AOVs
-    // above are kept; only color is replaced. Seeded per (ray, sample) -> two-run
-    // byte-exact. Misses sample the sky dome instead of staying black.
-    if (need_color && fid.enabled != 0u) {
+    // The default quality path accumulates spp jittered samples through the shared
+    // beauty shade. Misses sample the sky dome; textured materials are sampled in
+    // the same path. AOVs above always come from the center ray.
+    if (need_color) {
         const uint32_t S = fid.spp < 1u ? 1u : fid.spp;
         Vec3 accum{0.0f, 0.0f, 0.0f};
         for (uint32_t s = 0; s < S; ++s) {
@@ -363,9 +340,12 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
             const Vec3 shit{r.origin.x + bt * r.dir.x, r.origin.y + bt * r.dir.y,
                             r.origin.z + bt * r.dir.z};
             const Vec3 sV = RtNormalize<float>(Vec3{-r.dir.x, -r.dir.y, -r.dir.z});
+            Material sample_mat = smat;
+            ApplyMaterialTextures(env_inst, textures, bp, shit, su, sv, snf,
+                                  &sample_mat, true);
             Vec3 col = ShadeBeauty<PhiloxSeededRng>(env_nodes, leaves_per_env, env_inst,
                                                     env_mats, light, sky, shit, snf, sV,
-                                                    smat, &rng);
+                                                    sample_mat, &rng);
             if (sky.fog_density > 0.0f) {
                 const float f = 1.0f - expf(-sky.fog_density * bt);
                 col.x += (sky.fog_color.x - col.x) * f;
@@ -377,7 +357,12 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
         const float inv_s = 1.0f / static_cast<float>(S);
         color = Vec3{accum.x * inv_s, accum.y * inv_s, accum.z * inv_s};
         if (fid.tonemap != 0u) {
-            color = Vec3{TonemapAces(color.x), TonemapAces(color.y), TonemapAces(color.z)};
+            color = Vec3{TonemapAces(color.x), TonemapAces(color.y),
+                         TonemapAces(color.z)};
+        }
+        if (fid.srgb != 0u) {
+            color = Vec3{LinearToSrgb(color.x), LinearToSrgb(color.y),
+                          LinearToSrgb(color.z)};
         }
     }
 
@@ -416,16 +401,19 @@ __global__ void BatchedSensorPrimaryHitKernel(
     uint32_t aov_mask,
     float* __restrict__ out_depth,
     uint32_t* __restrict__ out_prim) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t work = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t pix_per_cam = width * height;
     const uint64_t total = static_cast<uint64_t>(num_cameras) * pix_per_cam;
-    if (static_cast<uint64_t>(gid) >= total) return;
+    if (static_cast<uint64_t>(work) >= total) return;
 
-    const uint32_t cam = gid / pix_per_cam;
+    const uint32_t cam = work / pix_per_cam;
+    const uint32_t p = work % pix_per_cam;
+    const uint32_t local_p = SensorPixelIndex(p, width, height);
+    const uint32_t px = local_p % width;
+    const uint32_t py = local_p / width;
+    const uint32_t gid = cam * pix_per_cam + local_p;
     const uint32_t env = cam / sensors_per_env;
-    const uint32_t p = gid % pix_per_cam;
-    const uint32_t px = p % width;
-    const uint32_t py = p / width;
+
     const PinholeCamera camera = cameras[cam];
     const Ray ray = camera.GenerateRay(px, py);
 
@@ -518,6 +506,9 @@ struct BatchedSensorSceneDevice::Impl {
     // Env-shared per-instance binding (uploaded once). d_materials holds the BASE
     // material set [M]; the per-env table d_materials_env [E*M] is derived from it.
     OwnedBuffer d_rows, d_blas_id, d_material_id, d_blas_refs, d_materials;
+    std::vector<OwnedBuffer> d_texture_texels;
+    OwnedBuffer d_textures;
+    uint32_t texture_count = 0u;
     uint32_t instances_per_env = 0u;
     uint32_t material_count = 0u;
 
@@ -528,8 +519,7 @@ struct BatchedSensorSceneDevice::Impl {
     uint32_t dr_env_count = 0u;  // env count the per-env tables are filled for
     rt::RenderDrConfig dr_cfg;   // disabled by default -> replicas
 
-    // Opt-in shading fidelity. Default (Enabled()==false) -> the trace takes the
-    // exact cheap-shade arithmetic (byte-identical to today).
+    // Default high-quality shading configuration used by every camera render.
     rt::SensorFidelityConfig fid_cfg;
 
     // Selected camera outputs. Default is the legacy all-AOV tensor; setters
@@ -620,6 +610,27 @@ BatchedSensorSceneDevice BuildBatchedSensorScene(const BatchedSensorSceneDesc& d
     impl->d_material_id = UploadOwned(ctx.device_bt, desc.material_id);
     impl->d_blas_refs = UploadOwned(ctx.device_bt, refs);
     impl->d_materials = UploadOwned(ctx.device_bt, mats);
+    if (desc.scene.textures != nullptr) {
+        const std::vector<Texture>& textures = *desc.scene.textures;
+        std::vector<DevTexture> device_textures(textures.size());
+        impl->d_texture_texels.reserve(textures.size());
+        for (std::size_t i = 0; i < textures.size(); ++i) {
+            const Texture& texture = textures[i];
+            if (texture.Empty()) continue;
+            impl->d_texture_texels.push_back(UploadOwned(ctx.device_bt, texture.texels));
+            DevTexture& device_texture = device_textures[i];
+            device_texture.texels = static_cast<const float*>(
+                impl->d_texture_texels.back().Data());
+            device_texture.width = texture.width;
+            device_texture.height = texture.height;
+            device_texture.channels = texture.channels;
+            device_texture.srgb = texture.srgb;
+        }
+        if (!device_textures.empty()) {
+            impl->d_textures = UploadOwned(ctx.device_bt, device_textures);
+            impl->texture_count = static_cast<uint32_t>(device_textures.size());
+        }
+    }
     cudaStreamSynchronize(ctx.stream);
     return out;
 }
@@ -646,8 +657,8 @@ constexpr uint32_t kMaxRenderDrEnvs = 1u << 20;  // 1,048,576 envs
 constexpr uint32_t kMaxFidelitySpp = 256u;
 constexpr uint32_t kMaxFidelitySamples = 256u;  // per soft-shadow / AO dimension
 
-// Lower the stored fidelity config to the kernel's device params, asserting the
-// sample caps. enabled==false -> the kernel takes the exact cheap-shade branch.
+// Lower the stored quality config to the kernel's device params and assert the
+// sample caps before launch.
 void BuildFidelityParams(const rt::SensorFidelityConfig& cfg, FidelityParams* fp,
                          BeautyParams* sky) {
     if (cfg.spp > kMaxFidelitySpp) {
@@ -662,8 +673,8 @@ void BuildFidelityParams(const rt::SensorFidelityConfig& cfg, FidelityParams* fp
             "(kMaxFidelitySamples=256)");
     }
     fp->spp = cfg.spp < 1u ? 1u : cfg.spp;
-    fp->enabled = cfg.Enabled() ? 1u : 0u;
     fp->tonemap = cfg.tonemap_enabled ? 1u : 0u;
+    fp->srgb = cfg.srgb_enabled ? 1u : 0u;
     fp->seed = cfg.seed;
     sky->shadow_rays = cfg.shadow_samples < 1u ? 1u : cfg.shadow_samples;
     sky->sun_angular_radius = cfg.sun_angular_radius;
@@ -864,6 +875,7 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
         phi::LaunchCuda(BatchedSensorTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
                         ctx.stream, cameras_device, d_nodes, m, d_instances,
                         static_cast<const Material*>(impl->d_materials_env.Data()),
+                        static_cast<const DevTexture*>(impl->d_textures.Data()),
                         impl->material_count,
                         static_cast<const Light*>(impl->d_light_env.Data()),
                         static_cast<const AmbientTerm*>(impl->d_ambient_env.Data()),
@@ -910,8 +922,8 @@ void SetRenderDr(BatchedSensorSceneDevice& device, const RenderDrConfig& cfg,
 void SetSensorFidelity(BatchedSensorSceneDevice& device,
                        const SensorFidelityConfig& cfg) {
     BatchedSensorSceneDevice::Impl* impl = device.GetImpl();
-    // Validate the caps here too so a bad config is rejected at set time, not only
-    // at the next render. The stored config drives the trace's shade branch.
+    // Record the quality config; the next render always uses the shared beauty
+    // path. Validation remains here so a bad profile fails before launch.
     FidelityParams fp;
     BeautyParams sky;
     BuildFidelityParams(cfg, &fp, &sky);

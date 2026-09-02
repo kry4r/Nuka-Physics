@@ -248,6 +248,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::JointFrictionloss, DlpackDtype::kF32, 1, false, false},  // joint_frictionloss
     {FieldId::BodyCollidableLink, DlpackDtype::kU32, 1, false, false},  // body_collidable_link
     {FieldId::BodyCollidableLocal, DlpackDtype::kF32, 2, false, false},  // body_collidable_local
+    {FieldId::BodyCollidableBody, DlpackDtype::kU32, 1, false, false},  // body_collidable_body
     {FieldId::UcontactIdPair, DlpackDtype::kU64, 2, false, false},  // ucontact_id_pair
     {FieldId::UcontactIdFeature, DlpackDtype::kU64, 2, false, false},  // ucontact_id_feature
     {FieldId::ContactCachePair, DlpackDtype::kU64, 2, false, false},  // contact_cache_pair
@@ -276,6 +277,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ActuatorEffort, DlpackDtype::kF32, 1, false, true},  // actuator_effort
     {FieldId::ActuatorSaturated, DlpackDtype::kF32, 1, false, true},  // actuator_saturated
     {FieldId::PairSortScratch, DlpackDtype::kU8, 1, false, false},  // pair_sort_scratch
+    {FieldId::TaskTarget, DlpackDtype::kF32, 2, false, false},  // task_target
+    {FieldId::TaskRotationTarget, DlpackDtype::kF32, 2, false, false},  // task_rotation_target
+    {FieldId::TaskLocalPose, DlpackDtype::kF32, 2, false, false},  // task_local_pose
 };
 
 } // namespace nuka::nk

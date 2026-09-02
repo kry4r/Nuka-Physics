@@ -160,6 +160,8 @@ VELOCITY_TARGET = Field.VELOCITY_TARGET
 ACTUATOR_NOLOAD_SPEED = Field.ACTUATOR_NOLOAD_SPEED
 # v0.5 C-fwd slice 3: writable per-ENV Osc task target (float3 {x,y,z} per env).
 TASK_TARGET = Field.TASK_TARGET
+TASK_ROTATION_TARGET = Field.TASK_ROTATION_TARGET
+TASK_LOCAL_POSE = Field.TASK_LOCAL_POSE
 # p03 episode-boundary fix: authoritative per-env root pose (un-lagged; correct
 # immediately after reset_envs). Shape (env_count, 7) == [px,py,pz, qw,qx,qy,qz].
 BASE_POSE = Field.BASE_POSE
@@ -312,6 +314,8 @@ __all__ = [
     "ACTUATOR_EFFORT_REQUESTED",
     "ACTUATOR_EFFORT",
     "ACTUATOR_SATURATED",
+    "TASK_ROTATION_TARGET",
+    "TASK_LOCAL_POSE",
     "CONTROL_MODE_PD_POSITION",
     "CONTROL_MODE_TORQUE",
     "CONTROL_MODE_VELOCITY",
