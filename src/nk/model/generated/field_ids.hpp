@@ -232,6 +232,7 @@ enum class FieldId : uint16_t {
     JointFrictionloss,  // joint_frictionloss (per:link arena:persistent owner:model flags:[param])
     BodyCollidableLink,  // body_collidable_link (per:body arena:persistent owner:model)
     BodyCollidableLocal,  // body_collidable_local (per:body arena:persistent owner:model)
+    BodyCollidableBody,  // body_collidable_body (per:body arena:persistent owner:model)
     UcontactIdPair,  // ucontact_id_pair (per:contact_slot arena:scratch owner:data elem:4)
     UcontactIdFeature,  // ucontact_id_feature (per:contact_slot arena:scratch owner:data elem:4)
     ContactCachePair,  // contact_cache_pair (per:contact_slot arena:persistent owner:data elem:4)
@@ -260,6 +261,9 @@ enum class FieldId : uint16_t {
     ActuatorEffort,  // actuator_effort (per:link arena:scratch owner:data flags:[readout])
     ActuatorSaturated,  // actuator_saturated (per:link arena:scratch owner:data flags:[readout])
     PairSortScratch,  // pair_sort_scratch (per:scalar arena:scratch owner:data count:pair_sort_scratch_bytes)
+    TaskTarget,  // task_target (per:env arena:persistent owner:data flags:[param])
+    TaskRotationTarget,  // task_rotation_target (per:env arena:persistent owner:data flags:[param])
+    TaskLocalPose,  // task_local_pose (per:env arena:persistent owner:data flags:[param])
     Count
 };
 

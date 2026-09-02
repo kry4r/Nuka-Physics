@@ -804,9 +804,9 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         }
         case FieldId::BodyCollidableLocal: {
-            // Proxy geom link-local offset (tiled env-major). Only read when the
-            // paired body_collidable_link != ~0u, so an unpopulated row's bytes are
-            // never used; a short/empty template leaves the trailing rows zero.
+            // Proxy geom owner-local offset (tiled env-major). Only read when the
+            // paired body_collidable_link/body != ~0u, so an unpopulated row's bytes
+            // are never used; a short/empty template leaves the trailing rows zero.
             const uint32_t B = capacities.bodies_per_env;
             auto* p = reinterpret_cast<math::Transform*>(dst);
             for (uint32_t e = 0; e < E; ++e) {
@@ -814,6 +814,22 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                     if (b < body_collidable_local.size()) {
                         p[static_cast<size_t>(e) * B + b] = body_collidable_local[b];
                     }
+                }
+            }
+            break;
+        }
+        case FieldId::BodyCollidableBody: {
+            // Multi-collidable proxy source BODY row (template-local, tiled
+            // env-major). Default ~0u == "not a body-owned proxy" (body row 0 is
+            // valid, so an unpopulated row must NOT read as body 0). Empty template
+            // -> all ~0u -> the body-proxy pose pass is a no-op.
+            const uint32_t B = capacities.bodies_per_env;
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            for (uint32_t e = 0; e < E; ++e) {
+                for (uint32_t b = 0; b < B; ++b) {
+                    p[static_cast<size_t>(e) * B + b] =
+                        (b < body_collidable_body.size()) ? body_collidable_body[b]
+                                                          : ~uint32_t(0);
                 }
             }
             break;
@@ -861,6 +877,7 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::BodyToArticulation:    v.body_to_articulation = static_cast<uint32_t*>(p); break;
         case FieldId::BodyCollidableLink:    v.body_collidable_link = static_cast<uint32_t*>(p); break;
         case FieldId::BodyCollidableLocal:   v.body_collidable_local = static_cast<math::Transform*>(p); break;
+        case FieldId::BodyCollidableBody:    v.body_collidable_body = static_cast<uint32_t*>(p); break;
         case FieldId::Heights:               v.heights = static_cast<float*>(p); break;
         case FieldId::JointDamping:          v.joint_damping = static_cast<float*>(p); break;
         case FieldId::JointArmature:         v.joint_armature = static_cast<float*>(p); break;
@@ -1005,6 +1022,7 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.filter_cross_env = src.filter_cross_env;
     dst.contact_family = src.contact_family;
     dst.drive_mode = src.drive_mode;
+    dst.osc_task_link = src.osc_task_link;
     dst.particles = std::move(src.particles);  // M6 particle cook product.
     dst.hull_verts = std::move(src.hull_verts);
     // L1-c: union_slots / table_enabled_default copies were removed; union_solref/
@@ -1043,6 +1061,7 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.body_to_articulation = std::move(src.body_to_articulation);
     dst.body_collidable_link = std::move(src.body_collidable_link);
     dst.body_collidable_local = std::move(src.body_collidable_local);
+    dst.body_collidable_body = std::move(src.body_collidable_body);
     dst.heightfields = std::move(src.heightfields);
     dst.heightfield_heights = std::move(src.heightfield_heights);
     // MLS-MPM material table: MISSING here dropped it on every move, so the World

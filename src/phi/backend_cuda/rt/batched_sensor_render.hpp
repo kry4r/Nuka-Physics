@@ -12,8 +12,8 @@
 // (sensor_scatter.cu), and the templated traversal nest ClosestHit/ReconstructHit
 // (two_level_render_kernels.cuh) instantiated Real=float. The scene + materials +
 // per-instance binding are env-shared (replicated scene); only the per-env poses +
-// cameras vary. The single-camera FP64 golden path is untouched -- this is an
-// additive FP32 cheap-shade profile.
+// cameras vary. The single-camera FP64 golden path is untouched -- this is the
+// persistent high-quality batched sensor path.
 //
 // This is the CUDA-FREE host-facing API (the device tokens live in the .cu via the
 // BatchedSensorSceneDevice pimpl, mirroring rt/two_level_render.hpp); it names only
@@ -117,11 +117,9 @@ void SetSensorMounts(BatchedSensorSceneDevice& device,
 void SetRenderDr(BatchedSensorSceneDevice& device, const RenderDrConfig& cfg,
                  uint32_t env_count, phi::Backend* backend = nullptr);
 
-// Record the opt-in shading-fidelity profile (spp / soft shadow / AO / GI / sky /
-// tonemap). The DEFAULT config (Enabled()==false) makes the trace take the exact
-// cheap-shade arithmetic -> the AOV bytes are unchanged. Non-default lifts RGB to
-// the single-camera beauty look; deterministic + seeded (same seed -> same bytes).
-// Caps spp/samples LOUDLY. Stored on the device; applies to the next render.
+// Record the default high-quality sensor profile (textured materials + MSAA +
+// soft shadow + AO/GI + ACES + sRGB). Caps spp/samples LOUDLY. Stored on the
+// device and applied to the next render.
 void SetSensorFidelity(BatchedSensorSceneDevice& device,
                        const SensorFidelityConfig& cfg);
 

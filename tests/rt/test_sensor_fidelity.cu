@@ -1,18 +1,11 @@
 // ---------------------------------------------------------------------------
-// Opt-in shading-fidelity gate for the batched sensor render. The batched trace
-// shades flat (1 spp, 1 hard shadow); SetSensorFidelity lifts it to the beauty
-// look (spp MSAA + soft shadow + AO + one-bounce GI + tonemap) in the SAME kernel,
-// gated on the config. The DEFAULT config takes the exact cheap arithmetic.
+// Default high-quality batched sensor contract.
 //
 // Gates:
-//  (1) DEFAULT == byte-no-op: a render after SetSensorFidelity(default) is
-//      byte-identical to a render with no fidelity ever set.
-//  (2) fidelity-ON deterministic: two renders at the same seed are byte-identical
-//      (Philox-seeded per (ray,sample), no mutable RNG state).
-//  (3) fidelity-ON visibly different + finite: the color differs from the cheap
-//      shade on a real fraction of pixels and every value is finite.
-//  (4) AOVs unchanged: depth/normal/prim are byte-identical cheap vs fidelity
-//      (the center ray fills them; only color is replaced).
+//  (1) DEFAULT is deterministic and explicit application is byte-identical.
+//  (2) quality rendering with the same seed is byte-identical across runs.
+//  (3) quality profiles differ on a real fraction of pixels and remain finite.
+//  (4) depth/normal/prim are center-ray AOVs and stay stable across profiles.
 // ---------------------------------------------------------------------------
 
 #include "math/quat.hpp"
@@ -226,18 +219,18 @@ rt::SensorFidelityConfig BeautyProfile() {
 
 }  // namespace
 
-// Gate 1 -- the default config is a byte no-op (cheap-shade arithmetic).
-TEST(SensorFidelity, DefaultConfigIsByteNoOp) {
+// Gate 1 -- default config is high-quality and explicit application is stable.
+TEST(SensorFidelity, DefaultConfigIsHighQuality) {
     ASSERT_NE(phi::ActiveBackend(), nullptr) << "no CUDA backend";
-    const Aov never = RenderOnce(nullptr, false);
-    const rt::SensorFidelityConfig def;  // default == cheap shade
-    EXPECT_FALSE(def.Enabled());
-    const Aov set_default = RenderOnce(&def, false);
-    ASSERT_EQ(never.color.size(), set_default.color.size());
-    EXPECT_EQ(std::memcmp(never.color.data(), set_default.color.data(),
-                          never.color.size() * sizeof(float)),
+    const Aov implicit = RenderOnce(nullptr, false);
+    const rt::SensorFidelityConfig def;
+    EXPECT_TRUE(def.Enabled());
+    const Aov explicit_default = RenderOnce(&def, false);
+    ASSERT_EQ(implicit.color.size(), explicit_default.color.size());
+    EXPECT_EQ(std::memcmp(implicit.color.data(), explicit_default.color.data(),
+                          implicit.color.size() * sizeof(float)),
               0)
-        << "default fidelity config moved bytes -- not a byte no-op";
+        << "explicit default profile changed the default render";
 }
 
 // Gate 2 -- fidelity ON is deterministic (same seed -> two renders byte-identical).
@@ -253,47 +246,45 @@ TEST(SensorFidelity, FidelityOnDeterministic) {
         << "fidelity render is not byte-exact two-run (RNG not stateless-seeded)";
 }
 
-// Gate 3 -- fidelity ON differs from the cheap shade on a real fraction of pixels
-// AND every value is finite.
-TEST(SensorFidelity, FidelityOnVisiblyDifferentAndFinite) {
+// Gate 3 -- quality profiles differ on a real fraction of pixels and are finite.
+TEST(SensorFidelity, QualityProfilesDifferAndFinite) {
     ASSERT_NE(phi::ActiveBackend(), nullptr) << "no CUDA backend";
-    const Aov cheap = RenderOnce(nullptr, false);
+    const Aov baseline = RenderOnce(nullptr, false);
     const rt::SensorFidelityConfig f = BeautyProfile();
-    const Aov fancy = RenderOnce(&f, false);
-    ASSERT_EQ(cheap.color.size(), fancy.color.size());
+    const Aov alternate = RenderOnce(&f, false);
+    ASSERT_EQ(baseline.color.size(), alternate.color.size());
 
     size_t diff = 0u, nonfinite = 0u;
-    for (size_t i = 0; i < fancy.color.size(); ++i) {
-        if (!std::isfinite(fancy.color[i])) ++nonfinite;
-        if (fancy.color[i] != cheap.color[i]) ++diff;
+    for (size_t i = 0; i < alternate.color.size(); ++i) {
+        if (!std::isfinite(alternate.color[i])) ++nonfinite;
+        if (alternate.color[i] != baseline.color[i]) ++diff;
     }
-    const double frac = static_cast<double>(diff) / fancy.color.size();
-    std::printf("[diag] fidelity vs cheap: %zu/%zu channels differ (%.1f%%), nonfinite=%zu\n",
-                diff, fancy.color.size(), 100.0 * frac, nonfinite);
-    EXPECT_EQ(nonfinite, 0u) << "fidelity produced non-finite color";
-    EXPECT_GT(frac, 0.05) << "fidelity barely changed the image (shade not applied)";
+    const double frac = static_cast<double>(diff) / alternate.color.size();
+    std::printf("[diag] quality profile delta: %zu/%zu channels differ (%.1f%%), nonfinite=%zu\n",
+                diff, alternate.color.size(), 100.0 * frac, nonfinite);
+    EXPECT_EQ(nonfinite, 0u) << "quality render produced non-finite color";
+    EXPECT_GT(frac, 0.05) << "quality profile barely changed the image";
 }
 
-// Gate 4 -- depth/normal/prim are byte-identical cheap vs fidelity (only color
-// changes; the center ray fills the AOVs in both modes).
-TEST(SensorFidelity, AovsUnchangedUnderFidelity) {
+// Gate 4 -- depth/normal/prim are center-ray AOVs across quality profiles.
+TEST(SensorFidelity, AovsStableAcrossQualityProfiles) {
     ASSERT_NE(phi::ActiveBackend(), nullptr) << "no CUDA backend";
-    const Aov cheap = RenderOnce(nullptr, true);
+    const Aov baseline = RenderOnce(nullptr, true);
     const rt::SensorFidelityConfig f = BeautyProfile();
-    const Aov fancy = RenderOnce(&f, true);
-    ASSERT_EQ(cheap.depth.size(), fancy.depth.size());
-    EXPECT_EQ(std::memcmp(cheap.depth.data(), fancy.depth.data(),
-                          cheap.depth.size() * sizeof(float)),
+    const Aov alternate = RenderOnce(&f, true);
+    ASSERT_EQ(baseline.depth.size(), alternate.depth.size());
+    EXPECT_EQ(std::memcmp(baseline.depth.data(), alternate.depth.data(),
+                          baseline.depth.size() * sizeof(float)),
               0)
-        << "depth changed under fidelity (must come from the center ray)";
-    EXPECT_EQ(std::memcmp(cheap.normal.data(), fancy.normal.data(),
-                          cheap.normal.size() * sizeof(float)),
+        << "depth changed across quality profiles (must come from the center ray)";
+    EXPECT_EQ(std::memcmp(baseline.normal.data(), alternate.normal.data(),
+                          baseline.normal.size() * sizeof(float)),
               0)
-        << "normal changed under fidelity";
-    EXPECT_EQ(std::memcmp(cheap.prim.data(), fancy.prim.data(),
-                          cheap.prim.size() * sizeof(uint32_t)),
+        << "normal changed across quality profiles";
+    EXPECT_EQ(std::memcmp(baseline.prim.data(), alternate.prim.data(),
+                          baseline.prim.size() * sizeof(uint32_t)),
               0)
-        << "prim changed under fidelity";
+        << "prim changed across quality profiles";
 }
 
 // Gate 5 -- spp over the cap is rejected LOUDLY (no silent clamp / hang).

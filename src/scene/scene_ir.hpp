@@ -77,6 +77,10 @@ struct CollisionShapeRecord {
     // declaration order; empty => none). Threaded to the .nka MESH normals
     // stream by SaveShape; empty keeps the cooked .nka byte-identical.
     std::vector<float>    mesh_normals;
+    // Authored per-vertex UVs (u,v pairs, 1:1 with mesh_vertices; empty => none).
+    // Threaded to the .nka MESH UV stream so textured visual meshes use their
+    // source UV layout instead of the world-space triplanar fallback.
+    std::vector<float>    mesh_uvs;
 
     // -- Visual-mesh asset reference (M8.5 T5: the visual-mesh cook) ---------
     // For a VISUAL-only geom (contype==0 && conaffinity==0) carrying triangle

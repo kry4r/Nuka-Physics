@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
+#include <limits>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 
@@ -331,6 +332,17 @@ __device__ __forceinline__ bool IsExcluded(const uint64_t* keys, uint32_t n,
     return false;
 }
 
+__device__ __forceinline__ uint32_t ReservePairSlot(uint32_t* count,
+                                                     uint32_t capacity) {
+    uint32_t old = *count;
+    while (old < capacity) {
+        const uint32_t observed = atomicCAS(count, old, old + 1u);
+        if (observed == old) return old;
+        old = observed;
+    }
+    return old;
+}
+
 // One thread per (env x leaf). Walks the env's tree, emits canonical i<j pairs
 // surviving the contype/conaffinity mask + excluded-list + same-body drop. The
 // pair is stored env-LOCAL (a,b in [0,N)); the cross-env gate is implicit (the
@@ -343,6 +355,7 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
                                     uint32_t rigid_slot_cap,
+                                    uint32_t max_pairs,
                                     uint32_t* __restrict__ out_pairs,   // elem:2 per slot
                                     uint32_t* __restrict__ out_count,
                                     uint32_t* __restrict__ env_status) {
@@ -405,10 +418,12 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
                         IsExcluded(excluded, excluded_count, key)) {
                         continue;
                     }
-                    const uint32_t slot = atomicAdd(&out_count[env], 1u);
-                    // Full slot stride for addressing, but cap emission at rigid_slot_cap
-                    // so body<->body never spills into the body<->particle sub-range.
-                    if (slot < rigid_slot_cap) {
+                    const uint32_t slot =
+                        ReservePairSlot(&out_count[env], min(rigid_slot_cap, max_pairs));
+                    // Full slot stride for addressing, but cap emission at the
+                    // configured rigid pair capacity so body<->body never spills
+                    // into the body<->particle sub-range.
+                    if (slot < min(rigid_slot_cap, max_pairs)) {
                         const size_t at =
                             (static_cast<size_t>(env) * slot_stride + slot) * 2u;
                         out_pairs[at + 0] = a32;
@@ -466,8 +481,10 @@ __global__ void PairSortFillKernel(uint32_t env_count, uint32_t slot_cap,
 // Prefix of the per-env clamped live counts: dst_env's sorted entries occupy
 // [prefix[dst_env], prefix[dst_env] + min(count,cap)) of the global order.
 __global__ void PairClampCountsKernel(const uint32_t* __restrict__ counts,
-                                      uint32_t slot_cap, uint32_t* __restrict__ clamped) {
+                                      uint32_t env_count, uint32_t slot_cap,
+                                      uint32_t* __restrict__ clamped) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= env_count) return;
     clamped[e] = min(counts[e], slot_cap);
 }
 
@@ -663,7 +680,7 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
                nodes, static_cast<const float*>(model.shape_table),
                static_cast<const uint64_t*>(model.excluded_pairs),
                p->excluded_count, N, p->max_contacts_per_env, p->rigid_slot_cap,
-               data.candidate_pairs, data.pair_count, data.env_status);
+               p->max_pairs, data.candidate_pairs, data.pair_count, data.env_status);
     // Canonicalize the emitted stream: the atomicAdd slot claim above orders
     // pairs by warp-scheduling race, which would leak into contact slots, row
     // slots, the GS sweep order, and the warm-start match as last-ULP float
@@ -673,7 +690,10 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
     const uint64_t sort_slots64 =
         static_cast<uint64_t>(E) * p->rigid_slot_cap;
     if (sort_slots64 > 0u) {
-        if (sort_slots64 > 0xFFFFFFFFull || data.pair_sort_scratch == nullptr) {
+        if (sort_slots64 > 0xFFFFFFFFull ||
+            sort_slots64 > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+            E > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+            data.pair_sort_scratch == nullptr) {
             return Status::Failed;  // LOUD: no silent nondeterministic fallback.
         }
         const uint32_t sort_slots = static_cast<uint32_t>(sort_slots64);
@@ -699,7 +719,7 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
         {
             const uint32_t eb = (E + kBlockSize - 1u) / kBlockSize;
             LaunchCuda(PairClampCountsKernel, dim3(eb), dim3(kBlockSize), 0u,
-                       stream, data.pair_count, p->rigid_slot_cap, clamped);
+                       stream, data.pair_count, E, p->rigid_slot_cap, clamped);
             size_t scan_bytes = static_cast<size_t>(sl.temp_bytes);
             (void)cub::DeviceScan::ExclusiveScan(
                 sort_temp, scan_bytes, clamped, prefix, NkScanSumOp{}, 0u,

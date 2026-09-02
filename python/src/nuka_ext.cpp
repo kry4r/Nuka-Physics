@@ -174,7 +174,12 @@ public:
                                     float heightfield_base_z,
                                     uint32_t curric_levels,
                                     uint32_t curric_types,
-                                    float terrain_feature_cell) {
+                                    float terrain_feature_cell,
+                                    uint32_t solver_vel_iters,
+                                    uint32_t solver_pos_iters,
+                                    float solver_contact_margin,
+                                    uint32_t solver_max_pairs,
+                                    float baumgarte_max_velocity) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -246,6 +251,13 @@ public:
         desc.curric_levels = curric_levels;
         desc.curric_types = curric_types;
         desc.terrain_feature_cell = terrain_feature_cell;
+        // Solver overrides; each zero leaves the engine default untouched, so an
+        // unset caller is byte-identical to a world created without them.
+        desc.solver_vel_iters = solver_vel_iters;
+        desc.solver_pos_iters = solver_pos_iters;
+        desc.solver_contact_margin = solver_contact_margin;
+        desc.solver_max_pairs = solver_max_pairs;
+        desc.solver_baumgarte_max_velocity = baumgarte_max_velocity;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -739,14 +751,14 @@ public:
               "nuka_world_set_render_randomization");
     }
 
-    // Opt-in sensor RGB shading fidelity: lift the batched RGB to the beauty look
-    // (MSAA spp + soft shadow + AO + GI + tonemap) for a vision policy. Default ==
-    // cheap shade (a byte no-op). Deterministic + seeded. Requires a camera attached.
+    // Default high-quality sensor shading: textures + MSAA + soft shadow + AO/GI
+    // + ACES + sRGB. The C ABI also accepts a NULL/all-zero descriptor as this
+    // profile; this binding exposes every quality knob explicitly.
     void set_sensor_fidelity(uint32_t spp, uint32_t shadow_samples,
                              float sun_angular_radius, bool ao_enabled,
                              uint32_t ao_samples, float ao_radius, bool gi_enabled,
                              bool tonemap_enabled, float sky_intensity,
-                             float fog_density, uint64_t seed) {
+                             float fog_density, uint64_t seed, bool srgb_enabled) {
         nuka_sensor_fidelity_desc_t desc{};
         desc.spp = spp;
         desc.shadow_samples = shadow_samples;
@@ -759,6 +771,7 @@ public:
         desc.sky_intensity = sky_intensity;
         desc.fog_density = fog_density;
         desc.seed = seed;
+        desc.srgb_enabled = srgb_enabled ? 1 : 0;
         check(nuka_world_set_sensor_fidelity(h_, &desc),
               "nuka_world_set_sensor_fidelity");
     }
@@ -1785,6 +1798,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("ACTUATOR_EFFORT_REQUESTED", NUKA_FIELD_ACTUATOR_EFFORT_REQUESTED)
         .value("ACTUATOR_EFFORT", NUKA_FIELD_ACTUATOR_EFFORT)
         .value("ACTUATOR_SATURATED", NUKA_FIELD_ACTUATOR_SATURATED)
+        .value("TASK_ROTATION_TARGET", NUKA_FIELD_TASK_ROTATION_TARGET)
+        .value("TASK_LOCAL_POSE", NUKA_FIELD_TASK_LOCAL_POSE)
         .export_values();
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
@@ -1873,6 +1888,11 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("curric_levels") = uint32_t{0},
                     nb::arg("curric_types") = uint32_t{0},
                     nb::arg("terrain_feature_cell") = 0.0f,
+                    nb::arg("solver_vel_iters") = uint32_t{0},
+                    nb::arg("solver_pos_iters") = uint32_t{0},
+                    nb::arg("solver_contact_margin") = 0.0f,
+                    nb::arg("solver_max_pairs") = uint32_t{0},
+                    nb::arg("baumgarte_max_velocity") = 0.0f,
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
@@ -1904,7 +1924,15 @@ NB_MODULE(_nuka_ext, m) {
                     "Field.ENV_TERRAIN_TYPE (0=Flat,1=PyramidStairs,2=InvertedPyramid,"
                     "3=RandomBoxes) and Field.ENV_TERRAIN_DIFFICULTY (default 1.0, "
                     "scales the vertical feature height) via buffer_view. All-zero "
-                    "terrain == byte-identical to a world created without terrain.")
+                    "terrain == byte-identical to a world created without terrain. "
+                    "solver_vel_iters (0 => 32), solver_pos_iters (0 => 4), "
+                    "solver_contact_margin (0.0 => engine default; widens the "
+                    "narrow-phase/AABB speculative margin, which thin-walled "
+                    "geometry needs so a fast-closing contact cannot tunnel), "
+                    "solver_max_pairs (0 => bodies_per_env * 4, the broadphase "
+                    "candidate-pair emission cap) and baumgarte_max_velocity (0.0 "
+                    "keeps the cooked model default). Each zero leaves the engine "
+                    "default untouched.")
         .def_static(
             "create_coupled_from_scene", &World::create_coupled_from_scene,
             nb::arg("device"), nb::arg("scene_path"), nb::arg("env_count") = 1u,
@@ -2427,37 +2455,32 @@ NB_MODULE(_nuka_ext, m) {
             "replicas (cross-env byte-identical). A pure function of (seed, env, "
             "axis) -- the same seed yields the same bytes (RL-reproducible). Requires "
             "a camera attached; safe to re-call per reset.")
-        // Opt-in sensor RGB shading fidelity (the sim2real lever for a vision
-        // policy): lift the batched RGB to the single-camera beauty look.
+        // High-quality path: textured materials, MSAA, soft shadow, AO/GI,
+        // ACES tonemap and sRGB output are enabled by default.
         .def(
             "set_sensor_fidelity",
             [](World& w, uint32_t spp, uint32_t shadow_samples,
                float sun_angular_radius, bool ao_enabled, uint32_t ao_samples,
                float ao_radius, bool gi_enabled, bool tonemap_enabled,
-               float sky_intensity, float fog_density, uint64_t seed) {
+               float sky_intensity, float fog_density, uint64_t seed,
+               bool srgb_enabled) {
                 w.set_sensor_fidelity(spp, shadow_samples, sun_angular_radius,
                                       ao_enabled, ao_samples, ao_radius, gi_enabled,
                                       tonemap_enabled, sky_intensity, fog_density,
-                                      seed);
+                                      seed, srgb_enabled);
             },
-            nb::arg("spp") = 4u, nb::arg("shadow_samples") = 4u,
+            nb::arg("spp") = 16u, nb::arg("shadow_samples") = 12u,
             nb::arg("sun_angular_radius") = 0.04f, nb::arg("ao_enabled") = true,
-            nb::arg("ao_samples") = 3u, nb::arg("ao_radius") = 0.6f,
+            nb::arg("ao_samples") = 8u, nb::arg("ao_radius") = 0.6f,
             nb::arg("gi_enabled") = true, nb::arg("tonemap_enabled") = true,
             nb::arg("sky_intensity") = 0.0f, nb::arg("fog_density") = 0.0f,
-            nb::arg("seed") = 0x9e3779b9u,
-            "Enable opt-in sensor RGB shading fidelity: the batched RGB shades flat "
-            "(1 spp, 1 hard shadow) by default; this lifts it to the single-camera "
-            "beauty look -- MSAA (spp jittered samples), soft sun shadow "
-            "(shadow_samples across sun_angular_radius), ambient occlusion + "
-            "one-bounce GI (ao_*/gi_enabled), and an ACES-ish tonemap. The default "
-            "World shade (no call, or spp<=1 with everything off) is the cheap shade "
-            "(the AOV bytes are unchanged). depth/normal/albedo/prim always come from "
-            "the center ray. Deterministic + seeded: the samples derive from "
-            "Philox(seed, env, sensor, pixel, sample), so the same seed yields the "
-            "same bytes. spp/shadow_samples/ao_samples are capped at 256. Requires a "
-            "camera attached; safe to re-call per reset. Textures are not yet "
-            "applied (a follow-on); this is lighting/shading + anti-aliasing.")
+            nb::arg("seed") = 0x9e3779b9u, nb::arg("srgb_enabled") = true,
+            "Configure the default high-quality sensor RGB path: MSAA, soft sun "
+            "shadow, ambient occlusion, one-bounce GI, ACES-ish tonemap and sRGB "
+            "encoding. Textured material maps are sampled when present. The path "
+            "is persistent, deterministic for a fixed seed, and uses center-ray "
+            "depth/normal/albedo/prim AOVs. spp/shadow_samples/ao_samples are "
+            "capped at 256. Requires a camera attached; safe per reset.")
         // Camera lens model: radial distortion + a clipped depth range on every
         // attached camera. Default (distortion off, wide-open clip) is a byte no-op.
         .def(

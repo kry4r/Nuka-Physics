@@ -75,6 +75,9 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         has_articulation ? cap.articulations_per_env * cap.env_count : 0u;
     const uint32_t slot_count       = cap.max_contacts_per_env * cap.env_count;
     const uint32_t max_dof          = cap.dofs_per_env;
+    // OSC is an explicit world-create opt-in. Every other mode keeps the
+    // historical pipeline order byte-for-byte.
+    const bool use_osc = model.drive_mode == 4u;
     // rigid_cap recovers the pre-particle budget the cook grew from, so rigid keeps
     // [0, rigid_cap) and particles the top range; particle-free -> rigid_cap == total.
     // The MpmXpbd MPM slice couples via the grid and reserves no slots — the SAME
@@ -87,6 +90,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
                             collision::gpu::kBodyParticleContactSlotsPerParticle
                       : 0u;
     const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve;
+    const uint32_t default_pair_cap =
+        cap.bodies_per_env * 4u < rigid_cap ? cap.bodies_per_env * 4u : rigid_cap;
+    const uint32_t pair_emit_cap =
+        cfg.max_pairs == 0u ? default_pair_cap
+                            : (cfg.max_pairs < rigid_cap ? cfg.max_pairs : rigid_cap);
     const uint32_t contact_rows_per_env =
         rigid_cap * kPairDrivenRowsPerSlot +
         particle_reserve * kPairDrivenParticleRowsPerSlot;
@@ -124,14 +132,43 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_apply_drives_.total_link_count = total_link_count;
         p_apply_drives_.defer_velocity_damping = cfg.defer_velocity_damping;
         p_apply_drives_.mode = model.drive_mode;
-        add(phi::NkOp::ApplyDrives, &p_apply_drives_);
 
         p_aba_.gravity[0] = cfg.gravity[0];
         p_aba_.gravity[1] = cfg.gravity[1];
         p_aba_.gravity[2] = cfg.gravity[2];
         p_aba_.articulation_count = articulation_cnt;
         p_aba_.total_link_count = total_link_count;
-        add(phi::NkOp::AbaForward, &p_aba_);
+
+        if (use_osc) {
+            // Current-q task kinematics, followed by a force-free ABA. Its
+            // qddot is the bias/gravity acceleration consumed by ApplyOscDrives.
+            p_fk_.articulation_count = articulation_cnt;
+            p_fk_.total_link_count = total_link_count;
+            add(phi::NkOp::FkWorldPoses, &p_fk_);
+            add(phi::NkOp::ApplyDrives, &p_apply_drives_);
+            add(phi::NkOp::AbaForward, &p_aba_);
+
+            // OSC requires the pure physics M^-1, never the joint-damping fold.
+            p_crba_m_.dt = cfg.dt;
+            p_crba_m_.max_dof = max_dof;
+            p_crba_m_.articulation_count = articulation_cnt;
+            p_crba_m_.total_link_count = total_link_count;
+            p_crba_m_.fold_drive_damping = 0u;
+            add(phi::NkOp::CrbaComputeM, &p_crba_m_);
+            p_crba_factor_.max_dof = max_dof;
+            p_crba_factor_.articulation_count = articulation_cnt;
+            add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
+
+            p_apply_osc_.max_dof = max_dof;
+            p_apply_osc_.articulation_count = articulation_cnt;
+            p_apply_osc_.total_link_count = total_link_count;
+            p_apply_osc_.task_link = model.osc_task_link;
+            add(phi::NkOp::ApplyOscDrives, &p_apply_osc_);
+            add(phi::NkOp::AbaForward, &p_aba_);
+        } else {
+            add(phi::NkOp::ApplyDrives, &p_apply_drives_);
+            add(phi::NkOp::AbaForward, &p_aba_);
+        }
     }
 
     if (has_articulation || has_bodies) {
@@ -255,7 +292,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ParticlePredict, &p_part_predict_);
     }
 
-    if (has_articulation) {
+    if (has_articulation && !use_osc) {
         p_fk_.articulation_count = articulation_cnt;
         p_fk_.total_link_count = total_link_count;
         add(phi::NkOp::FkWorldPoses, &p_fk_);
@@ -289,7 +326,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_lbvh_build_.bodies_per_env = bodies_per_env;
         add(phi::NkOp::LbvhBuild, &p_lbvh_build_);
 
-        p_lbvh_query_.max_pairs = cfg.max_pairs;
+        p_lbvh_query_.max_pairs = pair_emit_cap;
         p_lbvh_query_.family = family;
         p_lbvh_query_.env_count = env_count;
         p_lbvh_query_.bodies_per_env = bodies_per_env;
@@ -427,7 +464,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ContactTangentBasis, &p_tangent_);
     }
 
-    if (has_articulation) {
+    if (has_articulation && !use_osc) {
         p_crba_m_.dt = cfg.dt;
         p_crba_m_.max_dof = max_dof;
         p_crba_m_.articulation_count = articulation_cnt;
@@ -488,7 +525,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.particle_soft_friction = mp.soft_friction;
         p_assemble_.particle_fluid_friction = mp.fluid_friction;
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
-        if (family == phi::kContactFamilyPairDriven) {
+        if constexpr (family == phi::kContactFamilyPairDriven) {
             p_warm_start_prepare_.phase = 0u;
             p_warm_start_prepare_.env_count = env_count;
             p_warm_start_prepare_.slot_count = cap.max_contacts_per_env;
@@ -497,7 +534,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             p_warm_start_prepare_.decay_steps = 2u;
         }
         add(phi::NkOp::AssembleRows, &p_assemble_);
-        if (family == phi::kContactFamilyPairDriven) {
+        if constexpr (family == phi::kContactFamilyPairDriven) {
             add(phi::NkOp::ContactWarmStart, &p_warm_start_prepare_);
         }
     }
@@ -619,7 +656,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_islands_.particles_per_env = cap.particles_per_env;
         add(phi::NkOp::BuildSolveIslands, &p_islands_);
         add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
-        if (family == phi::kContactFamilyPairDriven) {
+        if constexpr (family == phi::kContactFamilyPairDriven) {
             p_warm_start_commit_ = p_warm_start_prepare_;
             p_warm_start_commit_.phase = 1u;
             add(phi::NkOp::ContactWarmStart, &p_warm_start_commit_);

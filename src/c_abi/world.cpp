@@ -294,17 +294,19 @@ nuka_result_t ValidateWorldDescAndDevice(
     if (desc->determinism > 1u) {
         return NUKA_RESULT_INVALID_ARG;
     }
-    // Control mode: 0 PDPosition + 1 Torque are wired onto the ONE nk::World (presets
-    // of the one affine actuator). The other modes have no op kernel yet -> rejected
-    // NOT_SUPPORTED. A value above the enum range is an outright INVALID_ARG.
+    // Control mode: PDPosition/Torque retain their established affine schedules.
+    // OSC is opt-in and owns a separately gated free-dynamics/task-space schedule;
+    // no default world enters it. Other declared legacy modes remain unsupported
+    // on the unified nk world.
     if (!articulation::IsControlModeImplemented(desc->control_mode)) {
         return NUKA_RESULT_INVALID_ARG;
     }
     const auto control_mode =
         static_cast<articulation::ControlMode>(desc->control_mode);
     if (control_mode != articulation::ControlMode::PDPosition &&
-        control_mode != articulation::ControlMode::Torque) {
-        return NUKA_RESULT_NOT_SUPPORTED;  // preset not yet wired on the nk world.
+        control_mode != articulation::ControlMode::Torque &&
+        control_mode != articulation::ControlMode::Osc) {
+        return NUKA_RESULT_NOT_SUPPORTED;
     }
 
     auto* device_record = nuka::c_abi::DeviceTable().Get(device);
@@ -324,11 +326,10 @@ nuka_result_t ApplyControlTerrainGravity(
     const nuka_world_desc_t* desc, articulation::ControlMode control_mode,
     nuka::nk::Model& model, nuka::terrain::HeightField* out_terrain,
     nuka::math::Vec3* out_gravity) {
-    // Route the declared control mode onto the cooked Model's drive_mode (PDPosition
-    // -> 0 position-PD kernel, Torque -> 1 direct-torque kernel). PDPosition is a
-    // no-op (drive_mode defaults to 0 => the PD goldens stay byte-identical).
-    model.drive_mode =
-        (control_mode == articulation::ControlMode::Torque) ? 1u : 0u;
+    // The numeric mode is preserved on the Model. PD (0) and Torque (1) keep
+    // their original affine paths; OSC (4) is an explicitly selected pipeline.
+    model.drive_mode = static_cast<uint32_t>(control_mode);
+    model.osc_task_link = desc->osc_task_link;
 
     // When the caller requests a baked heightfield (contact_family == 1), build the
     // ONE source-of-truth HeightField -- from a grayscale IMAGE if set, else the
@@ -455,11 +456,15 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 uint32_t env_count,
                                 articulation::ControlMode control_mode,
                                 const nuka::math::Vec3& gravity,
+                                uint32_t osc_task_link,
                                 nuka_world_handle* out,
                                 uint32_t solver_vel_iters,
                                 uint32_t solver_pos_iters,
                                 float solver_contact_margin,
                                 uint32_t solver_max_pairs) {
+    // ApplyControlTerrainGravity ran before the Model move, but keep the public
+    // task-link option explicit on the shared world-assembly path.
+    cooked_model.osc_task_link = osc_task_link;
     auto record = std::make_unique<WorldRecord>();
     record->device = device_record;
     record->env_count = env_count;
@@ -524,11 +529,20 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         if (!prepared.scene.Media().empty()) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }
+        // A positive baumgarte_max_velocity bounds the contact recovery push-out; 0
+        // keeps the cooked model default.
+        if (desc->solver_baumgarte_max_velocity > 0.0f) {
+            prepared.model.baumgarte_max_velocity =
+                desc->solver_baumgarte_max_velocity;
+        }
         // Build + insert the live world (the shared record-assembly path).
         const nuka_result_t made = nuka::c_abi::FinishWorldCreate(
             std::move(prepared.model), std::move(prepared.scene),
             std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
-            desc->env_count, prepared.control_mode, prepared.gravity, out);
+            desc->env_count, prepared.control_mode, prepared.gravity,
+            desc->osc_task_link, out, desc->solver_vel_iters,
+            desc->solver_pos_iters, desc->solver_contact_margin,
+            desc->solver_max_pairs);
         if (made == NUKA_RESULT_OK) {
             if (auto* rec = nuka::c_abi::WorldTable().Get(*out)) {
                 rec->scene_dir =
@@ -612,7 +626,8 @@ nuka_result_t nuka_world_create_coupled_from_scene(
         const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
             std::move(prepared.model), std::move(prepared.scene),
             std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
-            desc->env_count, prepared.control_mode, prepared.gravity, out,
+            desc->env_count, prepared.control_mode, prepared.gravity,
+            desc->osc_task_link, out,
             particles->solver_vel_iters, particles->solver_pos_iters,
             particles->solver_contact_margin, particles->solver_max_pairs);
         if (result == NUKA_RESULT_OK) {

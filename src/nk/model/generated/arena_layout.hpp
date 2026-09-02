@@ -271,6 +271,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // joint_frictionloss
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 1, 4, 0},  // body_collidable_link
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 7, 28, 0},  // body_collidable_local
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Body, 1, 1, 4, 0},  // body_collidable_body
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // ucontact_id_pair
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // ucontact_id_feature
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_pair
@@ -299,6 +300,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_effort
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_saturated
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // pair_sort_scratch
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 3, 12, 0},  // task_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 4, 16, 0},  // task_rotation_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 7, 28, 0},  // task_local_pose
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

@@ -620,13 +620,14 @@ __device__ __forceinline__ Vec3 ApplyMaterialTextures(
         const float w0 = 1.0f - bu - bv;
         const float u = (w0 * uv0.x + bu * uv1.x + bv * uv2.x) * scale;
         const float v = (w0 * uv0.y + bu * uv1.y + bv * uv2.y) * scale;
+        const float texture_v = 1.0f - v;
         if (want_albedo) {
-            const Vec3 c = SampleTexture(textures[mat->albedo_tex], u, v);
+            const Vec3 c = SampleTexture(textures[mat->albedo_tex], u, texture_v);
             mat->albedo = Vec3{mat->albedo.x * c.x, mat->albedo.y * c.y,
                                mat->albedo.z * c.z};
         }
         if (want_rough) {
-            const Vec3 r = SampleTexture(textures[mat->roughness_tex], u, v);
+            const Vec3 r = SampleTexture(textures[mat->roughness_tex], u, texture_v);
             mat->roughness = fminf(1.0f, fmaxf(0.02f, mat->roughness * r.x));
         }
         if (want_normal) {
@@ -650,7 +651,7 @@ __device__ __forceinline__ Vec3 ApplyMaterialTextures(
                                (e2.z * du1 - e1.z * du2) * r};
                 const Vec3 T = QuatRotate(I.transform.rotation, t_l);
                 const Vec3 B = QuatRotate(I.transform.rotation, b_l);
-                const Vec3 t = SampleNormalMap(textures[mat->normal_tex], u, v);
+                const Vec3 t = SampleNormalMap(textures[mat->normal_tex], u, texture_v);
                 const Vec3 nn{T.x * t.x + B.x * t.y + n_world.x * t.z,
                               T.y * t.x + B.y * t.y + n_world.y * t.z,
                               T.z * t.x + B.z * t.y + n_world.z * t.z};
@@ -1165,6 +1166,13 @@ NUKA_RT_HD inline float TonemapAces(float x) {
     const float y = (x * (a * x + b)) / (x * (c * x + d) + e);
     return y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
 }
+
+NUKA_RT_HD inline float LinearToSrgb(float x) {
+    x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+    return x <= 0.0031308f ? 12.92f * x
+                            : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
+}
+
 
 // Launch the FP32 beauty kernel (defined in two_level_render_beauty.cu, built
 // --fmad=true). The host build path (BuildFrameTlas + buffers) stays in

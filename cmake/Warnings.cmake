@@ -10,6 +10,10 @@ function(nuka_set_warnings target)
             /permissive-
             /wd4819       # suppress code-page encoding warning
         )
+        # The codebase deliberately uses the portable C library (getenv/fopen) for
+        # diagnostic switches and golden-file IO; MSVC's _s variants are not
+        # portable, so opt out of the deprecation rather than fork every call site.
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
         if(NK_WARNINGS_AS_ERRORS)
             target_compile_options(${target} PRIVATE /WX)
         endif()

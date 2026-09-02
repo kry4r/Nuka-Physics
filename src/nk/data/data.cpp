@@ -233,6 +233,9 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ActuatorEffortRequested: v.actuator_effort_requested = static_cast<float*>(p); break;
         case FieldId::ActuatorEffort:      v.actuator_effort = static_cast<float*>(p); break;
         case FieldId::ActuatorSaturated:   v.actuator_saturated = static_cast<float*>(p); break;
+        case FieldId::TaskTarget:          v.task_target = static_cast<math::Vec3*>(p); break;
+        case FieldId::TaskRotationTarget:  v.task_rotation_target = static_cast<math::Quat*>(p); break;
+        case FieldId::TaskLocalPose:       v.task_local_pose = static_cast<math::Transform*>(p); break;
         default: break;  // model-owned field id: not a DataView member.
     }
 }

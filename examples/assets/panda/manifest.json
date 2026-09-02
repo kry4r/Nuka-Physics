@@ -1,0 +1,18 @@
+{
+  "asset": "MuJoCo Menagerie Franka Emika Panda",
+  "license": "Apache-2.0",
+  "revision": "da76818e269b82289eba39808e2fb91d679d6994",
+  "source": ".nuka-assets/src/mujoco_menagerie/franka_emika_panda/panda.xml",
+  "source_sha256": "c5a92e6ff47e7282ea303ffe13530ffe150248a22bb4b349a9369881e52facf0",
+  "generated_scene": ".nuka-assets/generated/panda/panda_pick_place.xml",
+  "generator": "tools/assets/convert_embodied_assets.py",
+  "conversion": [
+    "merge hand geometry and physical inertia into link7",
+    "reparent both finger bodies to link7",
+    "remove tendon, equality, actuator, and keyframe semantics",
+    "fix link0 root by setting its root mass to zero"
+  ],
+  "expected_base_link_count": 10,
+  "expected_engine_action_dim": 9,
+  "policy_action_dim": 8
+}

@@ -113,8 +113,10 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_TORQUE_INPUT,           kStrideF32,   kWireDtypeF32, nk::FieldId::DriveTarget},
     {NUKA_FIELD_VELOCITY_TARGET,        kStrideF32,   kWireDtypeF32, kNoFieldId},
     {NUKA_FIELD_ACTUATOR_NOLOAD_SPEED,  kStrideF32,   kWireDtypeF32, kNoFieldId},
-    // TASK_TARGET is per-ENV float3 {x,y,z} (stride 12), NOT per-link f32.
-    {NUKA_FIELD_TASK_TARGET,            kStrideVec3,  kWireDtypeF32, kNoFieldId},
+    // TASK_TARGET is now an arena-backed per-env position input. The optional
+    // quaternion and local task frame append the 6D OSC surface without changing
+    // the existing field's integer or stride.
+    {NUKA_FIELD_TASK_TARGET,            kStrideVec3,  kWireDtypeF32, nk::FieldId::TaskTarget},
     // -- field 16: net per-link world contact wrench [F(3),tau(3)], 24 B. -----
     {NUKA_FIELD_LINK_CONTACT_WRENCH,    kStrideSpat6, kWireDtypeF32, nk::FieldId::LinkContactWrench},
     // -- field 17: per-slot world unit normal (Vec3, 12 B). ------------------
@@ -147,14 +149,16 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_ACTUATOR_EFFORT_REQUESTED, kStrideF32, kWireDtypeF32, nk::FieldId::ActuatorEffortRequested},
     {NUKA_FIELD_ACTUATOR_EFFORT,        kStrideF32,   kWireDtypeF32, nk::FieldId::ActuatorEffort},
     {NUKA_FIELD_ACTUATOR_SATURATED,     kStrideF32,   kWireDtypeF32, nk::FieldId::ActuatorSaturated},
+    {NUKA_FIELD_TASK_ROTATION_TARGET,   static_cast<uint32_t>(4u * sizeof(float)), kWireDtypeF32, nk::FieldId::TaskRotationTarget},
+    {NUKA_FIELD_TASK_LOCAL_POSE,        kStridePose,  kWireDtypeF32, nk::FieldId::TaskLocalPose},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // The table covers the append-only public field range through actuator telemetry.
-static_assert(kDlpackFieldCount == 31u,
-              "dlpack_table must hold exactly the 31 public state fields");
+static_assert(kDlpackFieldCount == 33u,
+              "dlpack_table must hold exactly the 33 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,
@@ -163,6 +167,8 @@ static_assert(static_cast<int>(NUKA_FIELD_PARTICLE_VELOCITY) == 24,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_ACTUATOR_SATURATED) == 30,
               "public field enum range changed — review the RL binary contract");
+static_assert(static_cast<int>(NUKA_FIELD_TASK_LOCAL_POSE) == 32,
+              "OSC field enum range changed — review the RL binary contract");
 
 // Resolve a public field's canonical descriptor. Returns nullptr if the field
 // integer is out of the table's covered range. The table is laid out so row i

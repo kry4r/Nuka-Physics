@@ -60,15 +60,25 @@ constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
 // FusedFoot foot count) so the contact buffer grows with the cooked geometry.
 constexpr uint32_t kCandidatePairsPerCollidable = 4u;
 
-// One EXTRA collision geom of an articulation link (beyond the first, which folds
-// into the link's own body row via link_geom). Materialized into an appended
-// collidable body row so a link owns multiple collidables (multi-geom feet).
+// One EXTRA collision shape of a multi-collidable owner. Materialized into an
+// appended collidable body row so an owner can hold several collidables. The
+// owner is EITHER an articulation link (owner_link set; its FIRST shape folds
+// into the link's own body row via link_geom) or a free-rigid/static body
+// (owner_link ~0u; EVERY shape becomes a proxy and the owner row stops colliding).
 struct ProxyCollidableSpec {
-    uint32_t owner_link  = ~0u;  // template-local link (pose source).
-    uint32_t owner_body  = ~0u;  // owner body row (exclusion inheritance).
-    uint32_t owner_artic = ~0u;  // template-local articulation.
+    uint32_t owner_link  = ~0u;  // template-local link (pose source), or ~0u.
+    uint32_t owner_body  = ~0u;  // owner body row (pose source when owner_link ~0u).
+    uint32_t owner_artic = ~0u;  // template-local articulation, or ~0u.
     uint32_t shape_row   = ~0u;  // cooked ModelShape / blob shape index.
 };
+
+static bool ShapeCollides(const CookedBlob& blob, uint32_t shape) {
+    const uint32_t ct = shape < blob.contact_params.contypes.size()
+                            ? blob.contact_params.contypes[shape] : 1u;
+    const uint32_t ca = shape < blob.contact_params.conaffinities.size()
+                            ? blob.contact_params.conaffinities[shape] : 1u;
+    return (ct != 0u) || (ca != 0u);
+}
 
 // resolve the AUTHORED initial-condition for the cooked articulation
 // (the settle product, controller ruling R4: BAKED). Two sources, in priority:
@@ -234,6 +244,16 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
         throw std::runtime_error("CookToModel: row capacity overflows u32");
     }
     cap.max_rows_per_env = static_cast<uint32_t>(total_rows);
+}
+
+static uint32_t DefaultRigidCandidatePairs(uint32_t collidables) {
+    const uint64_t pairs = static_cast<uint64_t>(collidables) *
+                           static_cast<uint64_t>(kCandidatePairsPerCollidable);
+    if (pairs > 0xFFFFFFFFull) {
+        throw std::runtime_error(
+            "CookToModel: default rigid candidate-pair capacity overflows u32");
+    }
+    return static_cast<uint32_t>(pairs);
 }
 
 }  // namespace
@@ -514,22 +534,18 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         }
 
         // Per-link collision geometry: per template-link, record the FIRST
-        // primitive (Sphere/Box/Capsule) collision shape whose owning body maps to
-        // that link, in the link's LOCAL frame. This is the source the GENERAL
-        // contact path poses into world space (SyncLinkBodyPose: link_pose o
-        // link_geom_local -> the link's collidable body row in the LBVH). Cooked
-        // for EVERY scene; the UnionCsr graph never reads it (it only feeds the
-        // PairDriven SyncLinkBodyPose op).
-        // kind sentinel: 0 == none; a primitive stores (ShapeType + 1) so the
-        // default-zero (no-shape) link is unambiguously inactive.
+        // primitive COLLISION shape whose owning body maps to that link, in the
+        // link's LOCAL frame. Visual-only shapes must never claim the link's
+        // physics row, even when they precede collision geoms in the source XML.
         m.link_geom_kind.assign(m.link_count, 0u);
         m.link_geom_params.assign(static_cast<size_t>(m.link_count) * 4u, 0.0f);
         m.link_geom_local.assign(m.link_count, math::Transform::Identity());
         for (uint32_t shape = 0; shape < blob.shapes.types.size(); ++shape) {
             const ShapeType st = blob.shapes.types[shape];
-            if (st != ShapeType::Sphere && st != ShapeType::Box &&
-                st != ShapeType::Capsule) {
-                continue;  // only bounded primitives are collidable here.
+            if (!ShapeCollides(blob, shape) ||
+                (st != ShapeType::Sphere && st != ShapeType::Box &&
+                 st != ShapeType::Capsule)) {
+                continue;
             }
             const BodyId body = shape < blob.shapes.body_ids.size()
                                     ? blob.shapes.body_ids[shape]
@@ -772,22 +788,14 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // collide); the cooked filter pair lists ride the blob for .
     model.filter_cross_env = false;
 
-    // 9. Contact / row capacities. ONE general per-env candidate-slot budget for
-    // the LBVH broadphase, driven by the actual cooked collidable count (the
-    // body rows the broadphase iterates) -- NO scene-type branch and NO baked
-    // foot-count constants. The broadphase builds over bodies_per_env collidable
-    // body rows and emits up to max_contacts_per_env candidate pairs (it SILENTLY
-    // drops overflow, lbvh_traversal.cuh), so the budget scales with the
-    // collidables: collidable_count * kCandidatePairsPerCollidable. The static
-    // ground collidable (appended in section 10) is included via +1. The
-    // PairDriven overload re-sizes max_rows_per_env to its per-candidate-slot
-    // row layout; max_rows here is the broadphase-agnostic initial bound.
+    // 9. Contact / row capacities. Ordinary scenes use a bounded default reserve
+    // that scales with cooked collidables. Explicit `solver_max_pairs` is clamped
+    // to this reserve; broadphase overflow is surfaced through env_status rather
+    // than silently writing out of bounds. Terrain cooking recomputes the same
+    // reserve after adding its explicit heightfield leaf.
     {
-        const uint32_t static_collidables = 1u;  // the ground plane (section 10).
-        const uint32_t collidables = cap.bodies_per_env + static_collidables;
-        cap.max_contacts_per_env =
-            cap.bodies_per_env > 0u ? collidables * kCandidatePairsPerCollidable
-                                    : 0u;
+        cap.max_contacts_per_env = cap.bodies_per_env > 1u
+            ? DefaultRigidCandidatePairs(cap.bodies_per_env) : 0u;
         SetRowCapacity(cap,
                        static_cast<uint64_t>(cap.max_contacts_per_env) *
                            nk::kPairDrivenRowsPerSlot);
@@ -805,9 +813,12 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         SetRowCapacity(cap, 0u);
     }
 
-    // 10. — pair-driven generalized-collision + SDF main-path staging (plan
-    // the spec). The shape_table (one PairDrivenShape / collidable body row),
-    // the SDF sampling-point pool (SAMP cook), the cooked sparse-SDF grids
+    // 10. Pair-driven generalized-collision + SDF main-path staging. The shape_table
+    // contains one row per LBVH collidable body, followed by proxy rows; the SDF
+    // sampling-point pool and filter exclude-list are staged alongside it.
+    // The source scene owns ordinary flat geometry (for example LIBERO's table
+    // top); do not inject a phantom default plane into every scene. Terrain cooking
+    // below materializes its explicit heightfield leaf.
     // (SdfDeviceWorld upload duties moved INTO the Model), and the filter
     // exclude-list. A scene with no SdfMesh shape leaves the SDF
     // tables empty (max_sdf_* == 0); they are populated for a cooked
@@ -818,23 +829,56 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // shape_table: one row per body, from its FIRST shape's primitive + the
         // contype/conaffinity (from the cooked filter groups when present).
         model.shape_table_rows.assign(cap.bodies_per_env, {});
-        // Per body, pick its first COLLIDING shape (contype/conaffinity != 0);
-        // a visual-only body falls back to its first shape. Keeps a real collision
-        // primitive as the body row instead of a non-colliding visual mesh.
-        auto shape_collides = [&](uint32_t i) {
-            const uint32_t ct = i < blob.contact_params.contypes.size()
-                                   ? blob.contact_params.contypes[i] : 1u;
-            const uint32_t ca = i < blob.contact_params.conaffinities.size()
-                                   ? blob.contact_params.conaffinities[i] : 1u;
-            return (ct != 0u) || (ca != 0u);
-        };
+        // Per body, pick its first COLLIDING shape (contype/conaffinity != 0).
+        // A visual-only body remains an empty row rather than becoming a phantom
+        // collidable; its render geom is intentionally not used for physics.
+        // `shape_collides` is shared with the link-geometry selection above.
         std::vector<uint32_t> body_shape(cap.bodies_per_env, ~0u);
         for (uint32_t i = 0; i < model.shapes.size(); ++i) {
             const uint32_t b = model.shapes[i].body_row;
-            if (b >= cap.bodies_per_env) continue;
+            if (b >= cap.bodies_per_env || !ShapeCollides(blob, i)) continue;
             if (body_shape[b] == ~uint32_t(0)) body_shape[b] = i;
-            else if (shape_collides(i) && !shape_collides(body_shape[b])) body_shape[b] = i;
         }
+
+        // A body whose COLLIDING shapes cannot be expressed by one body-centered
+        // row -- more than one of them, or a single one carrying a non-identity
+        // offset -- hands ALL of them to appended proxy rows and stops colliding
+        // itself. Articulation links keep their existing split (first shape folds
+        // into link_geom, extras already queued above), so only non-link bodies
+        // enter here. A body with exactly one identity-posed colliding shape is
+        // untouched -> every pre-existing scene cooks byte-identically.
+        std::vector<uint8_t> body_proxied(cap.bodies_per_env, 0u);
+        {
+            auto is_identity = [](const math::Transform& t) {
+                return t.position.x == 0.0f && t.position.y == 0.0f &&
+                       t.position.z == 0.0f && t.rotation.x == 0.0f &&
+                       t.rotation.y == 0.0f && t.rotation.z == 0.0f &&
+                       t.rotation.w == 1.0f;
+            };
+            std::vector<uint32_t> colliding_count(cap.bodies_per_env, 0u);
+            for (uint32_t i = 0; i < model.shapes.size(); ++i) {
+                const uint32_t b = model.shapes[i].body_row;
+                if (b >= cap.bodies_per_env || !ShapeCollides(blob, i)) continue;
+                const bool is_link = b < body_is_articulation_link.size() &&
+                                     body_is_articulation_link[b] != 0u;
+                if (is_link) continue;
+                ++colliding_count[b];
+                if (colliding_count[b] > 1u ||
+                    !is_identity(model.shapes[i].local_transform)) {
+                    body_proxied[b] = 1u;
+                }
+            }
+            for (uint32_t i = 0; i < model.shapes.size(); ++i) {
+                const uint32_t b = model.shapes[i].body_row;
+                if (b >= cap.bodies_per_env || !ShapeCollides(blob, i)) continue;
+                if (body_proxied[b] == 0u) continue;
+                ProxyCollidableSpec px;
+                px.owner_body = b;
+                px.shape_row = i;
+                link_proxies.push_back(px);
+            }
+        }
+
         for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
             const uint32_t s = body_shape[b];
             if (s == ~uint32_t(0)) continue;
@@ -891,6 +935,13 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                               ? blob.contact_params.contypes[s] : 1u;
             row.conaffinity = s < blob.contact_params.conaffinities.size()
                                   ? blob.contact_params.conaffinities[s] : 1u;
+            // A proxied owner keeps its primitive (the LBVH leaf stays valid) but
+            // stops pairing: its collidables now live on the appended proxy rows,
+            // and the broadphase mask (contype & conaffinity both 0) rejects it.
+            if (body_proxied[b] != 0u) {
+                row.contype = 0u;
+                row.conaffinity = 0u;
+            }
             row.sdf_grid = ~0u;  // resolved below if the piece has a cooked SDF.
             // R1 (general contact pipeline): the shape->body indirection.
             // A cooked collidable row maps to its OWNING body row (never static
@@ -1007,42 +1058,6 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // scene (go2) -> the hull_verts segment stays zero bytes (byte-inert).
         cap.max_hull_verts =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
-
-        // R5 (general contact pipeline): emit a STATIC ground collidable
-        // row into shape_table as a first-class collidable with body_id == -1 (no
-        // reaction side). Appended AFTER the per-body rows so the per-body rows
-        // [0, bodies_per_env) keep their exact indices + bytes; the static row
-        // lives at index bodies_per_env. contype/conaffinity == 1 (collide-all).
-        // INERT before the general path is wired: the broadphase iterates only bodies_per_env body rows
-        // per env (it never indexes the static row), and shape_table is a model
-        // param pinned by no golden, so growing max_bodies_total by one row is
-        // byte-safe for the gated UnionCsr family. The static row's
-        // WORLD pose / LBVH entry is wired in the general path (R5 downstream + B3); here we
-        // only register the collidable. A Plane kind anchors the flat-ground case
-        // (the general heightfield collidable, kShapeHeightfield, is added by H2/H3
-        // in the general path). params[0] carries the ground plane height for the future
-        // static-pose stamp.
-        {
-            nk::Model::PairDrivenShape ground;
-            ground.kind = ::nuka::collision::kShapePlane;
-            ground.params[0] = model.ground_height;
-            ground.params[1] = 0.0f;
-            ground.params[2] = 0.0f;
-            ground.params[3] = 0.0f;
-            ground.contype = 1u;
-            ground.conaffinity = 1u;
-            ground.sdf_grid = ~0u;
-            ground.body_id = -1;   // STATIC: no owning body, no reaction side.
-            ground.group = 0u;
-            ground.contact_profile_index = 0u;
-            model.shape_table_rows.push_back(ground);
-        }
-        // Grow the shape_table capacity to cover the appended static row(s). Only
-        // shape_table (count max_bodies_total*10) + samp_ranges (count
-        // max_bodies_total*2) scale with this; both are model params pinned by no
-        // golden, and the extra samp_ranges entries default to 0 (no samples).
-        cap.max_bodies_total =
-            static_cast<uint32_t>(model.shape_table_rows.size());
     }
 
     // Terrain bake (gated on a TerrainRecord -> terrain-free scenes stay byte-
@@ -1077,20 +1092,26 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         result.terrain = std::move(hf);
     }
 
-    // Multi-geom collidable proxies: each EXTRA link collision primitive becomes
-    // its own appended collidable body row. Reuses the whole broadphase ->
-    // narrowphase -> assembly (a proxy resolves to its owner link via body_to_link)
-    // + SyncLinkBodyPose's proxy-pose pass. Empty for single-geom links -> the
-    // block is skipped and every existing scene is byte-identical.
+    // Multi-collidable proxies: each EXTRA collision primitive becomes its own
+    // appended collidable body row. Reuses the whole broadphase -> narrowphase ->
+    // assembly (a proxy resolves to its owner link via body_to_link, or to its
+    // owner body row via body_collidable_body) + SyncLinkBodyPose's proxy-pose
+    // pass. Empty for single-collidable scenes -> the block is skipped and every
+    // existing scene is byte-identical.
     if (!link_proxies.empty()) {
         const uint32_t base = cap.bodies_per_env;   // rows before proxies.
         const uint32_t proxy_count = static_cast<uint32_t>(link_proxies.size());
-        const uint32_t final_bodies = base + proxy_count;
+        const uint64_t final_bodies64 = static_cast<uint64_t>(base) + proxy_count;
+        if (final_bodies64 > 0xFFFFFFFFull) {
+            throw std::runtime_error("CookToModel: proxy body count overflows u32");
+        }
+        const uint32_t final_bodies = static_cast<uint32_t>(final_bodies64);
 
         // Grow every per-body table to the final row count. body_collidable_link/
-        // local default to ~0u/identity for the pre-proxy rows (not proxies).
+        // body/local default to ~0u/~0u/identity for the pre-proxy rows (not proxies).
         model.body_collidable_link.assign(final_bodies, ~uint32_t(0));
         model.body_collidable_local.assign(final_bodies, math::Transform::Identity());
+        model.body_collidable_body.assign(final_bodies, ~uint32_t(0));
         model.body_to_link.resize(final_bodies, ~uint32_t(0));
         model.body_to_articulation.resize(final_bodies, ~uint32_t(0));
         // Preserve any TRAILING static shape rows (a non-terrain scene appends the
@@ -1146,12 +1167,45 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             prow.body_id = static_cast<int32_t>(row);
             prow.group = 0u;
             prow.contact_profile_index = sh.material_bucket;
+            // Hull / mesh proxy: pack THIS piece's mesh-local verts into the shared
+            // pool and bound the broadphase sphere by the max vertex radius (the
+            // same treatment the owner-row path gives a hull).
+            if ((sh.kind == static_cast<uint8_t>(ShapeType::ConvexHull) ||
+                 sh.kind == static_cast<uint8_t>(ShapeType::TriMesh)) &&
+                sh.convex_geometry_index != ~uint32_t(0) &&
+                sh.convex_geometry_index < blob.convex_geometry.Count()) {
+                const CookedConvexGeometry& g = blob.convex_geometry;
+                const uint32_t piece = sh.convex_geometry_index;
+                const uint32_t voff = g.vertex_offsets[piece];
+                const uint32_t vcnt = g.vertex_counts[piece];
+                const uint32_t hull_base =
+                    static_cast<uint32_t>(model.hull_verts.size() / 3u);
+                float max_sq = 0.0f;
+                for (uint32_t v = 0; v < vcnt; ++v) {
+                    const size_t at = (static_cast<size_t>(voff) + v) * 3u;
+                    const float x = g.vertices[at + 0];
+                    const float y = g.vertices[at + 1];
+                    const float z = g.vertices[at + 2];
+                    const float d = x * x + y * y + z * z;
+                    if (d > max_sq) max_sq = d;
+                    model.hull_verts.push_back(x);
+                    model.hull_verts.push_back(y);
+                    model.hull_verts.push_back(z);
+                }
+                prow.params[0] = std::sqrt(max_sq);
+                prow.hull_vert_offset = hull_base;
+                prow.hull_vert_count = vcnt;
+            }
             model.shape_table_rows[row] = prow;
 
-            // Inverse maps (reaction -> owner link) + pose binding + material + freeze.
+            // Inverse maps (reaction -> owner) + pose binding + material + freeze.
+            // A link-owned proxy resolves through body_to_link; a body-owned proxy
+            // leaves those ~0u and carries its owner row in body_collidable_body.
             model.body_to_link[row] = px.owner_link;
             model.body_to_articulation[row] = px.owner_artic;
             model.body_collidable_link[row] = px.owner_link;
+            model.body_collidable_body[row] =
+                (px.owner_link == ~uint32_t(0)) ? px.owner_body : ~uint32_t(0);
             model.body_collidable_local[row] = sh.local_transform;
             if (row < model.body_material_bucket.size()) {
                 model.body_material_bucket[row] = sh.material_bucket;
@@ -1162,7 +1216,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             }
 
             // Exclusions: never contact the owner body, its excluded partners, a
-            // same-link sibling, or a proxy whose owner bodies are excluded partners.
+            // same-owner sibling, or a proxy whose owner bodies are excluded partners.
             add_exclude(row, px.owner_body);
             for (uint64_t key : base_excludes) {
                 const uint32_t lo = static_cast<uint32_t>(key >> 32);
@@ -1172,7 +1226,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             }
             for (uint32_t j = 0; j < i; ++j) {
                 const ProxyCollidableSpec& pj = link_proxies[j];
-                if (pj.owner_link == px.owner_link ||
+                if (pj.owner_body == px.owner_body ||
                     std::binary_search(base_sorted.begin(), base_sorted.end(),
                                        pair_key(px.owner_body, pj.owner_body))) {
                     add_exclude(row, base + j);
@@ -1195,10 +1249,15 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.bodies_per_env = final_bodies;
         cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
         cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
-        cap.max_contacts_per_env += proxy_count * kCandidatePairsPerCollidable;
-        SetRowCapacity(cap,
-                       static_cast<uint64_t>(cap.max_contacts_per_env) *
-                           nk::kPairDrivenRowsPerSlot);
+        if (enable_contacts) {
+            cap.max_contacts_per_env = DefaultRigidCandidatePairs(final_bodies);
+            SetRowCapacity(cap,
+                           static_cast<uint64_t>(cap.max_contacts_per_env) *
+                               nk::kPairDrivenRowsPerSlot);
+        } else {
+            cap.max_contacts_per_env = 0u;
+            SetRowCapacity(cap, 0u);
+        }
     }
 
     return result;
@@ -1379,8 +1438,9 @@ uint32_t CookHeightfieldGrid(nk::Model& model,
 uint32_t CookTerrainIntoModel(nk::Model& model,
                               const ::nuka::terrain::HeightField& hf,
                               uint32_t orig_bodies) {
-    // The heightfield seeds at orig_bodies (it overwrites the static ground-plane
-    // shape row appended there, keeping the collidable count unchanged).
+    // The heightfield replaces the explicit flat ground seed at `orig_bodies`.
+    // `orig_bodies` is the source-body count because ordinary scenes do not carry
+    // an injected default plane.
     model.body_init.resize(orig_bodies);
     const uint32_t body_row = CookHeightfieldGrid(model, hf);
 
@@ -1390,9 +1450,7 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
     // per-collidable slot rate -- the SAME rule the body cook uses.
     cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
     cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
-    constexpr uint32_t kStaticCollidables = 1u;
-    const uint32_t rigid_base =
-        (orig_bodies + kStaticCollidables) * kCandidatePairsPerCollidable;
+    const uint32_t rigid_base = DefaultRigidCandidatePairs(cap.bodies_per_env);
     cap.max_contacts_per_env = rigid_base;
     SetRowCapacity(cap,
                    static_cast<uint64_t>(cap.max_contacts_per_env) *

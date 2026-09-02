@@ -238,6 +238,7 @@ struct MjcfParseContext {
     std::unordered_map<std::string, scene::BodyId> body_ids;
     std::unordered_map<std::string, scene::JointId> joint_ids;
     std::unordered_map<std::string, scene::MaterialId> material_ids;
+    std::unordered_map<std::string, std::string> texture_files;
     std::unordered_map<std::string, MjcfMeshAsset> mesh_assets;
     // Named geoms only: resolves a <contact><pair geom1=/geom2=> name to the
     // ShapeId returned by AddCollisionShape (v0.8 C1b).
@@ -472,10 +473,22 @@ bool MjcfSensorType(const std::string& tag, scene::SensorType& out) {
 
 void ParseMaterials(tinyxml2::XMLElement* mujoco,
                     scene::SceneIR& scene,
-                    MjcfParseContext& context) {
+                    MjcfParseContext& context,
+                    const std::filesystem::path& base_dir) {
     auto* asset = mujoco->FirstChildElement("asset");
     if (!asset) {
         return;
+    }
+
+    for (auto* texture = asset->FirstChildElement("texture");
+         texture != nullptr;
+         texture = texture->NextSiblingElement("texture")) {
+        const char* name = texture->Attribute("name");
+        const char* file = texture->Attribute("file");
+        if (name == nullptr || file == nullptr || file[0] == '\0') {
+            continue;
+        }
+        context.texture_files[name] = (base_dir / file).lexically_normal().string();
     }
 
     for (auto* material = asset->FirstChildElement("material");
@@ -492,6 +505,15 @@ void ParseMaterials(tinyxml2::XMLElement* mujoco,
         }
         material->QueryFloatAttribute("roughness", &record.roughness);
         material->QueryFloatAttribute("metallic", &record.metallic);
+        if (const char* texture_name = material->Attribute("texture")) {
+            const auto it = context.texture_files.find(texture_name);
+            if (it != context.texture_files.end()) {
+                record.albedo_map = it->second;
+                // Image materials prefer authored UVs; meshes without UVs still
+                // use the shader's triplanar fallback.
+                record.triplanar = false;
+            }
+        }
 
         const scene::MaterialId id = scene.AddMaterial(std::move(record));
         context.material_ids[scene.GetMaterial(id).name] = id;
@@ -730,6 +752,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
                 }
                 shape.mesh_vertices = std::move(geo.vertices);
                 shape.mesh_normals = std::move(geo.normals);
+                shape.mesh_uvs = std::move(geo.uvs);
                 shape.mesh_indices = std::move(geo.indices);
             }
         }
@@ -812,6 +835,10 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         jrec.damping = defaults.joint.damping;
         jrec.armature = defaults.joint.armature;
         jrec.frictionloss = defaults.joint.frictionloss;
+        // Nuka extension: author the cooked q0 explicitly. MJCF keyframes are
+        // intentionally not imported, so this keeps initial FK/colliders aligned
+        // before the first physics step without changing MuJoCo joint semantics.
+        joint->QueryFloatAttribute("nuka:initial_position", &jrec.initial_position);
         // A joint's own frictionloss attr overrides the resolved class default
         // (QueryFloatAttribute writes only on success -> absent leaves the default).
         joint->QueryFloatAttribute("frictionloss", &jrec.frictionloss);
@@ -1056,6 +1083,30 @@ void ParseContact(tinyxml2::XMLElement* mujoco,
     }
 }
 
+void ParseNukaEnvironment(tinyxml2::XMLElement* mujoco, scene::SceneIR& scene) {
+    // Nuka-only beauty metadata for generated MJCF scenes. It is deliberately a
+    // root child so source MuJoCo assets stay untouched and physics import is
+    // independent from presentation settings.
+    auto* element = mujoco->FirstChildElement("nuka_environment");
+    if (!element) {
+        return;
+    }
+
+    scene::EnvironmentRecord record;
+    bool enabled = false;
+    if (element->QueryBoolAttribute("use_scene_materials", &enabled) == tinyxml2::XML_SUCCESS) {
+        record.use_scene_materials = enabled;
+    }
+    element->QueryFloatAttribute("exposure_ev", &record.exposure_ev);
+    element->QueryFloatAttribute("grade", &record.grade);
+    element->QueryFloatAttribute("sun_disc", &record.sun_disc);
+    bool specular = false;
+    if (element->QueryBoolAttribute("specular_env", &specular) == tinyxml2::XML_SUCCESS) {
+        record.specular_env = specular;
+    }
+    scene.EnvironmentMut() = std::move(record);
+}
+
 } // namespace
 
 scene::SceneIR LoadMjcf(const std::string& path) {
@@ -1080,7 +1131,8 @@ scene::SceneIR LoadMjcf(const std::string& path) {
     MjcfParseContext context;
 
     ParseDefaults(mujoco, context);
-    ParseMaterials(mujoco, scene, context);
+    ParseMaterials(mujoco, scene, context, std::filesystem::path(path).parent_path());
+    ParseNukaEnvironment(mujoco, scene);
     ParseMeshAssets(mujoco, context, std::filesystem::path(path).parent_path());
     ParseLights(worldbody, scene);
 

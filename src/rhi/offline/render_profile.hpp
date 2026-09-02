@@ -59,19 +59,19 @@ struct RenderProfile {
     }
 
     // A Sensor profile producing the batched per-env AOV tensor at the given
-    // per-sensor resolution. The cheap sensor shade (1spp, one hard shadow ray, no
-    // AO, no GI) is the FP32 path the batched trace runs; the controls are set here
-    // as the single source of truth for what that profile means.
+    // per-sensor resolution. RGB uses the persistent high-quality FP32 path:
+    // textured materials, MSAA, soft shadows, AO/GI, ACES and sRGB. The controls
+    // are set here as the single source of truth for that sensor profile.
     static RenderProfile Sensor(uint32_t width, uint32_t height) {
         RenderProfile p;
         p.output = RenderOutput::Sensor;
         p.determinism = Determinism::Golden;
         p.image_width = width;
         p.image_height = height;
-        p.beauty.samples = 1u;       // 1spp
-        p.beauty.shadow_rays = 1u;   // one hard shadow ray
-        p.beauty.ao_samples = 0u;    // no ambient occlusion
-        p.beauty.gi_bounces = 0u;    // no indirect bounce
+        p.beauty.samples = 16u;
+        p.beauty.shadow_rays = 12u;
+        p.beauty.ao_samples = 8u;
+        p.beauty.gi_bounces = 1u;
         return p;
     }
 };

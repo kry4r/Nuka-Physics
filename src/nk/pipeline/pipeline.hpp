@@ -95,6 +95,7 @@ private:
     // reallocates (each op is emitted at most once). Plain value members keep
     // the addresses stable for the Pipeline's lifetime.
     phi::ApplyDrivesParams            p_apply_drives_{};
+    phi::ApplyOscDrivesParams         p_apply_osc_{};
     phi::AbaForwardParams             p_aba_{};
     phi::IntegrateVelocityParams      p_int_vel_{};
     phi::FkWorldPosesParams           p_fk_{};

@@ -502,7 +502,7 @@ nuka_result_t nuka_world_create_from_built_scene(
         const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
             std::move(cooked.model), std::move(built), std::move(cooked_terrain),
             device_record, desc->fixed_dt, desc->env_count, control_mode, gravity,
-            out, options ? options->solver_vel_iters : 0u,
+            desc->osc_task_link, out, options ? options->solver_vel_iters : 0u,
             options ? options->solver_pos_iters : 0u,
             options ? options->solver_contact_margin : 0.0f,
             options ? options->solver_max_pairs : 0u);

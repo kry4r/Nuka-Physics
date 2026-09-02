@@ -683,6 +683,7 @@ enum NkDrivePreset : uint32_t {
     kDrivePresetTorque   = 1u,
     kDrivePresetVelocity = 2u,
     kDrivePresetDamper   = 3u,
+    kDrivePresetOsc      = 4u,
 };
 
 __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
@@ -717,6 +718,11 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
         // gain=1, r1=0, b0=0 -> p = u (no q/qdot read -- identical to the legacy
         // ApplyTorqueDriveKernel, which set tau = torque_input directly).
         tau = u;
+    } else if (mode == kDrivePresetOsc) {
+        // OSC's first ABA is intentionally force-free. The dedicated
+        // ApplyOscDrives op consumes its qddot as the bias/gravity acceleration,
+        // writes compensated task torques, and is followed by the real ABA.
+        tau = 0.0f;
     } else if (mode == kDrivePresetVelocity) {
         // gain=Kd, r1=0 -> p = Kd*u; the -Kd*qdot completes via the implicit fold
         // (drive_damping == Kd), giving the Kd*(u-qdot) velocity servo. If the
@@ -760,7 +766,7 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     actuator_saturated[link] = requested_effort != tau ? 1.0f : 0.0f;
 
     // Direct generalized force is independent of actuator saturation.
-    if (joint_feedforward != nullptr) {
+    if (joint_feedforward != nullptr && mode != kDrivePresetOsc) {
         const float jf = joint_feedforward[link];
         if (jf != 0.0f) {
             tau += jf;
@@ -913,10 +919,462 @@ __device__ math::Transform RelativeTransform(const ArticulationDeviceState& stat
             QuatNormalize(QuatMul(local_pose.rotation,
                                   QuatFromAxisAngle(axis, state.q[link])));
     } else if (type == ArticulationJointType::Prismatic) {
-        relative.position =
-            AddVec(relative.position, ScaleVec(axis, state.q[link]));
+        relative.position = AddVec(
+            relative.position,
+            RotateByQuat(local_pose.rotation, ScaleVec(axis, state.q[link])));
     }
     return relative;
+}
+
+constexpr uint32_t kMaxOscDof = 18u;
+constexpr uint32_t kOscTaskDim = 6u;
+
+// Fixed-order dense SPD helpers used by the opt-in OSC kernel. The controller
+// is deliberately bounded to the historical 18-DOF drive tile; worlds above
+// that limit fail at the op boundary instead of silently truncating a matrix.
+__device__ void OscFactorSpd(const float* matrix, uint32_t n, uint32_t stride,
+                             float diagonal_regularization, float* ld,
+                             float* diagonal) {
+    for (uint32_t r = 0u; r < n; ++r) {
+        for (uint32_t c = 0u; c < n; ++c) {
+            ld[r * kMaxOscDof + c] = matrix[r * stride + c];
+        }
+        ld[r * kMaxOscDof + r] += diagonal_regularization;
+    }
+    for (uint32_t j = 0u; j < n; ++j) {
+        float djj = ld[j * kMaxOscDof + j];
+        for (uint32_t k = 0u; k < j; ++k) {
+            const float ljk = ld[j * kMaxOscDof + k];
+            djj -= ljk * ljk * diagonal[k];
+        }
+        djj = fmaxf(djj, kMinDiagonal);
+        diagonal[j] = djj;
+        for (uint32_t i = j + 1u; i < n; ++i) {
+            float lij = ld[i * kMaxOscDof + j];
+            for (uint32_t k = 0u; k < j; ++k) {
+                lij -= ld[i * kMaxOscDof + k] *
+                       ld[j * kMaxOscDof + k] * diagonal[k];
+            }
+            ld[i * kMaxOscDof + j] = lij / djj;
+        }
+    }
+}
+
+__device__ void OscSolveFactored(const float* ld, const float* diagonal,
+                                 uint32_t n, const float* rhs, float* solution) {
+    for (uint32_t i = 0u; i < n; ++i) {
+        float value = rhs[i];
+        for (uint32_t k = 0u; k < i; ++k) {
+            value -= ld[i * kMaxOscDof + k] * solution[k];
+        }
+        solution[i] = value;
+    }
+    for (uint32_t i = 0u; i < n; ++i) {
+        solution[i] /= diagonal[i];
+    }
+    for (uint32_t ii = n; ii > 0u; --ii) {
+        const uint32_t i = ii - 1u;
+        float value = solution[i];
+        for (uint32_t k = i + 1u; k < n; ++k) {
+            value -= ld[k * kMaxOscDof + i] * solution[k];
+        }
+        solution[i] = value;
+    }
+}
+
+__device__ void OscInvertSpd(const float* matrix, uint32_t n, uint32_t stride,
+                             float diagonal_regularization, float* inverse,
+                             uint32_t inverse_stride) {
+    float ld[kMaxOscDof * kMaxOscDof];
+    float diagonal[kMaxOscDof];
+    float rhs[kMaxOscDof];
+    float solution[kMaxOscDof];
+    OscFactorSpd(matrix, n, stride, diagonal_regularization, ld, diagonal);
+    for (uint32_t col = 0u; col < n; ++col) {
+        for (uint32_t r = 0u; r < n; ++r) {
+            rhs[r] = r == col ? 1.0f : 0.0f;
+            solution[r] = 0.0f;
+        }
+        OscSolveFactored(ld, diagonal, n, rhs, solution);
+        for (uint32_t r = 0u; r < n; ++r) {
+            inverse[r * inverse_stride + col] = solution[r];
+        }
+    }
+}
+
+// Opt-in robosuite-style operational-space control. The preceding force-free
+// ABA leaves qddot_free in state.qddot; CRBA leaves the current pure-physics
+// M^-1 in inertia_M_inv. This kernel reconstructs M, computes exact bias torque
+// -M*qddot_free, applies uncoupled position/orientation operational inertia,
+// and adds the mass-weighted initial-posture nullspace term used by robosuite.
+__global__ void ApplyOscPoseDriveKernel(
+    ArticulationDeviceState state, uint32_t max_dof, uint32_t task_link_local,
+    const float* inertia_M_inv, const math::Vec3* task_target,
+    const math::Quat* task_rotation_target,
+    const math::Transform* task_local_pose, const float* drive_target,
+    const float* drive_stiffness, const float* drive_damping,
+    const float* drive_force_limit, const float* joint_feedforward,
+    const float* snapshot_q, float* actuator_effort_requested,
+    float* actuator_effort, float* actuator_saturated) {
+    const uint32_t articulation = blockIdx.x;
+    if (articulation >= state.articulation_count || threadIdx.x != 0u) {
+        return;
+    }
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    if (count == 0u || task_link_local >= count) {
+        return;
+    }
+
+    uint32_t dof_to_link[kMaxOscDof];
+    uint8_t base_dof[kMaxOscDof];
+    uint32_t n = 0u;
+    for (uint32_t i = 0u; i < kMaxOscDof; ++i) {
+        base_dof[i] = 0u;
+    }
+    for (uint32_t local = 0u; local < count; ++local) {
+        const uint32_t link = offset + local;
+        const ArticulationJointType type = state.joint_type[link];
+        const uint32_t dof_count = JointDofCountDevice(type);
+        const uint32_t dof = LocalDofIndexDevice(state, offset, link);
+        if (type == ArticulationJointType::FloatingBase) {
+            for (uint32_t b = 0u; b < 6u && dof + b < max_dof; ++b) {
+                dof_to_link[dof + b] = link;
+                base_dof[dof + b] = 1u;
+                n = n > dof + b + 1u ? n : dof + b + 1u;
+            }
+        } else if (dof_count == 1u && dof < max_dof) {
+            dof_to_link[dof] = link;
+            n = n > dof + 1u ? n : dof + 1u;
+        }
+    }
+    if (n == 0u || n > kMaxOscDof) {
+        return;
+    }
+
+    const size_t tile_stride = static_cast<size_t>(max_dof) * max_dof;
+    const float* minv = inertia_M_inv +
+        static_cast<size_t>(articulation) * tile_stride;
+
+    // Recover the full M from CRBA's M^-1. This also lets the arm controller use
+    // the exact arm principal mass block, matching robosuite's joint-index slice
+    // while keeping gripper DOFs outside the task Jacobian.
+    float mass[kMaxOscDof * kMaxOscDof];
+    OscInvertSpd(minv, n, max_dof, 0.0f, mass, kMaxOscDof);
+
+    float qddot_free[kMaxOscDof];
+    float bias[kMaxOscDof];
+    for (uint32_t d = 0u; d < n; ++d) {
+        qddot_free[d] = state.joint_type[dof_to_link[d]] ==
+                                ArticulationJointType::FloatingBase
+                            ? state.link_acceleration[dof_to_link[d]].a[
+                                  d - LocalDofIndexDevice(state, offset, dof_to_link[d])]
+                            : state.qddot[dof_to_link[d]];
+    }
+    for (uint32_t r = 0u; r < n; ++r) {
+        float value = 0.0f;
+        for (uint32_t c = 0u; c < n; ++c) {
+            value -= mass[r * kMaxOscDof + c] * qddot_free[c];
+        }
+        bias[r] = value;
+    }
+
+    math::Transform local_task = task_local_pose[articulation];
+    const float local_norm_sq =
+        local_task.rotation.w * local_task.rotation.w +
+        local_task.rotation.x * local_task.rotation.x +
+        local_task.rotation.y * local_task.rotation.y +
+        local_task.rotation.z * local_task.rotation.z;
+    if (local_norm_sq <= 1.0e-12f) {
+        local_task.rotation = QuatIdentity();
+    }
+    const uint32_t task_link = offset + task_link_local;
+    const math::Transform task_pose =
+        ComposeTransform(state.link_pose[task_link], local_task);
+
+    // Build the 6xN geometric Jacobian at the configured local task frame.
+    float jacobian_full[kOscTaskDim * kMaxOscDof];
+    uint8_t chain_dof[kMaxOscDof];
+    for (uint32_t i = 0u; i < kOscTaskDim * kMaxOscDof; ++i) {
+        jacobian_full[i] = 0.0f;
+    }
+    for (uint32_t i = 0u; i < kMaxOscDof; ++i) {
+        chain_dof[i] = 0u;
+    }
+    uint32_t walk = task_link;
+    while (walk != kInvalidLink) {
+        const ArticulationJointType type = state.joint_type[walk];
+        const uint32_t dof_base = LocalDofIndexDevice(state, offset, walk);
+        if (type == ArticulationJointType::FloatingBase) {
+            const math::Quat root_rot = state.base_pose[articulation].rotation;
+            const math::Vec3 lever = mg::Sub(
+                task_pose.position, state.base_pose[articulation].position);
+            const math::Vec3 axes[3] = {
+                RotateByQuat(root_rot, {1.0f, 0.0f, 0.0f}),
+                RotateByQuat(root_rot, {0.0f, 1.0f, 0.0f}),
+                RotateByQuat(root_rot, {0.0f, 0.0f, 1.0f})};
+            for (uint32_t b = 0u; b < 3u; ++b) {
+                const uint32_t ad = dof_base + b;
+                const uint32_t ld = dof_base + 3u + b;
+                const math::Vec3 angular = Cross3(axes[b], lever);
+                if (ad < n) {
+                    jacobian_full[0u * kMaxOscDof + ad] = angular.x;
+                    jacobian_full[1u * kMaxOscDof + ad] = angular.y;
+                    jacobian_full[2u * kMaxOscDof + ad] = angular.z;
+                    jacobian_full[3u * kMaxOscDof + ad] = axes[b].x;
+                    jacobian_full[4u * kMaxOscDof + ad] = axes[b].y;
+                    jacobian_full[5u * kMaxOscDof + ad] = axes[b].z;
+                    chain_dof[ad] = 1u;
+                }
+                if (ld < n) {
+                    jacobian_full[0u * kMaxOscDof + ld] = axes[b].x;
+                    jacobian_full[1u * kMaxOscDof + ld] = axes[b].y;
+                    jacobian_full[2u * kMaxOscDof + ld] = axes[b].z;
+                    chain_dof[ld] = 1u;
+                }
+            }
+        } else if (JointDofCountDevice(type) == 1u) {
+            const uint32_t dof = dof_base;
+            if (dof < n) {
+                const math::Vec3 axis = RotateByQuat(
+                    state.link_pose[walk].rotation, state.joint_axis[walk]);
+                math::Vec3 linear = axis;
+                if (type != ArticulationJointType::Prismatic) {
+                    linear = Cross3(axis, mg::Sub(
+                        task_pose.position, state.link_pose[walk].position));
+                }
+                jacobian_full[0u * kMaxOscDof + dof] = linear.x;
+                jacobian_full[1u * kMaxOscDof + dof] = linear.y;
+                jacobian_full[2u * kMaxOscDof + dof] = linear.z;
+                if (type != ArticulationJointType::Prismatic) {
+                    jacobian_full[3u * kMaxOscDof + dof] = axis.x;
+                    jacobian_full[4u * kMaxOscDof + dof] = axis.y;
+                    jacobian_full[5u * kMaxOscDof + dof] = axis.z;
+                }
+                chain_dof[dof] = 1u;
+            }
+        }
+        const uint32_t parent_local = state.parent_link[walk];
+        walk = parent_local == kInvalidLink ? kInvalidLink : offset + parent_local;
+    }
+
+    uint32_t arm_dof[kMaxOscDof];
+    uint32_t arm_count = 0u;
+    walk = task_link;
+    while (walk != kInvalidLink) {
+        const ArticulationJointType type = state.joint_type[walk];
+        const uint32_t dof_base = LocalDofIndexDevice(state, offset, walk);
+        const uint32_t dof_count = JointDofCountDevice(type);
+        for (uint32_t b = 0u; b < dof_count && dof_base + b < n; ++b) {
+            arm_dof[arm_count++] = dof_base + b;
+        }
+        const uint32_t parent_local = state.parent_link[walk];
+        walk = parent_local == kInvalidLink ? kInvalidLink : offset + parent_local;
+    }
+    if (arm_count == 0u || arm_count > kMaxOscDof) {
+        return;
+    }
+
+    float arm_mass[kMaxOscDof * kMaxOscDof];
+    float arm_minv[kMaxOscDof * kMaxOscDof];
+    float jacobian[kOscTaskDim * kMaxOscDof];
+    for (uint32_t r = 0u; r < arm_count; ++r) {
+        for (uint32_t c = 0u; c < arm_count; ++c) {
+            arm_mass[r * kMaxOscDof + c] =
+                mass[arm_dof[r] * kMaxOscDof + arm_dof[c]];
+        }
+        for (uint32_t row = 0u; row < kOscTaskDim; ++row) {
+            jacobian[row * kMaxOscDof + r] =
+                jacobian_full[row * kMaxOscDof + arm_dof[r]];
+        }
+    }
+    OscInvertSpd(arm_mass, arm_count, kMaxOscDof, 0.0f,
+                 arm_minv, kMaxOscDof);
+
+    float task_velocity[kOscTaskDim] = {};
+    for (uint32_t row = 0u; row < kOscTaskDim; ++row) {
+        for (uint32_t a = 0u; a < arm_count; ++a) {
+            const uint32_t d = arm_dof[a];
+            const uint32_t link = dof_to_link[d];
+            float qd = state.qdot[link];
+            if (base_dof[d]) {
+                const uint32_t component =
+                    d - LocalDofIndexDevice(state, offset, link);
+                qd = state.link_velocity[link].v[component];
+            }
+            task_velocity[row] += jacobian[row * kMaxOscDof + a] * qd;
+        }
+    }
+
+    const math::Vec3 position_error =
+        mg::Sub(task_target[articulation], task_pose.position);
+    const math::Quat desired_quat_raw = task_rotation_target[articulation];
+    const float desired_norm_sq =
+        desired_quat_raw.w * desired_quat_raw.w +
+        desired_quat_raw.x * desired_quat_raw.x +
+        desired_quat_raw.y * desired_quat_raw.y +
+        desired_quat_raw.z * desired_quat_raw.z;
+    const bool control_orientation = desired_norm_sq > 1.0e-12f;
+    math::Vec3 orientation_error{};
+    if (control_orientation) {
+        const Mat3 current = RotationFromQuat(task_pose.rotation);
+        const Mat3 desired = RotationFromQuat(desired_quat_raw);
+        const math::Vec3 current_col[3] = {
+            {current.m[0], current.m[3], current.m[6]},
+            {current.m[1], current.m[4], current.m[7]},
+            {current.m[2], current.m[5], current.m[8]}};
+        const math::Vec3 desired_col[3] = {
+            {desired.m[0], desired.m[3], desired.m[6]},
+            {desired.m[1], desired.m[4], desired.m[7]},
+            {desired.m[2], desired.m[5], desired.m[8]}};
+        orientation_error = ScaleVec(
+            AddVec(AddVec(Cross3(current_col[0], desired_col[0]),
+                          Cross3(current_col[1], desired_col[1])),
+                   Cross3(current_col[2], desired_col[2])),
+            0.5f);
+    }
+
+    const float kp = drive_stiffness[task_link];
+    const float kd = drive_damping[task_link];
+    float desired_accel[kOscTaskDim] = {
+        kp * position_error.x - kd * task_velocity[0],
+        kp * position_error.y - kd * task_velocity[1],
+        kp * position_error.z - kd * task_velocity[2],
+        kp * orientation_error.x - kd * task_velocity[3],
+        kp * orientation_error.y - kd * task_velocity[4],
+        kp * orientation_error.z - kd * task_velocity[5]};
+
+    // Robosuite's default OSC uncouples position and orientation: invert the two
+    // 3x3 operational inertia blocks independently.
+    float task_wrench[kOscTaskDim] = {};
+    for (uint32_t block = 0u; block < (control_orientation ? 2u : 1u); ++block) {
+        float admittance[9] = {};
+        for (uint32_t r = 0u; r < 3u; ++r) {
+            for (uint32_t s = 0u; s < 3u; ++s) {
+                float value = 0.0f;
+                for (uint32_t a = 0u; a < arm_count; ++a) {
+                    for (uint32_t b = 0u; b < arm_count; ++b) {
+                        value += jacobian[(block * 3u + r) * kMaxOscDof + a] *
+                                 arm_minv[a * kMaxOscDof + b] *
+                                 jacobian[(block * 3u + s) * kMaxOscDof + b];
+                    }
+                }
+                admittance[r * 3u + s] = value;
+            }
+        }
+        float ld[kMaxOscDof * kMaxOscDof];
+        float diagonal[kMaxOscDof];
+        float rhs[kMaxOscDof] = {};
+        float solution[kMaxOscDof] = {};
+        for (uint32_t r = 0u; r < 3u; ++r) {
+            rhs[r] = desired_accel[block * 3u + r];
+        }
+        OscFactorSpd(admittance, 3u, 3u, 1.0e-7f, ld, diagonal);
+        OscSolveFactored(ld, diagonal, 3u, rhs, solution);
+        for (uint32_t r = 0u; r < 3u; ++r) {
+            task_wrench[block * 3u + r] = solution[r];
+        }
+    }
+
+    float task_torque[kMaxOscDof] = {};
+    const uint32_t task_rows = control_orientation ? 6u : 3u;
+    for (uint32_t a = 0u; a < arm_count; ++a) {
+        for (uint32_t row = 0u; row < task_rows; ++row) {
+            task_torque[a] +=
+                jacobian[row * kMaxOscDof + a] * task_wrench[row];
+        }
+    }
+
+    // Dynamically consistent nullspace N = I - Jbar*J, with the same initial
+    // posture acceleration and mass weighting as robosuite nullspace_torques().
+    float task_admittance[kOscTaskDim * kOscTaskDim] = {};
+    for (uint32_t r = 0u; r < task_rows; ++r) {
+        for (uint32_t s = 0u; s < task_rows; ++s) {
+            float value = 0.0f;
+            for (uint32_t a = 0u; a < arm_count; ++a) {
+                for (uint32_t b = 0u; b < arm_count; ++b) {
+                    value += jacobian[r * kMaxOscDof + a] *
+                             arm_minv[a * kMaxOscDof + b] *
+                             jacobian[s * kMaxOscDof + b];
+                }
+            }
+            task_admittance[r * kOscTaskDim + s] = value;
+        }
+    }
+    float lambda_full[kOscTaskDim * kOscTaskDim] = {};
+    OscInvertSpd(task_admittance, task_rows, kOscTaskDim, 1.0e-7f,
+                 lambda_full, kOscTaskDim);
+    float jbar[kMaxOscDof * kOscTaskDim] = {};
+    for (uint32_t a = 0u; a < arm_count; ++a) {
+        for (uint32_t r = 0u; r < task_rows; ++r) {
+            float value = 0.0f;
+            for (uint32_t s = 0u; s < task_rows; ++s) {
+                float minv_jt = 0.0f;
+                for (uint32_t b = 0u; b < arm_count; ++b) {
+                    minv_jt += arm_minv[a * kMaxOscDof + b] *
+                               jacobian[s * kMaxOscDof + b];
+                }
+                value += minv_jt * lambda_full[s * kOscTaskDim + r];
+            }
+            jbar[a * kOscTaskDim + r] = value;
+        }
+    }
+    float pose_torque[kMaxOscDof] = {};
+    constexpr float kNullKp = 10.0f;
+    constexpr float kNullKd = 6.32455532f;
+    for (uint32_t r = 0u; r < arm_count; ++r) {
+        for (uint32_t c = 0u; c < arm_count; ++c) {
+            const uint32_t link = dof_to_link[arm_dof[c]];
+            const float accel = base_dof[arm_dof[c]]
+                ? 0.0f
+                : kNullKp * (snapshot_q[link] - state.q[link]) -
+                      kNullKd * state.qdot[link];
+            pose_torque[r] += arm_mass[r * kMaxOscDof + c] * accel;
+        }
+    }
+    float null_torque[kMaxOscDof] = {};
+    for (uint32_t a = 0u; a < arm_count; ++a) {
+        for (uint32_t b = 0u; b < arm_count; ++b) {
+            float n_ba = b == a ? 1.0f : 0.0f;
+            for (uint32_t r = 0u; r < task_rows; ++r) {
+                n_ba -= jbar[b * kOscTaskDim + r] *
+                        jacobian[r * kMaxOscDof + a];
+            }
+            null_torque[a] += n_ba * pose_torque[b];
+        }
+    }
+
+    for (uint32_t d = 0u; d < n; ++d) {
+        const uint32_t link = dof_to_link[d];
+        float requested = bias[d];
+        if (chain_dof[d]) {
+            uint32_t a = 0u;
+            while (a < arm_count && arm_dof[a] != d) {
+                ++a;
+            }
+            if (a < arm_count) {
+                requested += task_torque[a] + null_torque[a];
+            }
+        } else {
+            // Gripper and other non-task-chain joints keep an independent joint
+            // servo while receiving the same inverse-dynamics bias compensation.
+            requested += drive_stiffness[link] *
+                             (drive_target[link] - state.q[link]) -
+                         drive_damping[link] * state.qdot[link];
+        }
+        float applied = requested;
+        const float limit = drive_force_limit[link];
+        if (limit > 0.0f) {
+            applied = fminf(fmaxf(applied, -limit), limit);
+        }
+        actuator_effort_requested[link] = requested;
+        actuator_effort[link] = applied;
+        actuator_saturated[link] = requested != applied ? 1.0f : 0.0f;
+        if (joint_feedforward != nullptr) {
+            applied += joint_feedforward[link];
+        }
+        state.tau[link] = applied;
+    }
 }
 
 __global__ void UpdateWorldLinkPosesKernel(ArticulationDeviceState state,
@@ -981,6 +1439,37 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
                data.actuator_saturated,
                p->mode,
                p->defer_velocity_damping != 0u);
+    return LaunchOk(stream);
+}
+
+Status OpApplyOscDrives(const ModelView& model, const DataView& data,
+                        const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ApplyOscDrivesParams*>(params);
+    if (p == nullptr || p->max_dof > kMaxOscDof) {
+        return Status::Failed;
+    }
+    if (p->articulation_count == 0u || p->total_link_count == 0u ||
+        p->max_dof == 0u) {
+        return Status::Ok;
+    }
+    if (data.m_inv == nullptr || data.task_target == nullptr ||
+        data.task_rotation_target == nullptr || data.task_local_pose == nullptr) {
+        return Status::Failed;
+    }
+    const ArticulationDeviceState state = MakeArticulationDeviceState(
+        model, data, p->total_link_count, p->articulation_count);
+    LaunchCuda(ApplyOscPoseDriveKernel, dim3(p->articulation_count), dim3(32u),
+               0u, stream, state, p->max_dof, p->task_link,
+               static_cast<const float*>(data.m_inv), data.task_target,
+               data.task_rotation_target, data.task_local_pose,
+               static_cast<const float*>(data.drive_target),
+               static_cast<const float*>(data.drive_stiffness),
+               static_cast<const float*>(data.drive_damping),
+               static_cast<const float*>(data.drive_force_limit),
+               static_cast<const float*>(data.joint_f),
+               static_cast<const float*>(data.snapshot_q),
+               data.actuator_effort_requested, data.actuator_effort,
+               data.actuator_saturated);
     return LaunchOk(stream);
 }
 
@@ -1113,6 +1602,7 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
 
 void RegisterNkAbaOps() {
     SetCudaOp(NkOp::ApplyDrives, &OpApplyDrives);
+    SetCudaOp(NkOp::ApplyOscDrives, &OpApplyOscDrives);
     SetCudaOp(NkOp::AbaForward, &OpAbaForward);
     SetCudaOp(NkOp::IntegrateVelocity, &OpIntegrateVelocity);
     SetCudaOp(NkOp::FkWorldPoses, &OpFkWorldPoses);

@@ -2,9 +2,9 @@
 // nuka::c_abi -- the device-resident batched camera-sensor surface.
 //
 // S cameras per env (each attach appends one mount) rendered into a single
-// (env_count, sensors_per_env, height, width, channels) device AOV tensor via the
-// SAME RT tracer at a cheap sensor profile -- the in-the-loop obs the RL stack
-// reads zero-copy (nuka_world_get_sensor_view + torch.from_dlpack). No host download.
+// (env_count, sensors_per_env, height, width, channels) device AOV tensor using
+// the persistent high-quality sensor trace. The in-the-loop observation stack
+// reads zero-copy (nuka_world_get_sensor_view + torch.from_dlpack); no host download.
 //
 // THE COOK BRIDGE: the per-env visual binding (which mesh/material each visual
 // instance is + the link/body it follows + its physics->visual offset) is built
@@ -274,9 +274,7 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
             attach->backend->SetRenderDr(attach->handle, carry_dr,
                                          record->world->EnvCount());
         }
-        if (carry_fid.Enabled()) {
-            attach->backend->SetSensorFidelity(attach->handle, carry_fid);
-        }
+        attach->backend->SetSensorFidelity(attach->handle, carry_fid);
         attach->backend->SetSensorAovMask(attach->handle, carry_aov_mask);
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
@@ -371,9 +369,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
             attach->backend->SetRenderDr(attach->handle, carry_dr,
                                          record->world->EnvCount());
         }
-        if (carry_fid.Enabled()) {
-            attach->backend->SetSensorFidelity(attach->handle, carry_fid);
-        }
+        attach->backend->SetSensorFidelity(attach->handle, carry_fid);
         attach->backend->SetSensorAovMask(attach->handle, carry_aov_mask);
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
@@ -694,13 +690,11 @@ nuka_result_t nuka_world_set_camera_intrinsics(
         s.handle = handle;
         s.sensors = std::move(rebuilt.sensors);
         s.rendered = false;
-        // Re-apply the retained per-env DR + shading fidelity onto the fresh scene.
+        // Re-apply the retained per-env DR + default high-quality sensor profile.
         if (s.render_dr.enabled) {
             s.backend->SetRenderDr(s.handle, s.render_dr, record->world->EnvCount());
         }
-        if (s.fidelity.Enabled()) {
-            s.backend->SetSensorFidelity(s.handle, s.fidelity);
-        }
+        s.backend->SetSensorFidelity(s.handle, s.fidelity);
         s.backend->SetSensorAovMask(s.handle, s.aov_mask);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -722,25 +716,36 @@ nuka_result_t nuka_world_set_sensor_fidelity(
         return NUKA_RESULT_NOT_SUPPORTED;  // no camera attached -> no scene to set.
     }
 
-    // A NULL desc restores the cheap shade (a byte no-op). Sample counts are capped
-    // here so an over-cap profile is rejected INVALID_ARG (not a hung launch).
-    nuka::rt::SensorFidelityConfig cfg;  // default == cheap shade
+    // A NULL or all-zero descriptor selects the default high-quality profile.
+    // Nonzero descriptors tune the profile, but never select a cheap renderer.
+    nuka::rt::SensorFidelityConfig cfg;
+    const bool default_profile =
+        desc == nullptr ||
+        (desc->spp == 0u && desc->shadow_samples == 0u &&
+         desc->sun_angular_radius == 0.0f && desc->ao_enabled == 0 &&
+         desc->ao_samples == 0u && desc->ao_radius == 0.0f &&
+         desc->gi_enabled == 0 && desc->tonemap_enabled == 0 &&
+         desc->srgb_enabled == 0 && desc->sky_intensity == 0.0f &&
+         desc->fog_density == 0.0f && desc->seed == 0u);
     if (desc != nullptr) {
         if (desc->spp > 256u || desc->shadow_samples > 256u ||
             desc->ao_samples > 256u) {
             return NUKA_RESULT_INVALID_ARG;
         }
-        cfg.spp = desc->spp < 1u ? 1u : desc->spp;
-        cfg.shadow_samples = desc->shadow_samples;
-        if (desc->sun_angular_radius > 0.0f) cfg.sun_angular_radius = desc->sun_angular_radius;
-        cfg.ao_enabled = desc->ao_enabled != 0;
-        if (desc->ao_samples > 0u) cfg.ao_samples = desc->ao_samples;
-        if (desc->ao_radius > 0.0f) cfg.ao_radius = desc->ao_radius;
-        cfg.gi_enabled = desc->gi_enabled != 0;
-        cfg.tonemap_enabled = desc->tonemap_enabled != 0;
-        if (desc->sky_intensity > 0.0f) cfg.sky_intensity = desc->sky_intensity;
-        cfg.fog_density = desc->fog_density;
-        cfg.seed = desc->seed;
+        if (!default_profile) {
+            cfg.spp = desc->spp < 1u ? 1u : desc->spp;
+            cfg.shadow_samples = desc->shadow_samples;
+            if (desc->sun_angular_radius > 0.0f) cfg.sun_angular_radius = desc->sun_angular_radius;
+            cfg.ao_enabled = desc->ao_enabled != 0;
+            if (desc->ao_samples > 0u) cfg.ao_samples = desc->ao_samples;
+            if (desc->ao_radius > 0.0f) cfg.ao_radius = desc->ao_radius;
+            cfg.gi_enabled = desc->gi_enabled != 0;
+            cfg.tonemap_enabled = desc->tonemap_enabled != 0;
+            cfg.srgb_enabled = desc->srgb_enabled != 0;
+            if (desc->sky_intensity > 0.0f) cfg.sky_intensity = desc->sky_intensity;
+            cfg.fog_density = desc->fog_density;
+            cfg.seed = desc->seed;
+        }
     }
 
     try {

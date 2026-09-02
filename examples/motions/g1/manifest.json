@@ -1,0 +1,31 @@
+{
+  "dataset": "G1 Moves",
+  "dataset_revision": "895d064b2385725e6aabf540461c219afc3e0916",
+  "code_revision": "475fdae98dcf18f96ebd3d0566d12fdefbaf2f0f",
+  "mjlab_revision": "e788f2932ecee6dda58a0adb1ee81beaa7c5e5f6",
+  "clip": "J_Dance17_Shuffle",
+  "npz": ".nuka-assets/src/g1-moves/dance/J_Dance17_Shuffle/training/J_Dance17_Shuffle.npz",
+  "npz_sha256": "3739840561a55d3fd76d0d7b2f2da1a96f4bfa37a5b2d03c425345408e147d01",
+  "fps": 60,
+  "frames": 1921,
+  "joint_count": 29,
+  "root_quaternion": "wxyz",
+  "policy": ".nuka-assets/src/g1-moves/dance/J_Dance17_Shuffle/policy/J_Dance17_Shuffle_policy.onnx",
+  "policy_sha256": "0ff13e1bf61bd6701aadf1da7a422bde0f2ad3a9d82099b18d34149be487b1af",
+  "onnx_input": "obs float32[batch,160]",
+  "onnx_output": "actions float32[batch,29] (raw mjlab actor action)",
+  "postprocess": "target = default_joint_pos + action_scale * actions",
+  "control": "Nuka PD position, 200 Hz physics, 50 Hz policy",
+  "observation_order": [
+    "reference_joint_position[29]",
+    "reference_joint_velocity[29]",
+    "torso_anchor_position_body[3]",
+    "torso_anchor_orientation_first_two_columns_row_major[6]",
+    "base_linear_velocity_body[3]",
+    "base_angular_velocity_body[3]",
+    "joint_position_minus_default[29]",
+    "joint_velocity[29]",
+    "previous_raw_action[29]"
+  ],
+  "sim2sim_adapter": "Source proxy capsules are removed and replaced by one thin box per foot in the generated Nuka scene; real visual meshes, inertias, joints, limits, and policy contract are unchanged."
+}
