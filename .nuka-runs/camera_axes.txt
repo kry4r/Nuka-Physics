@@ -1,0 +1,22 @@
+bowl world start: [-0.07500000298023224, 0.014999999664723873, 0.9700000286102295]
+raw framebuffer, no flip applied (x,y in 0..1 image coords)
+world x +0.25m -> image x 0.541 y 0.812
+world y +0.25m -> image x 0.829 y 0.523
+nanobind: leaked 1 instances!
+ - leaked instance 000002CF82CB5EA0 of type "nuka._nuka_ext.World"
+nanobind: leaked 1 types!
+ - leaked type "nuka._nuka_ext.World"
+nanobind: leaked 46 functions!
+ - leaked function "apply_sensor_noise"
+ - leaked function "__enter__"
+ - leaked function "state_hash"
+ - leaked function "set_render_dr"
+ - leaked function "reset"
+ - leaked function ""
+ - leaked function ""
+ - leaked function ""
+ - leaked function "sample_terrain_height"
+ - leaked function "render_beauty"
+ - ... skipped remainder
+nanobind: this is likely caused by a reference counting issue in the binding code.
+See https://nanobind.readthedocs.io/en/latest/refleaks.html
