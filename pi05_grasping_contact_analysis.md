@@ -44,8 +44,36 @@ cap.max_contacts_per_env = enable_contacts
 
 The existing `.nks` file at `.nuka-assets/generated/libero/libero_spatial_black_bowl.nks` was cooked with old code that set this to 0.
 
+### Steps to Fix
+1. **Rebuild Python extension** in WSL (where cmake/ninja are available):
+   ```bash
+   cd build-linux-python  # or build-win-python if using Windows tools
+   cmake --build . --target _nuka_ext
+   ```
+
+2. **Delete stale .nks file** to force recook:
+   ```bash
+   rm .nuka-assets/generated/libero/libero_spatial_black_bowl.nks
+   ```
+
+3. **Load from .xml source** - World.create_from_scene will automatically cook:
+   ```python
+   world = nuka.World.create_from_scene(
+       device,
+       ".nuka-assets/generated/libero/libero_spatial_black_bowl.xml",
+       env_count=1,
+       dt=0.005,
+       contact_family=2,  # PairDriven
+   )
+   ```
+
+4. **Verify contact capacity** - After successful load, the scene should have:
+   - `max_contacts_per_env = collidables * 4` (≈40 for 10-body scene)
+   - `rigid_slot_cap > 0` (allowing body-body collision detection)
+   - Non-zero contact geometry when fingers close on bowl
+
 ## Attempted Recook
-Recook attempt crashed during world creation (CUDA error or scene load failure). The crash needs investigation before the scene can be rebuilt with correct contact capacity.
+Initial recook attempt crashed, likely because the Python extension was using stale compiled code. The diagnostic code added to narrowphase_prims.cu wasn't executing because the installed Python package dated from August 21st.
 
 ## Diagnostic Artifacts
 - `diagnose_collision_pipeline.py`: Confirmed all contact geometry at (0,0,0)
