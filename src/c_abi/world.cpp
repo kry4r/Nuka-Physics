@@ -250,6 +250,14 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
     nuka::scene::cook::CookToModelResult cooked =
         nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
 
+    // Diagnostic: write cooked capacity to file
+    if (FILE* f = std::fopen("cooked_model_capacity.txt", "w")) {
+        std::fprintf(f, "bodies_per_env=%u\n", cooked.model.capacity.bodies_per_env);
+        std::fprintf(f, "max_contacts_per_env=%u\n", cooked.model.capacity.max_contacts_per_env);
+        std::fprintf(f, "collidables=%zu\n", cooked.model.collidables.size());
+        std::fclose(f);
+    }
+
     // Route control mode -> drive_mode, bake the optional heightfield collidable,
     // and resolve gravity (the post-cook step both create paths share).
     nuka::terrain::HeightField cooked_terrain;
