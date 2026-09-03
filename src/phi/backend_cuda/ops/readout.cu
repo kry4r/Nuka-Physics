@@ -79,6 +79,11 @@ __global__ void LegacyContactGeometryKernel(
     if (n > 0u) {
         out_contact_point[slot] = ucontact_point[slot * 4u];
         out_contact_normal[slot] = ucontact_normal[slot * 4u];
+        if (slot < 10) {
+            printf("LegacyContactGeometryKernel slot %u: n=%u pt=(%.4f,%.4f,%.4f)\n",
+                   slot, n, ucontact_point[slot*4u].x,
+                   ucontact_point[slot*4u].y, ucontact_point[slot*4u].z);
+        }
     } else {
         out_contact_point[slot] = {0.0f, 0.0f, 0.0f};
         out_contact_normal[slot] = {0.0f, 0.0f, 0.0f};
