@@ -1,0 +1,6 @@
+gray-structure centroid (x, y) in 0..1
+  reference : 0.58 0.33
+  nuka      : 0.52 0.32
+  dx -0.06  dy -0.01
+  same half x: True   same half y: True
+ORIENTATION MATCH
