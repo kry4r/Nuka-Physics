@@ -64,7 +64,30 @@ __forceinline__ __device__ float JitterDraw(Philox4x32Key key,
 
 // --- src/sensor/contact_wrench.cu (verbatim) --------------------------------
 
-// Per-slot contact force = lambda / dt (contact-basis components: {Fn,Ft1,Ft2}).
+// Populate legacy contact geometry fields from ucontact_* (PairDriven manifold).
+// Copies first valid manifold point to the per-slot contact_point/normal fields.
+__global__ void LegacyContactGeometryKernel(
+    const uint32_t* __restrict__ ucontact_count,
+    const Vec3* __restrict__ ucontact_point,   // elem:4 per slot
+    const Vec3* __restrict__ ucontact_normal,  // elem:4 per slot
+    uint32_t slot_count,
+    Vec3* __restrict__ out_contact_point,
+    Vec3* __restrict__ out_contact_normal) {
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= slot_count) return;
+    const uint32_t n = ucontact_count[slot];
+    if (n > 0u) {
+        out_contact_point[slot] = ucontact_point[slot * 4u];
+        out_contact_normal[slot] = ucontact_normal[slot * 4u];
+    } else {
+        out_contact_point[slot] = {0.0f, 0.0f, 0.0f};
+        out_contact_normal[slot] = {0.0f, 0.0f, 0.0f};
+    }
+}
+
+// Per-slot contact force = sum of normal impulses / dt. PairDriven assembles 12
+// rows per slot (4 manifold points × 3 spokes each); normal rows are at offsets
+// 0,3,6,9 within the slot's row block. Sum them to get total normal impulse.
 __global__ void ContactForceKernel(const float* __restrict__ lambda,
                                     uint32_t slot_count,
                                     float inv_dt,
@@ -73,10 +96,15 @@ __global__ void ContactForceKernel(const float* __restrict__ lambda,
     if (slot >= slot_count) {
         return;
     }
+    const uint32_t row_base = slot * 12u;  // 12 rows per slot
+    float fn = 0.0f;
+    for (uint32_t i = 0u; i < 4u; ++i) {
+        fn += lambda[row_base + i * 3u];  // normal rows: 0,3,6,9
+    }
     const uint32_t base = slot * kContactForceComponents;
-    out_contact_force[base + 0u] = lambda[base + 0u] * inv_dt;
-    out_contact_force[base + 1u] = lambda[base + 1u] * inv_dt;
-    out_contact_force[base + 2u] = lambda[base + 2u] * inv_dt;
+    out_contact_force[base + 0u] = fn * inv_dt;
+    out_contact_force[base + 1u] = 0.0f;  // no single tangent for 4-pt manifold
+    out_contact_force[base + 2u] = 0.0f;
 }
 
 // Net per-link contact wrench (world frame) over the ONE general (PairDriven)
@@ -368,6 +396,14 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
 
     constexpr uint32_t kBlock = 128u;
     const uint32_t force_grid = (slot_count + kBlock - 1u) / kBlock;
+
+    // Populate legacy contact geometry from ucontact_* (PairDriven manifold).
+    LaunchCuda(LegacyContactGeometryKernel, dim3(force_grid), dim3(kBlock), 0u, stream,
+               static_cast<const uint32_t*>(data.ucontact_count),
+               static_cast<const Vec3*>(data.ucontact_point),
+               static_cast<const Vec3*>(data.ucontact_normal),
+               slot_count, data.contact_point, data.contact_normal);
+
     LaunchCuda(ContactForceKernel, dim3(force_grid), dim3(kBlock), 0u, stream,
                static_cast<const float*>(data.lambda), slot_count, inv_dt,
                data.contact_force);
