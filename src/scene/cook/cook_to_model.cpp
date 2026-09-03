@@ -795,11 +795,18 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // than silently writing out of bounds. Terrain cooking recomputes the same
     // reserve after adding its explicit heightfield leaf.
     {
-        printf("[CookToModel] bodies_per_env=%u enable_contacts=%d\n",
-               cap.bodies_per_env, enable_contacts ? 1 : 0);
+        if (FILE* f = std::fopen("cook_contact_capacity.txt", "w")) {
+            std::fprintf(f, "bodies_per_env=%u\n", cap.bodies_per_env);
+            std::fprintf(f, "enable_contacts=%d\n", enable_contacts ? 1 : 0);
+            std::fprintf(f, "max_contacts_per_env_before=%u\n", cap.max_contacts_per_env);
+            std::fclose(f);
+        }
         cap.max_contacts_per_env = cap.bodies_per_env > 1u
             ? DefaultRigidCandidatePairs(cap.bodies_per_env) : 0u;
-        printf("[CookToModel] max_contacts_per_env=%u\n", cap.max_contacts_per_env);
+        if (FILE* f = std::fopen("cook_contact_capacity.txt", "a")) {
+            std::fprintf(f, "max_contacts_per_env_after=%u\n", cap.max_contacts_per_env);
+            std::fclose(f);
+        }
         SetRowCapacity(cap,
                        static_cast<uint64_t>(cap.max_contacts_per_env) *
                            nk::kPairDrivenRowsPerSlot);
