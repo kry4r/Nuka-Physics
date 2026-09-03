@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -794,8 +795,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // than silently writing out of bounds. Terrain cooking recomputes the same
     // reserve after adding its explicit heightfield leaf.
     {
+        printf("[CookToModel] bodies_per_env=%u enable_contacts=%d\n",
+               cap.bodies_per_env, enable_contacts ? 1 : 0);
         cap.max_contacts_per_env = cap.bodies_per_env > 1u
             ? DefaultRigidCandidatePairs(cap.bodies_per_env) : 0u;
+        printf("[CookToModel] max_contacts_per_env=%u\n", cap.max_contacts_per_env);
         SetRowCapacity(cap,
                        static_cast<uint64_t>(cap.max_contacts_per_env) *
                            nk::kPairDrivenRowsPerSlot);

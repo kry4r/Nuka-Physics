@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 
 #include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
@@ -55,6 +56,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     // dynamics and StepPlanned captures cleanly (no thrust LBVH mid-graph).
     const bool has_collidables  =
         (has_bodies || cap.links_per_env > 0) && cap.max_contacts_per_env > 0;
+    std::printf("[Pipeline] has_bodies=%d links_per_env=%u max_contacts_per_env=%u -> has_collidables=%d\n",
+                has_bodies, cap.links_per_env, cap.max_contacts_per_env, has_collidables);
     // deleted the FUSED runtime path; deleted the UnionCsr path. There
     // is now ONE general contact path: PairDriven. Every cooked model uses it.
     const uint32_t family = phi::kContactFamilyPairDriven;
@@ -382,6 +385,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_prim_.union_slot_count = cap.max_contacts_per_env;
         p_np_prim_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         p_np_prim_.bodies_per_env = cap.bodies_per_env;
+
+        // Diagnostic: write narrowphase params to file
+        if (FILE* f = std::fopen("narrowphase_params.txt", "w")) {
+            std::fprintf(f, "env_count=%u\n", p_np_prim_.env_count);
+            std::fprintf(f, "union_slot_count=%u\n", p_np_prim_.union_slot_count);
+            std::fprintf(f, "rigid_slot_cap=%u\n", p_np_prim_.rigid_slot_cap);
+            std::fprintf(f, "bodies_per_env=%u\n", p_np_prim_.bodies_per_env);
+            std::fprintf(f, "max_contacts_per_env=%u\n", cap.max_contacts_per_env);
+            std::fclose(f);
+        }
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
         p_np_prim_.particles_per_env = cap.particles_per_env;  // coupling slots.

@@ -256,7 +256,7 @@ class LiberoBlackBowlController:
             determinism=nuka.DETERMINISM_STRONG,
             control_mode=control_mode,
             osc_task_link=7,
-            contact_family=1,
+            contact_family=2,
             heightfield_terrain_type=0,
             solver_contact_margin=self.solver_contact_margin,
             solver_max_pairs=self.solver_max_pairs,

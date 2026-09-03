@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
+#include <cstdio>
 
 #include "math/cuda_vec_ops.cuh"
 #include "phi/backend_cuda/launch.cuh"
@@ -104,8 +105,8 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
         return Status::Failed;
     }
     if (p->family == kContactFamilyPairDriven) {
-        // M5 generalized family: candidate_pairs -> analytic prim dispatch
-        // (narrowphase_prims.cu). The ONE general narrowphase path.
+        printf("[OpNarrowphasePrimitives] env_count=%u union_slot_count=%u rigid_slot_cap=%u\n",
+               p->env_count, p->union_slot_count, p->rigid_slot_cap);
         return LaunchPairDrivenNarrowphase(model, data, *p, stream);
     }
     // L1-b deleted the legacy FUSED foot-vs-ground detection; L1-c deleted the

@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
+#include <cstdio>
 
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
