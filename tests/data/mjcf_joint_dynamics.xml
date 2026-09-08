@@ -1,0 +1,27 @@
+<mujoco model="joint_dynamics">
+  <default>
+    <joint damping="0.3" armature="0.01" frictionloss="0.075"/>
+    <default class="gripper">
+      <joint damping="10" armature="0.2" frictionloss="0.4"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="base">
+      <body name="root_defaults">
+        <joint name="root_defaults"/>
+      </body>
+      <body name="class_defaults" childclass="gripper">
+        <joint name="class_defaults"/>
+      </body>
+      <body name="explicit_values" childclass="gripper">
+        <joint name="explicit_values" damping="100" armature="1" frictionloss="1"/>
+      </body>
+      <body name="explicit_zero" childclass="gripper">
+        <joint name="explicit_zero" damping="0" armature="0" frictionloss="0"/>
+      </body>
+      <body name="partial_override">
+        <joint name="partial_override" class="gripper" damping="4"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

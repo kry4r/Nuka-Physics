@@ -231,7 +231,8 @@ def generate(output: Path = OUTPUT) -> dict:
     _add_material(
         asset,
         "libero_black",
-        "0.32 0.32 0.32 1",
+        # Preserve the authored texture colors with a white material multiplier.
+        "1 1 1 1",
         "0.24",
         texture=bowl_texture,
     )
@@ -365,6 +366,15 @@ def generate(output: Path = OUTPUT) -> dict:
     # that range to the menagerie body makes both fingers translate together.
     right_finger_joint.set("range", "0 0.04")
 
+    # Robosuite finger joints use armature 1, damping 100, and dry friction 1 N.
+    for finger_joint_name in ("finger_joint1", "finger_joint2"):
+        joint = worldbody.find(f".//joint[@name='{finger_joint_name}']")
+        if joint is None:
+            raise ValueError(f"Panda finger joint missing: {finger_joint_name}")
+        joint.set("armature", "1")
+        joint.set("damping", "100")
+        joint.set("frictionloss", "1")
+
     # Panda visual meshes remain unchanged; LIBERO's five collision pads are
     # added below with their source finger-local transforms.
     for body in worldbody.findall(".//body"):
@@ -400,10 +410,19 @@ def generate(output: Path = OUTPUT) -> dict:
         ("pad4", "0.003 0.002 0.0035", "0.0055 0.002 0.0395"),
         ("pad5", "0.003 0.002 0.0035", "-0.0055 0.002 0.0395"),
     )
+    # Five collision pads per finger provide the gripper's contact surfaces.
+    # Hand and finger meshes remain visual geometry.
     for finger_name in ("left_finger", "right_finger"):
         finger = link7.find(f"body[@name='{finger_name}']")
         if finger is None:
             raise ValueError(f"Panda finger missing after hand merge: {finger_name}")
+        # Use the robosuite finger mass, center of mass, and principal inertia.
+        finger_inertial = finger.find("inertial")
+        if finger_inertial is None:
+            raise ValueError(f"Panda finger inertial missing: {finger_name}")
+        finger_inertial.set("mass", "0.1")
+        finger_inertial.set("pos", "0 0 0.05")
+        finger_inertial.set("diaginertia", "0.01 0.01 0.005")
         for pad_name, size, pos in pad_specs:
             _geom(
                 finger,
@@ -411,10 +430,9 @@ def generate(output: Path = OUTPUT) -> dict:
                 type="box",
                 size=size,
                 pos=pos,
-                friction="0.95 0.3 0.1",
-                solref="0.001 1",
-                solimp="0.998 0.998 0.001",
-                priority="1",
+                # Robosuite pads use friction 2 and the (0.01, 0.5) contact reference.
+                friction="2 0.05 0.0001",
+                solref="0.01 0.5",
             )
 
     for tag in ("tendon", "equality", "actuator", "keyframe", "contact"):
@@ -722,8 +740,12 @@ def generate(output: Path = OUTPUT) -> dict:
         )
 
     for attrs in (
-        {"name": "libero_key", "pos": "0.32 -0.28 2.2", "dir": "-0.16 0.12 -1"},
-        {"name": "libero_fill", "pos": "-0.45 0.45 1.9", "dir": "0.2 -0.1 -1"},
+        # Scale light intensity by pi to match fixed-function diffuse brightness.
+        # The engine's Lambert term divides intensity by pi.
+        {"name": "light1", "pos": "1 1 4", "diffuse": "0.8 0.8 0.8",
+         "intensity": "3.14159265"},
+        {"name": "light2", "pos": "-3 -3 4", "diffuse": "0.8 0.8 0.8",
+         "intensity": "3.14159265"},
     ):
         ET.SubElement(worldbody, "light", attrs)
 

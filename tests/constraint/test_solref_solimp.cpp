@@ -218,6 +218,7 @@ TEST(SolrefSolimp, FunctionMatchesHandEvaluatedTable) {
             c.refsafe);
         EXPECT_EQ(std::memcmp(&row.R, &t.R, sizeof(float)), 0) << c.name;
         EXPECT_EQ(std::memcmp(&row.aref_bias, &t.aref, sizeof(float)), 0) << c.name;
+        EXPECT_EQ(std::memcmp(&row.damping, &t.b, sizeof(float)), 0) << c.name;
     }
 }
 

@@ -130,6 +130,16 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
     // (+XpbdProject / PbfDensityLambda inline) -> IntegratePosition
     // (+ParticleFinalize) -> ReadoutContactWrench.
 
+    if (has_contacts) {
+        p_step_velocity_.env_count = env_count;
+        p_step_velocity_.articulation_count = articulation_cnt;
+        p_step_velocity_.max_dof = max_dof;
+        p_step_velocity_.base_link_count = base_link_count;
+        p_step_velocity_.total_body_count = cap.bodies_per_env * env_count;
+        p_step_velocity_.total_particle_count = cap.particles_per_env * env_count;
+        add(phi::NkOp::SnapshotStepVelocity, &p_step_velocity_);
+    }
+
     if (has_articulation) {
         p_apply_drives_.dt = cfg.dt;
         p_apply_drives_.total_link_count = total_link_count;
@@ -522,6 +532,8 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_assemble_.union_slot_count = cap.max_contacts_per_env;
         p_assemble_.rows_per_env = cap.max_rows_per_env;
         p_assemble_.contact_rows_per_env = contact_rows_per_env;
+        p_assemble_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
+        p_assemble_.joint_friction_rows_per_env = cap.joint_friction_rows_per_env;
         // Layout follows the slot provider, not the particle solver mode: rigid
         // candidates are 4-point manifolds, the reserved sphere-particle tail is
         // one point. With no reserve rigid_cap == the full slot stride.
@@ -636,6 +648,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_solve_.articulation_count = articulation_cnt;
         p_solve_.rows_per_env = cap.max_rows_per_env;
         p_solve_.contact_rows_per_env = contact_rows_per_env;
+        p_solve_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
         p_solve_.base_link_count = base_link_count;
         p_solve_.total_body_count = cap.bodies_per_env * env_count;
         p_solve_.friction_coefficient = model.friction_coefficient;
@@ -708,6 +721,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_readout_.base_link_count = base_link_count;
         p_readout_.max_contacts_per_env = cap.max_contacts_per_env;
         p_readout_.rows_per_env = cap.max_rows_per_env;
+        p_readout_.full_row_slot_count = rigid_cap;
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }
 

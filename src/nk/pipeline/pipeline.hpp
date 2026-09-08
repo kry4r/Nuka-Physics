@@ -98,6 +98,7 @@ private:
     phi::ApplyOscDrivesParams         p_apply_osc_{};
     phi::AbaForwardParams             p_aba_{};
     phi::IntegrateVelocityParams      p_int_vel_{};
+    phi::SnapshotStepVelocityParams   p_step_velocity_{};
     phi::FkWorldPosesParams           p_fk_{};
     phi::IntegratePositionParams      p_int_pos_{};
     phi::CrbaComputeMParams           p_crba_m_{};

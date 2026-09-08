@@ -1,0 +1,15 @@
+<mujoco model="osc_passive_damping">
+  <worldbody>
+    <body name="base">
+      <inertial pos="0 0 0" mass="0" diaginertia="1 1 1"/>
+      <body name="hand">
+        <joint name="hand_x" type="slide" axis="1 0 0"/>
+        <inertial pos="0 0 0" mass="1" diaginertia="1 1 1"/>
+        <body name="finger">
+          <joint name="finger_y" type="slide" axis="0 1 0" armature="1" damping="100"/>
+          <inertial pos="0 0 0" mass="0.1" diaginertia="0.01 0.01 0.01"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

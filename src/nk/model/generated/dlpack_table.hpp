@@ -115,6 +115,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ChainJacobian, DlpackDtype::kF32, 1, false, false},  // chain_jacobian
     {FieldId::RowMinvJt, DlpackDtype::kF32, 1, false, false},  // row_minv_jt
     {FieldId::RowMeff, DlpackDtype::kF32, 1, false, false},  // row_meff
+    {FieldId::RowDamping, DlpackDtype::kF32, 1, false, false},  // row_damping
     {FieldId::RowCjLink, DlpackDtype::kU32, 1, false, false},  // row_cj_link
     {FieldId::RowCjPoint, DlpackDtype::kF32, 2, false, false},  // row_cj_point
     {FieldId::RowCjDir, DlpackDtype::kF32, 2, false, false},  // row_cj_dir
@@ -280,6 +281,16 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::TaskTarget, DlpackDtype::kF32, 2, false, false},  // task_target
     {FieldId::TaskRotationTarget, DlpackDtype::kF32, 2, false, false},  // task_rotation_target
     {FieldId::TaskLocalPose, DlpackDtype::kF32, 2, false, false},  // task_local_pose
+    {FieldId::BodyInertialFrame, DlpackDtype::kF32, 2, false, false},  // body_inertial_frame
+    {FieldId::BodyWorldInvInertia, DlpackDtype::kF32, 2, false, false},  // body_world_inv_inertia
+    {FieldId::StepQdotFlat, DlpackDtype::kF32, 1, false, false},  // step_qdot_flat
+    {FieldId::StepBodyLinearVelocity, DlpackDtype::kF32, 2, false, false},  // step_body_linear_velocity
+    {FieldId::StepBodyAngularVelocity, DlpackDtype::kF32, 2, false, false},  // step_body_angular_velocity
+    {FieldId::StepParticleVelocity, DlpackDtype::kF32, 2, false, false},  // step_particle_velocity
+    {FieldId::ContactSideAKind, DlpackDtype::kU32, 1, false, true},  // contact_side_a_kind
+    {FieldId::ContactSideBKind, DlpackDtype::kU32, 1, false, true},  // contact_side_b_kind
+    {FieldId::ContactSideAIndex, DlpackDtype::kU32, 1, false, true},  // contact_side_a_index
+    {FieldId::ContactSideBIndex, DlpackDtype::kU32, 1, false, true},  // contact_side_b_index
 };
 
 } // namespace nuka::nk

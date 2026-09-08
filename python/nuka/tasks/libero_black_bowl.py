@@ -61,6 +61,9 @@ PANDA_KP = np.array([600, 600, 500, 500, 360, 240, 160, 80, 80], dtype=np.float3
 PANDA_KD = np.array([46, 46, 38, 38, 28, 20, 14, 7, 7], dtype=np.float32)
 PANDA_FORCE_LIMIT = np.array([87, 87, 87, 87, 12, 12, 12, 20, 20], dtype=np.float32)
 PANDA_PD_GAIN_SCALE = 10.0
+# Gripper actuation uses gain 1000 and a 20 N force limit.
+# Passive joint damping and friction remain in the physics model.
+PANDA_GRIPPER_KP = 1000.0
 LIBERO_OSC_KP = 150.0
 LIBERO_OSC_KD = 2.0 * np.sqrt(LIBERO_OSC_KP)
 LIBERO_SOLVER_CONTACT_MARGIN = 0.003
@@ -104,6 +107,9 @@ LIBERO_WRIST_CAMERA_LOCAL = (
 )
 LIBERO_AGENT_FOV = 45.0
 LIBERO_WRIST_FOV = 75.0
+# Mirror upright Nuka images to match the LIBERO processor's camera convention.
+# Dim -2 is image width.
+LIBERO_POLICY_CAMERA_FLIP = (-2,)
 # Replay-only camera on the wall-free +Y side, close enough to show most of the
 # arm and the whole tabletop. Never part of the policy observation.
 LIBERO_THIRD_PERSON_EYE = np.array(
@@ -206,7 +212,8 @@ class LiberoBlackBowlController:
         scene: str | Path,
         device: nuka.Device,
         *,
-        dt: float = 0.005,
+        # LIBERO uses 500 Hz physics substeps.
+        dt: float = 0.002,
         control_backend: str = "joint_pd",
         render_quality: str = "high",
         solver_contact_margin: float = LIBERO_SOLVER_CONTACT_MARGIN,
@@ -217,6 +224,8 @@ class LiberoBlackBowlController:
         agent_camera_local: tuple[float, ...] = LIBERO_AGENT_CAMERA_LOCAL,
         agent_camera_mount: int = nuka.SensorMount.BASE.value,
         agent_camera_index: int = 0,
+        enable_histogram_matching: bool = False,
+        histogram_reference_dir: str | None = None,
     ):
         if control_backend not in CONTROL_BACKENDS:
             raise ValueError(
@@ -243,6 +252,12 @@ class LiberoBlackBowlController:
         self.agent_camera_index = int(agent_camera_index)
         if self.solver_contact_margin < 0.0 or self.solver_max_pairs < 0:
             raise ValueError("solver overrides must be non-negative")
+        self._enable_histogram_matching = enable_histogram_matching
+        if enable_histogram_matching:
+            if histogram_reference_dir is None:
+                raise ValueError("histogram_reference_dir required when enable_histogram_matching=True")
+            from nuka.vla.visual_adaptation import LiberoVisualAdapter
+            self._visual_adapter = LiberoVisualAdapter(histogram_reference_dir)
         control_mode = (
             nuka.CONTROL_MODE_OSC
             if control_backend == "osc"
@@ -357,12 +372,8 @@ class LiberoBlackBowlController:
             # limits stay physical; the two fingers retain independent joint PD.
             self.drive_kp[0, 7] = LIBERO_OSC_KP
             self.drive_kd[0, 7] = LIBERO_OSC_KD
-            self.drive_kp[0, 8:10] = torch.as_tensor(
-                PANDA_KP[7:] * PANDA_PD_GAIN_SCALE, device=self.q.device
-            )
-            self.drive_kd[0, 8:10] = torch.as_tensor(
-                PANDA_KD[7:] * np.sqrt(PANDA_PD_GAIN_SCALE), device=self.q.device
-            )
+            self.drive_kp[0, 8:10] = PANDA_GRIPPER_KP
+            self.drive_kd[0, 8:10] = 0.0
             self.drive_limit[:, 1:] = torch.as_tensor(
                 PANDA_FORCE_LIMIT, device=self.q.device
             )
@@ -391,6 +402,11 @@ class LiberoBlackBowlController:
             self.drive_limit[:, 1:] = torch.as_tensor(
                 PANDA_FORCE_LIMIT * PANDA_PD_GAIN_SCALE, device=self.q.device
             )
+        # The gripper keeps official parity in both backends: kp 1000, no
+        # actuator kd, +-20 N (the x10 PD-scale hack is arm-only).
+        self.drive_kp[..., 8:10] = PANDA_GRIPPER_KP
+        self.drive_kd[..., 8:10] = 0.0
+        self.drive_limit[..., 8:10] = 20.0
         nuka.sync()
 
     def eef_pose(self) -> torch.Tensor:
@@ -440,39 +456,25 @@ class LiberoBlackBowlController:
             LIBERO_CAMERA_SIZE,
         )
         self.world.set_sensor_aov_mask(int(nuka.SensorAov.COLOR))
-        if self.render_quality == "ultra":
-            fidelity = dict(
-                spp=32,
-                shadow_samples=24,
-                ao_enabled=True,
-                ao_samples=16,
-                gi_enabled=True,
-            )
-        elif self.render_quality == "high":
-            fidelity = dict(
-                spp=16,
-                shadow_samples=12,
-                ao_enabled=True,
-                ao_samples=8,
-                gi_enabled=True,
-            )
-        else:
-            fidelity = dict(
-                spp=4,
-                shadow_samples=4,
-                ao_enabled=True,
-                ao_samples=3,
-                gi_enabled=True,
-            )
+        # Policy cameras use untonemapped direct lighting without shadows or AO/GI.
+        # Render quality controls the sample count.
+        spp = {"ultra": 32, "high": 16, "preview": 4}[self.render_quality]
+        fidelity = dict(
+            spp=spp,
+            shadow_samples=0,
+            ao_enabled=False,
+            ao_samples=0,
+            gi_enabled=False,
+        )
         self.world.set_sensor_fidelity(
             **fidelity,
-            tonemap_enabled=True,
-            sky_intensity=0.01,
+            tonemap_enabled=False,
+            sky_intensity=0.0,
             seed=0x4C494245,
         )
         self._cameras_attached = True
 
-    def camera_images(self) -> torch.Tensor:
+    def camera_images(self, *, apply_histogram_matching: bool = False) -> torch.Tensor:
         """Return only the two policy cameras in checkpoint order."""
         self.attach_policy_cameras()
         self.world.render_sensors()
@@ -485,9 +487,25 @@ class LiberoBlackBowlController:
             raise RuntimeError(
                 f"unexpected LIBERO camera shape: {tuple(self._camera_tensor.shape)}"
             )
-        # Both streams pass through raw: the checkpoint's LIBERO processor applies
-        # its own camera-orientation rotation, so flipping here double-corrects.
-        return self._camera_tensor[0]
+        frames = self._camera_tensor[0]
+        result = torch.stack(
+            (
+                torch.flip(frames[0], dims=LIBERO_POLICY_CAMERA_FLIP),
+                torch.flip(frames[1], dims=LIBERO_POLICY_CAMERA_FLIP),
+            )
+        )
+        if apply_histogram_matching and hasattr(self, "_visual_adapter"):
+            agent_np = (result[0].cpu().numpy() * 255).clip(0, 255).astype("uint8")
+            wrist_np = (result[1].cpu().numpy() * 255).clip(0, 255).astype("uint8")
+            result = torch.stack(
+                (
+                    self._visual_adapter.adapt_agentview(agent_np).float().div_(255.0).to(result.device),
+                    self._visual_adapter.adapt_eye_in_hand(wrist_np).float().div_(255.0).to(result.device),
+                )
+            )
+        elif apply_histogram_matching:
+            raise RuntimeError("histogram matching requested but adapter not initialized")
+        return result
 
     def third_person_image(
         self, *, width: int = 820, height: int = 615, spp: int = 16

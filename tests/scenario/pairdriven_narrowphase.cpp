@@ -380,6 +380,7 @@ TEST(PairDrivenNarrowphase, WarmStartCacheSeedsRowsAndVelocity) {
     Backend b = GetBackend();
     nk::Pipeline::SolverConfig cfg = PairDrivenConfig();
     cfg.vel_iters = 0u;
+    cfg.pos_iters = 0u;  // Keep the contact feature fixed while testing cache reuse.
     nk::World world(BuildTwoBodyPairDrivenModel(), 1u, b.dev, b.backend, cfg);
     ASSERT_TRUE(world.Ready());
     ASSERT_TRUE(world.Step().AllOk());

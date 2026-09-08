@@ -15,6 +15,7 @@
 #include "math/vec3.hpp"
 #include "math/quat.hpp"
 #include "math/transform.hpp"
+#include "math/symmetric_mat3.hpp"
 
 namespace nuka::nk {
 // Spatial / matrix element types for the articulation device state
@@ -174,6 +175,7 @@ struct DataView {
     float* chain_jacobian = nullptr;  // per:row_dof arena:scratch owner:data
     float* row_minv_jt = nullptr;  // per:row_dof arena:scratch owner:data
     float* row_meff = nullptr;  // per:row_slot arena:scratch owner:data
+    float* row_damping = nullptr;  // per:row_slot arena:scratch owner:data
     uint32_t* row_cj_link = nullptr;  // per:row_slot arena:scratch owner:data
     ::nuka::math::Vec3* row_cj_point = nullptr;  // per:row_slot arena:scratch owner:data
     ::nuka::math::Vec3* row_cj_dir = nullptr;  // per:row_slot arena:scratch owner:data
@@ -288,6 +290,16 @@ struct DataView {
     ::nuka::math::Vec3* task_target = nullptr;  // per:env arena:persistent owner:data flags:[param]
     ::nuka::math::Quat* task_rotation_target = nullptr;  // per:env arena:persistent owner:data flags:[param]
     ::nuka::math::Transform* task_local_pose = nullptr;  // per:env arena:persistent owner:data flags:[param]
+    ::nuka::math::Transform* body_inertial_frame = nullptr;  // per:body arena:persistent owner:data flags:[param]
+    ::nuka::math::SymmetricMat3* body_world_inv_inertia = nullptr;  // per:body arena:scratch owner:data
+    float* step_qdot_flat = nullptr;  // per:articulation_dof arena:scratch owner:data
+    ::nuka::math::Vec3* step_body_linear_velocity = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* step_body_angular_velocity = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* step_particle_velocity = nullptr;  // per:particle arena:scratch owner:data
+    uint32_t* contact_side_a_kind = nullptr;  // per:contact_slot arena:scratch owner:data flags:[readout]
+    uint32_t* contact_side_b_kind = nullptr;  // per:contact_slot arena:scratch owner:data flags:[readout]
+    uint32_t* contact_side_a_index = nullptr;  // per:contact_slot arena:scratch owner:data flags:[readout]
+    uint32_t* contact_side_b_index = nullptr;  // per:contact_slot arena:scratch owner:data flags:[readout]
 };
 
 } // namespace nuka::phi

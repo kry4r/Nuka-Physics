@@ -630,8 +630,22 @@ typedef enum nuka_state_field_t {
     // WRITE (per-env). Rigid local frame on osc_task_link, represented as
     // [px,py,pz,qw,qx,qy,qz]. A near-zero quaternion means identity rotation;
     // the translation still selects an offset point such as a gripper site.
-    NUKA_FIELD_TASK_LOCAL_POSE = 32
+    NUKA_FIELD_TASK_LOCAL_POSE = 32,
+    // READ (per-contact-slot uint32). Kinds use nuka_contact_side_kind_t.
+    NUKA_FIELD_CONTACT_SIDE_A_KIND = 33,
+    NUKA_FIELD_CONTACT_SIDE_B_KIND = 34,
+    // READ (per-contact-slot uint32). Global body/link/particle index by kind.
+    // Static and inactive sides have UINT32_MAX; shape proxies resolve to their owner.
+    NUKA_FIELD_CONTACT_SIDE_A_INDEX = 35,
+    NUKA_FIELD_CONTACT_SIDE_B_INDEX = 36
 } nuka_state_field_t;
+
+typedef enum nuka_contact_side_kind_t {
+    NUKA_CONTACT_SIDE_RIGID = 0,
+    NUKA_CONTACT_SIDE_LINK = 1,
+    NUKA_CONTACT_SIDE_PARTICLE = 2,
+    NUKA_CONTACT_SIDE_STATIC = 3
+} nuka_contact_side_kind_t;
 
 typedef struct nuka_buffer_view_t {
     void* device_ptr;

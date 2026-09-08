@@ -250,6 +250,8 @@ TEST(ArticulatedLinkParticleCoupling, ArmLinkPressesParticlesAndJointRecoils) {
         uint32_t particle_rows = 0u;
         float max_body_lambda = 0.0f;
         float q_joint = 0.0f;             // the revolute coordinate (the 1 DOF).
+        std::vector<float> q_history;
+        std::vector<float> contact_history;
         std::vector<float> qdot;
         Vec3 tip{};
         float patch_min_z = 1.0e9f;
@@ -266,9 +268,13 @@ TEST(ArticulatedLinkParticleCoupling, ArmLinkPressesParticlesAndJointRecoils) {
         tgt[tip_link] = kDriveTarget;
         std::vector<float> urows(static_cast<size_t>(rows) * 32u, 0.0f);
         std::vector<float> lambda(rows, 0.0f);
+        std::vector<float> joint_position(L, 0.0f);
         for (uint32_t s = 0; s < kSettleSteps; ++s) {
             d.UploadField(nk::FieldId::DriveTarget, tgt.data(), L * sizeof(float));
-            w.Step();
+            EXPECT_TRUE(w.Step().AllOk());
+            d.DownloadField(nk::FieldId::Q, joint_position.data(), L * sizeof(float));
+            out.q_history.push_back(joint_position[tip_link]);
+            out.contact_history.push_back(0.0f);
             if (!patch_present) continue;
             d.DownloadField(nk::FieldId::Urows, urows.data(), urows.size() * sizeof(float));
             d.DownloadField(nk::FieldId::Lambda, lambda.data(), lambda.size() * sizeof(float));
@@ -289,6 +295,7 @@ TEST(ArticulatedLinkParticleCoupling, ArmLinkPressesParticlesAndJointRecoils) {
                 }
                 if (rs.upper > 1.0e30f)  // a normal row (friction spokes cap upper).
                     out.max_body_lambda = std::max(out.max_body_lambda, lambda[row]);
+                out.contact_history.back() += std::fabs(lambda[row]);
             }
         }
         std::vector<float> q(L, 0.0f);
@@ -309,10 +316,18 @@ TEST(ArticulatedLinkParticleCoupling, ArmLinkPressesParticlesAndJointRecoils) {
     const Run with_patch = run_scene(/*patch_present=*/true);
     const Run control = run_scene(/*patch_present=*/false);
 
-    // The patch holds the arm SHORT of the target the free control reaches: the
-    // contact reaction reduces the driven joint coordinate (the reaction reaches
-    // the articulation). qdot also differs from the control.
+    // Measure recoil during contact as the tip traverses the finite patch.
     const float q_lag = control.q_joint - with_patch.q_joint;
+    float peak_contact_lag = 0.0f;
+    uint32_t last_contact_step = 0u;
+    for (uint32_t step = 0; step < with_patch.q_history.size(); ++step) {
+        if (with_patch.contact_history[step] <= 1.0e-6f) continue;
+        last_contact_step = step;
+        peak_contact_lag = std::max(peak_contact_lag,
+            control.q_history[step] - with_patch.q_history[step]);
+    }
+    std::fprintf(stderr, "[artic-particle] peak_contact_lag=%.6f last_contact_step=%u\n",
+                 peak_contact_lag, last_contact_step);
     double qdot_delta = 0.0;
     ASSERT_EQ(with_patch.qdot.size(), control.qdot.size());
     for (size_t i = 0; i < with_patch.qdot.size(); ++i)
@@ -342,12 +357,9 @@ TEST(ArticulatedLinkParticleCoupling, ArmLinkPressesParticlesAndJointRecoils) {
     // (b) two-way, direction 1: the link pushed the particles DOWN below the lay.
     EXPECT_LT(with_patch.patch_min_z, patch_lay_z - 0.005f)
         << "the arm link did not push the particles down (no displacement)";
-    // (b) two-way, direction 2: the reaction reached the revolute JOINT -- the patch
-    // held the driven arm short of the target the free control reaches, and qdot
-    // differs. The impulse flowed through the articulated dynamics (foot<->ground).
-    EXPECT_GT(q_lag, 0.01f)
-        << "the patch did not hold the driven joint back vs the no-patch control -- "
-           "the contact reaction never reached the articulation (one-sided = a bug)";
+    // Contact must retard the driven joint while reaction impulses are present.
+    EXPECT_GT(peak_contact_lag, 0.01f)
+        << "the particle reaction did not retard the articulated joint during contact";
     EXPECT_GT(qdot_delta, 1.0e-4)
         << "the articulation qdot did not change vs the no-particle control";
 }

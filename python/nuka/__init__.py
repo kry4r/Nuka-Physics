@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from ._nuka_ext import (  # noqa: F401
     Device,
     Field,
+    ContactSideKind,
     World,
     StateCheckpoint,
     Tape,
@@ -285,6 +286,7 @@ __all__ = [
     "surfaces",
     "SimOptions",
     "Field",
+    "ContactSideKind",
     "sync",
     "__engine_version__",
     "DETERMINISM_STRONG",

@@ -240,7 +240,8 @@ static uint32_t RowExemptParticles(const nk::Model& model) {
 
 static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
     const uint64_t total_rows =
-        contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env);
+        contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env) +
+        static_cast<uint64_t>(cap.joint_friction_rows_per_env);
     if (total_rows > 0xFFFFFFFFull) {
         throw std::runtime_error("CookToModel: row capacity overflows u32");
     }
@@ -397,6 +398,15 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             std::any_of(m.joint_limit_flags.begin(), m.joint_limit_flags.end(),
                         [](uint8_t flags) { return flags != 0u; })
                 ? m.link_count * 2u : 0u;
+        for (float friction : m.joint_frictionloss) {
+            if (!std::isfinite(friction) || friction < 0.0f) {
+                throw std::runtime_error("CookToModel: invalid joint frictionloss");
+            }
+        }
+        cap.joint_friction_rows_per_env =
+            std::any_of(m.joint_frictionloss.begin(), m.joint_frictionloss.end(),
+                        [](float friction) { return friction > 0.0f; })
+                ? m.link_count : 0u;
         m.initial_q = host.q;                  // per LINK (scalar slot / link)
         m.initial_link_pose = host.link_pose;  // cook rest pose
         m.base_pose = host.base_pose.empty() ? math::Transform::Identity()
@@ -775,6 +785,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                                      body_is_articulation_link[b] != 0u;
                 const bool is_static = b < blob.bodies.is_static.size() &&
                                        blob.bodies.is_static[b] != 0u;
+                if (!is_link && b < blob.bodies.inertial_frames.size())
+                    bi.inertial_frame = blob.bodies.inertial_frames[b];
                 if (!is_link && !is_static) {
                     if (b < blob.bodies.inv_masses.size())
                         bi.inv_mass = blob.bodies.inv_masses[b];

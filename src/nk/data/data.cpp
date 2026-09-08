@@ -63,6 +63,8 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::BodyForce:           v.body_force = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyTorque:          v.body_torque = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyInvInertia:      v.body_inv_inertia = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyInertialFrame:   v.body_inertial_frame = static_cast<math::Transform*>(p); break;
+        case FieldId::BodyWorldInvInertia: v.body_world_inv_inertia = static_cast<math::SymmetricMat3*>(p); break;
         case FieldId::BodyAabbLo:          v.body_aabb_lo = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyAabbHi:          v.body_aabb_hi = static_cast<math::Vec3*>(p); break;
         case FieldId::PairCount:           v.pair_count = static_cast<uint32_t*>(p); break;
@@ -89,6 +91,10 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactMeffTangent1: v.contact_meff_tangent1 = static_cast<float*>(p); break;
         case FieldId::ContactMeffTangent2: v.contact_meff_tangent2 = static_cast<float*>(p); break;
         case FieldId::ContactForce:        v.contact_force = static_cast<float*>(p); break;
+        case FieldId::ContactSideAKind:    v.contact_side_a_kind = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactSideBKind:    v.contact_side_b_kind = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactSideAIndex:   v.contact_side_a_index = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactSideBIndex:   v.contact_side_b_index = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactCount:       v.ucontact_count = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactPoint:       v.ucontact_point = static_cast<math::Vec3*>(p); break;
         case FieldId::UcontactNormal:      v.ucontact_normal = static_cast<math::Vec3*>(p); break;
@@ -132,6 +138,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ChainJacobian:       v.chain_jacobian = static_cast<float*>(p); break;
         case FieldId::RowMinvJt:           v.row_minv_jt = static_cast<float*>(p); break;
         case FieldId::RowMeff:             v.row_meff = static_cast<float*>(p); break;
+        case FieldId::RowDamping:          v.row_damping = static_cast<float*>(p); break;
         case FieldId::RowCjLink:           v.row_cj_link = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPoint:          v.row_cj_point = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCjDir:            v.row_cj_dir = static_cast<math::Vec3*>(p); break;
@@ -145,6 +152,10 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         // rows_per_env order + 2*rows_per_env segments per env, disjoint per env).
         case FieldId::PdSolveScratch:      v.pd_solve_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::QdotFlat:            v.qdot_flat = static_cast<float*>(p); break;
+        case FieldId::StepQdotFlat:        v.step_qdot_flat = static_cast<float*>(p); break;
+        case FieldId::StepBodyLinearVelocity: v.step_body_linear_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::StepBodyAngularVelocity: v.step_body_angular_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::StepParticleVelocity: v.step_particle_velocity = static_cast<math::Vec3*>(p); break;
         // Split-impulse position pass: SEPARATE pseudo-velocity accumulators (never
         // the persisted velocity). Written by the gated position sweep, read by
         // IntegratePosition as (real+pseudo)*dt. Zero on the pos_iters==0 path.

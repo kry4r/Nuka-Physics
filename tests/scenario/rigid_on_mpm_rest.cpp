@@ -381,7 +381,7 @@ TEST(RigidOnMpmRest, OffCentreDropInducesTippingTorque) {
     // Step through the first contact transient; track the peak signed omega_y.
     constexpr uint32_t kSteps = 200u;
     for (uint32_t s = 0; s < kSteps; ++s) {
-        w.Step();
+        ASSERT_TRUE(w.Step().AllOk());
         w.GetData().DownloadField(nk::FieldId::BodyAngularVelocity, &ang_vel,
                                   sizeof(Vec3));
         w.GetData().DownloadField(nk::FieldId::MpmBodyReaction, &reaction,

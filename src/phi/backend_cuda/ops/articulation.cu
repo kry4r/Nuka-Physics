@@ -32,6 +32,7 @@
 #include "phi/backend_cuda/ops/articulation_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/rigid_types.cuh"
 
 namespace nuka::phi {
 
@@ -775,12 +776,13 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     state.tau[link] = tau;
 }
 
-// M4: movable rigid-body arms (the union world's cup path, ports of
-// the legacy coresident union world's gravity kick + IntegrateBodyPosition).
-
-// linear_velocity.z += g*dt for movable bodies — the legacy per-body kick.
-__global__ void BodyGravityKickKernel(math::Vec3* body_linear_velocity,
+// The world inertia tensor is refreshed before any contact impulses are applied.
+__global__ void BodyIntegrateVelocityKernel(math::Vec3* body_linear_velocity,
                                       const float* body_inv_mass,
+                                      const math::Transform* body_pose,
+                                      const math::Transform* body_inertial_frame,
+                                      const math::Vec3* body_inv_inertia,
+                                      math::SymmetricMat3* body_world_inv_inertia,
                                       uint32_t total_body_count,
                                       float gravity_z,
                                       float dt) {
@@ -789,21 +791,22 @@ __global__ void BodyGravityKickKernel(math::Vec3* body_linear_velocity,
         return;
     }
     if (body_inv_mass[body] <= 0.0f) {
+        body_world_inv_inertia[body] = math::SymmetricMat3{};
         return;
     }
+    body_world_inv_inertia[body] = BodyWorldInverseInertia(
+        body_pose[body], body_inertial_frame[body], body_inv_inertia[body]);
     body_linear_velocity[body].z += gravity_z * dt;
 }
 
-// Symplectic-Euler body position step — BYTE-FAITHFUL port of the legacy
-// coresident union world's IntegrateBodyPosition (position += v*dt; the small-angle
-// quaternion advance dq = {1, 0.5*w*dt}; orientation = (q*dq).Normalized() with
-// the host Normalized expression: n = sqrt(.), <1e-12 -> identity, else q/n).
+// Advance the COM and reconstruct the authored body frame after rotation.
 __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
                                             const math::Vec3* body_linear_velocity,
                                             const math::Vec3* body_angular_velocity,
                                             const math::Vec3* body_pseudo_lin_vel,
                                             const math::Vec3* body_pseudo_ang_vel,
                                             const float* body_inv_mass,
+                                            const math::Transform* body_inertial_frame,
                                             uint32_t total_body_count,
                                             float dt) {
     const uint32_t body = blockIdx.x * blockDim.x + threadIdx.x;
@@ -814,8 +817,7 @@ __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
         return;
     }
     math::Transform pose = body_pose[body];
-    // Split-impulse: position advances by (real+pseudo)*dt; persisted velocity
-    // stays = real. The null branch is the EXACT velocity-only expression.
+    // Split impulses affect pose while persisted velocities remain physical.
     math::Vec3 v = body_linear_velocity[body];
     math::Vec3 w = body_angular_velocity[body];
     if (body_pseudo_lin_vel != nullptr) {
@@ -824,22 +826,14 @@ __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
         v.x += vp.x; v.y += vp.y; v.z += vp.z;
         w.x += wp.x; w.y += wp.y; w.z += wp.z;
     }
-    pose.position.x += v.x * dt;
-    pose.position.y += v.y * dt;
-    pose.position.z += v.z * dt;
+    const math::Vec3 center = BodyCenterOfMass(pose, body_inertial_frame[body]);
     math::Quat dq;
     dq.w = 1.0f;
     dq.x = 0.5f * w.x * dt;
     dq.y = 0.5f * w.y * dt;
     dq.z = 0.5f * w.z * dt;
-    // Hamilton product pose.rotation * dq — the host constexpr operator*'s
-    // exact expression (the operator itself is host-only constexpr).
-    const math::Quat lq = pose.rotation;
-    math::Quat q;
-    q.w = lq.w * dq.w - lq.x * dq.x - lq.y * dq.y - lq.z * dq.z;
-    q.x = lq.w * dq.x + lq.x * dq.w + lq.y * dq.z - lq.z * dq.y;
-    q.y = lq.w * dq.y - lq.x * dq.z + lq.y * dq.w + lq.z * dq.x;
-    q.z = lq.w * dq.z + lq.x * dq.y - lq.y * dq.x + lq.z * dq.w;
+    // World angular velocity left-multiplies the body-to-world orientation.
+    math::Quat q = mg::QuatMul(dq, pose.rotation);
     const float n = sqrtf(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
     if (n < 1e-12f) {
         q.w = 1.0f; q.x = 0.0f; q.y = 0.0f; q.z = 0.0f;
@@ -847,6 +841,8 @@ __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
         q.w /= n; q.x /= n; q.y /= n; q.z /= n;
     }
     pose.rotation = q;
+    const math::Vec3 offset = mg::RotateByQuatNormalized(q, body_inertial_frame[body].position);
+    pose.position = mg::Sub(mg::Add(center, mg::Scale(v, dt)), offset);
     body_pose[body] = pose;
 }
 
@@ -1075,6 +1071,12 @@ __global__ void ApplyOscPoseDriveKernel(
         float value = 0.0f;
         for (uint32_t c = 0u; c < n; ++c) {
             value -= mass[r * kMaxOscDof + c] * qddot_free[c];
+        }
+        // Remove passive damping from force-free ABA's bias estimate so OSC
+        // compensates only gravity and Coriolis, preserving physical damping.
+        if (base_dof[r] == 0u) {
+            const uint32_t link = dof_to_link[r];
+            value -= state.joint_damping[link] * state.qdot[link];
         }
         bias[r] = value;
     }
@@ -1517,14 +1519,15 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
                        dim3(kAbaBlockSize), 0u, stream, state, p->dt, p->gravity_z);
         }
     }
-    // M4: the movable rigid-body gravity kick (the union world's cup kick —
-    // applied exactly once per step, before the contact solve).
+    // Free-body inertia and velocity are updated before the shared contact solve.
     if (p->total_body_count > 0u) {
         const uint32_t blocks =
             (p->total_body_count + kAbaBlockSize - 1u) / kAbaBlockSize;
-        LaunchCuda(BodyGravityKickKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
+        LaunchCuda(BodyIntegrateVelocityKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
                    stream, data.body_linear_velocity,
                    static_cast<const float*>(data.body_inv_mass),
+                   data.body_pose, data.body_inertial_frame, data.body_inv_inertia,
+                   data.body_world_inv_inertia,
                    p->total_body_count, p->gravity_z, p->dt);
     }
     return LaunchOk(stream);
@@ -1578,8 +1581,7 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
                        dim3(kAbaBlockSize), 0u, stream, state, link_vel_pseudo, p->dt);
         }
     }
-    // M4: the movable rigid-body symplectic-Euler position step (the union
-    // world's IntegrateBodyPosition — runs AFTER the contact solve).
+    // Advance free bodies using the velocities from the shared contact solve.
     if (p->total_body_count > 0u) {
         const uint32_t blocks =
             (p->total_body_count + kAbaBlockSize - 1u) / kAbaBlockSize;
@@ -1593,6 +1595,7 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
                    stream, data.body_pose, data.body_linear_velocity,
                    data.body_angular_velocity, body_pseudo_lin, body_pseudo_ang,
                    static_cast<const float*>(data.body_inv_mass),
+                   data.body_inertial_frame,
                    p->total_body_count, p->dt);
     }
     return LaunchOk(stream);

@@ -173,7 +173,7 @@ inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
     const uint64_t slim = sizeof(SlimRow) * rows_per_env;
     return sizeof(float) *
                (qdot_floats +                                          // qdot tile(s)
-                2ull * rows_per_env +                                   // lambda+meff
+                3ull * rows_per_env +                                   // lambda+meff+damping
                 jw) +                                                   // J + w (union only)
            slim +                                                       // slim (union only)
            sizeof(uint32_t) * 3ull * rows_per_env;                      // order+segs
@@ -244,7 +244,7 @@ __device__ void ApplySlimImpulse(
     const float* J_sh, const float* w_sh, const float* J_b_sh,
     const float* w_b_sh, math::Vec3* body_lin_vel,
     math::Vec3* body_ang_vel, const float* body_inv_mass,
-    const math::Vec3* body_inv_inertia, const float* particle_inv_mass,
+    const math::SymmetricMat3* body_world_inv_inertia, const float* particle_inv_mass,
     math::Vec3* particle_vel, uint32_t dof_stride) {
     const uint32_t code = sr.code;
     const uint32_t a_tile = (sr.a_tile == ~0u) ? 0u : sr.a_tile;
@@ -277,15 +277,16 @@ __device__ void ApplySlimImpulse(
             } else {
                 const float im = body_inv_mass[sr.dyn_index];
                 if (im > 0.0f) {
-                    const math::Vec3 ii = body_inv_inertia[sr.dyn_index];
+                    const math::Vec3 angular_response = body_world_inv_inertia[sr.dyn_index].Multiply(
+                        {sr.ja[0], sr.ja[1], sr.ja[2]});
                     math::Vec3& v = body_lin_vel[sr.dyn_index];
                     math::Vec3& w = body_ang_vel[sr.dyn_index];
                     v.x += sr.jl[0] * (im * delta);
                     v.y += sr.jl[1] * (im * delta);
                     v.z += sr.jl[2] * (im * delta);
-                    w.x += sr.ja[0] * ii.x * delta;
-                    w.y += sr.ja[1] * ii.y * delta;
-                    w.z += sr.ja[2] * ii.z * delta;
+                    w.x += angular_response.x * delta;
+                    w.y += angular_response.y * delta;
+                    w.z += angular_response.z * delta;
                 }
             }
         } else if ((code & kSlimFallback) && side == 1 && wlane == 0u) {
@@ -302,15 +303,15 @@ __device__ void ApplySlimImpulse(
             } else if (row.b.kind == kNkSideRigid) {
                 const float im = body_inv_mass[row.b.index];
                 if (im > 0.0f) {
-                    const math::Vec3 ii = body_inv_inertia[row.b.index];
+                    const math::Vec3 angular_response = body_world_inv_inertia[row.b.index].Multiply(row.b.jang);
                     math::Vec3& v = body_lin_vel[row.b.index];
                     math::Vec3& w = body_ang_vel[row.b.index];
                     v.x += row.b.jlin.x * (im * delta);
                     v.y += row.b.jlin.y * (im * delta);
                     v.z += row.b.jlin.z * (im * delta);
-                    w.x += row.b.jang.x * ii.x * delta;
-                    w.y += row.b.jang.y * ii.y * delta;
-                    w.z += row.b.jang.z * ii.z * delta;
+                    w.x += angular_response.x * delta;
+                    w.y += angular_response.y * delta;
+                    w.z += angular_response.z * delta;
                 }
             }
         }
@@ -398,8 +399,10 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   const SlimRow* slim_sh, // null => build inline
                                   float* lambda_sh,       // null => use global lambda
                                   const float* meff_sh,   // null => use global row_meff
+                                  const float* damping_sh, // null => use global row_damping
                                   float* __restrict__ lambda,    // global lambda
                                   const float* __restrict__ row_meff,  // global meff
+                                  const float* __restrict__ row_damping, // global damping
                                   const float* J_sh,      // shared (union) OR global (PD)
                                   const float* w_sh,
                                   const float* J_b_sh,    // side-B chain-J (or null)
@@ -409,7 +412,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   math::Vec3* __restrict__ body_lin_vel,
                                   math::Vec3* __restrict__ body_ang_vel,
                                   const float* __restrict__ body_inv_mass,
-                                  const math::Vec3* __restrict__ body_inv_inertia,
+                                  const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
                                   const float* __restrict__ particle_inv_mass,
                                   math::Vec3* __restrict__ particle_vel,
                                   uint32_t dof_stride,
@@ -486,6 +489,8 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         // a group member g is env_row_base + group_local + g == its global slot.
         const float effective_mass = meff_sh != nullptr ? meff_sh[ls]
                                                         : row_meff[gslot];
+        const float damping = damping_sh != nullptr ? damping_sh[ls]
+                                                    : row_damping[gslot];
         const float old_impulse = lambda_sh != nullptr ? lambda_sh[ls]
                                                        : lambda[gslot];
         if (apply_cached_impulse) {
@@ -500,8 +505,12 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             const NkRow& normal = urows[block_normal_slot];
             const NkRow& tangent1 = urows[block_tangent1_slot];
             const NkRow& tangent2 = urows[block_tangent2_slot];
-            const float residual_n = normal.rhs * dt - jv -
-                                     normal.compliance_alpha * block_old_normal;
+            const float normal_damping = damping_sh != nullptr
+                ? damping_sh[block_normal_slot - env_row_base]
+                : row_damping[block_normal_slot];
+            const float damping_scale = 1.0f / (1.0f + normal_damping * dt);
+            const float residual_n = normal.rhs * dt * damping_scale - jv -
+                                     normal.compliance_alpha * damping_scale * block_old_normal;
             const float residual_t1 = tangent1.rhs * dt - block_jv_tangent1 -
                                       tangent1.compliance_alpha * block_old_tangent1;
             const float residual_t2 = tangent2.rhs * dt - block_jv_tangent2 -
@@ -527,8 +536,14 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             block_delta_tangent2 = new_tangent2 - block_old_tangent2;
         } else {
             const float rhs_v = sr->rhs * dt;
+            const float damping_scale = 1.0f / (1.0f + damping * dt);
+            // row_meff stores 1/(A+R), also used by the position pass. Convert
+            // locally to 1/(A+R/(1+b*dt)) to match the normalized residual.
+            const float implicit_mass = effective_mass /
+                (1.0f - effective_mass * sr->R * (1.0f - damping_scale));
             const float lambda_inc =
-                effective_mass * (rhs_v - jv - sr->R * old_impulse);
+                implicit_mass * (rhs_v * damping_scale - jv -
+                                 sr->R * damping_scale * old_impulse);
             float lower = sr->lower;
             float upper = sr->upper;
             if (flags & nk::nk_row_flags::kFriction) {
@@ -561,7 +576,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             ApplySlimImpulse(sr_block, block_normal_slot, wlane, block_delta_normal,
                              env_artic_base, qdot_sh, urows, J_sh, w_sh, J_b_sh,
                              w_b_sh, body_lin_vel, body_ang_vel, body_inv_mass,
-                             body_inv_inertia, particle_inv_mass, particle_vel,
+                             body_world_inv_inertia, particle_inv_mass, particle_vel,
                              dof_stride);
         }
         if (fabsf(block_delta_tangent1) > 1.0e-12f) {
@@ -570,7 +585,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             ApplySlimImpulse(sr_block, block_tangent1_slot, wlane,
                              block_delta_tangent1, env_artic_base, qdot_sh, urows,
                              J_sh, w_sh, J_b_sh, w_b_sh, body_lin_vel,
-                             body_ang_vel, body_inv_mass, body_inv_inertia,
+                             body_ang_vel, body_inv_mass, body_world_inv_inertia,
                              particle_inv_mass, particle_vel, dof_stride);
         }
         if (fabsf(block_delta_tangent2) > 1.0e-12f) {
@@ -579,7 +594,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             ApplySlimImpulse(sr_block, block_tangent2_slot, wlane,
                              block_delta_tangent2, env_artic_base, qdot_sh, urows,
                              J_sh, w_sh, J_b_sh, w_b_sh, body_lin_vel,
-                             body_ang_vel, body_inv_mass, body_inv_inertia,
+                             body_ang_vel, body_inv_mass, body_world_inv_inertia,
                              particle_inv_mass, particle_vel, dof_stride);
         }
     }
@@ -622,15 +637,16 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                 } else {
                     const float im = body_inv_mass[sr->dyn_index];
                     if (im > 0.0f) {  // immovable rigid: no-op.
-                        const math::Vec3 ii = body_inv_inertia[sr->dyn_index];
+                        const math::Vec3 angular_response = body_world_inv_inertia[sr->dyn_index].Multiply(
+                            {sr->ja[0], sr->ja[1], sr->ja[2]});
                         math::Vec3& v = body_lin_vel[sr->dyn_index];
                         math::Vec3& w = body_ang_vel[sr->dyn_index];
                         v.x += sr->jl[0] * (im * delta);
                         v.y += sr->jl[1] * (im * delta);
                         v.z += sr->jl[2] * (im * delta);
-                        w.x += sr->ja[0] * ii.x * delta;
-                        w.y += sr->ja[1] * ii.y * delta;
-                        w.z += sr->ja[2] * ii.z * delta;
+                        w.x += angular_response.x * delta;
+                        w.y += angular_response.y * delta;
+                        w.z += angular_response.z * delta;
                     }
                 }
             } else if ((code & kSlimFallback) && side == 1 && wlane == 0u) {
@@ -648,15 +664,15 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                 } else if (row.b.kind == kNkSideRigid) {
                     const float im = body_inv_mass[row.b.index];
                     if (im > 0.0f) {
-                        const math::Vec3 ii = body_inv_inertia[row.b.index];
+                        const math::Vec3 angular_response = body_world_inv_inertia[row.b.index].Multiply(row.b.jang);
                         math::Vec3& v = body_lin_vel[row.b.index];
                         math::Vec3& w = body_ang_vel[row.b.index];
                         v.x += row.b.jlin.x * (im * delta);
                         v.y += row.b.jlin.y * (im * delta);
                         v.z += row.b.jlin.z * (im * delta);
-                        w.x += row.b.jang.x * ii.x * delta;
-                        w.y += row.b.jang.y * ii.y * delta;
-                        w.z += row.b.jang.z * ii.z * delta;
+                        w.x += angular_response.x * delta;
+                        w.y += angular_response.y * delta;
+                        w.z += angular_response.z * delta;
                     }
                 }
             }
@@ -689,7 +705,7 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
                                      math::Vec3* __restrict__ body_pseudo_lin,
                                      math::Vec3* __restrict__ body_pseudo_ang,
                                      const float* __restrict__ body_inv_mass,
-                                     const math::Vec3* __restrict__ body_inv_inertia,
+                                     const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
                                      const float* __restrict__ particle_inv_mass,
                                      math::Vec3* __restrict__ particle_pseudo_vel,
                                      uint32_t dof_stride,
@@ -701,48 +717,14 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
         (flags & (nk::nk_row_flags::kFriction | nk::nk_row_flags::kBlockTangent))) {
         return;  // inactive or tangential row: no position correction.
     }
-    const uint32_t code = sr.code;
-    const uint32_t a_tile = (sr.a_tile == ~0u) ? 0u : sr.a_tile;
-    const uint32_t b_tile = (sr.b_tile == ~0u) ? 0u : sr.b_tile;
 
     float delta = 0.0f;
     if (wlane == 0u) {
-        // Pseudo separating velocity from the SAME J over the pseudo qdot tile
-        // (artic) and the pseudo body/particle velocities (rigid/particle).
-        float art_jv_a = 0.0f;
-        if (code & kSlimAArt) {
-            const float* const J = J_sh + static_cast<size_t>(j_row) * dof_stride;
-            const float* const qd =
-                qdot_pseudo_sh + static_cast<size_t>(a_tile) * dof_stride;
-            for (uint32_t r = 0u; r < dof_stride; ++r) art_jv_a += J[r] * qd[r];
-        }
-        float art_jv_b = 0.0f;
-        if (code & kSlimBArt) {
-            const float* const J =
-                ((J_b_sh != nullptr) ? J_b_sh : J_sh) +
-                static_cast<size_t>(j_row) * dof_stride;
-            const float* const qd =
-                qdot_pseudo_sh + static_cast<size_t>(b_tile) * dof_stride;
-            for (uint32_t r = 0u; r < dof_stride; ++r) art_jv_b += J[r] * qd[r];
-        }
-        float dyn_jv = 0.0f;
-        if (code & kSlimHasDyn) {
-            const math::Vec3 jl{sr.jl[0], sr.jl[1], sr.jl[2]};
-            if (code & kSlimDynParticle) {
-                dyn_jv = (particle_pseudo_vel != nullptr)
-                             ? Dot3(jl, particle_pseudo_vel[sr.dyn_index])
-                             : 0.0f;
-            } else {
-                const math::Vec3 ja{sr.ja[0], sr.ja[1], sr.ja[2]};
-                dyn_jv = Dot3(jl, body_pseudo_lin[sr.dyn_index]) +
-                         Dot3(ja, body_pseudo_ang[sr.dyn_index]);
-            }
-        }
-        float jv = 0.0f;
-        if (code & kSlimAArt) jv += art_jv_a;
-        else if ((code & kSlimHasDyn) && !(code & kSlimDynIsB)) jv += dyn_jv;
-        if (code & kSlimBArt) jv += art_jv_b;
-        else if ((code & kSlimHasDyn) && (code & kSlimDynIsB)) jv += dyn_jv;
+        // Both reaction sides participate in geometric push-out, including the
+        // two-rigid fallback, so the position pass preserves center of mass.
+        const float jv = ComputeSlimRowVelocity(
+            sr, gslot, j_row, J_sh, J_b_sh, qdot_pseudo_sh, urows,
+            body_pseudo_lin, body_pseudo_ang, particle_pseudo_vel, dof_stride);
 
         // Pseudo separating velocity from the penetration, capped at
         // baumgarte_max_velocity (+inf default => byte-identical) for bounded push-out.
@@ -760,51 +742,11 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
     }
     delta = __shfl_sync(0xffffffffu, delta, 0);
     if (delta != 0.0f) {
-        for (int side = 0; side < 2; ++side) {
-            const bool art = side == 0 ? (code & kSlimAArt) != 0u
-                                       : (code & kSlimBArt) != 0u;
-            const bool dyn = (code & kSlimHasDyn) &&
-                             ((side == 1) == ((code & kSlimDynIsB) != 0u));
-            if (art) {
-                const uint32_t tile = (side == 0) ? a_tile : b_tile;
-                const float* w = ((side == 0) ? w_sh
-                                              : ((w_b_sh != nullptr) ? w_b_sh : w_sh)) +
-                                 static_cast<size_t>(j_row) * dof_stride;
-                float* const qd =
-                    qdot_pseudo_sh + static_cast<size_t>(tile) * dof_stride;
-                for (uint32_t r = wlane; r < dof_stride; r += 32u) {
-                    qd[r] += w[r] * delta;
-                }
-            } else if (dyn && wlane == 0u) {
-                // Particle pseudo-vel feeds the body side's split-impulse; the particle's
-                // own position is owned by its medium (XPBD/PBF), not integrated here.
-                if (code & kSlimDynParticle) {
-                    if (particle_pseudo_vel != nullptr &&
-                        particle_inv_mass != nullptr) {
-                        const float im = particle_inv_mass[sr.dyn_index];
-                        if (im > 0.0f) {
-                            math::Vec3& v = particle_pseudo_vel[sr.dyn_index];
-                            v.x += sr.jl[0] * (im * delta);
-                            v.y += sr.jl[1] * (im * delta);
-                            v.z += sr.jl[2] * (im * delta);
-                        }
-                    }
-                } else {
-                    const float im = body_inv_mass[sr.dyn_index];
-                    if (im > 0.0f) {
-                        const math::Vec3 ii = body_inv_inertia[sr.dyn_index];
-                        math::Vec3& v = body_pseudo_lin[sr.dyn_index];
-                        math::Vec3& w = body_pseudo_ang[sr.dyn_index];
-                        v.x += sr.jl[0] * (im * delta);
-                        v.y += sr.jl[1] * (im * delta);
-                        v.z += sr.jl[2] * (im * delta);
-                        w.x += sr.ja[0] * ii.x * delta;
-                        w.y += sr.ja[1] * ii.y * delta;
-                        w.z += sr.ja[2] * ii.z * delta;
-                    }
-                }
-            }
-        }
+        ApplySlimImpulse(sr, j_row, wlane, delta, env_artic_base, qdot_pseudo_sh,
+                         urows, J_sh, w_sh, J_b_sh, w_b_sh,
+                         body_pseudo_lin, body_pseudo_ang, body_inv_mass,
+                         body_world_inv_inertia, particle_inv_mass, particle_pseudo_vel,
+                         dof_stride);
     }
 }
 
@@ -813,7 +755,7 @@ __device__ void ApplyDynamicImpulseScalar(
     math::Vec3* __restrict__ body_lin_vel,
     math::Vec3* __restrict__ body_ang_vel,
     const float* __restrict__ body_inv_mass,
-    const math::Vec3* __restrict__ body_inv_inertia,
+    const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     const float* __restrict__ particle_inv_mass,
     math::Vec3* __restrict__ particle_vel) {
     if (fabsf(delta) <= 1.0e-12f) return;
@@ -832,15 +774,15 @@ __device__ void ApplyDynamicImpulseScalar(
         } else if (sd.kind == kNkSideRigid) {
             const float im = body_inv_mass[sd.index];
             if (im > 0.0f) {
-                const math::Vec3 ii = body_inv_inertia[sd.index];
+                const math::Vec3 angular_response = body_world_inv_inertia[sd.index].Multiply(sd.jang);
                 math::Vec3& v = body_lin_vel[sd.index];
                 math::Vec3& w = body_ang_vel[sd.index];
                 v.x += sd.jlin.x * (im * delta);
                 v.y += sd.jlin.y * (im * delta);
                 v.z += sd.jlin.z * (im * delta);
-                w.x += sd.jang.x * ii.x * delta;
-                w.y += sd.jang.y * ii.y * delta;
-                w.z += sd.jang.z * ii.z * delta;
+                w.x += angular_response.x * delta;
+                w.y += angular_response.y * delta;
+                w.z += angular_response.z * delta;
             }
         }
     }
@@ -856,10 +798,11 @@ __device__ void SolveDynamicRowScalar(
     uint32_t gslot, uint32_t env_row_base, uint32_t env_artic_base,
     const NkRow* __restrict__ urows, float* __restrict__ lambda,
     const float* __restrict__ row_meff,
+    const float* __restrict__ row_damping,
     math::Vec3* __restrict__ body_lin_vel,
     math::Vec3* __restrict__ body_ang_vel,
     const float* __restrict__ body_inv_mass,
-    const math::Vec3* __restrict__ body_inv_inertia,
+    const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     const float* __restrict__ particle_inv_mass,
     math::Vec3* __restrict__ particle_vel, float dt,
     bool apply_cached_impulse) {
@@ -924,8 +867,10 @@ __device__ void SolveDynamicRowScalar(
         const NkRow& normal = urows[block_normal_slot];
         const NkRow& tangent1 = urows[block_tangent1_slot];
         const NkRow& tangent2 = urows[block_tangent2_slot];
-        const float residual_n = normal.rhs * dt - jv -
-                                 normal.compliance_alpha * block_old_normal;
+        const float normal_damping = row_damping[block_normal_slot];
+        const float damping_scale = 1.0f / (1.0f + normal_damping * dt);
+        const float residual_n = normal.rhs * dt * damping_scale - jv -
+                                 normal.compliance_alpha * damping_scale * block_old_normal;
         const float residual_t1 = tangent1.rhs * dt - block_jv_tangent1 -
                                   tangent1.compliance_alpha * block_old_tangent1;
         const float residual_t2 = tangent2.rhs * dt - block_jv_tangent2 -
@@ -951,8 +896,12 @@ __device__ void SolveDynamicRowScalar(
         block_delta_tangent2 = new_tangent2 - block_old_tangent2;
     } else {
         const float rhs_v = sr.rhs * dt;
+        const float damping_scale = 1.0f / (1.0f + row_damping[gslot] * dt);
+        const float implicit_mass = effective_mass /
+            (1.0f - effective_mass * sr.R * (1.0f - damping_scale));
         const float lambda_inc =
-            effective_mass * (rhs_v - jv - sr.R * old_impulse);
+            implicit_mass * (rhs_v * damping_scale - jv -
+                             sr.R * damping_scale * old_impulse);
         float lower = sr.lower;
         float upper = sr.upper;
         if (flags & nk::nk_row_flags::kFriction) {
@@ -972,23 +921,22 @@ __device__ void SolveDynamicRowScalar(
     if (block_row) {
         ApplyDynamicImpulseScalar(block_normal_slot, block_delta_normal, urows,
                                   body_lin_vel, body_ang_vel, body_inv_mass,
-                                  body_inv_inertia, particle_inv_mass, particle_vel);
+                                  body_world_inv_inertia, particle_inv_mass, particle_vel);
         ApplyDynamicImpulseScalar(block_tangent1_slot, block_delta_tangent1, urows,
                                   body_lin_vel, body_ang_vel, body_inv_mass,
-                                  body_inv_inertia, particle_inv_mass, particle_vel);
+                                  body_world_inv_inertia, particle_inv_mass, particle_vel);
         ApplyDynamicImpulseScalar(block_tangent2_slot, block_delta_tangent2, urows,
                                   body_lin_vel, body_ang_vel, body_inv_mass,
-                                  body_inv_inertia, particle_inv_mass, particle_vel);
+                                  body_world_inv_inertia, particle_inv_mass, particle_vel);
     } else {
         ApplyDynamicImpulseScalar(gslot, delta, urows, body_lin_vel, body_ang_vel,
-                                  body_inv_mass, body_inv_inertia,
+                                  body_inv_mass, body_world_inv_inertia,
                                   particle_inv_mass, particle_vel);
     }
 }
 
-// Exact no-artic subset of SolvePositionRowWarp. As in the existing path, the
-// split pass acts only on SlimRow's selected dynamic side; the two-dynamic fallback
-// remains velocity-only, preserving current semantics byte-for-byte.
+// No-articulation subset of SolvePositionRowWarp, with the same two-sided
+// reaction as the scalar velocity solve.
 __device__ void SolvePositionRowScalar(
     uint32_t gslot, uint32_t env_row_base, uint32_t env_artic_base,
     const float* __restrict__ row_meff,
@@ -998,7 +946,7 @@ __device__ void SolvePositionRowScalar(
     math::Vec3* __restrict__ body_pseudo_lin,
     math::Vec3* __restrict__ body_pseudo_ang,
     const float* __restrict__ body_inv_mass,
-    const math::Vec3* __restrict__ body_inv_inertia,
+    const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     const float* __restrict__ particle_inv_mass,
     math::Vec3* __restrict__ particle_pseudo_vel,
     float beta, float slop, float dt, float baumgarte_max_velocity) {
@@ -1006,22 +954,9 @@ __device__ void SolvePositionRowScalar(
     const uint32_t flags = sr.flags;
     if (!(flags & nk::nk_row_flags::kActive) ||
         (flags & (nk::nk_row_flags::kFriction | nk::nk_row_flags::kBlockTangent))) return;
-    const uint32_t code = sr.code;
-    float dyn_jv = 0.0f;
-    if (code & kSlimHasDyn) {
-        const math::Vec3 jl{sr.jl[0], sr.jl[1], sr.jl[2]};
-        if (code & kSlimDynParticle) {
-            dyn_jv = (particle_pseudo_vel != nullptr)
-                         ? Dot3(jl, particle_pseudo_vel[sr.dyn_index]) : 0.0f;
-        } else {
-            const math::Vec3 ja{sr.ja[0], sr.ja[1], sr.ja[2]};
-            dyn_jv = Dot3(jl, body_pseudo_lin[sr.dyn_index]) +
-                     Dot3(ja, body_pseudo_ang[sr.dyn_index]);
-        }
-    }
-    float jv = 0.0f;
-    if ((code & kSlimHasDyn) && !(code & kSlimDynIsB)) jv += dyn_jv;
-    if ((code & kSlimHasDyn) && (code & kSlimDynIsB)) jv += dyn_jv;
+    const float jv = ComputeSlimRowVelocity(
+        sr, gslot, gslot, nullptr, nullptr, nullptr, urows,
+        body_pseudo_lin, body_pseudo_ang, particle_pseudo_vel, 0u);
     const float depth = row_penetration[gslot];
     const float bias =
         fminf(beta * fmaxf(depth - slop, 0.0f) / dt, baumgarte_max_velocity);
@@ -1033,44 +968,19 @@ __device__ void SolvePositionRowScalar(
     const float delta = (fabsf(d) > 1.0e-12f) ? d : 0.0f;
     if (delta == 0.0f) return;
 
-    for (int side = 0; side < 2; ++side) {
-        const bool dyn = (code & kSlimHasDyn) &&
-                         ((side == 1) == ((code & kSlimDynIsB) != 0u));
-        if (!dyn) continue;
-        if (code & kSlimDynParticle) {
-            if (particle_pseudo_vel != nullptr && particle_inv_mass != nullptr) {
-                const float im = particle_inv_mass[sr.dyn_index];
-                if (im > 0.0f) {
-                    math::Vec3& v = particle_pseudo_vel[sr.dyn_index];
-                    v.x += sr.jl[0] * (im * delta);
-                    v.y += sr.jl[1] * (im * delta);
-                    v.z += sr.jl[2] * (im * delta);
-                }
-            }
-        } else {
-            const float im = body_inv_mass[sr.dyn_index];
-            if (im > 0.0f) {
-                const math::Vec3 ii = body_inv_inertia[sr.dyn_index];
-                math::Vec3& v = body_pseudo_lin[sr.dyn_index];
-                math::Vec3& w = body_pseudo_ang[sr.dyn_index];
-                v.x += sr.jl[0] * (im * delta);
-                v.y += sr.jl[1] * (im * delta);
-                v.z += sr.jl[2] * (im * delta);
-                w.x += sr.ja[0] * ii.x * delta;
-                w.y += sr.ja[1] * ii.y * delta;
-                w.z += sr.ja[2] * ii.z * delta;
-            }
-        }
-    }
+    ApplyDynamicImpulseScalar(gslot, delta, urows, body_pseudo_lin, body_pseudo_ang,
+                              body_inv_mass, body_world_inv_inertia,
+                              particle_inv_mass, particle_pseudo_vel);
 }
 
 __global__ void SolveRowsScalarIslandsKernel(
     const NkRow* __restrict__ urows, float* __restrict__ lambda,
     const float* __restrict__ row_meff,
+    const float* __restrict__ row_damping,
     math::Vec3* __restrict__ body_lin_vel,
     math::Vec3* __restrict__ body_ang_vel,
     const float* __restrict__ body_inv_mass,
-    const math::Vec3* __restrict__ body_inv_inertia,
+    const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     const float* __restrict__ particle_inv_mass,
     math::Vec3* __restrict__ particle_vel,
     const uint32_t* __restrict__ islands,
@@ -1103,16 +1013,18 @@ __global__ void SolveRowsScalarIslandsKernel(
         for (uint32_t r = 0u; r < rec.seg_cnt; ++r) {
             SolveDynamicRowScalar(row_order[rec.seg_off + r], env_row_base,
                                   env_artic_base, urows, lambda, row_meff,
+                                  row_damping,
                                   body_lin_vel, body_ang_vel, body_inv_mass,
-                                  body_inv_inertia, particle_inv_mass,
+                                  body_world_inv_inertia, particle_inv_mass,
                                   particle_vel, dt, true);
         }
         for (uint32_t it = 0u; it < vel_iters; ++it) {
             for (uint32_t r = 0u; r < rec.seg_cnt; ++r) {
                 SolveDynamicRowScalar(row_order[rec.seg_off + r], env_row_base,
                                       env_artic_base, urows, lambda, row_meff,
+                                      row_damping,
                                       body_lin_vel, body_ang_vel, body_inv_mass,
-                                      body_inv_inertia, particle_inv_mass,
+                                      body_world_inv_inertia, particle_inv_mass,
                                       particle_vel, dt, false);
             }
         }
@@ -1125,7 +1037,7 @@ __global__ void SolveRowsScalarIslandsKernel(
                     row_order[rec.seg_off + r], env_row_base, env_artic_base,
                     row_meff, row_penetration, row_pseudo_lambda, urows,
                     body_pseudo_lin, body_pseudo_ang, body_inv_mass,
-                    body_inv_inertia, particle_inv_mass, particle_pseudo_vel,
+                    body_world_inv_inertia, particle_inv_mass, particle_pseudo_vel,
                     pos_beta, pos_slop, dt, baumgarte_max_velocity);
             }
         }
@@ -1154,13 +1066,14 @@ __global__ void SolveRowsBlockIslandKernel(
     const float* __restrict__ chain_jacobian_b,  // side-B (or null)
     const float* __restrict__ row_minv_jt_b,     // side-B (or null)
     const float* __restrict__ row_meff,
+    const float* __restrict__ row_damping,
     float* __restrict__ qdot_flat,
     Spatial6* __restrict__ link_velocity,
     float* __restrict__ qdot,
     math::Vec3* __restrict__ body_lin_vel,
     math::Vec3* __restrict__ body_ang_vel,
     const float* __restrict__ body_inv_mass,
-    const math::Vec3* __restrict__ body_inv_inertia,
+    const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     const float* __restrict__ particle_inv_mass,
     math::Vec3* __restrict__ particle_vel,
     const uint32_t* __restrict__ islands,
@@ -1236,18 +1149,13 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t qdot_floats =
         (with_b_arm != 0u) ? (k_tiles * dof_stride) : kMaxArticulationDof;
     float* const qdot_sh = reinterpret_cast<float*>(dyn_sh);
-    // Union stages lambda/meff/slim/J/w/order/seg in shared; PairDriven keeps every
-    // row-scaled array in GLOBAL (its per-env island can be thousands of rows),
-    // leaving ONLY the qdot tile(s) in shared. lambda_sh / meff_sh == null select
-    // the global lambda / row_meff source in SolveUnionRowWarp; order_sh / seg_sh
-    // point into this env's disjoint slice of the global pd_solve_scratch buffer
-    // (rows_per_env order u32 followed by 2*rows_per_env segment u32 per env).
-    // Split-impulse position pass (PairDriven only; pos_iters>0). The parallel
-    // pseudo qdot tile follows the real qdot tile in shared, sized identically.
+    // Row data stays in each environment's global scratch; velocity tiles use shared memory.
+    // A position solve adds an equally sized pseudo-velocity tile.
     const bool pos_pass = (pos_iters > 0u) && !cache_jw;
     float* const qdot_pseudo_sh = pos_pass ? (qdot_sh + qdot_floats) : nullptr;
     float* lambda_sh = nullptr;
     float* meff_sh = nullptr;
+    float* damping_sh = nullptr;
     float* J_sh = nullptr;   // shared J/w cache (Union only).
     float* w_sh = nullptr;
     SlimRow* slim_sh = nullptr;
@@ -1262,7 +1170,8 @@ __global__ void SolveRowsBlockIslandKernel(
     if (cache_jw) {
         lambda_sh = qdot_sh + qdot_floats;
         meff_sh = lambda_sh + rows_per_env;
-        J_sh = meff_sh + rows_per_env;
+        damping_sh = meff_sh + rows_per_env;
+        J_sh = damping_sh + rows_per_env;
         w_sh = J_sh + static_cast<size_t>(rows_per_env) * dof_stride;
         slim_sh = reinterpret_cast<SlimRow*>(
             w_sh + static_cast<size_t>(rows_per_env) * dof_stride);
@@ -1332,6 +1241,7 @@ __global__ void SolveRowsBlockIslandKernel(
             const size_t g = static_cast<size_t>(env_row_base) + i;
             lambda_sh[i] = lambda[g];
             meff_sh[i] = row_meff[g];
+            damping_sh[i] = row_damping[g];
             slim_sh[i] = MakeSlimRow(urows[g], env_row_base, env_artic_base);
         }
     }
@@ -1397,11 +1307,12 @@ __global__ void SolveRowsBlockIslandKernel(
                 const uint32_t gslot = obase[off + idx];
                 SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
                                   env_artic_base, gslot, wlane, nullptr,
-                                  nullptr, nullptr, lambda, row_meff,
+                                  nullptr, nullptr, nullptr, lambda, row_meff,
+                                  row_damping,
                                   chain_jacobian, row_minv_jt,
                                   chain_jacobian_b, row_minv_jt_b,
                                   qdot_sh, urows, body_lin_vel, body_ang_vel,
-                                  body_inv_mass, body_inv_inertia,
+                                  body_inv_mass, body_world_inv_inertia,
                                   particle_inv_mass, particle_vel,
                                   dof_stride, dt, true);
             }
@@ -1431,11 +1342,12 @@ __global__ void SolveRowsBlockIslandKernel(
                 SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
                                   env_artic_base, j_row, wlane,
                                   cache_jw ? slim_sh : nullptr,
-                                  lambda_sh, meff_sh, lambda, row_meff,
+                                  lambda_sh, meff_sh, damping_sh,
+                                  lambda, row_meff, row_damping,
                                   Ja, Wa, Jb, Wb,
                                   qdot_sh, urows,
                                   body_lin_vel, body_ang_vel, body_inv_mass,
-                                  body_inv_inertia, particle_inv_mass,
+                                  body_world_inv_inertia, particle_inv_mass,
                                   particle_vel, dof_stride, dt, false);
             }
             if (dynamic) __syncwarp(); else __syncthreads();
@@ -1483,7 +1395,7 @@ __global__ void SolveRowsBlockIslandKernel(
                         chain_jacobian_b, row_minv_jt_b,
                         qdot_pseudo_sh, urows,
                         body_pseudo_lin_vel, body_pseudo_ang_vel,
-                        body_inv_mass, body_inv_inertia,
+                        body_inv_mass, body_world_inv_inertia,
                         particle_inv_mass, particle_pseudo_vel,
                         dof_stride, pos_beta, pos_slop, dt,
                         baumgarte_max_velocity);
@@ -1744,9 +1656,10 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 dim3(kScalarIslandBlockSize), 0u, stream,
                 reinterpret_cast<const NkRow*>(data.urows), data.lambda,
                 static_cast<const float*>(data.row_meff),
+                static_cast<const float*>(data.row_damping),
                 data.body_linear_velocity, data.body_angular_velocity,
                 static_cast<const float*>(data.body_inv_mass),
-                static_cast<const math::Vec3*>(data.body_inv_inertia),
+                static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
                 static_cast<const float*>(data.particle_inv_mass), data.particle_vel,
                 data.island_quads, data.island_rows,
                 pos_pass ? static_cast<const float*>(data.row_penetration) : nullptr,
@@ -1774,13 +1687,14 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    with_b_arm ? static_cast<const float*>(data.row_minv_jt_b)
                               : nullptr,
                    static_cast<const float*>(data.row_meff),
+                   static_cast<const float*>(data.row_damping),
                    data.qdot_flat,
                    reinterpret_cast<Spatial6*>(data.link_velocity),
                    data.qdot,
                    data.body_linear_velocity,
                    data.body_angular_velocity,
                    static_cast<const float*>(data.body_inv_mass),
-                   static_cast<const math::Vec3*>(data.body_inv_inertia),
+                   static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
                    static_cast<const float*>(data.particle_inv_mass),
                    data.particle_vel,
                    islands_in,
@@ -1822,7 +1736,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                        static_cast<const uint32_t*>(model.dof_to_component));
         }
         if (with_b_arm && p->base_link_count > 0u &&
-            p->rows_per_env >= p->contact_rows_per_env + p->base_link_count * 2u &&
+            p->joint_limit_rows_per_env >= p->base_link_count * 2u &&
             data.joint_limit_impulse != nullptr) {
             const uint32_t total_links = p->base_link_count * p->env_count;
             const uint32_t blocks =

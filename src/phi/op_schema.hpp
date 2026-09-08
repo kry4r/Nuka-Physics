@@ -166,6 +166,7 @@ enum class NkOp : uint16_t {
                             // (stable NkOp values; execution order is the pipeline's,
                             // not the enum value).
     ContactWarmStart,       // ContactId-indexed warm-start prepare/commit.
+    SnapshotStepVelocity,   // Capture the contact acceleration reference before forces.
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -217,6 +218,15 @@ struct IntegrateVelocityParams {
     // The rigid-body arm: movable rigid-body gravity velocity-kick arm (the union world's
     // per-body `linear_velocity.z += g*dt` for inv_mass > 0). 0 = no bodies.
     uint32_t total_body_count;
+};
+
+struct SnapshotStepVelocityParams {
+    uint32_t env_count;
+    uint32_t articulation_count;
+    uint32_t max_dof;
+    uint32_t base_link_count;
+    uint32_t total_body_count;
+    uint32_t total_particle_count;
 };
 
 struct FkWorldPosesParams {
@@ -590,7 +600,9 @@ struct AssembleRowsParams {
     uint32_t family;            // kContactFamily*
     uint32_t union_slot_count;  // union slots per env
     uint32_t rows_per_env;      // row slots per env (== max_rows_per_env)
-    uint32_t contact_rows_per_env; // fixed contact footprint before joint-limit rows
+    uint32_t contact_rows_per_env; // fixed contact footprint before joint rows
+    uint32_t joint_limit_rows_per_env;
+    uint32_t joint_friction_rows_per_env;
     // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
     // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
     // Equal to union_slot_count when the model has no body-particle reserve.
@@ -629,7 +641,8 @@ struct SolveRowsBlockIslandParams {
     uint32_t env_count;
     uint32_t articulation_count;
     uint32_t rows_per_env;       // row slots per env (union family)
-    uint32_t contact_rows_per_env; // fixed contact footprint before joint-limit rows
+    uint32_t contact_rows_per_env; // fixed contact footprint before joint rows
+    uint32_t joint_limit_rows_per_env;
     uint32_t base_link_count;    // links per env (qdot scatter)
     uint32_t total_body_count;   // env-major rigid body count
     // Fused-family legacy knobs (Model properties; unused by the union family):
@@ -857,6 +870,7 @@ struct ReadoutContactWrenchParams {
     uint32_t base_link_count;
     uint32_t max_contacts_per_env;
     uint32_t rows_per_env;      // per-env solver row-slot span (max_rows_per_env)
+    uint32_t full_row_slot_count;  // rigid slots [0, this) use the 12-row layout
 };
 
 struct ExportObsParams {

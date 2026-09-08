@@ -72,17 +72,15 @@ struct EnvironmentMap {
     bool Enabled() const { return width > 0u && height > 0u && !texels.empty(); }
 };
 
-// One analytic light. directional == true: `direction` is the (unit) direction
-// the light TRAVELS (so the vector TO the light is -direction); distance is
-// infinite (shadow rays use a large t_max). directional == false: `position` is
-// a world point; the vector to the light is (position - hit) and the shadow ray
-// t_max is that distance.
+// Directional lights use their travel direction; point lights use a world position.
+// A body-attached point light is anchored to the rendering camera.
 struct Light {
     math::Vec3 color{1.0f, 1.0f, 1.0f};
     math::Vec3 direction{0.0f, -1.0f, 0.0f}; // travel dir (directional)
     math::Vec3 position{0.0f, 0.0f, 0.0f};   // world point (point light)
     float intensity = 1.0f;
     bool directional = true;
+    bool body_attached = false;
 };
 
 // Ambient term added once (flat, NOT ambient occlusion -- AO is a G2 photoreal

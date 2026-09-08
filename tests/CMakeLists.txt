@@ -1379,6 +1379,9 @@ if(CMAKE_CUDA_COMPILER)
         # Dynamic island solve == the static one-island-per-env schedule, bit-for-bit,
         # in the contact->airborne (pos_iters>0) and multi-env mixed-contact regimes.
         scenario/island_byte_identity.cpp
+        scenario/pairdriven_rigid_release.cpp
+        scenario/osc_passive_damping.cpp
+        scenario/free_rigid_dynamics.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test

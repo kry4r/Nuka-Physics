@@ -47,6 +47,7 @@ struct ModelCapacities {
     uint32_t max_contacts_per_env = 0;  // contact-slot capacity / env.
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
+    uint32_t joint_friction_rows_per_env = 0; // one scalar slot per link when friction is authored
     uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
     uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
     uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
@@ -481,6 +482,7 @@ public:
         math::Vec3 angular_velocity{};
         float      inv_mass = 0.0f;
         math::Vec3 inv_inertia{};
+        math::Transform inertial_frame = math::Transform::Identity();
     };
     std::vector<BodyInit> body_init;
     // The flat-DOF -> (template-local link, base component) maps (the legacy

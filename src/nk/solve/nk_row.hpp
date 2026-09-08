@@ -62,6 +62,7 @@ inline constexpr uint32_t kBlockTangent = 1u << 3;
 inline constexpr uint32_t kJointLimitLower = 1u << 4;
 inline constexpr uint32_t kJointLimitUpper = 1u << 5;
 inline constexpr uint32_t kJointLimit = kJointLimitLower | kJointLimitUpper;
+inline constexpr uint32_t kContactNormal = 1u << 6;
 }  // namespace nk_row_flags
 
 // General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-

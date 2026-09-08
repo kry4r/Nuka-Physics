@@ -177,6 +177,7 @@ bool World::SeedInitialState() {
         std::vector<math::Vec3> ang(static_cast<size_t>(B) * E);
         std::vector<float> inv_mass(static_cast<size_t>(B) * E, 0.0f);
         std::vector<math::Vec3> inv_inertia(static_cast<size_t>(B) * E);
+        std::vector<math::Transform> inertial_frame(static_cast<size_t>(B) * E);
         for (uint32_t e = 0; e < E; ++e) {
             for (uint32_t b = 0; b < B; ++b) {
                 const Model::BodyInit& src =
@@ -188,6 +189,7 @@ bool World::SeedInitialState() {
                 ang[at] = src.angular_velocity;
                 inv_mass[at] = src.inv_mass;
                 inv_inertia[at] = src.inv_inertia;
+                inertial_frame[at] = src.inertial_frame;
             }
         }
         if (!data_.UploadField(FieldId::BodyPose, poses.data(),
@@ -199,7 +201,9 @@ bool World::SeedInitialState() {
             !data_.UploadField(FieldId::BodyInvMass, inv_mass.data(),
                                inv_mass.size() * sizeof(float)) ||
             !data_.UploadField(FieldId::BodyInvInertia, inv_inertia.data(),
-                               inv_inertia.size() * sizeof(math::Vec3))) {
+                               inv_inertia.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::BodyInertialFrame, inertial_frame.data(),
+                               inertial_frame.size() * sizeof(math::Transform))) {
             return false;
         }
     }
@@ -564,7 +568,13 @@ phi::Status World::DispatchOp(phi::NkOp op, const void* params) {
 
 void World::DemandReadout(FieldId id) {
     uint32_t bit = 0u;
-    if (id == FieldId::LinkContactWrench || id == FieldId::ContactForce) {
+    // Every field OpReadoutContactWrench produces (geometry + {Fn,Ft1,Ft2} +
+    // owning link + per-link wrench) shares the one readout bit.
+    if (id == FieldId::LinkContactWrench || id == FieldId::ContactForce ||
+        id == FieldId::ContactPoint || id == FieldId::ContactNormal ||
+        id == FieldId::ContactLink || id == FieldId::ContactSideAKind ||
+        id == FieldId::ContactSideBKind || id == FieldId::ContactSideAIndex ||
+        id == FieldId::ContactSideBIndex) {
         bit = Pipeline::kReadoutContactWrench;
     }
     if (bit == 0u || (readout_demand_ & bit) != 0u) {

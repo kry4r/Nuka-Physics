@@ -19,7 +19,6 @@
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
-#include <cstdio>
 
 #include "collision/analytical_manifold.hpp"   // amf:: analytic handlers (HD)
 #include "collision/convex_narrowphase.hpp"    // cvx:: GJK/EPA/face-clip (G5)
@@ -180,22 +179,11 @@ __global__ void PairDrivenNarrowphaseKernel(
     uint32_t* __restrict__ contact_count) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Diagnostic: write marker BEFORE any early return to confirm kernel runs
-    if (gid == 0) {
-        upoint[0] = math::Vec3{999.0f, 888.0f, 777.0f};  // marker
-    }
-
     const uint32_t total = env_count * slot_stride;
     if (gid >= total) return;
     const uint32_t env = gid / slot_stride;
     const uint32_t slot = gid - env * slot_stride;
     const uint32_t live = pair_count[env];
-
-    // Diagnostic: encode diagnostic values into first two contact points
-    if (gid == 0) {
-        upoint[0] = math::Vec3{static_cast<float>(live), static_cast<float>(rigid_slot_cap), static_cast<float>(slot_stride)};
-        upoint[1] = math::Vec3{static_cast<float>(env_count), static_cast<float>(bodies_per_env), static_cast<float>(gid)};
-    }
 
     ContactManifold m;
     m.Clear();
@@ -221,11 +209,6 @@ __global__ void PairDrivenNarrowphaseKernel(
     const uint32_t n = m.point_count;
     ucount[gid] = n;
 
-    // Diagnostic: write (a,b) pairs to contact points 2-11 (slots 0-9)
-    if (env == 0 && slot < 10) {
-        const size_t pt_idx = static_cast<size_t>(slot + 2u);
-        upoint[pt_idx] = math::Vec3{static_cast<float>(a), static_cast<float>(b), static_cast<float>(n)};
-    }
     for (uint32_t i = 0u; i < 4u; ++i) {
         const size_t at = static_cast<size_t>(gid) * 4u + i;
         if (i < n) {
@@ -284,22 +267,7 @@ __global__ void ZeroEnvKernel(uint32_t* __restrict__ contact_count,
 Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                                    const NarrowphasePrimitivesParams& p,
                                    cudaStream_t stream) {
-    // Diagnostic: write launch params BEFORE early return check
-    if (data.ucontact_point != nullptr) {
-        math::Vec3 diag[3];
-        diag[0] = {static_cast<float>(p.env_count),
-                   static_cast<float>(p.union_slot_count),
-                   static_cast<float>(p.rigid_slot_cap)};
-        diag[1] = {12345.0f, 67890.0f, 11111.0f};  // marker to confirm host write
-        diag[2] = {static_cast<float>(p.bodies_per_env), 0.0f, 0.0f};
-        cudaMemcpyAsync(data.ucontact_point, diag, sizeof(math::Vec3) * 3,
-                        cudaMemcpyHostToDevice, stream);
-        cudaStreamSynchronize(stream);  // ensure write completes
-    }
-
     if (p.env_count == 0u || p.union_slot_count == 0u) {
-        printf("[LaunchPairDrivenNarrowphase] Early return: env_count=%u, slot_count=%u\n",
-               p.env_count, p.union_slot_count);
         return Status::Ok;
     }
     constexpr uint32_t kBlock = 128u;
