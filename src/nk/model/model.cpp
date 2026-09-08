@@ -95,6 +95,10 @@ uint64_t ModelCapacities::NeighborPoolCapacity() const {
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    if (contact_index_scratch_bytes == 0u &&
+        (id == FieldId::ActiveRowIds || id == FieldId::ActiveRowCount ||
+         id == FieldId::ContactEndpointKeys || id == FieldId::ContactEndpointCount ||
+         id == FieldId::LinkContactBegin || id == FieldId::LinkContactEnd)) return 0u;
     if (aero_tris_per_env == 0u &&
         (id == FieldId::AeroParticleOffset || id == FieldId::AeroParticleCount))
         return 0u;
@@ -179,6 +183,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         }
         if (id == FieldId::LbvhSortScratch) return lbvh_sort_scratch_bytes;
         if (id == FieldId::ContactCacheScratch) return contact_cache_scratch_bytes;
+        if (id == FieldId::ContactIndexScratch) return contact_index_scratch_bytes;
         // Dynamic-island component count (BuildSolveIslands): the solve grid
         // watermark — one global u32.
         if (id == FieldId::IslandCount) {
@@ -983,6 +988,8 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
     try {
         if (env_count == 0u) throw std::invalid_argument("environment count must be positive");
         const auto int_limit = static_cast<uint64_t>(std::numeric_limits<int>::max());
+        if (links_per_env != 0u && CheckedProduct({max_rows_per_env, env_count, 2u}) > int_limit)
+            throw std::invalid_argument("contact endpoints exceed device sort index range");
         for (auto count : {CheckedProduct({max_rows_per_env, env_count}),
                            CheckedProduct({max_contacts_per_env, env_count, kPairDrivenPtsPerSlot, 2u}),
                            CheckedProduct({particles_per_env, env_count}),

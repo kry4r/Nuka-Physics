@@ -239,6 +239,13 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridNeighborAttempted: v.grid_neighbor_attempted = static_cast<uint32_t*>(p); break;
         case FieldId::LbvhSortScratch: v.lbvh_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::ContactCacheScratch: v.contact_cache_scratch = static_cast<uint8_t*>(p); break;
+        case FieldId::ActiveRowIds: v.active_row_ids = static_cast<uint32_t*>(p); break;
+        case FieldId::ActiveRowCount: v.active_row_count = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactEndpointKeys: v.contact_endpoint_keys = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactEndpointCount: v.contact_endpoint_count = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkContactBegin: v.link_contact_begin = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkContactEnd: v.link_contact_end = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactIndexScratch: v.contact_index_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
         case FieldId::GridSortScratch:     v.grid_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSortScratch:     v.pair_sort_scratch = static_cast<uint8_t*>(p); break;

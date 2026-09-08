@@ -103,6 +103,7 @@ struct ModelCapacities {
     uint64_t pair_sort_scratch_bytes = 0;
     uint64_t lbvh_sort_scratch_bytes = 0;
     uint64_t contact_cache_scratch_bytes = 0;
+    uint64_t contact_index_scratch_bytes = 0;
 
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.

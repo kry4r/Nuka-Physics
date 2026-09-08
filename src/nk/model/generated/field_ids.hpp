@@ -286,6 +286,13 @@ enum class FieldId : uint16_t {
     GridNeighborScanOffset,  // grid_neighbor_scan_offset (per:particle arena:scratch owner:data)
     LbvhSortScratch,  // lbvh_sort_scratch (per:scalar arena:scratch owner:data count:lbvh_sort_scratch_bytes)
     ContactCacheScratch,  // contact_cache_scratch (per:scalar arena:scratch owner:data count:contact_cache_scratch_bytes)
+    ActiveRowIds,  // active_row_ids (per:row_slot arena:scratch owner:data)
+    ActiveRowCount,  // active_row_count (per:env arena:scratch owner:data)
+    ContactEndpointKeys,  // contact_endpoint_keys (per:row_slot arena:scratch owner:data elem:2)
+    ContactEndpointCount,  // contact_endpoint_count (per:env arena:scratch owner:data)
+    LinkContactBegin,  // link_contact_begin (per:link arena:scratch owner:data)
+    LinkContactEnd,  // link_contact_end (per:link arena:scratch owner:data)
+    ContactIndexScratch,  // contact_index_scratch (per:scalar arena:scratch owner:data count:contact_index_scratch_bytes)
     Count
 };
 
@@ -567,6 +574,13 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "grid_neighbor_scan_offset",
     "lbvh_sort_scratch",
     "contact_cache_scratch",
+    "active_row_ids",
+    "active_row_count",
+    "contact_endpoint_keys",
+    "contact_endpoint_count",
+    "link_contact_begin",
+    "link_contact_end",
+    "contact_index_scratch",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

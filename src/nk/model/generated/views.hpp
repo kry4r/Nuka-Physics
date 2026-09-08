@@ -311,6 +311,13 @@ struct DataView {
     uint64_t* grid_neighbor_scan_offset = nullptr;  // per:particle arena:scratch owner:data
     uint8_t* lbvh_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:lbvh_sort_scratch_bytes
     uint8_t* contact_cache_scratch = nullptr;  // per:scalar arena:scratch owner:data count:contact_cache_scratch_bytes
+    uint32_t* active_row_ids = nullptr;  // per:row_slot arena:scratch owner:data
+    uint32_t* active_row_count = nullptr;  // per:env arena:scratch owner:data
+    uint64_t* contact_endpoint_keys = nullptr;  // per:row_slot arena:scratch owner:data elem:2
+    uint32_t* contact_endpoint_count = nullptr;  // per:env arena:scratch owner:data
+    uint32_t* link_contact_begin = nullptr;  // per:link arena:scratch owner:data
+    uint32_t* link_contact_end = nullptr;  // per:link arena:scratch owner:data
+    uint8_t* contact_index_scratch = nullptr;  // per:scalar arena:scratch owner:data count:contact_index_scratch_bytes
 };
 
 } // namespace nuka::phi

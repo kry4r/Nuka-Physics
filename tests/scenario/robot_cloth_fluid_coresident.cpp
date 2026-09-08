@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -61,7 +62,8 @@ PipelineState ReadPipelineState(nk::World& world) {
                       nk::FieldId::LinkVelocity, nk::FieldId::BodyPose,
                       nk::FieldId::BodyLinearVelocity, nk::FieldId::BodyAngularVelocity,
                       nk::FieldId::ParticlePos,
-                      nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel}) {
+                      nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel,
+                      nk::FieldId::ContactForce, nk::FieldId::LinkContactWrench}) {
         const auto& segments = world.GetData().Segments();
         const auto segment = std::find_if(segments.begin(), segments.end(),
             [field](const auto& value) { return value.field == field; });
@@ -86,6 +88,10 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
     ASSERT_TRUE(graph.Ready()) << graph.CreationError();
     const auto initial = ReadPipelineState(graph);
     const auto* address = graph.DataViewRef().particle_pos;
+    const auto* endpoint_address = graph.DataViewRef().contact_endpoint_keys;
+    const auto* index_address = graph.DataViewRef().active_row_ids;
+    ASSERT_NE(endpoint_address, nullptr);
+    ASSERT_NE(index_address, nullptr);
     ASSERT_EQ(graph.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok)
         << graph.LastExecutionError().message;
     EXPECT_EQ(ReadPipelineState(graph), initial);
@@ -126,9 +132,112 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
     EXPECT_EQ(graph.GraphReplays(), 16u);
     ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
     EXPECT_EQ(graph.DataViewRef().particle_pos, address);
+    EXPECT_EQ(graph.DataViewRef().contact_endpoint_keys, endpoint_address);
+    EXPECT_EQ(graph.DataViewRef().active_row_ids, index_address);
     EXPECT_EQ(ReadPipelineState(graph), initial);
     ASSERT_EQ(graph.StepConfigured(), nphi::Status::Ok);
     EXPECT_EQ(graph.CaptureAttempts(), 2u);
+}
+
+template <class T>
+std::vector<T> ReadContactValues(nk::World& world, nk::FieldId field) {
+    const auto bytes = world.GetModel().capacities.ElementCount(field) * nk::LayoutOf(field).elem_size;
+    std::vector<T> values(bytes / sizeof(T));
+    EXPECT_TRUE(world.GetData().DownloadField(field, values.data(), bytes));
+    return values;
+}
+
+TEST(RobotClothFluidCoResident, ContactWrenchPreservesEndpointOrderAndIsolation) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    constexpr uint32_t envs = 3u;
+    nk::World world(CookRobot(Go2ScenePath()), envs, backend.dev, backend.backend, Cfg());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    const auto& cap = world.GetModel().capacities;
+    const uint32_t stride = cap.max_rows_per_env, links = cap.links_per_env;
+    ASSERT_GE(stride, 8u);
+    ASSERT_GE(links, 2u);
+    std::vector<nk::NkRow> rows(stride * envs);
+    std::vector<float> lambda(rows.size());
+    std::vector<uint32_t> link_a(rows.size(), ~0u), link_b(rows.size(), ~0u);
+    std::vector<Vec3> point_a(rows.size()), point_b(rows.size()), dir_a(rows.size()), dir_b(rows.size());
+    std::vector<Transform> poses(links * envs, Transform::Identity());
+    auto activate = [&](uint32_t row, uint32_t a, uint32_t b, float impulse) {
+        rows[row].flags = nk::nk_row_flags::kActive;
+        link_a[row] = a;
+        link_b[row] = b;
+        lambda[row] = impulse;
+    };
+    activate(2u, 0u, 0u, 2.0f);
+    point_a[2] = {0, 1, 0}; point_b[2] = {0, -1, 0};
+    dir_a[2] = {1, 0, 0}; dir_b[2] = {-1, 0, 0};
+    activate(5u, 0u, 1u, 1.0f);
+    point_a[5] = point_b[5] = {1, 0, 0};
+    dir_a[5] = {0, 1, 0}; dir_b[5] = {0, -1, 0};
+    activate(stride - 1u, ~0u, ~0u, 0.0f);
+    link_a[7] = 0u; dir_a[7] = {1, 1, 1}; lambda[7] = 1024.0f;
+    const uint32_t last_row = 2u * stride + 1u, last_link = links * envs - 1u;
+    activate(last_row, 0u, last_link, 0.5f);
+    point_b[last_row] = {0, 2, 0}; dir_b[last_row] = {0, 0, 1};
+    dir_a[last_row] = {1, 1, 1};
+    auto upload = [&](nk::FieldId field, const auto& values) {
+        ASSERT_TRUE(world.GetData().UploadField(field, values.data(), values.size() * sizeof(values[0])));
+    };
+    upload(nk::FieldId::Urows, rows);
+    upload(nk::FieldId::Lambda, lambda);
+    upload(nk::FieldId::RowCjLink, link_a);
+    upload(nk::FieldId::RowCjLinkB, link_b);
+    upload(nk::FieldId::RowCjPoint, point_a);
+    upload(nk::FieldId::RowCjPointB, point_b);
+    upload(nk::FieldId::RowCjDir, dir_a);
+    upload(nk::FieldId::RowCjDirB, dir_b);
+    upload(nk::FieldId::LinkPose, poses);
+    nphi::ReadoutContactWrenchParams params{};
+    params.dt = 0.5f;
+    params.env_count = envs;
+    params.base_link_count = links;
+    params.max_contacts_per_env = cap.max_contacts_per_env;
+    params.rows_per_env = stride;
+    params.full_row_slot_count = cap.max_contacts_per_env;
+    params.workspace_bytes = cap.contact_index_scratch_bytes;
+    ASSERT_EQ(world.DispatchOp(nphi::NkOp::ReadoutContactWrench, &params), nphi::Status::Ok);
+    ASSERT_EQ(world.Synchronize(), nphi::Status::Ok);
+    EXPECT_EQ(ReadContactValues<uint32_t>(world, nk::FieldId::ActiveRowCount),
+              (std::vector<uint32_t>{3u, 0u, 1u}));
+    EXPECT_EQ(ReadContactValues<uint32_t>(world, nk::FieldId::ContactEndpointCount),
+              (std::vector<uint32_t>{4u, 0u, 1u}));
+    const auto active = ReadContactValues<uint32_t>(world, nk::FieldId::ActiveRowIds);
+    EXPECT_EQ((std::vector<uint32_t>{active[0], active[1], active[2], active[2u * stride]}),
+              (std::vector<uint32_t>{2u, 5u, stride - 1u, last_row}));
+    const auto endpoints = ReadContactValues<uint64_t>(world, nk::FieldId::ContactEndpointKeys);
+    EXPECT_EQ((std::vector<uint64_t>{endpoints[0], endpoints[1], endpoints[2], endpoints[3]}),
+              (std::vector<uint64_t>{4u, 5u, 10u, (uint64_t{1u} << 32u) | 11u}));
+    EXPECT_EQ(endpoints[4u * stride], (uint64_t{last_link} << 32u) | (last_row * 2u + 1u));
+    std::vector<float> expected(links * envs * 6u);
+    expected[1] = 2.0f; expected[5] = -6.0f;
+    expected[7] = -2.0f; expected[11] = -2.0f;
+    expected[last_link * 6u + 2u] = 1.0f; expected[last_link * 6u + 3u] = 2.0f;
+    EXPECT_EQ(ReadContactValues<float>(world, nk::FieldId::LinkContactWrench), expected);
+    for (uint32_t failure = 0u; failure < 3u; ++failure) {
+        auto invalid = params;
+        if (failure == 0u) invalid.workspace_bytes = 1u;
+        if (failure == 1u) invalid.rows_per_env = 1u;
+        if (failure == 2u) invalid.env_count = invalid.rows_per_env = std::numeric_limits<uint32_t>::max();
+        EXPECT_EQ(world.DispatchOp(nphi::NkOp::ReadoutContactWrench, &invalid), nphi::Status::InvalidArgument);
+        EXPECT_EQ(ReadContactValues<float>(world, nk::FieldId::LinkContactWrench), expected);
+    }
+    ASSERT_EQ(world.Reset({0u}), nphi::Status::Ok);
+    EXPECT_EQ(ReadContactValues<uint32_t>(world, nk::FieldId::ActiveRowCount),
+              (std::vector<uint32_t>{0u, 0u, 1u}));
+    std::fill(expected.begin(), expected.begin() + links * 6u, 0.0f);
+    EXPECT_EQ(ReadContactValues<float>(world, nk::FieldId::LinkContactWrench), expected);
+    ASSERT_EQ(world.Reset(), nphi::Status::Ok);
+    ASSERT_EQ(world.DispatchOp(nphi::NkOp::ReadoutContactWrench, &params), nphi::Status::Ok);
+    EXPECT_EQ(ReadContactValues<uint32_t>(world, nk::FieldId::ActiveRowCount), std::vector<uint32_t>(envs));
+    EXPECT_EQ(ReadContactValues<uint32_t>(world, nk::FieldId::ContactEndpointCount), std::vector<uint32_t>(envs));
+    EXPECT_EQ(ReadContactValues<uint32_t>(world, nk::FieldId::LinkContactBegin), std::vector<uint32_t>(links * envs));
+    EXPECT_EQ(ReadContactValues<uint32_t>(world, nk::FieldId::LinkContactEnd), std::vector<uint32_t>(links * envs));
+    EXPECT_EQ(ReadContactValues<float>(world, nk::FieldId::LinkContactWrench), std::vector<float>(expected.size()));
 }
 
 void DownloadParticles(nk::World& w, std::vector<Vec3>* pos) {

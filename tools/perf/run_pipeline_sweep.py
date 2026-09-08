@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--capacity-scale", type=int, default=1)
     parser.add_argument("--save-state", action="store_true")
+    parser.add_argument("--save-wrench", action="store_true")
     args = parser.parse_args()
     if args.processes < 1 or any(count < 1 for count in args.envs):
         parser.error("positive process and environment counts required")
@@ -56,8 +57,11 @@ def main():
                            "--seed", "20260908", "--capacity-scale", str(args.capacity_scale),
                            "--perf-json", str(result_path)]
                 state_path = args.output / (label + ".state") if args.save_state and process == 0 else None
+                wrench_path = args.output / (label + ".wrench") if args.save_wrench and process == 0 else None
                 if state_path is not None:
                     command.extend(["--state-output", str(state_path.resolve())])
+                if wrench_path is not None:
+                    command.extend(["--wrench-output", str(wrench_path.resolve())])
                 before = gpu_state()
                 start = time.perf_counter()
                 with (args.output / (label + ".log")).open("w") as log:
@@ -69,6 +73,9 @@ def main():
                 if state_path is not None and state_path.exists():
                     receipt["state_sha256"] = digest(state_path)
                     receipt["state_bytes"] = state_path.stat().st_size
+                if wrench_path is not None and wrench_path.exists():
+                    receipt["wrench_sha256"] = digest(wrench_path)
+                    receipt["wrench_bytes"] = wrench_path.stat().st_size
                 (args.output / (label + "_command.json")).write_text(json.dumps(receipt, indent=2) + "\n")
                 print(json.dumps(receipt), flush=True)
                 if completed.returncode or not result_path.exists():
@@ -84,10 +91,15 @@ def main():
             gpu = [sample["timing"]["batch_step_ms"] for sample in samples]
             wall = [sample["timing"]["synchronized_wall_ms"] / args.steps for sample in samples]
             states = sorted({sample["quality"]["state_fnv1a64"] for sample in samples})
+            wrench_samples = [sample["quality"].get("link_wrench_trace_fnv1a64") for sample in samples]
+            wrenches = sorted({value for value in wrench_samples if value is not None})
+            wrench_consistent = len(wrenches) <= 1 and (not wrenches or all(wrench_samples))
             summary.append({"envs": envs, "execution": execution, "processes": len(samples),
                             "gpu_batch_step_ms_median": statistics.median(gpu), "gpu_range_ms": [min(gpu), max(gpu)],
                             "wall_batch_step_ms_median": statistics.median(wall), "wall_range_ms": [min(wall), max(wall)],
-                            "final_state_digests": states, "cross_process_d1": len(states) == 1})
+                            "final_state_digests": states, "wrench_trace_digests": wrenches,
+                            "wrench_trace_available": bool(wrenches),
+                            "cross_process_d1": len(states) == 1 and wrench_consistent})
     report = {"source_id": args.source_id, "binary_sha256": binary_hash, "summary": summary}
     (args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)

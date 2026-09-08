@@ -302,6 +302,13 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::GridNeighborScanOffset, DlpackDtype::kU64, 1, false, false},  // grid_neighbor_scan_offset
     {FieldId::LbvhSortScratch, DlpackDtype::kU8, 1, false, false},  // lbvh_sort_scratch
     {FieldId::ContactCacheScratch, DlpackDtype::kU8, 1, false, false},  // contact_cache_scratch
+    {FieldId::ActiveRowIds, DlpackDtype::kU32, 1, false, false},  // active_row_ids
+    {FieldId::ActiveRowCount, DlpackDtype::kU32, 1, false, false},  // active_row_count
+    {FieldId::ContactEndpointKeys, DlpackDtype::kU64, 2, false, false},  // contact_endpoint_keys
+    {FieldId::ContactEndpointCount, DlpackDtype::kU32, 1, false, false},  // contact_endpoint_count
+    {FieldId::LinkContactBegin, DlpackDtype::kU32, 1, false, false},  // link_contact_begin
+    {FieldId::LinkContactEnd, DlpackDtype::kU32, 1, false, false},  // link_contact_end
+    {FieldId::ContactIndexScratch, DlpackDtype::kU8, 1, false, false},  // contact_index_scratch
 };
 
 } // namespace nuka::nk

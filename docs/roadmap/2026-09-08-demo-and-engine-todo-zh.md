@@ -66,6 +66,10 @@
 - [x] 修复 pair snapshot 索引域覆盖，加入物理副本质量门；冻结仅修复此缺陷的旧架构基线与最终候选，保留旧 E=256 无效证据。
 - [x] 收口修正基线的五进程、容量×1/2/4 物理等价、公共渲染与最终 profile；65 个独立进程通过，新 graph E=1/16/256 为 3.073/3.367/6.499 ms，见执行验收。
 - [ ] 基于正确基线继续活跃 row/endpoint、确定性 link wrench gather、J/质量算子与岛调度；MPM/SDF/光追补各自基线，不能套用 PBF 加速比。
+- [x] 接触索引改造前冻结逐步 wrench 观测基线；graph E=1/16/256 各五进程、450 步读出轨迹通过，见 [本批 review](../research/2026-09-09-contact-index-upstream-review-zh.md)。
+- [x] 接触索引的功能/graph 子集：主 pipeline 34 passed，每步 wrench 与完整末帧逐字节一致；容量×1/2/4、graph/demand/reset、公共 API/渲染和 memcheck 通过，默认 graph 降时 16.08%–17.64%，见 [报告](../research/2026-09-09-contact-index-validation-zh.md)。
+- [ ] 接触索引 eager 性能：分组五进程与两组交错对照仍有回退；固定 CPU 未消除。完成 host launch/调度归因并处理，不把 graph 加速写成全部模式通过。
+- [ ] 依据新 profile 继续有效岛/J：岛求解占 kernel 时间 32.12%，XPBD bend/distance 占 17.98%；检查容量网格、active spans 和临时内存。MPM/SDF/光追仍先补各自完整基线。
 - [ ] T08a/T10a 剩余：真实接触密度曲线、完整容量水位及显存峰值；活跃 cache 排序/merge 和字段预算已实现。
 - [ ] T17 剩余：公共容量配置、投影位移触发的刷新/skin、边界密度和完整粒子时间层。
 - [ ] M04/M06：定位双浮基机器人重叠不分离；冻结旧版同样失败，尚未归因。

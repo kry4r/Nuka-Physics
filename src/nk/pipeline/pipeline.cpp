@@ -728,6 +728,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_readout_.max_contacts_per_env = cap.max_contacts_per_env;
         p_readout_.rows_per_env = cap.max_rows_per_env;
         p_readout_.full_row_slot_count = rigid_cap;
+        p_readout_.workspace_bytes = cap.contact_index_scratch_bytes;
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }
 
