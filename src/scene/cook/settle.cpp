@@ -143,13 +143,12 @@ SettleResult Settle(nk::World& world, const SceneIR& scene, const SceneMap& map,
         world.Step();
     }
 
-    // -- 4. Snapshot the settled state (so the settled q/base/body pose becomes
-    // the Reset-restore source: a later SnapshotState was already taken at ctor;
-    // this OVERWRITES it with the settled state — relying on T1's snapshot_body_*
-    // + snapshot_q/base coverage).
+    // Use the complete settled state as the reset snapshot.
     phi::SnapshotStateParams snap{};
     snap.total_link_count = L * E;
     snap.env_count = E;
+    snap.articulation_count = world.GetModel().capacities.articulations_per_env * E;
+    snap.total_particle_count = world.GetModel().capacities.particles_per_env * E;
     snap.total_body_count = B * E;
     if (world.DispatchOp(phi::NkOp::SnapshotState, &snap) != phi::Status::Ok) {
         return result;  // ok == false.

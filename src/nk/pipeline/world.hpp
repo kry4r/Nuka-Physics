@@ -86,12 +86,8 @@ public:
     // use Step()).
     phi::Status StepPlanned();
 
-    // Reset the selected envs DEVICE-SIDE (M3b): an empty list dispatches the
-    // bulk RestoreState op (snapshot -> live + clear qddot/tau/lambda, the
-    // legacy batched articulated Reset 1:1); a non-empty list uploads the
-    // ids into the reset_env_ids field and dispatches the per-env masked
-    // ResetEnvs op (the p03 ResetEnvsKernel port). The restore source is the
-    // construction-time SnapshotState (the cooked initial pose).
+    // Restore the selected environment set; empty selects all, duplicates are ignored.
+    // Invalid IDs fail without mutation. Control targets and unselected environments stay intact.
     phi::Status Reset(const std::vector<uint32_t>& env_ids = {});
 
     // Dispatch a single op outside the per-step pipeline (oracle harness +

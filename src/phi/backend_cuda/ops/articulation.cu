@@ -1380,8 +1380,13 @@ __global__ void ApplyOscPoseDriveKernel(
 }
 
 __global__ void UpdateWorldLinkPosesKernel(ArticulationDeviceState state,
-                                           math::Transform* out_world_pose) {
-    const uint32_t articulation = blockIdx.x;
+                                           math::Transform* out_world_pose,
+                                           const uint32_t* env_ids,
+                                           uint32_t articulations_per_env) {
+    const uint32_t articulation = env_ids
+        ? env_ids[blockIdx.x / articulations_per_env] * articulations_per_env +
+              blockIdx.x % articulations_per_env
+        : blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
         return;
@@ -1542,13 +1547,18 @@ Status OpFkWorldPoses(const ModelView& model, const DataView& data,
     if (p->articulation_count == 0u || p->total_link_count == 0u) {
         return Status::Ok;
     }
+    if (p->selected_env_count > 0u &&
+        (p->articulations_per_env == 0u || data.reset_env_ids == nullptr ||
+         p->articulation_count % p->articulations_per_env != 0u ||
+         p->selected_env_count > p->articulation_count / p->articulations_per_env))
+        return Status::Failed;
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, p->total_link_count, p->articulation_count);
-    // out_world_pose = the link_pose field itself: the kernel never reads
-    // link_pose (header note), so this is byte-identical to the legacy
-    // world_pose_-then-copy and saves the D2D copy.
-    LaunchCuda(UpdateWorldLinkPosesKernel, dim3(p->articulation_count), dim3(32u),
-               0u, stream, state, data.link_pose);
+    const uint32_t count = p->selected_env_count > 0u
+        ? p->selected_env_count * p->articulations_per_env : p->articulation_count;
+    const uint32_t* env_ids = p->selected_env_count > 0u ? data.reset_env_ids : nullptr;
+    LaunchCuda(UpdateWorldLinkPosesKernel, dim3(count), dim3(32u),
+               0u, stream, state, data.link_pose, env_ids, p->articulations_per_env);
     return LaunchOk(stream);
 }
 

@@ -1382,6 +1382,7 @@ if(CMAKE_CUDA_COMPILER)
         scenario/pairdriven_rigid_release.cpp
         scenario/osc_passive_damping.cpp
         scenario/free_rigid_dynamics.cpp
+        scenario/multi_articulation_reset.cpp
     )
     add_dependencies(nuka_scenario_test nuka_codegen)
     target_compile_definitions(nuka_scenario_test
