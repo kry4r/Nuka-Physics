@@ -1,19 +1,48 @@
-// ---------------------------------------------------------------------------
-// nk::World implementation (plan §3.2 / M3).
-// ---------------------------------------------------------------------------
+// World owns model, state, and the common physics operator sequence.
 
 #include "nk/pipeline/world.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <limits>
 #include <utility>
 
 #include "nk/solve/schedule.hpp"
+#include "nk/solve/nk_row.hpp"
 #include "nk/solve/xpbd_coloring.hpp"
 
 namespace nuka::nk {
+
+namespace {
+
+phi::Status DispatchChecked(phi::Backend* backend, const phi::ModelView& model,
+                            const phi::DataView& data, const phi::OpCall& call,
+                            phi::ExecutionError* error) {
+    phi::Status status;
+    try {
+        status = phi::BackendDispatch(backend, model, data, call);
+        if (status == phi::Status::Ok) return status;
+        std::snprintf(error->message, sizeof(error->message),
+                      "operator %u failed during eager execution", static_cast<unsigned>(call.op));
+    } catch (const std::bad_alloc& exception) {
+        status = phi::Status::OutOfMemory;
+        std::snprintf(error->message, sizeof(error->message), "%s", exception.what());
+    } catch (const std::exception& exception) {
+        status = phi::Status::Failed;
+        std::snprintf(error->message, sizeof(error->message), "%s", exception.what());
+    } catch (...) {
+        status = phi::Status::Failed;
+        std::snprintf(error->message, sizeof(error->message), "unknown operator exception");
+    }
+    error->status = status;
+    error->failed_op = call.op;
+    return status;
+}
+
+}  // namespace
 
 World::World(Model model, uint32_t env_count, phi::Device* device,
              phi::Backend* backend, const Pipeline::SolverConfig& cfg)
@@ -52,6 +81,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
 
     // Size the particle-grid sort/scan scratch so ParticleGridBuild captures into
     // the graph (no mid-capture cudaMalloc); 0 for a particle-free world (inert).
+    try {
     const bool runs_pbf =
         model_.particles.mode == Model::ParticleMode::Pbf ||
         model_.particles.mode == Model::ParticleMode::SoftFluid ||
@@ -101,9 +131,16 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     // op early-exits there, so the segment stays zero-byte / byte-inert).
     const bool runs_pair_driven =
         model_.contact_family == ContactFamily::PairDriven;
-    const uint64_t pair_sort_slots =
+    const uint64_t contact_slots =
         runs_pair_driven ? static_cast<uint64_t>(
             model_.capacities.max_contacts_per_env) * model_.capacities.env_count : 0u;
+    uint64_t pair_sort_slots = 0u;
+    for (const auto& call : pipeline_->Calls()) {
+        if (call.op == phi::NkOp::LbvhQueryPairs) {
+            const auto* query = static_cast<const phi::LbvhQueryPairsParams*>(call.params);
+            pair_sort_slots = uint64_t{query->env_count} * query->rigid_slot_cap;
+        }
+    }
     model_.capacities.pair_sort_scratch_bytes =
         (pair_sort_slots > 0u &&
          pair_sort_slots <= static_cast<uint64_t>(std::numeric_limits<int>::max()))
@@ -111,10 +148,24 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
                                         model_.capacities.env_count)
             : 0u;  // CUB sort/scan expose an int num_items contract.
 
+    model_.capacities.lbvh_sort_scratch_bytes = runs_pair_driven
+        ? phi::LbvhSortScratchBytes(model_.capacities.env_count, model_.capacities.bodies_per_env) : 0u;
+    model_.capacities.contact_cache_scratch_bytes = runs_pair_driven
+        ? phi::ContactCacheScratchBytes(static_cast<uint32_t>(contact_slots * kPairDrivenPtsPerSlot),
+                                        model_.capacities.env_count) : 0u;
+    } catch (const std::exception& error) {
+        creation_status_ = phi::Status::Failed;
+        creation_error_ = error.what();
+        return;
+    }
+    creation_status_ = model_.capacities.Validate(&creation_error_);
+    if (creation_status_ != phi::Status::Ok) return;
+
     // The init-time buffer type (stream-less default-stream device type — fine
     // for the one-shot Model upload + Arena alloc, per the plan's note).
     phi::BufferType* bt = phi::DeviceBufferType(device);
     if (bt == nullptr) {
+        creation_status_ = phi::Status::Failed;
         creation_error_ = "device has no buffer type";
         return;
     }
@@ -501,14 +552,17 @@ World::~World() {
 
 StepResult World::Step() {
     StepResult out;
+    execution_error_ = {};
     if (!ready_ || backend_ == nullptr) {
+        execution_error_.status = last_status_ = phi::Status::Failed;
+        std::snprintf(execution_error_.message, sizeof(execution_error_.message), "world is not ready");
         return out;
     }
     const std::vector<phi::OpCall>& calls = pipeline_->Calls();
     out.result = phi::Status::Ok;
     out.status.reserve(calls.size());
     for (const phi::OpCall& call : calls) {
-        const phi::Status s = phi::BackendDispatch(backend_, model_view_, data_view_, call);
+        const phi::Status s = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
         out.status.push_back(s);
         if (s != phi::Status::Ok) {
             out.result = s;
@@ -520,24 +574,51 @@ StepResult World::Step() {
     return out;
 }
 
-phi::Status World::StepPlanned() {
-    if (!ready_ || backend_ == nullptr) {
-        return phi::Status::Failed;
-    }
-    const std::vector<phi::OpCall>& calls = pipeline_->Calls();
-    if (plan_ == nullptr) {
-        plan_ = phi::BackendPlanCreate(backend_, model_view_, data_view_,
-                                       calls.data(),
-                                       static_cast<int>(calls.size()));
-        if (plan_ == nullptr) {
-            // No capturable plan: an op in the list could not be graph-captured.
-            // Every op is capture-safe today (the particle-grid sort/scan draw from
-            // pre-allocated scratch), so a healthy world never lands here; an honest
-            // Unsupported lets the caller fall back to Step() if it ever does.
-            return phi::Status::Unsupported;
+phi::Status World::PrepareGraph() {
+    if (!ready_ || !backend_) return last_status_ = phi::Status::Failed;
+    if (plan_ != nullptr) return phi::Status::Ok;
+    if (!plan_attempted_) {
+        plan_attempted_ = true;
+        ++capture_attempts_;
+        const auto& calls = pipeline_->Calls();
+        plan_ = phi::BackendPlanCreate(backend_, model_view_, data_view_, calls.data(),
+                                       static_cast<int>(calls.size()), &graph_error_);
+        if (!plan_ && graph_error_.status == phi::Status::Ok) {
+            graph_error_.status = phi::Status::Failed;
+            std::snprintf(graph_error_.message, sizeof(graph_error_.message),
+                          "backend returned no graph");
         }
     }
-    return phi::BackendPlanExecute(backend_, plan_);
+    execution_error_ = graph_error_;
+    return last_status_ = graph_error_.status;
+}
+
+phi::Status World::StepPlanned() {
+    const auto status = PrepareGraph();
+    if (status != phi::Status::Ok) return status;
+    last_status_ = phi::BackendPlanExecute(backend_, plan_, &execution_error_);
+    if (last_status_ == phi::Status::Ok) ++graph_replays_;
+    return last_status_;
+}
+
+phi::Status World::SetExecutionMode(ExecutionMode mode) {
+    if (mode != ExecutionMode::Eager && mode != ExecutionMode::Graph)
+        return last_status_ = phi::Status::InvalidArgument;
+    if (mode == ExecutionMode::Graph) {
+        const auto status = PrepareGraph();
+        if (status != phi::Status::Ok) return status;
+    }
+    execution_mode_ = mode;
+    return last_status_ = phi::Status::Ok;
+}
+
+phi::Status World::StepConfigured() {
+    return execution_mode_ == ExecutionMode::Graph ? StepPlanned() : Step().result;
+}
+
+phi::Status World::Synchronize() {
+    if (!ready_ || !backend_) return last_status_ = phi::Status::Failed;
+    return last_status_ = phi::BackendSynchronize(backend_, &execution_error_);
 }
 
 phi::Status World::Reset(const std::vector<uint32_t>& env_ids) {
@@ -585,7 +666,8 @@ phi::Status World::DispatchOp(phi::NkOp op, const void* params) {
         return phi::Status::Failed;
     }
     const phi::OpCall call{op, params};
-    return phi::BackendDispatch(backend_, model_view_, data_view_, call);
+    execution_error_ = {};
+    return last_status_ = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
 }
 
 phi::Status World::DemandReadout(FieldId id) {
@@ -607,7 +689,8 @@ phi::Status World::DemandReadout(FieldId id) {
     if (last_status_ != phi::Status::Ok) return last_status_;
     for (const phi::OpCall& call : candidate->Calls()) {
         if (call.op == phi::NkOp::ReadoutContactWrench) {
-            last_status_ = phi::BackendDispatch(backend_, model_view_, data_view_, call);
+            execution_error_ = {};
+            last_status_ = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
             if (last_status_ != phi::Status::Ok) return last_status_;
             break;
         }
@@ -616,6 +699,8 @@ phi::Status World::DemandReadout(FieldId id) {
         phi::BackendPlanFree(backend_, plan_);
         plan_ = nullptr;
     }
+    plan_attempted_ = false;
+    graph_error_ = {};
     pipeline_ = std::move(candidate);
     readout_demand_ |= bit;
     return last_status_ = phi::Status::Ok;

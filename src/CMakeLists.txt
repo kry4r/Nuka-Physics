@@ -1551,6 +1551,15 @@ if(CMAKE_CUDA_COMPILER)
         DESTINATION lib/cmake/nuka
     )
 
+    add_executable(nuka_pipeline_benchmark
+        ${CMAKE_SOURCE_DIR}/tools/perf/pipeline_benchmark.cpp)
+    target_include_directories(nuka_pipeline_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(nuka_pipeline_benchmark PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_link_libraries(nuka_pipeline_benchmark PRIVATE
+        nuka_scene_cook nuka_nk nuka_phi2 nuka_runtime_gpu nuka_runtime
+        nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu nuka_core CUDA::cudart)
+    nuka_set_warnings(nuka_pipeline_benchmark)
+
     add_executable(nuka_aba_cuda_probe
         ${CMAKE_SOURCE_DIR}/tools/reference/aba_cuda_probe.cpp
     )

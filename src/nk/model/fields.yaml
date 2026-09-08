@@ -915,3 +915,5 @@ fields:
   # Exact neighbor counts and a 64-bit prefix for environment-private CSR pools.
   - {name: grid_neighbor_attempted, dtype: u32, per: particle, arena: scratch, owner: data, flags: [readout]}
   - {name: grid_neighbor_scan_offset, dtype: u64, per: particle, arena: scratch, owner: data}
+  - {name: lbvh_sort_scratch, dtype: u8, per: scalar, count: "lbvh_sort_scratch_bytes", arena: scratch, owner: data}
+  - {name: contact_cache_scratch, dtype: u8, per: scalar, count: "contact_cache_scratch_bytes", arena: scratch, owner: data}

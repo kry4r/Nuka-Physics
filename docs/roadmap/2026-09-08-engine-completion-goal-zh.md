@@ -8,9 +8,11 @@
 
 已验收基线：π0.5/G1 demo 与主页、完整环境 reset、三轴重力和自由体外力（`0953516`）。本批新增稳定自由旋转、创建拓扑防护、确定性风阻功能、required op/首错停止及邻域容量池基础；见 [动力学整批验收](../research/2026-09-08-dynamics-pipeline-validation-zh.md)。原 demo、reset、外力轨迹和冻结库保留。
 
-当前进度：主 pipeline 25 passed、1 个已知接触 graph skip，逐步 env_status=0；含完整主场景的 memcheck 12 passed、0 errors，Python/C ABI/reset/渲染通过。修复 soft 预测位置缺写后，默认池中的邻域从 30996 条假/真实混合记录恢复为 2882 条真实且完整记录。风阻带宽/profile、完整五进程性能对照仍未完成；下一批集中 review 和实施 T06 剩余、LBVH workspace、公共 graph 与可解释的性能基线，不以本批正确性结果标记整体目标完成。
+当前进度：执行/workspace 批次主 pipeline 33 passed、0 skip，公共耦合/多环境/相机通过，完整 16 环境 graph memcheck 0 errors。公共 graph、失败缓存、LBVH workspace、活跃 cache 排序/merge 和字段预算已实现。容量检查发现旧版也存在的 pair snapshot 覆盖，现已通用修复；原 E=256 分母保留为失败证据。修正后 65 个独立进程、容量物理等价和 8 对公共渲染图通过，新 graph E=1/16/256 为 3.073/3.367/6.499 ms，结果见 [执行验收](../research/2026-09-09-execution-workspace-validation-zh.md)。
 
 ## 执行批次
+
+改造前已核对 spec 与 Newton/MuJoCo/Genesis，见 [执行 review](../research/2026-09-08-execution-workspace-upstream-review-zh.md) 和 [9 月 9 日性能方向 review](../research/2026-09-09-performance-directions-upstream-review-zh.md)。当前批次验收完成，后续按 [全路径细化方向](../plans/2026-09-09-performance-directions-detailed-spec-zh.md) 补 MLS-MPM/SDF/光追/端到端基线，并推进已测出的 active row/endpoint、读出、岛求解及其余热点。T06 全部错误传播、T08 密度、refit、异构、双浮基重叠和其他未完成物理/API/可微工作继续保留。
 
 | 顺序 | 合并实施范围 | 统一验收重点 |
 | --- | --- | --- |
@@ -36,6 +38,10 @@
 按用户追加要求，进入性能模块后以极致性能优化为主要工作：先用 GPU 完成时间和 profiler 定位关键路径，再成批优化 launch/graph、调度、数据布局、带宽、访存合并、寄存器与 occupancy、活跃工作压缩和 workspace/显存复用。分别优化少环境延迟与大批量吞吐，记录瓶颈如何迁移；达到初始 10% 门槛后继续处理仍有实测收益的热点，不把门槛当终点。
 
 优化始终遵守通用求解路径与同等物理质量。采用五个独立进程的对照，保存 GPU 设备/时钟条件、完整执行边界、p50/p95/p99、吞吐、显存和质量指标；microbenchmark 用于归因，最终收益以完整生产 pipeline 为准。每轮给出实际增益、回退和下一个主要瓶颈，尚未测量的上限不写成已达成结果。
+
+性能范围按用户追加要求明确覆盖多环境、刚体、柔体、MLS-MPM 流体、机器人多体耦合、SDF 接触求解和光追渲染。逐项建立少环境延迟、批量吞吐与容量/显存曲线，并以固定耦合环境验证跨模块收益。物理、渲染及物理→传感器端到端分别计时；渲染保持分辨率、相机数、采样数、材质和光照一致。当前 robot-cloth-fluid benchmark 的流体为 PBF，不能据此宣称 MLS-MPM 或光追性能已覆盖。具体矩阵见细化 spec 第 3.4 节。
+
+顺序约束：每条待优化路径先冻结通过质量检查的原基线，再用 profiler 和最新上游/官方 CUDA 资料确定方向，最后实施架构、CUDA 或库优化。发现共同正确性错误时保留失败证据、修复通用契约并重新冻结；不得从 invalid 运行中导出收益。Compute 硬件计数器当前受驱动权限限制，Systems 和 GPU 完成证据可继续使用，缺测指标保持待采集。
 
 ## 完成定义
 

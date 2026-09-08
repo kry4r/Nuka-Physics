@@ -323,6 +323,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_gyro_status
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_attempted
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 8, 0},  // grid_neighbor_scan_offset
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // lbvh_sort_scratch
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // contact_cache_scratch
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

@@ -276,8 +276,6 @@ TEST(MultiArticulationReset, CapturedContactStepsRemainValidAfterReset) {
     ASSERT_TRUE(world.Ready());
     ASSERT_TRUE(fresh.Ready());
     const auto capture = world.StepPlanned();
-    if (capture == phi::Status::Unsupported)
-        GTEST_SKIP() << "contact pipeline cannot be captured; LBVH workspace is a separate requirement";
     ASSERT_EQ(capture, phi::Status::Ok);
     Step(world, 3u, true);
     ASSERT_EQ(world.Reset({0u, 1u, 2u}), phi::Status::Ok);

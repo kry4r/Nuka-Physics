@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <vector>
+#include <stdexcept>
 
 namespace nuka::rt {
 
@@ -51,6 +52,7 @@ public:
     OwnedBuffer() = default;
     OwnedBuffer(phi::BufferType* bt, std::size_t bytes) {
         buf_ = phi::BufferAlloc(bt, bytes);
+        if (!buf_) throw std::bad_alloc();
     }
     explicit OwnedBuffer(phi::Buffer* buf) : buf_(buf) {}
     ~OwnedBuffer() { if (buf_ != nullptr) phi::BufferFree(buf_); }
@@ -66,10 +68,12 @@ public:
     OwnedBuffer& operator=(const OwnedBuffer&) = delete;
     void* Data() const { return buf_ != nullptr ? phi::BufferBase(buf_) : nullptr; }
     void CopyFromHost(const void* src, std::size_t bytes) const {
-        if (buf_ != nullptr && bytes > 0u) phi::BufferUpload(buf_, src, 0, bytes);
+        if (bytes > 0u && phi::BufferUpload(buf_, src, 0, bytes) != phi::Status::Ok)
+            throw std::runtime_error("render buffer upload failed");
     }
     void CopyToHost(void* dst, std::size_t bytes) const {
-        if (buf_ != nullptr && bytes > 0u) phi::BufferDownload(buf_, dst, 0, bytes);
+        if (bytes > 0u && phi::BufferDownload(buf_, dst, 0, bytes) != phi::Status::Ok)
+            throw std::runtime_error("render buffer download failed");
     }
 private:
     phi::Buffer* buf_ = nullptr;

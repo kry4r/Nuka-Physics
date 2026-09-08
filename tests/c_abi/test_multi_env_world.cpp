@@ -330,6 +330,24 @@ TEST(MultiEnvWorld, CppWrapperMultiEnv) {
                          values.size() * sizeof(float), cudaMemcpyDeviceToHost),
               cudaSuccess);
     EXPECT_TRUE(AllFinite(values)) << "C++ wrapper multi-env q non-finite";
+    nuka_world_execution_info_t invalid{};
+    EXPECT_EQ(nuka_world_get_execution_info(world->raw(), &invalid), NUKA_RESULT_INVALID_ARG);
+    invalid.struct_size = sizeof(invalid);
+    invalid.schema_version = NUKA_EXECUTION_INFO_VERSION + 1u;
+    EXPECT_EQ(nuka_world_get_execution_info(world->raw(), &invalid), NUKA_RESULT_INVALID_ARG);
+    ASSERT_TRUE(world->SetExecutionMode(NUKA_EXECUTION_GRAPH).has_value());
+    auto info = world->GetExecutionInfo();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->struct_size, sizeof(*info));
+    EXPECT_EQ(info->schema_version, NUKA_EXECUTION_INFO_VERSION);
+    EXPECT_EQ(info->capture_attempts, 1u);
+    EXPECT_EQ(info->graph_replays, 0u);
+    ASSERT_TRUE(world->StepN(4u).has_value());
+    ASSERT_TRUE(world->Synchronize().has_value());
+    auto replay_info = world->GetExecutionInfo();
+    ASSERT_TRUE(replay_info.has_value());
+    EXPECT_EQ(replay_info->graph_replays, 4u);
+    EXPECT_EQ(replay_info->last_result, NUKA_RESULT_OK);
     std::printf("[diag] (3) C++ wrapper env_count=%u q elements=%zu (OK)\n",
                 kEnvCount, values.size());
 }

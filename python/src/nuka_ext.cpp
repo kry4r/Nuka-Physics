@@ -478,6 +478,30 @@ public:
 
     void step() { check(nuka_world_step(h_), "nuka_world_step"); }
     void step_n(uint32_t n) { check(nuka_world_step_n(h_, n), "nuka_world_step_n"); }
+    void set_execution_mode(const std::string& mode) {
+        if (mode != "eager" && mode != "graph")
+            throw nb::value_error("execution mode must be eager or graph");
+        check(nuka_world_set_execution_mode(h_, mode == "graph" ? NUKA_EXECUTION_GRAPH : NUKA_EXECUTION_EAGER),
+              "nuka_world_set_execution_mode");
+    }
+    void synchronize() { check(nuka_world_synchronize(h_), "nuka_world_synchronize"); }
+    nb::dict execution_info() const {
+        nuka_world_execution_info_t info{};
+        info.struct_size = sizeof(info);
+        info.schema_version = NUKA_EXECUTION_INFO_VERSION;
+        check(nuka_world_get_execution_info(h_, &info), "nuka_world_get_execution_info");
+        nb::dict output;
+        output["schema_version"] = info.schema_version;
+        output["mode"] = info.mode == NUKA_EXECUTION_GRAPH ? "graph" : "eager";
+        output["graph_ready"] = info.graph_ready != 0u;
+        output["capture_attempts"] = info.capture_attempts;
+        output["graph_replays"] = info.graph_replays;
+        output["last_result"] = static_cast<uint32_t>(info.last_result);
+        output["failed_op"] = info.failed_op;
+        output["native_error"] = info.native_error;
+        output["message"] = info.message;
+        return output;
+    }
 
     // Restore initial physical state for all or selected environments.
     // Unselected state and control targets are preserved.
@@ -2010,6 +2034,10 @@ NB_MODULE(_nuka_ext, m) {
             "nk::Pipeline::SolverConfig); each 0 keeps the engine default, so a "
             "defaults-only call is byte-identical to today.")
         .def("step", &World::step, "Advance the world one fixed step.")
+        .def("set_execution_mode", &World::set_execution_mode, nb::arg("mode"),
+             "Select eager or single-step graph execution; graph failures are explicit.")
+        .def("synchronize", &World::synchronize, "Wait for physics completion and report device errors.")
+        .def_prop_ro("execution_info", &World::execution_info)
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
         .def("reset", &World::reset,

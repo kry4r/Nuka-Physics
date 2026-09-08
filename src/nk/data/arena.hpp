@@ -43,7 +43,7 @@ public:
 
     // Zero every data-owned field (used by Reset / construction). No-op if
     // unallocated.
-    void ZeroAll();
+    phi::Status ZeroAll();
 
     // Host->field upload / field->host download through BufferI (init-time
     // seeding + test readback; NOT a per-step path). `byte_offset` is relative
@@ -52,6 +52,10 @@ public:
                      uint64_t byte_offset = 0) const;
     bool DownloadField(FieldId id, void* dst, uint64_t bytes,
                        uint64_t byte_offset = 0) const;
+    phi::Status UploadFieldStatus(FieldId id, const void* src, uint64_t bytes,
+                                   uint64_t byte_offset = 0) const;
+    phi::Status DownloadFieldStatus(FieldId id, void* dst, uint64_t bytes,
+                                     uint64_t byte_offset = 0) const;
 
     // The per-field segment descriptor (one per data-owned field, in FieldId
     // order). Public so the acceptance test can assert determinism.

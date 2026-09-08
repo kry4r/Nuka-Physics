@@ -122,14 +122,14 @@ nuka_coupled_particles_desc_t MediaDesc(bool at_feet, float contact_radius = 0.0
     p.cloth_iters = 24u;
     // A shallow pool under the rear-left foot (x ~ -0.325, y ~ 0.017); the surface at
     // ~the foot centre so the lower hemisphere is submerged from rest.
-    const float pool_surf = foot_z + 0.01f;
+    const float pool_surf = foot_z + 0.0655f;
     p.fluid_min_x = -0.39f; p.fluid_min_y = -0.06f;
     p.fluid_max_x = -0.26f; p.fluid_max_y = 0.09f;
     p.fluid_spacing = 0.022f;
-    p.fluid_min_z = (foot_z - 0.10f) + dz;
+    p.fluid_min_z = (foot_z - 0.0095f) + dz;
     p.fluid_max_z = pool_surf + dz;
     p.fluid_rest_density = 1000.0f;
-    p.fluid_floor_z = (foot_z - 0.105f) + dz;
+    p.fluid_floor_z = p.fluid_min_z;
     p.fluid_friction = 0.0f;
     p.fluid_iters = 4u;
     p.contact_radius = contact_radius;
@@ -341,8 +341,8 @@ TEST(CoupledWorldCAbi, CreateStepReadCouplesThroughBridge) {
     // cloth is perimeter-pinned in both, so the fluid slice is the free-medium signal.
     const size_t n_cloth = 13u * 13u;            // the soft slice [0, n_cloth).
     const size_t n_total = at_feet.size() / 3u;  // [n_cloth, n_total) is the fluid.
-    const float at_feet_floor = 0.2545f - 0.105f;          // MediaDesc fluid_floor_z.
-    const float control_floor = at_feet_floor + kSinkOffset;
+    const float at_feet_floor = MediaDesc(true).fluid_floor_z;
+    const float control_floor = MediaDesc(false).fluid_floor_z;
     const float at_feet_surf =
         MaxZInSlice(at_feet, n_cloth, n_total) - at_feet_floor;
     const float control_surf =
@@ -608,12 +608,11 @@ TEST(CoupledWorldCAbi, ResetRestoresParticleStateBitExact) {
 // solver knobs; any drift means the flat-desc -> MediaRecord -> cook re-point changed a
 // translated field, an order, or a default. FNV constants match the demo / gate hash.
 TEST(CoupledWorldCAbi, DefaultsClothCookFnvMatchesFrozenCanary) {
-    const std::filesystem::path nks = SourcePath("examples/scenes/go2.nks");
-    if (!std::filesystem::exists(nks)) GTEST_SKIP() << "go2.nks scene is not available";
+    if (!SceneAvailable()) GTEST_SKIP() << "Go2 stand scene is not available";
     DeviceGuard device;
     ASSERT_NE(device.handle, nullptr);
 
-    const std::string scene = nks.string();  // outlive the borrowed d.scene_path.
+    const std::string scene = ScenePath();
     WorldGuard w;
     nuka_world_desc_t d = WorldDesc(scene, 1u);  // contact_family 1 == flat heightfield.
 

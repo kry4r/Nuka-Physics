@@ -279,6 +279,34 @@ void nuka_world_destroy(nuka_world_handle world);
 nuka_result_t nuka_world_step(nuka_world_handle world);
 nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count);
 
+typedef enum nuka_execution_mode_t {
+    NUKA_EXECUTION_EAGER = 0,
+    NUKA_EXECUTION_GRAPH = 1
+} nuka_execution_mode_t;
+
+enum { NUKA_EXECUTION_INFO_VERSION = 1 };
+
+typedef struct nuka_world_execution_info_t {
+    uint32_t struct_size;
+    uint32_t schema_version;
+    nuka_execution_mode_t mode;
+    uint32_t graph_ready;
+    uint64_t capture_attempts;
+    uint64_t graph_replays;
+    nuka_result_t last_result;
+    uint32_t failed_op;
+    int32_t native_error;
+    char message[256];
+} nuka_world_execution_info_t;
+
+// Graph selection captures one step without advancing state and fails explicitly if unavailable.
+// Reset preserves the graph; changes to the operator sequence invalidate it.
+nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execution_mode_t mode);
+// Initialize struct_size and schema_version before querying execution information.
+nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out);
+// Wait for submitted physics work and report asynchronous device errors.
+nuka_result_t nuka_world_synchronize(nuka_world_handle world);
+
 // Restore all environments' initial physical state and clear solver history.
 // Drive/task targets and view storage are preserved; any environment count is supported.
 nuka_result_t nuka_world_reset(nuka_world_handle world);

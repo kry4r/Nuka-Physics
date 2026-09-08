@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include "import/usd_importer.hpp"
@@ -263,12 +264,16 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
         phi::Device* real;
         phi::NkOp missing = phi::NkOp::Count;
         bool allocated = false;
+        bool no_buffer = false;
     };
     struct BackendProxy {
         const phi::BackendI* iface;
         phi::Backend* real;
         phi::NkOp failure = phi::NkOp::Count;
         std::vector<phi::NkOp> calls;
+        uint32_t captures = 0u;
+        bool throw_dispatch = false;
+        bool fail_completion = false;
     };
     auto device_iface = *phi::IfaceOf(real.device);
     device_iface.supports_op = [](phi::Device* device, phi::NkOp op) {
@@ -278,6 +283,7 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
     device_iface.get_buffer_type = [](phi::Device* device) {
         auto& proxy = *reinterpret_cast<DeviceProxy*>(device);
         proxy.allocated = true;
+        if (proxy.no_buffer) return static_cast<phi::BufferType*>(nullptr);
         return phi::DeviceBufferType(proxy.real);
     };
     auto backend_iface = *phi::IfaceOf(real.backend);
@@ -285,11 +291,34 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
                                 const phi::DataView& data, const phi::OpCall& call) {
         auto& proxy = *reinterpret_cast<BackendProxy*>(backend);
         proxy.calls.push_back(call.op);
-        if (call.op == proxy.failure) return phi::Status::Failed;
+        if (call.op == proxy.failure) {
+            if (proxy.throw_dispatch) throw std::runtime_error("injected operator exception");
+            return phi::Status::Failed;
+        }
         return phi::BackendDispatch(proxy.real, model, data, call);
     };
-    backend_iface.synchronize = [](phi::Backend* backend) {
-        phi::BackendSynchronize(reinterpret_cast<BackendProxy*>(backend)->real);
+    backend_iface.synchronize = [](phi::Backend* backend, phi::ExecutionError* error) {
+        const auto& proxy = *reinterpret_cast<BackendProxy*>(backend);
+        if (proxy.fail_completion) {
+            if (error) {
+                *error = {};
+                error->status = phi::Status::Failed;
+                error->native_code = 719;
+                std::snprintf(error->message, sizeof(error->message), "injected completion failure");
+            }
+            return phi::Status::Failed;
+        }
+        return phi::BackendSynchronize(proxy.real, error);
+    };
+    backend_iface.plan_create = [](phi::Backend* backend, const phi::ModelView&, const phi::DataView&,
+                                   const phi::OpCall*, int, phi::ExecutionError* error) -> phi::Plan* {
+        ++reinterpret_cast<BackendProxy*>(backend)->captures;
+        if (error) {
+            error->status = phi::Status::Unsupported;
+            error->failed_op = phi::NkOp::LbvhBuild;
+            std::snprintf(error->message, sizeof(error->message), "injected capture failure");
+        }
+        return nullptr;
     };
     DeviceProxy device{&device_iface, real.device};
     BackendProxy backend{&backend_iface, real.backend};
@@ -306,6 +335,15 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
     EXPECT_FALSE(device.allocated);
     EXPECT_TRUE(backend.calls.empty());
     EXPECT_FALSE(missing.Step().AllOk());
+
+    device.missing = phi::NkOp::Count;
+    device.no_buffer = true;
+    nk::World no_buffer(CookFreeBody(body, false), 1u, dev, be, Config());
+    EXPECT_FALSE(no_buffer.Ready());
+    EXPECT_EQ(no_buffer.CreationStatus(), phi::Status::Failed);
+    EXPECT_EQ(no_buffer.CreationError(), "device has no buffer type");
+    EXPECT_TRUE(backend.calls.empty());
+    device.no_buffer = false;
 
     device.missing = phi::NkOp::ReadoutContactWrench;
     nk::World world(CookFreeBody(body, true), 1u, dev, be, Config());
@@ -331,6 +369,159 @@ TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
     EXPECT_EQ(result.failed_op, phi::NkOp::IntegratePosition);
     EXPECT_EQ(backend.calls.back(), phi::NkOp::IntegratePosition);
     EXPECT_EQ(std::count(backend.calls.begin(), backend.calls.end(), phi::NkOp::ReadoutContactWrench), 0);
+    backend.calls.clear();
+    backend.throw_dispatch = true;
+    const auto thrown = world.Step();
+    EXPECT_EQ(thrown.result, phi::Status::Failed);
+    EXPECT_EQ(thrown.failed_op, phi::NkOp::IntegratePosition);
+    EXPECT_EQ(backend.calls.back(), phi::NkOp::IntegratePosition);
+    EXPECT_STREQ(world.LastExecutionError().message, "injected operator exception");
+    backend.throw_dispatch = false;
+    backend.failure = phi::NkOp::Count;
+    for (uint32_t attempt = 0u; attempt < 5u; ++attempt)
+        EXPECT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), phi::Status::Unsupported);
+    EXPECT_EQ(backend.captures, 1u);
+    EXPECT_EQ(world.CaptureAttempts(), 1u);
+    EXPECT_EQ(world.GetExecutionMode(), nk::World::ExecutionMode::Eager);
+    EXPECT_EQ(world.LastExecutionError().failed_op, phi::NkOp::LbvhBuild);
+    EXPECT_STREQ(world.LastExecutionError().message, "injected capture failure");
+    EXPECT_TRUE(world.Step().AllOk());
+    backend.fail_completion = true;
+    EXPECT_EQ(world.Synchronize(), phi::Status::Failed);
+    EXPECT_EQ(world.LastExecutionError().native_code, 719);
+    EXPECT_STREQ(world.LastExecutionError().message, "injected completion failure");
+    backend.fail_completion = false;
+    EXPECT_EQ(world.Synchronize(), phi::Status::Ok);
+    EXPECT_EQ(world.LastExecutionError().status, phi::Status::Ok);
+}
+
+TEST(PipelineContracts, BufferFailuresPreserveStatusAndReleaseAllocations) {
+    auto& real = Device();
+    if (!real.backend) GTEST_SKIP() << "no CUDA backend";
+    enum class Transfer { None, Upload, Download, Memset, Copy };
+    struct Allocator {
+        const phi::BufferTypeI* iface;
+        const phi::BufferI* buffer_iface;
+        phi::BufferType* real;
+        uint32_t allocations = 0u, live = 0u, fail_allocation = 0u;
+        Transfer fail_transfer = Transfer::None;
+    };
+    struct Buffer {
+        const phi::BufferI* iface;
+        phi::Buffer* real;
+        Allocator* owner;
+    };
+    phi::BufferI buffer_iface{};
+    buffer_iface.free = [](phi::Buffer* buffer) {
+        auto* proxy = reinterpret_cast<Buffer*>(buffer);
+        phi::BufferFree(proxy->real);
+        --proxy->owner->live;
+        delete proxy;
+    };
+    buffer_iface.base = [](phi::Buffer* buffer) {
+        return phi::BufferBase(reinterpret_cast<Buffer*>(buffer)->real);
+    };
+    buffer_iface.upload = [](phi::Buffer* buffer, const void* source, size_t offset, size_t bytes) {
+        auto& proxy = *reinterpret_cast<Buffer*>(buffer);
+        return proxy.owner->fail_transfer == Transfer::Upload ? phi::Status::Failed
+            : phi::BufferUpload(proxy.real, source, offset, bytes);
+    };
+    buffer_iface.download = [](phi::Buffer* buffer, void* target, size_t offset, size_t bytes) {
+        auto& proxy = *reinterpret_cast<Buffer*>(buffer);
+        return proxy.owner->fail_transfer == Transfer::Download ? phi::Status::Failed
+            : phi::BufferDownload(proxy.real, target, offset, bytes);
+    };
+    buffer_iface.memset = [](phi::Buffer* buffer, uint8_t value, size_t offset, size_t bytes) {
+        auto& proxy = *reinterpret_cast<Buffer*>(buffer);
+        return proxy.owner->fail_transfer == Transfer::Memset ? phi::Status::Failed
+            : phi::BufferMemset(proxy.real, value, offset, bytes);
+    };
+    buffer_iface.copy_from = [](phi::Buffer* target, phi::Buffer* source,
+                                size_t target_offset, size_t source_offset, size_t bytes) {
+        auto& proxy = *reinterpret_cast<Buffer*>(target);
+        return proxy.owner->fail_transfer == Transfer::Copy ? phi::Status::Failed
+            : phi::BufferCopyFrom(proxy.real, reinterpret_cast<Buffer*>(source)->real,
+                                  target_offset, source_offset, bytes);
+    };
+    auto allocator_iface = *phi::IfaceOf(phi::DeviceBufferType(real.device));
+    allocator_iface.get_name = [](phi::BufferType* type) {
+        return phi::BufferTypeName(reinterpret_cast<Allocator*>(type)->real);
+    };
+    allocator_iface.alignment = [](phi::BufferType* type) {
+        return phi::BufferTypeAlignment(reinterpret_cast<Allocator*>(type)->real);
+    };
+    allocator_iface.is_host = [](phi::BufferType* type) {
+        return phi::BufferTypeIsHost(reinterpret_cast<Allocator*>(type)->real);
+    };
+    allocator_iface.alloc = [](phi::BufferType* type, size_t bytes, phi::Status* status) -> phi::Buffer* {
+        auto& allocator = *reinterpret_cast<Allocator*>(type);
+        if (++allocator.allocations == allocator.fail_allocation) {
+            if (status) *status = phi::Status::OutOfMemory;
+            return nullptr;
+        }
+        auto* buffer = phi::BufferAlloc(allocator.real, bytes, status);
+        if (!buffer) return nullptr;
+        ++allocator.live;
+        return reinterpret_cast<phi::Buffer*>(new Buffer{allocator.buffer_iface, buffer, &allocator});
+    };
+    Allocator allocator{&allocator_iface, &buffer_iface, phi::DeviceBufferType(real.device)};
+    auto* type = reinterpret_cast<phi::BufferType*>(&allocator);
+    nk::ModelCapacities capacities;
+    capacities.env_count = 1u;
+    capacities.bodies_per_env = 1u;
+    phi::DataView view{};
+    {
+        nk::Data data;
+        allocator.fail_allocation = 2u;
+        EXPECT_EQ(data.Allocate(type, capacities, &view), phi::Status::OutOfMemory);
+        EXPECT_EQ(allocator.live, 0u);
+        allocator.fail_allocation = 0u;
+        allocator.fail_transfer = Transfer::Memset;
+        EXPECT_EQ(data.Allocate(type, capacities, &view), phi::Status::Failed);
+        EXPECT_EQ(allocator.live, 0u);
+        allocator.fail_transfer = Transfer::None;
+        ASSERT_EQ(data.Allocate(type, capacities, &view), phi::Status::Ok);
+        Vec3 value{};
+        allocator.fail_transfer = Transfer::Upload;
+        EXPECT_EQ(data.UploadFieldStatus(nk::FieldId::BodyForce, &value, sizeof(value)), phi::Status::Failed);
+        EXPECT_EQ(data.UploadFieldStatus(nk::FieldId::BodyForce, &value, sizeof(value), ~uint64_t{0}),
+                  phi::Status::InvalidArgument);
+        allocator.fail_transfer = Transfer::Download;
+        EXPECT_EQ(data.DownloadFieldStatus(nk::FieldId::BodyForce, &value, sizeof(value)), phi::Status::Failed);
+        allocator.fail_transfer = Transfer::Copy;
+        EXPECT_EQ(phi::BufferCopyFrom(data.GetArena().ScratchBuffer(), data.GetArena().PersistentBuffer(),
+                                      0u, 0u, sizeof(value)), phi::Status::Failed);
+        allocator.fail_transfer = Transfer::None;
+        EXPECT_EQ(data.UploadFieldStatus(nk::FieldId::BodyForce, &value, sizeof(value)), phi::Status::Ok);
+        EXPECT_EQ(data.DownloadFieldStatus(nk::FieldId::BodyForce, &value, sizeof(value)), phi::Status::Ok);
+    }
+    EXPECT_EQ(allocator.live, 0u);
+    scene::RigidBodyRecord body;
+    body.mass = 1.0f;
+    body.inertia = {1, 1, 1};
+    auto model = CookFreeBody(body, false);
+    phi::ModelView model_view{};
+    allocator.fail_transfer = Transfer::Upload;
+    EXPECT_EQ(model.UploadTo(type, &model_view), phi::Status::Failed);
+    EXPECT_EQ(allocator.live, 0u);
+
+    using OwnedBuffer = std::unique_ptr<phi::Buffer, decltype(&phi::BufferFree)>;
+    std::vector<uint8_t> expected(1u << 20u), actual(expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<uint8_t>(i % 251u);
+    auto* device_type = phi::BackendDeviceBufferType(real.backend);
+    auto* host_type = phi::BackendHostBufferType(real.backend);
+    OwnedBuffer device_buffer(phi::BufferAlloc(device_type, expected.size()), &phi::BufferFree);
+    OwnedBuffer host_source(phi::BufferAlloc(host_type, expected.size()), &phi::BufferFree);
+    OwnedBuffer host_target(phi::BufferAlloc(host_type, expected.size()), &phi::BufferFree);
+    ASSERT_TRUE(device_buffer && host_source && host_target);
+    ASSERT_EQ(phi::BufferUpload(device_buffer.get(), expected.data(), 0u, expected.size()), phi::Status::Ok);
+    ASSERT_EQ(phi::BufferCopyFrom(host_source.get(), device_buffer.get(), 0u, 0u, expected.size()), phi::Status::Ok);
+    ASSERT_EQ(phi::BufferCopyFrom(host_target.get(), host_source.get(), 0u, 0u, expected.size()), phi::Status::Ok);
+    ASSERT_EQ(phi::BufferDownload(host_target.get(), actual.data(), 0u, actual.size()), phi::Status::Ok);
+    EXPECT_EQ(actual, expected);
+    OwnedBuffer foreign(phi::BufferAlloc(type, expected.size()), &phi::BufferFree);
+    ASSERT_TRUE(foreign);
+    EXPECT_EQ(phi::BufferCopyFrom(device_buffer.get(), foreign.get(), 0u, 0u, 1u), phi::Status::Unsupported);
 }
 
 TEST(PipelineContracts, TopologyValidationRejectsUnsupportedAndMalformedLayouts) {

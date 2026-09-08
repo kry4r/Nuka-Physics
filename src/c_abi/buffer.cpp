@@ -140,10 +140,10 @@ nuka_result_t nuka_world_upload_field(nuka_world_handle world,
                 return nuka::c_abi::MapStatusToResult(record->world->LastStatus());
             return NUKA_RESULT_NOT_SUPPORTED;  // capacity-0 field on this scene.
         }
-        const bool ok = record->world->GetData().UploadField(
+        const auto status = record->world->GetData().UploadFieldStatus(
             row->field_id, bytes, static_cast<uint64_t>(nbytes),
             static_cast<uint64_t>(byte_offset));
-        return ok ? NUKA_RESULT_OK : NUKA_RESULT_INVALID_ARG;  // over-range == LOUD.
+        return nuka::c_abi::MapStatusToResult(status);  // over-range == LOUD.
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
@@ -183,10 +183,10 @@ nuka_result_t nuka_world_download_field(nuka_world_handle world,
                 return nuka::c_abi::MapStatusToResult(record->world->LastStatus());
             return NUKA_RESULT_NOT_SUPPORTED;
         }
-        const bool ok = record->world->GetData().DownloadField(
+        const auto status = record->world->GetData().DownloadFieldStatus(
             row->field_id, bytes, static_cast<uint64_t>(nbytes),
             static_cast<uint64_t>(byte_offset));
-        return ok ? NUKA_RESULT_OK : NUKA_RESULT_INVALID_ARG;
+        return nuka::c_abi::MapStatusToResult(status);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {

@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "../../tools/perf/robot_cloth_fluid_scene.hpp"
+
 #include "collision/shape_kind.hpp"
 #include "import/usd_importer.hpp"
 #include "math/transform.hpp"
@@ -33,30 +35,7 @@ namespace soft = nuka::runtime::soft;
 using nuka::math::Transform;
 using nuka::math::Vec3;
 
-// A uniform particle collision radius for both media (cloth + pool); the foot
-// touches a particle when their spheres overlap. d_min == 2*radius.
-constexpr float kContactDMin = 0.030f;
-
-// Cloth patch under the FRONT feet: a taut flat lattice, the whole perimeter pinned
-// so it is a trampoline membrane the foot rests in + indents (not a free sheet that
-// sags away). The front feet straddle it from rest (the membrane lies at the foot
-// centre) so contact is immediate; light particles so the foot dips it.
-constexpr uint32_t kClothNx = 13u;          // 13x13 = 169 cloth particles.
-constexpr float kClothSpacing = 0.016f;     // ~0.19 m square (spans both front feet).
-constexpr float kClothParticleMass = 0.01f; // 10 g per particle (light cloth).
-constexpr uint16_t kClothIters = 24u;       // tighter stretch solve = taut patch.
-
-// Shallow fluid pool under a REAR foot: a compact lattice on a z-up PBF boundary
-// floor. A standing foot's lower hemisphere is submerged from the start so the
-// contact is immediate; the foot displaces fluid (the pocket beneath it drops).
-constexpr float kPoolSpacing = 0.025f;
-constexpr float kPoolSupport = kPoolSpacing * 1.5f;
-constexpr float kPoolRestDensity = 1000.0f;
-constexpr uint32_t kPoolNx = 5u;            // 5x5 footprint.
-constexpr uint32_t kPoolNz = 4u;            // 4 layers deep.
-
-constexpr uint32_t kSettleSteps = 250u;     // settle the robot stance + the media.
-constexpr uint32_t kHoldSteps = 200u;       // co-step the held stance over the media.
+using namespace nuka::perf::fixture;
 
 std::filesystem::path Go2ScenePath() {
     return std::filesystem::path(NUKA_SOURCE_DIR) / "examples" / "scenes" /
@@ -72,114 +51,6 @@ Backend GetBackend() {
         return r;
     }();
     return b;
-}
-
-nk::Pipeline::SolverConfig Cfg() {
-    nk::Pipeline::SolverConfig cfg;
-    cfg.dt = 1.0f / 240.0f;
-    cfg.gravity[0] = 0.06f; cfg.gravity[1] = -0.04f; cfg.gravity[2] = -9.81f;
-    cfg.contact_margin = 0.0f;
-    // A big velocity budget: a heavy robot link vs light particles needs PGS
-    // iterations to transmit momentum without the foot tunnelling the medium.
-    cfg.vel_iters = 48u;
-    cfg.pos_iters = 0u;
-    cfg.max_pairs = 64u;
-    return cfg;
-}
-
-// A flat cloth lattice centred at (cx,cy) lying at height z; four corners pinned so
-// the patch stays under the front feet while they press it.
-cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
-    std::vector<Vec3> rest;
-    rest.reserve(kClothNx * kClothNx);
-    const float c0 = -0.5f * static_cast<float>(kClothNx - 1u) * kClothSpacing;
-    for (uint32_t j = 0; j < kClothNx; ++j)
-        for (uint32_t i = 0; i < kClothNx; ++i)
-            rest.push_back(Vec3{cx + c0 + static_cast<float>(i) * kClothSpacing,
-                                cy + c0 + static_cast<float>(j) * kClothSpacing, z});
-    auto idx = [](uint32_t i, uint32_t j) { return j * kClothNx + i; };
-    std::vector<soft::ClothTriangle> tris;
-    for (uint32_t j = 0; j + 1 < kClothNx; ++j)
-        for (uint32_t i = 0; i + 1 < kClothNx; ++i) {
-            tris.push_back(soft::ClothTriangle{{idx(i, j), idx(i + 1, j),
-                                                idx(i + 1, j + 1)}});
-            tris.push_back(soft::ClothTriangle{{idx(i, j), idx(i + 1, j + 1),
-                                                idx(i, j + 1)}});
-        }
-    soft::ClothTopologyOptions opts;
-    opts.distance_compliance_alpha = 0.0f;
-    opts.bend_compliance_alpha = 1.0e-4f;
-    soft::XpbdConstraintSet cs;
-    soft::BuildClothConstraints(rest, tris, opts, cs);
-
-    cook::XpbdCookInput in;
-    in.positions = rest;
-    in.velocities.assign(rest.size(), Vec3::Zero());
-    in.inv_mass.assign(rest.size(), 1.0f / kClothParticleMass);
-    // Pin the whole perimeter so the patch is a taut membrane (a trampoline) the
-    // hanging foot rests in + indents, instead of a free sheet that sags away.
-    const uint32_t last = kClothNx - 1u;
-    for (uint32_t k = 0; k < kClothNx; ++k) {
-        in.inv_mass[idx(k, 0)] = 0.0f; in.inv_mass[idx(k, last)] = 0.0f;
-        in.inv_mass[idx(0, k)] = 0.0f; in.inv_mass[idx(last, k)] = 0.0f;
-    }
-    for (const auto& dc : cs.distance) {
-        cook::CookDistanceCon c;
-        c.a = dc.particle_a; c.b = dc.particle_b;
-        c.rest_length = dc.rest_length; c.compliance_alpha = dc.compliance_alpha;
-        in.distance.push_back(c);
-    }
-    for (const auto& bc : cs.bend) {
-        cook::CookBendCon c;
-        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
-        c.compliance_alpha = bc.compliance_alpha;
-        in.bend.push_back(c);
-    }
-    in.solver_iterations = kClothIters;
-    for (const auto& triangle : tris)
-        in.aero_triangles.push_back({triangle.v[0], triangle.v[1], triangle.v[2]});
-    in.aero_drag_normal = 0.6f;
-    in.aero_drag_tangent = 0.04f;
-    in.aero_drag_max_dv = 0.5f;
-    in.friction = 0.6f;   // finite mu: the foot grips/drags the cloth.
-    return in;
-}
-
-// A compact PBF pool centred at (cx,cy), bottom on a z-up boundary floor at floor_z;
-// the grid AABB spans the footprint + vertical headroom for the submerged foot.
-cook::PbfCookInput BuildPool(float cx, float cy, float floor_z) {
-    cook::PbfCookInput in;
-    const float s = kPoolSpacing, h = kPoolSupport, rho0 = kPoolRestDensity;
-    const float c0 = -0.5f * static_cast<float>(kPoolNx - 1u) * s;
-    const float bottom = floor_z + 0.5f * s;
-    for (uint32_t iz = 0; iz < kPoolNz; ++iz)
-        for (uint32_t iy = 0; iy < kPoolNx; ++iy)
-            for (uint32_t ix = 0; ix < kPoolNx; ++ix)
-                in.positions.push_back(Vec3{cx + c0 + ix * s, cy + c0 + iy * s,
-                                            bottom + iz * s});
-    in.velocities.assign(in.positions.size(), Vec3::Zero());
-    in.particle_mass = rho0 * s * s * s;
-    in.rest_density = rho0;
-    in.support_radius = h;
-    in.cfm_epsilon = 1.0e-6f;
-    in.iters = 4u;
-    in.clamp_overdensity = true;
-    in.boundary_enabled = true;
-    in.floor_z = floor_z;
-    in.friction = 0.0f;   // fluid mu ~= 0: the foot slides; splash stays normal-driven.
-    // Grid AABB: the footprint plus lateral spread room + vertical headroom for the
-    // submerged foot. A particle outside the grid finds no neighbours, so it must
-    // enclose the whole working volume.
-    const float half = 0.5f * static_cast<float>(kPoolNx - 1u) * s + 3.0f * h;
-    const float top = floor_z + kPoolNz * s + 4.0f * h;
-    in.grid_min = Vec3{cx - half - h, cy - half - h, floor_z - h};
-    auto cells = [&](float extent) {
-        return static_cast<uint32_t>(std::ceil(extent / h)) + 1u;
-    };
-    in.grid_dims[0] = cells(2.0f * half);
-    in.grid_dims[1] = cells(2.0f * half);
-    in.grid_dims[2] = cells(top - (floor_z - h));
-    return in;
 }
 
 using PipelineState = std::vector<std::vector<uint8_t>>;
@@ -202,6 +73,62 @@ PipelineState ReadPipelineState(nk::World& world) {
         EXPECT_TRUE(world.GetData().DownloadField(field, state.back().data(), state.back().size()));
     }
     return state;
+}
+
+TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    const auto fixture = Prepare(Go2ScenePath(), backend.dev, backend.backend, Cfg());
+    constexpr uint32_t envs = 3u;
+    nk::World eager(CookPrepared(fixture, envs), envs, backend.dev, backend.backend, Cfg());
+    nk::World graph(CookPrepared(fixture, envs), envs, backend.dev, backend.backend, Cfg());
+    ASSERT_TRUE(eager.Ready()) << eager.CreationError();
+    ASSERT_TRUE(graph.Ready()) << graph.CreationError();
+    const auto initial = ReadPipelineState(graph);
+    const auto* address = graph.DataViewRef().particle_pos;
+    ASSERT_EQ(graph.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok)
+        << graph.LastExecutionError().message;
+    EXPECT_EQ(ReadPipelineState(graph), initial);
+    EXPECT_EQ(graph.CaptureAttempts(), 1u);
+    std::vector<float> targets(graph.GetModel().capacities.links_per_env * envs);
+    ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::DriveTarget, targets.data(),
+                                              targets.size() * sizeof(float)));
+    const auto rest = targets;
+    std::vector<uint32_t> flags(envs);
+    for (uint32_t step = 0u; step < 16u; ++step) {
+        for (size_t i = 0; i < targets.size(); ++i)
+            targets[i] = rest[i] + 0.004f * std::sin(static_cast<float>(step + i));
+        if (step == 4u) {
+            ASSERT_NE(eager.FieldPtr(nk::FieldId::ContactForce), nullptr);
+            ASSERT_NE(graph.FieldPtr(nk::FieldId::ContactForce), nullptr);
+            EXPECT_FALSE(graph.GraphReady());
+        }
+        if (step == 8u) {
+            ASSERT_EQ(eager.Reset({1u, 1u}), nphi::Status::Ok);
+            ASSERT_EQ(graph.Reset({1u, 1u}), nphi::Status::Ok);
+        }
+        for (auto* world : {&eager, &graph}) {
+            ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::DriveTarget, targets.data(),
+                                                    targets.size() * sizeof(float)));
+            ASSERT_EQ(world->StepConfigured(), nphi::Status::Ok) << world->LastExecutionError().message;
+            ASSERT_EQ(world->Synchronize(), nphi::Status::Ok);
+            ASSERT_TRUE(world->GetData().DownloadField(nk::FieldId::EnvStatus, flags.data(),
+                                                      flags.size() * sizeof(uint32_t)));
+            EXPECT_EQ(flags, std::vector<uint32_t>(envs));
+        }
+        EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
+        std::vector<uint8_t> eager_state, graph_state;
+        ASSERT_TRUE(eager.GetData().DownloadPersistent(&eager_state));
+        ASSERT_TRUE(graph.GetData().DownloadPersistent(&graph_state));
+        EXPECT_EQ(eager_state, graph_state);
+    }
+    EXPECT_EQ(graph.CaptureAttempts(), 2u);
+    EXPECT_EQ(graph.GraphReplays(), 16u);
+    ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
+    EXPECT_EQ(graph.DataViewRef().particle_pos, address);
+    EXPECT_EQ(ReadPipelineState(graph), initial);
+    ASSERT_EQ(graph.StepConfigured(), nphi::Status::Ok);
+    EXPECT_EQ(graph.CaptureAttempts(), 2u);
 }
 
 void DownloadParticles(nk::World& w, std::vector<Vec3>* pos) {
@@ -239,121 +166,17 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         GTEST_SKIP() << "go2_stand.usda not present";
     Backend b = GetBackend();
 
-    // --- cook the bare Go2 once + read where its feet rest in the held stance -----
-    cook::CookToModelOptions opt;
-    opt.contact_family = cook::CookContactFamily::PairDriven;
-
-    auto cook_go2 = [&](bool with_free_body = false) -> nk::Model {
-        nuka::scene::SceneIR s = nuka::import::LoadUsd(Go2ScenePath().string());
-        if (with_free_body) {
-            nuka::scene::RigidBodyRecord body;
-            body.name = "free_body";
-            body.mass = 2.0f;
-            body.inertia = {0.03f, 0.05f, 0.07f};
-            body.local_transform.position = {3.0f, 2.0f, 4.0f};
-            body.inertial_transform.position = {0.01f, -0.015f, 0.02f};
-            nuka::scene::CollisionShapeRecord shape;
-            shape.body_id = s.AddRigidBody(body);
-            shape.type = nuka::scene::ShapeType::Sphere;
-            shape.radius = 0.05f;
-            s.AddCollisionShape(shape);
-        }
-        nk::Model m = cook::CookToModel(s, 1, opt).model;
-        // Generous rigid candidate budget for the Go2 collidables (links + base);
-        // CookSoftFluidParticles grows a DISJOINT particle reserve above this.
-        m.capacities.max_contacts_per_env = 32u;
-        m.capacities.max_rows_per_env =
-            m.capacities.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
-        return m;
+    const auto prepared = Prepare(Go2ScenePath(), b.dev, b.backend, Cfg());
+    auto cook_go2 = [&](bool with_free_body = false) {
+        return CookRobot(Go2ScenePath(), with_free_body);
     };
+    const auto& front_centre = prepared.front_centre;
+    const auto& rear_foot = prepared.rear_foot;
+    const auto& link_geom_local = prepared.link_geom_local;
+    const auto front_link = prepared.front_link, rear_link = prepared.rear_link;
+    const float cloth_z = prepared.cloth_z, pool_floor = prepared.pool_floor;
+    const uint32_t L = static_cast<uint32_t>(link_geom_local.size());
 
-    nk::Model probe = cook_go2();
-    const uint32_t L = probe.capacities.links_per_env;
-    const std::vector<uint32_t> link_geom_kind = probe.articulation.link_geom_kind;
-    const std::vector<Transform> link_geom_local = probe.articulation.link_geom_local;
-    ASSERT_GT(L, 0u);
-
-    // The collidable foot links are the spheres (the four calf feet). link_geom_kind
-    // stores (ShapeType + 1), so a sphere link is kShapeSphere + 1.
-    constexpr uint32_t kSphereGeom = nuka::collision::kShapeSphere + 1u;
-    std::vector<uint32_t> foot_links;
-    for (uint32_t l = 0; l < L; ++l)
-        if (l < link_geom_kind.size() && link_geom_kind[l] == kSphereGeom)
-            foot_links.push_back(l);
-    ASSERT_GE(foot_links.size(), 4u) << "expected four Go2 foot spheres";
-
-    nk::World wp(std::move(probe), 1u, b.dev, b.backend, Cfg());
-    ASSERT_TRUE(wp.Ready());
-    for (uint32_t s = 0; s < kSettleSteps; ++s) ASSERT_TRUE(wp.Step().AllOk());
-    std::vector<Transform> link_pose(L);
-    ASSERT_TRUE(wp.GetData().DownloadField(nk::FieldId::LinkPose, link_pose.data(),
-                                           L * sizeof(Transform)));
-    std::vector<Vec3> foot_world;
-    for (uint32_t l : foot_links)
-        foot_world.push_back((link_pose[l] * link_geom_local[l]).position);
-    for (size_t i = 0; i < foot_world.size(); ++i)
-        std::fprintf(stderr, "[robot-coupling] foot_link=%u rest @ (%.4f,%.4f,%.4f)\n",
-                     foot_links[i], foot_world[i].x, foot_world[i].y, foot_world[i].z);
-
-    // Split the feet into front (max x) and rear (min x); the front pair gets the
-    // cloth, one rear foot gets the pool.
-    auto by_x = foot_world;
-    std::sort(by_x.begin(), by_x.end(),
-              [](const Vec3& a, const Vec3& c) { return a.x < c.x; });
-    const float front_x = by_x.back().x, rear_x = by_x.front().x;
-    Vec3 front_centre{0, 0, 0}; uint32_t nf = 0;
-    Vec3 rear_foot{0, 0, 0}; float rear_best = 1e9f;
-    float foot_rest_z = 0.0f;
-    uint32_t front_link = foot_links[0], rear_link = foot_links[0];
-    for (size_t i = 0; i < foot_world.size(); ++i) {
-        const Vec3& f = foot_world[i];
-        foot_rest_z += f.z;
-        if (f.x > 0.5f * (front_x + rear_x)) {
-            front_centre = front_centre + f; ++nf; front_link = foot_links[i];
-        } else if (f.x < rear_best) {
-            rear_best = f.x; rear_foot = f; rear_link = foot_links[i];
-        }
-    }
-    foot_rest_z /= static_cast<float>(foot_world.size());
-    front_centre = front_centre * (1.0f / static_cast<float>(nf));
-    std::fprintf(stderr,
-                 "[robot-coupling] front_centre=(%.4f,%.4f) rear_foot=(%.4f,%.4f) "
-                 "foot_rest_z=%.4f\n",
-                 front_centre.x, front_centre.y, rear_foot.x, rear_foot.y, foot_rest_z);
-
-    // The pool's top layer sits at ~the rear foot centre so the foot's lower
-    // hemisphere is submerged from rest; its floor is one pool-depth below.
-    const float pool_top = foot_rest_z;
-    const float pool_floor = pool_top - static_cast<float>(kPoolNz - 1u) * kPoolSpacing -
-                             0.5f * kPoolSpacing;
-
-    // The rear foot's fluid load shifts the WHOLE articulation (kinematic base + PD
-    // legs), lifting the front feet off their bare-robot rest. Probe the front
-    // foot's settled position WITH the pool present (cloth absent) so the cloth lay
-    // can be placed where the front foot actually sits in the co-resident world.
-    float front_foot_z_loaded = foot_rest_z;
-    {
-        nk::Model m = cook_go2();
-        cook::PbfCookInput pool = BuildPool(rear_foot.x, rear_foot.y, pool_floor);
-        cook::CookSoftFluidParticles(m, 1u, cook::XpbdCookInput{}, pool);
-        m.particles.pp_contact_d_min = kContactDMin;
-        nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
-        ASSERT_TRUE(w.Ready());
-        for (uint32_t s = 0; s < kSettleSteps; ++s) ASSERT_TRUE(w.Step().AllOk());
-        std::vector<Transform> lp(L);
-        ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform)));
-        front_foot_z_loaded = (lp[front_link] * link_geom_local[front_link]).position.z;
-    }
-    std::fprintf(stderr, "[robot-coupling] front_foot_z_loaded=%.4f\n",
-                 front_foot_z_loaded);
-
-    // The taut membrane lies at the front foot's loaded centre so the foot's lower
-    // hemisphere rests in + indents it (the pinned perimeter holds it taut, so it
-    // cannot sag out of reach the way a corner-pinned sheet does).
-    const float cloth_z = front_foot_z_loaded;
-
-    // --- build the co-resident world: Go2 + cloth (front) + pool (rear) -----------
-    // patch_present == false cooks the bare-Go2 control (same robot, no particles).
     struct Run {
         uint32_t cloth_link_rows = 0u, fluid_link_rows = 0u, two_particle_rows = 0u;
         uint32_t cloth_any_rows = 0u, fluid_any_rows = 0u;  // any body side (diag).

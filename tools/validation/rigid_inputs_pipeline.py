@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -52,7 +53,7 @@ def render(world):
     ).copy()
 
 
-def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
+def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager"):
     output.mkdir(parents=True, exist_ok=True)
     builder = nuka.SceneBuilder.create(str(ROOT / "examples/scenes/go2_stand.usda"))
     try:
@@ -83,6 +84,16 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
     assert world.__enter__() is world
     with world:
         initial = state(world)
+        world.set_execution_mode(execution)
+        for before, after in zip(initial, state(world)):
+            np.testing.assert_array_equal(before, after)
+        assert world.execution_info["mode"] == execution
+        try:
+            world.set_execution_mode("invalid")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid execution mode was accepted")
         candidates = np.flatnonzero(np.all(np.isclose(initial[0][0, :, :3], POSITION), axis=1))
         assert candidates.size == 1, candidates
         body = int(candidates[0])
@@ -111,6 +122,7 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
         assert not np.any(world.download_field(nuka.BODY_TORQUE))
 
         world.step_n(steps - 1)
+        world.synchronize()
         advanced = state(world)
         gyro_residual = read(world, nuka.BODY_GYRO_RESIDUAL, 1)
         gyro_iterations = read(world, nuka.BODY_GYRO_ITERATIONS, 1)
@@ -175,6 +187,7 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
         torque_view.copy_(torch.from_numpy(torques))
         torch.cuda.synchronize()
         world.step_n(steps)
+        world.synchronize()
         for expected, actual in zip(advanced, state(world)):
             np.testing.assert_array_equal(actual, expected)
 
@@ -189,6 +202,11 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
         continuous_position = (POSITION + 0.5 * GRAVITY * duration**2
                                + forces[:, body] * (dt * duration / MASS))
         continuous_error = float(np.max(np.abs(advanced[0][:, body, :3] - continuous_position)))
+        execution_info = dict(world.execution_info)
+        if execution == "graph":
+            assert execution_info["graph_ready"]
+            assert execution_info["capture_attempts"] == 1
+            assert execution_info["graph_replays"] == 2 * steps
         return {
             "env_count": world.env_count, "body_count_per_env": int(force_view.shape[1]),
             "particles_per_env": int(initial[-1].shape[1]), "steps": steps, "dt": dt,
@@ -201,6 +219,8 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
             "env_status": env_status.tolist(), "gyro_reset_isolated": True,
             "neighbor_max_count": int(neighbor_count.max()),
             "neighbor_count": int(neighbor_count.sum()), "neighbors_not_truncated": True,
+            "execution": execution_info,
+            "state_sha256": hashlib.sha256(b"".join(value.tobytes() for value in advanced)).hexdigest(),
         }
 
 
@@ -253,6 +273,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--contracts-only", action="store_true")
+    parser.add_argument("--execution", choices=["eager", "graph"], default="eager")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     with nuka.Device.create(0) as device:
@@ -261,8 +282,8 @@ def main():
             (args.output / "public_creation_contracts.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(report), flush=True)
             return
-        report = {"pipeline": run_pipeline(device, args.output),
-                  "refined_pipeline": run_pipeline(device, args.output / "refined", 1.0 / 480.0, 2 * STEPS),
+        report = {"pipeline": run_pipeline(device, args.output, execution=args.execution),
+                  "refined_pipeline": run_pipeline(device, args.output / "refined", 1.0 / 480.0, 2 * STEPS, args.execution),
                   "file_gravity": check_file_gravity(device),
                   "creation_contracts": check_creation_contracts(device)}
     coarse = report["pipeline"]["continuous_position_max_error_m"]

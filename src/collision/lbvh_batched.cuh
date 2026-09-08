@@ -1,20 +1,6 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nuka::collision::gpu -- shared BATCHED, single-launch, per-env LBVH build.
-//
-// The ONE copy of the env-indexed Karras build: N contiguous per-env trees in
-// one launch over dim3(node_blocks, env_count), env-offset node slices
-// env*(2N-1), plus ONE cross-env thrust::stable_sort_by_key on the u64 key
-// (env<<32)|morton30 (bit-identical to E independent stable sorts). Both the
-// pair-driven collision broadphase op and the render TLAS call these launchers;
-// the env-kernels are templated on an AABB SOURCE so the SAME kernel body reads
-// either an interleaved collision::AABB array (render / standalone) or the
-// collision arena's split lo/hi vec3 arrays -- one algorithm, two thin adapters.
-//
-// Leaf `.left` is the env-LOCAL leaf index; the caller maps it to a body /
-// instance id. The arithmetic is byte-identical to the single-tree build/refit
-// so per-env results equal independent builds. Included only from .cu TUs.
-// ---------------------------------------------------------------------------
+// Collision and rendering share this batched LBVH build with stable CUB sorting.
+// Explicit workspace keeps allocations outside capture; leaf indices are environment-local.
 
 #include "collision/lbvh_node.cuh"      // LbvhNode / LbvhDelta / LbvhMerge
 #include "collision/morton_codes.cuh"   // Morton3D30
@@ -22,15 +8,40 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <limits>
 
 #include <cuda_runtime.h>
 
-#include <thrust/execution_policy.h>
-#include <thrust/iterator/zip_iterator.h>
-#include <thrust/sort.h>
-#include <thrust/tuple.h>
+#include <cub/device/device_radix_sort.cuh>
 
 namespace nuka::collision::gpu {
+
+struct LbvhWorkspaceLayout {
+    size_t index_offset;
+    size_t temp_offset;
+    explicit LbvhWorkspaceLayout(uint32_t count)
+        : index_offset((size_t{count} * sizeof(uint64_t) + 255u) & ~size_t{255u}),
+          temp_offset((index_offset + size_t{count} * sizeof(uint32_t) + 255u) & ~size_t{255u}) {}
+};
+
+inline cudaError_t QueryLbvhWorkspaceBytes(uint32_t envs, uint32_t leaves,
+                                           size_t* bytes) {
+    if (bytes == nullptr) return cudaErrorInvalidValue;
+    *bytes = 0u;
+    if (envs == 0u || leaves < 2u) return cudaSuccess;
+    const uint64_t count = uint64_t{envs} * leaves;
+    if (envs > 65535u || count > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+        uint64_t{envs} * (uint64_t{leaves} * 2u - 1u) > std::numeric_limits<uint32_t>::max())
+        return cudaErrorInvalidValue;
+    size_t temp = 0u;
+    const auto status = cub::DeviceRadixSort::SortPairs<uint64_t, uint32_t>(
+        nullptr, temp, static_cast<const uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
+        static_cast<const uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
+        static_cast<int>(count));
+    if (status != cudaSuccess) return status;
+    *bytes = LbvhWorkspaceLayout(static_cast<uint32_t>(count)).temp_offset + temp;
+    return cudaSuccess;
+}
 
 // Interleaved-array AABB source: one collision::AABB per leaf (render / test).
 struct AabbArraySource {
@@ -219,40 +230,63 @@ static __global__ void ZeroU32Kernel(uint32_t* __restrict__ a, uint32_t n) {
     if (i < n) a[i] = 0u;
 }
 
+static __global__ void SortedMortonKernel(const uint64_t* __restrict__ keys,
+                                          uint32_t* __restrict__ morton, uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) morton[i] = static_cast<uint32_t>(keys[i]);
+}
+
 // Shared launch body over any AABB source. Both public launchers forward here.
 template <typename Src>
-inline void BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
+inline cudaError_t BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
                                       uint32_t env_count, uint32_t leaves_per_env,
                                       LbvhNode* out_nodes,
                                       uint32_t* morton, uint32_t* index,
-                                      uint64_t* sortkey, uint32_t* visit) {
+                                      uint64_t* sortkey, uint32_t* visit,
+                                      void* workspace, size_t workspace_bytes) {
     const uint32_t E = env_count;
     const uint32_t N = leaves_per_env;
-    if (E == 0u || N < 2u) return;
+    if (E == 0u || N < 2u) return cudaSuccess;
+    const uint64_t count = uint64_t{E} * N;
+    if (E > 65535u || count > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+        uint64_t{E} * (uint64_t{N} * 2u - 1u) > std::numeric_limits<uint32_t>::max())
+        return cudaErrorInvalidValue;
+    const LbvhWorkspaceLayout layout(static_cast<uint32_t>(count));
+    if (workspace == nullptr || workspace_bytes <= layout.temp_offset)
+        return cudaErrorInvalidValue;
+    auto* bytes = static_cast<uint8_t*>(workspace);
+    auto* keys_in = reinterpret_cast<uint64_t*>(bytes);
+    auto* indices_in = reinterpret_cast<uint32_t*>(bytes + layout.index_offset);
+    size_t temp_bytes = workspace_bytes - layout.temp_offset;
     {  // zero the per-leaf visit counters.
         const uint32_t n = E * N;
         const uint32_t b = (n + kBlockSize - 1u) / kBlockSize;
         ZeroU32Kernel<<<b, kBlockSize, 0, stream>>>(visit, n);
     }
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     EnvMortonKernel<Src><<<dim3(E), dim3(kBlockSize), 0, stream>>>(
-        src, N, morton, index, sortkey);
-    {  // ONE cross-env stable sort: high env bits keep envs disjoint, low morton
-       // bits order within an env, stability breaks ties by ascending local id.
-        const size_t total = static_cast<size_t>(E) * N;
-        auto vals = thrust::make_zip_iterator(thrust::make_tuple(index, morton));
-        thrust::stable_sort_by_key(thrust::cuda::par.on(stream),
-                                   sortkey, sortkey + total, vals);
-    }
+        src, N, morton, indices_in, keys_in);
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    const auto sorted = cub::DeviceRadixSort::SortPairs(
+        bytes + layout.temp_offset, temp_bytes, keys_in, sortkey,
+        indices_in, index, static_cast<int>(count), 0, 64, stream);
+    if (sorted != cudaSuccess) return sorted;
+    SortedMortonKernel<<<(static_cast<uint32_t>(count) + kBlockSize - 1u) / kBlockSize,
+                          kBlockSize, 0, stream>>>(sortkey, morton, static_cast<uint32_t>(count));
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     const uint32_t node_count = 2u * N - 1u;
     const uint32_t node_blocks = (node_count + kBlockSize - 1u) / kBlockSize;
     EnvInitNodesKernel<Src><<<dim3(node_blocks, E), dim3(kBlockSize), 0, stream>>>(
         src, index, N, out_nodes);
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     const uint32_t internal_blocks = ((N - 1u) + kBlockSize - 1u) / kBlockSize;
     EnvBuildInternalKernel<<<dim3(internal_blocks, E), dim3(kBlockSize), 0, stream>>>(
         morton, N, out_nodes);
+    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     const uint32_t leaf_blocks = (N + kBlockSize - 1u) / kBlockSize;
     EnvPropagateKernel<<<dim3(leaf_blocks, E), dim3(kBlockSize), 0, stream>>>(
         N, out_nodes, visit);
+    return cudaGetLastError();
 }
 
 template <typename Src>
@@ -278,7 +312,7 @@ inline void RefitLbvhBatchedImpl(cudaStream_t stream, LbvhNode* nodes, Src src,
 
 // Build E per-env trees over env-major `device_aabbs` into `device_out_nodes`
 // (env-offset env*(2N-1)); scratch each E*N; leaf `.left` = env-LOCAL index.
-inline void BuildLbvhBatchedNodes(cudaStream_t stream, int /*device_id*/,
+inline cudaError_t BuildLbvhBatchedNodes(cudaStream_t stream, int /*device_id*/,
                                   const collision::AABB* device_aabbs,
                                   uint32_t env_count,
                                   uint32_t leaves_per_env,
@@ -286,16 +320,17 @@ inline void BuildLbvhBatchedNodes(cudaStream_t stream, int /*device_id*/,
                                   uint32_t* device_morton_scratch,
                                   uint32_t* device_index_scratch,
                                   uint64_t* device_sortkey_scratch,
-                                  uint32_t* device_visit_scratch) {
-    lbvh_batched_detail::BuildLbvhBatchedNodesImpl(
+                                  uint32_t* device_visit_scratch,
+                                  void* workspace, size_t workspace_bytes) {
+    return lbvh_batched_detail::BuildLbvhBatchedNodesImpl(
         stream, AabbArraySource{device_aabbs}, env_count, leaves_per_env,
         device_out_nodes, device_morton_scratch, device_index_scratch,
-        device_sortkey_scratch, device_visit_scratch);
+        device_sortkey_scratch, device_visit_scratch, workspace, workspace_bytes);
 }
 
 // Split lo/hi overload for the collision arena (body_aabb_lo / body_aabb_hi).
 // Same algorithm; the source reassembles the interleaved AABB per leaf.
-inline void BuildLbvhBatchedNodes(cudaStream_t stream, int /*device_id*/,
+inline cudaError_t BuildLbvhBatchedNodes(cudaStream_t stream, int /*device_id*/,
                                   const math::Vec3* device_aabb_lo,
                                   const math::Vec3* device_aabb_hi,
                                   uint32_t env_count,
@@ -304,11 +339,13 @@ inline void BuildLbvhBatchedNodes(cudaStream_t stream, int /*device_id*/,
                                   uint32_t* device_morton_scratch,
                                   uint32_t* device_index_scratch,
                                   uint64_t* device_sortkey_scratch,
-                                  uint32_t* device_visit_scratch) {
-    lbvh_batched_detail::BuildLbvhBatchedNodesImpl(
+                                  uint32_t* device_visit_scratch,
+                                  void* workspace, size_t workspace_bytes) {
+    return lbvh_batched_detail::BuildLbvhBatchedNodesImpl(
         stream, AabbSplitSource{device_aabb_lo, device_aabb_hi}, env_count,
         leaves_per_env, device_out_nodes, device_morton_scratch,
-        device_index_scratch, device_sortkey_scratch, device_visit_scratch);
+        device_index_scratch, device_sortkey_scratch, device_visit_scratch,
+        workspace, workspace_bytes);
 }
 
 // Refit E per-env trees in place: env-offset leaf reload from `device_new_aabbs`

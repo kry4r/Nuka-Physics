@@ -23,6 +23,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <new>
+#include <exception>
 
 namespace nuka::phi {
 
@@ -147,7 +149,8 @@ Status BackendDispatchImpl(Backend* b, const ModelView& model,
     // LBVH sorts run on the default device via thrust::cuda::par.on(stream) —
     // they REQUIRE the current device to match the stream's device, which a
     // caller thread may not have set).
-    (void)cudaSetDevice(cb->device_id);
+    const auto selected = cudaSetDevice(cb->device_id);
+    if (selected != cudaSuccess) return CudaStatus(selected);
     OpProfiler& prof = OpProfiler::Get();
     prof.Ensure();
     if (!prof.on) {
@@ -177,71 +180,101 @@ Status BackendDispatchImpl(Backend* b, const ModelView& model,
     return s;
 }
 
-void BackendSynchronizeImpl(Backend* b) {
+Status SetExecutionError(ExecutionError* error, Status status, NkOp op,
+                         cudaError_t native, const char* message) {
+    if (error) {
+        *error = {};
+        error->status = status;
+        error->failed_op = op;
+        error->native_code = static_cast<int32_t>(native);
+        std::snprintf(error->message, sizeof(error->message), "%s", message ? message : "");
+    }
+    return status;
+}
+
+Status BackendSynchronizeImpl(Backend* b, ExecutionError* error) {
     CudaBackend* cb = AsBackend(b);
-    (void)cudaStreamSynchronize(cb->main);
+    auto status = cudaSetDevice(cb->device_id);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(cb->main);
+    return SetExecutionError(error, CudaStatus(status), NkOp::Count, status,
+                             status == cudaSuccess ? "" : cudaGetErrorString(status));
 }
 
 Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
-                            const DataView& data, const OpCall* calls, int n_calls) {
+                            const DataView& data, const OpCall* calls, int n_calls,
+                            ExecutionError* error) {
     CudaBackend* cb = AsBackend(b);
-
-    // Capture the op sequence on the dedicated capture stream into a graph.
-    if (cudaStreamBeginCapture(cb->capture, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        (void)cudaGetLastError();
+    ExecutionError failure{};
+    if (error) *error = {};
+    if (n_calls < 0 || (n_calls != 0 && calls == nullptr)) {
+        SetExecutionError(error, Status::InvalidArgument, NkOp::Count, cudaErrorInvalidValue,
+                          "invalid graph operator sequence");
         return nullptr;
     }
-    bool ok = true;
-    // Defensive guard: should an op ever allocate on the stream mid-capture it
-    // throws std::bad_alloc (cudaErrorStreamCaptureUnsupported); catch it so
-    // plan_create returns a clean nullptr (the caller falls back to Step) instead
-    // of unwinding through the C ABI vtable. The capture MUST still be ended (a
-    // left-open capture poisons the stream for the next StepPlanned). Every op is
-    // capture-safe today (the particle-grid sort/scan draw from pre-allocated
-    // scratch), so this path is not taken on the supported scenes.
+    auto native = cudaSetDevice(cb->device_id);
+    if (native == cudaSuccess)
+        native = cudaStreamBeginCapture(cb->capture, cudaStreamCaptureModeThreadLocal);
+    if (native != cudaSuccess) {
+        SetExecutionError(error, CudaStatus(native), NkOp::Count, native, cudaGetErrorString(native));
+        return nullptr;
+    }
+    NkOp current = NkOp::Count;
     try {
         for (int i = 0; i < n_calls; ++i) {
-            if (DispatchOn(model, data, calls[i], cb->capture) != Status::Ok) {
-                ok = false;
+            current = calls[i].op;
+            const auto status = DispatchOn(model, data, calls[i], cb->capture);
+            if (status != Status::Ok) {
+                SetExecutionError(&failure, status, current, cudaSuccess,
+                                  "operator failed during graph capture");
                 break;
             }
         }
+    } catch (const std::bad_alloc& exception) {
+        SetExecutionError(&failure, Status::OutOfMemory, current, cudaSuccess, exception.what());
+    } catch (const std::exception& exception) {
+        SetExecutionError(&failure, Status::Failed, current, cudaSuccess, exception.what());
     } catch (...) {
-        ok = false;
+        SetExecutionError(&failure, Status::Failed, current, cudaSuccess,
+                          "unknown exception during graph capture");
     }
-
     cudaGraph_t graph = nullptr;
-    cudaError_t end_err = cudaStreamEndCapture(cb->capture, &graph);
-    if (!ok || end_err != cudaSuccess || graph == nullptr) {
-        (void)cudaGetLastError();
-        if (graph != nullptr) { (void)cudaGraphDestroy(graph); }
+    native = cudaStreamEndCapture(cb->capture, &graph);
+    if (failure.status != Status::Ok || native != cudaSuccess || graph == nullptr) {
+        if (failure.status == Status::Ok)
+            SetExecutionError(&failure, native == cudaSuccess ? Status::Failed : CudaStatus(native),
+                              current, native, native == cudaSuccess ? "empty captured graph" : cudaGetErrorString(native));
+        if (error) *error = failure;
+        if (graph) cudaGraphDestroy(graph);
+        cudaGetLastError();
         return nullptr;
     }
-
     cudaGraphExec_t exec = nullptr;
-    if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
-        (void)cudaGetLastError();
-        (void)cudaGraphDestroy(graph);
+    native = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    if (native != cudaSuccess) {
+        SetExecutionError(error, CudaStatus(native), NkOp::Count, native, cudaGetErrorString(native));
+        cudaGraphDestroy(graph);
         return nullptr;
     }
-
-    CudaPlan* plan = new CudaPlan{};
-    plan->graph = graph;
-    plan->exec  = exec;
+    CudaPlan* plan = new (std::nothrow) CudaPlan{graph, exec};
+    if (!plan) {
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        SetExecutionError(error, Status::OutOfMemory, NkOp::Count, cudaSuccess,
+                          "graph owner allocation failed");
+    }
     return reinterpret_cast<Plan*>(plan);
 }
 
-Status BackendPlanExecuteImpl(Backend* b, Plan* p) {
+Status BackendPlanExecuteImpl(Backend* b, Plan* p, ExecutionError* error) {
     CudaBackend* cb = AsBackend(b);
     CudaPlan* plan = AsPlan(p);
-    if (plan == nullptr || plan->exec == nullptr) {
-        return Status::Failed;
-    }
-    if (cudaGraphLaunch(plan->exec, cb->main) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return Status::Failed;
-    }
-    return Status::Ok;
+    if (plan == nullptr || plan->exec == nullptr)
+        return SetExecutionError(error, Status::InvalidArgument, NkOp::Count,
+                                 cudaErrorInvalidValue, "graph is not initialized");
+    auto status = cudaSetDevice(cb->device_id);
+    if (status == cudaSuccess) status = cudaGraphLaunch(plan->exec, cb->main);
+    return SetExecutionError(error, CudaStatus(status), NkOp::Count, status,
+                             status == cudaSuccess ? "" : cudaGetErrorString(status));
 }
 
 void BackendPlanFreeImpl(Backend*, Plan* p) {
@@ -307,6 +340,8 @@ struct CudaDevice {
     const DeviceI* iface;   // MUST be first
     int            device_id;
     char           name[256];
+    CudaBufferType device_bt;
+    CudaBufferType host_bt;
 };
 
 CudaDevice* AsDevice(Device* d) { return reinterpret_cast<CudaDevice*>(d); }
@@ -326,7 +361,7 @@ void DeviceGetMemoryImpl(Device* d, size_t* free_b, size_t* total_b) {
 
 Backend* DeviceInitBackendImpl(Device* d, const char* /*params_json*/) {
     CudaDevice* cd = AsDevice(d);
-    (void)cudaSetDevice(cd->device_id);
+    if (cudaSetDevice(cd->device_id) != cudaSuccess) return nullptr;
 
     CudaBackend* cb = new CudaBackend{};
     cb->iface     = &kCudaBackendI;
@@ -343,29 +378,22 @@ Backend* DeviceInitBackendImpl(Device* d, const char* /*params_json*/) {
     cb->device_bt.iface   = &kCudaDeviceBufferTypeI;
     cb->device_bt.backend = cb;
     cb->device_bt.is_host = false;
+    cb->device_bt.device_id = cd->device_id;
 
     cb->host_bt.iface   = &kCudaHostBufferTypeI;
     cb->host_bt.backend = cb;
     cb->host_bt.is_host = true;
+    cb->host_bt.device_id = cd->device_id;
 
     return reinterpret_cast<Backend*>(cb);
 }
 
-BufferType* DeviceGetBufferTypeImpl(Device* /*d*/) {
-    // The buffer type is bound to a Backend (for its stream), not a Device. A
-    // caller wanting a stream-bound type allocates after init_backend and uses
-    // the backend's types (DeviceBufferType on the BACKEND in M3+). For the M1
-    // surface we return a stream-less default-stream device type so the
-    // BufferType handle is non-null and usable for allocation tests.
-    static CudaBufferType s_default_device_bt = {
-        &kCudaDeviceBufferTypeI, /*backend=*/nullptr, /*is_host=*/false};
-    return reinterpret_cast<BufferType*>(&s_default_device_bt);
+BufferType* DeviceGetBufferTypeImpl(Device* device) {
+    return reinterpret_cast<BufferType*>(&AsDevice(device)->device_bt);
 }
 
-BufferType* DeviceGetHostBufferTypeImpl(Device* /*d*/) {
-    static CudaBufferType s_default_host_bt = {
-        &kCudaHostBufferTypeI, /*backend=*/nullptr, /*is_host=*/true};
-    return reinterpret_cast<BufferType*>(&s_default_host_bt);
+BufferType* DeviceGetHostBufferTypeImpl(Device* device) {
+    return reinterpret_cast<BufferType*>(&AsDevice(device)->host_bt);
 }
 
 bool DeviceSupportsOpImpl(Device* /*d*/, NkOp op) {
@@ -413,6 +441,8 @@ void EnsureEnumerated(CudaRegistryEntry* reg) {
         CudaDevice& dev = reg->devices[i];
         dev.iface     = &kCudaDeviceI;
         dev.device_id = i;
+        dev.device_bt = {&kCudaDeviceBufferTypeI, nullptr, false, i};
+        dev.host_bt = {&kCudaHostBufferTypeI, nullptr, true, i};
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, i) == cudaSuccess) {
             // copy name, NUL-terminated

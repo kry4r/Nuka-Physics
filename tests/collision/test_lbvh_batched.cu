@@ -41,6 +41,8 @@ struct DeviceScratch {
     uint32_t* index = nullptr;
     uint64_t* sortkey = nullptr;
     uint32_t* visit = nullptr;
+    void* workspace = nullptr;
+    size_t workspace_bytes = 0u;
 
     DeviceScratch(uint32_t env_count, uint32_t leaves_per_env) {
         const size_t leaves = static_cast<size_t>(env_count) * leaves_per_env;
@@ -52,6 +54,8 @@ struct DeviceScratch {
         EXPECT_EQ(cudaMalloc(&index, leaves * sizeof(uint32_t)), cudaSuccess);
         EXPECT_EQ(cudaMalloc(&sortkey, leaves * sizeof(uint64_t)), cudaSuccess);
         EXPECT_EQ(cudaMalloc(&visit, leaves * sizeof(uint32_t)), cudaSuccess);
+        EXPECT_EQ(cg::QueryLbvhWorkspaceBytes(env_count, leaves_per_env, &workspace_bytes), cudaSuccess);
+        EXPECT_EQ(cudaMalloc(&workspace, workspace_bytes), cudaSuccess);
     }
     ~DeviceScratch() {
         cudaFree(aabbs);
@@ -60,6 +64,7 @@ struct DeviceScratch {
         cudaFree(index);
         cudaFree(sortkey);
         cudaFree(visit);
+        cudaFree(workspace);
     }
     DeviceScratch(const DeviceScratch&) = delete;
     DeviceScratch& operator=(const DeviceScratch&) = delete;
@@ -111,10 +116,10 @@ TEST(LbvhBatched, BatchedBuildEqualsIndependentBuilds) {
     DeviceScratch batched(kEnvCount, kLeavesPerEnv);
     NK_CUDA_OK(cudaMemcpy(batched.aabbs, all.data(), all.size() * sizeof(AABB),
                           cudaMemcpyHostToDevice));
-    cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, batched.aabbs,
+    NK_CUDA_OK(cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, batched.aabbs,
                               kEnvCount, kLeavesPerEnv, batched.nodes,
                               batched.morton, batched.index, batched.sortkey,
-                              batched.visit);
+                              batched.visit, batched.workspace, batched.workspace_bytes));
     NK_CUDA_OK(cudaDeviceSynchronize());
     const auto batched_nodes =
         DownloadNodes(batched.nodes, static_cast<size_t>(kEnvCount) * node_count);
@@ -124,9 +129,9 @@ TEST(LbvhBatched, BatchedBuildEqualsIndependentBuilds) {
         DeviceScratch one(1u, kLeavesPerEnv);
         NK_CUDA_OK(cudaMemcpy(one.aabbs, per_env[e].data(),
                               kLeavesPerEnv * sizeof(AABB), cudaMemcpyHostToDevice));
-        cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, one.aabbs,
+        NK_CUDA_OK(cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, one.aabbs,
                                   1u, kLeavesPerEnv, one.nodes, one.morton,
-                                  one.index, one.sortkey, one.visit);
+                                  one.index, one.sortkey, one.visit, one.workspace, one.workspace_bytes));
         NK_CUDA_OK(cudaDeviceSynchronize());
         const auto solo_nodes = DownloadNodes(one.nodes, node_count);
 
@@ -168,10 +173,10 @@ TEST(LbvhBatched, BatchedRefitEqualsIndependentRefits) {
     DeviceScratch batched(kEnvCount, kLeavesPerEnv);
     NK_CUDA_OK(cudaMemcpy(batched.aabbs, all.data(), all.size() * sizeof(AABB),
                           cudaMemcpyHostToDevice));
-    cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, batched.aabbs,
+    NK_CUDA_OK(cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, batched.aabbs,
                               kEnvCount, kLeavesPerEnv, batched.nodes,
                               batched.morton, batched.index, batched.sortkey,
-                              batched.visit);
+                              batched.visit, batched.workspace, batched.workspace_bytes));
     AABB* d_nudged = nullptr;
     NK_CUDA_OK(cudaMalloc(&d_nudged, all_nudged.size() * sizeof(AABB)));
     NK_CUDA_OK(cudaMemcpy(d_nudged, all_nudged.data(),
@@ -187,9 +192,9 @@ TEST(LbvhBatched, BatchedRefitEqualsIndependentRefits) {
         DeviceScratch one(1u, kLeavesPerEnv);
         NK_CUDA_OK(cudaMemcpy(one.aabbs, per_env[e].data(),
                               kLeavesPerEnv * sizeof(AABB), cudaMemcpyHostToDevice));
-        cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, one.aabbs,
+        NK_CUDA_OK(cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, one.aabbs,
                                   1u, kLeavesPerEnv, one.nodes, one.morton,
-                                  one.index, one.sortkey, one.visit);
+                                  one.index, one.sortkey, one.visit, one.workspace, one.workspace_bytes));
         AABB* d_one_nudged = nullptr;
         NK_CUDA_OK(cudaMalloc(&d_one_nudged, kLeavesPerEnv * sizeof(AABB)));
         NK_CUDA_OK(cudaMemcpy(d_one_nudged, per_env_nudged[e].data(),
@@ -229,9 +234,9 @@ TEST(LbvhBatched, SplitLoHiOverloadMatchesInterleaved) {
     DeviceScratch inter(kEnvCount, kLeavesPerEnv);
     NK_CUDA_OK(cudaMemcpy(inter.aabbs, all.data(), leaves * sizeof(AABB),
                           cudaMemcpyHostToDevice));
-    cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, inter.aabbs,
+    NK_CUDA_OK(cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, inter.aabbs,
                               kEnvCount, kLeavesPerEnv, inter.nodes, inter.morton,
-                              inter.index, inter.sortkey, inter.visit);
+                              inter.index, inter.sortkey, inter.visit, inter.workspace, inter.workspace_bytes));
 
     DeviceScratch split(kEnvCount, kLeavesPerEnv);
     nuka::math::Vec3* d_lo = nullptr;
@@ -242,9 +247,9 @@ TEST(LbvhBatched, SplitLoHiOverloadMatchesInterleaved) {
                           cudaMemcpyHostToDevice));
     NK_CUDA_OK(cudaMemcpy(d_hi, hi.data(), leaves * sizeof(nuka::math::Vec3),
                           cudaMemcpyHostToDevice));
-    cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, d_lo, d_hi,
+    NK_CUDA_OK(cg::BuildLbvhBatchedNodes(/*stream=*/nullptr, /*device_id=*/0, d_lo, d_hi,
                               kEnvCount, kLeavesPerEnv, split.nodes, split.morton,
-                              split.index, split.sortkey, split.visit);
+                              split.index, split.sortkey, split.visit, split.workspace, split.workspace_bytes));
     NK_CUDA_OK(cudaDeviceSynchronize());
 
     const size_t total = static_cast<size_t>(kEnvCount) * node_count;

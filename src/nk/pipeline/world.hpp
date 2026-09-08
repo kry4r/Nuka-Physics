@@ -1,17 +1,6 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nk::World — Model + Data + Pipeline bound to a backend (plan §3.2 / M3).
-//
-// Ctor takes the cook product (nk::Model), the env_count, and the phi::Backend:
-// it uploads the Model into ONE device buffer, allocates the Data arena, and
-// builds the Pipeline (the per-step OpCall list). Step() dispatches each OpCall,
-// surfacing per-op status HONESTLY (a healthy step is all-Ok; Unsupported means
-// the backend lacks the op). StepPlanned() builds
-// a CUDA-graph plan once then replays it. Reset(env_mask) dispatches ResetEnvs.
-// FieldPtr(FieldId) returns a device pointer (model- or data-owned).
-//
-// PURE C++ — zero CUDA tokens. All device + execution via the phi v2 vtable.
-// ---------------------------------------------------------------------------
+// World owns model, mutable state, and one operator sequence for eager or graph execution.
+// Device operations and storage use the backend interface without exposing CUDA types.
 
 #include <cstdint>
 #include <memory>
@@ -27,13 +16,7 @@
 
 namespace nuka::nk {
 
-// The M4 device-resident solve schedule (src/nk/solve/schedule.hpp): built
-// ONCE at construction over the MAX-CAPACITY row slots (worst-case coloring is
-// valid for every runtime subset — schedule.hpp invariant note), staged into
-// the Model device buffer by UploadTo. Reset() does NOT rebuild it: the
-// schedule is a pure function of the fixed capacities/topology, which Reset
-// never changes (plan §3.4 "构建/Reset 时" — same trigger condition, and the
-// condition's inputs are immutable post-build).
+// The fixed-capacity solve schedule depends on immutable topology and survives reset.
 class SolveSchedule;
 
 // Per-op step outcome — World surfaces the status of EVERY dispatched op so a
@@ -61,14 +44,9 @@ struct StepResult {
 
 class World {
 public:
-    // Construct from a cook product. The World TAKES the Model by value (move).
-    // env_count overrides the Model's capacity env_count if > 0 (the Model is
-    // cooked at a base env_count by CookToModel; this is the validation seam).
-    // backend must be a live phi::Backend; `device` supplies the BufferType used
-    // for the one-shot Model upload + Arena allocation (the plan's documented use
-    // of DeviceI::get_buffer_type — a stream-less default-stream type fine for
-    // init-time movement). On any device failure the World is left in an unbuilt
-    // state (Ready() == false).
+    enum class ExecutionMode : uint32_t { Eager, Graph };
+    // Takes ownership of the cooked model; a positive env_count overrides its capacity.
+    // Device and backend must remain live; creation failures leave Ready() false.
     World(Model model, uint32_t env_count, phi::Device* device,
           phi::Backend* backend, const Pipeline::SolverConfig& cfg = {});
 
@@ -85,12 +63,18 @@ public:
     // Dispatch in order and stop at the first host or launch failure.
     StepResult Step();
 
-    // Plan path: build a CUDA-graph plan over the OpCall list once, then execute.
-    // Returns the plan_execute status. If plan_create fails (an op the backend
-    // cannot capture — today the thrust sorts in ParticleGridBuild/LbvhBuild),
-    // returns Status::Unsupported and falls back to NOT planning (caller can
-    // use Step()).
+    // Capture the common operator sequence once and replay it without eager fallback.
+    // Failed captures are cached until the operator sequence changes.
     phi::Status StepPlanned();
+    phi::Status PrepareGraph();
+    phi::Status SetExecutionMode(ExecutionMode mode);
+    phi::Status StepConfigured();
+    phi::Status Synchronize();
+    ExecutionMode GetExecutionMode() const { return execution_mode_; }
+    bool GraphReady() const { return plan_ != nullptr; }
+    uint64_t CaptureAttempts() const { return capture_attempts_; }
+    uint64_t GraphReplays() const { return graph_replays_; }
+    const phi::ExecutionError& LastExecutionError() const { return execution_error_; }
 
     // Restore the selected environment set; empty selects all, duplicates are ignored.
     // Invalid IDs fail without mutation. Control targets and unselected environments stay intact.
@@ -100,9 +84,8 @@ public:
     // snapshot/restore/obs plumbing). params must match the op's POD.
     phi::Status DispatchOp(phi::NkOp op, const void* params);
 
-    // Device pointer of a field (model- or data-owned); null if absent/unbuilt.
-    // Requesting a readout-produced field (LinkContactWrench / ContactForce)
-    // turns the producing op on: pipeline rebuilt, plan recaptured next step.
+    // Returns the field's device pointer, enabling its readout producer when required.
+    // A new producer invalidates the graph; absent or unbuilt fields return null.
     void* FieldPtr(FieldId id) const;
     template <class T> T* FieldPtr(FieldId id) const { return static_cast<T*>(FieldPtr(id)); }
 
@@ -113,18 +96,11 @@ public:
     const Model&    GetModel()    const { return model_; }
     Data&           GetData()     { return data_; }
 
-    // The phi v2 backend this World is bound to (M11 INT-3). phi::Backend is an
-    // OPAQUE handle (phi/backend.hpp) -- NOT a CUDA token, so exposing it keeps
-    // the nk-engine zero-CUDA red-line green. The M11 CUDA<->Vulkan interop
-    // publisher (runtime/app/cuda_vulkan_interop) reads it to drive the
-    // device-scatter on the SAME backend (stream) the World's ops run on; it
-    // touches no CUDA type. Null when the World is unbuilt.
+    // Interop consumers share the world's backend and stream through this opaque handle.
     phi::Backend* Backend() const { return backend_; }
 
 private:
-    // Seed the Data persistent fields from the Model template (q / link_pose /
-    // base_pose / drive_* / mat_buckets, env-major replication) and take the
-    // device snapshot the Reset path restores. Called once from the ctor.
+    // Seed environment state from the model and capture the reset snapshot.
     bool SeedInitialState();
     phi::Status RefreshPoses(uint32_t selected_env_count);
 
@@ -142,6 +118,12 @@ private:
     phi::ModelView  model_view_{};
     phi::DataView   data_view_{};
     phi::Plan*      plan_ = nullptr;
+    bool            plan_attempted_ = false;
+    ExecutionMode   execution_mode_ = ExecutionMode::Eager;
+    uint64_t        capture_attempts_ = 0u;
+    uint64_t        graph_replays_ = 0u;
+    phi::ExecutionError graph_error_{};
+    phi::ExecutionError execution_error_{};
     bool            ready_ = false;
     phi::Status     creation_status_ = phi::Status::Failed;
     phi::Status     last_status_ = phi::Status::Ok;

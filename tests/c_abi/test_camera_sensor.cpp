@@ -172,11 +172,8 @@ TEST(CameraSensor, AttachRenderViewDeviceResidentNonEmpty) {
                 (unsigned long long)ids.size());
 }
 
-// ---------------------------------------------------------------------------
-// Gate 2 -- batched correctness: every env's tile is byte-identical (same
-// articulation, same Base-relative mount across the N per-env TLASes).
-// ---------------------------------------------------------------------------
-TEST(CameraSensor, PerEnvTilesByteIdentical) {
+// Geometry uses center rays; RGB samples have independent camera-indexed random streams.
+TEST(CameraSensor, PerEnvGeometryTilesByteIdentical) {
     if (!SceneAvailable()) GTEST_SKIP() << "go2_stand scene unavailable";
     DeviceGuard device;
     ASSERT_NE(device.handle, nullptr);
@@ -188,24 +185,22 @@ TEST(CameraSensor, PerEnvTilesByteIdentical) {
     ASSERT_EQ(AttachTopDownCamera(world.handle, kW, kH), NUKA_RESULT_OK);
     ASSERT_EQ(nuka_world_render_sensors(world.handle), NUKA_RESULT_OK);
 
-    nuka_buffer_view_t color{};
-    ASSERT_EQ(nuka_world_get_sensor_view(world.handle, NUKA_SENSOR_CHANNEL_COLOR,
-                                         &color),
-              NUKA_RESULT_OK);
-    const std::vector<float> rgb = DownloadFloat(color);
-    const size_t per = static_cast<size_t>(kW) * kH * 3u;
-    ASSERT_EQ(rgb.size(), per * kEnv);
-
-    size_t mismatches = 0u;
-    for (uint32_t e = 1u; e < kEnv; ++e) {
-        for (size_t i = 0u; i < per; ++i) {
-            if (rgb[static_cast<size_t>(e) * per + i] != rgb[i]) ++mismatches;
+    for (auto channel : {NUKA_SENSOR_CHANNEL_DEPTH, NUKA_SENSOR_CHANNEL_NORMAL,
+                         NUKA_SENSOR_CHANNEL_ALBEDO, NUKA_SENSOR_CHANNEL_PRIM}) {
+        nuka_buffer_view_t view{};
+        ASSERT_EQ(nuka_world_get_sensor_view(world.handle, channel, &view), NUKA_RESULT_OK);
+        const auto words = DownloadU32(view);
+        ASSERT_EQ(words.size() % kEnv, 0u);
+        const size_t per = words.size() / kEnv;
+        ASSERT_GE(per, static_cast<size_t>(kW) * kH);
+        size_t mismatches = 0u;
+        for (uint32_t e = 1u; e < kEnv; ++e) {
+            for (size_t i = 0u; i < per; ++i) {
+                if (words[static_cast<size_t>(e) * per + i] != words[i]) ++mismatches;
+            }
         }
+        EXPECT_EQ(mismatches, 0u) << "geometry channel " << channel << " differs across identical environments";
     }
-    std::printf("[diag] (2) cross-env tile mismatches = %zu / %zu\n", mismatches,
-                per * (kEnv - 1u));
-    EXPECT_EQ(mismatches, 0u)
-        << "the N per-env TLAS tiles diverge for identical state -- batched render bug";
 }
 
 // ---------------------------------------------------------------------------
