@@ -256,6 +256,38 @@ MeshGeometry MakeCapsule(float r, float hh, uint32_t slices = 16, uint32_t cap_s
     return m;
 }
 
+// Flat-capped cylinder along the local Z axis (MJCF `type="cylinder"` visual):
+// the capsule's side wall with disk caps at ±hh instead of hemispheres.
+MeshGeometry MakeCylinder(float r, float hh, uint32_t slices = 16) {
+    MeshGeometry m;
+    for (uint32_t j = 0; j < slices; ++j) {
+        const float u0 = 2.0f * kPi * static_cast<float>(j) / static_cast<float>(slices);
+        const float u1 = 2.0f * kPi * static_cast<float>(j + 1) / static_cast<float>(slices);
+        const math::Vec3 a{r * std::cos(u0), r * std::sin(u0), -hh};
+        const math::Vec3 b{r * std::cos(u1), r * std::sin(u1), -hh};
+        const math::Vec3 c{r * std::cos(u1), r * std::sin(u1),  hh};
+        const math::Vec3 d{r * std::cos(u0), r * std::sin(u0),  hh};
+        PushQuad(m, a, b, c, d);
+    }
+    auto disk = [&](float z, float sign) {
+        for (uint32_t j = 0; j < slices; ++j) {
+            const float u0 = 2.0f * kPi * static_cast<float>(j) / static_cast<float>(slices);
+            const float u1 = 2.0f * kPi * static_cast<float>(j + 1) / static_cast<float>(slices);
+            const math::Vec3 center{0.0f, 0.0f, z};
+            const math::Vec3 p0{r * std::cos(u0), r * std::sin(u0), z};
+            const math::Vec3 p1{r * std::cos(u1), r * std::sin(u1), z};
+            if (sign > 0.0f) {
+                PushTri(m, center, p0, p1);
+            } else {
+                PushTri(m, center, p1, p0);
+            }
+        }
+    };
+    disk(hh, 1.0f);
+    disk(-hh, -1.0f);
+    return m;
+}
+
 // True when the normal stream is missing, length-mismatched, or DEGENERATE
 // (every component ~0 -- the T5 zero-filled-normals cook gap).
 bool NormalsUnusable(const std::vector<float>& positions, const std::vector<float>& normals) {
@@ -285,6 +317,37 @@ std::string PrimKey(const char* kind, float a, float b, float c) {
     char buf[96];
     std::snprintf(buf, sizeof(buf), "prim:%s:%.6g,%.6g,%.6g", kind, a, b, c);
     return std::string(buf);
+}
+
+// Content hash (FNV-1a) over the inline triangle payload: repeated instances of
+// one source mesh (left/right fingers, per-link visual pieces) dedup to one entry.
+std::string InlineMeshKey(const scene::VisualMeshComponent& vis) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void* data, std::size_t bytes) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(vis.inline_positions.data(), vis.inline_positions.size() * sizeof(float));
+    mix(vis.inline_indices.data(), vis.inline_indices.size() * sizeof(uint32_t));
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "inline:%016llx", static_cast<unsigned long long>(h));
+    return std::string(buf);
+}
+
+// The in-memory import counterpart of FromNkaMesh: same normal synthesis so an
+// unauthored stream still shades (raster + path-tracer never normalize a zero).
+MeshGeometry FromInlineTriangles(const scene::VisualMeshComponent& vis) {
+    MeshGeometry m;
+    m.positions = vis.inline_positions;
+    m.uvs       = vis.inline_uvs;
+    m.indices   = vis.inline_indices;
+    m.normals   = NormalsUnusable(vis.inline_positions, vis.inline_normals)
+                      ? SmoothNormals(vis.inline_positions, vis.inline_indices)
+                      : vis.inline_normals;
+    return m;
 }
 
 }  // namespace
@@ -376,7 +439,16 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 // params; marks body_has_visual so the collision proxy is skipped.
                 using PK = scene::VisualMeshComponent::PrimKind;
                 if (vis.prim_kind == PK::None) {
-                    // Still asset-gated / non-renderable: skip (no misleading cube).
+                    // Render imported inline triangles when no MESH reference exists.
+                    if (!vis.inline_positions.empty() && !vis.inline_indices.empty()) {
+                        const uint32_t inline_mesh_id = world.meshes.InternPrimitive(
+                            InlineMeshKey(vis), [&]() { return FromInlineTriangles(vis); });
+                        if (const scene::SceneNode* b = nearest_body_node(e)) {
+                            body_has_visual.insert(b);
+                        }
+                        build_common(e, inline_mesh_id,
+                                     resolve_material(vis.render_material_id));
+                    }
                     return;
                 }
                 // Slot semantics are kind-specific (see VisualMeshComponent doc):
@@ -403,6 +475,13 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                         prim_mesh_id = world.meshes.InternPrimitive(
                             PrimKey("vcapsule", r, half_height, 0),
                             [&]() { return MakeCapsule(r, half_height); });
+                        break;
+                    }
+                    case PK::Cylinder: {
+                        const float r = vis.prim_params[0], half_height = vis.prim_params[1];
+                        prim_mesh_id = world.meshes.InternPrimitive(
+                            PrimKey("vcylinder", r, half_height, 0),
+                            [&]() { return MakeCylinder(r, half_height); });
                         break;
                     }
                     default:

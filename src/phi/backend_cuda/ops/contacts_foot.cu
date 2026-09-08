@@ -105,8 +105,6 @@ Status OpNarrowphasePrimitives(const ModelView& model, const DataView& data,
         return Status::Failed;
     }
     if (p->family == kContactFamilyPairDriven) {
-        printf("[OpNarrowphasePrimitives] env_count=%u union_slot_count=%u rigid_slot_cap=%u\n",
-               p->env_count, p->union_slot_count, p->rigid_slot_cap);
         return LaunchPairDrivenNarrowphase(model, data, *p, stream);
     }
     // L1-b deleted the legacy FUSED foot-vs-ground detection; L1-c deleted the

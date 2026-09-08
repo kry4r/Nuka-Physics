@@ -141,6 +141,7 @@ NUKA_SRSI_HD inline float SrsiIntPow(float base, int n) {
 struct CompliantContactRow {
     float R = 0.0f;          // dual regularizer = 1/D (ADD to A denominator)
     float aref_bias = 0.0f;  // reference acceleration = -k*imp*pos_aref - b*vel
+    float damping = 0.0f;    // reference damping coefficient b (1/s)
 };
 
 // The RICHER output: every intermediate term so a test can cross-check each
@@ -240,6 +241,7 @@ NUKA_SRSI_HD inline CompliantContactRow ComputeCompliantRow(
     CompliantContactRow out;
     out.R = t.R;
     out.aref_bias = t.aref;
+    out.damping = t.b;
     return out;
 }
 

@@ -28,8 +28,14 @@
 
 #include "nuka/nuka.h"
 #include "nk/model/generated/field_ids.hpp"
+#include "nk/solve/nk_row.hpp"
 
 namespace nuka::c_abi {
+
+static_assert(NUKA_CONTACT_SIDE_RIGID == nk::kNkSideRigid);
+static_assert(NUKA_CONTACT_SIDE_LINK == nk::kNkSideArtic);
+static_assert(NUKA_CONTACT_SIDE_PARTICLE == nk::kNkSideParticle);
+static_assert(NUKA_CONTACT_SIDE_STATIC == nk::kNkSideStatic);
 
 // Wire dtype codes carried in nuka_buffer_view_t::dtype (the PUBLIC contract,
 // nuka.h: 0 == float32 for every field, 1 == uint32 for CONTACT_LINK only).
@@ -151,14 +157,18 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_ACTUATOR_SATURATED,     kStrideF32,   kWireDtypeF32, nk::FieldId::ActuatorSaturated},
     {NUKA_FIELD_TASK_ROTATION_TARGET,   static_cast<uint32_t>(4u * sizeof(float)), kWireDtypeF32, nk::FieldId::TaskRotationTarget},
     {NUKA_FIELD_TASK_LOCAL_POSE,        kStridePose,  kWireDtypeF32, nk::FieldId::TaskLocalPose},
+    {NUKA_FIELD_CONTACT_SIDE_A_KIND,   kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideAKind},
+    {NUKA_FIELD_CONTACT_SIDE_B_KIND,   kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideBKind},
+    {NUKA_FIELD_CONTACT_SIDE_A_INDEX,  kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideAIndex},
+    {NUKA_FIELD_CONTACT_SIDE_B_INDEX,  kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideBIndex},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // The table covers the append-only public field range through actuator telemetry.
-static_assert(kDlpackFieldCount == 33u,
-              "dlpack_table must hold exactly the 33 public state fields");
+static_assert(kDlpackFieldCount == 37u,
+              "dlpack_table must hold exactly the 37 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

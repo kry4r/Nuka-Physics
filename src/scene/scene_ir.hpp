@@ -60,6 +60,9 @@ struct CollisionShapeRecord {
     math::Vec3 half_extents                = {0.5f, 0.5f, 0.5f};
     float radius                           = 0.5f;
     float half_height                      = 0.5f;
+    // A capsule collision record can project to a flat-capped cylinder visual.
+    // This flag is not serialized.
+    bool flat_capped                       = false;
 
     // -- Convex decomposition (mesh shapes; v0.7 p06) -----------------------
     // Authored intent (nuka:decompose) + the upper piece bound (nuka:decompose:

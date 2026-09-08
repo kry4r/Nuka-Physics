@@ -254,12 +254,10 @@ def test_4096_smoke(device):
         (nuka.DRIVE_STIFFNESS, (64, GO2_BLC)),
         (nuka.DRIVE_DAMPING, (64, GO2_BLC)),
         (nuka.DRIVE_FORCE_LIMIT, (64, GO2_BLC)),
-        # p14a (v0.7) contact-force readout. LINK_CONTACT_WRENCH is per-GLOBAL-link
-        # [F(3),tau(3)] -> (env, base_link, 6). CONTACT_NORMAL / CONTACT_FORCE are
-        # per-slot (kMaxFootContactsPerEnv == 4) -> (env, 4, 3).
+        # Contact vectors share the cooked contact-slot span of CONTACT_POINTS.
         (nuka.LINK_CONTACT_WRENCH, (64, GO2_BLC, 6)),
-        (nuka.CONTACT_NORMAL, (64, 4, 3)),
-        (nuka.CONTACT_FORCE, (64, 4, 3)),
+        (nuka.CONTACT_NORMAL, None),
+        (nuka.CONTACT_FORCE, None),
     ],
 )
 def test_dlpack_zero_copy(device, field, expect_shape):
@@ -270,24 +268,31 @@ def test_dlpack_zero_copy(device, field, expect_shape):
         t = torch.from_dlpack(view)
         assert t.is_cuda
         assert t.dtype == torch.float32
-        assert tuple(t.shape) == expect_shape
+        if expect_shape is None:
+            geometry = torch.from_dlpack(w.buffer_view(nuka.CONTACT_POINTS))
+            assert t.ndim == 3 and t.shape[0] == 64 and t.shape[2] == 3
+            assert t.shape[1] > 0 and t.shape == geometry.shape
+        else:
+            assert tuple(t.shape) == expect_shape
         # THE zero-copy proof: torch aliases the engine device buffer.
         assert t.data_ptr() == w.buffer_device_ptr(field), "DLPack made a copy!"
 
 
-def test_dlpack_zero_copy_contact_link_uint32(device):
-    # p14a: CONTACT_LINK is the ONE non-float32 field (per-slot owning GLOBAL link
-    # index, uint32). torch>=2.6 imports a uint32 CUDA DLPack capsule zero-copy, so
-    # the only difference from the float fields is the dtype assertion.
+@pytest.mark.parametrize("field", [nuka.CONTACT_LINK, nuka.Field.CONTACT_SIDE_A_KIND,
+                                  nuka.Field.CONTACT_SIDE_B_KIND, nuka.Field.CONTACT_SIDE_A_INDEX,
+                                  nuka.Field.CONTACT_SIDE_B_INDEX])
+def test_dlpack_zero_copy_contact_owner_uint32(device, field):
+    # Integer contact owners use the same per-env slot span as contact geometry.
     with make_world(device, 64) as w:
-        view = w.buffer_view(nuka.CONTACT_LINK)
+        view = w.buffer_view(field)
         assert hasattr(view, "__dlpack__")
         assert hasattr(view, "__dlpack_device__")
         t = torch.from_dlpack(view)
         assert t.is_cuda
         assert t.dtype == torch.uint32
-        assert tuple(t.shape) == (64, 4)  # (env, kMaxFootContactsPerEnv)
-        assert t.data_ptr() == w.buffer_device_ptr(nuka.CONTACT_LINK), \
+        geometry = torch.from_dlpack(w.buffer_view(nuka.CONTACT_POINTS))
+        assert t.shape == geometry.shape[:2] and t.shape[0] == 64
+        assert t.data_ptr() == w.buffer_device_ptr(field), \
             "DLPack made a copy!"
 
 

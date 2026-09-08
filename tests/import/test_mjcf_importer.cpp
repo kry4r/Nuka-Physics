@@ -51,6 +51,25 @@ TEST(MjcfImporter, JointNameIsParsed) {
     EXPECT_EQ(scene.GetJoint(0).name, "joint0");
 }
 
+TEST(MjcfImporter, JointDynamicsRespectDefaultsAndExplicitOverrides) {
+    const auto scene = nuka::import::LoadMjcf("tests/data/mjcf_joint_dynamics.xml");
+    ASSERT_EQ(scene.JointCount(), 5u);
+    const float expected[][3] = {
+        {0.3f, 0.01f, 0.075f},
+        {10.0f, 0.2f, 0.4f},
+        {100.0f, 1.0f, 1.0f},
+        {0.0f, 0.0f, 0.0f},
+        {4.0f, 0.2f, 0.4f},
+    };
+    for (uint32_t i = 0; i < scene.JointCount(); ++i) {
+        const auto& joint = scene.GetJoint(i);
+        SCOPED_TRACE(joint.name);
+        EXPECT_FLOAT_EQ(joint.damping, expected[i][0]);
+        EXPECT_FLOAT_EQ(joint.armature, expected[i][1]);
+        EXPECT_FLOAT_EQ(joint.frictionloss, expected[i][2]);
+    }
+}
+
 TEST(MjcfImporter, ParsesSceneAuthoringRecords) {
     const auto scene = nuka::import::LoadMjcf("tests/data/complete_robot.xml");
 

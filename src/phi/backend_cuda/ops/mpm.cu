@@ -37,6 +37,7 @@
 #include "phi/backend_cuda/ops/articulation_types.cuh"  // chain-J helper + device state
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/sdf_types.cuh"     // SdfRotate / SdfInverseTransformPoint
 #include "phi/op_schema.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"       // SparseSdfDevice / sparse_sdf_sample
@@ -857,6 +858,7 @@ __global__ void MpmGridBodyProjectKernel(
     uint32_t total_nodes, uint32_t nodes_per_env, uint32_t dims_x, uint32_t dims_y,
     float dx, m::Vec3 origin, uint32_t bodies_per_env, float body_mu, float band,
     const m::Transform* __restrict__ body_pose,
+    const m::Transform* __restrict__ body_inertial_frame,
     const m::Vec3* __restrict__ body_lin_vel,
     const m::Vec3* __restrict__ body_ang_vel,
     const float* __restrict__ shape_table, const float* __restrict__ sdf_headers,
@@ -908,8 +910,8 @@ __global__ void MpmGridBodyProjectKernel(
     if (saw_one_way_body && env_status != nullptr)
         atomicOr(&env_status[env], kEnvStatusMpmOneWayBody);
     if (best_body == ~0u) return;
-    // Body surface velocity at the node: v_b + w_b x (xi - body_origin).
-    const m::Vec3 xb = body_pose[best_body].position;
+    // Free-body surface velocities and impulses share the same COM anchor.
+    const m::Vec3 xb = nkops::BodyCenterOfMass(body_pose[best_body], body_inertial_frame[best_body]);
     const m::Vec3 vb = (body_lin_vel != nullptr) ? body_lin_vel[best_body]
                                                   : m::Vec3::Zero();
     const m::Vec3 wb = (body_ang_vel != nullptr) ? body_ang_vel[best_body]
@@ -944,16 +946,16 @@ __global__ void MpmInitNodeIdsKernel(uint32_t total_nodes,
     if (i < total_nodes) node_ids[i] = i;
 }
 
-// Per-body deterministic gather of -dp / -(x-xb)xdp over the nodes it owns. A
-// free-rigid body applies the impulse inline; an articulation-link body (cooked
-// inv_mass==0) stores the linear+angular reaction for the per-articulation deposit.
+// Gather node reactions deterministically, applying free-body impulses and
+// storing link wrenches for the articulation deposit.
 __global__ void MpmGridBodyReactKernel(
     uint32_t total_bodies, uint32_t bodies_per_env, uint32_t total_nodes,
     uint32_t nodes_per_env,
     uint32_t dims_x, uint32_t dims_y, float dx, m::Vec3 origin,
     const m::Transform* __restrict__ body_pose,
+    const m::Transform* __restrict__ body_inertial_frame,
     const float* __restrict__ body_inv_mass,
-    const m::Vec3* __restrict__ body_inv_inertia,
+    const m::SymmetricMat3* __restrict__ body_world_inv_inertia,
     const uint32_t* __restrict__ body_to_link,
     const m::Vec3* __restrict__ body_dp,
     const uint32_t* __restrict__ sorted_body_owner,
@@ -968,7 +970,8 @@ __global__ void MpmGridBodyReactKernel(
     // row is cooked inv_mass==0 yet DOES react through its articulation, so it runs.
     if (im <= 0.0f && !is_link) return;
     const uint32_t env = b / bodies_per_env;
-    const m::Vec3 xb = body_pose[b].position;
+    const m::Vec3 xb = is_link ? body_pose[b].position
+        : nkops::BodyCenterOfMass(body_pose[b], body_inertial_frame[b]);
     const uint32_t base = env * nodes_per_env;
     m::Vec3 dp_sum = m::Vec3::Zero();   // sum of node momentum changes this body caused.
     m::Vec3 tq_sum = m::Vec3::Zero();   // sum of (x-xb) x dp.
@@ -1004,11 +1007,11 @@ __global__ void MpmGridBodyReactKernel(
         body_lin_vel[b].x += lin_impulse.x * im;
         body_lin_vel[b].y += lin_impulse.y * im;
         body_lin_vel[b].z += lin_impulse.z * im;
-        if (body_ang_vel != nullptr && body_inv_inertia != nullptr) {
-            const m::Vec3 ii = body_inv_inertia[b];
-            body_ang_vel[b].x += ang_impulse.x * ii.x;
-            body_ang_vel[b].y += ang_impulse.y * ii.y;
-            body_ang_vel[b].z += ang_impulse.z * ii.z;
+        if (body_ang_vel != nullptr && body_world_inv_inertia != nullptr) {
+            const m::Vec3 angular_response = body_world_inv_inertia[b].Multiply(ang_impulse);
+            body_ang_vel[b].x += angular_response.x;
+            body_ang_vel[b].y += angular_response.y;
+            body_ang_vel[b].z += angular_response.z;
         }
     }
     if (body_reaction != nullptr) {  // accumulate the linear impulse (balance probe).
@@ -1313,7 +1316,7 @@ void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
         LaunchCuda(MpmGridBodyProjectKernel, dim3(nblocks), dim3(kBlockSize), 0u,
                    stream, total_nodes, p.nodes_per_env, p.grid_dims[0],
                    p.grid_dims[1], p.dx, origin, p.bodies_per_env, p.body_mu,
-                   p.body_band, data.body_pose, data.body_linear_velocity,
+                   p.body_band, data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
                    data.body_angular_velocity, model.shape_table, model.sdf_headers,
                    model.sdf_cell_count, model.sdf_cell_keys, model.sdf_cell_values,
                    model.sdf_cell_gradients, data.grid_mass, data.grid_velocity,
@@ -1333,7 +1336,7 @@ void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                    stream, total_bodies, p.bodies_per_env, total_nodes,
                    p.nodes_per_env,
                    p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-                   data.body_pose, data.body_inv_mass, data.body_inv_inertia,
+                   data.body_pose, data.body_inertial_frame, data.body_inv_mass, data.body_world_inv_inertia,
                    model.body_to_link, data.grid_body_dp, sc.keys_out, sc.idx_out,
                    data.body_linear_velocity, data.body_angular_velocity,
                    data.mpm_body_reaction, data.mpm_body_ang_reaction);

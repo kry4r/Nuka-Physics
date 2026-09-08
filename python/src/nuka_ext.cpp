@@ -1800,7 +1800,17 @@ NB_MODULE(_nuka_ext, m) {
         .value("ACTUATOR_SATURATED", NUKA_FIELD_ACTUATOR_SATURATED)
         .value("TASK_ROTATION_TARGET", NUKA_FIELD_TASK_ROTATION_TARGET)
         .value("TASK_LOCAL_POSE", NUKA_FIELD_TASK_LOCAL_POSE)
+        .value("CONTACT_SIDE_A_KIND", NUKA_FIELD_CONTACT_SIDE_A_KIND)
+        .value("CONTACT_SIDE_B_KIND", NUKA_FIELD_CONTACT_SIDE_B_KIND)
+        .value("CONTACT_SIDE_A_INDEX", NUKA_FIELD_CONTACT_SIDE_A_INDEX)
+        .value("CONTACT_SIDE_B_INDEX", NUKA_FIELD_CONTACT_SIDE_B_INDEX)
         .export_values();
+
+    nb::enum_<nuka_contact_side_kind_t>(m, "ContactSideKind")
+        .value("RIGID", NUKA_CONTACT_SIDE_RIGID)
+        .value("LINK", NUKA_CONTACT_SIDE_LINK)
+        .value("PARTICLE", NUKA_CONTACT_SIDE_PARTICLE)
+        .value("STATIC", NUKA_CONTACT_SIDE_STATIC);
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
     // = (N,H,W,3) float32, DEPTH = (N,H,W,1) float32, PRIM = (N,H,W,1) uint32. RANGE

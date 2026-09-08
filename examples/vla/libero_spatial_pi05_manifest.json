@@ -38,6 +38,7 @@
     ],
     "nuka_sensor_resolution": [360, 360],
     "orientation_adapter": "vertical mirror on both Nuka sensor streams before the LeRobot LIBERO processor's H/W 180-degree flip",
+    "normalization": {"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}
   },
   "action_contract": {
     "shape": [7],
@@ -48,7 +49,15 @@
     "gripper_closed": 1.0,
     "policy_rate_hz": 20,
     "chunk_size": 50,
-    "executed_actions_per_query": 10,
+    "executed_actions_per_query": 8,
+    "physics_rate_hz": 500,
     "nuka_adapter": "native 6D operational-space torque control"
+  },
+  "runtime": {
+    "lerobot_revision": "0b067df57d21d3a02d6c511f1609172fa39ac29b",
+    "seed": 20260828,
+    "seconds": 12,
+    "render_quality": "high",
+    "video_fps": 20
   }
 }

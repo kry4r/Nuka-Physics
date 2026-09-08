@@ -239,6 +239,9 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
 
     const PinholeCamera camera = cameras[cam];
     const Ray ray = camera.GenerateRay(px, py);
+    // Headlight anchor: a body-attached light rides the RENDERING camera's live
+    // origin (resolved per pixel below), so it tracks the mount every frame.
+    const Vec3 cam_origin = camera.origin;
 
     // Env-offset TLAS node slice + env-offset instance slice (TLAS leaf .left is
     // env-local, so the env instance slice resolves it directly).
@@ -345,7 +348,7 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                   &sample_mat, true);
             Vec3 col = ShadeBeauty<PhiloxSeededRng>(env_nodes, leaves_per_env, env_inst,
                                                     env_mats, light, sky, shit, snf, sV,
-                                                    sample_mat, &rng);
+                                                    sample_mat, &rng, textures, &cam_origin);
             if (sky.fog_density > 0.0f) {
                 const float f = 1.0f - expf(-sky.fog_density * bt);
                 col.x += (sky.fog_color.x - col.x) * f;
@@ -676,7 +679,9 @@ void BuildFidelityParams(const rt::SensorFidelityConfig& cfg, FidelityParams* fp
     fp->tonemap = cfg.tonemap_enabled ? 1u : 0u;
     fp->srgb = cfg.srgb_enabled ? 1u : 0u;
     fp->seed = cfg.seed;
-    sky->shadow_rays = cfg.shadow_samples < 1u ? 1u : cfg.shadow_samples;
+    // 0 = shadow rays OFF (the shader skips the visibility cone; MuJoCo's
+    // castshadow="false"), 1+ = hard/soft shadow rays.
+    sky->shadow_rays = cfg.shadow_samples;
     sky->sun_angular_radius = cfg.sun_angular_radius;
     // AO off -> the shared shade's indirect term must vanish: zero sky ambient +
     // no GI bounce, with a single (zero-contribution) AO ray (the primary-ray miss

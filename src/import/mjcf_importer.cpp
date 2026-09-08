@@ -582,6 +582,11 @@ scene::JointId ResolveJoint(const char* name, const MjcfParseContext& context) {
     return it == context.joint_ids.end() ? scene::kInvalidJoint : it->second;
 }
 
+// Defined below ParseBody; ParseBody nests body-attached <light> elements.
+void ParseLightElement(tinyxml2::XMLElement* light,
+                       scene::BodyId attached_body,
+                       scene::SceneIR& scene);
+
 void ParseBody(tinyxml2::XMLElement* body_elem,
                scene::BodyId parent_id,
                scene::SceneIR& scene,
@@ -709,6 +714,11 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
                 shape.radius = sz.x;
                 if (sz.y > 0.0f) {
                     shape.half_height = sz.y;
+                }
+                // Preserve flat cylinder caps in visual geometry.
+                if (geom->Attribute("type") != nullptr &&
+                    std::string(geom->Attribute("type")) == "cylinder") {
+                    shape.flat_capped = true;
                 }
             }
         }
@@ -839,8 +849,9 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         // intentionally not imported, so this keeps initial FK/colliders aligned
         // before the first physics step without changing MuJoCo joint semantics.
         joint->QueryFloatAttribute("nuka:initial_position", &jrec.initial_position);
-        // A joint's own frictionloss attr overrides the resolved class default
-        // (QueryFloatAttribute writes only on success -> absent leaves the default).
+        // Explicit dynamics override class defaults; omitted attributes retain them.
+        joint->QueryFloatAttribute("damping", &jrec.damping);
+        joint->QueryFloatAttribute("armature", &jrec.armature);
         joint->QueryFloatAttribute("frictionloss", &jrec.frictionloss);
         if (joint->Attribute("type")) {
             jrec.type = MjcfJointType(joint->Attribute("type"));
@@ -901,6 +912,14 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         context.site_ids[site_name] = s;
     }
 
+    // Body-nested lights attach to this body: their local transform composes with
+    // the body's live pose every frame (the general attachment path).
+    for (auto* light = body_elem->FirstChildElement("light");
+         light != nullptr;
+         light = light->NextSiblingElement("light")) {
+        ParseLightElement(light, body_id, scene);
+    }
+
     for (auto* child = body_elem->FirstChildElement("body");
          child != nullptr;
          child = child->NextSiblingElement("body")) {
@@ -908,27 +927,86 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     }
 }
 
+void ParseLightElement(tinyxml2::XMLElement* light,
+                       scene::BodyId attached_body,
+                       scene::SceneIR& scene) {
+    scene::LightRecord record;
+    record.name = light->Attribute("name") ? light->Attribute("name") : "light";
+    record.attached_body = attached_body;
+    bool directional = false;
+    light->QueryBoolAttribute("directional", &directional);
+    record.type = directional ? scene::LightType::Directional : scene::LightType::Point;
+    if (const char* pos = light->Attribute("pos")) {
+        record.local_transform.position = ParseVec3(pos);
+    }
+    if (const char* quat = light->Attribute("quat")) {
+        record.local_transform.rotation = ParseQuat(quat);
+    }
+    if (const char* dir = light->Attribute("dir")) {
+        // MuJoCo aims a light with `dir` (target direction of travel); convert to
+        // the equivalent local rotation so downstream consumers share one frame.
+        const math::Vec3 d = ParseVec3(dir);
+        const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        if (len > 1.0e-6f) {
+            const math::Vec3 n{d.x / len, d.y / len, d.z / len};
+            // MuJoCo light frame: -Z aims along `dir`, +Y up (camera convention).
+            math::Vec3 up_ref{0.0f, 0.0f, 1.0f};
+            if (std::fabs(n.x * up_ref.x + n.y * up_ref.y + n.z * up_ref.z) > 0.99f) {
+                up_ref = math::Vec3{0.0f, 1.0f, 0.0f};
+            }
+            math::Vec3 right{n.y * up_ref.z - n.z * up_ref.y,
+                             n.z * up_ref.x - n.x * up_ref.z,
+                             n.x * up_ref.y - n.y * up_ref.x};
+            const float rlen = std::sqrt(right.x * right.x + right.y * right.y +
+                                         right.z * right.z);
+            if (rlen > 1.0e-6f) {
+                right = math::Vec3{right.x / rlen, right.y / rlen, right.z / rlen};
+                const math::Vec3 up{right.y * n.z - right.z * n.y,
+                                    right.z * n.x - right.x * n.z,
+                                    right.x * n.y - right.y * n.x};
+                // Trace-based rotation-matrix -> quaternion extraction with
+                // columns X->right, Y->up, Z->-dir (the -Z aims convention).
+                const float m11 = right.x, m22 = up.y, m33 = n.z;
+                const float tr = m11 + m22 + m33;
+                math::Quat q;
+                if (tr > 0.0f) {
+                    const float s = std::sqrt(tr + 1.0f) * 2.0f;
+                    q = math::Quat{0.25f * s,
+                                   (up.z - n.y) / s,
+                                   (n.x - right.z) / s,
+                                   (right.y - up.x) / s};
+                } else if (m11 > m22 && m11 > m33) {
+                    const float s = std::sqrt(1.0f + m11 - m22 - m33) * 2.0f;
+                    q = math::Quat{(up.z - n.y) / s, 0.25f * s,
+                                   (up.x + right.y) / s,
+                                   (n.x + right.z) / s};
+                } else if (m22 > m33) {
+                    const float s = std::sqrt(1.0f + m22 - m11 - m33) * 2.0f;
+                    q = math::Quat{(n.x - right.z) / s, (up.x + right.y) / s,
+                                   0.25f * s,
+                                   (right.y + up.z) / s};
+                } else {
+                    const float s = std::sqrt(1.0f + m33 - m11 - m22) * 2.0f;
+                    q = math::Quat{(right.y - up.x) / s, (n.x + right.z) / s,
+                                   (right.y + up.z) / s, 0.25f * s};
+                }
+                record.local_transform.rotation = q.Normalized();
+            }
+        }
+        // A positional light's dir attribute aims it without changing its type.
+    }
+    if (const char* diffuse = light->Attribute("diffuse")) {
+        record.color = ParseVec3(diffuse);
+    }
+    light->QueryFloatAttribute("intensity", &record.intensity);
+    scene.AddLight(std::move(record));
+}
+
 void ParseLights(tinyxml2::XMLElement* worldbody, scene::SceneIR& scene) {
     for (auto* light = worldbody->FirstChildElement("light");
          light != nullptr;
          light = light->NextSiblingElement("light")) {
-
-        scene::LightRecord record;
-        record.name = light->Attribute("name") ? light->Attribute("name") : "light";
-        bool directional = false;
-        light->QueryBoolAttribute("directional", &directional);
-        record.type = directional ? scene::LightType::Directional : scene::LightType::Point;
-        if (const char* pos = light->Attribute("pos")) {
-            record.local_transform.position = ParseVec3(pos);
-        }
-        if (const char* quat = light->Attribute("quat")) {
-            record.local_transform.rotation = ParseQuat(quat);
-        }
-        if (const char* diffuse = light->Attribute("diffuse")) {
-            record.color = ParseVec3(diffuse);
-        }
-        light->QueryFloatAttribute("intensity", &record.intensity);
-        scene.AddLight(std::move(record));
+        ParseLightElement(light, scene::kInvalidBody, scene);
     }
 }
 

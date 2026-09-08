@@ -44,6 +44,13 @@ constexpr uint32_t kLinkWrenchComponents   = 6u;
 static_assert(kLinkWrenchComponents == sizeof(::nuka::math::Vec3) * 2u / sizeof(float),
               "link wrench == force(Vec3) + torque(Vec3)");
 
+// PairDriven per-slot row layout (nk_row.hpp): rigid slots carry 4 manifold
+// points x 3 spokes, the body-particle tail 1 point x 3 spokes.
+constexpr uint32_t kPdPtsPerSlot = nuka::nk::kPairDrivenPtsPerSlot;
+constexpr uint32_t kPdRowsPerSlot = nuka::nk::kPairDrivenRowsPerSlot;
+constexpr uint32_t kPdParticlePtsPerSlot = nuka::nk::kPairDrivenParticlePtsPerSlot;
+constexpr uint32_t kPdParticleRowsPerSlot = nuka::nk::kPairDrivenParticleRowsPerSlot;
+
 // M10 deterministic IC-jitter helpers (Philox4x32-10, host+device pure fns).
 using nuka::sensor::noise::MakeCounter;
 using nuka::sensor::noise::Philox4x32_10;
@@ -80,37 +87,98 @@ __global__ void LegacyContactGeometryKernel(
     if (n > 0u) {
         out_contact_point[slot] = ucontact_point[slot * 4u];
         out_contact_normal[slot] = ucontact_normal[slot * 4u];
-        if (slot < 10) {
-            printf("LegacyContactGeometryKernel slot %u: n=%u pt=(%.4f,%.4f,%.4f)\n",
-                   slot, n, ucontact_point[slot*4u].x,
-                   ucontact_point[slot*4u].y, ucontact_point[slot*4u].z);
-        }
     } else {
         out_contact_point[slot] = {0.0f, 0.0f, 0.0f};
         out_contact_normal[slot] = {0.0f, 0.0f, 0.0f};
     }
 }
 
-// Per-slot contact force = sum of normal impulses / dt. PairDriven assembles 12
-// rows per slot (4 manifold points × 3 spokes each); normal rows are at offsets
-// 0,3,6,9 within the slot's row block. Sum them to get total normal impulse.
+// Sum normal and tangent impulses using each slot's row layout and divide by dt.
+// Environment padding is excluded from the per-slot force readout.
 __global__ void ContactForceKernel(const float* __restrict__ lambda,
                                     uint32_t slot_count,
+                                    uint32_t slots_per_env,
+                                    uint32_t rows_per_env,
+                                    uint32_t full_row_slot_count,
                                     float inv_dt,
-                                    float* __restrict__ out_contact_force) {
+                                    float* __restrict__ out_contact_force,
+                                    const NkRow* __restrict__ urows,
+                                    const uint32_t* __restrict__ row_cj_link,
+                                    const uint32_t* __restrict__ row_cj_link_b,
+                                    uint32_t* __restrict__ out_a_kind,
+                                    uint32_t* __restrict__ out_b_kind,
+                                    uint32_t* __restrict__ out_a_index,
+                                    uint32_t* __restrict__ out_b_index) {
     const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= slot_count) {
         return;
     }
-    const uint32_t row_base = slot * 12u;  // 12 rows per slot
-    float fn = 0.0f;
-    for (uint32_t i = 0u; i < 4u; ++i) {
-        fn += lambda[row_base + i * 3u];  // normal rows: 0,3,6,9
+    const uint32_t env = slot / slots_per_env;
+    const uint32_t local = slot - env * slots_per_env;
+    const bool rigid_slot = local < full_row_slot_count;
+    const uint32_t row_base =
+        env * rows_per_env +
+        (rigid_slot ? local * kPdRowsPerSlot
+                    : full_row_slot_count * kPdRowsPerSlot +
+                          (local - full_row_slot_count) *
+                              kPdParticleRowsPerSlot);
+    const uint32_t pts = rigid_slot ? kPdPtsPerSlot
+                                    : kPdParticlePtsPerSlot;
+    const uint32_t t1 = rigid_slot ? kPdPtsPerSlot
+                                   : kPdParticlePtsPerSlot;
+    float fn = 0.0f, ft1 = 0.0f, ft2 = 0.0f;
+    for (uint32_t i = 0u; i < pts; ++i) {
+        fn += lambda[row_base + i];
+        ft1 += lambda[row_base + t1 + i];
+        ft2 += lambda[row_base + 2u * t1 + i];
     }
     const uint32_t base = slot * kContactForceComponents;
     out_contact_force[base + 0u] = fn * inv_dt;
-    out_contact_force[base + 1u] = 0.0f;  // no single tangent for 4-pt manifold
-    out_contact_force[base + 2u] = 0.0f;
+    out_contact_force[base + 1u] = ft1 * inv_dt;
+    out_contact_force[base + 2u] = ft2 * inv_dt;
+    const NkRow& row = urows[row_base];
+    const bool active = (row.flags & nk::nk_row_flags::kActive) != 0u;
+    out_a_kind[slot] = active ? row.a.kind : nk::kNkSideStatic;
+    out_b_kind[slot] = active ? row.b.kind : nk::kNkSideStatic;
+    out_a_index[slot] = !active || row.a.kind == nk::kNkSideStatic ? ~0u
+        : row.a.kind == nk::kNkSideArtic ? row_cj_link[row_base] : row.a.index;
+    out_b_index[slot] = !active || row.b.kind == nk::kNkSideStatic ? ~0u
+        : row.b.kind == nk::kNkSideArtic ? row_cj_link_b[row_base] : row.b.index;
+}
+
+// Report the first articulation side's global link, preferring side A.
+// Rigid/static or inactive slots report kInvalidLink.
+__global__ void ContactLinkKernel(const uint32_t* __restrict__ row_cj_link,
+                                   const uint32_t* __restrict__ row_cj_link_b,
+                                   uint32_t slot_count,
+                                   uint32_t slots_per_env,
+                                   uint32_t rows_per_env,
+                                   uint32_t full_row_slot_count,
+                                   uint32_t* __restrict__ out_contact_link) {
+    constexpr uint32_t kInvalidLink = ~0u;
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= slot_count) {
+        return;
+    }
+    const uint32_t env = slot / slots_per_env;
+    const uint32_t local = slot - env * slots_per_env;
+    const bool rigid_slot = local < full_row_slot_count;
+    const uint32_t row_base =
+        env * rows_per_env +
+        (rigid_slot ? local * kPdRowsPerSlot
+                    : full_row_slot_count * kPdRowsPerSlot +
+                          (local - full_row_slot_count) *
+                              kPdParticleRowsPerSlot);
+    const uint32_t pts = rigid_slot ? kPdPtsPerSlot
+                                    : kPdParticlePtsPerSlot;
+    uint32_t link = kInvalidLink;
+    for (uint32_t i = 0u; i < pts && link == kInvalidLink; ++i) {
+        link = row_cj_link[row_base + i];
+    }
+    for (uint32_t i = 0u; i < pts && link == kInvalidLink; ++i) {
+        link = row_cj_link_b[row_base + i];
+    }
+    out_contact_link[slot] = link;
 }
 
 // Net per-link contact wrench (world frame) over the ONE general (PairDriven)
@@ -394,7 +462,7 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
     }
     const uint32_t slot_count = p->env_count * p->max_contacts_per_env;
     const uint32_t total_link_count = p->env_count * p->base_link_count;
-    if (slot_count == 0u || total_link_count == 0u) {
+    if (slot_count == 0u) {
         return Status::Ok;
     }
     // force = impulse / dt; a non-positive dt yields a defined zero readout.
@@ -411,21 +479,32 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
                slot_count, data.contact_point, data.contact_normal);
 
     LaunchCuda(ContactForceKernel, dim3(force_grid), dim3(kBlock), 0u, stream,
-               static_cast<const float*>(data.lambda), slot_count, inv_dt,
-               data.contact_force);
-    const uint32_t wrench_grid = (total_link_count + kBlock - 1u) / kBlock;
-    LaunchCuda(LinkContactWrenchKernel, dim3(wrench_grid), dim3(kBlock), 0u, stream,
-               static_cast<const float*>(data.lambda),
-               reinterpret_cast<const NkRow*>(data.urows),
+               static_cast<const float*>(data.lambda), slot_count,
+               p->max_contacts_per_env, p->rows_per_env, p->full_row_slot_count,
+               inv_dt, data.contact_force, reinterpret_cast<const NkRow*>(data.urows),
+               data.row_cj_link, data.row_cj_link_b,
+               data.contact_side_a_kind, data.contact_side_b_kind,
+               data.contact_side_a_index, data.contact_side_b_index);
+    LaunchCuda(ContactLinkKernel, dim3(force_grid), dim3(kBlock), 0u, stream,
                static_cast<const uint32_t*>(data.row_cj_link),
-               static_cast<const Vec3*>(data.row_cj_point),
-               static_cast<const Vec3*>(data.row_cj_dir),
-               static_cast<const uint32_t*>(data.row_cj_link_b),
-               static_cast<const Vec3*>(data.row_cj_point_b),
-               static_cast<const Vec3*>(data.row_cj_dir_b),
-               static_cast<const Transform*>(data.link_pose),
-               total_link_count, p->base_link_count, p->rows_per_env,
-               inv_dt, reinterpret_cast<float*>(data.link_contact_wrench));
+               static_cast<const uint32_t*>(data.row_cj_link_b), slot_count,
+               p->max_contacts_per_env, p->rows_per_env, p->full_row_slot_count,
+               data.contact_link);
+    if (total_link_count != 0u) {
+        const uint32_t wrench_grid = (total_link_count + kBlock - 1u) / kBlock;
+        LaunchCuda(LinkContactWrenchKernel, dim3(wrench_grid), dim3(kBlock), 0u, stream,
+                   static_cast<const float*>(data.lambda),
+                   reinterpret_cast<const NkRow*>(data.urows),
+                   static_cast<const uint32_t*>(data.row_cj_link),
+                   static_cast<const Vec3*>(data.row_cj_point),
+                   static_cast<const Vec3*>(data.row_cj_dir),
+                   static_cast<const uint32_t*>(data.row_cj_link_b),
+                   static_cast<const Vec3*>(data.row_cj_point_b),
+                   static_cast<const Vec3*>(data.row_cj_dir_b),
+                   static_cast<const Transform*>(data.link_pose),
+                   total_link_count, p->base_link_count, p->rows_per_env,
+                   inv_dt, reinterpret_cast<float*>(data.link_contact_wrench));
+    }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

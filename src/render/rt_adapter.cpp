@@ -152,15 +152,15 @@ rt::TwoLevelScene RenderWorldToTwoLevelScene(const RenderWorld& world) {
         scene.instances.push_back(out);
     }
 
-    // Light: the bounded sensor renderer takes ONE analytic light. Use the first
-    // RenderLight (if any) as a point light at its world position; else leave the
-    // rt::Light default (directional). Extra lights are ignored (documented).
+    // The sensor renderer uses the first analytic light.
+    // Body-attached lights follow the camera; world lights retain their position.
     if (!world.lights.empty()) {
         const RenderLight& l = world.lights.front();
         scene.light.directional = false;
         scene.light.position = l.world_xform.position;
         scene.light.color = l.color;
         scene.light.intensity = l.intensity;
+        scene.light.body_attached = (l.pose_source.kind != PoseSource::Kind::Static);
     }
 
     return scene;

@@ -138,6 +138,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // chain_jacobian
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // row_minv_jt
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_meff
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_damping
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir
@@ -303,6 +304,16 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 3, 12, 0},  // task_target
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 4, 16, 0},  // task_rotation_target
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 7, 28, 0},  // task_local_pose
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 7, 28, 0},  // body_inertial_frame
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 6, 24, 0},  // body_world_inv_inertia
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // step_qdot_flat
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // step_body_linear_velocity
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // step_body_angular_velocity
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // step_particle_velocity
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_side_a_kind
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_side_b_kind
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_side_a_index
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_side_b_index
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
@@ -103,9 +104,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         return 0u;
     }
     if (lay.per == FieldPer::Scalar) {
-        // The one symbolic per:scalar field in M3a is mat_buckets (num_buckets*8),
-        // a GLOBAL table (not env-replicated). Any other scalar field defaults to
-        // a single env-major row. Keyed by FieldId so the resolution is explicit.
+        // Symbolic scalar counts require an explicit field-specific extent.
+        // Unresolved fields are rejected instead of allocating a smaller buffer.
         if (id == FieldId::MatBuckets) {
             return static_cast<uint64_t>(num_material_buckets) *
                    ModelMaterialBucket::kValueCount;
@@ -157,6 +157,9 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // single grid op, sized by World construct; 0 for a particle-free world.
         if (id == FieldId::GridSortScratch) {
             return grid_sort_scratch_bytes;
+        }
+        if (id == FieldId::PairSortScratch) {
+            return pair_sort_scratch_bytes;
         }
         // Dynamic-island component count (BuildSolveIslands): the solve grid
         // watermark — one global u32.
@@ -226,7 +229,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             const uint64_t nodes_per_env = (n >= 2u) ? (2ull * n - 1ull) : 0ull;
             return nodes_per_env * 9ull * static_cast<uint64_t>(env_count);
         }
-        return static_cast<uint64_t>(env_count);
+        throw std::logic_error("ModelCapacities::ElementCount: unresolved scalar field");
     }
     const uint64_t per_env = PerEnvCount(lay.per);
     return per_env * static_cast<uint64_t>(env_count);

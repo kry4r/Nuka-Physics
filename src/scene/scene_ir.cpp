@@ -980,16 +980,25 @@ void SceneIR::ProjectShape(const CollisionShapeRecord& rec) {
         vis.render_material_id = render_id;
         if (!rec.visual_mesh_ref.empty()) {
             vis.mesh = ParseAssetRef(rec.visual_mesh_ref);
+        } else if (!rec.mesh_vertices.empty() && !rec.mesh_indices.empty()) {
+            // In-memory import path: no .nka AssetRef exists yet, so carry the
+            // resolved triangles INLINE (the .nks route sets visual_mesh_ref).
+            vis.inline_positions = rec.mesh_vertices;
+            vis.inline_normals   = rec.mesh_normals;
+            vis.inline_uvs       = rec.mesh_uvs;
+            vis.inline_indices   = rec.mesh_indices;
         } else {
-            // No MESH asset: record the PRIMITIVE so render_world can tessellate it
-            // (the kitchen counters/walls/floor are box/cylinder VISUAL geoms with
-            // no mesh). cylinder is imported as Capsule; hull/trimesh have no inline
-            // params and stay None (their triangles come from a later .nka pass).
+            // Preserve the visual primitive for render-time tessellation.
+            // A flat-capped capsule record projects to a cylinder.
             switch (rec.type) {
                 case ShapeType::Box:     vis.prim_kind = VisualMeshComponent::PrimKind::Box;     break;
                 case ShapeType::Plane:   vis.prim_kind = VisualMeshComponent::PrimKind::Plane;   break;
                 case ShapeType::Sphere:  vis.prim_kind = VisualMeshComponent::PrimKind::Sphere;  break;
-                case ShapeType::Capsule: vis.prim_kind = VisualMeshComponent::PrimKind::Capsule; break;
+                case ShapeType::Capsule:
+                    vis.prim_kind = rec.flat_capped
+                        ? VisualMeshComponent::PrimKind::Cylinder
+                        : VisualMeshComponent::PrimKind::Capsule;
+                    break;
                 default:                 vis.prim_kind = VisualMeshComponent::PrimKind::None;    break;
             }
             if (vis.prim_kind != VisualMeshComponent::PrimKind::None) {

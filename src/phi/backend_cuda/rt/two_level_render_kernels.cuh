@@ -985,10 +985,29 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
                 fr * refl.z + (1.0f - fr) * transmitted.z};
 }
 
-// Per-pixel hit at world point `hit` with viewer-faced normal `Nf`: K-ray soft sun
-// shadow + cosine AO/GI bounces. Returns the lit RGB. Visibility rays use the
-// any-hit traversal; the AO/GI bounce uses a closest-hit pruned to ao_radius.
-// __device__-only: it rides the device-only TLAS/BLAS traversal nest.
+// Resolve the direction and distance to a world light or a camera-mounted headlight.
+__device__ __forceinline__ void ResolveLightVector(const Light& light,
+                                                   const Vec3& hit,
+                                                   const Vec3& cam_pos,
+                                                   Vec3* out_to_light,
+                                                   float* out_dist) {
+    Vec3 to;
+    float dist;
+    if (light.body_attached && !light.directional) {
+        to = Vec3{cam_pos.x - hit.x, cam_pos.y - hit.y, cam_pos.z - hit.z};
+        dist = sqrtf(to.x * to.x + to.y * to.y + to.z * to.z);
+    } else if (light.directional) {
+        to = Vec3{-light.direction.x, -light.direction.y, -light.direction.z};
+        dist = RtMissDepth();
+    } else {
+        to = Vec3{light.position.x - hit.x, light.position.y - hit.y,
+                  light.position.z - hit.z};
+        dist = sqrtf(to.x * to.x + to.y * to.y + to.z * to.z);
+    }
+    *out_to_light = RtNormalize<float>(to);
+    *out_dist = dist;
+}
+
 template <typename Rng>
 __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_nodes,
                                   uint32_t tlas_leaf_count,
@@ -997,14 +1016,21 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
                                   Light light, BeautyParams sky, const Vec3& hit,
                                   const Vec3& Nf, const Vec3& V, const Material& mat,
                                   Rng* rng,
-                                  const DevTexture* __restrict__ textures = nullptr) {
+                                  const DevTexture* __restrict__ textures = nullptr,
+                                  const Vec3* cam_pos = nullptr) {
     // Sun direction (toward the light) + a finite angular size -> penumbra.
     Vec3 Ls;
-    if (light.directional) {
+    float light_dist;
+    if (light.body_attached && cam_pos != nullptr) {
+        ResolveLightVector(light, hit, *cam_pos, &Ls, &light_dist);
+    } else if (light.directional) {
         Ls = RtNormalize<float>(Vec3{-light.direction.x, -light.direction.y, -light.direction.z});
+        light_dist = RtMissDepth();
     } else {
-        Ls = RtNormalize<float>(Vec3{light.position.x - hit.x, light.position.y - hit.y,
-                                     light.position.z - hit.z});
+        const Vec3 to{light.position.x - hit.x, light.position.y - hit.y,
+                      light.position.z - hit.z};
+        Ls = RtNormalize<float>(to);
+        light_dist = sqrtf(to.x * to.x + to.y * to.y + to.z * to.z);
     }
     const Vec3 light_col{light.color.x * light.intensity,
                          light.color.y * light.intensity,
@@ -1012,10 +1038,9 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
     const float eps = 1.0e-3f;
     const Vec3 sorigin{hit.x + Nf.x * eps, hit.y + Nf.y * eps, hit.z + Nf.z * eps};
 
-    // Soft shadow: average visibility over K cone-sampled sun directions (any-hit
-    // visibility -- boolean occlusion, first hit wins).
+    // Average visibility over cone-sampled rays; zero shadow rays gives full visibility.
+    const uint32_t K = sky.shadow_rays;
     float vis = 0.0f;
-    const uint32_t K = sky.shadow_rays < 1u ? 1u : sky.shadow_rays;
     for (uint32_t k = 0; k < K; ++k) {
         const Vec3 Lk = SampleCone(Ls, sky.sun_angular_radius, rng->NextF(), rng->NextF());
         if (Lk.x * Nf.x + Lk.y * Nf.y + Lk.z * Nf.z <= 0.0f) continue;
@@ -1024,7 +1049,7 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
             vis += 1.0f;
         }
     }
-    vis /= static_cast<float>(K);
+    vis = (K == 0u) ? 1.0f : vis / static_cast<float>(K);
 
     const float NoL = fmaxf(0.0f, Nf.x * Ls.x + Nf.y * Ls.y + Nf.z * Ls.z);
     // Half vector for a GGX-ish specular highlight so the shell catches the sun.

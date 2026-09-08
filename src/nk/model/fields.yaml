@@ -55,7 +55,7 @@
 # ===========================================================================
 
 schema:
-  dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36]
+  dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36, symmat3]
   per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2, articulation_dof, aero_tri]
   arena: [persistent, scratch, tape]
   owner: [model, data]
@@ -261,7 +261,9 @@ fields:
   # ArticulationApplyImpulse inner loop (bit-equal: same inner products, same
   # order, computed once instead of per iteration). row_meff: per-row effective
   # mass 1/(invA+invB+R) (assembly-time hoisting of ComputeCompliantEffective-
-  # Mass, constant across iterations). row_cj_*: the chain-Jacobian kernel
+  # Mass, constant across iterations). row_damping: the contact normal's
+  # reference damping coefficient b from aref = -k*imp*pos - b*vel; zero for
+  # tangential, limit, inactive, and legacy rows. row_cj_*: the chain-Jacobian kernel
   # inputs gathered per row slot (contact link / world point / row direction).
   # qdot_flat: the per-env flat prefix-sum joint-velocity vector (packed from
   # link_velocity[root] + qdot before the solve, scattered back after).
@@ -272,6 +274,7 @@ fields:
   - {name: chain_jacobian,  dtype: f32,  per: row_dof,  arena: scratch,    owner: data}
   - {name: row_minv_jt,     dtype: f32,  per: row_dof,  arena: scratch,    owner: data}
   - {name: row_meff,        dtype: f32,  per: row_slot, arena: scratch,    owner: data}
+  - {name: row_damping,     dtype: f32,  per: row_slot, arena: scratch,    owner: data}
   - {name: row_cj_link,     dtype: u32,  per: row_slot, arena: scratch,    owner: data}
   - {name: row_cj_point,    dtype: vec3, per: row_slot, arena: scratch,    owner: data}
   - {name: row_cj_dir,      dtype: vec3, per: row_slot, arena: scratch,    owner: data}
@@ -826,13 +829,7 @@ fields:
   - {name: island_count,       dtype: u32, per: scalar, count: "1",                     arena: scratch, owner: data}
   - {name: island_cub_temp,    dtype: u8,  per: scalar, count: "island_cub_temp_bytes", arena: scratch, owner: data}
 
-  # =========================================================================
-  # Joint dry friction (MuJoCo frictionloss). Per-link constant torque bound that
-  # opposes joint velocity, applied by the articulation velocity solve as a
-  # saturating, velocity-projecting term (implicit-friendly: never reverses qdot).
-  # 0 for every joint that does not author frictionloss -> byte-inert. APPENDED
-  # LAST so every pre-existing arena offset is byte-stable.
-  # =========================================================================
+  # Joint dry friction is a per-link bound on the shared solver impulse divided by dt.
   - {name: joint_frictionloss, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
 
   # =========================================================================
@@ -900,3 +897,20 @@ fields:
   - {name: task_target,          dtype: vec3,      per: env, arena: persistent, owner: data, flags: [param]}
   - {name: task_rotation_target, dtype: quat,      per: env, arena: persistent, owner: data, flags: [param]}
   - {name: task_local_pose,      dtype: transform, per: env, arena: persistent, owner: data, flags: [param]}
+
+  # Body pose is the authored frame; linear and angular velocity are world COM quantities.
+  # Principal inverse inertia is rotated into a symmetric world tensor before each solve.
+  - {name: body_inertial_frame, dtype: transform, per: body, arena: persistent, owner: data, flags: [param]}
+  - {name: body_world_inv_inertia, dtype: symmat3, per: body, arena: scratch, owner: data}
+
+  # Velocities before forces provide the normal contact acceleration reference.
+  - {name: step_qdot_flat, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
+  - {name: step_body_linear_velocity, dtype: vec3, per: body, arena: scratch, owner: data}
+  - {name: step_body_angular_velocity, dtype: vec3, per: body, arena: scratch, owner: data}
+  - {name: step_particle_velocity, dtype: vec3, per: particle, arena: scratch, owner: data}
+
+  # Contact reaction owners: world body, world link, or world particle index by kind.
+  - {name: contact_side_a_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data, flags: [readout]}
+  - {name: contact_side_b_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data, flags: [readout]}
+  - {name: contact_side_a_index, dtype: u32, per: contact_slot, arena: scratch, owner: data, flags: [readout]}
+  - {name: contact_side_b_index, dtype: u32, per: contact_slot, arena: scratch, owner: data, flags: [readout]}

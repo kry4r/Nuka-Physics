@@ -99,6 +99,7 @@ enum class FieldId : uint16_t {
     ChainJacobian,  // chain_jacobian (per:row_dof arena:scratch owner:data)
     RowMinvJt,  // row_minv_jt (per:row_dof arena:scratch owner:data)
     RowMeff,  // row_meff (per:row_slot arena:scratch owner:data)
+    RowDamping,  // row_damping (per:row_slot arena:scratch owner:data)
     RowCjLink,  // row_cj_link (per:row_slot arena:scratch owner:data)
     RowCjPoint,  // row_cj_point (per:row_slot arena:scratch owner:data)
     RowCjDir,  // row_cj_dir (per:row_slot arena:scratch owner:data)
@@ -264,6 +265,16 @@ enum class FieldId : uint16_t {
     TaskTarget,  // task_target (per:env arena:persistent owner:data flags:[param])
     TaskRotationTarget,  // task_rotation_target (per:env arena:persistent owner:data flags:[param])
     TaskLocalPose,  // task_local_pose (per:env arena:persistent owner:data flags:[param])
+    BodyInertialFrame,  // body_inertial_frame (per:body arena:persistent owner:data flags:[param])
+    BodyWorldInvInertia,  // body_world_inv_inertia (per:body arena:scratch owner:data)
+    StepQdotFlat,  // step_qdot_flat (per:articulation_dof arena:scratch owner:data)
+    StepBodyLinearVelocity,  // step_body_linear_velocity (per:body arena:scratch owner:data)
+    StepBodyAngularVelocity,  // step_body_angular_velocity (per:body arena:scratch owner:data)
+    StepParticleVelocity,  // step_particle_velocity (per:particle arena:scratch owner:data)
+    ContactSideAKind,  // contact_side_a_kind (per:contact_slot arena:scratch owner:data flags:[readout])
+    ContactSideBKind,  // contact_side_b_kind (per:contact_slot arena:scratch owner:data flags:[readout])
+    ContactSideAIndex,  // contact_side_a_index (per:contact_slot arena:scratch owner:data flags:[readout])
+    ContactSideBIndex,  // contact_side_b_index (per:contact_slot arena:scratch owner:data flags:[readout])
     Count
 };
 

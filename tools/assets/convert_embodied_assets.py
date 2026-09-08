@@ -142,8 +142,9 @@ def _body(name: str, pos: str = "0 0 0") -> ET.Element:
     return ET.Element("body", {"name": name, "pos": pos})
 
 
-def _geom(parent: ET.Element, **attrs: str) -> None:
-    ET.SubElement(parent, "geom", attrs)
+def _geom(parent: ET.Element, **attrs: str) -> ET.Element:
+    element = ET.SubElement(parent, "geom", attrs)
+    return element
 
 
 def _add_studio(worldbody: ET.Element, task: str) -> None:
