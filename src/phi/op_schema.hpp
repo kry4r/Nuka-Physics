@@ -359,6 +359,7 @@ uint64_t IslandSortScratchBytes(uint32_t total_rows);
 uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count);
 uint64_t LbvhSortScratchBytes(uint32_t env_count, uint32_t bodies_per_env);
 uint64_t ContactCacheScratchBytes(uint32_t point_count, uint32_t env_count);
+uint64_t ContactIndexScratchBytes(uint32_t row_count, uint32_t env_count);
 
 // Dynamic solve-island build (connected components over the active contact rows).
 // All launch geometry is a fixed function of the capacities (graph-capturable); the
@@ -882,6 +883,7 @@ struct ReadoutContactWrenchParams {
     uint32_t max_contacts_per_env;
     uint32_t rows_per_env;      // per-env solver row-slot span (max_rows_per_env)
     uint32_t full_row_slot_count;  // rigid slots [0, this) use the 12-row layout
+    uint64_t workspace_bytes;
 };
 
 struct ExportObsParams {

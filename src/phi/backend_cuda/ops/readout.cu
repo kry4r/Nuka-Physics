@@ -2,12 +2,14 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <limits>
 
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/contact_index.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"  // NkRow / kNkSideArtic (row solve)
 #include "sensor/noise/philox.cuh"
 
@@ -161,42 +163,36 @@ __global__ void ContactLinkKernel(const uint32_t* __restrict__ row_cj_link,
 // Gather both contact endpoints into each link's world-frame wrench.
 // Fixed row order gives deterministic force and torque sums without atomics.
 __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
-                                        const NkRow* __restrict__ urows,
-                                        const uint32_t* __restrict__ row_cj_link,
                                         const Vec3* __restrict__ row_cj_point,
                                         const Vec3* __restrict__ row_cj_dir,
-                                        const uint32_t* __restrict__ row_cj_link_b,
                                         const Vec3* __restrict__ row_cj_point_b,
                                         const Vec3* __restrict__ row_cj_dir_b,
                                         const Transform* __restrict__ link_world_pose,
+                                        const uint64_t* __restrict__ endpoint_keys,
+                                        const uint32_t* __restrict__ link_begin,
+                                        const uint32_t* __restrict__ link_end,
                                         uint32_t total_link_count,
-                                        uint32_t base_link_count,
-                                        uint32_t rows_per_env,
                                         float inv_dt,
                                         float* __restrict__ out_link_wrench) {
     const uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= total_link_count) {
         return;
     }
-    const uint32_t env = g / base_link_count;
-    const uint32_t row_begin = env * rows_per_env;
-    const uint32_t row_end = row_begin + rows_per_env;
     const Vec3 origin = link_world_pose[g].position;
 
     Vec3 force = Vec3::Zero();
     Vec3 torque = Vec3::Zero();
-    // Only active rows whose endpoint names this link contribute.
-    for (uint32_t rs = row_begin; rs < row_end; ++rs) {
-        if (!(urows[rs].flags & nk::nk_row_flags::kActive)) {
-            continue;
-        }
+    for (uint32_t i = link_begin[g]; i < link_end[g]; ++i) {
+        const auto endpoint = static_cast<uint32_t>(endpoint_keys[i]);
+        const uint32_t rs = endpoint / contact_index::kEndpointsPerRow;
+        const uint32_t side = endpoint % contact_index::kEndpointsPerRow;
         const float l = lambda[rs];
-        if (row_cj_link[rs] == g) {
+        if (side == 0u) {
             const Vec3 f_slot = row_cj_dir[rs] * (l * inv_dt);
             force += f_slot;
             torque += (row_cj_point[rs] - origin).Cross(f_slot);
         }
-        if (row_cj_link_b[rs] == g) {
+        if (side == 1u) {
             const Vec3 f_slot = row_cj_dir_b[rs] * (l * inv_dt);
             force += f_slot;
             torque += (row_cj_point_b[rs] - origin).Cross(f_slot);
@@ -231,6 +227,11 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     if (slot >= p.count) return;
     const uint32_t env = p.use_env_ids ? data.reset_env_ids[slot] : slot;
     if (env >= p.env_count) return;
+    const bool has_contact_index = p.base_link_count != 0u && p.lambda_stride != 0u && p.contact_slot_count != 0u;
+    if (has_contact_index && threadIdx.x == 0u) {
+        data.active_row_count[env] = 0u;
+        data.contact_endpoint_count[env] = 0u;
+    }
     const Philox4x32Key key = SplitSeed(p.ic_seed ^ (static_cast<uint64_t>(p.ic_episode) << 32));
     for (uint32_t local = threadIdx.x; local < p.base_link_count; local += blockDim.x) {
         const uint32_t link = env * p.base_link_count + local;
@@ -244,6 +245,7 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.qdot_pseudo[link] = 0.0f;
         data.link_velocity_pseudo[link] = {};
         data.link_contact_wrench[link] = {};
+        if (has_contact_index) data.link_contact_begin[link] = data.link_contact_end[link] = 0u;
     }
     for (uint32_t local = threadIdx.x; local < p.articulations_per_env; local += blockDim.x) {
         const uint32_t articulation = env * p.articulations_per_env + local;
@@ -377,13 +379,30 @@ __global__ void ExportObsKernel(const Transform* base_pose,
 Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
                               const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ReadoutContactWrenchParams*>(params);
-    if (p == nullptr) {
-        return Status::Failed;
-    }
-    const uint32_t slot_count = p->env_count * p->max_contacts_per_env;
-    const uint32_t total_link_count = p->env_count * p->base_link_count;
+    if (p == nullptr) return Status::InvalidArgument;
+    const uint64_t slots64 = uint64_t{p->env_count} * p->max_contacts_per_env;
+    const uint64_t links64 = uint64_t{p->env_count} * p->base_link_count;
+    const uint64_t rows64 = uint64_t{p->env_count} * p->rows_per_env;
+    constexpr auto index_limit = std::numeric_limits<uint32_t>::max();
+    if (p->full_row_slot_count > p->max_contacts_per_env ||
+        slots64 > index_limit / kPdPtsPerSlot || links64 > index_limit / kLinkWrenchComponents ||
+        rows64 > index_limit ||
+        (links64 != 0u && rows64 > static_cast<uint64_t>(std::numeric_limits<int>::max()) /
+                                           contact_index::kEndpointsPerRow))
+        return Status::InvalidArgument;
+    const uint64_t required_rows = uint64_t{p->full_row_slot_count} * kPdRowsPerSlot +
+        uint64_t{p->max_contacts_per_env - p->full_row_slot_count} * kPdParticleRowsPerSlot;
+    if (required_rows > p->rows_per_env) return Status::InvalidArgument;
+    const auto slot_count = static_cast<uint32_t>(slots64);
+    const auto total_link_count = static_cast<uint32_t>(links64);
     if (slot_count == 0u) {
         return Status::Ok;
+    }
+    if (total_link_count != 0u) {
+        const auto status = contact_index::Build(data, p->rows_per_env, p->base_link_count,
+                                                 p->env_count, p->workspace_bytes, stream);
+        if (status != cudaSuccess)
+            return status == cudaErrorInvalidValue ? Status::InvalidArgument : Status::Failed;
     }
     // force = impulse / dt; a non-positive dt yields a defined zero readout.
     const float inv_dt = (p->dt > 0.0f) ? (1.0f / p->dt) : 0.0f;
@@ -397,6 +416,7 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
                static_cast<const Vec3*>(data.ucontact_point),
                static_cast<const Vec3*>(data.ucontact_normal),
                slot_count, data.contact_point, data.contact_normal);
+    if (cudaGetLastError() != cudaSuccess) return Status::Failed;
 
     LaunchCuda(ContactForceKernel, dim3(force_grid), dim3(kBlock), 0u, stream,
                static_cast<const float*>(data.lambda), slot_count,
@@ -405,24 +425,24 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
                data.row_cj_link, data.row_cj_link_b,
                data.contact_side_a_kind, data.contact_side_b_kind,
                data.contact_side_a_index, data.contact_side_b_index);
+    if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     LaunchCuda(ContactLinkKernel, dim3(force_grid), dim3(kBlock), 0u, stream,
                static_cast<const uint32_t*>(data.row_cj_link),
                static_cast<const uint32_t*>(data.row_cj_link_b), slot_count,
                p->max_contacts_per_env, p->rows_per_env, p->full_row_slot_count,
                data.contact_link);
+    if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     if (total_link_count != 0u) {
         const uint32_t wrench_grid = (total_link_count + kBlock - 1u) / kBlock;
         LaunchCuda(LinkContactWrenchKernel, dim3(wrench_grid), dim3(kBlock), 0u, stream,
                    static_cast<const float*>(data.lambda),
-                   reinterpret_cast<const NkRow*>(data.urows),
-                   static_cast<const uint32_t*>(data.row_cj_link),
                    static_cast<const Vec3*>(data.row_cj_point),
                    static_cast<const Vec3*>(data.row_cj_dir),
-                   static_cast<const uint32_t*>(data.row_cj_link_b),
                    static_cast<const Vec3*>(data.row_cj_point_b),
                    static_cast<const Vec3*>(data.row_cj_dir_b),
                    static_cast<const Transform*>(data.link_pose),
-                   total_link_count, p->base_link_count, p->rows_per_env,
+                   data.contact_endpoint_keys, data.link_contact_begin, data.link_contact_end,
+                   total_link_count,
                    inv_dt, reinterpret_cast<float*>(data.link_contact_wrench));
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
@@ -555,6 +575,10 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
 }
 
 } // namespace
+
+uint64_t ContactIndexScratchBytes(uint32_t row_count, uint32_t env_count) {
+    return contact_index::ScratchBytes(row_count, env_count);
+}
 
 void RegisterNkReadoutOps() {
     SetCudaOp(NkOp::ReadoutContactWrench, &OpReadoutContactWrench);

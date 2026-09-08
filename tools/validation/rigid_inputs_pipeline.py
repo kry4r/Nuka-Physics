@@ -84,6 +84,9 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
     assert world.__enter__() is world
     with world:
         initial = state(world)
+        wrench_view = torch.from_dlpack(world.buffer_view(nuka.LINK_CONTACT_WRENCH)).reshape(2, -1, 6)
+        wrench_address = world.buffer_device_ptr(nuka.LINK_CONTACT_WRENCH)
+        assert wrench_view.data_ptr() == wrench_address
         world.set_execution_mode(execution)
         for before, after in zip(initial, state(world)):
             np.testing.assert_array_equal(before, after)
@@ -124,6 +127,9 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
         world.step_n(steps - 1)
         world.synchronize()
         advanced = state(world)
+        advanced_wrench = read(world, nuka.LINK_CONTACT_WRENCH, 6)
+        assert np.isfinite(advanced_wrench).all()
+        np.testing.assert_array_equal(wrench_view.cpu().numpy(), advanced_wrench)
         gyro_residual = read(world, nuka.BODY_GYRO_RESIDUAL, 1)
         gyro_iterations = read(world, nuka.BODY_GYRO_ITERATIONS, 1)
         gyro_status = read(world, nuka.BODY_GYRO_STATUS, 1)
@@ -157,6 +163,9 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
         world.upload_field(nuka.BODY_TORQUE, pending_torque)
         world.reset_envs(np.array([0], dtype=np.uint32))
         reset_state = state(world)
+        reset_wrench = read(world, nuka.LINK_CONTACT_WRENCH, 6)
+        assert not np.any(reset_wrench[0])
+        np.testing.assert_array_equal(reset_wrench[1], advanced_wrench[1])
         for field, before in ((nuka.BODY_GYRO_RESIDUAL, gyro_residual),
                               (nuka.BODY_GYRO_ITERATIONS, gyro_iterations),
                               (nuka.BODY_GYRO_STATUS, gyro_status)):
@@ -181,6 +190,8 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
         np.testing.assert_array_equal(frames[2], frames[0])
 
         world.reset()
+        assert not np.any(world.download_field(nuka.LINK_CONTACT_WRENCH))
+        assert world.buffer_device_ptr(nuka.LINK_CONTACT_WRENCH) == wrench_address
         assert not np.any(world.download_field(nuka.BODY_FORCE))
         assert not np.any(world.download_field(nuka.BODY_TORQUE))
         world.upload_field(nuka.BODY_FORCE, forces)
@@ -190,6 +201,7 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
         world.synchronize()
         for expected, actual in zip(advanced, state(world)):
             np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(read(world, nuka.LINK_CONTACT_WRENCH, 6), advanced_wrench)
 
         panel = Image.new("RGB", (640 * len(frames), 510), "white")
         draw = ImageDraw.Draw(panel)
@@ -219,6 +231,8 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
             "env_status": env_status.tolist(), "gyro_reset_isolated": True,
             "neighbor_max_count": int(neighbor_count.max()),
             "neighbor_count": int(neighbor_count.sum()), "neighbors_not_truncated": True,
+            "contact_wrench_dlpack_alias": True, "contact_wrench_reset_isolated": True,
+            "contact_wrench_sha256": hashlib.sha256(advanced_wrench.tobytes()).hexdigest(),
             "execution": execution_info,
             "state_sha256": hashlib.sha256(b"".join(value.tobytes() for value in advanced)).hexdigest(),
         }

@@ -917,3 +917,12 @@ fields:
   - {name: grid_neighbor_scan_offset, dtype: u64, per: particle, arena: scratch, owner: data}
   - {name: lbvh_sort_scratch, dtype: u8, per: scalar, count: "lbvh_sort_scratch_bytes", arena: scratch, owner: data}
   - {name: contact_cache_scratch, dtype: u8, per: scalar, count: "contact_cache_scratch_bytes", arena: scratch, owner: data}
+
+  # Stable active rows and sorted link endpoints are distinct from solver row identity.
+  - {name: active_row_ids, dtype: u32, per: row_slot, arena: scratch, owner: data}
+  - {name: active_row_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: contact_endpoint_keys, dtype: u64, per: row_slot, elem: 2, arena: scratch, owner: data}
+  - {name: contact_endpoint_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: link_contact_begin, dtype: u32, per: link, arena: scratch, owner: data}
+  - {name: link_contact_end, dtype: u32, per: link, arena: scratch, owner: data}
+  - {name: contact_index_scratch, dtype: u8, per: scalar, count: "contact_index_scratch_bytes", arena: scratch, owner: data}

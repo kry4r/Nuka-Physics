@@ -315,7 +315,9 @@ TEST(MultiArticulationReset, ClearsContactHistoryAndReadoutOnlyForSelectedEnviro
         nk::FieldId::ContactForce, nk::FieldId::ContactPoint, nk::FieldId::ContactNormal,
         nk::FieldId::LinkContactWrench, nk::FieldId::QdotPseudo, nk::FieldId::QdotPseudoFlat,
         nk::FieldId::LinkVelocityPseudo, nk::FieldId::BodyPseudoLinearVelocity,
-        nk::FieldId::BodyPseudoAngularVelocity, nk::FieldId::RowPseudoLambda};
+        nk::FieldId::BodyPseudoAngularVelocity, nk::FieldId::RowPseudoLambda,
+        nk::FieldId::ActiveRowCount, nk::FieldId::ContactEndpointCount,
+        nk::FieldId::LinkContactBegin, nk::FieldId::LinkContactEnd};
     for (auto field : zero_fields) {
         auto value = Read(world, field);
         std::fill(value.begin(), value.end(), 0x35u);

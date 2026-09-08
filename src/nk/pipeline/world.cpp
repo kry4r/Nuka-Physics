@@ -153,6 +153,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     model_.capacities.contact_cache_scratch_bytes = runs_pair_driven
         ? phi::ContactCacheScratchBytes(static_cast<uint32_t>(contact_slots * kPairDrivenPtsPerSlot),
                                         model_.capacities.env_count) : 0u;
+    const auto& cap = model_.capacities;
+    model_.capacities.contact_index_scratch_bytes = cap.links_per_env > 0u && cap.max_contacts_per_env > 0u
+        ? phi::ContactIndexScratchBytes(cap.max_rows_per_env * cap.env_count, cap.env_count) : 0u;
     } catch (const std::exception& error) {
         creation_status_ = phi::Status::Failed;
         creation_error_ = error.what();

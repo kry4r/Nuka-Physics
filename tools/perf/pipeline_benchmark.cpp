@@ -28,7 +28,7 @@ void CheckCuda(cudaError_t result) {
 }
 
 struct Options {
-    std::string scene = "robot-cloth-fluid", execution = "eager", output = "-", state_output;
+    std::string scene = "robot-cloth-fluid", execution = "eager", output = "-", state_output, wrench_output;
     uint32_t envs = 1u, steps = 200u, warmup = 250u, seed = 20260908u;
     float dt = 1.0f / 240.0f;
     uint32_t capacity_scale = 1u;
@@ -62,6 +62,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--execution") options.execution = value;
         else if (flag == "--perf-json") options.output = value;
         else if (flag == "--state-output") options.state_output = value;
+        else if (flag == "--wrench-output") options.wrench_output = value;
         else if (flag == "--capacity-scale") options.capacity_scale = ParseU32(value);
         else throw std::invalid_argument("unknown option " + flag);
     }
@@ -110,7 +111,8 @@ std::vector<uint8_t> State(nk::World& world, bool cache = true) {
         for (const auto field : {nk::FieldId::ContactCachePair, nk::FieldId::ContactCacheFeature,
                                 nk::FieldId::ContactCacheMaterial, nk::FieldId::ContactCacheAge,
                                 nk::FieldId::ContactCacheNormal, nk::FieldId::ContactCacheTangent1,
-                                nk::FieldId::ContactCacheTangent2, nk::FieldId::ContactCacheLambda})
+                                nk::FieldId::ContactCacheTangent2, nk::FieldId::ContactCacheLambda,
+                                nk::FieldId::LinkContactWrench})
             fields.push_back(field);
     }
     std::vector<uint8_t> result;
@@ -149,12 +151,20 @@ std::vector<uint32_t> MismatchedReplicas(nk::World& world, const std::vector<uin
     return result;
 }
 
-std::string Digest(const std::vector<uint8_t>& bytes) {
-    uint64_t hash = 14695981039346656037ull;
-    for (uint8_t value : bytes) { hash ^= value; hash *= 1099511628211ull; }
+uint64_t UpdateDigest(uint64_t hash, const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0u; i < size; ++i) { hash ^= bytes[i]; hash *= 1099511628211ull; }
+    return hash;
+}
+
+std::string FormatDigest(uint64_t hash) {
     std::ostringstream output;
     output << std::hex << std::setfill('0') << std::setw(16) << hash;
     return output.str();
+}
+
+std::string Digest(const std::vector<uint8_t>& bytes) {
+    return FormatDigest(UpdateDigest(14695981039346656037ull, bytes.data(), bytes.size()));
 }
 
 Json Distribution(std::vector<double> values) {
@@ -282,12 +292,30 @@ Json Run(const Options& options) {
     uint32_t status_union = 0u;
     const auto& caps = world.GetModel().capacities;
     std::vector<nk::NkRow> rows_host(size_t{caps.max_rows_per_env} * options.envs);
+    const size_t wrench_bytes = caps.ElementCount(nk::FieldId::LinkContactWrench) *
+                                nk::LayoutOf(nk::FieldId::LinkContactWrench).elem_size;
+    std::vector<float> wrench(wrench_bytes / sizeof(float));
+    std::ofstream wrench_output;
+    if (!options.wrench_output.empty()) {
+        wrench_output.open(options.wrench_output, std::ios::binary);
+        fixture::Require(wrench_output.is_open(), "cannot open wrench output");
+    }
+    uint64_t wrench_hash = 14695981039346656037ull;
+    bool wrench_finite = true;
     uint64_t cloth_rows = 0u, fluid_rows = 0u;
     for (uint32_t i = 0; i < options.warmup + options.steps; ++i) {
         Step(world, options);
         fixture::Require(world.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(),
                          status.size() * sizeof(uint32_t)), "status download failed");
         for (auto flags : status) status_union |= flags;
+        fixture::Require(world.GetData().DownloadField(nk::FieldId::LinkContactWrench,
+                         wrench.data(), wrench_bytes), "link wrench download failed");
+        for (float value : wrench) wrench_finite &= std::isfinite(value);
+        wrench_hash = UpdateDigest(wrench_hash, wrench.data(), wrench_bytes);
+        if (wrench_output.is_open()) {
+            wrench_output.write(reinterpret_cast<const char*>(wrench.data()), wrench_bytes);
+            fixture::Require(wrench_output.good(), "cannot write wrench output");
+        }
         if (i >= options.warmup && (i % 25u == 0u || i + 1u == options.warmup + options.steps)) {
             fixture::Require(world.GetData().DownloadField(nk::FieldId::Urows, rows_host.data(),
                              rows_host.size() * sizeof(nk::NkRow)), "row download failed");
@@ -318,7 +346,7 @@ Json Run(const Options& options) {
     const double quality_ms = Milliseconds(quality_start);
 
     Json result = Json::Object(), execution = Json::Object(), timing = Json::Object();
-    result.Set("schema_version", Json::Int(2));
+    result.Set("schema_version", Json::Int(3));
     result.Set("scene", Json::Str(options.scene));
     Json configuration = Json::Object();
     configuration.Set("envs", Json::Int(options.envs));
@@ -359,6 +387,10 @@ Json Run(const Options& options) {
     result.Set("memory", Memory(world));
     Json quality = Json::Object();
     quality.Set("finite", Json::Bool(finite));
+    quality.Set("link_wrench_finite", Json::Bool(wrench_finite));
+    quality.Set("link_wrench_trace_fnv1a64", Json::Str(FormatDigest(wrench_hash)));
+    quality.Set("link_wrench_bytes_per_step", Json::Int(wrench_bytes));
+    quality.Set("state_layout", Json::Str("physical fields, contact cache, link wrench"));
     quality.Set("env_status_union", Json::Int(status_union));
     quality.Set("reset_state_equal", Json::Bool(reset_equal));
     quality.Set("timed_replay_bit_equal", Json::Bool(timed_state == replay_state));
@@ -385,7 +417,7 @@ Json Run(const Options& options) {
     hardware.Set("total_device_bytes", Json::Int(properties.totalGlobalMem));
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
-    const bool valid = finite && status_union == 0u && reset_equal && timed_state == replay_state &&
+    const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && timed_state == replay_state &&
                        cloth_rows > 0u && fluid_rows > 0u && mismatched_envs.empty();
     validity.Set("valid", Json::Bool(valid));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));
@@ -406,7 +438,7 @@ int main(int argc, char** argv) {
         if (!result.At("status").At("valid").AsBool()) exit_code = 2;
     } catch (const std::exception& error) {
         result = Json::Object();
-        result.Set("schema_version", Json::Int(2));
+        result.Set("schema_version", Json::Int(3));
         Json status = Json::Object();
         status.Set("valid", Json::Bool(false));
         status.Set("error", Json::Str(error.what()));

@@ -325,6 +325,13 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 8, 0},  // grid_neighbor_scan_offset
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // lbvh_sort_scratch
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // contact_cache_scratch
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // active_row_ids
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // active_row_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 2, 1, 16, 0},  // contact_endpoint_keys
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // contact_endpoint_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // link_contact_begin
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // link_contact_end
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // contact_index_scratch
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

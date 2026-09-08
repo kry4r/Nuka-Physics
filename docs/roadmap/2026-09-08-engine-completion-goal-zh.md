@@ -12,6 +12,10 @@
 
 ## 执行批次
 
+当前接触索引的功能与 graph 子集已验证，见 [review](../research/2026-09-09-contact-index-upstream-review-zh.md) 和 [验收报告](../research/2026-09-09-contact-index-validation-zh.md)。有效 row/endpoint、稳定 link gather、预算/reset 契约已实现；主 pipeline 34 passed，完整 graph 和读出/reset memcheck 为 0 errors，公共报告与两组各 8 张渲染图逐字节一致。graph E=1/16/256 从 3.081/3.381/6.516 降至 2.551/2.837/5.367 ms；容量×2/4、逐步 wrench 和权威物理状态等价通过。
+
+eager 性能仍未验收：首次五进程和两组交错采样存在超过 5% 的回退，固定 CPU 后仍未消除。普通/完整 API trace 显示 GPU kernel busy 降低、host 主要耗在 launch，尚未证明原始回退根因；不能以 profiler 数据替代正常计时或据 graph 收益关闭此项。下一批先复核有效岛/J 调度及 host 提交契约，再继续通用路径优化。
+
 改造前已核对 spec 与 Newton/MuJoCo/Genesis，见 [执行 review](../research/2026-09-08-execution-workspace-upstream-review-zh.md) 和 [9 月 9 日性能方向 review](../research/2026-09-09-performance-directions-upstream-review-zh.md)。当前批次验收完成，后续按 [全路径细化方向](../plans/2026-09-09-performance-directions-detailed-spec-zh.md) 补 MLS-MPM/SDF/光追/端到端基线，并推进已测出的 active row/endpoint、读出、岛求解及其余热点。T06 全部错误传播、T08 密度、refit、异构、双浮基重叠和其他未完成物理/API/可微工作继续保留。
 
 | 顺序 | 合并实施范围 | 统一验收重点 |
