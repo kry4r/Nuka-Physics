@@ -31,16 +31,12 @@
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"
 #include "phi/op_schema.hpp"
+#include "phi/articulation_contract.hpp"
 
 namespace nuka::phi::nkops {
 
 // --- runtime/articulation/articulation_state.hpp (verbatim) ----------------
-enum class ArticulationJointType : uint8_t {
-    Revolute = 0,
-    Prismatic = 1,
-    Fixed = 2,
-    FloatingBase = 3,
-};
+using phi::ArticulationJointType;
 
 struct LinkSpatialInertia {
     float I[36] = {};
@@ -153,7 +149,7 @@ struct ArticulatedContactRow {
     math::Vec3 tangent2{};
 };
 
-constexpr uint32_t kMaxArticulationDof = 64u;
+using phi::kMaxArticulationDof;
 
 // The rows DataView field is f32 elem:16 per row_slot (64B) — the exact
 // ArticulatedContactRow footprint, so the field aliases as the struct.

@@ -43,7 +43,7 @@ struct ModelView;
 struct DataView;
 
 // --- Status --------------------------------------------------------------
-enum class Status : uint8_t { Ok, Unsupported, Failed, OutOfMemory };
+enum class Status : uint8_t { Ok, Unsupported, Failed, OutOfMemory, InvalidArgument };
 
 // --- OpCall --------------------------------------------------------------
 // One unit of work: an op id + a pointer to that op's POD params (op_schema.hpp).

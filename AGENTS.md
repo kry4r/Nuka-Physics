@@ -16,6 +16,8 @@ These rules OVERRIDE default behavior. Follow them in every file you write or ed
   build it generally — never add a shortcut.
 
 ## Validation
+- Batch related changes across modules, then build and validate the complete batch.
+- Avoid repeating full validation after each small edit; rerun for failures or new risks.
 - Minimize new unit tests. Prefer a fixed representative environment that runs
   the complete production pipeline.
 - Extend the robot + cloth + fluid pipeline regression to cover cooking, world
@@ -24,3 +26,8 @@ These rules OVERRIDE default behavior. Follow them in every file you write or ed
 - Add focused unit/oracle tests only when needed to isolate a failure or verify
   a physical invariant that the pipeline regression cannot measure adequately.
 - Test counts do not replace complete pipeline acceptance.
+
+## Performance
+- In performance modules, prioritize measured latency and throughput gains and keep pursuing remaining hotspots.
+- Profile GPU completion time, scheduling, bandwidth, layout, occupancy, and memory reuse on the general path.
+- Compare complete pipelines at equal physical quality; report regressions, memory cost, and five-process results.

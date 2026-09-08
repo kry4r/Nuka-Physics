@@ -59,6 +59,10 @@ inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM open-fac
 // An analytic-only collidable (no cooked SDF grid) imposes a one-way grid BC: it
 // has no SDF to rasterize, so the medium feels it but no reaction is deposited back.
 inline constexpr uint32_t kEnvStatusMpmOneWayBody    = 1u << 4;
+inline constexpr uint32_t kEnvStatusGyroFailure      = 1u << 5;
+inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
+inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
+inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
 
 // ---------------------------------------------------------------------------
 // NkOp — the closed op set. uint16_t backing so an op id fits a single field
@@ -239,12 +243,11 @@ struct IntegratePositionParams {
     float    dt;
     uint32_t total_link_count;
     uint32_t articulation_count;
-    // The rigid-body arm: movable rigid-body symplectic-Euler position arm (the union world's
-    // IntegrateBodyPosition port). 0 = no bodies.
+    // Free bodies drift in the principal inertia frame after all physical impulses.
     uint32_t total_body_count;
-    // Split-impulse: advance position by (real+pseudo)*dt while the persisted
-    // velocity stays = real. 0 (the velocity-only path) is byte-identical.
+    // Pseudo rotation changes geometry while preserving physical world angular momentum.
     uint32_t pos_pass;
+    uint32_t env_count = 1u;
 };
 
 struct CrbaComputeMParams {
@@ -329,6 +332,7 @@ struct ParticleGridBuildParams {
     uint32_t env_count;
     uint32_t particles_per_env;
     uint32_t cells_capacity;    // per-env cell capacity (max_grid_cells)
+    uint32_t neighbor_capacity; // total neighbor indices reserved per environment
 };
 inline constexpr uint32_t kGridPosSourceParticlePos = 0u;
 inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
@@ -732,6 +736,7 @@ struct AeroDragParams {
     float    drag_tangent;     // lumped 0.5*rho*Ct
     float    max_dv;           // per-step impulse clamp (0 == uncapped)
     uint32_t tri_count;        // total env-major aero triangles (0 == inert)
+    uint32_t particle_count;
 };
 
 struct ParticlePredictParams {
@@ -903,6 +908,7 @@ struct ResetEnvsParams {
     float    jitter_body_xyz[3];    // symmetric half-ranges; zero disables jitter
     float    jitter_base_pos[3];
     float    jitter_q;
+    uint32_t has_particle_grid = 0u;
 };
 
 struct SnapshotStateParams {
@@ -923,6 +929,7 @@ struct RestoreStateParams {
     uint32_t contact_slot_count;
     uint32_t total_body_count;
     uint32_t total_particle_count;
+    uint32_t has_particle_grid = 0u;
 };
 
 struct ContactWarmStartParams {

@@ -88,7 +88,7 @@ struct GridSortScratchLayout {
         size_t scan_bytes = 0u;
         (void)cub::DeviceScan::ExclusiveScan(
             nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), NkScanSumOp{}, 0u, n);
+            static_cast<uint64_t*>(nullptr), NkScanSumOp{}, uint64_t{0}, n);
         temp_bytes = sort_bytes > scan_bytes ? sort_bytes : scan_bytes;
         const uint64_t nbytes = static_cast<uint64_t>(particle_count) * sizeof(uint32_t);
         keys_off = AlignScratch(temp_bytes);
@@ -563,10 +563,9 @@ __global__ void GridCountKernel(uint32_t particle_count,
     if (i >= particle_count) return;
     const math::Vec3 pm = pos[i];
     const size_t cbase = static_cast<size_t>(i / particles_per_env) * cells_per_env;
-    uint32_t scratch[cg::kParticleGridMaxNeighbors];
     const uint32_t n = cg::QueryParticleNeighbors(
         make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
-        cell_end + cbase, idx_sorted, pos, scratch, cg::kParticleGridMaxNeighbors,
+        cell_end + cbase, idx_sorted, pos, nullptr, 0u,
         nullptr);
     counts[i] = n;
 }
@@ -579,8 +578,9 @@ __global__ void GridFillKernel(uint32_t particle_count,
                                const uint32_t* __restrict__ cell_start,
                                const uint32_t* __restrict__ cell_end,
                                const uint32_t* __restrict__ idx_sorted,
-                               const uint32_t* __restrict__ offsets,
-                               uint32_t slot_stride,
+                               const uint64_t* __restrict__ scanned_offsets,
+                               uint32_t* __restrict__ offsets,
+                               uint32_t pool_capacity,
                                uint32_t* __restrict__ neighbor_idx,
                                uint32_t* __restrict__ counts,
                                uint32_t* __restrict__ env_status) {
@@ -589,20 +589,21 @@ __global__ void GridFillKernel(uint32_t particle_count,
     const math::Vec3 pm = pos[i];
     const uint32_t env = i / particles_per_env;
     const size_t cbase = static_cast<size_t>(env) * cells_per_env;
-    // Per-particle PRIVATE CSR slice (fixed cap slot_stride per particle); the
-    // neighbor query writes them sorted ascending -> D1 by region (no append).
-    uint32_t* slice = neighbor_idx + static_cast<size_t>(i) * slot_stride;
+    const uint64_t local_offset = scanned_offsets[i] - scanned_offsets[env * particles_per_env];
+    const uint32_t retained_offset = static_cast<uint32_t>(
+        local_offset < pool_capacity ? local_offset : pool_capacity);
+    offsets[i] = env * pool_capacity + retained_offset;
+    uint32_t* slice = neighbor_idx + offsets[i];
     bool overflow = false;
     const uint32_t n = cg::QueryParticleNeighbors(
         make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
-        cell_end + cbase, idx_sorted, pos, slice, slot_stride, &overflow);
+        cell_end + cbase, idx_sorted, pos, slice, pool_capacity - retained_offset, &overflow);
     counts[i] = n;
     // Surface a dropped neighbor (cap exhausted) per-env -> env_status readout;
     // PBF density would otherwise silently lose interactions in dense regions.
     if (overflow && env_status != nullptr) {
         atomicOr(&env_status[env], kEnvStatusNeighborOverflow);
     }
-    (void)offsets;  // grid_neighbor_offset kept for the M6 flat-CSR consumer.
 }
 
 __global__ void ZeroU32Kernel(uint32_t* __restrict__ a, uint32_t n) {
@@ -749,6 +750,13 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     if (cells64 == 0u) return Status::Ok;
     const uint32_t E = p->env_count == 0u ? 1u : p->env_count;
     const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
+    const uint64_t pool_capacity = p->neighbor_capacity != 0u ? p->neighbor_capacity
+        : static_cast<uint64_t>(Ppe) * kDefaultParticleNeighborBudget;
+    if (static_cast<uint64_t>(E) * Ppe != Np || pool_capacity * E > 0xFFFFFFFFull ||
+        Np > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        !std::isfinite(p->cell_size) || !std::isfinite(p->query_radius) ||
+        p->query_radius < 0.0f || p->query_radius > p->cell_size)
+        return Status::InvalidArgument;
     // LOUD capacity guards (review fix): the cell-range arrays are sized
     // max_grid_cells x env_count — a dims product beyond the cooked capacity
     // would scatter cell keys past the segment (silent arena corruption), and
@@ -804,19 +812,19 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
                Np, data.grid_cell_key, data.grid_cell_start, data.grid_cell_end);
     LaunchCuda(GridCountKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
-               data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_count);
+               data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_attempted);
     // Exclusive scan of the count -> flat CSR offset (byte-identical to the prior
     // thrust exclusive_scan; out-of-place, reusing the capture-safe temp region).
     {
         size_t scan_temp_bytes = static_cast<size_t>(sl.temp_bytes);
         (void)cub::DeviceScan::ExclusiveScan(
-            sort_temp, scan_temp_bytes, data.grid_neighbor_count,
-            data.grid_neighbor_offset, NkScanSumOp{}, 0u, static_cast<int>(Np), stream);
+            sort_temp, scan_temp_bytes, data.grid_neighbor_attempted,
+            data.grid_neighbor_scan_offset, NkScanSumOp{}, uint64_t{0}, static_cast<int>(Np), stream);
     }
     LaunchCuda(GridFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
-               data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_offset,
-               cg::kParticleGridMaxNeighbors, data.grid_neighbor_idx,
+               data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_scan_offset,
+               data.grid_neighbor_offset, static_cast<uint32_t>(pool_capacity), data.grid_neighbor_idx,
                data.grid_neighbor_count, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

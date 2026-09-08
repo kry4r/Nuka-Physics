@@ -22,17 +22,18 @@ inline constexpr uint8_t kMaxContactsPerPair =
     static_cast<uint8_t>(constraint::ContactManifold::kMaxPoints);
 
 void Pipeline::AddOp(phi::NkOp op, const void* params, phi::Device* device) {
-    // Capability query (the spec): with a device, emit only ops the backend
-    // implements (unimplemented = a later system).
     if (device != nullptr && !phi::DeviceSupportsOp(device, op)) {
+        if (std::find(missing_ops_.begin(), missing_ops_.end(), op) == missing_ops_.end())
+            missing_ops_.push_back(op);
         return;
     }
     calls_.push_back(phi::OpCall{op, params});
 }
 
-void Pipeline::Build(const Model& model, const SolverConfig& cfg,
+phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
                      phi::Device* device, uint32_t readout_demand) {
     calls_.clear();
+    missing_ops_.clear();
     const ModelCapacities& cap = model.capacities;
 
     const bool has_articulation = cap.dofs_per_env > 0 || cap.links_per_env > 0;
@@ -288,6 +289,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
             p_aero_drag_.drag_tangent = mp.aero_drag_tangent;
             p_aero_drag_.max_dv = mp.aero_drag_max_dv;
             p_aero_drag_.tri_count = aero_tri_count;
+            p_aero_drag_.particle_count = cap.particles_per_env * env_count;
             add(phi::NkOp::ParticleAeroDrag, &p_aero_drag_);
         }
 
@@ -375,6 +377,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_grid_.env_count = env_count;
         p_grid_.particles_per_env = cap.particles_per_env;
         p_grid_.cells_capacity = cap.max_grid_cells;
+        p_grid_.neighbor_capacity = static_cast<uint32_t>(cap.NeighborPoolCapacity());
         add(phi::NkOp::ParticleGridBuild, &p_grid_);
     }
 
@@ -693,6 +696,7 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_int_pos_.total_link_count = total_link_count;
         p_int_pos_.articulation_count = articulation_cnt;
         p_int_pos_.total_body_count = cap.bodies_per_env * env_count;
+        p_int_pos_.env_count = env_count;
         // Read the split-impulse pseudo velocity additively when the position pass
         // is active (the general PairDriven path); else velocity-only (identical).
         p_int_pos_.pos_pass =
@@ -724,10 +728,11 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }
 
-    // the union-family per-env contact-observation readout
-    // (ReadoutUnionContactObs) was DELETED together with the entire UnionCsr path.
-    // Grasp/union moved to RL; the general per-env contact readout is
-    // ReadoutContactWrench over the unified contact buffer (above).
+    if (!missing_ops_.empty()) {
+        calls_.clear();
+        return phi::Status::Unsupported;
+    }
+    return phi::Status::Ok;
 }
 
 } // namespace nuka::nk

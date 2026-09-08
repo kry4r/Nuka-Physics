@@ -196,7 +196,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_cell_end
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_offset
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_count
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 32, 1, 128, 0},  // grid_neighbor_idx
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_neighbor_idx
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // rng_state
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_status
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // obs_buffer
@@ -314,6 +314,15 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_side_b_kind
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_side_a_index
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_side_b_index
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Particle, 1, 1, 4, 0},  // aero_particle_offset
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Particle, 1, 1, 4, 0},  // aero_particle_count
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 3, 1, 12, 0},  // aero_incident_tri
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::AeroTri, 1, 3, 12, 0},  // aero_tri_impulse
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_gyro_residual
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_gyro_iterations
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_gyro_status
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_attempted
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 8, 0},  // grid_neighbor_scan_offset
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

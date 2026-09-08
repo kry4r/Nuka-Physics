@@ -807,51 +807,69 @@ __global__ void BodyIntegrateVelocityKernel(math::Vec3* body_linear_velocity,
     body_angular_velocity[body] += body_world_inv_inertia[body].Multiply(torque) * dt;
 }
 
-// Advance the COM and reconstruct the authored body frame after rotation.
+__global__ void ClearGyroStatusKernel(uint32_t* status, uint32_t env_count) {
+    const uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
+    if (env < env_count) status[env] &= ~kEnvStatusGyroFailure;
+}
+
+// The midpoint momentum equation and Cayley pose update share one time layer.
 __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
                                             const math::Vec3* body_linear_velocity,
-                                            const math::Vec3* body_angular_velocity,
+                                            math::Vec3* body_angular_velocity,
                                             const math::Vec3* body_pseudo_lin_vel,
                                             const math::Vec3* body_pseudo_ang_vel,
                                             const float* body_inv_mass,
                                             const math::Transform* body_inertial_frame,
+                                            const math::Vec3* body_inv_inertia,
+                                            math::SymmetricMat3* body_world_inv_inertia,
+                                            float* gyro_residual,
+                                            uint32_t* gyro_iterations,
+                                            uint32_t* gyro_status,
+                                            uint32_t* env_status,
+                                            uint32_t bodies_per_env,
                                             uint32_t total_body_count,
                                             float dt) {
     const uint32_t body = blockIdx.x * blockDim.x + threadIdx.x;
     if (body >= total_body_count) {
         return;
     }
-    if (body_inv_mass[body] <= 0.0f) {
+    gyro_residual[body] = 0.0f;
+    gyro_iterations[body] = gyro_status[body] = 0u;
+    if (body_inv_mass[body] <= 0.0f) return;
+    math::Transform pose = body_pose[body];
+    const auto& frame = body_inertial_frame[body];
+    const math::Vec3 inv_i = body_inv_inertia[body];
+    const math::Quat principal = mg::QuatNormalizeRsqrt(mg::QuatMul(pose.rotation, frame.rotation), 1.0e-12f);
+    const math::Quat inverse = mg::MakeQuat(principal.w, -principal.x, -principal.y, -principal.z);
+    const math::Vec3 w0 = mg::RotateByQuatNormalized(inverse, body_angular_velocity[body]);
+    const GyroResult gyro = SolveFreeRotation(w0, inv_i, dt);
+    gyro_residual[body] = gyro.residual;
+    gyro_iterations[body] = gyro.iterations;
+    gyro_status[body] = gyro.status;
+    if (gyro.status != 0u) {
+        atomicOr(env_status + body / bodies_per_env, kEnvStatusGyroFailure);
         return;
     }
-    math::Transform pose = body_pose[body];
-    // Split impulses affect pose while persisted velocities remain physical.
+    const math::Vec3 momentum = mg::RotateByQuatNormalized(principal,
+        {w0.x / inv_i.x, w0.y / inv_i.y, w0.z / inv_i.z});
     math::Vec3 v = body_linear_velocity[body];
-    math::Vec3 w = body_angular_velocity[body];
+    const math::Vec3 w = mg::RotateByQuatNormalized(principal, gyro.midpoint);
+    const math::Vec3 center = BodyCenterOfMass(pose, frame);
+    const math::Quat dq = mg::MakeQuat(1.0f, 0.5f * dt * w.x, 0.5f * dt * w.y, 0.5f * dt * w.z);
+    math::Quat q = mg::QuatNormalizeRsqrt(mg::QuatMul(dq, pose.rotation), 1.0e-12f);
     if (body_pseudo_lin_vel != nullptr) {
-        const math::Vec3 vp = body_pseudo_lin_vel[body];
+        v += body_pseudo_lin_vel[body];
         const math::Vec3 wp = body_pseudo_ang_vel[body];
-        v.x += vp.x; v.y += vp.y; v.z += vp.z;
-        w.x += wp.x; w.y += wp.y; w.z += wp.z;
-    }
-    const math::Vec3 center = BodyCenterOfMass(pose, body_inertial_frame[body]);
-    math::Quat dq;
-    dq.w = 1.0f;
-    dq.x = 0.5f * w.x * dt;
-    dq.y = 0.5f * w.y * dt;
-    dq.z = 0.5f * w.z * dt;
-    // World angular velocity left-multiplies the body-to-world orientation.
-    math::Quat q = mg::QuatMul(dq, pose.rotation);
-    const float n = sqrtf(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
-    if (n < 1e-12f) {
-        q.w = 1.0f; q.x = 0.0f; q.y = 0.0f; q.z = 0.0f;
-    } else {
-        q.w /= n; q.x /= n; q.y /= n; q.z /= n;
+        const math::Quat pseudo = mg::MakeQuat(1.0f, 0.5f * dt * wp.x, 0.5f * dt * wp.y, 0.5f * dt * wp.z);
+        q = mg::QuatNormalizeRsqrt(mg::QuatMul(pseudo, q), 1.0e-12f);
     }
     pose.rotation = q;
-    const math::Vec3 offset = mg::RotateByQuatNormalized(q, body_inertial_frame[body].position);
+    const math::Vec3 offset = mg::RotateByQuatNormalized(q, frame.position);
     pose.position = mg::Sub(mg::Add(center, mg::Scale(v, dt)), offset);
     body_pose[body] = pose;
+    const auto inverse_inertia = BodyWorldInverseInertia(pose, frame, inv_i);
+    body_world_inv_inertia[body] = inverse_inertia;
+    body_angular_velocity[body] = inverse_inertia.Multiply(momentum);
 }
 
 // --- FkWorldPoses (port of articulation_contacts.cu UpdateWorldLinkPoses) ---
@@ -930,7 +948,7 @@ __device__ math::Transform RelativeTransform(const ArticulationDeviceState& stat
     return relative;
 }
 
-constexpr uint32_t kMaxOscDof = 18u;
+using phi::kMaxOscDof;
 constexpr uint32_t kOscTaskDim = 6u;
 
 // Fixed-order dense SPD helpers used by the opt-in OSC kernel. The controller
@@ -1603,6 +1621,11 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
     }
     // Advance free bodies using the velocities from the shared contact solve.
     if (p->total_body_count > 0u) {
+        if (p->env_count == 0u || p->total_body_count % p->env_count != 0u)
+            return Status::InvalidArgument;
+        LaunchCuda(ClearGyroStatusKernel,
+                   dim3((p->env_count + kAbaBlockSize - 1u) / kAbaBlockSize),
+                   dim3(kAbaBlockSize), 0u, stream, data.env_status, p->env_count);
         const uint32_t blocks =
             (p->total_body_count + kAbaBlockSize - 1u) / kAbaBlockSize;
         const math::Vec3* body_pseudo_lin =
@@ -1615,7 +1638,10 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
                    stream, data.body_pose, data.body_linear_velocity,
                    data.body_angular_velocity, body_pseudo_lin, body_pseudo_ang,
                    static_cast<const float*>(data.body_inv_mass),
-                   data.body_inertial_frame,
+                   data.body_inertial_frame, data.body_inv_inertia,
+                   data.body_world_inv_inertia, data.body_gyro_residual,
+                   data.body_gyro_iterations, data.body_gyro_status, data.env_status,
+                   p->total_body_count / p->env_count,
                    p->total_body_count, p->dt);
     }
     return LaunchOk(stream);

@@ -311,6 +311,8 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.body_pseudo_angular_velocity[body] = {};
         data.body_force[body] = {};
         data.body_torque[body] = {};
+        data.body_gyro_residual[body] = 0.0f;
+        data.body_gyro_iterations[body] = data.body_gyro_status[body] = 0u;
         data.mpm_body_reaction[body] = {};
         data.mpm_body_ang_reaction[body] = {};
     }
@@ -320,6 +322,10 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.particle_prev_pos[particle] = data.snapshot_particle_prev_pos[particle];
         data.particle_vel[particle] = data.snapshot_particle_vel[particle];
         data.particle_pseudo_vel[particle] = {};
+        if (p.has_particle_grid != 0u) {
+            data.grid_neighbor_count[particle] = data.grid_neighbor_offset[particle] = 0u;
+            data.grid_neighbor_attempted[particle] = 0u;
+        }
         if (data.particle_F != nullptr) {
             for (uint32_t component = 0u; component < 9u; ++component) {
                 data.particle_F[particle * 9u + component] = data.snapshot_particle_F[particle * 9u + component];
@@ -542,6 +548,7 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
     reset.base_link_count = p->total_link_count / envs;
     reset.body_count = p->total_body_count / envs;
     reset.particle_count = p->total_particle_count / envs;
+    reset.has_particle_grid = p->has_particle_grid;
     reset.lambda_stride = p->row_slot_count / envs;
     reset.contact_slot_count = p->contact_slot_count / envs;
     return OpResetEnvs(model, data, &reset, stream);

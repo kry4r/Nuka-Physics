@@ -46,6 +46,8 @@ class StudioRtRenderer;   // render/studio_beauty.hpp -- the offline RT beauty t
 
 namespace nuka::c_abi {
 
+nuka_result_t MapStatusToResult(phi::Status status) noexcept;
+
 struct DeviceRecord {
     // --- CUDA device ordinal (BUF-14) ---------------------------------------
     // The validated CUDA device this handle was created on. Read by the legacy

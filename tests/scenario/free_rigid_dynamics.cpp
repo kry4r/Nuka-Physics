@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <array>
+#include <limits>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -13,6 +15,7 @@
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_compose.hpp"
 #include "scene/scene_ir.hpp"
+#include "phi/articulation_contract.hpp"
 
 namespace {
 namespace nk = nuka::nk;
@@ -97,7 +100,332 @@ void ExpectVectorNear(Vec3 actual, Vec3 expected, float tolerance) {
     EXPECT_NEAR(actual.y, expected.y, tolerance);
     EXPECT_NEAR(actual.z, expected.z, tolerance);
 }
+
+Vec3 AngularMomentum(const Transform& pose, const Transform& frame, Vec3 inertia, Vec3 omega) {
+    const Quat principal = pose.rotation * frame.rotation;
+    const Vec3 local = principal.Conjugate().Rotate(omega);
+    return principal.Rotate({inertia.x * local.x, inertia.y * local.y, inertia.z * local.z});
+}
+
+std::array<double, 7> RotationReference(Vec3 inertia, Vec3 omega, Quat principal, double duration) {
+    using State = std::array<double, 7>;
+    State state{omega.x, omega.y, omega.z, principal.w, principal.x, principal.y, principal.z};
+    const double ix = inertia.x, iy = inertia.y, iz = inertia.z;
+    auto derivative = [&](const State& s) -> State {
+        return {(iy - iz) / ix * s[1] * s[2],
+                (iz - ix) / iy * s[2] * s[0],
+                (ix - iy) / iz * s[0] * s[1],
+                -0.5 * (s[4] * s[0] + s[5] * s[1] + s[6] * s[2]),
+                0.5 * (s[3] * s[0] + s[5] * s[2] - s[6] * s[1]),
+                0.5 * (s[3] * s[1] + s[6] * s[0] - s[4] * s[2]),
+                0.5 * (s[3] * s[2] + s[4] * s[1] - s[5] * s[0])};
+    };
+    auto offset = [](State a, const State& b, double h) {
+        for (size_t i = 0; i < a.size(); ++i) a[i] += h * b[i];
+        return a;
+    };
+    constexpr uint32_t steps = 40000u;
+    const double dt = duration / steps;
+    for (uint32_t i = 0; i < steps; ++i) {
+        const auto k1 = derivative(state);
+        const auto k2 = derivative(offset(state, k1, dt * 0.5));
+        const auto k3 = derivative(offset(state, k2, dt * 0.5));
+        const auto k4 = derivative(offset(state, k3, dt));
+        for (size_t j = 0; j < state.size(); ++j)
+            state[j] += dt / 6.0 * (k1[j] + 2.0 * k2[j] + 2.0 * k3[j] + k4[j]);
+    }
+    return state;
+}
 }  // namespace
+
+TEST(FreeRigidDynamics, FreeRotationConservesMomentumAndConvergesToTheReference) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (Quat rotation : {Quat::Identity(), Quat::FromAxisAngle({1, -2, 3}, 0.9f)}) {
+        scene::RigidBodyRecord body;
+        body.mass = 2.0f;
+        body.inertia = {0.4f, 0.7f, 0.9f};
+        body.local_transform.rotation = rotation * Quat::FromAxisAngle({2, 1, -1}, 0.6f);
+        body.inertial_transform.rotation = Quat::FromAxisAngle({3, -1, 2}, 0.7f);
+        body.inertial_transform.position = {0.02f, -0.03f, 0.01f};
+        const Quat principal = body.local_transform.rotation * body.inertial_transform.rotation;
+        const Vec3 local_omega{11.0f, 6.0f, -3.0f};
+        const Vec3 initial_omega = principal.Rotate(local_omega);
+        const Vec3 initial_momentum = AngularMomentum(body.local_transform,
+            body.inertial_transform, body.inertia, initial_omega);
+        const float energy = 0.5f * initial_momentum.Dot(initial_omega);
+        const auto reference = RotationReference(body.inertia, local_omega, principal, 2.0);
+        const Quat reference_principal{float(reference[3]), float(reference[4]),
+                                       float(reference[5]), float(reference[6])};
+        const Vec3 reference_omega = reference_principal.Rotate(
+            {float(reference[0]), float(reference[1]), float(reference[2])});
+        const Vec3 reference_axis = reference_principal.Rotate({1, 0, 0});
+        float previous_error = 0.0f;
+        for (uint32_t steps : {240u, 480u}) {
+            auto model = CookFreeBody(body, false);
+            model.body_init[0].angular_velocity = initial_omega;
+            auto config = Config();
+            config.dt = 2.0f / steps;
+            nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+            ASSERT_TRUE(world.Ready()) << world.CreationError();
+            float max_residual = 0.0f;
+            for (uint32_t step = 0u; step < steps; ++step) {
+                ASSERT_TRUE(world.Step().AllOk());
+                const auto status = Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u);
+                ASSERT_EQ(status, std::vector<uint32_t>(2u));
+                const auto residual = Read<float>(world, nk::FieldId::BodyGyroResidual, 2u);
+                max_residual = std::max(max_residual, residual[0]);
+            }
+            const auto poses = Read<Transform>(world, nk::FieldId::BodyPose, 2u);
+            const auto angular = Read<Vec3>(world, nk::FieldId::BodyAngularVelocity, 2u);
+            const Vec3 momentum = AngularMomentum(poses[0], body.inertial_transform, body.inertia, angular[0]);
+            const float momentum_error = (momentum - initial_momentum).Length() / initial_momentum.Length();
+            const float energy_error = std::fabs(0.5f * momentum.Dot(angular[0]) / energy - 1.0f);
+            const Quat final_principal = poses[0].rotation * body.inertial_transform.rotation;
+            const float error = (angular[0] - reference_omega).Length() +
+                                (final_principal.Rotate({1, 0, 0}) - reference_axis).Length();
+            EXPECT_LT(momentum_error, 3.0e-4f);
+            EXPECT_LT(energy_error, 5.0e-4f);
+            EXPECT_LE(max_residual, 1.0e-6f);
+            ExpectVectorNear(angular[0], angular[1], 0.0f);
+            if (previous_error > 0.0f) EXPECT_GT(previous_error / error, 3.2f);
+            previous_error = error;
+            std::fprintf(stderr, "[gyro-reference] steps=%u error=%g L_relative=%g energy_relative=%g residual=%g\n",
+                steps, error, momentum_error, energy_error, max_residual);
+
+            auto invalid = angular;
+            invalid[0].x = std::numeric_limits<float>::infinity();
+            ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyAngularVelocity,
+                                                   invalid.data(), invalid.size() * sizeof(Vec3)));
+            ASSERT_TRUE(world.Step().AllOk());
+            const auto status = Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u);
+            EXPECT_EQ(status[0], phi::kBodyGyroInvalidInput);
+            EXPECT_EQ(status[1], 0u);
+            const auto env_status = Read<uint32_t>(world, nk::FieldId::EnvStatus, 2u);
+            EXPECT_EQ(env_status[0] & phi::kEnvStatusGyroFailure, phi::kEnvStatusGyroFailure);
+            EXPECT_EQ(env_status[1], 0u);
+            ASSERT_EQ(world.Reset({1u}), phi::Status::Ok);
+            EXPECT_EQ(Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u), status);
+            ASSERT_EQ(world.Reset({0u}), phi::Status::Ok);
+            EXPECT_EQ(Read<uint32_t>(world, nk::FieldId::BodyGyroStatus, 2u), std::vector<uint32_t>(2u));
+        }
+    }
+}
+
+TEST(ParticleAerodynamics, SharedFacesAreDissipativeBoundedAndDeterministic) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (float coefficient : {0.0f, 1.0f, 1.0e6f}) {
+        scene::cook::XpbdCookInput input;
+        input.positions = {{0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}};
+        input.velocities = {{5, -3, 20}, {}, {-2, 4, 12}, {3, 1, -4}};
+        input.inv_mass = {1.0f, 0.0f, 2.0f, 5.0f};
+        input.aero_triangles = {{{0, 1, 2}}, {{0, 2, 3}}};
+        input.aero_drag_normal = coefficient;
+        input.aero_drag_tangent = coefficient * 0.1f;
+        input.aero_drag_max_dv = 0.5f;
+        nk::Model model;
+        scene::cook::CookXpbdParticles(model, 3u, input);
+        auto config = Config();
+        nk::World world(std::move(model), 3u, backend.device, backend.backend, config);
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        phi::AeroDragParams params{config.dt, input.aero_drag_normal, input.aero_drag_tangent,
+                                  input.aero_drag_max_dv, 6u, 12u};
+        const auto before = Read<Vec3>(world, nk::FieldId::ParticleVel, 12u);
+        ASSERT_EQ(world.DispatchOp(phi::NkOp::ParticleAeroDrag, &params), phi::Status::Ok);
+        const auto after = Read<Vec3>(world, nk::FieldId::ParticleVel, 12u);
+        double work = 0.0, energy_change = 0.0;
+        for (uint32_t p = 0u; p < 12u; ++p) {
+            const float inverse_mass = input.inv_mass[p % 4u];
+            if (inverse_mass == 0.0f || coefficient == 0.0f) EXPECT_EQ(before[p], after[p]);
+            if (inverse_mass == 0.0f) continue;
+            const auto delta = after[p] - before[p];
+            EXPECT_LE(delta.Length(), input.aero_drag_max_dv + 1.0e-5f);
+            work += before[p].Dot(delta) / inverse_mass;
+            energy_change += (after[p].LengthSq() - before[p].LengthSq()) * 0.5 / inverse_mass;
+        }
+        EXPECT_LE(work, 1.0e-5);
+        EXPECT_LE(energy_change, 1.0e-5);
+        for (uint32_t repeat = 0u; repeat < 5u; ++repeat) {
+            ASSERT_EQ(world.Reset(), phi::Status::Ok);
+            ASSERT_EQ(world.DispatchOp(phi::NkOp::ParticleAeroDrag, &params), phi::Status::Ok);
+            EXPECT_EQ(Read<Vec3>(world, nk::FieldId::ParticleVel, 12u), after);
+        }
+        std::fprintf(stderr, "[aero] coefficient=%g work=%g delta_energy=%g\n", coefficient, work, energy_change);
+    }
+}
+
+TEST(PipelineContracts, MissingOpsAndDispatchFailureStopAtTheBoundary) {
+    auto& real = Device();
+    if (!real.backend) GTEST_SKIP() << "no CUDA backend";
+    struct DeviceProxy {
+        const phi::DeviceI* iface;
+        phi::Device* real;
+        phi::NkOp missing = phi::NkOp::Count;
+        bool allocated = false;
+    };
+    struct BackendProxy {
+        const phi::BackendI* iface;
+        phi::Backend* real;
+        phi::NkOp failure = phi::NkOp::Count;
+        std::vector<phi::NkOp> calls;
+    };
+    auto device_iface = *phi::IfaceOf(real.device);
+    device_iface.supports_op = [](phi::Device* device, phi::NkOp op) {
+        const auto& proxy = *reinterpret_cast<DeviceProxy*>(device);
+        return op != proxy.missing && phi::DeviceSupportsOp(proxy.real, op);
+    };
+    device_iface.get_buffer_type = [](phi::Device* device) {
+        auto& proxy = *reinterpret_cast<DeviceProxy*>(device);
+        proxy.allocated = true;
+        return phi::DeviceBufferType(proxy.real);
+    };
+    auto backend_iface = *phi::IfaceOf(real.backend);
+    backend_iface.dispatch = [](phi::Backend* backend, const phi::ModelView& model,
+                                const phi::DataView& data, const phi::OpCall& call) {
+        auto& proxy = *reinterpret_cast<BackendProxy*>(backend);
+        proxy.calls.push_back(call.op);
+        if (call.op == proxy.failure) return phi::Status::Failed;
+        return phi::BackendDispatch(proxy.real, model, data, call);
+    };
+    backend_iface.synchronize = [](phi::Backend* backend) {
+        phi::BackendSynchronize(reinterpret_cast<BackendProxy*>(backend)->real);
+    };
+    DeviceProxy device{&device_iface, real.device};
+    BackendProxy backend{&backend_iface, real.backend};
+    auto* dev = reinterpret_cast<phi::Device*>(&device);
+    auto* be = reinterpret_cast<phi::Backend*>(&backend);
+    scene::RigidBodyRecord body;
+    body.mass = 1.0f;
+    body.inertia = {1, 1, 1};
+    device.missing = phi::NkOp::IntegratePosition;
+    nk::World missing(CookFreeBody(body, false), 1u, dev, be, Config());
+    EXPECT_FALSE(missing.Ready());
+    EXPECT_EQ(missing.CreationStatus(), phi::Status::Unsupported);
+    EXPECT_FALSE(missing.CreationError().empty());
+    EXPECT_FALSE(device.allocated);
+    EXPECT_TRUE(backend.calls.empty());
+    EXPECT_FALSE(missing.Step().AllOk());
+
+    device.missing = phi::NkOp::ReadoutContactWrench;
+    nk::World world(CookFreeBody(body, true), 1u, dev, be, Config());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    const size_t original_count = world.GetPipeline().Size();
+    EXPECT_EQ(world.FieldPtr(nk::FieldId::ContactForce), nullptr);
+    EXPECT_EQ(world.LastStatus(), phi::Status::Unsupported);
+    EXPECT_EQ(world.GetPipeline().Size(), original_count);
+    ASSERT_TRUE(world.Step().AllOk());
+    device.missing = phi::NkOp::Count;
+    backend.failure = phi::NkOp::ReadoutContactWrench;
+    EXPECT_EQ(world.FieldPtr(nk::FieldId::ContactForce), nullptr);
+    EXPECT_EQ(world.LastStatus(), phi::Status::Failed);
+    EXPECT_EQ(world.GetPipeline().Size(), original_count);
+    backend.failure = phi::NkOp::Count;
+    ASSERT_NE(world.FieldPtr(nk::FieldId::ContactForce), nullptr);
+    ASSERT_GT(world.GetPipeline().Size(), original_count);
+    backend.calls.clear();
+    backend.failure = phi::NkOp::IntegratePosition;
+    const auto result = world.Step();
+    EXPECT_FALSE(result.AllOk());
+    EXPECT_EQ(result.result, phi::Status::Failed);
+    EXPECT_EQ(result.failed_op, phi::NkOp::IntegratePosition);
+    EXPECT_EQ(backend.calls.back(), phi::NkOp::IntegratePosition);
+    EXPECT_EQ(std::count(backend.calls.begin(), backend.calls.end(), phi::NkOp::ReadoutContactWrench), 0);
+}
+
+TEST(PipelineContracts, TopologyValidationRejectsUnsupportedAndMalformedLayouts) {
+    const auto path = std::filesystem::path(NUKA_SOURCE_DIR) / "examples/scenes";
+    if (!std::filesystem::exists(path / "go2_stand.usda")) GTEST_SKIP();
+    const auto fixed = nuka::import::LoadUsd((path / "go2_stand.usda").string());
+    const auto floating = nuka::import::LoadUsd((path / "go2_float.usda").string());
+    scene::cook::CookToModelOptions options;
+    options.enable_contacts = false;
+    const auto same = scene::Compose(fixed, fixed, Transform{{2, 0, 0}, Quat::Identity()}, "second_");
+    auto supported = scene::cook::CookToModel(same, 1u, options).model;
+    std::string reason;
+    ASSERT_EQ(supported.ValidateTopology(&reason), phi::Status::Ok) << reason;
+    supported.articulation.articulation_link_offset[1] = 0u;
+    EXPECT_EQ(supported.ValidateTopology(&reason), phi::Status::InvalidArgument);
+    EXPECT_FALSE(reason.empty());
+    const auto mixed = scene::Compose(fixed, floating, Transform{{2, 0, 0}, Quat::Identity()}, "floating_");
+    auto unsupported = scene::cook::CookToModel(mixed, 1u, options).model;
+    EXPECT_EQ(unsupported.ValidateTopology(&reason), phi::Status::Unsupported);
+    EXPECT_FALSE(reason.empty());
+    auto single = scene::cook::CookToModel(fixed, 1u, options).model;
+    single.articulation.articulation_link_count.clear();
+    single.articulation.articulation_link_offset.clear();
+    ASSERT_EQ(single.ValidateTopology(&reason), phi::Status::Ok) << reason;
+    const auto parent = single.articulation.parent_link[1];
+    single.articulation.parent_link[1] = single.capacities.links_per_env;
+    EXPECT_EQ(single.ValidateTopology(&reason), phi::Status::InvalidArgument);
+    single.articulation.parent_link[1] = parent;
+    single.capacities.dofs_per_env = phi::kMaxArticulationDof + 1u;
+    EXPECT_EQ(single.ValidateTopology(&reason), phi::Status::Unsupported);
+}
+
+TEST(ParticleNeighborhood, EnvironmentPoolsMatchBruteForceAndIsolateOverflow) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    constexpr uint32_t particles = 40u;
+    scene::cook::PbfCookInput input;
+    for (uint32_t i = 0u; i < particles; ++i)
+        input.positions.push_back({0.001f * i, 0.0f, 0.5f});
+    input.velocities.resize(particles);
+    input.particle_mass = 0.001f;
+    input.rest_density = 1000.0f;
+    input.support_radius = 0.1f;
+    input.grid_min = {-0.1f, -0.1f, 0.4f};
+    input.grid_dims[0] = 80u;
+    input.grid_dims[1] = input.grid_dims[2] = 4u;
+    for (uint32_t capacity : {particles * (particles - 1u), particles * 20u}) {
+        nk::Model model;
+        scene::cook::CookPbfParticles(model, 2u, input);
+        model.capacities.neighbor_pool_capacity_per_env = capacity;
+        nk::World world(std::move(model), 2u, backend.device, backend.backend, Config());
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        auto positions = Read<Vec3>(world, nk::FieldId::ParticlePos, particles * 2u);
+        for (uint32_t i = 0u; i < particles; ++i) positions[particles + i].x = 0.2f * i;
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::ParticlePos,
+            positions.data(), positions.size() * sizeof(Vec3)));
+        phi::ParticleGridBuildParams params{};
+        bool found = false;
+        for (const auto& call : world.GetPipeline().Calls()) {
+            if (call.op == phi::NkOp::ParticleGridBuild) {
+                params = *static_cast<const phi::ParticleGridBuildParams*>(call.params);
+                found = true;
+            }
+        }
+        ASSERT_TRUE(found);
+        params.pos_source = phi::kGridPosSourceParticlePos;
+        ASSERT_EQ(world.DispatchOp(phi::NkOp::ParticleGridBuild, &params), phi::Status::Ok);
+        const auto attempted = Read<uint32_t>(world, nk::FieldId::GridNeighborAttempted, particles * 2u);
+        const auto retained = Read<uint32_t>(world, nk::FieldId::GridNeighborCount, particles * 2u);
+        const auto offsets = Read<uint32_t>(world, nk::FieldId::GridNeighborOffset, particles * 2u);
+        const auto pool = Read<uint32_t>(world, nk::FieldId::GridNeighborIdx, capacity * 2u);
+        const bool complete = capacity == particles * (particles - 1u);
+        for (uint32_t i = 0u; i < positions.size(); ++i) {
+            std::vector<uint32_t> expected;
+            const uint32_t start = i / particles * particles;
+            for (uint32_t j = start; j < start + particles; ++j)
+                if (i != j && (positions[i] - positions[j]).LengthSq() <= params.query_radius * params.query_radius)
+                    expected.push_back(j);
+            EXPECT_EQ(attempted[i], expected.size());
+            if (complete) EXPECT_EQ(retained[i], expected.size());
+            ASSERT_LE(retained[i], expected.size());
+            ASSERT_LE(offsets[i] + retained[i], (i / particles + 1u) * capacity);
+            for (uint32_t j = 0u; j < retained[i]; ++j) EXPECT_EQ(pool[offsets[i] + j], expected[j]);
+        }
+        const auto status = Read<uint32_t>(world, nk::FieldId::EnvStatus, 2u);
+        EXPECT_EQ(status[0], complete ? 0u : phi::kEnvStatusNeighborOverflow);
+        EXPECT_EQ(status[1], 0u);
+        ASSERT_EQ(world.Reset({1u}), phi::Status::Ok);
+        const auto restored = Read<uint32_t>(world, nk::FieldId::GridNeighborAttempted, particles * 2u);
+        for (uint32_t i = 0u; i < particles; ++i) {
+            EXPECT_EQ(restored[i], attempted[i]);
+            EXPECT_EQ(restored[particles + i], 0u);
+        }
+    }
+}
 
 TEST(FreeRigidDynamics, WorldAngularVelocityRotatesAboutTheAuthoredCenterOfMass) {
     auto& backend = Device();
@@ -243,13 +571,14 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
     for (bool force_static : {false, true}) {
         IslandMode mode(force_static);
         for (bool offset_center : {false, true}) {
+          for (uint16_t position_iterations : {0u, 4u}) {
             SCOPED_TRACE(::testing::Message() << "static=" << force_static
                          << " offset=" << offset_center);
             scene::RigidBodyRecord body;
             body.name = "free_body";
             body.mass = 0.5f;
             body.inertia = {0.003f, 0.007f, 0.011f};
-            body.local_transform.position = {0, 0, 0.0995f};
+            body.local_transform.position = {0, 0, 0.097f};
             body.local_transform.rotation = Quat::FromAxisAngle({1, 2, 3}, 1.05f);
             body.inertial_transform.rotation = Quat::FromAxisAngle({3, 1, 2}, 0.66f);
             if (offset_center) body.inertial_transform.position = {0.025f, -0.01f, 0.015f};
@@ -258,11 +587,14 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
             const auto capacity = model.capacities;
             const Vec3 incoming{0.2f, -0.1f, -0.2f};
             model.body_init[1].linear_velocity = incoming;
-            nk::World world(std::move(model), 2u, backend.device, backend.backend, Config());
+            auto config = Config();
+            config.pos_iters = position_iterations;
+            nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
             ASSERT_TRUE(world.Ready());
             ASSERT_TRUE(world.Step().AllOk());
             const auto linear = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
             const auto angular = Read<Vec3>(world, nk::FieldId::BodyAngularVelocity, 4u);
+            const auto poses = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
             const auto rows = Read<nk::NkRow>(world, nk::FieldId::Urows, 2u * capacity.max_rows_per_env);
             const auto impulses = Read<float>(world, nk::FieldId::Lambda, rows.size());
             const auto counts = Read<uint32_t>(world, nk::FieldId::UcontactCount,
@@ -270,8 +602,6 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
             const auto points = Read<Vec3>(world, nk::FieldId::UcontactPoint, 4u * counts.size());
             const Vec3 center = body.local_transform.position +
                 body.local_transform.rotation.Rotate(body.inertial_transform.position);
-            const Quat principal_world =
-                body.local_transform.rotation * body.inertial_transform.rotation;
             for (uint32_t env = 0; env < 2u; ++env) {
                 Vec3 impulse{}, torque{};
                 for (uint32_t slot = 0; slot < capacity.max_contacts_per_env; ++slot) {
@@ -293,13 +623,11 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
                     }
                 }
                 ASSERT_GT(impulse.LengthSq(), 1.0e-6f);
-                Vec3 local_torque = principal_world.Conjugate().Rotate(torque);
-                local_torque.x /= body.inertia.x;
-                local_torque.y /= body.inertia.y;
-                local_torque.z /= body.inertia.z;
                 ExpectVectorNear(linear[env * 2u + 1u], incoming + impulse / body.mass, 2.0e-5f);
-                ExpectVectorNear(angular[env * 2u + 1u], principal_world.Rotate(local_torque), 3.0e-5f);
+                ExpectVectorNear(AngularMomentum(poses[env * 2u + 1u], body.inertial_transform,
+                    body.inertia, angular[env * 2u + 1u]), torque, 3.0e-6f);
             }
+          }
         }
     }
 }

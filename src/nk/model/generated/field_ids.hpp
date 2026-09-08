@@ -156,8 +156,8 @@ enum class FieldId : uint16_t {
     GridCellStart,  // grid_cell_start (per:scalar arena:scratch owner:data count:max_grid_cells*env_count)
     GridCellEnd,  // grid_cell_end (per:scalar arena:scratch owner:data count:max_grid_cells*env_count)
     GridNeighborOffset,  // grid_neighbor_offset (per:particle arena:scratch owner:data)
-    GridNeighborCount,  // grid_neighbor_count (per:particle arena:scratch owner:data)
-    GridNeighborIdx,  // grid_neighbor_idx (per:particle arena:scratch owner:data elem:32)
+    GridNeighborCount,  // grid_neighbor_count (per:particle arena:scratch owner:data flags:[readout])
+    GridNeighborIdx,  // grid_neighbor_idx (per:scalar arena:scratch owner:data count:neighbor_pool_capacity*env_count)
     RngState,  // rng_state (per:env arena:persistent owner:data flags:[param])
     EnvStatus,  // env_status (per:env arena:scratch owner:data flags:[readout])
     ObsBuffer,  // obs_buffer (per:scalar arena:scratch owner:data count:obs_width*env_count flags:[readout])
@@ -275,6 +275,15 @@ enum class FieldId : uint16_t {
     ContactSideBKind,  // contact_side_b_kind (per:contact_slot arena:scratch owner:data flags:[readout])
     ContactSideAIndex,  // contact_side_a_index (per:contact_slot arena:scratch owner:data flags:[readout])
     ContactSideBIndex,  // contact_side_b_index (per:contact_slot arena:scratch owner:data flags:[readout])
+    AeroParticleOffset,  // aero_particle_offset (per:particle arena:persistent owner:model)
+    AeroParticleCount,  // aero_particle_count (per:particle arena:persistent owner:model)
+    AeroIncidentTri,  // aero_incident_tri (per:aero_tri arena:persistent owner:model elem:3)
+    AeroTriImpulse,  // aero_tri_impulse (per:aero_tri arena:scratch owner:data)
+    BodyGyroResidual,  // body_gyro_residual (per:body arena:scratch owner:data flags:[readout])
+    BodyGyroIterations,  // body_gyro_iterations (per:body arena:scratch owner:data flags:[readout])
+    BodyGyroStatus,  // body_gyro_status (per:body arena:scratch owner:data flags:[readout])
+    GridNeighborAttempted,  // grid_neighbor_attempted (per:particle arena:scratch owner:data flags:[readout])
+    GridNeighborScanOffset,  // grid_neighbor_scan_offset (per:particle arena:scratch owner:data)
     Count
 };
 

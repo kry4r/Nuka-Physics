@@ -105,6 +105,9 @@ cook::XpbdCookInput BuildPinnedMembrane(uint32_t n) {
     m.xpbd.iters = 8u;
     m.xpbd.distance_alpha = 1.0e-7f;
     m.xpbd.bend_alpha = 1.0e-4f;
+    m.xpbd.aero_drag_normal = 0.6f;
+    m.xpbd.aero_drag_tangent = 0.04f;
+    m.xpbd.aero_drag_max_dv = 0.5f;
     return cook::BuildClothXpbdInput(m);
 }
 

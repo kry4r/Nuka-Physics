@@ -90,8 +90,8 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
         // surface contract).
         void* ptr = record->world->FieldPtr(row->field_id);
         if (ptr == nullptr) {
-            // Field has no allocated storage in this Model (e.g. a contact/SDF
-            // field on a scene with that capacity == 0). Honest NOT_SUPPORTED.
+            if (record->world->LastStatus() != nuka::phi::Status::Ok)
+                return nuka::c_abi::MapStatusToResult(record->world->LastStatus());
             return NUKA_RESULT_NOT_SUPPORTED;
         }
         const uint64_t element_count =
@@ -136,6 +136,8 @@ nuka_result_t nuka_world_upload_field(nuka_world_handle world,
             return NUKA_RESULT_NOT_SUPPORTED;
         }
         if (record->world->FieldPtr(row->field_id) == nullptr) {
+            if (record->world->LastStatus() != nuka::phi::Status::Ok)
+                return nuka::c_abi::MapStatusToResult(record->world->LastStatus());
             return NUKA_RESULT_NOT_SUPPORTED;  // capacity-0 field on this scene.
         }
         const bool ok = record->world->GetData().UploadField(
@@ -177,6 +179,8 @@ nuka_result_t nuka_world_download_field(nuka_world_handle world,
             return NUKA_RESULT_NOT_SUPPORTED;
         }
         if (record->world->FieldPtr(row->field_id) == nullptr) {
+            if (record->world->LastStatus() != nuka::phi::Status::Ok)
+                return nuka::c_abi::MapStatusToResult(record->world->LastStatus());
             return NUKA_RESULT_NOT_SUPPORTED;
         }
         const bool ok = record->world->GetData().DownloadField(

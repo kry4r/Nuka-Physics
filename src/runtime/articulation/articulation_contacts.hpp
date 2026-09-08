@@ -325,7 +325,7 @@ struct ArticulatedContactRow {
 // (the launchers throw; the coresident worlds reject at construction) -- NEVER
 // a silent clamp. Raising the array sizes does not change any float op for
 // articulations within the old cap, so all <=18-DOF results stay byte-identical.
-constexpr uint32_t kMaxArticulationDof = 64u;
+using phi::kMaxArticulationDof;
 
 // Diffsim-tile DOF cap (18 = 6-DOF floating base + 12 revolute, e.g. a quadruped).
 // The contact solve itself now sizes by kMaxArticulationDof above; this constant

@@ -8,10 +8,12 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
+#include "phi/articulation_contract.hpp"
 
 namespace nuka::nk {
 
@@ -85,8 +87,19 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
     return 0u;
 }
 
+uint64_t ModelCapacities::NeighborPoolCapacity() const {
+    if (neighbor_pool_capacity_per_env != 0u) return neighbor_pool_capacity_per_env;
+    return static_cast<uint64_t>(particles_per_env) * phi::kDefaultParticleNeighborBudget;
+}
+
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    if (aero_tris_per_env == 0u &&
+        (id == FieldId::AeroParticleOffset || id == FieldId::AeroParticleCount))
+        return 0u;
+    if (grid_sort_scratch_bytes == 0u &&
+        (id == FieldId::GridNeighborAttempted || id == FieldId::GridNeighborScanOffset))
+        return 0u;
     // MPM transfer scratch is absent from pure XPBD/PBF worlds. The MPM op is not
     // emitted there, so these per-particle buffers must stay byte-inert just like
     // the scalar CUB workspace that owns their lifetime.
@@ -104,6 +117,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         return 0u;
     }
     if (lay.per == FieldPer::Scalar) {
+        if (id == FieldId::GridNeighborIdx)
+            return NeighborPoolCapacity() * static_cast<uint64_t>(env_count);
         // Symbolic scalar counts require an explicit field-specific extent.
         // Unresolved fields are rejected instead of allocating a smaller buffer.
         if (id == FieldId::MatBuckets) {
@@ -376,7 +391,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                 for (uint32_t k = 0; k < K; ++k) {
                     p[static_cast<size_t>(e) * K + k] =
                         k < a.articulation_link_count.size() ? a.articulation_link_count[k]
-                                                             : 0u;
+                                                             : (K == 1u ? L : 0u);
                 }
             }
             break;
@@ -747,6 +762,28 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, particles.aero_tri_area,
                          capacities.aero_tris_per_env, E, sizeof(float));
             break;
+        case FieldId::AeroParticleOffset: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t n = capacities.particles_per_env;
+            for (uint32_t e = 0; e < E; ++e)
+                for (uint32_t i = 0; i < particles.aero_particle_offset.size(); ++i)
+                    p[e * n + i] = particles.aero_particle_offset[i] +
+                                   e * capacities.aero_tris_per_env * 3u;
+            break;
+        }
+        case FieldId::AeroParticleCount:
+            StampPerLink(dst, particles.aero_particle_count,
+                         capacities.particles_per_env, E, sizeof(uint32_t));
+            break;
+        case FieldId::AeroIncidentTri: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            const uint32_t n = capacities.aero_tris_per_env * 3u;
+            for (uint32_t e = 0; e < E; ++e)
+                for (uint32_t i = 0; i < n; ++i)
+                    p[e * n + i] = particles.aero_incident_tri[i] +
+                                   e * capacities.aero_tris_per_env;
+            break;
+        }
         case FieldId::LinkGeomKind:
             // WP5/WP6: per-link collision primitive kind. Empty for non-dog-dog
             // cooks -> StampPerLink leaves the section zero (inactive sentinel),
@@ -926,6 +963,9 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::SmMass:                v.sm_mass = static_cast<float*>(p); break;
         case FieldId::AeroTriVerts:          v.aero_tri_verts = static_cast<uint32_t*>(p); break;
         case FieldId::AeroTriArea:           v.aero_tri_area = static_cast<float*>(p); break;
+        case FieldId::AeroParticleOffset:    v.aero_particle_offset = static_cast<uint32_t*>(p); break;
+        case FieldId::AeroParticleCount:     v.aero_particle_count = static_cast<uint32_t*>(p); break;
+        case FieldId::AeroIncidentTri:       v.aero_incident_tri = static_cast<uint32_t*>(p); break;
         case FieldId::DistColorSegments:     v.dist_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::BendColorSegments:     v.bend_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::VolColorSegments:      v.vol_color_segments = static_cast<uint32_t*>(p); break;
@@ -936,10 +976,152 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
 
 }  // namespace
 
+phi::Status Model::ValidateTopology(std::string* reason) const {
+    if (reason) reason->clear();
+    auto reject = [&](phi::Status status, const std::string& message) {
+        if (reason) *reason = message;
+        return status;
+    };
+    using phi::Status;
+    using Joint = phi::ArticulationJointType;
+    const auto& cap = capacities;
+    const auto& a = articulation;
+    const uint32_t n = cap.links_per_env, k = cap.articulations_per_env;
+    constexpr uint64_t limit = std::numeric_limits<uint32_t>::max();
+    if (cap.env_count == 0u)
+        return reject(Status::InvalidArgument, "environment count must be positive");
+    for (uint64_t count : {uint64_t(n), uint64_t(k), uint64_t(cap.bodies_per_env),
+                           uint64_t(cap.particles_per_env), uint64_t(cap.aero_tris_per_env) * 3u}) {
+        if (count * cap.env_count > limit)
+            return reject(Status::InvalidArgument, "topology exceeds 32-bit device indexing");
+    }
+    if (cap.dofs_per_env > phi::kMaxArticulationDof)
+        return reject(Status::Unsupported, "articulation DOF exceeds the solver capacity");
+    if (cap.NeighborPoolCapacity() * cap.env_count > limit)
+        return reject(Status::InvalidArgument, "neighbor pool exceeds 32-bit device indexing");
+    if (drive_mode == 4u && cap.dofs_per_env > phi::kMaxOscDof)
+        return reject(Status::Unsupported, "OSC DOF exceeds the controller capacity");
+    if (n == 0u && cap.dofs_per_env != 0u)
+        return reject(Status::InvalidArgument, "DOFs require articulation links");
+    if (n != 0u) {
+        if (k == 0u || a.link_count != n || a.articulation_count != k ||
+            a.joint_type.size() != n || a.parent_link.size() != n)
+            return reject(Status::InvalidArgument, "articulation topology counts disagree");
+        const bool implicit_span = k == 1u && a.articulation_link_count.empty() &&
+                                   a.articulation_link_offset.empty();
+        if (!implicit_span && (a.articulation_link_count.size() != k ||
+                               a.articulation_link_offset.size() != k))
+            return reject(Status::InvalidArgument, "articulation spans are incomplete");
+        if ((!a.base_poses.empty() && a.base_poses.size() != k) ||
+            (k > 1u && a.base_poses.size() != k) ||
+            (!a.link_to_articulation.empty() && a.link_to_articulation.size() != n))
+            return reject(Status::InvalidArgument, "articulation ownership tables are incomplete");
+        uint32_t covered = 0u;
+        const uint32_t reference_count = implicit_span ? n : a.articulation_link_count[0];
+        std::vector<uint32_t> expected_links, expected_components;
+        for (uint32_t tree = 0u; tree < k; ++tree) {
+            const uint32_t offset = implicit_span ? 0u : a.articulation_link_offset[tree];
+            const uint32_t count = implicit_span ? n : a.articulation_link_count[tree];
+            if (count == 0u || offset != covered || uint64_t(offset) + count > n)
+                return reject(Status::InvalidArgument, "articulation spans must cover links without gaps or overlap");
+            uint32_t dofs = 0u;
+            for (uint32_t local = 0u; local < count; ++local) {
+                const uint32_t link = offset + local;
+                const uint32_t parent = a.parent_link[link];
+                const auto type = static_cast<Joint>(a.joint_type[link]);
+                if ((local == 0u && parent != ~0u) || (local != 0u && parent >= local))
+                    return reject(Status::InvalidArgument, "parent must precede its child inside the same articulation");
+                if (!a.link_to_articulation.empty() && a.link_to_articulation[link] != tree)
+                    return reject(Status::InvalidArgument, "link owner disagrees with its articulation span");
+                uint32_t width = 0u;
+                switch (type) {
+                    case Joint::Fixed: break;
+                    case Joint::Revolute: case Joint::Prismatic: width = 1u; break;
+                    case Joint::FloatingBase:
+                        if (local != 0u)
+                            return reject(Status::InvalidArgument, "floating joint must be an articulation root");
+                        width = 6u;
+                        break;
+                    default: return reject(Status::Unsupported, "joint type is not supported by the articulation solver");
+                }
+                dofs += width;
+                if (tree == 0u) {
+                    for (uint32_t component = 0u; component < width; ++component) {
+                        expected_links.push_back(link);
+                        expected_components.push_back(width == 6u ? component : ~0u);
+                    }
+                }
+                if (tree > 0u && (count != reference_count ||
+                    a.joint_type[link] != a.joint_type[local] || parent != a.parent_link[local]))
+                    return reject(Status::Unsupported, "heterogeneous articulation topology requires independent DOF maps");
+            }
+            if (dofs != cap.dofs_per_env || dofs != a.dof_count)
+                return reject(Status::Unsupported, "actual articulation DOFs disagree with the shared DOF stride");
+            covered += count;
+        }
+        if (covered != n)
+            return reject(Status::InvalidArgument, "articulation spans leave uncovered links");
+        if ((!dof_to_link.empty() || !dof_to_component.empty()) &&
+            (dof_to_link != expected_links || dof_to_component != expected_components))
+            return reject(Status::InvalidArgument, "DOF map does not match the articulation joint layout");
+    }
+    if (body_init.size() > cap.bodies_per_env)
+        return reject(Status::InvalidArgument, "body state exceeds the declared topology");
+    for (const auto& body : body_init) {
+        if (!std::isfinite(body.inv_mass) || body.inv_mass < 0.0f)
+            return reject(Status::InvalidArgument, "body inverse mass must be finite and nonnegative");
+        if (body.inv_mass > 0.0f) {
+            for (float value : {body.inv_inertia.x, body.inv_inertia.y, body.inv_inertia.z}) {
+                if (!(value > 0.0f) || !std::isfinite(value) || !std::isfinite(1.0f / value))
+                    return reject(Status::InvalidArgument, "dynamic principal inertia must be finite and positive");
+            }
+        }
+    }
+    const auto& p = particles;
+    for (float value : {p.aero_drag_normal, p.aero_drag_tangent, p.aero_drag_max_dv})
+        if (!std::isfinite(value) || value < 0.0f)
+            return reject(Status::InvalidArgument, "aerodynamic coefficients must be finite and nonnegative");
+    if (p.aero_tri_area.size() != cap.aero_tris_per_env ||
+        p.aero_tri_verts.size() != uint64_t(cap.aero_tris_per_env) * 3u)
+        return reject(Status::InvalidArgument, "aerodynamic triangle counts disagree");
+    for (uint32_t t = 0; t < cap.aero_tris_per_env; ++t) {
+        const auto* v = p.aero_tri_verts.data() + t * 3u;
+        if (v[0] >= cap.particles_per_env || v[1] >= cap.particles_per_env ||
+            v[2] >= cap.particles_per_env || v[0] == v[1] || v[0] == v[2] || v[1] == v[2] ||
+            !std::isfinite(p.aero_tri_area[t]) || p.aero_tri_area[t] < 0.0f)
+            return reject(Status::InvalidArgument, "invalid aerodynamic triangle indices or area");
+    }
+    return Status::Ok;
+}
+
+void Model::BuildAeroAdjacency() {
+    auto& p = particles;
+    p.aero_particle_offset.clear();
+    p.aero_particle_count.clear();
+    p.aero_incident_tri.clear();
+    if (capacities.aero_tris_per_env == 0u) return;
+    p.aero_particle_count.assign(capacities.particles_per_env, 0u);
+    p.aero_particle_offset.resize(capacities.particles_per_env);
+    for (uint32_t vertex : p.aero_tri_verts) ++p.aero_particle_count[vertex];
+    uint32_t offset = 0u;
+    for (uint32_t i = 0u; i < capacities.particles_per_env; ++i) {
+        p.aero_particle_offset[i] = offset;
+        offset += p.aero_particle_count[i];
+    }
+    p.aero_incident_tri.resize(p.aero_tri_verts.size());
+    auto cursor = p.aero_particle_offset;
+    for (uint32_t t = 0u; t < capacities.aero_tris_per_env; ++t)
+        for (uint32_t j = 0u; j < 3u; ++j)
+            p.aero_incident_tri[cursor[p.aero_tri_verts[t * 3u + j]]++] = t;
+}
+
 phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     if (bt == nullptr || out_view == nullptr) {
         return phi::Status::Failed;
     }
+    const auto topology_status = ValidateTopology();
+    if (topology_status != phi::Status::Ok) return topology_status;
+    BuildAeroAdjacency();
     // Capacity contracts (loud-failure discipline): the cooked host tables MUST
     // fit their advertised capacities, else staging would SILENTLY drop the tail
     // (a truncated device model that simulates wrong with no diagnostic). The

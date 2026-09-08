@@ -14,6 +14,8 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "phi/backend.hpp"
@@ -40,9 +42,12 @@ struct StepResult {
     // Parallel to the Pipeline's OpCall list. status[i] is the dispatch result
     // of call i.
     std::vector<phi::Status> status;
+    phi::Status result = phi::Status::Failed;
+    phi::NkOp failed_op = phi::NkOp::Count;
 
     // Convenience aggregates.
     bool AllOk() const {
+        if (result != phi::Status::Ok) return false;
         for (phi::Status s : status) if (s != phi::Status::Ok) return false;
         return true;
     }
@@ -72,11 +77,12 @@ public:
     World& operator=(const World&) = delete;
 
     bool Ready() const { return ready_; }
+    phi::Status CreationStatus() const { return creation_status_; }
+    const std::string& CreationError() const { return creation_error_; }
+    phi::Status LastStatus() const { return last_status_; }
     uint32_t EnvCount() const { return model_.capacities.env_count; }
 
-    // Dispatch each OpCall in order; returns the per-op status vector (a
-    // healthy step is all-Ok — the Build-time supports_op filter already
-    // dropped ops the backend lacks).
+    // Dispatch in order and stop at the first host or launch failure.
     StepResult Step();
 
     // Plan path: build a CUDA-graph plan over the OpCall list once, then execute.
@@ -103,7 +109,7 @@ public:
     const phi::ModelView& ModelViewRef() const { return model_view_; }
     const phi::DataView&  DataViewRef()  const { return data_view_; }
 
-    const Pipeline& GetPipeline() const { return pipeline_; }
+    const Pipeline& GetPipeline() const { return *pipeline_; }
     const Model&    GetModel()    const { return model_; }
     Data&           GetData()     { return data_; }
 
@@ -124,11 +130,11 @@ private:
 
     // First external request for a readout output: emit the producing op from
     // now on (rebuild pipeline, drop the plan) + backfill it from the last solve.
-    void DemandReadout(FieldId id);
+    phi::Status DemandReadout(FieldId id);
 
     Model           model_;
     Data            data_;
-    Pipeline        pipeline_;
+    std::unique_ptr<Pipeline> pipeline_ = std::make_unique<Pipeline>();
     Pipeline::SolverConfig cfg_{};
     phi::Device*    device_ = nullptr;
     uint32_t        readout_demand_ = 0;
@@ -137,6 +143,9 @@ private:
     phi::DataView   data_view_{};
     phi::Plan*      plan_ = nullptr;
     bool            ready_ = false;
+    phi::Status     creation_status_ = phi::Status::Failed;
+    phi::Status     last_status_ = phi::Status::Ok;
+    std::string     creation_error_;
 
     // Reset/snapshot op params storage (stable addresses for dispatch).
     phi::ResetEnvsParams     reset_params_{};

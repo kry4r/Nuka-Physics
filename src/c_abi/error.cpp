@@ -21,7 +21,18 @@ HandleTable<nuka_world_t, WorldRecord>& WorldTable() {
     return table;
 }
 
+nuka_result_t MapStatusToResult(phi::Status status) noexcept {
+    switch (status) {
+        case phi::Status::Ok: return NUKA_RESULT_OK;
+        case phi::Status::Unsupported: return NUKA_RESULT_NOT_SUPPORTED;
+        case phi::Status::OutOfMemory: return NUKA_RESULT_OUT_OF_MEMORY;
+        case phi::Status::InvalidArgument: return NUKA_RESULT_INVALID_ARG;
+        default: return NUKA_RESULT_INTERNAL;
+    }
+}
+
 nuka_result_t MapExceptionToResult(const std::exception& error) noexcept {
+    if (dynamic_cast<const std::invalid_argument*>(&error)) return NUKA_RESULT_INVALID_ARG;
     const std::string message = error.what();
     if (message.find("cuda") != std::string::npos ||
         message.find("CUDA") != std::string::npos) {

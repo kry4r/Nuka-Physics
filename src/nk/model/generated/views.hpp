@@ -95,6 +95,9 @@ struct ModelView {
     float* joint_limit_lower = nullptr;  // per:link arena:persistent owner:model flags:[param]
     float* joint_limit_upper = nullptr;  // per:link arena:persistent owner:model flags:[param]
     uint8_t* joint_limit_flags = nullptr;  // per:link arena:persistent owner:model flags:[param]
+    uint32_t* aero_particle_offset = nullptr;  // per:particle arena:persistent owner:model
+    uint32_t* aero_particle_count = nullptr;  // per:particle arena:persistent owner:model
+    uint32_t* aero_incident_tri = nullptr;  // per:aero_tri arena:persistent owner:model elem:3
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena
@@ -198,8 +201,8 @@ struct DataView {
     uint32_t* grid_cell_start = nullptr;  // per:scalar arena:scratch owner:data count:max_grid_cells*env_count
     uint32_t* grid_cell_end = nullptr;  // per:scalar arena:scratch owner:data count:max_grid_cells*env_count
     uint32_t* grid_neighbor_offset = nullptr;  // per:particle arena:scratch owner:data
-    uint32_t* grid_neighbor_count = nullptr;  // per:particle arena:scratch owner:data
-    uint32_t* grid_neighbor_idx = nullptr;  // per:particle arena:scratch owner:data elem:32
+    uint32_t* grid_neighbor_count = nullptr;  // per:particle arena:scratch owner:data flags:[readout]
+    uint32_t* grid_neighbor_idx = nullptr;  // per:scalar arena:scratch owner:data count:neighbor_pool_capacity*env_count
     uint64_t* rng_state = nullptr;  // per:env arena:persistent owner:data flags:[param]
     uint32_t* env_status = nullptr;  // per:env arena:scratch owner:data flags:[readout]
     float* obs_buffer = nullptr;  // per:scalar arena:scratch owner:data count:obs_width*env_count flags:[readout]
@@ -300,6 +303,12 @@ struct DataView {
     uint32_t* contact_side_b_kind = nullptr;  // per:contact_slot arena:scratch owner:data flags:[readout]
     uint32_t* contact_side_a_index = nullptr;  // per:contact_slot arena:scratch owner:data flags:[readout]
     uint32_t* contact_side_b_index = nullptr;  // per:contact_slot arena:scratch owner:data flags:[readout]
+    ::nuka::math::Vec3* aero_tri_impulse = nullptr;  // per:aero_tri arena:scratch owner:data
+    float* body_gyro_residual = nullptr;  // per:body arena:scratch owner:data flags:[readout]
+    uint32_t* body_gyro_iterations = nullptr;  // per:body arena:scratch owner:data flags:[readout]
+    uint32_t* body_gyro_status = nullptr;  // per:body arena:scratch owner:data flags:[readout]
+    uint32_t* grid_neighbor_attempted = nullptr;  // per:particle arena:scratch owner:data flags:[readout]
+    uint64_t* grid_neighbor_scan_offset = nullptr;  // per:particle arena:scratch owner:data
 };
 
 } // namespace nuka::phi
