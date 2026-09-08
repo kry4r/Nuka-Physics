@@ -1,0 +1,79 @@
+{
+  "pi05_libero": {
+    "video": "docs/media/pi05_libero.mp4",
+    "gif": "docs/media/pi05_libero.gif",
+    "width": 1280,
+    "height": 720,
+    "fps": 20,
+    "seconds": 12,
+    "sha256": "1fa3710e234ef479e5ea579606bb8a8ebd38171b1abedc7d9b2c983017ea4a22",
+    "gif_width": 640,
+    "gif_height": 360,
+    "gif_fps": 12,
+    "capture": "Frames recorded during the policy rollout",
+    "seed": 20260828,
+    "checkpoint_manifest": "examples/vla/libero_spatial_pi05_manifest.json",
+    "model_sha256": "877b3ec1130548b69af7f8aeef3ec9d3fc7738040f0b9beb490857ec970997ae",
+    "engine_sha256": "44aa6ae9f71fdd16fdec503175ca06aa055a89b851a70223d154b59a19eea1c9",
+    "model_format": "full weights",
+    "control": {
+      "policy_action_shape": [
+        7
+      ],
+      "chunk_size": 50,
+      "execute_steps": 8,
+      "action_rate_hz": 20,
+      "physics_rate_hz": 500,
+      "position_scale_m": 0.05,
+      "rotation_scale_rad": 0.5,
+      "gripper": "-1 open, +1 closed",
+      "control_backend": "osc",
+      "render_quality": "high",
+      "adapter": "native 6D operational-space torque control"
+    },
+    "success": true,
+    "max_transport_drift_m": 0.0008449407397056003,
+    "longest_bilateral_grasp_seconds": 1.512,
+    "target_released": true,
+    "tail_plate_contact_fraction": 1.0,
+    "final_place_xy_error_m": 0.023948580026626587,
+    "overlap_audit": {
+      "body_a": "akita_black_bowl_1_main",
+      "body_b": "plate_1_main",
+      "samples": 6000,
+      "max_overlap_m": 0.0020862380202204224,
+      "max_overlap_time_s": 4.910000233212486,
+      "final_overlap_m": 0.0003224818202658738,
+      "tail_max_overlap_m": 0.00032248218840844577,
+      "deepest_box_pair": [
+        "akita_black_bowl_1_official_collision_40",
+        "plate_1_official_collision_1"
+      ],
+      "contract": "SAT minimum translation distance of authored collision boxes"
+    }
+  },
+  "g1_dance": {
+    "video": "docs/media/g1_dance.mp4",
+    "gif": "docs/media/g1_dance.gif",
+    "width": 960,
+    "height": 540,
+    "fps": 25,
+    "seconds": 20,
+    "sha256": "b7b10596f0c71abeb38c813d67eb9d63e7492914788c47724917150ca30fe4b4",
+    "gif_width": 640,
+    "gif_height": 360,
+    "gif_fps": 12,
+    "capture": "Frames recorded during the policy rollout",
+    "motion_manifest": "examples/motions/g1/manifest.json",
+    "mode": "pretrained_onnx_actor_160x29",
+    "physics_dt": 0.005,
+    "policy_hz": 50,
+    "control_backend": "engine_pd",
+    "finite": true,
+    "upright": true,
+    "dance_visible": true,
+    "root_height_min_m": 0.6876887679100037,
+    "joint_motion_span_mean_rad": 1.1445032358169556,
+    "joint_rmse_mean_rad": 0.21267883462179452
+  }
+}
