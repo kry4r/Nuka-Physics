@@ -161,14 +161,16 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_CONTACT_SIDE_B_KIND,   kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideBKind},
     {NUKA_FIELD_CONTACT_SIDE_A_INDEX,  kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideAIndex},
     {NUKA_FIELD_CONTACT_SIDE_B_INDEX,  kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideBIndex},
+    {NUKA_FIELD_BODY_FORCE,           kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyForce},
+    {NUKA_FIELD_BODY_TORQUE,          kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyTorque},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
-// The table covers the append-only public field range through actuator telemetry.
-static_assert(kDlpackFieldCount == 37u,
-              "dlpack_table must hold exactly the 37 public state fields");
+// Public field IDs remain append-only and match their table index.
+static_assert(kDlpackFieldCount == 39u,
+              "dlpack_table must hold exactly the 39 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

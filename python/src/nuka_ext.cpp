@@ -179,7 +179,8 @@ public:
                                     uint32_t solver_pos_iters,
                                     float solver_contact_margin,
                                     uint32_t solver_max_pairs,
-                                    float baumgarte_max_velocity) {
+                                    float baumgarte_max_velocity,
+                                    float gravity_x, float gravity_y, float gravity_z) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
         }
@@ -203,6 +204,9 @@ public:
         desc.scene_path = scene_path.c_str();
         desc.env_count = env_count;
         desc.fixed_dt = dt;
+        desc.gravity_x = gravity_x;
+        desc.gravity_y = gravity_y;
+        desc.gravity_z = gravity_z;
         // p01-W4: 0 = D1/Strong (default), 1 = D2/Weak. Plain uint8_t keeps the
         // desc C-compatible (the engine maps it to gpu::DeterminismLevel).
         desc.determinism = static_cast<uint8_t>(determinism);
@@ -1803,6 +1807,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("CONTACT_SIDE_B_KIND", NUKA_FIELD_CONTACT_SIDE_B_KIND)
         .value("CONTACT_SIDE_A_INDEX", NUKA_FIELD_CONTACT_SIDE_A_INDEX)
         .value("CONTACT_SIDE_B_INDEX", NUKA_FIELD_CONTACT_SIDE_B_INDEX)
+        .value("BODY_FORCE", NUKA_FIELD_BODY_FORCE)
+        .value("BODY_TORQUE", NUKA_FIELD_BODY_TORQUE)
         .export_values();
 
     nb::enum_<nuka_contact_side_kind_t>(m, "ContactSideKind")
@@ -1852,7 +1858,7 @@ NB_MODULE(_nuka_ext, m) {
                     "torch.cuda.current_stream().cuda_stream); 0 lets the engine "
                     "own a default stream. Device.create(0) is unchanged.")
         .def("close", &Device::close, "Destroy the device handle.")
-        .def("__enter__", [](Device& d) -> Device& { return d; })
+        .def("__enter__", [](Device& d) -> Device& { return d; }, nb::rv_policy::reference)
         .def("__exit__",
              [](Device& d, nb::object, nb::object, nb::object) { d.close(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
@@ -1862,7 +1868,7 @@ NB_MODULE(_nuka_ext, m) {
         .def("close", &StateCheckpoint::close, "Destroy the checkpoint handle.")
         .def("__enter__", [](StateCheckpoint& checkpoint) -> StateCheckpoint& {
             return checkpoint;
-        })
+        }, nb::rv_policy::reference)
         .def("__exit__",
              [](StateCheckpoint& checkpoint, nb::object, nb::object, nb::object) {
                  checkpoint.close();
@@ -1902,6 +1908,9 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("solver_contact_margin") = 0.0f,
                     nb::arg("solver_max_pairs") = uint32_t{0},
                     nb::arg("baumgarte_max_velocity") = 0.0f,
+                    nb::arg("gravity_x") = 0.0f,
+                    nb::arg("gravity_y") = 0.0f,
+                    nb::arg("gravity_z") = 0.0f,
                     nb::rv_policy::take_ownership,
                     "Create a batched world from a USDA scene. determinism "
                     "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
@@ -1941,7 +1950,8 @@ NB_MODULE(_nuka_ext, m) {
                     "solver_max_pairs (0 => bodies_per_env * 4, the broadphase "
                     "candidate-pair emission cap) and baumgarte_max_velocity (0.0 "
                     "keeps the cooked model default). Each zero leaves the engine "
-                    "default untouched.")
+                    "default untouched. gravity_x/y/z set world acceleration "
+                    "at creation; all-zero selects standard Earth gravity.")
         .def_static(
             "create_coupled_from_scene", &World::create_coupled_from_scene,
             nb::arg("device"), nb::arg("scene_path"), nb::arg("env_count") = 1u,
@@ -2266,7 +2276,7 @@ NB_MODULE(_nuka_ext, m) {
             "calf=-1.5, hip=0.1) -> a crouch; assign into DRIVE_TARGET[:, 1:]. A "
             "reserved 'entity=' kwarg is ignored (per-entity scoping arrives with the "
             "scene facade).")
-        .def("__enter__", [](World& w) -> World& { return w; })
+        .def("__enter__", [](World& w) -> World& { return w; }, nb::rv_policy::reference)
         .def("__exit__",
              [](World& w, nb::object, nb::object, nb::object) { w.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
@@ -2629,7 +2639,7 @@ NB_MODULE(_nuka_ext, m) {
              "gradient; grad_parameters is (link_count,) the dL/d(link mass) summed "
              "over steps. Bit-exact across two runs (D1).")
         .def("destroy", &Tape::destroy, "Destroy the tape.")
-        .def("__enter__", [](Tape& t) -> Tape& { return t; })
+        .def("__enter__", [](Tape& t) -> Tape& { return t; }, nb::rv_policy::reference)
         .def("__exit__",
              [](Tape& t, nb::object, nb::object, nb::object) { t.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
@@ -2666,7 +2676,7 @@ NB_MODULE(_nuka_ext, m) {
         .def("destroy", &Recorder::destroy, "Destroy the recorder.")
         .def_prop_ro("frame_count", &Recorder::frame_count,
                      "Total frames captured so far on this recorder.")
-        .def("__enter__", [](Recorder& r) -> Recorder& { return r; })
+        .def("__enter__", [](Recorder& r) -> Recorder& { return r; }, nb::rv_policy::reference)
         .def("__exit__",
              [](Recorder& r, nb::object, nb::object, nb::object) { r.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
@@ -2724,7 +2734,7 @@ NB_MODULE(_nuka_ext, m) {
         .def("save", &Scene::save, nb::arg("nks_path"),
              "Save the scene to `nks_path` (+ a sibling <base>.nka).")
         .def("destroy", &Scene::destroy, "Destroy the scene handle.")
-        .def("__enter__", [](Scene& s) -> Scene& { return s; })
+        .def("__enter__", [](Scene& s) -> Scene& { return s; }, nb::rv_policy::reference)
         .def("__exit__",
              [](Scene& s, nb::object, nb::object, nb::object) { s.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
@@ -2899,7 +2909,7 @@ NB_MODULE(_nuka_ext, m) {
              "environment, terrain, and composed articulations all round-trip and "
              "cook back through SceneBuilder.create(path).build().")
         .def("destroy", &SceneBuilder::destroy, "Destroy the scene-builder handle.")
-        .def("__enter__", [](SceneBuilder& b) -> SceneBuilder& { return b; })
+        .def("__enter__", [](SceneBuilder& b) -> SceneBuilder& { return b; }, nb::rv_policy::reference)
         .def("__exit__",
              [](SceneBuilder& b, nb::object, nb::object, nb::object) { b.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),

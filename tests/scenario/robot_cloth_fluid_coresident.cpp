@@ -76,7 +76,7 @@ Backend GetBackend() {
 nk::Pipeline::SolverConfig Cfg() {
     nk::Pipeline::SolverConfig cfg;
     cfg.dt = 1.0f / 240.0f;
-    cfg.gravity[0] = 0.0f; cfg.gravity[1] = 0.0f; cfg.gravity[2] = -9.81f;
+    cfg.gravity[0] = 0.06f; cfg.gravity[1] = -0.04f; cfg.gravity[2] = -9.81f;
     cfg.contact_margin = 0.0f;
     // A big velocity budget: a heavy robot link vs light particles needs PGS
     // iterations to transmit momentum without the foot tunnelling the medium.
@@ -181,7 +181,9 @@ using PipelineState = std::vector<std::vector<uint8_t>>;
 PipelineState ReadPipelineState(nk::World& world) {
     PipelineState state;
     for (auto field : {nk::FieldId::BasePose, nk::FieldId::Q, nk::FieldId::Qdot,
-                      nk::FieldId::LinkVelocity, nk::FieldId::ParticlePos,
+                      nk::FieldId::LinkVelocity, nk::FieldId::BodyPose,
+                      nk::FieldId::BodyLinearVelocity, nk::FieldId::BodyAngularVelocity,
+                      nk::FieldId::ParticlePos,
                       nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel}) {
         const auto& segments = world.GetData().Segments();
         const auto segment = std::find_if(segments.begin(), segments.end(),
@@ -235,8 +237,21 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
     cook::CookToModelOptions opt;
     opt.contact_family = cook::CookContactFamily::PairDriven;
 
-    auto cook_go2 = [&]() -> nk::Model {
+    auto cook_go2 = [&](bool with_free_body = false) -> nk::Model {
         nuka::scene::SceneIR s = nuka::import::LoadUsd(Go2ScenePath().string());
+        if (with_free_body) {
+            nuka::scene::RigidBodyRecord body;
+            body.name = "free_body";
+            body.mass = 2.0f;
+            body.inertia = {0.03f, 0.05f, 0.07f};
+            body.local_transform.position = {3.0f, 2.0f, 4.0f};
+            body.inertial_transform.position = {0.01f, -0.015f, 0.02f};
+            nuka::scene::CollisionShapeRecord shape;
+            shape.body_id = s.AddRigidBody(body);
+            shape.type = nuka::scene::ShapeType::Sphere;
+            shape.radius = 0.05f;
+            s.AddCollisionShape(shape);
+        }
         nk::Model m = cook::CookToModel(s, 1, opt).model;
         // Generous rigid candidate budget for the Go2 collidables (links + base);
         // CookSoftFluidParticles grows a DISJOINT particle reserve above this.
@@ -345,7 +360,7 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
     };
     auto run_scene = [&](bool patch_present) -> Run {
         Run out;
-        nk::Model m = cook_go2();
+        nk::Model m = cook_go2(true);
 
         cook::XpbdCookInput cloth = BuildCloth(front_centre.x, front_centre.y, cloth_z);
         cook::PbfCookInput pool = BuildPool(rear_foot.x, rear_foot.y, pool_floor);
@@ -361,8 +376,20 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         const uint32_t n_soft = m.particles.n_soft_particles;
         const uint32_t P = m.capacities.particles_per_env;
         const uint32_t rows = m.capacities.max_rows_per_env;
+        const uint32_t bodies = m.capacities.bodies_per_env;
+        const auto free_body = std::find_if(m.body_init.begin(), m.body_init.end(),
+            [](const auto& body) { return body.inv_mass > 0.0f; });
+        EXPECT_NE(free_body, m.body_init.end());
+        if (free_body == m.body_init.end()) { out.finite = false; return out; }
+        const uint32_t free_index = static_cast<uint32_t>(free_body - m.body_init.begin());
+        const float free_inv_mass = free_body->inv_mass;
+        const Vec3 initial_com = free_body->pose.TransformPoint(free_body->inertial_frame.position);
+        const Vec3 com_offset = free_body->inertial_frame.position;
+        const auto config = Cfg();
+        const Vec3 gravity{config.gravity[0], config.gravity[1], config.gravity[2]};
+        const Vec3 applied_force{0.3f, -0.2f, 0.4f};
 
-        nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
+        nk::World w(std::move(m), 1u, b.dev, b.backend, config);
         EXPECT_TRUE(w.Ready());
         if (!w.Ready()) { out.finite = false; return out; }
         nk::Data& d = w.GetData();
@@ -372,6 +399,14 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         std::vector<float> targets(L);
         EXPECT_TRUE(d.DownloadField(nk::FieldId::DriveTarget, targets.data(), targets.size() * sizeof(float)));
         EXPECT_TRUE(d.UploadField(nk::FieldId::DriveTarget, targets.data(), targets.size() * sizeof(float)));
+        auto apply_wrench = [&]() {
+            std::vector<Vec3> forces(bodies), torques(bodies);
+            forces[free_index] = applied_force;
+            torques[free_index] = {0.01f, -0.02f, 0.03f};
+            EXPECT_TRUE(d.UploadField(nk::FieldId::BodyForce, forces.data(), forces.size() * sizeof(Vec3)));
+            EXPECT_TRUE(d.UploadField(nk::FieldId::BodyTorque, torques.data(), torques.size() * sizeof(Vec3)));
+        };
+        apply_wrench();
         std::vector<nk::NkRow> urows(rows);
         std::vector<float> lambda(rows, 0.0f);
         std::vector<Vec3> p;
@@ -382,6 +417,20 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
                 return out;
             }
             if (s + 1u == replay_steps) first_steps = ReadPipelineState(w);
+            if (s == 0u) {
+                std::vector<Vec3> forces(bodies), torques(bodies), velocity(bodies), omega(bodies);
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyForce, forces.data(), bodies * sizeof(Vec3)));
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyTorque, torques.data(), bodies * sizeof(Vec3)));
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyLinearVelocity, velocity.data(), bodies * sizeof(Vec3)));
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyAngularVelocity, omega.data(), bodies * sizeof(Vec3)));
+                EXPECT_EQ(forces, std::vector<Vec3>(bodies));
+                EXPECT_EQ(torques, std::vector<Vec3>(bodies));
+                const Vec3 expected = (gravity + applied_force * free_inv_mass) * config.dt;
+                EXPECT_NEAR(velocity[free_index].x, expected.x, 1.0e-6f);
+                EXPECT_NEAR(velocity[free_index].y, expected.y, 1.0e-6f);
+                EXPECT_NEAR(velocity[free_index].z, expected.z, 1.0e-6f);
+                EXPECT_GT(omega[free_index].LengthSq(), 1.0e-7f);
+            }
             if (!patch_present || s < kSettleSteps) continue;
             // Capture the pool free surface / pocket at the first hold step (the
             // settled baseline) then track its max surface over the hold window.
@@ -439,6 +488,23 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         EXPECT_TRUE(d.DownloadField(nk::FieldId::Qdot, out.qdot.data(), L * sizeof(float)));
         for (float value : out.q) out.finite = out.finite && std::isfinite(value);
         for (float value : out.qdot) out.finite = out.finite && std::isfinite(value);
+        std::vector<Vec3> free_velocity(bodies);
+        std::vector<Transform> body_poses(bodies);
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyLinearVelocity, free_velocity.data(), bodies * sizeof(Vec3)));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyPose, body_poses.data(), bodies * sizeof(Transform)));
+        const float steps = static_cast<float>(kSettleSteps + kHoldSteps);
+        const Vec3 expected_velocity = gravity * (steps * config.dt) +
+            applied_force * (free_inv_mass * config.dt);
+        const Vec3 expected_com = initial_com +
+            gravity * (0.5f * steps * (steps + 1.0f) * config.dt * config.dt) +
+            applied_force * (free_inv_mass * steps * config.dt * config.dt);
+        const Vec3 actual_com = body_poses[free_index].TransformPoint(com_offset);
+        EXPECT_NEAR(free_velocity[free_index].x, expected_velocity.x, 2.0e-4f);
+        EXPECT_NEAR(free_velocity[free_index].y, expected_velocity.y, 2.0e-4f);
+        EXPECT_NEAR(free_velocity[free_index].z, expected_velocity.z, 2.0e-4f);
+        EXPECT_NEAR(actual_com.x, expected_com.x, 2.0e-3f);
+        EXPECT_NEAR(actual_com.y, expected_com.y, 2.0e-3f);
+        EXPECT_NEAR(actual_com.z, expected_com.z, 2.0e-3f);
         DownloadParticles(w, &p);
         for (const Vec3& q : p)
             if (!(std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z)))
@@ -460,6 +526,7 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
                 uint32_t contact_count = ~0u;
                 EXPECT_TRUE(d.DownloadField(nk::FieldId::ContactCount, &contact_count, sizeof(contact_count)));
                 EXPECT_EQ(contact_count, 0u);
+                apply_wrench();
                 for (uint32_t s = 0u; s < replay_steps; ++s) EXPECT_TRUE(w.Step().AllOk());
                 EXPECT_EQ(ReadPipelineState(w), first_steps);
             }

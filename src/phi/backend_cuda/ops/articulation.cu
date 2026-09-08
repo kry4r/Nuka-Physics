@@ -234,9 +234,11 @@ __device__ void MotionSubspaceForJoint(ArticulationJointType type,
     }
 }
 
-__device__ void GravityAcceleration(float gravity_z, float* out) {
+__device__ void GravityAcceleration(math::Vec3 gravity, float* out) {
     Zero6(out);
-    out[5] = -gravity_z;
+    out[3] = -gravity.x;
+    out[4] = -gravity.y;
+    out[5] = -gravity.z;
 }
 
 __device__ math::Vec3 RotateByQuatInverse(math::Quat q, math::Vec3 v) {
@@ -308,8 +310,7 @@ __device__ LinkSpatialTransform JointTransform(const ArticulationDeviceState& st
     return MakeMotionTransform(Mat3Transpose(rotation), translation);
 }
 
-__global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
-                                         float gravity_z) {
+__global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
@@ -386,7 +387,6 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
         state.joint_force[link] = 0.0f;
         Zero6(state.link_u_spatial[link].p);
     }
-    (void)gravity_z;
 }
 
 __global__ void AbaPass2ArticulatedInertiaKernel(ArticulationDeviceState state) {
@@ -470,7 +470,7 @@ __global__ void AbaPass2ArticulatedInertiaKernel(ArticulationDeviceState state) 
 }
 
 __global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
-                                           float gravity_z) {
+                                           math::Vec3 gravity) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
@@ -482,8 +482,7 @@ __global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
 
-        // T8a: free-floating root (see featherstone_aba.cu for the gravity
-        // bookkeeping rationale).
+        // Uniform gravity is added to floating-root velocity after this bias solve.
         if (state.parent_link[link] == kInvalidLink &&
             state.joint_type[link] == ArticulationJointType::FloatingBase) {
             float neg_p[6];
@@ -495,7 +494,6 @@ __global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
             Solve6x6Ldlt(state.link_articulated_I[link].Ia, neg_p, a_free);
             ArrayToAccel(a_free, &state.link_acceleration[link]);
             state.qddot[link] = 0.0f;
-            (void)gravity_z;
             continue;
         }
 
@@ -506,7 +504,9 @@ __global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
                             state.link_acceleration[offset + parent].a,
                             parent_accel);
         } else {
-            GravityAcceleration(gravity_z, parent_accel);
+            float world_accel[6];
+            GravityAcceleration(gravity, world_accel);
+            TransformMotion(state.link_xup[link], world_accel, parent_accel);
         }
 
         float accel[6];
@@ -579,7 +579,7 @@ __forceinline__ __device__ math::Quat QuatNormalizeForward(math::Quat q) {
 
 __global__ void IntegrateFloatingBaseVelocityKernel(ArticulationDeviceState state,
                                                     float dt,
-                                                    float gravity_z) {
+                                                    math::Vec3 gravity) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
@@ -591,7 +591,7 @@ __global__ void IntegrateFloatingBaseVelocityKernel(ArticulationDeviceState stat
         return;
     }
     float g_world_arr[6];
-    GravityAcceleration(gravity_z, g_world_arr);
+    GravityAcceleration(gravity, g_world_arr);
     const math::Quat base_rot = state.base_pose[articulation].rotation;
     const math::Vec3 g_body =
         RotateByQuatInverse(base_rot, MakeVec3(g_world_arr[3], g_world_arr[4],
@@ -778,25 +778,33 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
 
 // The world inertia tensor is refreshed before any contact impulses are applied.
 __global__ void BodyIntegrateVelocityKernel(math::Vec3* body_linear_velocity,
+                                      math::Vec3* body_angular_velocity,
+                                      math::Vec3* body_force,
+                                      math::Vec3* body_torque,
                                       const float* body_inv_mass,
                                       const math::Transform* body_pose,
                                       const math::Transform* body_inertial_frame,
                                       const math::Vec3* body_inv_inertia,
                                       math::SymmetricMat3* body_world_inv_inertia,
                                       uint32_t total_body_count,
-                                      float gravity_z,
+                                      math::Vec3 gravity,
                                       float dt) {
     const uint32_t body = blockIdx.x * blockDim.x + threadIdx.x;
     if (body >= total_body_count) {
         return;
     }
+    const math::Vec3 force = body_force[body];
+    const math::Vec3 torque = body_torque[body];
+    body_force[body] = {};
+    body_torque[body] = {};
     if (body_inv_mass[body] <= 0.0f) {
         body_world_inv_inertia[body] = math::SymmetricMat3{};
         return;
     }
     body_world_inv_inertia[body] = BodyWorldInverseInertia(
         body_pose[body], body_inertial_frame[body], body_inv_inertia[body]);
-    body_linear_velocity[body].z += gravity_z * dt;
+    body_linear_velocity[body] += (gravity + force * body_inv_mass[body]) * dt;
+    body_angular_velocity[body] += body_world_inv_inertia[body].Multiply(torque) * dt;
 }
 
 // Advance the COM and reconstruct the authored body frame after rotation.
@@ -1491,12 +1499,12 @@ Status OpAbaForward(const ModelView& model, const DataView& data,
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, p->total_link_count, p->articulation_count);
-    const float gravity_z = p->gravity[2];
+    const math::Vec3 gravity{p->gravity[0], p->gravity[1], p->gravity[2]};
     dim3 grid(p->articulation_count);
     dim3 block(kAbaBlockSize);
-    LaunchCuda(AbaPass1KinematicsKernel, grid, block, 0u, stream, state, gravity_z);
+    LaunchCuda(AbaPass1KinematicsKernel, grid, block, 0u, stream, state);
     LaunchCuda(AbaPass2ArticulatedInertiaKernel, grid, block, 0u, stream, state);
-    LaunchCuda(AbaPass3AccelerationKernel, grid, block, 0u, stream, state, gravity_z);
+    LaunchCuda(AbaPass3AccelerationKernel, grid, block, 0u, stream, state, gravity);
     return LaunchOk(stream);
 }
 
@@ -1509,6 +1517,7 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
     if (p->dt <= 0.0f) {
         return Status::Ok;
     }
+    const math::Vec3 gravity{p->gravity[0], p->gravity[1], p->gravity[2]};
     if (p->total_link_count > 0u) {
         const ArticulationDeviceState state = MakeArticulationDeviceState(
             model, data, p->total_link_count, p->articulation_count);
@@ -1521,7 +1530,7 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
                    dim3(kAbaBlockSize), 0u, stream, state, p->dt);
         if (p->articulation_count > 0u) {
             LaunchCuda(IntegrateFloatingBaseVelocityKernel, dim3(p->articulation_count),
-                       dim3(kAbaBlockSize), 0u, stream, state, p->dt, p->gravity_z);
+                       dim3(kAbaBlockSize), 0u, stream, state, p->dt, gravity);
         }
     }
     // Free-body inertia and velocity are updated before the shared contact solve.
@@ -1529,11 +1538,12 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
         const uint32_t blocks =
             (p->total_body_count + kAbaBlockSize - 1u) / kAbaBlockSize;
         LaunchCuda(BodyIntegrateVelocityKernel, dim3(blocks), dim3(kAbaBlockSize), 0u,
-                   stream, data.body_linear_velocity,
+                   stream, data.body_linear_velocity, data.body_angular_velocity,
+                   data.body_force, data.body_torque,
                    static_cast<const float*>(data.body_inv_mass),
                    data.body_pose, data.body_inertial_frame, data.body_inv_inertia,
                    data.body_world_inv_inertia,
-                   p->total_body_count, p->gravity_z, p->dt);
+                   p->total_body_count, gravity, p->dt);
     }
     return LaunchOk(stream);
 }

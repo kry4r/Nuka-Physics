@@ -366,11 +366,7 @@ bool World::SeedInitialState() {
     }
 
     if (L == 0) {
-        // No articulation, but the world may still have movable BODIES (e.g. a
-        // settled cup-on-table) or particles. The body + particle state was
-        // already seeded above, and snapshot_params_ carries both counts, so
-        // SnapshotState captures the body and particle slices — Reset restores
-        // them. When there is nothing per-env, SnapshotState is a genuine no-op.
+        if (RefreshPoses(0u) != phi::Status::Ok) return false;
         return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) ==
                phi::Status::Ok;
     }
@@ -451,8 +447,8 @@ bool World::SeedInitialState() {
             return false;
         }
     }
-    // Device snapshot of the seeded initial state (the Reset restore source —
-    // the legacy creation-time snapshot 1:1).
+    // Creation and reset expose the same FK and collision proxy poses.
+    if (RefreshPoses(0u) != phi::Status::Ok) return false;
     return DispatchOp(phi::NkOp::SnapshotState, &snapshot_params_) == phi::Status::Ok;
 }
 
@@ -520,19 +516,24 @@ phi::Status World::Reset(const std::vector<uint32_t>& env_ids) {
         ? DispatchOp(phi::NkOp::RestoreState, &restore_params_)
         : DispatchOp(phi::NkOp::ResetEnvs, &reset_params_);
     if (status != phi::Status::Ok) return status;
+    return RefreshPoses(reset_params_.count);
+}
 
-    fk_params_.selected_env_count = reset_params_.count;
+phi::Status World::RefreshPoses(uint32_t selected_env_count) {
+    fk_params_.selected_env_count = selected_env_count;
     if (fk_params_.total_link_count > 0u) {
-        status = DispatchOp(phi::NkOp::FkWorldPoses, &fk_params_);
+        const auto status = DispatchOp(phi::NkOp::FkWorldPoses, &fk_params_);
         if (status != phi::Status::Ok) return status;
     }
-    for (const auto& call : pipeline_.Calls()) {
-        if (call.op != phi::NkOp::SyncLinkBodyPose) continue;
-        auto params = *static_cast<const phi::SyncLinkBodyPoseParams*>(call.params);
-        params.selected_env_count = reset_params_.count;
-        return DispatchOp(phi::NkOp::SyncLinkBodyPose, &params);
-    }
-    return phi::Status::Ok;
+    const auto& capacity = model_.capacities;
+    if (capacity.bodies_per_env == 0u) return phi::Status::Ok;
+    phi::SyncLinkBodyPoseParams params{};
+    params.family = phi::kContactFamilyPairDriven;
+    params.env_count = capacity.env_count;
+    params.links_per_env = capacity.links_per_env;
+    params.bodies_per_env = capacity.bodies_per_env;
+    params.selected_env_count = selected_env_count;
+    return DispatchOp(phi::NkOp::SyncLinkBodyPose, &params);
 }
 
 phi::Status World::DispatchOp(phi::NkOp op, const void* params) {

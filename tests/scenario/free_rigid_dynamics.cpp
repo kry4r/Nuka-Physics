@@ -2,13 +2,16 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
+#include "import/usd_importer.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "scene/cook/cook_to_model.hpp"
+#include "scene/scene_compose.hpp"
 #include "scene/scene_ir.hpp"
 
 namespace {
@@ -131,6 +134,106 @@ TEST(FreeRigidDynamics, WorldAngularVelocityRotatesAboutTheAuthoredCenterOfMass)
             EXPECT_NEAR(pose.rotation.y, expected_rotation.y, 2.0e-6f);
             EXPECT_NEAR(pose.rotation.z, expected_rotation.z, 2.0e-6f);
         }
+    }
+}
+
+TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (Quat rotation : {Quat::Identity(), Quat::FromAxisAngle({1, 2, -3}, 1.1f)}) {
+        scene::RigidBodyRecord body;
+        body.name = "free_body";
+        body.mass = 2.0f;
+        body.inertia = {0.4f, 0.7f, 1.2f};
+        body.local_transform.position = rotation.Rotate({0.3f, -0.4f, 1.5f});
+        body.local_transform.rotation = rotation * Quat::FromAxisAngle({2, 1, 3}, 0.6f);
+        body.inertial_transform.position = {0.04f, -0.02f, 0.01f};
+        body.inertial_transform.rotation = Quat::FromAxisAngle({3, -2, 1}, 0.7f);
+        auto config = Config();
+        config.dt = 0.001f;
+        const Vec3 gravity = rotation.Rotate({1.7f, -2.3f, -8.1f});
+        config.gravity[0] = gravity.x;
+        config.gravity[1] = gravity.y;
+        config.gravity[2] = gravity.z;
+        const Vec3 force = rotation.Rotate({0.7f, -0.9f, 1.1f});
+        const Vec3 torque = rotation.Rotate(Vec3{0.2f, -0.3f, 0.1f}.Cross({0.7f, -0.9f, 1.1f}));
+        nk::World world(CookFreeBody(body, false), 2u, backend.device, backend.backend, config);
+        ASSERT_TRUE(world.Ready());
+        const std::vector<Vec3> forces{force, Vec3{}}, torques{torque, Vec3{}};
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), forces.size() * sizeof(Vec3)));
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyTorque, torques.data(), torques.size() * sizeof(Vec3)));
+        ASSERT_TRUE(world.Step().AllOk());
+        auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 2u);
+        const auto omega = Read<Vec3>(world, nk::FieldId::BodyAngularVelocity, 2u);
+        const auto pose = Read<Transform>(world, nk::FieldId::BodyPose, 2u);
+        ExpectVectorNear(velocity[0], (gravity + force / body.mass) * config.dt, 1.0e-6f);
+        ExpectVectorNear(velocity[1], gravity * config.dt, 1.0e-6f);
+        const Quat principal = body.local_transform.rotation * body.inertial_transform.rotation;
+        Vec3 principal_torque = principal.Conjugate().Rotate(torque);
+        principal_torque.x /= body.inertia.x;
+        principal_torque.y /= body.inertia.y;
+        principal_torque.z /= body.inertia.z;
+        ExpectVectorNear(omega[0], principal.Rotate(principal_torque) * config.dt, 1.0e-6f);
+        ExpectVectorNear(omega[1], Vec3{}, 1.0e-7f);
+        const Vec3 initial_com = body.local_transform.TransformPoint(body.inertial_transform.position);
+        for (uint32_t env = 0; env < 2u; ++env)
+            ExpectVectorNear(pose[env].TransformPoint(body.inertial_transform.position),
+                             initial_com + velocity[env] * config.dt, 1.0e-6f);
+        EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyForce, 2u), std::vector<Vec3>(2u));
+        EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyTorque, 2u), std::vector<Vec3>(2u));
+        ASSERT_TRUE(world.Step().AllOk());
+        velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 2u);
+        ExpectVectorNear(velocity[0], gravity * (2.0f * config.dt) + force * (config.dt / body.mass), 1.0e-6f);
+        ExpectVectorNear(velocity[1], gravity * (2.0f * config.dt), 1.0e-6f);
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), forces.size() * sizeof(Vec3)));
+        ASSERT_EQ(world.Reset({1u}), phi::Status::Ok);
+        EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyForce, 2u), forces);
+        ASSERT_EQ(world.Reset({0u}), phi::Status::Ok);
+        EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyForce, 2u), std::vector<Vec3>(2u));
+    }
+}
+
+TEST(FreeRigidDynamics, FixedAndFloatingArticulationsRespectRotatedGravity) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    const Quat rotation = Quat::FromAxisAngle({1, -3, 2}, 1.1f);
+    const Vec3 gravity{2.3f, -4.1f, -8.2f};
+    const Vec3 rotated_gravity = rotation.Rotate(gravity);
+    for (const char* filename : {"go2_stand.usda", "go2_float.usda"}) {
+        SCOPED_TRACE(filename);
+        const auto path = std::filesystem::path(NUKA_SOURCE_DIR) / "examples/scenes" / filename;
+        ASSERT_TRUE(std::filesystem::exists(path));
+        const auto source = nuka::import::LoadUsd(path.string());
+        const auto rotated = scene::Compose(scene::SceneIR{}, source, Transform{{}, rotation}, "rotated_");
+        scene::cook::CookToModelOptions options;
+        options.enable_contacts = false;
+        auto config = Config();
+        config.dt = 0.0005f;
+        config.gravity[0] = gravity.x;
+        config.gravity[1] = gravity.y;
+        config.gravity[2] = gravity.z;
+        nk::World original(scene::cook::CookToModel(source, 1, options).model,
+                           2u, backend.device, backend.backend, config);
+        config.gravity[0] = rotated_gravity.x;
+        config.gravity[1] = rotated_gravity.y;
+        config.gravity[2] = rotated_gravity.z;
+        nk::World transformed(scene::cook::CookToModel(rotated, 1, options).model,
+                              2u, backend.device, backend.backend, config);
+        ASSERT_TRUE(original.Ready());
+        ASSERT_TRUE(transformed.Ready());
+        ASSERT_TRUE(original.Step().AllOk());
+        ASSERT_TRUE(transformed.Step().AllOk());
+        const uint32_t links = original.GetModel().capacities.links_per_env * 2u;
+        const auto qdot = Read<float>(original, nk::FieldId::Qdot, links);
+        const auto rotated_qdot = Read<float>(transformed, nk::FieldId::Qdot, links);
+        for (uint32_t link = 0; link < links; ++link)
+            EXPECT_NEAR(rotated_qdot[link], qdot[link], 2.0e-6f) << "link=" << link;
+        const auto velocity = Read<nk::Spatial6>(original, nk::FieldId::LinkVelocity, links);
+        const auto rotated_velocity = Read<nk::Spatial6>(transformed, nk::FieldId::LinkVelocity, links);
+        for (uint32_t link = 0; link < links; ++link)
+            for (uint32_t axis = 0; axis < 6u; ++axis)
+                EXPECT_NEAR(rotated_velocity[link].v[axis], velocity[link].v[axis], 2.0e-6f)
+                    << "link=" << link << " axis=" << axis;
     }
 }
 
