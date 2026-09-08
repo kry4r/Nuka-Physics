@@ -1,4 +1,11 @@
-# Nuka Physics
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/media/nuka-logo-light.png">
+    <img src="docs/media/nuka-logo.png" width="112" height="112" alt="NukaPhysics logo">
+  </picture>
+</p>
+
+<h1 align="center">NukaPhysics</h1>
 
 <p align="center">
   <strong>GPU-resident, bit-deterministic, differentiable CUDA physics.</strong><br>
@@ -12,37 +19,68 @@
   <img src="https://img.shields.io/badge/license-AGPL--3.0%20%7C%20Commercial-cd3c32" alt="AGPL-3.0 or Commercial">
 </p>
 
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="examples/demo/README.md">Run the demos</a> ·
+  <a href="docs/getting-started.md">Documentation</a> ·
+  <a href="#architecture">Architecture</a>
+</p>
+
 <table align="center" width="100%">
 <tr>
-<td colspan="2" align="center">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots crossing procedural terrain"></a>
-  <br><b>Go2 Terrain</b> · RL locomotion on one general contact solver · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">1080p video</a>
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/pi05_libero.mp4"><img src="docs/media/pi05_libero.gif" width="100%" alt="Panda grasping, carrying, and placing a bowl with pi0.5 vision-language-action inference"></a>
+  <br><b>π0.5 Inference</b>
+  <br>Vision-language-action · LIBERO pick and place
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/pi05_libero.mp4">Full video</a> · <a href="examples/demo/README.md#pi05-inference">Run demo</a>
+</td>
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4"><img src="docs/media/g1_dance.gif" width="100%" alt="Unitree G1 performing the Shuffle dance with a pretrained ONNX policy"></a>
+  <br><b>G1 Dance</b>
+  <br>29-DoF humanoid · Shuffle policy inference
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4">Full video</a> · <a href="examples/demo/README.md#g1-dance">Run demo</a>
 </td>
 </tr>
 <tr>
-<td colspan="2" align="center">
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots crossing procedural terrain"></a>
+  <br><b>Go2 Terrain</b>
+  <br>RL locomotion · Procedural terrain
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">1080p video</a>
+</td>
+<td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4"><img src="docs/media/go2_cloth_drape.gif" width="100%" alt="Cloth draping over a Go2 quadruped"></a>
-  <br><b>Cloth × Go2</b> · Two-way body-particle coupling · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">1080p video</a>
+  <br><b>Cloth × Go2</b>
+  <br>Two-way body-particle coupling
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">1080p video</a>
 </td>
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="Rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
-  <br><b>Bunny × Water</b> · Two-way MLS-MPM coupling · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">video</a>
+  <br><b>Bunny × Water</b>
+  <br>Two-way MLS-MPM coupling
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">Full video</a>
 </td>
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4"><img src="docs/media/jelly_ball_drop.gif" width="100%" alt="MLS-MPM elastic jelly ball dropping and rebounding"></a>
-  <br><b>Elastic Jelly</b> · Deterministic MLS-MPM · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">video</a>
+  <br><b>Elastic Jelly</b>
+  <br>Deterministic MLS-MPM elasticity
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">Full video</a>
 </td>
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4"><img src="docs/media/nuka_go2_backflip.gif" width="100%" alt="Go2 performing a double backflip in Nuka"></a>
-  <br><b>Go2 Double Backflip</b> · TorchScript inference in Nuka · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4">1080p video</a>
+  <br><b>Go2 Double Backflip</b>
+  <br>TorchScript policy inference
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4"><img src="docs/media/nuka_go2_front_handstand.gif" width="100%" alt="Go2 performing a handstand in Nuka"></a>
-  <br><b>Go2 Handstand</b> · TorchScript inference in Nuka · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4">1080p video</a>
+  <br><b>Go2 Handstand</b>
+  <br>TorchScript policy inference
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4">1080p video</a>
 </td>
 </tr>
 </table>

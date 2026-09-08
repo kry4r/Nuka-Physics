@@ -1,75 +1,99 @@
-# Go2 locomotion demo video (v0.3 exit-criterion #6)
+# Demos
 
-This directory produces the v0.3 **exit-criterion #6 deliverable -- a Go2
-locomotion video** -- by **replaying the ALREADY-PROVEN trained Go2 policy**
-(`motion.pt`, from unitree_rl_gym PR#62) in Nuka and rendering the rollout.
+Pretrained policies run in Nuka, with video frames captured from the live simulated worlds. The [homepage gallery](../../README.md) links to the complete recordings.
 
-## HONESTY (read this first)
+| Demo | Entry point | Recording |
+|---|---|---|
+| π0.5 inference | [libero_pi05_play.py](libero_pi05_play.py) | [12 s, 1280 × 720](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/pi05_libero.mp4) |
+| G1 Shuffle dance | [g1_dance_play.py](g1_dance_play.py) | [20 s, 960 × 540](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4) |
 
-- This video shows an **externally-trained policy** that was then **validated in
-  Nuka** (sim-val #41/#43: dx +2.93 m / 6 s, vx 0.488 ~= cmd 0.5, tilt < 5.4 deg
-  at native dt=0.005). The capture here reproduces those numbers
-  (16-env mean net dx +2.78 m / 6 s, mean vx +0.46 m/s, final tilt max 5.5 deg).
-- It **satisfies exit #6** ("a Go2 locomotion video").
-- It **does NOT satisfy exit #3** ("from-scratch PPO convergence to a stable
-  gait"). That is a **separate gate**. Nothing here is evidence of in-house PPO
-  convergence; do not present it as a self-trained policy.
-- The **video frames** are drawn by a **self-contained Python rasterizer**
-  (`go2_demo_render.py`, side-view stick skeleton), **NOT** the offscreen-Vulkan
-  path. The Vulkan offscreen path *does* work on this box (verified with a 1-frame
-  and a 16-env Go2 smoke via lavapipe), but `nuka_scene_demo` runs its own
-  default-drive physics with no way to ingest the policy poses without a C++
-  rebuild, and its debug view is top-down (hides the gait). So we render the
-  captured world link poses ourselves. The **PPM -> MP4 ffmpeg tail** is the
-  documented headless path (`docs/architecture/headless-rendering.md`).
+Run commands from the repository root after the [CUDA build and Python installation](../../README.md#quick-start). Use Python 3.11, a CUDA-compatible PyTorch installation, Pillow, NumPy, and `ffmpeg` on `PATH`. Model weights and source assets stay in the ignored `.nuka-assets/` and `.nuka_cache/` directories; recordings and metrics go to `out/`.
 
-## Pipeline
+## pi0.5 inference
 
-1. `go2_demo_capture.py` -- imports the PROVEN policy-driving logic from
-   `examples/sim_val/go2_policy_drive.py` (so the captured motion is provably the
-   same validated obs->action->drive pipeline), runs the policy **batched** across
-   16 envs (per-env forward command vx in [0.35, 0.60] -- a spread **around** the
-   one command validated in Nuka, cmd=[0.5,0,0]; the off-0.5 speeds are **not**
-   separately pre-validated and we make **no** claim about the policy's training
-   command range -- each shown env is instead verified to walk by the renderer's
-   per-env check, and any that doesn't is flagged), **gates on the walk** (aborts
-   if the rollout does not advance forward + stay upright), and writes per-frame
-   `ARTICULATION_LINK_POSE` to a compact `.npz`.
-2. `go2_demo_render.py` -- rasterizes the `.npz` to PPM frames: a 4x4 grid, each
-   cell a side-view (X right, Z up) stick skeleton drawn directly from the world
-   link poses, with a follow-cam + **world-anchored scrolling ground ticks** so
-   the forward traversal reads. It re-checks each env per-env (forward + upright)
-   and flags any that did not walk.
-3. `render_video.sh` -- runs 1+2 then encodes PPM -> MP4 via ffmpeg.
+The Franka Panda uses two rendered camera streams and an 8-value robot state to pick up the black bowl and place it on the plate in LIBERO Spatial task 2. Inference, physics, and camera rendering share one local process. The showcased run uses the full 3.62B-parameter checkpoint, OSC control, 500 Hz physics, and 20 Hz actions. It executes eight actions from each predicted 50-action chunk before updating its observation.
 
-## Run
+The [asset and inference manifest](../vla/libero_spatial_pi05_manifest.json) pins the checkpoint, source scene, normalization, and action contract. Prepare the source repositories:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-examples/demo/render_video.sh            # out/go2_demo/go2_locomotion_16env.mp4
-# or step-by-step:
-python examples/demo/go2_demo_capture.py --envs 16 --seconds 6 --out out/go2_demo/go2_rollout.npz
-python examples/demo/go2_demo_render.py  --npz out/go2_demo/go2_rollout.npz --frames-dir out/go2_demo/frames
-ffmpeg -y -framerate 30 -i out/go2_demo/frames/frame_%05d.ppm -c:v libx264 -pix_fmt yuv420p out/go2_demo/go2_locomotion_16env.mp4
+mkdir -p .nuka-assets/src .nuka_cache
+git clone https://github.com/google-deepmind/mujoco_menagerie.git .nuka-assets/src/mujoco_menagerie
+git -C .nuka-assets/src/mujoco_menagerie checkout da76818e269b82289eba39808e2fb91d679d6994
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git .nuka_cache/LIBERO
+git -C .nuka_cache/LIBERO checkout 8f1084e3132a39270c3a13ebe37270a43ece2a01
 ```
 
-`out/` is gitignored (scratch); the MP4 + `.npz` regenerate from the command
-above. Small committed evidence lives in `examples/demo/sample_frames/`.
+Install the LeRobot revision used for the recording, then download the checkpoint and PaliGemma tokenizer. The tokenizer repository requires the corresponding Hugging Face access.
 
-## 4096-env throughput claim
+```bash
+pip install "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@0b067df57d21d3a02d6c511f1609172fa39ac29b"
+hf download lerobot/pi05_libero_finetuned_v044 \
+  --revision 8e174154ef5f6c60a8da12ae99c303d8963138c1 \
+  --local-dir .nuka_cache/pi05-libero
+hf download google/paligemma-3b-pt-224 \
+  --include tokenizer.json tokenizer_config.json special_tokens_map.json \
+  --local-dir .nuka_cache/paligemma-tokenizer
+python tools/assets/convert_libero_pi05.py
+python examples/demo/libero_pi05_play.py \
+  --control-backend osc --seconds 12 --execute-steps 8 \
+  --seed 20260828 --render-quality high --fps 20 \
+  --out out/libero/pi05_black_bowl
+```
 
-We render a representative **16-env grid**, not 4096 robots. **No 4096-env run was
-performed for this deliverable.** The 4096-env throughput story rests entirely on
-the **pre-existing** frozen perf baseline
-(`out/perf/baseline_rtx4000ada_4096_frozen.json`); the validation harness
-(`examples/sim_val/go2_policy_drive.py`) additionally contains a 4096-env finite
-smoke that can be run separately, but it was not executed here.
+The demo imports the generated XML with the running engine, records the rollout and policy chunks, and writes `summary.json`, `rollout.npz`, camera images, and `libero_pi05.mp4`. `--skip-video` disables recording. Success requires sustained bilateral grasp contact, transport without excessive slip, policy release, and stable upright support on the plate.
 
-## Environment caveat (at time of authoring)
+The showcased seed completed the task with these measured results:
 
-A plain `import nuka` was broken in the working tree by an **uncommitted edit** to
-`python/nuka/__init__.py` (`BASE_POSE = Field.BASE_POSE`, a Field the built
-`_nuka_ext` does not export). That is **not** part of this deliverable. The
-capture was run against the committed `__init__.py` via a temporary restore;
-`render_video.sh` does the same guard automatically (and restores the working-tree
-file byte-for-byte afterward).
+| Measurement | Result |
+|---|---:|
+| Bowl lift | 12.17 cm |
+| Sustained bilateral grasp | 1.512 s |
+| Maximum drift in the gripper frame during transport | 0.845 mm |
+| Plate support over the final 0.5 s | 100% |
+| Final placement XY error | 23.95 mm |
+| Peak / settled bowl–plate collision-box overlap | 2.086 / 0.322 mm |
+
+These measurements describe the recorded seed. They are not a LIBERO benchmark success rate. The [recording metadata](../../docs/media/demo_recordings.json) includes the model and video hashes. The transport and collision-box audits can also be run on a new recording:
+
+```bash
+python python/nuka/tasks/manipulation_metrics.py --run out/libero/pi05_black_bowl
+python tools/validation/libero_overlap_audit.py \
+  --run out/libero/pi05_black_bowl \
+  --scene .nuka-assets/generated/libero/libero_spatial_black_bowl.xml \
+  --body-a akita_black_bowl_1_main --body-b plate_1_main
+```
+
+## G1 dance
+
+The Unitree G1 runs the pretrained `J_Dance17_Shuffle` ONNX actor from [G1 Moves](https://github.com/experientialtech/g1-moves). Its 160-value observation produces 29 joint actions at 50 Hz; Nuka applies PD control with 200 Hz physics. The reference motion is sampled at 60 Hz. This is inference with an externally trained policy.
+
+The [robot manifest](../assets/g1_mode15/manifest.json) and [motion manifest](../motions/g1/manifest.json) record asset revisions, collision geometry, joint conventions, and policy hashes.
+
+```bash
+pip install onnxruntime pillow huggingface_hub
+mkdir -p .nuka-assets/src
+git clone https://github.com/experientialtech/g1-moves.git .nuka-assets/src/g1-moves
+git -C .nuka-assets/src/g1-moves checkout 475fdae98dcf18f96ebd3d0566d12fdefbaf2f0f
+git -C .nuka-assets/src/g1-moves submodule update --init mjlab
+hf download exptech/g1-moves --repo-type dataset \
+  --revision 895d064b2385725e6aabf540461c219afc3e0916 \
+  --include 'dance/J_Dance17_Shuffle/training/J_Dance17_Shuffle.npz' \
+            'dance/J_Dance17_Shuffle/policy/J_Dance17_Shuffle_policy.onnx' \
+  --local-dir .nuka-assets/src/g1-moves
+python tools/assets/convert_embodied_assets.py --asset g1
+python examples/demo/g1_dance_play.py \
+  --seconds 20 --video --fps 25 --width 960 --height 540 \
+  --out out/g1_shuffle
+```
+
+The entry point creates the NKS/NKA scene bundle and writes `g1_dance.mp4`, `summary.json`, and `metrics.jsonl`. The showcased 20-second run passed the finite-state, upright, and visible-motion checks: minimum root height was 0.688 m, mean joint motion span was 1.145 rad, and mean joint tracking RMSE was 0.213 rad.
+
+## Go2 locomotion capture
+
+The existing batched Go2 capture uses an externally trained TorchScript policy. It records 16 simulated environments and renders their link poses with the Python skeleton renderer:
+
+```bash
+examples/demo/render_video.sh
+```
+
+The output is `out/go2_demo/go2_locomotion_16env.mp4`. See [go2_demo_capture.py](go2_demo_capture.py), [go2_demo_render.py](go2_demo_render.py), and the [policy validation notes](../sim_val/go2_policy_drive_README.md) for the observation contract and validation. This capture is separate from the mesh-rendered skill videos in the homepage gallery.
