@@ -475,9 +475,8 @@ public:
     void step() { check(nuka_world_step(h_), "nuka_world_step"); }
     void step_n(uint32_t n) { check(nuka_world_step_n(h_, n), "nuka_world_step_n"); }
 
-    // p03 RL autoreset. reset() restores ALL envs to the creation-time initial
-    // pose; reset_envs(ids) restores only the listed envs (the masked autoreset
-    // path) and leaves every other env byte-for-byte unchanged.
+    // Restore initial physical state for all or selected environments.
+    // Unselected state and control targets are preserved.
     void reset() { check(nuka_world_reset(h_), "nuka_world_reset"); }
     void reset_envs(const uint32_t* ids, uint32_t count) {
         check(nuka_world_reset_envs(h_, ids, count), "nuka_world_reset_envs");
@@ -1992,27 +1991,23 @@ NB_MODULE(_nuka_ext, m) {
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
         .def("reset", &World::reset,
-             "Reset ALL envs to the deterministic creation-time initial pose "
-             "(internal floating-base pose, base/joint velocities, joint "
-             "positions; contact warm-start cleared). GPU-only, D1-deterministic. "
-             "Batched (env_count>1) worlds only.")
+             "Restore all environments' initial physical state and clear solver "
+             "history. Control targets and view storage are preserved.")
         .def(
             "reset_envs",
             [](World& w, nb::object env_ids) {
-                // Accept a 1-D int array (numpy / torch / list) -> host uint32[].
-                // A control-plane call (a few ids); a host round-trip is fine.
-                // `.tolist()` (when present) pulls a CUDA torch tensor to host
-                // python ints uniformly; a plain list/tuple is iterated directly.
+                // Convert supported one-dimensional arrays to host integers.
                 nb::object seq = env_ids;
                 if (nb::hasattr(env_ids, "tolist")) {
                     seq = env_ids.attr("tolist")();
                 }
                 std::vector<uint32_t> ids;
+                const uint32_t env_count = w.env_count();
                 for (nb::handle item : seq) {
                     const long long v = nb::cast<long long>(item);
-                    if (v < 0) {
+                    if (v < 0 || static_cast<uint64_t>(v) >= env_count) {
                         throw std::runtime_error(
-                            "reset_envs: env_id must be non-negative");
+                            "reset_envs: env_id must be in [0, env_count)");
                     }
                     ids.push_back(static_cast<uint32_t>(v));
                 }
@@ -2020,10 +2015,10 @@ NB_MODULE(_nuka_ext, m) {
                              static_cast<uint32_t>(ids.size()));
             },
             nb::arg("env_ids"),
-            "Reset only the listed envs to the creation-time initial pose (the "
-            "masked RL autoreset path). env_ids: a 1-D int array (numpy / torch / "
-            "list) of env indices in [0, env_count). Un-listed envs are left "
-            "byte-for-byte unchanged. GPU-only, D1-deterministic.")
+            "Restore the environment ID set from a one-dimensional integer array "
+            "(numpy, torch or list). Duplicates are ignored; an empty list is a "
+            "no-op. Invalid IDs fail without mutation. Unselected state, control "
+            "targets and view storage are preserved.")
         .def("capture_checkpoint", &World::capture_checkpoint,
              nb::rv_policy::take_ownership,
              "Capture all persistent simulation state, including warm-start caches. "

@@ -18,6 +18,7 @@ Proves (the p02 exit criteria):
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -25,7 +26,7 @@ import torch
 
 import nuka
 
-SCENE = "/root/Nuka-Physics/examples/scenes/go2_float.usda"
+SCENE = str(Path(__file__).resolve().parents[2] / "examples/scenes/go2_float.usda")
 GO2_BLC = 13  # base_link_count: root + 12 actuated leg joints
 
 
@@ -580,3 +581,44 @@ def test_reset_envs_accepts_int_array_types(device, mk_ids):
         nuka.sync()
         q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
         assert torch.isfinite(q).all()
+
+
+@pytest.mark.parametrize("bad_id", [-1, 8, 2**32, 2**32 + 2])
+def test_reset_envs_rejects_invalid_ids_without_mutation(device, bad_id):
+    with make_world(device, 8) as w:
+        w.step_n(8)
+        nuka.sync()
+        fields = (nuka.JOINT_POSITION, nuka.JOINT_VELOCITY, nuka.BASE_POSE)
+        views = [torch.from_dlpack(w.buffer_view(field)) for field in fields]
+        before = [view.clone() for view in views]
+        nuka.sync()
+        with pytest.raises(RuntimeError):
+            w.reset_envs([0, bad_id])
+        nuka.sync()
+        for field, view, expected in zip(fields, views, before):
+            assert torch.equal(view, expected), f"invalid ID mutated field {field}"
+
+
+def test_reset_envs_uses_set_semantics_and_keeps_views_valid(device):
+    with make_world(device, 8) as w:
+        fields = (nuka.JOINT_POSITION, nuka.JOINT_VELOCITY, nuka.BASE_POSE)
+        views = [torch.from_dlpack(w.buffer_view(field)) for field in fields]
+        nuka.sync()
+        initial = [view.clone() for view in views]
+        nuka.sync()
+        w.step_n(8)
+        nuka.sync()
+        before = [view.clone() for view in views]
+        nuka.sync()
+        assert not torch.equal(initial[-1], before[-1])
+        w.reset_envs([])
+        nuka.sync()
+        assert all(torch.equal(view, expected) for view, expected in zip(views, before))
+        w.reset_envs([2] * w.env_count + [0, 2])
+        nuka.sync()
+        for field, view, start, previous in zip(fields, views, initial, before):
+            assert view.data_ptr() == torch.from_dlpack(w.buffer_view(field)).data_ptr()
+            for env in range(w.env_count):
+                expected = start if env in (0, 2) else previous
+                assert torch.equal(view.reshape(w.env_count, -1)[env],
+                                   expected.reshape(w.env_count, -1)[env]), f"field {field}, env {env}"

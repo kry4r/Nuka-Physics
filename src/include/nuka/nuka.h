@@ -286,25 +286,11 @@ void nuka_world_destroy(nuka_world_handle world);
 nuka_result_t nuka_world_step(nuka_world_handle world);
 nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count);
 
-// p03 per-env RESET (RL autoreset). Restores selected envs to the deterministic
-// creation-time initial state -- the engine's INTERNAL authoritative buffers
-// (floating-base base_pose, base/link spatial velocity, joint q/qd) plus a clear
-// of the carried contact warm-start. A reset written through the writable buffer
-// views (e.g. ARTICULATION_LINK_POSE) is NON-authoritative for a floating base
-// (the integrator overwrites it from base_pose each step), so the reset MUST go
-// through here. GPU-only, D1-deterministic: bit-identical across runs, and
-// reset_envs leaves every un-listed env byte-for-byte unchanged.
-//
-// Only the batched (env_count > 1) path supports reset; the single-env oracle
-// path returns NUKA_RESULT_NOT_SUPPORTED (the RL autoreset path is always
-// batched).
-//
-// nuka_world_reset      -- reset ALL envs to the initial snapshot.
-// nuka_world_reset_envs -- reset only the `count` envs listed in `env_ids`
-//                          (each in [0, env_count); an out-of-range id returns
-//                          NUKA_RESULT_INVALID_ARG and resets nothing). count==0
-//                          (or env_ids==NULL with count==0) is a no-op OK.
+// Restore all environments' initial physical state and clear solver history.
+// Drive/task targets and view storage are preserved; any environment count is supported.
 nuka_result_t nuka_world_reset(nuka_world_handle world);
+// Reset an environment ID set; duplicates are ignored and count==0 is a no-op.
+// Invalid IDs return NUKA_RESULT_INVALID_ARG without changing any environment.
 nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
                                     const uint32_t* env_ids,
                                     uint32_t count);
@@ -406,26 +392,8 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_DRIVE_STIFFNESS = 8,
     NUKA_FIELD_DRIVE_DAMPING = 9,
     NUKA_FIELD_DRIVE_FORCE_LIMIT = 10,
-    // READ (batched/multi-env path only). The engine's AUTHORITATIVE per-env
-    // floating-base ROOT world pose -- the internal base_pose[articulation] buffer
-    // that the floating-base integrator advances each Step and that
-    // nuka_world_reset_envs restores from the creation-time snapshot. element_count
-    // == env_count (ONE Transform per env, NOT per link), element_stride_bytes ==
-    // sizeof(math::Transform) == 7 floats [px,py,pz, qw,qx,qy,qz] (quat w-first),
-    // SAME element layout as the ROOT slot of NUKA_FIELD_ARTICULATION_LINK_POSE.
-    //
-    // WHY THIS EXISTS (vs the root slot of ARTICULATION_LINK_POSE): the link_pose
-    // FK runs at stage 4 from the PRE-integrate base, while base_pose is advanced
-    // at stage 11, so after Step() returns ARTICULATION_LINK_POSE[root] is the
-    // PREVIOUS step's base pose (one-step lag). base_pose has NO such lag: it is
-    // current after Step() AND -- the load-bearing property for RL autoreset -- it
-    // is correct IMMEDIATELY after nuka_world_reset_envs with no further step (the
-    // reset writes it directly, whereas the lagged link_pose still shows the
-    // pre-reset/fallen pose until the next Step's FK). A vectorized RL env reads
-    // THIS field for the post-reset base orientation (projected_gravity) of the
-    // just-reset envs. The non-reset envs may keep reading the (validated, golden-
-    // pinned) lagged ARTICULATION_LINK_POSE -- the two intentionally differ by one
-    // integration step during normal stepping.
+    // READ: authoritative roots, env-major E*K transforms [px,py,pz,qw,qx,qy,qz].
+    // Current after step/reset; K is the articulation count per environment.
     NUKA_FIELD_BASE_POSE = 11,
     // WRITABLE (batched/multi-env path only). The per-env per-link TORQUE input
     // buffer the batched step reads every Step when the world's control_mode is

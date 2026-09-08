@@ -701,9 +701,7 @@ nuka_result_t nuka_world_reset(nuka_world_handle world) {
         return NUKA_RESULT_NOT_SUPPORTED;
     }
     try {
-        // Empty env list -> the bulk RestoreState op (restore the cooked initial
-        // snapshot + clear qddot/tau/lambda). The generic nk::World Reset replaces
-        // the legacy batched-only Reset.
+        // An empty selection restores all environments through the shared reset op.
         const nuka::phi::Status status = record->world->Reset({});
         return status == nuka::phi::Status::Ok ? NUKA_RESULT_OK
                                                : NUKA_RESULT_INTERNAL;

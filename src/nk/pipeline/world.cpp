@@ -4,6 +4,7 @@
 
 #include "nk/pipeline/world.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -126,22 +127,18 @@ bool World::SeedInitialState() {
     const uint32_t L = cap.links_per_env;
     const uint32_t E = cap.env_count;
 
-    // Fill the reset/snapshot params (stable addresses for dispatch). The body
-    // arm (M7 T1): SnapshotState/RestoreState carry the env-major TOTAL body
-    // count (bodies_per_env*env_count); ResetEnvs carries the PER-ENV body
-    // stride. All 0 when the world has no movable bodies (articulation-only
-    // worlds keep the byte-identical snapshot/restore/reset).
+    // Snapshot/restore carry total counts; masked reset carries environment strides.
     const uint32_t total_body_count = cap.bodies_per_env * E;
-    // Env-major total particle count: SnapshotState/RestoreState round-trip the
-    // particle slice so a coupled-world Reset restores the cloth/fluid state, not
-    // just the robot. 0 for a particle-free world (snapshot/restore byte-identical).
     const uint32_t total_particle_count = cap.particles_per_env * E;
     snapshot_params_.total_link_count = L * E;
     snapshot_params_.env_count = E;
+    snapshot_params_.articulation_count = cap.articulations_per_env * E;
     snapshot_params_.total_body_count = total_body_count;
     snapshot_params_.total_particle_count = total_particle_count;
     restore_params_.total_link_count = L * E;
     restore_params_.env_count = E;
+    restore_params_.articulation_count = cap.articulations_per_env * E;
+    restore_params_.dofs_per_articulation = cap.dofs_per_env;
     restore_params_.row_slot_count = cap.max_rows_per_env * E;
     restore_params_.contact_slot_count = cap.max_contacts_per_env * E;
     restore_params_.total_body_count = total_body_count;
@@ -151,22 +148,16 @@ bool World::SeedInitialState() {
     reset_params_.base_link_count = L;
     reset_params_.lambda_stride = cap.max_rows_per_env;
     reset_params_.contact_slot_count = cap.max_contacts_per_env;
-    // WP1 multi-articulation: reset addresses GLOBAL articulations (K per env). The
-    // ResetEnvs id-bound guard checks `env >= articulation_count`, so this must be
-    // the TOTAL co-resident articulation count. At K==1 this is E (unchanged).
-    // (NOTE: the ResetEnvs/Snapshot/Restore base_pose handling itself is still
-    // env-keyed -- only the FIRST dog's root pose per env round-trips a reset. The
-    // per-dog reset/snapshot is part of the later contact-crux RL work, NOT this
-    // forward-dynamics foundation; the co-step spike does not reset.)
+    // Each state category uses its own environment stride.
     reset_params_.articulation_count = cap.articulations_per_env * E;
+    reset_params_.articulations_per_env = cap.articulations_per_env;
+    reset_params_.dofs_per_articulation = cap.dofs_per_env;
+    reset_params_.use_env_ids = 1u;
     reset_params_.body_count = cap.bodies_per_env;
-    // FK refresh params: the total co-resident articulation + link counts the
-    // post-restore FkWorldPoses dispatch uses (0 links -> Reset skips the FK).
+    // Restored joint state immediately refreshes the selected FK poses.
     fk_params_.articulation_count = cap.articulations_per_env * E;
     fk_params_.total_link_count = L * E;
-    // Per-env particle stride: the per-env reset restores each listed env's
-    // particle slice from the snapshot (0 for a particle-free world -> the
-    // particle loop no-ops, byte-identical).
+    fk_params_.articulations_per_env = cap.articulations_per_env;
     reset_params_.particle_count = cap.particles_per_env;
 
     // -- M4: movable rigid-body template seeding (env-major replication) -----
@@ -446,11 +437,7 @@ bool World::SeedInitialState() {
         }
     }
     {
-        // WP1 multi-articulation: K distinct root poses per env (one per co-resident
-        // dog), laid out env-major at flat index e*K + k -- matching the FK kernel's
-        // base_pose[articulation] index where articulation == e*K + k. At K==1 this
-        // is exactly { a.base_pose } per env (E entries), byte-identical to the prior
-        // vector<Transform>(E, a.base_pose) seed (the K==1 D1 invariant).
+        // Each environment stores K roots at e*K+k, matching FK indexing.
         const uint32_t K = cap.articulations_per_env;
         std::vector<math::Transform> host(static_cast<size_t>(K) * E);
         for (uint32_t e = 0; e < E; ++e) {
@@ -514,48 +501,38 @@ phi::Status World::StepPlanned() {
 }
 
 phi::Status World::Reset(const std::vector<uint32_t>& env_ids) {
-    if (!ready_ || backend_ == nullptr) {
+    if (!ready_ || backend_ == nullptr) return phi::Status::Failed;
+    const uint32_t env_count = model_.capacities.env_count;
+    for (uint32_t id : env_ids) {
+        if (id >= env_count) return phi::Status::Failed;
+    }
+    std::vector<uint32_t> selected(env_ids);
+    std::sort(selected.begin(), selected.end());
+    selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+    if (!selected.empty() &&
+        !data_.UploadField(FieldId::ResetEnvIds, selected.data(),
+                           selected.size() * sizeof(uint32_t))) {
         return phi::Status::Failed;
     }
-    // M10 RL-completion: bump the IC-jitter episode counter so successive resets
-    // draw distinct (yet reproducible) Philox streams. The jitter MAGNITUDES stay
-    // at their zero defaults here (the training env wires them later), so this is
-    // a pure no-op for every existing caller — the kernel's per-perturbation
-    // `if (half != 0)` gates skip every draw and the reset is byte-identical.
     ++reset_params_.ic_episode;
-    phi::Status st;
-    if (env_ids.empty()) {
-        // Bulk restore: snapshot -> live + clear qddot/tau/lambda (device-side).
-        st = DispatchOp(phi::NkOp::RestoreState, &restore_params_);
-    } else {
-        // Per-env masked reset: validate host-side (a bad id must never OOB-write),
-        // upload the ids into the reset_env_ids field, dispatch ResetEnvs.
-        const uint32_t env_count = model_.capacities.env_count;
-        for (uint32_t id : env_ids) {
-            if (id >= env_count) {
-                return phi::Status::Failed;
-            }
-        }
-        const uint32_t count = static_cast<uint32_t>(
-            env_ids.size() > env_count ? env_count : env_ids.size());
-        if (!data_.UploadField(FieldId::ResetEnvIds, env_ids.data(),
-                               static_cast<uint64_t>(count) * sizeof(uint32_t))) {
-            return phi::Status::Failed;
-        }
-        reset_params_.count = count;
-        st = DispatchOp(phi::NkOp::ResetEnvs, &reset_params_);
-    }
-    if (st != phi::Status::Ok) {
-        return st;
-    }
-    // Recompute the FK-derived link world poses from the restored base_pose + q so a
-    // consumer renders / reads obs at the authored rest pose without first stepping
-    // (the snapshot carries base_pose + q, not the derived link_pose). A particle-only
-    // world has no links and skips it.
+    reset_params_.count = static_cast<uint32_t>(selected.size());
+    phi::Status status = selected.empty()
+        ? DispatchOp(phi::NkOp::RestoreState, &restore_params_)
+        : DispatchOp(phi::NkOp::ResetEnvs, &reset_params_);
+    if (status != phi::Status::Ok) return status;
+
+    fk_params_.selected_env_count = reset_params_.count;
     if (fk_params_.total_link_count > 0u) {
-        st = DispatchOp(phi::NkOp::FkWorldPoses, &fk_params_);
+        status = DispatchOp(phi::NkOp::FkWorldPoses, &fk_params_);
+        if (status != phi::Status::Ok) return status;
     }
-    return st;
+    for (const auto& call : pipeline_.Calls()) {
+        if (call.op != phi::NkOp::SyncLinkBodyPose) continue;
+        auto params = *static_cast<const phi::SyncLinkBodyPoseParams*>(call.params);
+        params.selected_env_count = reset_params_.count;
+        return DispatchOp(phi::NkOp::SyncLinkBodyPose, &params);
+    }
+    return phi::Status::Ok;
 }
 
 phi::Status World::DispatchOp(phi::NkOp op, const void* params) {

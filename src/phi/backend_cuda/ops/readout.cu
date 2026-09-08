@@ -1,29 +1,15 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M3b readout / reset / snapshot ops:
-//   ReadoutContactWrench / ExportObs / ResetEnvs / SnapshotState / RestoreState
-//
-// ReadoutContactWrench sums the per-link net contact wrench over the ONE general
-// (PairDriven) solved row buffer (urows + per-row lambda + the row_cj_* gather).
-// ResetEnvs is a LINE-BY-LINE PORT of the p03 ResetEnvsKernel (RL autoreset).
-// SnapshotState / RestoreState are the device-side forms of the legacy snapshot
-// D2D copies / Reset() restore (replacing the M3a host-mediated
-// Data::Snapshot/Restore): flat stream-ordered cudaMemcpyAsync/MemsetAsync in
-// fixed address order — trivially D1.
-//
-// ExportObs is the M3b minimal whole-body export (no golden gates it yet): per
-// env, [base_pose(7) | q(base_link_count) | qdot(base_link_count)] packed into
-// the obs_width-float obs_buffer row, deterministic truncation/zero-fill.
-// ---------------------------------------------------------------------------
+// Contact readout and environment state snapshot/restore.
 
 #include <cuda_runtime.h>
 #include <cstdio>
 
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"  // NkRow / kNkSideArtic (row solve)
-#include "sensor/noise/philox.cuh"               // M10: deterministic IC jitter
+#include "sensor/noise/philox.cuh"
 
 namespace nuka::phi {
 
@@ -34,11 +20,7 @@ using namespace ::nuka::phi::nkops;
 using nuka::math::Transform;
 using nuka::math::Vec3;
 
-// Contact-basis lambda layout: each contact slot carries {Fn, Ft1, Ft2}; each
-// link wrench is a Spatial6 {force.xyz, torque.xyz}. Named so a layout growth
-// (e.g. a torsional-friction spoke) is a single edit, not silent stride drift.
-// FLAG: AssembleRows / the row solver also encode the 3-component contact basis;
-// the divergence-proof home is a shared contact-constants header.
+// Contact forces use {Fn, Ft1, Ft2}; link wrenches use {force.xyz, torque.xyz}.
 constexpr uint32_t kContactForceComponents = 3u;
 constexpr uint32_t kLinkWrenchComponents   = 6u;
 static_assert(kLinkWrenchComponents == sizeof(::nuka::math::Vec3) * 2u / sizeof(float),
@@ -51,17 +33,14 @@ constexpr uint32_t kPdRowsPerSlot = nuka::nk::kPairDrivenRowsPerSlot;
 constexpr uint32_t kPdParticlePtsPerSlot = nuka::nk::kPairDrivenParticlePtsPerSlot;
 constexpr uint32_t kPdParticleRowsPerSlot = nuka::nk::kPairDrivenParticleRowsPerSlot;
 
-// M10 deterministic IC-jitter helpers (Philox4x32-10, host+device pure fns).
+// Philox generates deterministic initial-condition perturbations.
 using nuka::sensor::noise::MakeCounter;
 using nuka::sensor::noise::Philox4x32_10;
 using nuka::sensor::noise::Philox4x32Key;
 using nuka::sensor::noise::SplitSeed;
 using nuka::sensor::noise::Uint32ToUniform01;
 
-// One symmetric jitter draw in [-half, +half]: u in (0,1] -> (2u-1)*half. The
-// (element, seq) pair indexes a distinct Philox stream (injective counter), so
-// distinct envs / lanes get independent reproducible draws and half==0 callers
-// never reach here (the call sites gate on half != 0).
+// Each (element, seq) identifies a reproducible draw in [-half, +half].
 __forceinline__ __device__ float JitterDraw(Philox4x32Key key,
                                             uint32_t element_idx, uint64_t seq,
                                             float half) {
@@ -69,8 +48,6 @@ __forceinline__ __device__ float JitterDraw(Philox4x32Key key,
     const float u = Uint32ToUniform01(word);  // (0, 1]
     return (2.0f * u - 1.0f) * half;
 }
-
-// --- src/sensor/contact_wrench.cu (verbatim) --------------------------------
 
 // Populate legacy contact geometry fields from ucontact_* (PairDriven manifold).
 // Copies first valid manifold point to the per-slot contact_point/normal fields.
@@ -181,19 +158,8 @@ __global__ void ContactLinkKernel(const uint32_t* __restrict__ row_cj_link,
     out_contact_link[slot] = link;
 }
 
-// Net per-link contact wrench (world frame) over the ONE general (PairDriven)
-// solved row buffer. ONE THREAD PER OUTPUT LINK g. The solver writes one impulse
-// lambda[rs] per ROW slot; each active row's articulation side carries its owning
-// global link / world contact point / world row direction in the chain-J gather
-// (row_cj_link/point/dir for side A, row_cj_link_b/point_b/dir_b for side B). The
-// world force a link receives from a row is dir*lambda/dt (dir == the row's world
-// jlin: +n / -n for the two normal sides, +-spoke for the friction spokes), so the
-// per-link force is the sum over every row touching it (normal + friction spokes
-// of every manifold point) -- the physically-correct net contact reaction. A row
-// whose side is rigid/static carries kInvalidLink in that side's row_cj_link, so
-// it never matches g (matching the legacy inactive-slot skip). Both sides are
-// summed so a link<->link contact contributes to BOTH links. Fixed row order,
-// fp32, no atomics -> D1.
+// Gather both contact endpoints into each link's world-frame wrench.
+// Fixed row order gives deterministic force and torque sums without atomics.
 __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
                                         const NkRow* __restrict__ urows,
                                         const uint32_t* __restrict__ row_cj_link,
@@ -219,9 +185,7 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
 
     Vec3 force = Vec3::Zero();
     Vec3 torque = Vec3::Zero();
-    // FIXED row order; gate each side on its tagged link == g. An inactive row
-    // (flags bit0 clear) carries lambda == 0 AND kInvalidLink gathers, so it never
-    // contributes; explicit flag skip keeps it cheap.
+    // Only active rows whose endpoint names this link contribute.
     for (uint32_t rs = row_begin; rs < row_end; ++rs) {
         if (!(urows[rs].flags & nk::nk_row_flags::kActive)) {
             continue;
@@ -262,159 +226,115 @@ __device__ void ClearWarmStartPoint(
     cache_age[point_index] = 0u;
 }
 
-// --- p03 ResetEnvsKernel (per-env RL-autoreset primitive, verbatim) ----------
-
-__global__ void ResetEnvsKernel(ArticulationDeviceState state,
-                                 const uint32_t* env_ids,
-                                 uint32_t id_count,
-                                 uint32_t env_count,
-                                 uint32_t base_link_count,
-                                 uint32_t lambda_stride,
-                                 const Transform* snapshot_base_pose,
-                                 const LinkSpatialVel* snapshot_link_velocity,
-                                 const float* snapshot_q,
-                                 const float* snapshot_qdot,
-                                 float* lambda,
-                                 uint32_t contact_slot_count,
-                                 uint64_t* contact_cache_pair,
-                                 uint64_t* contact_cache_feature,
-                                 float* contact_cache_lambda,
-                                 Vec3* contact_cache_normal,
-                                 Vec3* contact_cache_tangent1,
-                                 Vec3* contact_cache_tangent2,
-                                 uint64_t* contact_cache_material,
-                                 uint32_t* contact_cache_age,
-                                 // M7 T1: movable rigid-body restore arm (body
-                                 // slice [env*body_count, +body_count), env-major
-                                 // — matches SeedInitialState's e*B+b body fill).
-                                 uint32_t body_count,
-                                 Transform* body_pose,
-                                 Vec3* body_linear_velocity,
-                                 Vec3* body_angular_velocity,
-                                 const Transform* snapshot_body_pose,
-                                 const Vec3* snapshot_body_linear_velocity,
-                                 const Vec3* snapshot_body_angular_velocity,
-                                 // M10 RL-completion: OPTIONAL per-env IC jitter.
-                                 // Each draw is gated `if (half != 0)`; an all-zero
-                                 // param set reduces to the verbatim snapshot copy
-                                 // (byte-identical to the pre-M10 reset).
-                                 uint64_t ic_seed,
-                                 uint32_t ic_episode,
-                                 uint32_t jitter_body_index,
-                                 float jitter_body_x,
-                                 float jitter_body_y,
-                                 float jitter_body_z,
-                                 float jitter_base_x,
-                                 float jitter_base_y,
-                                 float jitter_base_z,
-                                 float jitter_q,
-                                 // Per-env particle restore arm (env-major slice
-                                 // [env*particle_count, +particle_count)). 0 =>
-                                 // no particles (the loop no-ops, byte-identical).
-                                 uint32_t particle_count,
-                                 Vec3* particle_pos,
-                                 Vec3* particle_prev_pos,
-                                 Vec3* particle_vel,
-                                 const Vec3* snapshot_particle_pos,
-                                 const Vec3* snapshot_particle_prev_pos,
-                                 const Vec3* snapshot_particle_vel,
-                                 // MLS-MPM mutable continuum restore (F/C elem:9 +
-                                 // plastic). nullptr when the world has no MPM
-                                 // fields (the copies are guarded below).
-                                 float* particle_F,
-                                 float* particle_C,
-                                 float* particle_plastic,
-                                 const float* snapshot_particle_F,
-                                 const float* snapshot_particle_C,
-                                 const float* snapshot_particle_plastic) {
+__global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     const uint32_t slot = blockIdx.x;
-    if (slot >= id_count) {
-        return;
+    if (slot >= p.count) return;
+    const uint32_t env = p.use_env_ids ? data.reset_env_ids[slot] : slot;
+    if (env >= p.env_count) return;
+    const Philox4x32Key key = SplitSeed(p.ic_seed ^ (static_cast<uint64_t>(p.ic_episode) << 32));
+    for (uint32_t local = threadIdx.x; local < p.base_link_count; local += blockDim.x) {
+        const uint32_t link = env * p.base_link_count + local;
+        float q = data.snapshot_q[link];
+        if (p.jitter_q != 0.0f) q += JitterDraw(key, env, 1000u + local, p.jitter_q);
+        data.q[link] = q;
+        data.qdot[link] = data.snapshot_qdot[link];
+        data.qddot[link] = 0.0f;
+        data.tau[link] = 0.0f;
+        data.link_velocity[link] = data.snapshot_link_velocity[link];
+        data.qdot_pseudo[link] = 0.0f;
+        data.link_velocity_pseudo[link] = {};
+        data.link_contact_wrench[link] = {};
     }
-    const uint32_t env = env_ids[slot];
-    if (env >= env_count) {
-        return;
+    for (uint32_t local = threadIdx.x; local < p.articulations_per_env; local += blockDim.x) {
+        const uint32_t articulation = env * p.articulations_per_env + local;
+        Transform pose = data.snapshot_base_pose[articulation];
+        if (p.jitter_base_pos[0] != 0.0f)
+            pose.position.x += JitterDraw(key, articulation, 1u, p.jitter_base_pos[0]);
+        if (p.jitter_base_pos[1] != 0.0f)
+            pose.position.y += JitterDraw(key, articulation, 2u, p.jitter_base_pos[1]);
+        if (p.jitter_base_pos[2] != 0.0f)
+            pose.position.z += JitterDraw(key, articulation, 3u, p.jitter_base_pos[2]);
+        data.base_pose[articulation] = pose;
     }
-    const uint32_t link_begin = env * base_link_count;
-    // Per-env Philox key: seed XOR (episode << 32) so distinct episodes /seeds
-    // give independent reproducible streams. Computed once per block; cheap.
-    const Philox4x32Key ic_key =
-        SplitSeed(ic_seed ^ (static_cast<uint64_t>(ic_episode) << 32));
-
-    // Per-link / per-DOF live state (lanes cover the env's links in fixed order).
-    for (uint32_t local = threadIdx.x; local < base_link_count; local += blockDim.x) {
-        const uint32_t link = link_begin + local;
-        float q = snapshot_q[link];
-        // M10: optional per-DOF position jitter (gated; zero => verbatim copy).
-        if (jitter_q != 0.0f) {
-            q += JitterDraw(ic_key, env, 1000u + local, jitter_q);
+    const uint32_t dofs = p.articulations_per_env * p.dofs_per_articulation;
+    for (uint32_t local = threadIdx.x; local < dofs; local += blockDim.x)
+        data.qdot_pseudo_flat[env * dofs + local] = 0.0f;
+    for (uint32_t local = threadIdx.x; local < p.lambda_stride; local += blockDim.x) {
+        const uint32_t row = env * p.lambda_stride + local;
+        data.lambda[row] = 0.0f;
+        data.row_pseudo_lambda[row] = 0.0f;
+        reinterpret_cast<NkRow*>(data.urows)[row] = NkRow{};
+        data.row_cj_link[row] = ~0u;
+        data.row_cj_link_b[row] = ~0u;
+        data.row_cj_point[row] = {};
+        data.row_cj_point_b[row] = {};
+        data.row_cj_dir[row] = {};
+        data.row_cj_dir_b[row] = {};
+    }
+    for (uint32_t local = threadIdx.x; local < p.contact_slot_count; local += blockDim.x) {
+        const uint32_t contact = env * p.contact_slot_count + local;
+        data.ucontact_count[contact] = 0u;
+        data.contact_point[contact] = {};
+        data.contact_normal[contact] = {};
+        data.contact_depth[contact] = 0.0f;
+        data.contact_link[contact] = ~0u;
+        data.contact_side_a_kind[contact] = nk::kNkSideStatic;
+        data.contact_side_b_kind[contact] = nk::kNkSideStatic;
+        data.contact_side_a_index[contact] = ~0u;
+        data.contact_side_b_index[contact] = ~0u;
+        for (uint32_t component = 0u; component < kContactForceComponents; ++component)
+            data.contact_force[contact * kContactForceComponents + component] = 0.0f;
+        for (uint32_t point = 0u; point < kPdPtsPerSlot; ++point) {
+            ClearWarmStartPoint(contact * kPdPtsPerSlot + point, data.contact_cache_pair,
+                data.contact_cache_feature, data.contact_cache_lambda, data.contact_cache_normal,
+                data.contact_cache_tangent1, data.contact_cache_tangent2, data.contact_cache_material,
+                data.contact_cache_age);
         }
-        state.q[link] = q;
-        state.qdot[link] = snapshot_qdot[link];
-        state.qddot[link] = 0.0f;
-        state.tau[link] = 0.0f;
-        state.link_velocity[link] = snapshot_link_velocity[link];
     }
-    // Per-articulation root pose + per-env contact warm-start (lane 0 only).
-    if (threadIdx.x == 0u) {
-        Transform bp = snapshot_base_pose[env];
-        // M10: optional base-position jitter (per-axis distinct seq lanes 1/2/3).
-        if (jitter_base_x != 0.0f) bp.position.x += JitterDraw(ic_key, env, 1u, jitter_base_x);
-        if (jitter_base_y != 0.0f) bp.position.y += JitterDraw(ic_key, env, 2u, jitter_base_y);
-        if (jitter_base_z != 0.0f) bp.position.z += JitterDraw(ic_key, env, 3u, jitter_base_z);
-        state.base_pose[env] = bp;
-    }
-    for (uint32_t i = threadIdx.x; i < lambda_stride; i += blockDim.x) {
-        lambda[env * lambda_stride + i] = 0.0f;
-    }
-    if (contact_cache_pair != nullptr) {
-        const uint32_t cache_begin = env * contact_slot_count * 4u;
-        const uint32_t cache_end = cache_begin + contact_slot_count * 4u;
-        for (uint32_t i = cache_begin + threadIdx.x; i < cache_end; i += blockDim.x) {
-            ClearWarmStartPoint(i, contact_cache_pair, contact_cache_feature,
-                                 contact_cache_lambda, contact_cache_normal,
-                                 contact_cache_tangent1, contact_cache_tangent2,
-                                 contact_cache_material, contact_cache_age);
+    for (uint32_t local = threadIdx.x; local < p.body_count; local += blockDim.x) {
+        const uint32_t body = env * p.body_count + local;
+        Transform pose = data.snapshot_body_pose[body];
+        if (local == p.jitter_body_index) {
+            if (p.jitter_body_xyz[0] != 0.0f)
+                pose.position.x += JitterDraw(key, env, 10u, p.jitter_body_xyz[0]);
+            if (p.jitter_body_xyz[1] != 0.0f)
+                pose.position.y += JitterDraw(key, env, 11u, p.jitter_body_xyz[1]);
+            if (p.jitter_body_xyz[2] != 0.0f)
+                pose.position.z += JitterDraw(key, env, 12u, p.jitter_body_xyz[2]);
         }
+        data.body_pose[body] = pose;
+        data.body_linear_velocity[body] = data.snapshot_body_linear_velocity[body];
+        data.body_angular_velocity[body] = data.snapshot_body_angular_velocity[body];
+        data.body_world_inv_inertia[body] = BodyWorldInverseInertia(
+            pose, data.body_inertial_frame[body], data.body_inv_inertia[body]);
+        data.body_pseudo_linear_velocity[body] = {};
+        data.body_pseudo_angular_velocity[body] = {};
+        data.body_force[body] = {};
+        data.body_torque[body] = {};
+        data.mpm_body_reaction[body] = {};
+        data.mpm_body_ang_reaction[body] = {};
     }
-    // M7 T1: restore this env's body slice (pose + linear/angular velocity) from
-    // the snapshot. body_count == 0 (no bodies) skips the loop entirely, keeping
-    // the articulation-only reset byte-identical.
-    for (uint32_t b = threadIdx.x; b < body_count; b += blockDim.x) {
-        const uint32_t body = env * body_count + b;
-        Transform pose = snapshot_body_pose[body];
-        // M10: optional per-body position jitter, ONLY on the targeted body slot
-        // (per-axis distinct seq lanes 10/11/12). Gated; zero halves => verbatim
-        // copy. Name-agnostic: targets whichever slot jitter_body_index names.
-        if (b == jitter_body_index) {
-            if (jitter_body_x != 0.0f) pose.position.x += JitterDraw(ic_key, env, 10u, jitter_body_x);
-            if (jitter_body_y != 0.0f) pose.position.y += JitterDraw(ic_key, env, 11u, jitter_body_y);
-            if (jitter_body_z != 0.0f) pose.position.z += JitterDraw(ic_key, env, 12u, jitter_body_z);
-        }
-        body_pose[body] = pose;
-        body_linear_velocity[body] = snapshot_body_linear_velocity[body];
-        body_angular_velocity[body] = snapshot_body_angular_velocity[body];
-    }
-    // Restore this env's particle slice (pos + prev_pos + velocity) from the
-    // snapshot. particle_count == 0 (no particles) skips the loop, keeping the
-    // particle-free per-env reset byte-identical.
-    for (uint32_t i = threadIdx.x; i < particle_count; i += blockDim.x) {
-        const uint32_t pidx = env * particle_count + i;
-        particle_pos[pidx] = snapshot_particle_pos[pidx];
-        particle_prev_pos[pidx] = snapshot_particle_prev_pos[pidx];
-        particle_vel[pidx] = snapshot_particle_vel[pidx];
-        // MLS-MPM continuum state (guarded; null when the world has no MPM fields).
-        if (particle_F != nullptr) {
-            for (uint32_t k = 0u; k < 9u; ++k) {
-                particle_F[pidx * 9u + k] = snapshot_particle_F[pidx * 9u + k];
-                particle_C[pidx * 9u + k] = snapshot_particle_C[pidx * 9u + k];
+    for (uint32_t local = threadIdx.x; local < p.particle_count; local += blockDim.x) {
+        const uint32_t particle = env * p.particle_count + local;
+        data.particle_pos[particle] = data.snapshot_particle_pos[particle];
+        data.particle_prev_pos[particle] = data.snapshot_particle_prev_pos[particle];
+        data.particle_vel[particle] = data.snapshot_particle_vel[particle];
+        data.particle_pseudo_vel[particle] = {};
+        if (data.particle_F != nullptr) {
+            for (uint32_t component = 0u; component < 9u; ++component) {
+                data.particle_F[particle * 9u + component] = data.snapshot_particle_F[particle * 9u + component];
+                data.particle_C[particle * 9u + component] = data.snapshot_particle_C[particle * 9u + component];
             }
-            particle_plastic[pidx] = snapshot_particle_plastic[pidx];
+            data.particle_plastic[particle] = data.snapshot_particle_plastic[particle];
         }
+    }
+    if (threadIdx.x == 0u) {
+        data.contact_count[env] = 0u;
+        data.env_status[env] = 0u;
     }
 }
 
-// --- ExportObs (M3b minimal whole-body export) -------------------------------
+// Export each environment's root pose and joint state to a fixed-width row.
 
 __global__ void ExportObsKernel(const Transform* base_pose,
                                 const float* q,
@@ -447,12 +367,6 @@ __global__ void ExportObsKernel(const Transform* base_pose,
         out[w++] = 0.0f;
     }
 }
-
-// L1-c: ReadoutUnionContactObsKernel (the union-only per-env contact obs) was
-// DELETED here. Grasp/union moved to RL; the general path's per-env contact
-// readout is OpReadoutContactWrench over the unified contact buffer.
-
-// --- op entry points ---------------------------------------------------------
 
 Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
                               const void* params, cudaStream_t stream) {
@@ -527,70 +441,17 @@ Status OpExportObs(const ModelView& /*model*/, const DataView& data,
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-// L1-c: OpReadoutUnionContactObs was DELETED here (see kernel note above).
-
-Status OpResetEnvs(const ModelView& model, const DataView& data,
+Status OpResetEnvs(const ModelView& /*model*/, const DataView& data,
                    const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ResetEnvsParams*>(params);
-    if (p == nullptr) {
+    if (p == nullptr) return Status::Failed;
+    if (p->count == 0u) return Status::Ok;
+    if (p->count > p->env_count || (p->use_env_ids && data.reset_env_ids == nullptr) ||
+        static_cast<uint64_t>(p->articulations_per_env) * p->env_count != p->articulation_count)
         return Status::Failed;
-    }
-    // Proceed if there is ANYTHING per-env to restore: articulation links OR
-    // movable bodies OR particles. A bodies-only world (base_link_count == 0,
-    // body_count > 0) still resets its body slice; the kernel's per-link loop just
-    // no-ops then. A coupled world adds the particle slice on the same dispatch.
-    if (p->count == 0u ||
-        ((p->articulation_count == 0u || p->base_link_count == 0u) &&
-         p->body_count == 0u && p->particle_count == 0u)) {
-        return Status::Ok;
-    }
-    const ArticulationDeviceState state = MakeArticulationDeviceState(
-        model, data, p->articulation_count * p->base_link_count,
-        p->articulation_count);
-    constexpr uint32_t kResetBlock = 64u;  // covers go2's 13 links / 12 lambda.
-    LaunchCuda(ResetEnvsKernel, dim3(p->count), dim3(kResetBlock), 0u, stream,
-               state,
-               static_cast<const uint32_t*>(data.reset_env_ids),
-               p->count, p->env_count, p->base_link_count, p->lambda_stride,
-               static_cast<const Transform*>(data.snapshot_base_pose),
-               reinterpret_cast<const LinkSpatialVel*>(data.snapshot_link_velocity),
-               static_cast<const float*>(data.snapshot_q),
-               static_cast<const float*>(data.snapshot_qdot),
-               data.lambda, p->contact_slot_count,
-               data.contact_cache_pair, data.contact_cache_feature,
-               data.contact_cache_lambda, data.contact_cache_normal,
-               data.contact_cache_tangent1, data.contact_cache_tangent2,
-               data.contact_cache_material, data.contact_cache_age,
-               // M7 T1: movable rigid-body restore arm.
-               p->body_count,
-               static_cast<Transform*>(data.body_pose),
-               static_cast<Vec3*>(data.body_linear_velocity),
-               static_cast<Vec3*>(data.body_angular_velocity),
-               static_cast<const Transform*>(data.snapshot_body_pose),
-               static_cast<const Vec3*>(data.snapshot_body_linear_velocity),
-               static_cast<const Vec3*>(data.snapshot_body_angular_velocity),
-               // M10 RL-completion: optional per-env IC jitter (all-zero =>
-               // verbatim snapshot copy, byte-identical to the pre-M10 reset).
-               p->ic_seed, p->ic_episode, p->jitter_body_index,
-               p->jitter_body_xyz[0], p->jitter_body_xyz[1], p->jitter_body_xyz[2],
-               p->jitter_base_pos[0], p->jitter_base_pos[1], p->jitter_base_pos[2],
-               p->jitter_q,
-               // Per-env particle restore arm (0 particles => the loop no-ops).
-               p->particle_count,
-               static_cast<Vec3*>(data.particle_pos),
-               static_cast<Vec3*>(data.particle_prev_pos),
-               static_cast<Vec3*>(data.particle_vel),
-               static_cast<const Vec3*>(data.snapshot_particle_pos),
-               static_cast<const Vec3*>(data.snapshot_particle_prev_pos),
-               static_cast<const Vec3*>(data.snapshot_particle_vel),
-               // MLS-MPM mutable continuum restore (null when no MPM fields).
-               static_cast<float*>(data.particle_F),
-               static_cast<float*>(data.particle_C),
-               static_cast<float*>(data.particle_plastic),
-               static_cast<const float*>(data.snapshot_particle_F),
-               static_cast<const float*>(data.snapshot_particle_C),
-               static_cast<const float*>(data.snapshot_particle_plastic));
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    constexpr uint32_t block_size = 128u;
+    LaunchCuda(ResetEnvsKernel, dim3(p->count), dim3(block_size), 0u, stream, data, *p);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
@@ -599,21 +460,17 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    // Nothing to snapshot only when there are NEITHER links NOR bodies NOR
-    // particles (a bodies-only or particles-only world still round-trips its slice).
+    // Each state category can exist without the others.
     if (p->total_link_count == 0u && p->total_body_count == 0u &&
         p->total_particle_count == 0u) {
         return Status::Ok;
     }
     const size_t nl = p->total_link_count;
-    const size_t ne = p->env_count;
-    // Live -> snapshot (flat D2D in fixed order; the legacy creation-time
-    // snapshot 1:1: base_pose / link_velocity / q / qdot). Guarded on nl so a
-    // bodies-only world (nl == 0) skips the articulation copies but still
-    // snapshots bodies below — the articulation copies stay byte-identical.
+    const size_t na = p->articulation_count;
+    // Root and link state have distinct array lengths.
     if (nl > 0u &&
         (cudaMemcpyAsync(data.snapshot_base_pose, data.base_pose,
-                         ne * sizeof(Transform), cudaMemcpyDeviceToDevice,
+                         na * sizeof(Transform), cudaMemcpyDeviceToDevice,
                          stream) != cudaSuccess ||
          cudaMemcpyAsync(data.snapshot_link_velocity, data.link_velocity,
                          nl * 6u * sizeof(float), cudaMemcpyDeviceToDevice,
@@ -624,8 +481,7 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
         return Status::Failed;
     }
-    // M7 T1: APPEND the movable rigid-body snapshot (env-major total body count).
-    // Strictly additive — the articulation copies above are untouched.
+    // Snapshot body state in environment order.
     const size_t nb = p->total_body_count;
     if (nb > 0u &&
         (cudaMemcpyAsync(data.snapshot_body_pose, data.body_pose,
@@ -639,9 +495,7 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
         return Status::Failed;
     }
-    // APPEND the particle snapshot (env-major total particle count) so a coupled
-    // world round-trips its cloth/fluid slice on Reset. Additive — the articulation
-    // and body copies above are untouched; 0 particles skips it (byte-identical).
+    // Particle position, previous position and velocity are independent state.
     const size_t np = p->total_particle_count;
     if (np > 0u &&
         (cudaMemcpyAsync(data.snapshot_particle_pos, data.particle_pos,
@@ -655,8 +509,7 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
                          stream) != cudaSuccess)) {
         return Status::Failed;
     }
-    // APPEND the mutable MLS-MPM continuum snapshot (F/C are elem:9, plastic 1).
-    // Additive; 0 particles skips it. vol0/material_id are cook-constant (not here).
+    // F, C and plastic strain are mutable; rest volumes and material IDs are model data.
     if (np > 0u && data.particle_F != nullptr &&
         (cudaMemcpyAsync(data.snapshot_particle_F, data.particle_F,
                          np * 9u * sizeof(float), cudaMemcpyDeviceToDevice,
@@ -672,111 +525,26 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
     return Status::Ok;
 }
 
-Status OpRestoreState(const ModelView& /*model*/, const DataView& data,
+Status OpRestoreState(const ModelView& model, const DataView& data,
                       const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const RestoreStateParams*>(params);
-    if (p == nullptr) {
-        return Status::Failed;
-    }
-    // Nothing to restore only when there are NEITHER links NOR bodies NOR particles.
-    if (p->total_link_count == 0u && p->total_body_count == 0u &&
-        p->total_particle_count == 0u) {
-        return Status::Ok;
-    }
-    const size_t nl = p->total_link_count;
-    const size_t ne = p->env_count;
-    // Snapshot -> live + clear carried accumulators (qddot / tau / lambda):
-    // the legacy per-env Reset() restore 1:1. Guarded on nl so a
-    // bodies-only world (nl == 0) skips the articulation restore but still
-    // restores bodies below — the articulation copies stay byte-identical.
-    if (nl > 0u &&
-        (cudaMemcpyAsync(data.base_pose, data.snapshot_base_pose,
-                         ne * sizeof(Transform), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.link_velocity, data.snapshot_link_velocity,
-                         nl * 6u * sizeof(float), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.q, data.snapshot_q, nl * sizeof(float),
-                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.qdot, data.snapshot_qdot, nl * sizeof(float),
-                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-         cudaMemsetAsync(data.qddot, 0, nl * sizeof(float), stream) != cudaSuccess ||
-         cudaMemsetAsync(data.tau, 0, nl * sizeof(float), stream) != cudaSuccess)) {
-        return Status::Failed;
-    }
-    if (p->row_slot_count > 0u &&
-        cudaMemsetAsync(data.lambda, 0,
-                        static_cast<size_t>(p->row_slot_count) * sizeof(float),
-                        stream) != cudaSuccess) {
-        return Status::Failed;
-    }
-    if (p->contact_slot_count > 0u) {
-        const size_t points = static_cast<size_t>(p->contact_slot_count) * 4u;
-        if (cudaMemsetAsync(data.contact_cache_pair, 0,
-                            points * sizeof(uint64_t), stream) != cudaSuccess ||
-            cudaMemsetAsync(data.contact_cache_feature, 0,
-                            points * sizeof(uint64_t), stream) != cudaSuccess ||
-            cudaMemsetAsync(data.contact_cache_lambda, 0,
-                            points * 3u * sizeof(float), stream) != cudaSuccess ||
-            cudaMemsetAsync(data.contact_cache_normal, 0,
-                            points * sizeof(Vec3), stream) != cudaSuccess ||
-            cudaMemsetAsync(data.contact_cache_tangent1, 0,
-                            points * sizeof(Vec3), stream) != cudaSuccess ||
-            cudaMemsetAsync(data.contact_cache_tangent2, 0,
-                            points * sizeof(Vec3), stream) != cudaSuccess ||
-            cudaMemsetAsync(data.contact_cache_material, 0,
-                            points * sizeof(uint64_t), stream) != cudaSuccess ||
-            cudaMemsetAsync(data.contact_cache_age, 0,
-                            points * sizeof(uint32_t), stream) != cudaSuccess) {
-            return Status::Failed;
-        }
-    }
-    // Restore the movable rigid-body snapshot after clearing carried contact state.
-    const size_t nb = p->total_body_count;
-    if (nb > 0u &&
-        (cudaMemcpyAsync(data.body_pose, data.snapshot_body_pose,
-                         nb * sizeof(Transform), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.body_linear_velocity,
-                         data.snapshot_body_linear_velocity, nb * sizeof(Vec3),
-                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.body_angular_velocity,
-                         data.snapshot_body_angular_velocity, nb * sizeof(Vec3),
-                         cudaMemcpyDeviceToDevice, stream) != cudaSuccess)) {
-        return Status::Failed;
-    }
-    // APPEND the particle restore (snapshot -> live, env-major total particle
-    // count) so a coupled world's cloth/fluid slice returns to its cooked initial
-    // state. Additive; 0 particles skips it (byte-identical to a particle-free
-    // world). Particles carry no row accumulator beyond the lambda cleared above.
-    const size_t np = p->total_particle_count;
-    if (np > 0u &&
-        (cudaMemcpyAsync(data.particle_pos, data.snapshot_particle_pos,
-                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.particle_prev_pos, data.snapshot_particle_prev_pos,
-                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.particle_vel, data.snapshot_particle_vel,
-                         np * sizeof(Vec3), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess)) {
-        return Status::Failed;
-    }
-    // APPEND the inverse MLS-MPM continuum restore (snapshot -> live). Additive;
-    // 0 particles skips it. vol0/material_id are cook-constant (not restored here).
-    if (np > 0u && data.particle_F != nullptr &&
-        (cudaMemcpyAsync(data.particle_F, data.snapshot_particle_F,
-                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.particle_C, data.snapshot_particle_C,
-                         np * 9u * sizeof(float), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess ||
-         cudaMemcpyAsync(data.particle_plastic, data.snapshot_particle_plastic,
-                         np * sizeof(float), cudaMemcpyDeviceToDevice,
-                         stream) != cudaSuccess)) {
-        return Status::Failed;
-    }
-    return Status::Ok;
+    if (p == nullptr || p->env_count == 0u) return Status::Failed;
+    const uint32_t envs = p->env_count;
+    if (p->total_link_count % envs || p->articulation_count % envs ||
+        p->total_body_count % envs || p->total_particle_count % envs ||
+        p->row_slot_count % envs || p->contact_slot_count % envs) return Status::Failed;
+    ResetEnvsParams reset{};
+    reset.count = envs;
+    reset.env_count = envs;
+    reset.articulation_count = p->articulation_count;
+    reset.articulations_per_env = p->articulation_count / envs;
+    reset.dofs_per_articulation = p->dofs_per_articulation;
+    reset.base_link_count = p->total_link_count / envs;
+    reset.body_count = p->total_body_count / envs;
+    reset.particle_count = p->total_particle_count / envs;
+    reset.lambda_stride = p->row_slot_count / envs;
+    reset.contact_slot_count = p->contact_slot_count / envs;
+    return OpResetEnvs(model, data, &reset, stream);
 }
 
 } // namespace

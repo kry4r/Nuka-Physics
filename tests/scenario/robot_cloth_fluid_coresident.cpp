@@ -1,28 +1,5 @@
-// ---------------------------------------------------------------------------
-// A robot ARTICULATION + cloth (XPBD) + fluid (PBF) CO-RESIDENT in ONE nk::World,
-// all stepping on the ONE general physics pipeline with two-way coupling to BOTH
-// media. A Go2 quadruped is cooked through the SAME production path it uses on the
-// ground (LoadUsd -> CookToModel) and a cloth patch + a shallow fluid pool are
-// cooked onto the SAME model via CookSoftFluidParticles (the [soft | fluid] layout).
-// The Go2 holds its baked stance through the cooked position actuators; its front
-// feet rest on the cloth and a rear foot rests in the pool. The robot links, the
-// cloth, and the fluid all couple through the SAME body<->particle row solver a
-// foot uses on the ground: detection -> body<->particle narrowphase -> emit ->
-// SolveRowsBlockIsland -> finalize compose. No per-robot code, no per-medium branch:
-// a calf link is just another collidable body row, a particle is a sphere, and the
-// medium difference (cloth grips, fluid slides) is DATA (per-system mu), never code.
-//
-// Proven numerically against a no-particle control of the same robot:
-//   STABLE CO-STEP: ~1.7 sim seconds; the world stays finite, the robot stays
-//     controlled, the cloth + fluid stay finite.
-//   TWO-WAY TO CLOTH: a body<->particle row exists whose particle side kind ==
-//     kNkSideParticle AND whose BODY side maps to an articulation LINK
-//     (body_to_link != ~0), the foot is in the cloth (soft) slice [0, n_soft),
-//     the body-side normal lambda > 0, and the cloth dips below its undisturbed lay.
-//   TWO-WAY TO FLUID: the same, against a particle in the fluid slice [n_soft, P),
-//     and the pool is displaced under the foot.
-//   Every coupling row asserted has exactly one particle side -- the general path.
-// ---------------------------------------------------------------------------
+// Exercise cooking, controlled robot/cloth/fluid contact, readout and reset on one World pipeline.
+// A separated-media control measures the robot's response to both media.
 
 #include <gtest/gtest.h>
 
@@ -199,24 +176,30 @@ cook::PbfCookInput BuildPool(float cx, float cy, float floor_z) {
     return in;
 }
 
-// NkRow packs to 32 f32: [0]=flags [7]=upper, a.kind [16] a.index [17],
-// b.kind [24] b.index [25].
-struct RowSides { uint32_t a_kind, b_kind, a_index, b_index; bool active; float upper; };
-RowSides DecodeRow(const std::vector<float>& urows, uint32_t row) {
-    const float* r = urows.data() + static_cast<size_t>(row) * 32u;
-    auto u = [&](int i) { uint32_t v; std::memcpy(&v, &r[i], 4); return v; };
-    RowSides s;
-    s.active = (u(0) & 1u) != 0u;
-    s.upper = r[7];
-    s.a_kind = u(16); s.a_index = u(17);
-    s.b_kind = u(24); s.b_index = u(25);
-    return s;
+using PipelineState = std::vector<std::vector<uint8_t>>;
+
+PipelineState ReadPipelineState(nk::World& world) {
+    PipelineState state;
+    for (auto field : {nk::FieldId::BasePose, nk::FieldId::Q, nk::FieldId::Qdot,
+                      nk::FieldId::LinkVelocity, nk::FieldId::ParticlePos,
+                      nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel}) {
+        const auto& segments = world.GetData().Segments();
+        const auto segment = std::find_if(segments.begin(), segments.end(),
+            [field](const auto& value) { return value.field == field; });
+        if (segment == segments.end()) {
+            ADD_FAILURE() << "missing pipeline state field " << static_cast<uint32_t>(field);
+            return {};
+        }
+        state.emplace_back(segment->bytes);
+        EXPECT_TRUE(world.GetData().DownloadField(field, state.back().data(), state.back().size()));
+    }
+    return state;
 }
 
 void DownloadParticles(nk::World& w, std::vector<Vec3>* pos) {
     const uint32_t P = w.GetModel().capacities.particles_per_env;
     pos->assign(P, Vec3::Zero());
-    w.GetData().DownloadField(nk::FieldId::ParticlePos, pos->data(), P * sizeof(Vec3));
+    EXPECT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticlePos, pos->data(), P * sizeof(Vec3)));
 }
 
 // Min particle z over the disc of `reach` about (cx,cy), restricted to a particle
@@ -265,7 +248,6 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
 
     nk::Model probe = cook_go2();
     const uint32_t L = probe.capacities.links_per_env;
-    const std::vector<uint32_t> body_to_link = probe.body_to_link;
     const std::vector<uint32_t> link_geom_kind = probe.articulation.link_geom_kind;
     const std::vector<Transform> link_geom_local = probe.articulation.link_geom_local;
     ASSERT_GT(L, 0u);
@@ -281,7 +263,7 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
 
     nk::World wp(std::move(probe), 1u, b.dev, b.backend, Cfg());
     ASSERT_TRUE(wp.Ready());
-    for (uint32_t s = 0; s < kSettleSteps; ++s) wp.Step();
+    for (uint32_t s = 0; s < kSettleSteps; ++s) ASSERT_TRUE(wp.Step().AllOk());
     std::vector<Transform> link_pose(L);
     ASSERT_TRUE(wp.GetData().DownloadField(nk::FieldId::LinkPose, link_pose.data(),
                                            L * sizeof(Transform)));
@@ -336,9 +318,9 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         m.particles.pp_contact_d_min = kContactDMin;
         nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
         ASSERT_TRUE(w.Ready());
-        for (uint32_t s = 0; s < kSettleSteps; ++s) w.Step();
+        for (uint32_t s = 0; s < kSettleSteps; ++s) ASSERT_TRUE(w.Step().AllOk());
         std::vector<Transform> lp(L);
-        w.GetData().DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform));
+        ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform)));
         front_foot_z_loaded = (lp[front_link] * link_geom_local[front_link]).position.z;
     }
     std::fprintf(stderr, "[robot-coupling] front_foot_z_loaded=%.4f\n",
@@ -382,12 +364,24 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
 
         nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
         EXPECT_TRUE(w.Ready());
+        if (!w.Ready()) { out.finite = false; return out; }
         nk::Data& d = w.GetData();
-        std::vector<float> urows(static_cast<size_t>(rows) * 32u, 0.0f);
+        const auto initial_state = ReadPipelineState(w);
+        PipelineState first_steps;
+        constexpr uint32_t replay_steps = 8u;
+        std::vector<float> targets(L);
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::DriveTarget, targets.data(), targets.size() * sizeof(float)));
+        EXPECT_TRUE(d.UploadField(nk::FieldId::DriveTarget, targets.data(), targets.size() * sizeof(float)));
+        std::vector<nk::NkRow> urows(rows);
         std::vector<float> lambda(rows, 0.0f);
         std::vector<Vec3> p;
         for (uint32_t s = 0; s < kSettleSteps + kHoldSteps; ++s) {
-            w.Step();
+            if (!w.Step().AllOk()) {
+                ADD_FAILURE() << "pipeline step " << s << " failed";
+                out.finite = false;
+                return out;
+            }
+            if (s + 1u == replay_steps) first_steps = ReadPipelineState(w);
             if (!patch_present || s < kSettleSteps) continue;
             // Capture the pool free surface / pocket at the first hold step (the
             // settled baseline) then track its max surface over the hold window.
@@ -401,7 +395,7 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
                 out.cloth_base_min_z = MinZUnderFootInSlice(
                     p, front_centre.x, front_centre.y, cloth_reach, 0u, n_soft);
                 std::vector<Transform> lp(L);
-                d.DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform));
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform)));
                 out.front_foot_z =
                     (lp[front_link] * link_geom_local[front_link]).position.z;
                 out.rear_foot_z =
@@ -409,24 +403,24 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
             }
             out.pool_max_surface =
                 std::max(out.pool_max_surface, SurfaceMaxZInSlice(p, n_soft, P));
-            d.DownloadField(nk::FieldId::Urows, urows.data(),
-                            urows.size() * sizeof(float));
-            d.DownloadField(nk::FieldId::Lambda, lambda.data(),
-                            lambda.size() * sizeof(float));
+            EXPECT_TRUE(d.DownloadField(nk::FieldId::Urows, urows.data(),
+                                        urows.size() * sizeof(nk::NkRow)));
+            EXPECT_TRUE(d.DownloadField(nk::FieldId::Lambda, lambda.data(),
+                                        lambda.size() * sizeof(float)));
             for (uint32_t row = 0u; row < rows; ++row) {
-                const RowSides rs = DecodeRow(urows, row);
-                if (!rs.active) continue;
-                const bool a_part = rs.a_kind == nk::kNkSideParticle;
-                const bool b_part = rs.b_kind == nk::kNkSideParticle;
+                const auto& rs = urows[row];
+                if ((rs.flags & nk::nk_row_flags::kActive) == 0u) continue;
+                const bool a_part = rs.a.kind == nk::kNkSideParticle;
+                const bool b_part = rs.b.kind == nk::kNkSideParticle;
                 if (!(a_part || b_part)) continue;
                 if (a_part && b_part) { ++out.two_particle_rows; continue; }
-                const uint32_t body_idx = a_part ? rs.b_index : rs.a_index;
-                const uint32_t part_idx = a_part ? rs.a_index : rs.b_index;
+                const auto& owner = a_part ? rs.b : rs.a;
+                const uint32_t part_idx = a_part ? rs.a.index : rs.b.index;
                 if (part_idx < n_soft) ++out.cloth_any_rows; else ++out.fluid_any_rows;
-                const bool is_link = body_idx < body_to_link.size() &&
-                                     body_to_link[body_idx] != ~uint32_t(0);
-                if (!is_link) continue;
-                const bool normal = rs.upper > 1.0e30f;
+                if (owner.kind != nk::kNkSideArtic) continue;
+                EXPECT_LT(owner.index, w.GetModel().capacities.articulations_per_env);
+                EXPECT_LT(part_idx, P);
+                const bool normal = (rs.flags & nk::nk_row_flags::kContactNormal) != 0u;
                 if (part_idx < n_soft) {           // the cloth (soft) slice.
                     ++out.cloth_link_rows;
                     if (normal)
@@ -441,8 +435,10 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
             }
         }
         out.q.assign(L, 0.0f); out.qdot.assign(L, 0.0f);
-        d.DownloadField(nk::FieldId::Q, out.q.data(), L * sizeof(float));
-        d.DownloadField(nk::FieldId::Qdot, out.qdot.data(), L * sizeof(float));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::Q, out.q.data(), L * sizeof(float)));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::Qdot, out.qdot.data(), L * sizeof(float)));
+        for (float value : out.q) out.finite = out.finite && std::isfinite(value);
+        for (float value : out.qdot) out.finite = out.finite && std::isfinite(value);
         DownloadParticles(w, &p);
         for (const Vec3& q : p)
             if (!(std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z)))
@@ -454,6 +450,19 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
             out.pool_min_z = MinZUnderFootInSlice(p, rear_foot.x, rear_foot.y,
                                                   0.5f * kContactDMin + 2.0f * kPoolSpacing,
                                                   n_soft, P);
+            for (const auto& selection : std::vector<std::vector<uint32_t>>{{}, {0u}}) {
+                EXPECT_EQ(w.Reset(selection), nphi::Status::Ok);
+                EXPECT_EQ(ReadPipelineState(w), initial_state);
+                std::vector<float> restored_targets(L);
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::DriveTarget, restored_targets.data(),
+                                            restored_targets.size() * sizeof(float)));
+                EXPECT_EQ(restored_targets, targets);
+                uint32_t contact_count = ~0u;
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::ContactCount, &contact_count, sizeof(contact_count)));
+                EXPECT_EQ(contact_count, 0u);
+                for (uint32_t s = 0u; s < replay_steps; ++s) EXPECT_TRUE(w.Step().AllOk());
+                EXPECT_EQ(ReadPipelineState(w), first_steps);
+            }
         }
         return out;
     };

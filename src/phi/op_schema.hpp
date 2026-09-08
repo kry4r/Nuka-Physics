@@ -232,6 +232,8 @@ struct SnapshotStepVelocityParams {
 struct FkWorldPosesParams {
     uint32_t articulation_count;
     uint32_t total_link_count;
+    uint32_t articulations_per_env;
+    uint32_t selected_env_count;  // 0 = all; otherwise index reset_env_ids
 };
 
 struct IntegratePositionParams {
@@ -482,6 +484,7 @@ struct SyncLinkBodyPoseParams {
     uint32_t env_count;
     uint32_t links_per_env;   // per-env link stride (the kernel grids env*links)
     uint32_t bodies_per_env;  // body rows per env (the per-env body stride)
+    uint32_t selected_env_count;  // 0 = all; otherwise index reset_env_ids
 };
 
 // General contact pipeline (H3): the per-cell heightfield midphase. One
@@ -882,70 +885,44 @@ struct ExportObsParams {
 // ReadoutUnionContactObsParams (the union-only per-env contact obs params)
 // was DELETED here along with its op + kernel. Grasp/union moved to RL.
 
-// ResetEnvs: per-env masked snapshot restore. The env-id list is uploaded into
-// the reset_env_ids field (scratch) by World::Reset BEFORE the dispatch; count
-// is how many leading entries are valid.
+// Restore selected environments and invalidate their contact state.
 struct ResetEnvsParams {
     uint32_t count;
     uint32_t env_count;
-    uint32_t base_link_count;
-    uint32_t lambda_stride;     // row slots per env (== max_rows_per_env)
-    uint32_t contact_slot_count;// contact slots per env (cache clear span)
-    uint32_t articulation_count;
-    // movable rigid-body restore arm. body_count is the PER-ENV body
-    // stride (bodies_per_env); ResetEnvsKernel restores each reset env's body
-    // slice [env*body_count, env*body_count+body_count) from the snapshot_body_*
-    // fields. 0 => no bodies (the articulation-only path stays byte-identical).
-    uint32_t body_count;        // bodies per env (snapshot_body_* slice stride)
-    // Per-env particle stride (particles_per_env): ResetEnvsKernel restores each
-    // reset env's particle slice [env*particle_count, +particle_count) from the
-    // snapshot_particle_* fields so a coupled-world per-env reset is particle-
-    // complete. 0 => no particles (the articulation/body path stays byte-identical).
-    uint32_t particle_count;    // particles per env (snapshot_particle_* slice stride)
-    // OPTIONAL per-env Philox initial-condition randomization,
-    // applied ON TOP of the snapshot restore. ALL fields default-zero (this POD
-    // is value-init), and EACH perturbation is gated `if (half != 0)` in the
-    // kernel, so an all-zero params (every existing go2/fused caller) yields the
-    // VERBATIM snapshot copy — byte-identical to the pre- reset.
-    uint64_t ic_seed;           // Philox seed (0 default; combined with ic_episode)
-    uint32_t ic_episode;        // bumped each Reset so successive resets differ
-    // Name-agnostic single-body position jitter override: the reset op applies
-    // jitter_body_xyz to whichever body slot jitter_body_index names (was the
-    // cup-specific cup_body_index/jitter_cup_xy; a general reset must not bake an
-    // asset identity). All-zero halves => no jitter (verbatim snapshot copy).
-    uint32_t jitter_body_index; // which body slot the per-body jitter targets (0)
-    float    jitter_body_xyz[3];// +/- half-range for that body's pose x/y/z (0=off)
-    float    jitter_base_pos[3];// +/- half-range for base pose x/y/z (0 => off)
-    float    jitter_q;          // +/- half-range for each generalized coord (0=off)
+    uint32_t base_link_count;       // links per env
+    uint32_t lambda_stride;         // rows per env
+    uint32_t contact_slot_count;    // slots per env
+    uint32_t articulation_count;    // total roots
+    uint32_t articulations_per_env;
+    uint32_t dofs_per_articulation;
+    uint32_t use_env_ids;           // 0 = consecutive envs; 1 = reset_env_ids
+    uint32_t body_count;            // bodies per env
+    uint32_t particle_count;        // particles per env
+    uint64_t ic_seed;
+    uint32_t ic_episode;
+    uint32_t jitter_body_index;
+    float    jitter_body_xyz[3];    // symmetric half-ranges; zero disables jitter
+    float    jitter_base_pos[3];
+    float    jitter_q;
 };
 
 struct SnapshotStateParams {
     uint32_t total_link_count;
     uint32_t env_count;
-    // env-major total movable rigid-body count (bodies_per_env*env_count).
-    // OpSnapshotState appends the body_pose/lin/ang D2D copies after the four
-    // articulation copies. 0 => no bodies (articulation snapshot byte-identical).
+    uint32_t articulation_count;
     uint32_t total_body_count;
-    // Env-major total particle count (particles_per_env*env_count). OpSnapshotState
-    // appends the particle pos/prev_pos/vel D2D copies; 0 => no particle slice
-    // (snapshot byte-identical to a particle-free world).
     uint32_t total_particle_count;
 };
 
-// RestoreState: bulk snapshot -> live restore + clear the carried accumulators
-// (qddot / tau / lambda), the legacy batched articulated Reset 1:1.
+// Restore all environments with the same state lifecycle as a masked reset.
 struct RestoreStateParams {
     uint32_t total_link_count;
     uint32_t env_count;
-    uint32_t row_slot_count;    // env_count * max_rows_per_env (lambda clear)
-    uint32_t contact_slot_count;// env_count * max_contacts_per_env (cache clear)
-    // env-major total movable rigid-body count (bodies_per_env*env_count).
-    // OpRestoreState appends the body_pose/lin/ang snapshot->live copies after
-    // the articulation restore. 0 => no bodies (articulation restore unchanged).
+    uint32_t articulation_count;
+    uint32_t dofs_per_articulation;
+    uint32_t row_slot_count;
+    uint32_t contact_slot_count;
     uint32_t total_body_count;
-    // Env-major total particle count (particles_per_env*env_count). OpRestoreState
-    // appends the particle pos/prev_pos/vel snapshot->live copies; 0 => no particle
-    // slice (restore byte-identical to a particle-free world).
     uint32_t total_particle_count;
 };
 
