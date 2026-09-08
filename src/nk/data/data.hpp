@@ -36,7 +36,7 @@ public:
 
     // Zero every data-owned field (Reset baseline; the per-env ResetEnvs op does
     // the selective reset in M3b — M3a's Reset just re-zeros for now).
-    void ZeroAll() { arena_.ZeroAll(); }
+    phi::Status ZeroAll() { return arena_.ZeroAll(); }
 
     // -- snapshot / restore plumbing (backs SnapshotState / RestoreState ops) --
     // M3a: a host-side full copy of the PERSISTENT arena buffer (the live state
@@ -67,6 +67,14 @@ public:
     }
 
     const Arena& GetArena() const { return arena_; }
+    phi::Status UploadFieldStatus(FieldId id, const void* src, uint64_t bytes,
+                                   uint64_t byte_offset = 0) const {
+        return arena_.UploadFieldStatus(id, src, bytes, byte_offset);
+    }
+    phi::Status DownloadFieldStatus(FieldId id, void* dst, uint64_t bytes,
+                                     uint64_t byte_offset = 0) const {
+        return arena_.DownloadFieldStatus(id, dst, bytes, byte_offset);
+    }
     const std::vector<Arena::Segment>& Segments() const { return arena_.Segments(); }
 
 private:

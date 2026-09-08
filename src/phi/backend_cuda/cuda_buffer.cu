@@ -16,6 +16,8 @@
 #include "phi/backend_cuda/cuda_internal.cuh"
 
 #include <cstdint>
+#include <new>
+#include <cstring>
 
 namespace nuka::phi {
 
@@ -32,6 +34,7 @@ void BufferFreeImpl(Buffer* b) {
         return;
     }
     if (cb->ptr != nullptr) {
+        (void)cudaSetDevice(cb->device_id);
         if (cb->is_host) {
             (void)cudaFreeHost(cb->ptr);
         } else {
@@ -43,36 +46,76 @@ void BufferFreeImpl(Buffer* b) {
 
 void* BufferBaseImpl(Buffer* b) { return AsBuffer(b)->ptr; }
 
-void BufferUploadImpl(Buffer* b, const void* src, size_t off, size_t n) {
+Status BufferUploadImpl(Buffer* b, const void* src, size_t off, size_t n) {
     CudaBuffer* cb = AsBuffer(b);
+    if (off > cb->bytes || n > cb->bytes - off || (n != 0u && src == nullptr)) return Status::InvalidArgument;
+    if (n == 0u) return Status::Ok;
+    if (const auto status = cudaSetDevice(cb->device_id); status != cudaSuccess) return CudaStatus(status);
     cudaStream_t s = CudaBackendMainStream(cb->backend);
-    (void)cudaMemcpyAsync(static_cast<uint8_t*>(cb->ptr) + off, src, n,
-                          cudaMemcpyHostToDevice, s);
+    if (cb->is_host) {
+        const auto status = cudaStreamSynchronize(s);
+        if (status != cudaSuccess) return CudaStatus(status);
+        std::memcpy(static_cast<uint8_t*>(cb->ptr) + off, src, n);
+        return Status::Ok;
+    }
+    return CudaStatus(cudaMemcpyAsync(static_cast<uint8_t*>(cb->ptr) + off, src, n,
+                                      cudaMemcpyHostToDevice, s));
 }
 
-void BufferDownloadImpl(Buffer* b, void* dst, size_t off, size_t n) {
+Status BufferDownloadImpl(Buffer* b, void* dst, size_t off, size_t n) {
     CudaBuffer* cb = AsBuffer(b);
+    if (off > cb->bytes || n > cb->bytes - off || (n != 0u && dst == nullptr)) return Status::InvalidArgument;
+    if (n == 0u) return Status::Ok;
+    if (const auto status = cudaSetDevice(cb->device_id); status != cudaSuccess) return CudaStatus(status);
     cudaStream_t s = CudaBackendMainStream(cb->backend);
-    (void)cudaMemcpyAsync(dst, static_cast<const uint8_t*>(cb->ptr) + off, n,
-                          cudaMemcpyDeviceToHost, s);
+    if (cb->is_host) {
+        const auto status = cudaStreamSynchronize(s);
+        if (status != cudaSuccess) return CudaStatus(status);
+        std::memcpy(dst, static_cast<const uint8_t*>(cb->ptr) + off, n);
+        return Status::Ok;
+    }
+    const auto status = cudaMemcpyAsync(dst, static_cast<const uint8_t*>(cb->ptr) + off, n,
+                                        cudaMemcpyDeviceToHost, s);
+    if (status != cudaSuccess) return CudaStatus(status);
     // download is observable host-side; make it synchronous from the caller's
     // view by syncing the stream the copy was issued on.
-    (void)cudaStreamSynchronize(s);
+    return CudaStatus(cudaStreamSynchronize(s));
 }
 
-void BufferMemsetImpl(Buffer* b, uint8_t v, size_t off, size_t n) {
+Status BufferMemsetImpl(Buffer* b, uint8_t v, size_t off, size_t n) {
     CudaBuffer* cb = AsBuffer(b);
+    if (off > cb->bytes || n > cb->bytes - off) return Status::InvalidArgument;
+    if (n == 0u) return Status::Ok;
+    if (const auto status = cudaSetDevice(cb->device_id); status != cudaSuccess) return CudaStatus(status);
     cudaStream_t s = CudaBackendMainStream(cb->backend);
-    (void)cudaMemsetAsync(static_cast<uint8_t*>(cb->ptr) + off, v, n, s);
+    if (cb->is_host) {
+        const auto status = cudaStreamSynchronize(s);
+        if (status != cudaSuccess) return CudaStatus(status);
+        std::memset(static_cast<uint8_t*>(cb->ptr) + off, v, n);
+        return Status::Ok;
+    }
+    return CudaStatus(cudaMemsetAsync(static_cast<uint8_t*>(cb->ptr) + off, v, n, s));
 }
 
-void BufferCopyFromImpl(Buffer* dst, Buffer* src, size_t doff, size_t soff, size_t n) {
+Status BufferCopyFromImpl(Buffer* dst, Buffer* src, size_t doff, size_t soff, size_t n) {
+    if (IfaceOf(src) != IfaceOf(dst)) return Status::Unsupported;
     CudaBuffer* cd = AsBuffer(dst);
     CudaBuffer* cs = AsBuffer(src);
+    if (doff > cd->bytes || n > cd->bytes - doff || soff > cs->bytes || n > cs->bytes - soff)
+        return Status::InvalidArgument;
+    if (n == 0u) return Status::Ok;
+    if (cd->device_id != cs->device_id || cd->backend != cs->backend) return Status::Unsupported;
+    if (const auto status = cudaSetDevice(cd->device_id); status != cudaSuccess) return CudaStatus(status);
     cudaStream_t s = CudaBackendMainStream(cd->backend);
-    (void)cudaMemcpyAsync(static_cast<uint8_t*>(cd->ptr) + doff,
+    if (cd->is_host && cs->is_host) {
+        const auto status = cudaStreamSynchronize(s);
+        if (status != cudaSuccess) return CudaStatus(status);
+        std::memcpy(static_cast<uint8_t*>(cd->ptr) + doff, static_cast<const uint8_t*>(cs->ptr) + soff, n);
+        return Status::Ok;
+    }
+    return CudaStatus(cudaMemcpyAsync(static_cast<uint8_t*>(cd->ptr) + doff,
                           static_cast<const uint8_t*>(cs->ptr) + soff, n,
-                          cudaMemcpyDeviceToDevice, s);
+                          cudaMemcpyDefault, s));
 }
 
 const BufferI kCudaBufferI = {
@@ -89,9 +132,13 @@ const BufferI kCudaBufferI = {
 const char* DeviceBufferTypeName(BufferType*) { return "cuda_device"; }
 const char* HostBufferTypeName(BufferType*) { return "cuda_pinned_host"; }
 
-Buffer* BufferTypeAllocImpl(BufferType* t, size_t bytes) {
+Buffer* BufferTypeAllocImpl(BufferType* t, size_t bytes, Status* status) {
     CudaBufferType* ct = AsBufferType(t);
-    return CudaBufferAlloc(ct->backend, bytes, ct->is_host);
+    if (ct->device_id >= 0) {
+        const auto selected = cudaSetDevice(ct->device_id);
+        if (selected != cudaSuccess) { if (status) *status = CudaStatus(selected); return nullptr; }
+    }
+    return CudaBufferAlloc(ct->backend, bytes, ct->is_host, status);
 }
 
 size_t BufferTypeAlignmentImpl(BufferType*) { return 256; }
@@ -116,22 +163,34 @@ const BufferTypeI kCudaHostBufferTypeI = {
     /*is_host   =*/ &HostBufferTypeIsHost,
 };
 
-Buffer* CudaBufferAlloc(CudaBackend* backend, size_t bytes, bool is_host) {
+Buffer* CudaBufferAlloc(CudaBackend* backend, size_t bytes, bool is_host, Status* status) {
+    if (status) *status = Status::Ok;
+    int device_id = 0;
+    const auto selected = backend ? cudaSetDevice(backend->device_id) : cudaGetDevice(&device_id);
+    if (selected != cudaSuccess) { if (status) *status = CudaStatus(selected); return nullptr; }
+    if (backend) device_id = backend->device_id;
     void* ptr = nullptr;
     if (bytes > 0) {
         cudaError_t err = is_host ? cudaMallocHost(&ptr, bytes)
                                   : cudaMalloc(&ptr, bytes);
         if (err != cudaSuccess) {
+            if (status) *status = CudaStatus(err);
             (void)cudaGetLastError();  // clear the sticky error
             return nullptr;
         }
     }
-    CudaBuffer* cb = new CudaBuffer{};
+    CudaBuffer* cb = new (std::nothrow) CudaBuffer{};
+    if (!cb) {
+        if (ptr) { if (is_host) cudaFreeHost(ptr); else cudaFree(ptr); }
+        if (status) *status = Status::OutOfMemory;
+        return nullptr;
+    }
     cb->iface   = &kCudaBufferI;
     cb->backend = backend;
     cb->ptr     = ptr;
     cb->bytes   = bytes;
     cb->is_host = is_host;
+    cb->device_id = device_id;
     return reinterpret_cast<Buffer*>(cb);
 }
 

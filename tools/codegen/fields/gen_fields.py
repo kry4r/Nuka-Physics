@@ -168,6 +168,13 @@ def gen_field_ids(fields: list[dict[str, Any]]) -> str:
     lines.append("};")
     lines.append("")
     lines.append("inline constexpr int kFieldCount = static_cast<int>(FieldId::Count);")
+    lines.append("inline constexpr const char* kFieldNames[kFieldCount] = {")
+    for f in fields:
+        lines.append(f'    "{f["name"]}",')
+    lines.append("};")
+    lines.append("inline constexpr const char* FieldName(FieldId id) {")
+    lines.append('    return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";')
+    lines.append("}")
     lines.append("")
     lines.append("} // namespace nuka::nk")
     lines.append("")

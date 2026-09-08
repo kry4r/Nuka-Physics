@@ -33,6 +33,7 @@ struct CudaBufferType {
     const BufferTypeI* iface;   // MUST be first (opaque-handle contract)
     CudaBackend*       backend; // for the async stream; null => default stream
     bool               is_host;
+    int                device_id = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,7 @@ struct CudaBuffer {
     void*          ptr;     // device (or pinned-host) base address
     size_t         bytes;
     bool           is_host;
+    int            device_id;
 };
 
 // ---------------------------------------------------------------------------
@@ -64,7 +66,16 @@ struct CudaBackend {
 cudaStream_t CudaBackendMainStream(CudaBackend* b);
 
 // Factory for a CudaBuffer (defined in cuda_buffer.cu). Returns nullptr on OOM.
-Buffer* CudaBufferAlloc(CudaBackend* backend, size_t bytes, bool is_host);
+Buffer* CudaBufferAlloc(CudaBackend* backend, size_t bytes, bool is_host, Status* status = nullptr);
+
+inline Status CudaStatus(cudaError_t status) {
+    if (status == cudaSuccess) return Status::Ok;
+    if (status == cudaErrorMemoryAllocation) return Status::OutOfMemory;
+    if (status == cudaErrorInvalidValue) return Status::InvalidArgument;
+    if (status == cudaErrorNotSupported || status == cudaErrorStreamCaptureUnsupported)
+        return Status::Unsupported;
+    return Status::Failed;
+}
 
 // One-shot explicit registration of the CUDA RegistryEntry into the global
 // registry. Called from registry.cpp::InitBestDevice() so the static

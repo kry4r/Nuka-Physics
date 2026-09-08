@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "phi/status.hpp"
 
 namespace nuka::phi {
 
@@ -30,7 +31,7 @@ struct Buffer;
 // ---------------------------------------------------------------------------
 struct BufferTypeI {
     const char* (*get_name)(BufferType*);
-    Buffer*     (*alloc)(BufferType*, size_t bytes);   // backend owns device memory
+    Buffer*     (*alloc)(BufferType*, size_t bytes, Status* status);
     size_t      (*alignment)(BufferType*);             // CUDA returns 256
     bool        (*is_host)(BufferType*);
 };
@@ -44,10 +45,10 @@ struct BufferTypeI {
 struct BufferI {
     void  (*free)(Buffer*);
     void* (*base)(Buffer*);                                          // device base address
-    void  (*upload)  (Buffer*, const void* src, size_t off, size_t n);   // async on backend stream
-    void  (*download)(Buffer*, void* dst,       size_t off, size_t n);
-    void  (*memset)  (Buffer*, uint8_t v,       size_t off, size_t n);
-    void  (*copy_from)(Buffer* dst, Buffer* src, size_t doff, size_t soff, size_t n); // D2D
+    Status (*upload)  (Buffer*, const void* src, size_t off, size_t n);
+    Status (*download)(Buffer*, void* dst, size_t off, size_t n);
+    Status (*memset)  (Buffer*, uint8_t v, size_t off, size_t n);
+    Status (*copy_from)(Buffer* dst, Buffer* src, size_t doff, size_t soff, size_t n);
 };
 
 // The opaque-handle layout contract: every concrete BufferType / Buffer begins
@@ -65,18 +66,27 @@ inline const BufferI* IfaceOf(Buffer* b) {
 
 // --- BufferType convenience wrappers ------------------------------------
 inline const char* BufferTypeName(BufferType* t)   { return IfaceOf(t)->get_name(t); }
-inline Buffer*     BufferAlloc(BufferType* t, size_t bytes) { return IfaceOf(t)->alloc(t, bytes); }
+inline Buffer* BufferAlloc(BufferType* t, size_t bytes, Status* status = nullptr) {
+    if (!t) { if (status) *status = Status::InvalidArgument; return nullptr; }
+    return IfaceOf(t)->alloc(t, bytes, status);
+}
 inline size_t      BufferTypeAlignment(BufferType* t) { return IfaceOf(t)->alignment(t); }
 inline bool        BufferTypeIsHost(BufferType* t) { return IfaceOf(t)->is_host(t); }
 
 // --- Buffer convenience wrappers ----------------------------------------
 inline void  BufferFree(Buffer* b)  { IfaceOf(b)->free(b); }
 inline void* BufferBase(Buffer* b)  { return IfaceOf(b)->base(b); }
-inline void  BufferUpload(Buffer* b, const void* src, size_t off, size_t n)  { IfaceOf(b)->upload(b, src, off, n); }
-inline void  BufferDownload(Buffer* b, void* dst, size_t off, size_t n)      { IfaceOf(b)->download(b, dst, off, n); }
-inline void  BufferMemset(Buffer* b, uint8_t v, size_t off, size_t n)        { IfaceOf(b)->memset(b, v, off, n); }
-inline void  BufferCopyFrom(Buffer* dst, Buffer* src, size_t doff, size_t soff, size_t n) {
-    IfaceOf(dst)->copy_from(dst, src, doff, soff, n);
+inline Status BufferUpload(Buffer* b, const void* src, size_t off, size_t n) {
+    return b ? IfaceOf(b)->upload(b, src, off, n) : Status::InvalidArgument;
+}
+inline Status BufferDownload(Buffer* b, void* dst, size_t off, size_t n) {
+    return b ? IfaceOf(b)->download(b, dst, off, n) : Status::InvalidArgument;
+}
+inline Status BufferMemset(Buffer* b, uint8_t v, size_t off, size_t n) {
+    return b ? IfaceOf(b)->memset(b, v, off, n) : Status::InvalidArgument;
+}
+inline Status BufferCopyFrom(Buffer* dst, Buffer* src, size_t doff, size_t soff, size_t n) {
+    return dst && src ? IfaceOf(dst)->copy_from(dst, src, doff, soff, n) : Status::InvalidArgument;
 }
 
 } // namespace nuka::phi

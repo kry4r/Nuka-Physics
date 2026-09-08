@@ -309,6 +309,8 @@ struct DataView {
     uint32_t* body_gyro_status = nullptr;  // per:body arena:scratch owner:data flags:[readout]
     uint32_t* grid_neighbor_attempted = nullptr;  // per:particle arena:scratch owner:data flags:[readout]
     uint64_t* grid_neighbor_scan_offset = nullptr;  // per:particle arena:scratch owner:data
+    uint8_t* lbvh_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:lbvh_sort_scratch_bytes
+    uint8_t* contact_cache_scratch = nullptr;  // per:scalar arena:scratch owner:data count:contact_cache_scratch_bytes
 };
 
 } // namespace nuka::phi

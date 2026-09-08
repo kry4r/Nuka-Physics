@@ -101,6 +101,8 @@ struct ModelCapacities {
     // radix sort over the rigid slot capacity; sized at World construct,
     // 0 == non-PairDriven world -> the emitted stream stays as-is).
     uint64_t pair_sort_scratch_bytes = 0;
+    uint64_t lbvh_sort_scratch_bytes = 0;
+    uint64_t contact_cache_scratch_bytes = 0;
 
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
@@ -121,7 +123,8 @@ struct ModelCapacities {
     // Resolve a FieldPer count-unit to a concrete per-env element count using
     // these capacities (env-major; the env multiplier is applied by the Arena /
     // UploadTo packer, NOT folded in here -- this returns the PER-ENV count).
-    uint32_t PerEnvCount(FieldPer per) const;
+    uint64_t PerEnvCount(FieldPer per) const;
+    phi::Status Validate(std::string* reason = nullptr) const;
     // Total element count across all envs for a field (per-env x env_count, with
     // scalar fields counted once per env unless they are global). mat_buckets is
     // the one symbolic per:scalar field; its count = num_material_buckets*8.

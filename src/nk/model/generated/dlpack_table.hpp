@@ -300,6 +300,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::BodyGyroStatus, DlpackDtype::kU32, 1, false, true},  // body_gyro_status
     {FieldId::GridNeighborAttempted, DlpackDtype::kU32, 1, false, true},  // grid_neighbor_attempted
     {FieldId::GridNeighborScanOffset, DlpackDtype::kU64, 1, false, false},  // grid_neighbor_scan_offset
+    {FieldId::LbvhSortScratch, DlpackDtype::kU8, 1, false, false},  // lbvh_sort_scratch
+    {FieldId::ContactCacheScratch, DlpackDtype::kU8, 1, false, false},  // contact_cache_scratch
 };
 
 } // namespace nuka::nk

@@ -450,7 +450,8 @@ TEST(PairDrivenNarrowphase, WarmStartInvalidatesAndResetsDeterministically) {
     nk::Data& data = world.GetData();
     std::vector<uint64_t> pair(kPoints, 0u), feature(kPoints, 0u);
     std::vector<Vec3> normal(kPoints, Vec3::Zero());
-    std::vector<uint32_t> material(kPoints, 0u), age(kPoints, 0u);
+    std::vector<uint64_t> material(kPoints, 0u);
+    std::vector<uint32_t> age(kPoints, 0u);
     std::vector<float> cache_lambda(kPoints * 3u, 0.0f), rows(kRows, 0.0f);
     ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCachePair, pair.data(),
                                    pair.size() * sizeof(uint64_t)));
@@ -460,7 +461,7 @@ TEST(PairDrivenNarrowphase, WarmStartInvalidatesAndResetsDeterministically) {
                                    normal.size() * sizeof(Vec3)));
     ASSERT_TRUE(data.DownloadField(nk::FieldId::ContactCacheMaterial,
                                    material.data(),
-                                   material.size() * sizeof(uint32_t)));
+                                   material.size() * sizeof(uint64_t)));
     const uint32_t point_index = FirstCachedPoint(pair, feature);
     ASSERT_NE(point_index, ~0u);
     const uint32_t normal_row = (point_index / 4u) *
@@ -487,7 +488,7 @@ TEST(PairDrivenNarrowphase, WarmStartInvalidatesAndResetsDeterministically) {
                                  cache_lambda.size() * sizeof(float)));
     ASSERT_TRUE(data.UploadField(nk::FieldId::ContactCacheMaterial,
                                  material.data(),
-                                 material.size() * sizeof(uint32_t)));
+                                 material.size() * sizeof(uint64_t)));
     ASSERT_TRUE(world.Step().AllOk());
     ASSERT_TRUE(data.DownloadField(nk::FieldId::Lambda, rows.data(),
                                    rows.size() * sizeof(float)));

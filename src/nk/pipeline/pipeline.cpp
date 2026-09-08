@@ -338,6 +338,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_lbvh_build_.family = family;
         p_lbvh_build_.env_count = env_count;
         p_lbvh_build_.bodies_per_env = bodies_per_env;
+        p_lbvh_build_.workspace_bytes = cap.lbvh_sort_scratch_bytes;
         add(phi::NkOp::LbvhBuild, &p_lbvh_build_);
 
         p_lbvh_query_.max_pairs = pair_emit_cap;
@@ -346,6 +347,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_lbvh_query_.bodies_per_env = bodies_per_env;
         p_lbvh_query_.max_contacts_per_env = cap.max_contacts_per_env;
         p_lbvh_query_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
+        p_lbvh_query_.workspace_bytes = cap.pair_sort_scratch_bytes;
         p_lbvh_query_.filter_cross_env = model.filter_cross_env ? 1u : 0u;
         p_lbvh_query_.excluded_count =
             static_cast<uint32_t>(model.excluded_pairs.size());
@@ -559,6 +561,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
             p_warm_start_prepare_.rows_per_env = cap.max_rows_per_env;
             p_warm_start_prepare_.full_row_slot_count = rigid_cap;
             p_warm_start_prepare_.decay_steps = 2u;
+            p_warm_start_prepare_.workspace_bytes = cap.contact_cache_scratch_bytes;
         }
         add(phi::NkOp::AssembleRows, &p_assemble_);
         if constexpr (family == phi::kContactFamilyPairDriven) {

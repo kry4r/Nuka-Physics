@@ -29,6 +29,7 @@
 #include "phi/buffer.hpp"   // BufferType
 #include "phi/plan.hpp"     // Plan
 #include "phi/event.hpp"    // Event
+#include "phi/status.hpp"
 
 namespace nuka::phi {
 
@@ -43,7 +44,12 @@ struct ModelView;
 struct DataView;
 
 // --- Status --------------------------------------------------------------
-enum class Status : uint8_t { Ok, Unsupported, Failed, OutOfMemory, InvalidArgument };
+struct ExecutionError {
+    Status status = Status::Ok;
+    NkOp failed_op = NkOp::Count;
+    int32_t native_code = 0;
+    char message[256]{};
+};
 
 // --- OpCall --------------------------------------------------------------
 // One unit of work: an op id + a pointer to that op's POD params (op_schema.hpp).
@@ -61,9 +67,9 @@ struct BackendI {
     const char* (*get_name)(Backend*);
     void        (*free)(Backend*);
     Status      (*dispatch)(Backend*, const ModelView&, const DataView&, const OpCall&);
-    void        (*synchronize)(Backend*);
-    Plan*       (*plan_create)(Backend*, const ModelView&, const DataView&, const OpCall* calls, int n_calls);
-    Status      (*plan_execute)(Backend*, Plan*);
+    Status      (*synchronize)(Backend*, ExecutionError*);
+    Plan*       (*plan_create)(Backend*, const ModelView&, const DataView&, const OpCall* calls, int n_calls, ExecutionError*);
+    Status      (*plan_execute)(Backend*, Plan*, ExecutionError*);
     void        (*plan_free)(Backend*, Plan*);
     Event*      (*event_new)(Backend*);
     void        (*event_record)(Backend*, Event*);
@@ -109,11 +115,16 @@ inline void        BackendFree(Backend* b) { IfaceOf(b)->free(b); }
 inline Status      BackendDispatch(Backend* b, const ModelView& m, const DataView& d, const OpCall& call) {
     return IfaceOf(b)->dispatch(b, m, d, call);
 }
-inline void        BackendSynchronize(Backend* b) { IfaceOf(b)->synchronize(b); }
-inline Plan*       BackendPlanCreate(Backend* b, const ModelView& m, const DataView& d, const OpCall* calls, int n_calls) {
-    return IfaceOf(b)->plan_create(b, m, d, calls, n_calls);
+inline Status BackendSynchronize(Backend* b, ExecutionError* error = nullptr) {
+    return IfaceOf(b)->synchronize(b, error);
 }
-inline Status      BackendPlanExecute(Backend* b, Plan* p) { return IfaceOf(b)->plan_execute(b, p); }
+inline Plan* BackendPlanCreate(Backend* b, const ModelView& m, const DataView& d,
+                              const OpCall* calls, int n_calls, ExecutionError* error = nullptr) {
+    return IfaceOf(b)->plan_create(b, m, d, calls, n_calls, error);
+}
+inline Status BackendPlanExecute(Backend* b, Plan* p, ExecutionError* error = nullptr) {
+    return IfaceOf(b)->plan_execute(b, p, error);
+}
 inline void        BackendPlanFree(Backend* b, Plan* p)    { IfaceOf(b)->plan_free(b, p); }
 inline Event*      BackendEventNew(Backend* b)             { return IfaceOf(b)->event_new(b); }
 inline void        BackendEventRecord(Backend* b, Event* e) { IfaceOf(b)->event_record(b, e); }

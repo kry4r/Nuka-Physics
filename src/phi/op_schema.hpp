@@ -297,6 +297,7 @@ struct LbvhBuildParams {
     uint32_t family;            // kContactFamily* (PairDriven => build)
     uint32_t env_count;
     uint32_t bodies_per_env;
+    uint64_t workspace_bytes = 0u;
 };
 
 struct LbvhQueryPairsParams {
@@ -311,6 +312,7 @@ struct LbvhQueryPairsParams {
     // [0, rigid_slot_cap); the body<->particle narrowphase owns [rigid_slot_cap,
     // stride). Equals the stride when no particles -> byte-identical.
     uint32_t rigid_slot_cap;
+    uint64_t workspace_bytes;
 };
 
 struct ParticleGridBuildParams {
@@ -355,6 +357,8 @@ uint64_t IslandSortScratchBytes(uint32_t total_rows);
 // snapshot from. Host-callable (defined in broadphase.cu) so the World sizes the
 // field BEFORE allocation -> no mid-capture cudaMalloc. 0 for empty inputs.
 uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count);
+uint64_t LbvhSortScratchBytes(uint32_t env_count, uint32_t bodies_per_env);
+uint64_t ContactCacheScratchBytes(uint32_t point_count, uint32_t env_count);
 
 // Dynamic solve-island build (connected components over the active contact rows).
 // All launch geometry is a fixed function of the capacities (graph-capturable); the
@@ -939,6 +943,7 @@ struct ContactWarmStartParams {
     uint32_t rows_per_env;
     uint32_t full_row_slot_count;
     uint32_t decay_steps;        // absent contacts expire after this many steps
+    uint64_t workspace_bytes = 0u;
 };
 
 // --- domain randomization -----------------------------------------------

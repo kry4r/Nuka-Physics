@@ -533,6 +533,8 @@ struct BatchedSensorSceneDevice::Impl {
     // allocation's byte size so growth-only realloc is honest across steps.
     OwnedBuffer d_instances, d_world_aabbs, d_tlas_nodes;
     OwnedBuffer d_morton, d_index, d_sortkey, d_visit;
+    OwnedBuffer d_lbvh_workspace;
+    std::size_t lbvh_workspace_bytes = 0u;
     std::size_t inst_b = 0u, aabb_b = 0u, node_b = 0u;
     std::size_t mort_b = 0u, idx_b = 0u, key_b = 0u, vis_b = 0u;
     uint32_t env_count = 0u;
@@ -755,6 +757,13 @@ void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ct
     const uint64_t total_inst = static_cast<uint64_t>(env_count) * m;
     const uint64_t node_count = static_cast<uint64_t>(env_count) * (2u * m - 1u);
 
+    if (env_count != impl->env_count || !impl->topology_built) {
+        size_t bytes = 0u;
+        const auto status = collision::gpu::QueryLbvhWorkspaceBytes(env_count, m, &bytes);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        EnsureBytes(impl->d_lbvh_workspace, impl->lbvh_workspace_bytes, bt, bytes);
+    }
+
     EnsureBytes(impl->d_instances, impl->inst_b, bt, total_inst * sizeof(DevInstance));
     EnsureBytes(impl->d_world_aabbs, impl->aabb_b, bt, total_inst * sizeof(AABB));
     EnsureBytes(impl->d_tlas_nodes, impl->node_b, bt, node_count * sizeof(LbvhNode));
@@ -782,12 +791,14 @@ void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ct
                         ctx.stream, d_instances, env_count, m);
     }
     if (need_rebuild) {
-        collision::gpu::BuildLbvhBatchedNodes(
+        const auto status = collision::gpu::BuildLbvhBatchedNodes(
             ctx.stream, ctx.device_id, d_world_aabbs, env_count, m, d_nodes,
             static_cast<uint32_t*>(impl->d_morton.Data()),
             static_cast<uint32_t*>(impl->d_index.Data()),
             static_cast<uint64_t*>(impl->d_sortkey.Data()),
-            static_cast<uint32_t*>(impl->d_visit.Data()));
+            static_cast<uint32_t*>(impl->d_visit.Data()),
+            impl->d_lbvh_workspace.Data(), impl->lbvh_workspace_bytes);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         impl->env_count = env_count;
         impl->topology_built = true;
         impl->frames_since_rebuild = 0u;

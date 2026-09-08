@@ -32,6 +32,7 @@
 
 #include <cfloat>
 #include <limits>
+#include <stdexcept>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 
@@ -81,14 +82,14 @@ struct GridSortScratchLayout {
     explicit GridSortScratchLayout(uint32_t particle_count) {
         const int n = static_cast<int>(particle_count);
         size_t sort_bytes = 0u;
-        (void)cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
+        if (cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
             nullptr, sort_bytes, static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), n);
+            static_cast<uint32_t*>(nullptr), n) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
         size_t scan_bytes = 0u;
-        (void)cub::DeviceScan::ExclusiveScan(
+        if (cub::DeviceScan::ExclusiveScan(
             nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
-            static_cast<uint64_t*>(nullptr), NkScanSumOp{}, uint64_t{0}, n);
+            static_cast<uint64_t*>(nullptr), NkScanSumOp{}, uint64_t{0}, n) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
         temp_bytes = sort_bytes > scan_bytes ? sort_bytes : scan_bytes;
         const uint64_t nbytes = static_cast<uint64_t>(particle_count) * sizeof(uint32_t);
         keys_off = AlignScratch(temp_bytes);
@@ -97,12 +98,8 @@ struct GridSortScratchLayout {
     }
 };
 
-// 256B-aligned partition of pair_sort_scratch [cub temp | keys-in | keys-out |
-// slot perms | pair snapshot]. Sizes the segment (World construct) and
-// partitions it (the op) identically. The canonicalizing sort turns the
-// atomicAdd race order of EnvQueryPairsKernel into a pure function of the pair
-// ids, so contact slots, row slots, GS sweep order, and the warm-start cache
-// are all deterministic run-to-run.
+// Sorting keys, permutations, and pair snapshots share the compact rigid-slot domain.
+// Per-environment counts and prefixes occupy separate aligned regions.
 struct PairSortScratchLayout {
     uint64_t temp_bytes = 0u;   // cub temp-storage region size (max of sort/scan).
     uint64_t keys_in_off = 0u;  // byte offset of the unsorted u64 keys.
@@ -116,15 +113,15 @@ struct PairSortScratchLayout {
     explicit PairSortScratchLayout(uint32_t sort_slots, uint32_t env_count) {
         const int n = static_cast<int>(sort_slots);
         size_t sort_bytes = 0u;
-        (void)cub::DeviceRadixSort::SortPairs<uint64_t, uint32_t>(
+        if (cub::DeviceRadixSort::SortPairs<uint64_t, uint32_t>(
             nullptr, sort_bytes, static_cast<const uint64_t*>(nullptr),
             static_cast<uint64_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), n);
+            static_cast<uint32_t*>(nullptr), n) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
         size_t scan_bytes = 0u;
-        (void)cub::DeviceScan::ExclusiveScan(
+        if (cub::DeviceScan::ExclusiveScan(
             nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), NkScanSumOp{}, 0u,
-            static_cast<int>(env_count));
+            static_cast<int>(env_count)) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
         temp_bytes = sort_bytes > scan_bytes ? sort_bytes : scan_bytes;
         const uint64_t kbytes = static_cast<uint64_t>(sort_slots) * sizeof(uint64_t);
         const uint64_t pbytes = static_cast<uint64_t>(sort_slots) * sizeof(uint32_t);
@@ -134,7 +131,7 @@ struct PairSortScratchLayout {
         perms_in_off = AlignScratch(keys_out_off + kbytes);
         perms_out_off = AlignScratch(perms_in_off + pbytes);
         snap_off = AlignScratch(perms_out_off + pbytes);
-        clamp_off = AlignScratch(snap_off + 2u * kbytes);
+        clamp_off = AlignScratch(snap_off + 2u * pbytes);
         prefix_off = AlignScratch(clamp_off + ebytes);
         total = AlignScratch(prefix_off + ebytes);
     }
@@ -441,11 +438,8 @@ __global__ void EnvQueryPairsKernel(const cg::LbvhNode* __restrict__ nodes,
     }
 }
 
-// Canonicalization pass 1: flatten each env's live pair slots into a u64 sort
-// key over GLOBAL collidable ids (env-major -> one global sort is env-major),
-// snapshot the pairs being sorted, and park dead slots at the key sentinel.
-// The perm stores the LINEAR source slot id (env*stride + slot) because the
-// global sort compacts live entries across env boundaries.
+// Snapshot compact rigid slots and sort their global pair identities.
+// Permutations address the compact snapshot, independent of particle-reserved slots.
 __global__ void PairSortFillKernel(uint32_t env_count, uint32_t slot_cap,
                                    uint32_t slot_stride,
                                    const uint32_t* __restrict__ counts,
@@ -468,14 +462,14 @@ __global__ void PairSortFillKernel(uint32_t env_count, uint32_t slot_cap,
     }
     const uint32_t a = pairs[at + 0];
     const uint32_t b = pairs[at + 1];
-    snap[at + 0] = a;
-    snap[at + 1] = b;
+    snap[f * 2u + 0u] = a;
+    snap[f * 2u + 1u] = b;
     // Emission guarantees a < b, so the packed key is already canonical; global
     // ids keep every env's segment contiguous and ascending under one sort.
     const uint64_t ga = static_cast<uint64_t>(env) * bodies_per_env + a;
     const uint64_t gb = static_cast<uint64_t>(env) * bodies_per_env + b;
     keys[f] = (ga << 32) | gb;
-    perms[f] = static_cast<uint32_t>(at / 2u);
+    perms[f] = static_cast<uint32_t>(f);
 }
 
 // Prefix of the per-env clamped live counts: dst_env's sorted entries occupy
@@ -650,10 +644,11 @@ Status OpLbvhBuild(const ModelView& /*model*/, const DataView& data,
     auto* nodes = reinterpret_cast<cg::LbvhNode*>(data.lbvh_nodes);
     // Shared batched env-build over the arena's split lo/hi AABBs. Leaf `.left`
     // is the env-LOCAL body index (the query maps it via the env's node slice).
-    cg::BuildLbvhBatchedNodes(stream, /*device_id=*/0, data.body_aabb_lo,
+    const auto result = cg::BuildLbvhBatchedNodes(stream, /*device_id=*/0, data.body_aabb_lo,
                               data.body_aabb_hi, E, N, nodes, data.lbvh_morton,
-                              data.lbvh_index, data.lbvh_sortkey, data.lbvh_visit);
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+                              data.lbvh_index, data.lbvh_sortkey, data.lbvh_visit,
+                              data.lbvh_sort_scratch, p->workspace_bytes);
+    return result == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
@@ -699,6 +694,7 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
         }
         const uint32_t sort_slots = static_cast<uint32_t>(sort_slots64);
         const PairSortScratchLayout sl(sort_slots, E);
+        if (p->workspace_bytes < sl.total) return Status::InvalidArgument;
         char* sbase = reinterpret_cast<char*>(data.pair_sort_scratch);
         void* sort_temp = sbase;
         uint64_t* keys_in = reinterpret_cast<uint64_t*>(sbase + sl.keys_in_off);
@@ -714,17 +710,17 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
         LaunchCuda(PairSortFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    E, p->rigid_slot_cap, p->max_contacts_per_env, data.pair_count,
                    data.candidate_pairs, N, keys_in, perms_in, snap);
-        (void)cub::DeviceRadixSort::SortPairs(
+        if (cub::DeviceRadixSort::SortPairs(
             sort_temp, temp_bytes, keys_in, keys_out, perms_in, perms_out,
-            static_cast<int>(sort_slots), 0, 64, stream);
+            static_cast<int>(sort_slots), 0, 64, stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
         {
             const uint32_t eb = (E + kBlockSize - 1u) / kBlockSize;
             LaunchCuda(PairClampCountsKernel, dim3(eb), dim3(kBlockSize), 0u,
                        stream, data.pair_count, E, p->rigid_slot_cap, clamped);
             size_t scan_bytes = static_cast<size_t>(sl.temp_bytes);
-            (void)cub::DeviceScan::ExclusiveScan(
+            if (cub::DeviceScan::ExclusiveScan(
                 sort_temp, scan_bytes, clamped, prefix, NkScanSumOp{}, 0u,
-                static_cast<int>(E), stream);
+                static_cast<int>(E), stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
         }
         LaunchCuda(PairSortScatterKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    E, p->rigid_slot_cap, keys_out, perms_out, prefix,
@@ -788,13 +784,13 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
                data.grid_particle_idx);
     // Stable radix sort (byte-identical to the prior thrust stable_sort_by_key,
     // which dispatched here); out-of-place, then D2D-copied back to keep in-place.
-    (void)cub::DeviceRadixSort::SortPairs(
+    if (cub::DeviceRadixSort::SortPairs(
         sort_temp, sort_temp_bytes, data.grid_cell_key, keys_out,
-        data.grid_particle_idx, idx_out, static_cast<int>(Np), 0, 32, stream);
-    (void)cudaMemcpyAsync(data.grid_cell_key, keys_out, Np * sizeof(uint32_t),
-                          cudaMemcpyDeviceToDevice, stream);
-    (void)cudaMemcpyAsync(data.grid_particle_idx, idx_out, Np * sizeof(uint32_t),
-                          cudaMemcpyDeviceToDevice, stream);
+        data.grid_particle_idx, idx_out, static_cast<int>(Np), 0, 32, stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
+    if (cudaMemcpyAsync(data.grid_cell_key, keys_out, Np * sizeof(uint32_t),
+                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
+    if (cudaMemcpyAsync(data.grid_particle_idx, idx_out, Np * sizeof(uint32_t),
+                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
     {  // zero the per-env cell ranges (cells x env_count entries).
         const uint32_t zn = cells * E;
         const uint32_t b = (zn + kBlockSize - 1u) / kBlockSize;
@@ -817,9 +813,9 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
     // thrust exclusive_scan; out-of-place, reusing the capture-safe temp region).
     {
         size_t scan_temp_bytes = static_cast<size_t>(sl.temp_bytes);
-        (void)cub::DeviceScan::ExclusiveScan(
+        if (cub::DeviceScan::ExclusiveScan(
             sort_temp, scan_temp_bytes, data.grid_neighbor_attempted,
-            data.grid_neighbor_scan_offset, NkScanSumOp{}, uint64_t{0}, static_cast<int>(Np), stream);
+            data.grid_neighbor_scan_offset, NkScanSumOp{}, uint64_t{0}, static_cast<int>(Np), stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
     }
     LaunchCuda(GridFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
@@ -843,6 +839,13 @@ uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count) {
         return 0u;
     }
     return PairSortScratchLayout(total_sort_slots, env_count).total;
+}
+
+uint64_t LbvhSortScratchBytes(uint32_t env_count, uint32_t bodies_per_env) {
+    size_t bytes = 0u;
+    const auto status = cg::QueryLbvhWorkspaceBytes(env_count, bodies_per_env, &bytes);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    return bytes;
 }
 
 void RegisterNkBroadphaseOps() {

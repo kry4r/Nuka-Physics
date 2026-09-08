@@ -677,17 +677,68 @@ nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count) {
     }
     try {
         for (uint32_t step = 0u; step < step_count; ++step) {
-            const nuka::nk::StepResult result = record->world->Step();
-            if (!result.AllOk()) {
+            const auto result = record->world->StepConfigured();
+            if (result != nuka::phi::Status::Ok) {
                 std::fprintf(stderr, "[World] step failed at op %u\n",
-                    static_cast<unsigned>(result.failed_op));
-                return nuka::c_abi::MapStatusToResult(result.result);
+                    static_cast<unsigned>(record->world->LastExecutionError().failed_op));
+                return nuka::c_abi::MapStatusToResult(result);
             }
             ++record->simulated_step_count;
         }
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execution_mode_t mode) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    if (mode != NUKA_EXECUTION_EAGER && mode != NUKA_EXECUTION_GRAPH) return NUKA_RESULT_INVALID_ARG;
+    try {
+        return nuka::c_abi::MapStatusToResult(record->world->SetExecutionMode(
+            static_cast<nuka::nk::World::ExecutionMode>(mode)));
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out) {
+    if (!out || out->struct_size != sizeof(*out) || out->schema_version != NUKA_EXECUTION_INFO_VERSION)
+        return NUKA_RESULT_INVALID_ARG;
+    *out = {};
+    out->struct_size = sizeof(*out);
+    out->schema_version = NUKA_EXECUTION_INFO_VERSION;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    out->mode = static_cast<nuka_execution_mode_t>(record->world->GetExecutionMode());
+    out->graph_ready = record->world->GraphReady() ? 1u : 0u;
+    out->capture_attempts = record->world->CaptureAttempts();
+    out->graph_replays = record->world->GraphReplays();
+    const auto& error = record->world->LastExecutionError();
+    out->last_result = nuka::c_abi::MapStatusToResult(error.status);
+    out->failed_op = static_cast<uint32_t>(error.failed_op);
+    out->native_error = error.native_code;
+    std::snprintf(out->message, sizeof(out->message), "%s", error.message);
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_synchronize(nuka_world_handle world) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        return nuka::c_abi::MapStatusToResult(record->world->Synchronize());
     } catch (const std::exception& error) {
         return nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {

@@ -237,6 +237,8 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridNeighborCount:   v.grid_neighbor_count = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborIdx:     v.grid_neighbor_idx = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborAttempted: v.grid_neighbor_attempted = static_cast<uint32_t*>(p); break;
+        case FieldId::LbvhSortScratch: v.lbvh_sort_scratch = static_cast<uint8_t*>(p); break;
+        case FieldId::ContactCacheScratch: v.contact_cache_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
         case FieldId::GridSortScratch:     v.grid_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSortScratch:     v.pair_sort_scratch = static_cast<uint8_t*>(p); break;
@@ -297,8 +299,7 @@ bool Data::DownloadPersistent(std::vector<uint8_t>* out) const {
         return false;
     }
     out->assign(PersistentByteSize(), 0u);
-    phi::BufferDownload(buffer, out->data(), 0, out->size());
-    return true;
+    return phi::BufferDownload(buffer, out->data(), 0, out->size()) == phi::Status::Ok;
 }
 
 bool Data::UploadPersistent(const std::vector<uint8_t>& bytes) const {
@@ -306,8 +307,7 @@ bool Data::UploadPersistent(const std::vector<uint8_t>& bytes) const {
     if (buffer == nullptr || bytes.size() != PersistentByteSize()) {
         return false;
     }
-    phi::BufferUpload(buffer, bytes.data(), 0, bytes.size());
-    return true;
+    return phi::BufferUpload(buffer, bytes.data(), 0, bytes.size()) == phi::Status::Ok;
 }
 
 bool Data::Snapshot() {

@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "core/checked_size.hpp"
+#include "nk/solve/nk_row.hpp"
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
 #include "phi/articulation_contract.hpp"
 
@@ -21,7 +23,7 @@ namespace {
 
 constexpr uint64_t kAlign = 256;  // CUDA buffer-type alignment (BufferTypeAlignment).
 
-uint64_t AlignUp(uint64_t v) { return (v + (kAlign - 1)) & ~(kAlign - 1); }
+uint64_t AlignUp(uint64_t v) { return CheckedAlignUp(v, kAlign); }
 
 float CanonicalZero(float value) { return value == 0.0f ? 0.0f : value; }
 
@@ -53,7 +55,7 @@ bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
     return true;
 }
 
-uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
+uint64_t ModelCapacities::PerEnvCount(FieldPer per) const {
     switch (per) {
         case FieldPer::Env:            return 1u;
         case FieldPer::Dof:            return dofs_per_env;
@@ -61,26 +63,25 @@ uint32_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::Body:           return bodies_per_env;
         case FieldPer::ContactSlot:    return max_contacts_per_env;
         case FieldPer::RowSlot:        return max_rows_per_env;
-        case FieldPer::SlotDof:        return max_contacts_per_env * dofs_per_env;
-        case FieldPer::RowDof:         return max_rows_per_env * dofs_per_env;
+        case FieldPer::SlotDof:        return CheckedProduct({max_contacts_per_env, dofs_per_env});
+        case FieldPer::RowDof:         return CheckedProduct({max_rows_per_env, dofs_per_env});
         case FieldPer::Particle:       return particles_per_env;
         case FieldPer::DistCon:        return dist_cons_per_env;
         case FieldPer::BendCon:        return bend_cons_per_env;
         case FieldPer::VolCon:         return vol_cons_per_env;
         case FieldPer::ShapeMatchSlot:   return shape_match_slots_per_env;
         case FieldPer::ShapeMatchMember: return shape_match_members_per_env;
-        case FieldPer::EnvDof2:        return dofs_per_env * dofs_per_env;
+        case FieldPer::EnvDof2:        return CheckedProduct({dofs_per_env, dofs_per_env});
         // Multi-articulation co-residence: per-artic count == articulations_per_env;
         // the per-artic M-tile == articulations_per_env * max_dof^2. At
         // articulations_per_env == 1 these equal PerEnvCount(Env) / PerEnvCount(EnvDof2)
         // EXACTLY (same element count + ordering => the K==1 byte-identity invariant).
         case FieldPer::Articulation:     return articulations_per_env;
-        case FieldPer::ArticulationDof2: return articulations_per_env * dofs_per_env *
-                                                dofs_per_env;
+        case FieldPer::ArticulationDof2: return CheckedProduct({articulations_per_env, dofs_per_env, dofs_per_env});
         // Per-articulation flat-DOF tile (S3 qdot_flat). At articulations_per_env
         // == 1 this equals dofs_per_env == PerEnvCount(Dof) EXACTLY (same element
         // count + ordering => the K==1 byte-identity invariant for qdot_flat).
-        case FieldPer::ArticulationDof:  return articulations_per_env * dofs_per_env;
+        case FieldPer::ArticulationDof:  return CheckedProduct({articulations_per_env, dofs_per_env});
         case FieldPer::AeroTri:          return aero_tris_per_env;
         case FieldPer::Scalar:         return 0u;  // resolved by ElementCount
     }
@@ -118,7 +119,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
     }
     if (lay.per == FieldPer::Scalar) {
         if (id == FieldId::GridNeighborIdx)
-            return NeighborPoolCapacity() * static_cast<uint64_t>(env_count);
+            return CheckedProduct({NeighborPoolCapacity(), env_count});
         // Symbolic scalar counts require an explicit field-specific extent.
         // Unresolved fields are rejected instead of allocating a smaller buffer.
         if (id == FieldId::MatBuckets) {
@@ -176,6 +177,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::PairSortScratch) {
             return pair_sort_scratch_bytes;
         }
+        if (id == FieldId::LbvhSortScratch) return lbvh_sort_scratch_bytes;
+        if (id == FieldId::ContactCacheScratch) return contact_cache_scratch_bytes;
         // Dynamic-island component count (BuildSolveIslands): the solve grid
         // watermark — one global u32.
         if (id == FieldId::IslandCount) {
@@ -242,12 +245,12 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::LbvhNodes) {
             const uint32_t n = max_bodies_total;
             const uint64_t nodes_per_env = (n >= 2u) ? (2ull * n - 1ull) : 0ull;
-            return nodes_per_env * 9ull * static_cast<uint64_t>(env_count);
+            return CheckedProduct({nodes_per_env, 9u, env_count});
         }
         throw std::logic_error("ModelCapacities::ElementCount: unresolved scalar field");
     }
     const uint64_t per_env = PerEnvCount(lay.per);
-    return per_env * static_cast<uint64_t>(env_count);
+    return CheckedProduct({per_env, env_count});
 }
 
 std::vector<Model::Segment> Model::ComputeModelSegments(uint64_t* total_bytes) const {
@@ -260,10 +263,10 @@ std::vector<Model::Segment> Model::ComputeModelSegments(uint64_t* total_bytes) c
             continue;
         }
         const uint64_t count = capacities.ElementCount(id);
-        const uint64_t bytes = count * static_cast<uint64_t>(lay.elem_size);
+        const uint64_t bytes = CheckedProduct({count, lay.elem_size});
         const uint64_t aligned_off = AlignUp(offset);
         segs.push_back(Segment{id, aligned_off, bytes});
-        offset = aligned_off + bytes;
+        offset = CheckedAdd(aligned_off, bytes);
     }
     if (total_bytes != nullptr) {
         *total_bytes = AlignUp(offset);
@@ -976,6 +979,36 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
 
 }  // namespace
 
+phi::Status ModelCapacities::Validate(std::string* reason) const {
+    try {
+        if (env_count == 0u) throw std::invalid_argument("environment count must be positive");
+        const auto int_limit = static_cast<uint64_t>(std::numeric_limits<int>::max());
+        for (auto count : {CheckedProduct({max_rows_per_env, env_count}),
+                           CheckedProduct({max_contacts_per_env, env_count, kPairDrivenPtsPerSlot, 2u}),
+                           CheckedProduct({particles_per_env, env_count}),
+                           CheckedProduct({mpm_grid_nodes_per_env, env_count})}) {
+            if (count > int_limit) throw std::invalid_argument("capacity exceeds device sort index range");
+        }
+        if (CheckedProduct({NeighborPoolCapacity(), env_count}) > std::numeric_limits<uint32_t>::max())
+            throw std::invalid_argument("neighbor pool exceeds device index range");
+        uint64_t total = 0u;
+        for (int i = 0; i < kFieldCount; ++i) {
+            const auto id = static_cast<FieldId>(i);
+            const auto& layout = LayoutOf(id);
+            const auto count = ElementCount(id);
+            if (layout.per != FieldPer::Scalar && count > std::numeric_limits<uint32_t>::max())
+                throw std::invalid_argument("field exceeds device index range");
+            total = CheckedAdd(CheckedAlignUp(total, kAlign), CheckedProduct({count, layout.elem_size}));
+        }
+        if (CheckedAlignUp(total, kAlign) > std::numeric_limits<size_t>::max())
+            throw std::invalid_argument("capacity exceeds host address range");
+        return phi::Status::Ok;
+    } catch (const std::exception& error) {
+        if (reason) *reason = error.what();
+        return phi::Status::InvalidArgument;
+    }
+}
+
 phi::Status Model::ValidateTopology(std::string* reason) const {
     if (reason) reason->clear();
     auto reject = [&](phi::Status status, const std::string& message) {
@@ -985,6 +1018,7 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     using phi::Status;
     using Joint = phi::ArticulationJointType;
     const auto& cap = capacities;
+    if (cap.Validate(reason) != phi::Status::Ok) return phi::Status::InvalidArgument;
     const auto& a = articulation;
     const uint32_t n = cap.links_per_env, k = cap.articulations_per_env;
     constexpr uint64_t limit = std::numeric_limits<uint32_t>::max();
@@ -1152,21 +1186,14 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     uint64_t total = 0;
     const std::vector<Segment> segs = ComputeModelSegments(&total);
 
-    phi::Buffer* buf = phi::BufferAlloc(bt, total == 0 ? kAlign : total);
-    if (buf == nullptr) {
-        return phi::Status::OutOfMemory;
-    }
-    // Zero the whole buffer first (deterministic; unimplemented sections stay 0).
-    phi::BufferMemset(buf, 0, 0, total == 0 ? kAlign : total);
-
-    // Stage the model-owned fields host-side, then ONE upload of the packed bytes.
     std::vector<uint8_t> host(total, 0u);
-    for (const Segment& seg : segs) {
-        StageModelField(seg.field, seg, host);
-    }
-    if (total > 0) {
-        phi::BufferUpload(buf, host.data(), 0, total);
-    }
+    for (const Segment& seg : segs) StageModelField(seg.field, seg, host);
+    phi::Status transfer_status = phi::Status::Ok;
+    phi::Buffer* buf = phi::BufferAlloc(bt, total == 0u ? kAlign : total, &transfer_status);
+    if (buf == nullptr) return transfer_status;
+    transfer_status = total > 0u ? phi::BufferUpload(buf, host.data(), 0u, total)
+                                 : phi::BufferMemset(buf, 0u, 0u, kAlign);
+    if (transfer_status != phi::Status::Ok) { phi::BufferFree(buf); return transfer_status; }
 
     // Fill the view: each pointer = buffer base + section offset.
     auto* base = static_cast<uint8_t*>(phi::BufferBase(buf));

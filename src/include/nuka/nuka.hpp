@@ -140,6 +140,27 @@ public:
         return nuka::expected<void, Error>{};
     }
 
+    nuka::expected<void, Error> SetExecutionMode(nuka_execution_mode_t mode) noexcept {
+        const auto result = nuka_world_set_execution_mode(h_, mode);
+        if (result != NUKA_RESULT_OK) return nuka::unexpected(Error(result));
+        return {};
+    }
+
+    nuka::expected<nuka_world_execution_info_t, Error> GetExecutionInfo() const noexcept {
+        nuka_world_execution_info_t info{};
+        info.struct_size = sizeof(info);
+        info.schema_version = NUKA_EXECUTION_INFO_VERSION;
+        const auto result = nuka_world_get_execution_info(h_, &info);
+        if (result != NUKA_RESULT_OK) return nuka::unexpected(Error(result));
+        return info;
+    }
+
+    nuka::expected<void, Error> Synchronize() noexcept {
+        const auto result = nuka_world_synchronize(h_);
+        if (result != NUKA_RESULT_OK) return nuka::unexpected(Error(result));
+        return {};
+    }
+
     nuka::expected<BufferView, Error> GetBufferView(nuka_state_field_t field) const noexcept {
         nuka_buffer_view_t view{};
         const nuka_result_t result = nuka_world_get_buffer_view(h_, field, &view);

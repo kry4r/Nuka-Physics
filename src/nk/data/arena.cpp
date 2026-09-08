@@ -6,6 +6,7 @@
 
 #include <utility>
 
+#include "core/checked_size.hpp"
 #include "nk/model/model.hpp"   // ModelCapacities
 
 namespace nuka::nk {
@@ -13,7 +14,7 @@ namespace nuka::nk {
 namespace {
 
 constexpr uint64_t kAlign = 256;
-uint64_t AlignUp(uint64_t v) { return (v + (kAlign - 1)) & ~(kAlign - 1); }
+uint64_t AlignUp(uint64_t v) { return CheckedAlignUp(v, kAlign); }
 
 uint8_t ArenaIndex(FieldArena a) {
     switch (a) {
@@ -38,10 +39,10 @@ std::vector<Arena::Segment> Arena::ComputeSegments(const ModelCapacities& caps,
         }
         const uint8_t ai = ArenaIndex(lay.arena);
         const uint64_t count = caps.ElementCount(id);
-        const uint64_t bytes = count * static_cast<uint64_t>(lay.elem_size);
+        const uint64_t bytes = CheckedProduct({count, lay.elem_size});
         const uint64_t off = AlignUp(cursor[ai]);
         segs.push_back(Segment{id, ai, off, bytes});
-        cursor[ai] = off + bytes;
+        cursor[ai] = CheckedAdd(off, bytes);
     }
     for (int a = 0; a < 3; ++a) {
         arena_bytes[a] = AlignUp(cursor[a]);
@@ -53,21 +54,24 @@ phi::Status Arena::Allocate(phi::BufferType* bt, const ModelCapacities& caps) {
     if (bt == nullptr) {
         return phi::Status::Failed;
     }
+    if (caps.Validate() != phi::Status::Ok) return phi::Status::InvalidArgument;
     FreeAll();
     segments_ = ComputeSegments(caps, arena_bytes_);
 
     phi::Buffer** bufs[3] = {&persistent_, &scratch_, &tape_};
     for (int a = 0; a < 3; ++a) {
         const uint64_t n = arena_bytes_[a] == 0 ? kAlign : arena_bytes_[a];
-        phi::Buffer* b = phi::BufferAlloc(bt, n);
+        phi::Status status = phi::Status::Ok;
+        phi::Buffer* b = phi::BufferAlloc(bt, n, &status);
         if (b == nullptr) {
             FreeAll();
-            return phi::Status::OutOfMemory;
+            return status;
         }
         *bufs[a] = b;
     }
-    ZeroAll();
-    return phi::Status::Ok;
+    const auto status = ZeroAll();
+    if (status != phi::Status::Ok) FreeAll();
+    return status;
 }
 
 void* Arena::Ptr(FieldId id) const {
@@ -95,51 +99,51 @@ phi::Buffer* BufferOfSegment(uint8_t arena, phi::Buffer* p, phi::Buffer* s,
 
 }  // namespace
 
-bool Arena::UploadField(FieldId id, const void* src, uint64_t bytes,
-                        uint64_t byte_offset) const {
-    if (persistent_ == nullptr || src == nullptr) {
-        return false;
-    }
-    for (const Segment& s : segments_) {
-        if (s.field != id) {
-            continue;
-        }
-        if (byte_offset + bytes > s.bytes) {
-            return false;
-        }
-        phi::Buffer* b = BufferOfSegment(s.arena, persistent_, scratch_, tape_);
-        phi::BufferUpload(b, src, s.offset + byte_offset, bytes);
-        return true;
-    }
-    return false;
+bool Arena::UploadField(FieldId id, const void* src, uint64_t bytes, uint64_t byte_offset) const {
+    return UploadFieldStatus(id, src, bytes, byte_offset) == phi::Status::Ok;
 }
 
-bool Arena::DownloadField(FieldId id, void* dst, uint64_t bytes,
-                          uint64_t byte_offset) const {
-    if (persistent_ == nullptr || dst == nullptr) {
-        return false;
-    }
-    for (const Segment& s : segments_) {
-        if (s.field != id) {
-            continue;
-        }
-        if (byte_offset + bytes > s.bytes) {
-            return false;
-        }
-        phi::Buffer* b = BufferOfSegment(s.arena, persistent_, scratch_, tape_);
-        phi::BufferDownload(b, dst, s.offset + byte_offset, bytes);
-        return true;
-    }
-    return false;
+bool Arena::DownloadField(FieldId id, void* dst, uint64_t bytes, uint64_t byte_offset) const {
+    return DownloadFieldStatus(id, dst, bytes, byte_offset) == phi::Status::Ok;
 }
 
-void Arena::ZeroAll() {
-    phi::Buffer* bufs[3] = {persistent_, scratch_, tape_};
-    for (int a = 0; a < 3; ++a) {
-        if (bufs[a] != nullptr && arena_bytes_[a] > 0) {
-            phi::BufferMemset(bufs[a], 0, 0, arena_bytes_[a]);
+phi::Status Arena::UploadFieldStatus(FieldId id, const void* src, uint64_t bytes,
+                                     uint64_t byte_offset) const {
+    if (!persistent_) return phi::Status::Failed;
+    if (!src && bytes != 0u) return phi::Status::InvalidArgument;
+    for (const auto& segment : segments_) {
+        if (segment.field != id) continue;
+        if (byte_offset > segment.bytes || bytes > segment.bytes - byte_offset)
+            return phi::Status::InvalidArgument;
+        auto* buffer = BufferOfSegment(segment.arena, persistent_, scratch_, tape_);
+        return phi::BufferUpload(buffer, src, segment.offset + byte_offset, bytes);
+    }
+    return phi::Status::InvalidArgument;
+}
+
+phi::Status Arena::DownloadFieldStatus(FieldId id, void* dst, uint64_t bytes,
+                                       uint64_t byte_offset) const {
+    if (!persistent_) return phi::Status::Failed;
+    if (!dst && bytes != 0u) return phi::Status::InvalidArgument;
+    for (const auto& segment : segments_) {
+        if (segment.field != id) continue;
+        if (byte_offset > segment.bytes || bytes > segment.bytes - byte_offset)
+            return phi::Status::InvalidArgument;
+        auto* buffer = BufferOfSegment(segment.arena, persistent_, scratch_, tape_);
+        return phi::BufferDownload(buffer, dst, segment.offset + byte_offset, bytes);
+    }
+    return phi::Status::InvalidArgument;
+}
+
+phi::Status Arena::ZeroAll() {
+    phi::Buffer* buffers[3] = {persistent_, scratch_, tape_};
+    for (int i = 0; i < 3; ++i) {
+        if (buffers[i] && arena_bytes_[i] != 0u) {
+            const auto status = phi::BufferMemset(buffers[i], 0, 0, arena_bytes_[i]);
+            if (status != phi::Status::Ok) return status;
         }
     }
+    return phi::Status::Ok;
 }
 
 void Arena::FreeAll() {
