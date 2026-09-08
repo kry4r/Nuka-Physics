@@ -497,7 +497,8 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
         std::move(cooked_model), env_count, device_record->phi_device,
         device_record->backend, cfg);
     if (!record->world->Ready()) {
-        return NUKA_RESULT_INTERNAL;
+        std::fprintf(stderr, "[World] %s\n", record->world->CreationError().c_str());
+        return MapStatusToResult(record->world->CreationStatus());
     }
 
     // Transitional host mirror for the diffsim backward + set_link_mass + DR
@@ -678,10 +679,12 @@ nuka_result_t nuka_world_step_n(nuka_world_handle world, uint32_t step_count) {
         for (uint32_t step = 0u; step < step_count; ++step) {
             const nuka::nk::StepResult result = record->world->Step();
             if (!result.AllOk()) {
-                return NUKA_RESULT_INTERNAL;
+                std::fprintf(stderr, "[World] step failed at op %u\n",
+                    static_cast<unsigned>(result.failed_op));
+                return nuka::c_abi::MapStatusToResult(result.result);
             }
+            ++record->simulated_step_count;
         }
-        record->simulated_step_count += step_count;
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

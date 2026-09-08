@@ -1,39 +1,7 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — particle ops (XPBD soft + PBF fluid as backend ops).
-//
-// LINE-BY-LINE ports of the kernel bodies from
-// the legacy XPBD soft stepper (predict / distance / bend / volume / correct)
-// the legacy PBF fluid stepper (predict / density / lambda / delta / apply /
-// finalize / xsph viscosity / cohesion)
-// onto the nk arena fields (DataView/ModelView typed device pointers). The op
-// order, the reduction order, and every float expression are preserved verbatim
-// so the existing XPBD/PBF oracle tolerances hold UNCHANGED and the D1 byte-exact
-// contract is kept (single-thread fixed-order GS for XPBD; one-thread-per-particle
-// fixed-neighbor-order reductions for PBF, no float atomics).
-//
-// Two semantics live behind the ONE ParticlePredict / ParticleFinalize op (the
-// XPBD vs PBF predict/finalize diverge): the param's `mode` selects the kernel
-// body. The PBF density-projection iteration loop lives inside PbfDensityLambda /
-// PbfApplyDelta (the pipeline is a flat OpCall list, so the N-iteration coupling
-// is owned by the op TU, exactly as the legacy PBF stepper owned its inner loop).
-//
-// NEIGHBOR LAYOUT (arena CSR): the ParticleGridBuild op (broadphase.cu) writes
-// each particle's neighbor list into a PRIVATE slice grid_neighbor_idx[i*32 .. ]
-// (stride kParticleGridMaxNeighbors == 32, ascending in-cell order) with the live
-// count in grid_neighbor_count[i]. The legacy PBF kernels read a FLAT CSR
-// (neighbor_indices[neighbor_offsets[i] + k]); the port adapts the indexing to the
-// private-slice layout (base = i*32) — the SAME ascending k order, so the
-// fixed-order reduction (D1) is unchanged. Self is excluded by the grid query
-// (QueryParticleNeighbors skips index i), matching the legacy neighbor list.
-//
-// NO host allocation, no per-call device allocation (lint hot_path scope). All
-// scratch is arena-resident (pbf_predicted_pos / pbf_position_delta / pbf_density
-// / pbf_lambda + grid_neighbor_*).
-// ---------------------------------------------------------------------------
+// Particle integration and projection use stable CSR neighbor lists and arena storage.
 
 #include <cuda_runtime.h>
 
-#include "collision/particle_uniform_grid.hpp"  // kParticleGridMaxNeighbors (canonical)
 #include "math/cuda_vec_ops.cuh"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
@@ -55,11 +23,8 @@ using mg::Length;
 using mg::Scale;
 using mg::Sub;
 namespace fl = ::nuka::runtime::fluid;
-namespace cg = ::nuka::collision::gpu;
 
 constexpr uint32_t kBlockSize = 128u;
-// Per-particle private CSR slice stride the GridFillKernel wrote == the shared
-// cap cg::kParticleGridMaxNeighbors; base = i * cg::kParticleGridMaxNeighbors.
 
 // SoftFluid: within-env local particle index (env-major: env e owns
 // [e*per_env, e*per_env+per_env); the soft sub-slice is the first n_soft of each
@@ -72,28 +37,22 @@ __device__ __forceinline__ bool SfIsSoft(uint32_t i, uint32_t n_soft,
     return local < n_soft;
 }
 
-// =============================================================================
-// Cloth anisotropic AERODYNAMIC DRAG. One thread per surface triangle: build the
-// outward normal n̂ + the triangle's mean velocity v from the current positions,
-// decompose v into normal/tangent, and apply a quadratic-in-speed force
-//   F = -(Cn*|v_n|*v_n + Ct*|v_t|*v_t) * A
-// as a velocity impulse dv = (F/m)*dt scattered (atomicAdd) onto the 3 vertices
-// BEFORE the XPBD predict. The normal-dominant anisotropy (Cn >> Ct) is exactly
-// what breaks the flat-fall symmetry of a released sheet into flutter. The drag
-// op is emitted only when a coefficient is set, so a drag-free world is untouched.
-// =============================================================================
-__global__ void ClothAeroDragKernel(uint32_t tri_count,
+// Faces read one velocity time layer; particles gather impulses in stable triangle order.
+__global__ void ClothAeroImpulseKernel(uint32_t tri_count,
                                      const uint32_t* __restrict__ tri_verts,
                                      const float* __restrict__ tri_area,
                                      const math::Vec3* __restrict__ positions,
-                                     math::Vec3* __restrict__ velocities,
+                                     const math::Vec3* __restrict__ velocities,
                                      const float* __restrict__ inv_masses,
+                                     const uint32_t* __restrict__ incident_counts,
+                                     math::Vec3* __restrict__ impulses,
                                      float drag_normal, float drag_tangent,
                                      float max_dv, float dt) {
     const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= tri_count) {
         return;
     }
+    impulses[t] = {};
     const uint32_t ia = tri_verts[t * 3u + 0u];
     const uint32_t ib = tri_verts[t * 3u + 1u];
     const uint32_t ic = tri_verts[t * 3u + 2u];
@@ -104,9 +63,19 @@ __global__ void ClothAeroDragKernel(uint32_t tri_count,
         return;  // degenerate sliver: no defined normal.
     }
     const math::Vec3 nhat = Scale(nrm, 1.0f / nlen);
-    // Mean velocity of the face (air is still, so v_rel == v).
-    const math::Vec3 v = Scale(Add(Add(velocities[ia], velocities[ib]),
-                                   velocities[ic]), 1.0f / 3.0f);
+    const uint32_t idx[3] = {ia, ib, ic};
+    math::Vec3 velocity_sum{};
+    float weighted_degree = 0.0f, max_weighted_degree = 0.0f;
+    for (uint32_t p : idx) {
+        const float weight = inv_masses[p];
+        if (weight <= 0.0f) continue;
+        velocity_sum = Add(velocity_sum, velocities[p]);
+        const float degree = weight * static_cast<float>(incident_counts[p]);
+        weighted_degree += degree;
+        max_weighted_degree = fmaxf(max_weighted_degree, degree);
+    }
+    if (weighted_degree == 0.0f) return;
+    const math::Vec3 v = Scale(velocity_sum, 1.0f / 3.0f);
     const float vn = Dot(v, nhat);                 // signed normal speed
     const math::Vec3 v_n = Scale(nhat, vn);
     const math::Vec3 v_t = Sub(v, v_n);
@@ -116,23 +85,31 @@ __global__ void ClothAeroDragKernel(uint32_t tri_count,
     const math::Vec3 f = Scale(
         Add(Scale(v_n, -drag_normal * fabsf(vn)),
             Scale(v_t, -drag_tangent * vt)), area);
-    // Distribute the face force to its 3 vertices (each gets a third), as a
-    // per-vertex velocity impulse dv = (F_third * w) * dt, optionally clamped.
-    const math::Vec3 f_third = Scale(f, 1.0f / 3.0f);
-    const uint32_t idx[3] = {ia, ib, ic};
-    for (uint32_t k = 0; k < 3u; ++k) {
-        const uint32_t p = idx[k];
-        const float w = inv_masses[p];
-        if (w <= 0.0f) continue;  // pinned vertex.
-        math::Vec3 dv = Scale(f_third, w * dt);
-        if (max_dv > 0.0f) {
-            const float m = Length(dv);
-            if (m > max_dv) dv = Scale(dv, max_dv / m);
-        }
-        atomicAdd(&velocities[p].x, dv.x);
-        atomicAdd(&velocities[p].y, dv.y);
-        atomicAdd(&velocities[p].z, dv.z);
-    }
+    const math::Vec3 impulse = Scale(f, dt / 3.0f);
+    const float magnitude_sq = Dot(impulse, impulse);
+    if (magnitude_sq <= 0.0f) return;
+    // The incidence bound controls the sum over shared vertices, including its kinetic work.
+    const float work = fminf(Dot(velocity_sum, impulse), 0.0f);
+    float alpha = fminf(1.0f, -work / (weighted_degree * magnitude_sq));
+    if (max_dv > 0.0f)
+        alpha = fminf(alpha, max_dv / (sqrtf(magnitude_sq) * max_weighted_degree));
+    impulses[t] = Scale(impulse, alpha);
+}
+
+__global__ void ClothAeroGatherKernel(uint32_t particle_count,
+                                    const uint32_t* __restrict__ offsets,
+                                    const uint32_t* __restrict__ counts,
+                                    const uint32_t* __restrict__ incident_tri,
+                                    const math::Vec3* __restrict__ impulses,
+                                    const float* __restrict__ inv_masses,
+                                    math::Vec3* __restrict__ velocities) {
+    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= particle_count || inv_masses[p] <= 0.0f || counts[p] == 0u) return;
+    math::Vec3 impulse{};
+    const uint32_t offset = offsets[p];
+    for (uint32_t i = 0; i < counts[p]; ++i)
+        impulse = Add(impulse, impulses[incident_tri[offset + i]]);
+    velocities[p] = Add(velocities[p], Scale(impulse, inv_masses[p]));
 }
 
 // =============================================================================
@@ -531,12 +508,7 @@ __global__ void XpbdCorrectKernel(uint32_t particle_count,
                               p_proj.z + (dv.z + sp.z) * dt};
 }
 
-// =============================================================================
-// PBF kernels — VERBATIM from the legacy PBF fluid stepper. The ONLY change is the
-// neighbor read: the arena grid writes a PRIVATE per-particle slice
-// (neighbor_idx[i*32 + k], count[i]), so `base = i * kParticleGridMaxNeighbors` in
-// place of the legacy flat `neighbor_offsets[i]`. The k-loop order is identical.
-// =============================================================================
+// PBF sums actual neighbors in ascending particle order.
 
 // predict: v += dt*g ; pbf_predicted = p + dt*v. Plus v_pre saved AFTER gravity =
 // the velocity the body<->particle row solve reads (finalize subtracts it off).
@@ -581,6 +553,7 @@ __global__ void PbfDensityKernel(uint32_t particle_count,
                                  float particle_mass,
                                  fl::PbfKernelCoeffs coeffs,
                                  const uint32_t* __restrict__ neighbor_counts,
+                                 const uint32_t* __restrict__ neighbor_offsets,
                                  const uint32_t* __restrict__ neighbor_indices,
                                  float* __restrict__ out_density) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -592,7 +565,7 @@ __global__ void PbfDensityKernel(uint32_t particle_count,
     }
     const math::Vec3 pi = predicted[i];
     float rho = particle_mass * fl::Poly6FromR2(0.0f, coeffs);
-    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
+    const uint32_t base = neighbor_offsets[i];
     const uint32_t n = neighbor_counts[i];
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
@@ -618,6 +591,7 @@ __global__ void PbfLambdaKernel(uint32_t particle_count,
                                 bool clamp_to_overdensity,
                                 const float* __restrict__ density,
                                 const uint32_t* __restrict__ neighbor_counts,
+                                const uint32_t* __restrict__ neighbor_offsets,
                                 const uint32_t* __restrict__ neighbor_indices,
                                 float* __restrict__ out_lambda) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -634,7 +608,7 @@ __global__ void PbfLambdaKernel(uint32_t particle_count,
         return;
     }
     const math::Vec3 pi = predicted[i];
-    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
+    const uint32_t base = neighbor_offsets[i];
     const uint32_t n = neighbor_counts[i];
     math::Vec3 grad_i{0.0f, 0.0f, 0.0f};
     float sum_grad_sq = 0.0f;
@@ -667,6 +641,7 @@ __global__ void PbfComputeCorrectionKernel(
     float inv_rho0,
     const float* __restrict__ lambda,
     const uint32_t* __restrict__ neighbor_counts,
+    const uint32_t* __restrict__ neighbor_offsets,
     const uint32_t* __restrict__ neighbor_indices,
     math::Vec3* __restrict__ out_delta) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -679,7 +654,7 @@ __global__ void PbfComputeCorrectionKernel(
     }
     const math::Vec3 pi = predicted[i];
     const float lam_i = lambda[i];
-    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
+    const uint32_t base = neighbor_offsets[i];
     const uint32_t n = neighbor_counts[i];
     math::Vec3 dp{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
@@ -760,6 +735,7 @@ __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
                                    float c,
                                    fl::PbfKernelCoeffs coeffs,
                                    const uint32_t* __restrict__ neighbor_counts,
+    const uint32_t* __restrict__ neighbor_offsets,
                                    const uint32_t* __restrict__ neighbor_indices,
                                    math::Vec3* __restrict__ out_dv) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -772,7 +748,7 @@ __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
     }
     const math::Vec3 pi = positions[i];
     const math::Vec3 vi = velocities[i];
-    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
+    const uint32_t base = neighbor_offsets[i];
     const uint32_t n = neighbor_counts[i];
     math::Vec3 acc{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
@@ -823,6 +799,7 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
                                   float dt,
                                   fl::PbfCohesionCoeffs coeffs,
                                   const uint32_t* __restrict__ neighbor_counts,
+    const uint32_t* __restrict__ neighbor_offsets,
                                   const uint32_t* __restrict__ neighbor_indices) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= particle_count) {
@@ -832,7 +809,7 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
         return;  // SoftFluid: a soft owner is not nudged by fluid cohesion.
     }
     const math::Vec3 pi = positions[i];
-    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
+    const uint32_t base = neighbor_offsets[i];
     const uint32_t n = neighbor_counts[i];
     math::Vec3 force{0.0f, 0.0f, 0.0f};
     for (uint32_t k = 0u; k < n; ++k) {
@@ -988,16 +965,18 @@ __global__ void SoftFluidPredictKernel(uint32_t particle_count,
         return;
     }
     if (SfIsSoft(i, n_soft, per_env)) {
-        // VERBATIM XpbdPredictKernel body (velocity untouched -> v_pre == step-start v).
+        // The shared neighbor grid needs predicted positions for both particle types.
         const math::Vec3 p = positions[i];
         prev_positions[i] = p;
         v_pre[i] = velocities[i];
         if (inv_masses[i] <= 0.0f) {
+            predicted_positions[i] = p;
             return;
         }
         const math::Vec3 step =
             Add(Scale(velocities[i], dt), Scale(gravity, dt * dt));
         positions[i] = Add(p, step);
+        predicted_positions[i] = positions[i];
     } else {
         // VERBATIM PbfPredictKernel body (v_pre saved after gravity = solve's input v).
         math::Vec3 v = velocities[i];
@@ -1075,25 +1054,7 @@ __global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
     }
 }
 
-// =============================================================================
-// CROSS-SYSTEM particle-particle CONTACT (Cross-system). VERBATIM port of
-// runtime/coupling/particle_particle_contact.cu ComputeHalfCorrectionKernel +
-// ApplyCorrectionKernel onto the nk arena. The CLASS-BLIND unilateral
-// non-penetration row does NOT branch on soft/fluid (SfIsSoft is unused here): the
-// math is identical for soft<->soft, fluid<->fluid, soft<->fluid. The ONLY change
-// from the legacy is the neighbor read: the arena grid writes a PRIVATE
-// per-particle slice (neighbor_idx[i*32 + k], count[i]) instead of the legacy flat
-// CSR (neighbor_offsets[i] + k); the k-loop order (ascending neighbor index) is
-// identical so the fixed-order __fadd_rn reduction is D1-unchanged. The grid is
-// built over the FULL union by ParticleGridBuild (already arena-resident); no
-// second grid is assembled. inv_mass is the union particle_inv_mass (the cook
-// seeds the fluid slice = 1/particle_mass exactly as the legacy FillPbfInvMass).
-// =============================================================================
-
-// pass A: compute each union particle's HALF correction (Jacobi gather, read-only
-// on positions). One thread per union particle i; for every penetrating neighbor j
-// accumulate i's own half of the mass-weighted symmetric projection. VERBATIM body
-// from the legacy kernel; base = i*kParticleGridMaxNeighbors is the only change.
+// Each particle gathers its mass-weighted contact correction from one geometry time layer.
 __global__ void PpContactHalfCorrectionKernel(
     uint32_t union_count,
     const math::Vec3* __restrict__ positions,
@@ -1101,6 +1062,7 @@ __global__ void PpContactHalfCorrectionKernel(
     float d_min,
     float alpha_tilde,
     const uint32_t* __restrict__ neighbor_counts,
+    const uint32_t* __restrict__ neighbor_offsets,
     const uint32_t* __restrict__ neighbor_indices,
     math::Vec3* __restrict__ out_delta) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1109,7 +1071,7 @@ __global__ void PpContactHalfCorrectionKernel(
     }
     const math::Vec3 pi = positions[i];
     const float wi = inv_mass[i];
-    const uint32_t base = i * cg::kParticleGridMaxNeighbors;
+    const uint32_t base = neighbor_offsets[i];
     const uint32_t n = neighbor_counts[i];
 
     float dx = 0.0f;
@@ -1173,10 +1135,18 @@ Status OpParticleAeroDrag(const ModelView& model, const DataView& data,
         return Status::Ok;  // no aero triangles / drag off: inert.
     }
     const uint32_t blocks = (p->tri_count + kBlockSize - 1u) / kBlockSize;
-    LaunchCuda(ClothAeroDragKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+    if (p->particle_count == 0u) return Status::InvalidArgument;
+    LaunchCuda(ClothAeroImpulseKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                p->tri_count, model.aero_tri_verts, model.aero_tri_area,
                data.particle_pos, data.particle_vel, data.particle_inv_mass,
+               model.aero_particle_count, data.aero_tri_impulse,
                p->drag_normal, p->drag_tangent, p->max_dv, p->dt);
+    if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+    LaunchCuda(ClothAeroGatherKernel,
+               dim3((p->particle_count + kBlockSize - 1u) / kBlockSize),
+               dim3(kBlockSize), 0u, stream, p->particle_count,
+               model.aero_particle_offset, model.aero_particle_count, model.aero_incident_tri,
+               data.aero_tri_impulse, data.particle_inv_mass, data.particle_vel);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -1343,16 +1313,16 @@ Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
     for (uint32_t it = 0u; it < iters; ++it) {
         LaunchCuda(PbfDensityKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, n_soft, per_env, data.pbf_predicted_pos, p->particle_mass,
-                   coeffs, data.grid_neighbor_count, data.grid_neighbor_idx,
+                   coeffs, data.grid_neighbor_count, data.grid_neighbor_offset, data.grid_neighbor_idx,
                    data.pbf_density);
         LaunchCuda(PbfLambdaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, n_soft, per_env, data.pbf_predicted_pos, coeffs, inv_rho0,
                    p->rest_density, p->relaxation, p->clamp_overdensity != 0u,
-                   data.pbf_density, data.grid_neighbor_count,
+                   data.pbf_density, data.grid_neighbor_count, data.grid_neighbor_offset,
                    data.grid_neighbor_idx, data.pbf_lambda);
         LaunchCuda(PbfComputeCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
                    stream, N, n_soft, per_env, data.pbf_predicted_pos, coeffs,
-                   inv_rho0, data.pbf_lambda, data.grid_neighbor_count,
+                   inv_rho0, data.pbf_lambda, data.grid_neighbor_count, data.grid_neighbor_offset,
                    data.grid_neighbor_idx, data.pbf_position_delta);
         // Apply in-loop for every iteration EXCEPT the last (PbfApplyDelta runs
         // the last apply, so the two ops together == the legacy NxN loop).
@@ -1432,7 +1402,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
             LaunchCuda(PbfXsphDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                        N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
                        data.particle_vel, data.pbf_density, p->particle_mass,
-                       p->xsph_viscosity_c, coeffs, data.grid_neighbor_count,
+                       p->xsph_viscosity_c, coeffs, data.grid_neighbor_count, data.grid_neighbor_offset,
                        data.grid_neighbor_idx, data.pbf_position_delta);
             LaunchCuda(PbfApplyVelocityDeltaKernel, dim3(blocks), dim3(kBlockSize),
                        0u, stream, N, data.particle_vel, data.pbf_position_delta);
@@ -1443,7 +1413,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
             LaunchCuda(PbfCohesionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                        N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
                        data.particle_vel, p->particle_mass, p->surface_tension_gamma,
-                       p->dt, ccoeffs, data.grid_neighbor_count,
+                       p->dt, ccoeffs, data.grid_neighbor_count, data.grid_neighbor_offset,
                        data.grid_neighbor_idx);
         }
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
@@ -1458,7 +1428,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
         LaunchCuda(PbfXsphDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, 0u, p->particles_per_env, data.particle_pos, data.particle_vel,
                    data.pbf_density, p->particle_mass, p->xsph_viscosity_c, coeffs,
-                   data.grid_neighbor_count, data.grid_neighbor_idx,
+                   data.grid_neighbor_count, data.grid_neighbor_offset, data.grid_neighbor_idx,
                    data.pbf_position_delta);
         LaunchCuda(PbfApplyVelocityDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u,
                    stream, N, data.particle_vel, data.pbf_position_delta);
@@ -1469,7 +1439,7 @@ Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
         LaunchCuda(PbfCohesionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, 0u, p->particles_per_env, data.particle_pos, data.particle_vel,
                    p->particle_mass, p->surface_tension_gamma, p->dt, ccoeffs,
-                   data.grid_neighbor_count, data.grid_neighbor_idx);
+                   data.grid_neighbor_count, data.grid_neighbor_offset, data.grid_neighbor_idx);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
@@ -1505,7 +1475,7 @@ Status OpParticleParticleContact(const ModelView& /*model*/, const DataView& dat
         // XSPH polish that also uses it already ran + applied in OpParticleFinalize).
         LaunchCuda(PpContactHalfCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
                    stream, N, data.particle_pos, data.particle_inv_mass,
-                   p->contact_distance_d_min, alpha_tilde, data.grid_neighbor_count,
+                   p->contact_distance_d_min, alpha_tilde, data.grid_neighbor_count, data.grid_neighbor_offset,
                    data.grid_neighbor_idx, data.pbf_position_delta);
         LaunchCuda(PpContactApplyKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, data.particle_pos, data.pbf_position_delta);

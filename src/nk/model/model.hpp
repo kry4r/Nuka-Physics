@@ -15,6 +15,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "math/transform.hpp"
@@ -89,6 +90,8 @@ struct ModelCapacities {
     // Byte size of the grid_sort_scratch arena field (the ParticleGridBuild cub
     // sort/scan temp + out buffers; sized at World construct, 0 == no particles).
     uint64_t grid_sort_scratch_bytes = 0;
+    uint32_t neighbor_pool_capacity_per_env = 0u;
+    uint64_t NeighborPoolCapacity() const;
 
     // Byte size of the island_cub_temp field (the BuildSolveIslands cub radix-sort
     // temp over the total row capacity; sized at World construct, 0 == no rows).
@@ -383,6 +386,9 @@ public:
         // = rest-space area / triangle. Empty for a drag-free cook.
         std::vector<uint32_t>   aero_tri_verts;     // 3 / triangle
         std::vector<float>      aero_tri_area;      // 1 / triangle
+        std::vector<uint32_t>   aero_particle_offset;
+        std::vector<uint32_t>   aero_particle_count;
+        std::vector<uint32_t>   aero_incident_tri;
         // Anisotropic air-drag coefficients (lumped 0.5*rho*Cn, 0.5*rho*Ct). Both
         // default 0 -> the drag op is inert (a drag-free world stays byte-identical).
         // Cn >> Ct (normal-dominant) is what destabilizes a flat falling sheet into
@@ -606,6 +612,8 @@ public:
     // (iteration in FieldId order). The returned Buffer is owned by the Model and
     // freed in the dtor. Returns Status::Ok / OutOfMemory.
     phi::Status UploadTo(phi::BufferType* bt, phi::ModelView* out_view);
+    phi::Status ValidateTopology(std::string* reason = nullptr) const;
+    void BuildAeroAdjacency();
 
     // The packed device buffer (null until UploadTo). Exposed for World teardown.
     phi::Buffer* DeviceBuffer() const { return device_buffer_; }

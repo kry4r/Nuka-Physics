@@ -603,8 +603,33 @@ typedef enum nuka_state_field_t {
     // Consumed and cleared by the next step; continuous loads must be rewritten each step.
     NUKA_FIELD_BODY_FORCE = 37,
     // WRITE: world torque [N*m] about COM; same layout and lifetime as BODY_FORCE.
-    NUKA_FIELD_BODY_TORQUE = 38
+    NUKA_FIELD_BODY_TORQUE = 38,
+    // READ: environment validity bits, uint32 per environment; synchronize before host inspection.
+    NUKA_FIELD_ENV_STATUS = 39,
+    // READ: last free-body drift residual, iteration count and nuka_gyro_status_t, env-major.
+    NUKA_FIELD_BODY_GYRO_RESIDUAL = 40,
+    NUKA_FIELD_BODY_GYRO_ITERATIONS = 41,
+    NUKA_FIELD_BODY_GYRO_STATUS = 42,
+    // READ: exact and retained neighbors per particle at the last grid build, uint32.
+    NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED = 43,
+    NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT = 44
 } nuka_state_field_t;
+
+typedef enum nuka_env_status_t {
+    NUKA_ENV_STATUS_VALID = 0,
+    NUKA_ENV_STATUS_PAIR_OVERFLOW = 1u << 0,
+    NUKA_ENV_STATUS_NEIGHBOR_OVERFLOW = 1u << 1,
+    NUKA_ENV_STATUS_DOF_OVERFLOW = 1u << 2,
+    NUKA_ENV_STATUS_MPM_GRID_ESCAPE = 1u << 3,
+    NUKA_ENV_STATUS_MPM_ONE_WAY_BODY = 1u << 4,
+    NUKA_ENV_STATUS_GYRO_FAILURE = 1u << 5
+} nuka_env_status_t;
+
+typedef enum nuka_gyro_status_t {
+    NUKA_GYRO_OK = 0,
+    NUKA_GYRO_NOT_CONVERGED = 1,
+    NUKA_GYRO_INVALID_INPUT = 2
+} nuka_gyro_status_t;
 
 typedef enum nuka_contact_side_kind_t {
     NUKA_CONTACT_SIDE_RIGID = 0,

@@ -55,17 +55,8 @@ __device__ __forceinline__ uint32_t CellKeyFromPos(float3 p,
     return CellKey(CellCoord(p, cfg), cfg);
 }
 
-// Per-particle 27-cell neighbor query. Iterates the 3x3x3 block of cells around
-// the query particle's cell, collecting neighbors within `radius` (squared-
-// distance test), EXCLUDING self (`self_idx`). Writes up to `max_count`
-// neighbor original-indices into `out_neighbors` (a private slice owned by this
-// thread); returns the number written. If more than `max_count` neighbors are
-// in range, keeps the `max_count` LOWEST original indices (deterministic subset)
-// and sets `*out_overflow = true`. The written list is NOT yet sorted -- the
-// calling kernel sorts the private slice ascending (D1).
-//
-// `cell_start` / `cell_end` are the per-cell [start,end) ranges into
-// `particle_idx_sorted`; `positions` is the ORIGINAL (unsorted) position array.
+// Enumerate all in-radius neighbors; a null output returns the exact count.
+// A bounded output keeps ascending particle IDs and reports any discarded neighbors.
 __device__ inline uint32_t QueryParticleNeighbors(
     float3 p,
     uint32_t self_idx,
@@ -81,6 +72,7 @@ __device__ inline uint32_t QueryParticleNeighbors(
     const float r2 = radius * radius;
     const uint3 base = CellCoord(p, cfg);
     uint32_t count = 0u;
+    uint32_t attempted = 0u;
     bool overflow = false;
 
     const int dimx = static_cast<int>(cfg.grid_dims.x);
@@ -121,11 +113,13 @@ __device__ inline uint32_t QueryParticleNeighbors(
                     if (d2 > r2) {
                         continue;
                     }
-                    // Insert `other` keeping the buffer sorted ascending and
-                    // capped at max_count (keep the lowest indices). This is an
-                    // insertion sort into a small (<=32) array -- O(max_count)
-                    // per insert, but max_count is tiny so it is cheap and gives
-                    // a deterministic, already-sorted output.
+                    ++attempted;
+                    if (out_neighbors == nullptr) continue;
+                    if (max_count == 0u) {
+                        overflow = true;
+                        continue;
+                    }
+                    // Insertion by particle ID gives a deterministic output order.
                     if (count < max_count) {
                         // Insert into sorted position.
                         uint32_t pos = count;
@@ -157,7 +151,7 @@ __device__ inline uint32_t QueryParticleNeighbors(
     if (out_overflow != nullptr) {
         *out_overflow = overflow;
     }
-    return count;
+    return out_neighbors == nullptr ? attempted : count;
 }
 
 } // namespace nuka::collision::gpu

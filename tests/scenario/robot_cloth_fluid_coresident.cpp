@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,11 @@ cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
         in.bend.push_back(c);
     }
     in.solver_iterations = kClothIters;
+    for (const auto& triangle : tris)
+        in.aero_triangles.push_back({triangle.v[0], triangle.v[1], triangle.v[2]});
+    in.aero_drag_normal = 0.6f;
+    in.aero_drag_tangent = 0.04f;
+    in.aero_drag_max_dv = 0.5f;
     in.friction = 0.6f;   // finite mu: the foot grips/drags the cloth.
     return in;
 }
@@ -385,9 +391,17 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         const float free_inv_mass = free_body->inv_mass;
         const Vec3 initial_com = free_body->pose.TransformPoint(free_body->inertial_frame.position);
         const Vec3 com_offset = free_body->inertial_frame.position;
+        free_body->angular_velocity = {5.0f, -3.0f, 2.0f};
+        const Vec3 inv_inertia = free_body->inv_inertia;
+        const auto inertial_frame = free_body->inertial_frame;
+        const auto principal_start = free_body->pose.rotation * inertial_frame.rotation;
+        const Vec3 local_start = principal_start.Conjugate().Rotate(free_body->angular_velocity);
+        const Vec3 initial_momentum = principal_start.Rotate(
+            {local_start.x / inv_inertia.x, local_start.y / inv_inertia.y, local_start.z / inv_inertia.z});
         const auto config = Cfg();
         const Vec3 gravity{config.gravity[0], config.gravity[1], config.gravity[2]};
         const Vec3 applied_force{0.3f, -0.2f, 0.4f};
+        const Vec3 applied_torque{0.01f, -0.02f, 0.03f};
 
         nk::World w(std::move(m), 1u, b.dev, b.backend, config);
         EXPECT_TRUE(w.Ready());
@@ -402,7 +416,7 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         auto apply_wrench = [&]() {
             std::vector<Vec3> forces(bodies), torques(bodies);
             forces[free_index] = applied_force;
-            torques[free_index] = {0.01f, -0.02f, 0.03f};
+            torques[free_index] = applied_torque;
             EXPECT_TRUE(d.UploadField(nk::FieldId::BodyForce, forces.data(), forces.size() * sizeof(Vec3)));
             EXPECT_TRUE(d.UploadField(nk::FieldId::BodyTorque, torques.data(), torques.size() * sizeof(Vec3)));
         };
@@ -416,8 +430,24 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
                 out.finite = false;
                 return out;
             }
+            uint32_t step_status = 0u;
+            EXPECT_TRUE(d.DownloadField(nk::FieldId::EnvStatus, &step_status, sizeof(step_status)));
+            if (step_status != 0u) {
+                ADD_FAILURE() << "invalid environment at step " << s << ": " << step_status;
+                out.finite = false;
+                return out;
+            }
             if (s + 1u == replay_steps) first_steps = ReadPipelineState(w);
             if (s == 0u) {
+                std::vector<Vec3> predicted(P);
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::PbfPredictedPos, predicted.data(), P * sizeof(Vec3)));
+                for (uint32_t i = 0u; i < n_soft; ++i) {
+                    const Vec3 expected = cloth.positions[i] +
+                        (cloth.inv_mass[i] > 0.0f ? gravity * (config.dt * config.dt) : Vec3::Zero());
+                    EXPECT_NEAR(predicted[i].x, expected.x, 1.0e-6f);
+                    EXPECT_NEAR(predicted[i].y, expected.y, 1.0e-6f);
+                    EXPECT_NEAR(predicted[i].z, expected.z, 1.0e-6f);
+                }
                 std::vector<Vec3> forces(bodies), torques(bodies), velocity(bodies), omega(bodies);
                 EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyForce, forces.data(), bodies * sizeof(Vec3)));
                 EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyTorque, torques.data(), bodies * sizeof(Vec3)));
@@ -492,6 +522,39 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         std::vector<Transform> body_poses(bodies);
         EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyLinearVelocity, free_velocity.data(), bodies * sizeof(Vec3)));
         EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyPose, body_poses.data(), bodies * sizeof(Transform)));
+        std::vector<Vec3> angular(bodies);
+        std::vector<float> residual(bodies);
+        std::vector<uint32_t> gyro_status(bodies), iterations(bodies);
+        uint32_t env_status = 0u;
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyAngularVelocity, angular.data(), bodies * sizeof(Vec3)));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyGyroResidual, residual.data(), bodies * sizeof(float)));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyGyroStatus, gyro_status.data(), bodies * sizeof(uint32_t)));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyGyroIterations, iterations.data(), bodies * sizeof(uint32_t)));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::EnvStatus, &env_status, sizeof(env_status)));
+        EXPECT_EQ(gyro_status[free_index], 0u);
+        EXPECT_EQ(env_status, 0u);
+        std::vector<uint32_t> neighbor_attempted(P), neighbor_count(P);
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::GridNeighborAttempted, neighbor_attempted.data(), P * sizeof(uint32_t)));
+        EXPECT_TRUE(d.DownloadField(nk::FieldId::GridNeighborCount, neighbor_count.data(), P * sizeof(uint32_t)));
+        EXPECT_EQ(neighbor_count, neighbor_attempted);
+        std::fprintf(stderr, "[particle-neighbors] max=%u attempted=%llu retained=%llu\n",
+            *std::max_element(neighbor_attempted.begin(), neighbor_attempted.end()),
+            static_cast<unsigned long long>(std::accumulate(neighbor_attempted.begin(), neighbor_attempted.end(), uint64_t{0})),
+            static_cast<unsigned long long>(std::accumulate(neighbor_count.begin(), neighbor_count.end(), uint64_t{0})));
+        EXPECT_LE(residual[free_index], 1.0e-6f);
+        const auto principal_end = body_poses[free_index].rotation * inertial_frame.rotation;
+        const Vec3 local_end = principal_end.Conjugate().Rotate(angular[free_index]);
+        const Vec3 momentum = principal_end.Rotate(
+            {local_end.x / inv_inertia.x, local_end.y / inv_inertia.y, local_end.z / inv_inertia.z});
+        const Vec3 expected_momentum = initial_momentum + applied_torque * config.dt;
+        EXPECT_LT((momentum - expected_momentum).Length(), 2.0e-4f);
+        uint64_t model_bytes = 0u, data_bytes = 0u;
+        w.GetModel().ComputeModelSegments(&model_bytes);
+        for (const auto& segment : d.Segments()) data_bytes += segment.bytes;
+        std::fprintf(stderr, "[dynamics-pipeline] gyro_residual=%g iterations=%u L_error=%g "
+            "env_status=%u model_bytes=%llu data_field_bytes=%llu\n", residual[free_index],
+            iterations[free_index], (momentum - expected_momentum).Length(), env_status,
+            static_cast<unsigned long long>(model_bytes), static_cast<unsigned long long>(data_bytes));
         const float steps = static_cast<float>(kSettleSteps + kHoldSteps);
         const Vec3 expected_velocity = gravity * (steps * config.dt) +
             applied_force * (free_inv_mass * config.dt);

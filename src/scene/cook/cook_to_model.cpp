@@ -1590,6 +1590,10 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     mp.aero_tri_area.reserve(an);
     for (uint32_t t = 0; t < an; ++t) {
         const std::array<uint32_t, 3>& tri = in.aero_triangles[t];
+        if (tri[0] >= in.positions.size() || tri[1] >= in.positions.size() ||
+            tri[2] >= in.positions.size() || tri[0] == tri[1] ||
+            tri[0] == tri[2] || tri[1] == tri[2])
+            throw std::invalid_argument("invalid aerodynamic triangle indices");
         for (uint32_t j = 0; j < 3u; ++j) mp.aero_tri_verts.push_back(tri[j]);
         float area = 0.0f;
         if (tri[0] < in.positions.size() && tri[1] < in.positions.size() &&

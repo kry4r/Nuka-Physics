@@ -58,18 +58,13 @@ public:
         kReadoutContactWrench = 1u << 0,  // ContactForce + LinkContactWrench
     };
 
-    // `device` (optional) enables the ggml-style capability query (§3.1
-    // supports_op): an op the backend has no implementation for is NOT emitted
-    // (M3b: the M5 broadphase + NarrowphaseSdf and M6 particle ops). This keeps
-    // Step() all-Ok and the CUDA-graph plan capturable while later milestones
-    // light the ops up — the op order itself stays the §3.2 fixed order.
-    // `readout_demand` ORs ReadoutDemand bits (World turns them on when a
-    // consumer first requests the corresponding output field).
-    void Build(const Model& model, const SolverConfig& cfg,
+    // All emitted physics ops are required; unsupported demands leave no runnable calls.
+    phi::Status Build(const Model& model, const SolverConfig& cfg,
                phi::Device* device = nullptr, uint32_t readout_demand = 0u);
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }
     size_t Size() const { return calls_.size(); }
+    const std::vector<phi::NkOp>& MissingOps() const { return missing_ops_; }
 
 private:
     // The single op-emission helper (capability query + push). The builder and
@@ -83,6 +78,7 @@ private:
     // reserved vector are stable because we reserve to the worst-case count
     // (each op appears at most once per step).
     std::vector<phi::OpCall> calls_;
+    std::vector<phi::NkOp> missing_ops_;
 
     // The build-time coupling providers (row path + MLS-MPM grid-transfer path).
     // Owned by the Pipeline (their lifetime parallels the Params PODs); consulted

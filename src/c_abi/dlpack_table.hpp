@@ -29,6 +29,7 @@
 #include "nuka/nuka.h"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "phi/op_schema.hpp"
 
 namespace nuka::c_abi {
 
@@ -36,6 +37,9 @@ static_assert(NUKA_CONTACT_SIDE_RIGID == nk::kNkSideRigid);
 static_assert(NUKA_CONTACT_SIDE_LINK == nk::kNkSideArtic);
 static_assert(NUKA_CONTACT_SIDE_PARTICLE == nk::kNkSideParticle);
 static_assert(NUKA_CONTACT_SIDE_STATIC == nk::kNkSideStatic);
+static_assert(NUKA_ENV_STATUS_GYRO_FAILURE == phi::kEnvStatusGyroFailure);
+static_assert(NUKA_GYRO_NOT_CONVERGED == phi::kBodyGyroNotConverged);
+static_assert(NUKA_GYRO_INVALID_INPUT == phi::kBodyGyroInvalidInput);
 
 // Wire dtype codes carried in nuka_buffer_view_t::dtype (the PUBLIC contract,
 // nuka.h: 0 == float32 for every field, 1 == uint32 for CONTACT_LINK only).
@@ -163,14 +167,20 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_CONTACT_SIDE_B_INDEX,  kStrideU32,   kWireDtypeU32, nk::FieldId::ContactSideBIndex},
     {NUKA_FIELD_BODY_FORCE,           kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyForce},
     {NUKA_FIELD_BODY_TORQUE,          kStrideVec3,  kWireDtypeF32, nk::FieldId::BodyTorque},
+    {NUKA_FIELD_ENV_STATUS,          kStrideU32,   kWireDtypeU32, nk::FieldId::EnvStatus},
+    {NUKA_FIELD_BODY_GYRO_RESIDUAL,   kStrideF32,   kWireDtypeF32, nk::FieldId::BodyGyroResidual},
+    {NUKA_FIELD_BODY_GYRO_ITERATIONS, kStrideU32,   kWireDtypeU32, nk::FieldId::BodyGyroIterations},
+    {NUKA_FIELD_BODY_GYRO_STATUS,     kStrideU32,   kWireDtypeU32, nk::FieldId::BodyGyroStatus},
+    {NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED, kStrideU32, kWireDtypeU32, nk::FieldId::GridNeighborAttempted},
+    {NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT, kStrideU32, kWireDtypeU32, nk::FieldId::GridNeighborCount},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 39u,
-              "dlpack_table must hold exactly the 39 public state fields");
+static_assert(kDlpackFieldCount == 45u,
+              "dlpack_table must hold exactly the 45 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

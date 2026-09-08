@@ -5,6 +5,7 @@
 #include "nk/pipeline/world.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -18,11 +19,36 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
              phi::Backend* backend, const Pipeline::SolverConfig& cfg)
     : model_(std::move(model)), cfg_(cfg), device_(device), backend_(backend) {
     if (device == nullptr || backend == nullptr) {
+        creation_error_ = "a live device and backend are required";
         return;
     }
     if (env_count > 0) {
         model_.capacities.env_count = env_count;
     }
+    creation_status_ = model_.ValidateTopology(&creation_error_);
+    if (creation_status_ != phi::Status::Ok) return;
+    if (!(cfg_.dt > 0.0f) || !std::isfinite(cfg_.dt) ||
+        !std::isfinite(cfg_.gravity[0]) || !std::isfinite(cfg_.gravity[1]) ||
+        !std::isfinite(cfg_.gravity[2])) {
+        creation_status_ = phi::Status::InvalidArgument;
+        creation_error_ = "timestep and gravity must be finite with positive timestep";
+        return;
+    }
+    creation_status_ = pipeline_->Build(model_, cfg_, device_, readout_demand_);
+    for (phi::NkOp op : pipeline_->MissingOps())
+        creation_error_ += "missing required op " + std::to_string(static_cast<uint32_t>(op)) + "; ";
+    std::vector<phi::NkOp> state_ops{
+        phi::NkOp::SnapshotState, phi::NkOp::RestoreState, phi::NkOp::ResetEnvs};
+    if (model_.capacities.links_per_env > 0u) state_ops.push_back(phi::NkOp::FkWorldPoses);
+    if (model_.capacities.bodies_per_env > 0u) state_ops.push_back(phi::NkOp::SyncLinkBodyPose);
+    for (phi::NkOp op : state_ops) {
+        if (!phi::DeviceSupportsOp(device_, op)) {
+            creation_status_ = phi::Status::Unsupported;
+            creation_error_ += "missing state op " + std::to_string(static_cast<uint32_t>(op)) + "; ";
+        }
+    }
+    if (creation_status_ != phi::Status::Ok) return;
+    creation_status_ = phi::Status::Failed;
 
     // Size the particle-grid sort/scan scratch so ParticleGridBuild captures into
     // the graph (no mid-capture cudaMalloc); 0 for a particle-free world (inert).
@@ -33,6 +59,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
          model_.particles.coupled_internal == Model::CoupledInternal::Pbf);
     const uint32_t particle_grid_count = runs_pbf
         ? model_.capacities.particles_per_env * model_.capacities.env_count : 0u;
+    if (particle_grid_count > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        creation_status_ = phi::Status::InvalidArgument;
+        creation_error_ = "particle grid exceeds the sort item limit";
+        return;
+    }
     model_.capacities.grid_sort_scratch_bytes =
         phi::GridSortScratchBytes(particle_grid_count);
 
@@ -84,6 +115,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     // for the one-shot Model upload + Arena alloc, per the plan's note).
     phi::BufferType* bt = phi::DeviceBufferType(device);
     if (bt == nullptr) {
+        creation_error_ = "device has no buffer type";
         return;
     }
 
@@ -100,18 +132,22 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     XpbdColoring::Build(&model_);
 
     // 1. Upload the Model's constant tables into ONE device buffer + fill view.
-    if (model_.UploadTo(bt, &model_view_) != phi::Status::Ok) {
+    creation_status_ = model_.UploadTo(bt, &model_view_);
+    if (creation_status_ != phi::Status::Ok) {
+        creation_error_ = "model upload failed";
         return;
     }
 
     // 2. Allocate the Data arena + fill the data view.
-    if (data_.Allocate(bt, model_.capacities, &data_view_) != phi::Status::Ok) {
+    creation_status_ = data_.Allocate(bt, model_.capacities, &data_view_);
+    if (creation_status_ != phi::Status::Ok) {
+        creation_error_ = "state arena allocation failed";
         return;
     }
 
-    // 3. Build the per-step pipeline (OpCall list, §3.2 order; the device's
-    // supports_op capability query drops not-yet-implemented ops).
-    pipeline_.Build(model_, cfg_, device, readout_demand_);
+    // Coloring finalizes the model's constraint counts before parameter binding.
+    creation_status_ = pipeline_->Build(model_, cfg_, device, readout_demand_);
+    if (creation_status_ != phi::Status::Ok) return;
 
     ready_ = true;
 
@@ -119,6 +155,8 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     // that backs Reset. Failure leaves the World unbuilt (honest).
     if (!SeedInitialState()) {
         ready_ = false;
+        creation_status_ = phi::Status::Failed;
+        creation_error_ = "initial state or snapshot dispatch failed";
     }
 }
 
@@ -159,6 +197,8 @@ bool World::SeedInitialState() {
     fk_params_.total_link_count = L * E;
     fk_params_.articulations_per_env = cap.articulations_per_env;
     reset_params_.particle_count = cap.particles_per_env;
+    reset_params_.has_particle_grid = cap.grid_sort_scratch_bytes != 0u;
+    restore_params_.has_particle_grid = reset_params_.has_particle_grid;
 
     // -- M4: movable rigid-body template seeding (env-major replication) -----
     const uint32_t B = cap.bodies_per_env;
@@ -464,15 +504,19 @@ StepResult World::Step() {
     if (!ready_ || backend_ == nullptr) {
         return out;
     }
-    const std::vector<phi::OpCall>& calls = pipeline_.Calls();
+    const std::vector<phi::OpCall>& calls = pipeline_->Calls();
+    out.result = phi::Status::Ok;
     out.status.reserve(calls.size());
     for (const phi::OpCall& call : calls) {
-        // One BackendDispatch per OpCall, in the §3.2 fixed order. (Ops the
-        // backend lacks were already dropped by the Build-time supports_op
-        // capability filter, so a healthy step is all-Ok.)
         const phi::Status s = phi::BackendDispatch(backend_, model_view_, data_view_, call);
         out.status.push_back(s);
+        if (s != phi::Status::Ok) {
+            out.result = s;
+            out.failed_op = call.op;
+            break;
+        }
     }
+    last_status_ = out.result;
     return out;
 }
 
@@ -480,7 +524,7 @@ phi::Status World::StepPlanned() {
     if (!ready_ || backend_ == nullptr) {
         return phi::Status::Failed;
     }
-    const std::vector<phi::OpCall>& calls = pipeline_.Calls();
+    const std::vector<phi::OpCall>& calls = pipeline_->Calls();
     if (plan_ == nullptr) {
         plan_ = phi::BackendPlanCreate(backend_, model_view_, data_view_,
                                        calls.data(),
@@ -544,7 +588,7 @@ phi::Status World::DispatchOp(phi::NkOp op, const void* params) {
     return phi::BackendDispatch(backend_, model_view_, data_view_, call);
 }
 
-void World::DemandReadout(FieldId id) {
+phi::Status World::DemandReadout(FieldId id) {
     uint32_t bit = 0u;
     // Every field OpReadoutContactWrench produces (geometry + {Fn,Ft1,Ft2} +
     // owning link + per-link wrench) shares the one readout bit.
@@ -556,23 +600,25 @@ void World::DemandReadout(FieldId id) {
         bit = Pipeline::kReadoutContactWrench;
     }
     if (bit == 0u || (readout_demand_ & bit) != 0u) {
-        return;
+        return last_status_ = phi::Status::Ok;
     }
-    readout_demand_ |= bit;
-    pipeline_.Build(model_, cfg_, device_, readout_demand_);
-    // The op set changed: drop the captured plan so StepPlanned re-captures.
+    auto candidate = std::make_unique<Pipeline>();
+    last_status_ = candidate->Build(model_, cfg_, device_, readout_demand_ | bit);
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    for (const phi::OpCall& call : candidate->Calls()) {
+        if (call.op == phi::NkOp::ReadoutContactWrench) {
+            last_status_ = phi::BackendDispatch(backend_, model_view_, data_view_, call);
+            if (last_status_ != phi::Status::Ok) return last_status_;
+            break;
+        }
+    }
     if (plan_ != nullptr && backend_ != nullptr) {
         phi::BackendPlanFree(backend_, plan_);
         plan_ = nullptr;
     }
-    // Backfill from the last solved rows (pure readout over unchanged inputs =>
-    // the same bytes a step-time emission would have produced).
-    for (const phi::OpCall& call : pipeline_.Calls()) {
-        if (call.op == phi::NkOp::ReadoutContactWrench) {
-            phi::BackendDispatch(backend_, model_view_, data_view_, call);
-            break;
-        }
-    }
+    pipeline_ = std::move(candidate);
+    readout_demand_ |= bit;
+    return last_status_ = phi::Status::Ok;
 }
 
 void* World::FieldPtr(FieldId id) const {
@@ -580,7 +626,7 @@ void* World::FieldPtr(FieldId id) const {
         return nullptr;
     }
     // Readout outputs are produced on demand: the first request turns the op on.
-    const_cast<World*>(this)->DemandReadout(id);
+    if (const_cast<World*>(this)->DemandReadout(id) != phi::Status::Ok) return nullptr;
     const FieldLayout& lay = LayoutOf(id);
     if (lay.owner == FieldOwner::Model) {
         // Resolve from the model device buffer via its segment table.

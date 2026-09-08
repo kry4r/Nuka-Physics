@@ -7,6 +7,7 @@
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // phi::ModelView/DataView (M3b nk seam)
 #include "phi/buffer.hpp"                 // phi v2 opaque Buffer* + free-fn wrappers
+#include "phi/articulation_contract.hpp"
 #include "phi/scoped_device_guard.hpp"
 #include "scene/canonical_types.hpp"
 
@@ -18,19 +19,7 @@
 
 namespace nuka::runtime::articulation {
 
-enum class ArticulationJointType : uint8_t {
-    Revolute = 0,
-    Prismatic = 1,
-    Fixed = 2,
-    // T8a: free-floating 6-DOF base. Only valid on an articulation ROOT
-    // (parent_link == kInvalidLink). A floating root does NOT use the scalar
-    // q[root]/qdot[root]/qddot[root] slots: its 6-DOF spatial velocity lives in
-    // link_velocity[root], its spatial acceleration in link_acceleration[root],
-    // and its live world pose in the per-articulation base_pose buffer (the
-    // static link_pose stays cook-time constant). All ABA / FK handling of this
-    // type is gated so the fixed-base path stays byte-for-byte identical.
-    FloatingBase = 3,
-};
+using phi::ArticulationJointType;
 
 struct LinkSpatialInertia {
     float I[36] = {};

@@ -62,6 +62,10 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::BodyAngularVelocity: v.body_angular_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyForce:           v.body_force = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyTorque:          v.body_torque = static_cast<math::Vec3*>(p); break;
+        case FieldId::BodyGyroResidual:    v.body_gyro_residual = static_cast<float*>(p); break;
+        case FieldId::BodyGyroIterations:  v.body_gyro_iterations = static_cast<uint32_t*>(p); break;
+        case FieldId::BodyGyroStatus:      v.body_gyro_status = static_cast<uint32_t*>(p); break;
+        case FieldId::AeroTriImpulse:      v.aero_tri_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyInvInertia:      v.body_inv_inertia = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyInertialFrame:   v.body_inertial_frame = static_cast<math::Transform*>(p); break;
         case FieldId::BodyWorldInvInertia: v.body_world_inv_inertia = static_cast<math::SymmetricMat3*>(p); break;
@@ -232,6 +236,8 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridNeighborOffset:  v.grid_neighbor_offset = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborCount:   v.grid_neighbor_count = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborIdx:     v.grid_neighbor_idx = static_cast<uint32_t*>(p); break;
+        case FieldId::GridNeighborAttempted: v.grid_neighbor_attempted = static_cast<uint32_t*>(p); break;
+        case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
         case FieldId::GridSortScratch:     v.grid_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSortScratch:     v.pair_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::RngState:            v.rng_state = static_cast<uint64_t*>(p); break;

@@ -172,8 +172,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::GridCellStart, DlpackDtype::kU32, 1, false, false},  // grid_cell_start
     {FieldId::GridCellEnd, DlpackDtype::kU32, 1, false, false},  // grid_cell_end
     {FieldId::GridNeighborOffset, DlpackDtype::kU32, 1, false, false},  // grid_neighbor_offset
-    {FieldId::GridNeighborCount, DlpackDtype::kU32, 1, false, false},  // grid_neighbor_count
-    {FieldId::GridNeighborIdx, DlpackDtype::kU32, 2, false, false},  // grid_neighbor_idx
+    {FieldId::GridNeighborCount, DlpackDtype::kU32, 1, false, true},  // grid_neighbor_count
+    {FieldId::GridNeighborIdx, DlpackDtype::kU32, 1, false, false},  // grid_neighbor_idx
     {FieldId::RngState, DlpackDtype::kU64, 1, false, false},  // rng_state
     {FieldId::EnvStatus, DlpackDtype::kU32, 1, false, true},  // env_status
     {FieldId::ObsBuffer, DlpackDtype::kF32, 1, false, true},  // obs_buffer
@@ -291,6 +291,15 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactSideBKind, DlpackDtype::kU32, 1, false, true},  // contact_side_b_kind
     {FieldId::ContactSideAIndex, DlpackDtype::kU32, 1, false, true},  // contact_side_a_index
     {FieldId::ContactSideBIndex, DlpackDtype::kU32, 1, false, true},  // contact_side_b_index
+    {FieldId::AeroParticleOffset, DlpackDtype::kU32, 1, false, false},  // aero_particle_offset
+    {FieldId::AeroParticleCount, DlpackDtype::kU32, 1, false, false},  // aero_particle_count
+    {FieldId::AeroIncidentTri, DlpackDtype::kU32, 2, false, false},  // aero_incident_tri
+    {FieldId::AeroTriImpulse, DlpackDtype::kF32, 2, false, false},  // aero_tri_impulse
+    {FieldId::BodyGyroResidual, DlpackDtype::kF32, 1, false, true},  // body_gyro_residual
+    {FieldId::BodyGyroIterations, DlpackDtype::kU32, 1, false, true},  // body_gyro_iterations
+    {FieldId::BodyGyroStatus, DlpackDtype::kU32, 1, false, true},  // body_gyro_status
+    {FieldId::GridNeighborAttempted, DlpackDtype::kU32, 1, false, true},  // grid_neighbor_attempted
+    {FieldId::GridNeighborScanOffset, DlpackDtype::kU64, 1, false, false},  // grid_neighbor_scan_offset
 };
 
 } // namespace nuka::nk

@@ -1809,7 +1809,19 @@ NB_MODULE(_nuka_ext, m) {
         .value("CONTACT_SIDE_B_INDEX", NUKA_FIELD_CONTACT_SIDE_B_INDEX)
         .value("BODY_FORCE", NUKA_FIELD_BODY_FORCE)
         .value("BODY_TORQUE", NUKA_FIELD_BODY_TORQUE)
+        .value("ENV_STATUS", NUKA_FIELD_ENV_STATUS)
+        .value("BODY_GYRO_RESIDUAL", NUKA_FIELD_BODY_GYRO_RESIDUAL)
+        .value("BODY_GYRO_ITERATIONS", NUKA_FIELD_BODY_GYRO_ITERATIONS)
+        .value("BODY_GYRO_STATUS", NUKA_FIELD_BODY_GYRO_STATUS)
+        .value("PARTICLE_NEIGHBOR_ATTEMPTED", NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED)
+        .value("PARTICLE_NEIGHBOR_COUNT", NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT)
         .export_values();
+
+    nb::enum_<nuka_gyro_status_t>(m, "GyroStatus")
+        .value("OK", NUKA_GYRO_OK)
+        .value("NOT_CONVERGED", NUKA_GYRO_NOT_CONVERGED)
+        .value("INVALID_INPUT", NUKA_GYRO_INVALID_INPUT);
+    m.attr("ENV_STATUS_GYRO_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_GYRO_FAILURE);
 
     nb::enum_<nuka_contact_side_kind_t>(m, "ContactSideKind")
         .value("RIGID", NUKA_CONTACT_SIDE_RIGID)

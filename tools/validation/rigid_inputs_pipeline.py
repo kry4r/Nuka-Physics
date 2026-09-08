@@ -65,6 +65,7 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
             nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_XPBD,
             cloth_nx=9, cloth_ny=9, cloth_spacing=0.025,
             cloth_origin=[0.1, -0.1, 0.07], xpbd_iters=24,
+            xpbd_aero_normal=0.6, xpbd_aero_tangent=0.04, xpbd_aero_max_dv=0.5,
         )
         builder.add_media(
             nuka.MEDIA_FLUID, nuka.MEDIA_METHOD_PBF,
@@ -111,6 +112,19 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
 
         world.step_n(steps - 1)
         advanced = state(world)
+        gyro_residual = read(world, nuka.BODY_GYRO_RESIDUAL, 1)
+        gyro_iterations = read(world, nuka.BODY_GYRO_ITERATIONS, 1)
+        gyro_status = read(world, nuka.BODY_GYRO_STATUS, 1)
+        env_status = world.download_field(nuka.ENV_STATUS).copy()
+        assert not np.any(gyro_status)
+        assert not np.any(env_status), env_status
+        neighbor_attempted = read(world, nuka.PARTICLE_NEIGHBOR_ATTEMPTED, 1)
+        neighbor_count = read(world, nuka.PARTICLE_NEIGHBOR_COUNT, 1)
+        np.testing.assert_array_equal(neighbor_count, neighbor_attempted)
+        assert float(gyro_residual.max()) <= 1e-6
+        gyro_view = torch.from_dlpack(world.buffer_view(nuka.BODY_GYRO_STATUS))
+        assert gyro_view.dtype == torch.uint32
+        assert gyro_view.data_ptr() == world.buffer_device_ptr(nuka.BODY_GYRO_STATUS)
         expected_position = (
             POSITION + GRAVITY * (dt**2 * steps * (steps + 1) / 2)
             + forces[:, body] * (dt**2 * steps / MASS)
@@ -131,6 +145,17 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
         world.upload_field(nuka.BODY_TORQUE, pending_torque)
         world.reset_envs(np.array([0], dtype=np.uint32))
         reset_state = state(world)
+        for field, before in ((nuka.BODY_GYRO_RESIDUAL, gyro_residual),
+                              (nuka.BODY_GYRO_ITERATIONS, gyro_iterations),
+                              (nuka.BODY_GYRO_STATUS, gyro_status)):
+            restored = read(world, field, 1)
+            assert not np.any(restored[0])
+            np.testing.assert_array_equal(restored[1], before[1])
+        for field, before in ((nuka.PARTICLE_NEIGHBOR_ATTEMPTED, neighbor_attempted),
+                              (nuka.PARTICLE_NEIGHBOR_COUNT, neighbor_count)):
+            restored = read(world, field, 1)
+            assert not np.any(restored[0])
+            np.testing.assert_array_equal(restored[1], before[1])
         for before, moved, restored in zip(initial, advanced, reset_state):
             np.testing.assert_array_equal(restored[0], before[0])
             np.testing.assert_array_equal(restored[1], moved[1])
@@ -171,6 +196,11 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS):
             "continuous_position_max_error_m": continuous_error,
             "loads_consumed_once": True, "masked_reset_isolated": True,
             "replay_bit_exact": True, "render_reset_bit_exact": True,
+            "gyro_max_residual": float(gyro_residual.max()),
+            "gyro_max_iterations": int(gyro_iterations.max()),
+            "env_status": env_status.tolist(), "gyro_reset_isolated": True,
+            "neighbor_max_count": int(neighbor_count.max()),
+            "neighbor_count": int(neighbor_count.sum()), "neighbors_not_truncated": True,
         }
 
 
@@ -193,15 +223,48 @@ def check_file_gravity(device):
     return {"defaults_unchanged": True, "translation_delta_m": delta.tolist()}
 
 
+def check_creation_contracts(device):
+    results = {}
+    for addon in ("go2_float.usda", "h1_visual.nks"):
+        with nuka.SceneBuilder.create(str(ROOT / "examples/scenes/go2_stand.usda")) as builder:
+            with nuka.SceneBuilder.create(str(ROOT / "examples/scenes" / addon)) as other:
+                builder.compose(other, pos=[2, 0, 0], attach_at="second_")
+            try:
+                world = builder.build(device, env_count=2)
+            except RuntimeError as error:
+                assert str(error).endswith("not supported (7)"), str(error)
+                results[addon] = str(error)
+            else:
+                world.destroy()
+                raise AssertionError("unsupported topology was accepted: " + addon)
+    with nuka.SceneBuilder.create(str(ROOT / "examples/scenes/go2_stand.usda")) as builder:
+        try:
+            world = builder.build(device, dt=float("nan"))
+        except RuntimeError as error:
+            assert str(error).endswith("invalid argument (1)"), str(error)
+            results["nonfinite_dt"] = str(error)
+        else:
+            world.destroy()
+            raise AssertionError("nonfinite timestep was accepted")
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--contracts-only", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     with nuka.Device.create(0) as device:
+        if args.contracts_only:
+            report = check_creation_contracts(device)
+            (args.output / "public_creation_contracts.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(json.dumps(report), flush=True)
+            return
         report = {"pipeline": run_pipeline(device, args.output),
                   "refined_pipeline": run_pipeline(device, args.output / "refined", 1.0 / 480.0, 2 * STEPS),
-                  "file_gravity": check_file_gravity(device)}
+                  "file_gravity": check_file_gravity(device),
+                  "creation_contracts": check_creation_contracts(device)}
     coarse = report["pipeline"]["continuous_position_max_error_m"]
     fine = report["refined_pipeline"]["continuous_position_max_error_m"]
     assert 1.9 < coarse / fine < 2.1, (coarse, fine)
