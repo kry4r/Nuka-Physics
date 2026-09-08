@@ -832,6 +832,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // and StepPlanned captures cleanly (no thrust LBVH). Also keeps the PairDriven
     // overload's row-budget resize a no-op (it guards on max_contacts_per_env > 0).
     if (!enable_contacts) {
+        model.feet.clear();
         cap.max_contacts_per_env = 0u;
         SetRowCapacity(cap, 0u);
     }

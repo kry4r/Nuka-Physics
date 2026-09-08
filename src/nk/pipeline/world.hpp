@@ -120,6 +120,7 @@ private:
     // base_pose / drive_* / mat_buckets, env-major replication) and take the
     // device snapshot the Reset path restores. Called once from the ctor.
     bool SeedInitialState();
+    phi::Status RefreshPoses(uint32_t selected_env_count);
 
     // First external request for a readout output: emit the producing op from
     // now on (rebuild pipeline, drop the plan) + backfill it from the last solve.

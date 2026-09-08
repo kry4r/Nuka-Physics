@@ -205,18 +205,17 @@ struct ApplyOscDrivesParams {
 };
 
 struct AbaForwardParams {
-    float    gravity[3];   // world-frame gravity vector (gravity_z = gravity[2])
+    float    gravity[3];   // world-frame acceleration in m/s^2
     uint32_t articulation_count;
     uint32_t total_link_count;
 };
 
 struct IntegrateVelocityParams {
     float    dt;
-    float    gravity_z;    // floating-base velocity integrate re-derives a_grav
+    float    gravity[3];
     uint32_t total_link_count;
     uint32_t articulation_count;
-    // The rigid-body arm: movable rigid-body gravity velocity-kick arm (the union world's
-    // per-body `linear_velocity.z += g*dt` for inv_mass > 0). 0 = no bodies.
+    // Free-body velocity integration consumes world-frame COM force and torque.
     uint32_t total_body_count;
 };
 

@@ -177,6 +177,8 @@ fields:
   # =========================================================================
   - {name: body_linear_velocity,  dtype: vec3, per: body, arena: persistent, owner: data, flags: [diff]}
   - {name: body_angular_velocity, dtype: vec3, per: body, arena: persistent, owner: data, flags: [diff]}
+  # World-frame COM force [N] and torque [N*m] for dynamic free-body owners.
+  # Velocity integration consumes and clears these transient inputs each step.
   - {name: body_force,            dtype: vec3, per: body, arena: scratch,    owner: data}
   - {name: body_torque,           dtype: vec3, per: body, arena: scratch,    owner: data}
   - {name: body_inv_inertia,      dtype: vec3, per: body, arena: persistent, owner: data, flags: [param]}

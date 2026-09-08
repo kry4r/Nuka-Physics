@@ -164,15 +164,8 @@ typedef struct nuka_world_desc_t {
     float    heightfield_radius_y;       // image half-extent Y, m.
     float    heightfield_elevation_z;    // image value-1 world rise, m.
     float    heightfield_base_z;         // image value-0 world floor, m.
-    // World gravity vector (m/s^2) in the engine's Z-up convention. Passed through
-    // to BOTH the WorldRecord step_options (the diffsim/noise gravity scalar) and
-    // the nk Pipeline SolverConfig at construction, so non-Earth gravity is set at
-    // create time (the post-create nuka_world_set_gravity_z only patches the
-    // step_options scalar, not the live Pipeline). A zero-initialized desc leaves
-    // all three at 0.0 -> the engine substitutes standard Earth gravity
-    // {0, 0, -9.81} (a literal zero-G world must be requested via the diffsim DR
-    // gravity offset, not a zero-init desc) -> BYTE-IDENTICAL to every legacy
-    // create that hardcoded Earth gravity.
+    // World gravity [m/s^2] for all forward dynamics, fixed at world creation.
+    // All-zero means {0,0,-9.81}; set_gravity_z only configures the differentiable tape.
     float gravity_x;
     float gravity_y;
     float gravity_z;
@@ -605,7 +598,12 @@ typedef enum nuka_state_field_t {
     // READ (per-contact-slot uint32). Global body/link/particle index by kind.
     // Static and inactive sides have UINT32_MAX; shape proxies resolve to their owner.
     NUKA_FIELD_CONTACT_SIDE_A_INDEX = 35,
-    NUKA_FIELD_CONTACT_SIDE_B_INDEX = 36
+    NUKA_FIELD_CONTACT_SIDE_B_INDEX = 36,
+    // WRITE: world COM force [N], float3 per dynamic free-body owner, env-major.
+    // Consumed and cleared by the next step; continuous loads must be rewritten each step.
+    NUKA_FIELD_BODY_FORCE = 37,
+    // WRITE: world torque [N*m] about COM; same layout and lifetime as BODY_FORCE.
+    NUKA_FIELD_BODY_TORQUE = 38
 } nuka_state_field_t;
 
 typedef enum nuka_contact_side_kind_t {

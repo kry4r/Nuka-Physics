@@ -186,11 +186,10 @@ void Pipeline::Build(const Model& model, const SolverConfig& cfg,
 
     if (has_articulation || has_bodies) {
         p_int_vel_.dt = cfg.dt;
-        p_int_vel_.gravity_z = cfg.gravity[2];
+        std::copy(std::begin(cfg.gravity), std::end(cfg.gravity), p_int_vel_.gravity);
         p_int_vel_.total_link_count = total_link_count;
         p_int_vel_.articulation_count = articulation_cnt;
-        // The rigid-body arm: the rigid-body gravity kick rides IntegrateVelocity (the union
-        // world kicks the cup exactly once per step, before the contact solve).
+        // Free-body loads are applied once before the shared contact solve.
         p_int_vel_.total_body_count = cap.bodies_per_env * env_count;
         add(phi::NkOp::IntegrateVelocity, &p_int_vel_);
     }

@@ -144,6 +144,9 @@ from .author import SimOptions, materials, morphs, surfaces  # noqa: F401
 
 # Re-export the field enum members at top level for convenience.
 RIGID_BODY_TRANSFORM = Field.RIGID_BODY_TRANSFORM
+# World-frame COM loads consumed and cleared by the next step.
+BODY_FORCE = Field.BODY_FORCE
+BODY_TORQUE = Field.BODY_TORQUE
 ARTICULATION_LINK_POSE = Field.ARTICULATION_LINK_POSE
 JOINT_POSITION = Field.JOINT_POSITION
 JOINT_VELOCITY = Field.JOINT_VELOCITY
@@ -292,6 +295,8 @@ __all__ = [
     "DETERMINISM_STRONG",
     "DETERMINISM_WEAK",
     "RIGID_BODY_TRANSFORM",
+    "BODY_FORCE",
+    "BODY_TORQUE",
     "ARTICULATION_LINK_POSE",
     "JOINT_POSITION",
     "JOINT_VELOCITY",
