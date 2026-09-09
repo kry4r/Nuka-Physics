@@ -749,15 +749,10 @@ struct XpbdProjectParams {
     uint32_t dist_con_count;   // total env-major distance constraints
     uint32_t bend_con_count;   // total env-major bend constraints
     uint32_t vol_con_count;    // total env-major volume constraints
-    // total env-major shape-match cluster count (XPBD id 9). 0 == none.
-    // Solved LAST in the XPBD sweep (after dist/bend/vol), the legacy
-    // XPBD-sweep order, so it pulls the projected config toward the rigid goal.
+    // Environment-major shape-match clusters run after distance, bend, and volume.
     uint32_t shape_match_cluster_count;
-    // Graph-coloring: per-family color counts + per-env constraint/cluster/member
-    // strides. The colored kernels project a color's constraints in PARALLEL
-    // (one thread per (env, constraint); the color segment table gives the
-    // single-env [offset,count) range, the stride lifts it env-major). 0 colors
-    // for a family means it has no constraints (inert).
+    // Each color contains independent constraints; colors execute in order.
+    // Per-environment strides map local constraint and cluster indices to global indices.
     uint32_t dist_colors;
     uint32_t bend_colors;
     uint32_t vol_colors;
@@ -768,10 +763,8 @@ struct XpbdProjectParams {
     uint32_t vol_cons_per_env;
     uint32_t sm_clusters_per_env;
     uint32_t sm_members_per_env;
-    // HOST pointers to the per-family {offset,count}/color segment tables (the
-    // Model host vectors, valid for the World's lifetime). The op reads them to
-    // size each color's launch (the within-color thread count); the launches run
-    // in fixed color order so the per-color barrier is the launch boundary.
+    // Host {offset,count} color tables remain valid for the world's lifetime.
+    // Backends use their workload bounds while preserving ordered color dependencies.
     const uint32_t* dist_color_segments;
     const uint32_t* bend_color_segments;
     const uint32_t* vol_color_segments;

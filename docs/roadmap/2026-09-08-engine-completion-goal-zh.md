@@ -12,7 +12,9 @@
 
 ## 执行批次
 
-粒子物理批次：结构邻接/静止距离过滤、统一投影位置、材料与接触交替求解已实现；既有 24 次 XPBD 和 48 次速度预算不变，投影/接触增量只计一次，固定粒子保持不动。E=1/16/256 × eager/graph 完整 450 步的最大应变为 1.838344%、最坏每环境 RMS 为 0.203045%，原 5%/1% 门通过。已有场景及 C/Python/reset/渲染验收收口，E=16 graph 完整 memcheck 为 0 errors；修正既有压板几何/表面速度和流体三维量测，原失败保留、物理预算不放宽。新源码/二进制已冻结，六组五进程分母正在采集。此批是物理算法修复，不能用旧错误物理作为性能分母。独立架构隔离已提交 `6953f4a`，无 CUDA 核心构建通过；不代表 CPU 求解功能已完成。证据见 [粒子 review](../research/2026-09-09-particle-topology-review-zh.md)。
+粒子物理批次：结构邻接/静止距离过滤、统一投影位置、材料与接触交替求解已实现；既有 24 次 XPBD 和 48 次速度预算不变，投影/接触增量只计一次，固定粒子保持不动。E=1/16/256 × eager/graph 完整 450 步的最大应变为 1.838344%、最坏每环境 RMS 为 0.203045%，原 5%/1% 门通过。已有场景及 C/Python/reset/渲染验收收口，E=16 graph 完整 memcheck 为 0 errors；修正既有压板几何/表面速度和流体三维量测，原失败保留、物理预算不放宽。物理修复已提交 `b0c2816`，新源码/二进制已冻结，六组五进程分母采集完成；graph E=1/16/256 为 3.366/3.672/6.402 ms，eager 中位数为 15.182/10.848/13.941 ms，其噪声需交错对照。此批是物理算法修复，不能用旧错误物理作为性能分母。独立架构隔离已提交 `6953f4a`，无 CUDA 核心构建通过；不代表 CPU 求解功能已完成。证据见 [粒子 review](../research/2026-09-09-particle-topology-review-zh.md)。
+
+当前 CUDA 批次已完成 [验收](../research/2026-09-09-cuda-execution-validation-zh.md)：eager 五进程中位耗时下降 39.02%–55.21%，graph 增加 0.22%–2.38%，内存相同。保持材料/接触交替、原预算和公式；完整质量/身份、既有材料、公共 API/reset/渲染、memcheck/synccheck 通过。E=2048 eager 验证跨驻留网格的完整循环；soft-tet 既有失败和 ContactWarmStart 的大环境 graph capture 失败继续处理。GPU 岛求解仍是热点，不把减少 host 提交写成全部性能完成。
 
 当前接触索引的功能与 graph 子集已验证，见 [review](../research/2026-09-09-contact-index-upstream-review-zh.md) 和 [验收报告](../research/2026-09-09-contact-index-validation-zh.md)。有效 row/endpoint、稳定 link gather、预算/reset 契约已实现；主 pipeline 34 passed，完整 graph 和读出/reset memcheck 为 0 errors，公共报告与两组各 8 张渲染图逐字节一致。graph E=1/16/256 从 3.081/3.381/6.516 降至 2.551/2.837/5.367 ms；容量×2/4、逐步 wrench 和权威物理状态等价通过。
 
@@ -44,6 +46,10 @@ eager 性能仍未验收：首次五进程和两组交错采样存在超过 5% �
 - 本地 commit 简洁、无合作者；保留原有工作区文件。Editor 等引擎完善后再设计。
 
 ## 性能模块的重点
+
+MLS-MPM 按用户最新补充提升为当前 CUDA 调度批次之后的主要工作，覆盖从 P2G/应力到活跃网格、双向刚体/机器人反作用及 G2P/F 的完整路径。主负载复用 `examples/demo/mpm_water_drop_demo.cpp` 的 bunny-water（MLS-MPM），辅以已有 jelly、rigid/articulation-on-MPM 和 transfer 场景；`water_pool_demo.cpp` 的同名 PBF 场景不能替代。先记录当前输入、完整质量与性能基线/profile，再成批改生产代码，不新增独立测试框架。
+
+性能批次后紧接着完善 MPM 耦合：无 SDF collider 的通用几何查询，多个碰撞端点的有限质量约束，刚体/关节子步反作用与速度刷新，以及 MPM↔XPBD/其他介质的完整交换链路。SDF 是几何表示之一，不应成为通用耦合的必需条件；解析 primitive、凸体和网格查询生成同一接触契约，不增设场景求解器。当前 bunny 的 SDF、独立网格地板、single owner 和延迟 articulation deposit 等边界必须随性能结果报告，不以未覆盖能力无限推迟已有有效路径的优化，也不把局部性能验收当作完整多体耦合。
 
 按用户追加要求，进入性能模块后以极致性能优化为主要工作：先用 GPU 完成时间和 profiler 定位关键路径，再成批优化 launch/graph、调度、数据布局、带宽、访存合并、寄存器与 occupancy、活跃工作压缩和 workspace/显存复用。分别优化少环境延迟与大批量吞吐，记录瓶颈如何迁移；达到初始 10% 门槛后继续处理仍有实测收益的热点，不把门槛当终点。
 
