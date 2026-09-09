@@ -98,9 +98,13 @@ struct Events {
 
 void Step(nk::World& world, const Options& options) {
     const auto status = options.execution == "graph" ? world.StepPlanned() : world.Step().result;
-    if (status != phi::Status::Ok)
+    if (status != phi::Status::Ok) {
+        const auto& error = world.LastExecutionError();
         throw std::runtime_error(options.execution + " step failed with status " +
-                                 std::to_string(static_cast<unsigned>(status)));
+                                 std::to_string(static_cast<unsigned>(status)) +
+                                 ", op " + std::to_string(static_cast<unsigned>(error.failed_op)) +
+                                 ", native " + std::to_string(error.native_code) + ": " + error.message);
+    }
 }
 
 constexpr std::array<nk::FieldId, 10> kPhysicalFields{

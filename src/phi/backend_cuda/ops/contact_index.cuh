@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cub/device/device_scan.cuh>
-#include <cub/device/device_segmented_sort.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <cuda_runtime.h>
@@ -16,6 +16,7 @@
 namespace nuka::phi::contact_index {
 
 constexpr uint32_t kEndpointsPerRow = 2u;
+constexpr int kEndpointIndexBits = std::numeric_limits<uint32_t>::digits;
 struct Rank { uint32_t rows, endpoints; };
 struct AddRank {
     __host__ __device__ Rank operator()(Rank a, Rank b) const {
@@ -59,7 +60,7 @@ inline uint64_t ScratchBytes(uint32_t rows, uint32_t envs) {
         uint64_t{rows} * kEndpointsPerRow > static_cast<uint64_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("contact index exceeds device sort range");
     size_t sort_bytes = 0u, scan_bytes = 0u;
-    auto status = cub::DeviceSegmentedSort::StableSortKeys(nullptr, sort_bytes,
+    auto status = cub::DeviceSegmentedRadixSort::SortKeys(nullptr, sort_bytes,
         static_cast<const uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
         static_cast<int>(rows * kEndpointsPerRow), static_cast<int>(envs + 1u),
         static_cast<const uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr));
@@ -147,9 +148,14 @@ inline cudaError_t Build(const DataView& data, uint32_t rows_per_env, uint32_t l
         data.contact_endpoint_count, keys, begins, ends, data.link_contact_begin, data.link_contact_end);
     if (const auto error = cudaGetLastError(); error != cudaSuccess) return error;
     temp_bytes = available;
-    status = cub::DeviceSegmentedSort::StableSortKeys(temp, temp_bytes, keys,
+    int link_bits = 1;
+    for (uint32_t upper = links > 0u ? (links - 1u) >> 1u : 0u; upper != 0u; upper >>= 1u)
+        ++link_bits;
+    // Compaction already orders row and side; a stable link sort preserves that order.
+    status = cub::DeviceSegmentedRadixSort::SortKeys(temp, temp_bytes, keys,
         data.contact_endpoint_keys, static_cast<int>(rows * kEndpointsPerRow),
-        static_cast<int>(envs + 1u), begins, ends, stream);
+        static_cast<int>(envs + 1u), begins, ends, kEndpointIndexBits,
+        kEndpointIndexBits + link_bits, stream);
     if (status != cudaSuccess) return status;
     const uint32_t endpoints = rows * kEndpointsPerRow;
     LinkSpansKernel<<<(endpoints + block - 1u) / block, block, 0u, stream>>>(

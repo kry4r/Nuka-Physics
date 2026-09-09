@@ -50,7 +50,7 @@
 - [x] 收口已有流体验收：三维 control-relative 量测覆盖侧向流动，原 3 mm/0.02 L1 预算通过，接触反作用同时通过；没有新增测试集合。
 - [x] 冻结新物理 `b0c2816` 的六组五进程分母，全部质量/状态/wrench/调度身份通过；graph E=1/16/256 为 3.366/3.672/6.402 ms，eager 噪声需交错对照。
 - [x] CUDA 岛调度与 XPBD 设备颜色循环完成联合验收：eager 五进程下降 39.02%–55.21%，graph 增加 0.22%–2.38%；完整质量/身份、材料/公开链路及 memcheck/synccheck 通过，E=2048 eager 跨驻留网格通过，见 [报告](../research/2026-09-09-cuda-execution-validation-zh.md)。
-- [ ] 继续处理大环境 ContactWarmStart 的 graph capture 失败：E=1024/2048 旧版失败，候选 E=2048 同样失败；eager 完整运行可通过，不能归因于 OOM。
+- [x] 修复大环境 ContactWarmStart/endpoint 排序的 graph capture：公开 segmented radix 与完整键桶匹配，E=2048 eager/graph、60 次五对完整管线、E=16 memcheck 和原 bunny-water 通过。结果含 E=1 graph 中位 +4.86% 回退，不宣称普遍加速，见 [验收](../research/2026-09-10-contact-graph-validation-zh.md)。
 - [ ] 继续归因 soft-tet 压板的材料/形变验收不一致：基线和候选 min extent 0.179912567，恢复体积 0.00025918262，均未过原门；不因同值而宣称正确。
 
 以 [模块 spec 第 14 节](../plans/2026-09-07-physics-module-specs-newton-port-zh.md) 跟踪进度。每项改造前 review 对应 spec，性能方向对照最新 Newton/MuJoCo/Genesis 并记录决策；多体耦合按最新授权可独立推导方案。
