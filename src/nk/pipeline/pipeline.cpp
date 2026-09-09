@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
+#include "collision/contact_capacity.hpp"
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/model.hpp"
 #include "nk/solve/nk_row.hpp"
@@ -91,7 +91,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
             ? model.particles.n_mpm_particles : 0u;
     const uint32_t particle_reserve =
         has_particles ? (cap.particles_per_env - row_exempt_particles) *
-                            collision::gpu::kBodyParticleContactSlotsPerParticle
+                            collision::kBodyParticleContactSlotsPerParticle
                       : 0u;
     const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve;
     const uint32_t default_pair_cap =
