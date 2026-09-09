@@ -40,7 +40,8 @@
 - [x] CUDA MPM 连续传输记录、占用 cell 标记、独立 workspace、活跃网格和稳定反作用分块读取通过验收：五进程落水 eager/graph 降时 32.02%/35.42%，Data arena 增加 24.48 MB；33 项既有场景、固定 E=16 graph pipeline、memcheck/synccheck 通过，见 [CUDA MPM 验收](../research/2026-09-09-cuda-mpm-transfer-validation-zh.md)。失败的完整权重缓存方案保留记录。
 - [x] CUDA MPM 原记录协作写入通过五对验收：落水 eager/graph 再降时 8.18%/9.66%，静置降时 10.03%/10.98%，arena 不增加；既有场景、固定 pipeline 和两项 sanitizer 通过，见 [记录写入验收](../research/2026-09-10-cuda-mpm-record-store-validation-zh.md)。对齐、SoA 与额外偏移缓存候选未采用。
 - [x] CUDA P2G 有序协作读取及分量累加完成验收：五对落水 eager/graph 降时 18.56%/22.07%，静置降时 11.03%/15.57%，arena 不增加；完整质量/状态、既有场景、固定 pipeline、memcheck/synccheck 通过。关节支承补充五对和 profile 保留进程波动，见 [gather 验收](../research/2026-09-10-cuda-mpm-gather-validation-zh.md)。
-- [ ] 继续以原 MLS-MPM bunny-water 与已有 jelly/刚体/关节场景判断剩余热点：当前 P2G/连续记录准备占落水 kernel busy 的 60.58%/4.85%，继续读取与计算热点、粒子/节点 workspace 容量分离。保留同物理分母和完整质量门；同名 PBF demo 不替代。
+- [x] MPM 粒子/节点工作区按实际 P/N 分配：原 bunny 的 Data arena 减少 1,392,640 B，十对完整步时基本持平；既有 MPM 场景、固定 E=16 pipeline、十项 memcheck 和无 CUDA 核心构建通过，见 [容量验收](../research/2026-09-10-mpm-capacity-validation-zh.md)。直接读取与完整权重缓存候选未采用，失败证据保留。
+- [ ] 继续以原 MLS-MPM bunny-water 与已有 jelly/刚体/关节场景判断剩余热点：既有 profile 的 P2G/连续记录准备占落水 kernel busy 的 60.58%/4.85%，继续通用读取与计算、跨节点数据复用、稀疏网格及其余性能问题。保留同物理分母和完整质量门；同名 PBF demo 不替代。
 - [ ] MLS-MPM 和其他剩余性能项处理后，接续无 SDF 碰撞体与完整多体/MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面。独立推导可验证的通用方案，性能结果明确已有覆盖与限制；耦合完成后继续原 spec。
 - [x] 收口粒子时间层基础修复：统一工作位置、材料/接触交替、累计 lambda 与一次提交；六组完整长度门、已有场景/API/reset/渲染及 E=16 graph memcheck 通过。最大应变 1.838344%、最坏 RMS 0.203045%；完整接触刷新与 MPM 子步反馈另行继续。
 - [x] 单独完成构建架构隔离（`6953f4a`）：后端注册和 nk 核心脱离 CUDA 配置门，CUDA 源码与库按能力附加；无 CUDA 核心构建通过，不代表完整 CPU solver 已实现。

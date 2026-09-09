@@ -1,6 +1,7 @@
 // MLS-MPM transfers APIC momentum and constitutive stress through environment-private grids.
 // Stable cell sorting and ordered gathers keep particle and body accumulation deterministic.
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -185,7 +186,7 @@ struct MpmTransferInput {
     float stress[9];
 };
 
-// Scratch uses the common particle/node capacity; physical grid fields keep their own types.
+// Particle records and grid indexing have independent capacities; sort outputs are reused.
 struct MpmSortScratchLayout {
     uint64_t temp_bytes = 0u;     // cub radix-sort temp-storage region size.
     uint64_t keys_off   = 0u;     // byte offset of the sorted-keys out buffer.
@@ -198,48 +199,61 @@ struct MpmSortScratchLayout {
     uint64_t active_count_off = 0u;
     uint64_t transfer_input_off = 0u;
     uint64_t total      = 0u;     // full segment byte size.
-    explicit MpmSortScratchLayout(uint32_t item_count) {
-        const int n = static_cast<int>(item_count);
-        size_t sort_bytes = 0u;
-        auto status = cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
-            nullptr, sort_bytes, static_cast<const uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), n);
-        if (status != cudaSuccess)
-            throw std::runtime_error(cudaGetErrorString(status));
+    MpmSortScratchLayout(uint32_t particle_count, uint32_t node_count) {
+        const auto sort_bytes_for = [](uint32_t count) {
+            size_t bytes = 0u;
+            const auto status = cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
+                nullptr, bytes, static_cast<const uint32_t*>(nullptr),
+                static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
+                static_cast<uint32_t*>(nullptr), static_cast<int>(count));
+            if (status != cudaSuccess)
+                throw std::runtime_error(cudaGetErrorString(status));
+            return bytes;
+        };
+        const size_t particle_sort_bytes = sort_bytes_for(particle_count);
+        const size_t node_sort_bytes = sort_bytes_for(node_count);
         size_t select_bytes = 0u;
         thrust::counting_iterator<uint32_t> node_ids(0u);
-        status = cub::DeviceSelect::Flagged(
+        const auto status = cub::DeviceSelect::Flagged(
             nullptr, select_bytes, node_ids, static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-            n);
+            static_cast<int>(node_count));
         if (status != cudaSuccess)
             throw std::runtime_error(cudaGetErrorString(status));
-        temp_bytes = sort_bytes > select_bytes ? sort_bytes : select_bytes;
-        const uint64_t nbytes = static_cast<uint64_t>(item_count) * sizeof(uint32_t);
+        temp_bytes = std::max({particle_sort_bytes, node_sort_bytes, select_bytes});
+        const uint64_t output_bytes =
+            uint64_t{std::max(particle_count, node_count)} * sizeof(uint32_t);
+        const uint64_t node_bytes = uint64_t{node_count} * sizeof(uint32_t);
         keys_off = AlignScratch(temp_bytes);
-        idx_off  = AlignScratch(keys_off + nbytes);
-        active_nodes_off = AlignScratch(idx_off + nbytes);
-        active_flags_off = AlignScratch(active_nodes_off + nbytes);
-        cell_start_off = AlignScratch(active_flags_off + nbytes);
-        cell_end_off = AlignScratch(cell_start_off + nbytes);
-        node_ids_off = AlignScratch(cell_end_off + nbytes);
-        active_count_off = AlignScratch(node_ids_off + nbytes);
+        idx_off  = AlignScratch(keys_off + output_bytes);
+        active_nodes_off = AlignScratch(idx_off + output_bytes);
+        active_flags_off = AlignScratch(active_nodes_off + node_bytes);
+        cell_start_off = AlignScratch(active_flags_off + node_bytes);
+        cell_end_off = AlignScratch(cell_start_off + node_bytes);
+        node_ids_off = AlignScratch(cell_end_off + node_bytes);
+        active_count_off = AlignScratch(node_ids_off + node_bytes);
         transfer_input_off = AlignScratch(active_count_off + sizeof(uint32_t));
         total = AlignScratch(transfer_input_off +
-                             uint64_t{item_count} * sizeof(MpmTransferInput));
+                             uint64_t{particle_count} * sizeof(MpmTransferInput));
     }
 };
 
-const MpmSortScratchLayout& ScratchLayout(uint32_t item_count) {
+const MpmSortScratchLayout& ScratchLayout(uint32_t particle_count, uint32_t node_count) {
     int device = -1;
     const auto status = cudaGetDevice(&device);
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-    struct Entry { int device; uint32_t count; MpmSortScratchLayout layout; };
+    struct Entry {
+        int device;
+        uint32_t particles;
+        uint32_t nodes;
+        MpmSortScratchLayout layout;
+    };
     static thread_local std::vector<Entry> entries;
     for (const auto& entry : entries)
-        if (entry.device == device && entry.count == item_count) return entry.layout;
-    entries.push_back({device, item_count, MpmSortScratchLayout(item_count)});
+        if (entry.device == device && entry.particles == particle_count && entry.nodes == node_count)
+            return entry.layout;
+    entries.push_back({device, particle_count, node_count,
+                       MpmSortScratchLayout(particle_count, node_count)});
     return entries.back().layout;
 }
 
@@ -1323,8 +1337,8 @@ struct MpmScratch {
     MpmTransferInput* transfer_input = nullptr;
     size_t sort_temp_bytes = 0u;
 };
-MpmScratch PartitionScratch(void* base, uint32_t item_count) {
-    const auto& layout = ScratchLayout(item_count);
+MpmScratch PartitionScratch(void* base, uint32_t particle_count, uint32_t node_count) {
+    const auto& layout = ScratchLayout(particle_count, node_count);
     auto* bytes = static_cast<char*>(base);
     MpmScratch scratch;
     scratch.sort_temp = bytes;
@@ -1490,8 +1504,7 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     const uint32_t mpm_count = static_cast<uint32_t>(mpm_count64);
     const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
-    const MpmScratch scratch = PartitionScratch(data.mpm_sort_scratch,
-                                                mpm_count > total_nodes ? mpm_count : total_nodes);
+    const MpmScratch scratch = PartitionScratch(data.mpm_sort_scratch, mpm_count, total_nodes);
     uint32_t gather_blocks = 0u;
     if (ResidentGridSize(MpmP2GGatherKernel, kBlockSize, 0u,
                          (total_nodes + kGatherGroups - 1u) / kGatherGroups,
@@ -1550,10 +1563,11 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
 
 }  // namespace
 
-uint64_t MpmSortScratchBytes(uint32_t particle_count) {
-    if (particle_count == 0u || particle_count > static_cast<uint32_t>(INT_MAX))
+uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count) {
+    if (particle_count == 0u || node_count == 0u ||
+        particle_count > static_cast<uint32_t>(INT_MAX) || node_count > static_cast<uint32_t>(INT_MAX))
         return 0u;
-    return ScratchLayout(particle_count).total;
+    return ScratchLayout(particle_count, node_count).total;
 }
 
 void RegisterNkMpmOps() {
