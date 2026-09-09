@@ -2,6 +2,14 @@
 
 These rules OVERRIDE default behavior. Follow them in every file you write or edit.
 
+## Repository hygiene
+
+- Keep commit messages concise, include `[skip ci]`, and omit co-author trailers.
+- Keep session notes, scratch diagnostics, generated captures, Git bundles, and
+  downloaded tools out of version control. Use `.nuka-runs/` or `out/` for local work.
+- Preserve reproducible evidence locally; publish maintained reports and curated
+  demo assets in their dedicated directories.
+
 ## Comments
 - Keep code comments to **2 lines maximum**.
 - **No temporary or process wording in code/comments.** Never reference milestones,
