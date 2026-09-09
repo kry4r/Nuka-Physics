@@ -229,9 +229,11 @@ double CoupledMediaRefRelL1(nuka_device_handle device, const std::string& scene,
     // world; subtracting it cancels the offset, so a residual is the robot's effect.
     double l1 = 0.0;
     for (size_t i = 0; i < n_total; ++i) {
-        const double a = at_feet[i * 3u + 2u];
-        const double c = control[i * 3u + 2u] - kSinkOffset;
-        l1 += std::fabs(a - c);
+        for (size_t axis = 0u; axis < 3u; ++axis) {
+            const double a = at_feet[i * 3u + axis];
+            const double c = control[i * 3u + axis] - (axis == 2u ? kSinkOffset : 0.0f);
+            l1 += std::fabs(a - c);
+        }
     }
     return l1;
 }
@@ -267,9 +269,11 @@ double SingleMediumRefRelL1(
     // world; subtracting it cancels the offset, so a residual is the robot's effect.
     double l1 = 0.0;
     for (size_t i = 0; i < n_total; ++i) {
-        const double a = at_feet[i * 3u + 2u];
-        const double c = control[i * 3u + 2u] - kSinkOffset;
-        l1 += std::fabs(a - c);
+        for (size_t axis = 0u; axis < 3u; ++axis) {
+            const double a = at_feet[i * 3u + axis];
+            const double c = control[i * 3u + axis] - (axis == 2u ? kSinkOffset : 0.0f);
+            l1 += std::fabs(a - c);
+        }
     }
     return l1;
 }

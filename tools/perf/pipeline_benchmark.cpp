@@ -7,6 +7,8 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 
 #include "phi/backend_cuda/cuda_internal.cuh"
@@ -32,6 +34,7 @@ struct Options {
     uint32_t envs = 1u, steps = 200u, warmup = 250u, seed = 20260908u;
     float dt = 1.0f / 240.0f;
     uint32_t capacity_scale = 1u;
+    uint32_t cloth_nx = fixture::kClothNx;
 };
 
 uint32_t ParseU32(const std::string& value) {
@@ -64,6 +67,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--state-output") options.state_output = value;
         else if (flag == "--wrench-output") options.wrench_output = value;
         else if (flag == "--capacity-scale") options.capacity_scale = ParseU32(value);
+        else if (flag == "--cloth-grid") options.cloth_nx = ParseU32(value);
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u ||
@@ -210,6 +214,215 @@ Json Memory(nk::World& world) {
     return memory;
 }
 
+Json Histogram(const std::map<uint32_t, uint64_t>& counts) {
+    Json result = Json::Array();
+    for (const auto& [size, count] : counts) {
+        Json item = Json::Object();
+        item.Set("size", Json::Int(size));
+        item.Set("count", Json::Int(count));
+        result.PushBack(std::move(item));
+    }
+    return result;
+}
+
+Json XpbdWorkload(const nk::Model& model) {
+    Json result = Json::Object();
+    const auto family = [&](const char* name, const std::vector<uint32_t>& segments,
+                            uint32_t constraints) {
+        Json item = Json::Object(), counts = Json::Array();
+        uint32_t maximum = 0u;
+        uint64_t total = 0u;
+        fixture::Require(segments.size() % 2u == 0u, "invalid XPBD color table");
+        for (size_t i = 0u; i < segments.size(); i += 2u) {
+            fixture::Require(segments[i] == total, "non-contiguous XPBD colors");
+            const auto count = segments[i + 1u];
+            counts.PushBack(Json::Int(count));
+            maximum = std::max(maximum, count);
+            total += count;
+        }
+        fixture::Require(total == constraints, "XPBD colors do not cover constraints");
+        item.Set("constraints_per_env", Json::Int(constraints));
+        item.Set("constraints_total", Json::Int(total * model.capacities.env_count));
+        item.Set("colors", Json::Int(segments.size() / 2u));
+        item.Set("constraints_per_color_per_env", std::move(counts));
+        item.Set("largest_color_total", Json::Int(uint64_t{maximum} * model.capacities.env_count));
+        item.Set("iterations", Json::Int(std::max<uint16_t>(model.particles.xpbd_iters, 1u)));
+        result.Set(name, std::move(item));
+    };
+    const auto& caps = model.capacities;
+    family("distance", model.dist_color_segments, caps.dist_cons_per_env);
+    family("bend", model.bend_color_segments, caps.bend_cons_per_env);
+    family("volume", model.vol_color_segments, caps.vol_cons_per_env);
+    family("shape_match", model.sm_color_segments, caps.shape_match_slots_per_env);
+    return result;
+}
+
+Json XpbdQuality(nk::World& world, uint32_t step) {
+    const auto& model = world.GetModel();
+    const auto& particles = model.particles;
+    const auto& caps = model.capacities;
+    std::vector<nuka::math::Vec3> positions(size_t{caps.env_count} * caps.particles_per_env);
+    fixture::Require(world.GetData().DownloadField(nk::FieldId::ParticlePos, positions.data(),
+                     positions.size() * sizeof(positions.front())), "XPBD position download failed");
+    double distance_max = 0.0, distance_squared = 0.0, bend_max = 0.0, bend_squared = 0.0;
+    double pinned_max = 0.0, distance_rms_max_env = 0.0;
+    uint64_t distance_count = 0u, bend_count = 0u;
+    for (uint32_t env = 0u; env < caps.env_count; ++env) {
+        const auto* points = positions.data() + size_t{env} * caps.particles_per_env;
+        double env_distance_squared = 0.0;
+        for (uint32_t i = 0u; i < caps.particles_per_env; ++i) {
+            const auto& point = points[i];
+            fixture::Require(std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z),
+                             "non-finite particle in quality replay");
+            if (particles.inv_mass[i] != 0.0f) continue;
+            const auto& initial = particles.initial_pos[i];
+            const double dx = double{point.x} - initial.x;
+            const double dy = double{point.y} - initial.y;
+            const double dz = double{point.z} - initial.z;
+            pinned_max = std::max(pinned_max, std::sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        for (uint32_t i = 0u; i < caps.dist_cons_per_env; ++i) {
+            const auto& a = points[particles.dist_a[i]];
+            const auto& b = points[particles.dist_b[i]];
+            const double dx = double{a.x} - b.x, dy = double{a.y} - b.y, dz = double{a.z} - b.z;
+            const double rest = particles.dist_rest[i];
+            fixture::Require(rest > 0.0, "distance strain requires positive rest length");
+            const double error = std::abs(std::sqrt(dx * dx + dy * dy + dz * dz) / rest - 1.0);
+            distance_max = std::max(distance_max, error);
+            distance_squared += error * error;
+            env_distance_squared += error * error;
+            ++distance_count;
+        }
+        if (caps.dist_cons_per_env > 0u)
+            distance_rms_max_env = std::max(distance_rms_max_env,
+                std::sqrt(env_distance_squared / caps.dist_cons_per_env));
+        for (uint32_t i = 0u; i < caps.bend_cons_per_env; ++i) {
+            double constraint = 0.0;
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                const auto& gradient = particles.bend_gradients[size_t{i} * 4u + j];
+                const auto& point = points[particles.bend_particles[size_t{i} * 4u + j]];
+                constraint += double{gradient.x} * point.x + double{gradient.y} * point.y +
+                              double{gradient.z} * point.z;
+            }
+            bend_max = std::max(bend_max, std::abs(constraint));
+            bend_squared += constraint * constraint;
+            ++bend_count;
+        }
+    }
+    fixture::Require(pinned_max == 0.0, "pinned particle moved in quality replay");
+    Json result = Json::Object();
+    result.Set("step", Json::Int(step));
+    result.Set("distance_count", Json::Int(distance_count));
+    result.Set("distance_strain_max", Json::Float(distance_max));
+    result.Set("distance_strain_rms", Json::Float(distance_count ?
+        std::sqrt(distance_squared / static_cast<double>(distance_count)) : 0.0));
+    result.Set("distance_strain_rms_max_env", Json::Float(distance_rms_max_env));
+    result.Set("bend_count", Json::Int(bend_count));
+    result.Set("bend_constraint_max", Json::Float(bend_max));
+    result.Set("bend_constraint_rms", Json::Float(bend_count ?
+        std::sqrt(bend_squared / static_cast<double>(bend_count)) : 0.0));
+    result.Set("pinned_displacement_max_m", Json::Float(pinned_max));
+    return result;
+}
+
+struct XpbdAcceptance {
+    static constexpr double max_strain_limit = 0.05, rms_strain_limit = 0.01;
+    double max_strain = 0.0, max_rms_strain = 0.0;
+    uint32_t steps_checked = 0u, first_failed_step = 0u;
+
+    void Observe(const Json& sample) {
+        const double strain = sample.At("distance_strain_max").AsDouble();
+        const double rms = sample.At("distance_strain_rms_max_env").AsDouble();
+        max_strain = std::max(max_strain, strain);
+        max_rms_strain = std::max(max_rms_strain, rms);
+        ++steps_checked;
+        if (first_failed_step == 0u && (strain > max_strain_limit || rms > rms_strain_limit))
+            first_failed_step = static_cast<uint32_t>(sample.At("step").AsInt());
+    }
+
+    bool Valid() const { return steps_checked > 0u && first_failed_step == 0u; }
+
+    Json Report() const {
+        Json result = Json::Object();
+        result.Set("scope", Json::Str("all replay steps and environments, including warmup; hard distance constraints"));
+        result.Set("budget", Json::Str("inextensible cloth: 5% maximum edge length error and 1% per-environment RMS"));
+        result.Set("distance_strain_max_limit", Json::Float(max_strain_limit));
+        result.Set("distance_strain_rms_limit", Json::Float(rms_strain_limit));
+        result.Set("distance_strain_max", Json::Float(max_strain));
+        result.Set("distance_strain_rms_max_env", Json::Float(max_rms_strain));
+        result.Set("steps_checked", Json::Int(steps_checked));
+        result.Set("first_failed_step", first_failed_step > 0u ? Json::Int(first_failed_step) : Json::Null());
+        result.Set("valid", Json::Bool(Valid()));
+        return result;
+    }
+};
+
+Json IslandWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_t step) {
+    const auto& caps = world.GetModel().capacities;
+    uint32_t island_count = 0u, active_count = 0u;
+    uint64_t articulation_sides = 0u;
+    for (const auto& row : rows) {
+        if (!(row.flags & nk::nk_row_flags::kActive)) continue;
+        ++active_count;
+        articulation_sides += (row.a.kind == nk::kNkSideArtic) + (row.b.kind == nk::kNkSideArtic);
+    }
+    fixture::Require(world.GetData().DownloadField(nk::FieldId::IslandCount,
+                     &island_count, sizeof(island_count)), "island count download failed");
+    fixture::Require(island_count <= active_count, "island count exceeds active rows");
+    std::vector<std::array<uint32_t, 4>> islands(island_count);
+    std::vector<uint32_t> order(active_count);
+    if (island_count != 0u)
+        fixture::Require(world.GetData().DownloadField(nk::FieldId::IslandQuads, islands.data(),
+                         islands.size() * sizeof(islands.front())), "island span download failed");
+    if (active_count != 0u)
+        fixture::Require(world.GetData().DownloadField(nk::FieldId::IslandRows, order.data(),
+                         order.size() * sizeof(uint32_t)), "island rows download failed");
+    std::vector<bool> visited(rows.size(), false);
+    uint32_t visited_count = 0u, articulation_islands = 0u;
+    std::map<uint32_t, uint64_t> row_histogram, articulation_row_histogram, tree_histogram;
+    for (const auto& island : islands) {
+        const auto [offset, count, flags, env] = island;
+        fixture::Require(env < caps.env_count && count != 0u &&
+                         uint64_t{offset} + count <= order.size(), "invalid island span");
+        std::set<uint32_t> trees;
+        for (uint32_t i = 0u; i < count; ++i) {
+            const uint32_t id = order[offset + i];
+            fixture::Require(id < rows.size() && id / caps.max_rows_per_env == env && !visited[id] &&
+                             (rows[id].flags & nk::nk_row_flags::kActive) &&
+                             (i == 0u || order[offset + i - 1u] < id), "invalid island row ownership or order");
+            visited[id] = true;
+            ++visited_count;
+            for (const auto& side : {rows[id].a, rows[id].b}) {
+                if (side.kind == nk::kNkSideArtic) trees.insert(side.index);
+            }
+        }
+        fixture::Require(((flags & 1u) != 0u) == !trees.empty(), "invalid island articulation flag");
+        ++row_histogram[count];
+        ++tree_histogram[static_cast<uint32_t>(trees.size())];
+        if (!trees.empty()) { ++articulation_islands; ++articulation_row_histogram[count]; }
+    }
+    fixture::Require(visited_count == active_count, "active rows missing from island schedule");
+    std::sort(islands.begin(), islands.end(), [&](const auto& a, const auto& b) {
+        return order[a[0]] < order[b[0]];
+    });
+    uint64_t hash = 14695981039346656037ull;
+    for (const auto& island : islands) {
+        hash = UpdateDigest(hash, island.data() + 1u, 3u * sizeof(uint32_t));
+        hash = UpdateDigest(hash, order.data() + island[0], island[1] * sizeof(uint32_t));
+    }
+    Json result = Json::Object();
+    result.Set("step", Json::Int(step));
+    result.Set("active_rows", Json::Int(active_count));
+    result.Set("articulation_sides", Json::Int(articulation_sides));
+    result.Set("islands", Json::Int(island_count));
+    result.Set("articulation_islands", Json::Int(articulation_islands));
+    result.Set("rows_per_island", Histogram(row_histogram));
+    result.Set("rows_per_articulation_island", Histogram(articulation_row_histogram));
+    result.Set("trees_per_island", Histogram(tree_histogram));
+    result.Set("canonical_schedule_fnv1a64", Json::Str(FormatDigest(hash)));
+    return result;
+}
+
 Json Run(const Options& options) {
     auto* device = phi::InitBestDevice();
     fixture::Require(device != nullptr, "no physics device");
@@ -228,7 +441,7 @@ Json Run(const Options& options) {
     const auto prepared = fixture::Prepare(scene_path, device, owner.backend, config);
     const double preparation_ms = Milliseconds(prepare_start);
     const auto cook_start = Clock::now();
-    auto model = fixture::CookPrepared(prepared, options.envs);
+    auto model = fixture::CookPrepared(prepared, options.envs, true, options.cloth_nx);
     const auto slots = uint64_t{model.capacities.max_contacts_per_env} * options.capacity_scale;
     const auto rows = slots * nk::kPairDrivenRowsPerSlot;
     fixture::Require(rows * options.envs <= std::numeric_limits<int>::max(), "contact capacity exceeds index range");
@@ -303,6 +516,8 @@ Json Run(const Options& options) {
     uint64_t wrench_hash = 14695981039346656037ull;
     bool wrench_finite = true;
     uint64_t cloth_rows = 0u, fluid_rows = 0u;
+    Json workload_samples = Json::Array(), xpbd_samples = Json::Array();
+    XpbdAcceptance xpbd_acceptance;
     for (uint32_t i = 0; i < options.warmup + options.steps; ++i) {
         Step(world, options);
         fixture::Require(world.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(),
@@ -316,9 +531,13 @@ Json Run(const Options& options) {
             wrench_output.write(reinterpret_cast<const char*>(wrench.data()), wrench_bytes);
             fixture::Require(wrench_output.good(), "cannot write wrench output");
         }
+        auto xpbd_quality = XpbdQuality(world, i + 1u);
+        xpbd_acceptance.Observe(xpbd_quality);
         if (i >= options.warmup && (i % 25u == 0u || i + 1u == options.warmup + options.steps)) {
             fixture::Require(world.GetData().DownloadField(nk::FieldId::Urows, rows_host.data(),
                              rows_host.size() * sizeof(nk::NkRow)), "row download failed");
+            workload_samples.PushBack(IslandWorkload(world, rows_host, i + 1u));
+            xpbd_samples.PushBack(std::move(xpbd_quality));
             for (const auto& row : rows_host) {
                 if (!(row.flags & nk::nk_row_flags::kActive)) continue;
                 const auto& particle = row.a.kind == nk::kNkSideParticle ? row.a : row.b;
@@ -355,6 +574,7 @@ Json Run(const Options& options) {
     configuration.Set("seed_usage", Json::Str("deterministic held control; no randomization"));
     configuration.Set("vel_iters", Json::Int(config.vel_iters));
     configuration.Set("cloth_iters", Json::Int(fixture::kClothIters));
+    configuration.Set("cloth_grid", Json::Int(options.cloth_nx));
     configuration.Set("capacity_scale", Json::Int(options.capacity_scale));
     configuration.Set("contact_slots_per_env", Json::Int(caps.max_contacts_per_env));
     configuration.Set("rows_per_env", Json::Int(caps.max_rows_per_env));
@@ -385,6 +605,11 @@ Json Run(const Options& options) {
     per_tag.Set("host_step_submission", Distribution(std::move(host_us)));
     result.Set("per_tag", std::move(per_tag));
     result.Set("memory", Memory(world));
+    Json workload = Json::Object();
+    workload.Set("scope", Json::Str("untimed quality replay; active rows and canonical island ownership checked"));
+    workload.Set("samples", std::move(workload_samples));
+    workload.Set("xpbd", XpbdWorkload(world.GetModel()));
+    result.Set("workload", std::move(workload));
     Json quality = Json::Object();
     quality.Set("finite", Json::Bool(finite));
     quality.Set("link_wrench_finite", Json::Bool(wrench_finite));
@@ -404,6 +629,8 @@ Json Run(const Options& options) {
     quality.Set("replica_mismatch_envs", std::move(replica_errors));
     quality.Set("cloth_rows_sampled", Json::Int(cloth_rows));
     quality.Set("fluid_rows_sampled", Json::Int(fluid_rows));
+    quality.Set("xpbd_samples", std::move(xpbd_samples));
+    quality.Set("xpbd_acceptance", xpbd_acceptance.Report());
     result.Set("quality", std::move(quality));
     Json hardware = Json::Object();
     cudaDeviceProp properties{};
@@ -418,8 +645,13 @@ Json Run(const Options& options) {
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
     const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && timed_state == replay_state &&
-                       cloth_rows > 0u && fluid_rows > 0u && mismatched_envs.empty();
+                       cloth_rows > 0u && fluid_rows > 0u && mismatched_envs.empty() && xpbd_acceptance.Valid();
     validity.Set("valid", Json::Bool(valid));
+    Json failures = Json::Array();
+    if (!xpbd_acceptance.Valid()) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
+    if (cloth_rows == 0u) failures.PushBack(Json::Str("no sampled cloth-articulation contact"));
+    if (fluid_rows == 0u) failures.PushBack(Json::Str("no sampled fluid-articulation contact"));
+    validity.Set("failures", std::move(failures));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));
     unavailable.PushBack(Json::Str("residual, complementarity and detailed penetration observability remain incomplete"));
     validity.Set("unavailable", std::move(unavailable));

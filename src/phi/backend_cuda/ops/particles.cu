@@ -1,6 +1,7 @@
 // Particle integration and projection use stable CSR neighbor lists and arena storage.
 
 #include <cuda_runtime.h>
+#include <cmath>
 
 #include "math/cuda_vec_ops.cuh"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
@@ -112,42 +113,22 @@ __global__ void ClothAeroGatherKernel(uint32_t particle_count,
     velocities[p] = Add(velocities[p], Scale(impulse, inv_masses[p]));
 }
 
-// =============================================================================
-// XPBD kernels — VERBATIM from the legacy XPBD soft stepper (predict / distance /
-// bend / volume / correct). Indices/expressions unchanged; only the buffer
-// arguments are the arena fields.
-// =============================================================================
-
-// predict: prev = p; p += v*dt + g*dt^2 (velocity NOT mutated; pinned w==0 stay).
-__global__ void XpbdPredictKernel(uint32_t particle_count,
-                                  math::Vec3* __restrict__ positions,
-                                  math::Vec3* __restrict__ prev_positions,
-                                  const math::Vec3* __restrict__ velocities,
-                                  math::Vec3* __restrict__ v_pre,
-                                  const float* __restrict__ inv_masses,
-                                  math::Vec3 gravity,
-                                  float dt,
-                                  uint32_t mpm_per_env, uint32_t per_env) {
+// Prediction saves one step-start position and publishes one common working position.
+__global__ void ParticlePredictKernel(
+    uint32_t count, uint32_t per_env, uint32_t active_begin,
+    const math::Vec3* __restrict__ positions, math::Vec3* __restrict__ previous,
+    math::Vec3* __restrict__ predicted, math::Vec3* __restrict__ velocities,
+    math::Vec3* __restrict__ contact_reference, const float* __restrict__ inv_mass,
+    math::Vec3 gravity, float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
-    }
-    // MpmXpbd: skip the MPM slice [0, n_mpm) per env (the transfer loop owns it). The
-    // condition short-circuits for a pure-Xpbd world (mpm_per_env 0) -> byte-identical.
-    if (mpm_per_env != 0u && (i % per_env) < mpm_per_env) {
-        return;
-    }
-    const math::Vec3 p = positions[i];
-    prev_positions[i] = p;
-    // Save the pre-contact velocity (XPBD predict leaves velocity untouched, so
-    // this is the step-start velocity the finalize subtracts off the contact delta).
-    v_pre[i] = velocities[i];
-    if (inv_masses[i] <= 0.0f) {
-        return;
-    }
-    const math::Vec3 step =
-        Add(Scale(velocities[i], dt), Scale(gravity, dt * dt));
-    positions[i] = Add(p, step);
+    if (i >= count || i % per_env < active_begin) return;
+    const math::Vec3 start = positions[i];
+    previous[i] = start;
+    math::Vec3 velocity = velocities[i];
+    if (inv_mass[i] > 0.0f) velocity = Add(velocity, Scale(gravity, dt));
+    velocities[i] = velocity;
+    contact_reference[i] = velocity;
+    predicted[i] = inv_mass[i] > 0.0f ? Add(start, Scale(velocity, dt)) : start;
 }
 
 // XPBD multipliers reset to 0 at step start (Macklin 2016). One thread per
@@ -158,6 +139,45 @@ __global__ void XpbdLambdaResetKernel(uint32_t count, float* __restrict__ lambda
         return;
     }
     lambda[c] = 0.0f;
+}
+
+__global__ void ParticleProjectionVelocityKernel(
+    uint32_t count, uint32_t per_env, uint32_t active_begin,
+    const math::Vec3* __restrict__ previous, const math::Vec3* __restrict__ projected,
+    const float* __restrict__ inv_mass, math::Vec3* __restrict__ velocities,
+    math::Vec3* __restrict__ contact_reference, float inv_dt) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count || i % per_env < active_begin || inv_mass[i] <= 0.0f) return;
+    const math::Vec3 velocity = Scale(Sub(projected[i], previous[i]), inv_dt);
+    velocities[i] = velocity;
+    contact_reference[i] = velocity;
+}
+
+// Contact velocity increments are applied once before the next material projection.
+__global__ void ParticleContactDeltaKernel(
+    uint32_t count, uint32_t per_env, uint32_t active_begin,
+    math::Vec3* __restrict__ projected, const math::Vec3* __restrict__ velocities,
+    math::Vec3* __restrict__ contact_reference, const float* __restrict__ inv_mass, float dt) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count || i % per_env < active_begin || inv_mass[i] <= 0.0f) return;
+    const math::Vec3 delta = Sub(velocities[i], contact_reference[i]);
+    projected[i] = Add(projected[i], Scale(delta, dt));
+    contact_reference[i] = velocities[i];
+}
+
+// Pseudo displacement changes the committed position without entering physical velocity.
+__global__ void ParticleFinalizeKernel(
+    uint32_t count, uint32_t per_env, uint32_t active_begin,
+    math::Vec3* __restrict__ positions, const math::Vec3* __restrict__ previous,
+    const math::Vec3* __restrict__ projected, math::Vec3* __restrict__ velocities,
+    const math::Vec3* __restrict__ contact_reference, const math::Vec3* __restrict__ pseudo,
+    const float* __restrict__ inv_mass, float dt) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count || i % per_env < active_begin || inv_mass[i] <= 0.0f) return;
+    const math::Vec3 delta = Sub(velocities[i], contact_reference[i]);
+    velocities[i] = Add(Scale(Sub(projected[i], previous[i]), 1.0f / dt), delta);
+    const math::Vec3 correction = pseudo != nullptr ? Add(delta, pseudo[i]) : delta;
+    positions[i] = Add(projected[i], Scale(correction, dt));
 }
 
 // distance: COLORED parallel Gauss-Seidel. One thread per (env, in-color
@@ -468,79 +488,6 @@ __global__ void XpbdShapeMatchColorKernel(
     }
 }
 
-// Compose projection velocity (p-prev)/dt with the contact correction (v_now-v_pre)
-// and carry its displacement; untouched (v_now==v_pre) -> byte-identical to (p-prev)/dt.
-__global__ void XpbdCorrectKernel(uint32_t particle_count,
-                                  math::Vec3* __restrict__ positions,
-                                  const math::Vec3* __restrict__ prev_positions,
-                                  math::Vec3* __restrict__ velocities,
-                                  const math::Vec3* __restrict__ v_pre,
-                                  const math::Vec3* __restrict__ pseudo_vel,
-                                  const float* __restrict__ inv_masses,
-                                  float dt,
-                                  uint32_t mpm_per_env, uint32_t per_env) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
-    }
-    // MpmXpbd: skip the MPM slice [0, n_mpm) (the transfer loop set its final pos/vel).
-    // Short-circuits for a pure-Xpbd world (mpm_per_env 0) -> byte-identical.
-    if (mpm_per_env != 0u && (i % per_env) < mpm_per_env) {
-        return;
-    }
-    if (inv_masses[i] <= 0.0f) {
-        return;
-    }
-    const math::Vec3 v_now = velocities[i];  // contact-corrected velocity.
-    const math::Vec3 vp = v_pre[i];          // pre-contact velocity.
-    const math::Vec3 dv{v_now.x - vp.x, v_now.y - vp.y, v_now.z - vp.z};
-    const math::Vec3 p_proj = positions[i];
-    const math::Vec3 prev = prev_positions[i];
-    const float inv_dt = 1.0f / dt;
-    const math::Vec3 pbd_v{(p_proj.x - prev.x) * inv_dt, (p_proj.y - prev.y) * inv_dt,
-                           (p_proj.z - prev.z) * inv_dt};
-    velocities[i] = math::Vec3{pbd_v.x + dv.x, pbd_v.y + dv.y, pbd_v.z + dv.z};
-    // Split-impulse position push-out: advance by the pseudo velocity WITHOUT
-    // touching the persisted velocity (no energy injection). Null/zero == identity.
-    const math::Vec3 sp = pseudo_vel != nullptr ? pseudo_vel[i] : math::Vec3{0, 0, 0};
-    positions[i] = math::Vec3{p_proj.x + (dv.x + sp.x) * dt,
-                              p_proj.y + (dv.y + sp.y) * dt,
-                              p_proj.z + (dv.z + sp.z) * dt};
-}
-
-// PBF sums actual neighbors in ascending particle order.
-
-// predict: v += dt*g ; pbf_predicted = p + dt*v. Plus v_pre saved AFTER gravity =
-// the velocity the body<->particle row solve reads (finalize subtracts it off).
-__global__ void PbfPredictKernel(uint32_t particle_count,
-                                 const math::Vec3* __restrict__ positions,
-                                 math::Vec3* __restrict__ velocities,
-                                 math::Vec3* __restrict__ v_pre,
-                                 math::Vec3* __restrict__ predicted_positions,
-                                 const float* __restrict__ inv_masses,
-                                 math::Vec3 gravity,
-                                 float dt) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
-    }
-    math::Vec3 v = velocities[i];
-    // A pinned PBF particle (inv_mass == 0) holds its velocity + position (the
-    // boundary/static-particle convention; the legacy fluid-only world had no
-    // pinned particles so this guard is inert there, byte-exact, and lets a
-    // coupled scene anchor boundary particles).
-    if (inv_masses[i] > 0.0f) {
-        v.x += dt * gravity.x;
-        v.y += dt * gravity.y;
-        v.z += dt * gravity.z;
-        velocities[i] = v;
-    }
-    v_pre[i] = v;  // pre-contact (post-gravity) velocity the solve reads.
-    const math::Vec3 p = positions[i];
-    predicted_positions[i] =
-        math::Vec3{p.x + dt * v.x, p.y + dt * v.y, p.z + dt * v.z};
-}
-
 // density (Poly6, self term first, ascending neighbor sum). Verbatim, plus the
 // SoftFluid fluid-slice scope: when n_soft > 0 the owner particle skips if
 // it is a SOFT particle, and a SOFT neighbor is skipped in the sum (a soft
@@ -678,10 +625,12 @@ __global__ void PbfComputeCorrectionKernel(
 __global__ void PbfApplyCorrectionKernel(uint32_t particle_count,
                                          math::Vec3* __restrict__ predicted,
                                          const math::Vec3* __restrict__ delta,
+                                         const float* __restrict__ inv_mass,
+                                         uint32_t n_soft, uint32_t per_env,
                                          bool boundary_enabled,
                                          float floor_z) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
+    if (i >= particle_count || inv_mass[i] <= 0.0f || SfIsSoft(i, n_soft, per_env)) {
         return;
     }
     const math::Vec3 pi = predicted[i];
@@ -691,34 +640,6 @@ __global__ void PbfApplyCorrectionKernel(uint32_t particle_count,
         out.z = floor_z;
     }
     predicted[i] = out;
-}
-
-// finalize: v = (predicted-position)/dt + (v_now-v_pre); pos = predicted + dv*dt.
-// dv == +0.0 when no row touched the particle -> byte-identical to the plain finalize.
-__global__ void PbfFinalizeKernel(uint32_t particle_count,
-                                  math::Vec3* __restrict__ positions,
-                                  const math::Vec3* __restrict__ predicted,
-                                  math::Vec3* __restrict__ velocities,
-                                  const math::Vec3* __restrict__ v_pre,
-                                  const float* __restrict__ inv_masses,
-                                  float inv_dt) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
-    }
-    if (inv_masses[i] <= 0.0f) {
-        return;
-    }
-    const math::Vec3 p0 = positions[i];
-    const math::Vec3 pp = predicted[i];
-    const math::Vec3 v_now = velocities[i];  // contact-corrected velocity.
-    const math::Vec3 vp = v_pre[i];          // pre-contact velocity.
-    const math::Vec3 dv{v_now.x - vp.x, v_now.y - vp.y, v_now.z - vp.z};
-    const float dt = 1.0f / inv_dt;
-    velocities[i] = math::Vec3{(pp.x - p0.x) * inv_dt + dv.x,
-                               (pp.y - p0.y) * inv_dt + dv.y,
-                               (pp.z - p0.z) * inv_dt + dv.z};
-    positions[i] = math::Vec3{pp.x + dv.x * dt, pp.y + dv.y * dt, pp.z + dv.z * dt};
 }
 
 // XSPH viscosity compute (read-only into the delta scratch). Verbatim, plus the
@@ -776,9 +697,10 @@ __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
 // out_dv zeroed in the compute pass, so the own-index add is a no-op for it.
 __global__ void PbfApplyVelocityDeltaKernel(uint32_t particle_count,
                                             math::Vec3* __restrict__ velocities,
+                                            const float* __restrict__ inv_mass,
                                             const math::Vec3* __restrict__ dv) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
+    if (i >= particle_count || inv_mass[i] <= 0.0f) {
         return;
     }
     const math::Vec3 v = velocities[i];
@@ -794,6 +716,7 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
                                   uint32_t per_env,
                                   const math::Vec3* __restrict__ positions,
                                   math::Vec3* __restrict__ velocities,
+                                  const float* __restrict__ inv_mass,
                                   float particle_mass,
                                   float gamma,
                                   float dt,
@@ -802,7 +725,7 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
     const uint32_t* __restrict__ neighbor_offsets,
                                   const uint32_t* __restrict__ neighbor_indices) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
+    if (i >= particle_count || inv_mass[i] <= 0.0f) {
         return;
     }
     if (n_soft > 0u && SfIsSoft(i, n_soft, per_env)) {
@@ -835,230 +758,34 @@ __global__ void PbfCohesionKernel(uint32_t particle_count,
     velocities[i] = v;
 }
 
-// =============================================================================
-// COUPLED kernels : particles co-step against rigid/artic bodies through the
-// unified row solve. The contact solve corrects the particle velocity BETWEEN
-// these two kernels (the legacy unified_costep pre/couple/post ordering inside
-// the fixed pipeline). pbf_predicted_pos stores v_pre so finalize composes the
-// XPBD soft-constraint (PBD) velocity with the contact velocity delta.
-// =============================================================================
-
-// predict: prev = pos; if free: v += g*dt; save v_pre := v; pos += v*dt.
-// The PREDICTED position is written into particle_pos so the narrowphase detects
-// the coupling contacts on it (the legacy couple-on-predicted-positions). For a
-// PBF-internal coupled body, pbf_predicted_pos is seeded == the predicted position
-// so the density-projection ops (which own pbf_predicted_pos) run on it; the
-// finalize then reads pbf_predicted_pos as the density-projected position. The
-// pre-contact velocity is saved into the dedicated particle_v_pre scratch.
-__global__ void CoupledPredictKernel(uint32_t particle_count,
-                                     math::Vec3* __restrict__ positions,
-                                     math::Vec3* __restrict__ prev_positions,
-                                     math::Vec3* __restrict__ velocities,
-                                     math::Vec3* __restrict__ v_pre,
-                                     math::Vec3* __restrict__ pbf_predicted,
-                                     uint32_t internal,
-                                     const float* __restrict__ inv_masses,
-                                     math::Vec3 gravity,
-                                     float dt) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
+// Structural neighbors may overlap in the rest shape; distant folded members still collide.
+__device__ __forceinline__ bool RestNeighbors(
+    uint32_t i, uint32_t j, uint32_t per_env, float distance,
+    const uint32_t* offsets, const uint32_t* elements, const math::Vec3* rest) {
+    if (offsets == nullptr) return false;
+    const uint32_t a = i % per_env, b = j % per_env;
+    const math::Vec3 separation = Sub(rest[a], rest[b]);
+    if (Dot(separation, separation) >= distance * distance) return false;
+    uint32_t ai = offsets[a], bi = offsets[b];
+    const uint32_t ae = offsets[a + 1u], be = offsets[b + 1u];
+    while (ai < ae && bi < be) {
+        const uint32_t ag = elements[ai], bg = elements[bi];
+        if (ag == bg) return true;
+        if (ag < bg) ++ai;
+        else ++bi;
     }
-    const math::Vec3 p = positions[i];
-    prev_positions[i] = p;
-    math::Vec3 v = velocities[i];
-    if (inv_masses[i] > 0.0f) {
-        v.x += dt * gravity.x;
-        v.y += dt * gravity.y;
-        v.z += dt * gravity.z;
-        velocities[i] = v;
-    }
-    v_pre[i] = v;  // pre-contact (predicted) velocity.
-    math::Vec3 pred = p;
-    if (inv_masses[i] > 0.0f) {
-        pred = math::Vec3{p.x + v.x * dt, p.y + v.y * dt, p.z + v.z * dt};
-        positions[i] = pred;
-    }
-    // PBF-internal coupled body: seed the density-projection working buffer.
-    if (internal == kCoupledInternalPbf) {
-        pbf_predicted[i] = pred;
-    }
-}
-
-// finalize: compose the PBD (soft-constraint / density) velocity with the contact
-// delta.
-// contact_delta = v_now - v_pre (the row solve's velocity correction)
-// pbd_vel = (pos_projected - prev)/dt (the internal-projection velocity)
-// v_final = pbd_vel + contact_delta
-// pos_final = prev + v_final*dt
-// pos_projected is pbf_predicted_pos for a PBF-internal body (the density-projected
-// position) and particle_pos for XPBD / free-point bodies. A pinned particle
-// (inv_mass 0) holds position + velocity (boundary anchor).
-__global__ void CoupledFinalizeKernel(uint32_t particle_count,
-                                      math::Vec3* __restrict__ positions,
-                                      const math::Vec3* __restrict__ prev_positions,
-                                      math::Vec3* __restrict__ velocities,
-                                      const math::Vec3* __restrict__ v_pre,
-                                      const math::Vec3* __restrict__ pbf_predicted,
-                                      const math::Vec3* __restrict__ pseudo_vel,
-                                      uint32_t internal,
-                                      const float* __restrict__ inv_masses,
-                                      float dt) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
-    }
-    if (inv_masses[i] <= 0.0f) {
-        return;
-    }
-    const math::Vec3 prev = prev_positions[i];
-    const math::Vec3 pos_proj = (internal == kCoupledInternalPbf)
-                                    ? pbf_predicted[i]   // density-projected pos.
-                                    : positions[i];      // XPBD / free predicted pos.
-    const math::Vec3 v_now = velocities[i];        // contact-corrected velocity.
-    const math::Vec3 vp = v_pre[i];                // pre-contact velocity.
-    const float inv_dt = 1.0f / dt;
-    const math::Vec3 pbd_v{(pos_proj.x - prev.x) * inv_dt,
-                           (pos_proj.y - prev.y) * inv_dt,
-                           (pos_proj.z - prev.z) * inv_dt};
-    const math::Vec3 v_final{pbd_v.x + (v_now.x - vp.x), pbd_v.y + (v_now.y - vp.y),
-                             pbd_v.z + (v_now.z - vp.z)};
-    velocities[i] = v_final;
-    // Split-impulse position push-out: advance by the pseudo velocity WITHOUT
-    // touching the persisted velocity (no energy injection). Null/zero == identity.
-    const math::Vec3 sp = pseudo_vel != nullptr ? pseudo_vel[i] : math::Vec3{0, 0, 0};
-    positions[i] = math::Vec3{prev.x + (v_final.x + sp.x) * dt,
-                              prev.y + (v_final.y + sp.y) * dt,
-                              prev.z + (v_final.z + sp.z) * dt};
-}
-
-// =============================================================================
-// SOFT+FLUID co-resident kernels : ONE Model holds a soft (XPBD) set in
-// [0, n_soft) and a fluid (PBF) set in [n_soft, per_env) per env. The predict /
-// finalize kernels branch per-particle on the within-env local index vs n_soft;
-// the soft branch is the VERBATIM XPBD predict/correct, the fluid branch the
-// VERBATIM PBF predict/finalize. (Single-system byte-identity is preserved: the
-// single-system path still uses the dedicated XpbdPredictKernel/PbfPredictKernel;
-// these run ONLY for kParticleModeSoftFluid.)
-// =============================================================================
-
-// The body<->particle contact row solve corrects particle_vel AFTER predict and
-// BEFORE finalize, so finalize must separate the gravity+free-flight+projection
-// velocity (reproduced from prev/predicted) from the contact correction. v_pre is
-// the pre-contact velocity each slice's finalize subtracts so the contact delta
-// enters exactly once. The soft branch never mutates velocity, so its v_pre is the
-// step-start velocity; the fluid branch saves v_pre AFTER gravity (the velocity the
-// solve reads). When no row touches a particle, v_now == v_pre bit-exactly.
-__global__ void SoftFluidPredictKernel(uint32_t particle_count,
-                                       uint32_t n_soft,
-                                       uint32_t per_env,
-                                       math::Vec3* __restrict__ positions,
-                                       math::Vec3* __restrict__ prev_positions,
-                                       math::Vec3* __restrict__ velocities,
-                                       math::Vec3* __restrict__ v_pre,
-                                       math::Vec3* __restrict__ predicted_positions,
-                                       const float* __restrict__ inv_masses,
-                                       math::Vec3 gravity,
-                                       float dt) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
-    }
-    if (SfIsSoft(i, n_soft, per_env)) {
-        // The shared neighbor grid needs predicted positions for both particle types.
-        const math::Vec3 p = positions[i];
-        prev_positions[i] = p;
-        v_pre[i] = velocities[i];
-        if (inv_masses[i] <= 0.0f) {
-            predicted_positions[i] = p;
-            return;
-        }
-        const math::Vec3 step =
-            Add(Scale(velocities[i], dt), Scale(gravity, dt * dt));
-        positions[i] = Add(p, step);
-        predicted_positions[i] = positions[i];
-    } else {
-        // VERBATIM PbfPredictKernel body (v_pre saved after gravity = solve's input v).
-        math::Vec3 v = velocities[i];
-        if (inv_masses[i] > 0.0f) {
-            v.x += dt * gravity.x;
-            v.y += dt * gravity.y;
-            v.z += dt * gravity.z;
-            velocities[i] = v;
-        }
-        v_pre[i] = v;
-        const math::Vec3 p = positions[i];
-        predicted_positions[i] =
-            math::Vec3{p.x + dt * v.x, p.y + dt * v.y, p.z + dt * v.z};
-    }
-}
-
-// Compose the gravity+free-flight+projection velocity (pbd_v, reproduced from the
-// position the projection left) with the body<->particle contact correction
-// (v_now - v_pre, what the row solve wrote into particle_vel). The contact delta
-// enters exactly once and the projection velocity exactly once. When no row touched
-// the particle, v_now == v_pre bit-exactly so (v_now - v_pre) is +0.0 per component
-// and v_final == pbd_v -> byte-identical to the plain v = (pos_proj - prev)/dt. The
-// soft branch then carries the contact displacement (v_final - pbd_v)*dt onto the
-// projected position; adding the +0.0 displacement leaves it bit-identical. The
-// fluid branch likewise carries dv*dt onto the predicted position (dv == +0.0 ->
-// pos == predicted, bit-identical to the verbatim PbfFinalizeKernel).
-__global__ void SoftFluidFinalizeKernel(uint32_t particle_count,
-                                        uint32_t n_soft,
-                                        uint32_t per_env,
-                                        math::Vec3* __restrict__ positions,
-                                        const math::Vec3* __restrict__ prev_positions,
-                                        const math::Vec3* __restrict__ predicted,
-                                        math::Vec3* __restrict__ velocities,
-                                        const math::Vec3* __restrict__ v_pre,
-                                        const math::Vec3* __restrict__ pseudo_vel,
-                                        const float* __restrict__ inv_masses,
-                                        float dt) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) {
-        return;
-    }
-    if (inv_masses[i] <= 0.0f) {
-        return;  // pinned: position + velocity held (both branches).
-    }
-    const math::Vec3 v_now = velocities[i];  // contact-corrected velocity.
-    const math::Vec3 vp = v_pre[i];          // pre-contact velocity.
-    const math::Vec3 dv{v_now.x - vp.x, v_now.y - vp.y, v_now.z - vp.z};
-    // Split-impulse position push-out: positional only, persisted velocity untouched.
-    const math::Vec3 sp = pseudo_vel != nullptr ? pseudo_vel[i] : math::Vec3{0, 0, 0};
-    const float inv_dt = 1.0f / dt;
-    if (SfIsSoft(i, n_soft, per_env)) {
-        // pbd_v = (projected pos - prev)/dt; add the contact delta; carry the
-        // contact displacement dv*dt onto the projected position (dv == 0 -> pos
-        // unchanged, bit-identical to the verbatim XpbdCorrectKernel).
-        const math::Vec3 p_proj = positions[i];
-        const math::Vec3 prev = prev_positions[i];
-        const math::Vec3 pbd_v{(p_proj.x - prev.x) * inv_dt,
-                               (p_proj.y - prev.y) * inv_dt,
-                               (p_proj.z - prev.z) * inv_dt};
-        velocities[i] = math::Vec3{pbd_v.x + dv.x, pbd_v.y + dv.y, pbd_v.z + dv.z};
-        positions[i] = math::Vec3{p_proj.x + (dv.x + sp.x) * dt,
-                                  p_proj.y + (dv.y + sp.y) * dt,
-                                  p_proj.z + (dv.z + sp.z) * dt};
-    } else {
-        // pbd_v = (predicted - pos)/dt; add the contact delta; carry dv*dt onto the
-        // predicted pos (dv == 0 -> bit-identical to the verbatim PbfFinalizeKernel).
-        const math::Vec3 p0 = positions[i];
-        const math::Vec3 pp = predicted[i];
-        const math::Vec3 pbd_v{(pp.x - p0.x) * inv_dt, (pp.y - p0.y) * inv_dt,
-                               (pp.z - p0.z) * inv_dt};
-        velocities[i] = math::Vec3{pbd_v.x + dv.x, pbd_v.y + dv.y, pbd_v.z + dv.z};
-        positions[i] = math::Vec3{pp.x + (dv.x + sp.x) * dt,
-                                  pp.y + (dv.y + sp.y) * dt,
-                                  pp.z + (dv.z + sp.z) * dt};
-    }
+    return false;
 }
 
 // Each particle gathers its mass-weighted contact correction from one geometry time layer.
 __global__ void PpContactHalfCorrectionKernel(
     uint32_t union_count,
+    uint32_t per_env,
     const math::Vec3* __restrict__ positions,
     const float* __restrict__ inv_mass,
+    const uint32_t* __restrict__ topology_offsets,
+    const uint32_t* __restrict__ topology_elements,
+    const math::Vec3* __restrict__ rest_positions,
     float d_min,
     float alpha_tilde,
     const uint32_t* __restrict__ neighbor_counts,
@@ -1088,6 +815,8 @@ __global__ void PpContactHalfCorrectionKernel(
         if (c >= 0.0f) {
             continue;  // separating: unilateral contact is inactive.
         }
+        if (RestNeighbors(i, j, per_env, d_min, topology_offsets, topology_elements, rest_positions))
+            continue;
         const float wj = inv_mass[j];
         const float wsum = wi + wj + alpha_tilde;
         if (wsum <= 0.0f) {
@@ -1150,120 +879,172 @@ Status OpParticleAeroDrag(const ModelView& model, const DataView& data,
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-Status OpParticlePredict(const ModelView& /*model*/, const DataView& data,
+Status OpParticlePredict(const ModelView&, const DataView& data,
                          const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ParticlePredictParams*>(params);
-    if (p == nullptr) return Status::Failed;
-    if (p->mode == kParticleModeNone || p->particle_count == 0u) {
-        return Status::Ok;  // no particles: inert (the union/foot graph never adds it).
-    }
-    if (p->mode == kParticleModeMpm) return Status::Ok;  // MPM advances via its own transfer ops
-    const uint32_t blocks = (p->particle_count + kBlockSize - 1u) / kBlockSize;
-    const math::Vec3 g{p->gravity[0], p->gravity[1], p->gravity[2]};
-    if (p->mode == kParticleModeXpbd || p->mode == kParticleModeMpmXpbd) {
-        // MpmXpbd runs the XPBD predict over its slice [n_mpm, P); the MPM slice
-        // [0, n_mpm) is skipped in-kernel (mpm_per_env 0 for pure Xpbd => byte-id).
-        const uint32_t mpm_pe =
-            p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
-        LaunchCuda(XpbdPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   p->particle_count, data.particle_pos, data.particle_prev_pos,
-                   data.particle_vel, data.particle_v_pre, data.particle_inv_mass,
-                   g, p->dt, mpm_pe, p->particles_per_env);
-    } else if (p->mode == kParticleModeCoupled) {
-        LaunchCuda(CoupledPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   p->particle_count, data.particle_pos, data.particle_prev_pos,
-                   data.particle_vel, data.particle_v_pre, data.pbf_predicted_pos,
-                   p->coupled_internal, data.particle_inv_mass, g, p->dt);
-    } else if (p->mode == kParticleModeSoftFluid) {
-        LaunchCuda(SoftFluidPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   p->particle_count, p->n_soft_particles, p->particles_per_env,
-                   data.particle_pos, data.particle_prev_pos, data.particle_vel,
-                   data.particle_v_pre, data.pbf_predicted_pos,
-                   data.particle_inv_mass, g, p->dt);
-    } else {  // kParticleModePbf
-        LaunchCuda(PbfPredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   p->particle_count, data.particle_pos, data.particle_vel,
-                   data.particle_v_pre, data.pbf_predicted_pos,
-                   data.particle_inv_mass, g, p->dt);
-    }
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    if (p == nullptr) return Status::InvalidArgument;
+    if (p->mode == kParticleModeNone || p->mode == kParticleModeMpm || p->particle_count == 0u)
+        return Status::Ok;
+    const uint32_t per_env = p->particles_per_env != 0u ? p->particles_per_env : p->particle_count;
+    const uint32_t active_begin = p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
+    if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particle_count % per_env != 0u ||
+        active_begin > per_env || data.particle_pos == nullptr || data.particle_prev_pos == nullptr ||
+        data.pbf_predicted_pos == nullptr || data.particle_vel == nullptr ||
+        data.particle_v_pre == nullptr || data.particle_inv_mass == nullptr)
+        return Status::InvalidArgument;
+    const uint32_t blocks = (p->particle_count - 1u) / kBlockSize + 1u;
+    LaunchCuda(ParticlePredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+               p->particle_count, per_env, active_begin, data.particle_pos, data.particle_prev_pos,
+               data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre, data.particle_inv_mass,
+               math::Vec3{p->gravity[0], p->gravity[1], p->gravity[2]}, p->dt);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
+Status OpParticleProjectionVelocity(const ModelView&, const DataView& data,
+                                    const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ParticleProjectionVelocityParams*>(params);
+    if (p == nullptr) return Status::InvalidArgument;
+    if (p->particle_count == 0u) return Status::Ok;
+    if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particles_per_env == 0u ||
+        p->particle_count % p->particles_per_env != 0u ||
+        p->active_begin_per_env > p->particles_per_env ||
+        data.particle_vel == nullptr || data.particle_v_pre == nullptr ||
+        data.particle_inv_mass == nullptr || data.particle_prev_pos == nullptr ||
+        data.pbf_predicted_pos == nullptr)
+        return Status::InvalidArgument;
+    if (p->active_begin_per_env == p->particles_per_env) return Status::Ok;
+    const uint32_t blocks = (p->particle_count - 1u) / kBlockSize + 1u;
+    LaunchCuda(ParticleProjectionVelocityKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+               p->particle_count, p->particles_per_env, p->active_begin_per_env,
+               data.particle_prev_pos, data.pbf_predicted_pos, data.particle_inv_mass,
+               data.particle_vel, data.particle_v_pre, 1.0f / p->dt);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
+Status OpParticleContactDelta(const ModelView&, const DataView& data,
+                              const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ParticleContactDeltaParams*>(params);
+    if (p == nullptr) return Status::InvalidArgument;
+    if (p->particle_count == 0u) return Status::Ok;
+    if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particles_per_env == 0u ||
+        p->particle_count % p->particles_per_env != 0u ||
+        p->active_begin_per_env > p->particles_per_env || data.pbf_predicted_pos == nullptr ||
+        data.particle_vel == nullptr || data.particle_v_pre == nullptr || data.particle_inv_mass == nullptr)
+        return Status::InvalidArgument;
+    if (p->active_begin_per_env == p->particles_per_env) return Status::Ok;
+    const uint32_t blocks = (p->particle_count - 1u) / kBlockSize + 1u;
+    LaunchCuda(ParticleContactDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+               p->particle_count, p->particles_per_env, p->active_begin_per_env,
+               data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre,
+               data.particle_inv_mass, p->dt);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 Status OpXpbdProject(const ModelView& model, const DataView& data,
                      const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const XpbdProjectParams*>(params);
-    if (p == nullptr) return Status::Failed;
+    if (p == nullptr) return Status::InvalidArgument;
     if (p->dist_con_count == 0u && p->bend_con_count == 0u &&
         p->vol_con_count == 0u && p->shape_match_cluster_count == 0u) {
         return Status::Ok;  // PBF-only (or no XPBD) scene: inert.
     }
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
     const uint32_t E = p->env_count == 0u ? 1u : p->env_count;
-    // COLORED parallel Gauss-Seidel. Each family's constraints are reordered into
-    // color-contiguous order at cook time (XpbdColoring); a color shares no
-    // particle, so within a color one thread per (env, constraint) is race-free
-    // (no atomics, D1). Family order is FIXED (distance, bend, volume, shape-
-    // match) and each family runs ALL `iters` sweeps before the next — the legacy
-    // family-sequential schedule, now colored within each sweep (the per-color
-    // launch boundary is the Gauss-Seidel barrier). Lambda resets once per family;
-    // shape-match carries no lambda (re-evaluated from the current positions).
+    if (!(p->dt > 0.0f) || !std::isfinite(p->dt) ||
+        data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr)
+        return Status::InvalidArgument;
+    if ((p->dist_con_count > 0u &&
+         (p->dist_colors == 0u || p->dist_color_segments == nullptr ||
+          uint64_t{p->dist_cons_per_env} * E != p->dist_con_count ||
+          model.dist_particle_a == nullptr || model.dist_particle_b == nullptr ||
+          model.dist_rest_length == nullptr || model.dist_compliance == nullptr || data.dist_lambda == nullptr)) ||
+        (p->bend_con_count > 0u &&
+         (p->bend_colors == 0u || p->bend_color_segments == nullptr ||
+          uint64_t{p->bend_cons_per_env} * E != p->bend_con_count ||
+          model.bend_particles == nullptr || model.bend_gradients == nullptr ||
+          model.bend_compliance == nullptr || data.bend_lambda == nullptr)) ||
+        (p->vol_con_count > 0u &&
+         (p->vol_colors == 0u || p->vol_color_segments == nullptr ||
+          uint64_t{p->vol_cons_per_env} * E != p->vol_con_count ||
+          model.vol_particles == nullptr || model.vol_rest_times6 == nullptr ||
+          model.vol_compliance == nullptr || data.vol_lambda == nullptr)) ||
+        (p->shape_match_cluster_count > 0u &&
+         (p->sm_colors == 0u || p->sm_color_segments == nullptr ||
+          uint64_t{p->sm_clusters_per_env} * E != p->shape_match_cluster_count ||
+          model.sm_cluster_offset == nullptr || model.sm_cluster_size == nullptr ||
+          model.sm_stiffness == nullptr || model.sm_rest_centroid == nullptr ||
+          model.sm_particles == nullptr || model.sm_rest_q == nullptr || model.sm_mass == nullptr)))
+        return Status::InvalidArgument;
+    // Colors retain deterministic order; continuation preserves the current step's lambdas.
     if (p->dist_con_count > 0u) {
         const uint32_t rb = (p->dist_con_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
-                   p->dist_con_count, data.dist_lambda);
+        if (p->iteration_start == 0u) {
+            LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
+                       p->dist_con_count, data.dist_lambda);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        }
         for (uint32_t iter = 0u; iter < iters; ++iter) {
             // Symmetric sweep: reverse color order on odd iters (faster GS
             // convergence at the same launch count, deterministic).
             for (uint32_t ci = 0u; ci < p->dist_colors; ++ci) {
-                const uint32_t col = (iter & 1u) ? (p->dist_colors - 1u - ci) : ci;
+                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->dist_colors - 1u - ci) : ci;
                 const uint32_t cnt = p->dist_color_segments[col * 2u + 1u];
                 if (cnt == 0u) continue;
                 const uint32_t off = p->dist_color_segments[col * 2u + 0u];
                 const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
                 LaunchCuda(XpbdDistanceColorKernel, dim3(blocks), dim3(kBlockSize),
                            0u, stream, off, cnt, E, p->dist_cons_per_env,
-                           data.particle_pos, data.particle_inv_mass,
+                           data.pbf_predicted_pos, data.particle_inv_mass,
                            model.dist_particle_a, model.dist_particle_b,
                            model.dist_rest_length, model.dist_compliance,
                            data.dist_lambda, p->dt);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }
         }
     }
     if (p->bend_con_count > 0u) {
         const uint32_t rb = (p->bend_con_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
-                   p->bend_con_count, data.bend_lambda);
+        if (p->iteration_start == 0u) {
+            LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
+                       p->bend_con_count, data.bend_lambda);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        }
         for (uint32_t iter = 0u; iter < iters; ++iter) {
             for (uint32_t ci = 0u; ci < p->bend_colors; ++ci) {
-                const uint32_t col = (iter & 1u) ? (p->bend_colors - 1u - ci) : ci;
+                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->bend_colors - 1u - ci) : ci;
                 const uint32_t cnt = p->bend_color_segments[col * 2u + 1u];
                 if (cnt == 0u) continue;
                 const uint32_t off = p->bend_color_segments[col * 2u + 0u];
                 const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
                 LaunchCuda(XpbdBendColorKernel, dim3(blocks), dim3(kBlockSize), 0u,
                            stream, off, cnt, E, p->bend_cons_per_env,
-                           data.particle_pos, data.particle_inv_mass,
+                           data.pbf_predicted_pos, data.particle_inv_mass,
                            model.bend_particles, model.bend_gradients,
                            model.bend_compliance, data.bend_lambda, p->dt);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }
         }
     }
     if (p->vol_con_count > 0u) {
         const uint32_t rb = (p->vol_con_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
-                   p->vol_con_count, data.vol_lambda);
+        if (p->iteration_start == 0u) {
+            LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
+                       p->vol_con_count, data.vol_lambda);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        }
         for (uint32_t iter = 0u; iter < iters; ++iter) {
             for (uint32_t ci = 0u; ci < p->vol_colors; ++ci) {
-                const uint32_t col = (iter & 1u) ? (p->vol_colors - 1u - ci) : ci;
+                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->vol_colors - 1u - ci) : ci;
                 const uint32_t cnt = p->vol_color_segments[col * 2u + 1u];
                 if (cnt == 0u) continue;
                 const uint32_t off = p->vol_color_segments[col * 2u + 0u];
                 const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
                 LaunchCuda(XpbdVolumeColorKernel, dim3(blocks), dim3(kBlockSize), 0u,
                            stream, off, cnt, E, p->vol_cons_per_env,
-                           data.particle_pos, data.particle_inv_mass,
+                           data.pbf_predicted_pos, data.particle_inv_mass,
                            model.vol_particles, model.vol_rest_times6,
                            model.vol_compliance, data.vol_lambda, p->dt);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }
         }
     }
@@ -1272,17 +1053,18 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
     if (p->shape_match_cluster_count > 0u) {
         for (uint32_t iter = 0u; iter < iters; ++iter) {
             for (uint32_t ci = 0u; ci < p->sm_colors; ++ci) {
-                const uint32_t col = (iter & 1u) ? (p->sm_colors - 1u - ci) : ci;
+                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->sm_colors - 1u - ci) : ci;
                 const uint32_t cnt = p->sm_color_segments[col * 2u + 1u];
                 if (cnt == 0u) continue;
                 const uint32_t off = p->sm_color_segments[col * 2u + 0u];
                 const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
                 LaunchCuda(XpbdShapeMatchColorKernel, dim3(blocks), dim3(kBlockSize),
                            0u, stream, off, cnt, E, p->sm_clusters_per_env,
-                           data.particle_pos, data.particle_inv_mass,
+                           data.pbf_predicted_pos, data.particle_inv_mass,
                            model.sm_cluster_offset, model.sm_cluster_size,
                            model.sm_stiffness, model.sm_rest_centroid,
                            model.sm_particles, model.sm_rest_q, model.sm_mass);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }
         }
     }
@@ -1298,38 +1080,52 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
 Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
                           const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const PbfDensityLambdaParams*>(params);
-    if (p == nullptr) return Status::Failed;
+    if (p == nullptr) return Status::InvalidArgument;
     if (p->particle_count == 0u || p->support_radius <= 0.0f ||
         p->rest_density <= 0.0f) {
         return Status::Ok;  // XPBD-only scene: inert.
     }
+    const uint32_t per_env = p->particles_per_env != 0u ? p->particles_per_env : p->particle_count;
+    if (!std::isfinite(p->support_radius) || !std::isfinite(p->rest_density) ||
+        !(p->particle_mass > 0.0f) || !std::isfinite(p->particle_mass) ||
+        p->relaxation < 0.0f || !std::isfinite(p->relaxation) ||
+        p->particle_count % per_env != 0u || p->n_soft_particles > per_env ||
+        (p->boundary_enabled != 0u && !std::isfinite(p->floor_z)) ||
+        data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr ||
+        data.pbf_density == nullptr || data.pbf_lambda == nullptr || data.pbf_position_delta == nullptr ||
+        data.grid_neighbor_count == nullptr || data.grid_neighbor_offset == nullptr)
+        return Status::InvalidArgument;
     const fl::PbfKernelCoeffs coeffs = fl::MakePbfKernelCoeffs(p->support_radius);
     const float inv_rho0 = 1.0f / p->rest_density;
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
     const uint32_t N = p->particle_count;
     const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
     const uint32_t n_soft = p->n_soft_particles;
-    const uint32_t per_env = p->particles_per_env;
     for (uint32_t it = 0u; it < iters; ++it) {
         LaunchCuda(PbfDensityKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, n_soft, per_env, data.pbf_predicted_pos, p->particle_mass,
                    coeffs, data.grid_neighbor_count, data.grid_neighbor_offset, data.grid_neighbor_idx,
                    data.pbf_density);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         LaunchCuda(PbfLambdaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    N, n_soft, per_env, data.pbf_predicted_pos, coeffs, inv_rho0,
                    p->rest_density, p->relaxation, p->clamp_overdensity != 0u,
                    data.pbf_density, data.grid_neighbor_count, data.grid_neighbor_offset,
                    data.grid_neighbor_idx, data.pbf_lambda);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         LaunchCuda(PbfComputeCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
                    stream, N, n_soft, per_env, data.pbf_predicted_pos, coeffs,
                    inv_rho0, data.pbf_lambda, data.grid_neighbor_count, data.grid_neighbor_offset,
                    data.grid_neighbor_idx, data.pbf_position_delta);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         // Apply in-loop for every iteration EXCEPT the last (PbfApplyDelta runs
         // the last apply, so the two ops together == the legacy NxN loop).
         if (it + 1u < iters) {
             LaunchCuda(PbfApplyCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
                        stream, N, data.pbf_predicted_pos, data.pbf_position_delta,
+                       data.particle_inv_mass, n_soft, per_env,
                        p->boundary_enabled != 0u, p->floor_z);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         }
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
@@ -1340,121 +1136,75 @@ Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
 Status OpPbfApplyDelta(const ModelView& /*model*/, const DataView& data,
                        const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const PbfApplyDeltaParams*>(params);
-    if (p == nullptr) return Status::Failed;
+    if (p == nullptr) return Status::InvalidArgument;
     if (p->particle_count == 0u || p->support_radius <= 0.0f) {
         return Status::Ok;  // XPBD-only scene: inert.
     }
     const uint32_t N = p->particle_count;
+    const uint32_t per_env = p->particles_per_env != 0u ? p->particles_per_env : N;
+    if (!std::isfinite(p->support_radius) || N % per_env != 0u || p->n_soft_particles > per_env ||
+        (p->boundary_enabled != 0u && !std::isfinite(p->floor_z)) ||
+        data.pbf_predicted_pos == nullptr || data.pbf_position_delta == nullptr || data.particle_inv_mass == nullptr)
+        return Status::InvalidArgument;
     const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
     LaunchCuda(PbfApplyCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                N, data.pbf_predicted_pos, data.pbf_position_delta,
+               data.particle_inv_mass, p->n_soft_particles, per_env,
                p->boundary_enabled != 0u, p->floor_z);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-Status OpParticleFinalize(const ModelView& /*model*/, const DataView& data,
+Status OpParticleFinalize(const ModelView&, const DataView& data,
                           const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ParticleFinalizeParams*>(params);
-    if (p == nullptr) return Status::Failed;
-    if (p->mode == kParticleModeNone || p->particle_count == 0u) {
+    if (p == nullptr) return Status::InvalidArgument;
+    if (p->mode == kParticleModeNone || p->mode == kParticleModeMpm || p->particle_count == 0u)
         return Status::Ok;
-    }
-    if (p->mode == kParticleModeMpm) return Status::Ok;  // MPM advances via its own transfer ops
-    const uint32_t N = p->particle_count;
-    const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
-    // The split-impulse positional push-out the row solve accumulated this step;
-    // null when the position pass is off so every finalize stays byte-identical.
-    const math::Vec3* pseudo_vel =
-        p->pos_pass != 0u ? static_cast<const math::Vec3*>(data.particle_pseudo_vel)
-                          : nullptr;
-    if (p->mode == kParticleModeXpbd || p->mode == kParticleModeMpmXpbd) {
-        // MpmXpbd finalizes the XPBD slice [n_mpm, P); the MPM slice is skipped
-        // in-kernel (mpm_per_env 0 for pure Xpbd => byte-identical XpbdCorrect).
-        const uint32_t mpm_pe =
-            p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
-        LaunchCuda(XpbdCorrectKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.particle_pos, data.particle_prev_pos, data.particle_vel,
-                   data.particle_v_pre, pseudo_vel, data.particle_inv_mass, p->dt,
-                   mpm_pe, p->particles_per_env);
-        return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-    }
-    if (p->mode == kParticleModeCoupled) {
-        LaunchCuda(CoupledFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.particle_pos, data.particle_prev_pos, data.particle_vel,
-                   data.particle_v_pre, data.pbf_predicted_pos, pseudo_vel,
-                   p->coupled_internal, data.particle_inv_mass, p->dt);
-        return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-    }
-    if (p->mode == kParticleModeSoftFluid) {
-        // SoftFluid finalize: soft slice => XPBD correct (v from particle_pos);
-        // fluid slice => PBF finalize (v from pbf_predicted_pos, commit). Then the
-        // post-finalize polish (XSPH/cohesion), FLUID-SLICE-SCOPED via n_soft so it
-        // never nudges a soft velocity (the soft slice is left exactly as the XPBD
-        // correct set it). The polish reuses THIS step's neighbor grid + the
-        // position-delta scratch, the same as the single-system PBF path below.
-        LaunchCuda(SoftFluidFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
-                   data.particle_prev_pos, data.pbf_predicted_pos, data.particle_vel,
-                   data.particle_v_pre, pseudo_vel, data.particle_inv_mass, p->dt);
-        if (p->xsph_viscosity_c > 0.0f && p->support_radius > 0.0f) {
-            const fl::PbfKernelCoeffs coeffs =
-                fl::MakePbfKernelCoeffs(p->support_radius);
-            LaunchCuda(PbfXsphDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                       N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
-                       data.particle_vel, data.pbf_density, p->particle_mass,
-                       p->xsph_viscosity_c, coeffs, data.grid_neighbor_count, data.grid_neighbor_offset,
-                       data.grid_neighbor_idx, data.pbf_position_delta);
-            LaunchCuda(PbfApplyVelocityDeltaKernel, dim3(blocks), dim3(kBlockSize),
-                       0u, stream, N, data.particle_vel, data.pbf_position_delta);
-        }
-        if (p->surface_tension_gamma > 0.0f && p->support_radius > 0.0f) {
-            const fl::PbfCohesionCoeffs ccoeffs =
-                fl::MakePbfCohesionCoeffs(p->support_radius);
-            LaunchCuda(PbfCohesionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                       N, p->n_soft_particles, p->particles_per_env, data.particle_pos,
-                       data.particle_vel, p->particle_mass, p->surface_tension_gamma,
-                       p->dt, ccoeffs, data.grid_neighbor_count, data.grid_neighbor_offset,
-                       data.grid_neighbor_idx);
-        }
-        return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-    }
-    // PBF: finalize composes the density-projection velocity with the body<->particle
-    // contact correction, then the gated post-finalize polish (XSPH/cohesion).
-    LaunchCuda(PbfFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               N, data.particle_pos, data.pbf_predicted_pos, data.particle_vel,
-               data.particle_v_pre, data.particle_inv_mass, 1.0f / p->dt);
-    if (p->xsph_viscosity_c > 0.0f && p->support_radius > 0.0f) {
+    const uint32_t per_env = p->particles_per_env != 0u ? p->particles_per_env : p->particle_count;
+    const uint32_t active_begin = p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
+    if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particle_count % per_env != 0u ||
+        active_begin > per_env || data.particle_pos == nullptr || data.particle_prev_pos == nullptr ||
+        data.pbf_predicted_pos == nullptr || data.particle_vel == nullptr ||
+        data.particle_v_pre == nullptr || data.particle_inv_mass == nullptr ||
+        (p->pos_pass != 0u && data.particle_pseudo_vel == nullptr))
+        return Status::InvalidArgument;
+    const uint32_t count = p->particle_count;
+    const uint32_t blocks = (count - 1u) / kBlockSize + 1u;
+    LaunchCuda(ParticleFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+               count, per_env, active_begin, data.particle_pos, data.particle_prev_pos,
+               data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre,
+               p->pos_pass != 0u ? data.particle_pseudo_vel : nullptr,
+               data.particle_inv_mass, p->dt);
+    if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+    const bool has_fluid = p->mode == kParticleModePbf || p->mode == kParticleModeSoftFluid ||
+        (p->mode == kParticleModeCoupled && p->coupled_internal == kCoupledInternalPbf);
+    if (!has_fluid || !(p->support_radius > 0.0f)) return Status::Ok;
+    const uint32_t fluid_begin = p->mode == kParticleModeSoftFluid ? p->n_soft_particles : 0u;
+    if (p->xsph_viscosity_c > 0.0f) {
         const fl::PbfKernelCoeffs coeffs = fl::MakePbfKernelCoeffs(p->support_radius);
         LaunchCuda(PbfXsphDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, 0u, p->particles_per_env, data.particle_pos, data.particle_vel,
+                   count, fluid_begin, per_env, data.particle_pos, data.particle_vel,
                    data.pbf_density, p->particle_mass, p->xsph_viscosity_c, coeffs,
-                   data.grid_neighbor_count, data.grid_neighbor_offset, data.grid_neighbor_idx,
-                   data.pbf_position_delta);
-        LaunchCuda(PbfApplyVelocityDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                   stream, N, data.particle_vel, data.pbf_position_delta);
+                   data.grid_neighbor_count, data.grid_neighbor_offset,
+                   data.grid_neighbor_idx, data.pbf_position_delta);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        LaunchCuda(PbfApplyVelocityDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   count, data.particle_vel, data.particle_inv_mass, data.pbf_position_delta);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     }
-    if (p->surface_tension_gamma > 0.0f && p->support_radius > 0.0f) {
-        const fl::PbfCohesionCoeffs ccoeffs =
-            fl::MakePbfCohesionCoeffs(p->support_radius);
+    if (p->surface_tension_gamma > 0.0f) {
+        const fl::PbfCohesionCoeffs coeffs = fl::MakePbfCohesionCoeffs(p->support_radius);
         LaunchCuda(PbfCohesionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, 0u, p->particles_per_env, data.particle_pos, data.particle_vel,
-                   p->particle_mass, p->surface_tension_gamma, p->dt, ccoeffs,
+                   count, fluid_begin, per_env, data.particle_pos, data.particle_vel,
+                   data.particle_inv_mass, p->particle_mass, p->surface_tension_gamma, p->dt, coeffs,
                    data.grid_neighbor_count, data.grid_neighbor_offset, data.grid_neighbor_idx);
     }
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
-// OpParticleParticleContact (Cross-system): the cross-system contact
-// co-step. Runs AFTER ParticleFinalize (incl. the fluid-slice polish), operating
-// on the committed union positions (particle_pos). Only SoftFluid carries this op;
-// the single-system Xpbd/Pbf paths never emit it (byte-identity preserved). The
-// Jacobi double-buffer (gather into pbf_position_delta, then own-index apply) is
-// re-launched solver_iterations times over the SAME union grid -- exactly the
-// legacy inner loop. No host grid is built: the union grid CSR is already
-// arena-resident (ParticleGridBuild ran this step over the full union). When no
-// pair is within d_min the gathered delta is zero and the apply leaves positions
-// untouched (inert byte-identity).
-Status OpParticleParticleContact(const ModelView& /*model*/, const DataView& data,
+// The contact sweep consumes projected positions and the shared neighbor CSR.
+// Each Jacobi iteration gathers corrections before applying them at separate indices.
+Status OpParticleParticleContact(const ModelView& model, const DataView& data,
                                  const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ParticleParticleContactParams*>(params);
     if (p == nullptr) return Status::Failed;
@@ -1464,21 +1214,24 @@ Status OpParticleParticleContact(const ModelView& /*model*/, const DataView& dat
         return Status::Ok;
     }
     const uint32_t N = p->particle_count;
+    if (p->particles_per_env == 0u || N % p->particles_per_env != 0u ||
+        (model.particle_topology_offsets != nullptr &&
+         (model.particle_topology_elements == nullptr || model.particle_contact_rest_pos == nullptr)))
+        return Status::InvalidArgument;
     const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
     const uint32_t iters = p->solver_iterations == 0u ? 1u : p->solver_iterations;
     const float alpha_tilde = p->compliance_alpha;  // a~ at dt=1 (position-based).
     for (uint32_t it = 0u; it < iters; ++it) {
-        // JACOBI: gather every half from the SAME pre-correction positions (pass A,
-        // read-only on particle_pos), THEN apply own-index (pass B). The launch
-        // boundary is the barrier that makes this race-free + D1. The half-
-        // correction scratch reuses pbf_position_delta (free post-finalize; the
-        // XSPH polish that also uses it already ran + applied in OpParticleFinalize).
+        // Density projection has consumed pbf_position_delta before contact gathers reuse it.
         LaunchCuda(PpContactHalfCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                   stream, N, data.particle_pos, data.particle_inv_mass,
+                   stream, N, p->particles_per_env, data.pbf_predicted_pos, data.particle_inv_mass,
+                   model.particle_topology_offsets, model.particle_topology_elements,
+                   model.particle_contact_rest_pos,
                    p->contact_distance_d_min, alpha_tilde, data.grid_neighbor_count, data.grid_neighbor_offset,
                    data.grid_neighbor_idx, data.pbf_position_delta);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         LaunchCuda(PpContactApplyKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.particle_pos, data.pbf_position_delta);
+                   N, data.pbf_predicted_pos, data.pbf_position_delta);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
@@ -1488,6 +1241,8 @@ Status OpParticleParticleContact(const ModelView& /*model*/, const DataView& dat
 void RegisterNkParticleOps() {
     SetCudaOp(NkOp::ParticleAeroDrag, &OpParticleAeroDrag);
     SetCudaOp(NkOp::ParticlePredict, &OpParticlePredict);
+    SetCudaOp(NkOp::ParticleProjectionVelocity, &OpParticleProjectionVelocity);
+    SetCudaOp(NkOp::ParticleContactDelta, &OpParticleContactDelta);
     SetCudaOp(NkOp::XpbdProject, &OpXpbdProject);
     SetCudaOp(NkOp::PbfDensityLambda, &OpPbfDensityLambda);
     SetCudaOp(NkOp::PbfApplyDelta, &OpPbfApplyDelta);

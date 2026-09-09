@@ -994,7 +994,7 @@ __global__ void SolveRowsScalarIslandsKernel(
     uint32_t rows_per_env, uint32_t artics_per_env,
     uint32_t vel_iters, uint32_t pos_iters,
     float pos_beta, float pos_slop, float dt,
-    float baumgarte_max_velocity) {
+    float baumgarte_max_velocity, bool apply_cached_impulses) {
     const uint32_t live_islands = *island_count_dev;
     // BuildSolveIslands packs live components into a prefix. Interleave that prefix
     // across blocks before filling the next lane so a modest fixed grid spreads
@@ -1010,13 +1010,15 @@ __global__ void SolveRowsScalarIslandsKernel(
         const uint32_t env_row_base = rec.env * rows_per_env;
         const uint32_t env_artic_base =
             rec.env * (artics_per_env == 0u ? 1u : artics_per_env);
-        for (uint32_t r = 0u; r < rec.seg_cnt; ++r) {
-            SolveDynamicRowScalar(row_order[rec.seg_off + r], env_row_base,
-                                  env_artic_base, urows, lambda, row_meff,
-                                  row_damping,
-                                  body_lin_vel, body_ang_vel, body_inv_mass,
-                                  body_world_inv_inertia, particle_inv_mass,
-                                  particle_vel, dt, true);
+        if (apply_cached_impulses) {
+            for (uint32_t r = 0u; r < rec.seg_cnt; ++r) {
+                SolveDynamicRowScalar(row_order[rec.seg_off + r], env_row_base,
+                                      env_artic_base, urows, lambda, row_meff,
+                                      row_damping,
+                                      body_lin_vel, body_ang_vel, body_inv_mass,
+                                      body_world_inv_inertia, particle_inv_mass,
+                                      particle_vel, dt, true);
+            }
         }
         for (uint32_t it = 0u; it < vel_iters; ++it) {
             for (uint32_t r = 0u; r < rec.seg_cnt; ++r) {
@@ -1101,7 +1103,7 @@ __global__ void SolveRowsBlockIslandKernel(
     uint32_t pos_iters,
     float pos_beta, float pos_slop,
     float dt,
-    float baumgarte_max_velocity) {
+    float baumgarte_max_velocity, bool apply_cached_impulses) {
     const uint32_t island = blockIdx.x;
     // Dynamic islanding (PairDriven): the live component count is a DEVICE scalar
     // (BuildSolveIslands writes it each step) and the grid is the static max-island
@@ -1298,7 +1300,7 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t warp = lane >> 5u;
     const uint32_t wlane = lane & 31u;
     const uint32_t nwarps = blockDim.x >> 5u;
-    if (with_b_arm != 0u) {
+    if (with_b_arm != 0u && apply_cached_impulses) {
         for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
             const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
             const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
@@ -1671,7 +1673,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 static_cast<uint32_t>(p->vel_iters),
                 static_cast<uint32_t>(p->pos_iters),
                 p->pos_beta, p->pos_slop, p->dt,
-                p->baumgarte_max_velocity);
+                p->baumgarte_max_velocity, p->continue_impulses == 0u);
         }
         const uint32_t island_block_size = with_b_arm
             ? kPairDrivenIslandBlockSize : kUnionIslandBlockSize;
@@ -1718,7 +1720,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    static_cast<uint32_t>(p->vel_iters),
                    static_cast<uint32_t>(p->pos_iters),
                    p->pos_beta, p->pos_slop, p->dt,
-                   p->baumgarte_max_velocity);
+                   p->baumgarte_max_velocity, p->continue_impulses == 0u);
         // Flush the articulation tiles the dynamic schedule dropped (the static path
         // scatters all tiles in-kernel). cc_artic_first is BuildSolveIslands' claim table.
         if (run_dynamic && p->articulation_count > 0u && p->max_dof > 0u &&

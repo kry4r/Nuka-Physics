@@ -63,9 +63,9 @@ constexpr float kContactDMin = 0.030f;    // particle sphere radius = d_min/2 = 
 constexpr float kRidgeHalfX = 0.12f;      // each ridge half-extents (tops at z=0.10).
 constexpr float kRidgeHalfY = 0.30f;
 constexpr float kRidgeHalfZ = 0.05f;
-constexpr float kRidgeCenterX = 0.16f;    // ridges at x = +/-0.16 (gap ~0.08 wide).
 constexpr float kRidgeTopZ = kRidgeHalfZ * 2.0f;  // ridges sit on the ground -> 0.10.
 constexpr float kPresserRadius = 0.06f;
+constexpr float kRidgeCenterX = kRidgeHalfX + kPresserRadius + kContactDMin;
 constexpr uint16_t kXpbdIters = 20u;
 constexpr uint32_t kSettleSteps = 800u;
 constexpr uint32_t kPresserBody = 3u;     // ground(0) + ridge x2(1,2) + presser(3).
@@ -148,8 +148,7 @@ void AddSphere(nk::Model& m, const Vec3& pos, float radius, float inv_mass,
     m.shape_table_rows.push_back(sh);
 }
 
-// The cloth XPBD input: a flat WxH lattice with stretch + bend constraints. Two
-// far corners of the top row are pinned so the drape hangs without sliding off.
+// Unpinned cloth drapes over the ridges with stretch and bend constraints.
 cook::XpbdCookInput BuildCloth() {
     std::vector<Vec3> rest;
     rest.reserve(kGridN * kGridN);
@@ -265,15 +264,18 @@ constexpr uint64_t kPoseOff = static_cast<uint64_t>(kPresserBody) * sizeof(Trans
 constexpr uint64_t kVec3Off = static_cast<uint64_t>(kPresserBody) * sizeof(Vec3);
 constexpr uint64_t kFloatOff = static_cast<uint64_t>(kPresserBody) * sizeof(float);
 
-// Drive the kinematic presser to `target` this step: set its pose and zero its
-// velocity (a scripted kinematic body, the viewer_move_entity primitive).
+// Kinematic surface velocity matches the uploaded displacement over this timestep.
 void DrivePresser(nk::World& w, const Vec3& target) {
+    Transform previous;
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::BodyPose, &previous,
+                                          sizeof(Transform), kPoseOff));
     Transform tf = Transform::Identity();
     tf.position = target;
+    const Vec3 velocity = (target - previous.position) / Cfg().dt;
     const Vec3 zero = Vec3::Zero();
-    w.GetData().UploadField(nk::FieldId::BodyPose, &tf, sizeof(Transform), kPoseOff);
-    w.GetData().UploadField(nk::FieldId::BodyLinearVelocity, &zero, sizeof(Vec3), kVec3Off);
-    w.GetData().UploadField(nk::FieldId::BodyAngularVelocity, &zero, sizeof(Vec3), kVec3Off);
+    ASSERT_TRUE(w.GetData().UploadField(nk::FieldId::BodyPose, &tf, sizeof(Transform), kPoseOff));
+    ASSERT_TRUE(w.GetData().UploadField(nk::FieldId::BodyLinearVelocity, &velocity, sizeof(Vec3), kVec3Off));
+    ASSERT_TRUE(w.GetData().UploadField(nk::FieldId::BodyAngularVelocity, &zero, sizeof(Vec3), kVec3Off));
 }
 
 }  // namespace
@@ -297,9 +299,7 @@ TEST(ClothPresserTwoWay, ClothDipsUnderPresserThenRecovers) {
     DownloadParticles(w, &settled);
     const float rest_min_z = MinZUnderPresser(settled, presser_xy);
 
-    // PRESS: lower the presser into the sagging center over ~200 steps, hold ~150.
-    // The center spans the gap (no obstacle under it), so the presser pushes the
-    // cloth well below its sag rest without hitting rigid geometry.
+    // The gap accommodates the sphere and the cloth's collision thickness.
     const float bottom = kRidgeTopZ - 0.02f + kPresserRadius;  // sphere center ~0.14.
     for (uint32_t s = 0; s < 200u; ++s) {
         const float t = static_cast<float>(s) / 199.0f;

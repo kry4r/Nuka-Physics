@@ -98,6 +98,9 @@ struct ModelView {
     uint32_t* aero_particle_offset = nullptr;  // per:particle arena:persistent owner:model
     uint32_t* aero_particle_count = nullptr;  // per:particle arena:persistent owner:model
     uint32_t* aero_incident_tri = nullptr;  // per:aero_tri arena:persistent owner:model elem:3
+    uint32_t* particle_topology_offsets = nullptr;  // per:scalar arena:persistent owner:model count:particle_topology_offsets
+    uint32_t* particle_topology_elements = nullptr;  // per:scalar arena:persistent owner:model count:particle_topology_incidence_count
+    ::nuka::math::Vec3* particle_contact_rest_pos = nullptr;  // per:scalar arena:persistent owner:model count:particle_contact_rest_positions
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena

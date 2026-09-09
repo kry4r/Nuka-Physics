@@ -36,6 +36,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=250)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--capacity-scale", type=int, default=1)
+    parser.add_argument("--cloth-grid", type=int)
+    parser.add_argument("--cuda-launch-queues", choices=["default", "0.25x", "0.5x", "2x", "4x"])
     parser.add_argument("--save-state", action="store_true")
     parser.add_argument("--save-wrench", action="store_true")
     args = parser.parse_args()
@@ -46,7 +48,12 @@ def main():
     binary_hash = digest(binary)
     results = []
     environment = dict(os.environ)
+    if args.cuda_launch_queues == "default":
+        environment.pop("CUDA_SCALE_LAUNCH_QUEUES", None)
+    elif args.cuda_launch_queues:
+        environment["CUDA_SCALE_LAUNCH_QUEUES"] = args.cuda_launch_queues
     environment["LD_LIBRARY_PATH"] = str(binary.parent) + ":" + environment.get("LD_LIBRARY_PATH", "")
+    runner_hash = digest(Path(__file__))
     for envs in args.envs:
         for execution in args.executions:
             for process in range(args.processes):
@@ -56,6 +63,8 @@ def main():
                            "--execution", execution, "--warmup", str(args.warmup), "--steps", str(args.steps),
                            "--seed", "20260908", "--capacity-scale", str(args.capacity_scale),
                            "--perf-json", str(result_path)]
+                if args.cloth_grid is not None:
+                    command.extend(["--cloth-grid", str(args.cloth_grid)])
                 state_path = args.output / (label + ".state") if args.save_state and process == 0 else None
                 wrench_path = args.output / (label + ".wrench") if args.save_wrench and process == 0 else None
                 if state_path is not None:
@@ -68,6 +77,9 @@ def main():
                     completed = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
                 receipt = {"label": label, "command": command, "source_id": args.source_id,
                            "binary_sha256": binary_hash, "exit_code": completed.returncode,
+                           "runner_sha256": runner_hash,
+                           "cuda_environment": {key: environment.get(key) for key in
+                               ("CUDA_SCALE_LAUNCH_QUEUES", "CUDA_DEVICE_MAX_CONNECTIONS", "CUDA_LAUNCH_BLOCKING")},
                            "wall_seconds": time.perf_counter() - start,
                            "gpu_before": before, "gpu_after": gpu_state()}
                 if state_path is not None and state_path.exists():
@@ -94,12 +106,17 @@ def main():
             wrench_samples = [sample["quality"].get("link_wrench_trace_fnv1a64") for sample in samples]
             wrenches = sorted({value for value in wrench_samples if value is not None})
             wrench_consistent = len(wrenches) <= 1 and (not wrenches or all(wrench_samples))
+            schedule_samples = [sample.get("workload", {}).get("samples") for sample in samples]
+            schedules = sorted({hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+                                for value in schedule_samples if value is not None})
+            schedule_consistent = len(schedules) <= 1 and (not schedules or all(schedule_samples))
             summary.append({"envs": envs, "execution": execution, "processes": len(samples),
                             "gpu_batch_step_ms_median": statistics.median(gpu), "gpu_range_ms": [min(gpu), max(gpu)],
                             "wall_batch_step_ms_median": statistics.median(wall), "wall_range_ms": [min(wall), max(wall)],
                             "final_state_digests": states, "wrench_trace_digests": wrenches,
                             "wrench_trace_available": bool(wrenches),
-                            "cross_process_d1": len(states) == 1 and wrench_consistent})
+                            "island_schedule_digests": schedules, "island_schedule_available": bool(schedules),
+                            "cross_process_d1": len(states) == 1 and wrench_consistent and schedule_consistent})
     report = {"source_id": args.source_id, "binary_sha256": binary_hash, "summary": summary}
     (args.output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)

@@ -33,6 +33,16 @@
 
 ## 按规格实施
 
+- [x] 收口粒子时间层基础修复：统一工作位置、材料/接触交替、累计 lambda 与一次提交；六组完整长度门、已有场景/API/reset/渲染及 E=16 graph memcheck 通过。最大应变 1.838344%、最坏 RMS 0.203045%；完整接触刷新与 MPM 子步反馈另行继续。
+- [x] 单独完成构建架构隔离（`6953f4a`）：后端注册和 nk 核心脱离 CUDA 配置门，CUDA 源码与库按能力附加；无 CUDA 核心构建通过，不代表完整 CPU solver 已实现。
+- [x] 补充持续约束：原版不作为物理真值；参考 Newton/MuJoCo/Genesis 的匹配仿真、解析解/守恒/约束误差/收敛；multi-backend 下分开架构优化、CUDA 调优和物理算法变化。
+- [x] MuJoCo 静止结构参照及主环境逐步长度质量门已加入，原始参数/结果留存；Newton 单三角运行失败、Genesis 未实跑，不宣称完整三引擎动态对照。
+- [x] 当前新增模型字段的无 CUDA 核心构建及公共 C/Python/reset/渲染链路通过；非 CUDA solver 能力仍未完成。
+- [x] 修复结构近邻球接触与距离约束冲突，保留原 152.74% 应变失败；冻结新物理源码/二进制，见 [证据与方向](../research/2026-09-09-particle-topology-review-zh.md)。
+- [x] 布料压板输入修正：间隙计入球径/粒子厚度，表面速度与位姿一致；原各 10 mm 门通过，下压/恢复约 29.0/28.9 mm。原失败记录保留。
+- [x] 收口已有流体验收：三维 control-relative 量测覆盖侧向流动，原 3 mm/0.02 L1 预算通过，接触反作用同时通过；没有新增测试集合。
+- [ ] 冻结新物理六组五进程性能分母后，继续 CUDA 岛调度与每次 XPBD op 内的设备颜色循环；保留材料/接触交替边界，后端调优独立提交。
+
 以 [模块 spec 第 14 节](../plans/2026-09-07-physics-module-specs-newton-port-zh.md) 跟踪进度。每项改造前 review 对应 spec，再对照最新 Newton/MuJoCo/Genesis 实现并记录 revision 和决策。
 
 验证约束：少新增单测，以固定机器人＋布料＋流体环境的完整 pipeline 为主；必要解析反例辅助定位，影响渲染时验证图像链路。
@@ -70,6 +80,8 @@
 - [x] 接触索引的功能/graph 子集：主 pipeline 34 passed，每步 wrench 与完整末帧逐字节一致；容量×1/2/4、graph/demand/reset、公共 API/渲染和 memcheck 通过，默认 graph 降时 16.08%–17.64%，见 [报告](../research/2026-09-09-contact-index-validation-zh.md)。
 - [ ] 接触索引 eager 性能：分组五进程与两组交错对照仍有回退；固定 CPU 未消除。完成 host launch/调度归因并处理，不把 graph 加速写成全部模式通过。
 - [ ] 依据新 profile 继续有效岛/J：岛求解占 kernel 时间 32.12%，XPBD bend/distance 占 17.98%；检查容量网格、active spans 和临时内存。MPM/SDF/光追仍先补各自完整基线。
+- [ ] 岛调度批次：已补 canonical island/活跃行观测，试验资源限制网格与有序执行行、Jacobian 合并读取；正式性能尚未收口，见 [review](../research/2026-09-09-island-scheduling-upstream-review-zh.md)。
+- [ ] 20 机器人台阶脚部下沉：扩大验证报告 -0.0892994255 m，冻结旧版同样失败且值相同；核对实际碰撞几何、地形与测量方法，保存 `out/validation/island_scheduling_20260909/terrain_baseline.*`，不改容差掩盖。
 - [ ] T08a/T10a 剩余：真实接触密度曲线、完整容量水位及显存峰值；活跃 cache 排序/merge 和字段预算已实现。
 - [ ] T17 剩余：公共容量配置、投影位移触发的刷新/skin、边界密度和完整粒子时间层。
 - [ ] M04/M06：定位双浮基机器人重叠不分离；冻结旧版同样失败，尚未归因。

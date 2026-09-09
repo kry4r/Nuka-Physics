@@ -68,6 +68,7 @@ struct ModelCapacities {
     uint32_t xpbd_bend_colors = 0;
     uint32_t xpbd_vol_colors  = 0;
     uint32_t xpbd_sm_colors   = 0;
+    uint32_t particle_topology_incidence_count = 0;
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
@@ -359,6 +360,8 @@ public:
         std::vector<math::Vec3> initial_pos;
         std::vector<math::Vec3> initial_vel;
         std::vector<float>      inv_mass;
+        std::vector<uint32_t> topology_offsets;
+        std::vector<uint32_t> topology_elements;
         // MLS-MPM per-particle init (single-env template; replicated env-major).
         // F seeded identity, vol0 from the sampling lattice, material_id indexes
         // mpm_materials. Empty for a non-MPM cook (C is the arena zero default).
@@ -618,6 +621,7 @@ public:
     phi::Status UploadTo(phi::BufferType* bt, phi::ModelView* out_view);
     phi::Status ValidateTopology(std::string* reason = nullptr) const;
     void BuildAeroAdjacency();
+    void BuildParticleTopology();
 
     // The packed device buffer (null until UploadTo). Exposed for World teardown.
     phi::Buffer* DeviceBuffer() const { return device_buffer_; }

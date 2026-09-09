@@ -618,6 +618,77 @@ TEST(ParticleNeighborhood, EnvironmentPoolsMatchBruteForceAndIsolateOverflow) {
     }
 }
 
+TEST(ParticleNeighborhood, RestAdjacencyPreservesStructureAndKeepsUnrelatedContacts) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    constexpr uint32_t count = 6u, envs = 2u;
+    nk::Model model;
+    auto& p = model.particles;
+    auto& cap = model.capacities;
+    p.mode = nk::Model::ParticleMode::SoftFluid;
+    p.n_soft_particles = count;
+    p.initial_pos = {{0, 0, 0.5f}, {0.02f, 0, 0.5f}, {0.2f, 0, 0.5f},
+                     {0.22f, 0, 0.5f}, {0.4f, 0, 0.5f}, {0.5f, 0, 0.5f}};
+    p.initial_vel.resize(count);
+    p.inv_mass = {0, 1, 1, 1, 1, 1};
+    p.dist_a = {0u}; p.dist_b = {1u}; p.dist_rest = {0.02f}; p.dist_alpha = {0.0f};
+    p.sm_cluster_offset = {0u}; p.sm_cluster_size = {2u}; p.sm_stiffness = {0.5f};
+    p.sm_rest_centroid = {{0.45f, 0, 0.5f}};
+    p.sm_particles = {4u, 5u}; p.sm_rest_q = {{-0.05f, 0, 0}, {0.05f, 0, 0}}; p.sm_mass = {1, 1};
+    p.grid_min = {-0.1f, -0.1f, 0.4f};
+    p.grid_dims[0] = 16u; p.grid_dims[1] = p.grid_dims[2] = 4u;
+    p.cell_size = p.query_radius = 0.06f;
+    p.pp_contact_d_min = 0.03f;
+    cap.env_count = envs; cap.particles_per_env = count; cap.dist_cons_per_env = 1u;
+    cap.shape_match_slots_per_env = 1u; cap.shape_match_members_per_env = 2u;
+    cap.max_grid_cells = p.grid_dims[0] * p.grid_dims[1] * p.grid_dims[2];
+    p.dist_b[0] = count;
+    std::string reason;
+    EXPECT_EQ(model.ValidateTopology(&reason), phi::Status::InvalidArgument);
+    p.dist_b[0] = 1u;
+    ASSERT_EQ(model.ValidateTopology(&reason), phi::Status::Ok) << reason;
+    nk::World world(std::move(model), envs, backend.device, backend.backend, Config());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    auto positions = Read<Vec3>(world, nk::FieldId::ParticlePos, count * envs);
+    const auto initial = positions;
+    positions[5].x = 0.42f;
+    ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::ParticlePos,
+        positions.data(), positions.size() * sizeof(Vec3)));
+    // Keep the contact sweep's state transitions and budget; omit material unfolding.
+    for (const auto& call : world.GetPipeline().Calls()) {
+        switch (call.op) {
+            case phi::NkOp::ParticlePredict:
+            case phi::NkOp::ParticleGridBuild:
+            case phi::NkOp::ParticleParticleContact:
+            case phi::NkOp::ParticleProjectionVelocity:
+            case phi::NkOp::ParticleFinalize:
+                ASSERT_EQ(world.DispatchOp(call.op, call.params), phi::Status::Ok);
+                break;
+            default:
+                break;
+        }
+    }
+    const auto actual = Read<Vec3>(world, nk::FieldId::ParticlePos, count * envs);
+    for (uint32_t env = 0u; env < envs; ++env) {
+        const uint32_t base = env * count;
+        ExpectVectorNear(actual[base], positions[base], 0.0f);
+        ExpectVectorNear(actual[base + 1u], positions[base + 1u], 0.0f);
+        EXPECT_NEAR(actual[base + 3u].x - actual[base + 2u].x, 0.03f, 1.0e-7f);
+        EXPECT_NEAR(actual[base + 3u].x + actual[base + 2u].x,
+                    positions[base + 3u].x + positions[base + 2u].x, 1.0e-7f);
+    }
+    EXPECT_NEAR(actual[5].x - actual[4].x, 0.03f, 1.0e-7f);
+    EXPECT_NEAR(actual[5].x + actual[4].x, positions[5].x + positions[4].x, 1.0e-7f);
+    ExpectVectorNear(actual[count + 4u], positions[count + 4u], 0.0f);
+    ExpectVectorNear(actual[count + 5u], positions[count + 5u], 0.0f);
+    ASSERT_EQ(world.Reset({1u}), phi::Status::Ok);
+    const auto reset = Read<Vec3>(world, nk::FieldId::ParticlePos, count * envs);
+    for (uint32_t i = 0u; i < count; ++i) {
+        ExpectVectorNear(reset[i], actual[i], 0.0f);
+        ExpectVectorNear(reset[count + i], initial[count + i], 0.0f);
+    }
+}
+
 TEST(FreeRigidDynamics, WorldAngularVelocityRotatesAboutTheAuthoredCenterOfMass) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";

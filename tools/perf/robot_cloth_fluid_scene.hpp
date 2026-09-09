@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -50,18 +51,20 @@ inline nk::Pipeline::SolverConfig Cfg() {
     cfg.max_pairs = 64u;
     return cfg;
 }
-inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
+inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = kClothNx) {
+    Require(nx >= 3u && uint64_t{nx} * nx <= std::numeric_limits<uint32_t>::max() / 6u,
+            "cloth grid exceeds topology index range");
     std::vector<Vec3> rest;
-    rest.reserve(kClothNx * kClothNx);
-    const float c0 = -0.5f * static_cast<float>(kClothNx - 1u) * kClothSpacing;
-    for (uint32_t j = 0; j < kClothNx; ++j)
-        for (uint32_t i = 0; i < kClothNx; ++i)
+    rest.reserve(nx * nx);
+    const float c0 = -0.5f * static_cast<float>(nx - 1u) * kClothSpacing;
+    for (uint32_t j = 0; j < nx; ++j)
+        for (uint32_t i = 0; i < nx; ++i)
             rest.push_back(Vec3{cx + c0 + static_cast<float>(i) * kClothSpacing,
                                 cy + c0 + static_cast<float>(j) * kClothSpacing, z});
-    auto idx = [](uint32_t i, uint32_t j) { return j * kClothNx + i; };
+    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
     std::vector<soft::ClothTriangle> tris;
-    for (uint32_t j = 0; j + 1 < kClothNx; ++j)
-        for (uint32_t i = 0; i + 1 < kClothNx; ++i) {
+    for (uint32_t j = 0; j + 1 < nx; ++j)
+        for (uint32_t i = 0; i + 1 < nx; ++i) {
             tris.push_back(soft::ClothTriangle{{idx(i, j), idx(i + 1, j),
                                                 idx(i + 1, j + 1)}});
             tris.push_back(soft::ClothTriangle{{idx(i, j), idx(i + 1, j + 1),
@@ -77,8 +80,8 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
     in.positions = rest;
     in.velocities.assign(rest.size(), Vec3::Zero());
     in.inv_mass.assign(rest.size(), 1.0f / kClothParticleMass);
-    const uint32_t last = kClothNx - 1u;
-    for (uint32_t k = 0; k < kClothNx; ++k) {
+    const uint32_t last = nx - 1u;
+    for (uint32_t k = 0; k < nx; ++k) {
         in.inv_mass[idx(k, 0)] = 0.0f; in.inv_mass[idx(k, last)] = 0.0f;
         in.inv_mass[idx(0, k)] = 0.0f; in.inv_mass[idx(last, k)] = 0.0f;
     }
@@ -245,9 +248,9 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
 }
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
-                              bool patch_present = true) {
+                              bool patch_present = true, uint32_t cloth_nx = kClothNx) {
     nk::Model model = CookRobot(scene.path, true);
-    auto cloth = BuildCloth(scene.front_centre.x, scene.front_centre.y, scene.cloth_z);
+    auto cloth = BuildCloth(scene.front_centre.x, scene.front_centre.y, scene.cloth_z, cloth_nx);
     auto pool = BuildPool(scene.rear_foot.x, scene.rear_foot.y, scene.pool_floor);
     if (!patch_present) {
         for (auto& position : cloth.positions) position.z -= 10.0f;

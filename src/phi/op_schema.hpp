@@ -171,6 +171,8 @@ enum class NkOp : uint16_t {
                             // not the enum value).
     ContactWarmStart,       // ContactId-indexed warm-start prepare/commit.
     SnapshotStepVelocity,   // Capture the contact acceleration reference before forces.
+    ParticleProjectionVelocity, // Publish projected particle velocities before contact solving.
+    ParticleContactDelta,   // Apply only the new contact impulse to particle working positions.
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -679,54 +681,22 @@ struct SolveRowsBlockIslandParams {
     // Validation hook (NUKA_FORCE_STATIC_ISLANDS): run the conservative cook-time
     // one-island-per-env schedule instead of the dynamic CC pass, to A/B them. 0 == off.
     uint32_t force_static_islands;
+    uint32_t continue_impulses = 0u; // Retain this step's applied impulses across solver calls.
 };
 
-// --- particle (XPBD / PBF) substep --------------------------------------
-// Prediction-mode selector (the XPBD vs PBF predict semantics DIVERGE — the
-// XPBD predict folds gravity into the position WITHOUT mutating velocity and
-// snapshots prev_pos, while PBF kicks the velocity by g*dt then predicts into a
-// SEPARATE pbf_predicted_pos buffer). The op param carries the mode so the ONE
-// op TU dispatches the correct legacy kernel body.
-inline constexpr uint32_t kParticleModeNone = 0u;  // no particles (early-exit)
-inline constexpr uint32_t kParticleModeXpbd = 1u;  // XPBD soft/cloth predict
-inline constexpr uint32_t kParticleModePbf  = 2u;  // PBF fluid predict
-// COUPLED mode : particles co-step against rigid/artic bodies through the
-// unified row solve (the ParticleInvMass arm). The contact solve corrects the
-// particle VELOCITY between the position predict and the position finalize (the
-// legacy unified_costep pre/couple/post ordering, reproduced inside the fixed
-// pipeline). The pre-contact velocity is saved into the DEDICATED particle_v_pre
-// scratch field (NOT pbf_predicted_pos, which the PBF density projection owns in
-// coupled mode — see fields.yaml) so ParticleFinalize can compose the PBD
-// (XPBD soft-constraint / PBF density) velocity with the contact velocity
-// delta — exactly v_final = (pos_projected - prev)/dt + (v_contact - v_pre).
+// Particle modes select material constraints and ownership; all row-coupled particles share integration.
+inline constexpr uint32_t kParticleModeNone = 0u;
+inline constexpr uint32_t kParticleModeXpbd = 1u;
+inline constexpr uint32_t kParticleModePbf = 2u;
 inline constexpr uint32_t kParticleModeCoupled = 3u;
-// SOFT+FLUID co-residence mode: ONE Model holds a soft (XPBD) particle
-// set in [0, n_soft) and a fluid (PBF) particle set in [n_soft, particles_per_env)
-// per env (contiguous [soft | fluid] split, mirrors the co-step's [xpbd | pbf]
-// union with split n_x 1:1). The predict/finalize ops branch per-particle on the
-// within-env local index vs n_soft (soft => XPBD predict/correct; fluid => PBF
-// predict/finalize). The PBF density/lambda/neighbor solve is SCOPED to the fluid
-// slice (a soft particle must NOT contribute to fluid density); the XPBD
-// constraints are edge-based so they only touch the soft slice. The 
-// cross-contact runs over the FULL union.
 inline constexpr uint32_t kParticleModeSoftFluid = 4u;
-// MLS-MPM continuum medium: the particle set is advanced by the P2G ->
-// grid-update -> G2P transfer loop (a new ParticleMode value, not a step branch).
 inline constexpr uint32_t kParticleModeMpm = 5u;
-// MPM + XPBD co-residence: an MLS-MPM slice [0, n_mpm) advanced by the transfer
-// loop and an XPBD slice [n_mpm, per_env) advanced by predict/project/finalize, in
-// ONE Model. Each slice scopes its own ops; the two couple on the shared seam.
 inline constexpr uint32_t kParticleModeMpmXpbd = 6u;
 
-// Common particle launch geometry (the views are pure pointer aggregates, so
-// every particle op carries its counts). particle_count == total env-major
-// particles; the constraint counts are total env-major XPBD constraint slots.
-// Coupled internal-dynamics sub-type (which projected-position buffer the
-// coupled finalize composes): none (free point masses) / xpbd (particle_pos) /
-// pbf (pbf_predicted_pos). Only meaningful when mode == kParticleModeCoupled.
+// The internal material controls which projection equations apply to coupled point masses.
 inline constexpr uint32_t kCoupledInternalNone = 0u;
 inline constexpr uint32_t kCoupledInternalXpbd = 1u;
-inline constexpr uint32_t kCoupledInternalPbf  = 2u;
+inline constexpr uint32_t kCoupledInternalPbf = 2u;
 
 // Cloth anisotropic AERODYNAMIC DRAG (pre-predict velocity impulse). One thread
 // per surface triangle forms the outward normal + mean velocity from the current
@@ -750,14 +720,27 @@ struct ParticlePredictParams {
     uint32_t mode;             // kParticleMode*
     uint32_t particle_count;   // total env-major particles
     uint32_t coupled_internal; // kCoupledInternal* (coupled mode only)
-    // SoftFluid: the per-env [soft | fluid] split + per-env stride. The
-    // SoftFluid predict/finalize kernels branch per-particle on (i % per_env) vs
-    // n_soft. 0 for the single-system modes (unused).
+    // The material split is independent of the shared prediction and finalization kernels.
     uint32_t n_soft_particles; // per-env soft count (split index)
     uint32_t particles_per_env;// per-env particle stride
     // MpmXpbd: the per-env MPM slice count. The XPBD predict SKIPS the low slice
     // [0, n_mpm) (the transfer loop owns it); 0 for every non-MpmXpbd mode.
     uint32_t n_mpm_particles;
+};
+
+// Non-MPM particles share one projected position buffer and one step-start position.
+struct ParticleProjectionVelocityParams {
+    float dt;
+    uint32_t particle_count;
+    uint32_t particles_per_env;
+    uint32_t active_begin_per_env;
+};
+
+struct ParticleContactDeltaParams {
+    float dt;
+    uint32_t particle_count;
+    uint32_t particles_per_env;
+    uint32_t active_begin_per_env;
 };
 
 struct XpbdProjectParams {
@@ -793,6 +776,7 @@ struct XpbdProjectParams {
     const uint32_t* bend_color_segments;
     const uint32_t* vol_color_segments;
     const uint32_t* sm_color_segments;
+    uint32_t iteration_start = 0u; // Zero starts the step's lambda accumulation.
 };
 
 struct PbfDensityLambdaParams {
@@ -835,9 +819,7 @@ struct ParticleFinalizeParams {
     float    xsph_viscosity_c;     // XSPH velocity-smoothing coefficient
     float    surface_tension_gamma;// Akinci cohesion coefficient
     float    rest_density;         // rho0 (for the XSPH density normalization)
-    // SoftFluid: the per-env [soft | fluid] split + per-env stride. The
-    // SoftFluid finalize branches per-particle (soft => XPBD correct; fluid =>
-    // PBF finalize). The polish passes are scoped to the fluid slice. 0 == single.
+    // Velocity polish is restricted to the fluid material range.
     uint32_t n_soft_particles;
     uint32_t particles_per_env;
     // Split-impulse position pass active: carry the per-particle pseudo velocity
@@ -848,16 +830,8 @@ struct ParticleFinalizeParams {
     uint32_t n_mpm_particles;
 };
 
-// Cross-system — cross-system particle-particle CONTACT (the op-ified
-// legacy cross-system particle co-step). A class-blind
-// unilateral non-penetration row over the FULL [soft | fluid] union (the row math
-// does NOT branch on soft vs fluid). Mirrors ParticleParticleContactParams 1:1
-// (contact_distance_d_min / compliance_alpha / solver_iterations) + the particle
-// launch geometry. Emitted ONLY in kParticleModeSoftFluid (the single-system Xpbd/
-// Pbf paths never carry this op, so they stay byte-identical). Reads particle_pos
-// (the committed union positions post-finalize) + particle_inv_mass + the union
-// grid CSR; writes a per-particle Jacobi half-correction into pbf_position_delta
-// (free at the post-finalize slot) then applies it own-index (no float atomics).
+// Particle contact gathers mass-weighted corrections from the current projected positions.
+// Both Jacobi passes use the shared neighbor CSR and temporary density-correction storage.
 struct ParticleParticleContactParams {
     // Minimum contact distance d_min == 2*contact_radius (uniform-radius). A pair
     // (i,j) penetrates iff |p_i - p_j| < d_min. <= 0 => the op is inert.

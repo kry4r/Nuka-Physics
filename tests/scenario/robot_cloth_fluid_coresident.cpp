@@ -295,6 +295,7 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         float front_foot_z = 0.0f, rear_foot_z = 0.0f;  // run-scene foot z (diag).
         bool finite = true;
         std::vector<float> q, qdot;
+        std::vector<Vec3> fluid_displacement;
     };
     auto run_scene = [&](bool patch_present) -> Run {
         Run out;
@@ -371,14 +372,17 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
             }
             if (s + 1u == replay_steps) first_steps = ReadPipelineState(w);
             if (s == 0u) {
-                std::vector<Vec3> predicted(P);
+                std::vector<Vec3> predicted(P), previous(P), particle_velocity(P);
                 EXPECT_TRUE(d.DownloadField(nk::FieldId::PbfPredictedPos, predicted.data(), P * sizeof(Vec3)));
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::ParticlePrevPos, previous.data(), P * sizeof(Vec3)));
+                EXPECT_TRUE(d.DownloadField(nk::FieldId::ParticleVel, particle_velocity.data(), P * sizeof(Vec3)));
                 for (uint32_t i = 0u; i < n_soft; ++i) {
-                    const Vec3 expected = cloth.positions[i] +
-                        (cloth.inv_mass[i] > 0.0f ? gravity * (config.dt * config.dt) : Vec3::Zero());
-                    EXPECT_NEAR(predicted[i].x, expected.x, 1.0e-6f);
-                    EXPECT_NEAR(predicted[i].y, expected.y, 1.0e-6f);
-                    EXPECT_NEAR(predicted[i].z, expected.z, 1.0e-6f);
+                    EXPECT_EQ(previous[i], cloth.positions[i]);
+                    const Vec3 displacement = predicted[i] - previous[i];
+                    if (cloth.inv_mass[i] == 0.0f) EXPECT_EQ(displacement, Vec3::Zero());
+                    EXPECT_NEAR(displacement.x, particle_velocity[i].x * config.dt, 1.0e-6f);
+                    EXPECT_NEAR(displacement.y, particle_velocity[i].y * config.dt, 1.0e-6f);
+                    EXPECT_NEAR(displacement.z, particle_velocity[i].z * config.dt, 1.0e-6f);
                 }
                 std::vector<Vec3> forces(bodies), torques(bodies), velocity(bodies), omega(bodies);
                 EXPECT_TRUE(d.DownloadField(nk::FieldId::BodyForce, forces.data(), bodies * sizeof(Vec3)));
@@ -501,6 +505,9 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
         EXPECT_NEAR(actual_com.y, expected_com.y, 2.0e-3f);
         EXPECT_NEAR(actual_com.z, expected_com.z, 2.0e-3f);
         DownloadParticles(w, &p);
+        out.fluid_displacement.resize(P - n_soft);
+        for (uint32_t i = n_soft; i < P; ++i)
+            out.fluid_displacement[i - n_soft] = p[i] - pool.positions[i - n_soft];
         for (const Vec3& q : p)
             if (!(std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z)))
                 out.finite = false;
@@ -547,6 +554,14 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
                  cloth_z);
     const float pool_rise = with_media.pool_max_surface - with_media.pool_base_surface;
     const float pocket_drop = with_media.pool_base_pocket - with_media.pool_min_z;
+    ASSERT_EQ(with_media.fluid_displacement.size(), control.fluid_displacement.size());
+    ASSERT_FALSE(with_media.fluid_displacement.empty());
+    double fluid_displacement_sq = 0.0;
+    for (size_t i = 0u; i < with_media.fluid_displacement.size(); ++i)
+        fluid_displacement_sq += static_cast<double>(
+            (with_media.fluid_displacement[i] - control.fluid_displacement[i]).LengthSq());
+    const double fluid_displacement_rms =
+        std::sqrt(fluid_displacement_sq / with_media.fluid_displacement.size());
     std::fprintf(stderr,
                  "[robot-coupling] fluid_rows=%u fluid_lambda=%.6f base_surface=%.4f "
                  "max_surface=%.4f (rise=%.4f) base_pocket=%.4f pool_min_z=%.4f "
@@ -554,6 +569,8 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
                  with_media.fluid_link_rows, with_media.fluid_link_lambda,
                  with_media.pool_base_surface, with_media.pool_max_surface, pool_rise,
                  with_media.pool_base_pocket, with_media.pool_min_z, pocket_drop);
+    std::fprintf(stderr, "[robot-coupling] fluid_control_displacement_rms=%.6f\n",
+                 fluid_displacement_rms);
     std::fprintf(stderr,
                  "[robot-coupling] cloth_any_rows=%u fluid_any_rows=%u "
                  "run_front_foot_z=%.4f run_rear_foot_z=%.4f two_particle_rows=%u "
@@ -580,14 +597,13 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
     EXPECT_LT(with_media.cloth_min_z, cloth_z - 0.001f)
         << "the standing foot did not dip the cloth below its lay";
 
-    // TWO-WAY to FLUID: the same, against a fluid-slice particle, pool displaced
-    // (the submerged foot pushes fluid up at the edges OR down in the pocket).
+    // Fluid displacement includes lateral flow on the open floor, relative to its control.
     EXPECT_GT(with_media.fluid_link_rows, 0u)
         << "no robot-link<->fluid coupling rows emitted";
     EXPECT_GT(with_media.fluid_link_lambda, 0.0f)
         << "the robot link produced no body-side reaction on the fluid";
-    EXPECT_TRUE(pool_rise > 0.003f || pocket_drop > 0.003f)
-        << "the foot did not displace the fluid (no surface rise, no pocket drop)";
+    EXPECT_GT(fluid_displacement_rms, 0.003)
+        << "the foot did not displace the fluid relative to the uncoupled control";
 
     // The reaction reaches the articulation: the held stance differs from the
     // no-media control (the impulse flows through the articulated dynamics).

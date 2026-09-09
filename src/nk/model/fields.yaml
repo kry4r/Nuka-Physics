@@ -392,12 +392,7 @@ fields:
   - {name: particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data, flags: [diff]}
   - {name: particle_inv_mass, dtype: f32,  per: particle, arena: persistent, owner: data, flags: [param]}
-  # M6 COUPLED mode: the pre-contact (predicted) velocity scratch. CoupledPredict
-  # saves the post-gravity velocity here so CoupledFinalize can compose the PBD
-  # (XPBD/PBF position-projection) velocity with the contact velocity delta:
-  #   v_final = (pos_projected - prev)/dt + (v_contact - v_pre).
-  # Standalone XPBD/PBF never touch it (mode-gated). A dedicated field (NOT a reuse
-  # of pbf_predicted_pos, which the PBF density-projection owns in coupled mode).
+  # Current projected velocity reference; subtract it to apply each new contact increment once.
   - {name: particle_v_pre,    dtype: vec3, per: particle, arena: scratch,    owner: data}
 
   # --- XPBD DISTANCE constraints (per dist_con) ---
@@ -464,6 +459,7 @@ fields:
   # particle_vel with XPBD; PBF-specific scratch is predicted pos / density /
   # lambda / position deltas.
   # =========================================================================
+  # Shared working positions for all row-coupled particle materials; committed once at finalize.
   - {name: pbf_predicted_pos,  dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: pbf_position_delta, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: pbf_density,        dtype: f32,  per: particle, arena: scratch, owner: data}
@@ -926,3 +922,8 @@ fields:
   - {name: link_contact_begin, dtype: u32, per: link, arena: scratch, owner: data}
   - {name: link_contact_end, dtype: u32, per: link, arena: scratch, owner: data}
   - {name: contact_index_scratch, dtype: u8, per: scalar, count: "contact_index_scratch_bytes", arena: scratch, owner: data}
+
+  # Shared rest geometry and structural incidence for particle contact exclusions.
+  - {name: particle_topology_offsets, dtype: u32, per: scalar, count: "particle_topology_offsets", arena: persistent, owner: model}
+  - {name: particle_topology_elements, dtype: u32, per: scalar, count: "particle_topology_incidence_count", arena: persistent, owner: model}
+  - {name: particle_contact_rest_pos, dtype: vec3, per: scalar, count: "particle_contact_rest_positions", arena: persistent, owner: model}

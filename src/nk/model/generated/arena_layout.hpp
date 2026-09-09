@@ -332,6 +332,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // link_contact_begin
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // link_contact_end
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // contact_index_scratch
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_topology_offsets
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_topology_elements
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 3, 12, 0},  // particle_contact_rest_pos
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {
