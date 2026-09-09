@@ -6,7 +6,7 @@
 
 #include <algorithm>
 
-#include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
+#include "collision/contact_capacity.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/pipeline.hpp"
 
@@ -28,7 +28,7 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // ordering guard). The particle collision radius is the cooked d_min/2 (the
     // same uniform radius the particle-particle co-step uses).
     const uint32_t cands_per_particle =
-        collision::gpu::kBodyParticleContactSlotsPerParticle;
+        collision::kBodyParticleContactSlotsPerParticle;
     // particle_base == rigid_cap by construction: particles take the top
     // [rigid_cap, total) range above the rigid [0, rigid_cap) sub-range.
     p_np_body_particle.family = ctx.family;

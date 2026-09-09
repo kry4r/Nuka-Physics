@@ -23,6 +23,7 @@
 // ---------------------------------------------------------------------------
 
 #include "collision/broadphase_lbvh.hpp"
+#include "collision/contact_capacity.hpp"
 #include "math/vec3.hpp"
 #include "phi/buffer.hpp"
 #include "phi/scoped_device_guard.hpp"
@@ -37,9 +38,7 @@ namespace nuka::collision::gpu {
 // Per-particle candidate cap (16, spec 7.5.5 memory R-C).
 inline constexpr uint32_t kCrossSystemMaxCandidates = 16u;
 
-// Body-contact slots reserved per particle, in a DISJOINT sub-range above the rigid
-// budget; an excess flags kEnvStatusPairOverflow in the narrowphase (no silent drop).
-inline constexpr uint32_t kBodyParticleContactSlotsPerParticle = 4u;
+using ::nuka::collision::kBodyParticleContactSlotsPerParticle;
 
 // Result of a cross-system particle->rigid query. CSR-like: particle i's
 // candidate rigid bodies occupy [CandidateOffsets[i],

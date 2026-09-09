@@ -31,7 +31,7 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "collision/cross_system_query.hpp"  // kBodyParticleContactSlotsPerParticle
+#include "collision/contact_capacity.hpp"
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "scene/terrain/heightfield.hpp"  // HeightField (the cooked grid source)
 #include "scene/terrain/heightfield_loaders.hpp"  // parametric/image grid fill
@@ -273,7 +273,7 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
         row_exempt < cap.particles_per_env ? cap.particles_per_env - row_exempt : 0u;
     const uint64_t reserve =
         static_cast<uint64_t>(row_particles) *
-        collision::gpu::kBodyParticleContactSlotsPerParticle;
+        collision::kBodyParticleContactSlotsPerParticle;
     const uint64_t total = static_cast<uint64_t>(rigid_base) + reserve;
     const uint64_t rows =
         static_cast<uint64_t>(rigid_base) * nk::kPairDrivenRowsPerSlot +

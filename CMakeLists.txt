@@ -81,7 +81,7 @@ else()
     if(NK_REQUIRE_CUDA OR NK_PHYSICS_BACKEND STREQUAL "CUDA")
         message(FATAL_ERROR "CUDA compiler not found, but CUDA is the required/preferred production physics backend.")
     endif()
-    message(STATUS "CUDA compiler not found; building CPU reference backend only")
+    message(STATUS "CUDA backend disabled; building host components and the backend-independent physics core")
 endif()
 
 find_package(Vulkan REQUIRED)

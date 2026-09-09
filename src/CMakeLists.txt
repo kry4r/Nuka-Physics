@@ -563,9 +563,30 @@ target_link_libraries(nuka_sensor
 
 nuka_set_warnings(nuka_sensor)
 
-# ---------------------------------------------------------------------------
-# nuka_phi – Physics Hardware Interface (CUDA backend)
-# ---------------------------------------------------------------------------
+# The registry and physics core compile independently of device implementations.
+add_library(nuka_phi2 STATIC phi/registry.cpp)
+set_target_properties(nuka_phi2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nuka_phi2 PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(nuka_phi2 PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4 /permissive- /WX /wd4819>
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror>
+)
+
+add_library(nuka_nk STATIC
+    nk/model/model.cpp
+    nk/data/arena.cpp
+    nk/data/data.cpp
+    nk/pipeline/pipeline.cpp
+    nk/pipeline/coupling_provider.cpp
+    nk/pipeline/world.cpp
+    nk/solve/schedule.cpp
+    nk/solve/xpbd_coloring.cpp
+)
+set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nuka_nk PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_nk PUBLIC nuka_phi2 nuka_math)
+nuka_set_warnings(nuka_nk)
+
 if(CMAKE_CUDA_COMPILER)
     set_source_files_properties(
         ${NUKA_CODEGEN_OUTPUTS}
@@ -658,21 +679,8 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
-    # -----------------------------------------------------------------------
-    # nuka_phi2 — PHI v2: ggml-style runtime multi-backend layer (M1).
-    #
-    # Built ALONGSIDE the legacy nuka_phi (which all production paths still
-    # consume until M9). PHI v2 has NO production consumers yet — only the
-    # phi2_smoke scenario gate. Same CUDA-gating / PIC / include / warning
-    # policy as nuka_phi.
-    #
-    # NUKA_PHI2_WITH_CUDA: drives the explicit, linker-safe CUDA registry
-    # self-registration in registry.cpp -> RegisterCudaBackendEntry() (see the
-    # static-lib self-registration de-risk comment there). A non-CUDA build
-    # would compile registry.cpp with the macro undefined and register nothing.
-    # -----------------------------------------------------------------------
-    add_library(nuka_phi2 STATIC
-        phi/registry.cpp
+    # Backend objects share the registry archive so static linking retains op registration.
+    add_library(nuka_phi2_cuda OBJECT
         phi/backend_cuda/cuda_backend.cu
         phi/backend_cuda/cuda_buffer.cu
         phi/backend_cuda/ops/registry.cu
@@ -725,57 +733,11 @@ if(CMAKE_CUDA_COMPILER)
         # grad_mass accumulate kernel so diffsim's backward_runner stays host-only.
         phi/backend_cuda/ops/diffsim_backward.cu
     )
-    set_target_properties(nuka_phi2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    target_compile_definitions(nuka_phi2 PUBLIC NUKA_PHI2_WITH_CUDA)
-
-    target_include_directories(nuka_phi2
-        PUBLIC
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_phi2
-        PUBLIC
-            CUDA::cudart
-    )
-
-    target_compile_options(nuka_phi2 PRIVATE
-        $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4 /permissive- /WX /wd4819>
-        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror>
-    )
-
-    # -----------------------------------------------------------------------
-    # nuka_nk — the new unified core (M3): Model / Data arena / generated field
-    # views / Pipeline + World skeleton. PURE C++ (zero CUDA tokens; lint scope
-    # nk_engine): all device memory + execution through the phi v2 vtable
-    # (nuka_phi2). The generated field headers (src/nk/model/generated/) are
-    # committed; they are #included as ordinary headers (regen via
-    # tools/codegen/regen.py). Depends only on nuka_phi2 + nuka_math.
-    # -----------------------------------------------------------------------
-    add_library(nuka_nk STATIC
-        nk/model/model.cpp
-        nk/data/arena.cpp
-        nk/data/data.cpp
-        nk/pipeline/pipeline.cpp
-        nk/pipeline/coupling_provider.cpp
-        nk/pipeline/world.cpp
-        nk/solve/schedule.cpp
-        nk/solve/xpbd_coloring.cpp
-    )
-    set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    target_include_directories(nuka_nk
-        PUBLIC
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_nk
-        PUBLIC
-            nuka_phi2
-            nuka_math
-    )
-
-    nuka_set_warnings(nuka_nk)
+    set_target_properties(nuka_phi2_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(nuka_phi2_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(nuka_phi2_cuda PRIVATE CUDA::cudart)
+    target_compile_definitions(nuka_phi2 PRIVATE NUKA_PHI2_WITH_CUDA)
+    target_link_libraries(nuka_phi2 PRIVATE nuka_phi2_cuda)
 
     # -------------------------------------------------------------------------
     # nuka_scene_cook — CookToModel (SceneIR -> {nk::Model, SceneMap}). Cleanest
