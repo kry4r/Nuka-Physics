@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<h1 align="center">NukaPhysics</h1>
+<h1 align="center">Nuka-Physics</h1>
 
 <p align="center">
   <strong>GPU-resident, bit-deterministic, differentiable CUDA physics.</strong><br>
@@ -13,9 +13,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/CUDA-12.8-76b900" alt="CUDA 12.8">
-  <img src="https://img.shields.io/badge/determinism-D1%20bit--exact-222222" alt="D1 bit-exact determinism">
-  <img src="https://img.shields.io/badge/platform-Linux-555555" alt="Linux">
+  <img src="https://img.shields.io/badge/backend-CUDA%20%7C%20extensible-76b900" alt="CUDA backend, extensible backend architecture">
+  <img src="https://img.shields.io/badge/platform-Linux%20%26%20Windows-222222" alt="Linux and Windows">
   <img src="https://img.shields.io/badge/license-AGPL--3.0%20%7C%20Commercial-cd3c32" alt="AGPL-3.0 or Commercial">
 </p>
 
@@ -100,7 +99,7 @@
 </p>
 
 | Layer | Core modules | Responsibility |
-|---|---|---|
+| --- | --- | --- |
 | Authoring | `scene`, `import` | NKS, MJCF, URDF, and text-USD → SceneIR → cooked model |
 | Simulation | `nk`, `collision`, `constraint` | GPU world, broadphase, narrowphase, universal rows, deterministic solve |
 | Systems | `diffsim`, `sensor`, `codegen` | Reverse-mode adjoint, sensor queries, generated forward/adjoint kernels |
@@ -109,7 +108,7 @@
 ## Capabilities
 
 | System | Status |
-|---|---|
+| --- | --- |
 | Rigid + articulated dynamics (Featherstone / ABA) | Production |
 | General contact + terrain / heightfields | Production |
 | XPBD cloth and soft bodies | Functional |

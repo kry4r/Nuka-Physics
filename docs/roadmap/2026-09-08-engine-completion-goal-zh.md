@@ -6,6 +6,8 @@
 
 完成 [模块 spec](../plans/2026-09-07-physics-module-specs-newton-port-zh.md) 与 [细化 spec](../plans/2026-09-08-physics-optimization-detailed-spec-zh.md) 中尚未完成的引擎功能和性能工作，持续回写规格、进度、TODO、实际结果和限制。旧目标的 demo 调优、规格细化及开始实施已验收；本目标接续其全部引擎剩余项，不以首批完成代表整体完成。
 
+2026-09-09 用户更新执行顺序：先提交并推送现有 commit 与 README；随后优先完成 MLS-MPM 和其他剩余性能问题，再分析、优化完整多体耦合，耦合处理结束后继续原 spec 的其余计划。耦合方案允许从现有架构与物理原理独立推导，探索整体最优设计；Newton/MuJoCo/Genesis 是可选参考与适用物理对照，不限定架构或算法选择。总范围和 active 状态不变。
+
 已验收基线：π0.5/G1 demo 与主页、完整环境 reset、三轴重力和自由体外力（`0953516`）。本批新增稳定自由旋转、创建拓扑防护、确定性风阻功能、required op/首错停止及邻域容量池基础；见 [动力学整批验收](../research/2026-09-08-dynamics-pipeline-validation-zh.md)。原 demo、reset、外力轨迹和冻结库保留。
 
 当前进度：执行/workspace 批次主 pipeline 33 passed、0 skip，公共耦合/多环境/相机通过，完整 16 环境 graph memcheck 0 errors。公共 graph、失败缓存、LBVH workspace、活跃 cache 排序/merge 和字段预算已实现。容量检查发现旧版也存在的 pair snapshot 覆盖，现已通用修复；原 E=256 分母保留为失败证据。修正后 65 个独立进程、容量物理等价和 8 对公共渲染图通过，新 graph E=1/16/256 为 3.073/3.367/6.499 ms，结果见 [执行验收](../research/2026-09-09-execution-workspace-validation-zh.md)。
@@ -38,12 +40,12 @@ eager 性能仍未验收：首次五进程和两组交错采样存在超过 5% �
 - 原引擎不是物理真值。字节一致只证明确定性或既定运算次序；还须独立验收约束误差、接触/滑移/穿透、守恒和时间步收敛。发现共同错误时保留失败、修复通用契约，再冻结正确性能分母。
 - 物理验收可参考 Newton、MuJoCo、Genesis 的实跑仿真结果。先对齐几何、质量/惯量、材料、约束、dt/substep、控制和坐标/单位，记录版本、原始轨迹与差异；不等价模型只比较共同可解释的物理量。参考引擎分歧用解析解、不变量和收敛证据判断，不能据旧版相同或多数一致宣布正确。
 - 目标是 multi-backend。物理契约、模型/拓扑、算子依赖和公共 API 保持后端无关；架构优化、CUDA 实现调优和物理算法变化分别标注、验证与提交。CUDA occupancy/cooperative launch/stream/graph/intrinsics/库只能属于 CUDA 后端，不成为核心模型要求；无 CUDA 构建检查只证明依赖隔离，不代表其他后端物理能力已完备。
-- 每批修改前 review 对应 spec，再读取最新 Newton、MuJoCo、Genesis 相关实现，记录 revision、采用与差异。
+- 每批修改前 review 对应 spec；性能方向对照最新 Newton、MuJoCo、Genesis 和相关资料，记录采用与差异。多体耦合按最新授权可基于现有架构与物理推导独立设计，不以参考引擎的现有能力限制方案。
 - 一个通用物理求解路径；禁止机器人、抓取、场景专用分支和固定布局捷径。
 - 少新增单测；固定主环境覆盖 cook、创建、控制、step、接触/耦合、reset、读出，图像受影响时包含 headless 渲染。
 - 相关修改合并构建和 pipeline 验证，避免每个小改动都重复全量测试。物理不变量和无法由主环境测量的失败才增加必要解析补充。
 - 保存失败日志、源码与二进制身份、配置、质量、确定性、耗时和内存证据；缺测数据明确列出。
-- 本地 commit 简洁、无合作者；保留原有工作区文件。Editor 等引擎完善后再设计。
+- Commit 简洁、无合作者，按用户授权推送已完成改动；保留原有工作区文件。Editor 等引擎完善后再设计。
 
 ## 性能模块的重点
 
@@ -51,7 +53,7 @@ MLS-MPM 已完成体积硬截断修复、[粒子归属/容量架构验收](../re
 
 MLS-MPM 按用户最新补充提升为当前 CUDA 调度批次之后的主要工作，覆盖从 P2G/应力到活跃网格、双向刚体/机器人反作用及 G2P/F 的完整路径。主负载复用 `examples/demo/mpm_water_drop_demo.cpp` 的 bunny-water（MLS-MPM），辅以已有 jelly、rigid/articulation-on-MPM 和 transfer 场景；`water_pool_demo.cpp` 的同名 PBF 场景不能替代。先记录当前输入、完整质量与性能基线/profile，再成批改生产代码，不新增独立测试框架。
 
-性能批次后紧接着完善 MPM 耦合：无 SDF collider 的通用几何查询，多个碰撞端点的有限质量约束，刚体/关节子步反作用与速度刷新，以及 MPM↔XPBD/其他介质的完整交换链路。SDF 是几何表示之一，不应成为通用耦合的必需条件；解析 primitive、凸体和网格查询生成同一接触契约，不增设场景求解器。当前 bunny 的 SDF、独立网格地板、single owner 和延迟 articulation deposit 等边界必须随性能结果报告，不以未覆盖能力无限推迟已有有效路径的优化，也不把局部性能验收当作完整多体耦合。
+优先完成 MLS-MPM 与其他剩余性能问题后，接续完整多体/多介质耦合：无 SDF collider 的通用几何查询，多个碰撞端点的有限质量约束，刚体/关节子步反作用与速度刷新，以及 MPM↔XPBD/其他介质的完整交换链路。SDF 是几何表示之一，不应成为通用耦合的必需条件；解析 primitive、凸体和网格查询生成同一接触契约，不增设场景求解器。当前 bunny 的 SDF、独立网格地板、single owner 和延迟 articulation deposit 等边界必须随性能结果报告，不以未覆盖能力无限推迟已有有效路径的优化，也不把局部性能验收当作完整多体耦合。耦合完成后继续原 spec 的其余功能、API 与高级能力。
 
 按用户追加要求，进入性能模块后以极致性能优化为主要工作：先用 GPU 完成时间和 profiler 定位关键路径，再成批优化 launch/graph、调度、数据布局、带宽、访存合并、寄存器与 occupancy、活跃工作压缩和 workspace/显存复用。分别优化少环境延迟与大批量吞吐，记录瓶颈如何迁移；达到初始 10% 门槛后继续处理仍有实测收益的热点，不把门槛当终点。
 

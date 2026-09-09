@@ -4,6 +4,8 @@
 
 当前 active goal 已接续为 [引擎完善目标](2026-09-08-engine-completion-goal-zh.md)：覆盖 spec 全部剩余项，相关模块成批修改、统一验证。旧 demo/细化规格/开始实施目标已验收关闭。
 
+最新执行顺序（2026-09-09）：提交并推送现有 commit 与 README → MLS-MPM 和其他剩余性能优化 → 完整多体/多介质耦合分析与优化 → 继续原 spec。耦合方案可由现有架构与物理推导独立设计，上游引擎作为适用参考，不限定方案。
+
 按用户指定顺序推进：先完成 pi0.5 demo 的调优、代码修复和渲染，再细化 9 月 7 日引擎功能/性能优化规格，最后按细化规格开始执行。固定 seed 的 demo、reset、外力/重力、稳定自由旋转和共享风阻功能已验收，现接续执行、内存与性能模块。
 
 ## pi0.5 demo
@@ -37,7 +39,7 @@
 - [x] 统一纯/混合 MPM 粒子归属及接触容量：五进程落水 eager/graph 分别改善 4.89%/6.26%，数据区 1.64 GB → 71.22 MB；完整状态/质量、33 项既有 MPM 场景及固定 pipeline 通过，见 [容量验收](../research/2026-09-09-mpm-ownership-validation-zh.md)。
 - [x] CUDA MPM 连续传输记录、占用 cell 标记、独立 workspace、活跃网格和稳定反作用分块读取通过验收：五进程落水 eager/graph 降时 32.02%/35.42%，Data arena 增加 24.48 MB；33 项既有场景、固定 E=16 graph pipeline、memcheck/synccheck 通过，见 [CUDA MPM 验收](../research/2026-09-09-cuda-mpm-transfer-validation-zh.md)。失败的完整权重缓存方案保留记录。
 - [ ] 继续以原 MLS-MPM bunny-water 与已有 jelly/刚体/关节场景判断剩余热点：当前 P2G/连续记录准备占落水 kernel busy 的 62.78%/13.26%，审查合并读取与粒子/节点 workspace 容量分离。保留同物理分母和完整质量门；同名 PBF demo 不替代。
-- [ ] 性能批次后立即接续无 SDF 碰撞体与完整 MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面和完整多体链路。性能结果先明确已有覆盖与限制，不能把 single owner/SDF-only 路径验收写成完整耦合。
+- [ ] MLS-MPM 和其他剩余性能项处理后，接续无 SDF 碰撞体与完整多体/MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面。独立推导可验证的通用方案，性能结果明确已有覆盖与限制；耦合完成后继续原 spec。
 - [x] 收口粒子时间层基础修复：统一工作位置、材料/接触交替、累计 lambda 与一次提交；六组完整长度门、已有场景/API/reset/渲染及 E=16 graph memcheck 通过。最大应变 1.838344%、最坏 RMS 0.203045%；完整接触刷新与 MPM 子步反馈另行继续。
 - [x] 单独完成构建架构隔离（`6953f4a`）：后端注册和 nk 核心脱离 CUDA 配置门，CUDA 源码与库按能力附加；无 CUDA 核心构建通过，不代表完整 CPU solver 已实现。
 - [x] 补充持续约束：原版不作为物理真值；参考 Newton/MuJoCo/Genesis 的匹配仿真、解析解/守恒/约束误差/收敛；multi-backend 下分开架构优化、CUDA 调优和物理算法变化。
@@ -51,7 +53,7 @@
 - [ ] 继续处理大环境 ContactWarmStart 的 graph capture 失败：E=1024/2048 旧版失败，候选 E=2048 同样失败；eager 完整运行可通过，不能归因于 OOM。
 - [ ] 继续归因 soft-tet 压板的材料/形变验收不一致：基线和候选 min extent 0.179912567，恢复体积 0.00025918262，均未过原门；不因同值而宣称正确。
 
-以 [模块 spec 第 14 节](../plans/2026-09-07-physics-module-specs-newton-port-zh.md) 跟踪进度。每项改造前 review 对应 spec，再对照最新 Newton/MuJoCo/Genesis 实现并记录 revision 和决策。
+以 [模块 spec 第 14 节](../plans/2026-09-07-physics-module-specs-newton-port-zh.md) 跟踪进度。每项改造前 review 对应 spec，性能方向对照最新 Newton/MuJoCo/Genesis 并记录决策；多体耦合按最新授权可独立推导方案。
 
 验证约束：少新增单测，以固定机器人＋布料＋流体环境的完整 pipeline 为主；必要解析反例辅助定位，影响渲染时验证图像链路。
 
