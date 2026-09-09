@@ -6,11 +6,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include <cuda_runtime.h>
 
+#include <cub/block/block_store.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
@@ -662,30 +665,43 @@ __global__ void MpmPrepareTransferInputKernel(
     const float* __restrict__ volume, const float* __restrict__ stress,
     m::Vec3 origin, float inv_dx, uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
     MpmTransferInput* __restrict__ transfer_input) {
-    const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= particle_count) return;
-    const uint32_t p = sorted_idx[s];
-    const m::Vec3 xp = pos[p];
-    const Bspline axes[3] = {QuadWeights((xp.x - origin.x) * inv_dx),
-                             QuadWeights((xp.y - origin.y) * inv_dx),
-                             QuadWeights((xp.z - origin.z) * inv_dx)};
-    float mass = inv_mass[p] > 0.0f ? 1.0f / inv_mass[p] : 0.0f;
-    const bool overlaps_grid = axes[0].base >= -2 && axes[0].base < dims_x &&
-        axes[1].base >= -2 && axes[1].base < dims_y &&
-        axes[2].base >= -2 && axes[2].base < dims_z;
-    if (!overlaps_grid) mass = 0.0f;
-    MpmTransferInput cached;
-    cached.position = xp;
-    cached.mass = mass;
-    cached.velocity = velocity[p];
-    cached.volume = volume[p];
-    for (int i = 0; i < 3; ++i)
-        cached.base[i] = overlaps_grid ? static_cast<int32_t>(axes[i].base) : 0;
-    for (int i = 0; i < 9; ++i) {
-        cached.affine[i] = affine[static_cast<size_t>(p) * 9u + i];
-        cached.stress[i] = stress[static_cast<size_t>(p) * 9u + i];
+    const uint32_t block_begin = blockIdx.x * blockDim.x;
+    const uint32_t s = block_begin + threadIdx.x;
+    MpmTransferInput cached{};
+    if (s < particle_count) {
+        const uint32_t p = sorted_idx[s];
+        const m::Vec3 xp = pos[p];
+        const Bspline axes[3] = {QuadWeights((xp.x - origin.x) * inv_dx),
+                                 QuadWeights((xp.y - origin.y) * inv_dx),
+                                 QuadWeights((xp.z - origin.z) * inv_dx)};
+        float mass = inv_mass[p] > 0.0f ? 1.0f / inv_mass[p] : 0.0f;
+        const bool overlaps_grid = axes[0].base >= -2 && axes[0].base < dims_x &&
+            axes[1].base >= -2 && axes[1].base < dims_y &&
+            axes[2].base >= -2 && axes[2].base < dims_z;
+        if (!overlaps_grid) mass = 0.0f;
+        cached.position = xp;
+        cached.mass = mass;
+        cached.velocity = velocity[p];
+        cached.volume = volume[p];
+        for (int i = 0; i < 3; ++i)
+            cached.base[i] = overlaps_grid ? static_cast<int32_t>(axes[i].base) : 0;
+        for (int i = 0; i < 9; ++i) {
+            cached.affine[i] = affine[static_cast<size_t>(p) * 9u + i];
+            cached.stress[i] = stress[static_cast<size_t>(p) * 9u + i];
+        }
     }
-    transfer_input[s] = cached;
+
+    static_assert(std::is_trivially_copyable_v<MpmTransferInput>);
+    static_assert(sizeof(MpmTransferInput) % sizeof(uint32_t) == 0u);
+    constexpr int kWords = sizeof(MpmTransferInput) / sizeof(uint32_t);
+    using Store = cub::BlockStore<uint32_t, kBlockSize, kWords, cub::BLOCK_STORE_WARP_TRANSPOSE>;
+    __shared__ typename Store::TempStorage storage;
+    uint32_t words[kWords];
+    memcpy(words, &cached, sizeof(cached));
+    const uint32_t valid_words = min(kBlockSize, particle_count - block_begin) * kWords;
+    // All lanes join the transpose; the tail block writes only complete valid records.
+    Store(storage).Store(reinterpret_cast<uint32_t*>(transfer_input) +
+                             static_cast<size_t>(block_begin) * kWords, words, valid_words);
 }
 
 // The cached base preserves clipped stencils while evaluating only the requested weight.

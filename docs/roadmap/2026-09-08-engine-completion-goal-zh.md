@@ -59,7 +59,9 @@
 
 MLS-MPM 已完成体积硬截断修复、[粒子归属/容量架构验收](../research/2026-09-09-mpm-ownership-validation-zh.md) 和 [CUDA 传输验收](../research/2026-09-09-cuda-mpm-transfer-validation-zh.md)。保持原 bunny-water 输入，CUDA 独立五进程落水 eager/graph 为 48.270 → 32.812 / 44.611 → 28.809 ms/步（−32.02%/−35.42%），Data arena 为 71.22 → 95.70 MB。完整质量/状态、33 项既有场景、固定 E=16 graph pipeline 和针对性 memcheck/synccheck 通过。P2G/记录准备仍是热点；局部大 J、无 SDF、多 owner、有限质量、复合形状实际 owner 和 articulation 子步反馈均未据此关闭。
 
-MLS-MPM 按用户最新补充提升为当前 CUDA 调度批次之后的主要工作，覆盖从 P2G/应力到活跃网格、双向刚体/机器人反作用及 G2P/F 的完整路径。主负载复用 `examples/demo/mpm_water_drop_demo.cpp` 的 bunny-water（MLS-MPM），辅以已有 jelly、rigid/articulation-on-MPM 和 transfer 场景；`water_pool_demo.cpp` 的同名 PBF 场景不能替代。先记录当前输入、完整质量与性能基线/profile，再成批改生产代码，不新增独立测试框架。
+后续 [CUDA 记录写入优化](../research/2026-09-10-cuda-mpm-record-store-validation-zh.md) 已通过五对验收：落水 eager/graph 再降时 8.18%/9.66%，静置降时 10.03%/10.98%，arena 不增加。完整质量/状态、既有场景、固定 E=16 pipeline 及 memcheck/synccheck 通过。当前 P2G 仍占落水 kernel busy 的 69.49%，记录准备降至 3.77%；继续有序读取与容量热点，不将本批视为 MLS-MPM 性能完成。
+
+MLS-MPM 按用户最新补充作为当前主要工作，覆盖从 P2G/应力到活跃网格、双向刚体/机器人反作用及 G2P/F 的完整路径。主负载复用 `examples/demo/mpm_water_drop_demo.cpp` 的 bunny-water（MLS-MPM），辅以已有 jelly、rigid/articulation-on-MPM 和 transfer 场景；`water_pool_demo.cpp` 的同名 PBF 场景不能替代。先记录当前输入、完整质量与性能基线/profile，再成批改生产代码，不新增独立测试框架。
 
 优先完成 MLS-MPM 与其他剩余性能问题后，接续完整多体/多介质耦合：无 SDF collider 的通用几何查询，多个碰撞端点的有限质量约束，刚体/关节子步反作用与速度刷新，以及 MPM↔XPBD/其他介质的完整交换链路。SDF 是几何表示之一，不应成为通用耦合的必需条件；解析 primitive、凸体和网格查询生成同一接触契约，不增设场景求解器。当前 bunny 的 SDF、独立网格地板、single owner 和延迟 articulation deposit 等边界必须随性能结果报告，不以未覆盖能力无限推迟已有有效路径的优化，也不把局部性能验收当作完整多体耦合。耦合完成后继续原 spec 的其余功能、API 与高级能力。
 
