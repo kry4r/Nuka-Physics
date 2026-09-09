@@ -3639,41 +3639,6 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
-    # Demo 1 headline clip: a heavy rigid Stanford bunny dropped into an MLS-MPM
-    # water pool (weakly-compressible FLUID constitutive model_kind==3, Tait EOS),
-    # TWO-WAY coupled through the env-private grid (the SAME grid BC the floor uses).
-    # STEPS nk::World on CUDA and renders the live MPM fluid marching-cubes isosurface
-    # as a refractive dielectric with teal depth absorption (ior 1.33, transmit
-    # bounces, Taubin smoothing) + the bunny (SDF collider, posed from body_pose) + a
-    # checker pool bottom on the CUDA RT beauty backend. --dump/--from decouple the
-    # ~once sim from cheap render iteration; writes a PNG sequence (-> mp4).
-    add_executable(nuka_mpm_water_drop_demo
-        ${CMAKE_SOURCE_DIR}/examples/demo/mpm_water_drop_demo.cpp
-    )
-    add_dependencies(nuka_mpm_water_drop_demo nuka_codegen)
-    target_compile_definitions(nuka_mpm_water_drop_demo
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-            NK_BUILD_VULKAN_VALIDATION)
-    target_include_directories(nuka_mpm_water_drop_demo
-        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-    target_link_libraries(nuka_mpm_water_drop_demo
-        PRIVATE
-            nuka_scene_cook
-            nuka_render
-            nuka_phi2_rt
-            nuka_nk
-            nuka_phi2
-            nuka_runtime_gpu
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-    )
-
     # Cloth<->rigid coupling headline clip: a free unpinned square cloth sheet released
     # above a PD-standing Go2 (full per-link collision skeleton cooked from go2.nks)
     # drapes over the body on the ONE general body<->particle row solver. STEPS nk::World
