@@ -1,35 +1,22 @@
-// ---------------------------------------------------------------------------
-// mpm_water_drop_demo.cpp -- a heavy rigid box dropped into an MLS-MPM water
-// pool, TWO-WAY coupled, rendered as refractive water.
-//
-// An MLS-MPM weakly-compressible FLUID pool (model_kind == 3, Tait EOS) fills a
-// confined tank: the grid xy-box separating-wall BC is the tank walls, the floor
-// plane BC is the bottom. A heavy rigid box is released above the rest surface
-// and plunges in. The box couples to the fluid TWO-WAY through the env-private
-// grid: the box SDF is rasterized onto the grid, the node velocity is projected
-// onto the box surface velocity, and the grid->box reaction brakes/floats the
-// box -- there is NO bespoke fluid coupler, the splash and the brake both EMERGE
-// from the same grid BC the floor uses.
-//
-// RENDER reuses the refractive-water path: PER FRAME download the live MPM fluid
-// particle positions, march the isosurface (MarchFluidSurface) into a clear
-// dielectric (ior 1.33, transmit bounces, Taubin smoothing, anisotropic kernels),
-// pose the box from its live body_pose, render box + water + checker pool bottom
-// + studio floor on the CUDA RT beauty backend, write a PNG sequence (-> mp4).
-//
-// Built behind NK_BUILD_VULKAN_VALIDATION. Usage:
-//   mpm_water_drop_demo [--width W] [--height H] [--png-dir DIR] [--samples N]
-//                       [--probe] [--video] [--video-stride S]
-// ---------------------------------------------------------------------------
+// A rigid bunny drops into MLS-MPM water through the production World pipeline.
+// CUDA ray tracing, headless quality checks, and completion timing share this input.
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <memory>
+#include <numeric>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -45,6 +32,7 @@
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/backend.hpp"
+#include "phi/backend_cuda/cuda_internal.cuh"
 #include "phi/op_schema.hpp"
 #include "render/mesh_normals.hpp"
 #include "render/raster/vulkan_raster_renderer.hpp"
@@ -56,6 +44,7 @@
 #include "runtime/sdf/sparse_sdf_query.cuh"
 #include "runtime/soft/tetmesh_topology.hpp"
 #include "scene/cook/cook_to_model.hpp"
+#include "scene/format/json.hpp"
 
 namespace {
 
@@ -71,16 +60,33 @@ namespace nimport = nuka::import;
 using nuka::math::Quat;
 using nuka::math::Transform;
 using nuka::math::Vec3;
+using Json = nuka::scene::json::Value;
+using Clock = std::chrono::steady_clock;
+
+void Require(bool ok, const std::string& message) {
+    if (!ok) throw std::runtime_error(message);
+}
+
+void CheckCuda(cudaError_t status) {
+    Require(status == cudaSuccess, cudaGetErrorString(status));
+}
+
+double Milliseconds(Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+void WriteJson(const std::string& path, const Json& report) {
+    if (path.empty()) return;
+    std::ofstream file(path);
+    file << report.Dump() << '\n';
+    Require(file.good(), "cannot write " + path);
+}
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr uint32_t kKindBox = 2u;
 constexpr uint32_t kKindPlane = 3u;
 
-// Pool + grid geometry. A wide, deeper tank: the grid xy-box separating-wall BC
-// is the tank walls and the floor plane BC is the bottom (no separate wall
-// bodies). dx + substeps are the stability knobs (CFL dt_sub < ~0.4*dx/c with
-// c = sqrt(K/rho0)); a small viscosity damps the explicit lattice ringing so the
-// free surface settles flat.
+// The grid x/y walls and floor boundary contain the fluid pool.
 constexpr float kFloorZ      = 0.0f;
 constexpr float kDx          = 0.011f;
 constexpr float kTankHalfXY  = 0.215f;  // tank (domain box) half-extent in x/y.
@@ -88,26 +94,18 @@ constexpr float kFluidHalfXY = 0.205f;  // fluid fills the tank cross-section ~f
                                         // to the wall (no rim gap to dilate into).
 constexpr float kPoolTopZ    = 0.18f;   // fluid pool rest height (deep enough to swallow the bunny).
 constexpr float kDensity     = 1000.0f; // rho0 (water).
-constexpr float kBulk        = 2.0e5f;  // K: c = sqrt(K/rho0) ~ 14 m/s >> impact ~3.4 m/s; stiff
-                                        // bulk holds the interior J near 1.
+constexpr float kBulk        = 2.0e5f;  // Tait coefficient B; c = sqrt(gamma*B/rho0) at J=1.
 constexpr float kTaitGamma   = 7.0f;    // water EOS exponent.
-constexpr float kViscosity   = 0.4f;    // low damping so surface gravity waves (the radiating
-                                        // ripple rings) and the crown sheet survive (water, not jelly).
-// CFL: c = sqrt(K/rho0) ~ 14 m/s at the finer dx; c*dt_sub ~ 0.09*dx leaves a 4x
-// margin for the impact transient.
+constexpr float kViscosity   = 0.4f;    // Dynamic viscosity in the Newtonian stress.
 constexpr uint32_t kSubsteps = 40u;
 
-// The bunny: a heavy rigid body (denser than the displaced water) released well
-// above the rest surface so it arrives fast, throws a crown, then submerges. The
-// MPM body BC samples its cooked SDF grid; the analytic kind/params are unused.
+// The heavy bunny couples through its cooked sparse SDF.
 constexpr float kBunnyExtent = 0.14f;   // longest AABB extent (< pool depth so it submerges); big
                                         // enough that the plunge displaces a visible splash.
 constexpr float kBunnyMass   = 2.5f;    // heavy (stone-dense over its hull) -> a fast, deep plunge.
 constexpr float kDropAbove   = 0.60f;   // release this far above the rest surface.
 
-// Sample the fluid pool on a lattice at dx/2 (8 particles/cell) filling the
-// confined tank: the fluid spans the domain box cross-section so the wall BC
-// ring holds it (no lateral slump) and it settles into a flat hydrostatic column.
+// Sample the pool at dx/2, giving eight particles per grid cell.
 cook::MpmCookInput BuildPoolInput() {
     cook::MpmCookInput in;
     const float pdx = kDx * 0.5f;
@@ -127,10 +125,7 @@ cook::MpmCookInput BuildPoolInput() {
     in.material.tait_gamma = kTaitGamma;
     in.material.viscosity = kViscosity;
     in.grid_origin = Vec3{-kTankHalfXY, -kTankHalfXY, kFloorZ - 3.0f * kDx};
-    // Grid covers the pool + the splash crown (peaks ~0.39 m above rest) + margin,
-    // sized to the FLUID — not the rigid release height — so empty air nodes (every
-    // node pays a per-substep gather) do not dominate the step cost. Crown must stay
-    // under the top or it trips the escape flag.
+    // The grid covers the fluid pool and splash; its top boundary is open.
     const float top = kPoolTopZ + 0.54f;
     in.grid_dims[0] = static_cast<uint32_t>(2.0f * kTankHalfXY / kDx) + 1u;
     in.grid_dims[1] = in.grid_dims[0];
@@ -143,9 +138,7 @@ cook::MpmCookInput BuildPoolInput() {
     return in;
 }
 
-// Load the OBJ, center the AABB, scale longest extent to kBunnyExtent, rotate
-// -90deg about X (dataset is Y-up; engine is Z-up), re-center on its own AABB so
-// the body origin is its centroid (SDF/inertia/pose all consistent).
+// Center the mesh AABB, scale its longest extent, and rotate from Y-up to Z-up.
 soft::TriMesh LoadBunnyMesh(const std::string& path) {
     nimport::MeshGeometry g = nimport::LoadObj(path);
     soft::TriMesh m;
@@ -349,9 +342,7 @@ render::MeshGeometry MakeSlabGeo(float half, float thickness, float top) {
     return g;
 }
 
-// Pool-bottom checker tiles for one parity (even or odd), flat quads at z=top.
-// Two parities with two materials read as a tiled pool floor so light refracted
-// through the clear water reveals structure instead of a flat color.
+// Two material parities form checker tiles at the pool floor.
 render::MeshGeometry MakeCheckerTiles(float half, uint32_t cells, float top, bool odd) {
     render::MeshGeometry g;
     const float step = (2.0f * half) / static_cast<float>(cells);
@@ -468,9 +459,7 @@ private:
     uint32_t samples_ = 24u;
 };
 
-// Water isosurface params over the MPM fluid particle set. Isotropic kernels give
-// a rounder, watery surface; iso level auto-calibrates so iso_fraction stays
-// meaningful.
+// Isotropic kernels reconstruct the water surface at a calibrated iso fraction.
 fluid::FluidSurfaceParams WaterSurfaceParams() {
     fluid::FluidSurfaceParams p;
     const float pdx = kDx * 0.5f;            // MPM particle spacing (8/cell).
@@ -504,18 +493,14 @@ void SmoothWaterMesh(render::MeshGeometry& g, uint32_t iters, float lambda, floa
     g.normals = render::SmoothNormals(g.positions, g.indices);
 }
 
-// One renderable frame: the rigid bunny (posed this frame) + the refractive water
-// surface (marched over the MPM fluid particles) + a checker pool bottom + opaque
-// slate side walls + a studio floor under the tank.
+// Render the live bunny pose and water surface with the pool and studio floor.
 render::RenderWorld BuildFrame(const std::vector<Vec3>& fluid_pos, uint32_t n,
                                const soft::TriMesh& bunny, const Transform& box_xf,
                                float rest_surface) {
     render::RenderWorld rw;
     rw.materials.push_back(MakeMat(0.66f, 0.34f, 0.22f, 0.0f, 0.45f));            // 0 bunny terracotta
     rw.materials.push_back(MakeMat(0.80f, 0.86f, 0.92f, 0.0f, 0.55f));            // 1 light pool tile
-    // Bulk water dielectric: ior 1.33 + strong Beer-Lambert absorption (red/green
-    // decay fastest -> the pool deepens to teal with depth, so refraction reads as a
-    // colored liquid volume, not clear glass). Thin splash/jet sheets stay near-clear.
+    // Water uses refraction and wavelength-dependent depth absorption.
     rw.materials.push_back(MakeMat(0.82f, 0.90f, 0.95f, 0.0f, 0.04f,
                                    /*transmission=*/0.96f, /*ior=*/1.33f,
                                    /*ax=*/3.5f, /*ay=*/1.3f, /*az=*/0.5f));        // 2 water (teal depth)
@@ -611,13 +596,26 @@ struct Args {
     uint32_t start_step = 0u;   // video: skip free-fall steps before the box enters frame.
     std::string dump_path;      // write per-step snapshots here after the sim, then exit.
     std::string from_path;      // load snapshots from here and render WITHOUT simulating.
+    std::string execution = "eager";
+    std::string perf_json;
+    std::string state_output;
 };
 Args ParseArgs(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
-        auto next_u = [&](uint32_t def) -> uint32_t {
-            return (i + 1 < argc) ? static_cast<uint32_t>(std::atoi(argv[++i])) : def;
+        auto next_value = [&]() -> std::string {
+            Require(i + 1 < argc, "missing value for " + s);
+            return argv[++i];
+        };
+        auto next_u = [&](uint32_t) -> uint32_t {
+            const auto value = next_value();
+            size_t consumed = 0u;
+            Require(!value.empty() && value.front() != '-', "invalid unsigned integer");
+            const auto parsed = std::stoull(value, &consumed);
+            Require(consumed == value.size() && parsed <= std::numeric_limits<uint32_t>::max(),
+                    "unsigned integer out of range");
+            return static_cast<uint32_t>(parsed);
         };
         if (s == "--width") a.width = next_u(a.width);
         else if (s == "--height") a.height = next_u(a.height);
@@ -628,16 +626,131 @@ Args ParseArgs(int argc, char** argv) {
         else if (s == "--settle") a.settle_steps = next_u(a.settle_steps);
         else if (s == "--drop") a.drop_steps = next_u(a.drop_steps);
         else if (s == "--start") a.start_step = next_u(a.start_step);
-        else if (s == "--png-dir" && i + 1 < argc) a.png_dir = argv[++i];
-        else if (s == "--dump" && i + 1 < argc) a.dump_path = argv[++i];
-        else if (s == "--from" && i + 1 < argc) a.from_path = argv[++i];
+        else if (s == "--png-dir") a.png_dir = next_value();
+        else if (s == "--dump") a.dump_path = next_value();
+        else if (s == "--from") a.from_path = next_value();
+        else if (s == "--execution") a.execution = next_value();
+        else if (s == "--perf-json") a.perf_json = next_value();
+        else if (s == "--state-output") a.state_output = next_value();
+        else throw std::invalid_argument("unknown option " + s);
     }
+    Require(a.width > 0u && a.height > 0u && a.drop_steps > 0u &&
+            (a.execution == "eager" || a.execution == "graph"), "invalid demo configuration");
+    Require(a.from_path.empty() || (a.perf_json.empty() && a.state_output.empty()),
+            "simulation measurements cannot be requested with --from");
+    Require(!a.probe || a.dump_path.empty(), "--probe does not collect render snapshots for --dump");
     return a;
 }
 
-// Per-drop-step simulation snapshots: the fluid particle field + the bunny pose,
-// enough to re-render any camera/material without re-simulating. Sim once (--dump),
-// iterate the render many times (--from).
+Json Distribution(const std::vector<double>& values, size_t begin, size_t end) {
+    std::vector<double> sorted(values.begin() + begin, values.begin() + end);
+    Json result = Json::Object();
+    result.Set("count", Json::Int(sorted.size()));
+    if (sorted.empty()) return result;
+    std::sort(sorted.begin(), sorted.end());
+    const auto percentile = [&](double p) { return sorted[static_cast<size_t>(p * (sorted.size() - 1u))]; };
+    result.Set("mean_ms", Json::Float(std::accumulate(sorted.begin(), sorted.end(), 0.0) / sorted.size()));
+    result.Set("p50_ms", Json::Float(percentile(0.5)));
+    result.Set("p95_ms", Json::Float(percentile(0.95)));
+    result.Set("p99_ms", Json::Float(percentile(0.99)));
+    result.Set("min_ms", Json::Float(sorted.front()));
+    result.Set("max_ms", Json::Float(sorted.back()));
+    return result;
+}
+
+class StepMeasurements {
+public:
+    StepMeasurements(nk::World& world, bool enabled) : world_(world), enabled_(enabled) {
+        if (!enabled_) return;
+        Require(std::strcmp(nphi::BackendName(world.Backend()), "cuda") == 0,
+                "completion timing requires the CUDA backend");
+        auto* backend = reinterpret_cast<nphi::CudaBackend*>(world.Backend());
+        CheckCuda(cudaSetDevice(backend->device_id));
+        stream_ = nphi::CudaBackendMainStream(backend);
+        CheckCuda(cudaEventCreate(&begin_));
+        const auto status = cudaEventCreate(&end_);
+        if (status != cudaSuccess) { cudaEventDestroy(begin_); CheckCuda(status); }
+    }
+    ~StepMeasurements() {
+        if (begin_) cudaEventDestroy(begin_);
+        if (end_) cudaEventDestroy(end_);
+    }
+    void Step() {
+        if (enabled_) CheckCuda(cudaEventRecord(begin_, stream_));
+        const auto start = Clock::now();
+        const auto status = world_.StepConfigured();
+        const double host_ms = Milliseconds(start);
+        if (status != nphi::Status::Ok) {
+            const auto& error = world_.LastExecutionError();
+            throw std::runtime_error("step failed, op " +
+                std::to_string(static_cast<unsigned>(error.failed_op)) + ": " + error.message);
+        }
+        if (!enabled_) return;
+        CheckCuda(cudaEventRecord(end_, stream_));
+        CheckCuda(cudaEventSynchronize(end_));
+        wall_ms_.push_back(Milliseconds(start));
+        float gpu_ms = 0.0f;
+        CheckCuda(cudaEventElapsedTime(&gpu_ms, begin_, end_));
+        gpu_ms_.push_back(gpu_ms);
+        host_ms_.push_back(host_ms);
+    }
+    Json Report(uint32_t settle_steps) const {
+        Json result = Json::Object();
+        result.Set("boundary", Json::Str("World step completion; uploads, downloads, quality scans and rendering excluded"));
+        for (unsigned phase = 0; phase < 2u; ++phase) {
+            const size_t begin = phase == 0u ? 0u : settle_steps;
+            const size_t end = phase == 0u ? settle_steps : gpu_ms_.size();
+            Json item = Json::Object();
+            item.Set("gpu_completion", Distribution(gpu_ms_, begin, end));
+            item.Set("host_call", Distribution(host_ms_, begin, end));
+            item.Set("synchronized_wall", Distribution(wall_ms_, begin, end));
+            result.Set(phase == 0u ? "settle" : "drop", std::move(item));
+        }
+        return result;
+    }
+private:
+    nk::World& world_;
+    bool enabled_;
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t begin_ = nullptr, end_ = nullptr;
+    std::vector<double> gpu_ms_, host_ms_, wall_ms_;
+};
+
+void HashBytes(uint64_t& hash, const void* data, size_t bytes) {
+    const auto* source = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < bytes; ++i) hash = (hash ^ source[i]) * 1099511628211ull;
+}
+
+std::string FormatHash(uint64_t hash) {
+    std::ostringstream text;
+    text << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return text.str();
+}
+
+void SaveState(nk::World& world, const std::string& path) {
+    if (path.empty()) return;
+    std::ofstream file(path, std::ios::binary);
+    const auto write = [&](const void* data, size_t bytes) {
+        file.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+        Require(file.good(), "cannot write " + path);
+    };
+    const std::array<nk::FieldId, 10> fields = {
+        nk::FieldId::ParticlePos, nk::FieldId::ParticleVel, nk::FieldId::ParticleF,
+        nk::FieldId::ParticleC, nk::FieldId::BodyPose, nk::FieldId::BodyLinearVelocity,
+        nk::FieldId::BodyAngularVelocity, nk::FieldId::MpmBodyReaction,
+        nk::FieldId::MpmBodyAngReaction, nk::FieldId::EnvStatus};
+    for (auto field : fields) {
+        const uint64_t size = world.GetModel().capacities.ElementCount(field) * nk::LayoutOf(field).elem_size;
+        Require(size > 0u, "missing state field");
+        std::vector<uint8_t> bytes(size);
+        Require(world.GetData().DownloadField(field, bytes.data(), bytes.size()), "state download failed");
+        const uint32_t id = static_cast<uint32_t>(field);
+        const uint64_t count = bytes.size();
+        write(&id, sizeof(id)); write(&count, sizeof(count)); write(bytes.data(), bytes.size());
+    }
+}
+
+// Particle positions and bunny poses can be saved and rendered independently.
 struct RenderData {
     std::vector<std::vector<Vec3>> fluid_snap;
     std::vector<Transform> pose_snap;
@@ -692,9 +805,7 @@ bool LoadSnap(const std::string& path, RenderData& rd) {
 
 }  // namespace
 
-// Runs the settle+drop simulation, capturing per-drop-step snapshots into `out`.
-// Returns <0 to proceed to render with the in-memory snapshots; >=0 to exit the
-// process with that code (probe verdict, dump-only success, or an init failure).
+// Run settling and release; return a process status or -1 to render snapshots.
 int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
            RenderData& out) {
     nphi::Device* dev = nphi::InitBestDevice();
@@ -703,19 +814,31 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
         std::fprintf(stderr, "[mpm_water_drop] no CUDA backend\n");
         return 2;
     }
+    std::unique_ptr<nphi::Backend, decltype(&nphi::BackendFree)> owner(backend, &nphi::BackendFree);
 
-    // The release height: drop kDropAbove above the rest surface. The rest surface
-    // is ~kPoolTopZ (the pool fill height); the bunny bottom starts bunny_half.z
-    // below its centroid, so place the centroid at rest_surface + half.z + kDropAbove.
+    // Place the bunny bottom above the initial pool surface by kDropAbove.
     const float release_z = kPoolTopZ + bunny_half.z + kDropAbove;
+    const auto cook_start = Clock::now();
     nk::Model model = BuildModel(release_z, bunny);
+    const double cook_ms = Milliseconds(cook_start);
     const uint32_t P = model.capacities.particles_per_env;
     const uint32_t B = model.capacities.bodies_per_env;
+    const auto create_start = Clock::now();
     nk::World world(std::move(model), 1u, dev, backend, Cfg());
     if (!world.Ready()) {
         std::fprintf(stderr, "[mpm_water_drop] world not ready\n");
         return 3;
     }
+    Require(world.Synchronize() == nphi::Status::Ok, "world creation did not complete");
+    const double create_ms = Milliseconds(create_start);
+    const auto capture_start = Clock::now();
+    Require(world.SetExecutionMode(args.execution == "graph" ? nk::World::ExecutionMode::Graph
+                                                            : nk::World::ExecutionMode::Eager) == nphi::Status::Ok,
+            "execution mode is unavailable");
+    if (args.execution == "graph")
+        Require(world.PrepareGraph() == nphi::Status::Ok, world.LastExecutionError().message);
+    const double capture_ms = Milliseconds(capture_start);
+    StepMeasurements measurements(world, !args.perf_json.empty());
     std::fprintf(stderr,
                  "[mpm_water_drop] fluid particles=%u bodies=%u substeps=%u K=%.1e visc=%.1f "
                  "dx=%.3f release_z=%.4f bunny_mass=%.2f\n",
@@ -726,9 +849,56 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
     std::vector<Vec3> fpos(P, Vec3::Zero());
     std::vector<Transform> body(B, Transform::Identity());
     std::vector<float> F(static_cast<size_t>(P) * 9u, 0.0f);
+    std::vector<Vec3> fvel(P), body_vel(B), body_omega(B), body_reaction(B);
+    uint32_t status_union = 0u;
+    uint64_t trajectory_hash = 14695981039346656037ull;
+    float min_J = 1e30f, max_J = -1e30f;
+    double current_volume_ratio = 1.0, max_volume_ratio_error = 0.0;
+    double fluid_kinetic_j = 0.0;
+    bool nonfinite = false;
+    Json samples = Json::Array();
     auto download = [&] {
-        d.DownloadField(nk::FieldId::ParticlePos, fpos.data(), P * sizeof(Vec3));
-        d.DownloadField(nk::FieldId::BodyPose, body.data(), B * sizeof(Transform));
+        const auto read = [&](nk::FieldId field, void* target, size_t bytes) {
+            Require(d.DownloadField(field, target, bytes), std::string("download failed: ") + nk::FieldName(field));
+        };
+        read(nk::FieldId::ParticlePos, fpos.data(), fpos.size() * sizeof(Vec3));
+        read(nk::FieldId::ParticleVel, fvel.data(), fvel.size() * sizeof(Vec3));
+        read(nk::FieldId::BodyPose, body.data(), body.size() * sizeof(Transform));
+        read(nk::FieldId::BodyLinearVelocity, body_vel.data(), body_vel.size() * sizeof(Vec3));
+        read(nk::FieldId::BodyAngularVelocity, body_omega.data(), body_omega.size() * sizeof(Vec3));
+        read(nk::FieldId::MpmBodyReaction, body_reaction.data(), body_reaction.size() * sizeof(Vec3));
+        read(nk::FieldId::ParticleF, F.data(), F.size() * sizeof(float));
+        uint32_t status = 0u;
+        read(nk::FieldId::EnvStatus, &status, sizeof(status));
+        status_union |= status;
+        double sum_J = 0.0, sum_v2 = 0.0;
+        const auto finite_vec = [](const Vec3& v) {
+            return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+        };
+        for (uint32_t i = 0; i < P; ++i) {
+            const float J = Det3(&F[static_cast<size_t>(i) * 9u]);
+            nonfinite |= !finite_vec(fpos[i]) || !finite_vec(fvel[i]) || !std::isfinite(J);
+            min_J = std::min(min_J, J); max_J = std::max(max_J, J);
+            sum_J += J;
+            sum_v2 += static_cast<double>(fvel[i].LengthSq());
+        }
+        for (uint32_t i = 0; i < B; ++i)
+            nonfinite |= !finite_vec(body[i].position) || !finite_vec(body_vel[i]) ||
+                         !finite_vec(body_omega[i]) || !finite_vec(body_reaction[i]);
+        current_volume_ratio = sum_J / P;
+        max_volume_ratio_error = std::max(max_volume_ratio_error, std::abs(current_volume_ratio - 1.0));
+        const double pdx = kDx * 0.5;
+        fluid_kinetic_j = 0.5 * kDensity * pdx * pdx * pdx * sum_v2;
+        if (!args.perf_json.empty()) {
+            HashBytes(trajectory_hash, fpos.data(), fpos.size() * sizeof(Vec3));
+            HashBytes(trajectory_hash, fvel.data(), fvel.size() * sizeof(Vec3));
+            HashBytes(trajectory_hash, F.data(), F.size() * sizeof(float));
+            HashBytes(trajectory_hash, body.data(), body.size() * sizeof(Transform));
+            HashBytes(trajectory_hash, body_vel.data(), body_vel.size() * sizeof(Vec3));
+            HashBytes(trajectory_hash, body_omega.data(), body_omega.size() * sizeof(Vec3));
+            HashBytes(trajectory_hash, body_reaction.data(), body_reaction.size() * sizeof(Vec3));
+            HashBytes(trajectory_hash, &status, sizeof(status));
+        }
     };
     // Pin the bunny (body 0) at a pose with zero velocity each step: its SDF stays out
     // of the pool while the fluid settles, then it is released into free fall.
@@ -737,9 +907,9 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
     auto hold_box = [&](const Vec3& at) {
         Transform tf = Transform::Identity(); tf.position = at;
         const Vec3 zero = Vec3::Zero();
-        d.UploadField(nk::FieldId::BodyPose, &tf, sizeof(Transform), pose_off);
-        d.UploadField(nk::FieldId::BodyLinearVelocity, &zero, sizeof(Vec3), vec3_off);
-        d.UploadField(nk::FieldId::BodyAngularVelocity, &zero, sizeof(Vec3), vec3_off);
+        Require(d.UploadField(nk::FieldId::BodyPose, &tf, sizeof(Transform), pose_off), "pose upload failed");
+        Require(d.UploadField(nk::FieldId::BodyLinearVelocity, &zero, sizeof(Vec3), vec3_off), "velocity upload failed");
+        Require(d.UploadField(nk::FieldId::BodyAngularVelocity, &zero, sizeof(Vec3), vec3_off), "angular velocity upload failed");
     };
 
     // SETTLE: hold the bunny parked high so its SDF stays clear of the pool while the
@@ -747,14 +917,15 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
     const uint32_t kSettleSteps = args.settle_steps;
     for (uint32_t s = 0; s < kSettleSteps; ++s) {
         hold_box(Vec3{0.0f, 0.0f, release_z});
-        world.Step();
+        measurements.Step();
+        download();
         if (s % 50u == 0u) {
-            download();
             std::fprintf(stderr, "[mpm_water_drop] settle s=%u surf_max=%.4f box_z=%.4f\n",
                          s, SurfaceMaxZ(fpos, P), body[0].position.z);
         }
     }
-    download();
+    if (kSettleSteps == 0u) download();
+    const double settled_volume_ratio = current_volume_ratio;
     const float rest_surface = RestSurfaceZ(fpos, P);
     std::fprintf(stderr, "[mpm_water_drop] settled rest_surface=%.4f (max_z=%.4f) box_z=%.4f\n",
                  rest_surface, SurfaceMaxZ(fpos, P), body[0].position.z);
@@ -776,17 +947,16 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
     float peak_surface = rest_surface, box_min_z = 1.0e9f, min_vz = 0.0f;
     float max_splash_z = -1e9f, max_react = 0.0f;
     uint32_t max_splash_count = 0u, peak_splash_step = 0u, escape = 0u;
-    float min_J = 1e30f, max_J = -1e30f;
-    bool nonfinite = false, decel = false;
+    bool decel = false;
     float prev_vz = 0.0f;
 
     Vec3 lin_vel{0, 0, 0}, reaction{0, 0, 0};
 
     for (uint32_t s = 0; s < kDropSteps; ++s) {
-        world.Step();
+        measurements.Step();
         download();
-        d.DownloadField(nk::FieldId::BodyLinearVelocity, &lin_vel, sizeof(Vec3));
-        d.DownloadField(nk::FieldId::MpmBodyReaction, &reaction, sizeof(Vec3));
+        lin_vel = body_vel[0];
+        reaction = body_reaction[0];
         const float box_z = body[0].position.z;
         const float surf = SurfaceMaxZ(fpos, P);
         uint32_t sc; float smz;
@@ -801,20 +971,17 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
         prev_vz = lin_vel.z;
         nonfinite = nonfinite || !std::isfinite(box_z) || !std::isfinite(lin_vel.z) ||
                     !std::isfinite(surf);
-        uint32_t st = 0u;
-        d.DownloadField(nk::FieldId::EnvStatus, &st, sizeof(uint32_t));
-        escape |= st & nphi::kEnvStatusMpmGridEscape;
-        // The full-particle finiteness + J bound scan is periodic (the dominant host
-        // cost over 23k particles); the per-step surf/splash/reaction track every step.
+        escape = status_union & nphi::kEnvStatusMpmGridEscape;
         if (s % 15u == 0u || s + 1u == kDropSteps) {
-            for (uint32_t i = 0; i < P; ++i)
-                nonfinite = nonfinite ||
-                    !(std::isfinite(fpos[i].x) && std::isfinite(fpos[i].y) && std::isfinite(fpos[i].z));
-            d.DownloadField(nk::FieldId::ParticleF, F.data(), F.size() * sizeof(float));
-            for (uint32_t i = 0; i < P; ++i) {
-                const float J = Det3(&F[static_cast<size_t>(i) * 9u]);
-                min_J = std::min(min_J, J); max_J = std::max(max_J, J);
-            }
+            Json sample = Json::Object();
+            sample.Set("drop_step", Json::Int(s));
+            sample.Set("bunny_z_m", Json::Float(box_z));
+            sample.Set("bunny_vz_m_s", Json::Float(lin_vel.z));
+            sample.Set("reaction_z_Ns", Json::Float(reaction.z));
+            sample.Set("volume_ratio", Json::Float(current_volume_ratio));
+            sample.Set("fluid_kinetic_J", Json::Float(fluid_kinetic_j));
+            sample.Set("surface_max_z_m", Json::Float(surf));
+            samples.PushBack(std::move(sample));
             std::fprintf(stderr,
                          "[mpm_water_drop] drop s=%u box_z=%.4f vz=%.3f surf=%.4f splash=%u "
                          "react=%.3e minJ=%.3f maxJ=%.3f escape=%u\n",
@@ -841,6 +1008,63 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
     out.rest_surface = rest_surface;
     out.peak_splash_step = peak_splash_step;
     out.particle_count = P;
+    const bool splash = max_splash_count >= 20u && (max_splash_z - rest_surface) > 0.04f;
+    const bool two_way = max_react > 1e-4f && decel;
+    const bool stable = !nonfinite && escape == 0u && min_J > 0.0f;
+    const bool submerged = box_min_z < rest_surface - 0.5f * bunny_half.z;
+    const bool volume_ok = max_volume_ratio_error <= 0.05;
+    const bool status_ok = (status_union & ~nphi::kEnvStatusMpmOneWayBody) == 0u;
+    const bool ok = splash && two_way && stable && submerged && volume_ok && status_ok;
+    SaveState(world, args.state_output);
+    if (!args.perf_json.empty()) {
+        Json report = Json::Object(), configuration = Json::Object(), quality = Json::Object();
+        report.Set("schema_version", Json::Int(1));
+        report.Set("scene", Json::Str("mpm-bunny-water"));
+        configuration.Set("execution", Json::Str(args.execution));
+        configuration.Set("envs", Json::Int(world.EnvCount()));
+        configuration.Set("particles", Json::Int(P));
+        configuration.Set("grid_nodes", Json::Int(world.GetModel().capacities.mpm_grid_nodes_per_env));
+        configuration.Set("substeps", Json::Int(kSubsteps));
+        configuration.Set("dt", Json::Float(Cfg().dt));
+        configuration.Set("dx", Json::Float(kDx));
+        configuration.Set("bulk_modulus", Json::Float(kBulk));
+        configuration.Set("viscosity", Json::Float(kViscosity));
+        configuration.Set("settle_steps", Json::Int(kSettleSteps));
+        configuration.Set("drop_steps", Json::Int(kDropSteps));
+        report.Set("config", std::move(configuration));
+        report.Set("cook_ms", Json::Float(cook_ms));
+        report.Set("create_ms", Json::Float(create_ms));
+        report.Set("capture_ms", Json::Float(capture_ms));
+        report.Set("timing", measurements.Report(kSettleSteps));
+        uint64_t model_bytes = 0u, arena_bytes[3]{};
+        world.GetModel().ComputeModelSegments(&model_bytes);
+        nk::Arena::ComputeSegments(world.GetModel().capacities, arena_bytes);
+        Json memory = Json::Object();
+        memory.Set("data_bytes", Json::Int(arena_bytes[0] + arena_bytes[1] + arena_bytes[2]));
+        memory.Set("model_bytes", Json::Int(model_bytes));
+        report.Set("memory", std::move(memory));
+        quality.Set("finite", Json::Bool(!nonfinite));
+        quality.Set("env_status_union", Json::Int(status_union));
+        quality.Set("trajectory_fnv1a64", Json::Str(FormatHash(trajectory_hash)));
+        quality.Set("trajectory_scope", Json::Str("all settle/drop particle position, velocity, F; body pose, velocities and reaction; status"));
+        quality.Set("min_J", Json::Float(min_J));
+        quality.Set("max_J", Json::Float(max_J));
+        quality.Set("settled_volume_ratio", Json::Float(settled_volume_ratio));
+        quality.Set("max_volume_ratio_error", Json::Float(max_volume_ratio_error));
+        quality.Set("volume_ratio_error_limit", Json::Float(0.05));
+        quality.Set("samples", std::move(samples));
+        quality.Set("splash", Json::Bool(splash));
+        quality.Set("two_way_response", Json::Bool(two_way));
+        quality.Set("submerged", Json::Bool(submerged));
+        quality.Set("coupling_complete", Json::Bool(false));
+        quality.Set("coupling_scope", Json::Str("SDF bunny; static plane duplicates the MPM grid floor; single owner; finite-mass and articulation feedback remain incomplete"));
+        report.Set("quality", std::move(quality));
+        Json status = Json::Object();
+        status.Set("valid", Json::Bool(ok));
+        status.Set("scope", Json::Str("this configured SDF-bunny/grid-boundary workload; not general coupling acceptance"));
+        report.Set("status", std::move(status));
+        WriteJson(args.perf_json, report);
+    }
     if (!args.dump_path.empty()) {
         const bool ok = DumpSnap(args.dump_path, out);
         std::fprintf(stderr, "[mpm_water_drop] DUMP %s %zu frames (P=%u) -> %s\n",
@@ -849,24 +1073,19 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
     }
 
     if (args.probe) {
-        const bool splash = max_splash_count >= 20u && (max_splash_z - rest_surface) > 0.04f;
-        const bool two_way = max_react > 1e-4f && decel;
-        const bool stable = !nonfinite && escape == 0u && min_J > 0.5f && max_J <= 3.0f;
-        const bool submerged = box_min_z < rest_surface - 0.5f * bunny_half.z;
-        const bool ok = splash && two_way && stable && submerged;
         std::fprintf(stderr,
-                     "[mpm_water_drop] PROBE %s splash=%d two_way=%d stable=%d submerged=%d\n",
-                     ok ? "PASS" : "FAIL", splash, two_way, stable, submerged);
+                     "[mpm_water_drop] PROBE %s splash=%d two_way=%d stable=%d submerged=%d volume=%d status=%u\n",
+                     ok ? "PASS" : "FAIL", splash, two_way, stable, submerged, volume_ok, status_union);
         return ok ? 0 : 5;
     }
     return -1;
 }
 
-int main(int argc, char** argv) {
-    const Args args = ParseArgs(argc, argv);
+int RunDemo(const Args& args) {
     const std::string bunny_path =
         std::string(NUKA_SOURCE_DIR) + "/.nuka-assets/stanford/bunny.obj";
     const soft::TriMesh bunny = LoadBunnyMesh(bunny_path);
+    Require(!bunny.positions.empty() && !bunny.triangles.empty(), "bunny mesh is unavailable: " + bunny_path);
     const Vec3 bunny_half = BunnyHalfExtents(bunny);
     std::fprintf(stderr, "[mpm_water_drop] bunny verts=%zu tris=%zu half=(%.4f,%.4f,%.4f)\n",
                  bunny.positions.size(), bunny.triangles.size() / 3u,
@@ -925,10 +1144,7 @@ int main(int argc, char** argv) {
     pool_cp.x = 0.0f; pool_cp.y = 0.0f; pool_cp.radius = kFluidHalfXY * 1.05f; pool_cp.strength = 0.40f;
     opts.contact_points.push_back(pool_cp);
 
-    // Low grazing hero camera aimed at the water surface: a near-eye-level angle makes
-    // the surface Fresnel-reflect the sky (reads as water), lets the crown/jet rise
-    // visibly, and rakes light across the radiating ripple rings. Bunny drops in from
-    // the top of frame. Gentle orbit keeps the hero angle.
+    // A low camera angle shows the water reflection and splash with a gentle orbit.
     const Vec3 look{0.0f, 0.0f, rest_surface + 0.05f};
     const float cam_r = kFluidHalfXY * 3.7f;
     const float cam_elev = 20.0f * kPi / 180.0f;
@@ -987,4 +1203,20 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "[mpm_water_drop] DONE -> %s\n", args.png_dir.c_str());
     return 0;
+}
+
+int main(int argc, char** argv) {
+    Args args;
+    try {
+        args = ParseArgs(argc, argv);
+        return RunDemo(args);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[mpm_water_drop] %s\n", error.what());
+        Json report = Json::Object(), status = Json::Object();
+        status.Set("valid", Json::Bool(false));
+        status.Set("error", Json::Str(error.what()));
+        report.Set("status", std::move(status));
+        try { WriteJson(args.perf_json, report); } catch (...) {}
+        return 2;
+    }
 }

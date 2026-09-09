@@ -1,23 +1,5 @@
-// ---------------------------------------------------------------------------
-// MLS-MPM continuum step (APIC; Hu et al. 2018) — the umbrella MpmStep op.
-//
-// ONE registered op whose body iterates a substep loop of file-local kernels:
-//   clear -> P2G (mass + APIC momentum + constitutive node force) -> grid update
-//   (gravity + momentum->velocity normalize + static-plane BC) -> G2P (recover
-//   v_p + affine C_p; advect x_p; write the final particle_vel) -> F-update.
-// The medium couples to the floor entirely through the static-plane grid BC; the
-// G2P velocity IS the particle's final velocity (no dv-compose — the row path's).
-//
-// Determinism: particles are radix-sorted by env-offset MPM cell key, then each
-// grid node sums its 3^3-stencil particle contributions in the sorted order. The
-// __fadd_rn pins the accumulation ORDER (run-to-run deterministic); inner products
-// stay FMA-contractible (compile-time deterministic). The grid is env-private
-// (env-offset node keys) so replicated envs never cross-couple.
-//
-// The constitutive P(F) (fixed-corotated / Neo-Hookean elastic) is computed from a
-// self-written deterministic 3x3 SVD (fixed iteration count, no data-dependent
-// branch) so the node force is D1.
-// ---------------------------------------------------------------------------
+// MLS-MPM transfers APIC momentum and constitutive stress through environment-private grids.
+// Stable cell sorting and ordered gathers keep particle and body accumulation deterministic.
 
 #include <climits>
 #include <cstdio>
@@ -49,9 +31,8 @@ namespace {
 namespace m = ::nuka::math;
 constexpr uint32_t kBlockSize = 128u;
 
-// Opt-in stage timer for the reusable end-to-end solver profiler. Production is
-// a true no-op unless NUKA_MPM_TIMING is set; profiling uses ordinary Step(), not
-// CUDA-graph capture, and reports each substage amortized per World::Step.
+// NUKA_MPM_TIMING enables synchronous eager stage timing, amortized per World::Step.
+// Leave it disabled for ordinary execution and graph capture.
 enum class MpmStage : uint32_t {
     GridPrepare,
     CellKeys,
@@ -157,15 +138,10 @@ struct MpmProfiler {
     }
 };
 
-// Smallest node mass the momentum->velocity divide is float-stable for. A node
-// reached only by denormal-tiny stencil-weight products (a particle sitting at an
-// exact cell center rounds one axis weight to ~eps^2) otherwise divides by a
-// denormal -> inf/NaN velocity that G2P then spreads. Such a node holds no matter.
+// A normal mass keeps momentum normalization from dividing by a denormal.
 constexpr float kMinNodeMass = 1.0e-30f;
 
-// MLS-MPM material-table row stride (f32 per row). Must match
-// MpmMaterial::kValueCount: youngs poisson density dp_friction dp_cohesion
-// model_kind | bulk_modulus tait_gamma viscosity.
+// Packed material rows follow MpmMaterial::kValueCount.
 constexpr uint32_t kMpmMatStride = 9u;
 
 // Round up to the 256B section alignment the Arena lays scratch out at, so every
@@ -175,11 +151,7 @@ inline __host__ uint64_t AlignScratch(uint64_t v) {
     return (v + (kScratchAlign - 1u)) & ~(kScratchAlign - 1u);
 }
 
-// CUB keeps the original keys while ordering only the requested bit range.
-// Particle-cell keys occupy [0,total_cells); body owners occupy
-// [0,total_bodies), while ~0u is the inactive sentinel. Enough low bits to
-// represent the inclusive maximum therefore preserve the exact unsigned order
-// and avoid passes over high bits that carry no information.
+// Retain enough low bits to sort valid cell/body keys before the ~0u sentinel.
 inline __host__ int RadixBitsInclusive(uint32_t max_key) {
     int bits = 0;
     do {
@@ -189,10 +161,8 @@ inline __host__ int RadixBitsInclusive(uint32_t max_key) {
     return bits;
 }
 
-// 256B-aligned partition of mpm_sort_scratch [cub temp | keys-out | idx-out].
-// P2G particle sorting, active-node selection, and body-reaction node sorting use
-// it sequentially. World sizes the segment for the larger item count; every phase
-// uses that common layout so cub temp can never overlap live sorted-particle output.
+// Sorting and selection share aligned temporary storage sized for the larger item count.
+// Sorted outputs remain outside the CUB temporary region.
 struct MpmSortScratchLayout {
     uint64_t temp_bytes = 0u;     // cub radix-sort temp-storage region size.
     uint64_t keys_off   = 0u;     // byte offset of the sorted-keys out buffer.
@@ -219,10 +189,7 @@ struct MpmSortScratchLayout {
     }
 };
 
-// ===========================================================================
-// File-local 3x3 helpers (row-major float[9]; the particle_F/C packing) and a
-// deterministic SVD/polar for the constitutive stress.
-// ===========================================================================
+// Row-major 3x3 algebra matches particle_F/C packing.
 
 // C = A * B (row-major 3x3).
 __device__ __forceinline__ void Mat3Mul(const float* A, const float* B, float* C) {
@@ -266,10 +233,7 @@ __device__ __forceinline__ bool Mat3InvTranspose(const float* F, float* out, flo
     return true;
 }
 
-// One symmetric Jacobi rotation zeroing S(p,q): rotate columns p,q of S and
-// accumulate into V (the eigenvectors). Fixed-angle, no data-dependent branch on
-// magnitude (a sub-tolerance off-diagonal yields a ~identity rotation), so the
-// sweep count is constant -> the decomposition is bit-reproducible (D1).
+// One symmetric Jacobi rotation eliminates S(p,q) and accumulates eigenvectors in V.
 __device__ __forceinline__ void JacobiRotate(float* S, float* V, int p, int q) {
     const float spq = S[p * 3 + q];
     if (spq == 0.0f) return;
@@ -294,10 +258,8 @@ __device__ __forceinline__ void JacobiRotate(float* S, float* V, int p, int q) {
     }
 }
 
-// Deterministic 3x3 SVD F = U * diag(sig) * V^T. Symmetric-eigen on A = F^T F via a
-// fixed 8-sweep Jacobi (V = eigenvectors, sig^2 = eigenvalues), then U = F V / sig.
-// A near-zero singular value falls back to the corresponding V column so U stays a
-// rotation (the cell is degenerate; the stress there is ~0).
+// Eight Jacobi sweeps decompose F^T F; U = F V / sig completes the SVD.
+// Near-zero singular values use the corresponding V column.
 __device__ __forceinline__ void Svd3(const float* F, float* U, float* sig, float* V) {
     float A[9];
     // A := F^T F (symmetric); its eigenvectors are the right singular vectors V.
@@ -339,10 +301,8 @@ __device__ __forceinline__ void Svd3(const float* F, float* U, float* sig, float
     }
 }
 
-// First Piola-Kirchhoff stress P(F). Fixed-corotated (Stomakhin 2012):
-// P = 2*mu*(F - R) + lambda*(J-1)*J*F^{-T}, R = U V^T from the SVD. Neo-Hookean
-// (model_kind==2 elastic alternative): P = mu*(F - F^{-T}) + lambda*log(J)*F^{-T}.
-// Row-major float[9]; mu/lambda are the Lame moduli.
+// First Piola-Kirchhoff stress for fixed-corotated and Neo-Hookean elasticity.
+// mu/lambda are the Lame moduli; matrices use row-major float[9] storage.
 __device__ __forceinline__ void FirstPiola(const float* F, float mu, float lambda,
                                            float model_kind, float* P) {
     const float J = Mat3Det(F);
@@ -363,16 +323,11 @@ __device__ __forceinline__ void FirstPiola(const float* F, float mu, float lambd
         P[k] = 2.0f * mu * (F[k] - R[k]) + coef * FinvT[k];
 }
 
-// Elastic Hencky-strain cap: sand's recoverable strain is a few percent; anything
-// past it is absorbed plastically (grain rearrangement). This BOUNDS the stress a
-// degenerate rim/impact F can emit (the fluid J-floor's philosophy), so a
-// near-massless boundary node never receives a runaway kick.
+// Granular stress and stored elastic deformation share this Hencky-strain bound.
 constexpr float kSandHenckyCap = 0.15f;
 
-// Granular Kirchhoff stress (Klar et al. 2016, "Drucker-Prager Elastoplasticity for
-// Sand Animation"): Hencky (log-strain) St.-Venant-Kirchhoff elasticity on the stored
-// elastic F. tau = U diag(2*mu*eps + lambda*tr(eps)) U^T, eps_i = ln(sig_i). This IS
-// the P*F^T the MLS node force wants; the reflection sign in U cancels in the product.
+// Hencky elasticity: tau = U diag(2*mu*eps + lambda*tr(eps)) U^T.
+// eps_i = ln(sig_i) uses the stored elastic deformation.
 __device__ __forceinline__ void GranularKirchhoff(const float* F, float mu,
                                                   float lambda, float* stress) {
     float U[9], sig[3], V[9];
@@ -392,12 +347,8 @@ __device__ __forceinline__ void GranularKirchhoff(const float* F, float mu,
                                 U[r * 3 + 2] * tau[2] * U[c * 3 + 2];
 }
 
-// Drucker-Prager return map on the trial elastic F (Klar et al. 2016, Box 3). Projects
-// the principal Hencky strains onto the yield cone: expansion past the cohesion apex ->
-// stress-free apex (discards the volumetric plastic strain, the standard sand model, no
-// hardening/volume-correction here), shear past the cone -> radial return, inside ->
-// elastic. friction_deg = internal friction angle (deg), cohesion = a stress that
-// shifts the apex into tension. cohesion 0 recovers the cohesionless sand map.
+// Drucker-Prager return mapping of principal Hencky strains (Klar et al. 2016).
+// Cohesion shifts the tensile apex; friction_deg sets the yield-cone angle.
 __device__ __forceinline__ void SandReturnMap(float* F, float mu, float lambda,
                                              float friction_deg, float cohesion) {
     float U[9], sig[3], V[9];
@@ -450,9 +401,7 @@ struct Bspline {
 __device__ __forceinline__ Bspline QuadWeights(float gx) {
     // base = floor(gx - 0.5); fx in [0.5, 1.5) is the offset from base.
     Bspline b;
-    // Non-finite coords saturate floor's float->int cast at INT_MAX, which would
-    // overflow the 32-bit stencil math below; park them on a node every bounds
-    // check rejects.
+    // Invalid coordinates use a base outside every grid stencil.
     b.base = isfinite(gx) ? static_cast<int64_t>(floorf(gx - 0.5f)) : -0x40000000;
     const float fx = gx - static_cast<float>(b.base);
     b.w[0] = 0.5f * (1.5f - fx) * (1.5f - fx);
@@ -462,10 +411,8 @@ __device__ __forceinline__ Bspline QuadWeights(float gx) {
     return b;
 }
 
-// Per-env grid node id from integer node coords (env-offset for env-private grids).
-// Coordinates are 64-bit: callers add stencil offsets to values that can saturate
-// near INT_MAX, and 32-bit signed overflow would corrupt both the bounds check
-// and the address math.
+// Use 64-bit coordinates so stencil offsets cannot overflow the bounds check.
+// Each environment occupies a separate contiguous node range.
 __device__ __forceinline__ int64_t NodeId(uint32_t env, int64_t ix, int64_t iy,
                                           int64_t iz, const uint32_t dims[3],
                                           uint32_t nodes_per_env) {
@@ -487,9 +434,7 @@ __global__ void MpmClearEscapeBitKernel(uint32_t* env_status, uint32_t env_count
     env_status[e] &= ~kEnvStatusMpmGridEscape;
 }
 
-// Zero the per-body reaction probes once per step so they hold the impulse summed
-// over THIS step's substeps (linear = balance diagnostic; angular = the deposit
-// torque the per-articulation M^-1 J^T pass consumes).
+// Per-body reaction probes accumulate linear/angular impulse over all substeps.
 __global__ void MpmClearBodyReactionKernel(uint32_t total_bodies, m::Vec3* reaction,
                                           m::Vec3* ang_reaction) {
     const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -498,11 +443,7 @@ __global__ void MpmClearBodyReactionKernel(uint32_t total_bodies, m::Vec3* react
     if (ang_reaction != nullptr) ang_reaction[b] = m::Vec3::Zero();
 }
 
-// --- cell key (the particle's base-node cell, env-offset) -------------------
-// Map an MPM-slice thread t in [0, mpm_count) to (env, global particle index). The
-// MPM slice is [0, mpm_per_env) inside each Ppe-strided env, so global = env*Ppe +
-// (t - env*mpm_per_env). For a lone MPM medium mpm_per_env == Ppe -> global == t
-// (byte-identical to the old contiguous [0, Np) launch).
+// Map a compact MPM index to the low particle slice of its environment.
 __device__ __forceinline__ uint32_t MpmSliceGlobal(uint32_t t, uint32_t mpm_per_env,
                                                    uint32_t ppe, uint32_t& env_out) {
     const uint32_t env = t / mpm_per_env;
@@ -510,10 +451,7 @@ __device__ __forceinline__ uint32_t MpmSliceGlobal(uint32_t t, uint32_t mpm_per_
     return env * ppe + (t - env * mpm_per_env);
 }
 
-// Constitutive stress is a particle property during one substep. Precompute the
-// same row-major Kirchhoff stress the gather formerly rebuilt for every destination
-// node; storing/reloading f32 preserves the exact values while retiring ~27 repeated
-// SVD/polar evaluations per interior particle.
+// Compute each particle's Kirchhoff stress once per substep for all destination nodes.
 __global__ void MpmPrecomputeStressKernel(
     uint32_t mpm_count, uint32_t particles_per_env, uint32_t mpm_per_env,
     const float* __restrict__ part_C, const float* __restrict__ part_F,
@@ -633,11 +571,8 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
     }
 }
 
-// Sparse-P2G preparation. The gather writes only active nodes, so clear the mass
-// field first; every active node overwrites momentum in P2G, while inactive nodes
-// take GridUpdate's mass==0 branch and never consume stale momentum. GridUpdate
-// subsequently overwrites every velocity. grid_body_owner is unused until
-// BodyProject and serves as the active-node flags.
+// Clear mass before active P2G overwrites momentum; zero-mass nodes ignore stale momentum.
+// grid_body_owner temporarily stores active flags until body projection.
 __global__ void MpmGridPrepareKernel(uint32_t total_nodes,
                                      float* __restrict__ grid_mass,
                                      uint32_t* __restrict__ active_node_flags,
@@ -649,9 +584,7 @@ __global__ void MpmGridPrepareKernel(uint32_t total_nodes,
     cell_start[i] = ~0u;
 }
 
-// Convert the stable cell-key sort to an O(1) lookup table. Exactly one sorted
-// position owns each run boundary, so the writes are race-free and the stored
-// [start,end) interval preserves the original stable particle order.
+// Each sorted run owns its [start,end) boundaries, preserving stable particle order.
 __global__ void MpmBuildCellRangesKernel(
     uint32_t particle_count, const uint32_t* __restrict__ sorted_keys,
     uint32_t total_cells, uint32_t* __restrict__ cell_start,
@@ -665,12 +598,8 @@ __global__ void MpmBuildCellRangesKernel(
         cell_end[key] = s + 1u;
 }
 
-// --- P2G deterministic gather (one thread per grid node) --------------------
-// Node i sums the contributions of every particle whose 3^3 stencil includes i,
-// i.e. particles whose base cell lies in [i-2, i] per axis. The sorted particle
-// stream (by env-offset cell key) is scanned per candidate cell in a fixed order
-// with __fadd_rn -> bit-reproducible run-to-run (NO atomics). Accumulates mass +
-// APIC momentum + the constitutive node force -N_i*V0*(4/dx^2)*P(F)*F^T*(x_i-x_p).
+// Each node gathers mass, APIC momentum and stress impulse from base cells in [i-2,i].
+// Stable particle order and explicit rounded sums make the accumulation deterministic.
 __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                                    const uint32_t* __restrict__ active_nodes,
                                    const uint32_t* __restrict__ active_node_count,
@@ -770,11 +699,7 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
     grid_momentum[node] = mom;
 }
 
-// --- grid update: gravity kick + momentum->velocity normalize + static-plane BC -
-// One thread per node. m*v_hat = m*v + dt*(m*g) (the constitutive impulse was
-// folded into momentum in P2G); normalize; then project velocity against the static
-// floor plane (no-penetration normal + Coulomb friction). The plane is static so
-// its surface velocity is zero -> no grid->body reaction (the dynamic body is later).
+// Normalize momentum, add gravity and project against the static frictional floor.
 __global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env,
                                     uint32_t dims_x, uint32_t dims_y, float dx,
                                     m::Vec3 origin, m::Vec3 gravity, float dt,
@@ -808,10 +733,7 @@ __global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env
             }
         }
     }
-    // Separating domain-wall BC on the OUTERMOST x/y boundary node ring: cut only the
-    // OUTWARD-normal velocity (a node never pushed past the grid box). A no-op for any
-    // scene whose mass stays >= 2 cells off the x/y faces (a massless ring node returns
-    // above); the elastic gates' >= 4*dx margin keeps those nodes massless.
+    // The outer x/y node ring removes outward velocity at separating domain walls.
     const int32_t hx = static_cast<int32_t>(dims_x) - 1;
     const int32_t hy = static_cast<int32_t>(dims_y) - 1;
     if (nx == 0 && v.x < 0.0f) v.x = 0.0f;
@@ -937,9 +859,7 @@ __global__ void MpmGridBodyProjectKernel(
     }
 }
 
-// grid_mass is dead after body projection in this substep (G2P reads velocity only),
-// so its equally sized/aligned u32 storage becomes the stable-sort node-id input.
-// The next substep's P2G overwrites every mass element before it is read again.
+// Node sorting aliases grid_mass after projection; the next P2G overwrites that storage.
 __global__ void MpmInitNodeIdsKernel(uint32_t total_nodes,
                                      uint32_t* __restrict__ node_ids) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1027,10 +947,8 @@ __global__ void MpmGridBodyReactKernel(
     }
 }
 
-// One thread per ARTICULATION. Loops its link bodies in ascending global-row order,
-// chain-walks each link's grid reaction wrench into the generalized force g, sums,
-// applies M^-1 once, and seeds qdot_flat[tile] += M^-1 J^T wrench. Single writer per
-// tile (Go2's 4 feet share one tile) -> race-free + deterministic (fixed order).
+// One thread gathers owned link wrenches in body order and applies M^-1 J^T.
+// Each articulation tile has a single writer.
 __global__ void MpmArticReactDepositKernel(
     nkops::ArticulationDeviceState state, uint32_t artic_count, uint32_t artics_per_env,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t max_dof,
@@ -1089,10 +1007,8 @@ __global__ void MpmArticReactDepositKernel(
     }
 }
 
-// --- G2P gather (one thread per particle; race-free, naturally D1) ----------
-// v_p = sum_i N_i v_i; C_p = (4/dx^2) sum_i N_i v_i (x_i - x_p)^T (the MLS fit).
-// Advects x_p += dt*v_p and writes the recovered v_p DIRECTLY into particle_vel
-// (the MPM particle's final velocity — no finalize dv-compose).
+// G2P recovers v_p and the MLS affine fit C_p, then advects x_p by dt*v_p.
+// particle_vel owns the resulting MPM velocity without a row-finalize increment.
 __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
                                    uint32_t particles_per_env, uint32_t mpm_per_env,
                                    uint32_t nodes_per_env,
@@ -1154,9 +1070,8 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
     part_pos[p] = np;
 }
 
-// --- F-update: elastic F^{n+1} = (I + dt*C) F^n; fluid (kind 3) tracks volume off the
-// divergence J *= (1 + dt*tr C), keeping F = cbrt(J)*I (no shear-driven inversion);
-// granular (kind 4) predicts the elastic F then Drucker-Prager return-maps it (plastic).
+// Elastic F follows the affine map; fluids retain only its divergence-driven volume.
+// Granular materials return-map the trial elastic deformation.
 __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
                                  const float* __restrict__ part_C,
                                  const uint32_t* __restrict__ part_mat,
@@ -1194,11 +1109,12 @@ __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
         // Shear leaves a fluid's volume unchanged, so track J off the divergence tr(C);
         // no det of the full affine map => no shear-driven inversion at a hard impact.
         const float Jraw = Mat3Det(F) * (1.0f + dt * (C[0] + C[4] + C[8]));
-        if (Jraw <= 0.0f && env_status != nullptr)
-            atomicOr(&env_status[p / particles_per_env], kEnvStatusMpmGridEscape);
-        // Floor/ceil J so an explicit overshoot stays finite and self-recovers (water
-        // is near-incompressible; J leaves [0.83,1.01] only on a transient overshoot).
-        const float s = cbrtf(fminf(fmaxf(Jraw, 0.3f), 3.0f));
+        if (!(Jraw > 0.0f) || !isfinite(Jraw)) {
+            if (env_status != nullptr)
+                atomicOr(&env_status[p / particles_per_env], kEnvStatusMpmGridEscape);
+            return;
+        }
+        const float s = cbrtf(Jraw);
         for (int k = 0; k < 9; ++k) F[k] = (k % 4 == 0) ? s : 0.0f;
     } else {  // elastic: F^{n+1} = (I + dt*C) F^n.
         float IpdtC[9];
@@ -1419,11 +1335,8 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         LaunchSubstep(*p, model, data, dt_sub, Np, Ppe, mpm_pe, mpm_count, cpe,
                       total_nodes, inv_dx, origin, stream);
     }
-    // Articulated-link deposit: the link rows' net grid reaction (summed over the
-    // substeps above) becomes delta-qdot via M^-1 J^T into the per-articulation
-    // qdot_flat tile, which SolveRowsBlockIsland seeds from. Once per Step, after the
-    // substep loop (m_inv + the kinematic frame are constant across substeps, and
-    // M^-1 is linear, so the summed-wrench deposit equals the per-substep sum).
+    // Deposit accumulated link reaction into qdot after the substep loop.
+    // Articulation surface velocities are therefore fixed during these substeps.
     if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
         p->bodies_per_env > 0u && p->artic_count > 0u && p->max_dof > 0u &&
         data.mpm_body_ang_reaction != nullptr && data.qdot_flat != nullptr &&
@@ -1440,9 +1353,8 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
                    data.qdot_flat);
         profiler.Stop(MpmStage::ArticDeposit, stream);
     }
-    // Launch-config errors surface here, but async kernel faults only after the
-    // stream drains; sync once per MPM step outside graph capture so failures
-    // are loud, not sticky (a capturing stream must never be synchronized).
+    // Eager execution drains the stream to expose asynchronous faults.
+    // Captured execution reports completion errors through graph replay.
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
         capture == cudaStreamCaptureStatusNone) {

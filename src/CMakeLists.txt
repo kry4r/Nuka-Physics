@@ -1522,6 +1522,18 @@ if(CMAKE_CUDA_COMPILER)
         nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu nuka_core CUDA::cudart)
     nuka_set_warnings(nuka_pipeline_benchmark)
 
+    # The water demo uses CUDA physics and ray tracing without a Vulkan dependency.
+    add_executable(nuka_mpm_water_drop_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/mpm_water_drop_demo.cpp)
+    add_dependencies(nuka_mpm_water_drop_demo nuka_codegen)
+    set_target_properties(nuka_mpm_water_drop_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    target_compile_definitions(nuka_mpm_water_drop_demo PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(nuka_mpm_water_drop_demo PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_mpm_water_drop_demo PRIVATE
+        nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2 nuka_runtime_gpu
+        nuka_runtime nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu
+        nuka_core nuka_phi CUDA::cudart)
+
     add_executable(nuka_aba_cuda_probe
         ${CMAKE_SOURCE_DIR}/tools/reference/aba_cuda_probe.cpp
     )
