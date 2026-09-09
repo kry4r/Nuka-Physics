@@ -1,11 +1,15 @@
 // Particle integration and projection use stable CSR neighbor lists and arena storage.
 
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "math/cuda_vec_ops.cuh"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
+#include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/op_schema.hpp"
@@ -27,11 +31,7 @@ namespace fl = ::nuka::runtime::fluid;
 
 constexpr uint32_t kBlockSize = 128u;
 
-// SoftFluid: within-env local particle index (env-major: env e owns
-// [e*per_env, e*per_env+per_env); the soft sub-slice is the first n_soft of each
-// env). per_env == 0 (defensive) makes the local index the global index. The
-// PBF fluid ops use this to skip soft particles; single-system n_soft == 0 makes
-// it always false -> the fluid kernels stay byte-identical to the legacy.
+// Particles are environment-major; the initial per-environment slice contains soft material.
 __device__ __forceinline__ bool SfIsSoft(uint32_t i, uint32_t n_soft,
                                          uint32_t per_env) {
     const uint32_t local = per_env > 0u ? (i % per_env) : i;
@@ -180,173 +180,139 @@ __global__ void ParticleFinalizeKernel(
     positions[i] = Add(projected[i], Scale(correction, dt));
 }
 
-// distance: COLORED parallel Gauss-Seidel. One thread per (env, in-color
-// constraint); a color shares no particle, so no two threads write the same
-// position — race-free, no atomics, D1. The op launches the colors in fixed
-// order; this kernel does ONE projection pass over color [offset, offset+count).
-__global__ void XpbdDistanceColorKernel(uint32_t color_offset,
-                                        uint32_t color_count,
-                                        uint32_t env_count,
-                                        uint32_t cons_per_env,
-                                        math::Vec3* __restrict__ positions,
-                                        const float* __restrict__ inv_masses,
-                                        const uint32_t* __restrict__ particle_a,
-                                        const uint32_t* __restrict__ particle_b,
-                                        const float* __restrict__ rest_length,
-                                        const float* __restrict__ compliance_alpha,
-                                        float* __restrict__ lambda,
-                                        float dt) {
-    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= color_count * env_count) {
-        return;  // guard the trailing partial block (env overflow).
-    }
-    const uint32_t env = t / color_count;
-    const uint32_t local = color_offset + (t % color_count);
-    const uint32_t c = env * cons_per_env + local;
-    const float inv_dt2 = 1.0f / (dt * dt);
-    const uint32_t ia = particle_a[c];
-    const uint32_t ib = particle_b[c];
-    const float wa = inv_masses[ia];
-    const float wb = inv_masses[ib];
-    const float w_sum = wa + wb;
-    if (w_sum <= 0.0f) {
-        return;
-    }
-    const math::Vec3 pa = positions[ia];
-    const math::Vec3 pb = positions[ib];
-    const math::Vec3 r = Sub(pa, pb);
-    const float dist = sqrtf(Dot(r, r));
-    if (dist <= 0.0f) {
-        return;
-    }
-    const math::Vec3 n = Scale(r, 1.0f / dist);
-    const float constraint = dist - rest_length[c];
-    const float alpha_tilde = compliance_alpha[c] * inv_dt2;
-    const float lam = lambda[c];
-    const float delta_lambda =
-        (-constraint - alpha_tilde * lam) / (w_sum + alpha_tilde);
-    positions[ia] = Add(pa, Scale(n, wa * delta_lambda));
-    positions[ib] = Sub(pb, Scale(n, wb * delta_lambda));
-    lambda[c] = lam + delta_lambda;
-}
+// Distance projection updates only the two particles owned by its constraint.
+struct XpbdDistanceProjector {
+    math::Vec3* __restrict__ positions;
+    const float* __restrict__ inv_masses;
+    const uint32_t* __restrict__ particle_a;
+    const uint32_t* __restrict__ particle_b;
+    const float* __restrict__ rest_length;
+    const float* __restrict__ compliance_alpha;
+    float* __restrict__ lambda;
+    float dt;
 
-// bend (Bergou isometric): COLORED parallel Gauss-Seidel (one thread per
-// (env, in-color constraint); race-free within a color, D1). ONE projection
-// pass over color [offset, offset+count).
-__global__ void XpbdBendColorKernel(uint32_t color_offset,
-                                    uint32_t color_count,
-                                    uint32_t env_count,
-                                    uint32_t cons_per_env,
-                                    math::Vec3* __restrict__ positions,
-                                    const float* __restrict__ inv_masses,
-                                    const uint32_t* __restrict__ particles,
-                                    const math::Vec3* __restrict__ gradients,
-                                    const float* __restrict__ compliance_alpha,
-                                    float* __restrict__ lambda,
-                                    float dt) {
-    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= color_count * env_count) {
-        return;  // guard the trailing partial block (env overflow).
-    }
-    const uint32_t env = t / color_count;
-    const uint32_t local = color_offset + (t % color_count);
-    const uint32_t c = env * cons_per_env + local;
-    const float inv_dt2 = 1.0f / (dt * dt);
-    const uint32_t base = c * 4u;
-    uint32_t idx[4];
-    math::Vec3 grad[4];
-    float w[4];
-    float denom = 0.0f;
-    float constraint = 0.0f;
-    for (uint32_t j = 0u; j < 4u; ++j) {
-        idx[j] = particles[base + j];
-        grad[j] = gradients[base + j];
-        w[j] = inv_masses[idx[j]];
-        constraint += Dot(grad[j], positions[idx[j]]);
-        denom += w[j] * Dot(grad[j], grad[j]);
-    }
-    const float alpha_tilde = compliance_alpha[c] * inv_dt2;
-    denom += alpha_tilde;
-    if (denom <= 0.0f) {
-        return;
-    }
-    const float lam = lambda[c];
-    const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
-    for (uint32_t j = 0u; j < 4u; ++j) {
-        if (w[j] > 0.0f) {
-            positions[idx[j]] =
-                Add(positions[idx[j]], Scale(grad[j], w[j] * delta_lambda));
+    __device__ __forceinline__ void operator()(uint32_t c) const {
+        const float inv_dt2 = 1.0f / (dt * dt);
+        const uint32_t ia = particle_a[c];
+        const uint32_t ib = particle_b[c];
+        const float wa = inv_masses[ia];
+        const float wb = inv_masses[ib];
+        const float w_sum = wa + wb;
+        if (w_sum <= 0.0f) {
+            return;
         }
+        const math::Vec3 pa = positions[ia];
+        const math::Vec3 pb = positions[ib];
+        const math::Vec3 r = Sub(pa, pb);
+        const float dist = sqrtf(Dot(r, r));
+        if (dist <= 0.0f) {
+            return;
+        }
+        const math::Vec3 n = Scale(r, 1.0f / dist);
+        const float constraint = dist - rest_length[c];
+        const float alpha_tilde = compliance_alpha[c] * inv_dt2;
+        const float lam = lambda[c];
+        const float delta_lambda =
+            (-constraint - alpha_tilde * lam) / (w_sum + alpha_tilde);
+        positions[ia] = Add(pa, Scale(n, wa * delta_lambda));
+        positions[ib] = Sub(pb, Scale(n, wb * delta_lambda));
+        lambda[c] = lam + delta_lambda;
     }
-    lambda[c] = lam + delta_lambda;
-}
+};
 
-// volume (tet): COLORED parallel Gauss-Seidel (one thread per (env, in-color
-// tet); race-free within a color, D1). ONE projection pass over the color.
-__global__ void XpbdVolumeColorKernel(uint32_t color_offset,
-                                      uint32_t color_count,
-                                      uint32_t env_count,
-                                      uint32_t cons_per_env,
-                                      math::Vec3* __restrict__ positions,
-                                      const float* __restrict__ inv_masses,
-                                      const uint32_t* __restrict__ particles,
-                                      const float* __restrict__ rest_times6,
-                                      const float* __restrict__ compliance_alpha,
-                                      float* __restrict__ lambda,
-                                      float dt) {
-    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= color_count * env_count) {
-        return;  // guard the trailing partial block (env overflow).
-    }
-    const uint32_t env = t / color_count;
-    const uint32_t local = color_offset + (t % color_count);
-    const uint32_t c = env * cons_per_env + local;
-    const float inv_dt2 = 1.0f / (dt * dt);
-    const uint32_t base = c * 4u;
-    const uint32_t i0 = particles[base + 0u];
-    const uint32_t i1 = particles[base + 1u];
-    const uint32_t i2 = particles[base + 2u];
-    const uint32_t i3 = particles[base + 3u];
-    const math::Vec3 p0 = positions[i0];
-    const math::Vec3 p1 = positions[i1];
-    const math::Vec3 p2 = positions[i2];
-    const math::Vec3 p3 = positions[i3];
-    const math::Vec3 e1 = Sub(p1, p0);
-    const math::Vec3 e2 = Sub(p2, p0);
-    const math::Vec3 e3 = Sub(p3, p0);
-    const math::Vec3 g1 = Cross(e2, e3);
-    const math::Vec3 g2 = Cross(e3, e1);
-    const math::Vec3 g3 = Cross(e1, e2);
-    const math::Vec3 g0 = Scale(Add(Add(g1, g2), g3), -1.0f);
-    const float det = Dot(e1, g1);
-    const float constraint = det - rest_times6[c];
-    const float w0 = inv_masses[i0];
-    const float w1 = inv_masses[i1];
-    const float w2 = inv_masses[i2];
-    const float w3 = inv_masses[i3];
-    const float alpha_tilde = compliance_alpha[c] * inv_dt2;
-    const float denom = w0 * Dot(g0, g0) + w1 * Dot(g1, g1) +
-                        w2 * Dot(g2, g2) + w3 * Dot(g3, g3) + alpha_tilde;
-    if (denom <= 0.0f) {
-        return;
-    }
-    const float lam = lambda[c];
-    const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
-    if (w0 > 0.0f) positions[i0] = Add(p0, Scale(g0, w0 * delta_lambda));
-    if (w1 > 0.0f) positions[i1] = Add(p1, Scale(g1, w1 * delta_lambda));
-    if (w2 > 0.0f) positions[i2] = Add(p2, Scale(g2, w2 * delta_lambda));
-    if (w3 > 0.0f) positions[i3] = Add(p3, Scale(g3, w3 * delta_lambda));
-    lambda[c] = lam + delta_lambda;
-}
+// Isometric bend projection retains the constraint's fixed gradient order.
+struct XpbdBendProjector {
+    math::Vec3* __restrict__ positions;
+    const float* __restrict__ inv_masses;
+    const uint32_t* __restrict__ particles;
+    const math::Vec3* __restrict__ gradients;
+    const float* __restrict__ compliance_alpha;
+    float* __restrict__ lambda;
+    float dt;
 
-// --- solve: shape-match (Mueller et al. 2005) ---------------------------------
-// VERBATIM port of the legacy XPBD soft SolveShapeMatchConstraintsKernel +
-// its local 3x3 polar machinery. Same math, same reduction order, single-thread
-// fixed-order GS sweep -- D1, no float atomics. The buffer arguments are the nk
-// arena/model fields (positions = data.particle_pos; the CSR cluster tables come
-// from the ModelView sm_* fields). The reduction order (ascending member j) and
-// every float expression are unchanged so the legacy shape-match invariants hold.
-// A 3x3 matrix stored ROW-MAJOR as nine floats m[0..8] (m[3*r+c]).
+    __device__ __forceinline__ void operator()(uint32_t c) const {
+        const float inv_dt2 = 1.0f / (dt * dt);
+        const size_t base = static_cast<size_t>(c) * 4u;
+        uint32_t idx[4];
+        math::Vec3 grad[4];
+        float w[4];
+        float denom = 0.0f;
+        float constraint = 0.0f;
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            idx[j] = particles[base + j];
+            grad[j] = gradients[base + j];
+            w[j] = inv_masses[idx[j]];
+            constraint += Dot(grad[j], positions[idx[j]]);
+            denom += w[j] * Dot(grad[j], grad[j]);
+        }
+        const float alpha_tilde = compliance_alpha[c] * inv_dt2;
+        denom += alpha_tilde;
+        if (denom <= 0.0f) {
+            return;
+        }
+        const float lam = lambda[c];
+        const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            if (w[j] > 0.0f) {
+                positions[idx[j]] =
+                    Add(positions[idx[j]], Scale(grad[j], w[j] * delta_lambda));
+            }
+        }
+        lambda[c] = lam + delta_lambda;
+    }
+};
+
+// Tetrahedral volume projection uses the signed rest determinant.
+struct XpbdVolumeProjector {
+    math::Vec3* __restrict__ positions;
+    const float* __restrict__ inv_masses;
+    const uint32_t* __restrict__ particles;
+    const float* __restrict__ rest_times6;
+    const float* __restrict__ compliance_alpha;
+    float* __restrict__ lambda;
+    float dt;
+
+    __device__ __forceinline__ void operator()(uint32_t c) const {
+        const float inv_dt2 = 1.0f / (dt * dt);
+        const size_t base = static_cast<size_t>(c) * 4u;
+        const uint32_t i0 = particles[base + 0u];
+        const uint32_t i1 = particles[base + 1u];
+        const uint32_t i2 = particles[base + 2u];
+        const uint32_t i3 = particles[base + 3u];
+        const math::Vec3 p0 = positions[i0];
+        const math::Vec3 p1 = positions[i1];
+        const math::Vec3 p2 = positions[i2];
+        const math::Vec3 p3 = positions[i3];
+        const math::Vec3 e1 = Sub(p1, p0);
+        const math::Vec3 e2 = Sub(p2, p0);
+        const math::Vec3 e3 = Sub(p3, p0);
+        const math::Vec3 g1 = Cross(e2, e3);
+        const math::Vec3 g2 = Cross(e3, e1);
+        const math::Vec3 g3 = Cross(e1, e2);
+        const math::Vec3 g0 = Scale(Add(Add(g1, g2), g3), -1.0f);
+        const float det = Dot(e1, g1);
+        const float constraint = det - rest_times6[c];
+        const float w0 = inv_masses[i0];
+        const float w1 = inv_masses[i1];
+        const float w2 = inv_masses[i2];
+        const float w3 = inv_masses[i3];
+        const float alpha_tilde = compliance_alpha[c] * inv_dt2;
+        const float denom = w0 * Dot(g0, g0) + w1 * Dot(g1, g1) +
+                            w2 * Dot(g2, g2) + w3 * Dot(g3, g3) + alpha_tilde;
+        if (denom <= 0.0f) {
+            return;
+        }
+        const float lam = lambda[c];
+        const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
+        if (w0 > 0.0f) positions[i0] = Add(p0, Scale(g0, w0 * delta_lambda));
+        if (w1 > 0.0f) positions[i1] = Add(p1, Scale(g1, w1 * delta_lambda));
+        if (w2 > 0.0f) positions[i2] = Add(p2, Scale(g2, w2 * delta_lambda));
+        if (w3 > 0.0f) positions[i3] = Add(p3, Scale(g3, w3 * delta_lambda));
+        lambda[c] = lam + delta_lambda;
+    }
+};
+
+// Shape matching uses row-major 3x3 matrices and a fixed-order polar iteration.
 struct SmMat3 {
     float m[9];
 };
@@ -406,93 +372,154 @@ __device__ __forceinline__ SmMat3 SmPolarRotation(const SmMat3& A) {
     }
     return R;
 }
-// shape-match: COLORED parallel goal projection. One thread per (env, in-color
-// cluster); a color shares no member particle, so the per-cluster centroid /
-// covariance / polar / goal-pull run with no cross-cluster write race (D1, no
-// atomics). ONE projection pass over color [offset, offset+count). No lambda
-// (shape matching is re-evaluated from the current positions each iteration).
-__global__ void XpbdShapeMatchColorKernel(
-    uint32_t color_offset,
-    uint32_t color_count,
-    uint32_t env_count,
-    uint32_t clusters_per_env,
-    math::Vec3* __restrict__ positions,
-    const float* __restrict__ inv_masses,
-    const uint32_t* __restrict__ cluster_offset,
-    const uint32_t* __restrict__ cluster_size,
-    const float* __restrict__ stiffness,
-    const math::Vec3* __restrict__ rest_centroid,  // c0 (unused; q_i pre-offset)
-    const uint32_t* __restrict__ particles,        // sum(n_c)
-    const math::Vec3* __restrict__ rest_q,         // q_i = x_i^0 - c0
-    const float* __restrict__ mass) {              // m_i
-    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= color_count * env_count) {
-        return;  // guard the trailing partial block (env overflow).
-    }
-    const uint32_t env = t / color_count;
-    const uint32_t local = color_offset + (t % color_count);
-    const uint32_t cc = env * clusters_per_env + local;
-    (void)rest_centroid;  // c0 folded into the cooked q_i; kept for completeness.
-    using mg::MakeVec3;
-    const uint32_t base = cluster_offset[cc];
-    const uint32_t n = cluster_size[cc];
-    if (n == 0u) {
-        return;
-    }
-    const float s = stiffness[cc];
-    // Current mass-weighted centroid c (fixed-order ascending sum).
-    float mass_sum = 0.0f;
-    math::Vec3 c_acc = MakeVec3(0.0f, 0.0f, 0.0f);
-    for (uint32_t j = 0u; j < n; ++j) {
-        const uint32_t idx = particles[base + j];
-        const float mi = mass[base + j];
-        mass_sum += mi;
-        c_acc = Add(c_acc, Scale(positions[idx], mi));
-    }
-    if (mass_sum <= 0.0f) {
-        return;  // degenerate cluster weights.
-    }
-    const math::Vec3 c = Scale(c_acc, 1.0f / mass_sum);
-    // Covariance A = sum_i m_i (p_i - c) q_i^T (row-major; fixed order).
-    SmMat3 A = SmMat3Zero();
-    for (uint32_t j = 0u; j < n; ++j) {
-        const uint32_t idx = particles[base + j];
-        const float mi = mass[base + j];
-        const math::Vec3 d = Sub(positions[idx], c);  // p_i - c
-        const math::Vec3 q = rest_q[base + j];        // q_i = x_i^0 - c0
-        A.m[0] += mi * d.x * q.x;
-        A.m[1] += mi * d.x * q.y;
-        A.m[2] += mi * d.x * q.z;
-        A.m[3] += mi * d.y * q.x;
-        A.m[4] += mi * d.y * q.y;
-        A.m[5] += mi * d.y * q.z;
-        A.m[6] += mi * d.z * q.x;
-        A.m[7] += mi * d.z * q.y;
-        A.m[8] += mi * d.z * q.z;
-    }
-    const SmMat3 R = SmPolarRotation(A);
-    // Goal pull: g_i = c + R q_i ; p_i += w_active * s * (g_i - p_i).
-    for (uint32_t j = 0u; j < n; ++j) {
-        const uint32_t idx = particles[base + j];
-        if (inv_masses[idx] <= 0.0f) {
-            continue;  // pinned particle: position held fixed.
+// Shape matching keeps centroid, covariance, and goal updates in member order.
+struct XpbdShapeMatchProjector {
+    math::Vec3* __restrict__ positions;
+    const float* __restrict__ inv_masses;
+    const uint32_t* __restrict__ cluster_offset;
+    const uint32_t* __restrict__ cluster_size;
+    const float* __restrict__ stiffness;
+    const math::Vec3* __restrict__ rest_centroid;
+    const uint32_t* __restrict__ particles;
+    const math::Vec3* __restrict__ rest_q;
+    const float* __restrict__ mass;
+
+    __device__ __forceinline__ void operator()(uint32_t cc) const {
+        (void)rest_centroid;  // c0 folded into the cooked q_i; kept for completeness.
+        using mg::MakeVec3;
+        const uint32_t base = cluster_offset[cc];
+        const uint32_t n = cluster_size[cc];
+        if (n == 0u) {
+            return;
         }
-        const math::Vec3 q = rest_q[base + j];
-        const math::Vec3 rq = MakeVec3(
-            R.m[0] * q.x + R.m[1] * q.y + R.m[2] * q.z,
-            R.m[3] * q.x + R.m[4] * q.y + R.m[5] * q.z,
-            R.m[6] * q.x + R.m[7] * q.y + R.m[8] * q.z);
-        const math::Vec3 goal = Add(c, rq);
-        const math::Vec3 p = positions[idx];
-        positions[idx] = Add(p, Scale(Sub(goal, p), s));
+        const float s = stiffness[cc];
+        // Current mass-weighted centroid c (fixed-order ascending sum).
+        float mass_sum = 0.0f;
+        math::Vec3 c_acc = MakeVec3(0.0f, 0.0f, 0.0f);
+        for (uint32_t j = 0u; j < n; ++j) {
+            const uint32_t idx = particles[base + j];
+            const float mi = mass[base + j];
+            mass_sum += mi;
+            c_acc = Add(c_acc, Scale(positions[idx], mi));
+        }
+        if (mass_sum <= 0.0f) {
+            return;  // degenerate cluster weights.
+        }
+        const math::Vec3 c = Scale(c_acc, 1.0f / mass_sum);
+        // Covariance A = sum_i m_i (p_i - c) q_i^T (row-major; fixed order).
+        SmMat3 A = SmMat3Zero();
+        for (uint32_t j = 0u; j < n; ++j) {
+            const uint32_t idx = particles[base + j];
+            const float mi = mass[base + j];
+            const math::Vec3 d = Sub(positions[idx], c);  // p_i - c
+            const math::Vec3 q = rest_q[base + j];        // q_i = x_i^0 - c0
+            A.m[0] += mi * d.x * q.x;
+            A.m[1] += mi * d.x * q.y;
+            A.m[2] += mi * d.x * q.z;
+            A.m[3] += mi * d.y * q.x;
+            A.m[4] += mi * d.y * q.y;
+            A.m[5] += mi * d.y * q.z;
+            A.m[6] += mi * d.z * q.x;
+            A.m[7] += mi * d.z * q.y;
+            A.m[8] += mi * d.z * q.z;
+        }
+        const SmMat3 R = SmPolarRotation(A);
+        // Goal pull: g_i = c + R q_i ; p_i += w_active * s * (g_i - p_i).
+        for (uint32_t j = 0u; j < n; ++j) {
+            const uint32_t idx = particles[base + j];
+            if (inv_masses[idx] <= 0.0f) {
+                continue;  // pinned particle: position held fixed.
+            }
+            const math::Vec3 q = rest_q[base + j];
+            const math::Vec3 rq = MakeVec3(
+                R.m[0] * q.x + R.m[1] * q.y + R.m[2] * q.z,
+                R.m[3] * q.x + R.m[4] * q.y + R.m[5] * q.z,
+                R.m[6] * q.x + R.m[7] * q.y + R.m[8] * q.z);
+            const math::Vec3 goal = Add(c, rq);
+            const math::Vec3 p = positions[idx];
+            positions[idx] = Add(p, Scale(Sub(goal, p), s));
+        }
+    }
+};
+
+template <typename Projector>
+__global__ void XpbdColorSweepKernel(Projector project,
+                                     const uint32_t* __restrict__ color_segments,
+                                     uint32_t colors, uint32_t constraints_per_env,
+                                     uint32_t env_count, uint32_t iters,
+                                     uint32_t iteration_start) {
+    const auto grid = cooperative_groups::this_grid();
+    const uint64_t first = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    const uint64_t stride = uint64_t{gridDim.x} * blockDim.x;
+    for (uint32_t iter = 0u; iter < iters; ++iter) {
+        for (uint32_t ci = 0u; ci < colors; ++ci) {
+            const uint32_t col = ((iteration_start + iter) & 1u) ? colors - 1u - ci : ci;
+            const uint32_t offset = color_segments[static_cast<size_t>(col) * 2u];
+            const uint32_t count = color_segments[static_cast<size_t>(col) * 2u + 1u];
+            const uint64_t work = uint64_t{count} * env_count;
+            for (uint64_t item = first; item < work; item += stride) {
+                const uint32_t t = static_cast<uint32_t>(item);
+                const uint32_t env = t / count;
+                project(env * constraints_per_env + offset + t % count);
+            }
+            // Every thread participates, including trailing threads and empty colors.
+            grid.sync();
+        }
     }
 }
 
-// density (Poly6, self term first, ascending neighbor sum). Verbatim, plus the
-// SoftFluid fluid-slice scope: when n_soft > 0 the owner particle skips if
-// it is a SOFT particle, and a SOFT neighbor is skipped in the sum (a soft
-// particle must NOT contribute to fluid density). For single-system PBF n_soft ==
-// 0 so SfIsSoft is always false -> the loop is BYTE-IDENTICAL to the legacy.
+template <typename Projector>
+Status PrepareXpbdSweep(uint32_t constraints, uint32_t constraints_per_env,
+                        uint32_t env_count, uint32_t colors,
+                        const uint32_t* host_segments, const uint32_t* device_segments,
+                        uint32_t* blocks) {
+    *blocks = 0u;
+    if (constraints == 0u) return Status::Ok;
+    if (colors == 0u || host_segments == nullptr || device_segments == nullptr ||
+        uint64_t{constraints_per_env} * env_count != constraints)
+        return Status::InvalidArgument;
+    uint64_t end = 0u;
+    uint32_t widest_color = 0u;
+    for (uint32_t color = 0u; color < colors; ++color) {
+        const uint32_t offset = host_segments[static_cast<size_t>(color) * 2u];
+        const uint32_t count = host_segments[static_cast<size_t>(color) * 2u + 1u];
+        if (offset != end || end + count > constraints_per_env)
+            return Status::InvalidArgument;
+        end += count;
+        widest_color = std::max(widest_color, count);
+    }
+    if (end != constraints_per_env || widest_color == 0u) return Status::InvalidArgument;
+    const uint64_t work = uint64_t{widest_color} * env_count;
+    const uint64_t bound = (work - 1u) / kBlockSize + 1u;
+    if (work > std::numeric_limits<uint32_t>::max() ||
+        bound > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
+    return ResidentGridSize(XpbdColorSweepKernel<Projector>, kBlockSize, 0u,
+                            static_cast<uint32_t>(bound), blocks) == cudaSuccess
+        ? Status::Ok : Status::Failed;
+}
+
+template <typename Projector>
+Status ProjectXpbdFamily(Projector project, uint32_t blocks, uint32_t constraints,
+                         uint32_t constraints_per_env, uint32_t env_count,
+                         uint32_t colors, const uint32_t* color_segments,
+                         uint32_t iters, uint32_t iteration_start,
+                         float* lambda, cudaStream_t stream) {
+    if (constraints == 0u) return Status::Ok;
+    if (lambda != nullptr && iteration_start == 0u) {
+        const uint32_t reset_blocks = (constraints - 1u) / kBlockSize + 1u;
+        LaunchCuda(XpbdLambdaResetKernel, dim3(reset_blocks), dim3(kBlockSize), 0u,
+                   stream, constraints, lambda);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+    }
+    const auto result = LaunchCooperativeCuda(
+        XpbdColorSweepKernel<Projector>, dim3(blocks), dim3(kBlockSize), 0u, stream,
+        project, color_segments, colors, constraints_per_env, env_count, iters,
+        iteration_start);
+    if (result != cudaSuccess) return Status::Failed;
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
+// Poly6 density sums the self term and fluid neighbors in stable order.
 __global__ void PbfDensityKernel(uint32_t particle_count,
                                  uint32_t n_soft,
                                  uint32_t per_env,
@@ -642,10 +669,7 @@ __global__ void PbfApplyCorrectionKernel(uint32_t particle_count,
     predicted[i] = out;
 }
 
-// XSPH viscosity compute (read-only into the delta scratch). Verbatim, plus the
-// SoftFluid fluid-slice scope (a soft owner gets no XSPH delta; a soft
-// neighbor is skipped in the sum). Single-system PBF passes n_soft == 0 so
-// SfIsSoft is always false -> BYTE-IDENTICAL to the legacy XSPH.
+// XSPH viscosity reads fluid velocities and stages per-particle corrections.
 __global__ void PbfXsphDeltaKernel(uint32_t particle_count,
                                    uint32_t n_soft,
                                    uint32_t per_env,
@@ -708,9 +732,7 @@ __global__ void PbfApplyVelocityDeltaKernel(uint32_t particle_count,
     velocities[i] = math::Vec3{v.x + d.x, v.y + d.y, v.z + d.z};
 }
 
-// cohesion velocity nudge (Akinci cohesion only). Verbatim, plus the 
-// SoftFluid fluid-slice scope (a soft owner gets no cohesion nudge; a soft
-// neighbor is skipped). Single-system PBF (n_soft == 0) is BYTE-IDENTICAL.
+// Akinci cohesion gathers fluid-neighbor velocity corrections in stable order.
 __global__ void PbfCohesionKernel(uint32_t particle_count,
                                   uint32_t n_soft,
                                   uint32_t per_env,
@@ -832,10 +854,7 @@ __global__ void PpContactHalfCorrectionKernel(
     out_delta[i] = math::Vec3{dx, dy, dz};
 }
 
-// pass B: apply the accumulated half corrections (own-index write -> race-free, no
-// atomics, D1). INERT byte-identity: when the gathered delta is exactly zero (no
-// in-range penetrating pair) the position is left UNTOUCHED (so a SoftFluid scene
-// with no cross pairs is byte-identical to running the two subsystems alone).
+// Each particle applies its gathered contact correction without shared writes.
 __global__ void PpContactApplyKernel(uint32_t union_count,
                                      math::Vec3* __restrict__ positions,
                                      const math::Vec3* __restrict__ delta) {
@@ -851,9 +870,7 @@ __global__ void PpContactApplyKernel(uint32_t union_count,
     positions[i] = math::Vec3{p.x + d.x, p.y + d.y, p.z + d.z};
 }
 
-// =============================================================================
-// op entry points
-// =============================================================================
+// Particle op entry points validate buffers and launch on the supplied stream.
 
 Status OpParticleAeroDrag(const ModelView& model, const DataView& data,
                           const void* params, cudaStream_t stream) {
@@ -945,138 +962,83 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
     const auto* p = static_cast<const XpbdProjectParams*>(params);
     if (p == nullptr) return Status::InvalidArgument;
     if (p->dist_con_count == 0u && p->bend_con_count == 0u &&
-        p->vol_con_count == 0u && p->shape_match_cluster_count == 0u) {
-        return Status::Ok;  // PBF-only (or no XPBD) scene: inert.
-    }
+        p->vol_con_count == 0u && p->shape_match_cluster_count == 0u) return Status::Ok;
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
-    const uint32_t E = p->env_count == 0u ? 1u : p->env_count;
+    const uint32_t env_count = p->env_count == 0u ? 1u : p->env_count;
     if (!(p->dt > 0.0f) || !std::isfinite(p->dt) ||
         data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr)
         return Status::InvalidArgument;
     if ((p->dist_con_count > 0u &&
-         (p->dist_colors == 0u || p->dist_color_segments == nullptr ||
-          uint64_t{p->dist_cons_per_env} * E != p->dist_con_count ||
-          model.dist_particle_a == nullptr || model.dist_particle_b == nullptr ||
-          model.dist_rest_length == nullptr || model.dist_compliance == nullptr || data.dist_lambda == nullptr)) ||
+         (model.dist_particle_a == nullptr || model.dist_particle_b == nullptr ||
+          model.dist_rest_length == nullptr || model.dist_compliance == nullptr ||
+          data.dist_lambda == nullptr)) ||
         (p->bend_con_count > 0u &&
-         (p->bend_colors == 0u || p->bend_color_segments == nullptr ||
-          uint64_t{p->bend_cons_per_env} * E != p->bend_con_count ||
-          model.bend_particles == nullptr || model.bend_gradients == nullptr ||
+         (model.bend_particles == nullptr || model.bend_gradients == nullptr ||
           model.bend_compliance == nullptr || data.bend_lambda == nullptr)) ||
         (p->vol_con_count > 0u &&
-         (p->vol_colors == 0u || p->vol_color_segments == nullptr ||
-          uint64_t{p->vol_cons_per_env} * E != p->vol_con_count ||
-          model.vol_particles == nullptr || model.vol_rest_times6 == nullptr ||
+         (model.vol_particles == nullptr || model.vol_rest_times6 == nullptr ||
           model.vol_compliance == nullptr || data.vol_lambda == nullptr)) ||
         (p->shape_match_cluster_count > 0u &&
-         (p->sm_colors == 0u || p->sm_color_segments == nullptr ||
-          uint64_t{p->sm_clusters_per_env} * E != p->shape_match_cluster_count ||
-          model.sm_cluster_offset == nullptr || model.sm_cluster_size == nullptr ||
+         (model.sm_cluster_offset == nullptr || model.sm_cluster_size == nullptr ||
           model.sm_stiffness == nullptr || model.sm_rest_centroid == nullptr ||
           model.sm_particles == nullptr || model.sm_rest_q == nullptr || model.sm_mass == nullptr)))
         return Status::InvalidArgument;
-    // Colors retain deterministic order; continuation preserves the current step's lambdas.
-    if (p->dist_con_count > 0u) {
-        const uint32_t rb = (p->dist_con_count + kBlockSize - 1u) / kBlockSize;
-        if (p->iteration_start == 0u) {
-            LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
-                       p->dist_con_count, data.dist_lambda);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-        }
-        for (uint32_t iter = 0u; iter < iters; ++iter) {
-            // Symmetric sweep: reverse color order on odd iters (faster GS
-            // convergence at the same launch count, deterministic).
-            for (uint32_t ci = 0u; ci < p->dist_colors; ++ci) {
-                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->dist_colors - 1u - ci) : ci;
-                const uint32_t cnt = p->dist_color_segments[col * 2u + 1u];
-                if (cnt == 0u) continue;
-                const uint32_t off = p->dist_color_segments[col * 2u + 0u];
-                const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
-                LaunchCuda(XpbdDistanceColorKernel, dim3(blocks), dim3(kBlockSize),
-                           0u, stream, off, cnt, E, p->dist_cons_per_env,
-                           data.pbf_predicted_pos, data.particle_inv_mass,
-                           model.dist_particle_a, model.dist_particle_b,
-                           model.dist_rest_length, model.dist_compliance,
-                           data.dist_lambda, p->dt);
-                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-            }
-        }
-    }
-    if (p->bend_con_count > 0u) {
-        const uint32_t rb = (p->bend_con_count + kBlockSize - 1u) / kBlockSize;
-        if (p->iteration_start == 0u) {
-            LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
-                       p->bend_con_count, data.bend_lambda);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-        }
-        for (uint32_t iter = 0u; iter < iters; ++iter) {
-            for (uint32_t ci = 0u; ci < p->bend_colors; ++ci) {
-                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->bend_colors - 1u - ci) : ci;
-                const uint32_t cnt = p->bend_color_segments[col * 2u + 1u];
-                if (cnt == 0u) continue;
-                const uint32_t off = p->bend_color_segments[col * 2u + 0u];
-                const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
-                LaunchCuda(XpbdBendColorKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                           stream, off, cnt, E, p->bend_cons_per_env,
-                           data.pbf_predicted_pos, data.particle_inv_mass,
-                           model.bend_particles, model.bend_gradients,
-                           model.bend_compliance, data.bend_lambda, p->dt);
-                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-            }
-        }
-    }
-    if (p->vol_con_count > 0u) {
-        const uint32_t rb = (p->vol_con_count + kBlockSize - 1u) / kBlockSize;
-        if (p->iteration_start == 0u) {
-            LaunchCuda(XpbdLambdaResetKernel, dim3(rb), dim3(kBlockSize), 0u, stream,
-                       p->vol_con_count, data.vol_lambda);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-        }
-        for (uint32_t iter = 0u; iter < iters; ++iter) {
-            for (uint32_t ci = 0u; ci < p->vol_colors; ++ci) {
-                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->vol_colors - 1u - ci) : ci;
-                const uint32_t cnt = p->vol_color_segments[col * 2u + 1u];
-                if (cnt == 0u) continue;
-                const uint32_t off = p->vol_color_segments[col * 2u + 0u];
-                const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
-                LaunchCuda(XpbdVolumeColorKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                           stream, off, cnt, E, p->vol_cons_per_env,
-                           data.pbf_predicted_pos, data.particle_inv_mass,
+    const auto cooperative = RequireCooperativeLaunch();
+    if (cooperative == cudaErrorNotSupported) return Status::Unsupported;
+    if (cooperative != cudaSuccess) return Status::Failed;
+
+    // Validate every family and its launch resources before modifying particle state.
+    uint32_t dist_blocks = 0u, bend_blocks = 0u, vol_blocks = 0u, sm_blocks = 0u;
+    auto status = PrepareXpbdSweep<XpbdDistanceProjector>(
+        p->dist_con_count, p->dist_cons_per_env, env_count, p->dist_colors,
+        p->dist_color_segments, model.dist_color_segments, &dist_blocks);
+    if (status != Status::Ok) return status;
+    status = PrepareXpbdSweep<XpbdBendProjector>(
+        p->bend_con_count, p->bend_cons_per_env, env_count, p->bend_colors,
+        p->bend_color_segments, model.bend_color_segments, &bend_blocks);
+    if (status != Status::Ok) return status;
+    status = PrepareXpbdSweep<XpbdVolumeProjector>(
+        p->vol_con_count, p->vol_cons_per_env, env_count, p->vol_colors,
+        p->vol_color_segments, model.vol_color_segments, &vol_blocks);
+    if (status != Status::Ok) return status;
+    status = PrepareXpbdSweep<XpbdShapeMatchProjector>(
+        p->shape_match_cluster_count, p->sm_clusters_per_env, env_count, p->sm_colors,
+        p->sm_color_segments, model.sm_color_segments, &sm_blocks);
+    if (status != Status::Ok) return status;
+
+    // Each call retains the material-family order and the step's accumulated lambdas.
+    status = ProjectXpbdFamily(
+        XpbdDistanceProjector{data.pbf_predicted_pos, data.particle_inv_mass,
+                             model.dist_particle_a, model.dist_particle_b,
+                             model.dist_rest_length, model.dist_compliance, data.dist_lambda, p->dt},
+        dist_blocks, p->dist_con_count, p->dist_cons_per_env, env_count, p->dist_colors,
+        model.dist_color_segments, iters, p->iteration_start, data.dist_lambda, stream);
+    if (status != Status::Ok) return status;
+    status = ProjectXpbdFamily(
+        XpbdBendProjector{data.pbf_predicted_pos, data.particle_inv_mass,
+                         model.bend_particles, model.bend_gradients,
+                         model.bend_compliance, data.bend_lambda, p->dt},
+        bend_blocks, p->bend_con_count, p->bend_cons_per_env, env_count, p->bend_colors,
+        model.bend_color_segments, iters, p->iteration_start, data.bend_lambda, stream);
+    if (status != Status::Ok) return status;
+    status = ProjectXpbdFamily(
+        XpbdVolumeProjector{data.pbf_predicted_pos, data.particle_inv_mass,
                            model.vol_particles, model.vol_rest_times6,
-                           model.vol_compliance, data.vol_lambda, p->dt);
-                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-            }
-        }
-    }
-    // Shape-match is solved LAST (after the local constraints), the legacy XPBD-
-    // sweep order, so it pulls the already-projected config toward the rigid goal.
-    if (p->shape_match_cluster_count > 0u) {
-        for (uint32_t iter = 0u; iter < iters; ++iter) {
-            for (uint32_t ci = 0u; ci < p->sm_colors; ++ci) {
-                const uint32_t col = ((p->iteration_start + iter) & 1u) ? (p->sm_colors - 1u - ci) : ci;
-                const uint32_t cnt = p->sm_color_segments[col * 2u + 1u];
-                if (cnt == 0u) continue;
-                const uint32_t off = p->sm_color_segments[col * 2u + 0u];
-                const uint32_t blocks = (cnt * E + kBlockSize - 1u) / kBlockSize;
-                LaunchCuda(XpbdShapeMatchColorKernel, dim3(blocks), dim3(kBlockSize),
-                           0u, stream, off, cnt, E, p->sm_clusters_per_env,
-                           data.pbf_predicted_pos, data.particle_inv_mass,
-                           model.sm_cluster_offset, model.sm_cluster_size,
-                           model.sm_stiffness, model.sm_rest_centroid,
-                           model.sm_particles, model.sm_rest_q, model.sm_mass);
-                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-            }
-        }
-    }
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+                           model.vol_compliance, data.vol_lambda, p->dt},
+        vol_blocks, p->vol_con_count, p->vol_cons_per_env, env_count, p->vol_colors,
+        model.vol_color_segments, iters, p->iteration_start, data.vol_lambda, stream);
+    if (status != Status::Ok) return status;
+    return ProjectXpbdFamily(
+        XpbdShapeMatchProjector{data.pbf_predicted_pos, data.particle_inv_mass,
+                               model.sm_cluster_offset, model.sm_cluster_size,
+                               model.sm_stiffness, model.sm_rest_centroid,
+                               model.sm_particles, model.sm_rest_q, model.sm_mass},
+        sm_blocks, p->shape_match_cluster_count, p->sm_clusters_per_env, env_count, p->sm_colors,
+        model.sm_color_segments, iters, p->iteration_start, nullptr, stream);
 }
 
-// PbfDensityLambda owns the FULL iterated density-projection loop EXCEPT the
-// final correction-apply pass (PbfApplyDelta runs that). For iters 0..N-2 the
-// apply is in-loop here; the LAST iteration's compute leaves `pbf_position_delta`
-// staged for PbfApplyDelta. This keeps both ops non-vacuous + byte-exact to the
-// legacy [density,lambda,delta,apply]xN inner loop (the pipeline is a flat list,
-// so the iteration coupling is owned by the op TU, exactly as the legacy PBF stepper did).
+// Density projection applies all but the last iteration here.
+// PbfApplyDelta consumes the final staged correction.
 Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
                           const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const PbfDensityLambdaParams*>(params);

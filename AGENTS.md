@@ -44,6 +44,9 @@ These rules OVERRIDE default behavior. Follow them in every file you write or ed
   performance denominator; do not count changed physics as a speedup.
 
 ## Performance
+- Optimize the general solver using topology, active work, and device capability.
+- Do not add demo-specific tuning, scene thresholds, solver shortcuts, or hidden
+  quality reductions. Every optimization must retain independently checked physics.
 - In performance modules, prioritize measured latency and throughput gains and keep pursuing remaining hotspots.
 - Profile GPU completion time, scheduling, bandwidth, layout, occupancy, and memory reuse on the general path.
 - Compare complete pipelines at equal physical quality; report regressions, memory cost, and five-process results.

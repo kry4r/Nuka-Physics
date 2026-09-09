@@ -1,56 +1,11 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — SolveRowsBlockIsland (the spec device-resident
-// unified row solve). TWO contact families behind the ONE op (params->family):
-//
-// (: the legacy FUSED block-per-articulation PGS path was DELETED here —
-// `SolveArticulatedContactRowsKernel` + its dispatch branch are gone. The ONE
-// general island solver below now serves both remaining families.)
-//
-// UNION (kContactFamilyUnionCsr) — THE the spec KERNEL: grid = total_islands
-// (= N_env x islands/env from the build-time SolveSchedule), block = 256;
-// per block:
-// for it in vel_iters:
-// for c in colors(island): // device-resident segment table
-// rows of color c in parallel (thread/row) -> __syncthreads
-// Per-row math = row_solver.cu's COMPLIANT branch, preserved numerically:
-// * jv = per-side dispatch (CompliantSideConstraintVelocity):
-// rigid: dot(jlin,v)+dot(jang,w); artic: serial
-// sum_r J[r]*qdot[r] (ascending r, the legacy order);
-// particle: dot(jlin,v); static: 0. Side a then b.
-// * update = lambda_new = clamp(lambda + meff*(rhs*dt - jv
-// - R*lambda), bounds) — incl. the C5c-2 regularizer
-// feedback (-R*lambda) the legacy kernel carries.
-// * friction = the unilateral coupled-pyramid bound
-// [0, mu * TotalNormalLambda(group)] (IsCompliantFriction-
-// Row semantics; the group sum over the FIXED normal slots
-// equals the legacy compacted sum — inactive slots carry
-// lambda == 0).
-// * apply = per-side dispatch: rigid v += jlin*(im*dl), w += jang*
-// invI*dl (skip im<=0); artic qdot[r] += w[r]*dl with the
-// PRECOMPUTED w = M^-1 J^T (the ArticulationApplyImpulse
-// inner product hoisted to AssembleRows — same products,
-// same order); particle v += jlin*(im*dl). |dl| > 1e-12
-// gate, side a then b. meff is the assembly-hoisted
-// ComputeCompliantEffectiveMass (constant across iters).
-// The articulation qdot tile lives in SHARED memory for the island's env
-// (loaded from qdot_flat before the sweep, scattered back to link_velocity /
-// qdot through the cooked dof maps after — the legacy pack/scatter 1:1; a
-// contact-free env scatters its own unchanged values, a no-op). 51-DOF
-// M^-1 J^T is the per-thread register loop over the row's coalesced
-// chain_jacobian / row_minv_jt segments (fields.yaml layout note).
-// Watermark early-exit: an inactive row slot (flags bit0 clear) returns
-// immediately — max grid + early exit keeps the kernel graph-capturable
-// (the design capacity policy).
-// pos_iters is accepted but unused: every union row is COMPLIANT, and the
-// legacy compliant path skips Baumgarte position projection entirely
-// (SolvePositionRow returns 0 for Compliant rows; the legacy union runs
-// position_iterations = 0) — preserved semantics, not an omission.
-// ---------------------------------------------------------------------------
+// Independent islands retain ordered row updates and separate real/pseudo velocities.
 
 #include <cuda_runtime.h>
+#include <limits>
 
 #include "math/cuda_vec_ops.cuh"
 #include "phi/backend_cuda/launch.cuh"
+#include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"
@@ -67,15 +22,9 @@ __forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
     return mg::Dot(a, b);
 }
 
-// ===========================================================================
-// UNION-family island kernel (NEW — the spec kernel).
-// ===========================================================================
+// Island records and row storage support the shared ordered solver.
 
-// Island record: the schedule's per-island quad. The flat schedule array is a
-// run of these (schedule.cpp builds it as raw {seg_off, seg_cnt, flags, env}
-// stride-4 u32). FLAG: schedule.cpp:256-323 + fields.yaml encode the same quad
-// with raw `* 4u + k` arithmetic — they should adopt THIS struct so a field
-// addition is one edit, not a silent stride drift across three sites.
+// The schedule stores {segment offset, segment count, flags, owning environment}.
 struct IslandRecord {
     uint32_t seg_off;   // first color segment of this island
     uint32_t seg_cnt;   // color segment count
@@ -85,26 +34,15 @@ struct IslandRecord {
 static_assert(sizeof(IslandRecord) == 4u * sizeof(uint32_t),
               "IslandRecord must pack exactly the stride-4 schedule quad");
 
-// Union's cooked color segments can expose two independent rows at once, so it
-// keeps two warps. Dynamic PairDriven islands deliberately preserve serial GS by
-// giving each active row its own segment; a second warp can never receive work and
-// only doubles the surplus-block traffic. One warp also lets the per-row ordering
-// fence use __syncwarp instead of a CTA barrier without changing any arithmetic.
+// Static colors can expose independent rows to two warps; dynamic islands use one
+// warp because each active row occupies its own segment.
 constexpr uint32_t kUnionIslandBlockSize = 64u;
 constexpr uint32_t kPairDrivenIslandBlockSize = 32u;
 constexpr uint32_t kScalarIslandBlockSize = 32u;
 constexpr uint32_t kScalarIslandGridBlocks = 64u;
 
-// Slim per-row SOLVE record (16 f32 = 64 B), built IN-KERNEL at launch from
-// the NkRow records. Rationale (MEASURED): the sweep re-reads its row record
-// every iteration; broadcasting the full 128 B NkRow to every lane spilled to
-// local memory and dominated the bookkeeping cost. The slim record carries
-// exactly what the velocity update needs: flags / group (re-based env-LOCAL) /
-// compliance terms / the side dispatch folded to {artic bits + at most ONE
-// dynamic (rigid|particle) side}. A row with TWO dynamic sides (the
-// particle x particle class — never emitted by the assembly) sets the
-// FALLBACK bit and the row solve reads the full NkRow from global (slow but
-// correct path; no silent drop).
+// A compact row stores both articulation tiles and one dynamic side.
+// Rows with two dynamic sides read their complete NkRow.
 struct SlimRow {
     uint32_t flags;
     uint32_t group_local;   // group_first - env_row_base
@@ -114,11 +52,7 @@ struct SlimRow {
     float rhs, R, lower, upper, mu;
     float jl[3];            // the dynamic side's linear jacobian
     float ja[3];            // ... angular (rigid r x j augment)
-    // the ENV-LOCAL articulation tile
-    // index for each artic side (global_artic - env*artics_per_env) so the row
-    // reads/writes the CORRECT per-articulation qdot tile in shared memory. At
-    // K==1 both collapse to 0 (one tile/env) -> byte-identical to the single-tile
-    // path. ~0u sentinel when the side is not articulation.
+    // Environment-local articulation tiles; ~0u denotes a non-articulation side.
     uint32_t a_tile;        // side-A artic env-local tile index (or ~0u).
     uint32_t b_tile;        // side-B artic env-local tile index (or ~0u).
 };
@@ -130,42 +64,13 @@ constexpr uint32_t kSlimDynIsB = 1u << 3;
 constexpr uint32_t kSlimDynParticle = 1u << 4;
 constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 
-// The island kernel's DYNAMIC shared working-set size for a given env slice
-// (see the kernel's layout carve). Union: qdot tile + lambda + meff + slim records
-// + J + w (R x D each) + order + segments. PairDriven: ONLY the qdot tile (every
-// row-scaled array lives in global). The 51-DOF / 190-row union scene
-// needs ~92 KB — within sm_8x+'s opt-in dynamic shared (set once via
-// cudaFuncAttributeMaxDynamicSharedMemorySize). A model whose slice exceeds
-// the device limit fails LOUDLY at the op entry (Model capacity property;
-// the broadphase-cooked sizing revisits it).
-// the qdot region holds ALL of the env's articulation tiles
-// (qdot_tiles * dof_stride floats) so a PairDriven mixed island can service every
-// co-resident articulation it touches. For the Union/Fused single-artic families
-// qdot_tiles == kMaxArticulationDof / dof_stride is unused; they pass
-// qdot_tiles == 1 BUT the legacy carve reserved kMaxArticulationDof floats — so
-// to keep the union footprint UNCHANGED (the H1 golden's measured ~92 KB) the op
-// passes the legacy reservation for the non-PairDriven families (with_b_arm == 0)
-// and the compact K-tile reservation for PairDriven. The B-arm J_b/w_b region
-// is present ONLY when with_b_arm (the PairDriven family) — the union path
-// never allocates it, so its shared footprint is byte-for-byte the legacy carve.
-// cache_jw: the Union family caches the per-row chain-J (J) + M^-1 J^T (w) rows in
-// SHARED (the measured latency core of its dense 190-row sweep). The PairDriven
-// family does NOT (with_b_arm == true): its worst-case per-env island can hold
-// HUNDREDS of rows x ~18 DOF x 4 arrays (J,w,J_b,w_b) which would blow the ~99 KB
-// dynamic-shared limit, so it reads J/w/J_b/w_b straight from GLOBAL each iteration
-// (bounded shared; correctness-first). The shared carve excludes those regions.
-// The PairDriven family ALSO keeps lambda / meff / order / segments in GLOBAL (all
-// scale with rows_per_env); only the qdot tile region stays in shared. The Union
-// family stages every row-scaled array in shared (its carve is unchanged).
+// Static schedules cache row data and Jacobians; dynamic schedules use global rows.
+// Both allocate velocity tiles, with separate pseudo tiles for the position solve.
 inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
                                 uint32_t qdot_floats, bool cache_jw,
                                 bool pos_pass, uint32_t k_tiles) {
     if (!cache_jw) {
-        // PairDriven: only the qdot tile(s) live in shared; lambda/meff/order/seg
-        // are read from GLOBAL, so the carve does not scale with rows_per_env. The
-        // split-impulse position pass adds a parallel pseudo qdot tile (same size).
-        // The dynamic-island path also carves a per-component tile present/list pair
-        // (k_tiles u32 each) so the load/scatter touch ONLY this island's tiles.
+        // Global rows need shared velocity tiles and a per-island articulation index.
         return sizeof(float) * qdot_floats * (pos_pass ? 2u : 1u) +
                sizeof(uint32_t) * 2ull * k_tiles;
     }
@@ -179,10 +84,7 @@ inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
            sizeof(uint32_t) * 3ull * rows_per_env;                      // order+segs
 }
 
-// Build the compact solve record from the full NkRow. The Union family stages
-// these in shared once per launch; the PairDriven family builds them inline in
-// the sweep (reading the NkRow from global), keeping the per-row shared footprint
-// out of the rows_per_env-sized carve so a many-contact env fits the block.
+// Compact row construction retains global row identity and environment-local tiles.
 __device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
                                       uint32_t env_artic_base) {
     SlimRow sr;
@@ -228,15 +130,8 @@ __device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
     return sr;
 }
 
-// One row's velocity update — row_solver.cu SolveCompliantVelocityRow,
-// preserved numerically (see the file header), executed by ONE WARP:
-// * the Jv reduction stays the LEGACY SERIAL ascending-r loop on lane 0
-// over the SHARED J slice (a tree/warp reduction would change the
-// summation order),
-// * the lambda update (bounds, clamp, regularizer feedback) is lane 0,
-// * the M^-1 J^T apply is warp-PARALLEL over the dof elements (each
-// qdot[r] += w[r]*delta is one independent multiply-add — identical
-// rounding regardless of which lane executes it; w is shared-cached).
+// Compliant velocity projection preserves ascending DOF sums and side A/B order.
+// Effective mass and inverse-mass Jacobians are assembled before the solve.
 __device__ void ApplySlimImpulse(
     const SlimRow& sr, uint32_t j_row, uint32_t wlane, float delta,
     uint32_t env_artic_base, float* qdot_sh,
@@ -484,9 +379,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                 dof_stride);
         }
 
-        // lambda / meff source: SHARED slice (Union) or GLOBAL (PairDriven, where
-        // the row-scaled staging stays out of shared). The global env-local slot of
-        // a group member g is env_row_base + group_local + g == its global slot.
+        // Static schedules cache lambda and effective mass; dynamic schedules read global rows.
         const float effective_mass = meff_sh != nullptr ? meff_sh[ls]
                                                         : row_meff[gslot];
         const float damping = damping_sh != nullptr ? damping_sh[ls]
@@ -599,18 +492,14 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         }
     }
     if (!block_row && delta != 0.0f) {
-        // side a then b (the legacy apply order). The artic arm is the
-        // dof-wide element-independent apply — warp-parallel; the rigid /
-        // particle arms touch a handful of scalars — lane 0.
+        // Apply side A before side B; articulation inverse-mass Jacobians are precomputed.
         for (int side = 0; side < 2; ++side) {
             const bool art = side == 0 ? (code & kSlimAArt) != 0u
                                        : (code & kSlimBArt) != 0u;
             const bool dyn = (code & kSlimHasDyn) &&
                              ((side == 1) == ((code & kSlimDynIsB) != 0u));
             if (art) {
-                // qdot_side += w_side * delta with the PRECOMPUTED w = M^-1 J^T,
-                // into the side's OWN per-articulation tile — element-
-                // independent multiply-add (bit-equal whatever lane executes it).
+                // Apply the precomputed inverse-mass Jacobian in ascending DOF order.
                 const uint32_t tile = (side == 0) ? a_tile : b_tile;
                 const float* w;
                 if (side == 0) {
@@ -680,14 +569,8 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
     }
 }
 
-// One NORMAL row's split-impulse position update, executed by ONE WARP. A
-// GEOMETRIC projection (no -R*lambda compliance feedback): it drives a SEPARATE
-// pseudo velocity from the contact penetration depth so position can close the
-// overlap WITHOUT injecting energy into the persisted velocity. Mirrors the
-// velocity warp's machinery (same J, same w = M^-1 J^T, same meff, same side
-// dispatch, same fixed sweep order) but reads/writes ONLY the pseudo
-// accumulators. Friction rows are skipped (one-sided non-penetration only);
-// the pseudo impulse is clamped >= 0.
+// Normal rows project penetration into separate pseudo velocities in fixed order.
+// Tangent rows receive no pseudo impulse.
 __device__ void SolvePositionRowWarp(uint32_t gslot,
                                      uint32_t env_row_base,
                                      uint32_t env_artic_base,
@@ -788,12 +671,7 @@ __device__ void ApplyDynamicImpulseScalar(
     }
 }
 
-// A component with no articulation side has no reduced-coordinate vector to fan
-// across a warp: every row update is scalar rigid/particle work. Dynamic islanding
-// proves distinct components share no mutable side or friction group, so one CUDA
-// thread may run each component's original ascending GS sweep independently. The
-// arithmetic below is the no-artic subset of SolveUnionRowWarp, kept statement-for-
-// statement so only execution width changes.
+// An island without articulation DOFs uses one thread for the same ordered row solve.
 __device__ void SolveDynamicRowScalar(
     uint32_t gslot, uint32_t env_row_base, uint32_t env_artic_base,
     const NkRow* __restrict__ urows, float* __restrict__ lambda,
@@ -996,14 +874,11 @@ __global__ void SolveRowsScalarIslandsKernel(
     float pos_beta, float pos_slop, float dt,
     float baumgarte_max_velocity, bool apply_cached_impulses) {
     const uint32_t live_islands = *island_count_dev;
-    // BuildSolveIslands packs live components into a prefix. Interleave that prefix
-    // across blocks before filling the next lane so a modest fixed grid spreads
-    // serial GS components over the device instead of concentrating them in the
-    // first few CTAs. Each component remains owned by exactly one thread and keeps
-    // its original ascending row/iteration order.
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t island = blockIdx.x + threadIdx.x * gridDim.x;
-         island < live_islands; island += stride) {
+    // Interleave live islands across blocks; each island retains one owner and row order.
+    const uint64_t stride = uint64_t{gridDim.x} * blockDim.x;
+    for (uint64_t cursor = blockIdx.x + uint64_t{threadIdx.x} * gridDim.x;
+         cursor < live_islands; cursor += stride) {
+        const uint32_t island = static_cast<uint32_t>(cursor);
         const IslandRecord rec =
             reinterpret_cast<const IslandRecord*>(islands)[island];
         if (rec.flags & 1u) continue;  // reduced-coordinate component: warp path.
@@ -1104,391 +979,327 @@ __global__ void SolveRowsBlockIslandKernel(
     float pos_beta, float pos_slop,
     float dt,
     float baumgarte_max_velocity, bool apply_cached_impulses) {
-    const uint32_t island = blockIdx.x;
-    // Dynamic islanding (PairDriven): the live component count is a DEVICE scalar
-    // (BuildSolveIslands writes it each step) and the grid is the static max-island
-    // bound, so blocks past the live count early-exit. Static schedule: total_islands.
     const bool dynamic = (island_count_dev != nullptr);
     const uint32_t live_islands = dynamic ? *island_count_dev : total_islands;
-    if (island >= live_islands) {
-        return;
-    }
-    // Read the island's quad via the named record (same memory as the raw
-    // stride-4 layout; reinterpret keeps the schedule array untouched). For the
-    // dynamic schedule the quad is {row_off, row_cnt, flags, env} indexing the
-    // pre-grouped island_rows (each row its OWN color); static: {seg_off, seg_cnt}.
-    const IslandRecord rec =
-        reinterpret_cast<const IslandRecord*>(islands)[island];
-    const uint32_t seg_off = rec.seg_off;
-    const uint32_t seg_cnt = rec.seg_cnt;
-    const uint32_t flags = rec.flags;
-    const uint32_t env = rec.env;
-    // Dynamic rigid/particle-only components are solved by the scalar-island
-    // kernel. Static schedules and any component touching an articulation retain
-    // this warp path unchanged.
-    if (dynamic && !(flags & 1u)) return;
-    const uint32_t lane = threadIdx.x;
-    const uint32_t env_row_base = env * rows_per_env;
-    const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;
-    const uint32_t env_artic_base = env * k_tiles;  // first global artic of this env
+    for (uint64_t cursor = blockIdx.x; cursor < live_islands; cursor += gridDim.x) {
+        const uint32_t island = static_cast<uint32_t>(cursor);
+        // Dynamic records index contiguous active rows; static records index color segments.
+        const IslandRecord rec =
+            reinterpret_cast<const IslandRecord*>(islands)[island];
+        const uint32_t seg_off = rec.seg_off;
+        const uint32_t seg_cnt = rec.seg_cnt;
+        const uint32_t flags = rec.flags;
+        const uint32_t env = rec.env;
+        // Islands without articulation DOFs are owned by the scalar dispatch.
+        if (dynamic && !(flags & 1u)) continue;
+        const uint32_t lane = threadIdx.x;
+        const uint32_t env_row_base = env * rows_per_env;
+        const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;
+        const uint32_t env_artic_base = env * k_tiles;  // first global artic of this env
 
-    // DYNAMIC SHARED working set for the 64-iteration sweep (sized by the op
-    // entry). Union caches the ENV SLICE\'s lambdas / effective masses / slim
-    // records / chain-J rows / M^-1 J^T rows + the island\'s segment + order
-    // tables here — all re-read EVERY iteration, the measured latency core of the
-    // sweep. PairDriven keeps every row-scaled array in global (its per-env island
-    // is too large for shared); only the qdot tile lives here. Loading the WHOLE
-    // env slice is read-safe under multiple islands per env; only THIS island\'s
-    // rows are written back (its lambdas), so concurrent blocks never collide.
-    extern __shared__ unsigned char dyn_sh[];
-    // The Union/Fused families CACHE the per-row J/w in shared (with_b_arm == 0 ->
-    // cache_jw == true). PairDriven does NOT (its per-env worst-case island can be
-    // hundreds of rows; caching J,w,J_b,w_b would blow the ~99 KB shared limit) --
-    // it reads J/w/J_b/w_b from GLOBAL each iteration (bounded shared).
-    const bool cache_jw = (with_b_arm == 0u);
-    // the qdot region. Union: the legacy kMaxArticulationDof reservation (shared
-    // footprint byte-for-byte the H1-golden carve). PairDriven: compact K-tile.
-    const uint32_t qdot_floats =
-        (with_b_arm != 0u) ? (k_tiles * dof_stride) : kMaxArticulationDof;
-    float* const qdot_sh = reinterpret_cast<float*>(dyn_sh);
-    // Row data stays in each environment's global scratch; velocity tiles use shared memory.
-    // A position solve adds an equally sized pseudo-velocity tile.
-    const bool pos_pass = (pos_iters > 0u) && !cache_jw;
-    float* const qdot_pseudo_sh = pos_pass ? (qdot_sh + qdot_floats) : nullptr;
-    float* lambda_sh = nullptr;
-    float* meff_sh = nullptr;
-    float* damping_sh = nullptr;
-    float* J_sh = nullptr;   // shared J/w cache (Union only).
-    float* w_sh = nullptr;
-    SlimRow* slim_sh = nullptr;
-    uint32_t* order_sh = nullptr;
-    uint32_t* seg_sh = nullptr;
-    // Dynamic-island per-component tile working set (PairDriven): a present-bitmap +
-    // compacted list of THIS component's env-local artic tiles, carved after the
-    // qdot region(s). The load/scatter touch ONLY these tiles so concurrent
-    // same-env components never race on qdot_flat. Unused by the Union path.
-    uint32_t* tile_present = nullptr;
-    uint32_t* tile_list = nullptr;
-    if (cache_jw) {
-        lambda_sh = qdot_sh + qdot_floats;
-        meff_sh = lambda_sh + rows_per_env;
-        damping_sh = meff_sh + rows_per_env;
-        J_sh = damping_sh + rows_per_env;
-        w_sh = J_sh + static_cast<size_t>(rows_per_env) * dof_stride;
-        slim_sh = reinterpret_cast<SlimRow*>(
-            w_sh + static_cast<size_t>(rows_per_env) * dof_stride);
-        order_sh = reinterpret_cast<uint32_t*>(slim_sh + rows_per_env);
-        seg_sh = order_sh + rows_per_env;                        // 2R u32
-    } else {
-        float* const tile_base =
-            qdot_sh + static_cast<size_t>(qdot_floats) * (pos_pass ? 2u : 1u);
-        tile_present = reinterpret_cast<uint32_t*>(tile_base);
-        tile_list = tile_present + k_tiles;
-        // Static PairDriven fallback (dynamic == false): the legacy GLOBAL
-        // order/segment scratch (one block per env). The dynamic path reads the
-        // pre-grouped row_order directly and never touches this scratch.
-        order_sh = pd_solve_scratch + static_cast<size_t>(3u) * env_row_base;
-        seg_sh = order_sh + rows_per_env;                        // 2R u32
-    }
-    __shared__ uint32_t tile_cnt_sh;
-
-    const bool has_artic = (flags & 1u) != 0u && dof_stride > 0u;
-    // Dynamic path: collect THIS component's distinct env-local artic tiles into
-    // tile_list (present-bitmap then compact). The component's rows all live in this
-    // block (the union-find merged every shared tile), so its tile set is closed.
-    if (dynamic && has_artic) {
-        for (uint32_t i = lane; i < k_tiles; i += blockDim.x) tile_present[i] = 0u;
-        if (lane == 0u) tile_cnt_sh = 0u;
-        __syncthreads();
-        for (uint32_t r = lane; r < seg_cnt; r += blockDim.x) {
-            const NkRow& row = urows[row_order[seg_off + r]];
-            if (row.a.kind == kNkSideArtic && row.a.index >= env_artic_base) {
-                atomicOr(&tile_present[row.a.index - env_artic_base], 1u);
-            }
-            if (row.b.kind == kNkSideArtic && row.b.index >= env_artic_base) {
-                atomicOr(&tile_present[row.b.index - env_artic_base], 1u);
-            }
-        }
-        __syncthreads();
-        for (uint32_t t = lane; t < k_tiles; t += blockDim.x) {
-            if (tile_present[t] != 0u) tile_list[atomicAdd(&tile_cnt_sh, 1u)] = t;
-        }
-        __syncthreads();
-    }
-    if (has_artic) {
-        if (dynamic) {
-            // load ONLY this component's tiles (into their env-local qdot_sh slots);
-            // the unloaded slots are never read (no component row touches them).
-            const uint32_t tc = tile_cnt_sh;
-            for (uint32_t u = 0u; u < tc; ++u) {
-                const uint32_t tile = tile_list[u];
-                for (uint32_t k = lane; k < dof_stride; k += blockDim.x) {
-                    qdot_sh[tile * dof_stride + k] = qdot_flat[
-                        static_cast<size_t>(env_artic_base + tile) * dof_stride + k];
-                }
-            }
+        // Shared storage belongs to this block and is reused after each island finishes.
+        extern __shared__ unsigned char dyn_sh[];
+        // Static schedules cache row Jacobians; dynamic schedules keep them in global storage.
+        const bool cache_jw = (with_b_arm == 0u);
+        // the qdot region. Union: the legacy kMaxArticulationDof reservation (shared
+        // footprint byte-for-byte the H1-golden carve). PairDriven: compact K-tile.
+        const uint32_t qdot_floats =
+            (with_b_arm != 0u) ? (k_tiles * dof_stride) : kMaxArticulationDof;
+        float* const qdot_sh = reinterpret_cast<float*>(dyn_sh);
+        // Row data stays in each environment's global scratch; velocity tiles use shared memory.
+        // A position solve adds an equally sized pseudo-velocity tile.
+        const bool pos_pass = (pos_iters > 0u) && !cache_jw;
+        float* const qdot_pseudo_sh = pos_pass ? (qdot_sh + qdot_floats) : nullptr;
+        float* lambda_sh = nullptr;
+        float* meff_sh = nullptr;
+        float* damping_sh = nullptr;
+        float* J_sh = nullptr;   // shared J/w cache (Union only).
+        float* w_sh = nullptr;
+        SlimRow* slim_sh = nullptr;
+        uint32_t* order_sh = nullptr;
+        uint32_t* seg_sh = nullptr;
+        // A present bitmap and compact tile list restrict shared velocity writes to this island.
+        uint32_t* tile_present = nullptr;
+        uint32_t* tile_list = nullptr;
+        if (cache_jw) {
+            lambda_sh = qdot_sh + qdot_floats;
+            meff_sh = lambda_sh + rows_per_env;
+            damping_sh = meff_sh + rows_per_env;
+            J_sh = damping_sh + rows_per_env;
+            w_sh = J_sh + static_cast<size_t>(rows_per_env) * dof_stride;
+            slim_sh = reinterpret_cast<SlimRow*>(
+                w_sh + static_cast<size_t>(rows_per_env) * dof_stride);
+            order_sh = reinterpret_cast<uint32_t*>(slim_sh + rows_per_env);
+            seg_sh = order_sh + rows_per_env;                        // 2R u32
         } else {
-            // load EVERY co-resident articulation tile of this env (K tiles). At
-            // K==1 this is the single legacy tile (qdot_flat[env*dof_stride]).
-            for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
-                qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
-            }
+            float* const tile_base =
+                qdot_sh + static_cast<size_t>(qdot_floats) * (pos_pass ? 2u : 1u);
+            tile_present = reinterpret_cast<uint32_t*>(tile_base);
+            tile_list = tile_present + k_tiles;
+            // Static schedules build their ordered segments in per-environment global scratch.
+            order_sh = pd_solve_scratch + static_cast<size_t>(3u) * env_row_base;
+            seg_sh = order_sh + rows_per_env;                        // 2R u32
         }
-    }
-    // Union stages lambda / meff / slim records in shared; PairDriven reads lambda /
-    // row_meff straight from global and builds slim inline in the sweep (its carve
-    // has none of these regions).
-    if (cache_jw) {
-        for (uint32_t i = lane; i < rows_per_env; i += blockDim.x) {
-            const size_t g = static_cast<size_t>(env_row_base) + i;
-            lambda_sh[i] = lambda[g];
-            meff_sh[i] = row_meff[g];
-            damping_sh[i] = row_damping[g];
-            slim_sh[i] = MakeSlimRow(urows[g], env_row_base, env_artic_base);
-        }
-    }
-    // Union: cache the per-row J/w into shared (the dense-sweep latency core).
-    // PairDriven reads J/w/J_b/w_b from global in the sweep (no shared cache).
-    if (cache_jw) {
-        for (size_t i = lane; i < static_cast<size_t>(rows_per_env) * dof_stride;
-             i += blockDim.x) {
-            const size_t g = static_cast<size_t>(env_row_base) * dof_stride + i;
-            J_sh[i] = chain_jacobian[g];
-            w_sh[i] = row_minv_jt[g];
-        }
-    }
-    // The island\'s rows are CONTIGUOUS in row_order (per-component spans).
-    // COMPACT the schedule to the ACTIVE rows once (lane 0): the active set is
-    // FIXED for the whole sweep (row flags never change inside the solve), so
-    // dropping inactive rows / empty segments here only removes NO-OP visits —
-    // the surviving execution order is the schedule\'s order, unchanged.
-    __shared__ uint32_t live_seg_cnt_sh;
-    if (dynamic) {
-        // The dynamic schedule already grouped the component's ACTIVE rows in
-        // row_order[seg_off .. seg_off+seg_cnt), each its OWN color (serial GS, the
-        // bit-identical single-island order). No compaction / scratch needed.
-        if (lane == 0u) live_seg_cnt_sh = seg_cnt;
-    } else if (lane == 0u) {
-        uint32_t out_rows = 0u;
-        uint32_t out_segs = 0u;
-        const uint32_t span_start =
-            seg_cnt > 0u ? segments[static_cast<size_t>(seg_off) * 2u + 0u] : 0u;
-        for (uint32_t s = 0u; s < seg_cnt; ++s) {
-            const uint32_t off = segments[static_cast<size_t>(seg_off + s) * 2u + 0u];
-            const uint32_t cnt = segments[static_cast<size_t>(seg_off + s) * 2u + 1u];
-            const uint32_t seg_begin = out_rows;
-            for (uint32_t i = 0u; i < cnt; ++i) {
-                const uint32_t gslot = row_order[off + i];
-                // slim_sh is not yet visible (no barrier) — read the flag from
-                // the GLOBAL record (one u32 per row, once per launch).
-                if (urows[gslot].flags & nk::nk_row_flags::kActive) {
-                    order_sh[out_rows++] = gslot;
+        __shared__ uint32_t tile_cnt_sh;
+
+        const bool has_artic = (flags & 1u) != 0u && dof_stride > 0u;
+        // Union-find closes each island's articulation tile set; other islands never write it.
+        if (dynamic && has_artic) {
+            for (uint32_t i = lane; i < k_tiles; i += blockDim.x) tile_present[i] = 0u;
+            if (lane == 0u) tile_cnt_sh = 0u;
+            __syncthreads();
+            for (uint32_t r = lane; r < seg_cnt; r += blockDim.x) {
+                const NkRow& row = urows[row_order[seg_off + r]];
+                if (row.a.kind == kNkSideArtic && row.a.index >= env_artic_base) {
+                    atomicOr(&tile_present[row.a.index - env_artic_base], 1u);
+                }
+                if (row.b.kind == kNkSideArtic && row.b.index >= env_artic_base) {
+                    atomicOr(&tile_present[row.b.index - env_artic_base], 1u);
                 }
             }
-            if (out_rows > seg_begin) {
-                seg_sh[2u * out_segs + 0u] = seg_begin;
-                seg_sh[2u * out_segs + 1u] = out_rows - seg_begin;
-                ++out_segs;
+            __syncthreads();
+            for (uint32_t t = lane; t < k_tiles; t += blockDim.x) {
+                if (tile_present[t] != 0u) tile_list[atomicAdd(&tile_cnt_sh, 1u)] = t;
             }
+            __syncthreads();
         }
-        live_seg_cnt_sh = out_segs;
-        (void)span_start;
-    }
-    __syncthreads();
-    const uint32_t live_seg_cnt = live_seg_cnt_sh;
-
-    const uint32_t warp = lane >> 5u;
-    const uint32_t wlane = lane & 31u;
-    const uint32_t nwarps = blockDim.x >> 5u;
-    if (with_b_arm != 0u && apply_cached_impulses) {
-        for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
-            const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
-            const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
-            const uint32_t* const obase = dynamic ? row_order : order_sh;
-            for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
-                const uint32_t gslot = obase[off + idx];
-                SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
-                                  env_artic_base, gslot, wlane, nullptr,
-                                  nullptr, nullptr, nullptr, lambda, row_meff,
-                                  row_damping,
-                                  chain_jacobian, row_minv_jt,
-                                  chain_jacobian_b, row_minv_jt_b,
-                                  qdot_sh, urows, body_lin_vel, body_ang_vel,
-                                  body_inv_mass, body_world_inv_inertia,
-                                  particle_inv_mass, particle_vel,
-                                  dof_stride, dt, true);
-            }
-            if (dynamic) __syncwarp(); else __syncthreads();
-        }
-    }
-    for (uint32_t it = 0u; it < vel_iters; ++it) {
-        for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
-            // Dynamic: the s-th unit is one component row at row_order[seg_off+s]
-            // (its own color). Static: the s-th compacted color segment in seg_sh.
-            const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
-            const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
-            const uint32_t* const obase = dynamic ? row_order : order_sh;
-            // One WARP per row of the color (rows of one color share no
-            // mutable state — warp-level parallel is exactly the old
-            // thread-level parallel, with the row\'s inner work distributed
-            // across the warp\'s lanes).
-            for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
-                const uint32_t gslot = obase[off + idx];
-                // Union: shared J/w cache indexed by env-local slot. PairDriven:
-                // GLOBAL J/w/J_b/w_b indexed by the global slot (j_row == gslot).
-                const float* Ja = cache_jw ? J_sh : chain_jacobian;
-                const float* Wa = cache_jw ? w_sh : row_minv_jt;
-                const float* Jb = cache_jw ? nullptr : chain_jacobian_b;
-                const float* Wb = cache_jw ? nullptr : row_minv_jt_b;
-                const uint32_t j_row = cache_jw ? (gslot - env_row_base) : gslot;
-                SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
-                                  env_artic_base, j_row, wlane,
-                                  cache_jw ? slim_sh : nullptr,
-                                  lambda_sh, meff_sh, damping_sh,
-                                  lambda, row_meff, row_damping,
-                                  Ja, Wa, Jb, Wb,
-                                  qdot_sh, urows,
-                                  body_lin_vel, body_ang_vel, body_inv_mass,
-                                  body_world_inv_inertia, particle_inv_mass,
-                                  particle_vel, dof_stride, dt, false);
-            }
-            if (dynamic) __syncwarp(); else __syncthreads();
-        }
-    }
-
-    // Split-impulse position pass (PairDriven, pos_iters>0): drive a SEPARATE
-    // pseudo velocity from the geometric penetration into qdot_pseudo_sh / the
-    // pseudo body+particle velocities, never the persisted velocity. Same fixed
-    // sweep order (D1). The pseudo qdot tile starts at ZERO (pseudo velocity is
-    // built from depth, not carried from the velocity solve).
-    if (pos_pass) {
         if (has_artic) {
-            for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
-                qdot_pseudo_sh[i] = 0.0f;
+            if (dynamic) {
+                // load ONLY this component's tiles (into their env-local qdot_sh slots);
+                // the unloaded slots are never read (no component row touches them).
+                const uint32_t tc = tile_cnt_sh;
+                for (uint32_t u = 0u; u < tc; ++u) {
+                    const uint32_t tile = tile_list[u];
+                    for (uint32_t k = lane; k < dof_stride; k += blockDim.x) {
+                        qdot_sh[tile * dof_stride + k] = qdot_flat[
+                            static_cast<size_t>(env_artic_base + tile) * dof_stride + k];
+                    }
+                }
+            } else {
+                // load EVERY co-resident articulation tile of this env (K tiles). At
+                // K==1 this is the single legacy tile (qdot_flat[env*dof_stride]).
+                for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
+                    qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
+                }
             }
         }
-        // Zero this island's per-row pseudo accumulators (global, race-free per
-        // island). Dynamic: the component rows in row_order[seg_off..); static: the
-        // compacted ACTIVE rows in order_sh.
+        // Static schedules cache row parameters; dynamic schedules read them from global storage.
+        if (cache_jw) {
+            for (uint32_t i = lane; i < rows_per_env; i += blockDim.x) {
+                const size_t g = static_cast<size_t>(env_row_base) + i;
+                lambda_sh[i] = lambda[g];
+                meff_sh[i] = row_meff[g];
+                damping_sh[i] = row_damping[g];
+                slim_sh[i] = MakeSlimRow(urows[g], env_row_base, env_artic_base);
+            }
+        }
+        // Union: cache the per-row J/w into shared (the dense-sweep latency core).
+        // PairDriven reads J/w/J_b/w_b from global in the sweep (no shared cache).
+        if (cache_jw) {
+            for (size_t i = lane; i < static_cast<size_t>(rows_per_env) * dof_stride;
+                 i += blockDim.x) {
+                const size_t g = static_cast<size_t>(env_row_base) * dof_stride + i;
+                J_sh[i] = chain_jacobian[g];
+                w_sh[i] = row_minv_jt[g];
+            }
+        }
+        // Compact active static rows once, preserving the order of all surviving segments.
+        __shared__ uint32_t live_seg_cnt_sh;
         if (dynamic) {
-            for (uint32_t i = lane; i < seg_cnt; i += blockDim.x) {
-                row_pseudo_lambda[row_order[seg_off + i]] = 0.0f;
+            // Dynamic schedules already group active rows into deterministic single-row segments.
+            if (lane == 0u) live_seg_cnt_sh = seg_cnt;
+        } else if (lane == 0u) {
+            uint32_t out_rows = 0u;
+            uint32_t out_segs = 0u;
+            const uint32_t span_start =
+                seg_cnt > 0u ? segments[static_cast<size_t>(seg_off) * 2u + 0u] : 0u;
+            for (uint32_t s = 0u; s < seg_cnt; ++s) {
+                const uint32_t off = segments[static_cast<size_t>(seg_off + s) * 2u + 0u];
+                const uint32_t cnt = segments[static_cast<size_t>(seg_off + s) * 2u + 1u];
+                const uint32_t seg_begin = out_rows;
+                for (uint32_t i = 0u; i < cnt; ++i) {
+                    const uint32_t gslot = row_order[off + i];
+                    // slim_sh is not yet visible (no barrier) — read the flag from
+                    // the GLOBAL record (one u32 per row, once per launch).
+                    if (urows[gslot].flags & nk::nk_row_flags::kActive) {
+                        order_sh[out_rows++] = gslot;
+                    }
+                }
+                if (out_rows > seg_begin) {
+                    seg_sh[2u * out_segs + 0u] = seg_begin;
+                    seg_sh[2u * out_segs + 1u] = out_rows - seg_begin;
+                    ++out_segs;
+                }
             }
-        } else if (live_seg_cnt > 0u) {
-            const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
-            const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
-            const uint32_t island_rows = last_off + last_cnt;
-            for (uint32_t i = lane; i < island_rows; i += blockDim.x) {
-                row_pseudo_lambda[order_sh[i]] = 0.0f;
-            }
+            live_seg_cnt_sh = out_segs;
+            (void)span_start;
         }
         __syncthreads();
-        for (uint32_t it = 0u; it < pos_iters; ++it) {
+        const uint32_t live_seg_cnt = live_seg_cnt_sh;
+
+        const uint32_t warp = lane >> 5u;
+        const uint32_t wlane = lane & 31u;
+        const uint32_t nwarps = blockDim.x >> 5u;
+        if (with_b_arm != 0u && apply_cached_impulses) {
             for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
                 const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
                 const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
                 const uint32_t* const obase = dynamic ? row_order : order_sh;
                 for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
                     const uint32_t gslot = obase[off + idx];
-                    SolvePositionRowWarp(
-                        gslot, env_row_base, env_artic_base, gslot, wlane,
-                        row_meff, row_penetration, row_pseudo_lambda,
-                        chain_jacobian, row_minv_jt,
-                        chain_jacobian_b, row_minv_jt_b,
-                        qdot_pseudo_sh, urows,
-                        body_pseudo_lin_vel, body_pseudo_ang_vel,
-                        body_inv_mass, body_world_inv_inertia,
-                        particle_inv_mass, particle_pseudo_vel,
-                        dof_stride, pos_beta, pos_slop, dt,
-                        baumgarte_max_velocity);
+                    SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
+                                      env_artic_base, gslot, wlane, nullptr,
+                                      nullptr, nullptr, nullptr, lambda, row_meff,
+                                      row_damping,
+                                      chain_jacobian, row_minv_jt,
+                                      chain_jacobian_b, row_minv_jt_b,
+                                      qdot_sh, urows, body_lin_vel, body_ang_vel,
+                                      body_inv_mass, body_world_inv_inertia,
+                                      particle_inv_mass, particle_vel,
+                                      dof_stride, dt, true);
                 }
                 if (dynamic) __syncwarp(); else __syncthreads();
             }
         }
-    }
-
-    // Write back THIS island's lambdas (the persistent warm-start/readout
-    // field) — walk the island's own ACTIVE rows (the only lambdas the sweep
-    // can change; inactive slots keep the assembled 0). Multi-island-per-env
-    // safe: islands never share rows. Union stages lambda in shared, so it copies
-    // the slice back here; PairDriven writes lambda[gslot] in-place during the
-    // sweep (no shared slice), so its writeback is already done.
-    if (cache_jw && live_seg_cnt > 0u) {
-        const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
-        const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
-        const uint32_t island_rows = last_off + last_cnt;
-        for (uint32_t i = lane; i < island_rows; i += blockDim.x) {
-            const uint32_t gslot = order_sh[i];
-            lambda[gslot] = lambda_sh[gslot - env_row_base];
-        }
-    }
-
-    // Scatter the post-solve qdot tile(s) back through the cooked dof maps.
-    // with_b_arm == 0 (Union/Fused): the LEGACY single-tile scatter, byte-exact
-    // (env tile 0 via the per:dof dof_to_link/component maps). with_b_arm != 0
-    // (PairDriven): scatter ALL K co-resident articulation tiles. The cooked
-    // dof_to_link/component are per:dof (ONE dog's map); for tile a > 0 the same
-    // template-local (link, component) applies to articulation (env_artic_base+a),
-    // whose links live at global articulation_link_offset[that artic] + local. At
-    // K==1 (single tile) PairDriven and the legacy path land on the SAME slots.
-    if (has_artic) {
-        if (with_b_arm == 0u) {
-            for (uint32_t k = lane; k < dof_stride; k += blockDim.x) {
-                const size_t flat = static_cast<size_t>(env) * dof_stride + k;
-                const uint32_t link = dof_to_link[flat];
-                const uint32_t comp = dof_to_component[flat];
-                const size_t gl = static_cast<size_t>(env) * base_link_count + link;
-                const float v = qdot_sh[k];
-                if (comp != ~0u) {
-                    link_velocity[gl].v[comp] = v;
-                } else {
-                    qdot[gl] = v;
+        for (uint32_t it = 0u; it < vel_iters; ++it) {
+            for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
+                // Dynamic: the s-th unit is one component row at row_order[seg_off+s]
+                // (its own color). Static: the s-th compacted color segment in seg_sh.
+                const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
+                const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
+                const uint32_t* const obase = dynamic ? row_order : order_sh;
+                // Rows within a color are independent; each warp applies one row's DOF updates.
+                for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
+                    const uint32_t gslot = obase[off + idx];
+                    // Union: shared J/w cache indexed by env-local slot. PairDriven:
+                    // GLOBAL J/w/J_b/w_b indexed by the global slot (j_row == gslot).
+                    const float* Ja = cache_jw ? J_sh : chain_jacobian;
+                    const float* Wa = cache_jw ? w_sh : row_minv_jt;
+                    const float* Jb = cache_jw ? nullptr : chain_jacobian_b;
+                    const float* Wb = cache_jw ? nullptr : row_minv_jt_b;
+                    const uint32_t j_row = cache_jw ? (gslot - env_row_base) : gslot;
+                    SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
+                                      env_artic_base, j_row, wlane,
+                                      cache_jw ? slim_sh : nullptr,
+                                      lambda_sh, meff_sh, damping_sh,
+                                      lambda, row_meff, row_damping,
+                                      Ja, Wa, Jb, Wb,
+                                      qdot_sh, urows,
+                                      body_lin_vel, body_ang_vel, body_inv_mass,
+                                      body_world_inv_inertia, particle_inv_mass,
+                                      particle_vel, dof_stride, dt, false);
                 }
-                qdot_flat[flat] = v;
+                if (dynamic) __syncwarp(); else __syncthreads();
             }
-        } else {
-            // PairDriven multi-tile scatter. dof_to_link/component are the per:dog
-            // template map; the global link of tile a is env*base_link + (link +
-            // a*base_link/k_tiles) ONLY if each dog occupies a contiguous link
-            // block of base_link/k_tiles. The multi-dog cook lays out K dogs'
-            // links contiguously per env (link_to_articulation groups them), so
-            // tile a's links are offset by a * links_per_dog. links_per_dog =
-            // base_link_count / k_tiles.
-            const uint32_t links_per_dog =
-                (k_tiles > 0u) ? (base_link_count / k_tiles) : base_link_count;
-            // Dynamic: scatter ONLY this component's tiles (tile_list[0..tile_cnt)),
-            // so concurrent same-env components never write the same qdot_flat slot.
-            // Static: ALL k_tiles. Both use the per-tile template map (a*links_per_dog).
-            const uint32_t scatter_tiles = dynamic ? tile_cnt_sh : k_tiles;
-            for (uint32_t i = lane; i < scatter_tiles * dof_stride; i += blockDim.x) {
-                const uint32_t u = i / dof_stride;       // tile slot in the iteration
-                const uint32_t k = i - u * dof_stride;   // DOF within tile
-                const uint32_t a = dynamic ? tile_list[u] : u;  // env-local tile
-                uint32_t comp; size_t gl;
-                ArticDofTarget(env, a, k, dof_stride, links_per_dog, base_link_count,
-                               dof_to_link, dof_to_component, comp, gl);
-                const float v = qdot_sh[static_cast<size_t>(a) * dof_stride + k];
-                if (comp != ~0u) {
-                    link_velocity[gl].v[comp] = v;
-                } else {
-                    qdot[gl] = v;
+        }
+
+        // Penetration drives a fresh pseudo-velocity field in the same fixed row order.
+        if (pos_pass) {
+            if (has_artic) {
+                for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
+                    qdot_pseudo_sh[i] = 0.0f;
                 }
-                qdot_flat[static_cast<size_t>(env_artic_base + a) * dof_stride + k] = v;
-                // Split-impulse: scatter the pseudo qdot tile to its OWN buffers,
-                // mirroring the real scatter (so IntegratePosition reads it
-                // additively without touching the persisted velocity).
-                if (pos_pass) {
-                    const float vp = qdot_pseudo_sh[static_cast<size_t>(a) * dof_stride + k];
-                    if (comp != ~0u) {
-                        link_velocity_pseudo[gl].v[comp] = vp;
-                    } else {
-                        qdot_pseudo[gl] = vp;
+            }
+            // Clear pseudo accumulators only for rows owned by this island.
+            if (dynamic) {
+                for (uint32_t i = lane; i < seg_cnt; i += blockDim.x) {
+                    row_pseudo_lambda[row_order[seg_off + i]] = 0.0f;
+                }
+            } else if (live_seg_cnt > 0u) {
+                const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
+                const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
+                const uint32_t island_rows = last_off + last_cnt;
+                for (uint32_t i = lane; i < island_rows; i += blockDim.x) {
+                    row_pseudo_lambda[order_sh[i]] = 0.0f;
+                }
+            }
+            __syncthreads();
+            for (uint32_t it = 0u; it < pos_iters; ++it) {
+                for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
+                    const uint32_t off = dynamic ? (seg_off + s) : seg_sh[2u * s + 0u];
+                    const uint32_t cnt = dynamic ? 1u : seg_sh[2u * s + 1u];
+                    const uint32_t* const obase = dynamic ? row_order : order_sh;
+                    for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
+                        const uint32_t gslot = obase[off + idx];
+                        SolvePositionRowWarp(
+                            gslot, env_row_base, env_artic_base, gslot, wlane,
+                            row_meff, row_penetration, row_pseudo_lambda,
+                            chain_jacobian, row_minv_jt,
+                            chain_jacobian_b, row_minv_jt_b,
+                            qdot_pseudo_sh, urows,
+                            body_pseudo_lin_vel, body_pseudo_ang_vel,
+                            body_inv_mass, body_world_inv_inertia,
+                            particle_inv_mass, particle_pseudo_vel,
+                            dof_stride, pos_beta, pos_slop, dt,
+                            baumgarte_max_velocity);
                     }
-                    qdot_pseudo_flat[static_cast<size_t>(env_artic_base + a) *
-                                         dof_stride + k] = vp;
+                    if (dynamic) __syncwarp(); else __syncthreads();
                 }
             }
         }
+
+        // Write back this island's cached lambdas; globally stored lambdas are already current.
+        if (cache_jw && live_seg_cnt > 0u) {
+            const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
+            const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
+            const uint32_t island_rows = last_off + last_cnt;
+            for (uint32_t i = lane; i < island_rows; i += blockDim.x) {
+                const uint32_t gslot = order_sh[i];
+                lambda[gslot] = lambda_sh[gslot - env_row_base];
+            }
+        }
+
+        // Scatter the solved velocity tiles through the cooked DOF maps.
+        if (has_artic) {
+            if (with_b_arm == 0u) {
+                for (uint32_t k = lane; k < dof_stride; k += blockDim.x) {
+                    const size_t flat = static_cast<size_t>(env) * dof_stride + k;
+                    const uint32_t link = dof_to_link[flat];
+                    const uint32_t comp = dof_to_component[flat];
+                    const size_t gl = static_cast<size_t>(env) * base_link_count + link;
+                    const float v = qdot_sh[k];
+                    if (comp != ~0u) {
+                        link_velocity[gl].v[comp] = v;
+                    } else {
+                        qdot[gl] = v;
+                    }
+                    qdot_flat[flat] = v;
+                }
+            } else {
+                // Homogeneous articulation tiles occupy contiguous link ranges within an environment.
+                const uint32_t links_per_dog =
+                    (k_tiles > 0u) ? (base_link_count / k_tiles) : base_link_count;
+                // Dynamic schedules scatter only owned tiles; static schedules own every environment tile.
+                const uint32_t scatter_tiles = dynamic ? tile_cnt_sh : k_tiles;
+                for (uint32_t i = lane; i < scatter_tiles * dof_stride; i += blockDim.x) {
+                    const uint32_t u = i / dof_stride;       // tile slot in the iteration
+                    const uint32_t k = i - u * dof_stride;   // DOF within tile
+                    const uint32_t a = dynamic ? tile_list[u] : u;  // env-local tile
+                    uint32_t comp; size_t gl;
+                    ArticDofTarget(env, a, k, dof_stride, links_per_dog, base_link_count,
+                                   dof_to_link, dof_to_component, comp, gl);
+                    const float v = qdot_sh[static_cast<size_t>(a) * dof_stride + k];
+                    if (comp != ~0u) {
+                        link_velocity[gl].v[comp] = v;
+                    } else {
+                        qdot[gl] = v;
+                    }
+                    qdot_flat[static_cast<size_t>(env_artic_base + a) * dof_stride + k] = v;
+                    // Scatter pseudo velocity to separate buffers consumed by position integration.
+                    if (pos_pass) {
+                        const float vp = qdot_pseudo_sh[static_cast<size_t>(a) * dof_stride + k];
+                        if (comp != ~0u) {
+                            link_velocity_pseudo[gl].v[comp] = vp;
+                        } else {
+                            qdot_pseudo[gl] = vp;
+                        }
+                        qdot_pseudo_flat[static_cast<size_t>(env_artic_base + a) *
+                                             dof_stride + k] = vp;
+                    }
+                }
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -1560,46 +1371,32 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         // The dynamic CC pass runs for PairDriven; the validation hook forces the
         // cook-time static schedule (the byte-identity reference) instead.
         const bool run_dynamic = with_b_arm && (p->force_static_islands == 0u);
-        // Dynamic islanding (PairDriven): the grid is the static MAX-island bound —
-        // each component consumes >=1 distinct dynamic entity (the broadphase drops
-        // static-static pairs), so #components <= artics + bodies + particles. The
-        // kernel reads the LIVE component count from data.island_count and early-exits
-        // the surplus blocks. The static schedule keeps its cook-time island count.
-        const uint32_t max_island_bound =
-            p->articulation_count + p->total_body_count + p->total_particle_count;
-        const uint32_t grid_islands = run_dynamic ? max_island_bound : p->total_islands;
-        if (grid_islands == 0u) {
+        // Distinct dynamic entities bound the number of live islands.
+        const uint64_t entity_bound = uint64_t{p->articulation_count} +
+                                      p->total_body_count + p->total_particle_count;
+        if (entity_bound > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
+        const uint32_t max_island_bound = static_cast<uint32_t>(entity_bound);
+        const uint32_t island_bound = run_dynamic ? max_island_bound : p->total_islands;
+        if (island_bound == 0u) {
             return Status::Ok;
         }
         // qdot region: legacy kMaxArticulationDof reservation for UnionCsr (the
         // H1-golden footprint), the compact K-tile reservation for PairDriven .
-        const uint32_t qdot_floats =
-            with_b_arm ? (artics_per_env * p->max_dof) : kMaxArticulationDof;
+        const uint64_t qdot_count = with_b_arm
+            ? uint64_t{artics_per_env} * p->max_dof : kMaxArticulationDof;
+        if (qdot_count > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
+        const uint32_t qdot_floats = static_cast<uint32_t>(qdot_count);
         // Split-impulse position pass runs ONLY on the PairDriven path (pos_iters>0).
         const bool pos_pass = (p->pos_iters > 0u) && with_b_arm;
-        // Union caches J/w in shared (cache_jw == !with_b_arm); PairDriven reads
-        // them from global (bounded shared), so its carve excludes the J/w regions.
-        // The position pass adds a parallel pseudo qdot tile + the dynamic-island
-        // per-component tile working set (PairDriven only).
+        // Shared storage includes velocity tiles and the schedule's optional row cache.
         const size_t shared_bytes = IslandSharedBytes(p->rows_per_env, p->max_dof,
                                                       qdot_floats, !with_b_arm,
                                                       pos_pass, artics_per_env);
-        // One-time opt-in past the 48 KB default dynamic-shared carve-out
-        // (sm_8x+ allows ~99 KB/block). Host-side attribute set — NOT a
-        // stream op, so it is graph-capture-safe; cached so the steady-state
-        // dispatch (and the captured plan) never re-issues it.
-        {
-            static size_t opted_in_bytes = 0;
-            if (shared_bytes > opted_in_bytes) {
-                if (cudaFuncSetAttribute(
-                        SolveRowsBlockIslandKernel,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        static_cast<int>(shared_bytes)) != cudaSuccess) {
-                    return Status::Failed;  // LOUD: slice exceeds the device limit.
-                }
-                opted_in_bytes = shared_bytes;
-            }
-        }
+        const uint32_t island_block_size = with_b_arm
+            ? kPairDrivenIslandBlockSize : kUnionIslandBlockSize;
+        uint32_t grid_islands = 0u;
+        if (ResidentGridSize(SolveRowsBlockIslandKernel, island_block_size, shared_bytes,
+                             island_bound, &grid_islands) != cudaSuccess) return Status::Failed;
         // Zero every GLOBAL pseudo accumulator (rigid/particle/articulation): the
         // dynamic schedule rewrites only solved tiles, so a dropped tile reads 0 here.
         if (pos_pass) {
@@ -1674,9 +1471,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 static_cast<uint32_t>(p->pos_iters),
                 p->pos_beta, p->pos_slop, p->dt,
                 p->baumgarte_max_velocity, p->continue_impulses == 0u);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         }
-        const uint32_t island_block_size = with_b_arm
-            ? kPairDrivenIslandBlockSize : kUnionIslandBlockSize;
         LaunchCuda(SolveRowsBlockIslandKernel, dim3(grid_islands),
                    dim3(island_block_size), static_cast<uint32_t>(shared_bytes),
                    stream,
@@ -1721,6 +1517,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    static_cast<uint32_t>(p->pos_iters),
                    p->pos_beta, p->pos_slop, p->dt,
                    p->baumgarte_max_velocity, p->continue_impulses == 0u);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         // Flush the articulation tiles the dynamic schedule dropped (the static path
         // scatters all tiles in-kernel). cc_artic_first is BuildSolveIslands' claim table.
         if (run_dynamic && p->articulation_count > 0u && p->max_dof > 0u &&
@@ -1736,6 +1533,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                        reinterpret_cast<Spatial6*>(data.link_velocity), data.qdot,
                        static_cast<const uint32_t*>(model.dof_to_link),
                        static_cast<const uint32_t*>(model.dof_to_component));
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         }
         if (with_b_arm && p->base_link_count > 0u &&
             p->joint_limit_rows_per_env >= p->base_link_count * 2u &&
@@ -1753,9 +1551,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     }
 
-    // the legacy FUSED family was deleted. The only remaining families are
-    // UnionCsr / PairDriven (handled above); anything else is an unconfigured
-    // contact family with nothing to solve.
+    // An unconfigured contact family has no rows to solve.
     return Status::Ok;
 }
 

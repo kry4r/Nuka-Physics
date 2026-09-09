@@ -33,6 +33,8 @@
 
 ## 按规格实施
 
+- [ ] 按用户最新补充，以 `mpm_water_drop_demo.cpp` 的 MLS-MPM bunny-water 为当前 CUDA 批次后的主要性能负载，辅以已有 jelly/刚体/关节 MPM 场景。冻结有效输入与质量/五进程基线，定位 P2G、应力、活跃网格、双向反作用、G2P/F 后成批优化；同名 PBF demo 不替代。
+- [ ] 性能批次后立即接续无 SDF 碰撞体与完整 MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面和完整多体链路。性能结果先明确已有覆盖与限制，不能把 single owner/SDF-only 路径验收写成完整耦合。
 - [x] 收口粒子时间层基础修复：统一工作位置、材料/接触交替、累计 lambda 与一次提交；六组完整长度门、已有场景/API/reset/渲染及 E=16 graph memcheck 通过。最大应变 1.838344%、最坏 RMS 0.203045%；完整接触刷新与 MPM 子步反馈另行继续。
 - [x] 单独完成构建架构隔离（`6953f4a`）：后端注册和 nk 核心脱离 CUDA 配置门，CUDA 源码与库按能力附加；无 CUDA 核心构建通过，不代表完整 CPU solver 已实现。
 - [x] 补充持续约束：原版不作为物理真值；参考 Newton/MuJoCo/Genesis 的匹配仿真、解析解/守恒/约束误差/收敛；multi-backend 下分开架构优化、CUDA 调优和物理算法变化。
@@ -41,7 +43,10 @@
 - [x] 修复结构近邻球接触与距离约束冲突，保留原 152.74% 应变失败；冻结新物理源码/二进制，见 [证据与方向](../research/2026-09-09-particle-topology-review-zh.md)。
 - [x] 布料压板输入修正：间隙计入球径/粒子厚度，表面速度与位姿一致；原各 10 mm 门通过，下压/恢复约 29.0/28.9 mm。原失败记录保留。
 - [x] 收口已有流体验收：三维 control-relative 量测覆盖侧向流动，原 3 mm/0.02 L1 预算通过，接触反作用同时通过；没有新增测试集合。
-- [ ] 冻结新物理六组五进程性能分母后，继续 CUDA 岛调度与每次 XPBD op 内的设备颜色循环；保留材料/接触交替边界，后端调优独立提交。
+- [x] 冻结新物理 `b0c2816` 的六组五进程分母，全部质量/状态/wrench/调度身份通过；graph E=1/16/256 为 3.366/3.672/6.402 ms，eager 噪声需交错对照。
+- [x] CUDA 岛调度与 XPBD 设备颜色循环完成联合验收：eager 五进程下降 39.02%–55.21%，graph 增加 0.22%–2.38%；完整质量/身份、材料/公开链路及 memcheck/synccheck 通过，E=2048 eager 跨驻留网格通过，见 [报告](../research/2026-09-09-cuda-execution-validation-zh.md)。
+- [ ] 继续处理大环境 ContactWarmStart 的 graph capture 失败：E=1024/2048 旧版失败，候选 E=2048 同样失败；eager 完整运行可通过，不能归因于 OOM。
+- [ ] 继续归因 soft-tet 压板的材料/形变验收不一致：基线和候选 min extent 0.179912567，恢复体积 0.00025918262，均未过原门；不因同值而宣称正确。
 
 以 [模块 spec 第 14 节](../plans/2026-09-07-physics-module-specs-newton-port-zh.md) 跟踪进度。每项改造前 review 对应 spec，再对照最新 Newton/MuJoCo/Genesis 实现并记录 revision 和决策。
 
