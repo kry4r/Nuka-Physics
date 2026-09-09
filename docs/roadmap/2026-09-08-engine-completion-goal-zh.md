@@ -47,6 +47,8 @@ eager 性能仍未验收：首次五进程和两组交错采样存在超过 5% �
 
 ## 性能模块的重点
 
+MLS-MPM 已完成体积硬截断修复和 [粒子归属/容量架构验收](../research/2026-09-09-mpm-ownership-validation-zh.md)。保持原 bunny-water 输入，五进程落水 eager/graph 从 50.865/47.616 降至 48.378/44.633 ms/步，数据区从 1.64 GB 降至 71.22 MB。CUDA 传输、活跃工作和反作用读取已成批修改，继续独立验证；局部大 J、无 SDF、多 owner、有限质量和 articulation 子步反馈均未据此关闭。
+
 MLS-MPM 按用户最新补充提升为当前 CUDA 调度批次之后的主要工作，覆盖从 P2G/应力到活跃网格、双向刚体/机器人反作用及 G2P/F 的完整路径。主负载复用 `examples/demo/mpm_water_drop_demo.cpp` 的 bunny-water（MLS-MPM），辅以已有 jelly、rigid/articulation-on-MPM 和 transfer 场景；`water_pool_demo.cpp` 的同名 PBF 场景不能替代。先记录当前输入、完整质量与性能基线/profile，再成批改生产代码，不新增独立测试框架。
 
 性能批次后紧接着完善 MPM 耦合：无 SDF collider 的通用几何查询，多个碰撞端点的有限质量约束，刚体/关节子步反作用与速度刷新，以及 MPM↔XPBD/其他介质的完整交换链路。SDF 是几何表示之一，不应成为通用耦合的必需条件；解析 primitive、凸体和网格查询生成同一接触契约，不增设场景求解器。当前 bunny 的 SDF、独立网格地板、single owner 和延迟 articulation deposit 等边界必须随性能结果报告，不以未覆盖能力无限推迟已有有效路径的优化，也不把局部性能验收当作完整多体耦合。

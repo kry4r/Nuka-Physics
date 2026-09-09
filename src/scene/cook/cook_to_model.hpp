@@ -96,14 +96,8 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
                               const ::nuka::terrain::HeightField& hf,
                               uint32_t orig_bodies);
 
-// Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
-// body<->body slot count) for body<->particle rows; idempotent, byte-identical when
-// particles_per_env == 0 (the reserve is then 0). The c_abi terrain cook recomputes
-// the rigid base after appending terrain collidables and re-applies this so a world
-// with BOTH terrain and particles keeps the rigid + particle slot ranges disjoint.
-// `row_exempt` = per-env particles that never emit body rows (the grid-coupled MPM
-// slice under MpmXpbd); they reserve no slots. Every remaining body-particle slot
-// has the provider-wide one-point/five-row footprint, independent of solver mode.
+// Reserve one-point particle contacts above the rigid manifold budget.
+// row_exempt is the grid-owned particle count from Model::MpmParticlesPerEnv().
 void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
                                    uint32_t row_exempt = 0u);
 

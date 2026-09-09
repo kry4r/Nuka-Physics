@@ -1036,6 +1036,12 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
     }
 }
 
+uint32_t Model::MpmParticlesPerEnv() const {
+    if (particles.mode == ParticleMode::Mpm) return capacities.particles_per_env;
+    if (particles.mode == ParticleMode::MpmXpbd) return particles.n_mpm_particles;
+    return 0u;
+}
+
 phi::Status Model::ValidateTopology(std::string* reason) const {
     if (reason) reason->clear();
     auto reject = [&](phi::Status status, const std::string& message) {
@@ -1051,6 +1057,8 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     constexpr uint64_t limit = std::numeric_limits<uint32_t>::max();
     if (cap.env_count == 0u)
         return reject(Status::InvalidArgument, "environment count must be positive");
+    if (MpmParticlesPerEnv() > cap.particles_per_env)
+        return reject(Status::InvalidArgument, "MPM particle slice exceeds its environment");
     for (uint64_t count : {uint64_t(n), uint64_t(k), uint64_t(cap.bodies_per_env),
                            uint64_t(cap.particles_per_env), uint64_t(cap.aero_tris_per_env) * 3u}) {
         if (count * cap.env_count > limit)
