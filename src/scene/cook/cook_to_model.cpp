@@ -230,14 +230,6 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
     return static_cast<uint32_t>(out.size() / 3u) - start;
 }
 
-// Per-env particles that never emit body rows: the grid-coupled MPM slice under
-// MpmXpbd. 0 for every other mode (their whole particle set reserves slots).
-static uint32_t RowExemptParticles(const nk::Model& model) {
-    return model.particles.mode == nk::Model::ParticleMode::MpmXpbd
-               ? model.particles.n_mpm_particles
-               : 0u;
-}
-
 static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
     const uint64_t total_rows =
         contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env) +
@@ -260,17 +252,14 @@ static uint32_t DefaultRigidCandidatePairs(uint32_t collidables) {
 
 }  // namespace
 
-// Grow the body-contact budget by a DISJOINT reserve above `rigid_base` (the cooked
-// body<->body budget) for body<->particle rows; idempotent, byte-identical when 0.
-// `row_exempt` = per-env particles that never emit body rows (a grid-coupled MPM
-// slice under MpmXpbd) and therefore reserve no slots. Every reserved particle
-// slot is sphere-vs-body and uses the same one-point/five-row footprint in every
-// particle mode; rigid slots retain the four-point/twenty-row worst case.
+// Reserve particle rows above the rigid budget, excluding grid-owned particles.
+// Rigid slots retain the full manifold footprint; particle slots contain one point.
 void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
                                    uint32_t row_exempt) {
-    if (rigid_base == 0u) return;  // no body contacts -> no body<->particle rows.
-    const uint32_t row_particles =
-        row_exempt < cap.particles_per_env ? cap.particles_per_env - row_exempt : 0u;
+    if (row_exempt > cap.particles_per_env)
+        throw std::runtime_error("CookToModel: grid particle slice exceeds its environment");
+    if (rigid_base == 0u) return;
+    const uint32_t row_particles = cap.particles_per_env - row_exempt;
     const uint64_t reserve =
         static_cast<uint64_t>(row_particles) *
         collision::kBodyParticleContactSlotsPerParticle;
@@ -1481,7 +1470,7 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
                        nk::kPairDrivenRowsPerSlot);
     // A coupled world (terrain AND particles) keeps the body<->particle slot reserve
     // disjoint above the rigid base -- no-op when particles_per_env == 0.
-    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
+    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
     return body_row;
 }
 
@@ -1619,7 +1608,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     cap.aero_tris_per_env = an;
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget
     // (no-op when there are no body contacts -> particle-only cooks byte-identical).
-    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
+    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
     // n_soft_particles is left at its default (0); it is only consulted for the
     // SoftFluid mode (CookSoftFluidParticles sets it). The single-system Xpbd
     // ops ignore it (mode-gated), so the device-staged bytes are unaffected.
@@ -1714,9 +1703,8 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
 
     const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(n);
-    // Reuse the SAME disjoint body<->particle slot reserve as the XPBD cook so
-    // coupling stays one-path (no-op when there are no body contacts).
-    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
+    // Grid transfer owns these particles, so only the rigid manifold budget remains.
+    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
 void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
@@ -1843,7 +1831,7 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     cap.max_grid_cells = in.grid_dims[0] * in.grid_dims[1] * in.grid_dims[2];
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget
     // (no-op when there are no body contacts -> particle-only cooks byte-identical).
-    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
+    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
 // Wire the body<->particle contact radius + cross-system non-penetration co-step
@@ -1959,7 +1947,7 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
         fluid.grid_dims[0] * fluid.grid_dims[1] * fluid.grid_dims[2];
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget for
     // the FULL union (recomputed from rigid_base, overriding the inner soft growth).
-    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
+    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
 // ---------------------------------------------------------------------------
@@ -2049,9 +2037,8 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     cap.shape_match_slots_per_env   = xtmp.capacities.shape_match_slots_per_env;
     cap.shape_match_members_per_env = xtmp.capacities.shape_match_members_per_env;
     cap.aero_tris_per_env = xtmp.capacities.aero_tris_per_env;
-    // Reserve the disjoint body<->particle slot block over the FULL [mpm|xpbd] count
-    // (recomputed from rigid_base, overriding the MPM cook's inner growth).
-    GrowContactBudgetForParticles(cap, rigid_base, RowExemptParticles(model));
+    // Reserve body-particle rows for the XPBD slice above the rigid manifold budget.
+    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
 // ---------------------------------------------------------------------------

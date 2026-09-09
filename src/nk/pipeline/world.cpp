@@ -99,11 +99,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
 
     // Size the MLS-MPM P2G deterministic-gather scratch the same way; 0 for a
     // non-MPM world (zero-byte segment, byte-inert).
-    const uint32_t mpm_per_env =
-        model_.particles.mode == Model::ParticleMode::Mpm
-            ? model_.capacities.particles_per_env
-        : model_.particles.mode == Model::ParticleMode::MpmXpbd
-            ? model_.particles.n_mpm_particles : 0u;
+    const uint32_t mpm_per_env = model_.MpmParticlesPerEnv();
     const uint64_t mpm_particle_sort_count =
         static_cast<uint64_t>(mpm_per_env) * model_.capacities.env_count;
     // The same workspace also compacts active P2G nodes and, when dynamic bodies

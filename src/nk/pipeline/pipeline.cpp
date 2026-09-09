@@ -40,13 +40,9 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const bool has_bodies       = cap.bodies_per_env > 0;
     const bool has_particles    = cap.particles_per_env > 0;
     const bool has_contacts     = cap.max_rows_per_env > 0;
-    // A cooked MLS-MPM medium (mode == Mpm + a sized grid). Gates the MpmStep emit
-    // build-time so a non-MPM world's op list is byte-identical (no MpmStep OpCall).
-    const bool has_mpm =
-        has_particles &&
-        (model.particles.mode == Model::ParticleMode::Mpm ||
-         model.particles.mode == Model::ParticleMode::MpmXpbd) &&
-        cap.mpm_grid_nodes_per_env > 0u;
+    const uint32_t grid_particles_per_env = model.MpmParticlesPerEnv();
+    if (grid_particles_per_env > cap.particles_per_env) return phi::Status::InvalidArgument;
+    const bool has_mpm = grid_particles_per_env > 0u && cap.mpm_grid_nodes_per_env > 0u;
     // gate the contact pipeline (SyncLinkBodyPose / broadphase / narrowphase)
     // on actual contact capacity. For every cooked-with-contacts world this equals
     // the old structural test -- the cook sizes max_contacts_per_env ==
@@ -82,17 +78,12 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     // OSC is an explicit world-create opt-in. Every other mode keeps the
     // historical pipeline order byte-for-byte.
     const bool use_osc = model.drive_mode == 4u;
-    // rigid_cap recovers the pre-particle budget the cook grew from, so rigid keeps
-    // [0, rigid_cap) and particles the top range; particle-free -> rigid_cap == total.
-    // The MpmXpbd MPM slice couples via the grid and reserves no slots — the SAME
-    // exemption GrowContactBudgetForParticles applies, so the recovery matches.
-    const uint32_t row_exempt_particles =
-        model.particles.mode == Model::ParticleMode::MpmXpbd
-            ? model.particles.n_mpm_particles : 0u;
-    const uint32_t particle_reserve =
-        has_particles ? (cap.particles_per_env - row_exempt_particles) *
-                            collision::kBodyParticleContactSlotsPerParticle
-                      : 0u;
+    // The same particle ownership sizes the cook reserve and the pipeline's row range.
+    const uint64_t particle_reserve64 = cap.max_contacts_per_env > 0u
+        ? uint64_t{cap.particles_per_env - grid_particles_per_env} *
+              collision::kBodyParticleContactSlotsPerParticle : 0u;
+    if (particle_reserve64 > cap.max_contacts_per_env) return phi::Status::InvalidArgument;
+    const uint32_t particle_reserve = static_cast<uint32_t>(particle_reserve64);
     const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve;
     const uint32_t default_pair_cap =
         cap.bodies_per_env * 4u < rigid_cap ? cap.bodies_per_env * 4u : rigid_cap;
@@ -208,10 +199,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     // SoftFluid: the per-env [soft | fluid] split + stride (0 elsewhere).
     const uint32_t n_soft = mp.mode == Model::ParticleMode::SoftFluid
                                 ? mp.n_soft_particles : 0u;
-    // MpmXpbd: the per-env MPM slice count [0, n_mpm) (0 elsewhere). The XPBD ops
-    // skip it; the MpmStep scopes to it; the body<->particle rows start above it.
-    const uint32_t n_mpm = mp.mode == Model::ParticleMode::MpmXpbd
-                               ? mp.n_mpm_particles : 0u;
+    const uint32_t n_mpm = grid_particles_per_env;
     const uint32_t per_env_particles = cap.particles_per_env;
     // Per-env soft-particle count selecting which per-system mu a particle side
     // reads: SoftFluid the explicit split, Xpbd all-soft, Pbf all-fluid, Coupled by type.
@@ -435,8 +423,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_part_projection_velocity_.particle_count = particle_count;
         p_part_projection_velocity_.particles_per_env = per_env_particles;
         p_part_projection_velocity_.active_begin_per_env =
-            (particle_mode == phi::kParticleModeMpm || particle_mode == phi::kParticleModeNone)
-                ? per_env_particles : n_mpm;
+            particle_mode == phi::kParticleModeNone ? per_env_particles : n_mpm;
         p_part_contact_delta_.dt = cfg.dt;
         p_part_contact_delta_.particle_count = particle_count;
         p_part_contact_delta_.particles_per_env = per_env_particles;

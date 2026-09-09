@@ -45,9 +45,7 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // Every row-coupled particle uses the same projected geometry.
     p_np_body_particle.fluid_pos_source = 1u;
     p_np_body_particle.n_soft_particles = 0u;
-    // MpmXpbd: the MPM slice [0, n_mpm) couples via the grid, not rows, so it
-    // generates no body<->particle manifold; only [n_mpm, P) (the cloth) makes rows.
-    // 0 for every other mode -> the whole particle range makes rows (byte-identical).
+    // Grid-owned particles do not emit body-particle manifolds.
     p_np_body_particle.particle_row_base = ctx.n_mpm;
     // Warp-per-particle only pays off when a collider has a WIDE hull whose
     // SupportHull scan dominates; an analytic-only collider world (box/sphere/
@@ -94,8 +92,7 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
     phi::MpmStepParams& p = *ctx.p_mpm_step;
     p.particle_count = ctx.particle_count;
     p.particles_per_env = ctx.particles_per_env;
-    // MpmXpbd scopes the transfer to the MPM slice [0, n_mpm); a lone MPM medium runs
-    // the whole per-env block (n_mpm 0 -> OpMpmStep treats it as particles_per_env).
+    // Pure and mixed MPM use the same explicit grid-owned particle range.
     p.mpm_particles_per_env = ctx.n_mpm;
     p.env_count = ctx.env_count;
     p.nodes_per_env = model.capacities.mpm_grid_nodes_per_env;

@@ -33,6 +33,9 @@
 
 ## 按规格实施
 
+- [x] MLS-MPM 体积更新修复：取消隐藏 J 截断，保留失败状态并纠正 Tait 声速/CFL 口径；原 bunny-water eager/graph 与已有 28 项场景通过。局部稀疏膨胀和完整耦合继续审查，见 [MPM review](../research/2026-09-09-mpm-performance-review-zh.md)。
+- [x] 统一纯/混合 MPM 粒子归属及接触容量：五进程落水 eager/graph 分别改善 4.89%/6.26%，数据区 1.64 GB → 71.22 MB；完整状态/质量、33 项既有 MPM 场景及固定 pipeline 通过，见 [容量验收](../research/2026-09-09-mpm-ownership-validation-zh.md)。
+- [ ] 验收 CUDA MPM 传输权重缓存、占用 cell 标记、独立 workspace、活跃网格和稳定反作用分块读取；按同物理分母采集五进程与 sanitizer，继续定位剩余热点。
 - [ ] 按用户最新补充，以 `mpm_water_drop_demo.cpp` 的 MLS-MPM bunny-water 为当前 CUDA 批次后的主要性能负载，辅以已有 jelly/刚体/关节 MPM 场景。冻结有效输入与质量/五进程基线，定位 P2G、应力、活跃网格、双向反作用、G2P/F 后成批优化；同名 PBF demo 不替代。
 - [ ] 性能批次后立即接续无 SDF 碰撞体与完整 MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面和完整多体链路。性能结果先明确已有覆盖与限制，不能把 single owner/SDF-only 路径验收写成完整耦合。
 - [x] 收口粒子时间层基础修复：统一工作位置、材料/接触交替、累计 lambda 与一次提交；六组完整长度门、已有场景/API/reset/渲染及 E=16 graph memcheck 通过。最大应变 1.838344%、最坏 RMS 0.203045%；完整接触刷新与 MPM 子步反馈另行继续。

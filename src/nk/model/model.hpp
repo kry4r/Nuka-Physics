@@ -472,6 +472,9 @@ public:
     };
     ModelParticles particles;
 
+    // The low particle slice owned by grid transfer, excluded from particle contact rows.
+    uint32_t MpmParticlesPerEnv() const;
+
     // -- M4: contact family + union (CSR compliant) tables --------------------
     // L1-b: the FUSED runtime path is deleted; PairDriven is the general default.
     // (The FusedFoot enum value is retained but dead until the L1-d enum collapse.)
