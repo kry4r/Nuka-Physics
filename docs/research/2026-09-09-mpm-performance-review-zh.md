@@ -58,6 +58,16 @@ Nsight Compute 返回 `ERR_NVGPUCTRPERM`，没有获得硬件计数器；保留�
 - 每个刚体的节点数据并行分块加载，线/角反作用仍按原稳定节点顺序累加；保持自由体反馈与关节 deposit 的现有时间层，时间层修复另做。
 - 检查 CUB/workspace 与 launch 错误。记录额外 workspace 成本，不用删除 eager 完成检查、改变材料或减少子步取得收益。
 
+首个 CUDA 候选 `cuda_transfer_v1_frozen` 保持完整轨迹/十个末帧字段相同，既有 33 项场景通过，但不接受其静置回退：单次 eager/graph 静置为 44.307/39.747 ms，高于容量基线的 41.471/36.965 ms。profile 中 P2G 静置从 26.670 增至 33.838 ms，尽管 registers 从 71 降至 54；缓存完整权重/64 位 base 没有取得净收益。反作用分块读取降至下降阶段 0.419 ms，cell run 标记为 0.259 ms，这两项保留。原候选、状态和 profile 完整留存，不进入正式性能验收。
+
+下一实现取消完整 B-spline 记录：稳定 cell run 已给出 base，P2G 直接计算当前 stencil 的单个轴权重，避免重复 floor、64 位 base 读取与无用轴权重。位置、质量、速度、C、应力及参考体积按稳定粒子次序连续打包，替换每个贡献项的多数组间接读取；仅复制原 f32 属性，原 APIC/应力分项及累加顺序保持。其他 workspace/活跃集合/错误传播与反作用改动不变，再进行联合验证。
+
+第二版单进程 eager 静置/落水为 28.393/30.154 ms，graph 为 23.617/26.189 ms；33 项既有场景通过，但完整轨迹与分母不同，未进入正式五进程验收。代码审查发现按 cell 推导 base 会丢弃越界粒子的部分 stencil，且内联权重的坐标乘减存在不同的收缩舍入机会。下一版在连续记录中保留已检查范围的三轴 int32 base，恢复部分 stencil 贡献及其逃逸状态；单权重计算显式保留坐标减法舍入。仍不缓存完整权重，也不改变材料、迭代或反作用公式。原第二版结果完整保留，数值差异需验证归因，不能只凭时间改善接受。
+
+本次更新前再次查询并 fetch：Newton `90c56c3be73e35a34ccb37ab593a529e8a3d18dd`，MuJoCo `319cf22fdf6fabb803205fcafbb9398707736c8d`，Genesis `8325a478f0d52a1c28bb58c95dfe519fcf38fc2b`。Newton 无增量，MuJoCo 仅阻抗说明/图与渲染包初始化变化；Genesis 更新异构 default armature、树内 inverse weight 刷新及 MJCF actuator force range，MPM/coupler 源码未变。本批不改惯量或驱动力契约；后续有限质量和多体耦合须包含转子惯量、整个关节树的有效质量刷新，不能照搬忽略锁定轴的简单 slider 权重。版本与原始增量保存在 `cuda_transfer_v3_upstream_review.json` 及各引擎 diff。
+
+最终第三版通过 [五进程与完整 pipeline 验收](2026-09-09-cuda-mpm-transfer-validation-zh.md)：落水 eager 48.270 → 32.812 ms（−32.02%），graph 44.611 → 28.809 ms（−35.42%）；静置也改善，十对完整状态和质量相同。Data arena 增加 24.48 MB 至 95.70 MB。33 项既有场景、固定 E=16 graph pipeline 及针对性 memcheck/synccheck 通过。最终 profile 中 P2G/记录准备仍占落水 kernel busy 的 62.78%/13.26%，继续保留其优化方向与网格主导容量的内存成本；本批不关闭完整耦合或全路径性能目标。
+
 ## 性能方向与分类
 
 1. **共享架构**：纯 MPM 与混合 MPM/XPBD 应使用相同的粒子所有权定义。当前 `RowExemptParticles` 仅识别混合模式，纯 MPM 的 180,000 粒子被分配 720,000 个不会发射的 body-particle slots，使 contact/cache/row workspace 显著膨胀。统一 model/cook/pipeline 对网格粒子范围的认识，保留真实刚体接触预算、全部网格反作用及混合场景 XPBD 接触；不得通过关闭接触获得减量。
