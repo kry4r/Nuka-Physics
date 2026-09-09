@@ -309,6 +309,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::LinkContactBegin, DlpackDtype::kU32, 1, false, false},  // link_contact_begin
     {FieldId::LinkContactEnd, DlpackDtype::kU32, 1, false, false},  // link_contact_end
     {FieldId::ContactIndexScratch, DlpackDtype::kU8, 1, false, false},  // contact_index_scratch
+    {FieldId::ParticleTopologyOffsets, DlpackDtype::kU32, 1, false, false},  // particle_topology_offsets
+    {FieldId::ParticleTopologyElements, DlpackDtype::kU32, 1, false, false},  // particle_topology_elements
+    {FieldId::ParticleContactRestPos, DlpackDtype::kF32, 2, false, false},  // particle_contact_rest_pos
 };
 
 } // namespace nuka::nk

@@ -42,16 +42,9 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // contact radius); 0 leaves the op inert (no collision radius cooked).
     p_np_body_particle.particle_radius = 0.5f * model.particles.pp_contact_d_min;
     p_np_body_particle.contact_margin = ctx.contact_margin;
-    // Detect the fluid slice at its predicted position (the gravity-integrated
-    // pos the density solve uses) for PBF/SoftFluid, consistent with the
-    // particle grid's pos_source -- kills the one-step fluid<->body contact
-    // lag. The soft slice + pure-Xpbd/Coupled keep particle_pos (n_soft=0 for
-    // pure Pbf routes every particle; the SoftFluid split routes [n_soft, P)).
-    p_np_body_particle.fluid_pos_source =
-        (ctx.particle_mode == phi::kParticleModePbf ||
-         ctx.particle_mode == phi::kParticleModeSoftFluid)
-            ? 1u : 0u;
-    p_np_body_particle.n_soft_particles = ctx.n_soft;
+    // Every row-coupled particle uses the same projected geometry.
+    p_np_body_particle.fluid_pos_source = 1u;
+    p_np_body_particle.n_soft_particles = 0u;
     // MpmXpbd: the MPM slice [0, n_mpm) couples via the grid, not rows, so it
     // generates no body<->particle manifold; only [n_mpm, P) (the cloth) makes rows.
     // 0 for every other mode -> the whole particle range makes rows (byte-identical).
@@ -148,7 +141,6 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
 void RowCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {
     const Model& model = *ctx.model;
     phi::ParticleFinalizeParams& p_part_finalize = *ctx.p_part_finalize;
-    phi::ParticleParticleContactParams& p_pp_contact = *ctx.p_pp_contact;
 
     p_part_finalize.dt = ctx.dt;
     p_part_finalize.mode = ctx.particle_mode;
@@ -169,23 +161,6 @@ void RowCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {
     p_part_finalize.pos_pass = ctx.pos_pass;
     ctx.Emit(phi::NkOp::ParticleFinalize, &p_part_finalize);
 
-    // Cross-system: the cross-system particle-particle contact co-step
-    // (the op-ified cross-system particle co-step). Runs AFTER ParticleFinalize
-    // (incl. the fluid-slice polish), correcting the committed union positions
-    // (particle_pos) over the union grid CSR built this step. ONLY the SoftFluid
-    // mode emits real work; the single-system Xpbd/Pbf paths carry the op only
-    // as an inert no-op (mode-gated early-exit) so they stay byte-identical.
-    p_pp_contact.contact_distance_d_min =
-        ctx.particle_mode == phi::kParticleModeSoftFluid
-            ? model.particles.pp_contact_d_min : 0.0f;
-    p_pp_contact.compliance_alpha = model.particles.pp_contact_compliance;
-    p_pp_contact.solver_iterations =
-        model.particles.pp_contact_iters == 0u ? 1u : model.particles.pp_contact_iters;
-    p_pp_contact.mode = ctx.particle_mode;
-    p_pp_contact.particle_count = ctx.particle_count;
-    p_pp_contact.n_soft_particles = ctx.n_soft;
-    p_pp_contact.particles_per_env = ctx.particles_per_env;
-    ctx.Emit(phi::NkOp::ParticleParticleContact, &p_pp_contact);
 }
 
 } // namespace nuka::nk

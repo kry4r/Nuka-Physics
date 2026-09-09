@@ -72,13 +72,11 @@ private:
     void AddOp(phi::NkOp op, const void* params, phi::Device* device);
     friend struct CouplingBuildCtx;
 
-    // Append an op with its params; the params live in `param_storage_` (a node-
-    // stable deque-like vector of variant blocks) so addresses never move after
-    // Build returns. We keep one typed vector per param POD; pointers into a
-    // reserved vector are stable because we reserve to the worst-case count
-    // (each op appears at most once per step).
+    // Parameter storage is sized before emission so captured calls retain stable addresses.
     std::vector<phi::OpCall> calls_;
     std::vector<phi::NkOp> missing_ops_;
+    std::vector<phi::XpbdProjectParams> p_xpbd_iterations_;
+    std::vector<phi::SolveRowsBlockIslandParams> p_solve_iterations_;
 
     // The build-time coupling providers (row path + MLS-MPM grid-transfer path).
     // Owned by the Pipeline (their lifetime parallels the Params PODs); consulted
@@ -87,9 +85,7 @@ private:
     RowCouplingProvider row_coupling_provider_;
     MpmCouplingProvider mpm_coupling_provider_;
 
-    // Stable param storage: one slot per op kind. Reserved so push_back never
-    // reallocates (each op is emitted at most once). Plain value members keep
-    // the addresses stable for the Pipeline's lifetime.
+    // Reused parameter blocks are immutable after the pipeline is built.
     phi::ApplyDrivesParams            p_apply_drives_{};
     phi::ApplyOscDrivesParams         p_apply_osc_{};
     phi::AbaForwardParams             p_aba_{};
@@ -117,6 +113,8 @@ private:
     phi::SolveRowsBlockIslandParams   p_solve_{};
     phi::AeroDragParams               p_aero_drag_{};
     phi::ParticlePredictParams        p_part_predict_{};
+    phi::ParticleProjectionVelocityParams p_part_projection_velocity_{};
+    phi::ParticleContactDeltaParams   p_part_contact_delta_{};
     phi::XpbdProjectParams            p_xpbd_{};
     phi::PbfDensityLambdaParams       p_pbf_density_{};
     phi::PbfApplyDeltaParams          p_pbf_apply_{};

@@ -5,6 +5,7 @@
 #include "nk/model/model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -241,6 +242,13 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         }
         if (id == FieldId::SmColorSegments) {
             return static_cast<uint64_t>(xpbd_sm_colors) * 2ull;
+        }
+        if (id == FieldId::ParticleTopologyOffsets) {
+            return particle_topology_incidence_count > 0u ? uint64_t{particles_per_env} + 1u : 0u;
+        }
+        if (id == FieldId::ParticleTopologyElements) return particle_topology_incidence_count;
+        if (id == FieldId::ParticleContactRestPos) {
+            return particle_topology_incidence_count > 0u ? particles_per_env : 0u;
         }
         // LBVH per-env Karras tree: (2N-1) nodes/env (N = bodies_per_env), 9 f32
         // lanes/node, env_count envs. The kernel strides by env*(2N-1) so the
@@ -605,6 +613,15 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             if (!sm_color_segments.empty())
                 std::memcpy(dst, sm_color_segments.data(),
                             sm_color_segments.size() * sizeof(uint32_t));
+            break;
+        case FieldId::ParticleTopologyOffsets:
+            std::memcpy(dst, particles.topology_offsets.data(), seg.bytes);
+            break;
+        case FieldId::ParticleTopologyElements:
+            std::memcpy(dst, particles.topology_elements.data(), seg.bytes);
+            break;
+        case FieldId::ParticleContactRestPos:
+            std::memcpy(dst, particles.initial_pos.data(), seg.bytes);
             break;
         // ---------------------------------------------------------------
         // M6 XPBD constraint templates (owner:model). The single-env template
@@ -974,6 +991,9 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::AeroParticleOffset:    v.aero_particle_offset = static_cast<uint32_t*>(p); break;
         case FieldId::AeroParticleCount:     v.aero_particle_count = static_cast<uint32_t*>(p); break;
         case FieldId::AeroIncidentTri:       v.aero_incident_tri = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleTopologyOffsets: v.particle_topology_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleTopologyElements: v.particle_topology_elements = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleContactRestPos: v.particle_contact_rest_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::DistColorSegments:     v.dist_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::BendColorSegments:     v.bend_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::VolColorSegments:      v.vol_color_segments = static_cast<uint32_t*>(p); break;
@@ -1119,6 +1139,44 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         }
     }
     const auto& p = particles;
+    if (p.dist_a.size() != p.dist_b.size() || p.dist_a.size() != p.dist_rest.size() ||
+        p.dist_a.size() != p.dist_alpha.size() || p.dist_a.size() > cap.dist_cons_per_env ||
+        p.bend_particles.size() != p.bend_alpha.size() * 4ull ||
+        p.bend_gradients.size() != p.bend_particles.size() || p.bend_alpha.size() > cap.bend_cons_per_env ||
+        p.vol_particles.size() != p.vol_alpha.size() * 4ull || p.vol_rest6.size() != p.vol_alpha.size() ||
+        p.vol_alpha.size() > cap.vol_cons_per_env)
+        return reject(Status::InvalidArgument, "incomplete particle constraint tables");
+    const auto clusters = p.sm_cluster_size.size();
+    if (p.sm_cluster_offset.size() != clusters || p.sm_stiffness.size() != clusters ||
+        p.sm_rest_centroid.size() != clusters || clusters > cap.shape_match_slots_per_env ||
+        p.sm_particles.size() != p.sm_rest_q.size() || p.sm_particles.size() != p.sm_mass.size() ||
+        p.sm_particles.size() > cap.shape_match_members_per_env)
+        return reject(Status::InvalidArgument, "incomplete shape-match cluster tables");
+    uint64_t incidences = p.dist_a.size() * 2ull + p.bend_particles.size() +
+                          p.vol_particles.size() + p.aero_tri_verts.size();
+    if (p.dist_a.size() + p.bend_alpha.size() + p.vol_alpha.size() + clusters +
+        p.aero_tri_area.size() > limit)
+        return reject(Status::InvalidArgument, "particle structural elements exceed device indexing");
+    for (size_t cluster = 0u; cluster < clusters; ++cluster) {
+        if (uint64_t{p.sm_cluster_offset[cluster]} + p.sm_cluster_size[cluster] > p.sm_particles.size())
+            return reject(Status::InvalidArgument, "shape-match member span exceeds its pool");
+        incidences += p.sm_cluster_size[cluster];
+        if (incidences > limit)
+            return reject(Status::InvalidArgument, "particle structural incidence exceeds device indexing");
+    }
+    if (incidences > limit)
+        return reject(Status::InvalidArgument, "particle structural incidence exceeds device indexing");
+    for (const auto* indices : {&p.dist_a, &p.dist_b, &p.bend_particles, &p.vol_particles, &p.sm_particles})
+        for (uint32_t particle : *indices)
+            if (particle >= cap.particles_per_env)
+                return reject(Status::InvalidArgument, "particle constraint index exceeds its environment");
+    if (incidences > 0u) {
+        if (p.initial_pos.size() != cap.particles_per_env)
+            return reject(Status::InvalidArgument, "particle topology requires complete rest positions");
+        for (const auto& position : p.initial_pos)
+            if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z))
+                return reject(Status::InvalidArgument, "particle rest positions must be finite");
+    }
     for (float value : {p.aero_drag_normal, p.aero_drag_tangent, p.aero_drag_max_dv})
         if (!std::isfinite(value) || value < 0.0f)
             return reject(Status::InvalidArgument, "aerodynamic coefficients must be finite and nonnegative");
@@ -1133,6 +1191,45 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
             return reject(Status::InvalidArgument, "invalid aerodynamic triangle indices or area");
     }
     return Status::Ok;
+}
+
+void Model::BuildParticleTopology() {
+    auto& p = particles;
+    p.topology_offsets.clear();
+    p.topology_elements.clear();
+    capacities.particle_topology_incidence_count = 0u;
+    std::vector<std::pair<uint32_t, uint32_t>> memberships;
+    size_t incidence_bound = p.dist_a.size() * 2u + p.bend_particles.size() +
+                             p.vol_particles.size() + p.aero_tri_verts.size();
+    for (uint32_t count : p.sm_cluster_size) incidence_bound += count;
+    memberships.reserve(incidence_bound);
+    uint32_t element = 0u;
+    const auto append = [&](const uint32_t* indices, size_t count) {
+        for (size_t i = 0u; i < count; ++i) memberships.emplace_back(indices[i], element);
+        ++element;
+    };
+    for (size_t i = 0u; i < p.dist_a.size(); ++i) {
+        const std::array<uint32_t, 2> indices{p.dist_a[i], p.dist_b[i]};
+        append(indices.data(), indices.size());
+    }
+    for (size_t i = 0u; i < p.bend_particles.size(); i += 4u) append(p.bend_particles.data() + i, 4u);
+    for (size_t i = 0u; i < p.vol_particles.size(); i += 4u) append(p.vol_particles.data() + i, 4u);
+    for (size_t i = 0u; i < p.sm_cluster_size.size(); ++i)
+        if (p.sm_cluster_size[i] > 0u)
+            append(p.sm_particles.data() + p.sm_cluster_offset[i], p.sm_cluster_size[i]);
+    for (size_t i = 0u; i < p.aero_tri_verts.size(); i += 3u) append(p.aero_tri_verts.data() + i, 3u);
+    if (memberships.empty()) return;
+    std::sort(memberships.begin(), memberships.end());
+    memberships.erase(std::unique(memberships.begin(), memberships.end()), memberships.end());
+    p.topology_offsets.assign(size_t{capacities.particles_per_env} + 1u, 0u);
+    p.topology_elements.reserve(memberships.size());
+    for (const auto& [particle, group] : memberships) {
+        ++p.topology_offsets[size_t{particle} + 1u];
+        p.topology_elements.push_back(group);
+    }
+    for (size_t i = 1u; i < p.topology_offsets.size(); ++i)
+        p.topology_offsets[i] += p.topology_offsets[i - 1u];
+    capacities.particle_topology_incidence_count = static_cast<uint32_t>(memberships.size());
 }
 
 void Model::BuildAeroAdjacency() {
@@ -1163,6 +1260,7 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     const auto topology_status = ValidateTopology();
     if (topology_status != phi::Status::Ok) return topology_status;
     BuildAeroAdjacency();
+    BuildParticleTopology();
     // Capacity contracts (loud-failure discipline): the cooked host tables MUST
     // fit their advertised capacities, else staging would SILENTLY drop the tail
     // (a truncated device model that simulates wrong with no diagnostic). The

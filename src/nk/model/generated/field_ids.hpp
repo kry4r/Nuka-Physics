@@ -293,6 +293,9 @@ enum class FieldId : uint16_t {
     LinkContactBegin,  // link_contact_begin (per:link arena:scratch owner:data)
     LinkContactEnd,  // link_contact_end (per:link arena:scratch owner:data)
     ContactIndexScratch,  // contact_index_scratch (per:scalar arena:scratch owner:data count:contact_index_scratch_bytes)
+    ParticleTopologyOffsets,  // particle_topology_offsets (per:scalar arena:persistent owner:model count:particle_topology_offsets)
+    ParticleTopologyElements,  // particle_topology_elements (per:scalar arena:persistent owner:model count:particle_topology_incidence_count)
+    ParticleContactRestPos,  // particle_contact_rest_pos (per:scalar arena:persistent owner:model count:particle_contact_rest_positions)
     Count
 };
 
@@ -581,6 +584,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "link_contact_begin",
     "link_contact_end",
     "contact_index_scratch",
+    "particle_topology_offsets",
+    "particle_topology_elements",
+    "particle_contact_rest_pos",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

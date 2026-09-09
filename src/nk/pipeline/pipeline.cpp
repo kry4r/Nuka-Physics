@@ -123,13 +123,8 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         AddOp(op, params, device);
     };
 
-    // the spec FIXED order:
-    // ApplyDrives -> AbaForward -> IntegrateVelocity (+ParticlePredict) ->
-    // FkWorldPoses -> BuildAabbs -> LbvhBuild -> LbvhQueryPairs (+ParticleGridBuild)
-    // -> NarrowphasePrimitives -> NarrowphaseSdf -> ContactTangentBasis ->
-    // CrbaComputeM -> CrbaFactorM -> AssembleRows -> SolveRowsBlockIsland
-    // (+XpbdProject / PbfDensityLambda inline) -> IntegratePosition
-    // (+ParticleFinalize) -> ReadoutContactWrench.
+    // Contact detection and solving consume the internally projected particle state.
+    // Step-start velocity remains the acceleration reference; finalization adds contact deltas once.
 
     if (has_contacts) {
         p_step_velocity_.env_count = env_count;
@@ -240,6 +235,22 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         (particle_mode == phi::kParticleModeSoftFluid) ||
         (particle_mode == phi::kParticleModeCoupled &&
          coupled_internal == phi::kCoupledInternalPbf);
+
+    const uint32_t xpbd_iterations = (dist_count | bend_count | vol_count | sm_cluster_count) != 0u
+        ? std::max<uint32_t>(mp.xpbd_iters, 1u) : 0u;
+    const uint32_t pbf_iterations = runs_pbf ? std::max<uint32_t>(mp.pbf_iters, 1u) : 0u;
+    const uint32_t pp_iterations = particle_mode == phi::kParticleModeSoftFluid && mp.pp_contact_d_min > 0.0f
+        ? std::max<uint32_t>(mp.pp_contact_iters, 1u) : 0u;
+    const uint32_t coupling_iterations = std::max({1u, xpbd_iterations, pbf_iterations, pp_iterations});
+    p_xpbd_iterations_.resize(coupling_iterations);
+    p_solve_iterations_.resize(coupling_iterations);
+    const auto iterations_before = [coupling_iterations](uint32_t pass, uint32_t budget) {
+        return static_cast<uint32_t>((static_cast<uint64_t>(pass) * budget + coupling_iterations - 1u)
+                                     / coupling_iterations);
+    };
+    const auto iteration_work = [&](uint32_t pass, uint32_t budget) {
+        return iterations_before(pass + 1u, budget) - iterations_before(pass, budget);
+    };
 
     // The build-time coupling context: the row provider's PreCouple/PostCouple
     // fill the Pipeline-owned PODs from these resolved scalars at their original
@@ -355,14 +366,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_particles) {
-        // resolve the PBF uniform-grid params from the cooked Model. For a
-        // PBF fluid the cell_size/query_radius == the support radius (the
-        // grid precondition cell >= query); the grid_min/dims come from the
-        // cooked domain. An XPBD-only scene leaves cell_size 0 -> the build op
-        // early-exits (no PBF neighbors needed). The grid is rebuilt every step
-        // over the PREDICTED positions (pbf_predicted_pos) — but ParticleGridBuild
-        // reads particle_pos; the pipeline routes it at the PBF predicted positions via the
-        // op reading particle_pos AFTER ParticlePredict... see the note below.
+        // Spatial constraints rebuild neighbors from the current shared working positions.
         p_grid_.cell_size = runs_pbf ? mp.cell_size : 0.0f;
         p_grid_.query_radius = mp.query_radius;
         p_grid_.particle_count = particle_count;
@@ -370,18 +374,99 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
             p_grid_.grid_min[k] = (&mp.grid_min.x)[k];
             p_grid_.grid_dims[k] = mp.grid_dims[k];
         }
-        // PBF builds the grid over the predicted positions (ParticlePredict runs
-        // just above, seeding pbf_predicted_pos).
-        p_grid_.pos_source = runs_pbf ? phi::kGridPosSourcePbfPredicted
-                                      : phi::kGridPosSourceParticlePos;
+        // The projected buffer is shared by every row-coupled particle material.
+        p_grid_.pos_source = phi::kGridPosSourcePbfPredicted;
         // Env-private grids: per-env cell-key offsets + the cooked cell
         // capacity (the grid_cell_start/end arena sizing the op guards).
         p_grid_.env_count = env_count;
         p_grid_.particles_per_env = cap.particles_per_env;
         p_grid_.cells_capacity = cap.max_grid_cells;
         p_grid_.neighbor_capacity = static_cast<uint32_t>(cap.NeighborPoolCapacity());
-        add(phi::NkOp::ParticleGridBuild, &p_grid_);
     }
+
+    if (has_particles) {
+        p_xpbd_.dt = cfg.dt;
+        p_xpbd_.iters = 1u;
+        p_xpbd_.dist_con_count = dist_count;
+        p_xpbd_.bend_con_count = bend_count;
+        p_xpbd_.vol_con_count = vol_count;
+        p_xpbd_.shape_match_cluster_count = sm_cluster_count;
+        p_xpbd_.dist_colors = cap.xpbd_dist_colors;
+        p_xpbd_.bend_colors = cap.xpbd_bend_colors;
+        p_xpbd_.vol_colors = cap.xpbd_vol_colors;
+        p_xpbd_.sm_colors = cap.xpbd_sm_colors;
+        p_xpbd_.env_count = env_count;
+        p_xpbd_.dist_cons_per_env = cap.dist_cons_per_env;
+        p_xpbd_.bend_cons_per_env = cap.bend_cons_per_env;
+        p_xpbd_.vol_cons_per_env = cap.vol_cons_per_env;
+        p_xpbd_.sm_clusters_per_env = cap.shape_match_slots_per_env;
+        p_xpbd_.sm_members_per_env = cap.shape_match_members_per_env;
+        p_xpbd_.dist_color_segments = model.dist_color_segments.data();
+        p_xpbd_.bend_color_segments = model.bend_color_segments.data();
+        p_xpbd_.vol_color_segments = model.vol_color_segments.data();
+        p_xpbd_.sm_color_segments = model.sm_color_segments.data();
+        for (uint32_t pass = 0u; pass < coupling_iterations; ++pass) {
+            p_xpbd_iterations_[pass] = p_xpbd_;
+            p_xpbd_iterations_[pass].iteration_start = iterations_before(pass, xpbd_iterations);
+        }
+
+        p_pbf_density_.rest_density = mp.pbf_rest_density;
+        p_pbf_density_.relaxation = mp.pbf_cfm_epsilon;
+        p_pbf_density_.support_radius = mp.pbf_support_radius;
+        p_pbf_density_.particle_mass = mp.pbf_particle_mass;
+        p_pbf_density_.particle_count = particle_count;
+        p_pbf_density_.iters = 1u;
+        p_pbf_density_.clamp_overdensity = mp.pbf_clamp_overdensity ? 1u : 0u;
+        p_pbf_density_.dt = cfg.dt;
+        p_pbf_density_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
+        p_pbf_density_.floor_z = mp.floor_z;
+        p_pbf_density_.n_soft_particles = n_soft;
+        p_pbf_density_.particles_per_env = per_env_particles;
+
+        p_pbf_apply_.support_radius = mp.pbf_support_radius;
+        p_pbf_apply_.particle_mass = mp.pbf_particle_mass;
+        p_pbf_apply_.particle_count = particle_count;
+        p_pbf_apply_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
+        p_pbf_apply_.floor_z = mp.floor_z;
+        p_pbf_apply_.n_soft_particles = n_soft;
+        p_pbf_apply_.particles_per_env = per_env_particles;
+
+        p_part_projection_velocity_.dt = cfg.dt;
+        p_part_projection_velocity_.particle_count = particle_count;
+        p_part_projection_velocity_.particles_per_env = per_env_particles;
+        p_part_projection_velocity_.active_begin_per_env =
+            (particle_mode == phi::kParticleModeMpm || particle_mode == phi::kParticleModeNone)
+                ? per_env_particles : n_mpm;
+        p_part_contact_delta_.dt = cfg.dt;
+        p_part_contact_delta_.particle_count = particle_count;
+        p_part_contact_delta_.particles_per_env = per_env_particles;
+        p_part_contact_delta_.active_begin_per_env = p_part_projection_velocity_.active_begin_per_env;
+
+        p_pp_contact_.contact_distance_d_min = pp_iterations != 0u ? mp.pp_contact_d_min : 0.0f;
+        p_pp_contact_.compliance_alpha = mp.pp_contact_compliance;
+        p_pp_contact_.solver_iterations = 1u;
+        p_pp_contact_.mode = particle_mode;
+        p_pp_contact_.particle_count = particle_count;
+        p_pp_contact_.n_soft_particles = n_soft;
+        p_pp_contact_.particles_per_env = per_env_particles;
+    }
+
+    const auto project_particles = [&](uint32_t pass) {
+        if (!has_particles) return;
+        if (iteration_work(pass, xpbd_iterations) != 0u)
+            add(phi::NkOp::XpbdProject, &p_xpbd_iterations_[pass]);
+        const bool density_work = iteration_work(pass, pbf_iterations) != 0u;
+        const bool contact_work = iteration_work(pass, pp_iterations) != 0u;
+        if (density_work || contact_work) add(phi::NkOp::ParticleGridBuild, &p_grid_);
+        if (density_work) {
+            add(phi::NkOp::PbfDensityLambda, &p_pbf_density_);
+            add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
+        }
+        if (contact_work) add(phi::NkOp::ParticleParticleContact, &p_pp_contact_);
+        if (p_part_projection_velocity_.active_begin_per_env < per_env_particles)
+            add(phi::NkOp::ParticleProjectionVelocity, &p_part_projection_velocity_);
+    };
+    project_particles(0u);
 
     if (has_collidables) {
         p_np_prim_.contact_margin = cfg.contact_margin;
@@ -569,62 +654,6 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         }
     }
 
-    if (has_particles) {
-        // XpbdProject: the distance/bend/volume sweeps (XPBD soft). Inert for a
-        // PBF-only scene (all constraint counts 0). iters from the cooked Model
-        // (NOT cfg.vel_iters — the XPBD GS sweep count is a soft-body property).
-        p_xpbd_.dt = cfg.dt;
-        p_xpbd_.iters = mp.xpbd_iters == 0u ? 1u : mp.xpbd_iters;
-        p_xpbd_.dist_con_count = dist_count;
-        p_xpbd_.bend_con_count = bend_count;
-        p_xpbd_.vol_con_count  = vol_count;
-        p_xpbd_.shape_match_cluster_count = sm_cluster_count;
-        // Graph-coloring: per-family color counts + per-env strides so the colored
-        // kernels iterate the single-env color ranges env-major in parallel.
-        p_xpbd_.dist_colors = cap.xpbd_dist_colors;
-        p_xpbd_.bend_colors = cap.xpbd_bend_colors;
-        p_xpbd_.vol_colors  = cap.xpbd_vol_colors;
-        p_xpbd_.sm_colors   = cap.xpbd_sm_colors;
-        p_xpbd_.env_count   = env_count;
-        p_xpbd_.dist_cons_per_env   = cap.dist_cons_per_env;
-        p_xpbd_.bend_cons_per_env   = cap.bend_cons_per_env;
-        p_xpbd_.vol_cons_per_env    = cap.vol_cons_per_env;
-        p_xpbd_.sm_clusters_per_env = cap.shape_match_slots_per_env;
-        p_xpbd_.sm_members_per_env  = cap.shape_match_members_per_env;
-        p_xpbd_.dist_color_segments = model.dist_color_segments.data();
-        p_xpbd_.bend_color_segments = model.bend_color_segments.data();
-        p_xpbd_.vol_color_segments  = model.vol_color_segments.data();
-        p_xpbd_.sm_color_segments   = model.sm_color_segments.data();
-        add(phi::NkOp::XpbdProject, &p_xpbd_);
-
-        // PbfDensityLambda / PbfApplyDelta: the PBF density-projection. Inert for
-        // an XPBD-only scene (rest_density / support_radius 0). The two ops split
-        // the legacy [density,lambda,delta,apply]xN loop (density-lambda + the in-
-        // loop applies for iters 0..N-2 here; the final apply in PbfApplyDelta).
-        p_pbf_density_.rest_density   = mp.pbf_rest_density;
-        p_pbf_density_.relaxation     = mp.pbf_cfm_epsilon;
-        p_pbf_density_.support_radius = mp.pbf_support_radius;
-        p_pbf_density_.particle_mass  = mp.pbf_particle_mass;
-        p_pbf_density_.particle_count = particle_count;
-        p_pbf_density_.iters          = mp.pbf_iters;
-        p_pbf_density_.clamp_overdensity = mp.pbf_clamp_overdensity ? 1u : 0u;
-        p_pbf_density_.dt             = cfg.dt;
-        p_pbf_density_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
-        p_pbf_density_.floor_z        = mp.floor_z;
-        p_pbf_density_.n_soft_particles = n_soft;
-        p_pbf_density_.particles_per_env = per_env_particles;
-        add(phi::NkOp::PbfDensityLambda, &p_pbf_density_);
-
-        p_pbf_apply_.support_radius  = mp.pbf_support_radius;
-        p_pbf_apply_.particle_mass   = mp.pbf_particle_mass;
-        p_pbf_apply_.particle_count  = particle_count;
-        p_pbf_apply_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
-        p_pbf_apply_.floor_z         = mp.floor_z;
-        p_pbf_apply_.n_soft_particles = n_soft;
-        p_pbf_apply_.particles_per_env = per_env_particles;
-        add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
-    }
-
     // The MLS-MPM grid-transfer provider's Couple: ONE umbrella MpmStep op at the
     // pre-solve coupling seam (the substep loop is self-contained relative to the
     // single SolveRowsBlockIsland). Build-time gated on has_mpm -> a non-MPM world
@@ -686,12 +715,24 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_islands_.bodies_per_env = cap.bodies_per_env;
         p_islands_.particles_per_env = cap.particles_per_env;
         add(phi::NkOp::BuildSolveIslands, &p_islands_);
-        add(phi::NkOp::SolveRowsBlockIsland, &p_solve_);
+        for (uint32_t pass = 0u; pass < coupling_iterations; ++pass) {
+            if (pass != 0u) project_particles(pass);
+            auto& solve = p_solve_iterations_[pass];
+            solve = p_solve_;
+            solve.vel_iters = static_cast<uint16_t>(iteration_work(pass, cfg.vel_iters));
+            solve.pos_iters = pass + 1u == coupling_iterations ? p_solve_.pos_iters : 0u;
+            solve.continue_impulses = pass != 0u ? 1u : 0u;
+            add(phi::NkOp::SolveRowsBlockIsland, &solve);
+            if (has_particles && p_part_contact_delta_.active_begin_per_env < per_env_particles)
+                add(phi::NkOp::ParticleContactDelta, &p_part_contact_delta_);
+        }
         if constexpr (family == phi::kContactFamilyPairDriven) {
             p_warm_start_commit_ = p_warm_start_prepare_;
             p_warm_start_commit_.phase = 1u;
             add(phi::NkOp::ContactWarmStart, &p_warm_start_commit_);
         }
+    } else {
+        for (uint32_t pass = 1u; pass < coupling_iterations; ++pass) project_particles(pass);
     }
 
     if (has_articulation || has_bodies) {
@@ -708,10 +749,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::IntegratePosition, &p_int_pos_);
     }
 
-    // The row provider's post-coupling emission (ParticleFinalize +
-    // ParticleParticleContact). Runs AFTER IntegratePosition at the TOP level
-    // (NOT inside has_collidables) and BEFORE ReadoutContactWrench, the original
-    // position. Gated on actual particles -> byte-identical when absent.
+    // Commit particle state once after all incremental coupling solves.
     if (has_particles) {
         row_coupling_provider_.PostCouple(coupling_ctx);
     }
