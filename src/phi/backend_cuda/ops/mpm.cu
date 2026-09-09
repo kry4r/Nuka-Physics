@@ -16,12 +16,14 @@
 #include <cub/block/block_store.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/warp/warp_load.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
+#include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"  // chain-J helper + device state
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
@@ -36,6 +38,11 @@ namespace {
 
 namespace m = ::nuka::math;
 constexpr uint32_t kBlockSize = 128u;
+constexpr uint32_t kSpatialComponents = 3u;
+constexpr uint32_t kTransferGroupThreads = 1u + kSpatialComponents;
+constexpr uint32_t kGatherGroups = kBlockSize / kTransferGroupThreads;
+constexpr uint32_t kFullWarpMask = ~uint32_t{0};
+static_assert(kBlockSize % kTransferGroupThreads == 0u);
 
 // NUKA_MPM_TIMING enables synchronous eager stage timing, amortized per World::Step.
 // Leave it disabled for ordinary execution and graph capture.
@@ -715,8 +722,7 @@ __device__ __forceinline__ float QuadWeight(float coordinate, int32_t base, int3
     return 0.5f * (fx - 0.5f) * (fx - 0.5f);
 }
 
-// Each node gathers mass, APIC momentum and stress impulse from base cells in [i-2,i].
-// Stable particle order and explicit rounded sums make the accumulation deterministic.
+// Thread groups gather adjacent records and retain each node's ordered scalar sums.
 __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                                    const uint32_t* __restrict__ active_nodes,
                                    const uint32_t* __restrict__ active_node_count,
@@ -729,84 +735,131 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                                    float inv_dx, float dx, float dt, m::Vec3 origin,
                                    float* __restrict__ grid_mass,
                                    m::Vec3* __restrict__ grid_momentum) {
-    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (slot >= total_nodes || slot >= *active_node_count) return;
-    const uint32_t node = active_nodes[slot];
-    const uint32_t env = node / nodes_per_env;
-    const uint32_t env_begin = env * mpm_particles_per_env;
-    const uint32_t env_end = min(env_begin + mpm_particles_per_env, particle_count);
-    const uint32_t local = node % nodes_per_env;
-    const int32_t nx = static_cast<int32_t>(local % dims_x);
-    const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
-    const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
-    const m::Vec3 xi = m::Vec3{origin.x + nx * dx, origin.y + ny * dx,
-                               origin.z + nz * dx};
-    const float stress_scale = 4.0f * inv_dx * inv_dx;  // W^{-1} = 4/dx^2 (quadratic).
-    float mass = 0.0f;
-    m::Vec3 mom = m::Vec3::Zero();
-    // Scan the 3^3 base cells that can place a particle's stencil on this node.
-    for (int32_t dz = -2; dz <= 0; ++dz) {
-        const int32_t cz = nz + dz;
-        if (cz < 0 || cz >= static_cast<int32_t>(dims_z)) continue;
-        for (int32_t dy = -2; dy <= 0; ++dy) {
-            const int32_t cy = ny + dy;
-            if (cy < 0 || cy >= static_cast<int32_t>(dims_y)) continue;
-            for (int32_t dx_i = -2; dx_i <= 0; ++dx_i) {
-                const int32_t cx = nx + dx_i;
-                if (cx < 0 || cx >= static_cast<int32_t>(dims_x)) continue;
-                const uint32_t ck = (static_cast<uint32_t>(cz) * dims_y +
-                                     static_cast<uint32_t>(cy)) * dims_x +
-                                    static_cast<uint32_t>(cx);
-                const uint32_t key = env * cells_per_env + ck;
-                const uint32_t begin = cell_start[key];
-                if (begin == ~0u) continue;
-                const uint32_t end = min(cell_end[key], env_end);
-                for (uint32_t s = max(begin, env_begin); s < end; ++s) {
-                    const MpmTransferInput& cached = transfer_input[s];
-                    const float wp = cached.mass;
-                    if (wp <= 0.0f) continue;
-                    const m::Vec3 xp = cached.position;
+    constexpr int kWords = sizeof(MpmTransferInput) / sizeof(uint32_t);
+    using Load = cub::WarpLoad<uint32_t, kWords, cub::WARP_LOAD_TRANSPOSE, kTransferGroupThreads>;
+    constexpr uint32_t kConservedComponents = 1u + kSpatialComponents;
+    struct Contribution {
+        float mass_apic[kConservedComponents];
+        float stress[kSpatialComponents];
+    };
+    union GroupTile {
+        typename Load::TempStorage records;
+        Contribution contributions[kTransferGroupThreads];
+    };
+    __shared__ GroupTile storage[kGatherGroups];
+    const uint32_t group = threadIdx.x / kTransferGroupThreads;
+    const uint32_t lane = threadIdx.x % kTransferGroupThreads;
+    const uint32_t group_offset = threadIdx.x % static_cast<uint32_t>(warpSize) - lane;
+    const uint32_t group_mask =
+        (kFullWarpMask >> (static_cast<uint32_t>(warpSize) - kTransferGroupThreads)) << group_offset;
+    const uint32_t active_count = min(total_nodes, *active_node_count);
+    for (uint32_t slot = blockIdx.x * kGatherGroups + group; slot < active_count;
+         slot += gridDim.x * kGatherGroups) {
+        const uint32_t node = active_nodes[slot];
+        const uint32_t env = node / nodes_per_env;
+        const uint32_t env_begin = env * mpm_particles_per_env;
+        const uint32_t env_end = min(env_begin + mpm_particles_per_env, particle_count);
+        const uint32_t local = node % nodes_per_env;
+        const int32_t nx = static_cast<int32_t>(local % dims_x);
+        const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
+        const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
+        const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
+        const float stress_scale = 4.0f * inv_dx * inv_dx;
+        float component_sum = 0.0f;
+        for (int32_t dz = -2; dz <= 0; ++dz) {
+            const int32_t cz = nz + dz;
+            if (cz < 0 || cz >= static_cast<int32_t>(dims_z)) continue;
+            for (int32_t dy = -2; dy <= 0; ++dy) {
+                const int32_t cy = ny + dy;
+                if (cy < 0 || cy >= static_cast<int32_t>(dims_y)) continue;
+                uint32_t begin = ~0u, end = 0u;
+                // Adjacent x cells occupy one continuous interval in the stable sorted array.
+                for (int32_t dx_i = -2; dx_i <= 0; ++dx_i) {
+                    const int32_t cx = nx + dx_i;
+                    if (cx < 0 || cx >= static_cast<int32_t>(dims_x)) continue;
+                    const uint32_t ck = (static_cast<uint32_t>(cz) * dims_y +
+                                         static_cast<uint32_t>(cy)) * dims_x +
+                                        static_cast<uint32_t>(cx);
+                    const uint32_t key = env * cells_per_env + ck;
+                    if (cell_start[key] == ~0u) continue;
+                    const uint32_t cell_begin = max(cell_start[key], env_begin);
+                    const uint32_t cell_limit = min(cell_end[key], env_end);
+                    if (cell_begin >= cell_limit) continue;
+                    begin = min(begin, cell_begin);
+                    end = max(end, cell_limit);
+                }
+                for (uint32_t tile = begin; tile < end; tile += kTransferGroupThreads) {
+                    const uint32_t count = min(kTransferGroupThreads, end - tile);
+                    uint32_t words[kWords];
+                    Load(storage[group].records).Load(
+                        reinterpret_cast<const uint32_t*>(transfer_input + tile),
+                        words, static_cast<int>(count) * kWords, 0u);
+                    MpmTransferInput cached;
+                    memcpy(&cached, words, sizeof(cached));
+                    __syncwarp(group_mask);
                     const int32_t ox = nx - cached.base[0], oy = ny - cached.base[1],
                                   oz = nz - cached.base[2];
-                    if (ox < 0 || ox > 2 || oy < 0 || oy > 2 || oz < 0 || oz > 2) continue;
-                    const float wx = QuadWeight((xp.x - origin.x) * inv_dx, cached.base[0], ox);
-                    const float wy = QuadWeight((xp.y - origin.y) * inv_dx, cached.base[1], oy);
-                    const float wz = QuadWeight((xp.z - origin.z) * inv_dx, cached.base[2], oz);
-                    const float w = wx * wy * wz;
-                    const m::Vec3 vp = cached.velocity;
-                    // APIC affine term C_p * (x_i - x_p) (row-major 3x3 in part_C).
-                    const m::Vec3 dpos = xi - xp;
-                    const float* C = cached.affine;
-                    const m::Vec3 cterm = m::Vec3{
-                        C[0] * dpos.x + C[1] * dpos.y + C[2] * dpos.z,
-                        C[3] * dpos.x + C[4] * dpos.y + C[5] * dpos.z,
-                        C[6] * dpos.x + C[7] * dpos.y + C[8] * dpos.z};
-                    const float wm = w * wp;
-                    mass = __fadd_rn(mass, wm);
-                    mom.x = __fadd_rn(mom.x, wm * (vp.x + cterm.x));
-                    mom.y = __fadd_rn(mom.y, wm * (vp.y + cterm.y));
-                    mom.z = __fadd_rn(mom.z, wm * (vp.z + cterm.z));
-                    // Constitutive node-momentum impulse dt * f_i folded into momentum,
-                    // f_i = -w * V0 * (4/dx^2) * P(F) F^T (x_i - x_p).
-                    if (dt > 0.0f) {
-                        const float vol0 = cached.volume;
-                        if (vol0 > 0.0f) {
+                    const bool valid = lane < count && cached.mass > 0.0f &&
+                        ox >= 0 && ox <= 2 && oy >= 0 && oy <= 2 && oz >= 0 && oz <= 2;
+                    const bool has_stress = valid && dt > 0.0f && cached.volume > 0.0f;
+                    float wm = 0.0f;
+                    m::Vec3 apic = m::Vec3::Zero(), impulse = m::Vec3::Zero();
+                    if (valid) {
+                        const m::Vec3 xp = cached.position;
+                        const float wx = QuadWeight((xp.x - origin.x) * inv_dx, cached.base[0], ox);
+                        const float wy = QuadWeight((xp.y - origin.y) * inv_dx, cached.base[1], oy);
+                        const float wz = QuadWeight((xp.z - origin.z) * inv_dx, cached.base[2], oz);
+                        const float w = wx * wy * wz;
+                        const m::Vec3 vp = cached.velocity;
+                        const m::Vec3 dpos = xi - xp;
+                        const float* C = cached.affine;
+                        const m::Vec3 cterm{
+                            C[0] * dpos.x + C[1] * dpos.y + C[2] * dpos.z,
+                            C[3] * dpos.x + C[4] * dpos.y + C[5] * dpos.z,
+                            C[6] * dpos.x + C[7] * dpos.y + C[8] * dpos.z};
+                        wm = w * cached.mass;
+                        apic = {wm * (vp.x + cterm.x), wm * (vp.y + cterm.y),
+                                wm * (vp.z + cterm.z)};
+                        if (has_stress) {
                             const float* stress = cached.stress;
-                            const float coef = -w * vol0 * stress_scale;
-                            mom.x = __fadd_rn(mom.x, dt * coef * (stress[0] * dpos.x +
-                                              stress[1] * dpos.y + stress[2] * dpos.z));
-                            mom.y = __fadd_rn(mom.y, dt * coef * (stress[3] * dpos.x +
-                                              stress[4] * dpos.y + stress[5] * dpos.z));
-                            mom.z = __fadd_rn(mom.z, dt * coef * (stress[6] * dpos.x +
-                                              stress[7] * dpos.y + stress[8] * dpos.z));
+                            const float coef = -w * cached.volume * stress_scale;
+                            impulse = {
+                                dt * coef * (stress[0] * dpos.x + stress[1] * dpos.y + stress[2] * dpos.z),
+                                dt * coef * (stress[3] * dpos.x + stress[4] * dpos.y + stress[5] * dpos.z),
+                                dt * coef * (stress[6] * dpos.x + stress[7] * dpos.y + stress[8] * dpos.z)};
                         }
                     }
+                    const uint32_t valid_mask = __ballot_sync(group_mask, valid) >> group_offset;
+                    const uint32_t stress_mask = __ballot_sync(group_mask, has_stress) >> group_offset;
+                    // Every lane has consumed the record tile before contributions reuse it.
+                    storage[group].contributions[lane] =
+                        {{wm, apic.x, apic.y, apic.z}, {impulse.x, impulse.y, impulse.z}};
+                    __syncwarp(group_mask);
+                    // Mass and each momentum component retain their independent ordered sum.
+                    if (lane < kConservedComponents) {
+                        for (uint32_t source = 0u; source < count; ++source) {
+                            if ((valid_mask & (1u << source)) != 0u) {
+                                component_sum = __fadd_rn(component_sum,
+                                    storage[group].contributions[source].mass_apic[lane]);
+                            }
+                            if (lane > 0u && (stress_mask & (1u << source)) != 0u) {
+                                component_sum = __fadd_rn(component_sum,
+                                    storage[group].contributions[source].stress[lane - 1u]);
+                            }
+                        }
+                    }
+                    __syncwarp(group_mask);
                 }
             }
         }
+        const m::Vec3 momentum{__shfl_sync(group_mask, component_sum, 1u, kTransferGroupThreads),
+                               __shfl_sync(group_mask, component_sum, 2u, kTransferGroupThreads),
+                               __shfl_sync(group_mask, component_sum, 3u, kTransferGroupThreads)};
+        if (lane == 0u) {
+            grid_mass[node] = component_sum;
+            grid_momentum[node] = momentum;
+        }
     }
-    grid_mass[node] = mass;
-    grid_momentum[node] = mom;
 }
 
 // Normalize momentum, add gravity and project against the static frictional floor.
@@ -1292,7 +1345,7 @@ MpmScratch PartitionScratch(void* base, uint32_t item_count) {
 cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
                          const DataView& data, const MpmScratch& scratch,
                          float dt_sub, uint32_t Ppe, uint32_t mpm_pe, uint32_t mpm_count,
-                         uint32_t cpe, uint32_t total_nodes, float inv_dx,
+                         uint32_t cpe, uint32_t total_nodes, uint32_t gather_blocks, float inv_dx,
                          const m::Vec3& origin, cudaStream_t stream) {
     MpmProfiler& profiler = MpmProfiler::Get();
     const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
@@ -1343,7 +1396,7 @@ cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
            mpm_count, scratch.idx_out, data.particle_pos, data.particle_inv_mass,
            data.particle_vel, data.particle_C, data.particle_vol0, data.mpm_particle_stress,
            origin, inv_dx, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.transfer_input);
-    launch(MpmStage::P2G, MpmP2GGatherKernel, nblocks,
+    launch(MpmStage::P2G, MpmP2GGatherKernel, gather_blocks,
            total_nodes, scratch.active_nodes, scratch.active_count,
            scratch.transfer_input, scratch.cell_start, scratch.cell_end,
            mpm_count, mpm_pe, p.nodes_per_env,
@@ -1439,6 +1492,10 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
     const MpmScratch scratch = PartitionScratch(data.mpm_sort_scratch,
                                                 mpm_count > total_nodes ? mpm_count : total_nodes);
+    uint32_t gather_blocks = 0u;
+    if (ResidentGridSize(MpmP2GGatherKernel, kBlockSize, 0u,
+                         (total_nodes + kGatherGroups - 1u) / kGatherGroups,
+                         &gather_blocks) != cudaSuccess) return Status::Failed;
     const float inv_dx = 1.0f / p->dx;
     const m::Vec3 origin{p->grid_origin[0], p->grid_origin[1], p->grid_origin[2]};
     const uint32_t substeps = p->substeps == 0u ? 1u : p->substeps;
@@ -1462,7 +1519,7 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     if (cudaPeekAtLastError() != cudaSuccess) return Status::Failed;
     for (uint32_t s = 0; s < substeps; ++s)
         if (LaunchSubstep(*p, model, data, scratch, dt_sub, Ppe, mpm_pe, mpm_count, cpe,
-                          total_nodes, inv_dx, origin, stream) != cudaSuccess) return Status::Failed;
+                          total_nodes, gather_blocks, inv_dx, origin, stream) != cudaSuccess) return Status::Failed;
     // Deposit accumulated link reaction into qdot after the substep loop.
     // Articulation surface velocities are therefore fixed during these substeps.
     if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
