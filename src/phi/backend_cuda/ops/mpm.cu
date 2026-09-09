@@ -2,9 +2,12 @@
 // Stable cell sorting and ordered gathers keep particle and body accumulation deterministic.
 
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <stdexcept>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -40,6 +43,7 @@ enum class MpmStage : uint32_t {
     CellRanges,
     ActiveSelect,
     Stress,
+    TransferInput,
     P2G,
     GridUpdate,
     BodyProject,
@@ -72,7 +76,7 @@ struct MpmProfiler {
     static const char* Name(uint32_t stage) {
         constexpr const char* names[kCount] = {
             "grid_prepare", "cell_keys", "radix_sort", "cell_ranges",
-            "active_select", "stress", "p2g_gather", "grid_update", "body_project",
+            "active_select", "stress", "transfer_input", "p2g_gather", "grid_update", "body_project",
             "body_sort", "body_react", "g2p_gather", "update_F", "artic_deposit"};
         return names[stage];
     }
@@ -161,33 +165,73 @@ inline __host__ int RadixBitsInclusive(uint32_t max_key) {
     return bits;
 }
 
-// Sorting and selection share aligned temporary storage sized for the larger item count.
-// Sorted outputs remain outside the CUB temporary region.
+struct MpmTransferInput {
+    m::Vec3 position;
+    float mass;
+    m::Vec3 velocity;
+    float volume;
+    int32_t base[3];
+    float affine[9];
+    float stress[9];
+};
+
+// Scratch uses the common particle/node capacity; physical grid fields keep their own types.
 struct MpmSortScratchLayout {
     uint64_t temp_bytes = 0u;     // cub radix-sort temp-storage region size.
     uint64_t keys_off   = 0u;     // byte offset of the sorted-keys out buffer.
     uint64_t idx_off    = 0u;     // byte offset of the sorted-idx out buffer.
+    uint64_t active_nodes_off = 0u;
+    uint64_t active_flags_off = 0u;
+    uint64_t cell_start_off = 0u;
+    uint64_t cell_end_off = 0u;
+    uint64_t node_ids_off = 0u;
+    uint64_t active_count_off = 0u;
+    uint64_t transfer_input_off = 0u;
     uint64_t total      = 0u;     // full segment byte size.
     explicit MpmSortScratchLayout(uint32_t item_count) {
         const int n = static_cast<int>(item_count);
         size_t sort_bytes = 0u;
-        (void)cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
+        auto status = cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
             nullptr, sort_bytes, static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), n);
+        if (status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(status));
         size_t select_bytes = 0u;
         thrust::counting_iterator<uint32_t> node_ids(0u);
-        (void)cub::DeviceSelect::Flagged(
+        status = cub::DeviceSelect::Flagged(
             nullptr, select_bytes, node_ids, static_cast<const uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
             n);
+        if (status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(status));
         temp_bytes = sort_bytes > select_bytes ? sort_bytes : select_bytes;
         const uint64_t nbytes = static_cast<uint64_t>(item_count) * sizeof(uint32_t);
         keys_off = AlignScratch(temp_bytes);
         idx_off  = AlignScratch(keys_off + nbytes);
-        total    = AlignScratch(idx_off + nbytes);
+        active_nodes_off = AlignScratch(idx_off + nbytes);
+        active_flags_off = AlignScratch(active_nodes_off + nbytes);
+        cell_start_off = AlignScratch(active_flags_off + nbytes);
+        cell_end_off = AlignScratch(cell_start_off + nbytes);
+        node_ids_off = AlignScratch(cell_end_off + nbytes);
+        active_count_off = AlignScratch(node_ids_off + nbytes);
+        transfer_input_off = AlignScratch(active_count_off + sizeof(uint32_t));
+        total = AlignScratch(transfer_input_off +
+                             uint64_t{item_count} * sizeof(MpmTransferInput));
     }
 };
+
+const MpmSortScratchLayout& ScratchLayout(uint32_t item_count) {
+    int device = -1;
+    const auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    struct Entry { int device; uint32_t count; MpmSortScratchLayout layout; };
+    static thread_local std::vector<Entry> entries;
+    for (const auto& entry : entries)
+        if (entry.device == device && entry.count == item_count) return entry.layout;
+    entries.push_back({device, item_count, MpmSortScratchLayout(item_count)});
+    return entries.back().layout;
+}
 
 // Row-major 3x3 algebra matches particle_F/C packing.
 
@@ -402,7 +446,8 @@ __device__ __forceinline__ Bspline QuadWeights(float gx) {
     // base = floor(gx - 0.5); fx in [0.5, 1.5) is the offset from base.
     Bspline b;
     // Invalid coordinates use a base outside every grid stencil.
-    b.base = isfinite(gx) ? static_cast<int64_t>(floorf(gx - 0.5f)) : -0x40000000;
+    b.base = isfinite(gx) && fabsf(gx) < 0x1p62f
+        ? static_cast<int64_t>(floorf(gx - 0.5f)) : -0x40000000;
     const float fx = gx - static_cast<float>(b.base);
     b.w[0] = 0.5f * (1.5f - fx) * (1.5f - fx);
     const float d = fx - 1.0f;
@@ -520,8 +565,6 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
                                   uint32_t dims_z, uint32_t cells_per_env,
                                   uint32_t* __restrict__ keys,
                                   uint32_t* __restrict__ idx,
-                                  uint32_t nodes_per_env,
-                                  uint32_t* __restrict__ active_node_flags,
                                   uint32_t* __restrict__ env_status) {
     const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= mpm_count) return;
@@ -533,7 +576,8 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
     const float gz = (xp.z - origin.z) * inv_dx;
     // Non-finite or out-of-float-range coords are UB in the float->int cast;
     // detect before converting and park the particle on the escape path.
-    const bool nonfinite = !isfinite(gx) || !isfinite(gy) || !isfinite(gz);
+    const bool nonfinite = !isfinite(gx) || !isfinite(gy) || !isfinite(gz) ||
+                          fabsf(gx) >= 0x1p62f || fabsf(gy) >= 0x1p62f || fabsf(gz) >= 0x1p62f;
     const int64_t bx = nonfinite ? 0 : static_cast<int64_t>(floorf(gx - 0.5f));
     const int64_t by = nonfinite ? 0 : static_cast<int64_t>(floorf(gy - 0.5f));
     const int64_t bz = nonfinite ? 0 : static_cast<int64_t>(floorf(gz - 0.5f));
@@ -557,45 +601,102 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
         (cz * dims_y + cy) * dims_x + cx);
     keys[t] = env * cells_per_env + local;
     idx[t] = p;
-    // Mark exactly the 3^3 node stencil this particle can contribute to. Races
-    // only write the same flag value; atomicExch makes the idempotence explicit.
-    const uint32_t dims[3] = {dims_x, dims_y, dims_z};
-    for (int64_t a = 0; a < 3; ++a) {
-        for (int64_t b = 0; b < 3; ++b) {
-            for (int64_t c = 0; c < 3; ++c) {
-                const int64_t node =
-                    NodeId(env, bx + a, by + b, bz + c, dims, nodes_per_env);
-                if (node >= 0) atomicExch(&active_node_flags[node], 1u);
-            }
-        }
-    }
 }
 
-// Clear mass before active P2G overwrites momentum; zero-mass nodes ignore stale momentum.
-// grid_body_owner temporarily stores active flags until body projection.
+// Initialize physical grid fields and independent transfer indexing before active work.
 __global__ void MpmGridPrepareKernel(uint32_t total_nodes,
                                      float* __restrict__ grid_mass,
+                                     m::Vec3* __restrict__ grid_momentum,
+                                     m::Vec3* __restrict__ grid_velocity,
+                                     m::Vec3* __restrict__ body_dp,
+                                     uint32_t* __restrict__ body_owner,
                                      uint32_t* __restrict__ active_node_flags,
-                                     uint32_t* __restrict__ cell_start) {
+                                     uint32_t* __restrict__ cell_start,
+                                     uint32_t* __restrict__ node_ids) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total_nodes) return;
     grid_mass[i] = 0.0f;
+    grid_momentum[i] = m::Vec3::Zero();
+    grid_velocity[i] = m::Vec3::Zero();
+    body_dp[i] = m::Vec3::Zero();
+    body_owner[i] = ~0u;
     active_node_flags[i] = 0u;
     cell_start[i] = ~0u;
+    node_ids[i] = i;
 }
 
-// Each sorted run owns its [start,end) boundaries, preserving stable particle order.
+// Each sorted cell run owns its boundaries and marks its common 27-node stencil once.
 __global__ void MpmBuildCellRangesKernel(
     uint32_t particle_count, const uint32_t* __restrict__ sorted_keys,
     uint32_t total_cells, uint32_t* __restrict__ cell_start,
-    uint32_t* __restrict__ cell_end) {
+    uint32_t* __restrict__ cell_end, uint32_t cells_per_env, uint32_t nodes_per_env,
+    uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
+    uint32_t* __restrict__ active_node_flags) {
     const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= particle_count) return;
     const uint32_t key = sorted_keys[s];
     if (key >= total_cells) return;
-    if (s == 0u || sorted_keys[s - 1u] != key) cell_start[key] = s;
+    if (s == 0u || sorted_keys[s - 1u] != key) {
+        cell_start[key] = s;
+        const uint32_t env = key / cells_per_env;
+        const uint32_t local = key % cells_per_env;
+        const int64_t bx = local % dims_x;
+        const int64_t by = (local / dims_x) % dims_y;
+        const int64_t bz = local / (dims_x * dims_y);
+        const uint32_t dims[3] = {dims_x, dims_y, dims_z};
+        for (int64_t a = 0; a < 3; ++a)
+            for (int64_t b = 0; b < 3; ++b)
+                for (int64_t c = 0; c < 3; ++c) {
+                    const int64_t node = NodeId(env, bx + a, by + b, bz + c, dims, nodes_per_env);
+                    if (node >= 0) atomicExch(&active_node_flags[node], 1u);
+                }
+    }
     if (s + 1u == particle_count || sorted_keys[s + 1u] != key)
         cell_end[key] = s + 1u;
+}
+
+__global__ void MpmPrepareTransferInputKernel(
+    uint32_t particle_count, const uint32_t* __restrict__ sorted_idx,
+    const m::Vec3* __restrict__ pos, const float* __restrict__ inv_mass,
+    const m::Vec3* __restrict__ velocity, const float* __restrict__ affine,
+    const float* __restrict__ volume, const float* __restrict__ stress,
+    m::Vec3 origin, float inv_dx, uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
+    MpmTransferInput* __restrict__ transfer_input) {
+    const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= particle_count) return;
+    const uint32_t p = sorted_idx[s];
+    const m::Vec3 xp = pos[p];
+    const Bspline axes[3] = {QuadWeights((xp.x - origin.x) * inv_dx),
+                             QuadWeights((xp.y - origin.y) * inv_dx),
+                             QuadWeights((xp.z - origin.z) * inv_dx)};
+    float mass = inv_mass[p] > 0.0f ? 1.0f / inv_mass[p] : 0.0f;
+    const bool overlaps_grid = axes[0].base >= -2 && axes[0].base < dims_x &&
+        axes[1].base >= -2 && axes[1].base < dims_y &&
+        axes[2].base >= -2 && axes[2].base < dims_z;
+    if (!overlaps_grid) mass = 0.0f;
+    MpmTransferInput cached;
+    cached.position = xp;
+    cached.mass = mass;
+    cached.velocity = velocity[p];
+    cached.volume = volume[p];
+    for (int i = 0; i < 3; ++i)
+        cached.base[i] = overlaps_grid ? static_cast<int32_t>(axes[i].base) : 0;
+    for (int i = 0; i < 9; ++i) {
+        cached.affine[i] = affine[static_cast<size_t>(p) * 9u + i];
+        cached.stress[i] = stress[static_cast<size_t>(p) * 9u + i];
+    }
+    transfer_input[s] = cached;
+}
+
+// The cached base preserves clipped stencils while evaluating only the requested weight.
+__device__ __forceinline__ float QuadWeight(float coordinate, int32_t base, int32_t offset) {
+    const float fx = __fsub_rn(coordinate, static_cast<float>(base));
+    if (offset == 0) return 0.5f * (1.5f - fx) * (1.5f - fx);
+    if (offset == 1) {
+        const float d = fx - 1.0f;
+        return 0.75f - d * d;
+    }
+    return 0.5f * (fx - 0.5f) * (fx - 0.5f);
 }
 
 // Each node gathers mass, APIC momentum and stress impulse from base cells in [i-2,i].
@@ -603,13 +704,7 @@ __global__ void MpmBuildCellRangesKernel(
 __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                                    const uint32_t* __restrict__ active_nodes,
                                    const uint32_t* __restrict__ active_node_count,
-                                   const m::Vec3* __restrict__ pos,
-                                   const float* __restrict__ inv_mass,
-                                   const m::Vec3* __restrict__ vel,
-                                   const float* __restrict__ part_C,
-                                   const float* __restrict__ part_vol0,
-                                   const float* __restrict__ particle_stress,
-                                   const uint32_t* __restrict__ sorted_idx,
+                                   const MpmTransferInput* __restrict__ transfer_input,
                                    const uint32_t* __restrict__ cell_start,
                                    const uint32_t* __restrict__ cell_end,
                                    uint32_t particle_count, uint32_t mpm_particles_per_env,
@@ -651,21 +746,21 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                 if (begin == ~0u) continue;
                 const uint32_t end = min(cell_end[key], env_end);
                 for (uint32_t s = max(begin, env_begin); s < end; ++s) {
-                    const uint32_t p = sorted_idx[s];
-                    const float wp = (inv_mass[p] > 0.0f) ? (1.0f / inv_mass[p]) : 0.0f;
+                    const MpmTransferInput& cached = transfer_input[s];
+                    const float wp = cached.mass;
                     if (wp <= 0.0f) continue;
-                    const m::Vec3 xp = pos[p];
-                    const Bspline wxs = QuadWeights((xp.x - origin.x) * inv_dx);
-                    const Bspline wys = QuadWeights((xp.y - origin.y) * inv_dx);
-                    const Bspline wzs = QuadWeights((xp.z - origin.z) * inv_dx);
-                    const int64_t ox = nx - wxs.base, oy = ny - wys.base,
-                                  oz = nz - wzs.base;
+                    const m::Vec3 xp = cached.position;
+                    const int32_t ox = nx - cached.base[0], oy = ny - cached.base[1],
+                                  oz = nz - cached.base[2];
                     if (ox < 0 || ox > 2 || oy < 0 || oy > 2 || oz < 0 || oz > 2) continue;
-                    const float w = wxs.w[ox] * wys.w[oy] * wzs.w[oz];
-                    const m::Vec3 vp = vel[p];
+                    const float wx = QuadWeight((xp.x - origin.x) * inv_dx, cached.base[0], ox);
+                    const float wy = QuadWeight((xp.y - origin.y) * inv_dx, cached.base[1], oy);
+                    const float wz = QuadWeight((xp.z - origin.z) * inv_dx, cached.base[2], oz);
+                    const float w = wx * wy * wz;
+                    const m::Vec3 vp = cached.velocity;
                     // APIC affine term C_p * (x_i - x_p) (row-major 3x3 in part_C).
                     const m::Vec3 dpos = xi - xp;
-                    const float* C = part_C + static_cast<size_t>(p) * 9u;
+                    const float* C = cached.affine;
                     const m::Vec3 cterm = m::Vec3{
                         C[0] * dpos.x + C[1] * dpos.y + C[2] * dpos.z,
                         C[3] * dpos.x + C[4] * dpos.y + C[5] * dpos.z,
@@ -677,11 +772,10 @@ __global__ void MpmP2GGatherKernel(uint32_t total_nodes,
                     mom.z = __fadd_rn(mom.z, wm * (vp.z + cterm.z));
                     // Constitutive node-momentum impulse dt * f_i folded into momentum,
                     // f_i = -w * V0 * (4/dx^2) * P(F) F^T (x_i - x_p).
-                    if (particle_stress != nullptr && part_vol0 != nullptr && dt > 0.0f) {
-                        const float vol0 = part_vol0[p];
+                    if (dt > 0.0f) {
+                        const float vol0 = cached.volume;
                         if (vol0 > 0.0f) {
-                            const float* stress =
-                                particle_stress + static_cast<size_t>(p) * 9u;
+                            const float* stress = cached.stress;
                             const float coef = -w * vol0 * stress_scale;
                             mom.x = __fadd_rn(mom.x, dt * coef * (stress[0] * dpos.x +
                                               stress[1] * dpos.y + stress[2] * dpos.z));
@@ -704,11 +798,14 @@ __global__ void MpmGridUpdateKernel(uint32_t total_nodes, uint32_t nodes_per_env
                                     uint32_t dims_x, uint32_t dims_y, float dx,
                                     m::Vec3 origin, m::Vec3 gravity, float dt,
                                     m::Vec3 plane_n, float plane_d, float plane_mu,
+                                    const uint32_t* __restrict__ active_nodes,
+                                    const uint32_t* __restrict__ active_node_count,
                                     const float* __restrict__ mass,
                                     const m::Vec3* __restrict__ momentum,
                                     m::Vec3* __restrict__ velocity) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total_nodes) return;
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= total_nodes || slot >= *active_node_count) return;
+    const uint32_t i = active_nodes[slot];
     const float mi = mass[i];
     if (mi < kMinNodeMass) { velocity[i] = m::Vec3::Zero(); return; }
     m::Vec3 v = momentum[i] * (1.0f / mi) + gravity * dt;  // symplectic Euler kick.
@@ -779,6 +876,8 @@ __forceinline__ __device__ sdfq::SparseSdfDevice LoadGrid(
 __global__ void MpmGridBodyProjectKernel(
     uint32_t total_nodes, uint32_t nodes_per_env, uint32_t dims_x, uint32_t dims_y,
     float dx, m::Vec3 origin, uint32_t bodies_per_env, float body_mu, float band,
+    const uint32_t* __restrict__ active_nodes,
+    const uint32_t* __restrict__ active_node_count,
     const m::Transform* __restrict__ body_pose,
     const m::Transform* __restrict__ body_inertial_frame,
     const m::Vec3* __restrict__ body_lin_vel,
@@ -789,10 +888,9 @@ __global__ void MpmGridBodyProjectKernel(
     const m::Vec3* __restrict__ sdf_grads, const float* __restrict__ mass,
     m::Vec3* __restrict__ velocity, m::Vec3* __restrict__ body_dp,
     uint32_t* __restrict__ body_owner, uint32_t* __restrict__ env_status) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total_nodes) return;
-    body_dp[i] = m::Vec3::Zero();
-    body_owner[i] = ~0u;
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= total_nodes || slot >= *active_node_count) return;
+    const uint32_t i = active_nodes[slot];
     const float mi = mass[i];
     if (mi < kMinNodeMass) return;
     const uint32_t env = i / nodes_per_env;
@@ -859,15 +957,8 @@ __global__ void MpmGridBodyProjectKernel(
     }
 }
 
-// Node sorting aliases grid_mass after projection; the next P2G overwrites that storage.
-__global__ void MpmInitNodeIdsKernel(uint32_t total_nodes,
-                                     uint32_t* __restrict__ node_ids) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total_nodes) node_ids[i] = i;
-}
-
-// Gather node reactions deterministically, applying free-body impulses and
-// storing link wrenches for the articulation deposit.
+// Load reaction tiles cooperatively and accumulate in stable node order.
+// Free bodies receive impulses; link wrenches feed the articulation deposit.
 __global__ void MpmGridBodyReactKernel(
     uint32_t total_bodies, uint32_t bodies_per_env, uint32_t total_nodes,
     uint32_t nodes_per_env,
@@ -882,7 +973,7 @@ __global__ void MpmGridBodyReactKernel(
     const uint32_t* __restrict__ sorted_node_id,
     m::Vec3* __restrict__ body_lin_vel, m::Vec3* __restrict__ body_ang_vel,
     m::Vec3* __restrict__ body_reaction, m::Vec3* __restrict__ body_ang_reaction) {
-    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t b = blockIdx.x;
     if (b >= total_bodies) return;
     const float im = body_inv_mass[b];
     const bool is_link = (body_to_link != nullptr) && (body_to_link[b] != ~0u);
@@ -895,30 +986,53 @@ __global__ void MpmGridBodyReactKernel(
     const uint32_t base = env * nodes_per_env;
     m::Vec3 dp_sum = m::Vec3::Zero();   // sum of node momentum changes this body caused.
     m::Vec3 tq_sum = m::Vec3::Zero();   // sum of (x-xb) x dp.
-    // CUB radix sort is stable. Its input node ids are 0..total_nodes-1, so equal
-    // owner keys retain the exact ascending node order of the old full-grid scan.
-    uint32_t lo = 0u, hi = total_nodes;
-    while (lo < hi) {
-        const uint32_t mid = lo + ((hi - lo) >> 1);
-        if (sorted_body_owner[mid] < b) lo = mid + 1u; else hi = mid;
+    __shared__ uint32_t range_begin, range_end;
+    __shared__ float3 linear_tile[kBlockSize], angular_tile[kBlockSize];
+    if (threadIdx.x == 0u) {
+        uint32_t lo = 0u, hi = total_nodes;
+        while (lo < hi) {
+            const uint32_t mid = lo + ((hi - lo) >> 1);
+            if (sorted_body_owner[mid] < b) lo = mid + 1u; else hi = mid;
+        }
+        range_begin = lo;
+        hi = total_nodes;
+        while (lo < hi) {
+            const uint32_t mid = lo + ((hi - lo) >> 1);
+            if (sorted_body_owner[mid] <= b) lo = mid + 1u; else hi = mid;
+        }
+        range_end = lo;
     }
-    for (uint32_t s = lo; s < total_nodes && sorted_body_owner[s] == b; ++s) {
-        const uint32_t node = sorted_node_id[s];
-        const uint32_t local = node - base;
-        const m::Vec3 dp = body_dp[node];
-        const int32_t nx = static_cast<int32_t>(local % dims_x);
-        const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
-        const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
-        const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
-        const m::Vec3 r = xi - xb;
-        dp_sum.x = __fadd_rn(dp_sum.x, dp.x);
-        dp_sum.y = __fadd_rn(dp_sum.y, dp.y);
-        dp_sum.z = __fadd_rn(dp_sum.z, dp.z);
-        const m::Vec3 tq = r.Cross(dp);
-        tq_sum.x = __fadd_rn(tq_sum.x, tq.x);
-        tq_sum.y = __fadd_rn(tq_sum.y, tq.y);
-        tq_sum.z = __fadd_rn(tq_sum.z, tq.z);
+    __syncthreads();
+    for (uint32_t start = range_begin; start < range_end;) {
+        const uint32_t count = min(blockDim.x, range_end - start);
+        if (threadIdx.x < count) {
+            const uint32_t node = sorted_node_id[start + threadIdx.x];
+            const uint32_t local = node - base;
+            const m::Vec3 dp = body_dp[node];
+            const int32_t nx = static_cast<int32_t>(local % dims_x);
+            const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
+            const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
+            const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
+            const m::Vec3 tq = (xi - xb).Cross(dp);
+            linear_tile[threadIdx.x] = make_float3(dp.x, dp.y, dp.z);
+            angular_tile[threadIdx.x] = make_float3(tq.x, tq.y, tq.z);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            for (uint32_t i = 0u; i < count; ++i) {
+                const float3 dp = linear_tile[i], tq = angular_tile[i];
+                dp_sum.x = __fadd_rn(dp_sum.x, dp.x);
+                dp_sum.y = __fadd_rn(dp_sum.y, dp.y);
+                dp_sum.z = __fadd_rn(dp_sum.z, dp.z);
+                tq_sum.x = __fadd_rn(tq_sum.x, tq.x);
+                tq_sum.y = __fadd_rn(tq_sum.y, tq.y);
+                tq_sum.z = __fadd_rn(tq_sum.z, tq.z);
+            }
+        }
+        __syncthreads();
+        start += count;
     }
+    if (threadIdx.x != 0u) return;
     // Reaction = -dp (equal-and-opposite); dp is the per-substep momentum, so it
     // IS the substep impulse (no dt scale).
     const m::Vec3 lin_impulse = dp_sum * (-1.0f);
@@ -1126,151 +1240,143 @@ __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
     }
 }
 
-// Partition the pre-allocated scratch [cub temp | keys-out | idx-out] (host-side,
-// so the sort never cudaMalloc/syncs mid-capture; the gather joins the graph).
+// Sorting outputs may be reused after P2G; node indexing and transfer inputs remain separate.
 struct MpmScratch {
     void* sort_temp = nullptr;
     uint32_t* keys_out = nullptr;
     uint32_t* idx_out = nullptr;
+    uint32_t* active_nodes = nullptr;
+    uint32_t* active_flags = nullptr;
+    uint32_t* cell_start = nullptr;
+    uint32_t* cell_end = nullptr;
+    uint32_t* node_ids = nullptr;
+    uint32_t* active_count = nullptr;
+    MpmTransferInput* transfer_input = nullptr;
     size_t sort_temp_bytes = 0u;
 };
-inline MpmScratch PartitionScratch(void* base, uint32_t Np) {
-    const MpmSortScratchLayout sl(Np);
-    char* sbase = reinterpret_cast<char*>(base);
-    MpmScratch s;
-    s.sort_temp = sbase;
-    s.keys_out = reinterpret_cast<uint32_t*>(sbase + sl.keys_off);
-    s.idx_out  = reinterpret_cast<uint32_t*>(sbase + sl.idx_off);
-    s.sort_temp_bytes = static_cast<size_t>(sl.temp_bytes);
-    return s;
+MpmScratch PartitionScratch(void* base, uint32_t item_count) {
+    const auto& layout = ScratchLayout(item_count);
+    auto* bytes = static_cast<char*>(base);
+    MpmScratch scratch;
+    scratch.sort_temp = bytes;
+    scratch.keys_out = reinterpret_cast<uint32_t*>(bytes + layout.keys_off);
+    scratch.idx_out = reinterpret_cast<uint32_t*>(bytes + layout.idx_off);
+    scratch.active_nodes = reinterpret_cast<uint32_t*>(bytes + layout.active_nodes_off);
+    scratch.active_flags = reinterpret_cast<uint32_t*>(bytes + layout.active_flags_off);
+    scratch.cell_start = reinterpret_cast<uint32_t*>(bytes + layout.cell_start_off);
+    scratch.cell_end = reinterpret_cast<uint32_t*>(bytes + layout.cell_end_off);
+    scratch.node_ids = reinterpret_cast<uint32_t*>(bytes + layout.node_ids_off);
+    scratch.active_count = reinterpret_cast<uint32_t*>(bytes + layout.active_count_off);
+    scratch.transfer_input = reinterpret_cast<MpmTransferInput*>(bytes + layout.transfer_input_off);
+    scratch.sort_temp_bytes = static_cast<size_t>(layout.temp_bytes);
+    return scratch;
 }
 
-// One MLS-MPM substep: sparse P2G(force) -> grid update + BC -> G2P -> F-update.
-void LaunchSubstep(const MpmStepParams& p, const ModelView& model,
-                   const DataView& data, float dt_sub, uint32_t Np, uint32_t Ppe,
-                   uint32_t mpm_pe, uint32_t mpm_count,
-                   uint32_t cpe, uint32_t total_nodes, float inv_dx,
-                   const m::Vec3& origin, cudaStream_t stream) {
+// One MLS-MPM substep retains the ordered transfer, boundary and constitutive dependencies.
+cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
+                         const DataView& data, const MpmScratch& scratch,
+                         float dt_sub, uint32_t Ppe, uint32_t mpm_pe, uint32_t mpm_count,
+                         uint32_t cpe, uint32_t total_nodes, float inv_dx,
+                         const m::Vec3& origin, cudaStream_t stream) {
     MpmProfiler& profiler = MpmProfiler::Get();
     const uint32_t nblocks = (total_nodes + kBlockSize - 1u) / kBlockSize;
-    // The particle-iterating kernels span the MPM sub-slice only. Sort/select share
-    // one layout sized for the larger of the particle stream and the full grid.
     const uint32_t pblocks = (mpm_count + kBlockSize - 1u) / kBlockSize;
-    const uint32_t sort_count = mpm_count > total_nodes ? mpm_count : total_nodes;
-    MpmScratch sc = PartitionScratch(data.mpm_sort_scratch, sort_count);
-    // grid_body_dp is raw 3*u32-per-node scratch until BodyProject overwrites it:
-    // [active node ids | cell starts | cell ends].
-    uint32_t* grid_node_scratch = reinterpret_cast<uint32_t*>(data.grid_body_dp);
-    uint32_t* active_nodes = grid_node_scratch;
-    uint32_t* cell_start = grid_node_scratch + total_nodes;
-    uint32_t* cell_end = grid_node_scratch + 2ull * total_nodes;
-    profiler.Start(MpmStage::GridPrepare, stream);
-    LaunchCuda(MpmGridPrepareKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-               total_nodes, data.grid_mass, data.grid_body_owner, cell_start);
-    profiler.Stop(MpmStage::GridPrepare, stream);
-    profiler.Start(MpmStage::CellKeys, stream);
-    LaunchCuda(MpmCellKeysKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
-               mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
-               p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], cpe,
-               data.mpm_grid_cell_key, data.mpm_grid_part_idx, p.nodes_per_env,
-               data.grid_body_owner, data.env_status);
-    profiler.Stop(MpmStage::CellKeys, stream);
-    profiler.Start(MpmStage::RadixSort, stream);
+    cudaError_t error = cudaSuccess;
+    const auto launch = [&](MpmStage stage, auto kernel, uint32_t blocks, auto... args) {
+        if (error != cudaSuccess) return;
+        profiler.Start(stage, stream);
+        LaunchCuda(kernel, dim3(blocks), dim3(kBlockSize), 0u, stream, args...);
+        error = cudaPeekAtLastError();
+        profiler.Stop(stage, stream);
+    };
+    launch(MpmStage::GridPrepare, MpmGridPrepareKernel, nblocks,
+           total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
+           data.grid_body_dp, data.grid_body_owner, scratch.active_flags,
+           scratch.cell_start, scratch.node_ids);
+    launch(MpmStage::CellKeys, MpmCellKeysKernel, pblocks,
+           mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
+           p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], cpe,
+           data.mpm_grid_cell_key, data.mpm_grid_part_idx, data.env_status);
+    if (error != cudaSuccess) return error;
     const uint32_t total_cells = cpe * p.env_count;
-    (void)cub::DeviceRadixSort::SortPairs(
-        sc.sort_temp, sc.sort_temp_bytes, data.mpm_grid_cell_key, sc.keys_out,
-        data.mpm_grid_part_idx, sc.idx_out, static_cast<int>(mpm_count), 0,
+    size_t temp_bytes = scratch.sort_temp_bytes;
+    profiler.Start(MpmStage::RadixSort, stream);
+    error = cub::DeviceRadixSort::SortPairs(
+        scratch.sort_temp, temp_bytes, data.mpm_grid_cell_key, scratch.keys_out,
+        data.mpm_grid_part_idx, scratch.idx_out, static_cast<int>(mpm_count), 0,
         RadixBitsInclusive(total_cells - 1u), stream);
     profiler.Stop(MpmStage::RadixSort, stream);
-    profiler.Start(MpmStage::CellRanges, stream);
-    LaunchCuda(MpmBuildCellRangesKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
-               mpm_count, sc.keys_out, total_nodes, cell_start, cell_end);
-    profiler.Stop(MpmStage::CellRanges, stream);
-    // The particle key input is dead after radix sort, so lane 0 stores the
-    // selected-count scalar.
-    uint32_t* active_node_count = data.mpm_grid_cell_key;
+    if (error != cudaSuccess) return error;
+    launch(MpmStage::CellRanges, MpmBuildCellRangesKernel, pblocks,
+           mpm_count, scratch.keys_out, total_cells, scratch.cell_start, scratch.cell_end,
+           cpe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.active_flags);
+    if (error != cudaSuccess) return error;
     thrust::counting_iterator<uint32_t> active_id_iter(0u);
-    size_t select_temp_bytes = sc.sort_temp_bytes;
+    temp_bytes = scratch.sort_temp_bytes;
     profiler.Start(MpmStage::ActiveSelect, stream);
-    (void)cub::DeviceSelect::Flagged(
-        sc.sort_temp, select_temp_bytes, active_id_iter, data.grid_body_owner,
-        active_nodes, active_node_count, static_cast<int>(total_nodes), stream);
+    error = cub::DeviceSelect::Flagged(
+        scratch.sort_temp, temp_bytes, active_id_iter, scratch.active_flags,
+        scratch.active_nodes, scratch.active_count, static_cast<int>(total_nodes), stream);
     profiler.Stop(MpmStage::ActiveSelect, stream);
-    profiler.Start(MpmStage::Stress, stream);
-    LaunchCuda(MpmPrecomputeStressKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
-               mpm_count, Ppe, mpm_pe, data.particle_C, data.particle_F,
-               data.particle_vol0, data.particle_material_id,
-               data.mpm_material_table, p.material_count,
-               data.mpm_particle_stress);
-    profiler.Stop(MpmStage::Stress, stream);
-    profiler.Start(MpmStage::P2G, stream);
-    LaunchCuda(MpmP2GGatherKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-               total_nodes, active_nodes, active_node_count,
-               data.particle_pos, data.particle_inv_mass,
-               data.particle_vel, data.particle_C, data.particle_vol0,
-               data.mpm_particle_stress, sc.idx_out, cell_start, cell_end,
-               mpm_count, mpm_pe,
-               p.nodes_per_env,
-               cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx,
-               dt_sub, origin, data.grid_mass, data.grid_momentum);
-    profiler.Stop(MpmStage::P2G, stream);
+    if (error != cudaSuccess) return error;
+    launch(MpmStage::Stress, MpmPrecomputeStressKernel, pblocks,
+           mpm_count, Ppe, mpm_pe, data.particle_C, data.particle_F,
+           data.particle_vol0, data.particle_material_id,
+           data.mpm_material_table, p.material_count, data.mpm_particle_stress);
+    launch(MpmStage::TransferInput, MpmPrepareTransferInputKernel, pblocks,
+           mpm_count, scratch.idx_out, data.particle_pos, data.particle_inv_mass,
+           data.particle_vel, data.particle_C, data.particle_vol0, data.mpm_particle_stress,
+           origin, inv_dx, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.transfer_input);
+    launch(MpmStage::P2G, MpmP2GGatherKernel, nblocks,
+           total_nodes, scratch.active_nodes, scratch.active_count,
+           scratch.transfer_input, scratch.cell_start, scratch.cell_end,
+           mpm_count, mpm_pe, p.nodes_per_env,
+           cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx,
+           dt_sub, origin, data.grid_mass, data.grid_momentum);
     const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
     const m::Vec3 pn{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
-    profiler.Start(MpmStage::GridUpdate, stream);
-    LaunchCuda(MpmGridUpdateKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-               total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx,
-               origin, g, dt_sub, pn, p.plane_d, p.plane_mu, data.grid_mass,
-               data.grid_momentum, data.grid_velocity);
-    profiler.Stop(MpmStage::GridUpdate, stream);
-    // Dynamic-body grid BC + two-way reaction (between grid-update and G2P). The
-    // BITE disables ONLY these kernels (the static-plane BC above stays on).
-    if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u &&
-        p.bodies_per_env > 0u) {
+    launch(MpmStage::GridUpdate, MpmGridUpdateKernel, nblocks,
+           total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx,
+           origin, g, dt_sub, pn, p.plane_d, p.plane_mu,
+           scratch.active_nodes, scratch.active_count, data.grid_mass,
+           data.grid_momentum, data.grid_velocity);
+    if (error != cudaSuccess) return error;
+    if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u && p.bodies_per_env > 0u) {
         const uint32_t total_bodies = p.bodies_per_env * p.env_count;
-        const uint32_t bblocks = (total_bodies + kBlockSize - 1u) / kBlockSize;
-        profiler.Start(MpmStage::BodyProject, stream);
-        LaunchCuda(MpmGridBodyProjectKernel, dim3(nblocks), dim3(kBlockSize), 0u,
-                   stream, total_nodes, p.nodes_per_env, p.grid_dims[0],
-                   p.grid_dims[1], p.dx, origin, p.bodies_per_env, p.body_mu,
-                   p.body_band, data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
-                   data.body_angular_velocity, model.shape_table, model.sdf_headers,
-                   model.sdf_cell_count, model.sdf_cell_keys, model.sdf_cell_values,
-                   model.sdf_cell_gradients, data.grid_mass, data.grid_velocity,
-                   data.grid_body_dp, data.grid_body_owner, data.env_status);
-        profiler.Stop(MpmStage::BodyProject, stream);
-        uint32_t* body_node_ids = reinterpret_cast<uint32_t*>(data.grid_mass);
+        launch(MpmStage::BodyProject, MpmGridBodyProjectKernel, nblocks,
+               total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx, origin,
+               p.bodies_per_env, p.body_mu, p.body_band, scratch.active_nodes, scratch.active_count,
+               data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
+               data.body_angular_velocity, model.shape_table, model.sdf_headers,
+               model.sdf_cell_count, model.sdf_cell_keys, model.sdf_cell_values,
+               model.sdf_cell_gradients, data.grid_mass, data.grid_velocity,
+               data.grid_body_dp, data.grid_body_owner, data.env_status);
+        if (error != cudaSuccess) return error;
+        temp_bytes = scratch.sort_temp_bytes;
         profiler.Start(MpmStage::BodySort, stream);
-        LaunchCuda(MpmInitNodeIdsKernel, dim3(nblocks), dim3(kBlockSize), 0u, stream,
-                   total_nodes, body_node_ids);
-        (void)cub::DeviceRadixSort::SortPairs(
-            sc.sort_temp, sc.sort_temp_bytes, data.grid_body_owner,
-            sc.keys_out, body_node_ids, sc.idx_out, static_cast<int>(total_nodes), 0,
+        error = cub::DeviceRadixSort::SortPairs(
+            scratch.sort_temp, temp_bytes, data.grid_body_owner,
+            scratch.keys_out, scratch.node_ids, scratch.idx_out, static_cast<int>(total_nodes), 0,
             RadixBitsInclusive(total_bodies), stream);
         profiler.Stop(MpmStage::BodySort, stream);
-        profiler.Start(MpmStage::BodyReact, stream);
-        LaunchCuda(MpmGridBodyReactKernel, dim3(bblocks), dim3(kBlockSize), 0u,
-                   stream, total_bodies, p.bodies_per_env, total_nodes,
-                   p.nodes_per_env,
-                   p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-                   data.body_pose, data.body_inertial_frame, data.body_inv_mass, data.body_world_inv_inertia,
-                   model.body_to_link, data.grid_body_dp, sc.keys_out, sc.idx_out,
-                   data.body_linear_velocity, data.body_angular_velocity,
-                   data.mpm_body_reaction, data.mpm_body_ang_reaction);
-        profiler.Stop(MpmStage::BodyReact, stream);
+        if (error != cudaSuccess) return error;
+        launch(MpmStage::BodyReact, MpmGridBodyReactKernel, total_bodies,
+               total_bodies, p.bodies_per_env, total_nodes, p.nodes_per_env,
+               p.grid_dims[0], p.grid_dims[1], p.dx, origin,
+               data.body_pose, data.body_inertial_frame, data.body_inv_mass, data.body_world_inv_inertia,
+               model.body_to_link, data.grid_body_dp, scratch.keys_out, scratch.idx_out,
+               data.body_linear_velocity, data.body_angular_velocity,
+               data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
-    profiler.Start(MpmStage::G2P, stream);
-    LaunchCuda(MpmG2PGatherKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream,
-               mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
-               p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
-               data.grid_velocity, data.particle_pos, data.particle_vel,
-               data.particle_C);
-    profiler.Stop(MpmStage::G2P, stream);
-    profiler.Start(MpmStage::UpdateF, stream);
-    LaunchCuda(MpmUpdateFKernel, dim3(pblocks), dim3(kBlockSize), 0u, stream, mpm_count,
-               dt_sub, data.particle_C, data.particle_material_id,
-               data.mpm_material_table, p.material_count, Ppe, mpm_pe, data.particle_F,
-               data.env_status);
-    profiler.Stop(MpmStage::UpdateF, stream);
+    launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
+           mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
+           p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
+           data.grid_velocity, data.particle_pos, data.particle_vel, data.particle_C);
+    launch(MpmStage::UpdateF, MpmUpdateFKernel, pblocks, mpm_count,
+           dt_sub, data.particle_C, data.particle_material_id,
+           data.mpm_material_table, p.material_count, Ppe, mpm_pe, data.particle_F,
+           data.env_status);
+    return error;
 }
 
 Status OpMpmStep(const ModelView& model, const DataView& data,
@@ -1279,38 +1385,44 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     if (p == nullptr) return Status::Failed;
     MpmProfiler& profiler = MpmProfiler::Get();
     profiler.BeginStep();
-    // Defensive inertness (the build-time add() gate already keeps this op off a
-    // non-MPM op list): nothing to do without MPM particles / a grid / a cell size.
-    if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmXpbd) ||
-        p->particle_count == 0u || p->nodes_per_env == 0u || p->dx <= 0.0f) {
+    if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmXpbd) || p->particle_count == 0u) {
         return Status::Ok;
     }
+    if (p->env_count == 0u || p->nodes_per_env == 0u || !(p->dx > 0.0f) ||
+        !std::isfinite(p->dx) || !std::isfinite(p->dt) || p->dt < 0.0f ||
+        p->grid_dims[0] == 0u || p->grid_dims[1] == 0u || p->grid_dims[2] == 0u)
+        return Status::InvalidArgument;
     const uint64_t total_nodes64 =
         static_cast<uint64_t>(p->nodes_per_env) * p->env_count;
-    const uint64_t cells_per_env =
-        static_cast<uint64_t>(p->grid_dims[0]) * p->grid_dims[1] * p->grid_dims[2];
-    if (cells_per_env == 0u) return Status::Ok;
-    // LOUD overflow: the env-offset node/cell key + total-body launch must fit u32.
-    if (total_nodes64 > static_cast<uint64_t>(INT_MAX)) return Status::Failed;
-    if (cells_per_env * p->env_count > 0xFFFFFFFFull) return Status::Failed;
-    if (static_cast<uint64_t>(p->bodies_per_env) * p->env_count > 0xFFFFFFFFull)
-        return Status::Failed;
+    const uint64_t grid_xy = static_cast<uint64_t>(p->grid_dims[0]) * p->grid_dims[1];
+    if (grid_xy > p->nodes_per_env || grid_xy * p->grid_dims[2] != p->nodes_per_env ||
+        total_nodes64 > static_cast<uint64_t>(INT_MAX) ||
+        static_cast<uint64_t>(p->bodies_per_env) * p->env_count > static_cast<uint64_t>(INT_MAX))
+        return Status::InvalidArgument;
+    const uint64_t cells_per_env = grid_xy * p->grid_dims[2];
     const uint32_t Np = p->particle_count;
     const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
-    // The MPM sub-slice [0, mpm_pe) per env. 0 => the whole per-env block is MPM (a
-    // lone MPM medium; then mpm_count == Np, byte-identical to the contiguous launch).
-    const uint32_t mpm_pe =
-        (p->mpm_particles_per_env == 0u || p->mpm_particles_per_env > Ppe)
-            ? Ppe : p->mpm_particles_per_env;
+    if (p->mpm_particles_per_env > Ppe) return Status::InvalidArgument;
+    const uint32_t mpm_pe = p->mpm_particles_per_env == 0u ? Ppe : p->mpm_particles_per_env;
     const uint64_t mpm_count64 =
         static_cast<uint64_t>(mpm_pe) * p->env_count;
-    // LOUD invariants: the count fits the per-env footprint + cub's int num_items.
-    if (static_cast<uint64_t>(Np) >
-        static_cast<uint64_t>(Ppe) * p->env_count) return Status::Failed;
-    if (mpm_count64 > static_cast<uint64_t>(INT_MAX)) return Status::Failed;
+    if (static_cast<uint64_t>(Np) != static_cast<uint64_t>(Ppe) * p->env_count ||
+        mpm_count64 > static_cast<uint64_t>(INT_MAX)) return Status::InvalidArgument;
+    if (!data.particle_pos || !data.particle_vel || !data.particle_inv_mass ||
+        !data.particle_C || !data.particle_F || !data.particle_vol0 ||
+        !data.grid_mass || !data.grid_momentum || !data.grid_velocity ||
+        !data.grid_body_dp || !data.grid_body_owner || !data.mpm_sort_scratch ||
+        !data.mpm_grid_cell_key || !data.mpm_grid_part_idx || !data.mpm_particle_stress ||
+        !data.env_status || (p->material_count > 0u && !data.mpm_material_table))
+        return Status::InvalidArgument;
+    if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u && p->bodies_per_env > 0u &&
+        (!model.shape_table || !data.body_pose || !data.body_inertial_frame || !data.body_inv_mass ||
+         !data.body_linear_velocity)) return Status::InvalidArgument;
     const uint32_t mpm_count = static_cast<uint32_t>(mpm_count64);
     const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
+    const MpmScratch scratch = PartitionScratch(data.mpm_sort_scratch,
+                                                mpm_count > total_nodes ? mpm_count : total_nodes);
     const float inv_dx = 1.0f / p->dx;
     const m::Vec3 origin{p->grid_origin[0], p->grid_origin[1], p->grid_origin[2]};
     const uint32_t substeps = p->substeps == 0u ? 1u : p->substeps;
@@ -1331,10 +1443,10 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         LaunchCuda(MpmClearBodyReactionKernel, dim3(bb), dim3(kBlockSize), 0u,
                    stream, tb, data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
-    for (uint32_t s = 0; s < substeps; ++s) {
-        LaunchSubstep(*p, model, data, dt_sub, Np, Ppe, mpm_pe, mpm_count, cpe,
-                      total_nodes, inv_dx, origin, stream);
-    }
+    if (cudaPeekAtLastError() != cudaSuccess) return Status::Failed;
+    for (uint32_t s = 0; s < substeps; ++s)
+        if (LaunchSubstep(*p, model, data, scratch, dt_sub, Ppe, mpm_pe, mpm_count, cpe,
+                          total_nodes, inv_dx, origin, stream) != cudaSuccess) return Status::Failed;
     // Deposit accumulated link reaction into qdot after the substep loop.
     // Articulation surface velocities are therefore fixed during these substeps.
     if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
@@ -1355,12 +1467,11 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     }
     // Eager execution drains the stream to expose asynchronous faults.
     // Captured execution reports completion errors through graph replay.
+    if (cudaPeekAtLastError() != cudaSuccess) return Status::Failed;
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
-        capture == cudaStreamCaptureStatusNone) {
-        if (cudaStreamSynchronize(stream) != cudaSuccess) return Status::Failed;
-        return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-    }
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) return Status::Failed;
+    if (capture == cudaStreamCaptureStatusNone && cudaStreamSynchronize(stream) != cudaSuccess)
+        return Status::Failed;
     return Status::Ok;
 }
 
@@ -1369,7 +1480,7 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
 uint64_t MpmSortScratchBytes(uint32_t particle_count) {
     if (particle_count == 0u || particle_count > static_cast<uint32_t>(INT_MAX))
         return 0u;
-    return MpmSortScratchLayout(particle_count).total;
+    return ScratchLayout(particle_count).total;
 }
 
 void RegisterNkMpmOps() {
