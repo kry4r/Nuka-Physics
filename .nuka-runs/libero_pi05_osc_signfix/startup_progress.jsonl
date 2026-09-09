@@ -1,7 +1,0 @@
-{"event": "process_start", "wall_seconds": 4.409999998955527e-06, "pid": 279}
-{"event": "device_ready", "wall_seconds": 0.23690023500000024}
-{"event": "world_ready", "wall_seconds": 0.7769662579999981, "control_backend": "osc"}
-{"event": "settle_begin", "wall_seconds": 0.7795628959999981, "steps": 25, "control_hz": 20}
-{"event": "settle_done", "wall_seconds": 1.4303622259999997}
-{"event": "policy_load_begin", "wall_seconds": 1.433046222999998}
-{"event": "policy_load_done", "wall_seconds": 86.076121094, "seconds": 84.637903714}

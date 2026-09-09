@@ -15,6 +15,42 @@ docs/specs/
 core.*
 *.log
 
+# Local runs, downloaded utilities, and session notes
+/.nuka-runs/
+/logs/
+/tools/ffmpeg/
+/.after.md
+/.last_summary.md
+/.session_*.md
+/.tail*.md
+/SESSION_SUMMARY.md
+/STATUS_*.md
+/PI05_*SUMMARY.md
+/PI05_DEMO_SUCCESS.md
+/context.md
+/pi05_grasping_contact_analysis.md
+
+# Root-level scratch scripts and generated captures
+/diagnose_*.py
+/test_*.py
+/tmp_*.py
+/check_*.py
+/read_narrowphase_diagnostic.py
+/*.bundle
+/*.ppm
+/*.raw
+/*.mp4
+/*.npy
+/*.npz
+/camera_*.png
+/frame_*.png
+/initial_state.png
+/test_home_view.png
+/MUJOCO_LOG.TXT
+/nul
+/grasp_frames/
+/libero_grasp_output/
+
 # Visual Studio
 .vs/
 *.suo
@@ -47,11 +83,11 @@ CTestTestfile.cmake
 Testing/
 _deps/
 
-# Content-addressed cook-artifact cache (M2c): regenerable hull/SDF blobs.
+# Content-addressed cook-artifact cache: regenerable hull/SDF blobs.
 # Keyed by input content hash; safe to delete (re-cooked on demand).
 .nuka_cache/
 
-# Spec 05 external assets/checkpoints. Manifests and fetch scripts are tracked;
+# External assets/checkpoints. Manifests and fetch scripts are tracked;
 # downloaded meshes, motions, model weights, rollout frames, and metrics are not.
 .nuka-assets/
 *.safetensors

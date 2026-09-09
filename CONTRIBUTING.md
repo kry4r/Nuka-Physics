@@ -72,6 +72,14 @@ two runs**, with no float atomics and a fixed reduction order in physics paths.
   the scoped allowlist policy. The allowlist is only for documented migration
   debt or validation code — never use it to land new physics code.
 
+## Local outputs
+
+Keep scratch diagnostics, session notes, recordings, and benchmark output in
+`.nuka-runs/` or `out/`. Do not commit Git bundles or downloaded tool distributions.
+Maintained tools belong in `tools/`; curated showcase media belongs in `docs/media/`.
+Video export requires FFmpeg on `PATH`; `tools/ffmpeg/` is an optional, ignored
+local installation directory.
+
 ## Generated code: DO NOT EDIT
 
 Files under **`src/codegen/generated/**`** are produced by the codegen step and

@@ -767,7 +767,7 @@ def main() -> None:
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument("--histogram-matching", action="store_true",
                         help="Apply histogram matching to adapt Nuka renders to LIBERO distribution")
-    parser.add_argument("--histogram-reference", default=str(REPO / ".nuka-runs/libero_reference"),
+    parser.add_argument("--histogram-reference", default=str(REPO / "examples/assets/libero/reference"),
                         help="Directory containing LIBERO reference frames for histogram matching")
     args = parser.parse_args()
 
