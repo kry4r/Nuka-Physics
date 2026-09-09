@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cub/device/device_segmented_sort.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "core/checked_size.hpp"
+#include "nk/contact/contact_identity.hpp"
 #include "nk/model/generated/views.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/backend.hpp"
@@ -44,6 +45,12 @@ struct KeySource {
     }
     __device__ uint64_t Material(uint32_t id) const {
         return id < points ? current_material[id / nk::kPairDrivenPtsPerSlot] : cache_material[id - points];
+    }
+    __device__ uint32_t Bucket(uint32_t id) const {
+        uint64_t hash = nk::ContactHashWord(1469598103934665603ull, Pair(id));
+        hash = nk::ContactHashWord(hash, Feature(id));
+        hash = nk::ContactHashWord(hash, Material(id));
+        return static_cast<uint32_t>(hash) ^ static_cast<uint32_t>(hash >> 32u);
     }
     __device__ bool Same(uint32_t a, uint32_t b) const {
         return Valid(a) && Valid(b) && Point(a) / points_per_env == Point(b) / points_per_env &&
@@ -85,9 +92,10 @@ inline uint64_t ScratchBytes(uint32_t points, uint32_t envs) {
     size_t sort_bytes = 0u, scan_bytes = 0u, compact_bytes = 0u;
     cub::DoubleBuffer<uint64_t> keys(nullptr, nullptr);
     cub::DoubleBuffer<uint32_t> order(nullptr, nullptr);
-    auto status = cub::DeviceSegmentedSort::StableSortPairs(nullptr, sort_bytes, keys, order,
+    auto status = cub::DeviceSegmentedRadixSort::SortPairs(nullptr, sort_bytes, keys, order,
         static_cast<int>(points * 2u), static_cast<int>(envs + 1u),
-        static_cast<const uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr));
+        static_cast<const uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
+        0, std::numeric_limits<uint32_t>::digits);
     if (status == cudaSuccess)
         status = cub::DeviceScan::ExclusiveScan(nullptr, scan_bytes,
             static_cast<const Ranks*>(nullptr), static_cast<Ranks*>(nullptr),
@@ -160,17 +168,16 @@ static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* vali
     order[begin + prefix[i] - prefix[begin]] = keys.Source(i);
 }
 
-static __global__ void SortKeysKernel(KeySource source, const uint32_t* order,
-                                      const uint32_t* ends, uint32_t component, uint64_t* keys) {
+static __global__ void BucketKeysKernel(KeySource source, const uint32_t* order,
+                                      const uint32_t* ends, uint64_t* keys) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= source.points * 2u || i >= ends[i / (source.points_per_env * 2u)]) return;
-    const uint32_t id = order[i];
-    keys[i] = component == 0u ? source.Material(id)
-        : component == 1u ? source.Feature(id) : source.Pair(id);
+    keys[i] = source.Bucket(order[i]);
 }
 
-// Each exact-key group is consumed once; source indices define stable ownership.
+// Hashes index buckets only; complete keys determine matches and ownership.
 static __global__ void MergeGroupsKernel(KeySource keys, const uint32_t* order,
+                                          const uint64_t* buckets,
                                           const uint32_t* begins, const uint32_t* ends,
                                           const uint32_t* age, uint32_t decay_steps,
                                           uint32_t* matches, uint32_t* owner, uint32_t* keep) {
@@ -178,25 +185,35 @@ static __global__ void MergeGroupsKernel(KeySource keys, const uint32_t* order,
     if (i >= keys.points * 2u) return;
     const uint32_t env = i / (keys.points_per_env * 2u);
     if (i >= ends[env]) return;
-    const uint32_t first = order[i];
-    if (i != begins[env] && keys.Same(order[i - 1u], first)) return;
-    uint32_t current = ~0u, old = ~0u, warm = ~0u;
-    for (uint32_t j = i; j < ends[env]; ++j) {
-        const uint32_t id = order[j];
-        if (j != i && !keys.Same(first, id)) break;
-        if (id < keys.points) {
-            if (current == ~0u) current = id;
-        } else {
-            const uint32_t point = id - keys.points;
-            if (old == ~0u) old = point;
-            if (warm == ~0u && age[point] < decay_steps) warm = point;
+    const uint64_t bucket = buckets[i];
+    if (i != begins[env] && buckets[i - 1u] == bucket) return;
+    uint32_t end = i + 1u;
+    while (end < ends[env] && buckets[end] == bucket) ++end;
+    for (uint32_t entry = i; entry < end; ++entry) {
+        const uint32_t source = order[entry];
+        bool seen = false;
+        for (uint32_t prior = i; prior < entry; ++prior) {
+            if (keys.Same(order[prior], source)) { seen = true; break; }
         }
-    }
-    if (current != ~0u) {
-        owner[current] = 1u;
-        matches[current] = warm;
-    } else if (old != ~0u && decay_steps > 1u && age[old] < decay_steps - 1u) {
-        keep[old] = 1u;
+        if (seen) continue;
+        uint32_t current = ~0u, old = ~0u, warm = ~0u;
+        for (uint32_t j = entry; j < end; ++j) {
+            const uint32_t id = order[j];
+            if (!keys.Same(source, id)) continue;
+            if (id < keys.points) {
+                if (current == ~0u) current = id;
+            } else {
+                const uint32_t point = id - keys.points;
+                if (old == ~0u) old = point;
+                if (warm == ~0u && age[point] < decay_steps) warm = point;
+            }
+        }
+        if (current != ~0u) {
+            owner[current] = 1u;
+            matches[current] = warm;
+        } else if (old != ~0u && decay_steps > 1u && age[old] < decay_steps - 1u) {
+            keep[old] = 1u;
+        }
     }
 }
 
@@ -221,18 +238,16 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
     cub::DoubleBuffer<uint64_t> key_buffers(workspace.keys, workspace.alternate_keys);
     cub::DoubleBuffer<uint32_t> order_buffers(workspace.order, workspace.alternate);
-    for (uint32_t component = 0u; component < 3u; ++component) {
-        SortKeysKernel<<<blocks, block, 0u, stream>>>(keys, order_buffers.Current(),
-            workspace.ends, component, key_buffers.Current());
-        if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
-        temp_bytes = workspace.temp_bytes;
-        status = cub::DeviceSegmentedSort::StableSortPairs(workspace.temp, temp_bytes,
-            key_buffers, order_buffers, static_cast<int>(points * 2u), static_cast<int>(envs + 1u),
-            workspace.begins, workspace.ends, stream);
-        if (status != cudaSuccess) return status;
-    }
+    BucketKeysKernel<<<blocks, block, 0u, stream>>>(keys, order_buffers.Current(),
+        workspace.ends, key_buffers.Current());
+    if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
+    temp_bytes = workspace.temp_bytes;
+    status = cub::DeviceSegmentedRadixSort::SortPairs(workspace.temp, temp_bytes,
+        key_buffers, order_buffers, static_cast<int>(points * 2u), static_cast<int>(envs + 1u),
+        workspace.begins, workspace.ends, 0, std::numeric_limits<uint32_t>::digits, stream);
+    if (status != cudaSuccess) return status;
     MergeGroupsKernel<<<blocks, block, 0u, stream>>>(keys,
-        order_buffers.Current(), workspace.begins, workspace.ends,
+        order_buffers.Current(), key_buffers.Current(), workspace.begins, workspace.ends,
         data.contact_cache_age, decay_steps, workspace.matches,
         data.contact_cache_current_owner, data.contact_cache_old_keep);
     return cudaGetLastError();
