@@ -57,6 +57,8 @@
 
 ## 性能模块的重点
 
+最新 [MPM 粒子/节点容量验收](../research/2026-09-10-mpm-capacity-validation-zh.md) 已完成：共享查询分别传入实际 P/N，CUDA 内部分别分配记录与节点数组。原 bunny 的 Data arena 从 95,699,456 降至 94,306,816 B；十对完整步时基本持平，收益按容量回收记录。既有 MPM 场景、固定 E=16 pipeline、十项 memcheck 和无 CUDA 核心构建通过，补充共驻五对没有复现稳定回退。三个直接读取/缓存候选未采用，生产 P2G 保留已验收实现。稀疏网格、跨节点的数据复用、其余性能路径及完整耦合继续保持未完成；执行优先级和 active 状态不变。
+
 MLS-MPM 已完成体积硬截断修复、[粒子归属/容量架构验收](../research/2026-09-09-mpm-ownership-validation-zh.md) 和 [CUDA 传输验收](../research/2026-09-09-cuda-mpm-transfer-validation-zh.md)。保持原 bunny-water 输入，CUDA 独立五进程落水 eager/graph 为 48.270 → 32.812 / 44.611 → 28.809 ms/步（−32.02%/−35.42%），Data arena 为 71.22 → 95.70 MB。完整质量/状态、33 项既有场景、固定 E=16 graph pipeline 和针对性 memcheck/synccheck 通过。P2G/记录准备仍是热点；局部大 J、无 SDF、多 owner、有限质量、复合形状实际 owner 和 articulation 子步反馈均未据此关闭。
 
 后续 [CUDA 记录写入优化](../research/2026-09-10-cuda-mpm-record-store-validation-zh.md) 已通过五对验收：落水 eager/graph 再降时 8.18%/9.66%，静置降时 10.03%/10.98%，arena 不增加。继而 [P2G 有序协作读取](../research/2026-09-10-cuda-mpm-gather-validation-zh.md) 再降时 18.56%/22.07%，graph 落水为 20.3586 ms/步，arena 仍不增加。两批的完整质量/状态、既有场景、固定 E=16 pipeline 及 memcheck/synccheck 通过；关节支承补充对照保留进程波动。当前 P2G 仍占落水 kernel busy 的 60.58%，继续读取/计算及容量热点，不将局部验收视为 MLS-MPM 性能完成。

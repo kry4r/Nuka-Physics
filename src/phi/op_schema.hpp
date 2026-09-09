@@ -430,12 +430,9 @@ struct MpmStepParams {
     uint32_t artics_per_env;     // co-resident articulations per env (>=1 when artic).
 };
 
-// Byte size of the pre-allocated mpm_sort_scratch field (the deterministic P2G
-// particle sort, active-node select, and body-reaction node sort share one cub
-// temp + sorted key/idx output pair, 256B-aligned).
-// Host-callable (defined in mpm.cu) so World sizes the field before allocation
-// -> no mid-capture cudaMalloc. 0 for 0 particles.
-uint64_t MpmSortScratchBytes(uint32_t particle_count);
+// Workspace bytes for the actual MPM particle and grid node counts.
+// Query before state allocation; zero particles require no workspace.
+uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count);
 
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params

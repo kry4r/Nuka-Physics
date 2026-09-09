@@ -97,14 +97,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     model_.capacities.grid_sort_scratch_bytes =
         phi::GridSortScratchBytes(particle_grid_count);
 
-    // Size the MLS-MPM P2G deterministic-gather scratch the same way; 0 for a
-    // non-MPM world (zero-byte segment, byte-inert).
+    // Particle transfers and grid indexing retain their own workspace capacities.
     const uint32_t mpm_per_env = model_.MpmParticlesPerEnv();
     const uint64_t mpm_particle_sort_count =
         static_cast<uint64_t>(mpm_per_env) * model_.capacities.env_count;
-    // The same workspace also compacts active P2G nodes and, when dynamic bodies
-    // are enabled, stably groups projected nodes by owner for the reaction gather.
-    // Both node phases need capacity for the full env-private grid.
+    // Active-node compaction and body-reaction grouping cover the full private grids.
     const uint64_t mpm_node_sort_count = mpm_per_env > 0u
         ? static_cast<uint64_t>(model_.capacities.mpm_grid_nodes_per_env) *
               model_.capacities.env_count
@@ -114,8 +111,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
             ? mpm_particle_sort_count : mpm_node_sort_count;
     model_.capacities.mpm_grid_sort_scratch_bytes =
         mpm_sort_count <= static_cast<uint64_t>(std::numeric_limits<int>::max())
-            ? phi::MpmSortScratchBytes(static_cast<uint32_t>(mpm_sort_count))
-            : 0u;  // CUB sort/select expose an int num_items contract.
+            ? phi::MpmSortScratchBytes(static_cast<uint32_t>(mpm_particle_sort_count),
+                                        static_cast<uint32_t>(mpm_node_sort_count))
+            : 0u;
 
     // Size the dynamic-island cub radix-sort scratch (BuildSolveIslands) over the
     // total row capacity so the sort captures into the graph; 0 if no rows (inert).
