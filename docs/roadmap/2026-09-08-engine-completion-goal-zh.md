@@ -1,12 +1,20 @@
 # Nuka-Physics 引擎完善目标
 
-状态：active。创建：2026-09-08。依据用户最新要求，后续成批修改多个相关模块，再统一验证；Editor 暂缓。
+状态：active。创建：2026-09-08；更新：2026-09-10。依据用户最新要求，后续成批修改多个相关模块，再统一验证；Editor 暂缓。
 
 ## 目标与范围
 
 完成 [模块 spec](../plans/2026-09-07-physics-module-specs-newton-port-zh.md) 与 [细化 spec](../plans/2026-09-08-physics-optimization-detailed-spec-zh.md) 中尚未完成的引擎功能和性能工作，持续回写规格、进度、TODO、实际结果和限制。旧目标的 demo 调优、规格细化及开始实施已验收；本目标接续其全部引擎剩余项，不以首批完成代表整体完成。
 
-2026-09-09 用户更新执行顺序：先提交并推送现有 commit 与 README；随后优先完成 MLS-MPM 和其他剩余性能问题，再分析、优化完整多体耦合，耦合处理结束后继续原 spec 的其余计划。耦合方案允许从现有架构与物理原理独立推导，探索整体最优设计；Newton/MuJoCo/Genesis 是可选参考与适用物理对照，不限定架构或算法选择。总范围和 active 状态不变。
+2026-09-10 用户确认当前目标的执行顺序：优先完成 MLS-MPM 和其他剩余性能问题 → 分析、优化完整多体/多介质耦合 → 按原 spec 继续全部未完成工作。现有 commit、README 与临时产物清理均已推送；当前工作重心回到引擎性能。总范围和 active 状态不变。
+
+| 优先级 | 目标内容 | 推进依据 |
+| --- | --- | --- |
+| 1 | MLS-MPM 与其余性能优化 | 先处理原 bunny-water 的 P2G、传输记录准备和 workspace 热点，再推进多环境、刚体/机器人、柔体、SDF、光追和端到端性能；以完整管线的同等物理质量、五进程收益及内存代价验收 |
+| 2 | 完整多体/多介质耦合分析与优化 | 从现有架构、质量算子、接触界面和时间层独立推导方案，覆盖无 SDF 几何、多个有限质量端点、刚体/机器人子步反作用及 MPM↔XPBD 交换；以守恒、界面残差和步长收敛判断 |
+| 3 | 原 spec 的其余引擎工作 | 接续异构映射、接触/几何、错误契约、API/传感器、可微及其他尚未验收项，持续回写细化规格和实际进度 |
+
+耦合方案不必局限于 Newton、MuJoCo、Genesis 的现有实现，可以仅基于本引擎架构与物理推导探索最优方案；适用的上游仿真结果用于物理对照，不限定设计。共享架构、CUDA 后端调优与物理算法仍分别分类，始终保持 multi-backend 和一个通用求解路径。
 
 已验收基线：π0.5/G1 demo 与主页、完整环境 reset、三轴重力和自由体外力（`0953516`）。本批新增稳定自由旋转、创建拓扑防护、确定性风阻功能、required op/首错停止及邻域容量池基础；见 [动力学整批验收](../research/2026-09-08-dynamics-pipeline-validation-zh.md)。原 demo、reset、外力轨迹和冻结库保留。
 
@@ -20,7 +28,7 @@
 
 当前接触索引的功能与 graph 子集已验证，见 [review](../research/2026-09-09-contact-index-upstream-review-zh.md) 和 [验收报告](../research/2026-09-09-contact-index-validation-zh.md)。有效 row/endpoint、稳定 link gather、预算/reset 契约已实现；主 pipeline 34 passed，完整 graph 和读出/reset memcheck 为 0 errors，公共报告与两组各 8 张渲染图逐字节一致。graph E=1/16/256 从 3.081/3.381/6.516 降至 2.551/2.837/5.367 ms；容量×2/4、逐步 wrench 和权威物理状态等价通过。
 
-eager 性能仍未验收：首次五进程和两组交错采样存在超过 5% 的回退，固定 CPU 后仍未消除。普通/完整 API trace 显示 GPU kernel busy 降低、host 主要耗在 launch，尚未证明原始回退根因；不能以 profiler 数据替代正常计时或据 graph 收益关闭此项。下一批先复核有效岛/J 调度及 host 提交契约，再继续通用路径优化。
+接触索引的历史 eager 性能回退仍保留跟踪：首次五进程和两组交错采样存在超过 5% 的回退，固定 CPU 后仍未消除。普通/完整 API trace 显示 GPU kernel busy 降低、host 主要耗在 launch，尚未证明原始回退根因；不能以 profiler 数据替代正常计时或据 graph 收益关闭此项。后续与有效岛/J 调度及 host 提交共同作为剩余性能项处理，当前优先继续 MLS-MPM 热点。
 
 改造前已核对 spec 与 Newton/MuJoCo/Genesis，见 [执行 review](../research/2026-09-08-execution-workspace-upstream-review-zh.md) 和 [9 月 9 日性能方向 review](../research/2026-09-09-performance-directions-upstream-review-zh.md)。当前批次验收完成，后续按 [全路径细化方向](../plans/2026-09-09-performance-directions-detailed-spec-zh.md) 补 MLS-MPM/SDF/光追/端到端基线，并推进已测出的 active row/endpoint、读出、岛求解及其余热点。T06 全部错误传播、T08 密度、refit、异构、双浮基重叠和其他未完成物理/API/可微工作继续保留。
 
