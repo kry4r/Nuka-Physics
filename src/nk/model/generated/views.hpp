@@ -325,6 +325,12 @@ struct DataView {
     uint32_t* link_contact_begin = nullptr;  // per:link arena:scratch owner:data
     uint32_t* link_contact_end = nullptr;  // per:link arena:scratch owner:data
     uint8_t* contact_index_scratch = nullptr;  // per:scalar arena:scratch owner:data count:contact_index_scratch_bytes
+    uint32_t* step_env_status = nullptr;  // per:env arena:scratch owner:data
+    ::nuka::math::Vec3* step_mpm_body_impulse = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* step_mpm_body_moment = nullptr;  // per:body arena:scratch owner:data
+    ::nuka::math::Vec3* step_link_impulse = nullptr;  // per:link arena:scratch owner:data
+    ::nuka::math::Vec3* step_link_moment = nullptr;  // per:link arena:scratch owner:data
+    float* step_joint_limit_impulse = nullptr;  // per:link arena:scratch owner:data elem:2
 };
 
 } // namespace nuka::phi

@@ -389,6 +389,26 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state) {
     }
 }
 
+__global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state) {
+    const uint32_t articulation = blockIdx.x;
+    if (articulation >= state.articulation_count || threadIdx.x != 0u) return;
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    for (uint32_t local = 0u; local < count; ++local) {
+        const uint32_t link = offset + local;
+        const uint32_t parent = state.parent_link[link];
+        if (parent == kInvalidLink && state.joint_type[link] == ArticulationJointType::FloatingBase)
+            continue;
+        float parent_velocity[6] = {};
+        if (parent != kInvalidLink) SpatialToArray(state.link_velocity[offset + parent], parent_velocity);
+        float velocity[6];
+        TransformMotion(state.link_xup[link], parent_velocity, velocity);
+        for (uint32_t component = 0u; component < 6u; ++component)
+            velocity[component] += state.joint_motion_subspace[link].s[component] * state.qdot[link];
+        ArrayToSpatial(velocity, &state.link_velocity[link]);
+    }
+}
+
 __global__ void AbaPass2ArticulatedInertiaKernel(ArticulationDeviceState state) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
@@ -788,15 +808,17 @@ __global__ void BodyIntegrateVelocityKernel(math::Vec3* body_linear_velocity,
                                       math::SymmetricMat3* body_world_inv_inertia,
                                       uint32_t total_body_count,
                                       math::Vec3 gravity,
-                                      float dt) {
+                                      float dt, uint32_t clear_forces) {
     const uint32_t body = blockIdx.x * blockDim.x + threadIdx.x;
     if (body >= total_body_count) {
         return;
     }
     const math::Vec3 force = body_force[body];
     const math::Vec3 torque = body_torque[body];
-    body_force[body] = {};
-    body_torque[body] = {};
+    if (clear_forces != 0u) {
+        body_force[body] = {};
+        body_torque[body] = {};
+    }
     if (body_inv_mass[body] <= 0.0f) {
         body_world_inv_inertia[body] = math::SymmetricMat3{};
         return;
@@ -1561,7 +1583,7 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.body_inv_mass),
                    data.body_pose, data.body_inertial_frame, data.body_inv_inertia,
                    data.body_world_inv_inertia,
-                   p->total_body_count, gravity, p->dt);
+                   p->total_body_count, gravity, p->dt, p->clear_body_forces);
     }
     return LaunchOk(stream);
 }
@@ -1587,6 +1609,20 @@ Status OpFkWorldPoses(const ModelView& model, const DataView& data,
     const uint32_t* env_ids = p->selected_env_count > 0u ? data.reset_env_ids : nullptr;
     LaunchCuda(UpdateWorldLinkPosesKernel, dim3(count), dim3(32u),
                0u, stream, state, data.link_pose, env_ids, p->articulations_per_env);
+    return LaunchOk(stream);
+}
+
+Status OpFkLinkVelocities(const ModelView& model, const DataView& data,
+                           const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const FkLinkVelocitiesParams*>(params);
+    if (p == nullptr) return Status::InvalidArgument;
+    if (p->articulation_count == 0u || p->total_link_count == 0u) return Status::Ok;
+    if (!model.articulation_link_offset || !model.articulation_link_count ||
+        !model.parent_link || !model.joint_type || !data.link_velocity || !data.qdot ||
+        !data.link_xup || !data.joint_motion_subspace) return Status::InvalidArgument;
+    const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
+    LaunchCuda(FkLinkVelocitiesKernel, dim3(p->articulation_count), dim3(32u),
+               0u, stream, state);
     return LaunchOk(stream);
 }
 
@@ -1655,6 +1691,7 @@ void RegisterNkAbaOps() {
     SetCudaOp(NkOp::AbaForward, &OpAbaForward);
     SetCudaOp(NkOp::IntegrateVelocity, &OpIntegrateVelocity);
     SetCudaOp(NkOp::FkWorldPoses, &OpFkWorldPoses);
+    SetCudaOp(NkOp::FkLinkVelocities, &OpFkLinkVelocities);
     SetCudaOp(NkOp::IntegratePosition, &OpIntegratePosition);
 }
 

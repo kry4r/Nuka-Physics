@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #include "collision/contact_capacity.hpp"
 #include "collision/shape_kind.hpp"
@@ -31,8 +33,74 @@ void Pipeline::AddOp(phi::NkOp op, const void* params, phi::Device* device) {
     calls_.push_back(phi::OpCall{op, params});
 }
 
+uint32_t Pipeline::SubstepCount(const Model& model, const SolverConfig& cfg) {
+    uint32_t count = std::max(1u, cfg.substeps);
+    if (model.MpmParticlesPerEnv() > 0u && model.capacities.mpm_grid_nodes_per_env > 0u)
+        count = std::max(count, model.particles.mpm_substeps);
+    return count;
+}
+
 phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
-                     phi::Device* device, uint32_t readout_demand) {
+                            phi::Device* device, uint32_t readout_demand) {
+    const uint32_t substeps = SubstepCount(model, cfg);
+    SolverConfig interval = cfg;
+    interval.dt /= static_cast<float>(substeps);
+    calls_.clear();
+    missing_ops_.clear();
+    p_accumulate_step_.clear();
+    if (!(interval.dt > 0.0f) || !std::isfinite(interval.dt) ||
+        !std::isfinite(1.0f / interval.dt) || !std::isfinite(1.0f / cfg.dt))
+        return phi::Status::InvalidArgument;
+    const auto status = BuildInterval(model, interval, device, readout_demand);
+    if (status != phi::Status::Ok) return status;
+    const auto& cap = model.capacities;
+    const bool has_mpm = model.MpmParticlesPerEnv() > 0u && cap.mpm_grid_nodes_per_env > 0u;
+    const bool mpm_reaction = has_mpm && cap.bodies_per_env > 0u;
+    if (substeps == 1u && !mpm_reaction) return phi::Status::Ok;
+    const uint64_t call_count = uint64_t(substeps) * (calls_.size() + 1u + uint32_t(mpm_reaction));
+    if (call_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        calls_.clear();
+        return phi::Status::InvalidArgument;
+    }
+    const auto interval_calls = calls_;
+    p_int_vel_.clear_body_forces = 0u;
+    calls_.clear();
+    calls_.reserve(static_cast<size_t>(call_count));
+    p_accumulate_step_.resize(static_cast<size_t>(substeps) * 2u);
+    for (uint32_t step = 0u; step < substeps; ++step) {
+        auto& capture = p_accumulate_step_[static_cast<size_t>(step) * 2u];
+        capture.env_count = cap.env_count;
+        capture.bodies_per_env = cap.bodies_per_env;
+        capture.links_per_env = cap.links_per_env;
+        capture.artics_per_env = cap.articulations_per_env;
+        capture.flags = phi::kAccumulateMpmImpulse;
+        capture.first = step == 0u ? 1u : 0u;
+        capture.last = step + 1u == substeps ? 1u : 0u;
+        capture.substep_dt = interval.dt;
+        capture.inv_outer_dt = 1.0f / cfg.dt;
+        auto& outputs = p_accumulate_step_[static_cast<size_t>(step) * 2u + 1u];
+        outputs = capture;
+        outputs.flags = phi::kAccumulateOutputs;
+        if (cap.bodies_per_env > 0u) outputs.flags |= phi::kFinalizeBodyForces;
+        if (mpm_reaction) outputs.flags |= phi::kAccumulateMpmOutput;
+        if (substeps > 1u && (readout_demand & kReadoutContactWrench) != 0u &&
+            cap.max_contacts_per_env > 0u)
+            outputs.flags |= phi::kAccumulateLinkWrench;
+        if (substeps > 1u && cap.joint_limit_rows_per_env != 0u)
+            outputs.flags |= phi::kAccumulateJointLimit;
+        for (const auto& call : interval_calls) {
+            AddOp(call.op, call.params, device);
+            if (mpm_reaction && call.op == phi::NkOp::MpmStep)
+                AddOp(phi::NkOp::AccumulateStep, &capture, device);
+        }
+        AddOp(phi::NkOp::AccumulateStep, &outputs, device);
+    }
+    if (!missing_ops_.empty()) { calls_.clear(); return phi::Status::Unsupported; }
+    return phi::Status::Ok;
+}
+
+phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
+                                    phi::Device* device, uint32_t readout_demand) {
     calls_.clear();
     missing_ops_.clear();
     const ModelCapacities& cap = model.capacities;
@@ -179,6 +247,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_int_vel_.articulation_count = articulation_cnt;
         // Free-body loads are applied once before the shared contact solve.
         p_int_vel_.total_body_count = cap.bodies_per_env * env_count;
+        p_int_vel_.clear_body_forces = 1u;
         add(phi::NkOp::IntegrateVelocity, &p_int_vel_);
     }
 
@@ -652,11 +721,13 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         }
     }
 
-    // The MLS-MPM grid-transfer provider's Couple: ONE umbrella MpmStep op at the
-    // pre-solve coupling seam (the substep loop is self-contained relative to the
-    // single SolveRowsBlockIsland). Build-time gated on has_mpm -> a non-MPM world
-    // emits no op (op list byte-identical). Emitted whether or not there are rows
-    // (the static-plane BC needs no body, so an MPM-only world has no contacts).
+    // Grid transfer advances one common interval before the shared contact solve.
+    // A grid-only world also advances when it has no contact rows.
+    if (has_mpm && has_articulation) {
+        p_fk_velocity_.articulation_count = articulation_cnt;
+        p_fk_velocity_.total_link_count = total_link_count;
+        add(phi::NkOp::FkLinkVelocities, &p_fk_velocity_);
+    }
     mpm_coupling_provider_.Couple(coupling_ctx);
 
     if (has_contacts) {

@@ -399,3 +399,112 @@ TEST(RigidOnMpmRest, OffCentreDropInducesTippingTorque) {
     EXPECT_GT(std::fabs(peak_wy), 1e-3)
         << "the induced torque must be non-trivial in magnitude";
 }
+
+TEST(RigidOnMpmRest, SharedIntervalsMatchCompleteWorldSteps) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (bool planned : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "graph=" << planned);
+        auto make_model = [] {
+            auto model = BuildModel(false, 0.07f);
+            model.body_init[0].inertial_frame.position = {0.004f, -0.003f, 0.002f};
+            return model;
+        };
+        auto interval_model = make_model();
+        const uint32_t substeps = interval_model.particles.mpm_substeps;
+        interval_model.particles.mpm_substeps = 1u;
+        auto config = Cfg();
+        auto interval_config = config;
+        interval_config.dt /= static_cast<float>(substeps);
+        nk::World outer(make_model(), 2u, backend.dev, backend.backend, config);
+        nk::World intervals(std::move(interval_model), 2u, backend.dev, backend.backend, interval_config);
+        ASSERT_TRUE(outer.Ready()) << outer.CreationError();
+        ASSERT_TRUE(intervals.Ready()) << intervals.CreationError();
+        const auto& cap = outer.GetModel().capacities;
+        const uint32_t bodies = cap.bodies_per_env * cap.env_count;
+        const uint32_t particles = cap.particles_per_env * cap.env_count;
+        const auto advance = [&](nk::World& world) {
+            return planned ? world.StepPlanned() : world.Step().result;
+        };
+        const auto read_vectors = [&](nk::World& world, nk::FieldId field) {
+            std::vector<Vec3> result(bodies);
+            EXPECT_TRUE(world.GetData().DownloadField(field, result.data(), result.size() * sizeof(Vec3)));
+            return result;
+        };
+        const auto compare = [&](nk::FieldId field, size_t bytes) {
+            std::vector<uint8_t> a(bytes), b(bytes);
+            ASSERT_TRUE(outer.GetData().DownloadField(field, a.data(), bytes));
+            ASSERT_TRUE(intervals.GetData().DownloadField(field, b.data(), bytes));
+            EXPECT_EQ(a, b) << nk::FieldName(field);
+        };
+        const auto expect_vector = [](Vec3 a, Vec3 b, float tolerance) {
+            EXPECT_NEAR(a.x, b.x, tolerance);
+            EXPECT_NEAR(a.y, b.y, tolerance);
+            EXPECT_NEAR(a.z, b.z, tolerance);
+        };
+        std::vector<Vec3> forces(bodies), torques(bodies);
+        forces[0] = {0.12f, -0.06f, 0.08f};
+        torques[0] = {0.001f, 0.002f, -0.001f};
+        for (uint32_t step = 0u; step < 4u; ++step) {
+            SCOPED_TRACE(step);
+            if (step == 2u) {
+                ASSERT_EQ(outer.Reset({1u}), nphi::Status::Ok);
+                ASSERT_EQ(intervals.Reset({1u}), nphi::Status::Ok);
+            }
+            const auto before = read_vectors(outer, nk::FieldId::BodyLinearVelocity);
+            ASSERT_TRUE(outer.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), bodies * sizeof(Vec3)));
+            ASSERT_TRUE(outer.GetData().UploadField(nk::FieldId::BodyTorque, torques.data(), bodies * sizeof(Vec3)));
+            ASSERT_EQ(advance(outer), nphi::Status::Ok);
+            std::vector<Vec3> impulse(bodies), world_moment(bodies);
+            std::vector<uint32_t> combined_status(cap.env_count, 0u);
+            for (uint32_t interval = 0u; interval < substeps; ++interval) {
+                ASSERT_TRUE(intervals.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), bodies * sizeof(Vec3)));
+                ASSERT_TRUE(intervals.GetData().UploadField(nk::FieldId::BodyTorque, torques.data(), bodies * sizeof(Vec3)));
+                ASSERT_EQ(advance(intervals), nphi::Status::Ok);
+                const auto linear = read_vectors(intervals, nk::FieldId::MpmBodyReaction);
+                const auto angular = read_vectors(intervals, nk::FieldId::MpmBodyAngReaction);
+                std::vector<Transform> poses(bodies);
+                ASSERT_TRUE(intervals.GetData().DownloadField(nk::FieldId::BodyPose, poses.data(), bodies * sizeof(Transform)));
+                std::vector<uint32_t> status(cap.env_count);
+                ASSERT_TRUE(intervals.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(), status.size() * sizeof(uint32_t)));
+                for (uint32_t env = 0u; env < cap.env_count; ++env) combined_status[env] |= status[env];
+                for (uint32_t body = 0u; body < bodies; ++body) {
+                    const auto& frame = intervals.GetModel().body_init[body % cap.bodies_per_env].inertial_frame;
+                    const Vec3 origin = poses[body].TransformPoint(frame.position);
+                    impulse[body] += linear[body];
+                    world_moment[body] += angular[body] + origin.Cross(linear[body]);
+                }
+            }
+            compare(nk::FieldId::BodyPose, bodies * sizeof(Transform));
+            compare(nk::FieldId::BodyLinearVelocity, bodies * sizeof(Vec3));
+            compare(nk::FieldId::BodyAngularVelocity, bodies * sizeof(Vec3));
+            compare(nk::FieldId::ParticlePos, particles * sizeof(Vec3));
+            compare(nk::FieldId::ParticleVel, particles * sizeof(Vec3));
+            compare(nk::FieldId::ParticleF, particles * 9u * sizeof(float));
+            compare(nk::FieldId::ParticleC, particles * 9u * sizeof(float));
+            const auto linear = read_vectors(outer, nk::FieldId::MpmBodyReaction);
+            const auto angular = read_vectors(outer, nk::FieldId::MpmBodyAngReaction);
+            const auto after = read_vectors(outer, nk::FieldId::BodyLinearVelocity);
+            std::vector<Transform> poses(bodies);
+            ASSERT_TRUE(outer.GetData().DownloadField(nk::FieldId::BodyPose, poses.data(), bodies * sizeof(Transform)));
+            for (uint32_t body = 0u; body < bodies; ++body) {
+                const auto& initial = outer.GetModel().body_init[body % cap.bodies_per_env];
+                const Vec3 origin = poses[body].TransformPoint(initial.inertial_frame.position);
+                expect_vector(linear[body], impulse[body], 1.0e-7f);
+                expect_vector(angular[body] + origin.Cross(linear[body]), world_moment[body], 1.0e-7f);
+                if (initial.inv_mass > 0.0f) {
+                    const Vec3 gravity{config.gravity[0], config.gravity[1], config.gravity[2]};
+                    const Vec3 change = (after[body] - before[body]) / initial.inv_mass;
+                    const Vec3 external = (forces[body] + gravity / initial.inv_mass) * config.dt;
+                    expect_vector(change, external + linear[body], 2.0e-6f);
+                }
+            }
+            EXPECT_GT(linear[0].z, 1.0e-6f);
+            EXPECT_EQ(read_vectors(outer, nk::FieldId::BodyForce), std::vector<Vec3>(bodies));
+            EXPECT_EQ(read_vectors(outer, nk::FieldId::BodyTorque), std::vector<Vec3>(bodies));
+            std::vector<uint32_t> status(cap.env_count);
+            ASSERT_TRUE(outer.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(), status.size() * sizeof(uint32_t)));
+            EXPECT_EQ(status, combined_status);
+        }
+    }
+}

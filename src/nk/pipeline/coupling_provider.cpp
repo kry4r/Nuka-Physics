@@ -110,7 +110,7 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
     p.dx = mp.mpm_cell_size;
     p.dt = ctx.dt;
     p.mode = ctx.particle_mode;
-    p.substeps = mp.mpm_substeps == 0u ? 1u : mp.mpm_substeps;
+    p.substeps = 1u;
     p.material_count = model.capacities.mpm_material_count;
     for (int k = 0; k < 3; ++k) p.gravity[k] = ctx.gravity[k];
     // The static floor plane (z-up). Coulomb mu reuses the body<->soft friction.
@@ -120,7 +120,7 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
     p.plane_d = mp.mpm_floor_d;
     p.plane_mu = mp.mpm_floor_friction;
     // Collidable surfaces impose grid boundaries and route reaction to their owner.
-    // Unsupported geometry is reported; articulation feedback follows the substeps.
+    // Unsupported geometry is reported; articulation feedback follows each interval.
     p.dynamic_body_bc = ctx.bodies_per_env > 0u ? 1u : 0u;
     p.bite_disable_dynamic_bc = mp.mpm_bite_disable_dynamic_bc ? 1u : 0u;
     p.bodies_per_env = ctx.bodies_per_env;

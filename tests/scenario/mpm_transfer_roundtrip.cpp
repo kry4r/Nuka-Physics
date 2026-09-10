@@ -147,15 +147,19 @@ TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
     const double duration = 1.0 / 60.0;
     double previous_error = 0.0;
     for (const uint32_t substeps : {1u, 2u, 4u}) {
-        ASSERT_EQ(nphi::Status::Ok, w.Reset());
-        p.dt = static_cast<float>(duration);
-        p.substeps = substeps;
-        p.gravity[2] = -1.0f;
-        ASSERT_TRUE(RunTransfer(w, p));
+        auto model = BuildMpmModel(seed);
+        model.particles.mpm_substeps = substeps;
+        model.particles.mpm_floor_d = -1.0e6f;
+        auto config = Cfg();
+        config.dt = static_cast<float>(duration);
+        config.gravity[2] = -1.0f;
+        nk::World advancing(std::move(model), 1u, b.dev, b.backend, config);
+        ASSERT_TRUE(advancing.Ready());
+        ASSERT_TRUE(advancing.Step().AllOk());
         std::vector<Vec3> pos(np);
-        ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(),
+        ASSERT_TRUE(advancing.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(),
                                               pos.size() * sizeof(Vec3)));
-        ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticleVel, out.data(),
+        ASSERT_TRUE(advancing.GetData().DownloadField(nk::FieldId::ParticleVel, out.data(),
                                               out.size() * sizeof(Vec3)));
         double position_error = 0.0;
         for (uint32_t i = 0; i < np; ++i) {
@@ -173,6 +177,8 @@ TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
                      substeps, position_error, euler_error);
         previous_error = position_error;
     }
+    p.substeps = 2u;
+    EXPECT_EQ(w.DispatchOp(nphi::NkOp::MpmStep, &p), nphi::Status::InvalidArgument);
 }
 
 // (2) the deterministic gather is byte-identical run-to-run (NO float atomics).

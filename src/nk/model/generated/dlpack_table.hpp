@@ -315,6 +315,12 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::MeshSurfaceInfo, DlpackDtype::kU8, 2, false, false},  // mesh_surface_info
     {FieldId::MeshTriangles, DlpackDtype::kU32, 1, false, false},  // mesh_triangles
     {FieldId::MeshBvhNodes, DlpackDtype::kU8, 2, false, false},  // mesh_bvh_nodes
+    {FieldId::StepEnvStatus, DlpackDtype::kU32, 1, false, false},  // step_env_status
+    {FieldId::StepMpmBodyImpulse, DlpackDtype::kF32, 2, false, false},  // step_mpm_body_impulse
+    {FieldId::StepMpmBodyMoment, DlpackDtype::kF32, 2, false, false},  // step_mpm_body_moment
+    {FieldId::StepLinkImpulse, DlpackDtype::kF32, 2, false, false},  // step_link_impulse
+    {FieldId::StepLinkMoment, DlpackDtype::kF32, 2, false, false},  // step_link_moment
+    {FieldId::StepJointLimitImpulse, DlpackDtype::kF32, 2, false, false},  // step_joint_limit_impulse
 };
 
 } // namespace nuka::nk

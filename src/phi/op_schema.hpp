@@ -114,9 +114,7 @@ enum class NkOp : uint16_t {
     ParticleFinalize,      // v = (x* - x)/dt; commit x
 
     // --- MLS-MPM continuum step -----------------------------------------
-    MpmStep,               // one umbrella op: predict -> clear -> P2G -> grid-update +
-                           // static-plane BC -> G2P -> F-update, iterated substeps times
-                           // (file-local kernels). Emitted at the pre-solve coupling seam.
+    MpmStep,               // MPM transfer and material update over one physics interval.
 
     // --- readout / RL substrate -----------------------------------------
     ReadoutContactWrench,  // per-link contact wrench readout
@@ -178,6 +176,8 @@ enum class NkOp : uint16_t {
     SnapshotStepVelocity,   // Capture the contact acceleration reference before forces.
     ParticleProjectionVelocity, // Publish projected particle velocities before contact solving.
     ParticleContactDelta,   // Apply only the new contact impulse to particle working positions.
+    AccumulateStep,         // Aggregate impulses and diagnostics across physical intervals.
+    FkLinkVelocities,       // Refresh link spatial velocities from current generalized state.
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -228,6 +228,7 @@ struct IntegrateVelocityParams {
     uint32_t articulation_count;
     // Free-body velocity integration consumes world-frame COM force and torque.
     uint32_t total_body_count;
+    uint32_t clear_body_forces = 1u;
 };
 
 struct SnapshotStepVelocityParams {
@@ -239,11 +240,35 @@ struct SnapshotStepVelocityParams {
     uint32_t total_particle_count;
 };
 
+inline constexpr uint32_t kAccumulateMpmImpulse = 1u << 0;
+inline constexpr uint32_t kAccumulateOutputs = 1u << 1;
+inline constexpr uint32_t kAccumulateLinkWrench = 1u << 2;
+inline constexpr uint32_t kAccumulateJointLimit = 1u << 3;
+inline constexpr uint32_t kAccumulateMpmOutput = 1u << 4;
+inline constexpr uint32_t kFinalizeBodyForces = 1u << 5;
+
+struct AccumulateStepParams {
+    uint32_t env_count = 0u;
+    uint32_t bodies_per_env = 0u;
+    uint32_t links_per_env = 0u;
+    uint32_t artics_per_env = 0u;
+    uint32_t flags = 0u;
+    uint32_t first = 0u;
+    uint32_t last = 0u;
+    float substep_dt = 0.0f;
+    float inv_outer_dt = 0.0f;
+};
+
 struct FkWorldPosesParams {
     uint32_t articulation_count;
     uint32_t total_link_count;
     uint32_t articulations_per_env;
     uint32_t selected_env_count;  // 0 = all; otherwise index reset_env_ids
+};
+
+struct FkLinkVelocitiesParams {
+    uint32_t articulation_count;
+    uint32_t total_link_count;
 };
 
 struct IntegratePositionParams {
@@ -381,14 +406,8 @@ struct BuildSolveIslandsParams {
     uint32_t particles_per_env;  // particle count per env
 };
 
-// --- MLS-MPM continuum step ---------------------------------------------
-// The single umbrella MpmStep op's params. The grid is env-private: node keys are
-// env-offset (env*nodes_per_env + local), mirroring the particle CSR grid, so
-// replicated envs never cross-couple. grid_dims/origin/dx define the dense
-// Cartesian lattice; particle_count is the env-major particle total. The op
-// iterates the substep loop (clear -> P2G(force) -> grid-update + static-plane BC
-// -> [dynamic-body BC + reaction] -> G2P -> F-update) substeps times at dt/substeps;
-// gravity is the grid kick. The dynamic-body BC runs only when dynamic_body_bc != 0.
+// MPM advances one common physics interval on an environment-private Cartesian grid.
+// Transfer, stress, boundary response and advection all use the supplied dt.
 struct MpmStepParams {
     uint32_t particle_count;     // total env-major particles (0 => inert no-op)
     uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
@@ -402,9 +421,9 @@ struct MpmStepParams {
     uint32_t grid_dims[3];       // per-env node resolution (nx, ny, nz)
     float    grid_origin[3];     // world-space corner of node (0,0,0)
     float    dx;                 // uniform node spacing
-    float    dt;                 // full World.Step dt (split across substeps)
+    float    dt;                 // common physics interval
     uint32_t mode;               // kParticleMode* (MpmStep runs only for kParticleModeMpm)
-    uint32_t substeps;           // internal explicit substeps per World.Step (>=1)
+    uint32_t substeps;           // zero or one; subdivision belongs to the pipeline
     uint32_t material_count;     // mpm_material_table rows (indexed by particle_material_id)
     float    gravity[3];         // world-frame gravity applied on the grid each substep
     // Static-plane floor BC (z-up: n=(0,0,1), d=floor_z). A grid node at/below the

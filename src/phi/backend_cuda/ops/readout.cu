@@ -1,11 +1,15 @@
 // Contact readout and environment state snapshot/restore.
 
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <limits>
 
+#include "nk/solve/collidable_owner.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/prims_types.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
@@ -25,6 +29,7 @@ using nuka::math::Vec3;
 // Contact forces use {Fn, Ft1, Ft2}; link wrenches use {force.xyz, torque.xyz}.
 constexpr uint32_t kContactForceComponents = 3u;
 constexpr uint32_t kLinkWrenchComponents   = 6u;
+constexpr uint32_t kJointLimitSides = 2u;
 static_assert(kLinkWrenchComponents == sizeof(::nuka::math::Vec3) * 2u / sizeof(float),
               "link wrench == force(Vec3) + torque(Vec3)");
 
@@ -206,6 +211,125 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
     out_link_wrench[out + 3u] = torque.x;
     out_link_wrench[out + 4u] = torque.y;
     out_link_wrench[out + 5u] = torque.z;
+}
+
+__device__ Vec3 ReactionOrigin(const ModelView& model, const DataView& data,
+                               const AccumulateStepParams& p, uint32_t body) {
+    const uint32_t local = body % p.bodies_per_env;
+    const auto shape = LoadPrimShape(model.shape_table, local);
+    const auto owner = nk::ResolveCollidableOwner(
+        shape.body_id, body / p.bodies_per_env, local, p.bodies_per_env,
+        p.links_per_env, p.artics_per_env, model.body_to_link,
+        model.body_to_articulation, model.body_collidable_body);
+    if (owner.kind == nk::kNkSideArtic) return data.link_pose[owner.link].position;
+    if (owner.kind == ~0u) return Vec3::Zero();
+    return BodyCenterOfMass(data.body_pose[owner.body], data.body_inertial_frame[owner.body]);
+}
+
+__global__ void AccumulateStepKernel(ModelView model, DataView data,
+                                     AccumulateStepParams p) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t bodies = p.env_count * p.bodies_per_env;
+    const uint32_t links = p.env_count * p.links_per_env;
+    if ((p.flags & kAccumulateMpmImpulse) != 0u && i < bodies) {
+        const Vec3 impulse = data.mpm_body_reaction[i];
+        const Vec3 moment = data.mpm_body_ang_reaction[i] +
+            ReactionOrigin(model, data, p, i).Cross(impulse);
+        if (p.first != 0u) {
+            data.step_mpm_body_impulse[i] = impulse;
+            data.step_mpm_body_moment[i] = moment;
+        } else {
+            data.step_mpm_body_impulse[i] += impulse;
+            data.step_mpm_body_moment[i] += moment;
+        }
+    }
+    if ((p.flags & kAccumulateOutputs) == 0u) return;
+    if (i < p.env_count) {
+        const uint32_t status = data.env_status[i];
+        const uint32_t combined = p.first != 0u ? status : data.step_env_status[i] | status;
+        data.step_env_status[i] = combined;
+        if (p.last != 0u) data.env_status[i] = combined;
+    }
+    if ((p.flags & kAccumulateLinkWrench) != 0u && i < links) {
+        auto& wrench = data.link_contact_wrench[i];
+        const Vec3 impulse = Vec3{wrench.v[0], wrench.v[1], wrench.v[2]} * p.substep_dt;
+        const Vec3 origin = data.link_pose[i].position;
+        const Vec3 moment = Vec3{wrench.v[3], wrench.v[4], wrench.v[5]} * p.substep_dt +
+            origin.Cross(impulse);
+        if (p.first != 0u) {
+            data.step_link_impulse[i] = impulse;
+            data.step_link_moment[i] = moment;
+        } else {
+            data.step_link_impulse[i] += impulse;
+            data.step_link_moment[i] += moment;
+        }
+        if (p.last != 0u) {
+            const Vec3 force = data.step_link_impulse[i] * p.inv_outer_dt;
+            const Vec3 torque = (data.step_link_moment[i] -
+                origin.Cross(data.step_link_impulse[i])) * p.inv_outer_dt;
+            wrench = {{force.x, force.y, force.z, torque.x, torque.y, torque.z}};
+        }
+    }
+    if ((p.flags & kAccumulateJointLimit) != 0u && i < links) {
+        for (uint32_t side = 0u; side < kJointLimitSides; ++side) {
+            const uint32_t slot = i * kJointLimitSides + side;
+            const float impulse = data.joint_limit_impulse[slot];
+            if (p.first != 0u) data.step_joint_limit_impulse[slot] = impulse;
+            else data.step_joint_limit_impulse[slot] += impulse;
+            if (p.last != 0u) data.joint_limit_impulse[slot] = data.step_joint_limit_impulse[slot];
+        }
+    }
+    if (p.last == 0u || i >= bodies) return;
+    if ((p.flags & kAccumulateMpmOutput) != 0u) {
+        const Vec3 impulse = data.step_mpm_body_impulse[i];
+        data.mpm_body_reaction[i] = impulse;
+        data.mpm_body_ang_reaction[i] = data.step_mpm_body_moment[i] -
+            ReactionOrigin(model, data, p, i).Cross(impulse);
+    }
+    if ((p.flags & kFinalizeBodyForces) != 0u) {
+        data.body_force[i] = {};
+        data.body_torque[i] = {};
+    }
+}
+
+Status OpAccumulateStep(const ModelView& model, const DataView& data,
+                         const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const AccumulateStepParams*>(params);
+    constexpr uint32_t allowed_flags = kAccumulateMpmImpulse | kAccumulateOutputs |
+        kAccumulateLinkWrench | kAccumulateJointLimit | kAccumulateMpmOutput | kFinalizeBodyForces;
+    if (p == nullptr || (p->flags & ~allowed_flags) != 0u || p->first > 1u || p->last > 1u ||
+        !(p->substep_dt > 0.0f) || !std::isfinite(p->substep_dt) ||
+        !(p->inv_outer_dt > 0.0f) || !std::isfinite(p->inv_outer_dt)) return Status::InvalidArgument;
+    const uint64_t bodies64 = uint64_t{p->env_count} * p->bodies_per_env;
+    const uint64_t links64 = uint64_t{p->env_count} * p->links_per_env;
+    constexpr auto index_limit = std::numeric_limits<int>::max();
+    if (bodies64 > index_limit || links64 > index_limit / kJointLimitSides ||
+        p->env_count > index_limit) return Status::InvalidArgument;
+    if (p->env_count == 0u) return Status::Ok;
+    const auto bodies = static_cast<uint32_t>(bodies64);
+    const auto links = static_cast<uint32_t>(links64);
+    const bool outputs = (p->flags & kAccumulateOutputs) != 0u;
+    const bool mpm = (p->flags & (kAccumulateMpmImpulse | kAccumulateMpmOutput)) != 0u;
+    if (outputs && (!data.env_status || !data.step_env_status)) return Status::InvalidArgument;
+    if (mpm && bodies != 0u &&
+        (!model.shape_table || !data.body_pose || !data.body_inertial_frame ||
+         !data.mpm_body_reaction || !data.mpm_body_ang_reaction ||
+         !data.step_mpm_body_impulse || !data.step_mpm_body_moment ||
+         (links != 0u && (!data.link_pose || !model.body_to_link || !model.body_to_articulation))))
+        return Status::InvalidArgument;
+    if ((p->flags & kAccumulateLinkWrench) != 0u && links != 0u &&
+        (!outputs || !data.link_pose || !data.link_contact_wrench ||
+         !data.step_link_impulse || !data.step_link_moment)) return Status::InvalidArgument;
+    if ((p->flags & kAccumulateJointLimit) != 0u && links != 0u &&
+        (!outputs || !data.joint_limit_impulse || !data.step_joint_limit_impulse))
+        return Status::InvalidArgument;
+    if ((p->flags & kFinalizeBodyForces) != 0u && bodies != 0u &&
+        (!outputs || !data.body_force || !data.body_torque)) return Status::InvalidArgument;
+    const uint32_t count = std::max(p->env_count, std::max(bodies, links));
+    constexpr uint32_t block_size = 128u;
+    LaunchCuda(AccumulateStepKernel, dim3((count + block_size - 1u) / block_size),
+               dim3(block_size), 0u, stream, model, data, *p);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 __device__ void ClearWarmStartPoint(
@@ -581,6 +705,7 @@ uint64_t ContactIndexScratchBytes(uint32_t row_count, uint32_t env_count) {
 }
 
 void RegisterNkReadoutOps() {
+    SetCudaOp(NkOp::AccumulateStep, &OpAccumulateStep);
     SetCudaOp(NkOp::ReadoutContactWrench, &OpReadoutContactWrench);
     SetCudaOp(NkOp::ExportObs, &OpExportObs);
     SetCudaOp(NkOp::ResetEnvs, &OpResetEnvs);

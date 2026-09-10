@@ -50,7 +50,7 @@ constexpr uint32_t kFullWarpMask = ~uint32_t{0};
 static_assert(kBlockSize % kCudaWarpThreads == 0u);
 static_assert(kStencilNodes <= kCudaWarpThreads);
 
-// NUKA_MPM_TIMING enables synchronous eager stage timing, amortized per World::Step.
+// NUKA_MPM_TIMING enables synchronous eager stage timing per physics interval.
 // Leave it disabled for ordinary execution and graph capture.
 enum class MpmStage : uint32_t {
     GridPrepare,
@@ -76,9 +76,9 @@ struct MpmProfiler {
     unsigned long long calls[kCount] = {0};
     cudaEvent_t begin = nullptr;
     cudaEvent_t end = nullptr;
-    long step = 0;
+    long interval = 0;
     long warmup = 0;
-    unsigned long long measured_steps = 0;
+    unsigned long long measured_intervals = 0;
     bool on = false;
     bool active = false;
     bool initialized = false;
@@ -112,12 +112,12 @@ struct MpmProfiler {
         std::atexit(&MpmProfiler::Dump);
     }
 
-    void BeginStep() {
+    void BeginInterval() {
         Ensure();
         if (!on) return;
-        ++step;
-        active = step > warmup;
-        if (active) ++measured_steps;
+        ++interval;
+        active = interval > warmup;
+        if (active) ++measured_intervals;
     }
 
     void Start(MpmStage stage, cudaStream_t stream) {
@@ -139,20 +139,20 @@ struct MpmProfiler {
 
     static void Dump() {
         MpmProfiler& profiler = Get();
-        if (profiler.measured_steps == 0) return;
-        std::printf("\n[NUKA_MPM_TIMING] MpmStep GPU stages (steps=%llu, warmup=%ld)\n",
-                    profiler.measured_steps, profiler.warmup);
-        std::printf("  %-18s %10s %10s %12s\n", "stage", "ms/step", "ms/call",
+        if (profiler.measured_intervals == 0) return;
+        std::printf("\n[NUKA_MPM_TIMING] MpmStep GPU stages (intervals=%llu, warmup_intervals=%ld)\n",
+                    profiler.measured_intervals, profiler.warmup);
+        std::printf("  %-18s %10s %10s %12s\n", "stage", "ms/interval", "ms/call",
                     "calls");
         double total = 0.0;
         for (uint32_t i = 0; i < kCount; ++i) {
             if (profiler.calls[i] == 0) continue;
             total += profiler.ms[i];
             std::printf("  %-18s %10.3f %10.4f %12llu\n", Name(i),
-                        profiler.ms[i] / profiler.measured_steps,
+                        profiler.ms[i] / profiler.measured_intervals,
                         profiler.ms[i] / profiler.calls[i], profiler.calls[i]);
         }
-        std::printf("  %-18s %10.3f\n", "TOTAL/step", total / profiler.measured_steps);
+        std::printf("  %-18s %10.3f\n", "TOTAL/interval", total / profiler.measured_intervals);
         std::fflush(stdout);
     }
 };
@@ -509,14 +509,14 @@ __device__ __forceinline__ int64_t NodeId(uint32_t env, int64_t ix, int64_t iy,
     return static_cast<int64_t>(env) * nodes_per_env + local;
 }
 
-// MPM status accumulates across substeps; shared invalid-endpoint status stays latched.
+// MPM interval status is refreshed; shared invalid-endpoint status stays latched.
 __global__ void MpmClearStatusBitsKernel(uint32_t* env_status, uint32_t env_count) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= env_count) return;
     env_status[e] &= ~(kEnvStatusMpmGridEscape | kEnvStatusMpmOneWayBody);
 }
 
-// Per-body reaction probes accumulate linear/angular impulse over all substeps.
+// Per-body reaction probes contain this interval's linear and angular impulse.
 __global__ void MpmClearBodyReactionKernel(uint32_t total_bodies, m::Vec3* reaction,
                                           m::Vec3* ang_reaction) {
     const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1471,13 +1471,14 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     const auto* p = static_cast<const MpmStepParams*>(params);
     if (p == nullptr) return Status::Failed;
     MpmProfiler& profiler = MpmProfiler::Get();
-    profiler.BeginStep();
+    profiler.BeginInterval();
     if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmXpbd) || p->particle_count == 0u) {
         return Status::Ok;
     }
     if (p->env_count == 0u || p->nodes_per_env == 0u || !(p->dx > 0.0f) ||
         !std::isfinite(p->dx) || !std::isfinite(p->dt) || p->dt < 0.0f ||
-        p->grid_dims[0] == 0u || p->grid_dims[1] == 0u || p->grid_dims[2] == 0u)
+        p->grid_dims[0] == 0u || p->grid_dims[1] == 0u || p->grid_dims[2] == 0u ||
+        p->substeps > 1u)
         return Status::InvalidArgument;
     const uint64_t total_nodes64 =
         static_cast<uint64_t>(p->nodes_per_env) * p->env_count;
@@ -1531,16 +1532,15 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
                          &cell_blocks) != cudaSuccess) return Status::Failed;
     const float inv_dx = 1.0f / p->dx;
     const m::Vec3 origin{p->grid_origin[0], p->grid_origin[1], p->grid_origin[2]};
-    const uint32_t substeps = p->substeps == 0u ? 1u : p->substeps;
-    const float dt_sub = p->dt / static_cast<float>(substeps);
-    // Clear MPM-owned diagnostics once; every substep contributes to the same status.
+    const float dt_sub = p->dt;
+    // The pipeline aggregates diagnostics across the shared physical intervals.
     if (data.env_status != nullptr) {
         const uint32_t e = p->env_count == 0u ? 1u : p->env_count;
         const uint32_t eb = (e + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(MpmClearStatusBitsKernel, dim3(eb), dim3(kBlockSize), 0u, stream,
                    data.env_status, e);
     }
-    // Zero the per-step reaction probe so it accumulates only this step's substeps.
+    // The reaction probe contains only this interval's impulse.
     if (p->dynamic_body_bc != 0u && p->bodies_per_env > 0u &&
         data.mpm_body_reaction != nullptr) {
         const uint32_t tb = p->bodies_per_env * p->env_count;
@@ -1549,12 +1549,10 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
                    stream, tb, data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
     if (cudaPeekAtLastError() != cudaSuccess) return Status::Failed;
-    for (uint32_t s = 0; s < substeps; ++s)
-        if (LaunchSubstep(*p, model, data, scratch, dt_sub, Ppe, mpm_pe, mpm_count, cpe,
-                          total_nodes, finalize_blocks, cell_blocks, inv_dx, origin, stream) != cudaSuccess)
-            return Status::Failed;
-    // Deposit accumulated link reaction into qdot after the substep loop.
-    // Articulation surface velocities are therefore fixed during these substeps.
+    if (LaunchSubstep(*p, model, data, scratch, dt_sub, Ppe, mpm_pe, mpm_count, cpe,
+                      total_nodes, finalize_blocks, cell_blocks, inv_dx, origin, stream) != cudaSuccess)
+        return Status::Failed;
+    // The shared solve commits this impulse before the next physics interval.
     if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
         p->bodies_per_env > 0u && p->artic_count > 0u && p->max_dof > 0u &&
         data.mpm_body_ang_reaction != nullptr && data.qdot_flat != nullptr &&

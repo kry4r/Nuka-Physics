@@ -50,6 +50,7 @@ public:
         // friction/baumgarte values default from the Model, see Build()).
         uint32_t defer_velocity_damping = 1;  // PD drive emits Kp torque only
         uint32_t fold_drive_damping = 1;      // CRBA folds dt*C -> (M+dt*C)^-1
+        uint32_t substeps = 1u;
     };
 
     // Demand mask for pure-readout ops: a readout writes an output field no other
@@ -61,12 +62,15 @@ public:
     // All emitted physics ops are required; unsupported demands leave no runnable calls.
     phi::Status Build(const Model& model, const SolverConfig& cfg,
                phi::Device* device = nullptr, uint32_t readout_demand = 0u);
+    static uint32_t SubstepCount(const Model& model, const SolverConfig& cfg);
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }
     size_t Size() const { return calls_.size(); }
     const std::vector<phi::NkOp>& MissingOps() const { return missing_ops_; }
 
 private:
+    phi::Status BuildInterval(const Model& model, const SolverConfig& cfg,
+                              phi::Device* device, uint32_t readout_demand);
     // The single op-emission helper (capability query + push). The builder and
     // the coupling providers both append through it so the emit semantics match.
     void AddOp(phi::NkOp op, const void* params, phi::Device* device);
@@ -77,6 +81,8 @@ private:
     std::vector<phi::NkOp> missing_ops_;
     std::vector<phi::XpbdProjectParams> p_xpbd_iterations_;
     std::vector<phi::SolveRowsBlockIslandParams> p_solve_iterations_;
+    std::vector<phi::AccumulateStepParams> p_accumulate_step_;
+    phi::FkLinkVelocitiesParams p_fk_velocity_{};
 
     // The build-time coupling providers (row path + MLS-MPM grid-transfer path).
     // Owned by the Pipeline (their lifetime parallels the Params PODs); consulted
