@@ -160,6 +160,23 @@ TEST(AnalyticalManifold, SphereBoxSinglePoint) {
     EXPECT_NEAR(m.points[0].penetration, 0.1f, kTol);
     EXPECT_TRUE(Vec3Near(m.points[0].normal, {0.0f, 1.0f, 0.0f}));  // sep dir for sphere(A)
     EXPECT_TRUE(Vec3Near(m.points[0].position, {0.0f, 1.0f, 0.0f}));
+
+    box = MakeBox({1.0f, 2.0f, 3.0f}, {4.0f, -2.0f, 1.0f});
+    sph = MakeSphere(0.2f, box.frame.LocalToWorld({-0.8f, 0.3f, 0.4f}));
+    m = Route(ShapeType::Sphere, ShapeType::Box, sph, box);
+    ASSERT_EQ(m.point_count, 1u);
+    EXPECT_NEAR(m.points[0].penetration, 0.4f, kTol);
+    EXPECT_TRUE(Vec3Near(m.points[0].normal, {-1.0f, 0.0f, 0.0f}));
+    EXPECT_TRUE(Vec3Near(m.points[0].position, {3.0f, -1.7f, 1.4f}));
+
+    box.frame = BuildPrimFrame(Transform{{4.0f, -2.0f, 1.0f},
+        Quat::FromAxisAngle(Vec3::UnitZ(), 0.5f * std::acos(-1.0f))});
+    sph = MakeSphere(0.2f, box.frame.LocalToWorld({-0.8f, 0.3f, 0.4f}));
+    m = Route(ShapeType::Sphere, ShapeType::Box, sph, box);
+    ASSERT_EQ(m.point_count, 1u);
+    EXPECT_NEAR(m.points[0].penetration, 0.4f, kTol);
+    EXPECT_TRUE(Vec3Near(m.points[0].normal, {0.0f, -1.0f, 0.0f}));
+    EXPECT_TRUE(Vec3Near(m.points[0].position, {3.7f, -3.0f, 1.4f}));
 }
 
 // Swapped order: box is A, sphere is B -> normal flips to point box away (-y).
@@ -288,6 +305,24 @@ TEST(AnalyticalManifold, CapsuleSphereSinglePoint) {
     EXPECT_TRUE(Vec3Near(m.points[0].normal, {-1.0f, 0.0f, 0.0f}));
     // contact point on capsule surface toward the sphere: (0,0,0) + (1,0,0)*r.
     EXPECT_TRUE(Vec3Near(m.points[0].position, {0.5f, 0.0f, 0.0f}));
+
+    sph = MakeSphere(0.5f, {0.0f, 0.3f, 0.0f});
+    m = Route(ShapeType::Capsule, ShapeType::Sphere, cap, sph);
+    ASSERT_EQ(m.point_count, 1u);
+    EXPECT_NEAR(m.points[0].penetration, 1.0f, kTol);
+    EXPECT_TRUE(Vec3Near(m.points[0].normal, {-1.0f, 0.0f, 0.0f}));
+    EXPECT_TRUE(Vec3Near(m.points[0].position, {0.5f, 0.3f, 0.0f}));
+
+    cap.frame = BuildPrimFrame(Transform{{0.0f, 0.0f, 0.0f},
+        Quat::FromAxisAngle(Vec3::UnitZ(), 0.5f * std::acos(-1.0f))});
+    sph = MakeSphere(0.5f, cap.frame.LocalToWorld({0.0f, 0.3f, 0.0f}));
+    m = Route(ShapeType::Capsule, ShapeType::Sphere, cap, sph);
+    ASSERT_EQ(m.point_count, 1u);
+    EXPECT_NEAR(m.points[0].penetration, 1.0f, kTol);
+    EXPECT_NEAR(m.points[0].normal.Dot(cap.frame.cy), 0.0f, kTol);
+    const Vec3 local_point = cap.frame.WorldToLocal(m.points[0].position);
+    EXPECT_NEAR(local_point.y, 0.3f, kTol);
+    EXPECT_NEAR(local_point.x * local_point.x + local_point.z * local_point.z, 0.25f, kTol);
 }
 
 // ---------------------------------------------------------------------------

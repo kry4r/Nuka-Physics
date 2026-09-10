@@ -25,6 +25,7 @@
 
 #include "constraint/solref_solimp.hpp"  // ComputeCompliantRow (HD)
 #include "nk/contact/contact_profile.hpp"
+#include "nk/solve/collidable_owner.hpp"
 #include "scene/contact_filter.hpp"
 #include "math/cuda_vec_ops.cuh"
 #include "phi/backend_cuda/launch.cuh"
@@ -437,18 +438,8 @@ constexpr uint32_t kPdParticlePtsPerSlot =
 constexpr uint32_t kPdParticleRowsPerSlot =
     nk::kPairDrivenParticleRowsPerSlot;                          // 3
 
-// Resolve a contact side -> reaction side. The side-kind TAG (nk::kUContactSide*)
-// is consulted FIRST: it declares whether `index` is a body-local collidable row
-// or a global particle id, so a non-body index never reaches the shape_table
-// body-row lookup. A particle channel resolves to the particle side with the
-// GLOBAL particle id carried in `index` (the narrowphase wrote it global). For a
-// body-local index: body_id < 0 (the caller's already-loaded shape body_id) is
-// static; an articulation-link body row resolves to (real artic id, owning global
-// link); a free-rigid body row resolves to the rigid side. Returns the side kind;
-// out_artic / out_link valid only for the artic kind; out_body for the rigid kind;
-// out_particle for particle. env-major: body_to_* are TEMPLATE-local (per:body),
-// so the global body row == env*bodies_per_env + local; the global link ==
-// env*base_link + template_link; the global artic == env*artics_per_env + local.
+// Particle indices are global; body indices name environment-local collidables.
+// Invalid endpoints return ~0u and never read a state array.
 __device__ uint32_t ResolvePairSide(uint32_t side_kind,
                                     int32_t body_id,
                                     const uint32_t* body_to_link,
@@ -456,43 +447,24 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
                                     const uint32_t* body_collidable_body,
                                     uint32_t env, uint32_t index,
                                     uint32_t bodies_per_env, uint32_t base_link_count,
-                                    uint32_t artics_per_env,
+                                    uint32_t artics_per_env, uint32_t particles_per_env,
                                     uint32_t* out_artic, uint32_t* out_link,
                                     uint32_t* out_body, uint32_t* out_particle) {
     *out_artic = ~0u; *out_link = ~0u; *out_body = ~0u; *out_particle = ~0u;
     if (side_kind == nk::kUContactSideParticle) {
-        // The narrowphase carries the GLOBAL particle id in `index`; the particle
-        // side is a point mass (jang stays zero) keyed by that id.
+        const uint64_t first = static_cast<uint64_t>(env) * particles_per_env;
+        if (index < first || index >= first + particles_per_env) return ~0u;
         *out_particle = index;
         return kNkSideParticle;
     }
-    if (side_kind != nk::kUContactSideBody) {
-        return kNkSideStatic;  // unknown channel: no reaction here.
-    }
-    uint32_t local_body = index;
-    if (body_id < 0) {
-        return kNkSideStatic;  // static ground / heightfield collidable.
-    }
-    // A body-owned collidable PROXY row carries no mass or dynamics state of its
-    // own: redirect to the owner body row so the reaction lands on the owner's
-    // inv_mass and lever arm. A link-owned proxy leaves this ~0u and resolves
-    // through body_to_link below (unchanged).
-    if (body_collidable_body != nullptr && local_body < bodies_per_env) {
-        const uint32_t owner = body_collidable_body[local_body];
-        if (owner != ~0u && owner < bodies_per_env) local_body = owner;
-    }
-    const uint32_t tmpl_link = (local_body < bodies_per_env)
-                                   ? body_to_link[local_body] : ~0u;
-    if (tmpl_link == ~0u) {
-        // free-rigid body row (not an articulation link).
-        *out_body = env * bodies_per_env + local_body;
-        return kNkSideRigid;
-    }
-    const uint32_t local_artic = (local_body < bodies_per_env)
-                                     ? body_to_articulation[local_body] : ~0u;
-    *out_artic = env * artics_per_env + (local_artic == ~0u ? 0u : local_artic);
-    *out_link = env * base_link_count + tmpl_link;
-    return kNkSideArtic;
+    if (side_kind != nk::kUContactSideBody) return ~0u;
+    const nk::CollidableOwner owner = nk::ResolveCollidableOwner(
+        body_id, env, index, bodies_per_env, base_link_count, artics_per_env,
+        body_to_link, body_to_articulation, body_collidable_body);
+    *out_artic = owner.articulation;
+    *out_link = owner.link;
+    *out_body = owner.body;
+    return owner.kind;
 }
 
 // Particle systems have no collidable profile row, so they use the canonical
@@ -536,7 +508,7 @@ __global__ void EmitPairDrivenRowsKernel(
     math::Vec3* __restrict__ row_cj_dir_b,
     uint32_t* __restrict__ row_count,
     float* __restrict__ row_penetration,
-    float* __restrict__ row_damping) {
+    float* __restrict__ row_damping, uint32_t* __restrict__ env_status) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * slot_count;
     if (gid >= total) return;
@@ -551,7 +523,7 @@ __global__ void EmitPairDrivenRowsKernel(
                    (slot - full_row_slot_count) * kPdParticleRowsPerSlot
              : slot * kPdRowsPerSlot);
 
-    const uint32_t n_active = ucontact_count[gid];
+    uint32_t n_active = ucontact_count[gid];
 
     // Resolve the two sides ONCE per slot (same a/b for every manifold point).
     uint32_t kind_a = kNkSideStatic, kind_b = kNkSideStatic;
@@ -567,12 +539,12 @@ __global__ void EmitPairDrivenRowsKernel(
         side_kind_a = ucontact_a_kind[static_cast<size_t>(gid) * 4u];
         side_kind_b = ucontact_b_kind[static_cast<size_t>(gid) * 4u];
         // body_id only meaningful for a body-local index (material read below).
-        if (side_kind_a == nk::kUContactSideBody) {
+        if (side_kind_a == nk::kUContactSideBody && local_a < bodies_per_env) {
             const PrimShapeDev shape = LoadPrimShape(shape_table, local_a);
             bid_a = shape.body_id;
             profile_a = shape.contact_profile_index;
         }
-        if (side_kind_b == nk::kUContactSideBody) {
+        if (side_kind_b == nk::kUContactSideBody && local_b < bodies_per_env) {
             const PrimShapeDev shape = LoadPrimShape(shape_table, local_b);
             bid_b = shape.body_id;
             profile_b = shape.contact_profile_index;
@@ -580,13 +552,18 @@ __global__ void EmitPairDrivenRowsKernel(
         kind_a = ResolvePairSide(side_kind_a, bid_a, body_to_link,
                                  body_to_articulation, body_collidable_body,
                                  env, local_a, bodies_per_env,
-                                 base_link_count, artics_per_env, &art_a, &link_a,
+                                 base_link_count, artics_per_env, particles_per_env, &art_a, &link_a,
                                  &body_a, &part_a);
         kind_b = ResolvePairSide(side_kind_b, bid_b, body_to_link,
                                  body_to_articulation, body_collidable_body,
                                  env, local_b, bodies_per_env,
-                                 base_link_count, artics_per_env, &art_b, &link_b,
+                                 base_link_count, artics_per_env, particles_per_env, &art_b, &link_b,
                                  &body_b, &part_b);
+        if (kind_a == ~0u || kind_b == ~0u) {
+            if (env_status != nullptr) atomicOr(&env_status[env], kEnvStatusInvalidEndpoint);
+            n_active = 0u;
+            kind_a = kind_b = kNkSideStatic;
+        }
     }
     const uint32_t idx_a = (kind_a == kNkSideArtic) ? art_a
                           : (kind_a == kNkSideRigid) ? body_a
@@ -1435,7 +1412,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,
                    data.row_cj_link_b, data.row_cj_point_b, data.row_cj_dir_b,
-                   data.row_count, data.row_penetration, data.row_damping);
+                   data.row_count, data.row_penetration, data.row_damping, data.env_status);
     }
 
     if (has_artic &&

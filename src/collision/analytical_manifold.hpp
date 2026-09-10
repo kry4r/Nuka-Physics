@@ -56,6 +56,7 @@
 //     two-run memcmp of the manifold is byte-identical (D1 gate).
 // ---------------------------------------------------------------------------
 
+#include "collision/primitive_surface.hpp"
 #include "constraint/contact_manifold.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -433,18 +434,14 @@ NUKA_AMF_HD inline void SphereBox(const PrimParams& sph, const PrimParams& box,
                                   ContactManifold* out) {
     out->Clear();
     const Vec3 cl = box.frame.WorldToLocal(sph.frame.t);     // sphere center, box-local
-    const Vec3 he = box.half_extents;
-    const Vec3 q{cl.x < -he.x ? -he.x : (cl.x > he.x ? he.x : cl.x),
-                 cl.y < -he.y ? -he.y : (cl.y > he.y ? he.y : cl.y),
-                 cl.z < -he.z ? -he.z : (cl.z > he.z ? he.z : cl.z)};
-    const Vec3 closest_world = box.frame.LocalToWorld(q);
-    const Vec3 delta = sph.frame.t - closest_world;          // sphere away from box
-    const float dist = Len(delta);
-    const float pen = sph.radius - dist;
+    const auto surface = QueryPrimitiveSurface(kShapeBox, box.half_extents, cl);
+    if (!surface.valid) return;
+    const float pen = sph.radius - surface.distance;
     if (pen <= 0.0f) return;
-    const Vec3 n = Norm(delta, Vec3::UnitY());               // separation dir for sphere(=A)
     ContactPoint pt;
-    pt.position = closest_world; pt.normal = n; pt.penetration = pen;
+    pt.position = box.frame.LocalToWorld(surface.point);
+    pt.normal = box.frame.DirLocalToWorld(surface.normal);
+    pt.penetration = pen;
     pt.stable_key = 0ull;
     out->AddPoint(pt);
 }
@@ -771,24 +768,16 @@ NUKA_AMF_HD inline void CapsulePlane(const PrimParams& cap, const PrimParams& pl
 NUKA_AMF_HD inline void CapsuleSphere(const PrimParams& cap, const PrimParams& sph,
                                       ContactManifold* out) {
     out->Clear();
-    const Vec3 axis = cap.frame.cy;
-    const Vec3 seg_a = cap.frame.t - axis * cap.half_height;
-    const Vec3 ab = axis * (2.0f * cap.half_height);
-    const float ab_len2 = ab.Dot(ab);
-    float tparam = 0.0f;
-    if (ab_len2 > 1.0e-12f) {
-        tparam = (sph.frame.t - seg_a).Dot(ab) / ab_len2;
-        tparam = tparam < 0.0f ? 0.0f : (tparam > 1.0f ? 1.0f : tparam);
-    }
-    const Vec3 closest = seg_a + ab * tparam;                // on capsule axis
-    const Vec3 delta = closest - sph.frame.t;                // capsule away from sphere
-    const float dist = Len(delta);
-    const float pen = (cap.radius + sph.radius) - dist;
+    const auto surface = QueryPrimitiveSurface(kShapeCapsule,
+        {cap.radius, cap.half_height, 0.0f}, cap.frame.WorldToLocal(sph.frame.t));
+    if (!surface.valid) return;
+    const float pen = sph.radius - surface.distance;
     if (pen <= 0.0f) return;
-    const Vec3 n = Norm(delta, Vec3::UnitY());               // separation dir for capsule(=A)
-    const Vec3 p = closest - n * cap.radius;                 // on capsule surface
     ContactPoint pt;
-    pt.position = p; pt.normal = n; pt.penetration = pen; pt.stable_key = 0ull;
+    pt.position = cap.frame.LocalToWorld(surface.point);
+    pt.normal = cap.frame.DirLocalToWorld(surface.normal) * -1.0f;
+    pt.penetration = pen;
+    pt.stable_key = 0ull;
     out->AddPoint(pt);
 }
 

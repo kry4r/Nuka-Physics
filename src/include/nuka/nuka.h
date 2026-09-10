@@ -650,7 +650,11 @@ typedef enum nuka_env_status_t {
     NUKA_ENV_STATUS_DOF_OVERFLOW = 1u << 2,
     NUKA_ENV_STATUS_MPM_GRID_ESCAPE = 1u << 3,
     NUKA_ENV_STATUS_MPM_ONE_WAY_BODY = 1u << 4,
-    NUKA_ENV_STATUS_GYRO_FAILURE = 1u << 5
+    NUKA_ENV_STATUS_GYRO_FAILURE = 1u << 5,
+    // Invalid contact ownership or endpoint indices; cleared by world reset.
+    NUKA_ENV_STATUS_INVALID_ENDPOINT = 1u << 6,
+    // Missing or invalid sampled contact geometry; cleared by world reset.
+    NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE = 1u << 7
 } nuka_env_status_t;
 
 typedef enum nuka_gyro_status_t {

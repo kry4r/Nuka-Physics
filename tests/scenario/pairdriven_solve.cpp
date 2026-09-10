@@ -28,6 +28,7 @@
 #include <cstring>
 #include <vector>
 
+#include "collision/shape_kind.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
@@ -234,37 +235,50 @@ TEST(PairDrivenSolve, FreeBoxRestsOnStaticGround) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
 
-    // Ground plane at z=0 (body 0, static im==0) + a box just above it (body 1)
-    // dropped under gravity. The general box x plane contact must catch the box so
-    // it RESTS on the surface (does not fall through), with the ground (static)
-    // scattering no reaction (it is immovable).
-    nk::Model m;
-    AddGroundPlane(m, 0);
-    AddBox(m, Vec3{0, 0, 0.105f}, Vec3{0, 0, 0}, 0.10f, 1.0f, 1);  // box base ~0.005 above ground
-    FinishBodyModel(m);
-    const uint32_t bodies = 2u, rows = m.capacities.max_rows_per_env;
+    for (uint32_t representation = 0u; representation < 3u; ++representation) {
+        SCOPED_TRACE(representation);
+        const uint32_t box = representation == 2u ? 0u : 1u;
+        const uint32_t ground = 1u - box;
+        nk::Model m;
+        if (ground == 0u) AddGroundPlane(m, 0);
+        AddBox(m, Vec3{0, 0, 0.105f}, Vec3{0, 0, 0}, 0.10f, 1.0f, box);
+        if (ground == 1u) AddGroundPlane(m, 1);
+        if (representation != 0u) {
+            auto& shape = m.shape_table_rows[box];
+            shape.kind = nuka::collision::kShapeSdfMesh;
+            // A conservative bound must not become the collision surface.
+            shape.params[0] = 0.70f;
+            shape.params[1] = shape.params[2] = shape.params[3] = 0.40f;
+            for (float x : {-0.10f, 0.10f})
+                for (float y : {-0.10f, 0.10f})
+                    for (float z : {-0.10f, 0.10f})
+                        m.samp_points.insert(m.samp_points.end(), {x, y, z});
+            m.samp_ranges.assign(4u, 0u);
+            m.samp_ranges[box * 2u + 1u] = 8u;
+            m.capacities.max_samp_points = 8u;
+        }
+        FinishBodyModel(m);
+        const uint32_t rows = m.capacities.max_rows_per_env;
+        nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg(-9.81f));
+        ASSERT_TRUE(w.Ready());
+        for (uint32_t s = 0; s < 240u; ++s) ASSERT_TRUE(w.Step().AllOk()) << s;
 
-    nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg(-9.81f));
-    ASSERT_TRUE(w.Ready());
-    for (uint32_t s = 0; s < 240u; ++s) ASSERT_TRUE(w.Step().AllOk()) << s;
-
-    const Snapshot snap = Download(w, bodies, rows);
-    ASSERT_TRUE(snap.ok);
-    const float box_z = snap.pose[1].position.z;
-    const float ground_z = snap.pose[0].position.z;
-    std::fprintf(stderr, "[pd box-on-ground] box_z=%.4f ground_z=%.4f vbox.z=%.5f\n",
-                 box_z, ground_z, snap.lin[1].z);
-
-    // (1) the box did NOT fall through (its center stays near the resting height
-    // half == 0.10 above the plane; a fall-through would be deeply negative).
-    EXPECT_GT(box_z, 0.10f - 0.03f) << "box sank through the ground (穿模)";
-    EXPECT_LT(box_z, 0.10f + 0.03f) << "box floats above its resting height";
-    // (2) the static ground never moved (im==0 -> no reaction scattered into it).
-    EXPECT_NEAR(ground_z, 0.0f, 1.0e-5f) << "static ground must not move";
-    EXPECT_NEAR(snap.lin[0].x, 0.0f, 1.0e-5f);
-    EXPECT_NEAR(snap.lin[0].z, 0.0f, 1.0e-5f) << "static ground velocity must stay 0";
-    // (3) the box is at rest (its vertical velocity damped to ~0 by the contact).
-    EXPECT_LT(std::abs(snap.lin[1].z), 0.2f) << "box must come to rest on the ground";
+        const Snapshot snap = Download(w, 2u, rows);
+        ASSERT_TRUE(snap.ok);
+        uint32_t status = 0u;
+        ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::EnvStatus, &status, sizeof(status)));
+        EXPECT_EQ(status, 0u);
+        const float box_z = snap.pose[box].position.z;
+        const float ground_z = snap.pose[ground].position.z;
+        std::fprintf(stderr, "[pd box-on-ground] representation=%u box_z=%.4f ground_z=%.4f vbox.z=%.5f\n",
+                     representation, box_z, ground_z, snap.lin[box].z);
+        EXPECT_GT(box_z, 0.10f - 0.03f) << "box sank through the ground";
+        EXPECT_LT(box_z, 0.10f + 0.03f) << "box floats above its resting height";
+        EXPECT_NEAR(ground_z, 0.0f, 1.0e-5f) << "static ground must not move";
+        EXPECT_NEAR(snap.lin[ground].x, 0.0f, 1.0e-5f);
+        EXPECT_NEAR(snap.lin[ground].z, 0.0f, 1.0e-5f);
+        EXPECT_LT(std::abs(snap.lin[box].z), 0.2f) << "box must come to rest on the ground";
+    }
 }
 
 // --- (e) two-run byte-identity for the PairDriven solve path ------------------

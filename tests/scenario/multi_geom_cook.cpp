@@ -110,9 +110,15 @@ TEST(MultiGeomCook, ExtraGeomBecomesProxyRow) {
     for (uint64_t k : two.excluded_pairs) if (k == key) excluded = true;
     EXPECT_TRUE(excluded);
 
-    // The trailing static ground row survives (last shape row is static, id -1).
-    ASSERT_FALSE(two.shape_table_rows.empty());
-    EXPECT_EQ(two.shape_table_rows.back().body_id, -1);
+    // Appending a proxy preserves every original collidable's geometry and owner.
+    ASSERT_EQ(two.shape_table_rows.size(), one.shape_table_rows.size() + 1u);
+    for (size_t b = 0u; b < one.shape_table_rows.size(); ++b) {
+        EXPECT_EQ(two.shape_table_rows[b].kind, one.shape_table_rows[b].kind);
+        EXPECT_EQ(two.shape_table_rows[b].body_id, one.shape_table_rows[b].body_id);
+        EXPECT_EQ(two.shape_table_rows[b].sdf_grid, one.shape_table_rows[b].sdf_grid);
+        for (uint32_t p = 0u; p < 4u; ++p)
+            EXPECT_EQ(two.shape_table_rows[b].params[p], one.shape_table_rows[b].params[p]);
+    }
 }
 
 // Proxies of two links whose bodies are filter-excluded (parent-child) must be
