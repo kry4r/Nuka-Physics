@@ -33,6 +33,7 @@
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/op_schema.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"       // SparseSdfDevice / sparse_sdf_sample
+#include "phi/backend_cuda/ops/surface_query.cuh"
 
 namespace nuka::phi {
 
@@ -927,31 +928,12 @@ __global__ void MpmGridFinalizeKernel(
 }
 
 namespace sdfq = ::nuka::runtime::sdf;
-// Load one SDF grid view from the Model sdf_* tables (header floats + flat cells).
-__forceinline__ __device__ sdfq::SparseSdfDevice LoadGrid(
-    const float* headers, const uint32_t* counts, const uint64_t* keys,
-    const float* values, const m::Vec3* grads, uint32_t grid) {
-    const float* h = headers + static_cast<size_t>(grid) * nuka::phi::kSdfHeaderStride;
-    sdfq::SparseSdfDevice s;
-    s.origin = {h[0], h[1], h[2]};
-    s.voxel_size = h[3];
-    s.dims[0] = __float_as_uint(h[4]);
-    s.dims[1] = __float_as_uint(h[5]);
-    s.dims[2] = __float_as_uint(h[6]);
-    const uint32_t off = __float_as_uint(h[7]);
-    s.cell_keys = keys + off;
-    s.cell_values = values + off;
-    s.cell_gradients = grads + off;
-    s.cell_count = counts[grid];
-    return s;
-}
-
 // Project the node velocity onto the surface velocity of its deepest-covering
 // body; record dp = m*(v_after-v_before) + the owner for the reaction gather.
 __global__ void MpmGridBodyProjectKernel(
     uint32_t total_nodes, uint32_t nodes_per_env, uint32_t dims_x, uint32_t dims_y,
     float dx, m::Vec3 origin, uint32_t bodies_per_env, float body_mu, float band,
-    uint32_t links_per_env, uint32_t artics_per_env, uint32_t sdf_grid_count,
+    uint32_t links_per_env, uint32_t artics_per_env, nkops::SurfaceQueryView surfaces,
     const uint32_t* __restrict__ active_nodes,
     const uint32_t* __restrict__ active_node_count,
     const m::Transform* __restrict__ body_pose,
@@ -963,10 +945,7 @@ __global__ void MpmGridBodyProjectKernel(
     const uint32_t* __restrict__ body_to_link,
     const uint32_t* __restrict__ body_to_articulation,
     const uint32_t* __restrict__ body_collidable_body,
-    const float* __restrict__ shape_table, const float* __restrict__ sdf_headers,
-    const uint32_t* __restrict__ sdf_cell_count,
-    const uint64_t* __restrict__ sdf_keys, const float* __restrict__ sdf_values,
-    const m::Vec3* __restrict__ sdf_grads, const float* __restrict__ mass,
+    const float* __restrict__ shape_table, const float* __restrict__ mass,
     m::Vec3* __restrict__ velocity, m::Vec3* __restrict__ body_dp,
     uint32_t* __restrict__ body_owner, uint32_t* __restrict__ env_status) {
     const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
@@ -990,21 +969,14 @@ __global__ void MpmGridBodyProjectKernel(
         if ((shape.contype | shape.conaffinity) == 0u) continue;
         const m::Transform xf = body_pose[env * bodies_per_env + bl];
         const m::Vec3 q = nkops::PrimInverseTransformPoint(xf, xi);
-        const auto surface = collision::QueryPrimitiveSurface(
-            shape.kind, {shape.params[0], shape.params[1], shape.params[2]}, q);
-        float phi = surface.distance;
-        m::Vec3 grad = surface.normal;
+        const auto surface = nkops::QueryCollidableSurface(surfaces, bl, shape, q, band);
         if (!surface.valid) {
-            if (shape.sdf_grid >= sdf_grid_count) {
-                status |= kEnvStatusMpmOneWayBody;
-                continue;
-            }
-            const sdfq::SparseSdfDevice sg = LoadGrid(sdf_headers, sdf_cell_count,
-                sdf_keys, sdf_values, sdf_grads, shape.sdf_grid);
-            phi = sdfq::sparse_sdf_sample(sg, q, grad);
+            status |= kEnvStatusMpmOneWayBody | kEnvStatusContactGeometryUnavailable;
+            continue;
         }
+        const float phi = surface.distance;
         if (phi >= sdfq::SparseSdfDevice::kOutsideBand || phi >= best_phi) continue;
-        const m::Vec3 gw = nkops::PrimRotate(xf.rotation, grad);
+        const m::Vec3 gw = nkops::PrimRotate(xf.rotation, surface.normal);
         const float gl = sqrtf(gw.LengthSq());
         if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-8f) continue;
         const nk::CollidableOwner owner = nk::ResolveCollidableOwner(
@@ -1453,15 +1425,15 @@ cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
         launch(MpmStage::BodyProject, MpmGridBodyProjectKernel, nblocks,
                total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx, origin,
                p.bodies_per_env, p.body_mu, p.body_band,
-               p.base_link_count, p.artics_per_env, p.sdf_grid_count,
+               p.base_link_count, p.artics_per_env,
+               nkops::MakeSurfaceQueryView(model, p.bodies_per_env, p.mesh_geometry,
+                                           p.sdf_grid_count, p.sdf_cell_total),
                scratch.active_nodes, scratch.active_count,
                data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
                data.body_angular_velocity, data.link_pose,
                reinterpret_cast<const nkops::LinkSpatialVel*>(data.link_velocity),
                model.body_to_link, model.body_to_articulation, model.body_collidable_body,
-               model.shape_table, model.sdf_headers,
-               model.sdf_cell_count, model.sdf_cell_keys, model.sdf_cell_values,
-               model.sdf_cell_gradients, data.grid_mass, data.grid_velocity,
+               model.shape_table, data.grid_mass, data.grid_velocity,
                data.grid_body_dp, data.grid_body_owner, data.env_status);
         if (error != cudaSuccess) return error;
         temp_bytes = scratch.sort_temp_bytes;
@@ -1535,9 +1507,9 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
             !data.body_inv_mass || !data.body_world_inv_inertia || !data.body_linear_velocity ||
             !data.body_angular_velocity || !data.mpm_body_reaction || !data.mpm_body_ang_reaction)
             return Status::InvalidArgument;
-        if (p->sdf_grid_count > 0u &&
-            (!model.sdf_headers || !model.sdf_cell_count || !model.sdf_cell_keys ||
-             !model.sdf_cell_values || !model.sdf_cell_gradients)) return Status::InvalidArgument;
+        if (!nkops::SurfaceQueryStorageValid(nkops::MakeSurfaceQueryView(model,
+            p->bodies_per_env, p->mesh_geometry, p->sdf_grid_count, p->sdf_cell_total)))
+            return Status::InvalidArgument;
         if (p->artic_count > 0u &&
             (p->base_link_count == 0u || p->artics_per_env == 0u ||
              static_cast<uint64_t>(p->artics_per_env) * p->env_count != p->artic_count ||

@@ -1,4 +1,4 @@
-// Surface samples query analytic or sparse SDF geometry and emit shared manifolds.
+// Surface samples query analytic, triangle or sparse SDF geometry and emit shared manifolds.
 // Bounds cull candidates; only the declared collision surface supplies contacts.
 
 #include <cuda_runtime.h>
@@ -13,6 +13,7 @@
 #include "phi/backend_cuda/ops/prims_types.cuh"  // kShapeTableRowStride (shared)
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/sdf_types.cuh"
+#include "phi/backend_cuda/ops/surface_query.cuh"
 #include "phi/op_schema.hpp"
 
 namespace nuka::phi {
@@ -151,24 +152,19 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
     }
 }
 
-// Sample both surfaces into the shared manifold when analytic/convex detection
-// leaves the pair empty. Primitive and SDF targets share the same signed-distance contract.
+// Query both surfaces into the shared manifold when analytic/convex detection leaves it empty.
 __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs,
                                     const uint32_t* __restrict__ pair_count,
                                     const float* __restrict__ shape_table,
                                     const float* __restrict__ samp_points,
                                     const uint32_t* __restrict__ samp_ranges,
-                                    const float* __restrict__ sdf_headers,
-                                    const uint32_t* __restrict__ sdf_cell_count,
-                                    const uint64_t* __restrict__ sdf_keys,
-                                    const float* __restrict__ sdf_values,
-                                    const math::Vec3* __restrict__ sdf_grads,
+                                    SurfaceQueryView surfaces,
                                     const math::Transform* __restrict__ body_pose,
                                     uint32_t env_count,
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
                                     uint32_t rigid_slot_cap,
-                                    uint32_t sdf_grid_count, uint32_t sample_point_count,
+                                    uint32_t sample_point_count,
                                     uint32_t k,
                                     float margin,
                                     uint32_t* __restrict__ ucount,
@@ -215,57 +211,62 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
     for (uint32_t side = 0u; side < 2u; ++side) {
         const uint32_t other = 1u - side;
         const PrimShapeDev& target = shapes[other];
+        if (!HasCollidableSurface(surfaces, bodies[other], target)) continue;
+        const math::Transform& sxf = poses[side];
+        const math::Transform& txf = poses[other];
+        if (shapes[side].kind == collision::kShapeSphere) {
+            queried = true;
+            const float radius = shapes[side].params[0];
+            const auto surface = QueryCollidableSurface(surfaces, bodies[other], target,
+                SdfInverseTransformPoint(txf, sxf.position), radius + margin);
+            if (!surface.valid) {
+                geometry_status |= kEnvStatusContactGeometryUnavailable;
+                continue;
+            }
+            const float depth = radius + margin - surface.distance;
+            if (depth > 0.0f) {
+                const auto normal = SdfRotate(txf.rotation, surface.normal);
+                const uint32_t feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
+                DeepestKInsert(SdfTransformPoint(txf, surface.point),
+                    side == 0u ? normal : normal * -1.0f, depth,
+                    side == 0u ? 0u : feature, side == 0u ? feature : 0u,
+                    kk, pt, nm, dp, feature_a, feature_b, &kept);
+            }
+            continue;
+        }
+        if (target.kind == collision::kShapeSphere &&
+            HasCollidableSurface(surfaces, bodies[side], shapes[side])) continue;
         const uint32_t soff = samp_ranges[bodies[side] * 2u];
         const uint32_t scnt = samp_ranges[bodies[side] * 2u + 1u];
         if (soff > sample_point_count || scnt > sample_point_count - soff) {
             geometry_status |= kEnvStatusContactGeometryUnavailable;
             continue;
         }
-        if (scnt == 0u) {
-            if (shapes[side].kind == collision::kShapeSdfMesh)
-                geometry_status |= kEnvStatusContactGeometryUnavailable;
-            continue;
-        }
-        const bool analytic = target.kind <= collision::kShapePlane;
-        if (!analytic && target.sdf_grid >= sdf_grid_count) continue;
-        const math::Transform& sxf = poses[side];
-        const math::Transform& txf = poses[other];
-        sdf::SparseSdfDevice grid;
-        if (!analytic) grid = LoadSdfGrid(sdf_headers, sdf_cell_count,
-            sdf_keys, sdf_values, sdf_grads, target.sdf_grid);
+        if (scnt == 0u) continue;
         queried = true;
         for (uint32_t s = 0u; s < scnt; ++s) {
             const size_t at = static_cast<size_t>(soff + s) * 3u;
             const math::Vec3 local{samp_points[at], samp_points[at + 1u], samp_points[at + 2u]};
             const math::Vec3 world = SdfTransformPoint(sxf, local);
             const math::Vec3 q = SdfInverseTransformPoint(txf, world);
-            math::Vec3 grad;
-            uint32_t target_feature = nk::kContactFeatureUnavailable;
-            float phi;
-            if (analytic) {
-                const auto surface = collision::QueryPrimitiveSurface(target.kind,
-                    {target.params[0], target.params[1], target.params[2]}, q);
-                if (!surface.valid) {
-                    geometry_status |= kEnvStatusContactGeometryUnavailable;
-                    continue;
-                }
-                phi = surface.distance;
-                grad = surface.normal;
-                target_feature = surface.feature;
-            } else {
-                phi = sdf::sparse_sdf_sample(grid, q, grad);
+            const auto surface = QueryCollidableSurface(surfaces, bodies[other], target, q, margin);
+            if (!surface.valid) {
+                geometry_status |= kEnvStatusContactGeometryUnavailable;
+                continue;
             }
+            const float phi = surface.distance;
             if (phi >= sdf::SparseSdfDevice::kOutsideBand) continue;
             const float depth = -phi + margin;
             if (depth <= 0.0f) continue;
-            const math::Vec3 gw = SdfRotate(txf.rotation, grad);
+            const math::Vec3 gw = SdfRotate(txf.rotation, surface.normal);
             const float gl = sqrtf(gw.Dot(gw));
             if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-12f) {
                 geometry_status |= kEnvStatusContactGeometryUnavailable;
                 continue;
             }
             const math::Vec3 n = gw / gl;
-            const math::Vec3 cp = world - n * phi;
+            const math::Vec3 cp = SdfTransformPoint(txf, surface.point);
+            const uint32_t target_feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
             DeepestKInsert(cp, side == 0u ? n : n * -1.0f, depth,
                 side == 0u ? s : target_feature, side == 0u ? target_feature : s,
                 kk, pt, nm, dp, feature_a, feature_b, &kept);
@@ -323,11 +324,11 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
         p->bodies_per_env == 0u) {
         return Status::Ok;
     }
+    const auto surfaces = MakeSurfaceQueryView(model, p->bodies_per_env, p->mesh_geometry,
+                                               p->sdf_grid_count, p->sdf_cell_total);
     if (!model.samp_ranges || !model.shape_table || !data.candidate_pairs || !data.body_pose ||
-        (p->sample_point_count > 0u && !model.samp_points) ||
-        (p->sdf_grid_count > 0u && (!model.sdf_headers || !model.sdf_cell_count ||
-                                 !model.sdf_cell_keys || !model.sdf_cell_values ||
-                                 !model.sdf_cell_gradients))) return Status::InvalidArgument;
+        (p->sample_point_count > 0u && !model.samp_points) || !SurfaceQueryStorageValid(surfaces))
+        return Status::InvalidArgument;
     const uint32_t total = p->env_count * p->max_contacts_per_env;
     constexpr uint32_t kBlock = 128u;
     const uint32_t blocks = (total + kBlock - 1u) / kBlock;
@@ -336,14 +337,10 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                static_cast<const float*>(model.shape_table),
                static_cast<const float*>(model.samp_points),
                static_cast<const uint32_t*>(model.samp_ranges),
-               static_cast<const float*>(model.sdf_headers),
-               static_cast<const uint32_t*>(model.sdf_cell_count),
-               static_cast<const uint64_t*>(model.sdf_cell_keys),
-               static_cast<const float*>(model.sdf_cell_values),
-               static_cast<const math::Vec3*>(model.sdf_cell_gradients),
+               surfaces,
                static_cast<const math::Transform*>(data.body_pose),
                p->env_count, p->bodies_per_env, p->max_contacts_per_env,
-               p->rigid_slot_cap, p->sdf_grid_count, p->sample_point_count,
+               p->rigid_slot_cap, p->sample_point_count,
                static_cast<uint32_t>(p->max_contacts_per_pair), p->contact_margin,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,

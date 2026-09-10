@@ -24,8 +24,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 #include "collision/shape_kind.hpp"
@@ -35,6 +37,8 @@
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "scene/cook/cook_to_model.hpp"
+#include "scene/format/nks.hpp"
 
 namespace {
 
@@ -278,6 +282,144 @@ TEST(PairDrivenSolve, FreeBoxRestsOnStaticGround) {
         EXPECT_NEAR(snap.lin[ground].x, 0.0f, 1.0e-5f);
         EXPECT_NEAR(snap.lin[ground].z, 0.0f, 1.0e-5f);
         EXPECT_LT(std::abs(snap.lin[box].z), 0.2f) << "box must come to rest on the ground";
+    }
+}
+
+TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    namespace scene = nuka::scene;
+    namespace cook = nuka::scene::cook;
+    constexpr uint32_t envs = 2u, steps = 120u;
+    constexpr float radius = 0.02f;
+    struct StoredScene {
+        std::filesystem::path nks_path, nka_path;
+        ~StoredScene() {
+            std::error_code error;
+            std::filesystem::remove(nks_path, error);
+            std::filesystem::remove(nka_path, error);
+        }
+    };
+    for (uint32_t surface_case = 0u; surface_case < 3u; ++surface_case) {
+        SCOPED_TRACE(surface_case);
+        const float side = surface_case == 2u ? -1.0f : 1.0f;
+        const Vec3 offset{0.07f, -0.03f, 0.02f};
+        scene::SceneIR source;
+        scene::RigidBodyRecord wall;
+        wall.is_static = true;
+        wall.local_transform.position = offset * -1.0f;
+        const auto wall_id = source.AddRigidBody(wall);
+        scene::CollisionShapeRecord mesh;
+        mesh.body_id = wall_id;
+        mesh.type = scene::ShapeType::TriMesh;
+        mesh.local_transform.position = offset;
+        if (surface_case == 0u) {
+            const Vec3 polygon[] = {{-0.4f, 0, -0.1f}, {0.4f, 0, -0.1f}, {0.4f, 0, 0},
+                {-0.2f, 0, 0}, {-0.2f, 0, 0.4f}, {-0.4f, 0, 0.4f}};
+            for (float y : {-0.4f, 0.4f})
+                for (auto p : polygon) mesh.mesh_vertices.insert(mesh.mesh_vertices.end(), {p.x, y, p.z});
+            for (uint32_t i = 1u; i < 5u; ++i) {
+                mesh.mesh_indices.insert(mesh.mesh_indices.end(), {0u, i, i + 1u,
+                    6u, i + 7u, i + 6u});
+            }
+            for (uint32_t i = 0u; i < 6u; ++i) {
+                const uint32_t j = (i + 1u) % 6u;
+                mesh.mesh_indices.insert(mesh.mesh_indices.end(), {i, j, j + 6u, i, j + 6u, i + 6u});
+            }
+        } else {
+            mesh.mesh_vertices = {-0.4f, -0.4f, 0, 0.4f, -0.4f, 0,
+                                   0.4f, 0.4f, 0, -0.4f, 0.4f, 0};
+            mesh.mesh_indices = {0u, 1u, 2u, 0u, 2u, 3u};
+        }
+        source.AddCollisionShape(mesh);
+        scene::CollisionShapeRecord other;
+        other.body_id = wall_id;
+        other.type = scene::ShapeType::Sphere;
+        other.radius = 0.01f;
+        other.local_transform.position = {4.0f, 0, 0};
+        source.AddCollisionShape(other);
+        scene::RigidBodyRecord sphere;
+        sphere.local_transform.position = {0.1f, -0.08f, side * 0.15f};
+        const float inertia = 0.4f * sphere.mass * radius * radius;
+        sphere.inertia = {inertia, inertia, inertia};
+        const auto sphere_id = source.AddRigidBody(sphere);
+        scene::CollisionShapeRecord ball;
+        ball.body_id = sphere_id;
+        ball.type = scene::ShapeType::Sphere;
+        ball.radius = radius;
+        source.AddCollisionShape(ball);
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto stem = std::filesystem::temp_directory_path() /
+            ("nuka_surface_" + std::to_string(stamp) + "_" + std::to_string(surface_case));
+        StoredScene stored{stem.string() + ".nks", stem.string() + ".nka"};
+        scene::nks::Save(source, stored.nks_path.string());
+        const auto loaded = scene::nks::Load(stored.nks_path.string());
+        ASSERT_EQ(loaded.Shapes()[0].mesh_vertices, mesh.mesh_vertices);
+        ASSERT_EQ(loaded.Shapes()[0].mesh_indices, mesh.mesh_indices);
+        ASSERT_EQ(loaded.Shapes()[0].type, scene::ShapeType::TriMesh);
+        auto model = std::move(cook::CookSceneToModel(loaded, envs, {}).model);
+        ASSERT_GT(model.capacities.bodies_per_env, source.Bodies().size());
+        ASSERT_GT(model.capacities.max_mesh_triangles, 0u);
+        ASSERT_EQ(model.capacities.max_sdf_grids, 0u);
+        for (uint32_t body = 0u; body < model.mesh_surface_info.size(); ++body) {
+            if (model.mesh_surface_info[body].triangle_count == 0u) continue;
+            EXPECT_EQ(model.shape_table_rows[body].kind, nuka::collision::kShapeSdfMesh);
+            EXPECT_EQ((model.mesh_surface_info[body].flags & nuka::collision::kMeshSurfaceClosed) != 0u,
+                      surface_case == 0u);
+        }
+        cook::XpbdCookInput particle;
+        particle.positions = {{0.1f, 0.08f, side * 0.15f}};
+        particle.velocities = {{0, 0, 0}};
+        particle.inv_mass = {100.0f};
+        cook::CookXpbdParticles(model, envs, particle);
+        model.particles.pp_contact_d_min = 2.0f * radius;
+        const uint32_t bodies = model.capacities.bodies_per_env;
+        auto cfg = Cfg(-side * 9.81f);
+        cfg.dt = 1.0f / 480.0f;
+        nk::World world(std::move(model), envs, backend.dev, backend.backend, cfg);
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        ASSERT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok);
+        std::vector<Transform> poses(envs * bodies);
+        std::vector<Vec3> positions(envs), velocities(envs * bodies);
+        std::vector<uint32_t> status(envs);
+        float max_penetration = 0.0f;
+        const auto read = [&]() {
+            return world.GetData().DownloadField(nk::FieldId::BodyPose, poses.data(), poses.size() * sizeof(Transform)) &&
+                world.GetData().DownloadField(nk::FieldId::ParticlePos, positions.data(), positions.size() * sizeof(Vec3));
+        };
+        for (uint32_t step = 0u; step < steps; ++step) {
+            ASSERT_TRUE(world.Step().AllOk());
+            ASSERT_TRUE(read());
+            for (uint32_t env = 0u; env < envs; ++env) {
+                max_penetration = std::max(max_penetration,
+                    radius - std::min(side * poses[env * bodies + sphere_id].position.z,
+                                      side * positions[env].z));
+            }
+        }
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(), status.size() * sizeof(uint32_t)));
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::BodyLinearVelocity,
+            velocities.data(), velocities.size() * sizeof(Vec3)));
+        for (uint32_t env = 0u; env < envs; ++env) {
+            EXPECT_EQ(status[env], 0u);
+            EXPECT_NEAR(side * poses[env * bodies + sphere_id].position.z, radius, 0.003f);
+            EXPECT_NEAR(side * positions[env].z, radius, 0.003f);
+            EXPECT_LT(std::fabs(velocities[env * bodies + sphere_id].z), 0.1f);
+        }
+        EXPECT_LT(max_penetration, 0.006f);
+        std::fprintf(stderr, "[triangle surface] case=%u rigid_z=%.7f particle_z=%.7f penetration=%.7f\n",
+            surface_case, poses[sphere_id].position.z, positions[0].z, max_penetration);
+        const auto before = poses;
+        const auto particle_before = positions;
+        ASSERT_EQ(world.Reset({0u}), nphi::Status::Ok);
+        ASSERT_TRUE(read());
+        EXPECT_NEAR(poses[sphere_id].position.z, side * 0.15f, 1e-7f);
+        EXPECT_NEAR(positions[0].z, side * 0.15f, 1e-7f);
+        EXPECT_EQ(poses[bodies + sphere_id].position.z, before[bodies + sphere_id].position.z);
+        EXPECT_EQ(positions[1].z, particle_before[1].z);
+        for (uint32_t step = 0u; step < steps; ++step) ASSERT_TRUE(world.Step().AllOk());
+        ASSERT_TRUE(read());
+        EXPECT_NEAR(poses[sphere_id].position.z, before[sphere_id].position.z, 1e-6f);
+        EXPECT_NEAR(positions[0].z, particle_before[0].z, 1e-6f);
     }
 }
 

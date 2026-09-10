@@ -1,19 +1,6 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nuka::import::cooker – V-HACD convex decomposition (cook-time)
-// ---------------------------------------------------------------------------
-// Wraps V-HACD v4 behind a stable interface so the implementation can be
-// swapped later. Runs ONCE at cook time (offline / host CPU): the sanctioned
-// exception to the GPU-only rule (master plan §5.6). No CUDA here.
-//
-// Determinism contract: DecomposeMesh() is a PURE function of (mesh, params).
-// V-HACD is configured single-threaded / async-off with fixed parameters, and
-// the output is canonicalized (pieces sorted by a stable geometric key, hull
-// vertices sorted with indices remapped) so that N runs of the same input are
-// byte-identical. The SHA-256 cache below NEVER masks this: it is a separate
-// wrapper that only memoizes; the determinism test drives DecomposeMesh()
-// directly.
-// ---------------------------------------------------------------------------
+// Deterministic CPU V-HACD decomposition with canonical output and content caching.
+// This optional approximation is separate from source triangle-surface cooking.
 
 #include "import/cooker/convex_piece.hpp"
 
@@ -23,9 +10,9 @@ namespace nuka::import::cooker {
 
 /// Decomposition mode authored on a mesh (USD nuka:decompose / URDF / MJCF).
 enum class DecomposeMode : uint8_t {
-    Auto,   // cooker decides (already-convex => 1 piece; concave => V-HACD)
+    Auto,   // preserve the authored surface representation
     Force,  // always run V-HACD
-    Skip,   // treat the source mesh as a single convex piece (its own hull)
+    Skip,   // preserve source vertices, triangles, and shape type
 };
 
 /// Parameters controlling the convex decomposition. Defaults match the spec.

@@ -4,7 +4,7 @@
 
 当前 active goal 已接续为 [引擎完善目标](2026-09-08-engine-completion-goal-zh.md)：覆盖 spec 全部剩余项，相关模块成批修改、统一验证。旧 demo/细化规格/开始实施目标已验收关闭。
 
-最新执行顺序（2026-09-10）：收口当前 MLS-MPM 性能改动 → 完整多体/多介质耦合分析与优化 → 继续原 spec 全部剩余工作。主验证场景为 MLS-MPM water pool（原 bunny-water）和 jelly，暂停压痕 demo 测试；性能足够时进入下一阶段，剩余热点及历史回退保留，不要求先穷尽。耦合方案可仅由现有架构与物理推导独立设计，不必局限于 Newton/MuJoCo/Genesis；适用的外部结果用于物理对照。
+最新执行顺序（2026-09-10）：凸分解自动 cook 与完整多体/多介质耦合 → MLS-MPM 相关修复 → 弹塑性体网络调研与通用功能集成 → 机械臂挤压 demo、渲染及替换主页 Go2 行走视频 → 继续原 spec 全部剩余工作。主验证场景为 MLS-MPM water pool（原 bunny-water）和 jelly，暂停压痕 demo 测试；性能足够时进入下一阶段，剩余热点及历史回退保留，不要求先穷尽。耦合方案可仅由现有架构与物理推导独立设计，不必局限于 Newton/MuJoCo/Genesis；适用的外部结果用于物理对照。
 
 当前耦合范围按用户最新补充覆盖 ABA 机器人、刚体、柔体、XPBD/PBF（XPBF）和 MLS-MPM 的全量路径。最终验收包括机器人提起装多个小球的塑料袋，以及双夹爪拧毛巾，见 [全量细化 spec](../plans/2026-09-10-full-coupling-detailed-spec-zh.md)。共存、单向边界和固定顶点演示均不能代替完整双向耦合。
 
@@ -51,7 +51,14 @@
 - [ ] 完整 PBF↔柔体、MPM↔柔体和 PBF↔MPM 直接交换；消除全局粒子模式对多介质共存的限制，并明确 MPM 多材料的混合/分离与界面模型。
 - [ ] 机器人提袋装球 demo：真实 ABA 控制与夹爪摩擦抓持，袋内多个动态球；提起、摆动、停留、放下/释放，量测漏球/穿透、布面应变、负载回传，输出完整视频及精选 GIF。
 - [ ] 拧毛巾 demo：双夹爪真实抓持、相向扭转、保持、释放；验收大变形、自碰撞、滑移和反作用扭矩，输出视频/GIF。展示湿毛巾时必须有真实液体交换与质量收支。
-- [ ] 耦合完成后继续原 spec 和其余性能热点；物理改变后重建质量通过的性能分母。
+- [x] 保留真实非凸/开放三角表面并接入刚体、粒子和 MPM 的共同查询；155 项导入、63 项场景、E16 完整管线、公共 API/reset/渲染及 memcheck 通过，见 [验收记录](../research/2026-09-10-triangle-surface-validation-zh.md)。有限厚度、CCD 与全量耦合继续保留。
+- [ ] 将成熟 GPU 凸分解集成到统一场景 cook，自动准备几何、设备执行与缓存；覆盖混合场景、owner、序列化/recook 和生产接触消费者，预算不足保留真实三角表面。
+- [ ] 凸分解与全量耦合验收后继续 MLS-MPM 修复：局部大 J、本构/体积、材料状态、边界与耦合残留问题；water pool/jelly 和固定完整 pipeline 通过后再冻结性能分母。
+- [ ] 按 [弹塑性体细化 spec](../plans/2026-09-10-elastoplastic-body-detailed-spec-zh.md) 做网络调研，比较 MPM、FEM 等大变形方法及屈服/塑性积分，记录论文、实现版本、许可、取舍和可验证物理契约。
+- [ ] 集成通用弹塑性材料与持久塑性状态，打通 authoring/import/cook、公共参数、ABA 双向接触、step、reset/readout 与渲染；审计已有 granular 路径，不能用现有 jelly 弹性形变冒充塑性。
+- [ ] 制作机械臂挤压球体或其他物体的 demo，展示小载荷弹性恢复、大载荷屈服及卸载残余形变；记录夹爪反力、加载/卸载曲线、能量耗散和时间步/分辨率收敛。
+- [ ] 渲染完整弹塑性体 demo、关键帧和精选 GIF，物理与画面验收后替换主页 Go2 行走展示（当前 `Go2 Terrain`）；保留顶部 π0.5/G1 顺序与两两排列，补充运行说明。
+- [ ] 弹塑性体与主页替换完成后继续原 spec 和其余性能热点；物理改变后重建质量通过的性能分母。
 - [x] review 最新 Newton/MuJoCo/Genesis 与 M05/M08/M09，形成 [共享几何/owner 细化 spec](../plans/2026-09-10-coupling-surface-owner-detailed-spec-zh.md)，明确解析体覆盖、内部点距离、真实 owner 及后续多端点/子步契约。
 - [x] 完成首批共享几何/owner 修复：内部球心 Box/Capsule 法线、无 SDF 解析碰撞体、真实 owner/力矩参考点、代理表面数据及状态反馈；water/jelly、固定 E=16 管线、公共 C/Python/reset/渲染通过，见 [验收](../research/2026-09-10-coupling-surface-owner-validation-zh.md)。
 - [x] 修复 bunny 的 Box/SDF 几何不一致和 SDF 接触点符号；真实顶点参与通用 mesh/plane 接触，报告直接量测旋转后的实际表面。错误 Box 轨迹、过期元数据断言及对应修正结果均保留。

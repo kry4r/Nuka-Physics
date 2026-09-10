@@ -61,8 +61,7 @@ struct CookToModelOptions {
     // base / free-space scene with nothing to collide. The cooked shape_table /
     // link_geom rows stay sized consistently (just never read). Default true.
     bool enable_contacts = true;
-    // Bake visual-mesh SDF data for unbound mesh colliders; authored primitives
-    // and collision SDFs retain their declared geometry.
+    // Produce optional visual distance fields without binding them to colliders.
     bool bake_link_sdf = false;
 };
 CookToModelResult CookToModel(const SceneIR& scene, int env_count,

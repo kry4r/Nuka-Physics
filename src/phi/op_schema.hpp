@@ -29,6 +29,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include "collision/mesh_surface_types.hpp"
 
 namespace nuka::phi {
 
@@ -422,6 +423,8 @@ struct MpmStepParams {
     uint32_t bite_disable_dynamic_bc;
     uint32_t bodies_per_env;     // collidable body rows / env (the BC body loop).
     uint32_t sdf_grid_count;     // available SDF descriptors; primitives need none.
+    uint32_t sdf_cell_total;
+    collision::MeshGeometryCounts mesh_geometry;
     float    body_mu;            // Coulomb friction the body BC clamps the tangent by.
     float    body_band;          // nodes with signed surface distance below this couple.
     // Articulation deposit dims (the link-row grid reaction -> qdot_flat seed). All
@@ -576,6 +579,8 @@ struct NarrowphaseBodyParticleParams {
     float    min_z, max_z;      // LOCAL z-range (for the cell corner heights)
     uint32_t data_offset;       // base index into the `heights` field
     uint32_t sdf_grid_count;    // available SDF descriptors
+    uint32_t sdf_cell_total;
+    collision::MeshGeometryCounts mesh_geometry;
 };
 
 // Sampled surfaces query the opposing analytic/SDF geometry within each pair.
@@ -590,6 +595,8 @@ struct NarrowphaseSdfParams {
     uint32_t rigid_slot_cap;    // body<->body live cap (<= stride; == stride if no particles)
     uint32_t sdf_grid_count;    // available SDF descriptors
     uint32_t sample_point_count; // available surface samples
+    uint32_t sdf_cell_total;
+    collision::MeshGeometryCounts mesh_geometry;
 };
 
 struct ContactTangentBasisParams {

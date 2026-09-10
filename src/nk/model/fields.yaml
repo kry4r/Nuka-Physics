@@ -927,3 +927,8 @@ fields:
   - {name: particle_topology_offsets, dtype: u32, per: scalar, count: "particle_topology_offsets", arena: persistent, owner: model}
   - {name: particle_topology_elements, dtype: u32, per: scalar, count: "particle_topology_incidence_count", arena: persistent, owner: model}
   - {name: particle_contact_rest_pos, dtype: vec3, per: scalar, count: "particle_contact_rest_positions", arena: persistent, owner: model}
+
+  # Mesh topology is shared by all environments and indexed by collidable.
+  - {name: mesh_surface_info, dtype: mesh_surface_info, per: scalar, count: "mesh_surface_info_count", arena: persistent, owner: model}
+  - {name: mesh_triangles, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
+  - {name: mesh_bvh_nodes, dtype: mesh_bvh_node, per: scalar, count: "max_mesh_bvh_nodes", arena: persistent, owner: model}

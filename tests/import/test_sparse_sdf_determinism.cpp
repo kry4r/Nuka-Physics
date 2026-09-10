@@ -1,19 +1,4 @@
-// ---------------------------------------------------------------------------
-// p07 sparse narrow-band SDF: determinism + per-mesh dedup (exit-crit 4 & 7).
-// ---------------------------------------------------------------------------
-// Determinism: N cooks of the same mesh + params produce a byte-identical
-// SparseSdfData (cell_keys + values + gradients). Mirrors
-// test_vhacd_determinism.cpp's serialize-and-compare. Host single-thread + fixed
-// traversal order + double->float-once => bit-reproducible.
-//
-// Dedup: two identical mesh pieces in a scene cook to ONE stored SDF (content
-// hash). We verify CookedSdfTable::Count() (unique) vs piece count (total), the
-// shared SDF index, and report narrow-band bytes vs the ~80MB cap (R-C).
-//
-// Sign-on-real-piece: a Skip-mode cube piece (the cook path's actual ConvexHull)
-// samples phi<0 at an interior point, phi>0 outside -> the convex-hull sign path
-// is exercised on shipping geometry, not just hand-wound test meshes.
-// ---------------------------------------------------------------------------
+// Sparse SDF cooking preserves deterministic cells, shared geometry, and convex signs.
 
 #include "import/cooker/sparse_sdf_cooker.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
@@ -97,7 +82,7 @@ TEST(SparseSdfDeterminism, CookedSdfTableIsByteIdenticalAcrossCooks) {
         const auto cube = nuka::test::UnitCubeMesh();
         CollisionShapeRecord shape;
         shape.body_id = id;
-        shape.type = ShapeType::TriMesh;
+        shape.type = ShapeType::ConvexHull;
         shape.decompose_mode = DecomposeMode::Skip;
         shape.mesh_vertices = cube.vertices;
         shape.mesh_indices = cube.indices;
@@ -116,8 +101,7 @@ TEST(SparseSdfDeterminism, CookedSdfTableIsByteIdenticalAcrossCooks) {
               0);
 }
 
-// Build a scene with `n` IDENTICAL Skip-mode cube mesh shapes (each -> one
-// ConvexHull piece). All pieces share one geometry -> one deduped SDF.
+// Identical authored convex cubes share one SDF.
 SceneIR BuildIdenticalCubes(int n) {
     SceneIR scene;
     const auto cube = nuka::test::UnitCubeMesh();
@@ -129,8 +113,8 @@ SceneIR BuildIdenticalCubes(int n) {
 
         CollisionShapeRecord shape;
         shape.body_id = id;
-        shape.type = ShapeType::TriMesh;
-        shape.decompose_mode = DecomposeMode::Skip;  // 1 ConvexHull piece each
+        shape.type = ShapeType::ConvexHull;
+        shape.decompose_mode = DecomposeMode::Skip;
         shape.mesh_vertices = cube.vertices;
         shape.mesh_indices = cube.indices;
         scene.AddCollisionShape(std::move(shape));

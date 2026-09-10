@@ -50,6 +50,8 @@ struct ModelCapacities {
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
     uint32_t joint_friction_rows_per_env = 0; // one scalar slot per link when friction is authored
     uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
+    uint32_t max_mesh_triangles   = 0;
+    uint32_t max_mesh_bvh_nodes   = 0;
     uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
     uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
     uint32_t bend_cons_per_env    = 0;  // XPBD bend-constraint count / env.
@@ -485,7 +487,10 @@ public:
     uint32_t drive_mode = 0;
     // Articulation-local task link selected by nuka_world_desc_t::osc_task_link.
     uint32_t osc_task_link = 0;
-    std::vector<float>     hull_verts;    // mesh-local hull verts (xyz packed).
+    std::vector<float>     hull_verts;    // shared collision vertices, xyz packed
+    std::vector<collision::MeshSurfaceInfo> mesh_surface_info;
+    std::vector<uint32_t> mesh_triangles;
+    std::vector<collision::MeshBvhNode> mesh_bvh_nodes;
     // The ONE general path's contact-compliance defaults (solref/solimp). The
     // PairDriven row emitter (EmitPairDrivenRows) feeds these to ComputeCompliantRow.
     // (L1-c renamed these from union_solref/union_solimp; the values are unchanged.)

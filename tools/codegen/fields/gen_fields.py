@@ -54,6 +54,8 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
     "transform": {"cpp": "::nuka::math::Transform", "code": "kF32", "lanes": 7},
     "spatial6":  {"cpp": "::nuka::nk::Spatial6",    "code": "kF32", "lanes": 6},
     "mat36":     {"cpp": "::nuka::nk::Mat36",       "code": "kF32", "lanes": 36},
+    "mesh_surface_info": {"cpp": "::nuka::collision::MeshSurfaceInfo", "code": "kU8", "lanes": 32},
+    "mesh_bvh_node": {"cpp": "::nuka::collision::MeshBvhNode", "code": "kU8", "lanes": 32},
 }
 
 VALID_PER = {
@@ -207,6 +209,7 @@ def gen_views(fields: list[dict[str, Any]]) -> str:
         '#include "math/quat.hpp"',
         '#include "math/transform.hpp"',
         '#include "math/symmetric_mat3.hpp"',
+        '#include "collision/mesh_surface_types.hpp"',
         "",
         "namespace nuka::nk {",
         "// Spatial / matrix element types for the articulation device state",
@@ -299,7 +302,8 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "aero_tri": "AeroTri",
     }
     scalar_size = {"f32": 4, "u32": 4, "u64": 8, "u8": 1, "vec3": 4, "quat": 4,
-                   "transform": 4, "spatial6": 4, "mat36": 4, "symmat3": 4}
+                   "transform": 4, "spatial6": 4, "mat36": 4, "symmat3": 4,
+                   "mesh_surface_info": 1, "mesh_bvh_node": 1}
     lines.append("inline constexpr FieldLayout kFieldLayout[kFieldCount] = {")
     for f in fields:
         info = DTYPE_INFO[f["dtype"]]

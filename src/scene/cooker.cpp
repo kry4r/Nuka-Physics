@@ -5,6 +5,7 @@
 #include "scene/cooker.hpp"
 
 #include "import/cooker/convex_decomposition.hpp"
+#include "import/cooker/mesh_surface_cooker.hpp"
 #include "import/cooker/sdf_bake_backend.hpp"
 #include "import/cooker/sparse_sdf_cooker.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"  // PackSdfCellKey codec (shared)
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -57,18 +59,27 @@ bool IsIdentityLocal(const math::Transform& t) {
            t.rotation.y == 0.0f && t.rotation.z == 0.0f;
 }
 
-// Append one convex hull (vertices/indices/volume) into the cooked geometry
-// table and return its index.
+// Preserve the authored triangle order and store its query hierarchy.
 uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
                               const std::vector<float>& vertices,
                               const std::vector<uint32_t>& indices,
-                              float volume) {
+                              float volume, bool convex) {
+    if (vertices.size() % 3u != 0u || indices.size() % 3u != 0u)
+        throw std::invalid_argument("Collision mesh arrays must contain complete vertices and triangles");
+    auto surface = import::cooker::CookMeshSurface(vertices.data(),
+        static_cast<uint32_t>(vertices.size() / 3u), indices.data(),
+        static_cast<uint32_t>(indices.size() / 3u), convex);
     const uint32_t index = geom.Count();
     geom.vertex_offsets.push_back(static_cast<uint32_t>(geom.vertices.size() / 3));
     geom.vertex_counts.push_back(static_cast<uint32_t>(vertices.size() / 3));
     geom.index_offsets.push_back(static_cast<uint32_t>(geom.indices.size()));
     geom.index_counts.push_back(static_cast<uint32_t>(indices.size()));
     geom.volumes.push_back(volume);
+    surface.info.vertex_offset = geom.vertex_offsets.back();
+    surface.info.triangle_offset = geom.index_offsets.back() / 3u;
+    surface.info.node_offset = static_cast<uint32_t>(geom.surface_nodes.size());
+    geom.surface_info.push_back(surface.info);
+    geom.surface_nodes.insert(geom.surface_nodes.end(), surface.nodes.begin(), surface.nodes.end());
     geom.vertices.insert(geom.vertices.end(), vertices.begin(), vertices.end());
     geom.indices.insert(geom.indices.end(), indices.begin(), indices.end());
     return index;
@@ -127,6 +138,9 @@ void CookSdfsForGeometry(const CookedConvexGeometry& geom,
     uint32_t total = 0;
     uint64_t bytes = 0;
     for (uint32_t piece = 0; piece < geom.Count(); ++piece) {
+        // This SDF baker uses convex face signs; other surfaces retain exact BVH queries.
+        if (piece >= geom.surface_info.size() ||
+            (geom.surface_info[piece].flags & collision::kMeshSurfaceConvex) == 0u) continue;
         const uint32_t vbase = geom.vertex_offsets[piece];
         const uint32_t vcount = geom.vertex_counts[piece];
         const uint32_t ibase = geom.index_offsets[piece];
@@ -137,6 +151,20 @@ void CookSdfsForGeometry(const CookedConvexGeometry& geom,
         const float* vptr = geom.vertices.data() + static_cast<size_t>(vbase) * 3u;
         const uint32_t* iptr = geom.indices.data() + ibase;
         const uint32_t tri_count = icount / 3u;
+        math::Vec3 center{};
+        for (uint32_t v = 0u; v < vcount; ++v)
+            center += math::Vec3{vptr[v * 3u], vptr[v * 3u + 1u], vptr[v * 3u + 2u]} /
+                      static_cast<float>(vcount);
+        bool outward = true;
+        for (uint32_t t = 0u; t < tri_count; ++t) {
+            const auto vertex = [&](uint32_t corner) -> math::Vec3 {
+                const size_t at = static_cast<size_t>(iptr[t * 3u + corner]) * 3u;
+                return {vptr[at], vptr[at + 1u], vptr[at + 2u]};
+            };
+            const auto a = vertex(0u), b = vertex(1u), c = vertex(2u);
+            if ((b - a).Cross(c - a).Dot(center - a) >= 0.0f) outward = false;
+        }
+        if (!outward) continue;
 
         ++total;
         const std::string key =
@@ -498,9 +526,12 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         const bool is_mesh =
             (s.type == ShapeType::TriMesh || s.type == ShapeType::ConvexHull);
         const bool has_geometry = !s.mesh_vertices.empty() && !s.mesh_indices.empty();
+        const bool shape_collides = (s.contype != 0u) || (s.conaffinity != 0u);
+        if (is_mesh && shape_collides && !has_geometry)
+            throw std::invalid_argument("Collision mesh '" + s.name + "' on body " +
+                std::to_string(s.body_id) + " requires vertices and triangles");
 
-        // Non-mesh shapes (and mesh shapes lacking geometry — e.g. importers
-        // that do not yet load mesh files) pass through unchanged, one row.
+        // Primitives and unresolved visual-only meshes retain their authored row.
         if (!is_mesh || !has_geometry) {
             PushShapeRow(blob.shapes, blob.contact_params, s, s.type,
                          kNoConvexGeometry, resolved_friction);
@@ -509,7 +540,6 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
 
         // Bake a colliding mesh's authored local pose into its geometry: cooked
         // convex pieces are consumed as BODY-frame data (no local-pose lane).
-        const bool shape_collides = (s.contype != 0u) || (s.conaffinity != 0u);
         CollisionShapeRecord baked;
         const CollisionShapeRecord* rowp = &s;
         if (shape_collides && !IsIdentityLocal(s.local_transform)) {
@@ -526,34 +556,25 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
             rowp = &baked;
         }
         const CollisionShapeRecord& r = *rowp;
+        if (r.mesh_vertices.size() % 3u != 0u || r.mesh_indices.size() % 3u != 0u ||
+            r.mesh_vertices.size() / 3u > uint64_t(~uint32_t(0)) ||
+            r.mesh_indices.size() > uint64_t(~uint32_t(0)))
+            throw std::invalid_argument("Collision mesh arrays exceed complete triangle storage");
 
-        import::cooker::DecomposeMode mode = ToCookerMode(r.decompose_mode);
-
-        // L-RECON-B: the GENERAL cvx narrowphase wants ONE convex hull per mesh,
-        // not V-HACD's N concave pieces. When single-hull is requested, collapse
-        // every mesh to its own hull (the Skip path) UNLESS the author explicitly
-        // forced decomposition (a genuinely-concave shape opting INTO V-HACD).
-        // This is a STAGE gate driven by the cook option + the per-shape mode —
-        // no entity/scene-name branch.
-        if (options.general_single_hull &&
-            mode != import::cooker::DecomposeMode::Force) {
-            mode = import::cooker::DecomposeMode::Skip;
-        }
-
-        if (mode == import::cooker::DecomposeMode::Skip) {
-            // Treat the source mesh as a single convex piece (store its own
-            // geometry as one ConvexHull; no V-HACD run).
+        const auto mode = ToCookerMode(r.decompose_mode);
+        if (mode != import::cooker::DecomposeMode::Force) {
             const uint32_t geom_index = AppendConvexGeometry(
-                blob.convex_geometry, r.mesh_vertices, r.mesh_indices, 0.0f);
-            PushShapeRow(blob.shapes, blob.contact_params, r,
-                         ShapeType::ConvexHull, geom_index, resolved_friction);
+                blob.convex_geometry, r.mesh_vertices, r.mesh_indices, 0.0f,
+                r.type == ShapeType::ConvexHull);
+            PushShapeRow(blob.shapes, blob.contact_params, r, r.type,
+                         geom_index, resolved_friction);
             continue;
         }
 
-        // Auto / Force => run V-HACD. (A convex input naturally yields 1 piece,
-        // so Auto ~= Force at this phase.) Served through the content-hash cache
-        // (p06): identical (mesh, params) reuse a prior decomposition instead of
-        // re-running the 0.5-5s V-HACD.
+        // Only explicit decomposition may replace the authored surface by convex pieces.
+        import::cooker::ValidateMeshSurfaceInput(r.mesh_vertices.data(),
+            static_cast<uint32_t>(r.mesh_vertices.size() / 3u), r.mesh_indices.data(),
+            static_cast<uint32_t>(r.mesh_indices.size() / 3u));
         import::cooker::ConvexDecompositionParams params;
         params.max_pieces = r.decompose_max_pieces;
         bool decompose_hit = false;
@@ -568,18 +589,12 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         (void)decompose_hit;
 
         if (!result.succeeded || result.pieces.empty()) {
-            // Decomposition failed: fall back to passing the mesh through as a
-            // single ConvexHull carrying its own geometry (never drop the shape).
-            const uint32_t geom_index = AppendConvexGeometry(
-                blob.convex_geometry, r.mesh_vertices, r.mesh_indices, 0.0f);
-            PushShapeRow(blob.shapes, blob.contact_params, r,
-                         ShapeType::ConvexHull, geom_index, resolved_friction);
-            continue;
+            throw std::runtime_error("Requested collision mesh decomposition failed");
         }
 
         for (const auto& piece : result.pieces) {
             const uint32_t geom_index = AppendConvexGeometry(
-                blob.convex_geometry, piece.vertices, piece.indices, piece.volume);
+                blob.convex_geometry, piece.vertices, piece.indices, piece.volume, true);
             PushShapeRow(blob.shapes, blob.contact_params, r,
                          ShapeType::ConvexHull, geom_index, resolved_friction);
         }

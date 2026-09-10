@@ -312,6 +312,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticleTopologyOffsets, DlpackDtype::kU32, 1, false, false},  // particle_topology_offsets
     {FieldId::ParticleTopologyElements, DlpackDtype::kU32, 1, false, false},  // particle_topology_elements
     {FieldId::ParticleContactRestPos, DlpackDtype::kF32, 2, false, false},  // particle_contact_rest_pos
+    {FieldId::MeshSurfaceInfo, DlpackDtype::kU8, 2, false, false},  // mesh_surface_info
+    {FieldId::MeshTriangles, DlpackDtype::kU32, 1, false, false},  // mesh_triangles
+    {FieldId::MeshBvhNodes, DlpackDtype::kU8, 2, false, false},  // mesh_bvh_nodes
 };
 
 } // namespace nuka::nk

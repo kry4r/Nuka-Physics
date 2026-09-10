@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "core/checked_size.hpp"
+#include "collision/mesh_surface.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
 #include "phi/articulation_contract.hpp"
@@ -141,6 +142,11 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             // GLOBAL convex-hull vertex pool, xyz packed.
             return static_cast<uint64_t>(max_hull_verts) * 3ull;
         }
+        if (id == FieldId::MeshSurfaceInfo)
+            return max_mesh_triangles > 0u ? max_bodies_total : 0u;
+        if (id == FieldId::MeshTriangles)
+            return static_cast<uint64_t>(max_mesh_triangles) * 3u;
+        if (id == FieldId::MeshBvhNodes) return max_mesh_bvh_nodes;
         // M5 pair-driven / SDF GLOBAL tables (per-env template, base-relative).
         // R1: the shape_table record GREW 8 -> 10 f32/row (appended body_id +
         // group). L-RECON-D: it GREW 10 -> 12 f32/row (appended the per-shape
@@ -457,6 +463,18 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        case FieldId::MeshSurfaceInfo:
+            if (!mesh_surface_info.empty()) std::memcpy(dst, mesh_surface_info.data(),
+                mesh_surface_info.size() * sizeof(collision::MeshSurfaceInfo));
+            break;
+        case FieldId::MeshTriangles:
+            if (!mesh_triangles.empty()) std::memcpy(dst, mesh_triangles.data(),
+                mesh_triangles.size() * sizeof(uint32_t));
+            break;
+        case FieldId::MeshBvhNodes:
+            if (!mesh_bvh_nodes.empty()) std::memcpy(dst, mesh_bvh_nodes.data(),
+                mesh_bvh_nodes.size() * sizeof(collision::MeshBvhNode));
+            break;
         case FieldId::ShapeTable: {
             // GLOBAL pair-driven shape table: R1 GREW it 8 -> 10 packed f32 per
             // body row {kind(u32 bits), p0..p3, contype(u32), conaffinity(u32),
@@ -955,6 +973,9 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::FootShape:             v.foot_shape = static_cast<float*>(p); break;
         // L1-c: FieldId::UnionSlots (v.union_slots) was DELETED with the field.
         case FieldId::HullVerts:             v.hull_verts = static_cast<float*>(p); break;
+        case FieldId::MeshSurfaceInfo: v.mesh_surface_info = static_cast<collision::MeshSurfaceInfo*>(p); break;
+        case FieldId::MeshTriangles: v.mesh_triangles = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshBvhNodes: v.mesh_bvh_nodes = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ShapeTable:            v.shape_table = static_cast<float*>(p); break;
         case FieldId::ExcludedPairs:         v.excluded_pairs = static_cast<uint64_t*>(p); break;
         case FieldId::SampPoints:            v.samp_points = static_cast<float*>(p); break;
@@ -1279,11 +1300,54 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     const bool capacities_ok =
         feet.size() <= capacities.max_contacts_per_env &&
         shape_table_rows.size() <= capacities.max_bodies_total &&
-        hull_verts.size() <=
-            static_cast<size_t>(capacities.max_hull_verts) * 3u;
+        hull_verts.size() <= static_cast<size_t>(capacities.max_hull_verts) * 3u &&
+        mesh_surface_info.size() <= capacities.ElementCount(FieldId::MeshSurfaceInfo) &&
+        mesh_triangles.size() <= static_cast<size_t>(capacities.max_mesh_triangles) * 3u &&
+        mesh_bvh_nodes.size() <= capacities.max_mesh_bvh_nodes;
     assert(capacities_ok && "cooked table exceeds its capacity -> would truncate");
     if (!capacities_ok) {
         return phi::Status::Failed;
+    }
+    const collision::MeshSurfaceView mesh_view{hull_verts.data(), mesh_triangles.data(),
+        mesh_bvh_nodes.data(), {static_cast<uint32_t>(hull_verts.size() / 3u),
+            static_cast<uint32_t>(mesh_triangles.size() / 3u),
+            static_cast<uint32_t>(mesh_bvh_nodes.size())}};
+    if (mesh_triangles.size() % 3u != 0u) return phi::Status::InvalidArgument;
+    for (const auto& info : mesh_surface_info) {
+        if (info.triangle_count == 0u && info.node_count == 0u) continue;
+        if (!collision::MeshSurfaceRangeValid(mesh_view, info)) return phi::Status::InvalidArgument;
+        std::vector<uint8_t> seen(info.triangle_count, 0u);
+        uint32_t leaves = 0u;
+        const auto contains = [](const collision::MeshBvhNode& node, math::Vec3 p) {
+            return p.x >= node.lower.x && p.x <= node.upper.x &&
+                   p.y >= node.lower.y && p.y <= node.upper.y &&
+                   p.z >= node.lower.z && p.z <= node.upper.z;
+        };
+        for (uint32_t n = 0u; n < info.node_count; ++n) {
+            const auto& node = mesh_bvh_nodes[info.node_offset + n];
+            if (node.escape <= n || node.escape > info.node_count ||
+                !contains(node, node.lower) || !contains(node, node.upper))
+                return phi::Status::InvalidArgument;
+            if (node.triangle == ~0u) {
+                if (n + 1u >= info.node_count) return phi::Status::InvalidArgument;
+                const auto& left = mesh_bvh_nodes[info.node_offset + n + 1u];
+                if (left.escape >= info.node_count || left.escape <= n + 1u)
+                    return phi::Status::InvalidArgument;
+                const auto& right = mesh_bvh_nodes[info.node_offset + left.escape];
+                if (right.escape != node.escape || !contains(node, left.lower) ||
+                    !contains(node, left.upper) || !contains(node, right.lower) ||
+                    !contains(node, right.upper)) return phi::Status::InvalidArgument;
+            } else {
+                math::Vec3 a, b, c;
+                if (node.escape != n + 1u ||
+                    !collision::MeshSurfaceTriangle(mesh_view, info, node.triangle, a, b, c) ||
+                    seen[node.triangle] || !contains(node, a) || !contains(node, b) || !contains(node, c))
+                    return phi::Status::InvalidArgument;
+                seen[node.triangle] = 1u;
+                ++leaves;
+            }
+        }
+        if (leaves != info.triangle_count) return phi::Status::InvalidArgument;
     }
     // Enforce the excluded-pairs contract AT THE STAGING BOUNDARY: the device
     // pair-query binary-searches this list, so it MUST be ascending + unique.
@@ -1350,6 +1414,9 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.osc_task_link = src.osc_task_link;
     dst.particles = std::move(src.particles);  // M6 particle cook product.
     dst.hull_verts = std::move(src.hull_verts);
+    dst.mesh_surface_info = std::move(src.mesh_surface_info);
+    dst.mesh_triangles = std::move(src.mesh_triangles);
+    dst.mesh_bvh_nodes = std::move(src.mesh_bvh_nodes);
     // L1-c: union_slots / table_enabled_default copies were removed; union_solref/
     // union_solimp renamed to the general path's contact_solref/contact_solimp.
     for (int k = 0; k < 2; ++k) dst.contact_solref[k] = src.contact_solref[k];

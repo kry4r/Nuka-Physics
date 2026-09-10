@@ -29,6 +29,7 @@
 #include "phi/op_schema.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
 #include "scene/cook/cook_to_model.hpp"
+#include "../import/vhacd_test_meshes.hpp"
 
 namespace {
 
@@ -214,7 +215,8 @@ void AddBoxSdf(nk::Model& m, int32_t body_id, float half) {
 
 // Heavy free box above the pool + a far immovable filler (>= 2 bodies for the LBVH),
 // cooked on top of the fluid via the sim_method=mlsmpm selector.
-nk::Model BuildPoolWithBodyModel(bool with_sdf, bool proxy, uint32_t env_count) {
+nk::Model BuildPoolWithBodyModel(bool with_sdf, bool proxy, uint32_t env_count,
+                               bool triangle_surface = false) {
     nk::Model m;
     m.capacities.env_count = env_count;
 
@@ -233,6 +235,30 @@ nk::Model BuildPoolWithBodyModel(bool with_sdf, bool proxy, uint32_t env_count) 
     bf.inv_mass = 0.0f; bf.inv_inertia = Vec3{0, 0, 0};
     m.body_init.push_back(bf);
     AddBoxSdf(m, 1, 0.05f);
+
+    if (triangle_surface) {
+        nuka::scene::SceneIR scene;
+        for (uint32_t body = 0u; body < 2u; ++body) {
+            nuka::scene::RigidBodyRecord record;
+            record.local_transform = m.body_init[body].pose;
+            record.mass = body == 0u ? kBoxMass : 0.0f;
+            record.is_static = body != 0u;
+            record.inertia = {I, I, I};
+            const auto id = scene.AddRigidBody(record);
+            nuka::scene::CollisionShapeRecord shape;
+            shape.body_id = id;
+            shape.type = body == 0u ? nuka::scene::ShapeType::TriMesh : nuka::scene::ShapeType::Box;
+            shape.half_extents = {0.05f, 0.05f, 0.05f};
+            if (body == 0u) {
+                auto mesh = nuka::test::UnitCubeMesh();
+                for (float& v : mesh.vertices) v *= 2.0f * kBoxHalf;
+                shape.mesh_vertices = std::move(mesh.vertices);
+                shape.mesh_indices = std::move(mesh.indices);
+            }
+            scene.AddCollisionShape(shape);
+        }
+        m = std::move(cook::CookSceneToModel(scene, static_cast<int>(env_count), {}).model);
+    }
 
     if (!with_sdf) {
         m.sdf_grids.clear();
@@ -257,6 +283,15 @@ nk::Model BuildPoolWithBodyModel(bool with_sdf, bool proxy, uint32_t env_count) 
         m.body_collidable_link.assign(m.body_init.size(), ~0u);
         m.body_collidable_local.assign(m.body_init.size(), Transform::Identity());
         m.body_collidable_local.back().position = offset;
+        if (!m.mesh_surface_info.empty()) {
+            const auto surface = m.mesh_surface_info[0];
+            m.mesh_surface_info.resize(m.body_init.size());
+            m.mesh_surface_info.back() = surface;
+            const uint32_t sample_offset = m.samp_ranges[0], sample_count = m.samp_ranges[1];
+            m.samp_ranges.resize(m.body_init.size() * 2u, 0u);
+            m.samp_ranges[m.samp_ranges.size() - 2u] = sample_offset;
+            m.samp_ranges.back() = sample_count;
+        }
     }
 
     nk::ModelCapacities& cap = m.capacities;
@@ -442,10 +477,10 @@ TEST(MpmFluidRest, HeavyBodyIntoPoolDeceleratesAndReacts) {
     constexpr uint32_t kEnvs = 2u;
     constexpr uint32_t kSteps = 240u;
     const float dt = Cfg().dt;
-    for (uint32_t representation = 0u; representation < 3u; ++representation) {
+    for (uint32_t representation = 0u; representation < 5u; ++representation) {
         SCOPED_TRACE(representation);
-        const bool proxy = representation == 2u;
-        nk::Model m = BuildPoolWithBodyModel(representation == 0u, proxy, kEnvs);
+        const bool proxy = representation == 2u || representation == 4u;
+        nk::Model m = BuildPoolWithBodyModel(representation == 0u, proxy, kEnvs, representation >= 3u);
         const uint32_t P = m.capacities.particles_per_env;
         const uint32_t B = m.capacities.bodies_per_env;
         const Vec3 com_local = m.body_init[0].inertial_frame.position;

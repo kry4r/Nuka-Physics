@@ -183,13 +183,8 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
     return static_cast<uint32_t>(buckets.size() - 1u);
 }
 
-// SAMP cook : build the SDF sampling-point set for one convex-hull
-// piece — the hull vertices PLUS each triangle edge's midpoint (so a coarse hull
-// still samples the SDF densely along its silhouette). Edge midpoints are
-// de-duplicated by the canonical (min,max) vertex pair so a shared edge is
-// emitted once (deterministic; ascending edge order). Appends xyz triples to
-// `out` and returns the count added (the per-body samp_range count). nka
-// EncodeSamples writes this exact xyz pool to the .nka SAMP chunk.
+// Surface samples comprise the vertices and unique edge midpoints.
+// Edges use ascending canonical vertex pairs, independent of triangle order.
 uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
                          std::vector<float>& out) {
     if (piece >= geo.Count()) return 0u;
@@ -207,25 +202,26 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
     }
     // 2. unique triangle-edge midpoints (canonical (lo,hi) dedup, ascending).
     std::vector<uint64_t> seen;
+    seen.reserve(icnt);
     auto edge_key = [](uint32_t a, uint32_t b) -> uint64_t {
         const uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
         return (static_cast<uint64_t>(lo) << 32) | hi;
-    };
-    auto add_edge = [&](uint32_t a, uint32_t b) {
-        const uint64_t k = edge_key(a, b);
-        if (std::find(seen.begin(), seen.end(), k) != seen.end()) return;
-        seen.push_back(k);
-        const size_t pa = (static_cast<size_t>(voff) + a) * 3u;
-        const size_t pb = (static_cast<size_t>(voff) + b) * 3u;
-        out.push_back(0.5f * (geo.vertices[pa + 0] + geo.vertices[pb + 0]));
-        out.push_back(0.5f * (geo.vertices[pa + 1] + geo.vertices[pb + 1]));
-        out.push_back(0.5f * (geo.vertices[pa + 2] + geo.vertices[pb + 2]));
     };
     for (uint32_t t = 0; t + 2 < icnt; t += 3u) {
         const uint32_t i0 = geo.indices[ioff + t + 0];
         const uint32_t i1 = geo.indices[ioff + t + 1];
         const uint32_t i2 = geo.indices[ioff + t + 2];
-        add_edge(i0, i1); add_edge(i1, i2); add_edge(i2, i0);
+        seen.push_back(edge_key(i0, i1));
+        seen.push_back(edge_key(i1, i2));
+        seen.push_back(edge_key(i2, i0));
+    }
+    std::sort(seen.begin(), seen.end());
+    seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+    for (const uint64_t edge : seen) {
+        const size_t pa = (static_cast<size_t>(voff) + static_cast<uint32_t>(edge >> 32u)) * 3u;
+        const size_t pb = (static_cast<size_t>(voff) + static_cast<uint32_t>(edge)) * 3u;
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            out.push_back(0.5f * (geo.vertices[pa + axis] + geo.vertices[pb + axis]));
     }
     return static_cast<uint32_t>(out.size() / 3u) - start;
 }
@@ -307,6 +303,65 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     nk::ModelCapacities& cap = model.capacities;
     cap.env_count = envs;
     cap.bodies_per_env = blob.body_count;
+    struct MeshBinding {
+        collision::MeshSurfaceInfo info{};
+        uint32_t sample_offset = 0u;
+        uint32_t sample_count = 0u;
+        float radius = 0.0f;
+        math::Vec3 extents{};
+    };
+    std::vector<MeshBinding> mesh_bindings(blob.convex_geometry.Count());
+    const auto bind_mesh = [&](const nk::ModelShape& shape,
+                               nk::Model::PairDrivenShape& row, uint32_t body) {
+        const uint32_t piece = shape.convex_geometry_index;
+        const auto& geometry = blob.convex_geometry;
+        if (piece >= geometry.Count()) return;
+        if (piece >= geometry.surface_info.size())
+            throw std::runtime_error("CookToModel: collision mesh has no surface topology");
+        auto& binding = mesh_bindings[piece];
+        if (binding.info.node_count == 0u) {
+            const auto& source = geometry.surface_info[piece];
+            binding.info = source;
+            binding.info.vertex_offset = static_cast<uint32_t>(model.hull_verts.size() / 3u);
+            binding.info.triangle_offset = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
+            binding.info.node_offset = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+            for (uint32_t v = 0u; v < source.vertex_count; ++v) {
+                const size_t at = (static_cast<size_t>(source.vertex_offset) + v) * 3u;
+                const math::Vec3 p{geometry.vertices[at], geometry.vertices[at + 1u],
+                                    geometry.vertices[at + 2u]};
+                binding.radius = std::max(binding.radius, std::sqrt(p.LengthSq()));
+                binding.extents.x = std::max(binding.extents.x, std::fabs(p.x));
+                binding.extents.y = std::max(binding.extents.y, std::fabs(p.y));
+                binding.extents.z = std::max(binding.extents.z, std::fabs(p.z));
+                model.hull_verts.insert(model.hull_verts.end(), {p.x, p.y, p.z});
+            }
+            const size_t triangle_begin = static_cast<size_t>(source.triangle_offset) * 3u;
+            model.mesh_triangles.insert(model.mesh_triangles.end(),
+                geometry.indices.begin() + triangle_begin,
+                geometry.indices.begin() + triangle_begin + static_cast<size_t>(source.triangle_count) * 3u);
+            model.mesh_bvh_nodes.insert(model.mesh_bvh_nodes.end(),
+                geometry.surface_nodes.begin() + source.node_offset,
+                geometry.surface_nodes.begin() + source.node_offset + source.node_count);
+            binding.sample_offset = static_cast<uint32_t>(model.samp_points.size() / 3u);
+            binding.sample_count = CookHullSamples(geometry, piece, model.samp_points);
+            cap.max_mesh_triangles = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
+            cap.max_mesh_bvh_nodes = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+        }
+        if (model.mesh_surface_info.size() <= body) model.mesh_surface_info.resize(body + 1u);
+        model.mesh_surface_info[body] = binding.info;
+        if (model.samp_ranges.size() < static_cast<size_t>(body + 1u) * 2u)
+            model.samp_ranges.resize(static_cast<size_t>(body + 1u) * 2u, 0u);
+        model.samp_ranges[body * 2u] = binding.sample_offset;
+        model.samp_ranges[body * 2u + 1u] = binding.sample_count;
+        row.hull_vert_offset = binding.info.vertex_offset;
+        row.hull_vert_count = binding.info.vertex_count;
+        row.params[0] = binding.radius;
+        row.params[1] = binding.extents.x;
+        row.params[2] = binding.extents.y;
+        row.params[3] = binding.extents.z;
+        if (piece < blob.sdfs.piece_sdf_indices.size())
+            row.sdf_grid = blob.sdfs.piece_sdf_indices[piece];
+    };
     // obs_width is derived from the cooked observable dimensionality below, once
     // links_per_env is known (ExportObs layout: base pose + q + qdot per link).
 
@@ -842,6 +897,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // shape_table: one row per body, from its FIRST shape's primitive + the
         // contype/conaffinity (from the cooked filter groups when present).
         model.shape_table_rows.assign(cap.bodies_per_env, {});
+        model.samp_ranges.assign(static_cast<size_t>(cap.bodies_per_env) * 2u, 0u);
         // Per body, pick its first COLLIDING shape (contype/conaffinity != 0).
         // A visual-only body remains an empty row rather than becoming a phantom
         // collidable; its render geom is intentionally not used for physics.
@@ -908,39 +964,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 row.params[1] = sh.half_extents.y;
                 row.params[2] = sh.half_extents.z;
             }
-            // Hull / mesh rows: params[0] = the BOUND RADIUS (max |vertex| of
-            // the cooked convex piece) — the broadphase AABB is a conservative
-            // bound sphere (review fix: the default 0.5 sphere radius was
-            // unrelated to the actual hull extent). : ALSO pack this
-            // piece's MESH-LOCAL verts into the concatenated model.hull_verts pool
-            // and record the row's (hull_vert_offset, hull_vert_count) slice so the
-            // cvx narrowphase collides THIS shape's hull (not one global hull).
-            if ((sh.kind == static_cast<uint8_t>(ShapeType::ConvexHull) ||
-                 sh.kind == static_cast<uint8_t>(ShapeType::TriMesh)) &&
-                sh.convex_geometry_index != ~uint32_t(0) &&
-                sh.convex_geometry_index < blob.convex_geometry.Count()) {
-                const CookedConvexGeometry& g = blob.convex_geometry;
-                const uint32_t piece = sh.convex_geometry_index;
-                const uint32_t voff = g.vertex_offsets[piece];
-                const uint32_t vcnt = g.vertex_counts[piece];
-                const uint32_t hull_base =
-                    static_cast<uint32_t>(model.hull_verts.size() / 3u);
-                float max_sq = 0.0f;
-                for (uint32_t v = 0; v < vcnt; ++v) {
-                    const size_t at = (static_cast<size_t>(voff) + v) * 3u;
-                    const float x = g.vertices[at + 0];
-                    const float y = g.vertices[at + 1];
-                    const float z = g.vertices[at + 2];
-                    const float d = x * x + y * y + z * z;
-                    if (d > max_sq) max_sq = d;
-                    model.hull_verts.push_back(x);
-                    model.hull_verts.push_back(y);
-                    model.hull_verts.push_back(z);
-                }
-                row.params[0] = std::sqrt(max_sq);
-                row.hull_vert_offset = hull_base;
-                row.hull_vert_count = vcnt;
-            }
+            bind_mesh(sh, row, b);
             // contype/conaffinity from the cooked per-shape values (the MuJoCo
             // bitmask the broadphase tests), NOT a blanket collide-all -- a
             // visual-only geom (contype 0) must stay non-colliding.
@@ -955,7 +979,6 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 row.contype = 0u;
                 row.conaffinity = 0u;
             }
-            row.sdf_grid = ~0u;  // resolved below if the piece has a cooked SDF.
             // R1 (general contact pipeline): the shape->body indirection.
             // A cooked collidable row maps to its OWNING body row (never static
             // here — static collidables are emitted separately, R5). group 0 ==
@@ -966,13 +989,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             row.contact_profile_index = sh.material_bucket;
         }
 
-        // SDF grids: mirror the cooked CookedSdfTable into the Model SDF tables;
-        // for each SdfMesh / ConvexHull shape carrying a cooked SDF, build the
-        // sampling-point set (CookHullSamples) and bind the body's samp_range +
-        // (for the OTHER body) the sdf_grid index.
+        // Distance fields retain their explicit cooked identity.
         const CookedSdfTable& sdf = blob.sdfs;
-        const CookedConvexGeometry& geo = blob.convex_geometry;
-        model.samp_ranges.assign(static_cast<size_t>(cap.bodies_per_env) * 2u, 0u);
         if (sdf.Count() > 0) {
             // Concatenate the cooked SDF grids into the Model device tables.
             model.sdf_grids.reserve(sdf.Count());
@@ -994,38 +1012,6 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                     model.sdf_cell_gradients.push_back(sdf.cell_gradients[off + c]);
                 }
                 cell_cursor += grid.cell_count;
-            }
-        }
-        // Samples and SDFs belong to the selected collidable, not another shape
-        // or visual mesh attached to the same dynamics body.
-        for (uint32_t b = 0u; b < cap.bodies_per_env; ++b) {
-            if (body_shape[b] == ~0u || body_proxied[b] != 0u) continue;
-            const auto& sh = model.shapes[body_shape[b]];
-            if (sh.kind != collision::kShapeConvexHull && sh.kind != collision::kShapeSdfMesh)
-                continue;
-            const uint32_t cgi = sh.convex_geometry_index;
-            if (cgi >= geo.Count()) continue;
-            const uint32_t before = static_cast<uint32_t>(model.samp_points.size() / 3u);
-            const uint32_t added = CookHullSamples(geo, cgi, model.samp_points);
-            model.samp_ranges[b * 2u] = before;
-            model.samp_ranges[b * 2u + 1u] = added;
-            if (cgi < sdf.piece_sdf_indices.size())
-                model.shape_table_rows[b].sdf_grid = sdf.piece_sdf_indices[cgi];
-        }
-        if (sdf.Count() > 0u) {
-            // Visual silhouettes may supply an unbound mesh collider, never replace
-            // an authored primitive or an SDF already bound to collision geometry.
-            for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
-                if (b >= sdf.body_sdf_indices.size()) break;
-                const uint32_t gi = sdf.body_sdf_indices[b];
-                if (gi == kNoSdf || b >= model.shape_table_rows.size()) continue;
-                const auto& shape = model.shape_table_rows[b];
-                if (shape.kind != ::nuka::collision::kShapeSdfMesh || shape.sdf_grid != kNoSdf)
-                    continue;
-                model.shape_table_rows[b].sdf_grid = gi;
-                // Populate the orphaned ModelShape.sdf_index for this body's rows.
-                for (nk::ModelShape& msh : model.shapes)
-                    if (msh.body_row == b) msh.sdf_index = gi;
             }
         }
         cap.max_samp_points = static_cast<uint32_t>(model.samp_points.size() / 3u);
@@ -1182,41 +1168,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             prow.body_id = static_cast<int32_t>(row);
             prow.group = 0u;
             prow.contact_profile_index = sh.material_bucket;
-            // Hull / mesh proxy: pack THIS piece's mesh-local verts into the shared
-            // pool and bound the broadphase sphere by the max vertex radius (the
-            // same treatment the owner-row path gives a hull).
-            if ((sh.kind == static_cast<uint8_t>(ShapeType::ConvexHull) ||
-                 sh.kind == static_cast<uint8_t>(ShapeType::TriMesh)) &&
-                sh.convex_geometry_index != ~uint32_t(0) &&
-                sh.convex_geometry_index < blob.convex_geometry.Count()) {
-                const CookedConvexGeometry& g = blob.convex_geometry;
-                const uint32_t piece = sh.convex_geometry_index;
-                const uint32_t voff = g.vertex_offsets[piece];
-                const uint32_t vcnt = g.vertex_counts[piece];
-                const uint32_t hull_base =
-                    static_cast<uint32_t>(model.hull_verts.size() / 3u);
-                float max_sq = 0.0f;
-                for (uint32_t v = 0; v < vcnt; ++v) {
-                    const size_t at = (static_cast<size_t>(voff) + v) * 3u;
-                    const float x = g.vertices[at + 0];
-                    const float y = g.vertices[at + 1];
-                    const float z = g.vertices[at + 2];
-                    const float d = x * x + y * y + z * z;
-                    if (d > max_sq) max_sq = d;
-                    model.hull_verts.push_back(x);
-                    model.hull_verts.push_back(y);
-                    model.hull_verts.push_back(z);
-                }
-                prow.params[0] = std::sqrt(max_sq);
-                prow.hull_vert_offset = hull_base;
-                prow.hull_vert_count = vcnt;
-                const uint32_t sample_base = static_cast<uint32_t>(model.samp_points.size() / 3u);
-                const uint32_t sample_count = CookHullSamples(g, piece, model.samp_points);
-                model.samp_ranges[row * 2u] = sample_base;
-                model.samp_ranges[row * 2u + 1u] = sample_count;
-                if (piece < blob.sdfs.piece_sdf_indices.size())
-                    prow.sdf_grid = blob.sdfs.piece_sdf_indices[piece];
-            }
+            bind_mesh(sh, prow, row);
             model.shape_table_rows[row] = prow;
 
             // Inverse maps (reaction -> owner) + pose binding + material + freeze.

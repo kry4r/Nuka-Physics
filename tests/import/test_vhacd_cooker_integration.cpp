@@ -1,17 +1,13 @@
-// ---------------------------------------------------------------------------
-// Tests for the cooker integration of V-HACD (CookScene -> ConvexHull rows)
-// ---------------------------------------------------------------------------
-// Validates deliverable 6: a mesh CollisionShapeRecord flagged for
-// decomposition, when cooked, expands into N ShapeType::ConvexHull rows whose
-// geometry lands in CookedBlob::convex_geometry. skip => 1 ConvexHull (its own
-// hull); non-mesh shapes pass through unchanged.
-// ---------------------------------------------------------------------------
+// Mesh cooking preserves source surfaces or emits explicitly requested convex pieces.
 
 #include "scene/cooker.hpp"
 #include "scene/scene_ir.hpp"
 #include "tests/import/vhacd_test_meshes.hpp"
+#include "collision/mesh_surface.hpp"
+#include "collision/primitive_surface.hpp"
 
 #include <gtest/gtest.h>
+#include <stdexcept>
 
 namespace {
 
@@ -77,9 +73,7 @@ TEST(VhacdCookerIntegration, ForceDecomposeExpandsToMultipleConvexHullRows) {
     }
 }
 
-// C1-batch review IMPORTANT-2: a source mesh that V-HACDs into N>1 pieces must
-// yield N PARALLEL CookedContactParamTable rows, each carrying the SOURCE geom's
-// contact metadata (the folded PushShapeRow keeps the two tables in lockstep).
+// Every decomposed piece inherits the source shape's contact parameters.
 TEST(VhacdCookerIntegration, ContactParamsParallelAndPropagatedAcrossPieces) {
     SceneIR scene;
     const auto body = AddDynamicBody(scene);
@@ -124,7 +118,7 @@ TEST(VhacdCookerIntegration, ContactParamsParallelAndPropagatedAcrossPieces) {
     }
 }
 
-TEST(VhacdCookerIntegration, SkipStoresSingleConvexHullWithSourceGeometry) {
+TEST(VhacdCookerIntegration, SkipPreservesTriangleSurfaceAndInterior) {
     SceneIR scene;
     const auto body = AddDynamicBody(scene);
 
@@ -140,7 +134,7 @@ TEST(VhacdCookerIntegration, SkipStoresSingleConvexHullWithSourceGeometry) {
     const auto blob = CookScene(scene);
 
     ASSERT_EQ(blob.shape_count, 1u);
-    EXPECT_EQ(blob.shapes.types[0], ShapeType::ConvexHull);
+    EXPECT_EQ(blob.shapes.types[0], ShapeType::TriMesh);
     const uint32_t gi = blob.shapes.convex_geometry_indices[0];
     ASSERT_NE(gi, kNoConvexGeometry);
     // Skip stores the source mesh verbatim (no V-HACD), so vertex count matches.
@@ -148,6 +142,29 @@ TEST(VhacdCookerIntegration, SkipStoresSingleConvexHullWithSourceGeometry) {
               static_cast<uint32_t>(mesh.vertices.size() / 3));
     EXPECT_EQ(blob.convex_geometry.index_counts[gi],
               static_cast<uint32_t>(mesh.indices.size()));
+    const auto& geometry = blob.convex_geometry;
+    const nuka::collision::MeshSurfaceView view{geometry.vertices.data(), geometry.indices.data(),
+        geometry.surface_nodes.data(), {static_cast<uint32_t>(geometry.vertices.size() / 3u),
+            static_cast<uint32_t>(geometry.indices.size() / 3u),
+            static_cast<uint32_t>(geometry.surface_nodes.size())}};
+    ASSERT_EQ(geometry.surface_info[gi].flags, nuka::collision::kMeshSurfaceClosed);
+    for (float x : {-0.75f, -0.5f, -0.25f, 0.0f, 0.25f, 0.5f, 0.75f})
+        for (float y : {-0.5f, -0.25f, 0.0f, 0.25f, 0.5f})
+            for (float z : {-0.5f, -0.25f, 0.0f, 0.25f, 0.5f}) {
+                const nuka::math::Vec3 p{x, y, z};
+                const auto exact = nuka::collision::QueryPrimitiveSurface(
+                    nuka::collision::kShapeBox, {0.5f, 0.5f, 0.5f}, p);
+                const auto surface = nuka::collision::QueryMeshSurface(view, geometry.surface_info[gi], p);
+                ASSERT_TRUE(surface.valid);
+                EXPECT_NEAR(surface.distance, exact.distance, 2e-6f) << x << ',' << y << ',' << z;
+                EXPECT_NEAR(surface.normal.Length(), 1.0f, 2e-6f);
+                EXPECT_LT((surface.point + surface.normal * surface.distance - p).Length(), 2e-6f);
+                nuka::math::Vec3 a, b, c;
+                ASSERT_TRUE(nuka::collision::MeshSurfaceTriangle(view, geometry.surface_info[gi],
+                    surface.triangle, a, b, c));
+                EXPECT_LT((a * surface.barycentric.x + b * surface.barycentric.y +
+                    c * surface.barycentric.z - surface.point).Length(), 2e-6f);
+            }
 }
 
 TEST(VhacdCookerIntegration, NonMeshShapesPassThroughUnchanged) {
@@ -168,23 +185,26 @@ TEST(VhacdCookerIntegration, NonMeshShapesPassThroughUnchanged) {
     EXPECT_EQ(blob.convex_geometry.Count(), 0u);
 }
 
-TEST(VhacdCookerIntegration, MeshWithoutGeometryPassesThroughAsIs) {
-    SceneIR scene;
-    const auto body = AddDynamicBody(scene);
-
-    // A TriMesh shape flagged Force but carrying no geometry (the importer path
-    // today): must NOT crash and must pass through as a single TriMesh row.
-    CollisionShapeRecord shape;
-    shape.body_id = body;
-    shape.type = ShapeType::TriMesh;
-    shape.decompose_mode = DecomposeMode::Force;
-    scene.AddCollisionShape(std::move(shape));
-
-    const auto blob = CookScene(scene);
-
-    ASSERT_EQ(blob.shape_count, 1u);
-    EXPECT_EQ(blob.shapes.types[0], ShapeType::TriMesh);
-    EXPECT_EQ(blob.shapes.convex_geometry_indices[0], kNoConvexGeometry);
+TEST(VhacdCookerIntegration, RejectsMissingCollisionMeshGeometry) {
+    for (auto mode : {DecomposeMode::Auto, DecomposeMode::Force, DecomposeMode::Skip}) {
+        SceneIR scene;
+        CollisionShapeRecord shape;
+        shape.body_id = AddDynamicBody(scene);
+        shape.type = ShapeType::TriMesh;
+        shape.decompose_mode = mode;
+        const auto id = scene.AddCollisionShape(std::move(shape));
+        EXPECT_THROW(CookScene(scene), std::invalid_argument);
+        scene.GetShapeMut(id).mesh_vertices = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        EXPECT_THROW(CookScene(scene), std::invalid_argument);
+        scene.GetShapeMut(id).mesh_vertices.clear();
+        scene.GetShapeMut(id).mesh_indices = {0u, 1u, 2u};
+        EXPECT_THROW(CookScene(scene), std::invalid_argument);
+        scene.GetShapeMut(id).contype = 0u;
+        scene.GetShapeMut(id).conaffinity = 0u;
+        const auto blob = CookScene(scene);
+        ASSERT_EQ(blob.shape_count, 1u);
+        EXPECT_EQ(blob.shapes.convex_geometry_indices[0], kNoConvexGeometry);
+    }
 }
 
 } // namespace

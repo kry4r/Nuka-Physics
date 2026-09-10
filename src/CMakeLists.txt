@@ -41,6 +41,7 @@ target_include_directories(nuka_math
 # SYSTEM include path and by omitting the strict flag set on this TU.
 add_library(nuka_cooker STATIC
     import/cooker/convex_decomposition.cpp
+    import/cooker/mesh_surface_cooker.cpp
     # v0.7 p07: narrow-band sparse SDF cooker (HOST CPU; the cooked SDF is a
     # byte-reproducible golden, so it runs on the deterministic host path rather
     # than taking the cook-time GPU exception). The runtime query header
