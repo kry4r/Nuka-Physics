@@ -42,6 +42,9 @@ target_include_directories(nuka_math
 add_library(nuka_cooker STATIC
     import/cooker/convex_decomposition.cpp
     import/cooker/mesh_surface_cooker.cpp
+    import/cooker/mesh_surface_cache.cpp
+    import/cooker/mesh_query_backend.cpp
+    import/cooker/convex_cover.cpp
     # v0.7 p07: narrow-band sparse SDF cooker (HOST CPU; the cooked SDF is a
     # byte-reproducible golden, so it runs on the deterministic host path rather
     # than taking the cook-time GPU exception). The runtime query header
@@ -52,6 +55,13 @@ add_library(nuka_cooker STATIC
     import/cooker/sdf_bake_backend.cpp
 )
 set_target_properties(nuka_cooker PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(CMAKE_CUDA_COMPILER)
+    target_sources(nuka_cooker PRIVATE phi/backend_cuda/cooking/mesh_query.cu)
+    target_compile_definitions(nuka_cooker PRIVATE NUKA_COOKER_HAS_CUDA=1)
+    target_link_libraries(nuka_cooker PRIVATE CUDA::cudart)
+    set_target_properties(nuka_cooker PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+endif()
 
 target_include_directories(nuka_cooker
     PUBLIC

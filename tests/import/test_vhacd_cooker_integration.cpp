@@ -7,6 +7,9 @@
 #include "collision/primitive_surface.hpp"
 
 #include <gtest/gtest.h>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 
 namespace {
@@ -204,6 +207,110 @@ TEST(VhacdCookerIntegration, RejectsMissingCollisionMeshGeometry) {
         const auto blob = CookScene(scene);
         ASSERT_EQ(blob.shape_count, 1u);
         EXPECT_EQ(blob.shapes.convex_geometry_indices[0], kNoConvexGeometry);
+    }
+}
+
+TEST(VhacdCookerIntegration, AutoCookPreservesExactSurfaceAcrossDevicesCachesAndBudgets) {
+    namespace cooker = nuka::import::cooker;
+    namespace collision = nuka::collision;
+    nuka::test::TestMesh mesh;
+    const float polygon[6][2] = {{0, 0}, {3, 0}, {3, 1}, {1, 1}, {1, 3}, {0, 3}};
+    for (float z : {0.0f, 1.0f})
+        for (const auto& point : polygon)
+            mesh.vertices.insert(mesh.vertices.end(), {point[0], point[1], z});
+    for (uint32_t i = 1u; i < 5u; ++i)
+        mesh.indices.insert(mesh.indices.end(), {0u, i + 1u, i, 6u, i + 6u, i + 7u});
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        const uint32_t j = (i + 1u) % 6u;
+        mesh.indices.insert(mesh.indices.end(), {i, j, j + 6u, i, j + 6u, i + 6u});
+    }
+    const auto raw = cooker::CookMeshSurface(mesh.vertices.data(),
+        static_cast<uint32_t>(mesh.vertices.size() / 3u), mesh.indices.data(),
+        static_cast<uint32_t>(mesh.indices.size() / 3u));
+    const collision::MeshSurfaceView reference{mesh.vertices.data(), mesh.indices.data(),
+        raw.nodes.data(), {raw.info.vertex_count, raw.info.triangle_count, raw.info.node_count}};
+    SceneIR scene;
+    for (uint32_t instance = 0u; instance < 2u; ++instance) {
+        CollisionShapeRecord shape;
+        shape.body_id = AddDynamicBody(scene);
+        shape.type = ShapeType::TriMesh;
+        shape.mesh_vertices = mesh.vertices;
+        shape.mesh_indices = mesh.indices;
+        scene.AddCollisionShape(std::move(shape));
+    }
+    struct CacheDirectory {
+        std::filesystem::path path;
+        ~CacheDirectory() {
+            std::error_code error;
+            for (const auto& file : std::filesystem::directory_iterator(path, error))
+                if (file.is_regular_file(error)) std::filesystem::remove(file.path(), error);
+            std::filesystem::remove(path, error);
+        }
+    };
+    for (bool allow_device : {false, true}) {
+        SCOPED_TRACE(allow_device);
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        CacheDirectory cache{std::filesystem::temp_directory_path() /
+            ("nuka_surface_cook_" + std::to_string(stamp))};
+        nuka::scene::CookSceneOptions options;
+        options.bake_sdf = false;
+        options.mesh_surface.allow_device = allow_device;
+        options.mesh_surface.cache_directory = cache.path.string();
+        const auto cold = CookScene(scene, options);
+        ASSERT_EQ(cold.body_count, 2u);
+        ASSERT_EQ(cold.shape_count, 2u);
+        ASSERT_EQ(cold.convex_geometry.Count(), 1u);
+        EXPECT_NE(cold.shapes.body_ids[0], cold.shapes.body_ids[1]);
+        EXPECT_EQ(cold.shapes.convex_geometry_indices[0], cold.shapes.convex_geometry_indices[1]);
+        const auto verify = [&](const nuka::scene::CookedBlob& blob) {
+            const auto& geometry = blob.convex_geometry;
+            EXPECT_EQ(geometry.vertices, mesh.vertices);
+            EXPECT_EQ(geometry.indices, mesh.indices);
+            EXPECT_EQ(blob.shapes.types[0], ShapeType::TriMesh);
+            const auto& info = geometry.surface_info[0];
+            const collision::MeshSurfaceView view{geometry.vertices.data(), geometry.indices.data(),
+                geometry.surface_nodes.data(), {info.vertex_count, info.triangle_count, info.node_count}};
+            ASSERT_TRUE(cooker::MeshSurfaceTreeValid(view, info));
+            for (int x = -2; x <= 10; ++x)
+                for (int y = -2; y <= 10; ++y)
+                    for (int z = -2; z <= 10; ++z) {
+                        const nuka::math::Vec3 point{float(x) * 0.25f, float(y) * 0.25f, float(z) * 0.25f};
+                        const auto expected = collision::QueryMeshSurface(reference, raw.info, point);
+                        const auto actual = collision::QueryMeshSurface(view, info, point);
+                        ASSERT_TRUE(actual.valid);
+                        EXPECT_FLOAT_EQ(actual.distance, expected.distance);
+                        EXPECT_EQ(actual.triangle, expected.triangle);
+                        EXPECT_EQ(actual.feature, expected.feature);
+                        EXPECT_FLOAT_EQ(actual.normal.x, expected.normal.x);
+                        EXPECT_FLOAT_EQ(actual.normal.y, expected.normal.y);
+                        EXPECT_FLOAT_EQ(actual.normal.z, expected.normal.z);
+                    }
+        };
+        const auto& cover = cold.convex_geometry.surface_covers[0];
+        ASSERT_EQ(cover.status, cooker::ConvexCoverStatus::Complete) << cover.reason;
+        EXPECT_GE(cover.parts.size(), 2u);
+        EXPECT_EQ(cover.backend, cooker::MeshQueryBackendName(allow_device));
+        EXPECT_GT(cover.query_points, 0u);
+        verify(cold);
+        const auto warm = CookScene(scene, options);
+        ASSERT_EQ(warm.convex_geometry.surface_cache_hits[0], 1u);
+        verify(warm);
+        {
+            std::ofstream corrupt(cache.path / (cold.convex_geometry.surface_cache_keys[0] + ".nukasurf"),
+                                  std::ios::binary | std::ios::trunc);
+            corrupt << "invalid surface artifact";
+        }
+        const auto repaired = CookScene(scene, options);
+        EXPECT_EQ(repaired.convex_geometry.surface_cache_hits[0], 0u);
+        verify(repaired);
+        EXPECT_EQ(CookScene(scene, options).convex_geometry.surface_cache_hits[0], 1u);
+        options.mesh_surface.cover.max_operations = 1u;
+        const auto bounded = CookScene(scene, options);
+        ASSERT_EQ(bounded.convex_geometry.surface_covers[0].status,
+                  cooker::ConvexCoverStatus::BudgetExceeded);
+        EXPECT_TRUE(bounded.convex_geometry.surface_covers[0].parts.empty());
+        EXPECT_NE(bounded.convex_geometry.surface_cache_keys[0], cold.convex_geometry.surface_cache_keys[0]);
+        verify(bounded);
     }
 }
 
