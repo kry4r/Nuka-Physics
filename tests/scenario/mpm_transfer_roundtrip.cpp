@@ -1,19 +1,8 @@
-// ---------------------------------------------------------------------------
-// MLS-MPM transfer ROUND-TRIP IDENTITY gate (the umbrella-op transfer proof).
-//
-// Builds a small MLS-MPM particle set + an env-private background grid, seeds
-// C=0 / F=I / a known particle velocity, and runs the umbrella MpmStep with
-// substeps=1, zero gravity, and the floor plane sunk far below (no BC fires). With
-// F=I the constitutive stress P(I)=0, so the step is the pure APIC transfer:
-//   (1) the G2P-recovered velocity reproduces the seeded velocity (the APIC
-//       transfer with C=0 / P(I)=0 is the identity on a constant velocity field);
-//   (2) MpmStep run twice is BIT-identical (the deterministic gather, NO atomics);
-//   (3) the snapshot/restore round-trips F/C (the three readout.cu sites);
-//   (4) a particle outside the grid AABB flags the env-status escape bit.
-// ---------------------------------------------------------------------------
+// MLS-MPM transfer invariants, determinism, state restoration and domain errors.
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -58,9 +47,7 @@ constexpr uint32_t kDim = 6u;   // 6^3 = 216 nodes/env.
 constexpr float    kDx  = 0.1f;
 const Vec3 kOrigin{0.0f, 0.0f, 0.0f};
 
-// A small block of MLS-MPM particles well inside the grid AABB, each with the SAME
-// (constant) velocity so the APIC C=0 transfer is the exact identity. The grid is
-// kDim^3 nodes at spacing kDx from kOrigin.
+// A constant velocity field with complete quadratic stencils inside the grid.
 nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
     nk::Model m;
     nk::Model::ModelParticles& mp = m.particles;
@@ -155,6 +142,37 @@ TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
     std::fprintf(stderr, "[mpm-roundtrip] np=%u max_err=%.3e\n", np, max_err);
     EXPECT_LE(max_err, 1.0e-5f)
         << "APIC C=0 transfer must reproduce the constant velocity field";
+
+    const auto initial_pos = w.GetModel().particles.initial_pos;
+    const double duration = 1.0 / 60.0;
+    double previous_error = 0.0;
+    for (const uint32_t substeps : {1u, 2u, 4u}) {
+        ASSERT_EQ(nphi::Status::Ok, w.Reset());
+        p.dt = static_cast<float>(duration);
+        p.substeps = substeps;
+        p.gravity[2] = -1.0f;
+        ASSERT_TRUE(RunTransfer(w, p));
+        std::vector<Vec3> pos(np);
+        ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticlePos, pos.data(),
+                                              pos.size() * sizeof(Vec3)));
+        ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticleVel, out.data(),
+                                              out.size() * sizeof(Vec3)));
+        double position_error = 0.0;
+        for (uint32_t i = 0; i < np; ++i) {
+            EXPECT_NEAR(out[i].x, seed.x, 1.0e-5);
+            EXPECT_NEAR(out[i].y, seed.y, 1.0e-5);
+            EXPECT_NEAR(out[i].z, seed.z - duration, 1.0e-5);
+            const double analytic_z = initial_pos[i].z + seed.z * duration -
+                                      0.5 * duration * duration;
+            position_error += std::abs(pos[i].z - analytic_z) / np;
+        }
+        const double euler_error = 0.5 * duration * duration / substeps;
+        EXPECT_NEAR(position_error, euler_error, 1.0e-6);
+        if (previous_error > 0.0) EXPECT_NEAR(position_error / previous_error, 0.5, 0.02);
+        std::fprintf(stderr, "[mpm-acceleration] substeps=%u position_error=%.9g expected=%.9g\n",
+                     substeps, position_error, euler_error);
+        previous_error = position_error;
+    }
 }
 
 // (2) the deterministic gather is byte-identical run-to-run (NO float atomics).
@@ -189,6 +207,103 @@ TEST(MpmTransferRoundtrip, P2GGatherByteIdenticalRunToRun) {
     for (float v : m1) total += v;
     std::fprintf(stderr, "[mpm-gather] total_mass=%.6f nodes=%zu\n", total, m1.size());
     EXPECT_NEAR(total, static_cast<double>(m1.empty() ? 0 : 8), 1.0e-3);
+}
+
+TEST(MpmTransferRoundtrip, StressedTransferConservesLinearAndAngularMomentum) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    const Backend b = GetBackend();
+    nk::Model model = BuildMpmModel(Vec3::Zero());
+    constexpr uint32_t count = 74u;
+    auto& particles = model.particles;
+    particles.initial_pos.resize(count);
+    particles.initial_vel.resize(count);
+    particles.inv_mass.assign(count, 1.0f);
+    particles.initial_vol0.assign(count, kDx * kDx * kDx);
+    particles.initial_material_id.assign(count, 0u);
+    particles.initial_F.assign(count * 9u, 0.0f);
+    model.capacities.particles_per_env = count;
+    std::vector<float> affine(count * 9u, 0.0f);
+    std::array<double, 3> expected_linear{}, expected_angular{};
+    double linear_scale = 0.0, angular_scale = 0.0;
+    const double second_moment = 0.25 * double{kDx} * kDx;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const float sign = i < count / 2u ? 1.0f : -1.0f;
+        auto& pos = particles.initial_pos[i];
+        pos = {0.22f + 0.1f * (i / (count / 2u)) + 0.001f * (i % 5u),
+               0.23f + 0.001f * (i % 7u), 0.23f + 0.001f * (i % 11u)};
+        const Vec3 vel{sign * 0.9f, sign * -0.6f, sign * 0.3f};
+        particles.initial_vel[i] = vel;
+        float* F = particles.initial_F.data() + i * 9u;
+        F[0] = 1.0f + sign * 0.03f;
+        F[4] = 1.0f - sign * 0.015f;
+        F[8] = 1.01f;
+        F[1] = F[3] = 0.01f;
+        float* C = affine.data() + i * 9u;
+        C[1] = -0.7f; C[3] = 0.7f;
+        C[2] = 0.2f; C[6] = -0.2f;
+        C[5] = -0.3f; C[7] = 0.3f;
+        const std::array<double, 3> x{pos.x, pos.y, pos.z}, v{vel.x, vel.y, vel.z};
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            const uint32_t j = (axis + 1u) % 3u, k = (axis + 2u) % 3u;
+            const double angular = x[j] * v[k] - x[k] * v[j] +
+                second_moment * (double{C[k * 3u + j]} - C[j * 3u + k]);
+            expected_linear[axis] += v[axis];
+            expected_angular[axis] += angular;
+            linear_scale += std::abs(v[axis]);
+            angular_scale += std::abs(angular);
+        }
+    }
+    const uint32_t nodes = model.capacities.mpm_grid_nodes_per_env;
+    nk::World world(std::move(model), 1u, b.dev, b.backend, Cfg());
+    ASSERT_TRUE(world.Ready());
+    auto params = MakeParams(world.GetModel());
+    std::vector<float> mass(nodes);
+    std::vector<Vec3> momentum(nodes);
+    std::array<std::vector<Vec3>, 3> outputs;
+    for (uint32_t level = 0u; level < outputs.size(); ++level) {
+        ASSERT_EQ(nphi::Status::Ok, world.Reset());
+        ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::ParticleC, affine.data(),
+                                                affine.size() * sizeof(float)));
+        params.dt = (1.0f / 240.0f) / static_cast<float>(1u << level);
+        ASSERT_TRUE(RunTransfer(world, params));
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::GridMass, mass.data(),
+                                                  mass.size() * sizeof(float)));
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::GridMomentum, momentum.data(),
+                                                  momentum.size() * sizeof(Vec3)));
+        double total_mass = 0.0;
+        std::array<double, 3> linear{}, angular{};
+        for (uint32_t node = 0u; node < nodes; ++node) {
+            total_mass += mass[node];
+            const std::array<double, 3> x{(node % kDim) * double{kDx},
+                ((node / kDim) % kDim) * double{kDx}, (node / (kDim * kDim)) * double{kDx}};
+            const std::array<double, 3> q{momentum[node].x, momentum[node].y, momentum[node].z};
+            for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                const uint32_t j = (axis + 1u) % 3u, k = (axis + 2u) % 3u;
+                linear[axis] += q[axis];
+                angular[axis] += x[j] * q[k] - x[k] * q[j];
+            }
+        }
+        EXPECT_NEAR(total_mass, count, 2.0e-6 * count);
+        double linear_error = 0.0, angular_error = 0.0;
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            linear_error = std::max(linear_error, std::abs(linear[axis] - expected_linear[axis]));
+            angular_error = std::max(angular_error, std::abs(angular[axis] - expected_angular[axis]));
+        }
+        EXPECT_LT(linear_error / linear_scale, 2.0e-6);
+        EXPECT_LT(angular_error / angular_scale, 2.0e-6);
+        std::fprintf(stderr, "[mpm-moments] dt=%.9g mass_error=%.9g linear_rel=%.9g angular_rel=%.9g\n",
+                     params.dt, std::abs(total_mass - count) / count,
+                     linear_error / linear_scale, angular_error / angular_scale);
+        outputs[level] = momentum;
+    }
+    std::array<double, 2> impulse_change{};
+    for (uint32_t level = 0u; level < impulse_change.size(); ++level)
+        for (uint32_t node = 0u; node < nodes; ++node) {
+            const Vec3 delta = outputs[level][node] - outputs[level + 1u][node];
+            impulse_change[level] += std::abs(delta.x) + std::abs(delta.y) + std::abs(delta.z);
+        }
+    ASSERT_GT(impulse_change[0], 1.0e-3);
+    EXPECT_NEAR(impulse_change[1] / impulse_change[0], 0.5, 1.0e-3);
 }
 
 // (3) snapshot/restore round-trips F/C: mutate F on device, restore, F == cooked I.

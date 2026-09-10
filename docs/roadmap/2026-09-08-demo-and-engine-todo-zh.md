@@ -4,7 +4,7 @@
 
 当前 active goal 已接续为 [引擎完善目标](2026-09-08-engine-completion-goal-zh.md)：覆盖 spec 全部剩余项，相关模块成批修改、统一验证。旧 demo/细化规格/开始实施目标已验收关闭。
 
-最新执行顺序（2026-09-10）：优先 MLS-MPM 和其他剩余性能优化 → 完整多体/多介质耦合分析与优化 → 继续原 spec 全部剩余工作。现有 commit、README 和仓库临时产物清理已推送。耦合方案可仅由现有架构与物理推导独立设计，不必局限于 Newton/MuJoCo/Genesis；适用的外部结果用于物理对照。
+最新执行顺序（2026-09-10）：收口当前 MLS-MPM 性能改动 → 完整多体/多介质耦合分析与优化 → 继续原 spec 全部剩余工作。主验证场景为 MLS-MPM water pool（原 bunny-water）和 jelly，暂停压痕 demo 测试；性能足够时进入下一阶段，剩余热点及历史回退保留，不要求先穷尽。耦合方案可仅由现有架构与物理推导独立设计，不必局限于 Newton/MuJoCo/Genesis；适用的外部结果用于物理对照。
 
 按用户指定顺序推进：先完成 pi0.5 demo 的调优、代码修复和渲染，再细化 9 月 7 日引擎功能/性能优化规格，最后按细化规格开始执行。固定 seed 的 demo、reset、外力/重力、稳定自由旋转和共享风阻功能已验收，现接续执行、内存与性能模块。
 
@@ -41,8 +41,11 @@
 - [x] CUDA MPM 原记录协作写入通过五对验收：落水 eager/graph 再降时 8.18%/9.66%，静置降时 10.03%/10.98%，arena 不增加；既有场景、固定 pipeline 和两项 sanitizer 通过，见 [记录写入验收](../research/2026-09-10-cuda-mpm-record-store-validation-zh.md)。对齐、SoA 与额外偏移缓存候选未采用。
 - [x] CUDA P2G 有序协作读取及分量累加完成验收：五对落水 eager/graph 降时 18.56%/22.07%，静置降时 11.03%/15.57%，arena 不增加；完整质量/状态、既有场景、固定 pipeline、memcheck/synccheck 通过。关节支承补充五对和 profile 保留进程波动，见 [gather 验收](../research/2026-09-10-cuda-mpm-gather-validation-zh.md)。
 - [x] MPM 粒子/节点工作区按实际 P/N 分配：原 bunny 的 Data arena 减少 1,392,640 B，十对完整步时基本持平；既有 MPM 场景、固定 E=16 pipeline、十项 memcheck 和无 CUDA 核心构建通过，见 [容量验收](../research/2026-09-10-mpm-capacity-validation-zh.md)。直接读取与完整权重缓存候选未采用，失败证据保留。
-- [ ] 继续以原 MLS-MPM bunny-water 与已有 jelly/刚体/关节场景判断剩余热点：既有 profile 的 P2G/连续记录准备占落水 kernel busy 的 60.58%/4.85%，继续通用读取与计算、跨节点数据复用、稀疏网格及其余性能问题。保留同物理分母和完整质量门；同名 PBF demo 不替代。
-- [ ] MLS-MPM 和其他剩余性能项处理后，接续无 SDF 碰撞体与完整多体/MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面。独立推导可验证的通用方案，性能结果明确已有覆盖与限制；耦合完成后继续原 spec。
+- [x] 收口并采纳 MPM cell 共享传输：原 bunny-water 五对落水 eager/graph 减少 20.03%/43.25%，Data arena 增加 47.69 MB；water/jelly、独立物理门、E=16 pipeline、memcheck/synccheck 和 8 对渲染帧通过。数值分组与 CUDA 实现分别记录，见 [验收记录](../research/2026-09-10-mpm-cell-transfer-validation-zh.md)。
+- [ ] 耦合改造后接续剩余性能：小水池墙时中位 +8.13% 且逐对波动、host 提交、稀疏网格、多环境与其他热点。中间版本压痕 eager +12.88% 保留、暂停追测，不冒称已解决。新物理需重新冻结分母，PBF 不替代 MLS-MPM。
+- [ ] 当前 MLS-MPM 性能批次收口后，接续无 SDF 碰撞体与完整多体/MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面。独立推导可验证的通用方案，性能结果明确已有覆盖与限制；耦合完成后继续原 spec 和其余性能热点。
+- [x] review 最新 Newton/MuJoCo/Genesis 与 M05/M08/M09，形成 [共享几何/owner 细化 spec](../plans/2026-09-10-coupling-surface-owner-detailed-spec-zh.md)，明确解析体覆盖、内部点距离、真实 owner 及后续多端点/子步契约。
+- [ ] 开始首批耦合生产代码：共享解析距离和 owner，修复内部球心 Box 接触、无 SDF 解析碰撞体及复合形状反作用路由；复用 water pool/jelly 和固定完整 pipeline 成批验收。
 - [x] 收口粒子时间层基础修复：统一工作位置、材料/接触交替、累计 lambda 与一次提交；六组完整长度门、已有场景/API/reset/渲染及 E=16 graph memcheck 通过。最大应变 1.838344%、最坏 RMS 0.203045%；完整接触刷新与 MPM 子步反馈另行继续。
 - [x] 单独完成构建架构隔离（`6953f4a`）：后端注册和 nk 核心脱离 CUDA 配置门，CUDA 源码与库按能力附加；无 CUDA 核心构建通过，不代表完整 CPU solver 已实现。
 - [x] 补充持续约束：原版不作为物理真值；参考 Newton/MuJoCo/Genesis 的匹配仿真、解析解/守恒/约束误差/收敛；multi-backend 下分开架构优化、CUDA 调优和物理算法变化。
