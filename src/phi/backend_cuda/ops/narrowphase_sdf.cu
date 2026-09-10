@@ -2,8 +2,12 @@
 // Bounds cull candidates; only the declared collision surface supplies contacts.
 
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
+#include <algorithm>
+#include <limits>
 
 #include "collision/primitive_surface.hpp"
+#include "constraint/contact_manifold.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/contact/contact_identity.hpp"
@@ -76,6 +80,47 @@ namespace {
 using namespace ::nuka::phi::nkops;
 namespace sdf = ::nuka::runtime::sdf;
 
+constexpr uint32_t kManifoldPoints = constraint::ContactManifold::kMaxPoints;
+constexpr uint32_t kSurfaceQueryThreads = 128u;
+
+struct SampleContact {
+    math::Vec3 point;
+    math::Vec3 normal;
+    float depth;
+    uint32_t feature_a;
+    uint32_t feature_b;
+    uint64_t sequence;
+};
+
+struct SampleRank {
+    float depth;
+    uint32_t lane;
+    uint64_t sequence;
+};
+
+struct DeeperSample {
+    __device__ SampleRank operator()(const SampleRank& a, const SampleRank& b) const {
+        if (a.depth != b.depth) return a.depth > b.depth ? a : b;
+        return a.sequence <= b.sequence ? a : b;
+    }
+};
+
+// The global top-K is contained in the union of every lane's local top-K.
+// Original side/sample order breaks ties independently of execution order.
+__device__ void InsertSampleContact(const SampleContact& sample, uint32_t capacity,
+                                    SampleContact* contacts, uint32_t& count) {
+    uint32_t position = count;
+    while (position > 0u &&
+           (contacts[position - 1u].depth < sample.depth ||
+            (contacts[position - 1u].depth == sample.depth &&
+             contacts[position - 1u].sequence > sample.sequence))) --position;
+    if (position >= capacity) return;
+    const uint32_t last = count < capacity ? count : capacity - 1u;
+    for (uint32_t i = last; i > position; --i) contacts[i] = contacts[i - 1u];
+    contacts[position] = sample;
+    if (count < capacity) ++count;
+}
+
 // Each pair samples a local surface into an SDF, with normals separating A.
 __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
                                      const uint32_t* __restrict__ samp_ranges,
@@ -114,8 +159,8 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
     const sdf::SparseSdfDevice sdf_grid = LoadSdfGrid(
         sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads, grid);
 
-    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4];
-    uint32_t feature_a[4], feature_b[4];
+    math::Vec3 pt[kManifoldPoints]; math::Vec3 nm[kManifoldPoints]; float dp[kManifoldPoints];
+    uint32_t feature_a[kManifoldPoints], feature_b[kManifoldPoints];
     uint32_t kept = 0u;
 
     for (uint32_t s = 0u; s < scnt; ++s) {
@@ -142,8 +187,8 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
     }
 
     ucount[out_gid] = kept;
-    for (uint32_t i = 0u; i < 4u; ++i) {
-        const size_t at = static_cast<size_t>(out_gid) * 4u + i;
+    for (uint32_t i = 0u; i < kManifoldPoints; ++i) {
+        const size_t at = static_cast<size_t>(out_gid) * kManifoldPoints + i;
         if (i < kept) { upoint[at] = pt[i]; unormal[at] = nm[i]; udepth[at] = dp[i]; }
         else { upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f; }
     }
@@ -164,6 +209,7 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
                                     uint32_t rigid_slot_cap,
+                                    uint32_t pair_slots,
                                     uint32_t sample_point_count,
                                     uint32_t k,
                                     float margin,
@@ -180,11 +226,10 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint64_t* __restrict__ ucontact_id_feature,
                                     uint32_t* __restrict__ contact_count,
                                     uint32_t* __restrict__ env_status) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t total = env_count * slot_stride;
-    if (gid >= total) return;
-    const uint32_t env = gid / slot_stride;
-    const uint32_t slot = gid - env * slot_stride;
+    const uint32_t env = blockIdx.x / pair_slots;
+    const uint32_t slot = blockIdx.x - env * pair_slots;
+    if (env >= env_count) return;
+    const uint32_t gid = env * slot_stride + slot;
     // Body<->body candidates fill [0, rigid_slot_cap); slots above belong to the
     // body<->particle narrowphase (== slot_stride when no particles -> identical).
     if (slot >= pair_count[env] || slot >= rigid_slot_cap) return;
@@ -195,17 +240,16 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
     const uint32_t a = candidate_pairs[static_cast<size_t>(gid) * 2u + 0u];
     const uint32_t b = candidate_pairs[static_cast<size_t>(gid) * 2u + 1u];
     if (a >= bodies_per_env || b >= bodies_per_env) {
-        if (env_status) atomicOr(&env_status[env], kEnvStatusInvalidEndpoint);
+        if (env_status && threadIdx.x == 0u) atomicOr(&env_status[env], kEnvStatusInvalidEndpoint);
         return;
     }
     const PrimShapeDev shapes[2] = {LoadPrimShape(shape_table, a), LoadPrimShape(shape_table, b)};
     const math::Transform poses[2] = {body_pose[env * bodies_per_env + a],
                                       body_pose[env * bodies_per_env + b]};
     const uint32_t bodies[2] = {a, b};
-    const uint32_t kk = (k > 4u) ? 4u : k;
-    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4];
-    uint32_t feature_a[4], feature_b[4];
-    uint32_t kept = 0u;
+    const uint32_t kk = k > kManifoldPoints ? kManifoldPoints : k;
+    SampleContact local_contacts[kManifoldPoints];
+    uint32_t local_count = 0u;
     bool queried = false;
     uint32_t geometry_status = 0u;
     for (uint32_t side = 0u; side < 2u; ++side) {
@@ -216,6 +260,7 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
         const math::Transform& txf = poses[other];
         if (shapes[side].kind == collision::kShapeSphere) {
             queried = true;
+            if (threadIdx.x != 0u) continue;
             const float radius = shapes[side].params[0];
             const auto surface = QueryCollidableSurface(surfaces, bodies[other], target,
                 SdfInverseTransformPoint(txf, sxf.position), radius + margin);
@@ -227,10 +272,11 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
             if (depth > 0.0f) {
                 const auto normal = SdfRotate(txf.rotation, surface.normal);
                 const uint32_t feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
-                DeepestKInsert(SdfTransformPoint(txf, surface.point),
+                InsertSampleContact({SdfTransformPoint(txf, surface.point),
                     side == 0u ? normal : normal * -1.0f, depth,
                     side == 0u ? 0u : feature, side == 0u ? feature : 0u,
-                    kk, pt, nm, dp, feature_a, feature_b, &kept);
+                    uint64_t(side) * (uint64_t(sample_point_count) + 1u)},
+                    kk, local_contacts, local_count);
             }
             continue;
         }
@@ -244,7 +290,8 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
         }
         if (scnt == 0u) continue;
         queried = true;
-        for (uint32_t s = 0u; s < scnt; ++s) {
+        for (uint64_t sample = threadIdx.x; sample < scnt; sample += blockDim.x) {
+            const auto s = static_cast<uint32_t>(sample);
             const size_t at = static_cast<size_t>(soff + s) * 3u;
             const math::Vec3 local{samp_points[at], samp_points[at + 1u], samp_points[at + 2u]};
             const math::Vec3 world = SdfTransformPoint(sxf, local);
@@ -267,50 +314,71 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
             const math::Vec3 n = gw / gl;
             const math::Vec3 cp = SdfTransformPoint(txf, surface.point);
             const uint32_t target_feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
-            DeepestKInsert(cp, side == 0u ? n : n * -1.0f, depth,
+            InsertSampleContact({cp, side == 0u ? n : n * -1.0f, depth,
                 side == 0u ? s : target_feature, side == 0u ? target_feature : s,
-                kk, pt, nm, dp, feature_a, feature_b, &kept);
+                uint64_t(side) * (uint64_t(sample_point_count) + 1u) + s},
+                kk, local_contacts, local_count);
         }
     }
     if (!queried && (shapes[0].kind == collision::kShapeSdfMesh ||
                     shapes[1].kind == collision::kShapeSdfMesh))
         geometry_status |= kEnvStatusContactGeometryUnavailable;
-    if (geometry_status != 0u && env_status) atomicOr(&env_status[env], geometry_status);
+    const bool unavailable = __syncthreads_or(geometry_status != 0u) != 0;
+    if (unavailable && env_status && threadIdx.x == 0u)
+        atomicOr(&env_status[env], kEnvStatusContactGeometryUnavailable);
 
-    ucount[gid] = kept;
-    for (uint32_t i = 0u; i < 4u; ++i) {
-        const size_t at = static_cast<size_t>(gid) * 4u + i;
-        if (i < kept) {
-            upoint[at] = pt[i]; unormal[at] = nm[i]; udepth[at] = dp[i];
+    using Reduction = cub::BlockReduce<SampleRank, kSurfaceQueryThreads>;
+    __shared__ typename Reduction::TempStorage reduction;
+    __shared__ uint32_t winner;
+    uint32_t cursor = 0u;
+    uint32_t kept = 0u;
+    for (uint32_t i = 0u; i < kk; ++i) {
+        const SampleRank rank = cursor < local_count
+            ? SampleRank{local_contacts[cursor].depth, threadIdx.x, local_contacts[cursor].sequence}
+            : SampleRank{0.0f, threadIdx.x, ~uint64_t{0u}};
+        const auto best = Reduction(reduction).Reduce(rank, DeeperSample{});
+        if (threadIdx.x == 0u) winner = best.depth > 0.0f ? best.lane : ~0u;
+        __syncthreads();
+        if (winner == ~0u) break;
+        if (threadIdx.x == winner) {
+            const auto& contact = local_contacts[cursor++];
+            const size_t at = static_cast<size_t>(gid) * kManifoldPoints + i;
+            upoint[at] = contact.point;
+            unormal[at] = contact.normal;
+            udepth[at] = contact.depth;
             ucontact_a[at] = a;
             ucontact_b[at] = b;
-            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
-            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
+            ucontact_a_kind[at] = nk::kUContactSideBody;
+            ucontact_b_kind[at] = nk::kUContactSideBody;
             ucontact_gen[at] = 1u;
-            ::nuka::nk::CanonicalContactDescriptor descriptor;
+            nk::CanonicalContactDescriptor descriptor;
             descriptor.a.handle = a;
             descriptor.b.handle = b;
-            descriptor.local_point_a =
-                ::nuka::phi::nkops::PrimInverseTransformPoint(poses[0], pt[i]);
-            descriptor.local_point_b =
-                ::nuka::phi::nkops::PrimInverseTransformPoint(poses[1], pt[i]);
-            descriptor.normal = nm[i];
-            descriptor.feature_a = feature_a[i];
-            descriptor.feature_b = feature_b[i];
+            descriptor.local_point_a = PrimInverseTransformPoint(poses[0], contact.point);
+            descriptor.local_point_b = PrimInverseTransformPoint(poses[1], contact.point);
+            descriptor.normal = contact.normal;
+            descriptor.feature_a = contact.feature_a;
+            descriptor.feature_b = contact.feature_b;
             descriptor.manifold_slot = i;
-            const ::nuka::nk::ContactId id = ::nuka::nk::MakeContactId(descriptor);
+            const nk::ContactId id = nk::MakeContactId(descriptor);
             ucontact_id_pair[at] = id.pair;
             ucontact_id_feature[at] = id.feature;
-        } else {
-            upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
-            ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
-            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
-            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
-            ucontact_id_pair[at] = 0u;
-            ucontact_id_feature[at] = 0u;
         }
+        ++kept;
+        __syncthreads();
     }
-    if (kept > 0u && contact_count != nullptr) {
+    if (threadIdx.x == 0u) ucount[gid] = kept;
+    for (uint32_t i = threadIdx.x; i < kManifoldPoints; i += blockDim.x) {
+        const size_t at = static_cast<size_t>(gid) * kManifoldPoints + i;
+        if (i < kept) continue;
+        upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
+        ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
+        ucontact_a_kind[at] = nk::kUContactSideBody;
+        ucontact_b_kind[at] = nk::kUContactSideBody;
+        ucontact_id_pair[at] = 0u;
+        ucontact_id_feature[at] = 0u;
+    }
+    if (kept > 0u && contact_count != nullptr && threadIdx.x == 0u) {
         atomicAdd(&contact_count[env], kept);
     }
 }
@@ -329,10 +397,16 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
     if (!model.samp_ranges || !model.shape_table || !data.candidate_pairs || !data.body_pose ||
         (p->sample_point_count > 0u && !model.samp_points) || !SurfaceQueryStorageValid(surfaces))
         return Status::InvalidArgument;
-    const uint32_t total = p->env_count * p->max_contacts_per_env;
-    constexpr uint32_t kBlock = 128u;
-    const uint32_t blocks = (total + kBlock - 1u) / kBlock;
-    LaunchCuda(PairDrivenSdfKernel, dim3(blocks), dim3(kBlock), 0u, stream,
+    const uint32_t pair_slots = std::min(p->max_contacts_per_env, p->rigid_slot_cap);
+    if (pair_slots == 0u) return Status::Ok;
+    const uint64_t total = uint64_t(p->env_count) * p->max_contacts_per_env;
+    if (total > std::numeric_limits<int>::max() || !data.pair_count ||
+        !data.ucontact_count || !data.ucontact_point || !data.ucontact_normal ||
+        !data.ucontact_depth || !data.ucontact_a || !data.ucontact_b ||
+        !data.ucontact_a_kind || !data.ucontact_b_kind || !data.ucontact_gen ||
+        !data.ucontact_id_pair || !data.ucontact_id_feature) return Status::InvalidArgument;
+    const uint32_t blocks = p->env_count * pair_slots;
+    LaunchCuda(PairDrivenSdfKernel, dim3(blocks), dim3(kSurfaceQueryThreads), 0u, stream,
                data.candidate_pairs, data.pair_count,
                static_cast<const float*>(model.shape_table),
                static_cast<const float*>(model.samp_points),
@@ -340,7 +414,7 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                surfaces,
                static_cast<const math::Transform*>(data.body_pose),
                p->env_count, p->bodies_per_env, p->max_contacts_per_env,
-               p->rigid_slot_cap, p->sample_point_count,
+               p->rigid_slot_cap, pair_slots, p->sample_point_count,
                static_cast<uint32_t>(p->max_contacts_per_pair), p->contact_margin,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
@@ -379,7 +453,7 @@ Status LaunchNarrowphaseSdf(const float* samp_points,
     LaunchCuda(NarrowphaseSdfKernel, dim3(blocks), dim3(kBlock), 0u, stream,
                samp_points, samp_ranges, shape_table, sdf_headers, sdf_cell_count,
                sdf_keys, sdf_values, sdf_grads, body_pose, pairs, pair_count,
-               (k > 4u ? 4u : k), margin, slot_stride, ucount, upoint, unormal,
+               (k > kManifoldPoints ? kManifoldPoints : k), margin, slot_stride, ucount, upoint, unormal,
                udepth, contact_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
