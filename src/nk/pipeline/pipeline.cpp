@@ -10,6 +10,7 @@
 #include <cstdlib>
 
 #include "collision/contact_capacity.hpp"
+#include "collision/shape_kind.hpp"
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/model.hpp"
 #include "nk/solve/nk_row.hpp"
@@ -546,7 +547,15 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.bodies_per_env = cap.bodies_per_env;
         p_np_sdf_.max_contacts_per_env = cap.max_contacts_per_env;
         p_np_sdf_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
-        add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
+        p_np_sdf_.sdf_grid_count = cap.max_sdf_grids;
+        p_np_sdf_.sample_point_count = cap.max_samp_points;
+        const bool has_sampled_geometry = cap.max_samp_points > 0u || cap.max_sdf_grids > 0u ||
+            std::any_of(model.shape_table_rows.begin(), model.shape_table_rows.end(),
+                [](const Model::PairDrivenShape& shape) {
+                    return shape.kind == collision::kShapeSdfMesh &&
+                           (shape.contype | shape.conaffinity) != 0u;
+                });
+        if (has_sampled_geometry) add(phi::NkOp::NarrowphaseSdf, &p_np_sdf_);
 
         // Body/artic <-> particle narrowphase (the row provider's pre-coupling
         // emission). Runs AFTER the rigid narrowphase and BEFORE AssembleRows,

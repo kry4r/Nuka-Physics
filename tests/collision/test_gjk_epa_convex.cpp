@@ -1132,6 +1132,7 @@ TEST(SdfPrecisionOracle, SphereSampleVsSphereSdf_DepthMatchesAnalytic) {
     EXPECT_NEAR(h.normal.x, 1.0f, 0.05f);
     EXPECT_NEAR(h.normal.y, 0.0f, 0.05f);
     EXPECT_NEAR(h.normal.z, 0.0f, 0.05f);
+    EXPECT_NEAR(h.point.Length(), R, cell);
 }
 
 // SPHERE-SAMPLE x BOX SDF: target = box he=(0.2,0.2,0.2); sample inside near the
@@ -1157,11 +1158,15 @@ TEST(SdfPrecisionOracle, SampleVsBoxSdf_DepthMatchesAnalytic) {
     SdfOracleScene s = BuildSdfScene(sample, Transform::Identity(),
                                      Transform::Identity(), keys, vals, grads,
                                      dims, origin, cell, cell);
-    const SdfHit h = RunSdfOp(s);
+    const float margin = 0.003f;
+    const SdfHit h = RunSdfOp(s, margin);
     ASSERT_EQ(h.count, 1u);
-    EXPECT_NEAR(h.depth, he.z - 0.16f, cell) << "SDF box depth != min-face analytic";
+    EXPECT_NEAR(h.depth, he.z - 0.16f + margin, cell) << "SDF box depth != min-face analytic";
     // Normal points out the nearest (+Z) face.
     EXPECT_NEAR(h.normal.z, 1.0f, 0.1f);
+    EXPECT_NEAR(h.point.x, 0.0f, cell);
+    EXPECT_NEAR(h.point.y, 0.0f, cell);
+    EXPECT_NEAR(h.point.z, he.z, cell * 0.1f);
 }
 
 // SEPARATED: sample OUTSIDE the SDF band -> no contact (count 0).

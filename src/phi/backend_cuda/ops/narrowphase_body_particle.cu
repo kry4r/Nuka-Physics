@@ -476,6 +476,7 @@ __global__ void NarrowphaseBodyParticleKernel(
         uint32_t body = (lane == 0u) ? cand[ci] : 0u;
         if (kWarp) body = __shfl_sync(0xffffffffu, body, 0);
         const PrimShapeDev sb = LoadPrimShape(shape_table, body);
+        if ((sb.contype | sb.conaffinity) == 0u) continue;
         const math::Transform xb = body_pose[env * N + body];
         const amf::PrimParams pb = MakePrim(sb, xb);
 
@@ -520,21 +521,18 @@ __global__ void NarrowphaseBodyParticleKernel(
                         ParticleHeightfield(center, radius, pp.contact_margin, xb, pp,
                                             heights, &m);
                     } else if (env_status != nullptr) {
-                        atomicOr(&env_status[env], kEnvStatusPairOverflow);
+                        atomicOr(&env_status[env], kEnvStatusContactGeometryUnavailable);
                     }
                 }
                 break;
             case kKindSdfMesh:
-                // The particle (sphere) vs the body's cooked silhouette SDF: one
-                // query of the SAME sparse_sdf_sample the rigid SDF narrowphase +
-                // the MPM grid BC call (one query, three callers). Point-vs-grid, so
-                // LANE 0 only (no wide hull to split). phi = signed distance at the
-                // particle center in the body's local frame; penetrating iff phi <
-                // radius (+ margin band). The normal is the OUTWARD SDF gradient
-                // (separation dir for the particle); depth = radius - phi.
-                if (lane == 0u && sdf_headers != nullptr) {
+                // The same signed-distance field supplies the particle contact.
+                if (lane == 0u) {
                     const uint32_t grid = sb.sdf_grid;
-                    if (grid != ~0u) {
+                    if (grid >= pp.sdf_grid_count) {
+                        if (env_status)
+                            atomicOr(&env_status[env], kEnvStatusContactGeometryUnavailable);
+                    } else {
                         const sdfq::SparseSdfDevice sg = LoadParticleSdfGrid(
                             sdf_headers, sdf_cell_count, sdf_keys, sdf_values,
                             sdf_grads, grid);
@@ -548,9 +546,12 @@ __global__ void NarrowphaseBodyParticleKernel(
                                 ::nuka::phi::nkops::SdfRotate(xb.rotation, grad);
                             const float gl = sqrtf(gw.x * gw.x + gw.y * gw.y +
                                                    gw.z * gw.z);
-                            const Vec3 n = (gl > 1.0e-12f)
-                                ? Vec3{gw.x / gl, gw.y / gl, gw.z / gl}
-                                : Vec3{0.0f, 0.0f, 1.0f};
+                            if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-12f) {
+                                if (env_status)
+                                    atomicOr(&env_status[env], kEnvStatusContactGeometryUnavailable);
+                                break;
+                            }
+                            const Vec3 n = gw / gl;
                             ::nuka::constraint::ContactPoint pt;
                             pt.position = Vec3{center.x - n.x * radius,
                                                center.y - n.y * radius,
@@ -563,7 +564,10 @@ __global__ void NarrowphaseBodyParticleKernel(
                     }
                 }
                 break;
-            default: break;  // unknown kind: no analytic particle handler.
+            default:
+                if (lane == 0u && env_status)
+                    atomicOr(&env_status[env], kEnvStatusContactGeometryUnavailable);
+                break;
         }
         // Manifold store + bookkeeping: LANE 0 ONLY (m on the other lanes is unused).
         // The whole warp keeps iterating every candidate to `ncand` so the hull
@@ -641,6 +645,9 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
         model.shape_table == nullptr) {
         return Status::Ok;
     }
+    if (p->sdf_grid_count > 0u && (!model.sdf_headers || !model.sdf_cell_count ||
+        !model.sdf_cell_keys || !model.sdf_cell_values || !model.sdf_cell_gradients))
+        return Status::InvalidArgument;
     const uint32_t total = p->env_count * p->particles_per_env;
     // Warp-per-particle (a wide hull collider) launches 32 threads/particle (== the
     // serial block count *32); thread-per-particle launches one thread/particle.

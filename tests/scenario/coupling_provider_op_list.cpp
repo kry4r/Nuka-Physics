@@ -194,7 +194,7 @@ void AssertBuildTwiceIdentical(nk::Model (*build)(), const char* name) {
             << name << ": op[" << i << "] differs build-to-build";
     }
 
-    // FULL byte memcmp of each moved POD (present iff has_particles).
+    // Compare each emitted parameter block across independent builds.
     const bool has_particles = m1.capacities.particles_per_env > 0u;
     nphi::NarrowphaseBodyParticleParams np1{}, np2{};
     nphi::ParticleFinalizeParams pf1{}, pf2{};
@@ -207,15 +207,20 @@ void AssertBuildTwiceIdentical(nk::Model (*build)(), const char* name) {
     const bool pp_b = CopyParams(p2, nphi::NkOp::ParticleParticleContact, &pp2);
     EXPECT_EQ(np_a, has_particles) << name << ": NarrowphaseBodyParticle presence";
     EXPECT_EQ(pf_a, has_particles) << name << ": ParticleFinalize presence";
-    EXPECT_EQ(pp_a, has_particles) << name << ": ParticleParticleContact presence";
+    const bool has_pair_projection = m1.particles.mode == nk::Model::ParticleMode::SoftFluid;
+    EXPECT_EQ(pp_a, has_pair_projection) << name << ": ParticleParticleContact presence";
     EXPECT_EQ(np_a, np_b);
     EXPECT_EQ(pf_a, pf_b);
     EXPECT_EQ(pp_a, pp_b);
-    if (has_particles) {
+    if (np_a) {
         EXPECT_EQ(std::memcmp(&np1, &np2, sizeof(np1)), 0)
             << name << ": NarrowphaseBodyParticleParams bytes differ";
+    }
+    if (pf_a) {
         EXPECT_EQ(std::memcmp(&pf1, &pf2, sizeof(pf1)), 0)
             << name << ": ParticleFinalizeParams bytes differ";
+    }
+    if (pp_a) {
         EXPECT_EQ(std::memcmp(&pp1, &pp2, sizeof(pp1)), 0)
             << name << ": ParticleParticleContactParams bytes differ";
     }
@@ -265,9 +270,8 @@ TEST(CouplingProviderOpList, RigidOnlyEmitsNoCouplingOps) {
     EXPECT_EQ(IndexOf(seq, nphi::NkOp::ParticleParticleContact), -1);
 }
 
-// The row provider's emission points: NarrowphaseBodyParticle between Sdf and the
-// tangent basis; ParticleFinalize then ParticleParticleContact after IntegratePos.
-// ReadoutContactWrench is demand-gated: absent by default, last when demanded.
+// Detection uses projected particle positions; finalization follows all projections.
+// Contact wrench readout is emitted only when demanded.
 TEST(CouplingProviderOpList, RowProviderEmitsAtCanonicalPositions) {
     nk::Model m = BuildSoftFluid();
     nk::Pipeline p0;
@@ -278,11 +282,12 @@ TEST(CouplingProviderOpList, RowProviderEmitsAtCanonicalPositions) {
     p.Build(m, Cfg(), nullptr, nk::Pipeline::kReadoutContactWrench);
     const std::vector<nphi::NkOp> seq = OpSequence(p);
 
-    const int sdf = IndexOf(seq, nphi::NkOp::NarrowphaseSdf);
+    const int prim = IndexOf(seq, nphi::NkOp::NarrowphasePrimitives);
     const int bp  = IndexOf(seq, nphi::NkOp::NarrowphaseBodyParticle);
     const int tan = IndexOf(seq, nphi::NkOp::ContactTangentBasis);
-    ASSERT_GE(sdf, 0); ASSERT_GE(bp, 0); ASSERT_GE(tan, 0);
-    EXPECT_LT(sdf, bp) << "NarrowphaseBodyParticle must follow NarrowphaseSdf";
+    EXPECT_EQ(IndexOf(seq, nphi::NkOp::NarrowphaseSdf), -1);
+    ASSERT_GE(prim, 0); ASSERT_GE(bp, 0); ASSERT_GE(tan, 0);
+    EXPECT_LT(prim, bp) << "NarrowphaseBodyParticle must follow rigid detection";
     EXPECT_LT(bp, tan) << "NarrowphaseBodyParticle must precede ContactTangentBasis";
 
     const int ipos = IndexOf(seq, nphi::NkOp::IntegratePosition);
@@ -291,6 +296,9 @@ TEST(CouplingProviderOpList, RowProviderEmitsAtCanonicalPositions) {
     const int rd   = IndexOf(seq, nphi::NkOp::ReadoutContactWrench);
     ASSERT_GE(ipos, 0); ASSERT_GE(fin, 0); ASSERT_GE(ppc, 0); ASSERT_GE(rd, 0);
     EXPECT_LT(ipos, fin) << "ParticleFinalize must follow IntegratePosition";
-    EXPECT_LT(fin, ppc) << "ParticleParticleContact must follow ParticleFinalize";
-    EXPECT_LT(ppc, rd) << "ParticleParticleContact must precede ReadoutContactWrench";
+    EXPECT_LT(ppc, bp) << "initial particle projection must precede body contact detection";
+    for (size_t i = 0u; i < seq.size(); ++i)
+        if (seq[i] == nphi::NkOp::ParticleParticleContact)
+            EXPECT_LT(static_cast<int>(i), fin) << "particle projections must finish before commit";
+    EXPECT_LT(fin, rd) << "contact readout must follow finalization";
 }

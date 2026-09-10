@@ -56,10 +56,14 @@ inline constexpr uint32_t kEnvStatusPairOverflow     = 1u << 0;  // candidate_pa
 inline constexpr uint32_t kEnvStatusNeighborOverflow = 1u << 1;  // particle neighbor dropped
 inline constexpr uint32_t kEnvStatusDofOverflow      = 1u << 2;  // artic dof > max_dof (CRBA)
 inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM open-face escape / invalid F
-// An analytic-only collidable (no cooked SDF grid) imposes a one-way grid BC: it
-// has no SDF to rasterize, so the medium feels it but no reaction is deposited back.
+// A collidable has no supported surface representation and is skipped by MPM.
+// The bit name is retained for compatibility; analytic primitives are supported.
 inline constexpr uint32_t kEnvStatusMpmOneWayBody    = 1u << 4;
 inline constexpr uint32_t kEnvStatusGyroFailure      = 1u << 5;
+// Invalid contact ownership or endpoint indices stay latched until world reset.
+inline constexpr uint32_t kEnvStatusInvalidEndpoint  = 1u << 6;
+// Missing or invalid sampled contact geometry stays latched until world reset.
+inline constexpr uint32_t kEnvStatusContactGeometryUnavailable = 1u << 7;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
 inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
@@ -408,11 +412,8 @@ struct MpmStepParams {
     float    plane_n[3];
     float    plane_d;
     float    plane_mu;
-    // Dynamic-body grid BC (the two-way coupling). When dynamic_body_bc != 0 the
-    // substep loop rasterizes each cooked body's SDF onto the grid, projects the
-    // node velocity onto the body surface velocity (no-penetration + Coulomb mu),
-    // and deposits the equal-and-opposite reaction into the shared body sink. The
-    // grid provider's Couple sets it; default 0 => the static-plane-only path.
+    // Analytic primitives and cooked SDFs project grid velocity and record reaction.
+    // The deepest collidable supplies each node's current boundary condition.
     uint32_t dynamic_body_bc;
     // Free-fall BITE: disable the dynamic-body grid coupling -- both the per-substep
     // BC and the per-Step M^-1 J^T deposit (the static-plane BC stays on, so the
@@ -420,8 +421,9 @@ struct MpmStepParams {
     // coupling, not an artifact. Default 0.
     uint32_t bite_disable_dynamic_bc;
     uint32_t bodies_per_env;     // collidable body rows / env (the BC body loop).
+    uint32_t sdf_grid_count;     // available SDF descriptors; primitives need none.
     float    body_mu;            // Coulomb friction the body BC clamps the tangent by.
-    float    body_band;          // SDF |phi| band (cells nearer than this are BC nodes).
+    float    body_band;          // nodes with signed surface distance below this couple.
     // Articulation deposit dims (the link-row grid reaction -> qdot_flat seed). All
     // 0 for a body-only / MPM-only world -> the deposit kernel never launches.
     uint32_t artic_count;        // GLOBAL articulations (artics_per_env * env_count).
@@ -573,12 +575,10 @@ struct NarrowphaseBodyParticleParams {
     uint32_t nrow, ncol;
     float    min_z, max_z;      // LOCAL z-range (for the cell corner heights)
     uint32_t data_offset;       // base index into the `heights` field
+    uint32_t sdf_grid_count;    // available SDF descriptors
 };
 
-// Spec-fixed semantic fields : {contact_margin, max_contacts_per_pair}.
-// appends the pair-driven launch geometry: the op samples each sampling
-// shape's SAMP point slice against the OTHER shape's cooked SDF grid (plan
-// the spec). EARLY-EXITS unless family == kContactFamilyPairDriven.
+// Sampled surfaces query the opposing analytic/SDF geometry within each pair.
 struct NarrowphaseSdfParams {
     float   contact_margin;
     uint8_t max_contacts_per_pair;
@@ -588,6 +588,8 @@ struct NarrowphaseSdfParams {
     uint32_t bodies_per_env;
     uint32_t max_contacts_per_env;  // ucontact slot stride / env
     uint32_t rigid_slot_cap;    // body<->body live cap (<= stride; == stride if no particles)
+    uint32_t sdf_grid_count;    // available SDF descriptors
+    uint32_t sample_point_count; // available surface samples
 };
 
 struct ContactTangentBasisParams {

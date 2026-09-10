@@ -6,6 +6,8 @@
 
 最新执行顺序（2026-09-10）：收口当前 MLS-MPM 性能改动 → 完整多体/多介质耦合分析与优化 → 继续原 spec 全部剩余工作。主验证场景为 MLS-MPM water pool（原 bunny-water）和 jelly，暂停压痕 demo 测试；性能足够时进入下一阶段，剩余热点及历史回退保留，不要求先穷尽。耦合方案可仅由现有架构与物理推导独立设计，不必局限于 Newton/MuJoCo/Genesis；适用的外部结果用于物理对照。
 
+当前耦合范围按用户最新补充覆盖 ABA 机器人、刚体、柔体、XPBD/PBF（XPBF）和 MLS-MPM 的全量路径。最终验收包括机器人提起装多个小球的塑料袋，以及双夹爪拧毛巾，见 [全量细化 spec](../plans/2026-09-10-full-coupling-detailed-spec-zh.md)。共存、单向边界和固定顶点演示均不能代替完整双向耦合。
+
 按用户指定顺序推进：先完成 pi0.5 demo 的调优、代码修复和渲染，再细化 9 月 7 日引擎功能/性能优化规格，最后按细化规格开始执行。固定 seed 的 demo、reset、外力/重力、稳定自由旋转和共享风阻功能已验收，现接续执行、内存与性能模块。
 
 ## pi0.5 demo
@@ -43,9 +45,17 @@
 - [x] MPM 粒子/节点工作区按实际 P/N 分配：原 bunny 的 Data arena 减少 1,392,640 B，十对完整步时基本持平；既有 MPM 场景、固定 E=16 pipeline、十项 memcheck 和无 CUDA 核心构建通过，见 [容量验收](../research/2026-09-10-mpm-capacity-validation-zh.md)。直接读取与完整权重缓存候选未采用，失败证据保留。
 - [x] 收口并采纳 MPM cell 共享传输：原 bunny-water 五对落水 eager/graph 减少 20.03%/43.25%，Data arena 增加 47.69 MB；water/jelly、独立物理门、E=16 pipeline、memcheck/synccheck 和 8 对渲染帧通过。数值分组与 CUDA 实现分别记录，见 [验收记录](../research/2026-09-10-mpm-cell-transfer-validation-zh.md)。
 - [ ] 耦合改造后接续剩余性能：小水池墙时中位 +8.13% 且逐对波动、host 提交、稀疏网格、多环境与其他热点。中间版本压痕 eager +12.88% 保留、暂停追测，不冒称已解决。新物理需重新冻结分母，PBF 不替代 MLS-MPM。
-- [ ] 当前 MLS-MPM 性能批次收口后，接续无 SDF 碰撞体与完整多体/MPM 耦合：解析/凸体/网格统一几何查询、多个有限质量端点、每子步刚体与 articulation 反作用/速度刷新、MPM↔XPBD 直接界面。独立推导可验证的通用方案，性能结果明确已有覆盖与限制；耦合完成后继续原 spec 和其余性能热点。
+- [ ] 全量耦合矩阵逐项验收：ABA↔ABA/刚体/柔体/PBF/MPM、刚体↔刚体/柔体/PBF/MPM、柔体自接触与柔体↔PBF/MPM，以及 PBF↔PBF/MPM、MPM 多材料相互作用。每项记录当前路径、未完成能力、独立物理证据和公共 pipeline 覆盖。
+- [ ] 统一多端点有效质量、子步时间层、增量冲量与反作用读出；修复多关节树、复合碰撞形状及同一 owner 的归属，运动学/固定边界的外部冲量单独记账。
+- [ ] 连续布面/软体表面碰撞、点面与边边自碰撞、厚度、摩擦和 CCD；真实面权重与共同 Jacobian 保持线/角动量，不能用稀疏顶点球代替连续表面。
+- [ ] 完整 PBF↔柔体、MPM↔柔体和 PBF↔MPM 直接交换；消除全局粒子模式对多介质共存的限制，并明确 MPM 多材料的混合/分离与界面模型。
+- [ ] 机器人提袋装球 demo：真实 ABA 控制与夹爪摩擦抓持，袋内多个动态球；提起、摆动、停留、放下/释放，量测漏球/穿透、布面应变、负载回传，输出完整视频及精选 GIF。
+- [ ] 拧毛巾 demo：双夹爪真实抓持、相向扭转、保持、释放；验收大变形、自碰撞、滑移和反作用扭矩，输出视频/GIF。展示湿毛巾时必须有真实液体交换与质量收支。
+- [ ] 耦合完成后继续原 spec 和其余性能热点；物理改变后重建质量通过的性能分母。
 - [x] review 最新 Newton/MuJoCo/Genesis 与 M05/M08/M09，形成 [共享几何/owner 细化 spec](../plans/2026-09-10-coupling-surface-owner-detailed-spec-zh.md)，明确解析体覆盖、内部点距离、真实 owner 及后续多端点/子步契约。
-- [ ] 开始首批耦合生产代码：共享解析距离和 owner，修复内部球心 Box 接触、无 SDF 解析碰撞体及复合形状反作用路由；复用 water pool/jelly 和固定完整 pipeline 成批验收。
+- [x] 完成首批共享几何/owner 修复：内部球心 Box/Capsule 法线、无 SDF 解析碰撞体、真实 owner/力矩参考点、代理表面数据及状态反馈；water/jelly、固定 E=16 管线、公共 C/Python/reset/渲染通过，见 [验收](../research/2026-09-10-coupling-surface-owner-validation-zh.md)。
+- [x] 修复 bunny 的 Box/SDF 几何不一致和 SDF 接触点符号；真实顶点参与通用 mesh/plane 接触，报告直接量测旋转后的实际表面。错误 Box 轨迹、过期元数据断言及对应修正结果均保留。
+- [ ] 处理真实 bunny 冲击瞬间约 9.5 mm 的穿透、离散采样的几何覆盖及局部大 J；末态约 0.156 mm 支承误差不代表薄层/CCD 已完成。完整表面、有限质量、子步反馈及两项操作 demo 继续。
 - [x] 收口粒子时间层基础修复：统一工作位置、材料/接触交替、累计 lambda 与一次提交；六组完整长度门、已有场景/API/reset/渲染及 E=16 graph memcheck 通过。最大应变 1.838344%、最坏 RMS 0.203045%；完整接触刷新与 MPM 子步反馈另行继续。
 - [x] 单独完成构建架构隔离（`6953f4a`）：后端注册和 nk 核心脱离 CUDA 配置门，CUDA 源码与库按能力附加；无 CUDA 核心构建通过，不代表完整 CPU solver 已实现。
 - [x] 补充持续约束：原版不作为物理真值；参考 Newton/MuJoCo/Genesis 的匹配仿真、解析解/守恒/约束误差/收敛；multi-backend 下分开架构优化、CUDA 调优和物理算法变化。

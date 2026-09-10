@@ -38,6 +38,8 @@ static_assert(NUKA_CONTACT_SIDE_LINK == nk::kNkSideArtic);
 static_assert(NUKA_CONTACT_SIDE_PARTICLE == nk::kNkSideParticle);
 static_assert(NUKA_CONTACT_SIDE_STATIC == nk::kNkSideStatic);
 static_assert(NUKA_ENV_STATUS_GYRO_FAILURE == phi::kEnvStatusGyroFailure);
+static_assert(NUKA_ENV_STATUS_INVALID_ENDPOINT == phi::kEnvStatusInvalidEndpoint);
+static_assert(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE == phi::kEnvStatusContactGeometryUnavailable);
 static_assert(NUKA_GYRO_NOT_CONVERGED == phi::kBodyGyroNotConverged);
 static_assert(NUKA_GYRO_INVALID_INPUT == phi::kBodyGyroInvalidInput);
 

@@ -995,32 +995,33 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 }
                 cell_cursor += grid.cell_count;
             }
-            // Per-body: a SdfMesh/hull body carrying a cooked SDF binds sdf_grid;
-            // any body owning a hull piece gets a SAMP slice (the sampling set).
-            for (uint32_t s = 0; s < model.shapes.size(); ++s) {
-                const nk::ModelShape& sh = model.shapes[s];
-                if (sh.body_row >= cap.bodies_per_env) continue;
-                const uint32_t cgi = sh.convex_geometry_index;
-                if (cgi == ~uint32_t(0) || cgi >= geo.Count()) continue;
-                const uint32_t before = static_cast<uint32_t>(model.samp_points.size() / 3u);
-                const uint32_t added = CookHullSamples(geo, cgi, model.samp_points);
-                model.samp_ranges[sh.body_row * 2u + 0u] = before;
-                model.samp_ranges[sh.body_row * 2u + 1u] = added;
-                // If this piece has a cooked SDF, expose it on the body's shape row.
-                if (cgi < sdf.piece_sdf_indices.size() &&
-                    sdf.piece_sdf_indices[cgi] != kNoSdf &&
-                    sh.body_row < model.shape_table_rows.size()) {
-                    model.shape_table_rows[sh.body_row].sdf_grid =
-                        sdf.piece_sdf_indices[cgi];
-                }
-            }
-
-            // Bind each visual-mesh silhouette SDF to the collidable's sdf_grid (lane 7:
-            // MLS-MPM grid BC + particle query); the rigid kind/params stay the primitive.
+        }
+        // Samples and SDFs belong to the selected collidable, not another shape
+        // or visual mesh attached to the same dynamics body.
+        for (uint32_t b = 0u; b < cap.bodies_per_env; ++b) {
+            if (body_shape[b] == ~0u || body_proxied[b] != 0u) continue;
+            const auto& sh = model.shapes[body_shape[b]];
+            if (sh.kind != collision::kShapeConvexHull && sh.kind != collision::kShapeSdfMesh)
+                continue;
+            const uint32_t cgi = sh.convex_geometry_index;
+            if (cgi >= geo.Count()) continue;
+            const uint32_t before = static_cast<uint32_t>(model.samp_points.size() / 3u);
+            const uint32_t added = CookHullSamples(geo, cgi, model.samp_points);
+            model.samp_ranges[b * 2u] = before;
+            model.samp_ranges[b * 2u + 1u] = added;
+            if (cgi < sdf.piece_sdf_indices.size())
+                model.shape_table_rows[b].sdf_grid = sdf.piece_sdf_indices[cgi];
+        }
+        if (sdf.Count() > 0u) {
+            // Visual silhouettes may supply an unbound mesh collider, never replace
+            // an authored primitive or an SDF already bound to collision geometry.
             for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
                 if (b >= sdf.body_sdf_indices.size()) break;
                 const uint32_t gi = sdf.body_sdf_indices[b];
                 if (gi == kNoSdf || b >= model.shape_table_rows.size()) continue;
+                const auto& shape = model.shape_table_rows[b];
+                if (shape.kind != ::nuka::collision::kShapeSdfMesh || shape.sdf_grid != kNoSdf)
+                    continue;
                 model.shape_table_rows[b].sdf_grid = gi;
                 // Populate the orphaned ModelShape.sdf_index for this body's rows.
                 for (nk::ModelShape& msh : model.shapes)
@@ -1137,6 +1138,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                                    model.shape_table_rows.end());
         }
         model.shape_table_rows.resize(final_bodies);
+        model.samp_ranges.resize(static_cast<size_t>(final_bodies) * 2u, 0u);
         if (!model.body_init.empty()) {
             model.body_init.resize(final_bodies, nk::Model::BodyInit{});
         }
@@ -1208,6 +1210,12 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 prow.params[0] = std::sqrt(max_sq);
                 prow.hull_vert_offset = hull_base;
                 prow.hull_vert_count = vcnt;
+                const uint32_t sample_base = static_cast<uint32_t>(model.samp_points.size() / 3u);
+                const uint32_t sample_count = CookHullSamples(g, piece, model.samp_points);
+                model.samp_ranges[row * 2u] = sample_base;
+                model.samp_ranges[row * 2u + 1u] = sample_count;
+                if (piece < blob.sdfs.piece_sdf_indices.size())
+                    prow.sdf_grid = blob.sdfs.piece_sdf_indices[piece];
             }
             model.shape_table_rows[row] = prow;
 
@@ -1261,6 +1269,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         // sized separately (multi-geom feet do not co-occur with particles today).
         cap.bodies_per_env = final_bodies;
         cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
+        cap.max_hull_verts = static_cast<uint32_t>(model.hull_verts.size() / 3u);
+        cap.max_samp_points = static_cast<uint32_t>(model.samp_points.size() / 3u);
         cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
         if (enable_contacts) {
             cap.max_contacts_per_env = DefaultRigidCandidatePairs(final_bodies);

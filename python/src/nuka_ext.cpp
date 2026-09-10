@@ -1846,6 +1846,9 @@ NB_MODULE(_nuka_ext, m) {
         .value("NOT_CONVERGED", NUKA_GYRO_NOT_CONVERGED)
         .value("INVALID_INPUT", NUKA_GYRO_INVALID_INPUT);
     m.attr("ENV_STATUS_GYRO_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_GYRO_FAILURE);
+    m.attr("ENV_STATUS_INVALID_ENDPOINT") = static_cast<uint32_t>(NUKA_ENV_STATUS_INVALID_ENDPOINT);
+    m.attr("ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE") =
+        static_cast<uint32_t>(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE);
 
     nb::enum_<nuka_contact_side_kind_t>(m, "ContactSideKind")
         .value("RIGID", NUKA_CONTACT_SIDE_RIGID)

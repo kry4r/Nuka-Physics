@@ -19,16 +19,18 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
+#include "collision/primitive_surface.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
+#include "nk/solve/collidable_owner.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"  // chain-J helper + device state
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
+#include "phi/backend_cuda/ops/prims_types.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
-#include "phi/backend_cuda/ops/sdf_types.cuh"     // SdfRotate / SdfInverseTransformPoint
 #include "phi/op_schema.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"       // SparseSdfDevice / sparse_sdf_sample
 
@@ -506,11 +508,11 @@ __device__ __forceinline__ int64_t NodeId(uint32_t env, int64_t ix, int64_t iy,
     return static_cast<int64_t>(env) * nodes_per_env + local;
 }
 
-// Clear THIS op's grid-escape status bit per env (order-independent across ops).
-__global__ void MpmClearEscapeBitKernel(uint32_t* env_status, uint32_t env_count) {
+// MPM status accumulates across substeps; shared invalid-endpoint status stays latched.
+__global__ void MpmClearStatusBitsKernel(uint32_t* env_status, uint32_t env_count) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= env_count) return;
-    env_status[e] &= ~kEnvStatusMpmGridEscape;
+    env_status[e] &= ~(kEnvStatusMpmGridEscape | kEnvStatusMpmOneWayBody);
 }
 
 // Per-body reaction probes accumulate linear/angular impulse over all substeps.
@@ -924,18 +926,7 @@ __global__ void MpmGridFinalizeKernel(
     }
 }
 
-// Shape-table lane 7 (sdf_grid; ~0u when the shape has no cooked SDF), canonical
-// row stride. Mirrors the narrowphase reader so the body BC samples the same grids.
 namespace sdfq = ::nuka::runtime::sdf;
-__forceinline__ __device__ uint32_t ShapeSdfGrid(const float* table, uint32_t row) {
-    return __float_as_uint(
-        table[static_cast<size_t>(row) * nuka::phi::kShapeTableRowStride + 7u]);
-}
-// Shape-table lane 5 (contype; 0 => not a contact collider).
-__forceinline__ __device__ uint32_t ShapeContype(const float* table, uint32_t row) {
-    return __float_as_uint(
-        table[static_cast<size_t>(row) * nuka::phi::kShapeTableRowStride + 5u]);
-}
 // Load one SDF grid view from the Model sdf_* tables (header floats + flat cells).
 __forceinline__ __device__ sdfq::SparseSdfDevice LoadGrid(
     const float* headers, const uint32_t* counts, const uint64_t* keys,
@@ -960,12 +951,18 @@ __forceinline__ __device__ sdfq::SparseSdfDevice LoadGrid(
 __global__ void MpmGridBodyProjectKernel(
     uint32_t total_nodes, uint32_t nodes_per_env, uint32_t dims_x, uint32_t dims_y,
     float dx, m::Vec3 origin, uint32_t bodies_per_env, float body_mu, float band,
+    uint32_t links_per_env, uint32_t artics_per_env, uint32_t sdf_grid_count,
     const uint32_t* __restrict__ active_nodes,
     const uint32_t* __restrict__ active_node_count,
     const m::Transform* __restrict__ body_pose,
     const m::Transform* __restrict__ body_inertial_frame,
     const m::Vec3* __restrict__ body_lin_vel,
     const m::Vec3* __restrict__ body_ang_vel,
+    const m::Transform* __restrict__ link_pose,
+    const nkops::LinkSpatialVel* __restrict__ link_velocity,
+    const uint32_t* __restrict__ body_to_link,
+    const uint32_t* __restrict__ body_to_articulation,
+    const uint32_t* __restrict__ body_collidable_body,
     const float* __restrict__ shape_table, const float* __restrict__ sdf_headers,
     const uint32_t* __restrict__ sdf_cell_count,
     const uint64_t* __restrict__ sdf_keys, const float* __restrict__ sdf_values,
@@ -983,45 +980,61 @@ __global__ void MpmGridBodyProjectKernel(
     const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
     const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
     const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
-    // Pick the body whose SDF places this node deepest inside its band (most
-    // negative phi) -> a single deterministic owner per node.
-    uint32_t best_body = ~0u;
+    // Signed distances select the deepest surface in stable collidable order.
+    nk::CollidableOwner best_owner;
     float best_phi = band;
     m::Vec3 best_n = m::Vec3::Zero();
-    bool saw_one_way_body = false;
+    uint32_t status = 0u;
     for (uint32_t bl = 0u; bl < bodies_per_env; ++bl) {
-        const uint32_t grid = ShapeSdfGrid(shape_table, bl);
-        if (grid == ~0u) {
-            // The status is a bit, so one atomic per active node is identical to
-            // issuing the same OR once for every non-SDF collidable body.
-            saw_one_way_body |= ShapeContype(shape_table, bl) != 0u;
+        const nkops::PrimShapeDev shape = nkops::LoadPrimShape(shape_table, bl);
+        if ((shape.contype | shape.conaffinity) == 0u) continue;
+        const m::Transform xf = body_pose[env * bodies_per_env + bl];
+        const m::Vec3 q = nkops::PrimInverseTransformPoint(xf, xi);
+        const auto surface = collision::QueryPrimitiveSurface(
+            shape.kind, {shape.params[0], shape.params[1], shape.params[2]}, q);
+        float phi = surface.distance;
+        m::Vec3 grad = surface.normal;
+        if (!surface.valid) {
+            if (shape.sdf_grid >= sdf_grid_count) {
+                status |= kEnvStatusMpmOneWayBody;
+                continue;
+            }
+            const sdfq::SparseSdfDevice sg = LoadGrid(sdf_headers, sdf_cell_count,
+                sdf_keys, sdf_values, sdf_grads, shape.sdf_grid);
+            phi = sdfq::sparse_sdf_sample(sg, q, grad);
+        }
+        if (phi >= sdfq::SparseSdfDevice::kOutsideBand || phi >= best_phi) continue;
+        const m::Vec3 gw = nkops::PrimRotate(xf.rotation, grad);
+        const float gl = sqrtf(gw.LengthSq());
+        if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-8f) continue;
+        const nk::CollidableOwner owner = nk::ResolveCollidableOwner(
+            shape.body_id, env, bl, bodies_per_env, links_per_env, artics_per_env,
+            body_to_link, body_to_articulation, body_collidable_body);
+        if (owner.kind == ~0u ||
+            (owner.kind == nk::kNkSideArtic && (!link_pose || !link_velocity))) {
+            status |= kEnvStatusInvalidEndpoint;
             continue;
         }
-        const m::Transform xf = body_pose[env * bodies_per_env + bl];
-        const m::Vec3 q = nkops::SdfInverseTransformPoint(xf, xi);
-        const sdfq::SparseSdfDevice sg = LoadGrid(sdf_headers, sdf_cell_count,
-                                                  sdf_keys, sdf_values, sdf_grads, grid);
-        m::Vec3 grad{0.0f, 0.0f, 0.0f};
-        const float phi = sdfq::sparse_sdf_sample(sg, q, grad);
-        if (phi >= sdfq::SparseSdfDevice::kOutsideBand || phi >= best_phi) continue;
-        const m::Vec3 gw = nkops::SdfRotate(xf.rotation, grad);
-        const float gl = sqrtf(gw.LengthSq());
-        if (gl < 1.0e-8f) continue;
         best_phi = phi;
-        best_body = env * bodies_per_env + bl;
+        best_owner = owner;
         best_n = gw * (1.0f / gl);
     }
-    if (saw_one_way_body && env_status != nullptr)
-        atomicOr(&env_status[env], kEnvStatusMpmOneWayBody);
-    if (best_body == ~0u) return;
-    // Free-body surface velocities and impulses share the same COM anchor.
-    const m::Vec3 xb = nkops::BodyCenterOfMass(body_pose[best_body], body_inertial_frame[best_body]);
-    const m::Vec3 vb = (body_lin_vel != nullptr) ? body_lin_vel[best_body]
-                                                  : m::Vec3::Zero();
-    const m::Vec3 wb = (body_ang_vel != nullptr) ? body_ang_vel[best_body]
-                                                  : m::Vec3::Zero();
-    const m::Vec3 r = xi - xb;
-    const m::Vec3 v_surf = vb + wb.Cross(r);
+    if (status != 0u && env_status != nullptr) atomicOr(&env_status[env], status);
+    if (best_owner.kind == ~0u) return;
+    m::Vec3 v_surf = m::Vec3::Zero();
+    if (best_owner.kind == nk::kNkSideArtic) {
+        const m::Transform pose = link_pose[best_owner.link];
+        const nkops::LinkSpatialVel spatial = link_velocity[best_owner.link];
+        const m::Vec3 omega = nkops::PrimRotate(pose.rotation,
+            {spatial.v[0], spatial.v[1], spatial.v[2]});
+        const m::Vec3 linear = nkops::PrimRotate(pose.rotation,
+            {spatial.v[3], spatial.v[4], spatial.v[5]});
+        v_surf = linear + omega.Cross(xi - pose.position);
+    } else if (best_owner.kind == nk::kNkSideRigid) {
+        const uint32_t b = best_owner.body;
+        const m::Vec3 com = nkops::BodyCenterOfMass(body_pose[b], body_inertial_frame[b]);
+        v_surf = body_lin_vel[b] + body_ang_vel[b].Cross(xi - com);
+    }
     const m::Vec3 v_before = velocity[i];
     m::Vec3 v_rel = v_before - v_surf;
     const float vn = v_rel.Dot(best_n);
@@ -1037,7 +1050,7 @@ __global__ void MpmGridBodyProjectKernel(
         const m::Vec3 v_after = v_surf + v_rel;
         velocity[i] = v_after;
         body_dp[i] = (v_after - v_before) * mi;
-        body_owner[i] = best_body;
+        body_owner[i] = best_owner.body;
     }
 }
 
@@ -1047,11 +1060,16 @@ __global__ void MpmGridBodyReactKernel(
     uint32_t total_bodies, uint32_t bodies_per_env, uint32_t total_nodes,
     uint32_t nodes_per_env,
     uint32_t dims_x, uint32_t dims_y, float dx, m::Vec3 origin,
+    uint32_t links_per_env, uint32_t artics_per_env,
+    const float* __restrict__ shape_table,
     const m::Transform* __restrict__ body_pose,
     const m::Transform* __restrict__ body_inertial_frame,
+    const m::Transform* __restrict__ link_pose,
     const float* __restrict__ body_inv_mass,
     const m::SymmetricMat3* __restrict__ body_world_inv_inertia,
     const uint32_t* __restrict__ body_to_link,
+    const uint32_t* __restrict__ body_to_articulation,
+    const uint32_t* __restrict__ body_collidable_body,
     const m::Vec3* __restrict__ body_dp,
     const uint32_t* __restrict__ sorted_body_owner,
     const uint32_t* __restrict__ sorted_node_id,
@@ -1059,13 +1077,17 @@ __global__ void MpmGridBodyReactKernel(
     m::Vec3* __restrict__ body_reaction, m::Vec3* __restrict__ body_ang_reaction) {
     const uint32_t b = blockIdx.x;
     if (b >= total_bodies) return;
-    const float im = body_inv_mass[b];
-    const bool is_link = (body_to_link != nullptr) && (body_to_link[b] != ~0u);
-    // A free-rigid immovable body (static ground/wall) imposes no reaction; a link
-    // row is cooked inv_mass==0 yet DOES react through its articulation, so it runs.
-    if (im <= 0.0f && !is_link) return;
     const uint32_t env = b / bodies_per_env;
-    const m::Vec3 xb = is_link ? body_pose[b].position
+    const uint32_t local_body = b % bodies_per_env;
+    const nkops::PrimShapeDev shape = nkops::LoadPrimShape(shape_table, local_body);
+    const nk::CollidableOwner owner = nk::ResolveCollidableOwner(
+        shape.body_id, env, local_body, bodies_per_env, links_per_env, artics_per_env,
+        body_to_link, body_to_articulation, body_collidable_body);
+    if (owner.kind == ~0u || owner.body != b) return;
+    const float im = body_inv_mass[b];
+    const bool is_link = owner.kind == nk::kNkSideArtic;
+    if (is_link && link_pose == nullptr) return;
+    const m::Vec3 xb = is_link ? link_pose[owner.link].position
         : nkops::BodyCenterOfMass(body_pose[b], body_inertial_frame[b]);
     const uint32_t base = env * nodes_per_env;
     m::Vec3 dp_sum = m::Vec3::Zero();   // sum of node momentum changes this body caused.
@@ -1121,7 +1143,7 @@ __global__ void MpmGridBodyReactKernel(
     // IS the substep impulse (no dt scale).
     const m::Vec3 lin_impulse = dp_sum * (-1.0f);
     const m::Vec3 ang_impulse = tq_sum * (-1.0f);
-    if (!is_link) {  // the solve_rows.cu free-rigid apply form.
+    if (owner.kind == nk::kNkSideRigid && im > 0.0f) {
         body_lin_vel[b].x += lin_impulse.x * im;
         body_lin_vel[b].y += lin_impulse.y * im;
         body_lin_vel[b].z += lin_impulse.z * im;
@@ -1137,8 +1159,8 @@ __global__ void MpmGridBodyReactKernel(
         body_reaction[b].y += lin_impulse.y;
         body_reaction[b].z += lin_impulse.z;
     }
-    // A link body's torque impulse feeds the per-articulation M^-1 J^T deposit.
-    if (is_link && body_ang_reaction != nullptr) {
+    // Static reactions remain observable as external impulse; link torques feed J^T.
+    if (body_ang_reaction != nullptr) {
         body_ang_reaction[b].x += ang_impulse.x;
         body_ang_reaction[b].y += ang_impulse.y;
         body_ang_reaction[b].z += ang_impulse.z;
@@ -1150,7 +1172,6 @@ __global__ void MpmGridBodyReactKernel(
 __global__ void MpmArticReactDepositKernel(
     nkops::ArticulationDeviceState state, uint32_t artic_count, uint32_t artics_per_env,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t max_dof,
-    const m::Transform* __restrict__ body_pose,
     const uint32_t* __restrict__ body_to_link,
     const m::Vec3* __restrict__ body_reaction,
     const m::Vec3* __restrict__ body_ang_reaction,
@@ -1165,21 +1186,21 @@ __global__ void MpmArticReactDepositKernel(
     // Sum each owned link's J^T wrench. Ascending body row -> deterministic g.
     const uint32_t row0 = env * bodies_per_env;
     for (uint32_t lb = 0u; lb < bodies_per_env; ++lb) {
-        const uint32_t tmpl_link = body_to_link[lb];
-        if (tmpl_link == ~0u) continue;                 // free rigid / static row.
+        const uint32_t b = row0 + lb;
+        const uint32_t tmpl_link = body_to_link[b];
+        if (tmpl_link >= base_link_count) continue;
         const uint32_t gl_link = env * base_link_count + tmpl_link;
         if (gl_link >= state.total_link_count) continue;
         // Derive offset from the link's OWN articulation (the assemble_rows.cu
         // reference), then skip if it is not this thread's tile -> race-free.
         const uint32_t articulation = state.link_to_articulation[gl_link];
         if (articulation != ag) continue;
-        const uint32_t b = row0 + lb;
         const m::Vec3 f = body_reaction[b];
         const m::Vec3 tau = body_ang_reaction[b];
         if (f.x == 0.0f && f.y == 0.0f && f.z == 0.0f &&
             tau.x == 0.0f && tau.y == 0.0f && tau.z == 0.0f) continue;
         const uint32_t offset = state.articulation_link_offset[articulation];
-        const m::Vec3 point = body_pose[b].position;  // == the react gather anchor.
+        const m::Vec3 point = state.link_pose[gl_link].position;
         // Bounded root-walk: a chain is at most total_link_count deep, and every link
         // is range-checked, so a malformed parent map can never spin the GPU.
         uint32_t link = gl_link;
@@ -1431,9 +1452,14 @@ cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
         const uint32_t total_bodies = p.bodies_per_env * p.env_count;
         launch(MpmStage::BodyProject, MpmGridBodyProjectKernel, nblocks,
                total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-               p.bodies_per_env, p.body_mu, p.body_band, scratch.active_nodes, scratch.active_count,
+               p.bodies_per_env, p.body_mu, p.body_band,
+               p.base_link_count, p.artics_per_env, p.sdf_grid_count,
+               scratch.active_nodes, scratch.active_count,
                data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
-               data.body_angular_velocity, model.shape_table, model.sdf_headers,
+               data.body_angular_velocity, data.link_pose,
+               reinterpret_cast<const nkops::LinkSpatialVel*>(data.link_velocity),
+               model.body_to_link, model.body_to_articulation, model.body_collidable_body,
+               model.shape_table, model.sdf_headers,
                model.sdf_cell_count, model.sdf_cell_keys, model.sdf_cell_values,
                model.sdf_cell_gradients, data.grid_mass, data.grid_velocity,
                data.grid_body_dp, data.grid_body_owner, data.env_status);
@@ -1449,8 +1475,11 @@ cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
         launch(MpmStage::BodyReact, MpmGridBodyReactKernel, total_bodies,
                total_bodies, p.bodies_per_env, total_nodes, p.nodes_per_env,
                p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-               data.body_pose, data.body_inertial_frame, data.body_inv_mass, data.body_world_inv_inertia,
-               model.body_to_link, data.grid_body_dp, scratch.keys_out, scratch.idx_out,
+               p.base_link_count, p.artics_per_env, model.shape_table,
+               data.body_pose, data.body_inertial_frame, data.link_pose,
+               data.body_inv_mass, data.body_world_inv_inertia,
+               model.body_to_link, model.body_to_articulation, model.body_collidable_body,
+               data.grid_body_dp, scratch.keys_out, scratch.idx_out,
                data.body_linear_velocity, data.body_angular_velocity,
                data.mpm_body_reaction, data.mpm_body_ang_reaction);
     }
@@ -1501,9 +1530,22 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         !data.mpm_grid_cell_key || !data.mpm_grid_part_idx || !data.mpm_particle_stress ||
         !data.env_status || (p->material_count > 0u && !data.mpm_material_table))
         return Status::InvalidArgument;
-    if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u && p->bodies_per_env > 0u &&
-        (!model.shape_table || !data.body_pose || !data.body_inertial_frame || !data.body_inv_mass ||
-         !data.body_linear_velocity)) return Status::InvalidArgument;
+    if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u && p->bodies_per_env > 0u) {
+        if (!model.shape_table || !data.body_pose || !data.body_inertial_frame ||
+            !data.body_inv_mass || !data.body_world_inv_inertia || !data.body_linear_velocity ||
+            !data.body_angular_velocity || !data.mpm_body_reaction || !data.mpm_body_ang_reaction)
+            return Status::InvalidArgument;
+        if (p->sdf_grid_count > 0u &&
+            (!model.sdf_headers || !model.sdf_cell_count || !model.sdf_cell_keys ||
+             !model.sdf_cell_values || !model.sdf_cell_gradients)) return Status::InvalidArgument;
+        if (p->artic_count > 0u &&
+            (p->base_link_count == 0u || p->artics_per_env == 0u ||
+             static_cast<uint64_t>(p->artics_per_env) * p->env_count != p->artic_count ||
+             static_cast<uint64_t>(p->base_link_count) * p->env_count > INT_MAX ||
+             !data.link_pose || !data.link_velocity || !model.body_to_link ||
+             !model.body_to_articulation ||
+             (p->max_dof > 0u && (!data.m_inv || !data.qdot_flat)))) return Status::InvalidArgument;
+    }
     const uint32_t mpm_count = static_cast<uint32_t>(mpm_count64);
     const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
@@ -1519,12 +1561,11 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     const m::Vec3 origin{p->grid_origin[0], p->grid_origin[1], p->grid_origin[2]};
     const uint32_t substeps = p->substeps == 0u ? 1u : p->substeps;
     const float dt_sub = p->dt / static_cast<float>(substeps);
-    // Clear THIS op's grid-escape bit per env once (the per-substep cell-key kernel
-    // ORs into it without re-clearing, so an escape in any substep stays flagged).
+    // Clear MPM-owned diagnostics once; every substep contributes to the same status.
     if (data.env_status != nullptr) {
         const uint32_t e = p->env_count == 0u ? 1u : p->env_count;
         const uint32_t eb = (e + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(MpmClearEscapeBitKernel, dim3(eb), dim3(kBlockSize), 0u, stream,
+        LaunchCuda(MpmClearStatusBitsKernel, dim3(eb), dim3(kBlockSize), 0u, stream,
                    data.env_status, e);
     }
     // Zero the per-step reaction probe so it accumulates only this step's substeps.
@@ -1553,7 +1594,7 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
         profiler.Start(MpmStage::ArticDeposit, stream);
         LaunchCuda(MpmArticReactDepositKernel, dim3(ablocks), dim3(kBlockSize), 0u,
                    stream, state, p->artic_count, p->artics_per_env, p->bodies_per_env,
-                   p->base_link_count, p->max_dof, data.body_pose, model.body_to_link,
+                   p->base_link_count, p->max_dof, model.body_to_link,
                    data.mpm_body_reaction, data.mpm_body_ang_reaction, data.m_inv,
                    data.qdot_flat);
         profiler.Stop(MpmStage::ArticDeposit, stream);

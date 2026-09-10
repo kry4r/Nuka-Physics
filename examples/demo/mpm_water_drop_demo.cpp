@@ -21,6 +21,7 @@
 #include <system_error>
 #include <vector>
 
+#include "collision/shape_kind.hpp"
 #include "import/cooker/sparse_sdf_cooker.hpp"
 #include "import/cooker/sparse_sdf_storage.hpp"
 #include "import/mesh_file_loader.hpp"
@@ -83,8 +84,7 @@ void WriteJson(const std::string& path, const Json& report) {
 }
 
 constexpr float kPi = 3.14159265358979323846f;
-constexpr uint32_t kKindBox = 2u;
-constexpr uint32_t kKindPlane = 3u;
+constexpr uint32_t kKindPlane = nuka::collision::kShapePlane;
 
 // The grid x/y walls and floor boundary contain the fluid pool.
 constexpr float kFloorZ      = 0.0f;
@@ -177,8 +177,14 @@ Vec3 BunnyHalfExtents(const soft::TriMesh& bunny) {
     return Vec3{0.5f * (hi.x - lo.x), 0.5f * (hi.y - lo.y), 0.5f * (hi.z - lo.z)};
 }
 
-// Bake the bunny mesh into a sparse narrow-band SDF grid + a shape row. The MPM
-// body BC samples ONLY this cooked grid (the analytic kind/params are unused).
+float SurfaceMinZ(const soft::TriMesh& mesh, const Transform& pose) {
+    const Vec3 up = pose.rotation.Conjugate().Rotate(Vec3{0.0f, 0.0f, 1.0f});
+    float local_min = std::numeric_limits<float>::infinity();
+    for (const Vec3& point : mesh.positions) local_min = std::min(local_min, point.Dot(up));
+    return pose.position.z + local_min;
+}
+
+// The mesh supplies the SDF and local surface samples; its bounds only cull pairs.
 void AddBunnySdf(nk::Model& m, int32_t body_id, const soft::TriMesh& bunny, float voxel) {
     std::vector<float> verts; verts.reserve(bunny.positions.size() * 3);
     for (const Vec3& p : bunny.positions) { verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z); }
@@ -204,15 +210,21 @@ void AddBunnySdf(nk::Model& m, int32_t body_id, const soft::TriMesh& bunny, floa
 
     const Vec3 half = BunnyHalfExtents(bunny);
     nk::Model::PairDrivenShape sh;
-    sh.kind = kKindBox;  // unused by the MPM BC; AABB half just for any broadphase bound.
-    sh.params[0] = half.x; sh.params[1] = half.y; sh.params[2] = half.z;
+    sh.kind = nuka::collision::kShapeSdfMesh;
+    sh.params[0] = std::sqrt(half.Dot(half));
+    sh.params[1] = half.x; sh.params[2] = half.y; sh.params[3] = half.z;
     sh.contype = 1u; sh.conaffinity = 1u;
     sh.sdf_grid = grid_idx; sh.body_id = body_id; sh.group = 0u;
     m.shape_table_rows.push_back(sh);
+    m.samp_ranges.resize(m.body_init.size() * 2u, 0u);
+    m.samp_ranges[static_cast<size_t>(body_id) * 2u] =
+        static_cast<uint32_t>(m.samp_points.size() / 3u);
+    m.samp_ranges[static_cast<size_t>(body_id) * 2u + 1u] =
+        static_cast<uint32_t>(bunny.positions.size());
+    m.samp_points.insert(m.samp_points.end(), verts.begin(), verts.end());
 }
 
-// A static ground plane at z=0 (local +z up via the +90deg-about-x pose). No SDF,
-// so it is a rigid-contact floor only; the fluid keeps its own grid floor BC.
+// The analytic plane supports the rigid mesh and fluid at the pool floor.
 void AddGroundPlane(nk::Model& m, int32_t body_id) {
     nk::Model::BodyInit bi;
     bi.pose = Transform::Identity();
@@ -253,6 +265,8 @@ nk::Model BuildModel(float release_z, const soft::TriMesh& bunny) {
     cap.bodies_per_env = bodies; cap.max_bodies_total = bodies;
     cap.max_sdf_grids = static_cast<uint32_t>(m.sdf_grids.size());
     cap.max_sdf_cells = static_cast<uint32_t>(m.sdf_cell_values.size());
+    cap.max_samp_points = static_cast<uint32_t>(m.samp_points.size() / 3u);
+    m.samp_ranges.resize(static_cast<size_t>(bodies) * 2u, 0u);
     cap.max_contacts_per_env = 16u;
     cap.max_rows_per_env = 16u * nk::kPairDrivenRowsPerSlot;
     m.contact_family = nk::ContactFamily::PairDriven;
@@ -958,13 +972,14 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
         lin_vel = body_vel[0];
         reaction = body_reaction[0];
         const float box_z = body[0].position.z;
+        const float bottom_z = SurfaceMinZ(bunny, body[0]);
         const float surf = SurfaceMaxZ(fpos, P);
         uint32_t sc; float smz;
         SplashStats(fpos, P, splash_thresh, &sc, &smz);
         peak_surface = std::max(peak_surface, surf);
         max_splash_z = std::max(max_splash_z, smz);
         if (sc > max_splash_count) { max_splash_count = sc; peak_splash_step = s; }
-        box_min_z = std::min(box_min_z, box_z - bunny_half.z);
+        box_min_z = std::min(box_min_z, bottom_z);
         min_vz = std::min(min_vz, lin_vel.z);
         max_react = std::max(max_react, reaction.z);
         if (lin_vel.z > prev_vz + 1e-4f && min_vz < -0.2f) decel = true;
@@ -976,6 +991,7 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
             Json sample = Json::Object();
             sample.Set("drop_step", Json::Int(s));
             sample.Set("bunny_z_m", Json::Float(box_z));
+            sample.Set("bunny_surface_min_z_m", Json::Float(bottom_z));
             sample.Set("bunny_vz_m_s", Json::Float(lin_vel.z));
             sample.Set("reaction_z_Ns", Json::Float(reaction.z));
             sample.Set("volume_ratio", Json::Float(current_volume_ratio));
@@ -1013,7 +1029,7 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
     const bool stable = !nonfinite && escape == 0u && min_J > 0.0f;
     const bool submerged = box_min_z < rest_surface - 0.5f * bunny_half.z;
     const bool volume_ok = max_volume_ratio_error <= 0.05;
-    const bool status_ok = (status_union & ~nphi::kEnvStatusMpmOneWayBody) == 0u;
+    const bool status_ok = status_union == 0u;
     const bool ok = splash && two_way && stable && submerged && volume_ok && status_ok;
     SaveState(world, args.state_output);
     if (!args.perf_json.empty()) {
@@ -1029,6 +1045,11 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
         configuration.Set("dx", Json::Float(kDx));
         configuration.Set("bulk_modulus", Json::Float(kBulk));
         configuration.Set("viscosity", Json::Float(kViscosity));
+        configuration.Set("collision_geometry", Json::Str("SdfMesh"));
+        configuration.Set("collision_surface_samples", Json::Int(world.GetModel().capacities.max_samp_points));
+        configuration.Set("sdf_voxel_size", Json::Float(kDx * 0.6f));
+        configuration.Set("bunny_mass_kg", Json::Float(kBunnyMass));
+        configuration.Set("inertia_model", Json::Str("uniform box with the mesh AABB extents"));
         configuration.Set("settle_steps", Json::Int(kSettleSteps));
         configuration.Set("drop_steps", Json::Int(kDropSteps));
         report.Set("config", std::move(configuration));
@@ -1049,6 +1070,8 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
         quality.Set("trajectory_scope", Json::Str("all settle/drop particle position, velocity, F; body pose, velocities and reaction; status"));
         quality.Set("min_J", Json::Float(min_J));
         quality.Set("max_J", Json::Float(max_J));
+        quality.Set("minimum_bunny_surface_z_m", Json::Float(box_min_z));
+        quality.Set("final_bunny_surface_z_m", Json::Float(SurfaceMinZ(bunny, body[0])));
         quality.Set("settled_volume_ratio", Json::Float(settled_volume_ratio));
         quality.Set("max_volume_ratio_error", Json::Float(max_volume_ratio_error));
         quality.Set("volume_ratio_error_limit", Json::Float(0.05));

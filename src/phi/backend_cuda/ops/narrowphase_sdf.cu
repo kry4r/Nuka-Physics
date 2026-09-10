@@ -1,32 +1,9 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M5 NarrowphaseSdf op (plan §3.5: the SDF MAIN PATH for
-// arbitrary mesh contact, Genesis-style point-vs-grid SAMPLING — NOT the Newton
-// 1-point witness, which stays the CPU tier until M9).
-//
-// For each candidate pair where the OTHER shape carries a cooked sparse narrow-
-// band SDF (shape.sdf_grid != ~0), the SAMPLING shape's cooked sample-point set
-// (hull verts + edge midpoints, the .nka SAMP chunk, staged into samp_points /
-// samp_ranges) is transformed into the SDF shape's local frame and queried
-// against the SDF grid (value/gradient -> contact point/normal/depth). The
-// deepest-K (K = max_contacts_per_pair) penetrating samples are selected in a
-// DETERMINISTIC fixed order (sample index ascending on a penetration tie) and
-// written into the ucontact_* manifold scratch — the SAME layout AssembleRows
-// consumes (so AssembleRows is UNCHANGED).
-//
-// The SDF sampler is the SHARED runtime/sdf header (sparse_sdf_query.cuh,
-// trilinear, binary search, fixed accumulation order -> D1). The Model SDF cell
-// tables are the SdfDeviceWorld layout moved INTO the Model device buffer
-// (sdf_headers / sdf_cell_keys / sdf_cell_values / sdf_cell_gradients).
-//
-// FAMILY GATING: EARLY-EXITS unless family == kContactFamilyPairDriven (the
-// union slot-template family detects fingertip x cup with cvx::SphereHull, NOT
-// the SDF path). A standalone test launcher (LaunchNarrowphaseSdf) drives the
-// converted GJK/EPA precision oracle (test_gjk_epa_convex.cpp) against analytic
-// truth with hand-built device SDF + sample buffers.
-// ---------------------------------------------------------------------------
+// Surface samples query analytic or sparse SDF geometry and emit shared manifolds.
+// Bounds cull candidates; only the declared collision surface supplies contacts.
 
 #include <cuda_runtime.h>
 
+#include "collision/primitive_surface.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/contact/contact_identity.hpp"
@@ -44,12 +21,6 @@ namespace nkops {
 
 namespace sdf = ::nuka::runtime::sdf;
 
-// SDF header row stride (f32 / grid): origin.xyz, voxel_size, dims.xyz, cell_offset.
-// FLAG: model.cpp:91 (ElementCount(SdfHeaders) = max_sdf_grids*8) and model.cpp:364
-// (staging stride) hardcode the same 8; the divergence-proof home is sdf_types.cuh
-// / sparse_sdf_query.cuh so both TUs share THIS constant.
-constexpr uint32_t kSdfHeaderStride = 8u;
-
 // Load one SDF grid view from the Model sdf_* device tables (kSdfHeaderStride f32
 // header + flat cell arrays). Mirrors SparseSdfDevice; cell_* point into the buffer.
 __device__ sdf::SparseSdfDevice LoadSdfGrid(const float* headers,
@@ -58,7 +29,7 @@ __device__ sdf::SparseSdfDevice LoadSdfGrid(const float* headers,
                                             const float* values,
                                             const math::Vec3* grads,
                                             uint32_t grid) {
-    const float* h = headers + static_cast<size_t>(grid) * kSdfHeaderStride;
+    const float* h = headers + static_cast<size_t>(grid) * ::nuka::phi::kSdfHeaderStride;
     sdf::SparseSdfDevice s;
     s.origin = {h[0], h[1], h[2]};
     s.voxel_size = h[3];
@@ -73,14 +44,11 @@ __device__ sdf::SparseSdfDevice LoadSdfGrid(const float* headers,
     return s;
 }
 
-// Insert one penetrating sample into the per-slot deepest-K manifold buffer,
-// keeping the slots ordered by DESCENDING depth with the sample index as the
-// tie-break (the deterministic fixed order). out_* are the 4-slot ucontact
-// arrays for ONE contact slot (gid).
+// Keep descending depth; equal-depth samples retain their insertion order.
 __device__ void DeepestKInsert(math::Vec3 point, math::Vec3 normal, float depth,
-                               uint32_t sample_id, uint32_t k,
+                               uint32_t id_a, uint32_t id_b, uint32_t k,
                                math::Vec3* pt, math::Vec3* nm, float* dp,
-                               uint32_t* feature, uint32_t* count) {
+                               uint32_t* feature_a, uint32_t* feature_b, uint32_t* count) {
     uint32_t n = *count;
     // Find the insertion position (descending depth). Equal-depth ties keep the
     // earlier-inserted sample (sample index ascending) — stable insert.
@@ -91,10 +59,12 @@ __device__ void DeepestKInsert(math::Vec3 point, math::Vec3 normal, float depth,
     uint32_t last = (n < k) ? n : (k - 1u);
     for (uint32_t i = last; i > pos; --i) {
         pt[i] = pt[i - 1u]; nm[i] = nm[i - 1u]; dp[i] = dp[i - 1u];
-        feature[i] = feature[i - 1u];
+        feature_a[i] = feature_a[i - 1u];
+        feature_b[i] = feature_b[i - 1u];
     }
     pt[pos] = point; nm[pos] = normal; dp[pos] = depth;
-    feature[pos] = sample_id;
+    feature_a[pos] = id_a;
+    feature_b[pos] = id_b;
     *count = (n < k) ? (n + 1u) : k;
 }
 
@@ -105,17 +75,7 @@ namespace {
 using namespace ::nuka::phi::nkops;
 namespace sdf = ::nuka::runtime::sdf;
 
-// Read just lane 7 (sdf_grid; ~0u when the shape has no cooked SDF) of a
-// shape_table row, using the shared row stride.
-__forceinline__ __device__ uint32_t LoadShapeSdfGrid(const float* table,
-                                                     uint32_t row) {
-    return __float_as_uint(table[static_cast<size_t>(row) * nkops::kShapeTableRowStride + 7u]);
-}
-
-// One thread per (env x sampling-body). Samples the body's SAMP slice against
-// the target SDF grid and writes the deepest-K manifold into the body's
-// ucontact slot. The contact NORMAL is the SDF gradient (separation dir for the
-// SAMPLING shape = A), depth = -phi (penetration positive inside the surface).
+// Each pair samples a local surface into an SDF, with normals separating A.
 __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
                                      const uint32_t* __restrict__ samp_ranges,
                                      const float* __restrict__ shape_table,
@@ -153,7 +113,8 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
     const sdf::SparseSdfDevice sdf_grid = LoadSdfGrid(
         sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads, grid);
 
-    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4]; uint32_t feature[4];
+    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4];
+    uint32_t feature_a[4], feature_b[4];
     uint32_t kept = 0u;
 
     for (uint32_t s = 0u; s < scnt; ++s) {
@@ -168,18 +129,15 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
         if (phi >= sdf::SparseSdfDevice::kOutsideBand) continue;
         const float depth = -phi + margin;   // penetration (positive inside).
         if (depth <= 0.0f) continue;
-        // Contact normal: the SDF gradient in WORLD, pointing OUT of the target
-        // surface = separation dir for the sampling shape (A). Rotate grad
-        // (local) by the target rotation.
+        // The world SDF gradient separates the sampling shape from the target.
         const math::Vec3 gw = SdfRotate(txf.rotation, grad);
         const float gl = sqrtf(gw.x * gw.x + gw.y * gw.y + gw.z * gw.z);
-        const math::Vec3 n = (gl > 1.0e-12f)
-            ? math::Vec3{gw.x / gl, gw.y / gl, gw.z / gl}
-            : math::Vec3{0.0f, 0.0f, 1.0f};
+        if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-12f) continue;
+        const math::Vec3 n = gw / gl;
         // Contact point: the sample, pushed back onto the surface along n.
-        const math::Vec3 cp{world.x - n.x * depth, world.y - n.y * depth,
-                            world.z - n.z * depth};
-        DeepestKInsert(cp, n, depth, s, k, pt, nm, dp, feature, &kept);
+        const math::Vec3 cp = world - n * phi;
+        DeepestKInsert(cp, n, depth, s, nk::kContactFeatureUnavailable,
+                       k, pt, nm, dp, feature_a, feature_b, &kept);
     }
 
     ucount[out_gid] = kept;
@@ -193,16 +151,8 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
     }
 }
 
-// In-pipeline SDF narrowphase: one thread per (env x candidate slot). When the
-// slot's broadphase pair has EXACTLY one side carrying a cooked SDF grid, sample
-// the OTHER (sampling) shape's SAMP point slice against that grid and write the
-// deepest-K manifold into THIS slot's unified ucontact_* (side a == the sampling
-// body, side b == the SDF body). A non-SDF slot is LEFT untouched (it belongs to
-// NarrowphasePrimitives / NarrowphaseHeightfield, which ran first and wrote it).
-// Mirrors the NarrowphaseHeightfield slot-ownership pattern so the three pair-
-// driven narrowphases compose over one candidate stream without clobbering.
-constexpr uint32_t kNoSdfGrid = ~0u;
-
+// Sample both surfaces into the shared manifold when analytic/convex detection
+// leaves the pair empty. Primitive and SDF targets share the same signed-distance contract.
 __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs,
                                     const uint32_t* __restrict__ pair_count,
                                     const float* __restrict__ shape_table,
@@ -218,6 +168,7 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint32_t bodies_per_env,
                                     uint32_t slot_stride,
                                     uint32_t rigid_slot_cap,
+                                    uint32_t sdf_grid_count, uint32_t sample_point_count,
                                     uint32_t k,
                                     float margin,
                                     uint32_t* __restrict__ ucount,
@@ -231,7 +182,8 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint32_t* __restrict__ ucontact_gen,
                                     uint64_t* __restrict__ ucontact_id_pair,
                                     uint64_t* __restrict__ ucontact_id_feature,
-                                    uint32_t* __restrict__ contact_count) {
+                                    uint32_t* __restrict__ contact_count,
+                                    uint32_t* __restrict__ env_status) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * slot_stride;
     if (gid >= total) return;
@@ -241,77 +193,109 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
     // body<->particle narrowphase (== slot_stride when no particles -> identical).
     if (slot >= pair_count[env] || slot >= rigid_slot_cap) return;
 
-    // Own ONLY slots the analytic/cvx (NarrowphasePrimitives) + heightfield ops
-    // left EMPTY: a hull body may ALSO carry an SDF grid (the cook binds sdf_grid
-    // on hull bodies), and that pair is already resolved by the cvx hull path.
-    // Filling only empty slots covers exactly the "non-cvx side -> empty; the SDF
-    // path covers it" gap those ops promise, with no clobber of a valid manifold.
+    // Analytic, convex and heightfield detection retain any manifold they emitted.
     if (ucount[gid] != 0u) return;
 
     const uint32_t a = candidate_pairs[static_cast<size_t>(gid) * 2u + 0u];
     const uint32_t b = candidate_pairs[static_cast<size_t>(gid) * 2u + 1u];
-    // shape_table lane 7 == sdf_grid (kNoSdfGrid when the shape has no cooked SDF).
-    const uint32_t ga = LoadShapeSdfGrid(shape_table, a);
-    const uint32_t gb = LoadShapeSdfGrid(shape_table, b);
-    const bool a_sdf = (ga != kNoSdfGrid);
-    const bool b_sdf = (gb != kNoSdfGrid);
-    if (a_sdf == b_sdf) return;  // both or neither -> not an SDF pair; leave it.
-
-    const uint32_t sample_body = a_sdf ? b : a;   // the OTHER shape samples.
-    const uint32_t target_body = a_sdf ? a : b;   // the SDF shape is the target.
-    const uint32_t grid = a_sdf ? ga : gb;
-
-    const math::Transform sxf = body_pose[env * bodies_per_env + sample_body];
-    const math::Transform txf = body_pose[env * bodies_per_env + target_body];
-    const uint32_t soff = samp_ranges[sample_body * 2u + 0u];
-    const uint32_t scnt = samp_ranges[sample_body * 2u + 1u];
-    const sdf::SparseSdfDevice sdf_grid = LoadSdfGrid(
-        sdf_headers, sdf_cell_count, sdf_keys, sdf_values, sdf_grads, grid);
-
-    const uint32_t kk = (k > 4u) ? 4u : k;
-    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4]; uint32_t feature[4];
-    uint32_t kept = 0u;
-    for (uint32_t s = 0u; s < scnt; ++s) {
-        const math::Vec3 local{samp_points[(soff + s) * 3u + 0u],
-                               samp_points[(soff + s) * 3u + 1u],
-                               samp_points[(soff + s) * 3u + 2u]};
-        const math::Vec3 world = SdfTransformPoint(sxf, local);
-        const math::Vec3 q = SdfInverseTransformPoint(txf, world);
-        math::Vec3 grad{0, 0, 0};
-        const float phi = sdf::sparse_sdf_sample(sdf_grid, q, grad);
-        if (phi >= sdf::SparseSdfDevice::kOutsideBand) continue;
-        const float depth = -phi + margin;
-        if (depth <= 0.0f) continue;
-        const math::Vec3 gw = SdfRotate(txf.rotation, grad);
-        const float gl = sqrtf(gw.x * gw.x + gw.y * gw.y + gw.z * gw.z);
-        const math::Vec3 n = (gl > 1.0e-12f)
-            ? math::Vec3{gw.x / gl, gw.y / gl, gw.z / gl}
-            : math::Vec3{0.0f, 0.0f, 1.0f};
-        const math::Vec3 cp{world.x - n.x * depth, world.y - n.y * depth,
-                            world.z - n.z * depth};
-        DeepestKInsert(cp, n, depth, s, kk, pt, nm, dp, feature, &kept);
+    if (a >= bodies_per_env || b >= bodies_per_env) {
+        if (env_status) atomicOr(&env_status[env], kEnvStatusInvalidEndpoint);
+        return;
     }
+    const PrimShapeDev shapes[2] = {LoadPrimShape(shape_table, a), LoadPrimShape(shape_table, b)};
+    const math::Transform poses[2] = {body_pose[env * bodies_per_env + a],
+                                      body_pose[env * bodies_per_env + b]};
+    const uint32_t bodies[2] = {a, b};
+    const uint32_t kk = (k > 4u) ? 4u : k;
+    math::Vec3 pt[4]; math::Vec3 nm[4]; float dp[4];
+    uint32_t feature_a[4], feature_b[4];
+    uint32_t kept = 0u;
+    bool queried = false;
+    uint32_t geometry_status = 0u;
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        const uint32_t other = 1u - side;
+        const PrimShapeDev& target = shapes[other];
+        const uint32_t soff = samp_ranges[bodies[side] * 2u];
+        const uint32_t scnt = samp_ranges[bodies[side] * 2u + 1u];
+        if (soff > sample_point_count || scnt > sample_point_count - soff) {
+            geometry_status |= kEnvStatusContactGeometryUnavailable;
+            continue;
+        }
+        if (scnt == 0u) {
+            if (shapes[side].kind == collision::kShapeSdfMesh)
+                geometry_status |= kEnvStatusContactGeometryUnavailable;
+            continue;
+        }
+        const bool analytic = target.kind <= collision::kShapePlane;
+        if (!analytic && target.sdf_grid >= sdf_grid_count) continue;
+        const math::Transform& sxf = poses[side];
+        const math::Transform& txf = poses[other];
+        sdf::SparseSdfDevice grid;
+        if (!analytic) grid = LoadSdfGrid(sdf_headers, sdf_cell_count,
+            sdf_keys, sdf_values, sdf_grads, target.sdf_grid);
+        queried = true;
+        for (uint32_t s = 0u; s < scnt; ++s) {
+            const size_t at = static_cast<size_t>(soff + s) * 3u;
+            const math::Vec3 local{samp_points[at], samp_points[at + 1u], samp_points[at + 2u]};
+            const math::Vec3 world = SdfTransformPoint(sxf, local);
+            const math::Vec3 q = SdfInverseTransformPoint(txf, world);
+            math::Vec3 grad;
+            uint32_t target_feature = nk::kContactFeatureUnavailable;
+            float phi;
+            if (analytic) {
+                const auto surface = collision::QueryPrimitiveSurface(target.kind,
+                    {target.params[0], target.params[1], target.params[2]}, q);
+                if (!surface.valid) {
+                    geometry_status |= kEnvStatusContactGeometryUnavailable;
+                    continue;
+                }
+                phi = surface.distance;
+                grad = surface.normal;
+                target_feature = surface.feature;
+            } else {
+                phi = sdf::sparse_sdf_sample(grid, q, grad);
+            }
+            if (phi >= sdf::SparseSdfDevice::kOutsideBand) continue;
+            const float depth = -phi + margin;
+            if (depth <= 0.0f) continue;
+            const math::Vec3 gw = SdfRotate(txf.rotation, grad);
+            const float gl = sqrtf(gw.Dot(gw));
+            if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-12f) {
+                geometry_status |= kEnvStatusContactGeometryUnavailable;
+                continue;
+            }
+            const math::Vec3 n = gw / gl;
+            const math::Vec3 cp = world - n * phi;
+            DeepestKInsert(cp, side == 0u ? n : n * -1.0f, depth,
+                side == 0u ? s : target_feature, side == 0u ? target_feature : s,
+                kk, pt, nm, dp, feature_a, feature_b, &kept);
+        }
+    }
+    if (!queried && (shapes[0].kind == collision::kShapeSdfMesh ||
+                    shapes[1].kind == collision::kShapeSdfMesh))
+        geometry_status |= kEnvStatusContactGeometryUnavailable;
+    if (geometry_status != 0u && env_status) atomicOr(&env_status[env], geometry_status);
 
     ucount[gid] = kept;
     for (uint32_t i = 0u; i < 4u; ++i) {
         const size_t at = static_cast<size_t>(gid) * 4u + i;
         if (i < kept) {
             upoint[at] = pt[i]; unormal[at] = nm[i]; udepth[at] = dp[i];
-            ucontact_a[at] = sample_body;  // side a = the sampling body (sep dir).
-            ucontact_b[at] = target_body;  // side b = the SDF body.
+            ucontact_a[at] = a;
+            ucontact_b[at] = b;
             ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
             ucontact_gen[at] = 1u;
             ::nuka::nk::CanonicalContactDescriptor descriptor;
-            descriptor.a.handle = sample_body;
-            descriptor.b.handle = target_body;
+            descriptor.a.handle = a;
+            descriptor.b.handle = b;
             descriptor.local_point_a =
-                ::nuka::phi::nkops::PrimInverseTransformPoint(sxf, pt[i]);
+                ::nuka::phi::nkops::PrimInverseTransformPoint(poses[0], pt[i]);
             descriptor.local_point_b =
-                ::nuka::phi::nkops::PrimInverseTransformPoint(txf, pt[i]);
+                ::nuka::phi::nkops::PrimInverseTransformPoint(poses[1], pt[i]);
             descriptor.normal = nm[i];
-            descriptor.feature_a = feature[i];
-            descriptor.feature_b = ::nuka::nk::kContactFeatureUnavailable;
+            descriptor.feature_a = feature_a[i];
+            descriptor.feature_b = feature_b[i];
             descriptor.manifold_slot = i;
             const ::nuka::nk::ContactId id = ::nuka::nk::MakeContactId(descriptor);
             ucontact_id_pair[at] = id.pair;
@@ -334,22 +318,16 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                         const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const NarrowphaseSdfParams*>(params);
     if (p == nullptr) return Status::Failed;
-    // The union slot-template family does its OWN detection (finger x cup is
-    // cvx::SphereHull), so the SDF op only runs for the general PairDriven family;
-    // the union StepPlanned graph stays bit-identical (this op enqueues nothing).
     if (p->family != kContactFamilyPairDriven) return Status::Ok;
     if (p->env_count == 0u || p->max_contacts_per_env == 0u ||
         p->bodies_per_env == 0u) {
         return Status::Ok;
     }
-    // No cooked SDF grids => no SDF pair can exist; skip (the standalone launcher
-    // remains the precision-oracle seam). model.sdf_headers null guards an
-    // SDF-less model.
-    if (model.sdf_headers == nullptr || model.samp_points == nullptr ||
-        model.samp_ranges == nullptr || model.shape_table == nullptr ||
-        data.candidate_pairs == nullptr || data.body_pose == nullptr) {
-        return Status::Ok;
-    }
+    if (!model.samp_ranges || !model.shape_table || !data.candidate_pairs || !data.body_pose ||
+        (p->sample_point_count > 0u && !model.samp_points) ||
+        (p->sdf_grid_count > 0u && (!model.sdf_headers || !model.sdf_cell_count ||
+                                 !model.sdf_cell_keys || !model.sdf_cell_values ||
+                                 !model.sdf_cell_gradients))) return Status::InvalidArgument;
     const uint32_t total = p->env_count * p->max_contacts_per_env;
     constexpr uint32_t kBlock = 128u;
     const uint32_t blocks = (total + kBlock - 1u) / kBlock;
@@ -365,21 +343,19 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                static_cast<const math::Vec3*>(model.sdf_cell_gradients),
                static_cast<const math::Transform*>(data.body_pose),
                p->env_count, p->bodies_per_env, p->max_contacts_per_env,
-               p->rigid_slot_cap,
+               p->rigid_slot_cap, p->sdf_grid_count, p->sample_point_count,
                static_cast<uint32_t>(p->max_contacts_per_pair), p->contact_margin,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,
                data.ucontact_gen, data.ucontact_id_pair,
-               data.ucontact_id_feature, data.contact_count);
+               data.ucontact_id_feature, data.contact_count, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
 }  // namespace
 
-// Standalone launcher (the precision oracle seam): drive the SDF sampling
-// narrowphase over a hand-built pair list + device SAMP/SDF buffers. Returns
-// cudaSuccess-mapped Status. (D1: fixed deepest-K order, shared D1 sampler.)
+// The geometry oracle drives the same signed-distance contract with explicit pairs.
 Status LaunchNarrowphaseSdf(const float* samp_points,
                             const uint32_t* samp_ranges,
                             const float* shape_table,

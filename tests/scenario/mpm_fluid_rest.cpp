@@ -214,9 +214,9 @@ void AddBoxSdf(nk::Model& m, int32_t body_id, float half) {
 
 // Heavy free box above the pool + a far immovable filler (>= 2 bodies for the LBVH),
 // cooked on top of the fluid via the sim_method=mlsmpm selector.
-nk::Model BuildPoolWithBodyModel() {
+nk::Model BuildPoolWithBodyModel(bool with_sdf, bool proxy, uint32_t env_count) {
     nk::Model m;
-    m.capacities.env_count = 1u;
+    m.capacities.env_count = env_count;
 
     nk::Model::BodyInit bi;
     bi.pose = Transform::Identity();
@@ -234,10 +234,35 @@ nk::Model BuildPoolWithBodyModel() {
     m.body_init.push_back(bf);
     AddBoxSdf(m, 1, 0.05f);
 
+    if (!with_sdf) {
+        m.sdf_grids.clear();
+        m.sdf_cell_keys.clear();
+        m.sdf_cell_values.clear();
+        m.sdf_cell_gradients.clear();
+        for (auto& shape : m.shape_table_rows) shape.sdf_grid = ~0u;
+    }
+    if (proxy) {
+        const Vec3 offset{0.035f, -0.025f, 0.01f};
+        nk::Model::BodyInit shape_body;
+        shape_body.pose = m.body_init[0].pose;
+        m.body_init.push_back(shape_body);
+        const auto shape = m.shape_table_rows[0];
+        m.shape_table_rows.push_back(shape);
+        m.shape_table_rows[0].contype = 0u;
+        m.shape_table_rows[0].conaffinity = 0u;
+        m.body_init[0].pose.position -= offset;
+        m.body_init[0].inertial_frame.position = offset;
+        m.body_collidable_body.assign(m.body_init.size(), ~0u);
+        m.body_collidable_body.back() = 0u;
+        m.body_collidable_link.assign(m.body_init.size(), ~0u);
+        m.body_collidable_local.assign(m.body_init.size(), Transform::Identity());
+        m.body_collidable_local.back().position = offset;
+    }
+
     nk::ModelCapacities& cap = m.capacities;
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
     cap.bodies_per_env = bodies;
-    cap.max_bodies_total = bodies;
+    cap.max_bodies_total = bodies * env_count;
     cap.max_sdf_grids = static_cast<uint32_t>(m.sdf_grids.size());
     cap.max_sdf_cells = static_cast<uint32_t>(m.sdf_cell_values.size());
     cap.max_contacts_per_env = 16u;
@@ -245,15 +270,14 @@ nk::Model BuildPoolWithBodyModel() {
     m.contact_family = nk::ContactFamily::PairDriven;
     m.filter_cross_env = true;
 
-    // A stiffer, deeper-substep pool for the body impact: K sets the sound speed
-    // c = sqrt(K/rho0) ~ 14 m/s, well above the ~0.6 m/s entry (stable explicit step).
+    // The impact pool resolves its Tait sound speed sqrt(gamma*K/rho0) with substeps.
     cook::MpmCookInput pool = BuildPoolInput();
     pool.material.bulk_modulus = 2.0e5f;
     pool.material.viscosity = 2.0f;
     pool.substeps = 40u;
     cook::XpbdCookInput soft;
     soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, pool);
+    cook::CookSoftBodyParticles(m, env_count, soft, pool);
 
     m.particles.mpm_body_friction = 0.0f;
     m.particles.mpm_bite_disable_dynamic_bc = 0u;
@@ -415,74 +439,80 @@ TEST(MpmFluidRest, GridMassMomentumDeterministicAndConserved) {
 TEST(MpmFluidRest, HeavyBodyIntoPoolDeceleratesAndReacts) {
     if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     Backend b = GetBackend();
-    nk::Model m = BuildPoolWithBodyModel();
-    const uint32_t P = m.capacities.particles_per_env;
-    ASSERT_GT(P, 1000u) << "the pool must be dense";
-    nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
-    ASSERT_TRUE(w.Ready());
-
+    constexpr uint32_t kEnvs = 2u;
+    constexpr uint32_t kSteps = 240u;
     const float dt = Cfg().dt;
-    Transform body_pose{};
-    Vec3 lin_vel{0, 0, 0}, reaction{0, 0, 0};
-    std::vector<float> Fb(static_cast<size_t>(P) * 9u, 0.0f);
-    auto box_z = [&]() {
-        w.GetData().DownloadField(nk::FieldId::BodyPose, &body_pose, sizeof(Transform));
-        return body_pose.position.z;
-    };
-
-    const float z0 = box_z();
-    float min_vz = 0.0f;           // most-negative downward velocity (free-fall peak).
-    float max_react = 0.0f;        // peak upward (signed +z) reaction sink.
-    float min_J = 1e30f, max_J = -1e30f;
-    uint32_t escape = 0u;
-    bool nonfinite = false;
-    bool decel = false;
-    float prev_vz = 0.0f;
-    constexpr uint32_t kSteps = 240u;   // 1 s: free-fall, entry, deceleration.
-    for (uint32_t s = 0; s < kSteps; ++s) {
-        w.Step();
-        w.GetData().DownloadField(nk::FieldId::BodyLinearVelocity, &lin_vel, sizeof(Vec3));
-        w.GetData().DownloadField(nk::FieldId::MpmBodyReaction, &reaction, sizeof(Vec3));
-        const float z = box_z();
-        nonfinite = nonfinite || !std::isfinite(z) || !std::isfinite(lin_vel.z) ||
-                    !std::isfinite(reaction.z);
-        min_vz = std::min(min_vz, lin_vel.z);
-        max_react = std::max(max_react, reaction.z);   // signed: the sink pushes up (+z).
-        uint32_t st = 0u;
-        w.GetData().DownloadField(nk::FieldId::EnvStatus, &st, sizeof(uint32_t));
-        escape |= st & nphi::kEnvStatusMpmGridEscape;
-        if (s % 20u == 0u || s + 1u == kSteps) {     // bound the fluid state periodically.
-            w.GetData().DownloadField(nk::FieldId::ParticleF, Fb.data(),
-                                      Fb.size() * sizeof(float));
-            for (uint32_t i = 0; i < P; ++i) {
-                const float J = Det3(&Fb[static_cast<size_t>(i) * 9u]);
-                min_J = std::min(min_J, J); max_J = std::max(max_J, J);
+    for (uint32_t representation = 0u; representation < 3u; ++representation) {
+        SCOPED_TRACE(representation);
+        const bool proxy = representation == 2u;
+        nk::Model m = BuildPoolWithBodyModel(representation == 0u, proxy, kEnvs);
+        const uint32_t P = m.capacities.particles_per_env;
+        const uint32_t B = m.capacities.bodies_per_env;
+        const Vec3 com_local = m.body_init[0].inertial_frame.position;
+        ASSERT_GT(P, 1000u);
+        nk::World w(std::move(m), kEnvs, b.dev, b.backend, Cfg());
+        ASSERT_TRUE(w.Ready());
+        std::vector<Transform> poses(B * kEnvs);
+        std::vector<Vec3> velocities(B * kEnvs), reactions(B * kEnvs), previous(kEnvs);
+        std::vector<float> Fb(static_cast<size_t>(P) * kEnvs * 9u);
+        std::vector<uint32_t> status(kEnvs);
+        float min_vz = 0.0f, max_react = 0.0f;
+        float min_J = 1e30f, max_J = -1e30f;
+        float max_balance_error = 0.0f, max_proxy_reaction = 0.0f, max_replica_error = 0.0f;
+        uint32_t status_union = 0u;
+        bool nonfinite = false, decel = false;
+        for (uint32_t s = 0u; s < kSteps; ++s) {
+            w.Step();
+            ASSERT_EQ(w.LastStatus(), nphi::Status::Ok);
+            ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::BodyPose,
+                poses.data(), poses.size() * sizeof(Transform)));
+            ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::BodyLinearVelocity,
+                velocities.data(), velocities.size() * sizeof(Vec3)));
+            ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::MpmBodyReaction,
+                reactions.data(), reactions.size() * sizeof(Vec3)));
+            ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::EnvStatus,
+                status.data(), status.size() * sizeof(uint32_t)));
+            for (uint32_t e = 0u; e < kEnvs; ++e) {
+                const uint32_t owner = e * B;
+                const Vec3 v = velocities[owner], reaction = reactions[owner];
+                const Vec3 com = poses[owner].position + poses[owner].rotation.Rotate(com_local);
+                nonfinite |= !std::isfinite(com.z) || !std::isfinite(v.z) || !std::isfinite(reaction.z);
+                min_vz = std::min(min_vz, v.z);
+                max_react = std::max(max_react, reaction.z);
+                const Vec3 momentum = (v - previous[e] - Vec3{0, 0, -9.81f * dt}) * kBoxMass;
+                max_balance_error = std::max(max_balance_error, (momentum - reaction).Length());
+                max_replica_error = std::max(max_replica_error, (v - velocities[0]).Length());
+                if (proxy) max_proxy_reaction = std::max(max_proxy_reaction,
+                    reactions[owner + B - 1u].Length());
+                status_union |= status[e];
+                if (v.z > previous[e].z + 1e-4f && min_vz < -0.2f) decel = true;
+                previous[e] = v;
+            }
+            if (s % 20u == 0u || s + 1u == kSteps) {
+                ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticleF,
+                    Fb.data(), Fb.size() * sizeof(float)));
+                for (uint32_t i = 0u; i < P * kEnvs; ++i) {
+                    const float J = Det3(&Fb[static_cast<size_t>(i) * 9u]);
+                    nonfinite |= !std::isfinite(J);
+                    min_J = std::min(min_J, J);
+                    max_J = std::max(max_J, J);
+                }
             }
         }
-        // Deceleration: once it has reached its downward peak, vz must recover upward.
-        if (lin_vel.z > prev_vz + 1e-4f && min_vz < -0.2f) decel = true;
-        prev_vz = lin_vel.z;
+        std::fprintf(stderr,
+            "[fluid+body] representation=%u envs=%u min_vz=%.4f max_react=%.6e "
+            "min_J=%.4f max_J=%.4f balance=%.6e replica=%.6e proxy_reaction=%.6e status=%u\n",
+            representation, kEnvs, min_vz, max_react, min_J, max_J, max_balance_error,
+            max_replica_error, max_proxy_reaction, status_union);
+        EXPECT_FALSE(nonfinite);
+        EXPECT_EQ(status_union, 0u);
+        EXPECT_GT(min_vz, -9.81f * kSteps * dt);
+        EXPECT_TRUE(decel);
+        EXPECT_GT(max_react, 1e-4f);
+        EXPECT_LT(max_balance_error, 5e-5f) << "owner momentum must match the measured impulse";
+        EXPECT_LT(max_replica_error, 2e-5f);
+        EXPECT_LT(max_proxy_reaction, 1e-7f) << "a proxy must not own physical reaction";
+        EXPECT_GT(min_J, 0.9f);
+        EXPECT_LT(max_J, 2.0f);
     }
-    const float z1 = box_z();
-    const float free_fall_vz = -9.81f * (kSteps * dt);  // unresisted terminal vz.
-
-    std::fprintf(stderr,
-                 "[fluid+body] z0=%.4f z1=%.4f min_vz=%.4f free_fall_vz=%.4f "
-                 "max_react=%.6e min_J=%.4f max_J=%.4f decel=%d escape=%u\n",
-                 z0, z1, min_vz, free_fall_vz, max_react, min_J, max_J,
-                 decel ? 1 : 0, escape);
-
-    EXPECT_FALSE(nonfinite) << "the body+fluid trajectory must be finite";
-    EXPECT_EQ(0u, escape) << "the stiff pool must stay contained (no escape / inverted F)";
-    // The pool resists: the body never reaches the unresisted free-fall speed and it
-    // decelerates after entry (vz recovers from its downward peak).
-    EXPECT_GT(min_vz, free_fall_vz)
-        << "the fluid must resist the drop (vz above unresisted free-fall)";
-    EXPECT_TRUE(decel) << "the body must decelerate after entering the pool";
-    // Two-way: the grid->body reaction sink pushes UP (+z, the sign of buoyant resist).
-    EXPECT_GT(max_react, 1e-4f) << "the body-reaction sink must push up (coupled)";
-    // The fluid stays stable at K=2.0e5 (c~14 m/s): the deepest particle compresses only
-    // a few % and dilation stays well below the J clamp ceiling (both live, not the clamp).
-    EXPECT_GT(min_J, 0.9f) << "stable pool: the deepest particle compresses only a few %";
-    EXPECT_LT(max_J, 2.0f) << "dilation must stay well below the J clamp ceiling (live bound)";
 }
