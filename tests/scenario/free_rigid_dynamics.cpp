@@ -730,6 +730,9 @@ TEST(FreeRigidDynamics, WorldAngularVelocityRotatesAboutTheAuthoredCenterOfMass)
 TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (uint32_t substeps : {1u, 5u}) {
+      for (bool planned : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "substeps=" << substeps << " graph=" << planned);
     for (Quat rotation : {Quat::Identity(), Quat::FromAxisAngle({1, 2, -3}, 1.1f)}) {
         scene::RigidBodyRecord body;
         body.name = "free_body";
@@ -741,6 +744,7 @@ TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
         body.inertial_transform.rotation = Quat::FromAxisAngle({3, -2, 1}, 0.7f);
         auto config = Config();
         config.dt = 0.001f;
+        config.substeps = substeps;
         const Vec3 gravity = rotation.Rotate({1.7f, -2.3f, -8.1f});
         config.gravity[0] = gravity.x;
         config.gravity[1] = gravity.y;
@@ -749,10 +753,11 @@ TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
         const Vec3 torque = rotation.Rotate(Vec3{0.2f, -0.3f, 0.1f}.Cross({0.7f, -0.9f, 1.1f}));
         nk::World world(CookFreeBody(body, false), 2u, backend.device, backend.backend, config);
         ASSERT_TRUE(world.Ready());
+        const auto advance = [&]() { return planned ? world.StepPlanned() : world.Step().result; };
         const std::vector<Vec3> forces{force, Vec3{}}, torques{torque, Vec3{}};
         ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyForce, forces.data(), forces.size() * sizeof(Vec3)));
         ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::BodyTorque, torques.data(), torques.size() * sizeof(Vec3)));
-        ASSERT_TRUE(world.Step().AllOk());
+        ASSERT_EQ(advance(), phi::Status::Ok);
         auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 2u);
         const auto omega = Read<Vec3>(world, nk::FieldId::BodyAngularVelocity, 2u);
         const auto pose = Read<Transform>(world, nk::FieldId::BodyPose, 2u);
@@ -768,10 +773,11 @@ TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
         const Vec3 initial_com = body.local_transform.TransformPoint(body.inertial_transform.position);
         for (uint32_t env = 0; env < 2u; ++env)
             ExpectVectorNear(pose[env].TransformPoint(body.inertial_transform.position),
-                             initial_com + velocity[env] * config.dt, 1.0e-6f);
+                             initial_com + velocity[env] *
+                                 (config.dt * (0.5f + 0.5f / substeps)), 1.0e-6f);
         EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyForce, 2u), std::vector<Vec3>(2u));
         EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyTorque, 2u), std::vector<Vec3>(2u));
-        ASSERT_TRUE(world.Step().AllOk());
+        ASSERT_EQ(advance(), phi::Status::Ok);
         velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 2u);
         ExpectVectorNear(velocity[0], gravity * (2.0f * config.dt) + force * (config.dt / body.mass), 1.0e-6f);
         ExpectVectorNear(velocity[1], gravity * (2.0f * config.dt), 1.0e-6f);
@@ -780,6 +786,8 @@ TEST(FreeRigidDynamics, WorldWrenchesAndGravityAreCovariantAndConsumedOnce) {
         EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyForce, 2u), forces);
         ASSERT_EQ(world.Reset({0u}), phi::Status::Ok);
         EXPECT_EQ(Read<Vec3>(world, nk::FieldId::BodyForce, 2u), std::vector<Vec3>(2u));
+    }
+      }
     }
 }
 

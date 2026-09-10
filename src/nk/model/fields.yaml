@@ -932,3 +932,11 @@ fields:
   - {name: mesh_surface_info, dtype: mesh_surface_info, per: scalar, count: "mesh_surface_info_count", arena: persistent, owner: model}
   - {name: mesh_triangles, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
   - {name: mesh_bvh_nodes, dtype: mesh_bvh_node, per: scalar, count: "max_mesh_bvh_nodes", arena: persistent, owner: model}
+
+  # Outer-step impulses use world-origin moments until the final reference-point shift.
+  - {name: step_env_status, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: step_mpm_body_impulse, dtype: vec3, per: body, arena: scratch, owner: data}
+  - {name: step_mpm_body_moment, dtype: vec3, per: body, arena: scratch, owner: data}
+  - {name: step_link_impulse, dtype: vec3, per: link, arena: scratch, owner: data}
+  - {name: step_link_moment, dtype: vec3, per: link, arena: scratch, owner: data}
+  - {name: step_joint_limit_impulse, dtype: f32, per: link, arena: scratch, owner: data, elem: 2}

@@ -32,27 +32,51 @@ namespace nuka::phi {
 // Brackets each dispatched op with CUDA events; a warmup gate skips the transient.
 namespace {
 const char* NkOpName(int op) {
-    switch (op) {
-        case 0: return "ApplyDrives"; case 1: return "AbaForward";
-        case 2: return "IntegrateVelocity"; case 3: return "FkWorldPoses";
-        case 4: return "IntegratePosition"; case 5: return "CrbaComputeM";
-        case 6: return "CrbaFactorM"; case 7: return "ApplyImplicitDamping";
-        case 8: return "BuildAabbs"; case 9: return "LbvhBuild";
-        case 10: return "LbvhQueryPairs"; case 11: return "ParticleGridBuild";
-        case 12: return "NarrowphasePrimitives"; case 13: return "NarrowphaseSdf";
-        case 14: return "ContactTangentBasis"; case 15: return "AssembleRows";
-        case 16: return "SolveRowsBlockIsland";
-        case 17: return "ParticleAeroDrag"; case 18: return "ParticlePredict";
-        case 19: return "XpbdProject"; case 20: return "PbfDensityLambda";
-        case 21: return "PbfApplyDelta"; case 22: return "ParticleFinalize";
-        case 23: return "MpmStep"; case 24: return "ReadoutContactWrench";
-        case 25: return "ExportObs"; case 26: return "ResetEnvs";
-        case 27: return "SnapshotState"; case 28: return "RestoreState";
-        case 29: return "RandomizeMaterialBuckets"; case 30: return "RandomizeBodyParams";
-        case 31: return "StepBackward"; case 32: return "ParticleParticleContact";
-        case 33: return "SyncLinkBodyPose"; case 34: return "NarrowphaseBodyParticle";
-        case 35: return "NarrowphaseHeightfield"; case 36: return "BuildSolveIslands";
-        case 37: return "ContactWarmStart";
+    switch (static_cast<NkOp>(op)) {
+        case NkOp::ApplyDrives: return "ApplyDrives";
+        case NkOp::ApplyOscDrives: return "ApplyOscDrives";
+        case NkOp::AbaForward: return "AbaForward";
+        case NkOp::IntegrateVelocity: return "IntegrateVelocity";
+        case NkOp::FkWorldPoses: return "FkWorldPoses";
+        case NkOp::IntegratePosition: return "IntegratePosition";
+        case NkOp::CrbaComputeM: return "CrbaComputeM";
+        case NkOp::CrbaFactorM: return "CrbaFactorM";
+        case NkOp::ApplyImplicitDamping: return "ApplyImplicitDamping";
+        case NkOp::BuildAabbs: return "BuildAabbs";
+        case NkOp::LbvhBuild: return "LbvhBuild";
+        case NkOp::LbvhQueryPairs: return "LbvhQueryPairs";
+        case NkOp::ParticleGridBuild: return "ParticleGridBuild";
+        case NkOp::NarrowphasePrimitives: return "NarrowphasePrimitives";
+        case NkOp::NarrowphaseSdf: return "NarrowphaseSdf";
+        case NkOp::ContactTangentBasis: return "ContactTangentBasis";
+        case NkOp::AssembleRows: return "AssembleRows";
+        case NkOp::SolveRowsBlockIsland: return "SolveRowsBlockIsland";
+        case NkOp::ParticleAeroDrag: return "ParticleAeroDrag";
+        case NkOp::ParticlePredict: return "ParticlePredict";
+        case NkOp::XpbdProject: return "XpbdProject";
+        case NkOp::PbfDensityLambda: return "PbfDensityLambda";
+        case NkOp::PbfApplyDelta: return "PbfApplyDelta";
+        case NkOp::ParticleFinalize: return "ParticleFinalize";
+        case NkOp::MpmStep: return "MpmStep";
+        case NkOp::ReadoutContactWrench: return "ReadoutContactWrench";
+        case NkOp::ExportObs: return "ExportObs";
+        case NkOp::ResetEnvs: return "ResetEnvs";
+        case NkOp::SnapshotState: return "SnapshotState";
+        case NkOp::RestoreState: return "RestoreState";
+        case NkOp::RandomizeMaterialBuckets: return "RandomizeMaterialBuckets";
+        case NkOp::RandomizeBodyParams: return "RandomizeBodyParams";
+        case NkOp::StepBackward: return "StepBackward";
+        case NkOp::ParticleParticleContact: return "ParticleParticleContact";
+        case NkOp::SyncLinkBodyPose: return "SyncLinkBodyPose";
+        case NkOp::NarrowphaseBodyParticle: return "NarrowphaseBodyParticle";
+        case NkOp::NarrowphaseHeightfield: return "NarrowphaseHeightfield";
+        case NkOp::BuildSolveIslands: return "BuildSolveIslands";
+        case NkOp::ContactWarmStart: return "ContactWarmStart";
+        case NkOp::SnapshotStepVelocity: return "SnapshotStepVelocity";
+        case NkOp::ParticleProjectionVelocity: return "ParticleProjectionVelocity";
+        case NkOp::ParticleContactDelta: return "ParticleContactDelta";
+        case NkOp::AccumulateStep: return "AccumulateStep";
+        case NkOp::FkLinkVelocities: return "FkLinkVelocities";
         default: return "op";
     }
 }
@@ -81,20 +105,19 @@ struct OpProfiler {
     static void Dump() {
         OpProfiler& p = Get();
         double tot = 0.0;
-        unsigned long long steps = 0;
-        for (int i = 0; i < kN; ++i) { tot += p.ms[i]; if (p.calls[i] > steps) steps = p.calls[i]; }
-        if (steps == 0) return;
-        std::printf("\n[NUKA_STEP_TIMING] steady-state per-op GPU ms (steps=%llu, warmup=%ld)\n",
-                    steps, p.warmup);
-        std::printf("  %-24s %10s %12s %8s\n", "op", "ms/step", "total_ms", "%%");
+        unsigned long long calls = 0;
+        for (int i = 0; i < kN; ++i) { tot += p.ms[i]; calls += p.calls[i]; }
+        if (calls == 0) return;
+        std::printf("\n[NUKA_STEP_TIMING] per-op GPU ms (calls=%llu, warmup_groups=%ld)\n",
+                    calls, p.warmup);
+        std::printf("  %-24s %10s %12s %8s %12s\n", "op", "ms/call", "total_ms", "%%", "calls");
         for (int i = 0; i < kN; ++i) {
             if (p.calls[i] == 0) continue;
             const double per = p.ms[i] / static_cast<double>(p.calls[i]);
-            std::printf("  %-24s %10.3f %12.2f %7.1f%%\n", NkOpName(i), per, p.ms[i],
-                        tot > 0.0 ? 100.0 * p.ms[i] / tot : 0.0);
+            std::printf("  %-24s %10.3f %12.2f %7.1f%% %12llu\n", NkOpName(i), per, p.ms[i],
+                        tot > 0.0 ? 100.0 * p.ms[i] / tot : 0.0, p.calls[i]);
         }
-        std::printf("  %-24s %10.3f %12.2f\n", "TOTAL/step",
-                    tot / static_cast<double>(steps), tot);
+        std::printf("  %-24s %10s %12.2f\n", "TOTAL", "", tot);
         std::fflush(stdout);
     }
 };
@@ -157,8 +180,7 @@ Status BackendDispatchImpl(Backend* b, const ModelView& model,
         return DispatchOn(model, data, call, cb->main);
     }
     const int oid = static_cast<int>(call.op);
-    // Step boundary = an op id repeats since the last boundary (robust to the
-    // one-off construction/seed dispatches that precede the step loop).
+    // Repeated op ids define warmup groups, not physical steps or solver intervals.
     if (oid >= 0 && oid < OpProfiler::kN) {
         if (prof.seen[oid]) {
             ++prof.step;

@@ -338,6 +338,12 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // mesh_surface_info
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mesh_triangles
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // mesh_bvh_nodes
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // step_env_status
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // step_mpm_body_impulse
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 3, 12, 0},  // step_mpm_body_moment
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 3, 12, 0},  // step_link_impulse
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 3, 12, 0},  // step_link_moment
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 2, 1, 8, 0},  // step_joint_limit_impulse
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

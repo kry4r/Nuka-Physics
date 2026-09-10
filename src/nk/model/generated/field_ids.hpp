@@ -299,6 +299,12 @@ enum class FieldId : uint16_t {
     MeshSurfaceInfo,  // mesh_surface_info (per:scalar arena:persistent owner:model count:mesh_surface_info_count)
     MeshTriangles,  // mesh_triangles (per:scalar arena:persistent owner:model count:max_mesh_triangles*3)
     MeshBvhNodes,  // mesh_bvh_nodes (per:scalar arena:persistent owner:model count:max_mesh_bvh_nodes)
+    StepEnvStatus,  // step_env_status (per:env arena:scratch owner:data)
+    StepMpmBodyImpulse,  // step_mpm_body_impulse (per:body arena:scratch owner:data)
+    StepMpmBodyMoment,  // step_mpm_body_moment (per:body arena:scratch owner:data)
+    StepLinkImpulse,  // step_link_impulse (per:link arena:scratch owner:data)
+    StepLinkMoment,  // step_link_moment (per:link arena:scratch owner:data)
+    StepJointLimitImpulse,  // step_joint_limit_impulse (per:link arena:scratch owner:data elem:2)
     Count
 };
 
@@ -593,6 +599,12 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "mesh_surface_info",
     "mesh_triangles",
     "mesh_bvh_nodes",
+    "step_env_status",
+    "step_mpm_body_impulse",
+    "step_mpm_body_moment",
+    "step_link_impulse",
+    "step_link_moment",
+    "step_joint_limit_impulse",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

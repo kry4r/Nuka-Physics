@@ -97,6 +97,14 @@ uint64_t ModelCapacities::NeighborPoolCapacity() const {
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    const bool mpm_reaction = mpm_grid_nodes_per_env != 0u && bodies_per_env != 0u;
+    if (integration_substeps <= 1u &&
+        (id == FieldId::StepLinkImpulse || id == FieldId::StepLinkMoment ||
+         id == FieldId::StepJointLimitImpulse || (id == FieldId::StepEnvStatus && !mpm_reaction)))
+        return 0u;
+    if (!mpm_reaction &&
+        (id == FieldId::StepMpmBodyImpulse || id == FieldId::StepMpmBodyMoment)) return 0u;
+    if (joint_limit_rows_per_env == 0u && id == FieldId::StepJointLimitImpulse) return 0u;
     if (contact_index_scratch_bytes == 0u &&
         (id == FieldId::ActiveRowIds || id == FieldId::ActiveRowCount ||
          id == FieldId::ContactEndpointKeys || id == FieldId::ContactEndpointCount ||

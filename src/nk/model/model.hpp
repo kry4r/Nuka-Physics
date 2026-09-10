@@ -33,6 +33,7 @@ namespace nuka::nk {
 // a Model property (deterministic for a given cook product + env_count).
 struct ModelCapacities {
     uint32_t env_count       = 1;   // number of replicated envs (env-major).
+    uint32_t integration_substeps = 1u;
     // Multi-articulation co-residence (K Go2 in ONE env): the number of SEPARATE
     // articulations resident in each env. The forward kernels are grid =
     // articulation_count == articulations_per_env * env_count, each dog keeping

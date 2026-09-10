@@ -39,6 +39,10 @@
 
 ## 执行批次
 
+公共子步时间层已完成 [本批验收](../research/2026-09-10-coupled-substep-clock-validation-zh.md)：ABA/刚体/XPBD/PBF/MPM 以同一个 h 重复完整管线，外力只消费一次，区间前刷新 link 速度，外步累计冲量/wrench/错误。组合律、完整 E16 N=2、C/Python/reset/渲染与定向 memcheck 通过；N=1 五进程状态/逐步 wrench/岛调度和内存一致。bunny 瞬时穿入降至约 1.34 mm，但局部 max J=76.19，落水步时从约 19.40 增至 321.19 ms。Nsight 确认串行通用表面查询占短窗口 kernel 时间约 78.1%；先独立修复此 CUDA 瓶颈，再继续多 owner 有限质量、插值面端点和完整介质交换，不能据时间层通过关闭全量耦合。
+
+自动 GPU 辅助凸覆盖 cook 已收口，见 [验收](../research/2026-09-10-automatic-convex-cover-validation-zh.md)。同次切分合并查询、父裁剪和边拓扑复用，使真实杯子五进程冷 cook 中位数 2063.324 → 544.751 ms；缓存、预算回退、独立几何审查、完整管线/公共 API/reset/渲染和 memcheck 通过。仅精确表面 cook 仍明显更便宜；E16 运行步时/内存持平，不宣称求解加速或严格覆盖认证。继续多端点有效质量与子步时间层，再按原顺序推进完整介质耦合、MLS-MPM 修复、弹塑性体及操作 demo；整体目标保持 active。
+
 粒子物理批次：结构邻接/静止距离过滤、统一投影位置、材料与接触交替求解已实现；既有 24 次 XPBD 和 48 次速度预算不变，投影/接触增量只计一次，固定粒子保持不动。E=1/16/256 × eager/graph 完整 450 步的最大应变为 1.838344%、最坏每环境 RMS 为 0.203045%，原 5%/1% 门通过。已有场景及 C/Python/reset/渲染验收收口，E=16 graph 完整 memcheck 为 0 errors；修正既有压板几何/表面速度和流体三维量测，原失败保留、物理预算不放宽。物理修复已提交 `b0c2816`，新源码/二进制已冻结，六组五进程分母采集完成；graph E=1/16/256 为 3.366/3.672/6.402 ms，eager 中位数为 15.182/10.848/13.941 ms，其噪声需交错对照。此批是物理算法修复，不能用旧错误物理作为性能分母。独立架构隔离已提交 `6953f4a`，无 CUDA 核心构建通过；不代表 CPU 求解功能已完成。证据见 [粒子 review](../research/2026-09-09-particle-topology-review-zh.md)。
 
 当前 CUDA 批次已完成 [验收](../research/2026-09-09-cuda-execution-validation-zh.md)：eager 五进程中位耗时下降 39.02%–55.21%，graph 增加 0.22%–2.38%，内存相同。保持材料/接触交替、原预算和公式；完整质量/身份、既有材料、公共 API/reset/渲染、memcheck/synccheck 通过。后续 [接触 graph 修复](../research/2026-09-10-contact-graph-validation-zh.md) 已使 E=2048 eager/graph 完整运行，60 次五对管线、E=16 memcheck 和原 bunny-water 通过；小环境有计时波动及回退，不能据此宣称普遍加速。soft-tet 既有失败继续保留。GPU 岛求解仍是热点，不把减少 host 提交写成全部性能完成。

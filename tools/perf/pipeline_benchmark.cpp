@@ -34,6 +34,7 @@ struct Options {
     uint32_t envs = 1u, steps = 200u, warmup = 250u, seed = 20260908u;
     float dt = 1.0f / 240.0f;
     uint32_t capacity_scale = 1u;
+    uint32_t substeps = 1u;
     uint32_t cloth_nx = fixture::kClothNx;
 };
 
@@ -56,6 +57,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--envs") options.envs = ParseU32(value);
         else if (flag == "--steps") options.steps = ParseU32(value);
         else if (flag == "--warmup") options.warmup = ParseU32(value);
+        else if (flag == "--substeps") options.substeps = ParseU32(value);
         else if (flag == "--seed") options.seed = ParseU32(value);
         else if (flag == "--dt") {
             size_t consumed = 0u;
@@ -70,7 +72,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--cloth-grid") options.cloth_nx = ParseU32(value);
         else throw std::invalid_argument("unknown option " + flag);
     }
-    if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u ||
+    if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
         uint64_t{options.steps} + options.warmup > std::numeric_limits<uint32_t>::max() ||
         (options.execution != "eager" && options.execution != "graph"))
@@ -438,11 +440,13 @@ Json Run(const Options& options) {
     const auto stream = phi::CudaBackendMainStream(backend);
     auto config = fixture::Cfg();
     config.dt = options.dt;
+    config.substeps = options.substeps;
     const auto scene_path = options.scene == "robot-cloth-fluid"
         ? std::filesystem::path(NUKA_SOURCE_DIR) / "examples/scenes/go2_stand.usda"
         : std::filesystem::path(options.scene);
     const auto prepare_start = Clock::now();
-    const auto prepared = fixture::Prepare(scene_path, device, owner.backend, config);
+    const auto fixture_config = fixture::Cfg();
+    const auto prepared = fixture::Prepare(scene_path, device, owner.backend, fixture_config);
     const double preparation_ms = Milliseconds(prepare_start);
     const auto cook_start = Clock::now();
     auto model = fixture::CookPrepared(prepared, options.envs, true, options.cloth_nx);
@@ -574,6 +578,9 @@ Json Run(const Options& options) {
     Json configuration = Json::Object();
     configuration.Set("envs", Json::Int(options.envs));
     configuration.Set("dt", Json::Float(options.dt));
+    configuration.Set("substeps", Json::Int(options.substeps));
+    configuration.Set("fixture_dt", Json::Float(fixture_config.dt));
+    configuration.Set("fixture_substeps", Json::Int(fixture_config.substeps));
     configuration.Set("seed", Json::Int(options.seed));
     configuration.Set("seed_usage", Json::Str("deterministic held control; no randomization"));
     configuration.Set("vel_iters", Json::Int(config.vel_iters));

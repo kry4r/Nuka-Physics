@@ -207,6 +207,12 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridBodyOwner:       v.grid_body_owner = static_cast<uint32_t*>(p); break;
         case FieldId::MpmBodyReaction:     v.mpm_body_reaction = static_cast<math::Vec3*>(p); break;
         case FieldId::MpmBodyAngReaction:  v.mpm_body_ang_reaction = static_cast<math::Vec3*>(p); break;
+        case FieldId::StepEnvStatus:       v.step_env_status = static_cast<uint32_t*>(p); break;
+        case FieldId::StepMpmBodyImpulse:  v.step_mpm_body_impulse = static_cast<math::Vec3*>(p); break;
+        case FieldId::StepMpmBodyMoment:   v.step_mpm_body_moment = static_cast<math::Vec3*>(p); break;
+        case FieldId::StepLinkImpulse:     v.step_link_impulse = static_cast<math::Vec3*>(p); break;
+        case FieldId::StepLinkMoment:      v.step_link_moment = static_cast<math::Vec3*>(p); break;
+        case FieldId::StepJointLimitImpulse: v.step_joint_limit_impulse = static_cast<float*>(p); break;
         // Dynamic solve islands (BuildSolveIslands union-find + emit working set).
         case FieldId::CcParent:            v.cc_parent = static_cast<uint32_t*>(p); break;
         case FieldId::CcRoot:              v.cc_root = static_cast<uint32_t*>(p); break;

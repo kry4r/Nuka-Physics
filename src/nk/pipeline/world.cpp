@@ -63,6 +63,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         creation_error_ = "timestep and gravity must be finite with positive timestep";
         return;
     }
+    model_.capacities.integration_substeps = Pipeline::SubstepCount(model_, cfg_);
     creation_status_ = pipeline_->Build(model_, cfg_, device_, readout_demand_);
     for (phi::NkOp op : pipeline_->MissingOps())
         creation_error_ += "missing required op " + std::to_string(static_cast<uint32_t>(op)) + "; ";
