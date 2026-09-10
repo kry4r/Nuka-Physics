@@ -5,6 +5,7 @@
 
 #include "scene/canonical_types.hpp"
 #include "collision/mesh_surface_types.hpp"
+#include "import/cooker/convex_cover.hpp"
 #include "scene/contact_filter.hpp"   // MergedContactParams (v0.8 C1c)
 #include "math/transform.hpp"
 
@@ -68,6 +69,10 @@ struct CookedConvexGeometry {
     std::vector<float>    volumes;         // per-hull volume
     std::vector<collision::MeshSurfaceInfo> surface_info;
     std::vector<collision::MeshBvhNode> surface_nodes;
+    std::vector<import::cooker::ConvexCoverResult> surface_covers;
+    std::vector<std::string> surface_cache_keys;
+    std::vector<uint8_t> surface_cache_hits;
+    std::vector<uint8_t> surface_cover_hierarchy;
     uint32_t Count() const { return static_cast<uint32_t>(vertex_counts.size()); }
 };
 

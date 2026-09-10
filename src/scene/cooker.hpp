@@ -5,6 +5,7 @@
 
 #include "scene/scene_ir.hpp"
 #include "scene/cooked_blob.hpp"
+#include "import/cooker/mesh_surface_cooker.hpp"
 
 namespace nuka::scene {
 
@@ -12,10 +13,11 @@ namespace nuka::scene {
 struct CookSceneOptions {
     // Bake a narrow-band sparse SDF for validated convex pieces.
     bool bake_sdf = true;
-    // Retained for source compatibility; only explicit Force may decompose a mesh.
+    // Retained for source compatibility; it does not change collision geometry.
     bool general_single_hull = false;
     // Produce optional visual distance fields; they do not supply collision geometry.
     bool bake_link_sdf = false;
+    import::cooker::MeshSurfaceCookOptions mesh_surface;
 };
 
 /// Flatten the scene intermediate representation into struct-of-arrays

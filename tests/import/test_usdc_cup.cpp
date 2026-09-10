@@ -221,7 +221,7 @@ TEST_F(UsdcCup, CooksToCollidableTriangleSurface) {
     for (size_t i = 0; i < scene.ShapeCount(); ++i) {
         auto& s = scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
         if (!s.mesh_vertices.empty()) {
-            s.decompose_mode = nuka::scene::DecomposeMode::Skip;
+            s.decompose_mode = nuka::scene::DecomposeMode::Auto;
         }
     }
 
@@ -234,6 +234,14 @@ TEST_F(UsdcCup, CooksToCollidableTriangleSurface) {
     EXPECT_GT(blob.convex_geometry.index_counts[0], 0u);
     EXPECT_FALSE(blob.convex_geometry.vertices.empty());
     ASSERT_EQ(blob.convex_geometry.surface_info.size(), 1u);
+    ASSERT_EQ(blob.convex_geometry.surface_covers.size(), 1u);
+    const auto& cover = blob.convex_geometry.surface_covers[0];
+    EXPECT_EQ(cover.status, nuka::import::cooker::ConvexCoverStatus::Complete) << cover.reason;
+    EXPECT_GT(cover.parts.size(), 1u);
+    std::fprintf(stderr, "[cup cook] backend=%s parts=%zu cells=%u queries=%llu hierarchy=%u\n",
+        cover.backend.c_str(), cover.parts.size(), cover.distance_cells,
+        static_cast<unsigned long long>(cover.query_points),
+        unsigned(blob.convex_geometry.surface_cover_hierarchy[0]));
     EXPECT_EQ(blob.convex_geometry.vertices, scene.GetShape(0u).mesh_vertices);
     EXPECT_EQ(blob.convex_geometry.indices, scene.GetShape(0u).mesh_indices);
 

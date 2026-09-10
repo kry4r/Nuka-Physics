@@ -9,6 +9,8 @@
 #include <numeric>
 #include <stdexcept>
 
+#include "collision/mesh_surface.hpp"
+
 namespace nuka::import::cooker {
 namespace {
 
@@ -55,6 +57,51 @@ uint32_t BuildNodes(std::vector<MeshBvhNode>& nodes, std::vector<uint32_t>& orde
     }
     nodes[index].escape = static_cast<uint32_t>(nodes.size());
     return index;
+}
+
+void AppendTree(std::vector<MeshBvhNode>& destination, const std::vector<MeshBvhNode>& source) {
+    const auto offset = static_cast<uint32_t>(destination.size());
+    for (auto node : source) { node.escape += offset; destination.push_back(node); }
+}
+
+void BuildGroups(std::vector<MeshBvhNode>& nodes, std::vector<uint32_t>& order,
+    const std::vector<std::vector<MeshBvhNode>>& groups, uint32_t begin, uint32_t end) {
+    if (end - begin == 1u) { AppendTree(nodes, groups[order[begin]]); return; }
+    const auto at = static_cast<uint32_t>(nodes.size());
+    nodes.emplace_back();
+    Vec3 lower{FLT_MAX, FLT_MAX, FLT_MAX}, upper{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (uint32_t i = begin; i < end; ++i) {
+        lower = Min(lower, groups[order[i]][0].lower);
+        upper = Max(upper, groups[order[i]][0].upper);
+    }
+    const Vec3 extent = upper - lower;
+    const uint32_t axis = extent.x >= extent.y && extent.x >= extent.z ? 0u
+        : extent.y >= extent.z ? 1u : 2u;
+    const auto center = [&](uint32_t group) {
+        const auto& root = groups[group][0];
+        const Vec3 value = root.lower * 0.5f + root.upper * 0.5f;
+        return axis == 0u ? value.x : axis == 1u ? value.y : value.z;
+    };
+    const uint32_t middle = begin + (end - begin) / 2u;
+    std::nth_element(order.begin() + begin, order.begin() + middle, order.begin() + end,
+        [&](uint32_t a, uint32_t b) {
+            const float ca = center(a), cb = center(b);
+            return ca < cb || (ca == cb && a < b);
+        });
+    BuildGroups(nodes, order, groups, begin, middle);
+    BuildGroups(nodes, order, groups, middle, end);
+    nodes[at].lower = lower;
+    nodes[at].upper = upper;
+    nodes[at].escape = static_cast<uint32_t>(nodes.size());
+}
+
+double TreeArea(const std::vector<MeshBvhNode>& nodes) {
+    double total = 0.0;
+    for (const auto& node : nodes) {
+        const auto extent = node.upper - node.lower;
+        total += double(extent.x) * extent.y + double(extent.x) * extent.z + double(extent.y) * extent.z;
+    }
+    return total;
 }
 
 }  // namespace
@@ -132,6 +179,90 @@ CookedMeshSurface CookMeshSurface(const float* vertices, uint32_t vertex_count,
     BuildNodes(result.nodes, order, leaves, 0u, triangle_count);
     result.info.node_count = static_cast<uint32_t>(result.nodes.size());
     return result;
+}
+
+bool MeshSurfaceTreeValid(collision::MeshSurfaceView source, collision::MeshSurfaceInfo info) {
+    if (!collision::MeshSurfaceRangeValid(source, info) ||
+        uint64_t(info.node_count) != uint64_t(info.triangle_count) * 2u - 1u ||
+        source.nodes[info.node_offset].escape != info.node_count) return false;
+    std::vector<uint8_t> seen(info.triangle_count, 0u);
+    uint32_t leaves = 0u;
+    const auto contains = [](const MeshBvhNode& node, Vec3 p) {
+        return p.x >= node.lower.x && p.x <= node.upper.x && p.y >= node.lower.y &&
+               p.y <= node.upper.y && p.z >= node.lower.z && p.z <= node.upper.z;
+    };
+    for (uint32_t n = 0u; n < info.node_count; ++n) {
+        const auto& node = source.nodes[info.node_offset + n];
+        if (node.escape <= n || node.escape > info.node_count ||
+            !std::isfinite(node.lower.x) || !std::isfinite(node.lower.y) ||
+            !std::isfinite(node.lower.z) || !std::isfinite(node.upper.x) ||
+            !std::isfinite(node.upper.y) || !std::isfinite(node.upper.z) ||
+            !contains(node, node.lower) || !contains(node, node.upper)) return false;
+        if (node.triangle == ~0u) {
+            if (n + 1u >= info.node_count) return false;
+            const auto& left = source.nodes[info.node_offset + n + 1u];
+            if (left.escape <= n + 1u || left.escape >= node.escape) return false;
+            const auto& right = source.nodes[info.node_offset + left.escape];
+            if (right.escape != node.escape || !contains(node, left.lower) ||
+                !contains(node, left.upper) || !contains(node, right.lower) ||
+                !contains(node, right.upper)) return false;
+        } else {
+            Vec3 a, b, c;
+            if (node.escape != n + 1u ||
+                !collision::MeshSurfaceTriangle(source, info, node.triangle, a, b, c) ||
+                seen[node.triangle] || !contains(node, a) || !contains(node, b) || !contains(node, c))
+                return false;
+            seen[node.triangle] = 1u;
+            ++leaves;
+        }
+    }
+    return leaves == info.triangle_count;
+}
+
+void GroupMeshSurfaceByCover(CookedMeshSurface& surface, const float* vertices,
+    const uint32_t* indices) {
+    if (surface.cover.status != ConvexCoverStatus::Complete || surface.cover.parts.size() < 2u) return;
+    const auto& info = surface.info;
+    const collision::MeshSurfaceView source{vertices, indices, surface.nodes.data(),
+        {info.vertex_count, info.triangle_count, info.node_count}};
+    std::vector<MeshBvhNode> leaves(info.triangle_count);
+    std::vector<std::vector<uint32_t>> assigned(surface.cover.parts.size());
+    for (uint32_t triangle = 0u; triangle < info.triangle_count; ++triangle) {
+        Vec3 a, b, c;
+        if (!collision::MeshSurfaceTriangle(source, info, triangle, a, b, c))
+            throw std::invalid_argument("Convex cover grouping has an invalid source triangle");
+        leaves[triangle].lower = Min(a, Min(b, c));
+        leaves[triangle].upper = Max(a, Max(b, c));
+        const Vec3 center = a / 3.0f + b / 3.0f + c / 3.0f;
+        double nearest = DBL_MAX;
+        size_t owner = 0u;
+        for (size_t part = 0u; part < surface.cover.parts.size(); ++part) {
+            double distance = -DBL_MAX;
+            for (const auto& plane : surface.cover.parts[part].planes)
+                distance = std::max(distance, plane.normal.x * center.x + plane.normal.y * center.y +
+                    plane.normal.z * center.z - plane.offset);
+            if (distance < nearest) { nearest = distance; owner = part; }
+        }
+        assigned[owner].push_back(triangle);
+    }
+    std::vector<std::vector<MeshBvhNode>> groups;
+    for (auto& triangles : assigned) {
+        if (triangles.empty()) continue;
+        groups.emplace_back();
+        BuildNodes(groups.back(), triangles, leaves, 0u, static_cast<uint32_t>(triangles.size()));
+    }
+    std::vector<uint32_t> order(groups.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::vector<MeshBvhNode> nodes;
+    nodes.reserve(surface.nodes.size());
+    BuildGroups(nodes, order, groups, 0u, static_cast<uint32_t>(groups.size()));
+    const collision::MeshSurfaceView grouped{vertices, indices, nodes.data(), source.counts};
+    if (!MeshSurfaceTreeValid(grouped, info))
+        throw std::runtime_error("Convex cover grouping failed source surface coverage");
+    if (TreeArea(nodes) < TreeArea(surface.nodes)) {
+        surface.nodes = std::move(nodes);
+        surface.cover_hierarchy = true;
+    }
 }
 
 }  // namespace nuka::import::cooker

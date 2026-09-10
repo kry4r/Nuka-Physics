@@ -127,16 +127,17 @@ TEST(SparseSdfDedup, IdenticalMeshesShareOneSdf) {
     const auto scene = BuildIdenticalCubes(kInstances);
     const auto blob = CookScene(scene);
 
-    // 5 ConvexHull pieces (one per instance), but only ONE unique SDF.
-    ASSERT_EQ(blob.convex_geometry.Count(), static_cast<uint32_t>(kInstances));
+    // Independent owners share immutable geometry and its distance field.
+    ASSERT_EQ(blob.shape_count, static_cast<uint32_t>(kInstances));
+    ASSERT_EQ(blob.convex_geometry.Count(), 1u);
     EXPECT_EQ(blob.sdfs.Count(), 1u) << "identical meshes must dedup to one SDF";
 
-    // Every piece references the SAME (valid) SDF index.
-    ASSERT_EQ(blob.sdfs.piece_sdf_indices.size(), static_cast<size_t>(kInstances));
+    ASSERT_EQ(blob.sdfs.piece_sdf_indices.size(), 1u);
     const uint32_t shared = blob.sdfs.piece_sdf_indices[0];
     ASSERT_NE(shared, kNoSdf);
     for (int i = 0; i < kInstances; ++i) {
-        EXPECT_EQ(blob.sdfs.piece_sdf_indices[i], shared);
+        ASSERT_EQ(blob.shapes.convex_geometry_indices[i], 0u);
+        EXPECT_EQ(blob.sdfs.piece_sdf_indices[blob.shapes.convex_geometry_indices[i]], shared);
     }
 
     // Dedup + memory stats (R-C ~80MB cap; one small cube is far under).

@@ -63,12 +63,17 @@ bool IsIdentityLocal(const math::Transform& t) {
 uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
                               const std::vector<float>& vertices,
                               const std::vector<uint32_t>& indices,
-                              float volume, bool convex) {
+                              float volume, bool convex,
+                              const import::cooker::MeshSurfaceCookOptions& options = {}) {
     if (vertices.size() % 3u != 0u || indices.size() % 3u != 0u)
         throw std::invalid_argument("Collision mesh arrays must contain complete vertices and triangles");
-    auto surface = import::cooker::CookMeshSurface(vertices.data(),
+    auto surface = import::cooker::CookMeshSurfaceCached(vertices.data(),
         static_cast<uint32_t>(vertices.size() / 3u), indices.data(),
-        static_cast<uint32_t>(indices.size() / 3u), convex);
+        static_cast<uint32_t>(indices.size() / 3u), convex, options);
+    const auto found = std::find(geom.surface_cache_keys.begin(), geom.surface_cache_keys.end(),
+                                 surface.cache_key);
+    if (found != geom.surface_cache_keys.end())
+        return static_cast<uint32_t>(found - geom.surface_cache_keys.begin());
     const uint32_t index = geom.Count();
     geom.vertex_offsets.push_back(static_cast<uint32_t>(geom.vertices.size() / 3));
     geom.vertex_counts.push_back(static_cast<uint32_t>(vertices.size() / 3));
@@ -79,6 +84,10 @@ uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
     surface.info.triangle_offset = geom.index_offsets.back() / 3u;
     surface.info.node_offset = static_cast<uint32_t>(geom.surface_nodes.size());
     geom.surface_info.push_back(surface.info);
+    geom.surface_covers.push_back(std::move(surface.cover));
+    geom.surface_cache_keys.push_back(std::move(surface.cache_key));
+    geom.surface_cache_hits.push_back(surface.cache_hit ? 1u : 0u);
+    geom.surface_cover_hierarchy.push_back(surface.cover_hierarchy ? 1u : 0u);
     geom.surface_nodes.insert(geom.surface_nodes.end(), surface.nodes.begin(), surface.nodes.end());
     geom.vertices.insert(geom.vertices.end(), vertices.begin(), vertices.end());
     geom.indices.insert(geom.indices.end(), indices.begin(), indices.end());
@@ -563,9 +572,12 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
 
         const auto mode = ToCookerMode(r.decompose_mode);
         if (mode != import::cooker::DecomposeMode::Force) {
+            auto surface_options = options.mesh_surface;
+            surface_options.decompose = surface_options.decompose && shape_collides &&
+                mode == import::cooker::DecomposeMode::Auto;
             const uint32_t geom_index = AppendConvexGeometry(
                 blob.convex_geometry, r.mesh_vertices, r.mesh_indices, 0.0f,
-                r.type == ShapeType::ConvexHull);
+                r.type == ShapeType::ConvexHull, surface_options);
             PushShapeRow(blob.shapes, blob.contact_params, r, r.type,
                          geom_index, resolved_friction);
             continue;

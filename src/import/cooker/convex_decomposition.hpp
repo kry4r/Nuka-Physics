@@ -10,7 +10,7 @@ namespace nuka::import::cooker {
 
 /// Decomposition mode authored on a mesh (USD nuka:decompose / URDF / MJCF).
 enum class DecomposeMode : uint8_t {
-    Auto,   // preserve the authored surface representation
+    Auto,   // prepare acceleration while preserving the authored surface
     Force,  // always run V-HACD
     Skip,   // preserve source vertices, triangles, and shape type
 };
