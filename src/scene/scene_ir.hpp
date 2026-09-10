@@ -64,14 +64,8 @@ struct CollisionShapeRecord {
     // This flag is not serialized.
     bool flat_capped                       = false;
 
-    // -- Convex decomposition (mesh shapes; v0.7 p06) -----------------------
-    // Authored intent (nuka:decompose) + the upper piece bound (nuka:decompose:
-    // max_pieces). For ConvexHull / TriMesh shapes, mesh_vertices / mesh_indices
-    // carry the source geometry; when present and the mode warrants it, the
-    // cooker runs V-HACD and emits one ConvexHull per piece. Empty geometry =>
-    // the shape is passed through unchanged (importers do not yet load mesh
-    // files, so geometry is normally supplied programmatically / by future
-    // mesh-file loading).
+    // Collision meshes carry complete source triangles; explicit decomposition
+    // emits convex pieces while Auto/Skip retain the authored surface.
     DecomposeMode decompose_mode           = DecomposeMode::Auto;
     uint32_t      decompose_max_pieces     = 32;
     std::vector<float>    mesh_vertices;   // x,y,z triples (source mesh)

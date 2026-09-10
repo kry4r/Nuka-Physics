@@ -215,15 +215,9 @@ TEST_F(UsdcCup, DeterministicAcrossLoads) {
     EXPECT_EQ(sa->mesh_vertices.size(), 1796u * 3u);
 }
 
-// ---------------------------------------------------------------------------
-// The cup cooks to a COLLIDABLE convex hull (the C7b grasp-gate need). With
-// DecomposeMode::Skip the source mesh becomes exactly one ConvexHull carrying
-// its own geometry; cook-twice is byte-identical (D1).
-// ---------------------------------------------------------------------------
-TEST_F(UsdcCup, CooksToCollidableConvexHull) {
+// Preserve the cup's concavity and its original collision triangles.
+TEST_F(UsdcCup, CooksToCollidableTriangleSurface) {
     auto scene = nuka::import::LoadUsd(kModelUsda);
-    // Force the single-hull path so the assertion is deterministic and the
-    // result is unambiguously one collidable ConvexHull.
     for (size_t i = 0; i < scene.ShapeCount(); ++i) {
         auto& s = scene.GetShapeMut(static_cast<nuka::scene::ShapeId>(i));
         if (!s.mesh_vertices.empty()) {
@@ -233,20 +227,22 @@ TEST_F(UsdcCup, CooksToCollidableConvexHull) {
 
     const auto blob = nuka::scene::CookScene(scene);
 
-    // Exactly one shape, of ConvexHull type, with non-empty hull geometry.
     ASSERT_EQ(blob.shapes.types.size(), 1u);
-    EXPECT_EQ(blob.shapes.types[0], nuka::scene::ShapeType::ConvexHull);
+    EXPECT_EQ(blob.shapes.types[0], nuka::scene::ShapeType::TriMesh);
     ASSERT_FALSE(blob.convex_geometry.vertex_counts.empty());
     EXPECT_GT(blob.convex_geometry.vertex_counts[0], 0u);
     EXPECT_GT(blob.convex_geometry.index_counts[0], 0u);
     EXPECT_FALSE(blob.convex_geometry.vertices.empty());
+    ASSERT_EQ(blob.convex_geometry.surface_info.size(), 1u);
+    EXPECT_EQ(blob.convex_geometry.vertices, scene.GetShape(0u).mesh_vertices);
+    EXPECT_EQ(blob.convex_geometry.indices, scene.GetShape(0u).mesh_indices);
 
-    // The cooked hull lives in the few-cm scaled envelope (collidable cup).
+    // The collision mesh retains the imported scale.
     const Bbox hb = BboxOf(blob.convex_geometry.vertices);
     EXPECT_LE(hb.hi[2], kScaleZ + 2e-4f);
     EXPECT_GE(hb.lo[2], -kScaleZ - 2e-4f);
 
-    // D1: cook twice -> byte-identical hull geometry.
+    // Repeated cooking preserves vertex and triangle order.
     const auto blob2 = nuka::scene::CookScene(scene);
     EXPECT_EQ(blob.convex_geometry.vertices, blob2.convex_geometry.vertices);
     EXPECT_EQ(blob.convex_geometry.indices, blob2.convex_geometry.indices);

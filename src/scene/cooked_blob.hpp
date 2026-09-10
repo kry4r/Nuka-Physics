@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 #include "scene/canonical_types.hpp"
+#include "collision/mesh_surface_types.hpp"
 #include "scene/contact_filter.hpp"   // MergedContactParams (v0.8 C1c)
 #include "math/transform.hpp"
 
@@ -51,16 +52,12 @@ struct CookedShapeTable {
     std::vector<math::Vec3>      half_extents;
     std::vector<float>           radii;
     std::vector<float>           half_heights;
-    // Per-shape index into CookedConvexGeometry (kNoConvexGeometry for shapes
-    // without hull geometry, e.g. Sphere/Box/Plane/Capsule). Parallel to the
-    // arrays above. v0.7 p06.
+    // Index into the shared triangle geometry table; primitives have no entry.
     std::vector<uint32_t>        convex_geometry_indices;
 };
 
-// Flat geometry storage for ConvexHull shapes (one entry per ConvexHull row).
-// Vertices are x,y,z triples; indices are triangles. Each hull's slice is
-// [vertex_offsets[i]*3, +vertex_counts[i]*3) into `vertices` and
-// [index_offsets[i], +index_counts[i]) into `indices`. v0.7 p06.
+// Shared geometry for convex pieces and authored triangle meshes.
+// Vertices are xyz triples; triangle indices are local to each geometry entry.
 struct CookedConvexGeometry {
     std::vector<float>    vertices;        // flat x,y,z triples for all hulls
     std::vector<uint32_t> indices;         // flat triangle indices for all hulls
@@ -69,6 +66,8 @@ struct CookedConvexGeometry {
     std::vector<uint32_t> index_offsets;   // per-hull start index (in indices)
     std::vector<uint32_t> index_counts;    // per-hull index count
     std::vector<float>    volumes;         // per-hull volume
+    std::vector<collision::MeshSurfaceInfo> surface_info;
+    std::vector<collision::MeshBvhNode> surface_nodes;
     uint32_t Count() const { return static_cast<uint32_t>(vertex_counts.size()); }
 };
 

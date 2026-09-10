@@ -16,6 +16,7 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "math/symmetric_mat3.hpp"
+#include "collision/mesh_surface_types.hpp"
 
 namespace nuka::nk {
 // Spatial / matrix element types for the articulation device state
@@ -101,6 +102,9 @@ struct ModelView {
     uint32_t* particle_topology_offsets = nullptr;  // per:scalar arena:persistent owner:model count:particle_topology_offsets
     uint32_t* particle_topology_elements = nullptr;  // per:scalar arena:persistent owner:model count:particle_topology_incidence_count
     ::nuka::math::Vec3* particle_contact_rest_pos = nullptr;  // per:scalar arena:persistent owner:model count:particle_contact_rest_positions
+    ::nuka::collision::MeshSurfaceInfo* mesh_surface_info = nullptr;  // per:scalar arena:persistent owner:model count:mesh_surface_info_count
+    uint32_t* mesh_triangles = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_triangles*3
+    ::nuka::collision::MeshBvhNode* mesh_bvh_nodes = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_bvh_nodes
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena

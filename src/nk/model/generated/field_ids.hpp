@@ -296,6 +296,9 @@ enum class FieldId : uint16_t {
     ParticleTopologyOffsets,  // particle_topology_offsets (per:scalar arena:persistent owner:model count:particle_topology_offsets)
     ParticleTopologyElements,  // particle_topology_elements (per:scalar arena:persistent owner:model count:particle_topology_incidence_count)
     ParticleContactRestPos,  // particle_contact_rest_pos (per:scalar arena:persistent owner:model count:particle_contact_rest_positions)
+    MeshSurfaceInfo,  // mesh_surface_info (per:scalar arena:persistent owner:model count:mesh_surface_info_count)
+    MeshTriangles,  // mesh_triangles (per:scalar arena:persistent owner:model count:max_mesh_triangles*3)
+    MeshBvhNodes,  // mesh_bvh_nodes (per:scalar arena:persistent owner:model count:max_mesh_bvh_nodes)
     Count
 };
 
@@ -587,6 +590,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_topology_offsets",
     "particle_topology_elements",
     "particle_contact_rest_pos",
+    "mesh_surface_info",
+    "mesh_triangles",
+    "mesh_bvh_nodes",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

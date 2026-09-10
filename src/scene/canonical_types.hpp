@@ -86,9 +86,9 @@ enum class ActuatorType : uint8_t {
 // here so the scene IR / cooked blob carry it without depending on the cooker
 // library's headers.
 enum class DecomposeMode : uint8_t {
-    Auto,   // cooker decides (already-convex => 1 piece; concave => V-HACD)
+    Auto,   // preserve the authored surface representation
     Force,  // always run V-HACD
-    Skip,   // treat the source mesh as a single convex piece (its own hull)
+    Skip,   // preserve source vertices, triangles, and shape type
 };
 
 } // namespace nuka::scene

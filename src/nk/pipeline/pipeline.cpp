@@ -549,6 +549,8 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         p_np_sdf_.sdf_grid_count = cap.max_sdf_grids;
         p_np_sdf_.sample_point_count = cap.max_samp_points;
+        p_np_sdf_.sdf_cell_total = cap.max_sdf_cells;
+        p_np_sdf_.mesh_geometry = {cap.max_hull_verts, cap.max_mesh_triangles, cap.max_mesh_bvh_nodes};
         const bool has_sampled_geometry = cap.max_samp_points > 0u || cap.max_sdf_grids > 0u ||
             std::any_of(model.shape_table_rows.begin(), model.shape_table_rows.end(),
                 [](const Model::PairDrivenShape& shape) {

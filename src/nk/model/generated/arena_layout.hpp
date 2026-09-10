@@ -335,6 +335,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_topology_offsets
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_topology_elements
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 3, 12, 0},  // particle_contact_rest_pos
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // mesh_surface_info
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mesh_triangles
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // mesh_bvh_nodes
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

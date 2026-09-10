@@ -9,6 +9,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <chrono>
+#include <filesystem>
 #include <string>
 
 namespace {
@@ -76,10 +78,14 @@ TEST(InertiaFriction, JointFrictionlossParsed) {
 // survive an nks Save/Load round-trip byte-for-value.
 TEST(InertiaFriction, NksRoundTripPreservesInertiaAndFriction) {
     const auto scene = nuka::import::LoadMjcf("tests/data/inertia_friction.xml");
-    const std::string path =
-        "/data/xtzhang25/_work/activate/tmp/inertia_friction_roundtrip.nks";
+    auto file = std::filesystem::temp_directory_path() /
+        ("nuka_inertia_friction_" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".nks");
+    const std::string path = file.string();
     nuka::scene::nks::Save(scene, path);
     const auto loaded = nuka::scene::nks::Load(path);
+    std::filesystem::remove(file);
+    std::filesystem::remove(file.replace_extension(".nka"));
 
     ASSERT_GE(loaded.RigidBodyCount(), 2u);
     ASSERT_GE(loaded.JointCount(), 1u);

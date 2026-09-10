@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include "collision/contact_capacity.hpp"
+#include "collision/shape_kind.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/pipeline.hpp"
 
@@ -48,6 +49,9 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // Grid-owned particles do not emit body-particle manifolds.
     p_np_body_particle.particle_row_base = ctx.n_mpm;
     p_np_body_particle.sdf_grid_count = model.capacities.max_sdf_grids;
+    p_np_body_particle.sdf_cell_total = model.capacities.max_sdf_cells;
+    p_np_body_particle.mesh_geometry = {model.capacities.max_hull_verts,
+        model.capacities.max_mesh_triangles, model.capacities.max_mesh_bvh_nodes};
     // Warp-per-particle only pays off when a collider has a WIDE hull whose
     // SupportHull scan dominates; an analytic-only collider world (box/sphere/
     // plane walls) keeps thread-per-particle so 31 lanes don't idle. The
@@ -55,7 +59,8 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // per-scene branch; both launch paths are byte-identical.
     uint32_t max_hull_vcount = 0u;
     for (const auto& sh : model.shape_table_rows)
-        max_hull_vcount = std::max(max_hull_vcount, sh.hull_vert_count);
+        if (sh.kind == collision::kShapeConvexHull)
+            max_hull_vcount = std::max(max_hull_vcount, sh.hull_vert_count);
     constexpr uint32_t kWarpHullVcountThreshold = 256u;
     p_np_body_particle.warp_per_particle =
         (max_hull_vcount > kWarpHullVcountThreshold) ? 1u : 0u;
@@ -120,6 +125,9 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
     p.bite_disable_dynamic_bc = mp.mpm_bite_disable_dynamic_bc ? 1u : 0u;
     p.bodies_per_env = ctx.bodies_per_env;
     p.sdf_grid_count = model.capacities.max_sdf_grids;
+    p.sdf_cell_total = model.capacities.max_sdf_cells;
+    p.mesh_geometry = {model.capacities.max_hull_verts,
+        model.capacities.max_mesh_triangles, model.capacities.max_mesh_bvh_nodes};
     p.body_mu = mp.mpm_body_friction;
     p.body_band = mp.mpm_body_band > 0.0f ? mp.mpm_body_band : mp.mpm_cell_size;
     // Link reactions seed the shared solve through M^-1 J^T in qdot_flat.
