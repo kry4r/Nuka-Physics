@@ -60,6 +60,13 @@ public:
     phi::Status LastStatus() const { return last_status_; }
     uint32_t EnvCount() const { return model_.capacities.env_count; }
 
+    // Rebuild the common operator parameters; state and readout buffers retain their identity.
+    phi::Status SetGravity(const math::Vec3& gravity);
+    math::Vec3 Gravity() const { return {cfg_.gravity[0], cfg_.gravity[1], cfg_.gravity[2]}; }
+
+    // Update one template link's spatial inertia in every environment without reallocating.
+    phi::Status SetLinkInertia(uint32_t link_index, const Mat36& inertia);
+
     // Dispatch in order and stop at the first host or launch failure.
     StepResult Step();
 

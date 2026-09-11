@@ -526,21 +526,13 @@ public:
         return hash;
     }
 
-    // v0.5 p04 §4 PARAMETER spine: set one articulation link's scalar mass at
-    // runtime (GLOBAL link index in [0, total_link_count)). Rebuilds the link's
-    // 6x6 spatial inertia from the new mass via the SAME affine MakeSpatialInertia
-    // parameterization the mass-gradient adjoint assumes. The Python autograd layer
-    // calls this BEFORE stepping so the sim actually uses the param tensor's value
-    // (otherwise the gradient would be silently wrong). See nuka_diffsim.h.
+    // Template link masses apply to every environment, with COM and rotational inertia fixed.
     void set_link_mass(uint32_t link_index, float mass) {
         check(nuka_world_set_link_mass(h_, link_index, mass),
               "nuka_world_set_link_mass");
     }
 
-    // v0.5 p04 A4 floating-gradcheck enabler: set the world's uniform gravity
-    // (Z component, m/s^2). NO behavioral change until called (default stays
-    // -9.81); a world that never calls this steps byte-identically. MUST be called
-    // BEFORE nuka_tape_create -- the tape captures gravity_z at create time.
+    // Production gravity changes on the next step; tapes retain their creation parameters.
     void set_gravity_z(float gravity_z) {
         check(nuka_world_set_gravity_z(h_, gravity_z), "nuka_world_set_gravity_z");
     }
@@ -2574,25 +2566,16 @@ NB_MODULE(_nuka_ext, m) {
             "per-axis focal are renderer-side knobs not carried by the scene schema, "
             "so they are not exposed here. Requires a camera attached; rebuilds the "
             "sensor scene (per-env DR + shading fidelity are preserved).")
-        // v0.5 p04 §4 PARAMETER spine: runtime link-mass setter (the forward write
-        // the autograd layer uses to push a mass param tensor INTO the sim).
         .def("set_link_mass", &World::set_link_mass, nb::arg("link_index"),
              nb::arg("mass"),
-             "Set one articulation link's scalar mass (GLOBAL link index in "
-             "[0, base_link_count) for single-env). Rebuilds the link's 6x6 spatial "
-             "inertia affinely from the new mass via the SAME MakeSpatialInertia "
-             "parameterization the mass-gradient adjoint assumes; the next step()/"
-             "step_with_tape() reads it fresh. Used by nuka.autograd."
-             "differentiable_step to push a mass param tensor's value into the sim "
-             "BEFORE stepping (so the true d(output)/d(mass) is nonzero). mass > 0; "
-             "an out-of-range index or non-positive mass raises.")
-        // v0.5 p04 A4 enabler: world gravity setter (MUST precede Tape.create).
+             "Set one template link's mass in every environment. link_index is in "
+             "[0, base_link_count), and mass must be finite and positive (kg). "
+             "The COM and rotational inertia at the COM stay fixed. Model and live "
+             "spatial inertia update together without reallocating buffers.")
         .def("set_gravity_z", &World::set_gravity_z, nb::arg("gravity_z"),
-             "Set the world's uniform gravity Z (m/s^2). Default is -9.81; call "
-             "BEFORE creating a Tape (the tape captures gravity at create time). "
-             "Used by the floating mass-gradcheck, which needs g=0 so the deferred "
-             "floating-base orientation channel is inert. A world that never calls "
-             "this steps byte-identically (default unchanged).")
+             "Set finite uniform gravity Z (m/s^2), preserving X and Y. Applies to "
+             "the next production step in every environment; a changed value "
+             "invalidates the execution graph. Tapes capture gravity at creation.")
         // v0.5 p04 N1 sim-to-real sensor noise (Task 5.4.9). Register/clear a
         // per-field noise descriptor; apply it in place to the live device
         // buffer. Counter-based (Philox) -> D1 two-run bit-exact.

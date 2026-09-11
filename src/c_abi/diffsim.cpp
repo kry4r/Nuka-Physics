@@ -27,6 +27,8 @@
 #include <cuda_runtime.h>
 
 #include <exception>
+#include <cmath>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -42,7 +44,7 @@ namespace diffsim = nuka::diffsim;
 // the backward runner. The world's articulation_device.View() is the live state
 // all of them operate on.
 struct TapeRecord {
-    WorldRecord* world = nullptr;
+    nuka_world_handle world = nullptr;
     diffsim::TapeDesc desc;
     uint32_t total_link_count = 0u;
     std::unique_ptr<diffsim::RecomputeOrchestrator> orchestrator;
@@ -116,11 +118,12 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         world_record->articulation_host.TotalLinkCount() == 0u) {
         return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
     }
-    if (world_record->world->GetModel().capacities.mpm_plastic_state)
+    if (world_record->world->EnvCount() != 1u ||
+        world_record->world->GetModel().capacities.mpm_plastic_state)
         return NUKA_RESULT_NOT_SUPPORTED;
     try {
         auto record = std::make_unique<TapeRecord>();
-        record->world = world_record;
+        record->world = world;
         record->desc.checkpoint_interval = desc->checkpoint_interval;
         record->desc.max_tape_entries = desc->max_tape_entries;
         record->desc.max_checkpoints = desc->max_checkpoints;
@@ -192,7 +195,7 @@ nuka_result_t nuka_world_step_with_tape(nuka_world_handle world,
         return NUKA_RESULT_NULL_HANDLE;
     }
     WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
-    if (world_record == nullptr || world_record != record->world) {
+    if (world_record == nullptr || world != record->world) {
         return NUKA_RESULT_INVALID_ARG;
     }
     try {
@@ -250,12 +253,14 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
     if (record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
+    WorldRecord* world_record = nuka::c_abi::WorldTable().Get(record->world);
+    if (world_record == nullptr) return NUKA_RESULT_NULL_HANDLE;
     if (grad_actions_out == nullptr) {
         return NUKA_RESULT_INVALID_ARG;
     }
     try {
         const cudaStream_t stream = nullptr;  // BUF-14: stream 0
-        const int device_id = record->world->device->device_id;
+        const int device_id = world_record->device->device_id;
         const uint32_t n = record->total_link_count;
         const uint32_t step_count = record->tape->StepCount();
         if (step_count == 0u) {
@@ -389,7 +394,8 @@ nuka_result_t nuka_tape_state_view(nuka_tape_handle tape,
     out->dtype = 0u;
 
     TapeRecord* record = TapeTable().Get(tape);
-    if (record == nullptr || !record->orchestrator) {
+    if (record == nullptr || !record->orchestrator ||
+        nuka::c_abi::WorldTable().Get(record->world) == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
     try {
@@ -450,29 +456,24 @@ nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
     if (link_index >= total_links || link_index >= host.link_inertia.size()) {
         return NUKA_RESULT_INVALID_ARG;
     }
-    // Reject a non-positive mass: MakeSpatialInertia's mass<=0 guard returns a
-    // ZERO 6x6, which is degenerate for ABA (singular articulated inertia) and
-    // makes the affine dI/dmass parameterization the adjoint assumes inapplicable.
-    if (!(mass > 0.0f)) {
+    if (!(mass > 0.0f) || !std::isfinite(mass)) {
         return NUKA_RESULT_INVALID_ARG;
     }
     try {
-        // Resolve the GLOBAL link index to its (articulation, local) so we read
-        // the SAME (diagonal_inertia, inertial_frame) the cooker stored -- the
-        // identical source BuildMassParams uses to build dI/dmass. Iterating the
-        // articulations in concatenation order reproduces the global-link layout
-        // BuildArticulationHostState emits.
         nuka::math::Vec3 diagonal_inertia{0.0f, 0.0f, 0.0f};
         nuka::math::Transform inertial_frame =
             nuka::math::Transform::Identity();
+        float* template_mass = nullptr;
         {
             uint32_t global = 0u;
             bool resolved = false;
-            for (const auto& topo : host.articulations) {
+            for (auto& topo : host.articulations) {
                 const uint32_t link_count =
                     static_cast<uint32_t>(topo.link_bodies.size());
                 if (link_index < global + link_count) {
                     const uint32_t local = link_index - global;
+                    if (local >= topo.masses.size()) return NUKA_RESULT_INVALID_ARG;
+                    template_mass = &topo.masses[local];
                     diagonal_inertia = (local < topo.inertias.size())
                                            ? topo.inertias[local]
                                            : nuka::math::Vec3{0.0f, 0.0f, 0.0f};
@@ -490,45 +491,19 @@ nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
             }
         }
 
-        // Reconstruct the link's spatial inertia from the new scalar mass using
-        // the EXACT MakeSpatialInertia parameterization the engine cooked it with:
-        // COM (inertial_frame.position) + the rotated diagonal inertia tensor are
-        // HELD FIXED, only `mass` changes. This is affine in mass and matches the
-        // backward's dI/dmass = MakeSpatialInertia(m+1) - MakeSpatialInertia(m)
-        // (see diffsim::BuildSpatialInertiaMassJacobian). The COM-fixed convention
-        // means dI/dmass is constant -- exactly what the p02 adjoint contracts
-        // grad_I against.
+        // Scalar mass varies with the COM and rotational inertia at the COM held fixed.
+        // This affine parameterization matches the adjoint's spatial inertia derivative.
         const nuka::runtime::articulation::LinkSpatialInertia new_inertia =
             nuka::runtime::articulation::MakeSpatialInertia(
                 mass, diagonal_inertia, inertial_frame);
 
-        // Update the host mirror (keeps BuildMassParams / the DR nominal baseline
-        // consistent) and write the SINGLE link's 6x6 into the live nk arena
-        // LinkInertia field in place (offset link_index, no realloc). The diffsim
-        // seam reads link_inertia from THIS arena field (model_view.link_inertia),
-        // and AbaPass1 reads it FRESH every step (CopySpatialInertia +
-        // Mat66MulVec6(I, v)), so the write takes effect on the NEXT step; there
-        // is no derived/cached inertia to invalidate. dI/dmass is mass-independent
-        // (affine), so the tape's uploaded slope needs no refresh.
+        nuka::nk::Mat36 packed{};
+        static_assert(sizeof(packed) == sizeof(new_inertia));
+        std::memcpy(&packed, &new_inertia, sizeof(packed));
+        const auto status = world_record->world->SetLinkInertia(link_index, packed);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
         host.link_inertia[link_index] = new_inertia;
-
-        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
-        const int device_id = world_record->device->device_id;
-        auto* device_inertia =
-            world_record->world->FieldPtr<nuka::runtime::articulation::LinkSpatialInertia>(
-                nuka::nk::FieldId::LinkInertia);
-        if (device_inertia == nullptr) {
-            return NUKA_RESULT_NOT_SUPPORTED;
-        }
-        nuka::phi::ScopedDeviceGuard guard(device_id);
-        cudaError_t copy_status = cudaMemcpyAsync(
-            device_inertia + link_index, &new_inertia,
-            sizeof(nuka::runtime::articulation::LinkSpatialInertia),
-            cudaMemcpyHostToDevice, stream);
-        if (copy_status != cudaSuccess) {
-            return NUKA_RESULT_INTERNAL;
-        }
-        cudaStreamSynchronize(stream);
+        *template_mass = mass;
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
@@ -544,12 +519,21 @@ nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z)
     if (world_record == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
-    // A plain host-side scalar write to the world's step options. nuka_tape_create
-    // reads step_options.gravity.z into RolloutParams.gravity_z, so this must be
-    // called BEFORE the tape is created to take effect on the differentiable
-    // rollout. No device work; nothing cached/derived to invalidate.
-    world_record->step_options.gravity.z = gravity_z;
-    return NUKA_RESULT_OK;
+    if (!world_record->world || !std::isfinite(gravity_z)) return NUKA_RESULT_INVALID_ARG;
+    try {
+        auto gravity = world_record->world->Gravity();
+        gravity.z = gravity_z;
+        const auto status = world_record->world->SetGravity(gravity);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        world_record->step_options.gravity = gravity;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        return nuka::c_abi::MapExceptionToResult(e);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
 }
 
 nuka_result_t nuka_world_set_sparse_solver_backend(

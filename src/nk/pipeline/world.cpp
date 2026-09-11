@@ -668,6 +668,62 @@ phi::Status World::DispatchOp(phi::NkOp op, const void* params) {
     return last_status_ = DispatchChecked(backend_, model_view_, data_view_, call, &execution_error_);
 }
 
+phi::Status World::SetGravity(const math::Vec3& gravity) {
+    if (!ready_ || !std::isfinite(gravity.x) || !std::isfinite(gravity.y) ||
+        !std::isfinite(gravity.z)) return last_status_ = phi::Status::InvalidArgument;
+    if (gravity.x == cfg_.gravity[0] && gravity.y == cfg_.gravity[1] &&
+        gravity.z == cfg_.gravity[2]) return last_status_ = phi::Status::Ok;
+    auto config = cfg_;
+    config.gravity[0] = gravity.x;
+    config.gravity[1] = gravity.y;
+    config.gravity[2] = gravity.z;
+    auto candidate = std::make_unique<Pipeline>();
+    last_status_ = candidate->Build(model_, config, device_, readout_demand_);
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    if (plan_ != nullptr) {
+        phi::BackendPlanFree(backend_, plan_);
+        plan_ = nullptr;
+    }
+    plan_attempted_ = false;
+    graph_error_ = {};
+    pipeline_ = std::move(candidate);
+    cfg_ = config;
+    return last_status_ = phi::Status::Ok;
+}
+
+phi::Status World::SetLinkInertia(uint32_t link_index, const Mat36& inertia) {
+    constexpr size_t width = sizeof(inertia.m) / sizeof(float);
+    const uint32_t links = model_.capacities.links_per_env;
+    if (!ready_ || link_index >= links ||
+        (size_t(link_index) + 1u) * width > model_.articulation.link_inertia_spatial.size())
+        return last_status_ = phi::Status::InvalidArgument;
+    for (float value : inertia.m)
+        if (!std::isfinite(value)) return last_status_ = phi::Status::InvalidArgument;
+    uint64_t total_bytes = 0u;
+    const auto segments = model_.ComputeModelSegments(&total_bytes);
+    const auto segment = std::find_if(segments.begin(), segments.end(),
+        [](const Model::Segment& value) { return value.field == FieldId::LinkInertia; });
+    if (segment == segments.end()) return last_status_ = phi::Status::Unsupported;
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    for (uint32_t env = 0u; env < EnvCount(); ++env) {
+        const size_t offset = segment->offset + (size_t(env) * links + link_index) * sizeof(inertia);
+        last_status_ = phi::BufferUpload(model_.DeviceBuffer(), &inertia, offset, sizeof(inertia));
+        if (last_status_ != phi::Status::Ok) {
+            const auto failure = last_status_;
+            Synchronize();
+            return last_status_ = failure;
+        }
+    }
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    std::copy(inertia.m, inertia.m + width,
+              model_.articulation.link_inertia_spatial.begin() + size_t(link_index) * width);
+    return last_status_ = phi::Status::Ok;
+}
+
 phi::Status World::DemandReadout(FieldId id) {
     uint32_t bit = 0u;
     // Every field OpReadoutContactWrench produces (geometry + {Fn,Ft1,Ft2} +

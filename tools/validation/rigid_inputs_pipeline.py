@@ -53,6 +53,54 @@ def render(world):
     ).copy()
 
 
+def check_runtime_parameters(world, body):
+    fields = (nuka.JOINT_POSITION, nuka.JOINT_VELOCITY, nuka.BASE_POSE, nuka.RIGID_BODY_TRANSFORM)
+    addresses = [world.buffer_device_ptr(field) for field in fields]
+    before = [world.download_field(field).copy() for field in fields]
+    for invalid in (float("nan"), float("inf"), -float("inf")):
+        for setter, arguments in ((world.set_gravity_z, (invalid,)),
+                                  (world.set_link_mass, (1, invalid))):
+            try:
+                setter(*arguments)
+            except RuntimeError as error:
+                assert str(error).endswith("invalid argument (1)"), str(error)
+            else:
+                raise AssertionError("nonfinite runtime parameter was accepted")
+    for field, expected in zip(fields, before):
+        np.testing.assert_array_equal(world.download_field(field), expected)
+
+    world.reset()
+    gravity = GRAVITY.copy()
+    gravity[2] = -3.0
+    graph_before = dict(world.execution_info)
+    world.set_gravity_z(float(gravity[2]))
+    if graph_before["mode"] == "graph":
+        assert not world.execution_info["graph_ready"]
+    world.step()
+    expected = np.broadcast_to(gravity * world.dt, (world.env_count, 3))
+    np.testing.assert_allclose(read(world, nuka.Field.BODY_LINEAR_VELOCITY, 3)[:, body],
+                               expected, rtol=0, atol=1e-6)
+    after_gravity = dict(world.execution_info)
+    world.set_gravity_z(float(gravity[2]))
+    assert dict(world.execution_info) == after_gravity
+    if graph_before["mode"] == "graph":
+        assert after_gravity["capture_attempts"] == graph_before["capture_attempts"] + 1
+        assert after_gravity["graph_ready"]
+
+    world.reset()
+    world.set_link_mass(1, 0.42)
+    world.step_n(4)
+    for field in (nuka.JOINT_POSITION, nuka.JOINT_VELOCITY, nuka.LINK_VELOCITY):
+        values = world.download_field(field).reshape(world.env_count, -1)
+        assert np.isfinite(values).all()
+        np.testing.assert_array_equal(values[0], values[1])
+    assert not np.any(world.download_field(nuka.ENV_STATUS))
+    assert [world.buffer_device_ptr(field) for field in fields] == addresses
+    return {"nonfinite_rejected_without_state_mutation": True,
+            "runtime_gravity_m_s2": gravity.tolist(), "gravity_applies_to_production": True,
+            "mass_update_all_environments": True, "state_buffers_reused": True}
+
+
 def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager"):
     output.mkdir(parents=True, exist_ok=True)
     builder = nuka.SceneBuilder.create(str(ROOT / "examples/scenes/go2_stand.usda"))
@@ -219,6 +267,7 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
             assert execution_info["graph_ready"]
             assert execution_info["capture_attempts"] == 1
             assert execution_info["graph_replays"] == 2 * steps
+        parameter_updates = check_runtime_parameters(world, body)
         return {
             "env_count": world.env_count, "body_count_per_env": int(force_view.shape[1]),
             "particles_per_env": int(initial[-1].shape[1]), "steps": steps, "dt": dt,
@@ -234,6 +283,7 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
             "contact_wrench_dlpack_alias": True, "contact_wrench_reset_isolated": True,
             "contact_wrench_sha256": hashlib.sha256(advanced_wrench.tobytes()).hexdigest(),
             "execution": execution_info,
+            "parameter_updates": parameter_updates,
             "state_sha256": hashlib.sha256(b"".join(value.tobytes() for value in advanced)).hexdigest(),
         }
 
