@@ -403,8 +403,7 @@ bool WritePng(const render::VulkanOffscreenReport& rep, const std::string& path)
     return rc == 0;
 }
 
-// ---- CUDA ray-traced backend (GPU beauty path; the scene changes each frame,
-// so it is freed + rebuilt per frame). ----
+// The scene update retains unchanged geometry and refreshes the live surface.
 class GpuRenderer {
 public:
     explicit GpuRenderer(const render::RenderWorld& rw) {
@@ -420,8 +419,7 @@ public:
     render::VulkanOffscreenReport Render(const render::RenderWorld& rw,
                                          const render::RasterOptions& opts) {
         scene_ = render::RenderWorldToTwoLevelScene(rw);
-        if (handle_) backend_->FreeScene(handle_);
-        handle_ = backend_->BuildScene(scene_);
+        backend_->UpdateScene(handle_, scene_);
         ApplyLighting(opts);
         const rt::PinholeCamera cam = CameraFromOptions(opts);
         rt::Framebuffer fb =
@@ -613,6 +611,9 @@ struct Args {
     std::string execution = "eager";
     std::string perf_json;
     std::string state_output;
+    std::string render_perf_json;
+    uint32_t render_warmup = 32u;
+    uint32_t render_frames = std::numeric_limits<uint32_t>::max();
 };
 Args ParseArgs(int argc, char** argv) {
     Args a;
@@ -646,6 +647,9 @@ Args ParseArgs(int argc, char** argv) {
         else if (s == "--execution") a.execution = next_value();
         else if (s == "--perf-json") a.perf_json = next_value();
         else if (s == "--state-output") a.state_output = next_value();
+        else if (s == "--render-perf-json") a.render_perf_json = next_value();
+        else if (s == "--render-warmup") a.render_warmup = next_u(a.render_warmup);
+        else if (s == "--render-frames") a.render_frames = next_u(a.render_frames);
         else throw std::invalid_argument("unknown option " + s);
     }
     Require(a.width > 0u && a.height > 0u && a.drop_steps > 0u &&
@@ -653,6 +657,8 @@ Args ParseArgs(int argc, char** argv) {
     Require(a.from_path.empty() || (a.perf_json.empty() && a.state_output.empty()),
             "simulation measurements cannot be requested with --from");
     Require(!a.probe || a.dump_path.empty(), "--probe does not collect render snapshots for --dump");
+    Require(a.render_perf_json.empty() || (a.video && !a.probe && a.dump_path.empty() && a.render_frames > 0u),
+            "render measurements require video rendering");
     return a;
 }
 
@@ -740,6 +746,92 @@ std::string FormatHash(uint64_t hash) {
     text << std::hex << std::setw(16) << std::setfill('0') << hash;
     return text.str();
 }
+
+class FrameMeasurements {
+public:
+    FrameMeasurements(const Args& args, size_t frames) : args_(args) {
+        if (args_.render_perf_json.empty()) return;
+        auto* backend = nphi::ActiveBackend();
+        Require(backend && std::strcmp(nphi::BackendName(backend), "cuda") == 0,
+                "render completion timing requires CUDA");
+        stream_ = nphi::CudaBackendMainStream(reinterpret_cast<nphi::CudaBackend*>(backend));
+        events_.assign(frames * 2u, nullptr);
+        try {
+            for (auto& event : events_) CheckCuda(cudaEventCreate(&event));
+        } catch (...) {
+            for (auto event : events_) if (event) cudaEventDestroy(event);
+            throw;
+        }
+        size_t total = 0u;
+        CheckCuda(cudaMemGetInfo(&free_before_, &total));
+    }
+    ~FrameMeasurements() { for (auto event : events_) if (event) cudaEventDestroy(event); }
+    bool Enabled() const { return !events_.empty(); }
+    void Begin() {
+        if (!Enabled()) return;
+        CheckCuda(cudaEventRecord(events_[wall_.size() * 2u], stream_));
+        start_ = Clock::now();
+    }
+    void GeometryReady() { if (Enabled()) geometry_.push_back(Milliseconds(start_)); }
+    void End(uint32_t step, const render::VulkanOffscreenReport& image) {
+        if (!Enabled()) return;
+        CheckCuda(cudaEventRecord(events_[wall_.size() * 2u + 1u], stream_));
+        wall_.push_back(Milliseconds(start_));
+        Require(image.width == args_.width && image.height == args_.height &&
+                    image.pixels.size() == size_t{args_.width} * args_.height &&
+                    image.non_background_pixel_count > 0u, "invalid render output");
+        uint64_t digest = 14695981039346656037ull;
+        HashBytes(digest, image.pixels.data(), image.pixels.size() * sizeof(image.pixels[0]));
+        Json frame = Json::Object();
+        frame.Set("step", Json::Int(step));
+        frame.Set("rgba_fnv1a64", Json::Str(FormatHash(digest)));
+        frame.Set("non_background_pixels", Json::Int(image.non_background_pixel_count));
+        frames_.PushBack(std::move(frame));
+    }
+    void Save(double creation_ms) {
+        if (!Enabled()) return;
+        Require(!wall_.empty(), "no measured render frames");
+        CheckCuda(cudaEventSynchronize(events_[wall_.size() * 2u - 1u]));
+        std::vector<double> gpu;
+        for (size_t i = 0u; i < wall_.size(); ++i) {
+            float elapsed = 0.0f;
+            CheckCuda(cudaEventElapsedTime(&elapsed, events_[i * 2u], events_[i * 2u + 1u]));
+            gpu.push_back(elapsed);
+        }
+        size_t free_after = 0u, total = 0u;
+        CheckCuda(cudaMemGetInfo(&free_after, &total));
+        Json report = Json::Object(), config = Json::Object(), timing = Json::Object();
+        config.Set("width", Json::Int(args_.width));
+        config.Set("height", Json::Int(args_.height));
+        config.Set("samples", Json::Int(args_.samples));
+        config.Set("warmup_frames", Json::Int(args_.render_warmup));
+        config.Set("snapshot", Json::Str(args_.from_path));
+        config.Set("shadow_rays", Json::Int(6));
+        config.Set("ao_samples", Json::Int(4));
+        config.Set("transmit_bounces", Json::Int(6));
+        config.Set("seed", Json::Int(0x9e3779b9u));
+        report.Set("config", std::move(config));
+        timing.Set("creation_ms", Json::Float(creation_ms));
+        timing.Set("gpu_completion", Distribution(gpu, 0u, gpu.size()));
+        timing.Set("synchronized_wall", Distribution(wall_, 0u, wall_.size()));
+        timing.Set("surface_build_cpu", Distribution(geometry_, 0u, geometry_.size()));
+        timing.Set("boundary", Json::Str("surface reconstruction, scene update, trace and host RGBA delivery; GPU event interval includes host scheduling gaps; PNG encoding excluded"));
+        report.Set("timing", std::move(timing));
+        report.Set("resident_device_delta_bytes", Json::Int(static_cast<int64_t>(free_before_) - static_cast<int64_t>(free_after)));
+        report.Set("memory_scope", Json::Str("cudaMemGetInfo before scene creation and after final render; resident delta, not allocation peak"));
+        report.Set("frames", std::move(frames_));
+        report.Set("valid", Json::Bool(true));
+        WriteJson(args_.render_perf_json, report);
+    }
+private:
+    const Args& args_;
+    cudaStream_t stream_ = nullptr;
+    std::vector<cudaEvent_t> events_;
+    std::vector<double> wall_, geometry_;
+    Json frames_ = Json::Array();
+    Clock::time_point start_;
+    size_t free_before_ = 0u;
+};
 
 void SaveState(nk::World& world, const std::string& path) {
     if (path.empty()) return;
@@ -1176,11 +1268,16 @@ int RunDemo(const Args& args) {
     if (args.video) {
         const uint32_t total = static_cast<uint32_t>(fluid_snap.size());
         const uint32_t s0 = std::min(args.start_step, total > 0u ? total - 1u : 0u);
+        const size_t measured_frames = std::min<uint64_t>(args.render_frames,
+            (uint64_t{total} - s0 + args.video_stride - 1u) / args.video_stride);
+        FrameMeasurements measurements(args, measured_frames);
+        const auto create_start = Clock::now();
         GpuRenderer gpu(BuildFrame(fluid_snap[s0], P, bunny, pose_snap[s0], rest_surface));
+        const double creation_ms = Milliseconds(create_start);
         if (!gpu.ok()) { std::fprintf(stderr, "[mpm_water_drop] no CUDA RT backend\n"); return 6; }
         gpu.SetSamples(args.samples);
         uint32_t fi = 0u;
-        for (uint32_t s = s0; s < total; s += args.video_stride) {
+        for (uint32_t s = s0; s < total && fi < args.render_frames; s += args.video_stride) {
             const float t = total > s0 + 1u
                 ? static_cast<float>(s - s0) / static_cast<float>(total - 1u - s0) : 0.0f;
             const float az = az0 + az_sweep * t;
@@ -1188,8 +1285,15 @@ int RunDemo(const Args& args) {
                                look.y - cam_r * std::cos(cam_elev) * std::cos(az),
                                look.z + cam_r * std::sin(cam_elev)};
             opts.camera_target = look;
+            if (fi == 0u && measurements.Enabled()) {
+                const auto initial_frame = BuildFrame(fluid_snap[s], P, bunny, pose_snap[s], rest_surface);
+                for (uint32_t warm = 0u; warm < args.render_warmup; ++warm) gpu.Render(initial_frame, opts);
+            }
+            measurements.Begin();
             render::RenderWorld rw = BuildFrame(fluid_snap[s], P, bunny, pose_snap[s], rest_surface);
+            measurements.GeometryReady();
             render::VulkanOffscreenReport rep = gpu.Render(rw, opts);
+            measurements.End(s, rep);
             char name[160];
             std::snprintf(name, sizeof(name), "%s/v%04u.png", args.png_dir.c_str(), fi);
             if (!WritePng(rep, name)) std::fprintf(stderr, "[mpm_water_drop] PNG fail %s\n", name);
@@ -1200,6 +1304,7 @@ int RunDemo(const Args& args) {
         }
         std::fprintf(stderr, "[mpm_water_drop] VIDEO: %u frames -> %s\n",
                      fi, args.png_dir.c_str());
+        measurements.Save(creation_ms);
         return 0;
     }
 

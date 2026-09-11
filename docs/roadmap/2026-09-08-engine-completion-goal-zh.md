@@ -26,8 +26,8 @@
 | --- | --- | --- |
 | 已收口 | 当前 MLS-MPM 性能改动 | cell 共享传输的原 bunny-water 五对落水 eager/graph 减少 20.03%/43.25%；jelly、独立物理门、pipeline、sanitizer、渲染通过。内存代价和小水池墙时回退保留 |
 | 已收口 | 自动凸覆盖、共享表面/owner、公共子步和并行查询 | 保留真实表面与共同时间层；查询五进程落水降时 90.48%，E16 eager 回退 2.16% 如实保留 |
-| 当前 | 渲染性能优化 | 固定画质与输入，量测创建/BLAS、TLAS 更新、遍历/着色和交付；完成 render-only 与 physics→sensor 的五进程对照 |
-| 接续 1 | 弹塑性体调研、通用集成及 demo 必需的耦合修复 | 比较 MPM/FEM，明确屈服、硬化、持久塑性状态和积分；验证有限质量、真实夹爪反力、材料与 reset/readout |
+| 已收口 | 渲染表面/场景更新优化 | 五进程水体完整帧降低 71.51%，像素一致；E16 physics→sensor 平均回退 1.45%，动态介质 sensor 及着色热点保留 |
+| 当前 | 弹塑性体调研、通用集成及 demo 必需的耦合修复 | 已选定 Hencky J2 与 Fe/Fp/alpha，开始生产接线；有限质量、真实夹爪反力、材料与 reset/readout 尚待验收 |
 | 接续 2 | 机械臂挤压 demo、渲染和主页替换 | 展示弹性恢复、屈服及残余形变，记录反力/耗散；视频和 GIF 验收后替换 Go2 行走展示 |
 | 接续重点 | 性能优化与多体耦合补齐 | 优先共享质量/多端点、完整耦合矩阵、连续表面/自碰撞、直接介质交换及其热点；MLS-MPM 局部大 J 等共同错误按依赖修复，继续提袋装球/拧毛巾验收 |
 | 后续 | 原 spec 其余引擎工作 | 依性能和耦合需求接续映射、错误契约、API/传感器、可微等未验收项，持续回写规格与证据 |
@@ -39,6 +39,8 @@
 当前进度：执行/workspace 批次主 pipeline 33 passed、0 skip，公共耦合/多环境/相机通过，完整 16 环境 graph memcheck 0 errors。公共 graph、失败缓存、LBVH workspace、活跃 cache 排序/merge 和字段预算已实现。容量检查发现旧版也存在的 pair snapshot 覆盖，现已通用修复；原 E=256 分母保留为失败证据。修正后 65 个独立进程、容量物理等价和 8 对公共渲染图通过，新 graph E=1/16/256 为 3.073/3.367/6.499 ms，结果见 [执行验收](../research/2026-09-09-execution-workspace-validation-zh.md)。
 
 ## 执行批次
+
+渲染表面重建与场景更新已完成 [五进程验收](../research/2026-09-11-render-refresh-validation-zh.md)：水体完整帧平均墙时中位数 676.341 → 192.701 ms（−71.51%），128 帧像素一致，RSS 增加 1.65%、设备驻留增加 6 MiB。批量相机基本持平，E16 完整均值回退 1.45%；旧新共有的 opaque checksum 失败保留，动态粒子 sensor 和着色热点未关闭。材料方法与实施前预算见 [Hencky J2 研究](../research/2026-09-11-elastoplastic-methods-zh.md)，当前继续材料接线与有限质量耦合，尚未完成 demo。
 
 CUDA 并行表面查询已完成[验收](../research/2026-09-11-parallel-surface-query-validation-zh.md)：完整落水 graph 五进程 GPU 中位步时 317.824 → 30.247 ms，质量、轨迹、8 张渲染图和内存相同；E16 eager/graph 分别回退 2.16%/0.12%。定向 memcheck/synccheck 为 0 errors。按用户最新要求转向渲染提速，随后弹塑性 demo；demo 后优先继续优化与多体耦合，局部大 J、有限质量及其余物理缺口仍保留。
 

@@ -122,9 +122,8 @@ void PublishStudioScene(StudioScene& scene,
                         const std::vector<math::Vec3>& particle_pos,
                         const std::vector<math::Transform>& body_pose = {});
 
-// The offline CUDA path-tracer over a StudioScene's RenderWorld. Rebuilds the BLAS
-// each frame (the surface deforms) and traces to a host RGBA8 report. ok() is false
-// when no CUDA RT backend is linked/available (the render lib's weak fallback).
+// Refresh the live render scene and trace to a host RGBA8 report.
+// Unchanged meshes and frame resources remain resident across calls.
 class StudioRtRenderer {
 public:
     StudioRtRenderer();

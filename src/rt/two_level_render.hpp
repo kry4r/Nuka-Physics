@@ -116,11 +116,8 @@ struct TwoLevelScene {
     EnvironmentMap environment;
 };
 
-// Cross-BuildScene device residency for the (static) image textures + HDR
-// environment. A persistent backend holds ONE; successive builds over the same
-// content (matched by TwoLevelScene::texture_version + the env fingerprint) reuse
-// the device buffers instead of re-uploading. Move-only, opaque (impl in the .cu).
-// A null cache (the default) keeps the prior behavior: every build uploads.
+// Shared image residency is keyed by texture version, exact HDR content and device.
+// A backend retains this cache across scene destruction and recreation.
 class TextureEnvCache {
 public:
     TextureEnvCache();
@@ -190,9 +187,8 @@ struct BeautyOptions {
     AovDownloadMask download;
 };
 
-// Opaque, move-only device handle that owns the per-mesh BLAS trees + uploaded
-// LOCAL prim buffers. Survives across frames (rigid BLAS is never refit); the
-// per-frame TLAS is built inside RenderFrame. Built once by BuildTwoLevelScene.
+// Move-only owner of mesh BLAS and persistent frame resources on one device.
+// Geometry updates replace changed meshes; frame rendering refreshes the TLAS.
 class TwoLevelSceneDevice {
 public:
     TwoLevelSceneDevice();
@@ -231,6 +227,12 @@ struct RtDeviceAovs {
 TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
                                        phi::Backend* backend = nullptr,
                                        TextureEnvCache* tex_env_cache = nullptr);
+
+// Update on the original backend, retaining unchanged meshes and frame buffers.
+// Changed geometry/attributes rebuild their BLAS; recollect external references.
+void UpdateTwoLevelScene(TwoLevelSceneDevice& device, const TwoLevelScene& scene,
+                        phi::Backend* backend = nullptr,
+                        TextureEnvCache* tex_env_cache = nullptr);
 
 // Surface ONE SensorBlasRef per built mesh (indexed by blas_id) so the batched
 // sensor path reuses the SAME once-built BLAS. Additive; the trace path unchanged.

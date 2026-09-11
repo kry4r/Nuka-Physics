@@ -67,6 +67,10 @@ public:
         return handle.release();
     }
 
+    void UpdateScene(RtSceneHandle* handle, const rt::TwoLevelScene& scene) override {
+        rt::UpdateTwoLevelScene(handle->device, scene, backend_, &tex_env_cache_);
+    }
+
     void Trace(RtSceneHandle* handle,
                const rt::TwoLevelScene& scene,
                const rt::PinholeCamera& camera,

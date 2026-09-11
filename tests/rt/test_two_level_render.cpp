@@ -58,6 +58,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 using namespace nuka;
@@ -728,16 +730,124 @@ TEST(RtTwoLevelRender, RefitFromMovedTopologyByteExactVsRebuild) {
                 cam.width, cam.height, scene_a.instances.size(), hits);
 }
 
-// =====================================================================
-// 5. SPARSE-SDF leaf through the two-level nest (the p16-relevant path). Two
-//    sphere-SDF instances: ONE at IDENTITY, ONE ROTATED. Gates:
-//      * Oracle 1 byte-exact host==device across ALL 6 AOVs (the rotated SDF
-//        exercises ReconstructHit's QuatRotate(rotation, n_local) gradient-
-//        normal-to-world line + the local-AABB march clip under rotation), and
-//      * Oracle 2 byte-exact vs the trusted flat p13 RenderScene for the IDENTITY
-//        SDF (SDF renders at identity in the flat path; QuatRotate(identity)==id,
-//        so the two-level identity SDF must be bit-identical to flat).
-// =====================================================================
+// Resource updates match fresh uploads through refits, content changes and reset.
+TEST(RtTwoLevelRender, SceneUpdateMatchesFreshResourcesAcrossLifecycle) {
+    rt::TwoLevelScene scene;
+    rt::BlasMesh triangle, sphere;
+    triangle.triangles.push_back({{-1.0f, -0.7f, 0.0f}, {1.0f, -0.7f, 0.0f}, {0.0f, 1.0f, 0.0f}, 0u});
+    triangle.tri_normals.push_back({{0.0f, 0.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, 0.0f, -1.0f}});
+    triangle.tri_uvs.push_back({{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.5f, 1.0f, 0.0f}});
+    sphere.spheres.push_back({{0.0f, 0.0f, 0.0f}, 0.8f, 0u});
+    sphere.sphere_colors.push_back({0.8f, 0.7f, 0.6f});
+    scene.meshes = {triangle, sphere, MakeSphereSdfMesh()};
+    scene.materials.resize(2u);
+    scene.materials[0].albedo_tex = 0;
+    scene.materials[0].triplanar = 0u;
+    scene.instances = {{0u, {{-2.4f, 0.0f, 0.0f}, math::Quat::Identity()}, 0u},
+                       {1u, math::Transform::Identity(), 1u},
+                       {2u, {{2.4f, 0.0f, 0.0f}, math::Quat::Identity()}, 1u}};
+    rt::Texture texture;
+    texture.width = 2u; texture.height = 2u; texture.channels = 3u;
+    texture.texels = {0.9f, 0.1f, 0.2f, 0.2f, 0.8f, 0.1f, 0.1f, 0.3f, 0.9f, 0.9f, 0.8f, 0.3f};
+    scene.textures = std::make_shared<std::vector<rt::Texture>>(1u, texture);
+    scene.texture_version = 1u;
+    scene.environment.width = 2u; scene.environment.height = 1u;
+    scene.environment.texels = {0.6f, 0.2f, 0.1f, 0.2f, 0.3f, 0.8f};
+    scene.light.direction = {0.2f, -0.3f, 1.0f};
+    const auto camera = rt::BuildPinhole({0.0f, 0.0f, -7.0f}, {0.0f, 0.0f, 0.0f},
+                                       {0.0f, 1.0f, 0.0f}, 0.45f * kPi, 96u, 64u);
+    rt::BeautyOptions beauty;
+    beauty.samples = 2u; beauty.shadow_rays = 1u; beauty.ao_samples = 1u;
+    beauty.smooth_normals = true;
+    rt::TextureEnvCache cache;
+    auto device = rt::BuildTwoLevelScene(scene, nullptr, &cache);
+    auto compare = [&] {
+        auto fresh = rt::BuildTwoLevelScene(scene);
+        const auto equal = [](const rt::Framebuffer& a, const rt::Framebuffer& b) {
+            const auto channel = [](const auto& x, const auto& y) {
+                ASSERT_EQ(x.size(), y.size());
+                if (!x.empty()) EXPECT_EQ(0, std::memcmp(x.data(), y.data(), x.size() * sizeof(x[0])));
+            };
+            channel(a.color, b.color); channel(a.depth, b.depth); channel(a.normal, b.normal);
+            channel(a.albedo, b.albedo); channel(a.uv, b.uv); channel(a.prim, b.prim);
+        };
+        equal(rt::RenderFrame(device, scene, camera), rt::RenderFrame(fresh, scene, camera));
+        const auto output = rt::RenderBeauty(device, scene, camera, beauty);
+        equal(output, rt::RenderBeauty(fresh, scene, camera, beauty));
+        return output;
+    };
+    const auto initial = compare();
+    for (uint32_t instance = 0u; instance < 3u; ++instance) {
+        size_t hits = 0u;
+        for (auto primitive : initial.prim)
+            if (primitive != rt::kNoPrim && (primitive >> rt::kPrimBits) == instance) ++hits;
+        EXPECT_GT(hits, 10u);
+    }
+    for (uint32_t frame = 0u; frame < 36u; ++frame) {
+        SCOPED_TRACE(frame);
+        scene.instances[1].transform.position.y = 0.1f * std::sin(static_cast<float>(frame));
+        const auto uploads = rt::DebugTextureUploadCount();
+        rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+        EXPECT_EQ(uploads, rt::DebugTextureUploadCount());
+        compare();
+    }
+
+    scene.meshes[0].tri_normals[0].n0 = {0.6f, 0.0f, -0.8f};
+    scene.meshes[0].tri_uvs[0].uv0.x = 0.35f;
+    scene.meshes[1].sphere_colors[0] = {0.1f, 0.8f, 0.2f};
+    scene.materials[1].albedo = {0.3f, 0.6f, 0.9f};
+    scene.environment.texels[0] = 1.7f;
+    scene.environment.yaw = 0.4f; scene.environment.intensity = 0.8f;
+    rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+    EXPECT_NE(initial.color, compare().color);
+
+    scene.meshes[0].triangles[0].v0.x -= 0.3f;
+    scene.meshes[1].spheres[0].radius = 0.65f;
+    auto& sdf = scene.meshes[2].sdfs[0];
+    sdf.header.origin.x += 0.04f;
+    sdf.surface_eps = 0.008f; sdf.max_iters = 480;
+    sdf.aabb.min.x -= 0.04f;
+    for (auto& value : sdf.values) value -= 0.02f;
+    for (auto& gradient : sdf.gradients) gradient.x += 0.01f;
+    sdf.keys.pop_back(); sdf.values.pop_back(); sdf.gradients.pop_back();
+    texture.texels[0] = 0.1f;
+    scene.textures = std::make_shared<std::vector<rt::Texture>>(1u, texture);
+    ++scene.texture_version;
+    rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+    EXPECT_NE(initial.depth, compare().depth);
+
+    scene.meshes.push_back(sphere);
+    scene.instances.push_back({3u, {{0.0f, 1.5f, 0.0f}, math::Quat::Identity()}, 1u});
+    rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+    compare();
+    scene.instances.pop_back(); scene.meshes.pop_back();
+    scene.meshes[0] = sphere;
+    scene.environment = {};
+    scene.texture_version = 0u;
+    rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+    compare();
+    const auto uploads = rt::DebugTextureUploadCount();
+    rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+    EXPECT_EQ(uploads + 1u, rt::DebugTextureUploadCount());
+    compare();
+
+    auto invalid = scene;
+    invalid.instances[0].blas_id = 99u;
+    EXPECT_THROW(rt::UpdateTwoLevelScene(device, invalid, nullptr, &cache), std::invalid_argument);
+    invalid = scene;
+    invalid.environment.width = invalid.environment.height = std::numeric_limits<uint32_t>::max();
+    invalid.environment.texels = {1.0f, 1.0f, 1.0f};
+    EXPECT_THROW(rt::UpdateTwoLevelScene(device, invalid, nullptr, &cache), std::invalid_argument);
+    compare();
+    const auto restored = scene;
+    scene.instances.clear(); scene.meshes.clear();
+    rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+    compare();
+    scene = restored;
+    rt::UpdateTwoLevelScene(device, scene, nullptr, &cache);
+    compare();
+}
+
 TEST(RtTwoLevelRender, SdfLeafThroughNestIdentityAndRotated) {
     rt::BlasMesh sdf_mesh = MakeSphereSdfMesh();
 

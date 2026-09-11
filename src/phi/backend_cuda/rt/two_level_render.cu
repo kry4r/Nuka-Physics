@@ -52,10 +52,13 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace nuka::rt {
@@ -323,11 +326,10 @@ struct FrameTlasView {
 
 }  // namespace
 
-// Device residency for the (static) image textures + HDR environment texels: the
-// per-texture texel buffers, the DevTexture descriptor table, and the equirect env
-// buffer. A content `version` + `env_key` gate reuse across BuildScene calls; the
-// env yaw/intensity are light per-build scalars kept on the scene device, not here.
+// Texture versions and exact environment contents identify reusable residency.
+// Environment yaw/intensity belong to the scene and need no texel upload.
 struct TextureEnvResidency {
+    int device_id = -1;
     std::vector<OwnedBuffer> texture_texel_bufs;  // one texel buffer per texture
     OwnedBuffer d_textures;                        // DevTexture descriptor table
     uint32_t texture_count = 0u;
@@ -336,14 +338,16 @@ struct TextureEnvResidency {
     uint32_t env_width = 0u, env_height = 0u;
 
     uint64_t version = 0u;   // TwoLevelScene::texture_version this was built from
-    uint64_t env_key = 0u;   // fingerprint of the env texel-buffer identity
+    std::vector<float> env_texels;
 };
 
 // Opaque impl: the per-mesh BLAS devices (built once) + the persistent render
 // context (AOV scratch + TLAS buffers reused/refit across frames) + a shared handle
 // to the device-resident textures/env (owned jointly with the backend's cache).
 struct TwoLevelSceneDevice::Impl {
+    int device_id = -1;
     std::vector<BlasDevice> meshes;
+    std::vector<BlasMesh> mesh_sources;
     RtRenderContext rt;
 
     std::shared_ptr<TextureEnvResidency> tex_env;  // shared with the backend cache
@@ -612,13 +616,35 @@ FrameTlasView EnsureFrameTlas(TwoLevelSceneDevice::Impl* impl, const TwoLevelSce
     return out;
 }
 
-// A cheap fingerprint of the environment texel-buffer identity (dims + size). An
-// unchanged HDRI keeps the same key; a swapped map almost always differs.
-uint64_t EnvKey(const EnvironmentMap& env) {
-    if (!env.Enabled()) return 0u;
-    return (static_cast<uint64_t>(env.width) * 73856093ull) ^
-           (static_cast<uint64_t>(env.height) * 19349663ull) ^
-           (static_cast<uint64_t>(env.texels.size()) * 83492791ull);
+template <typename T>
+bool EqualBytes(const std::vector<T>& a, const std::vector<T>& b) {
+    static_assert(std::is_trivially_copyable<T>::value, "byte comparison requires value records");
+    return a.size() == b.size() &&
+           (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
+}
+
+bool SameMesh(const BlasMesh& a, const BlasMesh& b) {
+    if (!EqualBytes(a.triangles, b.triangles) || !EqualBytes(a.spheres, b.spheres) ||
+        !EqualBytes(a.tri_normals, b.tri_normals) || !EqualBytes(a.tri_uvs, b.tri_uvs) ||
+        !EqualBytes(a.sphere_colors, b.sphere_colors) || a.sdfs.size() != b.sdfs.size()) return false;
+    for (size_t i = 0u; i < a.sdfs.size(); ++i) {
+        const auto& x = a.sdfs[i];
+        const auto& y = b.sdfs[i];
+        if (std::memcmp(&x.header.origin, &y.header.origin, sizeof(x.header.origin)) != 0 ||
+            x.header.voxel_size != y.header.voxel_size ||
+            std::memcmp(x.header.dims, y.header.dims, sizeof(x.header.dims)) != 0 ||
+            std::memcmp(&x.aabb, &y.aabb, sizeof(x.aabb)) != 0 ||
+            x.surface_eps != y.surface_eps || x.max_iters != y.max_iters ||
+            !EqualBytes(x.keys, y.keys) || !EqualBytes(x.values, y.values) ||
+            !EqualBytes(x.gradients, y.gradients)) return false;
+    }
+    return true;
+}
+
+bool SameEnvironment(const TextureEnvResidency& residency, const EnvironmentMap& env) {
+    if (!env.Enabled()) return residency.env_width == 0u;
+    return residency.env_width == env.width && residency.env_height == env.height &&
+           EqualBytes(residency.env_texels, env.texels);
 }
 
 // Upload one scene's image textures + HDR environment into a FRESH device residency
@@ -653,9 +679,10 @@ std::shared_ptr<TextureEnvResidency> UploadTextureEnvResidency(const TwoLevelSce
         res->d_env_texels = UploadOwned(ctx.device_bt, scene.environment.texels);
         res->env_width = scene.environment.width;
         res->env_height = scene.environment.height;
+        res->env_texels = scene.environment.texels;
     }
     res->version = scene.texture_version;
-    res->env_key = EnvKey(scene.environment);
+    res->device_id = ctx.device_id;
     return res;
 }
 
@@ -664,11 +691,29 @@ std::shared_ptr<TextureEnvResidency> UploadTextureEnvResidency(const TwoLevelSce
 TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
                                        phi::Backend* backend,
                                        TextureEnvCache* tex_env_cache) {
+    TwoLevelSceneDevice device;
+    UpdateTwoLevelScene(device, scene, backend, tex_env_cache);
+    return device;
+}
+
+void UpdateTwoLevelScene(TwoLevelSceneDevice& device, const TwoLevelScene& scene,
+                        phi::Backend* backend, TextureEnvCache* tex_env_cache) {
     if (scene.instances.size() > kMaxInstances) {
-        throw std::runtime_error(
-            "BuildTwoLevelScene: instance_count exceeds kMaxInstances (1<<12); "
-            "rebalance prim_id.cuh kInstanceBits/kPrimBits (named consumer: p16)");
+        throw std::invalid_argument("render instance count exceeds primitive ID capacity");
     }
+    for (const auto& instance : scene.instances) {
+        if (instance.blas_id >= scene.meshes.size() ||
+            instance.material_id >= std::max<size_t>(1u, scene.materials.size()))
+            throw std::invalid_argument("render instance references missing geometry or material");
+    }
+    for (const auto& mesh : scene.meshes) {
+        if (mesh.triangles.size() + mesh.spheres.size() + mesh.sdfs.size() > kMaxBlasPrims)
+            throw std::invalid_argument("render mesh exceeds primitive ID capacity");
+    }
+    if (scene.environment.Enabled() &&
+        (scene.environment.texels.size() % 3u != 0u ||
+         uint64_t{scene.environment.width} * scene.environment.height != scene.environment.texels.size() / 3u))
+        throw std::invalid_argument("render environment dimensions do not match its texels");
 
     // The BLAS uploads run on the selected device + stream (re-assert the active
     // device, mirroring the backend dispatch path).
@@ -676,40 +721,48 @@ TwoLevelSceneDevice BuildTwoLevelScene(const TwoLevelScene& scene,
     phi::ScopedDeviceGuard guard(ctx.device_id);
     (void)cudaSetDevice(ctx.device_id);
 
-    TwoLevelSceneDevice device;
     TwoLevelSceneDevice::Impl* impl = device.GetImpl();
-    impl->meshes.reserve(scene.meshes.size());
-    for (const auto& mesh : scene.meshes) {
-        impl->meshes.push_back(BuildBlas(mesh, ctx));
+    if (!impl || (impl->device_id != -1 && impl->device_id != ctx.device_id))
+        throw std::invalid_argument("render scene update requires its original device");
+    struct MeshUpdate {
+        size_t index;
+        BlasMesh source;
+        BlasDevice device;
+    };
+    std::vector<MeshUpdate> updates;
+    for (size_t i = 0u; i < scene.meshes.size(); ++i) {
+        if (i < impl->mesh_sources.size() && SameMesh(impl->mesh_sources[i], scene.meshes[i])) continue;
+        BlasMesh source = scene.meshes[i];
+        auto mesh = BuildBlas(source, ctx);
+        updates.push_back({i, std::move(source), std::move(mesh)});
     }
 
-    // Textures + HDR environment are static across frames. With a persistent cache a
-    // per-frame rebuild REUSES the device residency while the content version + env
-    // fingerprint are unchanged; only a real change re-uploads. A textured scene with
-    // no library stamp (version 0) never reuses -- distinct such scenes can't be told
-    // apart -- so it uploads every build (the prior behavior). No cache => same.
     const bool has_tex = scene.textures && !scene.textures->empty();
     const bool version_reusable = !has_tex || scene.texture_version != 0u;
-    std::shared_ptr<TextureEnvResidency> residency;
-    if (tex_env_cache != nullptr) {
-        TextureEnvCache::Impl* cache = tex_env_cache->GetImpl();
-        if (version_reusable && cache->residency &&
-            cache->residency->version == scene.texture_version &&
-            cache->residency->env_key == EnvKey(scene.environment)) {
-            residency = cache->residency;  // reuse device buffers, skip the H2D
-        } else {
-            residency = UploadTextureEnvResidency(scene, ctx);
-            cache->residency = residency;
-        }
-    } else {
-        residency = UploadTextureEnvResidency(scene, ctx);
+    const auto reusable = [&](const std::shared_ptr<TextureEnvResidency>& residency) {
+        return version_reusable && residency && residency->device_id == ctx.device_id &&
+               residency->version == scene.texture_version &&
+               SameEnvironment(*residency, scene.environment);
+    };
+    auto residency = impl->tex_env;
+    auto* cache = tex_env_cache != nullptr ? tex_env_cache->GetImpl() : nullptr;
+    if (cache && reusable(cache->residency)) residency = cache->residency;
+    if (!reusable(residency)) residency = UploadTextureEnvResidency(scene, ctx);
+
+    impl->meshes.reserve(scene.meshes.size());
+    impl->mesh_sources.reserve(scene.meshes.size());
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "render scene update");
+    impl->meshes.resize(scene.meshes.size());
+    impl->mesh_sources.resize(scene.meshes.size());
+    for (auto& update : updates) {
+        impl->meshes[update.index] = std::move(update.device);
+        impl->mesh_sources[update.index] = std::move(update.source);
     }
+    if (cache) cache->residency = residency;
     impl->tex_env = std::move(residency);
     impl->env_yaw = scene.environment.yaw;
     impl->env_intensity = scene.environment.intensity;
-
-    cudaStreamSynchronize(ctx.stream);
-    return device;
+    impl->device_id = ctx.device_id;
 }
 
 void CollectSensorBlasRefs(const TwoLevelSceneDevice& device,
