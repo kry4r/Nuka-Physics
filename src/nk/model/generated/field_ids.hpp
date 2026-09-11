@@ -215,7 +215,7 @@ enum class FieldId : uint16_t {
     MpmGridPartIdx,  // mpm_grid_part_idx (per:particle arena:scratch owner:data)
     MpmSortScratch,  // mpm_sort_scratch (per:scalar arena:scratch owner:data count:mpm_grid_sort_scratch_bytes)
     MpmParticleStress,  // mpm_particle_stress (per:particle arena:scratch owner:data elem:9)
-    MpmMaterialTable,  // mpm_material_table (per:scalar arena:persistent owner:data count:mpm_material_count*6)
+    MpmMaterialTable,  // mpm_material_table (per:scalar arena:persistent owner:data count:mpm_material_count*11)
     GridBodyDp,  // grid_body_dp (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     GridBodyOwner,  // grid_body_owner (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     MpmBodyReaction,  // mpm_body_reaction (per:body arena:scratch owner:data flags:[readout])
@@ -305,6 +305,8 @@ enum class FieldId : uint16_t {
     StepLinkImpulse,  // step_link_impulse (per:link arena:scratch owner:data)
     StepLinkMoment,  // step_link_moment (per:link arena:scratch owner:data)
     StepJointLimitImpulse,  // step_joint_limit_impulse (per:link arena:scratch owner:data elem:2)
+    ParticlePlasticF,  // particle_plastic_F (per:particle arena:persistent owner:data elem:9)
+    SnapshotParticlePlasticF,  // snapshot_particle_plastic_F (per:particle arena:persistent owner:data elem:9)
     Count
 };
 
@@ -605,6 +607,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "step_link_impulse",
     "step_link_moment",
     "step_joint_limit_impulse",
+    "particle_plastic_F",
+    "snapshot_particle_plastic_F",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

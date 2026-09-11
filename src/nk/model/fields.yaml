@@ -769,7 +769,7 @@ fields:
 
   # MLS-MPM material table (global flat f32 pool like mat_buckets; stride
   # MpmMaterial::kValueCount, resolved in ElementCount). APPENDED LAST.
-  - {name: mpm_material_table, dtype: f32, per: scalar, count: "mpm_material_count*6", arena: persistent, owner: data}
+  - {name: mpm_material_table, dtype: f32, per: scalar, count: "mpm_material_count*11", arena: persistent, owner: data}
 
   # MLS-MPM dynamic-body grid BC handoff (per grid node) + the per-body reaction
   # diagnostic. grid_body_dp is the node momentum change the BC imposed; the owning
@@ -940,3 +940,7 @@ fields:
   - {name: step_link_impulse, dtype: vec3, per: link, arena: scratch, owner: data}
   - {name: step_link_moment, dtype: vec3, per: link, arena: scratch, owner: data}
   - {name: step_joint_limit_impulse, dtype: f32, per: link, arena: scratch, owner: data, elem: 2}
+
+  # Multiplicative plastic deformation is present when a material requires its history.
+  - {name: particle_plastic_F, dtype: f32, per: particle, arena: persistent, owner: data, elem: 9}
+  - {name: snapshot_particle_plastic_F, dtype: f32, per: particle, arena: persistent, owner: data, elem: 9}

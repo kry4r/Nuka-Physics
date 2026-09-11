@@ -321,6 +321,8 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::StepLinkImpulse, DlpackDtype::kF32, 2, false, false},  // step_link_impulse
     {FieldId::StepLinkMoment, DlpackDtype::kF32, 2, false, false},  // step_link_moment
     {FieldId::StepJointLimitImpulse, DlpackDtype::kF32, 2, false, false},  // step_joint_limit_impulse
+    {FieldId::ParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // particle_plastic_F
+    {FieldId::SnapshotParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_plastic_F
 };
 
 } // namespace nuka::nk

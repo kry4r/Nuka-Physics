@@ -83,6 +83,7 @@ inline constexpr uint32_t kStrideF32x2 = static_cast<uint32_t>(2u * sizeof(float
 inline constexpr uint32_t kStrideVec3  = static_cast<uint32_t>(3u * sizeof(float));   // 12
 inline constexpr uint32_t kStrideSpat6 = static_cast<uint32_t>(6u * sizeof(float));   // 24
 inline constexpr uint32_t kStridePose  = static_cast<uint32_t>(7u * sizeof(float));   // 28
+inline constexpr uint32_t kStrideMat3  = static_cast<uint32_t>(9u * sizeof(float));
 
 inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     // -- field 0: per-body rigid transform (Transform, quat W-FIRST). Not
@@ -175,14 +176,17 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_BODY_GYRO_STATUS,     kStrideU32,   kWireDtypeU32, nk::FieldId::BodyGyroStatus},
     {NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED, kStrideU32, kWireDtypeU32, nk::FieldId::GridNeighborAttempted},
     {NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT, kStrideU32, kWireDtypeU32, nk::FieldId::GridNeighborCount},
+    {NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticleF},
+    {NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticlePlasticF},
+    {NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN, kStrideF32, kWireDtypeF32, nk::FieldId::ParticlePlastic},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 45u,
-              "dlpack_table must hold exactly the 45 public state fields");
+static_assert(kDlpackFieldCount == 48u,
+              "dlpack_table must hold exactly the 48 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

@@ -14,7 +14,7 @@
 
 最新 cook 要求：将凸分解直接集成进统一场景 cook，用户只提供场景；几何准备、设备选择、分解和缓存自动完成。处理混合/复合场景、实例、闭合实体、开放面与变形表面，保留完整 collider 和 owner 语义。分解预算不足时自动保持精确三角表示，不能静默遗漏几何或用未验收近似补齐。统一入口、序列化/recook 和完整生产消费者接线是必做交付，当前原型与现有三角面 cook 不能视为这项要求已经完成。
 
-新增弹塑性体工作按 [细化 spec](../plans/2026-09-10-elastoplastic-body-detailed-spec-zh.md) 执行：先做网络调研和当前材料路径审计，再选择可验证的大变形本构与塑性积分方法。集成通用材料、持久塑性状态、双向 ABA 接触、公共 cook/reset/readout 和渲染；demo 以同一物体的加载、卸载、恢复和残余形变展示物理特性。该项尚未开始，不能把现有 jelly 或 granular 功能视为新功能完成。正式视频/GIF 验收后替换 README 当前 `Go2 Terrain` 行走展示，保持顶部 π0.5/G1 与两列布局。
+新增弹塑性体工作按 [细化 spec](../plans/2026-09-10-elastoplastic-body-detailed-spec-zh.md) 执行：调研、Hencky J2 材料、Fe/Fp/alpha 生命周期、公共 cook/reset/readout 和连续动态表面已按 [材料验收](../research/2026-09-11-elastoplastic-methods-zh.md) 收口。当前继续有限质量共享网格接触与双向 ABA 夹持；demo 须以同一物体的加载、卸载、恢复和残余形变展示物理特性，材料落地画面不替代此验收。正式视频/GIF 验收后替换 README 当前 `Go2 Terrain` 行走展示，保持顶部 π0.5/G1 与两列布局。
 
 共享几何/owner 基础修复已按 [验收记录](../research/2026-09-10-coupling-surface-owner-validation-zh.md) 收口：解析体无 SDF 接触、内部点法线、真实 owner/力矩参考点、双向采样与代理几何映射、状态反馈已落地；water/jelly、固定 E=16 完整管线、C/Python/reset/渲染和针对性 GPU 内存检查通过。真实 bunny 替换原来的 Box 标签，实测末态支承误差约 0.156 mm，但冲击瞬时仍穿入约 9.5 mm。下一批必须处理通用表面/连续碰撞、多端点质量与子步闭环；这些数据不能作为薄袋/毛巾或全量耦合已通过的证明。
 
@@ -27,7 +27,8 @@
 | 已收口 | 当前 MLS-MPM 性能改动 | cell 共享传输的原 bunny-water 五对落水 eager/graph 减少 20.03%/43.25%；jelly、独立物理门、pipeline、sanitizer、渲染通过。内存代价和小水池墙时回退保留 |
 | 已收口 | 自动凸覆盖、共享表面/owner、公共子步和并行查询 | 保留真实表面与共同时间层；查询五进程落水降时 90.48%，E16 eager 回退 2.16% 如实保留 |
 | 已收口 | 渲染表面/场景更新优化 | 五进程水体完整帧降低 71.51%，像素一致；E16 physics→sensor 平均回退 1.45%，动态介质 sensor 及着色热点保留 |
-| 当前 | 弹塑性体调研、通用集成及 demo 必需的耦合修复 | 已选定 Hencky J2 与 Fe/Fp/alpha，开始生产接线；有限质量、真实夹爪反力、材料与 reset/readout 尚待验收 |
+| 已收口 | Hencky J2 材料与生命周期 | 82 项场景、公共 C/Python、E16 N=1/2、sensor、定向 memcheck、无 CUDA 核心/材料/渲染及动态表面通过；失败基线保留 |
+| 当前 | demo 必需的有限质量耦合 | 拆分 MPM 预测/提交，网格多 owner 接触进入共享 ContactBlock；真实动态夹爪反力、接触收敛尚待验收 |
 | 接续 2 | 机械臂挤压 demo、渲染和主页替换 | 展示弹性恢复、屈服及残余形变，记录反力/耗散；视频和 GIF 验收后替换 Go2 行走展示 |
 | 接续重点 | 性能优化与多体耦合补齐 | 优先共享质量/多端点、完整耦合矩阵、连续表面/自碰撞、直接介质交换及其热点；MLS-MPM 局部大 J 等共同错误按依赖修复，继续提袋装球/拧毛巾验收 |
 | 后续 | 原 spec 其余引擎工作 | 依性能和耦合需求接续映射、错误契约、API/传感器、可微等未验收项，持续回写规格与证据 |
@@ -40,7 +41,7 @@
 
 ## 执行批次
 
-渲染表面重建与场景更新已完成 [五进程验收](../research/2026-09-11-render-refresh-validation-zh.md)：水体完整帧平均墙时中位数 676.341 → 192.701 ms（−71.51%），128 帧像素一致，RSS 增加 1.65%、设备驻留增加 6 MiB。批量相机基本持平，E16 完整均值回退 1.45%；旧新共有的 opaque checksum 失败保留，动态粒子 sensor 和着色热点未关闭。材料方法与实施前预算见 [Hencky J2 研究](../research/2026-09-11-elastoplastic-methods-zh.md)，当前继续材料接线与有限质量耦合，尚未完成 demo。
+渲染表面重建与场景更新已完成 [五进程验收](../research/2026-09-11-render-refresh-validation-zh.md)：水体完整帧平均墙时中位数 676.341 → 192.701 ms（−71.51%），128 帧像素一致，RSS 增加 1.65%、设备驻留增加 6 MiB。批量相机基本持平，E16 完整均值回退 1.45%；旧新共有的 opaque checksum 失败保留，动态粒子 sensor 和着色热点未关闭。材料方法及生产验收见 [Hencky J2 研究](../research/2026-09-11-elastoplastic-methods-zh.md)，当前继续有限质量耦合，尚未完成 demo。
 
 CUDA 并行表面查询已完成[验收](../research/2026-09-11-parallel-surface-query-validation-zh.md)：完整落水 graph 五进程 GPU 中位步时 317.824 → 30.247 ms，质量、轨迹、8 张渲染图和内存相同；E16 eager/graph 分别回退 2.16%/0.12%。定向 memcheck/synccheck 为 0 errors。按用户最新要求转向渲染提速，随后弹塑性 demo；demo 后优先继续优化与多体耦合，局部大 J、有限质量及其余物理缺口仍保留。
 

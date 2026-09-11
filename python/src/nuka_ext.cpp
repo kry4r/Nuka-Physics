@@ -1477,7 +1477,8 @@ public:
                    float cable_radius, uint32_t cable_pin, bool cable_bend,
                    const std::vector<float>& cable_slab_half_extents,
                    float cable_slab_mass, float cable_slab_stiffness,
-                   uint32_t cable_slab_render_material_id) {
+                   uint32_t cable_slab_render_material_id,
+                   float mpm_yield_stress, float mpm_hardening_modulus) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1555,7 +1556,12 @@ public:
         d.cable_slab_stiffness = cable_slab_stiffness;
         d.cable_slab_render_material_id = cable_slab_render_material_id;
         uint32_t media_id = 0u;
-        check(nuka_scene_add_media(h_, &d, &media_id), "nuka_scene_add_media");
+        const nuka_mpm_plasticity_desc_t plasticity{
+            sizeof(nuka_mpm_plasticity_desc_t), mpm_yield_stress, mpm_hardening_modulus};
+        const bool has_plasticity = mpm_model_kind == 5.0f ||
+                                   mpm_yield_stress != 0.0f || mpm_hardening_modulus != 0.0f;
+        check(nuka_scene_add_media_ex(h_, &d, has_plasticity ? &plasticity : nullptr, &media_id),
+              "nuka_scene_add_media_ex");
         return media_id;
     }
 
@@ -1567,7 +1573,8 @@ public:
                       float position_jitter, float youngs, float poisson,
                       float density, float dp_friction, float dp_cohesion,
                       float model_kind, float bulk_modulus, float tait_gamma,
-                      float viscosity, uint32_t render_material_id) {
+                      float viscosity, uint32_t render_material_id,
+                      float yield_stress, float hardening_modulus) {
         if (box_min.size() != 3 || box_max.size() != 3) {
             throw std::runtime_error(
                 "add_mpm_fill: box_min / box_max must be 3 floats each");
@@ -1586,7 +1593,12 @@ public:
         d.tait_gamma = tait_gamma;
         d.viscosity = viscosity;
         d.render_material_id = render_material_id;
-        check(nuka_scene_add_mpm_fill(h_, media_id, &d), "nuka_scene_add_mpm_fill");
+        const nuka_mpm_plasticity_desc_t plasticity{
+            sizeof(nuka_mpm_plasticity_desc_t), yield_stress, hardening_modulus};
+        const bool has_plasticity = model_kind == 5.0f || yield_stress != 0.0f ||
+                                   hardening_modulus != 0.0f;
+        check(nuka_scene_add_mpm_fill_ex(h_, media_id, &d, has_plasticity ? &plasticity : nullptr),
+              "nuka_scene_add_mpm_fill_ex");
     }
 
     // Cook the built scene to a live nk::World on `device` (the SAME cook + record
@@ -1839,6 +1851,9 @@ NB_MODULE(_nuka_ext, m) {
         .value("BODY_GYRO_STATUS", NUKA_FIELD_BODY_GYRO_STATUS)
         .value("PARTICLE_NEIGHBOR_ATTEMPTED", NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED)
         .value("PARTICLE_NEIGHBOR_COUNT", NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT)
+        .value("PARTICLE_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT)
+        .value("PARTICLE_PLASTIC_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT)
+        .value("PARTICLE_EQUIVALENT_PLASTIC_STRAIN", NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN)
         .export_values();
 
     nb::enum_<nuka_gyro_status_t>(m, "GyroStatus")
@@ -1846,6 +1861,7 @@ NB_MODULE(_nuka_ext, m) {
         .value("NOT_CONVERGED", NUKA_GYRO_NOT_CONVERGED)
         .value("INVALID_INPUT", NUKA_GYRO_INVALID_INPUT);
     m.attr("ENV_STATUS_GYRO_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_GYRO_FAILURE);
+    m.attr("ENV_STATUS_CONSTITUTIVE_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE);
     m.attr("ENV_STATUS_INVALID_ENDPOINT") = static_cast<uint32_t>(NUKA_ENV_STATUS_INVALID_ENDPOINT);
     m.attr("ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE") =
         static_cast<uint32_t>(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE);
@@ -2880,6 +2896,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("cable_slab_mass") = 0.0f,
              nb::arg("cable_slab_stiffness") = 0.0f,
              nb::arg("cable_slab_render_material_id") = uint32_t{0xFFFFFFFFu},
+             nb::arg("mpm_yield_stress") = 0.0f, nb::arg("mpm_hardening_modulus") = 0.0f,
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
              "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
@@ -2896,6 +2913,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("model_kind") = 0.0f, nb::arg("bulk_modulus") = 0.0f,
              nb::arg("tait_gamma") = 0.0f, nb::arg("viscosity") = 0.0f,
              nb::arg("render_material_id") = uint32_t{0xFFFFFFFFu},
+             nb::arg("yield_stress") = 0.0f, nb::arg("hardening_modulus") = 0.0f,
              "Append a heterogeneous MLS-MPM sub-fill (a [box_min,box_max] sub-box at "
              "`spacing`, position_jitter breaking the lattice, with its own "
              "constitutive) to the box MLS-MPM medium `media_id` (the add_media return). "

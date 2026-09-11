@@ -459,6 +459,10 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
             }
             data.particle_plastic[particle] = data.snapshot_particle_plastic[particle];
         }
+        if (data.particle_plastic_F != nullptr)
+            for (uint32_t component = 0u; component < 9u; ++component)
+                data.particle_plastic_F[particle * 9u + component] =
+                    data.snapshot_particle_plastic_F[particle * 9u + component];
     }
     if (threadIdx.x == 0u) {
         data.contact_count[env] = 0u;
@@ -672,6 +676,10 @@ Status OpSnapshotState(const ModelView& /*model*/, const DataView& data,
                          stream) != cudaSuccess)) {
         return Status::Failed;
     }
+    if (np > 0u && data.particle_plastic_F != nullptr &&
+        cudaMemcpyAsync(data.snapshot_particle_plastic_F, data.particle_plastic_F,
+                        np * 9u * sizeof(float), cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+        return Status::Failed;
     return Status::Ok;
 }
 

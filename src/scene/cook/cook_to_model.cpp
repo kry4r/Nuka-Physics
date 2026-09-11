@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 #include "scene/cook/cook_to_model.hpp"
+#include "nk/material/hencky_j2.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1610,19 +1611,16 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     mp.initial_vol0 = in.vol0;
     if (mp.initial_vol0.size() != n) mp.initial_vol0.assign(n, in.dx * in.dx * in.dx);
 
-    // Convert one cook material row -> the model POD; reject kind 1 loudly (granular
-    // Drucker-Prager would silently run as elastic). The F-update branch reads it later.
+    // Material validation is shared with direct model creation and device evaluation.
     auto to_material = [](const MpmMaterialInput& mi) {
-        if (mi.model_kind > 0.5f && mi.model_kind < 1.5f) {
-            throw std::runtime_error(
-                "CookMpmParticles: granular Drucker-Prager MPM (model_kind == 1) is "
-                "not yet implemented");
-        }
         nk::MpmMaterial m;
         m.youngs = mi.youngs; m.poisson = mi.poisson; m.density = mi.density;
         m.dp_friction = mi.dp_friction; m.dp_cohesion = mi.dp_cohesion;
         m.model_kind = mi.model_kind; m.bulk_modulus = mi.bulk_modulus;
         m.tait_gamma = mi.tait_gamma; m.viscosity = mi.viscosity;
+        m.yield_stress = mi.yield_stress; m.hardening_modulus = mi.hardening_modulus;
+        if (!nk::material::ValidMpmMaterial(m))
+            throw std::invalid_argument("CookMpmParticles: unknown or invalid MPM material");
         return m;
     };
     if (in.materials.empty()) {
@@ -1641,6 +1639,11 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
         if (in.material_id.size() == n) mp.initial_material_id = in.material_id;
         else mp.initial_material_id.assign(n, 0u);
     }
+    cap.mpm_plastic_state = std::any_of(model.mpm_materials.begin(), model.mpm_materials.end(),
+        [](const nk::MpmMaterial& m) { return m.model_kind == nk::MpmMaterial::kHenckyJ2; });
+    for (uint32_t id : mp.initial_material_id)
+        if (id >= cap.mpm_material_count)
+            throw std::invalid_argument("CookMpmParticles: particle material index is out of range");
 
     // Env-private dense grid sizing (the node product, loud u32 overflow guard).
     const uint64_t nodes64 = static_cast<uint64_t>(in.grid_dims[0]) *
@@ -2189,10 +2192,8 @@ void ApplyGrainSkin(MediaRenderSurface& s, const MediaRenderSkin& rs) {
     s.grain_tint_jitter = rs.grain_tint_jitter;
 }
 
-// One instanced-sphere skin PER fill (base bed then each mpm_fill), each with its own
-// radius + render material, over the fill's slice of the MPM particle block. Returns
-// the total MPM particle count so the caller advances the running base. Heterogeneous
-// media only; a homogeneous medium keeps its single-skin path.
+// Each fill owns a particle range and render material; granular fills use grains.
+// The returned count advances the shared MPM particle range.
 uint32_t AppendMpmFillSurfaces(std::vector<MediaRenderSurface>& out,
                                const MediaRecord& media, uint32_t base) {
     uint32_t first = base;
@@ -2205,6 +2206,8 @@ uint32_t AppendMpmFillSurfaces(std::vector<MediaRenderSurface>& out,
         if (cnt == 0u) continue;  // empty sub-box: no particles, no skin (cook skips it too).
         MediaRenderSurface s;
         s.particle_radius = 0.5f * f.box.spacing;
+        if (media.kind != MediaRecord::Kind::Granular)
+            s.surface_spacing = f.box.spacing;
         s.particle_first = first;
         s.particle_count = cnt;
         s.render_material_id = f.render_material_id;
@@ -2220,9 +2223,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     const std::vector<MediaRecord>& media) {
     std::vector<MediaRenderSurface> surfaces;
     if (media.empty()) return surfaces;
-    // A lone MLS-MPM medium is its own ParticleMode (a dense sample, not the lattice
-    // vertices), so no boundary-triangle surface indexes its cooked particle set; it
-    // renders as instanced particle spheres over the whole field instead.
+    // MPM samples have no fixed boundary topology; cohesive media reconstruct density.
+    // Granular media retain individual grains over the same particle range.
     if (media.size() == 1u && media.front().method == MediaRecord::Method::MlsMpm) {
         const MediaRecord& m = media.front();
         if (!m.mpm_fills.empty()) {  // heterogeneous bed: one skin per fill.
@@ -2235,15 +2237,14 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         if (sp > 0.0f) {
             MediaRenderSurface s;
             s.particle_radius = 0.5f * sp;  // half the sampling lattice spacing.
+            if (m.kind != MediaRecord::Kind::Granular) s.surface_spacing = sp;
             s.render_material_id = m.render_material_id;
             ApplyGrainSkin(s, m.render_skin);
             surfaces.push_back(std::move(s));
         }
         return surfaces;
     }
-    // MpmXpbd: the MLS-MPM medium renders as instanced spheres over its low slice
-    // [0, n_mpm); the XPBD (cloth/tet) media then triangulate [n_mpm, P). A lone MPM
-    // medium already returned above, so an MPM here means the co-resident layout.
+    // MPM owns [0,n_mpm); fixed XPBD boundary topology indexes [n_mpm,P).
     const MediaRecord* mpm_medium = nullptr;
     for (const MediaRecord& m : media) {
         if (m.method == MediaRecord::Method::MlsMpm) { mpm_medium = &m; break; }
@@ -2261,6 +2262,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             if (sp > 0.0f && n_mpm > 0u) {
                 MediaRenderSurface s;
                 s.particle_radius = 0.5f * sp;
+                if (mpm_medium->kind != MediaRecord::Kind::Granular)
+                    s.surface_spacing = sp;
                 s.particle_first = 0u;
                 s.particle_count = n_mpm;
                 s.render_material_id = mpm_medium->render_material_id;
@@ -2563,7 +2566,8 @@ static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
         const MediaRecord::FluidBox& b = f.box;
         if (!(b.spacing > 0.0f && b.max.x > b.min.x && b.max.y > b.min.y &&
               b.max.z > b.min.z)) continue;  // empty/invalid sub-box: contributes nothing.
-        const float density = f.material.density > 0.0f ? f.material.density : 1000.0f;
+        const float density = f.material.model_kind == nk::MpmMaterial::kHenckyJ2 ?
+            f.material.density : (f.material.density > 0.0f ? f.material.density : 1000.0f);
         import::cooker::FluidBoxSpec spec;
         spec.min_corner = b.min;
         spec.max_corner = b.max;
@@ -2591,6 +2595,8 @@ static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
                             ? 4.0f : f.material.model_kind;
         mi.bulk_modulus = f.material.bulk_modulus; mi.tait_gamma = f.material.tait_gamma;
         mi.viscosity = f.material.viscosity;
+        mi.yield_stress = f.material.yield_stress;
+        mi.hardening_modulus = f.material.hardening_modulus;
         in.materials.push_back(mi);
         if (!have) { lo = b.min; hi = b.max; have = true; }
         else {
@@ -2626,7 +2632,8 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     if (!media.mpm_fills.empty()) return BuildMpmInputFills(media);
     MpmCookInput in;
     const MediaMpmMaterial& mp = media.mpm;
-    const float density = mp.density > 0.0f ? mp.density : 1000.0f;
+    const float density = mp.model_kind == nk::MpmMaterial::kHenckyJ2 ?
+        mp.density : (mp.density > 0.0f ? mp.density : 1000.0f);
     math::Vec3 lo{0.0f, 0.0f, 0.0f}, hi{0.0f, 0.0f, 0.0f};  // geometry AABB.
     float vol0 = 0.0f;                                       // per-particle sampling volume.
 
@@ -2676,6 +2683,8 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     in.material.bulk_modulus = mp.bulk_modulus;
     in.material.tait_gamma = mp.tait_gamma;
     in.material.viscosity = mp.viscosity;
+    in.material.yield_stress = mp.yield_stress;
+    in.material.hardening_modulus = mp.hardening_modulus;
     in.dx = mp.dx;
     in.substeps = mp.substeps;
     in.floor_normal = mp.floor_normal;

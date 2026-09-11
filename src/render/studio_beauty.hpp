@@ -20,6 +20,7 @@
 #include "render/raster/vulkan_raster_renderer.hpp"  // RasterOptions, VulkanOffscreenReport
 #include "render/render_world.hpp"
 #include "runtime/soft/particle_surface.hpp"  // SurfaceTopology
+#include "runtime/fluid/surface_mesher.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -63,10 +64,19 @@ struct StudioScene {
         float       tint_jitter = 0.0f;
     };
 
+    struct DensitySurface {
+        runtime::fluid::FluidSurfaceParams params;
+        uint32_t first = 0u, count = 0u;
+        uint32_t material_id = kNoId;
+        uint32_t mesh_id = kNoId;
+        std::size_t instance = ~std::size_t(0);
+    };
+
     RenderWorld world;
     RasterOptions options;  // studio lighting/sky/floor; the caller sets camera_* each frame.
     std::vector<DeformingSurface> surfaces;      // one per cooked particle medium (empty => none).
     std::vector<ParticleSkin> particle_skins;    // instanced-sphere media (empty => none).
+    std::vector<DensitySurface> density_surfaces;
     std::vector<uint32_t> link_of_instance;      // per link-posed instance -> link index.
     std::vector<math::Transform> visual_local;   // per link-posed instance -> physics->visual offset.
     uint32_t link_instance_count = 0u;           // [0, link_instance_count) follow a link pose.
@@ -111,6 +121,11 @@ void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
                            uint32_t first, uint32_t count,
                            bool round = false, float radius_jitter = 0.0f,
                            float tint_jitter = 0.0f);
+
+// Reconstruct a continuous surface using the medium's rest sampling spacing.
+void AddStudioDensitySurface(StudioScene& scene, const scene::Registry& registry,
+                             uint32_t scene_material_id, float spacing,
+                             uint32_t first, uint32_t count);
 
 // Refresh per-frame: each link-posed instance's world_xform = link_pose[link] o
 // visual_local (a free-BODY instance poses from body_pose[row] instead); every

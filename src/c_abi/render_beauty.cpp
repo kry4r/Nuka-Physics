@@ -94,6 +94,11 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
     }
     for (const cook::MediaRenderSurface& s : record->particle_surfaces) {
         if (!s.triangles.empty() || s.particle_radius <= 0.0f) continue;
+        if (s.surface_spacing > 0.0f) {
+            nuka::render::AddStudioDensitySurface(*bridge->scene, record->scene->Ecs(),
+                s.render_material_id, s.surface_spacing, s.particle_first, s.particle_count);
+            continue;
+        }
         nuka::render::AddStudioParticleSkin(*bridge->scene, record->scene->Ecs(),
                                             s.render_material_id, s.particle_radius,
                                             s.particle_first, s.particle_count,
@@ -193,7 +198,8 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
         std::vector<nuka::math::Vec3> particle_pos(particle_count,
                                                    nuka::math::Vec3::Zero());
         if (particle_count > 0u &&
-            (!studio.surfaces.empty() || !studio.particle_skins.empty()) &&
+            (!studio.surfaces.empty() || !studio.particle_skins.empty() ||
+             !studio.density_surfaces.empty()) &&
             record->world->FieldPtr(nuka::nk::FieldId::ParticlePos) != nullptr) {
             data.DownloadField(nuka::nk::FieldId::ParticlePos, particle_pos.data(),
                                static_cast<uint64_t>(particle_count) *

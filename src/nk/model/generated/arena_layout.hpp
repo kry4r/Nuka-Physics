@@ -344,6 +344,8 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 3, 12, 0},  // step_link_impulse
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 3, 12, 0},  // step_link_moment
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 2, 1, 8, 0},  // step_joint_limit_impulse
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // particle_plastic_F
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // snapshot_particle_plastic_F
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

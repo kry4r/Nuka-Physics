@@ -640,7 +640,13 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_BODY_GYRO_STATUS = 42,
     // READ: exact and retained neighbors per particle at the last grid build, uint32.
     NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED = 43,
-    NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT = 44
+    NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT = 44,
+    // READ: row-major 3x3 per particle, env-major; elastic Fe for plastic materials.
+    NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT = 45,
+    // READ: multiplicative Fp; empty when no material requires plastic history.
+    NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT = 46,
+    // READ: cumulative equivalent plastic strain alpha; scalar per particle.
+    NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN = 47
 } nuka_state_field_t;
 
 typedef enum nuka_env_status_t {
@@ -654,7 +660,9 @@ typedef enum nuka_env_status_t {
     // Invalid contact ownership or endpoint indices; cleared by world reset.
     NUKA_ENV_STATUS_INVALID_ENDPOINT = 1u << 6,
     // Missing or invalid sampled contact geometry; cleared by world reset.
-    NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE = 1u << 7
+    NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE = 1u << 7,
+    // Material integration failed; the prior elastic/plastic history is retained.
+    NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE = 1u << 8
 } nuka_env_status_t;
 
 typedef enum nuka_gyro_status_t {

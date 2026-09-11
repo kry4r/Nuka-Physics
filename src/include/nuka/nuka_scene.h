@@ -442,6 +442,24 @@ typedef struct nuka_mpm_fill_desc_t {
 nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id,
                                       const nuka_mpm_fill_desc_t* desc);
 
+// Hencky J2 uses equivalent Kirchhoff yield stress and linear hardening in Pa.
+// Set struct_size to sizeof(nuka_mpm_plasticity_desc_t) and material model_kind to 5.
+typedef struct nuka_mpm_plasticity_desc_t {
+    uint32_t struct_size;
+    float yield_stress;
+    float hardening_modulus;
+} nuka_mpm_plasticity_desc_t;
+
+// Extended authoring preserves the layout of existing media and fill descriptors.
+// Plasticity is required for model_kind 5 and must be NULL for other materials.
+nuka_result_t nuka_scene_add_media_ex(nuka_scene_handle scene,
+                                    const nuka_media_desc_t* desc,
+                                    const nuka_mpm_plasticity_desc_t* plasticity,
+                                    uint32_t* out_media_id);
+nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media_id,
+                                       const nuka_mpm_fill_desc_t* desc,
+                                       const nuka_mpm_plasticity_desc_t* plasticity);
+
 // Optional nk::Pipeline::SolverConfig overrides for the built-scene world (1:1 with
 // the coupled desc's solver_* block, applied through the SAME FinishWorldCreate). A
 // soft body authors a tighter contact solve here (more position-correction sweeps, a

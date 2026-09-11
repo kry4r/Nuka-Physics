@@ -25,6 +25,7 @@
 #include "scene/canonical_types.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_ir.hpp"
+#include "nk/material/hencky_j2.hpp"
 #include "scene/terrain/heightfield.hpp"
 
 #include <exception>
@@ -43,6 +44,19 @@ namespace cook = nuka::scene::cook;
 namespace articulation = nuka::runtime::articulation;
 namespace nscene = nuka::scene;
 namespace nmath = nuka::math;
+
+bool ApplyMpmPlasticity(const nuka_mpm_plasticity_desc_t* desc,
+                       nscene::MediaMpmMaterial& material) {
+    if (desc == nullptr) return material.model_kind != nuka::nk::MpmMaterial::kHenckyJ2;
+    if (desc->struct_size < sizeof(*desc) ||
+        material.model_kind != nuka::nk::MpmMaterial::kHenckyJ2 ||
+        !std::isfinite(material.density) || !(material.density > 0.0f) ||
+        !nuka::nk::material::ValidHenckyJ2({material.youngs, material.poisson,
+                                         desc->yield_stress, desc->hardening_modulus})) return false;
+    material.yield_stress = desc->yield_stress;
+    material.hardening_modulus = desc->hardening_modulus;
+    return true;
+}
 
 // A primitive's world pose; an all-zero quat reads as identity (a zero-init desc
 // then sits at the origin upright, the ergonomic default).
@@ -379,6 +393,13 @@ nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
 nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
                                    const nuka_media_desc_t* desc,
                                    uint32_t* out_media_id) {
+    return nuka_scene_add_media_ex(scene, desc, nullptr, out_media_id);
+}
+
+nuka_result_t nuka_scene_add_media_ex(nuka_scene_handle scene,
+                                    const nuka_media_desc_t* desc,
+                                    const nuka_mpm_plasticity_desc_t* plasticity,
+                                    uint32_t* out_media_id) {
     if (desc == nullptr) return NUKA_RESULT_INVALID_ARG;
     SceneRecord* sr = SceneTable().Get(scene);
     if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
@@ -387,6 +408,9 @@ nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
         if (!MediaFromDesc(*desc, &media)) {
             return NUKA_RESULT_INVALID_ARG;  // unknown kind / method.
         }
+        if (!ApplyMpmPlasticity(plasticity, media.mpm) ||
+            (plasticity != nullptr && media.method != nscene::MediaRecord::Method::MlsMpm))
+            return NUKA_RESULT_INVALID_ARG;
         // Reject an illegal (kind x method) immediately via the SAME cook validator
         // (a single-record list; the cross-medium MPM+XPBD/PBF mix is caught at cook).
         cook::ValidateMedia(std::vector<nscene::MediaRecord>{media});
@@ -406,6 +430,12 @@ nuka_result_t nuka_scene_add_media(nuka_scene_handle scene,
 
 nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id,
                                       const nuka_mpm_fill_desc_t* desc) {
+    return nuka_scene_add_mpm_fill_ex(scene, media_id, desc, nullptr);
+}
+
+nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media_id,
+                                       const nuka_mpm_fill_desc_t* desc,
+                                       const nuka_mpm_plasticity_desc_t* plasticity) {
     if (desc == nullptr) return NUKA_RESULT_INVALID_ARG;
     SceneRecord* sr = SceneTable().Get(scene);
     if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
@@ -432,6 +462,9 @@ nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id
         fl.material.bulk_modulus = desc->bulk_modulus;
         fl.material.tait_gamma = desc->tait_gamma;
         fl.material.viscosity = desc->viscosity;
+        if (!ApplyMpmPlasticity(plasticity, fl.material) ||
+            (plasticity != nullptr && rec.kind == nscene::MediaRecord::Kind::Granular))
+            return NUKA_RESULT_INVALID_ARG;
         fl.render_material_id = desc->render_material_id;
         rec.mpm_fills.push_back(std::move(fl));
         return NUKA_RESULT_OK;

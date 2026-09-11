@@ -31,7 +31,8 @@
 ## 引擎优化细化规格
 
 - [x] 渲染表面重建与场景更新五进程验收：水体完整帧 676.341 → 192.701 ms（−71.51%），全部像素一致；内存、E16 sensor 均值回退与历史 checksum 失败如实保留，见 [报告](../research/2026-09-11-render-refresh-validation-zh.md)。
-- [ ] 接续 [Hencky J2 材料](../research/2026-09-11-elastoplastic-methods-zh.md) 的生产接线、Fe/Fp/alpha 生命周期、有限质量共同接触与真实夹爪 demo。调研和运行前预算已完成，材料及 demo 尚未验收。
+- [x] [Hencky J2 材料](../research/2026-09-11-elastoplastic-methods-zh.md) 的调研、生产接线、Fe/Fp/alpha 生命周期、C/Python、reset/readout 和连续动态表面通过；82 项场景、E16 N=1/2、sensor、memcheck 与无 CUDA 边界检查完成，失败基线保留。
+- [ ] 接续有限质量共同网格接触、多 owner 和真实动态夹爪 demo；材料落地画面不替代夹持验收。
 - [x] 核对 2026-09-07 的引擎审计/优化规格与当前代码，区分已修复和仍缺失能力。
 - [x] 按功能契约、数据流、通用算法、失败语义、兼容性细化优化点。
 - [x] 定义正确性/性能基线、指标、采集规则和验收门槛；未采集数据不冒充实测。
@@ -40,7 +41,7 @@
 ## 按规格实施
 
 - [x] 并行通用表面查询：完整落水 graph 五进程 GPU 317.824 → 30.247 ms（−90.48%），轨迹、质量、8 帧渲染和内存相同；E16 eager/graph +2.16%/+0.12% 回退保留，memcheck/synccheck 0 errors，见[报告](../research/2026-09-11-parallel-surface-query-validation-zh.md)。
-- [ ] 当前优先渲染提速：固定输入/画质，覆盖 TLAS rebuild 周期、批量相机、render-only 与 physics→sensor；同质量五进程验收后进入弹塑性 demo。
+- [x] 渲染表面/场景更新同质量五进程验收收口；批量相机回退、动态介质 sensor 和着色热点继续保留，当前推进弹塑性 demo 必需的耦合修复。
 - [x] 公共子步时钟：所有参与系统以相同 h 重复完整管线，外力只消费一次、累计冲量/wrench；组合律、E16 N=2、公共接口/reset/渲染及 memcheck 通过，见[报告](../research/2026-09-10-coupled-substep-clock-validation-zh.md)。有限质量与多 owner 仍待补齐。
 
 - [x] MLS-MPM 体积更新修复：取消隐藏 J 截断，保留失败状态并纠正 Tait 声速/CFL 口径；原 bunny-water eager/graph 与已有 28 项场景通过。局部稀疏膨胀和完整耦合继续审查，见 [MPM review](../research/2026-09-09-mpm-performance-review-zh.md)。
@@ -60,7 +61,7 @@
 - [x] 保留真实非凸/开放三角表面并接入刚体、粒子和 MPM 的共同查询；155 项导入、63 项场景、E16 完整管线、公共 API/reset/渲染及 memcheck 通过，见 [验收记录](../research/2026-09-10-triangle-surface-validation-zh.md)。有限厚度、CCD 与全量耦合继续保留。
 - [x] GPU 辅助凸覆盖集成统一 cook，自动准备几何、执行和缓存；覆盖 owner、序列化/recook、接触消费者与预算回退，见[验收](../research/2026-09-10-automatic-convex-cover-validation-zh.md)。最终碰撞仍用真实三角表面，不宣称严格覆盖认证。
 - [ ] 按 demo 和耦合依赖继续 MLS-MPM 修复：局部大 J、本构/体积、材料状态及边界；water pool/jelly 和完整 pipeline 验收后重建性能分母，其余项在 demo 后随优化/耦合优先推进。
-- [ ] 按 [弹塑性体细化 spec](../plans/2026-09-10-elastoplastic-body-detailed-spec-zh.md) 做网络调研，比较 MPM、FEM 等大变形方法及屈服/塑性积分，记录论文、实现版本、许可、取舍和可验证物理契约。
+- [x] 按 [弹塑性体细化 spec](../plans/2026-09-10-elastoplastic-body-detailed-spec-zh.md) 完成网络调研及 MPM/FEM、屈服/塑性积分比较，记录论文、上游版本/许可、取舍、方程与冻结的物理预算。
 - [ ] 集成通用弹塑性材料与持久塑性状态，打通 authoring/import/cook、公共参数、ABA 双向接触、step、reset/readout 与渲染；审计已有 granular 路径，不能用现有 jelly 弹性形变冒充塑性。
 - [ ] 制作机械臂挤压球体或其他物体的 demo，展示小载荷弹性恢复、大载荷屈服及卸载残余形变；记录夹爪反力、加载/卸载曲线、能量耗散和时间步/分辨率收敛。
 - [ ] 渲染完整弹塑性体 demo、关键帧和精选 GIF，物理与画面验收后替换主页 Go2 行走展示（当前 `Go2 Terrain`）；保留顶部 π0.5/G1 顺序与两两排列，补充运行说明。

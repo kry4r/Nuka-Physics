@@ -54,6 +54,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     if (env_count > 0) {
         model_.capacities.env_count = env_count;
     }
+    model_.capacities.mpm_plastic_state = std::any_of(
+        model_.mpm_materials.begin(), model_.mpm_materials.end(),
+        [](const MpmMaterial& material) { return material.model_kind == MpmMaterial::kHenckyJ2; });
     creation_status_ = model_.ValidateTopology(&creation_error_);
     if (creation_status_ != phi::Status::Ok) return;
     if (!(cfg_.dt > 0.0f) || !std::isfinite(cfg_.dt) ||
@@ -388,24 +391,21 @@ bool World::SeedInitialState() {
                                    mat.size() * sizeof(uint32_t))) {
                 return false;
             }
+            if (cap.mpm_plastic_state) {
+                std::vector<float> plastic(F.size(), 0.0f);
+                for (size_t i = 0u; i < plastic.size(); i += 9u)
+                    plastic[i] = plastic[i + 4u] = plastic[i + 8u] = 1.0f;
+                if (!data_.UploadField(FieldId::ParticlePlasticF, plastic.data(),
+                                      plastic.size() * sizeof(float))) return false;
+            }
         }
     }
 
-    // MLS-MPM material table (global; data-owned, flat f32 pool like mat_buckets).
-    // 0 materials -> the segment is zero bytes and this block no-ops (byte-inert).
+    // Material records retain their named, backend-independent representation on upload.
     if (cap.mpm_material_count > 0 && !model_.mpm_materials.empty()) {
-        const uint32_t stride = MpmMaterial::kValueCount;
-        std::vector<float> host(static_cast<size_t>(cap.mpm_material_count) * stride, 0.0f);
-        for (uint32_t r = 0; r < cap.mpm_material_count &&
-                             r < model_.mpm_materials.size(); ++r) {
-            const MpmMaterial& mm = model_.mpm_materials[r];
-            float* dst = host.data() + static_cast<size_t>(r) * stride;
-            dst[0] = mm.youngs; dst[1] = mm.poisson; dst[2] = mm.density;
-            dst[3] = mm.dp_friction; dst[4] = mm.dp_cohesion; dst[5] = mm.model_kind;
-            dst[6] = mm.bulk_modulus; dst[7] = mm.tait_gamma; dst[8] = mm.viscosity;
-        }
-        if (!data_.UploadField(FieldId::MpmMaterialTable, host.data(),
-                               host.size() * sizeof(float))) {
+        if (cap.mpm_material_count != model_.mpm_materials.size() ||
+            !data_.UploadField(FieldId::MpmMaterialTable, model_.mpm_materials.data(),
+                               model_.mpm_materials.size() * sizeof(MpmMaterial))) {
             return false;
         }
     }

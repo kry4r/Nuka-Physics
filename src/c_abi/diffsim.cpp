@@ -116,6 +116,8 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         world_record->articulation_host.TotalLinkCount() == 0u) {
         return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
     }
+    if (world_record->world->GetModel().capacities.mpm_plastic_state)
+        return NUKA_RESULT_NOT_SUPPORTED;
     try {
         auto record = std::make_unique<TapeRecord>();
         record->world = world_record;

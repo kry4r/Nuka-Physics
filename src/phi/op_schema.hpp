@@ -65,6 +65,7 @@ inline constexpr uint32_t kEnvStatusGyroFailure      = 1u << 5;
 inline constexpr uint32_t kEnvStatusInvalidEndpoint  = 1u << 6;
 // Missing or invalid sampled contact geometry stays latched until world reset.
 inline constexpr uint32_t kEnvStatusContactGeometryUnavailable = 1u << 7;
+inline constexpr uint32_t kEnvStatusConstitutiveFailure = 1u << 8;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
 inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
