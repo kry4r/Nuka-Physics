@@ -194,10 +194,12 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ParticleC:           v.particle_C = static_cast<float*>(p); break;
         case FieldId::ParticleVol0:        v.particle_vol0 = static_cast<float*>(p); break;
         case FieldId::ParticlePlastic:     v.particle_plastic = static_cast<float*>(p); break;
+        case FieldId::ParticlePlasticF:    v.particle_plastic_F = static_cast<float*>(p); break;
         case FieldId::ParticleMaterialId:  v.particle_material_id = static_cast<uint32_t*>(p); break;
         case FieldId::SnapshotParticleF:       v.snapshot_particle_F = static_cast<float*>(p); break;
         case FieldId::SnapshotParticleC:       v.snapshot_particle_C = static_cast<float*>(p); break;
         case FieldId::SnapshotParticlePlastic: v.snapshot_particle_plastic = static_cast<float*>(p); break;
+        case FieldId::SnapshotParticlePlasticF: v.snapshot_particle_plastic_F = static_cast<float*>(p); break;
         case FieldId::MpmGridCellKey:      v.mpm_grid_cell_key = static_cast<uint32_t*>(p); break;
         case FieldId::MpmGridPartIdx:      v.mpm_grid_part_idx = static_cast<uint32_t*>(p); break;
         case FieldId::MpmSortScratch:      v.mpm_sort_scratch = static_cast<uint8_t*>(p); break;
@@ -292,7 +294,7 @@ void Data::FillView(phi::DataView* out_view) const {
     }
     *out_view = phi::DataView{};
     for (const Arena::Segment& seg : arena_.Segments()) {
-        BindDataPointer(*out_view, seg.field, arena_.Ptr(seg.field));
+        BindDataPointer(*out_view, seg.field, seg.bytes == 0u ? nullptr : arena_.Ptr(seg.field));
     }
 }
 

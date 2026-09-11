@@ -14,6 +14,7 @@ runs here -- a material only carries parameters.
 from __future__ import annotations
 
 import dataclasses as _dc
+import math as _math
 from typing import Optional, Tuple
 
 
@@ -151,6 +152,21 @@ class MpmMaterial:
     dp_cohesion: float = 0.0
     # Extra +z grid headroom (m) so kicked/lofted debris stays inside the grid.
     loft_headroom: float = 0.0
+    yield_stress: float = 0.0
+    hardening_modulus: float = 0.0
+
+    def __post_init__(self):
+        if self.model_kind != 5.0:
+            if self.yield_stress != 0.0 or self.hardening_modulus != 0.0:
+                raise ValueError("Plasticity parameters require Hencky J2 (model_kind 5)")
+            return
+        values = (self.youngs, self.poisson, self.density,
+                  self.yield_stress, self.hardening_modulus)
+        if (not all(_math.isfinite(v) for v in values) or
+                self.youngs <= 0.0 or not -1.0 < self.poisson < 0.5 or
+                self.density <= 0.0 or self.yield_stress <= 0.0 or
+                self.hardening_modulus < 0.0):
+            raise ValueError("Hencky J2 requires finite E,rho,yield > 0, -1 < nu < 0.5, H >= 0")
 
     @property
     def MEDIA_KIND(self) -> str:
@@ -170,6 +186,8 @@ class MpmMaterial:
             mpm_floor_d=float(self.floor_d),
             mpm_floor_friction=float(self.floor_friction),
             mpm_loft_headroom=float(self.loft_headroom),
+            mpm_yield_stress=float(self.yield_stress),
+            mpm_hardening_modulus=float(self.hardening_modulus),
         )
 
     def fill_kwargs(self) -> dict:
@@ -181,7 +199,8 @@ class MpmMaterial:
             density=float(self.density), dp_friction=float(self.dp_friction),
             dp_cohesion=float(self.dp_cohesion), model_kind=float(self.model_kind),
             bulk_modulus=float(self.bulk_modulus), tait_gamma=float(self.tait_gamma),
-            viscosity=float(self.viscosity))
+            viscosity=float(self.viscosity), yield_stress=float(self.yield_stress),
+            hardening_modulus=float(self.hardening_modulus))
 
 
 class Soft:
@@ -206,7 +225,8 @@ class Soft:
             substeps: int = 20,
             floor_normal: Tuple[float, float, float] = (0.0, 0.0, 1.0),
             floor_d: float = 0.0, floor_friction: float = 0.4,
-            loft_headroom: float = 0.0) -> MpmMaterial:
+            loft_headroom: float = 0.0, yield_stress: float = 0.0,
+            hardening_modulus: float = 0.0) -> MpmMaterial:
         """An MLS-MPM continuum solid: ``model_kind`` 0 corotated / 2 neo-hookean,
         ``youngs`` / ``poisson`` elasticity, ``density`` kg/m^3, grid cell ``dx`` m,
         ``substeps`` per step, and a separating floor at ``floor_normal . x =
@@ -219,7 +239,23 @@ class Soft:
         return MpmMaterial("soft_tet", youngs, poisson, density, model_kind,
                            bulk_modulus, tait_gamma, viscosity, dx, substeps,
                            floor_normal, floor_d, floor_friction,
-                           loft_headroom=loft_headroom)
+                           loft_headroom=loft_headroom, yield_stress=yield_stress,
+                           hardening_modulus=hardening_modulus)
+
+    @staticmethod
+    def ElastoPlastic(*, yield_stress: float, hardening_modulus: float = 0.0,
+                     youngs: float = 1.0e5, poisson: float = 0.3,
+                     density: float = 1000.0, dx: float = 0.02, substeps: int = 20,
+                     floor_normal: Tuple[float, float, float] = (0.0, 0.0, 1.0),
+                     floor_d: float = 0.0, floor_friction: float = 0.4,
+                     loft_headroom: float = 0.0) -> MpmMaterial:
+        """Hencky J2 solid; yield stress and linear isotropic hardening are in Pa.
+        Plastic flow is isochoric; yield uses equivalent Kirchhoff stress."""
+        return Soft.MPM(youngs=youngs, poisson=poisson, density=density, model_kind=5.0,
+                        dx=dx, substeps=substeps, floor_normal=floor_normal,
+                        floor_d=floor_d, floor_friction=floor_friction,
+                        loft_headroom=loft_headroom, yield_stress=yield_stress,
+                        hardening_modulus=hardening_modulus)
 
 
 @_dc.dataclass(frozen=True)

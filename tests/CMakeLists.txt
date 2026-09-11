@@ -45,6 +45,7 @@ gtest_discover_tests(nuka_smoke_test
 # --- Math tests ------------------------------------------------------------
 add_executable(nuka_math_test
     math/test_spatial_math.cpp
+    math/test_hencky_j2.cpp
 )
 
 target_link_libraries(nuka_math_test

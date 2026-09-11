@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "math/vec3.hpp"
+#include "nk/material/hencky_j2.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
@@ -216,4 +217,64 @@ TEST(MpmJellyBall, TwoRunByteIdentical) {
     ASSERT_EQ(a.size(), c.size());
     EXPECT_EQ(0, std::memcmp(a.data(), c.data(), a.size() * sizeof(Vec3)))
         << "MPM trajectory differs run-to-run (an atomic scatter would)";
+}
+
+TEST(MpmJellyBall, PlasticImpactHistoryAndEnvironmentReset) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    const Backend backend = GetBackend();
+    auto input = BuildJellyInput();
+    input.material.model_kind = nk::MpmMaterial::kHenckyJ2;
+    input.material.poisson = 0.0f;
+    input.material.yield_stress = 200.0f;
+    input.material.hardening_modulus = 4000.0f;
+    nk::Model model;
+    cook::CookMpmParticles(model, 2u, input);
+    const size_t count = input.positions.size(), total = count * 2u;
+    nk::World world(std::move(model), 2u, backend.dev, backend.backend, Cfg());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    ASSERT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok);
+    std::vector<float> elastic(total * 9u), plastic(total * 9u), alpha(total), previous(total, 0.0f);
+    auto read = [&] {
+        return world.GetData().DownloadField(nk::FieldId::ParticleF, elastic.data(), elastic.size() * sizeof(float)) &&
+               world.GetData().DownloadField(nk::FieldId::ParticlePlasticF, plastic.data(), plastic.size() * sizeof(float)) &&
+               world.GetData().DownloadField(nk::FieldId::ParticlePlastic, alpha.data(), alpha.size() * sizeof(float));
+    };
+    ASSERT_TRUE(read());
+    const auto initial_elastic = elastic, initial_plastic = plastic, initial_alpha = alpha;
+    float peak_alpha = 0.0f, max_volume_error = 0.0f;
+    for (uint32_t step = 0u; step < 160u; ++step) {
+        ASSERT_EQ(world.StepConfigured(), nphi::Status::Ok);
+        uint32_t status[2]{};
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::EnvStatus, status, sizeof(status)));
+        ASSERT_EQ(status[0] | status[1], 0u) << "step " << step;
+        ASSERT_TRUE(read());
+        for (size_t i = 0u; i < total; ++i) {
+            ASSERT_TRUE(std::isfinite(alpha[i]));
+            ASSERT_GE(alpha[i], previous[i]);
+            const float volume = nk::material::detail::Determinant(plastic.data() + i * 9u);
+            ASSERT_TRUE(std::isfinite(volume));
+            max_volume_error = std::max(max_volume_error, std::abs(volume - 1.0f));
+            peak_alpha = std::max(peak_alpha, alpha[i]);
+        }
+        previous = alpha;
+    }
+    EXPECT_GT(peak_alpha, 0.001f);
+    EXPECT_LT(max_volume_error, 2.0e-4f);
+    EXPECT_TRUE(std::equal(alpha.begin(), alpha.begin() + count, alpha.begin() + count));
+    const auto before_elastic = elastic, before_plastic = plastic, before_alpha = alpha;
+    ASSERT_EQ(world.Reset({0u}), nphi::Status::Ok);
+    ASSERT_TRUE(read());
+    EXPECT_TRUE(std::equal(elastic.begin(), elastic.begin() + count * 9u, initial_elastic.begin()));
+    EXPECT_TRUE(std::equal(plastic.begin(), plastic.begin() + count * 9u, initial_plastic.begin()));
+    EXPECT_TRUE(std::equal(alpha.begin(), alpha.begin() + count, initial_alpha.begin()));
+    EXPECT_TRUE(std::equal(elastic.begin() + count * 9u, elastic.end(), before_elastic.begin() + count * 9u));
+    EXPECT_TRUE(std::equal(plastic.begin() + count * 9u, plastic.end(), before_plastic.begin() + count * 9u));
+    EXPECT_TRUE(std::equal(alpha.begin() + count, alpha.end(), before_alpha.begin() + count));
+    ASSERT_EQ(world.StepConfigured(), nphi::Status::Ok);
+    ASSERT_EQ(world.Reset(), nphi::Status::Ok);
+    ASSERT_TRUE(read());
+    EXPECT_EQ(elastic, initial_elastic);
+    EXPECT_EQ(plastic, initial_plastic);
+    EXPECT_EQ(alpha, initial_alpha);
+    std::printf("[hencky-j2] peak_alpha=%.8g max_plastic_volume_error=%.8g\n", peak_alpha, max_volume_error);
 }

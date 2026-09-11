@@ -321,7 +321,7 @@ struct MediaMpmMaterial {
     float density      = 0.0f;
     float dp_friction  = 0.0f;   // granular internal friction angle (deg).
     float dp_cohesion  = 0.0f;   // granular cohesion stress (Pa; 0 = cohesionless).
-    float model_kind   = 0.0f;   // 0 corotated, 2 neo-hookean, 3 fluid, 4 granular DP
+    float model_kind   = 0.0f;   // 0 corotated, 2 Neo-Hookean, 3 fluid, 4 DP, 5 Hencky J2
     float bulk_modulus = 0.0f;
     float tait_gamma   = 0.0f;
     float viscosity    = 0.0f;
@@ -333,6 +333,7 @@ struct MediaMpmMaterial {
     // Extra +z grid headroom (m) above the sampled box so kicked/lofted debris does
     // not trip the +z escape clip. 0 (default) keeps today's motion headroom.
     float      loft_headroom  = 0.0f;
+    float      yield_stress = 0.0f, hardening_modulus = 0.0f;
 };
 
 // Render-skin metadata for surface baking. The cloth fields mirror the particle

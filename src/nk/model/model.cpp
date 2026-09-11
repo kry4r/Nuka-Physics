@@ -16,6 +16,7 @@
 #include "core/checked_size.hpp"
 #include "collision/mesh_surface.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "nk/material/hencky_j2.hpp"
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
 #include "phi/articulation_contract.hpp"
 
@@ -97,6 +98,8 @@ uint64_t ModelCapacities::NeighborPoolCapacity() const {
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    if (!mpm_plastic_state &&
+        (id == FieldId::ParticlePlasticF || id == FieldId::SnapshotParticlePlasticF)) return 0u;
     const bool mpm_reaction = mpm_grid_nodes_per_env != 0u && bodies_per_env != 0u;
     if (integration_substeps <= 1u &&
         (id == FieldId::StepLinkImpulse || id == FieldId::StepLinkMoment ||
@@ -1088,6 +1091,14 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         return reject(Status::InvalidArgument, "environment count must be positive");
     if (MpmParticlesPerEnv() > cap.particles_per_env)
         return reject(Status::InvalidArgument, "MPM particle slice exceeds its environment");
+    if (mpm_materials.size() != cap.mpm_material_count)
+        return reject(Status::InvalidArgument, "MPM material table count disagrees with capacity");
+    for (const MpmMaterial& m : mpm_materials)
+        if (!material::ValidMpmMaterial(m))
+            return reject(Status::InvalidArgument, "unknown or invalid MPM material");
+    for (uint32_t id : particles.initial_material_id)
+        if (id >= cap.mpm_material_count)
+            return reject(Status::InvalidArgument, "MPM particle material index is out of range");
     for (uint64_t count : {uint64_t(n), uint64_t(k), uint64_t(cap.bodies_per_env),
                            uint64_t(cap.particles_per_env), uint64_t(cap.aero_tris_per_env) * 3u}) {
         if (count * cap.env_count > limit)

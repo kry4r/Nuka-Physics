@@ -21,6 +21,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/contact/contact_profile.hpp"
+#include "nk/material/mpm_material.hpp"
 #include "phi/backend.hpp"   // phi::ModelView, BufferType, Buffer (forward + wrappers)
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/generated/arena_layout.hpp"
@@ -118,6 +119,7 @@ struct ModelCapacities {
     // MLS-MPM material-table row count (indexed by particle_material_id); 0 for a
     // non-MPM world -> zero-byte mpm_material_table segment.
     uint32_t mpm_material_count = 0;
+    bool mpm_plastic_state = false;
 
     // H1 (general contact pipeline Phase 0) — total cooked heightfield-grid cells
     // (sum over all heightfield collidables of nrow*ncol). Sizes the GLOBAL
@@ -252,20 +254,6 @@ struct ModelMaterialBucket {
 
 bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
                                          ModelMaterialBucket* canonical);
-
-// One MLS-MPM material: elastic moduli + Drucker-Prager params + weakly-compressible
-// fluid params, indexed by the per-particle material id. model_kind selects which
-// the constitutive branch reads; fluid (3) reads bulk_modulus/tait_gamma/viscosity.
-struct MpmMaterial {
-    static constexpr uint32_t kValueCount = 9u;  // f32 count of this POD (table stride).
-    float youngs = 0.0f, poisson = 0.0f, density = 0.0f;
-    // dp_friction = internal friction angle (deg); dp_cohesion = cohesion stress (Pa).
-    float dp_friction = 0.0f, dp_cohesion = 0.0f;
-    // 0 = fixed-corotated elastic, 1 = Drucker-Prager (reserved), 2 = Neo-Hookean,
-    // 3 = weakly-compressible fluid (Tait EOS), 4 = granular Drucker-Prager sand.
-    float model_kind = 0.0f;
-    float bulk_modulus = 0.0f, tait_gamma = 0.0f, viscosity = 0.0f;
-};
 
 // ---------------------------------------------------------------------------
 // M4: the UNION (CSR compliant) contact family — Model-side authoring tables.

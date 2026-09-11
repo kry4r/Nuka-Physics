@@ -22,6 +22,7 @@
 #include "collision/primitive_surface.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "nk/material/hencky_j2.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "nk/solve/collidable_owner.hpp"
 #include "phi/backend_cuda/launch.cuh"
@@ -159,9 +160,6 @@ struct MpmProfiler {
 
 // A normal mass keeps momentum normalization from dividing by a denormal.
 constexpr float kMinNodeMass = 1.0e-30f;
-
-// Packed material rows follow MpmMaterial::kValueCount.
-constexpr uint32_t kMpmMatStride = 9u;
 
 // Round up to the 256B section alignment the Arena lays scratch out at, so every
 // sub-region of mpm_sort_scratch is 256B-aligned device memory.
@@ -534,27 +532,35 @@ __device__ __forceinline__ uint32_t MpmSliceGlobal(uint32_t t, uint32_t mpm_per_
 }
 
 // Compute a particle's Kirchhoff stress for its transfer record and observable field.
-__device__ __forceinline__ void MpmParticleStress(
+__device__ __forceinline__ bool MpmParticleStress(
     uint32_t p,
     const float* __restrict__ part_C, const float* __restrict__ part_F,
     const float* __restrict__ part_vol0, const uint32_t* __restrict__ part_mat,
-    const float* __restrict__ material_table, uint32_t material_count,
+    const nk::MpmMaterial* __restrict__ material_table, uint32_t material_count,
     float* __restrict__ stress) {
     const float vol0 = part_vol0 != nullptr ? part_vol0[p] : 0.0f;
     if (part_F == nullptr || vol0 <= 0.0f) {
         for (int k = 0; k < 9; ++k) stress[k] = 0.0f;
-        return;
+        return true;
     }
     const uint32_t mid = part_mat != nullptr ? part_mat[p] : 0u;
+    if (material_count > 0u && mid >= material_count) return false;
     float youngs = 0.0f, poisson = 0.0f, kind = 0.0f;
     float bulk = 0.0f, tait_gamma = 0.0f, visc = 0.0f;
     if (material_table != nullptr && mid < material_count) {
-        const float* mr = material_table + static_cast<size_t>(mid) * kMpmMatStride;
-        youngs = mr[0]; poisson = mr[1]; kind = mr[5];
-        bulk = mr[6]; tait_gamma = mr[7]; visc = mr[8];
+        const nk::MpmMaterial& mr = material_table[mid];
+        youngs = mr.youngs; poisson = mr.poisson; kind = mr.model_kind;
+        bulk = mr.bulk_modulus; tait_gamma = mr.tait_gamma; visc = mr.viscosity;
     }
     const float* F = part_F + static_cast<size_t>(p) * 9u;
-    if (kind > 3.5f) {
+    if (kind == nk::MpmMaterial::kHenckyJ2) {
+        const nk::MpmMaterial& mr = material_table[mid];
+        nk::material::HenckyResponse response;
+        if (nk::material::EvaluateHenckyJ2(F,
+                {mr.youngs, mr.poisson, mr.yield_stress, mr.hardening_modulus}, response) !=
+            nk::material::ConstitutiveStatus::Ok) return false;
+        for (int k = 0; k < 9; ++k) stress[k] = response.kirchhoff[k];
+    } else if (kind > 3.5f) {
         const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
         const float mu = youngs / (2.0f * (1.0f + poisson));
         const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
@@ -587,6 +593,7 @@ __device__ __forceinline__ void MpmParticleStress(
         FirstPiola(F, mu, lambda, kind, P);
         Mat3MulT(P, F, stress);
     }
+    return true;
 }
 
 __global__ void MpmCellKeysKernel(uint32_t mpm_count,
@@ -692,8 +699,9 @@ __global__ void MpmPrepareTransferInputKernel(
     const m::Vec3* __restrict__ pos, const float* __restrict__ inv_mass,
     const m::Vec3* __restrict__ velocity, const float* __restrict__ affine,
     const float* __restrict__ deformation, const float* __restrict__ volume,
-    const uint32_t* __restrict__ material_ids, const float* __restrict__ material_table,
+    const uint32_t* __restrict__ material_ids, const nk::MpmMaterial* __restrict__ material_table,
     uint32_t material_count, float* __restrict__ particle_stress,
+    uint32_t particles_per_env, uint32_t* __restrict__ env_status,
     m::Vec3 origin, float inv_dx, uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
     MpmTransferInput* __restrict__ transfer_input) {
     const uint32_t block_begin = blockIdx.x * blockDim.x;
@@ -701,8 +709,11 @@ __global__ void MpmPrepareTransferInputKernel(
     MpmTransferInput cached{};
     if (s < particle_count) {
         const uint32_t p = sorted_idx[s];
-        MpmParticleStress(p, affine, deformation, volume, material_ids,
-                          material_table, material_count, cached.stress);
+        if (!MpmParticleStress(p, affine, deformation, volume, material_ids,
+                               material_table, material_count, cached.stress)) {
+            atomicOr(&env_status[p / particles_per_env], kEnvStatusConstitutiveFailure);
+            for (int i = 0; i < 9; ++i) cached.stress[i] = 0.0f;
+        }
         for (int i = 0; i < 9; ++i)
             particle_stress[static_cast<size_t>(p) * 9u + i] = cached.stress[i];
         const m::Vec3 xp = pos[p];
@@ -1261,15 +1272,17 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
     part_pos[p] = np;
 }
 
-// Elastic F follows the affine map; fluids retain only its divergence-driven volume.
-// Granular materials return-map the trial elastic deformation.
+// Elastic F follows the affine map; fluids retain its divergence-driven volume.
+// Plastic return maps commit history once per completed grid interval.
 __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
                                  const float* __restrict__ part_C,
                                  const uint32_t* __restrict__ part_mat,
-                                 const float* __restrict__ material_table,
+                                 const nk::MpmMaterial* __restrict__ material_table,
                                  uint32_t material_count, uint32_t particles_per_env,
                                  uint32_t mpm_per_env,
                                  float* __restrict__ part_F,
+                                 float* __restrict__ part_plastic_F,
+                                 float* __restrict__ part_plastic,
                                  uint32_t* __restrict__ env_status) {
     const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= mpm_count) return;
@@ -1278,14 +1291,30 @@ __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
     const float* C = part_C + static_cast<size_t>(p) * 9u;
     float* F = part_F + static_cast<size_t>(p) * 9u;
     float kind = 0.0f, youngs = 0.0f, poisson = 0.0f, dpf = 0.0f, dpc = 0.0f;
+    const nk::MpmMaterial* material = nullptr;
     if (part_mat != nullptr && material_table != nullptr) {
         const uint32_t mid = part_mat[p];
         if (mid < material_count) {
-            const float* mr = material_table + static_cast<size_t>(mid) * kMpmMatStride;
-            youngs = mr[0]; poisson = mr[1]; dpf = mr[3]; dpc = mr[4]; kind = mr[5];
+            material = material_table + mid;
+            youngs = material->youngs; poisson = material->poisson;
+            dpf = material->dp_friction; dpc = material->dp_cohesion;
+            kind = material->model_kind;
         }
     }
-    if (kind > 3.5f) {  // granular: elastic predictor then Drucker-Prager return map.
+    if (kind == nk::MpmMaterial::kHenckyJ2) {
+        if (part_plastic_F == nullptr || part_plastic == nullptr) {
+            atomicOr(&env_status[p / particles_per_env], kEnvStatusConstitutiveFailure);
+            return;
+        }
+        float map[9], trial[9];
+        for (int k = 0; k < 9; ++k) map[k] = dt * C[k] + (k % 4 == 0 ? 1.0f : 0.0f);
+        Mat3Mul(map, F, trial);
+        if (nk::material::ReturnHenckyJ2(trial,
+                {youngs, poisson, material->yield_stress, material->hardening_modulus},
+                F, part_plastic_F + static_cast<size_t>(p) * 9u, part_plastic[p]) !=
+            nk::material::ConstitutiveStatus::Ok)
+            atomicOr(&env_status[p / particles_per_env], kEnvStatusConstitutiveFailure);
+    } else if (kind > 3.5f) {  // granular: elastic predictor and Drucker-Prager return.
         float IpdtC[9];
         for (int k = 0; k < 9; ++k) IpdtC[k] = dt * C[k];
         IpdtC[0] += 1.0f; IpdtC[4] += 1.0f; IpdtC[8] += 1.0f;
@@ -1402,8 +1431,9 @@ cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
     launch(MpmStage::TransferInput, MpmPrepareTransferInputKernel, pblocks,
            mpm_count, scratch.idx_out, data.particle_pos, data.particle_inv_mass,
            data.particle_vel, data.particle_C, data.particle_F,
-           data.particle_vol0, data.particle_material_id, data.mpm_material_table,
-           p.material_count, data.mpm_particle_stress,
+           data.particle_vol0, data.particle_material_id,
+           reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
+           p.material_count, data.mpm_particle_stress, Ppe, data.env_status,
            origin, inv_dx, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.transfer_input);
     if (error != cudaSuccess) return error;
     launch(MpmStage::P2GCells, MpmP2GCellsKernel, cell_blocks,
@@ -1461,8 +1491,9 @@ cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
            data.grid_velocity, data.particle_pos, data.particle_vel, data.particle_C);
     launch(MpmStage::UpdateF, MpmUpdateFKernel, pblocks, mpm_count,
            dt_sub, data.particle_C, data.particle_material_id,
-           data.mpm_material_table, p.material_count, Ppe, mpm_pe, data.particle_F,
-           data.env_status);
+           reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
+           p.material_count, Ppe, mpm_pe, data.particle_F, data.particle_plastic_F,
+           data.particle_plastic, data.env_status);
     return error;
 }
 

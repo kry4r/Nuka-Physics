@@ -25,12 +25,14 @@ struct MediaRenderSurface {
     // renderer's default media material).
     uint32_t render_material_id = 0xFFFFFFFFu;
 
-    // Surface-less particle media (granular / MPM fluid) render as instanced
-    // spheres instead: radius > 0 selects the sphere skin over the particle
-    // range [first, first+count) (count 0 = the whole particle field).
+    // Particle media retain a range and sampling radius; zero count means the whole field.
+    // Without density reconstruction, the range renders as individual grains.
     float    particle_radius = 0.0f;
     uint32_t particle_first = 0u;
     uint32_t particle_count = 0u;
+
+    // Positive spacing selects a continuous density surface over the particle range.
+    float surface_spacing = 0.0f;
 
     // Grain look for the instanced-sphere skin: analytic spheres vs octahedra, plus
     // deterministic per-grain radius/albedo scatter (all 0/false => uniform octahedra).

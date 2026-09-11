@@ -16,6 +16,9 @@
 #include "scene/ecs/registry.hpp"
 
 #include <cstdint>
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <string>
 
 namespace nuka::render {
@@ -285,6 +288,27 @@ void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
     scene.particle_skins.push_back(sk);
 }
 
+void AddStudioDensitySurface(StudioScene& scene, const scene::Registry& registry,
+                             uint32_t scene_material_id, float spacing,
+                             uint32_t first, uint32_t count) {
+    if (!(spacing > 0.0f) || !std::isfinite(spacing))
+        throw std::invalid_argument("Density surface requires positive finite spacing");
+    StudioScene::DensitySurface surface;
+    surface.first = first;
+    surface.count = count;
+    surface.params.h = 2.0f * spacing;
+    surface.params.cell_size = 0.5f * spacing;
+    surface.params.particle_mass = spacing * spacing * spacing;
+    surface.params.rest_density_rho0 = 1.0f;
+    uint32_t slot = InternSceneMaterial(scene, registry, scene_material_id);
+    if (slot == kNoId) {
+        scene.world.materials.push_back(Mk(0.42f, 0.385f, 0.34f, 0.0f, 0.85f));
+        slot = static_cast<uint32_t>(scene.world.materials.size() - 1u);
+    }
+    surface.material_id = slot;
+    scene.density_surfaces.push_back(surface);
+}
+
 void PublishStudioScene(StudioScene& scene,
                         const std::vector<Transform>& link_pose,
                         const std::vector<Vec3>& particle_pos,
@@ -346,6 +370,33 @@ void PublishStudioScene(StudioScene& scene,
             sk.instance = scene.world.instances.size() - 1u;
         } else {
             scene.world.meshes.ReplaceGeometry(sk.mesh_id, std::move(mesh));
+        }
+    }
+
+    for (std::size_t si = 0; si < scene.density_surfaces.size(); ++si) {
+        StudioScene::DensitySurface& surface = scene.density_surfaces[si];
+        if (surface.first > particle_pos.size())
+            throw std::out_of_range("Density surface particle range is outside the state");
+        const std::size_t available = particle_pos.size() - surface.first;
+        const std::size_t count = surface.count == 0u ? available : surface.count;
+        if (count > available)
+            throw std::out_of_range("Density surface particle count exceeds the state");
+        const auto begin = particle_pos.begin() + surface.first;
+        const std::vector<Vec3> positions(begin, begin + count);
+        MeshGeometry mesh = runtime::fluid::MarchFluidSurface(positions, surface.params);
+        if (surface.mesh_id == kNoId) {
+            if (mesh.positions.empty()) continue;
+            surface.mesh_id = scene.world.meshes.InternPrimitive(
+                "density_surface" + std::to_string(si), [&] { return mesh; });
+            RenderInstance instance;
+            instance.mesh_id = surface.mesh_id;
+            instance.render_material_id = surface.material_id;
+            instance.world_xform = Transform::Identity();
+            instance.pose_source.kind = PoseSource::Kind::Static;
+            scene.world.instances.push_back(instance);
+            surface.instance = scene.world.instances.size() - 1u;
+        } else {
+            scene.world.meshes.ReplaceGeometry(surface.mesh_id, std::move(mesh));
         }
     }
 }

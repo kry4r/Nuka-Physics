@@ -168,6 +168,7 @@ struct MpmMaterialInput {
     // 3 = weakly-compressible fluid (Tait EOS, reads the three fields below).
     float model_kind = 0.0f;
     float bulk_modulus = 0.0f, tait_gamma = 0.0f, viscosity = 0.0f;
+    float yield_stress = 0.0f, hardening_modulus = 0.0f;
 };
 
 struct MpmCookInput {

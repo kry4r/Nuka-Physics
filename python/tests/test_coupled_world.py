@@ -23,11 +23,13 @@ state) -- that is a separate RL-track follow-on. This test only proves create + 
 from __future__ import annotations
 
 import os
+import numpy as np
 
 import pytest
 import torch
 
 import nuka
+from nuka.author.materials import Soft
 
 SCENE = "/root/Nuka-Physics/examples/scenes/go2_stand.usda"
 
@@ -81,6 +83,7 @@ def test_create_step_read_couples_through_python(device):
             assert pos.is_cuda and vel.is_cuda
             assert pos.numel() == w.particle_count * 3
             assert pos.shape[-1] == 3
+            assert w.download_field(nuka.PARTICLE_PLASTIC_DEFORMATION_GRADIENT).size == 0
             for _ in range(200):
                 w.step()
             # Copy out the final particle positions (env 0; single-env world).
@@ -119,3 +122,66 @@ def test_coupled_world_requires_a_medium(device):
     create_from_scene for a particle-free world)."""
     with pytest.raises(RuntimeError):
         nuka.World.create_coupled_from_scene(device, SCENE, env_count=1)
+
+
+def test_plastic_material_cook_graph_reset_and_readout(device, tmp_path):
+    material = Soft.ElastoPlastic(youngs=30000.0, poisson=0.0, yield_stress=200.0,
+                                 hardening_modulus=4000.0, dx=0.025, substeps=10)
+    fields = (nuka.PARTICLE_DEFORMATION_GRADIENT,
+              nuka.PARTICLE_PLASTIC_DEFORMATION_GRADIENT,
+              nuka.PARTICLE_EQUIVALENT_PLASTIC_STRAIN)
+    saved = str(tmp_path / "plastic.nks")
+    states = []
+    with nuka.SceneBuilder.create() as builder:
+        builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
+                          tet_center=[0.0, 0.0, 0.15], tet_radius=0.08,
+                          tet_cells=12, tet_cell_len=0.016,
+                          **material.media_material_kwargs())
+        builder.save(saved)
+        for source in (builder, nuka.SceneBuilder.create(saved)):
+            try:
+                with source.build(device, env_count=2, dt=1.0 / 240.0) as world:
+                    world.set_execution_mode("graph")
+                    initial = [world.download_field(f).copy().reshape(2, -1) for f in fields]
+                    for _ in range(120):
+                        world.step()
+                    assert not np.any(world.download_field(nuka.ENV_STATUS))
+                    final = [world.download_field(f).copy().reshape(2, -1) for f in fields]
+                    assert final[2].max() > 0.001
+                    np.testing.assert_allclose(np.linalg.det(final[1].reshape(-1, 3, 3)),
+                                               1.0, rtol=0.0, atol=2.0e-4)
+                    for value in final:
+                        assert np.isfinite(value).all()
+                        np.testing.assert_array_equal(value[0], value[1])
+                    states.append(final)
+                    world.reset_envs([0])
+                    for f, seed, held in zip(fields, initial, final):
+                        actual = world.download_field(f).reshape(2, -1)
+                        np.testing.assert_array_equal(actual[0], seed[0])
+                        np.testing.assert_array_equal(actual[1], held[1])
+                    world.step()
+                    world.reset()
+                    for f, seed in zip(fields, initial):
+                        np.testing.assert_array_equal(world.download_field(f).reshape(2, -1), seed)
+                    invalid = initial[1].copy()
+                    invalid[0, 0] = 0.0
+                    world.upload_field(fields[1], invalid.ravel())
+                    world.step()
+                    status = world.download_field(nuka.ENV_STATUS)
+                    assert status[0] & nuka.ENV_STATUS_CONSTITUTIVE_FAILURE
+                    assert status[1] == 0
+                    np.testing.assert_array_equal(world.download_field(fields[1])[:9], invalid[0, :9])
+                    assert world.download_field(fields[2])[0] == 0.0
+                    world.reset()
+                    assert not np.any(world.download_field(nuka.ENV_STATUS))
+            finally:
+                if source is not builder:
+                    source.destroy()
+    for original, reloaded in zip(*states):
+        np.testing.assert_array_equal(original, reloaded)
+    with pytest.raises(ValueError):
+        Soft.ElastoPlastic(yield_stress=200.0, poisson=0.5)
+    with nuka.SceneBuilder.create() as builder:
+        with pytest.raises(RuntimeError):
+            builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
+                              mpm_model_kind=5.0, mpm_youngs=30000.0, mpm_density=1000.0)
