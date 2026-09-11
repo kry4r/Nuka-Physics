@@ -2436,6 +2436,27 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_render_world_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
+    add_executable(nuka_elastoplastic_compression_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/elastoplastic_compression_demo.cpp)
+    add_dependencies(nuka_elastoplastic_compression_demo nuka_codegen)
+    target_include_directories(nuka_elastoplastic_compression_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_elastoplastic_compression_demo PRIVATE
+        nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
+        nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
+        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+
+    add_executable(nuka_elastoplastic_bunny_demo
+        ${CMAKE_SOURCE_DIR}/examples/demo/elastoplastic_bunny_demo.cpp)
+    add_dependencies(nuka_elastoplastic_bunny_demo nuka_codegen)
+    target_compile_definitions(nuka_elastoplastic_bunny_demo PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(nuka_elastoplastic_bunny_demo
+        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+    target_link_libraries(nuka_elastoplastic_bunny_demo PRIVATE
+        nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
+        nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
+        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+
     # --- Offline RHI replay gate: the host render layer (nuka_rhi) over the
     # PHI-unified tracer must add ZERO numeric change vs driving RtBackendI
     # directly. Renders one RenderWorld both ways with a Beauty profile and

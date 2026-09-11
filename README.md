@@ -42,16 +42,30 @@
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots crossing procedural terrain"></a>
-  <br><b>Go2 Terrain</b>
-  <br>RL locomotion · Procedural terrain
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4"><img src="docs/media/nuka_go2_backflip.gif" width="100%" alt="Go2 performing a double backflip in Nuka"></a>
+  <br><b>Go2 Double Backflip</b>
+  <br>TorchScript policy inference
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4"><img src="docs/media/go2_cloth_drape.gif" width="100%" alt="Cloth draping over a Go2 quadruped"></a>
-  <br><b>Cloth × Go2</b>
-  <br>Two-way body-particle coupling
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4"><img src="docs/media/nuka_go2_front_handstand.gif" width="100%" alt="Go2 performing a handstand in Nuka"></a>
+  <br><b>Go2 Handstand</b>
+  <br>TorchScript policy inference
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4">1080p video</a>
+</td>
+</tr>
+<tr>
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4"><img src="docs/media/elastoplastic_compression.gif" width="100%" alt="MLS-MPM material recovering from light compression and retaining plastic deformation after strong compression"></a>
+  <br><b>Elastoplastic Compression</b>
+  <br>Elastic recovery · Permanent deformation
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4">Full video</a> · <a href="examples/demo/README.md#elastoplastic-compression">Run demo</a>
+</td>
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4"><img src="docs/media/elastoplastic_bunny.gif" width="100%" alt="A freely falling Stanford bunny indenting an MLS-MPM elastoplastic block"></a>
+  <br><b>Bunny × Elastoplastic</b>
+  <br>Free fall · Plastic indentation
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4">Full video</a> · <a href="examples/demo/README.md#bunny-elastoplastic-impact">Run demo</a>
 </td>
 </tr>
 <tr>
@@ -70,16 +84,16 @@
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4"><img src="docs/media/nuka_go2_backflip.gif" width="100%" alt="Go2 performing a double backflip in Nuka"></a>
-  <br><b>Go2 Double Backflip</b>
-  <br>TorchScript policy inference
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots crossing procedural terrain"></a>
+  <br><b>Go2 Terrain</b>
+  <br>RL locomotion · Procedural terrain
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4"><img src="docs/media/nuka_go2_front_handstand.gif" width="100%" alt="Go2 performing a handstand in Nuka"></a>
-  <br><b>Go2 Handstand</b>
-  <br>TorchScript policy inference
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4"><img src="docs/media/go2_cloth_drape.gif" width="100%" alt="Cloth draping over a Go2 quadruped"></a>
+  <br><b>Cloth × Go2</b>
+  <br>Two-way body-particle coupling
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">1080p video</a>
 </td>
 </tr>
 </table>
