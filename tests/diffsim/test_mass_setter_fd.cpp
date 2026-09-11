@@ -104,11 +104,12 @@ struct TapeGuard {
 // Single-env articulated world from go2_stand (FIXED base). Gravity is the
 // engine default (-9.81); a fixed base has no orientation channel so the adjoint
 // is exact under gravity.
-nuka_result_t CreateStandWorld(nuka_device_handle device, nuka_world_handle* out) {
+nuka_result_t CreateStandWorld(nuka_device_handle device, nuka_world_handle* out,
+                              uint32_t env_count = 1u) {
     const std::string scene = Go2StandScenePath();
     nuka_world_desc_t desc{};
     desc.scene_path = scene.c_str();
-    desc.env_count = 1u;
+    desc.env_count = env_count;
     desc.fixed_dt = 0.005f;
     return nuka_world_create_from_scene(device, &desc, out);
 }
@@ -283,7 +284,7 @@ TEST(MassSetterFD, ParameterizationMatchesAdjointDiDMass) {
     DeviceGuard device;
     ASSERT_NE(device.handle, nullptr);
     WorldGuard world;
-    ASSERT_EQ(CreateStandWorld(device.handle, &world.handle), NUKA_RESULT_OK);
+    ASSERT_EQ(CreateStandWorld(device.handle, &world.handle, 3u), NUKA_RESULT_OK);
 
     const auto params = HostMassParams(world.handle);
     const uint32_t n = static_cast<uint32_t>(params.size());
@@ -314,6 +315,15 @@ TEST(MassSetterFD, ParameterizationMatchesAdjointDiDMass) {
     }
     EXPECT_EQ(inertia_mismatches, 0u)
         << "set_link_mass device inertia != MakeSpatialInertia(m', diag, frame)";
+    for (uint32_t env = 1u; env < 3u; ++env) {
+        const auto replicated = DownloadInertia(world.handle, env * n + static_cast<uint32_t>(link));
+        EXPECT_EQ(0, std::memcmp(&replicated, &want, sizeof(want)));
+    }
+    const auto* record = nuka::c_abi::WorldTable().Get(world.handle);
+    const auto& model_inertia = record->world->GetModel().articulation.link_inertia_spatial;
+    EXPECT_EQ(0, std::memcmp(model_inertia.data() + size_t(link) * (sizeof(want) / sizeof(float)),
+                             &want, sizeof(want)));
+    EXPECT_EQ(HostMassParams(world.handle)[link].mass, m_new);
 
     // 2. Central slope (I(m+e)-I(m-e))/(2e) == BuildSpatialInertiaMassJacobian
     //    slice. The Jacobian is mass-independent (affine), so the slope equals it

@@ -82,11 +82,11 @@ struct TapeGuard {
 // Single-env articulated world (env_count == 1 uploads the articulation_device
 // the tape binds to; the differentiable forward is independent of the stepper).
 nuka_result_t CreateFloatWorld(nuka_device_handle device,
-                               nuka_world_handle* out) {
+                               nuka_world_handle* out, uint32_t env_count = 1u) {
     const std::string scene = Go2FloatScenePath();
     nuka_world_desc_t desc{};
     desc.scene_path = scene.c_str();
-    desc.env_count = 1u;
+    desc.env_count = env_count;
     desc.fixed_dt = 0.005f;
     return nuka_world_create_from_scene(device, &desc, out);
 }
@@ -200,6 +200,32 @@ TEST(DiffsimTapeCAbi, BackwardBitIdenticalAcrossTwoRuns) {
                 r1.size());
     EXPECT_EQ(mismatches, 0u)
         << "C-ABI tape backward not bit-identical across two runs";
+}
+
+TEST(DiffsimTapeCAbi, RejectsDestroyedWorldAndUnsupportedReplication) {
+    if (!Go2FloatSceneAvailable()) GTEST_SKIP() << "go2_float scene is not available";
+    DeviceGuard device;
+    WorldGuard world;
+    ASSERT_EQ(CreateFloatWorld(device.handle, &world.handle), NUKA_RESULT_OK);
+    nuka_tape_desc_t desc{};
+    desc.checkpoint_interval = 1u;
+    desc.max_tape_entries = 8u;
+    desc.max_checkpoints = 8u;
+    desc.recompute_on_backward = 1u;
+    TapeGuard tape;
+    ASSERT_EQ(nuka_tape_create(world.handle, &desc, &tape.handle), NUKA_RESULT_OK);
+    ASSERT_EQ(nuka_world_step_with_tape(world.handle, tape.handle), NUKA_RESULT_OK);
+    nuka_world_destroy(world.handle);
+    world.handle = nullptr;
+    std::vector<float> gradient(nuka_tape_link_count(tape.handle));
+    EXPECT_EQ(nuka_tape_backward(tape.handle, nullptr, gradient.data(), nullptr), NUKA_RESULT_NULL_HANDLE);
+    nuka_buffer_view_t view{};
+    EXPECT_EQ(nuka_tape_state_view(tape.handle, NUKA_FIELD_JOINT_POSITION, &view), NUKA_RESULT_NULL_HANDLE);
+    EXPECT_EQ(view.device_ptr, nullptr);
+    ASSERT_EQ(CreateFloatWorld(device.handle, &world.handle, 2u), NUKA_RESULT_OK);
+    nuka_tape_handle unsupported = nullptr;
+    EXPECT_EQ(nuka_tape_create(world.handle, &desc, &unsupported), NUKA_RESULT_NOT_SUPPORTED);
+    EXPECT_EQ(unsupported, nullptr);
 }
 
 // v0.7 p01: sparse-solver backend selection C ABI round-trip + validation.
