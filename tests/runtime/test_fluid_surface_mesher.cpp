@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <map>
 #include <utility>
 #include <vector>
@@ -171,26 +172,30 @@ void PrintStats(const char* label, const MeshStats& s) {
 TEST(FluidSurfaceMesher, DeterministicByteIdentical) {
     const float spacing = 0.05f;
     const std::vector<Vec3> pool = SettledPool(8, 8, 6, spacing, {0.0f, 0.0f, 0.0f});
-    const FluidSurfaceParams p = PoolParams(pool, spacing);
-
-    const MeshGeometry a = MarchFluidSurface(pool, p);
-    const MeshGeometry b = MarchFluidSurface(pool, p);
-
-    PrintStats("determinism", Analyze(a));
-    ASSERT_GT(a.VertexCount(), 0u);
-    ASSERT_GT(a.TriangleCount(), 0u);
-
-    ASSERT_EQ(a.positions.size(), b.positions.size());
-    ASSERT_EQ(a.indices.size(), b.indices.size());
-    ASSERT_EQ(a.normals.size(), b.normals.size());
-    EXPECT_EQ(0, std::memcmp(a.positions.data(), b.positions.data(),
-                             a.positions.size() * sizeof(float)));
-    EXPECT_EQ(0, std::memcmp(a.indices.data(), b.indices.data(),
-                             a.indices.size() * sizeof(uint32_t)));
-    EXPECT_EQ(0, std::memcmp(a.normals.data(), b.normals.data(),
-                             a.normals.size() * sizeof(float)));
-    std::printf("    memcmp(positions/indices/normals) all == 0 (byte-identical)\n");
-    EXPECT_TRUE(a.uvs.empty());
+    for (bool anisotropic : {false, true}) {
+        SCOPED_TRACE(anisotropic);
+        FluidSurfaceParams p = PoolParams(pool, spacing);
+        p.anisotropic = anisotropic;
+        p.aniso_ks = 1.0f / (p.h * p.h);
+        const MeshGeometry expected = MarchFluidSurface(pool, p);
+        auto first = std::async(std::launch::async, [&] { return MarchFluidSurface(pool, p); });
+        auto second = std::async(std::launch::async, [&] { return MarchFluidSurface(pool, p); });
+        PrintStats("determinism", Analyze(expected));
+        ASSERT_GT(expected.VertexCount(), 0u);
+        ASSERT_GT(expected.TriangleCount(), 0u);
+        for (const MeshGeometry& actual : {first.get(), second.get()}) {
+            ASSERT_EQ(expected.positions.size(), actual.positions.size());
+            ASSERT_EQ(expected.indices.size(), actual.indices.size());
+            ASSERT_EQ(expected.normals.size(), actual.normals.size());
+            EXPECT_EQ(0, std::memcmp(expected.positions.data(), actual.positions.data(),
+                                     expected.positions.size() * sizeof(float)));
+            EXPECT_EQ(0, std::memcmp(expected.indices.data(), actual.indices.data(),
+                                     expected.indices.size() * sizeof(uint32_t)));
+            EXPECT_EQ(0, std::memcmp(expected.normals.data(), actual.normals.data(),
+                                     expected.normals.size() * sizeof(float)));
+            EXPECT_TRUE(actual.uvs.empty());
+        }
+    }
 }
 
 TEST(FluidSurfaceMesher, WatertightClosedBody) {

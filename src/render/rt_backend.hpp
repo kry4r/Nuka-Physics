@@ -91,6 +91,10 @@ public:
     // handle owned by this backend (free with FreeScene). nullptr on failure.
     virtual RtSceneHandle* BuildScene(const rt::TwoLevelScene& scene) = 0;
 
+    // Refresh geometry and appearance while preserving reusable scene resources.
+    // Mesh changes invalidate external references to the corresponding BLAS.
+    virtual void UpdateScene(RtSceneHandle* handle, const rt::TwoLevelScene& scene) = 0;
+
     // Rebuild the per-frame TLAS over scene.instances' CURRENT transforms and write
     // the requested AOVs into the caller's device buffers IN PLACE on the selected
     // backend's stream (no host round-trip); `handle` must have the SAME meshes.

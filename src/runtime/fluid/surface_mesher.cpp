@@ -9,6 +9,7 @@
 
 #include "runtime/fluid/surface_mesher.hpp"
 
+#include "core/parallel_for.hpp"
 #include "import/cooker/fluid_cooker_types.hpp"  // Poly6FromR2Host / Poly6GradientHost
 
 #include <algorithm>
@@ -494,7 +495,7 @@ std::vector<AnisoKernel> BuildAnisoKernels(const std::vector<math::Vec3>& pts,
 
     // Eq. 6: Laplacian position pre-smooth -> kernel centers x-bar.
     std::vector<math::Vec3> centers(n);
-    for (size_t i = 0; i < n; ++i) {
+    core::ParallelFor(n, [&](size_t i) {
         const math::Vec3 xi = pts[i];
         math::Vec3 sum{0, 0, 0}; float wsum = 0.0f;
         gather(xi, [&](uint32_t j) {
@@ -505,10 +506,10 @@ std::vector<AnisoKernel> BuildAnisoKernels(const std::vector<math::Vec3>& pts,
         });
         const math::Vec3 mean = wsum > 0.0f ? sum * (1.0f / wsum) : xi;
         centers[i] = xi * (1.0f - p.aniso_lambda) + mean * p.aniso_lambda;
-    }
+    });
 
     std::vector<AnisoKernel> out(n);
-    for (size_t i = 0; i < n; ++i) {
+    core::ParallelFor(n, [&](size_t i) {
         const math::Vec3 xi = pts[i];
         // Eq. 10: weighted mean position of the neighborhood.
         math::Vec3 mean{0, 0, 0}; float wsum = 0.0f; uint32_t cnt = 0u;
@@ -539,7 +540,7 @@ std::vector<AnisoKernel> BuildAnisoKernels(const std::vector<math::Vec3>& pts,
             const float s = p.aniso_kn / h;
             ak.g[0] = ak.g[1] = ak.g[2] = s; ak.g[3] = ak.g[4] = ak.g[5] = 0.0f;
             ak.det = s * s * s;
-            out[i] = ak; continue;
+            out[i] = ak; return;
         }
         for (float& c : cov) c /= cwsum;
         float w[3], V[9];
@@ -568,7 +569,7 @@ std::vector<AnisoKernel> BuildAnisoKernels(const std::vector<math::Vec3>& pts,
         // det(G) = (1/h)^3 / (sigma1 sigma2 sigma3) (R orthonormal).
         ak.det = (inv_h * inv_h * inv_h) / (sigma[0] * sigma[1] * sigma[2]);
         out[i] = ak;
-    }
+    });
     return out;
 }
 
@@ -657,7 +658,7 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
         // `iso_fraction` keeps its meaning regardless of k_s units: sample the field
         // at every smoothed kernel center and take a robust upper percentile as rho0.
         std::vector<float> rho_at(n, 0.0f);
-        for (size_t i = 0; i < n; ++i) rho_at[i] = density(ker[i].center);
+        core::ParallelFor(n, [&](size_t i) { rho_at[i] = density(ker[i].center); });
         std::sort(rho_at.begin(), rho_at.end());
         const float rho0 = rho_at[(rho_at.size() * 90u) / 100u];
         iso = p.iso_fraction * rho0;
@@ -689,13 +690,12 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
         return (static_cast<size_t>(k) * sy + j) * sx + i;
     };
     std::vector<float> field(static_cast<size_t>(sx) * sy * sz, 0.0f);
-    for (int k = 0; k < sz; ++k) {
-        for (int j = 0; j < sy; ++j) {
-            for (int i = 0; i < sx; ++i) {
-                field[sidx(i, j, k)] = density(sample_pos(i, j, k));
-            }
-        }
-    }
+    core::ParallelFor(field.size(), [&](size_t index) {
+        const int i = static_cast<int>(index % sx);
+        const int j = static_cast<int>((index / sx) % sy);
+        const int k = static_cast<int>(index / (static_cast<size_t>(sx) * sy));
+        field[index] = density(sample_pos(i, j, k));
+    });
 
     // Edge-keyed vertex dedup. The key is the canonical grid-edge id (its lower
     // corner + axis); an ordered map keeps first-seen indices deterministic.
@@ -743,19 +743,6 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
         out.positions.push_back(vp.x);
         out.positions.push_back(vp.y);
         out.positions.push_back(vp.z);
-        // Outward normal = -grad(density) (toward decreasing density); fall back to
-        // +Z if the gradient is degenerate so the shader never normalizes zero.
-        const math::Vec3 grad = gradient(vp);
-        math::Vec3 nrm{-grad.x, -grad.y, -grad.z};
-        const float nl = std::sqrt(nrm.Dot(nrm));
-        if (nl > 1e-12f) {
-            nrm.x /= nl; nrm.y /= nl; nrm.z /= nl;
-        } else {
-            nrm = math::Vec3{0.0f, 0.0f, 1.0f};
-        }
-        out.normals.push_back(nrm.x);
-        out.normals.push_back(nrm.y);
-        out.normals.push_back(nrm.z);
         edge_vert.emplace(key, vid);
         return vid;
     };
@@ -784,18 +771,6 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
                     uint32_t a = static_cast<uint32_t>(edge_vid[kTriTable[code][t + 0]]);
                     uint32_t b = static_cast<uint32_t>(edge_vid[kTriTable[code][t + 1]]);
                     uint32_t c = static_cast<uint32_t>(edge_vid[kTriTable[code][t + 2]]);
-                    // Orient by the density gradient (outward = -grad) at the centroid
-                    // so winding is consistent regardless of the table's convention.
-                    const math::Vec3 pa{out.positions[a * 3], out.positions[a * 3 + 1], out.positions[a * 3 + 2]};
-                    const math::Vec3 pb{out.positions[b * 3], out.positions[b * 3 + 1], out.positions[b * 3 + 2]};
-                    const math::Vec3 pc{out.positions[c * 3], out.positions[c * 3 + 1], out.positions[c * 3 + 2]};
-                    const math::Vec3 gn = (pb - pa).Cross(pc - pa);
-                    const math::Vec3 ctr{(pa.x + pb.x + pc.x) / 3.0f, (pa.y + pb.y + pc.y) / 3.0f,
-                                         (pa.z + pb.z + pc.z) / 3.0f};
-                    const math::Vec3 grad = gradient(ctr);
-                    if (gn.Dot(math::Vec3{-grad.x, -grad.y, -grad.z}) < 0.0f) {
-                        std::swap(b, c);  // flip to outward winding.
-                    }
                     out.indices.push_back(a);
                     out.indices.push_back(b);
                     out.indices.push_back(c);
@@ -803,6 +778,35 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
             }
         }
     }
+    out.normals.resize(out.positions.size());
+    core::ParallelFor(out.positions.size() / 3u, [&](size_t vertex) {
+        const size_t at = vertex * 3u;
+        const math::Vec3 position{out.positions[at], out.positions[at + 1u], out.positions[at + 2u]};
+        const math::Vec3 grad = gradient(position);
+        math::Vec3 normal{-grad.x, -grad.y, -grad.z};
+        const float length = std::sqrt(normal.Dot(normal));
+        if (length > 1e-12f) {
+            normal.x /= length; normal.y /= length; normal.z /= length;
+        } else {
+            normal = math::Vec3{0.0f, 0.0f, 1.0f};
+        }
+        out.normals[at] = normal.x;
+        out.normals[at + 1u] = normal.y;
+        out.normals[at + 2u] = normal.z;
+    });
+    core::ParallelFor(out.indices.size() / 3u, [&](size_t triangle) {
+        const size_t at = triangle * 3u;
+        const uint32_t a = out.indices[at], b = out.indices[at + 1u], c = out.indices[at + 2u];
+        const math::Vec3 pa{out.positions[a * 3u], out.positions[a * 3u + 1u], out.positions[a * 3u + 2u]};
+        const math::Vec3 pb{out.positions[b * 3u], out.positions[b * 3u + 1u], out.positions[b * 3u + 2u]};
+        const math::Vec3 pc{out.positions[c * 3u], out.positions[c * 3u + 1u], out.positions[c * 3u + 2u]};
+        const math::Vec3 normal = (pb - pa).Cross(pc - pa);
+        const math::Vec3 center{(pa.x + pb.x + pc.x) / 3.0f, (pa.y + pb.y + pc.y) / 3.0f,
+                                (pa.z + pb.z + pc.z) / 3.0f};
+        const math::Vec3 grad = gradient(center);
+        if (normal.Dot(math::Vec3{-grad.x, -grad.y, -grad.z}) < 0.0f)
+            std::swap(out.indices[at + 1u], out.indices[at + 2u]);
+    });
     return out;
 }
 

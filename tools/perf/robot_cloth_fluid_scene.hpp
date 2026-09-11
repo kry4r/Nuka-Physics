@@ -140,28 +140,33 @@ inline cook::PbfCookInput BuildPool(float cx, float cy, float floor_z) {
 }
 
 
+inline nuka::scene::SceneIR RobotScene(const std::filesystem::path& path, bool with_free_body = false) {
+    nuka::scene::SceneIR scene = nuka::import::LoadUsd(path.string());
+    if (with_free_body) {
+        nuka::scene::RigidBodyRecord body;
+        body.name = "free_body";
+        body.mass = 2.0f;
+        body.inertia = {0.03f, 0.05f, 0.07f};
+        body.local_transform.position = {3.0f, 2.0f, 4.0f};
+        body.inertial_transform.position = {0.01f, -0.015f, 0.02f};
+        nuka::scene::CollisionShapeRecord shape;
+        shape.body_id = scene.AddRigidBody(body);
+        shape.type = nuka::scene::ShapeType::Sphere;
+        shape.radius = 0.05f;
+        scene.AddCollisionShape(shape);
+    }
+    return scene;
+}
+
 inline nk::Model CookRobot(const std::filesystem::path& path, bool with_free_body = false) {
     cook::CookToModelOptions opt;
     opt.contact_family = cook::CookContactFamily::PairDriven;
-        nuka::scene::SceneIR s = nuka::import::LoadUsd(path.string());
-        if (with_free_body) {
-            nuka::scene::RigidBodyRecord body;
-            body.name = "free_body";
-            body.mass = 2.0f;
-            body.inertia = {0.03f, 0.05f, 0.07f};
-            body.local_transform.position = {3.0f, 2.0f, 4.0f};
-            body.inertial_transform.position = {0.01f, -0.015f, 0.02f};
-            nuka::scene::CollisionShapeRecord shape;
-            shape.body_id = s.AddRigidBody(body);
-            shape.type = nuka::scene::ShapeType::Sphere;
-            shape.radius = 0.05f;
-            s.AddCollisionShape(shape);
-        }
-        nk::Model m = cook::CookToModel(s, 1, opt).model;
-        m.capacities.max_contacts_per_env = 32u;
-        m.capacities.max_rows_per_env =
-            m.capacities.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
-        return m;
+    auto scene = RobotScene(path, with_free_body);
+    nk::Model model = cook::CookToModel(scene, 1, opt).model;
+    model.capacities.max_contacts_per_env = 32u;
+    model.capacities.max_rows_per_env =
+        model.capacities.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    return model;
 }
 
 struct PreparedScene {

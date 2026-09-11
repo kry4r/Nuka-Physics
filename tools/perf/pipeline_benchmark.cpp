@@ -12,6 +12,9 @@
 #include <sstream>
 
 #include "phi/backend_cuda/cuda_internal.cuh"
+#include "render/render_world.hpp"
+#include "render/sensor_backend.hpp"
+#include "render/rt_adapter.hpp"
 #include "scene/format/json.hpp"
 
 namespace {
@@ -36,6 +39,9 @@ struct Options {
     uint32_t capacity_scale = 1u;
     uint32_t substeps = 1u;
     uint32_t cloth_nx = fixture::kClothNx;
+    uint32_t render_sensors = 0u, render_width = 256u, render_height = 256u;
+    uint32_t render_samples = 4u, render_shadows = 4u, render_ao = 3u, render_warmup = 32u;
+    std::string render_output;
 };
 
 uint32_t ParseU32(const std::string& value) {
@@ -70,6 +76,14 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--wrench-output") options.wrench_output = value;
         else if (flag == "--capacity-scale") options.capacity_scale = ParseU32(value);
         else if (flag == "--cloth-grid") options.cloth_nx = ParseU32(value);
+        else if (flag == "--render-sensors") options.render_sensors = ParseU32(value);
+        else if (flag == "--render-width") options.render_width = ParseU32(value);
+        else if (flag == "--render-height") options.render_height = ParseU32(value);
+        else if (flag == "--render-samples") options.render_samples = ParseU32(value);
+        else if (flag == "--render-shadows") options.render_shadows = ParseU32(value);
+        else if (flag == "--render-ao") options.render_ao = ParseU32(value);
+        else if (flag == "--render-warmup") options.render_warmup = ParseU32(value);
+        else if (flag == "--render-output") options.render_output = value;
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
@@ -77,6 +91,11 @@ Options Parse(int argc, char** argv) {
         uint64_t{options.steps} + options.warmup > std::numeric_limits<uint32_t>::max() ||
         (options.execution != "eager" && options.execution != "graph"))
         throw std::invalid_argument("invalid benchmark configuration");
+    if (options.render_sensors != 0u && (options.render_width == 0u || options.render_height == 0u ||
+        options.render_width > 65535u || options.render_height > 65535u || options.render_samples == 0u ||
+        uint64_t{options.envs} * options.render_sensors >
+            std::numeric_limits<uint32_t>::max() / options.render_width / options.render_height))
+        throw std::invalid_argument("invalid render configuration");
     return options;
 }
 
@@ -429,6 +448,198 @@ Json IslandWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
     return result;
 }
 
+class PipelineSensor {
+public:
+    PipelineSensor(const fixture::PreparedScene& prepared, const Options& options) : options_(options) {
+        auto scene = fixture::RobotScene(prepared.path, true);
+        nuka::scene::cook::CookToModelOptions cook_options;
+        cook_options.contact_family = nuka::scene::cook::CookContactFamily::PairDriven;
+        const auto cooked = nuka::scene::cook::CookToModel(scene, 1, cook_options);
+        const auto world = nuka::render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
+        nuka::render::SensorSceneDesc desc;
+        desc.scene = nuka::render::RenderWorldToTwoLevelScene(world);
+        fixture::Require(!world.instances.empty(), "no sensor geometry");
+        for (const auto& instance : world.instances) {
+            phi::InstanceScatterRow row;
+            row.kind = static_cast<uint32_t>(instance.pose_source.kind);
+            row.row = instance.pose_source.row;
+            const auto& pose = instance.cached_visual_local;
+            const float values[] = {pose.position.x, pose.position.y, pose.position.z,
+                                    pose.rotation.w, pose.rotation.x, pose.rotation.y, pose.rotation.z};
+            std::copy(std::begin(values), std::end(values), row.cached_visual_local);
+            desc.rows.push_back(row);
+            desc.blas_id.push_back(instance.mesh_id);
+            desc.material_id.push_back(instance.render_material_id < world.materials.size()
+                ? instance.render_material_id : static_cast<uint32_t>(desc.scene.materials.size() - 1u));
+        }
+        for (uint32_t camera = 0u; camera < options_.render_sensors; ++camera) {
+            nuka::scene::SensorDesc sensor;
+            sensor.type = nuka::scene::SensorType::Camera;
+            sensor.mount = nuka::scene::MountFrame::Base;
+            const auto yaw = nuka::math::Quat::FromAxisAngle({0, 0, 1},
+                6.28318530718f * static_cast<float>(camera) / static_cast<float>(options_.render_sensors));
+            sensor.local_offset.position = yaw.Rotate({0.0f, -1.25f, 0.65f});
+            sensor.local_offset.rotation = yaw * nuka::math::Quat::FromAxisAngle({1, 0, 0}, std::atan2(1.25f, 0.65f));
+            sensor.cam.width = static_cast<uint16_t>(options_.render_width);
+            sensor.cam.height = static_cast<uint16_t>(options_.render_height);
+            sensor.cam.vfov_degrees = 50.0f;
+            desc.sensors.push_back(sensor);
+        }
+        backend_ = nuka::render::CreateCudaSensorBackend();
+        fixture::Require(backend_ != nullptr, "sensor backend unavailable");
+        handle_ = backend_->BuildSensorScene(desc);
+        fixture::Require(handle_ != nullptr, "sensor scene build failed");
+        nuka::rt::SensorFidelityConfig fidelity;
+        fidelity.spp = options_.render_samples;
+        fidelity.shadow_samples = options_.render_shadows;
+        fidelity.ao_samples = options_.render_ao;
+        fidelity.ao_enabled = options_.render_ao != 0u;
+        fidelity.seed = options_.seed;
+        try {
+            backend_->SetSensorFidelity(handle_, fidelity);
+        } catch (...) {
+            backend_->FreeSensorScene(handle_);
+            handle_ = nullptr;
+            throw;
+        }
+    }
+    ~PipelineSensor() { if (handle_) backend_->FreeSensorScene(handle_); }
+    void Render(nk::World& world) {
+        phi::ScatterFkSource fk;
+        fk.link_pose = world.FieldPtr(nk::FieldId::LinkPose);
+        fk.body_pose = world.FieldPtr(nk::FieldId::BodyPose);
+        fk.base_pose = world.FieldPtr(nk::FieldId::BasePose);
+        fk.links_per_env = world.GetModel().capacities.links_per_env;
+        fk.bodies_per_env = world.GetModel().capacities.bodies_per_env;
+        fk.world_backend = world.Backend();
+        backend_->RenderSensors(handle_, fk, options_.envs, options_.render_width, options_.render_height);
+    }
+    std::vector<uint8_t> Output() const {
+        const size_t pixels = size_t{options_.envs} * options_.render_sensors * options_.render_width * options_.render_height;
+        std::vector<uint8_t> output;
+        auto append = [&](const void* source, size_t bytes) {
+            fixture::Require(source != nullptr, "missing sensor output");
+            const size_t offset = output.size();
+            output.resize(offset + bytes);
+            CheckCuda(cudaMemcpy(output.data() + offset, source, bytes, cudaMemcpyDeviceToHost));
+        };
+        append(backend_->SensorColorDevice(handle_), pixels * 3u * sizeof(float));
+        append(backend_->SensorDepthDevice(handle_), pixels * sizeof(float));
+        append(backend_->SensorNormalDevice(handle_), pixels * 3u * sizeof(float));
+        append(backend_->SensorAlbedoDevice(handle_), pixels * 3u * sizeof(float));
+        append(backend_->SensorPrimDevice(handle_), pixels * sizeof(uint32_t));
+        return output;
+    }
+private:
+    const Options& options_;
+    std::unique_ptr<nuka::render::SensorBackendI> backend_;
+    nuka::render::SensorSceneHandle* handle_ = nullptr;
+};
+
+Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared,
+                        const Options& options, const std::vector<uint8_t>& expected_state) {
+    struct ActiveBackendScope {
+        phi::Backend* previous = phi::ActiveBackend();
+        ~ActiveBackendScope() { phi::SetActiveBackend(previous); }
+    } active_scope;
+    phi::SetActiveBackend(world.Backend());
+    const auto stream = phi::CudaBackendMainStream(reinterpret_cast<phi::CudaBackend*>(world.Backend()));
+    size_t free_before = 0u, total_bytes = 0u;
+    CheckCuda(cudaMemGetInfo(&free_before, &total_bytes));
+    const auto create_start = Clock::now();
+    PipelineSensor renderer(prepared, options);
+    const double creation_ms = Milliseconds(create_start);
+    fixture::Require(world.Reset() == phi::Status::Ok, "render replay reset failed");
+    for (uint32_t i = 0u; i < options.warmup; ++i) Step(world, options);
+    CheckCuda(cudaStreamSynchronize(stream));
+    for (uint32_t i = 0u; i < options.render_warmup; ++i) renderer.Render(world);
+    const auto measure = [&](bool coupled) {
+        Events events(size_t{options.steps} * 3u);
+        std::vector<double> physics, render, completion, wall;
+        CheckCuda(cudaStreamSynchronize(stream));
+        const auto batch_start = Clock::now();
+        for (uint32_t i = 0u; i < options.steps; ++i) {
+            const auto start = Clock::now();
+            CheckCuda(cudaEventRecord(events.events[size_t{i} * 3u], stream));
+            if (coupled) Step(world, options);
+            CheckCuda(cudaEventRecord(events.events[size_t{i} * 3u + 1u], stream));
+            renderer.Render(world);
+            CheckCuda(cudaEventRecord(events.events[size_t{i} * 3u + 2u], stream));
+            wall.push_back(Milliseconds(start) * 1000.0);
+        }
+        CheckCuda(cudaEventSynchronize(events.events.back()));
+        const double wall_ms = Milliseconds(batch_start);
+        for (uint32_t i = 0u; i < options.steps; ++i) {
+            float p = 0.0f, r = 0.0f, c = 0.0f;
+            CheckCuda(cudaEventElapsedTime(&p, events.events[size_t{i} * 3u], events.events[size_t{i} * 3u + 1u]));
+            CheckCuda(cudaEventElapsedTime(&r, events.events[size_t{i} * 3u + 1u], events.events[size_t{i} * 3u + 2u]));
+            CheckCuda(cudaEventElapsedTime(&c, events.events[size_t{i} * 3u], events.events[size_t{i} * 3u + 2u]));
+            physics.push_back(p * 1000.0); render.push_back(r * 1000.0); completion.push_back(c * 1000.0);
+        }
+        Json result = Json::Object();
+        if (coupled) result.Set("physics_gpu", Distribution(std::move(physics)));
+        result.Set("render_gpu", Distribution(std::move(render)));
+        result.Set("completion_gpu", Distribution(std::move(completion)));
+        result.Set("host_submission", Distribution(std::move(wall)));
+        result.Set("synchronized_wall_ms", Json::Float(wall_ms));
+        result.Set("synchronized_wall_mean_us", Json::Float(wall_ms * 1000.0 / options.steps));
+        return result;
+    };
+    Json result = Json::Object(), config = Json::Object();
+    result.Set("creation_ms", Json::Float(creation_ms));
+    result.Set("physics_to_sensor", measure(true));
+    const bool coupled_state_equal = State(world) == expected_state;
+    const auto coupled_output = renderer.Output();
+    for (uint32_t i = 0u; i < options.render_warmup; ++i) renderer.Render(world);
+    result.Set("render_only", measure(false));
+    const auto output = renderer.Output();
+    const bool repeated_output_equal = output == coupled_output;
+    const bool render_state_equal = State(world) == expected_state;
+    const size_t pixels = size_t{options.envs} * options.render_sensors * options.render_width * options.render_height;
+    uint64_t hits = 0u;
+    bool finite = true;
+    for (size_t i = 0u; i < pixels * 10u; ++i) {
+        float value;
+        std::memcpy(&value, output.data() + i * sizeof(float), sizeof(float));
+        if (i >= pixels * 3u && i < pixels * 4u) finite &= std::isfinite(value) || value == std::numeric_limits<float>::infinity();
+        else finite &= std::isfinite(value);
+    }
+    for (size_t i = 0u; i < pixels; ++i) {
+        uint32_t prim;
+        std::memcpy(&prim, output.data() + (pixels * 10u + i) * sizeof(uint32_t), sizeof(uint32_t));
+        if (prim != ~0u) ++hits;
+    }
+    if (!options.render_output.empty()) {
+        std::ofstream file(options.render_output, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(output.data()), output.size());
+        fixture::Require(file.good(), "cannot write sensor output");
+    }
+    size_t free_after = 0u;
+    CheckCuda(cudaMemGetInfo(&free_after, &total_bytes));
+    result.Set("resident_device_delta_bytes", Json::Int(static_cast<int64_t>(free_before) - static_cast<int64_t>(free_after)));
+    result.Set("memory_scope", Json::Str("cudaMemGetInfo resident delta; allocation peak requires separate profiling"));
+    config.Set("cameras_per_env", Json::Int(options.render_sensors));
+    config.Set("width", Json::Int(options.render_width));
+    config.Set("height", Json::Int(options.render_height));
+    config.Set("samples", Json::Int(options.render_samples));
+    config.Set("shadow_samples", Json::Int(options.render_shadows));
+    config.Set("ao_samples", Json::Int(options.render_ao));
+    config.Set("seed", Json::Int(options.seed));
+    config.Set("warmup_frames", Json::Int(options.render_warmup));
+    result.Set("config", std::move(config));
+    result.Set("geometry_scope", Json::Str("authored rigid visuals on the public batched sensor path; deforming particle surfaces are not supported by this path"));
+    result.Set("boundary", Json::Str("physics-to-sensor uses live per-step poses; render-only repeats its final world; both complete all AOVs on device; output download is untimed"));
+    result.Set("output_layout", Json::Str("env-camera-major color f32x3, depth f32, normal f32x3, albedo f32x3, prim u32"));
+    result.Set("output_fnv1a64", Json::Str(Digest(output)));
+    result.Set("hit_pixels", Json::Int(hits));
+    result.Set("finite", Json::Bool(finite));
+    result.Set("coupled_state_equal", Json::Bool(coupled_state_equal));
+    result.Set("render_state_equal", Json::Bool(render_state_equal));
+    result.Set("repeated_output_equal", Json::Bool(repeated_output_equal));
+    result.Set("valid", Json::Bool(finite && hits > 0u && coupled_state_equal && render_state_equal && repeated_output_equal));
+    return result;
+}
+
 Json Run(const Options& options) {
     auto* device = phi::InitBestDevice();
     fixture::Require(device != nullptr, "no physics device");
@@ -643,6 +854,12 @@ Json Run(const Options& options) {
     quality.Set("xpbd_samples", std::move(xpbd_samples));
     quality.Set("xpbd_acceptance", xpbd_acceptance.Report());
     result.Set("quality", std::move(quality));
+    bool render_valid = true;
+    if (options.render_sensors != 0u) {
+        auto render = RenderMeasurements(world, prepared, options, timed_state);
+        render_valid = render.At("valid").AsBool();
+        result.Set("render", std::move(render));
+    }
     Json hardware = Json::Object();
     cudaDeviceProp properties{};
     CheckCuda(cudaGetDeviceProperties(&properties, backend->device_id));
@@ -656,12 +873,13 @@ Json Run(const Options& options) {
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
     const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && timed_state == replay_state &&
-                       cloth_rows > 0u && fluid_rows > 0u && mismatched_envs.empty() && xpbd_acceptance.Valid();
+                       cloth_rows > 0u && fluid_rows > 0u && mismatched_envs.empty() && xpbd_acceptance.Valid() && render_valid;
     validity.Set("valid", Json::Bool(valid));
     Json failures = Json::Array();
     if (!xpbd_acceptance.Valid()) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
     if (cloth_rows == 0u) failures.PushBack(Json::Str("no sampled cloth-articulation contact"));
     if (fluid_rows == 0u) failures.PushBack(Json::Str("no sampled fluid-articulation contact"));
+    if (!render_valid) failures.PushBack(Json::Str("sensor lifecycle, output or physics parity failed"));
     validity.Set("failures", std::move(failures));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));
     unavailable.PushBack(Json::Str("residual, complementarity and detailed penetration observability remain incomplete"));

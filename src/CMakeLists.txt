@@ -137,6 +137,7 @@ set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_recorder.h
 )
 
+find_package(Threads REQUIRED)
 add_library(nuka_render STATIC
     render/render_world.cpp
     # Host image decode (stb_image) -> rt::Texture / rt::EnvironmentMap for the
@@ -288,6 +289,7 @@ target_link_libraries(nuka_render
         Vulkan::Vulkan
     PRIVATE
         nuka_stb
+        Threads::Threads
 )
 
 nuka_set_warnings(nuka_render)
@@ -1529,8 +1531,8 @@ if(CMAKE_CUDA_COMPILER)
     target_include_directories(nuka_pipeline_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_definitions(nuka_pipeline_benchmark PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_link_libraries(nuka_pipeline_benchmark PRIVATE
-        nuka_scene_cook nuka_nk nuka_phi2 nuka_runtime_gpu nuka_runtime
-        nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu nuka_core CUDA::cudart)
+        nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2 nuka_runtime_gpu nuka_runtime
+        nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi CUDA::cudart)
     nuka_set_warnings(nuka_pipeline_benchmark)
 
     # The water demo uses CUDA physics and ray tracing without a Vulkan dependency.

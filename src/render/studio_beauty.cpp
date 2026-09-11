@@ -422,11 +422,9 @@ void StudioRtRenderer::SetBeauty(bool on, uint32_t samples) {
 VulkanOffscreenReport StudioRtRenderer::Render(const RenderWorld& world,
                                                const RasterOptions& options) {
     Impl& im = *impl_;
-    // The surface deforms every frame, so the BLAS is rebuilt over the CURRENT
-    // meshes (offline by design): free the prior handle, rebuild, trace.
-    if (im.backend && im.handle) im.backend->FreeScene(im.handle);
     im.scene = RenderWorldToTwoLevelScene(world);
-    im.handle = im.backend->BuildScene(im.scene);
+    if (im.handle) im.backend->UpdateScene(im.handle, im.scene);
+    else im.handle = im.backend->BuildScene(im.scene);
     im.ApplyLighting(options);
     const rt::PinholeCamera cam = im.CameraFromOptions(options);
     rt::Framebuffer fb;
