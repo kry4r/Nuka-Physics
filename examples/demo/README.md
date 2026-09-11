@@ -1,11 +1,13 @@
 # Demos
 
-Pretrained policies run in Nuka, with video frames captured from the live simulated worlds. The [homepage gallery](../../README.md) links to the complete recordings.
+Pretrained policies and material experiments run in Nuka. Video frames come from live simulated worlds or replay of their saved states. The [homepage gallery](../../README.md) links to the complete recordings.
 
 | Demo | Entry point | Recording |
 |---|---|---|
 | π0.5 inference | [libero_pi05_play.py](libero_pi05_play.py) | [12 s, 1280 × 720](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/pi05_libero.mp4) |
 | G1 Shuffle dance | [g1_dance_play.py](g1_dance_play.py) | [20 s, 960 × 540](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4) |
+| Elastoplastic compression | [elastoplastic_compression_demo.cpp](elastoplastic_compression_demo.cpp) | [24.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4) |
+| Bunny elastoplastic impact | [elastoplastic_bunny_demo.cpp](elastoplastic_bunny_demo.cpp) | [18.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4) |
 
 Run commands from the repository root after the [CUDA build and Python installation](../../README.md#quick-start). Use Python 3.11, a CUDA-compatible PyTorch installation, Pillow, NumPy, and `ffmpeg` on `PATH`. Model weights and source assets stay in the ignored `.nuka-assets/` and `.nuka_cache/` directories; recordings and metrics go to `out/`.
 
@@ -87,6 +89,56 @@ python examples/demo/g1_dance_play.py \
 ```
 
 The entry point creates the NKS/NKA scene bundle and writes `g1_dance.mp4`, `summary.json`, and `metrics.jsonl`. The showcased 20-second run passed the finite-state, upright, and visible-motion checks: minimum root height was 0.688 m, mean joint motion span was 1.145 rad, and mean joint tracking RMSE was 0.213 rad.
+
+## Elastoplastic compression
+
+A single 80 × 80 × 100 mm specimen undergoes light compression, unloading, strong compression, and unloading between prescribed rigid platens. Both loads use the same continuous simulation. Hencky J2 plasticity in the production MLS-MPM solver gives elastic recovery after the light load and permanent deformation after the strong load.
+
+Both material recordings use E = 50 kPa, Poisson ratio 0.30, density 1000 kg/m³, yield stress 12 kPa, and linear hardening 3 kPa. The grid spacing is 5 mm and the particle spacing is 2.5 mm. Physics runs at 7680 Hz; saved states at 120 Hz play at 24 fps, giving **5× slow motion without state interpolation**. The path tracer uses 128 samples per pixel. The line below the specimen shows the contact force history, without labels.
+
+```bash
+cmake --build build-cuda128 --target \
+  nuka_elastoplastic_compression_demo nuka_elastoplastic_bunny_demo -j
+export LD_LIBRARY_PATH="$PWD/build-cuda128/src:${LD_LIBRARY_PATH:-}"
+build-cuda128/tests/nuka_elastoplastic_compression_demo \
+  --no-render --out-dir out/elastoplastic/compression
+build-cuda128/tests/nuka_elastoplastic_compression_demo \
+  --replay out/elastoplastic/compression \
+  --out-dir out/elastoplastic/compression_render \
+  --width 1600 --height 1000 --samples 128 --render-stride 1
+python examples/demo/compose_elastoplastic_compression.py \
+  --capture out/elastoplastic/compression \
+  --frames out/elastoplastic/compression_render/frames \
+  --out-dir out/elastoplastic/compression_video
+```
+
+The capture includes configuration, particle/body states, per-frame physical measurements, and reset results. Composition checks the physical acceptance criteria before encoding, then verifies the decoded video frame count, size, rate, and duration. Use `--analyze-only` to check a capture without rendering. To reproduce timestep and grid comparisons, capture again with `--steps-per-frame 128`, then with `--dx 0.004 --steps-per-frame 128`, and pass both directories as repeated `--compare` arguments. Compare the two runs at 128 steps per frame to isolate the grid change.
+
+The recorded light-load recovery error is 0.0648%; strong loading leaves 33.13% height compression. The [physical report](../../docs/research/2026-09-11-elastoplastic-compression-demo-zh.md) records convergence and energy measurements. The prescribed platens demonstrate material response; they do not validate dynamic gripper coupling.
+
+## Bunny elastoplastic impact
+
+A freely falling 2.5 kg Stanford bunny drops 180 mm onto a 240 × 200 × 60 mm material pad. Rendering, collision, center of mass, and inertia use the same closed triangle mesh. The original Stanford scan has five openings; the asset preparation tool caps its boundary loops and writes a separate mesh plus a hash and mass-properties manifest.
+
+Obtain the [Stanford bunny scan](https://graphics.stanford.edu/data/3Dscanrep/) (`bunny/reconstruction/bun_zipper.ply`) and convert its vertex positions and triangle indices to OBJ without remeshing. Place it at `.nuka-assets/stanford/bunny.obj`. The recorded source has 35,947 vertices and 69,451 triangles; its identity is included in [recording metadata](../../docs/media/demo_recordings.json).
+
+```bash
+python tools/assets/prepare_solid_mesh.py \
+  .nuka-assets/stanford/bunny.obj .nuka-assets/generated/bunny_solid_120mm.obj \
+  --extent 0.12 --y-up
+build-cuda128/tests/nuka_elastoplastic_bunny_demo \
+  --no-render --out-dir out/elastoplastic/bunny
+build-cuda128/tests/nuka_elastoplastic_bunny_demo \
+  --replay out/elastoplastic/bunny \
+  --out-dir out/elastoplastic/bunny_render \
+  --width 1600 --height 1000 --samples 128 --render-stride 1
+python examples/demo/compose_elastoplastic_bunny.py \
+  --capture out/elastoplastic/bunny \
+  --frames out/elastoplastic/bunny_render/frames \
+  --out-dir out/elastoplastic/bunny_video
+```
+
+The bunny remains on the pad, whose center settles 20.82 mm below its initial surface. This is deformation under load. The [physical report](../../docs/research/2026-09-11-elastoplastic-bunny-demo-zh.md) includes timestep/grid comparisons, momentum balance, plastic dissipation, and measured penetration. The current grid contact projects velocity and returns reaction impulses each physics interval; a shared finite-mass solve for multiple contacting owners remains unfinished.
 
 ## Go2 locomotion capture
 
