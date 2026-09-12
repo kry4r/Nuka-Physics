@@ -34,7 +34,8 @@ namespace {
 const char* NkOpName(int op) {
     switch (static_cast<NkOp>(op)) {
         case NkOp::ApplyDrives: return "ApplyDrives";
-        case NkOp::ApplyOscDrives: return "ApplyOscDrives";
+        case NkOp::ApplyDynamicsDrives: return "ApplyDynamicsDrives";
+        case NkOp::ReadoutDrives: return "ReadoutDrives";
         case NkOp::AbaForward: return "AbaForward";
         case NkOp::IntegrateVelocity: return "IntegrateVelocity";
         case NkOp::FkWorldPoses: return "FkWorldPoses";

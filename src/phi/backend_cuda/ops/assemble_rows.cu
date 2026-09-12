@@ -854,6 +854,50 @@ __global__ void EmitJointFrictionRowsKernel(
     urows[rs] = row;
 }
 
+// Implicit affine actuator effort is a bounded impulse with J = e_joint.
+__global__ void EmitJointDriveRowsKernel(
+    ArticulationDeviceState state, float dt, uint32_t base_link_count,
+    uint32_t rows_per_env, uint32_t first_row, uint32_t dof_stride,
+    const float* command, const float* dissipation, const float* lower, const float* upper,
+    NkRow* urows, float* lambda, float* chain_jacobian,
+    uint32_t* row_cj_link, uint32_t* row_cj_link_b,
+    float* row_penetration, float* row_damping, uint32_t* row_count) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) return;
+    const uint32_t env = link / base_link_count;
+    const uint32_t local = link - env * base_link_count;
+    const uint32_t slot = env * rows_per_env + first_row + local;
+    NkRow row{};
+    row_cj_link[slot] = row_cj_link_b[slot] = kInvalidLink;
+    row_penetration[slot] = row_damping[slot] = lambda[slot] = 0.0f;
+    float* J = chain_jacobian + static_cast<size_t>(slot) * dof_stride;
+    for (uint32_t d = 0u; d < dof_stride; ++d) J[d] = 0.0f;
+    if (JointDofCountDevice(state.joint_type[link]) == 1u &&
+        (fminf(fmaxf(command[link], lower[link]), upper[link]) != 0.0f || dissipation[link] > 0.0f)) {
+        const uint32_t articulation = state.link_to_articulation[link];
+        const uint32_t offset = state.articulation_link_offset[articulation];
+        const uint32_t dof = LocalDofIndexDevice(state, offset, link);
+        row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kVelocityOnly;
+        row.group_first = slot;
+        row.group_normal_count = 1u;
+        row.env = env;
+        row.a.kind = kNkSideArtic;
+        row.a.index = articulation;
+        J[dof] = 1.0f;
+        if (dissipation[link] > 0.0f) {
+            row.compliance_alpha = 1.0f / (dt * dissipation[link]);
+            row.rhs = command[link] * row.compliance_alpha;
+            row.lower = fmaxf(lower[link] * dt, -kFltMax);
+            row.upper = fminf(upper[link] * dt, kFltMax);
+        } else {
+            const float effort = fminf(fmaxf(command[link], lower[link]), upper[link]);
+            row.lower = row.upper = effort * dt;
+        }
+        atomicAdd(row_count + env, 1u);
+    }
+    urows[slot] = row;
+}
+
 // K4a-B: w_b = M^-1 J_b^T per articulation SIDE-B row . Mirrors
 // ComputeRowMinvJtKernel but gates on row.b.kind and tiles by row.b.index.
 __global__ void ComputeRowMinvJtBKernel(const NkRow* __restrict__ urows,
@@ -1476,6 +1520,17 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.chain_jacobian, data.row_cj_link, data.row_cj_link_b,
                    data.row_penetration, data.row_damping, data.row_count);
+    }
+
+    if (has_artic && p->joint_drive_rows_per_env >= p->base_link_count && p->base_link_count > 0u) {
+        const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
+        const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(EmitJointDriveRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   state, p->dt, p->base_link_count, p->rows_per_env,
+                   p->contact_rows_per_env + p->joint_limit_rows_per_env + p->joint_friction_rows_per_env,
+                   p->max_dof, data.drive_command, data.drive_dissipation, data.drive_lower, data.drive_upper,
+                   reinterpret_cast<NkRow*>(data.urows), data.lambda, data.chain_jacobian,
+                   data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
     }
 
     if (has_artic) {

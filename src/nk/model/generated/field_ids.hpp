@@ -262,9 +262,9 @@ enum class FieldId : uint16_t {
     ActuatorEffort,  // actuator_effort (per:link arena:scratch owner:data flags:[readout])
     ActuatorSaturated,  // actuator_saturated (per:link arena:scratch owner:data flags:[readout])
     PairSortScratch,  // pair_sort_scratch (per:scalar arena:scratch owner:data count:pair_sort_scratch_bytes)
-    TaskTarget,  // task_target (per:env arena:persistent owner:data flags:[param])
-    TaskRotationTarget,  // task_rotation_target (per:env arena:persistent owner:data flags:[param])
-    TaskLocalPose,  // task_local_pose (per:env arena:persistent owner:data flags:[param])
+    TaskTarget,  // task_target (per:articulation arena:persistent owner:data flags:[param])
+    TaskRotationTarget,  // task_rotation_target (per:articulation arena:persistent owner:data flags:[param])
+    TaskLocalPose,  // task_local_pose (per:articulation arena:persistent owner:data flags:[param])
     BodyInertialFrame,  // body_inertial_frame (per:body arena:persistent owner:data flags:[param])
     BodyWorldInvInertia,  // body_world_inv_inertia (per:body arena:scratch owner:data)
     StepQdotFlat,  // step_qdot_flat (per:articulation_dof arena:scratch owner:data)
@@ -322,6 +322,20 @@ enum class FieldId : uint16_t {
     StepMpmBoundaryImpulse,  // step_mpm_boundary_impulse (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count)
     StepMpmBoundaryMoment,  // step_mpm_boundary_moment (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count)
     SolverVelocityScratch,  // solver_velocity_scratch (per:scalar arena:scratch owner:data count:solver_velocity_scratch_bytes)
+    VelocityTarget,  // velocity_target (per:link arena:persistent owner:data flags:[param])
+    AccelerationTarget,  // acceleration_target (per:link arena:persistent owner:data flags:[param])
+    ActuatorNoloadSpeed,  // actuator_noload_speed (per:link arena:persistent owner:data flags:[param])
+    TaskNullspaceStiffness,  // task_nullspace_stiffness (per:articulation arena:persistent owner:data flags:[param])
+    TaskNullspaceDamping,  // task_nullspace_damping (per:articulation arena:persistent owner:data flags:[param])
+    DriveCommand,  // drive_command (per:link arena:scratch owner:data)
+    DriveDissipation,  // drive_dissipation (per:link arena:scratch owner:data)
+    DriveLower,  // drive_lower (per:link arena:scratch owner:data)
+    DriveUpper,  // drive_upper (per:link arena:scratch owner:data)
+    ControlMass,  // control_mass (per:articulation_dof2 arena:scratch owner:data)
+    ControlFactor,  // control_factor (per:articulation_dof2 arena:scratch owner:data)
+    ControlJacobian,  // control_jacobian (per:articulation_dof arena:scratch owner:data elem:6)
+    ControlResponse,  // control_response (per:articulation_dof arena:scratch owner:data elem:6)
+    ControlTaskMap,  // control_task_map (per:articulation_dof arena:scratch owner:data elem:6)
     Count
 };
 
@@ -639,6 +653,20 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "step_mpm_boundary_impulse",
     "step_mpm_boundary_moment",
     "solver_velocity_scratch",
+    "velocity_target",
+    "acceleration_target",
+    "actuator_noload_speed",
+    "task_nullspace_stiffness",
+    "task_nullspace_damping",
+    "drive_command",
+    "drive_dissipation",
+    "drive_lower",
+    "drive_upper",
+    "control_mass",
+    "control_factor",
+    "control_jacobian",
+    "control_response",
+    "control_task_map",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

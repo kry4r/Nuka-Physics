@@ -82,12 +82,14 @@ struct TapeGuard {
 // Single-env articulated world (env_count == 1 uploads the articulation_device
 // the tape binds to; the differentiable forward is independent of the stepper).
 nuka_result_t CreateFloatWorld(nuka_device_handle device,
-                               nuka_world_handle* out, uint32_t env_count = 1u) {
+                               nuka_world_handle* out, uint32_t env_count = 1u,
+                               uint8_t control_mode = 0u) {
     const std::string scene = Go2FloatScenePath();
     nuka_world_desc_t desc{};
     desc.scene_path = scene.c_str();
     desc.env_count = env_count;
     desc.fixed_dt = 0.005f;
+    desc.control_mode = control_mode;
     return nuka_world_create_from_scene(device, &desc, out);
 }
 
@@ -226,6 +228,12 @@ TEST(DiffsimTapeCAbi, RejectsDestroyedWorldAndUnsupportedReplication) {
     nuka_tape_handle unsupported = nullptr;
     EXPECT_EQ(nuka_tape_create(world.handle, &desc, &unsupported), NUKA_RESULT_NOT_SUPPORTED);
     EXPECT_EQ(unsupported, nullptr);
+    for (uint8_t mode = 1u; mode < 6u; ++mode) {
+        WorldGuard controlled;
+        ASSERT_EQ(CreateFloatWorld(device.handle, &controlled.handle, 1u, mode), NUKA_RESULT_OK);
+        EXPECT_EQ(nuka_tape_create(controlled.handle, &desc, &unsupported), NUKA_RESULT_NOT_SUPPORTED);
+        EXPECT_EQ(unsupported, nullptr);
+    }
 }
 
 // v0.7 p01: sparse-solver backend selection C ABI round-trip + validation.

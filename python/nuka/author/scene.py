@@ -50,7 +50,7 @@ _DEFAULT_MEDIA_MATERIAL = {"cloth": _materials.Cloth.XPBD,
 @_dc.dataclass
 class SimOptions:
     """World-level options shared by every entity: the fixed ``dt``, ``env_count``,
-    the ``control_mode`` (0 PD-position, 1 torque), and the static collidable.
+    the six ``control_mode`` values (0 through 5), and the static collidable.
 
     ``contact_family == 1`` bakes a flat heightfield the robot stands on and the
     cloth hem pools onto (``heightfield_terrain_type`` selects its feature set,
@@ -82,6 +82,7 @@ class SimOptions:
     # Bake a per-link SDF from each link's VISUAL mesh so a foot engages the MPM grid
     # BC (rides the true silhouette). Default False keeps every cook byte-identical.
     bake_link_sdf: bool = False
+    osc_task_link: int = 0
 
 
 @_dc.dataclass
@@ -242,7 +243,7 @@ class Scene:
                 "(Earth) gravity; author a Ground/Plane + media to set gravity.")
         kw = dict(
             device=device, env_count=int(o.env_count), dt=float(o.dt),
-            control_mode=int(o.control_mode),
+            control_mode=int(o.control_mode), osc_task_link=int(o.osc_task_link),
             contact_family=int(o.contact_family),
             heightfield_terrain_type=int(o.heightfield_terrain_type),
             solver_vel_iters=int(o.solver_vel_iters),
@@ -328,7 +329,7 @@ class Scene:
             gx, gy, gz = (float(c) for c in o.gravity)
             world = builder.build(
                 device, env_count=int(o.env_count), dt=float(o.dt),
-                control_mode=int(o.control_mode),
+                control_mode=int(o.control_mode), osc_task_link=int(o.osc_task_link),
                 contact_family=int(o.contact_family),
                 heightfield_terrain_type=int(o.heightfield_terrain_type),
                 gravity_x=gx, gravity_y=gy, gravity_z=gz,

@@ -51,6 +51,8 @@ struct ModelCapacities {
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
     uint32_t joint_friction_rows_per_env = 0; // one scalar slot per link when friction is authored
+    uint32_t joint_drive_rows_per_env = 0;
+    bool inverse_dynamics_controls = false;
     uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
     uint32_t max_mesh_triangles   = 0;
     uint32_t max_mesh_bvh_nodes   = 0;

@@ -724,6 +724,9 @@ Json Run(const Options& options) {
     uint32_t status_union = 0u;
     const auto& caps = world.GetModel().capacities;
     std::vector<nk::NkRow> rows_host(size_t{caps.max_rows_per_env} * options.envs);
+    std::vector<float> impulses(rows_host.size());
+    std::vector<double> cloth_impulses(options.envs), fluid_impulses(options.envs);
+    uint32_t last_cloth_contact_step = 0u, last_fluid_contact_step = 0u;
     const size_t wrench_bytes = caps.ElementCount(nk::FieldId::LinkContactWrench) *
                                 nk::LayoutOf(nk::FieldId::LinkContactWrench).elem_size;
     std::vector<float> wrench(wrench_bytes / sizeof(float));
@@ -752,9 +755,27 @@ Json Run(const Options& options) {
         }
         auto xpbd_quality = XpbdQuality(world, i + 1u);
         xpbd_acceptance.Observe(xpbd_quality);
+        fixture::Require(world.GetData().DownloadField(nk::FieldId::Urows, rows_host.data(),
+                         rows_host.size() * sizeof(nk::NkRow)), "row download failed");
+        fixture::Require(world.GetData().DownloadField(nk::FieldId::Lambda, impulses.data(),
+                         impulses.size() * sizeof(float)), "impulse download failed");
+        for (size_t index = 0u; index < rows_host.size(); ++index) {
+            const auto& row = rows_host[index];
+            if (!(row.flags & nk::nk_row_flags::kActive) ||
+                !(row.flags & nk::nk_row_flags::kContactNormal) || impulses[index] <= 0.0f) continue;
+            const auto& particle = row.a.kind == nk::kNkSideParticle ? row.a : row.b;
+            const auto& rigid = row.a.kind == nk::kNkSideParticle ? row.b : row.a;
+            if (particle.kind != nk::kNkSideParticle || rigid.kind != nk::kNkSideArtic) continue;
+            const uint32_t env = particle.index / caps.particles_per_env;
+            if (particle.index % caps.particles_per_env < world.GetModel().particles.n_soft_particles) {
+                cloth_impulses[env] += impulses[index];
+                last_cloth_contact_step = i + 1u;
+            } else {
+                fluid_impulses[env] += impulses[index];
+                last_fluid_contact_step = i + 1u;
+            }
+        }
         if (i >= options.warmup && (i % 25u == 0u || i + 1u == options.warmup + options.steps)) {
-            fixture::Require(world.GetData().DownloadField(nk::FieldId::Urows, rows_host.data(),
-                             rows_host.size() * sizeof(nk::NkRow)), "row download failed");
             workload_samples.PushBack(IslandWorkload(world, rows_host, i + 1u));
             xpbd_samples.PushBack(std::move(xpbd_quality));
             for (const auto& row : rows_host) {
@@ -851,6 +872,21 @@ Json Run(const Options& options) {
     quality.Set("replica_mismatch_envs", std::move(replica_errors));
     quality.Set("cloth_rows_sampled", Json::Int(cloth_rows));
     quality.Set("fluid_rows_sampled", Json::Int(fluid_rows));
+    const auto valid_impulses = [](const std::vector<double>& values) {
+        return std::all_of(values.begin(), values.end(), [](double value) { return value > 0.0 && std::isfinite(value); });
+    };
+    const bool coupling_valid = valid_impulses(cloth_impulses) && valid_impulses(fluid_impulses);
+    Json coupling = Json::Object(), cloth_by_env = Json::Array(), fluid_by_env = Json::Array();
+    for (double value : cloth_impulses) cloth_by_env.PushBack(Json::Float(value));
+    for (double value : fluid_impulses) fluid_by_env.PushBack(Json::Float(value));
+    coupling.Set("scope", Json::Str("every replay step and environment, including warmup; positive normal impulse required for both media"));
+    coupling.Set("cloth_normal_impulse_by_env_Ns", std::move(cloth_by_env));
+    coupling.Set("fluid_normal_impulse_by_env_Ns", std::move(fluid_by_env));
+    coupling.Set("last_cloth_contact_step", Json::Int(last_cloth_contact_step));
+    coupling.Set("last_fluid_contact_step", Json::Int(last_fluid_contact_step));
+    coupling.Set("timed_samples_include_both_media", Json::Bool(cloth_rows > 0u && fluid_rows > 0u));
+    coupling.Set("valid", Json::Bool(coupling_valid));
+    quality.Set("coupling_acceptance", std::move(coupling));
     quality.Set("xpbd_samples", std::move(xpbd_samples));
     quality.Set("xpbd_acceptance", xpbd_acceptance.Report());
     result.Set("quality", std::move(quality));
@@ -873,12 +909,11 @@ Json Run(const Options& options) {
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
     const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && timed_state == replay_state &&
-                       cloth_rows > 0u && fluid_rows > 0u && mismatched_envs.empty() && xpbd_acceptance.Valid() && render_valid;
+                       coupling_valid && mismatched_envs.empty() && xpbd_acceptance.Valid() && render_valid;
     validity.Set("valid", Json::Bool(valid));
     Json failures = Json::Array();
     if (!xpbd_acceptance.Valid()) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
-    if (cloth_rows == 0u) failures.PushBack(Json::Str("no sampled cloth-articulation contact"));
-    if (fluid_rows == 0u) failures.PushBack(Json::Str("no sampled fluid-articulation contact"));
+    if (!coupling_valid) failures.PushBack(Json::Str("missing positive cloth/fluid-articulation impulse during complete replay"));
     if (!render_valid) failures.PushBack(Json::Str("sensor lifecycle, output or physics parity failed"));
     validity.Set("failures", std::move(failures));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));

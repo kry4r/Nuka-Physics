@@ -23,6 +23,7 @@
 // ---------------------------------------------------------------------------
 
 #include "nuka/nuka.h"
+#include "nuka/nuka_scene.h"
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -91,6 +92,11 @@ bool AllFinite(const std::vector<float>& v) {
     }
     return true;
 }
+
+struct SceneGuard {
+    nuka_scene_handle handle = nullptr;
+    ~SceneGuard() { if (handle != nullptr) nuka_scene_destroy(handle); }
+};
 
 // The Go2 base settles around z ~ 0.30 with its feet near z ~ 0.05; place the cloth
 // under the front of the base and the fluid pool under the rear, both near the foot
@@ -187,6 +193,67 @@ nuka_world_desc_t WorldDesc(const std::string& scene, uint32_t terrain) {
     d.fixed_dt = 1.0f / 240.0f;
     d.contact_family = terrain;  // 1 == bake a heightfield collidable.
     return d;
+}
+
+TEST(CoupledWorldCAbi, AllControlModesThroughEveryCreationEntry) {
+    ASSERT_TRUE(SceneAvailable());
+    DeviceGuard device;
+    const auto path = ScenePath();
+    SceneGuard scene{nuka_scene_create(path.c_str())};
+    ASSERT_NE(scene.handle, nullptr);
+    const auto media = MediaDesc(true);
+    for (uint8_t mode = 0u; mode < 6u; ++mode) {
+        for (uint32_t entry = 0u; entry < 3u; ++entry) {
+            SCOPED_TRACE(::testing::Message() << "mode=" << unsigned(mode) << " entry=" << entry);
+            auto desc = WorldDesc(path, 0u);
+            desc.env_count = 2u;
+            desc.control_mode = mode;
+            desc.osc_task_link = 3u;
+            WorldGuard world;
+            const auto created = entry == 0u
+                ? nuka_world_create_from_scene(device.handle, &desc, &world.handle)
+                : entry == 1u
+                ? nuka_world_create_coupled_from_scene(device.handle, &desc, &media, &world.handle)
+                : nuka_world_create_from_built_scene(device.handle, &desc, scene.handle, nullptr, &world.handle);
+            ASSERT_EQ(created, NUKA_RESULT_OK);
+            const auto initial = DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION);
+            const nuka_state_field_t fields[] = {NUKA_FIELD_DRIVE_TARGET, NUKA_FIELD_TORQUE_INPUT,
+                NUKA_FIELD_VELOCITY_TARGET, NUKA_FIELD_ACCELERATION_TARGET,
+                NUKA_FIELD_TASK_TARGET, NUKA_FIELD_TORQUE_INPUT};
+            nuka_buffer_view_t input{};
+            ASSERT_EQ(nuka_world_get_buffer_view(world.handle, fields[mode], &input), NUKA_RESULT_OK);
+            auto targets = DownloadField(world.handle, fields[mode]);
+            ASSERT_FALSE(targets.empty());
+            if (mode == 4u) {
+                ASSERT_EQ(targets.size(), 6u);
+                const auto pose = DownloadField(world.handle, NUKA_FIELD_ARTICULATION_LINK_POSE);
+                const auto links = initial.size() / 2u;
+                for (size_t env = 0u; env < 2u; ++env)
+                    for (size_t axis = 0u; axis < 3u; ++axis)
+                        targets[env * 3u + axis] = pose[(env * links + 3u) * 7u + axis];
+            } else {
+                for (float& target : targets) target += 0.02f;
+            }
+            ASSERT_EQ(cudaMemcpy(input.device_ptr, targets.data(), targets.size() * sizeof(float),
+                                 cudaMemcpyHostToDevice), cudaSuccess);
+            ASSERT_EQ(nuka_world_set_execution_mode(world.handle, NUKA_EXECUTION_GRAPH), NUKA_RESULT_OK);
+            ASSERT_EQ(nuka_world_step_n(world.handle, 4u), NUKA_RESULT_OK);
+            EXPECT_TRUE(AllFinite(DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION)));
+            EXPECT_TRUE(AllFinite(DownloadField(world.handle, NUKA_FIELD_ACTUATOR_EFFORT)));
+            nuka_buffer_view_t status{};
+            ASSERT_EQ(nuka_world_get_buffer_view(world.handle, NUKA_FIELD_ENV_STATUS, &status), NUKA_RESULT_OK);
+            uint32_t flags[2] = {~0u, ~0u};
+            ASSERT_EQ(cudaMemcpy(flags, status.device_ptr, sizeof(flags), cudaMemcpyDeviceToHost), cudaSuccess);
+            EXPECT_EQ(flags[0], 0u);
+            EXPECT_EQ(flags[1], 0u);
+            const uint32_t reset_env = 1u;
+            ASSERT_EQ(nuka_world_reset_envs(world.handle, &reset_env, 1u), NUKA_RESULT_OK);
+            const auto restored = DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION);
+            for (size_t i = initial.size() / 2u; i < initial.size(); ++i)
+                EXPECT_EQ(restored[i], initial[i]);
+            EXPECT_EQ(DownloadField(world.handle, fields[mode]), targets);
+        }
+    }
 }
 
 // Max particle z over a particle index slice [lo, hi) -- a medium's free-surface

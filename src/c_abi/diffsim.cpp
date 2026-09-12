@@ -118,7 +118,8 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         world_record->articulation_host.TotalLinkCount() == 0u) {
         return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
     }
-    if (world_record->world->EnvCount() != 1u ||
+    if (world_record->control_mode != nuka::runtime::articulation::ControlMode::PDPosition ||
+        world_record->world->EnvCount() != 1u ||
         world_record->world->GetModel().capacities.mpm_plastic_state)
         return NUKA_RESULT_NOT_SUPPORTED;
     try {

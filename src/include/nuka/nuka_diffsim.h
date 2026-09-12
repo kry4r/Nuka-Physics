@@ -24,7 +24,7 @@ typedef struct nuka_tape_desc_t {
     uint32_t recompute_on_backward;
 } nuka_tape_desc_t;
 
-// Binds a tape to one articulated environment; replication and plastic state are unsupported.
+// Binds a tape to one PD-controlled articulation environment; other modes and plastic state are unsupported.
 // The world must remain alive while stepping, reading state, or running backward.
 nuka_result_t nuka_tape_create(nuka_world_handle world,
                                const nuka_tape_desc_t* desc,

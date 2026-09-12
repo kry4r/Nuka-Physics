@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from pathlib import Path
 import numpy as np
 
 import pytest
@@ -32,7 +33,7 @@ import torch
 import nuka
 from nuka.author.materials import Soft
 
-SCENE = "/root/Nuka-Physics/examples/scenes/go2_stand.usda"
+SCENE = str(Path(__file__).resolve().parents[2] / "examples/scenes/go2_stand.usda")
 
 # The Go2 (fixed base z=0.445) settles with its four foot spheres centred at z~0.2545
 # (front pair x~0.062, rear pair x~-0.325) -- the media sit just under the feet.
@@ -123,6 +124,62 @@ def test_coupled_world_requires_a_medium(device):
     create_from_scene for a particle-free world)."""
     with pytest.raises(RuntimeError):
         nuka.World.create_coupled_from_scene(device, SCENE, env_count=1)
+
+
+@pytest.mark.parametrize("mode", range(6))
+@pytest.mark.parametrize("entry", ["coupled", "builder", "author_coupled", "author_built"])
+def test_control_creation_entries(device, mode, entry):
+    from nuka.author import Scene, SimOptions, materials, morphs
+
+    options = dict(env_count=2, control_mode=mode, osc_task_link=3)
+    if entry == "coupled":
+        world = nuka.World.create_coupled_from_scene(device, SCENE, **options, **_media_kwargs(True))
+    elif entry == "builder":
+        with nuka.SceneBuilder.create(SCENE) as builder:
+            world = builder.build(device, **options)
+    else:
+        authored = Scene(SimOptions(**options))
+        authored.add_entity(morphs.NKS(SCENE))
+        authored.add_entity(morphs.Grid(5, 5, 0.018, origin=(0.062, 0.0, FOOT_Z)),
+                            materials.Cloth.XPBD())
+        if entry == "author_built":
+            authored.add_entity(morphs.Sphere(0.03, pos=(3.0, 0.0, 0.3)), materials.Rigid())
+        world = authored.build(device)
+    with world:
+        initial = world.download_field(nuka.JOINT_POSITION).copy().reshape(2, -1)
+        field = [nuka.DRIVE_TARGET, nuka.TORQUE_INPUT, nuka.VELOCITY_TARGET,
+                 nuka.ACCELERATION_TARGET, nuka.TASK_TARGET, nuka.TORQUE_INPUT][mode]
+        targets = torch.from_dlpack(world.buffer_view(field))
+        if mode == nuka.CONTROL_MODE_OSC:
+            assert targets.numel() == 6
+            poses = torch.from_dlpack(world.buffer_view(nuka.ARTICULATION_LINK_POSE))
+            targets.reshape(2, 3).copy_(poses.reshape(2, -1, 7)[:, 3, :3])
+            targets.reshape(2, 3)[:, 0] += 0.002
+            assert world.download_field(nuka.TASK_NULLSPACE_STIFFNESS).size == 2
+            assert world.download_field(nuka.TASK_NULLSPACE_DAMPING).size == 2
+        else:
+            targets.add_(0.02)
+        persistent = targets.clone()
+        nuka.sync()
+        world.set_execution_mode("graph")
+        world.step_n(4)
+        assert not np.any(world.download_field(nuka.ENV_STATUS))
+        assert np.isfinite(world.download_field(nuka.JOINT_POSITION)).all()
+        assert np.isfinite(world.download_field(nuka.ACTUATOR_EFFORT)).all()
+        world.reset_envs([1])
+        np.testing.assert_array_equal(world.download_field(nuka.JOINT_POSITION).reshape(2, -1)[1], initial[1])
+        assert torch.equal(targets, persistent)
+        targets.reshape(2, -1)[0, -1] = float("nan")
+        nuka.sync()
+        world.step()
+        status = world.download_field(nuka.ENV_STATUS).ravel()
+        assert status[0] & nuka.ENV_STATUS_CONTROL_FAILURE
+        assert status[1] == 0
+        assert np.isfinite(world.download_field(nuka.JOINT_POSITION)).all()
+        targets.copy_(persistent)
+        nuka.sync()
+        world.reset_envs([0])
+        assert not np.any(world.download_field(nuka.ENV_STATUS))
 
 
 def test_plastic_material_cook_graph_reset_and_readout(device, tmp_path):

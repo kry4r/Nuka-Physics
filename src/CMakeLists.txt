@@ -578,6 +578,7 @@ nuka_set_warnings(nuka_sensor)
 
 # The registry and physics core compile independently of device implementations.
 add_library(nuka_phi2 STATIC phi/registry.cpp)
+add_dependencies(nuka_phi2 nuka_codegen)
 set_target_properties(nuka_phi2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nuka_phi2 PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(nuka_phi2 PRIVATE
@@ -596,6 +597,7 @@ add_library(nuka_nk STATIC
     nk/solve/xpbd_coloring.cpp
 )
 set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(nuka_nk nuka_codegen)
 target_include_directories(nuka_nk PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(nuka_nk PUBLIC nuka_phi2 nuka_math)
 nuka_set_warnings(nuka_nk)

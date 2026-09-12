@@ -67,6 +67,7 @@ inline constexpr uint32_t kEnvStatusInvalidEndpoint  = 1u << 6;
 inline constexpr uint32_t kEnvStatusContactGeometryUnavailable = 1u << 7;
 inline constexpr uint32_t kEnvStatusConstitutiveFailure = 1u << 8;
 inline constexpr uint32_t kEnvStatusGridContactOverflow = 1u << 9;
+inline constexpr uint32_t kEnvStatusControlFailure = 1u << 10;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
 inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
@@ -78,7 +79,7 @@ inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
 enum class NkOp : uint16_t {
     // --- articulated-body dynamics --------------------------------------
     ApplyDrives,           // PD / motor drives -> generalized forces
-    ApplyOscDrives,        // 6D operational-space torque from free ABA + M^-1
+    ApplyDynamicsDrives,   // computed-torque and task control from free ABA + M^-1
     AbaForward,            // Featherstone ABA forward dynamics (q,qd -> qdd)
     IntegrateVelocity,     // qd += qdd * dt
     FkWorldPoses,          // forward kinematics -> per-link world poses
@@ -183,6 +184,8 @@ enum class NkOp : uint16_t {
     AccumulateStep,         // Aggregate impulses and diagnostics across physical intervals.
     FkLinkVelocities,       // Refresh link spatial velocities from current generalized state.
 
+    ReadoutDrives,         // actual bounded effort from the common velocity solve
+
     Count                    // sentinel: number of ops (NOT an op)
 };
 
@@ -199,24 +202,29 @@ enum class NkOp : uint16_t {
 // articulation_count / max_dof) in their params because ModelView/DataView are
 // pure pointer aggregates; the Pipeline fills them from the Model capacities.
 struct ApplyDrivesParams {
-    float    dt;
+    float dt;
     uint32_t total_link_count;
-    // 1 => the drive emits ONLY the Kp stiffness torque; -Kd*qdot is applied
-    // IMPLICITLY downstream (the production batched + single-env paths). 0 =>
-    // explicit -Kd*qdot in the drive (the legacy pre-implicit oracle form).
     uint32_t defer_velocity_damping;
-    // The rigid-body arm: drive mode. 0 = position PD hold drive (ApplyPositionDriveKernel, the
-    // batched articulated path). 1 = direct torque drive (the union
-    // world's LaunchApplyTorqueDriveKernels port: tau = clamp(drive_target,
-    // +/-drive_force_limit) — drive_target carries the per-link torque).
     uint32_t mode;
+    uint32_t links_per_env;
 };
 
-struct ApplyOscDrivesParams {
+struct ApplyDynamicsDrivesParams {
     uint32_t max_dof;
     uint32_t articulation_count;
     uint32_t total_link_count;
-    uint32_t task_link;  // articulation-local link index
+    uint32_t task_link;
+    uint32_t mode;
+    uint32_t links_per_env;
+    float gravity[3];
+};
+
+struct ReadoutDrivesParams {
+    float dt;
+    uint32_t total_link_count;
+    uint32_t links_per_env;
+    uint32_t rows_per_env;
+    uint32_t first_drive_row;
 };
 
 struct AbaForwardParams {
@@ -645,6 +653,7 @@ struct AssembleRowsParams {
     uint32_t contact_rows_per_env; // fixed contact footprint before joint rows
     uint32_t joint_limit_rows_per_env;
     uint32_t joint_friction_rows_per_env;
+    uint32_t joint_drive_rows_per_env;
     // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
     // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
     // Equal to union_slot_count when the model has no body-particle reserve.

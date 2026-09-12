@@ -871,14 +871,11 @@ fields:
   # zero-byte segment (byte-inert). APPENDED LAST.
   - {name: pair_sort_scratch, dtype: u8, per: scalar, count: "pair_sort_scratch_bytes", arena: scratch, owner: data}
 
-  # Operational-space control inputs. TASK_TARGET keeps the original public
-  # per-env position contract; the optional quaternion promotes the task to 6D,
-  # and task_local_pose selects a rigid frame on the authored task link. A zero
-  # quaternion is treated as "position only" and a zero local quaternion as the
-  # identity, preserving the historical 3D OSC behavior.
-  - {name: task_target,          dtype: vec3,      per: env, arena: persistent, owner: data, flags: [param]}
-  - {name: task_rotation_target, dtype: quat,      per: env, arena: persistent, owner: data, flags: [param]}
-  - {name: task_local_pose,      dtype: transform, per: env, arena: persistent, owner: data, flags: [param]}
+  # One task frame per articulation; a zero target quaternion selects position control.
+  # A zero local quaternion denotes the identity rotation.
+  - {name: task_target,          dtype: vec3,      per: articulation, arena: persistent, owner: data, flags: [param]}
+  - {name: task_rotation_target, dtype: quat,      per: articulation, arena: persistent, owner: data, flags: [param]}
+  - {name: task_local_pose,      dtype: transform, per: articulation, arena: persistent, owner: data, flags: [param]}
 
   # Body pose is the authored frame; linear and angular velocity are world COM quantities.
   # Principal inverse inertia is rotated into a symmetric world tensor before each solve.
@@ -967,3 +964,23 @@ fields:
 
   # Backend workspace for compensated contact velocity accumulation.
   - {name: solver_velocity_scratch, dtype: u8, per: scalar, count: "solver_velocity_scratch_bytes", arena: scratch, owner: data}
+
+  # Control inputs persist across state reset, independently of the position target.
+  - {name: velocity_target, dtype: f32, per: link, arena: persistent, owner: data, flags: [param]}
+  - {name: acceleration_target, dtype: f32, per: link, arena: persistent, owner: data, flags: [param]}
+  - {name: actuator_noload_speed, dtype: f32, per: link, arena: persistent, owner: data, flags: [param]}
+  - {name: task_nullspace_stiffness, dtype: f32, per: articulation, arena: persistent, owner: data, flags: [param]}
+  - {name: task_nullspace_damping, dtype: f32, per: articulation, arena: persistent, owner: data, flags: [param]}
+
+  # Every actuator supplies a bounded affine effort to the common velocity solve.
+  - {name: drive_command, dtype: f32, per: link, arena: scratch, owner: data}
+  - {name: drive_dissipation, dtype: f32, per: link, arena: scratch, owner: data}
+  - {name: drive_lower, dtype: f32, per: link, arena: scratch, owner: data}
+  - {name: drive_upper, dtype: f32, per: link, arena: scratch, owner: data}
+
+  # Reduced actuation mass and task response use the full articulation dynamics.
+  - {name: control_mass, dtype: f32, per: articulation_dof2, arena: scratch, owner: data}
+  - {name: control_factor, dtype: f32, per: articulation_dof2, arena: scratch, owner: data}
+  - {name: control_jacobian, dtype: f32, per: articulation_dof, elem: 6, arena: scratch, owner: data}
+  - {name: control_response, dtype: f32, per: articulation_dof, elem: 6, arena: scratch, owner: data}
+  - {name: control_task_map, dtype: f32, per: articulation_dof, elem: 6, arena: scratch, owner: data}

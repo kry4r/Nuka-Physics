@@ -99,6 +99,10 @@ uint64_t ModelCapacities::NeighborPoolCapacity() const {
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    if (!inverse_dynamics_controls &&
+        (id == FieldId::ControlMass || id == FieldId::ControlFactor ||
+         id == FieldId::ControlJacobian || id == FieldId::ControlResponse ||
+         id == FieldId::ControlTaskMap)) return 0u;
     if (mpm_grid_nodes_per_env == 0u &&
         (id == FieldId::GridContactAttempted || id == FieldId::GridContactRetained ||
          id == FieldId::GridContactPeak || id == FieldId::GridContactOverflow)) return 0u;
@@ -1125,8 +1129,8 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         return reject(Status::Unsupported, "articulation DOF exceeds the solver capacity");
     if (cap.NeighborPoolCapacity() * cap.env_count > limit)
         return reject(Status::InvalidArgument, "neighbor pool exceeds 32-bit device indexing");
-    if (drive_mode == 4u && cap.dofs_per_env > phi::kMaxOscDof)
-        return reject(Status::Unsupported, "OSC DOF exceeds the controller capacity");
+    if (drive_mode > static_cast<uint32_t>(phi::ArticulationControlMode::Actuator))
+        return reject(Status::InvalidArgument, "unknown articulation control mode");
     if (n == 0u && cap.dofs_per_env != 0u)
         return reject(Status::InvalidArgument, "DOFs require articulation links");
     if (n != 0u) {
@@ -1150,6 +1154,9 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
             const uint32_t count = implicit_span ? n : a.articulation_link_count[tree];
             if (count == 0u || offset != covered || uint64_t(offset) + count > n)
                 return reject(Status::InvalidArgument, "articulation spans must cover links without gaps or overlap");
+            if (drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc) &&
+                osc_task_link >= count)
+                return reject(Status::InvalidArgument, "OSC task link is outside its articulation");
             uint32_t dofs = 0u;
             for (uint32_t local = 0u; local < count; ++local) {
                 const uint32_t link = offset + local;

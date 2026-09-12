@@ -302,20 +302,11 @@ nuka_result_t ValidateWorldDescAndDevice(
     if (desc->determinism > 1u) {
         return NUKA_RESULT_INVALID_ARG;
     }
-    // Control mode: PDPosition/Torque retain their established affine schedules.
-    // OSC is opt-in and owns a separately gated free-dynamics/task-space schedule;
-    // no default world enters it. Other declared legacy modes remain unsupported
-    // on the unified nk world.
     if (!articulation::IsControlModeImplemented(desc->control_mode)) {
         return NUKA_RESULT_INVALID_ARG;
     }
     const auto control_mode =
         static_cast<articulation::ControlMode>(desc->control_mode);
-    if (control_mode != articulation::ControlMode::PDPosition &&
-        control_mode != articulation::ControlMode::Torque &&
-        control_mode != articulation::ControlMode::Osc) {
-        return NUKA_RESULT_NOT_SUPPORTED;
-    }
 
     auto* device_record = nuka::c_abi::DeviceTable().Get(device);
     if (device_record == nullptr) {
@@ -334,8 +325,6 @@ nuka_result_t ApplyControlTerrainGravity(
     const nuka_world_desc_t* desc, articulation::ControlMode control_mode,
     nuka::nk::Model& model, nuka::terrain::HeightField* out_terrain,
     nuka::math::Vec3* out_gravity) {
-    // The numeric mode is preserved on the Model. PD (0) and Torque (1) keep
-    // their original affine paths; OSC (4) is an explicitly selected pipeline.
     model.drive_mode = static_cast<uint32_t>(control_mode);
     model.osc_task_link = desc->osc_task_link;
 
