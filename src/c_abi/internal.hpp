@@ -4,6 +4,8 @@
 
 #include "core/diagnostics/invariants.hpp"
 #include "sensor/noise/noise_config.hpp"
+#include "sensor/observation.hpp"
+#include <map>
 #include "rt/render_dr.hpp"
 #include "rt/sensor_fidelity.hpp"
 #include "phi/backend.hpp"
@@ -228,22 +230,8 @@ struct WorldRecord {
     // via the bilinear sampler, so obs and physics share one height definition.
     nuka::terrain::HeightField cooked_terrain;
 
-    // --- v0.5 p04 N1: per-sensor-field domain-randomization noise -----------
-    // Fixed array indexed by nuka_state_field_t. Default is None so a field with
-    // no registered noise is a byte no-op on apply and V1 oracle scenes stay
-    // byte-identical. `noise_seq[f]` is that field's monotonically advancing
-    // per-apply sequence index (the Philox counter seq lane), giving independent
-    // noise across steps; the SAME (seed, seq) replays bit-exact on the reverse
-    // pass (no RNG state to checkpoint -- exit #6). Sized to cover EVERY public
-    // field: derived from the current enum maximum so adding a field never leaves
-    // it silently out of range (the old hardcoded 16 rejected terrain fields).
-    static constexpr uint32_t kNoiseFieldCount =
-        static_cast<uint32_t>(NUKA_FIELD_ACTUATOR_SATURATED) + 1u;
-    static_assert(NUKA_FIELD_ACTUATOR_SATURATED >=
-                      NUKA_FIELD_ENV_TERRAIN_DIFFICULTY,
-                  "kNoiseFieldCount must derive from the maximum field enum");
-    nuka::sensor::noise::SensorNoiseConfig noise_config[kNoiseFieldCount];
-    uint64_t noise_seq[kNoiseFieldCount] = {};
+    // Field observations own their output and stochastic history, independently of physical state.
+    std::map<nuka_state_field_t, std::unique_ptr<sensor::Observation>> field_observations;
 
     // --- v0.5 p04 N2: per-episode domain randomization ----------------------
     // The DR descriptor (default disabled -> apply is a byte no-op, oracle safe).

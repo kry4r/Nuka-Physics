@@ -1,132 +1,99 @@
-"""nuka.noise -- ergonomic sim-to-real noise + domain-randomization config.
+"""Physical observation errors and per-episode domain randomization.
 
-v0.5 p04 Task 5.4.9 (the Python user-facing wrapper for the N1 sensor noise +
-N2 per-episode domain randomization the engine + C-ABI already implement -- see
-``src/include/nuka/nuka_noise.h``).
-
-PURE PYTHON: this module imports NO torch / NO jax, so it is safe to import
-eagerly from ``nuka/__init__.py`` (``import nuka`` must never hard-require a DL
-framework). The dataclasses are thin config holders; the ``apply_to`` /
-``configure`` helpers call straight through to the ``World`` nanobind methods
-(``set_sensor_noise`` / ``apply_sensor_noise`` / ``set_domain_randomization`` /
-``apply_domain_randomization``).
-
-Noise kinds (mirror ``nuka_noise_kind_t``; also exposed as module ints on the
-extension as ``NOISE_NONE`` / ``NOISE_GAUSSIAN`` / ``NOISE_POISSON``):
-    0 = NONE      clears the field's noise (apply becomes a byte no-op)
-    1 = GAUSSIAN  param1 = mean, param2 = stddev
-    2 = POISSON   param1 = lambda
-
-Typical use::
-
-    import nuka
-
-    with nuka.Device.create(0) as dev:
-        world = nuka.World.create_from_scene(dev, scene, env_count=64)
-
-        # Sensor noise on the observed joint velocities.
-        noise = nuka.GaussianNoise(mean=0.0, stddev=0.02, seed=123)
-        world.step()
-        noise.apply_to(world, nuka.JOINT_VELOCITY)   # set + apply in one call
-        nuka.sync()                                  # apply kernel is async
-
-        # Per-episode domain randomization (call at episode reset).
-        dr = nuka.DomainRandomization(seed=7)
-        dr.configure(world)            # register the descriptor
-        dr.apply(world)                # sample + apply for all envs
+Configure a field once, then call ``world.sample_observation`` or
+``world.apply_sensor_noise`` for each acquisition. Read ``get_observation_view``
+or ``download_observation``; physics remains available through ``buffer_view``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import ClassVar, Tuple
 
-# Noise-kind ints -- mirror nuka_noise_kind_t. Hardcoded (NOT imported from the
-# extension) so this module stays import-light and dependency-free.
 NOISE_NONE = 0
 NOISE_GAUSSIAN = 1
 NOISE_POISSON = 2
 
-__all__ = [
-    "NOISE_NONE",
-    "NOISE_GAUSSIAN",
-    "NOISE_POISSON",
-    "GaussianNoise",
-    "PoissonNoise",
-    "DomainRandomization",
-]
+__all__ = ["NOISE_NONE", "NOISE_GAUSSIAN", "NOISE_POISSON", "GaussianNoise",
+           "PoissonNoise", "MeasurementError", "DomainRandomization"]
 
 
 @dataclass
 class GaussianNoise:
-    """Additive zero-mean (configurable) Gaussian sensor noise.
-
-    Maps to ``nuka_sensor_noise_desc_t{NUKA_NOISE_GAUSSIAN, mean, stddev, seed}``.
-    Counter-based (Philox) -> D1 two-run bit-exact and replay-stable.
-    """
+    """Per-acquisition additive Gaussian error in measurement units."""
 
     mean: float = 0.0
     stddev: float = 0.01
     seed: int = 0
-
-    #: The ``nuka_noise_kind_t`` int this dataclass registers. ClassVar so it is
-    #: NOT an __init__ parameter / repr field (the spec constructor is
-    #: GaussianNoise(mean, stddev, seed)).
     kind: ClassVar[int] = NOISE_GAUSSIAN
 
     def configure(self, world, field) -> None:
-        """Register this noise on ``field`` (does NOT apply yet).
-
-        ``world`` is a ``nuka.World``; ``field`` is a ``nuka.Field`` enum value.
-        Recording resets the field's per-field sequence counter to 0.
-        """
-        world.set_sensor_noise(field, NOISE_GAUSSIAN, float(self.mean),
-                               float(self.stddev), int(self.seed))
+        """Configure observations and reset their history, leaving physics intact."""
+        world.set_sensor_noise(field, self.kind, float(self.mean), float(self.stddev), int(self.seed))
 
     def apply_to(self, world, field) -> None:
-        """Register + apply the noise to ``field``'s live device buffer once.
-
-        The apply kernel is async -- call ``nuka.sync()`` before reading the
-        buffer back. Applying advances the field's sequence counter, so a
-        subsequent apply produces independent noise.
-        """
+        """Configure, then acquire once; further apply_sensor_noise calls advance the sequence."""
         self.configure(world, field)
         world.apply_sensor_noise(field)
 
 
 @dataclass
 class PoissonNoise:
-    """Poisson-distributed sensor noise with rate ``lam``.
-
-    Maps to ``nuka_sensor_noise_desc_t{NUKA_NOISE_POISSON, lam, 0, seed}``
-    (param2 is unused for Poisson). Counter-based -> D1 two-run bit-exact.
-    """
+    """Add an independent Poisson count; this is not a camera photon model."""
 
     lam: float = 1.0
     seed: int = 0
-
-    #: The ``nuka_noise_kind_t`` int this dataclass registers. ClassVar so it is
-    #: NOT an __init__ parameter / repr field (the spec constructor is
-    #: PoissonNoise(lam, seed)).
     kind: ClassVar[int] = NOISE_POISSON
 
     def configure(self, world, field) -> None:
-        """Register this noise on ``field`` (does NOT apply yet)."""
-        world.set_sensor_noise(field, NOISE_POISSON, float(self.lam), 0.0,
-                               int(self.seed))
+        """Configure a nonnegative rate up to 1e8 counts per acquisition."""
+        world.set_sensor_noise(field, self.kind, float(self.lam), 0.0, int(self.seed))
 
     def apply_to(self, world, field) -> None:
-        """Register + apply the noise to ``field``'s live device buffer once.
-
-        The apply kernel is async -- call ``nuka.sync()`` before reading back.
-        """
+        """Configure, then acquire into the independent observation buffer."""
         self.configure(world, field)
         world.apply_sensor_noise(field)
 
 
 @dataclass
+class MeasurementError:
+    """Calibration and stochastic error in the observed field's physical units.
+
+    ``noise_density`` is the square root of two-sided PSD, in units * sqrt(s).
+    ``bias_random_walk`` is in units / sqrt(s); correlation and response times
+    are seconds. Temperatures are Celsius. Both limits are needed to saturate.
+    """
+
+    bias: float = 0.0
+    scale_error: float = 0.0
+    noise_density: float = 0.0
+    initial_bias_stddev: float = 0.0
+    bias_random_walk: float = 0.0
+    correlated_bias_stddev: float = 0.0
+    correlation_time: float = 0.0
+    quantization: float = 0.0
+    minimum: float | None = None
+    maximum: float | None = None
+    response_time: float = 0.0
+    temperature_coefficient: float = 0.0
+    reference_temperature: float = 25.0
+    seed: int = 0
+
+    def configure(self, world, field) -> None:
+        """Replace the observation model and reset its per-environment history."""
+        parameters = asdict(self)
+        minimum = parameters.pop("minimum")
+        maximum = parameters.pop("maximum")
+        if (minimum is None) != (maximum is None):
+            raise ValueError("minimum and maximum must both be supplied")
+        if minimum is not None:
+            parameters.update(minimum=minimum, maximum=maximum, saturation_enabled=True)
+        world.set_sensor_error(field, **parameters)
+
+
+@dataclass
 class DomainRandomization:
-    """Per-episode domain randomization (Task 5.4.7).
+    """Per-episode domain randomization.
 
     Maps to ``nuka_domain_randomization_desc_t``. ``mass_range`` / ``friction_range``
     are MULTIPLIER ranges ``[lo, hi]`` applied as ``nominal * mult``;

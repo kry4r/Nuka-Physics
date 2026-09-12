@@ -20,9 +20,7 @@ struct WorldCheckpointRecord {
     uint32_t simulated_step_count = 0u;
     runtime::WorldStepOptions step_options;
     uint32_t sparse_solver_backend = 0u;
-    std::array<sensor::noise::SensorNoiseConfig, WorldRecord::kNoiseFieldCount>
-        noise_config{};
-    std::array<uint64_t, WorldRecord::kNoiseFieldCount> noise_seq{};
+    std::map<nuka_state_field_t, sensor::ObservationSnapshot> observations;
     sensor::noise::DomainRandomizationConfig dr_config;
     bool dr_baseline_captured = false;
     std::vector<float> dr_nominal_link_mass;
@@ -62,15 +60,16 @@ void HashFloatVector(uint64_t* hash, const std::vector<float>& values) {
     }
 }
 
-void CopyHostState(const WorldRecord& source, WorldCheckpointRecord* target) {
+phi::Status CopyHostState(const WorldRecord& source, WorldCheckpointRecord* target) {
     target->simulated_step_count = source.simulated_step_count;
     target->step_options = source.step_options;
     target->sparse_solver_backend = source.sparse_solver_backend;
     target->link_inertia = source.articulation_host.link_inertia;
     target->joint_armature = source.articulation_host.joint_armature;
-    for (uint32_t i = 0u; i < WorldRecord::kNoiseFieldCount; ++i) {
-        target->noise_config[i] = source.noise_config[i];
-        target->noise_seq[i] = source.noise_seq[i];
+    for (const auto& entry : source.field_observations) {
+        if (!entry.second->Active()) continue;
+        const auto status = entry.second->Capture(&target->observations[entry.first]);
+        if (status != phi::Status::Ok) return status;
     }
     target->dr_config = source.dr_config;
     target->dr_baseline_captured = source.dr_baseline_captured;
@@ -78,16 +77,13 @@ void CopyHostState(const WorldRecord& source, WorldCheckpointRecord* target) {
     target->dr_nominal_joint_armature = source.dr_nominal_joint_armature;
     target->dr_nominal_gravity_z = source.dr_nominal_gravity_z;
     target->dr_nominal_friction = source.dr_nominal_friction;
+    return phi::Status::Ok;
 }
 
 void RestoreHostState(const WorldCheckpointRecord& source, WorldRecord* target) {
     target->simulated_step_count = source.simulated_step_count;
     target->step_options = source.step_options;
     target->sparse_solver_backend = source.sparse_solver_backend;
-    for (uint32_t i = 0u; i < WorldRecord::kNoiseFieldCount; ++i) {
-        target->noise_config[i] = source.noise_config[i];
-        target->noise_seq[i] = source.noise_seq[i];
-    }
     target->dr_config = source.dr_config;
     target->dr_baseline_captured = source.dr_baseline_captured;
     target->dr_nominal_link_mass = source.dr_nominal_link_mass;
@@ -100,7 +96,7 @@ void RestoreHostState(const WorldCheckpointRecord& source, WorldRecord* target) 
     target->invariant_sampler.Reset();
 }
 
-void HashHostState(uint64_t* hash, const WorldRecord& record) {
+phi::Status HashHostState(uint64_t* hash, const WorldRecord& record) {
     HashValue(hash, record.env_count);
     HashValue(hash, record.simulated_step_count);
     const uint8_t mode = static_cast<uint8_t>(record.control_mode);
@@ -119,13 +115,29 @@ void HashHostState(uint64_t* hash, const WorldRecord& record) {
     HashValue(hash, record.step_options.solver_position_iterations);
     HashValue(hash, record.step_options.solver_slop);
     HashValue(hash, record.step_options.solver_baumgarte);
-    for (uint32_t i = 0u; i < WorldRecord::kNoiseFieldCount; ++i) {
-        const uint32_t kind = static_cast<uint32_t>(record.noise_config[i].kind);
+    uint64_t observation_count = 0u;
+    for (const auto& entry : record.field_observations) if (entry.second->Active()) ++observation_count;
+    HashValue(hash, observation_count);
+    for (const auto& entry : record.field_observations) {
+        if (!entry.second->Active()) continue;
+        sensor::ObservationSnapshot snapshot;
+        const auto status = entry.second->Capture(&snapshot);
+        if (status != phi::Status::Ok) return status;
+        HashValue(hash, static_cast<uint32_t>(entry.first));
+        const uint32_t kind = static_cast<uint32_t>(snapshot.config.noise.kind);
         HashValue(hash, kind);
-        HashValue(hash, record.noise_config[i].param1);
-        HashValue(hash, record.noise_config[i].param2);
-        HashValue(hash, record.noise_config[i].seed);
-        HashValue(hash, record.noise_seq[i]);
+        HashValue(hash, snapshot.config.noise.param1);
+        HashValue(hash, snapshot.config.noise.param2);
+        HashValue(hash, snapshot.config.noise.seed);
+        const auto& e = snapshot.config.error;
+        const float parameters[] = {e.bias, e.scale_error, e.noise_density, e.initial_bias_stddev,
+            e.bias_random_walk, e.correlated_bias_stddev, e.correlation_time, e.quantization,
+            e.minimum, e.maximum, e.response_time, e.temperature_coefficient, e.reference_temperature};
+        HashBytes(hash, parameters, sizeof(parameters));
+        HashValue(hash, e.saturation_enabled);
+        HashValue(hash, snapshot.env_count);
+        HashValue(hash, snapshot.values_per_env);
+        HashBytes(hash, snapshot.bytes.data(), snapshot.bytes.size());
     }
     const auto hash_range = [hash](const sensor::noise::DomainRandomizationConfig::Range& range) {
         HashValue(hash, range.lo);
@@ -149,6 +161,7 @@ void HashHostState(uint64_t* hash, const WorldRecord& record) {
     for (const auto& inertia : record.articulation_host.link_inertia) {
         HashBytes(hash, &inertia, sizeof(inertia));
     }
+    return phi::Status::Ok;
 }
 
 }  // namespace
@@ -176,7 +189,8 @@ nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
         if (!record->world->GetData().DownloadPersistent(&checkpoint->persistent)) {
             return NUKA_RESULT_INTERNAL;
         }
-        nuka::c_abi::CopyHostState(*record, checkpoint.get());
+        const auto status = nuka::c_abi::CopyHostState(*record, checkpoint.get());
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
         *out = nuka::c_abi::CheckpointTable().Insert(std::move(checkpoint));
         return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -202,10 +216,21 @@ nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
         return NUKA_RESULT_NOT_SUPPORTED;
     }
     try {
+        for (const auto& entry : saved->observations) {
+            const auto found = record->field_observations.find(entry.first);
+            if (found == record->field_observations.end() || !found->second->Compatible(entry.second))
+                return NUKA_RESULT_INVALID_ARG;
+        }
         if (!record->world->GetData().UploadPersistent(saved->persistent)) {
             return NUKA_RESULT_INVALID_ARG;
         }
         nuka::c_abi::RestoreHostState(*saved, record);
+        for (auto& entry : record->field_observations) {
+            const auto found = saved->observations.find(entry.first);
+            const auto status = found == saved->observations.end() ? entry.second->Deactivate() :
+                entry.second->Restore(found->second);
+            if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        }
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
@@ -238,9 +263,10 @@ nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash)
             return NUKA_RESULT_INTERNAL;
         }
         uint64_t hash = nuka::c_abi::kFnvOffset;
-        constexpr char domain[] = "NukaStateHashV1";
+        constexpr char domain[] = "NukaStateHashV2";
         nuka::c_abi::HashBytes(&hash, domain, sizeof(domain));
-        nuka::c_abi::HashHostState(&hash, *record);
+        const auto status = nuka::c_abi::HashHostState(&hash, *record);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
         const uint64_t byte_count = persistent.size();
         nuka::c_abi::HashValue(&hash, byte_count);
         nuka::c_abi::HashBytes(&hash, persistent.data(), persistent.size());

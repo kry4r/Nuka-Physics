@@ -737,9 +737,14 @@ nuka_result_t nuka_world_reset(nuka_world_handle world) {
     }
     try {
         // An empty selection restores all environments through the shared reset op.
-        const nuka::phi::Status status = record->world->Reset({});
-        return status == nuka::phi::Status::Ok ? NUKA_RESULT_OK
-                                               : NUKA_RESULT_INTERNAL;
+        auto status = record->world->Reset({});
+        if (status == nuka::phi::Status::Ok) {
+            for (auto& entry : record->field_observations) {
+                status = entry.second->Reset();
+                if (status != nuka::phi::Status::Ok) break;
+            }
+        }
+        return nuka::c_abi::MapStatusToResult(status);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
@@ -775,9 +780,14 @@ nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
     }
     try {
         const std::vector<uint32_t> ids(env_ids, env_ids + count);
-        const nuka::phi::Status status = record->world->Reset(ids);
-        return status == nuka::phi::Status::Ok ? NUKA_RESULT_OK
-                                               : NUKA_RESULT_INTERNAL;
+        auto status = record->world->Reset(ids);
+        if (status == nuka::phi::Status::Ok) {
+            for (auto& entry : record->field_observations) {
+                status = entry.second->Reset(ids);
+                if (status != nuka::phi::Status::Ok) break;
+            }
+        }
+        return nuka::c_abi::MapStatusToResult(status);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {

@@ -128,6 +128,7 @@
 | XPBD cloth and soft bodies | Functional |
 | PBF fluid and MLS-MPM continuum | Functional |
 | Two-way rigid / articulation / MLS-MPM / XPBD coupling | [Functional](docs/concepts/coupling.md) |
+| Independent observations, calibration and stochastic error | [Scalar field models](docs/concepts/sensors.md) |
 | Differentiable rigid + articulated simulation | Functional, contact-free |
 | Batched RL, PyTorch, JAX, DLPack | Functional |
 | Vulkan raster + CUDA path tracing | Functional |

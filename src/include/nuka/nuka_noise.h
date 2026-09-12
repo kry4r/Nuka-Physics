@@ -1,30 +1,5 @@
 #ifndef NUKA_NUKA_NOISE_H
 #define NUKA_NUKA_NOISE_H
-// ---------------------------------------------------------------------------
-// nuka_noise.h -- C ABI for sim-to-real N1 sensor noise (v0.5 p04 Task 5.4.8)
-// ---------------------------------------------------------------------------
-//
-// Registers per-sensor-field domain-randomization noise and applies it to that
-// field's live device buffer. The noise is COUNTER-BASED (Philox4x32-10): a
-// sample is a pure function of (seed, element_idx, sequence). This makes it D1
-// (DeterminismLevel::Strong) two-run bit-exact AND replay-stable -- the reverse
-// pass re-derives the identical noise from the same indices with no RNG state to
-// checkpoint (v0.5 exit #6).
-//
-// DEFAULT IS NONE: a field with no registered noise is byte-unchanged by apply,
-// and no existing call site invokes apply -- so V1 oracle scenes stay byte-for-
-// byte identical unless noise is explicitly enabled.
-//
-// Usage:
-//   nuka_sensor_noise_desc_t d = { NUKA_NOISE_GAUSSIAN, 0.0f, 0.02f, 1234u };
-//   nuka_world_set_sensor_noise(world, NUKA_FIELD_JOINT_VELOCITY, &d);
-//   nuka_world_step(world);                 // observation produced
-//   nuka_world_apply_sensor_noise(world, NUKA_FIELD_JOINT_VELOCITY);
-//   // -> the field's device buffer now carries Gaussian noise; the per-field
-//   //    sequence counter advanced (so the NEXT apply is independent noise).
-//
-// Plain C: no STL, no exceptions cross the boundary.
-// ---------------------------------------------------------------------------
 
 #include "nuka/nuka.h"
 
@@ -42,64 +17,58 @@ typedef enum nuka_noise_kind_t {
 
 typedef struct nuka_sensor_noise_desc_t {
     nuka_noise_kind_t kind;
-    float param1;   /* Gaussian: mean   / Poisson: lambda */
-    float param2;   /* Gaussian: stddev / (unused for Poisson) */
-    uint64_t seed;  /* RNG seed (Philox key) */
+    float param1;   /* Gaussian mean or additive Poisson rate, 0 <= rate <= 1e8. */
+    float param2;   /* Gaussian standard deviation, nonnegative. */
+    uint64_t seed;
 } nuka_sensor_noise_desc_t;
 
-// Registers the noise descriptor for `sensor_field`. Pass kind == NUKA_NOISE_NONE
-// (or a NULL desc) to clear it. Recording a desc resets that field's sequence
-// counter to 0. Returns NUKA_RESULT_INVALID_ARG for an out-of-range field or an
-// unknown kind, NUKA_RESULT_NULL_HANDLE for a bad world handle.
+typedef struct nuka_sensor_error_desc_t {
+    uint32_t struct_size;
+    float bias;                      /* Measurement units. */
+    float scale_error;               /* Fractional calibration error. */
+    float noise_density;             /* Measurement units * sqrt(seconds), two-sided PSD. */
+    float initial_bias_stddev;       /* Per-environment and per-element reset bias. */
+    float bias_random_walk;          /* Measurement units / sqrt(seconds). */
+    float correlated_bias_stddev;    /* Stationary Ornstein-Uhlenbeck standard deviation. */
+    float correlation_time;          /* Seconds; positive when correlated bias is enabled. */
+    float quantization;              /* Measurement units per least significant bit; 0 disables. */
+    float minimum;
+    float maximum;
+    float response_time;             /* Seconds; 0 disables first-order response lag. */
+    float temperature_coefficient;   /* Measurement units / degree Celsius. */
+    float reference_temperature;     /* Degrees Celsius. */
+    uint32_t saturation_enabled;
+    uint64_t seed;
+} nuka_sensor_error_desc_t;
+
+typedef struct nuka_observation_stamp_t {
+    uint64_t sequence;      /* Acquisitions since reset; zero before the first sample. */
+    double elapsed_time;   /* Sum of explicit acquisition intervals, in seconds. */
+    uint32_t valid;         /* Reset or configuration invalidates the previous measurement. */
+    uint32_t reserved;
+} nuka_observation_stamp_t;
+
+// Configure scalar float32 field observations; registration resets their stochastic history.
+// NULL clears all errors. Integer and structured fields are rejected, without changing physics.
 nuka_result_t nuka_world_set_sensor_noise(nuka_world_handle world,
-                                          nuka_state_field_t sensor_field,
-                                          const nuka_sensor_noise_desc_t* desc);
+    nuka_state_field_t sensor_field, const nuka_sensor_noise_desc_t* desc);
+nuka_result_t nuka_world_set_sensor_error(nuka_world_handle world,
+    nuka_state_field_t sensor_field, const nuka_sensor_error_desc_t* desc);
 
-// Applies the registered noise to `sensor_field`'s device buffer ONCE, in place,
-// then advances that field's sequence counter (so the next apply is independent
-// noise across steps). NONE (or no registered desc) is a byte no-op returning
-// NUKA_RESULT_OK with zero writes. Resolves the buffer the SAME way
-// nuka_world_get_buffer_view does. Only float-stride fields are supported (the
-// noise primitive operates on float32 elements); a non-float-stride field (e.g.
-// the 7-float pose / 6-float velocity struct fields) returns
-// NUKA_RESULT_NOT_SUPPORTED. Returns NUKA_RESULT_INVALID_ARG for an out-of-range
-// field, NUKA_RESULT_NULL_HANDLE for a bad world handle.
-nuka_result_t nuka_world_apply_sensor_noise(nuka_world_handle world,
-                                            nuka_state_field_t sensor_field);
+// Sample the current physical field into independent observation storage, advancing its sequence.
+// apply_sensor_noise uses fixed_dt and reference temperature; sample_observation uses explicit units.
+nuka_result_t nuka_world_apply_sensor_noise(nuka_world_handle world, nuka_state_field_t sensor_field);
+nuka_result_t nuka_world_sample_observation(nuka_world_handle world,
+    nuka_state_field_t sensor_field, double sample_interval, float temperature);
 
-// ---------------------------------------------------------------------------
-// N2 per-episode domain randomization (v0.5 p04 Task 5.4.7).
-//
-// Mirrors the C++ DomainRandomizationConfig. Each [lo, hi] range is sampled ONCE
-// per env per episode-reset to a per-env multiplier / offset that is a PURE
-// FUNCTION of (seed, env_idx, param_idx) via the SAME counter-based Philox the
-// sensor noise uses. There is no mutable sampled state -- the deterministic seed
-// IS the recorded state, so the diff-sim reverse/replay pass re-derives identical
-// values and the backward stays D1 byte-exact two-run.
-//
-// mass / friction are MULTIPLIERS; restitution / armature / gravity are OFFSETS.
-// Apply snapshots a NOMINAL baseline ONCE (first enabled apply) and thereafter
-// computes value = nominal*mult / nominal+offset, so repeated resets re-randomize
-// AROUND nominal (idempotent) rather than compounding a random walk.
-//
-// DEFAULT IS DISABLED (enabled == 0): a world with DR off is byte-unchanged by
-// apply, so V1 oracle scenes stay byte-identical unless DR is explicitly enabled.
-//
-// ENGINE-BUFFER MAPPING (single-env contact-free diff-sim tape):
-//   mass        -> per-link spatial inertia (link_inertia, rebuilt via the SAME
-//                  MakeSpatialInertia path nuka_world_set_link_mass uses). TAPE-
-//                  VISIBLE: changes the contact-free ABA forward + its gradient.
-//   gravity_z   -> step_options.gravity.z (read by nuka_tape_create into
-//                  RolloutParams.gravity_z). TAPE-VISIBLE. NOTE: one world scalar
-//                  -> the same offset applies to all envs (gravity is global).
-//   armature    -> per-DOF joint_armature buffer (host mirror + device). Present
-//                  on the articulation state but INERT in the contact-free tape
-//                  forward (does not enter the tape's ABA + integrate).
-//   friction    -> the batched contact path's scalar friction_coefficient; the
-//                  single-env contact-free tape has no contact solve -> INERT.
-//   restitution -> no engine buffer in the contact-free path -> sampled for RL
-//                  completeness but INERT (applied where a contact buffer exists).
-// ---------------------------------------------------------------------------
+// Views retain their address across sampling, configuration, reset and checkpoint restoration.
+// They contain the last sampled value; reading a view does not acquire another measurement.
+nuka_result_t nuka_world_get_observation_view(nuka_world_handle world,
+    nuka_state_field_t sensor_field, nuka_buffer_view_t* out);
+nuka_result_t nuka_world_download_observation(nuka_world_handle world,
+    nuka_state_field_t sensor_field, void* bytes, size_t nbytes, size_t byte_offset);
+nuka_result_t nuka_world_get_observation_stamp(nuka_world_handle world,
+    nuka_state_field_t sensor_field, uint32_t env, nuka_observation_stamp_t* out);
 
 typedef struct nuka_domain_randomization_desc_t {
     float mass_mul_lo;       /* mass multiplier range  [lo, hi] (nominal * mult) */
