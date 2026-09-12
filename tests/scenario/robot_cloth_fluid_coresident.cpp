@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -171,6 +172,111 @@ std::vector<T> ReadContactValues(nk::World& world, nk::FieldId field) {
     std::vector<T> values(bytes / sizeof(T));
     EXPECT_TRUE(world.GetData().DownloadField(field, values.data(), bytes));
     return values;
+}
+
+TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    const auto prepared = Prepare(Go2ScenePath(), backend.dev, backend.backend, Cfg());
+    auto config = Cfg();
+    config.dt = 0.001f;
+    config.vel_iters = 128u;
+    constexpr uint32_t envs = 3u;
+    nk::World eager(CookMpmPrepared(prepared, envs), envs, backend.dev, backend.backend, config);
+    nk::World graph(CookMpmPrepared(prepared, envs), envs, backend.dev, backend.backend, config);
+    auto set_static_islands = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("NUKA_FORCE_STATIC_ISLANDS", value != nullptr ? value : "");
+#else
+        if (value != nullptr) setenv("NUKA_FORCE_STATIC_ISLANDS", value, 1);
+        else unsetenv("NUKA_FORCE_STATIC_ISLANDS");
+#endif
+    };
+    const char* previous_setting = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
+    const bool had_setting = previous_setting != nullptr;
+    const std::string saved_setting = had_setting ? previous_setting : "";
+    set_static_islands("1");
+    nk::World conservative(CookMpmPrepared(prepared, envs), envs, backend.dev, backend.backend, config);
+    EXPECT_NE(conservative.FieldPtr(nk::FieldId::ContactForce), nullptr);
+    set_static_islands(had_setting ? saved_setting.c_str() : nullptr);
+    ASSERT_TRUE(eager.Ready()) << eager.CreationError();
+    ASSERT_TRUE(graph.Ready()) << graph.CreationError();
+    ASSERT_TRUE(conservative.Ready()) << conservative.CreationError();
+    const auto& cap = graph.GetModel().capacities;
+    ASSERT_GT(cap.particle_surfaces_per_env, 0u);
+    ASSERT_GT(cap.point_endpoints_per_env, 0u);
+    for (auto* world : {&eager, &graph}) ASSERT_NE(world->FieldPtr(nk::FieldId::ContactForce), nullptr);
+    const auto initial = ReadPipelineState(graph);
+    const auto targets = ReadContactValues<float>(graph, nk::FieldId::DriveTarget);
+    const auto* address = graph.DataViewRef().point_endpoint_terms;
+    ASSERT_EQ(graph.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok);
+    double pair_impulse[envs][4][4]{};
+    bool shared_island[envs]{};
+    auto category = [](uint32_t kind) {
+        if (kind == nk::kNkSideRigid) return 0u;
+        if (kind == nk::kNkSideArtic) return 1u;
+        if (kind == nk::kNkSideParticle || kind == nk::kNkSidePointEndpoint) return 2u;
+        if (kind == nk::kNkSideGrid) return 3u;
+        return 4u;
+    };
+    for (uint32_t step = 0u; step < 32u; ++step) {
+        if (step == 16u) {
+            const auto before = ReadContactValues<Vec3>(graph, nk::FieldId::ParticlePos);
+            for (auto* world : {&eager, &graph, &conservative}) ASSERT_EQ(world->Reset({1u}), nphi::Status::Ok);
+            const auto after = ReadContactValues<Vec3>(graph, nk::FieldId::ParticlePos);
+            for (uint32_t env : {0u, 2u})
+                EXPECT_EQ(std::memcmp(before.data() + env * cap.particles_per_env,
+                    after.data() + env * cap.particles_per_env, cap.particles_per_env * sizeof(Vec3)), 0);
+        }
+        auto input = targets;
+        for (size_t i = 0u; i < input.size(); ++i)
+            input[i] += 0.002f * std::sin(0.2f * float(step) + float(i));
+        for (auto* world : {&eager, &graph, &conservative}) {
+            ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::DriveTarget, input.data(), input.size() * sizeof(float)));
+            ASSERT_EQ(world->StepConfigured(), nphi::Status::Ok) << world->LastExecutionError().message;
+            ASSERT_EQ(world->Synchronize(), nphi::Status::Ok);
+            EXPECT_EQ(ReadContactValues<uint32_t>(*world, nk::FieldId::EnvStatus), std::vector<uint32_t>(envs));
+        }
+        EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
+        EXPECT_EQ(ReadPipelineState(conservative), ReadPipelineState(graph));
+        for (auto field : {nk::FieldId::ParticleF, nk::FieldId::ParticleC, nk::FieldId::PointEndpointRanges,
+                           nk::FieldId::PointEndpointTerms, nk::FieldId::ContactSideAKind, nk::FieldId::ContactSideBKind,
+                           nk::FieldId::ContactSideAIndex, nk::FieldId::ContactSideBIndex})
+            EXPECT_EQ(ReadContactValues<uint8_t>(eager, field), ReadContactValues<uint8_t>(graph, field));
+        const auto rows = ReadContactValues<nk::NkRow>(graph, nk::FieldId::Urows);
+        const auto lambda = ReadContactValues<float>(graph, nk::FieldId::Lambda);
+        const auto roots = ReadContactValues<uint32_t>(graph, nk::FieldId::CcRoot);
+        std::vector<uint32_t> masks(rows.size());
+        for (uint32_t r = 0u; r < rows.size(); ++r) {
+            const auto& row = rows[r];
+            if (!(row.flags & nk::nk_row_flags::kActive)) continue;
+            const uint32_t env = r / cap.max_rows_per_env;
+            ASSERT_LT(roots[r], rows.size());
+            EXPECT_EQ(roots[r] / cap.max_rows_per_env, env);
+            const uint32_t a = category(row.a.kind), b = category(row.b.kind);
+            if (a < 4u) masks[roots[r]] |= 1u << a;
+            if (b < 4u) masks[roots[r]] |= 1u << b;
+            if (a < 4u && b < 4u && a != b && (row.flags & nk::nk_row_flags::kContactNormal))
+                pair_impulse[env][std::min(a, b)][std::max(a, b)] += std::abs(lambda[r]);
+        }
+        for (uint32_t r = 0u; r < masks.size(); ++r)
+            if (masks[r] == 15u) shared_island[r / cap.max_rows_per_env] = true;
+        for (auto value : ReadContactValues<Vec3>(graph, nk::FieldId::ParticlePos))
+            ASSERT_TRUE(std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z));
+        for (float value : ReadContactValues<float>(graph, nk::FieldId::ParticleF)) ASSERT_TRUE(std::isfinite(value));
+    }
+    for (uint32_t env = 0u; env < envs; ++env) {
+        EXPECT_TRUE(shared_island[env]);
+        for (uint32_t a = 0u; a < 4u; ++a)
+            for (uint32_t b = a + 1u; b < 4u; ++b) {
+                std::printf("[four-system-contact] env=%u a=%u b=%u impulse=%.9e\n", env, a, b, pair_impulse[env][a][b]);
+                EXPECT_GT(pair_impulse[env][a][b], 1.0e-8) << "env=" << env << " a=" << a << " b=" << b;
+            }
+    }
+    EXPECT_EQ(graph.DataViewRef().point_endpoint_terms, address);
+    EXPECT_EQ(graph.GraphReplays(), 32u);
+    ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
+    EXPECT_EQ(ReadPipelineState(graph), initial);
 }
 
 TEST(RobotClothFluidCoResident, ContactWrenchPreservesEndpointOrderAndIsolation) {

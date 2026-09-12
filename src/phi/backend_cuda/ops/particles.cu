@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 
+#include "collision/mesh_surface.hpp"
 #include "math/cuda_vec_ops.cuh"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "phi/backend_cuda/launch.cuh"
@@ -30,6 +31,55 @@ using mg::Sub;
 namespace fl = ::nuka::runtime::fluid;
 
 constexpr uint32_t kBlockSize = 128u;
+
+// Bounds follow the current working positions; immutable escape links retain the cooked topology.
+__global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView model, DataView data) {
+    const uint32_t task = blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= p.env_count * p.surfaces_per_env) return;
+    const uint32_t env = task / p.surfaces_per_env;
+    const auto info = model.particle_surface_info[task % p.surfaces_per_env];
+    const collision::MeshSurfaceView view{
+        reinterpret_cast<const float*>(data.pbf_predicted_pos + size_t{env} * p.particles_per_env),
+        model.particle_surface_triangles, model.particle_surface_tree,
+        {p.particles_per_env, p.triangles_per_env, p.nodes_per_env}};
+    auto* nodes = data.particle_surface_nodes + size_t{env} * p.nodes_per_env + info.node_offset;
+    for (uint32_t remaining = info.node_count; remaining > 0u; --remaining) {
+        const uint32_t local = remaining - 1u;
+        auto node = model.particle_surface_tree[info.node_offset + local];
+        if (node.triangle != ~0u) {
+            math::Vec3 a, b, c;
+            if (!collision::MeshSurfaceTriangle(view, info, node.triangle, a, b, c) ||
+                !isfinite(a.LengthSq()) || !isfinite(b.LengthSq()) || !isfinite(c.LengthSq())) {
+                atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                nodes[0].escape = 0u;
+                return;
+            }
+            node.lower = {fminf(a.x, fminf(b.x, c.x)), fminf(a.y, fminf(b.y, c.y)), fminf(a.z, fminf(b.z, c.z))};
+            node.upper = {fmaxf(a.x, fmaxf(b.x, c.x)), fmaxf(a.y, fmaxf(b.y, c.y)), fmaxf(a.z, fmaxf(b.z, c.z))};
+        } else {
+            const auto left = nodes[local + 1u];
+            const auto right = nodes[left.escape];
+            node.lower = {fminf(left.lower.x, right.lower.x), fminf(left.lower.y, right.lower.y),
+                          fminf(left.lower.z, right.lower.z)};
+            node.upper = {fmaxf(left.upper.x, right.upper.x), fmaxf(left.upper.y, right.upper.y),
+                          fmaxf(left.upper.z, right.upper.z)};
+        }
+        nodes[local] = node;
+    }
+}
+
+Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
+                              const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ParticleSurfacesParams*>(params);
+    if (p == nullptr) return Status::InvalidArgument;
+    if (p->surfaces_per_env == 0u || p->env_count == 0u) return Status::Ok;
+    if (!model.particle_surface_info || !model.particle_surface_tree ||
+        !model.particle_surface_triangles || !data.particle_surface_nodes || !data.pbf_predicted_pos)
+        return Status::InvalidArgument;
+    const uint32_t blocks = (p->env_count * p->surfaces_per_env + kBlockSize - 1u) / kBlockSize;
+    LaunchCuda(RefitParticleSurfacesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream, *p, model, data);
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
 
 // Particles are environment-major; the initial per-environment slice contains soft material.
 __device__ __forceinline__ bool SfIsSoft(uint32_t i, uint32_t n_soft,
@@ -118,7 +168,8 @@ __global__ void ParticlePredictKernel(
     uint32_t count, uint32_t per_env, uint32_t active_begin,
     const math::Vec3* __restrict__ positions, math::Vec3* __restrict__ previous,
     math::Vec3* __restrict__ predicted, math::Vec3* __restrict__ velocities,
-    math::Vec3* __restrict__ contact_reference, const float* __restrict__ inv_mass,
+    math::Vec3* __restrict__ contact_reference, math::Vec3* __restrict__ projection_delta,
+    const float* __restrict__ inv_mass,
     math::Vec3 gravity, float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count || i % per_env < active_begin) return;
@@ -129,6 +180,7 @@ __global__ void ParticlePredictKernel(
     velocities[i] = velocity;
     contact_reference[i] = velocity;
     predicted[i] = inv_mass[i] > 0.0f ? Add(start, Scale(velocity, dt)) : start;
+    projection_delta[i] = {};
 }
 
 // XPBD multipliers reset to 0 at step start (Macklin 2016). One thread per
@@ -143,46 +195,57 @@ __global__ void XpbdLambdaResetKernel(uint32_t count, float* __restrict__ lambda
 
 __global__ void ParticleProjectionVelocityKernel(
     uint32_t count, uint32_t per_env, uint32_t active_begin,
-    const math::Vec3* __restrict__ previous, const math::Vec3* __restrict__ projected,
+    const math::Vec3* __restrict__ previous, math::Vec3* __restrict__ projected,
+    math::Vec3* __restrict__ projection_delta,
     const float* __restrict__ inv_mass, math::Vec3* __restrict__ velocities,
-    math::Vec3* __restrict__ contact_reference, float inv_dt) {
+    math::Vec3* __restrict__ contact_reference, float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count || i % per_env < active_begin || inv_mass[i] <= 0.0f) return;
-    const math::Vec3 velocity = Scale(Sub(projected[i], previous[i]), inv_dt);
+    const math::Vec3 velocity = Add(velocities[i], Scale(projection_delta[i], 1.0f / dt));
     velocities[i] = velocity;
     contact_reference[i] = velocity;
+    projection_delta[i] = {};
+    projected[i] = Add(previous[i], Scale(velocity, dt));
 }
 
-// Contact velocity increments are applied once before the next material projection.
+// Reconstruct working positions from the interval start to avoid accumulating position-rounding error.
 __global__ void ParticleContactDeltaKernel(
     uint32_t count, uint32_t per_env, uint32_t active_begin,
-    math::Vec3* __restrict__ projected, const math::Vec3* __restrict__ velocities,
-    math::Vec3* __restrict__ contact_reference, const float* __restrict__ inv_mass, float dt) {
+    const math::Vec3* __restrict__ previous, math::Vec3* __restrict__ projected,
+    const math::Vec3* __restrict__ velocities,
+    math::Vec3* __restrict__ contact_reference,
+    const float* __restrict__ inv_mass, float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count || i % per_env < active_begin || inv_mass[i] <= 0.0f) return;
-    const math::Vec3 delta = Sub(velocities[i], contact_reference[i]);
-    projected[i] = Add(projected[i], Scale(delta, dt));
+    projected[i] = Add(previous[i], Scale(velocities[i], dt));
     contact_reference[i] = velocities[i];
 }
 
 // Pseudo displacement changes the committed position without entering physical velocity.
 __global__ void ParticleFinalizeKernel(
     uint32_t count, uint32_t per_env, uint32_t active_begin,
-    math::Vec3* __restrict__ positions, const math::Vec3* __restrict__ previous,
-    const math::Vec3* __restrict__ projected, math::Vec3* __restrict__ velocities,
+    math::Vec3* __restrict__ positions,
+    const math::Vec3* __restrict__ projected, const math::Vec3* __restrict__ velocities,
     const math::Vec3* __restrict__ contact_reference, const math::Vec3* __restrict__ pseudo,
     const float* __restrict__ inv_mass, float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count || i % per_env < active_begin || inv_mass[i] <= 0.0f) return;
     const math::Vec3 delta = Sub(velocities[i], contact_reference[i]);
-    velocities[i] = Add(Scale(Sub(projected[i], previous[i]), 1.0f / dt), delta);
     const math::Vec3 correction = pseudo != nullptr ? Add(delta, pseudo[i]) : delta;
     positions[i] = Add(projected[i], Scale(correction, dt));
+}
+
+// Accumulate corrections before absolute-position rounding can erase their velocity impulses.
+__device__ __forceinline__ void ApplyProjectionDelta(math::Vec3* positions,
+    math::Vec3* accumulated, uint32_t index, math::Vec3 delta) {
+    positions[index] = Add(positions[index], delta);
+    accumulated[index] = Add(accumulated[index], delta);
 }
 
 // Distance projection updates only the two particles owned by its constraint.
 struct XpbdDistanceProjector {
     math::Vec3* __restrict__ positions;
+    math::Vec3* __restrict__ projection_delta;
     const float* __restrict__ inv_masses;
     const uint32_t* __restrict__ particle_a;
     const uint32_t* __restrict__ particle_b;
@@ -214,8 +277,8 @@ struct XpbdDistanceProjector {
         const float lam = lambda[c];
         const float delta_lambda =
             (-constraint - alpha_tilde * lam) / (w_sum + alpha_tilde);
-        positions[ia] = Add(pa, Scale(n, wa * delta_lambda));
-        positions[ib] = Sub(pb, Scale(n, wb * delta_lambda));
+        ApplyProjectionDelta(positions, projection_delta, ia, Scale(n, wa * delta_lambda));
+        ApplyProjectionDelta(positions, projection_delta, ib, Scale(n, -wb * delta_lambda));
         lambda[c] = lam + delta_lambda;
     }
 };
@@ -223,6 +286,7 @@ struct XpbdDistanceProjector {
 // Isometric bend projection retains the constraint's fixed gradient order.
 struct XpbdBendProjector {
     math::Vec3* __restrict__ positions;
+    math::Vec3* __restrict__ projection_delta;
     const float* __restrict__ inv_masses;
     const uint32_t* __restrict__ particles;
     const math::Vec3* __restrict__ gradients;
@@ -254,8 +318,7 @@ struct XpbdBendProjector {
         const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
         for (uint32_t j = 0u; j < 4u; ++j) {
             if (w[j] > 0.0f) {
-                positions[idx[j]] =
-                    Add(positions[idx[j]], Scale(grad[j], w[j] * delta_lambda));
+                ApplyProjectionDelta(positions, projection_delta, idx[j], Scale(grad[j], w[j] * delta_lambda));
             }
         }
         lambda[c] = lam + delta_lambda;
@@ -265,6 +328,7 @@ struct XpbdBendProjector {
 // Tetrahedral volume projection uses the signed rest determinant.
 struct XpbdVolumeProjector {
     math::Vec3* __restrict__ positions;
+    math::Vec3* __restrict__ projection_delta;
     const float* __restrict__ inv_masses;
     const uint32_t* __restrict__ particles;
     const float* __restrict__ rest_times6;
@@ -304,10 +368,10 @@ struct XpbdVolumeProjector {
         }
         const float lam = lambda[c];
         const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
-        if (w0 > 0.0f) positions[i0] = Add(p0, Scale(g0, w0 * delta_lambda));
-        if (w1 > 0.0f) positions[i1] = Add(p1, Scale(g1, w1 * delta_lambda));
-        if (w2 > 0.0f) positions[i2] = Add(p2, Scale(g2, w2 * delta_lambda));
-        if (w3 > 0.0f) positions[i3] = Add(p3, Scale(g3, w3 * delta_lambda));
+        if (w0 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i0, Scale(g0, w0 * delta_lambda));
+        if (w1 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i1, Scale(g1, w1 * delta_lambda));
+        if (w2 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i2, Scale(g2, w2 * delta_lambda));
+        if (w3 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i3, Scale(g3, w3 * delta_lambda));
         lambda[c] = lam + delta_lambda;
     }
 };
@@ -375,6 +439,7 @@ __device__ __forceinline__ SmMat3 SmPolarRotation(const SmMat3& A) {
 // Shape matching keeps centroid, covariance, and goal updates in member order.
 struct XpbdShapeMatchProjector {
     math::Vec3* __restrict__ positions;
+    math::Vec3* __restrict__ projection_delta;
     const float* __restrict__ inv_masses;
     const uint32_t* __restrict__ cluster_offset;
     const uint32_t* __restrict__ cluster_size;
@@ -437,7 +502,7 @@ struct XpbdShapeMatchProjector {
                 R.m[6] * q.x + R.m[7] * q.y + R.m[8] * q.z);
             const math::Vec3 goal = Add(c, rq);
             const math::Vec3 p = positions[idx];
-            positions[idx] = Add(p, Scale(Sub(goal, p), s));
+            ApplyProjectionDelta(positions, projection_delta, idx, Scale(Sub(goal, p), s));
         }
     }
 };
@@ -651,6 +716,7 @@ __global__ void PbfComputeCorrectionKernel(
 // z-up; the boundary clamps the predicted z (the legacy clamped y — same shape).
 __global__ void PbfApplyCorrectionKernel(uint32_t particle_count,
                                          math::Vec3* __restrict__ predicted,
+                                         math::Vec3* __restrict__ projection_delta,
                                          const math::Vec3* __restrict__ delta,
                                          const float* __restrict__ inv_mass,
                                          uint32_t n_soft, uint32_t per_env,
@@ -661,12 +727,14 @@ __global__ void PbfApplyCorrectionKernel(uint32_t particle_count,
         return;
     }
     const math::Vec3 pi = predicted[i];
-    const math::Vec3 dp = delta[i];
+    math::Vec3 dp = delta[i];
     math::Vec3 out{pi.x + dp.x, pi.y + dp.y, pi.z + dp.z};
     if (boundary_enabled && out.z < floor_z) {
         out.z = floor_z;
+        dp.z = floor_z - pi.z;
     }
     predicted[i] = out;
+    projection_delta[i] = Add(projection_delta[i], dp);
 }
 
 // XSPH viscosity reads fluid velocities and stages per-particle corrections.
@@ -857,6 +925,7 @@ __global__ void PpContactHalfCorrectionKernel(
 // Each particle applies its gathered contact correction without shared writes.
 __global__ void PpContactApplyKernel(uint32_t union_count,
                                      math::Vec3* __restrict__ positions,
+                                     math::Vec3* __restrict__ projection_delta,
                                      const math::Vec3* __restrict__ delta) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= union_count) {
@@ -866,8 +935,7 @@ __global__ void PpContactApplyKernel(uint32_t union_count,
     if (d.x == 0.0f && d.y == 0.0f && d.z == 0.0f) {
         return;  // no correction: leave the position bit-untouched (inert path).
     }
-    const math::Vec3 p = positions[i];
-    positions[i] = math::Vec3{p.x + d.x, p.y + d.y, p.z + d.z};
+    ApplyProjectionDelta(positions, projection_delta, i, d);
 }
 
 // Particle op entry points validate buffers and launch on the supplied stream.
@@ -907,12 +975,14 @@ Status OpParticlePredict(const ModelView&, const DataView& data,
     if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particle_count % per_env != 0u ||
         active_begin > per_env || data.particle_pos == nullptr || data.particle_prev_pos == nullptr ||
         data.pbf_predicted_pos == nullptr || data.particle_vel == nullptr ||
-        data.particle_v_pre == nullptr || data.particle_inv_mass == nullptr)
+        data.particle_v_pre == nullptr || data.particle_projection_delta == nullptr ||
+        data.particle_inv_mass == nullptr)
         return Status::InvalidArgument;
     const uint32_t blocks = (p->particle_count - 1u) / kBlockSize + 1u;
     LaunchCuda(ParticlePredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                p->particle_count, per_env, active_begin, data.particle_pos, data.particle_prev_pos,
-               data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre, data.particle_inv_mass,
+               data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre,
+               data.particle_projection_delta, data.particle_inv_mass,
                math::Vec3{p->gravity[0], p->gravity[1], p->gravity[2]}, p->dt);
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
@@ -926,15 +996,16 @@ Status OpParticleProjectionVelocity(const ModelView&, const DataView& data,
         p->particle_count % p->particles_per_env != 0u ||
         p->active_begin_per_env > p->particles_per_env ||
         data.particle_vel == nullptr || data.particle_v_pre == nullptr ||
-        data.particle_inv_mass == nullptr || data.particle_prev_pos == nullptr ||
-        data.pbf_predicted_pos == nullptr)
+        data.particle_inv_mass == nullptr || data.particle_projection_delta == nullptr ||
+        data.pbf_predicted_pos == nullptr || data.particle_prev_pos == nullptr)
         return Status::InvalidArgument;
     if (p->active_begin_per_env == p->particles_per_env) return Status::Ok;
     const uint32_t blocks = (p->particle_count - 1u) / kBlockSize + 1u;
     LaunchCuda(ParticleProjectionVelocityKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                p->particle_count, p->particles_per_env, p->active_begin_per_env,
-               data.particle_prev_pos, data.pbf_predicted_pos, data.particle_inv_mass,
-               data.particle_vel, data.particle_v_pre, 1.0f / p->dt);
+               data.particle_prev_pos, data.pbf_predicted_pos,
+               data.particle_projection_delta, data.particle_inv_mass,
+               data.particle_vel, data.particle_v_pre, p->dt);
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
@@ -946,13 +1017,14 @@ Status OpParticleContactDelta(const ModelView&, const DataView& data,
     if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particles_per_env == 0u ||
         p->particle_count % p->particles_per_env != 0u ||
         p->active_begin_per_env > p->particles_per_env || data.pbf_predicted_pos == nullptr ||
-        data.particle_vel == nullptr || data.particle_v_pre == nullptr || data.particle_inv_mass == nullptr)
+        data.particle_vel == nullptr || data.particle_v_pre == nullptr ||
+        data.particle_inv_mass == nullptr || data.particle_prev_pos == nullptr)
         return Status::InvalidArgument;
     if (p->active_begin_per_env == p->particles_per_env) return Status::Ok;
     const uint32_t blocks = (p->particle_count - 1u) / kBlockSize + 1u;
     LaunchCuda(ParticleContactDeltaKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                p->particle_count, p->particles_per_env, p->active_begin_per_env,
-               data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre,
+               data.particle_prev_pos, data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre,
                data.particle_inv_mass, p->dt);
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
@@ -966,7 +1038,8 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
     const uint32_t env_count = p->env_count == 0u ? 1u : p->env_count;
     if (!(p->dt > 0.0f) || !std::isfinite(p->dt) ||
-        data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr)
+        data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr ||
+        data.particle_projection_delta == nullptr)
         return Status::InvalidArgument;
     if ((p->dist_con_count > 0u &&
          (model.dist_particle_a == nullptr || model.dist_particle_b == nullptr ||
@@ -1008,28 +1081,28 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
 
     // Each call retains the material-family order and the step's accumulated lambdas.
     status = ProjectXpbdFamily(
-        XpbdDistanceProjector{data.pbf_predicted_pos, data.particle_inv_mass,
+        XpbdDistanceProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
                              model.dist_particle_a, model.dist_particle_b,
                              model.dist_rest_length, model.dist_compliance, data.dist_lambda, p->dt},
         dist_blocks, p->dist_con_count, p->dist_cons_per_env, env_count, p->dist_colors,
         model.dist_color_segments, iters, p->iteration_start, data.dist_lambda, stream);
     if (status != Status::Ok) return status;
     status = ProjectXpbdFamily(
-        XpbdBendProjector{data.pbf_predicted_pos, data.particle_inv_mass,
+        XpbdBendProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
                          model.bend_particles, model.bend_gradients,
                          model.bend_compliance, data.bend_lambda, p->dt},
         bend_blocks, p->bend_con_count, p->bend_cons_per_env, env_count, p->bend_colors,
         model.bend_color_segments, iters, p->iteration_start, data.bend_lambda, stream);
     if (status != Status::Ok) return status;
     status = ProjectXpbdFamily(
-        XpbdVolumeProjector{data.pbf_predicted_pos, data.particle_inv_mass,
+        XpbdVolumeProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
                            model.vol_particles, model.vol_rest_times6,
                            model.vol_compliance, data.vol_lambda, p->dt},
         vol_blocks, p->vol_con_count, p->vol_cons_per_env, env_count, p->vol_colors,
         model.vol_color_segments, iters, p->iteration_start, data.vol_lambda, stream);
     if (status != Status::Ok) return status;
     return ProjectXpbdFamily(
-        XpbdShapeMatchProjector{data.pbf_predicted_pos, data.particle_inv_mass,
+        XpbdShapeMatchProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
                                model.sm_cluster_offset, model.sm_cluster_size,
                                model.sm_stiffness, model.sm_rest_centroid,
                                model.sm_particles, model.sm_rest_q, model.sm_mass},
@@ -1055,6 +1128,7 @@ Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
         (p->boundary_enabled != 0u && !std::isfinite(p->floor_z)) ||
         data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr ||
         data.pbf_density == nullptr || data.pbf_lambda == nullptr || data.pbf_position_delta == nullptr ||
+        data.particle_projection_delta == nullptr ||
         data.grid_neighbor_count == nullptr || data.grid_neighbor_offset == nullptr)
         return Status::InvalidArgument;
     const fl::PbfKernelCoeffs coeffs = fl::MakePbfKernelCoeffs(p->support_radius);
@@ -1084,7 +1158,7 @@ Status OpPbfDensityLambda(const ModelView& /*model*/, const DataView& data,
         // the last apply, so the two ops together == the legacy NxN loop).
         if (it + 1u < iters) {
             LaunchCuda(PbfApplyCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                       stream, N, data.pbf_predicted_pos, data.pbf_position_delta,
+                       stream, N, data.pbf_predicted_pos, data.particle_projection_delta, data.pbf_position_delta,
                        data.particle_inv_mass, n_soft, per_env,
                        p->boundary_enabled != 0u, p->floor_z);
             if (cudaGetLastError() != cudaSuccess) return Status::Failed;
@@ -1106,11 +1180,12 @@ Status OpPbfApplyDelta(const ModelView& /*model*/, const DataView& data,
     const uint32_t per_env = p->particles_per_env != 0u ? p->particles_per_env : N;
     if (!std::isfinite(p->support_radius) || N % per_env != 0u || p->n_soft_particles > per_env ||
         (p->boundary_enabled != 0u && !std::isfinite(p->floor_z)) ||
-        data.pbf_predicted_pos == nullptr || data.pbf_position_delta == nullptr || data.particle_inv_mass == nullptr)
+        data.pbf_predicted_pos == nullptr || data.pbf_position_delta == nullptr || data.particle_inv_mass == nullptr ||
+        data.particle_projection_delta == nullptr)
         return Status::InvalidArgument;
     const uint32_t blocks = (N + kBlockSize - 1u) / kBlockSize;
     LaunchCuda(PbfApplyCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               N, data.pbf_predicted_pos, data.pbf_position_delta,
+               N, data.pbf_predicted_pos, data.particle_projection_delta, data.pbf_position_delta,
                data.particle_inv_mass, p->n_soft_particles, per_env,
                p->boundary_enabled != 0u, p->floor_z);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
@@ -1133,7 +1208,7 @@ Status OpParticleFinalize(const ModelView&, const DataView& data,
     const uint32_t count = p->particle_count;
     const uint32_t blocks = (count - 1u) / kBlockSize + 1u;
     LaunchCuda(ParticleFinalizeKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               count, per_env, active_begin, data.particle_pos, data.particle_prev_pos,
+               count, per_env, active_begin, data.particle_pos,
                data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre,
                p->pos_pass != 0u ? data.particle_pseudo_vel : nullptr,
                data.particle_inv_mass, p->dt);
@@ -1177,6 +1252,7 @@ Status OpParticleParticleContact(const ModelView& model, const DataView& data,
     }
     const uint32_t N = p->particle_count;
     if (p->particles_per_env == 0u || N % p->particles_per_env != 0u ||
+        data.particle_projection_delta == nullptr ||
         (model.particle_topology_offsets != nullptr &&
          (model.particle_topology_elements == nullptr || model.particle_contact_rest_pos == nullptr)))
         return Status::InvalidArgument;
@@ -1193,7 +1269,7 @@ Status OpParticleParticleContact(const ModelView& model, const DataView& data,
                    data.grid_neighbor_idx, data.pbf_position_delta);
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         LaunchCuda(PpContactApplyKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   N, data.pbf_predicted_pos, data.pbf_position_delta);
+                   N, data.pbf_predicted_pos, data.particle_projection_delta, data.pbf_position_delta);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
@@ -1201,6 +1277,7 @@ Status OpParticleParticleContact(const ModelView& model, const DataView& data,
 }  // namespace
 
 void RegisterNkParticleOps() {
+    SetCudaOp(NkOp::RefitParticleSurfaces, &OpRefitParticleSurfaces);
     SetCudaOp(NkOp::ParticleAeroDrag, &OpParticleAeroDrag);
     SetCudaOp(NkOp::ParticlePredict, &OpParticlePredict);
     SetCudaOp(NkOp::ParticleProjectionVelocity, &OpParticleProjectionVelocity);

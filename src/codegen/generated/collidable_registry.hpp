@@ -25,9 +25,10 @@ enum class CollidableType : uint8_t {
     StaticWorld = 3u,
     GridNode = 4u,
     StaticBoundary = 5u,
+    ParticleSurface = 6u,
 };
 
-inline constexpr uint32_t kCollidableTypeCount = 6u;
+inline constexpr uint32_t kCollidableTypeCount = 7u;
 
 // STATIC per-type metadata. Provider KIND selectors only -- NO function pointers
 // (the runtime device-fn-ptrs, e.g. the compute_aabbs AABB provider, are
@@ -47,6 +48,7 @@ inline constexpr CollidableTypeInfo kCollidableTypeTable[kCollidableTypeCount] =
     { CollidableType::StaticWorld, AccelStructureKind::None, ShapeProxyKind::ShapeBacked, ReactionProviderKind::StaticNull },
     { CollidableType::GridNode, AccelStructureKind::None, ShapeProxyKind::None, ReactionProviderKind::GridInvMass },
     { CollidableType::StaticBoundary, AccelStructureKind::None, ShapeProxyKind::None, ReactionProviderKind::StaticNull },
+    { CollidableType::ParticleSurface, AccelStructureKind::None, ShapeProxyKind::ShapeBacked, ReactionProviderKind::PointEndpoint },
 };
 
 // O(1) metadata lookup (direct index into the id-ordered table).

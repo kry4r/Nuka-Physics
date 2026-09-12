@@ -44,3 +44,4 @@ enums:
     - ParticleInvMass
     - StaticNull
     - GridInvMass
+    - PointEndpoint

@@ -95,6 +95,7 @@ private:
     phi::ApplyDrivesParams            p_apply_drives_{};
     phi::ApplyDynamicsDrivesParams    p_apply_dynamics_{};
     phi::ReadoutDrivesParams          p_readout_drives_{};
+    phi::ParticleSurfacesParams       p_particle_surfaces_{};
     phi::AbaForwardParams             p_aba_{};
     phi::IntegrateVelocityParams      p_int_vel_{};
     phi::SnapshotStepVelocityParams   p_step_velocity_{};

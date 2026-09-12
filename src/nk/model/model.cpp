@@ -143,6 +143,14 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         return 0u;
     }
     if (lay.per == FieldPer::Scalar) {
+        if (id == FieldId::ParticleSurfaceInfo || id == FieldId::ParticleSurfaceThickness ||
+            id == FieldId::ParticleSurfaceFriction) return particle_surfaces_per_env;
+        if (id == FieldId::ParticleSurfaceTriangles) return uint64_t{particle_surface_triangles} * 3u;
+        if (id == FieldId::ParticleSurfaceTree) return particle_surface_nodes_per_env;
+        if (id == FieldId::ParticleSurfaceNodes)
+            return point_endpoints_per_env > 0u ? CheckedProduct({particle_surface_nodes_per_env, env_count}) : 0u;
+        if (id == FieldId::PointEndpointRanges) return CheckedProduct({point_endpoints_per_env, env_count});
+        if (id == FieldId::PointEndpointTerms) return CheckedProduct({point_endpoint_terms_per_env, env_count});
         if (id == FieldId::GridNeighborIdx)
             return CheckedProduct({NeighborPoolCapacity(), env_count});
         // Symbolic scalar counts require an explicit field-specific extent.
@@ -487,6 +495,26 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
+        case FieldId::ParticleSurfaceInfo:
+            if (!particles.surface_info.empty()) std::memcpy(dst, particles.surface_info.data(),
+                particles.surface_info.size() * sizeof(collision::MeshSurfaceInfo));
+            break;
+        case FieldId::ParticleSurfaceTriangles:
+            if (!particles.surface_triangles.empty()) std::memcpy(dst, particles.surface_triangles.data(),
+                particles.surface_triangles.size() * sizeof(uint32_t));
+            break;
+        case FieldId::ParticleSurfaceTree:
+            if (!particles.surface_tree.empty()) std::memcpy(dst, particles.surface_tree.data(),
+                particles.surface_tree.size() * sizeof(collision::MeshBvhNode));
+            break;
+        case FieldId::ParticleSurfaceThickness:
+            if (!particles.surface_thickness.empty()) std::memcpy(dst, particles.surface_thickness.data(),
+                particles.surface_thickness.size() * sizeof(float));
+            break;
+        case FieldId::ParticleSurfaceFriction:
+            if (!particles.surface_friction.empty()) std::memcpy(dst, particles.surface_friction.data(),
+                particles.surface_friction.size() * sizeof(float));
+            break;
         case FieldId::MeshSurfaceInfo:
             if (!mesh_surface_info.empty()) std::memcpy(dst, mesh_surface_info.data(),
                 mesh_surface_info.size() * sizeof(collision::MeshSurfaceInfo));
@@ -998,6 +1026,11 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         // L1-c: FieldId::UnionSlots (v.union_slots) was DELETED with the field.
         case FieldId::HullVerts:             v.hull_verts = static_cast<float*>(p); break;
         case FieldId::MeshSurfaceInfo: v.mesh_surface_info = static_cast<collision::MeshSurfaceInfo*>(p); break;
+        case FieldId::ParticleSurfaceInfo: v.particle_surface_info = static_cast<collision::MeshSurfaceInfo*>(p); break;
+        case FieldId::ParticleSurfaceTriangles: v.particle_surface_triangles = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceTree: v.particle_surface_tree = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::ParticleSurfaceThickness: v.particle_surface_thickness = static_cast<float*>(p); break;
+        case FieldId::ParticleSurfaceFriction: v.particle_surface_friction = static_cast<float*>(p); break;
         case FieldId::MeshTriangles: v.mesh_triangles = static_cast<uint32_t*>(p); break;
         case FieldId::MeshBvhNodes: v.mesh_bvh_nodes = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ShapeTable:            v.shape_table = static_cast<float*>(p); break;
@@ -1058,8 +1091,13 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
             throw std::invalid_argument("grid contact pool exceeds contact capacity");
         if (mpm_grid_nodes_per_env > 0u &&
             (CheckedProduct({mpm_grid_nodes_per_env, env_count}) > nk::kContactHandleMask ||
-             CheckedProduct({env_count, kMpmBoundaryCount}) > nk::kContactHandleMask))
+             CheckedProduct({env_count, kMpmBoundaryCount}) > nk::kContactHandleMask ||
+             CheckedProduct({particle_surfaces_per_env, env_count}) > nk::kContactHandleMask))
             throw std::invalid_argument("grid contact identity exceeds handle range");
+        if (mpm_grid_nodes_per_env > 0u && particle_surfaces_per_env > 0u &&
+            (point_endpoints_per_env < mpm_contact_capacity_per_env ||
+             uint64_t{point_endpoint_terms_per_env} < uint64_t{mpm_contact_capacity_per_env} * kTriangleEndpointTerms))
+            throw std::invalid_argument("grid surface contacts exceed point endpoint capacity");
         const auto int_limit = static_cast<uint64_t>(std::numeric_limits<int>::max());
         if (links_per_env != 0u && CheckedProduct({max_rows_per_env, env_count, 2u}) > int_limit)
             throw std::invalid_argument("contact endpoints exceed device sort index range");
@@ -1112,6 +1150,51 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         return reject(Status::InvalidArgument, "environment count must be positive");
     if (MpmParticlesPerEnv() > cap.particles_per_env)
         return reject(Status::InvalidArgument, "MPM particle slice exceeds its environment");
+    if (particles.surface_info.size() != cap.particle_surfaces_per_env ||
+        particles.surface_thickness.size() != particles.surface_info.size() ||
+        particles.surface_friction.size() != particles.surface_info.size() ||
+        particles.surface_triangles.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
+        particles.surface_tree.size() != cap.particle_surface_nodes_per_env)
+        return reject(Status::InvalidArgument, "particle surface topology counts disagree");
+    const collision::MeshSurfaceView particle_mesh{
+        reinterpret_cast<const float*>(particles.initial_pos.data()), particles.surface_triangles.data(),
+        particles.surface_tree.data(), {cap.particles_per_env, cap.particle_surface_triangles,
+                                       cap.particle_surface_nodes_per_env}};
+    for (uint32_t surface = 0u; surface < cap.particle_surfaces_per_env; ++surface) {
+        const auto& info = particles.surface_info[surface];
+        if (!collision::MeshSurfaceRangeValid(particle_mesh, info) ||
+            particles.initial_pos.size() != cap.particles_per_env ||
+            !std::isfinite(particles.surface_thickness[surface]) || particles.surface_thickness[surface] < 0.0f ||
+            !std::isfinite(particles.surface_friction[surface]) || particles.surface_friction[surface] < 0.0f ||
+            info.node_count != uint64_t{info.triangle_count} * 2u - 1u)
+            return reject(Status::InvalidArgument, "invalid particle surface");
+        std::vector<uint8_t> seen(info.triangle_count, 0u);
+        for (uint32_t node = 0u; node < info.node_count; ++node) {
+            const auto& entry = particles.surface_tree[info.node_offset + node];
+            if (entry.escape <= node || entry.escape > info.node_count)
+                return reject(Status::InvalidArgument, "invalid particle surface tree escape");
+            if (entry.triangle == ~0u) {
+                if (node + 1u >= info.node_count)
+                    return reject(Status::InvalidArgument, "particle surface tree has no children");
+                const auto& left = particles.surface_tree[info.node_offset + node + 1u];
+                if (left.escape <= node + 1u || left.escape >= entry.escape ||
+                    particles.surface_tree[info.node_offset + left.escape].escape != entry.escape)
+                    return reject(Status::InvalidArgument, "invalid particle surface tree children");
+            } else {
+                if (entry.triangle >= info.triangle_count || entry.escape != node + 1u || seen[entry.triangle]++)
+                    return reject(Status::InvalidArgument, "invalid particle surface tree leaf");
+                const size_t at = size_t{info.triangle_offset + entry.triangle} * 3u;
+                for (uint32_t j = 0u; j < 3u; ++j) {
+                    const uint32_t vertex = particles.surface_triangles[at + j];
+                    if (vertex >= info.vertex_count || info.vertex_offset + vertex < MpmParticlesPerEnv())
+                        return reject(Status::InvalidArgument, "particle surface must reference row-coupled particles");
+                }
+            }
+        }
+        if (particles.surface_tree[info.node_offset].escape != info.node_count ||
+            std::find(seen.begin(), seen.end(), 0u) != seen.end())
+            return reject(Status::InvalidArgument, "particle surface tree omits geometry");
+    }
     if (mpm_materials.size() != cap.mpm_material_count)
         return reject(Status::InvalidArgument, "MPM material table count disagrees with capacity");
     for (const MpmMaterial& m : mpm_materials)
@@ -1121,7 +1204,9 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         if (id >= cap.mpm_material_count)
             return reject(Status::InvalidArgument, "MPM particle material index is out of range");
     for (uint64_t count : {uint64_t(n), uint64_t(k), uint64_t(cap.bodies_per_env),
-                           uint64_t(cap.particles_per_env), uint64_t(cap.aero_tris_per_env) * 3u}) {
+                           uint64_t(cap.particles_per_env), uint64_t(cap.aero_tris_per_env) * 3u,
+                           uint64_t(cap.particle_surface_nodes_per_env), uint64_t(cap.point_endpoints_per_env),
+                           uint64_t(cap.point_endpoint_terms_per_env)}) {
         if (count * cap.env_count > limit)
             return reject(Status::InvalidArgument, "topology exceeds 32-bit device indexing");
     }

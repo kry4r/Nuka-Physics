@@ -1,5 +1,6 @@
 #pragma once
 
+#include "collision/mesh_surface.hpp"
 #include "nk/contact/contact_identity.hpp"
 #include "nk/model/generated/views.hpp"
 #include "nk/solve/collidable_owner.hpp"
@@ -119,6 +120,54 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
                 p.body_mu, surface.feature, body);
         }
     }
+    const collision::MeshSurfaceView particle_surfaces{
+        data.pbf_predicted_pos != nullptr
+            ? reinterpret_cast<const float*>(data.pbf_predicted_pos + size_t{env} * p.particles_per_env) : nullptr,
+        model.particle_surface_triangles,
+        data.particle_surface_nodes != nullptr
+            ? data.particle_surface_nodes + size_t{env} * p.particle_surface_nodes_per_env : nullptr,
+        {p.particles_per_env, p.particle_surface_triangles, p.particle_surface_nodes_per_env}};
+    for (uint32_t mesh = 0u; mesh < p.particle_surfaces_per_env; ++mesh) {
+        const auto info = model.particle_surface_info[mesh];
+        const float band = p.body_band + model.particle_surface_thickness[mesh];
+        const auto surface = collision::QueryMeshSurface(particle_surfaces, info, point, band);
+        if (!surface.valid) {
+            status |= kEnvStatusContactGeometryUnavailable;
+            continue;
+        }
+        if (!(surface.distance < band) || surface.triangle == ~0u) continue;
+        const size_t at = size_t{info.triangle_offset + surface.triangle} * 3u;
+        uint32_t indices[nk::kTriangleEndpointTerms];
+        math::Vec3 vertices[nk::kTriangleEndpointTerms];
+        for (uint32_t i = 0u; i < nk::kTriangleEndpointTerms; ++i) {
+            indices[i] = env * p.particles_per_env + info.vertex_offset + model.particle_surface_triangles[at + i];
+            // Detection uses predicted geometry; impulse arms use the positions that own momentum.
+            vertices[i] = data.particle_pos[indices[i]];
+        }
+        nk::PointEndpointTerm terms[nk::kTriangleEndpointTerms];
+        if (!nk::BuildTrianglePointEndpoint(indices, vertices, surface.barycentric, point, terms)) {
+            status |= kEnvStatusContactGeometryUnavailable;
+            continue;
+        }
+        uint32_t endpoint = 0u;
+        if constexpr (emit) {
+            const uint64_t contact = data.grid_contact_offset[node] -
+                data.grid_contact_offset[env * p.nodes_per_env] + count;
+            if (contact < p.contact_capacity) {
+                endpoint = env * p.point_endpoints_per_env + static_cast<uint32_t>(contact);
+                const uint32_t first = env * p.point_endpoint_terms_per_env +
+                    static_cast<uint32_t>(contact) * nk::kTriangleEndpointTerms;
+                data.point_endpoint_ranges[endpoint] = {first, nk::kTriangleEndpointTerms};
+                for (uint32_t i = 0u; i < nk::kTriangleEndpointTerms; ++i)
+                    data.point_endpoint_terms[first + i] = terms[i];
+            }
+        }
+        Visit<emit>(p, data, node, count, nk::kUContactSidePointEndpoint, endpoint,
+            {constraint::CollidableType::ParticleSurface, constraint::ReactionProviderKind::PointEndpoint,
+             env * p.particle_surfaces_per_env + mesh}, point, surface.normal, band - surface.distance,
+            fmaxf(p.body_mu, model.particle_surface_friction[mesh]),
+            info.triangle_offset + surface.triangle, mesh);
+    }
     if constexpr (!emit) data.grid_contact_count[node] = count;
     if (status != 0u) atomicOr(&data.env_status[env], status);
 }
@@ -129,6 +178,10 @@ __global__ void ClearSlots(MpmParams p, DataView data) {
     const uint32_t slot = (i / p.contact_capacity) * p.contact_slots_per_env +
                           p.contact_slot_base + i % p.contact_capacity;
     data.ucontact_count[slot] = 0u;
+    if (data.point_endpoint_ranges != nullptr) {
+        const uint32_t endpoint = (i / p.contact_capacity) * p.point_endpoints_per_env + i % p.contact_capacity;
+        data.point_endpoint_ranges[endpoint] = {};
+    }
 }
 
 __global__ void CountDiagnostics(MpmParams p, DataView data) {

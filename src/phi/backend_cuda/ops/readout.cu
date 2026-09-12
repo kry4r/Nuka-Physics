@@ -441,6 +441,10 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
                 data.contact_cache_age);
         }
     }
+    for (uint32_t local = threadIdx.x; local < p.point_endpoints_per_env; local += blockDim.x)
+        data.point_endpoint_ranges[env * p.point_endpoints_per_env + local] = {};
+    for (uint32_t local = threadIdx.x; local < p.point_endpoint_terms_per_env; local += blockDim.x)
+        data.point_endpoint_terms[env * p.point_endpoint_terms_per_env + local] = {};
     for (uint32_t local = threadIdx.x; local < p.body_count; local += blockDim.x) {
         const uint32_t body = env * p.body_count + local;
         Transform pose = data.snapshot_body_pose[body];
@@ -737,6 +741,8 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
     reset.body_count = p->total_body_count / envs;
     reset.particle_count = p->total_particle_count / envs;
     reset.has_particle_grid = p->has_particle_grid;
+    reset.point_endpoints_per_env = p->point_endpoints_per_env;
+    reset.point_endpoint_terms_per_env = p->point_endpoint_terms_per_env;
     reset.lambda_stride = p->row_slot_count / envs;
     reset.contact_slot_count = p->contact_slot_count / envs;
     return OpResetEnvs(model, data, &reset, stream);

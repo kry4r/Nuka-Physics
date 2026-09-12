@@ -47,6 +47,7 @@
 #include "runtime/soft/cloth_topology.hpp"     // BuildClothConstraints
 #include "runtime/soft/tetmesh_topology.hpp"   // BuildSphereTetLattice / BuildTetMeshConstraints
 #include "import/cooker/fluid_cooker.hpp"       // CookFluidBox
+#include "import/cooker/mesh_surface_cooker.hpp"
 
 namespace nuka::scene::cook {
 
@@ -854,18 +855,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // than silently writing out of bounds. Terrain cooking recomputes the same
     // reserve after adding its explicit heightfield leaf.
     {
-        if (FILE* f = std::fopen("cook_contact_capacity.txt", "w")) {
-            std::fprintf(f, "bodies_per_env=%u\n", cap.bodies_per_env);
-            std::fprintf(f, "enable_contacts=%d\n", enable_contacts ? 1 : 0);
-            std::fprintf(f, "max_contacts_per_env_before=%u\n", cap.max_contacts_per_env);
-            std::fclose(f);
-        }
         cap.max_contacts_per_env = cap.bodies_per_env > 1u
             ? DefaultRigidCandidatePairs(cap.bodies_per_env) : 0u;
-        if (FILE* f = std::fopen("cook_contact_capacity.txt", "a")) {
-            std::fprintf(f, "max_contacts_per_env_after=%u\n", cap.max_contacts_per_env);
-            std::fclose(f);
-        }
         SetRowCapacity(cap,
                        static_cast<uint64_t>(cap.max_contacts_per_env) *
                            nk::kPairDrivenRowsPerSlot);
@@ -1562,6 +1553,31 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     mp.aero_drag_tangent = in.aero_drag_tangent;
     mp.aero_drag_max_dv  = in.aero_drag_max_dv;
 
+    mp.surface_info.clear();
+    mp.surface_triangles.clear();
+    mp.surface_tree.clear();
+    mp.surface_thickness.clear();
+    mp.surface_friction.clear();
+    for (const auto& surface : in.surfaces) {
+        if (surface.triangles.empty() || surface.triangles.size() % 3u != 0u ||
+            !std::isfinite(surface.half_thickness) || surface.half_thickness < 0.0f ||
+            !std::isfinite(surface.friction) || surface.friction < 0.0f)
+            throw std::invalid_argument("invalid deformable collision surface");
+        auto cooked = import::cooker::CookMeshSurface(
+            reinterpret_cast<const float*>(mp.initial_pos.data()), static_cast<uint32_t>(mp.initial_pos.size()),
+            surface.triangles.data(), static_cast<uint32_t>(surface.triangles.size() / 3u));
+        cooked.info.triangle_offset = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
+        cooked.info.node_offset = static_cast<uint32_t>(mp.surface_tree.size());
+        mp.surface_info.push_back(cooked.info);
+        mp.surface_triangles.insert(mp.surface_triangles.end(), surface.triangles.begin(), surface.triangles.end());
+        mp.surface_tree.insert(mp.surface_tree.end(), cooked.nodes.begin(), cooked.nodes.end());
+        mp.surface_thickness.push_back(surface.half_thickness);
+        mp.surface_friction.push_back(surface.friction);
+    }
+    cap.particle_surfaces_per_env = static_cast<uint32_t>(mp.surface_info.size());
+    cap.particle_surface_triangles = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
+    cap.particle_surface_nodes_per_env = static_cast<uint32_t>(mp.surface_tree.size());
+
     const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     cap.dist_cons_per_env = dn;
@@ -1593,6 +1609,16 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
 
     nk::Model::ModelParticles& mp = model.particles;
     mp.mode = nk::Model::ParticleMode::Mpm;
+    mp.surface_info.clear();
+    mp.surface_triangles.clear();
+    mp.surface_tree.clear();
+    mp.surface_thickness.clear();
+    mp.surface_friction.clear();
+    cap.particle_surfaces_per_env = 0u;
+    cap.particle_surface_triangles = 0u;
+    cap.particle_surface_nodes_per_env = 0u;
+    cap.point_endpoints_per_env = 0u;
+    cap.point_endpoint_terms_per_env = 0u;
     mp.initial_pos = in.positions;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
@@ -1990,6 +2016,23 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.xpbd_iters = xp.xpbd_iters;
     mp.soft_friction = xp.soft_friction;
 
+    mp.surface_info = xp.surface_info;
+    for (auto& info : mp.surface_info) info.vertex_offset += n_mpm;
+    mp.surface_triangles = xp.surface_triangles;
+    mp.surface_tree = xp.surface_tree;
+    mp.surface_thickness = xp.surface_thickness;
+    mp.surface_friction = xp.surface_friction;
+    cap.particle_surfaces_per_env = xtmp.capacities.particle_surfaces_per_env;
+    cap.particle_surface_triangles = xtmp.capacities.particle_surface_triangles;
+    cap.particle_surface_nodes_per_env = xtmp.capacities.particle_surface_nodes_per_env;
+    if (cap.particle_surfaces_per_env > 0u) {
+        const uint64_t terms = uint64_t{cap.mpm_contact_capacity_per_env} * nk::kTriangleEndpointTerms;
+        if (terms > std::numeric_limits<uint32_t>::max())
+            throw std::invalid_argument("point endpoint term capacity exceeds device indexing");
+        cap.point_endpoints_per_env = cap.mpm_contact_capacity_per_env;
+        cap.point_endpoint_terms_per_env = static_cast<uint32_t>(terms);
+    }
+
     // 3) The body<->particle cloth contact radius + the co-residence schema.
     ApplyParticleBodyContact(mp, contact);
     mp.mode = nk::Model::ParticleMode::MpmXpbd;
@@ -2093,6 +2136,11 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
     runtime::soft::BuildClothConstraints(rest, tris, opts, cs);
 
     in.positions = rest;
+    CookParticleSurface collision_surface;
+    collision_surface.friction = media.xpbd.friction;
+    for (const auto& tri : tris)
+        collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
+    in.surfaces.push_back(std::move(collision_surface));
     in.velocities.assign(rest.size(), math::Vec3::Zero());
     const float mass =
         media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
@@ -2357,6 +2405,8 @@ XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
     runtime::soft::BuildTetMeshConstraints(lat.rest, lat.tets, opts, cs);
 
     in.positions = init;
+    in.surfaces.push_back({runtime::soft::ExtractBoundaryTriangles(lat.rest, lat.tets),
+                           0.0f, media.xpbd.friction});
     in.velocities.assign(init.size(), math::Vec3::Zero());
     const float mass =
         media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
@@ -2432,6 +2482,7 @@ XpbdCookInput BuildCableXpbdInput(const MediaRecord& media) {
             cluster.cluster_mass.push_back(slab_mass);
         }
         in.shape_match.push_back(std::move(cluster));
+        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.xpbd.friction});
         const uint32_t end_p = np - 1u;
         for (uint32_t k = 4u; k < 8u; ++k) {  // the 4 top corners (iz == 1).
             in.distance.push_back({end_p, base + k,
@@ -2763,6 +2814,10 @@ void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
     for (std::array<uint32_t, 3> t : src.aero_triangles) {
         t[0] += base; t[1] += base; t[2] += base;
         dst.aero_triangles.push_back(t);
+    }
+    for (auto surface : src.surfaces) {
+        for (uint32_t& vertex : surface.triangles) vertex += base;
+        dst.surfaces.push_back(std::move(surface));
     }
     // The soft slice carries one solver/friction/aero set (per-medium override is the
     // medium's own); a single soft medium sets them verbatim.

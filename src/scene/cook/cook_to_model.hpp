@@ -129,6 +129,12 @@ struct CookShapeMatchCluster {
     float stiffness = 1.0f;                  // goal-pull fraction in [0,1].
 };
 
+struct CookParticleSurface {
+    std::vector<uint32_t> triangles;
+    float half_thickness = 0.0f;
+    float friction = 0.6f;
+};
+
 struct XpbdCookInput {
     std::vector<math::Vec3>      positions;     // per-particle rest state
     std::vector<math::Vec3>      velocities;    // per-particle initial velocity
@@ -152,6 +158,7 @@ struct XpbdCookInput {
     // Xpbd (default) cooks the existing XPBD soft body byte-identically; Mpm
     // routes the cook to CookMpmParticles instead (ParticleMode::Mpm + material).
     nk::Model::ParticleMode solver = nk::Model::ParticleMode::Xpbd;
+    std::vector<CookParticleSurface> surfaces;
 };
 
 // Stage an XPBD soft body into the Model (single-env template; SeedInitialState

@@ -35,6 +35,7 @@
 #include <cstdint>
 
 #include "math/vec3.hpp"
+#include "math/symmetric_mat3.hpp"
 
 namespace nuka::nk {
 
@@ -45,6 +46,7 @@ inline constexpr uint32_t kNkSideArtic    = 1u;  // ArticulationChainJ
 inline constexpr uint32_t kNkSideParticle = 2u;  // ParticleInvMass
 inline constexpr uint32_t kNkSideStatic   = 3u;  // StaticNull
 inline constexpr uint32_t kNkSideGrid     = 4u;  // GridInvMass
+inline constexpr uint32_t kNkSidePointEndpoint = 5u;  // Interpolated point-mass stencil
 
 // Per-contact-slot side-kind tag for the unified contact buffer's a/b index
 // channel. It declares what each ucontact_a/b index ADDRESSES so the row
@@ -56,6 +58,7 @@ inline constexpr uint32_t kUContactSideBody     = 0u;  // index = body-local row
 inline constexpr uint32_t kUContactSideParticle = 1u;  // index = global particle
 inline constexpr uint32_t kUContactSideGrid     = 2u;  // index = global grid node
 inline constexpr uint32_t kUContactSideBoundary = 3u;  // index = environment-local boundary
+inline constexpr uint32_t kUContactSidePointEndpoint = 4u;  // index = global endpoint range
 
 // Compliant contacts integrate a reference acceleration; velocity contacts impose Jv >= 0.
 inline constexpr uint32_t kContactLawCompliant = 0u;
@@ -110,7 +113,8 @@ struct NkRow {
     float    lower = 0.0f;
     float    upper = 0.0f;
     float    mu = 0.0f;                // first tangent cone coefficient
-    float    reserved[7] = {};         // [0] = second tangent coefficient
+    float    friction_secondary = 0.0f;
+    math::SymmetricMat3 contact_response{};
     NkRowSide a;
     NkRowSide b;
 };

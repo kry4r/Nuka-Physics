@@ -99,6 +99,11 @@ void MpmCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     p.contact_slots_per_env = ctx.max_contacts_per_env;
     p.full_row_slot_count = ctx.rigid_cap;
     p.rows_per_env = model.capacities.max_rows_per_env;
+    p.particle_surfaces_per_env = model.capacities.particle_surfaces_per_env;
+    p.particle_surface_triangles = model.capacities.particle_surface_triangles;
+    p.particle_surface_nodes_per_env = model.capacities.particle_surface_nodes_per_env;
+    p.point_endpoints_per_env = model.capacities.point_endpoints_per_env;
+    p.point_endpoint_terms_per_env = model.capacities.point_endpoint_terms_per_env;
     p.particle_count = ctx.particle_count;
     p.particles_per_env = ctx.particles_per_env;
     // Pure and mixed MPM use the same explicit grid-owned particle range.

@@ -67,6 +67,11 @@ struct ModelCapacities {
     // Cloth aerodynamic-drag element count / env (one per surface triangle). 0 ==
     // no drag (the drag op is not emitted -> a drag-free cook is byte-identical).
     uint32_t aero_tris_per_env           = 0;
+    uint32_t particle_surfaces_per_env = 0u;
+    uint32_t particle_surface_triangles = 0u;
+    uint32_t particle_surface_nodes_per_env = 0u;
+    uint32_t point_endpoints_per_env = 0u;
+    uint32_t point_endpoint_terms_per_env = 0u;
     // Graph-coloring color counts per XPBD family (single-env template; a color
     // is an independent constraint set sharing no particle). Built by
     // nk::XpbdColoring; size the per-family color-segment tables (pairs/color).
@@ -355,6 +360,11 @@ public:
         std::vector<float>      inv_mass;
         std::vector<uint32_t> topology_offsets;
         std::vector<uint32_t> topology_elements;
+        std::vector<collision::MeshSurfaceInfo> surface_info;
+        std::vector<uint32_t> surface_triangles;
+        std::vector<collision::MeshBvhNode> surface_tree;
+        std::vector<float> surface_thickness;
+        std::vector<float> surface_friction;
         // MLS-MPM per-particle init (single-env template; replicated env-major).
         // F seeded identity, vol0 from the sampling lattice, material_id indexes
         // mpm_materials. Empty for a non-MPM cook (C is the arena zero default).

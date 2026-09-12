@@ -126,6 +126,91 @@ def test_coupled_world_requires_a_medium(device):
         nuka.World.create_coupled_from_scene(device, SCENE, env_count=1)
 
 
+def test_mpm_surface_endpoints_roundtrip_graph_and_reset(device, tmp_path):
+    saved = str(tmp_path / "mpm_cloth.nks")
+    states = []
+    term_dtype = np.dtype([("kind", "<u4"), ("index", "<u4"), ("columns", "<f4", (3, 3))])
+    assert term_dtype.itemsize == 44
+    with nuka.SceneBuilder.create() as builder:
+        for x in (-0.04, 0.04):
+            builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+                              cloth_nx=6, cloth_ny=6, cloth_spacing=0.016,
+                              cloth_origin=[x, 0.0, 0.06], cloth_free=True,
+                              xpbd_particle_mass=0.01, xpbd_iters=8)
+        builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
+                          tet_center=[0.0, 0.0, 0.085], tet_radius=0.04,
+                          tet_cells=8, tet_cell_len=0.012,
+                          mpm_youngs=10000.0, mpm_poisson=0.3, mpm_density=1000.0,
+                          mpm_dx=0.02, mpm_substeps=2, mpm_floor_d=-1.0,
+                          mpm_contact_capacity=2048)
+        builder.save(saved)
+        for source in (builder, nuka.SceneBuilder.create(saved)):
+            try:
+                with source.build(device, env_count=3, dt=0.0005, gravity_z=0.0,
+                                  solver_vel_iters=128) as world:
+                    nmpm = world.particle_count - 72
+                    assert nmpm > 0
+                    velocity = np.zeros((3, world.particle_count, 3), dtype=np.float32)
+                    velocity[:, :nmpm, 2] = -0.2
+                    world.upload_field(nuka.Field.PARTICLE_VELOCITY, velocity)
+                    initial = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1).copy()
+                    ranges_view = torch.from_dlpack(world.buffer_view(nuka.POINT_ENDPOINT_RANGES))
+                    terms_view = torch.from_dlpack(world.buffer_view(nuka.POINT_ENDPOINT_TERMS))
+                    assert ranges_view.dtype == torch.uint32 and ranges_view.shape[-1] == 2
+                    assert terms_view.dtype == torch.uint8 and terms_view.shape[-1] == 44
+                    assert ranges_view.shape[0] == terms_view.shape[0] == 3
+                    address = terms_view.data_ptr()
+                    world.set_execution_mode("graph")
+                    world.step_n(8)
+                    assert not np.any(world.download_field(nuka.ENV_STATUS))
+                    ranges = world.download_field(nuka.POINT_ENDPOINT_RANGES).reshape(3, -1, 2)
+                    terms = world.download_field(nuka.POINT_ENDPOINT_TERMS).reshape(3, -1, 44)
+                    np.testing.assert_array_equal(ranges_view.cpu().numpy(), ranges)
+                    np.testing.assert_array_equal(terms_view.cpu().numpy(), terms)
+                    records = terms.reshape(-1, 44).view(term_dtype).reshape(-1)
+                    kinds = world.download_field(nuka.CONTACT_SIDE_B_KIND).reshape(3, -1)
+                    indices = world.download_field(nuka.CONTACT_SIDE_B_INDEX).reshape(3, -1)
+                    forces = world.download_field(nuka.CONTACT_FORCE).reshape(3, -1, 3)
+                    for env in range(3):
+                        active = kinds[env] == nuka.ContactSideKind.POINT_ENDPOINT.value
+                        assert active.any() and np.max(np.linalg.norm(forces[env, active], axis=1)) > 1.0e-6
+                        participants = set()
+                        for index in indices[env, active]:
+                            assert env * ranges.shape[1] <= index < (env + 1) * ranges.shape[1]
+                            first, count = ranges[env, index - env * ranges.shape[1]]
+                            assert count == 3
+                            endpoint = records[first:first + count]
+                            assert np.all(endpoint["kind"] == nuka.ContactSideKind.PARTICLE.value)
+                            local = endpoint["index"].astype(np.int64) - env * world.particle_count
+                            assert np.all((local >= nmpm) & (local < world.particle_count))
+                            participants.update(((local - nmpm) // 36).tolist())
+                            np.testing.assert_allclose(endpoint["columns"].sum(axis=0), np.eye(3), atol=2.0e-5)
+                        assert participants == {0, 1}
+                    before = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1).copy()
+                    assert np.isfinite(before).all() and not np.array_equal(before, initial)
+                    states.append((before, ranges.copy(), terms.copy(), kinds.copy(), indices.copy()))
+                    world.reset_envs([1])
+                    after = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1)
+                    np.testing.assert_array_equal(after[[0, 2]], before[[0, 2]])
+                    np.testing.assert_array_equal(after[1], initial[1])
+                    reset_ranges = world.download_field(nuka.POINT_ENDPOINT_RANGES).reshape(ranges.shape)
+                    reset_terms = world.download_field(nuka.POINT_ENDPOINT_TERMS).reshape(terms.shape)
+                    assert not np.any(reset_ranges[1])
+                    cleared = reset_terms[1].view(term_dtype).reshape(-1)
+                    assert not np.any(cleared["columns"])
+                    assert np.all(cleared["index"] == np.iinfo(np.uint32).max)
+                    np.testing.assert_array_equal(reset_ranges[[0, 2]], ranges[[0, 2]])
+                    np.testing.assert_array_equal(reset_terms[[0, 2]], terms[[0, 2]])
+                    assert terms_view.data_ptr() == address
+                    world.step()
+                    assert not np.any(world.download_field(nuka.ENV_STATUS))
+            finally:
+                if source is not builder:
+                    source.destroy()
+    for original, reloaded in zip(*states):
+        np.testing.assert_array_equal(original, reloaded)
+
+
 @pytest.mark.parametrize("mode", range(6))
 @pytest.mark.parametrize("entry", ["coupled", "builder", "author_coupled", "author_built"])
 def test_control_creation_entries(device, mode, entry):

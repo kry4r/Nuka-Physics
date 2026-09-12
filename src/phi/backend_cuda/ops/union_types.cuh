@@ -24,6 +24,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "nk/solve/point_endpoint.hpp"
 #include "phi/backend.hpp"   // Status / ModelView / DataView
 #include "phi/backend_cuda/ops/articulation_types.cuh"
 #include "phi/op_schema.hpp"
@@ -38,6 +39,7 @@ using ::nuka::nk::kNkSideParticle;
 using ::nuka::nk::kNkSideRigid;
 using ::nuka::nk::kNkSideStatic;
 using ::nuka::nk::kNkSideGrid;
+using ::nuka::nk::kNkSidePointEndpoint;
 
 // Material particles and background nodes share scalar mass response with separate state.
 struct PointMassView {
@@ -45,12 +47,61 @@ struct PointMassView {
     math::Vec3* particle_velocity = nullptr;
     const float* grid_inv_mass = nullptr;
     math::Vec3* grid_velocity = nullptr;
+    const nk::PointEndpointRange* ranges = nullptr;
+    const nk::PointEndpointTerm* terms = nullptr;
+
+    struct Contribution {
+        uint32_t kind;
+        uint32_t index;
+        math::Vec3 jacobian;
+    };
+
+    __device__ static bool IsPointSide(uint32_t kind) {
+        return kind == kNkSideParticle || kind == kNkSideGrid || kind == nk::kNkSidePointEndpoint;
+    }
+    __device__ uint32_t Count(const NkRowSide& side) const {
+        return side.kind == nk::kNkSidePointEndpoint ? ranges[side.index].count : 1u;
+    }
+    __device__ Contribution At(const NkRowSide& side, uint32_t term) const {
+        if (side.kind != nk::kNkSidePointEndpoint) return {side.kind, side.index, side.jlin};
+        const auto& entry = terms[ranges[side.index].first + term];
+        return {entry.kind, entry.index, entry.TransposeMultiply(side.jlin)};
+    }
 
     __device__ const float* InverseMass(uint32_t kind) const {
         return kind == kNkSideGrid ? grid_inv_mass : particle_inv_mass;
     }
     __device__ math::Vec3* Velocity(uint32_t kind) const {
         return kind == kNkSideGrid ? grid_velocity : particle_velocity;
+    }
+    __device__ float RowVelocity(const NkRowSide& side) const {
+        float result = 0.0f;
+        for (uint32_t i = 0u; i < Count(side); ++i) {
+            const auto term = At(side, i);
+            const auto* velocity = Velocity(term.kind);
+            if (velocity != nullptr) result += term.jacobian.Dot(velocity[term.index]);
+        }
+        return result;
+    }
+    __device__ float Coupling(const NkRowSide& lhs, const NkRowSide& rhs) const {
+        float result = 0.0f;
+        for (uint32_t i = 0u; i < Count(lhs); ++i) {
+            const auto a = At(lhs, i);
+            const float* inv_mass = InverseMass(a.kind);
+            if (inv_mass == nullptr) continue;
+            for (uint32_t j = 0u; j < Count(rhs); ++j) {
+                const auto b = At(rhs, j);
+                if (a.kind == b.kind && a.index == b.index)
+                    result += inv_mass[a.index] * a.jacobian.Dot(b.jacobian);
+            }
+        }
+        return result;
+    }
+    __device__ PointMassView Pseudo(math::Vec3* particle_pseudo) const {
+        auto result = *this;
+        result.particle_velocity = particle_pseudo;
+        result.grid_velocity = nullptr;
+        return result;
     }
 };
 

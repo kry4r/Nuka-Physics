@@ -1,0 +1,6 @@
+# A deformable mesh routes contact impulses through interpolated point-mass endpoints.
+name: ParticleSurface
+collidable_type_id: 6
+accel_structure: None
+shape_proxy: ShapeBacked
+reaction_provider: PointEndpoint

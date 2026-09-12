@@ -97,17 +97,25 @@ __device__ inline void ClaimUnion(uint32_t* parent, const NkRowSide& s, uint32_t
                                   uint32_t* artic_first, uint32_t artic_count,
                                   uint32_t* body_first, uint32_t body_count,
                                   uint32_t* particle_first, uint32_t particle_count,
-                                  uint32_t* grid_first, uint32_t grid_count) {
-    uint32_t* table = nullptr;
-    uint32_t limit = 0u;
-    if (s.kind == kNkSideArtic)         { table = artic_first;    limit = artic_count; }
-    else if (s.kind == kNkSideRigid)    { table = body_first;     limit = body_count; }
-    else if (s.kind == kNkSideParticle) { table = particle_first; limit = particle_count; }
-    else if (s.kind == kNkSideGrid)     { table = grid_first;     limit = grid_count; }
-    else return;
-    if (s.index >= limit) return;
-    const uint32_t old = atomicCAS(&table[s.index], kSentinel, row);
-    if (old != kSentinel) Unite(parent, row, old);
+                                  uint32_t* grid_first, uint32_t grid_count,
+                                  const nk::PointEndpointRange* ranges,
+                                  const nk::PointEndpointTerm* terms) {
+    const bool interpolated = s.kind == nk::kNkSidePointEndpoint;
+    const uint32_t count = interpolated ? ranges[s.index].count : 1u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const auto term = interpolated ? terms[ranges[s.index].first + i] : nk::PointEndpointTerm{};
+        const uint32_t kind = interpolated ? term.kind : s.kind;
+        const uint32_t index = interpolated ? term.index : s.index;
+        uint32_t* table = nullptr;
+        uint32_t limit = 0u;
+        if (kind == kNkSideArtic)         { table = artic_first;    limit = artic_count; }
+        else if (kind == kNkSideRigid)    { table = body_first;     limit = body_count; }
+        else if (kind == kNkSideParticle) { table = particle_first; limit = particle_count; }
+        else if (kind == kNkSideGrid)     { table = grid_first;     limit = grid_count; }
+        if (table == nullptr || index >= limit) continue;
+        const uint32_t old = atomicCAS(&table[index], kSentinel, row);
+        if (old != kSentinel) Unite(parent, row, old);
+    }
 }
 
 // One thread per row slot. Active rows union by their two sides' coupling keys + the
@@ -117,15 +125,16 @@ __global__ void UnionRowsKernel(const NkRow* __restrict__ urows, uint32_t* paren
                                 uint32_t* body_first, uint32_t body_count,
                                 uint32_t* particle_first, uint32_t particle_count,
                                 uint32_t* grid_first, uint32_t grid_count,
+                                const nk::PointEndpointRange* ranges, const nk::PointEndpointTerm* terms,
                                 uint32_t total_rows) {
     const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= total_rows) return;
     if (!(urows[row].flags & nk::nk_row_flags::kActive)) return;
     const NkRow r = urows[row];
     ClaimUnion(parent, r.a, row, artic_first, artic_count, body_first, body_count,
-               particle_first, particle_count, grid_first, grid_count);
+               particle_first, particle_count, grid_first, grid_count, ranges, terms);
     ClaimUnion(parent, r.b, row, artic_first, artic_count, body_first, body_count,
-               particle_first, particle_count, grid_first, grid_count);
+               particle_first, particle_count, grid_first, grid_count, ranges, terms);
     const uint32_t gf = r.group_first;
     if (gf != row && gf < total_rows) Unite(parent, row, gf);
 }
@@ -227,7 +236,8 @@ Status OpBuildSolveIslands(const ModelView& /*model*/, const DataView& data,
     LaunchCuda(UnionRowsKernel, dim3(rblocks), dim3(kBlockSize), 0u, stream, urows,
                data.cc_parent, data.cc_artic_first, artic_count, data.cc_body_first,
                body_count, data.cc_particle_first, particle_count,
-               data.cc_grid_first, grid_count, total_rows);
+               data.cc_grid_first, grid_count,
+               data.point_endpoint_ranges, data.point_endpoint_terms, total_rows);
     LaunchCuda(FlattenRootsKernel, dim3(rblocks), dim3(kBlockSize), 0u, stream, urows,
                data.cc_parent, data.cc_root, total_rows);
 

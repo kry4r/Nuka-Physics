@@ -375,6 +375,15 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 6, 1, 24, 0},  // control_jacobian
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 6, 1, 24, 0},  // control_response
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 6, 1, 24, 0},  // control_task_map
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // particle_surface_info
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_triangles
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // particle_surface_tree
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_thickness
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_friction
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 32, 32, 0},  // particle_surface_nodes
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 8, 8, 0},  // point_endpoint_ranges
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 44, 44, 0},  // point_endpoint_terms
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_projection_delta
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

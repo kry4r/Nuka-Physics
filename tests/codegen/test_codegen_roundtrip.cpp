@@ -307,14 +307,17 @@ TEST(CodegenRoundtrip, CollidableTypeRegistryIsCorrect) {
     using nuka::constraint::generated::GetCollidableTypeInfo;
     using nuka::constraint::generated::kCollidableTypeCount;
 
-    // v0.8 has 4 collidable types (v0.9 adds 4 more); enum values are the
-    // contiguous range 0..3 (the table is indexed by these, so this is a contract
-    // tripwire -- if a type is added/reordered, update this consciously).
-    EXPECT_EQ(kCollidableTypeCount, 4u);
+    // Type ids are append-only and index the generated registry.
+    EXPECT_EQ(kCollidableTypeCount, 7u);
     EXPECT_EQ(static_cast<uint8_t>(CollidableType::RigidBody), 0u);
     EXPECT_EQ(static_cast<uint8_t>(CollidableType::ArticulationLink), 1u);
     EXPECT_EQ(static_cast<uint8_t>(CollidableType::Particle), 2u);
     EXPECT_EQ(static_cast<uint8_t>(CollidableType::StaticWorld), 3u);
+    EXPECT_EQ(static_cast<uint8_t>(CollidableType::GridNode), 4u);
+    EXPECT_EQ(static_cast<uint8_t>(CollidableType::StaticBoundary), 5u);
+    EXPECT_EQ(static_cast<uint8_t>(CollidableType::ParticleSurface), 6u);
+    const auto& surface = GetCollidableTypeInfo(CollidableType::ParticleSurface);
+    EXPECT_EQ(surface.react, ReactionProviderKind::PointEndpoint);
 
     // RigidBody (id 0): rigid LBVH, shape-backed, rigid inverse-mass reaction.
     const auto& rigid = GetCollidableTypeInfo(CollidableType::RigidBody);

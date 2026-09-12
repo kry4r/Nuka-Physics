@@ -185,6 +185,7 @@ enum class NkOp : uint16_t {
     FkLinkVelocities,       // Refresh link spatial velocities from current generalized state.
 
     ReadoutDrives,         // actual bounded effort from the common velocity solve
+    RefitParticleSurfaces,
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -423,6 +424,14 @@ struct BuildSolveIslandsParams {
 
 // All MPM operations share one physical interval and environment-private grid.
 // Prediction owns grid initialization; commit alone advances particles and history.
+struct ParticleSurfacesParams {
+    uint32_t env_count;
+    uint32_t particles_per_env;
+    uint32_t surfaces_per_env;
+    uint32_t triangles_per_env;
+    uint32_t nodes_per_env;
+};
+
 struct MpmParams {
     uint32_t contact_slot_base;
     uint32_t contact_capacity;
@@ -463,6 +472,11 @@ struct MpmParams {
     uint32_t max_dof;            // per-articulation generalized DOF (the m_inv tile side).
     uint32_t base_link_count;    // links per env (global link = env*base_link_count+tmpl).
     uint32_t artics_per_env;     // co-resident articulations per env (>=1 when artic).
+    uint32_t particle_surfaces_per_env;
+    uint32_t particle_surface_triangles;
+    uint32_t particle_surface_nodes_per_env;
+    uint32_t point_endpoints_per_env;
+    uint32_t point_endpoint_terms_per_env;
 };
 
 // Workspace bytes for the actual MPM particle and grid node counts.
@@ -672,6 +686,8 @@ struct AssembleRowsParams {
     // Cap on the contact normal aref so a deep contact recovers over several steps,
     // not in one fling. +inf default == non-binding (byte-identical). Model property.
     float    baumgarte_max_velocity;
+    uint32_t point_endpoints_per_env = 0u;
+    uint32_t point_endpoint_terms_per_env = 0u;
 };
 
 // Spec-fixed semantic fields : {dt, vel_iters, pos_iters}. The fields BELOW
@@ -922,6 +938,8 @@ struct ResetEnvsParams {
     float    jitter_base_pos[3];
     float    jitter_q;
     uint32_t has_particle_grid = 0u;
+    uint32_t point_endpoints_per_env = 0u;
+    uint32_t point_endpoint_terms_per_env = 0u;
 };
 
 struct SnapshotStateParams {
@@ -943,6 +961,8 @@ struct RestoreStateParams {
     uint32_t total_body_count;
     uint32_t total_particle_count;
     uint32_t has_particle_grid = 0u;
+    uint32_t point_endpoints_per_env = 0u;
+    uint32_t point_endpoint_terms_per_env = 0u;
 };
 
 struct ContactWarmStartParams {
