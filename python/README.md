@@ -128,6 +128,57 @@ base_vel_body = vel[:, 0, :]   # [wx,wy,wz,vx,vy,vz], root-link body frame
 world.step()   # the next step uses the new gains
 ```
 
+## Control modes
+
+All creation entries accept modes `0` through `5`: `World.create_from_scene`,
+`World.create_coupled_from_scene`, `SceneBuilder.build`, and author `SimOptions`.
+OSC accepts any supported scene format and does not require LIBERO.
+
+| Mode | Input | Control law before effort limits |
+|------|-------|----------------------------------|
+| `CONTROL_MODE_PD_POSITION` (`0`) | `DRIVE_TARGET`, `VELOCITY_TARGET` | `Kp*(q_target-q) + Kd*(v_target-v_next)` |
+| `CONTROL_MODE_TORQUE` (`1`) | `TORQUE_INPUT` | Direct force or torque |
+| `CONTROL_MODE_VELOCITY` (`2`) | `VELOCITY_TARGET` | `Kp*(v_target-v_next)` |
+| `CONTROL_MODE_COMPUTED_TORQUE` (`3`) | Position, velocity and `ACCELERATION_TARGET` | Inverse dynamics with acceleration feedforward and position/velocity feedback |
+| `CONTROL_MODE_OSC` (`4`) | `TASK_TARGET`, optional `TASK_ROTATION_TARGET` | Dynamically weighted task control with projected posture feedback |
+| `CONTROL_MODE_ACTUATOR` (`5`) | `TORQUE_INPUT`, `ACTUATOR_NOLOAD_SPEED` | Direct effort limited by a signed torque-speed envelope |
+
+`TORQUE_INPUT` aliases `DRIVE_TARGET`. The other inputs have distinct buffers.
+Scalar joint inputs use the joint-position layout; fixed and floating-root slots
+do not accept actuator forces. Gains must be finite and nonnegative.
+`DRIVE_FORCE_LIMIT > 0` bounds the complete actuator effort, including damping;
+values at or below zero disable the bound. Revolute efforts are N·m, prismatic
+efforts are N. `JOINT_FEEDFORWARD` is an independent generalized load outside the
+actuator bound. Passive joint damping remains a separate physical property.
+
+PD and velocity feedback use the common implicit constraint solve by default.
+Computed torque and OSC use the complete articulated mass response, including
+floating-base reaction. Their gain units correspond to acceleration feedback.
+OSC controls the world-frame pose of `osc_task_link` within each articulation;
+the link index must exist in every tree. `TASK_TARGET`, `TASK_ROTATION_TARGET`,
+and `TASK_LOCAL_POSE` contain respectively 3, 4 and 7 floats per articulation,
+ordered by environment and then tree. Quaternions use `[w,x,y,z]`. A zero
+orientation target selects position-only control; a zero local-frame quaternion
+means identity. `TASK_LOCAL_POSE` selects a point/frame on the task link.
+Task gains come from that link's `DRIVE_STIFFNESS` and `DRIVE_DAMPING`.
+`TASK_NULLSPACE_STIFFNESS` and `TASK_NULLSPACE_DAMPING` each hold one value per
+articulation, initially `10` and `2*sqrt(10)`. Posture targets use the joint inputs.
+Unreachable task directions are omitted by the task-response pseudoinverse.
+
+For actuator mode with limit `L > 0` and no-load speed `v0 > 0`, the bounds at the
+start-of-step velocity `v` are `clamp(-L-L*v/v0, -L, L)` and
+`clamp(L-L*v/v0, -L, L)`. This preserves braking in all four quadrants, including
+overspeed. A no-load speed at or below zero disables the speed envelope.
+
+Control inputs persist across full and masked state resets. Actual effort,
+requested effort and saturation are available through `ACTUATOR_EFFORT`,
+`ACTUATOR_EFFORT_REQUESTED` and `ACTUATOR_SATURATED`; reset clears these readouts.
+Nonfinite inputs, invalid gains or an invalid control mass factor set
+`ENV_STATUS_CONTROL_FAILURE` until state reset. Inspect `ENV_STATUS` after
+synchronizing. Differentiable tape currently accepts only single-environment PD
+and records a separate contact-free explicit-damping map; it does not provide
+gradients of the production implicit control/contact pipeline.
+
 ## Layout metadata
 
 `world.env_count`, `world.base_link_count` (13 for go2), `world.dt`. Indexing is

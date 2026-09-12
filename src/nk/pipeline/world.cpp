@@ -10,6 +10,8 @@
 #include <limits>
 #include <utility>
 
+#include "collision/contact_capacity.hpp"
+#include "phi/articulation_contract.hpp"
 #include "nk/solve/schedule.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "nk/solve/xpbd_coloring.hpp"
@@ -54,6 +56,37 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     if (env_count > 0) {
         model_.capacities.env_count = env_count;
     }
+    auto& control_cap = model_.capacities;
+    const uint32_t drive_rows = control_cap.dofs_per_env > 0u ? control_cap.links_per_env : 0u;
+    const uint32_t grid_particles = model_.MpmParticlesPerEnv();
+    if (grid_particles > control_cap.particles_per_env) {
+        creation_status_ = phi::Status::InvalidArgument;
+        creation_error_ = "grid particle count exceeds the particle capacity";
+        return;
+    }
+    const uint64_t point_slots = control_cap.mpm_contact_capacity_per_env +
+        (control_cap.bodies_per_env > 0u && control_cap.max_contacts_per_env > 0u
+             ? uint64_t{control_cap.particles_per_env - grid_particles} *
+                   collision::kBodyParticleContactSlotsPerParticle : 0u);
+    if (point_slots > control_cap.max_contacts_per_env) {
+        creation_status_ = phi::Status::InvalidArgument;
+        creation_error_ = "particle contact reserve exceeds the contact capacity";
+        return;
+    }
+    const uint64_t row_count =
+        (control_cap.max_contacts_per_env - point_slots) * kPairDrivenRowsPerSlot +
+        point_slots * kPairDrivenParticleRowsPerSlot + control_cap.joint_limit_rows_per_env +
+        control_cap.joint_friction_rows_per_env + drive_rows;
+    if (row_count > std::numeric_limits<uint32_t>::max()) {
+        creation_status_ = phi::Status::InvalidArgument;
+        creation_error_ = "actuator row capacity is invalid";
+        return;
+    }
+    control_cap.max_rows_per_env = std::max(control_cap.max_rows_per_env, static_cast<uint32_t>(row_count));
+    control_cap.joint_drive_rows_per_env = drive_rows;
+    control_cap.inverse_dynamics_controls =
+        model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
+        model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
     model_.capacities.mpm_plastic_state = std::any_of(
         model_.mpm_materials.begin(), model_.mpm_materials.end(),
         [](const MpmMaterial& material) { return material.model_kind == MpmMaterial::kHenckyJ2; });
@@ -477,12 +510,21 @@ bool World::SeedInitialState() {
         return data_.UploadField(id, host.data(), host.size() * sizeof(float));
     };
     if (!replicate_f32(FieldId::Q, a.initial_q) ||
-        !replicate_f32(FieldId::DriveTarget, model_.hold_drives.targets) ||
+        !replicate_f32(FieldId::DriveTarget,
+            model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Torque) ||
+            model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Actuator)
+                ? std::vector<float>{} : model_.hold_drives.targets) ||
         !replicate_f32(FieldId::DriveStiffness, model_.hold_drives.stiffness) ||
         !replicate_f32(FieldId::DriveDamping, model_.hold_drives.damping) ||
         !replicate_f32(FieldId::DriveForceLimit, model_.hold_drives.force_limits)) {
         return false;
     }
+    const size_t task_count = static_cast<size_t>(E) * model_.capacities.articulations_per_env;
+    const std::vector<float> null_stiffness(task_count, 10.0f);
+    const std::vector<float> null_damping(task_count, 2.0f * std::sqrt(10.0f));
+    if (!data_.UploadField(FieldId::TaskNullspaceStiffness, null_stiffness.data(), task_count * sizeof(float)) ||
+        !data_.UploadField(FieldId::TaskNullspaceDamping, null_damping.data(), task_count * sizeof(float)))
+        return false;
     // M4 (union family): the SETTLED initial velocity state (the legacy
     // factory's pre-roll product). Empty templates keep the zero-velocity
     // arena init (the M3 path, byte-unchanged).

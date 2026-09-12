@@ -48,8 +48,8 @@ public:
         uint32_t max_pairs = 0;
         // M3b articulation-pipeline knobs (both production paths use 1/1; the
         // friction/baumgarte values default from the Model, see Build()).
-        uint32_t defer_velocity_damping = 1;  // PD drive emits Kp torque only
-        uint32_t fold_drive_damping = 1;      // CRBA folds dt*C -> (M+dt*C)^-1
+        uint32_t defer_velocity_damping = 1;  // solve affine velocity feedback implicitly
+        uint32_t fold_drive_damping = 1;      // enable implicit feedback in the shared rows
         uint32_t substeps = 1u;
     };
 
@@ -93,7 +93,8 @@ private:
 
     // Reused parameter blocks are immutable after the pipeline is built.
     phi::ApplyDrivesParams            p_apply_drives_{};
-    phi::ApplyOscDrivesParams         p_apply_osc_{};
+    phi::ApplyDynamicsDrivesParams    p_apply_dynamics_{};
+    phi::ReadoutDrivesParams          p_readout_drives_{};
     phi::AbaForwardParams             p_aba_{};
     phi::IntegrateVelocityParams      p_int_vel_{};
     phi::SnapshotStepVelocityParams   p_step_velocity_{};

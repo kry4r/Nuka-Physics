@@ -301,9 +301,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_effort
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_saturated
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // pair_sort_scratch
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 3, 12, 0},  // task_target
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 4, 16, 0},  // task_rotation_target
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 7, 28, 0},  // task_local_pose
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Articulation, 1, 3, 12, 0},  // task_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Articulation, 1, 4, 16, 0},  // task_rotation_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Articulation, 1, 7, 28, 0},  // task_local_pose
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 7, 28, 0},  // body_inertial_frame
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 6, 24, 0},  // body_world_inv_inertia
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // step_qdot_flat
@@ -361,6 +361,20 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // step_mpm_boundary_impulse
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // step_mpm_boundary_moment
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // solver_velocity_scratch
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // velocity_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // acceleration_target
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // actuator_noload_speed
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Articulation, 1, 1, 4, 0},  // task_nullspace_stiffness
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Articulation, 1, 1, 4, 0},  // task_nullspace_damping
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // drive_command
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // drive_dissipation
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // drive_lower
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // drive_upper
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // control_mass
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // control_factor
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 6, 1, 24, 0},  // control_jacobian
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 6, 1, 24, 0},  // control_response
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 6, 1, 24, 0},  // control_task_map
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

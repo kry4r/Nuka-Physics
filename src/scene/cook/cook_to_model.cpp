@@ -230,7 +230,8 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
 static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
     const uint64_t total_rows =
         contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env) +
-        static_cast<uint64_t>(cap.joint_friction_rows_per_env);
+        static_cast<uint64_t>(cap.joint_friction_rows_per_env) +
+        static_cast<uint64_t>(cap.joint_drive_rows_per_env);
     if (total_rows > 0xFFFFFFFFull) {
         throw std::runtime_error("CookToModel: row capacity overflows u32");
     }
@@ -439,6 +440,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 throw std::runtime_error("CookToModel: invalid authored joint limit");
             }
         }
+        cap.joint_drive_rows_per_env = m.link_count;
         cap.joint_limit_rows_per_env =
             std::any_of(m.joint_limit_flags.begin(), m.joint_limit_flags.end(),
                         [](uint8_t flags) { return flags != 0u; })

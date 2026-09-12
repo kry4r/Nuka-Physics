@@ -384,6 +384,9 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.qdot[link] = data.snapshot_qdot[link];
         data.qddot[link] = 0.0f;
         data.tau[link] = 0.0f;
+        data.actuator_effort_requested[link] = 0.0f;
+        data.actuator_effort[link] = 0.0f;
+        data.actuator_saturated[link] = 0.0f;
         data.link_velocity[link] = data.snapshot_link_velocity[link];
         data.qdot_pseudo[link] = 0.0f;
         data.link_velocity_pseudo[link] = {};

@@ -338,6 +338,20 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::StepMpmBoundaryImpulse, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_impulse
     {FieldId::StepMpmBoundaryMoment, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_moment
     {FieldId::SolverVelocityScratch, DlpackDtype::kU8, 1, false, false},  // solver_velocity_scratch
+    {FieldId::VelocityTarget, DlpackDtype::kF32, 1, false, false},  // velocity_target
+    {FieldId::AccelerationTarget, DlpackDtype::kF32, 1, false, false},  // acceleration_target
+    {FieldId::ActuatorNoloadSpeed, DlpackDtype::kF32, 1, false, false},  // actuator_noload_speed
+    {FieldId::TaskNullspaceStiffness, DlpackDtype::kF32, 1, false, false},  // task_nullspace_stiffness
+    {FieldId::TaskNullspaceDamping, DlpackDtype::kF32, 1, false, false},  // task_nullspace_damping
+    {FieldId::DriveCommand, DlpackDtype::kF32, 1, false, false},  // drive_command
+    {FieldId::DriveDissipation, DlpackDtype::kF32, 1, false, false},  // drive_dissipation
+    {FieldId::DriveLower, DlpackDtype::kF32, 1, false, false},  // drive_lower
+    {FieldId::DriveUpper, DlpackDtype::kF32, 1, false, false},  // drive_upper
+    {FieldId::ControlMass, DlpackDtype::kF32, 1, false, false},  // control_mass
+    {FieldId::ControlFactor, DlpackDtype::kF32, 1, false, false},  // control_factor
+    {FieldId::ControlJacobian, DlpackDtype::kF32, 2, false, false},  // control_jacobian
+    {FieldId::ControlResponse, DlpackDtype::kF32, 2, false, false},  // control_response
+    {FieldId::ControlTaskMap, DlpackDtype::kF32, 2, false, false},  // control_task_map
 };
 
 } // namespace nuka::nk

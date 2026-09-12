@@ -65,36 +65,11 @@ typedef struct nuka_world_desc_t {
     // is NOT held to the D1 bit-exact bar. Any value > 1 is rejected with
     // NUKA_RESULT_INVALID_ARG.
     uint8_t determinism;
-    // Stage-1 control mode (v0.5 C-fwd). 0 = PDPosition (the default when the
-    // desc is zero-initialized): the legacy PD position drive, BYTE-FOR-BYTE
-    // unchanged. 1 = Torque (tau = clamp(NUKA_FIELD_TORQUE_INPUT)). 2 = Velocity
-    // (tau = clamp(drive_stiffness*(NUKA_FIELD_VELOCITY_TARGET - qdot))). 3 =
-    // ComputedTorque (inverse-dynamics PD: tau = M*(Kp*(DRIVE_TARGET - q) -
-    // Kd*qdot) + bias, Kp/Kd reuse DRIVE_STIFFNESS/DRIVE_DAMPING). 5 = Actuator
-    // (DC-motor torque-speed envelope on NUKA_FIELD_TORQUE_INPUT; tau_stall reuses
-    // DRIVE_FORCE_LIMIT, no-load speed is NUKA_FIELD_ACTUATOR_NOLOAD_SPEED). Value
-    // 4 = Osc (operational-space control, FORWARD position-task mode: tau =
-    // J^T*Lambda*(Kp*e_x + Kd*edot_x) driving the world position of the task link
-    // `osc_task_link` toward NUKA_FIELD_TASK_TARGET; Kp/Kd reuse DRIVE_STIFFNESS/
-    // DRIVE_DAMPING at the task link; bounded to a 3-DOF position task on a fixed-
-    // base scene). Any value > 5 is rejected with NUKA_RESULT_INVALID_ARG. Non-PD
-    // modes require the BATCHED path
-    // (env_count > 1); the single-env oracle path supports PDPosition only and
-    // returns NUKA_RESULT_NOT_SUPPORTED for a non-PD mode (the golden oracle
-    // drive site stays untouched). The implicit joint damping (#43, driven by
-    // DRIVE_DAMPING) is a joint property orthogonal to the control law and runs
-    // for every mode.
+    // 0 PD position, 1 torque, 2 velocity, 3 computed torque, 4 OSC, 5 actuator.
+    // Every creation entry supports all six modes at any positive environment count.
     uint8_t control_mode;
-    // v0.5 C-fwd slice 3 (p03 R2): the OSC task link, an articulation-LOCAL link
-    // index (0-based within the cooked articulation; global = env*base_link_count +
-    // osc_task_link). Read ONLY when control_mode == 4 (Osc): it selects the link
-    // whose world position the 3-DOF position task drives toward
-    // NUKA_FIELD_TASK_TARGET. Zero-initialized (== 0, the ROOT) is the default; for
-    // a fixed-base scene the root has a zero task Jacobian (the controller is a
-    // no-op), so an Osc caller MUST set this to a real end-effector (e.g. a Go2
-    // foot/calf local link). Ignored by every non-Osc mode (so a zero-init desc for
-    // a PD/Torque/etc world is unaffected). An index >= the articulation's link
-    // count makes the Osc drive a no-op (tau left unchanged).
+    // Articulation-local OSC task link; validated against every articulation at creation.
+    // Each articulation has independent task inputs, including an optional orientation target.
     uint32_t osc_task_link;
     // Go2-on-stairs Phase 2a: procedural-terrain cook config (the shared
     // nuka::terrain::TerrainParams, minus ground_height which stays the model's).
@@ -416,53 +391,17 @@ typedef enum nuka_state_field_t {
     // READ: authoritative roots, env-major E*K transforms [px,py,pz,qw,qx,qy,qz].
     // Current after step/reset; K is the articulation count per environment.
     NUKA_FIELD_BASE_POSE = 11,
-    // WRITABLE (batched/multi-env path only). The per-env per-link TORQUE input
-    // buffer the batched step reads every Step when the world's control_mode is
-    // Torque (1). Aliases the live device buffer (zero-copy, write IN PLACE and
-    // the NEXT nuka_world_step picks it up). IDENTICAL layout to
-    // NUKA_FIELD_DRIVE_TARGET: float[env_count * base_link_count], env-major,
-    // index (env*base_link_count + link), stride sizeof(float). Per-env slot map
-    // matches DRIVE_TARGET: slot 0 = ROOT (inert), slots 1..N = actuated joints.
-    // The applied torque is clamped to +/- DRIVE_FORCE_LIMIT (when > 0). Reads
-    // return the CURRENT torque input (initially all zero). Returns
-    // NUKA_RESULT_NOT_SUPPORTED on the single-env path. (Allocated even for a PD
-    // world; it is simply never read there.)
+    // WRITABLE: per-link torque command, aliased to DRIVE_TARGET; initially zero in torque modes.
+    // Torque and actuator modes clamp the command before adding JOINT_FEEDFORWARD.
     NUKA_FIELD_TORQUE_INPUT = 12,
-    // WRITABLE (batched/multi-env path only). The per-env per-link VELOCITY
-    // TARGET buffer the batched step reads every Step when the world's
-    // control_mode is Velocity (2). Same zero-copy aliasing, layout and slot map
-    // as NUKA_FIELD_TORQUE_INPUT. The velocity-servo torque is
-    // drive_stiffness*(velocity_target - qdot) clamped to +/- DRIVE_FORCE_LIMIT
-    // (Kp_v reuses the DRIVE_STIFFNESS buffer). Reads return the CURRENT target
-    // (initially all zero). Returns NUKA_RESULT_NOT_SUPPORTED on the single-env
-    // path. (Allocated even for a PD world; it is simply never read there.)
+    // WRITABLE: per-link desired velocity; PD/CT use it as the derivative target.
+    // Velocity mode applies DRIVE_STIFFNESS * (target - qdot), subject to the effort limit.
     NUKA_FIELD_VELOCITY_TARGET = 13,
-    // WRITABLE (batched/multi-env path only). v0.5 C-fwd slice 2: the per-env
-    // per-link DC-motor NO-LOAD SPEED buffer the batched step reads every Step
-    // when the world's control_mode is Actuator (5). Same zero-copy aliasing,
-    // layout and slot map as NUKA_FIELD_TORQUE_INPUT. In Actuator mode the
-    // commanded torque (NUKA_FIELD_TORQUE_INPUT) is clamped to the velocity-
-    // dependent DC-motor envelope tau_max(qdot) = clamp(tau_stall*(1 -
-    // |qdot|/qdot_noload), 0, tau_stall), where tau_stall reuses the
-    // DRIVE_FORCE_LIMIT buffer and qdot_noload is THIS buffer. A per-link value
-    // <= 0 disables the speed term (falls back to the plain DRIVE_FORCE_LIMIT
-    // clamp == Torque mode), so an all-zero buffer is safe. Reads return the
-    // CURRENT no-load speeds (initially all zero). Returns
-    // NUKA_RESULT_NOT_SUPPORTED on the single-env path. (Allocated even for a
-    // non-Actuator world; it is simply never read there.)
+    // WRITABLE: per-link no-load speed. Actuator mode uses a signed torque-speed envelope.
+    // Non-positive speed disables the speed envelope; a non-positive effort limit is unlimited.
     NUKA_FIELD_ACTUATOR_NOLOAD_SPEED = 14,
-    // WRITABLE (batched/multi-env path only). v0.5 C-fwd slice 3 (p03 R2): the
-    // per-ENV operational-space-control TASK TARGET buffer the batched step reads
-    // every Step when the world's control_mode is Osc (4). UNLIKE the per-LINK
-    // control-input fields (TORQUE_INPUT / VELOCITY_TARGET / ACTUATOR_NOLOAD_SPEED),
-    // this is per-ENV: element_count == env_count, element_stride_bytes == 3*sizeof
-    // (float) (a float3 {x,y,z} WORLD position per env), index env*3. It is the
-    // world position the task link (the desc's osc_task_link) is driven toward.
-    // Same zero-copy aliasing as the other writable fields (write IN PLACE; the
-    // NEXT nuka_world_step picks it up). Reads return the CURRENT targets (initially
-    // all zero == the world origin). Returns NUKA_RESULT_NOT_SUPPORTED on the
-    // single-env path. (Allocated for every batched world so the view always
-    // succeeds; only read in Osc mode.)
+    // WRITABLE: E*K world positions [x,y,z], one task per articulation, in environment order.
+    // Available for every creation entry and environment count; state reset preserves inputs.
     NUKA_FIELD_TASK_TARGET = 15,
     // READ (batched/multi-env path only). p14a (v0.7): the NET per-LINK contact
     // WRENCH (force + torque) in the WORLD frame, aggregated over every contact
@@ -612,13 +551,11 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_ACTUATOR_EFFORT_REQUESTED = 28,
     NUKA_FIELD_ACTUATOR_EFFORT = 29,
     NUKA_FIELD_ACTUATOR_SATURATED = 30,
-    // WRITE (per-env). Optional world-frame OSC orientation target as a
-    // W-first quaternion. A near-zero quaternion keeps the original 3D
-    // position-only TASK_TARGET behavior.
+    // WRITE: E*K world-frame OSC W-first quaternions, one per articulation.
+    // A near-zero quaternion selects position-only control.
     NUKA_FIELD_TASK_ROTATION_TARGET = 31,
-    // WRITE (per-env). Rigid local frame on osc_task_link, represented as
-    // [px,py,pz,qw,qx,qy,qz]. A near-zero quaternion means identity rotation;
-    // the translation still selects an offset point such as a gripper site.
+    // WRITE: E*K rigid local frames on osc_task_link, [px,py,pz,qw,qx,qy,qz].
+    // A near-zero quaternion means identity; translation selects the offset point.
     NUKA_FIELD_TASK_LOCAL_POSE = 32,
     // READ (per-contact-slot uint32). Kinds use nuka_contact_side_kind_t.
     NUKA_FIELD_CONTACT_SIDE_A_KIND = 33,
@@ -656,7 +593,12 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_MPM_BODY_IMPULSE = 52,
     NUKA_FIELD_MPM_BODY_ANGULAR_IMPULSE = 53,
     NUKA_FIELD_MPM_BOUNDARY_IMPULSE = 54,
-    NUKA_FIELD_MPM_BOUNDARY_ANGULAR_IMPULSE = 55
+    NUKA_FIELD_MPM_BOUNDARY_ANGULAR_IMPULSE = 55,
+    // WRITABLE: per-link feedforward acceleration for computed-torque control, initially zero.
+    NUKA_FIELD_ACCELERATION_TARGET = 56,
+    // WRITABLE: E*K posture acceleration gains for OSC, initially 10 and 2*sqrt(10).
+    NUKA_FIELD_TASK_NULLSPACE_STIFFNESS = 57,
+    NUKA_FIELD_TASK_NULLSPACE_DAMPING = 58
 } nuka_state_field_t;
 
 typedef enum nuka_env_status_t {
@@ -673,7 +615,8 @@ typedef enum nuka_env_status_t {
     NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE = 1u << 7,
     // Material integration failed; the prior elastic/plastic history is retained.
     NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE = 1u << 8,
-    NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW = 1u << 9
+    NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW = 1u << 9,
+    NUKA_ENV_STATUS_CONTROL_FAILURE = 1u << 10
 } nuka_env_status_t;
 
 typedef enum nuka_gyro_status_t {

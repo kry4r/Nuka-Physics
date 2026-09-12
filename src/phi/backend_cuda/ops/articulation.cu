@@ -1,28 +1,9 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M3b articulation dynamics ops:
-//   ApplyDrives / AbaForward / IntegrateVelocity / FkWorldPoses /
-//   IntegratePosition
-//
-// KERNEL BODIES ARE LINE-BY-LINE PORTS (D1 byte-exact contract) of
-//   src/runtime/articulation/featherstone_aba.cu      (drives / ABA / integrate)
-//   src/runtime/articulation/articulation_contacts.cu (UpdateWorldLinkPosesKernel)
-// The ONLY change is the input wiring: pointers come from ModelView/DataView
-// (via nkops::MakeArticulationDeviceState) instead of ArticulationDeviceBuffers,
-// and launches go through phi::LaunchCuda on the dispatch/capture stream.
-// Floating-point operation order, fma patterns, block/grid shapes and launch
-// geometry are UNCHANGED. The legacy files stay alive (production) until M9.
-//
-// FkWorldPoses note: the legacy pipeline computes world poses into a separate
-// world_pose_ scratch buffer and then D2D-copies it over state.link_pose. The
-// FK kernel never READS link_pose (it reads q/topology/base_pose and its own
-// output for parents), so writing straight into the link_pose field produces
-// byte-identical link_pose/world-pose content with one buffer and no copy.
-//
-// NO allocation in this TU (lint hot_path_cuda_malloc covers ops/**); all
-// staging is init-time (Model::UploadTo / Arena).
-// ---------------------------------------------------------------------------
+// Articulation dynamics and bounded control share the model/data arenas.
+// Controller mass response and contact impulses use the same physical inertia.
 
 #include <cuda_runtime.h>
+
+#include <cfloat>
 
 #include "math/cuda_spatial_ops.cuh"
 #include "math/cuda_vec_ops.cuh"
@@ -664,136 +645,135 @@ __global__ void IntegrateFloatingBasePoseKernel(ArticulationDeviceState state,
     state.base_pose[articulation] = pose;
 }
 
-// ---------------------------------------------------------------------------
-// The ONE affine actuator (T2). All actuator "modes" are PRESETS of a single
-// affine force law -- there is NO per-actuator-type code path (owner's "禁止特化",
-// the convergent MuJoCo/Newton/Genesis design). Per actuated DOF, with control
-// input u (= the drive_target field), joint pos q, joint vel qdot:
-//
-//     p     = gain*u + b0 + b1*q + b2*qdot          (the affine law)
-//     tau   = clamp(p, -force_limit, +force_limit)  (effort saturation)
-//
-// The velocity term b2*qdot is folded IMPLICITLY into the mass-matrix diagonal
-// (crba.cu reads the drive_damping field as the per-DOF Kd and adds dt*Kd to the
-// M diagonal) -- the SAME stability mechanism PD has always used. So this kernel
-// applies ONLY {gain*u + b0 + b1*q}; the b2*qdot stabilizing term lives in the
-// implicit solve and is therefore NOT recomputed here when defer_velocity_damping
-// is set (the production schedule). The passive joint viscous damping
-// (model.joint_damping, applied in ABA Pass-2) is a SEPARATE physical property
-// from the control Kd (drive_damping): it persists in every preset incl. Torque,
-// so torque control does not silently lose joint friction.
-//
-// Preset table (which params each mode sets; Kp == drive_stiffness, Kd ==
-// drive_damping). The affine is evaluated GAIN-FACTORED -- p = gain*(u + r1*q) +
-// b0 with r1 = b1/gain -- because that is the ONLY float form that is BIT-EXACT
-// to the historical kernels (the distributed form gain*u + b1*q rounds
-// differently in ~43% of inputs and would move the byte-pinned PD trajectory;
-// the factored form Kp*(u + (-1)*q) == Kp*(u-q) exactly, since -1*q is exact so
-// the inner add carries a single rounding either way, fma or not):
-//   PDPosition (0): gain=Kp,  r1=-1, b0=0   -> Kp*(u-q)   [+ implicit -Kd*qdot]
-//   Torque     (1): gain=1,   r1=0,  b0=0   -> u          [direct torque]
-//   Velocity   (2): gain=Kd,  r1=0,  b0=0   -> Kd*u       [+ implicit -Kd*qdot
-//                                              == Kd*(u-qdot), the velocity servo]
-//   Damper     (3): gain=0,   b0=0          -> 0 explicit [pure implicit -Kd*qdot,
-//                                              ctrl-scaled damping; u unused here]
-// Modes 0/1 are the C-ABI-reachable, byte-D1-gated presets; 2/3 are wired in the
-// evaluator (presets = parameters, not new code paths) for when their control
-// surface is lit, and cannot perturb the reachable presets.
-enum NkDrivePreset : uint32_t {
-    kDrivePresetPD       = 0u,
-    kDrivePresetTorque   = 1u,
-    kDrivePresetVelocity = 2u,
-    kDrivePresetDamper   = 3u,
-    kDrivePresetOsc      = 4u,
+struct DriveControlView {
+    const float* target;
+    const float* velocity_target;
+    const float* acceleration_target;
+    const float* stiffness;
+    const float* damping;
+    const float* force_limit;
+    const float* noload_speed;
+    const float* feedforward;
+    const math::Vec3* task_target;
+    const math::Quat* task_rotation;
+    const math::Transform* task_frame;
+    const float* null_stiffness;
+    const float* null_damping;
+    const float* inverse_mass;
+    float* command;
+    float* dissipation;
+    float* lower;
+    float* upper;
+    float* mass;
+    float* factor;
+    float* jacobian;
+    float* response;
+    float* task_map;
+    uint32_t* status;
 };
 
+DriveControlView MakeDriveControlView(const DataView& data) {
+    return {data.drive_target, data.velocity_target, data.acceleration_target,
+            data.drive_stiffness, data.drive_damping, data.drive_force_limit,
+            data.actuator_noload_speed, data.joint_f, data.task_target,
+            data.task_rotation_target, data.task_local_pose,
+            data.task_nullspace_stiffness, data.task_nullspace_damping, data.m_inv,
+            data.drive_command, data.drive_dissipation, data.drive_lower,
+            data.drive_upper, data.control_mass, data.control_factor,
+            data.control_jacobian, data.control_response, data.control_task_map,
+            data.env_status};
+}
+
+// Controllers provide an affine effort and its bounds to the common row solver.
+// Passive joint damping stays in ABA; feedforward is an independent generalized load.
 __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
-                                       const float* drive_targets,
-                                       const float* drive_stiffness,
-                                       const float* drive_damping,
-                                       const float* drive_force_limits,
-                                       const float* joint_feedforward,
-                                       float* actuator_effort_requested,
-                                       float* actuator_effort,
-                                       float* actuator_saturated,
-                                       uint32_t mode,
-                                       bool defer_velocity_damping) {
+                                       DriveControlView drive, uint32_t mode,
+                                       uint32_t links_per_env, bool implicit) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) {
+    if (link >= state.total_link_count) return;
+    drive.command[link] = drive.dissipation[link] = 0.0f;
+    drive.lower[link] = drive.upper[link] = 0.0f;
+    state.tau[link] = 0.0f;
+    if (JointDofCountDevice(state.joint_type[link]) != 1u) return;
+
+    const auto control = static_cast<ArticulationControlMode>(mode);
+    const bool inverse_dynamics = control == ArticulationControlMode::ComputedTorque ||
+                                  control == ArticulationControlMode::Osc;
+    const bool position_control = control == ArticulationControlMode::PDPosition || inverse_dynamics;
+    const bool velocity_control = control == ArticulationControlMode::Velocity;
+    if ((position_control && (!isfinite(drive.target[link]) ||
+            !isfinite(drive.stiffness[link]) || drive.stiffness[link] < 0.0f ||
+            !isfinite(drive.damping[link]) || drive.damping[link] < 0.0f)) ||
+        ((position_control || velocity_control) && !isfinite(drive.velocity_target[link])) ||
+        (velocity_control && (!isfinite(drive.stiffness[link]) || drive.stiffness[link] < 0.0f)) ||
+        (control == ArticulationControlMode::ComputedTorque && !isfinite(drive.acceleration_target[link])) ||
+        (control == ArticulationControlMode::Actuator && !isfinite(drive.noload_speed[link]))) {
+        atomicOr(drive.status + link / links_per_env, kEnvStatusControlFailure);
         return;
     }
-    if (state.joint_type[link] == ArticulationJointType::Fixed) {
-        actuator_effort_requested[link] = 0.0f;
-        actuator_effort[link] = 0.0f;
-        actuator_saturated[link] = 0.0f;
-        state.tau[link] = 0.0f;
+    const float velocity = state.qdot[link];
+    const float limit = drive.force_limit[link];
+    float lower = limit > 0.0f ? -limit : -FLT_MAX;
+    float upper = limit > 0.0f ? limit : FLT_MAX;
+    float bias = 0.0f;
+    float damping = 0.0f;
+    switch (control) {
+        case ArticulationControlMode::PDPosition:
+            damping = drive.damping[link];
+            bias = drive.stiffness[link] * (drive.target[link] - state.q[link]) +
+                   damping * drive.velocity_target[link];
+            break;
+        case ArticulationControlMode::Velocity:
+            damping = drive.stiffness[link];
+            bias = damping * drive.velocity_target[link];
+            break;
+        case ArticulationControlMode::Torque:
+        case ArticulationControlMode::Actuator:
+            bias = drive.target[link];
+            if (control == ArticulationControlMode::Actuator && limit > 0.0f &&
+                drive.noload_speed[link] > 0.0f) {
+                const float speed_bias = limit * velocity / drive.noload_speed[link];
+                lower = fminf(fmaxf(-limit - speed_bias, -limit), limit);
+                upper = fminf(fmaxf(limit - speed_bias, -limit), limit);
+            }
+            break;
+        case ArticulationControlMode::ComputedTorque:
+        case ArticulationControlMode::Osc:
+            break;
+    }
+    if (!implicit) {
+        bias -= damping * velocity;
+        damping = 0.0f;
+    }
+    const float feedforward = drive.feedforward[link];
+    if (!isfinite(bias) || !isfinite(damping) || damping < 0.0f ||
+        !isfinite(limit) || !isfinite(feedforward) || !isfinite(velocity) || !isfinite(state.q[link])) {
+        atomicOr(drive.status + link / links_per_env, kEnvStatusControlFailure);
         return;
     }
-    const float u = drive_targets[link];
+    drive.command[link] = bias;
+    drive.dissipation[link] = damping;
+    drive.lower[link] = lower;
+    drive.upper[link] = upper;
+    state.tau[link] = inverse_dynamics ? 0.0f : feedforward;
+}
 
-    // The affine, GAIN-FACTORED so each preset's float arithmetic is BIT-EXACT to
-    // the kernel it replaces. PDPosition is the historical position-PD expression
-    // Kp*(target-q); Torque is the historical direct-torque tau=u.
-    float tau;
-    if (mode == kDrivePresetTorque) {
-        // gain=1, r1=0, b0=0 -> p = u (no q/qdot read -- identical to the legacy
-        // ApplyTorqueDriveKernel, which set tau = torque_input directly).
-        tau = u;
-    } else if (mode == kDrivePresetOsc) {
-        // OSC's first ABA is intentionally force-free. The dedicated
-        // ApplyOscDrives op consumes its qddot as the bias/gravity acceleration,
-        // writes compensated task torques, and is followed by the real ABA.
-        tau = 0.0f;
-    } else if (mode == kDrivePresetVelocity) {
-        // gain=Kd, r1=0 -> p = Kd*u; the -Kd*qdot completes via the implicit fold
-        // (drive_damping == Kd), giving the Kd*(u-qdot) velocity servo. If the
-        // implicit fold is OFF, apply -Kd*qdot explicitly (mirrors PD's branch).
-        const float kd = drive_damping[link];
-        tau = kd * u;
-        if (!defer_velocity_damping) {
-            tau -= kd * state.qdot[link];
-        }
-    } else if (mode == kDrivePresetDamper) {
-        // gain=0, b0=0 -> no explicit term; the damping is the implicit -Kd*qdot.
-        // With the fold OFF, realize it explicitly as -Kd*qdot.
-        tau = 0.0f;
-        if (!defer_velocity_damping) {
-            tau -= drive_damping[link] * state.qdot[link];
-        }
-    } else {
-        // PDPosition (default). gain=Kp, r1=-1, b0=0 -> the affine reduces to
-        // Kp*(u - q). Written as the subtraction (the r1=-1 reduction) so the
-        // emitted float arithmetic is TEXTUALLY identical to the historical
-        // ApplyPositionDriveKernel (Kp*(target-q)); u is the same value as
-        // drive_targets[link]. This keeps the byte-pinned PD trajectory exact.
-        tau = drive_stiffness[link] * (u - state.q[link]);
-        if (!defer_velocity_damping) {
-            tau -= drive_damping[link] * state.qdot[link];
-        }
-    }
-
-    // Effort saturation (symmetric today; T3 generalizes to asymmetric). A
-    // non-positive limit means "unlimited", matching every historical kernel.
-    const float requested_effort = tau;
-    if (drive_force_limits != nullptr) {
-        const float limit = drive_force_limits[link];
-        if (limit > 0.0f) {
-            tau = fminf(fmaxf(tau, -limit), limit);
-        }
-    }
-
-    actuator_effort_requested[link] = requested_effort;
-    actuator_effort[link] = tau;
-    actuator_saturated[link] = requested_effort != tau ? 1.0f : 0.0f;
-
-    // Direct generalized force is independent of actuator saturation.
-    if (joint_feedforward != nullptr && mode != kDrivePresetOsc) {
-        const float jf = joint_feedforward[link];
-        if (jf != 0.0f) {
-            tau += jf;
-        }
-    }
-    state.tau[link] = tau;
+__global__ void ReadoutDrivesKernel(ArticulationDeviceState state,
+                                    DriveControlView drive, const float* lambda,
+                                    ReadoutDrivesParams params, float* requested,
+                                    float* applied, float* saturated) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) return;
+    requested[link] = applied[link] = saturated[link] = 0.0f;
+    if (JointDofCountDevice(state.joint_type[link]) != 1u) return;
+    const uint32_t env = link / params.links_per_env;
+    const uint32_t local = link - env * params.links_per_env;
+    const uint32_t row = env * params.rows_per_env + params.first_drive_row + local;
+    const float effort = drive.command[link] - drive.dissipation[link] * state.qdot[link];
+    requested[link] = effort;
+    applied[link] = lambda[row] / params.dt;
+    saturated[link] = effort < drive.lower[link] || effort > drive.upper[link] ? 1.0f : 0.0f;
+    state.tau[link] += applied[link];
 }
 
 // The world inertia tensor is refreshed before any contact impulses are applied.
@@ -970,460 +950,350 @@ __device__ math::Transform RelativeTransform(const ArticulationDeviceState& stat
     return relative;
 }
 
-using phi::kMaxOscDof;
-constexpr uint32_t kOscTaskDim = 6u;
+constexpr uint32_t kTaskDimension = 6u;
 
-// Fixed-order dense SPD helpers used by the opt-in OSC kernel. The controller
-// is deliberately bounded to the historical 18-DOF drive tile; worlds above
-// that limit fail at the op boundary instead of silently truncating a matrix.
-__device__ void OscFactorSpd(const float* matrix, uint32_t n, uint32_t stride,
-                             float diagonal_regularization, float* ld,
-                             float* diagonal) {
-    for (uint32_t r = 0u; r < n; ++r) {
-        for (uint32_t c = 0u; c < n; ++c) {
-            ld[r * kMaxOscDof + c] = matrix[r * stride + c];
-        }
-        ld[r * kMaxOscDof + r] += diagonal_regularization;
-    }
+// LDL factors use arena storage sized from the articulation, without a controller-specific DOF cap.
+__device__ bool FactorControlMass(float* matrix, uint32_t n, uint32_t stride,
+                                   float* diagonal) {
     for (uint32_t j = 0u; j < n; ++j) {
-        float djj = ld[j * kMaxOscDof + j];
+        double pivot = matrix[j * stride + j];
         for (uint32_t k = 0u; k < j; ++k) {
-            const float ljk = ld[j * kMaxOscDof + k];
-            djj -= ljk * ljk * diagonal[k];
+            const double value = matrix[j * stride + k];
+            pivot -= value * value * diagonal[k];
         }
-        djj = fmaxf(djj, kMinDiagonal);
-        diagonal[j] = djj;
+        if (!(pivot > 0.0) || !isfinite(pivot)) return false;
+        diagonal[j] = static_cast<float>(pivot);
         for (uint32_t i = j + 1u; i < n; ++i) {
-            float lij = ld[i * kMaxOscDof + j];
-            for (uint32_t k = 0u; k < j; ++k) {
-                lij -= ld[i * kMaxOscDof + k] *
-                       ld[j * kMaxOscDof + k] * diagonal[k];
-            }
-            ld[i * kMaxOscDof + j] = lij / djj;
+            double value = matrix[i * stride + j];
+            for (uint32_t k = 0u; k < j; ++k)
+                value -= static_cast<double>(matrix[i * stride + k]) *
+                         matrix[j * stride + k] * diagonal[k];
+            matrix[i * stride + j] = static_cast<float>(value / pivot);
         }
     }
+    return true;
 }
 
-__device__ void OscSolveFactored(const float* ld, const float* diagonal,
-                                 uint32_t n, const float* rhs, float* solution) {
+__device__ void SolveControlMass(const float* factor, const float* diagonal,
+                                  uint32_t n, uint32_t stride,
+                                  const float* rhs, float* solution) {
     for (uint32_t i = 0u; i < n; ++i) {
-        float value = rhs[i];
-        for (uint32_t k = 0u; k < i; ++k) {
-            value -= ld[i * kMaxOscDof + k] * solution[k];
-        }
-        solution[i] = value;
+        double value = rhs[i];
+        for (uint32_t j = 0u; j < i; ++j)
+            value -= static_cast<double>(factor[i * stride + j]) * solution[j];
+        solution[i] = static_cast<float>(value);
     }
-    for (uint32_t i = 0u; i < n; ++i) {
-        solution[i] /= diagonal[i];
-    }
+    for (uint32_t i = 0u; i < n; ++i) solution[i] /= diagonal[i];
     for (uint32_t ii = n; ii > 0u; --ii) {
         const uint32_t i = ii - 1u;
-        float value = solution[i];
-        for (uint32_t k = i + 1u; k < n; ++k) {
-            value -= ld[k * kMaxOscDof + i] * solution[k];
-        }
-        solution[i] = value;
+        double value = solution[i];
+        for (uint32_t j = i + 1u; j < n; ++j)
+            value -= static_cast<double>(factor[j * stride + i]) * solution[j];
+        solution[i] = static_cast<float>(value);
     }
 }
 
-__device__ void OscInvertSpd(const float* matrix, uint32_t n, uint32_t stride,
-                             float diagonal_regularization, float* inverse,
-                             uint32_t inverse_stride) {
-    float ld[kMaxOscDof * kMaxOscDof];
-    float diagonal[kMaxOscDof];
-    float rhs[kMaxOscDof];
-    float solution[kMaxOscDof];
-    OscFactorSpd(matrix, n, stride, diagonal_regularization, ld, diagonal);
-    for (uint32_t col = 0u; col < n; ++col) {
-        for (uint32_t r = 0u; r < n; ++r) {
-            rhs[r] = r == col ? 1.0f : 0.0f;
-            solution[r] = 0.0f;
+// A symmetric pseudoinverse discards unreachable task directions at the float precision floor.
+__device__ void InvertTaskResponse(float* matrix, uint32_t n, float* inverse) {
+    float vectors[kTaskDimension * kTaskDimension] = {};
+    for (uint32_t i = 0u; i < n; ++i) vectors[i * kTaskDimension + i] = 1.0f;
+    for (uint32_t sweep = 0u; sweep < 24u; ++sweep) {
+        bool changed = false;
+        for (uint32_t p = 0u; p < n; ++p) {
+            for (uint32_t q = p + 1u; q < n; ++q) {
+                const float app = matrix[p * kTaskDimension + p];
+                const float aqq = matrix[q * kTaskDimension + q];
+                const float apq = matrix[p * kTaskDimension + q];
+                if (fabsf(apq) <= FLT_EPSILON * (fabsf(app) + fabsf(aqq))) continue;
+                changed = true;
+                const double theta = (static_cast<double>(aqq) - app) / (2.0 * apq);
+                const float tangent = static_cast<float>(copysign(1.0, theta) /
+                    (fabs(theta) + sqrt(1.0 + theta * theta)));
+                const float cosine = rsqrtf(1.0f + tangent * tangent);
+                const float sine = tangent * cosine;
+                for (uint32_t k = 0u; k < n; ++k) {
+                    if (k != p && k != q) {
+                        const float kp = matrix[k * kTaskDimension + p];
+                        const float kq = matrix[k * kTaskDimension + q];
+                        matrix[k * kTaskDimension + p] = matrix[p * kTaskDimension + k] = cosine * kp - sine * kq;
+                        matrix[k * kTaskDimension + q] = matrix[q * kTaskDimension + k] = sine * kp + cosine * kq;
+                    }
+                    const float vp = vectors[k * kTaskDimension + p];
+                    const float vq = vectors[k * kTaskDimension + q];
+                    vectors[k * kTaskDimension + p] = cosine * vp - sine * vq;
+                    vectors[k * kTaskDimension + q] = sine * vp + cosine * vq;
+                }
+                matrix[p * kTaskDimension + p] = app - tangent * apq;
+                matrix[q * kTaskDimension + q] = aqq + tangent * apq;
+                matrix[p * kTaskDimension + q] = matrix[q * kTaskDimension + p] = 0.0f;
+            }
         }
-        OscSolveFactored(ld, diagonal, n, rhs, solution);
-        for (uint32_t r = 0u; r < n; ++r) {
-            inverse[r * inverse_stride + col] = solution[r];
+        if (!changed) break;
+    }
+    float largest = 0.0f;
+    for (uint32_t i = 0u; i < n; ++i)
+        largest = fmaxf(largest, matrix[i * kTaskDimension + i]);
+    const float tolerance = largest * (8.0f * FLT_EPSILON);
+    for (uint32_t r = 0u; r < n; ++r) {
+        for (uint32_t c = 0u; c < n; ++c) {
+            double value = 0.0;
+            for (uint32_t k = 0u; k < n; ++k) {
+                const float eigenvalue = matrix[k * kTaskDimension + k];
+                if (eigenvalue > tolerance)
+                    value += static_cast<double>(vectors[r * kTaskDimension + k]) *
+                             vectors[c * kTaskDimension + k] / eigenvalue;
+            }
+            inverse[r * kTaskDimension + c] = static_cast<float>(value);
         }
     }
 }
 
-// Opt-in robosuite-style operational-space control. The preceding force-free
-// ABA leaves qddot_free in state.qddot; CRBA leaves the current pure-physics
-// M^-1 in inertia_M_inv. This kernel reconstructs M, computes exact bias torque
-// -M*qddot_free, applies uncoupled position/orientation operational inertia,
-// and adds the mass-weighted initial-posture nullspace term used by robosuite.
-__global__ void ApplyOscPoseDriveKernel(
-    ArticulationDeviceState state, uint32_t max_dof, uint32_t task_link_local,
-    const float* inertia_M_inv, const math::Vec3* task_target,
-    const math::Quat* task_rotation_target,
-    const math::Transform* task_local_pose, const float* drive_target,
-    const float* drive_stiffness, const float* drive_damping,
-    const float* drive_force_limit, const float* joint_feedforward,
-    const float* snapshot_q, float* actuator_effort_requested,
-    float* actuator_effort, float* actuator_saturated) {
+__device__ void StoreTaskColumn(float* jacobian, uint32_t stride, uint32_t dof,
+                                 math::Vec3 linear, math::Vec3 angular) {
+    jacobian[dof] = linear.x;
+    jacobian[stride + dof] = linear.y;
+    jacobian[2u * stride + dof] = linear.z;
+    jacobian[3u * stride + dof] = angular.x;
+    jacobian[4u * stride + dof] = angular.y;
+    jacobian[5u * stride + dof] = angular.z;
+}
+
+__device__ math::Vec3 TaskOrientationError(math::Quat desired, math::Quat current) {
+    current = QuatNormalize(current);
+    desired = QuatNormalize(desired);
+    math::Quat conjugate = current;
+    conjugate.x = -conjugate.x;
+    conjugate.y = -conjugate.y;
+    conjugate.z = -conjugate.z;
+    math::Quat error = QuatMul(desired, conjugate);
+    const float sign = error.w < 0.0f ? -1.0f : 1.0f;
+    const float length = sqrtf(error.x * error.x + error.y * error.y + error.z * error.z);
+    const float scale = length > 1.0e-7f
+        ? sign * 2.0f * atan2f(length, fabsf(error.w)) / length : sign * 2.0f;
+    return {error.x * scale, error.y * scale, error.z * scale};
+}
+
+// S selects scalar actuators: H = (S M^-1 S^T)^-1 includes floating-base reaction.
+// OSC uses B = J M^-1 S^T and projects posture forces through its dynamic nullspace.
+__global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
+                                          DriveControlView drive,
+                                          ApplyDynamicsDrivesParams params) {
     const uint32_t articulation = blockIdx.x;
-    if (articulation >= state.articulation_count || threadIdx.x != 0u) {
-        return;
-    }
+    if (articulation >= state.articulation_count || threadIdx.x != 0u) return;
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
-    if (count == 0u || task_link_local >= count) {
-        return;
-    }
-
-    uint32_t dof_to_link[kMaxOscDof];
-    uint8_t base_dof[kMaxOscDof];
-    uint32_t n = 0u;
-    for (uint32_t i = 0u; i < kMaxOscDof; ++i) {
-        base_dof[i] = 0u;
-    }
+    const uint32_t stride = params.max_dof;
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
-        const ArticulationJointType type = state.joint_type[link];
-        const uint32_t dof_count = JointDofCountDevice(type);
-        const uint32_t dof = LocalDofIndexDevice(state, offset, link);
-        if (type == ArticulationJointType::FloatingBase) {
-            for (uint32_t b = 0u; b < 6u && dof + b < max_dof; ++b) {
-                dof_to_link[dof + b] = link;
-                base_dof[dof + b] = 1u;
-                n = n > dof + b + 1u ? n : dof + b + 1u;
-            }
-        } else if (dof_count == 1u && dof < max_dof) {
-            dof_to_link[dof] = link;
-            n = n > dof + 1u ? n : dof + 1u;
+        if (JointDofCountDevice(state.joint_type[link]) == 1u &&
+            drive.lower[link] == 0.0f && drive.upper[link] == 0.0f)
+            return;
+    }
+    if (params.mode == static_cast<uint32_t>(ArticulationControlMode::Osc)) {
+        const auto target = drive.task_target[articulation];
+        const auto rotation = drive.task_rotation[articulation];
+        const auto frame = drive.task_frame[articulation];
+        const uint32_t link = offset + params.task_link;
+        if (!isfinite(target.x) || !isfinite(target.y) || !isfinite(target.z) ||
+            !isfinite(rotation.w) || !isfinite(rotation.x) || !isfinite(rotation.y) || !isfinite(rotation.z) ||
+            !isfinite(frame.position.x) || !isfinite(frame.position.y) || !isfinite(frame.position.z) ||
+            !isfinite(frame.rotation.w) || !isfinite(frame.rotation.x) ||
+            !isfinite(frame.rotation.y) || !isfinite(frame.rotation.z) ||
+            !isfinite(drive.stiffness[link]) || drive.stiffness[link] < 0.0f ||
+            !isfinite(drive.damping[link]) || drive.damping[link] < 0.0f ||
+            !isfinite(drive.null_stiffness[articulation]) || drive.null_stiffness[articulation] < 0.0f ||
+            !isfinite(drive.null_damping[articulation]) || drive.null_damping[articulation] < 0.0f) {
+            atomicOr(drive.status + offset / params.links_per_env, kEnvStatusControlFailure);
+            return;
         }
     }
-    if (n == 0u || n > kMaxOscDof) {
+    uint32_t links[kMaxArticulationDof];
+    uint32_t dofs[kMaxArticulationDof];
+    uint32_t active = 0u;
+    for (uint32_t local = 0u; local < count; ++local) {
+        const uint32_t link = offset + local;
+        if (JointDofCountDevice(state.joint_type[link]) == 1u) {
+            links[active] = link;
+            dofs[active] = LocalDofIndexDevice(state, offset, link);
+            state.tau[link] = drive.feedforward[link];
+            ++active;
+        }
+    }
+    if (active == 0u) return;
+    const size_t matrix_offset = static_cast<size_t>(articulation) * stride * stride;
+    const float* inverse_mass = drive.inverse_mass + matrix_offset;
+    float* factor = drive.factor + matrix_offset;
+    float* mass = drive.mass + matrix_offset;
+    float diagonal[kMaxArticulationDof];
+    float rhs[kMaxArticulationDof];
+    float solution[kMaxArticulationDof];
+    for (uint32_t r = 0u; r < active; ++r)
+        for (uint32_t c = 0u; c < active; ++c)
+            factor[r * stride + c] = 0.5f *
+                (inverse_mass[dofs[r] * stride + dofs[c]] + inverse_mass[dofs[c] * stride + dofs[r]]);
+    if (!FactorControlMass(factor, active, stride, diagonal)) {
+        atomicOr(drive.status + offset / params.links_per_env, kEnvStatusControlFailure);
         return;
     }
-
-    const size_t tile_stride = static_cast<size_t>(max_dof) * max_dof;
-    const float* minv = inertia_M_inv +
-        static_cast<size_t>(articulation) * tile_stride;
-
-    // Recover the full M from CRBA's M^-1. This also lets the arm controller use
-    // the exact arm principal mass block, matching robosuite's joint-index slice
-    // while keeping gripper DOFs outside the task Jacobian.
-    float mass[kMaxOscDof * kMaxOscDof];
-    OscInvertSpd(minv, n, max_dof, 0.0f, mass, kMaxOscDof);
-
-    float qddot_free[kMaxOscDof];
-    float bias[kMaxOscDof];
-    for (uint32_t d = 0u; d < n; ++d) {
-        qddot_free[d] = state.joint_type[dof_to_link[d]] ==
-                                ArticulationJointType::FloatingBase
-                            ? state.link_acceleration[dof_to_link[d]].a[
-                                  d - LocalDofIndexDevice(state, offset, dof_to_link[d])]
-                            : state.qddot[dof_to_link[d]];
+    for (uint32_t c = 0u; c < active; ++c) {
+        for (uint32_t r = 0u; r < active; ++r) rhs[r] = r == c ? 1.0f : 0.0f;
+        SolveControlMass(factor, diagonal, active, stride, rhs, solution);
+        for (uint32_t r = 0u; r < active; ++r) mass[r * stride + c] = solution[r];
     }
-    for (uint32_t r = 0u; r < n; ++r) {
-        float value = 0.0f;
-        for (uint32_t c = 0u; c < n; ++c) {
-            value -= mass[r * kMaxOscDof + c] * qddot_free[c];
+    float bias[kMaxArticulationDof];
+    for (uint32_t r = 0u; r < active; ++r) {
+        double value = -state.joint_damping[links[r]] * state.qdot[links[r]];
+        for (uint32_t c = 0u; c < active; ++c)
+            value -= static_cast<double>(mass[r * stride + c]) * state.qddot[links[c]];
+        bias[r] = static_cast<float>(value);
+    }
+    if (params.mode == static_cast<uint32_t>(ArticulationControlMode::ComputedTorque)) {
+        for (uint32_t c = 0u; c < active; ++c) {
+            const uint32_t link = links[c];
+            rhs[c] = drive.acceleration_target[link] +
+                drive.stiffness[link] * (drive.target[link] - state.q[link]) +
+                drive.damping[link] * (drive.velocity_target[link] - state.qdot[link]);
         }
-        // Remove passive damping from force-free ABA's bias estimate so OSC
-        // compensates only gravity and Coriolis, preserving physical damping.
-        if (base_dof[r] == 0u) {
-            const uint32_t link = dof_to_link[r];
-            value -= state.joint_damping[link] * state.qdot[link];
+        for (uint32_t r = 0u; r < active; ++r) {
+            double value = bias[r];
+            for (uint32_t c = 0u; c < active; ++c)
+                value += static_cast<double>(mass[r * stride + c]) * rhs[c];
+            drive.command[links[r]] = static_cast<float>(value);
         }
-        bias[r] = value;
-    }
-
-    math::Transform local_task = task_local_pose[articulation];
-    const float local_norm_sq =
-        local_task.rotation.w * local_task.rotation.w +
-        local_task.rotation.x * local_task.rotation.x +
-        local_task.rotation.y * local_task.rotation.y +
-        local_task.rotation.z * local_task.rotation.z;
-    if (local_norm_sq <= 1.0e-12f) {
-        local_task.rotation = QuatIdentity();
-    }
-    const uint32_t task_link = offset + task_link_local;
-    const math::Transform task_pose =
-        ComposeTransform(state.link_pose[task_link], local_task);
-
-    // Build the 6xN geometric Jacobian at the configured local task frame.
-    float jacobian_full[kOscTaskDim * kMaxOscDof];
-    uint8_t chain_dof[kMaxOscDof];
-    for (uint32_t i = 0u; i < kOscTaskDim * kMaxOscDof; ++i) {
-        jacobian_full[i] = 0.0f;
-    }
-    for (uint32_t i = 0u; i < kMaxOscDof; ++i) {
-        chain_dof[i] = 0u;
-    }
-    uint32_t walk = task_link;
-    while (walk != kInvalidLink) {
-        const ArticulationJointType type = state.joint_type[walk];
-        const uint32_t dof_base = LocalDofIndexDevice(state, offset, walk);
-        if (type == ArticulationJointType::FloatingBase) {
-            const math::Quat root_rot = state.base_pose[articulation].rotation;
-            const math::Vec3 lever = mg::Sub(
-                task_pose.position, state.base_pose[articulation].position);
-            const math::Vec3 axes[3] = {
-                RotateByQuat(root_rot, {1.0f, 0.0f, 0.0f}),
-                RotateByQuat(root_rot, {0.0f, 1.0f, 0.0f}),
-                RotateByQuat(root_rot, {0.0f, 0.0f, 1.0f})};
-            for (uint32_t b = 0u; b < 3u; ++b) {
-                const uint32_t ad = dof_base + b;
-                const uint32_t ld = dof_base + 3u + b;
-                const math::Vec3 angular = Cross3(axes[b], lever);
-                if (ad < n) {
-                    jacobian_full[0u * kMaxOscDof + ad] = angular.x;
-                    jacobian_full[1u * kMaxOscDof + ad] = angular.y;
-                    jacobian_full[2u * kMaxOscDof + ad] = angular.z;
-                    jacobian_full[3u * kMaxOscDof + ad] = axes[b].x;
-                    jacobian_full[4u * kMaxOscDof + ad] = axes[b].y;
-                    jacobian_full[5u * kMaxOscDof + ad] = axes[b].z;
-                    chain_dof[ad] = 1u;
+    } else {
+        const uint32_t task_link = offset + params.task_link;
+        math::Transform local_task = drive.task_frame[articulation];
+        local_task.rotation = QuatNormalize(local_task.rotation);
+        const math::Transform task_pose = ComposeTransform(state.link_pose[task_link], local_task);
+        const size_t task_offset = static_cast<size_t>(articulation) * stride * kTaskDimension;
+        float* jacobian = drive.jacobian + task_offset;
+        float* response = drive.response + task_offset;
+        float* task_map = drive.task_map + task_offset;
+        for (uint32_t i = 0u; i < stride * kTaskDimension; ++i) jacobian[i] = 0.0f;
+        uint8_t chain[kMaxArticulationDof] = {};
+        uint32_t walk = task_link;
+        while (walk != kInvalidLink) {
+            const auto type = state.joint_type[walk];
+            const uint32_t dof = LocalDofIndexDevice(state, offset, walk);
+            const math::Vec3 lever = mg::Sub(task_pose.position, state.link_pose[walk].position);
+            if (type == ArticulationJointType::FloatingBase) {
+                const math::Vec3 basis[3] = {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+                for (uint32_t c = 0u; c < 3u; ++c) {
+                    const auto axis = RotateByQuat(state.base_pose[articulation].rotation, basis[c]);
+                    StoreTaskColumn(jacobian, stride, dof + c, Cross3(axis, lever), axis);
+                    StoreTaskColumn(jacobian, stride, dof + 3u + c, axis, {});
                 }
-                if (ld < n) {
-                    jacobian_full[0u * kMaxOscDof + ld] = axes[b].x;
-                    jacobian_full[1u * kMaxOscDof + ld] = axes[b].y;
-                    jacobian_full[2u * kMaxOscDof + ld] = axes[b].z;
-                    chain_dof[ld] = 1u;
-                }
+            } else if (JointDofCountDevice(type) == 1u) {
+                const auto axis = RotateByQuat(state.link_pose[walk].rotation, state.joint_axis[walk]);
+                const bool revolute = type == ArticulationJointType::Revolute;
+                StoreTaskColumn(jacobian, stride, dof, revolute ? Cross3(axis, lever) : axis,
+                                revolute ? axis : math::Vec3{});
+                chain[dof] = 1u;
             }
-        } else if (JointDofCountDevice(type) == 1u) {
-            const uint32_t dof = dof_base;
-            if (dof < n) {
-                const math::Vec3 axis = RotateByQuat(
-                    state.link_pose[walk].rotation, state.joint_axis[walk]);
-                math::Vec3 linear = axis;
-                if (type != ArticulationJointType::Prismatic) {
-                    linear = Cross3(axis, mg::Sub(
-                        task_pose.position, state.link_pose[walk].position));
-                }
-                jacobian_full[0u * kMaxOscDof + dof] = linear.x;
-                jacobian_full[1u * kMaxOscDof + dof] = linear.y;
-                jacobian_full[2u * kMaxOscDof + dof] = linear.z;
-                if (type != ArticulationJointType::Prismatic) {
-                    jacobian_full[3u * kMaxOscDof + dof] = axis.x;
-                    jacobian_full[4u * kMaxOscDof + dof] = axis.y;
-                    jacobian_full[5u * kMaxOscDof + dof] = axis.z;
-                }
-                chain_dof[dof] = 1u;
-            }
+            const uint32_t parent = state.parent_link[walk];
+            walk = parent == kInvalidLink ? kInvalidLink : offset + parent;
         }
-        const uint32_t parent_local = state.parent_link[walk];
-        walk = parent_local == kInvalidLink ? kInvalidLink : offset + parent_local;
-    }
-
-    uint32_t arm_dof[kMaxOscDof];
-    uint32_t arm_count = 0u;
-    walk = task_link;
-    while (walk != kInvalidLink) {
-        const ArticulationJointType type = state.joint_type[walk];
-        const uint32_t dof_base = LocalDofIndexDevice(state, offset, walk);
-        const uint32_t dof_count = JointDofCountDevice(type);
-        for (uint32_t b = 0u; b < dof_count && dof_base + b < n; ++b) {
-            arm_dof[arm_count++] = dof_base + b;
-        }
-        const uint32_t parent_local = state.parent_link[walk];
-        walk = parent_local == kInvalidLink ? kInvalidLink : offset + parent_local;
-    }
-    if (arm_count == 0u || arm_count > kMaxOscDof) {
-        return;
-    }
-
-    float arm_mass[kMaxOscDof * kMaxOscDof];
-    float arm_minv[kMaxOscDof * kMaxOscDof];
-    float jacobian[kOscTaskDim * kMaxOscDof];
-    for (uint32_t r = 0u; r < arm_count; ++r) {
-        for (uint32_t c = 0u; c < arm_count; ++c) {
-            arm_mass[r * kMaxOscDof + c] =
-                mass[arm_dof[r] * kMaxOscDof + arm_dof[c]];
-        }
-        for (uint32_t row = 0u; row < kOscTaskDim; ++row) {
-            jacobian[row * kMaxOscDof + r] =
-                jacobian_full[row * kMaxOscDof + arm_dof[r]];
-        }
-    }
-    OscInvertSpd(arm_mass, arm_count, kMaxOscDof, 0.0f,
-                 arm_minv, kMaxOscDof);
-
-    float task_velocity[kOscTaskDim] = {};
-    for (uint32_t row = 0u; row < kOscTaskDim; ++row) {
-        for (uint32_t a = 0u; a < arm_count; ++a) {
-            const uint32_t d = arm_dof[a];
-            const uint32_t link = dof_to_link[d];
-            float qd = state.qdot[link];
-            if (base_dof[d]) {
-                const uint32_t component =
-                    d - LocalDofIndexDevice(state, offset, link);
-                qd = state.link_velocity[link].v[component];
-            }
-            task_velocity[row] += jacobian[row * kMaxOscDof + a] * qd;
-        }
-    }
-
-    const math::Vec3 position_error =
-        mg::Sub(task_target[articulation], task_pose.position);
-    const math::Quat desired_quat_raw = task_rotation_target[articulation];
-    const float desired_norm_sq =
-        desired_quat_raw.w * desired_quat_raw.w +
-        desired_quat_raw.x * desired_quat_raw.x +
-        desired_quat_raw.y * desired_quat_raw.y +
-        desired_quat_raw.z * desired_quat_raw.z;
-    const bool control_orientation = desired_norm_sq > 1.0e-12f;
-    math::Vec3 orientation_error{};
-    if (control_orientation) {
-        const Mat3 current = RotationFromQuat(task_pose.rotation);
-        const Mat3 desired = RotationFromQuat(desired_quat_raw);
-        const math::Vec3 current_col[3] = {
-            {current.m[0], current.m[3], current.m[6]},
-            {current.m[1], current.m[4], current.m[7]},
-            {current.m[2], current.m[5], current.m[8]}};
-        const math::Vec3 desired_col[3] = {
-            {desired.m[0], desired.m[3], desired.m[6]},
-            {desired.m[1], desired.m[4], desired.m[7]},
-            {desired.m[2], desired.m[5], desired.m[8]}};
-        orientation_error = ScaleVec(
-            AddVec(AddVec(Cross3(current_col[0], desired_col[0]),
-                          Cross3(current_col[1], desired_col[1])),
-                   Cross3(current_col[2], desired_col[2])),
-            0.5f);
-    }
-
-    const float kp = drive_stiffness[task_link];
-    const float kd = drive_damping[task_link];
-    float desired_accel[kOscTaskDim] = {
-        kp * position_error.x - kd * task_velocity[0],
-        kp * position_error.y - kd * task_velocity[1],
-        kp * position_error.z - kd * task_velocity[2],
-        kp * orientation_error.x - kd * task_velocity[3],
-        kp * orientation_error.y - kd * task_velocity[4],
-        kp * orientation_error.z - kd * task_velocity[5]};
-
-    // Robosuite's default OSC uncouples position and orientation: invert the two
-    // 3x3 operational inertia blocks independently.
-    float task_wrench[kOscTaskDim] = {};
-    for (uint32_t block = 0u; block < (control_orientation ? 2u : 1u); ++block) {
-        float admittance[9] = {};
-        for (uint32_t r = 0u; r < 3u; ++r) {
-            for (uint32_t s = 0u; s < 3u; ++s) {
-                float value = 0.0f;
-                for (uint32_t a = 0u; a < arm_count; ++a) {
-                    for (uint32_t b = 0u; b < arm_count; ++b) {
-                        value += jacobian[(block * 3u + r) * kMaxOscDof + a] *
-                                 arm_minv[a * kMaxOscDof + b] *
-                                 jacobian[(block * 3u + s) * kMaxOscDof + b];
-                    }
-                }
-                admittance[r * 3u + s] = value;
-            }
-        }
-        float ld[kMaxOscDof * kMaxOscDof];
-        float diagonal[kMaxOscDof];
-        float rhs[kMaxOscDof] = {};
-        float solution[kMaxOscDof] = {};
-        for (uint32_t r = 0u; r < 3u; ++r) {
-            rhs[r] = desired_accel[block * 3u + r];
-        }
-        OscFactorSpd(admittance, 3u, 3u, 1.0e-7f, ld, diagonal);
-        OscSolveFactored(ld, diagonal, 3u, rhs, solution);
-        for (uint32_t r = 0u; r < 3u; ++r) {
-            task_wrench[block * 3u + r] = solution[r];
-        }
-    }
-
-    float task_torque[kMaxOscDof] = {};
-    const uint32_t task_rows = control_orientation ? 6u : 3u;
-    for (uint32_t a = 0u; a < arm_count; ++a) {
-        for (uint32_t row = 0u; row < task_rows; ++row) {
-            task_torque[a] +=
-                jacobian[row * kMaxOscDof + a] * task_wrench[row];
-        }
-    }
-
-    // Dynamically consistent nullspace N = I - Jbar*J, with the same initial
-    // posture acceleration and mass weighting as robosuite nullspace_torques().
-    float task_admittance[kOscTaskDim * kOscTaskDim] = {};
-    for (uint32_t r = 0u; r < task_rows; ++r) {
-        for (uint32_t s = 0u; s < task_rows; ++s) {
-            float value = 0.0f;
-            for (uint32_t a = 0u; a < arm_count; ++a) {
-                for (uint32_t b = 0u; b < arm_count; ++b) {
-                    value += jacobian[r * kMaxOscDof + a] *
-                             arm_minv[a * kMaxOscDof + b] *
-                             jacobian[s * kMaxOscDof + b];
-                }
-            }
-            task_admittance[r * kOscTaskDim + s] = value;
-        }
-    }
-    float lambda_full[kOscTaskDim * kOscTaskDim] = {};
-    OscInvertSpd(task_admittance, task_rows, kOscTaskDim, 1.0e-7f,
-                 lambda_full, kOscTaskDim);
-    float jbar[kMaxOscDof * kOscTaskDim] = {};
-    for (uint32_t a = 0u; a < arm_count; ++a) {
+        const auto desired_rotation = drive.task_rotation[articulation];
+        const float rotation_norm = desired_rotation.w * desired_rotation.w +
+            desired_rotation.x * desired_rotation.x + desired_rotation.y * desired_rotation.y +
+            desired_rotation.z * desired_rotation.z;
+        const uint32_t task_rows = rotation_norm > 1.0e-12f ? 6u : 3u;
         for (uint32_t r = 0u; r < task_rows; ++r) {
-            float value = 0.0f;
-            for (uint32_t s = 0u; s < task_rows; ++s) {
-                float minv_jt = 0.0f;
-                for (uint32_t b = 0u; b < arm_count; ++b) {
-                    minv_jt += arm_minv[a * kMaxOscDof + b] *
-                               jacobian[s * kMaxOscDof + b];
-                }
-                value += minv_jt * lambda_full[s * kOscTaskDim + r];
+            for (uint32_t c = 0u; c < active; ++c) {
+                double value = 0.0;
+                for (uint32_t d = 0u; d < stride; ++d)
+                    value += static_cast<double>(jacobian[r * stride + d]) * inverse_mass[d * stride + dofs[c]];
+                response[r * stride + c] = static_cast<float>(value);
             }
-            jbar[a * kOscTaskDim + r] = value;
         }
-    }
-    float pose_torque[kMaxOscDof] = {};
-    constexpr float kNullKp = 10.0f;
-    constexpr float kNullKd = 6.32455532f;
-    for (uint32_t r = 0u; r < arm_count; ++r) {
-        for (uint32_t c = 0u; c < arm_count; ++c) {
-            const uint32_t link = dof_to_link[arm_dof[c]];
-            const float accel = base_dof[arm_dof[c]]
-                ? 0.0f
-                : kNullKp * (snapshot_q[link] - state.q[link]) -
-                      kNullKd * state.qdot[link];
-            pose_torque[r] += arm_mass[r * kMaxOscDof + c] * accel;
-        }
-    }
-    float null_torque[kMaxOscDof] = {};
-    for (uint32_t a = 0u; a < arm_count; ++a) {
-        for (uint32_t b = 0u; b < arm_count; ++b) {
-            float n_ba = b == a ? 1.0f : 0.0f;
-            for (uint32_t r = 0u; r < task_rows; ++r) {
-                n_ba -= jbar[b * kOscTaskDim + r] *
-                        jacobian[r * kMaxOscDof + a];
+        for (uint32_t r = 0u; r < task_rows; ++r) {
+            for (uint32_t c = 0u; c < active; ++c) {
+                double value = 0.0;
+                for (uint32_t a = 0u; a < active; ++a)
+                    value += static_cast<double>(mass[c * stride + a]) * response[r * stride + a];
+                task_map[r * stride + c] = static_cast<float>(value);
             }
-            null_torque[a] += n_ba * pose_torque[b];
         }
-    }
+        float metric[kTaskDimension * kTaskDimension] = {};
+        float inverse_metric[kTaskDimension * kTaskDimension] = {};
+        for (uint32_t r = 0u; r < task_rows; ++r) {
+            for (uint32_t c = 0u; c < task_rows; ++c) {
+                double value = 0.0;
+                for (uint32_t a = 0u; a < active; ++a)
+                    value += static_cast<double>(response[r * stride + a]) * task_map[c * stride + a];
+                metric[r * kTaskDimension + c] = static_cast<float>(value);
+            }
+        }
+        InvertTaskResponse(metric, task_rows, inverse_metric);
 
-    for (uint32_t d = 0u; d < n; ++d) {
-        const uint32_t link = dof_to_link[d];
-        float requested = bias[d];
-        if (chain_dof[d]) {
-            uint32_t a = 0u;
-            while (a < arm_count && arm_dof[a] != d) {
-                ++a;
+        const float* velocity = state.link_velocity[task_link].v;
+        const float* acceleration = state.link_acceleration[task_link].a;
+        const math::Vec3 omega{velocity[0], velocity[1], velocity[2]};
+        const math::Vec3 linear{velocity[3], velocity[4], velocity[5]};
+        const math::Vec3 alpha{acceleration[0], acceleration[1], acceleration[2]};
+        const math::Vec3 linear_accel{acceleration[3], acceleration[4], acceleration[5]};
+        const auto rotation = state.link_pose[task_link].rotation;
+        const auto task_velocity = RotateByQuat(rotation, AddVec(linear, Cross3(omega, local_task.position)));
+        const auto task_angular = RotateByQuat(rotation, omega);
+        const auto task_accel = AddVec(RotateByQuat(rotation,
+            AddVec(AddVec(linear_accel, Cross3(omega, linear)),
+                   AddVec(Cross3(alpha, local_task.position), Cross3(omega, Cross3(omega, local_task.position))))),
+            {params.gravity[0], params.gravity[1], params.gravity[2]});
+        const auto task_angular_accel = RotateByQuat(rotation, alpha);
+        const auto position_error = mg::Sub(drive.task_target[articulation], task_pose.position);
+        const auto orientation_error = task_rows == 6u ? TaskOrientationError(desired_rotation, task_pose.rotation) : math::Vec3{};
+        const float kp = drive.stiffness[task_link], kd = drive.damping[task_link];
+        float task_rhs[kTaskDimension] = {
+            kp * position_error.x - kd * task_velocity.x - task_accel.x,
+            kp * position_error.y - kd * task_velocity.y - task_accel.y,
+            kp * position_error.z - kd * task_velocity.z - task_accel.z,
+            kp * orientation_error.x - kd * task_angular.x - task_angular_accel.x,
+            kp * orientation_error.y - kd * task_angular.y - task_angular_accel.y,
+            kp * orientation_error.z - kd * task_angular.z - task_angular_accel.z};
+
+        const float null_kp = drive.null_stiffness[articulation];
+        const float null_kd = drive.null_damping[articulation];
+        for (uint32_t c = 0u; c < active; ++c) {
+            const uint32_t link = links[c];
+            rhs[c] = chain[dofs[c]] ?
+                null_kp * (drive.target[link] - state.q[link]) +
+                null_kd * (drive.velocity_target[link] - state.qdot[link]) : 0.0f;
+        }
+        float posture[kMaxArticulationDof];
+        for (uint32_t r = 0u; r < active; ++r) {
+            double value = 0.0;
+            for (uint32_t c = 0u; c < active; ++c)
+                value += static_cast<double>(mass[r * stride + c]) * rhs[c];
+            const uint32_t link = links[r];
+            if (!chain[dofs[r]])
+                value += drive.stiffness[link] * (drive.target[link] - state.q[link]) +
+                         drive.damping[link] * (drive.velocity_target[link] - state.qdot[link]);
+            posture[r] = static_cast<float>(value);
+        }
+        for (uint32_t r = 0u; r < task_rows; ++r) {
+            for (uint32_t a = 0u; a < active; ++a) {
+                const uint32_t link = links[a];
+                task_rhs[r] -= response[r * stride + a] *
+                    (bias[a] + state.joint_damping[link] * state.qdot[link] + posture[a]);
             }
-            if (a < arm_count) {
-                requested += task_torque[a] + null_torque[a];
-            }
-        } else {
-            // Gripper and other non-task-chain joints keep an independent joint
-            // servo while receiving the same inverse-dynamics bias compensation.
-            requested += drive_stiffness[link] *
-                             (drive_target[link] - state.q[link]) -
-                         drive_damping[link] * state.qdot[link];
         }
-        float applied = requested;
-        const float limit = drive_force_limit[link];
-        if (limit > 0.0f) {
-            applied = fminf(fmaxf(applied, -limit), limit);
+        float task_force[kTaskDimension] = {};
+        for (uint32_t r = 0u; r < task_rows; ++r)
+            for (uint32_t c = 0u; c < task_rows; ++c)
+                task_force[r] += inverse_metric[r * kTaskDimension + c] * task_rhs[c];
+        for (uint32_t a = 0u; a < active; ++a) {
+            double value = bias[a] + posture[a];
+            for (uint32_t r = 0u; r < task_rows; ++r)
+                value += static_cast<double>(task_map[r * stride + a]) * task_force[r];
+            drive.command[links[a]] = static_cast<float>(value);
         }
-        actuator_effort_requested[link] = requested;
-        actuator_effort[link] = applied;
-        actuator_saturated[link] = requested != applied ? 1.0f : 0.0f;
-        if (joint_feedforward != nullptr) {
-            applied += joint_feedforward[link];
+    }
+    for (uint32_t a = 0u; a < active; ++a) {
+        if (!isfinite(drive.command[links[a]])) {
+            for (uint32_t c = 0u; c < active; ++c) drive.command[links[c]] = 0.0f;
+            atomicOr(drive.status + offset / params.links_per_env, kEnvStatusControlFailure);
+            return;
         }
-        state.tau[link] = applied;
     }
 }
 
@@ -1469,62 +1339,48 @@ Status LaunchOk(cudaStream_t /*stream*/) {
 Status OpApplyDrives(const ModelView& model, const DataView& data,
                      const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ApplyDrivesParams*>(params);
-    if (p == nullptr) {
-        return Status::Failed;
-    }
-    if (p->total_link_count == 0u) {
-        return Status::Ok;
-    }
-    const ArticulationDeviceState state =
-        MakeArticulationDeviceState(model, data, p->total_link_count, 0u);
+    if (!p || p->mode > static_cast<uint32_t>(ArticulationControlMode::Actuator))
+        return Status::InvalidArgument;
+    if (p->total_link_count == 0u) return Status::Ok;
+    if (p->links_per_env == 0u) return Status::InvalidArgument;
+    const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, 0u);
     const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
-    // ONE affine actuator kernel for EVERY preset (p->mode selects which params the
-    // affine uses; there is no per-mode kernel/code path). PDPosition (0) and
-    // Torque (1) are the reachable, byte-D1-gated presets; Velocity (2)/Damper (3)
-    // are evaluated by the same kernel for when their control surface is lit.
     LaunchCuda(ApplyAffineDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
-               state,
-               static_cast<const float*>(data.drive_target),
-               static_cast<const float*>(data.drive_stiffness),
-               static_cast<const float*>(data.drive_damping),
-               static_cast<const float*>(data.drive_force_limit),
-               static_cast<const float*>(data.joint_f),
-               data.actuator_effort_requested,
-               data.actuator_effort,
-               data.actuator_saturated,
-               p->mode,
+               state, MakeDriveControlView(data), p->mode, p->links_per_env,
                p->defer_velocity_damping != 0u);
     return LaunchOk(stream);
 }
 
-Status OpApplyOscDrives(const ModelView& model, const DataView& data,
-                        const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const ApplyOscDrivesParams*>(params);
-    if (p == nullptr || p->max_dof > kMaxOscDof) {
-        return Status::Failed;
-    }
-    if (p->articulation_count == 0u || p->total_link_count == 0u ||
-        p->max_dof == 0u) {
+Status OpApplyDynamicsDrives(const ModelView& model, const DataView& data,
+                             const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ApplyDynamicsDrivesParams*>(params);
+    if (!p || p->max_dof > kMaxArticulationDof ||
+        (p->mode != static_cast<uint32_t>(ArticulationControlMode::ComputedTorque) &&
+         p->mode != static_cast<uint32_t>(ArticulationControlMode::Osc)))
+        return Status::InvalidArgument;
+    if (p->articulation_count == 0u || p->total_link_count == 0u || p->max_dof == 0u)
         return Status::Ok;
-    }
-    if (data.m_inv == nullptr || data.task_target == nullptr ||
-        data.task_rotation_target == nullptr || data.task_local_pose == nullptr) {
-        return Status::Failed;
-    }
-    const ArticulationDeviceState state = MakeArticulationDeviceState(
-        model, data, p->total_link_count, p->articulation_count);
-    LaunchCuda(ApplyOscPoseDriveKernel, dim3(p->articulation_count), dim3(32u),
-               0u, stream, state, p->max_dof, p->task_link,
-               static_cast<const float*>(data.m_inv), data.task_target,
-               data.task_rotation_target, data.task_local_pose,
-               static_cast<const float*>(data.drive_target),
-               static_cast<const float*>(data.drive_stiffness),
-               static_cast<const float*>(data.drive_damping),
-               static_cast<const float*>(data.drive_force_limit),
-               static_cast<const float*>(data.joint_f),
-               static_cast<const float*>(data.snapshot_q),
-               data.actuator_effort_requested, data.actuator_effort,
-               data.actuator_saturated);
+    if (!data.m_inv || !data.control_mass || !data.control_factor || !data.control_jacobian ||
+        !data.control_response || !data.control_task_map || p->links_per_env == 0u)
+        return Status::InvalidArgument;
+    const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
+    LaunchCuda(ApplyDynamicsDriveKernel, dim3(p->articulation_count), dim3(32u), 0u,
+               stream, state, MakeDriveControlView(data), *p);
+    return LaunchOk(stream);
+}
+
+Status OpReadoutDrives(const ModelView& model, const DataView& data,
+                       const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ReadoutDrivesParams*>(params);
+    if (!p || p->dt <= 0.0f) return Status::InvalidArgument;
+    if (p->total_link_count == 0u) return Status::Ok;
+    if (p->links_per_env == 0u || p->first_drive_row + p->links_per_env > p->rows_per_env)
+        return Status::InvalidArgument;
+    const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, 0u);
+    const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
+    LaunchCuda(ReadoutDrivesKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
+               state, MakeDriveControlView(data), data.lambda, *p,
+               data.actuator_effort_requested, data.actuator_effort, data.actuator_saturated);
     return LaunchOk(stream);
 }
 
@@ -1687,7 +1543,8 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
 
 void RegisterNkAbaOps() {
     SetCudaOp(NkOp::ApplyDrives, &OpApplyDrives);
-    SetCudaOp(NkOp::ApplyOscDrives, &OpApplyOscDrives);
+    SetCudaOp(NkOp::ApplyDynamicsDrives, &OpApplyDynamicsDrives);
+    SetCudaOp(NkOp::ReadoutDrives, &OpReadoutDrives);
     SetCudaOp(NkOp::AbaForward, &OpAbaForward);
     SetCudaOp(NkOp::IntegrateVelocity, &OpIntegrateVelocity);
     SetCudaOp(NkOp::FkWorldPoses, &OpFkWorldPoses);

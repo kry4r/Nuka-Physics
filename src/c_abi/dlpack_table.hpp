@@ -42,6 +42,7 @@ static_assert(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW == phi::kEnvStatusGridContac
 static_assert(NUKA_ENV_STATUS_GYRO_FAILURE == phi::kEnvStatusGyroFailure);
 static_assert(NUKA_ENV_STATUS_INVALID_ENDPOINT == phi::kEnvStatusInvalidEndpoint);
 static_assert(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE == phi::kEnvStatusContactGeometryUnavailable);
+static_assert(NUKA_ENV_STATUS_CONTROL_FAILURE == phi::kEnvStatusControlFailure);
 static_assert(NUKA_GYRO_NOT_CONVERGED == phi::kBodyGyroNotConverged);
 static_assert(NUKA_GYRO_INVALID_INPUT == phi::kBodyGyroInvalidInput);
 
@@ -53,10 +54,7 @@ inline constexpr uint8_t kWireDtypeF32 = 0u;
 inline constexpr uint8_t kWireDtypeU32 = 1u;
 inline constexpr uint8_t kWireDtypeU64 = 2u;
 
-// Sentinel for a public field that has NO corresponding fields.yaml ordinal
-// (the control-input params buffers — TORQUE_INPUT / VELOCITY_TARGET /
-// ACTUATOR_NOLOAD_SPEED / TASK_TARGET — are params-carried raw device buffers,
-// not Arena Data fields, so they have no nk::FieldId. See the per-row notes.)
+// Sentinel for a public descriptor without arena storage.
 inline constexpr nk::FieldId kNoFieldId = nk::FieldId::Count;
 
 // One descriptor row per public nuka_state_field_t value.
@@ -116,23 +114,11 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     // -- field 11: authoritative per-env floating-base root world pose
     //    (Transform, quat W-FIRST, 28 B; ONE per env, NOT per link). ----------
     {NUKA_FIELD_BASE_POSE,              kStridePose,  kWireDtypeF32, nk::FieldId::BasePose},
-    // -- field 12: TORQUE_INPUT. The Torque control mode (drive_mode==1) reads the
-    //    per-link torque command from the SAME persistent Data field as the PD
-    //    target (DriveTarget): OpApplyDrives's ApplyTorqueDriveKernel consumes
-    //    data.drive_target as the torque (articulation.cu ApplyTorqueDriveKernel +
-    //    OpApplyDrives mode==1). So in the unified actuator (T1) TORQUE_INPUT
-    //    ALIASES DriveTarget -- the public field is the SAME device buffer as
-    //    DRIVE_TARGET, reinterpreted by the active preset (this is "禁止特化":
-    //    ONE control buffer `u`, the preset decides its meaning). Byte-identical
-    //    storage; the alias is only the wire name. The other three control-input
-    //    fields (13/14/15) stay kNoFieldId until their presets are wired.
+    // Torque input retains the position-target alias; other inputs have separate storage.
     {NUKA_FIELD_TORQUE_INPUT,           kStrideF32,   kWireDtypeF32, nk::FieldId::DriveTarget},
-    {NUKA_FIELD_VELOCITY_TARGET,        kStrideF32,   kWireDtypeF32, kNoFieldId},
-    {NUKA_FIELD_ACTUATOR_NOLOAD_SPEED,  kStrideF32,   kWireDtypeF32, kNoFieldId},
-    // TASK_TARGET is now an arena-backed per-env position input. The optional
-    // quaternion and local task frame append the 6D OSC surface without changing
-    // the existing field's integer or stride.
-    {NUKA_FIELD_TASK_TARGET,            kStrideVec3,  kWireDtypeF32, nk::FieldId::TaskTarget},
+    {NUKA_FIELD_VELOCITY_TARGET,        kStrideF32,   kWireDtypeF32, nk::FieldId::VelocityTarget},
+    {NUKA_FIELD_ACTUATOR_NOLOAD_SPEED,  kStrideF32,   kWireDtypeF32, nk::FieldId::ActuatorNoloadSpeed},
+    {NUKA_FIELD_TASK_TARGET,            kStrideVec3, kWireDtypeF32, nk::FieldId::TaskTarget},
     // -- field 16: net per-link world contact wrench [F(3),tau(3)], 24 B. -----
     {NUKA_FIELD_LINK_CONTACT_WRENCH,    kStrideSpat6, kWireDtypeF32, nk::FieldId::LinkContactWrench},
     // -- field 17: per-slot world unit normal (Vec3, 12 B). ------------------
@@ -190,14 +176,17 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_MPM_BODY_ANGULAR_IMPULSE, kStrideVec3, kWireDtypeF32, nk::FieldId::MpmBodyAngReaction},
     {NUKA_FIELD_MPM_BOUNDARY_IMPULSE, kStrideVec3, kWireDtypeF32, nk::FieldId::MpmBoundaryImpulse},
     {NUKA_FIELD_MPM_BOUNDARY_ANGULAR_IMPULSE, kStrideVec3, kWireDtypeF32, nk::FieldId::MpmBoundaryMoment},
+    {NUKA_FIELD_ACCELERATION_TARGET,    kStrideF32, kWireDtypeF32, nk::FieldId::AccelerationTarget},
+    {NUKA_FIELD_TASK_NULLSPACE_STIFFNESS, kStrideF32, kWireDtypeF32, nk::FieldId::TaskNullspaceStiffness},
+    {NUKA_FIELD_TASK_NULLSPACE_DAMPING,  kStrideF32, kWireDtypeF32, nk::FieldId::TaskNullspaceDamping},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 56u,
-              "dlpack_table must hold exactly the 56 public state fields");
+static_assert(kDlpackFieldCount == 59u,
+              "dlpack_table must hold exactly the 59 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

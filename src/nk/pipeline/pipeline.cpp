@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 #include "nk/pipeline/pipeline.hpp"
+#include "phi/articulation_contract.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -144,9 +145,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         has_articulation ? cap.articulations_per_env * cap.env_count : 0u;
     const uint32_t slot_count       = cap.max_contacts_per_env * cap.env_count;
     const uint32_t max_dof          = cap.dofs_per_env;
-    // OSC is an explicit world-create opt-in. Every other mode keeps the
-    // historical pipeline order byte-for-byte.
-    const bool use_osc = model.drive_mode == 4u;
+    const bool use_inverse_dynamics =
+        model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
+        model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
     // The same particle ownership sizes the cook reserve and the pipeline's row range.
     const uint64_t particle_reserve64 = cap.bodies_per_env > 0u && cap.max_contacts_per_env > 0u
         ? uint64_t{cap.particles_per_env - grid_particles_per_env} *
@@ -201,7 +202,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     if (has_articulation) {
         p_apply_drives_.dt = cfg.dt;
         p_apply_drives_.total_link_count = total_link_count;
-        p_apply_drives_.defer_velocity_damping = cfg.defer_velocity_damping;
+        p_apply_drives_.defer_velocity_damping = cfg.defer_velocity_damping && cfg.fold_drive_damping;
+        p_apply_drives_.links_per_env = base_link_count;
         p_apply_drives_.mode = model.drive_mode;
 
         p_aba_.gravity[0] = cfg.gravity[0];
@@ -210,16 +212,16 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_aba_.articulation_count = articulation_cnt;
         p_aba_.total_link_count = total_link_count;
 
-        if (use_osc) {
-            // Current-q task kinematics, followed by a force-free ABA. Its
-            // qddot is the bias/gravity acceleration consumed by ApplyOscDrives.
+        if (use_inverse_dynamics) {
+            // Current kinematics and force-free acceleration share the same mass response.
+            // Controllers remove passive damping from bias compensation.
             p_fk_.articulation_count = articulation_cnt;
             p_fk_.total_link_count = total_link_count;
             add(phi::NkOp::FkWorldPoses, &p_fk_);
             add(phi::NkOp::ApplyDrives, &p_apply_drives_);
             add(phi::NkOp::AbaForward, &p_aba_);
 
-            // OSC requires the pure physics M^-1, never the joint-damping fold.
+            // Inverse dynamics and contacts consume the same physical M^-1.
             p_crba_m_.dt = cfg.dt;
             p_crba_m_.max_dof = max_dof;
             p_crba_m_.articulation_count = articulation_cnt;
@@ -230,11 +232,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             p_crba_factor_.articulation_count = articulation_cnt;
             add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
 
-            p_apply_osc_.max_dof = max_dof;
-            p_apply_osc_.articulation_count = articulation_cnt;
-            p_apply_osc_.total_link_count = total_link_count;
-            p_apply_osc_.task_link = model.osc_task_link;
-            add(phi::NkOp::ApplyOscDrives, &p_apply_osc_);
+            p_apply_dynamics_.max_dof = max_dof;
+            p_apply_dynamics_.articulation_count = articulation_cnt;
+            p_apply_dynamics_.total_link_count = total_link_count;
+            p_apply_dynamics_.task_link = model.osc_task_link;
+            p_apply_dynamics_.mode = model.drive_mode;
+            p_apply_dynamics_.links_per_env = base_link_count;
+            std::copy(std::begin(cfg.gravity), std::end(cfg.gravity), p_apply_dynamics_.gravity);
+            add(phi::NkOp::ApplyDynamicsDrives, &p_apply_dynamics_);
             add(phi::NkOp::AbaForward, &p_aba_);
         } else {
             add(phi::NkOp::ApplyDrives, &p_apply_drives_);
@@ -379,7 +384,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     mpm_coupling_provider_.PreCouple(coupling_ctx);
 
-    if (has_articulation && !use_osc) {
+    if (has_articulation && !use_inverse_dynamics) {
         p_fk_.articulation_count = articulation_cnt;
         p_fk_.total_link_count = total_link_count;
         add(phi::NkOp::FkWorldPoses, &p_fk_);
@@ -650,33 +655,16 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ContactTangentBasis, &p_tangent_);
     }
 
-    if (has_articulation && !use_osc) {
+    if (has_articulation && !use_inverse_dynamics) {
         p_crba_m_.dt = cfg.dt;
         p_crba_m_.max_dof = max_dof;
         p_crba_m_.articulation_count = articulation_cnt;
         p_crba_m_.total_link_count = total_link_count;
-        p_crba_m_.fold_drive_damping = cfg.fold_drive_damping;
+        p_crba_m_.fold_drive_damping = 0u;
         add(phi::NkOp::CrbaComputeM, &p_crba_m_);
         p_crba_factor_.max_dof = max_dof;
         p_crba_factor_.articulation_count = articulation_cnt;
         add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
-        // standalone backward-Euler joint viscous damping. This is GENERAL
-        // articulation physics that used to ride inside the now-deleted FUSED
-        // contact solve kernel (which ran every step on the go2 stand world even
-        // with zero actual contacts). It applies qdot -= dt*(M+dt*C)^-1*(C*qdot)
-        // using the freshly factored data.m_inv == (M+dt*C)^-1, so it MUST come
-        // AFTER CrbaFactorM and BEFORE AssembleRows/SolveRowsBlockIsland +
-        // IntegratePosition (the legacy single-env oracle order: factor ->
-        // damping -> solve -> integrate). Gated on fold_drive_damping so worlds
-        // that don't fold dt*C (e.g. the union path) emit NO new op -> their
-        // captured graphs / goldens stay byte-identical.
-        if (cfg.fold_drive_damping != 0u) {
-            p_apply_damping_.dt = cfg.dt;
-            p_apply_damping_.max_dof = max_dof;
-            p_apply_damping_.articulation_count = articulation_cnt;
-            p_apply_damping_.total_link_count = total_link_count;
-            add(phi::NkOp::ApplyImplicitDamping, &p_apply_damping_);
-        }
     }
 
     if (has_contacts) {
@@ -698,6 +686,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.contact_rows_per_env = contact_rows_per_env;
         p_assemble_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
         p_assemble_.joint_friction_rows_per_env = cap.joint_friction_rows_per_env;
+        p_assemble_.joint_drive_rows_per_env = cap.joint_drive_rows_per_env;
         // Layout follows the slot provider, not the particle solver mode: rigid
         // candidates are 4-point manifolds, the reserved sphere-particle tail is
         // one point. With no reserve rigid_cap == the full slot stride.
@@ -801,6 +790,16 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         }
     } else {
         for (uint32_t pass = 1u; pass < coupling_iterations; ++pass) project_particles(pass);
+    }
+
+    if (cap.joint_drive_rows_per_env > 0u) {
+        p_readout_drives_.dt = cfg.dt;
+        p_readout_drives_.total_link_count = total_link_count;
+        p_readout_drives_.links_per_env = base_link_count;
+        p_readout_drives_.rows_per_env = cap.max_rows_per_env;
+        p_readout_drives_.first_drive_row = contact_rows_per_env +
+            cap.joint_limit_rows_per_env + cap.joint_friction_rows_per_env;
+        add(phi::NkOp::ReadoutDrives, &p_readout_drives_);
     }
 
     mpm_coupling_provider_.PostCouple(coupling_ctx);

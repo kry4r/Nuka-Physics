@@ -1,23 +1,5 @@
-// ---------------------------------------------------------------------------
-// nuka::c_abi -- the RL zero-copy state-buffer view (M9 T5/T6 cutover).
-//
-// Every public state field is now served DIRECTLY from the ONE generic
-// nk::World's Data/Model arena: device_ptr = world->FieldPtr(field_id),
-// element_count = Model::capacities.ElementCount(field_id) (the logical
-// stride-sized element count, env-major). The per-field stride/dtype/FieldId come
-// from the single source dlpack_table.hpp (the RL binary contract) -- BYTE-
-// IDENTICAL to the legacy path. The legacy single-env host round-trip and the
-// batched-world device-buffer arms are deleted.
-//
-// T1 (unified actuator): TORQUE_INPUT now ALIASES nk::FieldId::DriveTarget in
-// dlpack_table.hpp -- the Torque preset reads its `u` from the SAME persistent
-// Data field as the PD target, so TORQUE_INPUT is served zero-copy as the very
-// same device buffer as DRIVE_TARGET (one control buffer, preset-reinterpreted).
-// The remaining three control-input fields (VELOCITY_TARGET/ACTUATOR_NOLOAD_SPEED/
-// TASK_TARGET) still map to kNoFieldId -- their presets are not yet wired onto the
-// unified nk::World, so they return NOT_SUPPORTED rather than aliasing a buffer
-// that no preset consumes yet.
-// ---------------------------------------------------------------------------
+// Public state and control views expose the live model/data arenas.
+// Field descriptors define dtype, element layout, and writable input storage.
 
 #include "c_abi/dlpack_table.hpp"
 #include "c_abi/handle_table.hpp"
@@ -75,10 +57,7 @@ nuka_result_t nuka_world_get_buffer_view(nuka_world_handle world,
             return NUKA_RESULT_NOT_SUPPORTED;
         }
 
-        // The control-input params buffers (TORQUE_INPUT/VELOCITY_TARGET/
-        // ACTUATOR_NOLOAD_SPEED/TASK_TARGET) have no Arena field (kNoFieldId);
-        // their source was the deleted batched world. M10 named gap (non-PD
-        // control). Honest NOT_SUPPORTED rather than a dangling alias.
+        // A descriptor without arena storage cannot expose a device pointer.
         if (row->field_id == nuka::c_abi::kNoFieldId) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }

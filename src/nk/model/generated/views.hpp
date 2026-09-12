@@ -297,9 +297,9 @@ struct DataView {
     float* actuator_effort = nullptr;  // per:link arena:scratch owner:data flags:[readout]
     float* actuator_saturated = nullptr;  // per:link arena:scratch owner:data flags:[readout]
     uint8_t* pair_sort_scratch = nullptr;  // per:scalar arena:scratch owner:data count:pair_sort_scratch_bytes
-    ::nuka::math::Vec3* task_target = nullptr;  // per:env arena:persistent owner:data flags:[param]
-    ::nuka::math::Quat* task_rotation_target = nullptr;  // per:env arena:persistent owner:data flags:[param]
-    ::nuka::math::Transform* task_local_pose = nullptr;  // per:env arena:persistent owner:data flags:[param]
+    ::nuka::math::Vec3* task_target = nullptr;  // per:articulation arena:persistent owner:data flags:[param]
+    ::nuka::math::Quat* task_rotation_target = nullptr;  // per:articulation arena:persistent owner:data flags:[param]
+    ::nuka::math::Transform* task_local_pose = nullptr;  // per:articulation arena:persistent owner:data flags:[param]
     ::nuka::math::Transform* body_inertial_frame = nullptr;  // per:body arena:persistent owner:data flags:[param]
     ::nuka::math::SymmetricMat3* body_world_inv_inertia = nullptr;  // per:body arena:scratch owner:data
     float* step_qdot_flat = nullptr;  // per:articulation_dof arena:scratch owner:data
@@ -348,6 +348,20 @@ struct DataView {
     ::nuka::math::Vec3* step_mpm_boundary_impulse = nullptr;  // per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count
     ::nuka::math::Vec3* step_mpm_boundary_moment = nullptr;  // per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count
     uint8_t* solver_velocity_scratch = nullptr;  // per:scalar arena:scratch owner:data count:solver_velocity_scratch_bytes
+    float* velocity_target = nullptr;  // per:link arena:persistent owner:data flags:[param]
+    float* acceleration_target = nullptr;  // per:link arena:persistent owner:data flags:[param]
+    float* actuator_noload_speed = nullptr;  // per:link arena:persistent owner:data flags:[param]
+    float* task_nullspace_stiffness = nullptr;  // per:articulation arena:persistent owner:data flags:[param]
+    float* task_nullspace_damping = nullptr;  // per:articulation arena:persistent owner:data flags:[param]
+    float* drive_command = nullptr;  // per:link arena:scratch owner:data
+    float* drive_dissipation = nullptr;  // per:link arena:scratch owner:data
+    float* drive_lower = nullptr;  // per:link arena:scratch owner:data
+    float* drive_upper = nullptr;  // per:link arena:scratch owner:data
+    float* control_mass = nullptr;  // per:articulation_dof2 arena:scratch owner:data
+    float* control_factor = nullptr;  // per:articulation_dof2 arena:scratch owner:data
+    float* control_jacobian = nullptr;  // per:articulation_dof arena:scratch owner:data elem:6
+    float* control_response = nullptr;  // per:articulation_dof arena:scratch owner:data elem:6
+    float* control_task_map = nullptr;  // per:articulation_dof arena:scratch owner:data elem:6
 };
 
 } // namespace nuka::phi

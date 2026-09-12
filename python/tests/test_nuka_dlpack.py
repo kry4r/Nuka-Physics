@@ -124,49 +124,37 @@ def test_torque_mode_drives_joint_sign_correct(device):
     assert not bad, f"torque wrong-sign joints (slot, d+, d-): {bad}"
 
 
-# NOT YET WIRED on the unified nk::World: the ComputedTorque / Actuator / Osc
-# presets have no op kernel on nk::World yet (T1 lights PDPosition + Torque only).
-# create_from_scene returns NOT_SUPPORTED for these, so their binding smokes stay
-# skipped until those presets are wired.
-@pytest.mark.skip(reason="ComputedTorque/Actuator presets not yet wired on the "
-                         "unified nk::World (T1 wires PDPosition + Torque)")
 @pytest.mark.parametrize(
     "mode, field",
     [
-        (nuka.CONTROL_MODE_COMPUTED_TORQUE, nuka.DRIVE_TARGET),
+        (nuka.CONTROL_MODE_VELOCITY, nuka.VELOCITY_TARGET),
+        (nuka.CONTROL_MODE_COMPUTED_TORQUE, nuka.ACCELERATION_TARGET),
         (nuka.CONTROL_MODE_ACTUATOR, nuka.ACTUATOR_NOLOAD_SPEED),
     ],
 )
-def test_slice2_control_mode_world_steps(device, mode, field):
+def test_control_mode_world_steps(device, mode, field):
     with nuka.World.create_from_scene(device, SCENE, 64, control_mode=mode) as w:
         # The mode-specific control buffer is a writable, correctly-shaped view.
         view = torch.from_dlpack(w.buffer_view(field))
         assert view.is_cuda
         assert view.numel() == w.env_count * w.base_link_count
         view.zero_()  # writable in place.
-        w.step()  # the slice-2 stage-1 law must step without throwing.
+        w.step()
         nuka.sync()
         q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
         assert torch.isfinite(q).all()
 
 
-@pytest.mark.skip(reason="M10 named gap: Osc control mode deferred to M10 "
-                         "(M9 unified-world wires PDPosition only)")
 def test_osc_mode_world_steps(device):
-    # Osc (4, p03 R2): operational-space control, forward position task. The
-    # binding smoke -- the world constructs in Osc mode (with a task link) and
-    # steps without throwing, and the per-ENV TASK_TARGET view is writable and
-    # correctly shaped (env_count x 3, NOT per-link). osc_task_link picks a
-    # non-root link so the task Jacobian is non-trivial.
     with nuka.World.create_from_scene(
         device, SCENE, 64, control_mode=nuka.CONTROL_MODE_OSC, osc_task_link=3
     ) as w:
         view = torch.from_dlpack(w.buffer_view(nuka.TASK_TARGET))
         assert view.is_cuda
-        # Per-ENV float3 {x,y,z}: env_count * 3 floats.
+        # This scene contains one articulation per environment.
         assert view.numel() == w.env_count * 3
         view.zero_()  # writable in place.
-        w.step()  # the Osc stage-1 law must step without throwing.
+        w.step()
         nuka.sync()
         q = torch.from_dlpack(w.buffer_view(nuka.JOINT_POSITION))
         assert torch.isfinite(q).all()

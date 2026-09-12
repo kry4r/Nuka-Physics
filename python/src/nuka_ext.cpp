@@ -301,20 +301,20 @@ public:
         bool cloth_free, float aero_normal, float aero_tangent, float aero_max_dv,
         uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
-        float baumgarte_max_velocity) {
+        float baumgarte_max_velocity, uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_coupled_from_scene: invalid device");
         }
-        if (control_mode > 1u) {
+        if (control_mode > 5u) {
             throw std::runtime_error(
-                "create_coupled_from_scene: control_mode must be 0 (PDPosition) or "
-                "1 (Torque)");
+                "create_coupled_from_scene: control_mode must be between 0 and 5");
         }
         nuka_world_desc_t desc{};
         desc.scene_path = scene_path.c_str();
         desc.env_count = env_count;
         desc.fixed_dt = dt;
         desc.control_mode = static_cast<uint8_t>(control_mode);
+        desc.osc_task_link = osc_task_link;
         desc.contact_family = contact_family;  // 1 == bake a heightfield collidable.
         desc.heightfield_terrain_type = heightfield_terrain_type;
         desc.terrain_step_height = terrain_step_height;
@@ -396,7 +396,7 @@ public:
         float terrain_grid_height_max, float gravity_x, float gravity_y,
         float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
-        float baumgarte_max_velocity, bool bake_link_sdf) {
+        float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_built_scene: invalid device");
         }
@@ -408,16 +408,16 @@ public:
             throw std::runtime_error(
                 "create_from_built_scene: determinism must be 0 (Strong) or 1 (Weak)");
         }
-        if (control_mode > 1u) {
+        if (control_mode > 5u) {
             throw std::runtime_error(
-                "create_from_built_scene: control_mode must be 0 (PDPosition) or "
-                "1 (Torque)");
+                "create_from_built_scene: control_mode must be between 0 and 5");
         }
         nuka_world_desc_t desc{};
         desc.scene_path = nullptr;  // the scene comes from the handle, not a file.
         desc.env_count = env_count;
         desc.fixed_dt = dt;
         desc.control_mode = static_cast<uint8_t>(control_mode);
+        desc.osc_task_link = osc_task_link;
         desc.determinism = static_cast<uint8_t>(determinism);
         desc.contact_family = contact_family;
         desc.heightfield_terrain_type = heightfield_terrain_type;
@@ -1609,7 +1609,7 @@ public:
                  float terrain_grid_height_max, float gravity_x, float gravity_y,
                  float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
                  float solver_contact_margin, uint32_t solver_max_pairs,
-                 float baumgarte_max_velocity, bool bake_link_sdf) {
+                 float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
         if (device == nullptr) {
             throw std::runtime_error("SceneBuilder.build: device is None");
         }
@@ -1620,7 +1620,7 @@ public:
             terrain_platform_width, terrain_grid_width, terrain_grid_height_max,
             gravity_x, gravity_y, gravity_z, solver_vel_iters, solver_pos_iters,
             solver_contact_margin, solver_max_pairs, baumgarte_max_velocity,
-            bake_link_sdf);
+            bake_link_sdf, osc_task_link);
     }
 
     // Attach one collision shape to an EXISTING body node (by derived tree path):
@@ -1836,6 +1836,9 @@ NB_MODULE(_nuka_ext, m) {
         .value("ACTUATOR_SATURATED", NUKA_FIELD_ACTUATOR_SATURATED)
         .value("TASK_ROTATION_TARGET", NUKA_FIELD_TASK_ROTATION_TARGET)
         .value("TASK_LOCAL_POSE", NUKA_FIELD_TASK_LOCAL_POSE)
+        .value("ACCELERATION_TARGET", NUKA_FIELD_ACCELERATION_TARGET)
+        .value("TASK_NULLSPACE_STIFFNESS", NUKA_FIELD_TASK_NULLSPACE_STIFFNESS)
+        .value("TASK_NULLSPACE_DAMPING", NUKA_FIELD_TASK_NULLSPACE_DAMPING)
         .value("CONTACT_SIDE_A_KIND", NUKA_FIELD_CONTACT_SIDE_A_KIND)
         .value("CONTACT_SIDE_B_KIND", NUKA_FIELD_CONTACT_SIDE_B_KIND)
         .value("CONTACT_SIDE_A_INDEX", NUKA_FIELD_CONTACT_SIDE_A_INDEX)
@@ -1868,6 +1871,7 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("ENV_STATUS_GYRO_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_GYRO_FAILURE);
     m.attr("ENV_STATUS_CONSTITUTIVE_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE);
     m.attr("ENV_STATUS_GRID_CONTACT_OVERFLOW") = static_cast<uint32_t>(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW);
+    m.attr("ENV_STATUS_CONTROL_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_CONTROL_FAILURE);
     m.attr("ENV_STATUS_INVALID_ENDPOINT") = static_cast<uint32_t>(NUKA_ENV_STATUS_INVALID_ENDPOINT);
     m.attr("ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE") =
         static_cast<uint32_t>(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE);
@@ -1974,28 +1978,17 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("gravity_y") = 0.0f,
                     nb::arg("gravity_z") = 0.0f,
                     nb::rv_policy::take_ownership,
-                    "Create a batched world from a USDA scene. determinism "
-                    "(p01-W4, default 0): 0 = DETERMINISM_STRONG (D1, bit-exact "
-                    "and reproducible -- the default) or 1 = DETERMINISM_WEAK (D2, "
-                    "the reserved atomic-fast-path escape hatch; today it selects "
-                    "the SAME kernels as D1 and is NOT held to the D1 bit-exact "
-                    "bar). control_mode (v0.5 C-fwd, default 0): 0 = "
-                    "CONTROL_MODE_PD_POSITION (legacy PD drive, byte-for-byte "
-                    "unchanged), 1 = CONTROL_MODE_TORQUE (writes Field.TORQUE_INPUT), "
-                    "2 = CONTROL_MODE_VELOCITY (writes Field.VELOCITY_TARGET; servo "
-                    "gain == DRIVE_STIFFNESS), 3 = CONTROL_MODE_COMPUTED_TORQUE "
-                    "(inverse-dynamics PD on DRIVE_TARGET; gains == "
-                    "DRIVE_STIFFNESS/DRIVE_DAMPING), 4 = CONTROL_MODE_OSC "
-                    "(operational-space control, forward position task on the world "
-                    "position of the osc_task_link link toward Field.TASK_TARGET; "
-                    "task gains Kp/Kd reuse DRIVE_STIFFNESS/DRIVE_DAMPING at the "
-                    "task link), 5 = CONTROL_MODE_ACTUATOR "
-                    "(DC-motor envelope on Field.TORQUE_INPUT; tau_stall == "
-                    "DRIVE_FORCE_LIMIT, no-load speed == Field.ACTUATOR_NOLOAD_SPEED). "
-                    "Non-PD modes require env_count > 1. osc_task_link (default 0, "
-                    "Osc only): the articulation-local link index of the task link; "
-                    "for a fixed-base scene the root (0) is a no-op, so set a real "
-                    "end-effector (e.g. a foot/calf local link). "
+                    "Create a world from a scene. All six control modes support any positive "
+                    "environment count: 0 PD position, 1 torque, 2 velocity, 3 computed "
+                    "torque, 4 OSC, 5 actuator. VELOCITY_TARGET is independent of "
+                    "DRIVE_TARGET; computed torque also consumes ACCELERATION_TARGET. "
+                    "OSC selects an articulation-local osc_task_link and consumes one "
+                    "TASK_TARGET and optional TASK_ROTATION_TARGET per articulation. "
+                    "Task gains use DRIVE_STIFFNESS/DRIVE_DAMPING on that link. "
+                    "TASK_NULLSPACE_STIFFNESS/DAMPING set posture gains. Torque and "
+                    "actuator modes read TORQUE_INPUT, aliased to DRIVE_TARGET. The "
+                    "actuator uses DRIVE_FORCE_LIMIT and ACTUATOR_NOLOAD_SPEED for its "
+                    "signed torque-speed envelope. Control inputs persist across reset. "
                     "terrain_* (Go2-on-stairs Phase 2a, all default 0.0 == flat): "
                     "the procedural-terrain cook config (model-level, NOT per env). "
                     "Set terrain_step_height/terrain_step_width/terrain_platform_width "
@@ -2038,6 +2031,7 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
             nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
             nb::arg("baumgarte_max_velocity") = 0.0f,
+            nb::arg("osc_task_link") = 0u,
             nb::rv_policy::take_ownership,
             "Create a COUPLED world: a robot cooked from scene_path PLUS cloth (XPBD) "
             "and/or fluid (PBF) particles, stepping on the ONE general contact "
@@ -2943,6 +2937,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
              nb::arg("baumgarte_max_velocity") = 0.0f,
              nb::arg("bake_link_sdf") = false,
+             nb::arg("osc_task_link") = 0u,
              nb::rv_policy::take_ownership,
              "Cook the built scene to a live nuka.World on `device` via the SAME "
              "CookSceneToModel + record assembly a file scene uses (rigid + media, "

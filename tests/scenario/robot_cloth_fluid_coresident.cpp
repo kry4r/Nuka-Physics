@@ -82,61 +82,87 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     const auto fixture = Prepare(Go2ScenePath(), backend.dev, backend.backend, Cfg());
     constexpr uint32_t envs = 3u;
-    nk::World eager(CookPrepared(fixture, envs), envs, backend.dev, backend.backend, Cfg());
-    nk::World graph(CookPrepared(fixture, envs), envs, backend.dev, backend.backend, Cfg());
-    ASSERT_TRUE(eager.Ready()) << eager.CreationError();
-    ASSERT_TRUE(graph.Ready()) << graph.CreationError();
-    const auto initial = ReadPipelineState(graph);
-    const auto* address = graph.DataViewRef().particle_pos;
-    const auto* endpoint_address = graph.DataViewRef().contact_endpoint_keys;
-    const auto* index_address = graph.DataViewRef().active_row_ids;
-    ASSERT_NE(endpoint_address, nullptr);
-    ASSERT_NE(index_address, nullptr);
-    ASSERT_EQ(graph.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok)
-        << graph.LastExecutionError().message;
-    EXPECT_EQ(ReadPipelineState(graph), initial);
-    EXPECT_EQ(graph.CaptureAttempts(), 1u);
-    std::vector<float> targets(graph.GetModel().capacities.links_per_env * envs);
-    ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::DriveTarget, targets.data(),
-                                              targets.size() * sizeof(float)));
-    const auto rest = targets;
-    std::vector<uint32_t> flags(envs);
-    for (uint32_t step = 0u; step < 16u; ++step) {
-        for (size_t i = 0; i < targets.size(); ++i)
-            targets[i] = rest[i] + 0.004f * std::sin(static_cast<float>(step + i));
-        if (step == 4u) {
-            ASSERT_NE(eager.FieldPtr(nk::FieldId::ContactForce), nullptr);
-            ASSERT_NE(graph.FieldPtr(nk::FieldId::ContactForce), nullptr);
-            EXPECT_FALSE(graph.GraphReady());
+    for (uint32_t mode = 0u; mode < 6u; ++mode) {
+        SCOPED_TRACE(::testing::Message() << "control mode=" << mode);
+        auto make_model = [&] {
+            auto model = CookPrepared(fixture, envs);
+            model.drive_mode = mode;
+            model.osc_task_link = 3u;
+            return model;
+        };
+        nk::World eager(make_model(), envs, backend.dev, backend.backend, Cfg());
+        nk::World graph(make_model(), envs, backend.dev, backend.backend, Cfg());
+        ASSERT_TRUE(eager.Ready()) << eager.CreationError();
+        ASSERT_TRUE(graph.Ready()) << graph.CreationError();
+        const auto initial = ReadPipelineState(graph);
+        const auto* address = graph.DataViewRef().particle_pos;
+        const auto* endpoint_address = graph.DataViewRef().contact_endpoint_keys;
+        const auto* index_address = graph.DataViewRef().active_row_ids;
+        ASSERT_NE(endpoint_address, nullptr);
+        ASSERT_NE(index_address, nullptr);
+        ASSERT_EQ(graph.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok)
+            << graph.LastExecutionError().message;
+        EXPECT_EQ(ReadPipelineState(graph), initial);
+        EXPECT_EQ(graph.CaptureAttempts(), 1u);
+        std::vector<float> targets(graph.GetModel().capacities.links_per_env * envs);
+        ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::DriveTarget, targets.data(),
+                                                  targets.size() * sizeof(float)));
+        const auto rest = targets;
+        std::vector<Vec3> task_targets(envs);
+        std::vector<Transform> poses(targets.size());
+        ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::LinkPose, poses.data(), poses.size() * sizeof(Transform)));
+        for (uint32_t env = 0u; env < envs; ++env)
+            task_targets[env] = poses[env * graph.GetModel().capacities.links_per_env + 3u].position;
+        std::vector<uint32_t> flags(envs);
+        for (uint32_t step = 0u; step < 16u; ++step) {
+            for (size_t i = 0; i < targets.size(); ++i)
+                targets[i] = rest[i] + 0.004f * std::sin(static_cast<float>(step + i));
+            if (step == 4u) {
+                ASSERT_NE(eager.FieldPtr(nk::FieldId::ContactForce), nullptr);
+                ASSERT_NE(graph.FieldPtr(nk::FieldId::ContactForce), nullptr);
+                EXPECT_FALSE(graph.GraphReady());
+            }
+            if (step == 8u) {
+                ASSERT_EQ(eager.Reset({1u, 1u}), nphi::Status::Ok);
+                ASSERT_EQ(graph.Reset({1u, 1u}), nphi::Status::Ok);
+            }
+            for (auto* world : {&eager, &graph}) {
+                ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::DriveTarget, targets.data(),
+                                                        targets.size() * sizeof(float)));
+                if (mode == 2u)
+                    ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::VelocityTarget, targets.data(), targets.size() * sizeof(float)));
+                if (mode == 3u) {
+                    const std::vector<float> acceleration(targets.size(), 0.1f);
+                    ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::AccelerationTarget, acceleration.data(), acceleration.size() * sizeof(float)));
+                }
+                if (mode == 4u)
+                    ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::TaskTarget, task_targets.data(), task_targets.size() * sizeof(Vec3)));
+                if (mode == 5u) {
+                    const std::vector<float> noload(targets.size(), 20.0f);
+                    ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::ActuatorNoloadSpeed, noload.data(), noload.size() * sizeof(float)));
+                }
+                ASSERT_EQ(world->StepConfigured(), nphi::Status::Ok) << world->LastExecutionError().message;
+                ASSERT_EQ(world->Synchronize(), nphi::Status::Ok);
+                ASSERT_TRUE(world->GetData().DownloadField(nk::FieldId::EnvStatus, flags.data(),
+                                                          flags.size() * sizeof(uint32_t)));
+                EXPECT_EQ(flags, std::vector<uint32_t>(envs));
+            }
+            EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
+            std::vector<uint8_t> eager_state, graph_state;
+            ASSERT_TRUE(eager.GetData().DownloadPersistent(&eager_state));
+            ASSERT_TRUE(graph.GetData().DownloadPersistent(&graph_state));
+            EXPECT_EQ(eager_state, graph_state);
         }
-        if (step == 8u) {
-            ASSERT_EQ(eager.Reset({1u, 1u}), nphi::Status::Ok);
-            ASSERT_EQ(graph.Reset({1u, 1u}), nphi::Status::Ok);
-        }
-        for (auto* world : {&eager, &graph}) {
-            ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::DriveTarget, targets.data(),
-                                                    targets.size() * sizeof(float)));
-            ASSERT_EQ(world->StepConfigured(), nphi::Status::Ok) << world->LastExecutionError().message;
-            ASSERT_EQ(world->Synchronize(), nphi::Status::Ok);
-            ASSERT_TRUE(world->GetData().DownloadField(nk::FieldId::EnvStatus, flags.data(),
-                                                      flags.size() * sizeof(uint32_t)));
-            EXPECT_EQ(flags, std::vector<uint32_t>(envs));
-        }
-        EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
-        std::vector<uint8_t> eager_state, graph_state;
-        ASSERT_TRUE(eager.GetData().DownloadPersistent(&eager_state));
-        ASSERT_TRUE(graph.GetData().DownloadPersistent(&graph_state));
-        EXPECT_EQ(eager_state, graph_state);
+        EXPECT_EQ(graph.CaptureAttempts(), 2u);
+        EXPECT_EQ(graph.GraphReplays(), 16u);
+        ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
+        EXPECT_EQ(graph.DataViewRef().particle_pos, address);
+        EXPECT_EQ(graph.DataViewRef().contact_endpoint_keys, endpoint_address);
+        EXPECT_EQ(graph.DataViewRef().active_row_ids, index_address);
+        EXPECT_EQ(ReadPipelineState(graph), initial);
+        ASSERT_EQ(graph.StepConfigured(), nphi::Status::Ok);
+        EXPECT_EQ(graph.CaptureAttempts(), 2u);
     }
-    EXPECT_EQ(graph.CaptureAttempts(), 2u);
-    EXPECT_EQ(graph.GraphReplays(), 16u);
-    ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
-    EXPECT_EQ(graph.DataViewRef().particle_pos, address);
-    EXPECT_EQ(graph.DataViewRef().contact_endpoint_keys, endpoint_address);
-    EXPECT_EQ(graph.DataViewRef().active_row_ids, index_address);
-    EXPECT_EQ(ReadPipelineState(graph), initial);
-    ASSERT_EQ(graph.StepConfigured(), nphi::Status::Ok);
-    EXPECT_EQ(graph.CaptureAttempts(), 2u);
 }
 
 template <class T>
@@ -397,27 +423,29 @@ TEST(RobotClothFluidCoResident, Go2StanceCouplesClothAndFluidOnOnePipeline) {
                 EXPECT_NEAR(velocity[free_index].z, expected.z, 1.0e-6f);
                 EXPECT_GT(omega[free_index].LengthSq(), 1.0e-7f);
             }
-            if (!patch_present || s < kSettleSteps) continue;
-            // Capture the pool free surface / pocket at the first hold step (the
-            // settled baseline) then track its max surface over the hold window.
-            DownloadParticles(w, &p);
-            const float cloth_reach = 0.5f * kContactDMin + 2.0f * kClothSpacing;
-            if (s == kSettleSteps) {
-                out.pool_base_surface = SurfaceMaxZInSlice(p, n_soft, P);
-                out.pool_base_pocket = MinZUnderFootInSlice(
-                    p, rear_foot.x, rear_foot.y,
-                    0.5f * kContactDMin + 2.0f * kPoolSpacing, n_soft, P);
-                out.cloth_base_min_z = MinZUnderFootInSlice(
-                    p, front_centre.x, front_centre.y, cloth_reach, 0u, n_soft);
-                std::vector<Transform> lp(L);
-                EXPECT_TRUE(d.DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform)));
-                out.front_foot_z =
-                    (lp[front_link] * link_geom_local[front_link]).position.z;
-                out.rear_foot_z =
-                    (lp[rear_link] * link_geom_local[rear_link]).position.z;
+            if (!patch_present) continue;
+            if (s >= kSettleSteps) {
+                // Capture the pool free surface / pocket at the first hold step (the
+                // settled baseline) then track its max surface over the hold window.
+                DownloadParticles(w, &p);
+                const float cloth_reach = 0.5f * kContactDMin + 2.0f * kClothSpacing;
+                if (s == kSettleSteps) {
+                    out.pool_base_surface = SurfaceMaxZInSlice(p, n_soft, P);
+                    out.pool_base_pocket = MinZUnderFootInSlice(
+                        p, rear_foot.x, rear_foot.y,
+                        0.5f * kContactDMin + 2.0f * kPoolSpacing, n_soft, P);
+                    out.cloth_base_min_z = MinZUnderFootInSlice(
+                        p, front_centre.x, front_centre.y, cloth_reach, 0u, n_soft);
+                    std::vector<Transform> lp(L);
+                    EXPECT_TRUE(d.DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform)));
+                    out.front_foot_z =
+                        (lp[front_link] * link_geom_local[front_link]).position.z;
+                    out.rear_foot_z =
+                        (lp[rear_link] * link_geom_local[rear_link]).position.z;
+                }
+                out.pool_max_surface =
+                    std::max(out.pool_max_surface, SurfaceMaxZInSlice(p, n_soft, P));
             }
-            out.pool_max_surface =
-                std::max(out.pool_max_surface, SurfaceMaxZInSlice(p, n_soft, P));
             EXPECT_TRUE(d.DownloadField(nk::FieldId::Urows, urows.data(),
                                         urows.size() * sizeof(nk::NkRow)));
             EXPECT_TRUE(d.DownloadField(nk::FieldId::Lambda, lambda.data(),

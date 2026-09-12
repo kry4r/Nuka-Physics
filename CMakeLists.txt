@@ -158,6 +158,10 @@ set(NUKA_CODEGEN_GENERATED_HEADERS
     # v0.8 C2a: the collidable-type registry header (enum CollidableType + static
     # metadata table). Emitted by regen.py's SECOND, parallel collidable pass.
     "${NUKA_CODEGEN_OUTPUT_DIR}/collidable_registry.hpp"
+    "${CMAKE_SOURCE_DIR}/src/nk/model/generated/field_ids.hpp"
+    "${CMAKE_SOURCE_DIR}/src/nk/model/generated/views.hpp"
+    "${CMAKE_SOURCE_DIR}/src/nk/model/generated/arena_layout.hpp"
+    "${CMAKE_SOURCE_DIR}/src/nk/model/generated/dlpack_table.hpp"
 )
 set(NUKA_CODEGEN_OUTPUTS
     ${NUKA_CODEGEN_GENERATED_SOURCES}
