@@ -598,6 +598,7 @@ Value SaveMedia(const MediaRecord& m) {
         mp.Set("viscosity", Value::Float(mm.viscosity));
         mp.Set("dx", Value::Float(mm.dx));
         mp.Set("substeps", Value::Int(mm.substeps));
+        mp.Set("contact_capacity", Value::Int(mm.contact_capacity));
         mp.Set("floor_normal", Vec3Json(mm.floor_normal));
         mp.Set("floor_d", Value::Float(mm.floor_d));
         mp.Set("floor_friction", Value::Float(mm.floor_friction));
@@ -1548,6 +1549,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             mm.viscosity = f(mp, "viscosity", mm.viscosity);
             mm.dx = f(mp, "dx", mm.dx);
             mm.substeps = u(mp, "substeps", mm.substeps);
+            mm.contact_capacity = u(mp, "contact_capacity", mm.contact_capacity);
             mm.floor_normal = v3(mp, "floor_normal", mm.floor_normal);
             mm.floor_d = f(mp, "floor_d", mm.floor_d);
             mm.floor_friction = f(mp, "floor_friction", mm.floor_friction);

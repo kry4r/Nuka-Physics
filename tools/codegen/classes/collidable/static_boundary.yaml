@@ -1,0 +1,6 @@
+# Analytical domain boundaries have a distinct identity from cooked collidables.
+name: StaticBoundary
+collidable_type_id: 5
+accel_structure: None
+shape_proxy: None
+reaction_provider: StaticNull

@@ -16,6 +16,7 @@
 #include "core/checked_size.hpp"
 #include "collision/mesh_surface.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "nk/contact/contact_identity.hpp"
 #include "nk/material/hencky_j2.hpp"
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
 #include "phi/articulation_contract.hpp"
@@ -98,12 +99,15 @@ uint64_t ModelCapacities::NeighborPoolCapacity() const {
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
     const FieldLayout& lay = LayoutOf(id);
+    if (mpm_grid_nodes_per_env == 0u &&
+        (id == FieldId::GridContactAttempted || id == FieldId::GridContactRetained ||
+         id == FieldId::GridContactPeak || id == FieldId::GridContactOverflow)) return 0u;
     if (!mpm_plastic_state &&
         (id == FieldId::ParticlePlasticF || id == FieldId::SnapshotParticlePlasticF)) return 0u;
     const bool mpm_reaction = mpm_grid_nodes_per_env != 0u && bodies_per_env != 0u;
     if (integration_substeps <= 1u &&
         (id == FieldId::StepLinkImpulse || id == FieldId::StepLinkMoment ||
-         id == FieldId::StepJointLimitImpulse || (id == FieldId::StepEnvStatus && !mpm_reaction)))
+         id == FieldId::StepJointLimitImpulse || (id == FieldId::StepEnvStatus && mpm_grid_nodes_per_env == 0u)))
         return 0u;
     if (!mpm_reaction &&
         (id == FieldId::StepMpmBodyImpulse || id == FieldId::StepMpmBodyMoment)) return 0u;
@@ -202,6 +206,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::LbvhSortScratch) return lbvh_sort_scratch_bytes;
         if (id == FieldId::ContactCacheScratch) return contact_cache_scratch_bytes;
         if (id == FieldId::ContactIndexScratch) return contact_index_scratch_bytes;
+        if (id == FieldId::SolverVelocityScratch) return solver_velocity_scratch_bytes;
         // Dynamic-island component count (BuildSolveIslands): the solve grid
         // watermark — one global u32.
         if (id == FieldId::IslandCount) {
@@ -214,12 +219,13 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // MLS-MPM background grid node fields: per-env nodes x env_count (the keys
         // are env-offset, so each env owns a private node span). 0 for a non-MPM world.
         // grid_body_dp/grid_body_owner share the per-node extent (the body-BC handoff).
-        if (id == FieldId::GridForce) {
-            return 0u;  // retired force buffer; P2G folds force into momentum.
+        if (id == FieldId::GridForce || id == FieldId::GridBodyDp || id == FieldId::GridBodyOwner) {
+            return 0u;  // Force and single-owner projection buffers have no consumers.
         }
         if (id == FieldId::GridMass || id == FieldId::GridMomentum ||
-            id == FieldId::GridVelocity ||
-            id == FieldId::GridBodyDp || id == FieldId::GridBodyOwner) {
+            id == FieldId::GridVelocity || id == FieldId::GridInvMass ||
+            id == FieldId::CcGridFirst || id == FieldId::GridContactCount ||
+            id == FieldId::GridContactOffset) {
             return static_cast<uint64_t>(mpm_grid_nodes_per_env) *
                    static_cast<uint64_t>(env_count);
         }
@@ -228,6 +234,9 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::MpmSortScratch) {
             return mpm_grid_sort_scratch_bytes;
         }
+        if (id == FieldId::MpmBoundaryImpulse || id == FieldId::MpmBoundaryMoment ||
+            id == FieldId::StepMpmBoundaryImpulse || id == FieldId::StepMpmBoundaryMoment)
+            return mpm_grid_nodes_per_env > 0u ? uint64_t{kMpmBoundaryCount} * env_count : 0u;
         // MLS-MPM material table (flat f32 pool, like mat_buckets): rows x stride
         // via the named constant (never a magic literal). 0 for a non-MPM world.
         if (id == FieldId::MpmMaterialTable) {
@@ -1039,6 +1048,14 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
 phi::Status ModelCapacities::Validate(std::string* reason) const {
     try {
         if (env_count == 0u) throw std::invalid_argument("environment count must be positive");
+        if (mpm_grid_nodes_per_env > 0u && mpm_contact_capacity_per_env == 0u)
+            throw std::invalid_argument("MPM grid requires a nonempty contact pool");
+        if (mpm_contact_capacity_per_env > max_contacts_per_env)
+            throw std::invalid_argument("grid contact pool exceeds contact capacity");
+        if (mpm_grid_nodes_per_env > 0u &&
+            (CheckedProduct({mpm_grid_nodes_per_env, env_count}) > nk::kContactHandleMask ||
+             CheckedProduct({env_count, kMpmBoundaryCount}) > nk::kContactHandleMask))
+            throw std::invalid_argument("grid contact identity exceeds handle range");
         const auto int_limit = static_cast<uint64_t>(std::numeric_limits<int>::max());
         if (links_per_env != 0u && CheckedProduct({max_rows_per_env, env_count, 2u}) > int_limit)
             throw std::invalid_argument("contact endpoints exceed device sort index range");

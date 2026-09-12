@@ -57,6 +57,7 @@ enum class ReactionProviderKind : uint8_t {
     ArticulationChainJ = 1u,
     ParticleInvMass   = 2u,
     StaticNull        = 3u,
+    GridInvMass       = 4u,
 };
 
 } // namespace nuka::constraint

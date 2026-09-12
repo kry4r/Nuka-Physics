@@ -428,6 +428,17 @@ nuka_result_t nuka_scene_add_media_ex(nuka_scene_handle scene,
     }
 }
 
+nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,
+                                                  uint32_t media_id, uint32_t capacity) {
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount()) return NUKA_RESULT_INVALID_ARG;
+    auto& media = sr->scene->GetMediaMut(media_id);
+    if (media.method != nscene::MediaRecord::Method::MlsMpm) return NUKA_RESULT_INVALID_ARG;
+    media.mpm.contact_capacity = capacity;
+    return NUKA_RESULT_OK;
+}
+
 nuka_result_t nuka_scene_add_mpm_fill(nuka_scene_handle scene, uint32_t media_id,
                                       const nuka_mpm_fill_desc_t* desc) {
     return nuka_scene_add_mpm_fill_ex(scene, media_id, desc, nullptr);

@@ -109,10 +109,12 @@ struct ModelCapacities {
     uint64_t lbvh_sort_scratch_bytes = 0;
     uint64_t contact_cache_scratch_bytes = 0;
     uint64_t contact_index_scratch_bytes = 0;
+    uint64_t solver_velocity_scratch_bytes = 0;
 
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
     uint32_t mpm_grid_nodes_per_env = 0;
+    uint32_t mpm_contact_capacity_per_env = 0;  // Shared pool; multiple contacts may use any node.
     // Byte size of the mpm_sort_scratch field (the P2G deterministic-gather cub
     // sort temp + out buffers; sized at World construct; 0 == no MPM particles).
     uint64_t mpm_grid_sort_scratch_bytes = 0;

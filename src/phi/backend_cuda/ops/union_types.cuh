@@ -37,6 +37,22 @@ using ::nuka::nk::kNkSideArtic;
 using ::nuka::nk::kNkSideParticle;
 using ::nuka::nk::kNkSideRigid;
 using ::nuka::nk::kNkSideStatic;
+using ::nuka::nk::kNkSideGrid;
+
+// Material particles and background nodes share scalar mass response with separate state.
+struct PointMassView {
+    const float* particle_inv_mass = nullptr;
+    math::Vec3* particle_velocity = nullptr;
+    const float* grid_inv_mass = nullptr;
+    math::Vec3* grid_velocity = nullptr;
+
+    __device__ const float* InverseMass(uint32_t kind) const {
+        return kind == kNkSideGrid ? grid_inv_mass : particle_inv_mass;
+    }
+    __device__ math::Vec3* Velocity(uint32_t kind) const {
+        return kind == kNkSideGrid ? grid_velocity : particle_velocity;
+    }
+};
 
 // Union slot classes / flags — MUST mirror nk::UnionSlot (model.hpp).
 inline constexpr uint32_t kUSlotInactive       = 0u;

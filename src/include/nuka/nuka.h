@@ -646,7 +646,17 @@ typedef enum nuka_state_field_t {
     // READ: multiplicative Fp; empty when no material requires plastic history.
     NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT = 46,
     // READ: cumulative equivalent plastic strain alpha; scalar per particle.
-    NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN = 47
+    NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN = 47,
+    // READ: latest interval counts; peak since reset. Counts except retained are uint64.
+    NUKA_FIELD_GRID_CONTACT_ATTEMPTED = 48,
+    NUKA_FIELD_GRID_CONTACT_RETAINED = 49,
+    NUKA_FIELD_GRID_CONTACT_PEAK = 50,
+    NUKA_FIELD_GRID_CONTACT_OVERFLOW = 51,
+    // READ: outer-step impulses; body moments use COM/link origin, boundaries world origin.
+    NUKA_FIELD_MPM_BODY_IMPULSE = 52,
+    NUKA_FIELD_MPM_BODY_ANGULAR_IMPULSE = 53,
+    NUKA_FIELD_MPM_BOUNDARY_IMPULSE = 54,
+    NUKA_FIELD_MPM_BOUNDARY_ANGULAR_IMPULSE = 55
 } nuka_state_field_t;
 
 typedef enum nuka_env_status_t {
@@ -662,7 +672,8 @@ typedef enum nuka_env_status_t {
     // Missing or invalid sampled contact geometry; cleared by world reset.
     NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE = 1u << 7,
     // Material integration failed; the prior elastic/plastic history is retained.
-    NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE = 1u << 8
+    NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE = 1u << 8,
+    NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW = 1u << 9
 } nuka_env_status_t;
 
 typedef enum nuka_gyro_status_t {
@@ -675,14 +686,15 @@ typedef enum nuka_contact_side_kind_t {
     NUKA_CONTACT_SIDE_RIGID = 0,
     NUKA_CONTACT_SIDE_LINK = 1,
     NUKA_CONTACT_SIDE_PARTICLE = 2,
-    NUKA_CONTACT_SIDE_STATIC = 3
+    NUKA_CONTACT_SIDE_STATIC = 3,
+    NUKA_CONTACT_SIDE_GRID = 4
 } nuka_contact_side_kind_t;
 
 typedef struct nuka_buffer_view_t {
     void* device_ptr;
     size_t element_count;
     uint32_t element_stride_bytes;
-    // Element scalar type: 0 == float32, 1 == uint32.
+    // Element scalar type: 0 == float32, 1 == uint32, 2 == uint64.
     uint8_t dtype;
 } nuka_buffer_view_t;
 

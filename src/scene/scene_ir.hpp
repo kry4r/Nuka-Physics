@@ -316,6 +316,7 @@ struct MediaPbfMaterial {
 // Constitutive material for an MLS-MPM medium. Mirrors cook::MpmMaterialInput
 // plus the cook::MpmCookInput grid/floor scalars.
 struct MediaMpmMaterial {
+    uint32_t contact_capacity = 0u;
     float youngs       = 0.0f;
     float poisson      = 0.0f;
     float density      = 0.0f;

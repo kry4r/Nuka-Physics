@@ -90,10 +90,10 @@
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4"><img src="docs/media/go2_cloth_drape.gif" width="100%" alt="Cloth draping over a Go2 quadruped"></a>
-  <br><b>Cloth × Go2</b>
-  <br>Two-way body-particle coupling
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_cloth_drape.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4"><img src="docs/media/robot_elastoplastic.gif" width="100%" alt="A dynamically driven Panda gripper loading and releasing an MLS-MPM elastoplastic specimen"></a>
+  <br><b>Panda × Elastoplastic</b>
+  <br>Dynamic gripper · Visual preview
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4">Full video</a> · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic_close.mp4">Close-up</a> · <a href="examples/demo/README.md#dynamic-elastoplastic-gripper">Run demo</a>
 </td>
 </tr>
 </table>

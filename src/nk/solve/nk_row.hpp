@@ -44,6 +44,7 @@ inline constexpr uint32_t kNkSideRigid    = 0u;  // RigidInvMass
 inline constexpr uint32_t kNkSideArtic    = 1u;  // ArticulationChainJ
 inline constexpr uint32_t kNkSideParticle = 2u;  // ParticleInvMass
 inline constexpr uint32_t kNkSideStatic   = 3u;  // StaticNull
+inline constexpr uint32_t kNkSideGrid     = 4u;  // GridInvMass
 
 // Per-contact-slot side-kind tag for the unified contact buffer's a/b index
 // channel. It declares what each ucontact_a/b index ADDRESSES so the row
@@ -53,6 +54,13 @@ inline constexpr uint32_t kNkSideStatic   = 3u;  // StaticNull
 // body-row meaning, so a zero-initialized slot resolves exactly as before.
 inline constexpr uint32_t kUContactSideBody     = 0u;  // index = body-local row
 inline constexpr uint32_t kUContactSideParticle = 1u;  // index = global particle
+inline constexpr uint32_t kUContactSideGrid     = 2u;  // index = global grid node
+inline constexpr uint32_t kUContactSideBoundary = 3u;  // index = environment-local boundary
+
+// Compliant contacts integrate a reference acceleration; velocity contacts impose Jv >= 0.
+inline constexpr uint32_t kContactLawCompliant = 0u;
+inline constexpr uint32_t kContactLawVelocity = 1u;
+inline constexpr uint32_t kMpmBoundaryCount = 5u;  // floor, x-/x+, y-/y+
 
 namespace nk_row_flags {
 inline constexpr uint32_t kActive       = 1u << 0;
@@ -63,6 +71,7 @@ inline constexpr uint32_t kJointLimitLower = 1u << 4;
 inline constexpr uint32_t kJointLimitUpper = 1u << 5;
 inline constexpr uint32_t kJointLimit = kJointLimitLower | kJointLimitUpper;
 inline constexpr uint32_t kContactNormal = 1u << 6;
+inline constexpr uint32_t kVelocityOnly = 1u << 7;
 }  // namespace nk_row_flags
 
 // General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-

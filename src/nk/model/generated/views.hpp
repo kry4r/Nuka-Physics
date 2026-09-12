@@ -333,6 +333,21 @@ struct DataView {
     float* step_joint_limit_impulse = nullptr;  // per:link arena:scratch owner:data elem:2
     float* particle_plastic_F = nullptr;  // per:particle arena:persistent owner:data elem:9
     float* snapshot_particle_plastic_F = nullptr;  // per:particle arena:persistent owner:data elem:9
+    float* grid_inv_mass = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    uint32_t* cc_grid_first = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    uint64_t* grid_contact_count = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    uint64_t* grid_contact_offset = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    uint32_t* ucontact_law = nullptr;  // per:contact_slot arena:scratch owner:data
+    float* ucontact_friction = nullptr;  // per:contact_slot arena:scratch owner:data
+    uint64_t* grid_contact_attempted = nullptr;  // per:env arena:scratch owner:data flags:[readout]
+    uint32_t* grid_contact_retained = nullptr;  // per:env arena:scratch owner:data flags:[readout]
+    uint64_t* grid_contact_peak = nullptr;  // per:env arena:persistent owner:data flags:[readout]
+    uint64_t* grid_contact_overflow = nullptr;  // per:env arena:scratch owner:data flags:[readout]
+    ::nuka::math::Vec3* mpm_boundary_impulse = nullptr;  // per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count flags:[readout]
+    ::nuka::math::Vec3* mpm_boundary_moment = nullptr;  // per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count flags:[readout]
+    ::nuka::math::Vec3* step_mpm_boundary_impulse = nullptr;  // per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count
+    ::nuka::math::Vec3* step_mpm_boundary_moment = nullptr;  // per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count
+    uint8_t* solver_velocity_scratch = nullptr;  // per:scalar arena:scratch owner:data count:solver_velocity_scratch_bytes
 };
 
 } // namespace nuka::phi

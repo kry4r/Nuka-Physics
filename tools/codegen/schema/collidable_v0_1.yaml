@@ -43,3 +43,4 @@ enums:
     - ArticulationChainJ
     - ParticleInvMass
     - StaticNull
+    - GridInvMass

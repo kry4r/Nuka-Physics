@@ -323,6 +323,21 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::StepJointLimitImpulse, DlpackDtype::kF32, 2, false, false},  // step_joint_limit_impulse
     {FieldId::ParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // particle_plastic_F
     {FieldId::SnapshotParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_plastic_F
+    {FieldId::GridInvMass, DlpackDtype::kF32, 1, false, false},  // grid_inv_mass
+    {FieldId::CcGridFirst, DlpackDtype::kU32, 1, false, false},  // cc_grid_first
+    {FieldId::GridContactCount, DlpackDtype::kU64, 1, false, false},  // grid_contact_count
+    {FieldId::GridContactOffset, DlpackDtype::kU64, 1, false, false},  // grid_contact_offset
+    {FieldId::UcontactLaw, DlpackDtype::kU32, 1, false, false},  // ucontact_law
+    {FieldId::UcontactFriction, DlpackDtype::kF32, 1, false, false},  // ucontact_friction
+    {FieldId::GridContactAttempted, DlpackDtype::kU64, 1, false, true},  // grid_contact_attempted
+    {FieldId::GridContactRetained, DlpackDtype::kU32, 1, false, true},  // grid_contact_retained
+    {FieldId::GridContactPeak, DlpackDtype::kU64, 1, false, true},  // grid_contact_peak
+    {FieldId::GridContactOverflow, DlpackDtype::kU64, 1, false, true},  // grid_contact_overflow
+    {FieldId::MpmBoundaryImpulse, DlpackDtype::kF32, 2, false, true},  // mpm_boundary_impulse
+    {FieldId::MpmBoundaryMoment, DlpackDtype::kF32, 2, false, true},  // mpm_boundary_moment
+    {FieldId::StepMpmBoundaryImpulse, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_impulse
+    {FieldId::StepMpmBoundaryMoment, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_moment
+    {FieldId::SolverVelocityScratch, DlpackDtype::kU8, 1, false, false},  // solver_velocity_scratch
 };
 
 } // namespace nuka::nk

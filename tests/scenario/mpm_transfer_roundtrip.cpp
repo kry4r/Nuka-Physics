@@ -13,6 +13,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
+#include "nk/solve/nk_row.hpp"
 #include "phi/backend.hpp"
 #include "phi/op_schema.hpp"
 
@@ -80,6 +81,9 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
     nk::ModelCapacities& cap = m.capacities;
     cap.particles_per_env = static_cast<uint32_t>(n);
     cap.mpm_grid_nodes_per_env = kDim * kDim * kDim;
+    cap.mpm_contact_capacity_per_env = cap.mpm_grid_nodes_per_env;
+    cap.max_contacts_per_env = cap.mpm_contact_capacity_per_env;
+    cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenParticleRowsPerSlot;
     cap.mpm_material_count = 1u;
     mp.mpm_grid_min = kOrigin;
     mp.mpm_grid_dims[0] = kDim; mp.mpm_grid_dims[1] = kDim; mp.mpm_grid_dims[2] = kDim;
@@ -90,6 +94,9 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
 // One transfer interval with zero gravity and a floor below the grid.
 nphi::MpmParams MakeParams(const nk::Model& m) {
     nphi::MpmParams p{};
+    p.contact_capacity = m.capacities.mpm_contact_capacity_per_env;
+    p.contact_slots_per_env = m.capacities.max_contacts_per_env;
+    p.rows_per_env = m.capacities.max_rows_per_env;
     p.particle_count = m.capacities.particles_per_env;  // env_count == 1.
     p.particles_per_env = m.capacities.particles_per_env;
     p.env_count = 1u;
