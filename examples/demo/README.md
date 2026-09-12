@@ -115,7 +115,7 @@ python examples/demo/compose_elastoplastic_compression.py \
 
 The capture includes configuration, particle/body states, per-frame physical measurements, and reset results. Composition checks the physical acceptance criteria before encoding, then verifies the decoded video frame count, size, rate, and duration. Use `--analyze-only` to check a capture without rendering. To reproduce timestep and grid comparisons, capture again with `--steps-per-frame 128`, then with `--dx 0.004 --steps-per-frame 128`, and pass both directories as repeated `--compare` arguments. Compare the two runs at 128 steps per frame to isolate the grid change.
 
-The recorded light-load recovery error is 0.0648%; strong loading leaves 33.13% height compression. The [physical report](../../docs/research/2026-09-11-elastoplastic-compression-demo-zh.md) records convergence and energy measurements. The prescribed platens demonstrate material response; they do not validate dynamic gripper coupling.
+The recorded light-load recovery error is 0.0648%; strong loading leaves 33.13% height compression. Peak particle-center penetration reaches 4.007 mm, and geometric convergence remains open. The prescribed platens demonstrate material response; they do not validate dynamic gripper coupling.
 
 ## Bunny elastoplastic impact
 
@@ -139,13 +139,13 @@ python examples/demo/compose_elastoplastic_bunny.py \
   --out-dir out/elastoplastic/bunny_video
 ```
 
-The bunny remains on the pad, whose center settles 20.82 mm below its initial surface. This is deformation under load. The [physical report](../../docs/research/2026-09-11-elastoplastic-bunny-demo-zh.md) includes timestep/grid comparisons, momentum balance, plastic dissipation, and measured penetration. This recording uses the earlier grid projection and reaction scheme. The dynamic gripper below uses shared finite-mass grid contacts.
+The bunny remains on the pad, whose center settles 20.82 mm below its initial surface. This is deformation under load. Particle-center penetration reaches 2.393 mm with a 5 mm contact envelope. This recording uses the earlier grid projection and reaction scheme. The dynamic gripper below uses shared finite-mass grid contacts.
 
 ## Dynamic elastoplastic gripper
 
 A Franka Panda applies light compression, opens, applies strong compression, and releases the same 24 × 36 × 28 mm specimen. Both fingers and the arm use articulated dynamics with finite PD forces and sampled gravity feedforward. The controller updates joint targets; contact forces determine the actual joint motion. The specimen has no pinned particles, and its material history is retained between loads.
 
-The production MLS-MPM solver uses Hencky J2 plasticity with E = 50 kPa, Poisson ratio 0.25, density 1000 kg/m³, yield stress 12 kPa, and linear hardening 7.5 kPa. Grid nodes, rigid bodies, and articulated links exchange impulses through the common contact solver. The [physical report](../../docs/research/2026-09-12-finite-mass-grid-contact-zh.md) records geometric accuracy, conservation, convergence, and remaining limitations.
+The production MLS-MPM solver uses Hencky J2 plasticity with E = 50 kPa, Poisson ratio 0.25, density 1000 kg/m³, yield stress 12 kPa, and linear hardening 7.5 kPa. Grid nodes, rigid bodies, and articulated links exchange impulses through the common contact solver.
 
 The published videos are a **visual preview** at 4 mm grid spacing. Maximum particle-center penetration is 3.996 mm against a 2 mm acceptance budget; grid, timestep, and iteration convergence remain pending. The other recorded physical checks pass, including elastic recovery, persistent plastic deformation, reaction balance, and reset. Publication retains the failed spatial check in the [recording metadata](../../docs/media/demo_recordings.json).
 

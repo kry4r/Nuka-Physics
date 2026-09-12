@@ -32,8 +32,7 @@ pre-general-contact numbers are historical and are not the current baseline verd
 
 ## 1. Conventions (the contract), proven in rung D0
 
-From `docs/plans/2026-05-30-v03-unitree-policy-config.md`, re-confirmed bit-exact
-against the golden (`/root/third_party/go2_pr62/golden_io.json`) in **D0**:
+Policy conventions are checked against the frozen policy input/output fixture:
 
 - **obs(48):** `[0:3]` base_lin_vel ×2.0, `[3:6]` base_ang_vel ×0.25, `[6:9]`
   projected_gravity (gravity unit vector in BODY frame, no scale), `[9:12]`

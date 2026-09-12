@@ -9,6 +9,8 @@ cmake-build-*/
 subagent-plans/
 docs/plans/
 docs/specs/
+docs/roadmap/
+docs/research/
 .g1e_logs/
 .g2_logs/
 *.lock
