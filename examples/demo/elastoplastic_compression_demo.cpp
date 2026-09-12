@@ -19,6 +19,7 @@
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/scene_map.hpp"
+#include "tools/perf/cuda_step_measurements.hpp"
 
 namespace {
 namespace nk = nuka::nk;
@@ -41,6 +42,7 @@ constexpr Vec3 kPlateHalf{0.085f, 0.070f, 0.009f};
 struct Args {
     std::filesystem::path out = "out/elastoplastic_compression";
     std::filesystem::path replay;
+    std::filesystem::path perf_json;
     float dx = 0.005f;
     uint32_t steps_per_frame = 64u;
     uint32_t width = 1600u, height = 1000u, samples = 64u;
@@ -61,6 +63,7 @@ Args ParseArgs(int argc, char** argv) {
         const std::string value = argv[++i];
         if (key == "--out-dir") args.out = value;
         else if (key == "--replay") args.replay = value;
+        else if (key == "--perf-json") args.perf_json = value;
         else if (key == "--dx") args.dx = std::stof(value);
         else if (key == "--steps-per-frame") args.steps_per_frame = std::stoul(value);
         else if (key == "--width") args.width = std::stoul(value);
@@ -73,6 +76,7 @@ Args ParseArgs(int argc, char** argv) {
             "dx must be positive and no greater than 0.01 m");
     Require(args.steps_per_frame && args.width && args.height && args.samples &&
             args.render_stride, "Counts must be positive");
+    Require(args.perf_json.empty() || args.replay.empty(), "Step timing requires live simulation");
     return args;
 }
 
@@ -401,6 +405,8 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
     Require(world.FieldPtr(nk::FieldId::MpmBodyReaction) != nullptr, "No boundary impulse readout");
     Require(world.SetExecutionMode(nk::World::ExecutionMode::Graph) == phi::Status::Ok,
             "Graph configuration failed");
+    nuka::perf::CudaStepMeasurements measurements(world, !args.perf_json.empty(),
+        args.steps_per_frame, kFrames);
 
     const float spacing = args.dx * 0.5f;
     const double volume = double(spacing) * spacing * spacing;
@@ -437,6 +443,7 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
         double top_impulse = 0.0, bottom_impulse = 0.0;
         uint32_t status = 0u;
         if (frame > 0u) {
+            measurements.BeginInterval();
             for (uint32_t s = 0u; s < args.steps_per_frame; ++s) {
                 const uint64_t step = uint64_t(frame-1u) * args.steps_per_frame + s;
                 const double begin = step * dt, end = (step+1u) * dt;
@@ -447,7 +454,7 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
                     bodies.size() * sizeof(Transform)), "Boundary pose upload failed");
                 Require(world.GetData().UploadField(nk::FieldId::BodyLinearVelocity,
                     body_velocity.data(), body_velocity.size() * sizeof(Vec3)), "Boundary velocity upload failed");
-                Require(world.StepConfigured() == phi::Status::Ok, "Simulation step failed");
+                measurements.Step();
                 Download(world, nk::FieldId::MpmBodyReaction, reaction);
                 uint32_t step_status = 0u;
                 Require(world.GetData().DownloadField(nk::FieldId::EnvStatus, &step_status,
@@ -467,6 +474,7 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
                 bodies.size() * sizeof(Transform)), "Final boundary pose upload failed");
         }
         Require(world.Synchronize() == phi::Status::Ok, "Simulation completion failed");
+        if (frame > 0u) measurements.EndInterval();
         Download(world, nk::FieldId::ParticlePos, positions);
         Download(world, nk::FieldId::ParticleVel, velocity);
         Download(world, nk::FieldId::ParticleF, elastic);
@@ -548,6 +556,7 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
     std::ofstream completion(args.out / "completion.json");
     completion << "{\"frames\": " << kFrames+1u << ", \"reset_passed\": true, "
         "\"material_reset_between_loads\": false}\n";
+    measurements.Write(args.perf_json, dt);
 }
 }  // namespace
 
