@@ -231,6 +231,16 @@ __global__ void AccumulateStepKernel(ModelView model, DataView data,
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t bodies = p.env_count * p.bodies_per_env;
     const uint32_t links = p.env_count * p.links_per_env;
+    const uint32_t boundaries = p.env_count * nk::kMpmBoundaryCount;
+    if ((p.flags & kAccumulateMpmImpulse) != 0u && i < boundaries) {
+        if (p.first != 0u) {
+            data.step_mpm_boundary_impulse[i] = data.mpm_boundary_impulse[i];
+            data.step_mpm_boundary_moment[i] = data.mpm_boundary_moment[i];
+        } else {
+            data.step_mpm_boundary_impulse[i] += data.mpm_boundary_impulse[i];
+            data.step_mpm_boundary_moment[i] += data.mpm_boundary_moment[i];
+        }
+    }
     if ((p.flags & kAccumulateMpmImpulse) != 0u && i < bodies) {
         const Vec3 impulse = data.mpm_body_reaction[i];
         const Vec3 moment = data.mpm_body_ang_reaction[i] +
@@ -279,6 +289,10 @@ __global__ void AccumulateStepKernel(ModelView model, DataView data,
             if (p.last != 0u) data.joint_limit_impulse[slot] = data.step_joint_limit_impulse[slot];
         }
     }
+    if (p.last != 0u && (p.flags & kAccumulateMpmOutput) != 0u && i < boundaries) {
+        data.mpm_boundary_impulse[i] = data.step_mpm_boundary_impulse[i];
+        data.mpm_boundary_moment[i] = data.step_mpm_boundary_moment[i];
+    }
     if (p.last == 0u || i >= bodies) return;
     if ((p.flags & kAccumulateMpmOutput) != 0u) {
         const Vec3 impulse = data.step_mpm_body_impulse[i];
@@ -310,6 +324,10 @@ Status OpAccumulateStep(const ModelView& model, const DataView& data,
     const auto links = static_cast<uint32_t>(links64);
     const bool outputs = (p->flags & kAccumulateOutputs) != 0u;
     const bool mpm = (p->flags & (kAccumulateMpmImpulse | kAccumulateMpmOutput)) != 0u;
+    if (mpm && (!data.mpm_boundary_impulse || !data.mpm_boundary_moment ||
+                !data.step_mpm_boundary_impulse || !data.step_mpm_boundary_moment ||
+                uint64_t{p->env_count} * nk::kMpmBoundaryCount > index_limit))
+        return Status::InvalidArgument;
     if (outputs && (!data.env_status || !data.step_env_status)) return Status::InvalidArgument;
     if (mpm && bodies != 0u &&
         (!model.shape_table || !data.body_pose || !data.body_inertial_frame ||
@@ -325,7 +343,8 @@ Status OpAccumulateStep(const ModelView& model, const DataView& data,
         return Status::InvalidArgument;
     if ((p->flags & kFinalizeBodyForces) != 0u && bodies != 0u &&
         (!outputs || !data.body_force || !data.body_torque)) return Status::InvalidArgument;
-    const uint32_t count = std::max(p->env_count, std::max(bodies, links));
+    const uint32_t count = std::max(mpm ? p->env_count * nk::kMpmBoundaryCount : p->env_count,
+                                    std::max(bodies, links));
     constexpr uint32_t block_size = 128u;
     LaunchCuda(AccumulateStepKernel, dim3((count + block_size - 1u) / block_size),
                dim3(block_size), 0u, stream, model, data, *p);
@@ -400,6 +419,8 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     for (uint32_t local = threadIdx.x; local < p.contact_slot_count; local += blockDim.x) {
         const uint32_t contact = env * p.contact_slot_count + local;
         data.ucontact_count[contact] = 0u;
+        data.ucontact_law[contact] = nk::kContactLawCompliant;
+        data.ucontact_friction[contact] = 0.0f;
         data.contact_point[contact] = {};
         data.contact_normal[contact] = {};
         data.contact_depth[contact] = 0.0f;
@@ -467,6 +488,18 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     if (threadIdx.x == 0u) {
         data.contact_count[env] = 0u;
         data.env_status[env] = 0u;
+        if (data.grid_contact_peak != nullptr) {
+            data.grid_contact_peak[env] = data.grid_contact_attempted[env] = 0u;
+            data.grid_contact_overflow[env] = 0u;
+            data.grid_contact_retained[env] = 0u;
+            for (uint32_t boundary = 0u; boundary < nk::kMpmBoundaryCount; ++boundary) {
+                const uint32_t index = env * nk::kMpmBoundaryCount + boundary;
+                data.mpm_boundary_impulse[index] = {};
+                data.mpm_boundary_moment[index] = {};
+                data.step_mpm_boundary_impulse[index] = {};
+                data.step_mpm_boundary_moment[index] = {};
+            }
+        }
     }
 }
 

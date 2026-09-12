@@ -8,6 +8,7 @@ Pretrained policies and material experiments run in Nuka. Video frames come from
 | G1 Shuffle dance | [g1_dance_play.py](g1_dance_play.py) | [20 s, 960 × 540](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4) |
 | Elastoplastic compression | [elastoplastic_compression_demo.cpp](elastoplastic_compression_demo.cpp) | [24.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4) |
 | Bunny elastoplastic impact | [elastoplastic_bunny_demo.cpp](elastoplastic_bunny_demo.cpp) | [18.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4) |
+| Dynamic elastoplastic gripper | [robot_elastoplastic_demo.cpp](robot_elastoplastic_demo.cpp) | [Full view](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4) · [Contact close-up](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic_close.mp4) |
 
 Run commands from the repository root after the [CUDA build and Python installation](../../README.md#quick-start). Use Python 3.11, a CUDA-compatible PyTorch installation, Pillow, NumPy, and `ffmpeg` on `PATH`. Model weights and source assets stay in the ignored `.nuka-assets/` and `.nuka_cache/` directories; recordings and metrics go to `out/`.
 
@@ -138,7 +139,49 @@ python examples/demo/compose_elastoplastic_bunny.py \
   --out-dir out/elastoplastic/bunny_video
 ```
 
-The bunny remains on the pad, whose center settles 20.82 mm below its initial surface. This is deformation under load. The [physical report](../../docs/research/2026-09-11-elastoplastic-bunny-demo-zh.md) includes timestep/grid comparisons, momentum balance, plastic dissipation, and measured penetration. The current grid contact projects velocity and returns reaction impulses each physics interval; a shared finite-mass solve for multiple contacting owners remains unfinished.
+The bunny remains on the pad, whose center settles 20.82 mm below its initial surface. This is deformation under load. The [physical report](../../docs/research/2026-09-11-elastoplastic-bunny-demo-zh.md) includes timestep/grid comparisons, momentum balance, plastic dissipation, and measured penetration. This recording uses the earlier grid projection and reaction scheme. The dynamic gripper below uses shared finite-mass grid contacts.
+
+## Dynamic elastoplastic gripper
+
+A Franka Panda applies light compression, opens, applies strong compression, and releases the same 24 × 36 × 28 mm specimen. Both fingers and the arm use articulated dynamics with finite PD forces and sampled gravity feedforward. The controller updates joint targets; contact forces determine the actual joint motion. The specimen has no pinned particles, and its material history is retained between loads.
+
+The production MLS-MPM solver uses Hencky J2 plasticity with E = 50 kPa, Poisson ratio 0.25, density 1000 kg/m³, yield stress 12 kPa, and linear hardening 7.5 kPa. Grid nodes, rigid bodies, and articulated links exchange impulses through the common contact solver. The [physical report](../../docs/research/2026-09-12-finite-mass-grid-contact-zh.md) records geometric accuracy, conservation, convergence, and remaining limitations.
+
+The published videos are a **visual preview** at 4 mm grid spacing. Maximum particle-center penetration is 3.996 mm against a 2 mm acceptance budget; grid, timestep, and iteration convergence remain pending. The other recorded physical checks pass, including elastic recovery, persistent plastic deformation, reaction balance, and reset. Publication retains the failed spatial check in the [recording metadata](../../docs/media/demo_recordings.json).
+
+Prepare the Panda assets from the Menagerie revision in the [asset manifest](../assets/panda/manifest.json), using the source checkout described above:
+
+```bash
+python tools/assets/convert_embodied_assets.py --asset panda
+python - <<'PY'
+import nuka
+scene = nuka.Scene.load('.nuka-assets/generated/panda/panda_pick_place.xml')
+try:
+    scene.save('.nuka-assets/generated/panda/panda_pick_place.nks')
+finally:
+    scene.destroy()
+PY
+cmake --build build-cuda128 --target nuka_robot_elastoplastic_demo -j
+export LD_LIBRARY_PATH="$PWD/build-cuda128/src:${LD_LIBRARY_PATH:-}"
+build-cuda128/tests/nuka_robot_elastoplastic_demo \
+  --no-render --dx 0.004 --substeps 64 --execution graph \
+  --contact-capacity 32768 \
+  --out-dir out/elastoplastic/gripper
+build-cuda128/tests/nuka_robot_elastoplastic_demo \
+  --replay out/elastoplastic/gripper \
+  --out-dir out/elastoplastic/gripper_render \
+  --width 1280 --height 800 --samples 48
+python examples/demo/compose_robot_elastoplastic.py \
+  --capture out/elastoplastic/gripper \
+  --frames out/elastoplastic/gripper_render/frames \
+  --out-dir out/elastoplastic/gripper_video --visual-preview
+```
+
+Captures contain the scene bundle, particle and robot states, physical measurements, configuration, and reset result. The composer checks physical acceptance before encoding both views. `--visual-preview` explicitly permits encoding despite failed physical checks, retains every check in `analysis.json`, and labels playback as a preview. Capture integrity, finite state, execution mode, environment status, contact capacity, and reset must still pass. `--analyze-only` checks a completed capture without rendering; repeated `--compare` arguments check runs that change one of `--dx`, `--substeps`, or `--velocity-iterations`. Full physical acceptance requires all checks and all three convergence comparisons. A contact-pool overflow invalidates a capture even when the step call succeeds.
+
+State capture saves two alternating checkpoints every 12 samples. To continue an interrupted capture, repeat the capture command with `--resume`, using the same executable, engine library, scene, and physical arguments. Keep both `scene.nks` and `scene.nka` with the recording. Recovery checks file integrity and restores material history, contact caches, controller inputs, and curve integrals; incomplete output after the last valid checkpoint is recomputed. `--stop-after N` ends a capture segment after sample N without marking the complete demo as finished. `--execution eager` selects the same operator sequence without graph replay.
+
+The two cameras replay the same saved states. A 120 Hz capture plays at 24 fps: **5× slow motion without state interpolation**, covering 2.8 seconds of simulated motion. The line below the scene shows mean finger reaction. Penetration is measured from particle centers to the authored collision geometry, including Panda pad boxes. The rendered material surface is reconstructed from particles. Actuator work and gravity torque are sampled estimates; the recording does not claim a closed total-energy budget or validate lifting and transport.
 
 ## Go2 locomotion capture
 

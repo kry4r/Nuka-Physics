@@ -66,6 +66,7 @@ inline constexpr uint32_t kEnvStatusInvalidEndpoint  = 1u << 6;
 // Missing or invalid sampled contact geometry stays latched until world reset.
 inline constexpr uint32_t kEnvStatusContactGeometryUnavailable = 1u << 7;
 inline constexpr uint32_t kEnvStatusConstitutiveFailure = 1u << 8;
+inline constexpr uint32_t kEnvStatusGridContactOverflow = 1u << 9;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
 inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
@@ -395,6 +396,8 @@ uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count);
 uint64_t LbvhSortScratchBytes(uint32_t env_count, uint32_t bodies_per_env);
 uint64_t ContactCacheScratchBytes(uint32_t point_count, uint32_t env_count);
 uint64_t ContactIndexScratchBytes(uint32_t row_count, uint32_t env_count);
+uint64_t SolverVelocityScratchBytes(uint32_t body_count, uint32_t particle_count,
+                                    uint32_t grid_count);
 
 // Dynamic solve-island build (connected components over the active contact rows).
 // All launch geometry is a fixed function of the capacities (graph-capturable); the
@@ -407,11 +410,17 @@ struct BuildSolveIslandsParams {
     uint32_t articulation_count; // global artic count (== artics_per_env * env_count)
     uint32_t bodies_per_env;     // movable rigid body count per env
     uint32_t particles_per_env;  // particle count per env
+    uint32_t grid_nodes_per_env = 0u;
 };
 
 // All MPM operations share one physical interval and environment-private grid.
 // Prediction owns grid initialization; commit alone advances particles and history.
 struct MpmParams {
+    uint32_t contact_slot_base;
+    uint32_t contact_capacity;
+    uint32_t contact_slots_per_env;
+    uint32_t full_row_slot_count;
+    uint32_t rows_per_env;
     uint32_t particle_count;     // total env-major particles (0 => inert no-op)
     uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
     // Grid-owned particles occupy [0, mpm_particles_per_env) in each environment.
@@ -427,13 +436,11 @@ struct MpmParams {
     uint32_t substeps;           // zero or one; subdivision belongs to the pipeline
     uint32_t material_count;     // mpm_material_table rows (indexed by particle_material_id)
     float    gravity[3];         // world-frame gravity applied on the grid each substep
-    // The static floor projects inward grid velocity and applies Coulomb friction.
-    // Its external impulse is distinct from collidable-owner reactions.
+    // Static boundaries emit unilateral velocity constraints and external impulse readout.
     float    plane_n[3];
     float    plane_d;
     float    plane_mu;
-    // Analytic primitives and cooked SDFs project grid velocity and record reaction.
-    // The deepest collidable supplies each node's current boundary condition.
+    // Every supported collidable within the band emits a shared contact block.
     uint32_t dynamic_body_bc;
     // Disables collidable exchange and reaction while retaining the static floor.
     uint32_t bite_disable_dynamic_bc;
@@ -443,7 +450,7 @@ struct MpmParams {
     collision::MeshGeometryCounts mesh_geometry;
     float    body_mu;            // Coulomb friction the body BC clamps the tangent by.
     float    body_band;          // nodes with signed surface distance below this couple.
-    // Articulation dimensions for the link-reaction generalized impulse.
+    // Articulation dimensions for endpoint validation and reaction reference points.
     uint32_t artic_count;        // GLOBAL articulations (artics_per_env * env_count).
     uint32_t max_dof;            // per-articulation generalized DOF (the m_inv tile side).
     uint32_t base_link_count;    // links per env (global link = env*base_link_count+tmpl).
@@ -624,6 +631,7 @@ struct ContactTangentBasisParams {
 };
 
 struct AssembleRowsParams {
+    uint32_t grid_nodes_per_env = 0u;
     float    dt;
     uint32_t slot_count;        // total contact slots (env_count * max_contacts)
     uint32_t max_dof;           // chain-Jacobian dof_stride (== dofs_per_env)
@@ -703,6 +711,8 @@ struct SolveRowsBlockIslandParams {
     // one-island-per-env schedule instead of the dynamic CC pass, to A/B them. 0 == off.
     uint32_t force_static_islands;
     uint32_t continue_impulses = 0u; // Retain this step's applied impulses across solver calls.
+    uint32_t total_grid_count = 0u;
+    uint64_t workspace_bytes = 0u;
 };
 
 // Particle modes select material constraints and ownership; all row-coupled particles share integration.

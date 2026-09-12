@@ -172,6 +172,7 @@ struct MpmMaterialInput {
 };
 
 struct MpmCookInput {
+    uint32_t contact_capacity = 0u;  // Zero reserves one slot per reachable grid node.
     std::vector<math::Vec3> positions;     // per-particle rest state
     std::vector<math::Vec3> velocities;    // per-particle initial velocity
     std::vector<float>      inv_mass;      // 1/mass (0 == pinned)

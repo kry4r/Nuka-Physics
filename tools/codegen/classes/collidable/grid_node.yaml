@@ -1,0 +1,6 @@
+# A background-grid point mass shares the contact solver with material particles.
+name: GridNode
+collidable_type_id: 4
+accel_structure: None
+shape_proxy: None
+reaction_provider: GridInvMass

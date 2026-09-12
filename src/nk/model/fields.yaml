@@ -944,3 +944,26 @@ fields:
   # Multiplicative plastic deformation is present when a material requires its history.
   - {name: particle_plastic_F, dtype: f32, per: particle, arena: persistent, owner: data, elem: 9}
   - {name: snapshot_particle_plastic_F, dtype: f32, per: particle, arena: persistent, owner: data, elem: 9}
+
+  # Finite grid endpoints and deterministic contact compaction.
+  - {name: grid_inv_mass, dtype: f32, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: cc_grid_first, dtype: u32, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_contact_count, dtype: u64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_contact_offset, dtype: u64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: ucontact_law, dtype: u32, per: contact_slot, arena: scratch, owner: data}
+  - {name: ucontact_friction, dtype: f32, per: contact_slot, arena: scratch, owner: data}
+
+  # Counts describe the latest interval; peak is retained until reset.
+  - {name: grid_contact_attempted, dtype: u64, per: env, arena: scratch, owner: data, flags: [readout]}
+  - {name: grid_contact_retained, dtype: u32, per: env, arena: scratch, owner: data, flags: [readout]}
+  - {name: grid_contact_peak, dtype: u64, per: env, arena: persistent, owner: data, flags: [readout]}
+  - {name: grid_contact_overflow, dtype: u64, per: env, arena: scratch, owner: data, flags: [readout]}
+
+  # Boundary reactions are impulses and moments about the world origin.
+  - {name: mpm_boundary_impulse, dtype: vec3, per: scalar, count: "mpm_boundary_count*env_count", arena: scratch, owner: data, flags: [readout]}
+  - {name: mpm_boundary_moment, dtype: vec3, per: scalar, count: "mpm_boundary_count*env_count", arena: scratch, owner: data, flags: [readout]}
+  - {name: step_mpm_boundary_impulse, dtype: vec3, per: scalar, count: "mpm_boundary_count*env_count", arena: scratch, owner: data}
+  - {name: step_mpm_boundary_moment, dtype: vec3, per: scalar, count: "mpm_boundary_count*env_count", arena: scratch, owner: data}
+
+  # Backend workspace for compensated contact velocity accumulation.
+  - {name: solver_velocity_scratch, dtype: u8, per: scalar, count: "solver_velocity_scratch_bytes", arena: scratch, owner: data}

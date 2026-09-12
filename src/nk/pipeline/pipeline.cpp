@@ -55,7 +55,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     if (status != phi::Status::Ok) return status;
     const auto& cap = model.capacities;
     const bool has_mpm = model.MpmParticlesPerEnv() > 0u && cap.mpm_grid_nodes_per_env > 0u;
-    const bool mpm_reaction = has_mpm && cap.bodies_per_env > 0u;
+    const bool mpm_reaction = has_mpm;
     if (substeps == 1u && !mpm_reaction) return phi::Status::Ok;
     const uint64_t call_count = uint64_t(substeps) * (calls_.size() + 1u + uint32_t(mpm_reaction));
     if (call_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
@@ -90,7 +90,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
             outputs.flags |= phi::kAccumulateJointLimit;
         for (const auto& call : interval_calls) {
             AddOp(call.op, call.params, device);
-            if (mpm_reaction && call.op == phi::NkOp::MpmExchange)
+            if (mpm_reaction && call.op == phi::NkOp::MpmCommit)
                 AddOp(phi::NkOp::AccumulateStep, &capture, device);
         }
         AddOp(phi::NkOp::AccumulateStep, &outputs, device);
@@ -148,12 +148,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     // historical pipeline order byte-for-byte.
     const bool use_osc = model.drive_mode == 4u;
     // The same particle ownership sizes the cook reserve and the pipeline's row range.
-    const uint64_t particle_reserve64 = cap.max_contacts_per_env > 0u
+    const uint64_t particle_reserve64 = cap.bodies_per_env > 0u && cap.max_contacts_per_env > 0u
         ? uint64_t{cap.particles_per_env - grid_particles_per_env} *
               collision::kBodyParticleContactSlotsPerParticle : 0u;
-    if (particle_reserve64 > cap.max_contacts_per_env) return phi::Status::InvalidArgument;
+    if (particle_reserve64 + cap.mpm_contact_capacity_per_env > cap.max_contacts_per_env)
+        return phi::Status::InvalidArgument;
     const uint32_t particle_reserve = static_cast<uint32_t>(particle_reserve64);
-    const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve;
+    const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve -
+                               cap.mpm_contact_capacity_per_env;
     const uint32_t default_pair_cap =
         cap.bodies_per_env * 4u < rigid_cap ? cap.bodies_per_env * 4u : rigid_cap;
     const uint32_t pair_emit_cap =
@@ -161,7 +163,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
                             : (cfg.max_pairs < rigid_cap ? cfg.max_pairs : rigid_cap);
     const uint32_t contact_rows_per_env =
         rigid_cap * kPairDrivenRowsPerSlot +
-        particle_reserve * kPairDrivenParticleRowsPerSlot;
+        (particle_reserve + cap.mpm_contact_capacity_per_env) * kPairDrivenParticleRowsPerSlot;
     // The per-ARTICULATION contact-slot stride the contact detection/assembly/solve
     // share, DATA-DRIVEN from the cooked geometry: the cook sizes max_contacts_per_env
     // from the collidable count, so the stride is the per-articulation quotient
@@ -638,8 +640,11 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             row_coupling_provider_.PreCouple(coupling_ctx);
         }
 
-        // ContactTangentBasis: the ONE general PairDriven path. The op builds the
-        // tangents over the unified contact buffer (ucontact_*).
+    }
+
+    mpm_coupling_provider_.Couple(coupling_ctx);
+    if (cap.max_contacts_per_env > 0u) {
+        // All contact providers finish before tangent construction and row assembly.
         p_tangent_.slot_count = slot_count;
         p_tangent_.family = family;
         add(phi::NkOp::ContactTangentBasis, &p_tangent_);
@@ -675,6 +680,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_contacts) {
+        p_assemble_.grid_nodes_per_env = cap.mpm_grid_nodes_per_env;
         p_assemble_.dt = cfg.dt;
         p_assemble_.slot_count = slot_count;
         p_assemble_.max_dof = max_dof;
@@ -723,14 +729,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         }
     }
 
-    // Exchange reads the latest endpoint velocity before the shared solve.
-    if (has_mpm && has_articulation) {
-        p_fk_velocity_.articulation_count = articulation_cnt;
-        p_fk_velocity_.total_link_count = total_link_count;
-        add(phi::NkOp::FkLinkVelocities, &p_fk_velocity_);
-    }
-    mpm_coupling_provider_.Couple(coupling_ctx);
-
     if (has_contacts) {
         // The rigid-body arm: the spec-fixed SolveRowsBlockIslandParams takes over the slot
         // (the transitional SolveArticulatedParams routing is deleted).
@@ -745,6 +743,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_solve_.pos_beta = cfg.pos_beta;
         p_solve_.pos_slop = cfg.pos_slop;
         p_solve_.total_particle_count = particle_count;
+        p_solve_.total_grid_count = cap.mpm_grid_nodes_per_env * env_count;
+        p_solve_.workspace_bytes = cap.solver_velocity_scratch_bytes;
         p_solve_.family = family;
         p_solve_.total_islands = model.schedule_island_count;
         p_solve_.max_dof = max_dof;
@@ -781,6 +781,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_islands_.articulation_count = articulation_cnt;
         p_islands_.bodies_per_env = cap.bodies_per_env;
         p_islands_.particles_per_env = cap.particles_per_env;
+        p_islands_.grid_nodes_per_env = cap.mpm_grid_nodes_per_env;
         add(phi::NkOp::BuildSolveIslands, &p_islands_);
         for (uint32_t pass = 0u; pass < coupling_iterations; ++pass) {
             if (pass != 0u) project_particles(pass);

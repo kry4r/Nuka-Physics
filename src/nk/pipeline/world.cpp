@@ -154,6 +154,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     const auto& cap = model_.capacities;
     model_.capacities.contact_index_scratch_bytes = cap.links_per_env > 0u && cap.max_contacts_per_env > 0u
         ? phi::ContactIndexScratchBytes(cap.max_rows_per_env * cap.env_count, cap.env_count) : 0u;
+    model_.capacities.solver_velocity_scratch_bytes = cap.max_rows_per_env > 0u
+        ? phi::SolverVelocityScratchBytes(cap.bodies_per_env * cap.env_count,
+            cap.particles_per_env * cap.env_count, cap.mpm_grid_nodes_per_env * cap.env_count) : 0u;
     } catch (const std::exception& error) {
         creation_status_ = phi::Status::Failed;
         creation_error_ = error.what();

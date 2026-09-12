@@ -38,6 +38,7 @@ using ::nuka::nk::NkRowSide;
 using ::nuka::nk::kNkSideArtic;
 using ::nuka::nk::kNkSideRigid;
 using ::nuka::nk::kNkSideParticle;
+using ::nuka::nk::kNkSideGrid;
 
 constexpr uint32_t kBlockSize = 128u;
 constexpr uint32_t kSentinel = ~0u;  // empty key / inactive root (sorts to the end).
@@ -95,12 +96,14 @@ __global__ void FillIdentityKernel(uint32_t* arr, uint32_t n) {
 __device__ inline void ClaimUnion(uint32_t* parent, const NkRowSide& s, uint32_t row,
                                   uint32_t* artic_first, uint32_t artic_count,
                                   uint32_t* body_first, uint32_t body_count,
-                                  uint32_t* particle_first, uint32_t particle_count) {
+                                  uint32_t* particle_first, uint32_t particle_count,
+                                  uint32_t* grid_first, uint32_t grid_count) {
     uint32_t* table = nullptr;
     uint32_t limit = 0u;
     if (s.kind == kNkSideArtic)         { table = artic_first;    limit = artic_count; }
     else if (s.kind == kNkSideRigid)    { table = body_first;     limit = body_count; }
     else if (s.kind == kNkSideParticle) { table = particle_first; limit = particle_count; }
+    else if (s.kind == kNkSideGrid)     { table = grid_first;     limit = grid_count; }
     else return;
     if (s.index >= limit) return;
     const uint32_t old = atomicCAS(&table[s.index], kSentinel, row);
@@ -113,15 +116,16 @@ __global__ void UnionRowsKernel(const NkRow* __restrict__ urows, uint32_t* paren
                                 uint32_t* artic_first, uint32_t artic_count,
                                 uint32_t* body_first, uint32_t body_count,
                                 uint32_t* particle_first, uint32_t particle_count,
+                                uint32_t* grid_first, uint32_t grid_count,
                                 uint32_t total_rows) {
     const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= total_rows) return;
     if (!(urows[row].flags & nk::nk_row_flags::kActive)) return;
     const NkRow r = urows[row];
     ClaimUnion(parent, r.a, row, artic_first, artic_count, body_first, body_count,
-               particle_first, particle_count);
+               particle_first, particle_count, grid_first, grid_count);
     ClaimUnion(parent, r.b, row, artic_first, artic_count, body_first, body_count,
-               particle_first, particle_count);
+               particle_first, particle_count, grid_first, grid_count);
     const uint32_t gf = r.group_first;
     if (gf != row && gf < total_rows) Unite(parent, row, gf);
 }
@@ -195,6 +199,7 @@ Status OpBuildSolveIslands(const ModelView& /*model*/, const DataView& data,
         static_cast<uint32_t>(static_cast<uint64_t>(p->bodies_per_env) * p->env_count);
     const uint32_t particle_count =
         static_cast<uint32_t>(static_cast<uint64_t>(p->particles_per_env) * p->env_count);
+    const uint32_t grid_count = p->grid_nodes_per_env * p->env_count;
     const uint32_t rblocks = (total_rows + kBlockSize - 1u) / kBlockSize;
     const auto* urows = reinterpret_cast<const NkRow*>(data.urows);
 
@@ -214,11 +219,15 @@ Status OpBuildSolveIslands(const ModelView& /*model*/, const DataView& data,
                               static_cast<size_t>(particle_count) * sizeof(uint32_t), stream);
     }
     (void)cudaMemsetAsync(data.island_count, 0, sizeof(uint32_t), stream);
+    if (grid_count > 0u)
+        (void)cudaMemsetAsync(data.cc_grid_first, 0xFF,
+                              static_cast<size_t>(grid_count) * sizeof(uint32_t), stream);
 
     // Union-find, then flatten each active row to its component root.
     LaunchCuda(UnionRowsKernel, dim3(rblocks), dim3(kBlockSize), 0u, stream, urows,
                data.cc_parent, data.cc_artic_first, artic_count, data.cc_body_first,
-               body_count, data.cc_particle_first, particle_count, total_rows);
+               body_count, data.cc_particle_first, particle_count,
+               data.cc_grid_first, grid_count, total_rows);
     LaunchCuda(FlattenRootsKernel, dim3(rblocks), dim3(kBlockSize), 0u, stream, urows,
                data.cc_parent, data.cc_root, total_rows);
 

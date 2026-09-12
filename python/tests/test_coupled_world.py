@@ -23,6 +23,7 @@ state) -- that is a separate RL-track follow-on. This test only proves create + 
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 import numpy as np
 
 import pytest
@@ -127,9 +128,13 @@ def test_coupled_world_requires_a_medium(device):
 def test_plastic_material_cook_graph_reset_and_readout(device, tmp_path):
     material = Soft.ElastoPlastic(youngs=30000.0, poisson=0.0, yield_stress=200.0,
                                  hardening_modulus=4000.0, dx=0.025, substeps=10)
+    material = replace(material, contact_capacity=4096)
     fields = (nuka.PARTICLE_DEFORMATION_GRADIENT,
               nuka.PARTICLE_PLASTIC_DEFORMATION_GRADIENT,
-              nuka.PARTICLE_EQUIVALENT_PLASTIC_STRAIN)
+              nuka.PARTICLE_EQUIVALENT_PLASTIC_STRAIN,
+              nuka.GRID_CONTACT_ATTEMPTED, nuka.GRID_CONTACT_RETAINED,
+              nuka.GRID_CONTACT_PEAK, nuka.GRID_CONTACT_OVERFLOW,
+              nuka.MPM_BOUNDARY_IMPULSE, nuka.MPM_BOUNDARY_ANGULAR_IMPULSE)
     saved = str(tmp_path / "plastic.nks")
     states = []
     with nuka.SceneBuilder.create() as builder:
@@ -147,6 +152,14 @@ def test_plastic_material_cook_graph_reset_and_readout(device, tmp_path):
                         world.step()
                     assert not np.any(world.download_field(nuka.ENV_STATUS))
                     final = [world.download_field(f).copy().reshape(2, -1) for f in fields]
+                    for f in (nuka.GRID_CONTACT_ATTEMPTED, nuka.GRID_CONTACT_PEAK,
+                              nuka.GRID_CONTACT_OVERFLOW):
+                        host = world.download_field(f)
+                        view = torch.from_dlpack(world.buffer_view(f))
+                        assert host.dtype == np.uint64 and view.dtype == torch.uint64
+                        np.testing.assert_array_equal(view.cpu().numpy().ravel(), host.ravel())
+                    assert np.all(final[5] > 0) and not np.any(final[6])
+                    assert np.all(final[5] <= material.contact_capacity)
                     assert final[2].max() > 0.001
                     np.testing.assert_allclose(np.linalg.det(final[1].reshape(-1, 3, 3)),
                                                1.0, rtol=0.0, atol=2.0e-4)
@@ -163,6 +176,15 @@ def test_plastic_material_cook_graph_reset_and_readout(device, tmp_path):
                     world.reset()
                     for f, seed in zip(fields, initial):
                         np.testing.assert_array_equal(world.download_field(f).reshape(2, -1), seed)
+                    peak_view = torch.from_dlpack(world.buffer_view(nuka.GRID_CONTACT_PEAK))
+                    large_counts = np.array([2**40 + 3, 2**40 + 7], dtype=np.uint64)
+                    peak_view.copy_(torch.from_numpy(large_counts).to(peak_view.device).reshape(peak_view.shape))
+                    torch.cuda.synchronize()
+                    np.testing.assert_array_equal(world.download_field(nuka.GRID_CONTACT_PEAK), large_counts)
+                    world.reset_envs([0])
+                    np.testing.assert_array_equal(world.download_field(nuka.GRID_CONTACT_PEAK),
+                                                  np.array([0, large_counts[1]], dtype=np.uint64))
+                    world.reset()
                     invalid = initial[1].copy()
                     invalid[0, 0] = 0.0
                     world.upload_field(fields[1], invalid.ravel())

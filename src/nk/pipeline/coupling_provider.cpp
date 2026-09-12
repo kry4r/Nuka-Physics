@@ -94,6 +94,11 @@ void MpmCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     const Model& model = *ctx.model;
     const Model::ModelParticles& mp = model.particles;
     phi::MpmParams& p = *ctx.p_mpm;
+    p.contact_capacity = model.capacities.mpm_contact_capacity_per_env;
+    p.contact_slot_base = ctx.max_contacts_per_env - p.contact_capacity;
+    p.contact_slots_per_env = ctx.max_contacts_per_env;
+    p.full_row_slot_count = ctx.rigid_cap;
+    p.rows_per_env = model.capacities.max_rows_per_env;
     p.particle_count = ctx.particle_count;
     p.particles_per_env = ctx.particles_per_env;
     // Pure and mixed MPM use the same explicit grid-owned particle range.
@@ -129,7 +134,7 @@ void MpmCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
         model.capacities.max_mesh_triangles, model.capacities.max_mesh_bvh_nodes};
     p.body_mu = mp.mpm_body_friction;
     p.body_band = mp.mpm_body_band > 0.0f ? mp.mpm_body_band : mp.mpm_cell_size;
-    // Link reactions seed the shared solve through M^-1 J^T in qdot_flat.
+    // Row assembly resolves full rigid and articulated mass response.
     p.artic_count = ctx.articulation_count;
     p.max_dof = ctx.max_dof;
     p.base_link_count = ctx.base_link_count;

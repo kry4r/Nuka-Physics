@@ -154,8 +154,11 @@ class MpmMaterial:
     loft_headroom: float = 0.0
     yield_stress: float = 0.0
     hardening_modulus: float = 0.0
+    contact_capacity: int = 0
 
     def __post_init__(self):
+        if not isinstance(self.contact_capacity, int) or not 0 <= self.contact_capacity <= 0xFFFFFFFF:
+            raise ValueError("MPM contact_capacity must be a nonnegative uint32")
         if self.model_kind != 5.0:
             if self.yield_stress != 0.0 or self.hardening_modulus != 0.0:
                 raise ValueError("Plasticity parameters require Hencky J2 (model_kind 5)")
@@ -185,6 +188,7 @@ class MpmMaterial:
             mpm_floor_normal=[float(c) for c in self.floor_normal],
             mpm_floor_d=float(self.floor_d),
             mpm_floor_friction=float(self.floor_friction),
+            mpm_contact_capacity=self.contact_capacity,
             mpm_loft_headroom=float(self.loft_headroom),
             mpm_yield_stress=float(self.yield_stress),
             mpm_hardening_modulus=float(self.hardening_modulus),

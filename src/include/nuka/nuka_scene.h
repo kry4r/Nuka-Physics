@@ -460,6 +460,10 @@ nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media
                                        const nuka_mpm_fill_desc_t* desc,
                                        const nuka_mpm_plasticity_desc_t* plasticity);
 
+// The environment-wide contact pool has no per-node limit; zero uses the cook default.
+nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,
+                                                  uint32_t media_id, uint32_t capacity);
+
 // Optional nk::Pipeline::SolverConfig overrides for the built-scene world (1:1 with
 // the coupled desc's solver_* block, applied through the SAME FinishWorldCreate). A
 // soft body authors a tighter contact solve here (more position-correction sweeps, a

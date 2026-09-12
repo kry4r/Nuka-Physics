@@ -16,6 +16,7 @@
 
 #include <cub/block/block_store.cuh>
 #include <cub/device/device_select.cuh>
+#include <cub/device/device_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -35,6 +36,7 @@
 #include "phi/op_schema.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"       // SparseSdfDevice / sparse_sdf_sample
 #include "phi/backend_cuda/ops/surface_query.cuh"
+#include "phi/backend_cuda/ops/mpm_contacts.cuh"
 
 namespace nuka::phi {
 
@@ -43,7 +45,7 @@ namespace {
 namespace m = ::nuka::math;
 constexpr uint32_t kBlockSize = 128u;
 constexpr uint32_t kSpatialComponents = 3u;
-constexpr uint32_t kStencilWidth = 3u;
+constexpr uint32_t kStencilWidth = nk::kMpmStencilWidth;
 constexpr uint32_t kStencilNodes = kStencilWidth * kStencilWidth * kStencilWidth;
 constexpr uint32_t kCudaWarpThreads = 32u;
 constexpr uint32_t kCellGroups = kBlockSize / kCudaWarpThreads;
@@ -62,12 +64,12 @@ enum class MpmStage : uint32_t {
     TransferInput,
     P2GCells,
     GridFinalize,
-    BodyProject,
-    BodySort,
-    BodyReact,
+    ContactCount,
+    ContactScan,
+    ContactEmit,
+    ReactionReadout,
     G2P,
     UpdateF,
-    ArticDeposit,
     Count,
 };
 
@@ -92,8 +94,8 @@ struct MpmProfiler {
     static const char* Name(uint32_t stage) {
         constexpr const char* names[kCount] = {
             "grid_prepare", "cell_keys", "radix_sort", "cell_ranges",
-            "active_select", "transfer_input", "p2g_cells", "grid_finalize", "body_project",
-            "body_sort", "body_react", "g2p_gather", "update_F", "artic_deposit"};
+            "active_select", "transfer_input", "p2g_cells", "grid_finalize", "contact_count",
+            "contact_scan", "contact_emit", "reaction_readout", "g2p_gather", "update_F"};
         return names[stage];
     }
 
@@ -229,7 +231,13 @@ struct MpmSortScratchLayout {
             static_cast<int>(node_count));
         if (status != cudaSuccess)
             throw std::runtime_error(cudaGetErrorString(status));
-        temp_bytes = std::max({particle_sort_bytes, node_sort_bytes, select_bytes});
+        size_t scan_bytes = 0u;
+        const auto scan_status = cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes,
+            static_cast<const uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
+            static_cast<int>(node_count));
+        if (scan_status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(scan_status));
+        temp_bytes = std::max({particle_sort_bytes, node_sort_bytes, select_bytes, scan_bytes});
         const uint64_t output_bytes =
             uint64_t{std::max(particle_count, node_count)} * sizeof(uint32_t);
         const uint64_t node_bytes = uint64_t{node_count} * sizeof(uint32_t);
@@ -511,7 +519,7 @@ __device__ __forceinline__ int64_t NodeId(uint32_t env, int64_t ix, int64_t iy,
 __global__ void MpmClearStatusBitsKernel(uint32_t* env_status, uint32_t env_count) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= env_count) return;
-    env_status[e] &= ~(kEnvStatusMpmGridEscape | kEnvStatusMpmOneWayBody);
+    env_status[e] &= ~(kEnvStatusMpmGridEscape | kEnvStatusMpmOneWayBody | kEnvStatusGridContactOverflow);
 }
 
 // Per-body reaction probes contain this interval's linear and angular impulse.
@@ -647,8 +655,8 @@ __global__ void MpmGridPrepareKernel(uint32_t total_nodes,
                                      float* __restrict__ grid_mass,
                                      m::Vec3* __restrict__ grid_momentum,
                                      m::Vec3* __restrict__ grid_velocity,
-                                     m::Vec3* __restrict__ body_dp,
-                                     uint32_t* __restrict__ body_owner,
+                                     float* __restrict__ grid_inv_mass,
+                                     uint64_t* __restrict__ contact_count,
                                      uint32_t* __restrict__ active_node_flags,
                                      uint32_t* __restrict__ cell_start,
                                      uint32_t* __restrict__ node_ids) {
@@ -657,8 +665,8 @@ __global__ void MpmGridPrepareKernel(uint32_t total_nodes,
     grid_mass[i] = 0.0f;
     grid_momentum[i] = m::Vec3::Zero();
     grid_velocity[i] = m::Vec3::Zero();
-    body_dp[i] = m::Vec3::Zero();
-    body_owner[i] = ~0u;
+    grid_inv_mass[i] = 0.0f;
+    contact_count[i] = 0u;
     active_node_flags[i] = 0u;
     cell_start[i] = ~0u;
     node_ids[i] = i;
@@ -868,9 +876,8 @@ __global__ void MpmGridFinalizeKernel(
     uint32_t nodes_per_env, uint32_t cells_per_env,
     uint32_t dims_x, uint32_t dims_y, uint32_t dims_z,
     float dx, m::Vec3 origin, m::Vec3 gravity, float dt,
-    m::Vec3 plane_n, float plane_d, float plane_mu,
     float* __restrict__ grid_mass, m::Vec3* __restrict__ grid_momentum,
-    m::Vec3* __restrict__ grid_velocity) {
+    m::Vec3* __restrict__ grid_velocity, float* __restrict__ grid_inv_mass) {
     const uint32_t active_count = min(total_nodes, *active_node_count);
     for (uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x; slot < active_count;
          slot += gridDim.x * blockDim.x) {
@@ -911,306 +918,12 @@ __global__ void MpmGridFinalizeKernel(
         grid_mass[node] = mass;
         grid_momentum[node] = momentum;
         if (mass < kMinNodeMass) { grid_velocity[node] = m::Vec3::Zero(); continue; }
-        m::Vec3 v = momentum * (1.0f / mass) + gravity * dt;
-        const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
-        const float sd = plane_n.x * xi.x + plane_n.y * xi.y + plane_n.z * xi.z - plane_d;
-        if (sd <= 0.0f) {
-            const float vn = v.Dot(plane_n);
-            if (vn < 0.0f) {
-                const m::Vec3 vt = v - plane_n * vn;
-                const float vt_len = sqrtf(vt.LengthSq());
-                const float coulomb = plane_mu * (-vn);
-                if (vt_len <= coulomb || vt_len < 1e-8f) {
-                    v = m::Vec3::Zero();
-                } else {
-                    v = vt * (1.0f - coulomb / vt_len);
-                }
-            }
-        }
-        // The outer x/y node ring removes outward velocity at separating domain walls.
-        const int32_t hx = static_cast<int32_t>(dims_x) - 1;
-        const int32_t hy = static_cast<int32_t>(dims_y) - 1;
-        if (nx == 0 && v.x < 0.0f) v.x = 0.0f;
-        else if (nx == hx && v.x > 0.0f) v.x = 0.0f;
-        if (ny == 0 && v.y < 0.0f) v.y = 0.0f;
-        else if (ny == hy && v.y > 0.0f) v.y = 0.0f;
-        grid_velocity[node] = v;
+        const float inv_mass = 1.0f / mass;
+        grid_inv_mass[node] = inv_mass;
+        grid_velocity[node] = momentum * inv_mass + gravity * dt;
     }
 }
 
-namespace sdfq = ::nuka::runtime::sdf;
-// Project the node velocity onto the surface velocity of its deepest-covering
-// body; record dp = m*(v_after-v_before) + the owner for the reaction gather.
-__global__ void MpmGridBodyProjectKernel(
-    uint32_t total_nodes, uint32_t nodes_per_env, uint32_t dims_x, uint32_t dims_y,
-    float dx, m::Vec3 origin, uint32_t bodies_per_env, float body_mu, float band,
-    uint32_t links_per_env, uint32_t artics_per_env, nkops::SurfaceQueryView surfaces,
-    const uint32_t* __restrict__ active_nodes,
-    const uint32_t* __restrict__ active_node_count,
-    const m::Transform* __restrict__ body_pose,
-    const m::Transform* __restrict__ body_inertial_frame,
-    const m::Vec3* __restrict__ body_lin_vel,
-    const m::Vec3* __restrict__ body_ang_vel,
-    const m::Transform* __restrict__ link_pose,
-    const nkops::LinkSpatialVel* __restrict__ link_velocity,
-    const uint32_t* __restrict__ body_to_link,
-    const uint32_t* __restrict__ body_to_articulation,
-    const uint32_t* __restrict__ body_collidable_body,
-    const float* __restrict__ shape_table, const float* __restrict__ mass,
-    m::Vec3* __restrict__ velocity, m::Vec3* __restrict__ body_dp,
-    uint32_t* __restrict__ body_owner, uint32_t* __restrict__ env_status) {
-    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (slot >= total_nodes || slot >= *active_node_count) return;
-    const uint32_t i = active_nodes[slot];
-    const float mi = mass[i];
-    if (mi < kMinNodeMass) return;
-    const uint32_t env = i / nodes_per_env;
-    const uint32_t local = i % nodes_per_env;
-    const int32_t nx = static_cast<int32_t>(local % dims_x);
-    const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
-    const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
-    const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
-    // Signed distances select the deepest surface in stable collidable order.
-    nk::CollidableOwner best_owner;
-    float best_phi = band;
-    m::Vec3 best_n = m::Vec3::Zero();
-    uint32_t status = 0u;
-    for (uint32_t bl = 0u; bl < bodies_per_env; ++bl) {
-        const nkops::PrimShapeDev shape = nkops::LoadPrimShape(shape_table, bl);
-        if ((shape.contype | shape.conaffinity) == 0u) continue;
-        const m::Transform xf = body_pose[env * bodies_per_env + bl];
-        const m::Vec3 q = nkops::PrimInverseTransformPoint(xf, xi);
-        const auto surface = nkops::QueryCollidableSurface(surfaces, bl, shape, q, band);
-        if (!surface.valid) {
-            status |= kEnvStatusMpmOneWayBody | kEnvStatusContactGeometryUnavailable;
-            continue;
-        }
-        const float phi = surface.distance;
-        if (phi >= sdfq::SparseSdfDevice::kOutsideBand || phi >= best_phi) continue;
-        const m::Vec3 gw = nkops::PrimRotate(xf.rotation, surface.normal);
-        const float gl = sqrtf(gw.LengthSq());
-        if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-8f) continue;
-        const nk::CollidableOwner owner = nk::ResolveCollidableOwner(
-            shape.body_id, env, bl, bodies_per_env, links_per_env, artics_per_env,
-            body_to_link, body_to_articulation, body_collidable_body);
-        if (owner.kind == ~0u ||
-            (owner.kind == nk::kNkSideArtic && (!link_pose || !link_velocity))) {
-            status |= kEnvStatusInvalidEndpoint;
-            continue;
-        }
-        best_phi = phi;
-        best_owner = owner;
-        best_n = gw * (1.0f / gl);
-    }
-    if (status != 0u && env_status != nullptr) atomicOr(&env_status[env], status);
-    if (best_owner.kind == ~0u) return;
-    m::Vec3 v_surf = m::Vec3::Zero();
-    if (best_owner.kind == nk::kNkSideArtic) {
-        const m::Transform pose = link_pose[best_owner.link];
-        const nkops::LinkSpatialVel spatial = link_velocity[best_owner.link];
-        const m::Vec3 omega = nkops::PrimRotate(pose.rotation,
-            {spatial.v[0], spatial.v[1], spatial.v[2]});
-        const m::Vec3 linear = nkops::PrimRotate(pose.rotation,
-            {spatial.v[3], spatial.v[4], spatial.v[5]});
-        v_surf = linear + omega.Cross(xi - pose.position);
-    } else if (best_owner.kind == nk::kNkSideRigid) {
-        const uint32_t b = best_owner.body;
-        const m::Vec3 com = nkops::BodyCenterOfMass(body_pose[b], body_inertial_frame[b]);
-        v_surf = body_lin_vel[b] + body_ang_vel[b].Cross(xi - com);
-    }
-    const m::Vec3 v_before = velocity[i];
-    m::Vec3 v_rel = v_before - v_surf;
-    const float vn = v_rel.Dot(best_n);
-    if (vn < 0.0f) {  // approaching the body surface: project + friction.
-        v_rel = v_rel - best_n * vn;            // tangential remainder.
-        const float vt_len = sqrtf(v_rel.LengthSq());
-        const float coulomb = body_mu * (-vn);
-        if (vt_len <= coulomb || vt_len < 1.0e-8f) {
-            v_rel = m::Vec3::Zero();            // sticks (static friction).
-        } else {
-            v_rel = v_rel * (1.0f - coulomb / vt_len);
-        }
-        const m::Vec3 v_after = v_surf + v_rel;
-        velocity[i] = v_after;
-        body_dp[i] = (v_after - v_before) * mi;
-        body_owner[i] = best_owner.body;
-    }
-}
-
-// Load reaction tiles cooperatively and accumulate in stable node order.
-// Free bodies receive impulses; link wrenches feed the articulation deposit.
-__global__ void MpmGridBodyReactKernel(
-    uint32_t total_bodies, uint32_t bodies_per_env, uint32_t total_nodes,
-    uint32_t nodes_per_env,
-    uint32_t dims_x, uint32_t dims_y, float dx, m::Vec3 origin,
-    uint32_t links_per_env, uint32_t artics_per_env,
-    const float* __restrict__ shape_table,
-    const m::Transform* __restrict__ body_pose,
-    const m::Transform* __restrict__ body_inertial_frame,
-    const m::Transform* __restrict__ link_pose,
-    const float* __restrict__ body_inv_mass,
-    const m::SymmetricMat3* __restrict__ body_world_inv_inertia,
-    const uint32_t* __restrict__ body_to_link,
-    const uint32_t* __restrict__ body_to_articulation,
-    const uint32_t* __restrict__ body_collidable_body,
-    const m::Vec3* __restrict__ body_dp,
-    const uint32_t* __restrict__ sorted_body_owner,
-    const uint32_t* __restrict__ sorted_node_id,
-    m::Vec3* __restrict__ body_lin_vel, m::Vec3* __restrict__ body_ang_vel,
-    m::Vec3* __restrict__ body_reaction, m::Vec3* __restrict__ body_ang_reaction) {
-    const uint32_t b = blockIdx.x;
-    if (b >= total_bodies) return;
-    const uint32_t env = b / bodies_per_env;
-    const uint32_t local_body = b % bodies_per_env;
-    const nkops::PrimShapeDev shape = nkops::LoadPrimShape(shape_table, local_body);
-    const nk::CollidableOwner owner = nk::ResolveCollidableOwner(
-        shape.body_id, env, local_body, bodies_per_env, links_per_env, artics_per_env,
-        body_to_link, body_to_articulation, body_collidable_body);
-    if (owner.kind == ~0u || owner.body != b) return;
-    const float im = body_inv_mass[b];
-    const bool is_link = owner.kind == nk::kNkSideArtic;
-    if (is_link && link_pose == nullptr) return;
-    const m::Vec3 xb = is_link ? link_pose[owner.link].position
-        : nkops::BodyCenterOfMass(body_pose[b], body_inertial_frame[b]);
-    const uint32_t base = env * nodes_per_env;
-    m::Vec3 dp_sum = m::Vec3::Zero();   // sum of node momentum changes this body caused.
-    m::Vec3 tq_sum = m::Vec3::Zero();   // sum of (x-xb) x dp.
-    __shared__ uint32_t range_begin, range_end;
-    __shared__ float3 linear_tile[kBlockSize], angular_tile[kBlockSize];
-    if (threadIdx.x == 0u) {
-        uint32_t lo = 0u, hi = total_nodes;
-        while (lo < hi) {
-            const uint32_t mid = lo + ((hi - lo) >> 1);
-            if (sorted_body_owner[mid] < b) lo = mid + 1u; else hi = mid;
-        }
-        range_begin = lo;
-        hi = total_nodes;
-        while (lo < hi) {
-            const uint32_t mid = lo + ((hi - lo) >> 1);
-            if (sorted_body_owner[mid] <= b) lo = mid + 1u; else hi = mid;
-        }
-        range_end = lo;
-    }
-    __syncthreads();
-    for (uint32_t start = range_begin; start < range_end;) {
-        const uint32_t count = min(blockDim.x, range_end - start);
-        if (threadIdx.x < count) {
-            const uint32_t node = sorted_node_id[start + threadIdx.x];
-            const uint32_t local = node - base;
-            const m::Vec3 dp = body_dp[node];
-            const int32_t nx = static_cast<int32_t>(local % dims_x);
-            const int32_t ny = static_cast<int32_t>((local / dims_x) % dims_y);
-            const int32_t nz = static_cast<int32_t>(local / (dims_x * dims_y));
-            const m::Vec3 xi{origin.x + nx * dx, origin.y + ny * dx, origin.z + nz * dx};
-            const m::Vec3 tq = (xi - xb).Cross(dp);
-            linear_tile[threadIdx.x] = make_float3(dp.x, dp.y, dp.z);
-            angular_tile[threadIdx.x] = make_float3(tq.x, tq.y, tq.z);
-        }
-        __syncthreads();
-        if (threadIdx.x == 0u) {
-            for (uint32_t i = 0u; i < count; ++i) {
-                const float3 dp = linear_tile[i], tq = angular_tile[i];
-                dp_sum.x = __fadd_rn(dp_sum.x, dp.x);
-                dp_sum.y = __fadd_rn(dp_sum.y, dp.y);
-                dp_sum.z = __fadd_rn(dp_sum.z, dp.z);
-                tq_sum.x = __fadd_rn(tq_sum.x, tq.x);
-                tq_sum.y = __fadd_rn(tq_sum.y, tq.y);
-                tq_sum.z = __fadd_rn(tq_sum.z, tq.z);
-            }
-        }
-        __syncthreads();
-        start += count;
-    }
-    if (threadIdx.x != 0u) return;
-    // Reaction = -dp (equal-and-opposite); dp is the per-substep momentum, so it
-    // IS the substep impulse (no dt scale).
-    const m::Vec3 lin_impulse = dp_sum * (-1.0f);
-    const m::Vec3 ang_impulse = tq_sum * (-1.0f);
-    if (owner.kind == nk::kNkSideRigid && im > 0.0f) {
-        body_lin_vel[b].x += lin_impulse.x * im;
-        body_lin_vel[b].y += lin_impulse.y * im;
-        body_lin_vel[b].z += lin_impulse.z * im;
-        if (body_ang_vel != nullptr && body_world_inv_inertia != nullptr) {
-            const m::Vec3 angular_response = body_world_inv_inertia[b].Multiply(ang_impulse);
-            body_ang_vel[b].x += angular_response.x;
-            body_ang_vel[b].y += angular_response.y;
-            body_ang_vel[b].z += angular_response.z;
-        }
-    }
-    if (body_reaction != nullptr) {  // accumulate the linear impulse (balance probe).
-        body_reaction[b].x += lin_impulse.x;
-        body_reaction[b].y += lin_impulse.y;
-        body_reaction[b].z += lin_impulse.z;
-    }
-    // Static reactions remain observable as external impulse; link torques feed J^T.
-    if (body_ang_reaction != nullptr) {
-        body_ang_reaction[b].x += ang_impulse.x;
-        body_ang_reaction[b].y += ang_impulse.y;
-        body_ang_reaction[b].z += ang_impulse.z;
-    }
-}
-
-// One thread gathers owned link wrenches in body order and applies M^-1 J^T.
-// Each articulation tile has a single writer.
-__global__ void MpmArticReactDepositKernel(
-    nkops::ArticulationDeviceState state, uint32_t artic_count, uint32_t artics_per_env,
-    uint32_t bodies_per_env, uint32_t base_link_count, uint32_t max_dof,
-    const uint32_t* __restrict__ body_to_link,
-    const m::Vec3* __restrict__ body_reaction,
-    const m::Vec3* __restrict__ body_ang_reaction,
-    const float* __restrict__ m_inv, float* __restrict__ qdot_flat) {
-    const uint32_t ag = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ag >= artic_count) return;
-    if (max_dof == 0u || max_dof > nkops::kMaxArticulationDof) return;
-    const uint32_t ape = (artics_per_env == 0u) ? 1u : artics_per_env;
-    const uint32_t env = ag / ape;
-    float g[nkops::kMaxArticulationDof];
-    for (uint32_t k = 0u; k < max_dof; ++k) g[k] = 0.0f;
-    // Sum each owned link's J^T wrench. Ascending body row -> deterministic g.
-    const uint32_t row0 = env * bodies_per_env;
-    for (uint32_t lb = 0u; lb < bodies_per_env; ++lb) {
-        const uint32_t b = row0 + lb;
-        const uint32_t tmpl_link = body_to_link[b];
-        if (tmpl_link >= base_link_count) continue;
-        const uint32_t gl_link = env * base_link_count + tmpl_link;
-        if (gl_link >= state.total_link_count) continue;
-        // Derive offset from the link's OWN articulation (the assemble_rows.cu
-        // reference), then skip if it is not this thread's tile -> race-free.
-        const uint32_t articulation = state.link_to_articulation[gl_link];
-        if (articulation != ag) continue;
-        const m::Vec3 f = body_reaction[b];
-        const m::Vec3 tau = body_ang_reaction[b];
-        if (f.x == 0.0f && f.y == 0.0f && f.z == 0.0f &&
-            tau.x == 0.0f && tau.y == 0.0f && tau.z == 0.0f) continue;
-        const uint32_t offset = state.articulation_link_offset[articulation];
-        const m::Vec3 point = state.link_pose[gl_link].position;
-        // Bounded root-walk: a chain is at most total_link_count deep, and every link
-        // is range-checked, so a malformed parent map can never spin the GPU.
-        uint32_t link = gl_link;
-        for (uint32_t depth = 0u; link != ~0u && depth < state.total_link_count; ++depth) {
-            if (link >= state.total_link_count) break;
-            if (nkops::JointDofCountDevice(state.joint_type[link]) != 0u) {
-                const uint32_t dof_index =
-                    nkops::LocalDofIndexDevice(state, offset, link);
-                nkops::AccumulateChainJointForce(state, articulation, link, dof_index,
-                                                 max_dof, point, f, tau, g);
-            }
-            const uint32_t parent_local = state.parent_link[link];
-            link = (parent_local == ~0u) ? ~0u : (offset + parent_local);
-        }
-    }
-    // delta-qdot = M^-1 g (ascending c, plain +=); seed the per-artic flat tile.
-    const size_t tile = static_cast<size_t>(ag) * max_dof * max_dof;
-    for (uint32_t r = 0u; r < max_dof; ++r) {
-        const float* Minv = m_inv + tile + static_cast<size_t>(r) * max_dof;
-        float acc = 0.0f;
-        for (uint32_t c = 0u; c < max_dof; ++c) acc += Minv[c] * g[c];
-        qdot_flat[static_cast<size_t>(ag) * max_dof + r] += acc;
-    }
-}
-
-// G2P recovers v_p and the MLS affine fit C_p, then advects x_p by dt*v_p.
-// particle_vel owns the resulting MPM velocity without a row-finalize increment.
 __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
                                    uint32_t particles_per_env, uint32_t mpm_per_env,
                                    uint32_t nodes_per_env,
@@ -1404,7 +1117,7 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
     if constexpr (operation == MpmOperation::Predict) {
         launch(MpmStage::GridPrepare, MpmGridPrepareKernel, nblocks,
                total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
-               data.grid_body_dp, data.grid_body_owner, scratch.active_flags,
+               data.grid_inv_mass, data.grid_contact_count, scratch.active_flags,
                scratch.cell_start, scratch.node_ids);
         launch(MpmStage::CellKeys, MpmCellKeysKernel, pblocks,
                mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
@@ -1446,53 +1159,36 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
                p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx, dt_sub, origin,
                scratch.cell_transfers);
         const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
-        const m::Vec3 pn{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
         launch(MpmStage::GridFinalize, MpmGridFinalizeKernel, finalize_blocks,
                total_nodes, scratch.active_nodes, scratch.active_count,
                scratch.cell_transfers, scratch.cell_start, mpm_count,
                p.nodes_per_env, cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
-               p.dx, origin, g, dt_sub, pn, p.plane_d, p.plane_mu,
-               data.grid_mass, data.grid_momentum, data.grid_velocity);
+               p.dx, origin, g, dt_sub,
+               data.grid_mass, data.grid_momentum, data.grid_velocity, data.grid_inv_mass);
         if (error != cudaSuccess) return error;
     }
     if constexpr (operation == MpmOperation::Exchange) {
-        if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u && p.bodies_per_env > 0u) {
-            const uint32_t total_bodies = p.bodies_per_env * p.env_count;
-            launch(MpmStage::BodyProject, MpmGridBodyProjectKernel, nblocks,
-                   total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-                   p.bodies_per_env, p.body_mu, p.body_band,
-                   p.base_link_count, p.artics_per_env,
-                   nkops::MakeSurfaceQueryView(model, p.bodies_per_env, p.mesh_geometry,
-                                               p.sdf_grid_count, p.sdf_cell_total),
-                   scratch.active_nodes, scratch.active_count,
-                   data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
-                   data.body_angular_velocity, data.link_pose,
-                   reinterpret_cast<const nkops::LinkSpatialVel*>(data.link_velocity),
-                   model.body_to_link, model.body_to_articulation, model.body_collidable_body,
-                   model.shape_table, data.grid_mass, data.grid_velocity,
-                   data.grid_body_dp, data.grid_body_owner, data.env_status);
-            if (error != cudaSuccess) return error;
-            size_t temp_bytes = scratch.sort_temp_bytes;
-            profiler.Start(MpmStage::BodySort, stream);
-            error = cub::DeviceRadixSort::SortPairs(
-                scratch.sort_temp, temp_bytes, data.grid_body_owner,
-                scratch.keys_out, scratch.node_ids, scratch.idx_out, static_cast<int>(total_nodes), 0,
-                RadixBitsInclusive(total_bodies), stream);
-            profiler.Stop(MpmStage::BodySort, stream);
-            if (error != cudaSuccess) return error;
-            launch(MpmStage::BodyReact, MpmGridBodyReactKernel, total_bodies,
-                   total_bodies, p.bodies_per_env, total_nodes, p.nodes_per_env,
-                   p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-                   p.base_link_count, p.artics_per_env, model.shape_table,
-                   data.body_pose, data.body_inertial_frame, data.link_pose,
-                   data.body_inv_mass, data.body_world_inv_inertia,
-                   model.body_to_link, model.body_to_articulation, model.body_collidable_body,
-                   data.grid_body_dp, scratch.keys_out, scratch.idx_out,
-                   data.body_linear_velocity, data.body_angular_velocity,
-                   data.mpm_body_reaction, data.mpm_body_ang_reaction);
-        }
+        const auto surfaces = nkops::MakeSurfaceQueryView(model, p.bodies_per_env,
+            p.mesh_geometry, p.sdf_grid_count, p.sdf_cell_total);
+        const uint32_t contact_blocks = (p.env_count * p.contact_capacity + kBlockSize - 1u) / kBlockSize;
+        launch(MpmStage::ContactCount, mpm_contact::ClearSlots, contact_blocks, p, data);
+        launch(MpmStage::ContactCount, mpm_contact::Generate<false>, nblocks,
+               p, model, data, surfaces, scratch.active_nodes, scratch.active_count);
+        if (error != cudaSuccess) return error;
+        size_t temp_bytes = scratch.sort_temp_bytes;
+        profiler.Start(MpmStage::ContactScan, stream);
+        error = cub::DeviceScan::ExclusiveSum(scratch.sort_temp, temp_bytes,
+            data.grid_contact_count, data.grid_contact_offset, static_cast<int>(total_nodes), stream);
+        profiler.Stop(MpmStage::ContactScan, stream);
+        if (error != cudaSuccess) return error;
+        launch(MpmStage::ContactEmit, mpm_contact::CountDiagnostics,
+               (p.env_count + kBlockSize - 1u) / kBlockSize, p, data);
+        launch(MpmStage::ContactEmit, mpm_contact::Generate<true>, nblocks,
+               p, model, data, surfaces, scratch.active_nodes, scratch.active_count);
     }
     if constexpr (operation == MpmOperation::Commit) {
+        launch(MpmStage::ReactionReadout, mpm_contact::ReadReactions<kBlockSize>,
+               p.env_count * (p.bodies_per_env + nk::kMpmBoundaryCount), p, model, data);
         launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
                mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
                p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
@@ -1521,6 +1217,13 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
         p->grid_dims[0] == 0u || p->grid_dims[1] == 0u || p->grid_dims[2] == 0u ||
         p->substeps > 1u)
         return Status::InvalidArgument;
+    if (p->contact_capacity == 0u || p->contact_slot_base < p->full_row_slot_count ||
+        uint64_t{p->contact_slot_base} + p->contact_capacity > p->contact_slots_per_env ||
+        uint64_t{p->contact_slots_per_env} * p->env_count > INT_MAX ||
+        !data.ucontact_law || !data.ucontact_friction || !data.grid_contact_attempted ||
+        !data.grid_contact_retained || !data.grid_contact_peak || !data.grid_contact_overflow ||
+        !data.mpm_boundary_impulse || !data.mpm_boundary_moment)
+        return Status::InvalidArgument;
     const uint64_t total_nodes64 =
         static_cast<uint64_t>(p->nodes_per_env) * p->env_count;
     const uint64_t grid_xy = static_cast<uint64_t>(p->grid_dims[0]) * p->grid_dims[1];
@@ -1540,7 +1243,8 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
     if (!data.particle_pos || !data.particle_vel || !data.particle_inv_mass ||
         !data.particle_C || !data.particle_F || !data.particle_vol0 ||
         !data.grid_mass || !data.grid_momentum || !data.grid_velocity ||
-        !data.grid_body_dp || !data.grid_body_owner || !data.mpm_sort_scratch ||
+        !data.grid_inv_mass || !data.grid_contact_count || !data.grid_contact_offset ||
+        !data.mpm_sort_scratch ||
         !data.mpm_grid_cell_key || !data.mpm_grid_part_idx || !data.mpm_particle_stress ||
         !data.env_status || (p->material_count > 0u && !data.mpm_material_table))
         return Status::InvalidArgument;
@@ -1597,25 +1301,6 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
     if (LaunchMpmStage<operation>(*p, model, data, scratch, dt_sub, Ppe, mpm_pe, mpm_count, cpe,
                       total_nodes, finalize_blocks, cell_blocks, inv_dx, origin, stream) != cudaSuccess)
         return Status::Failed;
-    if constexpr (operation == MpmOperation::Exchange) {
-        // The shared solve commits this impulse before the next physics interval.
-        if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
-            p->bodies_per_env > 0u && p->artic_count > 0u && p->max_dof > 0u &&
-            data.mpm_body_ang_reaction != nullptr && data.qdot_flat != nullptr &&
-            data.m_inv != nullptr) {
-            const uint32_t total_links = p->base_link_count * p->env_count;
-            const nkops::ArticulationDeviceState state =
-                nkops::MakeArticulationDeviceState(model, data, total_links, p->artic_count);
-            const uint32_t ablocks = (p->artic_count + kBlockSize - 1u) / kBlockSize;
-            profiler.Start(MpmStage::ArticDeposit, stream);
-            LaunchCuda(MpmArticReactDepositKernel, dim3(ablocks), dim3(kBlockSize), 0u,
-                       stream, state, p->artic_count, p->artics_per_env, p->bodies_per_env,
-                       p->base_link_count, p->max_dof, model.body_to_link,
-                       data.mpm_body_reaction, data.mpm_body_ang_reaction, data.m_inv,
-                       data.qdot_flat);
-            profiler.Stop(MpmStage::ArticDeposit, stream);
-        }
-    }
     if (cudaPeekAtLastError() != cudaSuccess) return Status::Failed;
     if constexpr (operation == MpmOperation::Commit) {
         // Eager completion exposes asynchronous faults once per physical interval.

@@ -1,19 +1,5 @@
-// ---------------------------------------------------------------------------
-// Two-way rigid <-> MLS-MPM coupling gate: a free rigid box rests on an MPM bed.
-//
-// The MPM medium (sim_method=mlsmpm through the config selector, DATA not a demo
-// branch) couples to the dynamic body through the env-private grid: the body's
-// SDF is rasterized onto the grid, the node velocity is projected onto the body
-// surface velocity, and the equal-and-opposite reaction is deposited into the
-// SAME body-side sink the row path writes. Asserts:
-//   * the per-substep grid->body reaction summed over a step balances gravity
-//     (Sigma reaction.z ~= m*g*dt) and the box is held up (read from the per-body
-//     diagnostic mpm_body_reaction, NOT ReadoutContactWrench which sums rows);
-//   * the free-fall BITE (disable ONLY the dynamic-body BC; the static-plane BC
-//     stays on so the medium still rests on the floor) drops the box at ~g and the
-//     reaction is ~0;
-//   * two runs are byte-identical (the deterministic per-body gather).
-// ---------------------------------------------------------------------------
+// Grid and rigid endpoints share finite-mass contact rows.
+// Complete world steps check momentum, reaction balance and contact convergence.
 
 #include <gtest/gtest.h>
 
@@ -223,7 +209,151 @@ nk::Model BuildModel(bool bite, float box_x = 0.0f) {
     return m;
 }
 
+nk::Model FiniteMassImpact(float mass, uint32_t owners, uint32_t capacity) {
+    nk::Model model;
+    auto& cap = model.capacities;
+    cap.bodies_per_env = cap.max_bodies_total = owners;
+    cap.max_contacts_per_env = owners * 4u;
+    cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    for (uint32_t i = 0u; i < owners; ++i) {
+        nk::Model::BodyInit body;
+        body.pose = Transform::Identity();
+        body.pose.position = {-2.025f, 0.0f, 0.0f};
+        body.inv_mass = 1.0f / mass;
+        body.inv_inertia = Vec3{1.0f, 1.0f, 1.0f} * (3.0f / (8.0f * mass));
+        model.body_init.push_back(body);
+        nk::Model::PairDrivenShape shape;
+        shape.kind = kKindBox;
+        shape.body_id = static_cast<int32_t>(i);
+        shape.params[0] = shape.params[1] = shape.params[2] = 2.0f;
+        shape.contype = 1u;
+        shape.conaffinity = 0u;
+        model.shape_table_rows.push_back(shape);
+    }
+    cook::MpmCookInput input;
+    input.positions = {{0.0f, 0.0f, 0.0f}};
+    input.velocities = {{-1.0f, 0.0f, 0.0f}};
+    input.inv_mass = {1.0f};
+    input.vol0 = {0.001f};
+    input.material.youngs = 1000.0f;
+    input.material.poisson = 0.3f;
+    input.material.density = 1000.0f;
+    input.grid_origin = {-0.3f, -0.3f, -0.3f};
+    input.grid_dims[0] = input.grid_dims[1] = input.grid_dims[2] = 7u;
+    input.dx = 0.1f;
+    input.floor_d = -10.0f;
+    input.floor_friction = 0.0f;
+    input.contact_capacity = capacity;
+    cook::CookMpmParticles(model, 1u, input);
+    model.particles.mpm_body_friction = 0.0f;
+    return model;
+}
+
+template <class T>
+std::vector<T> ReadValues(nk::World& world, nk::FieldId field) {
+    const size_t bytes = world.GetModel().capacities.ElementCount(field) * nk::LayoutOf(field).elem_size;
+    std::vector<T> values(bytes / sizeof(T));
+    EXPECT_TRUE(world.GetData().DownloadField(field, values.data(), bytes));
+    return values;
+}
+
 }  // namespace
+
+TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (const float ratio : {1.0f, 10.0f, 100.0f, 1000.0f}) {
+        for (const uint32_t owners : {1u, 2u}) {
+            for (const float dt : {0.0001f, 0.0002f}) {
+                SCOPED_TRACE(::testing::Message() << "mass=" << ratio << " owners=" << owners << " dt=" << dt);
+                auto config = Cfg();
+                config.dt = dt;
+                config.gravity[2] = 0.0f;
+                config.vel_iters = 4096u;
+                config.pos_iters = 3u;
+                nk::World world(FiniteMassImpact(ratio, owners, 2u * nk::kMpmStencilNodes),
+                                1u, backend.dev, backend.backend, config);
+                ASSERT_TRUE(world.Ready()) << world.CreationError();
+                ASSERT_TRUE(world.Step().AllOk());
+                const auto& cap = world.GetModel().capacities;
+                const auto mass = ReadValues<float>(world, nk::FieldId::GridMass);
+                const auto grid = ReadValues<Vec3>(world, nk::FieldId::GridVelocity);
+                const auto rigid = ReadValues<Vec3>(world, nk::FieldId::BodyLinearVelocity);
+                const auto angular = ReadValues<Vec3>(world, nk::FieldId::BodyAngularVelocity);
+                const auto particles = ReadValues<Vec3>(world, nk::FieldId::ParticleVel);
+                const auto reaction = ReadValues<Vec3>(world, nk::FieldId::MpmBodyReaction);
+                const auto rows = ReadValues<nk::NkRow>(world, nk::FieldId::Urows);
+                const auto impulses = ReadValues<float>(world, nk::FieldId::Lambda);
+                const auto pseudo = ReadValues<float>(world, nk::FieldId::RowPseudoLambda);
+                const auto attempted = ReadValues<uint64_t>(world, nk::FieldId::GridContactAttempted);
+                const auto retained = ReadValues<uint32_t>(world, nk::FieldId::GridContactRetained);
+                ASSERT_EQ(attempted.size(), 1u);
+                EXPECT_GT(attempted[0], 0u);
+                EXPECT_EQ(attempted[0], retained[0]);
+                EXPECT_EQ(ReadValues<uint64_t>(world, nk::FieldId::GridContactOverflow)[0], 0u);
+                EXPECT_EQ(ReadValues<uint32_t>(world, nk::FieldId::EnvStatus)[0], 0u);
+                std::vector<bool> touched(mass.size());
+                double residual = 0.0;
+                uint32_t contacts = 0u;
+                for (uint32_t r = 0u; r < rows.size(); ++r) {
+                    const auto& row = rows[r];
+                    if (!(row.flags & nk::nk_row_flags::kContactNormal) || row.a.kind != nk::kNkSideGrid) continue;
+                    EXPECT_EQ(row.b.kind, nk::kNkSideRigid);
+                    EXPECT_NE(row.flags & nk::nk_row_flags::kVelocityOnly, 0u);
+                    EXPECT_FLOAT_EQ(pseudo[r], 0.0f);
+                    touched[row.a.index] = true;
+                    const double velocity = row.a.jlin.Dot(grid[row.a.index]) +
+                        row.b.jlin.Dot(rigid[row.b.index]) + row.b.jang.Dot(angular[row.b.index]);
+                    residual = std::max(residual, impulses[r] > 1.0e-9f ? std::fabs(velocity) : std::max(-velocity, 0.0));
+                    ++contacts;
+                }
+                EXPECT_EQ(contacts, retained[0]);
+                std::printf("[finite-mass] mass=%g owners=%u dt=%g iterations=%u residual=%.9e contacts=%u\n",
+                            ratio, owners, dt, config.vel_iters, residual, contacts);
+                EXPECT_LT(residual, 2.0e-5);
+                double coupled_mass = 0.0, grid_px = 0.0, grid_energy = 0.0;
+                Vec3 momentum{}, moment{};
+                for (uint32_t n = 0u; n < mass.size(); ++n) {
+                    if (touched[n]) coupled_mass += mass[n];
+                    grid_px += mass[n] * grid[n].x;
+                    grid_energy += 0.5 * mass[n] * grid[n].LengthSq();
+                    const Vec3 position{-0.3f + (n % 7u) * 0.1f,
+                        -0.3f + ((n / 7u) % 7u) * 0.1f, -0.3f + (n / 49u) * 0.1f};
+                    momentum += grid[n] * mass[n];
+                    moment += position.Cross(grid[n] * mass[n]);
+                }
+                const double common = -coupled_mass / (coupled_mass + ratio * owners);
+                double particle_px = particles[0].x;
+                for (uint32_t b = 0u; b < owners; ++b) {
+                    EXPECT_NEAR(rigid[b].x, common, 2.0e-5);
+                    EXPECT_LT(angular[b].Length(), 2.0e-5f);
+                    EXPECT_LT((reaction[b] - rigid[b] * ratio).Length(), 2.0e-5f);
+                    momentum += rigid[b] * ratio;
+                    moment += Vec3{-2.025f, 0.0f, 0.0f}.Cross(rigid[b] * ratio) + angular[b] * (8.0f * ratio / 3.0f);
+                    grid_px += ratio * rigid[b].x;
+                    particle_px += ratio * rigid[b].x;
+                    grid_energy += 0.5 * ratio * rigid[b].LengthSq() + (4.0 / 3.0) * ratio * angular[b].LengthSq();
+                }
+                EXPECT_NEAR(grid_px, -1.0, 2.0e-5);
+                EXPECT_NEAR(particle_px, -1.0, 2.0e-5);
+                EXPECT_LT((momentum - Vec3{-1.0f, 0.0f, 0.0f}).Length(), 2.0e-5f);
+                EXPECT_LT(moment.Length(), 2.0e-5f);
+                EXPECT_LE(grid_energy, 0.5 + 1.0e-6);
+                EXPECT_EQ(ReadValues<uint64_t>(world, nk::FieldId::GridContactPeak)[0], attempted[0]);
+                ASSERT_EQ(world.Reset({0u}), nphi::Status::Ok);
+                EXPECT_EQ(ReadValues<uint64_t>(world, nk::FieldId::GridContactPeak)[0], 0u);
+            }
+        }
+    }
+    nk::World limited(FiniteMassImpact(1.0f, 2u, 1u), 1u, backend.dev, backend.backend, Cfg());
+    ASSERT_TRUE(limited.Ready());
+    ASSERT_TRUE(limited.Step().AllOk());
+    const auto attempted = ReadValues<uint64_t>(limited, nk::FieldId::GridContactAttempted)[0];
+    EXPECT_GT(attempted, 1u);
+    EXPECT_EQ(ReadValues<uint32_t>(limited, nk::FieldId::GridContactRetained)[0], 1u);
+    EXPECT_EQ(ReadValues<uint64_t>(limited, nk::FieldId::GridContactOverflow)[0], attempted - 1u);
+    EXPECT_NE(ReadValues<uint32_t>(limited, nk::FieldId::EnvStatus)[0] & nphi::kEnvStatusGridContactOverflow, 0u);
+}
 
 // Gate (c): the per-substep grid->body reaction summed over a step balances
 // gravity and the box is held up (no sink-through, finite).

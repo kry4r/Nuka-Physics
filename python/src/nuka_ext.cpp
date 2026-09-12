@@ -1053,17 +1053,18 @@ FloatArray make_array_from_view(const nuka_buffer_view_t& view, uint32_t ec,
 // sizeof(uint32). owner keeps the engine buffer alive. Falls back to flat 1D if
 // the per-env divisibility does not hold (it always does for go2: slot_count ==
 // env_count * kMaxFootContactsPerEnv).
-Uint32Array make_uint32_view(const nuka_buffer_view_t& view, uint32_t ec,
-                             nb::handle owner) {
+template <typename T>
+nb::ndarray<nb::pytorch, T> make_unsigned_view(const nuka_buffer_view_t& view, uint32_t ec,
+                                              nb::handle owner) {
     const int dev_id = 0;
     if (ec > 0u && view.element_count % ec == 0u) {
         size_t shape[2] = {ec, view.element_count / ec};
-        return Uint32Array(view.device_ptr, 2, shape, owner, nullptr,
-                           nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
+        return nb::ndarray<nb::pytorch, T>(view.device_ptr, 2, shape, owner, nullptr,
+                           nb::dtype<T>(), nb::device::cuda::value, dev_id);
     }
     size_t shape[1] = {view.element_count};
-    return Uint32Array(view.device_ptr, 1, shape, owner, nullptr,
-                       nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
+    return nb::ndarray<nb::pytorch, T>(view.device_ptr, 1, shape, owner, nullptr,
+                       nb::dtype<T>(), nb::device::cuda::value, dev_id);
 }
 
 // Shape a batched-sensor AOV plane zero-copy: ch = element_count / (E*S*H*W) (3
@@ -1470,7 +1471,8 @@ public:
                    const std::vector<float>& cable_slab_half_extents,
                    float cable_slab_mass, float cable_slab_stiffness,
                    uint32_t cable_slab_render_material_id,
-                   float mpm_yield_stress, float mpm_hardening_modulus) {
+                   float mpm_yield_stress, float mpm_hardening_modulus,
+                   uint32_t mpm_contact_capacity) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1554,6 +1556,9 @@ public:
                                    mpm_yield_stress != 0.0f || mpm_hardening_modulus != 0.0f;
         check(nuka_scene_add_media_ex(h_, &d, has_plasticity ? &plasticity : nullptr, &media_id),
               "nuka_scene_add_media_ex");
+        if (mpm_contact_capacity != 0u)
+            check(nuka_scene_set_mpm_contact_capacity(h_, media_id, mpm_contact_capacity),
+                  "nuka_scene_set_mpm_contact_capacity");
         return media_id;
     }
 
@@ -1846,6 +1851,14 @@ NB_MODULE(_nuka_ext, m) {
         .value("PARTICLE_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT)
         .value("PARTICLE_PLASTIC_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT)
         .value("PARTICLE_EQUIVALENT_PLASTIC_STRAIN", NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN)
+        .value("GRID_CONTACT_ATTEMPTED", NUKA_FIELD_GRID_CONTACT_ATTEMPTED)
+        .value("GRID_CONTACT_RETAINED", NUKA_FIELD_GRID_CONTACT_RETAINED)
+        .value("GRID_CONTACT_PEAK", NUKA_FIELD_GRID_CONTACT_PEAK)
+        .value("GRID_CONTACT_OVERFLOW", NUKA_FIELD_GRID_CONTACT_OVERFLOW)
+        .value("MPM_BODY_IMPULSE", NUKA_FIELD_MPM_BODY_IMPULSE)
+        .value("MPM_BODY_ANGULAR_IMPULSE", NUKA_FIELD_MPM_BODY_ANGULAR_IMPULSE)
+        .value("MPM_BOUNDARY_IMPULSE", NUKA_FIELD_MPM_BOUNDARY_IMPULSE)
+        .value("MPM_BOUNDARY_ANGULAR_IMPULSE", NUKA_FIELD_MPM_BOUNDARY_ANGULAR_IMPULSE)
         .export_values();
 
     nb::enum_<nuka_gyro_status_t>(m, "GyroStatus")
@@ -1854,6 +1867,7 @@ NB_MODULE(_nuka_ext, m) {
         .value("INVALID_INPUT", NUKA_GYRO_INVALID_INPUT);
     m.attr("ENV_STATUS_GYRO_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_GYRO_FAILURE);
     m.attr("ENV_STATUS_CONSTITUTIVE_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE);
+    m.attr("ENV_STATUS_GRID_CONTACT_OVERFLOW") = static_cast<uint32_t>(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW);
     m.attr("ENV_STATUS_INVALID_ENDPOINT") = static_cast<uint32_t>(NUKA_ENV_STATUS_INVALID_ENDPOINT);
     m.attr("ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE") =
         static_cast<uint32_t>(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE);
@@ -1862,7 +1876,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("RIGID", NUKA_CONTACT_SIDE_RIGID)
         .value("LINK", NUKA_CONTACT_SIDE_LINK)
         .value("PARTICLE", NUKA_CONTACT_SIDE_PARTICLE)
-        .value("STATIC", NUKA_CONTACT_SIDE_STATIC);
+        .value("STATIC", NUKA_CONTACT_SIDE_STATIC)
+        .value("GRID", NUKA_CONTACT_SIDE_GRID);
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
     // = (N,H,W,3) float32, DEPTH = (N,H,W,1) float32, PRIM = (N,H,W,1) uint32. RANGE
@@ -2151,10 +2166,11 @@ NB_MODULE(_nuka_ext, m) {
             [](World& w, nuka_state_field_t field, size_t offset,
                size_t count) -> nb::object {
                 nuka_buffer_view_t view = w.get_view(field);
-                const size_t fpe = (view.element_stride_bytes >= sizeof(float))
-                                       ? (view.element_stride_bytes / sizeof(float))
+                const size_t scalar_bytes = view.dtype == 2u ? sizeof(uint64_t) : sizeof(float);
+                const size_t fpe = (view.element_stride_bytes >= scalar_bytes)
+                                       ? (view.element_stride_bytes / scalar_bytes)
                                        : 1u;
-                const size_t total = view.element_count * fpe;  // 4-byte scalars.
+                const size_t total = view.element_count * fpe;
                 if (offset > total) {
                     throw std::runtime_error("download_field: offset beyond field");
                 }
@@ -2163,6 +2179,14 @@ NB_MODULE(_nuka_ext, m) {
                     throw std::runtime_error("download_field: range exceeds field");
                 }
                 size_t shape[1] = {n};
+                if (view.dtype == 2u) {
+                    uint64_t* buf = new uint64_t[n ? n : 1u];
+                    check(nuka_world_download_field(w.raw(), field, buf, n * sizeof(uint64_t),
+                                                    offset * sizeof(uint64_t)),
+                          "nuka_world_download_field");
+                    nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<uint64_t*>(p); });
+                    return nb::cast(nb::ndarray<nb::numpy, uint64_t>(buf, 1, shape, owner));
+                }
                 if (view.dtype == 1u) {
                     uint32_t* buf = new uint32_t[n ? n : 1u];
                     check(nuka_world_download_field(w.raw(), field, buf, n * 4u,
@@ -2345,8 +2369,10 @@ NB_MODULE(_nuka_ext, m) {
                 // aliasing the engine buffer (float32 or uint32 respectively).
                 nuka_buffer_view_t view = w->get_view(field);
                 if (view.dtype == 1u) {
-                    return nb::cast(make_uint32_view(view, w->env_count(), self));
+                    return nb::cast(make_unsigned_view<uint32_t>(view, w->env_count(), self));
                 }
+                if (view.dtype == 2u)
+                    return nb::cast(make_unsigned_view<uint64_t>(view, w->env_count(), self));
                 return nb::cast(make_array_from_view(
                     view, w->env_count(), w->base_link_count(), self));
             },
@@ -2880,6 +2906,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("cable_slab_stiffness") = 0.0f,
              nb::arg("cable_slab_render_material_id") = uint32_t{0xFFFFFFFFu},
              nb::arg("mpm_yield_stress") = 0.0f, nb::arg("mpm_hardening_modulus") = 0.0f,
+             nb::arg("mpm_contact_capacity") = 0u,
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
              "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "

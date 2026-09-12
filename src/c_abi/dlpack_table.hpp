@@ -37,6 +37,8 @@ static_assert(NUKA_CONTACT_SIDE_RIGID == nk::kNkSideRigid);
 static_assert(NUKA_CONTACT_SIDE_LINK == nk::kNkSideArtic);
 static_assert(NUKA_CONTACT_SIDE_PARTICLE == nk::kNkSideParticle);
 static_assert(NUKA_CONTACT_SIDE_STATIC == nk::kNkSideStatic);
+static_assert(NUKA_CONTACT_SIDE_GRID == nk::kNkSideGrid);
+static_assert(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW == phi::kEnvStatusGridContactOverflow);
 static_assert(NUKA_ENV_STATUS_GYRO_FAILURE == phi::kEnvStatusGyroFailure);
 static_assert(NUKA_ENV_STATUS_INVALID_ENDPOINT == phi::kEnvStatusInvalidEndpoint);
 static_assert(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE == phi::kEnvStatusContactGeometryUnavailable);
@@ -49,6 +51,7 @@ static_assert(NUKA_GYRO_INVALID_INPUT == phi::kBodyGyroInvalidInput);
 // confuse them with nk::DlpackDtype (the codegen-side scalar code enum).
 inline constexpr uint8_t kWireDtypeF32 = 0u;
 inline constexpr uint8_t kWireDtypeU32 = 1u;
+inline constexpr uint8_t kWireDtypeU64 = 2u;
 
 // Sentinel for a public field that has NO corresponding fields.yaml ordinal
 // (the control-input params buffers — TORQUE_INPUT / VELOCITY_TARGET /
@@ -179,14 +182,22 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticleF},
     {NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticlePlasticF},
     {NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN, kStrideF32, kWireDtypeF32, nk::FieldId::ParticlePlastic},
+    {NUKA_FIELD_GRID_CONTACT_ATTEMPTED, sizeof(uint64_t), kWireDtypeU64, nk::FieldId::GridContactAttempted},
+    {NUKA_FIELD_GRID_CONTACT_RETAINED, kStrideU32, kWireDtypeU32, nk::FieldId::GridContactRetained},
+    {NUKA_FIELD_GRID_CONTACT_PEAK, sizeof(uint64_t), kWireDtypeU64, nk::FieldId::GridContactPeak},
+    {NUKA_FIELD_GRID_CONTACT_OVERFLOW, sizeof(uint64_t), kWireDtypeU64, nk::FieldId::GridContactOverflow},
+    {NUKA_FIELD_MPM_BODY_IMPULSE, kStrideVec3, kWireDtypeF32, nk::FieldId::MpmBodyReaction},
+    {NUKA_FIELD_MPM_BODY_ANGULAR_IMPULSE, kStrideVec3, kWireDtypeF32, nk::FieldId::MpmBodyAngReaction},
+    {NUKA_FIELD_MPM_BOUNDARY_IMPULSE, kStrideVec3, kWireDtypeF32, nk::FieldId::MpmBoundaryImpulse},
+    {NUKA_FIELD_MPM_BOUNDARY_ANGULAR_IMPULSE, kStrideVec3, kWireDtypeF32, nk::FieldId::MpmBoundaryMoment},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 48u,
-              "dlpack_table must hold exactly the 48 public state fields");
+static_assert(kDlpackFieldCount == 56u,
+              "dlpack_table must hold exactly the 56 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

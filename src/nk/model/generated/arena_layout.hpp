@@ -346,6 +346,21 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 2, 1, 8, 0},  // step_joint_limit_impulse
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // particle_plastic_F
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 9, 1, 36, 0},  // snapshot_particle_plastic_F
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_inv_mass
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // cc_grid_first
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 8, 0},  // grid_contact_count
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 8, 0},  // grid_contact_offset
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // ucontact_law
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // ucontact_friction
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // grid_contact_attempted
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // grid_contact_retained
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // grid_contact_peak
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // grid_contact_overflow
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // mpm_boundary_impulse
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // mpm_boundary_moment
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // step_mpm_boundary_impulse
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // step_mpm_boundary_moment
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // solver_velocity_scratch
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

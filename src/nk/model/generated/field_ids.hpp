@@ -307,6 +307,21 @@ enum class FieldId : uint16_t {
     StepJointLimitImpulse,  // step_joint_limit_impulse (per:link arena:scratch owner:data elem:2)
     ParticlePlasticF,  // particle_plastic_F (per:particle arena:persistent owner:data elem:9)
     SnapshotParticlePlasticF,  // snapshot_particle_plastic_F (per:particle arena:persistent owner:data elem:9)
+    GridInvMass,  // grid_inv_mass (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    CcGridFirst,  // cc_grid_first (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    GridContactCount,  // grid_contact_count (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    GridContactOffset,  // grid_contact_offset (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    UcontactLaw,  // ucontact_law (per:contact_slot arena:scratch owner:data)
+    UcontactFriction,  // ucontact_friction (per:contact_slot arena:scratch owner:data)
+    GridContactAttempted,  // grid_contact_attempted (per:env arena:scratch owner:data flags:[readout])
+    GridContactRetained,  // grid_contact_retained (per:env arena:scratch owner:data flags:[readout])
+    GridContactPeak,  // grid_contact_peak (per:env arena:persistent owner:data flags:[readout])
+    GridContactOverflow,  // grid_contact_overflow (per:env arena:scratch owner:data flags:[readout])
+    MpmBoundaryImpulse,  // mpm_boundary_impulse (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count flags:[readout])
+    MpmBoundaryMoment,  // mpm_boundary_moment (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count flags:[readout])
+    StepMpmBoundaryImpulse,  // step_mpm_boundary_impulse (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count)
+    StepMpmBoundaryMoment,  // step_mpm_boundary_moment (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count)
+    SolverVelocityScratch,  // solver_velocity_scratch (per:scalar arena:scratch owner:data count:solver_velocity_scratch_bytes)
     Count
 };
 
@@ -609,6 +624,21 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "step_joint_limit_impulse",
     "particle_plastic_F",
     "snapshot_particle_plastic_F",
+    "grid_inv_mass",
+    "cc_grid_first",
+    "grid_contact_count",
+    "grid_contact_offset",
+    "ucontact_law",
+    "ucontact_friction",
+    "grid_contact_attempted",
+    "grid_contact_retained",
+    "grid_contact_peak",
+    "grid_contact_overflow",
+    "mpm_boundary_impulse",
+    "mpm_boundary_moment",
+    "step_mpm_boundary_impulse",
+    "step_mpm_boundary_moment",
+    "solver_velocity_scratch",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

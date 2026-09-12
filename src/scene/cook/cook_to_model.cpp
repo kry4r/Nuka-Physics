@@ -255,15 +255,15 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
                                    uint32_t row_exempt) {
     if (row_exempt > cap.particles_per_env)
         throw std::runtime_error("CookToModel: grid particle slice exceeds its environment");
-    if (rigid_base == 0u) return;
     const uint32_t row_particles = cap.particles_per_env - row_exempt;
     const uint64_t reserve =
-        static_cast<uint64_t>(row_particles) *
+        static_cast<uint64_t>(rigid_base > 0u ? row_particles : 0u) *
         collision::kBodyParticleContactSlotsPerParticle;
-    const uint64_t total = static_cast<uint64_t>(rigid_base) + reserve;
+    const uint64_t compact = reserve + cap.mpm_contact_capacity_per_env;
+    const uint64_t total = static_cast<uint64_t>(rigid_base) + compact;
     const uint64_t rows =
         static_cast<uint64_t>(rigid_base) * nk::kPairDrivenRowsPerSlot +
-        reserve * nk::kPairDrivenParticleRowsPerSlot;
+        compact * nk::kPairDrivenParticleRowsPerSlot;
     if (total > 0xFFFFFFFFull || rows > 0xFFFFFFFFull) {
         throw std::runtime_error(
             "CookToModel: body<->particle contact budget overflows u32 "
@@ -1653,6 +1653,8 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
             "CookMpmParticles: the MPM grid node count (dims product) overflows u32");
     }
     cap.mpm_grid_nodes_per_env = static_cast<uint32_t>(nodes64);
+    cap.mpm_contact_capacity_per_env = in.contact_capacity != 0u ? in.contact_capacity :
+        static_cast<uint32_t>(std::min(nodes64, uint64_t{nk::kMpmStencilNodes} * n));
     mp.mpm_grid_min = in.grid_origin;
     mp.mpm_grid_dims[0] = in.grid_dims[0];
     mp.mpm_grid_dims[1] = in.grid_dims[1];
@@ -1668,7 +1670,7 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
 
     const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(n);
-    // Grid transfer owns these particles, so only the rigid manifold budget remains.
+    // Grid contacts share a compact pool without a per-node owner limit.
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
@@ -2602,6 +2604,7 @@ static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
         }
     }
     in.dx = grid.dx;
+    in.contact_capacity = grid.contact_capacity;
     in.substeps = grid.substeps;
     in.floor_normal = grid.floor_normal;
     in.floor_d = grid.floor_d;
@@ -2681,6 +2684,7 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     in.material.yield_stress = mp.yield_stress;
     in.material.hardening_modulus = mp.hardening_modulus;
     in.dx = mp.dx;
+    in.contact_capacity = mp.contact_capacity;
     in.substeps = mp.substeps;
     in.floor_normal = mp.floor_normal;
     in.floor_d = mp.floor_d;

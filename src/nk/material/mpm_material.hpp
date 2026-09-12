@@ -5,6 +5,9 @@
 
 namespace nuka::nk {
 
+inline constexpr uint32_t kMpmStencilWidth = 3u;
+inline constexpr uint32_t kMpmStencilNodes = kMpmStencilWidth * kMpmStencilWidth * kMpmStencilWidth;
+
 // Material rows use SI units and contain no execution-backend state.
 struct MpmMaterial {
     static constexpr uint32_t kValueCount = 11u;
