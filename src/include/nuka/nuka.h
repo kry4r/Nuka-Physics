@@ -291,13 +291,14 @@ nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
                                     const uint32_t* env_ids,
                                     uint32_t count);
 
-// Checkpoints capture the complete persistent arena and validate world ownership.
+// Checkpoints capture persistent physics, observation output/history, and host configuration.
+// Restores validate world ownership and preserve existing view addresses.
 nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
                                             nuka_checkpoint_handle* out);
 nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
                                             nuka_checkpoint_handle checkpoint);
 void nuka_checkpoint_destroy(nuka_checkpoint_handle checkpoint);
-// Hashes persistent simulation bytes plus host step/config state in fixed order.
+// Hashes persistent physics, observation output/history, and host state in fixed order.
 nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash);
 
 typedef enum nuka_state_field_t {

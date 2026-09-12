@@ -1,31 +1,8 @@
-"""pytest: nuka v0.5 sim-to-real noise wrapper (Task 5.4.9) through the binding.
-
-Mirrors the C++ gtests (tests/c_abi/test_sensor_noise.cpp +
-tests/sensor/test_n2_domain_randomization.cpp) but exercises the PYTHON binding:
-``World.set_sensor_noise`` / ``apply_sensor_noise`` /
-``set_domain_randomization`` / ``apply_domain_randomization`` and the ergonomic
-``nuka.GaussianNoise`` / ``nuka.PoissonNoise`` / ``nuka.DomainRandomization``
-config dataclasses.
-
-Run (single GPU only):
-    export CUDA_VISIBLE_DEVICES=0
-    python -m pytest python/tests/test_noise.py -v
-
-Gates:
-  Sensor noise (64-env go2_float):
-    * NONE / no apply -> JOINT_VELOCITY byte-unchanged.
-    * GAUSSIAN apply CHANGES the buffer.
-    * D1: two FRESH worlds, SAME seed -> post-apply buffer is BIT-IDENTICAL.
-    * sequence advances: two successive applies give different increments.
-    * non-float-stride field (ARTICULATION_LINK_POSE) -> apply raises.
-  Domain randomization (single-env go2_float + Tape + backward, mirrors C++
-  gate-4 since the C-ABI exposes no mass/gravity getter):
-    * two FRESH worlds, SAME seed, DR ON -> backward grads BIT-IDENTICAL.
-    * DR-on grads != DR-off grads (proves DR actually applied to the rollout).
-    * disabled (enabled=False) -> grads identical to the never-set baseline.
-"""
+"""Observation isolation, replay and noise configuration through the public Python API."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -33,7 +10,7 @@ import torch
 
 import nuka
 
-SCENE = "/root/Nuka-Physics/examples/scenes/go2_float.usda"
+SCENE = str(Path(__file__).resolve().parents[2] / "examples/scenes/go2_float.usda")
 GO2_BLC = 13  # base_link_count: root + 12 actuated leg joints
 
 
@@ -64,7 +41,7 @@ def test_noise_kind_ints_exposed():
 
 
 # ---------------------------------------------------------------------------
-# Sensor noise: NONE / no apply is a byte no-op.
+# Ideal acquisition preserves the physical source.
 # ---------------------------------------------------------------------------
 def test_sensor_noise_none_is_no_op(device):
     with make_world(device, 64) as w:
@@ -73,13 +50,13 @@ def test_sensor_noise_none_is_no_op(device):
         qd = torch.from_dlpack(w.buffer_view(nuka.JOINT_VELOCITY))
         before = qd.detach().cpu().clone()
 
-        # No noise registered -> apply is a byte no-op.
+        # Unregistered acquisition copies the physical source.
         w.apply_sensor_noise(nuka.JOINT_VELOCITY)
         nuka.sync()
         after_unreg = qd.detach().cpu().clone()
         assert torch.equal(before, after_unreg), "unregistered apply changed qd"
 
-        # Explicit NONE kind -> still a no-op.
+        # Explicit NONE also preserves physics.
         w.set_sensor_noise(nuka.JOINT_VELOCITY, nuka.NOISE_NONE, 0.0, 0.0, 0)
         w.apply_sensor_noise(nuka.JOINT_VELOCITY)
         nuka.sync()
@@ -88,9 +65,9 @@ def test_sensor_noise_none_is_no_op(device):
 
 
 # ---------------------------------------------------------------------------
-# Sensor noise: GAUSSIAN apply CHANGES the buffer (bounded perturbation).
+# Gaussian acquisition perturbs only the observation.
 # ---------------------------------------------------------------------------
-def test_sensor_noise_gaussian_changes_buffer(device):
+def test_sensor_noise_gaussian_changes_only_observation(device):
     with make_world(device, 64) as w:
         w.step()
         nuka.sync()
@@ -100,7 +77,8 @@ def test_sensor_noise_gaussian_changes_buffer(device):
         w.set_sensor_noise(nuka.JOINT_VELOCITY, nuka.NOISE_GAUSSIAN, 0.0, 0.02, 123)
         w.apply_sensor_noise(nuka.JOINT_VELOCITY)
         nuka.sync()
-        after = qd.detach().cpu().clone()
+        after = torch.from_dlpack(w.get_observation_view(nuka.JOINT_VELOCITY)).cpu().clone()
+        assert torch.equal(before, qd.cpu())
 
         assert not torch.equal(before, after), "Gaussian apply did not perturb qd"
         max_abs = (after - before).abs().max().item()
@@ -121,7 +99,7 @@ def _gaussian_qd_after_apply(device, seed):
         w.set_sensor_noise(nuka.JOINT_VELOCITY, nuka.NOISE_GAUSSIAN, 0.0, 0.02, seed)
         w.apply_sensor_noise(nuka.JOINT_VELOCITY)
         nuka.sync()
-        return qd.detach().cpu().clone()
+        return torch.from_dlpack(w.get_observation_view(nuka.JOINT_VELOCITY)).cpu().clone()
 
 
 def test_sensor_noise_two_world_bit_exact(device):
@@ -153,13 +131,13 @@ def test_sensor_noise_sequence_advances(device):
         s0 = qd.detach().cpu().clone()
         w.apply_sensor_noise(nuka.JOINT_VELOCITY)
         nuka.sync()
-        s1 = qd.detach().cpu().clone()
+        s1 = torch.from_dlpack(w.get_observation_view(nuka.JOINT_VELOCITY)).cpu().clone()
         w.apply_sensor_noise(nuka.JOINT_VELOCITY)
         nuka.sync()
-        s2 = qd.detach().cpu().clone()
+        s2 = torch.from_dlpack(w.get_observation_view(nuka.JOINT_VELOCITY)).cpu().clone()
 
         d1 = s1 - s0  # seq 0 noise
-        d2 = s2 - s1  # seq 1 noise
+        d2 = s2 - s0  # seq 1 noise
         assert not torch.equal(d1, d2), (
             "successive applies did not advance the sequence (same increment)"
         )
@@ -178,7 +156,7 @@ def _gaussian_qd_via_helper(device, seed):
             w, nuka.JOINT_VELOCITY
         )
         nuka.sync()
-        return qd.detach().cpu().clone()
+        return torch.from_dlpack(w.get_observation_view(nuka.JOINT_VELOCITY)).cpu().clone()
 
 
 def test_gaussian_noise_helper_matches_raw_and_deterministic(device):
@@ -197,7 +175,8 @@ def test_poisson_noise_helper_changes_buffer(device):
         before = qd.detach().cpu().clone()
         nuka.PoissonNoise(lam=1.0, seed=321).apply_to(w, nuka.JOINT_VELOCITY)
         nuka.sync()
-        after = qd.detach().cpu().clone()
+        after = torch.from_dlpack(w.get_observation_view(nuka.JOINT_VELOCITY)).cpu().clone()
+        assert torch.equal(before, qd.cpu())
         assert not torch.equal(before, after), "Poisson apply did not perturb qd"
 
 
@@ -209,12 +188,49 @@ def test_sensor_noise_non_float_stride_field_rejected(device):
     with make_world(device, 64) as w:
         w.step()
         nuka.sync()
-        # set is OK (registers), apply raises NOT_SUPPORTED.
-        w.set_sensor_noise(
-            nuka.ARTICULATION_LINK_POSE, nuka.NOISE_GAUSSIAN, 0.0, 0.01, 5
-        )
+        with pytest.raises(Exception):
+            w.set_sensor_noise(
+                nuka.ARTICULATION_LINK_POSE, nuka.NOISE_GAUSSIAN, 0.0, 0.01, 5
+            )
         with pytest.raises(Exception):
             w.apply_sensor_noise(nuka.ARTICULATION_LINK_POSE)
+
+
+def test_measurement_error_and_checkpoint_before_registration(device):
+    with make_world(device, 4) as world:
+        field = nuka.JOINT_VELOCITY
+        checkpoint = world.capture_checkpoint()
+        initial_hash = world.state_hash()
+        model = nuka.MeasurementError(bias=0.1, temperature_coefficient=0.02,
+                                      quantization=0.05, minimum=-0.25, maximum=0.25)
+        model.configure(world, field)
+        world.sample_observation(field, 0.01, temperature=35.0)
+        observed = world.download_observation(field)
+        np.testing.assert_allclose(observed, 0.25)
+        assert np.count_nonzero(world.download_field(field)) == 0
+        stamp = world.observation_stamp(field)
+        assert stamp == {"sequence": 1, "elapsed_time": 0.01, "valid": True}
+        pointer = torch.from_dlpack(world.get_observation_view(field)).data_ptr()
+        world.restore_checkpoint(checkpoint)
+        assert world.state_hash() == initial_hash
+        with pytest.raises(Exception):
+            world.get_observation_view(field)
+        world.apply_sensor_noise(field)
+        assert torch.from_dlpack(world.get_observation_view(field)).data_ptr() == pointer
+        np.testing.assert_array_equal(world.download_observation(field), 0.0)
+        checkpoint.close()
+        nuka.MeasurementError(noise_density=0.001, initial_bias_stddev=0.02,
+                              bias_random_walk=0.01, correlated_bias_stddev=0.03,
+                              correlation_time=0.2, response_time=0.1, seed=17).configure(world, field)
+        world.sample_observation(field, 0.01)
+        with world.capture_checkpoint() as saved:
+            world.step()
+            world.sample_observation(field, 0.02)
+            expected = world.download_observation(field).copy()
+            world.restore_checkpoint(saved)
+            world.step()
+            world.sample_observation(field, 0.02)
+            np.testing.assert_array_equal(world.download_observation(field), expected)
 
 
 # ---------------------------------------------------------------------------

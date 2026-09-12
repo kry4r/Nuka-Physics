@@ -130,6 +130,7 @@ class CameraCfg:
 from .noise import (  # noqa: F401
     GaussianNoise,
     PoissonNoise,
+    MeasurementError,
     DomainRandomization,
     NOISE_NONE,
     NOISE_GAUSSIAN,
@@ -400,6 +401,7 @@ __all__ = [
     # v0.5 p04 Task 5.4.9 sim-to-real noise config (pure-python, eager-safe).
     "GaussianNoise",
     "PoissonNoise",
+    "MeasurementError",
     "DomainRandomization",
     "NOISE_NONE",
     "NOISE_GAUSSIAN",

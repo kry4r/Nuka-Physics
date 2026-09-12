@@ -595,6 +595,7 @@ add_library(nuka_nk STATIC
     nk/pipeline/world.cpp
     nk/solve/schedule.cpp
     nk/solve/xpbd_coloring.cpp
+    sensor/observation.cpp
 )
 set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(nuka_nk nuka_codegen)
@@ -741,6 +742,7 @@ if(CMAKE_CUDA_COMPILER)
         # Pipeline::Build's op list.
         phi/backend_cuda/ops/mpm.cu
         phi/backend_cuda/ops/readout.cu
+        phi/backend_cuda/ops/sensors.cu
         # M9 T7: NkOp::StepBackward — the diffsim contact-free single-step reverse
         # adjoint, kernel moved VERBATIM from the deleted diffsim/step_backward.cu
         # (same reduction order / launch config / nvcc flags -> D1 byte-exact).

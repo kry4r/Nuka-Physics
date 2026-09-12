@@ -1570,6 +1570,7 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkParticleOps();
     RegisterNkMpmOps();              // MLS-MPM transfers (inert round-trip scaffold)
     RegisterNkReadoutOps();
+    RegisterNkSensorOps();
     RegisterNkDiffsimBackwardOps();  // M9 T7: NkOp::StepBackward
 }
 

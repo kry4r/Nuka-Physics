@@ -1,37 +1,23 @@
-// ---------------------------------------------------------------------------
-// nuka::c_abi -- C ABI for sim-to-real N1 sensor noise (v0.5 p04 Task 5.4.8)
-// ---------------------------------------------------------------------------
-//
-// nuka_world_set_sensor_noise records a per-field noise descriptor on the
-// WorldRecord; nuka_world_apply_sensor_noise resolves the field's live device
-// buffer (via nuka_world_get_buffer_view -- the SAME resolution the zero-copy
-// view uses) and launches the matching counter-based Philox kernel, then
-// advances the field's sequence counter so successive applies are independent
-// noise across steps. The Philox RNG is stateless / pure in (seed, idx, seq), so
-// the noise is D1 two-run bit-exact and replay-stable (exit #6). Default NONE is
-// a byte no-op -> V1 oracle scenes stay byte-identical.
-//
-// No exceptions cross the extern "C" boundary (try/catch -> MapExceptionToResult,
-// the buffer.cpp pattern). No `throw`.
-// ---------------------------------------------------------------------------
+// Sensor observations keep measured values separate from the physics state.
 
 #include "nuka/nuka_noise.h"
 
+#include "c_abi/dlpack_table.hpp"
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/scoped_device_guard.hpp"
 #include "runtime/articulation/articulation_state.hpp"
-#include "sensor/noise/n1_gaussian.hpp"
-#include "sensor/noise/n1_poisson.hpp"
 #include "sensor/noise/n2_domain_randomization.hpp"
 #include "sensor/noise/noise_config.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cmath>
 #include <exception>
+#include <limits>
 #include <new>
 #include <vector>
 
@@ -39,10 +25,35 @@ namespace {
 
 namespace noise = nuka::sensor::noise;
 
-// True iff `field` is a valid index into the WorldRecord noise arrays.
+// Public field descriptors define the supported field indices.
 bool FieldInRange(nuka_state_field_t field) {
-    const uint32_t f = static_cast<uint32_t>(field);
-    return f < nuka::c_abi::WorldRecord::kNoiseFieldCount;
+    return nuka::c_abi::FindDlpackFieldRow(field) != nullptr;
+}
+
+nuka_result_t ResolveObservation(nuka_world_handle world, nuka::c_abi::WorldRecord& record,
+    nuka_state_field_t field, nuka::sensor::Observation** observation, nuka_buffer_view_t* source) {
+    const auto* descriptor = nuka::c_abi::FindDlpackFieldRow(field);
+    if (!descriptor) return NUKA_RESULT_INVALID_ARG;
+    if (descriptor->dtype != nuka::c_abi::kWireDtypeF32 ||
+        descriptor->element_stride_bytes != sizeof(float)) return NUKA_RESULT_NOT_SUPPORTED;
+    auto result = nuka_world_get_buffer_view(world, field, source);
+    if (result != NUKA_RESULT_OK) return result;
+    if (source->dtype != nuka::c_abi::kWireDtypeF32 ||
+        source->element_stride_bytes != sizeof(float)) return NUKA_RESULT_NOT_SUPPORTED;
+    if (!record.world) return NUKA_RESULT_NOT_SUPPORTED;
+    const uint32_t env_count = record.world->EnvCount();
+    if (!env_count || !source->element_count || source->element_count % env_count != 0u ||
+        source->element_count > std::numeric_limits<uint32_t>::max()) return NUKA_RESULT_NOT_SUPPORTED;
+    auto found = record.field_observations.find(field);
+    if (found == record.field_observations.end()) {
+        auto created = std::make_unique<nuka::sensor::Observation>();
+        const auto status = created->Initialize(record.world->Backend(), env_count,
+            static_cast<uint32_t>(source->element_count / env_count), static_cast<uint32_t>(field));
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        found = record.field_observations.emplace(field, std::move(created)).first;
+    }
+    *observation = found->second.get();
+    return NUKA_RESULT_OK;
 }
 
 namespace articulation = nuka::runtime::articulation;
@@ -254,120 +265,146 @@ nuka_result_t ApplyPerEpisodeRandomization(
 extern "C" {
 
 nuka_result_t nuka_world_set_sensor_noise(nuka_world_handle world,
-                                          nuka_state_field_t sensor_field,
-                                          const nuka_sensor_noise_desc_t* desc) {
-    if (!FieldInRange(sensor_field)) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
+    nuka_state_field_t field, const nuka_sensor_noise_desc_t* desc) {
+    if (!FieldInRange(field)) return NUKA_RESULT_INVALID_ARG;
     auto* record = nuka::c_abi::WorldTable().Get(world);
-    if (record == nullptr) {
-        return NUKA_RESULT_NULL_HANDLE;
-    }
-    const uint32_t f = static_cast<uint32_t>(sensor_field);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    try {
+        nuka::sensor::ObservationConfig config;
+        if (desc) {
+            config.noise.kind = static_cast<noise::NoiseKind>(desc->kind);
+            config.noise.param1 = desc->param1;
+            config.noise.param2 = desc->param2;
+            config.noise.seed = desc->seed;
+        }
+        if (!nuka::sensor::ValidObservationConfig(config)) return NUKA_RESULT_INVALID_ARG;
+        if (!desc && record->field_observations.find(field) == record->field_observations.end())
+            return NUKA_RESULT_OK;
+        nuka_buffer_view_t source{};
+        nuka::sensor::Observation* observation = nullptr;
+        const auto result = ResolveObservation(world, *record, field, &observation, &source);
+        if (result != NUKA_RESULT_OK) return result;
+        return nuka::c_abi::MapStatusToResult(observation->Configure(config));
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) { return NUKA_RESULT_INTERNAL; }
+}
 
-    // NULL desc clears the field's noise (back to None).
-    if (desc == nullptr) {
-        record->noise_config[f] = noise::SensorNoiseConfig{};
-        record->noise_seq[f] = 0u;
-        return NUKA_RESULT_OK;
-    }
+nuka_result_t nuka_world_set_sensor_error(nuka_world_handle world,
+    nuka_state_field_t field, const nuka_sensor_error_desc_t* desc) {
+    if (!FieldInRange(field) || (desc && desc->struct_size < sizeof(*desc)))
+        return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!desc) return nuka_world_set_sensor_noise(world, field, nullptr);
+    try {
+        nuka::sensor::ObservationConfig config;
+        config.noise.seed = desc->seed;
+        auto& error = config.error;
+        error.bias = desc->bias;
+        error.scale_error = desc->scale_error;
+        error.noise_density = desc->noise_density;
+        error.initial_bias_stddev = desc->initial_bias_stddev;
+        error.bias_random_walk = desc->bias_random_walk;
+        error.correlated_bias_stddev = desc->correlated_bias_stddev;
+        error.correlation_time = desc->correlation_time;
+        error.quantization = desc->quantization;
+        error.minimum = desc->minimum;
+        error.maximum = desc->maximum;
+        error.response_time = desc->response_time;
+        error.temperature_coefficient = desc->temperature_coefficient;
+        error.reference_temperature = desc->reference_temperature;
+        error.saturation_enabled = desc->saturation_enabled;
+        if (!nuka::sensor::ValidObservationConfig(config)) return NUKA_RESULT_INVALID_ARG;
+        nuka_buffer_view_t source{};
+        nuka::sensor::Observation* observation = nullptr;
+        const auto result = ResolveObservation(world, *record, field, &observation, &source);
+        if (result != NUKA_RESULT_OK) return result;
+        return nuka::c_abi::MapStatusToResult(observation->Configure(config));
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) { return NUKA_RESULT_INTERNAL; }
+}
 
-    noise::NoiseKind kind;
-    switch (desc->kind) {
-        case NUKA_NOISE_NONE:
-            kind = noise::NoiseKind::None;
-            break;
-        case NUKA_NOISE_GAUSSIAN:
-            kind = noise::NoiseKind::Gaussian;
-            break;
-        case NUKA_NOISE_POISSON:
-            kind = noise::NoiseKind::Poisson;
-            break;
-        default:
-            return NUKA_RESULT_INVALID_ARG;
-    }
+nuka_result_t nuka_world_sample_observation(nuka_world_handle world,
+    nuka_state_field_t field, double sample_interval, float temperature) {
+    if (!FieldInRange(field) || !(sample_interval > 0.0) || !std::isfinite(sample_interval) ||
+        sample_interval > std::numeric_limits<float>::max() || !std::isfinite(temperature))
+        return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    try {
+        nuka_buffer_view_t source{};
+        nuka::sensor::Observation* observation = nullptr;
+        const auto result = ResolveObservation(world, *record, field, &observation, &source);
+        if (result != NUKA_RESULT_OK) return result;
+        const auto status = observation->Sample(static_cast<const float*>(source.device_ptr),
+                                                sample_interval, temperature);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        return nuka::c_abi::MapStatusToResult(record->world->Synchronize());
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) { return NUKA_RESULT_INTERNAL; }
+}
 
-    noise::SensorNoiseConfig cfg;
-    cfg.kind = kind;
-    cfg.param1 = desc->param1;
-    cfg.param2 = desc->param2;
-    cfg.seed = desc->seed;
-    record->noise_config[f] = cfg;
-    record->noise_seq[f] = 0u;  // fresh registration -> fresh sequence
+nuka_result_t nuka_world_apply_sensor_noise(nuka_world_handle world, nuka_state_field_t field) {
+    if (!FieldInRange(field)) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    const auto found = record->field_observations.find(field);
+    const float temperature = found == record->field_observations.end() ? 25.0f :
+        found->second->Config().error.reference_temperature;
+    return nuka_world_sample_observation(world, field, record->step_options.dt, temperature);
+}
+
+nuka_result_t nuka_world_get_observation_view(nuka_world_handle world,
+    nuka_state_field_t field, nuka_buffer_view_t* out) {
+    if (!out) return NUKA_RESULT_INVALID_ARG;
+    *out = {};
+    if (!FieldInRange(field)) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    const auto found = record->field_observations.find(field);
+    if (found == record->field_observations.end() || !found->second->Active()) return NUKA_RESULT_NOT_SUPPORTED;
+    out->device_ptr = found->second->Values();
+    out->element_count = found->second->ValueBytes() / sizeof(float);
+    out->element_stride_bytes = sizeof(float);
+    out->dtype = nuka::c_abi::kWireDtypeF32;
     return NUKA_RESULT_OK;
 }
 
-nuka_result_t nuka_world_apply_sensor_noise(nuka_world_handle world,
-                                            nuka_state_field_t sensor_field) {
-    if (!FieldInRange(sensor_field)) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
+nuka_result_t nuka_world_download_observation(nuka_world_handle world,
+    nuka_state_field_t field, void* bytes, size_t nbytes, size_t byte_offset) {
+    if (!FieldInRange(field)) return NUKA_RESULT_INVALID_ARG;
     auto* record = nuka::c_abi::WorldTable().Get(world);
-    if (record == nullptr) {
-        return NUKA_RESULT_NULL_HANDLE;
-    }
-    const uint32_t f = static_cast<uint32_t>(sensor_field);
-    const noise::SensorNoiseConfig& cfg = record->noise_config[f];
-
-    // NONE (or unregistered) -> byte no-op, no buffer touched, OK.
-    if (cfg.kind == noise::NoiseKind::None) {
-        return NUKA_RESULT_OK;
-    }
-
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    const auto found = record->field_observations.find(field);
+    if (found == record->field_observations.end() || !found->second->Active()) return NUKA_RESULT_NOT_SUPPORTED;
     try {
-        // Resolve the field's live device buffer the SAME way the zero-copy view
-        // does (reuse the extern "C" entry in buffer.cpp -- same shared lib).
-        nuka_buffer_view_t view;
-        const nuka_result_t view_result =
-            nuka_world_get_buffer_view(world, sensor_field, &view);
-        if (view_result != NUKA_RESULT_OK) {
-            return view_result;
-        }
-        if (view.device_ptr == nullptr || view.element_count == 0u) {
-            return NUKA_RESULT_OK;  // nothing to perturb
-        }
-        // The noise primitive operates on float32 elements. Reject non-float-
-        // stride fields (e.g. the 28-byte pose / 24-byte velocity struct views):
-        // honest default for a float-noise op.
-        if (view.element_stride_bytes != sizeof(float)) {
-            return NUKA_RESULT_NOT_SUPPORTED;
-        }
+        return nuka::c_abi::MapStatusToResult(found->second->Download(bytes, nbytes, byte_offset));
+    } catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) { return NUKA_RESULT_INTERNAL; }
+}
 
-        if (record->device == nullptr) {
-            return NUKA_RESULT_NULL_HANDLE;
-        }
-        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
-        const int device_id = record->device->device_id;
-        float* data = static_cast<float*>(view.device_ptr);
-        // Sensor buffers are small (<< 2^32 floats); guard the narrowing.
-        if (view.element_count > 0xFFFFFFFFull) {
-            return NUKA_RESULT_NOT_SUPPORTED;
-        }
-        const uint32_t count = static_cast<uint32_t>(view.element_count);
-        const uint64_t seq = record->noise_seq[f];
-
-        switch (cfg.kind) {
-            case noise::NoiseKind::Gaussian:
-                noise::LaunchGaussianNoise(stream, device_id, data, count, cfg.param1,
-                                           cfg.param2, cfg.seed, seq);
-                break;
-            case noise::NoiseKind::Poisson:
-                noise::LaunchPoissonNoise(stream, device_id, data, count, cfg.param1, cfg.seed,
-                                          seq);
-                break;
-            case noise::NoiseKind::None:
-                return NUKA_RESULT_OK;  // unreachable (guarded above)
-        }
-        cudaStreamSynchronize(stream);
-        record->noise_seq[f] = seq + 1u;  // advance for the next apply
+nuka_result_t nuka_world_get_observation_stamp(nuka_world_handle world,
+    nuka_state_field_t field, uint32_t env, nuka_observation_stamp_t* out) {
+    if (!out) return NUKA_RESULT_INVALID_ARG;
+    *out = {};
+    if (!FieldInRange(field)) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    const auto found = record->field_observations.find(field);
+    if (found == record->field_observations.end() || !found->second->Active()) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        nuka::sensor::ObservationStamp stamp;
+        const auto status = found->second->ReadStamp(env, &stamp);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        out->sequence = stamp.sequence;
+        out->elapsed_time = stamp.elapsed_time;
+        out->valid = stamp.valid;
         return NUKA_RESULT_OK;
-    } catch (const std::bad_alloc&) {
-        return NUKA_RESULT_OUT_OF_MEMORY;
-    } catch (const std::exception& error) {
-        return nuka::c_abi::MapExceptionToResult(error);
-    } catch (...) {
-        return NUKA_RESULT_INTERNAL;
-    }
+    } catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) { return NUKA_RESULT_INTERNAL; }
 }
 
 nuka_result_t nuka_world_set_domain_randomization(

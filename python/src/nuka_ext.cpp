@@ -537,10 +537,6 @@ public:
         check(nuka_world_set_gravity_z(h_, gravity_z), "nuka_world_set_gravity_z");
     }
 
-    // v0.5 p04 N1 sim-to-real sensor noise (Task 5.4.8/5.4.9). Register a noise
-    // descriptor on a per-field basis. kind: 0=NONE (clears), 1=GAUSSIAN
-    // (param1=mean, param2=stddev), 2=POISSON (param1=lambda). Recording resets
-    // that field's per-field sequence counter to 0. See nuka_noise.h.
     void set_sensor_noise(nuka_state_field_t field, int kind, float param1,
                           float param2, uint64_t seed) {
         nuka_sensor_noise_desc_t desc{};
@@ -548,17 +544,31 @@ public:
         desc.param1 = param1;
         desc.param2 = param2;
         desc.seed = seed;
-        check(nuka_world_set_sensor_noise(h_, field, &desc),
-              "nuka_world_set_sensor_noise");
+        check(nuka_world_set_sensor_noise(h_, field, &desc), "nuka_world_set_sensor_noise");
     }
 
-    // Apply the registered noise to `field`'s device buffer in place ONCE, then
-    // advance that field's sequence counter (next apply is independent noise).
-    // NONE / no registered desc -> byte no-op. Non-float-stride field (pose) ->
-    // NUKA_RESULT_NOT_SUPPORTED (raises).
     void apply_sensor_noise(nuka_state_field_t field) {
-        check(nuka_world_apply_sensor_noise(h_, field),
-              "nuka_world_apply_sensor_noise");
+        check(nuka_world_apply_sensor_noise(h_, field), "nuka_world_apply_sensor_noise");
+    }
+
+    void sample_observation(nuka_state_field_t field, double interval, float temperature) {
+        check(nuka_world_sample_observation(h_, field, interval, temperature), "nuka_world_sample_observation");
+    }
+
+    nuka_buffer_view_t observation_view(nuka_state_field_t field) const {
+        nuka_buffer_view_t view{};
+        check(nuka_world_get_observation_view(h_, field, &view), "nuka_world_get_observation_view");
+        return view;
+    }
+
+    nb::dict observation_stamp(nuka_state_field_t field, uint32_t env) const {
+        nuka_observation_stamp_t stamp{};
+        check(nuka_world_get_observation_stamp(h_, field, env, &stamp), "nuka_world_get_observation_stamp");
+        nb::dict result;
+        result["sequence"] = stamp.sequence;
+        result["elapsed_time"] = stamp.elapsed_time;
+        result["valid"] = stamp.valid != 0u;
+        return result;
     }
 
     // v0.5 p04 N2 per-episode domain randomization (Task 5.4.7/5.4.9). mass /
@@ -2610,26 +2620,74 @@ NB_MODULE(_nuka_ext, m) {
              "Set finite uniform gravity Z (m/s^2), preserving X and Y. Applies to "
              "the next production step in every environment; a changed value "
              "invalidates the execution graph. Tapes capture gravity at creation.")
-        // v0.5 p04 N1 sim-to-real sensor noise (Task 5.4.9). Register/clear a
-        // per-field noise descriptor; apply it in place to the live device
-        // buffer. Counter-based (Philox) -> D1 two-run bit-exact.
         .def("set_sensor_noise", &World::set_sensor_noise, nb::arg("field"),
              nb::arg("kind"), nb::arg("param1") = 0.0f, nb::arg("param2") = 0.0f,
              nb::arg("seed") = uint64_t{0},
-             "Register sim-to-real noise on `field`. kind: 0 = NOISE_NONE (clears "
-             "-> apply becomes a byte no-op), 1 = NOISE_GAUSSIAN (param1=mean, "
-             "param2=stddev), 2 = NOISE_POISSON (param1=lambda). Recording resets "
-             "the field's per-field sequence counter to 0. Only float-stride "
-             "fields (q/qd/drive/etc.) are supported by a later apply; a "
-             "non-float-stride field (e.g. ARTICULATION_LINK_POSE) registers OK "
-             "but raises NOT_SUPPORTED on apply. An out-of-range field or unknown "
-             "kind raises.")
+             "Configure independent scalar float32 observations. NONE clears errors; "
+             "GAUSSIAN uses mean/stddev; POISSON adds a count with the supplied rate. "
+             "Registration resets observation history. Physical fields are unchanged.")
+        .def("set_sensor_error", [](World& w, nuka_state_field_t field, const nb::kwargs& options) {
+            nuka_sensor_error_desc_t desc{};
+            desc.struct_size = sizeof(desc);
+            desc.reference_temperature = 25.0f;
+            struct Parameter { const char* name; float nuka_sensor_error_desc_t::*member; };
+            const Parameter parameters[] = {
+                {"bias", &nuka_sensor_error_desc_t::bias},
+                {"scale_error", &nuka_sensor_error_desc_t::scale_error},
+                {"noise_density", &nuka_sensor_error_desc_t::noise_density},
+                {"initial_bias_stddev", &nuka_sensor_error_desc_t::initial_bias_stddev},
+                {"bias_random_walk", &nuka_sensor_error_desc_t::bias_random_walk},
+                {"correlated_bias_stddev", &nuka_sensor_error_desc_t::correlated_bias_stddev},
+                {"correlation_time", &nuka_sensor_error_desc_t::correlation_time},
+                {"quantization", &nuka_sensor_error_desc_t::quantization},
+                {"minimum", &nuka_sensor_error_desc_t::minimum},
+                {"maximum", &nuka_sensor_error_desc_t::maximum},
+                {"response_time", &nuka_sensor_error_desc_t::response_time},
+                {"temperature_coefficient", &nuka_sensor_error_desc_t::temperature_coefficient},
+                {"reference_temperature", &nuka_sensor_error_desc_t::reference_temperature},
+            };
+            for (auto item : options) {
+                const auto name = nb::cast<std::string>(item.first);
+                if (name == "seed") { desc.seed = nb::cast<uint64_t>(item.second); continue; }
+                if (name == "saturation_enabled") {
+                    desc.saturation_enabled = nb::cast<bool>(item.second) ? 1u : 0u;
+                    continue;
+                }
+                bool found = false;
+                for (const auto& parameter : parameters) {
+                    if (name != parameter.name) continue;
+                    desc.*(parameter.member) = nb::cast<float>(item.second);
+                    found = true;
+                    break;
+                }
+                if (!found) throw nb::value_error(("unknown sensor error parameter: " + name).c_str());
+            }
+            check(nuka_world_set_sensor_error(w.raw(), field, &desc), "nuka_world_set_sensor_error");
+        }, nb::arg("field"), nb::arg("options"),
+             "Configure calibration, drift, response, quantization and saturation in physical units.")
         .def("apply_sensor_noise", &World::apply_sensor_noise, nb::arg("field"),
-             "Apply the registered noise to `field`'s device buffer ONCE, in "
-             "place, then advance that field's sequence counter (so the next "
-             "apply is independent noise across steps). NONE / no registered desc "
-             "-> byte no-op. Non-float-stride field -> raises NOT_SUPPORTED. The "
-             "kernel is async; call nuka.sync() before reading the buffer back.")
+             "Acquire an independent observation using fixed_dt and reference temperature. "
+             "Read get_observation_view or download_observation; buffer_view retains physical truth.")
+        .def("sample_observation", &World::sample_observation, nb::arg("field"),
+             nb::arg("sample_interval"), nb::arg("temperature") = 25.0f,
+             "Acquire the current field using an explicit positive interval in seconds and temperature in Celsius.")
+        .def("get_observation_view", [](World& w, nuka_state_field_t field) -> FloatArray {
+            const auto view = w.observation_view(field);
+            return make_array_from_view(view, w.env_count(),
+                static_cast<uint32_t>(view.element_count / w.env_count()), nb::cast(&w));
+        }, nb::arg("field"), nb::rv_policy::reference_internal,
+             "Persistent independent float32 observation view with shape (env, values). Reading does not sample.")
+        .def("download_observation", [](World& w, nuka_state_field_t field) -> nb::object {
+            const auto view = w.observation_view(field);
+            size_t shape[2] = {w.env_count(), view.element_count / w.env_count()};
+            float* values = new float[view.element_count];
+            nb::capsule owner(values, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            check(nuka_world_download_observation(w.raw(), field, values,
+                view.element_count * sizeof(float), 0u), "nuka_world_download_observation");
+            return nb::cast(nb::ndarray<nb::numpy, float>(values, 2, shape, owner));
+        }, nb::arg("field"), "Download the last observation as a float32 NumPy array with shape (env, values).")
+        .def("observation_stamp", &World::observation_stamp, nb::arg("field"), nb::arg("env") = 0u,
+             "Read acquisition count, accumulated sample time, and validity for one environment.")
         // v0.5 p04 N2 per-episode domain randomization (Task 5.4.9). mass /
         // friction are MULTIPLIER ranges; restitution / armature / gravity are
         // OFFSET ranges. enabled == 0 -> apply is a byte no-op (oracle safe).

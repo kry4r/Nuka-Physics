@@ -64,6 +64,8 @@ const char* NkOpName(int op) {
         case NkOp::MpmCommit: return "MpmCommit";
         case NkOp::ReadoutContactWrench: return "ReadoutContactWrench";
         case NkOp::ExportObs: return "ExportObs";
+        case NkOp::SampleObservation: return "SampleObservation";
+        case NkOp::ResetObservation: return "ResetObservation";
         case NkOp::ResetEnvs: return "ResetEnvs";
         case NkOp::SnapshotState: return "SnapshotState";
         case NkOp::RestoreState: return "RestoreState";

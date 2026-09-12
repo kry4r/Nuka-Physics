@@ -17,6 +17,8 @@
 // ---------------------------------------------------------------------------
 
 #include "sensor/noise/n1_gaussian.hpp"
+#include "sensor/noise/measurement_error.hpp"
+#include <utility>
 #include "sensor/noise/philox.cuh"
 #include "phi/backend.hpp"  // InitBestDevice / DeviceBufferType
 #include "phi/buffer.hpp"   // Buffer* / BufferAlloc / BufferUpload / BufferDownload
@@ -200,4 +202,55 @@ TEST(N1GaussianNoise, IndependenceSeedSeqElement) {
         }
     }
     EXPECT_FALSE(all_same) << "all elements identical -> idx not in counter";
+}
+
+TEST(MeasurementError, IntervalVarianceAndBiasCorrelation) {
+    constexpr uint32_t count = 65536u;
+    auto moments = [](const std::vector<float>& values) {
+        double mean = 0.0;
+        for (float value : values) mean += value;
+        mean /= static_cast<double>(values.size());
+        double variance = 0.0;
+        for (float value : values) variance += (value - mean) * (value - mean);
+        return std::pair<double, double>{mean, variance / static_cast<double>(values.size())};
+    };
+    for (double interval : {0.01, 0.04}) {
+        nuka::sensor::ObservationConfig config;
+        config.error.noise_density = 0.2f;
+        std::vector<float> values(count);
+        for (uint32_t i = 0u; i < count; ++i) {
+            nuka::sensor::ObservationNoiseState state;
+            values[i] = noise::MeasureValue(0.0f, config, &state, i, 0u, 0u, interval, 25.0f);
+        }
+        const auto [mean, variance] = moments(values);
+        const double expected = 0.04 / interval;
+        EXPECT_NEAR(mean, 0.0, 6.0 * std::sqrt(expected / count));
+        EXPECT_NEAR(variance, expected, expected * 0.04);
+    }
+    nuka::sensor::ObservationConfig config;
+    config.error.bias_random_walk = 0.1f;
+    std::vector<float> values(count), first(count), second(count);
+    for (uint32_t i = 0u; i < count; ++i) {
+        nuka::sensor::ObservationNoiseState state;
+        for (uint64_t sample = 0u; sample < 10u; ++sample)
+            values[i] = noise::MeasureValue(0.0f, config, &state, i, 0u, sample, 0.05, 25.0f);
+    }
+    EXPECT_NEAR(moments(values).second, 0.005, 0.005 * 0.04);
+    config.error.bias_random_walk = 0.0f;
+    config.error.correlated_bias_stddev = 0.3f;
+    config.error.correlation_time = 0.2f;
+    for (uint32_t i = 0u; i < count; ++i) {
+        nuka::sensor::ObservationNoiseState state;
+        first[i] = noise::MeasureValue(0.0f, config, &state, i, 0u, 0u, 0.05, 25.0f);
+        second[i] = noise::MeasureValue(0.0f, config, &state, i, 0u, 1u, 0.05, 25.0f);
+    }
+    const auto [first_mean, first_variance] = moments(first);
+    const auto [second_mean, second_variance] = moments(second);
+    double covariance = 0.0;
+    for (uint32_t i = 0u; i < count; ++i)
+        covariance += (first[i] - first_mean) * (second[i] - second_mean);
+    covariance /= count;
+    EXPECT_NEAR(first_variance, 0.09, 0.09 * 0.04);
+    EXPECT_NEAR(second_variance, 0.09, 0.09 * 0.04);
+    EXPECT_NEAR(covariance / std::sqrt(first_variance * second_variance), std::exp(-0.25), 0.01);
 }

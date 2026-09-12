@@ -27,6 +27,7 @@
 #include "phi/backend.hpp"
 #include "runtime/soft/cloth_topology.hpp"
 #include "scene/cook/cook_to_model.hpp"
+#include "sensor/observation.hpp"
 
 namespace {
 
@@ -95,6 +96,16 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
         nk::World graph(make_model(), envs, backend.dev, backend.backend, Cfg());
         ASSERT_TRUE(eager.Ready()) << eager.CreationError();
         ASSERT_TRUE(graph.Ready()) << graph.CreationError();
+        nuka::sensor::Observation observation;
+        ASSERT_EQ(observation.Initialize(backend.backend, envs,
+            graph.GetModel().capacities.links_per_env, 0u), nphi::Status::Ok);
+        nuka::sensor::ObservationConfig sensor_config;
+        sensor_config.error.noise_density = 0.01f;
+        sensor_config.error.initial_bias_stddev = 0.02f;
+        sensor_config.error.bias_random_walk = 0.002f;
+        sensor_config.error.correlated_bias_stddev = 0.005f;
+        sensor_config.error.correlation_time = 0.2f;
+        ASSERT_EQ(observation.Configure(sensor_config), nphi::Status::Ok);
         const auto initial = ReadPipelineState(graph);
         const auto* address = graph.DataViewRef().particle_pos;
         const auto* endpoint_address = graph.DataViewRef().contact_endpoint_keys;
@@ -126,6 +137,7 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
             if (step == 8u) {
                 ASSERT_EQ(eager.Reset({1u, 1u}), nphi::Status::Ok);
                 ASSERT_EQ(graph.Reset({1u, 1u}), nphi::Status::Ok);
+                ASSERT_EQ(observation.Reset({1u, 1u}), nphi::Status::Ok);
             }
             for (auto* world : {&eager, &graph}) {
                 ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::DriveTarget, targets.data(),
@@ -148,6 +160,7 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
                                                           flags.size() * sizeof(uint32_t)));
                 EXPECT_EQ(flags, std::vector<uint32_t>(envs));
             }
+            ASSERT_EQ(observation.Sample(graph.DataViewRef().qdot, Cfg().dt, 25.0f), nphi::Status::Ok);
             EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
             std::vector<uint8_t> eager_state, graph_state;
             ASSERT_TRUE(eager.GetData().DownloadPersistent(&eager_state));

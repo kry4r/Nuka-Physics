@@ -91,30 +91,31 @@ TEST(N1PoissonNoise, StatisticalMeanAndVariance) {
     const cudaStream_t ctx = nullptr;  // BUF-14: stream 0
     const int ctx_dev = 0;
     const uint32_t count = 100000u;
-    const float lambda = 4.0f;
     const uint64_t seed = 0xfeedface99887766ull;
 
-    const std::vector<float> s = RunPoisson(ctx, ctx_dev, count, lambda, seed, 0u);
+    for (float lambda : {4.0f, 30.0f, 1000.0f, 1.0e6f, 1.0e8f}) {
+        SCOPED_TRACE(lambda);
+        const std::vector<float> s = RunPoisson(ctx, ctx_dev, count, lambda, seed, 0u);
 
-    double sum = 0.0;
-    for (float v : s) sum += static_cast<double>(v);
-    const double sample_mean = sum / count;
-    double var = 0.0;
-    for (float v : s) {
-        const double d = static_cast<double>(v) - sample_mean;
-        var += d * d;
+        double sum = 0.0;
+        for (float v : s) sum += static_cast<double>(v);
+        const double sample_mean = sum / count;
+        double var = 0.0;
+        for (float v : s) {
+            const double d = static_cast<double>(v) - sample_mean;
+            var += d * d;
+        }
+        const double sample_var = var / count;
+
+        // The sample mean uses five standard errors; variance has a wider sampling tolerance.
+        EXPECT_NEAR(sample_mean, static_cast<double>(lambda),
+                    5.0 * std::sqrt(static_cast<double>(lambda) / count));
+        EXPECT_GT(sample_var, 0.88 * lambda);
+        EXPECT_LT(sample_var, 1.12 * lambda);
+
+        std::printf("[N1Poisson] N=%u lambda=%.4f measured(mean=%.6f var=%.6f)\n",
+                    count, lambda, sample_mean, sample_var);
     }
-    const double sample_var = var / count;
-
-    // Mean and variance both ~= lambda. SE(mean) ~ sqrt(lambda/N) ~ 6.3e-3; SE on
-    // the variance is larger, so allow ~10% on the variance.
-    EXPECT_NEAR(sample_mean, static_cast<double>(lambda),
-                5.0 * std::sqrt(static_cast<double>(lambda) / count));
-    EXPECT_GT(sample_var, 0.88 * lambda);
-    EXPECT_LT(sample_var, 1.12 * lambda);
-
-    std::printf("[N1Poisson] N=%u lambda=%.4f measured(mean=%.6f var=%.6f)\n",
-                count, lambda, sample_mean, sample_var);
 }
 
 // 3. Independence across seed and seq.

@@ -29,6 +29,7 @@ void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
 void RegisterNkParticleOps();         // particles.cu (M6)
 void RegisterNkMpmOps();              // mpm.cu (MLS-MPM transfers)
 void RegisterNkReadoutOps();          // readout.cu
+void RegisterNkSensorOps();
 void RegisterNkDiffsimBackwardOps();  // diffsim_backward.cu (M9 T7)
 
 } // namespace nuka::phi

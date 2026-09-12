@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include "collision/mesh_surface_types.hpp"
+#include "sensor/observation_types.hpp"
 
 namespace nuka::phi {
 
@@ -186,6 +187,8 @@ enum class NkOp : uint16_t {
 
     ReadoutDrives,         // actual bounded effort from the common velocity solve
     RefitParticleSurfaces,
+    SampleObservation,
+    ResetObservation,
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -913,6 +916,28 @@ struct ExportObsParams {
     uint32_t env_count;
     uint32_t base_link_count;
     uint32_t obs_width;         // floats per env in obs_buffer
+};
+
+struct SampleObservationParams {
+    const float* source = nullptr;
+    float* values = nullptr;
+    sensor::ObservationNoiseState* noise_state = nullptr;
+    sensor::ObservationStamp* stamps = nullptr;
+    uint32_t env_count = 0u;
+    uint32_t values_per_env = 0u;
+    uint32_t channel = 0u;
+    double sample_interval = 0.0;
+    float temperature = 25.0f;
+    sensor::ObservationConfig config;
+};
+
+struct ResetObservationParams {
+    float* values = nullptr;
+    sensor::ObservationNoiseState* noise_state = nullptr;
+    sensor::ObservationStamp* stamps = nullptr;
+    const uint32_t* env_ids = nullptr;
+    uint32_t selected_count = 0u;
+    uint32_t values_per_env = 0u;
 };
 
 // ReadoutUnionContactObsParams (the union-only per-env contact obs params)
