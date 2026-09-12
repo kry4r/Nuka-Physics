@@ -87,9 +87,9 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
     return m;
 }
 
-// MpmStep at substeps=1, zero gravity, floor sunk far below: the pure transfer.
-nphi::MpmStepParams MakeParams(const nk::Model& m) {
-    nphi::MpmStepParams p{};
+// One transfer interval with zero gravity and a floor below the grid.
+nphi::MpmParams MakeParams(const nk::Model& m) {
+    nphi::MpmParams p{};
     p.particle_count = m.capacities.particles_per_env;  // env_count == 1.
     p.particles_per_env = m.capacities.particles_per_env;
     p.env_count = 1u;
@@ -109,8 +109,10 @@ nphi::MpmStepParams MakeParams(const nk::Model& m) {
     return p;
 }
 
-bool RunTransfer(nk::World& w, const nphi::MpmStepParams& p) {
-    return w.DispatchOp(nphi::NkOp::MpmStep, &p) == nphi::Status::Ok;
+bool RunTransfer(nk::World& w, const nphi::MpmParams& p) {
+    for (auto op : {nphi::NkOp::MpmPredict, nphi::NkOp::MpmExchange, nphi::NkOp::MpmCommit})
+        if (w.DispatchOp(op, &p) != nphi::Status::Ok) return false;
+    return true;
 }
 
 }  // namespace
@@ -125,7 +127,7 @@ TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
 
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
     ASSERT_TRUE(w.Ready());
-    nphi::MpmStepParams p = MakeParams(w.GetModel());
+    nphi::MpmParams p = MakeParams(w.GetModel());
     ASSERT_TRUE(RunTransfer(w, p));
 
     std::vector<Vec3> out(np, Vec3::Zero());
@@ -142,6 +144,54 @@ TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
     std::fprintf(stderr, "[mpm-roundtrip] np=%u max_err=%.3e\n", np, max_err);
     EXPECT_LE(max_err, 1.0e-5f)
         << "APIC C=0 transfer must reproduce the constant velocity field";
+
+    ASSERT_EQ(w.Reset({0u}), nphi::Status::Ok);
+    ASSERT_EQ(w.DispatchOp(nphi::NkOp::MpmPredict, &p), nphi::Status::Ok);
+    ASSERT_EQ(w.DispatchOp(nphi::NkOp::MpmExchange, &p), nphi::Status::Ok);
+    std::vector<Vec3> pending_pos(np), pending_vel(np);
+    std::vector<float> pending_f(np * 9u);
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticlePos, pending_pos.data(),
+                                         pending_pos.size() * sizeof(Vec3)));
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticleVel, pending_vel.data(),
+                                         pending_vel.size() * sizeof(Vec3)));
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticleF, pending_f.data(),
+                                         pending_f.size() * sizeof(float)));
+    const auto& initial = w.GetModel().particles;
+    EXPECT_EQ(std::memcmp(pending_pos.data(), initial.initial_pos.data(), np * sizeof(Vec3)), 0);
+    EXPECT_EQ(std::memcmp(pending_vel.data(), initial.initial_vel.data(), np * sizeof(Vec3)), 0);
+    EXPECT_EQ(std::memcmp(pending_f.data(), initial.initial_F.data(), pending_f.size() * sizeof(float)), 0);
+
+    const uint32_t nodes = w.GetModel().capacities.mpm_grid_nodes_per_env;
+    std::vector<float> mass(nodes);
+    std::vector<Vec3> grid_velocity(nodes);
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::GridMass, mass.data(), nodes * sizeof(float)));
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::GridVelocity, grid_velocity.data(), nodes * sizeof(Vec3)));
+    const Vec3 velocity_change{-0.11f, 0.19f, 0.07f};
+    Vec3 grid_impulse{};
+    for (uint32_t i = 0u; i < nodes; ++i) {
+        if (mass[i] == 0.0f) continue;
+        grid_velocity[i] += velocity_change;
+        grid_impulse += velocity_change * mass[i];
+    }
+    ASSERT_TRUE(w.GetData().UploadField(nk::FieldId::GridVelocity, grid_velocity.data(), nodes * sizeof(Vec3)));
+    ASSERT_EQ(w.DispatchOp(nphi::NkOp::MpmCommit, &p), nphi::Status::Ok);
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticlePos, pending_pos.data(), np * sizeof(Vec3)));
+    ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::ParticleVel, out.data(), np * sizeof(Vec3)));
+    Vec3 particle_impulse{};
+    for (uint32_t i = 0u; i < np; ++i) {
+        const Vec3 expected_velocity = seed + velocity_change;
+        const Vec3 expected_position = initial.initial_pos[i] + expected_velocity * p.dt;
+        EXPECT_NEAR(out[i].x, expected_velocity.x, 1.0e-5f);
+        EXPECT_NEAR(out[i].y, expected_velocity.y, 1.0e-5f);
+        EXPECT_NEAR(out[i].z, expected_velocity.z, 1.0e-5f);
+        EXPECT_NEAR(pending_pos[i].x, expected_position.x, 1.0e-6f);
+        EXPECT_NEAR(pending_pos[i].y, expected_position.y, 1.0e-6f);
+        EXPECT_NEAR(pending_pos[i].z, expected_position.z, 1.0e-6f);
+        particle_impulse += out[i] - seed;
+    }
+    EXPECT_NEAR(particle_impulse.x, grid_impulse.x, 1.0e-5f);
+    EXPECT_NEAR(particle_impulse.y, grid_impulse.y, 1.0e-5f);
+    EXPECT_NEAR(particle_impulse.z, grid_impulse.z, 1.0e-5f);
 
     const auto initial_pos = w.GetModel().particles.initial_pos;
     const double duration = 1.0 / 60.0;
@@ -178,7 +228,8 @@ TEST(MpmTransferRoundtrip, P2GThenG2PReproducesVelocity) {
         previous_error = position_error;
     }
     p.substeps = 2u;
-    EXPECT_EQ(w.DispatchOp(nphi::NkOp::MpmStep, &p), nphi::Status::InvalidArgument);
+    for (auto op : {nphi::NkOp::MpmPredict, nphi::NkOp::MpmExchange, nphi::NkOp::MpmCommit})
+        EXPECT_EQ(w.DispatchOp(op, &p), nphi::Status::InvalidArgument);
 }
 
 // (2) the deterministic gather is byte-identical run-to-run (NO float atomics).
@@ -191,8 +242,8 @@ TEST(MpmTransferRoundtrip, P2GGatherByteIdenticalRunToRun) {
         const uint32_t nodes = m.capacities.mpm_grid_nodes_per_env;
         nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
         if (!w.Ready()) return false;
-        nphi::MpmStepParams p = MakeParams(w.GetModel());
-        if (w.DispatchOp(nphi::NkOp::MpmStep, &p) != nphi::Status::Ok) return false;
+        nphi::MpmParams p = MakeParams(w.GetModel());
+        if (!RunTransfer(w, p)) return false;
         mass.assign(nodes, 0.0f);
         mom.assign(nodes, Vec3::Zero());
         return w.GetData().DownloadField(nk::FieldId::GridMass, mass.data(),
@@ -338,12 +389,12 @@ TEST(MpmTransferRoundtrip, SnapshotRestoreRoundTripsF) {
     }
 }
 
-// Run MpmStep and return the env-status word (escape-bit probe).
+// Return the environment status after a complete transfer interval.
 uint32_t EscapeStatusAfterP2G(Backend& b, nk::Model m) {
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
     EXPECT_TRUE(w.Ready());
-    nphi::MpmStepParams p = MakeParams(w.GetModel());
-    EXPECT_EQ(nphi::Status::Ok, w.DispatchOp(nphi::NkOp::MpmStep, &p));
+    nphi::MpmParams p = MakeParams(w.GetModel());
+    EXPECT_TRUE(RunTransfer(w, p));
     uint32_t status = 0u;
     EXPECT_TRUE(w.GetData().DownloadField(nk::FieldId::EnvStatus, &status,
                                           sizeof(uint32_t)));

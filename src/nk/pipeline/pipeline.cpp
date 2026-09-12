@@ -90,7 +90,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
             outputs.flags |= phi::kAccumulateJointLimit;
         for (const auto& call : interval_calls) {
             AddOp(call.op, call.params, device);
-            if (mpm_reaction && call.op == phi::NkOp::MpmStep)
+            if (mpm_reaction && call.op == phi::NkOp::MpmExchange)
                 AddOp(phi::NkOp::AccumulateStep, &capture, device);
         }
         AddOp(phi::NkOp::AccumulateStep, &outputs, device);
@@ -343,7 +343,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     coupling_ctx.p_np_body_particle = &p_np_body_particle_;
     coupling_ctx.p_part_finalize = &p_part_finalize_;
     coupling_ctx.p_pp_contact = &p_pp_contact_;
-    coupling_ctx.p_mpm_step = &p_mpm_step_;
+    coupling_ctx.p_mpm = &p_mpm_;
     coupling_ctx.has_mpm = has_mpm ? 1u : 0u;
 
     if (has_particles) {
@@ -374,6 +374,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_part_predict_.n_mpm_particles = n_mpm;
         add(phi::NkOp::ParticlePredict, &p_part_predict_);
     }
+
+    mpm_coupling_provider_.PreCouple(coupling_ctx);
 
     if (has_articulation && !use_osc) {
         p_fk_.articulation_count = articulation_cnt;
@@ -721,8 +723,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         }
     }
 
-    // Grid transfer advances one common interval before the shared contact solve.
-    // A grid-only world also advances when it has no contact rows.
+    // Exchange reads the latest endpoint velocity before the shared solve.
     if (has_mpm && has_articulation) {
         p_fk_velocity_.articulation_count = articulation_cnt;
         p_fk_velocity_.total_link_count = total_link_count;
@@ -766,10 +767,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // reference for the dynamic islanding). Read once at Build (graph-safe).
         const char* fsi = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
         p_solve_.force_static_islands = (fsi != nullptr && fsi[0] == '1') ? 1u : 0u;
-        // Pre-solve coupling seam: each registered provider's Couple funnels its
-        // two-way reaction into the shared body sink before the single solve. The
-        // row provider emits nothing here (it rides this solve); a grid-transfer
-        // provider emits its umbrella op here.
+        // Particle rows exchange their impulses in the common solve.
         if (has_particles) {
             row_coupling_provider_.Couple(coupling_ctx);
         }
@@ -803,6 +801,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     } else {
         for (uint32_t pass = 1u; pass < coupling_iterations; ++pass) project_particles(pass);
     }
+
+    mpm_coupling_provider_.PostCouple(coupling_ctx);
 
     if (has_articulation || has_bodies) {
         p_int_pos_.dt = cfg.dt;
