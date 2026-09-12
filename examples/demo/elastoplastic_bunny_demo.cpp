@@ -29,6 +29,7 @@
 #include "scene/ecs/registry.hpp"
 #include "scene/format/json.hpp"
 #include "scene/scene_map.hpp"
+#include "tools/perf/cuda_step_measurements.hpp"
 
 namespace {
 namespace nk = nuka::nk;
@@ -51,6 +52,7 @@ constexpr float kFriction = 0.20f;
 struct Args {
     std::filesystem::path out = "out/elastoplastic_bunny";
     std::filesystem::path replay;
+    std::filesystem::path perf_json;
     std::filesystem::path mesh = std::filesystem::path(NUKA_SOURCE_DIR) /
         ".nuka-assets/generated/bunny_solid_120mm.obj";
     float dx = 0.005f, mass = 2.5f, drop_height = 0.18f, duration = 3.6f;
@@ -73,6 +75,7 @@ Args ParseArgs(int argc, char** argv) {
         const std::string value = argv[++i];
         if (key == "--out-dir") args.out = value;
         else if (key == "--replay") args.replay = value;
+        else if (key == "--perf-json") args.perf_json = value;
         else if (key == "--mesh") args.mesh = value;
         else if (key == "--dx") args.dx = std::stof(value);
         else if (key == "--mass") args.mass = std::stof(value);
@@ -91,6 +94,7 @@ Args ParseArgs(int argc, char** argv) {
     Require(args.steps_per_frame && args.width && args.height && args.samples && args.render_stride,
             "Counts must be positive");
     Require(std::isfinite(args.contact_band) && args.contact_band >= 0.0f, "Invalid contact band");
+    Require(args.perf_json.empty() || args.replay.empty(), "Step timing requires live simulation");
     return args;
 }
 
@@ -426,6 +430,8 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
     Require(world.FieldPtr(nk::FieldId::MpmBodyReaction) && world.FieldPtr(nk::FieldId::MpmBodyAngReaction),
             "No contact impulse readout");
     Require(world.SetExecutionMode(nk::World::ExecutionMode::Graph) == phi::Status::Ok, "Graph mode failed");
+    nuka::perf::CudaStepMeasurements measurements(world, !args.perf_json.empty(),
+        args.steps_per_frame, frames);
     const auto& model = world.GetModel();
     const collision::MeshSurfaceView surface{model.hull_verts.data(), model.mesh_triangles.data(),
         model.mesh_bvh_nodes.data(), {model.capacities.max_hull_verts, model.capacities.max_mesh_triangles,
@@ -475,8 +481,9 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
         double frame_impulse = 0.0;
         uint32_t status = 0u;
         if (frame > 0u) {
+            measurements.BeginInterval();
             for (uint32_t s = 0u; s < args.steps_per_frame; ++s) {
-                Require(world.StepConfigured() == phi::Status::Ok, "Simulation step failed");
+                measurements.Step();
                 Download(world, nk::FieldId::MpmBodyReaction, reaction);
                 Download(world, nk::FieldId::MpmBodyAngReaction, moment);
                 uint32_t step_status = 0u;
@@ -499,6 +506,7 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
             }
         }
         Require(world.Synchronize() == phi::Status::Ok, "Simulation completion failed");
+        if (frame > 0u) measurements.EndInterval();
         Download(world, nk::FieldId::ParticlePos, positions); Download(world, nk::FieldId::ParticleVel, velocity);
         Download(world, nk::FieldId::ParticleF, elastic); Download(world, nk::FieldId::ParticlePlasticF, plastic);
         Download(world, nk::FieldId::ParticleC, affine); Download(world, nk::FieldId::ParticlePlastic, alpha);
@@ -612,6 +620,7 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
     completion.Set("body_pose_written_after_release", Json::Bool(false));
     completion.Set("material_reset_during_capture", Json::Bool(false));
     WriteJson(args.out / "completion.json", completion);
+    measurements.Write(args.perf_json, dt);
 }
 }  // namespace
 
