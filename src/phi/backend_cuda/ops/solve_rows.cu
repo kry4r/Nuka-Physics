@@ -1,6 +1,8 @@
 // Independent islands retain ordered row updates and separate real/pseudo velocities.
 
 #include <cuda_runtime.h>
+
+#include "constraint/coulomb_contact.hpp"
 #include <limits>
 
 #include "math/cuda_vec_ops.cuh"
@@ -56,6 +58,18 @@ struct VelocityErrorView {
     }
 };
 
+__device__ void ApplyPointImpulse(const NkRowSide& side, float delta,
+                                  PointMassView points, VelocityErrorView error) {
+    for (uint32_t i = 0u; i < points.Count(side); ++i) {
+        const auto term = points.At(side, i);
+        const auto* inverse_mass = points.InverseMass(term.kind);
+        auto* velocity = points.Velocity(term.kind);
+        if (velocity != nullptr && inverse_mass != nullptr && inverse_mass[term.index] > 0.0f)
+            AddVelocity(velocity[term.index], error.Point(term.kind, term.index),
+                        term.jacobian * (inverse_mass[term.index] * delta));
+    }
+}
+
 // Island records and row storage support the shared ordered solver.
 
 // The schedule stores {segment offset, segment count, flags, owning environment}.
@@ -97,7 +111,18 @@ constexpr uint32_t kSlimHasDyn = 1u << 2;
 constexpr uint32_t kSlimDynIsB = 1u << 3;
 constexpr uint32_t kSlimDynParticle = 1u << 4;
 constexpr uint32_t kSlimDynGrid = 1u << 6;
+constexpr uint32_t kSlimDynEndpoint = 1u << 7;
+constexpr uint32_t kSlimPointMass = kSlimDynParticle | kSlimDynGrid | kSlimDynEndpoint;
 constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
+
+__device__ NkRowSide SlimPointSide(const SlimRow& row) {
+    NkRowSide side;
+    side.kind = (row.code & kSlimDynEndpoint) ? kNkSidePointEndpoint :
+                (row.code & kSlimDynGrid) ? kNkSideGrid : kNkSideParticle;
+    side.index = row.dyn_index;
+    side.jlin = {row.jl[0], row.jl[1], row.jl[2]};
+    return side;
+}
 
 // Static schedules cache row data and Jacobians; dynamic schedules use global rows.
 // Both allocate velocity tiles, with separate pseudo tiles for the position solve.
@@ -142,10 +167,8 @@ __device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
         code |= kSlimBArt;
         sr.b_tile = (row.b.index >= env_artic_base) ? (row.b.index - env_artic_base) : 0u;
     }
-    const bool a_dyn = row.a.kind == kNkSideRigid || row.a.kind == kNkSideParticle ||
-                       row.a.kind == kNkSideGrid;
-    const bool b_dyn = row.b.kind == kNkSideRigid || row.b.kind == kNkSideParticle ||
-                       row.b.kind == kNkSideGrid;
+    const bool a_dyn = row.a.kind == kNkSideRigid || PointMassView::IsPointSide(row.a.kind);
+    const bool b_dyn = row.b.kind == kNkSideRigid || PointMassView::IsPointSide(row.b.kind);
     sr.dyn_index = 0u;
     sr.jl[0] = sr.jl[1] = sr.jl[2] = 0.0f;
     sr.ja[0] = sr.ja[1] = sr.ja[2] = 0.0f;
@@ -153,6 +176,7 @@ __device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
         code |= kSlimHasDyn;
         if (row.a.kind == kNkSideParticle) code |= kSlimDynParticle;
         if (row.a.kind == kNkSideGrid) code |= kSlimDynGrid;
+        if (row.a.kind == kNkSidePointEndpoint) code |= kSlimDynEndpoint;
         sr.dyn_index = row.a.index;
         sr.jl[0] = row.a.jlin.x; sr.jl[1] = row.a.jlin.y; sr.jl[2] = row.a.jlin.z;
         sr.ja[0] = row.a.jang.x; sr.ja[1] = row.a.jang.y; sr.ja[2] = row.a.jang.z;
@@ -161,6 +185,7 @@ __device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
         code |= kSlimHasDyn | kSlimDynIsB;
         if (row.b.kind == kNkSideParticle) code |= kSlimDynParticle;
         if (row.b.kind == kNkSideGrid) code |= kSlimDynGrid;
+        if (row.b.kind == kNkSidePointEndpoint) code |= kSlimDynEndpoint;
         sr.dyn_index = row.b.index;
         sr.jl[0] = row.b.jlin.x; sr.jl[1] = row.b.jlin.y; sr.jl[2] = row.b.jlin.z;
         sr.ja[0] = row.b.jang.x; sr.ja[1] = row.b.jang.y; sr.ja[2] = row.b.jang.z;
@@ -172,7 +197,7 @@ __device__ inline SlimRow MakeSlimRow(const NkRow& row, uint32_t env_row_base,
 // Compliant velocity projection preserves ascending DOF sums and side A/B order.
 // Effective mass and inverse-mass Jacobians are assembled before the solve.
 __device__ void ApplySlimImpulse(
-    const SlimRow& sr, uint32_t j_row, uint32_t wlane, float delta,
+    const SlimRow& sr, uint32_t gslot, uint32_t j_row, uint32_t wlane, float delta,
     uint32_t env_artic_base, float* qdot_sh,
     const NkRow* __restrict__ urows,
     const float* J_sh, const float* w_sh, const float* J_b_sh,
@@ -199,18 +224,8 @@ __device__ void ApplySlimImpulse(
                 AddVelocity(qd[r], error.qdot != nullptr ?
                     error.qdot + static_cast<size_t>(tile) * dof_stride + r : nullptr, w[r] * delta);
         } else if (dyn && wlane == 0u) {
-            if (code & (kSlimDynParticle | kSlimDynGrid)) {
-                const uint32_t kind = (code & kSlimDynGrid) ? kNkSideGrid : kNkSideParticle;
-                const float* particle_inv_mass = point_masses.InverseMass(kind);
-                math::Vec3* particle_vel = point_masses.Velocity(kind);
-                if (particle_vel != nullptr && particle_inv_mass != nullptr) {
-                    const float im = particle_inv_mass[sr.dyn_index];
-                    if (im > 0.0f) {
-                        math::Vec3& v = particle_vel[sr.dyn_index];
-                        AddVelocity(v, error.Point(kind, sr.dyn_index),
-                                    math::Vec3{sr.jl[0], sr.jl[1], sr.jl[2]} * (im * delta));
-                    }
-                }
+            if (code & kSlimPointMass) {
+                ApplyPointImpulse(SlimPointSide(sr), delta, point_masses, error);
             } else {
                 const float im = body_inv_mass[sr.dyn_index];
                 if (im > 0.0f) {
@@ -224,16 +239,9 @@ __device__ void ApplySlimImpulse(
                 }
             }
         } else if ((code & kSlimFallback) && side == 1 && wlane == 0u) {
-            const NkRow row = urows[j_row];
-            if (row.b.kind == kNkSideParticle || row.b.kind == kNkSideGrid) {
-                const float* particle_inv_mass = point_masses.InverseMass(row.b.kind);
-                math::Vec3* particle_vel = point_masses.Velocity(row.b.kind);
-                if (particle_inv_mass == nullptr || particle_vel == nullptr) continue;
-                const float im = particle_inv_mass[row.b.index];
-                if (im > 0.0f) {
-                    math::Vec3& v = particle_vel[row.b.index];
-                    AddVelocity(v, error.Point(row.b.kind, row.b.index), row.b.jlin * (im * delta));
-                }
+            const NkRow row = urows[gslot];
+            if (PointMassView::IsPointSide(row.b.kind)) {
+                ApplyPointImpulse(row.b, delta, point_masses, error);
             } else if (row.b.kind == kNkSideRigid) {
                 const float im = body_inv_mass[row.b.index];
                 if (im > 0.0f) {
@@ -274,11 +282,8 @@ __device__ float ComputeSlimRowVelocity(
     float dyn_jv = 0.0f;
     if (code & kSlimHasDyn) {
         const math::Vec3 jl{sr.jl[0], sr.jl[1], sr.jl[2]};
-        if (code & (kSlimDynParticle | kSlimDynGrid)) {
-            const uint32_t kind = (code & kSlimDynGrid) ? kNkSideGrid : kNkSideParticle;
-            const math::Vec3* particle_vel = point_masses.Velocity(kind);
-            dyn_jv = particle_vel != nullptr ? Dot3(jl, particle_vel[sr.dyn_index])
-                                             : 0.0f;
+        if (code & kSlimPointMass) {
+            dyn_jv = point_masses.RowVelocity(SlimPointSide(sr));
         } else {
             const math::Vec3 ja{sr.ja[0], sr.ja[1], sr.ja[2]};
             dyn_jv = Dot3(jl, body_lin_vel[sr.dyn_index]) +
@@ -292,35 +297,14 @@ __device__ float ComputeSlimRowVelocity(
     else if ((code & kSlimHasDyn) && (code & kSlimDynIsB)) jv += dyn_jv;
     if (code & kSlimFallback) {
         const NkRow row = urows[gslot];
-        if (row.b.kind == kNkSideParticle || row.b.kind == kNkSideGrid) {
-            const math::Vec3* velocity = point_masses.Velocity(row.b.kind);
-            if (velocity != nullptr) jv += Dot3(row.b.jlin, velocity[row.b.index]);
+        if (PointMassView::IsPointSide(row.b.kind)) {
+            jv += point_masses.RowVelocity(row.b);
         } else if (row.b.kind == kNkSideRigid) {
             jv += Dot3(row.b.jlin, body_lin_vel[row.b.index]) +
                   Dot3(row.b.jang, body_ang_vel[row.b.index]);
         }
     }
     return jv;
-}
-
-__device__ void ProjectContactBlock(const NkRow& normal, float* lambda_n,
-                                    float* lambda_t1, float* lambda_t2) {
-    *lambda_n = fmaxf(*lambda_n, 0.0f);
-    const float mu1 = fmaxf(normal.mu, 0.0f);
-    const float mu2 = fmaxf(normal.reserved[0], 0.0f);
-    if (*lambda_n <= 0.0f || mu1 <= 1.0e-12f || mu2 <= 1.0e-12f) {
-        *lambda_t1 = 0.0f;
-        *lambda_t2 = 0.0f;
-        return;
-    }
-    const float q1 = *lambda_t1 / mu1;
-    const float q2 = *lambda_t2 / mu2;
-    const float radius = sqrtf(q1 * q1 + q2 * q2);
-    if (radius > *lambda_n && radius > 1.0e-12f) {
-        const float scale = *lambda_n / radius;
-        *lambda_t1 *= scale;
-        *lambda_t2 *= scale;
-    }
 }
 
 __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
@@ -364,6 +348,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
     if (!(flags & nk::nk_row_flags::kActive)) {
         return;  // watermark early-exit (inactive slot).
     }
+    const uint32_t jacobian_base = gslot - j_row;
     const bool block_row =
         (flags & (nk::nk_row_flags::kBlockNormal |
                   nk::nk_row_flags::kBlockTangent)) != 0u;
@@ -402,11 +387,13 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
             const SlimRow tangent2 = MakeSlimRow(urows[block_tangent2_slot],
                                                  env_row_base, env_artic_base);
             block_jv_tangent1 = ComputeSlimRowVelocity(
-                tangent1, block_tangent1_slot, block_tangent1_slot, J_sh, J_b_sh,
+                tangent1, block_tangent1_slot,
+                block_tangent1_slot - jacobian_base, J_sh, J_b_sh,
                 qdot_sh, urows, body_lin_vel, body_ang_vel, point_masses,
                 dof_stride);
             block_jv_tangent2 = ComputeSlimRowVelocity(
-                tangent2, block_tangent2_slot, block_tangent2_slot, J_sh, J_b_sh,
+                tangent2, block_tangent2_slot,
+                block_tangent2_slot - jacobian_base, J_sh, J_b_sh,
                 qdot_sh, urows, body_lin_vel, body_ang_vel, point_masses,
                 dof_stride);
         }
@@ -440,19 +427,10 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                       tangent1.compliance_alpha * block_old_tangent1;
             const float residual_t2 = tangent2.rhs * dt - block_jv_tangent2 -
                                       tangent2.compliance_alpha * block_old_tangent2;
-            float new_normal = block_old_normal +
-                normal.reserved[1] * residual_n +
-                normal.reserved[2] * residual_t1 +
-                normal.reserved[3] * residual_t2;
-            float new_tangent1 = block_old_tangent1 +
-                normal.reserved[2] * residual_n +
-                normal.reserved[4] * residual_t1 +
-                normal.reserved[5] * residual_t2;
-            float new_tangent2 = block_old_tangent2 +
-                normal.reserved[3] * residual_n +
-                normal.reserved[5] * residual_t1 +
-                normal.reserved[6] * residual_t2;
-            ProjectContactBlock(normal, &new_normal, &new_tangent1, &new_tangent2);
+            const auto projected = constraint::ProjectedCoulombStep(normal.contact_response,
+                {residual_n, residual_t1, residual_t2},
+                {block_old_normal, block_old_tangent1, block_old_tangent2}, normal.mu, normal.friction_secondary);
+            const float new_normal = projected.x, new_tangent1 = projected.y, new_tangent2 = projected.z;
             lambda[block_normal_slot] = new_normal;
             lambda[block_tangent1_slot] = new_tangent1;
             lambda[block_tangent2_slot] = new_tangent2;
@@ -498,7 +476,9 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         if (block_delta_normal != 0.0f) {
             const SlimRow sr_block = MakeSlimRow(urows[block_normal_slot],
                                                   env_row_base, env_artic_base);
-            ApplySlimImpulse(sr_block, block_normal_slot, wlane, block_delta_normal,
+            ApplySlimImpulse(sr_block, block_normal_slot,
+                             block_normal_slot - jacobian_base,
+                             wlane, block_delta_normal,
                              env_artic_base, qdot_sh, urows, J_sh, w_sh, J_b_sh,
                              w_b_sh, body_lin_vel, body_ang_vel, body_inv_mass,
                              body_world_inv_inertia, point_masses,
@@ -507,7 +487,8 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         if (block_delta_tangent1 != 0.0f) {
             const SlimRow sr_block = MakeSlimRow(urows[block_tangent1_slot],
                                                   env_row_base, env_artic_base);
-            ApplySlimImpulse(sr_block, block_tangent1_slot, wlane,
+            ApplySlimImpulse(sr_block, block_tangent1_slot,
+                             block_tangent1_slot - jacobian_base, wlane,
                              block_delta_tangent1, env_artic_base, qdot_sh, urows,
                              J_sh, w_sh, J_b_sh, w_b_sh, body_lin_vel,
                              body_ang_vel, body_inv_mass, body_world_inv_inertia,
@@ -516,7 +497,8 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         if (block_delta_tangent2 != 0.0f) {
             const SlimRow sr_block = MakeSlimRow(urows[block_tangent2_slot],
                                                   env_row_base, env_artic_base);
-            ApplySlimImpulse(sr_block, block_tangent2_slot, wlane,
+            ApplySlimImpulse(sr_block, block_tangent2_slot,
+                             block_tangent2_slot - jacobian_base, wlane,
                              block_delta_tangent2, env_artic_base, qdot_sh, urows,
                              J_sh, w_sh, J_b_sh, w_b_sh, body_lin_vel,
                              body_ang_vel, body_inv_mass, body_world_inv_inertia,
@@ -524,7 +506,7 @@ __device__ void SolveUnionRowWarp(uint32_t ls,            // env-local slot
         }
     }
     if (!block_row && delta != 0.0f) {
-        ApplySlimImpulse(*sr, j_row, wlane, delta, env_artic_base, qdot_sh,
+        ApplySlimImpulse(*sr, gslot, j_row, wlane, delta, env_artic_base, qdot_sh,
                          urows, J_sh, w_sh, J_b_sh, w_b_sh, body_lin_vel,
                          body_ang_vel, body_inv_mass, body_world_inv_inertia,
                          point_masses, dof_stride, error);
@@ -587,7 +569,7 @@ __device__ void SolvePositionRowWarp(uint32_t gslot,
     }
     delta = __shfl_sync(0xffffffffu, delta, 0);
     if (delta != 0.0f) {
-        ApplySlimImpulse(sr, j_row, wlane, delta, env_artic_base, qdot_pseudo_sh,
+        ApplySlimImpulse(sr, gslot, j_row, wlane, delta, env_artic_base, qdot_pseudo_sh,
                          urows, J_sh, w_sh, J_b_sh, w_b_sh,
                          body_pseudo_lin, body_pseudo_ang, body_inv_mass,
                          body_world_inv_inertia, point_masses,
@@ -606,15 +588,8 @@ __device__ void ApplyDynamicImpulseScalar(
     const NkRow row = urows[gslot];
     for (int side = 0; side < 2; ++side) {
         const NkRowSide& sd = side == 0 ? row.a : row.b;
-        if (sd.kind == kNkSideParticle || sd.kind == kNkSideGrid) {
-            const float* particle_inv_mass = point_masses.InverseMass(sd.kind);
-            math::Vec3* particle_vel = point_masses.Velocity(sd.kind);
-            if (particle_inv_mass == nullptr || particle_vel == nullptr) continue;
-            const float im = particle_inv_mass[sd.index];
-            if (im > 0.0f) {
-                math::Vec3& v = particle_vel[sd.index];
-                AddVelocity(v, error.Point(sd.kind, sd.index), sd.jlin * (im * delta));
-            }
+        if (PointMassView::IsPointSide(sd.kind)) {
+            ApplyPointImpulse(sd, delta, point_masses, error);
         } else if (sd.kind == kNkSideRigid) {
             const float im = body_inv_mass[sd.index];
             if (im > 0.0f) {
@@ -709,19 +684,10 @@ __device__ void SolveDynamicRowScalar(
                                   tangent1.compliance_alpha * block_old_tangent1;
         const float residual_t2 = tangent2.rhs * dt - block_jv_tangent2 -
                                   tangent2.compliance_alpha * block_old_tangent2;
-        float new_normal = block_old_normal +
-            normal.reserved[1] * residual_n +
-            normal.reserved[2] * residual_t1 +
-            normal.reserved[3] * residual_t2;
-        float new_tangent1 = block_old_tangent1 +
-            normal.reserved[2] * residual_n +
-            normal.reserved[4] * residual_t1 +
-            normal.reserved[5] * residual_t2;
-        float new_tangent2 = block_old_tangent2 +
-            normal.reserved[3] * residual_n +
-            normal.reserved[5] * residual_t1 +
-            normal.reserved[6] * residual_t2;
-        ProjectContactBlock(normal, &new_normal, &new_tangent1, &new_tangent2);
+        const auto projected = constraint::ProjectedCoulombStep(normal.contact_response,
+            {residual_n, residual_t1, residual_t2},
+            {block_old_normal, block_old_tangent1, block_old_tangent2}, normal.mu, normal.friction_secondary);
+        const float new_normal = projected.x, new_tangent1 = projected.y, new_tangent2 = projected.z;
         lambda[block_normal_slot] = new_normal;
         lambda[block_tangent1_slot] = new_tangent1;
         lambda[block_tangent2_slot] = new_tangent2;
@@ -867,7 +833,7 @@ __global__ void SolveRowsScalarIslandsKernel(
                     row_order[rec.seg_off + r], env_row_base, env_artic_base,
                     row_meff, row_penetration, row_pseudo_lambda, urows,
                     body_pseudo_lin, body_pseudo_ang, body_inv_mass,
-                    body_world_inv_inertia, PointMassView{point_masses.particle_inv_mass, particle_pseudo_vel, nullptr, nullptr},
+                    body_world_inv_inertia, point_masses.Pseudo(particle_pseudo_vel),
                     pos_beta, pos_slop, dt, baumgarte_max_velocity);
             }
         }
@@ -1183,7 +1149,7 @@ __global__ void SolveRowsBlockIslandKernel(
                             qdot_pseudo_sh, urows,
                             body_pseudo_lin_vel, body_pseudo_ang_vel,
                             body_inv_mass, body_world_inv_inertia,
-                            PointMassView{point_masses.particle_inv_mass, particle_pseudo_vel, nullptr, nullptr},
+                            point_masses.Pseudo(particle_pseudo_vel),
                             dof_stride, pos_beta, pos_slop, dt,
                             baumgarte_max_velocity);
                     }
@@ -1427,7 +1393,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 static_cast<const float*>(data.body_inv_mass),
                 static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
                 PointMassView{data.particle_inv_mass, data.particle_vel,
-                              data.grid_inv_mass, data.grid_velocity},
+                              data.grid_inv_mass, data.grid_velocity,
+                              data.point_endpoint_ranges, data.point_endpoint_terms},
                 data.island_quads, data.island_rows,
                 pos_pass ? static_cast<const float*>(data.row_penetration) : nullptr,
                 pos_pass ? static_cast<float*>(data.row_pseudo_lambda) : nullptr,
@@ -1462,7 +1429,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.body_inv_mass),
                    static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
                    PointMassView{data.particle_inv_mass, data.particle_vel,
-                              data.grid_inv_mass, data.grid_velocity},
+                              data.grid_inv_mass, data.grid_velocity,
+                              data.point_endpoint_ranges, data.point_endpoint_terms},
                    islands_in,
                    static_cast<const uint32_t*>(model.island_color_segments),
                    row_order_in,

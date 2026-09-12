@@ -29,6 +29,7 @@
 #include "nuka/nuka.h"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "nk/solve/point_endpoint.hpp"
 #include "phi/op_schema.hpp"
 
 namespace nuka::c_abi {
@@ -38,6 +39,10 @@ static_assert(NUKA_CONTACT_SIDE_LINK == nk::kNkSideArtic);
 static_assert(NUKA_CONTACT_SIDE_PARTICLE == nk::kNkSideParticle);
 static_assert(NUKA_CONTACT_SIDE_STATIC == nk::kNkSideStatic);
 static_assert(NUKA_CONTACT_SIDE_GRID == nk::kNkSideGrid);
+static_assert(NUKA_CONTACT_SIDE_POINT_ENDPOINT == nk::kNkSidePointEndpoint);
+static_assert(sizeof(nuka_point_endpoint_range_t) == sizeof(nk::PointEndpointRange));
+static_assert(sizeof(nuka_point_endpoint_term_t) == sizeof(nk::PointEndpointTerm));
+static_assert(offsetof(nuka_point_endpoint_term_t, column) == offsetof(nk::PointEndpointTerm, column));
 static_assert(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW == phi::kEnvStatusGridContactOverflow);
 static_assert(NUKA_ENV_STATUS_GYRO_FAILURE == phi::kEnvStatusGyroFailure);
 static_assert(NUKA_ENV_STATUS_INVALID_ENDPOINT == phi::kEnvStatusInvalidEndpoint);
@@ -53,6 +58,7 @@ static_assert(NUKA_GYRO_INVALID_INPUT == phi::kBodyGyroInvalidInput);
 inline constexpr uint8_t kWireDtypeF32 = 0u;
 inline constexpr uint8_t kWireDtypeU32 = 1u;
 inline constexpr uint8_t kWireDtypeU64 = 2u;
+inline constexpr uint8_t kWireDtypeU8 = 3u;
 
 // Sentinel for a public descriptor without arena storage.
 inline constexpr nk::FieldId kNoFieldId = nk::FieldId::Count;
@@ -179,14 +185,16 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_ACCELERATION_TARGET,    kStrideF32, kWireDtypeF32, nk::FieldId::AccelerationTarget},
     {NUKA_FIELD_TASK_NULLSPACE_STIFFNESS, kStrideF32, kWireDtypeF32, nk::FieldId::TaskNullspaceStiffness},
     {NUKA_FIELD_TASK_NULLSPACE_DAMPING,  kStrideF32, kWireDtypeF32, nk::FieldId::TaskNullspaceDamping},
+    {NUKA_FIELD_POINT_ENDPOINT_RANGES, sizeof(nuka_point_endpoint_range_t), kWireDtypeU32, nk::FieldId::PointEndpointRanges},
+    {NUKA_FIELD_POINT_ENDPOINT_TERMS, sizeof(nuka_point_endpoint_term_t), kWireDtypeU8, nk::FieldId::PointEndpointTerms},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 59u,
-              "dlpack_table must hold exactly the 59 public state fields");
+static_assert(kDlpackFieldCount == 61u,
+              "dlpack_table must hold exactly the 61 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

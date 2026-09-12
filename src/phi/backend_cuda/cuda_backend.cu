@@ -36,6 +36,7 @@ const char* NkOpName(int op) {
         case NkOp::ApplyDrives: return "ApplyDrives";
         case NkOp::ApplyDynamicsDrives: return "ApplyDynamicsDrives";
         case NkOp::ReadoutDrives: return "ReadoutDrives";
+        case NkOp::RefitParticleSurfaces: return "RefitParticleSurfaces";
         case NkOp::AbaForward: return "AbaForward";
         case NkOp::IntegrateVelocity: return "IntegrateVelocity";
         case NkOp::FkWorldPoses: return "FkWorldPoses";

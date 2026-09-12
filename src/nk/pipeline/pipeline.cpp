@@ -534,6 +534,12 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     };
     project_particles(0u);
 
+    if (cap.point_endpoints_per_env > 0u && cap.particle_surfaces_per_env > 0u) {
+        p_particle_surfaces_ = {env_count, per_env_particles, cap.particle_surfaces_per_env,
+                               cap.particle_surface_triangles, cap.particle_surface_nodes_per_env};
+        add(phi::NkOp::RefitParticleSurfaces, &p_particle_surfaces_);
+    }
+
     if (has_collidables) {
         p_np_prim_.contact_margin = cfg.contact_margin;
         p_np_prim_.max_contacts_per_pair = kMaxContactsPerPair;
@@ -551,15 +557,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_np_prim_.rigid_slot_cap = rigid_cap;  // body<->body fills only [0, rigid_cap).
         p_np_prim_.bodies_per_env = cap.bodies_per_env;
 
-        // Diagnostic: write narrowphase params to file
-        if (FILE* f = std::fopen("narrowphase_params.txt", "w")) {
-            std::fprintf(f, "env_count=%u\n", p_np_prim_.env_count);
-            std::fprintf(f, "union_slot_count=%u\n", p_np_prim_.union_slot_count);
-            std::fprintf(f, "rigid_slot_cap=%u\n", p_np_prim_.rigid_slot_cap);
-            std::fprintf(f, "bodies_per_env=%u\n", p_np_prim_.bodies_per_env);
-            std::fprintf(f, "max_contacts_per_env=%u\n", cap.max_contacts_per_env);
-            std::fclose(f);
-        }
         p_np_prim_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
         p_np_prim_.particles_per_env = cap.particles_per_env;  // coupling slots.
@@ -669,6 +666,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (has_contacts) {
         p_assemble_.grid_nodes_per_env = cap.mpm_grid_nodes_per_env;
+        p_assemble_.point_endpoints_per_env = cap.point_endpoints_per_env;
+        p_assemble_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
         p_assemble_.dt = cfg.dt;
         p_assemble_.slot_count = slot_count;
         p_assemble_.max_dof = max_dof;
@@ -828,7 +827,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     // consumer demanded its output fields (World flips the bit on first request
     // and rebuilds; unconsumed worlds skip the full row scan every step).
     if ((readout_demand & kReadoutContactWrench) != 0u &&
-        (has_articulation || has_bodies)) {
+        has_contacts) {
         p_readout_.dt = cfg.dt;
         p_readout_.env_count = env_count;
         p_readout_.base_link_count = base_link_count;

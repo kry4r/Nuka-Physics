@@ -448,9 +448,29 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
                                     uint32_t env, uint32_t index,
                                     uint32_t bodies_per_env, uint32_t base_link_count,
                                     uint32_t artics_per_env, uint32_t particles_per_env,
-                                    uint32_t grid_nodes_per_env, uint32_t* out_artic, uint32_t* out_link,
+                                    uint32_t grid_nodes_per_env, uint32_t endpoints_per_env,
+                                    uint32_t terms_per_env, const nk::PointEndpointRange* ranges,
+                                    const nk::PointEndpointTerm* terms, uint32_t* out_artic, uint32_t* out_link,
                                     uint32_t* out_body, uint32_t* out_particle) {
     *out_artic = ~0u; *out_link = ~0u; *out_body = ~0u; *out_particle = ~0u;
+    if (side_kind == nk::kUContactSidePointEndpoint) {
+        const uint64_t first = uint64_t{env} * endpoints_per_env;
+        if (!ranges || !terms || index < first || index >= first + endpoints_per_env) return ~0u;
+        const auto range = ranges[index];
+        const uint64_t begin = uint64_t{env} * terms_per_env;
+        if (range.count == 0u || range.first < begin || uint64_t{range.first} + range.count > begin + terms_per_env)
+            return ~0u;
+        for (uint32_t i = 0u; i < range.count; ++i) {
+            const auto& term = terms[range.first + i];
+            if (term.kind != kNkSideParticle && term.kind != kNkSideGrid) return ~0u;
+            const uint32_t stride = term.kind == kNkSideGrid ? grid_nodes_per_env : particles_per_env;
+            if (term.index < uint64_t{env} * stride || term.index >= uint64_t{env + 1u} * stride) return ~0u;
+            for (const auto& column : term.column)
+                if (!isfinite(column.x) || !isfinite(column.y) || !isfinite(column.z)) return ~0u;
+        }
+        *out_particle = index;
+        return kNkSidePointEndpoint;
+    }
     if (side_kind == nk::kUContactSideParticle) {
         const uint64_t first = static_cast<uint64_t>(env) * particles_per_env;
         if (index < first || index >= first + particles_per_env) return ~0u;
@@ -504,6 +524,8 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t num_material_buckets,
     uint64_t* __restrict__ contact_material,
     uint32_t n_soft_particles, uint32_t particles_per_env, uint32_t grid_nodes_per_env,
+    uint32_t endpoints_per_env, uint32_t terms_per_env,
+    const nk::PointEndpointRange* endpoint_ranges, const nk::PointEndpointTerm* endpoint_terms,
     float particle_soft_friction, float particle_fluid_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
@@ -565,12 +587,14 @@ __global__ void EmitPairDrivenRowsKernel(
                                  body_to_articulation, body_collidable_body,
                                  env, local_a, bodies_per_env,
                                  base_link_count, artics_per_env, particles_per_env, grid_nodes_per_env,
+                                 endpoints_per_env, terms_per_env, endpoint_ranges, endpoint_terms,
                                  &art_a, &link_a,
                                  &body_a, &part_a);
         kind_b = ResolvePairSide(side_kind_b, bid_b, body_to_link,
                                  body_to_articulation, body_collidable_body,
                                  env, local_b, bodies_per_env,
                                  base_link_count, artics_per_env, particles_per_env, grid_nodes_per_env,
+                                 endpoints_per_env, terms_per_env, endpoint_ranges, endpoint_terms,
                                  &art_b, &link_b,
                                  &body_b, &part_b);
         if (kind_a == ~0u || kind_b == ~0u) {
@@ -581,10 +605,10 @@ __global__ void EmitPairDrivenRowsKernel(
     }
     const uint32_t idx_a = (kind_a == kNkSideArtic) ? art_a
                           : (kind_a == kNkSideRigid) ? body_a
-                          : (kind_a == kNkSideParticle || kind_a == kNkSideGrid) ? part_a : ~0u;
+                          : PointMassView::IsPointSide(kind_a) ? part_a : ~0u;
     const uint32_t idx_b = (kind_b == kNkSideArtic) ? art_b
                           : (kind_b == kNkSideRigid) ? body_b
-                          : (kind_b == kNkSideParticle || kind_b == kNkSideGrid) ? part_b : ~0u;
+                          : PointMassView::IsPointSide(kind_b) ? part_b : ~0u;
 
     math::Vec3 com_a{0, 0, 0}, com_b{0, 0, 0};
     if (kind_a == kNkSideRigid) com_a = BodyCenterOfMass(body_pose[idx_a], body_inertial_frame[idx_a]);
@@ -611,9 +635,9 @@ __global__ void EmitPairDrivenRowsKernel(
                                                    : particle_fluid_friction;
         side_b = DefaultProfile(mu, solref0, solref1, default_solimp);
     }
-    if (kind_a == kNkSideGrid || side_kind_a == nk::kUContactSideBoundary)
+    if (kind_a == kNkSideGrid || kind_a == kNkSidePointEndpoint || side_kind_a == nk::kUContactSideBoundary)
         side_a = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
-    if (kind_b == kNkSideGrid || side_kind_b == nk::kUContactSideBoundary)
+    if (kind_b == kNkSideGrid || kind_b == kNkSidePointEndpoint || side_kind_b == nk::kUContactSideBoundary)
         side_b = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
     const scene::MergedContactParams merged = scene::MergeContactParams(side_a, side_b);
     const float* solref = merged.solref;
@@ -675,7 +699,7 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.lower = 0.0f;
                 row.upper = kFltMaxLocal;
                 row.mu = mu1;
-                row.reserved[0] = mu2;
+                row.friction_secondary = mu2;
                 row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = n;
                 row.b.kind = kind_b; row.b.index = idx_b;
                 row.b.jlin = math::Vec3{-n.x, -n.y, -n.z};
@@ -716,7 +740,7 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.lower = -kFltMaxLocal;
                 row.upper = kFltMaxLocal;
                 row.mu = mu1;
-                row.reserved[0] = mu2;
+                row.friction_secondary = mu2;
                 row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = dir;
                 row.b.kind = kind_b; row.b.index = idx_b;
                 row.b.jlin = math::Vec3{-dir.x, -dir.y, -dir.z};
@@ -933,6 +957,8 @@ __device__ float PairDrivenSideCoupling(
     const float* __restrict__ body_inv_mass,
     const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     PointMassView point_masses, uint32_t dof_stride) {
+    if (PointMassView::IsPointSide(lhs.kind) && PointMassView::IsPointSide(rhs.kind))
+        return point_masses.Coupling(lhs, rhs);
     if (lhs.kind != rhs.kind || lhs.index != rhs.index) return 0.0f;
     switch (lhs.kind) {
         case kNkSideRigid: {
@@ -984,42 +1010,12 @@ __device__ float PairDrivenRowCoupling(
     return coupling;
 }
 
-__device__ void StoreContactBlockInverse(NkRow* normal, float k00, float k01,
-                                         float k02, float k11, float k12,
-                                         float k22) {
-    const float scale = fmaxf(fmaxf(k00, k11), k22);
-    if (!(scale > 0.0f) || !isfinite(scale)) {
-        for (uint32_t i = 1u; i < 7u; ++i) normal->reserved[i] = 0.0f;
-        return;
-    }
-    k00 /= scale; k01 /= scale; k02 /= scale;
-    k11 /= scale; k12 /= scale; k22 /= scale;
-    const float c00 = k11 * k22 - k12 * k12;
-    const float c01 = k02 * k12 - k01 * k22;
-    const float c02 = k01 * k12 - k02 * k11;
-    const float c11 = k00 * k22 - k02 * k02;
-    const float c12 = k01 * k02 - k00 * k12;
-    const float c22 = k00 * k11 - k01 * k01;
-    const float determinant = k00 * c00 + k01 * c01 + k02 * c02;
-    const float threshold = 1.0e-12f;
-    if (!(determinant > threshold) || !isfinite(determinant)) {
-        for (uint32_t i = 1u; i < 7u; ++i) normal->reserved[i] = 0.0f;
-        return;
-    }
-    const float inv_det = (1.0f / determinant) / scale;
-    normal->reserved[1] = c00 * inv_det;
-    normal->reserved[2] = c01 * inv_det;
-    normal->reserved[3] = c02 * inv_det;
-    normal->reserved[4] = c11 * inv_det;
-    normal->reserved[5] = c12 * inv_det;
-    normal->reserved[6] = c22 * inv_det;
-}
-
 __device__ float ContactReferenceVelocity(
     const NkRow& row, uint32_t rs, uint32_t dof_stride,
     const float* chain_jacobian, const float* chain_jacobian_b,
     const float* step_qdot, const math::Vec3* step_body_linear,
-    const math::Vec3* step_body_angular, const math::Vec3* step_particle) {
+    const math::Vec3* step_body_angular, const math::Vec3* step_particle,
+    PointMassView point_masses) {
     float velocity = 0.0f;
     const NkRowSide sides[2] = {row.a, row.b};
     for (uint32_t s = 0; s < 2u; ++s) {
@@ -1033,14 +1029,18 @@ __device__ float ContactReferenceVelocity(
         } else if (side.kind == kNkSideRigid) {
             velocity += Dot3(side.jlin, step_body_linear[side.index]) +
                         Dot3(side.jang, step_body_angular[side.index]);
-        } else if (side.kind == kNkSideParticle) {
-            velocity += Dot3(side.jlin, step_particle[side.index]);
+        } else if (PointMassView::IsPointSide(side.kind)) {
+            for (uint32_t i = 0u; i < point_masses.Count(side); ++i) {
+                const auto term = point_masses.At(side, i);
+                if (term.kind == kNkSideParticle && step_particle != nullptr)
+                    velocity += Dot3(term.jacobian, step_particle[term.index]);
+            }
         }
     }
     return velocity;
 }
 
-// Computes scalar masses for every row and the symmetric contact block inverse.
+// Computes scalar masses and the symmetric response of each contact block.
 __global__ void ComputeRowMeffPairDrivenKernel(
     NkRow* __restrict__ urows,
     const float* __restrict__ chain_jacobian,
@@ -1074,7 +1074,7 @@ __global__ void ComputeRowMeffPairDrivenKernel(
         row.compliance_alpha *= fmaxf(diagonal, 0.0f);
         const float initial_velocity = ContactReferenceVelocity(
             row, rs, dof_stride, chain_jacobian, chain_jacobian_b,
-            step_qdot, step_body_linear, step_body_angular, step_particle);
+            step_qdot, step_body_linear, step_body_angular, step_particle, point_masses);
         // (1+b*dt)*v_next + R*impulse = v_start - dt*k*d*position.
         row.rhs += initial_velocity / dt;
     }
@@ -1089,7 +1089,7 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     const NkRow& tangent2 = urows[tangent2_row];
     if (!(tangent1.flags & nk::nk_row_flags::kBlockTangent) ||
         !(tangent2.flags & nk::nk_row_flags::kBlockTangent)) {
-        for (uint32_t i = 1u; i < 7u; ++i) row.reserved[i] = 0.0f;
+        row.contact_response = {};
         return;
     }
     // Normalize by (1+b*dt) to retain a symmetric block with R/(1+b*dt).
@@ -1131,7 +1131,7 @@ __global__ void ComputeRowMeffPairDrivenKernel(
                               chain_jacobian, row_minv_jt, chain_jacobian_b,
                               row_minv_jt_b, body_inv_mass, body_world_inv_inertia,
                               point_masses, dof_stride));
-    StoreContactBlockInverse(&row, k00, k01, k02, k11, k12, k22);
+    row.contact_response = {k00, k11, k22, k01, k02, k12};
 }
 
 __device__ bool ContactRowOffsets(uint32_t env, uint32_t slot, uint32_t point,
@@ -1478,6 +1478,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.mat_buckets),
                    p->num_material_buckets, data.contact_material,
                    p->n_soft_particles, p->particles_per_env, p->grid_nodes_per_env,
+                   p->point_endpoints_per_env, p->point_endpoint_terms_per_env,
+                   data.point_endpoint_ranges, data.point_endpoint_terms,
                    p->particle_soft_friction, p->particle_fluid_friction,
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
@@ -1580,7 +1582,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.body_inv_mass),
                    static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
                    PointMassView{data.particle_inv_mass, data.particle_vel,
-                                 data.grid_inv_mass, data.grid_velocity},
+                                 data.grid_inv_mass, data.grid_velocity,
+                                 data.point_endpoint_ranges, data.point_endpoint_terms},
                    data.row_damping, data.step_qdot_flat, data.step_body_linear_velocity,
                    data.step_body_angular_velocity, data.step_particle_velocity,
                    total_rows, p->max_dof, p->dt, data.row_meff);

@@ -336,6 +336,15 @@ enum class FieldId : uint16_t {
     ControlJacobian,  // control_jacobian (per:articulation_dof arena:scratch owner:data elem:6)
     ControlResponse,  // control_response (per:articulation_dof arena:scratch owner:data elem:6)
     ControlTaskMap,  // control_task_map (per:articulation_dof arena:scratch owner:data elem:6)
+    ParticleSurfaceInfo,  // particle_surface_info (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
+    ParticleSurfaceTriangles,  // particle_surface_triangles (per:scalar arena:persistent owner:model count:particle_surface_triangles*3)
+    ParticleSurfaceTree,  // particle_surface_tree (per:scalar arena:persistent owner:model count:particle_surface_nodes_per_env)
+    ParticleSurfaceThickness,  // particle_surface_thickness (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
+    ParticleSurfaceFriction,  // particle_surface_friction (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
+    ParticleSurfaceNodes,  // particle_surface_nodes (per:scalar arena:scratch owner:data count:particle_surface_nodes_per_env*env_count)
+    PointEndpointRanges,  // point_endpoint_ranges (per:scalar arena:scratch owner:data count:point_endpoints_per_env*env_count flags:[readout])
+    PointEndpointTerms,  // point_endpoint_terms (per:scalar arena:scratch owner:data count:point_endpoint_terms_per_env*env_count flags:[readout])
+    ParticleProjectionDelta,  // particle_projection_delta (per:particle arena:scratch owner:data)
     Count
 };
 
@@ -667,6 +676,15 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "control_jacobian",
     "control_response",
     "control_task_map",
+    "particle_surface_info",
+    "particle_surface_triangles",
+    "particle_surface_tree",
+    "particle_surface_thickness",
+    "particle_surface_friction",
+    "particle_surface_nodes",
+    "point_endpoint_ranges",
+    "point_endpoint_terms",
+    "particle_projection_delta",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

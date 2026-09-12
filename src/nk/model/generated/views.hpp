@@ -17,6 +17,7 @@
 #include "math/transform.hpp"
 #include "math/symmetric_mat3.hpp"
 #include "collision/mesh_surface_types.hpp"
+#include "nk/solve/point_endpoint.hpp"
 
 namespace nuka::nk {
 // Spatial / matrix element types for the articulation device state
@@ -105,6 +106,11 @@ struct ModelView {
     ::nuka::collision::MeshSurfaceInfo* mesh_surface_info = nullptr;  // per:scalar arena:persistent owner:model count:mesh_surface_info_count
     uint32_t* mesh_triangles = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_triangles*3
     ::nuka::collision::MeshBvhNode* mesh_bvh_nodes = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_bvh_nodes
+    ::nuka::collision::MeshSurfaceInfo* particle_surface_info = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
+    uint32_t* particle_surface_triangles = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_triangles*3
+    ::nuka::collision::MeshBvhNode* particle_surface_tree = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_nodes_per_env
+    float* particle_surface_thickness = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
+    float* particle_surface_friction = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena
@@ -362,6 +368,10 @@ struct DataView {
     float* control_jacobian = nullptr;  // per:articulation_dof arena:scratch owner:data elem:6
     float* control_response = nullptr;  // per:articulation_dof arena:scratch owner:data elem:6
     float* control_task_map = nullptr;  // per:articulation_dof arena:scratch owner:data elem:6
+    ::nuka::collision::MeshBvhNode* particle_surface_nodes = nullptr;  // per:scalar arena:scratch owner:data count:particle_surface_nodes_per_env*env_count
+    ::nuka::nk::PointEndpointRange* point_endpoint_ranges = nullptr;  // per:scalar arena:scratch owner:data count:point_endpoints_per_env*env_count flags:[readout]
+    ::nuka::nk::PointEndpointTerm* point_endpoint_terms = nullptr;  // per:scalar arena:scratch owner:data count:point_endpoint_terms_per_env*env_count flags:[readout]
+    ::nuka::math::Vec3* particle_projection_delta = nullptr;  // per:particle arena:scratch owner:data
 };
 
 } // namespace nuka::phi

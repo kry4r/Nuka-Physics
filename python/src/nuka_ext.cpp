@@ -1057,13 +1057,14 @@ template <typename T>
 nb::ndarray<nb::pytorch, T> make_unsigned_view(const nuka_buffer_view_t& view, uint32_t ec,
                                               nb::handle owner) {
     const int dev_id = 0;
+    const size_t lanes = view.element_stride_bytes / sizeof(T);
     if (ec > 0u && view.element_count % ec == 0u) {
-        size_t shape[2] = {ec, view.element_count / ec};
-        return nb::ndarray<nb::pytorch, T>(view.device_ptr, 2, shape, owner, nullptr,
+        size_t shape[3] = {ec, view.element_count / ec, lanes};
+        return nb::ndarray<nb::pytorch, T>(view.device_ptr, lanes > 1u ? 3 : 2, shape, owner, nullptr,
                            nb::dtype<T>(), nb::device::cuda::value, dev_id);
     }
-    size_t shape[1] = {view.element_count};
-    return nb::ndarray<nb::pytorch, T>(view.device_ptr, 1, shape, owner, nullptr,
+    size_t shape[2] = {view.element_count, lanes};
+    return nb::ndarray<nb::pytorch, T>(view.device_ptr, lanes > 1u ? 2 : 1, shape, owner, nullptr,
                        nb::dtype<T>(), nb::device::cuda::value, dev_id);
 }
 
@@ -1843,6 +1844,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("CONTACT_SIDE_B_KIND", NUKA_FIELD_CONTACT_SIDE_B_KIND)
         .value("CONTACT_SIDE_A_INDEX", NUKA_FIELD_CONTACT_SIDE_A_INDEX)
         .value("CONTACT_SIDE_B_INDEX", NUKA_FIELD_CONTACT_SIDE_B_INDEX)
+        .value("POINT_ENDPOINT_RANGES", NUKA_FIELD_POINT_ENDPOINT_RANGES)
+        .value("POINT_ENDPOINT_TERMS", NUKA_FIELD_POINT_ENDPOINT_TERMS)
         .value("BODY_FORCE", NUKA_FIELD_BODY_FORCE)
         .value("BODY_TORQUE", NUKA_FIELD_BODY_TORQUE)
         .value("ENV_STATUS", NUKA_FIELD_ENV_STATUS)
@@ -1881,7 +1884,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("LINK", NUKA_CONTACT_SIDE_LINK)
         .value("PARTICLE", NUKA_CONTACT_SIDE_PARTICLE)
         .value("STATIC", NUKA_CONTACT_SIDE_STATIC)
-        .value("GRID", NUKA_CONTACT_SIDE_GRID);
+        .value("GRID", NUKA_CONTACT_SIDE_GRID)
+        .value("POINT_ENDPOINT", NUKA_CONTACT_SIDE_POINT_ENDPOINT);
 
     // Batched camera-sensor AOV plane for World.get_sensor_view: COLOR/NORMAL/ALBEDO
     // = (N,H,W,3) float32, DEPTH = (N,H,W,1) float32, PRIM = (N,H,W,1) uint32. RANGE
@@ -2160,7 +2164,8 @@ NB_MODULE(_nuka_ext, m) {
             [](World& w, nuka_state_field_t field, size_t offset,
                size_t count) -> nb::object {
                 nuka_buffer_view_t view = w.get_view(field);
-                const size_t scalar_bytes = view.dtype == 2u ? sizeof(uint64_t) : sizeof(float);
+                const size_t scalar_bytes = view.dtype == 3u ? sizeof(uint8_t) :
+                    view.dtype == 2u ? sizeof(uint64_t) : sizeof(float);
                 const size_t fpe = (view.element_stride_bytes >= scalar_bytes)
                                        ? (view.element_stride_bytes / scalar_bytes)
                                        : 1u;
@@ -2173,6 +2178,13 @@ NB_MODULE(_nuka_ext, m) {
                     throw std::runtime_error("download_field: range exceeds field");
                 }
                 size_t shape[1] = {n};
+                if (view.dtype == 3u) {
+                    uint8_t* buf = new uint8_t[n ? n : 1u];
+                    nb::capsule owner(buf, [](void* p) noexcept { delete[] static_cast<uint8_t*>(p); });
+                    check(nuka_world_download_field(w.raw(), field, buf, n, offset),
+                          "nuka_world_download_field");
+                    return nb::cast(nb::ndarray<nb::numpy, uint8_t>(buf, 1, shape, owner));
+                }
                 if (view.dtype == 2u) {
                     uint64_t* buf = new uint64_t[n ? n : 1u];
                     check(nuka_world_download_field(w.raw(), field, buf, n * sizeof(uint64_t),
@@ -2367,6 +2379,8 @@ NB_MODULE(_nuka_ext, m) {
                 }
                 if (view.dtype == 2u)
                     return nb::cast(make_unsigned_view<uint64_t>(view, w->env_count(), self));
+                if (view.dtype == 3u)
+                    return nb::cast(make_unsigned_view<uint8_t>(view, w->env_count(), self));
                 return nb::cast(make_array_from_view(
                     view, w->env_count(), w->base_link_count(), self));
             },
@@ -2908,7 +2922,8 @@ NB_MODULE(_nuka_ext, m) {
              "cable_segments links, cable_radius bead size, cable_pin endpoint, optional "
              "cable_slab_* rigid weight welded to the loaded end. Material scalars at 0 take "
              "the cook's own defaults. An illegal (kind x method) pair raises here; an "
-             "MPM + XPBD/PBF mix raises at build(). Returns the new record's media id.")
+             "MPM + XPBD supports two-way surface contact; MPM + PBF raises at build(). "
+             "Returns the new record's media id.")
         .def("add_mpm_fill", &SceneBuilder::add_mpm_fill, nb::arg("media_id"),
              nb::arg("box_min"), nb::arg("box_max"), nb::arg("spacing"),
              nb::arg("position_jitter") = 0.0f, nb::arg("youngs") = 0.0f,

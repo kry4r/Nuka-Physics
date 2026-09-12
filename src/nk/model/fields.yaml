@@ -984,3 +984,17 @@ fields:
   - {name: control_jacobian, dtype: f32, per: articulation_dof, elem: 6, arena: scratch, owner: data}
   - {name: control_response, dtype: f32, per: articulation_dof, elem: 6, arena: scratch, owner: data}
   - {name: control_task_map, dtype: f32, per: articulation_dof, elem: 6, arena: scratch, owner: data}
+
+  # Deformable collision topology is independent of aerodynamic and rendering topology.
+  - {name: particle_surface_info, dtype: mesh_surface_info, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_triangles, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
+  - {name: particle_surface_tree, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_nodes_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_thickness, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_friction, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_nodes, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_nodes_per_env*env_count", arena: scratch, owner: data}
+
+  # Endpoint maps are frozen with the contact geometry during each physical interval.
+  - {name: point_endpoint_ranges, dtype: point_endpoint_range, per: scalar, count: "point_endpoints_per_env*env_count", arena: scratch, owner: data, flags: [readout]}
+  - {name: point_endpoint_terms, dtype: point_endpoint_term, per: scalar, count: "point_endpoint_terms_per_env*env_count", arena: scratch, owner: data, flags: [readout]}
+  # Material projection adds a velocity increment without re-encoding earlier impulses in positions.
+  - {name: particle_projection_delta, dtype: vec3, per: particle, arena: scratch, owner: data}

@@ -238,12 +238,8 @@ typedef struct nuka_environment_desc_t {
 nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
                                          const nuka_environment_desc_t* desc);
 
-// What a medium IS (solver routing) and HOW it solves (one method per medium).
-// The legal (kind x method) set is enforced by the SAME cook validator: cloth =
-// XPBD; soft-tet = XPBD or MLS-MPM; fluid = PBF or MLS-MPM; granular = MLS-MPM
-// only (Drucker-Prager); cable = XPBD. An illegal pair is
-// rejected LOUDLY (INVALID_ARG) at nuka_scene_add_media; an MPM + XPBD/PBF mix is
-// rejected at cook (nuka_world_create_from_built_scene).
+// The cook validator rejects unsupported kind/method pairs and MPM + PBF worlds.
+// MPM + XPBD worlds support two-way contact with authored particle surfaces.
 typedef enum nuka_media_kind_t {
     NUKA_MEDIA_CLOTH    = 0,
     NUKA_MEDIA_SOFT_TET = 1,

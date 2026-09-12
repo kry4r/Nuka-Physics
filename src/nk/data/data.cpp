@@ -17,6 +17,9 @@ namespace {
 // default (those are ModelView members, not here).
 void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
     switch (id) {
+        case FieldId::ParticleSurfaceNodes: v.particle_surface_nodes = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::PointEndpointRanges: v.point_endpoint_ranges = static_cast<PointEndpointRange*>(p); break;
+        case FieldId::PointEndpointTerms: v.point_endpoint_terms = static_cast<PointEndpointTerm*>(p); break;
         case FieldId::Q:                   v.q = static_cast<float*>(p); break;
         case FieldId::Qdot:                v.qdot = static_cast<float*>(p); break;
         case FieldId::LinkPose:            v.link_pose = static_cast<math::Transform*>(p); break;
@@ -258,6 +261,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::BendLambda:          v.bend_lambda = static_cast<float*>(p); break;
         case FieldId::VolLambda:           v.vol_lambda = static_cast<float*>(p); break;
         case FieldId::PbfPredictedPos:     v.pbf_predicted_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::ParticleProjectionDelta: v.particle_projection_delta = static_cast<math::Vec3*>(p); break;
         case FieldId::PbfPositionDelta:    v.pbf_position_delta = static_cast<math::Vec3*>(p); break;
         case FieldId::PbfDensity:          v.pbf_density = static_cast<float*>(p); break;
         case FieldId::PbfLambda:           v.pbf_lambda = static_cast<float*>(p); break;

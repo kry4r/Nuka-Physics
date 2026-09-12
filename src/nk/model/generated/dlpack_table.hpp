@@ -352,6 +352,15 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ControlJacobian, DlpackDtype::kF32, 2, false, false},  // control_jacobian
     {FieldId::ControlResponse, DlpackDtype::kF32, 2, false, false},  // control_response
     {FieldId::ControlTaskMap, DlpackDtype::kF32, 2, false, false},  // control_task_map
+    {FieldId::ParticleSurfaceInfo, DlpackDtype::kU8, 2, false, false},  // particle_surface_info
+    {FieldId::ParticleSurfaceTriangles, DlpackDtype::kU32, 1, false, false},  // particle_surface_triangles
+    {FieldId::ParticleSurfaceTree, DlpackDtype::kU8, 2, false, false},  // particle_surface_tree
+    {FieldId::ParticleSurfaceThickness, DlpackDtype::kF32, 1, false, false},  // particle_surface_thickness
+    {FieldId::ParticleSurfaceFriction, DlpackDtype::kF32, 1, false, false},  // particle_surface_friction
+    {FieldId::ParticleSurfaceNodes, DlpackDtype::kU8, 2, false, false},  // particle_surface_nodes
+    {FieldId::PointEndpointRanges, DlpackDtype::kU8, 2, false, true},  // point_endpoint_ranges
+    {FieldId::PointEndpointTerms, DlpackDtype::kU8, 2, false, true},  // point_endpoint_terms
+    {FieldId::ParticleProjectionDelta, DlpackDtype::kF32, 2, false, false},  // particle_projection_delta
 };
 
 } // namespace nuka::nk

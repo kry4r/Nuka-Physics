@@ -1,21 +1,4 @@
-// ---------------------------------------------------------------------------
-// M6 — nk standalone-particle EQUIVALENCE to the legacy XPBD/PBF oracle bars.
-//
-// The XPBD 4件套 + PBF 5件套 (tests/runtime/test_xpbd_*, test_pbf_*) test the
-// LEGACY soft/fluid stepper classes directly;
-// those classes SURVIVE until M9 and stay green. This file is the M6 nk-path
-// EQUIVALENCE: the SAME kernel bodies, now ported into the nk particle ops
-// (particles.cu, the standalone mode == Xpbd / Pbf path — no coupling), reproduce
-// the same oracle bars through nk::World:
-//   * XPBD distance oscillation: a tethered particle oscillates with the SAME
-//     analytic discrete period (the test_xpbd_distance_oracle gate) + D1.
-//   * XPBD tet volume: a free tet under gravity conserves its volume (the
-//     test_xpbd_volume_tet invariant) + D1.
-//   * PBF density: a rest-lattice blob's interior density stays near rho0 (the
-//     PBF density / volume-conservation oracle) + D1.
-// Cheap (small scenes, few steps); the byte-exact port is asserted by D1, the
-// physics by the same tolerance bands the legacy suites use.
-// ---------------------------------------------------------------------------
+// Particle pipeline checks for physical invariants and deterministic replay.
 
 #include <gtest/gtest.h>
 
@@ -56,7 +39,66 @@ float TetVolume6(const Vec3& p0, const Vec3& p1, const Vec3& p2, const Vec3& p3)
 
 }  // namespace
 
-// XPBD distance oscillation period (the test_xpbd_distance_oracle gate, nk path).
+TEST(NkParticleEquivalence, SmallStepFreeMotionRetainsMomentumAtTranslatedOrigins) {
+    const auto backend = GetCtx();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (float origin : {0.0f, 100.0f, 10000.0f}) {
+        nk::Model model;
+        model.particles.mode = nk::Model::ParticleMode::Xpbd;
+        model.particles.initial_pos = {{origin, origin, origin}};
+        model.particles.initial_vel = {{0.125f, -0.25f, 0.5f}};
+        model.particles.inv_mass = {0.001f};
+        model.capacities.particles_per_env = 1u;
+        nk::Pipeline::SolverConfig config;
+        config.dt = 1.0e-5f;
+        config.gravity[0] = 0.1f;
+        config.gravity[1] = 0.2f;
+        config.gravity[2] = -0.3f;
+        nk::World world(std::move(model), 1u, backend.dev, backend.backend, config);
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        for (uint32_t step = 0u; step < 50u; ++step) ASSERT_TRUE(world.Step().AllOk());
+        Vec3 actual{};
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticleVel, &actual, sizeof(actual)));
+        const Vec3 expected = Vec3{0.125f, -0.25f, 0.5f} + Vec3{0.1f, 0.2f, -0.3f} * (50.0f * config.dt);
+        EXPECT_LT((actual - expected).Length(), 2.0e-6f) << "origin=" << origin;
+    }
+}
+
+TEST(NkParticleEquivalence, SmallStepMaterialImpulseRetainsMomentumAtTranslatedOrigins) {
+    const auto backend = GetCtx();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    constexpr float rest = 0.9f, compliance = 0.001f, dt = 1.0e-5f;
+    const float expected_speed = (1.0f - rest) / (2.0f + compliance / (dt * dt)) / dt;
+    for (float origin : {0.0f, 10000.0f}) {
+        nk::Model model;
+        auto& particles = model.particles;
+        particles.mode = nk::Model::ParticleMode::Xpbd;
+        particles.initial_pos = {{origin, 0.0f, 0.0f}, {origin + 1.0f, 0.0f, 0.0f}};
+        particles.initial_vel = {Vec3::Zero(), Vec3::Zero()};
+        particles.inv_mass = {1.0f, 1.0f};
+        particles.dist_a = {0u};
+        particles.dist_b = {1u};
+        particles.dist_rest = {rest};
+        particles.dist_alpha = {compliance};
+        particles.xpbd_iters = 1u;
+        model.capacities.particles_per_env = 2u;
+        model.capacities.dist_cons_per_env = 1u;
+        nk::Pipeline::SolverConfig config;
+        config.dt = dt;
+        config.gravity[0] = config.gravity[1] = config.gravity[2] = 0.0f;
+        nk::World world(std::move(model), 1u, backend.dev, backend.backend, config);
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        ASSERT_TRUE(world.Step().AllOk());
+        Vec3 velocity[2]{};
+        ASSERT_TRUE(world.GetData().DownloadField(nk::FieldId::ParticleVel, velocity, sizeof(velocity)));
+        EXPECT_LT((velocity[0] - Vec3{expected_speed, 0.0f, 0.0f}).Length(), 1.0e-8f)
+            << "origin=" << origin;
+        EXPECT_LT((velocity[1] + Vec3{expected_speed, 0.0f, 0.0f}).Length(), 1.0e-8f)
+            << "origin=" << origin;
+        EXPECT_LT((velocity[0] + velocity[1]).Length(), 1.0e-9f) << "origin=" << origin;
+    }
+}
+
 TEST(NkParticleEquivalence, XpbdDistanceOscillationPeriodMatchesAnalytic) {
     if (GetCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
     const float rest = 1.0f, stretch = 0.1f, inv_mass = 1.0f, alpha = 0.02f;

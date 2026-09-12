@@ -560,7 +560,7 @@ typedef enum nuka_state_field_t {
     // READ (per-contact-slot uint32). Kinds use nuka_contact_side_kind_t.
     NUKA_FIELD_CONTACT_SIDE_A_KIND = 33,
     NUKA_FIELD_CONTACT_SIDE_B_KIND = 34,
-    // READ (per-contact-slot uint32). Global body/link/particle index by kind.
+    // READ (per-contact-slot uint32). Global body/link/particle/grid index or point-endpoint range index.
     // Static and inactive sides have UINT32_MAX; shape proxies resolve to their owner.
     NUKA_FIELD_CONTACT_SIDE_A_INDEX = 35,
     NUKA_FIELD_CONTACT_SIDE_B_INDEX = 36,
@@ -598,7 +598,11 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_ACCELERATION_TARGET = 56,
     // WRITABLE: E*K posture acceleration gains for OSC, initially 10 and 2*sqrt(10).
     NUKA_FIELD_TASK_NULLSPACE_STIFFNESS = 57,
-    NUKA_FIELD_TASK_NULLSPACE_DAMPING = 58
+    NUKA_FIELD_TASK_NULLSPACE_DAMPING = 58,
+    // READ: uint32[first,count] per endpoint; first addresses POINT_ENDPOINT_TERMS globally.
+    NUKA_FIELD_POINT_ENDPOINT_RANGES = 59,
+    // READ: uint8 records with the layout of nuka_point_endpoint_term_t, valid for the latest interval.
+    NUKA_FIELD_POINT_ENDPOINT_TERMS = 60
 } nuka_state_field_t;
 
 typedef enum nuka_env_status_t {
@@ -630,14 +634,28 @@ typedef enum nuka_contact_side_kind_t {
     NUKA_CONTACT_SIDE_LINK = 1,
     NUKA_CONTACT_SIDE_PARTICLE = 2,
     NUKA_CONTACT_SIDE_STATIC = 3,
-    NUKA_CONTACT_SIDE_GRID = 4
+    NUKA_CONTACT_SIDE_GRID = 4,
+    NUKA_CONTACT_SIDE_POINT_ENDPOINT = 5
 } nuka_contact_side_kind_t;
+
+typedef struct nuka_point_endpoint_range_t {
+    uint32_t first;
+    uint32_t count;
+} nuka_point_endpoint_range_t;
+
+// A column-major velocity map: endpoint velocity = sum_i column_i * point_velocity_i.
+// Its transpose distributes the endpoint impulse to the referenced particle or grid node.
+typedef struct nuka_point_endpoint_term_t {
+    uint32_t kind;
+    uint32_t index;
+    float column[3][3];
+} nuka_point_endpoint_term_t;
 
 typedef struct nuka_buffer_view_t {
     void* device_ptr;
     size_t element_count;
     uint32_t element_stride_bytes;
-    // Element scalar type: 0 == float32, 1 == uint32, 2 == uint64.
+    // Element scalar type: 0 == float32, 1 == uint32, 2 == uint64, 3 == uint8.
     uint8_t dtype;
 } nuka_buffer_view_t;
 

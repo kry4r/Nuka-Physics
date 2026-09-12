@@ -104,6 +104,11 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx =
     in.aero_drag_tangent = 0.04f;
     in.aero_drag_max_dv = 0.5f;
     in.friction = 0.6f;   // finite mu: the foot grips/drags the cloth.
+    cook::CookParticleSurface surface;
+    surface.friction = in.friction;
+    for (const auto& triangle : tris)
+        surface.triangles.insert(surface.triangles.end(), triangle.v, triangle.v + 3u);
+    in.surfaces.push_back(std::move(surface));
     return in;
 }
 inline cook::PbfCookInput BuildPool(float cx, float cy, float floor_z) {
@@ -176,6 +181,7 @@ struct PreparedScene {
     float cloth_z, pool_floor;
     uint32_t front_link, rear_link;
     std::vector<Transform> link_geom_local;
+    std::vector<float> settled_q, settled_qdot;
 };
 
 inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* device,
@@ -198,6 +204,11 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
     std::vector<Transform> link_pose(L);
     Require(wp.GetData().DownloadField(nk::FieldId::LinkPose, link_pose.data(),
                                            L * sizeof(Transform)), "calibration pose download failed");
+    std::vector<float> settled_q(L), settled_qdot(L);
+    Require(wp.GetData().DownloadField(nk::FieldId::Q, settled_q.data(), L * sizeof(float)),
+            "calibration joint position download failed");
+    Require(wp.GetData().DownloadField(nk::FieldId::Qdot, settled_qdot.data(), L * sizeof(float)),
+            "calibration joint velocity download failed");
     std::vector<Vec3> foot_world;
     for (uint32_t l : foot_links)
         foot_world.push_back((link_pose[l] * link_geom_local[l]).position);
@@ -249,7 +260,7 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
 
 
     return {path, config, front_centre, rear_foot, cloth_z, pool_floor,
-            front_link, rear_link, link_geom_local};
+            front_link, rear_link, link_geom_local, std::move(settled_q), std::move(settled_qdot)};
 }
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
@@ -267,6 +278,59 @@ inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
     model.particles.pp_contact_d_min = kContactDMin;
     for (auto& body : model.body_init)
         if (body.inv_mass > 0.0f) body.angular_velocity = {5.0f, -3.0f, 2.0f};
+    return model;
+}
+
+inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs) {
+    constexpr float radius = 0.028f, mass = 0.15f, dx = 0.02f;
+    const float cloth_z = prepared.cloth_z - 0.0175f;
+    auto scene = RobotScene(prepared.path, true);
+    auto free_body = nuka::scene::kInvalidBody;
+    for (const auto& body : scene.Bodies())
+        if (body.name == "free_body") free_body = body.id;
+    Require(free_body != nuka::scene::kInvalidBody, "free body is missing");
+    auto& body = scene.GetBodyMut(free_body);
+    body.mass = mass;
+    body.inertia = Vec3{1, 1, 1} * (0.4f * mass * radius * radius);
+    body.inertial_transform = Transform::Identity();
+    body.local_transform.position = {prepared.front_centre.x + 0.039f,
+                                     prepared.front_centre.y, cloth_z + radius};
+    std::vector<nuka::scene::ShapeId> shapes;
+    for (const auto& shape : scene.Shapes())
+        if (shape.body_id == free_body) shapes.push_back(shape.id);
+    for (auto id : shapes) scene.GetShapeMut(id).radius = radius;
+    cook::CookToModelOptions options;
+    options.contact_family = cook::CookContactFamily::PairDriven;
+    nk::Model model = cook::CookToModel(scene, envs, options).model;
+    model.articulation.initial_q = prepared.settled_q;
+    model.articulation.initial_qdot = prepared.settled_qdot;
+    auto cloth = BuildCloth(prepared.front_centre.x, prepared.front_centre.y, cloth_z);
+    cloth.aero_drag_normal = cloth.aero_drag_tangent = cloth.aero_drag_max_dv = 0.0f;
+    cook::MpmCookInput mpm;
+    const Vec3 centre{prepared.front_centre.x + 0.01f, prepared.front_centre.y, cloth_z};
+    const float spacing = 0.5f * dx;
+    for (uint32_t z = 0u; z < 4u; ++z)
+        for (uint32_t y = 0u; y < 9u; ++y)
+            for (uint32_t x = 0u; x < 9u; ++x)
+                mpm.positions.push_back(centre + Vec3{(float(x) - 4.0f) * spacing,
+                    (float(y) - 4.0f) * spacing, (float(z) - 3.5f) * spacing});
+    mpm.material.youngs = 10000.0f;
+    mpm.material.poisson = 0.3f;
+    mpm.material.density = 1000.0f;
+    const float volume = spacing * spacing * spacing;
+    mpm.vol0.assign(mpm.positions.size(), volume);
+    mpm.inv_mass.assign(mpm.positions.size(), 1.0f / (mpm.material.density * volume));
+    mpm.velocities.assign(mpm.positions.size(), Vec3{0.0f, 0.0f, 0.05f});
+    mpm.grid_origin = centre - Vec3{0.14f, 0.14f, 0.14f};
+    mpm.grid_dims[0] = mpm.grid_dims[1] = mpm.grid_dims[2] = 15u;
+    mpm.dx = dx;
+    mpm.substeps = 4u;
+    mpm.floor_d = cloth_z - 0.04f;
+    mpm.floor_friction = 0.6f;
+    mpm.contact_capacity = 2048u;
+    cook::CookMpmXpbd(model, envs, mpm, cloth);
+    model.particles.pp_contact_d_min = kClothSpacing;
+    model.particles.mpm_body_friction = 0.6f;
     return model;
 }
 }  // namespace nuka::perf::fixture
