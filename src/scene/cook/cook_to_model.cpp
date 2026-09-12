@@ -1915,12 +1915,7 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
-// ---------------------------------------------------------------------------
-// Two-system cook: MLS-MPM (bulk/granular/fluid) + XPBD (cloth/tet) co-resident in
-// ONE Model with a contiguous [mpm | xpbd] layout. MPM occupies [0, n_mpm), the
-// XPBD set [n_mpm, particles_per_env). MpmStep scopes to the MPM slice; the XPBD
-// predict/project/finalize + the body<->particle rows to the XPBD slice.
-// ---------------------------------------------------------------------------
+// Grid transfer owns [0, n_mpm); XPBD and particle contact rows own the remaining slice.
 
 void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
                  const XpbdCookInput& soft, const SoftFluidContactInput& contact) {

@@ -126,7 +126,7 @@ private:
     phi::PbfApplyDeltaParams          p_pbf_apply_{};
     phi::ParticleFinalizeParams       p_part_finalize_{};
     phi::ParticleParticleContactParams p_pp_contact_{};
-    phi::MpmStepParams                p_mpm_step_{};   // MLS-MPM umbrella step.
+    phi::MpmParams                    p_mpm_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
     // L1-c: p_union_obs_ (the union-only per-env contact-obs readout params)
     // was DELETED with the UnionCsr path / ReadoutUnionContactObs op.

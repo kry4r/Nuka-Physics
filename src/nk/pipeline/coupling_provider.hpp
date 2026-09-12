@@ -21,9 +21,7 @@ struct CouplingBuildCtx {
     uint32_t family = 0u;
     uint32_t env_count = 0u;
     uint32_t bodies_per_env = 0u;
-    // Articulation deposit dims (resolved in Build): the global articulation count,
-    // per-articulation DOF, links/env, and co-resident articulations/env. The MPM
-    // provider forwards them so the link-row grid reaction can chain-walk into qdot.
+    // Articulation dimensions for the generalized endpoint response.
     uint32_t articulation_count = 0u;
     uint32_t max_dof = 0u;
     uint32_t base_link_count = 0u;
@@ -46,10 +44,9 @@ struct CouplingBuildCtx {
     phi::NarrowphaseBodyParticleParams* p_np_body_particle = nullptr;
     phi::ParticleFinalizeParams*        p_part_finalize = nullptr;
     phi::ParticleParticleContactParams* p_pp_contact = nullptr;
-    phi::MpmStepParams*                 p_mpm_step = nullptr;
+    phi::MpmParams*                     p_mpm = nullptr;
 
-    // MLS-MPM grid provider scalars (resolved once in Build from the cooked Model).
-    // has_mpm gates the grid provider's MpmStep emit; 0 elsewhere -> no MpmStep op.
+    // Grid operations are present only when the model owns MPM particles.
     uint32_t has_mpm = 0u;
 
     // Append one op; defined in pipeline.cpp where Pipeline is complete so the
@@ -74,23 +71,19 @@ struct CouplingProvider {
     virtual void PostCouple(const CouplingBuildCtx&) const = 0;
 };
 
-// The row provider: today's body↔particle coupling re-expressed as one provider,
-// emitting the EXACT ops the builder emitted inline, in order, with the same PODs.
+// Particle contacts emit shared rows and commit their accumulated response once.
 struct RowCouplingProvider final : CouplingProvider {
     void PreCouple(const CouplingBuildCtx&) const override;
     void Couple(const CouplingBuildCtx&) const override;
     void PostCouple(const CouplingBuildCtx&) const override;
 };
 
-// The grid-transfer provider: an MLS-MPM medium couples through the env-private
-// background grid. It emits ONE umbrella MpmStep op at the pre-solve Couple seam
-// (build-time gated on the cooked has_mpm, so a non-MPM world emits no op at all).
-// PreCouple/PostCouple are empty — the grid medium's velocity arrives via G2P (no
-// per-particle row, no finalize dv-compose).
+// Grid prediction and exchange precede the shared solve; G2P commits afterward.
+// Grid and transfer scratch remain valid throughout the coupling interval.
 struct MpmCouplingProvider final : CouplingProvider {
-    void PreCouple(const CouplingBuildCtx&) const override {}
+    void PreCouple(const CouplingBuildCtx&) const override;
     void Couple(const CouplingBuildCtx&) const override;
-    void PostCouple(const CouplingBuildCtx&) const override {}
+    void PostCouple(const CouplingBuildCtx&) const override;
 };
 
 } // namespace nuka::nk

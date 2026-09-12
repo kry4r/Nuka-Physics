@@ -57,7 +57,9 @@ const char* NkOpName(int op) {
         case NkOp::PbfDensityLambda: return "PbfDensityLambda";
         case NkOp::PbfApplyDelta: return "PbfApplyDelta";
         case NkOp::ParticleFinalize: return "ParticleFinalize";
-        case NkOp::MpmStep: return "MpmStep";
+        case NkOp::MpmPredict: return "MpmPredict";
+        case NkOp::MpmExchange: return "MpmExchange";
+        case NkOp::MpmCommit: return "MpmCommit";
         case NkOp::ReadoutContactWrench: return "ReadoutContactWrench";
         case NkOp::ExportObs: return "ExportObs";
         case NkOp::ResetEnvs: return "ResetEnvs";

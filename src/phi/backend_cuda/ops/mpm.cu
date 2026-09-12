@@ -141,7 +141,7 @@ struct MpmProfiler {
     static void Dump() {
         MpmProfiler& profiler = Get();
         if (profiler.measured_intervals == 0) return;
-        std::printf("\n[NUKA_MPM_TIMING] MpmStep GPU stages (intervals=%llu, warmup_intervals=%ld)\n",
+        std::printf("\n[NUKA_MPM_TIMING] MPM GPU stages (intervals=%llu, warmup_intervals=%ld)\n",
                     profiler.measured_intervals, profiler.warmup);
         std::printf("  %-18s %10s %10s %12s\n", "stage", "ms/interval", "ms/call",
                     "calls");
@@ -1380,8 +1380,11 @@ MpmScratch PartitionScratch(void* base, uint32_t particle_count, uint32_t node_c
     return scratch;
 }
 
-// One MLS-MPM substep retains the ordered transfer, boundary and constitutive dependencies.
-cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
+enum class MpmOperation { Predict, Exchange, Commit };
+
+// Grid and transfer scratch survive until the interval commits.
+template <MpmOperation operation>
+cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
                          const DataView& data, const MpmScratch& scratch,
                          float dt_sub, uint32_t Ppe, uint32_t mpm_pe, uint32_t mpm_count,
                          uint32_t cpe, uint32_t total_nodes, uint32_t finalize_blocks,
@@ -1398,111 +1401,118 @@ cudaError_t LaunchSubstep(const MpmStepParams& p, const ModelView& model,
         error = cudaPeekAtLastError();
         profiler.Stop(stage, stream);
     };
-    launch(MpmStage::GridPrepare, MpmGridPrepareKernel, nblocks,
-           total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
-           data.grid_body_dp, data.grid_body_owner, scratch.active_flags,
-           scratch.cell_start, scratch.node_ids);
-    launch(MpmStage::CellKeys, MpmCellKeysKernel, pblocks,
-           mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
-           p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], cpe,
-           data.mpm_grid_cell_key, data.mpm_grid_part_idx, data.env_status);
-    if (error != cudaSuccess) return error;
-    const uint32_t total_cells = cpe * p.env_count;
-    size_t temp_bytes = scratch.sort_temp_bytes;
-    profiler.Start(MpmStage::RadixSort, stream);
-    error = cub::DeviceRadixSort::SortPairs(
-        scratch.sort_temp, temp_bytes, data.mpm_grid_cell_key, scratch.keys_out,
-        data.mpm_grid_part_idx, scratch.idx_out, static_cast<int>(mpm_count), 0,
-        RadixBitsInclusive(total_cells - 1u), stream);
-    profiler.Stop(MpmStage::RadixSort, stream);
-    if (error != cudaSuccess) return error;
-    launch(MpmStage::CellRanges, MpmBuildCellRangesKernel, pblocks,
-           mpm_count, scratch.keys_out, total_cells, scratch.cell_start, scratch.cell_end,
-           cpe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.active_flags);
-    if (error != cudaSuccess) return error;
-    thrust::counting_iterator<uint32_t> active_id_iter(0u);
-    temp_bytes = scratch.sort_temp_bytes;
-    profiler.Start(MpmStage::ActiveSelect, stream);
-    error = cub::DeviceSelect::Flagged(
-        scratch.sort_temp, temp_bytes, active_id_iter, scratch.active_flags,
-        scratch.active_nodes, scratch.active_count, static_cast<int>(total_nodes), stream);
-    profiler.Stop(MpmStage::ActiveSelect, stream);
-    if (error != cudaSuccess) return error;
-    launch(MpmStage::TransferInput, MpmPrepareTransferInputKernel, pblocks,
-           mpm_count, scratch.idx_out, data.particle_pos, data.particle_inv_mass,
-           data.particle_vel, data.particle_C, data.particle_F,
-           data.particle_vol0, data.particle_material_id,
-           reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
-           p.material_count, data.mpm_particle_stress, Ppe, data.env_status,
-           origin, inv_dx, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.transfer_input);
-    if (error != cudaSuccess) return error;
-    launch(MpmStage::P2GCells, MpmP2GCellsKernel, cell_blocks,
-           mpm_count, mpm_pe, total_cells, cpe, scratch.active_nodes, scratch.active_count,
-           scratch.transfer_input, scratch.cell_start, scratch.cell_end,
-           p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx, dt_sub, origin,
-           scratch.cell_transfers);
-    const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
-    const m::Vec3 pn{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
-    launch(MpmStage::GridFinalize, MpmGridFinalizeKernel, finalize_blocks,
-           total_nodes, scratch.active_nodes, scratch.active_count,
-           scratch.cell_transfers, scratch.cell_start, mpm_count,
-           p.nodes_per_env, cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
-           p.dx, origin, g, dt_sub, pn, p.plane_d, p.plane_mu,
-           data.grid_mass, data.grid_momentum, data.grid_velocity);
-    if (error != cudaSuccess) return error;
-    if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u && p.bodies_per_env > 0u) {
-        const uint32_t total_bodies = p.bodies_per_env * p.env_count;
-        launch(MpmStage::BodyProject, MpmGridBodyProjectKernel, nblocks,
-               total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-               p.bodies_per_env, p.body_mu, p.body_band,
-               p.base_link_count, p.artics_per_env,
-               nkops::MakeSurfaceQueryView(model, p.bodies_per_env, p.mesh_geometry,
-                                           p.sdf_grid_count, p.sdf_cell_total),
-               scratch.active_nodes, scratch.active_count,
-               data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
-               data.body_angular_velocity, data.link_pose,
-               reinterpret_cast<const nkops::LinkSpatialVel*>(data.link_velocity),
-               model.body_to_link, model.body_to_articulation, model.body_collidable_body,
-               model.shape_table, data.grid_mass, data.grid_velocity,
-               data.grid_body_dp, data.grid_body_owner, data.env_status);
+    if constexpr (operation == MpmOperation::Predict) {
+        launch(MpmStage::GridPrepare, MpmGridPrepareKernel, nblocks,
+               total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
+               data.grid_body_dp, data.grid_body_owner, scratch.active_flags,
+               scratch.cell_start, scratch.node_ids);
+        launch(MpmStage::CellKeys, MpmCellKeysKernel, pblocks,
+               mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
+               p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], cpe,
+               data.mpm_grid_cell_key, data.mpm_grid_part_idx, data.env_status);
         if (error != cudaSuccess) return error;
-        temp_bytes = scratch.sort_temp_bytes;
-        profiler.Start(MpmStage::BodySort, stream);
+        const uint32_t total_cells = cpe * p.env_count;
+        size_t temp_bytes = scratch.sort_temp_bytes;
+        profiler.Start(MpmStage::RadixSort, stream);
         error = cub::DeviceRadixSort::SortPairs(
-            scratch.sort_temp, temp_bytes, data.grid_body_owner,
-            scratch.keys_out, scratch.node_ids, scratch.idx_out, static_cast<int>(total_nodes), 0,
-            RadixBitsInclusive(total_bodies), stream);
-        profiler.Stop(MpmStage::BodySort, stream);
+            scratch.sort_temp, temp_bytes, data.mpm_grid_cell_key, scratch.keys_out,
+            data.mpm_grid_part_idx, scratch.idx_out, static_cast<int>(mpm_count), 0,
+            RadixBitsInclusive(total_cells - 1u), stream);
+        profiler.Stop(MpmStage::RadixSort, stream);
         if (error != cudaSuccess) return error;
-        launch(MpmStage::BodyReact, MpmGridBodyReactKernel, total_bodies,
-               total_bodies, p.bodies_per_env, total_nodes, p.nodes_per_env,
-               p.grid_dims[0], p.grid_dims[1], p.dx, origin,
-               p.base_link_count, p.artics_per_env, model.shape_table,
-               data.body_pose, data.body_inertial_frame, data.link_pose,
-               data.body_inv_mass, data.body_world_inv_inertia,
-               model.body_to_link, model.body_to_articulation, model.body_collidable_body,
-               data.grid_body_dp, scratch.keys_out, scratch.idx_out,
-               data.body_linear_velocity, data.body_angular_velocity,
-               data.mpm_body_reaction, data.mpm_body_ang_reaction);
+        launch(MpmStage::CellRanges, MpmBuildCellRangesKernel, pblocks,
+               mpm_count, scratch.keys_out, total_cells, scratch.cell_start, scratch.cell_end,
+               cpe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.active_flags);
+        if (error != cudaSuccess) return error;
+        thrust::counting_iterator<uint32_t> active_id_iter(0u);
+        temp_bytes = scratch.sort_temp_bytes;
+        profiler.Start(MpmStage::ActiveSelect, stream);
+        error = cub::DeviceSelect::Flagged(
+            scratch.sort_temp, temp_bytes, active_id_iter, scratch.active_flags,
+            scratch.active_nodes, scratch.active_count, static_cast<int>(total_nodes), stream);
+        profiler.Stop(MpmStage::ActiveSelect, stream);
+        if (error != cudaSuccess) return error;
+        launch(MpmStage::TransferInput, MpmPrepareTransferInputKernel, pblocks,
+               mpm_count, scratch.idx_out, data.particle_pos, data.particle_inv_mass,
+               data.particle_vel, data.particle_C, data.particle_F,
+               data.particle_vol0, data.particle_material_id,
+               reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
+               p.material_count, data.mpm_particle_stress, Ppe, data.env_status,
+               origin, inv_dx, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], scratch.transfer_input);
+        if (error != cudaSuccess) return error;
+        launch(MpmStage::P2GCells, MpmP2GCellsKernel, cell_blocks,
+               mpm_count, mpm_pe, total_cells, cpe, scratch.active_nodes, scratch.active_count,
+               scratch.transfer_input, scratch.cell_start, scratch.cell_end,
+               p.grid_dims[0], p.grid_dims[1], p.grid_dims[2], inv_dx, p.dx, dt_sub, origin,
+               scratch.cell_transfers);
+        const m::Vec3 g{p.gravity[0], p.gravity[1], p.gravity[2]};
+        const m::Vec3 pn{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
+        launch(MpmStage::GridFinalize, MpmGridFinalizeKernel, finalize_blocks,
+               total_nodes, scratch.active_nodes, scratch.active_count,
+               scratch.cell_transfers, scratch.cell_start, mpm_count,
+               p.nodes_per_env, cpe, p.grid_dims[0], p.grid_dims[1], p.grid_dims[2],
+               p.dx, origin, g, dt_sub, pn, p.plane_d, p.plane_mu,
+               data.grid_mass, data.grid_momentum, data.grid_velocity);
+        if (error != cudaSuccess) return error;
     }
-    launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
-           mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
-           p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
-           data.grid_velocity, data.particle_pos, data.particle_vel, data.particle_C);
-    launch(MpmStage::UpdateF, MpmUpdateFKernel, pblocks, mpm_count,
-           dt_sub, data.particle_C, data.particle_material_id,
-           reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
-           p.material_count, Ppe, mpm_pe, data.particle_F, data.particle_plastic_F,
-           data.particle_plastic, data.env_status);
+    if constexpr (operation == MpmOperation::Exchange) {
+        if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u && p.bodies_per_env > 0u) {
+            const uint32_t total_bodies = p.bodies_per_env * p.env_count;
+            launch(MpmStage::BodyProject, MpmGridBodyProjectKernel, nblocks,
+                   total_nodes, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1], p.dx, origin,
+                   p.bodies_per_env, p.body_mu, p.body_band,
+                   p.base_link_count, p.artics_per_env,
+                   nkops::MakeSurfaceQueryView(model, p.bodies_per_env, p.mesh_geometry,
+                                               p.sdf_grid_count, p.sdf_cell_total),
+                   scratch.active_nodes, scratch.active_count,
+                   data.body_pose, data.body_inertial_frame, data.body_linear_velocity,
+                   data.body_angular_velocity, data.link_pose,
+                   reinterpret_cast<const nkops::LinkSpatialVel*>(data.link_velocity),
+                   model.body_to_link, model.body_to_articulation, model.body_collidable_body,
+                   model.shape_table, data.grid_mass, data.grid_velocity,
+                   data.grid_body_dp, data.grid_body_owner, data.env_status);
+            if (error != cudaSuccess) return error;
+            size_t temp_bytes = scratch.sort_temp_bytes;
+            profiler.Start(MpmStage::BodySort, stream);
+            error = cub::DeviceRadixSort::SortPairs(
+                scratch.sort_temp, temp_bytes, data.grid_body_owner,
+                scratch.keys_out, scratch.node_ids, scratch.idx_out, static_cast<int>(total_nodes), 0,
+                RadixBitsInclusive(total_bodies), stream);
+            profiler.Stop(MpmStage::BodySort, stream);
+            if (error != cudaSuccess) return error;
+            launch(MpmStage::BodyReact, MpmGridBodyReactKernel, total_bodies,
+                   total_bodies, p.bodies_per_env, total_nodes, p.nodes_per_env,
+                   p.grid_dims[0], p.grid_dims[1], p.dx, origin,
+                   p.base_link_count, p.artics_per_env, model.shape_table,
+                   data.body_pose, data.body_inertial_frame, data.link_pose,
+                   data.body_inv_mass, data.body_world_inv_inertia,
+                   model.body_to_link, model.body_to_articulation, model.body_collidable_body,
+                   data.grid_body_dp, scratch.keys_out, scratch.idx_out,
+                   data.body_linear_velocity, data.body_angular_velocity,
+                   data.mpm_body_reaction, data.mpm_body_ang_reaction);
+        }
+    }
+    if constexpr (operation == MpmOperation::Commit) {
+        launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
+               mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
+               p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
+               data.grid_velocity, data.particle_pos, data.particle_vel, data.particle_C);
+        launch(MpmStage::UpdateF, MpmUpdateFKernel, pblocks, mpm_count,
+               dt_sub, data.particle_C, data.particle_material_id,
+               reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
+               p.material_count, Ppe, mpm_pe, data.particle_F, data.particle_plastic_F,
+               data.particle_plastic, data.env_status);
+    }
     return error;
 }
 
-Status OpMpmStep(const ModelView& model, const DataView& data,
+template <MpmOperation operation>
+Status OpMpmStage(const ModelView& model, const DataView& data,
                  const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const MpmStepParams*>(params);
+    const auto* p = static_cast<const MpmParams*>(params);
     if (p == nullptr) return Status::Failed;
     MpmProfiler& profiler = MpmProfiler::Get();
-    profiler.BeginInterval();
+    if constexpr (operation == MpmOperation::Predict) profiler.BeginInterval();
     if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmXpbd) || p->particle_count == 0u) {
         return Status::Ok;
     }
@@ -1555,58 +1565,65 @@ Status OpMpmStep(const ModelView& model, const DataView& data,
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
     const MpmScratch scratch = PartitionScratch(data.mpm_sort_scratch, mpm_count, total_nodes);
     uint32_t finalize_blocks = 0u, cell_blocks = 0u;
-    if (ResidentGridSize(MpmGridFinalizeKernel, kBlockSize, 0u,
-                         (total_nodes + kBlockSize - 1u) / kBlockSize,
-                         &finalize_blocks) != cudaSuccess ||
-        ResidentGridSize(MpmP2GCellsKernel, kBlockSize, 0u,
-                         (std::min(mpm_count, total_nodes) + kCellGroups - 1u) / kCellGroups,
-                         &cell_blocks) != cudaSuccess) return Status::Failed;
+    if constexpr (operation == MpmOperation::Predict) {
+        if (ResidentGridSize(MpmGridFinalizeKernel, kBlockSize, 0u,
+                             (total_nodes + kBlockSize - 1u) / kBlockSize,
+                             &finalize_blocks) != cudaSuccess ||
+            ResidentGridSize(MpmP2GCellsKernel, kBlockSize, 0u,
+                             (std::min(mpm_count, total_nodes) + kCellGroups - 1u) / kCellGroups,
+                             &cell_blocks) != cudaSuccess) return Status::Failed;
+    }
     const float inv_dx = 1.0f / p->dx;
     const m::Vec3 origin{p->grid_origin[0], p->grid_origin[1], p->grid_origin[2]};
     const float dt_sub = p->dt;
-    // The pipeline aggregates diagnostics across the shared physical intervals.
-    if (data.env_status != nullptr) {
-        const uint32_t e = p->env_count == 0u ? 1u : p->env_count;
-        const uint32_t eb = (e + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(MpmClearStatusBitsKernel, dim3(eb), dim3(kBlockSize), 0u, stream,
-                   data.env_status, e);
-    }
-    // The reaction probe contains only this interval's impulse.
-    if (p->dynamic_body_bc != 0u && p->bodies_per_env > 0u &&
-        data.mpm_body_reaction != nullptr) {
-        const uint32_t tb = p->bodies_per_env * p->env_count;
-        const uint32_t bb = (tb + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(MpmClearBodyReactionKernel, dim3(bb), dim3(kBlockSize), 0u,
-                   stream, tb, data.mpm_body_reaction, data.mpm_body_ang_reaction);
+    if constexpr (operation == MpmOperation::Predict) {
+        // The pipeline aggregates diagnostics across the shared physical intervals.
+        if (data.env_status != nullptr) {
+            const uint32_t e = p->env_count == 0u ? 1u : p->env_count;
+            const uint32_t eb = (e + kBlockSize - 1u) / kBlockSize;
+            LaunchCuda(MpmClearStatusBitsKernel, dim3(eb), dim3(kBlockSize), 0u, stream,
+                       data.env_status, e);
+        }
+        // The reaction probe contains only this interval's impulse.
+        if (p->dynamic_body_bc != 0u && p->bodies_per_env > 0u &&
+            data.mpm_body_reaction != nullptr) {
+            const uint32_t tb = p->bodies_per_env * p->env_count;
+            const uint32_t bb = (tb + kBlockSize - 1u) / kBlockSize;
+            LaunchCuda(MpmClearBodyReactionKernel, dim3(bb), dim3(kBlockSize), 0u,
+                       stream, tb, data.mpm_body_reaction, data.mpm_body_ang_reaction);
+        }
     }
     if (cudaPeekAtLastError() != cudaSuccess) return Status::Failed;
-    if (LaunchSubstep(*p, model, data, scratch, dt_sub, Ppe, mpm_pe, mpm_count, cpe,
+    if (LaunchMpmStage<operation>(*p, model, data, scratch, dt_sub, Ppe, mpm_pe, mpm_count, cpe,
                       total_nodes, finalize_blocks, cell_blocks, inv_dx, origin, stream) != cudaSuccess)
         return Status::Failed;
-    // The shared solve commits this impulse before the next physics interval.
-    if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
-        p->bodies_per_env > 0u && p->artic_count > 0u && p->max_dof > 0u &&
-        data.mpm_body_ang_reaction != nullptr && data.qdot_flat != nullptr &&
-        data.m_inv != nullptr) {
-        const uint32_t total_links = p->base_link_count * p->env_count;
-        const nkops::ArticulationDeviceState state =
-            nkops::MakeArticulationDeviceState(model, data, total_links, p->artic_count);
-        const uint32_t ablocks = (p->artic_count + kBlockSize - 1u) / kBlockSize;
-        profiler.Start(MpmStage::ArticDeposit, stream);
-        LaunchCuda(MpmArticReactDepositKernel, dim3(ablocks), dim3(kBlockSize), 0u,
-                   stream, state, p->artic_count, p->artics_per_env, p->bodies_per_env,
-                   p->base_link_count, p->max_dof, model.body_to_link,
-                   data.mpm_body_reaction, data.mpm_body_ang_reaction, data.m_inv,
-                   data.qdot_flat);
-        profiler.Stop(MpmStage::ArticDeposit, stream);
+    if constexpr (operation == MpmOperation::Exchange) {
+        // The shared solve commits this impulse before the next physics interval.
+        if (p->dynamic_body_bc != 0u && p->bite_disable_dynamic_bc == 0u &&
+            p->bodies_per_env > 0u && p->artic_count > 0u && p->max_dof > 0u &&
+            data.mpm_body_ang_reaction != nullptr && data.qdot_flat != nullptr &&
+            data.m_inv != nullptr) {
+            const uint32_t total_links = p->base_link_count * p->env_count;
+            const nkops::ArticulationDeviceState state =
+                nkops::MakeArticulationDeviceState(model, data, total_links, p->artic_count);
+            const uint32_t ablocks = (p->artic_count + kBlockSize - 1u) / kBlockSize;
+            profiler.Start(MpmStage::ArticDeposit, stream);
+            LaunchCuda(MpmArticReactDepositKernel, dim3(ablocks), dim3(kBlockSize), 0u,
+                       stream, state, p->artic_count, p->artics_per_env, p->bodies_per_env,
+                       p->base_link_count, p->max_dof, model.body_to_link,
+                       data.mpm_body_reaction, data.mpm_body_ang_reaction, data.m_inv,
+                       data.qdot_flat);
+            profiler.Stop(MpmStage::ArticDeposit, stream);
+        }
     }
-    // Eager execution drains the stream to expose asynchronous faults.
-    // Captured execution reports completion errors through graph replay.
     if (cudaPeekAtLastError() != cudaSuccess) return Status::Failed;
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) return Status::Failed;
-    if (capture == cudaStreamCaptureStatusNone && cudaStreamSynchronize(stream) != cudaSuccess)
-        return Status::Failed;
+    if constexpr (operation == MpmOperation::Commit) {
+        // Eager completion exposes asynchronous faults once per physical interval.
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) return Status::Failed;
+        if (capture == cudaStreamCaptureStatusNone && cudaStreamSynchronize(stream) != cudaSuccess)
+            return Status::Failed;
+    }
     return Status::Ok;
 }
 
@@ -1620,7 +1637,9 @@ uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count) {
 }
 
 void RegisterNkMpmOps() {
-    SetCudaOp(NkOp::MpmStep, &OpMpmStep);
+    SetCudaOp(NkOp::MpmPredict, &OpMpmStage<MpmOperation::Predict>);
+    SetCudaOp(NkOp::MpmExchange, &OpMpmStage<MpmOperation::Exchange>);
+    SetCudaOp(NkOp::MpmCommit, &OpMpmStage<MpmOperation::Commit>);
 }
 
 }  // namespace nuka::phi

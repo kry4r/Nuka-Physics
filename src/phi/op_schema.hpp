@@ -114,8 +114,10 @@ enum class NkOp : uint16_t {
     PbfApplyDelta,         // PBF position delta apply
     ParticleFinalize,      // v = (x* - x)/dt; commit x
 
-    // --- MLS-MPM continuum step -----------------------------------------
-    MpmStep,               // MPM transfer and material update over one physics interval.
+    // MLS-MPM grid state remains available between prediction and commit.
+    MpmPredict,            // P2G, stress and external-force grid prediction.
+    MpmExchange,           // Grid boundary impulse and endpoint reaction.
+    MpmCommit,             // G2P, particle advection and material history.
 
     // --- readout / RL substrate -----------------------------------------
     ReadoutContactWrench,  // per-link contact wrench readout
@@ -407,15 +409,13 @@ struct BuildSolveIslandsParams {
     uint32_t particles_per_env;  // particle count per env
 };
 
-// MPM advances one common physics interval on an environment-private Cartesian grid.
-// Transfer, stress, boundary response and advection all use the supplied dt.
-struct MpmStepParams {
+// All MPM operations share one physical interval and environment-private grid.
+// Prediction owns grid initialization; commit alone advances particles and history.
+struct MpmParams {
     uint32_t particle_count;     // total env-major particles (0 => inert no-op)
     uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
-    // MpmXpbd: the per-env MPM slice count [0, mpm_particles_per_env). The transfer
-    // kernels iterate this sub-slice, remapping thread -> (env, mpm_local) ->
-    // global = env*particles_per_env + mpm_local. 0 => the whole per-env block is MPM
-    // (single-MPM mode; then mpm_count == particle_count -> byte-identical launches).
+    // Grid-owned particles occupy [0, mpm_particles_per_env) in each environment.
+    // Zero selects the complete per-environment particle range.
     uint32_t mpm_particles_per_env;
     uint32_t env_count;
     uint32_t nodes_per_env;      // per-env grid node count (mpm_grid_nodes_per_env)
@@ -423,23 +423,19 @@ struct MpmStepParams {
     float    grid_origin[3];     // world-space corner of node (0,0,0)
     float    dx;                 // uniform node spacing
     float    dt;                 // common physics interval
-    uint32_t mode;               // kParticleMode* (MpmStep runs only for kParticleModeMpm)
+    uint32_t mode;               // kParticleModeMpm or kParticleModeMpmXpbd.
     uint32_t substeps;           // zero or one; subdivision belongs to the pipeline
     uint32_t material_count;     // mpm_material_table rows (indexed by particle_material_id)
     float    gravity[3];         // world-frame gravity applied on the grid each substep
-    // Static-plane floor BC (z-up: n=(0,0,1), d=floor_z). A grid node at/below the
-    // plane gets a no-penetration normal projection + Coulomb friction (mu). Static
-    // => zero surface velocity => no grid->body reaction (the dynamic body is later).
+    // The static floor projects inward grid velocity and applies Coulomb friction.
+    // Its external impulse is distinct from collidable-owner reactions.
     float    plane_n[3];
     float    plane_d;
     float    plane_mu;
     // Analytic primitives and cooked SDFs project grid velocity and record reaction.
     // The deepest collidable supplies each node's current boundary condition.
     uint32_t dynamic_body_bc;
-    // Free-fall BITE: disable the dynamic-body grid coupling -- both the per-substep
-    // BC and the per-Step M^-1 J^T deposit (the static-plane BC stays on, so the
-    // medium still rests on the floor). Proves the held-up state is the dynamic-body
-    // coupling, not an artifact. Default 0.
+    // Disables collidable exchange and reaction while retaining the static floor.
     uint32_t bite_disable_dynamic_bc;
     uint32_t bodies_per_env;     // collidable body rows / env (the BC body loop).
     uint32_t sdf_grid_count;     // available SDF descriptors; primitives need none.
@@ -447,8 +443,7 @@ struct MpmStepParams {
     collision::MeshGeometryCounts mesh_geometry;
     float    body_mu;            // Coulomb friction the body BC clamps the tangent by.
     float    body_band;          // nodes with signed surface distance below this couple.
-    // Articulation deposit dims (the link-row grid reaction -> qdot_flat seed). All
-    // 0 for a body-only / MPM-only world -> the deposit kernel never launches.
+    // Articulation dimensions for the link-reaction generalized impulse.
     uint32_t artic_count;        // GLOBAL articulations (artics_per_env * env_count).
     uint32_t max_dof;            // per-articulation generalized DOF (the m_inv tile side).
     uint32_t base_link_count;    // links per env (global link = env*base_link_count+tmpl).

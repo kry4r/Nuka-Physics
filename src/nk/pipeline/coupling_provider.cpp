@@ -85,16 +85,15 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
 }
 
 void RowCouplingProvider::Couple(const CouplingBuildCtx&) const {
-    // The row coupling rides the shared SolveRowsBlockIsland the builder emits;
-    // there is no extra op. A grid-transfer provider emits its umbrella here.
+    // Particle rows exchange impulses in the shared island solve.
 }
 
-void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
+void MpmCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // Only worlds containing grid-owned particles schedule MPM transfer.
-    if (ctx.has_mpm == 0u || ctx.p_mpm_step == nullptr) return;
+    if (ctx.has_mpm == 0u || ctx.p_mpm == nullptr) return;
     const Model& model = *ctx.model;
     const Model::ModelParticles& mp = model.particles;
-    phi::MpmStepParams& p = *ctx.p_mpm_step;
+    phi::MpmParams& p = *ctx.p_mpm;
     p.particle_count = ctx.particle_count;
     p.particles_per_env = ctx.particles_per_env;
     // Pure and mixed MPM use the same explicit grid-owned particle range.
@@ -135,7 +134,17 @@ void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
     p.max_dof = ctx.max_dof;
     p.base_link_count = ctx.base_link_count;
     p.artics_per_env = ctx.artics_per_env;
-    ctx.Emit(phi::NkOp::MpmStep, &p);
+    ctx.Emit(phi::NkOp::MpmPredict, &p);
+}
+
+void MpmCouplingProvider::Couple(const CouplingBuildCtx& ctx) const {
+    if (ctx.has_mpm == 0u || ctx.p_mpm == nullptr) return;
+    ctx.Emit(phi::NkOp::MpmExchange, ctx.p_mpm);
+}
+
+void MpmCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {
+    if (ctx.has_mpm == 0u || ctx.p_mpm == nullptr) return;
+    ctx.Emit(phi::NkOp::MpmCommit, ctx.p_mpm);
 }
 
 void RowCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {

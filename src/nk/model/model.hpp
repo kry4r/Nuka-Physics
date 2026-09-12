@@ -335,9 +335,7 @@ public:
     // to the fluid slice. This mirrors the co-step's existing [xpbd | pbf] union
     // (split n_x) 1:1, so the Phase-2 id-10 cross-contact port is near-verbatim
     // (global g < n_soft => soft, else fluid).
-    // MpmXpbd: ONE Model holds an MLS-MPM medium in the low slice [0, n_mpm) and an
-    // XPBD (cloth/tet) set in [n_mpm, P); MpmStep sweeps the MPM slice, the XPBD
-    // predict/project/finalize the XPBD slice, each coupling on the ONE seam.
+    // MpmXpbd assigns [0, n_mpm) to grid transfer and [n_mpm, P) to XPBD.
     enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Pbf = 2, Coupled = 3,
                                         SoftFluid = 4, Mpm = 5, MpmXpbd = 6 };
     // In Coupled mode, which internal dynamics run alongside the contact coupling:
@@ -401,10 +399,7 @@ public:
         // constraints (edge-based) reference only the soft slice. For the
         // single-system modes (Xpbd/Pbf/Coupled) it is 0 (Xpbd) or unused.
         uint32_t n_soft_particles = 0u;
-        // MpmXpbd [mpm | xpbd] split: the MPM slice occupies [0, n_mpm_particles),
-        // the XPBD slice [n_mpm_particles, particles_per_env). MpmStep scopes to the
-        // MPM slice; predict/project/finalize + body<->particle rows to the XPBD
-        // slice. 0 for every non-MpmXpbd mode (unused).
+        // MpmXpbd divides grid-owned [0, n_mpm_particles) from row-coupled particles.
         uint32_t n_mpm_particles = 0u;
         // Per-system body<->particle contact mu: soft finite (a foot grips cloth),
         // fluid ~0 (a foot slides); mixed with the body side by solmix=max.
@@ -428,13 +423,11 @@ public:
         // Boundary floor (z-up; the M5 grid + particle ops are z-up).
         bool  boundary_enabled = false;
         float floor_z = 0.0f;
-        // MLS-MPM env-private background grid descriptor (its OWN fields, NOT the PBF
-        // domain above). The grid-transfer coupling provider builds MpmStepParams from these.
+        // Environment-private MPM grid geometry supplies the shared MpmParams.
         math::Vec3 mpm_grid_min{0.0f, 0.0f, 0.0f};
         uint32_t   mpm_grid_dims[3] = {0u, 0u, 0u};
         float      mpm_cell_size = 0.0f;
-        // MLS-MPM internal explicit substeps per World.Step (CFL headroom for a stiff
-        // medium); the cook sets it from the material/dt. 0 => 1 substep.
+        // Preferred common substeps; the pipeline also honors the solver's request.
         uint32_t   mpm_substeps = 1u;
         // MLS-MPM static floor plane (z-up: n=(0,0,1), d=floor height). The grid BC
         // projects node velocity against this plane (no-penetration + Coulomb mu).
