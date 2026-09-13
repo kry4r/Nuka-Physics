@@ -11,7 +11,9 @@ typedef enum nuka_state_sensor_kind_t {
     NUKA_STATE_SENSOR_IMU = 0,
     NUKA_STATE_SENSOR_FRAME_POSE = 1,
     NUKA_STATE_SENSOR_JOINT_STATE = 2,
-    NUKA_STATE_SENSOR_LINEAR_VELOCITY = 3
+    NUKA_STATE_SENSOR_LINEAR_VELOCITY = 3,
+    NUKA_STATE_SENSOR_CONTACT_WRENCH = 4, /* Contact force xyz (N), torque xyz (N*m) in sensor axes. */
+    NUKA_STATE_SENSOR_FORCE_TORQUE = 5    /* Parent-on-subtree wrench; requires a supported articulation link. */
 } nuka_state_sensor_kind_t;
 
 typedef struct nuka_state_sensor_desc_t {

@@ -7,7 +7,7 @@
 
 namespace nuka::sensor {
 
-enum class StateSensorKind : uint32_t { Imu, FramePose, JointState, LinearVelocity };
+enum class StateSensorKind : uint32_t { Imu, FramePose, JointState, LinearVelocity, ContactWrench, ForceTorque };
 enum class StateSensorMount : uint32_t { Link, Body, Base };
 
 inline constexpr uint32_t kStateSensorErrorChannels = 6u;
@@ -33,6 +33,12 @@ struct MotionFrame {
     math::Transform pose;
     math::Vec3 linear_velocity;
     math::Vec3 angular_velocity;
+};
+
+// World-space impulse and angular impulse about the midpoint frame origin.
+struct WrenchImpulse {
+    math::Vec3 linear;
+    math::Vec3 angular;
 };
 
 struct StateSensorStamp {
