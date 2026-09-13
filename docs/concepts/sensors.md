@@ -34,6 +34,8 @@ stamp = world.state_sensor_stamp(imu, env=0)
 | `LINEAR_VELOCITY` | Mounting point linear velocity xyz in m/s, expressed in sensor axes |
 | `CONTACT_WRENCH` | Contact force xyz in N, then contact torque xyz in N·m, at the mounting point in sensor axes |
 | `FORCE_TORQUE` | Parent-on-subtree force xyz in N and torque xyz in N·m, at the mounting point in sensor axes |
+| `TOUCH` | Positive contact normal force integrated over a sensing volume, in N |
+| `TACTILE` | Taxel force: local tangent x/y and compression-positive normal, in N |
 
 IMU acquisition integrates velocity changes over physical substeps and subtracts gravity. Free fall therefore gives zero specific force at the center of mass; supported rest measures the opposing gravity vector. Off-center mounts include angular acceleration and centripetal acceleration. Solved contact impulses are included. Each substep uses the midpoint sensor orientation; high angular rates still require adequate integration resolution. Position and velocity sensors acquire the endpoint state.
 
@@ -64,7 +66,40 @@ Delivery uses fixed `latency` plus uniform jitter in `[-latency_jitter, +latency
 
 Checkpoint replay includes pending packets, clocks, accumulated IMU and load exposure, filter state and random processes. Restoring a checkpoint from before attachment deactivates later sensors and zeroes their existing views without freeing them. IDs remain stable allocation slots: `state_sensor_count()` includes inactive slots, and `state_sensor_active(id)` identifies active sensors. Reconfiguring an allocated sensor reactivates it and clears its complete sampling history.
 
-MJCF accelerometer/gyro, joint position/velocity, frame pose, velocimeter and force/torque records create these sensors automatically. IMU, joint and force/torque records expose the complete paired outputs shown above. Child bodies without a joint retain a fixed connection and a separate link frame, including tool inertia and mounted sensors. MJCF `touch` remains metadata: its scalar, site-volume normal-force integral differs from a whole-body contact wrench and is not automatically attached. Runtime noise and delivery settings are preserved by checkpoints but are not serialized in NKS. Camera and lidar APIs remain separate. Differentiable Tape creation, stepping and backward replay reject active mounted sensors because Tape does not execute this sampling pipeline.
+MJCF accelerometer/gyro, joint position/velocity, frame pose, velocimeter, force/torque and body-mounted `touch` records create sensors automatically. IMU, joint and force/torque records expose the complete paired outputs shown above. Child bodies without a joint retain a fixed connection and a separate link frame, including tool inertia and mounted sensors. Runtime noise and delivery settings are preserved by checkpoints but are not serialized in NKS. Camera and lidar APIs remain separate. Differentiable Tape creation, stepping and backward replay reject active mounted sensors because Tape does not execute this sampling pipeline.
+
+## Touch volumes and tactile taxels
+
+Touch and tactile sensors read the actual impulses from the common contact solver, including friction and contacts with XPBD and MLS-MPM. Their mounts select an owning rigid body or articulation link. The spatial mask selects contacts on that mount; it does not create contacts or add stiffness to the simulation. A deforming particle surface cannot itself carry these rigidly mounted sensors.
+
+`TOUCH` sums positive normal forces. A contact contributes when the ray from its contact point along the mounting body's outward contact normal intersects the sensing volume. This follows MuJoCo's touch-region convention, including projection of soft contacts into a site. Sphere, box, ellipsoid, capsule and cylinder regions are supported. Box and ellipsoid `size` contains three half-axes; sphere uses `(radius, 0, 0)`; capsule and cylinder use `(radius, half_height, 0)` along local Z.
+
+`TACTILE` represents one rectangular taxel. Its local +Z points out of the sensing surface; it reports local force x/y and the negative local z force, so compression is positive. Only contacts facing that side and lying within the configured Z half-thickness contribute. The X/Y rectangle is half-open, preventing double counting at shared edges. Force divided by `4 * size[0] * size[1]` is the taxel's average traction in Pa.
+
+```python
+taxel = world.attach_tactile_sensor(
+    size=(0.005, 0.005, 0.003),
+    mount=nuka.SensorMount.LINK, mount_index=pad_link,
+    local_offset=(0.0, 0.0, 0.02, 1.0, 0.0, 0.0, 0.0),
+    spread_fraction=0.3, spread_sigma=0.002,
+    hysteresis_strength=0.2, hysteresis_time=0.03,
+    sample_rate_hz=100, latency=0.01, seed=42,
+)
+nuka.MeasurementError(noise_density=0.001, quantization=0.01,
+                      minimum=0, maximum=20).configure_sensor(world, taxel, component=2)
+world.step_n(10)
+forces = world.download_state_sensor(taxel)
+```
+
+These parameters are examples, not a calibration of a particular device. Attach adjacent patches with the same sampling settings to form an array; each patch retains its own observation view and noise history. For a scalar volume sensor, pass `kind=nuka.StateSensorKind.TOUCH` and the desired `ContactRegionShape` to the same attachment method. The C API is `nuka_world_attach_tactile_sensor`, followed by the existing state-sensor readout and error APIs.
+
+Mechanical crosstalk uses `spread_fraction` to mix the ideal footprint with a normalized Gaussian of standard deviation `spread_sigma` in meters. Each taxel integrates that distribution over its rectangular area. An infinite planar partition preserves the total force; a finite array loses the part spread beyond its edges. The model uses a spatial transfer function for a sensing layer; it does not simulate elastomer deformation or optical gel markers. Spreading is available for rectangular taxels, not scalar touch volumes.
+
+The optional Maxwell observation branch models viscoelastic relaxation and dynamic hysteresis: `y = x + hysteresis_strength * z`, with `dz/dt = dx/dt - z/hysteresis_time`. Each physical substep treats force as constant, updates the relaxation state exactly and integrates the measured signal over the acquisition interval. Steady input has gain one; loading produces a transient overshoot and unloading can produce negative readings. Configure electronic saturation explicitly when the device clips those readings. This branch affects observations only. Existing response filtering, calibration, noise, temperature drift, quantization and saturation then apply to each output component.
+
+MJCF touch sites preserve their shape, size, default-class inheritance and local orientation, including quaternion, Euler, axis-angle, XY axes, Z axis and `fromto`. Site Euler and axis-angle values follow the compiler's angle settings. NKS serializes authored contact regions and tactile response parameters in the sensor's `tactile` object; `type` is `contact` for scalar touch and `tactile` for taxels. Old `contact` metadata without a sensing region requires a region definition or reimport from MJCF before world creation. Runtime attachments and measurement-error settings remain checkpoint state rather than NKS authoring data.
+
+Acquisition, delayed delivery, dropped packets, selective reset and checkpoint replay use the same state-sensor bank. Checkpoints include pending measurements, integrated force exposure and Maxwell history. Reading a taxel does not sample again or alter the physical state.
 
 ## Explicit scalar observations
 

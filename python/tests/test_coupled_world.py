@@ -23,6 +23,7 @@ state) -- that is a separate RL-track follow-on. This test only proves create + 
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import replace
 from pathlib import Path
 import numpy as np
@@ -432,6 +433,10 @@ def test_primitive_axes_halfspace_contacts_and_observations(device, execution, s
             world.attach_lidar_sensor(nuka.SensorMount.WORLD.value, 0,
                                       (0.25, 0.25, 2, q, 0, q, 0),
                                       1, 1, 0, 0, 0, 0, max_range=10.0)
+            ground_regions = [world.attach_tactile_sensor(
+                kind=nuka.StateSensorKind.TOUCH, mount=nuka.SensorMount.BODY, mount_index=0,
+                shape=nuka.ContactRegionShape.SPHERE, size=(0.3, 0, 0),
+                local_offset=(x, 0, 0, 1, 0, 0, 0)) for x in (0, -1.5)]
             world.step()
             body_velocity = world.download_field(nuka.Field.BODY_LINEAR_VELOCITY).reshape(3, 7, 3)
             angular_velocity = world.download_field(nuka.Field.BODY_ANGULAR_VELOCITY).reshape(3, 7, 3)
@@ -451,6 +456,8 @@ def test_primitive_axes_halfspace_contacts_and_observations(device, execution, s
             assert np.all(body_velocity[:, 4, 0] > 0.0)
             assert np.all(body_velocity[:, 5, 2] > 0.0)
             assert np.all(cloth_vz > 0.0)
+            for sensor in ground_regions:
+                assert np.all(world.download_state_sensor(sensor) > 0.0)
             # MPM enforces non-inward grid velocity without positional recovery.
             np.testing.assert_allclose(particle_velocity[:, :nmpm, 2], 0.0, atol=2.0e-6)
             # Uniform cylinder plus hemispheres: inertia in kg m^2 about the COM.
@@ -468,6 +475,131 @@ def test_primitive_axes_halfspace_contacts_and_observations(device, execution, s
             np.testing.assert_array_equal(after[1], initial[1])
             np.testing.assert_array_equal(after[[0, 2]], before[[0, 2]])
             assert not np.any(world.download_field(nuka.ENV_STATUS))
+
+
+def test_touch_taxels_contact_partition_and_replay(device, tmp_path):
+    source = Path(__file__).resolve().parents[2] / "tests/data/tactile_contact.xml"
+    saved = tmp_path / "tactile_contact.nks"
+    scene = nuka.Scene.load(str(source))
+    try:
+        scene.save(str(saved))
+    finally:
+        scene.destroy()
+    data = json.loads(saved.read_text())
+    assert len(data["sensors"]) == 9
+    assert data["sensors"][5]["tactile"]["shape"] == "capsule"
+    authored = dict(data["sensors"][2], name="authored_taxel", type="tactile")
+    data["sensors"].append(authored)
+    saved.write_text(json.dumps(data))
+    roundtrip = tmp_path / "tactile_roundtrip.nks"
+    scene = nuka.Scene.load(str(saved))
+    try:
+        scene.save(str(roundtrip))
+    finally:
+        scene.destroy()
+    observed = []
+    for path in (saved, roundtrip):
+        with nuka.World.create_from_scene(device, str(path), 3, dt=0.002,
+                                          solver_vel_iters=64, gravity_x=1.5, gravity_y=-0.4,
+                                          gravity_z=-9.81) as world:
+            assert world.state_sensor_count() == 10
+            world.set_execution_mode("graph")
+            mount = dict(mount=nuka.SensorMount.BODY, mount_index=0,
+                         local_offset=(0, 0, 0.1, 1, 0, 0, 0))
+            wrench = world.attach_state_sensor(nuka.StateSensorKind.CONTACT_WRENCH, **mount)
+            grids = []
+            for spread in (0.0, 1.0):
+                grid = []
+                for y in (-0.3, 0.0, 0.3):
+                    for x in (-0.3, 0.0, 0.3):
+                        grid.append(world.attach_tactile_sensor(size=(0.15, 0.15, 0.025),
+                            mount=nuka.SensorMount.BODY, mount_index=0,
+                            local_offset=(x, y, 0.1, 1, 0, 0, 0),
+                            spread_fraction=spread, spread_sigma=0.04))
+                grids.append(grid)
+            relaxed = world.attach_tactile_sensor(size=(0.5, 0.35, 0.025), **mount,
+                                                  hysteresis_strength=0.4, hysteresis_time=0.02)
+            saturated = world.attach_tactile_sensor(size=(0.5, 0.35, 0.025), **mount)
+            nuka.MeasurementError(bias=0.125, quantization=0.25, minimum=0,
+                                  maximum=5).configure_sensor(world, saturated, 2)
+            back = world.attach_tactile_sensor(size=(0.5, 0.35, 0.025),
+                mount=nuka.SensorMount.BODY, mount_index=0, local_offset=(0, 0, 0.1, 0, 1, 0, 0))
+            loads = [world.attach_tactile_sensor(size=(0.2, 0.2, 0.2),
+                mount=nuka.SensorMount.BODY, mount_index=body, local_offset=(0, 0, 0, 0, 1, 0, 0))
+                for body in (1, 2)]
+            before = world.state_hash()
+            for invalid in (dict(size=(0, 0, 0)), dict(shape=nuka.ContactRegionShape.SPHERE),
+                            dict(spread_fraction=1.1), dict(spread_fraction=1, spread_sigma=0),
+                            dict(hysteresis_strength=1, hysteresis_time=0)):
+                arguments = dict(size=(0.1, 0.1, 0.1), **mount)
+                arguments.update(invalid)
+                with pytest.raises(RuntimeError):
+                    world.attach_tactile_sensor(**arguments)
+            assert world.state_hash() == before
+            world.attach_camera_sensor(nuka.SensorMount.WORLD.value, 0,
+                                       (0, 0, 1.4, 1, 0, 0, 0), 55, 96, 64)
+            initial_rotations = world.download_field(nuka.Field.RIGID_BODY_TRANSFORM).reshape(3, -1, 7)[:, 1:3, 3:].copy()
+            world.step()
+            touch = np.stack([world.download_state_sensor(i)[:, 0] for i in range(9)], axis=1)
+            np.testing.assert_allclose(touch[:, 2], touch[:, 0] + touch[:, 1], atol=2e-5)
+            np.testing.assert_allclose(touch[:, 3:8], np.repeat(touch[:, :1], 5, axis=1), atol=2e-5)
+            np.testing.assert_allclose(touch[:, 8], 0.0, atol=0.0)
+            assert np.all(touch[:, 0] > 1) and np.all(touch[:, 1] > touch[:, 0])
+            force = world.download_state_sensor(wrench)[:, :3]
+            taxel = world.download_state_sensor(9)
+            np.testing.assert_allclose(taxel, force * [1, 1, -1], atol=2e-5)
+            assert np.all(np.abs(taxel[:, 0]) > 0.01)
+            np.testing.assert_allclose(taxel[:, 2], touch[:, 2], atol=2e-5)
+            for grid in grids:
+                partition = np.stack([world.download_state_sensor(i) for i in grid], axis=1)
+                np.testing.assert_allclose(partition.sum(axis=1), taxel, atol=8e-5)
+            # Opposite contacts balance in world coordinates while the loaded bodies rotate.
+            rotations = world.download_field(nuka.Field.RIGID_BODY_TRANSFORM).reshape(3, -1, 7)[:, 1:3, 3:]
+            sign = np.where(np.sum(initial_rotations * rotations, axis=-1, keepdims=True) < 0, -1, 1)
+            midpoint = initial_rotations + sign * rotations
+            midpoint /= np.linalg.norm(midpoint, axis=-1, keepdims=True)
+            reaction = np.stack([world.download_state_sensor(i) for i in loads], axis=1) * [1, -1, 1]
+            cross = 2 * np.cross(midpoint[..., 1:], reaction)
+            reaction += midpoint[..., :1] * cross + np.cross(midpoint[..., 1:], cross)
+            np.testing.assert_allclose(reaction.sum(axis=1), -force, atol=2e-5)
+            gain = 1 + 0.4 * 0.02 / world.dt * (-np.expm1(-world.dt / 0.02))
+            np.testing.assert_allclose(world.download_state_sensor(relaxed), taxel * gain, rtol=2e-5, atol=2e-5)
+            np.testing.assert_array_equal(world.download_state_sensor(saturated)[:, 2], 5.0)
+            np.testing.assert_array_equal(world.download_state_sensor(back), 0.0)
+            view = torch.from_dlpack(world.get_state_sensor_view(relaxed))
+            address = view.data_ptr()
+            world.render_sensors()
+            image = torch.from_dlpack(world.get_sensor_view(nuka.SensorChannel.COLOR))
+            assert np.isfinite(image.cpu().numpy()).all() and np.max(image.cpu().numpy()) > 0
+            world.step_n(3)
+            with world.capture_checkpoint() as checkpoint:
+                def advance():
+                    world.step_n(4)
+                    world.render_sensors()
+                    return ([world.download_state_sensor(i).copy() for i in range(world.state_sensor_count())],
+                            image.cpu().numpy().copy(), world.state_hash())
+                values, rendered, expected_hash = advance()
+                stamps = [world.state_sensor_stamp(relaxed, env) for env in range(3)]
+                world.restore_checkpoint(checkpoint)
+                replayed, replay_image, replay_hash = advance()
+                for a, b in zip(values, replayed):
+                    np.testing.assert_array_equal(a, b)
+                np.testing.assert_array_equal(rendered, replay_image)
+                assert replay_hash == expected_hash
+                assert stamps == [world.state_sensor_stamp(relaxed, env) for env in range(3)]
+            observed.append((touch, values, rendered))
+            world.reset_envs([1])
+            for i, expected in enumerate(values):
+                actual = world.download_state_sensor(i)
+                np.testing.assert_array_equal(actual[[0, 2]], expected[[0, 2]])
+                np.testing.assert_array_equal(actual[1], 0.0)
+                assert not world.state_sensor_stamp(i, 1)["valid"]
+            assert view.data_ptr() == address
+            assert not np.any(world.download_field(nuka.ENV_STATUS))
+    np.testing.assert_array_equal(observed[0][0], observed[1][0])
+    for a, b in zip(observed[0][1], observed[1][1]):
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(observed[0][2], observed[1][2])
 
 
 def test_mpm_surface_endpoints_roundtrip_graph_and_reset(device, tmp_path):

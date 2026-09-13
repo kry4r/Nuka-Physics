@@ -88,6 +88,7 @@ from ._nuka_ext import (  # noqa: F401
     SensorAov,
     SensorMount,
     StateSensorKind,
+    ContactRegionShape,
 )
 
 import dataclasses as _dataclasses
@@ -319,6 +320,7 @@ __all__ = [
     "CABLE_PIN_NONE",
     "StateCheckpoint",
     "StateSensorKind",
+    "ContactRegionShape",
     "SensorMount",
     "ENV_STATUS_SENSOR_QUEUE_OVERFLOW",
     "MEDIA_METHOD_XPBD",

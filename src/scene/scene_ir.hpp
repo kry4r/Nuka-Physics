@@ -27,6 +27,7 @@
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_metadata.hpp"     // SceneInitialState
 #include "math/transform.hpp"
+#include "sensor/tactile.hpp"
 
 #include <memory>
 #include <string>
@@ -169,6 +170,7 @@ struct SensorDesc {
     math::Transform local_offset           = math::Transform::Identity();
     CameraIntrinsics cam;
     LidarPattern lidar;
+    ::nuka::sensor::TactileConfig tactile;
     // Bit positions match camera channels COLOR..PRIM (bits 0..4). Zero means
     // the backwards-compatible all-AOV profile. RANGE is a separate lidar tensor.
     uint32_t aov_mask                      = 0;

@@ -126,6 +126,8 @@ TEST(MjcfImporter, ParsesSensorSuiteIntoUnifiedDescs) {
     EXPECT_FLOAT_EQ(scene.GetSensor(1).local_offset.position.z, 0.2f);
     EXPECT_EQ(scene.GetSensor(2).type, SensorType::Contact);      // touch
     EXPECT_FLOAT_EQ(scene.GetSensor(2).local_offset.position.z, -0.1f);
+    EXPECT_EQ(scene.GetSensor(2).tactile.shape, nuka::sensor::ContactRegionShape::Sphere);
+    EXPECT_FLOAT_EQ(scene.GetSensor(2).tactile.size.x, 0.005f);
     EXPECT_EQ(scene.GetSensor(3).type, SensorType::FramePose);    // framepos
 }
 

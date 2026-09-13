@@ -1960,14 +1960,22 @@ NB_MODULE(_nuka_ext, m) {
         .value("ALL", NUKA_SENSOR_AOV_ALL)
         .export_values();
 
-    // Which FK frame a camera mounts on for World.attach_camera_sensor.
     nb::enum_<nuka_state_sensor_kind_t>(m, "StateSensorKind")
         .value("IMU", NUKA_STATE_SENSOR_IMU)
         .value("FRAME_POSE", NUKA_STATE_SENSOR_FRAME_POSE)
         .value("JOINT_STATE", NUKA_STATE_SENSOR_JOINT_STATE)
         .value("LINEAR_VELOCITY", NUKA_STATE_SENSOR_LINEAR_VELOCITY)
         .value("CONTACT_WRENCH", NUKA_STATE_SENSOR_CONTACT_WRENCH)
-        .value("FORCE_TORQUE", NUKA_STATE_SENSOR_FORCE_TORQUE);
+        .value("FORCE_TORQUE", NUKA_STATE_SENSOR_FORCE_TORQUE)
+        .value("TOUCH", NUKA_STATE_SENSOR_TOUCH)
+        .value("TACTILE", NUKA_STATE_SENSOR_TACTILE);
+
+    nb::enum_<nuka_contact_region_shape_t>(m, "ContactRegionShape")
+        .value("BOX", NUKA_CONTACT_REGION_BOX)
+        .value("SPHERE", NUKA_CONTACT_REGION_SPHERE)
+        .value("ELLIPSOID", NUKA_CONTACT_REGION_ELLIPSOID)
+        .value("CAPSULE", NUKA_CONTACT_REGION_CAPSULE)
+        .value("CYLINDER", NUKA_CONTACT_REGION_CYLINDER);
 
     nb::enum_<nuka_sensor_mount_t>(m, "SensorMount")
         .value("LINK", NUKA_SENSOR_MOUNT_LINK)
@@ -2778,6 +2786,37 @@ NB_MODULE(_nuka_ext, m) {
            nb::arg("latency") = 0.0, nb::arg("latency_jitter") = 0.0,
            nb::arg("dropout_probability") = 0.0f, nb::arg("temperature") = 25.0f, nb::arg("seed") = uint64_t{0},
            "Attach an automatically sampled physical sensor; return its stable sensor index.")
+        .def("attach_tactile_sensor", [](World& w, const std::array<float, 3>& size,
+            nuka_state_sensor_kind_t kind, nuka_contact_region_shape_t shape, nuka_sensor_mount_t mount,
+            uint32_t mount_index, const std::array<float, 7>& local_offset, float spread_fraction,
+            float spread_sigma, float hysteresis_strength, float hysteresis_time,
+            double sample_rate_hz, uint32_t update_period, double latency, double latency_jitter,
+            float dropout_probability, float temperature, uint64_t seed) {
+            nuka_state_sensor_desc_t desc{};
+            desc.struct_size = sizeof(desc);
+            desc.kind = kind; desc.mount = mount; desc.mount_index = mount_index;
+            for (uint32_t i = 0u; i < 7u; ++i) desc.local_offset[i] = local_offset[i];
+            desc.sample_rate_hz = sample_rate_hz; desc.update_period = update_period;
+            desc.latency = latency; desc.latency_jitter = latency_jitter;
+            desc.dropout_probability = dropout_probability; desc.temperature = temperature; desc.seed = seed;
+            nuka_tactile_desc_t tactile{};
+            tactile.struct_size = sizeof(tactile);
+            tactile.shape = shape;
+            for (uint32_t i = 0u; i < 3u; ++i) tactile.size[i] = size[i];
+            tactile.spread_fraction = spread_fraction; tactile.spread_sigma = spread_sigma;
+            tactile.hysteresis_strength = hysteresis_strength; tactile.hysteresis_time = hysteresis_time;
+            uint32_t id;
+            check(nuka_world_attach_tactile_sensor(w.raw(), &desc, &tactile, &id), "nuka_world_attach_tactile_sensor");
+            return id;
+        }, nb::arg("size"), nb::arg("kind") = NUKA_STATE_SENSOR_TACTILE,
+           nb::arg("shape") = NUKA_CONTACT_REGION_BOX, nb::arg("mount") = NUKA_SENSOR_MOUNT_BASE,
+           nb::arg("mount_index") = 0u, nb::arg("local_offset") = std::array<float, 7>{0, 0, 0, 1, 0, 0, 0},
+           nb::arg("spread_fraction") = 0.0f, nb::arg("spread_sigma") = 0.0f,
+           nb::arg("hysteresis_strength") = 0.0f, nb::arg("hysteresis_time") = 0.0f,
+           nb::arg("sample_rate_hz") = 0.0, nb::arg("update_period") = 1u,
+           nb::arg("latency") = 0.0, nb::arg("latency_jitter") = 0.0,
+           nb::arg("dropout_probability") = 0.0f, nb::arg("temperature") = 25.0f, nb::arg("seed") = uint64_t{0},
+           "Attach a touch volume or three-axis taxel; read it through the state-sensor APIs.")
         .def("state_sensor_count", [](World& w) {
             uint32_t count;
             check(nuka_world_get_state_sensor_count(w.raw(), &count), "nuka_world_get_state_sensor_count");

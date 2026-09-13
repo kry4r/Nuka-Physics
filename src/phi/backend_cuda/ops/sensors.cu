@@ -109,7 +109,7 @@ __device__ math::Vec3 MidpointOrigin(const ReadoutSensorWrenchesParams& p, uint3
     return (p.before[frame].pose.position + p.after[frame].pose.position) * 0.5f;
 }
 
-__device__ bool ContactMountMatches(const ModelView& model, const ReadoutSensorWrenchesParams& p,
+__device__ bool ContactMountMatches(const ModelView& model, const SensorContactLayout& p,
                                     uint32_t env, uint32_t frame, uint32_t kind, uint32_t collidable) {
     if (kind != nk::kUContactSideBody || collidable >= p.bodies_per_env) return false;
     const auto shape = nkops::LoadPrimShape(model.shape_table, collidable);
@@ -120,6 +120,15 @@ __device__ bool ContactMountMatches(const ModelView& model, const ReadoutSensorW
         return owner.kind == nk::kNkSideArtic && owner.link == env * p.links_per_env + frame;
     return (owner.kind == nk::kNkSideRigid || owner.kind == nk::kNkSideStatic) &&
         owner.body == env * p.bodies_per_env + frame - p.links_per_env;
+}
+
+__device__ uint32_t ContactRowBase(const SensorContactLayout& p, uint32_t env, uint32_t slot,
+                                  uint32_t& count) {
+    const bool rigid = slot < p.rigid_slots_per_env;
+    count = rigid ? nk::kPairDrivenPtsPerSlot : nk::kPairDrivenParticlePtsPerSlot;
+    return env * p.rows_per_env + (rigid ? slot * nk::kPairDrivenRowsPerSlot :
+        p.rigid_slots_per_env * nk::kPairDrivenRowsPerSlot +
+        (slot - p.rigid_slots_per_env) * nk::kPairDrivenParticleRowsPerSlot);
 }
 
 // All contact providers publish the same solved rows and manifold points.
@@ -145,11 +154,8 @@ __global__ void ReadoutContactImpulseKernel(ModelView model, DataView data, Read
         const bool side_b = ContactMountMatches(model, p, env, local,
             data.ucontact_b_kind[point_base], data.ucontact_b[point_base]);
         if (!side_a && !side_b) continue;
-        const bool rigid = slot < p.rigid_slots_per_env;
-        const uint32_t count = rigid ? nk::kPairDrivenPtsPerSlot : nk::kPairDrivenParticlePtsPerSlot;
-        const uint32_t base = env * p.rows_per_env + (rigid ? slot * nk::kPairDrivenRowsPerSlot :
-            p.rigid_slots_per_env * nk::kPairDrivenRowsPerSlot +
-            (slot - p.rigid_slots_per_env) * nk::kPairDrivenParticleRowsPerSlot);
+        uint32_t count;
+        const uint32_t base = ContactRowBase(p, env, slot, count);
         for (uint32_t point = 0u; point < points && point < count; ++point) {
             const auto arm = data.ucontact_point[point_base + point] - origin;
             for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
@@ -222,6 +228,86 @@ Status OpReadoutSensorWrenches(const ModelView& model, const DataView& data,
     return cudaPeekAtLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
+struct AddContactImpulse {
+    __device__ math::Vec3 operator()(math::Vec3 a, math::Vec3 b) const { return a + b; }
+};
+
+__global__ void ReadoutContactRegionKernel(ModelView model, DataView data, ReadoutContactRegionParams p) {
+    const uint32_t env = blockIdx.x;
+    if (env >= p.env_count) return;
+    const uint32_t frame = env * (p.links_per_env + p.bodies_per_env) + p.frame;
+    const auto before = MountedFrame(p.before[frame], p.local_offset);
+    const auto after = MountedFrame(p.after[frame], p.local_offset);
+    const auto origin = (before.pose.position + after.pose.position) * 0.5f;
+    const auto inverse = InverseRotation(RotationMidpoint(before.pose.rotation, after.pose.rotation));
+    const auto* rows = reinterpret_cast<const nk::NkRow*>(data.urows);
+    math::Vec3 sum{};
+    for (uint32_t slot = threadIdx.x; slot < p.slots_per_env; slot += blockDim.x) {
+        const uint32_t global_slot = env * p.slots_per_env + slot;
+        const uint32_t points = data.ucontact_count[global_slot];
+        if (!points) continue;
+        const uint32_t point_base = global_slot * nk::kPairDrivenPtsPerSlot;
+        const bool sides[] = {
+            ContactMountMatches(model, p, env, p.frame, data.ucontact_a_kind[point_base], data.ucontact_a[point_base]),
+            ContactMountMatches(model, p, env, p.frame, data.ucontact_b_kind[point_base], data.ucontact_b[point_base])};
+        if (!sides[0] && !sides[1]) continue;
+        uint32_t count;
+        const uint32_t base = ContactRowBase(p, env, slot, count);
+        for (uint32_t point = 0u; point < points && point < count; ++point) {
+            const auto& normal_row = rows[base + point];
+            if (!(normal_row.flags & nk::nk_row_flags::kActive)) continue;
+            const auto position = mg::RotateByQuatNormalized(inverse, data.ucontact_point[point_base + point] - origin);
+            for (uint32_t side = 0u; side < 2u; ++side) {
+                if (!sides[side]) continue;
+                const auto normal = side == 0u ? normal_row.a.jlin : normal_row.b.jlin;
+                const auto local_normal = mg::RotateByQuatNormalized(inverse, normal);
+                if (p.kind == sensor::StateSensorKind::Touch) {
+                    const float magnitude = sqrtf(normal.Dot(normal)) * data.lambda[base + point];
+                    if (magnitude > 0.0f && sensor::TouchRegionIntersectsRay(p.config, position, local_normal * -1.0f))
+                        sum.x += magnitude;
+                    continue;
+                }
+                if (!(local_normal.z < 0.0f)) continue;
+                const float weight = sensor::TaxelWeight(p.config, position);
+                if (!(weight > 0.0f)) continue;
+                math::Vec3 impulse{};
+                for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
+                    const uint32_t index = base + axis * count + point;
+                    const auto& row = rows[index];
+                    if (!(row.flags & nk::nk_row_flags::kActive)) continue;
+                    impulse += (side == 0u ? row.a.jlin : row.b.jlin) * data.lambda[index];
+                }
+                const auto local_impulse = mg::RotateByQuatNormalized(inverse, impulse) * weight;
+                sum += math::Vec3{local_impulse.x, local_impulse.y, -local_impulse.z};
+            }
+        }
+    }
+    using Reduction = cub::BlockReduce<math::Vec3, kWrenchBlockSize>;
+    __shared__ typename Reduction::TempStorage scratch;
+    const auto total = Reduction(scratch).Reduce(sum, AddContactImpulse{});
+    if (threadIdx.x == 0u) p.states[env].impulse = total;
+}
+
+Status OpReadoutContactRegion(const ModelView& model, const DataView& data,
+                             const void* arguments, cudaStream_t stream) {
+    const auto* p = static_cast<const ReadoutContactRegionParams*>(arguments);
+    if (!p || !p->env_count || !p->before || !p->after || !p->states ||
+        !sensor::IsContactRegionSensor(p->kind) ||
+        !sensor::ValidTactileConfig(p->config, p->kind == sensor::StateSensorKind::Touch) ||
+        p->rigid_slots_per_env > p->slots_per_env) return Status::InvalidArgument;
+    const uint64_t frames = uint64_t{p->links_per_env} + p->bodies_per_env;
+    const uint64_t required_rows = uint64_t{p->rigid_slots_per_env} * nk::kPairDrivenRowsPerSlot +
+        uint64_t{p->slots_per_env - p->rigid_slots_per_env} * nk::kPairDrivenParticleRowsPerSlot;
+    if (p->frame >= frames || uint64_t{p->env_count} * frames > UINT32_MAX || required_rows > p->rows_per_env ||
+        uint64_t{p->env_count} * p->rows_per_env > UINT32_MAX ||
+        uint64_t{p->env_count} * p->slots_per_env > UINT32_MAX / nk::kPairDrivenPtsPerSlot ||
+        (p->slots_per_env && (!data.urows || !data.lambda || !model.shape_table || !data.ucontact_count ||
+            !data.ucontact_point || !data.ucontact_a || !data.ucontact_b ||
+            !data.ucontact_a_kind || !data.ucontact_b_kind))) return Status::InvalidArgument;
+    LaunchCuda(ReadoutContactRegionKernel, dim3(p->env_count), dim3(kWrenchBlockSize), 0u, stream, model, data, *p);
+    return cudaPeekAtLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+}
+
 __device__ double SensorUniform(uint64_t seed, uint32_t env, uint64_t sequence, uint32_t cause) {
     auto counter = sensor::noise::MakeCounter(env, sequence);
     counter.v[3] = cause;
@@ -267,13 +353,19 @@ __global__ void SampleStateSensorKernel(DataView data, SampleStateSensorParams p
         const float values[] = {linear.x, linear.y, linear.z, angular.x, angular.y, angular.z};
         for (uint32_t c = 0u; c < sensor::kStateSensorErrorChannels; ++c) state.integral[c] += values[c];
     }
+    if (p.tactile) {
+        const auto impulse = sensor::IntegrateTactileResponse(desc.tactile, p.tactile[env], p.interval);
+        state.integral[0] += impulse.x;
+        state.integral[1] += impulse.y;
+        state.integral[2] += impulse.z;
+    }
     state.exposure += p.interval;
     const double tolerance = 1.0e-10 * fmax(1.0, fabs(time));
     if (time + tolerance >= state.next_sample_time) {
         sensor::StateSensorPacket packet{};
         float truth[sensor::kStateSensorErrorChannels] = {};
         if (desc.kind == sensor::StateSensorKind::Imu || desc.kind == sensor::StateSensorKind::ContactWrench ||
-            desc.kind == sensor::StateSensorKind::ForceTorque)
+            desc.kind == sensor::StateSensorKind::ForceTorque || p.tactile)
             for (uint32_t c = 0u; c < sensor::kStateSensorErrorChannels; ++c)
                 truth[c] = static_cast<float>(state.integral[c] / state.exposure);
         if (desc.kind == sensor::StateSensorKind::FramePose) {
@@ -378,7 +470,8 @@ Status OpSampleStateSensor(const ModelView&, const DataView& data, const void* a
     if (!p || !p->before || !p->after || !p->times || !p->values || !p->runtime || !p->noise ||
         !p->queue || !p->queue_capacity || !p->env_count) return Status::InvalidArgument;
     if ((p->desc.kind == sensor::StateSensorKind::ContactWrench && !p->contact_impulses) ||
-        (p->desc.kind == sensor::StateSensorKind::ForceTorque && !p->transmitted_impulses)) return Status::InvalidArgument;
+        (p->desc.kind == sensor::StateSensorKind::ForceTorque && !p->transmitted_impulses) ||
+        (sensor::IsContactRegionSensor(p->desc.kind) && !p->tactile)) return Status::InvalidArgument;
     LaunchCuda(SampleStateSensorKernel, dim3((uint64_t{p->env_count} + kObservationBlockSize - 1u) /
         kObservationBlockSize), dim3(kObservationBlockSize), 0u, stream, data, *p);
     return cudaPeekAtLastError() == cudaSuccess ? Status::Ok : Status::Failed;
@@ -455,6 +548,7 @@ void RegisterNkSensorOps() {
     SetCudaOp(NkOp::ResetObservation, &OpResetObservation);
     SetCudaOp(NkOp::ReadoutMotion, &OpReadoutMotion);
     SetCudaOp(NkOp::ReadoutSensorWrenches, &OpReadoutSensorWrenches);
+    SetCudaOp(NkOp::ReadoutContactRegion, &OpReadoutContactRegion);
     SetCudaOp(NkOp::SampleStateSensor, &OpSampleStateSensor);
     SetCudaOp(NkOp::AdvanceSensorTime, &OpAdvanceSensorTime);
 }

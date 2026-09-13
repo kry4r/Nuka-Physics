@@ -1,0 +1,42 @@
+<mujoco model="tactile_contact">
+  <compiler angle="degree"/>
+  <default>
+    <geom friction="0.6 0 0"/>
+    <default class="pad"><site type="box" size="0.18 0.25 0.02"/></default>
+  </default>
+  <worldbody>
+    <body name="plate" pos="0 0 -0.1" childclass="pad">
+      <geom type="box" size="0.6 0.4 0.1" rgba="0.5 0.55 0.6 1"/>
+      <site name="left" pos="-0.2 0 0.1"/>
+      <site name="right" pos="0.2 0 0.1" euler="0 0 90" size="0.25 0.18 0.02"/>
+      <site name="total" pos="0 0 0.1" size="0.5 0.35 0.02"/>
+      <site name="sphere" type="sphere" pos="-0.2 0 0.1" size="0.13"/>
+      <site name="ellipsoid" type="ellipsoid" pos="-0.2 0 0.1" size="0.12 0.2 0.02" xyaxes="1 0 0 0 1 0"/>
+      <site name="capsule" type="capsule" size="0.05 0.12" fromto="-0.2 -0.12 0.1 -0.2 0.12 0.1"/>
+      <site name="cylinder" type="cylinder" size="0.12 0.02" pos="-0.2 0 0.1" axisangle="0 0 1 90"/>
+      <site name="above" type="sphere" size="0.04" pos="-0.2 0 0.2" zaxis="0 0 -1"/>
+      <site name="below" type="sphere" size="0.04" pos="-0.2 0 -0.1"/>
+    </body>
+    <body name="left_load" pos="-0.2 0 0.0999">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.004 0.004 0.004"/>
+      <geom type="sphere" size="0.1" rgba="0.1 0.6 0.25 1"/>
+    </body>
+    <body name="right_load" pos="0.2 0 0.0999">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="2" diaginertia="0.008 0.008 0.008"/>
+      <geom type="sphere" size="0.1" rgba="0.8 0.2 0.15 1"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <touch name="left" site="left"/>
+    <touch name="right" site="right"/>
+    <touch name="total" site="total"/>
+    <touch name="sphere" site="sphere"/>
+    <touch name="ellipsoid" site="ellipsoid"/>
+    <touch name="capsule" site="capsule"/>
+    <touch name="cylinder" site="cylinder"/>
+    <touch name="above" site="above"/>
+    <touch name="below" site="below"/>
+  </sensor>
+</mujoco>

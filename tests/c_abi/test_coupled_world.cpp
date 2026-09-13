@@ -24,6 +24,7 @@
 
 #include "nuka/nuka.h"
 #include "nuka/nuka_scene.h"
+#include "nuka/nuka_state_sensor.h"
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -216,6 +217,20 @@ TEST(CoupledWorldCAbi, AllControlModesThroughEveryCreationEntry) {
                 ? nuka_world_create_coupled_from_scene(device.handle, &desc, &media, &world.handle)
                 : nuka_world_create_from_built_scene(device.handle, &desc, scene.handle, nullptr, &world.handle);
             ASSERT_EQ(created, NUKA_RESULT_OK);
+            nuka_state_sensor_desc_t sensor_desc{};
+            sensor_desc.struct_size = sizeof(sensor_desc);
+            sensor_desc.kind = NUKA_STATE_SENSOR_TOUCH;
+            sensor_desc.mount = NUKA_SENSOR_MOUNT_LINK;
+            sensor_desc.mount_index = 2u;
+            sensor_desc.local_offset[3] = 1.0f;
+            sensor_desc.update_period = 1u;
+            nuka_tactile_desc_t tactile{};
+            tactile.struct_size = sizeof(tactile);
+            tactile.shape = NUKA_CONTACT_REGION_SPHERE;
+            uint32_t sensor = ~0u;
+            EXPECT_EQ(nuka_world_attach_tactile_sensor(world.handle, &sensor_desc, &tactile, &sensor), NUKA_RESULT_INVALID_ARG);
+            tactile.size[0] = 0.3f;
+            ASSERT_EQ(nuka_world_attach_tactile_sensor(world.handle, &sensor_desc, &tactile, &sensor), NUKA_RESULT_OK);
             const auto initial = DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION);
             const nuka_state_field_t fields[] = {NUKA_FIELD_DRIVE_TARGET, NUKA_FIELD_TORQUE_INPUT,
                 NUKA_FIELD_VELOCITY_TARGET, NUKA_FIELD_ACCELERATION_TARGET,
@@ -240,6 +255,14 @@ TEST(CoupledWorldCAbi, AllControlModesThroughEveryCreationEntry) {
             ASSERT_EQ(nuka_world_step_n(world.handle, 4u), NUKA_RESULT_OK);
             EXPECT_TRUE(AllFinite(DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION)));
             EXPECT_TRUE(AllFinite(DownloadField(world.handle, NUKA_FIELD_ACTUATOR_EFFORT)));
+            nuka_state_sensor_stamp_t sensor_stamp{};
+            ASSERT_EQ(nuka_world_get_state_sensor_stamp(world.handle, sensor, 0u, &sensor_stamp), NUKA_RESULT_OK);
+            EXPECT_EQ(sensor_stamp.acquisitions, 4u);
+            EXPECT_EQ(sensor_stamp.valid, 1u);
+            float touch_values[2];
+            ASSERT_EQ(nuka_world_download_state_sensor(world.handle, sensor, touch_values, sizeof(touch_values), 0u), NUKA_RESULT_OK);
+            EXPECT_TRUE(std::isfinite(touch_values[0]) && touch_values[0] >= 0.0f);
+            EXPECT_EQ(touch_values[0], touch_values[1]);
             nuka_buffer_view_t status{};
             ASSERT_EQ(nuka_world_get_buffer_view(world.handle, NUKA_FIELD_ENV_STATUS, &status), NUKA_RESULT_OK);
             uint32_t flags[2] = {~0u, ~0u};
@@ -248,6 +271,8 @@ TEST(CoupledWorldCAbi, AllControlModesThroughEveryCreationEntry) {
             EXPECT_EQ(flags[1], 0u);
             const uint32_t reset_env = 1u;
             ASSERT_EQ(nuka_world_reset_envs(world.handle, &reset_env, 1u), NUKA_RESULT_OK);
+            ASSERT_EQ(nuka_world_get_state_sensor_stamp(world.handle, sensor, reset_env, &sensor_stamp), NUKA_RESULT_OK);
+            EXPECT_EQ(sensor_stamp.valid, 0u);
             const auto restored = DownloadField(world.handle, NUKA_FIELD_JOINT_POSITION);
             for (size_t i = initial.size() / 2u; i < initial.size(); ++i)
                 EXPECT_EQ(restored[i], initial[i]);

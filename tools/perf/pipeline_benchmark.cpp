@@ -40,6 +40,7 @@ struct Options {
     uint32_t capacity_scale = 1u;
     uint32_t substeps = 1u;
     uint32_t state_sensors = 0u;
+    uint32_t tactile_grid = 0u;
     uint32_t cloth_nx = fixture::kClothNx;
     uint32_t render_sensors = 0u, render_width = 256u, render_height = 256u;
     uint32_t render_samples = 4u, render_shadows = 4u, render_ao = 3u, render_warmup = 32u;
@@ -68,6 +69,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--warmup") options.warmup = ParseU32(value);
         else if (flag == "--substeps") options.substeps = ParseU32(value);
         else if (flag == "--state-sensors") options.state_sensors = ParseU32(value);
+        else if (flag == "--tactile-grid") options.tactile_grid = ParseU32(value);
         else if (flag == "--seed") options.seed = ParseU32(value);
         else if (flag == "--dt") {
             size_t consumed = 0u;
@@ -93,6 +95,7 @@ Options Parse(int argc, char** argv) {
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
         options.state_sensors > 2u || options.imaging_models > 1u ||
+        uint64_t{options.tactile_grid} * options.tactile_grid + 1u > UINT32_MAX ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
         uint64_t{options.steps} + options.warmup > std::numeric_limits<uint32_t>::max() ||
         (options.execution != "eager" && options.execution != "graph"))
@@ -176,13 +179,57 @@ void AttachStateSensors(nk::World& world, const Options& options) {
     }
 }
 
-std::vector<uint8_t> StateSensorBytes(nk::World& world) {
+void AttachTactileSensors(nk::World& world, const Options& options, const fixture::PreparedScene& prepared) {
+    if (!options.tactile_grid) return;
+    std::vector<nuka::math::Transform> poses(world.GetModel().capacities.links_per_env);
+    fixture::Require(world.GetData().DownloadField(nk::FieldId::LinkPose, poses.data(),
+        poses.size() * sizeof(poses[0])), "tactile mounting pose download failed");
+    const auto inverse = poses.at(prepared.front_link).rotation.Conjugate();
+    nuka::sensor::StateSensorDesc desc;
+    desc.kind = nuka::sensor::StateSensorKind::Touch;
+    desc.mount = nuka::sensor::StateSensorMount::Link;
+    desc.index = prepared.front_link;
+    desc.local_offset.position = prepared.link_geom_local.at(prepared.front_link).position;
+    desc.local_offset.rotation = inverse;
+    desc.tactile.size = {0.1f, 0.1f, 0.1f};
+    desc.tactile.hysteresis_strength = 0.2f;
+    desc.tactile.hysteresis_time = 0.03f;
+    desc.latency = double{options.dt} * 2.0;
+    desc.latency_jitter = double{options.dt} * 0.5;
+    desc.dropout_probability = 0.1f;
+    desc.seed = options.seed;
+    for (auto& error : desc.errors) {
+        error.error.noise_density = 0.01f;
+        error.error.initial_bias_stddev = 0.02f;
+        error.error.bias_random_walk = 0.002f;
+        error.error.correlated_bias_stddev = 0.005f;
+        error.error.correlation_time = 0.2f;
+    }
+    uint32_t id;
+    fixture::Require(world.AttachStateSensor(desc, &id) == phi::Status::Ok, "touch volume attachment failed");
+    desc.kind = nuka::sensor::StateSensorKind::Tactile;
+    const auto origin = desc.local_offset.position;
+    const float pitch = 0.1f / static_cast<float>(options.tactile_grid);
+    desc.tactile.size = {0.5f * pitch, 0.5f * pitch, 0.1f};
+    desc.tactile.spread_fraction = 0.3f;
+    desc.tactile.spread_sigma = 0.005f;
+    for (uint32_t y = 0u; y < options.tactile_grid; ++y) {
+        for (uint32_t x = 0u; x < options.tactile_grid; ++x) {
+            desc.local_offset.position = origin + inverse.Rotate({(static_cast<float>(x) + 0.5f) * pitch - 0.05f,
+                (static_cast<float>(y) + 0.5f) * pitch - 0.05f, 0.0f});
+            fixture::Require(world.AttachStateSensor(desc, &id) == phi::Status::Ok, "taxel attachment failed");
+        }
+    }
+}
+
+std::vector<uint8_t> StateSensorBytes(nk::World& world, bool include_tactile = true) {
     std::vector<uint8_t> bytes;
     if (!world.StateSensors().HasActive()) return bytes;
     nuka::sensor::StateSensorBankSnapshot snapshot;
     fixture::Require(world.StateSensors().Capture(&snapshot) == phi::Status::Ok, "sensor snapshot failed");
     for (const auto& channel : snapshot.sensors)
-        if (channel.active) bytes.insert(bytes.end(), channel.bytes.begin(), channel.bytes.end());
+        if (channel.active && (include_tactile || !nuka::sensor::IsContactRegionSensor(channel.desc.kind)))
+            bytes.insert(bytes.end(), channel.bytes.begin(), channel.bytes.end());
     const auto* times = reinterpret_cast<const uint8_t*>(snapshot.times.data());
     bytes.insert(bytes.end(), times, times + snapshot.times.size() * sizeof(double));
     return bytes;
@@ -785,6 +832,7 @@ Json Run(const Options& options) {
     nk::World world(std::move(model), options.envs, device, owner.backend, config);
     fixture::Require(world.Ready(), world.CreationError());
     AttachStateSensors(world, options);
+    AttachTactileSensors(world, options, prepared);
     fixture::Require(world.FieldPtr(nk::FieldId::ContactForce) != nullptr, "contact readout unavailable");
     CheckCuda(cudaStreamSynchronize(stream));
     const double creation_ms = Milliseconds(create_start);
@@ -927,6 +975,7 @@ Json Run(const Options& options) {
     configuration.Set("dt", Json::Float(options.dt));
     configuration.Set("substeps", Json::Int(options.substeps));
     configuration.Set("state_sensors", Json::Int(options.state_sensors));
+    configuration.Set("tactile_grid", Json::Int(options.tactile_grid));
     configuration.Set("fixture_dt", Json::Float(fixture_config.dt));
     configuration.Set("fixture_substeps", Json::Int(fixture_config.substeps));
     configuration.Set("seed", Json::Int(options.seed));
@@ -968,6 +1017,8 @@ Json Run(const Options& options) {
     sensors.Set("count", Json::Int(world.StateSensors().Count()));
     sensors.Set("timed_replay_bit_equal", Json::Bool(timed_sensors == replay_sensors));
     sensors.Set("state_fnv1a64", Json::Str(Digest(replay_sensors)));
+    sensors.Set("existing_state_fnv1a64", Json::Str(Digest(StateSensorBytes(world, false))));
+    sensors.Set("tactile_count", Json::Int(options.tactile_grid ? 1u + options.tactile_grid * options.tactile_grid : 0u));
     sensors.Set("scope", Json::Str(options.state_sensors >= 2u ?
         "IMU, pose and velocity per base; encoder, contact wrench and F/T on each articulation's first scalar joint" :
         "IMU, pose and velocity per base; encoder on each articulation's first scalar joint"));

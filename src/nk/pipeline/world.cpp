@@ -858,6 +858,8 @@ phi::Status World::AttachStateSensor(const sensor::StateSensorDesc& desc, uint32
         if (!phi::DeviceSupportsOp(device_, op)) return phi::Status::Unsupported;
     if ((desc.kind == sensor::StateSensorKind::ContactWrench || desc.kind == sensor::StateSensorKind::ForceTorque) &&
         !phi::DeviceSupportsOp(device_, phi::NkOp::ReadoutSensorWrenches)) return phi::Status::Unsupported;
+    if (sensor::IsContactRegionSensor(desc.kind) && !phi::DeviceSupportsOp(device_, phi::NkOp::ReadoutContactRegion))
+        return phi::Status::Unsupported;
     auto status = Synchronize();
     if (status != phi::Status::Ok) return status;
     uint32_t added = ~0u;

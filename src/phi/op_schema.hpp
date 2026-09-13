@@ -195,6 +195,7 @@ enum class NkOp : uint16_t {
     SampleStateSensor,
     AdvanceSensorTime,
     ReadoutSensorWrenches,
+    ReadoutContactRegion,
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -937,6 +938,7 @@ struct SampleStateSensorParams {
     const sensor::MotionFrame* after = nullptr;
     const sensor::WrenchImpulse* contact_impulses = nullptr;
     const sensor::WrenchImpulse* transmitted_impulses = nullptr;
+    sensor::TactileState* tactile = nullptr;
     const double* times = nullptr;
     float* values = nullptr;
     sensor::ObservationNoiseState* noise = nullptr;
@@ -953,13 +955,7 @@ struct SampleStateSensorParams {
     uint32_t queue_capacity = 0u;
 };
 
-struct ReadoutSensorWrenchesParams {
-    const sensor::MotionFrame* before = nullptr;
-    const sensor::MotionFrame* after = nullptr;
-    sensor::WrenchImpulse* contact_impulses = nullptr;
-    sensor::WrenchImpulse* transmitted_impulses = nullptr;
-    math::Vec3 gravity;
-    double interval = 0.0;
+struct SensorContactLayout {
     uint32_t env_count = 0u;
     uint32_t links_per_env = 0u;
     uint32_t bodies_per_env = 0u;
@@ -967,9 +963,28 @@ struct ReadoutSensorWrenchesParams {
     uint32_t slots_per_env = 0u;
     uint32_t rigid_slots_per_env = 0u;
     uint32_t rows_per_env = 0u;
+};
+
+struct ReadoutSensorWrenchesParams : SensorContactLayout {
+    const sensor::MotionFrame* before = nullptr;
+    const sensor::MotionFrame* after = nullptr;
+    sensor::WrenchImpulse* contact_impulses = nullptr;
+    sensor::WrenchImpulse* transmitted_impulses = nullptr;
+    math::Vec3 gravity;
+    double interval = 0.0;
     uint32_t link_contacts = 0u;
     uint32_t body_contacts = 0u;
     uint32_t joint_loads = 0u;
+};
+
+struct ReadoutContactRegionParams : SensorContactLayout {
+    const sensor::MotionFrame* before = nullptr;
+    const sensor::MotionFrame* after = nullptr;
+    sensor::TactileState* states = nullptr;
+    sensor::TactileConfig config;
+    math::Transform local_offset;
+    uint32_t frame = 0u;
+    sensor::StateSensorKind kind = sensor::StateSensorKind::Touch;
 };
 
 struct AdvanceSensorTimeParams {
