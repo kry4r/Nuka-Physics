@@ -140,7 +140,7 @@ typedef struct nuka_world_desc_t {
     float    heightfield_elevation_z;    // image value-1 world rise, m.
     float    heightfield_base_z;         // image value-0 world floor, m.
     // World gravity [m/s^2] for all forward dynamics, fixed at world creation.
-    // All-zero means {0,0,-9.81}; set_gravity_z only configures the differentiable tape.
+    // All-zero selects {0,0,-9.81}; set_gravity_z can set zero gravity after creation.
     float gravity_x;
     float gravity_y;
     float gravity_z;
@@ -748,12 +748,13 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
 // With one camera per env the tensor collapses to (env_count, height, width, ch).
 // ---------------------------------------------------------------------------
 
-// Which FK pose the camera mounts on; selects FieldId::{LinkPose,BodyPose,
-// BasePose}. mount_index selects the row within that field.
+// LINK/BODY/BASE select a live pose row. WORLD fixes camera/lidar poses in world
+// coordinates and ignores mount_index; mounted state sensors require a body or link.
 typedef enum nuka_sensor_mount_t {
     NUKA_SENSOR_MOUNT_LINK = 0,
     NUKA_SENSOR_MOUNT_BODY = 1,
-    NUKA_SENSOR_MOUNT_BASE = 2
+    NUKA_SENSOR_MOUNT_BASE = 2,
+    NUKA_SENSOR_MOUNT_WORLD = 3
 } nuka_sensor_mount_t;
 
 // AOV channel the sensor view returns: 0 color(3) 1 depth(1) 2 normal(3) 3

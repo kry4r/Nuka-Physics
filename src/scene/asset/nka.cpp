@@ -1,12 +1,5 @@
-// ---------------------------------------------------------------------------
-// nuka::scene - .nka binary asset container implementation (M2c).
-// ---------------------------------------------------------------------------
-// HOST-ONLY file-format code. Pure, deterministic, dependency-free (only the
-// vendored SHA-256 and the cooker POD structs). All multi-byte values are
-// written in the machine's native byte order; the format is documented as
-// little-endian and the targets are little-endian, matching every other cooked
-// blob in this repo (.nukacvx etc.).
-// ---------------------------------------------------------------------------
+// Host-only .nka asset serialization. Multi-byte values use the little-endian
+// targets' native byte order, matching the cooked collision formats.
 
 #include "scene/asset/nka.hpp"
 
@@ -21,16 +14,17 @@ namespace nuka::scene {
 
 namespace {
 
-// -- little-endian POD append/read over a byte vector -----------------------
-template <typename T>
-void AppendPod(std::vector<uint8_t>& out, const T& value) {
-    const auto* p = reinterpret_cast<const uint8_t*>(&value);
-    out.insert(out.end(), p, p + sizeof(T));
+void AppendBytes(std::vector<uint8_t>& out, const void* data, size_t n) {
+    if (n == 0u) return;
+    const size_t offset = out.size();
+    if (n > out.max_size() - offset) throw std::length_error("nka: payload exceeds byte-vector capacity");
+    out.resize(offset + n);
+    std::memcpy(out.data() + offset, data, n);
 }
 
-void AppendBytes(std::vector<uint8_t>& out, const void* data, size_t n) {
-    const auto* p = static_cast<const uint8_t*>(data);
-    out.insert(out.end(), p, p + n);
+template <typename T>
+void AppendPod(std::vector<uint8_t>& out, const T& value) {
+    AppendBytes(out, &value, sizeof(T));
 }
 
 template <typename T>
@@ -87,12 +81,7 @@ std::vector<uint8_t> EncodeMesh(const NkaMesh& mesh) {
     // positions (3f / vert)
     AppendBytes(out, mesh.positions.data(), mesh.positions.size() * sizeof(float));
 
-    // normals (3f / vert) -- write zeros when absent so the stream count is fixed.
-    // NOTE (M9 cook-real-normals debt): authored OBJ `vn` normals exist in source
-    // files but are currently DROPPED by the loader (mesh_file_loader.cpp LoadObj
-    // ignores `vn`), so mesh.normals is empty here and we zero-fill; the render
-    // side synthesizes normals at load. Faithfully carrying authored normals is
-    // DEFERRED to M9 (it would change this cooked .nka byte stream -> D1-sensitive).
+    // Store three normal components per vertex, filling absent normals with zeros.
     if (!mesh.normals.empty()) {
         AppendBytes(out, mesh.normals.data(), mesh.normals.size() * sizeof(float));
     } else {

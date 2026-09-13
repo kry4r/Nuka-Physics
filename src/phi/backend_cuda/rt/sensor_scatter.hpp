@@ -76,7 +76,8 @@ void ScatterEnvInstances(cudaStream_t stream,
                          uint32_t env_count,
                          uint32_t instances_per_env,
                          DevInstance* out_instances,
-                         collision::AABB* out_world_aabbs);
+                         collision::AABB* out_world_aabbs,
+                         uint32_t blas_refs_per_env = 0u);
 
 // One sensor's mount binding + pinhole intrinsics + lidar pattern, the scatter
 // kernels' per-row input (env-invariant). kind: 1=Link, 2=Body, 3=Base, 0=Static

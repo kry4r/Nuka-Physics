@@ -1,16 +1,5 @@
-// ---------------------------------------------------------------------------
-// Batched sensor render gate: a per-env tile of the ONE batched (N,H,W,ch) AOV
-// tensor is BYTE-IDENTICAL to a standalone single-env render of that env's scene
-// + camera. Same FP32 trace (ClosestHit/ReconstructHit/ShadeDirect, Real=float)
-// + same per-env TLAS + same camera -> same FP32 bytes (one writer per pixel, no
-// atomics -> deterministic).
-//
-// Each env is a Base-mounted replicated cluster: world = base_pose[env] * cvl
-// (the env-invariant link layout). The reference for env e drives the SAME
-// batched path with E=1 and base_pose[0]=base_pose[e], so global==env-local ids
-// and every channel (color/depth/normal/albedo/prim) is byte-comparable. Tested
-// at envs 0 / mid / last over a multi-instance box scene.
-// ---------------------------------------------------------------------------
+// A batched environment must match its standalone scene at the same camera
+// and Monte Carlo sample indices, including every rendered AOV.
 
 #include "math/quat.hpp"
 #include "math/transform.hpp"
@@ -212,24 +201,26 @@ TEST(BatchedSensorRender, PerEnvTileMatchesSingleEnv) {
         std::vector<math::Transform> sb = {base[e]};
         DeviceBasePoses sdev;
         sdev.Upload(sb);
-        rt::PinholeCamera one = cams[e];
+        // Keep the global camera index so both traces use the same lighting samples.
+        const std::vector<rt::PinholeCamera> solo_cameras(e + 1u, cams[e]);
         rt::PinholeCamera* d_one = nullptr;
-        NK_CUDA_OK(cudaMalloc(&d_one, sizeof(rt::PinholeCamera)));
-        NK_CUDA_OK(cudaMemcpy(d_one, &one, sizeof(rt::PinholeCamera), cudaMemcpyHostToDevice));
+        NK_CUDA_OK(cudaMalloc(&d_one, solo_cameras.size() * sizeof(rt::PinholeCamera)));
+        NK_CUDA_OK(cudaMemcpy(d_one, solo_cameras.data(), solo_cameras.size() * sizeof(rt::PinholeCamera),
+                              cudaMemcpyHostToDevice));
 
-        rt::RenderSensorsBatched(solo, sdev.fk, d_one, 1u, 1u, kRes, kRes);
+        rt::RenderSensorsBatched(solo, sdev.fk, d_one, 1u, e + 1u, kRes, kRes);
         NK_CUDA_OK(cudaDeviceSynchronize());
-
-        std::vector<float> rc(pix * 3u), rn(pix * 3u), ra(pix * 3u), rd(pix);
-        std::vector<uint32_t> rp(pix);
-        NK_CUDA_OK(cudaMemcpy(rc.data(), rt::SensorColorDevice(solo), rc.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        NK_CUDA_OK(cudaMemcpy(rd.data(), rt::SensorDepthDevice(solo), rd.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        NK_CUDA_OK(cudaMemcpy(rn.data(), rt::SensorNormalDevice(solo), rn.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        NK_CUDA_OK(cudaMemcpy(ra.data(), rt::SensorAlbedoDevice(solo), ra.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        NK_CUDA_OK(cudaMemcpy(rp.data(), rt::SensorPrimDevice(solo), rp.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
         const size_t off3 = static_cast<size_t>(e) * pix * 3u;
         const size_t off1 = static_cast<size_t>(e) * pix;
+        std::vector<float> rc(pix * 3u), rn(pix * 3u), ra(pix * 3u), rd(pix);
+        std::vector<uint32_t> rp(pix);
+        NK_CUDA_OK(cudaMemcpy(rc.data(), rt::SensorColorDevice(solo) + off3, rc.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        NK_CUDA_OK(cudaMemcpy(rd.data(), rt::SensorDepthDevice(solo) + off1, rd.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        NK_CUDA_OK(cudaMemcpy(rn.data(), rt::SensorNormalDevice(solo) + off3, rn.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        NK_CUDA_OK(cudaMemcpy(ra.data(), rt::SensorAlbedoDevice(solo) + off3, ra.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        NK_CUDA_OK(cudaMemcpy(rp.data(), rt::SensorPrimDevice(solo) + off1, rp.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
         EXPECT_EQ(std::memcmp(rc.data(), color.data() + off3, rc.size() * sizeof(float)), 0)
             << "env " << e << " color tile != standalone";
         EXPECT_EQ(std::memcmp(rd.data(), depth.data() + off1, rd.size() * sizeof(float)), 0)

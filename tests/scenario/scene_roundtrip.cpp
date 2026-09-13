@@ -98,7 +98,14 @@ std::vector<uint8_t> ReadBytes(const fs::path& p) {
 SceneIR BuildMinimalComposed() {
     SceneIR arm = nuka::import::LoadMjcf(kMinimalArm);
     SceneIR usd = nuka::import::LoadUsd(kMinimalScene);
-    return Compose(arm, usd, nuka::math::Transform::Identity(), "addon/");
+    SceneIR combined = Compose(arm, usd, nuka::math::Transform::Identity(), "addon/");
+    SensorDesc camera;
+    camera.name = "world_camera";
+    camera.type = SensorType::Camera;
+    camera.mount = MountFrame::World;
+    camera.local_offset.position = {0.2f, 0.3f, 2.0f};
+    combined.AddSensor(std::move(camera));
+    return combined;
 }
 
 // -- tree equality: pre-order names + derived paths -----------------------
@@ -250,6 +257,11 @@ TEST(SceneRoundtrip, MinimalAlwaysOn) {
     ExpectJointRecordsEqual(orig, loaded);
     ExpectMaterialNamesEqual(orig, loaded);
     EXPECT_EQ(orig.SensorCount(), loaded.SensorCount());
+    ASSERT_GT(loaded.SensorCount(), 0u);
+    const auto& camera = loaded.GetSensor(loaded.SensorCount() - 1u);
+    EXPECT_EQ(camera.mount, MountFrame::World);
+    EXPECT_EQ(camera.type, SensorType::Camera);
+    EXPECT_FLOAT_EQ(camera.local_offset.position.z, 2.0f);
     EXPECT_EQ(orig.CameraCount(), loaded.CameraCount());
     EXPECT_EQ(orig.LightCount(), loaded.LightCount());
     EXPECT_EQ(orig.ExcludePairs().size(), loaded.ExcludePairs().size());

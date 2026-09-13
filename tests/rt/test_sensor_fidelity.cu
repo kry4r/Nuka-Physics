@@ -224,7 +224,9 @@ TEST(SensorFidelity, DefaultConfigIsHighQuality) {
     ASSERT_NE(phi::ActiveBackend(), nullptr) << "no CUDA backend";
     const Aov implicit = RenderOnce(nullptr, false);
     const rt::SensorFidelityConfig def;
-    EXPECT_TRUE(def.Enabled());
+    EXPECT_GT(def.spp, 1u);
+    EXPECT_GT(def.shadow_samples, 0u);
+    EXPECT_TRUE(def.ao_enabled);
     const Aov explicit_default = RenderOnce(&def, false);
     ASSERT_EQ(implicit.color.size(), explicit_default.color.size());
     EXPECT_EQ(std::memcmp(implicit.color.data(), explicit_default.color.data(),
@@ -237,7 +239,6 @@ TEST(SensorFidelity, DefaultConfigIsHighQuality) {
 TEST(SensorFidelity, FidelityOnDeterministic) {
     ASSERT_NE(phi::ActiveBackend(), nullptr) << "no CUDA backend";
     const rt::SensorFidelityConfig f = BeautyProfile();
-    ASSERT_TRUE(f.Enabled());
     const Aov a = RenderOnce(&f, false);
     const Aov b = RenderOnce(&f, false);
     ASSERT_EQ(a.color.size(), b.color.size());

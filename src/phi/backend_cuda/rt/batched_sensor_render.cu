@@ -26,6 +26,7 @@
 #include "math/vec3.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/rt/prim_id.cuh"
+#include "phi/backend_cuda/rt/particle_surface.cuh"
 #include "phi/backend_cuda/rt/ray_box.cuh"
 #include "phi/backend_cuda/rt/rt_device_context.cuh"  // RtContext / OwnedBuffer
 #include "phi/backend_cuda/rt/sensor_scatter.hpp"
@@ -74,6 +75,12 @@ __global__ void RebaseInstanceIdsKernel(DevInstance* __restrict__ instances,
     const uint32_t total = env_count * instances_per_env;
     if (i >= total) return;
     instances[i].instance_id = i % instances_per_env;
+}
+
+__global__ void ReplicateSensorBlasRefsKernel(const SensorBlasRef* shared, uint32_t meshes,
+                                             uint32_t count, SensorBlasRef* out) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = shared[i % meshes];
 }
 
 // A symmetric draw in [-1, 1], a PURE function of (seed, env, axis): one uniform
@@ -515,6 +522,12 @@ struct BatchedSensorSceneDevice::Impl {
     uint32_t instances_per_env = 0u;
     uint32_t material_count = 0u;
 
+    ParticlePositionSource particles;
+    std::vector<particle_surface_detail::SurfaceCache> particle_surfaces;
+    OwnedBuffer d_env_blas_refs;
+    size_t env_blas_refs_bytes = 0u;
+    uint32_t mesh_count = 0u, blas_ref_envs = 0u;
+
     // Per-env appearance tables (the ONE thing the trace reads): materials [E*M],
     // light/ambient [E]. DR off -> exact base replicas (byte-identical tiles).
     OwnedBuffer d_materials_env, d_light_env, d_ambient_env;
@@ -596,10 +609,22 @@ BatchedSensorSceneDevice BuildBatchedSensorScene(const BatchedSensorSceneDesc& d
     impl->blas = BuildTwoLevelScene(desc.scene, backend);
     std::vector<SensorBlasRef> refs;
     CollectSensorBlasRefs(impl->blas, &refs);
+    impl->mesh_count = static_cast<uint32_t>(refs.size());
     for (uint32_t b : desc.blas_id) {
         if (b >= refs.size()) {
             throw std::runtime_error("BuildBatchedSensorScene: blas_id out of range");
         }
+    }
+
+    impl->particles = desc.particles;
+    std::vector<uint8_t> bound_meshes(refs.size(), 0u);
+    for (const auto& surface : desc.particle_surfaces) {
+        if (surface.mesh_id >= refs.size() || bound_meshes[surface.mesh_id])
+            throw std::invalid_argument("invalid or duplicate particle surface mesh binding");
+        if (!desc.particles.positions || !desc.particles.env_count)
+            throw std::invalid_argument("particle surface requires live particle positions");
+        bound_meshes[surface.mesh_id] = 1u;
+        impl->particle_surfaces.emplace_back(surface, desc.particles.particles_per_env, ctx);
     }
 
     impl->light = desc.scene.light;
@@ -779,12 +804,31 @@ void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ct
     auto* d_world_aabbs = static_cast<AABB*>(impl->d_world_aabbs.Data());
     auto* d_nodes = static_cast<LbvhNode*>(impl->d_tlas_nodes.Data());
 
+    const auto* blas_refs = static_cast<const SensorBlasRef*>(impl->d_blas_refs.Data());
+    uint32_t blas_refs_per_env = 0u;
+    if (!impl->particle_surfaces.empty()) {
+        const uint64_t count = uint64_t{env_count} * impl->mesh_count;
+        if (count > UINT32_MAX - kBlockSize)
+            throw std::invalid_argument("sensor mesh table exceeds device index capacity");
+        EnsureBytes(impl->d_env_blas_refs, impl->env_blas_refs_bytes, bt, count * sizeof(SensorBlasRef));
+        auto* live_refs = static_cast<SensorBlasRef*>(impl->d_env_blas_refs.Data());
+        if (impl->blas_ref_envs != env_count) {
+            phi::LaunchCuda(ReplicateSensorBlasRefsKernel, dim3((count + kBlockSize - 1u) / kBlockSize),
+                dim3(kBlockSize), 0u, ctx.stream, blas_refs, impl->mesh_count,
+                static_cast<uint32_t>(count), live_refs);
+            impl->blas_ref_envs = env_count;
+        }
+        for (auto& surface : impl->particle_surfaces)
+            surface.Update(ctx, impl->particles, env_count, live_refs, impl->mesh_count);
+        blas_refs = live_refs;
+        blas_refs_per_env = impl->mesh_count;
+    }
+
     ScatterEnvInstances(ctx.stream, fk,
                         static_cast<const phi::InstanceScatterRow*>(impl->d_rows.Data()),
                         static_cast<const uint32_t*>(impl->d_blas_id.Data()),
                         static_cast<const uint32_t*>(impl->d_material_id.Data()),
-                        static_cast<const SensorBlasRef*>(impl->d_blas_refs.Data()),
-                        env_count, m, d_instances, d_world_aabbs);
+                        blas_refs, env_count, m, d_instances, d_world_aabbs, blas_refs_per_env);
     {
         const uint32_t grid = (static_cast<uint32_t>(total_inst) + kBlockSize - 1u) / kBlockSize;
         phi::LaunchCuda(RebaseInstanceIdsKernel, dim3(grid), dim3(kBlockSize), 0u,
@@ -825,10 +869,6 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     const uint32_t s = sensors_per_env == 0u ? 1u : sensors_per_env;
     if (env_count == 0u || width == 0u || height == 0u || m == 0u) {
         return;
-    }
-    if (m < 2u) {
-        throw std::runtime_error(
-            "RenderSensorsBatched: the batched LBVH build needs >=2 instances/env");
     }
 
     const RtContext ctx = ResolveRtContext(backend);
@@ -1003,10 +1043,6 @@ void RenderLidarsBatched(BatchedSensorSceneDevice& device,
     const uint32_t s = sensors_per_env == 0u ? 1u : sensors_per_env;
     if (env_count == 0u || az_count == 0u || el_count == 0u || m == 0u) {
         return;
-    }
-    if (m < 2u) {
-        throw std::runtime_error(
-            "RenderLidarsBatched: the batched LBVH build needs >=2 instances/env");
     }
     if (az_count > kMaxLidarAxis || el_count > kMaxLidarAxis) {
         throw std::runtime_error(

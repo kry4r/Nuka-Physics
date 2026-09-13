@@ -157,6 +157,7 @@ const char* MountFrameName(MountFrame m) {
         case MountFrame::Link: return "link";
         case MountFrame::Body: return "body";
         case MountFrame::Base: return "base";
+        case MountFrame::World: return "world";
     }
     return "body";
 }
@@ -164,6 +165,7 @@ MountFrame MountFrameFromName(const std::string& s) {
     if (s == "link") return MountFrame::Link;
     if (s == "body") return MountFrame::Body;
     if (s == "base") return MountFrame::Base;
+    if (s == "world") return MountFrame::World;
     return MountFrame::Body;
 }
 

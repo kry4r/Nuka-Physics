@@ -679,9 +679,8 @@ public:
         return buf;
     }
 
-    // Device-resident batched camera sensor: S cameras per env into a single
-    // (E,S,H,W,ch) device tensor (each attach at one size appends a camera).
-    // mount_frame 0=Link 1=Body 2=Base; offset=pos3+quat4.
+    // Cameras write one (E,S,H,W,ch) device tensor; same-size attachments append.
+    // mount_frame: 0=Link, 1=Body, 2=Base, 3=World; offset=pos3+quat4.
     void attach_camera_sensor(uint32_t mount_frame, uint32_t mount_index,
                               const std::array<float, 7>& local_offset,
                               float vfov_deg, uint32_t width, uint32_t height) {
@@ -704,9 +703,8 @@ public:
         return {e, s, hh, ww, ch};
     }
 
-    // Device-resident batched lidar: S lidars per env, each an (az,el) ray fan, into
-    // a single (E,S,az,el) device RANGE tensor on the SAME RT TLAS the cameras use.
-    // mount_frame 0=Link 1=Body 2=Base; offset=pos3+quat4; angles in radians.
+    // Lidars write an (E,S,az,el) range tensor using the same scene as cameras.
+    // mount_frame: 0=Link, 1=Body, 2=Base, 3=World; offset=pos3+quat4, angles in radians.
     void attach_lidar_sensor(uint32_t mount_frame, uint32_t mount_index,
                              const std::array<float, 7>& local_offset,
                              uint32_t az_count, uint32_t el_count, float az_min,
@@ -1975,6 +1973,7 @@ NB_MODULE(_nuka_ext, m) {
         .value("LINK", NUKA_SENSOR_MOUNT_LINK)
         .value("BODY", NUKA_SENSOR_MOUNT_BODY)
         .value("BASE", NUKA_SENSOR_MOUNT_BASE)
+        .value("WORLD", NUKA_SENSOR_MOUNT_WORLD)
         .export_values();
 
     nb::class_<Device>(m, "Device")
@@ -2495,7 +2494,7 @@ NB_MODULE(_nuka_ext, m) {
             },
             nb::arg("mount_frame"), nb::arg("mount_index"), nb::arg("local_offset"),
             nb::arg("vfov_deg"), nb::arg("width"), nb::arg("height"),
-            "Attach a camera mounted on mount_frame (0=Link, 1=Body, 2=Base) "
+            "Attach a camera mounted on mount_frame (0=Link, 1=Body, 2=Base, 3=World) "
             "link/body/base index mount_index, offset by local_offset (pos3 + quat4: "
             "px,py,pz, qw,qx,qy,qz) in that frame; camera-local axes are -Z forward, "
             "+Y up. vfov_deg is the vertical field of view; width/height size every "
@@ -2573,7 +2572,7 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("az_count"), nb::arg("el_count"), nb::arg("az_min"),
             nb::arg("az_max"), nb::arg("el_min"), nb::arg("el_max"),
             nb::arg("min_range") = 0.0f, nb::arg("max_range") = 100.0f,
-            "Attach a lidar mounted on mount_frame (0=Link, 1=Body, 2=Base) "
+            "Attach a lidar mounted on mount_frame (0=Link, 1=Body, 2=Base, 3=World) "
             "link/body/base index mount_index, offset by local_offset (pos3 + quat4: "
             "px,py,pz, qw,qx,qy,qz). The fan sweeps az_count*el_count rays: az in "
             "[az_min,az_max] (radians) about the local +Z axis, el in [el_min,el_max] "

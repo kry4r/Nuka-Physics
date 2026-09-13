@@ -126,6 +126,99 @@ def test_coupled_world_requires_a_medium(device):
         nuka.World.create_coupled_from_scene(device, SCENE, env_count=1)
 
 
+def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
+    saved = str(tmp_path / "observed_surfaces.nks")
+    recorded = []
+    with nuka.SceneBuilder.create() as builder:
+        builder.add_rigid_primitive(nuka.PRIMITIVE_PLANE)
+        cloth_material = builder.add_material("cloth", base_color=[0.1, 0.7, 0.2])
+        tet_material = builder.add_material("soft", base_color=[0.8, 0.1, 0.1])
+        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+                          cloth_nx=7, cloth_ny=7, cloth_spacing=0.08,
+                          cloth_origin=[0.0, 0.0, 0.5], cloth_free=True,
+                          xpbd_particle_mass=0.02, xpbd_iters=8,
+                          skin_normal_offset=0.007, skin_smooth_iters=2,
+                          skin_smooth_lambda=0.2, render_material_id=cloth_material)
+        builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_XPBD,
+                          tet_center=[0.8, 0.0, 0.5], tet_radius=0.12,
+                          tet_cells=8, tet_cell_len=0.04,
+                          xpbd_particle_mass=0.02, xpbd_iters=8,
+                          render_material_id=tet_material)
+        builder.save(saved)
+        for source in (builder, nuka.SceneBuilder.create(saved)):
+            try:
+                with source.build(device, env_count=3, dt=0.001, gravity_z=0.0) as world:
+                    world.set_gravity_z(0.0)
+                    for x in (0.0, 0.8):
+                        world.attach_camera_sensor(nuka.SensorMount.WORLD.value, 0,
+                                                   (x, 0, 2, 1, 0, 0, 0), 30, 65, 65)
+                    q = np.sqrt(0.5)
+                    world.attach_lidar_sensor(nuka.SensorMount.WORLD.value, 0, (0, 0, 2, q, 0, q, 0),
+                                              1, 1, 0, 0, 0, 0, max_range=10.0)
+
+                    def image(channel):
+                        return torch.from_dlpack(world.get_sensor_view(channel)).cpu().numpy().copy()
+
+                    world.render_sensors()
+                    depth = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    np.testing.assert_allclose(depth[:, 0, 32, 32], 1.493, atol=2.0e-6)
+                    assert np.all(depth[:, 1, 32, 32] < 1.45)
+                    np.testing.assert_allclose(image(nuka.SensorChannel.RANGE).ravel(),
+                                               depth[:, 0, 32, 32], atol=2.0e-6)
+                    albedo = image(nuka.SensorChannel.ALBEDO).reshape(3, 2, 65, 65, 3)
+                    for env in range(3):
+                        np.testing.assert_allclose(albedo[env, :, 32, 32],
+                                                   [[0.1, 0.7, 0.2], [0.8, 0.1, 0.1]], atol=2.0e-6)
+                    recorded.append(depth.copy())
+                    initial = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1, 3).copy()
+                    velocity = np.zeros_like(initial)
+                    velocity[:, :, 2] = np.array([0.1, 0.3, -0.1], dtype=np.float32)[:, None]
+                    world.upload_field(nuka.Field.PARTICLE_VELOCITY, velocity)
+                    world.set_execution_mode("graph")
+                    world.step_n(8)
+                    before_render = world.download_field(nuka.Field.PARTICLE_POSITION).copy()
+                    world.render_sensors()
+                    moved = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    np.testing.assert_allclose(moved[:, 0, 32, 32],
+                        depth[:, 0, 32, 32] - np.array([0.1, 0.3, -0.1]) * 0.008, atol=1.0e-5)
+                    np.testing.assert_array_equal(world.download_field(nuka.Field.PARTICLE_POSITION), before_render)
+                    tilted = initial.copy()
+                    tilted[:, :49, 2] += 0.1 * tilted[:, :49, 0] + 0.2 * tilted[:, :49, 1]
+                    world.upload_field(nuka.Field.PARTICLE_POSITION, tilted)
+                    world.render_sensors()
+                    tilted_depth = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    np.testing.assert_allclose(tilted_depth[:, 0, 32, 32],
+                                               1.5 - 0.007 * np.sqrt(1.05), atol=3.0e-6)
+                    normal = image(nuka.SensorChannel.NORMAL).reshape(3, 2, 65, 65, 3)
+                    for env in range(3):
+                        np.testing.assert_allclose(normal[env, 0, 32, 32],
+                                                   np.array([-0.1, -0.2, 1.0]) / np.sqrt(1.05), atol=3.0e-6)
+                    world.render_sensors()
+                    np.testing.assert_array_equal(image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65), tilted_depth)
+                    world.reset_envs([1])
+                    world.render_sensors()
+                    reset = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    np.testing.assert_array_equal(reset[1], depth[1])
+                    np.testing.assert_array_equal(reset[[0, 2]], tilted_depth[[0, 2]])
+                    assert not np.any(world.download_field(nuka.ENV_STATUS))
+            finally:
+                if source is not builder:
+                    source.destroy()
+    np.testing.assert_array_equal(*recorded)
+
+    with nuka.SceneBuilder.create() as builder:
+        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+                          cloth_nx=3, cloth_ny=3, cloth_spacing=0.1,
+                          cloth_origin=[0.0, 0.0, 0.5], cloth_free=True)
+        with builder.build(device, env_count=2) as world:
+            world.attach_camera_sensor(nuka.SensorMount.WORLD.value, 0,
+                                       (0, 0, 2, 1, 0, 0, 0), 30, 33, 33)
+            world.render_sensors()
+            depth = torch.from_dlpack(world.get_sensor_view(nuka.SensorChannel.DEPTH))
+            np.testing.assert_allclose(depth.cpu().numpy().reshape(2, 33, 33)[:, 16, 16],
+                                       1.5, atol=2.0e-6)
+
+
 def test_mpm_surface_endpoints_roundtrip_graph_and_reset(device, tmp_path):
     saved = str(tmp_path / "mpm_cloth.nks")
     states = []
