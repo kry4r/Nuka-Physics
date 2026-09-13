@@ -15,7 +15,7 @@ NOISE_GAUSSIAN = 1
 NOISE_POISSON = 2
 
 __all__ = ["NOISE_NONE", "NOISE_GAUSSIAN", "NOISE_POISSON", "GaussianNoise",
-           "PoissonNoise", "MeasurementError", "DomainRandomization"]
+           "PoissonNoise", "MeasurementError", "CameraResponse", "RangeResponse", "DomainRandomization"]
 
 
 @dataclass
@@ -96,6 +96,60 @@ class MeasurementError:
         if minimum is not None:
             parameters.update(minimum=minimum, maximum=maximum, saturation_enabled=True)
         return parameters
+
+
+@dataclass
+class CameraResponse:
+    """Electronic image formation; exposure in seconds and charge in electrons."""
+
+    enabled: bool = True
+    shot_noise: bool = True
+    adc_bits: int = 12
+    exposure_time: float = 0.01
+    electrons_per_unit_second: float = 1000000.0
+    full_well_electrons: float = 10000.0
+    read_noise_electrons: float = 0.0
+    row_noise_electrons: float = 0.0
+    dark_current: float = 0.0
+    dark_doubling_temperature: float = 0.0
+    temperature: float = 25.0
+    reference_temperature: float = 25.0
+    pixel_gain_stddev: float = 0.0
+    pixel_offset_stddev_electrons: float = 0.0
+    analog_gain: float = 1.0
+    black_level_electrons: float = 0.0
+    dead_pixel_probability: float = 0.0
+    hot_pixel_probability: float = 0.0
+    hot_pixel_current: float = 0.0
+    seed: int = 0
+
+    def configure(self, world, sensor_index=0) -> None:
+        """Configure a camera and restart its acquisition history."""
+        world.set_camera_response(sensor_index, **asdict(self))
+
+
+@dataclass
+class RangeResponse:
+    """Range errors in meters with diffuse photon returns at a reference distance."""
+
+    enabled: bool = True
+    bias: float = 0.0
+    scale_error: float = 0.0
+    distance_stddev: float = 0.0
+    quadratic_stddev: float = 0.0
+    incidence_bias: float = 0.0
+    quantization: float = 0.0
+    return_photons: float = 0.0
+    reference_distance: float = 1.0
+    background_photons: float = 0.0
+    precision: float = 0.0
+    minimum_return: int = 1
+    dropout_probability: float = 0.0
+    seed: int = 0
+
+    def configure(self, world, channel, sensor_index=0) -> None:
+        """Configure a DEPTH or RANGE channel and restart its acquisition history."""
+        world.set_range_response(int(getattr(channel, "value", channel)), sensor_index, **asdict(self))
 
 
 @dataclass

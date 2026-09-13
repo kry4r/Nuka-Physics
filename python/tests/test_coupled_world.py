@@ -126,6 +126,173 @@ def test_coupled_world_requires_a_medium(device):
         nuka.World.create_coupled_from_scene(device, SCENE, env_count=1)
 
 
+def _check_imaging_responses(world, image):
+    color_channel = nuka.SensorChannel.COLOR
+    depth_channel = nuka.SensorChannel.DEPTH
+    range_channel = nuka.SensorChannel.RANGE
+    world.reset()
+    initial_positions = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1).copy()
+    world.step_n(2)
+    world.set_sensor_fidelity(spp=1, shadow_samples=1, ao_enabled=False, gi_enabled=False,
+                              tonemap_enabled=False, srgb_enabled=False, seed=71)
+    world.render_sensors()
+    ideal = image(color_channel).reshape(3, 2, 65, 65, 3)
+    truth = image(depth_channel).reshape(3, 2, 65, 65)
+    albedo = image(nuka.SensorChannel.ALBEDO).reshape(ideal.shape)
+    positions = world.download_field(nuka.Field.PARTICLE_POSITION).copy()
+    measured = lambda: image(color_channel).reshape(ideal.shape)[:, 0]
+    stamp = lambda channel, env=0, sensor=0: world.imaging_stamp(channel.value, sensor, env)
+
+    nuka.CameraResponse(shot_noise=False, adc_bits=0).configure(world)
+    assert not stamp(color_channel)["valid"]
+    world.render_sensors()
+    np.testing.assert_allclose(measured(), np.clip(ideal[:, 0], 0, 1), atol=2e-7, rtol=2e-7)
+    np.testing.assert_array_equal(image(color_channel).reshape(ideal.shape)[:, 1], ideal[:, 1])
+    assert stamp(color_channel)["acquisitions"] == 1
+    assert stamp(color_channel)["sample_time"] == pytest.approx(0.002)
+
+    nuka.CameraResponse(adc_bits=0, electrons_per_unit_second=100000.0,
+                         read_noise_electrons=3.0, seed=71).configure(world)
+    world.render_sensors()
+    noisy = measured()
+    expected = ideal[:, 0].astype(np.float64) * (float(np.float32(0.01)) * 100000.0)
+    mask = (ideal[:, 0] > 0.05) & (ideal[:, 0] < 0.8)
+    assert mask.sum() > 1000
+    residual = noisy.astype(np.float64) * 10000.0 - expected
+    variance = expected + 9.0
+    assert abs(residual[mask].sum()) < 5.0 * np.sqrt(variance[mask].sum())
+    assert 0.85 < np.mean(residual[mask] ** 2 / variance[mask]) < 1.15
+    world.render_sensors()
+    assert not np.array_equal(noisy, measured())
+    assert not np.array_equal(noisy[0], noisy[1])
+
+    nuka.CameraResponse(shot_noise=False, adc_bits=0, pixel_gain_stddev=0.02, seed=71).configure(world)
+    world.render_sensors()
+    fixed = measured()
+    world.render_sensors()
+    np.testing.assert_array_equal(measured(), fixed)
+    assert not np.array_equal(fixed[0], fixed[1])
+
+    nuka.CameraResponse(shot_noise=False, adc_bits=0, row_noise_electrons=20.0, seed=71).configure(world)
+    world.render_sensors()
+    row_error = measured().astype(np.float64) * 10000.0 - ideal[:, 0] * (float(np.float32(0.01)) * 1000000.0)
+    row_means = []
+    for env in range(3):
+        for row in range(65):
+            values = row_error[env, row][mask[env, row]]
+            if values.size > 8:
+                assert np.std(values) < 0.01
+                row_means.append(np.mean(values))
+    assert 10.0 < np.std(row_means) < 30.0
+
+    nuka.CameraResponse(shot_noise=False, adc_bits=0, dead_pixel_probability=0.02,
+                         hot_pixel_probability=0.02, hot_pixel_current=1e8, seed=71).configure(world)
+    world.render_sensors()
+    failed_pixels = measured()
+    clear = np.all(mask, axis=-1)
+    assert 0.008 < np.mean(np.all(failed_pixels == 0.0, axis=-1)[clear]) < 0.035
+    assert 0.008 < np.mean(np.all(failed_pixels == 1.0, axis=-1)[clear]) < 0.035
+    world.render_sensors()
+    np.testing.assert_array_equal(measured(), failed_pixels)
+
+    for temperature, level in ((25.0, 0.001), (35.0, 0.004)):
+        nuka.CameraResponse(shot_noise=False, adc_bits=0, exposure_time=0.1,
+            full_well_electrons=1000.0, dark_current=10.0, dark_doubling_temperature=5.0,
+            temperature=temperature, dead_pixel_probability=1.0).configure(world)
+        world.render_sensors()
+        np.testing.assert_allclose(measured(), level, rtol=1e-6, atol=1e-8)
+    nuka.CameraResponse(adc_bits=10, seed=71).configure(world)
+    world.render_sensors()
+    np.testing.assert_allclose(measured() * 1023, np.round(measured() * 1023), atol=1e-4)
+
+    bias = nuka.RangeResponse(bias=0.004, scale_error=0.01, incidence_bias=0.02, quantization=0.0005)
+    bias.configure(world, depth_channel)
+    bias.configure(world, range_channel)
+    world.render_sensors()
+    expected_range = np.floor((truth[:, 0, 32, 32] * 1.01 + 0.004) / np.float32(0.0005) + 0.5) * np.float32(0.0005)
+    np.testing.assert_allclose(image(depth_channel).reshape(truth.shape)[:, 0, 32, 32], expected_range, atol=2e-6)
+    np.testing.assert_allclose(image(range_channel).ravel(), expected_range, atol=2e-6)
+    np.testing.assert_array_equal(image(depth_channel).reshape(truth.shape)[:, 1], truth[:, 1])
+
+    nuka.RangeResponse(return_photons=2.0, seed=71).configure(world, depth_channel)
+    world.render_sensors()
+    axis = (np.arange(65) + 0.5 - 32.5) * (np.tan(np.deg2rad(15.0)) / 32.5)
+    xx, yy = np.meshgrid(axis, axis)
+    cosine = 1.0 / np.sqrt(1 + xx * xx + yy * yy)
+    reflectance = albedo[:, 0] @ np.array([0.2126, 0.7152, 0.0722])
+    hit = np.isfinite(truth[:, 0])
+    missed_probability = np.exp(-2 * reflectance * cosine / truth[:, 0] ** 2)
+    dropped = np.isinf(image(depth_channel).reshape(truth.shape)[:, 0]) & hit
+    expected_dropped = missed_probability[hit].sum()
+    deviation = np.sqrt((missed_probability[hit] * (1 - missed_probability[hit])).sum())
+    assert abs(dropped.sum() - expected_dropped) < 5 * deviation + 2
+
+    nuka.RangeResponse(distance_stddev=0.001, quadratic_stddev=0.002, seed=71).configure(world, depth_channel)
+    world.render_sensors()
+    error = image(depth_channel).reshape(truth.shape)[:, 0][hit] - truth[:, 0][hit]
+    expected_variance = 0.001 ** 2 + (0.002 * truth[:, 0][hit] ** 2) ** 2
+    assert 0.85 < np.mean(error ** 2 / expected_variance) < 1.15
+
+    response = nuka.RangeResponse(distance_stddev=0.001, return_photons=1000,
+                                  precision=0.02, dropout_probability=0.05, seed=17)
+    response.configure(world, depth_channel)
+    response.configure(world, range_channel)
+    nuka.CameraResponse(read_noise_electrons=3, pixel_offset_stddev_electrons=2, seed=17).configure(world)
+    world.render_sensors()
+    channels = (color_channel, depth_channel, range_channel)
+    first = [image(channel) for channel in channels]
+    views = [torch.from_dlpack(world.get_sensor_view(channel)) for channel in channels]
+    addresses = [view.data_ptr() for view in views]
+    before_invalid = world.state_hash()
+    with pytest.raises((ValueError, RuntimeError)):
+        world.set_camera_response(adc_bits=25)
+    with pytest.raises((ValueError, RuntimeError)):
+        world.set_range_response(depth_channel.value, distance_stddev=float("nan"))
+    assert world.state_hash() == before_invalid
+    np.testing.assert_array_equal(world.download_field(nuka.Field.PARTICLE_POSITION), positions)
+    with world.capture_checkpoint() as checkpoint:
+        world.step()
+        world.render_sensors()
+        expected_images = [image(channel) for channel in channels]
+        expected_stamps = [[stamp(channel, env) for env in range(3)] for channel in channels]
+        expected_hash = world.state_hash()
+        nuka.CameraResponse(enabled=False).configure(world)
+        nuka.RangeResponse(enabled=False).configure(world, range_channel)
+        world.render_sensors()
+        world.restore_checkpoint(checkpoint)
+        for view, saved in zip(views, first):
+            np.testing.assert_array_equal(view.cpu().numpy(), saved)
+        world.step()
+        world.render_sensors()
+        for channel, saved, stamps in zip(channels, expected_images, expected_stamps):
+            np.testing.assert_array_equal(image(channel), saved)
+            assert [stamp(channel, env) for env in range(3)] == stamps
+        assert world.state_hash() == expected_hash
+    assert [view.data_ptr() for view in views] == addresses
+    before_reset = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1).copy()
+    world.reset_envs([1, 1])
+    for channel, saved in zip(channels, expected_images):
+        np.testing.assert_array_equal(image(channel)[[0, 2]], saved[[0, 2]])
+        assert not np.any(image(channel)[1]) and not stamp(channel, 1)["valid"]
+    world.render_sensors()
+    reset_images = [image(channel)[1].copy() for channel in channels]
+    for channel in channels:
+        assert stamp(channel, 1)["acquisitions"] == 1
+        assert stamp(channel, 1)["sample_time"] == 0.0
+    after_reset = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1)
+    np.testing.assert_array_equal(after_reset[[0, 2]], before_reset[[0, 2]])
+    np.testing.assert_array_equal(after_reset[1], initial_positions[1])
+    world.reset_envs([1])
+    world.render_sensors()
+    for channel, saved in zip(channels, reset_images):
+        np.testing.assert_array_equal(image(channel)[1], saved)
+    with world.capture_checkpoint() as checkpoint:
+        world.attach_camera_sensor(nuka.SensorMount.WORLD.value, 0, (0, 0, 2, 1, 0, 0, 0), 30, 65, 65)
+        with pytest.raises((ValueError, RuntimeError)):
+            world.restore_checkpoint(checkpoint)
+        np.testing.assert_array_equal(world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1), after_reset)
+
+
 def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
     saved = str(tmp_path / "observed_surfaces.nks")
     recorded = []
@@ -201,6 +368,7 @@ def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
                     np.testing.assert_array_equal(reset[1], depth[1])
                     np.testing.assert_array_equal(reset[[0, 2]], tilted_depth[[0, 2]])
                     assert not np.any(world.download_field(nuka.ENV_STATUS))
+                    _check_imaging_responses(world, image)
             finally:
                 if source is not builder:
                     source.destroy()

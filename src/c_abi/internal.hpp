@@ -8,6 +8,7 @@
 #include <map>
 #include "rt/render_dr.hpp"
 #include "rt/sensor_fidelity.hpp"
+#include "sensor/imaging.hpp"
 #include "phi/backend.hpp"
 // M9 T5/T6: the C-ABI world is now ONE generic nk::World (Scene->CookToModel->
 // nk::World). The diffsim + noise + set_link_mass paths still consume the legacy
@@ -117,6 +118,9 @@ struct SensorAttachment {
     // Camera AOV selection (0 => the default all-AOV profile). Retained across a
     // camera/lidar re-attach so an observation pipeline keeps its selected planes.
     uint32_t aov_mask = 0u;
+    uint64_t revision = 1u;
+    std::vector<nuka::sensor::CameraResponse> camera_responses;
+    std::vector<nuka::sensor::RangeResponse> depth_responses, lidar_responses;
     SensorAttachment();     // out-of-line (the SensorDesc vector member is incomplete here).
     ~SensorAttachment();    // defined in c_abi/sensor.cpp (FreeSensorScene then backend).
     SensorAttachment(SensorAttachment&&) = delete;

@@ -1,22 +1,5 @@
-// ---------------------------------------------------------------------------
-// nuka::rt -- the BATCHED device-resident sensor render. ONE batched LBVH build
-// over N per-env instance world-AABBs (collision/lbvh_batched.cuh) + ONE flat
-// trace launch over [E*S*H*W] rays into a single (E,S,H,W,ch) device AOV tensor
-// (S cameras per env, each on its own mount; S==1 collapses to (E,H,W,ch)).
-//
-// THE KERNEL is RenderFrameKernel (two_level_render.cu) generalized to a flat
-// global ray index over cameras: cam = gid/(H*W), env = cam/S; it rebases the
-// TLAS node slice (env*(2M-1)) + the DevInstance slice (env*M) per env (the scene
-// is env-shared) and reuses the SAME ClosestHit / ReconstructHit / beauty-shade
-// nest, instantiated Real=float (the FP32 sensor cost). The single-camera FP64
-// golden path is untouched -- this is the persistent high-quality batched path.
-//
-// The TLAS leaf `.left` is the env-LOCAL instance index (the batched build's leaf
-// payload), so `instances + env*M` resolves it directly; the prim_id pack uses an
-// env-LOCAL instance id (rebased from the scatter's global id) so it fits the
-// 12-bit instance field AND every env tile is byte-identical to a standalone
-// single-env render of that env's scene + camera.
-// ---------------------------------------------------------------------------
+// Batched cameras and lidars share traversal over environment-local instance trees.
+// Live poses and particle surfaces feed device-resident observation tensors.
 
 #include "phi/backend_cuda/rt/batched_sensor_render.hpp"
 
@@ -36,10 +19,14 @@
 #include "rt/render_dr.hpp"
 #include "rt/sensor_fidelity.hpp"   // SensorFidelityConfig (opt-in beauty shade)
 #include "sensor/noise/philox.cuh"  // Philox4x32 host/device pure RNG
+#include "sensor/noise/image_formation.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <algorithm>
+#include <limits>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -58,6 +45,14 @@ using ::nuka::collision::AABB;
 using ::nuka::collision::gpu::LbvhNode;
 using ::nuka::math::Vec3;
 
+__global__ void AdvanceImagingCounters(sensor::ImagingStamp* stamps, uint32_t count) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        ++stamps[index].acquisitions;
+        stamps[index].valid = 1u;
+    }
+}
+
 void CheckCuda(cudaError_t result, const char* op) {
     if (result != cudaSuccess) {
         throw std::runtime_error(std::string(op) + " failed: " +
@@ -75,6 +70,17 @@ __global__ void RebaseInstanceIdsKernel(DevInstance* __restrict__ instances,
     const uint32_t total = env_count * instances_per_env;
     if (i >= total) return;
     instances[i].instance_id = i % instances_per_env;
+}
+
+__global__ void PrepareImagingKeys(const sensor::CameraResponse* cameras, const sensor::RangeResponse* ranges,
+    uint32_t count, uint32_t sensors_per_env, uint32_t channel,
+    sensor::noise::CameraSampleKeys* camera_keys, sensor::noise::RangeSampleKeys* range_keys) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t sensor_id = i % sensors_per_env;
+    const uint32_t env = i / sensors_per_env;
+    if (cameras) camera_keys[i] = sensor::noise::MakeCameraSampleKeys(cameras[sensor_id].seed, env, sensor_id);
+    range_keys[i] = sensor::noise::MakeRangeSampleKeys(ranges[sensor_id].seed, env, sensor_id, channel);
 }
 
 __global__ void ReplicateSensorBlasRefsKernel(const SensorBlasRef* shared, uint32_t meshes,
@@ -202,13 +208,8 @@ __device__ inline uint32_t SensorPixelIndex(uint32_t work, uint32_t width,
     return py * width + px;
 }
 
-// Cameras are env-major (cameras[env*S+s]); the env owning a camera is cam/S, and
-// the TLAS node + instance + material slices index by env (the scene is env-shared
-// -- only cameras fan out). One writer per pixel, no atomics -> FP32-deterministic
-// byte-exact per tile. S==1 collapses cam==env, byte-identical to one cam per env.
-//
-// Every color pixel runs the shared beauty shade. The center ray's depth/normal/
-// albedo/prim remain stable AOVs; only RGB uses the sampled quality path.
+// Center rays supply geometric AOVs; RGB accumulates sampled linear illumination.
+// Camera, instance and material tables use environment-major indexing.
 __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ cameras,
                                          const LbvhNode* __restrict__ tlas_nodes,
                                          uint32_t leaves_per_env,
@@ -225,6 +226,11 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                          FidelityParams fid,
                                          BeautyParams sky,
                                          uint32_t aov_mask,
+                                         const sensor::CameraResponse* __restrict__ camera_responses,
+                                         const sensor::RangeResponse* __restrict__ range_responses,
+                                         const sensor::noise::CameraSampleKeys* __restrict__ camera_keys,
+                                         const sensor::noise::RangeSampleKeys* __restrict__ range_keys,
+                                         const sensor::ImagingStamp* __restrict__ stamps,
                                          float* __restrict__ out_color,
                                          float* __restrict__ out_depth,
                                          float* __restrict__ out_normal,
@@ -242,7 +248,9 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
     const uint32_t py = local_p / width;
     const uint32_t gid = cam * pix_per_cam + local_p;
     const uint32_t env = cam / sensors_per_env;
-
+    const uint32_t sensor_id = cam % sensors_per_env;
+    const bool measured_depth = range_responses && range_responses[sensor_id].enabled &&
+        (aov_mask & kSensorAovDepth) != 0u;
 
     const PinholeCamera camera = cameras[cam];
     const Ray ray = camera.GenerateRay(px, py);
@@ -278,9 +286,9 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
     // channels that consume them. The default all-AOV mask follows the exact
     // legacy arithmetic below.
     const bool need_details =
-        (aov_mask & (kSensorAovColor | kSensorAovNormal | kSensorAovAlbedo)) != 0u;
+        (aov_mask & (kSensorAovColor | kSensorAovNormal | kSensorAovAlbedo)) != 0u || measured_depth;
     const bool need_material =
-        (aov_mask & (kSensorAovColor | kSensorAovAlbedo)) != 0u;
+        (aov_mask & (kSensorAovColor | kSensorAovAlbedo)) != 0u || measured_depth;
     const bool need_color = (aov_mask & kSensorAovColor) != 0u;
     const Material* env_mats = nullptr;
     Light light{};
@@ -307,7 +315,7 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
             if (need_material) {
                 const uint32_t material_id = env_inst[inst].material_id;
                 mat = env_mats[material_id];
-                if (need_color || (aov_mask & kSensorAovAlbedo) != 0u) {
+                if (need_color || (aov_mask & kSensorAovAlbedo) != 0u || measured_depth) {
                     const Vec3 hit{ray.origin.x + best_t * ray.dir.x,
                                    ray.origin.y + best_t * ray.dir.y,
                                    ray.origin.z + best_t * ray.dir.z};
@@ -315,6 +323,15 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                                           n, &mat, true);
                 }
                 albedo = mat.albedo;
+            }
+
+            if (measured_depth) {
+                const float incidence = fabsf(n.Dot(ray.dir));
+                const float reflectance = fmaxf(0.0f, (0.2126f * mat.albedo.x +
+                    0.7152f * mat.albedo.y + 0.0722f * mat.albedo.z) * (1.0f - mat.transmission));
+                depth = sensor::noise::FormRange(depth, incidence, reflectance,
+                    camera.near_clip, camera.far_clip, RtMissDepth(), range_responses[sensor_id],
+                    range_keys[cam], local_p, stamps[cam].acquisitions);
             }
 
             // RGB is evaluated below by the default quality path. Keeping the
@@ -366,13 +383,19 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
         }
         const float inv_s = 1.0f / static_cast<float>(S);
         color = Vec3{accum.x * inv_s, accum.y * inv_s, accum.z * inv_s};
+        if (camera_responses && camera_responses[sensor_id].enabled) {
+            const auto& response = camera_responses[sensor_id];
+            const auto& keys = camera_keys[cam];
+            const uint64_t sequence = stamps[cam].acquisitions;
+            color.x = sensor::noise::FormCameraChannel(color.x, response, keys, local_p, py, 0u, sequence);
+            color.y = sensor::noise::FormCameraChannel(color.y, response, keys, local_p, py, 1u, sequence);
+            color.z = sensor::noise::FormCameraChannel(color.z, response, keys, local_p, py, 2u, sequence);
+        }
         if (fid.tonemap != 0u) {
-            color = Vec3{TonemapAces(color.x), TonemapAces(color.y),
-                         TonemapAces(color.z)};
+            color = Vec3{TonemapAces(color.x), TonemapAces(color.y), TonemapAces(color.z)};
         }
         if (fid.srgb != 0u) {
-            color = Vec3{LinearToSrgb(color.x), LinearToSrgb(color.y),
-                          LinearToSrgb(color.z)};
+            color = Vec3{LinearToSrgb(color.x), LinearToSrgb(color.y), LinearToSrgb(color.z)};
         }
     }
 
@@ -462,6 +485,12 @@ __global__ void BatchedLidarTraceKernel(const LidarSensor* __restrict__ lidars,
                                         uint32_t sensors_per_env,
                                         uint32_t az_count,
                                         uint32_t el_count,
+                                        const Material* __restrict__ materials,
+                                        const DevTexture* __restrict__ textures,
+                                        uint32_t material_count,
+                                        const sensor::RangeResponse* __restrict__ responses,
+                                        const sensor::noise::RangeSampleKeys* __restrict__ keys,
+                                        const sensor::ImagingStamp* __restrict__ stamps,
                                         float* __restrict__ out_range) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t rays_per_lidar = az_count * el_count;
@@ -499,6 +528,22 @@ __global__ void BatchedLidarTraceKernel(const LidarSensor* __restrict__ lidars,
     if (best_prim != kNoPrim) {
         range = best_t < s.min_range ? s.min_range
                                      : (best_t > s.max_range ? s.max_range : best_t);
+        const uint32_t sensor_id = lidar % sensors_per_env;
+        if (responses && responses[sensor_id].enabled) {
+            Vec3 n;
+            float u, v;
+            ReconstructHit<float>(env_inst, best_prim, origin, dir, &n, &u, &v);
+            const float incidence = fabsf(n.Dot(dir));
+            uint32_t instance, primitive;
+            UnpackPrimId(best_prim, &instance, &primitive);
+            Material mat = materials[size_t{env} * material_count + env_inst[instance].material_id];
+            const Vec3 hit = origin + dir * best_t;
+            ApplyMaterialTextures(env_inst, textures, best_prim, hit, u, v, n, &mat, true);
+            const float reflectance = fmaxf(0.0f, (0.2126f * mat.albedo.x +
+                0.7152f * mat.albedo.y + 0.0722f * mat.albedo.z) * (1.0f - mat.transmission));
+            range = sensor::noise::FormRange(best_t, incidence, reflectance, s.min_range, s.max_range,
+                s.max_range, responses[sensor_id], keys[lidar], r, stamps[lidar].acquisitions);
+        }
     }
     out_range[gid] = range;
 }
@@ -537,6 +582,18 @@ struct BatchedSensorSceneDevice::Impl {
 
     // Default high-quality shading configuration used by every camera render.
     rt::SensorFidelityConfig fid_cfg;
+
+    sensor::ImagingState imaging;
+    OwnedBuffer d_camera_responses, d_depth_responses, d_lidar_responses;
+    OwnedBuffer d_camera_stamps, d_lidar_stamps;
+    OwnedBuffer d_camera_keys, d_depth_keys, d_lidar_keys;
+    size_t camera_key_bytes = 0u, depth_key_bytes = 0u, lidar_key_bytes = 0u;
+    bool camera_keys_dirty = true, lidar_keys_dirty = true;
+    size_t camera_response_bytes = 0u, depth_response_bytes = 0u, lidar_response_bytes = 0u;
+    size_t camera_stamp_bytes = 0u, lidar_stamp_bytes = 0u;
+    bool responses_dirty = true;
+    bool camera_stamps_dirty = true, lidar_stamps_dirty = true;
+    uint32_t image_width = 0u, image_height = 0u;
 
     // Selected camera outputs. Default is the legacy all-AOV tensor; setters
     // normalize public mask==0 to this value.
@@ -673,6 +730,122 @@ void EnsureBytes(OwnedBuffer& buf, std::size_t& cur_bytes, phi::BufferType* bt,
     if (bytes != cur_bytes || buf.Data() == nullptr) {
         buf = OwnedBuffer(bt, bytes);
         cur_bytes = bytes;
+    }
+}
+
+void SizeImagingState(BatchedSensorSceneDevice::Impl* impl, uint32_t env_count) {
+    auto& state = impl->imaging;
+    if (state.env_count != env_count) {
+        state.env_count = env_count;
+        state.sample_times.assign(env_count, 0.0);
+        state.camera_stamps.clear();
+        state.lidar_stamps.clear();
+        impl->camera_stamps_dirty = impl->lidar_stamps_dirty = true;
+        impl->camera_keys_dirty = impl->lidar_keys_dirty = true;
+    }
+    state.camera_stamps.resize(size_t{env_count} * state.cameras.size());
+    state.lidar_stamps.resize(size_t{env_count} * state.lidars.size());
+}
+
+template <typename T>
+void UploadImagingVector(OwnedBuffer& buffer, size_t& allocated, const std::vector<T>& values,
+                          const RtContext& ctx) {
+    if (values.empty()) return;
+    const size_t bytes = values.size() * sizeof(T);
+    EnsureBytes(buffer, allocated, ctx.device_bt, bytes);
+    buffer.CopyFromHost(values.data(), bytes);
+}
+
+void PrepareImaging(BatchedSensorSceneDevice::Impl* impl, const RtContext& ctx,
+                     uint32_t env_count, uint32_t sensors_per_env, bool lidar, bool device_stamps) {
+    auto& state = impl->imaging;
+    if ((lidar && state.lidars.size() != sensors_per_env) ||
+        (!lidar && (state.cameras.size() != sensors_per_env || state.depths.size() != sensors_per_env)))
+        impl->responses_dirty = true;
+    if (lidar) state.lidars.resize(sensors_per_env);
+    else {
+        state.cameras.resize(sensors_per_env);
+        state.depths.resize(sensors_per_env);
+    }
+    SizeImagingState(impl, env_count);
+    if (impl->responses_dirty) {
+        UploadImagingVector(impl->d_camera_responses, impl->camera_response_bytes, state.cameras, ctx);
+        UploadImagingVector(impl->d_depth_responses, impl->depth_response_bytes, state.depths, ctx);
+        UploadImagingVector(impl->d_lidar_responses, impl->lidar_response_bytes, state.lidars, ctx);
+        impl->responses_dirty = false;
+        impl->camera_keys_dirty = impl->lidar_keys_dirty = true;
+    }
+    auto& stamps = lidar ? state.lidar_stamps : state.camera_stamps;
+    auto& keys_dirty = lidar ? impl->lidar_keys_dirty : impl->camera_keys_dirty;
+    if (device_stamps && keys_dirty) {
+        auto& range_keys = lidar ? impl->d_lidar_keys : impl->d_depth_keys;
+        auto& range_bytes = lidar ? impl->lidar_key_bytes : impl->depth_key_bytes;
+        EnsureBytes(range_keys, range_bytes, ctx.device_bt, stamps.size() * sizeof(sensor::noise::RangeSampleKeys));
+        if (!lidar) EnsureBytes(impl->d_camera_keys, impl->camera_key_bytes, ctx.device_bt,
+            stamps.size() * sizeof(sensor::noise::CameraSampleKeys));
+        phi::LaunchCuda(PrepareImagingKeys, dim3((stamps.size() + kBlockSize - 1u) / kBlockSize),
+            dim3(kBlockSize), 0u, ctx.stream,
+            lidar ? nullptr : static_cast<const sensor::CameraResponse*>(impl->d_camera_responses.Data()),
+            static_cast<const sensor::RangeResponse*>((lidar ? impl->d_lidar_responses : impl->d_depth_responses).Data()),
+            static_cast<uint32_t>(stamps.size()), sensors_per_env, lidar ? 4u : 3u,
+            lidar ? nullptr : static_cast<sensor::noise::CameraSampleKeys*>(impl->d_camera_keys.Data()),
+            static_cast<sensor::noise::RangeSampleKeys*>(range_keys.Data()));
+        CheckCuda(cudaGetLastError(), "prepare imaging random keys");
+        keys_dirty = false;
+    }
+    for (auto& stamp : stamps) if (stamp.acquisitions == UINT64_MAX)
+        throw std::overflow_error("imaging acquisition counter exhausted");
+    auto& dirty = lidar ? impl->lidar_stamps_dirty : impl->camera_stamps_dirty;
+    auto& buffer = lidar ? impl->d_lidar_stamps : impl->d_camera_stamps;
+    auto& allocated = lidar ? impl->lidar_stamp_bytes : impl->camera_stamp_bytes;
+    if (device_stamps && (dirty || allocated != stamps.size() * sizeof(sensor::ImagingStamp))) {
+        UploadImagingVector(buffer, allocated, stamps, ctx);
+        CheckCuda(cudaStreamSynchronize(ctx.stream), "initialize imaging counters");
+        dirty = false;
+    }
+    for (uint32_t env = 0u; env < env_count; ++env) for (uint32_t s = 0u; s < sensors_per_env; ++s) {
+        auto& stamp = stamps[size_t{env} * sensors_per_env + s];
+        ++stamp.acquisitions;
+        stamp.sample_time = state.sample_times[env];
+        stamp.valid = 1u;
+    }
+    if (device_stamps) {
+        phi::LaunchCuda(AdvanceImagingCounters, dim3((stamps.size() + kBlockSize - 1u) / kBlockSize),
+            dim3(kBlockSize), 0u, ctx.stream, static_cast<sensor::ImagingStamp*>(buffer.Data()),
+            static_cast<uint32_t>(stamps.size()));
+        CheckCuda(cudaGetLastError(), "advance imaging counters");
+    } else dirty = true;
+}
+
+void ClearImagingSensor(BatchedSensorSceneDevice::Impl* impl, const RtContext& ctx,
+                         bool lidar, uint32_t sensor_id, uint32_t env) {
+    auto& state = impl->imaging;
+    const size_t count = lidar ? state.lidars.size() : state.cameras.size();
+    if (sensor_id >= count || env >= state.env_count) throw std::invalid_argument("imaging sensor index out of range");
+    auto& stamps = lidar ? state.lidar_stamps : state.camera_stamps;
+    stamps[size_t{env} * count + sensor_id] = {};
+    auto& device_stamps = lidar ? impl->d_lidar_stamps : impl->d_camera_stamps;
+    const size_t stamp_bytes = lidar ? impl->lidar_stamp_bytes : impl->camera_stamp_bytes;
+    const size_t stamp_offset = (size_t{env} * count + sensor_id) * sizeof(sensor::ImagingStamp);
+    if (device_stamps.Data() && stamp_offset + sizeof(sensor::ImagingStamp) <= stamp_bytes)
+        CheckCuda(cudaMemsetAsync(static_cast<uint8_t*>(device_stamps.Data()) + stamp_offset,
+            0, sizeof(sensor::ImagingStamp), ctx.stream), "reset imaging counter");
+    const size_t elements = lidar ? size_t{impl->lidar_az} * impl->lidar_el
+        : size_t{impl->image_width} * impl->image_height;
+    const size_t tile = size_t{env} * count + sensor_id;
+    const auto clear = [&](OwnedBuffer& buffer, size_t bytes, size_t components) {
+        const size_t tile_bytes = elements * components * sizeof(float);
+        if (tile_bytes && buffer.Data() && (tile + 1u) * tile_bytes <= bytes)
+            CheckCuda(cudaMemsetAsync(static_cast<uint8_t*>(buffer.Data()) + tile * tile_bytes,
+                0, tile_bytes, ctx.stream), "clear imaging tile");
+    };
+    if (lidar) clear(impl->d_range, impl->range_b, 1u);
+    else {
+        clear(impl->d_color, impl->col_b, 3u);
+        clear(impl->d_depth, impl->dep_b, 1u);
+        clear(impl->d_normal, impl->nrm_b, 3u);
+        clear(impl->d_albedo, impl->alb_b, 3u);
+        clear(impl->d_prim, impl->prim_b, 1u);
     }
 }
 
@@ -878,9 +1051,19 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
 
     // Scene is env-shared (E trees of M instances); cameras fan out E*S env-major.
     const uint64_t num_cameras = static_cast<uint64_t>(env_count) * s;
+    if (num_cameras > UINT32_MAX || uint64_t{width} * height > UINT32_MAX / num_cameras)
+        throw std::invalid_argument("camera pixel count exceeds the supported index range");
     const uint64_t rays = num_cameras * width * height;
 
     const uint32_t aov_mask = impl->aov_mask;
+    const bool camera_response = (aov_mask & kSensorAovColor) != 0u &&
+        std::any_of(impl->imaging.cameras.begin(), impl->imaging.cameras.end(),
+        [](const auto& config) { return config.enabled != 0u; });
+    const bool depth_response = (aov_mask & kSensorAovDepth) != 0u &&
+        std::any_of(impl->imaging.depths.begin(), impl->imaging.depths.end(),
+        [](const auto& config) { return config.enabled != 0u; });
+    PrepareImaging(impl, ctx, env_count, s, false, camera_response || depth_response);
+
     if ((aov_mask & kSensorAovColor) != 0u) {
         EnsureBytes(impl->d_color, impl->col_b, bt, rays * 3u * sizeof(float));
     }
@@ -900,7 +1083,7 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     // Per-env material/light/ambient tables (refilled on an env-count change; DR
     // off -> base replicas). The trace reads these BY ENV -- the ONE path.
     const bool need_appearance =
-        (aov_mask & (kSensorAovColor | kSensorAovAlbedo)) != 0u;
+        (aov_mask & (kSensorAovColor | kSensorAovAlbedo)) != 0u || depth_response;
     if (need_appearance) {
         EnsureEnvAppearanceTables(impl, ctx, env_count, false);
     }
@@ -915,7 +1098,7 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
     // shading register footprint. Any appearance AOV uses the general shade path.
     const uint32_t grid = static_cast<uint32_t>((rays + kBlockSize - 1u) / kBlockSize);
     const bool primary_only =
-        (aov_mask & ~(kSensorAovDepth | kSensorAovPrim)) == 0u;
+        (aov_mask & ~(kSensorAovDepth | kSensorAovPrim)) == 0u && !depth_response;
     if (primary_only) {
         phi::LaunchCuda(BatchedSensorPrimaryHitKernel, dim3(grid),
                         dim3(kBlockSize), 0u, ctx.stream, cameras_device, d_nodes,
@@ -937,6 +1120,11 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
                         static_cast<const AmbientTerm*>(impl->d_ambient_env.Data()),
                         static_cast<uint32_t>(num_cameras), s,
                         width, height, fid, sky, aov_mask,
+                        camera_response ? static_cast<const sensor::CameraResponse*>(impl->d_camera_responses.Data()) : nullptr,
+                        depth_response ? static_cast<const sensor::RangeResponse*>(impl->d_depth_responses.Data()) : nullptr,
+                        static_cast<const sensor::noise::CameraSampleKeys*>(impl->d_camera_keys.Data()),
+                        static_cast<const sensor::noise::RangeSampleKeys*>(impl->d_depth_keys.Data()),
+                        static_cast<const sensor::ImagingStamp*>(impl->d_camera_stamps.Data()),
                         static_cast<float*>(impl->d_color.Data()),
                         static_cast<float*>(impl->d_depth.Data()),
                         static_cast<float*>(impl->d_normal.Data()),
@@ -945,6 +1133,8 @@ void RenderSensorsBatched(BatchedSensorSceneDevice& device,
         CheckCuda(cudaGetLastError(), "BatchedSensorTraceKernel launch");
     }
     impl->aov_rays = rays;
+    impl->image_width = width;
+    impl->image_height = height;
 }
 
 void SetSensorMounts(BatchedSensorSceneDevice& device,
@@ -959,6 +1149,11 @@ void SetSensorMounts(BatchedSensorSceneDevice& device,
     (void)cudaSetDevice(ctx.device_id);
     impl->d_mounts = UploadOwned(ctx.device_bt, mounts);
     impl->sensors_per_env = static_cast<uint32_t>(mounts.size());
+    impl->imaging.cameras.resize(mounts.size());
+    impl->imaging.depths.resize(mounts.size());
+    impl->imaging.camera_stamps.assign(size_t{impl->imaging.env_count} * mounts.size(), {});
+    impl->camera_stamps_dirty = true;
+    impl->responses_dirty = true;
     cudaStreamSynchronize(ctx.stream);
 }
 
@@ -994,6 +1189,158 @@ void SetSensorAovMask(BatchedSensorSceneDevice& device, uint32_t mask) {
             "SetSensorAovMask: mask contains bits outside COLOR..PRIM");
     }
     impl->aov_mask = effective;
+}
+
+void SetCameraResponse(BatchedSensorSceneDevice& device, uint32_t id,
+                       const sensor::CameraResponse& config, phi::Backend* backend) {
+    auto* impl = device.GetImpl();
+    if (id >= impl->imaging.cameras.size() || !sensor::ValidCameraResponse(config))
+        throw std::invalid_argument("invalid camera response or sensor index");
+    const auto ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    for (uint32_t env = 0u; env < impl->imaging.env_count; ++env)
+        ClearImagingSensor(impl, ctx, false, id, env);
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "clear camera response history");
+    impl->imaging.cameras[id] = config;
+    impl->responses_dirty = true;
+}
+
+void SetRangeResponse(BatchedSensorSceneDevice& device, bool lidar, uint32_t id,
+                      const sensor::RangeResponse& config, phi::Backend* backend) {
+    auto* impl = device.GetImpl();
+    auto& configs = lidar ? impl->imaging.lidars : impl->imaging.depths;
+    if (id >= configs.size() || !sensor::ValidRangeResponse(config))
+        throw std::invalid_argument("invalid range response or sensor index");
+    const auto ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    for (uint32_t env = 0u; env < impl->imaging.env_count; ++env)
+        ClearImagingSensor(impl, ctx, lidar, id, env);
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "clear range response history");
+    configs[id] = config;
+    impl->responses_dirty = true;
+}
+
+void SetSensorSampleTimes(BatchedSensorSceneDevice& device, const std::vector<double>& times) {
+    if (times.empty() || times.size() > UINT32_MAX) throw std::invalid_argument("invalid imaging clock count");
+    for (double time : times) if (!std::isfinite(time) || time < 0.0)
+        throw std::invalid_argument("invalid imaging sample time");
+    auto* impl = device.GetImpl();
+    SizeImagingState(impl, static_cast<uint32_t>(times.size()));
+    impl->imaging.sample_times = times;
+}
+
+sensor::ImagingStamp ImagingStamp(const BatchedSensorSceneDevice& device,
+                                  bool lidar, uint32_t id, uint32_t env) {
+    const auto& state = const_cast<BatchedSensorSceneDevice&>(device).GetImpl()->imaging;
+    const size_t count = lidar ? state.lidars.size() : state.cameras.size();
+    if (id >= count || (state.env_count && env >= state.env_count))
+        throw std::invalid_argument("imaging stamp index out of range");
+    if (!state.env_count) return {};
+    const auto& stamps = lidar ? state.lidar_stamps : state.camera_stamps;
+    return stamps[size_t{env} * count + id];
+}
+
+void ResetSensorState(BatchedSensorSceneDevice& device, const std::vector<uint32_t>& ids,
+                      phi::Backend* backend) {
+    auto* impl = device.GetImpl();
+    auto& state = impl->imaging;
+    if (!state.env_count) return;
+    for (uint32_t env : ids) if (env >= state.env_count)
+        throw std::invalid_argument("imaging reset environment out of range");
+    const auto ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    const auto reset = [&](uint32_t env) {
+        for (uint32_t s = 0u; s < state.cameras.size(); ++s) ClearImagingSensor(impl, ctx, false, s, env);
+        for (uint32_t s = 0u; s < state.lidars.size(); ++s) ClearImagingSensor(impl, ctx, true, s, env);
+        state.sample_times[env] = 0.0;
+    };
+    if (ids.empty()) for (uint32_t env = 0u; env < state.env_count; ++env) reset(env);
+    else for (uint32_t env : ids) reset(env);
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "reset imaging state");
+}
+
+SensorStateSnapshot CaptureSensorState(const BatchedSensorSceneDevice& device, phi::Backend* backend) {
+    auto* impl = const_cast<BatchedSensorSceneDevice&>(device).GetImpl();
+    const auto ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "capture imaging state");
+    SensorStateSnapshot snapshot;
+    snapshot.imaging = impl->imaging;
+    snapshot.render_dr = impl->dr_cfg;
+    snapshot.fidelity = impl->fid_cfg;
+    snapshot.aov_mask = impl->aov_mask;
+    snapshot.width = impl->image_width;
+    snapshot.height = impl->image_height;
+    snapshot.lidar_az = impl->lidar_az;
+    snapshot.lidar_el = impl->lidar_el;
+    const auto copy = [](const OwnedBuffer& buffer, size_t bytes, auto& values) {
+        using Value = typename std::decay_t<decltype(values)>::value_type;
+        if (bytes && buffer.Data()) {
+            values.resize(bytes / sizeof(Value));
+            buffer.CopyToHost(values.data(), bytes);
+        }
+    };
+    if (snapshot.width) {
+        if (impl->aov_mask & kSensorAovColor) copy(impl->d_color, impl->col_b, snapshot.color);
+        if (impl->aov_mask & kSensorAovDepth) copy(impl->d_depth, impl->dep_b, snapshot.depth);
+        if (impl->aov_mask & kSensorAovNormal) copy(impl->d_normal, impl->nrm_b, snapshot.normal);
+        if (impl->aov_mask & kSensorAovAlbedo) copy(impl->d_albedo, impl->alb_b, snapshot.albedo);
+        if (impl->aov_mask & kSensorAovPrim) copy(impl->d_prim, impl->prim_b, snapshot.prim);
+    }
+    copy(impl->d_range, impl->range_b, snapshot.range);
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "download imaging state");
+    return snapshot;
+}
+
+void RestoreSensorState(BatchedSensorSceneDevice& device, const SensorStateSnapshot& snapshot,
+                         phi::Backend* backend) {
+    auto* impl = device.GetImpl();
+    const auto& state = snapshot.imaging;
+    if (state.cameras.size() != impl->imaging.cameras.size() || state.depths.size() != state.cameras.size() ||
+        state.lidars.size() != impl->imaging.lidars.size() || state.sample_times.size() != state.env_count ||
+        state.camera_stamps.size() != size_t{state.env_count} * state.cameras.size() ||
+        state.lidar_stamps.size() != size_t{state.env_count} * state.lidars.size())
+        throw std::invalid_argument("imaging checkpoint layout mismatch");
+    for (const auto& config : state.cameras) if (!sensor::ValidCameraResponse(config))
+        throw std::invalid_argument("invalid camera checkpoint response");
+    for (const auto* configs : {&state.depths, &state.lidars})
+        for (const auto& config : *configs) if (!sensor::ValidRangeResponse(config))
+            throw std::invalid_argument("invalid range checkpoint response");
+    const uint64_t pixels = uint64_t{state.env_count} * state.cameras.size() * snapshot.width * snapshot.height;
+    const uint64_t rays = uint64_t{state.env_count} * state.lidars.size() * snapshot.lidar_az * snapshot.lidar_el;
+    const auto valid_size = [](const auto& values, uint64_t expected) { return values.empty() || values.size() == expected; };
+    if (pixels > UINT32_MAX || rays > UINT32_MAX || !valid_size(snapshot.color, pixels * 3u) ||
+        !valid_size(snapshot.depth, pixels) || !valid_size(snapshot.normal, pixels * 3u) ||
+        !valid_size(snapshot.albedo, pixels * 3u) || !valid_size(snapshot.prim, pixels) ||
+        !valid_size(snapshot.range, rays) || (snapshot.aov_mask & ~kSensorAovAll))
+        throw std::invalid_argument("invalid imaging checkpoint buffers");
+    const auto ctx = ResolveRtContext(backend);
+    phi::ScopedDeviceGuard guard(ctx.device_id);
+    const auto restore = [&](OwnedBuffer& buffer, size_t& bytes, const auto& values) {
+        if (values.empty()) {
+            if (buffer.Data()) CheckCuda(cudaMemsetAsync(buffer.Data(), 0, bytes, ctx.stream), "clear imaging checkpoint view");
+        } else UploadImagingVector(buffer, bytes, values, ctx);
+    };
+    restore(impl->d_color, impl->col_b, snapshot.color);
+    restore(impl->d_depth, impl->dep_b, snapshot.depth);
+    restore(impl->d_normal, impl->nrm_b, snapshot.normal);
+    restore(impl->d_albedo, impl->alb_b, snapshot.albedo);
+    restore(impl->d_prim, impl->prim_b, snapshot.prim);
+    restore(impl->d_range, impl->range_b, snapshot.range);
+    impl->imaging = state;
+    impl->responses_dirty = true;
+    impl->camera_stamps_dirty = impl->lidar_stamps_dirty = true;
+    impl->image_width = snapshot.width;
+    impl->image_height = snapshot.height;
+    impl->aov_rays = pixels;
+    impl->aov_mask = snapshot.aov_mask;
+    impl->fid_cfg = snapshot.fidelity;
+    impl->dr_cfg = snapshot.render_dr;
+    impl->dr_env_count = 0u;
+    impl->lidar_az = snapshot.lidar_az;
+    impl->lidar_el = snapshot.lidar_el;
+    impl->topology_built = false;
+    CheckCuda(cudaStreamSynchronize(ctx.stream), "restore imaging state");
 }
 
 void RenderSensorsMounted(BatchedSensorSceneDevice& device,
@@ -1056,7 +1403,13 @@ void RenderLidarsBatched(BatchedSensorSceneDevice& device,
     phi::BufferType* bt = ctx.device_bt;
 
     const uint64_t num_lidars = static_cast<uint64_t>(env_count) * s;
+    if (num_lidars > UINT32_MAX || uint64_t{az_count} * el_count > UINT32_MAX / num_lidars)
+        throw std::invalid_argument("lidar ray count exceeds the supported index range");
     const uint64_t rays = num_lidars * az_count * el_count;
+    const bool response = std::any_of(impl->imaging.lidars.begin(), impl->imaging.lidars.end(),
+        [](const auto& config) { return config.enabled != 0u; });
+    PrepareImaging(impl, ctx, env_count, s, true, response);
+    if (response) EnsureEnvAppearanceTables(impl, ctx, env_count, false);
     EnsureBytes(impl->d_range, impl->range_b, bt, rays * sizeof(float));
 
     // Scatter + batched LBVH build/refit (the SAME topology the camera trace uses),
@@ -1069,6 +1422,11 @@ void RenderLidarsBatched(BatchedSensorSceneDevice& device,
     phi::LaunchCuda(BatchedLidarTraceKernel, dim3(grid), dim3(kBlockSize), 0u,
                     ctx.stream, lidars_device, d_nodes, m, d_instances,
                     static_cast<uint32_t>(num_lidars), s, az_count, el_count,
+                    static_cast<const Material*>(impl->d_materials_env.Data()),
+                    static_cast<const DevTexture*>(impl->d_textures.Data()), impl->material_count,
+                    response ? static_cast<const sensor::RangeResponse*>(impl->d_lidar_responses.Data()) : nullptr,
+                    static_cast<const sensor::noise::RangeSampleKeys*>(impl->d_lidar_keys.Data()),
+                    static_cast<const sensor::ImagingStamp*>(impl->d_lidar_stamps.Data()),
                     static_cast<float*>(impl->d_range.Data()));
     CheckCuda(cudaGetLastError(), "BatchedLidarTraceKernel launch");
     impl->lidar_az = az_count;
@@ -1106,6 +1464,10 @@ void SetLidarMounts(BatchedSensorSceneDevice& device,
     (void)cudaSetDevice(ctx.device_id);
     impl->d_lidar_mounts = UploadOwned(ctx.device_bt, mounts);
     impl->lidars_per_env = static_cast<uint32_t>(mounts.size());
+    impl->imaging.lidars.resize(mounts.size());
+    impl->imaging.lidar_stamps.assign(size_t{impl->imaging.env_count} * mounts.size(), {});
+    impl->lidar_stamps_dirty = true;
+    impl->responses_dirty = true;
     impl->lidar_az = az;
     impl->lidar_el = el;
     cudaStreamSynchronize(ctx.stream);
