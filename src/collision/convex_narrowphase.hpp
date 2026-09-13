@@ -203,9 +203,9 @@ NUKA_CVX_HD inline Vec3 SupportSphere(const amf::PrimParams& s, Vec3 dir) {
     return s.frame.t + amf::Norm(dir, Vec3::UnitX()) * s.radius;
 }
 
-// Capsule support (axis = local Y): segment endpoint by sign(dir.axis) + r*norm(dir).
+// Capsule support along local Z: segment endpoint by sign(dir.axis) + r*norm(dir).
 NUKA_CVX_HD inline Vec3 SupportCapsule(const amf::PrimParams& c, Vec3 dir) {
-    const Vec3 axis = c.frame.cy;
+    const Vec3 axis = c.frame.cz;
     const Vec3 seg = c.frame.t + axis * ((axis.Dot(dir) >= 0.0f) ? c.half_height
                                                                  : -c.half_height);
     return seg + amf::Norm(dir, Vec3::UnitX()) * c.radius;
@@ -943,7 +943,7 @@ NUKA_CVX_HD inline void HullPlane(const ConvexHullView& hull,
                                   const amf::PrimParams& plane,
                                   Vec3 normal_for_hull, ContactManifold* out) {
     out->Clear();
-    const Vec3 n = amf::Norm(plane.frame.cy, Vec3::UnitY());  // plane normal (world)
+    const Vec3 n = amf::Norm(plane.frame.cz, Vec3::UnitZ());
     amf::ManifoldPointCand cand[amf::kClipMax];
     int ncand = 0;
     // Fixed-order vertex scan; first kClipMax penetrating verts (deepest kept by
@@ -1415,7 +1415,7 @@ NUKA_CVX_HD inline bool CapsuleConvex(const SupportProxy& cap,
                                       ContactManifold* out) {
     out->Clear();
     const float r = ProxyRadius(cap);       // capsule radius (the other core is 0)
-    const Vec3 axis = cap.prim->frame.cy;   // capsule local Y in world
+    const Vec3 axis = cap.prim->frame.cz;
     const Vec3 ends[2] = {cap.prim->frame.t + axis * cap.prim->half_height,
                           cap.prim->frame.t - axis * cap.prim->half_height};
     int nemit = 0;

@@ -203,6 +203,12 @@ MeshGeometry MakeBox(float hx, float hy, float hz) {
     return m;
 }
 
+MeshGeometry MakePlane(float hx, float hy) {
+    MeshGeometry m;
+    PushQuad(m, {-hx, -hy, 0.0f}, {hx, -hy, 0.0f}, {hx, hy, 0.0f}, {-hx, hy, 0.0f});
+    return m;
+}
+
 MeshGeometry MakeSphere(float r, uint32_t stacks = 12, uint32_t slices = 16) {
     MeshGeometry m;
     auto at = [&](uint32_t i, uint32_t j) -> math::Vec3 {
@@ -456,12 +462,18 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
                 // slots per-branch so no caller reads the wrong index silently.
                 uint32_t prim_mesh_id;
                 switch (vis.prim_kind) {
-                    case PK::Box:
-                    case PK::Plane: {
+                    case PK::Box: {
                         const float hx = vis.prim_params[0], hy = vis.prim_params[1],
                                     hz = vis.prim_params[2];
                         prim_mesh_id = world.meshes.InternPrimitive(
                             PrimKey("vbox", hx, hy, hz), [&]() { return MakeBox(hx, hy, hz); });
+                        break;
+                    }
+                    case PK::Plane: {
+                        const float hx = vis.prim_params[0], hy = vis.prim_params[1];
+                        if (hx <= 0.0f || hy <= 0.0f) return;
+                        prim_mesh_id = world.meshes.InternPrimitive(
+                            PrimKey("plane", hx, hy, 0), [&]() { return MakePlane(hx, hy); });
                         break;
                     }
                     case PK::Sphere: {
@@ -522,14 +534,18 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
             }
             uint32_t mesh_id;
             switch (cs.kind) {
-                case CK::Box:
-                case CK::Plane: {
+                case CK::Box: {
                     const float hx = cs.params[0], hy = cs.params[1], hz = cs.params[2];
-                    // An unbounded plane (zero extent) has no finite box proxy.
-                    if (cs.kind == CK::Plane && (hx <= 0.0f || hy <= 0.0f)) return;
                     mesh_id = world.meshes.InternPrimitive(
                         PrimKey("box", hx, hy, hz),
                         [&]() { return MakeBox(hx, hy, hz); });
+                    break;
+                }
+                case CK::Plane: {
+                    const float hx = cs.params[0], hy = cs.params[1];
+                    if (hx <= 0.0f || hy <= 0.0f) return;
+                    mesh_id = world.meshes.InternPrimitive(
+                        PrimKey("plane", hx, hy, 0), [&]() { return MakePlane(hx, hy); });
                     break;
                 }
                 case CK::Sphere: {

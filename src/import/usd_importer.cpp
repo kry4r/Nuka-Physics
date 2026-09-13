@@ -64,6 +64,7 @@ struct UsdPrim {
     std::string joint_path;
     std::string body_path;
     std::string axis_token = "Z";
+    std::string geometry_axis_token = "Z";
     std::string nuka_type;
     std::string purpose;                 // USD `purpose` token: default|render|proxy|guide
     std::string decompose_mode;          // nuka:decompose token
@@ -426,6 +427,7 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     (void)ParseRelationship(line, "nuka:joint", prim.joint_path);
     (void)ParseRelationship(line, "nuka:body", prim.body_path);
     (void)ParseTokenValue(line, "physics:axis", prim.axis_token);
+    (void)ParseTokenValue(line, "token axis", prim.geometry_axis_token);
     (void)ParseTokenValue(line, "nuka:type", prim.nuka_type);
     // USD `uniform token purpose = "render"|"proxy"|"guide"` (default unset).
     // guide/proxy geometry is skipped at SceneIR build; render forces a geom to
@@ -1098,6 +1100,12 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         } else if (shape_type == scene::ShapeType::Capsule) {
             shape.radius = prim.radius;
             shape.half_height = prim.height * 0.5f;
+            const auto axis = Lowercase(prim.geometry_axis_token);
+            math::Quat alignment;
+            if (axis == "x") alignment = math::Quat::FromAxisAngle({0, 1, 0}, 1.5707963267948966f);
+            else if (axis == "y") alignment = math::Quat::FromAxisAngle({1, 0, 0}, -1.5707963267948966f);
+            else if (axis != "z") throw std::runtime_error("USD: invalid capsule axis '" + prim.geometry_axis_token + "'");
+            shape.local_transform.rotation = (shape.local_transform.rotation * alignment).Normalized();
         }
         if (shape_type == scene::ShapeType::TriMesh) {
             shape.decompose_mode = DecomposeModeFromToken(prim.decompose_mode);

@@ -23,7 +23,8 @@ struct PrimitiveSurface {
     bool valid = false;
 };
 
-// Parameters are radius, (radius, half-height), or box half-extents; the axis is Y.
+// Capsules extend along local Z. Planes bound the solid half-space local z <= 0.
+// Parameters are radius, (radius, half-height), or box half-extents.
 NUKA_SURFACE_HD inline PrimitiveSurface QueryPrimitiveSurface(
     uint32_t kind, math::Vec3 parameters, math::Vec3 position) {
     using math::Vec3;
@@ -35,10 +36,10 @@ NUKA_SURFACE_HD inline PrimitiveSurface QueryPrimitiveSurface(
             Vec3 offset = position;
             if (kind == kShapeCapsule) {
                 if (!(parameters.y >= 0.0f)) return result;
-                const float axis = fmaxf(-parameters.y, fminf(position.y, parameters.y));
-                offset.y -= axis;
-                result.feature = position.y < -parameters.y ? 0u
-                    : position.y > parameters.y ? 2u : 1u;
+                const float axis = fmaxf(-parameters.y, fminf(position.z, parameters.y));
+                offset.z -= axis;
+                result.feature = position.z < -parameters.y ? 0u
+                    : position.z > parameters.y ? 2u : 1u;
             }
             const float length = sqrtf(offset.Dot(offset));
             if (length > 0.0f) result.normal = offset / length;
@@ -81,8 +82,8 @@ NUKA_SURFACE_HD inline PrimitiveSurface QueryPrimitiveSurface(
             break;
         }
         case kShapePlane:
-            result.distance = position.y;
-            result.normal = {0.0f, 1.0f, 0.0f};
+            result.distance = position.z;
+            result.normal = {0.0f, 0.0f, 1.0f};
             break;
         default:
             return result;

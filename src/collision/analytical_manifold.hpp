@@ -405,7 +405,7 @@ NUKA_AMF_HD inline void ReduceAndEmitSpread(ManifoldPointCand* cand, int n,
 struct PrimParams {
     Vec3      half_extents{0.5f, 0.5f, 0.5f};  // Box
     float     radius      = 0.5f;              // Sphere / Capsule
-    float     half_height = 0.5f;              // Capsule (along local Y)
+    float     half_height = 0.5f;              // Capsule along local Z.
     PrimFrame frame;                           // baked world frame
 };
 
@@ -446,14 +446,11 @@ NUKA_AMF_HD inline void SphereBox(const PrimParams& sph, const PrimParams& box,
     out->AddPoint(pt);
 }
 
-// ---------------------------------------------------------------------------
-// SPHERE (a) x PLANE (b) -> 1 point. Plane normal = b's local +Y in world.
-// normal = separation dir for A (sphere) = plane normal (sphere pushed up off).
-// ---------------------------------------------------------------------------
+// Sphere-plane contact uses the plane's local +Z outward normal.
 NUKA_AMF_HD inline void SpherePlane(const PrimParams& sph, const PrimParams& plane,
                                     ContactManifold* out) {
     out->Clear();
-    const Vec3 n = Norm(plane.frame.cy, Vec3::UnitY());      // plane normal (world)
+    const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
     const float signed_dist = (sph.frame.t - plane.frame.t).Dot(n);
     const float pen = sph.radius - signed_dist;
     if (pen <= 0.0f) return;
@@ -471,7 +468,7 @@ NUKA_AMF_HD inline void SpherePlane(const PrimParams& sph, const PrimParams& pla
 NUKA_AMF_HD inline void BoxPlane(const PrimParams& box, const PrimParams& plane,
                                  ContactManifold* out) {
     out->Clear();
-    const Vec3 n = Norm(plane.frame.cy, Vec3::UnitY());      // plane normal (world)
+    const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
     const Vec3 he = box.half_extents;
     ManifoldPointCand cand[8];
     int ncand = 0;
@@ -735,15 +732,13 @@ NUKA_AMF_HD inline void BoxBox(const PrimParams& A, const PrimParams& B,
     ReduceAndEmitSpread(cand, ncand, normalA, out);  // box-box: keep-deepest+spread
 }
 
-// ---------------------------------------------------------------------------
-// CAPSULE x PLANE -> up to 2 points (the two endpoints below the plane).
-// Capsule axis = local Y (half_height). normal = separation dir for A (capsule).
-// ---------------------------------------------------------------------------
+// Capsule-plane contact tests both segment endpoints along the capsule's local Z.
+// The normal separates the capsule from the plane's solid half-space.
 NUKA_AMF_HD inline void CapsulePlane(const PrimParams& cap, const PrimParams& plane,
                                      ContactManifold* out) {
     out->Clear();
-    const Vec3 n = Norm(plane.frame.cy, Vec3::UnitY());      // plane normal (world)
-    const Vec3 axis = cap.frame.cy;                          // capsule local Y in world
+    const Vec3 n = Norm(plane.frame.cz, Vec3::UnitZ());
+    const Vec3 axis = cap.frame.cz;
     const Vec3 e0 = cap.frame.t + axis * cap.half_height;
     const Vec3 e1 = cap.frame.t - axis * cap.half_height;
     const Vec3 ends[2] = {e0, e1};
@@ -854,8 +849,8 @@ NUKA_AMF_HD inline float ClosestPtSegmentSegment(Vec3 p1, Vec3 q1, Vec3 p2,
 NUKA_AMF_HD inline void CapsuleCapsule(const PrimParams& a, const PrimParams& b,
                                        ContactManifold* out) {
     out->Clear();
-    const Vec3 axa = a.frame.cy;                  // capsule a local Y in world
-    const Vec3 axb = b.frame.cy;
+    const Vec3 axa = a.frame.cz;
+    const Vec3 axb = b.frame.cz;
     const Vec3 a0 = a.frame.t + axa * a.half_height;
     const Vec3 a1 = a.frame.t - axa * a.half_height;
     const Vec3 b0 = b.frame.t + axb * b.half_height;

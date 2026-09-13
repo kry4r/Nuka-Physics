@@ -164,11 +164,8 @@ nuka_result_t nuka_scene_save(nuka_scene_handle scene, const char* nks_path);
 // imports a file cooks byte-identically to nuka_world_create_from_scene.
 // ---------------------------------------------------------------------------
 
-// A rigid collision primitive (one body + one shape). dims by kind: BOX uses
-// dims[0..2] as the half-extents (x,y,z); SPHERE uses dims[0] as the radius;
-// CAPSULE uses dims[0] radius + dims[1] half-height (local Z axis); PLANE uses
-// none (an infinite ground plane is always static). pos[3] is (x,y,z) metres,
-// quat[4] is (w,x,y,z) -- an all-zero quat reads as identity.
+// BOX: half-extents xyz; SPHERE: radius; CAPSULE: radius and segment half-length on local Z.
+// PLANE: static half-space local z <= 0, no dimensions. Pose uses metres and quaternion wxyz.
 typedef enum nuka_primitive_kind_t {
     NUKA_PRIMITIVE_PLANE   = 0,
     NUKA_PRIMITIVE_BOX     = 1,

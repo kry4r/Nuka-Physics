@@ -442,7 +442,7 @@ TEST(LinkAabb, BoxAabbUnderRotation) {
 
 TEST(LinkAabb, CapsuleAabbContainsEndpoints) {
     const float radius = 0.25f;
-    const float half_height = 0.7f;  // capsule axis = local Y.
+    const float half_height = 0.7f;
     const Transform link{Vec3{0.5f, -0.5f, 1.0f},
                          Quat::FromAxisAngle(Vec3{0.3f, 0.6f, 0.74161985f}, 0.6f)};
     const Transform local{Vec3{0.1f, 0.0f, -0.2f},
@@ -454,9 +454,9 @@ TEST(LinkAabb, CapsuleAabbContainsEndpoints) {
     ASSERT_LT(box.min.y, box.max.y);
     ASSERT_LT(box.min.z, box.max.z);
 
-    // The two cap centers in world (local Y axis through link*local).
+    // The two cap centers in world follow the local Z axis through link*local.
     const Quat world_rot = (link.rotation * local.rotation).Normalized();
-    const Vec3 axis = world_rot.Rotate(Vec3{0, 1, 0});
+    const Vec3 axis = world_rot.Rotate(Vec3{0, 0, 1});
     const Vec3 center = link.rotation.Rotate(local.position) + link.position;
     const Vec3 cap_a = center + axis * half_height;
     const Vec3 cap_b = center - axis * half_height;

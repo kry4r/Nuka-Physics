@@ -219,6 +219,89 @@ def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
                                        1.5, atol=2.0e-6)
 
 
+@pytest.mark.parametrize("execution", ["eager", "graph"])
+def test_primitive_axes_halfspace_contacts_and_observations(device, execution, steps_after_first=7):
+    q = np.sqrt(0.5)
+    dt = 0.001
+    with nuka.SceneBuilder.create() as builder:
+        builder.add_rigid_primitive(nuka.PRIMITIVE_PLANE)
+        builder.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[0.08, 0.25],
+                                    pos=[0.8, 0, 0.4], static=True)
+        builder.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[0.03],
+                                    pos=[0.8, 0, 0.755], friction=0)
+        builder.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[0.08, 0.25],
+                                    pos=[-0.8, 0, 0.4], quat=[q, 0, q, 0], static=True)
+        builder.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[0.03],
+                                    pos=[-0.445, 0, 0.4], friction=0)
+        builder.add_rigid_primitive(nuka.PRIMITIVE_SPHERE, dims=[0.03],
+                                    pos=[2_000_000, 0, -0.12], friction=0)
+        builder.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[0.1, 0.3],
+                                    pos=[0, 2, 1], mass=1.7)
+        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+                          cloth_nx=3, cloth_ny=3, cloth_spacing=0.04,
+                          cloth_origin=[0, 0, -0.08], cloth_free=True,
+                          xpbd_particle_mass=0.02, xpbd_iters=8)
+        builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
+                          tet_center=[-1.5, 0, -0.15], tet_radius=0.025,
+                          tet_cells=8, tet_cell_len=0.01,
+                          mpm_youngs=1000.0, mpm_poisson=0.3, mpm_density=1000.0,
+                          mpm_dx=0.02, mpm_substeps=2, mpm_floor_d=-1.0,
+                          mpm_contact_capacity=2048)
+        with builder.build(device, env_count=3, dt=dt, solver_vel_iters=64) as world:
+            world.set_gravity_z(0.0)
+            world.set_execution_mode(execution)
+            initial = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1, 3).copy()
+            nmpm = world.particle_count - 9
+            assert nmpm > 0
+            velocity = np.zeros_like(initial)
+            velocity[:, :nmpm, 2] = -0.2
+            world.upload_field(nuka.Field.PARTICLE_VELOCITY, velocity)
+            torque = np.zeros((3, 7, 3), dtype=np.float32)
+            torque[:, 6] = np.eye(3, dtype=np.float32)
+            world.upload_field(nuka.Field.BODY_TORQUE, torque)
+            world.attach_camera_sensor(nuka.SensorMount.WORLD.value, 0,
+                                       (0.25, 0.25, 2, 1, 0, 0, 0), 30, 33, 33)
+            world.attach_lidar_sensor(nuka.SensorMount.WORLD.value, 0,
+                                      (0.25, 0.25, 2, q, 0, q, 0),
+                                      1, 1, 0, 0, 0, 0, max_range=10.0)
+            world.step()
+            body_velocity = world.download_field(nuka.Field.BODY_LINEAR_VELOCITY).reshape(3, 7, 3)
+            angular_velocity = world.download_field(nuka.Field.BODY_ANGULAR_VELOCITY).reshape(3, 7, 3)
+            particle_velocity = world.download_field(nuka.Field.PARTICLE_VELOCITY).reshape(3, -1, 3)
+            physical = world.download_field(nuka.Field.PARTICLE_POSITION).copy()
+            world.render_sensors()
+            depth = torch.from_dlpack(world.get_sensor_view(nuka.SensorChannel.DEPTH)).cpu().numpy()
+            ranges = torch.from_dlpack(world.get_sensor_view(nuka.SensorChannel.RANGE)).cpu().numpy()
+            cloth_vz = particle_velocity[:, nmpm:, 2].mean(axis=1)
+            mpm_vz = particle_velocity[:, :nmpm, 2].mean(axis=1)
+            print(dict(execution=execution, capsule_z=body_velocity[:, 2, 2].tolist(),
+                       capsule_x=body_velocity[:, 4, 0].tolist(),
+                       deep_rigid_z=body_velocity[:, 5, 2].tolist(),
+                       cloth_z=cloth_vz.tolist(), mpm_z=mpm_vz.tolist(),
+                       ground_depth=depth.reshape(3, 33, 33)[:, 16, 16].tolist()))
+            assert np.all(body_velocity[:, 2, 2] > 0.0)
+            assert np.all(body_velocity[:, 4, 0] > 0.0)
+            assert np.all(body_velocity[:, 5, 2] > 0.0)
+            assert np.all(cloth_vz > 0.0)
+            # MPM enforces non-inward grid velocity without positional recovery.
+            np.testing.assert_allclose(particle_velocity[:, :nmpm, 2], 0.0, atol=2.0e-6)
+            # Uniform cylinder plus hemispheres: inertia in kg m^2 about the COM.
+            inertia = np.array([0.08121363636, 0.08121363636, 0.00819090909])
+            np.testing.assert_allclose(angular_velocity[:, 6], dt * np.eye(3) / inertia,
+                                       rtol=2.0e-5, atol=2.0e-7)
+            np.testing.assert_allclose(depth.reshape(3, 33, 33)[:, 16, 16], 2.0, atol=2.0e-6)
+            np.testing.assert_allclose(ranges.ravel(), 2.0, atol=2.0e-6)
+            np.testing.assert_array_equal(world.download_field(nuka.Field.PARTICLE_POSITION), physical)
+            if steps_after_first:
+                world.step_n(steps_after_first)
+            before = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1, 3).copy()
+            world.reset_envs([1])
+            after = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1, 3)
+            np.testing.assert_array_equal(after[1], initial[1])
+            np.testing.assert_array_equal(after[[0, 2]], before[[0, 2]])
+            assert not np.any(world.download_field(nuka.ENV_STATUS))
+
+
 def test_mpm_surface_endpoints_roundtrip_graph_and_reset(device, tmp_path):
     saved = str(tmp_path / "mpm_cloth.nks")
     states = []
