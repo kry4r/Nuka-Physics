@@ -203,7 +203,7 @@ ContactManifold Route(ShapeType ta, const ConvexHullView* hull_a, PrimParams pri
         const PrimParams& plane = plane_is_a ? prim_a : prim_b;
         if (hull == nullptr) { out.Clear(); return out; }
         const Vec3 plane_n =
-            nuka::collision::amf::Norm(plane.frame.cy, Vec3::UnitY());
+            nuka::collision::amf::Norm(plane.frame.cz, Vec3::UnitZ());
         const Vec3 normal_for_hull = plane_is_a ? Vec3{-plane_n.x, -plane_n.y, -plane_n.z}
                                                 : plane_n;
         nuka::collision::cvx::HullPlane(*hull, plane, normal_for_hull, &out);
@@ -596,20 +596,16 @@ TEST(GjkEpaConvex, CapsuleBoxPenetration) {
 }
 
 TEST(GjkEpaConvex, CapsuleCapsulePenetration) {
-    // Two parallel (axis-Y) capsules, radius 0.3, centers 0.5 apart in X ->
-    // combined radius 0.6 > 0.5 -> overlap 0.1 along X. sep dir for A = -X. No
-    // closed form -> the general GJK/EPA (cvx) path (NOT the analytical stub).
+    // Parallel Z-axis capsules of radius 0.3, separated by 0.5 along X,
+    // overlap by 0.1 and separate A along -X.
     const PrimParams A = MakeCapsulePrim(0.3f, 0.5f, Vec3{0.0f, 0.0f, 0.0f});
     const PrimParams B = MakeCapsulePrim(0.3f, 0.5f, Vec3{0.5f, 0.0f, 0.0f});
     const ContactManifold m = Route(ShapeType::Capsule, nullptr, A,
                                     ShapeType::Capsule, nullptr, B);
     ASSERT_GT(m.point_count, 0u) << "capsule x capsule must produce a contact, not the stub";
     EXPECT_NEAR(m.points[0].penetration, 0.10f, 1.0e-2f);
-    // Parallel-axis capsules => the CSO is degenerate (a line of equally-close
-    // points along the shared Y axis), the EPA-hard case. The depth is exact and
-    // the normal is -X to ~1% (a ~0.01 off-axis wobble on the degenerate CSO),
-    // so widen the normal tol slightly -- this is EVIDENCE the EPA stays robust
-    // on the parallel-degenerate config, not a sign error.
+    // The degenerate CSO has equally close points along Z.
+    // EPA's off-axis normal error is bounded independently of penetration depth.
     EXPECT_TRUE(Vec3Near(m.points[0].normal, Vec3{-1.0f, 0.0f, 0.0f}, 2.0e-2f));
 }
 
@@ -619,12 +615,11 @@ TEST(GjkEpaConvex, CapsuleCapsulePenetration) {
 TEST(GjkEpaConvex, HullVsPlane_BothOrders) {
     const Vec3 he{0.5f, 0.5f, 0.5f};
     const auto vh = BoxVerts(he);
-    // Box resting so its bottom corners dip below the plane at y=0 by 0.1:
-    // box center at y = 0.4 -> bottom corners at y = -0.1 (penetration 0.1).
-    const ConvexHullView H = MakeHull(vh, Vec3{0.0f, 0.4f, 0.0f});
-    const PrimParams P = MakePlanePrim(Vec3{0.0f, 0.0f, 0.0f});  // plane normal +Y
+    // The box bottom is 0.1 below the Z-up plane.
+    const ConvexHullView H = MakeHull(vh, Vec3{0.0f, 0.0f, 0.4f});
+    const PrimParams P = MakePlanePrim(Vec3{0.0f, 0.0f, 0.0f});
 
-    // Order 1: hull = A, plane = B. sep dir for A (hull) = +Y (push hull up).
+    // Hull A separates along +Z.
     {
         const ContactManifold m = Route(ShapeType::ConvexHull, &H, PrimParams{},
                                         ShapeType::Plane, nullptr, P);
@@ -632,19 +627,18 @@ TEST(GjkEpaConvex, HullVsPlane_BothOrders) {
         EXPECT_EQ(m.point_count, 4u) << "4 bottom corners below plane";
         for (uint32_t i = 0; i < m.point_count; ++i) {
             EXPECT_NEAR(m.points[i].penetration, 0.1f, kTol);
-            EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, 1.0f, 0.0f}, 1.0e-2f));
+            EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, 0.0f, 1.0f}, 1.0e-2f));
         }
     }
-    // Order 2: plane = A, hull = B. sep dir for A (plane) = -Y (plane pushes the
-    // OTHER way; the swapped-slot sign test).
+    // Plane A separates along -Z when the pair is swapped.
     {
         const ContactManifold m = Route(ShapeType::Plane, nullptr, P,
                                         ShapeType::ConvexHull, &H, PrimParams{});
         ASSERT_GT(m.point_count, 0u);
         for (uint32_t i = 0; i < m.point_count; ++i) {
             EXPECT_NEAR(m.points[i].penetration, 0.1f, kTol);
-            EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, -1.0f, 0.0f}, 1.0e-2f))
-                << "plane-as-A normal must be -Y (swapped sign)";
+            EXPECT_TRUE(Vec3Near(m.points[i].normal, Vec3{0.0f, 0.0f, -1.0f}, 1.0e-2f))
+                << "plane-as-A normal must be -Z";
         }
     }
 }

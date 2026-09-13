@@ -101,13 +101,14 @@ void AddBox(nk::Model& m, const Vec3& pos, const Vec3& vel, float half,
 
 constexpr uint32_t kKindCapsule = 1u;  // collision::ShapeKind Capsule
 
-// A capsule (radius, half_height; axis = local Y) lying flat at yaw `yaw_z`.
+// A capsule lying horizontally along Y, then rotated by yaw_z about world Z.
 void AddCapsule(nk::Model& m, const Vec3& pos, float radius, float half_height,
                 float yaw_z, float mass, int32_t body_id) {
     nk::Model::BodyInit bi;
     bi.pose = Transform::Identity();
     bi.pose.position = pos;
-    bi.pose.rotation = nuka::math::Quat::FromAxisAngle(Vec3{0, 0, 1}, yaw_z);
+    bi.pose.rotation = nuka::math::Quat::FromAxisAngle(Vec3{0, 0, 1}, yaw_z) *
+        nuka::math::Quat::FromAxisAngle(Vec3{1, 0, 0}, -1.57079632679f);
     bi.inv_mass = mass > 0.0f ? 1.0f / mass : 0.0f;
     // Small light body -> large inv-inertia, so a spurious contact torque would
     // tumble it hard (the ejection signature); the fix keeps it torque-free.
@@ -140,10 +141,6 @@ void AddStaticBox(nk::Model& m, const Vec3& pos, const Vec3& half, int32_t body_
 void AddGroundPlane(nk::Model& m, int32_t body_id) {
     nk::Model::BodyInit bi;
     bi.pose = Transform::Identity();      // plane at z=0.
-    // The amf:: plane convention puts the plane NORMAL along the body's LOCAL +Y
-    // (frame.cy). For a +Z-up ground we rotate local +Y -> world +Z (90 deg about X).
-    bi.pose.rotation =
-        nuka::math::Quat::FromAxisAngle(Vec3{1, 0, 0}, 1.57079632679f);
     bi.inv_mass = 0.0f;                   // static (immovable; rigid arm im==0 no-op).
     bi.inv_inertia = Vec3{0, 0, 0};
     m.body_init.push_back(bi);

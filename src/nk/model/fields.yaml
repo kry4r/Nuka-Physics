@@ -557,7 +557,7 @@ fields:
   #                      Capsule are the supported primitives). u32 per link.
   #   link_geom_params : packed primitive params, 4 f32 per link:
   #                        Sphere  -> [radius, 0, 0, 0]
-  #                        Capsule -> [radius, half_height, 0, 0]  (axis = local Y)
+  #                        Capsule -> [radius, half_height, 0, 0]  (axis = local Z)
   #                        Box     -> [hx, hy, hz, 0]
   #   link_geom_local  : the shape's LOCAL transform relative to its owning link.
   # =========================================================================

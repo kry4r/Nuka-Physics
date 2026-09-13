@@ -59,7 +59,7 @@ struct CollisionShapeRecord {
     math::Transform local_transform        = math::Transform::Identity();
     math::Vec3 half_extents                = {0.5f, 0.5f, 0.5f};
     float radius                           = 0.5f;
-    float half_height                      = 0.5f;
+    float half_height                      = 0.5f;  // Capsule segment half-length along local Z.
     // A capsule collision record can project to a flat-capped cylinder visual.
     // This flag is not serialized.
     bool flat_capped                       = false;

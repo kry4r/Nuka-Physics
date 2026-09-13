@@ -71,8 +71,7 @@ nmath::Transform PrimitivePose(const nuka_rigid_primitive_desc_t& d) {
     return t;
 }
 
-// Diagonal solid-body inertia from a primitive's dims + mass (a MOVABLE body then
-// responds to torque; a cylinder approximates the capsule; a static body ignores it).
+// Diagonal inertia of a uniform solid primitive about its center of mass.
 nmath::Vec3 PrimitiveInertia(uint32_t kind, const float dims[3], float mass) {
     switch (kind) {
         case NUKA_PRIMITIVE_BOX: {
@@ -86,9 +85,12 @@ nmath::Vec3 PrimitiveInertia(uint32_t kind, const float dims[3], float mass) {
             return nmath::Vec3{i, i, i};
         }
         case NUKA_PRIMITIVE_CAPSULE: {
-            const float r = dims[0], hh = dims[1];  // cylinder about local Z.
-            const float axial = 0.5f * mass * r * r;
-            const float trans = mass * (3.0f * r * r + 4.0f * hh * hh) / 12.0f;
+            const float r = dims[0], hh = dims[1];
+            const float cylinder_mass = mass * (3.0f * hh) / (3.0f * hh + 2.0f * r);
+            const float cap_mass = mass - cylinder_mass;
+            const float axial = (0.5f * cylinder_mass + 0.4f * cap_mass) * r * r;
+            const float trans = cylinder_mass * (0.25f * r * r + hh * hh / 3.0f) +
+                cap_mass * (0.4f * r * r + hh * hh + 0.75f * hh * r);
             return nmath::Vec3{trans, trans, axial};
         }
         default:  // PLANE: static, inertia irrelevant.

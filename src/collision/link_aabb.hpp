@@ -157,17 +157,14 @@ NUKA_LINK_AABB_HD inline AABB BoxWorldAabb(const math::Transform& link,
     return box;
 }
 
-// CAPSULE world AABB = union of the two spherical caps. The capsule axis is the
-// shape's LOCAL Y (the engine convention -- see analytical_manifold.hpp
-// CapsulePlane/CapsuleSphere: "capsule axis = local Y, half_height"); the caps
-// sit at the local center +/- half_height along that axis, each padded by radius.
+// A capsule's bounds enclose the two cap centers on its local Z axis,
+// each padded by the radius.
 NUKA_LINK_AABB_HD inline AABB CapsuleWorldAabb(const math::Transform& link,
                                                const math::Transform& local,
                                                float radius, float half_height) {
-    // Capsule local axis = local Y, expressed in world after local then link rot
-    // (composed rotation via RotateByQuatPair -> no product Quat -> device-safe).
+    // Compose local and link rotations to express the capsule axis in world space.
     const math::Vec3 axis_world =
-        RotateByQuatPair(link.rotation, local.rotation, math::Vec3{0.0f, 1.0f, 0.0f});
+        RotateByQuatPair(link.rotation, local.rotation, math::Vec3{0.0f, 0.0f, 1.0f});
     const math::Vec3 world_center = LinkPointToWorld(link, local.position);
     const math::Vec3 cap_a = world_center + (axis_world * half_height);
     const math::Vec3 cap_b = world_center - (axis_world * half_height);

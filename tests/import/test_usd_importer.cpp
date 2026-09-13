@@ -66,6 +66,51 @@ TEST(UsdImporter, ParsesUsdPhysicsJoint) {
     EXPECT_FLOAT_EQ(joint.axis.z, 1.0f);
 }
 
+TEST(UsdImporter, CapsuleAxisComposesWithAuthoredRotation) {
+    const auto path = TempUsdPath("nuka_capsule_axes.usda");
+    const char* axes[] = {"X", "Y", "Z", ""};
+    {
+        std::ofstream out(path);
+        out << "#usda 1.0\ndef Xform \"body\" (\n"
+               "    prepend apiSchemas = [\"PhysicsRigidBodyAPI\"]\n)\n{\n"
+               "    bool physics:rigidBodyEnabled = true\n";
+        for (int i = 0; i < 4; ++i) {
+            out << "    def Capsule \"cap" << i << "\" (\n"
+                   "        prepend apiSchemas = [\"PhysicsCollisionAPI\"]\n    )\n    {\n"
+                   "        double radius = 0.1\n        double height = 0.6\n"
+                   "        float3 xformOp:rotateXYZ = (0, 0, 90)\n";
+            if (axes[i][0]) out << "        uniform token axis = \"" << axes[i] << "\"\n";
+            out << "    }\n";
+        }
+        out << "}\n";
+    }
+    const auto scene = nuka::import::LoadUsd(path.string());
+    ASSERT_EQ(scene.ShapeCount(), 4u);
+    const nuka::math::Vec3 expected[] = {{0, 1, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, 1}};
+    for (uint32_t i = 0; i < 4u; ++i) {
+        SCOPED_TRACE(i);
+        const auto& shape = scene.GetShape(i);
+        EXPECT_EQ(shape.type, nuka::scene::ShapeType::Capsule);
+        EXPECT_FLOAT_EQ(shape.radius, 0.1f);
+        EXPECT_FLOAT_EQ(shape.half_height, 0.3f);
+        const auto axis = shape.local_transform.rotation.Rotate({0, 0, 1});
+        EXPECT_NEAR(axis.x, expected[i].x, 2.0e-6f);
+        EXPECT_NEAR(axis.y, expected[i].y, 2.0e-6f);
+        EXPECT_NEAR(axis.z, expected[i].z, 2.0e-6f);
+    }
+    {
+        std::ofstream out(path);
+        out << "#usda 1.0\ndef Xform \"body\" (\n"
+               "    prepend apiSchemas = [\"PhysicsRigidBodyAPI\"]\n)\n{\n"
+               "    bool physics:rigidBodyEnabled = true\n"
+               "    def Capsule \"cap\" (\n"
+               "        prepend apiSchemas = [\"PhysicsCollisionAPI\"]\n    )\n    {\n"
+               "        uniform token axis = \"invalid\"\n    }\n}\n";
+    }
+    EXPECT_NE(ExceptionTextForLoadUsd(path.string()).find("invalid capsule axis"), std::string::npos);
+    std::filesystem::remove(path);
+}
+
 TEST(UsdImporter, CookedBlobContainsUsdImportedTables) {
     const auto scene = nuka::import::LoadUsd("tests/data/minimal_scene.usda");
     const auto blob = nuka::scene::CookScene(scene);

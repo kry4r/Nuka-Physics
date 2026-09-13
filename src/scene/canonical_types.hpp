@@ -39,7 +39,7 @@ enum class ShapeType : uint8_t {
     Sphere,
     Capsule,
     Box,
-    Plane,
+    Plane,  // Infinite solid half-space local z <= 0; outward normal is +Z.
     ConvexHull,
     TriMesh,
     HeightField

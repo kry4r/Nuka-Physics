@@ -194,42 +194,41 @@ TEST(AnalyticalManifold, BoxSphereNormalFlips) {
 // Sphere x plane -> 1 point.
 // ---------------------------------------------------------------------------
 TEST(AnalyticalManifold, SpherePlaneSinglePoint) {
-    PrimParams sph = MakeSphere(1.0f, {0.0f, 0.8f, 0.0f});  // bottom at y=-0.2
-    PrimParams plane = MakePlane({0.0f, 0.0f, 0.0f});       // y=0 plane, normal +y
+    PrimParams sph = MakeSphere(1.0f, {0.0f, 0.0f, 0.8f});
+    PrimParams plane = MakePlane({0.0f, 0.0f, 0.0f});
     ContactManifold m = Route(ShapeType::Sphere, ShapeType::Plane, sph, plane);
     ASSERT_EQ(m.point_count, 1u);
     EXPECT_NEAR(m.points[0].penetration, 0.2f, kTol);
-    EXPECT_TRUE(Vec3Near(m.points[0].normal, {0.0f, 1.0f, 0.0f}));
-    EXPECT_TRUE(Vec3Near(m.points[0].position, {0.0f, -0.2f, 0.0f}));
+    EXPECT_TRUE(Vec3Near(m.points[0].normal, {0.0f, 0.0f, 1.0f}));
+    EXPECT_TRUE(Vec3Near(m.points[0].position, {0.0f, 0.0f, -0.2f}));
 }
 
 // ---------------------------------------------------------------------------
 // Box on plane resting -> exactly 4 coplanar bottom corners.
 // ---------------------------------------------------------------------------
 TEST(AnalyticalManifold, BoxOnPlaneFourCorners) {
-    // Box he=1, center at y=0.9 -> bottom face at y=-0.1 (penetration 0.1).
-    PrimParams box = MakeBox({1.0f, 1.0f, 1.0f}, {0.0f, 0.9f, 0.0f});
+    // Box he=1, center at z=0.9 gives a 0.1 m penetration.
+    PrimParams box = MakeBox({1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.9f});
     PrimParams plane = MakePlane({0.0f, 0.0f, 0.0f});
     ContactManifold m = Route(ShapeType::Box, ShapeType::Plane, box, plane);
     ASSERT_EQ(m.point_count, 4u);
     for (uint32_t i = 0; i < 4u; ++i) {
         EXPECT_NEAR(m.points[i].penetration, 0.1f, kTol);
-        EXPECT_TRUE(Vec3Near(m.points[i].normal, {0.0f, 1.0f, 0.0f}));
-        EXPECT_NEAR(m.points[i].position.y, -0.1f, kTol);  // coplanar at box bottom
+        EXPECT_TRUE(Vec3Near(m.points[i].normal, {0.0f, 0.0f, 1.0f}));
+        EXPECT_NEAR(m.points[i].position.z, -0.1f, kTol);
     }
-    // The 4 bottom corners (x,z in {-1,1}) at y=-0.1.
-    ExpectPositionSet(m, {{-1.0f, -0.1f, -1.0f}, {1.0f, -0.1f, -1.0f},
-                          {-1.0f, -0.1f, 1.0f}, {1.0f, -0.1f, 1.0f}});
+    ExpectPositionSet(m, {{-1.0f, -1.0f, -0.1f}, {1.0f, -1.0f, -0.1f},
+                          {-1.0f, 1.0f, -0.1f}, {1.0f, 1.0f, -0.1f}});
 }
 
-// Swapped order: plane is A, box is B -> normal flips to -y (separation for plane).
+// Swapping the plane and box reverses the separation normal.
 TEST(AnalyticalManifold, PlaneBoxNormalFlips) {
     PrimParams plane = MakePlane({0.0f, 0.0f, 0.0f});
-    PrimParams box = MakeBox({1.0f, 1.0f, 1.0f}, {0.0f, 0.9f, 0.0f});
+    PrimParams box = MakeBox({1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.9f});
     ContactManifold m = Route(ShapeType::Plane, ShapeType::Box, plane, box);
     ASSERT_EQ(m.point_count, 4u);
     for (uint32_t i = 0; i < 4u; ++i) {
-        EXPECT_TRUE(Vec3Near(m.points[i].normal, {0.0f, -1.0f, 0.0f}));
+        EXPECT_TRUE(Vec3Near(m.points[i].normal, {0.0f, 0.0f, -1.0f}));
     }
 }
 
@@ -269,31 +268,26 @@ TEST(AnalyticalManifold, BoxBoxOffsetClipsToOverlapRect) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Capsule x plane -> 2 endpoints (axis-aligned along Y? no -- lay it along X).
-// ---------------------------------------------------------------------------
+// A horizontal capsule contacts the plane at both segment endpoints.
 TEST(AnalyticalManifold, CapsulePlaneTwoEndpoints) {
-    // Capsule radius 0.5, half_height 1, laid along X (rotate local Y -> world X)
-    // centered at y=0.4 -> the cylinder surface bottom at y = 0.4-0.5 = -0.1.
-    const Quat lay = Quat::FromAxisAngle(Vec3::UnitZ(), -static_cast<float>(M_PI) / 2.0f);
-    PrimParams cap = MakeCapsule(0.5f, 1.0f, {0.0f, 0.4f, 0.0f}, lay);
+    const Quat lay = Quat::FromAxisAngle(Vec3::UnitY(), static_cast<float>(M_PI) / 2.0f);
+    PrimParams cap = MakeCapsule(0.5f, 1.0f, {0.0f, 0.0f, 0.4f}, lay);
     PrimParams plane = MakePlane({0.0f, 0.0f, 0.0f});
     ContactManifold m = Route(ShapeType::Capsule, ShapeType::Plane, cap, plane);
     ASSERT_EQ(m.point_count, 2u);
     for (uint32_t i = 0; i < 2u; ++i) {
         EXPECT_NEAR(m.points[i].penetration, 0.1f, kTol);
-        EXPECT_TRUE(Vec3Near(m.points[i].normal, {0.0f, 1.0f, 0.0f}));
-        EXPECT_NEAR(m.points[i].position.y, -0.1f, kTol);
+        EXPECT_TRUE(Vec3Near(m.points[i].normal, {0.0f, 0.0f, 1.0f}));
+        EXPECT_NEAR(m.points[i].position.z, -0.1f, kTol);
     }
-    // endpoints at x = +/-1 (half_height), surface point y = -0.1.
-    ExpectPositionSet(m, {{1.0f, -0.1f, 0.0f}, {-1.0f, -0.1f, 0.0f}});
+    ExpectPositionSet(m, {{1.0f, 0.0f, -0.1f}, {-1.0f, 0.0f, -0.1f}});
 }
 
 // ---------------------------------------------------------------------------
 // Capsule x sphere -> 1 point.
 // ---------------------------------------------------------------------------
 TEST(AnalyticalManifold, CapsuleSphereSinglePoint) {
-    // Capsule along Y (default), radius 0.5 hh 1 at origin. Sphere r 0.5 at
+    // Capsule along Z, radius 0.5 hh 1 at origin. Sphere r 0.5 at
     // x=0.8 (near the cylinder mid). dist from axis = 0.8; pen = (0.5+0.5)-0.8=0.2.
     PrimParams cap = MakeCapsule(0.5f, 1.0f, {0.0f, 0.0f, 0.0f});
     PrimParams sph = MakeSphere(0.5f, {0.8f, 0.0f, 0.0f});
@@ -306,23 +300,23 @@ TEST(AnalyticalManifold, CapsuleSphereSinglePoint) {
     // contact point on capsule surface toward the sphere: (0,0,0) + (1,0,0)*r.
     EXPECT_TRUE(Vec3Near(m.points[0].position, {0.5f, 0.0f, 0.0f}));
 
-    sph = MakeSphere(0.5f, {0.0f, 0.3f, 0.0f});
+    sph = MakeSphere(0.5f, {0.0f, 0.0f, 0.3f});
     m = Route(ShapeType::Capsule, ShapeType::Sphere, cap, sph);
     ASSERT_EQ(m.point_count, 1u);
     EXPECT_NEAR(m.points[0].penetration, 1.0f, kTol);
     EXPECT_TRUE(Vec3Near(m.points[0].normal, {-1.0f, 0.0f, 0.0f}));
-    EXPECT_TRUE(Vec3Near(m.points[0].position, {0.5f, 0.3f, 0.0f}));
+    EXPECT_TRUE(Vec3Near(m.points[0].position, {0.5f, 0.0f, 0.3f}));
 
     cap.frame = BuildPrimFrame(Transform{{0.0f, 0.0f, 0.0f},
-        Quat::FromAxisAngle(Vec3::UnitZ(), 0.5f * std::acos(-1.0f))});
-    sph = MakeSphere(0.5f, cap.frame.LocalToWorld({0.0f, 0.3f, 0.0f}));
+        Quat::FromAxisAngle(Vec3::UnitY(), 0.5f * std::acos(-1.0f))});
+    sph = MakeSphere(0.5f, cap.frame.LocalToWorld({0.0f, 0.0f, 0.3f}));
     m = Route(ShapeType::Capsule, ShapeType::Sphere, cap, sph);
     ASSERT_EQ(m.point_count, 1u);
     EXPECT_NEAR(m.points[0].penetration, 1.0f, kTol);
-    EXPECT_NEAR(m.points[0].normal.Dot(cap.frame.cy), 0.0f, kTol);
+    EXPECT_NEAR(m.points[0].normal.Dot(cap.frame.cz), 0.0f, kTol);
     const Vec3 local_point = cap.frame.WorldToLocal(m.points[0].position);
-    EXPECT_NEAR(local_point.y, 0.3f, kTol);
-    EXPECT_NEAR(local_point.x * local_point.x + local_point.z * local_point.z, 0.25f, kTol);
+    EXPECT_NEAR(local_point.z, 0.3f, kTol);
+    EXPECT_NEAR(local_point.x * local_point.x + local_point.y * local_point.y, 0.25f, kTol);
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +326,7 @@ TEST(AnalyticalManifold, CapsuleSphereSinglePoint) {
 // no EPA -> avoids the v0.8 shallow-penetration hull debt). Test it DIRECTLY.
 // ---------------------------------------------------------------------------
 TEST(AnalyticalManifold, CapsuleCapsuleParallelOverlapPushesApart) {
-    // Two capsules both along Y, r 0.1 hh 0.3. A at origin, B at x=0.15. The axes
+    // Two capsules both along Z, r 0.1 hh 0.3. A at origin, B at x=0.15. The axes
     // are parallel 0.15 apart; sum radii 0.2 => penetration 0.05. A must push -x.
     PrimParams a = MakeCapsule(0.1f, 0.3f, {0.0f, 0.0f, 0.0f});
     PrimParams b = MakeCapsule(0.1f, 0.3f, {0.15f, 0.0f, 0.0f});
@@ -346,19 +340,16 @@ TEST(AnalyticalManifold, CapsuleCapsuleParallelOverlapPushesApart) {
 }
 
 TEST(AnalyticalManifold, CapsuleCapsulePerpendicularCross) {
-    // A along Y at origin (r 0.1 hh 0.5); B along X crossing above it at z=0.15
-    // (r 0.1 hh 0.5). Closest features are the two axis crossings; the vertical
-    // gap is 0.15, sum radii 0.2 => pen 0.05, A pushed -z.
+    // Perpendicular Z/X capsules separated by 0.15 m along Y overlap by 0.05 m.
     PrimParams a = MakeCapsule(0.1f, 0.5f, {0.0f, 0.0f, 0.0f});
-    const Quat y_to_x = Quat::FromAxisAngle({0.0f, 0.0f, 1.0f},
-                                            -1.57079632679f);  // Y axis -> X
-    PrimParams b = MakeCapsule(0.1f, 0.5f, {0.0f, 0.0f, 0.15f}, y_to_x);
+    const Quat z_to_x = Quat::FromAxisAngle({0.0f, 1.0f, 0.0f}, 1.57079632679f);
+    PrimParams b = MakeCapsule(0.1f, 0.5f, {0.0f, 0.15f, 0.0f}, z_to_x);
     ContactManifold m;
     m.Clear();
     nuka::collision::amf::CapsuleCapsule(a, b, &m);
     ASSERT_EQ(m.point_count, 1u);
     EXPECT_NEAR(m.points[0].penetration, 0.05f, kTol);
-    EXPECT_TRUE(Vec3Near(m.points[0].normal, {0.0f, 0.0f, -1.0f}));
+    EXPECT_TRUE(Vec3Near(m.points[0].normal, {0.0f, -1.0f, 0.0f}));
 }
 
 TEST(AnalyticalManifold, CapsuleCapsuleSeparatedNoContact) {
@@ -400,7 +391,7 @@ TEST(AnalyticalManifold, BoxBoxTwoRunByteIdentical) {
 }
 
 TEST(AnalyticalManifold, BoxPlaneTwoRunByteIdentical) {
-    PrimParams box = MakeBox({1.0f, 1.0f, 1.0f}, {0.0f, 0.9f, 0.0f});
+    PrimParams box = MakeBox({1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.9f});
     PrimParams plane = MakePlane({0.0f, 0.0f, 0.0f});
     ContactManifold m1, m2;
     RouteIntoZeroed(ShapeType::Box, ShapeType::Plane, box, plane, &m1);

@@ -92,12 +92,10 @@ nk::Pipeline::SolverConfig Cfg() {
     return cfg;
 }
 
-// A static z-up ground plane at z=0 (the amf plane normal is local +Y, rotated to
-// world +Z). One-way by mass; the soft body lands on it.
+// A static Z-up half-space supports the soft body at z=0.
 void AddGroundPlane(nk::Model& m, int32_t body_id) {
     nk::Model::BodyInit bi;
     bi.pose = Transform::Identity();
-    bi.pose.rotation = Quat::FromAxisAngle(Vec3{1, 0, 0}, 1.57079632679f);
     bi.inv_mass = 0.0f;
     bi.inv_inertia = Vec3{0, 0, 0};
     m.body_init.push_back(bi);

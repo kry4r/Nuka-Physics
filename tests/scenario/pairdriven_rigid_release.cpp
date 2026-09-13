@@ -102,8 +102,6 @@ TEST(PairDrivenRigidRelease, ManifoldPointsStayOnTheContactingGeometry) {
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     nk::Model model;
     AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
-    model.body_init[0].pose.rotation = nuka::math::Quat::FromAxisAngle(
-        Vec3{1, 0, 0}, 1.57079632679f);
     for (uint32_t i = 0; i < 6u; ++i)
         AddBody(model, nuka::collision::kShapeBox,
                 {static_cast<float>(i), 0, 0.195f}, 0.2f, 0.2f);
@@ -167,8 +165,6 @@ TEST(PairDrivenRigidRelease, ContactReadoutMatchesSolvedRowsAcrossEnvironments) 
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     nk::Model model;
     AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
-    model.body_init[0].pose.rotation = nuka::math::Quat::FromAxisAngle(
-        Vec3{1, 0, 0}, 1.57079632679f);
     AddBody(model, nuka::collision::kShapeBox, {1, 0, 0.195f}, 0.2f, 0.2f);
     model.body_init[1].linear_velocity = {0.1f, 0.05f, 0};
     Finish(model);
@@ -247,8 +243,6 @@ TEST(PairDrivenRigidRelease, ImplicitDampingRemainsStableForScalarAndBlockContac
                             << " mass=" << mass);
                         nk::Model model;
                         AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
-                        model.body_init[0].pose.rotation = nuka::math::Quat::FromAxisAngle(
-                            Vec3{1, 0, 0}, 1.57079632679f);
                         AddBody(model, nuka::collision::kShapeSphere,
                                 {0, 0, 0.0995f}, 0.1f, mass);
                         model.body_init[1].linear_velocity = {0, 0, approach};
@@ -302,8 +296,6 @@ TEST(PairDrivenRigidRelease, CompliantDampingPreservesReferenceVelocityAcrossMas
                             << " mass=" << mass << " gravity=" << gravity);
                         nk::Model model;
                         AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
-                        model.body_init[0].pose.rotation = nuka::math::Quat::FromAxisAngle(
-                            Vec3{1, 0, 0}, 1.57079632679f);
                         AddBody(model, nuka::collision::kShapeSphere,
                                 {0, 0, 0.0995f}, 0.1f, mass);
                         model.body_init[1].linear_velocity = {0, 0, approach};

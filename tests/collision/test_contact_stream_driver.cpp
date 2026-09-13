@@ -80,8 +80,11 @@ amf::PrimParams MakeSpherePrim(float r, Vec3 pos) {
 }
 
 amf::PrimParams MakePlanePrim(Vec3 pos) {
-    amf::PrimParams p;  // plane normal = local +Y == frame.cy == world +Y
+    amf::PrimParams p;
     p.frame.t = pos;
+    // This fixture is Y-up; rotate the canonical plane normal from Z to Y.
+    p.frame.cy = {0.0f, 0.0f, -1.0f};
+    p.frame.cz = {0.0f, 1.0f, 0.0f};
     return p;
 }
 

@@ -451,7 +451,7 @@ inline void NarrowphaseConvex(const CandidatePair& pair, const ShapeProxyView& g
         if (hull == nullptr) { out->Clear(); StampSides(pair, out); return; }
         // plane_normal = separation dir for the HULL side. Re-sign to side A:
         //   hull == A (plane is B): +plane_normal ; plane == A: -plane_normal.
-        const math::Vec3 plane_n = amf::Norm(plane.frame.cy, math::Vec3::UnitY());
+        const math::Vec3 plane_n = amf::Norm(plane.frame.cz, math::Vec3::UnitZ());
         const math::Vec3 normal_for_hull = plane_is_a ? -plane_n : plane_n;
         cvx::HullPlane(*hull, plane, normal_for_hull, out);
         StampSides(pair, out);

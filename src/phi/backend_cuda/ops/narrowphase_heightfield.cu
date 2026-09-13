@@ -165,8 +165,8 @@ __device__ void ConvexLocalAabb(uint32_t kind, const amf::PrimParams& prim,
     switch (kind) {
         case kKindSphere:  { const float r = prim.radius; he = {r, r, r}; break; }
         case kKindBox:     he = rotabs(prim.half_extents); break;
-        case kKindCapsule: he = rotabs(Vec3{prim.radius, prim.radius + prim.half_height,
-                                            prim.radius}); break;
+        case kKindCapsule: he = rotabs(Vec3{prim.radius, prim.radius,
+                                            prim.radius + prim.half_height}); break;
         case kKindConvexHull: {
             // Bound-sphere from this shape's slice of the hull pool (rot-invariant).
             const float* hv = hull_verts + static_cast<size_t>(hull_off) * 3u;
@@ -305,8 +305,8 @@ __device__ void CapsuleHeightfieldTri(const amf::PrimParams& cprim,
     const Vec3 wa = hf_frame.LocalToWorld(tv[0]);
     const Vec3 wb = hf_frame.LocalToWorld(tv[1]);
     const Vec3 wc = hf_frame.LocalToWorld(tv[2]);
-    const Vec3 e0 = cprim.frame.t + cprim.frame.cy * cprim.half_height;
-    const Vec3 e1 = cprim.frame.t - cprim.frame.cy * cprim.half_height;
+    const Vec3 e0 = cprim.frame.t + cprim.frame.cz * cprim.half_height;
+    const Vec3 e1 = cprim.frame.t - cprim.frame.cz * cprim.half_height;
     for (int i = 0; i < kCapsuleSegSamples; ++i) {
         const float t = static_cast<float>(i) /
                         static_cast<float>(kCapsuleSegSamples - 1);

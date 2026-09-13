@@ -168,14 +168,6 @@ __forceinline__ __device__ ShapeDev LoadShape(const float* table, uint32_t row) 
     return s;
 }
 
-// Plane broadphase AABB: a plane is analytically infinite, so its LBVH leaf is a
-// large-but-finite slab. kPlaneLateralExtent (1 Mm) is the in-plane half-span — a
-// scene wider than this misses plane contacts at its rim (raise it / derive from
-// the scene bound). kPlaneThickness (1 mm) is the half-thickness along the plane
-// normal so the slab stays thin (Morton quantization stays sane).
-constexpr float kPlaneLateralExtent = 1.0e6f;
-constexpr float kPlaneThickness     = 1.0e-3f;
-
 // Shape kinds — R2: the ONE shared enum (collision/shape_kind.hpp). These local
 // aliases keep the kernel switch text identical while removing the divergent
 // copy-pasted sentinel block. Only the extents matter for the AABB.
@@ -223,7 +215,7 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
     switch (s.kind) {
         case kKindSphere:     r = s.p[0]; he = {r, r, r}; break;
         case kKindCapsule:    r = s.p[0]; he = RotAbs(xf.rotation,
-                                  math::Vec3{r, r + s.p[1], r}); break;
+                                  math::Vec3{r, r, r + s.p[1]}); break;
         case kKindBox:        he = RotAbs(xf.rotation,
                                   math::Vec3{s.p[0], s.p[1], s.p[2]}); break;
         // Hull: conservative BOUND-RADIUS sphere (p[0] = the cooked max |vertex|
@@ -270,18 +262,16 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
             out_hi[gid] = {c2.x + he.x + m, c2.y + he.y + m, c2.z + he.z + m};
             return;
         }
-        case kKindPlane: default:
-            // A plane has effectively-infinite extent; clamp to a large finite
-            // box so the LBVH morton quantization stays sane. The slab is thin
-            // along the plane NORMAL = the body's LOCAL +Y (the amf:: plane
-            // convention, analytical_manifold.hpp: n = frame.cy) — so the
-            // local slab MUST be rotated by the body pose like every other
-            // kind (review fix: the unrotated slab was thin in WORLD Y, which
-            // missed every contact of a z-up ground plane posed with Y->Z).
-            he = RotAbs(xf.rotation, math::Vec3{kPlaneLateralExtent,
-                                                kPlaneThickness,
-                                                kPlaneLateralExtent});
-            break;
+        case kKindPlane:
+            // An unbounded half-space must retain candidates at every penetration
+            // depth and lateral position. Symmetric finite limits keep Morton centers finite.
+            out_lo[gid] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+            out_hi[gid] = {FLT_MAX, FLT_MAX, FLT_MAX};
+            return;
+        default:
+            out_lo[gid] = {FLT_MAX, FLT_MAX, FLT_MAX};
+            out_hi[gid] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+            return;
     }
     const math::Vec3 c = xf.position;
     const float m = margin;

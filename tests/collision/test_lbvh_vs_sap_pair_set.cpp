@@ -30,6 +30,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cfloat>
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -132,7 +133,7 @@ scene::SceneIR BuildPlaneBoxScene() {
     box.name = "box";
     box.mass = 1.0f;
     box.inertia = {1.0f, 1.0f, 1.0f};
-    box.local_transform.position = {0.0f, 0.45f, 0.0f};
+    box.local_transform.position = {0.0f, 0.0f, 0.45f};
     const auto box_id = scene.AddRigidBody(std::move(box));
     scene::CollisionShapeRecord box_shape;
     box_shape.body_id = box_id;
@@ -142,11 +143,8 @@ scene::SceneIR BuildPlaneBoxScene() {
     return scene;
 }
 
-// Compute the per-shape world-space AABBs host-side using the SAME Sphere /
-// Plane / Box formulas the (removed) device AABB kernel used: the world
-// transform is Compose(body_pose, shape_local_transform); Sphere -> center +/-
-// radius; Plane -> a wide thin slab at the plane height; Box -> 8-corner OBB
-// bound. This reproduces the exact AABB values the old GPU-SAP path produced.
+// Compare candidate generators on shared conservative world-space bounds.
+// Planes occupy an unbounded solid half-space, so no finite slab is sufficient.
 std::vector<collision::AABB> ComputeSceneAabbs(const scene::SceneIR& scene) {
     const runtime::BuiltWorld world = runtime::BuildWorld(scene::CookScene(scene));
     const auto& shapes = world.template_view.shape_table;
@@ -165,9 +163,8 @@ std::vector<collision::AABB> ComputeSceneAabbs(const scene::SceneIR& scene) {
                                                    shapes.radii[s]);
             break;
         case scene::ShapeType::Plane: {
-            const float plane_y = world_transform.position.y;
-            aabbs[s].min = {-1.0e6f, plane_y - 0.01f, -1.0e6f};
-            aabbs[s].max = {1.0e6f, plane_y + 0.01f, 1.0e6f};
+            aabbs[s].min = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+            aabbs[s].max = {FLT_MAX, FLT_MAX, FLT_MAX};
             break;
         }
         default:
