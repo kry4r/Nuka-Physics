@@ -126,6 +126,14 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
         pose.kind = nuka::sensor::StateSensorKind::FramePose;
         pose.errors[3].error.noise_density = 0.001f;
         ASSERT_EQ(graph.AttachStateSensor(pose, &pose_id), nphi::Status::Ok);
+        auto load = joint;
+        load.kind = nuka::sensor::StateSensorKind::ForceTorque;
+        load.errors[0] = sensor_config;
+        uint32_t load_id, contact_id;
+        ASSERT_EQ(graph.AttachStateSensor(load, &load_id), nphi::Status::Ok);
+        load.kind = nuka::sensor::StateSensorKind::ContactWrench;
+        load.index = 3u;
+        ASSERT_EQ(graph.AttachStateSensor(load, &contact_id), nphi::Status::Ok);
         const auto* sensor_address = graph.StateSensors().Values(imu_id);
         const auto initial = ReadPipelineState(graph);
         const auto* address = graph.DataViewRef().particle_pos;
@@ -182,6 +190,11 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
                 EXPECT_EQ(flags, std::vector<uint32_t>(envs));
             }
             ASSERT_EQ(observation.Sample(graph.DataViewRef().qdot, Cfg().dt, 25.0f), nphi::Status::Ok);
+            for (uint32_t sensor : {load_id, contact_id}) {
+                std::vector<float> values(envs * 6u);
+                ASSERT_EQ(graph.StateSensors().Download(sensor, values.data(), values.size() * sizeof(float)), nphi::Status::Ok);
+                for (float value : values) ASSERT_TRUE(std::isfinite(value));
+            }
             std::vector<float> joint_values(envs * 2u), pose_values(envs * 7u), q(targets.size()), qdot(targets.size());
             ASSERT_EQ(graph.StateSensors().Download(joint_id, joint_values.data(), joint_values.size() * sizeof(float)), nphi::Status::Ok);
             ASSERT_EQ(graph.StateSensors().Download(pose_id, pose_values.data(), pose_values.size() * sizeof(float)), nphi::Status::Ok);
@@ -261,6 +274,25 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
     const auto& cap = graph.GetModel().capacities;
     ASSERT_GT(cap.particle_surfaces_per_env, 0u);
     ASSERT_GT(cap.point_endpoints_per_env, 0u);
+    nuka::sensor::StateSensorDesc sensor;
+    sensor.kind = nuka::sensor::StateSensorKind::ForceTorque;
+    sensor.mount = nuka::sensor::StateSensorMount::Link;
+    sensor.index = 2u;
+    std::vector<uint32_t> load_sensors(1u);
+    ASSERT_EQ(graph.AttachStateSensor(sensor, &load_sensors.front()), nphi::Status::Ok);
+    sensor.kind = nuka::sensor::StateSensorKind::ContactWrench;
+    sensor.mount = nuka::sensor::StateSensorMount::Body;
+    const auto& model = graph.GetModel();
+    for (uint32_t body = 0u; body < cap.bodies_per_env; ++body) {
+        if ((body < model.body_to_link.size() && model.body_to_link[body] != ~0u) ||
+            (body < model.body_collidable_body.size() && model.body_collidable_body[body] != ~0u)) continue;
+        sensor.index = body;
+        uint32_t id;
+        ASSERT_EQ(graph.AttachStateSensor(sensor, &id), nphi::Status::Ok);
+        load_sensors.push_back(id);
+    }
+    ASSERT_GT(load_sensors.size(), 1u);
+    double measured_contact = 0.0;
     for (auto* world : {&eager, &graph}) ASSERT_NE(world->FieldPtr(nk::FieldId::ContactForce), nullptr);
     const auto initial = ReadPipelineState(graph);
     const auto targets = ReadContactValues<float>(graph, nk::FieldId::DriveTarget);
@@ -295,6 +327,14 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
         }
         EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
         EXPECT_EQ(ReadPipelineState(conservative), ReadPipelineState(graph));
+        for (uint32_t id : load_sensors) {
+            std::vector<float> values(envs * 6u);
+            ASSERT_EQ(graph.StateSensors().Download(id, values.data(), values.size() * sizeof(float)), nphi::Status::Ok);
+            for (float value : values) {
+                ASSERT_TRUE(std::isfinite(value));
+                if (id != load_sensors.front()) measured_contact += std::abs(value);
+            }
+        }
         for (auto field : {nk::FieldId::ParticleF, nk::FieldId::ParticleC, nk::FieldId::PointEndpointRanges,
                            nk::FieldId::PointEndpointTerms, nk::FieldId::ContactSideAKind, nk::FieldId::ContactSideBKind,
                            nk::FieldId::ContactSideAIndex, nk::FieldId::ContactSideBIndex})
@@ -330,6 +370,7 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
             }
     }
     EXPECT_EQ(graph.DataViewRef().point_endpoint_terms, address);
+    EXPECT_GT(measured_contact, 0.0);
     EXPECT_EQ(graph.GraphReplays(), 32u);
     ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
     EXPECT_EQ(ReadPipelineState(graph), initial);

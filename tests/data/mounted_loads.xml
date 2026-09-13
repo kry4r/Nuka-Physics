@@ -1,0 +1,26 @@
+<mujoco model="mounted_loads">
+  <compiler angle="radian" autolimits="true"/>
+  <default><geom contype="0" conaffinity="0"/></default>
+  <worldbody>
+    <body name="base" pos="0 0 3">
+      <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
+      <geom type="sphere" size="0.05"/>
+      <body name="arm">
+        <joint name="hinge" type="hinge" axis="0 0 1" damping="0"/>
+        <inertial pos="0.2 0 0" mass="2" diaginertia="0.03 0.04 0.05"/>
+        <geom type="sphere" size="0.04"/>
+        <site name="wrist" pos="0.03 0 0"/>
+        <body name="tool" pos="0.3 0.1 0">
+          <inertial pos="0.04 -0.02 0.01" mass="0.5" diaginertia="0.002 0.003 0.004"/>
+          <geom type="sphere" size="0.03"/>
+          <site name="load_cell" pos="0 0.02 0.03" quat="0.7071067811865476 0 0 0.7071067811865476"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <sensor>
+    <force name="wrist_load" site="wrist"/>
+    <torque name="tool_load" site="load_cell"/>
+    <framepos name="tool_pose" objtype="body" objname="tool"/>
+  </sensor>
+</mujoco>

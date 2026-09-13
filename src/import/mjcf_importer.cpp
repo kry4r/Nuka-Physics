@@ -878,6 +878,17 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         context.joint_ids[scene.GetJoint(joint_id).name] = joint_id;
     }
 
+    // An omitted joint welds a child body to its parent; retain its inertia and sensor frame.
+    if (parent_id != scene::kInvalidBody && !body_elem->FirstChildElement("joint") &&
+        !body_elem->FirstChildElement("freejoint")) {
+        scene::JointRecord joint;
+        joint.name = body_name + "/fixed";
+        joint.parent_body = parent_id;
+        joint.child_body = body_id;
+        joint.type = scene::JointType::Fixed;
+        scene.AddJoint(std::move(joint));
+    }
+
     for (auto* camera = body_elem->FirstChildElement("camera");
          camera != nullptr;
          camera = camera->NextSiblingElement("camera")) {

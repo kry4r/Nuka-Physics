@@ -76,7 +76,10 @@ TEST(MjcfImporter, ParsesSceneAuthoringRecords) {
     const auto scene = nuka::import::LoadMjcf("tests/data/complete_robot.xml");
 
     EXPECT_EQ(scene.RigidBodyCount(), 2u);
-    EXPECT_EQ(scene.JointCount(), 1u);
+    ASSERT_EQ(scene.JointCount(), 2u);
+    EXPECT_EQ(scene.GetJoint(1).type, nuka::scene::JointType::Fixed);
+    EXPECT_EQ(scene.GetJoint(1).parent_body, 0u);
+    EXPECT_EQ(scene.GetJoint(1).child_body, 1u);
     EXPECT_EQ(scene.ShapeCount(), 2u);
     EXPECT_EQ(scene.MaterialCount(), 1u);
     EXPECT_EQ(scene.CameraCount(), 1u);

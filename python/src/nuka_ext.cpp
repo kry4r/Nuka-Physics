@@ -1967,7 +1967,9 @@ NB_MODULE(_nuka_ext, m) {
         .value("IMU", NUKA_STATE_SENSOR_IMU)
         .value("FRAME_POSE", NUKA_STATE_SENSOR_FRAME_POSE)
         .value("JOINT_STATE", NUKA_STATE_SENSOR_JOINT_STATE)
-        .value("LINEAR_VELOCITY", NUKA_STATE_SENSOR_LINEAR_VELOCITY);
+        .value("LINEAR_VELOCITY", NUKA_STATE_SENSOR_LINEAR_VELOCITY)
+        .value("CONTACT_WRENCH", NUKA_STATE_SENSOR_CONTACT_WRENCH)
+        .value("FORCE_TORQUE", NUKA_STATE_SENSOR_FORCE_TORQUE);
 
     nb::enum_<nuka_sensor_mount_t>(m, "SensorMount")
         .value("LINK", NUKA_SENSOR_MOUNT_LINK)

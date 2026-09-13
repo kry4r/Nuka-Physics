@@ -196,13 +196,15 @@ def test_sensor_noise_non_float_stride_field_rejected(device):
             w.apply_sensor_noise(nuka.ARTICULATION_LINK_POSE)
 
 
-def test_mounted_sensor_timing_replay_and_late_attachment(device):
+@pytest.mark.parametrize("kind", [nuka.StateSensorKind.IMU, nuka.StateSensorKind.CONTACT_WRENCH,
+                                 nuka.StateSensorKind.FORCE_TORQUE])
+def test_mounted_sensor_timing_replay_and_late_attachment(device, kind):
     with make_world(device, 4) as world:
         world.set_execution_mode("graph")
         world.step_n(3)
         with world.capture_checkpoint() as unregistered:
             initial_hash = world.state_hash()
-            sensor = world.attach_state_sensor(nuka.StateSensorKind.IMU, update_period=2,
+            sensor = world.attach_state_sensor(kind, mount=nuka.SensorMount.LINK, mount_index=2, update_period=2,
                 latency=world.dt * 3, latency_jitter=world.dt * 0.5,
                 dropout_probability=0.25, seed=36)
             nuka.MeasurementError(noise_density=0.002, bias_random_walk=0.001,
@@ -258,7 +260,7 @@ def test_imported_mounted_sensor_physics(device):
         acceleration = 1.0 / (0.1 + 0.05 + 2 * 0.4**2)
         np.testing.assert_allclose(velocity[:, hinge] / world.dt, acceleration, rtol=5e-5)
         np.testing.assert_allclose(velocity[:, slide] / world.dt, -0.3 * acceleration, rtol=5e-5)
-        assert world.state_sensor_count() == 4
+        assert world.state_sensor_count() == 5
         encoder = world.download_state_sensor(0)
         np.testing.assert_array_equal(encoder[:, 1], velocity[:, slide])
         imu = world.download_state_sensor(1)
@@ -270,12 +272,55 @@ def test_imported_mounted_sensor_physics(device):
         pose = world.download_state_sensor(3)
         np.testing.assert_allclose(pose[:, :3], np.tile([0.3, 0.4, 3.0], (2, 1)), atol=2e-7)
         np.testing.assert_allclose(np.linalg.norm(pose[:, 3:], axis=1), 1.0, atol=2e-7)
+        wrench = world.download_state_sensor(4)
+        expected_wrench = np.tile([0.0, 0.8 * acceleration, 0.0, 0.032 * acceleration,
+                                  0.0, 0.034 * acceleration], (2, 1))
+        np.testing.assert_allclose(wrench, expected_wrench, atol=4e-5, rtol=5e-5)
+        support = world.attach_state_sensor(nuka.StateSensorKind.FORCE_TORQUE,
+                                           mount=nuka.SensorMount.LINK, mount_index=hinge)
+        world.reset_envs([0, 1])
+        world.upload_field(nuka.JOINT_POSITION, q.ravel())
+        world.set_drive_targets(torque.ravel())
+        world.step()
+        expected_support = np.tile([-0.8 * acceleration, 0, 0, 0, 0, 1], (2, 1))
+        np.testing.assert_allclose(world.download_state_sensor(support), expected_support, atol=4e-5, rtol=5e-5)
         with pytest.raises(RuntimeError):
             world.set_state_sensor_error(3, 3, scale_error=0.01)
 
 
+@pytest.mark.parametrize("floating", [False, True])
+def test_mounted_loads_include_fixed_tool_and_live_mass(device, tmp_path, floating):
+    source = Path(__file__).resolve().parents[2] / "tests/data/mounted_loads.xml"
+    text = source.read_text()
+    if floating:
+        text = text.replace('<body name="base" pos="0 0 3">', '<body name="base" pos="0 0 3"><freejoint/>')
+    path = tmp_path / "mounted_loads.xml"
+    path.write_text(text)
+    with nuka.World.create_from_scene(device, str(path), 2, dt=0.001,
+                                     control_mode=nuka.CONTROL_MODE_TORQUE) as world:
+        world.set_execution_mode("graph")
+        for mass in (0.5, 1.5):
+            world.set_link_mass(2, mass)
+            world.step()
+            wrist = np.tile([0, 0, (2 + mass) * 9.81, mass * 0.08 * 9.81,
+                             -(2 * 0.17 + mass * 0.31) * 9.81, 0], (2, 1))
+            tool = np.tile([0, 0, mass * 9.81, -mass * 0.04 * 9.81, mass * 0.04 * 9.81, 0], (2, 1))
+            if floating:
+                wrist[:] = tool[:] = 0
+            np.testing.assert_allclose(world.download_state_sensor(0), wrist, atol=8e-5, rtol=2e-5)
+            np.testing.assert_allclose(world.download_state_sensor(1), tool, atol=8e-5, rtol=2e-5)
+        position = world.download_state_sensor(2)[:, :3]
+        np.testing.assert_allclose(position[:, :2], np.tile([0.3, 0.1], (2, 1)), atol=2e-6)
+        if floating:
+            assert np.all(position[:, 2] < 3.0)
+        else:
+            np.testing.assert_allclose(position[:, 2], 3.0, atol=2e-6)
+
+
 def test_mounted_sensors_reject_incompatible_tape_replay(device):
     with make_world(device, 1) as world:
+        with pytest.raises(RuntimeError):
+            world.attach_state_sensor(nuka.StateSensorKind.FORCE_TORQUE, mount=nuka.SensorMount.BASE)
         with nuka.Tape.create(world, checkpoint_interval=2, max_tape_entries=8,
                               max_checkpoints=8, recompute_on_backward=1) as tape:
             tape.step_with_tape()

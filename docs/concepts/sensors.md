@@ -32,8 +32,27 @@ stamp = world.state_sensor_stamp(imu, env=0)
 | `FRAME_POSE` | World position xyz in meters, then unit quaternion wxyz |
 | `JOINT_STATE` | Position and velocity: rad, rad/s for revolute joints; m, m/s for prismatic joints |
 | `LINEAR_VELOCITY` | Mounting point linear velocity xyz in m/s, expressed in sensor axes |
+| `CONTACT_WRENCH` | Contact force xyz in N, then contact torque xyz in N·m, at the mounting point in sensor axes |
+| `FORCE_TORQUE` | Parent-on-subtree force xyz in N and torque xyz in N·m, at the mounting point in sensor axes |
 
 IMU acquisition integrates velocity changes over physical substeps and subtracts gravity. Free fall therefore gives zero specific force at the center of mass; supported rest measures the opposing gravity vector. Off-center mounts include angular acceleration and centripetal acceleration. Solved contact impulses are included. Each substep uses the midpoint sensor orientation; high angular rates still require adequate integration resolution. Position and velocity sensors acquire the endpoint state.
+
+Contact transducers sum normal and friction impulses on all collision shapes belonging to the mounting body or link. Dynamic bodies and static force plates use the same contact rows, including contacts with XPBD particles and MLS-MPM grid endpoints. Torque includes the lever arm to `local_offset`; there is no spatial patch filter. A body mount must select the owning body, not an extra collision-shape proxy.
+
+`FORCE_TORQUE` measures the load transmitted from the parent into the selected link and its descendants. It uses live spatial inertias, changes in linear and spin momentum, gravity, and solved external contacts, then accumulates child loads through the articulation tree. Static weight, actuator effort transmitted to links, joint limits, friction and contact reactions contribute to this balance. Off-center centers of mass and rotated inertia frames are included. A fixed articulation root measures support from the world; free bodies and floating roots have no parent interface and are rejected. Place the sensor on a supported articulation link, such as a wrist or fixed tool attachment.
+
+Both load sensors integrate impulses over physical substeps and report their average over the acquisition interval. Lever arms and sensor axes use substep midpoints. This is a discrete momentum-balance measurement; it converges to continuous inverse-dynamics loads as the integration timestep decreases. Split-impulse position corrections do not count as physical momentum. Torque is expressed about the sensor point, even if the sensor is offset from the actual joint.
+
+```python
+wrist_load = world.attach_state_sensor(
+    nuka.StateSensorKind.FORCE_TORQUE,
+    mount=nuka.SensorMount.LINK, mount_index=wrist_link,
+    local_offset=(0.0, 0.0, 0.05, 1.0, 0.0, 0.0, 0.0),
+)
+nuka.MeasurementError(noise_density=0.01, bias=0.02).configure_sensor(
+    world, wrist_load, component=2,
+)
+```
 
 Error components follow output order except for pose orientation: components 3–5 are local rotation-vector errors in radians, applied on SO(3). Orientation response filtering preserves unit quaternions. Scalar gain errors are not defined for these orientation components and are rejected. Other state sensors and pose translation use the scalar error parameters below.
 
@@ -43,9 +62,9 @@ Delivery uses fixed `latency` plus uniform jitter in `[-latency_jitter, +latency
 
 `state_sensor_stamp` reports `sequence`, `acquisitions`, `dropped`, `sample_time`, `delivery_time` and `valid`. Times use the environment's simulation clock, which restarts on environment reset. Reading a view or stamp does not acquire a sample. `world.get_state_sensor_view(imu)` provides a float32 device view with the same shape as the downloaded array.
 
-Checkpoint replay includes pending packets, clocks, accumulated IMU exposure, filter state and random processes. Restoring a checkpoint from before attachment deactivates later sensors and zeroes their existing views without freeing them. IDs remain stable allocation slots: `state_sensor_count()` includes inactive slots, and `state_sensor_active(id)` identifies active sensors. Reconfiguring an allocated sensor reactivates it and clears its complete sampling history.
+Checkpoint replay includes pending packets, clocks, accumulated IMU and load exposure, filter state and random processes. Restoring a checkpoint from before attachment deactivates later sensors and zeroes their existing views without freeing them. IDs remain stable allocation slots: `state_sensor_count()` includes inactive slots, and `state_sensor_active(id)` identifies active sensors. Reconfiguring an allocated sensor reactivates it and clears its complete sampling history.
 
-MJCF accelerometer/gyro, joint position/velocity, frame pose and velocimeter records create these sensors automatically. IMU and joint records expose the complete paired outputs shown above. Runtime noise and delivery settings are preserved by checkpoints but are not serialized in NKS. Camera and lidar APIs remain separate; six-axis joint force/torque and contact transducers are not provided by these four sensor kinds. Differentiable Tape creation, stepping and backward replay reject active mounted sensors because Tape does not execute this sampling pipeline.
+MJCF accelerometer/gyro, joint position/velocity, frame pose, velocimeter and force/torque records create these sensors automatically. IMU, joint and force/torque records expose the complete paired outputs shown above. Child bodies without a joint retain a fixed connection and a separate link frame, including tool inertia and mounted sensors. MJCF `touch` remains metadata: its scalar, site-volume normal-force integral differs from a whole-body contact wrench and is not automatically attached. Runtime noise and delivery settings are preserved by checkpoints but are not serialized in NKS. Camera and lidar APIs remain separate. Differentiable Tape creation, stepping and backward replay reject active mounted sensors because Tape does not execute this sampling pipeline.
 
 ## Explicit scalar observations
 

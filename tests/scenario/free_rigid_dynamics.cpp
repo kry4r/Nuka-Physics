@@ -908,6 +908,15 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
             config.pos_iters = position_iterations;
             nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
             ASSERT_TRUE(world.Ready());
+            nuka::sensor::StateSensorDesc contact;
+            contact.kind = nuka::sensor::StateSensorKind::ContactWrench;
+            contact.mount = nuka::sensor::StateSensorMount::Body;
+            contact.index = 1u;
+            contact.local_offset = {{0.03f, -0.04f, 0.02f}, Quat::FromAxisAngle({1, 3, -2}, 0.7f)};
+            uint32_t body_sensor, plate_sensor;
+            ASSERT_EQ(world.AttachStateSensor(contact, &body_sensor), phi::Status::Ok);
+            contact.index = 0u;
+            ASSERT_EQ(world.AttachStateSensor(contact, &plate_sensor), phi::Status::Ok);
             ASSERT_TRUE(world.Step().AllOk());
             const auto linear = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
             const auto angular = Read<Vec3>(world, nk::FieldId::BodyAngularVelocity, 4u);
@@ -919,6 +928,9 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
             const auto points = Read<Vec3>(world, nk::FieldId::UcontactPoint, 4u * counts.size());
             const Vec3 center = body.local_transform.position +
                 body.local_transform.rotation.Rotate(body.inertial_transform.position);
+            std::vector<float> body_load(12u), plate_load(12u);
+            ASSERT_EQ(world.StateSensors().Download(body_sensor, body_load.data(), body_load.size() * sizeof(float)), phi::Status::Ok);
+            ASSERT_EQ(world.StateSensors().Download(plate_sensor, plate_load.data(), plate_load.size() * sizeof(float)), phi::Status::Ok);
             for (uint32_t env = 0; env < 2u; ++env) {
                 Vec3 impulse{}, torque{};
                 for (uint32_t slot = 0; slot < capacity.max_contacts_per_env; ++slot) {
@@ -943,6 +955,24 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
                 ExpectVectorNear(linear[env * 2u + 1u], incoming + impulse / body.mass, 2.0e-5f);
                 ExpectVectorNear(AngularMomentum(poses[env * 2u + 1u], body.inertial_transform,
                     body.inertia, angular[env * 2u + 1u]), torque, 3.0e-6f);
+                const auto start = body.local_transform * contact.local_offset;
+                const auto end = poses[env * 2u + 1u] * contact.local_offset;
+                const auto a = start.rotation, b = end.rotation;
+                const auto rotation = Quat{a.w + b.w, a.x + b.x, a.y + b.y, a.z + b.z}.Normalized();
+                const auto measured = [&](const std::vector<float>& values, uint32_t offset) {
+                    const uint32_t base = env * 6u + offset;
+                    return Vec3{values[base], values[base + 1u], values[base + 2u]} * config.dt;
+                };
+                const auto observed = rotation.Rotate(measured(body_load, 0u));
+                const auto moment = rotation.Rotate(measured(body_load, 3u)) +
+                    ((start.position + end.position) * 0.5f - center).Cross(observed);
+                ExpectVectorNear(observed, impulse, 2.0e-6f);
+                ExpectVectorNear(moment, torque, 2.0e-6f);
+                const auto plate = poses[env * 2u] * contact.local_offset;
+                const auto plate_impulse = plate.rotation.Rotate(measured(plate_load, 0u));
+                const auto plate_moment = plate.rotation.Rotate(measured(plate_load, 3u));
+                ExpectVectorNear(plate_impulse, -impulse, 2.0e-6f);
+                ExpectVectorNear(plate_moment, -torque - (center - plate.position).Cross(impulse), 2.0e-6f);
             }
           }
         }

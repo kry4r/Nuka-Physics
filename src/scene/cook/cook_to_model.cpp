@@ -1236,6 +1236,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             case SensorType::FramePose: desc.kind = ::nuka::sensor::StateSensorKind::FramePose; break;
             case SensorType::JointState: desc.kind = ::nuka::sensor::StateSensorKind::JointState; break;
             case SensorType::LinearVelocity: desc.kind = ::nuka::sensor::StateSensorKind::LinearVelocity; break;
+            case SensorType::ForceTorque: desc.kind = ::nuka::sensor::StateSensorKind::ForceTorque; break;
             default: continue;
         }
         desc.mount = static_cast<::nuka::sensor::StateSensorMount>(sensor.mount);

@@ -58,11 +58,13 @@ public:
 private:
     struct Channel;
     phi::Status AllocateMotion();
+    phi::Status AllocateWrenches(const nk::Model& model);
     void BuildCalls();
     phi::Status UploadTimes();
     phi::Backend* backend_ = nullptr;
     phi::Buffer* motion_storage_ = nullptr;
     phi::Buffer* clocks_ = nullptr;
+    phi::Buffer* wrench_storage_ = nullptr;
     uint32_t env_count_ = 0u;
     double outer_dt_ = 0.0;
     double interval_ = 0.0;
@@ -72,6 +74,7 @@ private:
     phi::ReadoutMotionParams motion_before_{};
     phi::ReadoutMotionParams motion_after_{};
     phi::AdvanceSensorTimeParams advance_{};
+    phi::ReadoutSensorWrenchesParams wrenches_{};
     std::vector<phi::OpCall> before_;
     std::vector<phi::OpCall> after_;
     math::Vec3 gravity_;

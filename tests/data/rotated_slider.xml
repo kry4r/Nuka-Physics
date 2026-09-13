@@ -28,5 +28,6 @@
     <accelerometer name="slider_imu" site="sensor_site"/>
     <velocimeter name="slider_velocity" site="sensor_site"/>
     <framepos name="slider_pose" objtype="body" objname="slider"/>
+    <force name="slider_load" site="sensor_site"/>
   </sensor>
 </mujoco>

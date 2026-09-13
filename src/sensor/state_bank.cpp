@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 
+#include "collision/contact_capacity.hpp"
 #include "nk/model/model.hpp"
 #include "nk/model/generated/views.hpp"
 #include "phi/articulation_contract.hpp"
@@ -16,6 +17,8 @@ uint32_t StateSensorValueCount(StateSensorKind kind) {
         case StateSensorKind::FramePose: return 7u;
         case StateSensorKind::JointState: return 2u;
         case StateSensorKind::LinearVelocity: return 3u;
+        case StateSensorKind::ContactWrench: return 6u;
+        case StateSensorKind::ForceTorque: return 6u;
     }
     return 0u;
 }
@@ -54,6 +57,7 @@ StateSensorBank::StateSensorBank() = default;
 StateSensorBank::~StateSensorBank() {
     if (motion_storage_) phi::BufferFree(motion_storage_);
     if (clocks_) phi::BufferFree(clocks_);
+    if (wrench_storage_) phi::BufferFree(wrench_storage_);
 }
 
 void StateSensorBank::Initialize(phi::Backend* backend, uint32_t env_count, double outer_dt,
@@ -109,6 +113,37 @@ phi::Status StateSensorBank::AllocateMotion() {
     return status;
 }
 
+phi::Status StateSensorBank::AllocateWrenches(const nk::Model& model) {
+    if (wrench_storage_) return phi::Status::Ok;
+    const auto& cap = model.capacities;
+    const uint64_t particle_slots = cap.bodies_per_env && cap.max_contacts_per_env
+        ? uint64_t{cap.particles_per_env - model.MpmParticlesPerEnv()} *
+              collision::kBodyParticleContactSlotsPerParticle : 0u;
+    if (particle_slots + cap.mpm_contact_capacity_per_env > cap.max_contacts_per_env)
+        return phi::Status::InvalidArgument;
+    const size_t frames = size_t{env_count_} * (uint64_t{cap.links_per_env} + cap.bodies_per_env);
+    const size_t links = size_t{env_count_} * cap.links_per_env;
+    phi::Status status;
+    wrench_storage_ = phi::BufferAlloc(phi::BackendDeviceBufferType(backend_),
+        (frames + links) * sizeof(WrenchImpulse), &status);
+    if (!wrench_storage_) return status;
+    wrenches_.before = motion_before_.frames;
+    wrenches_.after = motion_after_.frames;
+    wrenches_.contact_impulses = static_cast<WrenchImpulse*>(phi::BufferBase(wrench_storage_));
+    wrenches_.transmitted_impulses = wrenches_.contact_impulses + frames;
+    wrenches_.gravity = gravity_;
+    wrenches_.interval = interval_;
+    wrenches_.env_count = env_count_;
+    wrenches_.links_per_env = cap.links_per_env;
+    wrenches_.bodies_per_env = cap.bodies_per_env;
+    wrenches_.articulations_per_env = cap.articulations_per_env;
+    wrenches_.slots_per_env = cap.max_contacts_per_env;
+    wrenches_.rigid_slots_per_env = cap.max_contacts_per_env -
+        static_cast<uint32_t>(particle_slots) - cap.mpm_contact_capacity_per_env;
+    wrenches_.rows_per_env = cap.max_rows_per_env;
+    return phi::Status::Ok;
+}
+
 phi::Status StateSensorBank::Add(const nk::Model& model, const StateSensorDesc& requested, uint32_t* id) {
     if (!id || !backend_ || !env_count_ || !(interval_ > 0.0) || !std::isfinite(interval_) ||
         !ValidStateSensorDesc(requested) || channels_.size() >= UINT32_MAX ||
@@ -143,6 +178,10 @@ phi::Status StateSensorBank::Add(const nk::Model& model, const StateSensorDesc& 
         if (type != phi::ArticulationJointType::Revolute && type != phi::ArticulationJointType::Prismatic)
             return phi::Status::InvalidArgument;
     }
+    if (desc.kind == StateSensorKind::ForceTorque &&
+        (desc.mount != StateSensorMount::Link || desc.index >= model.articulation.joint_type.size() ||
+         static_cast<phi::ArticulationJointType>(model.articulation.joint_type[desc.index]) ==
+             phi::ArticulationJointType::FloatingBase)) return phi::Status::InvalidArgument;
     const auto rotation = desc.local_offset.rotation;
     const double norm = std::sqrt(double{rotation.w} * rotation.w + double{rotation.x} * rotation.x +
         double{rotation.y} * rotation.y + double{rotation.z} * rotation.z);
@@ -154,9 +193,13 @@ phi::Status StateSensorBank::Add(const nk::Model& model, const StateSensorDesc& 
         return phi::Status::InvalidArgument;
     channels_.reserve(channels_.size() + 1u);
     before_.reserve(1u);
-    after_.reserve(channels_.size() + 3u);
+    after_.reserve(channels_.size() + 4u);
     auto status = AllocateMotion();
     if (status != phi::Status::Ok) return status;
+    if (desc.kind == StateSensorKind::ContactWrench || desc.kind == StateSensorKind::ForceTorque) {
+        status = AllocateWrenches(model);
+        if (status != phi::Status::Ok) return status;
+    }
     auto channel = std::make_unique<Channel>();
     auto& params = channel->params;
     params.desc = desc;
@@ -207,9 +250,24 @@ bool StateSensorBank::HasActive() const {
 void StateSensorBank::BuildCalls() {
     before_.clear();
     after_.clear();
+    wrenches_.link_contacts = wrenches_.body_contacts = wrenches_.joint_loads = 0u;
+    for (const auto& channel : channels_) {
+        auto& p = channel->params;
+        p.contact_impulses = wrenches_.contact_impulses;
+        p.transmitted_impulses = wrenches_.transmitted_impulses;
+        if (!channel->active) continue;
+        if (p.desc.kind == StateSensorKind::ForceTorque)
+            wrenches_.joint_loads = wrenches_.link_contacts = 1u;
+        if (p.desc.kind == StateSensorKind::ContactWrench) {
+            if (p.desc.mount == StateSensorMount::Body) wrenches_.body_contacts = 1u;
+            else wrenches_.link_contacts = 1u;
+        }
+    }
     if (HasActive()) {
         before_.push_back({phi::NkOp::ReadoutMotion, &motion_before_});
         after_.push_back({phi::NkOp::ReadoutMotion, &motion_after_});
+        if (wrenches_.link_contacts || wrenches_.body_contacts)
+            after_.push_back({phi::NkOp::ReadoutSensorWrenches, &wrenches_});
         for (const auto& channel : channels_)
             if (channel->active) after_.push_back({phi::NkOp::SampleStateSensor, &channel->params});
     }
@@ -233,6 +291,7 @@ phi::Status StateSensorBank::ConfigureError(uint32_t id, uint32_t component, con
 
 void StateSensorBank::SetGravity(math::Vec3 gravity) {
     gravity_ = gravity;
+    wrenches_.gravity = gravity;
     for (auto& channel : channels_) channel->params.gravity = gravity;
 }
 
@@ -271,6 +330,8 @@ const StateSensorDesc* StateSensorBank::Descriptor(uint32_t id) const { return i
 size_t StateSensorBank::StorageBytes() const {
     size_t bytes = clocks_ ? size_t{env_count_} * sizeof(double) + size_t{env_count_} *
         (motion_before_.links_per_env + motion_before_.bodies_per_env) * 2u * sizeof(MotionFrame) : 0u;
+    if (wrench_storage_) bytes += size_t{env_count_} *
+        (2ull * motion_before_.links_per_env + motion_before_.bodies_per_env) * sizeof(WrenchImpulse);
     for (const auto& channel : channels_) bytes += channel->bytes;
     return bytes;
 }

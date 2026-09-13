@@ -90,7 +90,7 @@ Options Parse(int argc, char** argv) {
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
-        options.state_sensors > 1u ||
+        options.state_sensors > 2u ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
         uint64_t{options.steps} + options.warmup > std::numeric_limits<uint32_t>::max() ||
         (options.execution != "eager" && options.execution != "graph"))
@@ -163,6 +163,12 @@ void AttachStateSensors(nk::World& world, const Options& options) {
             desc.kind = nuka::sensor::StateSensorKind::JointState;
             desc.index = link;
             fixture::Require(world.AttachStateSensor(desc, &id) == phi::Status::Ok, "joint sensor attachment failed");
+            if (options.state_sensors >= 2u) {
+                desc.kind = nuka::sensor::StateSensorKind::ForceTorque;
+                fixture::Require(world.AttachStateSensor(desc, &id) == phi::Status::Ok, "load sensor attachment failed");
+                desc.kind = nuka::sensor::StateSensorKind::ContactWrench;
+                fixture::Require(world.AttachStateSensor(desc, &id) == phi::Status::Ok, "contact sensor attachment failed");
+            }
             break;
         }
     }
@@ -909,7 +915,9 @@ Json Run(const Options& options) {
     sensors.Set("count", Json::Int(world.StateSensors().Count()));
     sensors.Set("timed_replay_bit_equal", Json::Bool(timed_sensors == replay_sensors));
     sensors.Set("state_fnv1a64", Json::Str(Digest(replay_sensors)));
-    sensors.Set("scope", Json::Str("IMU, pose and velocity per base; encoder on each articulation's first scalar joint"));
+    sensors.Set("scope", Json::Str(options.state_sensors >= 2u ?
+        "IMU, pose and velocity per base; encoder, contact wrench and F/T on each articulation's first scalar joint" :
+        "IMU, pose and velocity per base; encoder on each articulation's first scalar joint"));
     sensors.Set("update_period", Json::Int(1));
     sensors.Set("noise_density", Json::Float(0.01));
     sensors.Set("initial_bias_stddev", Json::Float(0.02));
