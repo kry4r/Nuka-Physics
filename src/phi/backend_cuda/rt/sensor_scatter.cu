@@ -121,7 +121,8 @@ __global__ void ScatterEnvInstancesKernel(ScatterFkSource fk,
                                           uint32_t env_count,
                                           uint32_t instances_per_env,
                                           DevInstance* __restrict__ out_instances,
-                                          AABB* __restrict__ out_world_aabbs) {
+                                          AABB* __restrict__ out_world_aabbs,
+                                          uint32_t blas_refs_per_env) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * instances_per_env;
     if (i >= total) return;
@@ -129,7 +130,7 @@ __global__ void ScatterEnvInstancesKernel(ScatterFkSource fk,
     const uint32_t local = i % instances_per_env;
 
     const InstanceScatterRow row = rows[local];
-    const SensorBlasRef ref = blas_refs[blas_id[local]];
+    const SensorBlasRef ref = blas_refs[env * blas_refs_per_env + blas_id[local]];
 
     // cached_visual_local as plain floats (pos3 + quat w,x,y,z) -- the SAME bytes
     // math::Transform carries (pos.xyz, rot.wxyz).
@@ -242,7 +243,8 @@ void ScatterEnvInstances(cudaStream_t stream,
                          uint32_t env_count,
                          uint32_t instances_per_env,
                          DevInstance* out_instances,
-                         collision::AABB* out_world_aabbs) {
+                         collision::AABB* out_world_aabbs,
+                         uint32_t blas_refs_per_env) {
     const uint32_t total = env_count * instances_per_env;
     if (total == 0u) return;
     const uint32_t kBlock = 128u;
@@ -250,7 +252,7 @@ void ScatterEnvInstances(cudaStream_t stream,
     phi::LaunchCuda(ScatterEnvInstancesKernel, dim3(grid), dim3(kBlock), 0u, stream,
                     fk, device_rows, device_blas_id, device_material_id,
                     device_blas_refs, env_count, instances_per_env, out_instances,
-                    out_world_aabbs);
+                    out_world_aabbs, blas_refs_per_env);
 }
 
 void ScatterEnvCameras(cudaStream_t stream,
@@ -288,7 +290,7 @@ std::vector<SensorMountRow> BuildSensorMountRows(
     rows.reserve(sensors.size());
     for (const scene::SensorDesc& s : sensors) {
         SensorMountRow r;
-        r.kind = static_cast<uint32_t>(s.mount) + 1u;  // Link=1, Body=2, Base=3
+        r.kind = s.mount == scene::MountFrame::World ? 0u : static_cast<uint32_t>(s.mount) + 1u;
         r.row = s.mount_index;
         r.local_offset[0] = s.local_offset.position.x;
         r.local_offset[1] = s.local_offset.position.y;

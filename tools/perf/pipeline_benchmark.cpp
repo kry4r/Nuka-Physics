@@ -509,7 +509,8 @@ Json IslandWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
 
 class PipelineSensor {
 public:
-    PipelineSensor(const fixture::PreparedScene& prepared, const Options& options) : options_(options) {
+    PipelineSensor(nk::World& physics, const fixture::PreparedScene& prepared,
+                    const Options& options) : options_(options) {
         auto scene = fixture::RobotScene(prepared.path, true);
         nuka::scene::cook::CookToModelOptions cook_options;
         cook_options.contact_family = nuka::scene::cook::CookContactFamily::PairDriven;
@@ -530,6 +531,17 @@ public:
             desc.blas_id.push_back(instance.mesh_id);
             desc.material_id.push_back(instance.render_material_id < world.materials.size()
                 ? instance.render_material_id : static_cast<uint32_t>(desc.scene.materials.size() - 1u));
+        }
+        desc.particles = {static_cast<const nuka::math::Vec3*>(physics.FieldPtr(nk::FieldId::ParticlePos)),
+            physics.GetModel().capacities.particles_per_env, physics.EnvCount()};
+        const auto& particles = physics.GetModel().particles;
+        for (const auto& info : particles.surface_info) {
+            nuka::rt::ParticleSurfaceBinding surface;
+            const auto first = particles.surface_triangles.begin() + 3u * info.triangle_offset;
+            surface.triangle_particles.assign(first, first + 3u * info.triangle_count);
+            for (auto& vertex : surface.triangle_particles) vertex += info.vertex_offset;
+            nuka::render::AppendParticleSurface(desc, std::move(surface),
+                static_cast<uint32_t>(desc.scene.materials.size() - 1u));
         }
         for (uint32_t camera = 0u; camera < options_.render_sensors; ++camera) {
             nuka::scene::SensorDesc sensor;
@@ -606,7 +618,7 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     size_t free_before = 0u, total_bytes = 0u;
     CheckCuda(cudaMemGetInfo(&free_before, &total_bytes));
     const auto create_start = Clock::now();
-    PipelineSensor renderer(prepared, options);
+    PipelineSensor renderer(world, prepared, options);
     const double creation_ms = Milliseconds(create_start);
     fixture::Require(world.Reset() == phi::Status::Ok, "render replay reset failed");
     for (uint32_t i = 0u; i < options.warmup; ++i) Step(world, options);
@@ -686,8 +698,8 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     config.Set("seed", Json::Int(options.seed));
     config.Set("warmup_frames", Json::Int(options.render_warmup));
     result.Set("config", std::move(config));
-    result.Set("geometry_scope", Json::Str("authored rigid visuals on the public batched sensor path; deforming particle surfaces are not supported by this path"));
-    result.Set("boundary", Json::Str("physics-to-sensor uses live per-step poses; render-only repeats its final world; both complete all AOVs on device; output download is untimed"));
+    result.Set("geometry_scope", Json::Str("authored rigid visuals and fixed-topology particle surfaces from the physical model on the public batched sensor path"));
+    result.Set("boundary", Json::Str("physics-to-sensor uses live per-step poses and particle positions; render-only repeats its final world; both complete all AOVs on device; output download is untimed"));
     result.Set("output_layout", Json::Str("env-camera-major color f32x3, depth f32, normal f32x3, albedo f32x3, prim u32"));
     result.Set("output_fnv1a64", Json::Str(Digest(output)));
     result.Set("hit_pixels", Json::Int(hits));

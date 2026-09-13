@@ -39,11 +39,13 @@
 #include "phi/interop_scatter.hpp"  // phi::ScatterFkSource / InstanceScatterRow (CUDA-free)
 #include "rt/render_dr.hpp"         // rt::RenderDrConfig (CUDA-free per-env DR POD)
 #include "rt/sensor_fidelity.hpp"   // rt::SensorFidelityConfig (CUDA-free shade POD)
+#include "rt/particle_surface.hpp"
 #include "rt/two_level_render.hpp"  // rt::TwoLevelScene (CUDA-free scene-desc POD)
 #include "scene/scene_ir.hpp"       // scene::SensorDesc (CUDA-free)
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace nuka::render {
@@ -64,7 +66,23 @@ struct SensorSceneDesc {
     std::vector<uint32_t>                 blas_id;
     std::vector<uint32_t>                 material_id;
     std::vector<scene::SensorDesc>        sensors;  // mount/intrinsics per sensor
+    rt::ParticlePositionSource           particles;
+    std::vector<rt::ParticleSurfaceBinding> particle_surfaces;
 };
+
+inline void AppendParticleSurface(SensorSceneDesc& desc, rt::ParticleSurfaceBinding surface,
+                                   uint32_t material_id) {
+    surface.mesh_id = static_cast<uint32_t>(desc.scene.meshes.size());
+    desc.scene.meshes.emplace_back();
+    rt::Instance instance;
+    instance.blas_id = surface.mesh_id;
+    instance.material_id = material_id;
+    desc.scene.instances.push_back(instance);
+    desc.rows.emplace_back();
+    desc.blas_id.push_back(surface.mesh_id);
+    desc.material_id.push_back(material_id);
+    desc.particle_surfaces.push_back(std::move(surface));
+}
 
 // The device AOV tensor's logical shape after a render: an (env_count,
 // sensors_per_env, height, width, channels) view (S cameras per env, env-major).

@@ -54,6 +54,8 @@ public:
         cuda_desc.rows = desc.rows;
         cuda_desc.blas_id = desc.blas_id;
         cuda_desc.material_id = desc.material_id;
+        cuda_desc.particles = desc.particles;
+        cuda_desc.particle_surfaces = desc.particle_surfaces;
 
         // Split the type-tagged mount list: cameras and lidars ride the SAME scene/
         // TLAS but their own mount tables (one range trace, one AOV trace).

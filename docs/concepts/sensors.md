@@ -122,4 +122,14 @@ Random sequences use the seed, channel, element and that environment's acquisiti
 
 Observation views retain their addresses across configuration, acquisition, reset and checkpoint restoration. They are valid while the world owns their storage. All configuration values must be finite; deviations, densities, quantization and time constants must be nonnegative, with a positive correlation time for an enabled correlated bias.
 
-Camera and lidar attachment APIs remain separate. Camera sensor rendering currently omits deformable surfaces that the offline beauty renderer displays.
+## Cameras and lidar
+
+Camera and lidar attachment APIs use the same scene geometry and ray traversal. Articulated links, rigid bodies, and fixed-topology particle surfaces are visible: XPBD cloth and tetrahedral soft bodies update from each environment's live particle positions before tracing. A scene containing only one surface or one rigid instance is supported.
+
+Use `nuka.SensorMount.WORLD.value` for a fixed camera or lidar: `local_offset` is its world pose and `mount_index` is ignored. This also works in particle-only scenes without a rigid body or articulation. NKS sensor records use `"mount": "world"`. Mounted state sensors continue to require a body or articulation link.
+
+Particle surfaces retain their authored material and render skin. `skin_smooth_iters` and `skin_smooth_lambda` relax the render vertices before recomputing area-weighted smooth normals; `skin_normal_offset` offsets those vertices in meters along the normals. These settings change the observed surface without changing physical particle positions. Topology and adjacency are uploaded once; deformed vertices and acceleration structures stay on the device. Camera and lidar observations follow selective environment resets and NKS media roundtrips.
+
+Camera depth is distance along the center ray, in meters, rather than optical-axis Z depth. Normal, albedo and primitive ID also use that center ray; color integrates the configured shading samples. Lidar range uses its beam ray, with the configured maximum range for a miss. Equal camera and lidar rays therefore measure the same surface distance. Monte Carlo color samples depend on the global camera index as well as the configured seed; comparing a batched tile with a standalone camera requires matching those sample indices.
+
+These image and range views are ideal geometric observations. Mounted scalar error configuration does not apply photon/readout noise, material-dependent range errors, rolling shutter or scan timing to them. MLS-MPM density surfaces, individual grains and PBF fluid surfaces are not yet included in camera/lidar rendering.

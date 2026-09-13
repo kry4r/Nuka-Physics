@@ -1,24 +1,8 @@
-// ---------------------------------------------------------------------------
-// Device-resident batched camera sensor over the C ABI: attach a camera to an
-// N-env world, step, render every env into ONE device AOV tensor, read it back
-// zero-copy via nuka_world_get_sensor_view. The in-the-loop obs surface a
-// training stack consumes with torch.from_dlpack (no host download).
-//
-// Gates (all through the public C ABI, no internal headers):
-//  (1) attach + render + view round-trip: the color view is a DEVICE pointer with
-//      the (env_count*height*width*3) float layout the caller reshapes to
-//      (N,H,W,3); finite; non-empty geometry (the robot is visible -- PRIM has
-//      hits, not an all-background image).
-//  (2) batched correctness: every env renders the SAME articulation at the SAME
-//      mount, so the per-env tiles are BYTE-IDENTICAL across the N per-env TLASes
-//      (the batched single-launch render is consistent env-to-env).
-//  (3) determinism: two renders of the same stepped world are byte-identical.
-//  (4) lifecycle: get_sensor_view before any render is NOT_SUPPORTED; attach is
-//      re-callable; the view dtypes match (color/depth/normal/albedo float32,
-//      prim uint32).
-// ---------------------------------------------------------------------------
+// Camera and lidar observations through the public C ABI, including live geometry,
+// batched device views, deterministic rendering and environment reset.
 
 #include "nuka/nuka.h"
+#include "nuka/nuka_scene.h"
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -59,6 +43,11 @@ struct WorldGuard {
     ~WorldGuard() {
         if (handle != nullptr) nuka_world_destroy(handle);
     }
+};
+
+struct SceneGuard {
+    nuka_scene_handle handle = nuka_scene_create(nullptr);
+    ~SceneGuard() { if (handle) nuka_scene_destroy(handle); }
 };
 
 nuka_result_t CreateWorld(nuka_device_handle device, uint32_t env_count,
@@ -294,4 +283,74 @@ TEST(CameraSensor, LifecycleAndChannels) {
         EXPECT_TRUE(IsDevicePointer(v.device_ptr));
     }
     std::printf("[diag] (4) lifecycle + all 5 channels resolve (re-attach OK)\n");
+}
+
+TEST(CameraSensor, ParticleSurfaceWorldMountGraphAndReset) {
+    DeviceGuard device;
+    SceneGuard scene;
+    ASSERT_NE(device.handle, nullptr);
+    ASSERT_NE(scene.handle, nullptr);
+    nuka_media_desc_t cloth{};
+    cloth.kind = NUKA_MEDIA_CLOTH;
+    cloth.method = NUKA_MEDIA_METHOD_XPBD;
+    cloth.cloth_nx = cloth.cloth_ny = 3u;
+    cloth.cloth_spacing = 0.1f;
+    cloth.cloth_origin[2] = 0.5f;
+    cloth.cloth_free = 1u;
+    cloth.xpbd_particle_mass = 0.02f;
+    cloth.xpbd_iters = 8u;
+    cloth.skin_normal_offset = 0.007f;
+    cloth.skin_smooth_iters = 2u;
+    cloth.skin_smooth_lambda = 0.2f;
+    cloth.render_material_id = ~0u;
+    uint32_t media = ~0u;
+    ASSERT_EQ(nuka_scene_add_media(scene.handle, &cloth, &media), NUKA_RESULT_OK);
+    nuka_world_desc_t config{};
+    config.env_count = 2u;
+    config.fixed_dt = 0.001f;
+    WorldGuard world;
+    ASSERT_EQ(nuka_world_create_from_built_scene(device.handle, &config, scene.handle, nullptr,
+                                                 &world.handle), NUKA_RESULT_OK);
+    const float camera[7] = {0, 0, 2, 1, 0, 0, 0};
+    ASSERT_EQ(nuka_world_attach_camera_sensor(world.handle, NUKA_SENSOR_MOUNT_WORLD, 0u,
+                                               camera, 30.0f, 33u, 33u), NUKA_RESULT_OK);
+    const float q = std::sqrt(0.5f), lidar[7] = {0, 0, 2, q, 0, q, 0};
+    ASSERT_EQ(nuka_world_attach_lidar_sensor(world.handle, NUKA_SENSOR_MOUNT_WORLD, 0u,
+        lidar, 1u, 1u, 0, 0, 0, 0, 0, 10.0f), NUKA_RESULT_OK);
+    std::vector<float> depth;
+    uint32_t render_index = 0u;
+    auto render = [&]() {
+        SCOPED_TRACE(::testing::Message() << "render " << render_index++);
+        ASSERT_EQ(nuka_world_render_sensors(world.handle), NUKA_RESULT_OK);
+        nuka_buffer_view_t d{}, r{};
+        ASSERT_EQ(nuka_world_get_sensor_view(world.handle, NUKA_SENSOR_CHANNEL_DEPTH, &d), NUKA_RESULT_OK);
+        ASSERT_EQ(nuka_world_get_sensor_view(world.handle, NUKA_SENSOR_CHANNEL_RANGE, &r), NUKA_RESULT_OK);
+        depth = DownloadFloat(d);
+        const auto range = DownloadFloat(r);
+        ASSERT_EQ(depth.size(), 2u * 33u * 33u);
+        ASSERT_EQ(range.size(), 2u);
+        for (uint32_t env = 0; env < 2u; ++env) {
+            SCOPED_TRACE(::testing::Message() << "environment " << env);
+            EXPECT_NEAR(range[env], depth[env * 33u * 33u + 16u * 33u + 16u], 2.0e-6f);
+        }
+    };
+    render();
+    ASSERT_EQ(depth.size(), 2u * 33u * 33u);
+    const auto initial = depth;
+    for (uint32_t env = 0; env < 2u; ++env)
+        EXPECT_NEAR(initial[env * 33u * 33u + 16u * 33u + 16u], 1.493f, 2.0e-6f);
+    ASSERT_EQ(nuka_world_set_execution_mode(world.handle, NUKA_EXECUTION_GRAPH), NUKA_RESULT_OK);
+    ASSERT_EQ(nuka_world_step_n(world.handle, 8u), NUKA_RESULT_OK);
+    render();
+    const auto moved = depth;
+    for (uint32_t env = 0; env < 2u; ++env)
+        EXPECT_NEAR(moved[env * 33u * 33u + 16u * 33u + 16u],
+                    1.493f + 9.81f * 0.001f * 0.001f * 36.0f, 3.0e-6f);
+    for (uint32_t frame = 0; frame < 34u; ++frame) render();
+    EXPECT_EQ(depth, moved);
+    const uint32_t reset_env = 1u;
+    ASSERT_EQ(nuka_world_reset_envs(world.handle, &reset_env, 1u), NUKA_RESULT_OK);
+    render();
+    EXPECT_EQ(depth[16u * 33u + 16u], moved[16u * 33u + 16u]);
+    EXPECT_EQ(depth[33u * 33u + 16u * 33u + 16u], initial[33u * 33u + 16u * 33u + 16u]);
 }

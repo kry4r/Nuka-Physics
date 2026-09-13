@@ -24,6 +24,7 @@
 #include "phi/interop_scatter.hpp"  // ScatterFkSource / InstanceScatterRow
 #include "rt/camera.hpp"
 #include "rt/material.hpp"
+#include "rt/particle_surface.hpp"
 #include "rt/render_dr.hpp"          // RenderDrConfig (per-env appearance DR)
 #include "rt/sensor_fidelity.hpp"    // SensorFidelityConfig (opt-in beauty shade)
 #include "rt/two_level_render.hpp"  // TwoLevelScene / TwoLevelSceneDevice
@@ -83,6 +84,8 @@ struct BatchedSensorSceneDesc {
     std::vector<phi::InstanceScatterRow> rows;
     std::vector<uint32_t> blas_id;
     std::vector<uint32_t> material_id;
+    ParticlePositionSource particles;
+    std::vector<ParticleSurfaceBinding> particle_surfaces;
 };
 
 // Build the persistent batched sensor scene: BLAS once + the env-shared binding

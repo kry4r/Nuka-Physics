@@ -99,6 +99,33 @@ constexpr uint32_t kLeavesPerEnv = 37u;  // odd, > one block boundary friendline
 
 }  // namespace
 
+TEST(LbvhBatched, SingleLeafBuildAndRefitInitializeEachEnvironment) {
+    DeviceScratch scratch(kEnvCount, 1u);
+    NK_CUDA_OK(cudaMemset(scratch.nodes, 0x7f, kEnvCount * sizeof(cg::LbvhNode)));
+    std::vector<AABB> bounds(kEnvCount);
+    for (uint32_t pass = 0u; pass < 2u; ++pass) {
+        for (uint32_t env = 0u; env < kEnvCount; ++env)
+            bounds[env] = MakeEnvAabbs(1u, env + pass * kEnvCount).front();
+        NK_CUDA_OK(cudaMemcpy(scratch.aabbs, bounds.data(), bounds.size() * sizeof(AABB),
+                              cudaMemcpyHostToDevice));
+        if (pass == 0u) {
+            NK_CUDA_OK(cg::BuildLbvhBatchedNodes(nullptr, 0, scratch.aabbs, kEnvCount, 1u,
+                scratch.nodes, nullptr, nullptr, nullptr, nullptr, nullptr, 0u));
+        } else {
+            cg::RefitLbvhBatched(nullptr, 0, scratch.nodes, scratch.aabbs, kEnvCount, 1u, nullptr);
+        }
+        NK_CUDA_OK(cudaDeviceSynchronize());
+        const auto nodes = DownloadNodes(scratch.nodes, kEnvCount);
+        for (uint32_t env = 0u; env < kEnvCount; ++env) {
+            SCOPED_TRACE(::testing::Message() << "pass " << pass << ", environment " << env);
+            EXPECT_EQ(nodes[env].left, 0);
+            EXPECT_EQ(nodes[env].right, -1);
+            EXPECT_EQ(nodes[env].parent, -1);
+            EXPECT_EQ(std::memcmp(&nodes[env].aabb, &bounds[env], sizeof(AABB)), 0);
+        }
+    }
+}
+
 // One batched build over E envs == E independent single-env builds, byte-exact
 // per env (the cross-env u64 sort never mixes envs).
 TEST(LbvhBatched, BatchedBuildEqualsIndependentBuilds) {

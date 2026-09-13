@@ -128,7 +128,7 @@ __global__ void EnvInitNodesKernel(Src src,
         return;
     }
     const uint32_t lane = idx - internal;
-    const uint32_t local_leaf = sorted_index[bbase + lane];  // env-local id
+    const uint32_t local_leaf = sorted_index ? sorted_index[bbase + lane] : lane;
     LbvhNode leaf;
     leaf.left = static_cast<int32_t>(local_leaf);
     leaf.right = -1;
@@ -246,11 +246,16 @@ inline cudaError_t BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
                                       void* workspace, size_t workspace_bytes) {
     const uint32_t E = env_count;
     const uint32_t N = leaves_per_env;
-    if (E == 0u || N < 2u) return cudaSuccess;
+    if (E == 0u || N == 0u) return cudaSuccess;
     const uint64_t count = uint64_t{E} * N;
     if (E > 65535u || count > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
         uint64_t{E} * (uint64_t{N} * 2u - 1u) > std::numeric_limits<uint32_t>::max())
         return cudaErrorInvalidValue;
+    if (N == 1u) {
+        EnvInitNodesKernel<Src><<<dim3(1u, E), dim3(kBlockSize), 0, stream>>>(
+            src, nullptr, N, out_nodes);
+        return cudaGetLastError();
+    }
     const LbvhWorkspaceLayout layout(static_cast<uint32_t>(count));
     if (workspace == nullptr || workspace_bytes <= layout.temp_offset)
         return cudaErrorInvalidValue;
@@ -295,7 +300,11 @@ inline void RefitLbvhBatchedImpl(cudaStream_t stream, LbvhNode* nodes, Src src,
                                  uint32_t* visit) {
     const uint32_t E = env_count;
     const uint32_t N = leaves_per_env;
-    if (E == 0u || N < 2u) return;
+    if (E == 0u || N == 0u) return;
+    if (N == 1u) {
+        EnvRefitLeavesKernel<Src><<<dim3(1u, E), dim3(kBlockSize), 0, stream>>>(src, N, nodes);
+        return;
+    }
     {
         const uint32_t n = E * N;
         const uint32_t b = (n + kBlockSize - 1u) / kBlockSize;

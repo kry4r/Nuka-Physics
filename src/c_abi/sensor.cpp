@@ -49,18 +49,15 @@ namespace cook = nuka::scene::cook;
 
 // Lower the world's cooked scene to the env-shared sensor binding: RenderWorld ->
 // TwoLevelScene + per-instance rows/blas_id/material_id. False if no geometry.
-bool BuildSensorSceneDesc(const nuka::scene::SceneIR& scene, uint32_t env_count,
-                          nuka::render::SensorSceneDesc* out) {
+bool BuildSensorSceneDesc(const WorldRecord& record, nuka::render::SensorSceneDesc* out) {
+    const auto& scene = *record.scene;
+    const uint32_t env_count = record.world->EnvCount();
     // Cook to recover the EntityId<->row SceneMap (the binding render needs), at
     // the world's env_count so pose-source rows index the live arena.
     const cook::CookToModelResult cooked =
         cook::CookToModel(scene, static_cast<int>(env_count));
     const nuka::render::RenderWorld rw =
         nuka::render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
-    if (rw.instances.empty()) {
-        return false;
-    }
-
     out->scene = nuka::render::RenderWorldToTwoLevelScene(rw);
     // TwoLevelScene appends a neutral default after rw.materials; an out-of-range
     // render_material_id resolves to that last slot (same as the adapter's).
@@ -90,7 +87,21 @@ bool BuildSensorSceneDesc(const nuka::scene::SceneIR& scene, uint32_t env_count,
                                        ? inst.render_material_id
                                        : default_mat_id);
     }
-    return true;
+    out->particles.positions = static_cast<const nuka::math::Vec3*>(
+        record.world->FieldPtr(nuka::nk::FieldId::ParticlePos));
+    out->particles.particles_per_env = record.world->GetModel().capacities.particles_per_env;
+    out->particles.env_count = env_count;
+    for (const auto& topology : record.particle_surfaces) {
+        if (topology.triangles.empty()) continue;
+        nuka::rt::ParticleSurfaceBinding surface;
+        surface.triangle_particles = topology.triangles;
+        surface.normal_offset = topology.normal_offset;
+        surface.smooth_iters = topology.smooth_iters;
+        surface.smooth_lambda = topology.smooth_lambda;
+        nuka::render::AppendParticleSurface(*out, std::move(surface),
+            topology.render_material_id < mat_count ? topology.render_material_id : default_mat_id);
+    }
+    return !out->rows.empty();
 }
 
 // Lower the c_abi mount enum + offset to one camera's SensorDesc (one row of the
@@ -102,7 +113,7 @@ nuka::scene::SensorDesc MakeCameraSensorDesc(nuka_sensor_mount_t mount_frame,
                                              uint32_t height) {
     nuka::scene::SensorDesc s;
     s.type = nuka::scene::SensorType::Camera;
-    s.mount = static_cast<nuka::scene::MountFrame>(mount_frame);  // 0=Link,1=Body,2=Base.
+    s.mount = static_cast<nuka::scene::MountFrame>(mount_frame);
     s.mount_index = mount_index;
     if (local_offset != nullptr) {
         s.local_offset.position.x = local_offset[0];
@@ -131,7 +142,7 @@ nuka::scene::SensorDesc MakeLidarSensorDesc(nuka_sensor_mount_t mount_frame,
                                             float max_range) {
     nuka::scene::SensorDesc s;
     s.type = nuka::scene::SensorType::Lidar;
-    s.mount = static_cast<nuka::scene::MountFrame>(mount_frame);  // 0=Link,1=Body,2=Base.
+    s.mount = static_cast<nuka::scene::MountFrame>(mount_frame);
     s.mount_index = mount_index;
     if (local_offset != nullptr) {
         s.local_offset.position.x = local_offset[0];
@@ -181,7 +192,7 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
                                               float vfov_deg,
                                               uint32_t width,
                                               uint32_t height) {
-    if (mount_frame > NUKA_SENSOR_MOUNT_BASE) {
+    if (static_cast<uint32_t>(mount_frame) > NUKA_SENSOR_MOUNT_WORLD) {
         return NUKA_RESULT_INVALID_ARG;
     }
     if (width == 0u || height == 0u || vfov_deg <= 0.0f) {
@@ -205,8 +216,7 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         }
 
         nuka::render::SensorSceneDesc desc;
-        if (!nuka::c_abi::BuildSensorSceneDesc(*record->scene, record->world->EnvCount(),
-                                               &desc)) {
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &desc)) {
             return NUKA_RESULT_NOT_SUPPORTED;  // scene has no renderable geometry.
         }
 
@@ -299,7 +309,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
                                              float el_max,
                                              float min_range,
                                              float max_range) {
-    if (mount_frame > NUKA_SENSOR_MOUNT_BASE) {
+    if (static_cast<uint32_t>(mount_frame) > NUKA_SENSOR_MOUNT_WORLD) {
         return NUKA_RESULT_INVALID_ARG;
     }
     if (az_count == 0u || el_count == 0u || max_range <= 0.0f ||
@@ -322,8 +332,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
         }
 
         nuka::render::SensorSceneDesc desc;
-        if (!nuka::c_abi::BuildSensorSceneDesc(*record->scene, record->world->EnvCount(),
-                                               &desc)) {
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &desc)) {
             return NUKA_RESULT_NOT_SUPPORTED;  // scene has no renderable geometry.
         }
 
@@ -668,8 +677,7 @@ nuka_result_t nuka_world_set_camera_intrinsics(
         // Apply the lens knobs onto every stored camera (width/height/vfov/mount
         // unchanged) and rebuild the sensor scene from the SAME cooked binding.
         nuka::render::SensorSceneDesc rebuilt;
-        if (!nuka::c_abi::BuildSensorSceneDesc(*record->scene,
-                                               record->world->EnvCount(), &rebuilt)) {
+        if (!nuka::c_abi::BuildSensorSceneDesc(*record, &rebuilt)) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }
         rebuilt.sensors = s.sensors;

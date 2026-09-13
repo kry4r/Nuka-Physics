@@ -60,12 +60,12 @@ enum class SensorType : uint8_t {
     LinearVelocity
 };
 
-// Which device FK pose a sensor mounts on; maps to FieldId::{LinkPose,BodyPose,
-// BasePose} at runtime. mount_index selects the row within that field.
+// Link/Body/Base select a live pose row; World uses local_offset as a world pose.
 enum class MountFrame : uint8_t {
     Link,
     Body,
-    Base
+    Base,
+    World
 };
 
 enum class LightType : uint8_t {
