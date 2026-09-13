@@ -259,6 +259,17 @@ phi::Status HashHostState(uint64_t* hash, const WorldRecord& record) {
         HashValue(hash, d.temperature);
         HashValue(hash, d.seed);
         for (const auto& error : d.errors) HashObservationConfig(hash, error);
+        if (sensor::IsContactRegionSensor(d.kind)) {
+            const auto& tactile = d.tactile;
+            HashValue(hash, static_cast<uint32_t>(tactile.shape));
+            HashValue(hash, tactile.size.x);
+            HashValue(hash, tactile.size.y);
+            HashValue(hash, tactile.size.z);
+            HashValue(hash, tactile.spread_fraction);
+            HashValue(hash, tactile.spread_sigma);
+            HashValue(hash, tactile.hysteresis_strength);
+            HashValue(hash, tactile.hysteresis_time);
+        }
         HashBytes(hash, sensor.bytes.data(), sensor.bytes.size());
     }
     const uint8_t mode = static_cast<uint8_t>(record.control_mode);
@@ -428,7 +439,7 @@ nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash)
             return NUKA_RESULT_INTERNAL;
         }
         uint64_t hash = nuka::c_abi::kFnvOffset;
-        constexpr char domain[] = "NukaStateHashV4";
+        constexpr char domain[] = "NukaStateHashV5";
         nuka::c_abi::HashBytes(&hash, domain, sizeof(domain));
         const auto status = nuka::c_abi::HashHostState(&hash, *record);
         if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);

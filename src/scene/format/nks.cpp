@@ -135,6 +135,7 @@ const char* SensorTypeName(SensorType t) {
         case SensorType::Lidar:       return "lidar";
         case SensorType::RangeScan:   return "range_scan";
         case SensorType::LinearVelocity: return "linear_velocity";
+        case SensorType::Tactile: return "tactile";
     }
     return "imu";
 }
@@ -149,6 +150,7 @@ SensorType SensorTypeFromName(const std::string& s) {
     if (s == "lidar") return SensorType::Lidar;
     if (s == "range_scan") return SensorType::RangeScan;
     if (s == "linear_velocity") return SensorType::LinearVelocity;
+    if (s == "tactile") return SensorType::Tactile;
     return SensorType::Imu;
 }
 
@@ -469,8 +471,26 @@ Value SaveActuator(const ActuatorRecord& a) {
     return o;
 }
 
-// Legacy keys (attached_body=mount_index, local) plus additive mount/camera/lidar
-// payloads emitted only when non-default, so an Imu sensor's bytes are unchanged.
+const char* ContactRegionName(sensor::ContactRegionShape shape) {
+    switch (shape) {
+        case sensor::ContactRegionShape::Box: return "box";
+        case sensor::ContactRegionShape::Sphere: return "sphere";
+        case sensor::ContactRegionShape::Ellipsoid: return "ellipsoid";
+        case sensor::ContactRegionShape::Capsule: return "capsule";
+        case sensor::ContactRegionShape::Cylinder: return "cylinder";
+    }
+    throw std::runtime_error("invalid contact sensor region shape");
+}
+
+sensor::ContactRegionShape ContactRegionFromName(const std::string& name) {
+    if (name == "box") return sensor::ContactRegionShape::Box;
+    if (name == "sphere") return sensor::ContactRegionShape::Sphere;
+    if (name == "ellipsoid") return sensor::ContactRegionShape::Ellipsoid;
+    if (name == "capsule") return sensor::ContactRegionShape::Capsule;
+    if (name == "cylinder") return sensor::ContactRegionShape::Cylinder;
+    throw std::runtime_error("invalid contact sensor region shape: " + name);
+}
+
 Value SaveSensor(const SensorDesc& s) {
     Value o = Value::Object();
     o.Set("name", Value::Str(s.name));
@@ -487,6 +507,16 @@ Value SaveSensor(const SensorDesc& s) {
     }
     if (s.aov_mask != 0u) {
         o.Set("aov_mask", Value::Int(static_cast<int64_t>(s.aov_mask)));
+    }
+    if (s.type == SensorType::Contact || s.type == SensorType::Tactile) {
+        Value t = Value::Object();
+        t.Set("shape", Value::Str(ContactRegionName(s.tactile.shape)));
+        t.Set("size", Vec3Json(s.tactile.size));
+        t.Set("spread_fraction", Value::Float(s.tactile.spread_fraction));
+        t.Set("spread_sigma", Value::Float(s.tactile.spread_sigma));
+        t.Set("hysteresis_strength", Value::Float(s.tactile.hysteresis_strength));
+        t.Set("hysteresis_time", Value::Float(s.tactile.hysteresis_time));
+        o.Set("tactile", std::move(t));
     }
     if (s.type == SensorType::Camera || s.type == SensorType::Depth) {
         Value c = Value::Object();
@@ -1454,6 +1484,14 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             }
             if (const Value* am = s.Find("aov_mask")) {
                 rec.aov_mask = static_cast<uint32_t>(am->AsInt());
+            }
+            if (const Value* t = s.Find("tactile")) {
+                rec.tactile.shape = ContactRegionFromName(t->At("shape").AsString());
+                rec.tactile.size = Vec3FromJson(t->At("size"));
+                if (const Value* v = t->Find("spread_fraction")) rec.tactile.spread_fraction = v->AsFloat();
+                if (const Value* v = t->Find("spread_sigma")) rec.tactile.spread_sigma = v->AsFloat();
+                if (const Value* v = t->Find("hysteresis_strength")) rec.tactile.hysteresis_strength = v->AsFloat();
+                if (const Value* v = t->Find("hysteresis_time")) rec.tactile.hysteresis_time = v->AsFloat();
             }
             if (const Value* c = s.Find("camera")) {
                 rec.cam.width = static_cast<uint16_t>(c->At("width").AsInt());

@@ -1237,6 +1237,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             case SensorType::JointState: desc.kind = ::nuka::sensor::StateSensorKind::JointState; break;
             case SensorType::LinearVelocity: desc.kind = ::nuka::sensor::StateSensorKind::LinearVelocity; break;
             case SensorType::ForceTorque: desc.kind = ::nuka::sensor::StateSensorKind::ForceTorque; break;
+            case SensorType::Contact: desc.kind = ::nuka::sensor::StateSensorKind::Touch; break;
+            case SensorType::Tactile: desc.kind = ::nuka::sensor::StateSensorKind::Tactile; break;
             default: continue;
         }
         desc.mount = static_cast<::nuka::sensor::StateSensorMount>(sensor.mount);
@@ -1256,6 +1258,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             } else desc.index = binding->body_row;
         }
         desc.local_offset = sensor.local_offset;
+        desc.tactile = sensor.tactile;
         desc.update_period = sensor.update_period;
         if (!std::isfinite(sensor.sample_rate_hz) || sensor.sample_rate_hz < 0.0f)
             throw std::runtime_error("sensor sample rate must be finite and nonnegative");

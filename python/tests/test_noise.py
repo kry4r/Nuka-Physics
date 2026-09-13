@@ -197,16 +197,22 @@ def test_sensor_noise_non_float_stride_field_rejected(device):
 
 
 @pytest.mark.parametrize("kind", [nuka.StateSensorKind.IMU, nuka.StateSensorKind.CONTACT_WRENCH,
-                                 nuka.StateSensorKind.FORCE_TORQUE])
+                                 nuka.StateSensorKind.FORCE_TORQUE, nuka.StateSensorKind.TOUCH,
+                                 nuka.StateSensorKind.TACTILE])
 def test_mounted_sensor_timing_replay_and_late_attachment(device, kind):
     with make_world(device, 4) as world:
         world.set_execution_mode("graph")
         world.step_n(3)
         with world.capture_checkpoint() as unregistered:
             initial_hash = world.state_hash()
-            sensor = world.attach_state_sensor(kind, mount=nuka.SensorMount.LINK, mount_index=2, update_period=2,
-                latency=world.dt * 3, latency_jitter=world.dt * 0.5,
-                dropout_probability=0.25, seed=36)
+            options = dict(kind=kind, mount=nuka.SensorMount.LINK, mount_index=2, update_period=2,
+                           latency=world.dt * 3, latency_jitter=world.dt * 0.5,
+                           dropout_probability=0.25, seed=36)
+            if kind in (nuka.StateSensorKind.TOUCH, nuka.StateSensorKind.TACTILE):
+                sensor = world.attach_tactile_sensor(size=(0.3, 0.3, 0.3), hysteresis_strength=0.2,
+                                                      hysteresis_time=0.03, **options)
+            else:
+                sensor = world.attach_state_sensor(**options)
             nuka.MeasurementError(noise_density=0.002, bias_random_walk=0.001,
                 correlated_bias_stddev=0.01, correlation_time=0.1, seed=71).configure_sensor(world, sensor, 0)
             view = torch.from_dlpack(world.get_state_sensor_view(sensor))

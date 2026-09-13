@@ -23,6 +23,23 @@ nuka_result_t WithSensorWorld(nuka_world_handle world, Function function) {
     } catch (...) { return NUKA_RESULT_INTERNAL; }
 }
 
+nuka::sensor::StateSensorDesc StateSensorDescription(const nuka_state_sensor_desc_t& desc) {
+    nuka::sensor::StateSensorDesc config;
+    config.kind = static_cast<nuka::sensor::StateSensorKind>(desc.kind);
+    config.mount = static_cast<nuka::sensor::StateSensorMount>(desc.mount);
+    config.index = desc.mount_index;
+    config.local_offset.position = {desc.local_offset[0], desc.local_offset[1], desc.local_offset[2]};
+    config.local_offset.rotation = {desc.local_offset[3], desc.local_offset[4], desc.local_offset[5], desc.local_offset[6]};
+    config.sample_period = desc.sample_rate_hz > 0.0 ? 1.0 / desc.sample_rate_hz : 0.0;
+    config.update_period = desc.update_period;
+    config.latency = desc.latency;
+    config.latency_jitter = desc.latency_jitter;
+    config.dropout_probability = desc.dropout_probability;
+    config.temperature = desc.temperature;
+    config.seed = desc.seed;
+    return config;
+}
+
 }  // namespace
 
 extern "C" {
@@ -33,19 +50,24 @@ nuka_result_t nuka_world_attach_state_sensor(nuka_world_handle world,
         !std::isfinite(desc->sample_rate_hz) || desc->sample_rate_hz < 0.0) return NUKA_RESULT_INVALID_ARG;
     *out_sensor = ~0u;
     return WithSensorWorld(world, [&](nuka::nk::World& target) {
-        nuka::sensor::StateSensorDesc config;
-        config.kind = static_cast<nuka::sensor::StateSensorKind>(desc->kind);
-        config.mount = static_cast<nuka::sensor::StateSensorMount>(desc->mount);
-        config.index = desc->mount_index;
-        config.local_offset.position = {desc->local_offset[0], desc->local_offset[1], desc->local_offset[2]};
-        config.local_offset.rotation = {desc->local_offset[3], desc->local_offset[4], desc->local_offset[5], desc->local_offset[6]};
-        config.sample_period = desc->sample_rate_hz > 0.0 ? 1.0 / desc->sample_rate_hz : 0.0;
-        config.update_period = desc->update_period;
-        config.latency = desc->latency;
-        config.latency_jitter = desc->latency_jitter;
-        config.dropout_probability = desc->dropout_probability;
-        config.temperature = desc->temperature;
-        config.seed = desc->seed;
+        return nuka::c_abi::MapStatusToResult(target.AttachStateSensor(StateSensorDescription(*desc), out_sensor));
+    });
+}
+
+nuka_result_t nuka_world_attach_tactile_sensor(nuka_world_handle world,
+    const nuka_state_sensor_desc_t* desc, const nuka_tactile_desc_t* tactile, uint32_t* out_sensor) {
+    if (!desc || !tactile || !out_sensor || desc->struct_size < sizeof(*desc) ||
+        tactile->struct_size < sizeof(*tactile) || !std::isfinite(desc->sample_rate_hz) || desc->sample_rate_hz < 0.0 ||
+        (desc->kind != NUKA_STATE_SENSOR_TOUCH && desc->kind != NUKA_STATE_SENSOR_TACTILE)) return NUKA_RESULT_INVALID_ARG;
+    *out_sensor = ~0u;
+    return WithSensorWorld(world, [&](nuka::nk::World& target) {
+        auto config = StateSensorDescription(*desc);
+        config.tactile.shape = static_cast<nuka::sensor::ContactRegionShape>(tactile->shape);
+        config.tactile.size = {tactile->size[0], tactile->size[1], tactile->size[2]};
+        config.tactile.spread_fraction = tactile->spread_fraction;
+        config.tactile.spread_sigma = tactile->spread_sigma;
+        config.tactile.hysteresis_strength = tactile->hysteresis_strength;
+        config.tactile.hysteresis_time = tactile->hysteresis_time;
         return nuka::c_abi::MapStatusToResult(target.AttachStateSensor(config, out_sensor));
     });
 }

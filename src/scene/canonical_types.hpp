@@ -57,7 +57,8 @@ enum class SensorType : uint8_t {
     Depth,
     Lidar,
     RangeScan,
-    LinearVelocity
+    LinearVelocity,
+    Tactile
 };
 
 // Link/Body/Base select a live pose row; World uses local_offset as a world pose.

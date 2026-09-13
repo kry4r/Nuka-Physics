@@ -209,10 +209,20 @@ struct MjcfGeomDefaults {
     bool has_friction = false;      float friction_mu = 1.0f;  // first component only
 };
 
+struct MjcfSiteDefaults {
+    std::string type = "sphere";
+    math::Vec3 size{0.005f, 0.005f, 0.005f};
+    math::Vec3 position;
+    std::string orientation_tag;
+    std::string orientation_value;
+    std::string fromto;
+};
+
 struct MjcfDefaultClass {
     MjcfJointDefaults joint;
     MjcfGeneralDefaults general;
     MjcfGeomDefaults geom;
+    MjcfSiteDefaults site;
 };
 
 struct MjcfDefaults {
@@ -232,6 +242,7 @@ struct MjcfMeshAsset {
 struct MjcfSite {
     scene::BodyId body = scene::kInvalidBody;
     math::Transform local = math::Transform::Identity();
+    sensor::TactileConfig region;
 };
 
 struct MjcfParseContext {
@@ -245,6 +256,8 @@ struct MjcfParseContext {
     std::unordered_map<std::string, scene::ShapeId> geom_ids;
     std::unordered_map<std::string, MjcfSite> site_ids;
     MjcfDefaults defaults;
+    float site_angle_scale = 0.017453292519943295f;
+    std::string site_euler_sequence = "xyz";
 };
 
 scene::ShapeType MjcfGeomType(const char* type_str) {
@@ -418,6 +431,106 @@ void ApplyGeomDefault(const tinyxml2::XMLElement* geom_elem, MjcfDefaultClass* d
     }
 }
 
+void ApplySiteDefault(const tinyxml2::XMLElement* element, MjcfSiteDefaults* site) {
+    if (!element) return;
+    if (const char* type = element->Attribute("type")) site->type = type;
+    float size[] = {site->size.x, site->size.y, site->size.z};
+    ParseFloatList(element->Attribute("size"), size, 3);
+    site->size = {size[0], size[1], size[2]};
+    if (const char* pos = element->Attribute("pos")) site->position = ParseVec3(pos);
+    uint32_t rotations = 0u;
+    for (const char* tag : {"quat", "axisangle", "euler", "xyaxes", "zaxis"}) {
+        if (const char* value = element->Attribute(tag)) {
+            site->orientation_tag = tag;
+            site->orientation_value = value;
+            ++rotations;
+        }
+    }
+    if (rotations > 1u) throw std::runtime_error("MJCF: site has multiple orientation attributes");
+    if (const char* fromto = element->Attribute("fromto")) site->fromto = fromto;
+}
+
+math::Vec3 SiteUnitVector(math::Vec3 v) {
+    const float length = v.Length();
+    if (!(length > 0.0f) || !std::isfinite(length)) throw std::runtime_error("MJCF: invalid site orientation axis");
+    return v / length;
+}
+
+math::Quat SiteZRotation(math::Vec3 direction) {
+    const auto z = SiteUnitVector(direction);
+    return z.z <= -1.0f ? math::Quat{0.0f, 1.0f, 0.0f, 0.0f} :
+        math::Quat{1.0f + z.z, -z.y, z.x, 0.0f}.Normalized();
+}
+
+math::Quat SiteOrientation(const MjcfSiteDefaults& site, const MjcfParseContext& context) {
+    if (site.orientation_tag.empty()) return math::Quat::Identity();
+    float values[6]{};
+    const int required = site.orientation_tag == "xyaxes" ? 6 :
+        site.orientation_tag == "euler" || site.orientation_tag == "zaxis" ? 3 : 4;
+    if (ParseFloatList(site.orientation_value.c_str(), values, required) != required)
+        throw std::runtime_error("MJCF: incomplete site orientation");
+    for (float value : values) if (!std::isfinite(value)) throw std::runtime_error("MJCF: invalid site orientation");
+    if (site.orientation_tag == "quat") {
+        const math::Quat q{values[0], values[1], values[2], values[3]};
+        if (!(q.Norm() > 0.0f)) throw std::runtime_error("MJCF: zero site quaternion");
+        return q.Normalized();
+    }
+    if (site.orientation_tag == "axisangle")
+        return math::Quat::FromAxisAngle(SiteUnitVector({values[0], values[1], values[2]}), values[3] * context.site_angle_scale);
+    if (site.orientation_tag == "zaxis") return SiteZRotation({values[0], values[1], values[2]});
+    if (site.orientation_tag == "xyaxes") {
+        const auto x = SiteUnitVector({values[0], values[1], values[2]});
+        const math::Vec3 raw_y{values[3], values[4], values[5]};
+        const auto y = SiteUnitVector(raw_y - x * raw_y.Dot(x));
+        const auto z = x.Cross(y);
+        const double matrix[3][3] = {{x.x, y.x, z.x}, {x.y, y.y, z.y}, {x.z, y.z, z.z}};
+        return QuatFromMatrix(matrix);
+    }
+    if (context.site_euler_sequence.size() != 3u) throw std::runtime_error("MJCF: invalid eulerseq");
+    auto q = math::Quat::Identity();
+    for (uint32_t axis = 0u; axis < 3u; ++axis) {
+        const char code = context.site_euler_sequence[axis];
+        math::Vec3 vector{};
+        if (code == 'x' || code == 'X') vector.x = 1.0f;
+        else if (code == 'y' || code == 'Y') vector.y = 1.0f;
+        else if (code == 'z' || code == 'Z') vector.z = 1.0f;
+        else throw std::runtime_error("MJCF: invalid eulerseq axis");
+        const auto rotation = math::Quat::FromAxisAngle(vector, values[axis] * context.site_angle_scale);
+        q = code >= 'a' && code <= 'z' ? q * rotation : rotation * q;
+    }
+    return q.Normalized();
+}
+
+MjcfSite ResolveSite(const MjcfSiteDefaults& description, scene::BodyId body, const MjcfParseContext& context) {
+    MjcfSite site;
+    site.body = body;
+    site.local.position = description.position;
+    site.local.rotation = SiteOrientation(description, context);
+    auto& region = site.region;
+    region.size = description.size;
+    if (description.type == "sphere") region.shape = sensor::ContactRegionShape::Sphere;
+    else if (description.type == "box") region.shape = sensor::ContactRegionShape::Box;
+    else if (description.type == "ellipsoid") region.shape = sensor::ContactRegionShape::Ellipsoid;
+    else if (description.type == "capsule") region.shape = sensor::ContactRegionShape::Capsule;
+    else if (description.type == "cylinder") region.shape = sensor::ContactRegionShape::Cylinder;
+    else throw std::runtime_error("MJCF: unsupported site type '" + description.type + "'");
+    if (!description.fromto.empty()) {
+        float coordinates[6];
+        if (ParseFloatList(description.fromto.c_str(), coordinates, 6) != 6 || description.type == "sphere")
+            throw std::runtime_error("MJCF: invalid site fromto");
+        const math::Vec3 a{coordinates[0], coordinates[1], coordinates[2]};
+        const math::Vec3 b{coordinates[3], coordinates[4], coordinates[5]};
+        site.local.position = (a + b) * 0.5f;
+        site.local.rotation = SiteZRotation(b - a);
+        const float half_height = (b - a).Length() * 0.5f;
+        if (description.type == "capsule" || description.type == "cylinder") region.size.y = half_height;
+        else region.size.z = half_height;
+    }
+    if (description.type == "sphere") region.size.y = region.size.z = 0.0f;
+    if (description.type == "capsule" || description.type == "cylinder") region.size.z = 0.0f;
+    return site;
+}
+
 void ParseDefaultElement(tinyxml2::XMLElement* default_elem,
                          const MjcfDefaultClass& inherited,
                          MjcfDefaults* defaults) {
@@ -429,6 +542,7 @@ void ParseDefaultElement(tinyxml2::XMLElement* default_elem,
     ApplyJointDefault(default_elem->FirstChildElement("joint"), &current);
     ApplyGeneralDefault(default_elem->FirstChildElement("general"), &current);
     ApplyGeomDefault(default_elem->FirstChildElement("geom"), &current);
+    ApplySiteDefault(default_elem->FirstChildElement("site"), &current.site);
 
     if (const char* class_name = default_elem->Attribute("class")) {
         defaults->classes[class_name] = current;
@@ -906,8 +1020,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         scene.AddCamera(std::move(record));
     }
 
-    // Named <site>: a body-local frame a <sensor> can mount on. Stored so the
-    // sensor pass resolves site -> (body, pos/quat offset).
+    // Named sites retain their sensing volume and body-local frame.
     for (auto* site = body_elem->FirstChildElement("site");
          site != nullptr;
          site = site->NextSiblingElement("site")) {
@@ -915,15 +1028,10 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         if (!site_name) {
             continue;
         }
-        MjcfSite s;
-        s.body = body_id;
-        if (const char* pos = site->Attribute("pos")) {
-            s.local.position = ParseVec3(pos);
-        }
-        if (const char* quat = site->Attribute("quat")) {
-            s.local.rotation = ParseQuat(quat);
-        }
-        context.site_ids[site_name] = s;
+        const char* site_class = site->Attribute("class");
+        auto description = DefaultClassOrRoot(context.defaults, site_class ? site_class : child_class).site;
+        ApplySiteDefault(site, &description);
+        context.site_ids[site_name] = ResolveSite(description, body_id, context);
     }
 
     // Body-nested lights attach to this body: their local transform composes with
@@ -1095,6 +1203,7 @@ void ParseSensors(tinyxml2::XMLElement* mujoco,
             if (it != context.site_ids.end()) {
                 record.mount_index = it->second.body;
                 record.local_offset = it->second.local;
+                record.tactile = it->second.region;
             }
         } else {
             const char* body_name = sensor->Attribute("objname");
@@ -1103,6 +1212,9 @@ void ParseSensors(tinyxml2::XMLElement* mujoco,
             }
             record.mount_index = ResolveBody(body_name, context);
         }
+        if (record.type == scene::SensorType::Contact &&
+            (record.mount_index == scene::kInvalidBody || !sensor::ValidTactileConfig(record.tactile, true)))
+            throw std::runtime_error("MJCF: touch requires a valid body-mounted site volume");
 
         // A rangefinder is a single forward ray; the runtime ray-gen reads this
         // 1-ray pattern through the same lidar path the multi-ray scanners use.
@@ -1229,6 +1341,14 @@ scene::SceneIR LoadMjcf(const std::string& path) {
 
     scene::SceneIR scene;
     MjcfParseContext context;
+
+    if (const auto* compiler = mujoco->FirstChildElement("compiler")) {
+        if (const char* angle = compiler->Attribute("angle")) {
+            if (std::string(angle) == "radian") context.site_angle_scale = 1.0f;
+            else if (std::string(angle) != "degree") throw std::runtime_error("MJCF: invalid compiler angle");
+        }
+        if (const char* sequence = compiler->Attribute("eulerseq")) context.site_euler_sequence = sequence;
+    }
 
     ParseDefaults(mujoco, context);
     ParseMaterials(mujoco, scene, context, std::filesystem::path(path).parent_path());

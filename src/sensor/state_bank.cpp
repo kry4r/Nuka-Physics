@@ -11,6 +11,29 @@
 
 namespace nuka::sensor {
 
+namespace {
+
+phi::Status ContactLayout(const nk::Model& model, uint32_t env_count, phi::SensorContactLayout* layout) {
+    const auto& cap = model.capacities;
+    if (model.MpmParticlesPerEnv() > cap.particles_per_env) return phi::Status::InvalidArgument;
+    const uint64_t particle_slots = cap.bodies_per_env && cap.max_contacts_per_env
+        ? uint64_t{cap.particles_per_env - model.MpmParticlesPerEnv()} *
+              collision::kBodyParticleContactSlotsPerParticle : 0u;
+    if (particle_slots + cap.mpm_contact_capacity_per_env > cap.max_contacts_per_env)
+        return phi::Status::InvalidArgument;
+    layout->env_count = env_count;
+    layout->links_per_env = cap.links_per_env;
+    layout->bodies_per_env = cap.bodies_per_env;
+    layout->articulations_per_env = cap.articulations_per_env;
+    layout->slots_per_env = cap.max_contacts_per_env;
+    layout->rigid_slots_per_env = cap.max_contacts_per_env -
+        static_cast<uint32_t>(particle_slots) - cap.mpm_contact_capacity_per_env;
+    layout->rows_per_env = cap.max_rows_per_env;
+    return phi::Status::Ok;
+}
+
+}  // namespace
+
 uint32_t StateSensorValueCount(StateSensorKind kind) {
     switch (kind) {
         case StateSensorKind::Imu: return 6u;
@@ -19,6 +42,8 @@ uint32_t StateSensorValueCount(StateSensorKind kind) {
         case StateSensorKind::LinearVelocity: return 3u;
         case StateSensorKind::ContactWrench: return 6u;
         case StateSensorKind::ForceTorque: return 6u;
+        case StateSensorKind::Touch: return 1u;
+        case StateSensorKind::Tactile: return 3u;
     }
     return 0u;
 }
@@ -34,6 +59,8 @@ bool ValidStateSensorDesc(const StateSensorDesc& desc) {
         !std::isfinite(desc.latency_jitter) || desc.latency_jitter < 0.0 ||
         !std::isfinite(desc.dropout_probability) || desc.dropout_probability < 0.0f ||
         desc.dropout_probability > 1.0f || !std::isfinite(desc.temperature)) return false;
+    if (IsContactRegionSensor(desc.kind) && !ValidTactileConfig(desc.tactile, desc.kind == StateSensorKind::Touch))
+        return false;
     for (uint32_t channel = 0u; channel < kStateSensorErrorChannels; ++channel) {
         if (!ValidObservationConfig(desc.errors[channel])) return false;
         if (desc.kind == StateSensorKind::FramePose && channel >= 3u &&
@@ -48,8 +75,10 @@ struct StateSensorBank::Channel {
     size_t runtime_offset = 0u;
     size_t noise_offset = 0u;
     size_t queue_offset = 0u;
+    size_t tactile_offset = 0u;
     bool active = true;
     phi::SampleStateSensorParams params;
+    phi::ReadoutContactRegionParams region;
     ~Channel() { if (storage) phi::BufferFree(storage); }
 };
 
@@ -116,11 +145,8 @@ phi::Status StateSensorBank::AllocateMotion() {
 phi::Status StateSensorBank::AllocateWrenches(const nk::Model& model) {
     if (wrench_storage_) return phi::Status::Ok;
     const auto& cap = model.capacities;
-    const uint64_t particle_slots = cap.bodies_per_env && cap.max_contacts_per_env
-        ? uint64_t{cap.particles_per_env - model.MpmParticlesPerEnv()} *
-              collision::kBodyParticleContactSlotsPerParticle : 0u;
-    if (particle_slots + cap.mpm_contact_capacity_per_env > cap.max_contacts_per_env)
-        return phi::Status::InvalidArgument;
+    const auto layout_status = ContactLayout(model, env_count_, &wrenches_);
+    if (layout_status != phi::Status::Ok) return layout_status;
     const size_t frames = size_t{env_count_} * (uint64_t{cap.links_per_env} + cap.bodies_per_env);
     const size_t links = size_t{env_count_} * cap.links_per_env;
     phi::Status status;
@@ -133,14 +159,6 @@ phi::Status StateSensorBank::AllocateWrenches(const nk::Model& model) {
     wrenches_.transmitted_impulses = wrenches_.contact_impulses + frames;
     wrenches_.gravity = gravity_;
     wrenches_.interval = interval_;
-    wrenches_.env_count = env_count_;
-    wrenches_.links_per_env = cap.links_per_env;
-    wrenches_.bodies_per_env = cap.bodies_per_env;
-    wrenches_.articulations_per_env = cap.articulations_per_env;
-    wrenches_.slots_per_env = cap.max_contacts_per_env;
-    wrenches_.rigid_slots_per_env = cap.max_contacts_per_env -
-        static_cast<uint32_t>(particle_slots) - cap.mpm_contact_capacity_per_env;
-    wrenches_.rows_per_env = cap.max_rows_per_env;
     return phi::Status::Ok;
 }
 
@@ -193,7 +211,7 @@ phi::Status StateSensorBank::Add(const nk::Model& model, const StateSensorDesc& 
         return phi::Status::InvalidArgument;
     channels_.reserve(channels_.size() + 1u);
     before_.reserve(1u);
-    after_.reserve(channels_.size() + 4u);
+    after_.reserve(channels_.size() * 2u + 5u);
     auto status = AllocateMotion();
     if (status != phi::Status::Ok) return status;
     if (desc.kind == StateSensorKind::ContactWrench || desc.kind == StateSensorKind::ForceTorque) {
@@ -221,6 +239,12 @@ phi::Status StateSensorBank::Add(const nk::Model& model, const StateSensorDesc& 
     channel->queue_offset = align(channel->noise_offset + size_t{env_count_} *
         kStateSensorErrorChannels * sizeof(ObservationNoiseState));
     channel->bytes = channel->queue_offset + size_t{env_count_} * params.queue_capacity * sizeof(StateSensorPacket);
+    if (IsContactRegionSensor(desc.kind)) {
+        status = ContactLayout(model, env_count_, &channel->region);
+        if (status != phi::Status::Ok) return status;
+        channel->tactile_offset = align(channel->bytes);
+        channel->bytes = channel->tactile_offset + size_t{env_count_} * sizeof(TactileState);
+    }
     channel->storage = phi::BufferAlloc(phi::BackendDeviceBufferType(backend_), channel->bytes, &status);
     if (!channel->storage) return status;
     status = phi::BufferMemset(channel->storage, 0u, 0u, channel->bytes);
@@ -230,6 +254,8 @@ phi::Status StateSensorBank::Add(const nk::Model& model, const StateSensorDesc& 
     params.runtime = reinterpret_cast<StateSensorRuntime*>(base + channel->runtime_offset);
     params.noise = reinterpret_cast<ObservationNoiseState*>(base + channel->noise_offset);
     params.queue = reinterpret_cast<StateSensorPacket*>(base + channel->queue_offset);
+    if (IsContactRegionSensor(desc.kind))
+        params.tactile = reinterpret_cast<TactileState*>(base + channel->tactile_offset);
     channels_.push_back(std::move(channel));
     BuildCalls();
     *id = params.channel;
@@ -255,6 +281,16 @@ void StateSensorBank::BuildCalls() {
         auto& p = channel->params;
         p.contact_impulses = wrenches_.contact_impulses;
         p.transmitted_impulses = wrenches_.transmitted_impulses;
+        if (IsContactRegionSensor(p.desc.kind)) {
+            auto& region = channel->region;
+            region.before = p.before;
+            region.after = p.after;
+            region.states = p.tactile;
+            region.config = p.desc.tactile;
+            region.local_offset = p.desc.local_offset;
+            region.frame = p.desc.index + (p.desc.mount == StateSensorMount::Body ? p.links_per_env : 0u);
+            region.kind = p.desc.kind;
+        }
         if (!channel->active) continue;
         if (p.desc.kind == StateSensorKind::ForceTorque)
             wrenches_.joint_loads = wrenches_.link_contacts = 1u;
@@ -268,8 +304,12 @@ void StateSensorBank::BuildCalls() {
         after_.push_back({phi::NkOp::ReadoutMotion, &motion_after_});
         if (wrenches_.link_contacts || wrenches_.body_contacts)
             after_.push_back({phi::NkOp::ReadoutSensorWrenches, &wrenches_});
-        for (const auto& channel : channels_)
-            if (channel->active) after_.push_back({phi::NkOp::SampleStateSensor, &channel->params});
+        for (const auto& channel : channels_) {
+            if (!channel->active) continue;
+            if (IsContactRegionSensor(channel->params.desc.kind))
+                after_.push_back({phi::NkOp::ReadoutContactRegion, &channel->region});
+            after_.push_back({phi::NkOp::SampleStateSensor, &channel->params});
+        }
     }
     if (clocks_) after_.push_back({phi::NkOp::AdvanceSensorTime, &advance_});
 }
@@ -314,6 +354,11 @@ phi::Status StateSensorBank::Reset(const std::vector<uint32_t>& env_ids) {
             for (uint32_t segment = 0u; segment < 4u; ++segment) {
                 const auto status = phi::BufferMemset(channel->storage, 0u,
                     offsets[segment] + size_t{env} * strides[segment], strides[segment]);
+                if (status != phi::Status::Ok) return status;
+            }
+            if (p.tactile) {
+                const auto status = phi::BufferMemset(channel->storage, 0u,
+                    channel->tactile_offset + size_t{env} * sizeof(TactileState), sizeof(TactileState));
                 if (status != phi::Status::Ok) return status;
             }
         }

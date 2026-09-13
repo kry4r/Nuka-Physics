@@ -4,10 +4,11 @@
 
 #include "math/transform.hpp"
 #include "sensor/observation_types.hpp"
+#include "sensor/tactile.hpp"
 
 namespace nuka::sensor {
 
-enum class StateSensorKind : uint32_t { Imu, FramePose, JointState, LinearVelocity, ContactWrench, ForceTorque };
+enum class StateSensorKind : uint32_t { Imu, FramePose, JointState, LinearVelocity, ContactWrench, ForceTorque, Touch, Tactile };
 enum class StateSensorMount : uint32_t { Link, Body, Base };
 
 inline constexpr uint32_t kStateSensorErrorChannels = 6u;
@@ -26,7 +27,12 @@ struct StateSensorDesc {
     float temperature = 25.0f;
     uint64_t seed = 0u;
     ObservationConfig errors[kStateSensorErrorChannels];
+    TactileConfig tactile;
 };
+
+inline bool IsContactRegionSensor(StateSensorKind kind) {
+    return kind == StateSensorKind::Touch || kind == StateSensorKind::Tactile;
+}
 
 // World velocities refer to the frame origin; sensor offsets use rigid-body point kinematics.
 struct MotionFrame {
