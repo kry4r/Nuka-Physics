@@ -81,6 +81,13 @@ class MeasurementError:
 
     def configure(self, world, field) -> None:
         """Replace the observation model and reset its per-environment history."""
+        world.set_sensor_error(field, **self._parameters())
+
+    def configure_sensor(self, world, sensor, component) -> None:
+        """Configure a mounted sensor component and restart that sensor's acquisition history."""
+        world.set_state_sensor_error(sensor, component, **self._parameters())
+
+    def _parameters(self) -> dict:
         parameters = asdict(self)
         minimum = parameters.pop("minimum")
         maximum = parameters.pop("maximum")
@@ -88,7 +95,7 @@ class MeasurementError:
             raise ValueError("minimum and maximum must both be supplied")
         if minimum is not None:
             parameters.update(minimum=minimum, maximum=maximum, saturation_enabled=True)
-        world.set_sensor_error(field, **parameters)
+        return parameters
 
 
 @dataclass

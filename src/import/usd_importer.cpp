@@ -939,6 +939,7 @@ scene::ActuatorType ActuatorTypeFromToken(const std::string& token) {
 
 scene::SensorType SensorTypeFromToken(const std::string& token) {
     const std::string lower = Lowercase(token);
+    if (lower == "linear_velocity" || lower == "velocimeter") return scene::SensorType::LinearVelocity;
     if (lower == "lidar") {
         return scene::SensorType::Lidar;
     }
@@ -1179,6 +1180,7 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
             sensor.type = SensorTypeFromToken(prim.nuka_type);
             sensor.mount = scene::MountFrame::Body;
             sensor.mount_index = body_it->second;
+            sensor.local_offset = math::Transform{prim.translate, LocalRotation(prim)};
             sensor.sample_rate_hz = prim.sample_rate_hz;
             // Render-sensor payloads: a lidar/range fan + range, or a depth image
             // size. Absent attributes leave the descriptor's defaults in place.

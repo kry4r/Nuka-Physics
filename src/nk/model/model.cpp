@@ -1528,6 +1528,7 @@ namespace {
 void MoveModelMembers(Model& dst, Model&& src) {
     dst.capacities = std::move(src.capacities);
     dst.articulation = std::move(src.articulation);
+    dst.state_sensors = std::move(src.state_sensors);
     dst.shapes = std::move(src.shapes);
     dst.material_buckets = std::move(src.material_buckets);
     dst.body_material_bucket = std::move(src.body_material_bucket);

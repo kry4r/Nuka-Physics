@@ -37,6 +37,7 @@ from ._nuka_ext import (  # noqa: F401
     ENV_STATUS_CONSTITUTIVE_FAILURE,
     ENV_STATUS_GRID_CONTACT_OVERFLOW,
     ENV_STATUS_CONTROL_FAILURE,
+    ENV_STATUS_SENSOR_QUEUE_OVERFLOW,
     World,
     StateCheckpoint,
     Tape,
@@ -86,6 +87,7 @@ from ._nuka_ext import (  # noqa: F401
     SensorChannel,
     SensorAov,
     SensorMount,
+    StateSensorKind,
 )
 
 import dataclasses as _dataclasses
@@ -314,6 +316,9 @@ __all__ = [
     "CABLE_PIN_BOTH",
     "CABLE_PIN_NONE",
     "StateCheckpoint",
+    "StateSensorKind",
+    "SensorMount",
+    "ENV_STATUS_SENSOR_QUEUE_OVERFLOW",
     "MEDIA_METHOD_XPBD",
     "MEDIA_METHOD_PBF",
     "MEDIA_METHOD_MLSMPM",

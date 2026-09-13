@@ -1229,6 +1229,38 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         }
     }
 
+    for (const auto& sensor : scene.Sensors()) {
+        ::nuka::sensor::StateSensorDesc desc;
+        switch (sensor.type) {
+            case SensorType::Imu: desc.kind = ::nuka::sensor::StateSensorKind::Imu; break;
+            case SensorType::FramePose: desc.kind = ::nuka::sensor::StateSensorKind::FramePose; break;
+            case SensorType::JointState: desc.kind = ::nuka::sensor::StateSensorKind::JointState; break;
+            case SensorType::LinearVelocity: desc.kind = ::nuka::sensor::StateSensorKind::LinearVelocity; break;
+            default: continue;
+        }
+        desc.mount = static_cast<::nuka::sensor::StateSensorMount>(sensor.mount);
+        desc.index = sensor.mount_index;
+        if (sensor.joint_id != kInvalidJoint) {
+            if (sensor.joint_id >= scene.JointCount()) throw std::runtime_error("sensor joint reference is invalid");
+            desc.mount = ::nuka::sensor::StateSensorMount::Body;
+            desc.index = scene.GetJoint(sensor.joint_id).child_body;
+        }
+        if (desc.mount == ::nuka::sensor::StateSensorMount::Body) {
+            if (desc.index >= scene.RigidBodyCount()) throw std::runtime_error("sensor body reference is invalid");
+            const auto* binding = smap.RefOf(scene.EntityOfBody(desc.index));
+            if (!binding) throw std::runtime_error("sensor body has no cooked binding");
+            if (binding->link_index != SceneMap::kNoRow) {
+                desc.mount = ::nuka::sensor::StateSensorMount::Link;
+                desc.index = binding->link_index;
+            } else desc.index = binding->body_row;
+        }
+        desc.local_offset = sensor.local_offset;
+        desc.update_period = sensor.update_period;
+        if (!std::isfinite(sensor.sample_rate_hz) || sensor.sample_rate_hz < 0.0f)
+            throw std::runtime_error("sensor sample rate must be finite and nonnegative");
+        desc.sample_period = sensor.sample_rate_hz > 0.0f ? 1.0 / sensor.sample_rate_hz : 0.0;
+        model.state_sensors.push_back(desc);
+    }
     return result;
 }
 

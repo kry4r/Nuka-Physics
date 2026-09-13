@@ -134,6 +134,7 @@ const char* SensorTypeName(SensorType t) {
         case SensorType::Depth:       return "depth";
         case SensorType::Lidar:       return "lidar";
         case SensorType::RangeScan:   return "range_scan";
+        case SensorType::LinearVelocity: return "linear_velocity";
     }
     return "imu";
 }
@@ -147,6 +148,7 @@ SensorType SensorTypeFromName(const std::string& s) {
     if (s == "depth") return SensorType::Depth;
     if (s == "lidar") return SensorType::Lidar;
     if (s == "range_scan") return SensorType::RangeScan;
+    if (s == "linear_velocity") return SensorType::LinearVelocity;
     return SensorType::Imu;
 }
 
@@ -472,6 +474,7 @@ Value SaveSensor(const SensorDesc& s) {
     o.Set("name", Value::Str(s.name));
     o.Set("type", Value::Str(SensorTypeName(s.type)));
     o.Set("attached_body", Value::Int(static_cast<int64_t>(s.mount_index)));
+    if (s.joint_id != kInvalidJoint) o.Set("joint_id", Value::Int(s.joint_id));
     o.Set("local", TransformJson(s.local_offset));
     o.Set("sample_rate_hz", Value::Float(s.sample_rate_hz));
     if (s.mount != MountFrame::Body) {
@@ -1438,6 +1441,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             SensorDesc rec;
             rec.name = s.At("name").AsString();
             rec.type = SensorTypeFromName(s.At("type").AsString());
+            if (const Value* joint = s.Find("joint_id")) rec.joint_id = static_cast<uint32_t>(joint->AsInt());
             rec.mount_index = static_cast<uint32_t>(s.At("attached_body").AsInt());
             rec.local_offset = TransformFromJson(s.At("local"));
             rec.sample_rate_hz = s.At("sample_rate_hz").AsFloat();

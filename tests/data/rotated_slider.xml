@@ -1,0 +1,32 @@
+<mujoco model="rotated_slider">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.0001" gravity="0 0 0"/>
+  <default><geom contype="0" conaffinity="0"/></default>
+  <worldbody>
+    <body name="base" pos="0 0 3">
+      <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
+      <geom type="sphere" size="0.05"/>
+      <body name="arm">
+        <joint name="hinge" type="hinge" axis="0 0 1" damping="0"/>
+        <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
+        <geom type="sphere" size="0.04"/>
+        <body name="slider" pos="0.3 0 0" quat="0.7071067811865476 0 0 0.7071067811865476">
+          <joint name="slide" type="slide" axis="1 0 0" damping="0"/>
+          <inertial pos="0 0 0" mass="2" diaginertia="0.05 0.05 0.05"/>
+          <geom type="sphere" size="0.03"/>
+          <site name="sensor_site" pos="0.02 -0.03 0.04"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="hinge_motor" joint="hinge" forcerange="-100 100"/>
+    <motor name="slide_motor" joint="slide" forcerange="-100 100"/>
+  </actuator>
+  <sensor>
+    <jointpos name="slide_encoder" joint="slide"/>
+    <accelerometer name="slider_imu" site="sensor_site"/>
+    <velocimeter name="slider_velocity" site="sensor_site"/>
+    <framepos name="slider_pose" objtype="body" objname="slider"/>
+  </sensor>
+</mujoco>

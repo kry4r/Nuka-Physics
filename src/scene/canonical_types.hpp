@@ -56,7 +56,8 @@ enum class SensorType : uint8_t {
     Camera,
     Depth,
     Lidar,
-    RangeScan
+    RangeScan,
+    LinearVelocity
 };
 
 // Which device FK pose a sensor mounts on; maps to FieldId::{LinkPose,BodyPose,

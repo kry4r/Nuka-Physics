@@ -31,6 +31,7 @@
 #include <cstdint>
 #include "collision/mesh_surface_types.hpp"
 #include "sensor/observation_types.hpp"
+#include "sensor/state_types.hpp"
 
 namespace nuka::phi {
 
@@ -69,6 +70,7 @@ inline constexpr uint32_t kEnvStatusContactGeometryUnavailable = 1u << 7;
 inline constexpr uint32_t kEnvStatusConstitutiveFailure = 1u << 8;
 inline constexpr uint32_t kEnvStatusGridContactOverflow = 1u << 9;
 inline constexpr uint32_t kEnvStatusControlFailure = 1u << 10;
+inline constexpr uint32_t kEnvStatusSensorQueueOverflow = 1u << 11;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
 inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
@@ -189,6 +191,9 @@ enum class NkOp : uint16_t {
     RefitParticleSurfaces,
     SampleObservation,
     ResetObservation,
+    ReadoutMotion,
+    SampleStateSensor,
+    AdvanceSensorTime,
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -916,6 +921,39 @@ struct ExportObsParams {
     uint32_t env_count;
     uint32_t base_link_count;
     uint32_t obs_width;         // floats per env in obs_buffer
+};
+
+struct ReadoutMotionParams {
+    sensor::MotionFrame* frames = nullptr;
+    uint32_t env_count = 0u;
+    uint32_t links_per_env = 0u;
+    uint32_t bodies_per_env = 0u;
+    uint32_t articulations_per_env = 0u;
+};
+
+struct SampleStateSensorParams {
+    const sensor::MotionFrame* before = nullptr;
+    const sensor::MotionFrame* after = nullptr;
+    const double* times = nullptr;
+    float* values = nullptr;
+    sensor::ObservationNoiseState* noise = nullptr;
+    sensor::StateSensorRuntime* runtime = nullptr;
+    sensor::StateSensorPacket* queue = nullptr;
+    sensor::StateSensorDesc desc;
+    math::Vec3 gravity;
+    double interval = 0.0;
+    uint32_t env_count = 0u;
+    uint32_t frames_per_env = 0u;
+    uint32_t links_per_env = 0u;
+    uint32_t channel = 0u;
+    uint32_t value_count = 0u;
+    uint32_t queue_capacity = 0u;
+};
+
+struct AdvanceSensorTimeParams {
+    double* times = nullptr;
+    double interval = 0.0;
+    uint32_t env_count = 0u;
 };
 
 struct SampleObservationParams {

@@ -30,6 +30,7 @@
 #include "nuka/nuka.h"
 #include "nuka/nuka_diffsim.h"
 #include "nuka/nuka_noise.h"
+#include "nuka/nuka_state_sensor.h"
 #include "nuka/nuka_recorder.h"  // M8 T5: the offscreen recorder C ABI (PPM/mp4)
 #include "nuka/nuka_scene.h"  // M9 T4: the GENERIC scene-authoring C ABI
 
@@ -1721,6 +1722,45 @@ private:
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
+nuka_sensor_error_desc_t sensor_error_description(const nb::kwargs& options) {
+    nuka_sensor_error_desc_t desc{};
+    desc.struct_size = sizeof(desc);
+    desc.reference_temperature = 25.0f;
+    struct Parameter { const char* name; float nuka_sensor_error_desc_t::*member; };
+    const Parameter parameters[] = {
+        {"bias", &nuka_sensor_error_desc_t::bias},
+        {"scale_error", &nuka_sensor_error_desc_t::scale_error},
+        {"noise_density", &nuka_sensor_error_desc_t::noise_density},
+        {"initial_bias_stddev", &nuka_sensor_error_desc_t::initial_bias_stddev},
+        {"bias_random_walk", &nuka_sensor_error_desc_t::bias_random_walk},
+        {"correlated_bias_stddev", &nuka_sensor_error_desc_t::correlated_bias_stddev},
+        {"correlation_time", &nuka_sensor_error_desc_t::correlation_time},
+        {"quantization", &nuka_sensor_error_desc_t::quantization},
+        {"minimum", &nuka_sensor_error_desc_t::minimum},
+        {"maximum", &nuka_sensor_error_desc_t::maximum},
+        {"response_time", &nuka_sensor_error_desc_t::response_time},
+        {"temperature_coefficient", &nuka_sensor_error_desc_t::temperature_coefficient},
+        {"reference_temperature", &nuka_sensor_error_desc_t::reference_temperature},
+    };
+    for (auto item : options) {
+        const auto name = nb::cast<std::string>(item.first);
+        if (name == "seed") { desc.seed = nb::cast<uint64_t>(item.second); continue; }
+        if (name == "saturation_enabled") {
+            desc.saturation_enabled = nb::cast<bool>(item.second) ? 1u : 0u;
+            continue;
+        }
+        bool found = false;
+        for (const auto& parameter : parameters) {
+            if (name != parameter.name) continue;
+            desc.*(parameter.member) = nb::cast<float>(item.second);
+            found = true;
+            break;
+        }
+        if (!found) throw nb::value_error(("unknown sensor error parameter: " + name).c_str());
+    }
+    return desc;
+}
+
 NB_MODULE(_nuka_ext, m) {
     m.doc() = "Nuka physics engine -- nanobind binding (zero-copy DLPack interop)";
 
@@ -1885,6 +1925,7 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("ENV_STATUS_CONSTITUTIVE_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE);
     m.attr("ENV_STATUS_GRID_CONTACT_OVERFLOW") = static_cast<uint32_t>(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW);
     m.attr("ENV_STATUS_CONTROL_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_CONTROL_FAILURE);
+    m.attr("ENV_STATUS_SENSOR_QUEUE_OVERFLOW") = static_cast<uint32_t>(NUKA_ENV_STATUS_SENSOR_QUEUE_OVERFLOW);
     m.attr("ENV_STATUS_INVALID_ENDPOINT") = static_cast<uint32_t>(NUKA_ENV_STATUS_INVALID_ENDPOINT);
     m.attr("ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE") =
         static_cast<uint32_t>(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE);
@@ -1922,6 +1963,12 @@ NB_MODULE(_nuka_ext, m) {
         .export_values();
 
     // Which FK frame a camera mounts on for World.attach_camera_sensor.
+    nb::enum_<nuka_state_sensor_kind_t>(m, "StateSensorKind")
+        .value("IMU", NUKA_STATE_SENSOR_IMU)
+        .value("FRAME_POSE", NUKA_STATE_SENSOR_FRAME_POSE)
+        .value("JOINT_STATE", NUKA_STATE_SENSOR_JOINT_STATE)
+        .value("LINEAR_VELOCITY", NUKA_STATE_SENSOR_LINEAR_VELOCITY);
+
     nb::enum_<nuka_sensor_mount_t>(m, "SensorMount")
         .value("LINK", NUKA_SENSOR_MOUNT_LINK)
         .value("BODY", NUKA_SENSOR_MOUNT_BODY)
@@ -2626,42 +2673,70 @@ NB_MODULE(_nuka_ext, m) {
              "Configure independent scalar float32 observations. NONE clears errors; "
              "GAUSSIAN uses mean/stddev; POISSON adds a count with the supplied rate. "
              "Registration resets observation history. Physical fields are unchanged.")
-        .def("set_sensor_error", [](World& w, nuka_state_field_t field, const nb::kwargs& options) {
-            nuka_sensor_error_desc_t desc{};
+        .def("attach_state_sensor", [](World& w, nuka_state_sensor_kind_t kind,
+            nuka_sensor_mount_t mount, uint32_t mount_index, const std::array<float, 7>& local_offset,
+            double sample_rate_hz, uint32_t update_period, double latency, double latency_jitter,
+            float dropout_probability, float temperature, uint64_t seed) {
+            nuka_state_sensor_desc_t desc{};
             desc.struct_size = sizeof(desc);
-            desc.reference_temperature = 25.0f;
-            struct Parameter { const char* name; float nuka_sensor_error_desc_t::*member; };
-            const Parameter parameters[] = {
-                {"bias", &nuka_sensor_error_desc_t::bias},
-                {"scale_error", &nuka_sensor_error_desc_t::scale_error},
-                {"noise_density", &nuka_sensor_error_desc_t::noise_density},
-                {"initial_bias_stddev", &nuka_sensor_error_desc_t::initial_bias_stddev},
-                {"bias_random_walk", &nuka_sensor_error_desc_t::bias_random_walk},
-                {"correlated_bias_stddev", &nuka_sensor_error_desc_t::correlated_bias_stddev},
-                {"correlation_time", &nuka_sensor_error_desc_t::correlation_time},
-                {"quantization", &nuka_sensor_error_desc_t::quantization},
-                {"minimum", &nuka_sensor_error_desc_t::minimum},
-                {"maximum", &nuka_sensor_error_desc_t::maximum},
-                {"response_time", &nuka_sensor_error_desc_t::response_time},
-                {"temperature_coefficient", &nuka_sensor_error_desc_t::temperature_coefficient},
-                {"reference_temperature", &nuka_sensor_error_desc_t::reference_temperature},
-            };
-            for (auto item : options) {
-                const auto name = nb::cast<std::string>(item.first);
-                if (name == "seed") { desc.seed = nb::cast<uint64_t>(item.second); continue; }
-                if (name == "saturation_enabled") {
-                    desc.saturation_enabled = nb::cast<bool>(item.second) ? 1u : 0u;
-                    continue;
-                }
-                bool found = false;
-                for (const auto& parameter : parameters) {
-                    if (name != parameter.name) continue;
-                    desc.*(parameter.member) = nb::cast<float>(item.second);
-                    found = true;
-                    break;
-                }
-                if (!found) throw nb::value_error(("unknown sensor error parameter: " + name).c_str());
-            }
+            desc.kind = kind; desc.mount = mount; desc.mount_index = mount_index;
+            for (uint32_t i = 0u; i < 7u; ++i) desc.local_offset[i] = local_offset[i];
+            desc.sample_rate_hz = sample_rate_hz; desc.update_period = update_period;
+            desc.latency = latency; desc.latency_jitter = latency_jitter;
+            desc.dropout_probability = dropout_probability; desc.temperature = temperature; desc.seed = seed;
+            uint32_t id;
+            check(nuka_world_attach_state_sensor(w.raw(), &desc, &id), "nuka_world_attach_state_sensor");
+            return id;
+        }, nb::arg("kind"), nb::arg("mount") = NUKA_SENSOR_MOUNT_BASE, nb::arg("mount_index") = 0u,
+           nb::arg("local_offset") = std::array<float, 7>{0, 0, 0, 1, 0, 0, 0},
+           nb::arg("sample_rate_hz") = 0.0, nb::arg("update_period") = 1u,
+           nb::arg("latency") = 0.0, nb::arg("latency_jitter") = 0.0,
+           nb::arg("dropout_probability") = 0.0f, nb::arg("temperature") = 25.0f, nb::arg("seed") = uint64_t{0},
+           "Attach an automatically sampled physical sensor; return its stable sensor index.")
+        .def("state_sensor_count", [](World& w) {
+            uint32_t count;
+            check(nuka_world_get_state_sensor_count(w.raw(), &count), "nuka_world_get_state_sensor_count");
+            return count;
+        })
+        .def("set_state_sensor_error", [](World& w, uint32_t sensor, uint32_t component, const nb::kwargs& options) {
+            const auto desc = sensor_error_description(options);
+            check(nuka_world_set_state_sensor_error(w.raw(), sensor, component, &desc), "nuka_world_set_state_sensor_error");
+        }, nb::arg("sensor"), nb::arg("component"), nb::arg("options"),
+           "Configure one measurement component and reset that sensor's acquisition history.")
+        .def("get_state_sensor_view", [](World& w, uint32_t sensor) -> FloatArray {
+            nuka_buffer_view_t view{};
+            check(nuka_world_get_state_sensor_view(w.raw(), sensor, &view), "nuka_world_get_state_sensor_view");
+            return make_array_from_view(view, w.env_count(),
+                static_cast<uint32_t>(view.element_count / w.env_count()), nb::cast(&w));
+        }, nb::arg("sensor"), nb::rv_policy::reference_internal,
+           "Read the last delivered measurement as a CUDA view with shape (env, values).")
+        .def("download_state_sensor", [](World& w, uint32_t sensor) -> nb::object {
+            nuka_buffer_view_t view{};
+            check(nuka_world_get_state_sensor_view(w.raw(), sensor, &view), "nuka_world_get_state_sensor_view");
+            float* values = new float[view.element_count];
+            nb::capsule owner(values, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            check(nuka_world_download_state_sensor(w.raw(), sensor, values, view.element_count * sizeof(float), 0u),
+                "nuka_world_download_state_sensor");
+            size_t shape[2] = {w.env_count(), view.element_count / w.env_count()};
+            return nb::cast(nb::ndarray<nb::numpy, float>(values, 2, shape, owner));
+        }, nb::arg("sensor"), "Download the last delivered measurement as a float32 NumPy array.")
+        .def("state_sensor_active", [](World& w, uint32_t sensor) {
+            uint32_t active = 0u;
+            check(nuka_world_get_state_sensor_active(w.raw(), sensor, &active), "nuka_world_get_state_sensor_active");
+            return active != 0u;
+        }, nb::arg("sensor"))
+        .def("state_sensor_stamp", [](World& w, uint32_t sensor, uint32_t env) {
+            nuka_state_sensor_stamp_t stamp{};
+            check(nuka_world_get_state_sensor_stamp(w.raw(), sensor, env, &stamp), "nuka_world_get_state_sensor_stamp");
+            nb::dict result;
+            result["sequence"] = stamp.sequence; result["acquisitions"] = stamp.acquisitions;
+            result["dropped"] = stamp.dropped; result["sample_time"] = stamp.sample_time;
+            result["delivery_time"] = stamp.delivery_time; result["valid"] = stamp.valid != 0u;
+            return result;
+        }, nb::arg("sensor"), nb::arg("env") = 0u,
+           "Read the last delivery and acquisition/drop counters for one environment.")
+        .def("set_sensor_error", [](World& w, nuka_state_field_t field, const nb::kwargs& options) {
+            const auto desc = sensor_error_description(options);
             check(nuka_world_set_sensor_error(w.raw(), field, &desc), "nuka_world_set_sensor_error");
         }, nb::arg("field"), nb::arg("options"),
              "Configure calibration, drift, response, quantization and saturation in physical units.")

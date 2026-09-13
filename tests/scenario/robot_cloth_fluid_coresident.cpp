@@ -106,6 +106,27 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
         sensor_config.error.correlated_bias_stddev = 0.005f;
         sensor_config.error.correlation_time = 0.2f;
         ASSERT_EQ(observation.Configure(sensor_config), nphi::Status::Ok);
+        nuka::sensor::StateSensorDesc imu;
+        imu.mount = nuka::sensor::StateSensorMount::Base;
+        imu.index = 0u;
+        imu.update_period = 2u;
+        imu.latency = Cfg().dt;
+        imu.errors[0] = sensor_config;
+        uint32_t imu_id, joint_id, pose_id;
+        ASSERT_EQ(graph.AttachStateSensor(imu, &imu_id), nphi::Status::Ok);
+        auto joint = imu;
+        joint.kind = nuka::sensor::StateSensorKind::JointState;
+        joint.mount = nuka::sensor::StateSensorMount::Link;
+        joint.index = 2u;
+        joint.update_period = 1u;
+        joint.latency = 0.0;
+        joint.errors[0] = {};
+        ASSERT_EQ(graph.AttachStateSensor(joint, &joint_id), nphi::Status::Ok);
+        auto pose = joint;
+        pose.kind = nuka::sensor::StateSensorKind::FramePose;
+        pose.errors[3].error.noise_density = 0.001f;
+        ASSERT_EQ(graph.AttachStateSensor(pose, &pose_id), nphi::Status::Ok);
+        const auto* sensor_address = graph.StateSensors().Values(imu_id);
         const auto initial = ReadPipelineState(graph);
         const auto* address = graph.DataViewRef().particle_pos;
         const auto* endpoint_address = graph.DataViewRef().contact_endpoint_keys;
@@ -161,6 +182,24 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
                 EXPECT_EQ(flags, std::vector<uint32_t>(envs));
             }
             ASSERT_EQ(observation.Sample(graph.DataViewRef().qdot, Cfg().dt, 25.0f), nphi::Status::Ok);
+            std::vector<float> joint_values(envs * 2u), pose_values(envs * 7u), q(targets.size()), qdot(targets.size());
+            ASSERT_EQ(graph.StateSensors().Download(joint_id, joint_values.data(), joint_values.size() * sizeof(float)), nphi::Status::Ok);
+            ASSERT_EQ(graph.StateSensors().Download(pose_id, pose_values.data(), pose_values.size() * sizeof(float)), nphi::Status::Ok);
+            ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::Q, q.data(), q.size() * sizeof(float)));
+            ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::Qdot, qdot.data(), qdot.size() * sizeof(float)));
+            for (uint32_t env = 0u; env < envs; ++env) {
+                const auto link = env * graph.GetModel().capacities.links_per_env + 2u;
+                EXPECT_EQ(joint_values[env * 2u], q[link]);
+                EXPECT_EQ(joint_values[env * 2u + 1u], qdot[link]);
+                float norm = 0.0f;
+                for (uint32_t axis = 3u; axis < 7u; ++axis) norm += pose_values[env * 7u + axis] * pose_values[env * 7u + axis];
+                EXPECT_NEAR(norm, 1.0f, 2.0e-6f);
+                nuka::sensor::StateSensorStamp stamp;
+                ASSERT_EQ(graph.StateSensors().ReadStamp(joint_id, env, &stamp), nphi::Status::Ok);
+                const uint32_t expected = env == 1u && step >= 8u ? step - 7u : step + 1u;
+                EXPECT_EQ(stamp.acquisitions, expected);
+                EXPECT_NEAR(stamp.sample_time, expected * double{Cfg().dt}, 1.0e-8);
+            }
             EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
             std::vector<uint8_t> eager_state, graph_state;
             ASSERT_TRUE(eager.GetData().DownloadPersistent(&eager_state));
@@ -170,6 +209,10 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
         EXPECT_EQ(graph.CaptureAttempts(), 2u);
         EXPECT_EQ(graph.GraphReplays(), 16u);
         ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
+        EXPECT_EQ(graph.StateSensors().Values(imu_id), sensor_address);
+        nuka::sensor::StateSensorStamp reset_stamp;
+        ASSERT_EQ(graph.StateSensors().ReadStamp(imu_id, 0u, &reset_stamp), nphi::Status::Ok);
+        EXPECT_EQ(reset_stamp.valid, 0u);
         EXPECT_EQ(graph.DataViewRef().particle_pos, address);
         EXPECT_EQ(graph.DataViewRef().contact_endpoint_keys, endpoint_address);
         EXPECT_EQ(graph.DataViewRef().active_row_ids, index_address);

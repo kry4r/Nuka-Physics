@@ -1,46 +1,40 @@
-// ---------------------------------------------------------------------------
-// nuka::sensor -- State-based sensor implementations
-// ---------------------------------------------------------------------------
-
 #include "sensor/state_sensor.hpp"
+
+#include <cmath>
+#include <stdexcept>
 
 namespace nuka::sensor {
 
-SensorPacket BuildTestImuPacket() {
-    SensorPacket pkt;
-    pkt.has_linear_acceleration = true;
-    pkt.has_angular_velocity    = true;
-    pkt.has_position            = true;
-    pkt.linear_acceleration     = {0.0f, -9.81f, 0.0f};
-    pkt.angular_velocity        = {0.0f, 0.0f, 0.0f};
-    pkt.position                = {0.0f, 0.0f, 0.0f};
-    return pkt;
-}
-
-SensorPacket QueryImuSensor(const runtime::rigid::BodyState& body,
-                            math::Vec3 gravity) {
-    SensorPacket pkt;
-    pkt.has_linear_acceleration = true;
-    pkt.has_angular_velocity    = true;
-    pkt.has_position            = true;
-
-    // Accelerometer specific force: applied force minus gravity (reads +g up at
-    // rest). Gravity bypasses body.force in the integrator, so subtract it here.
-    pkt.linear_acceleration = body.force * body.inv_mass - gravity;
-    pkt.angular_velocity    = body.angular_velocity;
-    pkt.position            = body.position;
-    return pkt;
+SensorPacket QueryImuSensor(const MotionFrame& before, const MotionFrame& after,
+    double interval, math::Vec3 gravity, math::Transform local_offset) {
+    if (!(interval > 0.0) || !std::isfinite(interval)) throw std::invalid_argument("IMU interval must be positive and finite");
+    const auto first_pose = before.pose * local_offset;
+    const auto last_pose = after.pose * local_offset;
+    const auto first_velocity = before.linear_velocity + before.angular_velocity.Cross(
+        before.pose.rotation.Rotate(local_offset.position));
+    const auto last_velocity = after.linear_velocity + after.angular_velocity.Cross(
+        after.pose.rotation.Rotate(local_offset.position));
+    const auto a = first_pose.rotation;
+    const auto b = last_pose.rotation;
+    const float sign = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z < 0.0f ? -1.0f : 1.0f;
+    const auto midpoint = math::Quat{a.w + sign * b.w, a.x + sign * b.x,
+                                    a.y + sign * b.y, a.z + sign * b.z}.Normalized();
+    SensorPacket packet;
+    packet.has_linear_acceleration = packet.has_angular_velocity = packet.has_position = true;
+    packet.linear_acceleration = midpoint.Conjugate().Rotate(
+        (last_velocity - first_velocity) / static_cast<float>(interval) - gravity);
+    packet.angular_velocity = midpoint.Conjugate().Rotate(
+        (before.angular_velocity + after.angular_velocity) * 0.5f);
+    packet.position = last_pose.position;
+    return packet;
 }
 
 SensorPacket QueryJointStateSensor(float joint_angle, float joint_velocity) {
-    SensorPacket pkt;
-    pkt.has_position         = true;
-    pkt.has_angular_velocity = true;
-
-    // Encode joint angle in position.x and velocity in angular_velocity.x
-    pkt.position         = {joint_angle, 0.0f, 0.0f};
-    pkt.angular_velocity = {joint_velocity, 0.0f, 0.0f};
-    return pkt;
+    SensorPacket packet;
+    packet.has_position = packet.has_angular_velocity = true;
+    packet.position = {joint_angle, 0.0f, 0.0f};
+    packet.angular_velocity = {joint_velocity, 0.0f, 0.0f};
+    return packet;
 }
 
-} // namespace nuka::sensor
+}  // namespace nuka::sensor

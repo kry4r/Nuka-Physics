@@ -139,6 +139,53 @@ std::array<double, 7> RotationReference(Vec3 inertia, Vec3 omega, Quat principal
 }
 }  // namespace
 
+TEST(FreeRigidDynamics, MountedImuIncludesFreeFallAndCentripetalAcceleration) {
+    auto& backend = Device();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (uint32_t substeps : {1u, 4u}) {
+        auto config = Config();
+        config.dt = 0.002f;
+        config.substeps = substeps;
+        config.gravity[2] = -9.81f;
+        scene::RigidBodyRecord body;
+        body.mass = 2.0f;
+        body.inertia = {0.2f, 0.2f, 0.2f};
+        body.local_transform.position.z = 3.0f;
+        body.inertial_transform.position = {0.12f, -0.07f, 0.03f};
+        auto model = CookFreeBody(body, false);
+        model.body_init[0].angular_velocity = {0.0f, 0.0f, 3.0f};
+        nk::World world(std::move(model), 3u, backend.device, backend.backend, config);
+        ASSERT_TRUE(world.Ready()) << world.CreationError();
+        nuka::sensor::StateSensorDesc imu;
+        imu.mount = nuka::sensor::StateSensorMount::Body;
+        imu.index = 0u;
+        imu.local_offset.position = body.inertial_transform.position;
+        uint32_t center_id, offset_id;
+        ASSERT_EQ(world.AttachStateSensor(imu, &center_id), phi::Status::Ok);
+        imu.local_offset.position.x += 0.2f;
+        imu.local_offset.rotation = Quat::FromAxisAngle({1, 0, 0}, 1.57079632679f);
+        ASSERT_EQ(world.AttachStateSensor(imu, &offset_id), phi::Status::Ok);
+        ASSERT_EQ(world.SetExecutionMode(nk::World::ExecutionMode::Graph), phi::Status::Ok);
+        nuka::sensor::StateSensorStamp stamp;
+        ASSERT_EQ(world.StateSensors().ReadStamp(center_id, 0u, &stamp), phi::Status::Ok);
+        EXPECT_EQ(stamp.acquisitions, 0u);
+        for (uint32_t step = 0u; step < 40u; ++step) {
+            ASSERT_EQ(world.StepConfigured(), phi::Status::Ok);
+            std::vector<float> center(18u), offset(18u);
+            ASSERT_EQ(world.StateSensors().Download(center_id, center.data(), center.size() * sizeof(float)), phi::Status::Ok);
+            ASSERT_EQ(world.StateSensors().Download(offset_id, offset.data(), offset.size() * sizeof(float)), phi::Status::Ok);
+            for (uint32_t env = 0u; env < 3u; ++env) {
+                for (uint32_t axis = 0u; axis < 3u; ++axis) EXPECT_NEAR(center[env * 6u + axis], 0.0f, 5.0e-4f);
+                EXPECT_NEAR(center[env * 6u + 5u], 3.0f, 1.0e-5f);
+                EXPECT_NEAR(offset[env * 6u], -1.8f, 1.0e-3f);
+                EXPECT_NEAR(offset[env * 6u + 1u], 0.0f, 5.0e-4f);
+                EXPECT_NEAR(offset[env * 6u + 2u], 0.0f, 5.0e-4f);
+                EXPECT_NEAR(offset[env * 6u + 4u], 3.0f, 1.0e-5f);
+            }
+        }
+    }
+}
+
 TEST(FreeRigidDynamics, FreeRotationConservesMomentumAndConvergesToTheReference) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";

@@ -455,7 +455,8 @@ void ParseDefaults(tinyxml2::XMLElement* mujoco, MjcfParseContext& context) {
 // rejected by the caller, not silently coerced.
 bool MjcfSensorType(const std::string& tag, scene::SensorType& out) {
     if (tag == "rangefinder") { out = scene::SensorType::RangeScan; return true; }
-    if (tag == "accelerometer" || tag == "gyro" || tag == "velocimeter") {
+    if (tag == "velocimeter") { out = scene::SensorType::LinearVelocity; return true; }
+    if (tag == "accelerometer" || tag == "gyro") {
         out = scene::SensorType::Imu; return true;
     }
     if (tag == "force" || tag == "torque") { out = scene::SensorType::ForceTorque; return true; }
@@ -603,6 +604,8 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
     scene::RigidBodyRecord rec;
     rec.name = body_name;
     rec.parent_id = parent_id;
+    rec.is_static = parent_id == scene::kInvalidBody &&
+        !body_elem->FirstChildElement("joint") && !body_elem->FirstChildElement("freejoint");
     // Missing <inertial> stays massless until geom-derived inertia is supported;
     // never leak the SceneIR construction placeholder into imported physics.
     rec.mass = 0.0f;
@@ -1067,6 +1070,14 @@ void ParseSensors(tinyxml2::XMLElement* mujoco,
         // A <site> carries (body, local frame); else objname/body name a body.
         // An unresolved name stays kInvalidBody for the runtime to flag.
         record.mount = scene::MountFrame::Body;
+        if (record.type == scene::SensorType::JointState) {
+            record.joint_id = ResolveJoint(sensor->Attribute("joint"), context);
+            if (record.joint_id == scene::kInvalidJoint)
+                throw std::runtime_error("MJCF: joint sensor has an unresolved joint");
+            record.mount_index = scene.GetJoint(record.joint_id).child_body;
+            scene.AddSensor(std::move(record));
+            continue;
+        }
         const char* site_name = sensor->Attribute("site");
         if (site_name) {
             const auto it = context.site_ids.find(site_name);

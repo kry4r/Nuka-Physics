@@ -5,6 +5,7 @@
 #include "c_abi/dlpack_table.hpp"
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
+#include "c_abi/measurement_error.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/scoped_device_guard.hpp"
@@ -298,23 +299,7 @@ nuka_result_t nuka_world_set_sensor_error(nuka_world_handle world,
     if (!record) return NUKA_RESULT_NULL_HANDLE;
     if (!desc) return nuka_world_set_sensor_noise(world, field, nullptr);
     try {
-        nuka::sensor::ObservationConfig config;
-        config.noise.seed = desc->seed;
-        auto& error = config.error;
-        error.bias = desc->bias;
-        error.scale_error = desc->scale_error;
-        error.noise_density = desc->noise_density;
-        error.initial_bias_stddev = desc->initial_bias_stddev;
-        error.bias_random_walk = desc->bias_random_walk;
-        error.correlated_bias_stddev = desc->correlated_bias_stddev;
-        error.correlation_time = desc->correlation_time;
-        error.quantization = desc->quantization;
-        error.minimum = desc->minimum;
-        error.maximum = desc->maximum;
-        error.response_time = desc->response_time;
-        error.temperature_coefficient = desc->temperature_coefficient;
-        error.reference_temperature = desc->reference_temperature;
-        error.saturation_enabled = desc->saturation_enabled;
+        const auto config = nuka::c_abi::MeasurementErrorConfig(desc);
         if (!nuka::sensor::ValidObservationConfig(config)) return NUKA_RESULT_INVALID_ARG;
         nuka_buffer_view_t source{};
         nuka::sensor::Observation* observation = nullptr;
