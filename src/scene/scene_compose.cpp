@@ -115,6 +115,7 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
     for (const SensorDesc& src : addon.Sensors()) {
         SensorDesc rec = src;
         rec.name = PrefixName(addon_name_prefix, rec.name);
+        rec.joint_id = RemapId(rec.joint_id, joint_off);
         if (rec.mount == MountFrame::Body) {
             rec.mount_index = RemapId(rec.mount_index, body_off);
         }

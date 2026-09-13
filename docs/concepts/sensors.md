@@ -1,6 +1,55 @@
 # Sensor observations
 
-Physical state and measured observations have separate storage. `world.buffer_view(field)` and `world.download_field(field)` return physical state. Noise acquisition writes only to `world.get_observation_view(field)` and `world.download_observation(field)`.
+Physical state and measured observations have separate storage. `world.buffer_view(field)` and `world.download_field(field)` return physical state. Mounted sensors sample automatically during `world.step()`. Scalar field observations use explicit acquisition and separate observation views.
+
+## Mounted state sensors
+
+Attach sensors before or after stepping; attaching one rebuilds the execution plan while preserving existing views:
+
+```python
+imu = world.attach_state_sensor(
+    nuka.StateSensorKind.IMU,
+    mount=nuka.SensorMount.BASE, mount_index=0,
+    local_offset=(0.02, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0),
+    update_period=2,
+    latency=0.01, latency_jitter=0.001,
+    dropout_probability=0.01, seed=42,
+)
+nuka.MeasurementError(
+    bias=0.01, noise_density=0.002, bias_random_walk=0.0001,
+    correlated_bias_stddev=0.001, correlation_time=30.0,
+).configure_sensor(world, imu, component=0)
+world.step_n(10)
+values = world.download_state_sensor(imu)  # shape: (environments, values)
+stamp = world.state_sensor_stamp(imu, env=0)
+```
+
+`local_offset` is position xyz followed by quaternion wxyz. `LINK` selects a cooked link within each environment, `BASE` selects an articulation root, and `BODY` selects an owning rigid body. Articulation body mounts resolve to the corresponding link. These indices belong to the cooked model; imported SceneIR body and joint references are resolved during cooking.
+
+| Kind | Output and units |
+| --- | --- |
+| `IMU` | Specific force xyz in m/s², then angular velocity xyz in rad/s, both in sensor axes |
+| `FRAME_POSE` | World position xyz in meters, then unit quaternion wxyz |
+| `JOINT_STATE` | Position and velocity: rad, rad/s for revolute joints; m, m/s for prismatic joints |
+| `LINEAR_VELOCITY` | Mounting point linear velocity xyz in m/s, expressed in sensor axes |
+
+IMU acquisition integrates velocity changes over physical substeps and subtracts gravity. Free fall therefore gives zero specific force at the center of mass; supported rest measures the opposing gravity vector. Off-center mounts include angular acceleration and centripetal acceleration. Solved contact impulses are included. Each substep uses the midpoint sensor orientation; high angular rates still require adequate integration resolution. Position and velocity sensors acquire the endpoint state.
+
+Error components follow output order except for pose orientation: components 3–5 are local rotation-vector errors in radians, applied on SO(3). Orientation response filtering preserves unit quaternions. Scalar gain errors are not defined for these orientation components and are rejected. Other state sensors and pose translation use the scalar error parameters below.
+
+`update_period` counts outer timesteps. A positive `sample_rate_hz` overrides it and cannot exceed the integration substep rate. Acquisition and delivery occur at integration boundaries; rates that do not divide that cadence are rounded to the next boundary without accumulating schedule drift. The first acquisition follows one sample period after attachment or reconfiguration.
+
+Delivery uses fixed `latency` plus uniform jitter in `[-latency_jitter, +latency_jitter]`, with negative delays clamped to zero. Packets preserve acquisition order. `dropout_probability` drops deliveries while continuing the sensor's acquisition clock and stochastic error processes. The latest delivered sample is held between deliveries. Queue storage is sized from the maximum delay and sample period; unexpected overflow sets `ENV_STATUS_SENSOR_QUEUE_OVERFLOW`.
+
+`state_sensor_stamp` reports `sequence`, `acquisitions`, `dropped`, `sample_time`, `delivery_time` and `valid`. Times use the environment's simulation clock, which restarts on environment reset. Reading a view or stamp does not acquire a sample. `world.get_state_sensor_view(imu)` provides a float32 device view with the same shape as the downloaded array.
+
+Checkpoint replay includes pending packets, clocks, accumulated IMU exposure, filter state and random processes. Restoring a checkpoint from before attachment deactivates later sensors and zeroes their existing views without freeing them. IDs remain stable allocation slots: `state_sensor_count()` includes inactive slots, and `state_sensor_active(id)` identifies active sensors. Reconfiguring an allocated sensor reactivates it and clears its complete sampling history.
+
+MJCF accelerometer/gyro, joint position/velocity, frame pose and velocimeter records create these sensors automatically. IMU and joint records expose the complete paired outputs shown above. Runtime noise and delivery settings are preserved by checkpoints but are not serialized in NKS. Camera and lidar APIs remain separate; six-axis joint force/torque and contact transducers are not provided by these four sensor kinds. Differentiable Tape creation, stepping and backward replay reject active mounted sensors because Tape does not execute this sampling pipeline.
+
+## Explicit scalar observations
+
+`world.get_observation_view(field)` and `world.download_observation(field)` read manually acquired scalar observations.
 
 Configure an observation once, then acquire after advancing the world:
 

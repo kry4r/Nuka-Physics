@@ -12,6 +12,7 @@
 #include <sstream>
 
 #include "phi/backend_cuda/cuda_internal.cuh"
+#include "phi/articulation_contract.hpp"
 #include "render/render_world.hpp"
 #include "render/sensor_backend.hpp"
 #include "render/rt_adapter.hpp"
@@ -38,6 +39,7 @@ struct Options {
     float dt = 1.0f / 240.0f;
     uint32_t capacity_scale = 1u;
     uint32_t substeps = 1u;
+    uint32_t state_sensors = 0u;
     uint32_t cloth_nx = fixture::kClothNx;
     uint32_t render_sensors = 0u, render_width = 256u, render_height = 256u;
     uint32_t render_samples = 4u, render_shadows = 4u, render_ao = 3u, render_warmup = 32u;
@@ -64,6 +66,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--steps") options.steps = ParseU32(value);
         else if (flag == "--warmup") options.warmup = ParseU32(value);
         else if (flag == "--substeps") options.substeps = ParseU32(value);
+        else if (flag == "--state-sensors") options.state_sensors = ParseU32(value);
         else if (flag == "--seed") options.seed = ParseU32(value);
         else if (flag == "--dt") {
             size_t consumed = 0u;
@@ -87,6 +90,7 @@ Options Parse(int argc, char** argv) {
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
+        options.state_sensors > 1u ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
         uint64_t{options.steps} + options.warmup > std::numeric_limits<uint32_t>::max() ||
         (options.execution != "eager" && options.execution != "graph"))
@@ -126,6 +130,54 @@ void Step(nk::World& world, const Options& options) {
                                  ", op " + std::to_string(static_cast<unsigned>(error.failed_op)) +
                                  ", native " + std::to_string(error.native_code) + ": " + error.message);
     }
+}
+
+void AttachStateSensors(nk::World& world, const Options& options) {
+    if (!options.state_sensors) return;
+    const auto& topology = world.GetModel().articulation;
+    for (size_t articulation = 0u; articulation < topology.articulation_link_offset.size(); ++articulation) {
+        nuka::sensor::StateSensorDesc desc;
+        desc.mount = nuka::sensor::StateSensorMount::Link;
+        desc.index = topology.articulation_link_offset[articulation];
+        desc.latency = double{options.dt} * 2.0;
+        desc.latency_jitter = double{options.dt} * 0.5;
+        desc.dropout_probability = 0.1f;
+        desc.seed = options.seed;
+        for (auto& error : desc.errors) {
+            error.error.noise_density = 0.01f;
+            error.error.initial_bias_stddev = 0.02f;
+            error.error.bias_random_walk = 0.002f;
+            error.error.correlated_bias_stddev = 0.005f;
+            error.error.correlation_time = 0.2f;
+        }
+        uint32_t id;
+        for (auto kind : {nuka::sensor::StateSensorKind::Imu, nuka::sensor::StateSensorKind::FramePose,
+                          nuka::sensor::StateSensorKind::LinearVelocity}) {
+            desc.kind = kind;
+            fixture::Require(world.AttachStateSensor(desc, &id) == phi::Status::Ok, "state sensor attachment failed");
+        }
+        const auto end = desc.index + topology.articulation_link_count[articulation];
+        for (uint32_t link = desc.index; link < end; ++link) {
+            const auto kind = static_cast<phi::ArticulationJointType>(topology.joint_type[link]);
+            if (kind != phi::ArticulationJointType::Revolute && kind != phi::ArticulationJointType::Prismatic) continue;
+            desc.kind = nuka::sensor::StateSensorKind::JointState;
+            desc.index = link;
+            fixture::Require(world.AttachStateSensor(desc, &id) == phi::Status::Ok, "joint sensor attachment failed");
+            break;
+        }
+    }
+}
+
+std::vector<uint8_t> StateSensorBytes(nk::World& world) {
+    std::vector<uint8_t> bytes;
+    if (!world.StateSensors().HasActive()) return bytes;
+    nuka::sensor::StateSensorBankSnapshot snapshot;
+    fixture::Require(world.StateSensors().Capture(&snapshot) == phi::Status::Ok, "sensor snapshot failed");
+    for (const auto& channel : snapshot.sensors)
+        if (channel.active) bytes.insert(bytes.end(), channel.bytes.begin(), channel.bytes.end());
+    const auto* times = reinterpret_cast<const uint8_t*>(snapshot.times.data());
+    bytes.insert(bytes.end(), times, times + snapshot.times.size() * sizeof(double));
+    return bytes;
 }
 
 constexpr std::array<nk::FieldId, 10> kPhysicalFields{
@@ -226,6 +278,7 @@ Json Memory(nk::World& world) {
     memory.Set("workspace_bytes", Json::Int(arena_bytes[1]));
     memory.Set("tape_bytes", Json::Int(arena_bytes[2]));
     memory.Set("data_bytes", Json::Int(arena_bytes[0] + arena_bytes[1] + arena_bytes[2]));
+    memory.Set("state_sensor_bytes", Json::Int(world.StateSensors().StorageBytes()));
     for (const auto& segment : world.GetData().Segments()) {
         Json item = Json::Object();
         item.Set("field_id", Json::Int(static_cast<uint32_t>(segment.field)));
@@ -672,6 +725,7 @@ Json Run(const Options& options) {
     const auto create_start = Clock::now();
     nk::World world(std::move(model), options.envs, device, owner.backend, config);
     fixture::Require(world.Ready(), world.CreationError());
+    AttachStateSensors(world, options);
     fixture::Require(world.FieldPtr(nk::FieldId::ContactForce) != nullptr, "contact readout unavailable");
     CheckCuda(cudaStreamSynchronize(stream));
     const double creation_ms = Milliseconds(create_start);
@@ -716,6 +770,7 @@ Json Run(const Options& options) {
         gpu_us[i] = static_cast<double>(elapsed) * 1000.0;
     }
     const auto timed_state = State(world);
+    const auto timed_sensors = StateSensorBytes(world);
 
     const auto quality_start = Clock::now();
     fixture::Require(world.Reset() == phi::Status::Ok, "quality replay reset failed");
@@ -789,6 +844,7 @@ Json Run(const Options& options) {
         }
     }
     const auto replay_state = State(world);
+    const auto replay_sensors = StateSensorBytes(world);
     bool finite = true;
     const auto physical_state = State(world, false);
     const auto mismatched_envs = MismatchedReplicas(world, physical_state);
@@ -811,10 +867,11 @@ Json Run(const Options& options) {
     configuration.Set("envs", Json::Int(options.envs));
     configuration.Set("dt", Json::Float(options.dt));
     configuration.Set("substeps", Json::Int(options.substeps));
+    configuration.Set("state_sensors", Json::Int(options.state_sensors));
     configuration.Set("fixture_dt", Json::Float(fixture_config.dt));
     configuration.Set("fixture_substeps", Json::Int(fixture_config.substeps));
     configuration.Set("seed", Json::Int(options.seed));
-    configuration.Set("seed_usage", Json::Str("deterministic held control; no randomization"));
+    configuration.Set("seed_usage", Json::Str("deterministic held control; optional sensor error and delivery randomization"));
     configuration.Set("vel_iters", Json::Int(config.vel_iters));
     configuration.Set("cloth_iters", Json::Int(fixture::kClothIters));
     configuration.Set("cloth_grid", Json::Int(options.cloth_nx));
@@ -848,6 +905,21 @@ Json Run(const Options& options) {
     per_tag.Set("host_step_submission", Distribution(std::move(host_us)));
     result.Set("per_tag", std::move(per_tag));
     result.Set("memory", Memory(world));
+    Json sensors = Json::Object();
+    sensors.Set("count", Json::Int(world.StateSensors().Count()));
+    sensors.Set("timed_replay_bit_equal", Json::Bool(timed_sensors == replay_sensors));
+    sensors.Set("state_fnv1a64", Json::Str(Digest(replay_sensors)));
+    sensors.Set("scope", Json::Str("IMU, pose and velocity per base; encoder on each articulation's first scalar joint"));
+    sensors.Set("update_period", Json::Int(1));
+    sensors.Set("noise_density", Json::Float(0.01));
+    sensors.Set("initial_bias_stddev", Json::Float(0.02));
+    sensors.Set("bias_random_walk", Json::Float(0.002));
+    sensors.Set("correlated_bias_stddev", Json::Float(0.005));
+    sensors.Set("correlation_time", Json::Float(0.2));
+    sensors.Set("latency", Json::Float(double{options.dt} * 2.0));
+    sensors.Set("latency_jitter", Json::Float(double{options.dt} * 0.5));
+    sensors.Set("dropout_probability", Json::Float(0.1));
+    result.Set("state_sensors", std::move(sensors));
     Json workload = Json::Object();
     workload.Set("scope", Json::Str("untimed quality replay; active rows and canonical island ownership checked"));
     workload.Set("samples", std::move(workload_samples));
@@ -909,12 +981,14 @@ Json Run(const Options& options) {
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
     const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && timed_state == replay_state &&
-                       coupling_valid && mismatched_envs.empty() && xpbd_acceptance.Valid() && render_valid;
+                       coupling_valid && mismatched_envs.empty() && xpbd_acceptance.Valid() && render_valid &&
+                       timed_sensors == replay_sensors;
     validity.Set("valid", Json::Bool(valid));
     Json failures = Json::Array();
     if (!xpbd_acceptance.Valid()) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
     if (!coupling_valid) failures.PushBack(Json::Str("missing positive cloth/fluid-articulation impulse during complete replay"));
     if (!render_valid) failures.PushBack(Json::Str("sensor lifecycle, output or physics parity failed"));
+    if (timed_sensors != replay_sensors) failures.PushBack(Json::Str("mounted sensor replay mismatch"));
     validity.Set("failures", std::move(failures));
     unavailable.PushBack(Json::Str("GPU clocks, source/binary SHA256 and process identity are collected by the sweep runner"));
     unavailable.PushBack(Json::Str("residual, complementarity and detailed penetration observability remain incomplete"));

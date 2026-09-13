@@ -110,6 +110,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         return;
     }
     model_.capacities.integration_substeps = Pipeline::SubstepCount(model_, cfg_);
+    const double interval = cfg_.dt / static_cast<float>(model_.capacities.integration_substeps);
+    state_sensors_.Initialize(backend_, EnvCount(), interval * model_.capacities.integration_substeps,
+        interval, model_.capacities.links_per_env, model_.capacities.bodies_per_env,
+        model_.capacities.articulations_per_env);
+    state_sensors_.SetGravity(Gravity());
     creation_status_ = pipeline_->Build(model_, cfg_, device_, readout_demand_);
     for (phi::NkOp op : pipeline_->MissingOps())
         creation_error_ += "missing required op " + std::to_string(static_cast<uint32_t>(op)) + "; ";
@@ -255,6 +260,20 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         ready_ = false;
         creation_status_ = phi::Status::Failed;
         creation_error_ = "initial state or snapshot dispatch failed";
+        return;
+    }
+    for (const auto& desc : model_.state_sensors) {
+        uint32_t id;
+        creation_status_ = state_sensors_.Add(model_, desc, &id);
+        if (creation_status_ != phi::Status::Ok) {
+            ready_ = false;
+            creation_error_ = "invalid state sensor configuration or allocation failure";
+            return;
+        }
+    }
+    if (!model_.state_sensors.empty()) {
+        creation_status_ = RebuildPipeline();
+        if (creation_status_ != phi::Status::Ok) { ready_ = false; creation_error_ = "state sensor pipeline build failed"; }
     }
 }
 
@@ -628,6 +647,7 @@ StepResult World::Step() {
         }
     }
     last_status_ = out.result;
+    if (out.result == phi::Status::Ok) state_sensors_.StepCompleted();
     return out;
 }
 
@@ -654,7 +674,7 @@ phi::Status World::StepPlanned() {
     const auto status = PrepareGraph();
     if (status != phi::Status::Ok) return status;
     last_status_ = phi::BackendPlanExecute(backend_, plan_, &execution_error_);
-    if (last_status_ == phi::Status::Ok) ++graph_replays_;
+    if (last_status_ == phi::Status::Ok) { ++graph_replays_; state_sensors_.StepCompleted(); }
     return last_status_;
 }
 
@@ -698,7 +718,8 @@ phi::Status World::Reset(const std::vector<uint32_t>& env_ids) {
         ? DispatchOp(phi::NkOp::RestoreState, &restore_params_)
         : DispatchOp(phi::NkOp::ResetEnvs, &reset_params_);
     if (status != phi::Status::Ok) return status;
-    return RefreshPoses(reset_params_.count);
+    status = RefreshPoses(reset_params_.count);
+    return status == phi::Status::Ok ? state_sensors_.Reset(selected) : status;
 }
 
 phi::Status World::RefreshPoses(uint32_t selected_env_count) {
@@ -737,7 +758,7 @@ phi::Status World::SetGravity(const math::Vec3& gravity) {
     config.gravity[1] = gravity.y;
     config.gravity[2] = gravity.z;
     auto candidate = std::make_unique<Pipeline>();
-    last_status_ = candidate->Build(model_, config, device_, readout_demand_);
+    last_status_ = candidate->Build(model_, config, device_, readout_demand_, &state_sensors_);
     if (last_status_ != phi::Status::Ok) return last_status_;
     last_status_ = Synchronize();
     if (last_status_ != phi::Status::Ok) return last_status_;
@@ -749,6 +770,7 @@ phi::Status World::SetGravity(const math::Vec3& gravity) {
     graph_error_ = {};
     pipeline_ = std::move(candidate);
     cfg_ = config;
+    state_sensors_.SetGravity(gravity);
     return last_status_ = phi::Status::Ok;
 }
 
@@ -798,7 +820,7 @@ phi::Status World::DemandReadout(FieldId id) {
         return last_status_ = phi::Status::Ok;
     }
     auto candidate = std::make_unique<Pipeline>();
-    last_status_ = candidate->Build(model_, cfg_, device_, readout_demand_ | bit);
+    last_status_ = candidate->Build(model_, cfg_, device_, readout_demand_ | bit, &state_sensors_);
     if (last_status_ != phi::Status::Ok) return last_status_;
     for (const phi::OpCall& call : candidate->Calls()) {
         if (call.op == phi::NkOp::ReadoutContactWrench) {
@@ -817,6 +839,45 @@ phi::Status World::DemandReadout(FieldId id) {
     pipeline_ = std::move(candidate);
     readout_demand_ |= bit;
     return last_status_ = phi::Status::Ok;
+}
+
+phi::Status World::RebuildPipeline() {
+    auto candidate = std::make_unique<Pipeline>();
+    auto status = candidate->Build(model_, cfg_, device_, readout_demand_, &state_sensors_);
+    if (status != phi::Status::Ok) return last_status_ = status;
+    if (plan_) { phi::BackendPlanFree(backend_, plan_); plan_ = nullptr; }
+    plan_attempted_ = false;
+    graph_error_ = {};
+    pipeline_ = std::move(candidate);
+    return last_status_ = phi::Status::Ok;
+}
+
+phi::Status World::AttachStateSensor(const sensor::StateSensorDesc& desc, uint32_t* id) {
+    if (!ready_ || !id) return phi::Status::InvalidArgument;
+    for (const auto op : {phi::NkOp::ReadoutMotion, phi::NkOp::SampleStateSensor, phi::NkOp::AdvanceSensorTime})
+        if (!phi::DeviceSupportsOp(device_, op)) return phi::Status::Unsupported;
+    auto status = Synchronize();
+    if (status != phi::Status::Ok) return status;
+    uint32_t added = ~0u;
+    status = state_sensors_.Add(model_, desc, &added);
+    if (status != phi::Status::Ok) return status;
+    try { status = RebuildPipeline();
+    } catch (...) { state_sensors_.RemoveLast(added); throw; }
+    if (status == phi::Status::Ok) *id = added;
+    else state_sensors_.RemoveLast(added);
+    return status;
+}
+
+phi::Status World::ConfigureStateSensorError(uint32_t id, uint32_t channel, const sensor::ObservationConfig& config) {
+    auto status = Synchronize();
+    if (status != phi::Status::Ok) return status;
+    status = state_sensors_.ConfigureError(id, channel, config);
+    return status == phi::Status::Ok ? RebuildPipeline() : status;
+}
+
+phi::Status World::RestoreStateSensors(const sensor::StateSensorBankSnapshot& snapshot) {
+    auto status = state_sensors_.Restore(snapshot);
+    return status == phi::Status::Ok ? RebuildPipeline() : status;
 }
 
 void* World::FieldPtr(FieldId id) const {

@@ -129,6 +129,7 @@ set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.hpp
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_diffsim.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_noise.h
+    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_state_sensor.h
     # M8 T5: the offscreen recorder C ABI (PPM P6 capture + ffmpeg mp4). Its
     # IMPLEMENTATION (c_abi/recorder.cpp) is gated behind NK_BUILD_VULKAN_VALIDATION
     # (Decision D5) but the header + the exported symbols are ALWAYS present so the
@@ -596,6 +597,7 @@ add_library(nuka_nk STATIC
     nk/solve/schedule.cpp
     nk/solve/xpbd_coloring.cpp
     sensor/observation.cpp
+    sensor/state_bank.cpp
 )
 set_target_properties(nuka_nk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(nuka_nk nuka_codegen)
@@ -1403,6 +1405,7 @@ if(CMAKE_CUDA_COMPILER)
         c_abi/error.cpp
         c_abi/diffsim.cpp
         c_abi/noise.cpp
+        c_abi/state_sensor.cpp
         # M8 T5: the offscreen RECORDER C ABI (frame loop -> raster -> PPM P6 ->
         # ffmpeg mp4). ALWAYS compiled (so the symbols export for the python
         # binding), but its render-touching body is behind NK_BUILD_VULKAN_VALIDATION

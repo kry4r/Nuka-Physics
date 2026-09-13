@@ -21,6 +21,7 @@ struct WorldCheckpointRecord {
     runtime::WorldStepOptions step_options;
     uint32_t sparse_solver_backend = 0u;
     std::map<nuka_state_field_t, sensor::ObservationSnapshot> observations;
+    sensor::StateSensorBankSnapshot state_sensors;
     sensor::noise::DomainRandomizationConfig dr_config;
     bool dr_baseline_captured = false;
     std::vector<float> dr_nominal_link_mass;
@@ -60,7 +61,22 @@ void HashFloatVector(uint64_t* hash, const std::vector<float>& values) {
     }
 }
 
+void HashObservationConfig(uint64_t* hash, const sensor::ObservationConfig& config) {
+    HashValue(hash, static_cast<uint32_t>(config.noise.kind));
+    HashValue(hash, config.noise.param1);
+    HashValue(hash, config.noise.param2);
+    HashValue(hash, config.noise.seed);
+    const auto& e = config.error;
+    const float parameters[] = {e.bias, e.scale_error, e.noise_density, e.initial_bias_stddev,
+        e.bias_random_walk, e.correlated_bias_stddev, e.correlation_time, e.quantization,
+        e.minimum, e.maximum, e.response_time, e.temperature_coefficient, e.reference_temperature};
+    HashBytes(hash, parameters, sizeof(parameters));
+    HashValue(hash, e.saturation_enabled);
+}
+
 phi::Status CopyHostState(const WorldRecord& source, WorldCheckpointRecord* target) {
+    const auto sensor_status = source.world->StateSensors().Capture(&target->state_sensors);
+    if (sensor_status != phi::Status::Ok) return sensor_status;
     target->simulated_step_count = source.simulated_step_count;
     target->step_options = source.step_options;
     target->sparse_solver_backend = source.sparse_solver_backend;
@@ -99,6 +115,34 @@ void RestoreHostState(const WorldCheckpointRecord& source, WorldRecord* target) 
 phi::Status HashHostState(uint64_t* hash, const WorldRecord& record) {
     HashValue(hash, record.env_count);
     HashValue(hash, record.simulated_step_count);
+    sensor::StateSensorBankSnapshot state_sensors;
+    const auto sensor_status = record.world->StateSensors().Capture(&state_sensors);
+    if (sensor_status != phi::Status::Ok) return sensor_status;
+    HashValue(hash, state_sensors.step);
+    for (uint64_t reset : state_sensors.reset_steps) HashValue(hash, reset);
+    uint64_t sensor_count = 0u;
+    for (const auto& sensor : state_sensors.sensors) if (sensor.active) ++sensor_count;
+    HashValue(hash, sensor_count);
+    if (sensor_count) for (double time : state_sensors.times) HashValue(hash, time);
+    for (uint32_t id = 0u; id < state_sensors.sensors.size(); ++id) {
+        const auto& sensor = state_sensors.sensors[id];
+        if (!sensor.active) continue;
+        HashValue(hash, id);
+        const auto& d = sensor.desc;
+        HashValue(hash, static_cast<uint32_t>(d.kind));
+        HashValue(hash, static_cast<uint32_t>(d.mount));
+        HashValue(hash, d.index);
+        HashValue(hash, d.update_period);
+        HashBytes(hash, &d.local_offset, sizeof(d.local_offset));
+        HashValue(hash, d.sample_period);
+        HashValue(hash, d.latency);
+        HashValue(hash, d.latency_jitter);
+        HashValue(hash, d.dropout_probability);
+        HashValue(hash, d.temperature);
+        HashValue(hash, d.seed);
+        for (const auto& error : d.errors) HashObservationConfig(hash, error);
+        HashBytes(hash, sensor.bytes.data(), sensor.bytes.size());
+    }
     const uint8_t mode = static_cast<uint8_t>(record.control_mode);
     HashValue(hash, mode);
     HashValue(hash, record.sparse_solver_backend);
@@ -216,6 +260,7 @@ nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
         return NUKA_RESULT_NOT_SUPPORTED;
     }
     try {
+        if (!record->world->StateSensors().Compatible(saved->state_sensors)) return NUKA_RESULT_INVALID_ARG;
         for (const auto& entry : saved->observations) {
             const auto found = record->field_observations.find(entry.first);
             if (found == record->field_observations.end() || !found->second->Compatible(entry.second))
@@ -231,7 +276,7 @@ nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
                 entry.second->Restore(found->second);
             if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
         }
-        return NUKA_RESULT_OK;
+        return nuka::c_abi::MapStatusToResult(record->world->RestoreStateSensors(saved->state_sensors));
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
@@ -263,7 +308,7 @@ nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash)
             return NUKA_RESULT_INTERNAL;
         }
         uint64_t hash = nuka::c_abi::kFnvOffset;
-        constexpr char domain[] = "NukaStateHashV2";
+        constexpr char domain[] = "NukaStateHashV3";
         nuka::c_abi::HashBytes(&hash, domain, sizeof(domain));
         const auto status = nuka::c_abi::HashHostState(&hash, *record);
         if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);

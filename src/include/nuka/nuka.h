@@ -621,7 +621,8 @@ typedef enum nuka_env_status_t {
     // Material integration failed; the prior elastic/plastic history is retained.
     NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE = 1u << 8,
     NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW = 1u << 9,
-    NUKA_ENV_STATUS_CONTROL_FAILURE = 1u << 10
+    NUKA_ENV_STATUS_CONTROL_FAILURE = 1u << 10,
+    NUKA_ENV_STATUS_SENSOR_QUEUE_OVERFLOW = 1u << 11
 } nuka_env_status_t;
 
 typedef enum nuka_gyro_status_t {

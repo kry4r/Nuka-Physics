@@ -22,6 +22,7 @@
 #include "math/vec3.hpp"
 #include "nk/contact/contact_profile.hpp"
 #include "nk/material/mpm_material.hpp"
+#include "sensor/state_types.hpp"
 #include "phi/backend.hpp"   // phi::ModelView, BufferType, Buffer (forward + wrappers)
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/generated/arena_layout.hpp"
@@ -306,6 +307,7 @@ struct HeightfieldData {
 class Model {
 public:
     Model() = default;
+    std::vector<sensor::StateSensorDesc> state_sensors;
 
     // -- cook-product host tables (filled by CookToModel) -------------------
     ModelCapacities                 capacities;

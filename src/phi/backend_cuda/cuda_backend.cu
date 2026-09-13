@@ -66,6 +66,9 @@ const char* NkOpName(int op) {
         case NkOp::ExportObs: return "ExportObs";
         case NkOp::SampleObservation: return "SampleObservation";
         case NkOp::ResetObservation: return "ResetObservation";
+        case NkOp::ReadoutMotion: return "ReadoutMotion";
+        case NkOp::SampleStateSensor: return "SampleStateSensor";
+        case NkOp::AdvanceSensorTime: return "AdvanceSensorTime";
         case NkOp::ResetEnvs: return "ResetEnvs";
         case NkOp::SnapshotState: return "SnapshotState";
         case NkOp::RestoreState: return "RestoreState";

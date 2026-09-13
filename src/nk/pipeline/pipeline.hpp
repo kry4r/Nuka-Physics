@@ -18,6 +18,8 @@
 #include "phi/op_schema.hpp"   // NkOp + <Op>Params
 #include "nk/pipeline/coupling_provider.hpp"  // CouplingProvider / RowCouplingProvider
 
+namespace nuka::sensor { class StateSensorBank; }
+
 namespace nuka::nk {
 
 class Model;
@@ -61,7 +63,8 @@ public:
 
     // All emitted physics ops are required; unsupported demands leave no runnable calls.
     phi::Status Build(const Model& model, const SolverConfig& cfg,
-               phi::Device* device = nullptr, uint32_t readout_demand = 0u);
+               phi::Device* device = nullptr, uint32_t readout_demand = 0u,
+               const sensor::StateSensorBank* sensors = nullptr);
     static uint32_t SubstepCount(const Model& model, const SolverConfig& cfg);
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }

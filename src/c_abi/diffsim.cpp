@@ -120,7 +120,8 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
     }
     if (world_record->control_mode != nuka::runtime::articulation::ControlMode::PDPosition ||
         world_record->world->EnvCount() != 1u ||
-        world_record->world->GetModel().capacities.mpm_plastic_state)
+        world_record->world->GetModel().capacities.mpm_plastic_state ||
+        world_record->world->StateSensors().HasActive())
         return NUKA_RESULT_NOT_SUPPORTED;
     try {
         auto record = std::make_unique<TapeRecord>();
@@ -199,6 +200,7 @@ nuka_result_t nuka_world_step_with_tape(nuka_world_handle world,
     if (world_record == nullptr || world != record->world) {
         return NUKA_RESULT_INVALID_ARG;
     }
+    if (world_record->world->StateSensors().HasActive()) return NUKA_RESULT_NOT_SUPPORTED;
     try {
         const cudaStream_t stream = nullptr;  // BUF-14: stream 0
         // The action this step is the world's current DRIVE_TARGET arena field
@@ -256,6 +258,7 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
     }
     WorldRecord* world_record = nuka::c_abi::WorldTable().Get(record->world);
     if (world_record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (world_record->world->StateSensors().HasActive()) return NUKA_RESULT_NOT_SUPPORTED;
     if (grad_actions_out == nullptr) {
         return NUKA_RESULT_INVALID_ARG;
     }

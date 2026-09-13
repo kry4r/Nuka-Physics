@@ -11,6 +11,7 @@
 #include "math/transform.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/kinematics.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
@@ -283,8 +284,7 @@ __device__ LinkSpatialTransform JointTransform(const ArticulationDeviceState& st
     if (type == ArticulationJointType::Revolute) {
         joint_rotation = RotationFromAxisAngle(axis, state.q[link]);
     } else if (type == ArticulationJointType::Prismatic) {
-        translation = Add(parent_offset, Scale(axis, state.q[link]));
-        translation = Add(local_pose.position, translation);
+        translation = JointRelativeFrame(type, axis, local_pose, parent_offset, state.q[link]).position;
     }
     const Mat3 local_rotation = RotationFromQuat(local_pose.rotation);
     const Mat3 rotation = Mat3Mul(local_rotation, joint_rotation);
@@ -892,18 +892,6 @@ __forceinline__ __device__ math::Quat QuatNormalize(math::Quat q) {
     return mg::QuatNormalizeRsqrt(q, 1.0e-12f);
 }
 
-__device__ math::Quat QuatFromAxisAngle(math::Vec3 axis, float angle) {
-    const float length_sq = Dot3(axis, axis);
-    if (length_sq <= 1.0e-12f) {
-        return QuatIdentity();
-    }
-    const math::Vec3 a = ScaleVec(axis, rsqrtf(length_sq));
-    const float half = angle * 0.5f;
-    const float s = sinf(half);
-    const float c = cosf(half);
-    return MakeQuat(c, a.x * s, a.y * s, a.z * s);
-}
-
 __device__ math::Vec3 RotateByQuat(math::Quat q, math::Vec3 v) {
     const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
     if (norm_sq > 1.0e-12f) {
@@ -930,24 +918,8 @@ __device__ math::Transform ComposeTransform(const math::Transform& lhs,
 
 __device__ math::Transform RelativeTransform(const ArticulationDeviceState& state,
                                              uint32_t link) {
-    const ArticulationJointType type = state.joint_type[link];
-    const math::Vec3 axis = state.joint_axis[link];
-    const math::Transform local_pose = state.link_local_pose[link];
-    const math::Vec3 parent_offset = state.parent_offset[link];
-
-    math::Transform relative;
-    relative.position = AddVec(local_pose.position, parent_offset);
-    relative.rotation = local_pose.rotation;
-    if (type == ArticulationJointType::Revolute) {
-        relative.rotation =
-            QuatNormalize(QuatMul(local_pose.rotation,
-                                  QuatFromAxisAngle(axis, state.q[link])));
-    } else if (type == ArticulationJointType::Prismatic) {
-        relative.position = AddVec(
-            relative.position,
-            RotateByQuat(local_pose.rotation, ScaleVec(axis, state.q[link])));
-    }
-    return relative;
+    return JointRelativeFrame(state.joint_type[link], state.joint_axis[link],
+        state.link_local_pose[link], state.parent_offset[link], state.q[link]);
 }
 
 constexpr uint32_t kTaskDimension = 6u;

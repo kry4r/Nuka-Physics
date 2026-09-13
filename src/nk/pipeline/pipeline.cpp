@@ -17,6 +17,7 @@
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/model.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "sensor/state_bank.hpp"
 
 namespace nuka::nk {
 
@@ -42,7 +43,8 @@ uint32_t Pipeline::SubstepCount(const Model& model, const SolverConfig& cfg) {
 }
 
 phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
-                            phi::Device* device, uint32_t readout_demand) {
+                            phi::Device* device, uint32_t readout_demand,
+                            const sensor::StateSensorBank* sensors) {
     const uint32_t substeps = SubstepCount(model, cfg);
     SolverConfig interval = cfg;
     interval.dt /= static_cast<float>(substeps);
@@ -54,6 +56,14 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         return phi::Status::InvalidArgument;
     const auto status = BuildInterval(model, interval, device, readout_demand);
     if (status != phi::Status::Ok) return status;
+    if (sensors && (!sensors->Before().empty() || !sensors->After().empty())) {
+        const auto physics = std::move(calls_);
+        calls_.clear();
+        for (const auto& call : sensors->Before()) AddOp(call.op, call.params, device);
+        for (const auto& call : physics) AddOp(call.op, call.params, device);
+        for (const auto& call : sensors->After()) AddOp(call.op, call.params, device);
+        if (!missing_ops_.empty()) { calls_.clear(); return phi::Status::Unsupported; }
+    }
     const auto& cap = model.capacities;
     const bool has_mpm = model.MpmParticlesPerEnv() > 0u && cap.mpm_grid_nodes_per_env > 0u;
     const bool mpm_reaction = has_mpm;

@@ -196,6 +196,101 @@ def test_sensor_noise_non_float_stride_field_rejected(device):
             w.apply_sensor_noise(nuka.ARTICULATION_LINK_POSE)
 
 
+def test_mounted_sensor_timing_replay_and_late_attachment(device):
+    with make_world(device, 4) as world:
+        world.set_execution_mode("graph")
+        world.step_n(3)
+        with world.capture_checkpoint() as unregistered:
+            initial_hash = world.state_hash()
+            sensor = world.attach_state_sensor(nuka.StateSensorKind.IMU, update_period=2,
+                latency=world.dt * 3, latency_jitter=world.dt * 0.5,
+                dropout_probability=0.25, seed=36)
+            nuka.MeasurementError(noise_density=0.002, bias_random_walk=0.001,
+                correlated_bias_stddev=0.01, correlation_time=0.1, seed=71).configure_sensor(world, sensor, 0)
+            view = torch.from_dlpack(world.get_state_sensor_view(sensor))
+            address = view.data_ptr()
+            assert world.state_sensor_stamp(sensor)["valid"] is False
+            world.step_n(8)
+            with world.capture_checkpoint() as saved:
+                world.step_n(8)
+                expected_values = world.download_state_sensor(sensor).copy()
+                expected_stamps = [world.state_sensor_stamp(sensor, env) for env in range(4)]
+                expected_hash = world.state_hash()
+                world.restore_checkpoint(saved)
+                world.step_n(8)
+                np.testing.assert_array_equal(world.download_state_sensor(sensor), expected_values)
+                assert [world.state_sensor_stamp(sensor, env) for env in range(4)] == expected_stamps
+                assert world.state_hash() == expected_hash
+                assert view.data_ptr() == address
+                for stamp in expected_stamps:
+                    assert stamp["acquisitions"] == 8
+                    assert stamp["delivery_time"] - stamp["sample_time"] >= world.dt * 2.5
+            world.reset_envs([1])
+            assert world.state_sensor_stamp(sensor, 1)["acquisitions"] == 0
+            assert not world.state_sensor_stamp(sensor, 1)["valid"]
+            np.testing.assert_array_equal(world.download_state_sensor(sensor)[1], 0.0)
+            assert world.state_sensor_stamp(sensor, 0) == expected_stamps[0]
+            world.restore_checkpoint(unregistered)
+            assert world.state_hash() == initial_hash
+            assert world.state_sensor_count() == 1
+            assert not world.state_sensor_active(sensor)
+            np.testing.assert_array_equal(view.cpu(), 0.0)
+            with pytest.raises(RuntimeError):
+                world.get_state_sensor_view(sensor)
+
+
+def test_imported_mounted_sensor_physics(device):
+    scene = Path(__file__).resolve().parents[2] / "tests/data/rotated_slider.xml"
+    with nuka.World.create_from_scene(device, str(scene), 2, dt=0.0001,
+                                      control_mode=nuka.CONTROL_MODE_TORQUE) as world:
+        world.set_gravity_z(0.0)
+        world.set_execution_mode("graph")
+        names = world.dof_names()
+        hinge, slide = names.index("hinge"), names.index("slide")
+        q = np.array(world.download_field(nuka.JOINT_POSITION)).reshape(2, -1)
+        q[:, slide] = 0.4
+        world.upload_field(nuka.JOINT_POSITION, q.ravel())
+        torque = np.zeros_like(q)
+        torque[:, hinge] = 1.0
+        world.set_drive_targets(torque.ravel())
+        world.step()
+        velocity = np.asarray(world.download_field(nuka.JOINT_VELOCITY)).reshape(2, -1)
+        acceleration = 1.0 / (0.1 + 0.05 + 2 * 0.4**2)
+        np.testing.assert_allclose(velocity[:, hinge] / world.dt, acceleration, rtol=5e-5)
+        np.testing.assert_allclose(velocity[:, slide] / world.dt, -0.3 * acceleration, rtol=5e-5)
+        assert world.state_sensor_count() == 4
+        encoder = world.download_state_sensor(0)
+        np.testing.assert_array_equal(encoder[:, 1], velocity[:, slide])
+        imu = world.download_state_sensor(1)
+        expected = np.tile([0.03 * acceleration, 0.42 * acceleration, 0.0,
+                            0.0, 0.0, 0.5 * acceleration * world.dt], (2, 1))
+        np.testing.assert_allclose(imu, expected, atol=3e-5, rtol=5e-5)
+        measured_velocity = world.download_state_sensor(2)
+        np.testing.assert_allclose(measured_velocity, expected[:, :3] * world.dt, atol=2e-8)
+        pose = world.download_state_sensor(3)
+        np.testing.assert_allclose(pose[:, :3], np.tile([0.3, 0.4, 3.0], (2, 1)), atol=2e-7)
+        np.testing.assert_allclose(np.linalg.norm(pose[:, 3:], axis=1), 1.0, atol=2e-7)
+        with pytest.raises(RuntimeError):
+            world.set_state_sensor_error(3, 3, scale_error=0.01)
+
+
+def test_mounted_sensors_reject_incompatible_tape_replay(device):
+    with make_world(device, 1) as world:
+        with nuka.Tape.create(world, checkpoint_interval=2, max_tape_entries=8,
+                              max_checkpoints=8, recompute_on_backward=1) as tape:
+            tape.step_with_tape()
+            sensor = world.attach_state_sensor(nuka.StateSensorKind.IMU)
+            assert world.state_sensor_active(sensor)
+            before = world.state_hash()
+            with pytest.raises(RuntimeError):
+                tape.step_with_tape()
+            with pytest.raises(RuntimeError):
+                tape.backward(np.zeros(8 * tape.link_count, dtype=np.float32))
+            with pytest.raises(RuntimeError):
+                nuka.Tape.create(world)
+            assert world.state_hash() == before
+
+
 def test_measurement_error_and_checkpoint_before_registration(device):
     with make_world(device, 4) as world:
         field = nuka.JOINT_VELOCITY

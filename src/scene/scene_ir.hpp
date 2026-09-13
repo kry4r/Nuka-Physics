@@ -165,6 +165,7 @@ struct SensorDesc {
     SensorType type                        = SensorType::Imu;
     MountFrame mount                       = MountFrame::Link;
     uint32_t mount_index                   = kInvalidBody;
+    JointId joint_id                       = kInvalidJoint;
     math::Transform local_offset           = math::Transform::Identity();
     CameraIntrinsics cam;
     LidarPattern lidar;

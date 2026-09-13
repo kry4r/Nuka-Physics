@@ -13,6 +13,7 @@
 #include "nk/pipeline/pipeline.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/generated/views.hpp"
+#include "sensor/state_bank.hpp"
 
 namespace nuka::nk {
 
@@ -67,6 +68,11 @@ public:
     // Update one template link's spatial inertia in every environment without reallocating.
     phi::Status SetLinkInertia(uint32_t link_index, const Mat36& inertia);
 
+    phi::Status AttachStateSensor(const sensor::StateSensorDesc& desc, uint32_t* id);
+    phi::Status ConfigureStateSensorError(uint32_t id, uint32_t channel, const sensor::ObservationConfig& config);
+    phi::Status RestoreStateSensors(const sensor::StateSensorBankSnapshot& snapshot);
+    const sensor::StateSensorBank& StateSensors() const { return state_sensors_; }
+
     // Dispatch in order and stop at the first host or launch failure.
     StepResult Step();
 
@@ -114,8 +120,10 @@ private:
     // First external request for a readout output: emit the producing op from
     // now on (rebuild pipeline, drop the plan) + backfill it from the last solve.
     phi::Status DemandReadout(FieldId id);
+    phi::Status RebuildPipeline();
 
     Model           model_;
+    sensor::StateSensorBank state_sensors_;
     Data            data_;
     std::unique_ptr<Pipeline> pipeline_ = std::make_unique<Pipeline>();
     Pipeline::SolverConfig cfg_{};

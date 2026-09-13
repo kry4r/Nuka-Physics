@@ -9,6 +9,8 @@ TEST(MjcfImporter, LoadsMinimalBodyAndJoint) {
     const auto scene = nuka::import::LoadMjcf("tests/data/minimal_arm.xml");
     EXPECT_EQ(scene.RigidBodyCount(), 2u);
     EXPECT_EQ(scene.JointCount(), 1u);
+    EXPECT_TRUE(scene.GetBody(0).is_static);
+    EXPECT_FALSE(scene.GetBody(1).is_static);
 }
 
 TEST(MjcfImporter, BodyNamesAreCorrect) {
