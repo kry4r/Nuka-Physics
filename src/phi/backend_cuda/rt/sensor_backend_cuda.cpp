@@ -161,6 +161,43 @@ public:
         rt::SetSensorAovMask(handle->scene, mask);
     }
 
+    void SetCameraResponse(SensorSceneHandle* handle, uint32_t id,
+                            const sensor::CameraResponse& config) override {
+        rt::SetCameraResponse(handle->scene, id, config, backend_);
+    }
+
+    void SetRangeResponse(SensorSceneHandle* handle, bool lidar, uint32_t id,
+                           const sensor::RangeResponse& config) override {
+        rt::SetRangeResponse(handle->scene, lidar, id, config, backend_);
+    }
+
+    void SetSensorSampleTimes(SensorSceneHandle* handle, const std::vector<double>& times) override {
+        rt::SetSensorSampleTimes(handle->scene, times);
+    }
+
+    sensor::ImagingStamp ImagingStamp(const SensorSceneHandle* handle,
+                                      bool lidar, uint32_t id, uint32_t env) const override {
+        return rt::ImagingStamp(handle->scene, lidar, id, env);
+    }
+
+    void ResetSensorState(SensorSceneHandle* handle, const std::vector<uint32_t>& ids) override {
+        rt::ResetSensorState(handle->scene, ids, backend_);
+    }
+
+    rt::SensorStateSnapshot CaptureSensorState(const SensorSceneHandle* handle) const override {
+        return rt::CaptureSensorState(handle->scene, backend_);
+    }
+
+    void RestoreSensorState(SensorSceneHandle* handle, const rt::SensorStateSnapshot& snapshot) override {
+        rt::RestoreSensorState(handle->scene, snapshot, backend_);
+        handle->shape = {snapshot.width ? snapshot.imaging.env_count : 0u,
+            snapshot.width ? static_cast<uint32_t>(snapshot.imaging.cameras.size()) : 0u,
+            snapshot.height, snapshot.width};
+        handle->range_shape = {snapshot.range.empty() ? 0u : snapshot.imaging.env_count,
+            snapshot.range.empty() ? 0u : static_cast<uint32_t>(snapshot.imaging.lidars.size()),
+            snapshot.lidar_az, snapshot.lidar_el};
+    }
+
     void FreeSensorScene(SensorSceneHandle* handle) override { delete handle; }
 
 private:

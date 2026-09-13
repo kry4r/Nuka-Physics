@@ -945,6 +945,70 @@ typedef struct nuka_sensor_fidelity_desc_t {
 nuka_result_t nuka_world_set_sensor_fidelity(
     nuka_world_handle world, const nuka_sensor_fidelity_desc_t* desc);
 
+// Exposure is in seconds; charge, readout and offset parameters use electrons.
+// ADC bits 0 keeps continuous output; enabled 0 selects ideal RGB.
+typedef struct nuka_camera_response_desc_t {
+    uint32_t enabled;
+    uint32_t shot_noise;
+    uint32_t adc_bits;
+    float exposure_time;
+    float electrons_per_unit_second;
+    float full_well_electrons;
+    float read_noise_electrons;
+    float row_noise_electrons;
+    float dark_current;
+    float dark_doubling_temperature;
+    float temperature;
+    float reference_temperature;
+    float pixel_gain_stddev;
+    float pixel_offset_stddev_electrons;
+    float analog_gain;
+    float black_level_electrons;
+    float dead_pixel_probability;
+    float hot_pixel_probability;
+    float hot_pixel_current;
+    uint64_t seed;
+} nuka_camera_response_desc_t;
+
+// Distances are meters; precision is m*sqrt(photon), quadratic_stddev is 1/m.
+// return_photons specifies diffuse normal-incidence return at reference_distance.
+typedef struct nuka_range_response_desc_t {
+    uint32_t enabled;
+    float bias;
+    float scale_error;
+    float distance_stddev;
+    float quadratic_stddev;
+    float incidence_bias;
+    float quantization;
+    float return_photons;
+    float reference_distance;
+    float background_photons;
+    float precision;
+    uint32_t minimum_return;
+    float dropout_probability;
+    uint64_t seed;
+} nuka_range_response_desc_t;
+
+typedef struct nuka_imaging_stamp_t {
+    uint64_t acquisitions;
+    double sample_time;
+    uint32_t valid;
+} nuka_imaging_stamp_t;
+
+// Configure one camera or range channel and clear that sensor's acquisition history.
+// A null descriptor restores ideal observations; range channel must be DEPTH or RANGE.
+nuka_result_t nuka_world_set_camera_response(nuka_world_handle world, uint32_t sensor_index,
+                                              const nuka_camera_response_desc_t* desc);
+nuka_result_t nuka_world_set_range_response(nuka_world_handle world, nuka_sensor_channel_t channel,
+                                             uint32_t sensor_index, const nuka_range_response_desc_t* desc);
+
+// COLOR or DEPTH selects the shared camera acquisition; RANGE selects a lidar.
+// Sample time is the environment's simulation time at explicit render_sensors acquisition.
+nuka_result_t nuka_world_get_imaging_stamp(nuka_world_handle world, nuka_sensor_channel_t channel,
+                                            uint32_t sensor_index, uint32_t env_index,
+                                            nuka_imaging_stamp_t* out);
+
+
 // ---------------------------------------------------------------------------
 // Camera lens model: by default a camera is a centered pinhole (focal from the
 // attach vfov+aspect). This applies the schema-carried lens knobs -- radial

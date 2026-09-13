@@ -39,6 +39,7 @@
 #include "phi/interop_scatter.hpp"  // phi::ScatterFkSource / InstanceScatterRow (CUDA-free)
 #include "rt/render_dr.hpp"         // rt::RenderDrConfig (CUDA-free per-env DR POD)
 #include "rt/sensor_fidelity.hpp"   // rt::SensorFidelityConfig (CUDA-free shade POD)
+#include "rt/sensor_state.hpp"
 #include "rt/particle_surface.hpp"
 #include "rt/two_level_render.hpp"  // rt::TwoLevelScene (CUDA-free scene-desc POD)
 #include "scene/scene_ir.hpp"       // scene::SensorDesc (CUDA-free)
@@ -170,6 +171,17 @@ public:
     // Select camera AOV outputs. mask==0 means the legacy all-AOV profile;
     // bit positions match COLOR..PRIM in nuka_sensor_channel_t.
     virtual void SetSensorAovMask(SensorSceneHandle* handle, uint32_t mask) = 0;
+
+    virtual void SetCameraResponse(SensorSceneHandle* handle, uint32_t id,
+                                    const sensor::CameraResponse& config) = 0;
+    virtual void SetRangeResponse(SensorSceneHandle* handle, bool lidar, uint32_t id,
+                                   const sensor::RangeResponse& config) = 0;
+    virtual void SetSensorSampleTimes(SensorSceneHandle* handle, const std::vector<double>& times) = 0;
+    virtual sensor::ImagingStamp ImagingStamp(const SensorSceneHandle* handle,
+                                               bool lidar, uint32_t sensor, uint32_t env) const = 0;
+    virtual void ResetSensorState(SensorSceneHandle* handle, const std::vector<uint32_t>& env_ids) = 0;
+    virtual rt::SensorStateSnapshot CaptureSensorState(const SensorSceneHandle* handle) const = 0;
+    virtual void RestoreSensorState(SensorSceneHandle* handle, const rt::SensorStateSnapshot& snapshot) = 0;
 
     // Release a sensor scene handle built by this backend.
     virtual void FreeSensorScene(SensorSceneHandle* handle) = 0;

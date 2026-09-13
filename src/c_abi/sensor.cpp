@@ -47,6 +47,36 @@ namespace {
 
 namespace cook = nuka::scene::cook;
 
+void ApplyImagingModels(SensorAttachment& target) {
+    for (uint32_t i = 0u; i < target.camera_responses.size(); ++i) {
+        target.backend->SetCameraResponse(target.handle, i, target.camera_responses[i]);
+        target.backend->SetRangeResponse(target.handle, false, i, target.depth_responses[i]);
+    }
+    for (uint32_t i = 0u; i < target.lidar_responses.size(); ++i)
+        target.backend->SetRangeResponse(target.handle, true, i, target.lidar_responses[i]);
+}
+
+void CarryImagingModels(SensorAttachment& target, const SensorAttachment* previous, bool keep_cameras) {
+    if (previous) {
+        if (previous->revision == UINT64_MAX) throw std::overflow_error("sensor topology revision exhausted");
+        target.revision = previous->revision + 1u;
+        if (keep_cameras) {
+            target.camera_responses = previous->camera_responses;
+            target.depth_responses = previous->depth_responses;
+        }
+        target.lidar_responses = previous->lidar_responses;
+    }
+    size_t cameras = 0u, lidars = 0u;
+    for (const auto& s : target.sensors) {
+        if (s.type == nuka::scene::SensorType::Lidar || s.type == nuka::scene::SensorType::RangeScan) ++lidars;
+        else ++cameras;
+    }
+    target.camera_responses.resize(cameras);
+    target.depth_responses.resize(cameras);
+    target.lidar_responses.resize(lidars);
+    ApplyImagingModels(target);
+}
+
 // Lower the world's cooked scene to the env-shared sensor binding: RenderWorld ->
 // TwoLevelScene + per-instance rows/blas_id/material_id. False if no geometry.
 bool BuildSensorSceneDesc(const WorldRecord& record, nuka::render::SensorSceneDesc* out) {
@@ -286,6 +316,7 @@ nuka_result_t nuka_world_attach_camera_sensor(nuka_world_handle world,
         }
         attach->backend->SetSensorFidelity(attach->handle, carry_fid);
         attach->backend->SetSensorAovMask(attach->handle, carry_aov_mask);
+        nuka::c_abi::CarryImagingModels(*attach, record->sensor.get(), same_size);
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -380,6 +411,7 @@ nuka_result_t nuka_world_attach_lidar_sensor(nuka_world_handle world,
         }
         attach->backend->SetSensorFidelity(attach->handle, carry_fid);
         attach->backend->SetSensorAovMask(attach->handle, carry_aov_mask);
+        nuka::c_abi::CarryImagingModels(*attach, record->sensor.get(), true);
         record->sensor = std::move(attach);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
@@ -421,6 +453,9 @@ nuka_result_t nuka_world_render_sensors(nuka_world_handle world) {
         // lidars into the range tensor. Each call is a no-op if that kind is absent,
         // so a camera-only / lidar-only / mixed world all step the same path.
         nuka::c_abi::SensorAttachment& s = *record->sensor;
+        std::vector<double> times(w.EnvCount());
+        for (uint32_t env = 0u; env < w.EnvCount(); ++env) times[env] = w.StateSensors().SimulationTime(env);
+        s.backend->SetSensorSampleTimes(s.handle, times);
         s.backend->RenderSensors(s.handle, fk, w.EnvCount(), s.width, s.height);
         s.backend->RenderLidars(s.handle, fk, w.EnvCount());
         s.rendered = true;
@@ -704,6 +739,9 @@ nuka_result_t nuka_world_set_camera_intrinsics(
         }
         s.backend->SetSensorFidelity(s.handle, s.fidelity);
         s.backend->SetSensorAovMask(s.handle, s.aov_mask);
+        if (s.revision == UINT64_MAX) throw std::overflow_error("sensor topology revision exhausted");
+        ++s.revision;
+        nuka::c_abi::ApplyImagingModels(s);
         return NUKA_RESULT_OK;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
@@ -712,6 +750,102 @@ nuka_result_t nuka_world_set_camera_intrinsics(
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
+}
+
+nuka_result_t nuka_world_set_camera_response(nuka_world_handle world, uint32_t id,
+                                              const nuka_camera_response_desc_t* desc) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->sensor || !record->sensor->handle) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        nuka::sensor::CameraResponse config;
+        if (desc) {
+            config.enabled = desc->enabled;
+            config.shot_noise = desc->shot_noise;
+            config.adc_bits = desc->adc_bits;
+            config.exposure_time = desc->exposure_time;
+            config.electrons_per_unit_second = desc->electrons_per_unit_second;
+            config.full_well_electrons = desc->full_well_electrons;
+            config.read_noise_electrons = desc->read_noise_electrons;
+            config.row_noise_electrons = desc->row_noise_electrons;
+            config.dark_current = desc->dark_current;
+            config.dark_doubling_temperature = desc->dark_doubling_temperature;
+            config.temperature = desc->temperature;
+            config.reference_temperature = desc->reference_temperature;
+            config.pixel_gain_stddev = desc->pixel_gain_stddev;
+            config.pixel_offset_stddev_electrons = desc->pixel_offset_stddev_electrons;
+            config.analog_gain = desc->analog_gain;
+            config.black_level_electrons = desc->black_level_electrons;
+            config.dead_pixel_probability = desc->dead_pixel_probability;
+            config.hot_pixel_probability = desc->hot_pixel_probability;
+            config.hot_pixel_current = desc->hot_pixel_current;
+            config.seed = desc->seed;
+        }
+        auto& s = *record->sensor;
+        if (id >= s.camera_responses.size() || !nuka::sensor::ValidCameraResponse(config))
+            return NUKA_RESULT_INVALID_ARG;
+        s.backend->SetCameraResponse(s.handle, id, config);
+        s.camera_responses[id] = config;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY; }
+    catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error); }
+    catch (...) { return NUKA_RESULT_INTERNAL; }
+}
+
+nuka_result_t nuka_world_set_range_response(nuka_world_handle world, nuka_sensor_channel_t channel,
+                                             uint32_t id, const nuka_range_response_desc_t* desc) {
+    if (channel != NUKA_SENSOR_CHANNEL_DEPTH && channel != NUKA_SENSOR_CHANNEL_RANGE)
+        return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->sensor || !record->sensor->handle) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        nuka::sensor::RangeResponse config;
+        if (desc) {
+            config.enabled = desc->enabled;
+            config.bias = desc->bias;
+            config.scale_error = desc->scale_error;
+            config.distance_stddev = desc->distance_stddev;
+            config.quadratic_stddev = desc->quadratic_stddev;
+            config.incidence_bias = desc->incidence_bias;
+            config.quantization = desc->quantization;
+            config.return_photons = desc->return_photons;
+            config.reference_distance = desc->reference_distance;
+            config.background_photons = desc->background_photons;
+            config.precision = desc->precision;
+            config.minimum_return = desc->minimum_return;
+            config.dropout_probability = desc->dropout_probability;
+            config.seed = desc->seed;
+        }
+        auto& s = *record->sensor;
+        const bool lidar = channel == NUKA_SENSOR_CHANNEL_RANGE;
+        auto& configs = lidar ? s.lidar_responses : s.depth_responses;
+        if (id >= configs.size() || !nuka::sensor::ValidRangeResponse(config)) return NUKA_RESULT_INVALID_ARG;
+        s.backend->SetRangeResponse(s.handle, lidar, id, config);
+        configs[id] = config;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) { return NUKA_RESULT_OUT_OF_MEMORY; }
+    catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error); }
+    catch (...) { return NUKA_RESULT_INTERNAL; }
+}
+
+nuka_result_t nuka_world_get_imaging_stamp(nuka_world_handle world, nuka_sensor_channel_t channel,
+                                            uint32_t id, uint32_t env, nuka_imaging_stamp_t* out) {
+    if (!out || (channel != NUKA_SENSOR_CHANNEL_COLOR && channel != NUKA_SENSOR_CHANNEL_DEPTH &&
+                 channel != NUKA_SENSOR_CHANNEL_RANGE)) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world || !record->sensor || !record->sensor->handle) return NUKA_RESULT_NOT_SUPPORTED;
+    if (env >= record->world->EnvCount()) return NUKA_RESULT_INVALID_ARG;
+    try {
+        auto& s = *record->sensor;
+        const auto stamp = s.backend->ImagingStamp(s.handle, channel == NUKA_SENSOR_CHANNEL_RANGE, id, env);
+        out->acquisitions = stamp.acquisitions;
+        out->sample_time = stamp.sample_time;
+        out->valid = stamp.valid;
+        return NUKA_RESULT_OK;
+    } catch (const std::exception& error) { return nuka::c_abi::MapExceptionToResult(error); }
+    catch (...) { return NUKA_RESULT_INTERNAL; }
 }
 
 nuka_result_t nuka_world_set_sensor_fidelity(

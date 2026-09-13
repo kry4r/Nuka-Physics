@@ -43,6 +43,7 @@ struct Options {
     uint32_t cloth_nx = fixture::kClothNx;
     uint32_t render_sensors = 0u, render_width = 256u, render_height = 256u;
     uint32_t render_samples = 4u, render_shadows = 4u, render_ao = 3u, render_warmup = 32u;
+    uint32_t imaging_models = 0u;
     std::string render_output;
 };
 
@@ -86,11 +87,12 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--render-shadows") options.render_shadows = ParseU32(value);
         else if (flag == "--render-ao") options.render_ao = ParseU32(value);
         else if (flag == "--render-warmup") options.render_warmup = ParseU32(value);
+        else if (flag == "--imaging-models") options.imaging_models = ParseU32(value);
         else if (flag == "--render-output") options.render_output = value;
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
-        options.state_sensors > 2u ||
+        options.state_sensors > 2u || options.imaging_models > 1u ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
         uint64_t{options.steps} + options.warmup > std::numeric_limits<uint32_t>::max() ||
         (options.execution != "eager" && options.execution != "graph"))
@@ -568,6 +570,28 @@ public:
         fidelity.seed = options_.seed;
         try {
             backend_->SetSensorFidelity(handle_, fidelity);
+            if (options_.imaging_models) for (uint32_t camera = 0u; camera < options_.render_sensors; ++camera) {
+                nuka::sensor::CameraResponse color;
+                color.enabled = 1u;
+                color.read_noise_electrons = 3.0f;
+                color.row_noise_electrons = 1.0f;
+                color.pixel_gain_stddev = 0.01f;
+                color.dark_current = 25.0f;
+                color.dark_doubling_temperature = 6.0f;
+                color.temperature = 35.0f;
+                color.seed = options_.seed;
+                backend_->SetCameraResponse(handle_, camera, color);
+                nuka::sensor::RangeResponse depth;
+                depth.enabled = 1u;
+                depth.distance_stddev = 0.0005f;
+                depth.quadratic_stddev = 0.0001f;
+                depth.quantization = 0.0005f;
+                depth.return_photons = 1500.0f;
+                depth.precision = 0.02f;
+                depth.dropout_probability = 0.001f;
+                depth.seed = options_.seed;
+                backend_->SetRangeResponse(handle_, false, camera, depth);
+            }
         } catch (...) {
             backend_->FreeSensorScene(handle_);
             handle_ = nullptr;
@@ -583,8 +607,13 @@ public:
         fk.links_per_env = world.GetModel().capacities.links_per_env;
         fk.bodies_per_env = world.GetModel().capacities.bodies_per_env;
         fk.world_backend = world.Backend();
+        std::vector<double> times(options_.envs);
+        for (uint32_t env = 0u; env < options_.envs; ++env) times[env] = world.StateSensors().SimulationTime(env);
+        backend_->SetSensorSampleTimes(handle_, times);
         backend_->RenderSensors(handle_, fk, options_.envs, options_.render_width, options_.render_height);
     }
+    nuka::rt::SensorStateSnapshot Capture() const { return backend_->CaptureSensorState(handle_); }
+    void Restore(const nuka::rt::SensorStateSnapshot& snapshot) { backend_->RestoreSensorState(handle_, snapshot); }
     std::vector<uint8_t> Output() const {
         const size_t pixels = size_t{options_.envs} * options_.render_sensors * options_.render_width * options_.render_height;
         std::vector<uint8_t> output;
@@ -661,12 +690,19 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     result.Set("physics_to_sensor", measure(true));
     const bool coupled_state_equal = State(world) == expected_state;
     const auto coupled_output = renderer.Output();
+    const auto replay_start = renderer.Capture();
     for (uint32_t i = 0u; i < options.render_warmup; ++i) renderer.Render(world);
     result.Set("render_only", measure(false));
     const auto output = renderer.Output();
     const bool repeated_output_equal = output == coupled_output;
     const bool render_state_equal = State(world) == expected_state;
+    renderer.Restore(replay_start);
+    for (uint32_t i = 0u; i < options.render_warmup + options.steps; ++i) renderer.Render(world);
+    const bool replay_output_equal = renderer.Output() == output;
     const size_t pixels = size_t{options.envs} * options.render_sensors * options.render_width * options.render_height;
+    const size_t geometry_offset = pixels * 4u * sizeof(float);
+    const bool geometry_output_equal = std::equal(output.begin() + geometry_offset, output.end(),
+                                                   coupled_output.begin() + geometry_offset);
     uint64_t hits = 0u;
     bool finite = true;
     for (size_t i = 0u; i < pixels * 10u; ++i) {
@@ -697,6 +733,7 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     config.Set("ao_samples", Json::Int(options.render_ao));
     config.Set("seed", Json::Int(options.seed));
     config.Set("warmup_frames", Json::Int(options.render_warmup));
+    config.Set("imaging_models", Json::Int(options.imaging_models));
     result.Set("config", std::move(config));
     result.Set("geometry_scope", Json::Str("authored rigid visuals and fixed-topology particle surfaces from the physical model on the public batched sensor path"));
     result.Set("boundary", Json::Str("physics-to-sensor uses live per-step poses and particle positions; render-only repeats its final world; both complete all AOVs on device; output download is untimed"));
@@ -707,7 +744,11 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     result.Set("coupled_state_equal", Json::Bool(coupled_state_equal));
     result.Set("render_state_equal", Json::Bool(render_state_equal));
     result.Set("repeated_output_equal", Json::Bool(repeated_output_equal));
-    result.Set("valid", Json::Bool(finite && hits > 0u && coupled_state_equal && render_state_equal && repeated_output_equal));
+    result.Set("replay_output_equal", Json::Bool(replay_output_equal));
+    result.Set("geometry_output_equal", Json::Bool(geometry_output_equal));
+    const bool expected_frame_change = options.imaging_models ? !repeated_output_equal : repeated_output_equal;
+    result.Set("valid", Json::Bool(finite && hits > 0u && coupled_state_equal && render_state_equal &&
+        replay_output_equal && geometry_output_equal && expected_frame_change));
     return result;
 }
 

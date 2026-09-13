@@ -20,6 +20,7 @@
 
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
+#include "render/sensor_backend.hpp"
 
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"  // L1: kPairDrivenRowsPerSlot (general row budget)
@@ -738,6 +739,8 @@ nuka_result_t nuka_world_reset(nuka_world_handle world) {
     try {
         // An empty selection restores all environments through the shared reset op.
         auto status = record->world->Reset({});
+        if (status == nuka::phi::Status::Ok && record->sensor)
+            record->sensor->backend->ResetSensorState(record->sensor->handle, {});
         if (status == nuka::phi::Status::Ok) {
             for (auto& entry : record->field_observations) {
                 status = entry.second->Reset();
@@ -781,6 +784,8 @@ nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
     try {
         const std::vector<uint32_t> ids(env_ids, env_ids + count);
         auto status = record->world->Reset(ids);
+        if (status == nuka::phi::Status::Ok && record->sensor)
+            record->sensor->backend->ResetSensorState(record->sensor->handle, ids);
         if (status == nuka::phi::Status::Ok) {
             for (auto& entry : record->field_observations) {
                 status = entry.second->Reset(ids);

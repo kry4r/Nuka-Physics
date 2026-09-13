@@ -27,6 +27,7 @@
 #include "rt/particle_surface.hpp"
 #include "rt/render_dr.hpp"          // RenderDrConfig (per-env appearance DR)
 #include "rt/sensor_fidelity.hpp"    // SensorFidelityConfig (opt-in beauty shade)
+#include "rt/sensor_state.hpp"
 #include "rt/two_level_render.hpp"  // TwoLevelScene / TwoLevelSceneDevice
 #include "scene/scene_ir.hpp"       // scene::SensorDesc (mount table)
 
@@ -131,6 +132,20 @@ void SetSensorFidelity(BatchedSensorSceneDevice& device,
 // null accessors, so a caller cannot accidentally consume stale data after a mask
 // change. The selected path is general across every sensor scene.
 void SetSensorAovMask(BatchedSensorSceneDevice& device, uint32_t mask);
+
+void SetCameraResponse(BatchedSensorSceneDevice& device, uint32_t id,
+                       const sensor::CameraResponse& config, phi::Backend* backend = nullptr);
+void SetRangeResponse(BatchedSensorSceneDevice& device, bool lidar, uint32_t id,
+                      const sensor::RangeResponse& config, phi::Backend* backend = nullptr);
+void SetSensorSampleTimes(BatchedSensorSceneDevice& device, const std::vector<double>& times);
+sensor::ImagingStamp ImagingStamp(const BatchedSensorSceneDevice& device,
+                                  bool lidar, uint32_t sensor, uint32_t env);
+void ResetSensorState(BatchedSensorSceneDevice& device, const std::vector<uint32_t>& env_ids,
+                      phi::Backend* backend = nullptr);
+SensorStateSnapshot CaptureSensorState(const BatchedSensorSceneDevice& device,
+                                       phi::Backend* backend = nullptr);
+void RestoreSensorState(BatchedSensorSceneDevice& device, const SensorStateSnapshot& snapshot,
+                         phi::Backend* backend = nullptr);
 
 // ONE step driven by the stored mount table: scatter cameras (fk * local_offset
 // for every env x sensor) into the persistent camera buffer, then RenderSensorsBatched

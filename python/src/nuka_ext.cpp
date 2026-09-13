@@ -2658,6 +2658,90 @@ NB_MODULE(_nuka_ext, m) {
             "per-axis focal are renderer-side knobs not carried by the scene schema, "
             "so they are not exposed here. Requires a camera attached; rebuilds the "
             "sensor scene (per-env DR + shading fidelity are preserved).")
+        .def("set_camera_response",
+            [](World& w, uint32_t sensor_index, bool enabled, bool shot_noise,
+               uint32_t adc_bits, float exposure_time, float electrons_per_unit_second,
+               float full_well_electrons, float read_noise_electrons, float row_noise_electrons,
+               float dark_current, float dark_doubling_temperature, float temperature,
+               float reference_temperature, float pixel_gain_stddev, float pixel_offset_stddev_electrons,
+               float analog_gain, float black_level_electrons, float dead_pixel_probability,
+               float hot_pixel_probability, float hot_pixel_current, uint64_t seed) {
+                nuka_camera_response_desc_t desc{};
+                desc.enabled = enabled;
+                desc.shot_noise = shot_noise;
+                desc.adc_bits = adc_bits;
+                desc.exposure_time = exposure_time;
+                desc.electrons_per_unit_second = electrons_per_unit_second;
+                desc.full_well_electrons = full_well_electrons;
+                desc.read_noise_electrons = read_noise_electrons;
+                desc.row_noise_electrons = row_noise_electrons;
+                desc.dark_current = dark_current;
+                desc.dark_doubling_temperature = dark_doubling_temperature;
+                desc.temperature = temperature;
+                desc.reference_temperature = reference_temperature;
+                desc.pixel_gain_stddev = pixel_gain_stddev;
+                desc.pixel_offset_stddev_electrons = pixel_offset_stddev_electrons;
+                desc.analog_gain = analog_gain;
+                desc.black_level_electrons = black_level_electrons;
+                desc.dead_pixel_probability = dead_pixel_probability;
+                desc.hot_pixel_probability = hot_pixel_probability;
+                desc.hot_pixel_current = hot_pixel_current;
+                desc.seed = seed;
+                check(nuka_world_set_camera_response(w.raw(), sensor_index, &desc),
+                      "nuka_world_set_camera_response");
+            },
+            nb::arg("sensor_index") = 0u, nb::kw_only(), nb::arg("enabled") = true,
+            nb::arg("shot_noise") = true, nb::arg("adc_bits") = 12u, nb::arg("exposure_time") = 0.01f,
+            nb::arg("electrons_per_unit_second") = 1000000.0f, nb::arg("full_well_electrons") = 10000.0f, nb::arg("read_noise_electrons") = 0.0f,
+            nb::arg("row_noise_electrons") = 0.0f, nb::arg("dark_current") = 0.0f, nb::arg("dark_doubling_temperature") = 0.0f,
+            nb::arg("temperature") = 25.0f, nb::arg("reference_temperature") = 25.0f, nb::arg("pixel_gain_stddev") = 0.0f,
+            nb::arg("pixel_offset_stddev_electrons") = 0.0f, nb::arg("analog_gain") = 1.0f, nb::arg("black_level_electrons") = 0.0f,
+            nb::arg("dead_pixel_probability") = 0.0f, nb::arg("hot_pixel_probability") = 0.0f, nb::arg("hot_pixel_current") = 0.0f,
+            nb::arg("seed") = 0u,
+            "Configure one camera electronic response before tonemapping and sRGB.")
+        .def("set_range_response",
+            [](World& w, uint32_t channel, uint32_t sensor_index, bool enabled,
+               float bias, float scale_error, float distance_stddev,
+               float quadratic_stddev, float incidence_bias, float quantization,
+               float return_photons, float reference_distance, float background_photons,
+               float precision, uint32_t minimum_return, float dropout_probability,
+               uint64_t seed) {
+                nuka_range_response_desc_t desc{};
+                desc.enabled = enabled;
+                desc.bias = bias;
+                desc.scale_error = scale_error;
+                desc.distance_stddev = distance_stddev;
+                desc.quadratic_stddev = quadratic_stddev;
+                desc.incidence_bias = incidence_bias;
+                desc.quantization = quantization;
+                desc.return_photons = return_photons;
+                desc.reference_distance = reference_distance;
+                desc.background_photons = background_photons;
+                desc.precision = precision;
+                desc.minimum_return = minimum_return;
+                desc.dropout_probability = dropout_probability;
+                desc.seed = seed;
+                check(nuka_world_set_range_response(w.raw(), static_cast<nuka_sensor_channel_t>(channel), sensor_index, &desc),
+                      "nuka_world_set_range_response");
+            },
+            nb::arg("channel"), nb::arg("sensor_index") = 0u, nb::kw_only(),
+            nb::arg("enabled") = true, nb::arg("bias") = 0.0f, nb::arg("scale_error") = 0.0f,
+            nb::arg("distance_stddev") = 0.0f, nb::arg("quadratic_stddev") = 0.0f, nb::arg("incidence_bias") = 0.0f,
+            nb::arg("quantization") = 0.0f, nb::arg("return_photons") = 0.0f, nb::arg("reference_distance") = 1.0f,
+            nb::arg("background_photons") = 0.0f, nb::arg("precision") = 0.0f, nb::arg("minimum_return") = 1u,
+            nb::arg("dropout_probability") = 0.0f, nb::arg("seed") = 0u,
+            "Configure depth or lidar range errors from the traced surface and return signal.")
+        .def("imaging_stamp", [](World& w, uint32_t channel, uint32_t sensor_index, uint32_t env) {
+            nuka_imaging_stamp_t stamp{};
+            check(nuka_world_get_imaging_stamp(w.raw(), static_cast<nuka_sensor_channel_t>(channel),
+                sensor_index, env, &stamp), "nuka_world_get_imaging_stamp");
+            nb::dict out;
+            out["acquisitions"] = stamp.acquisitions;
+            out["sample_time"] = stamp.sample_time;
+            out["valid"] = stamp.valid != 0u;
+            return out;
+        }, nb::arg("channel"), nb::arg("sensor_index") = 0u, nb::arg("env") = 0u,
+           "Read an imaging acquisition stamp without advancing the sensor.")
         .def("set_link_mass", &World::set_link_mass, nb::arg("link_index"),
              nb::arg("mass"),
              "Set one template link's mass in every environment. link_index is in "

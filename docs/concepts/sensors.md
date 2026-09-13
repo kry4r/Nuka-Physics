@@ -132,4 +132,55 @@ Particle surfaces retain their authored material and render skin. `skin_smooth_i
 
 Camera depth is distance along the center ray, in meters, rather than optical-axis Z depth. Normal, albedo and primitive ID also use that center ray; color integrates the configured shading samples. Lidar range uses its beam ray, with the configured maximum range for a miss. Equal camera and lidar rays therefore measure the same surface distance. Monte Carlo color samples depend on the global camera index as well as the configured seed; comparing a batched tile with a standalone camera requires matching those sample indices.
 
-These image and range views are ideal geometric observations. Mounted scalar error configuration does not apply photon/readout noise, material-dependent range errors, rolling shutter or scan timing to them. MLS-MPM density surfaces, individual grains and PBF fluid surfaces are not yet included in camera/lidar rendering.
+Image and range observations are ideal unless their response model is enabled. MLS-MPM density surfaces, individual grains and PBF fluid surfaces are not yet included in camera/lidar rendering.
+
+### Electronic image formation
+
+Configure each camera separately, using its index in the camera tensor:
+
+```python
+nuka.CameraResponse(
+    exposure_time=0.01, electrons_per_unit_second=1_000_000,
+    full_well_electrons=10_000, read_noise_electrons=3,
+    row_noise_electrons=1, pixel_gain_stddev=0.01,
+    dark_current=25, dark_doubling_temperature=6,
+    temperature=35, reference_temperature=25, adc_bits=12, seed=42,
+).configure(world, sensor_index=0)
+world.render_sensors()
+stamp = world.imaging_stamp(nuka.SensorChannel.COLOR.value, sensor_index=0, env=0)
+```
+
+Color first accumulates the configured shading samples in linear light. For each channel, expected charge is `exposure_time × (linear_light × electrons_per_unit_second × pixel_gain + dark_current)`. The responsivity parameter calibrates the renderer's linear-light units to electron rate; those lighting units are not an absolute radiometric calibration. Changing exposure changes brightness, shot noise and saturation.
+
+`shot_noise=True` samples a Poisson electron count. Expected counts above 10⁸ use the normal limit. Charge saturates at `full_well_electrons`, then receives independent Gaussian readout noise, a shared row offset and fixed pixel offset. `analog_gain` scales the result and `black_level_electrons` adds an electronic offset. The result is clipped and normalized by full well, then rounded to `2**adc_bits - 1` levels. Zero bits keeps continuous output; supported ADC depths are 1–24 bits. Existing ACES and sRGB settings apply afterward. Disable both with `set_sensor_fidelity` to inspect normalized linear ADC output.
+
+`pixel_gain_stddev` is fractional pixel response nonuniformity; `pixel_offset_stddev_electrons` is fixed electronic offset variation. Their spatial patterns repeat across frames. Read noise varies per channel, pixel and acquisition; row noise is shared across pixels and color channels in the same row. Different environments and cameras have independent patterns. `dead_pixel_probability` removes photoresponse while retaining dark current; `hot_pixel_probability` adds `hot_pixel_current` electrons/s. The two failure classes are disjoint and their probabilities must sum to at most one.
+
+Dark and hot currents use the reference temperature and multiply by `2**((temperature-reference_temperature)/dark_doubling_temperature)`. A zero doubling temperature disables this scaling. Current rates are electrons/s; readout, row, pixel offset, full well and black level are electrons. This model represents three color channels without a Bayer mosaic, demosaicing or charge blooming. Exposure integrates a held scene radiance; motion blur and rolling shutter require temporal scene sampling and are not provided by this response model.
+
+### Depth and lidar returns
+
+```python
+response = nuka.RangeResponse(
+    bias=0.001, distance_stddev=0.0005, quadratic_stddev=0.0001,
+    return_photons=1500, reference_distance=1.0,
+    background_photons=10, precision=0.02, minimum_return=1,
+    quantization=0.0005, dropout_probability=0.001, seed=42,
+)
+response.configure(world, nuka.SensorChannel.DEPTH, sensor_index=0)
+response.configure(world, nuka.SensorChannel.RANGE, sensor_index=0)
+```
+
+Both channels use the same surface response. Expected diffuse return photons are `return_photons × reflectance × abs(normal·ray) × (reference_distance / range)**2`. Reflectance is linear RGB luminance of the textured albedo, multiplied by `1-transmission`. It is a configurable diffuse approximation using visible appearance, not a wavelength-calibrated infrared BRDF; specular returns, multipath and false detections are outside this model.
+
+The return count `N` and ambient count `B` are independent Poisson draws. A return below `minimum_return` is invalid. Distance variance is `distance_stddev**2 + (quadratic_stddev × range**2)**2 + precision**2 × (N+B)/N**2`. The quadratic term can represent disparity-derived depth uncertainty; the photon term represents timing uncertainty limited by return signal and background. Setting `return_photons=0` disables photon-based detection and requires zero background and precision.
+
+Calibration adds `bias + scale_error × range + incidence_bias × (1-abs(normal·ray))`, followed by quantization. An independent dropout probability models missing electronic deliveries. Invalid or out-of-range measurements use the existing channel miss value: positive infinity for camera depth, configured maximum range for lidar. Errors do not change normal, albedo or primitive ID; those remain geometric reference channels. Distances and quantization are meters, `quadratic_stddev` is 1/m, and `precision` is meters × √photon.
+
+### Imaging acquisition and replay
+
+Each `render_sensors()` call explicitly acquires all attached cameras and lidars at the current environment simulation time. Reads do not acquire. Camera color and depth share an acquisition counter; lidar counters are separate. `imaging_stamp` returns `acquisitions`, `sample_time` and `valid`. Noise streams include environment, sensor index, channel, pixel or beam and acquisition count; shading sample seeds remain independent of measurement noise.
+
+Configuring a camera or its depth response restarts that camera's complete acquisition history and clears its views. Configuring a lidar restarts that lidar. Other sensors retain their histories. Selective environment reset clears only selected tiles, stamps and counters. Checkpoints preserve response configuration, appearance settings, image/range tensors and acquisition histories, with stable existing view addresses. Checkpoints require the same attachment topology: adding/replacing sensors or rebuilding camera intrinsics invalidates earlier checkpoints and restoration rejects before changing physics. Reattachment retains existing response settings for retained sensors but starts new acquisition histories.
+
+`enabled=False` restores ideal output for that response; a null C descriptor does the same. Runtime response settings are checkpointed but are not yet serialized in NKS. Image acquisition remains explicit, without automatic frame scheduling, delivery queues, rolling shutter, scanning motion or an image gradient through differentiable Tape.

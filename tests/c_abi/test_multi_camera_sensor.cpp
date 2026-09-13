@@ -1,25 +1,5 @@
-// ---------------------------------------------------------------------------
-// Multiple cameras per env over the C ABI: attach TWO cameras with different mount
-// rows to an N-env world, render every (env, sensor) into ONE device AOV tensor
-// (E, S, H, W, ch), and prove the multi-camera path is the single-camera path fanned
-// out -- the SAME batched RT kernel, just one camera index per (env, sensor) instead
-// of one per env.
-//
-// Gates (all through the public C ABI, no internal headers):
-//  (1) dims: after attaching two cameras, get_sensor_dims reports (E, 2, H, W) and
-//      the color view is E*2*H*W*3 floats, device-resident.
-//  (2) tile == single-camera render: the (env, sensor=s) tile is byte-identical to a
-//      standalone world rendering ONLY camera s's mount. Proves the per-camera
-//      ray-gen renders each mount exactly as the one-camera path would.
-//  (3) cross-env byte-identical: every env's (sensor=s) tile matches env 0's, for
-//      both sensors (the scene is env-shared, only the per-env camera fans out).
-//
-// A co-resident multi-robot scene is not reachable from nuka_world_create_from_scene
-// here, so the two cameras ride two different mount rows of ONE robot (a Base mount
-// and a base-Link mount, different offsets). The trace kernel is identical for two
-// robots' cameras vs two cameras on one robot -- it indexes cameras env-major and the
-// env-shared TLAS by env -- so this proves the S>1 fan-out.
-// ---------------------------------------------------------------------------
+// Multiple camera mounts share the batched renderer and its env-camera-major AOVs.
+// Center-ray shading isolates batch layout from stochastic lighting samples.
 
 #include "nuka/nuka.h"
 
@@ -80,13 +60,20 @@ nuka_result_t AttachCam0(nuka_world_handle world, uint32_t w, uint32_t h) {
                                            60.0f, w, h);
 }
 
-// Camera 1: base-Link mount (a DIFFERENT mount row -- LinkPose, not BasePose), 4 m
-// above with a wider FOV. A genuinely different camera that exercises the second
-// mount row through the same kernel.
+// Camera 1 uses LinkPose at a different height and FOV from the BasePose camera.
 nuka_result_t AttachCam1(nuka_world_handle world, uint32_t w, uint32_t h) {
     const float off[7] = {0.0f, 0.0f, 4.0f, 1.0f, 0.0f, 0.0f, 0.0f};
     return nuka_world_attach_camera_sensor(world, NUKA_SENSOR_MOUNT_LINK, 0u, off,
                                            75.0f, w, h);
+}
+
+void ConfigureCenterRayShading(nuka_world_handle world) {
+    nuka_sensor_fidelity_desc_t config{};
+    config.spp = 1u;
+    config.shadow_samples = 1u;
+    config.tonemap_enabled = 1;
+    config.srgb_enabled = 1;
+    EXPECT_EQ(nuka_world_set_sensor_fidelity(world, &config), NUKA_RESULT_OK);
 }
 
 std::vector<float> DownloadFloat(const nuka_buffer_view_t& v) {
@@ -119,6 +106,7 @@ std::vector<float> SingleCameraColor(nuka_device_handle device, uint32_t env,
     EXPECT_EQ(which == 0 ? AttachCam0(world.handle, w, h)
                          : AttachCam1(world.handle, w, h),
               NUKA_RESULT_OK);
+    ConfigureCenterRayShading(world.handle);
     EXPECT_EQ(nuka_world_render_sensors(world.handle), NUKA_RESULT_OK);
     nuka_buffer_view_t color{};
     EXPECT_EQ(nuka_world_get_sensor_view(world.handle, NUKA_SENSOR_CHANNEL_COLOR,
@@ -129,10 +117,7 @@ std::vector<float> SingleCameraColor(nuka_device_handle device, uint32_t env,
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// Gate 1 -- two cameras: dims report (E, 2, H, W); the color tensor is E*2*H*W*3
-// floats, device-resident.
-// ---------------------------------------------------------------------------
+// Two cameras expose an (E, 2, H, W, 3) device tensor with default quality.
 TEST(MultiCameraSensor, TwoCamerasReportSensorDims) {
     if (!SceneAvailable()) GTEST_SKIP() << "go2_stand scene unavailable";
     DeviceGuard device;
@@ -166,11 +151,7 @@ TEST(MultiCameraSensor, TwoCamerasReportSensorDims) {
                 s, ww, hh, ch, (unsigned long long)color.element_count);
 }
 
-// ---------------------------------------------------------------------------
-// Gate 2 -- each (env, sensor) tile is byte-identical to a standalone single-camera
-// render of that sensor's mount. The S>1 fan-out renders each camera exactly as the
-// S==1 path does.
-// ---------------------------------------------------------------------------
+// Each camera tile matches the same mount rendered on its own.
 TEST(MultiCameraSensor, PerSensorTileMatchesSingleCamera) {
     if (!SceneAvailable()) GTEST_SKIP() << "go2_stand scene unavailable";
     DeviceGuard device;
@@ -185,6 +166,7 @@ TEST(MultiCameraSensor, PerSensorTileMatchesSingleCamera) {
     ASSERT_EQ(nuka_world_step_n(world.handle, kSteps), NUKA_RESULT_OK);
     ASSERT_EQ(AttachCam0(world.handle, kW, kH), NUKA_RESULT_OK);
     ASSERT_EQ(AttachCam1(world.handle, kW, kH), NUKA_RESULT_OK);
+    ConfigureCenterRayShading(world.handle);
     ASSERT_EQ(nuka_world_render_sensors(world.handle), NUKA_RESULT_OK);
     nuka_buffer_view_t color{};
     ASSERT_EQ(nuka_world_get_sensor_view(world.handle, NUKA_SENSOR_CHANNEL_COLOR,
@@ -226,10 +208,7 @@ TEST(MultiCameraSensor, PerSensorTileMatchesSingleCamera) {
                                "two-camera test)";
 }
 
-// ---------------------------------------------------------------------------
-// Gate 3 -- cross-env byte-identical for each sensor: env e's (sensor=s) tile equals
-// env 0's (the scene is env-shared, the cameras are env-replicated).
-// ---------------------------------------------------------------------------
+// Identical environments produce identical center-ray camera tiles.
 TEST(MultiCameraSensor, CrossEnvTilesByteIdenticalPerSensor) {
     if (!SceneAvailable()) GTEST_SKIP() << "go2_stand scene unavailable";
     DeviceGuard device;
@@ -243,6 +222,7 @@ TEST(MultiCameraSensor, CrossEnvTilesByteIdenticalPerSensor) {
     ASSERT_EQ(nuka_world_step_n(world.handle, 9u), NUKA_RESULT_OK);
     ASSERT_EQ(AttachCam0(world.handle, kW, kH), NUKA_RESULT_OK);
     ASSERT_EQ(AttachCam1(world.handle, kW, kH), NUKA_RESULT_OK);
+    ConfigureCenterRayShading(world.handle);
     ASSERT_EQ(nuka_world_render_sensors(world.handle), NUKA_RESULT_OK);
 
     nuka_buffer_view_t color{};

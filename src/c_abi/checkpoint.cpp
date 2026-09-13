@@ -3,6 +3,7 @@
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
 #include "nk/pipeline/world.hpp"
+#include "render/sensor_backend.hpp"
 
 #include <array>
 #include <cstdint>
@@ -22,6 +23,9 @@ struct WorldCheckpointRecord {
     uint32_t sparse_solver_backend = 0u;
     std::map<nuka_state_field_t, sensor::ObservationSnapshot> observations;
     sensor::StateSensorBankSnapshot state_sensors;
+    uint64_t sensor_revision = 0u;
+    bool sensor_rendered = false;
+    rt::SensorStateSnapshot imaging;
     sensor::noise::DomainRandomizationConfig dr_config;
     bool dr_baseline_captured = false;
     std::vector<float> dr_nominal_link_mass;
@@ -74,9 +78,107 @@ void HashObservationConfig(uint64_t* hash, const sensor::ObservationConfig& conf
     HashValue(hash, e.saturation_enabled);
 }
 
+void HashImagingState(uint64_t* hash, const rt::SensorStateSnapshot& snapshot) {
+    const auto& state = snapshot.imaging;
+    HashValue(hash, state.env_count);
+    HashValue(hash, uint64_t{state.cameras.size()});
+    for (const auto& c : state.cameras) {
+        HashValue(hash, c.enabled);
+        HashValue(hash, c.shot_noise);
+        HashValue(hash, c.adc_bits);
+        HashValue(hash, c.exposure_time);
+        HashValue(hash, c.electrons_per_unit_second);
+        HashValue(hash, c.full_well_electrons);
+        HashValue(hash, c.read_noise_electrons);
+        HashValue(hash, c.row_noise_electrons);
+        HashValue(hash, c.dark_current);
+        HashValue(hash, c.dark_doubling_temperature);
+        HashValue(hash, c.temperature);
+        HashValue(hash, c.reference_temperature);
+        HashValue(hash, c.pixel_gain_stddev);
+        HashValue(hash, c.pixel_offset_stddev_electrons);
+        HashValue(hash, c.analog_gain);
+        HashValue(hash, c.black_level_electrons);
+        HashValue(hash, c.dead_pixel_probability);
+        HashValue(hash, c.hot_pixel_probability);
+        HashValue(hash, c.hot_pixel_current);
+        HashValue(hash, c.seed);
+    }
+    for (const auto* configs : {&state.depths, &state.lidars}) {
+        HashValue(hash, uint64_t{configs->size()});
+        for (const auto& c : *configs) {
+            HashValue(hash, c.enabled);
+            HashValue(hash, c.bias);
+            HashValue(hash, c.scale_error);
+            HashValue(hash, c.distance_stddev);
+            HashValue(hash, c.quadratic_stddev);
+            HashValue(hash, c.incidence_bias);
+            HashValue(hash, c.quantization);
+            HashValue(hash, c.return_photons);
+            HashValue(hash, c.reference_distance);
+            HashValue(hash, c.background_photons);
+            HashValue(hash, c.precision);
+            HashValue(hash, c.minimum_return);
+            HashValue(hash, c.dropout_probability);
+            HashValue(hash, c.seed);
+        }
+    }
+    for (const auto* stamps : {&state.camera_stamps, &state.lidar_stamps}) {
+        HashValue(hash, uint64_t{stamps->size()});
+        for (const auto& stamp : *stamps) {
+            HashValue(hash, stamp.acquisitions);
+            HashValue(hash, stamp.sample_time);
+            HashValue(hash, stamp.valid);
+        }
+    }
+    for (double time : state.sample_times) HashValue(hash, time);
+    HashValue(hash, snapshot.aov_mask);
+    HashValue(hash, snapshot.width);
+    HashValue(hash, snapshot.height);
+    HashValue(hash, snapshot.lidar_az);
+    HashValue(hash, snapshot.lidar_el);
+    for (const auto* values : {&snapshot.color, &snapshot.depth, &snapshot.normal, &snapshot.albedo, &snapshot.range})
+        HashFloatVector(hash, *values);
+    HashValue(hash, uint64_t{snapshot.prim.size()});
+    HashBytes(hash, snapshot.prim.data(), snapshot.prim.size() * sizeof(uint32_t));
+    const auto& f = snapshot.fidelity;
+    HashValue(hash, f.spp);
+    HashValue(hash, f.shadow_samples);
+    HashValue(hash, f.sun_angular_radius);
+    HashValue(hash, f.ao_enabled);
+    HashValue(hash, f.ao_samples);
+    HashValue(hash, f.ao_radius);
+    HashValue(hash, f.gi_enabled);
+    HashValue(hash, f.tonemap_enabled);
+    HashValue(hash, f.srgb_enabled);
+    for (const auto& color : {f.sky_top, f.sky_bottom, f.sky_ground, f.fog_color}) {
+        HashValue(hash, color.x);
+        HashValue(hash, color.y);
+        HashValue(hash, color.z);
+    }
+    HashValue(hash, f.fog_density);
+    HashValue(hash, f.sky_intensity);
+    HashValue(hash, f.seed);
+    const auto& d = snapshot.render_dr;
+    HashValue(hash, d.enabled);
+    HashValue(hash, d.seed);
+    HashValue(hash, d.color_jitter);
+    HashValue(hash, d.roughness_jitter);
+    HashValue(hash, d.metallic_jitter);
+    HashValue(hash, d.light_dir_jitter);
+    HashValue(hash, d.light_intensity_jitter);
+    HashValue(hash, d.light_color_jitter);
+    HashValue(hash, d.ambient_intensity_jitter);
+}
+
 phi::Status CopyHostState(const WorldRecord& source, WorldCheckpointRecord* target) {
     const auto sensor_status = source.world->StateSensors().Capture(&target->state_sensors);
     if (sensor_status != phi::Status::Ok) return sensor_status;
+    if (source.sensor) {
+        target->sensor_revision = source.sensor->revision;
+        target->sensor_rendered = source.sensor->rendered;
+        target->imaging = source.sensor->backend->CaptureSensorState(source.sensor->handle);
+    }
     target->simulated_step_count = source.simulated_step_count;
     target->step_options = source.step_options;
     target->sparse_solver_backend = source.sparse_solver_backend;
@@ -110,11 +212,27 @@ void RestoreHostState(const WorldCheckpointRecord& source, WorldRecord* target) 
     target->articulation_host.joint_armature = source.joint_armature;
     target->last_invariant_violations.clear();
     target->invariant_sampler.Reset();
+    if (target->sensor) {
+        auto& s = *target->sensor;
+        s.backend->RestoreSensorState(s.handle, source.imaging);
+        s.rendered = source.sensor_rendered;
+        s.fidelity = source.imaging.fidelity;
+        s.render_dr = source.imaging.render_dr;
+        s.aov_mask = source.imaging.aov_mask;
+        s.camera_responses = source.imaging.imaging.cameras;
+        s.depth_responses = source.imaging.imaging.depths;
+        s.lidar_responses = source.imaging.imaging.lidars;
+    }
 }
 
 phi::Status HashHostState(uint64_t* hash, const WorldRecord& record) {
     HashValue(hash, record.env_count);
     HashValue(hash, record.simulated_step_count);
+    HashValue(hash, record.sensor ? record.sensor->revision : uint64_t{0u});
+    if (record.sensor) {
+        HashValue(hash, record.sensor->rendered);
+        HashImagingState(hash, record.sensor->backend->CaptureSensorState(record.sensor->handle));
+    }
     sensor::StateSensorBankSnapshot state_sensors;
     const auto sensor_status = record.world->StateSensors().Capture(&state_sensors);
     if (sensor_status != phi::Status::Ok) return sensor_status;
@@ -260,6 +378,8 @@ nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
         return NUKA_RESULT_NOT_SUPPORTED;
     }
     try {
+        if ((record->sensor ? record->sensor->revision : 0u) != saved->sensor_revision)
+            return NUKA_RESULT_INVALID_ARG;
         if (!record->world->StateSensors().Compatible(saved->state_sensors)) return NUKA_RESULT_INVALID_ARG;
         for (const auto& entry : saved->observations) {
             const auto found = record->field_observations.find(entry.first);
@@ -308,7 +428,7 @@ nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash)
             return NUKA_RESULT_INTERNAL;
         }
         uint64_t hash = nuka::c_abi::kFnvOffset;
-        constexpr char domain[] = "NukaStateHashV3";
+        constexpr char domain[] = "NukaStateHashV4";
         nuka::c_abi::HashBytes(&hash, domain, sizeof(domain));
         const auto status = nuka::c_abi::HashHostState(&hash, *record);
         if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
