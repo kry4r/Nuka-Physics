@@ -1,5 +1,6 @@
 // Independent islands retain ordered row updates and separate real/pseudo velocities.
 
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
 #include <cub/block/block_scan.cuh>
@@ -78,27 +79,45 @@ __device__ void ApplyPointImpulse(const NkRowSide& side, float delta,
 // Independent warps screen consecutive rows before the ordered updates.
 constexpr uint32_t kUnionIslandBlockSize = 64u;
 constexpr uint32_t kPairDrivenIslandBlockSize = 32u;
-constexpr uint32_t kDynamicIslandBlockSize = 256u;
 constexpr uint32_t kScalarIslandBlockSize = 32u;
 // One block carries the live-row scan so the compacted order stays deterministic.
 constexpr uint32_t kCompactBlockSize = 1024u;
 constexpr uint32_t kScalarIslandGridBlocks = 64u;
-// A batch hashes the state keys its rows write into a double-buffered shared table.
-constexpr uint32_t kOwnerTableSlots = 1024u;
+// A colored row spreads at most two owners over each lane of its warp.
 constexpr uint32_t kOwnerKeysPerRow = 64u;
 constexpr uint32_t kOwnerEmpty = ~0u;
 constexpr uint32_t kOwnerGroupKind = 7u;
-// A live row either runs ordered, runs concurrently with its batch, or is solved by its normal.
-constexpr uint32_t kRowOrdered = 0u;
-constexpr uint32_t kRowFree = 1u;
-constexpr uint32_t kRowSkipped = 2u;
+// Live rows sharing no written state take one color and sweep together across the grid.
+// Rows the palette cannot place, or with articulation owners, run in island order instead.
+constexpr uint32_t kColorPalette = 128u;
+constexpr uint32_t kColorWords = kColorPalette / 32u;
+constexpr uint32_t kColorEpochs = 16u;
+constexpr uint32_t kColorSlots = kColorPalette * kColorEpochs;
+constexpr uint32_t kColorRounds = 256u;
+constexpr uint32_t kColorBlockSize = 256u;
+constexpr uint32_t kColorBlocksPerSm = 2u;
+constexpr uint32_t kColorGridLimit = 1024u;
+constexpr uint32_t kColorPending = ~0u;
+constexpr uint32_t kColorOverflow = ~1u;
+constexpr uint32_t kColorChain = ~2u;
+// Control words: live and chain-island totals, the color count, then rotating round flags.
+constexpr uint32_t kControlLive = 0u;
+constexpr uint32_t kControlChainIslands = 2u;
+constexpr uint32_t kControlColors = 3u;
+constexpr uint32_t kControlPending = 4u;
+constexpr uint32_t kControlChanged = 8u;
+constexpr uint32_t kControlOverflow = 12u;
+constexpr uint32_t kControlWords = 16u;
+// Island roots keep their build flags in cc_parent; the top bit marks a root with live rows.
+constexpr uint32_t kIslandNeedsSolve = 1u << 31u;
 
 struct IslandActivityView {
     const uint32_t* sorted_roots = nullptr;
     uint32_t* needs_solve = nullptr;
 
     __device__ bool Active(const IslandRecord& island) const {
-        return needs_solve == nullptr || needs_solve[sorted_roots[island.seg_off]] != 0u;
+        return needs_solve == nullptr ||
+               (needs_solve[sorted_roots[island.seg_off]] & kIslandNeedsSolve) != 0u;
     }
 };
 
@@ -151,17 +170,11 @@ __device__ NkRowSide SlimPointSide(const SlimRow& row) {
     return side;
 }
 
-// Static schedules cache row data and Jacobians; dynamic schedules use global rows.
+// Union islands cache row data and Jacobians; PairDriven islands read global rows.
 // Both allocate velocity tiles, with separate pseudo tiles for the position solve.
 inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
-                                uint32_t qdot_floats, bool cache_jw,
-                                bool pos_pass, uint32_t k_tiles, uint32_t staged_warps = 0u) {
-    if (!cache_jw) {
-        // Global rows need shared velocity tiles and a per-island articulation index.
-        return sizeof(float) * qdot_floats * (pos_pass ? 3u : 2u) +
-               sizeof(uint32_t) * 2ull * k_tiles +
-               sizeof(float) * staged_warps * (12ull * dof_stride + 1ull);
-    }
+                                uint32_t qdot_floats, bool cache_jw, bool pos_pass) {
+    if (!cache_jw) return sizeof(float) * qdot_floats * (pos_pass ? 3u : 2u);
     const uint64_t jw = 2ull * rows_per_env * dof_stride;
     const uint64_t slim = sizeof(SlimRow) * rows_per_env;
     return sizeof(float) *
@@ -672,35 +685,160 @@ __device__ inline bool PreparedSideWritable(const NkRowSide& s, const float* bod
     return true;
 }
 
-// An owner key packs a state kind with its index; an unpackable index yields no key.
-__device__ inline uint32_t OwnerKey(uint32_t kind, uint32_t index) {
-    return index < (1u << 29u) ? (index << 3u) | kind : kOwnerEmpty;
-}
-
 __device__ inline uint32_t SideOwnerCount(const NkRowSide& side, PointMassView points,
                                           const float* body_inv_mass) {
     if (!PreparedSideWritable(side, body_inv_mass)) return 0u;
     return PointMassView::IsPointSide(side.kind) ? points.Count(side) : 1u;
 }
 
-__device__ inline uint32_t SideOwnerKey(const NkRowSide& side, uint32_t term, PointMassView points) {
-    if (!PointMassView::IsPointSide(side.kind)) return OwnerKey(side.kind, side.index);
-    const auto contribution = points.At(side, term);
-    return OwnerKey(contribution.kind, contribution.index);
+__device__ inline void SideOwner(const NkRowSide& side, uint32_t term, PointMassView points,
+                                 uint32_t& kind, uint32_t& index) {
+    kind = side.kind;
+    index = side.index;
+    if (side.kind != nk::kNkSidePointEndpoint) return;
+    const nk::PointEndpointTerm& entry = points.terms[points.ranges[side.index].first + term];
+    kind = entry.kind;
+    index = entry.index;
 }
 
-// Linear probing gives each key one slot whose mask collects every batch row holding it.
-__device__ uint32_t InsertOwner(uint32_t* keys, uint32_t* masks, uint32_t key, uint32_t bit) {
-    static_assert(kOwnerTableSlots == 1024u, "the hash keeps the top ten bits");
-    uint32_t slot = (key * 2654435761u) >> 22u;
-    for (;;) {
-        const uint32_t previous = atomicCAS(keys + slot, kOwnerEmpty, key);
-        if (previous == kOwnerEmpty || previous == key) {
-            atomicOr(masks + slot, bit);
-            return slot;
-        }
-        slot = (slot + 1u) & (kOwnerTableSlots - 1u);
+// Views of solve_color_scratch. Dense owners index bodies, particles, grid nodes, then row groups.
+struct ColorScratch {
+    uint32_t* used = nullptr;          // kColorWords per owner: colors taken this epoch
+    uint32_t* tent = nullptr;          // kColorWords per owner: this round's picks
+    uint32_t* dup = nullptr;           // kColorWords per owner: picks seen twice
+    uint32_t* claim = nullptr;         // per owner: highest priority among duplicate picks
+    uint32_t* pos_color = nullptr;     // per live position
+    uint32_t* pos_tent = nullptr;      // per live position: (round << 8) | color
+    uint32_t* color_rows = nullptr;
+    uint32_t* color_start = nullptr;   // bounds of the non-empty colors
+    uint32_t* color_cursor = nullptr;  // kColorSlots
+    uint32_t* chain_rows = nullptr;
+    uint32_t* chain_excl = nullptr;    // per live position, then the total
+    uint32_t* chain_islands = nullptr;
+    uint32_t* block_count = nullptr;   // kColorGridLimit
+    uint32_t* control = nullptr;       // kControlWords
+    float* qdot_error = nullptr;       // per articulation DOF
+    uint32_t bodies = 0u;
+    uint32_t particles = 0u;
+    uint32_t grid = 0u;
+    uint32_t rows = 0u;
+    uint32_t artic_dofs = 0u;
+};
+
+// Lays the scratch out from base; a null base only counts the words.
+uint64_t BindColorScratch(const SolveRowsBlockIslandParams& p, uint32_t* base, ColorScratch* out) {
+    const uint64_t rows = uint64_t{p.rows_per_env} * p.env_count;
+    const uint64_t owners = uint64_t{p.total_body_count} + p.total_particle_count +
+                            p.total_grid_count + rows;
+    uint64_t words = 0u;
+    auto take = [&](uint64_t count) {
+        uint32_t* const at = base != nullptr ? base + words : nullptr;
+        words += count;
+        return at;
+    };
+    ColorScratch s;
+    s.used = take(kColorWords * owners);
+    s.tent = take(kColorWords * owners);
+    s.dup = take(kColorWords * owners);
+    s.claim = take(owners);
+    s.pos_color = take(rows);
+    s.pos_tent = take(rows);
+    s.color_rows = take(rows);
+    s.color_start = take(kColorSlots + 1u);
+    s.color_cursor = take(kColorSlots);
+    s.chain_rows = take(rows);
+    s.chain_excl = take(rows + 1u);
+    s.chain_islands = take(rows);
+    s.block_count = take(kColorGridLimit);
+    s.control = take(kControlWords);
+    s.qdot_error = reinterpret_cast<float*>(take(uint64_t{p.articulation_count} * p.max_dof));
+    s.bodies = p.total_body_count;
+    s.particles = p.total_particle_count;
+    s.grid = p.total_grid_count;
+    s.rows = static_cast<uint32_t>(rows);
+    s.artic_dofs = p.articulation_count * p.max_dof;
+    if (out != nullptr) *out = s;
+    return words;
+}
+
+__device__ inline uint32_t DenseOwner(const ColorScratch& s, uint32_t kind, uint32_t index) {
+    uint32_t base = 0u;
+    uint32_t limit = 0u;
+    if (kind == kNkSideRigid) {
+        limit = s.bodies;
+    } else if (kind == kNkSideParticle) {
+        base = s.bodies;
+        limit = s.particles;
+    } else if (kind == kNkSideGrid) {
+        base = s.bodies + s.particles;
+        limit = s.grid;
+    } else if (kind == kOwnerGroupKind) {
+        base = s.bodies + s.particles + s.grid;
+        limit = s.rows;
     }
+    return index < limit ? base + index : kOwnerEmpty;
+}
+
+// Lane j holds a row's owners j and j + 32. Owner 0 is the row's friction group; a row with
+// an owner outside the dense ranges (an articulation tile) is reported unpacked.
+struct LaneOwners {
+    uint32_t first = kOwnerEmpty;
+    uint32_t second = kOwnerEmpty;
+    bool packed = true;
+};
+
+__device__ LaneOwners LoadLaneOwners(const NkRow& row, PointMassView points,
+                                     const float* body_inv_mass, const ColorScratch& s,
+                                     uint32_t lane) {
+    const uint32_t a_owners = SideOwnerCount(row.a, points, body_inv_mass);
+    const uint32_t owners = 1u + a_owners + SideOwnerCount(row.b, points, body_inv_mass);
+    LaneOwners result;
+    result.packed = owners <= kOwnerKeysPerRow;
+    for (uint32_t j = lane; result.packed && j < owners; j += warpSize) {
+        uint32_t kind = kOwnerGroupKind;
+        uint32_t index = row.group_first;
+        if (j != 0u) {
+            const bool side_a = j - 1u < a_owners;
+            SideOwner(side_a ? row.a : row.b, side_a ? j - 1u : j - 1u - a_owners, points,
+                      kind, index);
+        }
+        const uint32_t owner = DenseOwner(s, kind, index);
+        if (owner == kOwnerEmpty) result.packed = false;
+        if (j < warpSize) result.first = owner;
+        else result.second = owner;
+    }
+    result.packed = __all_sync(0xffffffffu, result.packed);
+    return result;
+}
+
+template <typename Visit>
+__device__ inline void VisitLaneOwners(const LaneOwners& owners, Visit&& visit) {
+    if (owners.first != kOwnerEmpty) visit(owners.first);
+    if (owners.second != kOwnerEmpty) visit(owners.second);
+}
+
+// A bijective integer mix, so distinct row slots keep distinct coloring priorities.
+__device__ inline uint32_t MixSlot(uint32_t x) {
+    x = (x ^ 61u) ^ (x >> 16u);
+    x *= 9u;
+    x ^= x >> 4u;
+    x *= 0x27d4eb2du;
+    x ^= x >> 15u;
+    return x;
+}
+
+// The first color free at every owner, scanning the palette cyclically from start.
+__device__ inline uint32_t FirstFreeColor(const uint32_t (&taken)[kColorWords], uint32_t start) {
+    const uint32_t first_word = start / 32u;
+    const uint32_t shift = start % 32u;
+    for (uint32_t k = 0u; k <= kColorWords; ++k) {
+        const uint32_t word = (first_word + k) % kColorWords;
+        uint32_t free = ~taken[word];
+        if (k == 0u) free &= ~0u << shift;
+        if (k == kColorWords) free &= (1u << shift) - 1u;
+        if (free != 0u) return word * 32u + static_cast<uint32_t>(__ffs(static_cast<int>(free))) - 1u;
+    }
+    return kColorPalette;
 }
 
 __device__ inline void StageRowWarp(const NkRow* rows, uint32_t slot, NkRow* staged, uint32_t lane) {
@@ -1098,8 +1236,10 @@ __global__ void MarkIslandActivityKernel(
                 lambda, row_meff, row_damping, chain_jacobian, chain_jacobian_b, qdot,
                 body_lin_vel, body_ang_vel, point_masses, dof_stride, dt, lane);
         }
-        if (lane == 0u && live_flags != nullptr) live_flags[cursor] = active ? 1u : 0u;
-        if (active && lane == 0u) atomicOr(&activity.needs_solve[root], 1u);
+        // Scalar islands solve every row in order; only warp-work islands list live rows.
+        const bool warp_work = (activity.needs_solve[root] & kIslandWarpWork) != 0u;
+        if (lane == 0u && live_flags != nullptr) live_flags[cursor] = active && warp_work ? 1u : 0u;
+        if (active && lane == 0u) atomicOr(&activity.needs_solve[root], kIslandNeedsSolve);
     }
 }
 
@@ -1109,7 +1249,7 @@ __global__ void CompactLiveRowsKernel(const uint32_t* __restrict__ sorted_roots,
                                       const uint32_t* __restrict__ row_order,
                                       uint32_t* __restrict__ live_scan,
                                       uint32_t* __restrict__ live_order,
-                                      uint32_t total_rows) {
+                                      uint32_t total_rows, uint32_t* __restrict__ live_total) {
     using BlockScanT = cub::BlockScan<uint32_t, kCompactBlockSize>;
     __shared__ typename BlockScanT::TempStorage temp;
     __shared__ uint32_t running, tail_seen;
@@ -1130,107 +1270,7 @@ __global__ void CompactLiveRowsKernel(const uint32_t* __restrict__ sorted_roots,
         __syncthreads();
         if (tail_seen != 0u) break;
     }
-}
-
-// Batch b of an island holds its live rows w * batches + b, one per solve warp. A row sharing
-// no written state with the rest of its batch commutes with it and is marked free.
-__global__ void ClassifyLiveRowsKernel(const NkRow* __restrict__ urows, PointMassView point_masses,
-                                       const float* __restrict__ body_inv_mass,
-                                       const uint32_t* __restrict__ islands,
-                                       const uint32_t* __restrict__ island_count_dev,
-                                       IslandActivityView activity,
-                                       const uint32_t* __restrict__ live_scan,
-                                       const uint32_t* __restrict__ live_order,
-                                       uint32_t* __restrict__ row_modes) {
-    __shared__ uint32_t owner_table[4u * kOwnerTableSlots];
-    __shared__ __align__(16) unsigned char row_storage[kDynamicIslandBlockSize / 32u * sizeof(NkRow)];
-    __shared__ uint32_t island_list[kDynamicIslandBlockSize];
-    __shared__ uint32_t island_list_cnt;
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t wlane = threadIdx.x & 31u;
-    const uint32_t nwarps = blockDim.x >> 5u;
-    NkRow* const staged = reinterpret_cast<NkRow*>(row_storage) + warp;
-    for (uint32_t i = threadIdx.x; i < 4u * kOwnerTableSlots; i += blockDim.x)
-        owner_table[i] = (i / kOwnerTableSlots) % 2u == 0u ? kOwnerEmpty : 0u;
-    uint32_t held_low = kOwnerEmpty;
-    uint32_t held_high = kOwnerEmpty;
-    uint32_t round = 0u;
-    const uint32_t island_count = *island_count_dev;
-    for (uint32_t base = 0u; base < island_count; base += blockDim.x) {
-        if (threadIdx.x == 0u) island_list_cnt = 0u;
-        __syncthreads();
-        if (base + threadIdx.x < island_count) {
-            const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[base + threadIdx.x];
-            if ((rec.flags & kIslandWarpWork) && rec.seg_cnt > 0u && activity.Active(rec))
-                island_list[atomicAdd(&island_list_cnt, 1u)] = base + threadIdx.x;
-        }
-        __syncthreads();
-        const uint32_t listed = island_list_cnt;
-        for (uint32_t k = 0u; k < listed; ++k) {
-            const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[island_list[k]];
-            const uint32_t live_off = rec.seg_off == 0u ? 0u : live_scan[rec.seg_off - 1u];
-            const uint32_t live_rows = live_scan[rec.seg_off + rec.seg_cnt - 1u] - live_off;
-            const uint32_t batches = (live_rows + nwarps - 1u) / nwarps;
-            for (uint32_t b = blockIdx.x; b < batches; b += gridDim.x, ++round) {
-                // The previous round's table is released while this round fills the other.
-                uint32_t* const keys = owner_table + (round & 1u) * 2u * kOwnerTableSlots;
-                uint32_t* const masks = keys + kOwnerTableSlots;
-                uint32_t* const released = owner_table + (~round & 1u) * 2u * kOwnerTableSlots;
-                if (held_low != kOwnerEmpty) {
-                    released[held_low] = kOwnerEmpty;
-                    released[kOwnerTableSlots + held_low] = 0u;
-                }
-                if (held_high != kOwnerEmpty) {
-                    released[held_high] = kOwnerEmpty;
-                    released[kOwnerTableSlots + held_high] = 0u;
-                }
-                held_low = kOwnerEmpty;
-                held_high = kOwnerEmpty;
-                const uint32_t position = warp * batches + b;
-                const bool valid = position < live_rows;
-                uint32_t mode = kRowOrdered;
-                bool participates = false;
-                if (valid) {
-                    StageRowWarp(urows, live_order[live_off + position], staged, wlane);
-                    const NkRow& row = staged[0];
-                    const uint32_t a_owners = SideOwnerCount(row.a, point_masses, body_inv_mass);
-                    const uint32_t owners =
-                        1u + a_owners + SideOwnerCount(row.b, point_masses, body_inv_mass);
-                    if (row.flags & nk::nk_row_flags::kBlockTangent) {
-                        mode = kRowSkipped;
-                    } else if (owners <= kOwnerKeysPerRow) {
-                        bool packed = true;
-                        for (uint32_t j = wlane; j < owners; j += warpSize) {
-                            const uint32_t key = j == 0u
-                                ? OwnerKey(kOwnerGroupKind, row.group_first)
-                                : (j - 1u < a_owners
-                                    ? SideOwnerKey(row.a, j - 1u, point_masses)
-                                    : SideOwnerKey(row.b, j - 1u - a_owners, point_masses));
-                            if (key == kOwnerEmpty) {
-                                packed = false;
-                                continue;
-                            }
-                            const uint32_t held = InsertOwner(keys, masks, key, 1u << warp);
-                            if (j < warpSize) held_low = held;
-                            else held_high = held;
-                        }
-                        participates = __all_sync(0xffffffffu, packed);
-                    }
-                }
-                __syncthreads();
-                if (participates) {
-                    const uint32_t others = ~(1u << warp);
-                    const bool shared_owner =
-                        (held_low != kOwnerEmpty && (masks[held_low] & others) != 0u) ||
-                        (held_high != kOwnerEmpty && (masks[held_high] & others) != 0u);
-                    if (!__any_sync(0xffffffffu, shared_owner)) mode = kRowFree;
-                }
-                if (valid && wlane == 0u) row_modes[live_off + position] = mode;
-                __syncthreads();
-            }
-        }
-        __syncthreads();
-    }
+    if (threadIdx.x == 0u) *live_total = running;
 }
 
 __device__ bool SolveUnionRowWarp(uint32_t ls,            // env-local slot
@@ -1321,7 +1361,7 @@ __device__ bool SolveUnionRowWarp(uint32_t ls,            // env-local slot
     }
     float delta = 0.0f;
     if (wlane == 0u) {
-        // Static schedules cache lambda and effective mass; dynamic schedules read global rows.
+        // Union islands cache lambda and effective mass; other callers read global rows.
         const float effective_mass = meff_sh != nullptr ? meff_sh[ls]
                                                         : row_meff[gslot];
         const float damping = damping_sh != nullptr ? damping_sh[ls]
@@ -1811,7 +1851,7 @@ __device__ __forceinline__ void ArticDofTarget(
     gl = static_cast<size_t>(env) * base_link_count + link;
 }
 
-template <bool pair_driven, bool dynamic>
+template <bool pair_driven>
 __global__ void SolveRowsBlockIslandKernel(
     const NkRow* __restrict__ urows,
     float* __restrict__ lambda,
@@ -1835,8 +1875,6 @@ __global__ void SolveRowsBlockIslandKernel(
     const uint32_t* __restrict__ dof_to_link,
     const uint32_t* __restrict__ dof_to_component,
     uint32_t* __restrict__ pd_solve_scratch,  // PairDriven GLOBAL order+seg scratch
-    const uint32_t* __restrict__ live_scan,   // inclusive live count per island slot
-    const uint32_t* __restrict__ live_order,  // compacted live rows (or null)
     float* __restrict__ row_penetration,    // split-impulse depth (or null)
     float* __restrict__ row_pseudo_lambda,        // split-impulse accumulator (or null)
     float* __restrict__ qdot_pseudo,              // per-link pseudo joint vel (or null)
@@ -1846,8 +1884,6 @@ __global__ void SolveRowsBlockIslandKernel(
     math::Vec3* __restrict__ body_pseudo_ang_vel, // per-body pseudo ang vel (or null)
     math::Vec3* __restrict__ particle_pseudo_vel, // per-particle pseudo vel (or null)
     math::Vec3* __restrict__ grid_pseudo_vel,
-    const uint32_t* __restrict__ island_count_dev, // dynamic island count (or null)
-    IslandActivityView activity,
     uint32_t total_islands,
     uint32_t rows_per_env,
     uint32_t dof_stride,
@@ -1859,26 +1895,15 @@ __global__ void SolveRowsBlockIslandKernel(
     float dt, float vel_tolerance,
     float baumgarte_max_velocity, bool apply_cached_impulses, VelocityErrorView error) {
     constexpr uint32_t with_b_arm = pair_driven ? 1u : 0u;
-    const uint32_t live_islands = dynamic ? *island_count_dev : total_islands;
-    for (uint64_t cursor = blockIdx.x; cursor < live_islands; cursor += gridDim.x) {
+    for (uint64_t cursor = blockIdx.x; cursor < total_islands; cursor += gridDim.x) {
         const uint32_t island = static_cast<uint32_t>(cursor);
-        // Dynamic records index contiguous active rows; static records index color segments.
+        // Cook-time island records index their color segments.
         const IslandRecord rec =
             reinterpret_cast<const IslandRecord*>(islands)[island];
         const uint32_t seg_off = rec.seg_off;
         const uint32_t seg_cnt = rec.seg_cnt;
         const uint32_t flags = rec.flags;
         const uint32_t env = rec.env;
-        if (dynamic && !(flags & kIslandWarpWork)) continue;
-        // Live rows form a contiguous slice of the compacted list, bounded by the scan.
-        const bool compacted = dynamic && live_scan != nullptr && live_order != nullptr;
-        const uint32_t live_off =
-            compacted ? (seg_off == 0u ? 0u : live_scan[seg_off - 1u]) : seg_off;
-        const uint32_t live_rows =
-            compacted ? live_scan[seg_off + seg_cnt - 1u] - live_off : seg_cnt;
-        const uint32_t* const walk_order = compacted ? live_order : row_order;
-        const bool active = activity.Active(rec);
-        if (!active && !(flags & kIslandHasArticulation)) continue;
         const uint32_t lane = threadIdx.x;
         const uint32_t env_row_base = env * rows_per_env;
         const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;
@@ -1886,7 +1911,7 @@ __global__ void SolveRowsBlockIslandKernel(
 
         // Shared storage belongs to this block and is reused after each island finishes.
         extern __shared__ unsigned char dyn_sh[];
-        // Static schedules cache row Jacobians; dynamic schedules keep them in global storage.
+        // Union islands cache row Jacobians; PairDriven islands keep them in global storage.
         const bool cache_jw = (with_b_arm == 0u);
         // the qdot region. Union: the legacy kMaxArticulationDof reservation (shared
         // footprint byte-for-byte the H1-golden carve). PairDriven: compact K-tile.
@@ -1908,9 +1933,6 @@ __global__ void SolveRowsBlockIslandKernel(
         SlimRow* slim_sh = nullptr;
         uint32_t* order_sh = nullptr;
         uint32_t* seg_sh = nullptr;
-        // A present bitmap and compact tile list restrict shared velocity writes to this island.
-        uint32_t* tile_present = nullptr;
-        uint32_t* tile_list = nullptr;
         if (cache_jw) {
             lambda_sh = qdot_error_sh + qdot_floats;
             meff_sh = lambda_sh + rows_per_env;
@@ -1922,58 +1944,20 @@ __global__ void SolveRowsBlockIslandKernel(
             order_sh = reinterpret_cast<uint32_t*>(slim_sh + rows_per_env);
             seg_sh = order_sh + rows_per_env;                        // 2R u32
         } else {
-            float* const tile_base =
-                qdot_sh + static_cast<size_t>(qdot_floats) * (pos_pass ? 3u : 2u);
-            tile_present = reinterpret_cast<uint32_t*>(tile_base);
-            tile_list = tile_present + k_tiles;
-            // Static schedules build their ordered segments in per-environment global scratch.
+            // PairDriven islands build their ordered segments in per-environment global scratch.
             order_sh = pd_solve_scratch + static_cast<size_t>(3u) * env_row_base;
             seg_sh = order_sh + rows_per_env;                        // 2R u32
         }
-        __shared__ uint32_t tile_cnt_sh;
 
         const bool has_artic = (flags & kIslandHasArticulation) != 0u && dof_stride > 0u;
-        // Union-find closes each island's articulation tile set; other islands never write it.
-        if (dynamic && has_artic) {
-            for (uint32_t i = lane; i < k_tiles; i += blockDim.x) tile_present[i] = 0u;
-            if (lane == 0u) tile_cnt_sh = 0u;
-            __syncthreads();
-            for (uint32_t r = lane; r < seg_cnt; r += blockDim.x) {
-                const NkRow& row = urows[row_order[seg_off + r]];
-                if (row.a.kind == kNkSideArtic && row.a.index >= env_artic_base) {
-                    atomicOr(&tile_present[row.a.index - env_artic_base], 1u);
-                }
-                if (row.b.kind == kNkSideArtic && row.b.index >= env_artic_base) {
-                    atomicOr(&tile_present[row.b.index - env_artic_base], 1u);
-                }
-            }
-            __syncthreads();
-            for (uint32_t t = lane; t < k_tiles; t += blockDim.x) {
-                if (tile_present[t] != 0u) tile_list[atomicAdd(&tile_cnt_sh, 1u)] = t;
-            }
-            __syncthreads();
-        }
         if (has_artic) {
-            if (dynamic) {
-                // load ONLY this component's tiles (into their env-local qdot_sh slots);
-                // the unloaded slots are never read (no component row touches them).
-                const uint32_t tc = tile_cnt_sh;
-                for (uint32_t u = 0u; u < tc; ++u) {
-                    const uint32_t tile = tile_list[u];
-                    for (uint32_t k = lane; k < dof_stride; k += blockDim.x) {
-                        qdot_sh[tile * dof_stride + k] = qdot_flat[
-                            static_cast<size_t>(env_artic_base + tile) * dof_stride + k];
-                    }
-                }
-            } else {
-                // load EVERY co-resident articulation tile of this env (K tiles). At
-                // K==1 this is the single legacy tile (qdot_flat[env*dof_stride]).
-                for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
-                    qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
-                }
+            // load EVERY co-resident articulation tile of this env (K tiles). At
+            // K==1 this is the single legacy tile (qdot_flat[env*dof_stride]).
+            for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
+                qdot_sh[i] = qdot_flat[static_cast<size_t>(env_artic_base) * dof_stride + i];
             }
         }
-        // Static schedules cache row parameters; dynamic schedules read them from global storage.
+        // Union islands cache row parameters; PairDriven islands read them from global storage.
         if (cache_jw) {
             for (uint32_t i = lane; i < rows_per_env; i += blockDim.x) {
                 const size_t g = static_cast<size_t>(env_row_base) + i;
@@ -1993,16 +1977,11 @@ __global__ void SolveRowsBlockIslandKernel(
                 w_sh[i] = row_minv_jt[g];
             }
         }
-        // Compact active static rows once, preserving the order of all surviving segments.
+        // Compact active rows once, preserving the order of all surviving segments.
         __shared__ uint32_t live_seg_cnt_sh;
-        if (dynamic) {
-            // Dynamic schedules already group active rows into deterministic single-row segments.
-            if (lane == 0u) live_seg_cnt_sh = active ? live_rows : 0u;
-        } else if (lane == 0u) {
+        if (lane == 0u) {
             uint32_t out_rows = 0u;
             uint32_t out_segs = 0u;
-            const uint32_t span_start =
-                seg_cnt > 0u ? segments[static_cast<size_t>(seg_off) * 2u + 0u] : 0u;
             for (uint32_t s = 0u; s < seg_cnt; ++s) {
                 const uint32_t off = segments[static_cast<size_t>(seg_off + s) * 2u + 0u];
                 const uint32_t cnt = segments[static_cast<size_t>(seg_off + s) * 2u + 1u];
@@ -2022,98 +2001,21 @@ __global__ void SolveRowsBlockIslandKernel(
                 }
             }
             live_seg_cnt_sh = out_segs;
-            (void)span_start;
         }
         __syncthreads();
         const uint32_t live_seg_cnt = live_seg_cnt_sh;
-        // Live-row modes come from ClassifyLiveRowsKernel, indexed by compacted position.
-        const uint32_t* const row_modes = compacted ? pd_solve_scratch : nullptr;
 
         const uint32_t warp = lane >> 5u;
         const uint32_t wlane = lane & 31u;
         const uint32_t nwarps = blockDim.x >> 5u;
-        __shared__ __align__(16) unsigned char row_storage[
-            3u * kDynamicIslandBlockSize / 32u * sizeof(NkRow)];
-        auto* staged_rows = reinterpret_cast<NkRow*>(row_storage);
-        float* const staged_j = dynamic ? reinterpret_cast<float*>(tile_list + k_tiles) : nullptr;
-        const size_t staged_size = size_t{3u} * nwarps * dof_stride;
-        float* const staged_tangent_response = dynamic ? staged_j + 4u * staged_size : nullptr;
-        __shared__ uint32_t batch_needed, sweep_changed, free_rows_sh, ordered_rows_sh;
-        __shared__ uint32_t row_changed, row_significant, friction_active;
-        __shared__ float contact_side_velocity[6], contact_delta[3];
-        __shared__ uint32_t ordered_list[kDynamicIslandBlockSize];
-        __shared__ uint32_t ordered_warp_rows[kDynamicIslandBlockSize / 32u];
-        // Batch b hands warp w the live row w * batches + b, so one batch spans the island.
-        const uint32_t batches = dynamic ? (live_seg_cnt + nwarps - 1u) / nwarps : 0u;
-        if (row_modes != nullptr) {
-            if (lane == 0u) {
-                free_rows_sh = 0u;
-                ordered_rows_sh = 0u;
-            }
-            __syncthreads();
-            uint32_t free_rows = 0u;
-            uint32_t ordered_rows = 0u;
-            for (uint32_t position = lane; position < live_seg_cnt; position += blockDim.x) {
-                const uint32_t mode = row_modes[live_off + position];
-                free_rows += mode == kRowFree ? 1u : 0u;
-                ordered_rows += mode == kRowOrdered ? 1u : 0u;
-            }
-            free_rows = __reduce_add_sync(0xffffffffu, free_rows);
-            ordered_rows = __reduce_add_sync(0xffffffffu, ordered_rows);
-            if (wlane == 0u) {
-                atomicAdd(&free_rows_sh, free_rows);
-                atomicAdd(&ordered_rows_sh, ordered_rows);
-            }
-            __syncthreads();
-        }
-
-        // A row sharing no written state with the rest of its batch commutes with it, so its
-        // warp solves it concurrently with the other warps.
-        auto free_sweep = [&](auto&& solve_row) {
-            if (row_modes == nullptr || free_rows_sh == 0u) return;
-            NkRow* const staged = staged_rows + 3u * warp;
-            for (uint32_t b = 0u; b < batches; ++b) {
-                const uint32_t position = warp * batches + b;
-                const bool valid = position < live_seg_cnt;
-                const uint32_t slot = valid ? walk_order[live_off + position] : 0u;
-                const uint32_t mode = valid ? row_modes[live_off + position] : kRowOrdered;
-                if (mode == kRowFree) {
-                    StageRowWarp(urows, slot, staged, wlane);
-                    solve_row(slot, staged);
-                }
-                __syncthreads();
-            }
-        };
-        // Rows that share state keep their relative live order, gathered one chunk at a time.
-        auto ordered_sweep = [&](auto&& solve_list) {
-            if (row_modes != nullptr && ordered_rows_sh == 0u) return;
-            for (uint32_t chunk = 0u; chunk < live_seg_cnt; chunk += blockDim.x) {
-                const uint32_t position = chunk + lane;
-                uint32_t slot = 0u;
-                bool take = false;
-                if (position < live_seg_cnt) {
-                    slot = walk_order[live_off + position];
-                    take = row_modes == nullptr || row_modes[live_off + position] == kRowOrdered;
-                }
-                const uint32_t ballot = __ballot_sync(0xffffffffu, take);
-                if (wlane == 0u) ordered_warp_rows[warp] = __popc(ballot);
-                __syncthreads();
-                uint32_t before = 0u;
-                uint32_t count = 0u;
-                for (uint32_t w = 0u; w < nwarps; ++w) {
-                    if (w < warp) before += ordered_warp_rows[w];
-                    count += ordered_warp_rows[w];
-                }
-                if (take) ordered_list[before + __popc(ballot & ((1u << wlane) - 1u))] = slot;
-                __syncthreads();
-                if (count > 0u) solve_list(count);
-                __syncthreads();
-            }
-        };
+        __shared__ uint32_t sweep_changed;
 
         if (with_b_arm != 0u && apply_cached_impulses) {
-            if constexpr (dynamic) {
-                auto apply_cached = [&](uint32_t gslot) {
+            for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
+                const uint32_t off = seg_sh[2u * s + 0u];
+                const uint32_t cnt = seg_sh[2u * s + 1u];
+                for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
+                    const uint32_t gslot = order_sh[off + idx];
                     SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
                                       env_artic_base, gslot, wlane, nullptr,
                                       nullptr, nullptr, nullptr, lambda, row_meff,
@@ -2124,175 +2026,32 @@ __global__ void SolveRowsBlockIslandKernel(
                                       body_inv_mass, body_world_inv_inertia,
                                       point_masses,
                                       dof_stride, dt, true, error);
-                };
-                free_sweep([&](uint32_t gslot, const NkRow*) { apply_cached(gslot); });
-                ordered_sweep([&](uint32_t count) {
-                    for (uint32_t idx = warp == 0u ? 0u : count; idx < count; ++idx) {
-                        apply_cached(ordered_list[idx]);
-                        __syncwarp();
-                    }
-                });
-            } else {
-                for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
-                    const uint32_t off = seg_sh[2u * s + 0u];
-                    const uint32_t cnt = seg_sh[2u * s + 1u];
-                    for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
-                        const uint32_t gslot = order_sh[off + idx];
-                        SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
-                                          env_artic_base, gslot, wlane, nullptr,
-                                          nullptr, nullptr, nullptr, lambda, row_meff,
-                                          row_damping,
-                                          chain_jacobian, row_minv_jt,
-                                          chain_jacobian_b, row_minv_jt_b,
-                                          qdot_sh, urows, body_lin_vel, body_ang_vel,
-                                          body_inv_mass, body_world_inv_inertia,
-                                          point_masses,
-                                          dof_stride, dt, true, error);
-                    }
-                    __syncthreads();
                 }
+                __syncthreads();
             }
         }
         for (uint32_t it = 0u; it < vel_iters; ++it) {
             bool warp_changed = false;
             if (lane == 0u) sweep_changed = 0u;
             __syncthreads();
-            if constexpr (dynamic) {
-                // Free rows read their Jacobians from global slots with tangent axes a group apart.
-                free_sweep([&](uint32_t gslot, NkRow* staged) {
-                    bool significant = false;
-                    if (staged[0].flags & nk::nk_row_flags::kBlockNormal) {
-                        significant = SolvePreparedContactBlockWarp(gslot, env_artic_base,
-                            wlane, urows, staged, lambda, row_damping, chain_jacobian,
-                            row_minv_jt, chain_jacobian_b, row_minv_jt_b, qdot_sh,
-                            body_lin_vel, body_ang_vel, body_inv_mass, body_world_inv_inertia,
-                            point_masses, dof_stride, dt, vel_tolerance, error);
-                    } else {
-                        significant = SolveUnionRowWarp(
-                            gslot - env_row_base, gslot, env_row_base, env_artic_base,
-                            gslot, wlane, nullptr, nullptr, nullptr, nullptr,
-                            lambda, row_meff, row_damping, chain_jacobian,
-                            row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                            qdot_sh, urows,
-                            body_lin_vel, body_ang_vel, body_inv_mass,
-                            body_world_inv_inertia, point_masses, dof_stride, dt,
-                            false, error, staged, vel_tolerance);
-                    }
-                    if (significant && wlane == 0u) atomicOr(&sweep_changed, 1u);
-                });
-                ordered_sweep([&](uint32_t count) {
-                    for (uint32_t s = 0u; s < count; s += nwarps) {
-                        const uint32_t batch_count = min(nwarps, count - s);
-                        if (lane == 0u) batch_needed = 0u;
-                        __syncthreads();
-                        if (warp < batch_count) {
-                            const uint32_t slot = ordered_list[s + warp];
-                            StageRowWarp(urows, slot, staged_rows + 3u * warp, wlane);
-                            const bool tangent = (staged_rows[3u * warp].flags &
-                                nk::nk_row_flags::kBlockTangent) != 0u;
-                            const bool needed = !tangent && RowNeedsVelocitySolveWarp(urows, slot,
-                                env_row_base, env_artic_base, lambda, row_meff, row_damping,
-                                chain_jacobian, chain_jacobian_b, qdot_sh, body_lin_vel,
-                                body_ang_vel, point_masses, dof_stride, dt, wlane,
-                                staged_rows + 3u * warp);
-                            if (needed && wlane == 0u) atomicOr(&batch_needed, 1u);
-                        }
-                        __syncthreads();
-                        // A batch is skipped only if every row leaves its input unchanged.
-                        if (batch_needed == 0u) {
-                            __syncthreads();
-                            continue;
-                        }
-                        if (warp < batch_count) {
-                            const uint32_t slot = ordered_list[s + warp];
-                            const NkRow& normal = staged_rows[3u * warp];
-                            if (wlane == 0u && (normal.flags & nk::nk_row_flags::kBlockNormal))
-                                staged_tangent_response[warp] = constraint::CoulombTangentSpectralResponse(
-                                    normal.contact_response, normal.mu, normal.friction_secondary);
-                            const uint32_t axes = (normal.flags & nk::nk_row_flags::kBlockNormal)
-                                ? 3u : ((normal.flags & nk::nk_row_flags::kBlockTangent) ? 0u : 1u);
-                            for (uint32_t axis = 0u; axis < axes; ++axis) {
-                                const uint32_t at = slot + axis * normal.group_normal_count;
-                                if (axis != 0u) {
-                                    uint32_t word;
-                                    memcpy(&word, reinterpret_cast<const unsigned char*>(urows + at) +
-                                                  wlane * sizeof(word), sizeof(word));
-                                    memcpy(reinterpret_cast<unsigned char*>(staged_rows + 3u * warp + axis) +
-                                               wlane * sizeof(word), &word, sizeof(word));
-                                }
-                                for (uint32_t k = wlane; k < dof_stride; k += warpSize) {
-                                    const size_t destination =
-                                        size_t{3u * warp + axis} * dof_stride + k;
-                                    const size_t source = size_t{at} * dof_stride + k;
-                                    if (normal.a.kind == kNkSideArtic) {
-                                        staged_j[destination] = chain_jacobian[source];
-                                        staged_j[staged_size + destination] = row_minv_jt[source];
-                                    }
-                                    if (normal.b.kind == kNkSideArtic) {
-                                        staged_j[2u * staged_size + destination] = chain_jacobian_b[source];
-                                        staged_j[3u * staged_size + destination] = row_minv_jt_b[source];
-                                    }
-                                }
-                            }
-                        }
-                        __syncthreads();
-                        for (uint32_t idx = 0u; idx < batch_count; ++idx) {
-                            const uint32_t gslot = ordered_list[s + idx];
-                            const NkRow* prepared = staged_rows + 3u * idx;
-                            if (prepared[0].flags & nk::nk_row_flags::kBlockTangent) {
-                                continue;
-                            } else if (prepared[0].flags & nk::nk_row_flags::kBlockNormal) {
-                                SolvePreparedContactBlock(gslot, env_artic_base, 3u * idx,
-                                    warp, wlane, prepared, lambda, row_damping,
-                                    staged_j, staged_j + staged_size,
-                                    staged_j + 2u * staged_size, staged_j + 3u * staged_size,
-                                    qdot_sh, body_lin_vel, body_ang_vel, body_inv_mass,
-                                    body_world_inv_inertia, point_masses, dof_stride, dt,
-                                    staged_tangent_response[idx], vel_tolerance, error,
-                                    contact_side_velocity, contact_delta, &friction_active,
-                                    &row_changed, &row_significant);
-                            } else {
-                                if (lane == 0u) row_significant = 0u;
-                                __syncthreads();
-                                if (warp == 0u) {
-                                    const bool changed = SolveUnionRowWarp(
-                                        gslot - env_row_base, gslot, env_row_base, env_artic_base,
-                                        3u * idx, wlane, nullptr, nullptr, nullptr, nullptr,
-                                        lambda, row_meff, row_damping, staged_j,
-                                        staged_j + staged_size, staged_j + 2u * staged_size,
-                                        staged_j + 3u * staged_size, qdot_sh, urows,
-                                        body_lin_vel, body_ang_vel, body_inv_mass,
-                                        body_world_inv_inertia, point_masses, dof_stride, dt,
-                                        false, error, prepared, vel_tolerance);
-                                    if (wlane == 0u) row_significant = changed ? 1u : 0u;
-                                }
-                            }
-                            __syncthreads();
-                            if (lane == 0u && row_significant != 0u) atomicOr(&sweep_changed, 1u);
-                            __syncthreads();
-                        }
-                    }
-                });
-            } else {
-                for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
-                    const uint32_t off = seg_sh[2u * s + 0u];
-                    const uint32_t cnt = seg_sh[2u * s + 1u];
-                    for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
-                        const uint32_t gslot = order_sh[off + idx];
-                        const bool changed = SolveUnionRowWarp(
-                            gslot - env_row_base, gslot, env_row_base, env_artic_base,
-                            gslot - env_row_base, wlane, slim_sh, lambda_sh, meff_sh,
-                            damping_sh, lambda, row_meff, row_damping, J_sh, w_sh,
-                            nullptr, nullptr, qdot_sh, urows, body_lin_vel, body_ang_vel,
-                            body_inv_mass, body_world_inv_inertia, point_masses,
-                            dof_stride, dt, false, error, nullptr, vel_tolerance);
-                        warp_changed |= changed;
-                        __syncwarp();
-                    }
-                    __syncthreads();
+            for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
+                const uint32_t off = seg_sh[2u * s + 0u];
+                const uint32_t cnt = seg_sh[2u * s + 1u];
+                for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
+                    const uint32_t gslot = order_sh[off + idx];
+                    const bool changed = SolveUnionRowWarp(
+                        gslot - env_row_base, gslot, env_row_base, env_artic_base,
+                        gslot - env_row_base, wlane, slim_sh, lambda_sh, meff_sh,
+                        damping_sh, lambda, row_meff, row_damping, J_sh, w_sh,
+                        nullptr, nullptr, qdot_sh, urows, body_lin_vel, body_ang_vel,
+                        body_inv_mass, body_world_inv_inertia, point_masses,
+                        dof_stride, dt, false, error, nullptr, vel_tolerance);
+                    warp_changed |= changed;
+                    __syncwarp();
                 }
-                if (warp_changed && wlane == 0u) atomicOr(&sweep_changed, 1u);
+                __syncthreads();
             }
+            if (warp_changed && wlane == 0u) atomicOr(&sweep_changed, 1u);
             __syncthreads();
             const bool converged = sweep_changed == 0u;
             __syncthreads();
@@ -2307,16 +2066,7 @@ __global__ void SolveRowsBlockIslandKernel(
                 }
             }
             // Clear pseudo accumulators only for rows owned by this island.
-            if (dynamic) {
-                // The sweeps read live depths; UpdateIdlePenetrationKernel advances the others.
-                for (uint32_t i = warp; i < live_seg_cnt; i += nwarps)
-                    UpdateSpeculativePenetration<true>(walk_order[live_off + i], env_row_base,
-                        env_artic_base, row_penetration, urows, chain_jacobian, chain_jacobian_b,
-                        qdot_sh, body_lin_vel, body_ang_vel, point_masses, dof_stride, dt, wlane);
-                for (uint32_t i = lane; i < seg_cnt; i += blockDim.x) {
-                    row_pseudo_lambda[row_order[seg_off + i]] = 0.0f;
-                }
-            } else if (live_seg_cnt > 0u) {
+            if (live_seg_cnt > 0u) {
                 const uint32_t last_off = seg_sh[2u * (live_seg_cnt - 1u) + 0u];
                 const uint32_t last_cnt = seg_sh[2u * (live_seg_cnt - 1u) + 1u];
                 const uint32_t island_rows = last_off + last_cnt;
@@ -2330,73 +2080,25 @@ __global__ void SolveRowsBlockIslandKernel(
             }
             __syncthreads();
             for (uint32_t it = 0u; it < pos_iters; ++it) {
-                if constexpr (dynamic) {
-                    const PointMassView pseudo_points =
-                        point_masses.Pseudo(particle_pseudo_vel, grid_pseudo_vel);
-                    free_sweep([&](uint32_t gslot, const NkRow* staged) {
-                        SolvePositionRowWarp(gslot, env_row_base, env_artic_base, gslot, wlane,
-                            row_meff, row_penetration, row_pseudo_lambda, chain_jacobian,
-                            row_minv_jt, chain_jacobian_b, row_minv_jt_b, qdot_pseudo_sh, urows,
-                            body_pseudo_lin_vel, body_pseudo_ang_vel, body_inv_mass,
-                            body_world_inv_inertia, pseudo_points, dof_stride, pos_beta,
-                            pos_slop, dt, baumgarte_max_velocity, staged);
-                    });
-                    ordered_sweep([&](uint32_t count) {
-                        for (uint32_t s = 0u; s < count; s += nwarps) {
-                            const uint32_t cnt = min(nwarps, count - s);
-                            // An unchanged batch cannot alter a later row's input during its ordered sweep.
-                            if (lane == 0u) batch_needed = 0u;
-                            __syncthreads();
-                            if (warp < cnt) {
-                                const uint32_t gslot = ordered_list[s + warp];
-                                const bool needed = SolvePositionRowWarp<false>(
-                                    gslot, env_row_base, env_artic_base, gslot, wlane,
-                                    row_meff, row_penetration, row_pseudo_lambda,
-                                    chain_jacobian, row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                                    qdot_pseudo_sh, urows, body_pseudo_lin_vel, body_pseudo_ang_vel,
-                                    body_inv_mass, body_world_inv_inertia, pseudo_points,
-                                    dof_stride, pos_beta, pos_slop, dt, baumgarte_max_velocity);
-                                if (needed && wlane == 0u) atomicOr(&batch_needed, 1u);
-                            }
-                            __syncthreads();
-                            if (batch_needed == 0u) {
-                                __syncthreads();
-                                continue;
-                            }
-                            for (uint32_t idx = warp == 0u ? 0u : cnt; idx < cnt; ++idx) {
-                                const uint32_t gslot = ordered_list[s + idx];
-                                SolvePositionRowWarp(gslot, env_row_base, env_artic_base, gslot,
-                                    wlane, row_meff, row_penetration, row_pseudo_lambda,
-                                    chain_jacobian, row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                                    qdot_pseudo_sh, urows, body_pseudo_lin_vel, body_pseudo_ang_vel,
-                                    body_inv_mass, body_world_inv_inertia, pseudo_points,
-                                    dof_stride, pos_beta, pos_slop, dt, baumgarte_max_velocity);
-                                __syncwarp();
-                            }
-                            __syncthreads();
-                        }
-                    });
-                } else {
-                    for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
-                        const uint32_t off = seg_sh[2u * s + 0u];
-                        const uint32_t cnt = seg_sh[2u * s + 1u];
-                        for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
-                            const uint32_t gslot = order_sh[off + idx];
-                            SolvePositionRowWarp(
-                                gslot, env_row_base, env_artic_base, gslot, wlane,
-                                row_meff, row_penetration, row_pseudo_lambda,
-                                chain_jacobian, row_minv_jt,
-                                chain_jacobian_b, row_minv_jt_b,
-                                qdot_pseudo_sh, urows,
-                                body_pseudo_lin_vel, body_pseudo_ang_vel,
-                                body_inv_mass, body_world_inv_inertia,
-                                point_masses.Pseudo(particle_pseudo_vel, grid_pseudo_vel),
-                                dof_stride, pos_beta, pos_slop, dt,
-                                baumgarte_max_velocity);
-                            __syncwarp();
-                        }
-                        __syncthreads();
+                for (uint32_t s = 0u; s < live_seg_cnt; ++s) {
+                    const uint32_t off = seg_sh[2u * s + 0u];
+                    const uint32_t cnt = seg_sh[2u * s + 1u];
+                    for (uint32_t idx = warp; idx < cnt; idx += nwarps) {
+                        const uint32_t gslot = order_sh[off + idx];
+                        SolvePositionRowWarp(
+                            gslot, env_row_base, env_artic_base, gslot, wlane,
+                            row_meff, row_penetration, row_pseudo_lambda,
+                            chain_jacobian, row_minv_jt,
+                            chain_jacobian_b, row_minv_jt_b,
+                            qdot_pseudo_sh, urows,
+                            body_pseudo_lin_vel, body_pseudo_ang_vel,
+                            body_inv_mass, body_world_inv_inertia,
+                            point_masses.Pseudo(particle_pseudo_vel, grid_pseudo_vel),
+                            dof_stride, pos_beta, pos_slop, dt,
+                            baumgarte_max_velocity);
+                        __syncwarp();
                     }
+                    __syncthreads();
                 }
             }
         }
@@ -2435,12 +2137,9 @@ __global__ void SolveRowsBlockIslandKernel(
                 // Homogeneous articulation tiles occupy contiguous link ranges within an environment.
                 const uint32_t links_per_dog =
                     (k_tiles > 0u) ? (base_link_count / k_tiles) : base_link_count;
-                // Dynamic schedules scatter only owned tiles; static schedules own every environment tile.
-                const uint32_t scatter_tiles = dynamic ? tile_cnt_sh : k_tiles;
-                for (uint32_t i = lane; i < scatter_tiles * dof_stride; i += blockDim.x) {
-                    const uint32_t u = i / dof_stride;       // tile slot in the iteration
-                    const uint32_t k = i - u * dof_stride;   // DOF within tile
-                    const uint32_t a = dynamic ? tile_list[u] : u;  // env-local tile
+                for (uint32_t i = lane; i < k_tiles * dof_stride; i += blockDim.x) {
+                    const uint32_t a = i / dof_stride;       // env-local tile
+                    const uint32_t k = i - a * dof_stride;   // DOF within tile
                     uint32_t comp; size_t gl;
                     ArticDofTarget(env, a, k, dof_stride, links_per_dog, base_link_count,
                                    dof_to_link, dof_to_component, comp, gl);
@@ -2467,6 +2166,731 @@ __global__ void SolveRowsBlockIslandKernel(
         }
         __syncthreads();
     }
+}
+
+// Control words change inside a cooperative launch, so reads past a grid barrier bypass L1.
+__device__ inline uint32_t LoadControl(const uint32_t* word) {
+    return *reinterpret_cast<const volatile uint32_t*>(word);
+}
+
+__global__ void ClearIslandActivityKernel(uint32_t* __restrict__ needs_solve, uint32_t total_rows) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total_rows) needs_solve[i] &= ~kIslandNeedsSolve;
+}
+
+// Each warp walks 32-wide stripes of live positions and visits those take accepts in order.
+template <typename Take, typename Visit>
+__device__ void ForEachLivePosition(uint32_t live, Take&& take, Visit&& visit) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t base = (blockIdx.x * blockDim.x + threadIdx.x) & ~31u; base < live;
+         base += stride) {
+        uint32_t mask = __ballot_sync(0xffffffffu, base + lane < live && take(base + lane));
+        while (mask != 0u) {
+            const uint32_t bit = static_cast<uint32_t>(__ffs(static_cast<int>(mask))) - 1u;
+            mask &= mask - 1u;
+            visit(base + bit);
+        }
+    }
+}
+
+__device__ inline LaneOwners LiveRowOwners(const NkRow* urows, uint32_t slot, PointMassView points,
+                                           const float* body_inv_mass, const ColorScratch& s,
+                                           uint32_t lane) {
+    return LoadLaneOwners(LoadRowWarp(urows, slot, lane), points, body_inv_mass, s, lane);
+}
+
+// Pending rows pick a color free at all their owners; among rows picking one color at a shared
+// owner only the highest priority keeps it. Full palettes open a new epoch of colors.
+__global__ void __launch_bounds__(kColorBlockSize) ColorLiveRowsKernel(
+    const NkRow* __restrict__ urows, PointMassView points, const float* __restrict__ body_inv_mass,
+    const uint32_t* __restrict__ islands, const uint32_t* __restrict__ island_count_dev,
+    IslandActivityView activity, const uint32_t* __restrict__ live_scan,
+    const uint32_t* __restrict__ live_order, ColorScratch s) {
+    using BlockScanT = cub::BlockScan<uint32_t, kColorBlockSize>;
+    static_assert(kColorSlots % kColorBlockSize == 0u, "colors split evenly over the scan block");
+    __shared__ typename BlockScanT::TempStorage scan_temp;
+    __shared__ uint32_t histogram[kColorSlots];
+    __shared__ uint32_t block_chain;
+    const auto grid = cooperative_groups::this_grid();
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t threads = gridDim.x * blockDim.x;
+    const uint32_t live = s.control[kControlLive];
+    for (uint32_t i = thread; i < kColorSlots; i += threads) s.color_cursor[i] = 0u;
+    for (uint32_t i = thread; i < s.artic_dofs; i += threads) s.qdot_error[i] = 0.0f;
+    if (thread > kControlLive && thread < kControlWords) s.control[thread] = 0u;
+    ForEachLivePosition(live, [](uint32_t) { return true; }, [&](uint32_t position) {
+        const LaneOwners owners =
+            LiveRowOwners(urows, live_order[position], points, body_inv_mass, s, lane);
+        if (lane == 0u) {
+            s.pos_color[position] = owners.packed ? kColorPending : kColorChain;
+            s.pos_tent[position] = kOwnerEmpty;
+        }
+    });
+    grid.sync();
+
+    const auto tentative = [&](uint32_t position) { return s.pos_tent[position] != kOwnerEmpty; };
+    uint32_t round = 0u;
+    for (uint32_t epoch = 0u; epoch < kColorEpochs; ++epoch) {
+        bool pending = true;
+        for (uint32_t step = 0u; pending && step < kColorRounds; ++step, ++round) {
+            uint32_t* const pending_flag = s.control + kControlPending + round % 3u;
+            if (thread == 0u) s.control[kControlPending + (round + 1u) % 3u] = 0u;
+            bool overflow = false;
+            ForEachLivePosition(live,
+                [&](uint32_t position) { return s.pos_color[position] == kColorPending; },
+                [&](uint32_t position) {
+                    const uint32_t slot = live_order[position];
+                    const LaneOwners owners =
+                        LiveRowOwners(urows, slot, points, body_inv_mass, s, lane);
+                    uint32_t taken[kColorWords] = {};
+                    VisitLaneOwners(owners, [&](uint32_t owner) {
+                        #pragma unroll
+                        for (uint32_t w = 0u; w < kColorWords; ++w)
+                            taken[w] |= s.used[size_t{owner} * kColorWords + w];
+                    });
+                    #pragma unroll
+                    for (uint32_t w = 0u; w < kColorWords; ++w)
+                        taken[w] = __reduce_or_sync(0xffffffffu, taken[w]);
+                    const uint32_t color = FirstFreeColor(
+                        taken, MixSlot(slot ^ (round * 0x9e3779b9u)) % kColorPalette);
+                    if (color == kColorPalette) {
+                        overflow = true;
+                        if (lane == 0u) s.pos_color[position] = kColorOverflow;
+                        return;
+                    }
+                    const uint32_t bit = 1u << (color % 32u);
+                    VisitLaneOwners(owners, [&](uint32_t owner) {
+                        const size_t at = size_t{owner} * kColorWords + color / 32u;
+                        if (atomicOr(s.tent + at, bit) & bit) atomicOr(s.dup + at, bit);
+                    });
+                    if (lane == 0u) s.pos_tent[position] = color;
+                });
+            if (__syncthreads_or(overflow) && threadIdx.x == 0u)
+                atomicOr(s.control + kControlOverflow + epoch % 2u, 1u);
+            grid.sync();
+
+            ForEachLivePosition(live, tentative, [&](uint32_t position) {
+                const uint32_t slot = live_order[position];
+                const LaneOwners owners = LiveRowOwners(urows, slot, points, body_inv_mass, s, lane);
+                const uint32_t color = s.pos_tent[position];
+                const uint32_t priority = MixSlot(slot);
+                VisitLaneOwners(owners, [&](uint32_t owner) {
+                    if (s.dup[size_t{owner} * kColorWords + color / 32u] & (1u << (color % 32u)))
+                        atomicMax(s.claim + owner, priority);
+                });
+            });
+            grid.sync();
+
+            bool left = false;
+            ForEachLivePosition(live, tentative, [&](uint32_t position) {
+                const uint32_t slot = live_order[position];
+                const LaneOwners owners = LiveRowOwners(urows, slot, points, body_inv_mass, s, lane);
+                const uint32_t color = s.pos_tent[position];
+                const uint32_t priority = MixSlot(slot);
+                const uint32_t bit = 1u << (color % 32u);
+                bool keep = true;
+                VisitLaneOwners(owners, [&](uint32_t owner) {
+                    if ((s.dup[size_t{owner} * kColorWords + color / 32u] & bit) &&
+                        s.claim[owner] != priority)
+                        keep = false;
+                });
+                if (__all_sync(0xffffffffu, keep)) {
+                    VisitLaneOwners(owners, [&](uint32_t owner) {
+                        atomicOr(s.used + size_t{owner} * kColorWords + color / 32u, bit);
+                    });
+                    if (lane == 0u) s.pos_color[position] = epoch * kColorPalette + color;
+                } else {
+                    left = true;
+                }
+            });
+            if (__syncthreads_or(left) && threadIdx.x == 0u) atomicOr(pending_flag, 1u);
+            grid.sync();
+
+            // Every picked word held only this round's picks, so clearing whole words is exact.
+            ForEachLivePosition(live, tentative, [&](uint32_t position) {
+                const LaneOwners owners =
+                    LiveRowOwners(urows, live_order[position], points, body_inv_mass, s, lane);
+                const uint32_t color = s.pos_tent[position];
+                VisitLaneOwners(owners, [&](uint32_t owner) {
+                    const size_t at = size_t{owner} * kColorWords + color / 32u;
+                    s.tent[at] = 0u;
+                    s.dup[at] = 0u;
+                    s.claim[owner] = 0u;
+                });
+                __syncwarp();
+                if (lane == 0u) s.pos_tent[position] = kOwnerEmpty;
+            });
+            grid.sync();
+            pending = LoadControl(pending_flag) != 0u;
+        }
+        const bool overflow = LoadControl(s.control + kControlOverflow + epoch % 2u) != 0u;
+        const bool last = !overflow || pending || epoch + 1u == kColorEpochs;
+        ForEachLivePosition(live,
+            [&](uint32_t position) { return s.pos_color[position] / kColorPalette == epoch; },
+            [&](uint32_t position) {
+                const LaneOwners owners =
+                    LiveRowOwners(urows, live_order[position], points, body_inv_mass, s, lane);
+                VisitLaneOwners(owners, [&](uint32_t owner) {
+                    #pragma unroll
+                    for (uint32_t w = 0u; w < kColorWords; ++w)
+                        s.used[size_t{owner} * kColorWords + w] = 0u;
+                });
+            });
+        for (uint32_t position = thread; position < live; position += threads) {
+            const uint32_t color = s.pos_color[position];
+            if (color == kColorPending || color == kColorOverflow)
+                s.pos_color[position] = last ? kColorChain : kColorPending;
+        }
+        if (thread == 0u) s.control[kControlOverflow + (epoch + 1u) % 2u] = 0u;
+        grid.sync();
+        if (last) break;
+    }
+
+    // Each block counts a contiguous chunk, so chain rows keep their live order.
+    const uint32_t chunk = (live + gridDim.x - 1u) / gridDim.x;
+    const uint32_t begin = static_cast<uint32_t>(
+        min(uint64_t{live}, uint64_t{blockIdx.x} * chunk));
+    const uint32_t end = min(live, begin + chunk);
+    for (uint32_t c = threadIdx.x; c < kColorSlots; c += blockDim.x) histogram[c] = 0u;
+    if (threadIdx.x == 0u) block_chain = 0u;
+    __syncthreads();
+    uint32_t chained = 0u;
+    for (uint32_t position = begin + threadIdx.x; position < end; position += blockDim.x) {
+        const uint32_t color = s.pos_color[position];
+        if (color < kColorSlots) atomicAdd(histogram + color, 1u);
+        else ++chained;
+    }
+    chained = __reduce_add_sync(0xffffffffu, chained);
+    if (lane == 0u && chained != 0u) atomicAdd(&block_chain, chained);
+    __syncthreads();
+    for (uint32_t c = threadIdx.x; c < kColorSlots; c += blockDim.x)
+        if (histogram[c] != 0u) atomicAdd(s.color_cursor + c, histogram[c]);
+    if (threadIdx.x == 0u) s.block_count[blockIdx.x] = block_chain;
+    grid.sync();
+
+    if (blockIdx.x == 0u) {
+        constexpr uint32_t per_thread = kColorSlots / kColorBlockSize;
+        uint32_t counts[per_thread];
+        uint32_t rows = 0u;
+        uint32_t filled = 0u;
+        #pragma unroll
+        for (uint32_t j = 0u; j < per_thread; ++j) {
+            counts[j] = s.color_cursor[threadIdx.x * per_thread + j];
+            rows += counts[j];
+            filled += counts[j] != 0u ? 1u : 0u;
+        }
+        uint32_t row_start = 0u, color_index = 0u, total_rows = 0u, total_colors = 0u;
+        BlockScanT(scan_temp).ExclusiveSum(rows, row_start, total_rows);
+        __syncthreads();
+        BlockScanT(scan_temp).ExclusiveSum(filled, color_index, total_colors);
+        #pragma unroll
+        for (uint32_t j = 0u; j < per_thread; ++j) {
+            if (counts[j] == 0u) continue;
+            s.color_start[color_index++] = row_start;
+            s.color_cursor[threadIdx.x * per_thread + j] = row_start;
+            row_start += counts[j];
+        }
+        if (threadIdx.x == 0u) {
+            s.color_start[total_colors] = total_rows;
+            s.control[kControlColors] = total_colors;
+        }
+        __syncthreads();
+    }
+    uint32_t earlier = 0u;
+    for (uint32_t b = threadIdx.x; b < blockIdx.x; b += blockDim.x) earlier += s.block_count[b];
+    uint32_t ignored = 0u, chain_base = 0u;
+    BlockScanT(scan_temp).ExclusiveSum(earlier, ignored, chain_base);
+    __syncthreads();
+    for (uint32_t tile = begin; tile < end; tile += blockDim.x) {
+        const uint32_t position = tile + threadIdx.x;
+        const uint32_t flag = position < end && s.pos_color[position] == kColorChain ? 1u : 0u;
+        uint32_t offset = 0u, tile_total = 0u;
+        BlockScanT(scan_temp).ExclusiveSum(flag, offset, tile_total);
+        if (position < end) s.chain_excl[position] = chain_base + offset;
+        if (flag != 0u) s.chain_rows[chain_base + offset] = live_order[position];
+        chain_base += tile_total;
+        __syncthreads();
+    }
+    if (blockIdx.x == gridDim.x - 1u && threadIdx.x == 0u) s.chain_excl[live] = chain_base;
+    grid.sync();
+
+    for (uint32_t position = thread; position < live; position += threads) {
+        const uint32_t color = s.pos_color[position];
+        if (color < kColorSlots)
+            s.color_rows[atomicAdd(s.color_cursor + color, 1u)] = live_order[position];
+    }
+    const uint32_t island_count = *island_count_dev;
+    for (uint32_t i = thread; i < island_count; i += threads) {
+        const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[i];
+        if (!(rec.flags & kIslandWarpWork) || rec.seg_cnt == 0u || !activity.Active(rec)) continue;
+        const uint32_t live_off = rec.seg_off == 0u ? 0u : live_scan[rec.seg_off - 1u];
+        const uint32_t live_end = live_scan[rec.seg_off + rec.seg_cnt - 1u];
+        if (s.chain_excl[live_end] != s.chain_excl[live_off])
+            s.chain_islands[atomicAdd(s.control + kControlChainIslands, 1u)] = i;
+    }
+}
+
+struct ColoredSolveArgs {
+    const NkRow* urows = nullptr;
+    float* lambda = nullptr;
+    const float* chain_jacobian = nullptr;
+    const float* row_minv_jt = nullptr;
+    const float* chain_jacobian_b = nullptr;
+    const float* row_minv_jt_b = nullptr;
+    const float* row_meff = nullptr;
+    const float* row_damping = nullptr;
+    float* qdot_flat = nullptr;
+    Spatial6* link_velocity = nullptr;
+    float* qdot = nullptr;
+    math::Vec3* body_linear = nullptr;
+    math::Vec3* body_angular = nullptr;
+    const float* body_inv_mass = nullptr;
+    const math::SymmetricMat3* body_inv_inertia = nullptr;
+    PointMassView points;
+    const uint32_t* islands = nullptr;
+    const uint32_t* live_scan = nullptr;
+    const uint32_t* live_order = nullptr;
+    const uint32_t* island_root_sorted = nullptr;
+    const uint32_t* cc_root = nullptr;
+    const uint32_t* cc_artic_first = nullptr;
+    const uint32_t* dof_to_link = nullptr;
+    const uint32_t* dof_to_component = nullptr;
+    float* row_penetration = nullptr;
+    float* row_pseudo_lambda = nullptr;
+    float* qdot_pseudo = nullptr;
+    Spatial6* link_velocity_pseudo = nullptr;
+    float* qdot_pseudo_flat = nullptr;
+    math::Vec3* body_pseudo_linear = nullptr;
+    math::Vec3* body_pseudo_angular = nullptr;
+    math::Vec3* particle_pseudo = nullptr;
+    math::Vec3* grid_pseudo = nullptr;
+    VelocityErrorView error;
+    uint32_t rows_per_env = 0u;
+    uint32_t artics_per_env = 0u;
+    uint32_t articulation_count = 0u;
+    uint32_t dof_stride = 0u;
+    uint32_t base_link_count = 0u;
+    uint32_t vel_iters = 0u;
+    uint32_t pos_iters = 0u;
+    float pos_beta = 0.0f;
+    float pos_slop = 0.0f;
+    float dt = 0.0f;
+    float vel_tolerance = 0.0f;
+    float baumgarte_max_velocity = 0.0f;
+    bool apply_cached = false;
+};
+
+enum class ChainSweep : uint32_t { WarmStart, Velocity, Position };
+
+// Each color sweeps across the grid behind one barrier. Chain rows then run per island in live
+// order on one block, with the island's articulation tiles staged in shared memory.
+__global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(ColoredSolveArgs a,
+                                                                          ColorScratch s) {
+    const auto grid = cooperative_groups::this_grid();
+    extern __shared__ __align__(16) unsigned char colored_shared[];
+    __shared__ __align__(16) unsigned char row_storage[3u * (kColorBlockSize / 32u) * sizeof(NkRow)];
+    __shared__ uint32_t batch_needed, row_changed, row_significant, friction_active;
+    __shared__ float contact_side_velocity[6], contact_delta[3];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t warp = lane >> 5u;
+    const uint32_t wlane = lane & 31u;
+    const uint32_t nwarps = blockDim.x >> 5u;
+    const uint32_t dofs = a.dof_stride;
+    const uint32_t k_tiles = a.artics_per_env == 0u ? 1u : a.artics_per_env;
+    const uint32_t tile_floats = k_tiles * dofs;
+    float* const tile_sh = reinterpret_cast<float*>(colored_shared);
+    float* const tile_error_sh = tile_sh + tile_floats;
+    float* const staged_j = tile_error_sh + tile_floats;
+    const size_t staged_size = size_t{3u} * nwarps * dofs;
+    float* const staged_tangent_response = staged_j + 4u * staged_size;
+    NkRow* const staged_rows = reinterpret_cast<NkRow*>(row_storage);
+    // A color fills one warp of every block before a second warp of any block.
+    const uint32_t color_warp = warp * gridDim.x + blockIdx.x;
+    const uint32_t color_warps = gridDim.x * nwarps;
+    const uint32_t colors = s.control[kControlColors];
+    const uint32_t chain_islands = s.control[kControlChainIslands];
+    const uint32_t live = s.control[kControlLive];
+    const bool pos_pass = a.pos_iters > 0u && a.row_penetration != nullptr;
+    const PointMassView pseudo_points = a.points.Pseudo(a.particle_pseudo, a.grid_pseudo);
+    VelocityErrorView chain_error = a.error;
+    chain_error.qdot = tile_error_sh;
+    bool changed = false;
+
+    auto color_sweep = [&](bool stage, auto&& solve_row) {
+        NkRow* const staged = staged_rows + 3u * warp;
+        for (uint32_t color = 0u; color < colors; ++color) {
+            const uint32_t end = s.color_start[color + 1u];
+            for (uint32_t i = s.color_start[color] + color_warp; i < end; i += color_warps) {
+                const uint32_t slot = s.color_rows[i];
+                if (stage) StageRowWarp(a.urows, slot, staged, wlane);
+                solve_row(slot, slot / a.rows_per_env, staged);
+            }
+            grid.sync();
+        }
+    };
+
+    auto chain_velocity = [&](uint32_t first, uint32_t last, uint32_t env_row_base,
+                              uint32_t env_artic_base) {
+        for (uint32_t base = first; base < last; base += nwarps) {
+            const uint32_t batch_count = min(nwarps, last - base);
+            if (lane == 0u) batch_needed = 0u;
+            __syncthreads();
+            if (warp < batch_count) {
+                const uint32_t slot = s.chain_rows[base + warp];
+                StageRowWarp(a.urows, slot, staged_rows + 3u * warp, wlane);
+                const bool tangent =
+                    (staged_rows[3u * warp].flags & nk::nk_row_flags::kBlockTangent) != 0u;
+                const bool needed = !tangent && RowNeedsVelocitySolveWarp(a.urows, slot,
+                    env_row_base, env_artic_base, a.lambda, a.row_meff, a.row_damping,
+                    a.chain_jacobian, a.chain_jacobian_b, tile_sh, a.body_linear,
+                    a.body_angular, a.points, dofs, a.dt, wlane, staged_rows + 3u * warp);
+                if (needed && wlane == 0u) atomicOr(&batch_needed, 1u);
+            }
+            __syncthreads();
+            // A batch is skipped only if every row leaves its input unchanged.
+            if (batch_needed == 0u) {
+                __syncthreads();
+                continue;
+            }
+            if (warp < batch_count) {
+                const uint32_t slot = s.chain_rows[base + warp];
+                const NkRow& normal = staged_rows[3u * warp];
+                if (wlane == 0u && (normal.flags & nk::nk_row_flags::kBlockNormal))
+                    staged_tangent_response[warp] = constraint::CoulombTangentSpectralResponse(
+                        normal.contact_response, normal.mu, normal.friction_secondary);
+                const uint32_t axes = (normal.flags & nk::nk_row_flags::kBlockNormal)
+                    ? 3u : ((normal.flags & nk::nk_row_flags::kBlockTangent) ? 0u : 1u);
+                for (uint32_t axis = 0u; axis < axes; ++axis) {
+                    const uint32_t at = slot + axis * normal.group_normal_count;
+                    if (axis != 0u) {
+                        uint32_t word;
+                        memcpy(&word, reinterpret_cast<const unsigned char*>(a.urows + at) +
+                                      wlane * sizeof(word), sizeof(word));
+                        memcpy(reinterpret_cast<unsigned char*>(staged_rows + 3u * warp + axis) +
+                                   wlane * sizeof(word), &word, sizeof(word));
+                    }
+                    for (uint32_t k = wlane; k < dofs; k += warpSize) {
+                        const size_t destination = size_t{3u * warp + axis} * dofs + k;
+                        const size_t source = size_t{at} * dofs + k;
+                        if (normal.a.kind == kNkSideArtic) {
+                            staged_j[destination] = a.chain_jacobian[source];
+                            staged_j[staged_size + destination] = a.row_minv_jt[source];
+                        }
+                        if (normal.b.kind == kNkSideArtic) {
+                            staged_j[2u * staged_size + destination] = a.chain_jacobian_b[source];
+                            staged_j[3u * staged_size + destination] = a.row_minv_jt_b[source];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            for (uint32_t idx = 0u; idx < batch_count; ++idx) {
+                const uint32_t gslot = s.chain_rows[base + idx];
+                const NkRow* prepared = staged_rows + 3u * idx;
+                if (prepared[0].flags & nk::nk_row_flags::kBlockTangent) {
+                    continue;
+                } else if (prepared[0].flags & nk::nk_row_flags::kBlockNormal) {
+                    SolvePreparedContactBlock(gslot, env_artic_base, 3u * idx, warp, wlane,
+                        prepared, a.lambda, a.row_damping, staged_j, staged_j + staged_size,
+                        staged_j + 2u * staged_size, staged_j + 3u * staged_size, tile_sh,
+                        a.body_linear, a.body_angular, a.body_inv_mass, a.body_inv_inertia,
+                        a.points, dofs, a.dt, staged_tangent_response[idx], a.vel_tolerance,
+                        chain_error, contact_side_velocity, contact_delta, &friction_active,
+                        &row_changed, &row_significant);
+                } else {
+                    if (lane == 0u) row_significant = 0u;
+                    __syncthreads();
+                    if (warp == 0u) {
+                        const bool significant = SolveUnionRowWarp(
+                            gslot - env_row_base, gslot, env_row_base, env_artic_base, 3u * idx,
+                            wlane, nullptr, nullptr, nullptr, nullptr, a.lambda, a.row_meff,
+                            a.row_damping, staged_j, staged_j + staged_size,
+                            staged_j + 2u * staged_size, staged_j + 3u * staged_size, tile_sh,
+                            a.urows, a.body_linear, a.body_angular, a.body_inv_mass,
+                            a.body_inv_inertia, a.points, dofs, a.dt, false, chain_error,
+                            prepared, a.vel_tolerance);
+                        if (wlane == 0u) row_significant = significant ? 1u : 0u;
+                    }
+                }
+                __syncthreads();
+                if (lane == 0u && row_significant != 0u) changed = true;
+                __syncthreads();
+            }
+        }
+    };
+
+    auto chain_position = [&](uint32_t first, uint32_t last, uint32_t env_row_base,
+                              uint32_t env_artic_base) {
+        for (uint32_t base = first; base < last; base += nwarps) {
+            const uint32_t batch_count = min(nwarps, last - base);
+            // An unchanged batch cannot alter a later row's input during its ordered sweep.
+            if (lane == 0u) batch_needed = 0u;
+            __syncthreads();
+            if (warp < batch_count) {
+                const uint32_t gslot = s.chain_rows[base + warp];
+                const bool needed = SolvePositionRowWarp<false>(gslot, env_row_base,
+                    env_artic_base, gslot, wlane, a.row_meff, a.row_penetration,
+                    a.row_pseudo_lambda, a.chain_jacobian, a.row_minv_jt, a.chain_jacobian_b,
+                    a.row_minv_jt_b, tile_sh, a.urows, a.body_pseudo_linear,
+                    a.body_pseudo_angular, a.body_inv_mass, a.body_inv_inertia, pseudo_points,
+                    dofs, a.pos_beta, a.pos_slop, a.dt, a.baumgarte_max_velocity);
+                if (needed && wlane == 0u) atomicOr(&batch_needed, 1u);
+            }
+            __syncthreads();
+            if (batch_needed == 0u) {
+                __syncthreads();
+                continue;
+            }
+            for (uint32_t idx = warp == 0u ? 0u : batch_count; idx < batch_count; ++idx) {
+                const uint32_t gslot = s.chain_rows[base + idx];
+                SolvePositionRowWarp(gslot, env_row_base, env_artic_base, gslot, wlane,
+                    a.row_meff, a.row_penetration, a.row_pseudo_lambda, a.chain_jacobian,
+                    a.row_minv_jt, a.chain_jacobian_b, a.row_minv_jt_b, tile_sh, a.urows,
+                    a.body_pseudo_linear, a.body_pseudo_angular, a.body_inv_mass,
+                    a.body_inv_inertia, pseudo_points, dofs, a.pos_beta, a.pos_slop, a.dt,
+                    a.baumgarte_max_velocity);
+                __syncwarp();
+            }
+            __syncthreads();
+        }
+    };
+
+    // An island stages every articulation tile of its environment and writes back its own.
+    auto chain_sweep = [&](ChainSweep sweep) {
+        float* const velocity = sweep == ChainSweep::Position ? a.qdot_pseudo_flat : a.qdot_flat;
+        const bool compensated = sweep != ChainSweep::Position;
+        const bool tiles = velocity != nullptr && dofs > 0u && a.cc_artic_first != nullptr;
+        for (uint32_t k = blockIdx.x; k < chain_islands; k += gridDim.x) {
+            const IslandRecord rec =
+                reinterpret_cast<const IslandRecord*>(a.islands)[s.chain_islands[k]];
+            const uint32_t root = a.island_root_sorted[rec.seg_off];
+            const uint32_t env_row_base = rec.env * a.rows_per_env;
+            const uint32_t env_artic_base = rec.env * k_tiles;
+            const uint32_t live_off = rec.seg_off == 0u ? 0u : a.live_scan[rec.seg_off - 1u];
+            const uint32_t first = s.chain_excl[live_off];
+            const uint32_t last = s.chain_excl[a.live_scan[rec.seg_off + rec.seg_cnt - 1u]];
+            float* const env_velocity = tiles ? velocity + size_t{env_artic_base} * dofs : nullptr;
+            float* const env_error = s.qdot_error + size_t{env_artic_base} * dofs;
+            for (uint32_t i = lane; tiles && i < tile_floats; i += blockDim.x) {
+                tile_sh[i] = env_velocity[i];
+                if (compensated) tile_error_sh[i] = env_error[i];
+            }
+            __syncthreads();
+            if (sweep == ChainSweep::WarmStart) {
+                for (uint32_t i = warp == 0u ? first : last; i < last; ++i) {
+                    const uint32_t slot = s.chain_rows[i];
+                    SolveUnionRowWarp(slot - env_row_base, slot, env_row_base, env_artic_base,
+                        slot, wlane, nullptr, nullptr, nullptr, nullptr, a.lambda, a.row_meff,
+                        a.row_damping, a.chain_jacobian, a.row_minv_jt, a.chain_jacobian_b,
+                        a.row_minv_jt_b, tile_sh, a.urows, a.body_linear, a.body_angular,
+                        a.body_inv_mass, a.body_inv_inertia, a.points, dofs, a.dt, true,
+                        chain_error);
+                    __syncwarp();
+                }
+            } else if (sweep == ChainSweep::Velocity) {
+                chain_velocity(first, last, env_row_base, env_artic_base);
+            } else {
+                chain_position(first, last, env_row_base, env_artic_base);
+            }
+            __syncthreads();
+            for (uint32_t i = lane; tiles && i < tile_floats; i += blockDim.x) {
+                const uint32_t claim = a.cc_artic_first[env_artic_base + i / dofs];
+                if (claim == ~0u || a.cc_root[claim] != root) continue;
+                env_velocity[i] = tile_sh[i];
+                if (compensated) env_error[i] = tile_error_sh[i];
+            }
+            __syncthreads();
+        }
+    };
+
+    if (a.apply_cached) {
+        color_sweep(false, [&](uint32_t slot, uint32_t env, NkRow*) {
+            SolveUnionRowWarp(slot - env * a.rows_per_env, slot, env * a.rows_per_env,
+                env * k_tiles, slot, wlane, nullptr, nullptr, nullptr, nullptr, a.lambda,
+                a.row_meff, a.row_damping, a.chain_jacobian, a.row_minv_jt, a.chain_jacobian_b,
+                a.row_minv_jt_b, nullptr, a.urows, a.body_linear, a.body_angular,
+                a.body_inv_mass, a.body_inv_inertia, a.points, dofs, a.dt, true, a.error);
+        });
+        chain_sweep(ChainSweep::WarmStart);
+        grid.sync();
+    }
+    for (uint32_t it = 0u; it < a.vel_iters; ++it) {
+        if (blockIdx.x == 0u && threadIdx.x == 0u)
+            s.control[kControlChanged + (it + 1u) % 3u] = 0u;
+        changed = false;
+        color_sweep(true, [&](uint32_t slot, uint32_t env, NkRow* staged) {
+            const uint32_t env_row_base = env * a.rows_per_env;
+            bool significant = false;
+            if (staged[0].flags & nk::nk_row_flags::kBlockNormal) {
+                significant = SolvePreparedContactBlockWarp(slot, env * k_tiles, wlane, a.urows,
+                    staged, a.lambda, a.row_damping, a.chain_jacobian, a.row_minv_jt,
+                    a.chain_jacobian_b, a.row_minv_jt_b, nullptr, a.body_linear, a.body_angular,
+                    a.body_inv_mass, a.body_inv_inertia, a.points, dofs, a.dt, a.vel_tolerance,
+                    a.error);
+            } else {
+                significant = SolveUnionRowWarp(slot - env_row_base, slot, env_row_base,
+                    env * k_tiles, slot, wlane, nullptr, nullptr, nullptr, nullptr, a.lambda,
+                    a.row_meff, a.row_damping, a.chain_jacobian, a.row_minv_jt,
+                    a.chain_jacobian_b, a.row_minv_jt_b, nullptr, a.urows, a.body_linear,
+                    a.body_angular, a.body_inv_mass, a.body_inv_inertia, a.points, dofs, a.dt,
+                    false, a.error, staged, a.vel_tolerance);
+            }
+            changed |= significant;
+        });
+        chain_sweep(ChainSweep::Velocity);
+        uint32_t* const flag = s.control + kControlChanged + it % 3u;
+        if (__syncthreads_or(changed) && threadIdx.x == 0u) atomicOr(flag, 1u);
+        grid.sync();
+        if (LoadControl(flag) == 0u) break;
+    }
+
+    // Penetration drives a fresh pseudo-velocity field over the same colors and chains.
+    if (pos_pass) {
+        for (uint32_t position = color_warp; position < live; position += color_warps) {
+            const uint32_t slot = a.live_order[position];
+            const uint32_t env = slot / a.rows_per_env;
+            const float* qdot = a.qdot_flat != nullptr
+                ? a.qdot_flat + size_t{env * k_tiles} * dofs : nullptr;
+            UpdateSpeculativePenetration<true>(slot, env * a.rows_per_env, env * k_tiles,
+                a.row_penetration, a.urows, a.chain_jacobian, a.chain_jacobian_b, qdot,
+                a.body_linear, a.body_angular, a.points, dofs, a.dt, wlane);
+        }
+        grid.sync();
+        for (uint32_t it = 0u; it < a.pos_iters; ++it) {
+            color_sweep(true, [&](uint32_t slot, uint32_t env, const NkRow* staged) {
+                SolvePositionRowWarp(slot, env * a.rows_per_env, env * k_tiles, slot, wlane,
+                    a.row_meff, a.row_penetration, a.row_pseudo_lambda, a.chain_jacobian,
+                    a.row_minv_jt, a.chain_jacobian_b, a.row_minv_jt_b, nullptr, a.urows,
+                    a.body_pseudo_linear, a.body_pseudo_angular, a.body_inv_mass,
+                    a.body_inv_inertia, pseudo_points, dofs, a.pos_beta, a.pos_slop, a.dt,
+                    a.baumgarte_max_velocity, staged);
+            });
+            chain_sweep(ChainSweep::Position);
+            grid.sync();
+        }
+    }
+
+    // Every articulation tile scatters through the cooked DOF maps, solved or not.
+    if (dofs == 0u || a.articulation_count == 0u || a.dof_to_link == nullptr ||
+        a.dof_to_component == nullptr || a.qdot_flat == nullptr) return;
+    const uint32_t links_per_dog = a.base_link_count / k_tiles;
+    const uint32_t total = a.articulation_count * dofs;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += gridDim.x * blockDim.x) {
+        const uint32_t tile = t / dofs;
+        const uint32_t k = t - tile * dofs;
+        const uint32_t env = tile / k_tiles;
+        uint32_t comp;
+        size_t gl;
+        ArticDofTarget(env, tile - env * k_tiles, k, dofs, links_per_dog, a.base_link_count,
+                       a.dof_to_link, a.dof_to_component, comp, gl);
+        const float v = a.qdot_flat[t];
+        if (comp != ~0u) a.link_velocity[gl].v[comp] = v;
+        else a.qdot[gl] = v;
+        if (!pos_pass || a.qdot_pseudo_flat == nullptr) continue;
+        const float vp = a.qdot_pseudo_flat[t];
+        if (comp != ~0u) a.link_velocity_pseudo[gl].v[comp] = vp;
+        else a.qdot_pseudo[gl] = vp;
+    }
+}
+
+Status SolveColoredIslands(const ModelView& model, const DataView& data,
+                           const SolveRowsBlockIslandParams& p, IslandActivityView activity,
+                           const ColorScratch& scratch, const uint32_t* live_scan,
+                           const uint32_t* live_order, VelocityErrorView error,
+                           uint32_t artics_per_env, bool pos_pass, cudaStream_t stream) {
+    const auto cooperative = RequireCooperativeLaunch();
+    if (cooperative == cudaErrorNotSupported) return Status::Unsupported;
+    if (cooperative != cudaSuccess) return Status::Failed;
+    if (live_scan == nullptr || live_order == nullptr || p.rows_per_env == 0u)
+        return Status::InvalidArgument;
+    const uint64_t owners = uint64_t{p.total_body_count} + p.total_particle_count +
+                            p.total_grid_count + uint64_t{p.rows_per_env} * p.env_count;
+    if (owners >= kOwnerEmpty) return Status::InvalidArgument;
+    int device = 0;
+    int sm_count = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        return Status::Failed;
+    const uint32_t grid_bound = static_cast<uint32_t>(std::min<uint64_t>(
+        kColorGridLimit, uint64_t{static_cast<uint32_t>(sm_count)} * kColorBlocksPerSm));
+    const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;
+    constexpr uint32_t warps = kColorBlockSize / 32u;
+    const size_t solve_shared = sizeof(float) *
+        (2u * size_t{k_tiles} * p.max_dof + 4u * 3u * size_t{warps} * p.max_dof + warps);
+    uint32_t color_blocks = 0u;
+    uint32_t solve_blocks = 0u;
+    if (ResidentGridSize(ColorLiveRowsKernel, kColorBlockSize, 0u, grid_bound,
+                         &color_blocks) != cudaSuccess ||
+        ResidentGridSize(SolveColoredRowsKernel, kColorBlockSize, solve_shared, grid_bound,
+                         &solve_blocks) != cudaSuccess)
+        return Status::Failed;
+    const PointMassView points{data.particle_inv_mass, data.particle_vel, data.grid_inv_mass,
+                               data.grid_velocity, data.point_endpoint_ranges,
+                               data.point_endpoint_terms};
+    const auto* urows = reinterpret_cast<const NkRow*>(data.urows);
+    if (LaunchCooperativeCuda(ColorLiveRowsKernel, dim3(color_blocks), dim3(kColorBlockSize), 0u,
+            stream, urows, points, static_cast<const float*>(data.body_inv_mass),
+            static_cast<const uint32_t*>(data.island_quads),
+            static_cast<const uint32_t*>(data.island_count), activity, live_scan, live_order,
+            scratch) != cudaSuccess)
+        return Status::Failed;
+    ColoredSolveArgs args;
+    args.urows = urows;
+    args.lambda = data.lambda;
+    args.chain_jacobian = static_cast<const float*>(data.chain_jacobian);
+    args.row_minv_jt = static_cast<const float*>(data.row_minv_jt);
+    args.chain_jacobian_b = static_cast<const float*>(data.chain_jacobian_b);
+    args.row_minv_jt_b = static_cast<const float*>(data.row_minv_jt_b);
+    args.row_meff = static_cast<const float*>(data.row_meff);
+    args.row_damping = static_cast<const float*>(data.row_damping);
+    args.qdot_flat = data.qdot_flat;
+    args.link_velocity = reinterpret_cast<Spatial6*>(data.link_velocity);
+    args.qdot = data.qdot;
+    args.body_linear = data.body_linear_velocity;
+    args.body_angular = data.body_angular_velocity;
+    args.body_inv_mass = static_cast<const float*>(data.body_inv_mass);
+    args.body_inv_inertia = static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia);
+    args.points = points;
+    args.islands = data.island_quads;
+    args.live_scan = live_scan;
+    args.live_order = live_order;
+    args.island_root_sorted = data.island_root_sorted;
+    args.cc_root = data.cc_root;
+    args.cc_artic_first = p.articulation_count > 0u ? data.cc_artic_first : nullptr;
+    args.dof_to_link = static_cast<const uint32_t*>(model.dof_to_link);
+    args.dof_to_component = static_cast<const uint32_t*>(model.dof_to_component);
+    if (pos_pass) {
+        args.row_penetration = data.row_penetration;
+        args.row_pseudo_lambda = static_cast<float*>(data.row_pseudo_lambda);
+        args.qdot_pseudo = static_cast<float*>(data.qdot_pseudo);
+        args.link_velocity_pseudo = reinterpret_cast<Spatial6*>(data.link_velocity_pseudo);
+        args.qdot_pseudo_flat = static_cast<float*>(data.qdot_pseudo_flat);
+        args.body_pseudo_linear = data.body_pseudo_linear_velocity;
+        args.body_pseudo_angular = data.body_pseudo_angular_velocity;
+        args.particle_pseudo = data.particle_pseudo_vel;
+        args.grid_pseudo = data.grid_pseudo_vel;
+    }
+    args.error = error;
+    args.rows_per_env = p.rows_per_env;
+    args.artics_per_env = artics_per_env;
+    args.articulation_count = p.articulation_count;
+    args.dof_stride = p.max_dof;
+    args.base_link_count = p.base_link_count;
+    args.vel_iters = static_cast<uint32_t>(p.vel_iters);
+    args.pos_iters = pos_pass ? static_cast<uint32_t>(p.pos_iters) : 0u;
+    args.pos_beta = p.pos_beta;
+    args.pos_slop = p.pos_slop;
+    args.dt = p.dt;
+    args.vel_tolerance = p.vel_tolerance;
+    args.baumgarte_max_velocity = p.baumgarte_max_velocity;
+    args.apply_cached = p.continue_impulses == 0u;
+    if (LaunchCooperativeCuda(SolveColoredRowsKernel, dim3(solve_blocks), dim3(kColorBlockSize),
+            solve_shared, stream, args, scratch) != cudaSuccess)
+        return Status::Failed;
+    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 // Island rows outside the position sweeps advance their speculative depth after the solve.
@@ -2504,34 +2928,6 @@ __global__ void UpdateIdlePenetrationKernel(
                 env_artic_base, row_penetration, urows, chain_jacobian, chain_jacobian_b, qdot,
                 body_lin_vel, body_ang_vel, point_masses, dof_stride, dt, lane);
         }
-    }
-}
-
-// Flush qdot_flat -> link_velocity for an articulation no active row claimed
-// (cc_artic_first==sentinel): the static all-tiles scatter did this every step.
-__global__ void FlushOrphanArticKernel(
-    const uint32_t* __restrict__ cc_artic_first, uint32_t artic_count,
-    uint32_t artics_per_env, uint32_t dof_stride, uint32_t base_link_count,
-    const float* __restrict__ qdot_flat, Spatial6* __restrict__ link_velocity,
-    float* __restrict__ qdot, const uint32_t* __restrict__ dof_to_link,
-    const uint32_t* __restrict__ dof_to_component) {
-    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= artic_count * dof_stride) return;
-    const uint32_t ag = t / dof_stride;
-    if (cc_artic_first[ag] != ~0u) return;  // a contact row already solved this tile.
-    const uint32_t k = t - ag * dof_stride;
-    const uint32_t ape = (artics_per_env == 0u) ? 1u : artics_per_env;
-    const uint32_t env = ag / ape;
-    const uint32_t a = ag - env * ape;       // env-local tile (env_artic_base + a == ag).
-    const uint32_t links_per_dog = (ape > 0u) ? (base_link_count / ape) : base_link_count;
-    uint32_t comp; size_t gl;
-    ArticDofTarget(env, a, k, dof_stride, links_per_dog, base_link_count,
-                   dof_to_link, dof_to_component, comp, gl);
-    const float v = qdot_flat[static_cast<size_t>(ag) * dof_stride + k];
-    if (comp != ~0u) {
-        link_velocity[gl].v[comp] = v;
-    } else {
-        qdot[gl] = v;
     }
 }
 
@@ -2668,32 +3064,19 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         const uint32_t qdot_floats = static_cast<uint32_t>(qdot_count);
         // Split-impulse position pass runs ONLY on the PairDriven path (pos_iters>0).
         const bool pos_pass = (p->pos_iters > 0u) && with_b_arm;
-        // Shared storage includes velocity tiles and the schedule's optional row cache.
-        size_t shared_bytes = IslandSharedBytes(p->rows_per_env, p->max_dof,
-                                                qdot_floats, !with_b_arm,
-                                                pos_pass, artics_per_env);
-        uint32_t island_block_size = run_dynamic ? kDynamicIslandBlockSize :
-            (with_b_arm ? kPairDrivenIslandBlockSize : kUnionIslandBlockSize);
-        const auto island_kernel = run_dynamic ? SolveRowsBlockIslandKernel<true, true> :
-            (with_b_arm ? SolveRowsBlockIslandKernel<true, false> : SolveRowsBlockIslandKernel<false, false>);
+        // Static schedules solve each island on one block with its optional row cache.
+        const size_t shared_bytes = IslandSharedBytes(p->rows_per_env, p->max_dof,
+                                                      qdot_floats, !with_b_arm, pos_pass);
+        const uint32_t island_block_size =
+            with_b_arm ? kPairDrivenIslandBlockSize : kUnionIslandBlockSize;
+        const auto island_kernel = with_b_arm ? SolveRowsBlockIslandKernel<true>
+                                              : SolveRowsBlockIslandKernel<false>;
         uint32_t grid_islands = 0u;
-        if (run_dynamic) {
-            for (;;) {
-                shared_bytes = IslandSharedBytes(p->rows_per_env, p->max_dof, qdot_floats,
-                    false, pos_pass, artics_per_env, island_block_size / 32u);
-                const auto status = ResidentGridSize(island_kernel, island_block_size,
-                    shared_bytes, island_bound, &grid_islands);
-                if (status == cudaSuccess) break;
-                if (status != cudaErrorInvalidConfiguration || island_block_size == 32u)
-                    return Status::Failed;
-                island_block_size /= 2u;
-            }
-        } else if (ResidentGridSize(island_kernel, island_block_size, shared_bytes,
-                                    island_bound, &grid_islands) != cudaSuccess) {
+        if (!run_dynamic && ResidentGridSize(island_kernel, island_block_size, shared_bytes,
+                                             island_bound, &grid_islands) != cudaSuccess) {
             return Status::Failed;
         }
-        // Zero every GLOBAL pseudo accumulator (rigid/particle/articulation): the
-        // dynamic schedule rewrites only solved tiles, so a dropped tile reads 0 here.
+        // Zero every global pseudo accumulator: a solve writes only the entries its rows reach.
         if (pos_pass) {
             if (p->total_grid_count > 0u && data.grid_pseudo_vel != nullptr) {
                 const size_t bytes = static_cast<size_t>(p->total_grid_count) * sizeof(math::Vec3);
@@ -2740,26 +3123,20 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 }
             }
         }
-        // Dynamic schedule: the per-step CC pass (island_quads/rows + island_count).
-        // Static schedule: the cook-time arrays (model.island_row_offsets/row_order).
-        const uint32_t* const islands_in = run_dynamic
-            ? data.island_quads : static_cast<const uint32_t*>(model.island_row_offsets);
-        const uint32_t* const row_order_in = run_dynamic
-            ? data.island_rows : static_cast<const uint32_t*>(model.row_order);
-        const uint32_t* const island_count_dev = run_dynamic ? data.island_count : nullptr;
         IslandActivityView activity;
-        // The scratch tail past the per-env batch flags carries the live-row list.
+        // The scratch carries the inclusive live-row scan followed by the compacted live order.
         const uint32_t scratch_rows = p->rows_per_env * p->env_count;
-        uint32_t* const live_scan = run_dynamic && data.pd_solve_scratch != nullptr
-            ? data.pd_solve_scratch + scratch_rows : nullptr;
+        uint32_t* const live_scan = run_dynamic ? data.pd_solve_scratch : nullptr;
         uint32_t* const live_order = live_scan != nullptr ? live_scan + scratch_rows : nullptr;
         if (run_dynamic) {
-            // Island emission releases cc_parent; each solve reuses it for root activity.
+            // Island roots keep their build flags in cc_parent; each solve resets the activity bit.
             const uint32_t total_rows = p->rows_per_env * p->env_count;
             activity = {data.island_root_sorted, data.cc_parent};
-            if (cudaMemsetAsync(activity.needs_solve, 0,
-                                static_cast<size_t>(total_rows) * sizeof(uint32_t),
-                                stream) != cudaSuccess) return Status::Failed;
+            ColorScratch scratch;
+            (void)BindColorScratch(*p, data.solve_color_scratch, &scratch);
+            if (scratch.control == nullptr) return Status::InvalidArgument;
+            LaunchCuda(ClearIslandActivityKernel, dim3((total_rows + 255u) / 256u), dim3(256u), 0u,
+                       stream, activity.needs_solve, total_rows);
             constexpr uint32_t activity_block_size = 128u;
             const uint32_t activity_bound = (total_rows + activity_block_size / 32u - 1u) /
                                             (activity_block_size / 32u);
@@ -2784,21 +3161,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             LaunchCuda(CompactLiveRowsKernel, dim3(1u), dim3(kCompactBlockSize), 0u, stream,
                        data.island_root_sorted, data.island_rows, live_scan, live_order,
-                       total_rows);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-            // Classification needs the island solve's warp count, so it shares its block size.
-            const uint32_t classify_warps = island_block_size / 32u;
-            uint32_t classify_blocks = 0u;
-            if (ResidentGridSize(ClassifyLiveRowsKernel, island_block_size, 0u,
-                    (total_rows + classify_warps - 1u) / classify_warps,
-                    &classify_blocks) != cudaSuccess) return Status::Failed;
-            LaunchCuda(ClassifyLiveRowsKernel, dim3(classify_blocks), dim3(island_block_size), 0u,
-                       stream, reinterpret_cast<const NkRow*>(data.urows),
-                       PointMassView{data.particle_inv_mass, data.particle_vel,
-                                     data.grid_inv_mass, data.grid_velocity,
-                                     data.point_endpoint_ranges, data.point_endpoint_terms},
-                       static_cast<const float*>(data.body_inv_mass), islands_in,
-                       island_count_dev, activity, live_scan, live_order, data.pd_solve_scratch);
+                       total_rows, scratch.control + kControlLive);
             if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             const uint32_t scalar_blocks = max_island_bound < kScalarIslandGridBlocks
                 ? max_island_bound : kScalarIslandGridBlocks;
@@ -2827,53 +3190,56 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 p->pos_beta, p->pos_slop, p->dt,
                 p->baumgarte_max_velocity, p->continue_impulses == 0u, error);
             if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            const Status colored = SolveColoredIslands(model, data, *p, activity, scratch,
+                live_scan, live_order, error, artics_per_env, pos_pass, stream);
+            if (colored != Status::Ok) return colored;
+        } else {
+            LaunchCuda(island_kernel, dim3(grid_islands),
+                       dim3(island_block_size), static_cast<uint32_t>(shared_bytes),
+                       stream,
+                       reinterpret_cast<const NkRow*>(data.urows),
+                       data.lambda,
+                       static_cast<const float*>(data.chain_jacobian),
+                       static_cast<const float*>(data.row_minv_jt),
+                       with_b_arm ? static_cast<const float*>(data.chain_jacobian_b)
+                                  : nullptr,
+                       with_b_arm ? static_cast<const float*>(data.row_minv_jt_b)
+                                  : nullptr,
+                       static_cast<const float*>(data.row_meff),
+                       static_cast<const float*>(data.row_damping),
+                       data.qdot_flat,
+                       reinterpret_cast<Spatial6*>(data.link_velocity),
+                       data.qdot,
+                       data.body_linear_velocity,
+                       data.body_angular_velocity,
+                       static_cast<const float*>(data.body_inv_mass),
+                       static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
+                       PointMassView{data.particle_inv_mass, data.particle_vel,
+                                  data.grid_inv_mass, data.grid_velocity,
+                                  data.point_endpoint_ranges, data.point_endpoint_terms},
+                       static_cast<const uint32_t*>(model.island_row_offsets),
+                       static_cast<const uint32_t*>(model.island_color_segments),
+                       static_cast<const uint32_t*>(model.row_order),
+                       static_cast<const uint32_t*>(model.dof_to_link),
+                       static_cast<const uint32_t*>(model.dof_to_component),
+                       data.pd_solve_scratch,
+                       pos_pass ? data.row_penetration : nullptr,
+                       pos_pass ? static_cast<float*>(data.row_pseudo_lambda) : nullptr,
+                       pos_pass ? static_cast<float*>(data.qdot_pseudo) : nullptr,
+                       pos_pass ? reinterpret_cast<Spatial6*>(data.link_velocity_pseudo) : nullptr,
+                       pos_pass ? static_cast<float*>(data.qdot_pseudo_flat) : nullptr,
+                       pos_pass ? data.body_pseudo_linear_velocity : nullptr,
+                       pos_pass ? data.body_pseudo_angular_velocity : nullptr,
+                       pos_pass ? data.particle_pseudo_vel : nullptr,
+                       pos_pass ? data.grid_pseudo_vel : nullptr,
+                       p->total_islands, p->rows_per_env, p->max_dof,
+                       p->base_link_count, artics_per_env,
+                       static_cast<uint32_t>(p->vel_iters),
+                       static_cast<uint32_t>(p->pos_iters),
+                       p->pos_beta, p->pos_slop, p->dt, p->vel_tolerance,
+                       p->baumgarte_max_velocity, p->continue_impulses == 0u, error);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         }
-        LaunchCuda(island_kernel, dim3(grid_islands),
-                   dim3(island_block_size), static_cast<uint32_t>(shared_bytes),
-                   stream,
-                   reinterpret_cast<const NkRow*>(data.urows),
-                   data.lambda,
-                   static_cast<const float*>(data.chain_jacobian),
-                   static_cast<const float*>(data.row_minv_jt),
-                   with_b_arm ? static_cast<const float*>(data.chain_jacobian_b)
-                              : nullptr,
-                   with_b_arm ? static_cast<const float*>(data.row_minv_jt_b)
-                              : nullptr,
-                   static_cast<const float*>(data.row_meff),
-                   static_cast<const float*>(data.row_damping),
-                   data.qdot_flat,
-                   reinterpret_cast<Spatial6*>(data.link_velocity),
-                   data.qdot,
-                   data.body_linear_velocity,
-                   data.body_angular_velocity,
-                   static_cast<const float*>(data.body_inv_mass),
-                   static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
-                   PointMassView{data.particle_inv_mass, data.particle_vel,
-                              data.grid_inv_mass, data.grid_velocity,
-                              data.point_endpoint_ranges, data.point_endpoint_terms},
-                   islands_in,
-                   static_cast<const uint32_t*>(model.island_color_segments),
-                   row_order_in,
-                   static_cast<const uint32_t*>(model.dof_to_link),
-                   static_cast<const uint32_t*>(model.dof_to_component),
-                   data.pd_solve_scratch, live_scan, live_order,
-                   pos_pass ? data.row_penetration : nullptr,
-                   pos_pass ? static_cast<float*>(data.row_pseudo_lambda) : nullptr,
-                   pos_pass ? static_cast<float*>(data.qdot_pseudo) : nullptr,
-                   pos_pass ? reinterpret_cast<Spatial6*>(data.link_velocity_pseudo) : nullptr,
-                   pos_pass ? static_cast<float*>(data.qdot_pseudo_flat) : nullptr,
-                   pos_pass ? data.body_pseudo_linear_velocity : nullptr,
-                   pos_pass ? data.body_pseudo_angular_velocity : nullptr,
-                   pos_pass ? data.particle_pseudo_vel : nullptr,
-                   pos_pass ? data.grid_pseudo_vel : nullptr,
-                   island_count_dev, activity,
-                   p->total_islands, p->rows_per_env, p->max_dof,
-                   p->base_link_count, artics_per_env,
-                   static_cast<uint32_t>(p->vel_iters),
-                   static_cast<uint32_t>(p->pos_iters),
-                   p->pos_beta, p->pos_slop, p->dt, p->vel_tolerance,
-                   p->baumgarte_max_velocity, p->continue_impulses == 0u, error);
-        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         if (run_dynamic && pos_pass && data.row_penetration != nullptr) {
             constexpr uint32_t idle_block_size = 128u;
             const uint32_t total_rows = p->rows_per_env * p->env_count;
@@ -2889,25 +3255,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 PointMassView{data.particle_inv_mass, data.particle_vel,
                               data.grid_inv_mass, data.grid_velocity,
                               data.point_endpoint_ranges, data.point_endpoint_terms},
-                islands_in, island_count_dev, activity, row_order_in, live_scan,
+                data.island_quads, data.island_count, activity, data.island_rows, live_scan,
                 data.row_penetration, p->rows_per_env, artics_per_env, p->max_dof, p->dt);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-        }
-        // Flush the articulation tiles the dynamic schedule dropped (the static path
-        // scatters all tiles in-kernel). cc_artic_first is BuildSolveIslands' claim table.
-        if (run_dynamic && p->articulation_count > 0u && p->max_dof > 0u &&
-            data.cc_artic_first != nullptr) {
-            const uint32_t flush_threads = p->articulation_count * p->max_dof;
-            const uint32_t flush_blocks =
-                (flush_threads + kPairDrivenIslandBlockSize - 1u) /
-                kPairDrivenIslandBlockSize;
-            LaunchCuda(FlushOrphanArticKernel, dim3(flush_blocks),
-                       dim3(kPairDrivenIslandBlockSize), 0u, stream,
-                       data.cc_artic_first, p->articulation_count, artics_per_env,
-                       p->max_dof, p->base_link_count, data.qdot_flat,
-                       reinterpret_cast<Spatial6*>(data.link_velocity), data.qdot,
-                       static_cast<const uint32_t*>(model.dof_to_link),
-                       static_cast<const uint32_t*>(model.dof_to_component));
             if (cudaGetLastError() != cudaSuccess) return Status::Failed;
         }
         if (with_b_arm && p->base_link_count > 0u &&
@@ -2943,6 +3292,12 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
 uint64_t SolverVelocityScratchBytes(uint32_t body_count, uint32_t particle_count,
                                     uint32_t grid_count) {
     return (2ull * body_count + particle_count + grid_count) * sizeof(math::Vec3);
+}
+
+uint64_t SolveColorScratchWords(const SolveRowsBlockIslandParams& params) {
+    if (params.family != kContactFamilyPairDriven || params.rows_per_env == 0u ||
+        params.env_count == 0u) return 0u;
+    return BindColorScratch(params, nullptr, nullptr);
 }
 
 void RegisterNkSolveRowsOps() {

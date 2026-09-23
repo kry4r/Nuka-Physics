@@ -366,6 +366,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactSolveMetrics, DlpackDtype::kU64, 2, false, true},  // contact_solve_metrics
     {FieldId::ContactSolveCounts, DlpackDtype::kU32, 2, false, true},  // contact_solve_counts
     {FieldId::PairSampleChunks, DlpackDtype::kU32, 1, false, false},  // pair_sample_chunks
+    {FieldId::SolveColorScratch, DlpackDtype::kU32, 1, false, false},  // solve_color_scratch
 };
 
 } // namespace nuka::nk

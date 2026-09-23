@@ -222,6 +222,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::ContactIndexScratch) return contact_index_scratch_bytes;
         if (id == FieldId::SolverVelocityScratch) return solver_velocity_scratch_bytes;
         if (id == FieldId::PairSampleChunks) return pair_sample_chunk_words;
+        if (id == FieldId::SolveColorScratch) return solve_color_scratch_words;
         // Dynamic-island component count (BuildSolveIslands): the solve grid
         // watermark — one global u32.
         if (id == FieldId::IslandCount) {

@@ -1006,3 +1006,6 @@ fields:
 
   # Pair sample chunks that yield contacts or geometry status, flagged before each manifold pass.
   - {name: pair_sample_chunks, dtype: u32, per: scalar, count: "pair_sample_chunk_words", arena: scratch, owner: data}
+
+  # Row colors and ordered chains the cooperative island solve rebuilds from each pass's live rows.
+  - {name: solve_color_scratch, dtype: u32, per: scalar, count: "solve_color_scratch_words", arena: scratch, owner: data}
