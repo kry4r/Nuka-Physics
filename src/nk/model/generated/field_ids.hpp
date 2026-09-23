@@ -131,7 +131,7 @@ enum class FieldId : uint16_t {
     DistCompliance,  // dist_compliance (per:dist_con arena:persistent owner:model flags:[param])
     DistLambda,  // dist_lambda (per:dist_con arena:persistent owner:data)
     BendParticles,  // bend_particles (per:bend_con arena:persistent owner:model elem:4)
-    BendGradients,  // bend_gradients (per:bend_con arena:persistent owner:model elem:4)
+    BendRestAngle,  // bend_rest_angle (per:bend_con arena:persistent owner:model)
     BendCompliance,  // bend_compliance (per:bend_con arena:persistent owner:model flags:[param])
     BendLambda,  // bend_lambda (per:bend_con arena:persistent owner:data)
     VolParticles,  // vol_particles (per:vol_con arena:persistent owner:model elem:4)
@@ -309,8 +309,8 @@ enum class FieldId : uint16_t {
     SnapshotParticlePlasticF,  // snapshot_particle_plastic_F (per:particle arena:persistent owner:data elem:9)
     GridInvMass,  // grid_inv_mass (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     CcGridFirst,  // cc_grid_first (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
-    GridContactCount,  // grid_contact_count (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
-    GridContactOffset,  // grid_contact_offset (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    GridContactCount,  // grid_contact_count (per:scalar arena:scratch owner:data count:particles_per_env*env_count)
+    GridContactOffset,  // grid_contact_offset (per:scalar arena:scratch owner:data count:particles_per_env*env_count)
     UcontactLaw,  // ucontact_law (per:contact_slot arena:scratch owner:data)
     UcontactFriction,  // ucontact_friction (per:contact_slot arena:scratch owner:data)
     GridContactAttempted,  // grid_contact_attempted (per:env arena:scratch owner:data flags:[readout])
@@ -345,6 +345,10 @@ enum class FieldId : uint16_t {
     PointEndpointRanges,  // point_endpoint_ranges (per:scalar arena:scratch owner:data count:point_endpoints_per_env*env_count flags:[readout])
     PointEndpointTerms,  // point_endpoint_terms (per:scalar arena:scratch owner:data count:point_endpoint_terms_per_env*env_count flags:[readout])
     ParticleProjectionDelta,  // particle_projection_delta (per:particle arena:scratch owner:data)
+    ParticleSurfaceMaxSpeed,  // particle_surface_max_speed (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
+    GridPseudoVel,  // grid_pseudo_vel (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
+    ContactSolveMetrics,  // contact_solve_metrics (per:env arena:scratch owner:data elem:8 flags:[readout])
+    ContactSolveCounts,  // contact_solve_counts (per:env arena:scratch owner:data elem:2 flags:[readout])
     Count
 };
 
@@ -471,7 +475,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dist_compliance",
     "dist_lambda",
     "bend_particles",
-    "bend_gradients",
+    "bend_rest_angle",
     "bend_compliance",
     "bend_lambda",
     "vol_particles",
@@ -685,6 +689,10 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "point_endpoint_ranges",
     "point_endpoint_terms",
     "particle_projection_delta",
+    "particle_surface_max_speed",
+    "grid_pseudo_vel",
+    "contact_solve_metrics",
+    "contact_solve_counts",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

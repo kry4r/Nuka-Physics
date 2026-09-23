@@ -2439,6 +2439,7 @@ if(CMAKE_CUDA_COMPILER)
     add_executable(nuka_elastoplastic_compression_demo
         ${CMAKE_SOURCE_DIR}/examples/demo/elastoplastic_compression_demo.cpp)
     add_dependencies(nuka_elastoplastic_compression_demo nuka_codegen)
+    target_compile_definitions(nuka_elastoplastic_compression_demo PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_include_directories(nuka_elastoplastic_compression_demo
         PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
     target_link_libraries(nuka_elastoplastic_compression_demo PRIVATE
@@ -3450,15 +3451,8 @@ if(NK_BUILD_VULKAN_VALIDATION)
     gtest_discover_tests(nuka_render_raster_smoke_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "fast_full")
 
-    # M8 T7 -- render_physics_parity: THE M8 EXIT GATE. Builds the real H1 union
-    # fixture (Load(.nks) -> CookToModel -> nk::World + BuildRenderWorld +
-    # Simulation, the render_frame_loop_smoke path) and asserts G1 (1:1
-    # physics<->render bit-exact over ALL physics-driven instances), G2 (two
-    # renders byte-identical, RAW pixels), G3 (non-background pixels > 0). Reads
-    # poses from nk::World::DownloadField directly (Decision D2). Asset-gated SKIP;
-    # the whole gate is behind NK_BUILD_VULKAN_VALIDATION (real Vulkan device).
-    # Links the nk physics libs + nuka_render + nuka_app (mirrors the
-    # render_frame_loop_smoke link set + the raster renderer).
+    # Compare live four-system poses and particle surfaces with rendered geometry.
+    # Check environment selection, repeated stage updates and image determinism.
     add_executable(nuka_render_physics_parity_test
         scenario/render_physics_parity.cpp
     )
@@ -3474,6 +3468,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_app
             nuka_scene_cook
             nuka_render
+            nuka_phi2_rt
             nuka_nk
             nuka_phi2
             nuka_runtime

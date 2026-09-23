@@ -404,7 +404,7 @@ fields:
 
   # --- XPBD BEND constraints (per bend_con; 4 particles + 4 gradient vecs) ---
   - {name: bend_particles,   dtype: u32,  per: bend_con, arena: persistent, owner: model, elem: 4}
-  - {name: bend_gradients,   dtype: vec3, per: bend_con, arena: persistent, owner: model, elem: 4}
+  - {name: bend_rest_angle,  dtype: f32, per: bend_con, arena: persistent, owner: model}
   - {name: bend_compliance,  dtype: f32,  per: bend_con, arena: persistent, owner: model, flags: [param]}
   - {name: bend_lambda,      dtype: f32,  per: bend_con, arena: persistent, owner: data}
 
@@ -649,14 +649,11 @@ fields:
   # =========================================================================
   # PairDriven block-island solver GLOBAL scratch (pd_solve_scratch). The
   # PairDriven family schedules ONE island per env holding ALL rows_per_env rows;
-  # the per-row STAGED arrays (the active-row order + the per-color segment table
-  # the single-thread compaction builds) cannot live in dynamic shared because
-  # that scales with rows_per_env (a 20-articulation env exceeds the device opt-in
-  # limit). They live HERE in global, one disjoint region per env: rows_per_env
-  # u32 of order followed by 2*rows_per_env u32 of segments == 3 u32 per row slot.
-  # One block per env owns its region (race-free, no atomics). INERT for the Union
-  # family (it stages order/segments in shared). APPENDED LAST so every pre-existing
-  # arena offset is byte-stable.
+  # the per-row staged order and segment table cannot live in dynamic shared when
+  # rows_per_env is large. They use one disjoint 3-u32-per-row region per env.
+  # Dynamic solves reuse the order region for cached disjoint-batch flags; the
+  # Union family stages its order and segments in shared. APPENDED LAST so every
+  # pre-existing arena offset is byte-stable.
   - {name: pd_solve_scratch, dtype: u32, per: row_slot, arena: scratch, owner: data, elem: 3}
 
   # =========================================================================
@@ -945,8 +942,8 @@ fields:
   # Finite grid endpoints and deterministic contact compaction.
   - {name: grid_inv_mass, dtype: f32, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
   - {name: cc_grid_first, dtype: u32, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
-  - {name: grid_contact_count, dtype: u64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
-  - {name: grid_contact_offset, dtype: u64, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_contact_count, dtype: u64, per: scalar, count: "particles_per_env*env_count", arena: scratch, owner: data}
+  - {name: grid_contact_offset, dtype: u64, per: scalar, count: "particles_per_env*env_count", arena: scratch, owner: data}
   - {name: ucontact_law, dtype: u32, per: contact_slot, arena: scratch, owner: data}
   - {name: ucontact_friction, dtype: f32, per: contact_slot, arena: scratch, owner: data}
 
@@ -998,3 +995,11 @@ fields:
   - {name: point_endpoint_terms, dtype: point_endpoint_term, per: scalar, count: "point_endpoint_terms_per_env*env_count", arena: scratch, owner: data, flags: [readout]}
   # Material projection adds a velocity increment without re-encoding earlier impulses in positions.
   - {name: particle_projection_delta, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: particle_surface_max_speed, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
+
+  # Position recovery uses the same endpoint masses without altering physical grid velocity.
+  - {name: grid_pseudo_vel, dtype: vec3, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
+
+  # Latest contact solve diagnostics are disposable and never restore physical state.
+  - {name: contact_solve_metrics, dtype: u64, per: env, elem: 8, arena: scratch, owner: data, flags: [readout]}
+  - {name: contact_solve_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data, flags: [readout]}

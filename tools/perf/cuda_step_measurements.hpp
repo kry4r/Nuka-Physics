@@ -14,6 +14,7 @@
 #include "nk/pipeline/world.hpp"
 #include "phi/backend_cuda/cuda_internal.cuh"
 #include "scene/format/json.hpp"
+#include "measurement_clock.hpp"
 
 namespace nuka::perf {
 
@@ -107,6 +108,7 @@ public:
         report.Set("schema_version", Json::Int(1));
         report.Set("gpu_boundary", Json::Str("CUDA events around each World::StepConfigured on its main stream; not kernel busy time"));
         report.Set("wall_boundary", Json::Str("Controlled interval with existing uploads, reaction/status readout and completion; particle analysis, capture and rendering excluded"));
+        report.Set("host_clock", Json::Str(Clock::Name()));
         Json config = Json::Object();
         const auto& model = world_.GetModel();
         config.Set("execution", Json::Str(world_.GetExecutionMode() == nk::World::ExecutionMode::Graph ? "graph" : "eager"));
@@ -170,7 +172,7 @@ public:
     }
 
 private:
-    using Clock = std::chrono::steady_clock;
+    using Clock = MeasurementClock;
     using Json = scene::json::Value;
 
     bool Enabled() const { return !events_.empty(); }

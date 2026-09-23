@@ -66,7 +66,7 @@ struct ModelView {
     float* dist_rest_length = nullptr;  // per:dist_con arena:persistent owner:model
     float* dist_compliance = nullptr;  // per:dist_con arena:persistent owner:model flags:[param]
     uint32_t* bend_particles = nullptr;  // per:bend_con arena:persistent owner:model elem:4
-    ::nuka::math::Vec3* bend_gradients = nullptr;  // per:bend_con arena:persistent owner:model elem:4
+    float* bend_rest_angle = nullptr;  // per:bend_con arena:persistent owner:model
     float* bend_compliance = nullptr;  // per:bend_con arena:persistent owner:model flags:[param]
     uint32_t* vol_particles = nullptr;  // per:vol_con arena:persistent owner:model elem:4
     float* vol_rest_times6 = nullptr;  // per:vol_con arena:persistent owner:model
@@ -341,8 +341,8 @@ struct DataView {
     float* snapshot_particle_plastic_F = nullptr;  // per:particle arena:persistent owner:data elem:9
     float* grid_inv_mass = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
     uint32_t* cc_grid_first = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
-    uint64_t* grid_contact_count = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
-    uint64_t* grid_contact_offset = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    uint64_t* grid_contact_count = nullptr;  // per:scalar arena:scratch owner:data count:particles_per_env*env_count
+    uint64_t* grid_contact_offset = nullptr;  // per:scalar arena:scratch owner:data count:particles_per_env*env_count
     uint32_t* ucontact_law = nullptr;  // per:contact_slot arena:scratch owner:data
     float* ucontact_friction = nullptr;  // per:contact_slot arena:scratch owner:data
     uint64_t* grid_contact_attempted = nullptr;  // per:env arena:scratch owner:data flags:[readout]
@@ -372,6 +372,10 @@ struct DataView {
     ::nuka::nk::PointEndpointRange* point_endpoint_ranges = nullptr;  // per:scalar arena:scratch owner:data count:point_endpoints_per_env*env_count flags:[readout]
     ::nuka::nk::PointEndpointTerm* point_endpoint_terms = nullptr;  // per:scalar arena:scratch owner:data count:point_endpoint_terms_per_env*env_count flags:[readout]
     ::nuka::math::Vec3* particle_projection_delta = nullptr;  // per:particle arena:scratch owner:data
+    float* particle_surface_max_speed = nullptr;  // per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count
+    ::nuka::math::Vec3* grid_pseudo_vel = nullptr;  // per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count
+    uint64_t* contact_solve_metrics = nullptr;  // per:env arena:scratch owner:data elem:8 flags:[readout]
+    uint32_t* contact_solve_counts = nullptr;  // per:env arena:scratch owner:data elem:2 flags:[readout]
 };
 
 } // namespace nuka::phi

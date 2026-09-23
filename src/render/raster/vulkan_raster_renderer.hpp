@@ -296,6 +296,10 @@ struct RasterOptions {
     float       shadow_strength  = 0.0f;     // 0 => shadow pass OFF (G2-safe default)
     uint32_t    shadow_map_size  = 2048u;    // shadow map resolution (px, square)
     float       shadow_bias      = 0.0025f;  // depth bias to suppress acne
+    float       shadow_filter_radius = 1.0f;  // PCF sample spacing in texels
+    // A positive radius focuses the shadow map on a world-space sphere; zero fits all geometry.
+    math::Vec3  shadow_center{};
+    float       shadow_radius = 0.0f;
 };
 
 // ---------------------------------------------------------------------------

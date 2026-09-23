@@ -122,8 +122,22 @@ bool BuildSensorSceneDesc(const WorldRecord& record, nuka::render::SensorSceneDe
     out->particles.particles_per_env = record.world->GetModel().capacities.particles_per_env;
     out->particles.env_count = env_count;
     for (const auto& topology : record.particle_surfaces) {
-        if (topology.triangles.empty()) continue;
         nuka::rt::ParticleSurfaceBinding surface;
+        using Kind = nuka::rt::ParticleSurfaceBinding::Kind;
+        if (topology.triangles.empty()) {
+            surface.particle_first = topology.particle_first;
+            surface.particle_count = topology.particle_count;
+            if (topology.surface_spacing > 0.0f) {
+                surface.kind = Kind::Density;
+                surface.density = nuka::runtime::fluid::DensitySurfaceParams(topology.surface_spacing);
+            } else if (topology.particle_radius > 0.0f) {
+                surface.kind = Kind::Grains;
+                surface.grains = {topology.particle_radius, topology.grain_round != 0u,
+                                  topology.grain_radius_jitter, topology.grain_tint_jitter};
+            } else {
+                throw std::invalid_argument("particle render surface has no geometry definition");
+            }
+        }
         surface.triangle_particles = topology.triangles;
         surface.normal_offset = topology.normal_offset;
         surface.smooth_iters = topology.smooth_iters;

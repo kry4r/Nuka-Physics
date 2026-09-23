@@ -30,6 +30,7 @@
 #include "sensor/tactile.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +70,7 @@ struct CollisionShapeRecord {
     // emits convex pieces while Auto/Skip retain the authored surface.
     DecomposeMode decompose_mode           = DecomposeMode::Auto;
     uint32_t      decompose_max_pieces     = 32;
+    bool          mesh_oriented           = false;
     std::vector<float>    mesh_vertices;   // x,y,z triples (source mesh)
     std::vector<uint32_t> mesh_indices;    // triangle indices (source mesh)
     // Authored per-vertex normals (x,y,z triples, 1:1 with mesh_vertices in
@@ -231,6 +233,33 @@ struct EnvironmentRecord {
     float grade                            = 0.0f;   // post filmic contrast/saturation strength
     float sun_disc                         = 0.0f;   // sky sun-disc radiance scale, keyed to the key light
     bool  specular_env                     = false;  // opaque arm: Cook-Torrance + env reflection ray
+
+    struct Sky {
+        bool enabled = false;
+        math::Vec3 top{0.22f, 0.32f, 0.52f};
+        math::Vec3 bottom{0.58f, 0.66f, 0.74f};
+        math::Vec3 ground{0.18f, 0.19f, 0.21f};
+        math::Vec3 ambient_sky{0.16f, 0.19f, 0.26f};
+        math::Vec3 ambient_ground{0.10f, 0.10f, 0.11f};
+        math::Vec3 background{0.055f, 0.067f, 0.09f};
+        float fill = 0.30f;
+    } sky;
+
+    struct ShadowBounds {
+        bool enabled = false;
+        math::Vec3 center{};
+        float radius = 1.0f;
+        std::optional<uint32_t> map_size;
+        std::optional<float> strength;
+        std::optional<float> bias;
+        std::optional<float> filter_radius;
+    } shadow;
+
+    bool Authored() const {
+        return !hdri.empty() || yaw_deg != 0.0f || intensity != 1.0f ||
+               use_scene_materials || ibl_full_fill || exposure_ev != 0.0f ||
+               grade != 0.0f || sun_disc != 0.0f || specular_env || sky.enabled || shadow.enabled;
+    }
 };
 
 struct CameraRecord {
@@ -241,6 +270,8 @@ struct CameraRecord {
     float vertical_fov_degrees             = 45.0f;
     float near_clip                        = 0.01f;
     float far_clip                         = 1000.0f;
+    float focus_distance                   = 1.0f;
+    float shadow_radius                    = 0.0f;
 };
 
 struct LightRecord {
@@ -290,6 +321,8 @@ struct ContactPairOverride {
 // distance+volume — one block). Fields map 1:1 to cook::XpbdCookInput.
 struct MediaXpbdMaterial {
     float    particle_mass     = 0.0f;
+    float    surface_density   = 0.0f;   // kg / m^2; mutually exclusive with particle_mass.
+    float    half_thickness    = 0.0f;   // m from the cloth midsurface.
     float    friction          = 0.6f;   // body<->soft contact mu
     float    distance_alpha    = 0.0f;   // distance-constraint compliance
     float    bend_alpha        = 0.0f;   // cloth bend compliance
@@ -384,6 +417,11 @@ struct MediaRecord {
         // FromFree defers to the legacy `free` flag; any other value overrides it.
         ClothPin   pin = ClothPin::FromFree;
     };
+    struct ClothMesh {
+        math::Transform local_transform{};
+        AssetRef material_mesh;
+        std::vector<uint32_t> pinned_vertices;
+    };
     struct TetSphere {
         math::Vec3 center{0.0f, 0.0f, 0.0f};
         float      radius = 0.0f;
@@ -433,6 +471,7 @@ struct MediaRecord {
         uint32_t         render_material_id = kInvalidMaterial;  // ~0u => inherit medium.
     };
     ClothGrid cloth_grid{};
+    ClothMesh cloth_mesh{};
     TetSphere tet_sphere{};
     FluidBox  fluid_box{};
     CableLine cable_line{};

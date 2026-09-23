@@ -107,6 +107,7 @@ struct VisualMeshComponent {
 struct CollisionShapeComponent {
     enum class Kind : uint8_t { Sphere, Capsule, Box, Plane, ConvexHull, SdfMesh };
     Kind     kind = Kind::Sphere;
+    bool     mesh_oriented = false;
     float    params[4]{0.0f, 0.0f, 0.0f, 0.0f};
     AssetRef cooked;                          // hull / SDF reference into .nka
     uint32_t physics_material_id = ~uint32_t(0);
@@ -189,6 +190,8 @@ struct CameraComponent {
     float           vertical_fov_degrees = 45.0f;
     float           near_clip            = 0.01f;
     float           far_clip             = 1000.0f;
+    float           focus_distance       = 1.0f;
+    float           shadow_radius        = 0.0f;
 };
 
 struct LightComponent {

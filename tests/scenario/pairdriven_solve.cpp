@@ -31,6 +31,8 @@
 #include <vector>
 
 #include "collision/shape_kind.hpp"
+#include "collision/mesh_surface.hpp"
+#include "import/cooker/mesh_surface_cooker.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
@@ -287,6 +289,16 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     namespace scene = nuka::scene;
     namespace cook = nuka::scene::cook;
+    const float edge_vertices[] = {0, 0, -1, 0, 0, 1, -0.6f, -0.8f, 0, 0, -1, 0};
+    const uint32_t edge_triangles[] = {1, 0, 2, 0, 1, 3};
+    auto edge = nuka::import::cooker::CookMeshSurface(edge_vertices, 4u, edge_triangles, 2u);
+    edge.info.flags |= nuka::collision::kMeshSurfaceOriented;
+    const nuka::collision::MeshSurfaceView edge_view{edge_vertices, edge_triangles,
+        edge.nodes.data(), {4u, 2u, edge.info.node_count}};
+    const auto exterior = nuka::collision::QueryMeshSurface(edge_view, edge.info, {0.01f, 0, 0});
+    ASSERT_TRUE(exterior.valid);
+    EXPECT_NEAR(exterior.distance, 0.01f, 1e-7f);
+    EXPECT_GT(exterior.normal.x, 0.99f);
     constexpr uint32_t envs = 2u, steps = 120u;
     constexpr float radius = 0.02f;
     struct StoredScene {
@@ -297,9 +309,10 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
             std::filesystem::remove(nka_path, error);
         }
     };
-    for (uint32_t surface_case = 0u; surface_case < 3u; ++surface_case) {
+    for (uint32_t surface_case = 0u; surface_case < 4u; ++surface_case) {
         SCOPED_TRACE(surface_case);
         const float side = surface_case == 2u ? -1.0f : 1.0f;
+        const float initial_height = surface_case == 3u ? -0.003f : side * 0.15f;
         const Vec3 offset{0.07f, -0.03f, 0.02f};
         scene::SceneIR source;
         scene::RigidBodyRecord wall;
@@ -309,6 +322,7 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         scene::CollisionShapeRecord mesh;
         mesh.body_id = wall_id;
         mesh.type = scene::ShapeType::TriMesh;
+        mesh.mesh_oriented = surface_case == 3u;
         mesh.local_transform.position = offset;
         if (surface_case == 0u) {
             const Vec3 polygon[] = {{-0.4f, 0, -0.1f}, {0.4f, 0, -0.1f}, {0.4f, 0, 0},
@@ -336,7 +350,7 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         other.local_transform.position = {4.0f, 0, 0};
         source.AddCollisionShape(other);
         scene::RigidBodyRecord sphere;
-        sphere.local_transform.position = {0.1f, -0.08f, side * 0.15f};
+        sphere.local_transform.position = {0.1f, -0.08f, initial_height};
         const float inertia = 0.4f * sphere.mass * radius * radius;
         sphere.inertia = {inertia, inertia, inertia};
         const auto sphere_id = source.AddRigidBody(sphere);
@@ -354,6 +368,7 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         ASSERT_EQ(loaded.Shapes()[0].mesh_vertices, mesh.mesh_vertices);
         ASSERT_EQ(loaded.Shapes()[0].mesh_indices, mesh.mesh_indices);
         ASSERT_EQ(loaded.Shapes()[0].type, scene::ShapeType::TriMesh);
+        ASSERT_EQ(loaded.Shapes()[0].mesh_oriented, mesh.mesh_oriented);
         auto model = std::move(cook::CookSceneToModel(loaded, envs, {}).model);
         ASSERT_GT(model.capacities.bodies_per_env, source.Bodies().size());
         ASSERT_GT(model.capacities.max_mesh_triangles, 0u);
@@ -363,9 +378,11 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
             EXPECT_EQ(model.shape_table_rows[body].kind, nuka::collision::kShapeSdfMesh);
             EXPECT_EQ((model.mesh_surface_info[body].flags & nuka::collision::kMeshSurfaceClosed) != 0u,
                       surface_case == 0u);
+            EXPECT_EQ((model.mesh_surface_info[body].flags & nuka::collision::kMeshSurfaceOriented) != 0u,
+                      mesh.mesh_oriented);
         }
         cook::XpbdCookInput particle;
-        particle.positions = {{0.1f, 0.08f, side * 0.15f}};
+        particle.positions = {{0.1f, 0.08f, initial_height}};
         particle.velocities = {{0, 0, 0}};
         particle.inv_mass = {100.0f};
         cook::CookXpbdParticles(model, envs, particle);
@@ -402,15 +419,15 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
             EXPECT_NEAR(side * positions[env].z, radius, 0.003f);
             EXPECT_LT(std::fabs(velocities[env * bodies + sphere_id].z), 0.1f);
         }
-        EXPECT_LT(max_penetration, 0.006f);
+        EXPECT_LT(max_penetration, surface_case == 3u ? radius - initial_height : 0.006f);
         std::fprintf(stderr, "[triangle surface] case=%u rigid_z=%.7f particle_z=%.7f penetration=%.7f\n",
             surface_case, poses[sphere_id].position.z, positions[0].z, max_penetration);
         const auto before = poses;
         const auto particle_before = positions;
         ASSERT_EQ(world.Reset({0u}), nphi::Status::Ok);
         ASSERT_TRUE(read());
-        EXPECT_NEAR(poses[sphere_id].position.z, side * 0.15f, 1e-7f);
-        EXPECT_NEAR(positions[0].z, side * 0.15f, 1e-7f);
+        EXPECT_NEAR(poses[sphere_id].position.z, initial_height, 1e-7f);
+        EXPECT_NEAR(positions[0].z, initial_height, 1e-7f);
         EXPECT_EQ(poses[bodies + sphere_id].position.z, before[bodies + sphere_id].position.z);
         EXPECT_EQ(positions[1].z, particle_before[1].z);
         for (uint32_t step = 0u; step < steps; ++step) ASSERT_TRUE(world.Step().AllOk());

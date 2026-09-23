@@ -139,6 +139,15 @@ set(NUKA_PUBLIC_HEADERS
 )
 
 find_package(Threads REQUIRED)
+add_library(nuka_particle_geometry STATIC
+    runtime/fluid/surface_mesher.cpp
+    runtime/particle_skin.cpp
+)
+set_target_properties(nuka_particle_geometry PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nuka_particle_geometry PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(nuka_particle_geometry PRIVATE Threads::Threads)
+nuka_set_warnings(nuka_particle_geometry)
+
 add_library(nuka_render STATIC
     render/render_world.cpp
     # Host image decode (stb_image) -> rt::Texture / rt::EnvironmentMap for the
@@ -148,10 +157,6 @@ add_library(nuka_render STATIC
     # tet/fluid later). Pure host, ZERO CUDA: it lives in nuka_render so a demo
     # gets a deforming surface from live particles with no CUDA dependency.
     runtime/soft/particle_surface.cpp
-    # The fluid counterpart: a PBF particle set -> marching-cubes isosurface
-    # MeshGeometry (same MeshToBlas path). Pure host, ZERO CUDA (reuses the
-    # CUDA-free host Poly6/Spiky in import/cooker/fluid_cooker_types.hpp).
-    runtime/fluid/surface_mesher.cpp
     # Host, CUDA-free adapter mapping RenderWorld -> the
     # self-written path-tracer scene-desc POD (rt::TwoLevelScene). Zero CUDA
     # token (src/render red-line); the CUDA backend is reached only via the
@@ -164,6 +169,7 @@ add_library(nuka_render STATIC
     # studio floor + cinematic options) the cloth demo AND the live-render bridge
     # draw. Reaches the offline RT tracer only via render::RtBackendI (zero CUDA).
     render/studio_beauty.cpp
+    render/scene_asset.cpp
     render/vulkan_renderer.cpp
     render/raster/vulkan_raster_renderer.cpp
     # M11 INT-4 (OD-2): the OPT-IN, default-OFF exportable per-instance transform
@@ -287,6 +293,7 @@ target_include_directories(nuka_render
 target_link_libraries(nuka_render
     PUBLIC
         nuka_scene
+        nuka_particle_geometry
         Vulkan::Vulkan
     PRIVATE
         nuka_stb
@@ -1209,6 +1216,7 @@ if(CMAKE_CUDA_COMPILER)
 
     target_link_libraries(nuka_phi2_rt
         PUBLIC
+            nuka_particle_geometry
             nuka_collision
             nuka_collision_gpu
             # RT-7 (M11): the rt device buffers are phi-v2 opaque Buffer*

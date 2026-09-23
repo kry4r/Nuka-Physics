@@ -18,6 +18,7 @@ namespace {
 void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
     switch (id) {
         case FieldId::ParticleSurfaceNodes: v.particle_surface_nodes = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::ParticleSurfaceMaxSpeed: v.particle_surface_max_speed = static_cast<float*>(p); break;
         case FieldId::PointEndpointRanges: v.point_endpoint_ranges = static_cast<PointEndpointRange*>(p); break;
         case FieldId::PointEndpointTerms: v.point_endpoint_terms = static_cast<PointEndpointTerm*>(p); break;
         case FieldId::Q:                   v.q = static_cast<float*>(p); break;
@@ -206,6 +207,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::GridMass:            v.grid_mass = static_cast<float*>(p); break;
         case FieldId::GridMomentum:        v.grid_momentum = static_cast<math::Vec3*>(p); break;
         case FieldId::GridVelocity:        v.grid_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::GridPseudoVel:       v.grid_pseudo_vel = static_cast<math::Vec3*>(p); break;
         case FieldId::GridForce:           v.grid_force = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleF:           v.particle_F = static_cast<float*>(p); break;
         case FieldId::ParticleC:           v.particle_C = static_cast<float*>(p); break;
@@ -287,6 +289,8 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::LinkContactEnd: v.link_contact_end = static_cast<uint32_t*>(p); break;
         case FieldId::ContactIndexScratch: v.contact_index_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::SolverVelocityScratch: v.solver_velocity_scratch = static_cast<uint8_t*>(p); break;
+        case FieldId::ContactSolveMetrics: v.contact_solve_metrics = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactSolveCounts: v.contact_solve_counts = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
         case FieldId::GridSortScratch:     v.grid_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSortScratch:     v.pair_sort_scratch = static_cast<uint8_t*>(p); break;
@@ -355,7 +359,14 @@ bool Data::UploadPersistent(const std::vector<uint8_t>& bytes) const {
     if (buffer == nullptr || bytes.size() != PersistentByteSize()) {
         return false;
     }
-    return phi::BufferUpload(buffer, bytes.data(), 0, bytes.size()) == phi::Status::Ok;
+    if (phi::BufferUpload(buffer, bytes.data(), 0, bytes.size()) != phi::Status::Ok) return false;
+    for (const auto& segment : arena_.Segments()) {
+        if (segment.field != FieldId::ContactSolveMetrics && segment.field != FieldId::ContactSolveCounts)
+            continue;
+        if (phi::BufferMemset(arena_.ScratchBuffer(), 0, segment.offset, segment.bytes) != phi::Status::Ok)
+            return false;
+    }
+    return true;
 }
 
 bool Data::Snapshot() {

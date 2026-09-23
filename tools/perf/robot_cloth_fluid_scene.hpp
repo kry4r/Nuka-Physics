@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -51,15 +52,18 @@ inline nk::Pipeline::SolverConfig Cfg() {
     cfg.max_pairs = 64u;
     return cfg;
 }
-inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = kClothNx) {
+inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = kClothNx,
+                                     float spacing_x = kClothSpacing) {
     Require(nx >= 3u && uint64_t{nx} * nx <= std::numeric_limits<uint32_t>::max() / 6u,
             "cloth grid exceeds topology index range");
+    Require(std::isfinite(spacing_x) && spacing_x > 0.0f, "cloth spacing must be positive");
     std::vector<Vec3> rest;
     rest.reserve(nx * nx);
     const float c0 = -0.5f * static_cast<float>(nx - 1u) * kClothSpacing;
+    const float x0 = -0.5f * static_cast<float>(nx - 1u) * spacing_x;
     for (uint32_t j = 0; j < nx; ++j)
         for (uint32_t i = 0; i < nx; ++i)
-            rest.push_back(Vec3{cx + c0 + static_cast<float>(i) * kClothSpacing,
+            rest.push_back(Vec3{cx + x0 + static_cast<float>(i) * spacing_x,
                                 cy + c0 + static_cast<float>(j) * kClothSpacing, z});
     auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
     std::vector<soft::ClothTriangle> tris;
@@ -93,7 +97,8 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx =
     }
     for (const auto& bc : cs.bend) {
         cook::CookBendCon c;
-        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
+        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
+        c.rest_angle = bc.rest_angle;
         c.compliance_alpha = bc.compliance_alpha;
         in.bend.push_back(c);
     }
@@ -163,14 +168,27 @@ inline nuka::scene::SceneIR RobotScene(const std::filesystem::path& path, bool w
     return scene;
 }
 
-inline nk::Model CookRobot(const std::filesystem::path& path, bool with_free_body = false) {
+struct SceneVisuals {
+    nuka::scene::SceneIR scene;
+    nuka::scene::SceneMap scene_map;
+    std::vector<cook::MediaRenderSurface> material_surfaces;
+};
+
+inline nk::Model CookRobot(const std::filesystem::path& path, bool with_free_body = false,
+                           SceneVisuals* visuals = nullptr) {
     cook::CookToModelOptions opt;
     opt.contact_family = cook::CookContactFamily::PairDriven;
     auto scene = RobotScene(path, with_free_body);
-    nk::Model model = cook::CookToModel(scene, 1, opt).model;
+    auto cooked = cook::CookToModel(scene, 1, opt);
+    nk::Model model = std::move(cooked.model);
     model.capacities.max_contacts_per_env = 32u;
     model.capacities.max_rows_per_env =
         model.capacities.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
+    if (visuals) {
+        visuals->scene = std::move(scene);
+        visuals->scene_map = std::move(cooked.scene_map);
+        visuals->material_surfaces.clear();
+    }
     return model;
 }
 
@@ -264,8 +282,9 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
 }
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
-                              bool patch_present = true, uint32_t cloth_nx = kClothNx) {
-    nk::Model model = CookRobot(scene.path, true);
+                              bool patch_present = true, uint32_t cloth_nx = kClothNx,
+                              SceneVisuals* visuals = nullptr) {
+    nk::Model model = CookRobot(scene.path, true, visuals);
     auto cloth = BuildCloth(scene.front_centre.x, scene.front_centre.y, scene.cloth_z, cloth_nx);
     auto pool = BuildPool(scene.rear_foot.x, scene.rear_foot.y, scene.pool_floor);
     if (!patch_present) {
@@ -281,7 +300,35 @@ inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
     return model;
 }
 
-inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs) {
+inline std::vector<uint32_t> LatticeBoundary(const std::array<uint32_t, 3>& dimensions) {
+    Require(dimensions[0] >= 2u && dimensions[1] >= 2u && dimensions[2] >= 2u &&
+            uint64_t{dimensions[0]} * dimensions[1] <= UINT32_MAX / dimensions[2],
+            "invalid material lattice dimensions");
+    const auto index = [&](const std::array<uint32_t, 3>& point) {
+        return (point[2] * dimensions[1] + point[1]) * dimensions[0] + point[0];
+    };
+    std::vector<uint32_t> triangles;
+    for (uint32_t axis = 0u; axis < 3u; ++axis) {
+        const uint32_t u = (axis + 1u) % 3u, v = (axis + 2u) % 3u;
+        for (uint32_t side = 0u; side < 2u; ++side)
+            for (uint32_t j = 0u; j + 1u < dimensions[v]; ++j)
+                for (uint32_t i = 0u; i + 1u < dimensions[u]; ++i) {
+                    std::array<uint32_t, 3> point{};
+                    point[axis] = side * (dimensions[axis] - 1u);
+                    point[u] = i; point[v] = j;
+                    const auto a = index(point);
+                    ++point[u]; const auto b = index(point);
+                    ++point[v]; const auto c = index(point);
+                    --point[u]; const auto d = index(point);
+                    if (side) triangles.insert(triangles.end(), {a, b, c, a, c, d});
+                    else triangles.insert(triangles.end(), {a, c, b, a, d, c});
+                }
+    }
+    return triangles;
+}
+
+inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
+                                SceneVisuals* visuals = nullptr) {
     constexpr float radius = 0.028f, mass = 0.15f, dx = 0.02f;
     const float cloth_z = prepared.cloth_z - 0.0175f;
     auto scene = RobotScene(prepared.path, true);
@@ -299,20 +346,37 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs) {
     for (const auto& shape : scene.Shapes())
         if (shape.body_id == free_body) shapes.push_back(shape.id);
     for (auto id : shapes) scene.GetShapeMut(id).radius = radius;
+    const float cloth_x = 0.5f * (prepared.front_centre.x + body.local_transform.position.x);
+    auto impact_body = body;
+    impact_body.name = "impact_body";
+    impact_body.local_transform.position.x = prepared.front_centre.x - radius - dx;
+    const auto impact_id = scene.AddRigidBody(impact_body);
+    nuka::scene::CollisionShapeRecord impact_shape;
+    impact_shape.body_id = impact_id;
+    impact_shape.type = nuka::scene::ShapeType::Sphere;
+    impact_shape.radius = radius;
+    scene.AddCollisionShape(impact_shape);
     cook::CookToModelOptions options;
     options.contact_family = cook::CookContactFamily::PairDriven;
-    nk::Model model = cook::CookToModel(scene, envs, options).model;
+    auto cooked = cook::CookToModel(scene, envs, options);
+    const auto* impact_ref = cooked.scene_map.RefOf(scene.EntityOfBody(impact_id));
+    Require(impact_ref != nullptr, "impact body is missing from the cooked scene map");
+    cooked.model.body_init.at(impact_ref->body_row).linear_velocity = {0.5f, 0.0f, 0.0f};
+    nk::Model model = std::move(cooked.model);
     model.articulation.initial_q = prepared.settled_q;
     model.articulation.initial_qdot = prepared.settled_qdot;
-    auto cloth = BuildCloth(prepared.front_centre.x, prepared.front_centre.y, cloth_z);
+    // A narrow membrane leaves exposed material beneath both contact bodies.
+    auto cloth = BuildCloth(cloth_x, prepared.front_centre.y, cloth_z, kClothNx,
+                            2.0f * kClothSpacing / float(kClothNx - 1u));
     cloth.aero_drag_normal = cloth.aero_drag_tangent = cloth.aero_drag_max_dv = 0.0f;
     cook::MpmCookInput mpm;
     const Vec3 centre{prepared.front_centre.x + 0.01f, prepared.front_centre.y, cloth_z};
     const float spacing = 0.5f * dx;
-    for (uint32_t z = 0u; z < 4u; ++z)
-        for (uint32_t y = 0u; y < 9u; ++y)
-            for (uint32_t x = 0u; x < 9u; ++x)
-                mpm.positions.push_back(centre + Vec3{(float(x) - 4.0f) * spacing,
+    constexpr std::array<uint32_t, 3> dimensions{13u, 9u, 4u};
+    for (uint32_t z = 0u; z < dimensions[2]; ++z)
+        for (uint32_t y = 0u; y < dimensions[1]; ++y)
+            for (uint32_t x = 0u; x < dimensions[0]; ++x)
+                mpm.positions.push_back(centre + Vec3{(float(x) - 6.0f) * spacing,
                     (float(y) - 4.0f) * spacing, (float(z) - 3.5f) * spacing});
     mpm.material.youngs = 10000.0f;
     mpm.material.poisson = 0.3f;
@@ -320,7 +384,7 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs) {
     const float volume = spacing * spacing * spacing;
     mpm.vol0.assign(mpm.positions.size(), volume);
     mpm.inv_mass.assign(mpm.positions.size(), 1.0f / (mpm.material.density * volume));
-    mpm.velocities.assign(mpm.positions.size(), Vec3{0.0f, 0.0f, 0.05f});
+    mpm.velocities.assign(mpm.positions.size(), Vec3{0.0f, 0.0f, 0.5f});
     mpm.grid_origin = centre - Vec3{0.14f, 0.14f, 0.14f};
     mpm.grid_dims[0] = mpm.grid_dims[1] = mpm.grid_dims[2] = 15u;
     mpm.dx = dx;
@@ -331,6 +395,15 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs) {
     cook::CookMpmXpbd(model, envs, mpm, cloth);
     model.particles.pp_contact_d_min = kClothSpacing;
     model.particles.mpm_body_friction = 0.6f;
+    if (visuals) {
+        visuals->scene = std::move(scene);
+        visuals->scene_map = std::move(cooked.scene_map);
+        visuals->material_surfaces.clear();
+        cook::MediaRenderSurface surface;
+        surface.triangles = LatticeBoundary(dimensions);
+        surface.particle_count = static_cast<uint32_t>(mpm.positions.size());
+        visuals->material_surfaces.push_back(std::move(surface));
+    }
     return model;
 }
 }  // namespace nuka::perf::fixture

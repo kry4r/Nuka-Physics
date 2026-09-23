@@ -1,23 +1,5 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M4 union-family (CSR compliant) shared op types.
-//
-// The union contact pipeline (NarrowphasePrimitives union branch ->
-// AssembleRows -> SolveRowsBlockIsland) transcribes the legacy coresident
-// union world step semantics 1:1:
-//   * detection = the SAME HD-clean analytic handlers the legacy host /
-//     grasp-GPU narrowphase ran (amf::SpherePlane / amf::BoxPlane /
-//     cvx::SphereHull), now launched device-resident per (env x slot);
-//   * row emission = EmitCompliantContactRows' math (solref/solimp aref + R
-//     via the SAME constraint/solref_solimp.hpp HD header, ChooseTangent
-//     spoke basis, normals-then-spokes group layout) onto FIXED row slots;
-//   * solve = row_solver.cu's compliant branch math (side dispatch, coupled-
-//     pyramid friction bounds, regularizer feedback) on the device-resident
-//     island/color schedule.
-//
-// This header carries the device-side UnionSlot unpack, the NkRow alias, and
-// the host->device launcher seams shared between the op TUs.
-// ---------------------------------------------------------------------------
+// Shared endpoint mass operators and cooked contact slot types for the CUDA solver.
 
 #include <cstdint>
 
@@ -40,6 +22,12 @@ using ::nuka::nk::kNkSideRigid;
 using ::nuka::nk::kNkSideStatic;
 using ::nuka::nk::kNkSideGrid;
 using ::nuka::nk::kNkSidePointEndpoint;
+
+__device__ __forceinline__ float WarpSum(float value) {
+    for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u)
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    return __shfl_sync(0xffffffffu, value, 0u);
+}
 
 // Material particles and background nodes share scalar mass response with separate state.
 struct PointMassView {
@@ -83,24 +71,44 @@ struct PointMassView {
         }
         return result;
     }
+    __device__ float RowVelocityWarp(const NkRowSide& side, uint32_t lane) const {
+        const uint32_t count = Count(side);
+        if (count == 1u) {
+            const auto term = At(side, 0u);
+            const auto* velocity = Velocity(term.kind);
+            return velocity != nullptr ? term.jacobian.Dot(velocity[term.index]) : 0.0f;
+        }
+        float result = 0.0f;
+        for (uint32_t i = lane; i < count; i += warpSize) {
+            const auto term = At(side, i);
+            const auto* velocity = Velocity(term.kind);
+            if (velocity != nullptr) result += term.jacobian.Dot(velocity[term.index]);
+        }
+        return WarpSum(result);
+    }
     __device__ float Coupling(const NkRowSide& lhs, const NkRowSide& rhs) const {
         float result = 0.0f;
-        for (uint32_t i = 0u; i < Count(lhs); ++i) {
+        uint32_t i = 0u, j = 0u;
+        const uint32_t lhs_count = Count(lhs), rhs_count = Count(rhs);
+        while (i < lhs_count && j < rhs_count) {
             const auto a = At(lhs, i);
-            const float* inv_mass = InverseMass(a.kind);
-            if (inv_mass == nullptr) continue;
-            for (uint32_t j = 0u; j < Count(rhs); ++j) {
-                const auto b = At(rhs, j);
-                if (a.kind == b.kind && a.index == b.index)
+            const auto b = At(rhs, j);
+            const uint64_t a_key = (uint64_t{a.kind} << 32u) | a.index;
+            const uint64_t b_key = (uint64_t{b.kind} << 32u) | b.index;
+            if (a_key == b_key) {
+                const float* inv_mass = InverseMass(a.kind);
+                if (inv_mass != nullptr)
                     result += inv_mass[a.index] * a.jacobian.Dot(b.jacobian);
             }
+            if (a_key <= b_key) ++i;
+            if (b_key <= a_key) ++j;
         }
         return result;
     }
-    __device__ PointMassView Pseudo(math::Vec3* particle_pseudo) const {
+    __device__ PointMassView Pseudo(math::Vec3* particle_pseudo, math::Vec3* grid_pseudo) const {
         auto result = *this;
         result.particle_velocity = particle_pseudo;
-        result.grid_velocity = nullptr;
+        result.grid_velocity = grid_pseudo;
         return result;
     }
 };

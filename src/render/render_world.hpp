@@ -32,6 +32,7 @@
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
+#include "render/mesh_geometry.hpp"
 #include "rt/material.hpp"   // rt::Texture / rt::EnvironmentMap (decoded, backend-agnostic)
 #include "scene/asset/asset_ref.hpp"
 #include "scene/ecs/components.hpp"
@@ -53,34 +54,6 @@ namespace nuka::render {
 
 // Sentinel "no row / no id" matching SceneMap::kNoRow / Registry::kNoSlot.
 inline constexpr uint32_t kNoId = ~uint32_t(0);
-
-// ---------------------------------------------------------------------------
-// MeshGeometry - host triangle geometry for ONE renderable mesh.
-//
-// Interleaving-free, render-backend-agnostic SoA-ish streams (positions are
-// mandatory; normals/uvs may be empty -> the renderer synthesizes them).
-// Sourced either from a decoded .nka MESH chunk (DecodeMesh) or, when no MESH
-// chunk exists for an instance, from a collision-primitive tessellation so that
-// EVERY RenderInstance always has renderable triangles (Decision D3 fallback).
-// ---------------------------------------------------------------------------
-struct MeshGeometry {
-    std::vector<float>    positions;  // x,y,z per vertex (3 floats/vertex)
-    std::vector<float>    normals;    // x,y,z per vertex (empty => renderer derives)
-    std::vector<float>    uvs;        // u,v   per vertex (empty => none)
-    std::vector<uint32_t> indices;    // triangle indices (3 per triangle)
-
-    // Analytic sphere primitives (rounder + cheaper than tessellated grains). One
-    // sphere = 3 center floats + 1 radius, plus an optional r,g,b albedo tint.
-    // Empty => a pure triangle mesh (byte-identical to a mesh that ships none).
-    std::vector<float>    sphere_centers;  // x,y,z per sphere
-    std::vector<float>    sphere_radii;    // radius per sphere
-    std::vector<float>    sphere_colors;   // r,g,b tint per sphere (empty => untinted)
-
-    uint32_t VertexCount() const { return static_cast<uint32_t>(positions.size() / 3); }
-    uint32_t TriangleCount() const { return static_cast<uint32_t>(indices.size() / 3); }
-    uint32_t SphereCount() const { return static_cast<uint32_t>(sphere_radii.size()); }
-    bool     Empty() const { return positions.empty() || indices.empty(); }
-};
 
 // How a mesh in the library was produced (informational; lets a consumer or
 // the D3 report distinguish asset-backed fidelity from primitive fallback).
@@ -105,6 +78,14 @@ public:
     // Geometry / provenance for a mesh id (id < Count()).
     const MeshGeometry& Geometry(uint32_t mesh_id) const { return meshes_[mesh_id]; }
     MeshSource          Source(uint32_t mesh_id) const { return sources_[mesh_id]; }
+
+    // Append independently editable geometry without sharing an interned asset key.
+    uint32_t AppendGeometry(MeshGeometry geometry, MeshSource source) {
+        const uint32_t id = Count();
+        meshes_.push_back(std::move(geometry));
+        sources_.push_back(source);
+        return id;
+    }
 
     // Replace an interned mesh's geometry in place (a deforming particle surface
     // updates its ONE mesh each frame; id/key stay stable so the table never grows).
@@ -202,6 +183,8 @@ struct RenderCamera {
     float           vertical_fov_degrees = 45.0f;
     float           near_clip            = 0.01f;
     float           far_clip            = 1000.0f;
+    float           focus_distance      = 1.0f;
+    float           shadow_radius       = 0.0f;
     PoseSource      pose_source;  // a camera may be attached to a moving body
     math::Transform cached_visual_local = math::Transform::Identity();
 };

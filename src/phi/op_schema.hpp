@@ -476,7 +476,7 @@ struct MpmParams {
     uint32_t sdf_cell_total;
     collision::MeshGeometryCounts mesh_geometry;
     float    body_mu;            // Coulomb friction the body BC clamps the tangent by.
-    float    body_band;          // nodes with signed surface distance below this couple.
+    float    body_band;          // broad query margin; does not change physical separation.
     // Articulation dimensions for endpoint validation and reaction reference points.
     uint32_t artic_count;        // GLOBAL articulations (artics_per_env * env_count).
     uint32_t max_dof;            // per-articulation generalized DOF (the m_inv tile side).
@@ -742,10 +742,13 @@ struct SolveRowsBlockIslandParams {
     uint32_t total_particle_count;
     float    pos_beta;
     float    pos_slop;
+    // Sweep convergence bound in velocity units (m/s); 0 sweeps the full budget.
+    float    vel_tolerance;
     // Validation hook (NUKA_FORCE_STATIC_ISLANDS): run the conservative cook-time
     // one-island-per-env schedule instead of the dynamic CC pass, to A/B them. 0 == off.
     uint32_t force_static_islands;
     uint32_t continue_impulses = 0u; // Retain this step's applied impulses across solver calls.
+    uint32_t measure_contact_residual = 0u;
     uint32_t total_grid_count = 0u;
     uint64_t workspace_bytes = 0u;
 };

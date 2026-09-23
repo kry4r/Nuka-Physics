@@ -39,15 +39,11 @@ struct XpbdDistanceConstraint {
     float compliance_alpha = 0.0f;  // XPBD compliance (1/stiffness); 0 == rigid.
 };
 
-// Host-side description of one BEND constraint over four particles (id 7). The
-// Bergou isometric stencil is stored as four CONSTANT gradient vectors K_i =
-// k_i*n_hat_rest (grad_{p_i} C), built once at cook time (cloth_topology). The
-// row's scalar constraint is C = sum_i K[i] . p[particle[i]], == 0 at flat rest.
+// Signed dihedral bend over a shared edge and two opposite vertices.
 struct XpbdBendConstraint {
     uint32_t particle[4] = {0u, 0u, 0u, 0u};
-    math::Vec3 k[4] = {math::Vec3{0.0f, 0.0f, 0.0f}, math::Vec3{0.0f, 0.0f, 0.0f},
-                       math::Vec3{0.0f, 0.0f, 0.0f}, math::Vec3{0.0f, 0.0f, 0.0f}};
-    float compliance_alpha = 0.0f;  // XPBD compliance (1/bend-stiffness).
+    float rest_angle = 0.0f;
+    float compliance_alpha = 0.0f;  // rad / (N m).
 };
 
 // Host-side description of one VOLUME constraint over the four particles of a tet

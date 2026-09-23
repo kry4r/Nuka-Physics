@@ -603,7 +603,12 @@ typedef enum nuka_state_field_t {
     // READ: uint32[first,count] per endpoint; first addresses POINT_ENDPOINT_TERMS globally.
     NUKA_FIELD_POINT_ENDPOINT_RANGES = 59,
     // READ: uint8 records with the layout of nuka_point_endpoint_term_t, valid for the latest interval.
-    NUKA_FIELD_POINT_ENDPOINT_TERMS = 60
+    NUKA_FIELD_POINT_ENDPOINT_TERMS = 60,
+    // Eight uint64 values per environment: float error bits in high 32, ~global_row in low 32.
+    // Order: normal/tangent velocity, normal velocity/impulse violation, complementarity, cone, work, dissipation.
+    NUKA_FIELD_CONTACT_SOLVE_METRICS = 61,
+    // Two uint32 counts per environment: evaluated contact blocks, invalid blocks; latest solve only.
+    NUKA_FIELD_CONTACT_SOLVE_COUNTS = 62
 } nuka_state_field_t;
 
 typedef enum nuka_env_status_t {
@@ -698,6 +703,27 @@ nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
                                       uint32_t link_index, char* out, size_t cap,
                                       size_t* out_len);
 
+typedef enum nuka_kinematic_joint_t {
+    NUKA_KINEMATIC_ROOT = 0,
+    NUKA_KINEMATIC_FIXED = 1,
+    NUKA_KINEMATIC_REVOLUTE = 2,
+    NUKA_KINEMATIC_PRISMATIC = 3
+} nuka_kinematic_joint_t;
+
+// Immutable encoder kinematics in cooked per-environment link order; roots have parent_index UINT32_MAX.
+// local_pose is the zero-coordinate parent-to-child transform (xyz, wxyz); axis is in its child frame.
+typedef struct nuka_kinematic_link_t {
+    uint32_t parent_index;
+    uint32_t articulation_index;
+    nuka_kinematic_joint_t joint_type;
+    float local_pose[7];
+    float axis[3];
+} nuka_kinematic_link_t;
+
+// Root local poses are identity: this calibration query exposes no live state or world placement.
+nuka_result_t nuka_world_get_kinematic_link(nuka_world_handle world,
+                                            uint32_t link_index, nuka_kinematic_link_t* out);
+
 // ---------------------------------------------------------------------------
 // Offline beauty render of the LIVE world: a one-off HOST RGB image of the world's
 // CURRENT state via the self-written offline CUDA path-tracer (NOT the gated
@@ -756,6 +782,29 @@ typedef enum nuka_sensor_mount_t {
     NUKA_SENSOR_MOUNT_BASE = 2,
     NUKA_SENSOR_MOUNT_WORLD = 3
 } nuka_sensor_mount_t;
+
+// Authored camera placement and optics, resolved against one environment's live state.
+// Local offsets use position followed by a wxyz quaternion; view is in world space.
+typedef struct nuka_scene_camera_t {
+    nuka_sensor_mount_t mount;
+    uint32_t mount_index;
+    float local_offset[7];
+    nuka_beauty_camera_t view;
+    float near_clip;
+    float far_clip;
+    float focus_distance;
+    float shadow_radius;
+} nuka_scene_camera_t;
+
+// Names match exactly or by an unambiguous slash-delimited suffix.
+nuka_result_t nuka_world_get_scene_camera(nuka_world_handle world, const char* name,
+                                         uint32_t env_index, nuka_scene_camera_t* out_camera);
+
+// Render environment zero using the named camera's live placement and authored optics.
+nuka_result_t nuka_world_render_scene_camera(nuka_world_handle world, const char* name,
+                                            uint32_t width, uint32_t height, uint32_t spp,
+                                            uint8_t dtype, void* out_rgb, size_t out_capacity,
+                                            size_t* out_pixel_count);
 
 // AOV channel the sensor view returns: 0 color(3) 1 depth(1) 2 normal(3) 3
 // albedo(3) 4 prim(1, uint32). RANGE(5) is the lidar plane (1 float per (az,el)

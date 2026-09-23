@@ -55,13 +55,13 @@ inline bool ValidTactileConfig(const TactileConfig& config, bool normal_only) {
 
 namespace tactile_detail {
 
-NUKA_TACTILE_HD inline bool Slab(double p, double d, double half, double& near, double& far) {
+NUKA_TACTILE_HD inline bool Slab(double p, double d, double half, double& t_near, double& t_far) {
     if (d == 0.0) return fabs(p) <= half;
     const double a = (-half - p) / d;
     const double b = (half - p) / d;
-    near = fmax(near, fmin(a, b));
-    far = fmin(far, fmax(a, b));
-    return far >= near;
+    t_near = fmax(t_near, fmin(a, b));
+    t_far = fmin(t_far, fmax(a, b));
+    return t_far >= t_near;
 }
 
 NUKA_TACTILE_HD inline bool SphereRay(math::Vec3 p, math::Vec3 d, double radius) {
@@ -73,8 +73,8 @@ NUKA_TACTILE_HD inline bool SphereRay(math::Vec3 p, math::Vec3 d, double radius)
 }
 
 NUKA_TACTILE_HD inline bool CylinderRay(math::Vec3 p, math::Vec3 d, double radius, double half_height) {
-    double near = 0.0, far = INFINITY;
-    if (!Slab(p.z, d.z, half_height, near, far)) return false;
+    double t_near = 0.0, t_far = INFINITY;
+    if (!Slab(p.z, d.z, half_height, t_near, t_far)) return false;
     const double a = double{d.x} * d.x + double{d.y} * d.y;
     const double b = double{p.x} * d.x + double{p.y} * d.y;
     const double c = double{p.x} * p.x + double{p.y} * p.y - radius * radius;
@@ -82,7 +82,7 @@ NUKA_TACTILE_HD inline bool CylinderRay(math::Vec3 p, math::Vec3 d, double radiu
     const double discriminant = b * b - a * c;
     if (discriminant < 0.0) return false;
     const double root = sqrt(discriminant);
-    return fmin(far, (-b + root) / a) >= fmax(near, (-b - root) / a);
+    return fmin(t_far, (-b + root) / a) >= fmax(t_near, (-b - root) / a);
 }
 
 NUKA_TACTILE_HD inline float GaussianInterval(float center, float half, float sigma) {
@@ -103,9 +103,9 @@ NUKA_TACTILE_HD inline bool TouchRegionIntersectsRay(const TactileConfig& config
     const auto s = config.size;
     switch (config.shape) {
         case ContactRegionShape::Box: {
-            double near = 0.0, far = INFINITY;
-            return Slab(p.x, d.x, s.x, near, far) && Slab(p.y, d.y, s.y, near, far) &&
-                Slab(p.z, d.z, s.z, near, far);
+            double t_near = 0.0, t_far = INFINITY;
+            return Slab(p.x, d.x, s.x, t_near, t_far) && Slab(p.y, d.y, s.y, t_near, t_far) &&
+                Slab(p.z, d.z, s.z, t_near, t_far);
         }
         case ContactRegionShape::Sphere: return SphereRay(p, d, s.x);
         case ContactRegionShape::Ellipsoid:

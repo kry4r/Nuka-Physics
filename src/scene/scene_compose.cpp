@@ -6,7 +6,9 @@
 
 #include "scene/canonical_types.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -47,11 +49,18 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
     const auto joint_off = static_cast<uint32_t>(base.JointCount());
     const auto shape_off = static_cast<uint32_t>(base.ShapeCount());
 
-    // A body takes the placement only if nothing joints onto it as a child: flat
-    // body lists (all parent_id kInvalidBody) carry their tree in joints, not parents.
+    const auto& rotation = placement.rotation;
+    const bool axis_aligned_media = std::any_of(addon.Media().begin(), addon.Media().end(),
+        [](const MediaRecord& m) { return m.kind != MediaRecord::Kind::Cloth || m.baked.Empty(); });
+    if ((axis_aligned_media || !addon.Terrain().empty()) &&
+        (rotation.x != 0.0f || rotation.y != 0.0f || rotation.z != 0.0f))
+        throw std::invalid_argument("Procedural media and terrain require axis-aligned placement");
+
+    // Only a joint to another body makes a body parent-relative.
+    // A joint to the world still leaves its child at the scene root.
     std::vector<uint8_t> addon_is_joint_child(addon.Bodies().size(), 0u);
     for (const JointRecord& j : addon.Joints()) {
-        if (j.child_body != kInvalidBody &&
+        if (j.parent_body != kInvalidBody && j.child_body != kInvalidBody &&
             j.child_body < addon_is_joint_child.size()) {
             addon_is_joint_child[j.child_body] = 1u;
         }
@@ -89,6 +98,7 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         rec.name = PrefixName(addon_name_prefix, rec.name);
         rec.body_id = RemapId(rec.body_id, body_off);
         rec.material_id = RemapId(rec.material_id, mat_off);
+        if (src.body_id == kInvalidBody) rec.local_transform = placement * rec.local_transform;
         out.AddCollisionShape(std::move(rec));
     }
 
@@ -127,6 +137,7 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         CameraRecord rec = src;
         rec.name = PrefixName(addon_name_prefix, rec.name);
         rec.attached_body = RemapId(rec.attached_body, body_off);
+        if (src.attached_body == kInvalidBody) rec.local_transform = placement * rec.local_transform;
         out.AddCamera(std::move(rec));
     }
 
@@ -138,6 +149,7 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         LightRecord rec = src;
         rec.name = PrefixName(addon_name_prefix, rec.name);
         rec.attached_body = RemapId(rec.attached_body, body_off);
+        if (src.attached_body == kInvalidBody) rec.local_transform = placement * rec.local_transform;
         out.AddLight(std::move(rec));
     }
 
@@ -160,6 +172,70 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         out.AddContactPair(pair);
     }
 
+    for (const MediaRecord& src : addon.Media()) {
+        MediaRecord rec = src;
+        rec.name = PrefixName(addon_name_prefix, rec.name);
+        rec.render_material_id = RemapId(rec.render_material_id, mat_off);
+        rec.cable_line.slab.render_material_id = RemapId(rec.cable_line.slab.render_material_id, mat_off);
+        if (rec.kind == MediaRecord::Kind::Cloth && !rec.baked.Empty()) {
+            rec.cloth_mesh.local_transform = placement * rec.cloth_mesh.local_transform;
+            out.AddMedia(std::move(rec));
+            continue;
+        }
+        const auto offset = placement.position;
+        if ((!rec.baked.Empty() || !rec.render_skin.skin_mesh.Empty()) && offset.LengthSq() != 0.0f)
+            throw std::invalid_argument("Baked media require placement in their mesh asset");
+        rec.cloth_grid.origin += offset;
+        rec.tet_sphere.center += offset;
+        rec.fluid_box.min += offset;
+        rec.fluid_box.max += offset;
+        rec.cable_line.start += offset;
+        rec.cable_line.end += offset;
+        rec.pbf.walls_min += offset;
+        rec.pbf.walls_max += offset;
+        rec.pbf.floor_z += offset.z;
+        rec.mpm.floor_d += rec.mpm.floor_normal.Dot(offset);
+        for (auto& fill : rec.mpm_fills) {
+            fill.box.min += offset;
+            fill.box.max += offset;
+            fill.render_material_id = RemapId(fill.render_material_id, mat_off);
+        }
+        out.AddMedia(std::move(rec));
+    }
+    for (const TerrainRecord& src : addon.Terrain()) {
+        TerrainRecord rec = src;
+        rec.name = PrefixName(addon_name_prefix, rec.name);
+        rec.origin += placement.position;
+        rec.base_z += placement.position.z;
+        out.AddTerrain(std::move(rec));
+    }
+    for (const auto& initial : addon.InitialState()) {
+        auto state = initial.second;
+        state.root = placement * state.root;
+        out.InitialStateMut()[PrefixName(addon_name_prefix, initial.first)] = std::move(state);
+    }
+    if (addon.Settle().steps != 0 || !addon.Settle().holds.empty()) {
+        auto& settle = out.SettleMut();
+        if (settle.steps != 0 && (settle.steps != addon.Settle().steps || settle.dt != addon.Settle().dt))
+            throw std::invalid_argument("Composed scenes require matching settle steps and timestep");
+        settle.steps = addon.Settle().steps;
+        settle.dt = addon.Settle().dt;
+        for (auto hold : addon.Settle().holds) {
+            hold.dof_pattern = PrefixName(addon_name_prefix, hold.dof_pattern);
+            settle.holds.push_back(std::move(hold));
+        }
+    }
+    for (const ScriptRecord& src : addon.Scripts()) {
+        ScriptRecord rec = src;
+        rec.parent_path = PrefixName(addon_name_prefix, rec.parent_path);
+        if (!rec.parent_path.empty() && rec.parent_path.back() == '/') rec.parent_path.pop_back();
+        out.AddScript(std::move(rec));
+    }
+    if (addon.Environment().Authored()) {
+        out.EnvironmentMut() = addon.Environment();
+        if (out.Environment().shadow.enabled)
+            out.EnvironmentMut().shadow.center = placement.TransformPoint(addon.Environment().shadow.center);
+    }
     return out;
 }
 

@@ -121,7 +121,7 @@ void XpbdColoring::Build(Model* model) {
         cap.xpbd_dist_colors = nc;
     }
 
-    // BEND: 4 particles per constraint (bend_particles[4*c]; gradients[4*c]).
+    // Bend rows carry four particles and one signed rest angle.
     const uint32_t bn = static_cast<uint32_t>(mp.bend_alpha.size());
     if (bn > 0u) {
         std::vector<std::vector<uint32_t>> members(bn);
@@ -135,7 +135,7 @@ void XpbdColoring::Build(Model* model) {
         const std::vector<uint32_t> order =
             ColorOrder(color, nc, &model->bend_color_segments);
         Permute(mp.bend_particles, order, 4u);
-        Permute(mp.bend_gradients, order, 4u);
+        Permute(mp.bend_rest_angle, order, 1u);
         Permute(mp.bend_alpha, order, 1u);
         cap.xpbd_bend_colors = nc;
     }

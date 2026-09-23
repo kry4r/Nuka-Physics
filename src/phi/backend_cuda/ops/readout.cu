@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include "constraint/coulomb_contact.hpp"
 
 #include "nk/solve/collidable_owner.hpp"
 #include "phi/backend_cuda/launch.cuh"
@@ -370,6 +371,10 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     if (slot >= p.count) return;
     const uint32_t env = p.use_env_ids ? data.reset_env_ids[slot] : slot;
     if (env >= p.env_count) return;
+    for (uint32_t metric = threadIdx.x; metric < constraint::kContactSolveMetricCount; metric += blockDim.x)
+        data.contact_solve_metrics[env * constraint::kContactSolveMetricCount + metric] = 0u;
+    for (uint32_t count = threadIdx.x; count < constraint::kContactSolveCountSize; count += blockDim.x)
+        data.contact_solve_counts[env * constraint::kContactSolveCountSize + count] = 0u;
     const bool has_contact_index = p.base_link_count != 0u && p.lambda_stride != 0u && p.contact_slot_count != 0u;
     if (has_contact_index && threadIdx.x == 0u) {
         data.active_row_count[env] = 0u;

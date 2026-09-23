@@ -36,6 +36,129 @@ from nuka.author.materials import Soft
 
 SCENE = str(Path(__file__).resolve().parents[2] / "examples/scenes/go2_stand.usda")
 
+
+@pytest.mark.parametrize("perception", ["proprio", "rgbd", "terrain"])
+def test_g1_course_observations_checkpoint_and_policy(tmp_path, perception):
+    from nuka.tasks.g1_locomotion import G1VelocityActor
+    from nuka.tasks.g1_policy import G1FusionConfig, G1FusionPolicy
+    from nuka.tasks.g1_wading import G1WadingTask, WadingConfig
+
+    root = Path(__file__).resolve().parents[2]
+    assets = root / ".nuka-assets/generated/g1_coupled_course"
+    scene = Path(os.environ.get("NUKA_G1_PIPELINE_SCENE", str(assets / "dry.nks")))
+    policy_path = root / ".nuka-assets/policies/g1_velocity_v0/policy.onnx"
+    if not scene.is_file() or not policy_path.is_file():
+        pytest.skip("Build the G1 course and fetch its velocity policy before this acceptance check")
+    use_camera, use_terrain = perception == "rgbd", perception == "terrain"
+    camera = {"update_period": 2, "latency": 0.025, "latency_jitter": 0.01, "dropout_probability": 0.1}
+    if use_terrain:
+        camera.update(camera_name="terrain_rgbd", image_observation=False)
+    task = G1WadingTask(WadingConfig(scene=str(scene), manifest=str(scene.with_name("manifest.json")),
+        deployment=str(policy_path.with_name("deploy.yaml")), num_envs=2,
+        finish_x=-1.5, finish_speed_tolerance=1.0, finish_hold_seconds=0.6,
+        camera=camera if use_camera or use_terrain else None, terrain={} if use_terrain else None,
+        proprioception={"load_source": "motor_effort", "effort_noise_density": 0.0} if use_terrain else {}))
+    try:
+        prior = G1VelocityActor.from_onnx(policy_path, device=task.device)
+        policy = G1FusionPolicy(prior, G1FusionConfig(**task.policy_observation_contract())).to(task.device)
+        observation = task.observation()
+        world = task.controller.world
+        camera_name = "terrain_rgbd" if use_terrain else "policy_rgbd"
+        mounted = world.scene_camera(camera_name)
+        assert mounted["mount"] == nuka.SensorMount.LINK.value
+        assert mounted["near_clip"] == pytest.approx(0.08)
+        assert mounted["far_clip"] == pytest.approx(4.0 if use_terrain else 5.0)
+        with pytest.raises(RuntimeError):
+            world.scene_camera("missing_camera")
+        expected_keys = {"proprio", "tactile"}
+        if use_camera:
+            expected_keys |= {"rgb", "depth", "depth_valid", "frame_valid", "age"}
+        elif use_terrain:
+            expected_keys |= {"terrain", "frame_valid", "age"}
+            assert task.camera.rgb is None and policy.encoder is None
+            assert not task.controller.proprioception.feet
+        else:
+            assert task.camera is None and policy.encoder is None
+            assert world.sensor_width == world.sensor_height == 0
+        assert set(observation) == expected_keys
+        with torch.no_grad():
+            torch.testing.assert_close(policy(observation), prior(observation["proprio"]), rtol=0, atol=0)
+            for _ in range(6):
+                observation, reward, terminated, truncated, _ = task.step(policy(observation))
+                assert torch.isfinite(reward).all()
+                assert not (terminated | truncated).any()
+            assert task.controller.proprioception.valid.all()
+            assert torch.all(task.finish_streak == 6)
+            for env in range(task.num_envs):
+                pose = task.controller.link_pose[env, mounted["mount_index"]]
+                local = pose.new_tensor(mounted["local_offset"][:3])
+                rotated = local + 2 * torch.cross(pose[4:],
+                    pose[3] * local + torch.cross(pose[4:], local, dim=0), dim=0)
+                measured = pose.new_tensor(world.scene_camera(camera_name, env)["eye"])
+                torch.testing.assert_close(measured, pose[:3] + rotated, rtol=0, atol=1e-6)
+            frame = np.asarray(world.render_beauty(camera="follow", width=160, height=120, spp=2))
+            assert frame.shape == (120, 160, 3) and frame.std() > 5
+            if use_camera or use_terrain:
+                assert observation["frame_valid"].any()
+                assert torch.all(task.camera.depth[~task.camera.depth_valid] == 0)
+                assert torch.all(observation["age"][observation["frame_valid"]] >= 0.015 - 1e-6)
+            if use_terrain:
+                from nuka.kinematics import rotate_vector
+
+                grid = observation["terrain"][:, -1].float()
+                known = grid[:, -1].bool()
+                assert known.any() and (~known).any()
+                assert torch.all(grid[:, :4].permute(0, 2, 3, 1)[~known] == 0)
+                assert ((grid[:, 2] < -0.035) & (grid[:, 2] > -0.085)).any()
+                local = task.camera.projector.camera_pose()
+                base = task.controller.base
+                estimated_eye = base[:, :3] + rotate_vector(base[:, 3:], local[:, :3])
+                measured_eye = estimated_eye.new_tensor([world.scene_camera(camera_name, env)["eye"]
+                                                       for env in range(task.num_envs)])
+                torch.testing.assert_close(estimated_eye, measured_eye, rtol=0, atol=1e-4)
+                legs = [index for index, name in enumerate(task.controller.contract.joint_names)
+                        if any(part in name for part in ("hip_", "knee_", "ankle_"))]
+                expected_effort = task.controller.effort[:, task.controller.joint_slots[legs]]
+                torch.testing.assert_close(task.controller.proprioception.motor_effort, expected_effort, rtol=0, atol=1e-6)
+            with task.checkpoint() as checkpoint:
+                def run():
+                    results = []
+                    for _ in range(4):
+                        current = task.observation()
+                        observed, reward, done, timeout, _ = task.step(policy(current))
+                        results.append({**{key: value.clone() for key, value in observed.items()},
+                                        "reward": reward.clone(), "done": done.clone(), "timeout": timeout.clone(),
+                                        "finish_streak": task.finish_streak.clone()})
+                    return results
+                expected = run()
+                task.restore_checkpoint(checkpoint)
+                actual = run()
+                for before, after in zip(expected, actual):
+                    for key in before:
+                        torch.testing.assert_close(before[key], after[key], rtol=0, atol=1e-6,
+                                                   msg=lambda detail: f"{key}: {detail}")
+            preserved = {key: value[1].clone() for key, value in task.observation().items()}
+            task.reset(torch.tensor([0], device=task.device))
+            assert task.finish_streak.tolist() == [0, 10]
+            observation = task.observation()
+            for key, value in preserved.items():
+                torch.testing.assert_close(observation[key][1], value, rtol=0, atol=0, msg=key)
+            if use_camera or use_terrain:
+                assert not observation["frame_valid"][0].any()
+            assert not task.controller.proprioception.valid[0].any()
+            saved = tmp_path / "g1_policy.pt"
+            policy.save(saved, input_contract=task.metadata())
+            restored, _ = G1FusionPolicy.load(saved, device=task.device)
+            torch.testing.assert_close(restored(observation), policy(observation), rtol=0, atol=0)
+            traced = torch.jit.trace(policy.eval(), (observation,), strict=False)
+            torch.testing.assert_close(traced(observation), policy(observation), rtol=2e-5, atol=2e-5)
+            task.finish_hold_steps = 11
+            _, _, done, _, info = task.step(policy(observation))
+            assert done.tolist() == [False, True]
+            assert info["reached"].tolist() == [False, True]
+    finally:
+        task.close()
+
 # The Go2 (fixed base z=0.445) settles with its four foot spheres centred at z~0.2545
 # (front pair x~0.062, rear pair x~-0.325) -- the media sit just under the feet.
 FOOT_Z = 0.2545
@@ -137,8 +260,8 @@ def _check_imaging_responses(world, image):
     world.set_sensor_fidelity(spp=1, shadow_samples=1, ao_enabled=False, gi_enabled=False,
                               tonemap_enabled=False, srgb_enabled=False, seed=71)
     world.render_sensors()
-    ideal = image(color_channel).reshape(3, 2, 65, 65, 3)
-    truth = image(depth_channel).reshape(3, 2, 65, 65)
+    ideal = image(color_channel).reshape(world.env_count, -1, 65, 65, 3)
+    truth = image(depth_channel).reshape(ideal.shape[:-1])
     albedo = image(nuka.SensorChannel.ALBEDO).reshape(ideal.shape)
     positions = world.download_field(nuka.Field.PARTICLE_POSITION).copy()
     measured = lambda: image(color_channel).reshape(ideal.shape)[:, 0]
@@ -148,7 +271,7 @@ def _check_imaging_responses(world, image):
     assert not stamp(color_channel)["valid"]
     world.render_sensors()
     np.testing.assert_allclose(measured(), np.clip(ideal[:, 0], 0, 1), atol=2e-7, rtol=2e-7)
-    np.testing.assert_array_equal(image(color_channel).reshape(ideal.shape)[:, 1], ideal[:, 1])
+    np.testing.assert_array_equal(image(color_channel).reshape(ideal.shape)[:, 1:], ideal[:, 1:])
     assert stamp(color_channel)["acquisitions"] == 1
     assert stamp(color_channel)["sample_time"] == pytest.approx(0.002)
 
@@ -213,7 +336,7 @@ def _check_imaging_responses(world, image):
     expected_range = np.floor((truth[:, 0, 32, 32] * 1.01 + 0.004) / np.float32(0.0005) + 0.5) * np.float32(0.0005)
     np.testing.assert_allclose(image(depth_channel).reshape(truth.shape)[:, 0, 32, 32], expected_range, atol=2e-6)
     np.testing.assert_allclose(image(range_channel).ravel(), expected_range, atol=2e-6)
-    np.testing.assert_array_equal(image(depth_channel).reshape(truth.shape)[:, 1], truth[:, 1])
+    np.testing.assert_array_equal(image(depth_channel).reshape(truth.shape)[:, 1:], truth[:, 1:])
 
     nuka.RangeResponse(return_photons=2.0, seed=71).configure(world, depth_channel)
     world.render_sensors()
@@ -257,10 +380,14 @@ def _check_imaging_responses(world, image):
         expected_images = [image(channel) for channel in channels]
         expected_stamps = [[stamp(channel, env) for env in range(3)] for channel in channels]
         expected_hash = world.state_hash()
+        solve_metrics = world.download_field(nuka.Field.CONTACT_SOLVE_METRICS).copy()
+        solve_counts = world.download_field(nuka.Field.CONTACT_SOLVE_COUNTS).copy()
         nuka.CameraResponse(enabled=False).configure(world)
         nuka.RangeResponse(enabled=False).configure(world, range_channel)
         world.render_sensors()
         world.restore_checkpoint(checkpoint)
+        assert not np.any(world.download_field(nuka.Field.CONTACT_SOLVE_METRICS))
+        assert not np.any(world.download_field(nuka.Field.CONTACT_SOLVE_COUNTS))
         for view, saved in zip(views, first):
             np.testing.assert_array_equal(view.cpu().numpy(), saved)
         world.step()
@@ -269,6 +396,8 @@ def _check_imaging_responses(world, image):
             np.testing.assert_array_equal(image(channel), saved)
             assert [stamp(channel, env) for env in range(3)] == stamps
         assert world.state_hash() == expected_hash
+        np.testing.assert_array_equal(world.download_field(nuka.Field.CONTACT_SOLVE_METRICS), solve_metrics)
+        np.testing.assert_array_equal(world.download_field(nuka.Field.CONTACT_SOLVE_COUNTS), solve_counts)
     assert [view.data_ptr() for view in views] == addresses
     before_reset = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1).copy()
     world.reset_envs([1, 1])
@@ -297,10 +426,17 @@ def _check_imaging_responses(world, image):
 def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
     saved = str(tmp_path / "observed_surfaces.nks")
     recorded = []
-    with nuka.SceneBuilder.create() as builder:
-        builder.add_rigid_primitive(nuka.PRIMITIVE_PLANE)
+    Path(saved).write_text(json.dumps({"nks_version": 1, "tree": [
+        {"name": "key", "light": {"type": "directional", "local": {"quat": [1, 0, 0, 0]},
+                                  "color": [1, 1, 1], "intensity": 1}}
+    ]}), encoding="utf-8")
+    with nuka.SceneBuilder.create(saved) as builder:
+        builder.add_rigid_primitive(nuka.PRIMITIVE_BOX, dims=[4.0, 1.0, 0.05],
+                                    pos=[1.5, 0, -0.05], static=True)
         cloth_material = builder.add_material("cloth", base_color=[0.1, 0.7, 0.2])
         tet_material = builder.add_material("soft", base_color=[0.8, 0.1, 0.1])
+        water_material = builder.add_material("water", base_color=[0.2, 0.5, 0.8])
+        grain_material = builder.add_material("grains", base_color=[0.6, 0.4, 0.2])
         builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
                           cloth_nx=7, cloth_ny=7, cloth_spacing=0.08,
                           cloth_origin=[0.0, 0.0, 0.5], cloth_free=True,
@@ -312,14 +448,29 @@ def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
                           tet_cells=8, tet_cell_len=0.04,
                           xpbd_particle_mass=0.02, xpbd_iters=8,
                           render_material_id=tet_material)
+        builder.add_media(kind=nuka.MEDIA_FLUID, method=nuka.MEDIA_METHOD_MLSMPM,
+                          fluid_min=[1.48, -0.12, 0.38], fluid_max=[1.72, 0.12, 0.5],
+                          fluid_spacing=0.04, mpm_model_kind=3, mpm_bulk_modulus=2000,
+                          mpm_density=1000, mpm_dx=0.08, mpm_substeps=2, mpm_floor_d=-1,
+                          render_material_id=water_material)
+        for x, round_grains in ((2.4, 1), (3.2, 0)):
+            builder.add_media(kind=nuka.MEDIA_GRANULAR, method=nuka.MEDIA_METHOD_MLSMPM,
+                              fluid_min=[x-0.08, -0.08, 0.38], fluid_max=[x+0.08, 0.08, 0.5],
+                              fluid_spacing=0.04, mpm_youngs=1000, mpm_density=1400,
+                              mpm_dx=0.08, mpm_substeps=2, mpm_floor_d=-1,
+                              skin_grain_round=round_grains, skin_grain_radius_jitter=0.15,
+                              skin_grain_tint_jitter=0.2, render_material_id=grain_material)
         builder.save(saved)
+        document = json.loads(Path(saved).read_text())
+        document["render_materials"]["water"].update(transmission=1.0, ior=1.333)
+        Path(saved).write_text(json.dumps(document))
         for source in (builder, nuka.SceneBuilder.create(saved)):
             try:
                 with source.build(device, env_count=3, dt=0.001, gravity_z=0.0) as world:
                     world.set_gravity_z(0.0)
-                    for x in (0.0, 0.8):
+                    for x in (0.0, 0.8, 1.6, 2.42, 3.22):
                         world.attach_camera_sensor(nuka.SensorMount.WORLD.value, 0,
-                                                   (x, 0, 2, 1, 0, 0, 0), 30, 65, 65)
+                                                   (x, 0.02 if x > 2 else 0, 2, 1, 0, 0, 0), 30, 65, 65)
                     q = np.sqrt(0.5)
                     world.attach_lidar_sensor(nuka.SensorMount.WORLD.value, 0, (0, 0, 2, q, 0, q, 0),
                                               1, 1, 0, 0, 0, 0, max_range=10.0)
@@ -328,46 +479,72 @@ def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
                         return torch.from_dlpack(world.get_sensor_view(channel)).cpu().numpy().copy()
 
                     world.render_sensors()
-                    depth = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    depth_view = torch.from_dlpack(world.get_sensor_view(nuka.SensorChannel.DEPTH))
+                    depth_address = depth_view.data_ptr()
+                    depth = image(nuka.SensorChannel.DEPTH).reshape(3, 5, 65, 65)
                     np.testing.assert_allclose(depth[:, 0, 32, 32], 1.493, atol=2.0e-6)
                     assert np.all(depth[:, 1, 32, 32] < 1.45)
+                    assert np.all((depth[:, 2, 32, 32] > 1.44) & (depth[:, 2, 32, 32] < 1.58))
+                    assert np.all((depth[:, 3:, 32, 32] > 1.49) & (depth[:, 3:, 32, 32] < 1.51))
                     np.testing.assert_allclose(image(nuka.SensorChannel.RANGE).ravel(),
                                                depth[:, 0, 32, 32], atol=2.0e-6)
-                    albedo = image(nuka.SensorChannel.ALBEDO).reshape(3, 2, 65, 65, 3)
+                    albedo = image(nuka.SensorChannel.ALBEDO).reshape(3, 5, 65, 65, 3)
                     for env in range(3):
-                        np.testing.assert_allclose(albedo[env, :, 32, 32],
+                        np.testing.assert_allclose(albedo[env, :2, 32, 32],
                                                    [[0.1, 0.7, 0.2], [0.8, 0.1, 0.1]], atol=2.0e-6)
+                    nuka.RangeResponse(return_photons=1.0e6, seed=73).configure(
+                        world, nuka.SensorChannel.DEPTH)
+                    world.render_sensors()
+                    measured_water = image(nuka.SensorChannel.DEPTH).reshape(3, 5, 65, 65)
+                    assert np.isfinite(measured_water[:, 2, 32, 32]).all()
+                    nuka.RangeResponse(enabled=False).configure(world, nuka.SensorChannel.DEPTH)
                     recorded.append(depth.copy())
                     initial = world.download_field(nuka.Field.PARTICLE_POSITION).reshape(3, -1, 3).copy()
+                    body_pose = world.download_field(nuka.Field.RIGID_BODY_TRANSFORM).reshape(3, -1, 7).copy()
+                    np.testing.assert_allclose(body_pose[:, 0, :3], np.tile([1.5, 0, -0.05], (3, 1)), atol=1e-7)
                     velocity = np.zeros_like(initial)
                     velocity[:, :, 2] = np.array([0.1, 0.3, -0.1], dtype=np.float32)[:, None]
                     world.upload_field(nuka.Field.PARTICLE_VELOCITY, velocity)
                     world.set_execution_mode("graph")
                     world.step_n(8)
+                    np.testing.assert_array_equal(world.download_field(nuka.Field.RIGID_BODY_TRANSFORM).reshape(body_pose.shape), body_pose)
                     before_render = world.download_field(nuka.Field.PARTICLE_POSITION).copy()
                     world.render_sensors()
-                    moved = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    moved = image(nuka.SensorChannel.DEPTH).reshape(3, 5, 65, 65)
                     np.testing.assert_allclose(moved[:, 0, 32, 32],
                         depth[:, 0, 32, 32] - np.array([0.1, 0.3, -0.1]) * 0.008, atol=1.0e-5)
                     np.testing.assert_array_equal(world.download_field(nuka.Field.PARTICLE_POSITION), before_render)
                     tilted = initial.copy()
-                    tilted[:, :49, 2] += 0.1 * tilted[:, :49, 0] + 0.2 * tilted[:, :49, 1]
+                    cloth = np.abs(initial[0, :, 0]) < 0.3
+                    assert np.count_nonzero(cloth) == 49
+                    tilted[:, cloth, 2] += 0.1 * tilted[:, cloth, 0] + 0.2 * tilted[:, cloth, 1]
                     world.upload_field(nuka.Field.PARTICLE_POSITION, tilted)
                     world.render_sensors()
-                    tilted_depth = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    tilted_depth = image(nuka.SensorChannel.DEPTH).reshape(3, 5, 65, 65)
                     np.testing.assert_allclose(tilted_depth[:, 0, 32, 32],
                                                1.5 - 0.007 * np.sqrt(1.05), atol=3.0e-6)
-                    normal = image(nuka.SensorChannel.NORMAL).reshape(3, 2, 65, 65, 3)
+                    normal = image(nuka.SensorChannel.NORMAL).reshape(3, 5, 65, 65, 3)
                     for env in range(3):
                         np.testing.assert_allclose(normal[env, 0, 32, 32],
                                                    np.array([-0.1, -0.2, 1.0]) / np.sqrt(1.05), atol=3.0e-6)
                     world.render_sensors()
-                    np.testing.assert_array_equal(image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65), tilted_depth)
+                    np.testing.assert_array_equal(image(nuka.SensorChannel.DEPTH).reshape(3, 5, 65, 65), tilted_depth)
+                    dispersed = tilted.copy()
+                    water = (initial[0, :, 0] > 1.4) & (initial[0, :, 0] < 1.8)
+                    dispersed[1, water] = np.column_stack((
+                        1.6 + np.arange(np.count_nonzero(water))*0.25,
+                        np.zeros(np.count_nonzero(water)), np.full(np.count_nonzero(water), 0.4)))
+                    world.upload_field(nuka.Field.PARTICLE_POSITION, dispersed)
+                    world.render_sensors()
+                    empty = image(nuka.SensorChannel.DEPTH).reshape(3, 5, 65, 65)
+                    np.testing.assert_allclose(empty[1, 2, 32, 32], 2.0, atol=2e-6)
+                    np.testing.assert_array_equal(empty[[0, 2]], tilted_depth[[0, 2]])
                     world.reset_envs([1])
                     world.render_sensors()
-                    reset = image(nuka.SensorChannel.DEPTH).reshape(3, 2, 65, 65)
+                    reset = image(nuka.SensorChannel.DEPTH).reshape(3, 5, 65, 65)
                     np.testing.assert_array_equal(reset[1], depth[1])
                     np.testing.assert_array_equal(reset[[0, 2]], tilted_depth[[0, 2]])
+                    assert torch.from_dlpack(world.get_sensor_view(nuka.SensorChannel.DEPTH)).data_ptr() == depth_address
                     assert not np.any(world.download_field(nuka.ENV_STATUS))
                     _check_imaging_responses(world, image)
             finally:

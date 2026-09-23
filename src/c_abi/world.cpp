@@ -941,4 +941,54 @@ nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
     }
 }
 
+nuka_result_t nuka_world_get_kinematic_link(nuka_world_handle world,
+                                            uint32_t link_index, nuka_kinematic_link_t* out) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
+    try {
+        const auto& model = record->world->GetModel().articulation;
+        if (link_index >= model.parent_link.size()) return NUKA_RESULT_INVALID_ARG;
+        const uint32_t articulation = model.link_to_articulation.empty()
+            ? 0u : model.link_to_articulation.at(link_index);
+        const uint32_t offset = model.articulation_link_offset.empty()
+            ? 0u : model.articulation_link_offset.at(articulation);
+        const uint32_t parent = model.parent_link.at(link_index);
+        nuka_kinematic_link_t result{};
+        result.parent_index = parent == ~uint32_t(0) ? parent : parent + offset;
+        result.articulation_index = articulation;
+        result.local_pose[3] = 1.0f;
+        if (parent == ~uint32_t(0)) {
+            result.joint_type = NUKA_KINEMATIC_ROOT;
+        } else {
+            using nuka::phi::ArticulationJointType;
+            switch (static_cast<ArticulationJointType>(model.joint_type.at(link_index))) {
+                case ArticulationJointType::Fixed: result.joint_type = NUKA_KINEMATIC_FIXED; break;
+                case ArticulationJointType::Revolute: result.joint_type = NUKA_KINEMATIC_REVOLUTE; break;
+                case ArticulationJointType::Prismatic: result.joint_type = NUKA_KINEMATIC_PRISMATIC; break;
+                default: return NUKA_RESULT_NOT_SUPPORTED;
+            }
+            const auto& local = model.link_local_pose.at(link_index);
+            const auto translation = local.position + model.parent_offset.at(link_index);
+            const auto& axis = model.joint_axis.at(link_index);
+            result.local_pose[0] = translation.x;
+            result.local_pose[1] = translation.y;
+            result.local_pose[2] = translation.z;
+            result.local_pose[3] = local.rotation.w;
+            result.local_pose[4] = local.rotation.x;
+            result.local_pose[5] = local.rotation.y;
+            result.local_pose[6] = local.rotation.z;
+            result.axis[0] = axis.x;
+            result.axis[1] = axis.y;
+            result.axis[2] = axis.z;
+        }
+        *out = result;
+        return NUKA_RESULT_OK;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 } // extern "C"

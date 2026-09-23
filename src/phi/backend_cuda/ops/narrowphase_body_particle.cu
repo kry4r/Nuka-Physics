@@ -350,6 +350,7 @@ __global__ void NarrowphaseBodyParticleKernel(
     const math::Transform* __restrict__ body_pose,
     const float* __restrict__ hull_verts,
     const Vec3* __restrict__ particle_pos,
+    const Vec3* __restrict__ particle_prev_pos,
     const Vec3* __restrict__ pbf_predicted_pos,
     const cg::LbvhNode* __restrict__ lbvh_nodes,
     const Vec3* __restrict__ body_aabb_lo,
@@ -366,6 +367,7 @@ __global__ void NarrowphaseBodyParticleKernel(
     uint32_t* __restrict__ ucontact_a_kind,
     uint32_t* __restrict__ ucontact_b_kind,
     uint32_t* __restrict__ ucontact_gen,
+    uint32_t* __restrict__ ucontact_law,
     uint64_t* __restrict__ ucontact_id_pair,
     uint64_t* __restrict__ ucontact_id_feature,
     uint32_t* __restrict__ contact_count,
@@ -396,6 +398,7 @@ __global__ void NarrowphaseBodyParticleKernel(
             if (slot >= pp.slot_stride) break;
             const size_t cell = (static_cast<size_t>(env) * pp.slot_stride + slot) * 4u;
             ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = 0u;
+            ucontact_law[static_cast<size_t>(env) * pp.slot_stride + slot] = nk::kContactLawSpeculative;
             for (uint32_t i = 0u; i < 4u; ++i) {
                 upoint[cell + i] = {0, 0, 0}; unormal[cell + i] = {0, 0, 0};
                 udepth[cell + i] = 0.0f;
@@ -546,7 +549,9 @@ __global__ void NarrowphaseBodyParticleKernel(
                     if (i < n) {
                         upoint[scell + i] = m.points[i].position;
                         unormal[scell + i] = m.points[i].normal;
-                        udepth[scell + i] = m.points[i].penetration;
+                        // The solver advances from the interval start, while detection uses projected positions.
+                        const Vec3 projected_offset = center - particle_prev_pos[global_particle];
+                        udepth[scell + i] = m.points[i].penetration + m.points[i].normal.Dot(projected_offset);
                         // Side A == the particle (GLOBAL id + the particle index-kind
                         // tag); side B == the body collidable (env-local row + tag).
                         ucontact_a[scell + i] = global_particle;
@@ -596,7 +601,8 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
         return Status::Ok;  // no particles or no reserved slots -> nothing to do.
     }
     if (p->particle_radius <= 0.0f) return Status::Ok;  // no collision radius cooked.
-    if (data.particle_pos == nullptr || data.body_pose == nullptr ||
+    if (data.particle_pos == nullptr || data.particle_prev_pos == nullptr ||
+        data.ucontact_law == nullptr || data.body_pose == nullptr ||
         model.shape_table == nullptr) {
         return Status::Ok;
     }
@@ -615,6 +621,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
                    static_cast<const math::Transform*>(data.body_pose),
                    static_cast<const float*>(model.hull_verts),
                    static_cast<const Vec3*>(data.particle_pos),
+                   static_cast<const Vec3*>(data.particle_prev_pos),
                    static_cast<const Vec3*>(data.pbf_predicted_pos),
                    reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes),
                    static_cast<const Vec3*>(data.body_aabb_lo),
@@ -624,6 +631,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
                    data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                    data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                    data.ucontact_a_kind, data.ucontact_b_kind, data.ucontact_gen,
+                   data.ucontact_law,
                    data.ucontact_id_pair, data.ucontact_id_feature,
                    data.contact_count, data.env_status);
     };

@@ -8,7 +8,9 @@
 
 namespace nuka::sensor {
 
-enum class StateSensorKind : uint32_t { Imu, FramePose, JointState, LinearVelocity, ContactWrench, ForceTorque, Touch, Tactile };
+enum class StateSensorKind : uint32_t {
+    Imu, FramePose, JointState, LinearVelocity, ContactWrench, ForceTorque, Touch, Tactile, JointEffort
+};
 enum class StateSensorMount : uint32_t { Link, Body, Base };
 
 inline constexpr uint32_t kStateSensorErrorChannels = 6u;

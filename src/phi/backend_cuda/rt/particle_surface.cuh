@@ -111,6 +111,68 @@ inline void Check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 
+class SurfaceBuffer {
+public:
+    void Ensure(const RtContext& ctx, size_t bytes) {
+        if (bytes <= capacity_) return;
+        const size_t grown = capacity_ <= std::numeric_limits<size_t>::max() / 3u
+                                 ? capacity_ + capacity_ / 2u : bytes;
+        const size_t capacity = std::max(bytes, grown);
+        buffer_ = OwnedBuffer(ctx.device_bt, capacity);
+        capacity_ = capacity;
+    }
+    void* Data() const { return buffer_.Data(); }
+    void Upload(const RtContext& ctx, const void* data, size_t bytes) {
+        Ensure(ctx, bytes);
+        buffer_.CopyFromHost(data, bytes);
+    }
+
+private:
+    OwnedBuffer buffer_;
+    size_t capacity_ = 0u;
+};
+
+class SurfaceBvh {
+public:
+    void Update(const RtContext& ctx, const collision::AABB* bounds, uint32_t envs,
+                uint32_t leaves, bool topology_changed) {
+        const bool shape_changed = envs_ != envs || leaves_ != leaves;
+        if (shape_changed) {
+            Check(collision::gpu::QueryLbvhWorkspaceBytes(envs, leaves, &workspace_bytes_));
+            const uint64_t count = uint64_t{envs} * leaves;
+            nodes_.Ensure(ctx, uint64_t{envs} * (2u * leaves - 1u) * sizeof(collision::gpu::LbvhNode));
+            morton_.Ensure(ctx, count * sizeof(uint32_t));
+            indices_.Ensure(ctx, count * sizeof(uint32_t));
+            keys_.Ensure(ctx, count * sizeof(uint64_t));
+            visits_.Ensure(ctx, count * sizeof(uint32_t));
+            workspace_.Ensure(ctx, workspace_bytes_);
+        }
+        auto* nodes = static_cast<collision::gpu::LbvhNode*>(nodes_.Data());
+        auto* visits = static_cast<uint32_t*>(visits_.Data());
+        const bool rebuild = shape_changed || topology_changed || updates_ >= kRebuildPeriod;
+        if (rebuild) {
+            Check(collision::gpu::BuildLbvhBatchedNodes(ctx.stream, ctx.device_id, bounds,
+                envs, leaves, nodes, static_cast<uint32_t*>(morton_.Data()),
+                static_cast<uint32_t*>(indices_.Data()), static_cast<uint64_t*>(keys_.Data()),
+                visits, workspace_.Data(), workspace_bytes_));
+        } else {
+            collision::gpu::RefitLbvhBatched(ctx.stream, ctx.device_id, nodes, bounds,
+                                            envs, leaves, visits);
+        }
+        envs_ = envs;
+        leaves_ = leaves;
+        updates_ = rebuild ? 0u : updates_ + 1u;
+    }
+    const collision::gpu::LbvhNode* Nodes() const {
+        return static_cast<const collision::gpu::LbvhNode*>(nodes_.Data());
+    }
+
+private:
+    uint32_t envs_ = 0u, leaves_ = 0u, updates_ = 0u;
+    size_t workspace_bytes_ = 0u;
+    SurfaceBuffer nodes_, morton_, indices_, keys_, visits_, workspace_;
+};
+
 // Immutable adjacency preserves triangle and neighbor accumulation order without atomic sums.
 class SurfaceCache {
 public:
@@ -179,7 +241,6 @@ public:
         auto* normals = static_cast<math::Vec3*>(normals_.Data());
         auto* geometry = static_cast<math::Vec3*>(geometry_.Data());
         auto* bounds = static_cast<collision::AABB*>(bounds_.Data());
-        auto* nodes = static_cast<collision::gpu::LbvhNode*>(nodes_.Data());
         phi::LaunchCuda(LoadParticleSurfaceKernel, vertex_grid, dim3(kBlock), 0u,
                         ctx.stream, source, mesh, envs, positions);
         if (binding_.smooth_lambda > 0.0f) for (uint32_t pass = 0u; pass < binding_.smooth_iters; ++pass) {
@@ -192,21 +253,10 @@ public:
         phi::LaunchCuda(GatherParticleSurfaceKernel, dim3((envs * faces_ + kBlock - 1u) / kBlock),
             dim3(kBlock), 0u, ctx.stream, mesh, envs, positions, normals,
             binding_.normal_offset, geometry, bounds);
-        const bool rebuild = active_envs_ != envs || updates_ >= kRebuildPeriod;
-        if (rebuild) {
-            Check(collision::gpu::BuildLbvhBatchedNodes(ctx.stream, ctx.device_id, bounds,
-                envs, faces_, nodes, static_cast<uint32_t*>(morton_.Data()),
-                static_cast<uint32_t*>(indices_.Data()), static_cast<uint64_t*>(keys_.Data()),
-                static_cast<uint32_t*>(visits_.Data()), workspace_.Data(), workspace_bytes_));
-        } else {
-            collision::gpu::RefitLbvhBatched(ctx.stream, ctx.device_id, nodes, bounds,
-                envs, faces_, static_cast<uint32_t*>(visits_.Data()));
-        }
-        active_envs_ = envs;
-        updates_ = rebuild ? 0u : updates_ + 1u;
+        bvh_.Update(ctx, bounds, envs, faces_, false);
         phi::LaunchCuda(PublishParticleSurfaceKernel, dim3((envs + kBlock - 1u) / kBlock),
             dim3(kBlock), 0u, ctx.stream, mesh, envs, binding_.mesh_id, mesh_count,
-            static_cast<const DevPrim*>(primitives_.Data()), geometry, nodes, refs);
+            static_cast<const DevPrim*>(primitives_.Data()), geometry, bvh_.Nodes(), refs);
         Check(cudaPeekAtLastError());
     }
 
@@ -217,27 +267,19 @@ private:
         if (vertices > std::numeric_limits<uint32_t>::max() - kBlock ||
             faces > std::numeric_limits<uint32_t>::max() / 6u)
             throw std::invalid_argument("particle surface exceeds device index capacity");
-        Check(collision::gpu::QueryLbvhWorkspaceBytes(envs, faces_, &workspace_bytes_));
         positions_ = OwnedBuffer(ctx.device_bt, vertices * sizeof(math::Vec3));
         next_ = OwnedBuffer(ctx.device_bt, vertices * sizeof(math::Vec3));
         normals_ = OwnedBuffer(ctx.device_bt, vertices * sizeof(math::Vec3));
         geometry_ = OwnedBuffer(ctx.device_bt, faces * 6u * sizeof(math::Vec3));
         bounds_ = OwnedBuffer(ctx.device_bt, faces * sizeof(collision::AABB));
-        nodes_ = OwnedBuffer(ctx.device_bt, uint64_t{envs} * (2u * faces_ - 1u) * sizeof(collision::gpu::LbvhNode));
-        morton_ = OwnedBuffer(ctx.device_bt, faces * sizeof(uint32_t));
-        indices_ = OwnedBuffer(ctx.device_bt, faces * sizeof(uint32_t));
-        keys_ = OwnedBuffer(ctx.device_bt, faces * sizeof(uint64_t));
-        visits_ = OwnedBuffer(ctx.device_bt, faces * sizeof(uint32_t));
-        if (workspace_bytes_) workspace_ = OwnedBuffer(ctx.device_bt, workspace_bytes_);
         capacity_envs_ = envs;
-        active_envs_ = 0u;
     }
 
     ParticleSurfaceBinding binding_;
-    uint32_t vertices_ = 0u, faces_ = 0u, capacity_envs_ = 0u, active_envs_ = 0u, updates_ = 0u;
-    size_t workspace_bytes_ = 0u;
+    uint32_t vertices_ = 0u, faces_ = 0u, capacity_envs_ = 0u;
+    SurfaceBvh bvh_;
     OwnedBuffer particles_, triangles_, primitives_, neighbor_offsets_, neighbors_, incident_offsets_, incident_;
-    OwnedBuffer positions_, next_, normals_, geometry_, bounds_, nodes_, morton_, indices_, keys_, visits_, workspace_;
+    OwnedBuffer positions_, next_, normals_, geometry_, bounds_;
 };
 
 }  // namespace nuka::rt::particle_surface_detail

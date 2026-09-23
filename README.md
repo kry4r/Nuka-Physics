@@ -98,6 +98,8 @@
 </tr>
 </table>
 
+Material demos load the shared [Nuka Dynamics Lab assets](docs/nuka-stage.md), with a layered experiment deck, warm grey panels and avocado green accents. Layouts, materials, lights and cameras are editable in NKS. Existing gallery recordings retain their recorded environment and physics.
+
 ## Why Nuka
 
 - **GPU-resident at scale.** One cooked world template drives thousands of independent environments on one GPU.

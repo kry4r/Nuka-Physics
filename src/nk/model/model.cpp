@@ -149,6 +149,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::ParticleSurfaceTree) return particle_surface_nodes_per_env;
         if (id == FieldId::ParticleSurfaceNodes)
             return point_endpoints_per_env > 0u ? CheckedProduct({particle_surface_nodes_per_env, env_count}) : 0u;
+        if (id == FieldId::ParticleSurfaceMaxSpeed)
+            return point_endpoints_per_env > 0u ? CheckedProduct({particle_surfaces_per_env, env_count}) : 0u;
         if (id == FieldId::PointEndpointRanges) return CheckedProduct({point_endpoints_per_env, env_count});
         if (id == FieldId::PointEndpointTerms) return CheckedProduct({point_endpoint_terms_per_env, env_count});
         if (id == FieldId::GridNeighborIdx)
@@ -235,12 +237,14 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return 0u;  // Force and single-owner projection buffers have no consumers.
         }
         if (id == FieldId::GridMass || id == FieldId::GridMomentum ||
-            id == FieldId::GridVelocity || id == FieldId::GridInvMass ||
-            id == FieldId::CcGridFirst || id == FieldId::GridContactCount ||
-            id == FieldId::GridContactOffset) {
+            id == FieldId::GridVelocity || id == FieldId::GridPseudoVel ||
+            id == FieldId::GridInvMass ||
+            id == FieldId::CcGridFirst) {
             return static_cast<uint64_t>(mpm_grid_nodes_per_env) *
                    static_cast<uint64_t>(env_count);
         }
+        if (id == FieldId::GridContactCount || id == FieldId::GridContactOffset)
+            return mpm_grid_nodes_per_env > 0u ? CheckedProduct({particles_per_env, env_count}) : 0u;
         // MLS-MPM P2G deterministic-gather scratch (u8 bytes): sized by World
         // construct; 0 for a non-MPM world.
         if (id == FieldId::MpmSortScratch) {
@@ -738,21 +742,10 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
-        case FieldId::BendGradients: {
-            auto* p = reinterpret_cast<math::Vec3*>(dst);
-            const uint32_t bn = capacities.bend_cons_per_env;
-            for (uint32_t e = 0; e < E; ++e) {
-                for (uint32_t c = 0; c < bn; ++c) {
-                    for (uint32_t j = 0; j < 4u; ++j) {
-                        const size_t si = static_cast<size_t>(c) * 4u + j;
-                        if (si >= particles.bend_gradients.size()) continue;
-                        p[(static_cast<size_t>(e) * bn + c) * 4u + j] =
-                            particles.bend_gradients[si];
-                    }
-                }
-            }
+        case FieldId::BendRestAngle:
+            StampPerLink(dst, particles.bend_rest_angle, capacities.bend_cons_per_env, E,
+                         sizeof(float));
             break;
-        }
         case FieldId::BendCompliance:
             StampPerLink(dst, particles.bend_alpha, capacities.bend_cons_per_env, E,
                          sizeof(float));
@@ -1052,7 +1045,7 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::DistRestLength:        v.dist_rest_length = static_cast<float*>(p); break;
         case FieldId::DistCompliance:        v.dist_compliance = static_cast<float*>(p); break;
         case FieldId::BendParticles:         v.bend_particles = static_cast<uint32_t*>(p); break;
-        case FieldId::BendGradients:         v.bend_gradients = static_cast<math::Vec3*>(p); break;
+        case FieldId::BendRestAngle:         v.bend_rest_angle = static_cast<float*>(p); break;
         case FieldId::BendCompliance:        v.bend_compliance = static_cast<float*>(p); break;
         case FieldId::VolParticles:          v.vol_particles = static_cast<uint32_t*>(p); break;
         case FieldId::VolRestTimes6:         v.vol_rest_times6 = static_cast<float*>(p); break;
@@ -1090,14 +1083,15 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
         if (mpm_contact_capacity_per_env > max_contacts_per_env)
             throw std::invalid_argument("grid contact pool exceeds contact capacity");
         if (mpm_grid_nodes_per_env > 0u &&
-            (CheckedProduct({mpm_grid_nodes_per_env, env_count}) > nk::kContactHandleMask ||
+            (CheckedProduct({particles_per_env, env_count}) > nk::kContactHandleMask ||
              CheckedProduct({env_count, kMpmBoundaryCount}) > nk::kContactHandleMask ||
              CheckedProduct({particle_surfaces_per_env, env_count}) > nk::kContactHandleMask))
             throw std::invalid_argument("grid contact identity exceeds handle range");
-        if (mpm_grid_nodes_per_env > 0u && particle_surfaces_per_env > 0u &&
-            (point_endpoints_per_env < mpm_contact_capacity_per_env ||
-             uint64_t{point_endpoint_terms_per_env} < uint64_t{mpm_contact_capacity_per_env} * kTriangleEndpointTerms))
-            throw std::invalid_argument("grid surface contacts exceed point endpoint capacity");
+        const uint32_t surface_contacts = particle_surfaces_per_env > 0u ? mpm_contact_capacity_per_env : 0u;
+        if (mpm_grid_nodes_per_env > 0u &&
+            (point_endpoints_per_env < MpmPointEndpointCount(particles_per_env, surface_contacts) ||
+             point_endpoint_terms_per_env < MpmPointEndpointTermCount(particles_per_env, surface_contacts)))
+            throw std::invalid_argument("material contacts exceed point endpoint capacity");
         const auto int_limit = static_cast<uint64_t>(std::numeric_limits<int>::max());
         if (links_per_env != 0u && CheckedProduct({max_rows_per_env, env_count, 2u}) > int_limit)
             throw std::invalid_argument("contact endpoints exceed device sort index range");
@@ -1299,7 +1293,7 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     if (p.dist_a.size() != p.dist_b.size() || p.dist_a.size() != p.dist_rest.size() ||
         p.dist_a.size() != p.dist_alpha.size() || p.dist_a.size() > cap.dist_cons_per_env ||
         p.bend_particles.size() != p.bend_alpha.size() * 4ull ||
-        p.bend_gradients.size() != p.bend_particles.size() || p.bend_alpha.size() > cap.bend_cons_per_env ||
+        p.bend_rest_angle.size() != p.bend_alpha.size() || p.bend_alpha.size() > cap.bend_cons_per_env ||
         p.vol_particles.size() != p.vol_alpha.size() * 4ull || p.vol_rest6.size() != p.vol_alpha.size() ||
         p.vol_alpha.size() > cap.vol_cons_per_env)
         return reject(Status::InvalidArgument, "incomplete particle constraint tables");

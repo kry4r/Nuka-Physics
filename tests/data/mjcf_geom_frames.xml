@@ -1,0 +1,18 @@
+<mujoco model="geometry_frames">
+  <compiler angle="degree"/>
+  <default>
+    <geom type="capsule" size="0.02 0.15"/>
+    <default class="segment">
+      <geom size="0.01" fromto="-0.2 0 0.1 0.2 0 0.1"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="root" pos="0 0 1">
+      <freejoint name="root_free"/>
+      <inertial mass="1" pos="0 0 0" diaginertia="0.1 0.1 0.1"/>
+      <geom name="inherited_segment" class="segment"/>
+      <geom name="rotated_segment" pos="0 0.3 0" euler="0 90 0"/>
+      <geom name="explicit_segment" class="segment" size="0.03" fromto="0 0 0 0 0.3 0.4"/>
+    </body>
+  </worldbody>
+</mujoco>

@@ -1,0 +1,43 @@
+prior: .nuka-assets/policies/g1_velocity_v0/policy.onnx
+task:
+  scene: .nuka-assets/generated/g1_coupled_course/wading.nks
+  deployment: .nuka-assets/policies/g1_velocity_v0/deploy.yaml
+  manifest: .nuka-assets/generated/g1_coupled_course/manifest.json
+  num_envs: 2
+  dt: 0.002
+  execution: graph
+  episode_seconds: 35.0
+  finish_x: 8.25
+  finish_hold_seconds: 0.6
+  commands: [0.4, 0.0, 0.0]
+  seed: 20260915
+  proprioception:
+    load_source: motor_effort
+  camera:
+    camera_name: terrain_rgbd
+    width: 192
+    height: 144
+    update_period: 2
+    history_length: 3
+    image_observation: true
+    latency: 0.02
+    latency_jitter: 0.005
+    dropout_probability: 0.02
+  terrain: {}
+fusion:
+  latent_dim: 96
+  residual_scale: 1.0
+  initial_std: 0.15
+ppo:
+  iterations: 300
+  horizon: 128
+  update_epochs: 4
+  minibatch: 256
+  learning_rate: 0.0001
+  minimum_learning_rate: 0.000001
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip: 0.2
+  target_kl: 0.02
+  entropy: 0.0
+  save_every: 10

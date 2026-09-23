@@ -383,9 +383,11 @@ __global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state) {
         float parent_velocity[6] = {};
         if (parent != kInvalidLink) SpatialToArray(state.link_velocity[offset + parent], parent_velocity);
         float velocity[6];
-        TransformMotion(state.link_xup[link], parent_velocity, velocity);
+        TransformMotion(JointTransform(state, link), parent_velocity, velocity);
+        float subspace[6];
+        MotionSubspaceForJoint(state.joint_type[link], state.joint_axis[link], subspace);
         for (uint32_t component = 0u; component < 6u; ++component)
-            velocity[component] += state.joint_motion_subspace[link].s[component] * state.qdot[link];
+            velocity[component] += subspace[component] * state.qdot[link];
         ArrayToSpatial(velocity, &state.link_velocity[link]);
     }
 }
@@ -1447,7 +1449,8 @@ Status OpFkLinkVelocities(const ModelView& model, const DataView& data,
     if (p->articulation_count == 0u || p->total_link_count == 0u) return Status::Ok;
     if (!model.articulation_link_offset || !model.articulation_link_count ||
         !model.parent_link || !model.joint_type || !data.link_velocity || !data.qdot ||
-        !data.link_xup || !data.joint_motion_subspace) return Status::InvalidArgument;
+        !data.q || !model.joint_axis || !model.link_local_pose || !model.parent_offset)
+        return Status::InvalidArgument;
     const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
     LaunchCuda(FkLinkVelocitiesKernel, dim3(p->articulation_count), dim3(32u),
                0u, stream, state);

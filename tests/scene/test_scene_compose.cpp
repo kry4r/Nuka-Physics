@@ -208,6 +208,15 @@ TEST(SceneCompose, RootGetsPlacementComposedTransform) {
     const Transform& childGot = out.GetBody(static_cast<BodyId>(boff + 1)).local_transform;
     EXPECT_TRUE(TransformsNear(childGot, childOrig))
         << "non-root addon body local transform must be unchanged";
+
+    SceneIR floating_addon = addon;
+    JointRecord free_joint;
+    free_joint.type = JointType::Free;
+    free_joint.child_body = 0u;
+    floating_addon.AddJoint(free_joint);
+    const auto floating = Compose(base, floating_addon, placement);
+    EXPECT_TRUE(TransformsNear(floating.GetBody(static_cast<BodyId>(boff)).local_transform, expected));
+    EXPECT_TRUE(TransformsNear(floating.GetBody(static_cast<BodyId>(boff + 1u)).local_transform, childOrig));
 }
 
 // ---------------------------------------------------------------------------

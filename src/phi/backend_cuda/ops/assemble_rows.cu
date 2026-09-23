@@ -200,7 +200,24 @@ __global__ void ComputeContactChainJacobianKernel(
     }
 }
 
-// (3) Per-contact effective mass m_eff = 1 / (J M^-1 J^T). One thread / contact.
+// Merge repeated articulation owners before inversion to retain exact force cancellation.
+__global__ void MergeSharedArticulationJacobianKernel(
+    const NkRow* __restrict__ rows, uint32_t count, uint32_t dof_stride,
+    float* __restrict__ jacobian, float* __restrict__ jacobian_b) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= count) return;
+    const NkRow& contact = rows[row];
+    if (!(contact.flags & nk::nk_row_flags::kActive) ||
+        contact.a.kind != kNkSideArtic || contact.b.kind != kNkSideArtic ||
+        contact.a.index != contact.b.index) return;
+    const size_t base = static_cast<size_t>(row) * dof_stride;
+    for (uint32_t i = 0u; i < dof_stride; ++i) {
+        jacobian[base + i] += jacobian_b[base + i];
+        jacobian_b[base + i] = 0.0f;
+    }
+}
+
+// Per-contact effective mass m_eff = 1 / (J M^-1 J^T).
 __global__ void ComputeContactEffectiveMassKernel(ArticulationDeviceState state,
                                                   const uint32_t* contact_link_indices,
                                                   const float* chain_jacobian,
@@ -462,6 +479,7 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
             return ~0u;
         for (uint32_t i = 0u; i < range.count; ++i) {
             const auto& term = terms[range.first + i];
+            if (i > 0u && terms[range.first + i - 1u].Key() >= term.Key()) return ~0u;
             if (term.kind != kNkSideParticle && term.kind != kNkSideGrid) return ~0u;
             const uint32_t stride = term.kind == kNkSideGrid ? grid_nodes_per_env : particles_per_env;
             if (term.index < uint64_t{env} * stride || term.index >= uint64_t{env + 1u} * stride) return ~0u;
@@ -557,7 +575,8 @@ __global__ void EmitPairDrivenRowsKernel(
 
     uint32_t n_active = ucontact_count[gid];
     const uint32_t law = ucontact_law != nullptr ? ucontact_law[gid] : nk::kContactLawCompliant;
-    const bool velocity_only = law == nk::kContactLawVelocity;
+    const bool speculative = law == nk::kContactLawSpeculative;
+    const bool velocity_only = law == nk::kContactLawVelocity || speculative;
 
     // Resolve the two sides ONCE per slot (same a/b for every manifold point).
     uint32_t kind_a = kNkSideStatic, kind_b = kNkSideStatic;
@@ -680,20 +699,23 @@ __global__ void EmitPairDrivenRowsKernel(
                 const float pos = -ucontact_depth[mp];
                 // Geometric penetration (positive when overlapping) for the
                 // split-impulse position pass; the velocity solve uses aref.
-                row_penetration[rs] = fmaxf(ucontact_depth[mp], 0.0f);
+                row_penetration[rs] = speculative ? ucontact_depth[mp] : fmaxf(ucontact_depth[mp], 0.0f);
                 constraint::CompliantContactRow compliant{};
                 if (!velocity_only)
                     compliant = constraint::ComputeCompliantRow(solref, solimp, pos, pos,
                         /*vel=*/0.0f, /*invweight=*/1.0f, dt, /*refsafe=*/true);
                 row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kContactNormal;
                 if (merged.condim == 3u) row.flags |= nk::nk_row_flags::kBlockNormal;
-                if (velocity_only) row.flags |= nk::nk_row_flags::kVelocityOnly;
+                if (law == nk::kContactLawVelocity) row.flags |= nk::nk_row_flags::kVelocityOnly;
+                if (speculative) row.flags |= nk::nk_row_flags::kSpeculative;
                 row.group_first = base;
                 row.group_normal_count = points_per_slot;
                 row.env = env;
                 // Cap aref so the target separating velocity aref*dt <=
                 // baumgarte_max_velocity (+inf default => byte-identical): bounded recovery.
                 row.rhs = fminf(compliant.aref_bias, baumgarte_max_velocity / dt);
+                // Gap closure belongs to physical velocity; overlap recovery adds no kinetic energy.
+                if (speculative) row.rhs = fminf(ucontact_depth[mp], 0.0f) / (dt * dt);
                 row_damping[rs] = compliant.damping;
                 row.compliance_alpha = compliant.R;
                 row.lower = 0.0f;
@@ -1069,7 +1091,7 @@ __global__ void ComputeRowMeffPairDrivenKernel(
         row_minv_jt_b, body_inv_mass, body_world_inv_inertia, point_masses,
         dof_stride);
     if ((row.flags & nk::nk_row_flags::kContactNormal) &&
-        !(row.flags & nk::nk_row_flags::kVelocityOnly)) {
+        !(row.flags & (nk::nk_row_flags::kVelocityOnly | nk::nk_row_flags::kSpeculative))) {
         // Scale impedance by J*M^-1*J^T so compliance is independent of mass units.
         row.compliance_alpha *= fmaxf(diagonal, 0.0f);
         const float initial_velocity = ContactReferenceVelocity(
@@ -1554,6 +1576,10 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const math::Vec3*>(data.row_cj_point_b),
                    static_cast<const math::Vec3*>(data.row_cj_dir_b),
                    total_rows, p->max_dof, data.chain_jacobian_b);
+
+        LaunchCuda(MergeSharedArticulationJacobianKernel, dim3(blocks), dim3(kBlockSize),
+                   0u, stream, reinterpret_cast<const NkRow*>(data.urows),
+                   total_rows, p->max_dof, data.chain_jacobian, data.chain_jacobian_b);
 
         // K4a: w = M^-1 J^T for side A and side B.
         const uint32_t wtotal = total_rows * p->max_dof;

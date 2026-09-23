@@ -131,7 +131,8 @@ cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
     }
     for (const auto& bc : cs.bend) {
         cook::CookBendCon c;
-        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
+        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
+        c.rest_angle = bc.rest_angle;
         c.compliance_alpha = bc.compliance_alpha;
         in.bend.push_back(c);
     }

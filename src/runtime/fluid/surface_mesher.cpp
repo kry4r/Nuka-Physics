@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 namespace nuka::runtime::fluid {
@@ -614,6 +615,17 @@ float DensityAtAniso(const math::Vec3& x, const std::vector<AnisoKernel>& ker,
 }
 
 }  // namespace
+
+FluidSurfaceParams DensitySurfaceParams(float spacing) {
+    if (!(spacing > 0.0f) || !std::isfinite(spacing))
+        throw std::invalid_argument("density surface requires positive finite spacing");
+    FluidSurfaceParams params;
+    params.h = 2.0f * spacing;
+    params.cell_size = 0.5f * spacing;
+    params.particle_mass = spacing * spacing * spacing;
+    params.rest_density_rho0 = 1.0f;
+    return params;
+}
 
 render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_positions,
                                        const FluidSurfaceParams& p) {

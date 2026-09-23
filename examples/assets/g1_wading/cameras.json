@@ -1,0 +1,34 @@
+{
+  "cameras": [
+    {
+      "name": "terrain_rgbd",
+      "attached_body": "torso_link",
+      "eye": [0.16, 0.0, 0.43],
+      "look": [0.7335764364, 0.0, -0.3891520443],
+      "vertical_fov_degrees": 70.0,
+      "near_clip": 0.08,
+      "far_clip": 4.0,
+      "shadow_radius": 0.0
+    },
+    {
+      "name": "policy_rgbd",
+      "attached_body": "torso_link",
+      "eye": [0.1, 0.0, 0.43],
+      "look": [0.9191520443, 0.0, -0.1435764364],
+      "vertical_fov_degrees": 65.0,
+      "near_clip": 0.08,
+      "far_clip": 5.0,
+      "shadow_radius": 0.0
+    },
+    {
+      "name": "follow",
+      "attached_body": "pelvis",
+      "eye": [2.1, -2.4, 0.9],
+      "look": [0.0, 0.0, -0.1],
+      "vertical_fov_degrees": 40.0,
+      "near_clip": 0.02,
+      "far_clip": 50.0,
+      "shadow_radius": 2.5
+    }
+  ]
+}

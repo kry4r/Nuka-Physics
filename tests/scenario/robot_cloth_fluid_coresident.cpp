@@ -61,11 +61,12 @@ using PipelineState = std::vector<std::vector<uint8_t>>;
 PipelineState ReadPipelineState(nk::World& world) {
     PipelineState state;
     for (auto field : {nk::FieldId::BasePose, nk::FieldId::Q, nk::FieldId::Qdot,
-                      nk::FieldId::LinkVelocity, nk::FieldId::BodyPose,
+                      nk::FieldId::LinkPose, nk::FieldId::LinkVelocity, nk::FieldId::BodyPose,
                       nk::FieldId::BodyLinearVelocity, nk::FieldId::BodyAngularVelocity,
                       nk::FieldId::ParticlePos,
                       nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel,
-                      nk::FieldId::ContactForce, nk::FieldId::LinkContactWrench}) {
+                      nk::FieldId::ContactForce, nk::FieldId::LinkContactWrench,
+                      nk::FieldId::ContactSolveMetrics, nk::FieldId::ContactSolveCounts}) {
         const auto& segments = world.GetData().Segments();
         const auto segment = std::find_if(segments.begin(), segments.end(),
             [field](const auto& value) { return value.field == field; });
@@ -84,6 +85,8 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     const auto fixture = Prepare(Go2ScenePath(), backend.dev, backend.backend, Cfg());
     constexpr uint32_t envs = 3u;
+    auto diagnostics_config = Cfg();
+    diagnostics_config.measure_contact_residual = true;
     for (uint32_t mode = 0u; mode < 6u; ++mode) {
         SCOPED_TRACE(::testing::Message() << "control mode=" << mode);
         auto make_model = [&] {
@@ -92,8 +95,8 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
             model.osc_task_link = 3u;
             return model;
         };
-        nk::World eager(make_model(), envs, backend.dev, backend.backend, Cfg());
-        nk::World graph(make_model(), envs, backend.dev, backend.backend, Cfg());
+        nk::World eager(make_model(), envs, backend.dev, backend.backend, diagnostics_config);
+        nk::World graph(make_model(), envs, backend.dev, backend.backend, diagnostics_config);
         ASSERT_TRUE(eager.Ready()) << eager.CreationError();
         ASSERT_TRUE(graph.Ready()) << graph.CreationError();
         nuka::sensor::Observation observation;
@@ -112,7 +115,7 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
         imu.update_period = 2u;
         imu.latency = Cfg().dt;
         imu.errors[0] = sensor_config;
-        uint32_t imu_id, joint_id, pose_id;
+        uint32_t imu_id, joint_id, pose_id, motor_id;
         ASSERT_EQ(graph.AttachStateSensor(imu, &imu_id), nphi::Status::Ok);
         auto joint = imu;
         joint.kind = nuka::sensor::StateSensorKind::JointState;
@@ -122,6 +125,9 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
         joint.latency = 0.0;
         joint.errors[0] = {};
         ASSERT_EQ(graph.AttachStateSensor(joint, &joint_id), nphi::Status::Ok);
+        auto motor = joint;
+        motor.kind = nuka::sensor::StateSensorKind::JointEffort;
+        ASSERT_EQ(graph.AttachStateSensor(motor, &motor_id), nphi::Status::Ok);
         auto pose = joint;
         pose.kind = nuka::sensor::StateSensorKind::FramePose;
         pose.errors[3].error.noise_density = 0.001f;
@@ -196,14 +202,22 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
                 for (float value : values) ASSERT_TRUE(std::isfinite(value));
             }
             std::vector<float> joint_values(envs * 2u), pose_values(envs * 7u), q(targets.size()), qdot(targets.size());
+            std::vector<float> motor_values(envs), effort(targets.size());
+            ASSERT_EQ(graph.StateSensors().Download(motor_id, motor_values.data(), motor_values.size() * sizeof(float)), nphi::Status::Ok);
+            ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::ActuatorEffort, effort.data(), effort.size() * sizeof(float)));
             ASSERT_EQ(graph.StateSensors().Download(joint_id, joint_values.data(), joint_values.size() * sizeof(float)), nphi::Status::Ok);
             ASSERT_EQ(graph.StateSensors().Download(pose_id, pose_values.data(), pose_values.size() * sizeof(float)), nphi::Status::Ok);
             ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::Q, q.data(), q.size() * sizeof(float)));
             ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::Qdot, qdot.data(), qdot.size() * sizeof(float)));
+            ASSERT_TRUE(graph.GetData().DownloadField(nk::FieldId::LinkPose, poses.data(), poses.size() * sizeof(Transform)));
             for (uint32_t env = 0u; env < envs; ++env) {
                 const auto link = env * graph.GetModel().capacities.links_per_env + 2u;
                 EXPECT_EQ(joint_values[env * 2u], q[link]);
                 EXPECT_EQ(joint_values[env * 2u + 1u], qdot[link]);
+                EXPECT_EQ(motor_values[env], effort[link]);
+                EXPECT_NEAR(pose_values[env * 7u], poses[link].position.x, 1.0e-7f);
+                EXPECT_NEAR(pose_values[env * 7u + 1u], poses[link].position.y, 1.0e-7f);
+                EXPECT_NEAR(pose_values[env * 7u + 2u], poses[link].position.z, 1.0e-7f);
                 float norm = 0.0f;
                 for (uint32_t axis = 3u; axis < 7u; ++axis) norm += pose_values[env * 7u + axis] * pose_values[env * 7u + axis];
                 EXPECT_NEAR(norm, 1.0f, 2.0e-6f);
@@ -300,15 +314,9 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
     ASSERT_EQ(graph.SetExecutionMode(nk::World::ExecutionMode::Graph), nphi::Status::Ok);
     double pair_impulse[envs][4][4]{};
     bool shared_island[envs]{};
-    auto category = [](uint32_t kind) {
-        if (kind == nk::kNkSideRigid) return 0u;
-        if (kind == nk::kNkSideArtic) return 1u;
-        if (kind == nk::kNkSideParticle || kind == nk::kNkSidePointEndpoint) return 2u;
-        if (kind == nk::kNkSideGrid) return 3u;
-        return 4u;
-    };
-    for (uint32_t step = 0u; step < 32u; ++step) {
-        if (step == 16u) {
+    constexpr uint32_t frames = 64u;
+    for (uint32_t step = 0u; step < frames; ++step) {
+        if (step == frames / 2u) {
             const auto before = ReadContactValues<Vec3>(graph, nk::FieldId::ParticlePos);
             for (auto* world : {&eager, &graph, &conservative}) ASSERT_EQ(world->Reset({1u}), nphi::Status::Ok);
             const auto after = ReadContactValues<Vec3>(graph, nk::FieldId::ParticlePos);
@@ -342,6 +350,18 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
         const auto rows = ReadContactValues<nk::NkRow>(graph, nk::FieldId::Urows);
         const auto lambda = ReadContactValues<float>(graph, nk::FieldId::Lambda);
         const auto roots = ReadContactValues<uint32_t>(graph, nk::FieldId::CcRoot);
+        const auto ranges = ReadContactValues<nk::PointEndpointRange>(graph, nk::FieldId::PointEndpointRanges);
+        const auto terms = ReadContactValues<nk::PointEndpointTerm>(graph, nk::FieldId::PointEndpointTerms);
+        const auto category = [&](const nk::NkRowSide& side) {
+            uint32_t kind = side.kind;
+            if (kind == nk::kNkSidePointEndpoint && ranges[side.index].count > 0u)
+                kind = terms[ranges[side.index].first].kind;
+            if (kind == nk::kNkSideRigid) return 0u;
+            if (kind == nk::kNkSideArtic) return 1u;
+            if (kind == nk::kNkSideParticle) return 2u;
+            if (kind == nk::kNkSideGrid) return 3u;
+            return 4u;
+        };
         std::vector<uint32_t> masks(rows.size());
         for (uint32_t r = 0u; r < rows.size(); ++r) {
             const auto& row = rows[r];
@@ -349,7 +369,7 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
             const uint32_t env = r / cap.max_rows_per_env;
             ASSERT_LT(roots[r], rows.size());
             EXPECT_EQ(roots[r] / cap.max_rows_per_env, env);
-            const uint32_t a = category(row.a.kind), b = category(row.b.kind);
+            const uint32_t a = category(row.a), b = category(row.b);
             if (a < 4u) masks[roots[r]] |= 1u << a;
             if (b < 4u) masks[roots[r]] |= 1u << b;
             if (a < 4u && b < 4u && a != b && (row.flags & nk::nk_row_flags::kContactNormal))
@@ -371,7 +391,7 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
     }
     EXPECT_EQ(graph.DataViewRef().point_endpoint_terms, address);
     EXPECT_GT(measured_contact, 0.0);
-    EXPECT_EQ(graph.GraphReplays(), 32u);
+    EXPECT_EQ(graph.GraphReplays(), frames);
     ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
     EXPECT_EQ(ReadPipelineState(graph), initial);
 }

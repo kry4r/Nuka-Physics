@@ -734,6 +734,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // Model-derived solver constants (see op_schema.hpp).
         p_solve_.dt = cfg.dt;
         p_solve_.vel_iters = cfg.vel_iters;
+        p_solve_.vel_tolerance = cfg.vel_tolerance;
         // Split-impulse position pass runs ONLY on the general PairDriven path; the
         // Union/Fused families stay velocity-only (byte-identical).
         p_solve_.pos_iters =
@@ -765,6 +766,12 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // reference for the dynamic islanding). Read once at Build (graph-safe).
         const char* fsi = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
         p_solve_.force_static_islands = (fsi != nullptr && fsi[0] == '1') ? 1u : 0u;
+        // Validation A/B: sweep the convergence bound without recooking a scene.
+        const char* tolerance = std::getenv("NUKA_SOLVER_VEL_TOLERANCE");
+        if (tolerance != nullptr) p_solve_.vel_tolerance = std::strtof(tolerance, nullptr);
+        const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
+        p_solve_.measure_contact_residual = cfg.measure_contact_residual ||
+            (diagnostics != nullptr && diagnostics[0] == '1');
         // Particle rows exchange their impulses in the common solve.
         if (has_particles) {
             row_coupling_provider_.Couple(coupling_ctx);
@@ -787,6 +794,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             solve = p_solve_;
             solve.vel_iters = static_cast<uint16_t>(iteration_work(pass, cfg.vel_iters));
             solve.pos_iters = pass + 1u == coupling_iterations ? p_solve_.pos_iters : 0u;
+            solve.measure_contact_residual =
+                pass + 1u == coupling_iterations ? p_solve_.measure_contact_residual : 0u;
             solve.continue_impulses = pass != 0u ? 1u : 0u;
             add(phi::NkOp::SolveRowsBlockIsland, &solve);
             if (has_particles && p_part_contact_delta_.active_begin_per_env < per_env_particles)
@@ -831,6 +840,15 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     if (has_particles) {
         row_coupling_provider_.PostCouple(coupling_ctx);
     }
+
+    // Public poses and velocities describe the completed interval before sensor sampling.
+    if (has_articulation) {
+        add(phi::NkOp::FkWorldPoses, &p_fk_);
+        p_fk_velocity_.articulation_count = articulation_cnt;
+        p_fk_velocity_.total_link_count = total_link_count;
+        add(phi::NkOp::FkLinkVelocities, &p_fk_velocity_);
+    }
+    if (has_collidables) add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
 
     // ReadoutContactWrench: the general per-env contact-wrench readout over the
     // unified PairDriven contact buffer. Pure readout — emitted only when a

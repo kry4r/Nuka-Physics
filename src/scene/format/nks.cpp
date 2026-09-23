@@ -293,9 +293,13 @@ Value TransformJson(const math::Transform& t) {
 }
 math::Transform TransformFromJson(const Value& o) {
     math::Transform t;
-    t.position = Vec3FromJson(o.At("pos"));
-    t.rotation = QuatFromJson(o.At("quat"));
+    if (const Value* p = o.Find("pos")) t.position = Vec3FromJson(*p);
+    if (const Value* q = o.Find("quat")) t.rotation = QuatFromJson(*q);
     return t;
+}
+
+uint32_t OffsetId(uint32_t id, uint32_t offset) {
+    return id == kInvalidBody ? id : id + offset;
 }
 
 Value FloatArray(const float* p, int n) {
@@ -304,8 +308,7 @@ Value FloatArray(const float* p, int n) {
     return a;
 }
 
-// An AssetRef serializes as its "<nka>#TAG/idx" text (empty string for an empty
-// ref); the .nka chunk bytes a media baked-mesh ref points at are not read here.
+// An empty reference serializes as an empty string.
 Value AssetRefJson(const AssetRef& r) { return Value::Str(ToString(r)); }
 AssetRef AssetRefFromJson(const Value& v) { return ParseAssetRef(v.AsString()); }
 
@@ -320,6 +323,23 @@ struct MeshSink {
     NkaWriter writer;
     std::string nka_basename;
     std::unordered_map<uint64_t, std::string> by_hash;  // content hash -> assetref text
+    std::unordered_map<std::string, std::string> imported;
+
+    std::string AddAsset(const AssetRef& source) {
+        if (source.Empty()) return {};
+        const auto payload = NkaFile::Open(source.nka_path).LoadChunk(source.fourcc, source.index);
+        const std::string key = std::to_string(source.fourcc) + ":" +
+                                std::to_string(NkaContentHash(payload));
+        const auto found = imported.find(key);
+        if (found != imported.end()) return found->second;
+        AssetRef target;
+        target.nka_path = nka_basename;
+        target.fourcc = source.fourcc;
+        target.index = writer.AddChunk(source.fourcc, payload);
+        const auto text = ToString(target);
+        imported.emplace(key, text);
+        return text;
+    }
 
     // Append a collision mesh (CMSH) deduped by content hash; return AssetRef text.
     std::string AddCollisionMesh(const std::vector<float>& verts,
@@ -409,6 +429,7 @@ Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink, bool is_visual) {
     o.Set("condim", Value::Int(s.condim));
     o.Set("decompose_mode", Value::Str(DecomposeModeName(s.decompose_mode)));
     o.Set("decompose_max_pieces", Value::Int(s.decompose_max_pieces));
+    if (s.mesh_oriented) o.Set("mesh_oriented", Value::Bool(true));
     // Inline mesh geometry -> .nka MESH (visual-only) / CMSH (colliding) chunk,
     // deduped; store the AssetRef text under the same "mesh" key. Routing matches
     // the facade projection so a non-colliding geom (the h1/go2 visual meshes)
@@ -547,14 +568,21 @@ Value SaveSensor(const SensorDesc& s) {
 
 // A media entry (cloth / soft-tet / fluid). Every block is written verbatim (like
 // SaveShape) so any MediaRecord round-trips field-for-field whatever populated it.
-Value SaveMedia(const MediaRecord& m) {
+Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     Value o = Value::Object();
     o.Set("name", Value::Str(m.name));
     o.Set("kind", Value::Str(MediaKindName(m.kind)));
     o.Set("method", Value::Str(MediaMethodName(m.method)));
     o.Set("render_material_id",
           Value::Int(static_cast<int64_t>(m.render_material_id)));
-    o.Set("baked", AssetRefJson(m.baked));
+    o.Set("baked", Value::Str(sink.AddAsset(m.baked)));
+    Value cm = Value::Object();
+    cm.Set("local", TransformJson(m.cloth_mesh.local_transform));
+    cm.Set("material_mesh", Value::Str(sink.AddAsset(m.cloth_mesh.material_mesh)));
+    Value pins = Value::Array();
+    for (uint32_t vertex : m.cloth_mesh.pinned_vertices) pins.PushBack(Value::Int(vertex));
+    cm.Set("pinned_vertices", std::move(pins));
+    o.Set("cloth_mesh", std::move(cm));
 
     Value cg = Value::Object();
     cg.Set("nx", Value::Int(m.cloth_grid.nx));
@@ -597,6 +625,8 @@ Value SaveMedia(const MediaRecord& m) {
 
     Value xp = Value::Object();
     xp.Set("particle_mass", Value::Float(m.xpbd.particle_mass));
+    xp.Set("surface_density", Value::Float(m.xpbd.surface_density));
+    xp.Set("half_thickness", Value::Float(m.xpbd.half_thickness));
     xp.Set("friction", Value::Float(m.xpbd.friction));
     xp.Set("distance_alpha", Value::Float(m.xpbd.distance_alpha));
     xp.Set("bend_alpha", Value::Float(m.xpbd.bend_alpha));
@@ -941,6 +971,8 @@ Value SaveNode(const SceneIR& scene, const NodeIndex& idx, MeshSink& sink,
         cam.Set("vertical_fov_degrees", Value::Float(c->vertical_fov_degrees));
         cam.Set("near_clip", Value::Float(c->near_clip));
         cam.Set("far_clip", Value::Float(c->far_clip));
+        if (c->focus_distance != 1.0f) cam.Set("focus_distance", Value::Float(c->focus_distance));
+        if (c->shadow_radius != 0.0f) cam.Set("shadow_radius", Value::Float(c->shadow_radius));
         o.Set("camera", std::move(cam));
     }
     if (ecs.Has<LightComponent>(e)) {
@@ -1047,7 +1079,7 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     // media-free scene's bytes are unchanged. Authoring order == Media() order.
     if (!scene.Media().empty()) {
         Value media = Value::Array();
-        for (const MediaRecord& m : scene.Media()) media.PushBack(SaveMedia(m));
+        for (const MediaRecord& m : scene.Media()) media.PushBack(SaveMedia(m, sink));
         root.Set("media", std::move(media));
     }
 
@@ -1072,9 +1104,7 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
     // Emitted only when authored so an environment-free scene's bytes are
     // unchanged.
     const auto& envr = scene.Environment();
-    if (!envr.hdri.empty() || envr.use_scene_materials || envr.ibl_full_fill ||
-        envr.exposure_ev != 0.0f || envr.grade != 0.0f || envr.sun_disc != 0.0f ||
-        envr.specular_env) {
+    if (envr.Authored()) {
         Value env = Value::Object();
         if (!envr.hdri.empty()) {
             env.Set("hdri", Value::Str(envr.hdri));
@@ -1102,6 +1132,27 @@ void Save(const SceneIR& scene, const std::string& nks_path) {
         }
         if (envr.specular_env) {
             env.Set("specular_env", Value::Bool(true));
+        }
+        if (envr.sky.enabled) {
+            Value sky = Value::Object();
+            sky.Set("top", Vec3Json(envr.sky.top));
+            sky.Set("bottom", Vec3Json(envr.sky.bottom));
+            sky.Set("ground", Vec3Json(envr.sky.ground));
+            sky.Set("ambient_sky", Vec3Json(envr.sky.ambient_sky));
+            sky.Set("ambient_ground", Vec3Json(envr.sky.ambient_ground));
+            sky.Set("background", Vec3Json(envr.sky.background));
+            sky.Set("fill", Value::Float(envr.sky.fill));
+            env.Set("sky", std::move(sky));
+        }
+        if (envr.shadow.enabled) {
+            Value shadow = Value::Object();
+            shadow.Set("center", Vec3Json(envr.shadow.center));
+            shadow.Set("radius", Value::Float(envr.shadow.radius));
+            if (envr.shadow.map_size) shadow.Set("map_size", Value::Int(*envr.shadow.map_size));
+            if (envr.shadow.strength) shadow.Set("strength", Value::Float(*envr.shadow.strength));
+            if (envr.shadow.bias) shadow.Set("bias", Value::Float(*envr.shadow.bias));
+            if (envr.shadow.filter_radius) shadow.Set("filter_radius", Value::Float(*envr.shadow.filter_radius));
+            env.Set("shadow", std::move(shadow));
         }
         root.Set("environment", std::move(env));
     }
@@ -1143,19 +1194,29 @@ SceneIR ApplyImports(SceneIR scene, const Value& imports,
 
 void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& base_dir,
               const std::string& nka_path) {
-    // Optional .nka (mesh chunks). Open lazily on the first mesh reference.
-    std::unique_ptr<NkaFile> nka;
-    auto ensure_nka = [&]() -> NkaFile& {
-        if (!nka) {
-            nka = std::make_unique<NkaFile>(NkaFile::Open(nka_path));
-        }
-        return *nka;
+    std::unordered_map<std::string, NkaFile> containers;
+    auto mesh_ref = [&](const Value& value) {
+        AssetRef ref = ParseAssetRef(value.AsString());
+        const auto path = ref.nka_path.empty() ? std::filesystem::path(nka_path) :
+            base_dir / ref.nka_path;
+        ref.nka_path = std::filesystem::absolute(path).lexically_normal().string();
+        return ref;
+    };
+    auto load_chunk = [&](const AssetRef& ref) {
+        auto found = containers.find(ref.nka_path);
+        if (found == containers.end())
+            found = containers.emplace(ref.nka_path, NkaFile::Open(ref.nka_path)).first;
+        return found->second.LoadChunk(ref.fourcc, ref.index);
     };
 
     // -- imports (compose first, deterministic) -----------------------------
     if (const Value* imports = root.Find("imports")) {
         scene = ApplyImports(std::move(scene), *imports, base_dir);
     }
+    const auto body_offset = static_cast<uint32_t>(scene.RigidBodyCount());
+    const auto material_offset = static_cast<uint32_t>(scene.MaterialCount());
+    const auto joint_offset = static_cast<uint32_t>(scene.JointCount());
+    const auto shape_offset = static_cast<uint32_t>(scene.ShapeCount());
 
     // -- split materials (keyed by name; physics + render sections) ---------
     // ProjectMaterial maps friction_mu -> static/dynamic friction equally, so
@@ -1174,9 +1235,9 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.base_color = math::Vec3{FloatAt(bc, 0, "base_color"),
                                             FloatAt(bc, 1, "base_color"),
                                             FloatAt(bc, 2, "base_color")};
-                rec.alpha = FloatAt(bc, 3, "base_color");
-                rec.metallic = rm.At("metallic").AsFloat();
-                rec.roughness = rm.At("roughness").AsFloat();
+                if (bc.Elements().size() > 3u) rec.alpha = FloatAt(bc, 3, "base_color");
+                if (const Value* v = rm.Find("metallic")) rec.metallic = v->AsFloat();
+                if (const Value* v = rm.Find("roughness")) rec.roughness = v->AsFloat();
                 if (const Value* em = rm.Find("emissive")) rec.emissive = Vec3FromJson(*em);
                 if (const Value* sh = rm.Find("sheen")) rec.sheen = sh->AsFloat();
                 if (const Value* tr = rm.Find("transmission")) rec.transmission = tr->AsFloat();
@@ -1233,12 +1294,13 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                     } else {
                         rec.name = prefix.empty() ? seg : (prefix + seg);
                     }
-                    rec.parent_id = static_cast<BodyId>(rb->At("parent_id").AsInt());
-                    rec.local_transform = TransformFromJson(node.At("transform"));
-                    rec.inertial_transform = TransformFromJson(rb->At("inertial"));
-                    rec.mass = rb->At("mass").AsFloat();
-                    rec.inertia = Vec3FromJson(rb->At("inertia"));
-                    rec.is_static = rb->At("is_static").AsBool();
+                    if (const Value* v = rb->Find("parent_id"))
+                        rec.parent_id = OffsetId(static_cast<BodyId>(v->AsInt()), body_offset);
+                    if (const Value* v = node.Find("transform")) rec.local_transform = TransformFromJson(*v);
+                    if (const Value* v = rb->Find("inertial")) rec.inertial_transform = TransformFromJson(*v);
+                    if (const Value* v = rb->Find("mass")) rec.mass = v->AsFloat();
+                    if (const Value* v = rb->Find("inertia")) rec.inertia = Vec3FromJson(*v);
+                    if (const Value* v = rb->Find("is_static")) rec.is_static = v->AsBool();
                     const BodyId id = scene.AddRigidBody(std::move(rec));
                     body_nodes.push_back(BodyNode{&node, id});
                     // A body resets the group prefix for ITS subtree (its node is
@@ -1273,31 +1335,43 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.name = node.At("name").AsString();
             }
             rec.body_id = body_id;
-            rec.material_id = static_cast<MaterialId>(s->At("material_id").AsInt());
+            if (const Value* v = s->Find("material_id"))
+                rec.material_id = OffsetId(static_cast<MaterialId>(v->AsInt()), material_offset);
+            if (const Value* v = s->Find("material")) {
+                const auto& materials = scene.Materials();
+                const auto found = std::find_if(materials.begin(), materials.end(),
+                    [&](const MaterialRecord& m) { return m.name == v->AsString(); });
+                if (found == materials.end())
+                    throw std::runtime_error("nks: unknown material: " + v->AsString());
+                rec.material_id = found->id;
+            }
             rec.type = ShapeTypeFromName(s->At("type").AsString());
-            rec.local_transform = TransformFromJson(s->At("local"));
-            rec.half_extents = Vec3FromJson(s->At("half_extents"));
-            rec.radius = s->At("radius").AsFloat();
-            rec.half_height = s->At("half_height").AsFloat();
-            rec.contype = static_cast<uint32_t>(s->At("contype").AsInt());
-            rec.conaffinity = static_cast<uint32_t>(s->At("conaffinity").AsInt());
-            rec.collision_group = static_cast<int32_t>(s->At("collision_group").AsInt());
-            rec.solref[0] = FloatAt(s->At("solref"), 0, "solref");
-            rec.solref[1] = FloatAt(s->At("solref"), 1, "solref");
-            for (int k = 0; k < 5; ++k) rec.solimp[k] = FloatAt(s->At("solimp"), k, "solimp");
-            rec.friction_mu = s->At("friction_mu").AsFloat();
-            rec.priority = static_cast<int32_t>(s->At("priority").AsInt());
-            rec.solmix = s->At("solmix").AsFloat();
-            rec.margin = s->At("margin").AsFloat();
-            rec.gap = s->At("gap").AsFloat();
-            rec.condim = static_cast<uint8_t>(s->At("condim").AsInt());
-            rec.decompose_mode = DecomposeModeFromName(s->At("decompose_mode").AsString());
-            rec.decompose_max_pieces =
-                static_cast<uint32_t>(s->At("decompose_max_pieces").AsInt());
+            if (const Value* v = s->Find("local")) rec.local_transform = TransformFromJson(*v);
+            else if (const Value* transform = node.Find("transform")) rec.local_transform = TransformFromJson(*transform);
+            if (const Value* v = s->Find("half_extents")) rec.half_extents = Vec3FromJson(*v);
+            if (const Value* v = s->Find("radius")) rec.radius = v->AsFloat();
+            if (const Value* v = s->Find("half_height")) rec.half_height = v->AsFloat();
+            if (is_visual) rec.contype = rec.conaffinity = 0u;
+            if (const Value* v = s->Find("contype")) rec.contype = static_cast<uint32_t>(v->AsInt());
+            if (const Value* v = s->Find("conaffinity")) rec.conaffinity = static_cast<uint32_t>(v->AsInt());
+            if (const Value* v = s->Find("collision_group")) rec.collision_group = static_cast<int32_t>(v->AsInt());
+            if (const Value* v = s->Find("solref"))
+                for (int k = 0; k < 2; ++k) rec.solref[k] = FloatAt(*v, k, "solref");
+            if (const Value* v = s->Find("solimp"))
+                for (int k = 0; k < 5; ++k) rec.solimp[k] = FloatAt(*v, k, "solimp");
+            if (const Value* v = s->Find("friction_mu")) rec.friction_mu = v->AsFloat();
+            if (const Value* v = s->Find("priority")) rec.priority = static_cast<int32_t>(v->AsInt());
+            if (const Value* v = s->Find("solmix")) rec.solmix = v->AsFloat();
+            if (const Value* v = s->Find("margin")) rec.margin = v->AsFloat();
+            if (const Value* v = s->Find("gap")) rec.gap = v->AsFloat();
+            if (const Value* v = s->Find("condim")) rec.condim = static_cast<uint8_t>(v->AsInt());
+            if (const Value* v = s->Find("decompose_mode")) rec.decompose_mode = DecomposeModeFromName(v->AsString());
+            if (const Value* v = s->Find("mesh_oriented")) rec.mesh_oriented = v->AsBool();
+            if (const Value* v = s->Find("decompose_max_pieces"))
+                rec.decompose_max_pieces = static_cast<uint32_t>(v->AsInt());
             if (const Value* mesh = s->Find("mesh")) {
-                const AssetRef ref = ParseAssetRef(mesh->AsString());
-                const std::vector<uint8_t> bytes =
-                    ensure_nka().LoadChunk(ref.fourcc, ref.index);
+                const AssetRef ref = mesh_ref(*mesh);
+                const std::vector<uint8_t> bytes = load_chunk(ref);
                 if (ref.fourcc == NkaTagMesh()) {
                     // M8.5 T5: a VISUAL geom's triangles live in a MESH chunk.
                     // Decode the source triangles back into the record (so the
@@ -1325,14 +1399,11 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                                     [](float uv) { return uv != 0.0f; })) {
                         rec.mesh_uvs = m.uvs;
                     }
-                    AssetRef resolved = ref;
-                    resolved.nka_path = nka_path;
-                    rec.visual_mesh_ref = ToString(resolved);
+                    rec.visual_mesh_ref = ToString(ref);
                 } else {
                     DecodeCollisionMesh(bytes, rec.mesh_vertices, rec.mesh_indices);
                 }
             }
-            (void)is_visual;  // routing is driven by the chunk fourcc above
             scene.AddCollisionShape(std::move(rec));
         };
         // Direct children of root that are geoms (orphan shapes: no body) come
@@ -1341,6 +1412,9 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             const Value* kids = node.Find("children");
             return kids ? &kids->Elements() : nullptr;
         };
+        for (const Value& top : tree->Elements()) {
+            if (!top.Find("rigid_body")) load_shape(top, kInvalidBody);
+        }
         for (const BodyNode& bn : body_nodes) {
             if (const auto* kids = direct_children(*bn.node)) {
                 for (const Value& c : *kids) load_shape(c, bn.id);
@@ -1355,8 +1429,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             JointRecord rec;
             rec.name = j->At("name").AsString();
             rec.type = JointTypeFromName(j->At("type").AsString());
-            rec.parent_body = static_cast<BodyId>(j->At("parent_body").AsInt());
-            rec.child_body = static_cast<BodyId>(j->At("child_body").AsInt());
+            rec.parent_body = OffsetId(static_cast<BodyId>(j->At("parent_body").AsInt()), body_offset);
+            rec.child_body = OffsetId(static_cast<BodyId>(j->At("child_body").AsInt()), body_offset);
             rec.axis = Vec3FromJson(j->At("axis"));
             rec.parent_frame = TransformFromJson(j->At("parent_frame"));
             rec.child_frame = TransformFromJson(j->At("child_frame"));
@@ -1397,6 +1471,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                         rec.vertical_fov_degrees = cam->At("vertical_fov_degrees").AsFloat();
                         rec.near_clip = cam->At("near_clip").AsFloat();
                         rec.far_clip = cam->At("far_clip").AsFloat();
+                        if (const Value* v = cam->Find("focus_distance")) rec.focus_distance = v->AsFloat();
+                        if (const Value* v = cam->Find("shadow_radius")) rec.shadow_radius = v->AsFloat();
                         scene.AddCamera(std::move(rec));
                     }
                 }
@@ -1428,6 +1504,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.vertical_fov_degrees = cam->At("vertical_fov_degrees").AsFloat();
                 rec.near_clip = cam->At("near_clip").AsFloat();
                 rec.far_clip = cam->At("far_clip").AsFloat();
+                if (const Value* v = cam->Find("focus_distance")) rec.focus_distance = v->AsFloat();
+                if (const Value* v = cam->Find("shadow_radius")) rec.shadow_radius = v->AsFloat();
                 scene.AddCamera(std::move(rec));
             }
             if (const Value* lt = top.Find("light")) {
@@ -1448,7 +1526,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             ActuatorRecord rec;
             rec.name = a->At("name").AsString();
             rec.type = ActuatorTypeFromName(a->At("type").AsString());
-            rec.joint_id = static_cast<JointId>(a->At("joint_id").AsInt());
+            rec.joint_id = OffsetId(static_cast<JointId>(a->At("joint_id").AsInt()), joint_offset);
             rec.gain = a->At("gain").AsFloat();
             rec.force_limit = a->At("force_limit").AsFloat();
             scene.AddActuator(std::move(rec));
@@ -1479,6 +1557,8 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.sample_rate_hz = s.At("sample_rate_hz").AsFloat();
             rec.mount = MountFrame::Body;
             if (const Value* m = s.Find("mount")) rec.mount = MountFrameFromName(m->AsString());
+            rec.joint_id = OffsetId(rec.joint_id, joint_offset);
+            if (rec.mount == MountFrame::Body) rec.mount_index = OffsetId(rec.mount_index, body_offset);
             if (const Value* up = s.Find("update_period")) {
                 rec.update_period = static_cast<uint32_t>(up->AsInt());
             }
@@ -1522,11 +1602,13 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
         for (const Value& c : cameras->Elements()) {
             CameraRecord rec;
             rec.name = c.At("name").AsString();
-            rec.attached_body = static_cast<BodyId>(c.At("attached_body").AsInt());
+            rec.attached_body = OffsetId(static_cast<BodyId>(c.At("attached_body").AsInt()), body_offset);
             rec.local_transform = TransformFromJson(c.At("local"));
             rec.vertical_fov_degrees = c.At("vertical_fov_degrees").AsFloat();
             rec.near_clip = c.At("near_clip").AsFloat();
             rec.far_clip = c.At("far_clip").AsFloat();
+            if (const Value* v = c.Find("focus_distance")) rec.focus_distance = v->AsFloat();
+            if (const Value* v = c.Find("shadow_radius")) rec.shadow_radius = v->AsFloat();
             scene.AddCamera(std::move(rec));
         }
     }
@@ -1537,7 +1619,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             LightRecord rec;
             rec.name = l.At("name").AsString();
             rec.type = LightTypeFromName(l.At("type").AsString());
-            rec.attached_body = static_cast<BodyId>(l.At("attached_body").AsInt());
+            rec.attached_body = OffsetId(static_cast<BodyId>(l.At("attached_body").AsInt()), body_offset);
             rec.local_transform = TransformFromJson(l.At("local"));
             rec.color = Vec3FromJson(l.At("color"));
             rec.intensity = l.At("intensity").AsFloat();
@@ -1548,15 +1630,15 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
     // -- filters ------------------------------------------------------------
     if (const Value* excludes = root.Find("exclude_pairs")) {
         for (const Value& e : excludes->Elements()) {
-            scene.AddExcludePair(static_cast<BodyId>(FloatAt(e, 0, "exclude_pair")),
-                                 static_cast<BodyId>(FloatAt(e, 1, "exclude_pair")));
+            scene.AddExcludePair(OffsetId(static_cast<BodyId>(FloatAt(e, 0, "exclude_pair")), body_offset),
+                                 OffsetId(static_cast<BodyId>(FloatAt(e, 1, "exclude_pair")), body_offset));
         }
     }
     if (const Value* pairs = root.Find("contact_pairs")) {
         for (const Value& cp : pairs->Elements()) {
             ContactPairOverride ov;
-            ov.geom1 = static_cast<ShapeId>(cp.At("geom1").AsInt());
-            ov.geom2 = static_cast<ShapeId>(cp.At("geom2").AsInt());
+            ov.geom1 = OffsetId(static_cast<ShapeId>(cp.At("geom1").AsInt()), shape_offset);
+            ov.geom2 = OffsetId(static_cast<ShapeId>(cp.At("geom2").AsInt()), shape_offset);
             ov.condim = static_cast<uint8_t>(cp.At("condim").AsInt());
             ov.friction_mu = cp.At("friction_mu").AsFloat();
             ov.solref[0] = FloatAt(cp.At("solref"), 0, "solref");
@@ -1607,8 +1689,21 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             if (const Value* nm = mv.Find("name")) rec.name = nm->AsString();
             rec.kind = MediaKindFromName(mv.At("kind").AsString());
             rec.method = MediaMethodFromName(mv.At("method").AsString());
-            rec.render_material_id = u(mv, "render_material_id", rec.render_material_id);
+            rec.render_material_id = OffsetId(u(mv, "render_material_id", rec.render_material_id), material_offset);
             if (const Value* bk = mv.Find("baked")) rec.baked = AssetRefFromJson(*bk);
+            if (const Value* cm = mv.Find("cloth_mesh")) {
+                if (const Value* local = cm->Find("local"))
+                    rec.cloth_mesh.local_transform = TransformFromJson(*local);
+                if (const Value* material = cm->Find("material_mesh"))
+                    rec.cloth_mesh.material_mesh = AssetRefFromJson(*material);
+                if (const Value* pins = cm->Find("pinned_vertices"))
+                    for (const Value& vertex : pins->Elements()) {
+                        const auto id = vertex.AsInt();
+                        if (id < 0 || static_cast<uint64_t>(id) > UINT32_MAX)
+                            throw std::invalid_argument("Cloth pinned vertex is out of range");
+                        rec.cloth_mesh.pinned_vertices.push_back(static_cast<uint32_t>(id));
+                    }
+            }
 
             if (const Value* cg = mv.Find("cloth_grid")) {
                 rec.cloth_grid.nx = u(*cg, "nx", rec.cloth_grid.nx);
@@ -1647,12 +1742,14 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                     rec.cable_line.slab.stiffness =
                         f(*sl, "stiffness", rec.cable_line.slab.stiffness);
                     rec.cable_line.slab.render_material_id =
-                        u(*sl, "render_material_id",
-                          rec.cable_line.slab.render_material_id);
+                        OffsetId(u(*sl, "render_material_id",
+                          rec.cable_line.slab.render_material_id), material_offset);
                 }
             }
             if (const Value* xp = mv.Find("xpbd")) {
                 rec.xpbd.particle_mass = f(*xp, "particle_mass", rec.xpbd.particle_mass);
+                rec.xpbd.surface_density = f(*xp, "surface_density", rec.xpbd.surface_density);
+                rec.xpbd.half_thickness = f(*xp, "half_thickness", rec.xpbd.half_thickness);
                 rec.xpbd.friction = f(*xp, "friction", rec.xpbd.friction);
                 rec.xpbd.distance_alpha = f(*xp, "distance_alpha", rec.xpbd.distance_alpha);
                 rec.xpbd.bend_alpha = f(*xp, "bend_alpha", rec.xpbd.bend_alpha);
@@ -1688,7 +1785,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                         }
                         if (const Value* fm = fv.Find("mpm")) read_mpm(*fm, fl.material);
                         fl.render_material_id =
-                            u(fv, "render_material_id", fl.render_material_id);
+                            OffsetId(u(fv, "render_material_id", fl.render_material_id), material_offset);
                         rec.mpm_fills.push_back(std::move(fl));
                     }
                 }
@@ -1750,7 +1847,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
     // Absent keys keep the record default; an absent section keeps the
     // procedural studio sky (backward-compatible).
     if (const Value* env = root.Find("environment")) {
-        EnvironmentRecord rec;
+        EnvironmentRecord rec = scene.Environment();
         if (const Value* hp = env->Find("hdri")) rec.hdri = hp->AsString();
         if (const Value* yv = env->Find("yaw_deg")) rec.yaw_deg = yv->AsFloat();
         if (const Value* iv = env->Find("intensity")) rec.intensity = iv->AsFloat();
@@ -1762,6 +1859,30 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
         if (const Value* gr = env->Find("grade")) rec.grade = gr->AsFloat();
         if (const Value* sd = env->Find("sun_disc")) rec.sun_disc = sd->AsFloat();
         if (const Value* se = env->Find("specular_env")) rec.specular_env = se->AsBool();
+        if (const Value* sky = env->Find("sky")) {
+            rec.sky.enabled = true;
+            if (const Value* v = sky->Find("top")) rec.sky.top = Vec3FromJson(*v);
+            if (const Value* v = sky->Find("bottom")) rec.sky.bottom = Vec3FromJson(*v);
+            if (const Value* v = sky->Find("ground")) rec.sky.ground = Vec3FromJson(*v);
+            if (const Value* v = sky->Find("ambient_sky")) rec.sky.ambient_sky = Vec3FromJson(*v);
+            if (const Value* v = sky->Find("ambient_ground")) rec.sky.ambient_ground = Vec3FromJson(*v);
+            if (const Value* v = sky->Find("background")) rec.sky.background = Vec3FromJson(*v);
+            if (const Value* v = sky->Find("fill")) rec.sky.fill = v->AsFloat();
+        }
+        if (const Value* shadow = env->Find("shadow")) {
+            rec.shadow.enabled = true;
+            if (const Value* v = shadow->Find("center")) rec.shadow.center = Vec3FromJson(*v);
+            if (const Value* v = shadow->Find("radius")) rec.shadow.radius = v->AsFloat();
+            if (const Value* v = shadow->Find("map_size")) {
+                const auto size = v->AsInt();
+                if (size <= 0 || static_cast<uint64_t>(size) > UINT32_MAX)
+                    throw std::invalid_argument("Shadow map_size must be a positive 32-bit integer");
+                rec.shadow.map_size = static_cast<uint32_t>(size);
+            }
+            if (const Value* v = shadow->Find("strength")) rec.shadow.strength = v->AsFloat();
+            if (const Value* v = shadow->Find("bias")) rec.shadow.bias = v->AsFloat();
+            if (const Value* v = shadow->Find("filter_radius")) rec.shadow.filter_radius = v->AsFloat();
+        }
         scene.EnvironmentMut() = std::move(rec);
     }
 
@@ -1837,8 +1958,31 @@ SceneIR ApplyImports(SceneIR scene, const Value& imports,
             addon = nuka::import::LoadUsd(src.string());
         } else if (ext == ".urdf") {
             addon = nuka::import::LoadUrdf(src.string());
+        } else if (ext == ".nks") {
+            addon = Load(src.string());
         } else {
             throw std::runtime_error("nks import: unsupported extension: " + ext);
+        }
+
+        const auto resolve_path = [&](const std::string& path) {
+            return path.empty() ? path : (src.parent_path() / path).lexically_normal().string();
+        };
+        for (uint32_t i = 0u; i < addon.MaterialCount(); ++i) {
+            auto& material = addon.GetMaterialMut(i);
+            material.albedo_map = resolve_path(material.albedo_map);
+            material.roughness_map = resolve_path(material.roughness_map);
+            material.normal_map = resolve_path(material.normal_map);
+        }
+        addon.EnvironmentMut().hdri = resolve_path(addon.Environment().hdri);
+        for (uint32_t i = 0u; i < addon.Media().size(); ++i) {
+            auto& medium = addon.GetMediaMut(i);
+            medium.baked.nka_path = resolve_path(medium.baked.nka_path);
+            medium.cloth_mesh.material_mesh.nka_path = resolve_path(medium.cloth_mesh.material_mesh.nka_path);
+            medium.render_skin.skin_mesh.nka_path = resolve_path(medium.render_skin.skin_mesh.nka_path);
+        }
+        for (uint32_t i = 0u; i < addon.Terrain().size(); ++i) {
+            auto& terrain = addon.GetTerrainMut(i);
+            terrain.image_path = resolve_path(terrain.image_path);
         }
 
         math::Transform placement = math::Transform::Identity();
@@ -1928,7 +2072,15 @@ std::string ReadTextFile(const std::string& path) {
 
 SceneIR Load(const std::string& nks_path) {
     namespace fs = std::filesystem;
-    const fs::path p(nks_path);
+    const fs::path p = fs::weakly_canonical(fs::absolute(nks_path));
+    static thread_local std::vector<fs::path> loading;
+    if (std::find(loading.begin(), loading.end(), p) != loading.end())
+        throw std::runtime_error("nks: cyclic import: " + p.string());
+    loading.push_back(p);
+    struct Scope {
+        std::vector<fs::path>& paths;
+        ~Scope() { paths.pop_back(); }
+    } scope{loading};
     const std::string stem = p.stem().string();
     const fs::path nka_path = p.parent_path() / (stem + ".nka");
 
@@ -1936,6 +2088,13 @@ SceneIR Load(const std::string& nks_path) {
 
     SceneIR scene;
     LoadInto(scene, root, p.parent_path(), nka_path.string());
+    for (uint32_t i = 0u; i < scene.Media().size(); ++i) {
+        auto& medium = scene.GetMediaMut(i);
+        for (AssetRef* ref : {&medium.baked, &medium.cloth_mesh.material_mesh,
+                             &medium.render_skin.skin_mesh}) {
+            if (!ref->Empty()) ref->nka_path = (p.parent_path() / ref->nka_path).lexically_normal().string();
+        }
+    }
     return scene;
 }
 

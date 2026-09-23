@@ -15,7 +15,8 @@ typedef enum nuka_state_sensor_kind_t {
     NUKA_STATE_SENSOR_CONTACT_WRENCH = 4, /* Contact force xyz (N), torque xyz (N*m) in sensor axes. */
     NUKA_STATE_SENSOR_FORCE_TORQUE = 5,   /* Parent-on-subtree wrench; requires a supported articulation link. */
     NUKA_STATE_SENSOR_TOUCH = 6,          /* Positive normal force integrated over a sensing volume, in N. */
-    NUKA_STATE_SENSOR_TACTILE = 7         /* Taxel force: tangent x/y and compression-positive normal, in N. */
+    NUKA_STATE_SENSOR_TACTILE = 7,        /* Taxel force: tangent x/y and compression-positive normal, in N. */
+    NUKA_STATE_SENSOR_JOINT_EFFORT = 8    /* Motor effort after actuator limits: N*m for revolute, N for prismatic. */
 } nuka_state_sensor_kind_t;
 
 typedef enum nuka_contact_region_shape_t {

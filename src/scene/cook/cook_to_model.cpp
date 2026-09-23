@@ -1,3 +1,7 @@
+#include "scene/asset/nka.hpp"
+#include <map>
+#include <set>
+
 // ---------------------------------------------------------------------------
 // nk CookToModel implementation (the design /).
 //
@@ -185,8 +189,8 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
     return static_cast<uint32_t>(buckets.size() - 1u);
 }
 
-// Surface samples comprise the vertices and unique edge midpoints.
-// Edges use ascending canonical vertex pairs, independent of triangle order.
+// Surface samples retain the first occurrence of each vertex and edge midpoint.
+// Exact coordinate duplicates carry no additional collision geometry.
 uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
                          std::vector<float>& out) {
     if (piece >= geo.Count()) return 0u;
@@ -195,14 +199,14 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
     const uint32_t ioff = geo.index_offsets[piece];
     const uint32_t icnt = geo.index_counts[piece];
     const uint32_t start = static_cast<uint32_t>(out.size() / 3u);
-    // 1. hull vertices.
+    std::set<std::array<float, 3>> points;
+    const auto append = [&](const std::array<float, 3>& point) {
+        if (points.insert(point).second) out.insert(out.end(), point.begin(), point.end());
+    };
     for (uint32_t v = 0; v < vcnt; ++v) {
         const size_t at = (static_cast<size_t>(voff) + v) * 3u;
-        out.push_back(geo.vertices[at + 0]);
-        out.push_back(geo.vertices[at + 1]);
-        out.push_back(geo.vertices[at + 2]);
+        append({geo.vertices[at], geo.vertices[at + 1], geo.vertices[at + 2]});
     }
-    // 2. unique triangle-edge midpoints (canonical (lo,hi) dedup, ascending).
     std::vector<uint64_t> seen;
     seen.reserve(icnt);
     auto edge_key = [](uint32_t a, uint32_t b) -> uint64_t {
@@ -222,8 +226,10 @@ uint32_t CookHullSamples(const CookedConvexGeometry& geo, uint32_t piece,
     for (const uint64_t edge : seen) {
         const size_t pa = (static_cast<size_t>(voff) + static_cast<uint32_t>(edge >> 32u)) * 3u;
         const size_t pb = (static_cast<size_t>(voff) + static_cast<uint32_t>(edge)) * 3u;
+        std::array<float, 3> midpoint;
         for (uint32_t axis = 0u; axis < 3u; ++axis)
-            out.push_back(0.5f * (geo.vertices[pa + axis] + geo.vertices[pb + axis]));
+            midpoint[axis] = 0.5f * (geo.vertices[pa + axis] + geo.vertices[pb + axis]);
+        append(midpoint);
     }
     return static_cast<uint32_t>(out.size() / 3u) - start;
 }
@@ -259,7 +265,7 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
         throw std::runtime_error("CookToModel: grid particle slice exceeds its environment");
     const uint32_t row_particles = cap.particles_per_env - row_exempt;
     const uint64_t reserve =
-        static_cast<uint64_t>(rigid_base > 0u ? row_particles : 0u) *
+        static_cast<uint64_t>(cap.bodies_per_env > 0u ? row_particles : 0u) *
         collision::kBodyParticleContactSlotsPerParticle;
     const uint64_t compact = reserve + cap.mpm_contact_capacity_per_env;
     const uint64_t total = static_cast<uint64_t>(rigid_base) + compact;
@@ -273,6 +279,15 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
     }
     cap.max_contacts_per_env = static_cast<uint32_t>(total);
     SetRowCapacity(cap, rows);
+    if (cap.mpm_grid_nodes_per_env > 0u) {
+        const uint32_t surfaces = cap.particle_surfaces_per_env > 0u ? cap.mpm_contact_capacity_per_env : 0u;
+        const uint64_t endpoints = nk::MpmPointEndpointCount(cap.particles_per_env, surfaces);
+        const uint64_t terms = nk::MpmPointEndpointTermCount(cap.particles_per_env, surfaces);
+        if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max())
+            throw std::invalid_argument("material contact endpoint capacity exceeds device indexing");
+        cap.point_endpoints_per_env = static_cast<uint32_t>(endpoints);
+        cap.point_endpoint_terms_per_env = static_cast<uint32_t>(terms);
+    }
 }
 
 namespace {
@@ -592,18 +607,14 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             model.feet.push_back(foot);
         }
 
-        // Per-link collision geometry: per template-link, record the FIRST
-        // primitive COLLISION shape whose owning body maps to that link, in the
-        // link's LOCAL frame. Visual-only shapes must never claim the link's
-        // physics row, even when they precede collision geoms in the source XML.
+        // The first collision shape owns the link's collidable row; all further shapes use proxies.
+        // Meshes and primitives retain the same owner and contact filtering.
         m.link_geom_kind.assign(m.link_count, 0u);
         m.link_geom_params.assign(static_cast<size_t>(m.link_count) * 4u, 0.0f);
         m.link_geom_local.assign(m.link_count, math::Transform::Identity());
         for (uint32_t shape = 0; shape < blob.shapes.types.size(); ++shape) {
             const ShapeType st = blob.shapes.types[shape];
-            if (!ShapeCollides(blob, shape) ||
-                (st != ShapeType::Sphere && st != ShapeType::Box &&
-                 st != ShapeType::Capsule)) {
+            if (!ShapeCollides(blob, shape)) {
                 continue;
             }
             const BodyId body = shape < blob.shapes.body_ids.size()
@@ -617,9 +628,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 continue;  // body is not an articulation link.
             }
             if (m.link_geom_kind[owner_link] != 0u) {
-                // The link already carries its FIRST primitive (folded into its own
-                // body row). This 2nd+ primitive becomes an appended collidable
-                // PROXY row so the link owns multiple collidables (multi-geom feet).
+                // Each additional shape keeps an independent surface and a shared reaction owner.
                 ProxyCollidableSpec px;
                 px.owner_link = owner_link;
                 px.owner_body = body;
@@ -644,7 +653,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             } else if (st == ShapeType::Capsule) {
                 m.link_geom_params[b + 0] = radius;
                 m.link_geom_params[b + 1] = half_height;
-            } else {  // Box
+            } else if (st == ShapeType::Box) {
                 m.link_geom_params[b + 0] = he.x;
                 m.link_geom_params[b + 1] = he.y;
                 m.link_geom_params[b + 2] = he.z;
@@ -944,7 +953,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
 
         for (uint32_t b = 0; b < cap.bodies_per_env; ++b) {
             const uint32_t s = body_shape[b];
-            if (s == ~uint32_t(0)) continue;
+            if (s == ~uint32_t(0)) {
+                model.shape_table_rows[b].contype = 0u;
+                model.shape_table_rows[b].conaffinity = 0u;
+                continue;
+            }
             const nk::ModelShape& sh = model.shapes[s];
             nk::Model::PairDrivenShape& row = model.shape_table_rows[sh.body_row];
             row.kind = sh.kind;
@@ -1504,13 +1517,13 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     }
     const uint32_t bn = static_cast<uint32_t>(in.bend.size());
     mp.bend_particles.resize(static_cast<size_t>(bn) * 4u);
-    mp.bend_gradients.resize(static_cast<size_t>(bn) * 4u);
+    mp.bend_rest_angle.resize(bn);
     mp.bend_alpha.resize(bn);
     for (uint32_t c = 0; c < bn; ++c) {
         for (uint32_t j = 0; j < 4u; ++j) {
             mp.bend_particles[static_cast<size_t>(c) * 4u + j] = in.bend[c].p[j];
-            mp.bend_gradients[static_cast<size_t>(c) * 4u + j] = in.bend[c].k[j];
         }
+        mp.bend_rest_angle[c] = in.bend[c].rest_angle;
         mp.bend_alpha[c] = in.bend[c].compliance_alpha;
     }
     const uint32_t vn = static_cast<uint32_t>(in.volume.size());
@@ -1636,11 +1649,11 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
-    if (in.dx <= 0.0f || in.grid_dims[0] == 0u || in.grid_dims[1] == 0u ||
-        in.grid_dims[2] == 0u) {
+    if (in.dx <= 0.0f || in.grid_dims[0] < nk::kMpmStencilWidth ||
+        in.grid_dims[1] < nk::kMpmStencilWidth || in.grid_dims[2] < nk::kMpmStencilWidth) {
         throw std::runtime_error(
             "CookMpmParticles: an MLS-MPM medium needs a positive cell size dx and "
-            "non-zero grid_dims (the env-private background grid)");
+            "at least three nodes per grid axis");
     }
 
     nk::Model::ModelParticles& mp = model.particles;
@@ -1755,7 +1768,7 @@ void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
 void ValidateMedia(const std::vector<MediaRecord>& media) {
     using Kind = MediaRecord::Kind;
     using Method = MediaRecord::Method;
-    uint32_t n_mpm = 0u, n_non_mpm = 0u, n_pbf_fluid = 0u;
+    uint32_t n_mpm = 0u, n_pbf_fluid = 0u;
     for (const MediaRecord& m : media) {
         bool legal = false;
         switch (m.kind) {
@@ -1795,7 +1808,7 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
             throw std::runtime_error(
                 "ValidateMedia: mpm_fills require a box MLS-MPM medium (fluid or granular)");
         }
-        if (m.method == Method::MlsMpm) ++n_mpm; else ++n_non_mpm;
+        if (m.method == Method::MlsMpm) ++n_mpm;
         if (m.kind == Kind::Fluid && m.method == Method::Pbf) ++n_pbf_fluid;
     }
     // An MLS-MPM medium may co-reside with XPBD (cloth/tet) media in the MpmXpbd
@@ -1810,11 +1823,6 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
         throw std::runtime_error(
             "ValidateMedia: a Model carries one PBF fluid slice; a second PBF fluid "
             "medium is not representable");
-    }
-    if (n_mpm > 1u) {
-        throw std::runtime_error(
-            "ValidateMedia: a Model carries one MLS-MPM medium; a second is not "
-            "representable");
     }
 }
 
@@ -2030,7 +2038,7 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.dist_rest = xp.dist_rest;
     mp.dist_alpha = xp.dist_alpha;
     for (uint32_t v : xp.bend_particles) mp.bend_particles.push_back(v + n_mpm);
-    mp.bend_gradients = xp.bend_gradients;
+    mp.bend_rest_angle = xp.bend_rest_angle;
     mp.bend_alpha = xp.bend_alpha;
     for (uint32_t v : xp.vol_particles) mp.vol_particles.push_back(v + n_mpm);
     mp.vol_rest6 = xp.vol_rest6;
@@ -2061,13 +2069,6 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     cap.particle_surfaces_per_env = xtmp.capacities.particle_surfaces_per_env;
     cap.particle_surface_triangles = xtmp.capacities.particle_surface_triangles;
     cap.particle_surface_nodes_per_env = xtmp.capacities.particle_surface_nodes_per_env;
-    if (cap.particle_surfaces_per_env > 0u) {
-        const uint64_t terms = uint64_t{cap.mpm_contact_capacity_per_env} * nk::kTriangleEndpointTerms;
-        if (terms > std::numeric_limits<uint32_t>::max())
-            throw std::invalid_argument("point endpoint term capacity exceeds device indexing");
-        cap.point_endpoints_per_env = cap.mpm_contact_capacity_per_env;
-        cap.point_endpoint_terms_per_env = static_cast<uint32_t>(terms);
-    }
 
     // 3) The body<->particle cloth contact radius + the co-residence schema.
     ApplyParticleBodyContact(mp, contact);
@@ -2139,69 +2140,210 @@ std::vector<uint32_t> CableSlabBoxTriangles(uint32_t base) {
 
 }  // namespace
 
+namespace {
+
+struct ClothGeometry {
+    std::vector<math::Vec3> rest;
+    std::vector<runtime::soft::ClothTriangle> triangles;
+    std::vector<std::array<math::Vec3, 3>> material_faces;
+};
+
+NkaMesh ReadClothMesh(const AssetRef& ref) {
+    const auto bytes = NkaFile::Open(ref.nka_path).LoadChunk(ref.fourcc, ref.index);
+    NkaMesh mesh;
+    if (ref.fourcc == NkaTagMesh()) mesh = DecodeMesh(bytes);
+    else if (ref.fourcc == NkaTagCmsh())
+        DecodeCollisionMesh(bytes, mesh.positions, mesh.indices);
+    else throw std::invalid_argument("Cloth requires a MESH or CMSH asset");
+    if (mesh.positions.empty() || mesh.positions.size() % 3u != 0u ||
+        mesh.indices.empty() || mesh.indices.size() % 3u != 0u)
+        throw std::invalid_argument("Cloth asset requires vertices and triangle indices");
+    return mesh;
+}
+
+ClothGeometry BuildClothGeometry(const MediaRecord& media) {
+    ClothGeometry out;
+    if (!media.baked.Empty()) {
+        const NkaMesh mesh = ReadClothMesh(media.baked);
+        const auto& local = media.cloth_mesh.local_transform;
+        const auto& q = local.rotation;
+        const float qnorm2 = q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z;
+        if (!std::isfinite(qnorm2) || std::abs(qnorm2 - 1.0f) > 1.0e-4f)
+            throw std::invalid_argument("Cloth mesh rotation must be a unit quaternion");
+        out.rest.reserve(mesh.positions.size() / 3u);
+        for (size_t i = 0u; i < mesh.positions.size(); i += 3u) {
+            const auto p = local.TransformPoint({mesh.positions[i], mesh.positions[i+1u],
+                                                 mesh.positions[i+2u]});
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+                throw std::invalid_argument("Cloth mesh contains a non-finite vertex");
+            out.rest.push_back(p);
+        }
+        std::vector<uint8_t> used(out.rest.size(), 0u);
+        std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, int>> edges;
+        std::set<std::array<uint32_t, 3>> faces;
+        for (size_t i = 0u; i < mesh.indices.size(); i += 3u) {
+            const uint32_t a = mesh.indices[i], b = mesh.indices[i+1u], c = mesh.indices[i+2u];
+            if (a >= out.rest.size() || b >= out.rest.size() || c >= out.rest.size() ||
+                a == b || a == c || b == c)
+                throw std::invalid_argument("Cloth asset has an invalid triangle");
+            const float area2 = (out.rest[b] - out.rest[a]).Cross(out.rest[c] - out.rest[a]).Length();
+            if (!(area2 > 0.0f) || !std::isfinite(area2))
+                throw std::invalid_argument("Cloth asset has a degenerate triangle");
+            std::array<uint32_t, 3> sorted{a, b, c};
+            std::sort(sorted.begin(), sorted.end());
+            if (!faces.insert(sorted).second)
+                throw std::invalid_argument("Cloth asset has duplicate faces");
+            const uint32_t ids[] = {a, b, c};
+            for (uint32_t j = 0; j < 3u; ++j) {
+                const uint32_t u = ids[j], v = ids[(j+1u)%3u];
+                used[u] = 1u;
+                auto& count = edges[{std::min(u,v), std::max(u,v)}];
+                ++count.first;
+                count.second += u < v ? 1 : -1;
+                if (count.first > 2u || (count.first == 2u && count.second != 0))
+                    throw std::invalid_argument("Cloth asset must have consistently wound manifold faces");
+            }
+            out.triangles.push_back({{a, b, c}});
+        }
+        if (std::find(used.begin(), used.end(), uint8_t{0}) != used.end())
+            throw std::invalid_argument("Cloth asset contains vertices without faces");
+        if (!media.cloth_mesh.material_mesh.Empty()) {
+            const auto pattern = ReadClothMesh(media.cloth_mesh.material_mesh);
+            if (pattern.indices.size() != mesh.indices.size())
+                throw std::invalid_argument("Cloth material faces must correspond to the surface corners");
+            for (size_t i = 0u; i < pattern.indices.size(); i += 3u) {
+                std::array<math::Vec3, 3> face;
+                for (size_t j = 0u; j < 3u; ++j) {
+                    const size_t vertex = pattern.indices[i+j];
+                    if (vertex >= pattern.positions.size() / 3u)
+                        throw std::invalid_argument("Cloth material vertex is out of range");
+                    face[j] = {pattern.positions[3u*vertex], pattern.positions[3u*vertex+1u],
+                               pattern.positions[3u*vertex+2u]};
+                    if (!std::isfinite(face[j].x) || !std::isfinite(face[j].y) || face[j].z != 0.0f)
+                        throw std::invalid_argument("Cloth material coordinates must be finite planar metres");
+                }
+                const float area2 = (face[1]-face[0]).Cross(face[2]-face[0]).Length();
+                if (!(area2 > 0.0f) || !std::isfinite(area2))
+                    throw std::invalid_argument("Cloth material face is degenerate");
+                out.material_faces.push_back(face);
+            }
+        }
+        return out;
+    }
+    const auto& g = media.cloth_grid;
+    if (g.nx < 2u || g.ny < 2u || g.spacing <= 0.0f) return out;
+    const float x0 = g.origin.x - 0.5f * static_cast<float>(g.nx - 1u) * g.spacing;
+    const float y0 = g.origin.y - 0.5f * static_cast<float>(g.ny - 1u) * g.spacing;
+    for (uint32_t j = 0u; j < g.ny; ++j)
+        for (uint32_t i = 0u; i < g.nx; ++i)
+            out.rest.push_back({x0 + static_cast<float>(i) * g.spacing,
+                                y0 + static_cast<float>(j) * g.spacing, g.origin.z});
+    const auto idx = [nx=g.nx](uint32_t i, uint32_t j) { return j*nx + i; };
+    for (uint32_t j = 0u; j+1u < g.ny; ++j)
+        for (uint32_t i = 0u; i+1u < g.nx; ++i) {
+            out.triangles.push_back({{idx(i,j), idx(i+1u,j), idx(i+1u,j+1u)}});
+            out.triangles.push_back({{idx(i,j), idx(i+1u,j+1u), idx(i,j+1u)}});
+        }
+    return out;
+}
+
+}  // namespace
+
 XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
     XpbdCookInput in;
-    const MediaRecord::ClothGrid& g = media.cloth_grid;
-    if (g.nx < 2u || g.ny < 2u || g.spacing <= 0.0f) {
-        return in;  // no cloth (an empty soft set is treated as none).
-    }
-    const uint32_t nx = g.nx, ny = g.ny;
-    const float s = g.spacing;
-    const float x0 = g.origin.x - 0.5f * static_cast<float>(nx - 1u) * s;
-    const float y0 = g.origin.y - 0.5f * static_cast<float>(ny - 1u) * s;
-    std::vector<math::Vec3> rest;
-    rest.reserve(static_cast<size_t>(nx) * ny);
-    for (uint32_t j = 0u; j < ny; ++j) {
-        for (uint32_t i = 0u; i < nx; ++i) {
-            rest.push_back(math::Vec3{x0 + static_cast<float>(i) * s,
-                                      y0 + static_cast<float>(j) * s, g.origin.z});
-        }
-    }
-    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
-    std::vector<runtime::soft::ClothTriangle> tris;
-    for (uint32_t j = 0u; j + 1u < ny; ++j) {
-        for (uint32_t i = 0u; i + 1u < nx; ++i) {
-            tris.push_back({{idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u)}});
-            tris.push_back({{idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)}});
-        }
-    }
+    const auto geometry = BuildClothGeometry(media);
+    const auto& rest = geometry.rest;
+    const auto& tris = geometry.triangles;
+    if (rest.empty()) return in;
+    const auto& material = media.xpbd;
+    if (!std::isfinite(material.surface_density) || material.surface_density < 0.0f ||
+        !std::isfinite(material.particle_mass) || material.particle_mass < 0.0f ||
+        !std::isfinite(material.half_thickness) || material.half_thickness < 0.0f ||
+        (material.surface_density > 0.0f && material.particle_mass > 0.0f))
+        throw std::invalid_argument("Cloth requires finite nonnegative thickness and one mass definition");
     runtime::soft::ClothTopologyOptions opts;
     opts.distance_compliance_alpha = media.xpbd.distance_alpha;
     opts.bend_compliance_alpha = media.xpbd.bend_alpha;
     runtime::soft::XpbdConstraintSet cs;
     runtime::soft::BuildClothConstraints(rest, tris, opts, cs);
+    if (!geometry.material_faces.empty()) {
+        std::map<std::pair<uint32_t, uint32_t>, std::pair<float, uint32_t>> lengths;
+        for (size_t i = 0u; i < tris.size(); ++i) {
+            const auto& face = geometry.material_faces[i];
+            for (uint32_t j = 0u; j < 3u; ++j) {
+                const uint32_t a = tris[i].v[j], b = tris[i].v[(j+1u)%3u];
+                auto& length = lengths[{std::min(a,b), std::max(a,b)}];
+                length.first += (face[j]-face[(j+1u)%3u]).Length();
+                ++length.second;
+            }
+        }
+        // Both panels contribute equally to a sewn edge's rest length.
+        for (auto& distance : cs.distance) {
+            const auto length = lengths.at({distance.particle_a, distance.particle_b});
+            distance.rest_length = length.first / static_cast<float>(length.second);
+        }
+        for (auto& bend : cs.bend) bend.rest_angle = 0.0f;
+    }
 
     in.positions = rest;
     CookParticleSurface collision_surface;
     collision_surface.friction = media.xpbd.friction;
+    collision_surface.half_thickness = material.half_thickness;
     for (const auto& tri : tris)
         collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
     in.surfaces.push_back(std::move(collision_surface));
     in.velocities.assign(rest.size(), math::Vec3::Zero());
-    const float mass =
-        media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
-    in.inv_mass.assign(rest.size(), 1.0f / mass);
-    // Pin set: None (a free drape), Perimeter (a taut membrane), or one grid
-    // edge (a hung curtain); the FromFree default defers to the legacy flag.
-    using Pin = MediaRecord::ClothPin;
-    Pin pin = g.pin;
-    if (pin == Pin::FromFree) pin = g.free ? Pin::None : Pin::Perimeter;
-    const uint32_t last_i = nx - 1u, last_j = ny - 1u;
-    if (pin == Pin::Perimeter) {
-        for (uint32_t k = 0u; k < nx; ++k) {
-            in.inv_mass[idx(k, 0u)] = 0.0f;
-            in.inv_mass[idx(k, last_j)] = 0.0f;
+    std::vector<float> masses(rest.size(), material.particle_mass > 0.0f ? material.particle_mass : 0.01f);
+    if (material.surface_density > 0.0f) {
+        std::fill(masses.begin(), masses.end(), 0.0f);
+        for (size_t i = 0u; i < tris.size(); ++i) {
+            const auto& tri = tris[i];
+            const auto face = geometry.material_faces.empty()
+                ? std::array<math::Vec3, 3>{rest[tri.v[0]], rest[tri.v[1]], rest[tri.v[2]]}
+                : geometry.material_faces[i];
+            const auto a = face[0], b = face[1], c = face[2];
+            const float share = (b-a).Cross(c-a).Length() * (material.surface_density / 6.0f);
+            for (uint32_t vertex : tri.v) masses[vertex] += share;
         }
-        for (uint32_t k = 0u; k < ny; ++k) {
-            in.inv_mass[idx(0u, k)] = 0.0f;
-            in.inv_mass[idx(last_i, k)] = 0.0f;
+    }
+    in.inv_mass.reserve(masses.size());
+    for (float mass : masses) {
+        if (!(mass > 0.0f) || !std::isfinite(1.0f / mass))
+            throw std::invalid_argument("Cloth vertex mass must be finite and positive");
+        in.inv_mass.push_back(1.0f / mass);
+    }
+    if (!media.baked.Empty()) {
+        for (uint32_t vertex : media.cloth_mesh.pinned_vertices) {
+            if (vertex >= in.inv_mass.size())
+                throw std::invalid_argument("Cloth pinned vertex is out of range");
+            in.inv_mass[vertex] = 0.0f;
         }
-    } else if (pin == Pin::EdgeX0 || pin == Pin::EdgeX1) {
-        const uint32_t i = pin == Pin::EdgeX0 ? 0u : last_i;
-        for (uint32_t k = 0u; k < ny; ++k) in.inv_mass[idx(i, k)] = 0.0f;
-    } else if (pin == Pin::EdgeY0 || pin == Pin::EdgeY1) {
-        const uint32_t j = pin == Pin::EdgeY0 ? 0u : last_j;
-        for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
+    } else {
+        const auto& g = media.cloth_grid;
+        const uint32_t nx = g.nx, ny = g.ny;
+        const auto idx = [nx](uint32_t i, uint32_t j) { return j*nx + i; };
+        // Pin set: None (a free drape), Perimeter (a taut membrane), or one grid
+        // edge (a hung curtain); the FromFree default defers to the legacy flag.
+        using Pin = MediaRecord::ClothPin;
+        Pin pin = g.pin;
+        if (pin == Pin::FromFree) pin = g.free ? Pin::None : Pin::Perimeter;
+        const uint32_t last_i = nx - 1u, last_j = ny - 1u;
+        if (pin == Pin::Perimeter) {
+            for (uint32_t k = 0u; k < nx; ++k) {
+                in.inv_mass[idx(k, 0u)] = 0.0f;
+                in.inv_mass[idx(k, last_j)] = 0.0f;
+            }
+            for (uint32_t k = 0u; k < ny; ++k) {
+                in.inv_mass[idx(0u, k)] = 0.0f;
+                in.inv_mass[idx(last_i, k)] = 0.0f;
+            }
+        } else if (pin == Pin::EdgeX0 || pin == Pin::EdgeX1) {
+            const uint32_t i = pin == Pin::EdgeX0 ? 0u : last_i;
+            for (uint32_t k = 0u; k < ny; ++k) in.inv_mass[idx(i, k)] = 0.0f;
+        } else if (pin == Pin::EdgeY0 || pin == Pin::EdgeY1) {
+            const uint32_t j = pin == Pin::EdgeY0 ? 0u : last_j;
+            for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
+        }
     }
     for (const auto& dc : cs.distance) {
         in.distance.push_back(
@@ -2209,7 +2351,8 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
     }
     for (const auto& bc : cs.bend) {
         CookBendCon c;
-        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
+        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
+        c.rest_angle = bc.rest_angle;
         c.compliance_alpha = bc.compliance_alpha;
         in.bend.push_back(c);
     }
@@ -2231,18 +2374,10 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
 }
 
 std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media) {
-    std::vector<uint32_t> tris;
-    const MediaRecord::ClothGrid& g = media.cloth_grid;
-    if (g.nx < 2u || g.ny < 2u || g.spacing <= 0.0f) return tris;
-    const uint32_t nx = g.nx, ny = g.ny;
-    auto idx = [nx](uint32_t i, uint32_t j) { return j * nx + i; };
-    for (uint32_t j = 0u; j + 1u < ny; ++j) {
-        for (uint32_t i = 0u; i + 1u < nx; ++i) {
-            tris.insert(tris.end(), {idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u),
-                                     idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)});
-        }
-    }
-    return tris;
+    std::vector<uint32_t> triangles;
+    for (const auto& tri : BuildClothGeometry(media).triangles)
+        triangles.insert(triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
+    return triangles;
 }
 
 namespace {
@@ -2280,6 +2415,7 @@ void ApplyGrainSkin(MediaRenderSurface& s, const MediaRenderSkin& rs) {
 uint32_t AppendMpmFillSurfaces(std::vector<MediaRenderSurface>& out,
                                const MediaRecord& media, uint32_t base) {
     uint32_t first = base;
+    const size_t begin = out.size();
     for (const MpmBoxFill& f : MpmBoxFills(media)) {
         import::cooker::FluidBoxSpec spec;
         spec.min_corner = f.box.min;
@@ -2295,7 +2431,14 @@ uint32_t AppendMpmFillSurfaces(std::vector<MediaRenderSurface>& out,
         s.particle_count = cnt;
         s.render_material_id = f.render_material_id;
         ApplyGrainSkin(s, media.render_skin);
-        out.push_back(std::move(s));
+        if (out.size() > begin && s.surface_spacing > 0.0f &&
+            out.back().surface_spacing == s.surface_spacing &&
+            out.back().render_material_id == s.render_material_id &&
+            out.back().particle_first + out.back().particle_count == first) {
+            out.back().particle_count += cnt;
+        } else {
+            out.push_back(std::move(s));
+        }
         first += cnt;
     }
     return first - base;
@@ -2306,54 +2449,29 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     const std::vector<MediaRecord>& media) {
     std::vector<MediaRenderSurface> surfaces;
     if (media.empty()) return surfaces;
-    // MPM samples have no fixed boundary topology; cohesive media reconstruct density.
-    // Granular media retain individual grains over the same particle range.
-    if (media.size() == 1u && media.front().method == MediaRecord::Method::MlsMpm) {
-        const MediaRecord& m = media.front();
-        if (!m.mpm_fills.empty()) {  // heterogeneous bed: one skin per fill.
-            AppendMpmFillSurfaces(surfaces, m, 0u);
-            return surfaces;
-        }
-        float sp = 0.0f;
-        if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
-        else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
-        if (sp > 0.0f) {
-            MediaRenderSurface s;
-            s.particle_radius = 0.5f * sp;  // half the sampling lattice spacing.
-            if (m.kind != MediaRecord::Kind::Granular) s.surface_spacing = sp;
-            s.render_material_id = m.render_material_id;
-            ApplyGrainSkin(s, m.render_skin);
-            surfaces.push_back(std::move(s));
-        }
-        return surfaces;
-    }
-    // MPM owns [0,n_mpm); fixed XPBD boundary topology indexes [n_mpm,P).
-    const MediaRecord* mpm_medium = nullptr;
-    for (const MediaRecord& m : media) {
-        if (m.method == MediaRecord::Method::MlsMpm) { mpm_medium = &m; break; }
-    }
+    // MPM media concatenate before XPBD; each medium retains its own surface definition.
     uint32_t base = 0u;
-    if (mpm_medium != nullptr) {
-        if (!mpm_medium->mpm_fills.empty()) {  // heterogeneous bed: one skin per fill.
-            base = AppendMpmFillSurfaces(surfaces, *mpm_medium, 0u);
+    for (const MediaRecord& m : media) {
+        if (m.method != MediaRecord::Method::MlsMpm) continue;
+        if (!m.mpm_fills.empty()) {
+            base += AppendMpmFillSurfaces(surfaces, m, base);
         } else {
             const uint32_t n_mpm =
-                static_cast<uint32_t>(BuildMpmInput(*mpm_medium).positions.size());
-            const float sp = mpm_medium->kind == MediaRecord::Kind::SoftTet
-                                 ? mpm_medium->tet_sphere.cell_len
-                                 : mpm_medium->fluid_box.spacing;
+                static_cast<uint32_t>(BuildMpmInput(m).positions.size());
+            const float sp = m.kind == MediaRecord::Kind::SoftTet
+                                 ? m.tet_sphere.cell_len : m.fluid_box.spacing;
             if (sp > 0.0f && n_mpm > 0u) {
                 MediaRenderSurface s;
                 s.particle_radius = 0.5f * sp;
-                if (mpm_medium->kind != MediaRecord::Kind::Granular)
+                if (m.kind != MediaRecord::Kind::Granular)
                     s.surface_spacing = sp;
-                s.particle_first = 0u;
+                s.particle_first = base;
                 s.particle_count = n_mpm;
-                s.render_material_id = mpm_medium->render_material_id;
-                ApplyGrainSkin(s, mpm_medium->render_skin);
+                s.render_material_id = m.render_material_id;
+                ApplyGrainSkin(s, m.render_skin);
                 surfaces.push_back(std::move(s));
             }
-            base = n_mpm;  // the XPBD slice starts above the MPM slice.
+            base += n_mpm;
         }
     }
     // Cloth + soft-tet concatenate into the XPBD slice in media order; track the
@@ -2388,11 +2506,10 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         std::vector<uint32_t> tris;
         uint32_t verts = 0u;
         if (m.kind == MediaRecord::Kind::Cloth) {
-            const MediaRecord::ClothGrid& g = m.cloth_grid;
-            if (g.nx >= 2u && g.ny >= 2u && g.spacing > 0.0f) {
-                tris = BuildClothSurfaceTriangles(m);
-                verts = g.nx * g.ny;
-            }
+            const auto geometry = BuildClothGeometry(m);
+            verts = static_cast<uint32_t>(geometry.rest.size());
+            for (const auto& tri : geometry.triangles)
+                tris.insert(tris.end(), {tri.v[0], tri.v[1], tri.v[2]});
         } else if (m.kind == MediaRecord::Kind::SoftTet) {
             const MediaRecord::TetSphere& ts = m.tet_sphere;
             if (ts.radius > 0.0f && ts.cells >= 2u && ts.cell_len > 0.0f) {
@@ -2797,6 +2914,67 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     return in;
 }
 
+MpmCookInput BuildMpmInput(const std::vector<MediaRecord>& media) {
+    MpmCookInput combined;
+    bool have = false;
+    for (const auto& medium : media) {
+        if (medium.method != MediaRecord::Method::MlsMpm) continue;
+        auto next = BuildMpmInput(medium);
+        if (!have) {
+            combined = std::move(next);
+            have = true;
+            continue;
+        }
+        if (!(combined.dx > 0.0f) || next.dx != combined.dx ||
+            next.floor_normal.x != combined.floor_normal.x ||
+            next.floor_normal.y != combined.floor_normal.y ||
+            next.floor_normal.z != combined.floor_normal.z ||
+            next.floor_d != combined.floor_d || next.floor_friction != combined.floor_friction)
+            throw std::runtime_error("MLS-MPM media sharing a grid require matching dx and floor parameters");
+        const auto materialize = [](MpmCookInput& input) {
+            if (input.materials.empty()) {
+                input.materials.push_back(input.material);
+                input.material_id.assign(input.positions.size(), 0u);
+            }
+        };
+        materialize(combined);
+        materialize(next);
+        const size_t material_base = combined.materials.size();
+        if (material_base + next.materials.size() > std::numeric_limits<uint32_t>::max() ||
+            combined.positions.size() + next.positions.size() > std::numeric_limits<uint32_t>::max())
+            throw std::length_error("MLS-MPM media exceed the model index capacity");
+        for (uint32_t& id : next.material_id) id += static_cast<uint32_t>(material_base);
+        const auto append = [](auto& destination, const auto& source) {
+            destination.insert(destination.end(), source.begin(), source.end());
+        };
+        append(combined.positions, next.positions);
+        append(combined.velocities, next.velocities);
+        append(combined.inv_mass, next.inv_mass);
+        append(combined.vol0, next.vol0);
+        append(combined.materials, next.materials);
+        append(combined.material_id, next.material_id);
+        combined.substeps = std::max(combined.substeps, next.substeps);
+        const uint64_t contacts = uint64_t{combined.contact_capacity} + next.contact_capacity;
+        if (contacts > std::numeric_limits<uint32_t>::max())
+            throw std::length_error("MLS-MPM contact capacity exceeds the model index capacity");
+        combined.contact_capacity = combined.contact_capacity && next.contact_capacity
+            ? static_cast<uint32_t>(contacts) : 0u;
+        float* origin[] = {&combined.grid_origin.x, &combined.grid_origin.y, &combined.grid_origin.z};
+        const float other[] = {next.grid_origin.x, next.grid_origin.y, next.grid_origin.z};
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            const double upper = std::max(
+                double(*origin[axis]) + double(combined.dx) * (combined.grid_dims[axis] - 1u),
+                double(other[axis]) + double(next.dx) * (next.grid_dims[axis] - 1u));
+            *origin[axis] = std::min(*origin[axis], other[axis]);
+            const double cells = std::ceil((upper - *origin[axis]) / combined.dx) + 1.0;
+            if (!(cells > 0.0) || cells > std::numeric_limits<uint32_t>::max())
+                throw std::length_error("MLS-MPM shared grid exceeds the model index capacity");
+            combined.grid_dims[axis] = static_cast<uint32_t>(cells);
+        }
+    }
+    return combined;
+}
+
 namespace {
 
 // The body<->particle / cross-system contact diameter: 2*radius when authored, else
@@ -2814,7 +2992,8 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
     for (const MediaRecord& m : media) {
         if (any_row_media && m.method == MediaRecord::Method::MlsMpm) continue;
         float sp = 0.0f;
-        if (m.kind == MediaRecord::Kind::Cloth) sp = m.cloth_grid.spacing;
+        if (m.kind == MediaRecord::Kind::Cloth)
+            sp = m.xpbd.half_thickness > 0.0f ? 2.0f * m.xpbd.half_thickness : m.cloth_grid.spacing;
         else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
         else if (m.kind == MediaRecord::Kind::Cable) sp = 2.0f * m.cable_line.radius;
         else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
@@ -2873,11 +3052,9 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     if (media.empty()) return;  // no media -> ParticleMode::None (byte-identical).
     ValidateMedia(media);
 
-    // The single MLS-MPM medium, if any (ValidateMedia guarantees at most one and no
-    // PBF fluid co-resident with it).
-    const MediaRecord* mpm_medium = nullptr;
+    bool have_mpm = false;
     for (const MediaRecord& m : media) {
-        if (m.method == MediaRecord::Method::MlsMpm) { mpm_medium = &m; break; }
+        if (m.method == MediaRecord::Method::MlsMpm) have_mpm = true;
     }
 
     // XPBD soft (cloth + tet-soft, concatenated) + the one PBF fluid. The MLS-MPM
@@ -2905,15 +3082,14 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     SoftFluidContactInput contact;
     contact.contact_d_min = CrossContactDMin(media, particle_contact_radius);
 
-    if (mpm_medium != nullptr) {
-        // An MLS-MPM medium co-resides with XPBD media in the [mpm | xpbd] layout, or
-        // stands alone as its own ParticleMode. No PBF fluid co-resides (ValidateMedia).
+    if (have_mpm) {
+        const auto mpm = BuildMpmInput(media);
         if (have_soft) {
-            CookMpmXpbd(model, env_count, BuildMpmInput(*mpm_medium), soft, contact);
+            CookMpmXpbd(model, env_count, mpm, soft, contact);
         } else {
             XpbdCookInput soft_mpm;
             soft_mpm.solver = nk::Model::ParticleMode::Mpm;  // the cook dispatch selector.
-            CookSoftBodyParticles(model, env_count, soft_mpm, BuildMpmInput(*mpm_medium));
+            CookSoftBodyParticles(model, env_count, soft_mpm, mpm);
         }
         return;
     }

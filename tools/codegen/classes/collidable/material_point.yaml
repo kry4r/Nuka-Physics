@@ -1,0 +1,6 @@
+# A material point exchanges impulse through its particle-to-grid interpolation.
+name: MaterialPoint
+collidable_type_id: 7
+accel_structure: None
+shape_proxy: PointSphere
+reaction_provider: PointEndpoint

@@ -8,6 +8,7 @@
 // ---------------------------------------------------------------------------
 
 #include "render/studio_beauty.hpp"
+#include "runtime/particle_skin.hpp"
 
 #include "math/quat.hpp"
 #include "render/rt_adapter.hpp"
@@ -50,81 +51,6 @@ MeshGeometry MakeFloorGeo(float half, float z) {
     return g;
 }
 
-// Deterministic 32-bit integer hash (index-keyed, stable across frames) -> [0,1).
-// `salt` decorrelates the radius / value / hue channels of one grain.
-float GrainHash01(uint32_t key, uint32_t salt) {
-    uint32_t x = key ^ (salt * 0x9e3779b9u);
-    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
-    return static_cast<float>(x >> 8) * (1.0f / 16777216.0f);
-}
-
-// Per-grain radius scale in [1-amp, 1+amp) (clamped positive) from the global index.
-float GrainRadiusScale(uint32_t g, float amp) {
-    if (amp <= 0.0f) return 1.0f;
-    const float s = 1.0f + amp * (2.0f * GrainHash01(g, 1u) - 1.0f);
-    return s < 0.05f ? 0.05f : s;
-}
-
-// Per-grain albedo tint multiplier: a shared value (brightness) shift plus small
-// per-channel hue offsets, both scaled by `amp`. amp 0 => neutral white.
-Vec3 GrainTint(uint32_t g, float amp) {
-    if (amp <= 0.0f) return Vec3{1.0f, 1.0f, 1.0f};
-    const float dv = amp * (2.0f * GrainHash01(g, 2u) - 1.0f);
-    const float hr = 0.5f * amp * (2.0f * GrainHash01(g, 3u) - 1.0f);
-    const float hg = 0.5f * amp * (2.0f * GrainHash01(g, 4u) - 1.0f);
-    const float hb = 0.5f * amp * (2.0f * GrainHash01(g, 5u) - 1.0f);
-    auto pos = [](float x) { return x < 0.0f ? 0.0f : x; };
-    return Vec3{pos(1.0f + dv + hr), pos(1.0f + dv + hg), pos(1.0f + dv + hb)};
-}
-
-// Bake every particle in [first, first+count) into one skin. `round` emits analytic
-// spheres (perfectly round, cheaper BLAS); otherwise radius-r octahedra (6 verts / 8
-// tris, rounded by smooth normals). `radius_jitter`/`tint_jitter` add deterministic
-// per-grain variation (both 0 + round false => today's uniform octahedra).
-MeshGeometry BakeParticleSpheres(const std::vector<Vec3>& pos, uint32_t first,
-                                 uint32_t count, float r, bool round,
-                                 float radius_jitter, float tint_jitter) {
-    MeshGeometry g;
-    const uint32_t total = static_cast<uint32_t>(pos.size());
-    const uint32_t lo = first < total ? first : total;
-    const uint32_t n = (count == 0u) ? (total - lo)
-                                     : (count < total - lo ? count : total - lo);
-    if (round) {
-        g.sphere_centers.reserve(static_cast<size_t>(n) * 3u);
-        g.sphere_radii.reserve(n);
-        if (tint_jitter > 0.0f) g.sphere_colors.reserve(static_cast<size_t>(n) * 3u);
-        for (uint32_t i = 0; i < n; ++i) {
-            const Vec3& p = pos[lo + i];
-            const uint32_t gi = lo + i;
-            g.sphere_centers.insert(g.sphere_centers.end(), {p.x, p.y, p.z});
-            g.sphere_radii.push_back(r * GrainRadiusScale(gi, radius_jitter));
-            if (tint_jitter > 0.0f) {
-                const Vec3 t = GrainTint(gi, tint_jitter);
-                g.sphere_colors.insert(g.sphere_colors.end(), {t.x, t.y, t.z});
-            }
-        }
-        return g;
-    }
-    static const float kV[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
-                                   {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-    static const uint32_t kF[8][3] = {{0, 2, 4}, {2, 1, 4}, {1, 3, 4}, {3, 0, 4},
-                                      {2, 0, 5}, {1, 2, 5}, {3, 1, 5}, {0, 3, 5}};
-    g.positions.reserve(static_cast<size_t>(n) * 18u);
-    g.indices.reserve(static_cast<size_t>(n) * 24u);
-    for (uint32_t i = 0; i < n; ++i) {
-        const Vec3& p = pos[lo + i];
-        const uint32_t base = i * 6u;
-        const float rp = r * GrainRadiusScale(lo + i, radius_jitter);
-        for (int v = 0; v < 6; ++v) {
-            g.positions.insert(g.positions.end(),
-                               {p.x + rp * kV[v][0], p.y + rp * kV[v][1],
-                                p.z + rp * kV[v][2]});
-        }
-        for (const auto& f : kF)
-            g.indices.insert(g.indices.end(), {base + f[0], base + f[1], base + f[2]});
-    }
-    return g;
-}
 
 // Append one scene Registry render material to the studio palette; kNoId when the
 // id is unset/unknown (the caller keeps its studio default then).
@@ -142,16 +68,16 @@ uint32_t InternSceneMaterial(StudioScene& s, const scene::Registry& registry,
 StudioScene BuildStudioScene(const scene::Registry& registry,
                              const scene::SceneMap& map,
                              const soft::SurfaceTopology& surface_topology,
-                             uint32_t width, uint32_t height) {
+                             uint32_t width, uint32_t height, bool add_default_floor) {
     std::vector<soft::SurfaceTopology> topologies;
     if (!surface_topology.triangles.empty()) topologies.push_back(surface_topology);
-    return BuildStudioScene(registry, map, topologies, width, height);
+    return BuildStudioScene(registry, map, topologies, width, height, add_default_floor);
 }
 
 StudioScene BuildStudioScene(const scene::Registry& registry,
                              const scene::SceneMap& map,
                              const std::vector<soft::SurfaceTopology>& surface_topologies,
-                             uint32_t width, uint32_t height) {
+                             uint32_t width, uint32_t height, bool add_default_floor) {
     StudioScene s;
     s.world = BuildRenderWorld(registry, map);
 
@@ -219,13 +145,13 @@ StudioScene BuildStudioScene(const scene::Registry& registry,
         s.world.instances[static_cast<std::size_t>(accent_inst)].render_material_id = kMatAccent;
 
     // The studio floor (a large static disc the scene sits on).
-    const uint32_t floor_mesh =
-        s.world.meshes.InternPrimitive("floor", [&] { return MakeFloorGeo(8.0f, 0.0f); });
-    RenderInstance fi;
-    fi.mesh_id = floor_mesh; fi.render_material_id = kMatFloor;
-    fi.world_xform = Transform::Identity();
-    fi.pose_source.kind = PoseSource::Kind::Static;
-    s.world.instances.push_back(fi);
+    if (add_default_floor) {
+        RenderInstance fi;
+        fi.mesh_id = s.world.meshes.InternPrimitive("floor", [&] { return MakeFloorGeo(8.0f, 0.0f); });
+        fi.render_material_id = kMatFloor;
+        s.floor_instance = s.world.instances.size();
+        s.world.instances.push_back(fi);
+    }
 
     // Cinematic RasterOptions (no implicit ground: the explicit floor mesh carries it).
     RasterOptions& o = s.options;
@@ -291,15 +217,10 @@ void AddStudioParticleSkin(StudioScene& scene, const scene::Registry& registry,
 void AddStudioDensitySurface(StudioScene& scene, const scene::Registry& registry,
                              uint32_t scene_material_id, float spacing,
                              uint32_t first, uint32_t count) {
-    if (!(spacing > 0.0f) || !std::isfinite(spacing))
-        throw std::invalid_argument("Density surface requires positive finite spacing");
     StudioScene::DensitySurface surface;
     surface.first = first;
     surface.count = count;
-    surface.params.h = 2.0f * spacing;
-    surface.params.cell_size = 0.5f * spacing;
-    surface.params.particle_mass = spacing * spacing * spacing;
-    surface.params.rest_density_rho0 = 1.0f;
+    surface.params = runtime::fluid::DensitySurfaceParams(spacing);
     uint32_t slot = InternSceneMaterial(scene, registry, scene_material_id);
     if (slot == kNoId) {
         scene.world.materials.push_back(Mk(0.42f, 0.385f, 0.34f, 0.0f, 0.85f));
@@ -355,7 +276,7 @@ void PublishStudioScene(StudioScene& scene,
     for (std::size_t si = 0; si < scene.particle_skins.size(); ++si) {
         StudioScene::ParticleSkin& sk = scene.particle_skins[si];
         MeshGeometry mesh =
-            BakeParticleSpheres(particle_pos, sk.first, sk.count, sk.radius, sk.round,
+            runtime::BakeParticleSpheres(particle_pos, sk.first, sk.count, sk.radius, sk.round,
                                 sk.radius_jitter, sk.tint_jitter);
         if (mesh.positions.empty() && mesh.sphere_centers.empty()) continue;
         if (sk.mesh_id == kNoId) {
@@ -414,14 +335,16 @@ struct StudioRtRenderer::Impl {
     Impl() { backend = CreateCudaRtBackend(); }
     ~Impl() { if (backend && handle) backend->FreeScene(handle); }
 
-    void ApplyLighting(const RasterOptions& opts) {
-        rt::Light& l = scene.light;
-        l.directional = true;
-        Vec3 to_sun{opts.sun_direction[0], opts.sun_direction[1], opts.sun_direction[2]};
-        if (to_sun.Length() > 1e-6f) to_sun = to_sun.Normalized();
-        l.direction = -to_sun;  // opts points TOWARD the sun; rt travels AWAY.
-        l.color = {opts.sun_color[0], opts.sun_color[1], opts.sun_color[2]};
-        l.intensity = 1.0f;
+    void ApplyLighting(const RasterOptions& opts, bool authored_light) {
+        if (!authored_light) {
+            rt::Light& l = scene.light;
+            l.directional = true;
+            Vec3 to_sun{opts.sun_direction[0], opts.sun_direction[1], opts.sun_direction[2]};
+            if (to_sun.Length() > 1e-6f) to_sun = to_sun.Normalized();
+            l.direction = -to_sun;
+            l.color = {opts.sun_color[0], opts.sun_color[1], opts.sun_color[2]};
+            l.intensity = opts.use_sun_light ? 1.0f : 0.0f;
+        }
         scene.ambient.color = {
             0.5f * (opts.sun_ambient_sky[0] + opts.sun_ambient_ground[0]),
             0.5f * (opts.sun_ambient_sky[1] + opts.sun_ambient_ground[1]),
@@ -474,9 +397,9 @@ VulkanOffscreenReport StudioRtRenderer::Render(const RenderWorld& world,
                                                const RasterOptions& options) {
     Impl& im = *impl_;
     im.scene = RenderWorldToTwoLevelScene(world);
+    im.ApplyLighting(options, !world.lights.empty());
     if (im.handle) im.backend->UpdateScene(im.handle, im.scene);
     else im.handle = im.backend->BuildScene(im.scene);
-    im.ApplyLighting(options);
     const rt::PinholeCamera cam = im.CameraFromOptions(options);
     rt::Framebuffer fb;
     if (im.beauty)

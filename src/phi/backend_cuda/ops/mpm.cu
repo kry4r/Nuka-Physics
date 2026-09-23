@@ -234,7 +234,7 @@ struct MpmSortScratchLayout {
         size_t scan_bytes = 0u;
         const auto scan_status = cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes,
             static_cast<const uint64_t*>(nullptr), static_cast<uint64_t*>(nullptr),
-            static_cast<int>(node_count));
+            static_cast<int>(std::max(particle_count, node_count)));
         if (scan_status != cudaSuccess)
             throw std::runtime_error(cudaGetErrorString(scan_status));
         temp_bytes = std::max({particle_sort_bytes, node_sort_bytes, select_bytes, scan_bytes});
@@ -479,42 +479,6 @@ __device__ __forceinline__ void SandReturnMap(float* F, float mu, float lambda,
     Mat3MulT(US, V, F);  // F = US * V^T = U diag(s2) V^T.
 }
 
-// Quadratic B-spline base node + the 3 per-axis weights. The particle sits in the
-// stencil [base, base+2]; fx is the particle offset from base in cell units.
-struct Bspline {
-    int64_t base;
-    float   w[3];
-};
-__device__ __forceinline__ Bspline QuadWeights(float gx) {
-    // base = floor(gx - 0.5); fx in [0.5, 1.5) is the offset from base.
-    Bspline b;
-    // Invalid coordinates use a base outside every grid stencil.
-    b.base = isfinite(gx) && fabsf(gx) < 0x1p62f
-        ? static_cast<int64_t>(floorf(gx - 0.5f)) : -0x40000000;
-    const float fx = gx - static_cast<float>(b.base);
-    b.w[0] = 0.5f * (1.5f - fx) * (1.5f - fx);
-    const float d = fx - 1.0f;
-    b.w[1] = 0.75f - d * d;
-    b.w[2] = 0.5f * (fx - 0.5f) * (fx - 0.5f);
-    return b;
-}
-
-// Use 64-bit coordinates so stencil offsets cannot overflow the bounds check.
-// Each environment occupies a separate contiguous node range.
-__device__ __forceinline__ int64_t NodeId(uint32_t env, int64_t ix, int64_t iy,
-                                          int64_t iz, const uint32_t dims[3],
-                                          uint32_t nodes_per_env) {
-    if (ix < 0 || iy < 0 || iz < 0 ||
-        ix >= static_cast<int64_t>(dims[0]) ||
-        iy >= static_cast<int64_t>(dims[1]) ||
-        iz >= static_cast<int64_t>(dims[2])) {
-        return -1;
-    }
-    const uint32_t local = static_cast<uint32_t>(
-        (iz * dims[1] + iy) * dims[0] + ix);
-    return static_cast<int64_t>(env) * nodes_per_env + local;
-}
-
 // MPM interval status is refreshed; shared invalid-endpoint status stays latched.
 __global__ void MpmClearStatusBitsKernel(uint32_t* env_status, uint32_t env_count) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
@@ -655,8 +619,8 @@ __global__ void MpmGridPrepareKernel(uint32_t total_nodes,
                                      float* __restrict__ grid_mass,
                                      m::Vec3* __restrict__ grid_momentum,
                                      m::Vec3* __restrict__ grid_velocity,
+                                     m::Vec3* __restrict__ grid_pseudo_velocity,
                                      float* __restrict__ grid_inv_mass,
-                                     uint64_t* __restrict__ contact_count,
                                      uint32_t* __restrict__ active_node_flags,
                                      uint32_t* __restrict__ cell_start,
                                      uint32_t* __restrict__ node_ids) {
@@ -665,8 +629,8 @@ __global__ void MpmGridPrepareKernel(uint32_t total_nodes,
     grid_mass[i] = 0.0f;
     grid_momentum[i] = m::Vec3::Zero();
     grid_velocity[i] = m::Vec3::Zero();
+    grid_pseudo_velocity[i] = m::Vec3::Zero();
     grid_inv_mass[i] = 0.0f;
-    contact_count[i] = 0u;
     active_node_flags[i] = 0u;
     cell_start[i] = ~0u;
     node_ids[i] = i;
@@ -694,7 +658,7 @@ __global__ void MpmBuildCellRangesKernel(
         for (int64_t a = 0; a < 3; ++a)
             for (int64_t b = 0; b < 3; ++b)
                 for (int64_t c = 0; c < 3; ++c) {
-                    const int64_t node = NodeId(env, bx + a, by + b, bz + c, dims, nodes_per_env);
+                    const int64_t node = nk::MpmNodeIndex(env, bx + a, by + b, bz + c, dims, nodes_per_env);
                     if (node >= 0) atomicExch(&active_node_flags[node], 1u);
                 }
     }
@@ -725,9 +689,9 @@ __global__ void MpmPrepareTransferInputKernel(
         for (int i = 0; i < 9; ++i)
             particle_stress[static_cast<size_t>(p) * 9u + i] = cached.stress[i];
         const m::Vec3 xp = pos[p];
-        const Bspline axes[3] = {QuadWeights((xp.x - origin.x) * inv_dx),
-                                 QuadWeights((xp.y - origin.y) * inv_dx),
-                                 QuadWeights((xp.z - origin.z) * inv_dx)};
+        const nk::MpmQuadraticBasis axes[3] = {nk::MpmQuadraticWeights((xp.x - origin.x) * inv_dx),
+                                 nk::MpmQuadraticWeights((xp.y - origin.y) * inv_dx),
+                                 nk::MpmQuadraticWeights((xp.z - origin.z) * inv_dx)};
         float mass = inv_mass[p] > 0.0f ? 1.0f / inv_mass[p] : 0.0f;
         const bool overlaps_grid = axes[0].base >= -2 && axes[0].base < dims_x &&
             axes[1].base >= -2 && axes[1].base < dims_y &&
@@ -931,6 +895,7 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
                                    float inv_dx, float dx, float dt, m::Vec3 origin,
                                    const float* __restrict__ inv_mass,
                                    const m::Vec3* __restrict__ grid_velocity,
+                                   const m::Vec3* __restrict__ grid_pseudo_velocity,
                                    m::Vec3* __restrict__ part_pos,
                                    m::Vec3* __restrict__ part_vel,
                                    float* __restrict__ part_C) {
@@ -939,20 +904,25 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
     uint32_t env = 0u;
     const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env);
     const m::Vec3 xp = part_pos[p];
-    const Bspline wxs = QuadWeights((xp.x - origin.x) * inv_dx);
-    const Bspline wys = QuadWeights((xp.y - origin.y) * inv_dx);
-    const Bspline wzs = QuadWeights((xp.z - origin.z) * inv_dx);
+    const nk::MpmQuadraticBasis wxs = nk::MpmQuadraticWeights((xp.x - origin.x) * inv_dx);
+    const nk::MpmQuadraticBasis wys = nk::MpmQuadraticWeights((xp.y - origin.y) * inv_dx);
+    const nk::MpmQuadraticBasis wzs = nk::MpmQuadraticWeights((xp.z - origin.z) * inv_dx);
     m::Vec3 vp = m::Vec3::Zero();
+    m::Vec3 pseudo = m::Vec3::Zero();
     float C[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     const uint32_t dims[3] = {dims_x, dims_y, dims_z};
     for (int64_t a = 0; a < 3; ++a) {
         for (int64_t b = 0; b < 3; ++b) {
             for (int64_t c = 0; c < 3; ++c) {
                 const int64_t ix = wxs.base + a, iy = wys.base + b, iz = wzs.base + c;
-                const int64_t id = NodeId(env, ix, iy, iz, dims, nodes_per_env);
+                const int64_t id = nk::MpmNodeIndex(env, ix, iy, iz, dims, nodes_per_env);
                 if (id < 0) continue;
                 const float w = wxs.w[a] * wys.w[b] * wzs.w[c];
                 const m::Vec3 vi = grid_velocity[static_cast<size_t>(id)];
+                const m::Vec3 correction = grid_pseudo_velocity[static_cast<size_t>(id)];
+                pseudo.x = __fadd_rn(pseudo.x, w * correction.x);
+                pseudo.y = __fadd_rn(pseudo.y, w * correction.y);
+                pseudo.z = __fadd_rn(pseudo.z, w * correction.z);
                 vp.x = __fadd_rn(vp.x, w * vi.x);
                 vp.y = __fadd_rn(vp.y, w * vi.y);
                 vp.z = __fadd_rn(vp.z, w * vi.z);
@@ -970,17 +940,7 @@ __global__ void MpmG2PGatherKernel(uint32_t mpm_count,
     for (int32_t k = 0; k < 9; ++k) Cd[k] = C[k] * scale;
     // Advect only a movable particle (a pinned inv_mass==0 sample holds position).
     if (inv_mass != nullptr && inv_mass[p] <= 0.0f) { part_vel[p] = vp; return; }
-    m::Vec3 np = xp + vp * dt;
-    // Separating domain walls at the grid-box faces (x/y both sides + z floor; +z stays
-    // open). Clamp position and drop the outward velocity so nothing leaks or injects.
-    const float xlo = origin.x + dx, xhi = origin.x + (dims_x - 2) * dx;
-    const float ylo = origin.y + dx, yhi = origin.y + (dims_y - 2) * dx;
-    const float zlo = origin.z + dx;
-    if (np.x < xlo) { np.x = xlo; vp.x = fmaxf(vp.x, 0.0f); }
-    else if (np.x > xhi) { np.x = xhi; vp.x = fminf(vp.x, 0.0f); }
-    if (np.y < ylo) { np.y = ylo; vp.y = fmaxf(vp.y, 0.0f); }
-    else if (np.y > yhi) { np.y = yhi; vp.y = fminf(vp.y, 0.0f); }
-    if (np.z < zlo) { np.z = zlo; vp.z = fmaxf(vp.z, 0.0f); }
+    m::Vec3 np = xp + (vp + pseudo) * dt;
     part_vel[p] = vp;
     part_pos[p] = np;
 }
@@ -1117,7 +1077,7 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
     if constexpr (operation == MpmOperation::Predict) {
         launch(MpmStage::GridPrepare, MpmGridPrepareKernel, nblocks,
                total_nodes, data.grid_mass, data.grid_momentum, data.grid_velocity,
-               data.grid_inv_mass, data.grid_contact_count, scratch.active_flags,
+               data.grid_pseudo_vel, data.grid_inv_mass, scratch.active_flags,
                scratch.cell_start, scratch.node_ids);
         launch(MpmStage::CellKeys, MpmCellKeysKernel, pblocks,
                mpm_count, data.particle_pos, Ppe, mpm_pe, inv_dx, origin,
@@ -1170,21 +1130,22 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
     if constexpr (operation == MpmOperation::Exchange) {
         const auto surfaces = nkops::MakeSurfaceQueryView(model, p.bodies_per_env,
             p.mesh_geometry, p.sdf_grid_count, p.sdf_cell_total);
-        const uint32_t contact_blocks = (p.env_count * p.contact_capacity + kBlockSize - 1u) / kBlockSize;
+        const uint32_t clear_count = p.env_count * std::max(p.contact_capacity, p.point_endpoints_per_env);
+        const uint32_t contact_blocks = (clear_count + kBlockSize - 1u) / kBlockSize;
         launch(MpmStage::ContactCount, mpm_contact::ClearSlots, contact_blocks, p, data);
-        launch(MpmStage::ContactCount, mpm_contact::Generate<false>, nblocks,
-               p, model, data, surfaces, scratch.active_nodes, scratch.active_count);
+        launch(MpmStage::ContactCount, mpm_contact::Generate<false>, pblocks,
+               p, model, data, surfaces, mpm_pe);
         if (error != cudaSuccess) return error;
         size_t temp_bytes = scratch.sort_temp_bytes;
         profiler.Start(MpmStage::ContactScan, stream);
         error = cub::DeviceScan::ExclusiveSum(scratch.sort_temp, temp_bytes,
-            data.grid_contact_count, data.grid_contact_offset, static_cast<int>(total_nodes), stream);
+            data.grid_contact_count, data.grid_contact_offset, static_cast<int>(mpm_count), stream);
         profiler.Stop(MpmStage::ContactScan, stream);
         if (error != cudaSuccess) return error;
         launch(MpmStage::ContactEmit, mpm_contact::CountDiagnostics,
-               (p.env_count + kBlockSize - 1u) / kBlockSize, p, data);
-        launch(MpmStage::ContactEmit, mpm_contact::Generate<true>, nblocks,
-               p, model, data, surfaces, scratch.active_nodes, scratch.active_count);
+               (p.env_count + kBlockSize - 1u) / kBlockSize, p, data, mpm_pe);
+        launch(MpmStage::ContactEmit, mpm_contact::Generate<true>, pblocks,
+               p, model, data, surfaces, mpm_pe);
     }
     if constexpr (operation == MpmOperation::Commit) {
         launch(MpmStage::ReactionReadout, mpm_contact::ReadReactions<kBlockSize>,
@@ -1192,7 +1153,7 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
         launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
                mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
                p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
-               data.grid_velocity, data.particle_pos, data.particle_vel, data.particle_C);
+               data.grid_velocity, data.grid_pseudo_vel, data.particle_pos, data.particle_vel, data.particle_C);
         launch(MpmStage::UpdateF, MpmUpdateFKernel, pblocks, mpm_count,
                dt_sub, data.particle_C, data.particle_material_id,
                reinterpret_cast<const nk::MpmMaterial*>(data.mpm_material_table),
@@ -1214,7 +1175,8 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
     }
     if (p->env_count == 0u || p->nodes_per_env == 0u || !(p->dx > 0.0f) ||
         !std::isfinite(p->dx) || !std::isfinite(p->dt) || p->dt < 0.0f ||
-        p->grid_dims[0] == 0u || p->grid_dims[1] == 0u || p->grid_dims[2] == 0u ||
+        p->grid_dims[0] < nk::kMpmStencilWidth || p->grid_dims[1] < nk::kMpmStencilWidth ||
+        p->grid_dims[2] < nk::kMpmStencilWidth ||
         p->substeps > 1u)
         return Status::InvalidArgument;
     if (p->contact_capacity == 0u || p->contact_slot_base < p->full_row_slot_count ||
@@ -1236,13 +1198,21 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
     const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
     if (p->mpm_particles_per_env > Ppe) return Status::InvalidArgument;
     const uint32_t mpm_pe = p->mpm_particles_per_env == 0u ? Ppe : p->mpm_particles_per_env;
+    const uint32_t surface_contacts = p->particle_surfaces_per_env > 0u ? p->contact_capacity : 0u;
+    if (p->point_endpoints_per_env < nk::MpmPointEndpointCount(Ppe, surface_contacts) ||
+        p->point_endpoint_terms_per_env < nk::MpmPointEndpointTermCount(Ppe, surface_contacts) ||
+        uint64_t{p->point_endpoints_per_env} * p->env_count > INT_MAX ||
+        uint64_t{p->point_endpoint_terms_per_env} * p->env_count > INT_MAX ||
+        !data.point_endpoint_ranges || !data.point_endpoint_terms ||
+        (p->particle_surfaces_per_env > 0u && !data.particle_surface_max_speed))
+        return Status::InvalidArgument;
     const uint64_t mpm_count64 =
         static_cast<uint64_t>(mpm_pe) * p->env_count;
     if (static_cast<uint64_t>(Np) != static_cast<uint64_t>(Ppe) * p->env_count ||
         mpm_count64 > static_cast<uint64_t>(INT_MAX)) return Status::InvalidArgument;
     if (!data.particle_pos || !data.particle_vel || !data.particle_inv_mass ||
         !data.particle_C || !data.particle_F || !data.particle_vol0 ||
-        !data.grid_mass || !data.grid_momentum || !data.grid_velocity ||
+        !data.grid_mass || !data.grid_momentum || !data.grid_velocity || !data.grid_pseudo_vel ||
         !data.grid_inv_mass || !data.grid_contact_count || !data.grid_contact_offset ||
         !data.mpm_sort_scratch ||
         !data.mpm_grid_cell_key || !data.mpm_grid_part_idx || !data.mpm_particle_stress ||

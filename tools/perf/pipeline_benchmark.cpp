@@ -1,4 +1,7 @@
+#include "constraint/dihedral_bend.hpp"
+
 #include "robot_cloth_fluid_scene.hpp"
+#include "measurement_clock.hpp"
 
 #include <array>
 #include <chrono>
@@ -13,6 +16,7 @@
 
 #include "phi/backend_cuda/cuda_internal.cuh"
 #include "phi/articulation_contract.hpp"
+#include "nk/solve/point_endpoint.hpp"
 #include "render/render_world.hpp"
 #include "render/sensor_backend.hpp"
 #include "render/rt_adapter.hpp"
@@ -23,7 +27,7 @@ namespace nk = nuka::nk;
 namespace phi = nuka::phi;
 namespace fixture = nuka::perf::fixture;
 using Json = nuka::scene::json::Value;
-using Clock = std::chrono::steady_clock;
+using Clock = nuka::perf::MeasurementClock;
 
 double Milliseconds(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -39,6 +43,7 @@ struct Options {
     float dt = 1.0f / 240.0f;
     uint32_t capacity_scale = 1u;
     uint32_t substeps = 1u;
+    uint32_t velocity_iterations = 48u;
     uint32_t state_sensors = 0u;
     uint32_t tactile_grid = 0u;
     uint32_t cloth_nx = fixture::kClothNx;
@@ -68,6 +73,7 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--steps") options.steps = ParseU32(value);
         else if (flag == "--warmup") options.warmup = ParseU32(value);
         else if (flag == "--substeps") options.substeps = ParseU32(value);
+        else if (flag == "--velocity-iterations") options.velocity_iterations = ParseU32(value);
         else if (flag == "--state-sensors") options.state_sensors = ParseU32(value);
         else if (flag == "--tactile-grid") options.tactile_grid = ParseU32(value);
         else if (flag == "--seed") options.seed = ParseU32(value);
@@ -94,6 +100,8 @@ Options Parse(int argc, char** argv) {
         else throw std::invalid_argument("unknown option " + flag);
     }
     if (options.envs == 0u || options.steps == 0u || options.capacity_scale == 0u || options.substeps == 0u ||
+        options.velocity_iterations == 0u || options.velocity_iterations > UINT16_MAX ||
+        (options.scene == "robot-rigid-mpm-cloth" && options.cloth_nx != fixture::kClothNx) ||
         options.state_sensors > 2u || options.imaging_models > 1u ||
         uint64_t{options.tactile_grid} * options.tactile_grid + 1u > UINT32_MAX ||
         !(options.dt > 0.0f) || !std::isfinite(options.dt) ||
@@ -235,11 +243,12 @@ std::vector<uint8_t> StateSensorBytes(nk::World& world, bool include_tactile = t
     return bytes;
 }
 
-constexpr std::array<nk::FieldId, 10> kPhysicalFields{
+constexpr std::array<nk::FieldId, 14> kPhysicalFields{
     nk::FieldId::BasePose, nk::FieldId::Q, nk::FieldId::Qdot,
     nk::FieldId::LinkVelocity, nk::FieldId::BodyPose,
     nk::FieldId::BodyLinearVelocity, nk::FieldId::BodyAngularVelocity,
-    nk::FieldId::ParticlePos, nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel};
+    nk::FieldId::ParticlePos, nk::FieldId::ParticlePrevPos, nk::FieldId::ParticleVel,
+    nk::FieldId::ParticleF, nk::FieldId::ParticleC, nk::FieldId::ParticlePlastic, nk::FieldId::ParticlePlasticF};
 
 std::vector<uint8_t> State(nk::World& world, bool cache = true) {
     std::vector<nk::FieldId> fields(kPhysicalFields.begin(), kPhysicalFields.end());
@@ -430,13 +439,12 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
             distance_rms_max_env = std::max(distance_rms_max_env,
                 std::sqrt(env_distance_squared / caps.dist_cons_per_env));
         for (uint32_t i = 0u; i < caps.bend_cons_per_env; ++i) {
-            double constraint = 0.0;
-            for (uint32_t j = 0u; j < 4u; ++j) {
-                const auto& gradient = particles.bend_gradients[size_t{i} * 4u + j];
-                const auto& point = points[particles.bend_particles[size_t{i} * 4u + j]];
-                constraint += double{gradient.x} * point.x + double{gradient.y} * point.y +
-                              double{gradient.z} * point.z;
-            }
+            const auto* ids = &particles.bend_particles[size_t{i} * 4u];
+            const auto geometry = nuka::constraint::EvaluateDihedralBend(
+                points[ids[0]], points[ids[1]], points[ids[2]], points[ids[3]]);
+            fixture::Require(geometry.valid, "degenerate cloth bending hinge");
+            const double constraint = nuka::constraint::DihedralBendError(
+                geometry.angle, particles.bend_rest_angle[i]);
             bend_max = std::max(bend_max, std::abs(constraint));
             bend_squared += constraint * constraint;
             ++bend_count;
@@ -451,8 +459,8 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
         std::sqrt(distance_squared / static_cast<double>(distance_count)) : 0.0));
     result.Set("distance_strain_rms_max_env", Json::Float(distance_rms_max_env));
     result.Set("bend_count", Json::Int(bend_count));
-    result.Set("bend_constraint_max", Json::Float(bend_max));
-    result.Set("bend_constraint_rms", Json::Float(bend_count ?
+    result.Set("bend_angle_error_max_rad", Json::Float(bend_max));
+    result.Set("bend_angle_error_rms_rad", Json::Float(bend_count ?
         std::sqrt(bend_squared / static_cast<double>(bend_count)) : 0.0));
     result.Set("pinned_displacement_max_m", Json::Float(pinned_max));
     return result;
@@ -511,22 +519,35 @@ Json IslandWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
         fixture::Require(world.GetData().DownloadField(nk::FieldId::IslandRows, order.data(),
                          order.size() * sizeof(uint32_t)), "island rows download failed");
     std::vector<bool> visited(rows.size(), false);
-    uint32_t visited_count = 0u, articulation_islands = 0u;
+    uint32_t visited_count = 0u, scheduled_count = 0u, articulation_islands = 0u;
     std::map<uint32_t, uint64_t> row_histogram, articulation_row_histogram, tree_histogram;
     for (const auto& island : islands) {
         const auto [offset, count, flags, env] = island;
         fixture::Require(env < caps.env_count && count != 0u &&
                          uint64_t{offset} + count <= order.size(), "invalid island span");
         std::set<uint32_t> trees;
-        for (uint32_t i = 0u; i < count; ++i) {
-            const uint32_t id = order[offset + i];
+        const auto visit = [&](uint32_t id) {
             fixture::Require(id < rows.size() && id / caps.max_rows_per_env == env && !visited[id] &&
-                             (rows[id].flags & nk::nk_row_flags::kActive) &&
-                             (i == 0u || order[offset + i - 1u] < id), "invalid island row ownership or order");
+                             (rows[id].flags & nk::nk_row_flags::kActive), "invalid island row ownership");
             visited[id] = true;
             ++visited_count;
             for (const auto& side : {rows[id].a, rows[id].b}) {
                 if (side.kind == nk::kNkSideArtic) trees.insert(side.index);
+            }
+        };
+        for (uint32_t i = 0u; i < count; ++i) {
+            const uint32_t id = order[offset + i];
+            fixture::Require(id < rows.size() && !(rows[id].flags & nk::nk_row_flags::kBlockTangent) &&
+                             (i == 0u || order[offset + i - 1u] < id), "invalid island row ownership or order");
+            visit(id);
+            ++scheduled_count;
+            if (rows[id].flags & nk::nk_row_flags::kBlockNormal) {
+                for (uint32_t tangent = 1u; tangent <= 2u; ++tangent) {
+                    const uint32_t spoke = id + tangent * rows[id].group_normal_count;
+                    fixture::Require(spoke < rows.size() &&
+                        (rows[spoke].flags & nk::nk_row_flags::kBlockTangent), "invalid friction block ownership");
+                    visit(spoke);
+                }
             }
         }
         fixture::Require(((flags & 1u) != 0u) == !trees.empty(), "invalid island articulation flag");
@@ -546,6 +567,7 @@ Json IslandWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
     Json result = Json::Object();
     result.Set("step", Json::Int(step));
     result.Set("active_rows", Json::Int(active_count));
+    result.Set("scheduled_contact_blocks_and_rows", Json::Int(scheduled_count));
     result.Set("articulation_sides", Json::Int(articulation_sides));
     result.Set("islands", Json::Int(island_count));
     result.Set("articulation_islands", Json::Int(articulation_islands));
@@ -556,15 +578,156 @@ Json IslandWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
     return result;
 }
 
+enum class ContactSystem : uint32_t { Rigid, Articulation, Xpbd, Mpm, Pbf, Fixed, Count };
+constexpr uint32_t kContactSystems = static_cast<uint32_t>(ContactSystem::Count);
+constexpr std::array<const char*, kContactSystems> kContactSystemNames{
+    "rigid", "articulation", "xpbd", "mpm", "pbf", "fixed"};
+
+struct CouplingAcceptance {
+    struct Pair {
+        double impulse = 0.0;
+        uint64_t timed_rows = 0u;
+        uint32_t first_step = 0u, last_step = 0u;
+    };
+    std::vector<std::array<Pair, kContactSystems * kContactSystems>> pairs;
+    bool four_systems;
+
+    CouplingAcceptance(uint32_t envs, bool four) : pairs(envs), four_systems(four) {}
+
+    static uint32_t PairIndex(ContactSystem a, ContactSystem b) {
+        const auto first = static_cast<uint32_t>(a), second = static_cast<uint32_t>(b);
+        return std::min(first, second) * kContactSystems + std::max(first, second);
+    }
+
+    bool Required(uint32_t a, uint32_t b) const {
+        return four_systems ? a < 4u && b < 4u && a < b :
+            a == static_cast<uint32_t>(ContactSystem::Articulation) &&
+            (b == static_cast<uint32_t>(ContactSystem::Xpbd) || b == static_cast<uint32_t>(ContactSystem::Pbf));
+    }
+
+    void Observe(nk::World& world, const std::vector<nk::NkRow>& rows,
+                 const std::vector<float>& impulses, uint32_t step, bool timed) {
+        const auto& model = world.GetModel();
+        const auto& caps = model.capacities;
+        std::vector<nk::PointEndpointRange> ranges(caps.ElementCount(nk::FieldId::PointEndpointRanges));
+        std::vector<nk::PointEndpointTerm> terms(caps.ElementCount(nk::FieldId::PointEndpointTerms));
+        if (!ranges.empty()) {
+            fixture::Require(world.GetData().DownloadField(nk::FieldId::PointEndpointRanges,
+                ranges.data(), ranges.size() * sizeof(ranges[0])), "endpoint range download failed");
+            fixture::Require(world.GetData().DownloadField(nk::FieldId::PointEndpointTerms,
+                terms.data(), terms.size() * sizeof(terms[0])), "endpoint term download failed");
+        }
+        const auto classify = [&](uint32_t kind, uint32_t index, uint32_t env) {
+            if (kind == nk::kNkSideStatic) return ContactSystem::Fixed;
+            if (kind == nk::kNkSideRigid) {
+                fixture::Require(caps.bodies_per_env && index / caps.bodies_per_env == env,
+                    "rigid endpoint crosses environments");
+                return model.body_init.at(index % caps.bodies_per_env).inv_mass > 0.0f ?
+                    ContactSystem::Rigid : ContactSystem::Fixed;
+            }
+            if (kind == nk::kNkSideArtic) {
+                fixture::Require(caps.articulations_per_env && index / caps.articulations_per_env == env,
+                    "articulation endpoint crosses environments");
+                return ContactSystem::Articulation;
+            }
+            if (kind == nk::kNkSideGrid) {
+                fixture::Require(caps.mpm_grid_nodes_per_env && index / caps.mpm_grid_nodes_per_env == env,
+                    "grid endpoint crosses environments");
+                return ContactSystem::Mpm;
+            }
+            fixture::Require(kind == nk::kNkSideParticle && caps.particles_per_env &&
+                index / caps.particles_per_env == env, "invalid particle endpoint");
+            const uint32_t local = index % caps.particles_per_env;
+            if (local < model.MpmParticlesPerEnv()) return ContactSystem::Mpm;
+            if (model.particles.mode == nk::Model::ParticleMode::MpmXpbd ||
+                model.particles.mode == nk::Model::ParticleMode::Xpbd ||
+                (model.particles.mode == nk::Model::ParticleMode::SoftFluid && local < model.particles.n_soft_particles))
+                return ContactSystem::Xpbd;
+            fixture::Require(model.particles.mode == nk::Model::ParticleMode::Pbf ||
+                model.particles.mode == nk::Model::ParticleMode::SoftFluid, "unknown particle system in coupling report");
+            return ContactSystem::Pbf;
+        };
+        const auto category = [&](const nk::NkRowSide& side, uint32_t env) {
+            if (side.kind != nk::kNkSidePointEndpoint) return classify(side.kind, side.index, env);
+            fixture::Require(caps.point_endpoints_per_env && side.index / caps.point_endpoints_per_env == env &&
+                side.index < ranges.size(), "invalid interpolated endpoint");
+            const auto range = ranges[side.index];
+            fixture::Require(range.count && range.first <= terms.size() && range.count <= terms.size() - range.first,
+                "invalid interpolated endpoint range");
+            const auto system = classify(terms[range.first].kind, terms[range.first].index, env);
+            for (uint32_t i = 1u; i < range.count; ++i)
+                fixture::Require(classify(terms[range.first + i].kind, terms[range.first + i].index, env) == system,
+                    "interpolated endpoint spans different physical systems");
+            return system;
+        };
+        for (size_t index = 0u; index < rows.size(); ++index) {
+            const auto& row = rows[index];
+            if (!(row.flags & nk::nk_row_flags::kActive) || !(row.flags & nk::nk_row_flags::kContactNormal)) continue;
+            fixture::Require(std::isfinite(impulses[index]) && impulses[index] >= 0.0f,
+                "invalid unilateral contact impulse");
+            const uint32_t env = static_cast<uint32_t>(index / caps.max_rows_per_env);
+            const auto a = category(row.a, env), b = category(row.b, env);
+            auto& sample = pairs.at(env)[PairIndex(a, b)];
+            if (timed) ++sample.timed_rows;
+            sample.impulse += impulses[index];
+            if (impulses[index] > 0.0f) {
+                if (!sample.first_step) sample.first_step = step;
+                sample.last_step = step;
+            }
+        }
+    }
+
+    bool Valid() const {
+        for (const auto& env : pairs)
+            for (uint32_t a = 0u; a < kContactSystems; ++a)
+                for (uint32_t b = a + 1u; b < kContactSystems; ++b)
+                    if (Required(a, b) && !(env[a * kContactSystems + b].impulse > 0.0)) return false;
+        return true;
+    }
+
+    Json Report() const {
+        Json result = Json::Object(), observations = Json::Array();
+        bool timed_coverage = true;
+        for (uint32_t a = 0u; a < kContactSystems; ++a) {
+            for (uint32_t b = a; b < kContactSystems; ++b) {
+                Json pair = Json::Object(), impulses = Json::Array(), rows = Json::Array();
+                Json first = Json::Array(), last = Json::Array();
+                bool observed = false;
+                for (const auto& env : pairs) {
+                    const auto& sample = env[a * kContactSystems + b];
+                    observed |= sample.first_step > 0u || sample.timed_rows > 0u;
+                    impulses.PushBack(Json::Float(sample.impulse));
+                    rows.PushBack(Json::Int(sample.timed_rows));
+                    first.PushBack(sample.first_step ? Json::Int(sample.first_step) : Json::Null());
+                    last.PushBack(sample.last_step ? Json::Int(sample.last_step) : Json::Null());
+                    if (Required(a, b)) timed_coverage &= sample.timed_rows > 0u;
+                }
+                if (!observed && !Required(a, b)) continue;
+                pair.Set("a", Json::Str(kContactSystemNames[a]));
+                pair.Set("b", Json::Str(kContactSystemNames[b]));
+                pair.Set("required", Json::Bool(Required(a, b)));
+                pair.Set("sampled_normal_impulse_by_env_Ns", std::move(impulses));
+                pair.Set("timed_normal_rows_by_env", std::move(rows));
+                pair.Set("first_impulse_step_by_env", std::move(first));
+                pair.Set("last_impulse_step_by_env", std::move(last));
+                observations.PushBack(std::move(pair));
+            }
+        }
+        result.Set("scope", Json::Str("final substep of every replay step, including warmup; sampled impulses are not time-integrated totals"));
+        result.Set("pairs", std::move(observations));
+        result.Set("timed_samples_cover_required_pairs", Json::Bool(timed_coverage));
+        result.Set("valid", Json::Bool(Valid()));
+        return result;
+    }
+};
+
+constexpr nuka::math::Vec3 kClothAlbedo{0.06f, 0.48f, 0.34f}, kMpmAlbedo{0.75f, 0.22f, 0.06f};
+
 class PipelineSensor {
 public:
-    PipelineSensor(nk::World& physics, const fixture::PreparedScene& prepared,
+    PipelineSensor(nk::World& physics, const fixture::SceneVisuals& visuals,
                     const Options& options) : options_(options) {
-        auto scene = fixture::RobotScene(prepared.path, true);
-        nuka::scene::cook::CookToModelOptions cook_options;
-        cook_options.contact_family = nuka::scene::cook::CookContactFamily::PairDriven;
-        const auto cooked = nuka::scene::cook::CookToModel(scene, 1, cook_options);
-        const auto world = nuka::render::BuildRenderWorld(scene.Ecs(), cooked.scene_map);
+        const auto world = nuka::render::BuildRenderWorld(visuals.scene.Ecs(), visuals.scene_map);
         nuka::render::SensorSceneDesc desc;
         desc.scene = nuka::render::RenderWorldToTwoLevelScene(world);
         fixture::Require(!world.instances.empty(), "no sensor geometry");
@@ -584,13 +747,28 @@ public:
         desc.particles = {static_cast<const nuka::math::Vec3*>(physics.FieldPtr(nk::FieldId::ParticlePos)),
             physics.GetModel().capacities.particles_per_env, physics.EnvCount()};
         const auto& particles = physics.GetModel().particles;
+        const auto append_material = [&](nuka::math::Vec3 color) {
+            nuka::rt::Material material;
+            material.albedo = color;
+            const auto id = static_cast<uint32_t>(desc.scene.materials.size());
+            desc.scene.materials.push_back(material);
+            return id;
+        };
+        const auto cloth_material = append_material(kClothAlbedo), mpm_material = append_material(kMpmAlbedo);
         for (const auto& info : particles.surface_info) {
             nuka::rt::ParticleSurfaceBinding surface;
             const auto first = particles.surface_triangles.begin() + 3u * info.triangle_offset;
             surface.triangle_particles.assign(first, first + 3u * info.triangle_count);
             for (auto& vertex : surface.triangle_particles) vertex += info.vertex_offset;
-            nuka::render::AppendParticleSurface(desc, std::move(surface),
-                static_cast<uint32_t>(desc.scene.materials.size() - 1u));
+            nuka::render::AppendParticleSurface(desc, std::move(surface), cloth_material);
+        }
+        for (const auto& info : visuals.material_surfaces) {
+            nuka::rt::ParticleSurfaceBinding surface;
+            surface.triangle_particles = info.triangles;
+            surface.normal_offset = info.normal_offset;
+            surface.smooth_iters = info.smooth_iters;
+            surface.smooth_lambda = info.smooth_lambda;
+            nuka::render::AppendParticleSurface(desc, std::move(surface), mpm_material);
         }
         for (uint32_t camera = 0u; camera < options_.render_sensors; ++camera) {
             nuka::scene::SensorDesc sensor;
@@ -683,7 +861,7 @@ private:
     nuka::render::SensorSceneHandle* handle_ = nullptr;
 };
 
-Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared,
+Json RenderMeasurements(nk::World& world, const fixture::SceneVisuals& visuals,
                         const Options& options, const std::vector<uint8_t>& expected_state) {
     struct ActiveBackendScope {
         phi::Backend* previous = phi::ActiveBackend();
@@ -694,7 +872,7 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     size_t free_before = 0u, total_bytes = 0u;
     CheckCuda(cudaMemGetInfo(&free_before, &total_bytes));
     const auto create_start = Clock::now();
-    PipelineSensor renderer(world, prepared, options);
+    PipelineSensor renderer(world, visuals, options);
     const double creation_ms = Milliseconds(create_start);
     fixture::Require(world.Reset() == phi::Status::Ok, "render replay reset failed");
     for (uint32_t i = 0u; i < options.warmup; ++i) Step(world, options);
@@ -729,6 +907,7 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
         result.Set("completion_gpu", Distribution(std::move(completion)));
         result.Set("host_submission", Distribution(std::move(wall)));
         result.Set("synchronized_wall_ms", Json::Float(wall_ms));
+        result.Set("host_clock", Json::Str(Clock::Name()));
         result.Set("synchronized_wall_mean_us", Json::Float(wall_ms * 1000.0 / options.steps));
         return result;
     };
@@ -750,7 +929,7 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     const size_t geometry_offset = pixels * 4u * sizeof(float);
     const bool geometry_output_equal = std::equal(output.begin() + geometry_offset, output.end(),
                                                    coupled_output.begin() + geometry_offset);
-    uint64_t hits = 0u;
+    uint64_t hits = 0u, cloth_pixels = 0u, mpm_pixels = 0u;
     bool finite = true;
     for (size_t i = 0u; i < pixels * 10u; ++i) {
         float value;
@@ -762,6 +941,10 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
         uint32_t prim;
         std::memcpy(&prim, output.data() + (pixels * 10u + i) * sizeof(uint32_t), sizeof(uint32_t));
         if (prim != ~0u) ++hits;
+        nuka::math::Vec3 albedo;
+        std::memcpy(&albedo, output.data() + (pixels * 7u + i * 3u) * sizeof(float), sizeof(albedo));
+        if ((albedo - kClothAlbedo).LengthSq() < 1.0e-10f) ++cloth_pixels;
+        if ((albedo - kMpmAlbedo).LengthSq() < 1.0e-10f) ++mpm_pixels;
     }
     if (!options.render_output.empty()) {
         std::ofstream file(options.render_output, std::ios::binary);
@@ -782,11 +965,15 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     config.Set("warmup_frames", Json::Int(options.render_warmup));
     config.Set("imaging_models", Json::Int(options.imaging_models));
     result.Set("config", std::move(config));
-    result.Set("geometry_scope", Json::Str("authored rigid visuals and fixed-topology particle surfaces from the physical model on the public batched sensor path"));
+    result.Set("geometry_scope", Json::Str("same cook's SceneIR and SceneMap; XPBD collision surfaces and an MPM lattice boundary skin follow live particles on the public batched sensor path"));
     result.Set("boundary", Json::Str("physics-to-sensor uses live per-step poses and particle positions; render-only repeats its final world; both complete all AOVs on device; output download is untimed"));
     result.Set("output_layout", Json::Str("env-camera-major color f32x3, depth f32, normal f32x3, albedo f32x3, prim u32"));
     result.Set("output_fnv1a64", Json::Str(Digest(output)));
     result.Set("hit_pixels", Json::Int(hits));
+    result.Set("xpbd_visible_pixels", Json::Int(cloth_pixels));
+    result.Set("mpm_visible_pixels", Json::Int(mpm_pixels));
+    const bool material_visible = options.scene != "robot-rigid-mpm-cloth" || (cloth_pixels > 0u && mpm_pixels > 0u);
+    result.Set("material_visible", Json::Bool(material_visible));
     result.Set("finite", Json::Bool(finite));
     result.Set("coupled_state_equal", Json::Bool(coupled_state_equal));
     result.Set("render_state_equal", Json::Bool(render_state_equal));
@@ -794,7 +981,7 @@ Json RenderMeasurements(nk::World& world, const fixture::PreparedScene& prepared
     result.Set("replay_output_equal", Json::Bool(replay_output_equal));
     result.Set("geometry_output_equal", Json::Bool(geometry_output_equal));
     const bool expected_frame_change = options.imaging_models ? !repeated_output_equal : repeated_output_equal;
-    result.Set("valid", Json::Bool(finite && hits > 0u && coupled_state_equal && render_state_equal &&
+    result.Set("valid", Json::Bool(finite && hits > 0u && material_visible && coupled_state_equal && render_state_equal &&
         replay_output_equal && geometry_output_equal && expected_frame_change));
     return result;
 }
@@ -811,7 +998,9 @@ Json Run(const Options& options) {
     auto config = fixture::Cfg();
     config.dt = options.dt;
     config.substeps = options.substeps;
-    const auto scene_path = options.scene == "robot-cloth-fluid"
+    config.vel_iters = static_cast<uint16_t>(options.velocity_iterations);
+    const bool four_systems = options.scene == "robot-rigid-mpm-cloth";
+    const auto scene_path = options.scene == "robot-cloth-fluid" || four_systems
         ? std::filesystem::path(NUKA_SOURCE_DIR) / "examples/scenes/go2_stand.usda"
         : std::filesystem::path(options.scene);
     const auto prepare_start = Clock::now();
@@ -819,7 +1008,9 @@ Json Run(const Options& options) {
     const auto prepared = fixture::Prepare(scene_path, device, owner.backend, fixture_config);
     const double preparation_ms = Milliseconds(prepare_start);
     const auto cook_start = Clock::now();
-    auto model = fixture::CookPrepared(prepared, options.envs, true, options.cloth_nx);
+    fixture::SceneVisuals visuals;
+    auto model = four_systems ? fixture::CookMpmPrepared(prepared, options.envs, &visuals)
+                             : fixture::CookPrepared(prepared, options.envs, true, options.cloth_nx, &visuals);
     const auto slots = uint64_t{model.capacities.max_contacts_per_env} * options.capacity_scale;
     const auto rows = slots * nk::kPairDrivenRowsPerSlot;
     fixture::Require(rows * options.envs <= std::numeric_limits<int>::max(), "contact capacity exceeds index range");
@@ -887,8 +1078,7 @@ Json Run(const Options& options) {
     const auto& caps = world.GetModel().capacities;
     std::vector<nk::NkRow> rows_host(size_t{caps.max_rows_per_env} * options.envs);
     std::vector<float> impulses(rows_host.size());
-    std::vector<double> cloth_impulses(options.envs), fluid_impulses(options.envs);
-    uint32_t last_cloth_contact_step = 0u, last_fluid_contact_step = 0u;
+    CouplingAcceptance coupling_acceptance(options.envs, four_systems);
     const size_t wrench_bytes = caps.ElementCount(nk::FieldId::LinkContactWrench) *
                                 nk::LayoutOf(nk::FieldId::LinkContactWrench).elem_size;
     std::vector<float> wrench(wrench_bytes / sizeof(float));
@@ -899,7 +1089,6 @@ Json Run(const Options& options) {
     }
     uint64_t wrench_hash = 14695981039346656037ull;
     bool wrench_finite = true;
-    uint64_t cloth_rows = 0u, fluid_rows = 0u;
     Json workload_samples = Json::Array(), xpbd_samples = Json::Array();
     XpbdAcceptance xpbd_acceptance;
     for (uint32_t i = 0; i < options.warmup + options.steps; ++i) {
@@ -921,33 +1110,10 @@ Json Run(const Options& options) {
                          rows_host.size() * sizeof(nk::NkRow)), "row download failed");
         fixture::Require(world.GetData().DownloadField(nk::FieldId::Lambda, impulses.data(),
                          impulses.size() * sizeof(float)), "impulse download failed");
-        for (size_t index = 0u; index < rows_host.size(); ++index) {
-            const auto& row = rows_host[index];
-            if (!(row.flags & nk::nk_row_flags::kActive) ||
-                !(row.flags & nk::nk_row_flags::kContactNormal) || impulses[index] <= 0.0f) continue;
-            const auto& particle = row.a.kind == nk::kNkSideParticle ? row.a : row.b;
-            const auto& rigid = row.a.kind == nk::kNkSideParticle ? row.b : row.a;
-            if (particle.kind != nk::kNkSideParticle || rigid.kind != nk::kNkSideArtic) continue;
-            const uint32_t env = particle.index / caps.particles_per_env;
-            if (particle.index % caps.particles_per_env < world.GetModel().particles.n_soft_particles) {
-                cloth_impulses[env] += impulses[index];
-                last_cloth_contact_step = i + 1u;
-            } else {
-                fluid_impulses[env] += impulses[index];
-                last_fluid_contact_step = i + 1u;
-            }
-        }
+        coupling_acceptance.Observe(world, rows_host, impulses, i + 1u, i >= options.warmup);
         if (i >= options.warmup && (i % 25u == 0u || i + 1u == options.warmup + options.steps)) {
             workload_samples.PushBack(IslandWorkload(world, rows_host, i + 1u));
             xpbd_samples.PushBack(std::move(xpbd_quality));
-            for (const auto& row : rows_host) {
-                if (!(row.flags & nk::nk_row_flags::kActive)) continue;
-                const auto& particle = row.a.kind == nk::kNkSideParticle ? row.a : row.b;
-                const auto& rigid = row.a.kind == nk::kNkSideParticle ? row.b : row.a;
-                if (particle.kind != nk::kNkSideParticle || rigid.kind != nk::kNkSideArtic) continue;
-                if (particle.index % caps.particles_per_env < world.GetModel().particles.n_soft_particles) ++cloth_rows;
-                else ++fluid_rows;
-            }
         }
     }
     const auto replay_state = State(world);
@@ -968,12 +1134,14 @@ Json Run(const Options& options) {
     const double quality_ms = Milliseconds(quality_start);
 
     Json result = Json::Object(), execution = Json::Object(), timing = Json::Object();
-    result.Set("schema_version", Json::Int(3));
+    result.Set("schema_version", Json::Int(4));
     result.Set("scene", Json::Str(options.scene));
     Json configuration = Json::Object();
     configuration.Set("envs", Json::Int(options.envs));
     configuration.Set("dt", Json::Float(options.dt));
     configuration.Set("substeps", Json::Int(options.substeps));
+    configuration.Set("mpm_substeps", Json::Int(world.GetModel().particles.mpm_substeps));
+    configuration.Set("mpm_particles_per_env", Json::Int(world.GetModel().MpmParticlesPerEnv()));
     configuration.Set("state_sensors", Json::Int(options.state_sensors));
     configuration.Set("tactile_grid", Json::Int(options.tactile_grid));
     configuration.Set("fixture_dt", Json::Float(fixture_config.dt));
@@ -995,6 +1163,7 @@ Json Run(const Options& options) {
     execution.Set("boundary", Json::Str("full physics pipeline with contact readout; held control; per-step GPU events; no timed D2H"));
     result.Set("execution", std::move(execution));
     timing.Set("scene_preparation_ms", Json::Float(preparation_ms));
+    timing.Set("host_clock", Json::Str(Clock::Name()));
     timing.Set("cook_ms", Json::Float(cook_ms));
     timing.Set("create_upload_ms", Json::Float(creation_ms));
     timing.Set("capture_first_execute_ms", Json::Float(capture_ms));
@@ -1002,6 +1171,7 @@ Json Run(const Options& options) {
     timing.Set("host_submission_ms", Json::Float(submission_ms));
     timing.Set("gpu_completion_ms", Json::Float(gpu_ms));
     timing.Set("synchronized_wall_ms", Json::Float(wall_ms));
+    timing.Set("gpu_to_host_duration_ratio", Json::Float(gpu_ms / wall_ms));
     timing.Set("batch_step_ms", Json::Float(static_cast<double>(gpu_ms) / options.steps));
     timing.Set("env_steps_per_s", Json::Float(static_cast<double>(options.envs) * options.steps * 1000.0 / wall_ms));
     timing.Set("amortized_env_step_us", Json::Float(gpu_ms * 1000.0 / options.steps / options.envs));
@@ -1042,7 +1212,7 @@ Json Run(const Options& options) {
     quality.Set("link_wrench_finite", Json::Bool(wrench_finite));
     quality.Set("link_wrench_trace_fnv1a64", Json::Str(FormatDigest(wrench_hash)));
     quality.Set("link_wrench_bytes_per_step", Json::Int(wrench_bytes));
-    quality.Set("state_layout", Json::Str("physical fields, contact cache, link wrench"));
+    quality.Set("state_layout", Json::Str("physical fields including MPM F/C/plastic history, contact cache, link wrench"));
     quality.Set("env_status_union", Json::Int(status_union));
     quality.Set("reset_state_equal", Json::Bool(reset_equal));
     quality.Set("timed_replay_bit_equal", Json::Bool(timed_state == replay_state));
@@ -1054,29 +1224,14 @@ Json Run(const Options& options) {
     Json replica_errors = Json::Array();
     for (uint32_t env : mismatched_envs) replica_errors.PushBack(Json::Int(env));
     quality.Set("replica_mismatch_envs", std::move(replica_errors));
-    quality.Set("cloth_rows_sampled", Json::Int(cloth_rows));
-    quality.Set("fluid_rows_sampled", Json::Int(fluid_rows));
-    const auto valid_impulses = [](const std::vector<double>& values) {
-        return std::all_of(values.begin(), values.end(), [](double value) { return value > 0.0 && std::isfinite(value); });
-    };
-    const bool coupling_valid = valid_impulses(cloth_impulses) && valid_impulses(fluid_impulses);
-    Json coupling = Json::Object(), cloth_by_env = Json::Array(), fluid_by_env = Json::Array();
-    for (double value : cloth_impulses) cloth_by_env.PushBack(Json::Float(value));
-    for (double value : fluid_impulses) fluid_by_env.PushBack(Json::Float(value));
-    coupling.Set("scope", Json::Str("every replay step and environment, including warmup; positive normal impulse required for both media"));
-    coupling.Set("cloth_normal_impulse_by_env_Ns", std::move(cloth_by_env));
-    coupling.Set("fluid_normal_impulse_by_env_Ns", std::move(fluid_by_env));
-    coupling.Set("last_cloth_contact_step", Json::Int(last_cloth_contact_step));
-    coupling.Set("last_fluid_contact_step", Json::Int(last_fluid_contact_step));
-    coupling.Set("timed_samples_include_both_media", Json::Bool(cloth_rows > 0u && fluid_rows > 0u));
-    coupling.Set("valid", Json::Bool(coupling_valid));
-    quality.Set("coupling_acceptance", std::move(coupling));
+    const bool coupling_valid = coupling_acceptance.Valid();
+    quality.Set("coupling_acceptance", coupling_acceptance.Report());
     quality.Set("xpbd_samples", std::move(xpbd_samples));
     quality.Set("xpbd_acceptance", xpbd_acceptance.Report());
     result.Set("quality", std::move(quality));
     bool render_valid = true;
     if (options.render_sensors != 0u) {
-        auto render = RenderMeasurements(world, prepared, options, timed_state);
+        auto render = RenderMeasurements(world, visuals, options, timed_state);
         render_valid = render.At("valid").AsBool();
         result.Set("render", std::move(render));
     }
@@ -1098,7 +1253,7 @@ Json Run(const Options& options) {
     validity.Set("valid", Json::Bool(valid));
     Json failures = Json::Array();
     if (!xpbd_acceptance.Valid()) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
-    if (!coupling_valid) failures.PushBack(Json::Str("missing positive cloth/fluid-articulation impulse during complete replay"));
+    if (!coupling_valid) failures.PushBack(Json::Str("missing positive impulse for a required system pair during replay"));
     if (!render_valid) failures.PushBack(Json::Str("sensor lifecycle, output or physics parity failed"));
     if (timed_sensors != replay_sensors) failures.PushBack(Json::Str("mounted sensor replay mismatch"));
     validity.Set("failures", std::move(failures));
@@ -1120,7 +1275,7 @@ int main(int argc, char** argv) {
         if (!result.At("status").At("valid").AsBool()) exit_code = 2;
     } catch (const std::exception& error) {
         result = Json::Object();
-        result.Set("schema_version", Json::Int(3));
+        result.Set("schema_version", Json::Int(4));
         Json status = Json::Object();
         status.Set("valid", Json::Bool(false));
         status.Set("error", Json::Str(error.what()));

@@ -13,6 +13,7 @@
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"   // kPairDrivenRowsPerSlot
+#include "nk/solve/point_endpoint.hpp"
 #include "phi/backend.hpp"
 #include "phi/op_schema.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"
@@ -209,7 +210,7 @@ nk::Model BuildModel(bool bite, float box_x = 0.0f) {
     return m;
 }
 
-nk::Model FiniteMassImpact(float mass, uint32_t owners, uint32_t capacity) {
+nk::Model FiniteMassImpact(float mass, uint32_t owners, uint32_t capacity, float gap = 0.0f) {
     nk::Model model;
     auto& cap = model.capacities;
     cap.bodies_per_env = cap.max_bodies_total = owners;
@@ -218,7 +219,7 @@ nk::Model FiniteMassImpact(float mass, uint32_t owners, uint32_t capacity) {
     for (uint32_t i = 0u; i < owners; ++i) {
         nk::Model::BodyInit body;
         body.pose = Transform::Identity();
-        body.pose.position = {-2.025f, 0.0f, 0.0f};
+        body.pose.position = {-2.0f - gap, 0.0f, 0.0f};
         body.inv_mass = 1.0f / mass;
         body.inv_inertia = Vec3{1.0f, 1.0f, 1.0f} * (3.0f / (8.0f * mass));
         model.body_init.push_back(body);
@@ -287,6 +288,8 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                 const auto pseudo = ReadValues<float>(world, nk::FieldId::RowPseudoLambda);
                 const auto attempted = ReadValues<uint64_t>(world, nk::FieldId::GridContactAttempted);
                 const auto retained = ReadValues<uint32_t>(world, nk::FieldId::GridContactRetained);
+                const auto ranges = ReadValues<nk::PointEndpointRange>(world, nk::FieldId::PointEndpointRanges);
+                const auto terms = ReadValues<nk::PointEndpointTerm>(world, nk::FieldId::PointEndpointTerms);
                 ASSERT_EQ(attempted.size(), 1u);
                 EXPECT_GT(attempted[0], 0u);
                 EXPECT_EQ(attempted[0], retained[0]);
@@ -297,13 +300,21 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                 uint32_t contacts = 0u;
                 for (uint32_t r = 0u; r < rows.size(); ++r) {
                     const auto& row = rows[r];
-                    if (!(row.flags & nk::nk_row_flags::kContactNormal) || row.a.kind != nk::kNkSideGrid) continue;
+                    if (!(row.flags & nk::nk_row_flags::kContactNormal) || row.a.kind != nk::kNkSidePointEndpoint) continue;
                     EXPECT_EQ(row.b.kind, nk::kNkSideRigid);
-                    EXPECT_NE(row.flags & nk::nk_row_flags::kVelocityOnly, 0u);
+                    EXPECT_NE(row.flags & nk::nk_row_flags::kSpeculative, 0u);
                     EXPECT_FLOAT_EQ(pseudo[r], 0.0f);
-                    touched[row.a.index] = true;
-                    const double velocity = row.a.jlin.Dot(grid[row.a.index]) +
-                        row.b.jlin.Dot(rigid[row.b.index]) + row.b.jang.Dot(angular[row.b.index]);
+                    Vec3 interpolated{};
+                    const auto range = ranges[row.a.index];
+                    for (uint32_t i = 0u; i < range.count; ++i) {
+                        const auto& term = terms[range.first + i];
+                        ASSERT_EQ(term.kind, nk::kNkSideGrid);
+                        touched[term.index] = true;
+                        interpolated += term.Multiply(grid[term.index]);
+                    }
+                    EXPECT_LT((interpolated - particles[0]).Length(), 2.0e-6f);
+                    const double velocity = row.a.jlin.Dot(interpolated) +
+                        row.b.jlin.Dot(rigid[row.b.index]) + row.b.jang.Dot(angular[row.b.index]) - row.rhs * dt;
                     residual = std::max(residual, impulses[r] > 1.0e-9f ? std::fabs(velocity) : std::max(-velocity, 0.0));
                     ++contacts;
                 }
@@ -329,7 +340,7 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                     EXPECT_LT(angular[b].Length(), 2.0e-5f);
                     EXPECT_LT((reaction[b] - rigid[b] * ratio).Length(), 2.0e-5f);
                     momentum += rigid[b] * ratio;
-                    moment += Vec3{-2.025f, 0.0f, 0.0f}.Cross(rigid[b] * ratio) + angular[b] * (8.0f * ratio / 3.0f);
+                    moment += Vec3{-2.0f, 0.0f, 0.0f}.Cross(rigid[b] * ratio) + angular[b] * (8.0f * ratio / 3.0f);
                     grid_px += ratio * rigid[b].x;
                     particle_px += ratio * rigid[b].x;
                     grid_energy += 0.5 * ratio * rigid[b].LengthSq() + (4.0 / 3.0) * ratio * angular[b].LengthSq();
@@ -345,6 +356,16 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
             }
         }
     }
+    auto separated_config = Cfg();
+    separated_config.dt = 0.0002f;
+    separated_config.gravity[2] = 0.0f;
+    nk::World separated(FiniteMassImpact(1.0f, 2u, 2u * nk::kMpmStencilNodes, 0.025f),
+                        1u, backend.dev, backend.backend, separated_config);
+    ASSERT_TRUE(separated.Ready());
+    ASSERT_TRUE(separated.Step().AllOk());
+    for (const auto impulse : ReadValues<Vec3>(separated, nk::FieldId::MpmBodyReaction))
+        EXPECT_EQ(impulse.LengthSq(), 0.0f);
+    EXPECT_NEAR(ReadValues<Vec3>(separated, nk::FieldId::ParticleVel)[0].x, -1.0f, 2.0e-6f);
     nk::World limited(FiniteMassImpact(1.0f, 2u, 1u), 1u, backend.dev, backend.backend, Cfg());
     ASSERT_TRUE(limited.Ready());
     ASSERT_TRUE(limited.Step().AllOk());
@@ -353,6 +374,52 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
     EXPECT_EQ(ReadValues<uint32_t>(limited, nk::FieldId::GridContactRetained)[0], 1u);
     EXPECT_EQ(ReadValues<uint64_t>(limited, nk::FieldId::GridContactOverflow)[0], attempted - 1u);
     EXPECT_NE(ReadValues<uint32_t>(limited, nk::FieldId::EnvStatus)[0] & nphi::kEnvStatusGridContactOverflow, 0u);
+}
+
+TEST(RigidOnMpmRest, MaterialPointGapAndThinColliderUseFinalVelocity) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    for (float mass : {0.1f, 1.0f, 1000.0f}) {
+        for (float dt : {0.001f, 0.002f}) {
+            for (float gap : {-0.001f, 0.0f, 0.004f, 0.03f}) {
+                SCOPED_TRACE(::testing::Message() << "mass=" << mass << " dt=" << dt << " gap=" << gap);
+                auto model = FiniteMassImpact(mass, 1u, nk::kMpmStencilNodes);
+                const float half = 0.002f, band = 0.002f, incoming = -10.0f;
+                model.body_init[0].pose.position.x = 0.013f;
+                model.shape_table_rows[0].params[0] = half;
+                model.particles.mpm_body_band = band;
+                const float initial = model.body_init[0].pose.position.x + half + gap;
+                model.particles.initial_pos[0].x = initial;
+                model.particles.initial_vel[0].x = incoming;
+                auto config = Cfg();
+                config.dt = dt;
+                config.gravity[2] = 0.0f;
+                config.pos_iters = 4u;
+                config.pos_beta = 1.0f;
+                config.pos_slop = 0.0f;
+                nk::World world(std::move(model), 1u, backend.dev, backend.backend, config);
+                ASSERT_TRUE(world.Ready()) << world.CreationError();
+                ASSERT_TRUE(world.Step().AllOk());
+                EXPECT_EQ(ReadValues<uint32_t>(world, nk::FieldId::EnvStatus)[0], 0u);
+                const auto point = ReadValues<Vec3>(world, nk::FieldId::ParticlePos)[0];
+                const auto particle_velocity = ReadValues<Vec3>(world, nk::FieldId::ParticleVel)[0];
+                const auto body = ReadValues<Transform>(world, nk::FieldId::BodyPose)[0];
+                const auto body_velocity = ReadValues<Vec3>(world, nk::FieldId::BodyLinearVelocity)[0];
+                const double impulse = std::max(0.0, (-double(std::max(gap, 0.0f)) / dt - incoming)
+                    / (1.0 + 1.0 / mass));
+                const double recovery = std::max(-double(gap), 0.0) / (1.0 + 1.0 / mass);
+                EXPECT_NEAR(particle_velocity.x, incoming + impulse, 3.0e-5);
+                EXPECT_NEAR(body_velocity.x, -impulse / mass, 3.0e-5);
+                EXPECT_NEAR(particle_velocity.x + mass * body_velocity.x, incoming, 3.0e-5);
+                EXPECT_NEAR(point.x, initial + particle_velocity.x * dt + recovery, 3.0e-7f);
+                EXPECT_NEAR(body.position.x, 0.013f + body_velocity.x * dt - recovery / mass, 3.0e-7f);
+                EXPECT_LE(particle_velocity.LengthSq() + mass * body_velocity.LengthSq(), incoming * incoming + 1.0e-4f);
+                EXPECT_GE(point.x - body.position.x - half, -2.0e-7f);
+                EXPECT_NEAR(point.x - body.position.x - half,
+                            std::max(0.0f, gap + incoming * dt), 3.0e-7f);
+            }
+        }
+    }
 }
 
 // Gate (c): the per-substep grid->body reaction summed over a step balances

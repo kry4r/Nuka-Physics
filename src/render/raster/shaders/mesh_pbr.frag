@@ -33,7 +33,7 @@ layout(set = 0, binding = 0) uniform SceneUbo {
     vec4     fog;            // rgb = haze colour; w = density (0 => fog OFF)
     GpuLight lights[kMaxLights];
     mat4     light_view_proj;   // sun's view-proj (world -> light clip) for shadows
-    vec4     shadow_params;     // x = strength (0=off), y = bias, z = texel, w pad
+    vec4     shadow_params;     // strength, depth bias, texel size, PCF spacing
 } scene;
 
 // Directional shadow map (depth from the sun). ALWAYS bound (a 1x1 dummy when
@@ -108,23 +108,21 @@ vec3 LinearToSrgb(vec3 c) {
     return mix(hi, lo, lessThanEqual(c, vec3(0.0031308)));
 }
 
-// Directional shadow factor in [0,1] (1 = fully lit, 0 = fully in shadow), from a
-// 3x3 PCF of the sun's depth map. Returns 1.0 (no shadow) when shadows are off or
-// the fragment is outside the shadow frustum. n_dot_l drives a slope-scaled bias
-// so steep treads do not self-shadow (acne) while contact stays tight.
+// Sample directional visibility with 3x3 PCF and slope-scaled depth bias.
+// Fragments outside the shadow frustum are lit.
 float SunShadow(float n_dot_l) {
     if (scene.shadow_params.x <= 0.0) return 1.0;          // shadows OFF -> fully lit
     // Perspective divide (ortho w==1, but divide for generality) -> NDC.
     vec3 ndc = vLightClip.xyz / max(vLightClip.w, 1e-6);
     // Outside the light frustum in xy -> treat as lit (CLAMP_TO_EDGE + white border).
-    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z > 1.0) {
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
         return 1.0;
     }
     vec2 uv = ndc.xy * 0.5 + 0.5;          // [-1,1] -> [0,1] texel space
     float frag_depth = ndc.z;              // already in [0,1] (Vulkan ortho)
     float slope = clamp(1.0 - n_dot_l, 0.0, 1.0);
     float bias = scene.shadow_params.y * (0.5 + 2.0 * slope);
-    float texel = scene.shadow_params.z;
+    float texel = scene.shadow_params.z * scene.shadow_params.w;
     float lit = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {

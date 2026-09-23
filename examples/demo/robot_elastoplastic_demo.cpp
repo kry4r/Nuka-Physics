@@ -21,8 +21,11 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "nk/solve/point_endpoint.hpp"
 #include "phi/articulation_contract.hpp"
 #include "render/studio_beauty.hpp"
+#include "render/scene_asset.hpp"
+#include "render/raster/vulkan_raster_renderer.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/format/nks.hpp"
 #include "world_capture_checkpoint.hpp"
@@ -59,12 +62,16 @@ struct Args {
     std::filesystem::path source = std::filesystem::path(NUKA_SOURCE_DIR) /
         ".nuka-assets/generated/panda/panda_pick_place.nks";
     std::filesystem::path replay;
+    std::filesystem::path environment = std::filesystem::path(NUKA_SOURCE_DIR) /
+        "examples/assets/nuka_lab/gripper.nks";
     float dx = 0.0012f;
     uint32_t substeps = 128u, velocity_iterations = 32u, frames = 336u;
     uint32_t contact_capacity = 32768u;
     uint32_t width = 1280u, height = 800u, samples = 48u, render_stride = 1u;
     uint32_t checkpoint_interval = 12u, stop_after = ~0u;
     nk::World::ExecutionMode execution = nk::World::ExecutionMode::Graph;
+    std::string overview = "three-quarter";
+    std::string renderer = "rt";
     bool no_render = false, resume = false;
 };
 
@@ -84,6 +91,7 @@ Args ParseArgs(int argc, char** argv) {
         if (key == "--out-dir") args.out = value;
         else if (key == "--scene") args.source = value;
         else if (key == "--replay") args.replay = value;
+        else if (key == "--environment") args.environment = value;
         else if (key == "--dx") args.dx = std::stof(value);
         else if (key == "--substeps") args.substeps = std::stoul(value);
         else if (key == "--velocity-iterations") args.velocity_iterations = std::stoul(value);
@@ -93,6 +101,15 @@ Args ParseArgs(int argc, char** argv) {
         else if (key == "--height") args.height = std::stoul(value);
         else if (key == "--samples") args.samples = std::stoul(value);
         else if (key == "--render-stride") args.render_stride = std::stoul(value);
+        else if (key == "--renderer") {
+            Require(value == "rt" || value == "raster", "Renderer must be rt or raster");
+            args.renderer = value;
+        }
+        else if (key == "--overview") {
+            Require(value == "three-quarter" || value == "front" || value == "top",
+                    "Overview must be three-quarter, front or top");
+            args.overview = value;
+        }
         else if (key == "--checkpoint-interval") args.checkpoint_interval = std::stoul(value);
         else if (key == "--stop-after") args.stop_after = std::stoul(value);
         else if (key == "--execution") {
@@ -142,11 +159,8 @@ const char* Stage(double time) {
 }
 
 void AddSupport(scene::SceneIR& ir, const std::string& name, Vec3 center, Vec3 half,
-                Vec3 color) {
-    scene::MaterialRecord material;
+                scene::MaterialRecord material) {
     material.name = name + "_material";
-    material.base_color = color;
-    material.roughness = 0.35f;
     const auto material_id = ir.AddMaterial(material);
     scene::RigidBodyRecord body;
     body.name = name;
@@ -199,10 +213,17 @@ SceneModel BuildModel(const Args& args) {
         }
         Require(found, "Missing Panda joint " + std::string(kJointNames[j]));
     }
-    AddSupport(ir, "bench", {0.35f, 0.0f, 0.40f}, {0.65f, 0.45f, 0.04f},
-               {0.055f, 0.075f, 0.10f});
+    const auto appearance = scene::nks::Load(args.environment.string());
+    const auto material = [&](const std::string& name) {
+        const auto& materials = appearance.Materials();
+        const auto found = std::find_if(materials.begin(), materials.end(),
+            [&](const auto& value) { return value.name == name; });
+        Require(found != materials.end(), "Missing environment material " + name);
+        return *found;
+    };
+    AddSupport(ir, "bench", {0.35f, 0.0f, 0.40f}, {0.65f, 0.45f, 0.04f}, material("bench_surface"));
     AddSupport(ir, "specimen_support", {kCenter.x, kCenter.y, 0.47f}, {0.04f, 0.05f, 0.03f},
-               {0.28f, 0.32f, 0.38f});
+               material("specimen_support"));
     for (uint32_t i = 0u; i < ir.ShapeCount(); ++i) {
         const auto& shape = ir.GetShape(i);
         if (shape.body_id == joint_bodies[7] || shape.body_id == joint_bodies[8])
@@ -372,12 +393,26 @@ InterfaceMetrics MeasureInterface(nk::World& world, const std::vector<Vec3>& pos
     const auto jb = DownloadRange<float>(world, nk::FieldId::ChainJacobianB, base * dofs, count * dofs);
     const auto qdot = Download<float>(world, nk::FieldId::QdotFlat);
     const auto grid = Download<Vec3>(world, nk::FieldId::GridVelocity);
+    const auto particle_velocity = Download<Vec3>(world, nk::FieldId::ParticleVel);
+    const auto ranges = Download<nk::PointEndpointRange>(world, nk::FieldId::PointEndpointRanges);
+    const auto terms = Download<nk::PointEndpointTerm>(world, nk::FieldId::PointEndpointTerms);
     const auto linear = Download<Vec3>(world, nk::FieldId::BodyLinearVelocity);
     const auto angular = Download<Vec3>(world, nk::FieldId::BodyAngularVelocity);
     const auto side_velocity = [&](const nk::NkRowSide& side, const std::vector<float>& jacobian,
                                    uint64_t row) {
         if (side.kind == nk::kNkSideStatic) return 0.0;
         if (side.kind == nk::kNkSideGrid) return double(side.jlin.Dot(grid[side.index]));
+        if (side.kind == nk::kNkSideParticle) return double(side.jlin.Dot(particle_velocity[side.index]));
+        if (side.kind == nk::kNkSidePointEndpoint) {
+            double value = 0.0;
+            const auto range = ranges.at(side.index);
+            for (uint32_t i = 0u; i < range.count; ++i) {
+                const auto& term = terms.at(range.first + i);
+                const auto& velocity = term.kind == nk::kNkSideGrid ? grid : particle_velocity;
+                value += term.TransposeMultiply(side.jlin).Dot(velocity.at(term.index));
+            }
+            return value;
+        }
         if (side.kind == nk::kNkSideRigid)
             return double(side.jlin.Dot(linear[side.index])) + side.jang.Dot(angular[side.index]);
         Require(side.kind == nk::kNkSideArtic, "Unexpected grid contact endpoint");
@@ -390,7 +425,8 @@ InterfaceMetrics MeasureInterface(nk::World& world, const std::vector<Vec3>& pos
         const auto& normal = rows[row];
         Require((normal.flags & nk::nk_row_flags::kVelocityOnly) != 0u && mass[row] > 0.0f,
                 "Invalid grid contact row");
-        const double velocity = side_velocity(normal.a, ja, row) + side_velocity(normal.b, jb, row);
+        const double velocity = side_velocity(normal.a, ja, row) + side_velocity(normal.b, jb, row) -
+                                double(normal.rhs) * params->dt;
         const double residual = std::fabs(std::min(velocity, double(impulse[row]) / mass[row]));
         result.normal_residual = std::max(result.normal_residual, residual);
         const double tangent = std::hypot(double(impulse[row + 1u]), double(impulse[row + 2u]));
@@ -423,23 +459,30 @@ public:
     Renderer(const Args& args, const scene::SceneIR& ir, const scene::SceneMap& map,
              uint32_t particles, float spacing) : args_(args) {
         scene_ = render::BuildStudioScene(ir.Ecs(), map,
-            std::vector<nuka::runtime::soft::SurfaceTopology>{}, args.width, args.height);
+            std::vector<nuka::runtime::soft::SurfaceTopology>{}, args.width, args.height, false);
         render::UseAuthoredSceneMaterials(scene_);
+        const auto environment = scene::nks::Load(args.environment.string());
+        const auto asset = render::BuildSceneRenderAsset(environment, args.environment.parent_path().string());
+        render::RenderAssetBinding binding;
+        render::SetSceneRenderAsset(scene_.world, binding, asset);
+        render::ApplySceneLighting(scene_.options, asset);
+        render::ApplySceneCamera(scene_.options, asset, args.overview);
+        close_options_ = scene_.options;
+        render::ApplySceneCamera(close_options_, asset, "close");
         render::AddStudioDensitySurface(scene_, ir.Ecs(), render::kNoId, spacing, 0u, particles);
         auto& surface = scene_.density_surfaces.back();
         surface.params.h = 3.0f * spacing;
-        auto& material = scene_.world.materials[surface.material_id];
-        material.base_color[0] = 0.75f;
-        material.base_color[1] = 0.22f;
-        material.base_color[2] = 0.06f;
-        material.roughness = 0.30f;
-        scene_.options.beauty_sky_fill = 0.85f;
-        scene_.options.beauty_specular_env = true;
-        scene_.options.beauty_grade = 0.12f;
-        renderer_ = std::make_unique<render::StudioRtRenderer>();
-        Require(renderer_->ok(), "No ray tracing backend");
-        renderer_->SetBeauty(true, args.samples);
+        surface.material_id = render::SceneAssetMaterial(asset, binding, "gripper_sample");
+        if (args.renderer == "raster") {
+            raster_ = std::make_unique<render::VulkanRasterRenderer>();
+            std::printf("raster device: %s\n", raster_->DeviceName().c_str());
+        } else {
+            renderer_ = std::make_unique<render::StudioRtRenderer>();
+            Require(renderer_->ok(), "No ray tracing backend");
+            renderer_->SetBeauty(true, args.samples);
+        }
         std::filesystem::create_directories(args.out / "frames");
+        scene::nks::Save(environment, (args.out / "render_environment.nks").string());
     }
 
     void Frame(uint32_t frame, const std::vector<Vec3>& positions,
@@ -447,11 +490,9 @@ public:
         if (frame % args_.render_stride != 0u) return;
         render::PublishStudioScene(scene_, links, positions, bodies);
         for (uint32_t view = 0u; view < 2u; ++view) {
-            auto& options = scene_.options;
-            options.camera_eye = view == 0u ? Vec3{1.18f, -1.25f, 1.05f} : Vec3{0.67f, -0.10f, 0.62f};
-            options.camera_target = view == 0u ? Vec3{0.28f, 0.0f, 0.68f} : kCenter;
-            options.camera_fov_degrees = view == 0u ? 37.0f : 29.0f;
-            const auto image = renderer_->Render(scene_.world, options);
+            const auto& options = view == 0u ? scene_.options : close_options_;
+            const auto image = raster_ ? raster_->Render(scene_.world, options) :
+                                         renderer_->Render(scene_.world, options);
             Require(image.pixels.size() == size_t(args_.width) * args_.height, "Incomplete image");
             char name[64];
             std::snprintf(name, sizeof(name), "%s_%06u.ppm", view == 0u ? "wide" : "close", frame);
@@ -469,7 +510,9 @@ public:
 private:
     Args args_;
     render::StudioScene scene_;
+    render::RasterOptions close_options_;
     std::unique_ptr<render::StudioRtRenderer> renderer_;
+    std::unique_ptr<render::VulkanRasterRenderer> raster_;
 };
 
 double Determinant(const float* f) {
