@@ -758,6 +758,10 @@ struct SolveRowsBlockIslandParams {
     uint64_t workspace_bytes = 0u;
 };
 
+// Word count of the solve_color_scratch field the dynamic island solve colors live rows in.
+// Host-callable (defined in solve_rows.cu) so the World sizes it before allocation.
+uint64_t SolveColorScratchWords(const SolveRowsBlockIslandParams& params);
+
 // Particle modes select material constraints and ownership; all row-coupled particles share integration.
 inline constexpr uint32_t kParticleModeNone = 0u;
 inline constexpr uint32_t kParticleModeXpbd = 1u;

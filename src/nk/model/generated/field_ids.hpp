@@ -350,6 +350,7 @@ enum class FieldId : uint16_t {
     ContactSolveMetrics,  // contact_solve_metrics (per:env arena:scratch owner:data elem:8 flags:[readout])
     ContactSolveCounts,  // contact_solve_counts (per:env arena:scratch owner:data elem:2 flags:[readout])
     PairSampleChunks,  // pair_sample_chunks (per:scalar arena:scratch owner:data count:pair_sample_chunk_words)
+    SolveColorScratch,  // solve_color_scratch (per:scalar arena:scratch owner:data count:solve_color_scratch_words)
     Count
 };
 
@@ -695,6 +696,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_solve_metrics",
     "contact_solve_counts",
     "pair_sample_chunks",
+    "solve_color_scratch",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

@@ -377,6 +377,7 @@ struct DataView {
     uint64_t* contact_solve_metrics = nullptr;  // per:env arena:scratch owner:data elem:8 flags:[readout]
     uint32_t* contact_solve_counts = nullptr;  // per:env arena:scratch owner:data elem:2 flags:[readout]
     uint32_t* pair_sample_chunks = nullptr;  // per:scalar arena:scratch owner:data count:pair_sample_chunk_words
+    uint32_t* solve_color_scratch = nullptr;  // per:scalar arena:scratch owner:data count:solve_color_scratch_words
 };
 
 } // namespace nuka::phi

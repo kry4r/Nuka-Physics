@@ -192,6 +192,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         if (call.op == phi::NkOp::NarrowphaseSdf)
             model_.capacities.pair_sample_chunk_words = phi::PairSampleChunkWords(
                 *static_cast<const phi::NarrowphaseSdfParams*>(call.params));
+        if (call.op == phi::NkOp::SolveRowsBlockIsland)
+            model_.capacities.solve_color_scratch_words = std::max(model_.capacities.solve_color_scratch_words,
+                phi::SolveColorScratchWords(*static_cast<const phi::SolveRowsBlockIslandParams*>(call.params)));
     }
     model_.capacities.pair_sort_scratch_bytes =
         (pair_sort_slots > 0u &&

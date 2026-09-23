@@ -290,6 +290,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactIndexScratch: v.contact_index_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::SolverVelocityScratch: v.solver_velocity_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSampleChunks: v.pair_sample_chunks = static_cast<uint32_t*>(p); break;
+        case FieldId::SolveColorScratch: v.solve_color_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::ContactSolveMetrics: v.contact_solve_metrics = static_cast<uint64_t*>(p); break;
         case FieldId::ContactSolveCounts: v.contact_solve_counts = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
