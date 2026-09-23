@@ -2308,8 +2308,9 @@ __global__ void SolveRowsBlockIslandKernel(
             }
             // Clear pseudo accumulators only for rows owned by this island.
             if (dynamic) {
-                for (uint32_t i = warp; i < seg_cnt; i += nwarps)
-                    UpdateSpeculativePenetration<true>(row_order[seg_off + i], env_row_base,
+                // The sweeps read live depths; UpdateIdlePenetrationKernel advances the others.
+                for (uint32_t i = warp; i < live_seg_cnt; i += nwarps)
+                    UpdateSpeculativePenetration<true>(walk_order[live_off + i], env_row_base,
                         env_artic_base, row_penetration, urows, chain_jacobian, chain_jacobian_b,
                         qdot_sh, body_lin_vel, body_ang_vel, point_masses, dof_stride, dt, wlane);
                 for (uint32_t i = lane; i < seg_cnt; i += blockDim.x) {
@@ -2465,6 +2466,44 @@ __global__ void SolveRowsBlockIslandKernel(
             }
         }
         __syncthreads();
+    }
+}
+
+// Island rows outside the position sweeps advance their speculative depth after the solve.
+// The solve writes only pseudo velocities after its own update, so both read the same state.
+__global__ void UpdateIdlePenetrationKernel(
+    const NkRow* __restrict__ urows, const float* __restrict__ chain_jacobian,
+    const float* __restrict__ chain_jacobian_b, const float* __restrict__ qdot_flat,
+    const math::Vec3* __restrict__ body_lin_vel, const math::Vec3* __restrict__ body_ang_vel,
+    PointMassView point_masses, const uint32_t* __restrict__ islands,
+    const uint32_t* __restrict__ island_count_dev, IslandActivityView activity,
+    const uint32_t* __restrict__ row_order, const uint32_t* __restrict__ live_scan,
+    float* __restrict__ row_penetration, uint32_t rows_per_env, uint32_t artics_per_env,
+    uint32_t dof_stride, float dt) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    const uint32_t stride = gridDim.x * (blockDim.x / warpSize);
+    const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;
+    const uint32_t island_count = *island_count_dev;
+    for (uint32_t island = 0u; island < island_count; ++island) {
+        const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[island];
+        const bool active = activity.Active(rec);
+        if (!(rec.flags & kIslandWarpWork) || (!active && !(rec.flags & kIslandHasArticulation)))
+            continue;
+        const uint32_t env_artic_base = rec.env * k_tiles;
+        const float* const qdot = qdot_flat != nullptr
+            ? qdot_flat + static_cast<size_t>(env_artic_base) * dof_stride : nullptr;
+        // Positions stride across the grid, so consecutive islands share the warps evenly.
+        const uint32_t end = rec.seg_off + rec.seg_cnt;
+        for (uint32_t idx = rec.seg_off + (warp + stride - rec.seg_off % stride) % stride;
+             idx < end; idx += stride) {
+            const bool live = live_scan == nullptr ||
+                live_scan[idx] != (idx == 0u ? 0u : live_scan[idx - 1u]);
+            if (active && live) continue;
+            UpdateSpeculativePenetration<true>(row_order[idx], rec.env * rows_per_env,
+                env_artic_base, row_penetration, urows, chain_jacobian, chain_jacobian_b, qdot,
+                body_lin_vel, body_ang_vel, point_masses, dof_stride, dt, lane);
+        }
     }
 }
 
@@ -2835,6 +2874,25 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                    p->pos_beta, p->pos_slop, p->dt, p->vel_tolerance,
                    p->baumgarte_max_velocity, p->continue_impulses == 0u, error);
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        if (run_dynamic && pos_pass && data.row_penetration != nullptr) {
+            constexpr uint32_t idle_block_size = 128u;
+            const uint32_t total_rows = p->rows_per_env * p->env_count;
+            uint32_t idle_blocks = 0u;
+            if (ResidentGridSize(UpdateIdlePenetrationKernel, idle_block_size, 0u,
+                    (total_rows + idle_block_size / 32u - 1u) / (idle_block_size / 32u),
+                    &idle_blocks) != cudaSuccess) return Status::Failed;
+            LaunchCuda(UpdateIdlePenetrationKernel, dim3(idle_blocks), dim3(idle_block_size), 0u,
+                stream, reinterpret_cast<const NkRow*>(data.urows),
+                static_cast<const float*>(data.chain_jacobian),
+                static_cast<const float*>(data.chain_jacobian_b), data.qdot_flat,
+                data.body_linear_velocity, data.body_angular_velocity,
+                PointMassView{data.particle_inv_mass, data.particle_vel,
+                              data.grid_inv_mass, data.grid_velocity,
+                              data.point_endpoint_ranges, data.point_endpoint_terms},
+                islands_in, island_count_dev, activity, row_order_in, live_scan,
+                data.row_penetration, p->rows_per_env, artics_per_env, p->max_dof, p->dt);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        }
         // Flush the articulation tiles the dynamic schedule dropped (the static path
         // scatters all tiles in-kernel). cc_artic_first is BuildSolveIslands' claim table.
         if (run_dynamic && p->articulation_count > 0u && p->max_dof > 0u &&
