@@ -27,6 +27,8 @@ struct SensorFidelityConfig {
 
     bool tonemap_enabled = true;   // ACES-ish filmic tonemap of averaged color
     bool srgb_enabled = true;      // encode linear color to the RGB sensor contract
+    uint32_t transmit_bounces = 2u;
+    bool smooth_normals = false;
 
     // Procedural sky + height fog for the miss shader + secondary-ray ambient.
     math::Vec3 sky_top{0.55f, 0.62f, 0.72f};     // zenith (up)

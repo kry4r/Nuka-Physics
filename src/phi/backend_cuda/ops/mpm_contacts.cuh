@@ -2,6 +2,7 @@
 
 #include "collision/mesh_surface.hpp"
 #include "nk/contact/contact_identity.hpp"
+#include "nk/material/mpm_transfer.hpp"
 #include "nk/model/generated/views.hpp"
 #include "nk/solve/collidable_owner.hpp"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
@@ -10,18 +11,39 @@
 
 namespace nuka::phi::mpm_contact {
 
-// Count and emit traverse the same node, boundary and collidable order.
+template <class Visitor>
+__device__ bool VisitStencil(const MpmParams& p, uint32_t env, math::Vec3 point, Visitor visit) {
+    const float inverse_dx = 1.0f / p.dx;
+    const auto x = nk::MpmQuadraticWeights((point.x - p.grid_origin[0]) * inverse_dx);
+    const auto y = nk::MpmQuadraticWeights((point.y - p.grid_origin[1]) * inverse_dx);
+    const auto z = nk::MpmQuadraticWeights((point.z - p.grid_origin[2]) * inverse_dx);
+    for (uint32_t c = 0u; c < nk::kMpmStencilWidth; ++c) {
+        for (uint32_t b = 0u; b < nk::kMpmStencilWidth; ++b) {
+            for (uint32_t a = 0u; a < nk::kMpmStencilWidth; ++a) {
+                const float weight = x.w[a] * y.w[b] * z.w[c];
+                if (!isfinite(weight)) return false;
+                if (!(weight > 0.0f)) continue;
+                const int64_t node = nk::MpmNodeIndex(env, x.base + a, y.base + b, z.base + c,
+                                                     p.grid_dims, p.nodes_per_env);
+                if (node < 0) return false;
+                visit(static_cast<uint32_t>(node), weight);
+            }
+        }
+    }
+    return true;
+}
+
+// Count and emit traverse the same material points and collidables in stable order.
 template <bool emit>
-__device__ void Visit(const MpmParams& p, const DataView& data, uint32_t node,
-                      uint64_t& count, uint32_t side_kind, uint32_t side_index,
-                      constraint::CollidableRef side, math::Vec3 point,
-                      math::Vec3 normal, float depth, float friction,
-                      uint32_t feature, uint32_t topology) {
+__device__ void Visit(const MpmParams& p, const DataView& data, uint32_t sample,
+    uint32_t mpm_per_env, uint64_t& count, uint32_t side_kind, uint32_t side_index,
+    constraint::CollidableRef side, math::Vec3 point, math::Vec3 normal,
+    float depth, float friction, uint32_t feature, uint32_t topology) {
     const uint64_t ordinal = count++;
     if constexpr (!emit) return;
-    const uint32_t env = node / p.nodes_per_env;
-    const uint64_t local = data.grid_contact_offset[node] -
-        data.grid_contact_offset[env * p.nodes_per_env] + ordinal;
+    const uint32_t env = sample / mpm_per_env;
+    const uint64_t local = data.grid_contact_offset[sample] -
+        data.grid_contact_offset[env * mpm_per_env] + ordinal;
     if (local >= p.contact_capacity) return;
     const uint32_t slot = env * p.contact_slots_per_env + p.contact_slot_base +
                           static_cast<uint32_t>(local);
@@ -30,16 +52,16 @@ __device__ void Visit(const MpmParams& p, const DataView& data, uint32_t node,
     data.ucontact_point[address] = point;
     data.ucontact_normal[address] = normal;
     data.ucontact_depth[address] = depth;
-    data.ucontact_a[address] = node;
+    data.ucontact_a[address] = env * p.point_endpoints_per_env + sample % mpm_per_env;
     data.ucontact_b[address] = side_index;
-    data.ucontact_a_kind[address] = nk::kUContactSideGrid;
+    data.ucontact_a_kind[address] = nk::kUContactSidePointEndpoint;
     data.ucontact_b_kind[address] = side_kind;
     data.ucontact_gen[address] = 1u;
-    data.ucontact_law[slot] = nk::kContactLawVelocity;
+    data.ucontact_law[slot] = nk::kContactLawSpeculative;
     data.ucontact_friction[slot] = friction;
     nk::CanonicalContactDescriptor descriptor;
-    descriptor.a = {constraint::CollidableType::GridNode,
-                    constraint::ReactionProviderKind::GridInvMass, node};
+    descriptor.a = {constraint::CollidableType::MaterialPoint,
+        constraint::ReactionProviderKind::PointEndpoint, env * p.particles_per_env + sample % mpm_per_env};
     descriptor.b = side;
     descriptor.normal = normal;
     descriptor.feature_a = 0u;
@@ -52,50 +74,46 @@ __device__ void Visit(const MpmParams& p, const DataView& data, uint32_t node,
 
 template <bool emit>
 __global__ void Generate(MpmParams p, ModelView model, DataView data,
-                         nkops::SurfaceQueryView surfaces,
-                         const uint32_t* active_nodes, const uint32_t* active_count) {
-    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (slot >= p.env_count * p.nodes_per_env || slot >= *active_count) return;
-    const uint32_t node = active_nodes[slot];
-    if (!(data.grid_inv_mass[node] > 0.0f)) return;
-    const uint32_t env = node / p.nodes_per_env;
-    const uint32_t local = node % p.nodes_per_env;
-    const uint32_t x = local % p.grid_dims[0];
-    const uint32_t y = (local / p.grid_dims[0]) % p.grid_dims[1];
-    const uint32_t z = local / (p.grid_dims[0] * p.grid_dims[1]);
-    const math::Vec3 point{p.grid_origin[0] + x * p.dx,
-                           p.grid_origin[1] + y * p.dx,
-                           p.grid_origin[2] + z * p.dx};
-    const math::Vec3 floor_normal{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
-    const float floor_distance = point.Dot(floor_normal) - p.plane_d;
+                         nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env) {
+    const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= p.env_count * mpm_per_env) return;
+    const uint32_t env = sample / mpm_per_env;
+    const uint32_t particle = env * p.particles_per_env + sample % mpm_per_env;
+    if constexpr (!emit) data.grid_contact_count[sample] = 0u;
+    if (!(data.particle_inv_mass[particle] > 0.0f)) return;
+    const math::Vec3 point = data.particle_pos[particle];
+    math::Vec3 velocity{};
+    const bool valid = VisitStencil(p, env, point, [&](uint32_t node, float weight) {
+        const auto value = data.grid_velocity[node];
+        velocity.x = __fadd_rn(velocity.x, weight * value.x);
+        velocity.y = __fadd_rn(velocity.y, weight * value.y);
+        velocity.z = __fadd_rn(velocity.z, weight * value.z);
+    });
+    if (!valid) {
+        atomicOr(&data.env_status[env], kEnvStatusMpmGridEscape | kEnvStatusInvalidEndpoint);
+        return;
+    }
+    const float reach = p.dx + p.dt * sqrtf(velocity.LengthSq());
     uint64_t count = 0u;
     const auto boundary = [&](uint32_t id, math::Vec3 normal, float depth, float mu) {
-        Visit<emit>(p, data, node, count, nk::kUContactSideBoundary, id,
+        if (depth < -reach) return;
+        Visit<emit>(p, data, sample, mpm_per_env, count, nk::kUContactSideBoundary, id,
             {constraint::CollidableType::StaticBoundary,
              constraint::ReactionProviderKind::StaticNull, env * nk::kMpmBoundaryCount + id},
             point, normal, depth, mu, id, 0u);
     };
-    if (floor_distance <= 0.0f) boundary(0u, floor_normal, -floor_distance, p.plane_mu);
-    if (x == 0u) boundary(1u, {1.0f, 0.0f, 0.0f}, 0.0f, 0.0f);
-    if (x + 1u == p.grid_dims[0]) boundary(2u, {-1.0f, 0.0f, 0.0f}, 0.0f, 0.0f);
-    if (y == 0u) boundary(3u, {0.0f, 1.0f, 0.0f}, 0.0f, 0.0f);
-    if (y + 1u == p.grid_dims[1]) boundary(4u, {0.0f, -1.0f, 0.0f}, 0.0f, 0.0f);
+    const math::Vec3 floor_normal{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
+    boundary(0u, floor_normal, p.plane_d - point.Dot(floor_normal), p.plane_mu);
+    boundary(1u, {1, 0, 0}, p.grid_origin[0] + p.dx - point.x, 0.0f);
+    boundary(2u, {-1, 0, 0}, point.x - (p.grid_origin[0] + (p.grid_dims[0] - 2u) * p.dx), 0.0f);
+    boundary(3u, {0, 1, 0}, p.grid_origin[1] + p.dx - point.y, 0.0f);
+    boundary(4u, {0, -1, 0}, point.y - (p.grid_origin[1] + (p.grid_dims[1] - 2u) * p.dx), 0.0f);
+    boundary(5u, {0, 0, 1}, p.grid_origin[2] + p.dx - point.z, 0.0f);
     uint32_t status = 0u;
     if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u) {
         for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
             const auto shape = nkops::LoadPrimShape(model.shape_table, body);
             if ((shape.contype | shape.conaffinity) == 0u) continue;
-            const auto pose = data.body_pose[env * p.bodies_per_env + body];
-            const auto surface = nkops::QueryCollidableSurface(surfaces, body, shape,
-                nkops::PrimInverseTransformPoint(pose, point), p.body_band);
-            if (!surface.valid) {
-                status |= kEnvStatusMpmOneWayBody | kEnvStatusContactGeometryUnavailable;
-                continue;
-            }
-            if (!isfinite(surface.distance) || surface.distance >= p.body_band) continue;
-            const math::Vec3 raw_normal = nkops::PrimRotate(pose.rotation, surface.normal);
-            const float length = sqrtf(raw_normal.LengthSq());
-            if (!isfinite(length) || length <= 1.0e-8f) continue;
             const auto owner = nk::ResolveCollidableOwner(shape.body_id, env, body,
                 p.bodies_per_env, p.base_link_count, p.artics_per_env, model.body_to_link,
                 model.body_to_articulation, model.body_collidable_body);
@@ -103,6 +121,31 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
                 status |= kEnvStatusInvalidEndpoint;
                 continue;
             }
+            math::Vec3 linear{}, angular{}, origin{};
+            if (owner.kind == nk::kNkSideArtic) {
+                const auto pose = data.link_pose[owner.link];
+                const auto v = data.link_velocity[owner.link];
+                angular = nkops::PrimRotate(pose.rotation, {v.v[0], v.v[1], v.v[2]});
+                linear = nkops::PrimRotate(pose.rotation, {v.v[3], v.v[4], v.v[5]});
+                origin = pose.position;
+            } else if (owner.kind == nk::kNkSideRigid) {
+                linear = data.body_linear_velocity[owner.body];
+                angular = data.body_angular_velocity[owner.body];
+                origin = nkops::BodyCenterOfMass(data.body_pose[owner.body], data.body_inertial_frame[owner.body]);
+            }
+            const float speed = sqrtf(linear.LengthSq()) + sqrtf(angular.LengthSq() * (point - origin).LengthSq());
+            const float query_distance = p.body_band + reach + p.dt * speed;
+            const auto pose = data.body_pose[env * p.bodies_per_env + body];
+            const auto surface = nkops::QueryCollidableSurface(surfaces, body, shape,
+                nkops::PrimInverseTransformPoint(pose, point), query_distance);
+            if (!surface.valid) {
+                status |= kEnvStatusMpmOneWayBody | kEnvStatusContactGeometryUnavailable;
+                continue;
+            }
+            if (!isfinite(surface.distance) || surface.distance > query_distance) continue;
+            const math::Vec3 raw_normal = nkops::PrimRotate(pose.rotation, surface.normal);
+            const float length = sqrtf(raw_normal.LengthSq());
+            if (!isfinite(length) || length <= 1.0e-8f) continue;
             constraint::CollidableRef endpoint;
             endpoint.handle = owner.body;
             endpoint.type = constraint::CollidableType::RigidBody;
@@ -115,33 +158,33 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
                 endpoint.type = constraint::CollidableType::StaticWorld;
                 endpoint.react = constraint::ReactionProviderKind::StaticNull;
             }
-            Visit<emit>(p, data, node, count, nk::kUContactSideBody, body, endpoint,
-                point, raw_normal * (1.0f / length), p.body_band - surface.distance,
+            Visit<emit>(p, data, sample, mpm_per_env, count, nk::kUContactSideBody, body, endpoint,
+                point, raw_normal * (1.0f / length), -surface.distance,
                 p.body_mu, surface.feature, body);
         }
     }
     const collision::MeshSurfaceView particle_surfaces{
-        data.pbf_predicted_pos != nullptr
-            ? reinterpret_cast<const float*>(data.pbf_predicted_pos + size_t{env} * p.particles_per_env) : nullptr,
+        reinterpret_cast<const float*>(data.particle_pos + size_t{env} * p.particles_per_env),
         model.particle_surface_triangles,
         data.particle_surface_nodes != nullptr
             ? data.particle_surface_nodes + size_t{env} * p.particle_surface_nodes_per_env : nullptr,
         {p.particles_per_env, p.particle_surface_triangles, p.particle_surface_nodes_per_env}};
     for (uint32_t mesh = 0u; mesh < p.particle_surfaces_per_env; ++mesh) {
         const auto info = model.particle_surface_info[mesh];
-        const float band = p.body_band + model.particle_surface_thickness[mesh];
-        const auto surface = collision::QueryMeshSurface(particle_surfaces, info, point, band);
+        const float thickness = model.particle_surface_thickness[mesh];
+        const float query_distance = p.body_band + thickness + reach + p.dt *
+            data.particle_surface_max_speed[env * p.particle_surfaces_per_env + mesh];
+        const auto surface = collision::QueryMeshSurface(particle_surfaces, info, point, query_distance);
         if (!surface.valid) {
             status |= kEnvStatusContactGeometryUnavailable;
             continue;
         }
-        if (!(surface.distance < band) || surface.triangle == ~0u) continue;
+        if (surface.distance > query_distance || surface.triangle == ~0u) continue;
         const size_t at = size_t{info.triangle_offset + surface.triangle} * 3u;
         uint32_t indices[nk::kTriangleEndpointTerms];
         math::Vec3 vertices[nk::kTriangleEndpointTerms];
         for (uint32_t i = 0u; i < nk::kTriangleEndpointTerms; ++i) {
             indices[i] = env * p.particles_per_env + info.vertex_offset + model.particle_surface_triangles[at + i];
-            // Detection uses predicted geometry; impulse arms use the positions that own momentum.
             vertices[i] = data.particle_pos[indices[i]];
         }
         nk::PointEndpointTerm terms[nk::kTriangleEndpointTerms];
@@ -149,46 +192,56 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
             status |= kEnvStatusContactGeometryUnavailable;
             continue;
         }
+        const uint32_t term_count = nk::CanonicalizePointEndpointTerms(terms, nk::kTriangleEndpointTerms);
         uint32_t endpoint = 0u;
         if constexpr (emit) {
-            const uint64_t contact = data.grid_contact_offset[node] -
-                data.grid_contact_offset[env * p.nodes_per_env] + count;
+            const uint64_t contact = data.grid_contact_offset[sample] -
+                data.grid_contact_offset[env * mpm_per_env] + count;
             if (contact < p.contact_capacity) {
-                endpoint = env * p.point_endpoints_per_env + static_cast<uint32_t>(contact);
+                endpoint = env * p.point_endpoints_per_env + p.particles_per_env + static_cast<uint32_t>(contact);
                 const uint32_t first = env * p.point_endpoint_terms_per_env +
-                    static_cast<uint32_t>(contact) * nk::kTriangleEndpointTerms;
-                data.point_endpoint_ranges[endpoint] = {first, nk::kTriangleEndpointTerms};
-                for (uint32_t i = 0u; i < nk::kTriangleEndpointTerms; ++i)
+                    p.particles_per_env * nk::kMpmStencilNodes + static_cast<uint32_t>(contact) * nk::kTriangleEndpointTerms;
+                data.point_endpoint_ranges[endpoint] = {first, term_count};
+                for (uint32_t i = 0u; i < term_count; ++i)
                     data.point_endpoint_terms[first + i] = terms[i];
             }
         }
-        Visit<emit>(p, data, node, count, nk::kUContactSidePointEndpoint, endpoint,
+        Visit<emit>(p, data, sample, mpm_per_env, count, nk::kUContactSidePointEndpoint, endpoint,
             {constraint::CollidableType::ParticleSurface, constraint::ReactionProviderKind::PointEndpoint,
-             env * p.particle_surfaces_per_env + mesh}, point, surface.normal, band - surface.distance,
-            fmaxf(p.body_mu, model.particle_surface_friction[mesh]),
-            info.triangle_offset + surface.triangle, mesh);
+             env * p.particle_surfaces_per_env + mesh}, point, surface.normal, thickness - surface.distance,
+            fmaxf(p.body_mu, model.particle_surface_friction[mesh]), info.triangle_offset + surface.triangle, mesh);
     }
-    if constexpr (!emit) data.grid_contact_count[node] = count;
+    if constexpr (emit) {
+        if (count > 0u) {
+            const uint32_t endpoint = env * p.point_endpoints_per_env + sample % mpm_per_env;
+            const uint32_t first = env * p.point_endpoint_terms_per_env + (sample % mpm_per_env) * nk::kMpmStencilNodes;
+            uint32_t terms = 0u;
+            VisitStencil(p, env, point, [&](uint32_t node, float weight) {
+                data.point_endpoint_terms[first + terms++] = nk::WeightedPointEndpointTerm(nk::kNkSideGrid, node, weight);
+            });
+            data.point_endpoint_ranges[endpoint] = {first, terms};
+        }
+    } else {
+        data.grid_contact_count[sample] = count;
+    }
     if (status != 0u) atomicOr(&data.env_status[env], status);
 }
 
 __global__ void ClearSlots(MpmParams p, DataView data) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= p.env_count * p.contact_capacity) return;
-    const uint32_t slot = (i / p.contact_capacity) * p.contact_slots_per_env +
-                          p.contact_slot_base + i % p.contact_capacity;
-    data.ucontact_count[slot] = 0u;
-    if (data.point_endpoint_ranges != nullptr) {
-        const uint32_t endpoint = (i / p.contact_capacity) * p.point_endpoints_per_env + i % p.contact_capacity;
-        data.point_endpoint_ranges[endpoint] = {};
+    if (i < p.env_count * p.contact_capacity) {
+        const uint32_t slot = (i / p.contact_capacity) * p.contact_slots_per_env +
+                              p.contact_slot_base + i % p.contact_capacity;
+        data.ucontact_count[slot] = 0u;
     }
+    if (i < p.env_count * p.point_endpoints_per_env) data.point_endpoint_ranges[i] = {};
 }
 
-__global__ void CountDiagnostics(MpmParams p, DataView data) {
+__global__ void CountDiagnostics(MpmParams p, DataView data, uint32_t mpm_per_env) {
     const uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
     if (env >= p.env_count) return;
-    const uint32_t first = env * p.nodes_per_env;
-    const uint32_t last = first + p.nodes_per_env - 1u;
+    const uint32_t first = env * mpm_per_env;
+    const uint32_t last = first + mpm_per_env - 1u;
     const uint64_t count = data.grid_contact_offset[last] + data.grid_contact_count[last] -
                            data.grid_contact_offset[first];
     const uint64_t retained = count < p.contact_capacity ? count : p.contact_capacity;

@@ -18,11 +18,13 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "render/studio_beauty.hpp"
+#include "render/scene_asset.hpp"
 #include "render/texture_image.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_ir.hpp"
 
 #include <cstdint>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <string>
@@ -139,14 +141,15 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
 
 }  // namespace nuka::c_abi
 
-extern "C" {
+namespace {
 
-nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
+nuka_result_t RenderBeauty(nuka_world_handle world,
                                        const nuka_beauty_camera_t* camera,
                                        uint32_t width, uint32_t height,
                                        uint32_t spp, uint8_t dtype,
                                        void* out_rgb, size_t out_capacity,
-                                       size_t* out_pixel_count) {
+                                       size_t* out_pixel_count,
+                                       const nuka_scene_camera_t* authored = nullptr) {
     if (width == 0u || height == 0u) {
         return NUKA_RESULT_INVALID_ARG;
     }
@@ -219,7 +222,7 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
         nuka::render::PublishStudioScene(studio, link_pose, particle_pos, body_pose);
 
         // Drive the camera + image size; trace the offline beauty frame to host.
-        nuka::render::RasterOptions& o = studio.options;
+        nuka::render::RasterOptions o = studio.options;
         o.width = width;
         o.height = height;
         o.use_camera_override = true;
@@ -231,14 +234,13 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
         // Author-driven beauty look levers; neutral env values reproduce the studio
         // defaults exactly (sun_disc keys off the key colour, direction unchanged).
         const nuka::scene::EnvironmentRecord& env = record->scene->Environment();
-        o.beauty_sky_fill =
-            (env.ibl_full_fill && !env.hdri.empty()) ? env.intensity : 0.30f;
-        o.beauty_sun_disc[0] = env.sun_disc * o.sun_color[0];
-        o.beauty_sun_disc[1] = env.sun_disc * o.sun_color[1];
-        o.beauty_sun_disc[2] = env.sun_disc * o.sun_color[2];
-        o.beauty_exposure_ev = env.exposure_ev;
-        o.beauty_grade = env.grade;
-        o.beauty_specular_env = env.specular_env;
+        nuka::render::ApplySceneEnvironment(o, env);
+        o.camera_near = authored != nullptr ? authored->near_clip : 0.05f;
+        o.camera_far = authored != nullptr ? authored->far_clip : 1000.0f;
+        if (authored != nullptr && authored->shadow_radius > 0.0f) {
+            o.shadow_center = o.camera_target;
+            o.shadow_radius = authored->shadow_radius;
+        }
         record->beauty->renderer->SetBeauty(true, spp != 0u ? spp : 16u);
         const nuka::render::VulkanOffscreenReport report =
             record->beauty->renderer->Render(studio.world, o);
@@ -270,6 +272,107 @@ nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
+}
+
+}  // namespace
+
+extern "C" {
+
+nuka_result_t nuka_world_get_scene_camera(nuka_world_handle world, const char* name,
+                                         uint32_t env_index, nuka_scene_camera_t* out_camera) {
+    if (name == nullptr || name[0] == '\0' || out_camera == nullptr) return NUKA_RESULT_INVALID_ARG;
+    const auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world || !record->scene) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        const auto& model = record->world->GetModel();
+        if (env_index >= model.capacities.env_count) return NUKA_RESULT_INVALID_ARG;
+        const nuka::scene::CameraRecord* selected = nullptr;
+        const std::string requested(name), suffix = "/" + requested;
+        for (const auto& camera : record->scene->Cameras()) {
+            if (camera.name == requested) { selected = &camera; break; }
+        }
+        if (selected == nullptr) {
+            for (const auto& camera : record->scene->Cameras()) {
+                if (camera.name.size() < suffix.size() ||
+                    camera.name.compare(camera.name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+                if (selected != nullptr) return NUKA_RESULT_INVALID_ARG;
+                selected = &camera;
+            }
+        }
+        if (selected == nullptr) return NUKA_RESULT_INVALID_ARG;
+        const auto& camera = *selected;
+        const auto& local = camera.local_transform;
+        if (!std::isfinite(local.position.LengthSq()) || !std::isfinite(local.rotation.Norm()) ||
+            std::fabs(local.rotation.Norm() - 1.0f) > 1e-4f ||
+            !(camera.vertical_fov_degrees > 0.0f && camera.vertical_fov_degrees < 180.0f) ||
+            !(camera.near_clip > 0.0f && camera.far_clip > camera.near_clip) ||
+            !std::isfinite(camera.far_clip) || !(camera.focus_distance > 0.0f) ||
+            !std::isfinite(camera.focus_distance) || !(camera.shadow_radius >= 0.0f) ||
+            !std::isfinite(camera.shadow_radius)) return NUKA_RESULT_INVALID_ARG;
+        nuka_scene_camera_t result{};
+        result.mount = NUKA_SENSOR_MOUNT_WORLD;
+        result.local_offset[0] = local.position.x;
+        result.local_offset[1] = local.position.y;
+        result.local_offset[2] = local.position.z;
+        result.local_offset[3] = local.rotation.w;
+        result.local_offset[4] = local.rotation.x;
+        result.local_offset[5] = local.rotation.y;
+        result.local_offset[6] = local.rotation.z;
+        auto pose = local;
+        if (camera.attached_body != nuka::scene::kInvalidBody) {
+            const auto body = camera.attached_body;
+            if (body >= record->scene->RigidBodyCount() || body >= model.capacities.bodies_per_env)
+                return NUKA_RESULT_INVALID_ARG;
+            const bool link = body < model.body_to_link.size() && model.body_to_link[body] != ~uint32_t{0};
+            result.mount = link ? NUKA_SENSOR_MOUNT_LINK : NUKA_SENSOR_MOUNT_BODY;
+            result.mount_index = link ? model.body_to_link[body] : body;
+            const auto stride = link ? model.capacities.links_per_env : model.capacities.bodies_per_env;
+            const auto field = link ? nuka::nk::FieldId::LinkPose : nuka::nk::FieldId::BodyPose;
+            nuka::math::Transform parent;
+            const auto offset = (uint64_t{env_index} * stride + result.mount_index) * sizeof(parent);
+            if (!record->world->GetData().DownloadField(field, &parent, sizeof(parent), offset))
+                return NUKA_RESULT_INTERNAL;
+            pose = parent * local;
+        }
+        const auto look = pose.TransformPoint({0.0f, 0.0f, -camera.focus_distance});
+        const auto up = pose.TransformDirection({0.0f, 1.0f, 0.0f});
+        const auto copy = [](float* output, nuka::math::Vec3 value) {
+            output[0] = value.x; output[1] = value.y; output[2] = value.z;
+        };
+        copy(result.view.eye, pose.position);
+        copy(result.view.look, look);
+        copy(result.view.up, up);
+        result.view.fov_deg = camera.vertical_fov_degrees;
+        result.near_clip = camera.near_clip;
+        result.far_clip = camera.far_clip;
+        result.focus_distance = camera.focus_distance;
+        result.shadow_radius = camera.shadow_radius;
+        *out_camera = result;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_render_beauty(nuka_world_handle world, const nuka_beauty_camera_t* camera,
+                                       uint32_t width, uint32_t height, uint32_t spp, uint8_t dtype,
+                                       void* out_rgb, size_t out_capacity, size_t* out_pixel_count) {
+    return RenderBeauty(world, camera, width, height, spp, dtype, out_rgb, out_capacity, out_pixel_count);
+}
+
+nuka_result_t nuka_world_render_scene_camera(nuka_world_handle world, const char* name,
+                                            uint32_t width, uint32_t height, uint32_t spp, uint8_t dtype,
+                                            void* out_rgb, size_t out_capacity, size_t* out_pixel_count) {
+    nuka_scene_camera_t camera{};
+    const auto status = nuka_world_get_scene_camera(world, name, 0u, &camera);
+    if (status != NUKA_RESULT_OK) return status;
+    return RenderBeauty(world, &camera.view, width, height, spp, dtype, out_rgb, out_capacity,
+                        out_pixel_count, &camera);
 }
 
 }  // extern "C"

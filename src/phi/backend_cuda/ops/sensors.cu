@@ -377,6 +377,8 @@ __global__ void SampleStateSensorKernel(DataView data, SampleStateSensorParams p
             truth[0] = data.q[env * p.links_per_env + desc.index];
             truth[1] = data.qdot[env * p.links_per_env + desc.index];
         }
+        if (desc.kind == sensor::StateSensorKind::JointEffort)
+            truth[0] = data.actuator_effort[env * p.links_per_env + desc.index];
         if (desc.kind == sensor::StateSensorKind::LinearVelocity) {
             const auto velocity = mg::RotateByQuatNormalized(InverseRotation(after.pose.rotation), after.linear_velocity);
             truth[0] = velocity.x; truth[1] = velocity.y; truth[2] = velocity.z;
@@ -471,7 +473,8 @@ Status OpSampleStateSensor(const ModelView&, const DataView& data, const void* a
         !p->queue || !p->queue_capacity || !p->env_count) return Status::InvalidArgument;
     if ((p->desc.kind == sensor::StateSensorKind::ContactWrench && !p->contact_impulses) ||
         (p->desc.kind == sensor::StateSensorKind::ForceTorque && !p->transmitted_impulses) ||
-        (sensor::IsContactRegionSensor(p->desc.kind) && !p->tactile)) return Status::InvalidArgument;
+        (sensor::IsContactRegionSensor(p->desc.kind) && !p->tactile) ||
+        (p->desc.kind == sensor::StateSensorKind::JointEffort && !data.actuator_effort)) return Status::InvalidArgument;
     LaunchCuda(SampleStateSensorKernel, dim3((uint64_t{p->env_count} + kObservationBlockSize - 1u) /
         kObservationBlockSize), dim3(kObservationBlockSize), 0u, stream, data, *p);
     return cudaPeekAtLastError() == cudaSuccess ? Status::Ok : Status::Failed;

@@ -169,6 +169,51 @@ NUKA_MESH_HD inline bool MeshSurfaceContains(
     return inside;
 }
 
+// Incident faces define an angle-weighted normal at a vertex and a summed normal at an edge.
+NUKA_MESH_HD inline math::Vec3 MeshFeatureNormal(
+    const MeshSurfaceView& view, const MeshSurfaceInfo& info, math::Vec3 point) {
+    using math::Vec3;
+    const auto& root = view.nodes[info.node_offset];
+    const float scale = fmaxf(fmaxf(fabsf(root.lower.x), fabsf(root.upper.x)),
+        fmaxf(fmaxf(fabsf(root.lower.y), fabsf(root.upper.y)),
+              fmaxf(fabsf(root.lower.z), fabsf(root.upper.z))));
+    const float tolerance = 64.0f * FLT_EPSILON * scale;
+    const float tolerance_sq = tolerance * tolerance;
+    Vec3 normal{};
+    uint32_t cursor = 0u;
+    while (cursor < info.node_count) {
+        const auto& node = view.nodes[info.node_offset + cursor];
+        if (node.escape <= cursor || node.escape > info.node_count) return {};
+        if (MeshBoundsDistanceSquared(point, node) > tolerance_sq) {
+            cursor = node.escape;
+            continue;
+        }
+        if (node.triangle != ~0u) {
+            Vec3 a, b, c;
+            if (!MeshSurfaceTriangle(view, info, node.triangle, a, b, c)) return {};
+            const Vec3 face = (b - a).Cross(c - a);
+            const float length = sqrtf(face.LengthSq());
+            if (length > 0.0f) {
+                const auto closest = ClosestTrianglePoint(point, a, b, c);
+                if ((point - closest.point).LengthSq() <= tolerance_sq) {
+                    const Vec3 vertices[3] = {a, b, c};
+                    float weight = 3.14159265358979323846f;
+                    for (uint32_t i = 0u; i < 3u; ++i) {
+                        if ((point - vertices[i]).LengthSq() > tolerance_sq) continue;
+                        const Vec3 u = vertices[(i + 1u) % 3u] - vertices[i];
+                        const Vec3 v = vertices[(i + 2u) % 3u] - vertices[i];
+                        weight = atan2f(sqrtf(u.Cross(v).LengthSq()), u.Dot(v));
+                        break;
+                    }
+                    normal += face * (weight / length);
+                }
+            }
+        }
+        ++cursor;
+    }
+    return normal;
+}
+
 NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info, math::Vec3 p,
     float max_distance = FLT_MAX) {
@@ -195,6 +240,7 @@ NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
         if (node.triangle != ~0u) {
             Vec3 a, b, c;
             if (!MeshSurfaceTriangle(view, info, node.triangle, a, b, c)) return {};
+            if (!((b - a).Cross(c - a).LengthSq() > 0.0f)) { ++cursor; continue; }
             const auto closest = ClosestTrianglePoint(p, a, b, c);
             const float sq = (p - closest.point).LengthSq();
             if (sq < best_sq || (sq == best_sq && node.triangle < result.triangle)) {
@@ -211,9 +257,16 @@ NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
     if (result.triangle == ~0u) return result;
     result.valid = true;
     const bool closed = (info.flags & kMeshSurfaceClosed) != 0u;
+    const bool oriented = (info.flags & kMeshSurfaceOriented) != 0u;
     const float distance = sqrtf(best_sq);
+    if (oriented && !closed && result.feature < 6u) {
+        const Vec3 feature_normal = MeshFeatureNormal(view, info, result.point);
+        if (feature_normal.LengthSq() > 0.0f) face_normal = feature_normal;
+    }
     if (distance > 0.0f) {
-        const bool inside = closed && MeshSurfaceContains(view, info, p, result.valid);
+        // Oriented boundaries use authored outward winding even when their surface has seams.
+        const bool inside = closed ? MeshSurfaceContains(view, info, p, result.valid)
+                                   : oriented && (p - result.point).Dot(face_normal) < 0.0f;
         result.distance = inside ? -distance : distance;
         result.normal = (p - result.point) * ((inside ? -1.0f : 1.0f) / distance);
     } else {

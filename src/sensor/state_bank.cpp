@@ -39,6 +39,7 @@ uint32_t StateSensorValueCount(StateSensorKind kind) {
         case StateSensorKind::Imu: return 6u;
         case StateSensorKind::FramePose: return 7u;
         case StateSensorKind::JointState: return 2u;
+        case StateSensorKind::JointEffort: return 1u;
         case StateSensorKind::LinearVelocity: return 3u;
         case StateSensorKind::ContactWrench: return 6u;
         case StateSensorKind::ForceTorque: return 6u;
@@ -189,7 +190,7 @@ phi::Status StateSensorBank::Add(const nk::Model& model, const StateSensorDesc& 
             return phi::Status::InvalidArgument;
         }
     } else return phi::Status::InvalidArgument;
-    if (desc.kind == StateSensorKind::JointState) {
+    if (desc.kind == StateSensorKind::JointState || desc.kind == StateSensorKind::JointEffort) {
         if (desc.mount != StateSensorMount::Link || desc.index >= model.articulation.joint_type.size())
             return phi::Status::InvalidArgument;
         const auto type = static_cast<phi::ArticulationJointType>(model.articulation.joint_type[desc.index]);

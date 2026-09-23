@@ -156,7 +156,8 @@ rt::TwoLevelScene RenderWorldToTwoLevelScene(const RenderWorld& world) {
     // Body-attached lights follow the camera; world lights retain their position.
     if (!world.lights.empty()) {
         const RenderLight& l = world.lights.front();
-        scene.light.directional = false;
+        scene.light.directional = l.type == scene::LightComponent::Type::Directional;
+        scene.light.direction = l.world_xform.TransformDirection({0.0f, 0.0f, -1.0f}).Normalized();
         scene.light.position = l.world_xform.position;
         scene.light.color = l.color;
         scene.light.intensity = l.intensity;

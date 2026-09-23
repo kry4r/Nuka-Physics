@@ -1,0 +1,41 @@
+{
+  "nks_version": 1,
+  "render_materials": {
+    "room": {"base_color": [0.115, 0.13, 0.13, 1], "roughness": 0.95, "metallic": 0},
+    "warm_shell": {"base_color": [0.52, 0.56, 0.53, 1], "roughness": 0.40, "metallic": 0.18},
+    "work_deck": {"base_color": [0.047, 0.068, 0.072, 1], "roughness": 0.83, "metallic": 0},
+    "graphite": {"base_color": [0.022, 0.033, 0.038, 1], "roughness": 0.62, "metallic": 0.15},
+    "edge_metal": {"base_color": [0.18, 0.24, 0.25, 1], "roughness": 0.38, "metallic": 0.72},
+    "avocado": {"base_color": [0.23, 0.34, 0.095, 1], "roughness": 0.48, "metallic": 0.12},
+    "edge_light": {"base_color": [0.30, 0.48, 0.13, 1], "roughness": 0.40, "metallic": 0, "emissive": [0.38, 0.62, 0.18]},
+    "lettering": {"base_color": [0.67, 0.73, 0.60, 1], "roughness": 0.62, "metallic": 0},
+    "grid_minor": {"base_color": [0.055, 0.080, 0.082, 1], "roughness": 0.83, "metallic": 0},
+    "grid_major": {"base_color": [0.064, 0.093, 0.094, 1], "roughness": 0.83, "metallic": 0},
+    "elastoplastic": {"base_color": [0.64, 0.19, 0.055, 1], "roughness": 0.32, "metallic": 0},
+    "gripper_sample": {"base_color": [0.75, 0.22, 0.06, 1], "roughness": 0.30, "metallic": 0},
+    "impact_metal": {"base_color": [0.52, 0.58, 0.65, 1], "roughness": 0.40, "metallic": 0.70},
+    "press_metal": {"base_color": [0.45, 0.50, 0.56, 1], "roughness": 0.24, "metallic": 0.90},
+    "bench_surface": {"base_color": [0.055, 0.075, 0.10, 1], "roughness": 0.35, "metallic": 0},
+    "specimen_support": {"base_color": [0.28, 0.32, 0.38, 1], "roughness": 0.35, "metallic": 0}
+  },
+  "environment": {
+    "use_scene_materials": true,
+    "grade": 0.08,
+    "specular_env": true,
+    "shadow": {
+      "map_size": 2048,
+      "strength": 0.9,
+      "bias": 0.0002,
+      "filter_radius": 1.0
+    },
+    "sky": {
+      "top": [0.18, 0.24, 0.27],
+      "bottom": [0.39, 0.44, 0.43],
+      "ground": [0.115, 0.13, 0.13],
+      "ambient_sky": [0.12, 0.17, 0.18],
+      "ambient_ground": [0.075, 0.09, 0.09],
+      "background": [0.0980392157, 0.1333333333, 0.1411764706],
+      "fill": 0.60
+    }
+  }
+}

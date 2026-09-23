@@ -63,7 +63,9 @@ inline constexpr uint32_t kUContactSidePointEndpoint = 4u;  // index = global en
 // Compliant contacts integrate a reference acceleration; velocity contacts impose Jv >= 0.
 inline constexpr uint32_t kContactLawCompliant = 0u;
 inline constexpr uint32_t kContactLawVelocity = 1u;
-inline constexpr uint32_t kMpmBoundaryCount = 5u;  // floor, x-/x+, y-/y+
+// Speculative contacts close positive gaps; existing overlap is removed by the position solve.
+inline constexpr uint32_t kContactLawSpeculative = 2u;
+inline constexpr uint32_t kMpmBoundaryCount = 6u;  // floor, x-/x+, y-/y+, grid lower z
 
 namespace nk_row_flags {
 inline constexpr uint32_t kActive       = 1u << 0;
@@ -75,6 +77,7 @@ inline constexpr uint32_t kJointLimitUpper = 1u << 5;
 inline constexpr uint32_t kJointLimit = kJointLimitLower | kJointLimitUpper;
 inline constexpr uint32_t kContactNormal = 1u << 6;
 inline constexpr uint32_t kVelocityOnly = 1u << 7;
+inline constexpr uint32_t kSpeculative = 1u << 8;
 }  // namespace nk_row_flags
 
 // General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-
@@ -102,6 +105,9 @@ struct NkRowSide {
     math::Vec3 jlin{};                 // contact Jacobian, linear part
     math::Vec3 jang{};                 // rigid: r x jlin (others: unused, 0)
 };
+
+// A repeated articulation owner stores its net chain Jacobian on side A and zero on B.
+// Contact endpoints remain separate for force readout and geometric identity.
 
 struct NkRow {
     uint32_t flags = 0u;               // nk_row_flags

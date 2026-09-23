@@ -28,6 +28,7 @@
 
 #include "nuka/nuka.h"
 #include "nk/model/generated/field_ids.hpp"
+#include "nk/model/generated/arena_layout.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "nk/solve/point_endpoint.hpp"
 #include "phi/op_schema.hpp"
@@ -187,14 +188,18 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_TASK_NULLSPACE_DAMPING,  kStrideF32, kWireDtypeF32, nk::FieldId::TaskNullspaceDamping},
     {NUKA_FIELD_POINT_ENDPOINT_RANGES, sizeof(nuka_point_endpoint_range_t), kWireDtypeU32, nk::FieldId::PointEndpointRanges},
     {NUKA_FIELD_POINT_ENDPOINT_TERMS, sizeof(nuka_point_endpoint_term_t), kWireDtypeU8, nk::FieldId::PointEndpointTerms},
+    {NUKA_FIELD_CONTACT_SOLVE_METRICS, nk::LayoutOf(nk::FieldId::ContactSolveMetrics).elem_size,
+        kWireDtypeU64, nk::FieldId::ContactSolveMetrics},
+    {NUKA_FIELD_CONTACT_SOLVE_COUNTS, nk::LayoutOf(nk::FieldId::ContactSolveCounts).elem_size,
+        kWireDtypeU32, nk::FieldId::ContactSolveCounts},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 61u,
-              "dlpack_table must hold exactly the 61 public state fields");
+static_assert(kDlpackFieldCount == 63u,
+              "dlpack_table must hold exactly the 63 public state fields");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

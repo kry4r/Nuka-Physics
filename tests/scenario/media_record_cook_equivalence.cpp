@@ -95,7 +95,8 @@ cook::XpbdCookInput LegacyClothCookInput(const FlatDesc& p) {
             {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
     for (const auto& bc : cs.bend) {
         cook::CookBendCon c;
-        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; c.k[k] = bc.k[k]; }
+        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
+        c.rest_angle = bc.rest_angle;
         c.compliance_alpha = bc.compliance_alpha;
         in.bend.push_back(c);
     }
@@ -217,10 +218,8 @@ void ExpectXpbdEqual(const cook::XpbdCookInput& a, const cook::XpbdCookInput& b)
     for (size_t i = 0; i < a.bend.size(); ++i) {
         for (uint32_t k = 0; k < 4u; ++k) {
             EXPECT_EQ(a.bend[i].p[k], b.bend[i].p[k]);
-            EXPECT_EQ(a.bend[i].k[k].x, b.bend[i].k[k].x);
-            EXPECT_EQ(a.bend[i].k[k].y, b.bend[i].k[k].y);
-            EXPECT_EQ(a.bend[i].k[k].z, b.bend[i].k[k].z);
         }
+        EXPECT_EQ(a.bend[i].rest_angle, b.bend[i].rest_angle);
         EXPECT_EQ(a.bend[i].compliance_alpha, b.bend[i].compliance_alpha);
     }
     ASSERT_EQ(a.volume.size(), b.volume.size()) << "volume size";

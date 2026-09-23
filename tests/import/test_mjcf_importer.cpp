@@ -102,6 +102,31 @@ TEST(MjcfImporter, ThrowsOnMissingFile) {
     EXPECT_THROW(nuka::import::LoadMjcf("nonexistent.xml"), std::runtime_error);
 }
 
+TEST(MjcfImporter, GeometryDefaultsAndFromToPreserveEndpoints) {
+    const auto scene = nuka::import::LoadMjcf("tests/data/mjcf_geom_frames.xml");
+    ASSERT_EQ(scene.Shapes().size(), 3u);
+    ASSERT_EQ(scene.Joints().size(), 1u);
+    EXPECT_EQ(scene.Joints()[0].type, nuka::scene::JointType::Free);
+    const auto& inherited = scene.Shapes()[0];
+    EXPECT_FLOAT_EQ(inherited.radius, 0.01f);
+    EXPECT_FLOAT_EQ(inherited.half_height, 0.2f);
+    const auto a = inherited.local_transform.TransformPoint({0, 0, -inherited.half_height});
+    const auto b = inherited.local_transform.TransformPoint({0, 0, inherited.half_height});
+    EXPECT_NEAR((a - nuka::math::Vec3{-0.2f, 0, 0.1f}).Length(), 0.0f, 1e-7f);
+    EXPECT_NEAR((b - nuka::math::Vec3{0.2f, 0, 0.1f}).Length(), 0.0f, 1e-7f);
+    const auto& rotated = scene.Shapes()[1];
+    EXPECT_FLOAT_EQ(rotated.radius, 0.02f);
+    EXPECT_FLOAT_EQ(rotated.half_height, 0.15f);
+    EXPECT_NEAR((rotated.local_transform.TransformPoint({0, 0, 0.15f}) -
+                 nuka::math::Vec3{0.15f, 0.3f, 0}).Length(), 0.0f, 1e-7f);
+    const auto& explicit_shape = scene.Shapes()[2];
+    EXPECT_FLOAT_EQ(explicit_shape.radius, 0.03f);
+    EXPECT_FLOAT_EQ(explicit_shape.half_height, 0.25f);
+    EXPECT_NEAR(explicit_shape.local_transform.TransformPoint({0, 0, -0.25f}).Length(), 0.0f, 1e-7f);
+    EXPECT_NEAR((explicit_shape.local_transform.TransformPoint({0, 0, 0.25f}) -
+                 nuka::math::Vec3{0, 0.3f, 0.4f}).Length(), 0.0f, 1e-7f);
+}
+
 TEST(MjcfImporter, ParsesSensorSuiteIntoUnifiedDescs) {
     using nuka::scene::SensorType;
     using nuka::scene::MountFrame;

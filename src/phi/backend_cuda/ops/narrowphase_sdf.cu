@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <cub/block/block_reduce.cuh>
 #include <algorithm>
+#include <cfloat>
 #include <limits>
 
 #include "collision/primitive_surface.hpp"
@@ -93,32 +94,55 @@ struct SampleContact {
 };
 
 struct SampleRank {
-    float depth;
+    float score;
     uint32_t lane;
     uint64_t sequence;
 };
 
-struct DeeperSample {
+struct BetterSample {
     __device__ SampleRank operator()(const SampleRank& a, const SampleRank& b) const {
-        if (a.depth != b.depth) return a.depth > b.depth ? a : b;
+        if (a.score != b.score) return a.score > b.score ? a : b;
         return a.sequence <= b.sequence ? a : b;
     }
 };
 
-// The global top-K is contained in the union of every lane's local top-K.
-// Original side/sample order breaks ties independently of execution order.
+__device__ float SampleSeparation(const SampleContact& a, const SampleContact& b) {
+    const math::Vec3 distance = a.point - b.point;
+    if (a.sequence == b.sequence || (distance.LengthSq() == 0.0f &&
+        (a.normal - b.normal).LengthSq() == 0.0f)) return -1.0f;
+    return distance.LengthSq();
+}
+
+// Keep the deepest contact and spread the remaining points over the surface patch.
+// Duplicate positions with the same normal never consume a manifold slot.
 __device__ void InsertSampleContact(const SampleContact& sample, uint32_t capacity,
                                     SampleContact* contacts, uint32_t& count) {
-    uint32_t position = count;
-    while (position > 0u &&
-           (contacts[position - 1u].depth < sample.depth ||
-            (contacts[position - 1u].depth == sample.depth &&
-             contacts[position - 1u].sequence > sample.sequence))) --position;
-    if (position >= capacity) return;
-    const uint32_t last = count < capacity ? count : capacity - 1u;
-    for (uint32_t i = last; i > position; --i) contacts[i] = contacts[i - 1u];
-    contacts[position] = sample;
-    if (count < capacity) ++count;
+    if (capacity == 0u) return;
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (SampleSeparation(sample, contacts[i]) >= 0.0f) continue;
+        if (sample.depth > contacts[i].depth) contacts[i] = sample;
+        return;
+    }
+    if (count < capacity) { contacts[count++] = sample; return; }
+    uint32_t selected[kManifoldPoints];
+    uint32_t selected_mask = 0u;
+    for (uint32_t kept = 0u; kept < capacity; ++kept) {
+        SampleRank best{-1.0f, 0u, ~uint64_t{0u}};
+        for (uint32_t i = 0u; i <= count; ++i) {
+            if ((selected_mask & (1u << i)) != 0u) continue;
+            const auto& candidate = i == count ? sample : contacts[i];
+            float score = kept == 0u ? candidate.depth : FLT_MAX;
+            for (uint32_t j = 0u; j < kept; ++j) {
+                const auto& prior = selected[j] == count ? sample : contacts[selected[j]];
+                score = fminf(score, SampleSeparation(candidate, prior));
+            }
+            best = BetterSample{}(best, {score, i, candidate.sequence});
+        }
+        selected[kept] = best.lane;
+        selected_mask |= 1u << best.lane;
+    }
+    for (uint32_t i = 0u; i < count; ++i)
+        if ((selected_mask & (1u << i)) == 0u) { contacts[i] = sample; return; }
 }
 
 // Each pair samples a local surface into an SDF, with normals separating A.
@@ -330,18 +354,28 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
     using Reduction = cub::BlockReduce<SampleRank, kSurfaceQueryThreads>;
     __shared__ typename Reduction::TempStorage reduction;
     __shared__ uint32_t winner;
-    uint32_t cursor = 0u;
+    __shared__ SampleContact selected[kManifoldPoints];
     uint32_t kept = 0u;
     for (uint32_t i = 0u; i < kk; ++i) {
-        const SampleRank rank = cursor < local_count
-            ? SampleRank{local_contacts[cursor].depth, threadIdx.x, local_contacts[cursor].sequence}
-            : SampleRank{0.0f, threadIdx.x, ~uint64_t{0u}};
-        const auto best = Reduction(reduction).Reduce(rank, DeeperSample{});
-        if (threadIdx.x == 0u) winner = best.depth > 0.0f ? best.lane : ~0u;
+        SampleRank rank{-1.0f, threadIdx.x, ~uint64_t{0u}};
+        uint32_t local_best = 0u;
+        for (uint32_t candidate = 0u; candidate < local_count; ++candidate) {
+            const auto& contact = local_contacts[candidate];
+            float score = i == 0u ? contact.depth : FLT_MAX;
+            for (uint32_t previous = 0u; previous < i; ++previous)
+                score = fminf(score, SampleSeparation(contact, selected[previous]));
+            if (score > rank.score || (score == rank.score && contact.sequence < rank.sequence)) {
+                rank = {score, threadIdx.x, contact.sequence};
+                local_best = candidate;
+            }
+        }
+        const auto best = Reduction(reduction).Reduce(rank, BetterSample{});
+        if (threadIdx.x == 0u) winner = best.score >= 0.0f ? best.lane : ~0u;
         __syncthreads();
         if (winner == ~0u) break;
         if (threadIdx.x == winner) {
-            const auto& contact = local_contacts[cursor++];
+            const auto& contact = local_contacts[local_best];
+            selected[i] = contact;
             const size_t at = static_cast<size_t>(gid) * kManifoldPoints + i;
             upoint[at] = contact.point;
             unormal[at] = contact.normal;

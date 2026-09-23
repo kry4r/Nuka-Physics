@@ -170,7 +170,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_compliance
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::DistCon, 1, 1, 4, 0},  // dist_lambda
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::BendCon, 4, 1, 16, 0},  // bend_particles
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::BendCon, 4, 3, 48, 0},  // bend_gradients
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::BendCon, 1, 1, 4, 0},  // bend_rest_angle
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::BendCon, 1, 1, 4, 0},  // bend_compliance
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::BendCon, 1, 1, 4, 0},  // bend_lambda
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 4, 1, 16, 0},  // vol_particles
@@ -384,6 +384,10 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 8, 8, 0},  // point_endpoint_ranges
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 44, 44, 0},  // point_endpoint_terms
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_projection_delta
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_max_speed
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_pseudo_vel
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 8, 1, 64, 0},  // contact_solve_metrics
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 8, 0},  // contact_solve_counts
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

@@ -40,7 +40,7 @@ void Save(const SceneIR& scene, const std::string& nks_path);
 // Load a scene from `<nks_path>` (reads the sibling .nka named inside). The
 // reconstructed SceneIR's records (and thus its facade tree/ECS) are identical
 // to the one that was Saved. `imports` in the JSON are resolved here (LoadMjcf/
-// LoadUsd/LoadUrdf by extension, then Compose with the attach_at prefix). Throws
+// LoadUsd/LoadUrdf/Load by extension, then Compose with the attach_at prefix). Throws
 // json::ParseError / std::runtime_error on malformed input.
 SceneIR Load(const std::string& nks_path);
 

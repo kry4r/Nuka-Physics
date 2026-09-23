@@ -87,14 +87,17 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     control_cap.inverse_dynamics_controls =
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
-    if (control_cap.particle_surfaces_per_env > 0u && control_cap.mpm_grid_nodes_per_env > 0u) {
-        const uint64_t terms = uint64_t{control_cap.mpm_contact_capacity_per_env} * kTriangleEndpointTerms;
-        if (terms > std::numeric_limits<uint32_t>::max()) {
+    if (control_cap.mpm_grid_nodes_per_env > 0u) {
+        const uint32_t surfaces = control_cap.particle_surfaces_per_env > 0u
+            ? control_cap.mpm_contact_capacity_per_env : 0u;
+        const uint64_t endpoints = MpmPointEndpointCount(control_cap.particles_per_env, surfaces);
+        const uint64_t terms = MpmPointEndpointTermCount(control_cap.particles_per_env, surfaces);
+        if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max()) {
             creation_status_ = phi::Status::InvalidArgument;
             creation_error_ = "point endpoint term capacity exceeds device indexing";
             return;
         }
-        control_cap.point_endpoints_per_env = control_cap.mpm_contact_capacity_per_env;
+        control_cap.point_endpoints_per_env = static_cast<uint32_t>(endpoints);
         control_cap.point_endpoint_terms_per_env = static_cast<uint32_t>(terms);
     }
     model_.capacities.mpm_plastic_state = std::any_of(

@@ -1,40 +1,6 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nuka::render::SensorBackendI -- the backend-agnostic interface to the BATCHED
-// device-resident sensor render (N per-env TLASes built in one LBVH launch + one
-// flat [E*H*W] trace into a single (N,H,W,ch) device AOV tensor). It is the
-// SIBLING of render::RtBackendI: a SEPARATE interface because the sensor path has
-// a different shape -- a PERSISTENT scene (BLAS + per-env TLAS scratch + the AOV
-// tensor reused across steps), per-step DEVICE poses + mounted cameras, and a
-// DEVICE-RESIDENT tensor output (no host download). Folding those onto RtBackendI
-// (single camera -> host rt::Framebuffer) would burden its clean single-camera
-// contract with an unrelated lifecycle, so this stays its own one-responsibility
-// interface that mirrors the same factory / weak-fallback pattern.
-//
-// ENGINE-LAYER (this header, src/render -- ZERO CUDA token) + CUDA-BACKEND impl
-// (src/phi/backend_cuda/rt/sensor_backend_cuda.cpp, the only place outside the rt
-// device TUs that reaches BuildBatchedSensorScene / RenderSensorsBatched /
-// ScatterEnvCameras). The concrete backend WRAPS those entry points -- it does
-// NOT reimplement the batched render; this TU adds NO arithmetic.
-//
-// CONTRACT:
-//   * BuildSensorScene(desc) -- BLAS built once + the env-shared per-instance
-//                               binding uploaded + the mount table lowered; returns
-//                               an opaque, backend-owned handle. nullptr on failure.
-//   * RenderSensors(handle, fk, E, W, H) -- scatter the per-env cameras from the
-//                               handle's mount table + `fk` (the device pose source),
-//                               then ONE batched build/refit + ONE flat trace into
-//                               the persistent device AOV tensor (no host round-trip).
-//   * Sensor*Device(handle) -- device pointers into that tensor after a render.
-//   * FreeSensorScene(handle) -- release the handle.
-//
-// FACTORY / FALLBACK: CreateCudaSensorBackend() binds phi::ActiveBackend() and
-// returns a heap-owned backend when a device is available, else nullptr (the same
-// "unavailable -> null" contract RtBackendI uses). DEFINED in the CUDA backend TU;
-// a consumer that wants a live sensor backend links nuka_phi2_rt.
-//
-// ZERO CUDA: names ONLY CUDA-free rt:: / phi:: / scene:: PODs. Compiles under g++.
-// ---------------------------------------------------------------------------
+// Persistent batched sensor output with backend-independent scene and particle bindings.
+// Surface reconstruction may stage through host memory; image and range views remain device-resident.
 
 #include "phi/interop_scatter.hpp"  // phi::ScatterFkSource / InstanceScatterRow (CUDA-free)
 #include "rt/render_dr.hpp"         // rt::RenderDrConfig (CUDA-free per-env DR POD)
@@ -118,11 +84,8 @@ public:
     // nullptr on failure.
     virtual SensorSceneHandle* BuildSensorScene(const SensorSceneDesc& desc) = 0;
 
-    // Scatter the per-env cameras from the handle's mount table + `fk` (the device
-    // LinkPose/BodyPose/BasePose source), then ONE batched build/refit + ONE flat
-    // trace over [E*H*W] rays into the persistent device AOV tensor IN PLACE on the
-    // selected backend's stream (no host round-trip). `width`/`height` size each
-    // sensor image; `env_count` is the number of envs (cameras = env_count*sensors).
+    // Refresh live geometry and mounted cameras, then trace into persistent [E*S*H*W] device views.
+    // The selected backend owns reconstruction, transfer and tracing synchronization.
     virtual void RenderSensors(SensorSceneHandle* handle,
                                const phi::ScatterFkSource& fk,
                                uint32_t env_count,
@@ -141,10 +104,8 @@ public:
     // accessors point into, as of the last RenderSensors (all-zero before the first).
     virtual SensorAovShape AovShape(const SensorSceneHandle* handle) const = 0;
 
-    // Scatter the per-env lidars from the handle's lidar mount table + `fk`, then
-    // ONE batched build/refit + ONE range trace over [E*S*az*el] rays into the
-    // persistent device range tensor IN PLACE (no host round-trip). A no-op if the
-    // handle carries no lidar mounts. The az/el fan comes from the lidar pattern.
+    // Refresh the same live geometry for mounted lidar fans and trace into persistent [E*S*az*el] views.
+    // A scene with no lidar mounts performs no range trace.
     virtual void RenderLidars(SensorSceneHandle* handle,
                               const phi::ScatterFkSource& fk,
                               uint32_t env_count) = 0;

@@ -19,6 +19,7 @@ struct CookedMeshSurface {
 struct MeshSurfaceCookOptions {
     ConvexCoverParams cover;
     bool decompose = true;
+    bool oriented_surface = false;
     bool allow_device = true;
     std::string cache_directory = ".nuka_cache";
 };

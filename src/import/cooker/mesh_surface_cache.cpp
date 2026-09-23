@@ -67,6 +67,7 @@ std::string CacheKey(const float* vertices, uint32_t vertex_count,
     Append(settings, triangle_count);
     Append(settings, uint32_t(require_convex));
     Append(settings, uint32_t(options.decompose));
+    Append(settings, uint32_t(options.oriented_surface));
     Append(settings, options.cover.relative_error);
     Append(settings, options.cover.max_parts);
     Append(settings, options.cover.max_planes);
@@ -132,8 +133,9 @@ bool Decode(const std::string& bytes, const float* vertices, uint32_t vertex_cou
         key != result.cache_key || !reader.Read(info.vertex_count) || info.vertex_count != vertex_count ||
         !reader.Read(info.triangle_count) || info.triangle_count != triangle_count ||
         !reader.Read(info.node_count) || uint64_t(info.node_count) != uint64_t(triangle_count) * 2u - 1u ||
-        !reader.Read(info.flags) || (info.flags & ~3u) != 0u ||
-        (require_convex && info.flags != (collision::kMeshSurfaceClosed | collision::kMeshSurfaceConvex)) ||
+        !reader.Read(info.flags) || (info.flags & ~7u) != 0u ||
+        ((info.flags & collision::kMeshSurfaceOriented) != 0u) != options.oriented_surface ||
+        (require_convex && (info.flags & 3u) != (collision::kMeshSurfaceClosed | collision::kMeshSurfaceConvex)) ||
         !reader.Read(status) || status > static_cast<uint32_t>(ConvexCoverStatus::BackendFailure) ||
         !reader.String(result.cover.backend, 16u) || !reader.String(result.cover.reason, 4096u) ||
         !reader.Read(result.cover.operations) || !reader.Read(result.cover.distance_cells) ||
@@ -236,6 +238,7 @@ CookedMeshSurface CookMeshSurfaceCached(const float* vertices, uint32_t vertex_c
         return surface;
     }
     surface = CookMeshSurface(vertices, vertex_count, indices, triangle_count, require_convex);
+    if (options.oriented_surface) surface.info.flags |= collision::kMeshSurfaceOriented;
     surface.cache_key = key;
     if (options.decompose && !require_convex && (surface.info.flags & collision::kMeshSurfaceClosed)) {
         const collision::MeshSurfaceView source{vertices, indices, surface.nodes.data(),

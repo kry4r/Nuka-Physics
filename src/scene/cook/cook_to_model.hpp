@@ -115,7 +115,7 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
 // One XPBD distance constraint (the de-interleaved XpbdDistanceConstraint).
 struct CookDistanceCon { uint32_t a, b; float rest_length, compliance_alpha; };
 // One XPBD bend constraint (4 particles + 4 cooked gradient vectors K_i).
-struct CookBendCon { uint32_t p[4]; math::Vec3 k[4]; float compliance_alpha; };
+struct CookBendCon { uint32_t p[4]; float rest_angle; float compliance_alpha; };
 // One XPBD volume constraint (4 particles + 6*rest_volume + compliance).
 struct CookVolumeCon { uint32_t p[4]; float rest_volume_times6, compliance_alpha; };
 // One XPBD shape-match cluster (; the de-interleaved XpbdShapeMatchCluster).
@@ -215,12 +215,7 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
 void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
                            const XpbdCookInput& in, const MpmCookInput& mpm);
 
-// LOUD cook-time validation of a media list against the (kind x method) legal set
-// (cloth = XPBD; tet-soft = XPBD or MLS-MPM; fluid = PBF or MLS-MPM) plus the rules
-// that an MLS-MPM medium may not co-reside with a PBF medium (XPBD is legal) and a
-// Model holds at most one PBF fluid slice / one MLS-MPM medium. Throws on an illegal
-// pair or mix; an empty list and the existing legal cases pass (so every existing
-// scene cooks byte-identically). The single call site is CookSceneMedia.
+// Validate material methods and grid compatibility: MPM can share a world with XPBD, but not PBF.
 void ValidateMedia(const std::vector<MediaRecord>& media);
 
 struct PbfCookInput {
@@ -324,19 +319,15 @@ XpbdCookInput BuildCableXpbdInput(const MediaRecord& media);
 // from the geometry (sphere lattice / CookFluidBox), material + grid from MediaMpmMaterial.
 MpmCookInput BuildMpmInput(const MediaRecord& media);
 
+// Concatenate MPM media and material tables onto one grid with matching spacing and floor.
+MpmCookInput BuildMpmInput(const std::vector<MediaRecord>& media);
+
 // The cloth lattice render-surface triangle list (two triangles per quad, the SAME
 // row-major winding BuildClothXpbdInput meshes the constraints with). Empty when the
 // grid extent is absent. Indexes the [0, nx*ny) cloth particles (laid out first).
 std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media);
 
-// The per-medium render surfaces of a media list, base-offset to match
-// CookSceneMedia's [soft|fluid] particle layout: cloth -> the lattice faces
-// (BuildClothSurfaceTriangles), soft-tet -> the tet boundary faces
-// (runtime::soft::ExtractBoundaryTriangles over the SAME sphere rest-lattice the
-// XPBD cook meshes). A fluid (no triangulated surface) and a lone MLS-MPM medium (a
-// dense sample, not the lattice vertices) yield no surface. ONE pass in the SAME
-// medium order CookSceneMedia lays particles out -- the per-medium topology is data,
-// so the live beauty render draws each surface uniformly (no cloth-vs-tet fork).
+// Fixed, density and grain surfaces reference the same particle order as CookSceneMedia.
 std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     const std::vector<MediaRecord>& media);
 

@@ -122,7 +122,7 @@ struct ModelCapacities {
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
     uint32_t mpm_grid_nodes_per_env = 0;
-    uint32_t mpm_contact_capacity_per_env = 0;  // Shared pool; multiple contacts may use any node.
+    uint32_t mpm_contact_capacity_per_env = 0;  // Shared pool; multiple contacts may use one material point.
     // Byte size of the mpm_sort_scratch field (the P2G deterministic-gather cub
     // sort temp + out buffers; sized at World construct; 0 == no MPM particles).
     uint64_t mpm_grid_sort_scratch_bytes = 0;
@@ -377,7 +377,7 @@ public:
         std::vector<uint32_t> dist_a, dist_b;     // distance endpoints
         std::vector<float>    dist_rest, dist_alpha;
         std::vector<uint32_t> bend_particles;     // 4 / bend constraint
-        std::vector<math::Vec3> bend_gradients;   // 4 / bend constraint
+        std::vector<float> bend_rest_angle;
         std::vector<float>    bend_alpha;
         std::vector<uint32_t> vol_particles;      // 4 / volume constraint
         std::vector<float>    vol_rest6, vol_alpha;
@@ -445,17 +445,14 @@ public:
         float      mpm_cell_size = 0.0f;
         // Preferred common substeps; the pipeline also honors the solver's request.
         uint32_t   mpm_substeps = 1u;
-        // MLS-MPM static floor plane (z-up: n=(0,0,1), d=floor height). The grid BC
-        // projects node velocity against this plane (no-penetration + Coulomb mu).
+        // The floor constrains material-point gaps through their grid velocity interpolation.
         math::Vec3 mpm_floor_normal{0.0f, 0.0f, 1.0f};
         float      mpm_floor_d = 0.0f;
         float      mpm_floor_friction = 0.4f;
-        // MLS-MPM dynamic-body grid BC: a cooked body's SDF is rasterized onto the
-        // grid and the node velocity projected onto its surface velocity (Coulomb
-        // mpm_body_friction, |phi| band mpm_body_band cells). The grid provider
-        // turns the BC on whenever a collidable body co-resides with the medium.
+        // Finite-mass contact uses the material point's geometric gap and Coulomb friction.
+        // The query margin expands detection without changing the physical surface.
         float      mpm_body_friction = 0.4f;
-        float      mpm_body_band = 0.0f;        // 0 => the provider defaults it to dx.
+        float      mpm_body_band = 0.0f;        // Query margin in metres; 0 defaults to dx.
         // Free-fall diagnostic: disable ONLY the dynamic-body BC (the static-plane
         // BC stays on). A test sets it to prove the held-up state is BC-caused.
         bool       mpm_bite_disable_dynamic_bc = false;

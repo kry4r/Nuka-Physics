@@ -1,24 +1,4 @@
-// ---------------------------------------------------------------------------
-// M9 T11: XPBD BEND (id 7) cloth tests, the STEPPING sub-tests RE-POINTED to nk.
-// Bergou isometric bending.
-//
-// The bend kernel already lives on the nk path (particles.cu XpbdBendKernel,
-// covered structurally by nk_particle_equivalence); M9 T11 re-points the bend
-// SIM sub-tests (sensitivity + drape) from the legacy XPBD soft
-// stepper to nk::World (cook -> World -> Step). The two PURE-HOST gates (stencil
-// linear-precision + grad-C FD) are stepper-independent and unchanged.
-//
-//   1. Stencil rest properties (host): sum_i k_i == 0 and sum_i k_i*x_rest == 0.
-//   2. grad C is CONSTANT (host): the stored K_i equal a host FD of C at two
-//      distinct non-flat configs.
-//   3. Bend SENSITIVITY (nk): stiff bend flattens a folded flap while a no-bend
-//      control stays folded -- proves grad C does work on the nk path.
-//   4. Drape invariants + D1 (nk): a patch under gravity stays finite, edges near
-//      rest length, and the nk bend forward is two-run byte-exact.
-//
-// A full Vellum/Houdini golden is DEFERRED; these are ANALYTIC/physical invariants.
-// ---------------------------------------------------------------------------
-
+#include "constraint/dihedral_bend.hpp"
 #include "import/cooker/xpbd_cooker_types.hpp"  // XpbdParticleSet / XpbdConstraintSet (host POD)
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"  // TetSignedVolumeTimes6 (planarity metric)
@@ -44,13 +24,11 @@ using nuka::math::Vec3;
 using nuka::runtime::soft::BuildClothConstraints;
 using nuka::runtime::soft::ClothTopologyOptions;
 using nuka::runtime::soft::ClothTriangle;
-using nuka::runtime::soft::ComputeIsometricBendStencil;
 using nuka::runtime::soft::TetSignedVolumeTimes6;
 using nuka::runtime::soft::XpbdBendConstraint;
 using nuka::runtime::soft::XpbdConstraintSet;
 using nuka::runtime::soft::XpbdParticleSet;
 
-// nk backend context (shared singleton, the nk_particle_equivalence pattern).
 struct NkCtx { nphi::Device* dev = nullptr; nphi::Backend* backend = nullptr; };
 NkCtx GetNkCtx() {
     static NkCtx c = [] {
@@ -62,15 +40,11 @@ NkCtx GetNkCtx() {
     return c;
 }
 
-// Downloaded particle state (replaces the legacy XpbdState).
 struct XpbdState {
     std::vector<Vec3> positions;
     std::vector<Vec3> velocities;
 };
 
-// Cook an XpbdParticleSet + XpbdConstraintSet (the HOST cloth_topology product)
-// into an nk::Model with mode = Xpbd, transcribing the de-interleaved SoA exactly
-// as CookXpbdParticles does (dist a/b/rest/alpha; bend 4-particle + 4-gradient).
 nk::Model BuildNkClothModel(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
                             uint16_t iters) {
     nk::Model model;
@@ -91,8 +65,8 @@ nk::Model BuildNkClothModel(const XpbdParticleSet& ps, const XpbdConstraintSet& 
     for (uint32_t c = 0; c < bn; ++c) {
         for (uint32_t j = 0; j < 4u; ++j) {
             mp.bend_particles.push_back(cs.bend[c].particle[j]);
-            mp.bend_gradients.push_back(cs.bend[c].k[j]);
         }
+        mp.bend_rest_angle.push_back(cs.bend[c].rest_angle);
         mp.bend_alpha.push_back(cs.bend[c].compliance_alpha);
     }
     nk::ModelCapacities& cap = model.capacities;
@@ -103,7 +77,6 @@ nk::Model BuildNkClothModel(const XpbdParticleSet& ps, const XpbdConstraintSet& 
     return model;
 }
 
-// Run an nk cloth world for kSteps with the given gravity/dt and download state.
 XpbdState RunNkCloth(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
                           uint16_t iters, Vec3 gravity, float dt, uint32_t kSteps) {
     NkCtx c = GetNkCtx();
@@ -124,9 +97,6 @@ XpbdState RunNkCloth(const XpbdParticleSet& ps, const XpbdConstraintSet& cs,
     return st;
 }
 
-// A single shared edge along x with two apex vertices straddling it in the z=0
-// plane (a flat flap): shared_a=(0,0,0), shared_b=(1,0,0), apex0=(0.3,0.8,0),
-// apex1=(0.6,-0.7,0).
 struct Flap {
     Vec3 sa{0.0f, 0.0f, 0.0f};
     Vec3 sb{1.0f, 0.0f, 0.0f};
@@ -134,112 +104,85 @@ struct Flap {
     Vec3 a1{0.6f, -0.7f, 0.0f};
 };
 
-// C = sum_i K_i . p_i for the bend constraint's four stored gradient vectors.
 float BendConstraintValue(const XpbdBendConstraint& bc,
                           const std::vector<Vec3>& positions) {
-    float c = 0.0f;
-    for (int j = 0; j < 4; ++j) {
-        c += bc.k[j].Dot(positions[bc.particle[j]]);
-    }
-    return c;
+    const auto g = nuka::constraint::EvaluateDihedralBend(
+        positions[bc.particle[0]], positions[bc.particle[1]],
+        positions[bc.particle[2]], positions[bc.particle[3]]);
+    return nuka::constraint::DihedralBendError(g.angle, bc.rest_angle);
 }
 
 } // namespace
 
-// Gate 2a: the isometric stencil satisfies the linear-precision conditions that
-// define it (sum_i k_i == 0, sum_i k_i*x_rest == 0). These pin k up to scale, so
-// matching them == matching the cotangent stencil up to the (compliance-absorbed)
-// scalar.
-TEST(XpbdBendCloth, IsometricStencilHasLinearPrecision) {
-    Flap f;
-    float k[4];
-    ASSERT_TRUE(ComputeIsometricBendStencil(f.sa, f.sb, f.a0, f.a1, k));
-
-    float sum_k = 0.0f;
-    Vec3 sum_kx{0.0f, 0.0f, 0.0f};
-    const Vec3 verts[4] = {f.sa, f.sb, f.a0, f.a1};
-    for (int j = 0; j < 4; ++j) {
-        sum_k += k[j];
-        sum_kx += verts[j] * k[j];
+TEST(XpbdBendCloth, RigidMotionAndCurvedRestPreserveBending) {
+    const std::vector<Vec3> rest{{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
+                                {0.3f, 0.8f, 0.4f}, {0.6f, -0.7f, 0.2f}};
+    const std::vector<ClothTriangle> triangles{{{0u, 1u, 2u}}, {{1u, 0u, 3u}}};
+    XpbdConstraintSet constraints;
+    BuildClothConstraints(rest, triangles, {}, constraints);
+    ASSERT_EQ(constraints.bend.size(), 1u);
+    EXPECT_GT(std::abs(constraints.bend[0].rest_angle), 0.1f);
+    const auto rotate = [](Vec3 p) {
+        const float c = std::cos(1.2f), s = std::sin(1.2f);
+        return Vec3{c*p.y - s*p.z, s*p.y + c*p.z, p.x};
+    };
+    std::vector<Vec3> transformed;
+    for (Vec3 p : rest) transformed.push_back(rotate(p) + Vec3{2.0f, -1.0f, 0.8f});
+    EXPECT_NEAR(BendConstraintValue(constraints.bend[0], transformed), 0.0f, 5.0e-7f);
+    const auto g = nuka::constraint::EvaluateDihedralBend(rest[0], rest[1], rest[2], rest[3]);
+    const auto r = nuka::constraint::EvaluateDihedralBend(
+        transformed[0], transformed[1], transformed[2], transformed[3]);
+    ASSERT_TRUE(g.valid);
+    ASSERT_TRUE(r.valid);
+    Vec3 force{}, torque{};
+    for (uint32_t i = 0; i < 4u; ++i) {
+        EXPECT_NEAR((rotate(g.gradients[i]) - r.gradients[i]).Length(), 0.0f, 2.0e-6f);
+        force += g.gradients[i];
+        torque += rest[i].Cross(g.gradients[i]);
     }
-    EXPECT_NEAR(sum_k, 0.0f, 1.0e-5f) << "stencil must annihilate constants";
-    EXPECT_NEAR(sum_kx.Length(), 0.0f, 1.0e-5f)
-        << "stencil must annihilate the flat rest positions (isometric)";
-    // Non-trivial (normalized so max|k| == 1).
-    float max_abs = 0.0f;
-    for (int j = 0; j < 4; ++j) {
-        max_abs = std::max(max_abs, std::fabs(k[j]));
-    }
-    EXPECT_NEAR(max_abs, 1.0f, 1.0e-6f);
+    EXPECT_NEAR(force.Length(), 0.0f, 2.0e-6f);
+    EXPECT_NEAR(torque.Length(), 0.0f, 2.0e-6f);
+    if (!GetNkCtx().backend) GTEST_SKIP() << "no CUDA backend";
+    XpbdParticleSet particles;
+    particles.positions = transformed;
+    particles.velocities.assign(4u, Vec3::Zero());
+    particles.inv_masses.assign(4u, 1.0f);
+    const auto state = RunNkCloth(particles, constraints, 8u, Vec3::Zero(), 0.002f, 10u);
+    for (uint32_t i = 0; i < 4u; ++i)
+        EXPECT_NEAR((state.positions[i] - transformed[i]).Length(), 0.0f, 5.0e-6f);
 }
 
-// Gate 2b: grad C is CONSTANT and equals a host central-difference of C at two
-// DISTINCT non-flat configs (the discriminating check that catches a non-linear
-// ||sum k x|| regression). Builds a one-flap mesh, extracts the bend constraint,
-// and FD-differences C wrt each particle coordinate at two folded configs.
-TEST(XpbdBendCloth, BendGradientIsConstantAndMatchesFd) {
-    Flap f;
-    std::vector<Vec3> rest = {f.sa, f.sb, f.a0, f.a1};
-    std::vector<ClothTriangle> tris = {ClothTriangle{{0u, 1u, 2u}},
-                                       ClothTriangle{{1u, 0u, 3u}}};
-    ClothTopologyOptions opts;
-    opts.emit_distance_constraints = false;
-    XpbdConstraintSet cs;
-    BuildClothConstraints(rest, tris, opts, cs);
-    ASSERT_EQ(cs.bend.size(), 1u);
-    const XpbdBendConstraint& bc = cs.bend[0];
-
-    // Two distinct NON-flat configurations (fold the apexes out of plane by
-    // different amounts so the gradients, if config-dependent, would differ).
-    auto fold = [&](float z0, float z1) {
-        std::vector<Vec3> p = rest;
-        p[2].z += z0;  // apex0
-        p[3].z += z1;  // apex1
-        return p;
-    };
-    const std::vector<Vec3> cfgA = fold(0.5f, -0.3f);
-    const std::vector<Vec3> cfgB = fold(-0.9f, 0.7f);
-
-    const float h = 1.0e-2f;
-    for (int particle_local = 0; particle_local < 4; ++particle_local) {
-        const uint32_t pi = bc.particle[particle_local];
-        for (int axis = 0; axis < 3; ++axis) {
-            // Analytic grad component == the stored K_i component.
-            float analytic = (axis == 0)   ? bc.k[particle_local].x
-                             : (axis == 1) ? bc.k[particle_local].y
-                                           : bc.k[particle_local].z;
-
-            auto fd_at = [&](std::vector<Vec3> cfg) {
-                Vec3& comp = cfg[pi];
-                float& a = (axis == 0) ? comp.x : (axis == 1) ? comp.y : comp.z;
-                const float saved = a;
-                a = saved + h;
-                const float cp = BendConstraintValue(bc, cfg);
-                a = saved - h;
-                const float cm = BendConstraintValue(bc, cfg);
-                return (cp - cm) / (2.0f * h);
-            };
-            const float fdA = fd_at(cfgA);
-            const float fdB = fd_at(cfgB);
-
-            // grad C constant across configs (catches a nonlinear realization).
-            EXPECT_NEAR(fdA, fdB, 1.0e-4f)
-                << "grad C must be config-independent (particle " << particle_local
-                << " axis " << axis << ")";
-            // Analytic == FD (rel-err < 1e-3 where the component is non-trivial).
-            const float denom = std::fabs(analytic) + std::fabs(fdA) + 1.0e-6f;
-            EXPECT_LT(std::fabs(analytic - fdA) / denom, 1.0e-3f)
-                << "analytic grad C != FD (particle " << particle_local << " axis "
-                << axis << ")";
-        }
+TEST(XpbdBendCloth, DihedralGradientMatchesFdAtFlatAndFoldedStates) {
+    const Flap f;
+    const std::vector<Vec3> rest{f.sa, f.sb, f.a0, f.a1};
+    const std::vector<ClothTriangle> triangles{{{0u, 1u, 2u}}, {{1u, 0u, 3u}}};
+    XpbdConstraintSet constraints;
+    BuildClothConstraints(rest, triangles, {}, constraints);
+    ASSERT_EQ(constraints.bend.size(), 1u);
+    for (const auto fold : {Vec3{0, 0, 0}, Vec3{0.5f, -0.3f, 0}, Vec3{-0.9f, 0.7f, 0}}) {
+        auto points = rest;
+        points[2].z = fold.x;
+        points[3].z = fold.y;
+        const auto g = nuka::constraint::EvaluateDihedralBend(points[0], points[1], points[2], points[3]);
+        ASSERT_TRUE(g.valid);
+        for (uint32_t i = 0; i < 4u; ++i)
+            for (uint32_t axis = 0; axis < 3u; ++axis) {
+                auto perturbed = points;
+                float& value = axis == 0u ? perturbed[i].x : axis == 1u ? perturbed[i].y : perturbed[i].z;
+                const float original = value;
+                constexpr float h = 0.001f;
+                value = original + h;
+                const float plus = BendConstraintValue(constraints.bend[0], perturbed);
+                value = original - h;
+                const float minus = BendConstraintValue(constraints.bend[0], perturbed);
+                const float analytic = axis == 0u ? g.gradients[i].x : axis == 1u ? g.gradients[i].y : g.gradients[i].z;
+                EXPECT_NEAR((plus-minus)/(2.0f*h), analytic, 2.0e-4f);
+            }
     }
 }
 
 namespace {
 
-// A WxH grid cloth patch in the z=0 plane (xy lattice), unit spacing, two
-// triangles per cell. Optionally pins the entire first row (y == 0) so the patch
-// hangs as a cantilever.
 struct GridCloth {
     XpbdParticleSet particles;
     std::vector<ClothTriangle> triangles;
@@ -277,25 +220,7 @@ GridCloth MakeGrid(uint32_t nx, uint32_t ny, float spacing, bool pin_first_row) 
 
 } // namespace
 
-// Gate 3: bend SENSITIVITY (the bend analog of IsolatedVolumeConstraintRestores).
-//
-// The isometric bend constraint is EXACTLY invariant under rigid motions of the
-// flat rest patch (C = sum_i k_i z_i is the discrete Laplacian of the z height
-// field; for any affine z = a*x + b*y + c, C = a*sum k_i x_i + b*sum k_i y_i +
-// c*sum k_i = 0 by the stencil's linear-precision properties). So a gravity-sag
-// metric like max|z| CANNOT discriminate -- a stiff plate just swings DOWN rigidly
-// about the hinge while staying flat. The bend constraint penalizes ONLY the
-// non-affine part of z (true curvature). The correct, non-circular sensitivity
-// test perturbs the flap OUT of plane and checks the ISOLATED bend constraint
-// flattens it (no gravity, no distance constraints):
-//   - non-planarity is measured by the flap's triple product (TetSignedVolumeTimes6
-//     on the 4 flap points), == 0 iff coplanar -- NOT C itself (asserting C->0
-//     would be circular since the projection literally drives C).
-//   - stiff bend must collapse non-planarity to a small fraction of its initial
-//     value; the NO-bend control (no constraints, no gravity -> positions frozen)
-//     must STAY folded. A zeroed bend gradient would make stiff == control.
 TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
-    // One flat flap; fold the two apexes out of the z=0 plane.
     const std::vector<Vec3> rest = {Vec3{0.0f, 0.0f, 0.0f}, Vec3{1.0f, 0.0f, 0.0f},
                                     Vec3{0.3f, 0.8f, 0.0f}, Vec3{0.6f, -0.7f, 0.0f}};
     const std::vector<ClothTriangle> tris = {ClothTriangle{{0u, 1u, 2u}},
@@ -330,14 +255,12 @@ TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
         opts.emit_bend_constraints = emit_bend;
         opts.bend_compliance_alpha = 0.0f;  // rigid bend (flatten hard).
         XpbdConstraintSet cs;
-        // Stencil built from the FLAT rest geometry (the isometric reference).
         BuildClothConstraints(rest, tris, opts, cs);
         if (emit_bend) {
             EXPECT_EQ(cs.bend.size(), 1u);
         } else {
             EXPECT_EQ(cs.bend.size(), 0u);
         }
-        // nk path: gravity OFF (isolate the constraint), 10 GS iters, 200 steps.
         const XpbdState st = RunNkCloth(particles, cs, /*iters=*/10u,
                                              Vec3{0.0f, 0.0f, 0.0f}, 1.0f / 240.0f,
                                              /*kSteps=*/200u);
@@ -348,8 +271,6 @@ TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
     const float none = run(/*emit_bend=*/false);
 
     ASSERT_TRUE(std::isfinite(stiff) && std::isfinite(none));
-    // Stiff bend flattens the flap (non-planarity collapses); the no-bend control
-    // stays folded (no constraints + no gravity -> frozen positions).
     EXPECT_LT(stiff, 0.2f * initial)
         << "stiff bend failed to flatten: initial=" << initial << " final=" << stiff;
     EXPECT_GT(none, 0.8f * initial)
@@ -357,14 +278,11 @@ TEST(XpbdBendCloth, StiffBendFlattensFoldedFlapWhileNoneStaysFolded) {
         << " final=" << none;
 }
 
-// Gate 3 (invariants) + Gate 4 (D1): a free patch drapes under gravity, stays
-// finite and near-inextensible, and is two-run byte-exact.
 TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
     if (GetNkCtx().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
 
     auto run = []() {
         GridCloth g = MakeGrid(4u, 4u, 0.25f, /*pin_first_row=*/false);
-        // Pin the two root corners so the patch does not free-fall forever.
         g.particles.inv_masses[0] = 0.0f;
         g.particles.inv_masses[3] = 0.0f;
 
@@ -374,12 +292,10 @@ TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
         XpbdConstraintSet cs;
         BuildClothConstraints(g.particles.positions, g.triangles, opts, cs);
 
-        // Capture rest edge lengths for the inextensibility check.
         std::vector<std::pair<std::pair<uint32_t, uint32_t>, float>> rest_edges;
         for (const auto& dc : cs.distance) {
             rest_edges.push_back({{dc.particle_a, dc.particle_b}, dc.rest_length});
         }
-        // nk path: gravity + small out-of-plane nudge, 20 GS iters, 300 steps.
         const XpbdState st = RunNkCloth(g.particles, cs, /*iters=*/20u,
                                              Vec3{0.0f, -9.81f, 0.3f}, 1.0f / 240.0f,
                                              /*kSteps=*/300u);
@@ -390,11 +306,9 @@ TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
     const auto b = run();
     const XpbdState& sa = a.first;
 
-    // Finite.
     for (const Vec3& p : sa.positions) {
         ASSERT_TRUE(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z));
     }
-    // Near-inextensible: max edge-length drift small (stiff distance constraints).
     float max_drift = 0.0f;
     for (const auto& re : a.second) {
         const Vec3 d = sa.positions[re.first.first] - sa.positions[re.first.second];
@@ -402,7 +316,6 @@ TEST(XpbdBendCloth, DrapeIsFiniteNearInextensibleAndByteExact) {
     }
     EXPECT_LT(max_drift, 0.05f) << "max relative edge-length drift " << max_drift;
 
-    // D1 two-run byte-exact (position + velocity).
     EXPECT_EQ(std::memcmp(sa.positions.data(), b.first.positions.data(),
                           sa.positions.size() * sizeof(Vec3)),
               0)

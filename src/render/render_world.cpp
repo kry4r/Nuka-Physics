@@ -425,12 +425,8 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
         const std::shared_ptr<scene::SceneNode> node = registry.NodeOf(e);
         const ResolvedPose rp = ResolvePoseSource(registry, map, node);
         inst.pose_source = rp.source;
-        // visual_local = transform from the physics frame down to the visual node
-        // (Decision D1). With no physics ancestor, this collapses to identity and
-        // the bind-pose world_xform below carries the full placement (Static).
-        inst.cached_visual_local =
-            (rp.physics_node ? LocalRelativeTo(registry, node, rp.physics_node)
-                             : math::Transform::Identity());
+        // Static instances retain the full world placement; moving instances use their physics frame.
+        inst.cached_visual_local = LocalRelativeTo(registry, node, rp.physics_node);
         // Bind pose: the full node-chain world transform from the root, so the
         // first frame (before any sync) already shows the rest placement.
         inst.world_xform = NodeWorldTransform(registry, node);
@@ -584,6 +580,8 @@ RenderWorld BuildRenderWorld(const scene::Registry& registry, const scene::Scene
             rc.vertical_fov_degrees = cam.vertical_fov_degrees;
             rc.near_clip            = cam.near_clip;
             rc.far_clip             = cam.far_clip;
+            rc.focus_distance       = cam.focus_distance;
+            rc.shadow_radius        = cam.shadow_radius;
             const auto node = registry.NodeOf(e);
             const ResolvedPose rp = ResolvePoseSource(registry, map, node);
             rc.pose_source = rp.source;

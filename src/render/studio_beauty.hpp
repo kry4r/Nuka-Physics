@@ -80,6 +80,7 @@ struct StudioScene {
     std::vector<uint32_t> link_of_instance;      // per link-posed instance -> link index.
     std::vector<math::Transform> visual_local;   // per link-posed instance -> physics->visual offset.
     uint32_t link_instance_count = 0u;           // [0, link_instance_count) follow a link pose.
+    std::size_t floor_instance = ~std::size_t(0);
 
     // Each build-time instance's AUTHORED scene material id (kNoId = none). The
     // studio palette overrides these by default; UseAuthoredSceneMaterials rebinds.
@@ -93,13 +94,13 @@ struct StudioScene {
 StudioScene BuildStudioScene(const scene::Registry& registry,
                              const scene::SceneMap& map,
                              const std::vector<runtime::soft::SurfaceTopology>& surface_topologies,
-                             uint32_t width, uint32_t height);
+                             uint32_t width, uint32_t height, bool add_default_floor = true);
 
 // Single-surface convenience: wraps one (possibly empty) topology into the list form.
 StudioScene BuildStudioScene(const scene::Registry& registry,
                              const scene::SceneMap& map,
                              const runtime::soft::SurfaceTopology& surface_topology,
-                             uint32_t width, uint32_t height);
+                             uint32_t width, uint32_t height, bool add_default_floor = true);
 
 // Bind medium `surface_index`'s authored scene render material (a Registry material
 // id) over the studio default. Call after BuildStudioScene, before the first Publish.

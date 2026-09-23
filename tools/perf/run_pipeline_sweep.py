@@ -10,6 +10,12 @@ import subprocess
 import time
 
 
+def elapsed_time():
+    if hasattr(time, "CLOCK_MONOTONIC_RAW"):
+        return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+    return time.perf_counter()
+
+
 def digest(path):
     with path.open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
@@ -30,6 +36,10 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-id", required=True)
+    parser.add_argument("--scene", default="robot-cloth-fluid")
+    parser.add_argument("--dt", type=float)
+    parser.add_argument("--substeps", type=int, default=1)
+    parser.add_argument("--velocity-iterations", type=int, default=48)
     parser.add_argument("--envs", type=int, nargs="+", default=[1, 16, 256])
     parser.add_argument("--executions", nargs="+", choices=["eager", "graph"], default=["eager", "graph"])
     parser.add_argument("--processes", type=int, default=5)
@@ -40,6 +50,11 @@ def main():
     parser.add_argument("--cuda-launch-queues", choices=["default", "0.25x", "0.5x", "2x", "4x"])
     parser.add_argument("--save-state", action="store_true")
     parser.add_argument("--save-wrench", action="store_true")
+    parser.add_argument("--render-sensors", type=int, default=0)
+    parser.add_argument("--render-width", type=int, default=256)
+    parser.add_argument("--render-height", type=int, default=256)
+    parser.add_argument("--render-samples", type=int, default=4)
+    parser.add_argument("--render-warmup", type=int, default=32)
     args = parser.parse_args()
     if args.processes < 1 or any(count < 1 for count in args.envs):
         parser.error("positive process and environment counts required")
@@ -59,10 +74,17 @@ def main():
             for process in range(args.processes):
                 label = f"{execution}_e{envs}_p{process}"
                 result_path = (args.output / (label + ".json")).resolve()
-                command = [str(binary), "--scene", "robot-cloth-fluid", "--envs", str(envs),
+                command = [str(binary), "--scene", args.scene, "--envs", str(envs),
                            "--execution", execution, "--warmup", str(args.warmup), "--steps", str(args.steps),
+                           "--substeps", str(args.substeps), "--velocity-iterations", str(args.velocity_iterations),
                            "--seed", "20260908", "--capacity-scale", str(args.capacity_scale),
                            "--perf-json", str(result_path)]
+                if args.dt is not None:
+                    command.extend(["--dt", str(args.dt)])
+                if args.render_sensors:
+                    command.extend(["--render-sensors", str(args.render_sensors),
+                                    "--render-width", str(args.render_width), "--render-height", str(args.render_height),
+                                    "--render-samples", str(args.render_samples), "--render-warmup", str(args.render_warmup)])
                 if args.cloth_grid is not None:
                     command.extend(["--cloth-grid", str(args.cloth_grid)])
                 state_path = args.output / (label + ".state") if args.save_state and process == 0 else None
@@ -72,7 +94,7 @@ def main():
                 if wrench_path is not None:
                     command.extend(["--wrench-output", str(wrench_path.resolve())])
                 before = gpu_state()
-                start = time.perf_counter()
+                start = elapsed_time()
                 with (args.output / (label + ".log")).open("w") as log:
                     completed = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT)
                 receipt = {"label": label, "command": command, "source_id": args.source_id,
@@ -80,7 +102,8 @@ def main():
                            "runner_sha256": runner_hash,
                            "cuda_environment": {key: environment.get(key) for key in
                                ("CUDA_SCALE_LAUNCH_QUEUES", "CUDA_DEVICE_MAX_CONNECTIONS", "CUDA_LAUNCH_BLOCKING")},
-                           "wall_seconds": time.perf_counter() - start,
+                           "wall_seconds": elapsed_time() - start,
+                           "host_clock": "CLOCK_MONOTONIC_RAW" if hasattr(time, "CLOCK_MONOTONIC_RAW") else "perf_counter",
                            "gpu_before": before, "gpu_after": gpu_state()}
                 if state_path is not None and state_path.exists():
                     receipt["state_sha256"] = digest(state_path)

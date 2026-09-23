@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "constraint/coulomb_contact.hpp"
@@ -65,7 +66,8 @@ std::vector<T> ReadSurfaceField(nk::World& world, nk::FieldId field) {
     return result;
 }
 
-nk::Model SurfaceImpactModel(float surface_mass, float friction, uint32_t surfaces, uint32_t envs) {
+nk::Model SurfaceImpactModel(float surface_mass, float friction, uint32_t surfaces, uint32_t envs,
+                             float gap = 0.0f) {
     cook::MpmCookInput mpm;
     mpm.positions = {{0.075f, 0.025f, -0.0125f}};
     mpm.velocities = {{-1.0f, 0.4f, 0.3f}};
@@ -91,6 +93,7 @@ nk::Model SurfaceImpactModel(float surface_mass, float friction, uint32_t surfac
         xpbd.positions.push_back({-0.025f, -1.0f, 1.0f});
         xpbd.surfaces.push_back({{0u, 2u, 3u}, 0.0f, friction});
     }
+    for (auto& point : xpbd.positions) point.x = mpm.positions[0].x - gap;
     xpbd.inv_mass.assign(xpbd.positions.size(), surface_mass > 0.0f ?
         static_cast<float>(xpbd.positions.size()) / surface_mass : 0.0f);
     xpbd.velocities.assign(xpbd.positions.size(), Vec3{});
@@ -106,6 +109,7 @@ nk::Pipeline::SolverConfig SurfaceConfig(uint16_t iterations = 1024u) {
     config.dt = 0.001f;
     config.gravity[2] = 0.0f;
     config.vel_iters = iterations;
+    config.measure_contact_residual = true;
     config.pos_iters = 0u;
     return config;
 }
@@ -135,6 +139,17 @@ TEST(NkMpmXpbdCoResidence, InterpolatedEndpointPreservesRigidMotionAndImpulseWor
     EXPECT_LT((total_impulse - impulse).Length(), 2.0e-6f);
     EXPECT_LT((total_moment - point.Cross(impulse)).Length(), 2.0e-6f);
     EXPECT_NEAR(work, velocity.Dot(impulse), 2.0e-6);
+    nk::PointEndpointTerm repeated[4] = {terms[2], terms[0], terms[1], terms[0]};
+    for (uint32_t axis = 0u; axis < 3u; ++axis) {
+        repeated[1].column[axis] *= 0.5f;
+        repeated[3].column[axis] *= 0.5f;
+    }
+    ASSERT_EQ(nk::CanonicalizePointEndpointTerms(repeated, 4u), 3u);
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        EXPECT_EQ(repeated[i].Key(), terms[i].Key());
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            EXPECT_EQ(repeated[i].column[axis], terms[i].column[axis]);
+    }
     const Vec3 singular[3] = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
     EXPECT_FALSE(nk::BuildTrianglePointEndpoint(indices, singular, weights, point, terms));
 }
@@ -142,6 +157,26 @@ TEST(NkMpmXpbdCoResidence, InterpolatedEndpointPreservesRigidMotionAndImpulseWor
 TEST(NkMpmXpbdCoResidence, ContactBlockSatisfiesNormalAndAnisotropicFriction) {
     // Unit inverse mass with r=(0.5,0.7,-0.3) and inverse inertia diag(2,3,4).
     const nuka::math::SymmetricMat3 response{3.23f, 2.18f, 2.73f, -1.4f, 0.45f, 0.42f};
+    const auto unsolved = nuka::constraint::EvaluateCoulombContactResidual(
+        response, Vec3{-1.0f, 0.4f, -0.3f}, Vec3{}, 0.4f, 0.7f);
+    EXPECT_TRUE(unsolved.valid);
+    EXPECT_NEAR(unsolved.normal_natural_velocity, 1.0f, 1.0e-6f);
+    EXPECT_NEAR(unsolved.normal_velocity_violation, 1.0f, 1.0e-6f);
+    EXPECT_FALSE(unsolved.Within(3.0e-6f, 3.0e-6f, 3.0e-6f));
+
+    const Vec3 fixed_impulse{0.8f, 0.1f, -0.05f};
+    const Vec3 fixed_velocity{0.0f, 0.35f, -0.2f};
+    const Vec3 fixed_projected = nuka::constraint::ProjectedCoulombTangentStep(
+        response, -fixed_velocity, fixed_impulse, fixed_impulse.x, 0.4f, 0.7f);
+    const Vec3 block_projected = nuka::constraint::ProjectedCoulombStep(
+        response, -fixed_velocity, fixed_impulse, 0.4f, 0.7f);
+    EXPECT_EQ(fixed_projected.x, fixed_impulse.x);
+    EXPECT_EQ(fixed_projected, block_projected);
+    const auto fixed_residual = nuka::constraint::EvaluateCoulombContactResidual(
+        response, fixed_velocity, fixed_impulse, 0.4f, 0.7f);
+    EXPECT_TRUE(fixed_residual.valid);
+    EXPECT_GT(fixed_residual.tangent_natural_velocity, 0.0f);
+
     for (float first : {0.0f, 0.15f, 0.6f}) {
         for (float second : {0.0f, 0.3f, 1.1f}) {
             for (const Vec3 incoming : {Vec3{-1.0f, 1.1f, -0.7f}, Vec3{0.4f, -0.2f, 0.1f}}) {
@@ -167,9 +202,54 @@ TEST(NkMpmXpbdCoResidence, ContactBlockSatisfiesNormalAndAnisotropicFriction) {
                 }
                 EXPECT_LE(impulse.y * velocity.y + impulse.z * velocity.z, 3.0e-6f);
                 EXPECT_LE(impulse.Dot(incoming) + 0.5f * impulse.Dot(response.Multiply(impulse)), 3.0e-6f);
+                const auto residual = nuka::constraint::EvaluateCoulombContactResidual(
+                    response, velocity, impulse, first, second);
+                EXPECT_TRUE(residual.valid);
+                EXPECT_TRUE(residual.Within(3.0e-6f, 3.0e-6f, 3.0e-6f))
+                    << residual.normal_natural_velocity << " "
+                    << residual.tangent_natural_velocity << " "
+                    << residual.normal_velocity_violation << " "
+                    << residual.normal_impulse_violation << " "
+                    << residual.normal_complementarity << " "
+                    << residual.friction_impulse_violation << " "
+                    << residual.friction_power_violation;
             }
         }
     }
+
+    const auto frictionless = nuka::constraint::EvaluateCoulombContactResidual(
+        response, Vec3{}, Vec3{1.0f, 0.0f, 0.0f}, 0.0f, 0.0f);
+    EXPECT_TRUE(frictionless.Within(0.0f, 0.0f, 0.0f));
+    const auto forbidden_axis = nuka::constraint::EvaluateCoulombContactResidual(
+        response, Vec3{}, Vec3{1.0f, 0.1f, 0.0f}, 0.0f, 0.7f);
+    EXPECT_TRUE(forbidden_axis.valid);
+    EXPECT_FLOAT_EQ(forbidden_axis.friction_impulse_violation, 0.1f);
+    EXPECT_FALSE(forbidden_axis.Within(0.0f, 0.0f, 0.0f));
+
+    auto invalid_response = response;
+    invalid_response.xx = -1.0f;
+    EXPECT_FALSE(nuka::constraint::EvaluateCoulombContactResidual(
+        invalid_response, Vec3{}, Vec3{}, 0.4f, 0.7f).valid);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(nuka::constraint::EvaluateCoulombContactResidual(
+        response, Vec3{nan, 0.0f, 0.0f}, Vec3{}, 0.4f, 0.7f).valid);
+    EXPECT_FALSE(nuka::constraint::EvaluateCoulombContactResidual(
+        response, Vec3{}, Vec3{}, -0.4f, 0.7f).valid);
+    const float inf = std::numeric_limits<float>::infinity();
+    EXPECT_FALSE(frictionless.Within(inf, inf, inf));
+    EXPECT_FALSE(nuka::constraint::EvaluateCoulombContactResidual(
+        response, Vec3{FLT_MAX, 0.0f, 0.0f}, Vec3{FLT_MAX, 0.0f, 0.0f}, 0.0f, 0.0f).valid);
+    const auto zero_response = nuka::math::SymmetricMat3{};
+    EXPECT_TRUE(nuka::constraint::EvaluateCoulombContactResidual(
+        zero_response, Vec3{1.0f, 2.0f, 0.0f}, Vec3{}, 0.4f, 0.7f).Within(0.0f, 0.0f, 0.0f));
+    EXPECT_FALSE(nuka::constraint::EvaluateCoulombContactResidual(
+        zero_response, Vec3{-1.0f, 0.0f, 0.0f}, Vec3{}, 0.4f, 0.7f).Within(0.0f, 0.0f, 0.0f));
+    EXPECT_FALSE(nuka::constraint::EvaluateCoulombContactResidual(
+        zero_response, Vec3{0.0f, 1.0f, 0.0f}, Vec3{1.0f, 0.0f, 0.0f}, 0.4f, 0.7f)
+        .Within(0.0f, 0.0f, 0.0f));
+    const auto different_normal_velocity = nuka::constraint::EvaluateCoulombContactResidual(
+        response, Vec3{-2.0f, fixed_velocity.y, fixed_velocity.z}, fixed_impulse, 0.4f, 0.7f);
+    EXPECT_EQ(different_normal_velocity.tangent_natural_velocity, fixed_residual.tangent_natural_velocity);
 }
 
 TEST(NkMpmXpbdCoResidence, SurfaceContactFiniteMassFrictionAndMomentum) {
@@ -201,6 +281,22 @@ TEST(NkMpmXpbdCoResidence, SurfaceContactFiniteMassFrictionAndMomentum) {
                 const auto retained = ReadSurfaceField<uint32_t>(world, nk::FieldId::GridContactRetained);
                 for (uint32_t flag : ReadSurfaceField<uint32_t>(world, nk::FieldId::EnvStatus)) EXPECT_EQ(flag, 0u);
                 for (uint64_t overflow : ReadSurfaceField<uint64_t>(world, nk::FieldId::GridContactOverflow)) EXPECT_EQ(overflow, 0u);
+                const auto solve_counts = ReadSurfaceField<uint32_t>(world, nk::FieldId::ContactSolveCounts);
+                const auto solve_metrics = ReadSurfaceField<uint64_t>(world, nk::FieldId::ContactSolveMetrics);
+                for (uint32_t env = 0u; env < envs; ++env) {
+                    EXPECT_GT(solve_counts[env * 2u], 0u);
+                    EXPECT_EQ(solve_counts[env * 2u + 1u], 0u);
+                    for (uint32_t metric = 0u; metric < nuka::constraint::kContactSolveMetricCount; ++metric) {
+                        const uint64_t packed = solve_metrics[env * nuka::constraint::kContactSolveMetricCount + metric];
+                        const uint32_t bits = static_cast<uint32_t>(packed >> 32u);
+                        float error;
+                        std::memcpy(&error, &bits, sizeof(error));
+                        EXPECT_LE(error, 3.0e-5f) << metric;
+                        const uint32_t slot = ~static_cast<uint32_t>(packed);
+                        EXPECT_GE(slot, env * cap.max_rows_per_env);
+                        EXPECT_LT(slot, (env + 1u) * cap.max_rows_per_env);
+                    }
+                }
                 for (uint32_t env = 0u; env < envs; ++env) {
                     const uint32_t first = env * cap.particles_per_env;
                     std::vector<Vec3> vertex_impulse(cap.particles_per_env);
@@ -209,7 +305,7 @@ TEST(NkMpmXpbdCoResidence, SurfaceContactFiniteMassFrictionAndMomentum) {
                     for (uint32_t r = env * cap.max_rows_per_env; r < (env + 1u) * cap.max_rows_per_env; ++r) {
                         const auto& row = rows[r];
                         if (!(row.flags & nk::nk_row_flags::kActive)) continue;
-                        ASSERT_EQ(row.a.kind, nk::kNkSideGrid);
+                        ASSERT_EQ(row.a.kind, nk::kNkSidePointEndpoint);
                         ASSERT_EQ(row.b.kind, nk::kNkSidePointEndpoint);
                         ASSERT_GE(row.b.index, env * cap.point_endpoints_per_env);
                         ASSERT_LT(row.b.index, (env + 1u) * cap.point_endpoints_per_env);
@@ -225,14 +321,23 @@ TEST(NkMpmXpbdCoResidence, SurfaceContactFiniteMassFrictionAndMomentum) {
                             point_velocity += term.Multiply(velocity[term.index]);
                         }
                         if (!(row.flags & nk::nk_row_flags::kContactNormal)) continue;
-                        const double speed = row.a.jlin.Dot(grid[row.a.index]) + row.b.jlin.Dot(point_velocity);
+                        Vec3 material_velocity{};
+                        const auto material_range = ranges[row.a.index];
+                        for (uint32_t i = 0u; i < material_range.count; ++i) {
+                            const auto& term = terms[material_range.first + i];
+                            ASSERT_EQ(term.kind, nk::kNkSideGrid);
+                            material_velocity += term.Multiply(grid[term.index]);
+                        }
+                        EXPECT_LT((material_velocity - velocity[first]).Length(), 2.0e-6f);
+                        const double speed = row.a.jlin.Dot(material_velocity) + row.b.jlin.Dot(point_velocity) -
+                                             row.rhs * SurfaceConfig(iterations).dt;
                         const double normal_error = lambda[r] > 1.0e-8f ? std::abs(speed) : std::max(-speed, 0.0);
                         normal_residual = std::max(normal_residual, normal_error);
                         Vec3 tangential_velocity{}, tangential_impulse{};
                         for (uint32_t tangent = 1u; tangent <= 2u; ++tangent) {
                             const uint32_t at = r + tangent * row.group_normal_count;
                             const auto& tr = rows[at];
-                            const float value = tr.a.jlin.Dot(grid[row.a.index]) + tr.b.jlin.Dot(point_velocity);
+                            const float value = tr.a.jlin.Dot(material_velocity) + tr.b.jlin.Dot(point_velocity);
                             if (tangent == 1u) {
                                 tangential_velocity.x = value;
                                 tangential_impulse.x = lambda[at];
@@ -322,6 +427,15 @@ TEST(NkMpmXpbdCoResidence, SurfaceContactGraphSubstepsAndMaskedReset) {
     const auto backend = GetBackend();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     constexpr uint32_t envs = 3u;
+    nk::World separated(SurfaceImpactModel(1.0f, 0.6f, 2u, envs, 0.1f), envs,
+                        backend.dev, backend.backend, SurfaceConfig());
+    ASSERT_TRUE(separated.Ready());
+    ASSERT_TRUE(separated.Step().AllOk());
+    for (float impulse : ReadSurfaceField<float>(separated, nk::FieldId::Lambda)) EXPECT_EQ(impulse, 0.0f);
+    const auto separated_velocity = ReadSurfaceField<Vec3>(separated, nk::FieldId::ParticleVel);
+    for (uint32_t env = 0u; env < envs; ++env)
+        EXPECT_LT((separated_velocity[env * separated.GetModel().capacities.particles_per_env] -
+                   Vec3{-1.0f, 0.4f, 0.3f}).Length(), 2.0e-6f);
     auto config = SurfaceConfig();
     config.dt = 0.0004f;
     config.substeps = 2u;
@@ -343,15 +457,20 @@ TEST(NkMpmXpbdCoResidence, SurfaceContactGraphSubstepsAndMaskedReset) {
         ASSERT_TRUE(reference.Step().AllOk());
         for (auto field : {nk::FieldId::ParticlePos, nk::FieldId::ParticleVel, nk::FieldId::ParticleF,
                            nk::FieldId::ParticleC, nk::FieldId::PointEndpointRanges, nk::FieldId::PointEndpointTerms,
-                           nk::FieldId::ContactForce, nk::FieldId::ContactSideBKind, nk::FieldId::ContactSideBIndex}) {
+                           nk::FieldId::ContactForce, nk::FieldId::ContactSideBKind, nk::FieldId::ContactSideBIndex,
+                           nk::FieldId::ContactSolveMetrics, nk::FieldId::ContactSolveCounts}) {
             const auto expected = ReadSurfaceField<uint8_t>(reference, field);
             EXPECT_EQ(ReadSurfaceField<uint8_t>(eager, field), expected) << uint32_t(field);
             EXPECT_EQ(ReadSurfaceField<uint8_t>(graph, field), expected) << uint32_t(field);
         }
         if (step != 5u) continue;
         const auto before = ReadSurfaceField<Vec3>(graph, nk::FieldId::ParticlePos);
+        const auto metrics_before = ReadSurfaceField<uint64_t>(graph, nk::FieldId::ContactSolveMetrics);
         for (auto* world : {&eager, &graph, &reference}) ASSERT_EQ(world->Reset({1u}), nphi::Status::Ok);
         const auto after = ReadSurfaceField<Vec3>(graph, nk::FieldId::ParticlePos);
+        const auto metrics_after = ReadSurfaceField<uint64_t>(graph, nk::FieldId::ContactSolveMetrics);
+        for (uint32_t i = 0u; i < metrics_after.size(); ++i)
+            EXPECT_EQ(metrics_after[i], i / nuka::constraint::kContactSolveMetricCount == 1u ? 0u : metrics_before[i]);
         const auto& cap = graph.GetModel().capacities;
         EXPECT_EQ(std::memcmp(before.data(), after.data(), cap.particles_per_env * sizeof(Vec3)), 0);
         EXPECT_EQ(std::memcmp(before.data() + 2u * cap.particles_per_env, after.data() + 2u * cap.particles_per_env,

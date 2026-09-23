@@ -46,6 +46,7 @@ namespace { using NkScanSumOp = ::cub::Sum; }
 
 #include "collision/lbvh_batched.cuh"   // BuildLbvhBatchedNodes (shared env-build)
 #include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
+#include "collision/mesh_surface_types.hpp"
 #include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
 #include "collision/particle_grid_traversal.cuh"  // ParticleGridConfigDevice / QueryParticleNeighbors
 #include "collision/particle_uniform_grid.hpp"     // kParticleGridMaxNeighbors (canonical)
@@ -200,6 +201,8 @@ __forceinline__ __device__ math::Vec3 RotAbs(math::Quat q, math::Vec3 v) {
 // extents + the body world pose, inflated by `margin`.
 __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
                                  const math::Transform* __restrict__ body_pose,
+                                 const collision::MeshSurfaceInfo* __restrict__ mesh_info,
+                                 const collision::MeshBvhNode* __restrict__ mesh_nodes,
                                  uint32_t total_bodies,
                                  uint32_t bodies_per_env,
                                  float margin,
@@ -210,6 +213,7 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
     const uint32_t row = gid - (gid / bodies_per_env) * bodies_per_env;
     const ShapeDev s = LoadShape(shape_table, row);
     const math::Transform xf = body_pose[gid];
+    math::Vec3 center = xf.position;
     math::Vec3 he{0, 0, 0};
     float r = 0.0f;
     switch (s.kind) {
@@ -224,7 +228,14 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
         // SDF mesh: p[1..3] = the cooked per-axis grid bound (a rotated box);
         // a cook without the stamp falls back to the p[0] bound-radius cube.
         case kKindSdfMesh:
-            if (s.p[1] > 0.0f && s.p[2] > 0.0f && s.p[3] > 0.0f) {
+            if (mesh_info != nullptr && mesh_nodes != nullptr && mesh_info[row].node_count > 0u) {
+                const auto& bounds = mesh_nodes[mesh_info[row].node_offset];
+                const math::Vec3 local_center = (bounds.lower + bounds.upper) * 0.5f;
+                const math::Vec3 qv{xf.rotation.x, xf.rotation.y, xf.rotation.z};
+                const math::Vec3 twice_cross = 2.0f * qv.Cross(local_center);
+                center = center + local_center + xf.rotation.w * twice_cross + qv.Cross(twice_cross);
+                he = RotAbs(xf.rotation, (bounds.upper - bounds.lower) * 0.5f);
+            } else if (s.p[1] > 0.0f && s.p[2] > 0.0f && s.p[3] > 0.0f) {
                 he = RotAbs(xf.rotation, math::Vec3{s.p[1], s.p[2], s.p[3]});
             } else {
                 r = s.p[0]; he = {r, r, r};
@@ -273,7 +284,7 @@ __global__ void BuildAabbsKernel(const float* __restrict__ shape_table,
             out_hi[gid] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
             return;
     }
-    const math::Vec3 c = xf.position;
+    const math::Vec3 c = center;
     const float m = margin;
     out_lo[gid] = {c.x - he.x - m, c.y - he.y - m, c.z - he.z - m};
     out_hi[gid] = {c.x + he.x + m, c.y + he.y + m, c.z + he.z + m};
@@ -617,6 +628,8 @@ Status OpBuildAabbs(const ModelView& model, const DataView& data,
     LaunchCuda(BuildAabbsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                static_cast<const float*>(model.shape_table),
                static_cast<const math::Transform*>(data.body_pose),
+               static_cast<const collision::MeshSurfaceInfo*>(model.mesh_surface_info),
+               static_cast<const collision::MeshBvhNode*>(model.mesh_bvh_nodes),
                total, p->bodies_per_env, p->margin,
                data.body_aabb_lo, data.body_aabb_hi);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;

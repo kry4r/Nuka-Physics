@@ -189,13 +189,22 @@ struct MjcfGeneralDefaults {
 // match JointRecord's; that invariant does NOT hold here — notably the record's
 // friction_mu default is the -1 "inherit material μ" sentinel, not MuJoCo's
 // 1.0 — so per-field presence tracking is required.)
-struct MjcfGeomDefaults {
+struct MjcfFrameDefaults {
+    math::Vec3 position;
+    std::string orientation_tag;
+    std::string orientation_value;
+    std::string fromto;
+};
+
+struct MjcfGeomDefaults : MjcfFrameDefaults {
     // M8.5 T5: the geom `type` can be set by a <default><geom type=...> class
     // (e.g. go2's class="visual" -> type="mesh"); the geom element itself then
     // omits the attr. Capture it so the geom loop resolves mesh geoms whose type
     // lives ONLY on the class default -- otherwise their STL/OBJ never loads and
     // the visual-mesh cook produces an empty .nka.
     bool has_type = false;          std::string type;
+    bool has_size = false;          math::Vec3 size{0.5f, 0.5f, 0.5f};
+    std::string material;
     bool has_contype = false;       uint32_t contype = 1;
     bool has_conaffinity = false;   uint32_t conaffinity = 1;
     bool has_group = false;         int32_t group = 0;
@@ -209,13 +218,9 @@ struct MjcfGeomDefaults {
     bool has_friction = false;      float friction_mu = 1.0f;  // first component only
 };
 
-struct MjcfSiteDefaults {
+struct MjcfSiteDefaults : MjcfFrameDefaults {
     std::string type = "sphere";
     math::Vec3 size{0.005f, 0.005f, 0.005f};
-    math::Vec3 position;
-    std::string orientation_tag;
-    std::string orientation_value;
-    std::string fromto;
 };
 
 struct MjcfDefaultClass {
@@ -256,8 +261,8 @@ struct MjcfParseContext {
     std::unordered_map<std::string, scene::ShapeId> geom_ids;
     std::unordered_map<std::string, MjcfSite> site_ids;
     MjcfDefaults defaults;
-    float site_angle_scale = 0.017453292519943295f;
-    std::string site_euler_sequence = "xyz";
+    float angle_scale = 0.017453292519943295f;
+    std::string euler_sequence = "xyz";
 };
 
 scene::ShapeType MjcfGeomType(const char* type_str) {
@@ -381,11 +386,33 @@ bool ParseFrictionFirst(const char* text, float& out_mu) {
 // class's geom-default struct, setting the matching has_* flag for each attr
 // that is actually present (absent attrs leave both the value and flag alone, so
 // they inherit from the parent class via the `current = inherited` copy).
+void ApplyFrameDefault(const tinyxml2::XMLElement* element, MjcfFrameDefaults* frame) {
+    if (const char* pos = element->Attribute("pos")) frame->position = ParseVec3(pos);
+    uint32_t rotations = 0u;
+    for (const char* tag : {"quat", "axisangle", "euler", "xyaxes", "zaxis"}) {
+        if (const char* value = element->Attribute(tag)) {
+            frame->orientation_tag = tag;
+            frame->orientation_value = value;
+            ++rotations;
+        }
+    }
+    if (rotations > 1u) throw std::runtime_error("MJCF: multiple orientation attributes");
+    if (const char* fromto = element->Attribute("fromto")) frame->fromto = fromto;
+}
+
 void ApplyGeomDefault(const tinyxml2::XMLElement* geom_elem, MjcfDefaultClass* defaults) {
     if (geom_elem == nullptr || defaults == nullptr) {
         return;
     }
     MjcfGeomDefaults& g = defaults->geom;
+    ApplyFrameDefault(geom_elem, &g);
+    if (const char* size = geom_elem->Attribute("size")) {
+        float values[] = {g.size.x, g.size.y, g.size.z};
+        if (ParseFloatList(size, values, 3) == 0) throw std::runtime_error("MJCF: invalid geom size");
+        g.size = {values[0], values[1], values[2]};
+        g.has_size = true;
+    }
+    if (const char* material = geom_elem->Attribute("material")) g.material = material;
 
     if (const char* type_str = geom_elem->Attribute("type")) {
         g.type = type_str;
@@ -437,65 +464,55 @@ void ApplySiteDefault(const tinyxml2::XMLElement* element, MjcfSiteDefaults* sit
     float size[] = {site->size.x, site->size.y, site->size.z};
     ParseFloatList(element->Attribute("size"), size, 3);
     site->size = {size[0], size[1], size[2]};
-    if (const char* pos = element->Attribute("pos")) site->position = ParseVec3(pos);
-    uint32_t rotations = 0u;
-    for (const char* tag : {"quat", "axisangle", "euler", "xyaxes", "zaxis"}) {
-        if (const char* value = element->Attribute(tag)) {
-            site->orientation_tag = tag;
-            site->orientation_value = value;
-            ++rotations;
-        }
-    }
-    if (rotations > 1u) throw std::runtime_error("MJCF: site has multiple orientation attributes");
-    if (const char* fromto = element->Attribute("fromto")) site->fromto = fromto;
+    ApplyFrameDefault(element, site);
 }
 
-math::Vec3 SiteUnitVector(math::Vec3 v) {
+math::Vec3 FrameUnitVector(math::Vec3 v) {
     const float length = v.Length();
-    if (!(length > 0.0f) || !std::isfinite(length)) throw std::runtime_error("MJCF: invalid site orientation axis");
+    if (!(length > 0.0f) || !std::isfinite(length)) throw std::runtime_error("MJCF: invalid orientation axis");
     return v / length;
 }
 
-math::Quat SiteZRotation(math::Vec3 direction) {
-    const auto z = SiteUnitVector(direction);
+math::Quat FrameZRotation(math::Vec3 direction) {
+    const auto z = FrameUnitVector(direction);
     return z.z <= -1.0f ? math::Quat{0.0f, 1.0f, 0.0f, 0.0f} :
         math::Quat{1.0f + z.z, -z.y, z.x, 0.0f}.Normalized();
 }
 
-math::Quat SiteOrientation(const MjcfSiteDefaults& site, const MjcfParseContext& context) {
+math::Quat FrameOrientation(const MjcfFrameDefaults& site, const MjcfParseContext& context) {
     if (site.orientation_tag.empty()) return math::Quat::Identity();
     float values[6]{};
     const int required = site.orientation_tag == "xyaxes" ? 6 :
         site.orientation_tag == "euler" || site.orientation_tag == "zaxis" ? 3 : 4;
     if (ParseFloatList(site.orientation_value.c_str(), values, required) != required)
-        throw std::runtime_error("MJCF: incomplete site orientation");
-    for (float value : values) if (!std::isfinite(value)) throw std::runtime_error("MJCF: invalid site orientation");
+        throw std::runtime_error("MJCF: incomplete orientation");
+    for (float value : values) if (!std::isfinite(value)) throw std::runtime_error("MJCF: invalid orientation");
     if (site.orientation_tag == "quat") {
         const math::Quat q{values[0], values[1], values[2], values[3]};
-        if (!(q.Norm() > 0.0f)) throw std::runtime_error("MJCF: zero site quaternion");
+        if (!(q.Norm() > 0.0f)) throw std::runtime_error("MJCF: zero quaternion");
         return q.Normalized();
     }
     if (site.orientation_tag == "axisangle")
-        return math::Quat::FromAxisAngle(SiteUnitVector({values[0], values[1], values[2]}), values[3] * context.site_angle_scale);
-    if (site.orientation_tag == "zaxis") return SiteZRotation({values[0], values[1], values[2]});
+        return math::Quat::FromAxisAngle(FrameUnitVector({values[0], values[1], values[2]}), values[3] * context.angle_scale);
+    if (site.orientation_tag == "zaxis") return FrameZRotation({values[0], values[1], values[2]});
     if (site.orientation_tag == "xyaxes") {
-        const auto x = SiteUnitVector({values[0], values[1], values[2]});
+        const auto x = FrameUnitVector({values[0], values[1], values[2]});
         const math::Vec3 raw_y{values[3], values[4], values[5]};
-        const auto y = SiteUnitVector(raw_y - x * raw_y.Dot(x));
+        const auto y = FrameUnitVector(raw_y - x * raw_y.Dot(x));
         const auto z = x.Cross(y);
         const double matrix[3][3] = {{x.x, y.x, z.x}, {x.y, y.y, z.y}, {x.z, y.z, z.z}};
         return QuatFromMatrix(matrix);
     }
-    if (context.site_euler_sequence.size() != 3u) throw std::runtime_error("MJCF: invalid eulerseq");
+    if (context.euler_sequence.size() != 3u) throw std::runtime_error("MJCF: invalid eulerseq");
     auto q = math::Quat::Identity();
     for (uint32_t axis = 0u; axis < 3u; ++axis) {
-        const char code = context.site_euler_sequence[axis];
+        const char code = context.euler_sequence[axis];
         math::Vec3 vector{};
         if (code == 'x' || code == 'X') vector.x = 1.0f;
         else if (code == 'y' || code == 'Y') vector.y = 1.0f;
         else if (code == 'z' || code == 'Z') vector.z = 1.0f;
         else throw std::runtime_error("MJCF: invalid eulerseq axis");
-        const auto rotation = math::Quat::FromAxisAngle(vector, values[axis] * context.site_angle_scale);
+        const auto rotation = math::Quat::FromAxisAngle(vector, values[axis] * context.angle_scale);
         q = code >= 'a' && code <= 'z' ? q * rotation : rotation * q;
     }
     return q.Normalized();
@@ -505,7 +522,7 @@ MjcfSite ResolveSite(const MjcfSiteDefaults& description, scene::BodyId body, co
     MjcfSite site;
     site.body = body;
     site.local.position = description.position;
-    site.local.rotation = SiteOrientation(description, context);
+    site.local.rotation = FrameOrientation(description, context);
     auto& region = site.region;
     region.size = description.size;
     if (description.type == "sphere") region.shape = sensor::ContactRegionShape::Sphere;
@@ -521,7 +538,7 @@ MjcfSite ResolveSite(const MjcfSiteDefaults& description, scene::BodyId body, co
         const math::Vec3 a{coordinates[0], coordinates[1], coordinates[2]};
         const math::Vec3 b{coordinates[3], coordinates[4], coordinates[5]};
         site.local.position = (a + b) * 0.5f;
-        site.local.rotation = SiteZRotation(b - a);
+        site.local.rotation = FrameZRotation(b - a);
         const float half_height = (b - a).Length() * 0.5f;
         if (description.type == "capsule" || description.type == "cylinder") region.size.y = half_height;
         else region.size.z = half_height;
@@ -789,7 +806,9 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
             shape.type = MjcfGeomType(nullptr);
         }
 
-        if (const char* material_name = geom->Attribute("material")) {
+        const char* material_name = geom->Attribute("material");
+        if (!material_name && !gd.material.empty()) material_name = gd.material.c_str();
+        if (material_name) {
             const auto it = context.material_ids.find(material_name);
             if (it != context.material_ids.end()) {
                 shape.material_id = it->second;
@@ -814,15 +833,17 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
             }
         }
 
-        if (const char* pos = geom->Attribute("pos")) {
-            shape.local_transform.position = ParseVec3(pos);
-        }
-        if (const char* quat = geom->Attribute("quat")) {
-            shape.local_transform.rotation = ParseQuat(quat);
-        }
+        MjcfFrameDefaults frame = gd;
+        ApplyFrameDefault(geom, &frame);
+        shape.local_transform.position = frame.position;
+        shape.local_transform.rotation = FrameOrientation(frame, context);
 
-        if (const char* size_attr = geom->Attribute("size")) {
-            const math::Vec3 sz = ParseVec3(size_attr);
+        const char* size_attr = geom->Attribute("size");
+        if (size_attr || gd.has_size) {
+            float size[] = {gd.size.x, gd.size.y, gd.size.z};
+            if (size_attr && ParseFloatList(size_attr, size, 3) == 0)
+                throw std::runtime_error("MJCF: invalid geom size");
+            const math::Vec3 sz{size[0], size[1], size[2]};
             if (shape.type == scene::ShapeType::Box || shape.type == scene::ShapeType::Plane) {
                 shape.half_extents = sz;
             } else if (shape.type == scene::ShapeType::Sphere) {
@@ -832,18 +853,34 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
                 if (sz.y > 0.0f) {
                     shape.half_height = sz.y;
                 }
-                // Preserve flat cylinder caps in visual geometry.
-                if (geom->Attribute("type") != nullptr &&
-                    std::string(geom->Attribute("type")) == "cylinder") {
-                    shape.flat_capped = true;
-                }
             }
+        }
+        const char* resolved_type = geom->Attribute("type");
+        if (!resolved_type && gd.has_type) resolved_type = gd.type.c_str();
+        shape.flat_capped = resolved_type && std::string(resolved_type) == "cylinder";
+        if (!frame.fromto.empty()) {
+            float points[6];
+            if (ParseFloatList(frame.fromto.c_str(), points, 6) != 6 ||
+                (shape.type != scene::ShapeType::Capsule && shape.type != scene::ShapeType::Box))
+                throw std::runtime_error("MJCF: invalid geom fromto");
+            const math::Vec3 a{points[0], points[1], points[2]};
+            const math::Vec3 b{points[3], points[4], points[5]};
+            shape.local_transform.position = (a + b) * 0.5f;
+            shape.local_transform.rotation = FrameZRotation(b - a);
+            const float half_length = (b - a).Length() * 0.5f;
+            if (shape.type == scene::ShapeType::Capsule) shape.half_height = half_length;
+            else shape.half_extents.z = half_length;
         }
 
         // nuka:decompose="auto|force|skip" + optional nuka:decompose:max_pieces
         // on a mesh geom (v0.7 p06).
         if (shape.type == scene::ShapeType::TriMesh) {
             shape.decompose_mode = DecomposeModeFromToken(geom->Attribute("nuka:decompose"));
+            if (const char* orientation = geom->Attribute("nuka:mesh_orientation")) {
+                if (std::string(orientation) != "automatic" && std::string(orientation) != "outward")
+                    throw std::runtime_error("MJCF mesh orientation must be automatic or outward");
+                shape.mesh_oriented = std::string(orientation) == "outward";
+            }
             int max_pieces = 0;
             if (geom->QueryIntAttribute("nuka:decompose:max_pieces", &max_pieces) ==
                     tinyxml2::XML_SUCCESS && max_pieces > 0) {
@@ -939,6 +976,19 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         if (!geom_name.empty()) {
             context.geom_ids[geom_name] = shape_id;
         }
+    }
+
+    if (const auto* free_joint = body_elem->FirstChildElement("freejoint")) {
+        if (parent_id != scene::kInvalidBody || body_elem->FirstChildElement("joint") ||
+            free_joint->NextSiblingElement("freejoint"))
+            throw std::runtime_error("MJCF freejoint must be the only joint of a root body");
+        scene::JointRecord joint;
+        const char* name = free_joint->Attribute("name");
+        joint.name = name ? name : body_name + "/free";
+        joint.type = scene::JointType::Free;
+        joint.child_body = body_id;
+        const scene::JointId id = scene.AddJoint(std::move(joint));
+        context.joint_ids[scene.GetJoint(id).name] = id;
     }
 
     for (auto* joint = body_elem->FirstChildElement("joint");
@@ -1344,10 +1394,10 @@ scene::SceneIR LoadMjcf(const std::string& path) {
 
     if (const auto* compiler = mujoco->FirstChildElement("compiler")) {
         if (const char* angle = compiler->Attribute("angle")) {
-            if (std::string(angle) == "radian") context.site_angle_scale = 1.0f;
+            if (std::string(angle) == "radian") context.angle_scale = 1.0f;
             else if (std::string(angle) != "degree") throw std::runtime_error("MJCF: invalid compiler angle");
         }
-        if (const char* sequence = compiler->Attribute("eulerseq")) context.site_euler_sequence = sequence;
+        if (const char* sequence = compiler->Attribute("eulerseq")) context.euler_sequence = sequence;
     }
 
     ParseDefaults(mujoco, context);

@@ -1,30 +1,14 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — BuildSolveIslands (dynamic connected-component schedule).
-//
-// The PairDriven contact rows are DYNAMIC broadphase candidates, so the cook-time
-// schedule conservatively held ALL of an env's rows in ONE island (one block). For
-// a multi-articulation scene (30 spatially-disjoint dogs in one env) that serializes
-// every contact through a single block. This op re-derives the TRUE islands each
-// step, on device, with ZERO host round-trip: a union-find over the ACTIVE rows
-// keyed by every coupling a row touches (artic side a/b, rigid body, particle) plus
-// the friction-group anchor, then a stable radix sort that groups each component's
-// rows CONTIGUOUSLY in ASCENDING slot order. The solve runs one block per component
-// in parallel.
-//
-// BYTE-IDENTITY: components are state-disjoint (the union-find merges every shared
-// coupling), so reordering rows across components changes nothing in any component's
-// arithmetic; the stable sort preserves each component's ascending row order, which
-// is exactly the order the single-island-per-env sweep used — bit-for-bit identical.
-// A single-articulation scene is ONE component -> structurally the old single island.
-// ---------------------------------------------------------------------------
+// Connected components include every shared velocity and friction group.
 
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 
 #include <cub/device/device_radix_sort.cuh>
 
 #include "nk/model/generated/views.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/backend_cuda/launch.cuh"
+#include "phi/backend_cuda/ops/island_schedule.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/op_schema.hpp"
@@ -47,9 +31,10 @@ inline __host__ uint64_t AlignScratch(uint64_t v) {
     return (v + (kScratchAlign - 1u)) & ~(kScratchAlign - 1u);
 }
 
-// Atomic load of a union-find parent slot (atomicOr-0): keeps EVERY parent access
-// atomic so the concurrent hooks/finds never tear under the CUDA memory model.
-__device__ inline uint32_t AtomicLoad(uint32_t* p) { return atomicOr(p, 0u); }
+// Parent reads are atomic without serializing readers through a read-modify-write.
+__device__ inline uint32_t AtomicLoad(uint32_t* p) {
+    return cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*p).load(cuda::memory_order_relaxed);
+}
 
 // Concurrent path-halving find (best-effort halve via atomicCAS; correct even when
 // the CAS loses a race — the node still advances toward its root).
@@ -63,9 +48,7 @@ __device__ uint32_t Find(uint32_t* parent, uint32_t i) {
     }
 }
 
-// Lock-free union, SMALLER-ROOT-WINS (the host RowUnionFind convention: the
-// component root is the min row index). The components are determined by the edge
-// set, not the union order, so any interleaving yields the same partition.
+// Smaller-root-wins union makes the component partition independent of hook order.
 __device__ void Unite(uint32_t* parent, uint32_t a, uint32_t b) {
     for (;;) {
         a = Find(parent, a);
@@ -93,13 +76,16 @@ __global__ void FillIdentityKernel(uint32_t* arr, uint32_t n) {
 
 // Claim a side's GLOBAL coupling key (first active row wins the slot) and union this
 // row with the prior claimer. Static sides / out-of-range keys contribute no edge.
+// A zero-inverse-mass body never receives an impulse, so it carries no edge either --
+// the solver already skips its write, and coupling through it would be fictitious.
 __device__ inline void ClaimUnion(uint32_t* parent, const NkRowSide& s, uint32_t row,
                                   uint32_t* artic_first, uint32_t artic_count,
                                   uint32_t* body_first, uint32_t body_count,
                                   uint32_t* particle_first, uint32_t particle_count,
                                   uint32_t* grid_first, uint32_t grid_count,
                                   const nk::PointEndpointRange* ranges,
-                                  const nk::PointEndpointTerm* terms) {
+                                  const nk::PointEndpointTerm* terms,
+                                  const float* body_inv_mass) {
     const bool interpolated = s.kind == nk::kNkSidePointEndpoint;
     const uint32_t count = interpolated ? ranges[s.index].count : 1u;
     for (uint32_t i = 0u; i < count; ++i) {
@@ -113,6 +99,9 @@ __device__ inline void ClaimUnion(uint32_t* parent, const NkRowSide& s, uint32_t
         else if (kind == kNkSideParticle) { table = particle_first; limit = particle_count; }
         else if (kind == kNkSideGrid)     { table = grid_first;     limit = grid_count; }
         if (table == nullptr || index >= limit) continue;
+        if (kind == kNkSideRigid && body_inv_mass != nullptr &&
+            !(body_inv_mass[index] > 0.0f))
+            continue;
         const uint32_t old = atomicCAS(&table[index], kSentinel, row);
         if (old != kSentinel) Unite(parent, row, old);
     }
@@ -126,15 +115,19 @@ __global__ void UnionRowsKernel(const NkRow* __restrict__ urows, uint32_t* paren
                                 uint32_t* particle_first, uint32_t particle_count,
                                 uint32_t* grid_first, uint32_t grid_count,
                                 const nk::PointEndpointRange* ranges, const nk::PointEndpointTerm* terms,
+                                const float* __restrict__ body_inv_mass,
                                 uint32_t total_rows) {
     const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= total_rows) return;
-    if (!(urows[row].flags & nk::nk_row_flags::kActive)) return;
+    const uint32_t flags = urows[row].flags;
+    if (!(flags & nk::nk_row_flags::kActive) || (flags & nk::nk_row_flags::kBlockTangent)) return;
     const NkRow r = urows[row];
     ClaimUnion(parent, r.a, row, artic_first, artic_count, body_first, body_count,
-               particle_first, particle_count, grid_first, grid_count, ranges, terms);
+               particle_first, particle_count, grid_first, grid_count, ranges, terms,
+               body_inv_mass);
     ClaimUnion(parent, r.b, row, artic_first, artic_count, body_first, body_count,
-               particle_first, particle_count, grid_first, grid_count, ranges, terms);
+               particle_first, particle_count, grid_first, grid_count, ranges, terms,
+               body_inv_mass);
     const uint32_t gf = r.group_first;
     if (gf != row && gf < total_rows) Unite(parent, row, gf);
 }
@@ -146,40 +139,57 @@ __global__ void FlattenRootsKernel(const NkRow* __restrict__ urows,
                                    uint32_t* __restrict__ cc_root, uint32_t total_rows) {
     const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= total_rows) return;
-    cc_root[row] = (urows[row].flags & nk::nk_row_flags::kActive)
+    // A block normal projects its complete friction triplet; tangents need no separate visit.
+    const uint32_t flags = urows[row].flags;
+    cc_root[row] = ((flags & nk::nk_row_flags::kActive) && !(flags & nk::nk_row_flags::kBlockTangent))
                        ? FindReadonly(parent, row) : kSentinel;
 }
 
-// One thread per SORTED position. The radix sort grouped equal roots contiguously
-// (ascending row within, stable). A position whose root differs from its predecessor
-// is a component START: it scans its run, emits the {row_off,row_cnt,flags,env} quad
-// at a freshly reserved component id, and stamps the has-artic flag.
+__global__ void AccumulateIslandFlagsKernel(
+    uint32_t* __restrict__ roots, const NkRow* __restrict__ urows,
+    const nk::PointEndpointRange* __restrict__ endpoint_ranges,
+    uint32_t total_rows, uint32_t* __restrict__ root_flags) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_rows) return;
+    const NkRow& row = urows[i];
+    if (!(row.flags & nk::nk_row_flags::kActive)) return;
+    // Tangents share their normal's component even though the solve visits only block normals.
+    if (row.flags & nk::nk_row_flags::kBlockTangent) {
+        roots[i] = roots[row.group_first];
+        return;
+    }
+    const uint32_t root = roots[i];
+    uint32_t flags = 0u;
+    if (row.a.kind == kNkSideArtic || row.b.kind == kNkSideArtic)
+        flags |= nkops::kIslandHasArticulation;
+    if ((row.a.kind == nk::kNkSidePointEndpoint && endpoint_ranges[row.a.index].count > 1u) ||
+        (row.b.kind == nk::kNkSidePointEndpoint && endpoint_ranges[row.b.index].count > 1u))
+        flags |= nkops::kIslandHasMultiplePointTerms;
+    if (flags != 0u) atomicOr(&root_flags[root], flags);
+}
+
+// Component bounds use binary search; endpoint flags are reduced in parallel.
 __global__ void EmitIslandsKernel(const uint32_t* __restrict__ root_sorted,
                                   const uint32_t* __restrict__ rows,
-                                  const NkRow* __restrict__ urows,
+                                  const uint32_t* __restrict__ root_flags,
                                   uint32_t total_rows, uint32_t rows_per_env,
                                   uint32_t* __restrict__ island_count,
-                                  uint32_t* __restrict__ island_quads) {
+                                  nkops::IslandRecord* __restrict__ islands) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total_rows) return;
     const uint32_t root = root_sorted[i];
     if (root == kSentinel) return;                 // inactive tail.
     if (i > 0u && root_sorted[i - 1u] == root) return;  // not a component start.
-    uint32_t j = i + 1u;
-    while (j < total_rows && root_sorted[j] == root) ++j;
-    const uint32_t row_cnt = j - i;
-    const uint32_t env = (rows_per_env > 0u) ? (rows[i] / rows_per_env) : 0u;
-    uint32_t flags = 0u;
-    for (uint32_t k = i; k < j; ++k) {
-        const NkRow& r = urows[rows[k]];
-        if (r.a.kind == kNkSideArtic || r.b.kind == kNkSideArtic) { flags |= 1u; break; }
+    uint32_t begin = i + 1u, end = total_rows;
+    while (begin < end) {
+        const uint32_t middle = begin + (end - begin) / 2u;
+        if (root_sorted[middle] == root) begin = middle + 1u;
+        else end = middle;
     }
+    const uint32_t row_cnt = begin - i;
+    const uint32_t env = (rows_per_env > 0u) ? (rows[i] / rows_per_env) : 0u;
     const uint32_t comp = atomicAdd(island_count, 1u);  // comp < #components <= total_rows.
-    uint32_t* const q = island_quads + static_cast<size_t>(comp) * 4u;
-    q[0] = i;        // row_off into island_rows
-    q[1] = row_cnt;
-    q[2] = flags;    // bit0 == component has an articulation row
-    q[3] = env;
+    islands[comp] = {i, row_cnt, root_flags[root], env};
 }
 
 }  // namespace
@@ -237,7 +247,8 @@ Status OpBuildSolveIslands(const ModelView& /*model*/, const DataView& data,
                data.cc_parent, data.cc_artic_first, artic_count, data.cc_body_first,
                body_count, data.cc_particle_first, particle_count,
                data.cc_grid_first, grid_count,
-               data.point_endpoint_ranges, data.point_endpoint_terms, total_rows);
+               data.point_endpoint_ranges, data.point_endpoint_terms,
+               static_cast<const float*>(data.body_inv_mass), total_rows);
     LaunchCuda(FlattenRootsKernel, dim3(rblocks), dim3(kBlockSize), 0u, stream, urows,
                data.cc_parent, data.cc_root, total_rows);
 
@@ -256,10 +267,16 @@ Status OpBuildSolveIslands(const ModelView& /*model*/, const DataView& data,
         return Status::Failed;
     }
 
-    // Emit one island per component span.
+    // Sorting releases cc_parent; reuse it for root flags until island records are emitted.
+    if (cudaMemsetAsync(data.cc_parent, 0, static_cast<size_t>(total_rows) * sizeof(uint32_t),
+                        stream) != cudaSuccess) return Status::Failed;
+    LaunchCuda(AccumulateIslandFlagsKernel, dim3(rblocks), dim3(kBlockSize), 0u, stream,
+               data.cc_root, urows, data.point_endpoint_ranges,
+               total_rows, data.cc_parent);
     LaunchCuda(EmitIslandsKernel, dim3(rblocks), dim3(kBlockSize), 0u, stream,
-               data.island_root_sorted, data.island_rows, urows, total_rows,
-               p->rows_per_env, data.island_count, data.island_quads);
+               data.island_root_sorted, data.island_rows, data.cc_parent,
+               total_rows, p->rows_per_env, data.island_count,
+               reinterpret_cast<nkops::IslandRecord*>(data.island_quads));
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

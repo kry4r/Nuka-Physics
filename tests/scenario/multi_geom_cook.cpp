@@ -1,8 +1,4 @@
-// ---------------------------------------------------------------------------
-// Multi-geom collidable cook: an articulation link with >1 collision primitive
-// must cook EXTRA collidable body rows (proxies) that resolve to the owner link,
-// while a single-geom link stays byte-identical (no proxies).
-// ---------------------------------------------------------------------------
+// Multiple collision shapes share their articulation owner through collidable proxies.
 
 #include <gtest/gtest.h>
 
@@ -22,7 +18,8 @@ namespace scene = nuka::scene;
 
 // A 2-link arm (fixed base -> hinge -> link), with `n_geoms` capsule colliders on
 // the link, each offset fore-aft so a multi-geom link forms a support polygon.
-scene::SceneIR MakeArm(int n_geoms) {
+scene::SceneIR MakeArm(int n_geoms, scene::ShapeType first = scene::ShapeType::Capsule,
+                      scene::ShapeType remaining = scene::ShapeType::Capsule) {
     scene::SceneIR s;
 
     scene::RigidBodyRecord base;
@@ -49,10 +46,17 @@ scene::SceneIR MakeArm(int n_geoms) {
     for (int i = 0; i < n_geoms; ++i) {
         scene::CollisionShapeRecord c;
         c.body_id = link_id;
-        c.type = scene::ShapeType::Capsule;
+        c.type = i == 0 ? first : remaining;
         c.radius = 0.02f;
         c.half_height = 0.015f;
         c.local_transform.position = Vec3{0.03f * static_cast<float>(i), 0.0f, -0.05f};
+        if (c.type == scene::ShapeType::TriMesh) {
+            c.mesh_vertices = {0.02f, 0, 0, -0.02f, 0, 0, 0, 0.02f, 0,
+                               0, -0.02f, 0, 0, 0, 0.02f, 0, 0, -0.02f};
+            c.mesh_indices = {0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4,
+                              2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5};
+            c.decompose_mode = scene::DecomposeMode::Skip;
+        }
         s.AddCollisionShape(c);
     }
     return s;
@@ -67,6 +71,9 @@ nuka::nk::Model Cook(const scene::SceneIR& s) {
 // A single-geom link cooks NO proxies: body_collidable_link stays empty/all-~0u.
 TEST(MultiGeomCook, SingleGeomHasNoProxies) {
     const nuka::nk::Model m = Cook(MakeArm(1));
+    ASSERT_GE(m.shape_table_rows.size(), 2u);
+    EXPECT_EQ(m.shape_table_rows[0].contype, 0u);
+    EXPECT_EQ(m.shape_table_rows[0].conaffinity, 0u);
     for (uint32_t v : m.body_collidable_link) {
         EXPECT_EQ(v, ~uint32_t(0));
     }
@@ -77,47 +84,53 @@ TEST(MultiGeomCook, SingleGeomHasNoProxies) {
 
 // A two-geom link cooks exactly ONE proxy collidable row bound to the owner link.
 TEST(MultiGeomCook, ExtraGeomBecomesProxyRow) {
-    const nuka::nk::Model one = Cook(MakeArm(1));
-    const nuka::nk::Model two = Cook(MakeArm(2));
+    for (auto first : {scene::ShapeType::Capsule, scene::ShapeType::TriMesh}) {
+        for (auto second : {scene::ShapeType::Capsule, scene::ShapeType::TriMesh}) {
+            SCOPED_TRACE(static_cast<uint32_t>(first));
+            SCOPED_TRACE(static_cast<uint32_t>(second));
+            const nuka::nk::Model one = Cook(MakeArm(1, first));
+            const nuka::nk::Model two = Cook(MakeArm(2, first, second));
+            EXPECT_EQ(two.capacities.bodies_per_env, one.capacities.bodies_per_env + 1u);
 
-    // One extra collidable body-row leaf vs the single-geom cook.
-    EXPECT_EQ(two.capacities.bodies_per_env, one.capacities.bodies_per_env + 1u);
+            uint32_t proxy_rows = 0u, proxy_link = ~0u, proxy_row = ~0u;
+            for (uint32_t b = 0; b < two.body_collidable_link.size(); ++b) {
+                if (two.body_collidable_link[b] != ~uint32_t(0)) {
+                    ++proxy_rows;
+                    proxy_link = two.body_collidable_link[b];
+                    proxy_row = b;
+                }
+            }
+            EXPECT_EQ(proxy_rows, 1u);
+            EXPECT_EQ(proxy_link, 1u);
 
-    // Exactly one proxy row, and it poses from the child link (template link 1).
-    uint32_t proxy_rows = 0u, proxy_link = ~0u, proxy_row = ~0u;
-    for (uint32_t b = 0; b < two.body_collidable_link.size(); ++b) {
-        if (two.body_collidable_link[b] != ~uint32_t(0)) {
-            ++proxy_rows;
-            proxy_link = two.body_collidable_link[b];
-            proxy_row = b;
+            ASSERT_LT(proxy_row, two.body_to_link.size());
+            EXPECT_EQ(two.body_to_link[proxy_row], 1u);
+            // Mesh cooking includes the local transform in its vertices.
+            ASSERT_LT(proxy_row, two.body_collidable_local.size());
+            EXPECT_NEAR(two.body_collidable_local[proxy_row].position.x,
+                        second == scene::ShapeType::TriMesh ? 0.0f : 0.03f, 1e-6);
+            if (second == scene::ShapeType::TriMesh) {
+                ASSERT_LT(proxy_row, two.mesh_surface_info.size());
+                EXPECT_EQ(two.mesh_surface_info[proxy_row].triangle_count, 8u);
+                EXPECT_EQ(two.samp_ranges[2u * proxy_row + 1u], 18u);
+            }
+
+            const uint32_t owner_body = 1u;
+            const uint64_t key = (static_cast<uint64_t>(owner_body) << 32) | proxy_row;
+            bool excluded = false;
+            for (uint64_t k : two.excluded_pairs) if (k == key) excluded = true;
+            EXPECT_TRUE(excluded);
+
+            // Appending a proxy preserves every original collidable's geometry and owner.
+            ASSERT_EQ(two.shape_table_rows.size(), one.shape_table_rows.size() + 1u);
+            for (size_t b = 0u; b < one.shape_table_rows.size(); ++b) {
+                EXPECT_EQ(two.shape_table_rows[b].kind, one.shape_table_rows[b].kind);
+                EXPECT_EQ(two.shape_table_rows[b].body_id, one.shape_table_rows[b].body_id);
+                EXPECT_EQ(two.shape_table_rows[b].sdf_grid, one.shape_table_rows[b].sdf_grid);
+                for (uint32_t p = 0u; p < 4u; ++p)
+                    EXPECT_EQ(two.shape_table_rows[b].params[p], one.shape_table_rows[b].params[p]);
+            }
         }
-    }
-    EXPECT_EQ(proxy_rows, 1u);
-    EXPECT_EQ(proxy_link, 1u);  // the child link's template-local index.
-
-    // The proxy row resolves its contact reaction back to the owner link.
-    ASSERT_LT(proxy_row, two.body_to_link.size());
-    EXPECT_EQ(two.body_to_link[proxy_row], 1u);
-    // Its geom offset is the 2nd capsule's local transform (x = 0.03).
-    ASSERT_LT(proxy_row, two.body_collidable_local.size());
-    EXPECT_NEAR(two.body_collidable_local[proxy_row].position.x, 0.03f, 1e-6);
-
-    // The proxy is excluded from its owner body row (never self-contacts the foot).
-    const uint32_t owner_body = 1u;  // link body row.
-    const uint64_t key = (static_cast<uint64_t>(owner_body < proxy_row ? owner_body : proxy_row) << 32) |
-                         static_cast<uint64_t>(owner_body < proxy_row ? proxy_row : owner_body);
-    bool excluded = false;
-    for (uint64_t k : two.excluded_pairs) if (k == key) excluded = true;
-    EXPECT_TRUE(excluded);
-
-    // Appending a proxy preserves every original collidable's geometry and owner.
-    ASSERT_EQ(two.shape_table_rows.size(), one.shape_table_rows.size() + 1u);
-    for (size_t b = 0u; b < one.shape_table_rows.size(); ++b) {
-        EXPECT_EQ(two.shape_table_rows[b].kind, one.shape_table_rows[b].kind);
-        EXPECT_EQ(two.shape_table_rows[b].body_id, one.shape_table_rows[b].body_id);
-        EXPECT_EQ(two.shape_table_rows[b].sdf_grid, one.shape_table_rows[b].sdf_grid);
-        for (uint32_t p = 0u; p < 4u; ++p)
-            EXPECT_EQ(two.shape_table_rows[b].params[p], one.shape_table_rows[b].params[p]);
     }
 }
 

@@ -832,7 +832,7 @@ private:
     // Last attached camera image size + cameras per env (the (E,S,H,W,ch) shaping).
     uint32_t sensor_width_ = 0u;
     uint32_t sensor_height_ = 0u;
-    uint32_t sensor_count_ = 1u;
+    uint32_t sensor_count_ = 0u;
     // Last attached lidar fan (the (E,S,az,el) range shaping).
     uint32_t lidar_count_ = 0u;
     uint32_t lidar_az_ = 0u;
@@ -1894,6 +1894,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("CONTACT_SIDE_B_INDEX", NUKA_FIELD_CONTACT_SIDE_B_INDEX)
         .value("POINT_ENDPOINT_RANGES", NUKA_FIELD_POINT_ENDPOINT_RANGES)
         .value("POINT_ENDPOINT_TERMS", NUKA_FIELD_POINT_ENDPOINT_TERMS)
+        .value("CONTACT_SOLVE_METRICS", NUKA_FIELD_CONTACT_SOLVE_METRICS)
+        .value("CONTACT_SOLVE_COUNTS", NUKA_FIELD_CONTACT_SOLVE_COUNTS)
         .value("BODY_FORCE", NUKA_FIELD_BODY_FORCE)
         .value("BODY_TORQUE", NUKA_FIELD_BODY_TORQUE)
         .value("ENV_STATUS", NUKA_FIELD_ENV_STATUS)
@@ -1961,6 +1963,7 @@ NB_MODULE(_nuka_ext, m) {
         .export_values();
 
     nb::enum_<nuka_state_sensor_kind_t>(m, "StateSensorKind")
+        .value("JOINT_EFFORT", NUKA_STATE_SENSOR_JOINT_EFFORT)
         .value("IMU", NUKA_STATE_SENSOR_IMU)
         .value("FRAME_POSE", NUKA_STATE_SENSOR_FRAME_POSE)
         .value("JOINT_STATE", NUKA_STATE_SENSOR_JOINT_STATE)
@@ -2290,7 +2293,10 @@ NB_MODULE(_nuka_ext, m) {
             "render_beauty",
             [](World& w, std::array<float, 3> eye, std::array<float, 3> look,
                std::array<float, 3> up, float fov_deg, uint32_t width,
-               uint32_t height, uint32_t spp, const std::string& dtype) -> nb::object {
+               uint32_t height, uint32_t spp, const std::string& dtype,
+               const std::string& camera) -> nb::object {
+                if (camera.empty() && eye == look)
+                    throw std::invalid_argument("Provide a scene camera name or distinct eye and look positions");
                 nuka_beauty_camera_t cam{};
                 for (int i = 0; i < 3; ++i) {
                     cam.eye[i] = eye[i]; cam.look[i] = look[i]; cam.up[i] = up[i];
@@ -2300,32 +2306,35 @@ NB_MODULE(_nuka_ext, m) {
                                        dtype == "f4" || dtype == "f");
                 const size_t n = static_cast<size_t>(width) * height * 3u;
                 size_t shape[3] = {height, width, 3u};
+                const auto render = [&](uint8_t format, void* pixels) {
+                    return camera.empty()
+                        ? nuka_world_render_beauty(w.raw(), &cam, width, height, spp, format, pixels, n, nullptr)
+                        : nuka_world_render_scene_camera(w.raw(), camera.c_str(), width, height, spp,
+                                                        format, pixels, n, nullptr);
+                };
                 if (as_float) {
                     float* buf = new float[n ? n : 1u];
-                    check(nuka_world_render_beauty(w.raw(), &cam, width, height, spp,
-                                                   1u, buf, n, nullptr),
-                          "nuka_world_render_beauty");
                     nb::capsule owner(buf, [](void* p) noexcept {
                         delete[] static_cast<float*>(p);
                     });
+                    check(render(1u, buf), "nuka_world_render_beauty");
                     return nb::cast(
                         nb::ndarray<nb::numpy, float>(buf, 3, shape, owner));
                 }
                 uint8_t* buf = new uint8_t[n ? n : 1u];
-                check(nuka_world_render_beauty(w.raw(), &cam, width, height, spp, 0u,
-                                               buf, n, nullptr),
-                      "nuka_world_render_beauty");
                 nb::capsule owner(buf, [](void* p) noexcept {
                     delete[] static_cast<uint8_t*>(p);
                 });
+                check(render(0u, buf), "nuka_world_render_beauty");
                 return nb::cast(
                     nb::ndarray<nb::numpy, uint8_t>(buf, 3, shape, owner));
             },
-            nb::arg("eye"), nb::arg("look"),
+            nb::arg("eye") = std::array<float, 3>{}, nb::arg("look") = std::array<float, 3>{},
             nb::arg("up") = std::array<float, 3>{{0.0f, 0.0f, 1.0f}},
             nb::arg("fov_deg") = 40.0f, nb::arg("width") = 1280u,
             nb::arg("height") = 720u, nb::arg("spp") = 16u,
             nb::arg("dtype") = std::string("uint8"),
+            nb::arg("camera") = std::string(),
             "Beauty-render the world's CURRENT state to a HOST (height, width, 3) "
             "numpy image with the offline CUDA path-tracer (the shared studio look: "
             "FK-posed robot link visuals + the live particle surface + a studio "
@@ -2333,7 +2342,50 @@ NB_MODULE(_nuka_ext, m) {
             "3-vectors; fov_deg is the vertical FOV; spp the beauty sample count. "
             "dtype 'uint8' -> uint8 [0,255] (default) or 'float'/'float32' -> float32 "
             "[0,1]. Renders env 0. Raises NOT_SUPPORTED if no offline RT backend or "
-            "the world has no renderable geometry.")
+            "the world has no renderable geometry. A nonempty camera selects an "
+            "authored scene camera and replaces eye/look/up/FOV with its live pose and optics.")
+        .def("scene_camera", [](World& w, const std::string& name, uint32_t env_index) {
+            nuka_scene_camera_t camera{};
+            check(nuka_world_get_scene_camera(w.raw(), name.c_str(), env_index, &camera),
+                  "nuka_world_get_scene_camera");
+            nb::dict result;
+            result["name"] = name;
+            result["mount"] = static_cast<uint32_t>(camera.mount);
+            result["mount_index"] = camera.mount_index;
+            result["local_offset"] = std::vector<float>(camera.local_offset, camera.local_offset + 7);
+            result["eye"] = std::vector<float>(camera.view.eye, camera.view.eye + 3);
+            result["look"] = std::vector<float>(camera.view.look, camera.view.look + 3);
+            result["up"] = std::vector<float>(camera.view.up, camera.view.up + 3);
+            result["vfov"] = camera.view.fov_deg;
+            result["near_clip"] = camera.near_clip;
+            result["far_clip"] = camera.far_clip;
+            result["focus_distance"] = camera.focus_distance;
+            result["shadow_radius"] = camera.shadow_radius;
+            return result;
+        }, nb::arg("name"), nb::arg("env_index") = 0u,
+            "Read an authored camera's cooked mount, optics and live world-space view.")
+        .def("kinematic_tree", [](World& w) {
+            nb::list links;
+            for (uint32_t index = 0u; index < w.base_link_count(); ++index) {
+                nuka_kinematic_link_t link{};
+                check(nuka_world_get_kinematic_link(w.raw(), index, &link),
+                      "nuka_world_get_kinematic_link");
+                nb::dict row;
+                row["name"] = w.dof_name(index);
+                row["parent_index"] = link.parent_index;
+                row["articulation_index"] = link.articulation_index;
+                switch (link.joint_type) {
+                    case NUKA_KINEMATIC_ROOT: row["joint_type"] = "root"; break;
+                    case NUKA_KINEMATIC_FIXED: row["joint_type"] = "fixed"; break;
+                    case NUKA_KINEMATIC_REVOLUTE: row["joint_type"] = "revolute"; break;
+                    case NUKA_KINEMATIC_PRISMATIC: row["joint_type"] = "prismatic"; break;
+                }
+                row["local_pose"] = std::vector<float>(link.local_pose, link.local_pose + 7);
+                row["axis"] = std::vector<float>(link.axis, link.axis + 3);
+                links.append(row);
+            }
+            return links;
+        }, "Read immutable encoder kinematics, with per-environment parent indices and identity root frames.")
         // Name->DOF introspection. The cooked DOF names (joint-resolved, correct
         // under CookArticulations reordering) and the regex/keyword resolvers.
         .def(

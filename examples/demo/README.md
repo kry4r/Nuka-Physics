@@ -2,10 +2,13 @@
 
 Pretrained policies and material experiments run in Nuka. Video frames come from live simulated worlds or replay of their saved states. The [homepage gallery](../../README.md) links to the complete recordings.
 
+The material examples load [Nuka Dynamics Lab](../../docs/nuka-stage.md), a shared NKS/NKA asset with a layered experiment deck, warm grey panels, avocado green edges and inset signage. Use `--environment` to select a layout; edit its materials, lights and cameras in NKS. The guide covers asset editing and replay rendering.
+
 | Demo | Entry point | Recording |
 |---|---|---|
 | π0.5 inference | [libero_pi05_play.py](libero_pi05_play.py) | [12 s, 1280 × 720](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/pi05_libero.mp4) |
 | G1 Shuffle dance | [g1_dance_play.py](g1_dance_play.py) | [20 s, 960 × 540](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4) |
+| G1 clothed water course | [g1_wading_demo.py](g1_wading_demo.py) | [Setup and training](../assets/g1_wading/README.md); traversal under validation |
 | Elastoplastic compression | [elastoplastic_compression_demo.cpp](elastoplastic_compression_demo.cpp) | [24.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4) |
 | Bunny elastoplastic impact | [elastoplastic_bunny_demo.cpp](elastoplastic_bunny_demo.cpp) | [18.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4) |
 | Dynamic elastoplastic gripper | [robot_elastoplastic_demo.cpp](robot_elastoplastic_demo.cpp) | [Full view](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4) · [Contact close-up](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic_close.mp4) |

@@ -270,6 +270,7 @@ __device__ __forceinline__ bool IntersectBlasPrimT(const DevBlas& b,
                                                    const Vec3& dir,
                                                    float t_min,
                                                    float* out_t) {
+    if (prim >= b.prim_count) return false;
     const DevPrim p = b.prims[prim];
     if (p.kind == static_cast<uint32_t>(PrimKind::Triangle)) {
         float u, v;

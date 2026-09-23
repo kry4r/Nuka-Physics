@@ -229,7 +229,7 @@ struct SceneUbo {
     //     offsets are unchanged; default-zero => the shader's shadow term is a
     //     strict no-op and the gated path is byte-identical, G2-safe). ---
     float    light_view_proj[16];  // the sun's view-projection (world -> light clip)
-    float    shadow_params[4];     // x = strength (0 => OFF), y = bias, z = texel size, w = pad
+    float    shadow_params[4];     // strength, depth bias, texel size, PCF spacing
 };
 static_assert(sizeof(SceneUbo) == 608, "SceneUbo must match the std140 shader block");
 
@@ -257,7 +257,7 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
     ubo.shadow_params[0] = options.shadow_strength;
     ubo.shadow_params[1] = options.shadow_bias;
     ubo.shadow_params[2] = shadow_texel;
-    ubo.shadow_params[3] = 0.0f;
+    ubo.shadow_params[3] = options.shadow_filter_radius;
 
     // Atmospheric haze (Go2-terrain demo). DEFAULT density 0 => fog[3] == 0 ->
     // the shader's fog mix is a strict no-op, so every non-fog caller is byte-
@@ -279,7 +279,7 @@ SceneUbo BuildSceneUbo(const RenderWorld& world, const Mat4& view_proj,
     // and the single sun's N.L carves the geometry. DEFAULT (off) leaves the exact
     // pre-existing studio ambient -> the gated smokes are byte-identical (G2-safe).
     const bool sun_mode = options.use_sun_light && world.lights.empty();
-    if (sun_mode) {
+    if (options.use_sun_light) {
         ubo.ambient[0] = options.sun_ambient_sky[0];
         ubo.ambient[1] = options.sun_ambient_sky[1];
         ubo.ambient[2] = options.sun_ambient_sky[2];
@@ -1513,6 +1513,14 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     if (options.width == 0u || options.height == 0u) {
         throw std::runtime_error("Vulkan raster render dimensions must be non-zero");
     }
+    if (!std::isfinite(options.shadow_radius) || options.shadow_radius < 0.0f ||
+        !std::isfinite(options.shadow_center.LengthSq()))
+        throw std::invalid_argument("shadow coverage must have a finite center and nonnegative radius");
+    if (options.shadow_map_size == 0u || !std::isfinite(options.shadow_strength) ||
+        options.shadow_strength < 0.0f || options.shadow_strength > 1.0f ||
+        !std::isfinite(options.shadow_bias) || options.shadow_bias < 0.0f ||
+        !std::isfinite(options.shadow_filter_radius) || options.shadow_filter_radius < 0.0f)
+        throw std::invalid_argument("shadow sampling parameters are invalid");
     Impl& d = *impl_;
 
     // -- 1. Build per-instance geometry + accumulate the scene AABB ----------
@@ -1624,8 +1632,9 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     Mat4 light_view_proj = Mat4::Identity();
     float shadow_texel = 0.0f;
     if (want_shadows) {
-        const math::Vec3 ctr = (aabb_min + aabb_max) * 0.5f;
-        const float radius = std::max((aabb_max - aabb_min).Length() * 0.5f, 1e-3f);
+        const math::Vec3 ctr = options.shadow_radius > 0.0f ? options.shadow_center : (aabb_min + aabb_max) * 0.5f;
+        const float radius = options.shadow_radius > 0.0f ? options.shadow_radius :
+            std::max((aabb_max - aabb_min).Length() * 0.5f, 1e-3f);
         math::Vec3 sun_dir = math::Vec3{options.sun_direction[0], options.sun_direction[1],
                                         options.sun_direction[2]}.Normalized();
         // Place the light eye back along the sun direction, looking at the centre.

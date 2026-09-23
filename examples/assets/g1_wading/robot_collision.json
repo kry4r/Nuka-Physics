@@ -1,0 +1,8 @@
+{
+  "collision_geometry": "visual_surface",
+  "exclude_body_pairs": [
+    ["left_knee_link", "left_ankle_roll_link"],
+    ["right_knee_link", "right_ankle_roll_link"]
+  ],
+  "description": "The lower-leg and foot visual shells overlap around each two-axis ankle joint. These connected housings do not collide with each other; both retain contact with every external body and medium. Original robot exclusions are preserved."
+}

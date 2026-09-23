@@ -147,7 +147,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DistCompliance, DlpackDtype::kF32, 1, false, false},  // dist_compliance
     {FieldId::DistLambda, DlpackDtype::kF32, 1, false, false},  // dist_lambda
     {FieldId::BendParticles, DlpackDtype::kU32, 2, false, false},  // bend_particles
-    {FieldId::BendGradients, DlpackDtype::kF32, 2, false, false},  // bend_gradients
+    {FieldId::BendRestAngle, DlpackDtype::kF32, 1, false, false},  // bend_rest_angle
     {FieldId::BendCompliance, DlpackDtype::kF32, 1, false, false},  // bend_compliance
     {FieldId::BendLambda, DlpackDtype::kF32, 1, false, false},  // bend_lambda
     {FieldId::VolParticles, DlpackDtype::kU32, 2, false, false},  // vol_particles
@@ -361,6 +361,10 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::PointEndpointRanges, DlpackDtype::kU8, 2, false, true},  // point_endpoint_ranges
     {FieldId::PointEndpointTerms, DlpackDtype::kU8, 2, false, true},  // point_endpoint_terms
     {FieldId::ParticleProjectionDelta, DlpackDtype::kF32, 2, false, false},  // particle_projection_delta
+    {FieldId::ParticleSurfaceMaxSpeed, DlpackDtype::kF32, 1, false, false},  // particle_surface_max_speed
+    {FieldId::GridPseudoVel, DlpackDtype::kF32, 2, false, false},  // grid_pseudo_vel
+    {FieldId::ContactSolveMetrics, DlpackDtype::kU64, 2, false, true},  // contact_solve_metrics
+    {FieldId::ContactSolveCounts, DlpackDtype::kU32, 2, false, true},  // contact_solve_counts
 };
 
 } // namespace nuka::nk

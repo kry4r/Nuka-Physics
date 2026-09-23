@@ -1009,6 +1009,7 @@ void SceneIR::ProjectShape(const CollisionShapeRecord& rec) {
     } else {
         CollisionShapeComponent cs;
         cs.kind = KindFromShapeType(rec.type);
+        cs.mesh_oriented = rec.mesh_oriented;
         FillShapeParams(rec, cs.params);
         cs.physics_material_id = phys_id;
         // Carry the render material so a collision-only body (no visual twin)
@@ -1089,6 +1090,8 @@ void SceneIR::ProjectCamera(const CameraRecord& rec) {
     cam.vertical_fov_degrees = rec.vertical_fov_degrees;
     cam.near_clip            = rec.near_clip;
     cam.far_clip             = rec.far_clip;
+    cam.focus_distance       = rec.focus_distance;
+    cam.shadow_radius        = rec.shadow_radius;
     ecs_.Add(entity, std::move(cam));
 }
 

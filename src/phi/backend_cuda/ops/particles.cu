@@ -1,3 +1,5 @@
+#include "constraint/dihedral_bend.hpp"
+
 // Particle integration and projection use stable CSR neighbor lists and arena storage.
 
 #include <cooperative_groups.h>
@@ -32,40 +34,83 @@ namespace fl = ::nuka::runtime::fluid;
 
 constexpr uint32_t kBlockSize = 128u;
 
-// Bounds follow the current working positions; immutable escape links retain the cooked topology.
+// Contact geometry and impulse arms share the positions that own momentum.
 __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView model, DataView data) {
-    const uint32_t task = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t task = blockIdx.x;
     if (task >= p.env_count * p.surfaces_per_env) return;
+    const uint32_t lane = threadIdx.x;
     const uint32_t env = task / p.surfaces_per_env;
     const auto info = model.particle_surface_info[task % p.surfaces_per_env];
     const collision::MeshSurfaceView view{
-        reinterpret_cast<const float*>(data.pbf_predicted_pos + size_t{env} * p.particles_per_env),
+        reinterpret_cast<const float*>(data.particle_pos + size_t{env} * p.particles_per_env),
         model.particle_surface_triangles, model.particle_surface_tree,
         {p.particles_per_env, p.triangles_per_env, p.nodes_per_env}};
     auto* nodes = data.particle_surface_nodes + size_t{env} * p.nodes_per_env + info.node_offset;
-    for (uint32_t remaining = info.node_count; remaining > 0u; --remaining) {
-        const uint32_t local = remaining - 1u;
-        auto node = model.particle_surface_tree[info.node_offset + local];
-        if (node.triangle != ~0u) {
+    __shared__ uint32_t ready[kBlockSize];
+    __shared__ uint32_t valid;
+    __shared__ float warp_speed[kBlockSize / 32u];
+    if (lane == 0u) valid = 1u;
+    float speed_squared = 0.0f;
+    for (uint32_t i = lane; i < info.vertex_count; i += blockDim.x) {
+        const uint32_t particle = env * p.particles_per_env + info.vertex_offset + i;
+        speed_squared = fmaxf(speed_squared, data.particle_vel[particle].LengthSq());
+    }
+    for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u)
+        speed_squared = fmaxf(speed_squared, __shfl_down_sync(0xffffffffu, speed_squared, offset));
+    if (lane % warpSize == 0u) warp_speed[lane / warpSize] = speed_squared;
+    __syncthreads();
+    if (lane == 0u) {
+        for (uint32_t i = 0u; i < kBlockSize / 32u; ++i)
+            speed_squared = fmaxf(speed_squared, warp_speed[i]);
+        data.particle_surface_max_speed[task] = sqrtf(speed_squared);
+    }
+    // Reverse tiles keep finished child subtrees available while each tile resolves its dependencies.
+    for (uint32_t end = info.node_count; end > 0u;) {
+        const uint32_t count = min(end, blockDim.x);
+        const uint32_t begin = end - count;
+        const uint32_t local = begin + lane;
+        collision::MeshBvhNode node;
+        if (lane < count) node = model.particle_surface_tree[info.node_offset + local];
+        const bool leaf = lane < count && node.triangle != ~0u;
+        if (leaf) {
             math::Vec3 a, b, c;
             if (!collision::MeshSurfaceTriangle(view, info, node.triangle, a, b, c) ||
                 !isfinite(a.LengthSq()) || !isfinite(b.LengthSq()) || !isfinite(c.LengthSq())) {
                 atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                nodes[0].escape = 0u;
-                return;
+                atomicExch(&valid, 0u);
+            } else {
+                node.lower = {fminf(a.x, fminf(b.x, c.x)), fminf(a.y, fminf(b.y, c.y)), fminf(a.z, fminf(b.z, c.z))};
+                node.upper = {fmaxf(a.x, fmaxf(b.x, c.x)), fmaxf(a.y, fmaxf(b.y, c.y)), fmaxf(a.z, fmaxf(b.z, c.z))};
             }
-            node.lower = {fminf(a.x, fminf(b.x, c.x)), fminf(a.y, fminf(b.y, c.y)), fminf(a.z, fminf(b.z, c.z))};
-            node.upper = {fmaxf(a.x, fmaxf(b.x, c.x)), fmaxf(a.y, fmaxf(b.y, c.y)), fmaxf(a.z, fmaxf(b.z, c.z))};
-        } else {
-            const auto left = nodes[local + 1u];
-            const auto right = nodes[left.escape];
-            node.lower = {fminf(left.lower.x, right.lower.x), fminf(left.lower.y, right.lower.y),
-                          fminf(left.lower.z, right.lower.z)};
-            node.upper = {fmaxf(left.upper.x, right.upper.x), fmaxf(left.upper.y, right.upper.y),
-                          fmaxf(left.upper.z, right.upper.z)};
+            nodes[local] = node;
         }
-        nodes[local] = node;
+        ready[lane] = leaf || lane >= count;
+        uint32_t pending = __syncthreads_count(ready[lane] == 0u);
+        if (valid == 0u) break;
+        while (pending > 0u) {
+            bool completed = false;
+            if (ready[lane] == 0u) {
+                const uint32_t left_index = local + 1u;
+                const uint32_t right_index = model.particle_surface_tree[info.node_offset + left_index].escape;
+                if ((left_index >= end || ready[left_index - begin] != 0u) &&
+                    (right_index >= end || ready[right_index - begin] != 0u)) {
+                    const auto left = nodes[left_index];
+                    const auto right = nodes[right_index];
+                    node.lower = {fminf(left.lower.x, right.lower.x), fminf(left.lower.y, right.lower.y),
+                                  fminf(left.lower.z, right.lower.z)};
+                    node.upper = {fmaxf(left.upper.x, right.upper.x), fmaxf(left.upper.y, right.upper.y),
+                                  fmaxf(left.upper.z, right.upper.z)};
+                    nodes[local] = node;
+                    completed = true;
+                }
+            }
+            __syncthreads();
+            if (completed) ready[lane] = 1u;
+            pending = __syncthreads_count(ready[lane] == 0u);
+        }
+        end = begin;
     }
+    if (valid == 0u && lane == 0u) nodes[0].escape = 0u;
 }
 
 Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
@@ -74,9 +119,10 @@ Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
     if (p == nullptr) return Status::InvalidArgument;
     if (p->surfaces_per_env == 0u || p->env_count == 0u) return Status::Ok;
     if (!model.particle_surface_info || !model.particle_surface_tree ||
-        !model.particle_surface_triangles || !data.particle_surface_nodes || !data.pbf_predicted_pos)
+        !model.particle_surface_triangles || !data.particle_surface_nodes || !data.particle_pos ||
+        !data.particle_vel || !data.particle_surface_max_speed)
         return Status::InvalidArgument;
-    const uint32_t blocks = (p->env_count * p->surfaces_per_env + kBlockSize - 1u) / kBlockSize;
+    const uint32_t blocks = p->env_count * p->surfaces_per_env;
     LaunchCuda(RefitParticleSurfacesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream, *p, model, data);
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
@@ -283,13 +329,13 @@ struct XpbdDistanceProjector {
     }
 };
 
-// Isometric bend projection retains the constraint's fixed gradient order.
+// Signed dihedral bending recomputes gradients from the current geometry.
 struct XpbdBendProjector {
     math::Vec3* __restrict__ positions;
     math::Vec3* __restrict__ projection_delta;
     const float* __restrict__ inv_masses;
     const uint32_t* __restrict__ particles;
-    const math::Vec3* __restrict__ gradients;
+    const float* __restrict__ rest_angles;
     const float* __restrict__ compliance_alpha;
     float* __restrict__ lambda;
     float dt;
@@ -301,12 +347,17 @@ struct XpbdBendProjector {
         math::Vec3 grad[4];
         float w[4];
         float denom = 0.0f;
-        float constraint = 0.0f;
+        for (uint32_t j = 0u; j < 4u; ++j) idx[j] = particles[base + j];
+        const auto geometry = constraint::EvaluateDihedralBend(
+            positions[idx[0]], positions[idx[1]], positions[idx[2]], positions[idx[3]]);
+        if (!geometry.valid) {
+            lambda[c] = 0.0f;
+            return;
+        }
+        const float constraint = nuka::constraint::DihedralBendError(geometry.angle, rest_angles[c]);
         for (uint32_t j = 0u; j < 4u; ++j) {
-            idx[j] = particles[base + j];
-            grad[j] = gradients[base + j];
+            grad[j] = geometry.gradients[j];
             w[j] = inv_masses[idx[j]];
-            constraint += Dot(grad[j], positions[idx[j]]);
             denom += w[j] * Dot(grad[j], grad[j]);
         }
         const float alpha_tilde = compliance_alpha[c] * inv_dt2;
@@ -1046,7 +1097,7 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
           model.dist_rest_length == nullptr || model.dist_compliance == nullptr ||
           data.dist_lambda == nullptr)) ||
         (p->bend_con_count > 0u &&
-         (model.bend_particles == nullptr || model.bend_gradients == nullptr ||
+         (model.bend_particles == nullptr || model.bend_rest_angle == nullptr ||
           model.bend_compliance == nullptr || data.bend_lambda == nullptr)) ||
         (p->vol_con_count > 0u &&
          (model.vol_particles == nullptr || model.vol_rest_times6 == nullptr ||
@@ -1089,7 +1140,7 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
     if (status != Status::Ok) return status;
     status = ProjectXpbdFamily(
         XpbdBendProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
-                         model.bend_particles, model.bend_gradients,
+                         model.bend_particles, model.bend_rest_angle,
                          model.bend_compliance, data.bend_lambda, p->dt},
         bend_blocks, p->bend_con_count, p->bend_cons_per_env, env_count, p->bend_colors,
         model.bend_color_segments, iters, p->iteration_start, data.bend_lambda, stream);

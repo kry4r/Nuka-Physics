@@ -16,6 +16,8 @@
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "render/studio_beauty.hpp"
+#include "render/scene_asset.hpp"
+#include "scene/format/nks.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/scene_map.hpp"
@@ -42,6 +44,8 @@ constexpr Vec3 kPlateHalf{0.085f, 0.070f, 0.009f};
 struct Args {
     std::filesystem::path out = "out/elastoplastic_compression";
     std::filesystem::path replay;
+    std::filesystem::path environment = std::filesystem::path(NUKA_SOURCE_DIR) /
+        "examples/assets/nuka_lab/compression.nks";
     std::filesystem::path perf_json;
     float dx = 0.005f;
     uint32_t steps_per_frame = 64u;
@@ -63,6 +67,7 @@ Args ParseArgs(int argc, char** argv) {
         const std::string value = argv[++i];
         if (key == "--out-dir") args.out = value;
         else if (key == "--replay") args.replay = value;
+        else if (key == "--environment") args.environment = value;
         else if (key == "--perf-json") args.perf_json = value;
         else if (key == "--dx") args.dx = std::stof(value);
         else if (key == "--steps-per-frame") args.steps_per_frame = std::stoul(value);
@@ -265,30 +270,17 @@ public:
         nuka::scene::Registry registry;
         nuka::scene::SceneMap map;
         scene_ = render::BuildStudioScene(registry, map,
-            std::vector<nuka::runtime::soft::SurfaceTopology>{}, args.width, args.height);
-        for (const auto& instance : scene_.world.instances) {
-            auto floor = scene_.world.meshes.Geometry(instance.mesh_id);
-            for (size_t i = 0u; i < floor.positions.size(); i += 3u) {
-                floor.positions[i] *= 4.0f;
-                floor.positions[i+1u] *= 4.0f;
-            }
-            scene_.world.meshes.ReplaceGeometry(instance.mesh_id, std::move(floor));
-        }
+            std::vector<nuka::runtime::soft::SurfaceTopology>{}, args.width, args.height, false);
+        const auto environment = nuka::scene::nks::Load(args.environment.string());
+        const auto asset = render::BuildSceneRenderAsset(environment, args.environment.parent_path().string());
+        render::RenderAssetBinding binding;
+        render::SetSceneRenderAsset(scene_.world, binding, asset);
+        render::ApplySceneLighting(scene_.options, asset);
+        render::ApplySceneCamera(scene_.options, asset, "overview");
         render::AddStudioDensitySurface(scene_, registry, render::kNoId, spacing, 0u, particles);
         scene_.density_surfaces.back().params.h = 3.0f * spacing;
-        auto& sample = scene_.world.materials[scene_.density_surfaces.back().material_id];
-        sample.base_color[0] = 0.64f; sample.base_color[1] = 0.19f; sample.base_color[2] = 0.055f;
-        sample.roughness = 0.32f;
-        for (const auto& instance : scene_.world.instances) {
-            auto& material=scene_.world.materials[instance.render_material_id];
-            material.base_color[0]=0.025f; material.base_color[1]=0.033f; material.base_color[2]=0.045f;
-            material.roughness=0.72f;
-        }
-        nuka::scene::RenderMaterial plate;
-        plate.base_color[0] = 0.45f; plate.base_color[1] = 0.50f; plate.base_color[2] = 0.56f;
-        plate.metallic = 0.90f; plate.roughness = 0.24f;
-        const uint32_t plate_material = static_cast<uint32_t>(scene_.world.materials.size());
-        scene_.world.materials.push_back(plate);
+        scene_.density_surfaces.back().material_id = render::SceneAssetMaterial(asset, binding, "elastoplastic");
+        const uint32_t plate_material = render::SceneAssetMaterial(asset, binding, "press_metal");
         const uint32_t mesh = scene_.world.meshes.InternPrimitive("compression_platen",
             [] { return BoxMesh(kPlateHalf,0.0015f); });
         for (uint32_t b = 0u; b < bodies; ++b) {
@@ -312,30 +304,18 @@ public:
         piston.render_material_id=plate_material;
         piston_instance_=scene_.world.instances.size();
         scene_.world.instances.push_back(piston);
-        auto& options = scene_.options;
-        options.camera_eye = {0.20f, -0.48f, 0.245f};
-        options.camera_target = {0.0f, 0.0f, 0.09f};
-        options.camera_fov_degrees = 30.0f;
-        options.sun_direction[0] = 0.25f;
-        options.sun_direction[1] = -0.80f;
-        options.sun_direction[2] = 0.22f;
-        options.beauty_sky_fill = 0.75f;
-        options.beauty_specular_env = true;
-        options.sky_top[0]=0.20f; options.sky_top[1]=0.24f; options.sky_top[2]=0.31f;
-        options.sky_bottom[0]=0.36f; options.sky_bottom[1]=0.40f; options.sky_bottom[2]=0.48f;
-        options.ground_color[0]=0.04f; options.ground_color[1]=0.045f; options.ground_color[2]=0.055f;
-        options.beauty_grade=0.20f;
         renderer_ = std::make_unique<render::StudioRtRenderer>();
         Require(renderer_->ok(), "No ray tracing backend");
         renderer_->SetBeauty(true, args.samples);
         std::filesystem::create_directories(args.out / "frames");
+        nuka::scene::nks::Save(environment, (args.out / "render_environment.nks").string());
         std::ofstream metadata(args.out / "render_config.json");
         metadata << "{\n  \"width\": " << args.width << ",\n  \"height\": " << args.height
             << ",\n  \"samples\": " << args.samples << ",\n  \"render_stride\": " << args.render_stride
-            << ",\n  \"camera_eye\": [0.20, -0.48, 0.245],\n  \"camera_target\": [0, 0, 0.09],"
-            << "\n  \"camera_fov_degrees\": 30,\n  \"surface_kernel_spacing_ratio\": 3,"
+            << ",\n  \"environment_asset\": \"render_environment.nks\",\n  \"camera\": \"overview\","
+            << "\n  \"camera_fov_degrees\": " << scene_.options.camera_fov_degrees
+            << ",\n  \"surface_kernel_spacing_ratio\": 3,"
             << "\n  \"surface_cell_spacing_ratio\": 0.5,\n  \"surface_iso_fraction\": 0.5,"
-            << "\n  \"studio_floor_radius_m\": 32,"
             << "\n  \"state_interpolation\": false\n}\n";
     }
 

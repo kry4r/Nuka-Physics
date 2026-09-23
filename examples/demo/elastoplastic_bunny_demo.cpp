@@ -25,6 +25,8 @@
 #include "nk/solve/nk_row.hpp"
 #include "render/mesh_normals.hpp"
 #include "render/studio_beauty.hpp"
+#include "render/scene_asset.hpp"
+#include "scene/format/nks.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/format/json.hpp"
@@ -52,6 +54,8 @@ constexpr float kFriction = 0.20f;
 struct Args {
     std::filesystem::path out = "out/elastoplastic_bunny";
     std::filesystem::path replay;
+    std::filesystem::path environment = std::filesystem::path(NUKA_SOURCE_DIR) /
+        "examples/assets/nuka_lab/bunny.nks";
     std::filesystem::path perf_json;
     std::filesystem::path mesh = std::filesystem::path(NUKA_SOURCE_DIR) /
         ".nuka-assets/generated/bunny_solid_120mm.obj";
@@ -75,6 +79,7 @@ Args ParseArgs(int argc, char** argv) {
         const std::string value = argv[++i];
         if (key == "--out-dir") args.out = value;
         else if (key == "--replay") args.replay = value;
+        else if (key == "--environment") args.environment = value;
         else if (key == "--perf-json") args.perf_json = value;
         else if (key == "--mesh") args.mesh = value;
         else if (key == "--dx") args.dx = std::stof(value);
@@ -295,29 +300,20 @@ public:
         nuka::scene::Registry registry;
         nuka::scene::SceneMap map;
         scene_ = render::BuildStudioScene(registry, map,
-            std::vector<nuka::runtime::soft::SurfaceTopology>{}, args.width, args.height);
-        for (const auto& instance : scene_.world.instances) {
-            auto floor = scene_.world.meshes.Geometry(instance.mesh_id);
-            for (size_t i = 0u; i < floor.positions.size(); i += 3u) {
-                floor.positions[i] *= 4.0f;
-                floor.positions[i+1u] *= 4.0f;
-            }
-            scene_.world.meshes.ReplaceGeometry(instance.mesh_id, std::move(floor));
-        }
-        for (auto& material : scene_.world.materials) {
-            material.base_color[0] = 0.025f; material.base_color[1] = 0.033f;
-            material.base_color[2] = 0.045f; material.roughness = 0.72f;
-        }
+            std::vector<nuka::runtime::soft::SurfaceTopology>{}, args.width, args.height, false);
+        const auto environment = nuka::scene::nks::Load(args.environment.string());
+        const auto asset = render::BuildSceneRenderAsset(environment, args.environment.parent_path().string());
+        render::RenderAssetBinding binding;
+        render::SetSceneRenderAsset(scene_.world, binding, asset);
+        render::ApplySceneLighting(scene_.options, asset);
+        render::ApplySceneCamera(scene_.options, asset, "overview");
+        begin_options_ = scene_.options;
+        end_options_ = scene_.options;
+        render::ApplySceneCamera(end_options_, asset, "close");
         render::AddStudioDensitySurface(scene_, registry, render::kNoId, spacing, 0u, particles);
         scene_.density_surfaces.back().params.h = 3.0f * spacing;
-        auto& sample = scene_.world.materials[scene_.density_surfaces.back().material_id];
-        sample.base_color[0] = 0.64f; sample.base_color[1] = 0.19f; sample.base_color[2] = 0.055f;
-        sample.roughness = 0.32f;
-        nuka::scene::RenderMaterial metal;
-        metal.base_color[0] = 0.52f; metal.base_color[1] = 0.58f; metal.base_color[2] = 0.65f;
-        metal.metallic = 0.70f; metal.roughness = 0.40f;
-        const uint32_t metal_id = static_cast<uint32_t>(scene_.world.materials.size());
-        scene_.world.materials.push_back(metal);
+        scene_.density_surfaces.back().material_id = render::SceneAssetMaterial(asset, binding, "elastoplastic");
+        const uint32_t metal_id = render::SceneAssetMaterial(asset, binding, "impact_metal");
         render::RenderInstance instance;
         instance.mesh_id = scene_.world.meshes.InternPrimitive("impact_mesh", [&] { return mesh; });
         instance.render_material_id = metal_id;
@@ -326,35 +322,25 @@ public:
         instance.mesh_id = scene_.world.meshes.InternPrimitive("impact_support", [] { return BoxMesh(kPlateHalf); });
         instance.world_xform.position.z = kPlateHalf.z;
         scene_.world.instances.push_back(instance);
-        auto& options = scene_.options;
-        options.camera_eye = {0.48f, -0.78f, 0.46f};
-        options.camera_target = {0, 0, 0.16f};
-        options.camera_fov_degrees = 32.0f;
-        options.sun_direction[0] = 0.25f; options.sun_direction[1] = -0.80f;
-        options.sun_direction[2] = 0.22f;
-        options.beauty_sky_fill = 0.75f; options.beauty_specular_env = true;
-        options.sky_top[0] = 0.20f; options.sky_top[1] = 0.24f; options.sky_top[2] = 0.31f;
-        options.sky_bottom[0] = 0.36f; options.sky_bottom[1] = 0.40f; options.sky_bottom[2] = 0.48f;
-        options.ground_color[0] = 0.04f; options.ground_color[1] = 0.045f; options.ground_color[2] = 0.055f;
-        options.beauty_grade = 0.20f;
         renderer_ = std::make_unique<render::StudioRtRenderer>();
         Require(renderer_->ok(), "No ray tracing backend");
         renderer_->SetBeauty(true, args.samples);
         std::filesystem::create_directories(args.out / "frames");
+        nuka::scene::nks::Save(environment, (args.out / "render_environment.nks").string());
         Json config = Json::Object();
         config.Set("width", Json::Int(args.width)); config.Set("height", Json::Int(args.height));
         config.Set("samples", Json::Int(args.samples)); config.Set("render_stride", Json::Int(args.render_stride));
-        config.Set("camera_eye_begin", Array({0.48f,-0.78f,0.46f}));
-        config.Set("camera_target_begin", Array({0,0,0.16f}));
-        config.Set("camera_eye_end", Array({0.34f,-0.51f,0.38f}));
-        config.Set("camera_target_end", Array({0,0,0.08f}));
+        config.Set("camera_eye_begin", Array(begin_options_.camera_eye));
+        config.Set("camera_target_begin", Array(begin_options_.camera_target));
+        config.Set("camera_eye_end", Array(end_options_.camera_eye));
+        config.Set("camera_target_end", Array(end_options_.camera_target));
         config.Set("camera_move_begin_s", Json::Float(0.45));
         config.Set("camera_move_end_s", Json::Float(1.55));
-        config.Set("camera_fov_degrees", Json::Float(32));
+        config.Set("camera_fov_degrees", Json::Float(scene_.options.camera_fov_degrees));
+        config.Set("environment_asset", Json::Str(args.environment.string()));
         config.Set("surface_kernel_spacing_ratio", Json::Float(3));
         config.Set("surface_cell_spacing_ratio", Json::Float(0.5));
         config.Set("surface_iso_fraction", Json::Float(0.5));
-        config.Set("studio_floor_radius_m", Json::Float(32));
         config.Set("state_interpolation", Json::Bool(false));
         WriteJson(args.out / "render_config.json", config);
     }
@@ -363,8 +349,9 @@ public:
         if (frame % args_.render_stride) return;
         float u = std::clamp((frame/kSampleHz-0.45f)/1.10f, 0.0f, 1.0f);
         u = u*u*u*(10.0f+u*(-15.0f+6.0f*u));
-        scene_.options.camera_eye = Vec3{0.48f,-0.78f,0.46f}*(1.0f-u) + Vec3{0.34f,-0.51f,0.38f}*u;
-        scene_.options.camera_target = Vec3{0,0,0.16f}*(1.0f-u) + Vec3{0,0,0.08f}*u;
+        scene_.options.camera_eye = begin_options_.camera_eye * (1.0f-u) + end_options_.camera_eye * u;
+        scene_.options.camera_target = begin_options_.camera_target * (1.0f-u) + end_options_.camera_target * u;
+        scene_.options.camera_up = (begin_options_.camera_up * (1.0f-u) + end_options_.camera_up * u).Normalized();
         render::PublishStudioScene(scene_, {}, positions);
         scene_.world.instances[bunny_instance_].world_xform = bunny;
         const auto result = renderer_->Render(scene_.world, scene_.options);
@@ -382,6 +369,7 @@ public:
 private:
     Args args_;
     render::StudioScene scene_;
+    render::RasterOptions begin_options_, end_options_;
     size_t bunny_instance_ = 0u;
     std::unique_ptr<render::StudioRtRenderer> renderer_;
 };

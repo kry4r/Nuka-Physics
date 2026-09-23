@@ -10,6 +10,7 @@
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/rt/prim_id.cuh"
 #include "phi/backend_cuda/rt/particle_surface.cuh"
+#include "phi/backend_cuda/rt/reconstructed_surface.cuh"
 #include "phi/backend_cuda/rt/ray_box.cuh"
 #include "phi/backend_cuda/rt/rt_device_context.cuh"  // RtContext / OwnedBuffer
 #include "phi/backend_cuda/rt/sensor_scatter.hpp"
@@ -44,6 +45,19 @@ constexpr uint32_t kTlasRebuildPeriod = 32u;
 using ::nuka::collision::AABB;
 using ::nuka::collision::gpu::LbvhNode;
 using ::nuka::math::Vec3;
+
+__device__ inline float SensorReflectance(const Material& material, float incidence) {
+    const float transmission = fminf(1.0f, fmaxf(0.0f, material.transmission));
+    const float luminance = fmaxf(0.0f, 0.2126f * material.albedo.x +
+        0.7152f * material.albedo.y + 0.0722f * material.albedo.z);
+    const float eta = fmaxf(material.ior, 1.0e-3f);
+    const float ratio = (eta - 1.0f) / (eta + 1.0f);
+    const float f0 = ratio * ratio;
+    const float grazing = 1.0f - fminf(1.0f, fmaxf(0.0f, incidence));
+    const float grazing2 = grazing * grazing;
+    const float fresnel = f0 + (1.0f - f0) * grazing2 * grazing2 * grazing;
+    return luminance * (1.0f - transmission) + fresnel * transmission;
+}
 
 __global__ void AdvanceImagingCounters(sensor::ImagingStamp* stamps, uint32_t count) {
     const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -327,8 +341,7 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
 
             if (measured_depth) {
                 const float incidence = fabsf(n.Dot(ray.dir));
-                const float reflectance = fmaxf(0.0f, (0.2126f * mat.albedo.x +
-                    0.7152f * mat.albedo.y + 0.0722f * mat.albedo.z) * (1.0f - mat.transmission));
+                const float reflectance = SensorReflectance(mat, incidence);
                 depth = sensor::noise::FormRange(depth, incidence, reflectance,
                     camera.near_clip, camera.far_clip, RtMissDepth(), range_responses[sensor_id],
                     range_keys[cam], local_p, stamps[cam].acquisitions);
@@ -368,11 +381,23 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
                             r.origin.z + bt * r.dir.z};
             const Vec3 sV = RtNormalize<float>(Vec3{-r.dir.x, -r.dir.y, -r.dir.z});
             Material sample_mat = smat;
-            ApplyMaterialTextures(env_inst, textures, bp, shit, su, sv, snf,
-                                  &sample_mat, true);
-            Vec3 col = ShadeBeauty<PhiloxSeededRng>(env_nodes, leaves_per_env, env_inst,
-                                                    env_mats, light, sky, shit, snf, sV,
-                                                    sample_mat, &rng, textures, &cam_origin);
+            Vec3 shade_normal = snf;
+            if (smat.transmission > 0.0f || sky.smooth_normals != 0u) {
+                const Vec3 smooth = SmoothWorldNormal(env_inst, bp, su, sv, sn);
+                shade_normal = smooth.Dot(sV) < 0.0f ? smooth * -1.0f : smooth;
+            }
+            Vec3 col;
+            if (smat.transmission > 0.0f) {
+                col = ShadeTransmissive(env_nodes, leaves_per_env, env_inst, env_mats,
+                                        light, sky, shit, shade_normal, sV, sample_mat,
+                                        &rng, textures);
+            } else {
+                shade_normal = ApplyMaterialTextures(env_inst, textures, bp, shit, su, sv,
+                                                      shade_normal, &sample_mat, true);
+                col = ShadeBeauty<PhiloxSeededRng>(env_nodes, leaves_per_env, env_inst,
+                                                  env_mats, light, sky, shit, shade_normal,
+                                                  sV, sample_mat, &rng, textures, &cam_origin);
+            }
             if (sky.fog_density > 0.0f) {
                 const float f = 1.0f - expf(-sky.fog_density * bt);
                 col.x += (sky.fog_color.x - col.x) * f;
@@ -539,8 +564,7 @@ __global__ void BatchedLidarTraceKernel(const LidarSensor* __restrict__ lidars,
             Material mat = materials[size_t{env} * material_count + env_inst[instance].material_id];
             const Vec3 hit = origin + dir * best_t;
             ApplyMaterialTextures(env_inst, textures, best_prim, hit, u, v, n, &mat, true);
-            const float reflectance = fmaxf(0.0f, (0.2126f * mat.albedo.x +
-                0.7152f * mat.albedo.y + 0.0722f * mat.albedo.z) * (1.0f - mat.transmission));
+            const float reflectance = SensorReflectance(mat, incidence);
             range = sensor::noise::FormRange(best_t, incidence, reflectance, s.min_range, s.max_range,
                 s.max_range, responses[sensor_id], keys[lidar], r, stamps[lidar].acquisitions);
         }
@@ -569,6 +593,7 @@ struct BatchedSensorSceneDevice::Impl {
 
     ParticlePositionSource particles;
     std::vector<particle_surface_detail::SurfaceCache> particle_surfaces;
+    std::vector<particle_surface_detail::ReconstructedSurfaceCache> reconstructed_surfaces;
     OwnedBuffer d_env_blas_refs;
     size_t env_blas_refs_bytes = 0u;
     uint32_t mesh_count = 0u, blas_ref_envs = 0u;
@@ -681,7 +706,10 @@ BatchedSensorSceneDevice BuildBatchedSensorScene(const BatchedSensorSceneDesc& d
         if (!desc.particles.positions || !desc.particles.env_count)
             throw std::invalid_argument("particle surface requires live particle positions");
         bound_meshes[surface.mesh_id] = 1u;
-        impl->particle_surfaces.emplace_back(surface, desc.particles.particles_per_env, ctx);
+        if (surface.kind == ParticleSurfaceBinding::Kind::Triangles)
+            impl->particle_surfaces.emplace_back(surface, desc.particles.particles_per_env, ctx);
+        else
+            impl->reconstructed_surfaces.emplace_back(surface, desc.particles.particles_per_env);
     }
 
     impl->light = desc.scene.light;
@@ -870,9 +898,9 @@ void BuildFidelityParams(const rt::SensorFidelityConfig& cfg, FidelityParams* fp
             "(kMaxFidelitySpp=256)");
     }
     if (cfg.shadow_samples > kMaxFidelitySamples ||
-        cfg.ao_samples > kMaxFidelitySamples) {
+        cfg.ao_samples > kMaxFidelitySamples || cfg.transmit_bounces > kMaxFidelitySamples) {
         throw std::runtime_error(
-            "SetSensorFidelity: shadow_samples/ao_samples exceed the sample cap "
+            "SetSensorFidelity: shadow, AO or transmission samples exceed the sample cap "
             "(kMaxFidelitySamples=256)");
     }
     fp->spp = cfg.spp < 1u ? 1u : cfg.spp;
@@ -895,6 +923,8 @@ void BuildFidelityParams(const rt::SensorFidelityConfig& cfg, FidelityParams* fp
     sky->sky_ground = cfg.sky_ground;
     sky->fog_color = cfg.fog_color;
     sky->fog_density = cfg.fog_density;
+    sky->transmit_bounces = cfg.transmit_bounces;
+    sky->smooth_normals = cfg.smooth_normals ? 1u : 0u;
     // Batched sensors carry no sun disc -> the sky stays byte-identical.
     sky->sun_dir = Vec3{0.0f, 0.0f, 0.0f};
     sky->sun_radiance = Vec3{0.0f, 0.0f, 0.0f};
@@ -979,7 +1009,7 @@ void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ct
 
     const auto* blas_refs = static_cast<const SensorBlasRef*>(impl->d_blas_refs.Data());
     uint32_t blas_refs_per_env = 0u;
-    if (!impl->particle_surfaces.empty()) {
+    if (!impl->particle_surfaces.empty() || !impl->reconstructed_surfaces.empty()) {
         const uint64_t count = uint64_t{env_count} * impl->mesh_count;
         if (count > UINT32_MAX - kBlockSize)
             throw std::invalid_argument("sensor mesh table exceeds device index capacity");
@@ -992,6 +1022,8 @@ void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ct
             impl->blas_ref_envs = env_count;
         }
         for (auto& surface : impl->particle_surfaces)
+            surface.Update(ctx, impl->particles, env_count, live_refs, impl->mesh_count);
+        for (auto& surface : impl->reconstructed_surfaces)
             surface.Update(ctx, impl->particles, env_count, live_refs, impl->mesh_count);
         blas_refs = live_refs;
         blas_refs_per_env = impl->mesh_count;

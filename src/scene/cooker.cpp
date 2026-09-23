@@ -573,6 +573,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         const auto mode = ToCookerMode(r.decompose_mode);
         if (mode != import::cooker::DecomposeMode::Force) {
             auto surface_options = options.mesh_surface;
+            surface_options.oriented_surface = r.mesh_oriented;
             surface_options.decompose = surface_options.decompose && shape_collides &&
                 mode == import::cooker::DecomposeMode::Auto;
             const uint32_t geom_index = AppendConvexGeometry(
