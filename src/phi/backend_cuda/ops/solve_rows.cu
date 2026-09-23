@@ -160,8 +160,7 @@ inline size_t IslandSharedBytes(uint32_t rows_per_env, uint32_t dof_stride,
         // Global rows need shared velocity tiles and a per-island articulation index.
         return sizeof(float) * qdot_floats * (pos_pass ? 3u : 2u) +
                sizeof(uint32_t) * 2ull * k_tiles +
-               sizeof(float) * staged_warps * (12ull * dof_stride + 1ull) +
-               (staged_warps > 0u ? sizeof(uint32_t) * 4ull * kOwnerTableSlots : 0ull);
+               sizeof(float) * staged_warps * (12ull * dof_stride + 1ull);
     }
     const uint64_t jw = 2ull * rows_per_env * dof_stride;
     const uint64_t slim = sizeof(SlimRow) * rows_per_env;
@@ -1026,6 +1025,107 @@ __global__ void CompactLiveRowsKernel(const uint32_t* __restrict__ sorted_roots,
     }
 }
 
+// Batch b of an island holds its live rows w * batches + b, one per solve warp. A row sharing
+// no written state with the rest of its batch commutes with it and is marked free.
+__global__ void ClassifyLiveRowsKernel(const NkRow* __restrict__ urows, PointMassView point_masses,
+                                       const float* __restrict__ body_inv_mass,
+                                       const uint32_t* __restrict__ islands,
+                                       const uint32_t* __restrict__ island_count_dev,
+                                       IslandActivityView activity,
+                                       const uint32_t* __restrict__ live_scan,
+                                       const uint32_t* __restrict__ live_order,
+                                       uint32_t* __restrict__ row_modes) {
+    __shared__ uint32_t owner_table[4u * kOwnerTableSlots];
+    __shared__ __align__(16) unsigned char row_storage[kDynamicIslandBlockSize / 32u * sizeof(NkRow)];
+    __shared__ uint32_t island_list[kDynamicIslandBlockSize];
+    __shared__ uint32_t island_list_cnt;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t wlane = threadIdx.x & 31u;
+    const uint32_t nwarps = blockDim.x >> 5u;
+    NkRow* const staged = reinterpret_cast<NkRow*>(row_storage) + warp;
+    for (uint32_t i = threadIdx.x; i < 4u * kOwnerTableSlots; i += blockDim.x)
+        owner_table[i] = (i / kOwnerTableSlots) % 2u == 0u ? kOwnerEmpty : 0u;
+    uint32_t held_low = kOwnerEmpty;
+    uint32_t held_high = kOwnerEmpty;
+    uint32_t round = 0u;
+    const uint32_t island_count = *island_count_dev;
+    for (uint32_t base = 0u; base < island_count; base += blockDim.x) {
+        if (threadIdx.x == 0u) island_list_cnt = 0u;
+        __syncthreads();
+        if (base + threadIdx.x < island_count) {
+            const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[base + threadIdx.x];
+            if ((rec.flags & kIslandWarpWork) && rec.seg_cnt > 0u && activity.Active(rec))
+                island_list[atomicAdd(&island_list_cnt, 1u)] = base + threadIdx.x;
+        }
+        __syncthreads();
+        const uint32_t listed = island_list_cnt;
+        for (uint32_t k = 0u; k < listed; ++k) {
+            const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[island_list[k]];
+            const uint32_t live_off = rec.seg_off == 0u ? 0u : live_scan[rec.seg_off - 1u];
+            const uint32_t live_rows = live_scan[rec.seg_off + rec.seg_cnt - 1u] - live_off;
+            const uint32_t batches = (live_rows + nwarps - 1u) / nwarps;
+            for (uint32_t b = blockIdx.x; b < batches; b += gridDim.x, ++round) {
+                // The previous round's table is released while this round fills the other.
+                uint32_t* const keys = owner_table + (round & 1u) * 2u * kOwnerTableSlots;
+                uint32_t* const masks = keys + kOwnerTableSlots;
+                uint32_t* const released = owner_table + (~round & 1u) * 2u * kOwnerTableSlots;
+                if (held_low != kOwnerEmpty) {
+                    released[held_low] = kOwnerEmpty;
+                    released[kOwnerTableSlots + held_low] = 0u;
+                }
+                if (held_high != kOwnerEmpty) {
+                    released[held_high] = kOwnerEmpty;
+                    released[kOwnerTableSlots + held_high] = 0u;
+                }
+                held_low = kOwnerEmpty;
+                held_high = kOwnerEmpty;
+                const uint32_t position = warp * batches + b;
+                const bool valid = position < live_rows;
+                uint32_t mode = kRowOrdered;
+                bool participates = false;
+                if (valid) {
+                    StageRowWarp(urows, live_order[live_off + position], staged, wlane);
+                    const NkRow& row = staged[0];
+                    const uint32_t a_owners = SideOwnerCount(row.a, point_masses, body_inv_mass);
+                    const uint32_t owners =
+                        1u + a_owners + SideOwnerCount(row.b, point_masses, body_inv_mass);
+                    if (row.flags & nk::nk_row_flags::kBlockTangent) {
+                        mode = kRowSkipped;
+                    } else if (owners <= kOwnerKeysPerRow) {
+                        bool packed = true;
+                        for (uint32_t j = wlane; j < owners; j += warpSize) {
+                            const uint32_t key = j == 0u
+                                ? OwnerKey(kOwnerGroupKind, row.group_first)
+                                : (j - 1u < a_owners
+                                    ? SideOwnerKey(row.a, j - 1u, point_masses)
+                                    : SideOwnerKey(row.b, j - 1u - a_owners, point_masses));
+                            if (key == kOwnerEmpty) {
+                                packed = false;
+                                continue;
+                            }
+                            const uint32_t held = InsertOwner(keys, masks, key, 1u << warp);
+                            if (j < warpSize) held_low = held;
+                            else held_high = held;
+                        }
+                        participates = __all_sync(0xffffffffu, packed);
+                    }
+                }
+                __syncthreads();
+                if (participates) {
+                    const uint32_t others = ~(1u << warp);
+                    const bool shared_owner =
+                        (held_low != kOwnerEmpty && (masks[held_low] & others) != 0u) ||
+                        (held_high != kOwnerEmpty && (masks[held_high] & others) != 0u);
+                    if (!__any_sync(0xffffffffu, shared_owner)) mode = kRowFree;
+                }
+                if (valid && wlane == 0u) row_modes[live_off + position] = mode;
+                __syncthreads();
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __device__ bool SolveUnionRowWarp(uint32_t ls,            // env-local slot
                                   uint32_t gslot,         // global slot
                                   uint32_t env_row_base,  // env's first global slot
@@ -1794,9 +1894,8 @@ __global__ void SolveRowsBlockIslandKernel(
         }
         __syncthreads();
         const uint32_t live_seg_cnt = live_seg_cnt_sh;
-        uint32_t* const row_modes = dynamic && pd_solve_scratch != nullptr
-            ? pd_solve_scratch + static_cast<size_t>(env_row_base)
-            : nullptr;
+        // Live-row modes come from ClassifyLiveRowsKernel, indexed by compacted position.
+        const uint32_t* const row_modes = compacted ? pd_solve_scratch : nullptr;
 
         const uint32_t warp = lane >> 5u;
         const uint32_t wlane = lane & 31u;
@@ -1807,8 +1906,6 @@ __global__ void SolveRowsBlockIslandKernel(
         float* const staged_j = dynamic ? reinterpret_cast<float*>(tile_list + k_tiles) : nullptr;
         const size_t staged_size = size_t{3u} * nwarps * dof_stride;
         float* const staged_tangent_response = dynamic ? staged_j + 4u * staged_size : nullptr;
-        uint32_t* const owner_table =
-            dynamic ? reinterpret_cast<uint32_t*>(staged_tangent_response + nwarps) : nullptr;
         __shared__ uint32_t batch_needed, sweep_changed, free_rows_sh, ordered_rows_sh;
         __shared__ uint32_t row_changed, row_significant, friction_active;
         __shared__ float contact_side_velocity[6], contact_delta[3];
@@ -1816,94 +1913,42 @@ __global__ void SolveRowsBlockIslandKernel(
         __shared__ uint32_t ordered_warp_rows[kDynamicIslandBlockSize / 32u];
         // Batch b hands warp w the live row w * batches + b, so one batch spans the island.
         const uint32_t batches = dynamic ? (live_seg_cnt + nwarps - 1u) / nwarps : 0u;
-        bool classified = false;
+        if (row_modes != nullptr) {
+            if (lane == 0u) {
+                free_rows_sh = 0u;
+                ordered_rows_sh = 0u;
+            }
+            __syncthreads();
+            uint32_t free_rows = 0u;
+            uint32_t ordered_rows = 0u;
+            for (uint32_t position = lane; position < live_seg_cnt; position += blockDim.x) {
+                const uint32_t mode = row_modes[live_off + position];
+                free_rows += mode == kRowFree ? 1u : 0u;
+                ordered_rows += mode == kRowOrdered ? 1u : 0u;
+            }
+            free_rows = __reduce_add_sync(0xffffffffu, free_rows);
+            ordered_rows = __reduce_add_sync(0xffffffffu, ordered_rows);
+            if (wlane == 0u) {
+                atomicAdd(&free_rows_sh, free_rows);
+                atomicAdd(&ordered_rows_sh, ordered_rows);
+            }
+            __syncthreads();
+        }
 
         // A row sharing no written state with the rest of its batch commutes with it, so its
-        // warp solves it concurrently. The first sweep of a launch records each row's mode.
+        // warp solves it concurrently with the other warps.
         auto free_sweep = [&](auto&& solve_row) {
-            if (row_modes == nullptr) return;
-            const bool classify = !classified;
-            classified = true;
-            if (classify) {
-                for (uint32_t i = lane; i < 4u * kOwnerTableSlots; i += blockDim.x)
-                    owner_table[i] = (i / kOwnerTableSlots) % 2u == 0u ? kOwnerEmpty : 0u;
-                if (lane == 0u) {
-                    free_rows_sh = 0u;
-                    ordered_rows_sh = 0u;
-                }
-                __syncthreads();
-            } else if (free_rows_sh == 0u) {
-                return;
-            }
+            if (row_modes == nullptr || free_rows_sh == 0u) return;
             NkRow* const staged = staged_rows + 3u * warp;
-            uint32_t held_low = kOwnerEmpty;
-            uint32_t held_high = kOwnerEmpty;
             for (uint32_t b = 0u; b < batches; ++b) {
                 const uint32_t position = warp * batches + b;
                 const bool valid = position < live_seg_cnt;
                 const uint32_t slot = valid ? walk_order[live_off + position] : 0u;
-                uint32_t mode = kRowOrdered;
-                if (classify) {
-                    // The previous batch's table is released while this batch fills the other.
-                    uint32_t* const keys = owner_table + (b & 1u) * 2u * kOwnerTableSlots;
-                    uint32_t* const masks = keys + kOwnerTableSlots;
-                    uint32_t* const released = owner_table + (~b & 1u) * 2u * kOwnerTableSlots;
-                    if (held_low != kOwnerEmpty) {
-                        released[held_low] = kOwnerEmpty;
-                        released[kOwnerTableSlots + held_low] = 0u;
-                    }
-                    if (held_high != kOwnerEmpty) {
-                        released[held_high] = kOwnerEmpty;
-                        released[kOwnerTableSlots + held_high] = 0u;
-                    }
-                    held_low = kOwnerEmpty;
-                    held_high = kOwnerEmpty;
-                    bool participates = false;
-                    if (valid) {
-                        StageRowWarp(urows, slot, staged, wlane);
-                        const NkRow& row = staged[0];
-                        const uint32_t a_owners = SideOwnerCount(row.a, point_masses, body_inv_mass);
-                        const uint32_t owners =
-                            1u + a_owners + SideOwnerCount(row.b, point_masses, body_inv_mass);
-                        if (row.flags & nk::nk_row_flags::kBlockTangent) {
-                            mode = kRowSkipped;
-                        } else if (owners <= kOwnerKeysPerRow) {
-                            bool packed = true;
-                            for (uint32_t j = wlane; j < owners; j += warpSize) {
-                                const uint32_t key = j == 0u
-                                    ? OwnerKey(kOwnerGroupKind, row.group_first)
-                                    : (j - 1u < a_owners
-                                        ? SideOwnerKey(row.a, j - 1u, point_masses)
-                                        : SideOwnerKey(row.b, j - 1u - a_owners, point_masses));
-                                if (key == kOwnerEmpty) {
-                                    packed = false;
-                                    continue;
-                                }
-                                const uint32_t held = InsertOwner(keys, masks, key, 1u << warp);
-                                if (j < warpSize) held_low = held;
-                                else held_high = held;
-                            }
-                            participates = __all_sync(0xffffffffu, packed);
-                        }
-                    }
-                    __syncthreads();
-                    if (participates) {
-                        const uint32_t others = ~(1u << warp);
-                        const bool shared_owner =
-                            (held_low != kOwnerEmpty && (masks[held_low] & others) != 0u) ||
-                            (held_high != kOwnerEmpty && (masks[held_high] & others) != 0u);
-                        if (!__any_sync(0xffffffffu, shared_owner)) mode = kRowFree;
-                    }
-                    if (valid && wlane == 0u) {
-                        row_modes[slot - env_row_base] = mode;
-                        if (mode == kRowFree) atomicAdd(&free_rows_sh, 1u);
-                        if (mode == kRowOrdered) atomicAdd(&ordered_rows_sh, 1u);
-                    }
-                } else if (valid) {
-                    mode = row_modes[slot - env_row_base];
-                    if (mode == kRowFree) StageRowWarp(urows, slot, staged, wlane);
+                const uint32_t mode = valid ? row_modes[live_off + position] : kRowOrdered;
+                if (mode == kRowFree) {
+                    StageRowWarp(urows, slot, staged, wlane);
+                    solve_row(slot, staged);
                 }
-                if (mode == kRowFree) solve_row(slot, staged);
                 __syncthreads();
             }
         };
@@ -1916,7 +1961,7 @@ __global__ void SolveRowsBlockIslandKernel(
                 bool take = false;
                 if (position < live_seg_cnt) {
                     slot = walk_order[live_off + position];
-                    take = row_modes == nullptr || row_modes[slot - env_row_base] == kRowOrdered;
+                    take = row_modes == nullptr || row_modes[live_off + position] == kRowOrdered;
                 }
                 const uint32_t ballot = __ballot_sync(0xffffffffu, take);
                 if (wlane == 0u) ordered_warp_rows[warp] = __popc(ballot);
@@ -2572,6 +2617,20 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             LaunchCuda(CompactLiveRowsKernel, dim3(1u), dim3(kCompactBlockSize), 0u, stream,
                        data.island_root_sorted, data.island_rows, live_scan, live_order,
                        total_rows);
+            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            // Classification needs the island solve's warp count, so it shares its block size.
+            const uint32_t classify_warps = island_block_size / 32u;
+            uint32_t classify_blocks = 0u;
+            if (ResidentGridSize(ClassifyLiveRowsKernel, island_block_size, 0u,
+                    (total_rows + classify_warps - 1u) / classify_warps,
+                    &classify_blocks) != cudaSuccess) return Status::Failed;
+            LaunchCuda(ClassifyLiveRowsKernel, dim3(classify_blocks), dim3(island_block_size), 0u,
+                       stream, reinterpret_cast<const NkRow*>(data.urows),
+                       PointMassView{data.particle_inv_mass, data.particle_vel,
+                                     data.grid_inv_mass, data.grid_velocity,
+                                     data.point_endpoint_ranges, data.point_endpoint_terms},
+                       static_cast<const float*>(data.body_inv_mass), islands_in,
+                       island_count_dev, activity, live_scan, live_order, data.pd_solve_scratch);
             if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             const uint32_t scalar_blocks = max_island_bound < kScalarIslandGridBlocks
                 ? max_island_bound : kScalarIslandGridBlocks;
