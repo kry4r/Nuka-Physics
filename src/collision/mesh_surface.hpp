@@ -214,6 +214,26 @@ NUKA_MESH_HD inline math::Vec3 MeshFeatureNormal(
     return normal;
 }
 
+// A leaf becomes the nearest triangle when closer, or equally close with a lower index.
+NUKA_MESH_HD inline bool MeshNearestLeaf(
+    const MeshSurfaceView& view, const MeshSurfaceInfo& info, math::Vec3 p, uint32_t triangle,
+    float& best_sq, MeshSurfacePoint& result, math::Vec3& face_normal) {
+    math::Vec3 a, b, c;
+    if (!MeshSurfaceTriangle(view, info, triangle, a, b, c)) return false;
+    if (!((b - a).Cross(c - a).LengthSq() > 0.0f)) return true;
+    const auto closest = ClosestTrianglePoint(p, a, b, c);
+    const float sq = (p - closest.point).LengthSq();
+    if (sq < best_sq || (sq == best_sq && triangle < result.triangle)) {
+        best_sq = sq;
+        result.point = closest.point;
+        result.barycentric = closest.barycentric;
+        result.triangle = triangle;
+        result.feature = closest.feature;
+        face_normal = (b - a).Cross(c - a);
+    }
+    return true;
+}
+
 NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info, math::Vec3 p,
     float max_distance = FLT_MAX) {
@@ -229,29 +249,49 @@ NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
     }
     float best_sq = FLT_MAX;
     Vec3 face_normal{1, 0, 0};
-    uint32_t cursor = 0u;
-    while (cursor < info.node_count) {
+    // Nearer children go first so the bound tightens early; the argmin does not depend on order.
+    // A full stack leaves the rest to an escape-order sweep under the bound found so far.
+    constexpr uint32_t kStackSize = 32u;
+    uint32_t stack[kStackSize];
+    uint32_t top = 1u;
+    stack[0] = 0u;
+    bool overflow = false;
+    while (top > 0u) {
+        uint32_t cursor = stack[--top];
+        if (MeshBoundsDistanceSquared(p, view.nodes[info.node_offset + cursor]) > best_sq) continue;
+        for (;;) {
+            const MeshBvhNode& node = view.nodes[info.node_offset + cursor];
+            if (node.escape <= cursor || node.escape > info.node_count) return {};
+            if (node.triangle != ~0u) {
+                if (!MeshNearestLeaf(view, info, p, node.triangle, best_sq, result, face_normal))
+                    return {};
+                break;
+            }
+            const uint32_t left = cursor + 1u;
+            if (left >= node.escape) return {};
+            const uint32_t right = view.nodes[info.node_offset + left].escape;
+            if (right <= left || right >= node.escape) return {};
+            const float left_sq = MeshBoundsDistanceSquared(p, view.nodes[info.node_offset + left]);
+            const float right_sq = MeshBoundsDistanceSquared(p, view.nodes[info.node_offset + right]);
+            const bool swap = right_sq < left_sq;
+            if ((swap ? left_sq : right_sq) <= best_sq) {
+                if (top < kStackSize) stack[top++] = swap ? left : right;
+                else overflow = true;
+            }
+            if (!((swap ? right_sq : left_sq) <= best_sq)) break;
+            cursor = swap ? right : left;
+        }
+    }
+    for (uint32_t cursor = 0u; overflow && cursor < info.node_count;) {
         const MeshBvhNode& node = view.nodes[info.node_offset + cursor];
         if (node.escape <= cursor || node.escape > info.node_count) return {};
         if (MeshBoundsDistanceSquared(p, node) > best_sq) {
             cursor = node.escape;
             continue;
         }
-        if (node.triangle != ~0u) {
-            Vec3 a, b, c;
-            if (!MeshSurfaceTriangle(view, info, node.triangle, a, b, c)) return {};
-            if (!((b - a).Cross(c - a).LengthSq() > 0.0f)) { ++cursor; continue; }
-            const auto closest = ClosestTrianglePoint(p, a, b, c);
-            const float sq = (p - closest.point).LengthSq();
-            if (sq < best_sq || (sq == best_sq && node.triangle < result.triangle)) {
-                best_sq = sq;
-                result.point = closest.point;
-                result.barycentric = closest.barycentric;
-                result.triangle = node.triangle;
-                result.feature = closest.feature;
-                face_normal = (b - a).Cross(c - a);
-            }
-        }
+        if (node.triangle != ~0u &&
+            !MeshNearestLeaf(view, info, p, node.triangle, best_sq, result, face_normal))
+            return {};
         ++cursor;
     }
     if (result.triangle == ~0u) return result;
