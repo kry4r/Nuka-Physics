@@ -651,7 +651,12 @@ struct NarrowphaseSdfParams {
     uint32_t sample_point_count; // available surface samples
     uint32_t sdf_cell_total;
     collision::MeshGeometryCounts mesh_geometry;
+    uint32_t max_body_samples;  // largest per-body slice of the sample pool
 };
+
+// Word count of the pair_sample_chunks field the NarrowphaseSdf op flags sample chunks in.
+// Host-callable (defined in narrowphase_sdf.cu) so the World sizes it before allocation.
+uint64_t PairSampleChunkWords(const NarrowphaseSdfParams& params);
 
 struct ContactTangentBasisParams {
     uint32_t slot_count;        // env_count * max_contacts_per_env

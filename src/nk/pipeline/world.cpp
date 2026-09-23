@@ -189,6 +189,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
             const auto* query = static_cast<const phi::LbvhQueryPairsParams*>(call.params);
             pair_sort_slots = uint64_t{query->env_count} * query->rigid_slot_cap;
         }
+        if (call.op == phi::NkOp::NarrowphaseSdf)
+            model_.capacities.pair_sample_chunk_words = phi::PairSampleChunkWords(
+                *static_cast<const phi::NarrowphaseSdfParams*>(call.params));
     }
     model_.capacities.pair_sort_scratch_bytes =
         (pair_sort_slots > 0u &&

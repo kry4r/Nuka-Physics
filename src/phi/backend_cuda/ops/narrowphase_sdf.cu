@@ -83,6 +83,14 @@ namespace sdf = ::nuka::runtime::sdf;
 
 constexpr uint32_t kManifoldPoints = constraint::ContactManifold::kMaxPoints;
 constexpr uint32_t kSurfaceQueryThreads = 128u;
+// A sample chunk is one block-wide sweep; each flag word covers 32 chunks.
+constexpr uint32_t kSamplesPerChunkWord = kSurfaceQueryThreads * 32u;
+// Few pairs spread their chunks over the device; many pairs fill it on their own.
+constexpr uint32_t kSampleChunkBlockBudget = 1u << 14;
+
+__host__ __device__ inline uint32_t SampleChunkWords(uint32_t samples) {
+    return static_cast<uint32_t>((uint64_t{samples} + kSamplesPerChunkWord - 1u) / kSamplesPerChunkWord);
+}
 
 struct SampleContact {
     math::Vec3 point;
@@ -221,6 +229,94 @@ __global__ void NarrowphaseSdfKernel(const float* __restrict__ samp_points,
     }
 }
 
+// One surface sample against the other side's surface; true when it yields a contact.
+__device__ __forceinline__ bool PairSampleContact(
+    const SurfaceQueryView& surfaces, uint32_t target_body, const PrimShapeDev& target,
+    const math::Transform& sxf, const math::Transform& txf, const float* samp_points,
+    uint32_t soff, uint32_t s, uint32_t side, uint32_t sample_point_count, float margin,
+    SampleContact& contact, uint32_t& geometry_status) {
+    const size_t at = static_cast<size_t>(soff + s) * 3u;
+    const math::Vec3 local{samp_points[at], samp_points[at + 1u], samp_points[at + 2u]};
+    const math::Vec3 world = SdfTransformPoint(sxf, local);
+    const math::Vec3 q = SdfInverseTransformPoint(txf, world);
+    const auto surface = QueryCollidableSurface(surfaces, target_body, target, q, margin);
+    if (!surface.valid) {
+        geometry_status |= kEnvStatusContactGeometryUnavailable;
+        return false;
+    }
+    const float phi = surface.distance;
+    if (phi >= sdf::SparseSdfDevice::kOutsideBand) return false;
+    const float depth = -phi + margin;
+    if (depth <= 0.0f) return false;
+    const math::Vec3 gw = SdfRotate(txf.rotation, surface.normal);
+    const float gl = sqrtf(gw.Dot(gw));
+    if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-12f) {
+        geometry_status |= kEnvStatusContactGeometryUnavailable;
+        return false;
+    }
+    const math::Vec3 n = gw / gl;
+    const math::Vec3 cp = SdfTransformPoint(txf, surface.point);
+    const uint32_t target_feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
+    contact = {cp, side == 0u ? n : n * -1.0f, depth,
+        side == 0u ? s : target_feature, side == 0u ? target_feature : s,
+        uint64_t(side) * (uint64_t(sample_point_count) + 1u) + s};
+    return true;
+}
+
+// Flags each sample chunk that yields a contact or a geometry status, spread over the grid.
+// The manifold pass then queries only flagged chunks, in its own per-thread order.
+__global__ void FlagPairSampleChunksKernel(const uint32_t* __restrict__ candidate_pairs,
+                                           const uint32_t* __restrict__ pair_count,
+                                           const float* __restrict__ shape_table,
+                                           const float* __restrict__ samp_points,
+                                           const uint32_t* __restrict__ samp_ranges,
+                                           SurfaceQueryView surfaces,
+                                           const math::Transform* __restrict__ body_pose,
+                                           uint32_t env_count,
+                                           uint32_t bodies_per_env,
+                                           uint32_t slot_stride,
+                                           uint32_t rigid_slot_cap,
+                                           uint32_t pair_slots,
+                                           uint32_t sample_point_count,
+                                           float margin,
+                                           const uint32_t* __restrict__ ucount,
+                                           uint32_t chunk_words,
+                                           uint32_t* __restrict__ sample_chunks) {
+    const uint32_t env = blockIdx.x / pair_slots;
+    const uint32_t slot = blockIdx.x - env * pair_slots;
+    const uint32_t side = blockIdx.y;
+    if (env >= env_count) return;
+    const uint32_t gid = env * slot_stride + slot;
+    if (slot >= pair_count[env] || slot >= rigid_slot_cap || ucount[gid] != 0u) return;
+    const uint32_t bodies[2] = {candidate_pairs[static_cast<size_t>(gid) * 2u + 0u],
+                                candidate_pairs[static_cast<size_t>(gid) * 2u + 1u]};
+    if (bodies[0] >= bodies_per_env || bodies[1] >= bodies_per_env) return;
+    const uint32_t other = 1u - side;
+    const PrimShapeDev sampled = LoadPrimShape(shape_table, bodies[side]);
+    const PrimShapeDev target = LoadPrimShape(shape_table, bodies[other]);
+    if (!HasCollidableSurface(surfaces, bodies[other], target) ||
+        sampled.kind == collision::kShapeSphere) return;
+    if (target.kind == collision::kShapeSphere &&
+        HasCollidableSurface(surfaces, bodies[side], sampled)) return;
+    const uint32_t soff = samp_ranges[bodies[side] * 2u];
+    const uint32_t scnt = samp_ranges[bodies[side] * 2u + 1u];
+    if (soff > sample_point_count || scnt > sample_point_count - soff ||
+        SampleChunkWords(scnt) > chunk_words) return;
+    const math::Transform sxf = body_pose[env * bodies_per_env + bodies[side]];
+    const math::Transform txf = body_pose[env * bodies_per_env + bodies[other]];
+    uint32_t* const chunks = sample_chunks + (size_t{blockIdx.x} * 2u + side) * chunk_words;
+    for (uint32_t first = blockIdx.z * kSurfaceQueryThreads; first < scnt;
+         first += gridDim.z * kSurfaceQueryThreads) {
+        const uint32_t s = first + threadIdx.x;
+        SampleContact contact;
+        uint32_t status = 0u;
+        const bool flagged = s < scnt && (PairSampleContact(surfaces, bodies[other], target, sxf, txf,
+            samp_points, soff, s, side, sample_point_count, margin, contact, status) || status != 0u);
+        if (__ballot_sync(~0u, flagged) != 0u && (threadIdx.x & 31u) == 0u)
+            atomicOr(chunks + first / kSamplesPerChunkWord, 1u << ((first / kSurfaceQueryThreads) & 31u));
+    }
+}
+
 // Query both surfaces into the shared manifold when analytic/convex detection leaves it empty.
 __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs,
                                     const uint32_t* __restrict__ pair_count,
@@ -249,7 +345,9 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint64_t* __restrict__ ucontact_id_pair,
                                     uint64_t* __restrict__ ucontact_id_feature,
                                     uint32_t* __restrict__ contact_count,
-                                    uint32_t* __restrict__ env_status) {
+                                    uint32_t* __restrict__ env_status,
+                                    uint32_t chunk_words,
+                                    const uint32_t* __restrict__ sample_chunks) {
     const uint32_t env = blockIdx.x / pair_slots;
     const uint32_t slot = blockIdx.x - env * pair_slots;
     if (env >= env_count) return;
@@ -308,40 +406,22 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
             HasCollidableSurface(surfaces, bodies[side], shapes[side])) continue;
         const uint32_t soff = samp_ranges[bodies[side] * 2u];
         const uint32_t scnt = samp_ranges[bodies[side] * 2u + 1u];
-        if (soff > sample_point_count || scnt > sample_point_count - soff) {
+        if (soff > sample_point_count || scnt > sample_point_count - soff ||
+            SampleChunkWords(scnt) > chunk_words) {
             geometry_status |= kEnvStatusContactGeometryUnavailable;
             continue;
         }
         if (scnt == 0u) continue;
         queried = true;
+        const uint32_t* const chunks = sample_chunks + (size_t{blockIdx.x} * 2u + side) * chunk_words;
         for (uint64_t sample = threadIdx.x; sample < scnt; sample += blockDim.x) {
             const auto s = static_cast<uint32_t>(sample);
-            const size_t at = static_cast<size_t>(soff + s) * 3u;
-            const math::Vec3 local{samp_points[at], samp_points[at + 1u], samp_points[at + 2u]};
-            const math::Vec3 world = SdfTransformPoint(sxf, local);
-            const math::Vec3 q = SdfInverseTransformPoint(txf, world);
-            const auto surface = QueryCollidableSurface(surfaces, bodies[other], target, q, margin);
-            if (!surface.valid) {
-                geometry_status |= kEnvStatusContactGeometryUnavailable;
-                continue;
-            }
-            const float phi = surface.distance;
-            if (phi >= sdf::SparseSdfDevice::kOutsideBand) continue;
-            const float depth = -phi + margin;
-            if (depth <= 0.0f) continue;
-            const math::Vec3 gw = SdfRotate(txf.rotation, surface.normal);
-            const float gl = sqrtf(gw.Dot(gw));
-            if (!isfinite(phi) || !isfinite(gl) || gl < 1.0e-12f) {
-                geometry_status |= kEnvStatusContactGeometryUnavailable;
-                continue;
-            }
-            const math::Vec3 n = gw / gl;
-            const math::Vec3 cp = SdfTransformPoint(txf, surface.point);
-            const uint32_t target_feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
-            InsertSampleContact({cp, side == 0u ? n : n * -1.0f, depth,
-                side == 0u ? s : target_feature, side == 0u ? target_feature : s,
-                uint64_t(side) * (uint64_t(sample_point_count) + 1u) + s},
-                kk, local_contacts, local_count);
+            const uint32_t word = chunks[s / kSamplesPerChunkWord];
+            if (((word >> ((s / kSurfaceQueryThreads) & 31u)) & 1u) == 0u) continue;
+            SampleContact contact;
+            if (PairSampleContact(surfaces, bodies[other], target, sxf, txf, samp_points, soff, s,
+                                  side, sample_point_count, margin, contact, geometry_status))
+                InsertSampleContact(contact, kk, local_contacts, local_count);
         }
     }
     if (!queried && (shapes[0].kind == collision::kShapeSdfMesh ||
@@ -440,6 +520,25 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
         !data.ucontact_a_kind || !data.ucontact_b_kind || !data.ucontact_gen ||
         !data.ucontact_id_pair || !data.ucontact_id_feature) return Status::InvalidArgument;
     const uint32_t blocks = p->env_count * pair_slots;
+    const uint32_t chunk_words = SampleChunkWords(p->max_body_samples);
+    const uint64_t words = PairSampleChunkWords(*p);
+    if (words > 0u) {
+        if (data.pair_sample_chunks == nullptr) return Status::InvalidArgument;
+        if (cudaMemsetAsync(data.pair_sample_chunks, 0, words * sizeof(uint32_t), stream) != cudaSuccess)
+            return Status::Failed;
+        const uint32_t sweeps = (p->max_body_samples + kSurfaceQueryThreads - 1u) / kSurfaceQueryThreads;
+        const uint32_t spread = std::clamp(kSampleChunkBlockBudget / (blocks * 2u), 1u, sweeps);
+        LaunchCuda(FlagPairSampleChunksKernel, dim3(blocks, 2u, spread), dim3(kSurfaceQueryThreads), 0u,
+                   stream, data.candidate_pairs, data.pair_count,
+                   static_cast<const float*>(model.shape_table),
+                   static_cast<const float*>(model.samp_points),
+                   static_cast<const uint32_t*>(model.samp_ranges),
+                   surfaces,
+                   static_cast<const math::Transform*>(data.body_pose),
+                   p->env_count, p->bodies_per_env, p->max_contacts_per_env,
+                   p->rigid_slot_cap, pair_slots, p->sample_point_count, p->contact_margin,
+                   data.ucontact_count, chunk_words, data.pair_sample_chunks);
+    }
     LaunchCuda(PairDrivenSdfKernel, dim3(blocks), dim3(kSurfaceQueryThreads), 0u, stream,
                data.candidate_pairs, data.pair_count,
                static_cast<const float*>(model.shape_table),
@@ -454,11 +553,18 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,
                data.ucontact_gen, data.ucontact_id_pair,
-               data.ucontact_id_feature, data.contact_count, data.env_status);
+               data.ucontact_id_feature, data.contact_count, data.env_status,
+               chunk_words, data.pair_sample_chunks);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
 }  // namespace
+
+uint64_t PairSampleChunkWords(const NarrowphaseSdfParams& params) {
+    if (params.family != kContactFamilyPairDriven || params.max_body_samples == 0u) return 0u;
+    const uint32_t pair_slots = std::min(params.max_contacts_per_env, params.rigid_slot_cap);
+    return uint64_t{params.env_count} * pair_slots * 2u * SampleChunkWords(params.max_body_samples);
+}
 
 // The geometry oracle drives the same signed-distance contract with explicit pairs.
 Status LaunchNarrowphaseSdf(const float* samp_points,

@@ -636,6 +636,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.sample_point_count = cap.max_samp_points;
         p_np_sdf_.sdf_cell_total = cap.max_sdf_cells;
         p_np_sdf_.mesh_geometry = {cap.max_hull_verts, cap.max_mesh_triangles, cap.max_mesh_bvh_nodes};
+        p_np_sdf_.max_body_samples = 0u;
+        for (size_t i = 1u; i < model.samp_ranges.size(); i += 2u)
+            p_np_sdf_.max_body_samples = std::max(p_np_sdf_.max_body_samples, model.samp_ranges[i]);
         const bool has_sampled_geometry = cap.max_samp_points > 0u || cap.max_sdf_grids > 0u ||
             std::any_of(model.shape_table_rows.begin(), model.shape_table_rows.end(),
                 [](const Model::PairDrivenShape& shape) {

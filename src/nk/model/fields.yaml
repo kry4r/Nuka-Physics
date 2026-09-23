@@ -1003,3 +1003,6 @@ fields:
   # Latest contact solve diagnostics are disposable and never restore physical state.
   - {name: contact_solve_metrics, dtype: u64, per: env, elem: 8, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_solve_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data, flags: [readout]}
+
+  # Pair sample chunks that yield contacts or geometry status, flagged before each manifold pass.
+  - {name: pair_sample_chunks, dtype: u32, per: scalar, count: "pair_sample_chunk_words", arena: scratch, owner: data}
