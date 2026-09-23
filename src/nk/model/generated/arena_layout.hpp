@@ -388,6 +388,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_pseudo_vel
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 8, 1, 64, 0},  // contact_solve_metrics
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 8, 0},  // contact_solve_counts
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // pair_sample_chunks
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

@@ -349,6 +349,7 @@ enum class FieldId : uint16_t {
     GridPseudoVel,  // grid_pseudo_vel (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     ContactSolveMetrics,  // contact_solve_metrics (per:env arena:scratch owner:data elem:8 flags:[readout])
     ContactSolveCounts,  // contact_solve_counts (per:env arena:scratch owner:data elem:2 flags:[readout])
+    PairSampleChunks,  // pair_sample_chunks (per:scalar arena:scratch owner:data count:pair_sample_chunk_words)
     Count
 };
 
@@ -693,6 +694,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "grid_pseudo_vel",
     "contact_solve_metrics",
     "contact_solve_counts",
+    "pair_sample_chunks",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";
