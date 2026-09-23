@@ -67,9 +67,20 @@ struct AabbSplitSource {
 namespace lbvh_batched_detail {
 
 constexpr uint32_t kBlockSize = 128u;
+constexpr uint32_t kMortonBlockSize = 1024u;
 
-// One thread folds the env's own AABB-center bound (fixed order) -> env-LOCAL
-// Morton + index + the (env<<32)|morton compound key (envs never mix).
+// Lane 0 ends with the warp's min over bound[0..2] and max over bound[3..5].
+__device__ __forceinline__ void WarpFoldBound(float (&bound)[6]) {
+    for (int k = 0; k < 6; ++k) {
+        for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u) {
+            const float other = __shfl_down_sync(0xffffffffu, bound[k], offset);
+            bound[k] = k < 3 ? fminf(bound[k], other) : fmaxf(bound[k], other);
+        }
+    }
+}
+
+// One block folds the env's AABB-center bound; min and max are exact in any order.
+// Each leaf then gets its env-LOCAL Morton, index and (env<<32)|morton key.
 template <typename Src>
 __global__ void EnvMortonKernel(Src src,
                                 uint32_t leaves_per_env,
@@ -78,24 +89,39 @@ __global__ void EnvMortonKernel(Src src,
                                 uint64_t* __restrict__ out_sortkey) {
     const uint32_t env = blockIdx.x;
     const uint32_t base = env * leaves_per_env;
-    if (threadIdx.x != 0u) return;
-    float mn[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
-    float mx[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
-    for (uint32_t i = 0; i < leaves_per_env; ++i) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t warp = threadIdx.x / warpSize;
+    float bound[6] = {FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (uint32_t i = threadIdx.x; i < leaves_per_env; i += blockDim.x) {
         const collision::AABB box = src.Load(base + i);
         const float c[3] = {0.5f * (box.min.x + box.max.x),
                             0.5f * (box.min.y + box.max.y),
                             0.5f * (box.min.z + box.max.z)};
         for (int k = 0; k < 3; ++k) {
-            mn[k] = fminf(mn[k], c[k]);
-            mx[k] = fmaxf(mx[k], c[k]);
+            bound[k] = fminf(bound[k], c[k]);
+            bound[3 + k] = fmaxf(bound[3 + k], c[k]);
         }
+    }
+    // Every warp folds the per-warp bounds itself, so no second barrier is needed.
+    __shared__ float warp_bound[6][kMortonBlockSize / 32u];
+    WarpFoldBound(bound);
+    if (lane == 0u)
+        for (int k = 0; k < 6; ++k) warp_bound[k][warp] = bound[k];
+    __syncthreads();
+    for (int k = 0; k < 6; ++k)
+        bound[k] = lane < blockDim.x / warpSize ? warp_bound[k][lane]
+                                                : (k < 3 ? FLT_MAX : -FLT_MAX);
+    WarpFoldBound(bound);
+    float mn[3], mx[3];
+    for (int k = 0; k < 3; ++k) {
+        mn[k] = __shfl_sync(0xffffffffu, bound[k], 0);
+        mx[k] = __shfl_sync(0xffffffffu, bound[3 + k], 0);
     }
     const float inv[3] = {
         (mx[0] > mn[0]) ? 1.0f / (mx[0] - mn[0]) : 0.0f,
         (mx[1] > mn[1]) ? 1.0f / (mx[1] - mn[1]) : 0.0f,
         (mx[2] > mn[2]) ? 1.0f / (mx[2] - mn[2]) : 0.0f};
-    for (uint32_t i = 0; i < leaves_per_env; ++i) {
+    for (uint32_t i = threadIdx.x; i < leaves_per_env; i += blockDim.x) {
         const collision::AABB box = src.Load(base + i);
         const float nx = (0.5f * (box.min.x + box.max.x) - mn[0]) * inv[0];
         const float ny = (0.5f * (box.min.y + box.max.y) - mn[1]) * inv[1];
@@ -269,7 +295,7 @@ inline cudaError_t BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
         ZeroU32Kernel<<<b, kBlockSize, 0, stream>>>(visit, n);
     }
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
-    EnvMortonKernel<Src><<<dim3(E), dim3(kBlockSize), 0, stream>>>(
+    EnvMortonKernel<Src><<<dim3(E), dim3(kMortonBlockSize), 0, stream>>>(
         src, N, morton, indices_in, keys_in);
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     const auto sorted = cub::DeviceRadixSort::SortPairs(
