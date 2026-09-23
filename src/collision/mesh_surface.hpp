@@ -234,23 +234,11 @@ NUKA_MESH_HD inline bool MeshNearestLeaf(
     return true;
 }
 
-NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
+// Nearer children go first so the bound tightens early; the argmin does not depend on order.
+// A full stack leaves the rest to an escape-order sweep under the bound found so far.
+NUKA_MESH_HD inline bool MeshNearestSearch(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info, math::Vec3 p,
-    float max_distance = FLT_MAX) {
-    using math::Vec3;
-    MeshSurfacePoint result;
-    if (!MeshSurfaceRangeValid(view, info)) return result;
-    const MeshBvhNode& root = view.nodes[info.node_offset];
-    if (max_distance >= 0.0f &&
-        MeshBoundsDistanceSquared(p, root) > max_distance * max_distance) {
-        result.distance = FLT_MAX;
-        result.valid = true;
-        return result;
-    }
-    float best_sq = FLT_MAX;
-    Vec3 face_normal{1, 0, 0};
-    // Nearer children go first so the bound tightens early; the argmin does not depend on order.
-    // A full stack leaves the rest to an escape-order sweep under the bound found so far.
+    float& best_sq, MeshSurfacePoint& result, math::Vec3& face_normal) {
     constexpr uint32_t kStackSize = 32u;
     uint32_t stack[kStackSize];
     uint32_t top = 1u;
@@ -261,16 +249,16 @@ NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
         if (MeshBoundsDistanceSquared(p, view.nodes[info.node_offset + cursor]) > best_sq) continue;
         for (;;) {
             const MeshBvhNode& node = view.nodes[info.node_offset + cursor];
-            if (node.escape <= cursor || node.escape > info.node_count) return {};
+            if (node.escape <= cursor || node.escape > info.node_count) return false;
             if (node.triangle != ~0u) {
                 if (!MeshNearestLeaf(view, info, p, node.triangle, best_sq, result, face_normal))
-                    return {};
+                    return false;
                 break;
             }
             const uint32_t left = cursor + 1u;
-            if (left >= node.escape) return {};
+            if (left >= node.escape) return false;
             const uint32_t right = view.nodes[info.node_offset + left].escape;
-            if (right <= left || right >= node.escape) return {};
+            if (right <= left || right >= node.escape) return false;
             const float left_sq = MeshBoundsDistanceSquared(p, view.nodes[info.node_offset + left]);
             const float right_sq = MeshBoundsDistanceSquared(p, view.nodes[info.node_offset + right]);
             const bool swap = right_sq < left_sq;
@@ -284,20 +272,55 @@ NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
     }
     for (uint32_t cursor = 0u; overflow && cursor < info.node_count;) {
         const MeshBvhNode& node = view.nodes[info.node_offset + cursor];
-        if (node.escape <= cursor || node.escape > info.node_count) return {};
+        if (node.escape <= cursor || node.escape > info.node_count) return false;
         if (MeshBoundsDistanceSquared(p, node) > best_sq) {
             cursor = node.escape;
             continue;
         }
         if (node.triangle != ~0u &&
             !MeshNearestLeaf(view, info, p, node.triangle, best_sq, result, face_normal))
-            return {};
+            return false;
         ++cursor;
     }
-    if (result.triangle == ~0u) return result;
-    result.valid = true;
+    return true;
+}
+
+NUKA_MESH_HD inline MeshSurfacePoint QueryMeshSurface(
+    const MeshSurfaceView& view, const MeshSurfaceInfo& info, math::Vec3 p,
+    float max_distance = FLT_MAX) {
+    using math::Vec3;
+    MeshSurfacePoint result;
+    if (!MeshSurfaceRangeValid(view, info)) return result;
+    const MeshBvhNode& root = view.nodes[info.node_offset];
+    if (max_distance >= 0.0f &&
+        MeshBoundsDistanceSquared(p, root) > max_distance * max_distance) {
+        result.distance = FLT_MAX;
+        result.valid = true;
+        return result;
+    }
     const bool closed = (info.flags & kMeshSurfaceClosed) != 0u;
     const bool oriented = (info.flags & kMeshSurfaceOriented) != 0u;
+    float best_sq = FLT_MAX;
+    Vec3 face_normal{1, 0, 0};
+    // Outside points beyond max_distance report FLT_MAX too; only inside ones need the full search.
+    // The slack keeps a rounded distance past the bound strictly above max_distance.
+    const float bound_sq = max_distance * max_distance * (1.0f + 1.0f / 65536.0f);
+    if (max_distance >= 0.0f && bound_sq < FLT_MAX && (closed || !oriented)) {
+        best_sq = bound_sq;
+        if (!MeshNearestSearch(view, info, p, best_sq, result, face_normal)) return {};
+        bool contained_valid = true;
+        if (result.triangle == ~0u &&
+            (!closed || (!MeshSurfaceContains(view, info, p, contained_valid) && contained_valid))) {
+            result.distance = FLT_MAX;
+            result.valid = true;
+            return result;
+        }
+        if (result.triangle == ~0u) best_sq = FLT_MAX;
+    }
+    if (result.triangle == ~0u && !MeshNearestSearch(view, info, p, best_sq, result, face_normal))
+        return {};
+    if (result.triangle == ~0u) return result;
+    result.valid = true;
     const float distance = sqrtf(best_sq);
     if (oriented && !closed && result.feature < 6u) {
         const Vec3 feature_normal = MeshFeatureNormal(view, info, result.point);
