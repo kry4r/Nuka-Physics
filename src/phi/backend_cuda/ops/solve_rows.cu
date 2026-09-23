@@ -301,6 +301,7 @@ __device__ void ApplySlimImpulse(
     }
 }
 
+// A caller that already summed the dynamic point side passes that sum as point_velocity.
 template <bool cooperative = false>
 __device__ float ComputeSlimRowVelocity(
     const SlimRow& sr, uint32_t gslot, uint32_t j_row,
@@ -309,7 +310,7 @@ __device__ float ComputeSlimRowVelocity(
     const math::Vec3* __restrict__ body_lin_vel,
     const math::Vec3* __restrict__ body_ang_vel,
     PointMassView point_masses, uint32_t dof_stride, uint32_t lane = 0u,
-    const NkRow* prepared = nullptr) {
+    const NkRow* prepared = nullptr, const float* point_velocity = nullptr) {
     const uint32_t code = sr.code;
     const uint32_t a_tile = sr.a_tile == ~0u ? 0u : sr.a_tile;
     const uint32_t b_tile = sr.b_tile == ~0u ? 0u : sr.b_tile;
@@ -340,7 +341,8 @@ __device__ float ComputeSlimRowVelocity(
     if (code & kSlimHasDyn) {
         const math::Vec3 jl{sr.jl[0], sr.jl[1], sr.jl[2]};
         if (code & kSlimPointMass) {
-            if constexpr (cooperative) dyn_jv = point_masses.RowVelocityWarp(SlimPointSide(sr), lane);
+            if (point_velocity != nullptr) dyn_jv = *point_velocity;
+            else if constexpr (cooperative) dyn_jv = point_masses.RowVelocityWarp(SlimPointSide(sr), lane);
             else dyn_jv = point_masses.RowVelocity(SlimPointSide(sr));
         } else {
             const math::Vec3 ja{sr.ja[0], sr.ja[1], sr.ja[2]};
@@ -877,10 +879,12 @@ struct PointLaneTerm {
 };
 
 // Axis velocities of a point side whose terms fit one per lane; sums match the uncached pass.
-__device__ math::Vec3 LoadPointSideVelocities(
-    const NkRowSide (&sides)[3], nk::PointEndpointRange range, PointMassView points,
-    VelocityErrorView error, uint32_t lane, PointLaneTerm& term) {
-    float result[3] = {0.0f, 0.0f, 0.0f};
+template <uint32_t axes>
+__device__ void LoadPointSideVelocities(
+    const NkRowSide (&sides)[axes], nk::PointEndpointRange range, PointMassView points,
+    VelocityErrorView error, uint32_t lane, PointLaneTerm& term, float (&result)[axes]) {
+    #pragma unroll
+    for (uint32_t axis = 0u; axis < axes; ++axis) result[axis] = 0.0f;
     const uint32_t i = range.count == 1u ? 0u : lane;
     if (i < range.count) {
         if (sides[0].kind == nk::kNkSidePointEndpoint) {
@@ -888,13 +892,13 @@ __device__ math::Vec3 LoadPointSideVelocities(
             term.kind = entry.kind;
             term.index = entry.index;
             #pragma unroll
-            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            for (uint32_t axis = 0u; axis < axes; ++axis)
                 term.jacobian[axis] = entry.TransposeMultiply(sides[axis].jlin);
         } else {
             term.kind = sides[0].kind;
             term.index = sides[0].index;
             #pragma unroll
-            for (uint32_t axis = 0u; axis < 3u; ++axis) term.jacobian[axis] = sides[axis].jlin;
+            for (uint32_t axis = 0u; axis < axes; ++axis) term.jacobian[axis] = sides[axis].jlin;
         }
         const math::Vec3* velocity = points.Velocity(term.kind);
         const float* inverse_mass = points.InverseMass(term.kind);
@@ -902,14 +906,27 @@ __device__ math::Vec3 LoadPointSideVelocities(
         if (velocity != nullptr) {
             term.velocity = velocity[term.index];
             #pragma unroll
-            for (uint32_t axis = 0u; axis < 3u; ++axis)
+            for (uint32_t axis = 0u; axis < axes; ++axis)
                 result[axis] += term.jacobian[axis].Dot(term.velocity);
         }
         if (inverse_mass != nullptr) term.inverse_mass = inverse_mass[term.index];
         if (compensation != nullptr) term.error = *compensation;
     }
-    if (range.count == 1u) return {result[0], result[1], result[2]};
-    return {WarpSum(result[0]), WarpSum(result[1]), WarpSum(result[2])};
+    if (range.count == 1u) return;
+    #pragma unroll
+    for (uint32_t axis = 0u; axis < axes; ++axis) result[axis] = WarpSum(result[axis]);
+}
+
+// A scalar impulse on a lane's cached term, rounded as ApplyPointImpulse rounds it.
+__device__ void ApplyPointLaneImpulse(const PointLaneTerm& term, uint32_t count, uint32_t lane,
+                                      float delta, PointMassView points) {
+    math::Vec3* velocity = points.Velocity(term.kind);
+    if (lane >= count || velocity == nullptr || points.InverseMass(term.kind) == nullptr ||
+        !(term.inverse_mass > 0.0f))
+        return;
+    math::Vec3 value = term.velocity;
+    AddVelocity(value, nullptr, term.jacobian[0] * (term.inverse_mass * delta));
+    velocity[term.index] = value;
 }
 
 // No concurrent row writes this lane's term, so its loaded state is still current.
@@ -966,8 +983,10 @@ __device__ bool SolvePreparedContactBlockWarp(
     const NkRowSide sides_a[3] = {rows[0].a, rows[1].a, rows[2].a};
     PointLaneTerm term;
     const bool fits = cached && range.count <= warpSize;
+    float point_velocity[3];
+    if (fits) LoadPointSideVelocities(sides_a, range, points, error, lane, term, point_velocity);
     const math::Vec3 a = fits
-        ? LoadPointSideVelocities(sides_a, range, points, error, lane, term)
+        ? math::Vec3{point_velocity[0], point_velocity[1], point_velocity[2]}
         : ComputePreparedSideVelocities(rows, 0u, gslot, count, env_artic_base, J, J_b, qdot,
               body_linear, body_angular, points, dofs, lane);
     const math::Vec3 b = ComputePreparedSideVelocities(rows, 1u, gslot, count, env_artic_base,
@@ -1440,8 +1459,10 @@ __device__ bool SolvePositionRowWarp(uint32_t gslot,
                                      PointMassView point_masses,
                                      uint32_t dof_stride,
                                      float beta, float slop, float dt,
-                                     float baumgarte_max_velocity) {
-    const SlimRow sr = MakeSlimRow(LoadRowWarp(urows, gslot, wlane), env_row_base, env_artic_base);
+                                     float baumgarte_max_velocity,
+                                     const NkRow* prepared = nullptr) {
+    const SlimRow sr = MakeSlimRow(prepared != nullptr ? *prepared : LoadRowWarp(urows, gslot, wlane),
+                                   env_row_base, env_artic_base);
     const uint32_t flags = sr.flags;
     if (!(flags & nk::nk_row_flags::kActive) ||
         (flags & (nk::nk_row_flags::kFriction | nk::nk_row_flags::kBlockTangent |
@@ -1449,20 +1470,36 @@ __device__ bool SolvePositionRowWarp(uint32_t gslot,
         return false;
     }
 
+    // Row state and the point side's terms load together; the apply reuses those terms.
+    float depth = 0.0f, effective_mass = 0.0f, old_imp = 0.0f;
+    if (wlane == 0u) {
+        depth = row_penetration[gslot];
+        effective_mass = row_meff[gslot];
+        old_imp = row_pseudo_lambda[gslot];
+    }
+    const NkRowSide point_side[1] = {SlimPointSide(sr)};
+    const bool point = (sr.code & kSlimPointMass) != 0u;
+    nk::PointEndpointRange range{0u, 1u};
+    if (point && point_side[0].kind == nk::kNkSidePointEndpoint)
+        range = point_masses.ranges[point_side[0].index];
+    const bool cached = point && range.count <= warpSize;
+    PointLaneTerm term;
+    float point_velocity[1];
+    if (cached)
+        LoadPointSideVelocities(point_side, range, point_masses, {}, wlane, term, point_velocity);
+
     // Both reaction sides participate in geometric push-out, preserving center of mass.
     const float jv = ComputeSlimRowVelocity<true>(
         sr, gslot, j_row, J_sh, J_b_sh, qdot_pseudo_sh, urows,
-        body_pseudo_lin, body_pseudo_ang, point_masses, dof_stride, wlane);
+        body_pseudo_lin, body_pseudo_ang, point_masses, dof_stride, wlane, prepared,
+        cached ? point_velocity : nullptr);
 
     float delta = 0.0f;
     if (wlane == 0u) {
         // Pseudo separating velocity from the penetration, capped at
         // baumgarte_max_velocity (+inf default => byte-identical) for bounded push-out.
-        const float depth = row_penetration[gslot];
         const float bias =
             fminf(beta * fmaxf(depth - slop, 0.0f) / dt, baumgarte_max_velocity);
-        const float effective_mass = row_meff[gslot];
-        const float old_imp = row_pseudo_lambda[gslot];
         // GEOMETRIC projection: no -R*lambda compliance term (this is position,
         // not a compliant force). One-sided (pseudo impulse >= 0).
         const float new_imp = fmaxf(old_imp + effective_mass * (bias - jv), 0.0f);
@@ -1472,11 +1509,18 @@ __device__ bool SolvePositionRowWarp(uint32_t gslot,
     }
     delta = __shfl_sync(0xffffffffu, delta, 0);
     if (apply && delta != 0.0f) {
-        ApplySlimImpulse(sr, gslot, j_row, wlane, delta, env_artic_base, qdot_pseudo_sh,
+        // The point side shares no state with an articulated side, so it may go first.
+        SlimRow rest = sr;
+        if (cached) {
+            ApplyPointLaneImpulse(term, range.count, wlane, delta, point_masses);
+            __syncwarp();
+            rest.code &= ~kSlimHasDyn;
+        }
+        ApplySlimImpulse(rest, gslot, j_row, wlane, delta, env_artic_base, qdot_pseudo_sh,
                          urows, J_sh, w_sh, J_b_sh, w_b_sh,
                          body_pseudo_lin, body_pseudo_ang, body_inv_mass,
                          body_world_inv_inertia, point_masses,
-                         dof_stride);
+                         dof_stride, {}, prepared);
     }
     return delta != 0.0f;
 }
@@ -2288,13 +2332,13 @@ __global__ void SolveRowsBlockIslandKernel(
                 if constexpr (dynamic) {
                     const PointMassView pseudo_points =
                         point_masses.Pseudo(particle_pseudo_vel, grid_pseudo_vel);
-                    free_sweep([&](uint32_t gslot, const NkRow*) {
+                    free_sweep([&](uint32_t gslot, const NkRow* staged) {
                         SolvePositionRowWarp(gslot, env_row_base, env_artic_base, gslot, wlane,
                             row_meff, row_penetration, row_pseudo_lambda, chain_jacobian,
                             row_minv_jt, chain_jacobian_b, row_minv_jt_b, qdot_pseudo_sh, urows,
                             body_pseudo_lin_vel, body_pseudo_ang_vel, body_inv_mass,
                             body_world_inv_inertia, pseudo_points, dof_stride, pos_beta,
-                            pos_slop, dt, baumgarte_max_velocity);
+                            pos_slop, dt, baumgarte_max_velocity, staged);
                     });
                     ordered_sweep([&](uint32_t count) {
                         for (uint32_t s = 0u; s < count; s += nwarps) {
