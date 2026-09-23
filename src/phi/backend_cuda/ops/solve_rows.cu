@@ -777,14 +777,13 @@ struct PreparedContactStep {
 
 // One projected Coulomb step from the six side velocities of a prepared contact.
 __device__ PreparedContactStep ProjectPreparedContact(
-    const NkRow* rows, uint32_t normal_slot, uint32_t first_slot, uint32_t second_slot,
-    const float* lambda, const float* row_damping, const float* side_velocity, float dt,
+    const NkRow* rows, math::Vec3 old, float damping, const float* side_velocity, float dt,
     float tangent_response, float vel_tolerance) {
     const NkRow& normal = rows[0];
-    const float old_normal = lambda[normal_slot];
-    const float old_first = lambda[first_slot];
-    const float old_second = lambda[second_slot];
-    const float damping_scale = 1.0f / (1.0f + row_damping[normal_slot] * dt);
+    const float old_normal = old.x;
+    const float old_first = old.y;
+    const float old_second = old.z;
+    const float damping_scale = 1.0f / (1.0f + damping * dt);
     const float normal_velocity = side_velocity[0] + side_velocity[1];
     const float first_velocity = side_velocity[2] + side_velocity[3];
     const float second_velocity = side_velocity[4] + side_velocity[5];
@@ -835,9 +834,9 @@ __device__ void SolvePreparedContactBlock(
     }
     __syncthreads();
     if (threadIdx.x == 0u) {
-        const PreparedContactStep step = ProjectPreparedContact(rows, normal_slot,
-            tangent_first_slot, tangent_second_slot, lambda, row_damping, side_velocity, dt,
-            tangent_response, vel_tolerance);
+        const PreparedContactStep step = ProjectPreparedContact(rows,
+            {lambda[normal_slot], lambda[tangent_first_slot], lambda[tangent_second_slot]},
+            row_damping[normal_slot], side_velocity, dt, tangent_response, vel_tolerance);
         lambda[normal_slot] = step.impulse.x;
         lambda[tangent_first_slot] = step.impulse.y;
         lambda[tangent_second_slot] = step.impulse.z;
@@ -867,33 +866,117 @@ __device__ void SolvePreparedContactBlock(
     }
 }
 
+// One lane's term of a point side, read once so the apply reuses what the velocity pass loaded.
+struct PointLaneTerm {
+    uint32_t kind = nk::kNkSideStatic;
+    uint32_t index = 0u;
+    math::Vec3 jacobian[3];
+    math::Vec3 velocity;
+    math::Vec3 error;
+    float inverse_mass = 0.0f;
+};
+
+// Axis velocities of a point side whose terms fit one per lane; sums match the uncached pass.
+__device__ math::Vec3 LoadPointSideVelocities(
+    const NkRowSide (&sides)[3], nk::PointEndpointRange range, PointMassView points,
+    VelocityErrorView error, uint32_t lane, PointLaneTerm& term) {
+    float result[3] = {0.0f, 0.0f, 0.0f};
+    const uint32_t i = range.count == 1u ? 0u : lane;
+    if (i < range.count) {
+        if (sides[0].kind == nk::kNkSidePointEndpoint) {
+            const nk::PointEndpointTerm& entry = points.terms[range.first + i];
+            term.kind = entry.kind;
+            term.index = entry.index;
+            #pragma unroll
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                term.jacobian[axis] = entry.TransposeMultiply(sides[axis].jlin);
+        } else {
+            term.kind = sides[0].kind;
+            term.index = sides[0].index;
+            #pragma unroll
+            for (uint32_t axis = 0u; axis < 3u; ++axis) term.jacobian[axis] = sides[axis].jlin;
+        }
+        const math::Vec3* velocity = points.Velocity(term.kind);
+        const float* inverse_mass = points.InverseMass(term.kind);
+        const math::Vec3* compensation = error.Point(term.kind, term.index);
+        if (velocity != nullptr) {
+            term.velocity = velocity[term.index];
+            #pragma unroll
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                result[axis] += term.jacobian[axis].Dot(term.velocity);
+        }
+        if (inverse_mass != nullptr) term.inverse_mass = inverse_mass[term.index];
+        if (compensation != nullptr) term.error = *compensation;
+    }
+    if (range.count == 1u) return {result[0], result[1], result[2]};
+    return {WarpSum(result[0]), WarpSum(result[1]), WarpSum(result[2])};
+}
+
+// No concurrent row writes this lane's term, so its loaded state is still current.
+__device__ void ApplyPointSideTerm(const PointLaneTerm& term, uint32_t count, uint32_t lane,
+                                   math::Vec3 impulse, PointMassView points,
+                                   VelocityErrorView error) {
+    math::Vec3* velocity = points.Velocity(term.kind);
+    if (lane >= count || velocity == nullptr || points.InverseMass(term.kind) == nullptr ||
+        !(term.inverse_mass > 0.0f))
+        return;
+    math::Vec3* compensation = error.Point(term.kind, term.index);
+    math::Vec3 value = term.velocity;
+    math::Vec3 residue = term.error;
+    AddBlockVelocity(value, compensation != nullptr ? &residue : nullptr,
+        term.jacobian[0] * term.inverse_mass, term.jacobian[1] * term.inverse_mass,
+        term.jacobian[2] * term.inverse_mass, impulse);
+    velocity[term.index] = value;
+    if (compensation != nullptr) *compensation = residue;
+}
+
 // One warp solves a prepared contact whose written state no concurrent row touches.
-// Axis rows of the Jacobian sit j_stride apart; the result reports a significant step.
+// Tangent rows, term ranges and old impulses load together; the result reports significance.
 __device__ bool SolvePreparedContactBlockWarp(
-    uint32_t gslot, uint32_t env_artic_base, uint32_t j_row, uint32_t j_stride,
-    uint32_t lane, const NkRow* rows,
+    uint32_t gslot, uint32_t env_artic_base, uint32_t lane, const NkRow* urows, NkRow* rows,
     float* lambda, const float* row_damping, const float* J, const float* minv_j,
     const float* J_b, const float* minv_j_b, float* qdot,
     math::Vec3* body_linear, math::Vec3* body_angular,
     const float* body_inv_mass, const math::SymmetricMat3* body_inv_inertia,
     PointMassView points, uint32_t dofs, float dt, float vel_tolerance,
     VelocityErrorView error) {
-    const NkRow& normal = rows[0];
-    const uint32_t count = normal.group_normal_count;
-    const uint32_t point = (gslot - normal.group_first) % count;
-    const uint32_t normal_slot = normal.group_first + point;
-    const uint32_t tangent_first_slot = normal.group_first + count + point;
-    const uint32_t tangent_second_slot = normal.group_first + 2u * count + point;
-    const math::Vec3 a = ComputePreparedSideVelocities(rows, 0u, j_row, j_stride,
-        env_artic_base, J, J_b, qdot, body_linear, body_angular, points, dofs, lane);
-    const math::Vec3 b = ComputePreparedSideVelocities(rows, 1u, j_row, j_stride,
-        env_artic_base, J, J_b, qdot, body_linear, body_angular, points, dofs, lane);
+    const uint32_t count = rows[0].group_normal_count;
+    const uint32_t point = (gslot - rows[0].group_first) % count;
+    const uint32_t normal_slot = rows[0].group_first + point;
+    const uint32_t tangent_first_slot = normal_slot + count;
+    const uint32_t tangent_second_slot = normal_slot + 2u * count;
+    const NkRowSide side_a = rows[0].a;
+    const bool cached = PointMassView::IsPointSide(side_a.kind);
+    nk::PointEndpointRange range{0u, 1u};
+    if (cached && side_a.kind == nk::kNkSidePointEndpoint) range = points.ranges[side_a.index];
+    const math::Vec3 old{lambda[normal_slot], lambda[tangent_first_slot],
+                         lambda[tangent_second_slot]};
+    const float damping = row_damping[normal_slot];
+    uint32_t first_word;
+    uint32_t second_word;
+    memcpy(&first_word, reinterpret_cast<const unsigned char*>(urows + tangent_first_slot) +
+                        lane * sizeof(first_word), sizeof(first_word));
+    memcpy(&second_word, reinterpret_cast<const unsigned char*>(urows + tangent_second_slot) +
+                         lane * sizeof(second_word), sizeof(second_word));
+    memcpy(reinterpret_cast<unsigned char*>(rows + 1) + lane * sizeof(first_word), &first_word,
+           sizeof(first_word));
+    memcpy(reinterpret_cast<unsigned char*>(rows + 2) + lane * sizeof(second_word), &second_word,
+           sizeof(second_word));
+    __syncwarp();
+    const NkRowSide sides_a[3] = {rows[0].a, rows[1].a, rows[2].a};
+    PointLaneTerm term;
+    const bool fits = cached && range.count <= warpSize;
+    const math::Vec3 a = fits
+        ? LoadPointSideVelocities(sides_a, range, points, error, lane, term)
+        : ComputePreparedSideVelocities(rows, 0u, gslot, count, env_artic_base, J, J_b, qdot,
+              body_linear, body_angular, points, dofs, lane);
+    const math::Vec3 b = ComputePreparedSideVelocities(rows, 1u, gslot, count, env_artic_base,
+        J, J_b, qdot, body_linear, body_angular, points, dofs, lane);
     const float side_velocity[6] = {a.x, b.x, a.y, b.y, a.z, b.z};
     const float tangent_response = constraint::CoulombTangentSpectralResponse(
-        normal.contact_response, normal.mu, normal.friction_secondary);
-    const PreparedContactStep step = ProjectPreparedContact(rows, normal_slot,
-        tangent_first_slot, tangent_second_slot, lambda, row_damping, side_velocity, dt,
-        tangent_response, vel_tolerance);
+        rows[0].contact_response, rows[0].mu, rows[0].friction_secondary);
+    const PreparedContactStep step = ProjectPreparedContact(rows, old, damping, side_velocity,
+        dt, tangent_response, vel_tolerance);
     __syncwarp();
     if (lane == 0u) {
         lambda[normal_slot] = step.impulse.x;
@@ -901,10 +984,15 @@ __device__ bool SolvePreparedContactBlockWarp(
         lambda[tangent_second_slot] = step.impulse.z;
     }
     if (step.changed) {
-        ApplyPreparedContactSide(rows, 0u, j_row, j_stride, env_artic_base, lane, step.delta,
-            qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
-            body_inv_inertia, points, dofs, error);
-        ApplyPreparedContactSide(rows, 1u, j_row, j_stride, env_artic_base, lane, step.delta,
+        if (fits) {
+            ApplyPointSideTerm(term, range.count, lane, step.delta, points, error);
+            __syncwarp();
+        } else {
+            ApplyPreparedContactSide(rows, 0u, gslot, count, env_artic_base, lane, step.delta,
+                qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
+                body_inv_inertia, points, dofs, error);
+        }
+        ApplyPreparedContactSide(rows, 1u, gslot, count, env_artic_base, lane, step.delta,
             qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
             body_inv_inertia, points, dofs, error);
     }
@@ -2030,11 +2118,8 @@ __global__ void SolveRowsBlockIslandKernel(
                 free_sweep([&](uint32_t gslot, NkRow* staged) {
                     bool significant = false;
                     if (staged[0].flags & nk::nk_row_flags::kBlockNormal) {
-                        const uint32_t stride = staged[0].group_normal_count;
-                        StageRowWarp(urows, gslot + stride, staged + 1u, wlane);
-                        StageRowWarp(urows, gslot + 2u * stride, staged + 2u, wlane);
                         significant = SolvePreparedContactBlockWarp(gslot, env_artic_base,
-                            gslot, stride, wlane, staged, lambda, row_damping, chain_jacobian,
+                            wlane, urows, staged, lambda, row_damping, chain_jacobian,
                             row_minv_jt, chain_jacobian_b, row_minv_jt_b, qdot_sh,
                             body_lin_vel, body_ang_vel, body_inv_mass, body_world_inv_inertia,
                             point_masses, dof_stride, dt, vel_tolerance, error);
