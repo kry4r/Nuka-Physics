@@ -210,9 +210,14 @@ struct MpmSortScratchLayout {
     uint64_t transfer_input_off = 0u;
     uint64_t cell_transfer_off = 0u;
     uint64_t contact_hit_mask_off = 0u;
+    uint64_t contact_targets_off = 0u;
+    uint64_t reaction_heads_off = 0u;
+    uint64_t reaction_next_off = 0u;
+    uint64_t reaction_contributions_off = 0u;
     uint64_t total      = 0u;     // full segment byte size.
     MpmSortScratchLayout(uint32_t particle_count, uint32_t node_count,
-                         uint64_t collidables_per_env) {
+                         uint64_t collidables_per_env, uint64_t contact_count,
+                         uint64_t reaction_target_count) {
         const auto sort_bytes_for = [](uint32_t count) {
             size_t bytes = 0u;
             const auto status = cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
@@ -257,13 +262,20 @@ struct MpmSortScratchLayout {
         contact_hit_mask_off = AlignScratch(cell_transfer_off +
             uint64_t{std::min(particle_count, node_count)} * kStencilNodes * sizeof(MpmCellTransfer));
         const uint64_t mask_words = (collidables_per_env + 31u) / 32u;
-        total = AlignScratch(contact_hit_mask_off + uint64_t{particle_count} *
-                             mask_words * sizeof(uint32_t));
+        contact_targets_off = AlignScratch(contact_hit_mask_off + uint64_t{particle_count} *
+                                           mask_words * sizeof(uint32_t));
+        reaction_next_off = AlignScratch(contact_targets_off + contact_count * sizeof(uint32_t));
+        reaction_heads_off = AlignScratch(reaction_next_off + contact_count * sizeof(uint32_t));
+        reaction_contributions_off = AlignScratch(reaction_heads_off +
+            reaction_target_count * kBlockSize * sizeof(uint32_t));
+        total = AlignScratch(reaction_contributions_off +
+            contact_count * sizeof(mpm_contact::ReactionContribution));
     }
 };
 
 const MpmSortScratchLayout& ScratchLayout(uint32_t particle_count, uint32_t node_count,
-                                          uint64_t collidables_per_env) {
+                                          uint64_t collidables_per_env, uint64_t contact_count,
+                                          uint64_t reaction_target_count) {
     int device = -1;
     const auto status = cudaGetDevice(&device);
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
@@ -272,15 +284,20 @@ const MpmSortScratchLayout& ScratchLayout(uint32_t particle_count, uint32_t node
         uint32_t particles;
         uint32_t nodes;
         uint64_t collidables;
+        uint64_t contacts;
+        uint64_t reaction_targets;
         MpmSortScratchLayout layout;
     };
     static thread_local std::vector<Entry> entries;
     for (const auto& entry : entries)
         if (entry.device == device && entry.particles == particle_count &&
-            entry.nodes == node_count && entry.collidables == collidables_per_env)
+            entry.nodes == node_count && entry.collidables == collidables_per_env &&
+            entry.contacts == contact_count && entry.reaction_targets == reaction_target_count)
             return entry.layout;
-    entries.push_back({device, particle_count, node_count, collidables_per_env,
-                       MpmSortScratchLayout(particle_count, node_count, collidables_per_env)});
+    entries.push_back({device, particle_count, node_count, collidables_per_env, contact_count,
+                       reaction_target_count,
+                       MpmSortScratchLayout(particle_count, node_count, collidables_per_env,
+                                            contact_count, reaction_target_count)});
     return entries.back().layout;
 }
 
@@ -1041,11 +1058,17 @@ struct MpmScratch {
     MpmTransferInput* transfer_input = nullptr;
     MpmCellTransfer* cell_transfers = nullptr;
     uint32_t* contact_hit_mask = nullptr;
+    uint32_t* contact_targets = nullptr;
+    uint32_t* reaction_heads = nullptr;
+    uint32_t* reaction_next = nullptr;
+    mpm_contact::ReactionContribution* reaction_contributions = nullptr;
     size_t sort_temp_bytes = 0u;
 };
 MpmScratch PartitionScratch(void* base, uint32_t particle_count, uint32_t node_count,
-                            uint64_t collidables_per_env) {
-    const auto& layout = ScratchLayout(particle_count, node_count, collidables_per_env);
+                            uint64_t collidables_per_env, uint64_t contact_count,
+                            uint64_t reaction_target_count) {
+    const auto& layout = ScratchLayout(particle_count, node_count, collidables_per_env,
+                                       contact_count, reaction_target_count);
     auto* bytes = static_cast<char*>(base);
     MpmScratch scratch;
     scratch.sort_temp = bytes;
@@ -1060,6 +1083,11 @@ MpmScratch PartitionScratch(void* base, uint32_t particle_count, uint32_t node_c
     scratch.transfer_input = reinterpret_cast<MpmTransferInput*>(bytes + layout.transfer_input_off);
     scratch.cell_transfers = reinterpret_cast<MpmCellTransfer*>(bytes + layout.cell_transfer_off);
     scratch.contact_hit_mask = reinterpret_cast<uint32_t*>(bytes + layout.contact_hit_mask_off);
+    scratch.contact_targets = reinterpret_cast<uint32_t*>(bytes + layout.contact_targets_off);
+    scratch.reaction_heads = reinterpret_cast<uint32_t*>(bytes + layout.reaction_heads_off);
+    scratch.reaction_next = reinterpret_cast<uint32_t*>(bytes + layout.reaction_next_off);
+    scratch.reaction_contributions = reinterpret_cast<mpm_contact::ReactionContribution*>(
+        bytes + layout.reaction_contributions_off);
     scratch.sort_temp_bytes = static_cast<size_t>(layout.temp_bytes);
     return scratch;
 }
@@ -1159,8 +1187,18 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
                p, model, data, surfaces, mpm_pe, scratch.contact_hit_mask);
     }
     if constexpr (operation == MpmOperation::Commit) {
+        uint32_t classify_blocks = 0u;
+        if (error == cudaSuccess)
+            error = ResidentGridSize(mpm_contact::ClassifyReactions, kBlockSize, 0u,
+                (p.env_count * p.contact_capacity + kBlockSize - 1u) / kBlockSize, &classify_blocks);
+        launch(MpmStage::ReactionReadout, mpm_contact::ClassifyReactions, classify_blocks,
+               p, model, data, scratch.contact_targets, scratch.reaction_contributions);
+        launch(MpmStage::ReactionReadout, mpm_contact::IndexReactions<kBlockSize>,
+               p.env_count, p, data, scratch.contact_targets, scratch.reaction_heads,
+               scratch.reaction_next);
         launch(MpmStage::ReactionReadout, mpm_contact::ReadReactions<kBlockSize>,
-               p.env_count * (p.bodies_per_env + nk::kMpmBoundaryCount), p, model, data);
+               p.env_count * (p.bodies_per_env + nk::kMpmBoundaryCount), p, model, data,
+               scratch.reaction_heads, scratch.reaction_next, scratch.reaction_contributions);
         launch(MpmStage::G2P, MpmG2PGatherKernel, pblocks,
                mpm_count, Ppe, mpm_pe, p.nodes_per_env, p.grid_dims[0], p.grid_dims[1],
                p.grid_dims[2], inv_dx, p.dx, dt_sub, origin, data.particle_inv_mass,
@@ -1193,6 +1231,7 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
     if (p->contact_capacity == 0u || p->contact_slot_base < p->full_row_slot_count ||
         uint64_t{p->contact_slot_base} + p->contact_capacity > p->contact_slots_per_env ||
         uint64_t{p->contact_slots_per_env} * p->env_count > INT_MAX ||
+        (uint64_t{p->bodies_per_env} + nk::kMpmBoundaryCount) * p->env_count > INT_MAX ||
         !data.ucontact_law || !data.ucontact_friction || !data.grid_contact_attempted ||
         !data.grid_contact_retained || !data.grid_contact_peak || !data.grid_contact_overflow ||
         !data.mpm_boundary_impulse || !data.mpm_boundary_moment)
@@ -1249,7 +1288,9 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
     const uint32_t cpe = static_cast<uint32_t>(cells_per_env);
     const uint32_t total_nodes = static_cast<uint32_t>(total_nodes64);
     const MpmScratch scratch = PartitionScratch(data.mpm_sort_scratch, mpm_count, total_nodes,
-        uint64_t{p->bodies_per_env} + p->particle_surfaces_per_env);
+        uint64_t{p->bodies_per_env} + p->particle_surfaces_per_env,
+        uint64_t{p->contact_capacity} * p->env_count,
+        (uint64_t{p->bodies_per_env} + nk::kMpmBoundaryCount) * p->env_count);
     uint32_t finalize_blocks = 0u, cell_blocks = 0u;
     if constexpr (operation == MpmOperation::Predict) {
         if (ResidentGridSize(MpmGridFinalizeKernel, kBlockSize, 0u,
@@ -1297,11 +1338,14 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
 }  // namespace
 
 uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count,
-                             uint64_t collidables_per_env) {
+                             uint64_t collidables_per_env, uint64_t contact_count,
+                             uint64_t reaction_target_count) {
     if (particle_count == 0u || node_count == 0u ||
-        particle_count > static_cast<uint32_t>(INT_MAX) || node_count > static_cast<uint32_t>(INT_MAX))
+        particle_count > static_cast<uint32_t>(INT_MAX) || node_count > static_cast<uint32_t>(INT_MAX) ||
+        contact_count > INT_MAX || reaction_target_count > INT_MAX)
         return 0u;
-    return ScratchLayout(particle_count, node_count, collidables_per_env).total;
+    return ScratchLayout(particle_count, node_count, collidables_per_env, contact_count,
+                         reaction_target_count).total;
 }
 
 void RegisterNkMpmOps() {

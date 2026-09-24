@@ -489,10 +489,11 @@ struct MpmParams {
     uint32_t point_endpoint_terms_per_env;
 };
 
-// Workspace bytes for the actual MPM particle and grid node counts.
+// Workspace bytes for MPM particles, grid nodes, contacts and body/boundary reaction targets.
 // Query before state allocation; zero particles require no workspace.
 uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count,
-                             uint64_t collidables_per_env);
+                             uint64_t collidables_per_env, uint64_t contact_count,
+                             uint64_t reaction_target_count);
 
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
