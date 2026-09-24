@@ -80,8 +80,6 @@ __device__ void ApplyPointImpulse(const NkRowSide& side, float delta,
 constexpr uint32_t kUnionIslandBlockSize = 64u;
 constexpr uint32_t kPairDrivenIslandBlockSize = 32u;
 constexpr uint32_t kScalarIslandBlockSize = 32u;
-// One block carries the live-row scan so the compacted order stays deterministic.
-constexpr uint32_t kCompactBlockSize = 1024u;
 constexpr uint32_t kScalarIslandGridBlocks = 64u;
 // A colored row spreads at most two owners over each lane of its warp.
 constexpr uint32_t kOwnerKeysPerRow = 64u;
@@ -102,6 +100,7 @@ constexpr uint32_t kColorOverflow = ~1u;
 constexpr uint32_t kColorChain = ~2u;
 // Control words: live and chain-island totals, the color count, then rotating round flags.
 constexpr uint32_t kControlLive = 0u;
+constexpr uint32_t kControlValidRows = 1u;
 constexpr uint32_t kControlChainIslands = 2u;
 constexpr uint32_t kControlColors = 3u;
 constexpr uint32_t kControlPending = 4u;
@@ -915,27 +914,30 @@ struct PreparedContactStep {
     bool significant;
 };
 
-// One projected Coulomb step from the six side velocities of a prepared contact.
-__device__ PreparedContactStep ProjectPreparedContact(
-    const NkRow* rows, math::Vec3 old, float damping, const float* side_velocity, float dt,
+template <bool precomputed_response>
+__device__ PreparedContactStep ContactBlockStep(
+    const NkRow& normal, const NkRow& first, const NkRow& second,
+    math::Vec3 old, float damping, math::Vec3 velocity, float dt,
     float tangent_response, float vel_tolerance) {
-    const NkRow& normal = rows[0];
     const float old_normal = old.x;
     const float old_first = old.y;
     const float old_second = old.z;
     const float damping_scale = 1.0f / (1.0f + damping * dt);
-    const float normal_velocity = side_velocity[0] + side_velocity[1];
-    const float first_velocity = side_velocity[2] + side_velocity[3];
-    const float second_velocity = side_velocity[4] + side_velocity[5];
     const math::Vec3 residual{
-        normal.rhs * dt * damping_scale - normal_velocity -
+        normal.rhs * dt * damping_scale - velocity.x -
             normal.compliance_alpha * damping_scale * old_normal,
-        rows[1].rhs * dt - first_velocity - rows[1].compliance_alpha * old_first,
-        rows[2].rhs * dt - second_velocity - rows[2].compliance_alpha * old_second};
+        first.rhs * dt - velocity.y - first.compliance_alpha * old_first,
+        second.rhs * dt - velocity.z - second.compliance_alpha * old_second};
     PreparedContactStep step;
-    step.impulse = constraint::ProjectedCoulombStepWithResponse(
-        normal.contact_response, residual, {old_normal, old_first, old_second},
-        normal.mu, normal.friction_secondary, tangent_response);
+    if constexpr (precomputed_response) {
+        step.impulse = constraint::ProjectedCoulombStepWithResponse(
+            normal.contact_response, residual, {old_normal, old_first, old_second},
+            normal.mu, normal.friction_secondary, tangent_response);
+    } else {
+        step.impulse = constraint::ProjectedCoulombStep(
+            normal.contact_response, residual, {old_normal, old_first, old_second},
+            normal.mu, normal.friction_secondary);
+    }
     step.delta = {step.impulse.x - old_normal, step.impulse.y - old_first,
                   step.impulse.z - old_second};
     step.changed = step.delta.x != 0.0f || step.delta.y != 0.0f || step.delta.z != 0.0f;
@@ -974,9 +976,11 @@ __device__ void SolvePreparedContactBlock(
     }
     __syncthreads();
     if (threadIdx.x == 0u) {
-        const PreparedContactStep step = ProjectPreparedContact(rows,
+        const PreparedContactStep step = ContactBlockStep<true>(rows[0], rows[1], rows[2],
             {lambda[normal_slot], lambda[tangent_first_slot], lambda[tangent_second_slot]},
-            row_damping[normal_slot], side_velocity, dt, tangent_response, vel_tolerance);
+            row_damping[normal_slot],
+            {side_velocity[0] + side_velocity[1], side_velocity[2] + side_velocity[3],
+             side_velocity[4] + side_velocity[5]}, dt, tangent_response, vel_tolerance);
         lambda[normal_slot] = step.impulse.x;
         lambda[tangent_first_slot] = step.impulse.y;
         lambda[tangent_second_slot] = step.impulse.z;
@@ -1132,8 +1136,8 @@ __device__ bool SolvePreparedContactBlockWarp(
     const float side_velocity[6] = {a.x, b.x, a.y, b.y, a.z, b.z};
     const float tangent_response = constraint::CoulombTangentSpectralResponse(
         rows[0].contact_response, rows[0].mu, rows[0].friction_secondary);
-    const PreparedContactStep step = ProjectPreparedContact(rows, old, damping, side_velocity,
-        dt, tangent_response, vel_tolerance);
+    const PreparedContactStep step = ContactBlockStep<true>(rows[0], rows[1], rows[2],
+        old, damping, {a.x + b.x, a.y + b.y, a.z + b.z}, dt, tangent_response, vel_tolerance);
     __syncwarp();
     if (lane == 0u) {
         lambda[normal_slot] = step.impulse.x;
@@ -1204,73 +1208,40 @@ __device__ void UpdateSpeculativePenetration(
     if (lane == 0u) row_penetration[slot] = fmaxf(row_penetration[slot] - dt * velocity, 0.0f);
 }
 
-// Zero-update islands retain both impulse fields at zero throughout every ordered sweep.
-__global__ void MarkIslandActivityKernel(
-    const NkRow* __restrict__ urows, const float* __restrict__ lambda,
-    const float* __restrict__ row_meff, const float* __restrict__ row_damping,
-    const float* __restrict__ chain_jacobian, const float* __restrict__ chain_jacobian_b,
-    const float* __restrict__ qdot_flat, const math::Vec3* __restrict__ body_lin_vel,
-    const math::Vec3* __restrict__ body_ang_vel, PointMassView point_masses,
-    const uint32_t* __restrict__ row_order, IslandActivityView activity,
-    const float* __restrict__ row_penetration, float* __restrict__ row_pseudo_lambda,
-    uint32_t* __restrict__ live_flags,
-    uint32_t total_rows, uint32_t rows_per_env, uint32_t artics_per_env,
-    uint32_t dof_stride, float dt, float pos_slop) {
-    const uint32_t lane = threadIdx.x % warpSize;
-    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
-    const uint32_t stride = gridDim.x * (blockDim.x / warpSize);
-    for (uint32_t cursor = warp; cursor < total_rows; cursor += stride) {
-        const uint32_t root = activity.sorted_roots[cursor];
-        if (root == ~0u) return;
-        const uint32_t slot = row_order[cursor];
-        if (row_pseudo_lambda != nullptr && lane == 0u) row_pseudo_lambda[slot] = 0.0f;
-        bool active = false;
-        if (row_penetration != nullptr && !(urows[slot].flags & nk::nk_row_flags::kVelocityOnly))
-            active |= row_penetration[slot] > pos_slop;
-        if (!active) {
-            const uint32_t env = slot / rows_per_env;
-            const uint32_t env_artic_base = env * artics_per_env;
-            const float* qdot = qdot_flat != nullptr
-                ? qdot_flat + static_cast<size_t>(env_artic_base) * dof_stride : nullptr;
-            active = RowNeedsVelocitySolveWarp(urows, slot, env * rows_per_env, env_artic_base,
-                lambda, row_meff, row_damping, chain_jacobian, chain_jacobian_b, qdot,
-                body_lin_vel, body_ang_vel, point_masses, dof_stride, dt, lane);
-        }
-        // Scalar islands solve every row in order; only warp-work islands list live rows.
-        const bool warp_work = (activity.needs_solve[root] & kIslandWarpWork) != 0u;
-        if (lane == 0u && live_flags != nullptr) live_flags[cursor] = active && warp_work ? 1u : 0u;
-        if (active && lane == 0u) atomicOr(&activity.needs_solve[root], kIslandNeedsSolve);
-    }
+struct ScalarStepResult {
+    float impulse;
+    float delta;
+};
+
+__device__ __forceinline__ float ScalarRowIncrement(const SlimRow& row, float effective_mass,
+                                                     float damping, float old_impulse,
+                                                     float jv, float dt) {
+    const float rhs_v = row.rhs * dt;
+    const float damping_scale = 1.0f / (1.0f + damping * dt);
+    const float implicit_mass = effective_mass /
+        (1.0f - effective_mass * row.R * (1.0f - damping_scale));
+    return implicit_mass * (rhs_v * damping_scale - jv -
+                            row.R * damping_scale * old_impulse);
 }
 
-// Gather each island's live rows into one ordered list. The sweep then walks only
-// rows that can still change, and live_scan carries each island's slice bounds.
-__global__ void CompactLiveRowsKernel(const uint32_t* __restrict__ sorted_roots,
-                                      const uint32_t* __restrict__ row_order,
-                                      uint32_t* __restrict__ live_scan,
-                                      uint32_t* __restrict__ live_order,
-                                      uint32_t total_rows, uint32_t* __restrict__ live_total) {
-    using BlockScanT = cub::BlockScan<uint32_t, kCompactBlockSize>;
-    __shared__ typename BlockScanT::TempStorage temp;
-    __shared__ uint32_t running, tail_seen;
-    if (threadIdx.x == 0u) { running = 0u; tail_seen = 0u; }
-    __syncthreads();
-    for (uint32_t base = 0u; base < total_rows; base += kCompactBlockSize) {
-        const uint32_t idx = base + threadIdx.x;
-        const bool in_prefix = idx < total_rows && sorted_roots[idx] != ~0u;
-        if (idx < total_rows && !in_prefix) tail_seen = 1u;
-        const uint32_t flag = in_prefix ? live_scan[idx] : 0u;
-        uint32_t inclusive = 0u;
-        BlockScanT(temp).InclusiveSum(flag, inclusive);
-        const uint32_t start = running;
-        if (flag != 0u) live_order[start + inclusive - 1u] = row_order[idx];
-        __syncthreads();
-        if (idx < total_rows) live_scan[idx] = start + inclusive;
-        if (threadIdx.x == kCompactBlockSize - 1u) running = start + inclusive;
-        __syncthreads();
-        if (tail_seen != 0u) break;
-    }
-    if (threadIdx.x == 0u) *live_total = running;
+__device__ __forceinline__ ScalarStepResult ScalarRowStep(float old_impulse,
+                                                            float increment, float lower,
+                                                            float upper) {
+    const float impulse = fminf(fmaxf(old_impulse + increment, lower), upper);
+    return {impulse, impulse - old_impulse};
+}
+
+struct PositionStepResult {
+    float impulse;
+    float delta;
+};
+
+__device__ PositionStepResult PositionRowStep(float depth, float effective_mass,
+                                              float old_impulse, float jv, float beta,
+                                              float slop, float dt, float max_velocity) {
+    const float bias = fminf(beta * fmaxf(depth - slop, 0.0f) / dt, max_velocity);
+    const float impulse = fmaxf(old_impulse + effective_mass * (bias - jv), 0.0f);
+    return {impulse, impulse - old_impulse};
 }
 
 __device__ bool SolveUnionRowWarp(uint32_t ls,            // env-local slot
@@ -1383,33 +1354,21 @@ __device__ bool SolveUnionRowWarp(uint32_t ls,            // env-local slot
             const float normal_damping = damping_sh != nullptr
                 ? damping_sh[block_normal_slot - env_row_base]
                 : row_damping[block_normal_slot];
-            const float damping_scale = 1.0f / (1.0f + normal_damping * dt);
-            const float residual_n = normal.rhs * dt * damping_scale - jv -
-                                     normal.compliance_alpha * damping_scale * block_old_normal;
-            const float residual_t1 = tangent1.rhs * dt - block_jv_tangent1 -
-                                      tangent1.compliance_alpha * block_old_tangent1;
-            const float residual_t2 = tangent2.rhs * dt - block_jv_tangent2 -
-                                      tangent2.compliance_alpha * block_old_tangent2;
-            const auto projected = constraint::ProjectedCoulombStep(normal.contact_response,
-                {residual_n, residual_t1, residual_t2},
-                {block_old_normal, block_old_tangent1, block_old_tangent2}, normal.mu, normal.friction_secondary);
-            const float new_normal = projected.x, new_tangent1 = projected.y, new_tangent2 = projected.z;
+            const PreparedContactStep step = ContactBlockStep<false>(normal, tangent1, tangent2,
+                {block_old_normal, block_old_tangent1, block_old_tangent2}, normal_damping,
+                {jv, block_jv_tangent1, block_jv_tangent2}, dt, 0.0f, vel_tolerance);
+            const float new_normal = step.impulse.x;
+            const float new_tangent1 = step.impulse.y;
+            const float new_tangent2 = step.impulse.z;
             lambda[block_normal_slot] = new_normal;
             lambda[block_tangent1_slot] = new_tangent1;
             lambda[block_tangent2_slot] = new_tangent2;
-            block_delta_normal = new_normal - block_old_normal;
-            block_delta_tangent1 = new_tangent1 - block_old_tangent1;
-            block_delta_tangent2 = new_tangent2 - block_old_tangent2;
+            block_delta_normal = step.delta.x;
+            block_delta_tangent1 = step.delta.y;
+            block_delta_tangent2 = step.delta.z;
         } else {
-            const float rhs_v = sr.rhs * dt;
-            const float damping_scale = 1.0f / (1.0f + damping * dt);
-            // row_meff stores 1/(A+R), also used by the position pass. Convert
-            // locally to 1/(A+R/(1+b*dt)) to match the normalized residual.
-            const float implicit_mass = effective_mass /
-                (1.0f - effective_mass * sr.R * (1.0f - damping_scale));
-            const float lambda_inc =
-                implicit_mass * (rhs_v * damping_scale - jv -
-                                 sr.R * damping_scale * old_impulse);
+            const float lambda_inc = ScalarRowIncrement(
+                sr, effective_mass, damping, old_impulse, jv, dt);
             float lower = sr.lower;
             float upper = sr.upper;
             if (flags & nk::nk_row_flags::kFriction) {
@@ -1423,12 +1382,10 @@ __device__ bool SolveUnionRowWarp(uint32_t ls,            // env-local slot
                 lower = 0.0f;
                 upper = fmaxf(sr.mu, 0.0f) * total;
             }
-            const float new_impulse =
-                fminf(fmaxf(old_impulse + lambda_inc, lower), upper);
-            if (lambda_sh != nullptr) lambda_sh[ls] = new_impulse;
-            else lambda[gslot] = new_impulse;
-            const float d = new_impulse - old_impulse;
-            delta = d;
+            const ScalarStepResult step = ScalarRowStep(old_impulse, lambda_inc, lower, upper);
+            if (lambda_sh != nullptr) lambda_sh[ls] = step.impulse;
+            else lambda[gslot] = step.impulse;
+            delta = step.delta;
         }
     }
     delta = __shfl_sync(0xffffffffu, delta, 0);
@@ -1536,16 +1493,10 @@ __device__ bool SolvePositionRowWarp(uint32_t gslot,
 
     float delta = 0.0f;
     if (wlane == 0u) {
-        // Pseudo separating velocity from the penetration, capped at
-        // baumgarte_max_velocity (+inf default => byte-identical) for bounded push-out.
-        const float bias =
-            fminf(beta * fmaxf(depth - slop, 0.0f) / dt, baumgarte_max_velocity);
-        // GEOMETRIC projection: no -R*lambda compliance term (this is position,
-        // not a compliant force). One-sided (pseudo impulse >= 0).
-        const float new_imp = fmaxf(old_imp + effective_mass * (bias - jv), 0.0f);
-        if constexpr (apply) row_pseudo_lambda[gslot] = new_imp;
-        const float d = new_imp - old_imp;
-        delta = d;
+        const PositionStepResult step = PositionRowStep(depth, effective_mass, old_imp, jv,
+            beta, slop, dt, baumgarte_max_velocity);
+        if constexpr (apply) row_pseudo_lambda[gslot] = step.impulse;
+        delta = step.delta;
     }
     delta = __shfl_sync(0xffffffffu, delta, 0);
     if (apply && delta != 0.0f) {
@@ -2173,11 +2124,6 @@ __device__ inline uint32_t LoadControl(const uint32_t* word) {
     return *reinterpret_cast<const volatile uint32_t*>(word);
 }
 
-__global__ void ClearIslandActivityKernel(uint32_t* __restrict__ needs_solve, uint32_t total_rows) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total_rows) needs_solve[i] &= ~kIslandNeedsSolve;
-}
-
 // Each warp walks 32-wide stripes of live positions and visits those take accepts in order.
 template <typename Take, typename Visit>
 __device__ void ForEachLivePosition(uint32_t live, Take&& take, Visit&& visit) {
@@ -2200,13 +2146,70 @@ __device__ inline LaneOwners LiveRowOwners(const NkRow* urows, uint32_t slot, Po
     return LoadLaneOwners(LoadRowWarp(urows, slot, lane), points, body_inv_mass, s, lane);
 }
 
+struct LivePrepareArgs {
+    const float* lambda = nullptr;
+    const float* row_meff = nullptr;
+    const float* row_damping = nullptr;
+    const float* chain_jacobian = nullptr;
+    const float* chain_jacobian_b = nullptr;
+    const float* qdot_flat = nullptr;
+    const math::Vec3* body_linear = nullptr;
+    const math::Vec3* body_angular = nullptr;
+    const uint32_t* row_order = nullptr;
+    const float* row_penetration = nullptr;
+    float* row_pseudo_lambda = nullptr;
+    uint32_t total_rows = 0u;
+    uint32_t rows_per_env = 0u;
+    uint32_t artics_per_env = 0u;
+    uint32_t dof_stride = 0u;
+    float dt = 0.0f;
+    float pos_slop = 0.0f;
+};
+
+__device__ __noinline__ void MarkLiveRows(const NkRow* urows, PointMassView points,
+                                          IslandActivityView activity, uint32_t* live_scan,
+                                          ColorScratch s, LivePrepareArgs prep) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t warp = thread >> 5u;
+    const uint32_t warp_stride = gridDim.x * (blockDim.x >> 5u);
+    uint32_t valid_end = 0u;
+    for (uint32_t cursor = warp; cursor < prep.total_rows; cursor += warp_stride) {
+        const uint32_t root = activity.sorted_roots[cursor];
+        if (root == ~0u) break;
+        valid_end = cursor + 1u;
+        const uint32_t slot = prep.row_order[cursor];
+        if (prep.row_pseudo_lambda != nullptr && lane == 0u)
+            prep.row_pseudo_lambda[slot] = 0.0f;
+        bool active = false;
+        if (prep.row_penetration != nullptr &&
+            !(urows[slot].flags & nk::nk_row_flags::kVelocityOnly))
+            active |= prep.row_penetration[slot] > prep.pos_slop;
+        if (!active) {
+            const uint32_t env = slot / prep.rows_per_env;
+            const uint32_t env_artic_base = env * prep.artics_per_env;
+            const float* qdot = prep.qdot_flat != nullptr
+                ? prep.qdot_flat + static_cast<size_t>(env_artic_base) * prep.dof_stride : nullptr;
+            active = RowNeedsVelocitySolveWarp(urows, slot, env * prep.rows_per_env,
+                env_artic_base, prep.lambda, prep.row_meff, prep.row_damping,
+                prep.chain_jacobian, prep.chain_jacobian_b, qdot, prep.body_linear,
+                prep.body_angular, points, prep.dof_stride, prep.dt, lane);
+        }
+        const bool warp_work = (activity.needs_solve[root] & kIslandWarpWork) != 0u;
+        if (lane == 0u) live_scan[cursor] = active && warp_work ? 1u : 0u;
+        if (active && lane == 0u) atomicOr(&activity.needs_solve[root], kIslandNeedsSolve);
+    }
+    if (lane == 0u && valid_end != 0u)
+        atomicMax(s.control + kControlValidRows, valid_end);
+}
+
 // Pending rows pick a color free at all their owners; among rows picking one color at a shared
 // owner only the highest priority keeps it. Full palettes open a new epoch of colors.
-__global__ void __launch_bounds__(kColorBlockSize) ColorLiveRowsKernel(
+__global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     const NkRow* __restrict__ urows, PointMassView points, const float* __restrict__ body_inv_mass,
     const uint32_t* __restrict__ islands, const uint32_t* __restrict__ island_count_dev,
-    IslandActivityView activity, const uint32_t* __restrict__ live_scan,
-    const uint32_t* __restrict__ live_order, ColorScratch s) {
+    IslandActivityView activity, uint32_t* __restrict__ live_scan,
+    uint32_t* __restrict__ live_order, ColorScratch s, LivePrepareArgs prep) {
     using BlockScanT = cub::BlockScan<uint32_t, kColorBlockSize>;
     static_assert(kColorSlots % kColorBlockSize == 0u, "colors split evenly over the scan block");
     __shared__ typename BlockScanT::TempStorage scan_temp;
@@ -2216,6 +2219,54 @@ __global__ void __launch_bounds__(kColorBlockSize) ColorLiveRowsKernel(
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t threads = gridDim.x * blockDim.x;
+    if (thread == 0u) s.control[kControlValidRows] = 0u;
+    for (uint32_t i = thread; i < prep.total_rows; i += threads)
+        activity.needs_solve[i] &= ~kIslandNeedsSolve;
+    grid.sync();
+
+    MarkLiveRows(urows, points, activity, live_scan, s, prep);
+    grid.sync();
+
+    const uint32_t valid_rows = s.control[kControlValidRows];
+    const uint32_t tiles = (valid_rows + kColorBlockSize - 1u) / kColorBlockSize;
+    const uint32_t tiles_per_block = (tiles + gridDim.x - 1u) / gridDim.x;
+    const uint32_t begin_row = blockIdx.x * tiles_per_block * kColorBlockSize;
+    const uint32_t end_row = min(valid_rows,
+        begin_row + tiles_per_block * kColorBlockSize);
+    uint32_t running = 0u;
+    for (uint32_t base = begin_row; base < end_row; base += kColorBlockSize) {
+        const uint32_t idx = base + threadIdx.x;
+        const uint32_t flag = idx < valid_rows &&
+            activity.sorted_roots[idx] != ~0u && live_scan[idx] != 0u ? 1u : 0u;
+        uint32_t inclusive = 0u, tile_total = 0u;
+        BlockScanT(scan_temp).InclusiveSum(flag, inclusive, tile_total);
+        if (idx < valid_rows) {
+            s.pos_color[idx] = flag;
+            live_scan[idx] = running + inclusive;
+        }
+        running += tile_total;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) s.block_count[blockIdx.x] = running;
+    grid.sync();
+    if (thread == 0u) {
+        uint32_t total = 0u;
+        for (uint32_t block = 0u; block < gridDim.x; ++block) {
+            const uint32_t count = s.block_count[block];
+            s.block_count[block] = total;
+            total += count;
+        }
+        s.control[kControlLive] = total;
+    }
+    grid.sync();
+    const uint32_t row_base = s.block_count[blockIdx.x];
+    for (uint32_t idx = begin_row + threadIdx.x; idx < end_row; idx += kColorBlockSize) {
+        const uint32_t prefix = row_base + live_scan[idx];
+        live_scan[idx] = prefix;
+        if (s.pos_color[idx] != 0u) live_order[prefix - 1u] = prep.row_order[idx];
+    }
+    grid.sync();
+
     const uint32_t live = s.control[kControlLive];
     for (uint32_t i = thread; i < kColorSlots; i += threads) s.color_cursor[i] = 0u;
     for (uint32_t i = thread; i < s.artic_dofs; i += threads) s.qdot_error[i] = 0.0f;
@@ -2820,23 +2871,14 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
     constexpr uint32_t warps = kColorBlockSize / 32u;
     const size_t solve_shared = sizeof(float) *
         (2u * size_t{k_tiles} * p.max_dof + 4u * 3u * size_t{warps} * p.max_dof + warps);
-    uint32_t color_blocks = 0u;
     uint32_t solve_blocks = 0u;
-    if (ResidentGridSize(ColorLiveRowsKernel, kColorBlockSize, 0u, grid_bound,
-                         &color_blocks) != cudaSuccess ||
-        ResidentGridSize(SolveColoredRowsKernel, kColorBlockSize, solve_shared, grid_bound,
+    if (ResidentGridSize(SolveColoredRowsKernel, kColorBlockSize, solve_shared, grid_bound,
                          &solve_blocks) != cudaSuccess)
         return Status::Failed;
     const PointMassView points{data.particle_inv_mass, data.particle_vel, data.grid_inv_mass,
                                data.grid_velocity, data.point_endpoint_ranges,
                                data.point_endpoint_terms};
     const auto* urows = reinterpret_cast<const NkRow*>(data.urows);
-    if (LaunchCooperativeCuda(ColorLiveRowsKernel, dim3(color_blocks), dim3(kColorBlockSize), 0u,
-            stream, urows, points, static_cast<const float*>(data.body_inv_mass),
-            static_cast<const uint32_t*>(data.island_quads),
-            static_cast<const uint32_t*>(data.island_count), activity, live_scan, live_order,
-            scratch) != cudaSuccess)
-        return Status::Failed;
     ColoredSolveArgs args;
     args.urows = urows;
     args.lambda = data.lambda;
@@ -3009,6 +3051,10 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
+    const uint64_t row_capacity = uint64_t{p->rows_per_env} * p->env_count;
+    if (row_capacity > uint64_t{kOwnerEmpty} -
+            uint64_t{kColorGridLimit} * kColorBlockSize)
+        return Status::InvalidArgument;
     if (p->measure_contact_residual != 0u) {
         if (data.contact_solve_metrics == nullptr || data.contact_solve_counts == nullptr)
             return Status::InvalidArgument;
@@ -3135,34 +3181,46 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             ColorScratch scratch;
             (void)BindColorScratch(*p, data.solve_color_scratch, &scratch);
             if (scratch.control == nullptr) return Status::InvalidArgument;
-            LaunchCuda(ClearIslandActivityKernel, dim3((total_rows + 255u) / 256u), dim3(256u), 0u,
-                       stream, activity.needs_solve, total_rows);
-            constexpr uint32_t activity_block_size = 128u;
-            const uint32_t activity_bound = (total_rows + activity_block_size / 32u - 1u) /
-                                            (activity_block_size / 32u);
-            uint32_t activity_blocks = 0u;
-            if (ResidentGridSize(MarkIslandActivityKernel, activity_block_size, 0u,
-                                 activity_bound, &activity_blocks) != cudaSuccess) return Status::Failed;
-            LaunchCuda(MarkIslandActivityKernel, dim3(activity_blocks),
-                dim3(activity_block_size), 0u, stream,
-                reinterpret_cast<const NkRow*>(data.urows), data.lambda,
-                static_cast<const float*>(data.row_meff), static_cast<const float*>(data.row_damping),
-                static_cast<const float*>(data.chain_jacobian),
-                static_cast<const float*>(data.chain_jacobian_b), data.qdot_flat,
-                data.body_linear_velocity, data.body_angular_velocity,
-                PointMassView{data.particle_inv_mass, data.particle_vel,
-                    data.grid_inv_mass, data.grid_velocity,
-                    data.point_endpoint_ranges, data.point_endpoint_terms},
-                data.island_rows, activity,
-                pos_pass ? data.row_penetration : nullptr,
-                pos_pass ? data.row_pseudo_lambda : nullptr,
-                live_scan,
-                total_rows, p->rows_per_env, artics_per_env, p->max_dof, p->dt, p->pos_slop);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-            LaunchCuda(CompactLiveRowsKernel, dim3(1u), dim3(kCompactBlockSize), 0u, stream,
-                       data.island_root_sorted, data.island_rows, live_scan, live_order,
-                       total_rows, scratch.control + kControlLive);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            LivePrepareArgs prep;
+            prep.lambda = data.lambda;
+            prep.row_meff = static_cast<const float*>(data.row_meff);
+            prep.row_damping = static_cast<const float*>(data.row_damping);
+            prep.chain_jacobian = static_cast<const float*>(data.chain_jacobian);
+            prep.chain_jacobian_b = static_cast<const float*>(data.chain_jacobian_b);
+            prep.qdot_flat = data.qdot_flat;
+            prep.body_linear = data.body_linear_velocity;
+            prep.body_angular = data.body_angular_velocity;
+            prep.row_order = data.island_rows;
+            prep.row_penetration = pos_pass ? data.row_penetration : nullptr;
+            prep.row_pseudo_lambda = pos_pass ? data.row_pseudo_lambda : nullptr;
+            prep.total_rows = total_rows;
+            prep.rows_per_env = p->rows_per_env;
+            prep.artics_per_env = artics_per_env;
+            prep.dof_stride = p->max_dof;
+            prep.dt = p->dt;
+            prep.pos_slop = p->pos_slop;
+            int device = 0, sm_count = 0;
+            if (cudaGetDevice(&device) != cudaSuccess ||
+                cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                       device) != cudaSuccess)
+                return Status::Failed;
+            const uint32_t prepare_bound = static_cast<uint32_t>(std::min<uint64_t>(
+                kColorGridLimit, uint64_t{static_cast<uint32_t>(sm_count)} * kColorBlocksPerSm));
+            uint32_t prepare_blocks = 0u;
+            if (ResidentGridSize(PrepareLiveColorsKernel, kColorBlockSize, 0u,
+                                 prepare_bound, &prepare_blocks) != cudaSuccess)
+                return Status::Failed;
+            if (LaunchCooperativeCuda(PrepareLiveColorsKernel, dim3(prepare_blocks),
+                    dim3(kColorBlockSize), 0u, stream,
+                    reinterpret_cast<const NkRow*>(data.urows),
+                    PointMassView{data.particle_inv_mass, data.particle_vel,
+                        data.grid_inv_mass, data.grid_velocity,
+                        data.point_endpoint_ranges, data.point_endpoint_terms},
+                    static_cast<const float*>(data.body_inv_mass),
+                    static_cast<const uint32_t*>(data.island_quads),
+                    static_cast<const uint32_t*>(data.island_count), activity,
+                    live_scan, live_order, scratch, prep) != cudaSuccess)
+                return Status::Failed;
             const uint32_t scalar_blocks = max_island_bound < kScalarIslandGridBlocks
                 ? max_island_bound : kScalarIslandGridBlocks;
             LaunchCuda(
