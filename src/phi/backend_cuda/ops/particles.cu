@@ -3,6 +3,7 @@
 // Particle integration and projection use stable CSR neighbor lists and arena storage.
 
 #include <cooperative_groups.h>
+#include <cuda/atomic>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -34,83 +35,105 @@ namespace fl = ::nuka::runtime::fluid;
 
 constexpr uint32_t kBlockSize = 128u;
 
+// Internal nodes hold this triangle id until both children are final; escape 0 marks invalid geometry.
+constexpr uint32_t kRefitPending = ~1u;
+
+__device__ inline bool SurfaceOfNode(const ModelView& model, const ParticleSurfacesParams& p,
+                                     uint32_t node, collision::MeshSurfaceInfo* info) {
+    for (uint32_t surface = 0u; surface < p.surfaces_per_env; ++surface) {
+        *info = model.particle_surface_info[surface];
+        if (node >= info->node_offset && node - info->node_offset < info->node_count) return true;
+    }
+    return false;
+}
+
 // Contact geometry and impulse arms share the positions that own momentum.
+// Leaves refit grid-wide; each internal node then waits only for its two preorder children.
 __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView model, DataView data) {
-    const uint32_t task = blockIdx.x;
-    if (task >= p.env_count * p.surfaces_per_env) return;
+    const auto grid = cooperative_groups::this_grid();
     const uint32_t lane = threadIdx.x;
-    const uint32_t env = task / p.surfaces_per_env;
-    const auto info = model.particle_surface_info[task % p.surfaces_per_env];
-    const collision::MeshSurfaceView view{
-        reinterpret_cast<const float*>(data.particle_pos + size_t{env} * p.particles_per_env),
-        model.particle_surface_triangles, model.particle_surface_tree,
-        {p.particles_per_env, p.triangles_per_env, p.nodes_per_env}};
-    auto* nodes = data.particle_surface_nodes + size_t{env} * p.nodes_per_env + info.node_offset;
-    __shared__ uint32_t ready[kBlockSize];
-    __shared__ uint32_t valid;
     __shared__ float warp_speed[kBlockSize / 32u];
-    if (lane == 0u) valid = 1u;
-    float speed_squared = 0.0f;
-    for (uint32_t i = lane; i < info.vertex_count; i += blockDim.x) {
-        const uint32_t particle = env * p.particles_per_env + info.vertex_offset + i;
-        speed_squared = fmaxf(speed_squared, data.particle_vel[particle].LengthSq());
+    for (uint32_t task = blockIdx.x; task < p.env_count * p.surfaces_per_env; task += gridDim.x) {
+        const uint32_t env = task / p.surfaces_per_env;
+        const auto info = model.particle_surface_info[task % p.surfaces_per_env];
+        float speed_squared = 0.0f;
+        for (uint32_t i = lane; i < info.vertex_count; i += blockDim.x) {
+            const uint32_t particle = env * p.particles_per_env + info.vertex_offset + i;
+            speed_squared = fmaxf(speed_squared, data.particle_vel[particle].LengthSq());
+        }
+        for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u)
+            speed_squared = fmaxf(speed_squared, __shfl_down_sync(0xffffffffu, speed_squared, offset));
+        if (lane % warpSize == 0u) warp_speed[lane / warpSize] = speed_squared;
+        __syncthreads();
+        if (lane == 0u) {
+            for (uint32_t i = 0u; i < kBlockSize / 32u; ++i)
+                speed_squared = fmaxf(speed_squared, warp_speed[i]);
+            data.particle_surface_max_speed[task] = sqrtf(speed_squared);
+        }
+        __syncthreads();
     }
-    for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u)
-        speed_squared = fmaxf(speed_squared, __shfl_down_sync(0xffffffffu, speed_squared, offset));
-    if (lane % warpSize == 0u) warp_speed[lane / warpSize] = speed_squared;
-    __syncthreads();
-    if (lane == 0u) {
-        for (uint32_t i = 0u; i < kBlockSize / 32u; ++i)
-            speed_squared = fmaxf(speed_squared, warp_speed[i]);
-        data.particle_surface_max_speed[task] = sqrtf(speed_squared);
-    }
-    // Reverse tiles keep finished child subtrees available while each tile resolves its dependencies.
-    for (uint32_t end = info.node_count; end > 0u;) {
-        const uint32_t count = min(end, blockDim.x);
-        const uint32_t begin = end - count;
-        const uint32_t local = begin + lane;
-        collision::MeshBvhNode node;
-        if (lane < count) node = model.particle_surface_tree[info.node_offset + local];
-        const bool leaf = lane < count && node.triangle != ~0u;
-        if (leaf) {
+    const uint32_t total = p.env_count * p.nodes_per_env;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    const uint32_t first = blockIdx.x * blockDim.x + lane;
+    for (uint32_t item = first; item < total; item += stride) {
+        const uint32_t env = item / p.nodes_per_env;
+        collision::MeshSurfaceInfo info;
+        if (!SurfaceOfNode(model, p, item % p.nodes_per_env, &info)) continue;
+        auto node = model.particle_surface_tree[item % p.nodes_per_env];
+        if (node.triangle == ~0u) {
+            node.triangle = kRefitPending;
+        } else {
+            const collision::MeshSurfaceView view{
+                reinterpret_cast<const float*>(data.particle_pos + size_t{env} * p.particles_per_env),
+                model.particle_surface_triangles, model.particle_surface_tree,
+                {p.particles_per_env, p.triangles_per_env, p.nodes_per_env}};
             math::Vec3 a, b, c;
             if (!collision::MeshSurfaceTriangle(view, info, node.triangle, a, b, c) ||
                 !isfinite(a.LengthSq()) || !isfinite(b.LengthSq()) || !isfinite(c.LengthSq())) {
                 atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                atomicExch(&valid, 0u);
+                node.escape = 0u;
             } else {
                 node.lower = {fminf(a.x, fminf(b.x, c.x)), fminf(a.y, fminf(b.y, c.y)), fminf(a.z, fminf(b.z, c.z))};
                 node.upper = {fmaxf(a.x, fmaxf(b.x, c.x)), fmaxf(a.y, fmaxf(b.y, c.y)), fmaxf(a.z, fmaxf(b.z, c.z))};
             }
-            nodes[local] = node;
         }
-        ready[lane] = leaf || lane >= count;
-        uint32_t pending = __syncthreads_count(ready[lane] == 0u);
-        if (valid == 0u) break;
-        while (pending > 0u) {
-            bool completed = false;
-            if (ready[lane] == 0u) {
-                const uint32_t left_index = local + 1u;
-                const uint32_t right_index = model.particle_surface_tree[info.node_offset + left_index].escape;
-                if ((left_index >= end || ready[left_index - begin] != 0u) &&
-                    (right_index >= end || ready[right_index - begin] != 0u)) {
-                    const auto left = nodes[left_index];
-                    const auto right = nodes[right_index];
-                    node.lower = {fminf(left.lower.x, right.lower.x), fminf(left.lower.y, right.lower.y),
-                                  fminf(left.lower.z, right.lower.z)};
-                    node.upper = {fmaxf(left.upper.x, right.upper.x), fmaxf(left.upper.y, right.upper.y),
-                                  fmaxf(left.upper.z, right.upper.z)};
-                    nodes[local] = node;
-                    completed = true;
-                }
-            }
-            __syncthreads();
-            if (completed) ready[lane] = 1u;
-            pending = __syncthreads_count(ready[lane] == 0u);
-        }
-        end = begin;
+        data.particle_surface_nodes[item] = node;
     }
-    if (valid == 0u && lane == 0u) nodes[0].escape = 0u;
+    grid.sync();
+    // Descending order always leaves the highest pending node with final children, so waits progress.
+    for (uint32_t item = total - 1u - first; item < total; item -= stride) {
+        const uint32_t env = item / p.nodes_per_env;
+        collision::MeshSurfaceInfo info;
+        if (!SurfaceOfNode(model, p, item % p.nodes_per_env, &info)) continue;
+        auto node = model.particle_surface_tree[item % p.nodes_per_env];
+        if (node.triangle != ~0u) continue;
+        auto* nodes = data.particle_surface_nodes + size_t{env} * p.nodes_per_env + info.node_offset;
+        const uint32_t local = item % p.nodes_per_env - info.node_offset;
+        const uint32_t left_index = local + 1u;
+        const uint32_t right_index = left_index < info.node_count
+            ? model.particle_surface_tree[info.node_offset + left_index].escape : 0u;
+        if (right_index <= left_index || right_index >= info.node_count) {
+            node.escape = 0u;
+        } else {
+            const uint32_t children[2] = {left_index, right_index};
+            for (const uint32_t child : children) {
+                cuda::atomic_ref<uint32_t, cuda::thread_scope_device> state(nodes[child].triangle);
+                while (state.load(cuda::memory_order_acquire) == kRefitPending) {}
+            }
+            const auto left = nodes[left_index];
+            const auto right = nodes[right_index];
+            node.lower = {fminf(left.lower.x, right.lower.x), fminf(left.lower.y, right.lower.y),
+                          fminf(left.lower.z, right.lower.z)};
+            node.upper = {fmaxf(left.upper.x, right.upper.x), fmaxf(left.upper.y, right.upper.y),
+                          fmaxf(left.upper.z, right.upper.z)};
+            if (left.escape == 0u || right.escape == 0u) node.escape = 0u;
+        }
+        nodes[local].lower = node.lower;
+        nodes[local].upper = node.upper;
+        nodes[local].escape = node.escape;
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(nodes[local].triangle)
+            .store(~0u, cuda::memory_order_release);
+    }
 }
 
 Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
@@ -122,9 +145,16 @@ Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
         !model.particle_surface_triangles || !data.particle_surface_nodes || !data.particle_pos ||
         !data.particle_vel || !data.particle_surface_max_speed)
         return Status::InvalidArgument;
-    const uint32_t blocks = p->env_count * p->surfaces_per_env;
-    LaunchCuda(RefitParticleSurfacesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream, *p, model, data);
-    return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+    const uint64_t nodes = uint64_t{p->env_count} * p->nodes_per_env;
+    if (nodes > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
+    const uint32_t bound = std::max(p->env_count * p->surfaces_per_env,
+                                    static_cast<uint32_t>((nodes + kBlockSize - 1u) / kBlockSize));
+    uint32_t blocks = 0u;
+    if (RequireCooperativeLaunch() != cudaSuccess ||
+        ResidentGridSize(RefitParticleSurfacesKernel, kBlockSize, 0u, bound, &blocks) != cudaSuccess)
+        return Status::Failed;
+    return LaunchCooperativeCuda(RefitParticleSurfacesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                                 *p, model, data) == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 // Particles are environment-major; the initial per-environment slice contains soft material.
