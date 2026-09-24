@@ -74,12 +74,22 @@ __device__ void Visit(const MpmParams& p, const DataView& data, uint32_t sample,
 
 template <bool emit>
 __global__ void Generate(MpmParams p, ModelView model, DataView data,
-                         nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env) {
+                         nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env,
+                         uint32_t* contact_hit_mask) {
     const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
     if (sample >= p.env_count * mpm_per_env) return;
     const uint32_t env = sample / mpm_per_env;
     const uint32_t particle = env * p.particles_per_env + sample % mpm_per_env;
-    if constexpr (!emit) data.grid_contact_count[sample] = 0u;
+    const size_t mask_words = (uint64_t{p.bodies_per_env} + p.particle_surfaces_per_env + 31u) / 32u;
+    const size_t mask_base = size_t{sample} * mask_words;
+    if constexpr (!emit) {
+        data.grid_contact_count[sample] = 0u;
+        for (size_t word = 0u; word < mask_words; ++word)
+            contact_hit_mask[mask_base + word] = 0u;
+    }
+    if constexpr (emit) {
+        if (data.grid_contact_count[sample] == 0u) return;
+    }
     if (!(data.particle_inv_mass[particle] > 0.0f)) return;
     const math::Vec3 point = data.particle_pos[particle];
     math::Vec3 velocity{};
@@ -112,6 +122,10 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
     uint32_t status = 0u;
     if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u) {
         for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
+            if constexpr (emit) {
+                if ((contact_hit_mask[mask_base + body / 32u] & (1u << (body % 32u))) == 0u)
+                    continue;
+            }
             const auto shape = nkops::LoadPrimShape(model.shape_table, body);
             if ((shape.contype | shape.conaffinity) == 0u) continue;
             const auto owner = nk::ResolveCollidableOwner(shape.body_id, env, body,
@@ -161,6 +175,8 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
             Visit<emit>(p, data, sample, mpm_per_env, count, nk::kUContactSideBody, body, endpoint,
                 point, raw_normal * (1.0f / length), -surface.distance,
                 p.body_mu, surface.feature, body);
+            if constexpr (!emit)
+                contact_hit_mask[mask_base + body / 32u] |= 1u << (body % 32u);
         }
     }
     const collision::MeshSurfaceView particle_surfaces{
@@ -170,6 +186,11 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
             ? data.particle_surface_nodes + size_t{env} * p.particle_surface_nodes_per_env : nullptr,
         {p.particles_per_env, p.particle_surface_triangles, p.particle_surface_nodes_per_env}};
     for (uint32_t mesh = 0u; mesh < p.particle_surfaces_per_env; ++mesh) {
+        const uint64_t bit = uint64_t{p.bodies_per_env} + mesh;
+        if constexpr (emit) {
+            if ((contact_hit_mask[mask_base + bit / 32u] & (1u << (bit % 32u))) == 0u)
+                continue;
+        }
         const auto info = model.particle_surface_info[mesh];
         const float thickness = model.particle_surface_thickness[mesh];
         const float query_distance = p.body_band + thickness + reach + p.dt *
@@ -210,6 +231,8 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
             {constraint::CollidableType::ParticleSurface, constraint::ReactionProviderKind::PointEndpoint,
              env * p.particle_surfaces_per_env + mesh}, point, surface.normal, thickness - surface.distance,
             fmaxf(p.body_mu, model.particle_surface_friction[mesh]), info.triangle_offset + surface.triangle, mesh);
+        if constexpr (!emit)
+            contact_hit_mask[mask_base + bit / 32u] |= 1u << (bit % 32u);
     }
     if constexpr (emit) {
         if (count > 0u) {

@@ -491,7 +491,8 @@ struct MpmParams {
 
 // Workspace bytes for the actual MPM particle and grid node counts.
 // Query before state allocation; zero particles require no workspace.
-uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count);
+uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count,
+                             uint64_t collidables_per_env);
 
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
