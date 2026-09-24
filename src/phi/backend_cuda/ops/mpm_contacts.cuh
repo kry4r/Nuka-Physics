@@ -275,40 +275,94 @@ __global__ void CountDiagnostics(MpmParams p, DataView data, uint32_t mpm_per_en
     if (count > retained) atomicOr(&data.env_status[env], kEnvStatusGridContactOverflow);
 }
 
-// Readout gathers the solver's impulses; it never changes endpoint velocities.
+struct ReactionContribution {
+    math::Vec3 impulse;
+    math::Vec3 moment;
+};
+
+// Each retained contact contributes once to its resolved body or boundary target.
+__global__ void ClassifyReactions(MpmParams p, ModelView model, DataView data, uint32_t* targets,
+                                  ReactionContribution* contributions) {
+    const uint32_t total = p.env_count * p.contact_capacity;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+        const uint32_t env = i / p.contact_capacity;
+        const uint32_t c = i % p.contact_capacity;
+        if (c >= data.grid_contact_retained[env]) continue;
+        const size_t address = static_cast<size_t>(env * p.contact_slots_per_env +
+            p.contact_slot_base + c) * nk::kPairDrivenPtsPerSlot;
+        const uint32_t side = data.ucontact_b[address];
+        const uint32_t kind = data.ucontact_b_kind[address];
+        uint32_t target = ~0u;
+        if (kind == nk::kUContactSideBody) {
+            const auto shape = nkops::LoadPrimShape(model.shape_table, side);
+            const auto owner = nk::ResolveCollidableOwner(shape.body_id, env, side,
+                p.bodies_per_env, p.base_link_count, p.artics_per_env, model.body_to_link,
+                model.body_to_articulation, model.body_collidable_body);
+            const uint32_t local = owner.body - env * p.bodies_per_env;
+            if (local < p.bodies_per_env) target = local;
+        } else if (kind == nk::kUContactSideBoundary && side < nk::kMpmBoundaryCount) {
+            target = p.bodies_per_env + side;
+        }
+        targets[i] = target;
+        if (target == ~0u) continue;
+        const uint32_t local_slot = p.contact_slot_base + c;
+        const uint32_t base = env * p.rows_per_env +
+            p.full_row_slot_count * nk::kPairDrivenRowsPerSlot +
+            (local_slot - p.full_row_slot_count) * nk::kPairDrivenParticleRowsPerSlot;
+        const auto* rows = reinterpret_cast<const nk::NkRow*>(data.urows);
+        math::Vec3 impulse{};
+        for (uint32_t axis = 0u; axis < nk::kPairDrivenParticleRowsPerSlot; ++axis)
+            impulse += rows[base + axis].b.jlin * data.lambda[base + axis];
+        contributions[i] = {impulse, data.ucontact_point[address].Cross(impulse)};
+    }
+}
+
+// Each lane owns disjoint heads; descending insertion preserves the original increasing contact order.
 template <uint32_t block_size>
-__global__ void ReadReactions(MpmParams p, ModelView model, DataView data) {
+__global__ void IndexReactions(MpmParams p, DataView data, const uint32_t* contact_targets,
+                               uint32_t* heads, uint32_t* next) {
+    const uint32_t env = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t targets = p.bodies_per_env + nk::kMpmBoundaryCount;
+    uint32_t* env_heads = heads + size_t{env} * targets * block_size;
+    uint32_t* env_next = next + size_t{env} * p.contact_capacity;
+    const uint32_t* env_targets = contact_targets + size_t{env} * p.contact_capacity;
+    for (uint32_t target = 0u; target < targets; ++target)
+        env_heads[size_t{target} * block_size + lane] = ~0u;
+    const uint32_t retained = data.grid_contact_retained[env];
+    if (lane >= retained) return;
+    uint32_t c = lane + ((retained - 1u - lane) / block_size) * block_size;
+    for (;;) {
+        const uint32_t target = env_targets[c];
+        if (target < targets) {
+            uint32_t& head = env_heads[size_t{target} * block_size + lane];
+            env_next[c] = head;
+            head = c;
+        }
+        if (c < block_size) break;
+        c -= block_size;
+    }
+}
+
+// Readout gathers solver impulses with the original lane assignment and reduction order.
+template <uint32_t block_size>
+__global__ void ReadReactions(MpmParams p, ModelView model, DataView data,
+                              const uint32_t* heads, const uint32_t* next,
+                              const ReactionContribution* contributions) {
     const uint32_t targets = p.bodies_per_env + nk::kMpmBoundaryCount;
     const uint32_t env = blockIdx.x / targets;
     const uint32_t target = blockIdx.x % targets;
     if (env >= p.env_count) return;
     const bool body_target = target < p.bodies_per_env;
     const uint32_t global_body = env * p.bodies_per_env + target;
-    const auto* rows = reinterpret_cast<const nk::NkRow*>(data.urows);
+    const uint32_t* env_next = next + size_t{env} * p.contact_capacity;
+    const ReactionContribution* env_contributions = contributions + size_t{env} * p.contact_capacity;
     double sum[6] = {};
-    for (uint32_t c = threadIdx.x; c < data.grid_contact_retained[env]; c += block_size) {
-        const uint32_t local_slot = p.contact_slot_base + c;
-        const size_t address = static_cast<size_t>(env * p.contact_slots_per_env + local_slot) *
-                                nk::kPairDrivenPtsPerSlot;
-        const uint32_t side = data.ucontact_b[address];
-        const uint32_t kind = data.ucontact_b_kind[address];
-        if (body_target) {
-            if (kind != nk::kUContactSideBody) continue;
-            const auto shape = nkops::LoadPrimShape(model.shape_table, side);
-            const auto owner = nk::ResolveCollidableOwner(shape.body_id, env, side,
-                p.bodies_per_env, p.base_link_count, p.artics_per_env, model.body_to_link,
-                model.body_to_articulation, model.body_collidable_body);
-            if (owner.body != global_body) continue;
-        } else if (kind != nk::kUContactSideBoundary || side != target - p.bodies_per_env) {
-            continue;
-        }
-        const uint32_t base = env * p.rows_per_env +
-            p.full_row_slot_count * nk::kPairDrivenRowsPerSlot +
-            (local_slot - p.full_row_slot_count) * nk::kPairDrivenParticleRowsPerSlot;
-        math::Vec3 impulse{};
-        for (uint32_t axis = 0u; axis < nk::kPairDrivenParticleRowsPerSlot; ++axis)
-            impulse += rows[base + axis].b.jlin * data.lambda[base + axis];
-        const math::Vec3 moment = data.ucontact_point[address].Cross(impulse);
+    for (uint32_t c = heads[size_t{blockIdx.x} * block_size + threadIdx.x];
+         c != ~0u; c = env_next[c]) {
+        const auto contribution = env_contributions[c];
+        const math::Vec3 impulse = contribution.impulse;
+        const math::Vec3 moment = contribution.moment;
         sum[0] += impulse.x; sum[1] += impulse.y; sum[2] += impulse.z;
         sum[3] += moment.x; sum[4] += moment.y; sum[5] += moment.z;
     }

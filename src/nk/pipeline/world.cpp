@@ -169,7 +169,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
             ? phi::MpmSortScratchBytes(static_cast<uint32_t>(mpm_particle_sort_count),
                                         static_cast<uint32_t>(mpm_node_sort_count),
                                         uint64_t{model_.capacities.bodies_per_env} +
-                                            model_.capacities.particle_surfaces_per_env)
+                                            model_.capacities.particle_surfaces_per_env,
+                                        uint64_t{model_.capacities.mpm_contact_capacity_per_env} *
+                                            model_.capacities.env_count,
+                                        (uint64_t{model_.capacities.bodies_per_env} + kMpmBoundaryCount) *
+                                            model_.capacities.env_count)
             : 0u;
 
     // Size the dynamic-island cub radix-sort scratch (BuildSolveIslands) over the
