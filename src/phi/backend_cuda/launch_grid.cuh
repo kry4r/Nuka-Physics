@@ -78,4 +78,39 @@ cudaError_t ResidentGridSize(Kernel kernel, uint32_t block_size, size_t shared_b
     return cudaSuccess;
 }
 
+// Dynamic shared memory a block can take without lowering the occupancy its other limits allow.
+template <typename Kernel>
+cudaError_t SpareSharedBytes(Kernel kernel, uint32_t block_size, size_t* shared_bytes) {
+    if (!shared_bytes || block_size == 0u || block_size > std::numeric_limits<int>::max())
+        return cudaErrorInvalidValue;
+    int device = -1;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    struct Spare {
+        Kernel kernel;
+        int device;
+        uint32_t block_size;
+        size_t bytes;
+    };
+    static thread_local std::vector<Spare> spares;
+    for (const auto& spare : spares) {
+        if (spare.kernel == kernel && spare.device == device && spare.block_size == block_size) {
+            *shared_bytes = spare.bytes;
+            return cudaSuccess;
+        }
+    }
+    int blocks_per_sm = 0;
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel,
+                                                         static_cast<int>(block_size), 0u);
+    if (status != cudaSuccess) return status;
+    if (blocks_per_sm <= 0) return cudaErrorInvalidConfiguration;
+    size_t bytes = 0u;
+    status = cudaOccupancyAvailableDynamicSMemPerBlock(&bytes, kernel, blocks_per_sm,
+                                                       static_cast<int>(block_size));
+    if (status != cudaSuccess) return status;
+    spares.push_back({kernel, device, block_size, bytes});
+    *shared_bytes = bytes;
+    return cudaSuccess;
+}
+
 }  // namespace nuka::phi
