@@ -2124,18 +2124,21 @@ __device__ inline uint32_t LoadControl(const uint32_t* word) {
     return *reinterpret_cast<const volatile uint32_t*>(word);
 }
 
-// Each warp walks 32-wide stripes of live positions and visits those take accepts in order.
+// Lane k of warp w tests position w + k * warps, so the positions take accepts spread over every
+// warp of the grid and each warp visits its own in order.
 template <typename Take, typename Visit>
 __device__ void ForEachLivePosition(uint32_t live, Take&& take, Visit&& visit) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t base = (blockIdx.x * blockDim.x + threadIdx.x) & ~31u; base < live;
+    const uint32_t warps = stride / 32u;
+    for (uint32_t base = (blockIdx.x * blockDim.x + threadIdx.x) / 32u; base < live;
          base += stride) {
-        uint32_t mask = __ballot_sync(0xffffffffu, base + lane < live && take(base + lane));
+        const uint32_t position = base + lane * warps;
+        uint32_t mask = __ballot_sync(0xffffffffu, position < live && take(position));
         while (mask != 0u) {
             const uint32_t bit = static_cast<uint32_t>(__ffs(static_cast<int>(mask))) - 1u;
             mask &= mask - 1u;
-            visit(base + bit);
+            visit(base + bit * warps);
         }
     }
 }
@@ -3199,16 +3202,10 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             prep.dof_stride = p->max_dof;
             prep.dt = p->dt;
             prep.pos_slop = p->pos_slop;
-            int device = 0, sm_count = 0;
-            if (cudaGetDevice(&device) != cudaSuccess ||
-                cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
-                                       device) != cudaSuccess)
-                return Status::Failed;
-            const uint32_t prepare_bound = static_cast<uint32_t>(std::min<uint64_t>(
-                kColorGridLimit, uint64_t{static_cast<uint32_t>(sm_count)} * kColorBlocksPerSm));
+            // Preparing is a chain of dependent loads per row, so it fills every resident slot.
             uint32_t prepare_blocks = 0u;
             if (ResidentGridSize(PrepareLiveColorsKernel, kColorBlockSize, 0u,
-                                 prepare_bound, &prepare_blocks) != cudaSuccess)
+                                 kColorGridLimit, &prepare_blocks) != cudaSuccess)
                 return Status::Failed;
             if (LaunchCooperativeCuda(PrepareLiveColorsKernel, dim3(prepare_blocks),
                     dim3(kColorBlockSize), 0u, stream,
