@@ -1009,6 +1009,12 @@ __device__ float PairDrivenSideCoupling(
     }
 }
 
+// Same-side couplings a caller already summed (bit s for side s) replace their merge.
+struct SharedSideCoupling {
+    uint32_t known = 0u;
+    float value[2] = {0.0f, 0.0f};
+};
+
 __device__ float PairDrivenRowCoupling(
     const NkRow& lhs, uint32_t lhs_row, const NkRow& rhs, uint32_t rhs_row,
     const float* __restrict__ chain_jacobian,
@@ -1017,19 +1023,59 @@ __device__ float PairDrivenRowCoupling(
     const float* __restrict__ row_minv_jt_b,
     const float* __restrict__ body_inv_mass,
     const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
-    PointMassView point_masses, uint32_t dof_stride) {
+    PointMassView point_masses, uint32_t dof_stride, SharedSideCoupling shared = {}) {
     const NkRowSide lhs_sides[2] = {lhs.a, lhs.b};
     const NkRowSide rhs_sides[2] = {rhs.a, rhs.b};
     float coupling = 0.0f;
     for (uint32_t i = 0u; i < 2u; ++i) {
         for (uint32_t j = 0u; j < 2u; ++j) {
-            coupling += PairDrivenSideCoupling(
-                lhs_sides[i], i, lhs_row, rhs_sides[j], j, rhs_row,
-                chain_jacobian, row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                body_inv_mass, body_world_inv_inertia, point_masses, dof_stride);
+            coupling += i == j && ((shared.known >> i) & 1u) != 0u ? shared.value[i]
+                : PairDrivenSideCoupling(
+                      lhs_sides[i], i, lhs_row, rhs_sides[j], j, rhs_row,
+                      chain_jacobian, row_minv_jt, chain_jacobian_b, row_minv_jt_b,
+                      body_inv_mass, body_world_inv_inertia, point_masses, dof_stride);
         }
     }
     return coupling;
+}
+
+// Point couplings of a block's rows on the endpoint all three share, in one pass over its terms;
+// each sum adds terms in the order a pairwise merge does. Order: 11, 22, 01, 02, 12.
+__device__ void SharedPointCouplings(const PointMassView& points, const NkRowSide& side,
+                                     const math::Vec3 (&jlin)[3], float (&coupling)[5]) {
+    for (uint32_t c = 0u; c < 5u; ++c) coupling[c] = 0.0f;
+    const uint32_t count = points.Count(side);
+    for (uint32_t term = 0u; term < count; ++term) {
+        uint32_t kind = side.kind, index = side.index;
+        math::Vec3 u[3] = {jlin[0], jlin[1], jlin[2]};
+        if (side.kind == nk::kNkSidePointEndpoint) {
+            const auto& entry = points.terms[points.ranges[side.index].first + term];
+            kind = entry.kind;
+            index = entry.index;
+            for (uint32_t r = 0u; r < 3u; ++r) u[r] = entry.TransposeMultiply(jlin[r]);
+        }
+        const float* inv_mass = points.InverseMass(kind);
+        if (inv_mass == nullptr) continue;
+        const float m = inv_mass[index];
+        coupling[0] += m * u[1].Dot(u[1]);
+        coupling[1] += m * u[2].Dot(u[2]);
+        coupling[2] += m * u[0].Dot(u[1]);
+        coupling[3] += m * u[0].Dot(u[2]);
+        coupling[4] += m * u[1].Dot(u[2]);
+    }
+}
+
+// Tangent rows a block normal owns.
+__device__ bool BlockTangentRows(const NkRow* urows, uint32_t normal_row, const NkRow& normal,
+                                 uint32_t (&tangent)[2]) {
+    if (!(normal.flags & nk::nk_row_flags::kActive) ||
+        !(normal.flags & nk::nk_row_flags::kBlockNormal))
+        return false;
+    const uint32_t point = (normal_row - normal.group_first) % normal.group_normal_count;
+    tangent[0] = normal.group_first + normal.group_normal_count + point;
+    tangent[1] = normal.group_first + 2u * normal.group_normal_count + point;
+    return (urows[tangent[0]].flags & nk::nk_row_flags::kBlockTangent) &&
+           (urows[tangent[1]].flags & nk::nk_row_flags::kBlockTangent);
 }
 
 __device__ float ContactReferenceVelocity(
@@ -1086,6 +1132,29 @@ __global__ void ComputeRowMeffPairDrivenKernel(
         return;
     }
     NkRow& row = urows[rs];
+    uint32_t tangent_rows[2] = {0u, 0u};
+    const bool block = BlockTangentRows(urows, rs, row, tangent_rows);
+    const uint32_t tangent1_row = tangent_rows[0], tangent2_row = tangent_rows[1];
+    // Pairs 11, 22, 01, 02, 12 of the normal and its tangents.
+    SharedSideCoupling shared[5];
+    if (block) {
+        const NkRow& tangent1 = urows[tangent1_row];
+        const NkRow& tangent2 = urows[tangent2_row];
+        for (uint32_t s = 0u; s < 2u; ++s) {
+            const NkRowSide& side = s == 0u ? row.a : row.b;
+            const NkRowSide& side1 = s == 0u ? tangent1.a : tangent1.b;
+            const NkRowSide& side2 = s == 0u ? tangent2.a : tangent2.b;
+            if (!PointMassView::IsPointSide(side.kind) || side1.kind != side.kind ||
+                side1.index != side.index || side2.kind != side.kind || side2.index != side.index)
+                continue;
+            float coupling[5];
+            SharedPointCouplings(point_masses, side, {side.jlin, side1.jlin, side2.jlin}, coupling);
+            for (uint32_t c = 0u; c < 5u; ++c) {
+                shared[c].known |= 1u << s;
+                shared[c].value[s] = coupling[c];
+            }
+        }
+    }
     float diagonal = PairDrivenRowCoupling(
         row, rs, row, rs, chain_jacobian, row_minv_jt, chain_jacobian_b,
         row_minv_jt_b, body_inv_mass, body_world_inv_inertia, point_masses,
@@ -1103,17 +1172,12 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     diagonal += row.compliance_alpha;
     row_meff[rs] = diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
     if (!(row.flags & nk::nk_row_flags::kBlockNormal)) return;
-
-    const uint32_t point = (rs - row.group_first) % row.group_normal_count;
-    const uint32_t tangent1_row = row.group_first + row.group_normal_count + point;
-    const uint32_t tangent2_row = row.group_first + 2u * row.group_normal_count + point;
-    const NkRow& tangent1 = urows[tangent1_row];
-    const NkRow& tangent2 = urows[tangent2_row];
-    if (!(tangent1.flags & nk::nk_row_flags::kBlockTangent) ||
-        !(tangent2.flags & nk::nk_row_flags::kBlockTangent)) {
+    if (!block) {
         row.contact_response = {};
         return;
     }
+    const NkRow& tangent1 = urows[tangent1_row];
+    const NkRow& tangent2 = urows[tangent2_row];
     // Normalize by (1+b*dt) to retain a symmetric block with R/(1+b*dt).
     // Keep row_meff's A+R for the geometric position pass.
     const float damping_scale = 1.0f / (1.0f + row_damping[rs] * dt);
@@ -1121,38 +1185,38 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     const float k11 = PairDrivenRowCoupling(
         tangent1, tangent1_row, tangent1, tangent1_row, chain_jacobian,
         row_minv_jt, chain_jacobian_b, row_minv_jt_b, body_inv_mass,
-        body_world_inv_inertia, point_masses, dof_stride) + tangent1.compliance_alpha;
+        body_world_inv_inertia, point_masses, dof_stride, shared[0]) + tangent1.compliance_alpha;
     const float k22 = PairDrivenRowCoupling(
         tangent2, tangent2_row, tangent2, tangent2_row, chain_jacobian,
         row_minv_jt, chain_jacobian_b, row_minv_jt_b, body_inv_mass,
-        body_world_inv_inertia, point_masses, dof_stride) + tangent2.compliance_alpha;
+        body_world_inv_inertia, point_masses, dof_stride, shared[1]) + tangent2.compliance_alpha;
     const float k01 = 0.5f * (
         PairDrivenRowCoupling(row, rs, tangent1, tangent1_row, chain_jacobian,
                               row_minv_jt, chain_jacobian_b, row_minv_jt_b,
                               body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride) +
+                              dof_stride, shared[2]) +
         PairDrivenRowCoupling(tangent1, tangent1_row, row, rs, chain_jacobian,
                               row_minv_jt, chain_jacobian_b, row_minv_jt_b,
                               body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride));
+                              dof_stride, shared[2]));
     const float k02 = 0.5f * (
         PairDrivenRowCoupling(row, rs, tangent2, tangent2_row, chain_jacobian,
                               row_minv_jt, chain_jacobian_b, row_minv_jt_b,
                               body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride) +
+                              dof_stride, shared[3]) +
         PairDrivenRowCoupling(tangent2, tangent2_row, row, rs, chain_jacobian,
                               row_minv_jt, chain_jacobian_b, row_minv_jt_b,
                               body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride));
+                              dof_stride, shared[3]));
     const float k12 = 0.5f * (
         PairDrivenRowCoupling(tangent1, tangent1_row, tangent2, tangent2_row,
                               chain_jacobian, row_minv_jt, chain_jacobian_b,
                               row_minv_jt_b, body_inv_mass, body_world_inv_inertia,
-                              point_masses, dof_stride) +
+                              point_masses, dof_stride, shared[4]) +
         PairDrivenRowCoupling(tangent2, tangent2_row, tangent1, tangent1_row,
                               chain_jacobian, row_minv_jt, chain_jacobian_b,
                               row_minv_jt_b, body_inv_mass, body_world_inv_inertia,
-                              point_masses, dof_stride));
+                              point_masses, dof_stride, shared[4]));
     row.contact_response = {k00, k11, k22, k01, k02, k12};
 }
 
