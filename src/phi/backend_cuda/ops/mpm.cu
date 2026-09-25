@@ -210,6 +210,7 @@ struct MpmSortScratchLayout {
     uint64_t transfer_input_off = 0u;
     uint64_t cell_transfer_off = 0u;
     uint64_t contact_hit_mask_off = 0u;
+    uint64_t contact_reach_off = 0u;
     uint64_t contact_targets_off = 0u;
     uint64_t reaction_heads_off = 0u;
     uint64_t reaction_next_off = 0u;
@@ -262,8 +263,10 @@ struct MpmSortScratchLayout {
         contact_hit_mask_off = AlignScratch(cell_transfer_off +
             uint64_t{std::min(particle_count, node_count)} * kStencilNodes * sizeof(MpmCellTransfer));
         const uint64_t mask_words = (collidables_per_env + 31u) / 32u;
-        contact_targets_off = AlignScratch(contact_hit_mask_off + uint64_t{particle_count} *
-                                           mask_words * sizeof(uint32_t));
+        contact_reach_off = AlignScratch(contact_hit_mask_off + uint64_t{particle_count} *
+                                         mask_words * sizeof(uint32_t));
+        contact_targets_off = AlignScratch(contact_reach_off +
+                                           uint64_t{particle_count} * sizeof(float));
         reaction_next_off = AlignScratch(contact_targets_off + contact_count * sizeof(uint32_t));
         reaction_heads_off = AlignScratch(reaction_next_off + contact_count * sizeof(uint32_t));
         reaction_contributions_off = AlignScratch(reaction_heads_off +
@@ -1058,6 +1061,7 @@ struct MpmScratch {
     MpmTransferInput* transfer_input = nullptr;
     MpmCellTransfer* cell_transfers = nullptr;
     uint32_t* contact_hit_mask = nullptr;
+    float* contact_reach = nullptr;
     uint32_t* contact_targets = nullptr;
     uint32_t* reaction_heads = nullptr;
     uint32_t* reaction_next = nullptr;
@@ -1083,6 +1087,7 @@ MpmScratch PartitionScratch(void* base, uint32_t particle_count, uint32_t node_c
     scratch.transfer_input = reinterpret_cast<MpmTransferInput*>(bytes + layout.transfer_input_off);
     scratch.cell_transfers = reinterpret_cast<MpmCellTransfer*>(bytes + layout.cell_transfer_off);
     scratch.contact_hit_mask = reinterpret_cast<uint32_t*>(bytes + layout.contact_hit_mask_off);
+    scratch.contact_reach = reinterpret_cast<float*>(bytes + layout.contact_reach_off);
     scratch.contact_targets = reinterpret_cast<uint32_t*>(bytes + layout.contact_targets_off);
     scratch.reaction_heads = reinterpret_cast<uint32_t*>(bytes + layout.reaction_heads_off);
     scratch.reaction_next = reinterpret_cast<uint32_t*>(bytes + layout.reaction_next_off);
@@ -1172,8 +1177,23 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
         const uint32_t clear_count = p.env_count * std::max(p.contact_capacity, p.point_endpoints_per_env);
         const uint32_t contact_blocks = (clear_count + kBlockSize - 1u) / kBlockSize;
         launch(MpmStage::ContactCount, mpm_contact::ClearSlots, contact_blocks, p, data);
-        launch(MpmStage::ContactCount, mpm_contact::Generate<false>, pblocks,
-               p, model, data, surfaces, mpm_pe, scratch.contact_hit_mask);
+        launch(MpmStage::ContactCount, mpm_contact::PrepareSamples, pblocks,
+               p, data, mpm_pe, scratch.contact_hit_mask, scratch.contact_reach);
+        if (error != cudaSuccess) return error;
+        if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u && p.bodies_per_env > 0u &&
+            pblocks > 0u) {
+            constexpr uint32_t kMaxGridY = 65535u;
+            profiler.Start(MpmStage::ContactCount, stream);
+            LaunchCuda(mpm_contact::QueryBodies, dim3(pblocks, std::min(p.bodies_per_env, kMaxGridY)),
+                       dim3(kBlockSize), 0u, stream, p, model, data, surfaces, mpm_pe,
+                       scratch.contact_hit_mask, static_cast<const float*>(scratch.contact_reach));
+            error = cudaPeekAtLastError();
+            profiler.Stop(MpmStage::ContactCount, stream);
+            if (error != cudaSuccess) return error;
+        }
+        launch(MpmStage::ContactCount, mpm_contact::CountContacts, pblocks,
+               p, model, data, mpm_pe, scratch.contact_hit_mask,
+               static_cast<const float*>(scratch.contact_reach));
         if (error != cudaSuccess) return error;
         size_t temp_bytes = scratch.sort_temp_bytes;
         profiler.Start(MpmStage::ContactScan, stream);
@@ -1183,8 +1203,9 @@ cudaError_t LaunchMpmStage(const MpmParams& p, const ModelView& model,
         if (error != cudaSuccess) return error;
         launch(MpmStage::ContactEmit, mpm_contact::CountDiagnostics,
                (p.env_count + kBlockSize - 1u) / kBlockSize, p, data, mpm_pe);
-        launch(MpmStage::ContactEmit, mpm_contact::Generate<true>, pblocks,
-               p, model, data, surfaces, mpm_pe, scratch.contact_hit_mask);
+        launch(MpmStage::ContactEmit, mpm_contact::EmitContacts, pblocks,
+               p, model, data, surfaces, mpm_pe, scratch.contact_hit_mask,
+               static_cast<const float*>(scratch.contact_reach));
     }
     if constexpr (operation == MpmOperation::Commit) {
         uint32_t classify_blocks = 0u;
