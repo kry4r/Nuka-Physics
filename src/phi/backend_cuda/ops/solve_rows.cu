@@ -2743,6 +2743,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
                 }
             }
         }
+        __syncwarp();
     };
 
     auto chain_velocity = [&](uint32_t first, uint32_t last, uint32_t env_row_base,
