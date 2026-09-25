@@ -159,6 +159,15 @@ __device__ inline BodyHit QueryBody(const MpmParams& p, const ModelView& model,
     return result;
 }
 
+// QueryBodies stores each warp's hits on a body contiguously so emission need not query them
+// again; first is per (sample warp, body), or ~0u when the records were full.
+struct BodyHitCache {
+    BodyHit* records = nullptr;
+    uint32_t* first = nullptr;
+    uint32_t* count = nullptr;
+    uint32_t capacity = 0u;
+};
+
 // Particle surfaces follow bodies; emission writes each hit's triangle endpoint terms.
 template <bool emit>
 __device__ void VisitParticleSurfaces(const MpmParams& p, const ModelView& model,
@@ -230,8 +239,10 @@ __device__ inline size_t ContactMaskWords(const MpmParams& p) {
 // Counting runs per sample, then per (sample, body), then per sample again; the hit mask carries
 // body hits between passes. A negative reach marks samples that make no queries.
 __global__ void PrepareSamples(MpmParams p, DataView data, uint32_t mpm_per_env,
-                               uint32_t* contact_hit_mask, float* sample_reach) {
+                               uint32_t* contact_hit_mask, float* sample_reach,
+                               uint32_t* body_hit_count) {
     const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample == 0u) *body_hit_count = 0u;
     if (sample >= p.env_count * mpm_per_env) return;
     const uint32_t env = sample / mpm_per_env;
     const uint32_t particle = env * p.particles_per_env + sample % mpm_per_env;
@@ -259,18 +270,33 @@ __global__ void PrepareSamples(MpmParams p, DataView data, uint32_t mpm_per_env,
 // Warps share one body, so its shape, owner and pose loads are uniform across the warp.
 __global__ void QueryBodies(MpmParams p, ModelView model, DataView data,
                             nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env,
-                            uint32_t* contact_hit_mask, const float* sample_reach) {
+                            uint32_t* contact_hit_mask, const float* sample_reach,
+                            BodyHitCache cache) {
     const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
-    if (sample >= p.env_count * mpm_per_env) return;
-    const float reach = sample_reach[sample];
-    if (reach < 0.0f) return;
+    const bool active = sample < p.env_count * mpm_per_env && sample_reach[sample] >= 0.0f;
     const uint32_t env = sample / mpm_per_env;
-    const math::Vec3 point = data.particle_pos[env * p.particles_per_env + sample % mpm_per_env];
+    const uint32_t lane = threadIdx.x % warpSize;
+    const math::Vec3 point = active
+        ? data.particle_pos[env * p.particles_per_env + sample % mpm_per_env] : math::Vec3{};
+    const float reach = active ? sample_reach[sample] : 0.0f;
     const size_t mask_base = size_t{sample} * ContactMaskWords(p);
     uint32_t status = 0u;
     for (uint32_t body = blockIdx.y; body < p.bodies_per_env; body += gridDim.y) {
-        if (QueryBody(p, model, data, surfaces, env, body, point, reach, status).hit)
-            atomicOr(&contact_hit_mask[mask_base + body / 32u], 1u << (body % 32u));
+        BodyHit hit;
+        if (active) hit = QueryBody(p, model, data, surfaces, env, body, point, reach, status);
+        if (hit.hit) atomicOr(&contact_hit_mask[mask_base + body / 32u], 1u << (body % 32u));
+        const uint32_t hits = __ballot_sync(~0u, hit.hit);
+        if (hits == 0u) continue;
+        const uint32_t leader = __ffs(hits) - 1u;
+        uint32_t first = 0u;
+        if (lane == leader) {
+            first = atomicAdd(cache.count, static_cast<uint32_t>(__popc(hits)));
+            if (uint64_t{first} + __popc(hits) > cache.capacity) first = ~0u;
+            cache.first[size_t{sample / warpSize} * p.bodies_per_env + body] = first;
+        }
+        first = __shfl_sync(~0u, first, leader);
+        if (hit.hit && first != ~0u)
+            cache.records[first + __popc(hits & ((1u << lane) - 1u))] = hit;
     }
     if (status != 0u) atomicOr(&data.env_status[env], status);
 }
@@ -296,9 +322,21 @@ __global__ void CountContacts(MpmParams p, ModelView model, DataView data, uint3
     if (status != 0u) atomicOr(&data.env_status[env], status);
 }
 
-// Emission revisits only the hits counting found, in the same boundary, body, surface order.
-__global__ void EmitContacts(MpmParams p, ModelView model, DataView data,
-                             nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env,
+// Body hits a sample's mask holds below limit, which precede that body's contact in order.
+__device__ inline uint32_t CountBodyHits(const uint32_t* contact_hit_mask, size_t mask_base,
+                                         uint32_t limit) {
+    uint32_t hits = 0u;
+    for (uint32_t word = 0u; word < limit / 32u; ++word)
+        hits += static_cast<uint32_t>(__popc(contact_hit_mask[mask_base + word]));
+    if (limit % 32u != 0u)
+        hits += static_cast<uint32_t>(__popc(
+            contact_hit_mask[mask_base + limit / 32u] & ((1u << (limit % 32u)) - 1u)));
+    return hits;
+}
+
+// Emission revisits only the hits counting found, in the same boundary, body, surface order;
+// EmitBodyContacts fills the body slots.
+__global__ void EmitContacts(MpmParams p, ModelView model, DataView data, uint32_t mpm_per_env,
                              uint32_t* contact_hit_mask, const float* sample_reach) {
     const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
     if (sample >= p.env_count * mpm_per_env) return;
@@ -309,15 +347,8 @@ __global__ void EmitContacts(MpmParams p, ModelView model, DataView data,
     const size_t mask_base = size_t{sample} * ContactMaskWords(p);
     uint64_t count = 0u;
     VisitBoundaries<true>(p, data, sample, mpm_per_env, count, point, reach);
+    count += CountBodyHits(contact_hit_mask, mask_base, p.bodies_per_env);
     uint32_t status = 0u;
-    // Lanes hitting the same body query it together.
-    for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
-        if ((contact_hit_mask[mask_base + body / 32u] & (1u << (body % 32u))) == 0u) continue;
-        const BodyHit hit = QueryBody(p, model, data, surfaces, env, body, point, reach, status);
-        if (hit.hit)
-            Visit<true>(p, data, sample, mpm_per_env, count, nk::kUContactSideBody, body,
-                hit.endpoint, point, hit.normal, hit.depth, p.body_mu, hit.feature, body);
-    }
     VisitParticleSurfaces<true>(p, model, data, sample, mpm_per_env, count, point, reach,
                                 contact_hit_mask, mask_base, status);
     if (count > 0u) {
@@ -328,6 +359,39 @@ __global__ void EmitContacts(MpmParams p, ModelView model, DataView data,
             data.point_endpoint_terms[first + terms++] = nk::WeightedPointEndpointTerm(nk::kNkSideGrid, node, weight);
         });
         data.point_endpoint_ranges[endpoint] = {first, terms};
+    }
+    if (status != 0u) atomicOr(&data.env_status[env], status);
+}
+
+// Each body hit is written at its ordinal after the sample's boundaries, from the record QueryBodies
+// stored or, when the records were full, from the same query run again.
+__global__ void EmitBodyContacts(MpmParams p, ModelView model, DataView data,
+                                 nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env,
+                                 const uint32_t* contact_hit_mask, const float* sample_reach,
+                                 BodyHitCache cache) {
+    const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool valid = sample < p.env_count * mpm_per_env;
+    const uint32_t env = sample / mpm_per_env;
+    const uint32_t lane = threadIdx.x % warpSize;
+    const size_t mask_base = size_t{sample} * ContactMaskWords(p);
+    uint32_t status = 0u;
+    for (uint32_t body = blockIdx.y; body < p.bodies_per_env; body += gridDim.y) {
+        const bool hit = valid &&
+            (contact_hit_mask[mask_base + body / 32u] & (1u << (body % 32u))) != 0u;
+        const uint32_t hits = __ballot_sync(~0u, hit);
+        if (!hit) continue;
+        const math::Vec3 point = data.particle_pos[env * p.particles_per_env + sample % mpm_per_env];
+        const float reach = sample_reach[sample];
+        uint64_t count = 0u;
+        VisitBoundaries<false>(p, data, sample, mpm_per_env, count, point, reach);
+        count += CountBodyHits(contact_hit_mask, mask_base, body);
+        const uint32_t first = cache.first[size_t{sample / warpSize} * p.bodies_per_env + body];
+        const BodyHit found = first != ~0u
+            ? cache.records[first + __popc(hits & ((1u << lane) - 1u))]
+            : QueryBody(p, model, data, surfaces, env, body, point, reach, status);
+        if (found.hit)
+            Visit<true>(p, data, sample, mpm_per_env, count, nk::kUContactSideBody, body,
+                found.endpoint, point, found.normal, found.depth, p.body_mu, found.feature, body);
     }
     if (status != 0u) atomicOr(&data.env_status[env], status);
 }
