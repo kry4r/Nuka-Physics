@@ -2125,20 +2125,22 @@ __device__ inline uint32_t LoadControl(const uint32_t* word) {
 }
 
 // Lane k of warp w tests position w + k * warps, so the positions take accepts spread over every
-// warp of the grid and each warp visits its own in order.
+// warp of the grid and each warp visits its own in order. Visits also get the position's index m
+// among its warp's positions (position = w + m * warps).
 template <typename Take, typename Visit>
 __device__ void ForEachLivePosition(uint32_t live, Take&& take, Visit&& visit) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t stride = gridDim.x * blockDim.x;
     const uint32_t warps = stride / 32u;
+    uint32_t first = 0u;
     for (uint32_t base = (blockIdx.x * blockDim.x + threadIdx.x) / 32u; base < live;
-         base += stride) {
+         base += stride, first += 32u) {
         const uint32_t position = base + lane * warps;
         uint32_t mask = __ballot_sync(0xffffffffu, position < live && take(position));
         while (mask != 0u) {
             const uint32_t bit = static_cast<uint32_t>(__ffs(static_cast<int>(mask))) - 1u;
             mask &= mask - 1u;
-            visit(base + bit * warps);
+            visit(base + bit * warps, first + bit);
         }
     }
 }
@@ -2165,8 +2167,31 @@ struct LivePrepareArgs {
     uint32_t rows_per_env = 0u;
     uint32_t artics_per_env = 0u;
     uint32_t dof_stride = 0u;
+    uint32_t owner_cache_slots = 0u;  // per warp, in the launch's dynamic shared memory
     float dt = 0.0f;
     float pos_slop = 0.0f;
+};
+
+// The first owner_cache_slots positions of each warp keep their owners in shared memory, one per
+// lane. Later positions, or rows with more owners than lanes, reload them from the row per visit.
+struct WarpOwnerCache {
+    uint32_t* owners = nullptr;
+    uint32_t slots = 0u;
+    uint32_t filled = 0u;  // bit m: position m holds its owners
+
+    __device__ bool Holds(uint32_t m) const { return m < slots && ((filled >> m) & 1u) != 0u; }
+    __device__ void Store(uint32_t m, const LaneOwners& lane_owners, uint32_t lane) {
+        if (m >= slots || !lane_owners.packed ||
+            !__all_sync(0xffffffffu, lane_owners.second == kOwnerEmpty))
+            return;
+        owners[m * 32u + lane] = lane_owners.first;
+        filled |= 1u << m;
+    }
+    __device__ LaneOwners Load(uint32_t m, uint32_t lane) const {
+        LaneOwners result;
+        result.first = owners[m * 32u + lane];
+        return result;
+    }
 };
 
 __device__ __noinline__ void MarkLiveRows(const NkRow* urows, PointMassView points,
@@ -2218,6 +2243,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     __shared__ typename BlockScanT::TempStorage scan_temp;
     __shared__ uint32_t histogram[kColorSlots];
     __shared__ uint32_t block_chain;
+    extern __shared__ uint32_t owner_cache_shared[];
     const auto grid = cooperative_groups::this_grid();
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2274,9 +2300,18 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     for (uint32_t i = thread; i < kColorSlots; i += threads) s.color_cursor[i] = 0u;
     for (uint32_t i = thread; i < s.artic_dofs; i += threads) s.qdot_error[i] = 0.0f;
     if (thread > kControlLive && thread < kControlWords) s.control[thread] = 0u;
-    ForEachLivePosition(live, [](uint32_t) { return true; }, [&](uint32_t position) {
+    WarpOwnerCache cache;
+    cache.slots = min(prep.owner_cache_slots, 32u);
+    cache.owners = owner_cache_shared + (threadIdx.x / 32u) * cache.slots * 32u;
+    const auto owners_at = [&](uint32_t position, uint32_t m) {
+        return cache.Holds(m) ? cache.Load(m, lane)
+                              : LiveRowOwners(urows, live_order[position], points,
+                                              body_inv_mass, s, lane);
+    };
+    ForEachLivePosition(live, [](uint32_t) { return true; }, [&](uint32_t position, uint32_t m) {
         const LaneOwners owners =
             LiveRowOwners(urows, live_order[position], points, body_inv_mass, s, lane);
+        cache.Store(m, owners, lane);
         if (lane == 0u) {
             s.pos_color[position] = owners.packed ? kColorPending : kColorChain;
             s.pos_tent[position] = kOwnerEmpty;
@@ -2294,10 +2329,9 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
             bool overflow = false;
             ForEachLivePosition(live,
                 [&](uint32_t position) { return s.pos_color[position] == kColorPending; },
-                [&](uint32_t position) {
+                [&](uint32_t position, uint32_t m) {
                     const uint32_t slot = live_order[position];
-                    const LaneOwners owners =
-                        LiveRowOwners(urows, slot, points, body_inv_mass, s, lane);
+                    const LaneOwners owners = owners_at(position, m);
                     uint32_t taken[kColorWords] = {};
                     VisitLaneOwners(owners, [&](uint32_t owner) {
                         #pragma unroll
@@ -2325,9 +2359,9 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
                 atomicOr(s.control + kControlOverflow + epoch % 2u, 1u);
             grid.sync();
 
-            ForEachLivePosition(live, tentative, [&](uint32_t position) {
+            ForEachLivePosition(live, tentative, [&](uint32_t position, uint32_t m) {
                 const uint32_t slot = live_order[position];
-                const LaneOwners owners = LiveRowOwners(urows, slot, points, body_inv_mass, s, lane);
+                const LaneOwners owners = owners_at(position, m);
                 const uint32_t color = s.pos_tent[position];
                 const uint32_t priority = MixSlot(slot);
                 VisitLaneOwners(owners, [&](uint32_t owner) {
@@ -2338,9 +2372,9 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
             grid.sync();
 
             bool left = false;
-            ForEachLivePosition(live, tentative, [&](uint32_t position) {
+            ForEachLivePosition(live, tentative, [&](uint32_t position, uint32_t m) {
                 const uint32_t slot = live_order[position];
-                const LaneOwners owners = LiveRowOwners(urows, slot, points, body_inv_mass, s, lane);
+                const LaneOwners owners = owners_at(position, m);
                 const uint32_t color = s.pos_tent[position];
                 const uint32_t priority = MixSlot(slot);
                 const uint32_t bit = 1u << (color % 32u);
@@ -2363,9 +2397,8 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
             grid.sync();
 
             // Every picked word held only this round's picks, so clearing whole words is exact.
-            ForEachLivePosition(live, tentative, [&](uint32_t position) {
-                const LaneOwners owners =
-                    LiveRowOwners(urows, live_order[position], points, body_inv_mass, s, lane);
+            ForEachLivePosition(live, tentative, [&](uint32_t position, uint32_t m) {
+                const LaneOwners owners = owners_at(position, m);
                 const uint32_t color = s.pos_tent[position];
                 VisitLaneOwners(owners, [&](uint32_t owner) {
                     const size_t at = size_t{owner} * kColorWords + color / 32u;
@@ -2383,9 +2416,8 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
         const bool last = !overflow || pending || epoch + 1u == kColorEpochs;
         ForEachLivePosition(live,
             [&](uint32_t position) { return s.pos_color[position] / kColorPalette == epoch; },
-            [&](uint32_t position) {
-                const LaneOwners owners =
-                    LiveRowOwners(urows, live_order[position], points, body_inv_mass, s, lane);
+            [&](uint32_t position, uint32_t m) {
+                const LaneOwners owners = owners_at(position, m);
                 VisitLaneOwners(owners, [&](uint32_t owner) {
                     #pragma unroll
                     for (uint32_t w = 0u; w < kColorWords; ++w)
@@ -3203,12 +3235,21 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             prep.dt = p->dt;
             prep.pos_slop = p->pos_slop;
             // Preparing is a chain of dependent loads per row, so it fills every resident slot.
+            // Owner caches take the shared memory those resident blocks leave unused.
+            size_t spare_shared = 0u;
+            if (SpareSharedBytes(PrepareLiveColorsKernel, kColorBlockSize, &spare_shared) !=
+                cudaSuccess)
+                return Status::Failed;
+            constexpr size_t kOwnerSlotBytes = size_t{kColorBlockSize} * sizeof(uint32_t);
+            prep.owner_cache_slots =
+                static_cast<uint32_t>(std::min<size_t>(spare_shared / kOwnerSlotBytes, 32u));
+            const size_t owner_cache_bytes = prep.owner_cache_slots * kOwnerSlotBytes;
             uint32_t prepare_blocks = 0u;
-            if (ResidentGridSize(PrepareLiveColorsKernel, kColorBlockSize, 0u,
+            if (ResidentGridSize(PrepareLiveColorsKernel, kColorBlockSize, owner_cache_bytes,
                                  kColorGridLimit, &prepare_blocks) != cudaSuccess)
                 return Status::Failed;
             if (LaunchCooperativeCuda(PrepareLiveColorsKernel, dim3(prepare_blocks),
-                    dim3(kColorBlockSize), 0u, stream,
+                    dim3(kColorBlockSize), owner_cache_bytes, stream,
                     reinterpret_cast<const NkRow*>(data.urows),
                     PointMassView{data.particle_inv_mass, data.particle_vel,
                         data.grid_inv_mass, data.grid_velocity,
