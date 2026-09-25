@@ -147,10 +147,14 @@ constexpr uint32_t kSlimPointMass = kSlimDynParticle | kSlimDynGrid | kSlimDynEn
 constexpr uint32_t kSlimFallback = 1u << 5;  // two dynamic sides: read NkRow
 
 // Lanes fetch adjacent words once, then broadcast the row fields needed by the solve.
-__forceinline__ __device__ NkRow LoadRowWarp(const NkRow* rows, uint32_t slot, uint32_t lane) {
+__forceinline__ __device__ uint32_t RowWordWarp(const NkRow* rows, uint32_t slot, uint32_t lane) {
     static_assert(sizeof(NkRow) == 32u * sizeof(uint32_t));
     uint32_t word;
     memcpy(&word, reinterpret_cast<const unsigned char*>(rows + slot) + lane * sizeof(word), sizeof(word));
+    return word;
+}
+
+__forceinline__ __device__ NkRow BroadcastRowWarp(uint32_t word) {
     NkRow result;
     #pragma unroll
     for (uint32_t i = 0u; i < sizeof(NkRow) / sizeof(word); ++i) {
@@ -158,6 +162,10 @@ __forceinline__ __device__ NkRow LoadRowWarp(const NkRow* rows, uint32_t slot, u
         memcpy(reinterpret_cast<unsigned char*>(&result) + i * sizeof(word), &value, sizeof(value));
     }
     return result;
+}
+
+__forceinline__ __device__ NkRow LoadRowWarp(const NkRow* rows, uint32_t slot, uint32_t lane) {
+    return BroadcastRowWarp(RowWordWarp(rows, slot, lane));
 }
 
 __device__ NkRowSide SlimPointSide(const SlimRow& row) {
@@ -1250,20 +1258,13 @@ __device__ bool SolveChainContactBlockWarp(
     return step.significant;
 }
 
-__device__ bool RowNeedsVelocitySolveWarp(
-    const NkRow* urows, uint32_t slot, uint32_t env_row_base, uint32_t env_artic_base,
-    const float* lambda, const float* row_meff, const float* row_damping,
+// Velocity test of an active row whose own and block impulses are all zero.
+__device__ bool RowVelocityNeedsSolveWarp(
+    const NkRow* urows, const NkRow& row, uint32_t slot, uint32_t env_row_base,
+    uint32_t env_artic_base, const float* lambda, const float* row_meff, const float* row_damping,
     const float* chain_jacobian, const float* chain_jacobian_b, const float* qdot,
     const math::Vec3* body_lin_vel, const math::Vec3* body_ang_vel,
-    PointMassView point_masses, uint32_t dof_stride, float dt, uint32_t lane,
-    const NkRow* prepared = nullptr) {
-    const uint32_t flags = prepared != nullptr ? prepared->flags : urows[slot].flags;
-    if (!(flags & nk::nk_row_flags::kActive)) return false;
-    if (lambda[slot] != 0.0f || (flags & nk::nk_row_flags::kFriction)) return true;
-    const NkRow row = prepared != nullptr ? *prepared : LoadRowWarp(urows, slot, lane);
-    if ((row.flags & nk::nk_row_flags::kBlockNormal) &&
-        (lambda[slot + row.group_normal_count] != 0.0f ||
-         lambda[slot + 2u * row.group_normal_count] != 0.0f)) return true;
+    PointMassView point_masses, uint32_t dof_stride, float dt, uint32_t lane) {
     const SlimRow sr = MakeSlimRow(row, env_row_base, env_artic_base);
     const float jv = ComputeSlimRowVelocity<true>(sr, slot, slot,
         chain_jacobian, chain_jacobian_b, qdot, urows, body_lin_vel,
@@ -1278,6 +1279,25 @@ __device__ bool RowNeedsVelocitySolveWarp(
     const float implicit_mass = effective_mass /
         (1.0f - effective_mass * row.compliance_alpha * (1.0f - damping_scale));
     return fminf(fmaxf(old_impulse + implicit_mass * residual, row.lower), row.upper) != 0.0f;
+}
+
+__device__ bool RowNeedsVelocitySolveWarp(
+    const NkRow* urows, uint32_t slot, uint32_t env_row_base, uint32_t env_artic_base,
+    const float* lambda, const float* row_meff, const float* row_damping,
+    const float* chain_jacobian, const float* chain_jacobian_b, const float* qdot,
+    const math::Vec3* body_lin_vel, const math::Vec3* body_ang_vel,
+    PointMassView point_masses, uint32_t dof_stride, float dt, uint32_t lane,
+    const NkRow* prepared = nullptr) {
+    const uint32_t flags = prepared != nullptr ? prepared->flags : urows[slot].flags;
+    if (!(flags & nk::nk_row_flags::kActive)) return false;
+    if (lambda[slot] != 0.0f || (flags & nk::nk_row_flags::kFriction)) return true;
+    const NkRow row = prepared != nullptr ? *prepared : LoadRowWarp(urows, slot, lane);
+    if ((row.flags & nk::nk_row_flags::kBlockNormal) &&
+        (lambda[slot + row.group_normal_count] != 0.0f ||
+         lambda[slot + 2u * row.group_normal_count] != 0.0f)) return true;
+    return RowVelocityNeedsSolveWarp(urows, row, slot, env_row_base, env_artic_base, lambda,
+        row_meff, row_damping, chain_jacobian, chain_jacobian_b, qdot, body_lin_vel, body_ang_vel,
+        point_masses, dof_stride, dt, lane);
 }
 
 template <bool cooperative>
@@ -2284,6 +2304,8 @@ struct WarpOwnerCache {
     }
 };
 
+// Each lane screens one of 32 consecutive rows; rows that no impulse or penetration decides
+// then take the warp's velocity test one after another.
 __device__ __noinline__ void MarkLiveRows(const NkRow* urows, PointMassView points,
                                           IslandActivityView activity, uint32_t* live_scan,
                                           ColorScratch s, LivePrepareArgs prep) {
@@ -2292,30 +2314,61 @@ __device__ __noinline__ void MarkLiveRows(const NkRow* urows, PointMassView poin
     const uint32_t warp = thread >> 5u;
     const uint32_t warp_stride = gridDim.x * (blockDim.x >> 5u);
     uint32_t valid_end = 0u;
-    for (uint32_t cursor = warp; cursor < prep.total_rows; cursor += warp_stride) {
-        const uint32_t root = activity.sorted_roots[cursor];
-        if (root == ~0u) break;
-        valid_end = cursor + 1u;
-        const uint32_t slot = prep.row_order[cursor];
-        if (prep.row_pseudo_lambda != nullptr && lane == 0u)
-            prep.row_pseudo_lambda[slot] = 0.0f;
+    for (uint32_t base = warp * 32u; base < prep.total_rows; base += warp_stride * 32u) {
+        const uint32_t cursor = base + lane;
+        const uint32_t root = cursor < prep.total_rows ? activity.sorted_roots[cursor] : ~0u;
+        const uint32_t valid = __ballot_sync(0xffffffffu, root != ~0u);
+        if (valid == 0u) break;
+        valid_end = base + 32u - static_cast<uint32_t>(__clz(static_cast<int>(valid)));
+        uint32_t slot = 0u;
         bool active = false;
-        if (prep.row_penetration != nullptr &&
-            !(urows[slot].flags & nk::nk_row_flags::kVelocityOnly))
-            active |= prep.row_penetration[slot] > prep.pos_slop;
-        if (!active) {
-            const uint32_t env = slot / prep.rows_per_env;
+        bool decided = true;
+        if (root != ~0u) {
+            slot = prep.row_order[cursor];
+            if (prep.row_pseudo_lambda != nullptr) prep.row_pseudo_lambda[slot] = 0.0f;
+            const uint32_t flags = urows[slot].flags;
+            if (prep.row_penetration != nullptr && !(flags & nk::nk_row_flags::kVelocityOnly))
+                active = prep.row_penetration[slot] > prep.pos_slop;
+            if (!active && (flags & nk::nk_row_flags::kActive)) {
+                active = prep.lambda[slot] != 0.0f || (flags & nk::nk_row_flags::kFriction);
+                if (!active && (flags & nk::nk_row_flags::kBlockNormal)) {
+                    const uint32_t count = urows[slot].group_normal_count;
+                    active = prep.lambda[slot + count] != 0.0f ||
+                             prep.lambda[slot + 2u * count] != 0.0f;
+                }
+                decided = active;
+            }
+        }
+        // Each row's words load while the warp tests the row before it.
+        uint32_t pending = __ballot_sync(0xffffffffu, !decided);
+        uint32_t owner = static_cast<uint32_t>(__ffs(static_cast<int>(pending))) - 1u;
+        uint32_t row_slot = __shfl_sync(0xffffffffu, slot, owner & 31u);
+        uint32_t word = pending != 0u ? RowWordWarp(urows, row_slot, lane) : 0u;
+        while (pending != 0u) {
+            const uint32_t next = pending & (pending - 1u);
+            const uint32_t next_owner = static_cast<uint32_t>(__ffs(static_cast<int>(next))) - 1u;
+            const uint32_t next_slot = __shfl_sync(0xffffffffu, slot, next_owner & 31u);
+            const uint32_t next_word = next != 0u ? RowWordWarp(urows, next_slot, lane) : 0u;
+            const uint32_t env = row_slot / prep.rows_per_env;
             const uint32_t env_artic_base = env * prep.artics_per_env;
             const float* qdot = prep.qdot_flat != nullptr
                 ? prep.qdot_flat + static_cast<size_t>(env_artic_base) * prep.dof_stride : nullptr;
-            active = RowNeedsVelocitySolveWarp(urows, slot, env * prep.rows_per_env,
-                env_artic_base, prep.lambda, prep.row_meff, prep.row_damping,
-                prep.chain_jacobian, prep.chain_jacobian_b, qdot, prep.body_linear,
-                prep.body_angular, points, prep.dof_stride, prep.dt, lane);
+            const NkRow row = BroadcastRowWarp(word);
+            const bool needed = RowVelocityNeedsSolveWarp(urows, row, row_slot,
+                env * prep.rows_per_env, env_artic_base, prep.lambda, prep.row_meff,
+                prep.row_damping, prep.chain_jacobian, prep.chain_jacobian_b, qdot,
+                prep.body_linear, prep.body_angular, points, prep.dof_stride, prep.dt, lane);
+            if (lane == owner) active = needed;
+            pending = next;
+            owner = next_owner;
+            row_slot = next_slot;
+            word = next_word;
         }
-        const bool warp_work = (activity.needs_solve[root] & kIslandWarpWork) != 0u;
-        if (lane == 0u) live_scan[cursor] = active && warp_work ? 1u : 0u;
-        if (active && lane == 0u) atomicOr(&activity.needs_solve[root], kIslandNeedsSolve);
+        if (root != ~0u) {
+            const bool warp_work = (activity.needs_solve[root] & kIslandWarpWork) != 0u;
+            live_scan[cursor] = active && warp_work ? 1u : 0u;
+        }
+        if (root != ~0u && active) atomicOr(&activity.needs_solve[root], kIslandNeedsSolve);
     }
     if (lane == 0u && valid_end != 0u)
         atomicMax(s.control + kControlValidRows, valid_end);
