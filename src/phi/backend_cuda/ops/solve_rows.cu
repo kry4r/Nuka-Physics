@@ -578,32 +578,8 @@ __device__ void ApplySlimContactImpulse(
     }
 }
 
-__device__ float ComputePreparedSideVelocity(
-    const NkRowSide& side, uint32_t j_row, bool side_b, uint32_t env_artic_base,
-    const float* J, const float* J_b, const float* qdot,
-    const math::Vec3* body_linear, const math::Vec3* body_angular,
-    PointMassView points, uint32_t dofs, uint32_t lane) {
-    if (side.kind == kNkSideArtic) {
-        const uint32_t tile = side.index - env_artic_base;
-        const float* source = side_b && J_b != nullptr ? J_b : J;
-        const float* jacobian = source + static_cast<size_t>(j_row) * dofs;
-        const float* velocity = qdot + static_cast<size_t>(tile) * dofs;
-        float result = 0.0f;
-        for (uint32_t k = lane; k < dofs; k += warpSize)
-            result += jacobian[k] * velocity[k];
-        return WarpSum(result);
-    }
-    if (PointMassView::IsPointSide(side.kind))
-        return points.RowVelocityWarp(side, lane);
-    float result = 0.0f;
-    if (side.kind == kNkSideRigid && lane == 0u)
-        result = side.jlin.Dot(body_linear[side.index]) +
-                 side.jang.Dot(body_angular[side.index]);
-    return __shfl_sync(0xffffffffu, result, 0u);
-}
-
 // The three axis rows of a contact side share its state, so one pass reads each
-// velocity once; each axis sums in the same order as ComputePreparedSideVelocity.
+// velocity once; each axis sums in the order a single-axis pass would.
 __device__ math::Vec3 ComputePreparedSideVelocities(
     const NkRow* rows, uint32_t side_index, uint32_t j_row, uint32_t j_stride,
     uint32_t env_artic_base, const float* J, const float* J_b, const float* qdot,
@@ -649,30 +625,6 @@ __device__ math::Vec3 ComputePreparedSideVelocities(
     }
     return {__shfl_sync(0xffffffffu, result[0], 0u), __shfl_sync(0xffffffffu, result[1], 0u),
             __shfl_sync(0xffffffffu, result[2], 0u)};
-}
-
-__device__ bool PreparedSidesDisjoint(
-    const NkRowSide& a, const NkRowSide& b, PointMassView points) {
-    if (a.kind == kNkSideStatic || b.kind == kNkSideStatic) return true;
-    if (a.kind == kNkSideArtic || b.kind == kNkSideArtic ||
-        a.kind == kNkSideRigid || b.kind == kNkSideRigid)
-        return a.kind != b.kind || a.index != b.index;
-    if (!PointMassView::IsPointSide(a.kind) || !PointMassView::IsPointSide(b.kind))
-        return true;
-    uint32_t i = 0u;
-    uint32_t j = 0u;
-    const uint32_t a_count = points.Count(a);
-    const uint32_t b_count = points.Count(b);
-    while (i < a_count && j < b_count) {
-        const auto first = points.At(a, i);
-        const auto second = points.At(b, j);
-        const uint64_t first_key = (uint64_t{first.kind} << 32u) | first.index;
-        const uint64_t second_key = (uint64_t{second.kind} << 32u) | second.index;
-        if (first_key == second_key) return false;
-        if (first_key <= second_key) ++i;
-        if (second_key <= first_key) ++j;
-    }
-    return true;
 }
 
 // A side the apply path never writes carries no aliasing: its impulse is skipped,
@@ -948,68 +900,6 @@ __device__ PreparedContactStep ContactBlockStep(
     return step;
 }
 
-__device__ void SolvePreparedContactBlock(
-    uint32_t gslot, uint32_t env_artic_base, uint32_t j_row,
-    uint32_t warp, uint32_t lane, const NkRow* rows,
-    float* lambda, const float* row_damping, const float* J, const float* minv_j,
-    const float* J_b, const float* minv_j_b, float* qdot,
-    math::Vec3* body_linear, math::Vec3* body_angular,
-    const float* body_inv_mass, const math::SymmetricMat3* body_inv_inertia,
-    PointMassView points, uint32_t dofs, float dt, float tangent_response,
-    float vel_tolerance, VelocityErrorView error,
-    float* side_velocity, float* delta, uint32_t* friction_active,
-    uint32_t* changed, uint32_t* significant) {
-    const NkRow& normal = rows[0];
-    const uint32_t count = normal.group_normal_count;
-    const uint32_t point = (gslot - normal.group_first) % count;
-    const uint32_t normal_slot = normal.group_first + point;
-    const uint32_t tangent_first_slot = normal.group_first + count + point;
-    const uint32_t tangent_second_slot = normal.group_first + 2u * count + point;
-    const uint32_t warps = blockDim.x / warpSize;
-    for (uint32_t component = warp; component < 6u; component += warps) {
-        const uint32_t axis = component / 2u;
-        const uint32_t side = component & 1u;
-        const NkRowSide& descriptor = side == 0u ? rows[axis].a : rows[axis].b;
-        const float velocity = ComputePreparedSideVelocity(descriptor, j_row + axis, side != 0u,
-            env_artic_base, J, J_b, qdot, body_linear, body_angular, points, dofs, lane);
-        if (lane == 0u) side_velocity[2u * axis + side] = velocity;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0u) {
-        const PreparedContactStep step = ContactBlockStep<true>(rows[0], rows[1], rows[2],
-            {lambda[normal_slot], lambda[tangent_first_slot], lambda[tangent_second_slot]},
-            row_damping[normal_slot],
-            {side_velocity[0] + side_velocity[1], side_velocity[2] + side_velocity[3],
-             side_velocity[4] + side_velocity[5]}, dt, tangent_response, vel_tolerance);
-        lambda[normal_slot] = step.impulse.x;
-        lambda[tangent_first_slot] = step.impulse.y;
-        lambda[tangent_second_slot] = step.impulse.z;
-        delta[0] = step.delta.x;
-        delta[1] = step.delta.y;
-        delta[2] = step.delta.z;
-        *changed = step.changed;
-        *significant = step.significant;
-        *friction_active = PreparedSidesDisjoint(rows[0].a, rows[0].b, points) ? 1u : 0u;
-    }
-    __syncthreads();
-    if (*changed != 0u) {
-        const math::Vec3 impulse{delta[0], delta[1], delta[2]};
-        if (*friction_active != 0u) {
-            for (uint32_t side = warp; side < 2u; side += warps)
-                ApplyPreparedContactSide(rows, side, j_row, 1u, env_artic_base, lane, impulse,
-                    qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
-                    body_inv_inertia, points, dofs, error);
-        } else if (warp == 0u) {
-            ApplyPreparedContactSide(rows, 0u, j_row, 1u, env_artic_base, lane, impulse,
-                qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
-                body_inv_inertia, points, dofs, error);
-            ApplyPreparedContactSide(rows, 1u, j_row, 1u, env_artic_base, lane, impulse,
-                qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
-                body_inv_inertia, points, dofs, error);
-        }
-    }
-}
-
 // One lane's term of a point side, read once so the apply reuses what the velocity pass loaded.
 struct PointLaneTerm {
     uint32_t kind = nk::kNkSideStatic;
@@ -1090,7 +980,7 @@ __device__ void ApplyPointSideTerm(const PointLaneTerm& term, uint32_t count, ui
 }
 
 // One warp solves a prepared contact whose written state no concurrent row touches.
-// Tangent rows, term ranges and old impulses load together; the result reports significance.
+// Axis k reads J row j_row + k * j_stride; tangent rows are copied in unless already staged.
 __device__ bool SolvePreparedContactBlockWarp(
     uint32_t gslot, uint32_t env_artic_base, uint32_t lane, const NkRow* urows, NkRow* rows,
     float* lambda, const float* row_damping, const float* J, const float* minv_j,
@@ -1098,7 +988,7 @@ __device__ bool SolvePreparedContactBlockWarp(
     math::Vec3* body_linear, math::Vec3* body_angular,
     const float* body_inv_mass, const math::SymmetricMat3* body_inv_inertia,
     PointMassView points, uint32_t dofs, float dt, float vel_tolerance,
-    VelocityErrorView error) {
+    VelocityErrorView error, uint32_t j_row, uint32_t j_stride, bool tangents_staged) {
     const uint32_t count = rows[0].group_normal_count;
     const uint32_t point = (gslot - rows[0].group_first) % count;
     const uint32_t normal_slot = rows[0].group_first + point;
@@ -1111,17 +1001,19 @@ __device__ bool SolvePreparedContactBlockWarp(
     const math::Vec3 old{lambda[normal_slot], lambda[tangent_first_slot],
                          lambda[tangent_second_slot]};
     const float damping = row_damping[normal_slot];
-    uint32_t first_word;
-    uint32_t second_word;
-    memcpy(&first_word, reinterpret_cast<const unsigned char*>(urows + tangent_first_slot) +
-                        lane * sizeof(first_word), sizeof(first_word));
-    memcpy(&second_word, reinterpret_cast<const unsigned char*>(urows + tangent_second_slot) +
-                         lane * sizeof(second_word), sizeof(second_word));
-    memcpy(reinterpret_cast<unsigned char*>(rows + 1) + lane * sizeof(first_word), &first_word,
-           sizeof(first_word));
-    memcpy(reinterpret_cast<unsigned char*>(rows + 2) + lane * sizeof(second_word), &second_word,
-           sizeof(second_word));
-    __syncwarp();
+    if (!tangents_staged) {
+        uint32_t first_word;
+        uint32_t second_word;
+        memcpy(&first_word, reinterpret_cast<const unsigned char*>(urows + tangent_first_slot) +
+                            lane * sizeof(first_word), sizeof(first_word));
+        memcpy(&second_word, reinterpret_cast<const unsigned char*>(urows + tangent_second_slot) +
+                             lane * sizeof(second_word), sizeof(second_word));
+        memcpy(reinterpret_cast<unsigned char*>(rows + 1) + lane * sizeof(first_word), &first_word,
+               sizeof(first_word));
+        memcpy(reinterpret_cast<unsigned char*>(rows + 2) + lane * sizeof(second_word),
+               &second_word, sizeof(second_word));
+        __syncwarp();
+    }
     const NkRowSide sides_a[3] = {rows[0].a, rows[1].a, rows[2].a};
     PointLaneTerm term;
     const bool fits = cached && range.count <= warpSize;
@@ -1129,11 +1021,10 @@ __device__ bool SolvePreparedContactBlockWarp(
     if (fits) LoadPointSideVelocities(sides_a, range, points, error, lane, term, point_velocity);
     const math::Vec3 a = fits
         ? math::Vec3{point_velocity[0], point_velocity[1], point_velocity[2]}
-        : ComputePreparedSideVelocities(rows, 0u, gslot, count, env_artic_base, J, J_b, qdot,
+        : ComputePreparedSideVelocities(rows, 0u, j_row, j_stride, env_artic_base, J, J_b, qdot,
               body_linear, body_angular, points, dofs, lane);
-    const math::Vec3 b = ComputePreparedSideVelocities(rows, 1u, gslot, count, env_artic_base,
+    const math::Vec3 b = ComputePreparedSideVelocities(rows, 1u, j_row, j_stride, env_artic_base,
         J, J_b, qdot, body_linear, body_angular, points, dofs, lane);
-    const float side_velocity[6] = {a.x, b.x, a.y, b.y, a.z, b.z};
     const float tangent_response = constraint::CoulombTangentSpectralResponse(
         rows[0].contact_response, rows[0].mu, rows[0].friction_secondary);
     const PreparedContactStep step = ContactBlockStep<true>(rows[0], rows[1], rows[2],
@@ -1149,13 +1040,212 @@ __device__ bool SolvePreparedContactBlockWarp(
             ApplyPointSideTerm(term, range.count, lane, step.delta, points, error);
             __syncwarp();
         } else {
-            ApplyPreparedContactSide(rows, 0u, gslot, count, env_artic_base, lane, step.delta,
+            ApplyPreparedContactSide(rows, 0u, j_row, j_stride, env_artic_base, lane, step.delta,
                 qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
                 body_inv_inertia, points, dofs, error);
         }
-        ApplyPreparedContactSide(rows, 1u, gslot, count, env_artic_base, lane, step.delta,
+        ApplyPreparedContactSide(rows, 1u, j_row, j_stride, env_artic_base, lane, step.delta,
             qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
             body_inv_inertia, points, dofs, error);
+    }
+    return step.significant;
+}
+
+// Every lane of every staged row can name a distinct point mass, so a batch always fits.
+constexpr uint32_t kChainCacheEntries = kColorBlockSize;
+constexpr unsigned long long kChainCacheEmpty = ~0ull;
+constexpr uint32_t kChainLaneTerm = 1u << 31u;
+constexpr uint32_t kChainLaneVelocity = 1u << 30u;
+constexpr uint32_t kChainLaneError = 1u << 29u;
+constexpr uint32_t kChainLaneEntry = 0xffffu;
+constexpr uint32_t kChainNoPointSide = 2u;
+constexpr uint32_t kChainRowScalars = 5u;
+static_assert((kChainCacheEntries & (kChainCacheEntries - 1u)) == 0u, "entries probe by mask");
+
+// One chain batch's point masses, staged once so its ordered rows read shared copies and
+// write each update through. Per row: point side, old impulses, damping, tangent response.
+struct ChainPointCache {
+    unsigned long long* key = nullptr;
+    float* velocity = nullptr;
+    float* error = nullptr;
+    float* inverse_mass = nullptr;
+    uint32_t* lane = nullptr;
+    float* jacobian = nullptr;
+    uint32_t* shape = nullptr;
+    float* scalar = nullptr;
+};
+
+// Stages a block normal's point side and old impulses; false when a point side is not cacheable.
+__device__ bool StageChainPoints(const NkRow* rows, uint32_t gslot, uint32_t row, uint32_t lane,
+                                 ChainPointCache cache, PointMassView points,
+                                 VelocityErrorView error, const float* lambda,
+                                 const float* row_damping) {
+    const NkRow& normal = rows[0];
+    const bool point_a = PointMassView::IsPointSide(normal.a.kind);
+    const bool point_b = PointMassView::IsPointSide(normal.b.kind);
+    if (normal.flags & nk::nk_row_flags::kBlockTangent) return true;
+    if (!(normal.flags & nk::nk_row_flags::kBlockNormal)) return !point_a && !point_b;
+    if (point_a && point_b) return false;
+    const uint32_t side = point_a ? 0u : (point_b ? 1u : kChainNoPointSide);
+    const NkRowSide sides[3] = {
+        side == 0u ? rows[0].a : rows[0].b,
+        side == 0u ? rows[1].a : rows[1].b,
+        side == 0u ? rows[2].a : rows[2].b};
+    const uint32_t count = side == kChainNoPointSide ? 0u : points.Count(sides[0]);
+    if (count > warpSize) return false;
+    uint32_t word = 0u;
+    if (lane < count) {
+        uint32_t kind = sides[0].kind;
+        uint32_t index = sides[0].index;
+        math::Vec3 jacobian[3] = {sides[0].jlin, sides[1].jlin, sides[2].jlin};
+        if (kind == nk::kNkSidePointEndpoint) {
+            const nk::PointEndpointTerm& entry = points.terms[points.ranges[index].first + lane];
+            kind = entry.kind;
+            index = entry.index;
+            #pragma unroll
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                jacobian[axis] = entry.TransposeMultiply(sides[axis].jlin);
+        }
+        const unsigned long long key = (static_cast<unsigned long long>(kind) << 32u) | index;
+        uint32_t at = MixSlot(index ^ (kind << 28u)) & (kChainCacheEntries - 1u);
+        unsigned long long prior = atomicCAS(cache.key + at, kChainCacheEmpty, key);
+        while (prior != kChainCacheEmpty && prior != key) {
+            at = (at + 1u) & (kChainCacheEntries - 1u);
+            prior = atomicCAS(cache.key + at, kChainCacheEmpty, key);
+        }
+        const math::Vec3* velocity = points.Velocity(kind);
+        const float* inverse_mass = points.InverseMass(kind);
+        const math::Vec3* compensation = error.Point(kind, index);
+        if (prior == kChainCacheEmpty) {
+            const math::Vec3 value = velocity != nullptr ? velocity[index] : math::Vec3{};
+            const math::Vec3 residue = compensation != nullptr ? *compensation : math::Vec3{};
+            cache.velocity[3u * at] = value.x;
+            cache.velocity[3u * at + 1u] = value.y;
+            cache.velocity[3u * at + 2u] = value.z;
+            cache.error[3u * at] = residue.x;
+            cache.error[3u * at + 1u] = residue.y;
+            cache.error[3u * at + 2u] = residue.z;
+            cache.inverse_mass[at] = velocity != nullptr && inverse_mass != nullptr
+                ? inverse_mass[index] : 0.0f;
+        }
+        word = at | kChainLaneTerm | (velocity != nullptr ? kChainLaneVelocity : 0u) |
+               (compensation != nullptr ? kChainLaneError : 0u);
+        float* const staged = cache.jacobian + 9u * (row * warpSize + lane);
+        #pragma unroll
+        for (uint32_t axis = 0u; axis < 3u; ++axis) {
+            staged[3u * axis] = jacobian[axis].x;
+            staged[3u * axis + 1u] = jacobian[axis].y;
+            staged[3u * axis + 2u] = jacobian[axis].z;
+        }
+    }
+    cache.lane[row * warpSize + lane] = word;
+    if (lane == 0u) {
+        const uint32_t normal_count = normal.group_normal_count;
+        const uint32_t normal_slot = normal.group_first + (gslot - normal.group_first) % normal_count;
+        float* const scalar = cache.scalar + row * kChainRowScalars;
+        scalar[0] = lambda[normal_slot];
+        scalar[1] = lambda[normal_slot + normal_count];
+        scalar[2] = lambda[normal_slot + 2u * normal_count];
+        scalar[3] = row_damping[normal_slot];
+        scalar[4] = constraint::CoulombTangentSpectralResponse(
+            normal.contact_response, normal.mu, normal.friction_secondary);
+        cache.shape[row] = count | (side << 16u);
+    }
+    return true;
+}
+
+__device__ inline math::Vec3 ChainLaneJacobian(const ChainPointCache& cache, uint32_t term,
+                                               uint32_t axis) {
+    const float* staged = cache.jacobian + 9u * term + 3u * axis;
+    return {staged[0], staged[1], staged[2]};
+}
+
+// A staged chain contact: its point side and old impulses come from the batch cache, and the
+// sums, step and side order match SolvePreparedContactBlockWarp.
+__device__ bool SolveChainContactBlockWarp(
+    uint32_t gslot, uint32_t row, uint32_t env_artic_base, uint32_t lane, const NkRow* rows,
+    const ChainPointCache& cache, float* lambda, const float* J, const float* minv_j,
+    const float* J_b, const float* minv_j_b, float* qdot, math::Vec3* body_linear,
+    math::Vec3* body_angular, const float* body_inv_mass,
+    const math::SymmetricMat3* body_inv_inertia, PointMassView points, uint32_t dofs, float dt,
+    float vel_tolerance, VelocityErrorView error, uint32_t j_row) {
+    const uint32_t shape = cache.shape[row];
+    const uint32_t count = shape & 0xffffu;
+    const uint32_t point_side = shape >> 16u;
+    const uint32_t term = row * warpSize + (count == 1u ? 0u : lane);
+    const uint32_t word = cache.lane[term];
+    const uint32_t at = word & kChainLaneEntry;
+    const float* scalar = cache.scalar + row * kChainRowScalars;
+    math::Vec3 side_velocity[2];
+    #pragma unroll
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        if (side != point_side) {
+            side_velocity[side] = ComputePreparedSideVelocities(rows, side, j_row, 1u,
+                env_artic_base, J, J_b, qdot, body_linear, body_angular, points, dofs, lane);
+            continue;
+        }
+        float result[3] = {0.0f, 0.0f, 0.0f};
+        if (word & kChainLaneVelocity) {
+            const math::Vec3 value{cache.velocity[3u * at], cache.velocity[3u * at + 1u],
+                                   cache.velocity[3u * at + 2u]};
+            #pragma unroll
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                result[axis] += ChainLaneJacobian(cache, term, axis).Dot(value);
+        }
+        side_velocity[side] = count == 1u
+            ? math::Vec3{result[0], result[1], result[2]}
+            : math::Vec3{WarpSum(result[0]), WarpSum(result[1]), WarpSum(result[2])};
+    }
+    const math::Vec3 a = side_velocity[0];
+    const math::Vec3 b = side_velocity[1];
+    const PreparedContactStep step = ContactBlockStep<true>(rows[0], rows[1], rows[2],
+        {scalar[0], scalar[1], scalar[2]}, scalar[3], {a.x + b.x, a.y + b.y, a.z + b.z}, dt,
+        scalar[4], vel_tolerance);
+    __syncwarp();
+    if (lane == 0u) {
+        const uint32_t normal_count = rows[0].group_normal_count;
+        const uint32_t normal_slot =
+            rows[0].group_first + (gslot - rows[0].group_first) % normal_count;
+        lambda[normal_slot] = step.impulse.x;
+        lambda[normal_slot + normal_count] = step.impulse.y;
+        lambda[normal_slot + 2u * normal_count] = step.impulse.z;
+    }
+    if (!step.changed) return step.significant;
+    #pragma unroll
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        if (side != point_side) {
+            ApplyPreparedContactSide(rows, side, j_row, 1u, env_artic_base, lane, step.delta,
+                qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
+                body_inv_inertia, points, dofs, error);
+            continue;
+        }
+        const float inverse_mass =
+            lane < count && (word & kChainLaneTerm) ? cache.inverse_mass[at] : 0.0f;
+        if (inverse_mass > 0.0f) {
+            const bool compensated = (word & kChainLaneError) != 0u;
+            math::Vec3 value{cache.velocity[3u * at], cache.velocity[3u * at + 1u],
+                             cache.velocity[3u * at + 2u]};
+            math::Vec3 residue{cache.error[3u * at], cache.error[3u * at + 1u],
+                               cache.error[3u * at + 2u]};
+            AddBlockVelocity(value, compensated ? &residue : nullptr,
+                ChainLaneJacobian(cache, term, 0u) * inverse_mass,
+                ChainLaneJacobian(cache, term, 1u) * inverse_mass,
+                ChainLaneJacobian(cache, term, 2u) * inverse_mass, step.delta);
+            cache.velocity[3u * at] = value.x;
+            cache.velocity[3u * at + 1u] = value.y;
+            cache.velocity[3u * at + 2u] = value.z;
+            const unsigned long long key = cache.key[at];
+            const uint32_t kind = static_cast<uint32_t>(key >> 32u);
+            const uint32_t index = static_cast<uint32_t>(key);
+            points.Velocity(kind)[index] = value;
+            if (compensated) {
+                cache.error[3u * at] = residue.x;
+                cache.error[3u * at + 1u] = residue.y;
+                cache.error[3u * at + 2u] = residue.z;
+                *error.Point(kind, index) = residue;
+            }
+        }
+        __syncwarp();
     }
     return step.significant;
 }
@@ -2577,8 +2667,17 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
     const auto grid = cooperative_groups::this_grid();
     extern __shared__ __align__(16) unsigned char colored_shared[];
     __shared__ __align__(16) unsigned char row_storage[3u * (kColorBlockSize / 32u) * sizeof(NkRow)];
-    __shared__ uint32_t batch_needed, row_changed, row_significant, friction_active;
-    __shared__ float contact_side_velocity[6], contact_delta[3];
+    __shared__ uint32_t batch_needed;
+    constexpr uint32_t kBatchRows = kColorBlockSize / 32u;
+    __shared__ unsigned long long cache_key[kChainCacheEntries];
+    __shared__ float cache_velocity[3u * kChainCacheEntries], cache_error[3u * kChainCacheEntries];
+    __shared__ float cache_inverse_mass[kChainCacheEntries];
+    __shared__ uint32_t cache_lane[kColorBlockSize];
+    __shared__ float cache_jacobian[9u * kColorBlockSize];
+    __shared__ uint32_t cache_shape[kBatchRows], batch_slot[kBatchRows];
+    __shared__ float cache_scalar[kChainRowScalars * kBatchRows];
+    const ChainPointCache cache{cache_key, cache_velocity, cache_error, cache_inverse_mass,
+                                cache_lane, cache_jacobian, cache_shape, cache_scalar};
     const uint32_t lane = threadIdx.x;
     const uint32_t warp = lane >> 5u;
     const uint32_t wlane = lane & 31u;
@@ -2590,7 +2689,6 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
     float* const tile_error_sh = tile_sh + tile_floats;
     float* const staged_j = tile_error_sh + tile_floats;
     const size_t staged_size = size_t{3u} * nwarps * dofs;
-    float* const staged_tangent_response = staged_j + 4u * staged_size;
     NkRow* const staged_rows = reinterpret_cast<NkRow*>(row_storage);
     // A color fills one warp of every block before a second warp of any block.
     const uint32_t color_warp = warp * gridDim.x + blockIdx.x;
@@ -2651,66 +2749,65 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
                               uint32_t env_artic_base) {
         for (uint32_t base = first; base < last; base += nwarps) {
             const uint32_t batch_count = min(nwarps, last - base);
+            for (uint32_t i = lane; i < kChainCacheEntries; i += blockDim.x)
+                cache_key[i] = kChainCacheEmpty;
             if (lane == 0u) batch_needed = 0u;
             __syncthreads();
+            // Each warp screens and stages its row together; bit 1 marks a batch left uncached.
             if (warp < batch_count) {
                 const uint32_t slot = s.chain_rows[base + warp];
-                StageRowWarp(a.urows, slot, staged_rows + 3u * warp, wlane);
-                const bool tangent =
-                    (staged_rows[3u * warp].flags & nk::nk_row_flags::kBlockTangent) != 0u;
+                NkRow* const staged = staged_rows + 3u * warp;
+                StageRowWarp(a.urows, slot, staged, wlane);
+                const bool tangent = (staged[0].flags & nk::nk_row_flags::kBlockTangent) != 0u;
                 const bool needed = !tangent && RowNeedsVelocitySolveWarp(a.urows, slot,
                     env_row_base, env_artic_base, a.lambda, a.row_meff, a.row_damping,
                     a.chain_jacobian, a.chain_jacobian_b, tile_sh, a.body_linear,
-                    a.body_angular, a.points, dofs, a.dt, wlane, staged_rows + 3u * warp);
-                if (needed && wlane == 0u) atomicOr(&batch_needed, 1u);
+                    a.body_angular, a.points, dofs, a.dt, wlane, staged);
+                stage_chain_terms(slot, true);
+                const bool cacheable = StageChainPoints(staged, slot, warp, wlane, cache,
+                    a.points, chain_error, a.lambda, a.row_damping);
+                if (wlane == 0u) {
+                    batch_slot[warp] = slot;
+                    if (needed || !cacheable)
+                        atomicOr(&batch_needed, (needed ? 1u : 0u) | (cacheable ? 0u : 2u));
+                }
             }
             __syncthreads();
             // A batch is skipped only if every row leaves its input unchanged.
-            if (batch_needed == 0u) {
+            if ((batch_needed & 1u) == 0u) {
                 __syncthreads();
                 continue;
             }
-            if (warp < batch_count) {
-                const uint32_t slot = s.chain_rows[base + warp];
-                const NkRow& normal = staged_rows[3u * warp];
-                if (wlane == 0u && (normal.flags & nk::nk_row_flags::kBlockNormal))
-                    staged_tangent_response[warp] = constraint::CoulombTangentSpectralResponse(
-                        normal.contact_response, normal.mu, normal.friction_secondary);
-                stage_chain_terms(slot, true);
+            const bool cached = (batch_needed & 2u) == 0u;
+            // One warp applies the staged batch in chain order, so its rows need no block barrier.
+            for (uint32_t idx = warp == 0u ? 0u : batch_count; idx < batch_count; ++idx) {
+                const uint32_t gslot = batch_slot[idx];
+                NkRow* const prepared = staged_rows + 3u * idx;
+                if (prepared[0].flags & nk::nk_row_flags::kBlockTangent) continue;
+                const bool block = (prepared[0].flags & nk::nk_row_flags::kBlockNormal) != 0u;
+                const bool significant = block && cached
+                    ? SolveChainContactBlockWarp(gslot, idx, env_artic_base, wlane, prepared,
+                          cache, a.lambda, staged_j, staged_j + staged_size,
+                          staged_j + 2u * staged_size, staged_j + 3u * staged_size, tile_sh,
+                          a.body_linear, a.body_angular, a.body_inv_mass, a.body_inv_inertia,
+                          a.points, dofs, a.dt, a.vel_tolerance, chain_error, 3u * idx)
+                    : block
+                    ? SolvePreparedContactBlockWarp(gslot, env_artic_base, wlane, a.urows,
+                          prepared, a.lambda, a.row_damping, staged_j, staged_j + staged_size,
+                          staged_j + 2u * staged_size, staged_j + 3u * staged_size, tile_sh,
+                          a.body_linear, a.body_angular, a.body_inv_mass, a.body_inv_inertia,
+                          a.points, dofs, a.dt, a.vel_tolerance, chain_error, 3u * idx, 1u, true)
+                    : SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
+                          env_artic_base, 3u * idx, wlane, nullptr, nullptr, nullptr, nullptr,
+                          a.lambda, a.row_meff, a.row_damping, staged_j, staged_j + staged_size,
+                          staged_j + 2u * staged_size, staged_j + 3u * staged_size, tile_sh,
+                          a.urows, a.body_linear, a.body_angular, a.body_inv_mass,
+                          a.body_inv_inertia, a.points, dofs, a.dt, false, chain_error,
+                          prepared, a.vel_tolerance);
+                if (significant && wlane == 0u) changed = true;
+                __syncwarp();
             }
             __syncthreads();
-            for (uint32_t idx = 0u; idx < batch_count; ++idx) {
-                const uint32_t gslot = s.chain_rows[base + idx];
-                const NkRow* prepared = staged_rows + 3u * idx;
-                if (prepared[0].flags & nk::nk_row_flags::kBlockTangent) {
-                    continue;
-                } else if (prepared[0].flags & nk::nk_row_flags::kBlockNormal) {
-                    SolvePreparedContactBlock(gslot, env_artic_base, 3u * idx, warp, wlane,
-                        prepared, a.lambda, a.row_damping, staged_j, staged_j + staged_size,
-                        staged_j + 2u * staged_size, staged_j + 3u * staged_size, tile_sh,
-                        a.body_linear, a.body_angular, a.body_inv_mass, a.body_inv_inertia,
-                        a.points, dofs, a.dt, staged_tangent_response[idx], a.vel_tolerance,
-                        chain_error, contact_side_velocity, contact_delta, &friction_active,
-                        &row_changed, &row_significant);
-                } else {
-                    if (lane == 0u) row_significant = 0u;
-                    __syncthreads();
-                    if (warp == 0u) {
-                        const bool significant = SolveUnionRowWarp(
-                            gslot - env_row_base, gslot, env_row_base, env_artic_base, 3u * idx,
-                            wlane, nullptr, nullptr, nullptr, nullptr, a.lambda, a.row_meff,
-                            a.row_damping, staged_j, staged_j + staged_size,
-                            staged_j + 2u * staged_size, staged_j + 3u * staged_size, tile_sh,
-                            a.urows, a.body_linear, a.body_angular, a.body_inv_mass,
-                            a.body_inv_inertia, a.points, dofs, a.dt, false, chain_error,
-                            prepared, a.vel_tolerance);
-                        if (wlane == 0u) row_significant = significant ? 1u : 0u;
-                    }
-                }
-                __syncthreads();
-                if (lane == 0u && row_significant != 0u) changed = true;
-                __syncthreads();
-            }
         }
     };
 
@@ -2833,7 +2930,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
                     staged, a.lambda, a.row_damping, a.chain_jacobian, a.row_minv_jt,
                     a.chain_jacobian_b, a.row_minv_jt_b, nullptr, a.body_linear, a.body_angular,
                     a.body_inv_mass, a.body_inv_inertia, a.points, dofs, a.dt, a.vel_tolerance,
-                    a.error);
+                    a.error, slot, staged[0].group_normal_count, false);
             } else {
                 significant = SolveUnionRowWarp(slot - env_row_base, slot, env_row_base,
                     env * k_tiles, slot, wlane, nullptr, nullptr, nullptr, nullptr, a.lambda,
@@ -2924,7 +3021,7 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
     const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;
     constexpr uint32_t warps = kColorBlockSize / 32u;
     const size_t solve_shared = sizeof(float) *
-        (2u * size_t{k_tiles} * p.max_dof + 4u * 3u * size_t{warps} * p.max_dof + warps);
+        (2u * size_t{k_tiles} * p.max_dof + 4u * 3u * size_t{warps} * p.max_dof);
     uint32_t solve_blocks = 0u;
     if (ResidentGridSize(SolveColoredRowsKernel, kColorBlockSize, solve_shared, grid_bound,
                          &solve_blocks) != cudaSuccess)
