@@ -2617,6 +2617,36 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         }
     };
 
+    // After its row is staged, a warp stages the block's tangent rows and every articulation arm's
+    // M^-1 J^T, plus J when the sweep measures velocities.
+    auto stage_chain_terms = [&](uint32_t slot, bool jacobian) {
+        const NkRow& normal = staged_rows[3u * warp];
+        const uint32_t axes = (normal.flags & nk::nk_row_flags::kBlockNormal)
+            ? 3u : ((normal.flags & nk::nk_row_flags::kBlockTangent) ? 0u : 1u);
+        for (uint32_t axis = 0u; axis < axes; ++axis) {
+            const uint32_t at = slot + axis * normal.group_normal_count;
+            if (axis != 0u) {
+                uint32_t word;
+                memcpy(&word, reinterpret_cast<const unsigned char*>(a.urows + at) +
+                              wlane * sizeof(word), sizeof(word));
+                memcpy(reinterpret_cast<unsigned char*>(staged_rows + 3u * warp + axis) +
+                           wlane * sizeof(word), &word, sizeof(word));
+            }
+            for (uint32_t k = wlane; k < dofs; k += warpSize) {
+                const size_t destination = size_t{3u * warp + axis} * dofs + k;
+                const size_t source = size_t{at} * dofs + k;
+                if (normal.a.kind == kNkSideArtic) {
+                    if (jacobian) staged_j[destination] = a.chain_jacobian[source];
+                    staged_j[staged_size + destination] = a.row_minv_jt[source];
+                }
+                if (normal.b.kind == kNkSideArtic) {
+                    if (jacobian) staged_j[2u * staged_size + destination] = a.chain_jacobian_b[source];
+                    staged_j[3u * staged_size + destination] = a.row_minv_jt_b[source];
+                }
+            }
+        }
+    };
+
     auto chain_velocity = [&](uint32_t first, uint32_t last, uint32_t env_row_base,
                               uint32_t env_artic_base) {
         for (uint32_t base = first; base < last; base += nwarps) {
@@ -2646,30 +2676,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
                 if (wlane == 0u && (normal.flags & nk::nk_row_flags::kBlockNormal))
                     staged_tangent_response[warp] = constraint::CoulombTangentSpectralResponse(
                         normal.contact_response, normal.mu, normal.friction_secondary);
-                const uint32_t axes = (normal.flags & nk::nk_row_flags::kBlockNormal)
-                    ? 3u : ((normal.flags & nk::nk_row_flags::kBlockTangent) ? 0u : 1u);
-                for (uint32_t axis = 0u; axis < axes; ++axis) {
-                    const uint32_t at = slot + axis * normal.group_normal_count;
-                    if (axis != 0u) {
-                        uint32_t word;
-                        memcpy(&word, reinterpret_cast<const unsigned char*>(a.urows + at) +
-                                      wlane * sizeof(word), sizeof(word));
-                        memcpy(reinterpret_cast<unsigned char*>(staged_rows + 3u * warp + axis) +
-                                   wlane * sizeof(word), &word, sizeof(word));
-                    }
-                    for (uint32_t k = wlane; k < dofs; k += warpSize) {
-                        const size_t destination = size_t{3u * warp + axis} * dofs + k;
-                        const size_t source = size_t{at} * dofs + k;
-                        if (normal.a.kind == kNkSideArtic) {
-                            staged_j[destination] = a.chain_jacobian[source];
-                            staged_j[staged_size + destination] = a.row_minv_jt[source];
-                        }
-                        if (normal.b.kind == kNkSideArtic) {
-                            staged_j[2u * staged_size + destination] = a.chain_jacobian_b[source];
-                            staged_j[3u * staged_size + destination] = a.row_minv_jt_b[source];
-                        }
-                    }
-                }
+                stage_chain_terms(slot, true);
             }
             __syncthreads();
             for (uint32_t idx = 0u; idx < batch_count; ++idx) {
@@ -2765,15 +2772,27 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
             }
             __syncthreads();
             if (sweep == ChainSweep::WarmStart) {
-                for (uint32_t i = warp == 0u ? first : last; i < last; ++i) {
-                    const uint32_t slot = s.chain_rows[i];
-                    SolveUnionRowWarp(slot - env_row_base, slot, env_row_base, env_artic_base,
-                        slot, wlane, nullptr, nullptr, nullptr, nullptr, a.lambda, a.row_meff,
-                        a.row_damping, a.chain_jacobian, a.row_minv_jt, a.chain_jacobian_b,
-                        a.row_minv_jt_b, tile_sh, a.urows, a.body_linear, a.body_angular,
-                        a.body_inv_mass, a.body_inv_inertia, a.points, dofs, a.dt, true,
-                        chain_error);
-                    __syncwarp();
+                // Every warp stages a row of the batch; one warp applies them in chain order.
+                for (uint32_t base = first; base < last; base += nwarps) {
+                    const uint32_t batch_count = min(nwarps, last - base);
+                    if (warp < batch_count) {
+                        const uint32_t slot = s.chain_rows[base + warp];
+                        StageRowWarp(a.urows, slot, staged_rows + 3u * warp, wlane);
+                        stage_chain_terms(slot, false);
+                    }
+                    __syncthreads();
+                    for (uint32_t idx = warp == 0u ? 0u : batch_count; idx < batch_count; ++idx) {
+                        const uint32_t slot = s.chain_rows[base + idx];
+                        SolveUnionRowWarp(slot - env_row_base, slot, env_row_base,
+                            env_artic_base, 3u * idx, wlane, nullptr, nullptr, nullptr, nullptr,
+                            a.lambda, a.row_meff, a.row_damping, staged_j,
+                            staged_j + staged_size, staged_j + 2u * staged_size,
+                            staged_j + 3u * staged_size, tile_sh, a.urows, a.body_linear,
+                            a.body_angular, a.body_inv_mass, a.body_inv_inertia, a.points, dofs,
+                            a.dt, true, chain_error, staged_rows + 3u * idx);
+                        __syncwarp();
+                    }
+                    __syncthreads();
                 }
             } else if (sweep == ChainSweep::Velocity) {
                 chain_velocity(first, last, env_row_base, env_artic_base);
