@@ -72,39 +72,12 @@ __device__ void Visit(const MpmParams& p, const DataView& data, uint32_t sample,
     data.ucontact_id_feature[address] = id.feature;
 }
 
+// Floor first, then the grid walls, in a fixed order.
 template <bool emit>
-__global__ void Generate(MpmParams p, ModelView model, DataView data,
-                         nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env,
-                         uint32_t* contact_hit_mask) {
-    const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
-    if (sample >= p.env_count * mpm_per_env) return;
+__device__ void VisitBoundaries(const MpmParams& p, const DataView& data, uint32_t sample,
+                                uint32_t mpm_per_env, uint64_t& count, math::Vec3 point,
+                                float reach) {
     const uint32_t env = sample / mpm_per_env;
-    const uint32_t particle = env * p.particles_per_env + sample % mpm_per_env;
-    const size_t mask_words = (uint64_t{p.bodies_per_env} + p.particle_surfaces_per_env + 31u) / 32u;
-    const size_t mask_base = size_t{sample} * mask_words;
-    if constexpr (!emit) {
-        data.grid_contact_count[sample] = 0u;
-        for (size_t word = 0u; word < mask_words; ++word)
-            contact_hit_mask[mask_base + word] = 0u;
-    }
-    if constexpr (emit) {
-        if (data.grid_contact_count[sample] == 0u) return;
-    }
-    if (!(data.particle_inv_mass[particle] > 0.0f)) return;
-    const math::Vec3 point = data.particle_pos[particle];
-    math::Vec3 velocity{};
-    const bool valid = VisitStencil(p, env, point, [&](uint32_t node, float weight) {
-        const auto value = data.grid_velocity[node];
-        velocity.x = __fadd_rn(velocity.x, weight * value.x);
-        velocity.y = __fadd_rn(velocity.y, weight * value.y);
-        velocity.z = __fadd_rn(velocity.z, weight * value.z);
-    });
-    if (!valid) {
-        atomicOr(&data.env_status[env], kEnvStatusMpmGridEscape | kEnvStatusInvalidEndpoint);
-        return;
-    }
-    const float reach = p.dx + p.dt * sqrtf(velocity.LengthSq());
-    uint64_t count = 0u;
     const auto boundary = [&](uint32_t id, math::Vec3 normal, float depth, float mu) {
         if (depth < -reach) return;
         Visit<emit>(p, data, sample, mpm_per_env, count, nk::kUContactSideBoundary, id,
@@ -119,66 +92,80 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
     boundary(3u, {0, 1, 0}, p.grid_origin[1] + p.dx - point.y, 0.0f);
     boundary(4u, {0, -1, 0}, point.y - (p.grid_origin[1] + (p.grid_dims[1] - 2u) * p.dx), 0.0f);
     boundary(5u, {0, 0, 1}, p.grid_origin[2] + p.dx - point.z, 0.0f);
-    uint32_t status = 0u;
-    if (p.dynamic_body_bc != 0u && p.bite_disable_dynamic_bc == 0u) {
-        for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
-            if constexpr (emit) {
-                if ((contact_hit_mask[mask_base + body / 32u] & (1u << (body % 32u))) == 0u)
-                    continue;
-            }
-            const auto shape = nkops::LoadPrimShape(model.shape_table, body);
-            if ((shape.contype | shape.conaffinity) == 0u) continue;
-            const auto owner = nk::ResolveCollidableOwner(shape.body_id, env, body,
-                p.bodies_per_env, p.base_link_count, p.artics_per_env, model.body_to_link,
-                model.body_to_articulation, model.body_collidable_body);
-            if (owner.kind == ~0u) {
-                status |= kEnvStatusInvalidEndpoint;
-                continue;
-            }
-            math::Vec3 linear{}, angular{}, origin{};
-            if (owner.kind == nk::kNkSideArtic) {
-                const auto pose = data.link_pose[owner.link];
-                const auto v = data.link_velocity[owner.link];
-                angular = nkops::PrimRotate(pose.rotation, {v.v[0], v.v[1], v.v[2]});
-                linear = nkops::PrimRotate(pose.rotation, {v.v[3], v.v[4], v.v[5]});
-                origin = pose.position;
-            } else if (owner.kind == nk::kNkSideRigid) {
-                linear = data.body_linear_velocity[owner.body];
-                angular = data.body_angular_velocity[owner.body];
-                origin = nkops::BodyCenterOfMass(data.body_pose[owner.body], data.body_inertial_frame[owner.body]);
-            }
-            const float speed = sqrtf(linear.LengthSq()) + sqrtf(angular.LengthSq() * (point - origin).LengthSq());
-            const float query_distance = p.body_band + reach + p.dt * speed;
-            const auto pose = data.body_pose[env * p.bodies_per_env + body];
-            const auto surface = nkops::QueryCollidableSurface(surfaces, body, shape,
-                nkops::PrimInverseTransformPoint(pose, point), query_distance);
-            if (!surface.valid) {
-                status |= kEnvStatusMpmOneWayBody | kEnvStatusContactGeometryUnavailable;
-                continue;
-            }
-            if (!isfinite(surface.distance) || surface.distance > query_distance) continue;
-            const math::Vec3 raw_normal = nkops::PrimRotate(pose.rotation, surface.normal);
-            const float length = sqrtf(raw_normal.LengthSq());
-            if (!isfinite(length) || length <= 1.0e-8f) continue;
-            constraint::CollidableRef endpoint;
-            endpoint.handle = owner.body;
-            endpoint.type = constraint::CollidableType::RigidBody;
-            endpoint.react = constraint::ReactionProviderKind::RigidInvMass;
-            if (owner.kind == nk::kNkSideArtic) {
-                endpoint.handle = owner.link;
-                endpoint.type = constraint::CollidableType::ArticulationLink;
-                endpoint.react = constraint::ReactionProviderKind::ArticulationChainJ;
-            } else if (owner.kind == nk::kNkSideStatic) {
-                endpoint.type = constraint::CollidableType::StaticWorld;
-                endpoint.react = constraint::ReactionProviderKind::StaticNull;
-            }
-            Visit<emit>(p, data, sample, mpm_per_env, count, nk::kUContactSideBody, body, endpoint,
-                point, raw_normal * (1.0f / length), -surface.distance,
-                p.body_mu, surface.feature, body);
-            if constexpr (!emit)
-                contact_hit_mask[mask_base + body / 32u] |= 1u << (body % 32u);
-        }
+}
+
+struct BodyHit {
+    bool hit = false;
+    constraint::CollidableRef endpoint;
+    math::Vec3 normal{};
+    float depth = 0.0f;
+    uint32_t feature = 0u;
+};
+
+// A body is hit when its surface lies within the band the sample and body can close in a step.
+__device__ inline BodyHit QueryBody(const MpmParams& p, const ModelView& model,
+    const DataView& data, const nkops::SurfaceQueryView& surfaces, uint32_t env, uint32_t body,
+    math::Vec3 point, float reach, uint32_t& status) {
+    BodyHit result;
+    const auto shape = nkops::LoadPrimShape(model.shape_table, body);
+    if ((shape.contype | shape.conaffinity) == 0u) return result;
+    const auto owner = nk::ResolveCollidableOwner(shape.body_id, env, body,
+        p.bodies_per_env, p.base_link_count, p.artics_per_env, model.body_to_link,
+        model.body_to_articulation, model.body_collidable_body);
+    if (owner.kind == ~0u) {
+        status |= kEnvStatusInvalidEndpoint;
+        return result;
     }
+    math::Vec3 linear{}, angular{}, origin{};
+    if (owner.kind == nk::kNkSideArtic) {
+        const auto pose = data.link_pose[owner.link];
+        const auto v = data.link_velocity[owner.link];
+        angular = nkops::PrimRotate(pose.rotation, {v.v[0], v.v[1], v.v[2]});
+        linear = nkops::PrimRotate(pose.rotation, {v.v[3], v.v[4], v.v[5]});
+        origin = pose.position;
+    } else if (owner.kind == nk::kNkSideRigid) {
+        linear = data.body_linear_velocity[owner.body];
+        angular = data.body_angular_velocity[owner.body];
+        origin = nkops::BodyCenterOfMass(data.body_pose[owner.body], data.body_inertial_frame[owner.body]);
+    }
+    const float speed = sqrtf(linear.LengthSq()) + sqrtf(angular.LengthSq() * (point - origin).LengthSq());
+    const float query_distance = p.body_band + reach + p.dt * speed;
+    const auto pose = data.body_pose[env * p.bodies_per_env + body];
+    const auto surface = nkops::QueryCollidableSurface(surfaces, body, shape,
+        nkops::PrimInverseTransformPoint(pose, point), query_distance);
+    if (!surface.valid) {
+        status |= kEnvStatusMpmOneWayBody | kEnvStatusContactGeometryUnavailable;
+        return result;
+    }
+    if (!isfinite(surface.distance) || surface.distance > query_distance) return result;
+    const math::Vec3 raw_normal = nkops::PrimRotate(pose.rotation, surface.normal);
+    const float length = sqrtf(raw_normal.LengthSq());
+    if (!isfinite(length) || length <= 1.0e-8f) return result;
+    result.endpoint.handle = owner.body;
+    result.endpoint.type = constraint::CollidableType::RigidBody;
+    result.endpoint.react = constraint::ReactionProviderKind::RigidInvMass;
+    if (owner.kind == nk::kNkSideArtic) {
+        result.endpoint.handle = owner.link;
+        result.endpoint.type = constraint::CollidableType::ArticulationLink;
+        result.endpoint.react = constraint::ReactionProviderKind::ArticulationChainJ;
+    } else if (owner.kind == nk::kNkSideStatic) {
+        result.endpoint.type = constraint::CollidableType::StaticWorld;
+        result.endpoint.react = constraint::ReactionProviderKind::StaticNull;
+    }
+    result.hit = true;
+    result.normal = raw_normal * (1.0f / length);
+    result.depth = -surface.distance;
+    result.feature = surface.feature;
+    return result;
+}
+
+// Particle surfaces follow bodies; emission writes each hit's triangle endpoint terms.
+template <bool emit>
+__device__ void VisitParticleSurfaces(const MpmParams& p, const ModelView& model,
+    const DataView& data, uint32_t sample, uint32_t mpm_per_env, uint64_t& count,
+    math::Vec3 point, float reach, uint32_t* contact_hit_mask, size_t mask_base,
+    uint32_t& status) {
+    const uint32_t env = sample / mpm_per_env;
     const collision::MeshSurfaceView particle_surfaces{
         reinterpret_cast<const float*>(data.particle_pos + size_t{env} * p.particles_per_env),
         model.particle_surface_triangles,
@@ -234,18 +221,113 @@ __global__ void Generate(MpmParams p, ModelView model, DataView data,
         if constexpr (!emit)
             contact_hit_mask[mask_base + bit / 32u] |= 1u << (bit % 32u);
     }
-    if constexpr (emit) {
-        if (count > 0u) {
-            const uint32_t endpoint = env * p.point_endpoints_per_env + sample % mpm_per_env;
-            const uint32_t first = env * p.point_endpoint_terms_per_env + (sample % mpm_per_env) * nk::kMpmStencilNodes;
-            uint32_t terms = 0u;
-            VisitStencil(p, env, point, [&](uint32_t node, float weight) {
-                data.point_endpoint_terms[first + terms++] = nk::WeightedPointEndpointTerm(nk::kNkSideGrid, node, weight);
-            });
-            data.point_endpoint_ranges[endpoint] = {first, terms};
-        }
-    } else {
-        data.grid_contact_count[sample] = count;
+}
+
+__device__ inline size_t ContactMaskWords(const MpmParams& p) {
+    return (uint64_t{p.bodies_per_env} + p.particle_surfaces_per_env + 31u) / 32u;
+}
+
+// Counting runs per sample, then per (sample, body), then per sample again; the hit mask carries
+// body hits between passes. A negative reach marks samples that make no queries.
+__global__ void PrepareSamples(MpmParams p, DataView data, uint32_t mpm_per_env,
+                               uint32_t* contact_hit_mask, float* sample_reach) {
+    const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= p.env_count * mpm_per_env) return;
+    const uint32_t env = sample / mpm_per_env;
+    const uint32_t particle = env * p.particles_per_env + sample % mpm_per_env;
+    const size_t mask_words = ContactMaskWords(p);
+    data.grid_contact_count[sample] = 0u;
+    for (size_t word = 0u; word < mask_words; ++word)
+        contact_hit_mask[size_t{sample} * mask_words + word] = 0u;
+    sample_reach[sample] = -1.0f;
+    if (!(data.particle_inv_mass[particle] > 0.0f)) return;
+    const math::Vec3 point = data.particle_pos[particle];
+    math::Vec3 velocity{};
+    const bool valid = VisitStencil(p, env, point, [&](uint32_t node, float weight) {
+        const auto value = data.grid_velocity[node];
+        velocity.x = __fadd_rn(velocity.x, weight * value.x);
+        velocity.y = __fadd_rn(velocity.y, weight * value.y);
+        velocity.z = __fadd_rn(velocity.z, weight * value.z);
+    });
+    if (!valid) {
+        atomicOr(&data.env_status[env], kEnvStatusMpmGridEscape | kEnvStatusInvalidEndpoint);
+        return;
+    }
+    sample_reach[sample] = p.dx + p.dt * sqrtf(velocity.LengthSq());
+}
+
+// Warps share one body, so its shape, owner and pose loads are uniform across the warp.
+__global__ void QueryBodies(MpmParams p, ModelView model, DataView data,
+                            nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env,
+                            uint32_t* contact_hit_mask, const float* sample_reach) {
+    const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= p.env_count * mpm_per_env) return;
+    const float reach = sample_reach[sample];
+    if (reach < 0.0f) return;
+    const uint32_t env = sample / mpm_per_env;
+    const math::Vec3 point = data.particle_pos[env * p.particles_per_env + sample % mpm_per_env];
+    const size_t mask_base = size_t{sample} * ContactMaskWords(p);
+    uint32_t status = 0u;
+    for (uint32_t body = blockIdx.y; body < p.bodies_per_env; body += gridDim.y) {
+        if (QueryBody(p, model, data, surfaces, env, body, point, reach, status).hit)
+            atomicOr(&contact_hit_mask[mask_base + body / 32u], 1u << (body % 32u));
+    }
+    if (status != 0u) atomicOr(&data.env_status[env], status);
+}
+
+__global__ void CountContacts(MpmParams p, ModelView model, DataView data, uint32_t mpm_per_env,
+                              uint32_t* contact_hit_mask, const float* sample_reach) {
+    const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= p.env_count * mpm_per_env) return;
+    const float reach = sample_reach[sample];
+    if (reach < 0.0f) return;
+    const uint32_t env = sample / mpm_per_env;
+    const math::Vec3 point = data.particle_pos[env * p.particles_per_env + sample % mpm_per_env];
+    const size_t mask_words = ContactMaskWords(p);
+    const size_t mask_base = size_t{sample} * mask_words;
+    uint64_t count = 0u;
+    VisitBoundaries<false>(p, data, sample, mpm_per_env, count, point, reach);
+    for (size_t word = 0u; word < mask_words; ++word)
+        count += static_cast<uint32_t>(__popc(contact_hit_mask[mask_base + word]));
+    uint32_t status = 0u;
+    VisitParticleSurfaces<false>(p, model, data, sample, mpm_per_env, count, point, reach,
+                                 contact_hit_mask, mask_base, status);
+    data.grid_contact_count[sample] = count;
+    if (status != 0u) atomicOr(&data.env_status[env], status);
+}
+
+// Emission revisits only the hits counting found, in the same boundary, body, surface order.
+__global__ void EmitContacts(MpmParams p, ModelView model, DataView data,
+                             nkops::SurfaceQueryView surfaces, uint32_t mpm_per_env,
+                             uint32_t* contact_hit_mask, const float* sample_reach) {
+    const uint32_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= p.env_count * mpm_per_env) return;
+    if (data.grid_contact_count[sample] == 0u) return;
+    const uint32_t env = sample / mpm_per_env;
+    const math::Vec3 point = data.particle_pos[env * p.particles_per_env + sample % mpm_per_env];
+    const float reach = sample_reach[sample];
+    const size_t mask_base = size_t{sample} * ContactMaskWords(p);
+    uint64_t count = 0u;
+    VisitBoundaries<true>(p, data, sample, mpm_per_env, count, point, reach);
+    uint32_t status = 0u;
+    // Lanes hitting the same body query it together.
+    for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
+        if ((contact_hit_mask[mask_base + body / 32u] & (1u << (body % 32u))) == 0u) continue;
+        const BodyHit hit = QueryBody(p, model, data, surfaces, env, body, point, reach, status);
+        if (hit.hit)
+            Visit<true>(p, data, sample, mpm_per_env, count, nk::kUContactSideBody, body,
+                hit.endpoint, point, hit.normal, hit.depth, p.body_mu, hit.feature, body);
+    }
+    VisitParticleSurfaces<true>(p, model, data, sample, mpm_per_env, count, point, reach,
+                                contact_hit_mask, mask_base, status);
+    if (count > 0u) {
+        const uint32_t endpoint = env * p.point_endpoints_per_env + sample % mpm_per_env;
+        const uint32_t first = env * p.point_endpoint_terms_per_env + (sample % mpm_per_env) * nk::kMpmStencilNodes;
+        uint32_t terms = 0u;
+        VisitStencil(p, env, point, [&](uint32_t node, float weight) {
+            data.point_endpoint_terms[first + terms++] = nk::WeightedPointEndpointTerm(nk::kNkSideGrid, node, weight);
+        });
+        data.point_endpoint_ranges[endpoint] = {first, terms};
     }
     if (status != 0u) atomicOr(&data.env_status[env], status);
 }
