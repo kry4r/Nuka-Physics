@@ -8,6 +8,8 @@
 // ---------------------------------------------------------------------------
 
 #include "runtime/fluid/surface_mesher.hpp"
+#include "collision/static_bvh.hpp"
+#include "collision/mesh_surface.hpp"
 
 #include "core/parallel_for.hpp"
 #include "import/cooker/fluid_cooker_types.hpp"  // Poly6FromR2Host / Poly6GradientHost
@@ -17,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -616,11 +619,110 @@ float DensityAtAniso(const math::Vec3& x, const std::vector<AnisoKernel>& ker,
 
 }  // namespace
 
+struct FluidSurfaceBoundary::Geometry {
+    render::MeshGeometry mesh;
+    collision::StaticBVH tree;
+    float orientation = 1.0f;
+};
+
+FluidSurfaceBoundary::FluidSurfaceBoundary(const render::MeshGeometry& mesh) {
+    auto geometry = std::make_shared<Geometry>();
+    geometry->mesh.positions = mesh.positions;
+    geometry->mesh.indices = mesh.indices;
+    std::vector<collision::AABB> bounds;
+    bounds.reserve(mesh.TriangleCount());
+    for (size_t t = 0; t < mesh.indices.size(); t += 3u) {
+        collision::AABB box;
+        for (size_t k = 0; k < 3u; ++k) {
+            const size_t at = size_t{mesh.indices[t + k]} * 3u;
+            if (at + 2u >= mesh.positions.size())
+                throw std::invalid_argument("fluid boundary triangle index is outside its mesh");
+            const math::Vec3 v{mesh.positions[at], mesh.positions[at + 1u], mesh.positions[at + 2u]};
+            if (k == 0u) box.min = box.max = v;
+            else {
+                box.min = {std::min(box.min.x, v.x), std::min(box.min.y, v.y), std::min(box.min.z, v.z)};
+                box.max = {std::max(box.max.x, v.x), std::max(box.max.y, v.y), std::max(box.max.z, v.z)};
+            }
+        }
+        bounds.push_back(box);
+    }
+    geometry->tree.Build(bounds);
+    double volume = 0.0;
+    for (size_t t = 0u; t + 2u < mesh.indices.size(); t += 3u) {
+        math::Vec3 v[3];
+        for (size_t k = 0u; k < 3u; ++k) {
+            const size_t at = size_t{mesh.indices[t + k]} * 3u;
+            v[k] = {mesh.positions[at], mesh.positions[at + 1u], mesh.positions[at + 2u]};
+        }
+        volume += double(v[0].Dot(v[1].Cross(v[2])));
+    }
+    geometry->orientation = volume < 0.0 ? -1.0f : 1.0f;
+    geometry_ = std::move(geometry);
+}
+
+bool FluidSurfaceBoundary::Sample(math::Vec3 point, float range, float& distance,
+                                  math::Vec3& normal) const {
+    const auto& nodes = geometry_->tree.Nodes();
+    if (nodes.empty()) return false;
+    const math::Vec3 p = transform.rotation.Conjugate().Rotate(point - transform.position);
+    const auto distance_sq = [&](const collision::AABB& box) {
+        const math::Vec3 d{std::max(0.0f, std::max(box.min.x - p.x, p.x - box.max.x)),
+            std::max(0.0f, std::max(box.min.y - p.y, p.y - box.max.y)),
+            std::max(0.0f, std::max(box.min.z - p.z, p.z - box.max.z))};
+        return d.Dot(d);
+    };
+    if (distance_sq(nodes.back().bounds) > range * range) return false;
+    const auto vertex = [&](uint32_t triangle, uint32_t corner) {
+        const size_t at = size_t{geometry_->mesh.indices[size_t{triangle} * 3u + corner]} * 3u;
+        const auto& v = geometry_->mesh.positions;
+        return math::Vec3{v[at], v[at + 1u], v[at + 2u]};
+    };
+    float best = range * range;
+    math::Vec3 nearest{}, face{};
+    bool found = false, inside = false;
+    uint32_t stack[std::numeric_limits<uint32_t>::digits + 1u];
+    uint32_t top = 0u;
+    stack[top++] = static_cast<uint32_t>(nodes.size() - 1u);
+    while (top > 0u) {
+        const auto& node = nodes[stack[--top]];
+        const bool near = distance_sq(node.bounds) <= best;
+        const bool ray = p.x <= node.bounds.max.x && p.y >= node.bounds.min.y &&
+            p.y <= node.bounds.max.y && p.z >= node.bounds.min.z && p.z <= node.bounds.max.z;
+        if (!near && !ray) continue;
+        if (!node.IsLeaf()) {
+            stack[top++] = node.right;
+            stack[top++] = node.left;
+            continue;
+        }
+        const auto a = vertex(node.shape_index, 0u), b = vertex(node.shape_index, 1u),
+                   c = vertex(node.shape_index, 2u);
+        if (ray && collision::MeshPositiveXRayCrosses(p, a, b, c)) inside = !inside;
+        if (!near) continue;
+        const auto q = collision::ClosestTrianglePoint(p, a, b, c).point;
+        const float sq = (p - q).LengthSq();
+        if (sq <= best) {
+            best = sq; nearest = q; face = (b - a).Cross(c - a); found = true;
+        }
+    }
+    if (!found) {
+        if (!inside) return false;
+        distance = -range;
+        normal = {};
+        return true;
+    }
+    const float length = std::sqrt(best);
+    distance = inside ? -length : length;
+    const auto n = length > 1.0e-8f * range ? (p - nearest) * ((inside ? -1.0f : 1.0f) / length)
+        : face.Normalized() * geometry_->orientation;
+    normal = transform.rotation.Rotate(n);
+    return true;
+}
+
 FluidSurfaceParams DensitySurfaceParams(float spacing) {
     if (!(spacing > 0.0f) || !std::isfinite(spacing))
         throw std::invalid_argument("density surface requires positive finite spacing");
     FluidSurfaceParams params;
-    params.h = 2.0f * spacing;
+    params.h = 2.6f * spacing;
     params.cell_size = 0.5f * spacing;
     params.particle_mass = spacing * spacing * spacing;
     params.rest_density_rho0 = 1.0f;
@@ -628,7 +730,8 @@ FluidSurfaceParams DensitySurfaceParams(float spacing) {
 }
 
 render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_positions,
-                                       const FluidSurfaceParams& p) {
+                                       const FluidSurfaceParams& p,
+                                       const std::vector<FluidSurfaceBoundary>& boundaries) {
     render::MeshGeometry out;
     out.uvs.clear();
     const size_t n = particle_positions.size();
@@ -661,9 +764,44 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
     const std::vector<AnisoKernel> ker =
         p.anisotropic ? BuildAnisoKernels(particle_positions, grid, p)
                       : std::vector<AnisoKernel>{};
-    auto density = [&](const math::Vec3& x) -> float {
+    auto particle_density = [&](const math::Vec3& x) -> float {
         return p.anisotropic ? DensityAtAniso(x, ker, grid, p)
                              : DensityAt(x, particle_positions, grid, p, nullptr);
+    };
+    auto density = [&](const math::Vec3& x) -> float {
+        if (boundaries.empty()) return particle_density(x);
+        float solid_distance = h;
+        struct Plane { float distance; math::Vec3 normal; };
+        thread_local std::vector<Plane> planes;
+        planes.clear();
+        thread_local std::vector<math::Vec3> samples;
+        samples.clear();
+        samples.push_back(x);
+        for (const auto& boundary : boundaries) {
+            float d; math::Vec3 normal;
+            if (!boundary.Sample(x, h, d, normal)) continue;
+            solid_distance = std::min(solid_distance, d);
+            if (normal.LengthSq() == 0.0f) continue;
+            bool shared = false;
+            for (auto& plane : planes) {
+                if (plane.normal.Dot(normal) < 1.0f - 64.0f * std::numeric_limits<float>::epsilon()) continue;
+                if (d < plane.distance) plane = {d, normal};
+                shared = true;
+                break;
+            }
+            if (!shared) planes.push_back({d, normal});
+        }
+        for (const auto& plane : planes) {
+            const size_t count = samples.size();
+            for (size_t i = 0u; i < count; ++i) {
+                const float sd = plane.distance + plane.normal.Dot(samples[i] - x);
+                if (std::abs(sd) < h) samples.push_back(samples[i] - plane.normal * (2.0f * sd));
+            }
+        }
+        float rho = 0.0f;
+        for (const auto& sample : samples) rho += particle_density(sample);
+        // Reflect density at solids; bury the closing interface within one quarter voxel.
+        return std::min(rho, iso + p.rest_density_rho0 * (solid_distance + 0.25f * ch) / h);
     };
     if (p.anisotropic) {
         // Calibrate the iso level to the anisotropic field's own interior density so
@@ -676,7 +814,7 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
         iso = p.iso_fraction * rho0;
     }
     auto gradient = [&](const math::Vec3& x) -> math::Vec3 {
-        if (!p.anisotropic) {
+        if (!p.anisotropic && boundaries.empty()) {
             math::Vec3 grad{0, 0, 0};
             DensityAt(x, particle_positions, grid, p, &grad);
             return grad;

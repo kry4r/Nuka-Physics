@@ -543,6 +543,39 @@ TEST(RenderWorldRtBeauty, RefractionBendsBackgroundAndBeerDarkens) {
     EXPECT_LT(tinted_l, clear_l * 0.9f) << "Beer-Lambert must darken the thicker tint";
 }
 
+TEST(RenderWorldRtBeauty, UnderwaterRayReflectsAboveCriticalAngle) {
+    auto backend = render::CreateCudaRtBackend();
+    ASSERT_NE(backend, nullptr);
+    render::RenderWorld world;
+    nuka::scene::RenderMaterial water;
+    water.transmission = 1.0f; water.ior = 1.333f; water.roughness = 0.0f;
+    nuka::scene::RenderMaterial emitter;
+    emitter.base_color[0] = emitter.base_color[1] = emitter.base_color[2] = 0.0f;
+    emitter.emissive[2] = 2.0f;
+    world.materials = {water, emitter};
+    const uint32_t pool = world.meshes.InternPrimitive("pool", [] { return BoxGeometry({3,3,0.5f}); });
+    const uint32_t floor = world.meshes.InternPrimitive("emitter", [] { return BoxGeometry({3,3,0.01f}); });
+    render::RenderInstance liquid;
+    liquid.mesh_id = pool; liquid.render_material_id = 0u;
+    liquid.world_xform.position = {0, 0, -0.5f};
+    world.instances.push_back(liquid);
+    render::RenderInstance bottom;
+    bottom.mesh_id = floor; bottom.render_material_id = 1u;
+    bottom.world_xform.position = {0, 0, -0.8f};
+    world.instances.push_back(bottom);
+    const auto scene = render::RenderWorldToTwoLevelScene(world);
+    auto* handle = backend->BuildScene(scene);
+    auto options = FixedBeauty();
+    options.samples = 1u;
+    options.sky_top = options.sky_bottom = options.sky_ground = {1, 0, 0};
+    const auto camera = rt::BuildPinhole({0,0,-0.2f}, {0.8660254f,0,0.3f}, {0,0,1}, 0.2f, 1u, 1u);
+    const auto image = backend->TraceBeautyToHost(handle, scene, camera, options);
+    backend->FreeScene(handle);
+    ASSERT_EQ(image.color.size(), 3u);
+    EXPECT_GT(image.color[2], 1.0f);
+    EXPECT_LT(image.color[0], 0.01f);
+}
+
 // SMOOTH NORMALS: a transmissive sphere refracts the bright-bar background. With
 // per-vertex smooth normals supplied the bend differs from the faceted flat fallback
 // -- this is the only test that exercises SmoothWorldNormal's barycentric blend.

@@ -2,12 +2,26 @@
 // Shared host reconstruction of particle density isosurfaces for rendering and sensors.
 
 #include "math/vec3.hpp"
+#include "math/transform.hpp"
 #include "render/mesh_geometry.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace nuka::runtime::fluid {
+
+// A rigid solid's triangle boundary; geometry is shared across poses and environments.
+class FluidSurfaceBoundary {
+public:
+    explicit FluidSurfaceBoundary(const render::MeshGeometry& mesh);
+    math::Transform transform = math::Transform::Identity();
+    bool Sample(math::Vec3 point, float range, float& distance, math::Vec3& normal) const;
+
+private:
+    struct Geometry;
+    std::shared_ptr<const Geometry> geometry_;
+};
 
 // Marching cubes over sum(m * Poly6); the isovalue is iso_fraction * rest_density_rho0.
 struct FluidSurfaceParams {
@@ -35,6 +49,7 @@ FluidSurfaceParams DensitySurfaceParams(float spacing);
 
 // Deterministic outward triangles and gradient normals; a sub-isovalue field yields an empty mesh.
 render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_positions,
-                                       const FluidSurfaceParams& p);
+                                       const FluidSurfaceParams& p,
+                                       const std::vector<FluidSurfaceBoundary>& boundaries = {});
 
 }  // namespace nuka::runtime::fluid

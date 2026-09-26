@@ -331,6 +331,7 @@ struct MediaXpbdMaterial {
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;
+    bool     self_contact      = false;  // particles collide across folds and layers
 };
 
 // Constitutive material for a PBF fluid. rest_density / support_scale / iters /

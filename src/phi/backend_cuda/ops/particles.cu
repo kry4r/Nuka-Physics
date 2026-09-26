@@ -1326,9 +1326,8 @@ Status OpParticleParticleContact(const ModelView& model, const DataView& data,
                                  const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ParticleParticleContactParams*>(params);
     if (p == nullptr) return Status::Failed;
-    // Emitted only for SoftFluid; inert for a zero/negative d_min or no particles.
-    if (p->mode != kParticleModeSoftFluid || p->particle_count == 0u ||
-        p->contact_distance_d_min <= 0.0f) {
+    // Inert for a zero/negative d_min or no particles.
+    if (p->particle_count == 0u || p->contact_distance_d_min <= 0.0f) {
         return Status::Ok;
     }
     const uint32_t N = p->particle_count;

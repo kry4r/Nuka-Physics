@@ -86,7 +86,7 @@ void WriteJson(const std::string& path, const Json& report) {
 constexpr float kPi = 3.14159265358979323846f;
 constexpr uint32_t kKindPlane = nuka::collision::kShapePlane;
 
-// The grid x/y walls and floor boundary contain the fluid pool.
+// Finite collidable walls contain the pool; the surrounding grid also carries overflow.
 constexpr float kFloorZ      = 0.0f;
 constexpr float kDx          = 0.011f;
 constexpr float kTankHalfXY  = 0.215f;  // tank (domain box) half-extent in x/y.
@@ -96,7 +96,7 @@ constexpr float kPoolTopZ    = 0.18f;   // fluid pool rest height (deep enough t
 constexpr float kDensity     = 1000.0f; // rho0 (water).
 constexpr float kBulk        = 2.0e5f;  // Tait coefficient B; c = sqrt(gamma*B/rho0) at J=1.
 constexpr float kTaitGamma   = 7.0f;    // water EOS exponent.
-constexpr float kViscosity   = 0.4f;    // Dynamic viscosity in the Newtonian stress.
+constexpr float kViscosity   = 0.001f;  // Dynamic viscosity of water in Pa s.
 constexpr uint32_t kSubsteps = 40u;
 
 // The heavy bunny couples through its cooked sparse SDF.
@@ -124,10 +124,11 @@ cook::MpmCookInput BuildPoolInput() {
     in.material.bulk_modulus = kBulk;
     in.material.tait_gamma = kTaitGamma;
     in.material.viscosity = kViscosity;
-    in.grid_origin = Vec3{-kTankHalfXY, -kTankHalfXY, kFloorZ - 3.0f * kDx};
+    const float extent = kTankHalfXY + 12.0f * kDx;
+    in.grid_origin = Vec3{-extent, -extent, kFloorZ - 3.0f * kDx};
     // The grid covers the fluid pool and splash; its top boundary is open.
     const float top = kPoolTopZ + 0.54f;
-    in.grid_dims[0] = static_cast<uint32_t>(2.0f * kTankHalfXY / kDx) + 1u;
+    in.grid_dims[0] = static_cast<uint32_t>(std::ceil(2.0f * extent / kDx)) + 1u;
     in.grid_dims[1] = in.grid_dims[0];
     in.grid_dims[2] = static_cast<uint32_t>((top - in.grid_origin.z) / kDx) + 1u;
     in.dx = kDx;
@@ -239,8 +240,20 @@ void AddGroundPlane(nk::Model& m, int32_t body_id) {
     m.shape_table_rows.push_back(sh);
 }
 
-// Heavy free bunny released above the pool + a static pool-floor plane (the heavy
-// bunny rests on it), cooked on top of the fluid via the sim_method=mlsmpm selector.
+struct PoolWall { Vec3 center, half; };
+
+std::vector<PoolWall> PoolWalls() {
+    const float thickness = 0.012f, top = kPoolTopZ + 0.01f;
+    const float center = kTankHalfXY + 0.5f * thickness;
+    const float length = kTankHalfXY + thickness;
+    const float z = kFloorZ + 0.5f * top;
+    return {{{-center, 0, z}, {0.5f * thickness, length, 0.5f * top}},
+            {{center, 0, z}, {0.5f * thickness, length, 0.5f * top}},
+            {{0, -center, z}, {length, 0.5f * thickness, 0.5f * top}},
+            {{0, center, z}, {length, 0.5f * thickness, 0.5f * top}}};
+}
+
+// The rendered pool and its finite collision walls share dimensions.
 nk::Model BuildModel(float release_z, const soft::TriMesh& bunny) {
     nk::Model m;
     m.capacities.env_count = 1u;
@@ -259,6 +272,19 @@ nk::Model BuildModel(float release_z, const soft::TriMesh& bunny) {
     AddBunnySdf(m, 0, bunny, kDx * 0.6f);
 
     AddGroundPlane(m, 1);
+    for (const auto& wall : PoolWalls()) {
+        nk::Model::BodyInit body;
+        body.pose = {wall.center, Quat::Identity()};
+        body.inv_mass = 0.0f;
+        body.inv_inertia = {};
+        nk::Model::PairDrivenShape shape;
+        shape.kind = nuka::collision::kShapeBox;
+        shape.params[0] = wall.half.x; shape.params[1] = wall.half.y; shape.params[2] = wall.half.z;
+        shape.body_id = static_cast<int32_t>(m.body_init.size());
+        shape.contype = 1u; shape.conaffinity = 1u; shape.sdf_grid = ~0u;
+        m.body_init.push_back(body);
+        m.shape_table_rows.push_back(shape);
+    }
 
     nk::ModelCapacities& cap = m.capacities;
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
@@ -471,40 +497,6 @@ private:
     uint32_t samples_ = 24u;
 };
 
-// Isotropic kernels reconstruct the water surface at a calibrated iso fraction.
-fluid::FluidSurfaceParams WaterSurfaceParams() {
-    fluid::FluidSurfaceParams p;
-    const float pdx = kDx * 0.5f;            // MPM particle spacing (8/cell).
-    p.h = 2.6f * pdx;                        // SPH support radius: full enough to merge the bulk,
-                                             // tight enough that the crown sheet survives.
-    p.rest_density_rho0 = kDensity;
-    p.iso_fraction = 0.5f;
-    p.particle_mass = kDensity * pdx * pdx * pdx;
-    p.cell_size = 0.30f * p.h;
-    p.anisotropic = false;
-    return p;
-}
-
-// Laplacian-smooth the marched water mesh in place + recompute smooth normals.
-void SmoothWaterMesh(render::MeshGeometry& g, uint32_t iters, float lambda, float mu) {
-    if (g.positions.empty() || g.indices.empty()) return;
-    std::vector<Vec3> pos(g.positions.size() / 3u);
-    for (size_t v = 0; v < pos.size(); ++v)
-        pos[v] = Vec3{g.positions[v * 3 + 0], g.positions[v * 3 + 1], g.positions[v * 3 + 2]};
-    // Taubin lambda|mu: a shrink pass then an inflate pass per iteration removes
-    // marching-cubes bumpiness into a flat water surface without volume loss.
-    for (uint32_t it = 0; it < iters; ++it) {
-        soft::SmoothSurface(g.indices, 1u, lambda, pos);
-        soft::SmoothSurface(g.indices, 1u, mu, pos);
-    }
-    for (size_t v = 0; v < pos.size(); ++v) {
-        g.positions[v * 3 + 0] = pos[v].x;
-        g.positions[v * 3 + 1] = pos[v].y;
-        g.positions[v * 3 + 2] = pos[v].z;
-    }
-    g.normals = render::SmoothNormals(g.positions, g.indices);
-}
-
 // Render the live bunny pose and water surface with the pool and studio floor.
 render::RenderWorld BuildFrame(const std::vector<Vec3>& fluid_pos, uint32_t n,
                                const soft::TriMesh& bunny, const Transform& box_xf,
@@ -553,13 +545,7 @@ render::RenderWorld BuildFrame(const std::vector<Vec3>& fluid_pos, uint32_t n,
     add(tiles_odd, 4u, Transform::Identity());
     add(floor_mesh, 3u, Transform::Identity());
 
-    // Open-top opaque pool container: four low slate wall slabs just outside the
-    // fluid footprint, from the floor up past the rest surface (BC at kTankHalfXY).
-    const float wt = 0.012f;                         // wall thickness.
-    const float wall_top = kPoolTopZ + 0.01f;        // rim ~ at the rest surface so a low camera sees the water.
-    const float wo = kTankHalfXY;                    // wall inner face at the BC.
-    const float wlen = kTankHalfXY + wt;
-    // Build each wall as an explicit slab in world space (x-walls span y, y-walls span x).
+    // Finite walls use the collision geometry dimensions.
     auto add_wall = [&](const Vec3& center, const Vec3& half) {
         render::MeshGeometry g;
         const float xs[2] = {center.x - half.x, center.x + half.x};
@@ -581,14 +567,15 @@ render::RenderWorld BuildFrame(const std::vector<Vec3>& fluid_pos, uint32_t n,
         const uint32_t mesh = rw.meshes.InternPrimitive(key, [&] { return g; });
         add(mesh, 5u, Transform::Identity());
     };
-    const float wzc = kFloorZ + 0.5f * wall_top, wzh = 0.5f * wall_top;
-    add_wall(Vec3{-(wo + 0.5f * wt), 0.0f, wzc}, Vec3{0.5f * wt, wlen, wzh});  // -x wall
-    add_wall(Vec3{+(wo + 0.5f * wt), 0.0f, wzc}, Vec3{0.5f * wt, wlen, wzh});  // +x wall
-    add_wall(Vec3{0.0f, -(wo + 0.5f * wt), wzc}, Vec3{wlen, 0.5f * wt, wzh});  // -y wall
-    add_wall(Vec3{0.0f, +(wo + 0.5f * wt), wzc}, Vec3{wlen, 0.5f * wt, wzh});  // +y wall
+    for (const auto& wall : PoolWalls()) add_wall(wall.center, wall.half);
 
-    render::MeshGeometry water_geo = fluid::MarchFluidSurface(fluid_pos, WaterSurfaceParams());
-    SmoothWaterMesh(water_geo, 2u, 0.5f, -0.53f);
+    std::vector<fluid::FluidSurfaceBoundary> boundaries;
+    for (const auto& instance : rw.instances) {
+        boundaries.emplace_back(rw.meshes.Geometry(instance.mesh_id));
+        boundaries.back().transform = instance.world_xform;
+    }
+    render::MeshGeometry water_geo = fluid::MarchFluidSurface(
+        fluid_pos, fluid::DensitySurfaceParams(kDx * 0.5f), boundaries);
     const uint32_t water_mesh = rw.meshes.InternPrimitive("water:live", [&] { return water_geo; });
     add(water_mesh, 2u, Transform::Identity());
     return rw;
@@ -1172,19 +1159,19 @@ int RunSim(const Args& args, const soft::TriMesh& bunny, const Vec3& bunny_half,
         quality.Set("two_way_response", Json::Bool(two_way));
         quality.Set("submerged", Json::Bool(submerged));
         quality.Set("coupling_complete", Json::Bool(false));
-        quality.Set("coupling_scope", Json::Str("SDF bunny; static plane duplicates the MPM grid floor; single owner; finite-mass and articulation feedback remain incomplete"));
+        quality.Set("coupling_scope", Json::Str("SDF bunny and finite pool walls through common contacts; this workload does not validate articulated coupling"));
         report.Set("quality", std::move(quality));
         Json status = Json::Object();
         status.Set("valid", Json::Bool(ok));
-        status.Set("scope", Json::Str("this configured SDF-bunny/grid-boundary workload; not general coupling acceptance"));
+        status.Set("scope", Json::Str("this configured SDF-bunny/finite-pool workload; not general coupling acceptance"));
         report.Set("status", std::move(status));
         WriteJson(args.perf_json, report);
     }
     if (!args.dump_path.empty()) {
-        const bool ok = DumpSnap(args.dump_path, out);
+        const bool saved = DumpSnap(args.dump_path, out);
         std::fprintf(stderr, "[mpm_water_drop] DUMP %s %zu frames (P=%u) -> %s\n",
-                     ok ? "OK" : "FAIL", out.fluid_snap.size(), P, args.dump_path.c_str());
-        return ok ? 0 : 8;
+                     saved ? "OK" : "FAIL", out.fluid_snap.size(), P, args.dump_path.c_str());
+        return saved ? (ok ? 0 : 5) : 8;
     }
 
     if (args.probe) {

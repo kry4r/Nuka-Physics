@@ -635,6 +635,7 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     xp.Set("aero_drag_normal", Value::Float(m.xpbd.aero_drag_normal));
     xp.Set("aero_drag_tangent", Value::Float(m.xpbd.aero_drag_tangent));
     xp.Set("aero_drag_max_dv", Value::Float(m.xpbd.aero_drag_max_dv));
+    if (m.xpbd.self_contact) xp.Set("self_contact", Value::Bool(true));
     o.Set("xpbd", std::move(xp));
 
     Value pb = Value::Object();
@@ -1758,6 +1759,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.xpbd.aero_drag_normal = f(*xp, "aero_drag_normal", rec.xpbd.aero_drag_normal);
                 rec.xpbd.aero_drag_tangent = f(*xp, "aero_drag_tangent", rec.xpbd.aero_drag_tangent);
                 rec.xpbd.aero_drag_max_dv = f(*xp, "aero_drag_max_dv", rec.xpbd.aero_drag_max_dv);
+                rec.xpbd.self_contact = b(*xp, "self_contact", rec.xpbd.self_contact);
             }
             if (const Value* pb = mv.Find("pbf")) {
                 rec.pbf.rest_density = f(*pb, "rest_density", rec.pbf.rest_density);

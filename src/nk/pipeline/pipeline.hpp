@@ -57,6 +57,8 @@ public:
         uint32_t defer_velocity_damping = 1;  // solve affine velocity feedback implicitly
         uint32_t fold_drive_damping = 1;      // enable implicit feedback in the shared rows
         uint32_t substeps = 1u;
+        // Contact exchanges per interval; zero follows the material projection count.
+        uint16_t coupling_passes = 0u;
     };
 
     // Demand mask for pure-readout ops: a readout writes an output field no other

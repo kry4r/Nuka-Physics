@@ -122,10 +122,8 @@ RenderBeautyKernel(PinholeCamera camera,
             // Dielectric arm: smooth normal + Fresnel reflect/refract + Beer; the
             // __noinline__ shader keeps the opaque (transmission==0) frame byte-exact.
             const Vec3 sn = SmoothWorldNormal(instances, bp, u, v, n);
-            const float tv = sn.x * (-ray.dir.x) + sn.y * (-ray.dir.y) + sn.z * (-ray.dir.z);
-            const Vec3 Nt = (tv < 0.0f) ? Vec3{-sn.x, -sn.y, -sn.z} : sn;
             col = ShadeTransmissive(tlas_nodes, tlas_leaf_count, instances, materials,
-                                    light, sky, hit, Nt, Vv, mat, &rng, textures);
+                                    light, sky, hit, sn, Vv, mat, &rng, textures);
         } else {
             // Opaque arm: optional smooth normal, then the material's image maps
             // (albedo/roughness/normal) enrich the shade at this hit.

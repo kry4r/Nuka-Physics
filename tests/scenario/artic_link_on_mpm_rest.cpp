@@ -450,7 +450,12 @@ TEST(ArticLinkOnMpmRest, MultiEnvDepositPerEnvStridesByteIdentical) {
     const uint32_t foot_link = CollidableLinks(m).front().link;
     nk::World w(std::move(m), kEnvs, b.dev, b.backend, Cfg());
     ASSERT_TRUE(w.Ready());
-    for (uint32_t s = 0; s < 70u; ++s) w.Step();
+    for (uint32_t s = 0; s < 70u; ++s) {
+        const auto step = w.Step();
+        ASSERT_EQ(step.result, nuka::phi::Status::Ok)
+            << "step=" << s << " op=" << static_cast<uint32_t>(step.failed_op)
+            << " " << w.LastExecutionError().message;
+    }
 
     std::vector<Transform> lp(static_cast<size_t>(L) * kEnvs);
     ASSERT_TRUE(w.GetData().DownloadField(nk::FieldId::LinkPose, lp.data(),

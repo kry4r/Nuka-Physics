@@ -26,33 +26,32 @@ struct ParticleGridConfigDevice {
     uint3 grid_dims;
 };
 
-// Clamp x into [lo, hi] (integer).
-__device__ __forceinline__ int ClampInt(int x, int lo, int hi) {
-    return x < lo ? lo : (x > hi ? hi : x);
+// Unbounded integer cell of a position; far values saturate so the cast stays defined.
+__device__ __forceinline__ int3 CellIndex(float3 p, const ParticleGridConfigDevice& cfg) {
+    const auto axis = [](float x, float lo, float inv) {
+        return static_cast<int>(fminf(fmaxf(floorf((x - lo) * inv), -1.0e9f), 1.0e9f));
+    };
+    return make_int3(axis(p.x, cfg.grid_min.x, cfg.inv_cell_size.x),
+                     axis(p.y, cfg.grid_min.y, cfg.inv_cell_size.y),
+                     axis(p.z, cfg.grid_min.z, cfg.inv_cell_size.z));
 }
 
-// Compute the integer cell coordinate of a position, clamped into the grid.
-__device__ __forceinline__ uint3 CellCoord(float3 p,
-                                            const ParticleGridConfigDevice& cfg) {
-    const int cx = static_cast<int>(floorf((p.x - cfg.grid_min.x) * cfg.inv_cell_size.x));
-    const int cy = static_cast<int>(floorf((p.y - cfg.grid_min.y) * cfg.inv_cell_size.y));
-    const int cz = static_cast<int>(floorf((p.z - cfg.grid_min.z) * cfg.inv_cell_size.z));
-    uint3 c;
-    c.x = static_cast<uint32_t>(ClampInt(cx, 0, static_cast<int>(cfg.grid_dims.x) - 1));
-    c.y = static_cast<uint32_t>(ClampInt(cy, 0, static_cast<int>(cfg.grid_dims.y) - 1));
-    c.z = static_cast<uint32_t>(ClampInt(cz, 0, static_cast<int>(cfg.grid_dims.z) - 1));
-    return c;
+// The grid tiles space periodically, so any position maps to a table cell.
+__device__ __forceinline__ uint32_t WrapCell(int c, uint32_t dim) {
+    const int d = static_cast<int>(dim);
+    const int r = c % d;
+    return static_cast<uint32_t>(r < 0 ? r + d : r);
 }
 
-// Flatten a cell coordinate to a linear cell key (x-fastest). Deterministic.
-__device__ __forceinline__ uint32_t CellKey(uint3 c,
-                                             const ParticleGridConfigDevice& cfg) {
-    return (c.z * cfg.grid_dims.y + c.y) * cfg.grid_dims.x + c.x;
+// Flatten a wrapped cell coordinate to a linear cell key (x-fastest). Deterministic.
+__device__ __forceinline__ uint32_t CellKey(int3 c, const ParticleGridConfigDevice& cfg) {
+    return (WrapCell(c.z, cfg.grid_dims.z) * cfg.grid_dims.y + WrapCell(c.y, cfg.grid_dims.y)) *
+               cfg.grid_dims.x + WrapCell(c.x, cfg.grid_dims.x);
 }
 
 __device__ __forceinline__ uint32_t CellKeyFromPos(float3 p,
                                                    const ParticleGridConfigDevice& cfg) {
-    return CellKey(CellCoord(p, cfg), cfg);
+    return CellKey(CellIndex(p, cfg), cfg);
 }
 
 // Enumerate all in-radius neighbors; a null output returns the exact count.
@@ -70,34 +69,18 @@ __device__ inline uint32_t QueryParticleNeighbors(
     uint32_t max_count,
     bool* __restrict__ out_overflow) {
     const float r2 = radius * radius;
-    const uint3 base = CellCoord(p, cfg);
+    const int3 base = CellIndex(p, cfg);
     uint32_t count = 0u;
     uint32_t attempted = 0u;
     bool overflow = false;
 
-    const int dimx = static_cast<int>(cfg.grid_dims.x);
-    const int dimy = static_cast<int>(cfg.grid_dims.y);
-    const int dimz = static_cast<int>(cfg.grid_dims.z);
-
-    for (int dz = -1; dz <= 1; ++dz) {
-        const int cz = static_cast<int>(base.z) + dz;
-        if (cz < 0 || cz >= dimz) {
-            continue;
-        }
-        for (int dy = -1; dy <= 1; ++dy) {
-            const int cy = static_cast<int>(base.y) + dy;
-            if (cy < 0 || cy >= dimy) {
-                continue;
-            }
-            for (int dx = -1; dx <= 1; ++dx) {
-                const int cx = static_cast<int>(base.x) + dx;
-                if (cx < 0 || cx >= dimx) {
-                    continue;
-                }
-                const uint32_t key =
-                    (static_cast<uint32_t>(cz) * cfg.grid_dims.y +
-                     static_cast<uint32_t>(cy)) * cfg.grid_dims.x +
-                    static_cast<uint32_t>(cx);
+    // Narrow axes visit each wrapped cell once: one cell for dim 1, two for dim 2.
+    const auto lo = [](uint32_t dim) { return dim >= 2u ? -1 : 0; };
+    const auto hi = [](uint32_t dim) { return dim >= 3u ? 1 : 0; };
+    for (int dz = lo(cfg.grid_dims.z); dz <= hi(cfg.grid_dims.z); ++dz) {
+        for (int dy = lo(cfg.grid_dims.y); dy <= hi(cfg.grid_dims.y); ++dy) {
+            for (int dx = lo(cfg.grid_dims.x); dx <= hi(cfg.grid_dims.x); ++dx) {
+                const uint32_t key = CellKey(make_int3(base.x + dx, base.y + dy, base.z + dz), cfg);
                 const uint32_t s = cell_start[key];
                 const uint32_t e = cell_end[key];
                 for (uint32_t k = s; k < e; ++k) {

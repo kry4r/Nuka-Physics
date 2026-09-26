@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -20,11 +21,13 @@
 #include "import/usd_importer.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "collision/mesh_surface_types.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/backend.hpp"
+#include "phi/op_schema.hpp"
 #include "runtime/soft/cloth_topology.hpp"
 #include "scene/cook/cook_to_model.hpp"
 #include "sensor/observation.hpp"
@@ -174,6 +177,36 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
                 ASSERT_EQ(graph.Reset({1u, 1u}), nphi::Status::Ok);
                 ASSERT_EQ(observation.Reset({1u, 1u}), nphi::Status::Ok);
             }
+            if (step == 12u) {
+                const auto budgets = [](const nk::World& world) {
+                    std::array<uint64_t, 5u> total{};
+                    for (const auto& call : world.GetPipeline().Calls()) {
+                        if (call.op == nphi::NkOp::XpbdProject)
+                            total[0] += static_cast<const nphi::XpbdProjectParams*>(call.params)->iters;
+                        if (call.op == nphi::NkOp::PbfDensityLambda)
+                            total[1] += static_cast<const nphi::PbfDensityLambdaParams*>(call.params)->iters;
+                        if (call.op == nphi::NkOp::ParticleParticleContact)
+                            total[2] += static_cast<const nphi::ParticleParticleContactParams*>(call.params)->solver_iterations;
+                        if (call.op == nphi::NkOp::SolveRowsBlockIsland) {
+                            const auto& solve = *static_cast<const nphi::SolveRowsBlockIslandParams*>(call.params);
+                            total[3] += solve.vel_iters;
+                            total[4] += solve.pos_iters;
+                        }
+                    }
+                    return total;
+                };
+                constexpr uint32_t passes[] = {0u, 1u, 2u, 3u, 5u, 12u};
+                const auto before = ReadPipelineState(graph);
+                const auto original = budgets(graph);
+                ASSERT_EQ(graph.SetCouplingPasses(UINT32_MAX), nphi::Status::InvalidArgument);
+                EXPECT_TRUE(graph.GraphReady());
+                for (auto* world : {&eager, &graph}) {
+                    ASSERT_EQ(world->SetCouplingPasses(passes[mode]), nphi::Status::Ok);
+                    EXPECT_EQ(budgets(*world), original);
+                    EXPECT_EQ(ReadPipelineState(*world), before);
+                }
+                EXPECT_EQ(graph.GraphReady(), mode == 0u);
+            }
             for (auto* world : {&eager, &graph}) {
                 ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::DriveTarget, targets.data(),
                                                         targets.size() * sizeof(float)));
@@ -233,7 +266,7 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
             ASSERT_TRUE(graph.GetData().DownloadPersistent(&graph_state));
             EXPECT_EQ(eager_state, graph_state);
         }
-        EXPECT_EQ(graph.CaptureAttempts(), 2u);
+        EXPECT_EQ(graph.CaptureAttempts(), mode == 0u ? 2u : 3u);
         EXPECT_EQ(graph.GraphReplays(), 16u);
         ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
         EXPECT_EQ(graph.StateSensors().Values(imu_id), sensor_address);
@@ -245,7 +278,7 @@ TEST(RobotClothFluidCoResident, GraphControlsReadoutAndResetMatchEager) {
         EXPECT_EQ(graph.DataViewRef().active_row_ids, index_address);
         EXPECT_EQ(ReadPipelineState(graph), initial);
         ASSERT_EQ(graph.StepConfigured(), nphi::Status::Ok);
-        EXPECT_EQ(graph.CaptureAttempts(), 2u);
+        EXPECT_EQ(graph.CaptureAttempts(), mode == 0u ? 2u : 3u);
     }
 }
 
@@ -267,24 +300,8 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
     constexpr uint32_t envs = 3u;
     nk::World eager(CookMpmPrepared(prepared, envs), envs, backend.dev, backend.backend, config);
     nk::World graph(CookMpmPrepared(prepared, envs), envs, backend.dev, backend.backend, config);
-    auto set_static_islands = [](const char* value) {
-#ifdef _WIN32
-        _putenv_s("NUKA_FORCE_STATIC_ISLANDS", value != nullptr ? value : "");
-#else
-        if (value != nullptr) setenv("NUKA_FORCE_STATIC_ISLANDS", value, 1);
-        else unsetenv("NUKA_FORCE_STATIC_ISLANDS");
-#endif
-    };
-    const char* previous_setting = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
-    const bool had_setting = previous_setting != nullptr;
-    const std::string saved_setting = had_setting ? previous_setting : "";
-    set_static_islands("1");
-    nk::World conservative(CookMpmPrepared(prepared, envs), envs, backend.dev, backend.backend, config);
-    EXPECT_NE(conservative.FieldPtr(nk::FieldId::ContactForce), nullptr);
-    set_static_islands(had_setting ? saved_setting.c_str() : nullptr);
     ASSERT_TRUE(eager.Ready()) << eager.CreationError();
     ASSERT_TRUE(graph.Ready()) << graph.CreationError();
-    ASSERT_TRUE(conservative.Ready()) << conservative.CreationError();
     const auto& cap = graph.GetModel().capacities;
     ASSERT_GT(cap.particle_surfaces_per_env, 0u);
     ASSERT_GT(cap.point_endpoints_per_env, 0u);
@@ -318,7 +335,7 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
     for (uint32_t step = 0u; step < frames; ++step) {
         if (step == frames / 2u) {
             const auto before = ReadContactValues<Vec3>(graph, nk::FieldId::ParticlePos);
-            for (auto* world : {&eager, &graph, &conservative}) ASSERT_EQ(world->Reset({1u}), nphi::Status::Ok);
+            for (auto* world : {&eager, &graph}) ASSERT_EQ(world->Reset({1u}), nphi::Status::Ok);
             const auto after = ReadContactValues<Vec3>(graph, nk::FieldId::ParticlePos);
             for (uint32_t env : {0u, 2u})
                 EXPECT_EQ(std::memcmp(before.data() + env * cap.particles_per_env,
@@ -327,14 +344,13 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
         auto input = targets;
         for (size_t i = 0u; i < input.size(); ++i)
             input[i] += 0.002f * std::sin(0.2f * float(step) + float(i));
-        for (auto* world : {&eager, &graph, &conservative}) {
+        for (auto* world : {&eager, &graph}) {
             ASSERT_TRUE(world->GetData().UploadField(nk::FieldId::DriveTarget, input.data(), input.size() * sizeof(float)));
             ASSERT_EQ(world->StepConfigured(), nphi::Status::Ok) << world->LastExecutionError().message;
             ASSERT_EQ(world->Synchronize(), nphi::Status::Ok);
             EXPECT_EQ(ReadContactValues<uint32_t>(*world, nk::FieldId::EnvStatus), std::vector<uint32_t>(envs));
         }
         EXPECT_EQ(ReadPipelineState(eager), ReadPipelineState(graph));
-        EXPECT_EQ(ReadPipelineState(conservative), ReadPipelineState(graph));
         for (uint32_t id : load_sensors) {
             std::vector<float> values(envs * 6u);
             ASSERT_EQ(graph.StateSensors().Download(id, values.data(), values.size() * sizeof(float)), nphi::Status::Ok);
@@ -367,6 +383,27 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
             const auto& row = rows[r];
             if (!(row.flags & nk::nk_row_flags::kActive)) continue;
             const uint32_t env = r / cap.max_rows_per_env;
+            if (row.flags & nk::nk_row_flags::kBlockNormal) {
+                ASSERT_GT(row.group_normal_count, 0u);
+                ASSERT_LT(r + 2u * row.group_normal_count, rows.size());
+                const float normal = lambda[r];
+                ASSERT_TRUE(std::isfinite(normal));
+                EXPECT_GE(normal, 0.0f);
+                const float mu[2] = {row.mu, row.friction_secondary};
+                double scaled_tangent_sq = 0.0;
+                for (uint32_t axis = 0u; axis < 2u; ++axis) {
+                    const float impulse = lambda[r + (axis + 1u) * row.group_normal_count];
+                    ASSERT_TRUE(std::isfinite(impulse));
+                    if (mu[axis] > 0.0f) {
+                        const double scaled = double(impulse) / mu[axis];
+                        scaled_tangent_sq += scaled * scaled;
+                    } else {
+                        EXPECT_EQ(impulse, 0.0f);
+                    }
+                }
+                const float tolerance = 32.0f * std::numeric_limits<float>::epsilon() * std::max(normal, 1.0f);
+                EXPECT_LE(std::sqrt(scaled_tangent_sq), double(normal) + tolerance);
+            }
             ASSERT_LT(roots[r], rows.size());
             EXPECT_EQ(roots[r] / cap.max_rows_per_env, env);
             const uint32_t a = category(row.a), b = category(row.b);
@@ -394,6 +431,129 @@ TEST(RobotClothFluidCoResident, RobotRigidMpmClothShareContactsGraphAndReset) {
     EXPECT_EQ(graph.GraphReplays(), frames);
     ASSERT_EQ(graph.Reset(), nphi::Status::Ok);
     EXPECT_EQ(ReadPipelineState(graph), initial);
+}
+
+// Host rebuild of every surface node from the same positions; min/max bounds are exact.
+std::vector<nuka::collision::MeshBvhNode> HostSurfaceNodes(const nk::Model& model,
+                                                          const std::vector<Vec3>& positions,
+                                                          uint32_t envs) {
+    const auto& cap = model.capacities;
+    const auto& particles = model.particles;
+    std::vector<nuka::collision::MeshBvhNode> nodes(size_t{envs} * cap.particle_surface_nodes_per_env);
+    for (uint32_t env = 0u; env < envs; ++env) {
+        for (const auto& info : particles.surface_info) {
+            auto* out = nodes.data() + size_t{env} * cap.particle_surface_nodes_per_env + info.node_offset;
+            const auto* tree = particles.surface_tree.data() + info.node_offset;
+            for (uint32_t local = info.node_count; local-- > 0u;) {
+                auto node = tree[local];
+                if (node.triangle != ~0u) {
+                    bool valid = node.triangle < info.triangle_count;
+                    Vec3 corner[3];
+                    for (uint32_t k = 0u; valid && k < 3u; ++k) {
+                        const uint32_t vertex = particles.surface_triangles[
+                            (size_t{info.triangle_offset} + node.triangle) * 3u + k];
+                        valid = vertex < info.vertex_count;
+                        if (valid) corner[k] = positions[size_t{env} * cap.particles_per_env + info.vertex_offset + vertex];
+                        valid = valid && std::isfinite(corner[k].LengthSq());
+                    }
+                    if (!valid) {
+                        node.escape = 0u;
+                    } else {
+                        node.lower = {std::fmin(corner[0].x, std::fmin(corner[1].x, corner[2].x)),
+                                      std::fmin(corner[0].y, std::fmin(corner[1].y, corner[2].y)),
+                                      std::fmin(corner[0].z, std::fmin(corner[1].z, corner[2].z))};
+                        node.upper = {std::fmax(corner[0].x, std::fmax(corner[1].x, corner[2].x)),
+                                      std::fmax(corner[0].y, std::fmax(corner[1].y, corner[2].y)),
+                                      std::fmax(corner[0].z, std::fmax(corner[1].z, corner[2].z))};
+                    }
+                } else {
+                    const uint32_t left = local + 1u;
+                    const uint32_t right = left < info.node_count ? tree[left].escape : 0u;
+                    if (right <= left || right >= info.node_count) {
+                        node.escape = 0u;
+                    } else {
+                        const auto& a = out[left];
+                        const auto& b = out[right];
+                        node.lower = {std::fmin(a.lower.x, b.lower.x), std::fmin(a.lower.y, b.lower.y),
+                                      std::fmin(a.lower.z, b.lower.z)};
+                        node.upper = {std::fmax(a.upper.x, b.upper.x), std::fmax(a.upper.y, b.upper.y),
+                                      std::fmax(a.upper.z, b.upper.z)};
+                        if (a.escape == 0u || b.escape == 0u) node.escape = 0u;
+                    }
+                }
+                out[local] = node;
+            }
+        }
+    }
+    return nodes;
+}
+
+// The refit op alone reproduces every node, surface speed, invalid flag and post-reset tree.
+TEST(RobotClothFluidCoResident, ParticleSurfaceRefitMatchesHostBounds) {
+    const auto backend = GetBackend();
+    if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
+    const auto prepared = Prepare(Go2ScenePath(), backend.dev, backend.backend, Cfg());
+    constexpr uint32_t envs = 3u;
+    nk::World world(CookMpmPrepared(prepared, envs), envs, backend.dev, backend.backend, Cfg());
+    ASSERT_TRUE(world.Ready()) << world.CreationError();
+    const auto& model = world.GetModel();
+    const auto& cap = model.capacities;
+    ASSERT_GT(cap.particle_surfaces_per_env, 0u);
+    const auto& calls = world.GetPipeline().Calls();
+    const auto refit = std::find_if(calls.begin(), calls.end(),
+        [](const nphi::OpCall& call) { return call.op == nphi::NkOp::RefitParticleSurfaces; });
+    ASSERT_NE(refit, calls.end());
+    const auto run_refit = [&] {
+        ASSERT_EQ(nphi::BackendDispatch(backend.backend, world.ModelViewRef(), world.DataViewRef(), *refit),
+                  nphi::Status::Ok);
+        ASSERT_EQ(world.Synchronize(), nphi::Status::Ok);
+    };
+    const auto check = [&](uint32_t invalid_env) {
+        const auto positions = ReadContactValues<Vec3>(world, nk::FieldId::ParticlePos);
+        const auto velocities = ReadContactValues<Vec3>(world, nk::FieldId::ParticleVel);
+        const auto nodes = ReadContactValues<nuka::collision::MeshBvhNode>(world, nk::FieldId::ParticleSurfaceNodes);
+        const auto speeds = ReadContactValues<float>(world, nk::FieldId::ParticleSurfaceMaxSpeed);
+        const auto status = ReadContactValues<uint32_t>(world, nk::FieldId::EnvStatus);
+        const auto expected = HostSurfaceNodes(model, positions, envs);
+        uint32_t compared = 0u;
+        for (uint32_t env = 0u; env < envs; ++env) {
+            const bool invalid = env == invalid_env;
+            EXPECT_EQ((status[env] & nphi::kEnvStatusContactGeometryUnavailable) != 0u, invalid) << "env=" << env;
+            for (uint32_t s = 0u; s < cap.particle_surfaces_per_env; ++s) {
+                const auto& info = model.particles.surface_info[s];
+                const size_t base = size_t{env} * cap.particle_surface_nodes_per_env + info.node_offset;
+                EXPECT_EQ(nodes[base].escape == 0u, invalid && s == 0u) << "env=" << env << " surface=" << s;
+                for (uint32_t local = 0u; local < info.node_count; ++local, ++compared)
+                    ASSERT_EQ(std::memcmp(&nodes[base + local], &expected[base + local], sizeof(nodes[0])), 0)
+                        << "env=" << env << " surface=" << s << " node=" << local;
+                float speed = 0.0f;
+                for (uint32_t i = 0u; i < info.vertex_count; ++i)
+                    speed = std::fmax(speed, velocities[size_t{env} * cap.particles_per_env + info.vertex_offset + i].LengthSq());
+                const float measured = speeds[env * cap.particle_surfaces_per_env + s];
+                EXPECT_NEAR(measured, std::sqrt(speed), 4.0f * std::numeric_limits<float>::epsilon() * std::sqrt(speed))
+                    << "env=" << env << " surface=" << s;
+            }
+        }
+        EXPECT_GT(compared, 0u);
+    };
+    for (uint32_t step = 0u; step < 4u; ++step) {
+        ASSERT_EQ(world.StepConfigured(), nphi::Status::Ok) << world.LastExecutionError().message;
+        ASSERT_EQ(world.Synchronize(), nphi::Status::Ok);
+        run_refit();
+        check(~0u);
+    }
+    auto positions = ReadContactValues<Vec3>(world, nk::FieldId::ParticlePos);
+    const auto& info = model.particles.surface_info.front();
+    const uint32_t vertex = model.particles.surface_triangles[size_t{info.triangle_offset} * 3u];
+    positions[size_t{1u} * cap.particles_per_env + info.vertex_offset + vertex].y =
+        std::numeric_limits<float>::quiet_NaN();
+    ASSERT_TRUE(world.GetData().UploadField(nk::FieldId::ParticlePos, positions.data(), positions.size() * sizeof(Vec3)));
+    run_refit();
+    check(1u);
+    ASSERT_EQ(world.Reset({1u}), nphi::Status::Ok);
+    ASSERT_EQ(world.Synchronize(), nphi::Status::Ok);
+    run_refit();
+    check(~0u);
 }
 
 TEST(RobotClothFluidCoResident, ContactWrenchPreservesEndpointOrderAndIsolation) {

@@ -1492,6 +1492,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     nk::Model::ModelParticles& mp = model.particles;
     mp.mode = nk::Model::ParticleMode::Xpbd;
     mp.soft_friction = in.friction;  // body<->soft contact mu (solmix=max).
+    mp.pp_self_contact = in.self_contact;
     mp.initial_pos = in.positions;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
@@ -1892,6 +1893,20 @@ static void ApplyParticleBodyContact(nk::Model::ModelParticles& mp,
     }
 }
 
+// Self-contact without a fluid grid gets a periodic neighbor table sized to the particle
+// count; the wrapped cells serve a medium wherever it moves.
+static void SizeSelfContactGrid(nk::Model& model) {
+    nk::Model::ModelParticles& mp = model.particles;
+    nk::ModelCapacities& cap = model.capacities;
+    if (!mp.pp_self_contact || !(mp.pp_contact_d_min > 0.0f) || cap.max_grid_cells != 0u) return;
+    const uint32_t side = std::max(
+        3u, static_cast<uint32_t>(std::ceil(std::cbrt(2.0 * cap.particles_per_env))));
+    mp.grid_min = math::Vec3::Zero();
+    for (uint32_t& dim : mp.grid_dims) dim = side;
+    mp.cell_size = mp.query_radius = std::max(mp.query_radius, mp.pp_contact_d_min);
+    cap.max_grid_cells = side * side * side;
+}
+
 // ---------------------------------------------------------------------------
 // Two-system cook: soft (XPBD) + fluid (PBF) co-resident in ONE Model.
 // ---------------------------------------------------------------------------
@@ -2028,6 +2043,9 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     nk::Model xtmp;
     CookXpbdParticles(xtmp, env_count, soft);
     const nk::Model::ModelParticles& xp = xtmp.particles;
+    // Particle contact would also push material points that the MPM grid already couples.
+    if (xp.pp_self_contact)
+        throw std::invalid_argument("xpbd self_contact cannot share a world with an MLS-MPM medium");
     mp.initial_pos.insert(mp.initial_pos.end(), xp.initial_pos.begin(),
                           xp.initial_pos.end());
     mp.initial_vel.insert(mp.initial_vel.end(), xp.initial_vel.begin(),
@@ -2359,6 +2377,7 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
     in.solver_iterations =
         static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
     in.friction = media.xpbd.friction;
+    in.self_contact = media.xpbd.self_contact;
     // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
     // triangles only when active (all-zero coeffs => no op => byte-identical cook).
     in.aero_drag_normal = media.xpbd.aero_drag_normal;
@@ -2578,6 +2597,7 @@ XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
     in.solver_iterations =
         static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
     in.friction = media.xpbd.friction;
+    in.self_contact = media.xpbd.self_contact;
     return in;
 }
 
@@ -2647,6 +2667,7 @@ XpbdCookInput BuildCableXpbdInput(const MediaRecord& media) {
     in.solver_iterations =
         static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
     in.friction = media.xpbd.friction;
+    in.self_contact = media.xpbd.self_contact;
     return in;
 }
 
@@ -3042,6 +3063,7 @@ void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
     dst.aero_drag_tangent = src.aero_drag_tangent;
     dst.aero_drag_max_dv = src.aero_drag_max_dv;
     dst.solver = src.solver;
+    dst.self_contact = dst.self_contact || src.self_contact;
 }
 
 }  // namespace
@@ -3096,6 +3118,7 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
 
     if (!have_soft && !have_fluid) return;
     CookSoftFluidParticles(model, env_count, soft, fluid, contact);
+    SizeSelfContactGrid(model);
 }
 
 CookToModelResult CookSceneToModel(const SceneIR& scene, int env_count,

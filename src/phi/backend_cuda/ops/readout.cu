@@ -166,8 +166,10 @@ __global__ void ContactLinkKernel(const uint32_t* __restrict__ row_cj_link,
     out_contact_link[slot] = link;
 }
 
+constexpr uint32_t kWrenchBlock = 256u;
+
 // Gather both contact endpoints into each link's world-frame wrench.
-// Fixed row order gives deterministic force and torque sums without atomics.
+// Endpoint terms load in parallel; one thread adds them in the fixed endpoint order without atomics.
 __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
                                         const Vec3* __restrict__ row_cj_point,
                                         const Vec3* __restrict__ row_cj_dir,
@@ -180,30 +182,40 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
                                         uint32_t total_link_count,
                                         float inv_dt,
                                         float* __restrict__ out_link_wrench) {
-    const uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t g = blockIdx.x;
     if (g >= total_link_count) {
         return;
     }
+    __shared__ Vec3 impulse[kWrenchBlock];
+    __shared__ Vec3 moment[kWrenchBlock];
     const Vec3 origin = link_world_pose[g].position;
+    const uint32_t begin = link_begin[g];
+    const uint32_t end = link_end[g];
 
     Vec3 force = Vec3::Zero();
     Vec3 torque = Vec3::Zero();
-    for (uint32_t i = link_begin[g]; i < link_end[g]; ++i) {
-        const auto endpoint = static_cast<uint32_t>(endpoint_keys[i]);
-        const uint32_t rs = endpoint / contact_index::kEndpointsPerRow;
-        const uint32_t side = endpoint % contact_index::kEndpointsPerRow;
-        const float l = lambda[rs];
-        if (side == 0u) {
-            const Vec3 f_slot = row_cj_dir[rs] * (l * inv_dt);
-            force += f_slot;
-            torque += (row_cj_point[rs] - origin).Cross(f_slot);
+    for (uint32_t base = begin; base < end; base += kWrenchBlock) {
+        const uint32_t i = base + threadIdx.x;
+        if (i < end) {
+            const auto endpoint = static_cast<uint32_t>(endpoint_keys[i]);
+            const uint32_t rs = endpoint / contact_index::kEndpointsPerRow;
+            const bool side_b = endpoint % contact_index::kEndpointsPerRow != 0u;
+            const float l = lambda[rs];
+            const Vec3 f_slot = (side_b ? row_cj_dir_b[rs] : row_cj_dir[rs]) * (l * inv_dt);
+            impulse[threadIdx.x] = f_slot;
+            moment[threadIdx.x] = ((side_b ? row_cj_point_b[rs] : row_cj_point[rs]) - origin).Cross(f_slot);
         }
-        if (side == 1u) {
-            const Vec3 f_slot = row_cj_dir_b[rs] * (l * inv_dt);
-            force += f_slot;
-            torque += (row_cj_point_b[rs] - origin).Cross(f_slot);
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            const uint32_t count = min(end - base, kWrenchBlock);
+            for (uint32_t k = 0u; k < count; ++k) {
+                force += impulse[k];
+                torque += moment[k];
+            }
         }
+        __syncthreads();
     }
+    if (threadIdx.x != 0u) return;
 
     const uint32_t out = g * kLinkWrenchComponents;
     out_link_wrench[out + 0u] = force.x;
@@ -606,8 +618,7 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
                data.contact_link);
     if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     if (total_link_count != 0u) {
-        const uint32_t wrench_grid = (total_link_count + kBlock - 1u) / kBlock;
-        LaunchCuda(LinkContactWrenchKernel, dim3(wrench_grid), dim3(kBlock), 0u, stream,
+        LaunchCuda(LinkContactWrenchKernel, dim3(total_link_count), dim3(kWrenchBlock), 0u, stream,
                    static_cast<const float*>(data.lambda),
                    static_cast<const Vec3*>(data.row_cj_point),
                    static_cast<const Vec3*>(data.row_cj_dir),

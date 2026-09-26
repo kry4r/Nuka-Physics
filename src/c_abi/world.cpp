@@ -694,6 +694,21 @@ nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execut
     }
 }
 
+nuka_result_t nuka_world_set_coupling_passes(nuka_world_handle world, uint32_t passes) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        return nuka::c_abi::MapStatusToResult(record->world->SetCouplingPasses(passes));
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out) {
     if (!out || out->struct_size != sizeof(*out) || out->schema_version != NUKA_EXECUTION_INFO_VERSION)
         return NUKA_RESULT_INVALID_ARG;

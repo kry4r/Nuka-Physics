@@ -538,6 +538,10 @@ public:
         check(nuka_world_set_gravity_z(h_, gravity_z), "nuka_world_set_gravity_z");
     }
 
+    void set_coupling_passes(uint32_t passes) {
+        check(nuka_world_set_coupling_passes(h_, passes), "nuka_world_set_coupling_passes");
+    }
+
     void set_sensor_noise(nuka_state_field_t field, int kind, float param1,
                           float param2, uint64_t seed) {
         nuka_sensor_noise_desc_t desc{};
@@ -2812,6 +2816,10 @@ NB_MODULE(_nuka_ext, m) {
              "Set finite uniform gravity Z (m/s^2), preserving X and Y. Applies to "
              "the next production step in every environment; a changed value "
              "invalidates the execution graph. Tapes capture gravity at creation.")
+        .def("set_coupling_passes", &World::set_coupling_passes, nb::arg("passes"),
+             "Set contact exchanges per interval (0..65535; zero follows material iterations). "
+             "Preserves material budgets and timestep, changes finite-iteration coupling, "
+             "and invalidates the execution graph when the value changes.")
         .def("set_sensor_noise", &World::set_sensor_noise, nb::arg("field"),
              nb::arg("kind"), nb::arg("param1") = 0.0f, nb::arg("param2") = 0.0f,
              nb::arg("seed") = uint64_t{0},

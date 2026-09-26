@@ -6,8 +6,11 @@
 
 #include "import/cooker/fluid_cooker.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 namespace nuka::import::cooker {
 
@@ -15,20 +18,34 @@ namespace {
 using math::Vec3;
 using runtime::fluid::PbfParticleSet;
 
-// floor(L/s) clamped to >= 0 as a uint32_t (an empty/inverted extent -> 0).
-uint32_t AxisCount(float length, float spacing) {
-    if (length <= 0.0f || spacing <= 0.0f) {
+double HalfUlp(float value) {
+    const double upper = double(std::nextafter(value, std::numeric_limits<float>::infinity())) - value;
+    const double lower = double(value) - std::nextafter(value, -std::numeric_limits<float>::infinity());
+    return 0.5 * std::max(upper, lower);
+}
+
+// Snap integral cell counts only within the rounding uncertainty of the input coordinates and spacing.
+uint32_t AxisCount(float lower, float upper, float spacing) {
+    if (!std::isfinite(lower) || !std::isfinite(upper) || !(upper > lower)) {
         return 0u;
     }
-    const float n = std::floor(length / spacing);
-    if (n <= 0.0f) {
+    const double length = double(upper) - lower;
+    const double ratio = length / spacing;
+    const double nearest = std::round(ratio);
+    const double uncertainty = HalfUlp(lower) + HalfUlp(upper) + nearest * HalfUlp(spacing);
+    const double n = uncertainty < 0.5 * spacing && std::abs(length - nearest * spacing) <= uncertainty
+        ? nearest : std::floor(ratio);
+    if (n <= 0.0) {
         return 0u;
     }
+    if (n > std::numeric_limits<uint32_t>::max())
+        throw std::length_error("fluid lattice axis exceeds the particle index capacity");
     return static_cast<uint32_t>(n);
 }
 
 bool SpecValid(const FluidBoxSpec& spec) {
-    return spec.spacing > 0.0f && spec.rest_density > 0.0f;
+    return spec.spacing > 0.0f && std::isfinite(spec.spacing) &&
+           spec.rest_density > 0.0f && std::isfinite(spec.rest_density);
 }
 
 // Deterministic per-cell jitter in [-1,1) keyed by (ix,iy,iz,axis) -- reproducible
@@ -49,9 +66,13 @@ FluidLatticeCounts FluidBoxLatticeCounts(const FluidBoxSpec& spec) {
     if (!SpecValid(spec)) {
         return c;  // all-zero.
     }
-    c.nx = AxisCount(spec.max_corner.x - spec.min_corner.x, spec.spacing);
-    c.ny = AxisCount(spec.max_corner.y - spec.min_corner.y, spec.spacing);
-    c.nz = AxisCount(spec.max_corner.z - spec.min_corner.z, spec.spacing);
+    c.nx = AxisCount(spec.min_corner.x, spec.max_corner.x, spec.spacing);
+    c.ny = AxisCount(spec.min_corner.y, spec.max_corner.y, spec.spacing);
+    c.nz = AxisCount(spec.min_corner.z, spec.max_corner.z, spec.spacing);
+    if (c.nx == 0u || c.ny == 0u || c.nz == 0u) return c;
+    const uint64_t xy = uint64_t{c.nx} * c.ny;
+    if (xy > std::numeric_limits<uint32_t>::max() / c.nz)
+        throw std::length_error("fluid lattice exceeds the particle index capacity");
     c.total = c.nx * c.ny * c.nz;
     return c;
 }
