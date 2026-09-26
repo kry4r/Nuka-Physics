@@ -314,17 +314,20 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     const uint32_t xpbd_iterations = (dist_count | bend_count | vol_count | sm_cluster_count) != 0u
         ? std::max<uint32_t>(mp.xpbd_iters, 1u) : 0u;
     const uint32_t pbf_iterations = runs_pbf ? std::max<uint32_t>(mp.pbf_iters, 1u) : 0u;
-    const uint32_t pp_iterations = particle_mode == phi::kParticleModeSoftFluid && mp.pp_contact_d_min > 0.0f
-        ? std::max<uint32_t>(mp.pp_contact_iters, 1u) : 0u;
-    const uint32_t coupling_iterations = std::max({1u, xpbd_iterations, pbf_iterations, pp_iterations});
-    p_xpbd_iterations_.resize(coupling_iterations);
+    const bool pp_contact = particle_mode == phi::kParticleModeSoftFluid || mp.pp_self_contact;
+    // Contact runs in every pass that projects the soft constraints it competes with.
+    const uint32_t pp_iterations = pp_contact && mp.pp_contact_d_min > 0.0f
+        ? std::max({mp.pp_contact_iters, xpbd_iterations, 1u}) : 0u;
+    const uint32_t projection_iterations = std::max({1u, xpbd_iterations, pbf_iterations, pp_iterations});
+    const uint32_t coupling_iterations = cfg.coupling_passes != 0u
+        ? cfg.coupling_passes : projection_iterations;
+    p_xpbd_iterations_.resize(projection_iterations);
     p_solve_iterations_.resize(coupling_iterations);
-    const auto iterations_before = [coupling_iterations](uint32_t pass, uint32_t budget) {
-        return static_cast<uint32_t>((static_cast<uint64_t>(pass) * budget + coupling_iterations - 1u)
-                                     / coupling_iterations);
+    const auto iterations_before = [](uint32_t pass, uint32_t budget, uint32_t passes) {
+        return static_cast<uint32_t>((static_cast<uint64_t>(pass) * budget + passes - 1u) / passes);
     };
-    const auto iteration_work = [&](uint32_t pass, uint32_t budget) {
-        return iterations_before(pass + 1u, budget) - iterations_before(pass, budget);
+    const auto iteration_work = [&](uint32_t pass, uint32_t budget, uint32_t passes) {
+        return iterations_before(pass + 1u, budget, passes) - iterations_before(pass, budget, passes);
     };
 
     // The build-time coupling context: the row provider's PreCouple/PostCouple
@@ -444,7 +447,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (has_particles) {
         // Spatial constraints rebuild neighbors from the current shared working positions.
-        p_grid_.cell_size = runs_pbf ? mp.cell_size : 0.0f;
+        p_grid_.cell_size = runs_pbf || pp_iterations != 0u ? mp.cell_size : 0.0f;
         p_grid_.query_radius = mp.query_radius;
         p_grid_.particle_count = particle_count;
         for (int k = 0; k < 3; ++k) {
@@ -482,9 +485,10 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_xpbd_.bend_color_segments = model.bend_color_segments.data();
         p_xpbd_.vol_color_segments = model.vol_color_segments.data();
         p_xpbd_.sm_color_segments = model.sm_color_segments.data();
-        for (uint32_t pass = 0u; pass < coupling_iterations; ++pass) {
+        for (uint32_t pass = 0u; pass < projection_iterations; ++pass) {
             p_xpbd_iterations_[pass] = p_xpbd_;
-            p_xpbd_iterations_[pass].iteration_start = iterations_before(pass, xpbd_iterations);
+            p_xpbd_iterations_[pass].iteration_start =
+                iterations_before(pass, xpbd_iterations, projection_iterations);
         }
 
         p_pbf_density_.rest_density = mp.pbf_rest_density;
@@ -529,18 +533,22 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     const auto project_particles = [&](uint32_t pass) {
         if (!has_particles) return;
-        if (iteration_work(pass, xpbd_iterations) != 0u)
-            add(phi::NkOp::XpbdProject, &p_xpbd_iterations_[pass]);
-        const bool density_work = iteration_work(pass, pbf_iterations) != 0u;
-        const bool contact_work = iteration_work(pass, pp_iterations) != 0u;
-        if (density_work || contact_work) add(phi::NkOp::ParticleGridBuild, &p_grid_);
-        if (density_work) {
-            add(phi::NkOp::PbfDensityLambda, &p_pbf_density_);
-            add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
+        const uint32_t begin = iterations_before(pass, projection_iterations, coupling_iterations);
+        const uint32_t end = iterations_before(pass + 1u, projection_iterations, coupling_iterations);
+        for (uint32_t iteration = begin; iteration < end; ++iteration) {
+            if (iteration_work(iteration, xpbd_iterations, projection_iterations) != 0u)
+                add(phi::NkOp::XpbdProject, &p_xpbd_iterations_[iteration]);
+            const bool density_work = iteration_work(iteration, pbf_iterations, projection_iterations) != 0u;
+            const bool contact_work = iteration_work(iteration, pp_iterations, projection_iterations) != 0u;
+            if (density_work || contact_work) add(phi::NkOp::ParticleGridBuild, &p_grid_);
+            if (density_work) {
+                add(phi::NkOp::PbfDensityLambda, &p_pbf_density_);
+                add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
+            }
+            if (contact_work) add(phi::NkOp::ParticleParticleContact, &p_pp_contact_);
+            if (p_part_projection_velocity_.active_begin_per_env < per_env_particles)
+                add(phi::NkOp::ParticleProjectionVelocity, &p_part_projection_velocity_);
         }
-        if (contact_work) add(phi::NkOp::ParticleParticleContact, &p_pp_contact_);
-        if (p_part_projection_velocity_.active_begin_per_env < per_env_particles)
-            add(phi::NkOp::ParticleProjectionVelocity, &p_part_projection_velocity_);
     };
     project_particles(0u);
 
@@ -795,7 +803,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             if (pass != 0u) project_particles(pass);
             auto& solve = p_solve_iterations_[pass];
             solve = p_solve_;
-            solve.vel_iters = static_cast<uint16_t>(iteration_work(pass, cfg.vel_iters));
+            solve.vel_iters = static_cast<uint16_t>(iteration_work(pass, cfg.vel_iters, coupling_iterations));
             solve.pos_iters = pass + 1u == coupling_iterations ? p_solve_.pos_iters : 0u;
             solve.measure_contact_residual =
                 pass + 1u == coupling_iterations ? p_solve_.measure_contact_residual : 0u;

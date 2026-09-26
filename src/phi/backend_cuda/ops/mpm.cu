@@ -23,7 +23,7 @@
 #include "collision/primitive_surface.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "nk/material/hencky_j2.hpp"
+#include "nk/material/mpm_constitutive.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
 #include "nk/solve/collidable_owner.hpp"
 #include "phi/backend_cuda/launch.cuh"
@@ -312,208 +312,11 @@ const MpmSortScratchLayout& ScratchLayout(uint32_t particle_count, uint32_t node
     return entries.back().layout;
 }
 
-// Row-major 3x3 algebra matches particle_F/C packing.
-
-// C = A * B (row-major 3x3).
-__device__ __forceinline__ void Mat3Mul(const float* A, const float* B, float* C) {
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            C[r * 3 + c] = __fadd_rn(__fadd_rn(A[r * 3 + 0] * B[0 * 3 + c],
-                                               A[r * 3 + 1] * B[1 * 3 + c]),
-                                     A[r * 3 + 2] * B[2 * 3 + c]);
-}
-
-// C = A * B^T (row-major 3x3).
-__device__ __forceinline__ void Mat3MulT(const float* A, const float* B, float* C) {
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            C[r * 3 + c] = __fadd_rn(__fadd_rn(A[r * 3 + 0] * B[c * 3 + 0],
-                                               A[r * 3 + 1] * B[c * 3 + 1]),
-                                     A[r * 3 + 2] * B[c * 3 + 2]);
-}
-
-__device__ __forceinline__ float Mat3Det(const float* F) {
-    return F[0] * (F[4] * F[8] - F[5] * F[7]) -
-           F[1] * (F[3] * F[8] - F[5] * F[6]) +
-           F[2] * (F[3] * F[7] - F[4] * F[6]);
-}
-
-// Transposed inverse F^{-T} (row-major). Returns false (and leaves out unset) for a
-// near-singular F so the caller can fall back to a zero stress (degenerate cell).
-__device__ __forceinline__ bool Mat3InvTranspose(const float* F, float* out, float det) {
-    if (fabsf(det) < 1e-12f) return false;
-    const float inv = 1.0f / det;
-    // Cofactor matrix C; F^{-1} = C^T/det, so F^{-T} = C/det.
-    out[0] = (F[4] * F[8] - F[5] * F[7]) * inv;
-    out[1] = (F[5] * F[6] - F[3] * F[8]) * inv;
-    out[2] = (F[3] * F[7] - F[4] * F[6]) * inv;
-    out[3] = (F[2] * F[7] - F[1] * F[8]) * inv;
-    out[4] = (F[0] * F[8] - F[2] * F[6]) * inv;
-    out[5] = (F[1] * F[6] - F[0] * F[7]) * inv;
-    out[6] = (F[1] * F[5] - F[2] * F[4]) * inv;
-    out[7] = (F[2] * F[3] - F[0] * F[5]) * inv;
-    out[8] = (F[0] * F[4] - F[1] * F[3]) * inv;
-    return true;
-}
-
-// One symmetric Jacobi rotation eliminates S(p,q) and accumulates eigenvectors in V.
-__device__ __forceinline__ void JacobiRotate(float* S, float* V, int p, int q) {
-    const float spq = S[p * 3 + q];
-    if (spq == 0.0f) return;
-    const float spp = S[p * 3 + p], sqq = S[q * 3 + q];
-    const float theta = (sqq - spp) / (2.0f * spq);
-    const float sign = theta >= 0.0f ? 1.0f : -1.0f;
-    const float t = sign / (fabsf(theta) + sqrtf(theta * theta + 1.0f));
-    const float c = 1.0f / sqrtf(t * t + 1.0f);
-    const float s = t * c;
-    for (int k = 0; k < 3; ++k) {
-        const float sik = S[k * 3 + p], siq = S[k * 3 + q];
-        S[k * 3 + p] = c * sik - s * siq;
-        S[k * 3 + q] = s * sik + c * siq;
+struct CudaMpmArithmetic {
+    __device__ __forceinline__ static float Sum3(float a, float b, float c) {
+        return __fadd_rn(__fadd_rn(a, b), c);
     }
-    for (int k = 0; k < 3; ++k) {
-        const float skp = S[p * 3 + k], skq = S[q * 3 + k];
-        S[p * 3 + k] = c * skp - s * skq;
-        S[q * 3 + k] = s * skp + c * skq;
-        const float vkp = V[k * 3 + p], vkq = V[k * 3 + q];
-        V[k * 3 + p] = c * vkp - s * vkq;
-        V[k * 3 + q] = s * vkp + c * vkq;
-    }
-}
-
-// Eight Jacobi sweeps decompose F^T F; U = F V / sig completes the SVD.
-// Near-zero singular values use the corresponding V column.
-__device__ __forceinline__ void Svd3(const float* F, float* U, float* sig, float* V) {
-    float A[9];
-    // A := F^T F (symmetric); its eigenvectors are the right singular vectors V.
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            A[r * 3 + c] = __fadd_rn(__fadd_rn(F[0 * 3 + r] * F[0 * 3 + c],
-                                               F[1 * 3 + r] * F[1 * 3 + c]),
-                                     F[2 * 3 + r] * F[2 * 3 + c]);
-    for (int k = 0; k < 9; ++k) V[k] = (k % 4 == 0) ? 1.0f : 0.0f;  // V = I.
-    for (int sweep = 0; sweep < 8; ++sweep) {
-        JacobiRotate(A, V, 0, 1);
-        JacobiRotate(A, V, 0, 2);
-        JacobiRotate(A, V, 1, 2);
-    }
-    float s2[3] = {A[0], A[4], A[8]};
-    // Floor the singular values so volumetric stress stays bounded as J -> 0.
-    for (int i = 0; i < 3; ++i) sig[i] = fmaxf(sqrtf(fmaxf(s2[i], 0.0f)), 0.05f);
-    // U columns = F * V_col / sig (fall back to V_col when sig ~ 0).
-    for (int c = 0; c < 3; ++c) {
-        float fc[3];
-        for (int r = 0; r < 3; ++r)
-            fc[r] = F[r * 3 + 0] * V[0 * 3 + c] + F[r * 3 + 1] * V[1 * 3 + c] +
-                    F[r * 3 + 2] * V[2 * 3 + c];
-        if (sig[c] > 1e-8f) {
-            const float inv = 1.0f / sig[c];
-            for (int r = 0; r < 3; ++r) U[r * 3 + c] = fc[r] * inv;
-        } else {
-            for (int r = 0; r < 3; ++r) U[r * 3 + c] = V[r * 3 + c];
-        }
-    }
-    // Reflect (not just rotate): if det(U) < 0 flip the smallest-magnitude singular
-    // value so R = U V^T is the closest proper rotation (handles inverted elements).
-    if (Mat3Det(U) < 0.0f) {
-        int kmin = 0;
-        if (fabsf(sig[1]) < fabsf(sig[kmin])) kmin = 1;
-        if (fabsf(sig[2]) < fabsf(sig[kmin])) kmin = 2;
-        for (int r = 0; r < 3; ++r) U[r * 3 + kmin] = -U[r * 3 + kmin];
-        sig[kmin] = -sig[kmin];
-    }
-}
-
-// First Piola-Kirchhoff stress for fixed-corotated and Neo-Hookean elasticity.
-// mu/lambda are the Lame moduli; matrices use row-major float[9] storage.
-__device__ __forceinline__ void FirstPiola(const float* F, float mu, float lambda,
-                                           float model_kind, float* P) {
-    const float J = Mat3Det(F);
-    float FinvT[9];
-    const bool ok = Mat3InvTranspose(F, FinvT, J);
-    if (!ok) { for (int k = 0; k < 9; ++k) P[k] = 0.0f; return; }
-    if (model_kind > 1.5f) {  // Neo-Hookean elastic (kind 2).
-        const float lj = logf(fmaxf(J, 1e-8f));
-        for (int k = 0; k < 9; ++k)
-            P[k] = mu * (F[k] - FinvT[k]) + lambda * lj * FinvT[k];
-        return;
-    }
-    float U[9], sig[3], V[9], R[9];
-    Svd3(F, U, sig, V);
-    Mat3MulT(U, V, R);  // R = U * V^T (proper rotation).
-    const float coef = lambda * (J - 1.0f) * J;
-    for (int k = 0; k < 9; ++k)
-        P[k] = 2.0f * mu * (F[k] - R[k]) + coef * FinvT[k];
-}
-
-// Granular stress and stored elastic deformation share this Hencky-strain bound.
-constexpr float kSandHenckyCap = 0.15f;
-
-// Hencky elasticity: tau = U diag(2*mu*eps + lambda*tr(eps)) U^T.
-// eps_i = ln(sig_i) uses the stored elastic deformation.
-__device__ __forceinline__ void GranularKirchhoff(const float* F, float mu,
-                                                  float lambda, float* stress) {
-    float U[9], sig[3], V[9];
-    Svd3(F, U, sig, V);
-    float eps[3];
-    for (int i = 0; i < 3; ++i) {
-        eps[i] = logf(fmaxf(fabsf(sig[i]), 1.0e-6f));
-        eps[i] = fminf(fmaxf(eps[i], -kSandHenckyCap), kSandHenckyCap);
-    }
-    const float tr = eps[0] + eps[1] + eps[2];
-    float tau[3];
-    for (int i = 0; i < 3; ++i) tau[i] = 2.0f * mu * eps[i] + lambda * tr;
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            stress[r * 3 + c] = U[r * 3 + 0] * tau[0] * U[c * 3 + 0] +
-                                U[r * 3 + 1] * tau[1] * U[c * 3 + 1] +
-                                U[r * 3 + 2] * tau[2] * U[c * 3 + 2];
-}
-
-// Drucker-Prager return mapping of principal Hencky strains (Klar et al. 2016).
-// Cohesion shifts the tensile apex; friction_deg sets the yield-cone angle.
-__device__ __forceinline__ void SandReturnMap(float* F, float mu, float lambda,
-                                             float friction_deg, float cohesion) {
-    float U[9], sig[3], V[9];
-    Svd3(F, U, sig, V);
-    float eps[3], sgn[3];
-    for (int i = 0; i < 3; ++i) {
-        sgn[i] = sig[i] < 0.0f ? -1.0f : 1.0f;
-        eps[i] = logf(fmaxf(fabsf(sig[i]), 1.0e-6f));
-    }
-    const float tr = eps[0] + eps[1] + eps[2];
-    const float kappa = 3.0f * lambda + 2.0f * mu;             // d*lambda + 2*mu, d=3.
-    const float c0 = kappa > 1.0e-9f ? cohesion / kappa : 0.0f;  // apex tensile strain.
-    float dev[3];
-    for (int i = 0; i < 3; ++i) dev[i] = eps[i] - tr * (1.0f / 3.0f);
-    const float devn = sqrtf(dev[0] * dev[0] + dev[1] * dev[1] + dev[2] * dev[2]);
-    const float sinp = sinf(friction_deg * 0.017453292519943295f);
-    const float alpha = 1.632993161855452f * sinp / fmaxf(3.0f - sinp, 1.0e-6f);
-    const float tr_shift = tr - c0;
-    float en[3];
-    if (devn < 1.0e-12f || tr_shift > 0.0f) {
-        for (int i = 0; i < 3; ++i) en[i] = c0 * (1.0f / 3.0f);  // return to the apex.
-    } else {
-        const float dgamma = devn + (kappa / (2.0f * mu)) * tr_shift * alpha;
-        if (dgamma <= 0.0f) {
-            for (int i = 0; i < 3; ++i) en[i] = eps[i];           // inside the cone.
-        } else {
-            const float inv = 1.0f / devn;                        // radial return.
-            for (int i = 0; i < 3; ++i) en[i] = eps[i] - dgamma * dev[i] * inv;
-        }
-    }
-    float s2[3];
-    for (int i = 0; i < 3; ++i) {
-        // Cap the STORED elastic strain: the overflow is plastic densification, so
-        // the state the next substep stresses can never spiral (bounded restoring).
-        en[i] = fminf(fmaxf(en[i], -kSandHenckyCap), kSandHenckyCap);
-        s2[i] = sgn[i] * expf(en[i]);
-    }
-    float US[9];
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c) US[r * 3 + c] = U[r * 3 + c] * s2[c];
-    Mat3MulT(US, V, F);  // F = US * V^T = U diag(s2) V^T.
-}
+};
 
 // MPM interval status is refreshed; shared invalid-endpoint status stays latched.
 __global__ void MpmClearStatusBitsKernel(uint32_t* env_status, uint32_t env_count) {
@@ -553,55 +356,12 @@ __device__ __forceinline__ bool MpmParticleStress(
     }
     const uint32_t mid = part_mat != nullptr ? part_mat[p] : 0u;
     if (material_count > 0u && mid >= material_count) return false;
-    float youngs = 0.0f, poisson = 0.0f, kind = 0.0f;
-    float bulk = 0.0f, tait_gamma = 0.0f, visc = 0.0f;
-    if (material_table != nullptr && mid < material_count) {
-        const nk::MpmMaterial& mr = material_table[mid];
-        youngs = mr.youngs; poisson = mr.poisson; kind = mr.model_kind;
-        bulk = mr.bulk_modulus; tait_gamma = mr.tait_gamma; visc = mr.viscosity;
-    }
-    const float* F = part_F + static_cast<size_t>(p) * 9u;
-    if (kind == nk::MpmMaterial::kHenckyJ2) {
-        const nk::MpmMaterial& mr = material_table[mid];
-        nk::material::HenckyResponse response;
-        if (nk::material::EvaluateHenckyJ2(F,
-                {mr.youngs, mr.poisson, mr.yield_stress, mr.hardening_modulus}, response) !=
-            nk::material::ConstitutiveStatus::Ok) return false;
-        for (int k = 0; k < 9; ++k) stress[k] = response.kirchhoff[k];
-    } else if (kind > 3.5f) {
-        const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
-        const float mu = youngs / (2.0f * (1.0f + poisson));
-        const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
-        GranularKirchhoff(F, mu, lambda, stress);
-    } else if (kind > 2.5f) {
-        const float J = Mat3Det(F);
-        const float pr = fmaxf(bulk * (powf(J, -tait_gamma) - 1.0f), 0.0f);
-        const float diag = -pr * J;
-        stress[0] = diag; stress[1] = 0.0f; stress[2] = 0.0f;
-        stress[3] = 0.0f; stress[4] = diag; stress[5] = 0.0f;
-        stress[6] = 0.0f; stress[7] = 0.0f; stress[8] = diag;
-        if (visc > 0.0f && part_C != nullptr) {
-            const float* C = part_C + static_cast<size_t>(p) * 9u;
-            const float Jv = J * visc;
-            stress[0] += Jv * 2.0f * C[0];
-            stress[4] += Jv * 2.0f * C[4];
-            stress[8] += Jv * 2.0f * C[8];
-            const float s01 = Jv * (C[1] + C[3]);
-            const float s02 = Jv * (C[2] + C[6]);
-            const float s12 = Jv * (C[5] + C[7]);
-            stress[1] += s01; stress[3] += s01;
-            stress[2] += s02; stress[6] += s02;
-            stress[5] += s12; stress[7] += s12;
-        }
-    } else {
-        const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
-        const float mu = youngs / (2.0f * (1.0f + poisson));
-        const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
-        float P[9];
-        FirstPiola(F, mu, lambda, kind, P);
-        Mat3MulT(P, F, stress);
-    }
-    return true;
+    const nk::MpmMaterial material = material_table != nullptr && mid < material_count
+        ? material_table[mid] : nk::MpmMaterial{};
+    const size_t offset = static_cast<size_t>(p) * 9u;
+    return nk::material::EvaluateMpmKirchhoff<CudaMpmArithmetic>(material,
+        part_F + offset, part_C != nullptr ? part_C + offset : nullptr, stress) ==
+        nk::material::ConstitutiveStatus::Ok;
 }
 
 __global__ void MpmCellKeysKernel(uint32_t mpm_count,
@@ -628,12 +388,11 @@ __global__ void MpmCellKeysKernel(uint32_t mpm_count,
     const int64_t bx = nonfinite ? 0 : static_cast<int64_t>(floorf(gx - 0.5f));
     const int64_t by = nonfinite ? 0 : static_cast<int64_t>(floorf(gy - 0.5f));
     const int64_t bz = nonfinite ? 0 : static_cast<int64_t>(floorf(gz - 0.5f));
-    // Walled x/y faces + plane floor contain a pressed particle (flag only a base off
-    // the grid there); the open +z top flags a stencil clip (base+2 past the ceiling).
+    // A clipped transfer stencil invalidates partition of unity on every grid face.
     const int64_t bx64 = bx, by64 = by, bz64 = bz;
     const bool escaped = nonfinite ||
-                         bx64 < 0 || bx64 >= static_cast<int64_t>(dims_x) ||
-                         by64 < 0 || by64 >= static_cast<int64_t>(dims_y) ||
+                         bx64 < 0 || bx64 + 2 >= static_cast<int64_t>(dims_x) ||
+                         by64 < 0 || by64 + 2 >= static_cast<int64_t>(dims_y) ||
                          bz64 < 0 || bz64 + 2 >= static_cast<int64_t>(dims_z);
     if (escaped && env_status != nullptr) {
         atomicOr(&env_status[env], kEnvStatusMpmGridEscape);
@@ -999,59 +758,22 @@ __global__ void MpmUpdateFKernel(uint32_t mpm_count, float dt,
     const uint32_t p = MpmSliceGlobal(t, mpm_per_env, particles_per_env, env_unused);
     const float* C = part_C + static_cast<size_t>(p) * 9u;
     float* F = part_F + static_cast<size_t>(p) * 9u;
-    float kind = 0.0f, youngs = 0.0f, poisson = 0.0f, dpf = 0.0f, dpc = 0.0f;
-    const nk::MpmMaterial* material = nullptr;
-    if (part_mat != nullptr && material_table != nullptr) {
-        const uint32_t mid = part_mat[p];
-        if (mid < material_count) {
-            material = material_table + mid;
-            youngs = material->youngs; poisson = material->poisson;
-            dpf = material->dp_friction; dpc = material->dp_cohesion;
-            kind = material->model_kind;
-        }
-    }
-    if (kind == nk::MpmMaterial::kHenckyJ2) {
-        if (part_plastic_F == nullptr || part_plastic == nullptr) {
-            atomicOr(&env_status[p / particles_per_env], kEnvStatusConstitutiveFailure);
-            return;
-        }
-        float map[9], trial[9];
-        for (int k = 0; k < 9; ++k) map[k] = dt * C[k] + (k % 4 == 0 ? 1.0f : 0.0f);
-        Mat3Mul(map, F, trial);
-        if (nk::material::ReturnHenckyJ2(trial,
-                {youngs, poisson, material->yield_stress, material->hardening_modulus},
-                F, part_plastic_F + static_cast<size_t>(p) * 9u, part_plastic[p]) !=
-            nk::material::ConstitutiveStatus::Ok)
-            atomicOr(&env_status[p / particles_per_env], kEnvStatusConstitutiveFailure);
-    } else if (kind > 3.5f) {  // granular: elastic predictor and Drucker-Prager return.
-        float IpdtC[9];
-        for (int k = 0; k < 9; ++k) IpdtC[k] = dt * C[k];
-        IpdtC[0] += 1.0f; IpdtC[4] += 1.0f; IpdtC[8] += 1.0f;
-        float Fn[9];
-        for (int k = 0; k < 9; ++k) Fn[k] = F[k];
-        Mat3Mul(IpdtC, Fn, F);  // trial elastic F = (I + dt*C) * F^n.
-        const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
-        const float mu = youngs / (2.0f * (1.0f + poisson));
-        const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
-        SandReturnMap(F, mu, lambda, dpf, dpc);
-    } else if (kind > 2.5f) {  // fluid: volume-only update J *= (1 + dt*tr C), F = cbrt(J)*I.
-        // Shear leaves a fluid's volume unchanged, so track J off the divergence tr(C);
-        // no det of the full affine map => no shear-driven inversion at a hard impact.
-        const float Jraw = Mat3Det(F) * (1.0f + dt * (C[0] + C[4] + C[8]));
-        if (!(Jraw > 0.0f) || !isfinite(Jraw)) {
-            if (env_status != nullptr)
-                atomicOr(&env_status[p / particles_per_env], kEnvStatusMpmGridEscape);
-            return;
-        }
-        const float s = cbrtf(Jraw);
-        for (int k = 0; k < 9; ++k) F[k] = (k % 4 == 0) ? s : 0.0f;
-    } else {  // elastic: F^{n+1} = (I + dt*C) F^n.
-        float IpdtC[9];
-        for (int k = 0; k < 9; ++k) IpdtC[k] = dt * C[k];
-        IpdtC[0] += 1.0f; IpdtC[4] += 1.0f; IpdtC[8] += 1.0f;
-        float Fn[9];
-        for (int k = 0; k < 9; ++k) Fn[k] = F[k];
-        Mat3Mul(IpdtC, Fn, F);  // (I + dt*C) * F^n.
+    nk::MpmMaterial material;
+    if (part_mat != nullptr && material_table != nullptr && part_mat[p] < material_count)
+        material = material_table[part_mat[p]];
+    float* plastic_f = part_plastic_F != nullptr ? part_plastic_F + static_cast<size_t>(p) * 9u : nullptr;
+    float* plastic_strain = part_plastic != nullptr ? part_plastic + p : nullptr;
+    const nk::material::MpmMaterialHistory history{F, plastic_f,
+        plastic_strain != nullptr ? *plastic_strain : 0.0f};
+    nk::material::MpmMaterialTrial trial;
+    const auto status = nk::material::EvaluateMpmMaterialTrial<CudaMpmArithmetic>(
+        material, history, C, dt, trial);
+    if (status != nk::material::ConstitutiveStatus::Ok ||
+        !nk::material::CommitMpmMaterialTrial(trial, F, plastic_f, plastic_strain)) {
+        const uint32_t flag = material.model_kind == 3.0f &&
+            status == nk::material::ConstitutiveStatus::SingularDeformation
+            ? kEnvStatusMpmGridEscape : kEnvStatusConstitutiveFailure;
+        if (env_status != nullptr) atomicOr(&env_status[p / particles_per_env], flag);
     }
 }
 

@@ -69,7 +69,8 @@ public:
     }
 
     void Update(const RtContext& ctx, ParticlePositionSource source, uint32_t envs,
-                SensorBlasRef* refs, uint32_t mesh_count) {
+                SensorBlasRef* refs, uint32_t mesh_count,
+                const std::vector<std::vector<runtime::fluid::FluidSurfaceBoundary>>& boundaries) {
         if (!source.positions || envs == 0u || envs > source.env_count ||
             source.particles_per_env != particles_per_env_)
             throw std::invalid_argument("reconstructed particle source is missing environments");
@@ -95,7 +96,8 @@ public:
             const auto begin = positions_.begin() + size_t{env} * count_;
             samples_.assign(begin, begin + count_);
             if (density) {
-                meshes_[env] = runtime::fluid::MarchFluidSurface(samples_, binding_.density);
+                meshes_[env] = runtime::fluid::MarchFluidSurface(samples_, binding_.density,
+                    boundaries.empty() ? std::vector<runtime::fluid::FluidSurfaceBoundary>{} : boundaries[env]);
             } else {
                 const auto& p = binding_.grains;
                 meshes_[env] = runtime::BakeParticleSpheres(samples_, 0u, count_, p.radius,

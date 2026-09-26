@@ -384,7 +384,8 @@ __global__ void BatchedSensorTraceKernel(const PinholeCamera* __restrict__ camer
             Vec3 shade_normal = snf;
             if (smat.transmission > 0.0f || sky.smooth_normals != 0u) {
                 const Vec3 smooth = SmoothWorldNormal(env_inst, bp, su, sv, sn);
-                shade_normal = smooth.Dot(sV) < 0.0f ? smooth * -1.0f : smooth;
+                shade_normal = smat.transmission > 0.0f || smooth.Dot(sV) >= 0.0f
+                    ? smooth : smooth * -1.0f;
             }
             Vec3 col;
             if (smat.transmission > 0.0f) {
@@ -594,6 +595,10 @@ struct BatchedSensorSceneDevice::Impl {
     ParticlePositionSource particles;
     std::vector<particle_surface_detail::SurfaceCache> particle_surfaces;
     std::vector<particle_surface_detail::ReconstructedSurfaceCache> reconstructed_surfaces;
+    std::vector<runtime::fluid::FluidSurfaceBoundary> fluid_boundaries;
+    std::vector<uint32_t> boundary_instances;
+    std::vector<DevInstance> host_instances;
+    std::vector<std::vector<runtime::fluid::FluidSurfaceBoundary>> env_boundaries;
     OwnedBuffer d_env_blas_refs;
     size_t env_blas_refs_bytes = 0u;
     uint32_t mesh_count = 0u, blas_ref_envs = 0u;
@@ -710,6 +715,24 @@ BatchedSensorSceneDevice BuildBatchedSensorScene(const BatchedSensorSceneDesc& d
             impl->particle_surfaces.emplace_back(surface, desc.particles.particles_per_env, ctx);
         else
             impl->reconstructed_surfaces.emplace_back(surface, desc.particles.particles_per_env);
+    }
+
+    const bool have_density = std::any_of(desc.particle_surfaces.begin(), desc.particle_surfaces.end(),
+        [](const auto& s) { return s.kind == ParticleSurfaceBinding::Kind::Density; });
+    if (have_density) {
+        for (uint32_t i = 0u; i < m; ++i) {
+            const uint32_t mesh = desc.blas_id[i];
+            if (bound_meshes[mesh] || desc.scene.meshes[mesh].triangles.empty()) continue;
+            render::MeshGeometry geometry;
+            for (const auto& triangle : desc.scene.meshes[mesh].triangles) {
+                for (const auto v : {triangle.v0, triangle.v1, triangle.v2}) {
+                    geometry.indices.push_back(static_cast<uint32_t>(geometry.indices.size()));
+                    geometry.positions.insert(geometry.positions.end(), {v.x, v.y, v.z});
+                }
+            }
+            impl->fluid_boundaries.emplace_back(geometry);
+            impl->boundary_instances.push_back(i);
+        }
     }
 
     impl->light = desc.scene.light;
@@ -1008,6 +1031,24 @@ void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ct
     auto* d_nodes = static_cast<LbvhNode*>(impl->d_tlas_nodes.Data());
 
     const auto* blas_refs = static_cast<const SensorBlasRef*>(impl->d_blas_refs.Data());
+    if (!impl->fluid_boundaries.empty()) {
+        ScatterEnvInstances(ctx.stream, fk,
+            static_cast<const phi::InstanceScatterRow*>(impl->d_rows.Data()),
+            static_cast<const uint32_t*>(impl->d_blas_id.Data()),
+            static_cast<const uint32_t*>(impl->d_material_id.Data()),
+            blas_refs, env_count, m, d_instances, d_world_aabbs, 0u);
+        impl->host_instances.resize(total_inst);
+        CheckCuda(cudaMemcpyAsync(impl->host_instances.data(), d_instances,
+            total_inst * sizeof(DevInstance), cudaMemcpyDeviceToHost, ctx.stream), "download fluid boundary poses");
+        CheckCuda(cudaStreamSynchronize(ctx.stream), "wait for fluid boundary poses");
+        impl->env_boundaries.resize(env_count);
+        for (uint32_t env = 0u; env < env_count; ++env) {
+            auto& boundaries = impl->env_boundaries[env];
+            boundaries = impl->fluid_boundaries;
+            for (size_t i = 0u; i < boundaries.size(); ++i)
+                boundaries[i].transform = impl->host_instances[size_t{env} * m + impl->boundary_instances[i]].transform;
+        }
+    }
     uint32_t blas_refs_per_env = 0u;
     if (!impl->particle_surfaces.empty() || !impl->reconstructed_surfaces.empty()) {
         const uint64_t count = uint64_t{env_count} * impl->mesh_count;
@@ -1024,7 +1065,7 @@ void EnsureEnvTopology(BatchedSensorSceneDevice::Impl* impl, const RtContext& ct
         for (auto& surface : impl->particle_surfaces)
             surface.Update(ctx, impl->particles, env_count, live_refs, impl->mesh_count);
         for (auto& surface : impl->reconstructed_surfaces)
-            surface.Update(ctx, impl->particles, env_count, live_refs, impl->mesh_count);
+            surface.Update(ctx, impl->particles, env_count, live_refs, impl->mesh_count, impl->env_boundaries);
         blas_refs = live_refs;
         blas_refs_per_env = impl->mesh_count;
     }

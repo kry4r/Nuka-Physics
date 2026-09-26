@@ -78,6 +78,36 @@ TEST(FluidCooker, BoxCooksToExpectedCountAndMass) {
     }
 }
 
+TEST(FluidCooker, AdjacentTranslatedFillsPreserveLatticeAndVolume) {
+    FluidBoxSpec left;
+    left.min_corner = {1.2f, -0.6f, 0.06f};
+    left.max_corner = {4.2f, 0.6f, 0.24f};
+    left.spacing = 0.02f;
+    auto right = left;
+    right.min_corner.x = left.max_corner.x;
+    right.max_corner.x = 4.5f;
+    const auto lc = FluidBoxLatticeCounts(left), rc = FluidBoxLatticeCounts(right);
+    ASSERT_EQ(lc.nx, 150u);
+    ASSERT_EQ(lc.ny, 60u);
+    ASSERT_EQ(lc.nz, 9u);
+    ASSERT_EQ(rc.nx, 15u);
+    EXPECT_EQ(rc.ny, lc.ny);
+    EXPECT_EQ(rc.nz, lc.nz);
+    const auto a = CookFluidBox(left), b = CookFluidBox(right);
+    const double mass = double(a.positions.size()) * a.particle_mass +
+                        double(b.positions.size()) * b.particle_mass;
+    EXPECT_NEAR(mass, 3.3 * 1.2 * 0.18 * 1000.0, 1.0e-3);
+    for (uint32_t row = 0u; row < lc.ny * lc.nz; ++row) {
+        const auto tail = a.positions[row * lc.nx + lc.nx - 1u];
+        const auto head = b.positions[row * rc.nx];
+        EXPECT_NEAR(head.x - tail.x, left.spacing, 1.0e-6f);
+        EXPECT_EQ(head.y, tail.y);
+        EXPECT_EQ(head.z, tail.z);
+    }
+    right.max_corner.x -= 0.001f;
+    EXPECT_EQ(FluidBoxLatticeCounts(right).nx, 14u);
+}
+
 // Gate 3(3): every particle sits at a cell center on the lattice, inside the box.
 TEST(FluidCooker, ParticlesAreCellCenteredInsideBox) {
     FluidBoxSpec spec;

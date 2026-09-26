@@ -65,7 +65,7 @@ inline constexpr uint32_t kContactLawCompliant = 0u;
 inline constexpr uint32_t kContactLawVelocity = 1u;
 // Speculative contacts close positive gaps; existing overlap is removed by the position solve.
 inline constexpr uint32_t kContactLawSpeculative = 2u;
-inline constexpr uint32_t kMpmBoundaryCount = 6u;  // floor, x-/x+, y-/y+, grid lower z
+inline constexpr uint32_t kMpmBoundaryCount = 1u;  // Authored floor; containers use collidable geometry.
 
 namespace nk_row_flags {
 inline constexpr uint32_t kActive       = 1u << 0;

@@ -299,3 +299,36 @@ TEST(FluidSurfaceMesher, SphereOfParticlesIsRoughlySpherical) {
                 mean, stdev, stdev / mean, rmin, rmax);
     EXPECT_LT(stdev / mean, 0.20) << "a sphere of particles should mesh to a thin spherical shell";
 }
+
+TEST(FluidSurfaceMesher, SolidWallPreservesFlatContactSurface) {
+    const float spacing = 0.02f, height = 0.16f;
+    const auto particles = SettledPool(12, 12, 8, spacing, {0, 0, 0});
+    const auto params = nuka::runtime::fluid::DensitySurfaceParams(spacing);
+    MeshGeometry wall;
+    wall.positions = {-0.10f,-0.10f,-0.10f, 0,-0.10f,-0.10f, 0,0.34f,-0.10f, -0.10f,0.34f,-0.10f,
+                      -0.10f,-0.10f,0.30f, 0,-0.10f,0.30f, 0,0.34f,0.30f, -0.10f,0.34f,0.30f};
+    wall.indices = {0,2,1,0,3,2, 4,5,6,4,6,7, 0,1,5,0,5,4,
+                    1,2,6,1,6,5, 2,3,7,2,7,6, 3,0,4,3,4,7};
+    nuka::runtime::fluid::FluidSurfaceBoundary boundary(wall);
+    float distance; Vec3 normal;
+    ASSERT_TRUE(boundary.Sample({0.01f,0.12f,0.12f}, params.h, distance, normal));
+    EXPECT_NEAR(distance, 0.01f, 1e-6f);
+    EXPECT_NEAR(normal.x, 1.0f, 1e-6f);
+    const auto mesh = MarchFluidSurface(particles, params, {boundary});
+    const auto repeated = MarchFluidSurface(particles, params, {boundary, boundary});
+    EXPECT_EQ(mesh.positions, repeated.positions);
+    EXPECT_EQ(mesh.normals, repeated.normals);
+    const auto stats = Analyze(mesh);
+    EXPECT_EQ(stats.boundary_edges, 0);
+    EXPECT_EQ(stats.nonmanifold_edges, 0);
+    size_t measured = 0u;
+    for (size_t i = 0u; i < mesh.positions.size(); i += 3u) {
+        if (mesh.positions[i] < 0.0f || mesh.positions[i] > spacing ||
+            mesh.positions[i + 1u] < 0.08f || mesh.positions[i + 1u] > 0.16f ||
+            mesh.positions[i + 2u] < height - spacing) continue;
+        EXPECT_NEAR(mesh.positions[i + 2u], height, 0.15f * spacing);
+        ++measured;
+    }
+    EXPECT_GT(measured, 4u);
+    EXPECT_GE(stats.lo.x, -params.cell_size * 0.5f);
+}

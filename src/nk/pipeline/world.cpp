@@ -142,7 +142,8 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         model_.particles.mode == Model::ParticleMode::SoftFluid ||
         (model_.particles.mode == Model::ParticleMode::Coupled &&
          model_.particles.coupled_internal == Model::CoupledInternal::Pbf);
-    const uint32_t particle_grid_count = runs_pbf
+    const bool particle_contact = model_.particles.pp_self_contact && model_.particles.pp_contact_d_min > 0.0f;
+    const uint32_t particle_grid_count = runs_pbf || particle_contact
         ? model_.capacities.particles_per_env * model_.capacities.env_count : 0u;
     if (particle_grid_count > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
         creation_status_ = phi::Status::InvalidArgument;
@@ -786,6 +787,27 @@ phi::Status World::SetGravity(const math::Vec3& gravity) {
     pipeline_ = std::move(candidate);
     cfg_ = config;
     state_sensors_.SetGravity(gravity);
+    return last_status_ = phi::Status::Ok;
+}
+
+phi::Status World::SetCouplingPasses(uint32_t passes) {
+    if (!ready_ || passes > UINT16_MAX) return last_status_ = phi::Status::InvalidArgument;
+    if (passes == cfg_.coupling_passes) return last_status_ = phi::Status::Ok;
+    auto config = cfg_;
+    config.coupling_passes = static_cast<uint16_t>(passes);
+    auto candidate = std::make_unique<Pipeline>();
+    last_status_ = candidate->Build(model_, config, device_, readout_demand_, &state_sensors_);
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    if (plan_ != nullptr) {
+        phi::BackendPlanFree(backend_, plan_);
+        plan_ = nullptr;
+    }
+    plan_attempted_ = false;
+    graph_error_ = {};
+    pipeline_ = std::move(candidate);
+    cfg_ = config;
     return last_status_ = phi::Status::Ok;
 }
 

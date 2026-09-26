@@ -121,13 +121,49 @@ cook::MpmCookInput BuildPoolInput() {
     return in;
 }
 
-// Cook the pool via the config SELECTOR (sim_method == mlsmpm), no hardcoded mode.
+void AddPoolWalls(nk::Model& model, uint32_t env_count) {
+    const float inner = kTankHalfXY - kDx;
+    const float height = kPoolTopZ + 8.0f * kDx;
+    for (uint32_t axis = 0u; axis < 2u; ++axis) for (float sign : {-1.0f, 1.0f}) {
+        nk::Model::BodyInit body;
+        body.pose = Transform::Identity();
+        body.pose.position = axis == 0u ? Vec3{sign * (inner + kDx), 0, height * 0.5f}
+            : Vec3{0, sign * (inner + kDx), height * 0.5f};
+        body.inv_mass = 0.0f; body.inv_inertia = {};
+        nk::Model::PairDrivenShape shape;
+        shape.kind = kKindBox;
+        shape.params[0] = axis == 0u ? kDx : inner + 2.0f * kDx;
+        shape.params[1] = axis == 1u ? kDx : inner + 2.0f * kDx;
+        shape.params[2] = height * 0.5f;
+        shape.body_id = static_cast<int32_t>(model.body_init.size());
+        shape.contype = 1u; shape.conaffinity = 1u; shape.sdf_grid = ~0u;
+        model.body_init.push_back(body);
+        model.shape_table_rows.push_back(shape);
+    }
+    const uint32_t bodies = static_cast<uint32_t>(model.body_init.size());
+    model.capacities.bodies_per_env = bodies;
+    model.capacities.max_bodies_total = bodies * env_count;
+    model.capacities.max_contacts_per_env = 16u;
+    model.capacities.max_rows_per_env = 16u * nk::kPairDrivenRowsPerSlot;
+    model.samp_ranges.resize(size_t{bodies} * 2u, 0u);
+    if (!model.mesh_surface_info.empty()) model.mesh_surface_info.resize(bodies);
+    if (!model.body_collidable_body.empty()) {
+        model.body_collidable_body.resize(bodies, ~0u);
+        model.body_collidable_link.resize(bodies, ~0u);
+        model.body_collidable_local.resize(bodies, Transform::Identity());
+    }
+    model.particles.mpm_body_friction = 0.0f;
+}
+
+// The pool uses ordinary finite box colliders, independent of grid storage bounds.
 nk::Model BuildPoolModel() {
     nk::Model m;
     m.capacities.env_count = 1u;
+    AddPoolWalls(m, 1u);
     cook::XpbdCookInput soft;
     soft.solver = nk::Model::ParticleMode::Mpm;
     cook::CookSoftBodyParticles(m, 1u, soft, BuildPoolInput());
+    m.particles.mpm_body_friction = 0.0f;
     return m;
 }
 
@@ -294,6 +330,7 @@ nk::Model BuildPoolWithBodyModel(bool with_sdf, bool proxy, uint32_t env_count,
         }
     }
 
+    AddPoolWalls(m, env_count);
     nk::ModelCapacities& cap = m.capacities;
     const uint32_t bodies = static_cast<uint32_t>(m.body_init.size());
     cap.bodies_per_env = bodies;
@@ -427,7 +464,7 @@ TEST(MpmFluidRest, GridMassMomentumDeterministicAndConserved) {
         const uint32_t P = m.capacities.particles_per_env;
         const uint32_t nodes = m.capacities.mpm_grid_nodes_per_env;
         nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
-        if (!w.Ready()) return false;
+        if (!w.Ready()) { ADD_FAILURE() << w.CreationError(); return false; }
         for (uint32_t s = 0; s < 120u; ++s) w.Step();
         mass_out.assign(nodes, 0.0f);
         mom_out.assign(nodes, Vec3::Zero());

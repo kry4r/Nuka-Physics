@@ -106,6 +106,8 @@ def main():
     parser.add_argument("--envs", type=int, default=1)
     parser.add_argument("--gains", choices=("deployment", "training"), default="deployment")
     parser.add_argument("--execution", choices=("graph", "eager"), default="graph")
+    parser.add_argument("--coupling-passes", type=int, default=0,
+                        help="Contact exchanges per interval; 0 follows material iteration count")
     # 12 sweeps track the 32-sweep trajectory to 0.7% at 1.94x the speed.
     parser.add_argument("--solver-vel-iters", type=int, default=12,
                         help="velocity sweep budget; 0 keeps the scene's own value")
@@ -164,6 +166,7 @@ def main():
         observation_source=observation_source, proprioception_config=proprioception,
         solver_options=solver_options)
     try:
+        controller.world.set_coupling_passes(args.coupling_passes)
         camera = None
         if args.sensors or args.sensor_config or args.terrain_config or uses_images or uses_terrain:
             values = json.loads(args.sensor_config.read_text()) if args.sensor_config else (task_config.get("camera") or {})
@@ -189,6 +192,8 @@ def main():
             "scene_sha256": hashlib.sha256(args.scene.read_bytes()).hexdigest(),
             "dt": args.dt, "policy_dt": controller.contract.step_dt, "envs": args.envs,
             "command": args.command, "particles": controller.world.particle_count,
+            "coupling_passes": args.coupling_passes,
+            "solver_vel_iters": args.solver_vel_iters,
             "execution": args.execution, "observation_source": observation_source,
             "camera_enabled": camera is not None, "policy_uses_images": uses_images,
             "policy_uses_terrain": uses_terrain,

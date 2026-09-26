@@ -468,6 +468,8 @@ public:
         float    pp_contact_d_min      = 0.0f;   // 2*contact_radius (0 => off)
         float    pp_contact_compliance = 0.0f;   // XPBD alpha (0 => rigid)
         uint32_t pp_contact_iters      = 1u;     // Jacobi gather+apply sweeps
+        // Authored self-contact runs the same particle contact over a single soft set.
+        bool     pp_self_contact       = false;
     };
     ModelParticles particles;
 

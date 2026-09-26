@@ -754,7 +754,7 @@ struct SolveRowsBlockIslandParams {
     // Validation hook (NUKA_FORCE_STATIC_ISLANDS): run the conservative cook-time
     // one-island-per-env schedule instead of the dynamic CC pass, to A/B them. 0 == off.
     uint32_t force_static_islands;
-    uint32_t continue_impulses = 0u; // Retain this step's applied impulses across solver calls.
+    uint32_t continue_impulses = 0u; // Continue the same assembled rows without reapplying impulses.
     uint32_t measure_contact_residual = 0u;
     uint32_t total_grid_count = 0u;
     uint64_t workspace_bytes = 0u;
@@ -913,7 +913,7 @@ struct ParticleParticleContactParams {
     // The position-based co-step uses alpha_tilde = compliance_alpha (dt folded 1).
     float    compliance_alpha;
     uint32_t solver_iterations; // full Jacobi gather+apply sweeps per call (>=1).
-    uint32_t mode;              // kParticleMode* (only SoftFluid runs the op).
+    uint32_t mode;              // kParticleMode* (SoftFluid, or an authored self-contact).
     uint32_t particle_count;    // total env-major union particles.
     // The per-env [soft | fluid] split + stride; the contact row is class-blind so
     // these are carried only for symmetry with the other particle ops + future

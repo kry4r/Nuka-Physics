@@ -250,6 +250,15 @@ void PublishStudioScene(StudioScene& scene,
             scene.world.instances[i].world_xform = link_pose[lk] * scene.visual_local[i];
     }
 
+    if (!scene.density_surfaces.empty()) {
+        if (scene.fluid_boundaries.empty()) {
+            for (const auto& instance : scene.world.instances)
+                scene.fluid_boundaries.emplace_back(scene.world.meshes.Geometry(instance.mesh_id));
+        }
+        for (size_t i = 0u; i < scene.fluid_boundaries.size(); ++i)
+            scene.fluid_boundaries[i].transform = scene.world.instances[i].world_xform;
+    }
+
     // Rebuild every deforming surface from the live particles over its own triangle
     // topology; each mesh id is stable (interned once) so the table never grows.
     for (std::size_t si = 0; si < scene.surfaces.size(); ++si) {
@@ -304,7 +313,7 @@ void PublishStudioScene(StudioScene& scene,
             throw std::out_of_range("Density surface particle count exceeds the state");
         const auto begin = particle_pos.begin() + surface.first;
         const std::vector<Vec3> positions(begin, begin + count);
-        MeshGeometry mesh = runtime::fluid::MarchFluidSurface(positions, surface.params);
+        MeshGeometry mesh = runtime::fluid::MarchFluidSurface(positions, surface.params, scene.fluid_boundaries);
         if (surface.mesh_id == kNoId) {
             if (mesh.positions.empty()) continue;
             surface.mesh_id = scene.world.meshes.InternPrimitive(

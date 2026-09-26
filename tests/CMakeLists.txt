@@ -1774,6 +1774,24 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_lbvh_batched_test
         PROPERTIES LABELS "fast_full")
 
+    # Point-mass endpoint operators and the compliant contact fixed point against dense
+    # references over merged mass degrees of freedom. Drives union_types.cuh, so a .cu.
+    add_executable(nuka_point_endpoint_operator_test
+        solver/test_point_endpoint_operator.cu
+    )
+    target_include_directories(nuka_point_endpoint_operator_test
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(nuka_point_endpoint_operator_test
+        PRIVATE
+            nuka_phi
+            CUDA::cudart
+            GTest::gtest_main
+    )
+    gtest_discover_tests(nuka_point_endpoint_operator_test
+        PROPERTIES LABELS "fast_full")
+
     # --- v0.7 p05: particle uniform grid + cross-system broadphase ---------
     # Correctness vs CPU brute-force + D1 two-run byte-exact for both the
     # particle neighbor grid and the particle->rigid cross-system query (which

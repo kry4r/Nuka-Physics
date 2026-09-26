@@ -277,6 +277,10 @@ typedef struct nuka_world_execution_info_t {
 // Graph selection captures one step without advancing state and fails explicitly if unavailable.
 // Reset preserves the graph; changes to the operator sequence invalidate it.
 nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execution_mode_t mode);
+
+// Contact exchanges per interval, 0..65535; zero follows material iterations.
+// Material budgets and timestep stay fixed; a changed value invalidates the execution graph.
+nuka_result_t nuka_world_set_coupling_passes(nuka_world_handle world, uint32_t passes);
 // Initialize struct_size and schema_version before querying execution information.
 nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out);
 // Wait for submitted physics work and report asynchronous device errors.

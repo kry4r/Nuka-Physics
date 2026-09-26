@@ -159,6 +159,7 @@ struct XpbdCookInput {
     // routes the cook to CookMpmParticles instead (ParticleMode::Mpm + material).
     nk::Model::ParticleMode solver = nk::Model::ParticleMode::Xpbd;
     std::vector<CookParticleSurface> surfaces;
+    bool self_contact = false;  // particles collide across folds and layers
 };
 
 // Stage an XPBD soft body into the Model (single-env template; SeedInitialState

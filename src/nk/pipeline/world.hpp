@@ -65,6 +65,9 @@ public:
     phi::Status SetGravity(const math::Vec3& gravity);
     math::Vec3 Gravity() const { return {cfg_.gravity[0], cfg_.gravity[1], cfg_.gravity[2]}; }
 
+    // Changes contact exchange frequency while retaining material iterations and interval length.
+    phi::Status SetCouplingPasses(uint32_t passes);
+
     // Update one template link's spatial inertia in every environment without reallocating.
     phi::Status SetLinkInertia(uint32_t link_index, const Mat36& inertia);
 

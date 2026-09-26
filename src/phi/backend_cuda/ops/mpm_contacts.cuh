@@ -72,7 +72,7 @@ __device__ void Visit(const MpmParams& p, const DataView& data, uint32_t sample,
     data.ucontact_id_feature[address] = id.feature;
 }
 
-// Floor first, then the grid walls, in a fixed order.
+// The authored floor is physical; computational grid bounds only limit storage.
 template <bool emit>
 __device__ void VisitBoundaries(const MpmParams& p, const DataView& data, uint32_t sample,
                                 uint32_t mpm_per_env, uint64_t& count, math::Vec3 point,
@@ -87,11 +87,6 @@ __device__ void VisitBoundaries(const MpmParams& p, const DataView& data, uint32
     };
     const math::Vec3 floor_normal{p.plane_n[0], p.plane_n[1], p.plane_n[2]};
     boundary(0u, floor_normal, p.plane_d - point.Dot(floor_normal), p.plane_mu);
-    boundary(1u, {1, 0, 0}, p.grid_origin[0] + p.dx - point.x, 0.0f);
-    boundary(2u, {-1, 0, 0}, point.x - (p.grid_origin[0] + (p.grid_dims[0] - 2u) * p.dx), 0.0f);
-    boundary(3u, {0, 1, 0}, p.grid_origin[1] + p.dx - point.y, 0.0f);
-    boundary(4u, {0, -1, 0}, point.y - (p.grid_origin[1] + (p.grid_dims[1] - 2u) * p.dx), 0.0f);
-    boundary(5u, {0, 0, 1}, p.grid_origin[2] + p.dx - point.z, 0.0f);
 }
 
 struct BodyHit {

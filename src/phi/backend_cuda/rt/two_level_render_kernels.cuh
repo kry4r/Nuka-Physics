@@ -818,10 +818,10 @@ static __device__ __noinline__ Vec3 ShadeEnvOpaque(const LbvhNode* __restrict__ 
                            materials)
             ? 0.0f : 1.0f;
     const float kd = (1.0f - mat.metallic) * (1.0f / RtMathPi());
-    const Vec3 amb = SkyColor(Nf, sky);  // cheap sky-dome ambient so creases aren't black
-    return Vec3{lc.x * mat.albedo.x * kd * NoL * vis + 0.15f * mat.albedo.x * amb.x,
-                lc.y * mat.albedo.y * kd * NoL * vis + 0.15f * mat.albedo.y * amb.y,
-                lc.z * mat.albedo.z * kd * NoL * vis + 0.15f * mat.albedo.z * amb.z};
+    const Vec3 amb = SkyColor(Nf, sky);
+    return Vec3{mat.emission.x + lc.x * mat.albedo.x * kd * NoL * vis + sky.sky_intensity * mat.albedo.x * amb.x,
+                mat.emission.y + lc.y * mat.albedo.y * kd * NoL * vis + sky.sky_intensity * mat.albedo.y * amb.y,
+                mat.emission.z + lc.z * mat.albedo.z * kd * NoL * vis + sky.sky_intensity * mat.albedo.z * amb.z};
 }
 
 // Trace ONE environment ray and return its radiance: an opaque hit is direct-shaded
@@ -930,7 +930,8 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
     Vec3 thr{1.0f, 1.0f, 1.0f};  // running transmittance weight
     Vec3 ro = Vec3{hit.x - Nf.x * eps, hit.y - Nf.y * eps, hit.z - Nf.z * eps};
     Vec3 rd = tdir;
-    bool inside = entering;  // we just refracted into the medium iff we were entering
+    bool inside = entering;
+    Material medium = mat;
     Vec3 transmitted{0.0f, 0.0f, 0.0f};
     const uint32_t cap = sky.transmit_bounces < 1u ? 1u : sky.transmit_bounces;
     for (uint32_t b = 0; b < cap; ++b) {
@@ -943,9 +944,9 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
         }
         if (inside) {
             // Beer-Lambert over the segment just traversed inside the medium.
-            thr.x *= expf(-mat.absorption.x * bt);
-            thr.y *= expf(-mat.absorption.y * bt);
-            thr.z *= expf(-mat.absorption.z * bt);
+            thr.x *= expf(-medium.absorption.x * bt);
+            thr.y *= expf(-medium.absorption.y * bt);
+            thr.z *= expf(-medium.absorption.z * bt);
         }
         uint32_t hi, hlp; UnpackPrimId(bp, &hi, &hlp);
         Material hmat = materials[instances[hi].material_id];
@@ -966,15 +967,19 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
         // Another dielectric interface: refract through it, flip inside, continue.
         const float hvn = -(rd.x * hn.x + rd.y * hn.y + rd.z * hn.z);
         const Vec3 hnf = (hvn < 0.0f) ? Vec3{-hn.x, -hn.y, -hn.z} : hn;
-        const float e2 = inside ? (n_med / n_air) : (n_air / n_med);
+        const float target_ior = hmat.ior > 1.0e-3f ? hmat.ior : 1.0f;
+        const float e2 = inside ? medium.ior / n_air : n_air / target_ior;
         Vec3 nt;
-        if (!Refract(rd, hnf, e2, &nt)) {
-            nt = RtNormalize<float>(Reflect(rd, hnf));  // TIR at the exit -> internal reflect
+        const bool total_reflection = !Refract(rd, hnf, e2, &nt);
+        if (total_reflection) {
+            nt = RtNormalize<float>(Reflect(rd, hnf));
         } else {
             inside = !inside;
+            if (inside) medium = hmat;
         }
         rd = nt;
-        ro = Vec3{hpt.x - hnf.x * eps, hpt.y - hnf.y * eps, hpt.z - hnf.z * eps};
+        const float offset = total_reflection ? eps : -eps;
+        ro = Vec3{hpt.x + hnf.x * offset, hpt.y + hnf.y * offset, hpt.z + hnf.z * offset};
         if (b + 1u == cap) {
             const Vec3 s = SkyColor(rd, sky);
             transmitted = Vec3{thr.x * s.x, thr.y * s.y, thr.z * s.z};

@@ -394,35 +394,40 @@ __global__ void PackQdotFlatMultiKernel(const Spatial6* __restrict__ link_veloci
     qdot_flat[gid] = (comp != ~0u) ? link_velocity[gl].v[comp] : qdot[gl];
 }
 
-// K4a: w = M^-1 J^T per articulation row. One thread per (row, r): the
-// ArticulationApplyImpulse / ArticulationEffectiveInvMass inner product
-// `acc = sum_c Minv[r*stride+c] * J[c]` with the IDENTICAL ascending-c order,
-// hoisted to assembly (the value is constant across iterations).
+// A warp screens consecutive rows, then evaluates each active articulation row in DOF order.
+// Each dot product retains its ascending-column accumulation.
+template <bool side_b>
 __global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
                                        const float* __restrict__ chain_jacobian,
                                        const float* __restrict__ m_inv,
                                        uint32_t total_rows,
                                        uint32_t dof_stride,
                                        float* __restrict__ row_minv_jt) {
+    const uint32_t lane = threadIdx.x % warpSize;
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t total = total_rows * dof_stride;
-    if (gid >= total) return;
-    const uint32_t rs = gid / dof_stride;
-    const uint32_t r = gid - rs * dof_stride;
-    // Read flags first; the ~99% inactive rows bail on 4 bytes, not the 128-byte
-    // struct. Active rows then read only the side fields they use (same values).
-    const NkRow* const rowp = urows + rs;
-    if (!(rowp->flags & nk::nk_row_flags::kActive) || rowp->a.kind != kNkSideArtic) {
-        return;  // only articulation rows carry a chain-J / w pair.
+    const uint32_t base = gid - lane;
+    uint32_t owner = 0u;
+    bool active = false;
+    if (gid < total_rows && (urows[gid].flags & nk::nk_row_flags::kActive)) {
+        const NkRowSide& endpoint = side_b ? urows[gid].b : urows[gid].a;
+        active = endpoint.kind == kNkSideArtic;
+        owner = endpoint.index;
     }
-    const size_t tile = static_cast<size_t>(rowp->a.index) * dof_stride * dof_stride;
-    const float* const Minv = m_inv + tile + static_cast<size_t>(r) * dof_stride;
-    const float* const J = chain_jacobian + static_cast<size_t>(rs) * dof_stride;
-    float acc = 0.0f;
-    for (uint32_t c = 0u; c < dof_stride; ++c) {
-        acc += Minv[c] * J[c];
+    uint32_t pending = __ballot_sync(0xffffffffu, active);
+    while (pending != 0u) {
+        const uint32_t first = static_cast<uint32_t>(__ffs(pending)) - 1u;
+        pending &= pending - 1u;
+        const uint32_t row = base + first;
+        const uint32_t articulation = __shfl_sync(0xffffffffu, owner, first);
+        const size_t tile = size_t{articulation} * dof_stride * dof_stride;
+        const float* const jacobian = chain_jacobian + size_t{row} * dof_stride;
+        for (uint32_t r = lane; r < dof_stride; r += warpSize) {
+            const float* const inverse_mass = m_inv + tile + size_t{r} * dof_stride;
+            float value = 0.0f;
+            for (uint32_t c = 0u; c < dof_stride; ++c) value += inverse_mass[c] * jacobian[c];
+            row_minv_jt[size_t{row} * dof_stride + r] = value;
+        }
     }
-    row_minv_jt[gid] = acc;
 }
 
 // (union-era ComputeRowMeffKernel deleted — never launched; superseded by the
@@ -942,31 +947,6 @@ __global__ void EmitJointDriveRowsKernel(
         atomicAdd(row_count + env, 1u);
     }
     urows[slot] = row;
-}
-
-// K4a-B: w_b = M^-1 J_b^T per articulation SIDE-B row . Mirrors
-// ComputeRowMinvJtKernel but gates on row.b.kind and tiles by row.b.index.
-__global__ void ComputeRowMinvJtBKernel(const NkRow* __restrict__ urows,
-                                        const float* __restrict__ chain_jacobian_b,
-                                        const float* __restrict__ m_inv,
-                                        uint32_t total_rows, uint32_t dof_stride,
-                                        float* __restrict__ row_minv_jt_b) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t total = total_rows * dof_stride;
-    if (gid >= total) return;
-    const uint32_t rs = gid / dof_stride;
-    const uint32_t r = gid - rs * dof_stride;
-    // Read flags first; inactive rows bail on 4 bytes, not the 128-byte struct.
-    const NkRow* const rowp = urows + rs;
-    if (!(rowp->flags & nk::nk_row_flags::kActive) || rowp->b.kind != kNkSideArtic) {
-        return;
-    }
-    const size_t tile = static_cast<size_t>(rowp->b.index) * dof_stride * dof_stride;
-    const float* const Minv = m_inv + tile + static_cast<size_t>(r) * dof_stride;
-    const float* const J = chain_jacobian_b + static_cast<size_t>(rs) * dof_stride;
-    float acc = 0.0f;
-    for (uint32_t c = 0u; c < dof_stride; ++c) acc += Minv[c] * J[c];
-    row_minv_jt_b[gid] = acc;
 }
 
 __device__ float PairDrivenSideCoupling(
@@ -1645,15 +1625,13 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    0u, stream, reinterpret_cast<const NkRow*>(data.urows),
                    total_rows, p->max_dof, data.chain_jacobian, data.chain_jacobian_b);
 
-        // K4a: w = M^-1 J^T for side A and side B.
-        const uint32_t wtotal = total_rows * p->max_dof;
-        const uint32_t wblocks = (wtotal + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ComputeRowMinvJtKernel, dim3(wblocks), dim3(kBlockSize), 0u, stream,
+        // Both articulation endpoints use the same row compaction and matrix product.
+        LaunchCuda(ComputeRowMinvJtKernel<false>, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    reinterpret_cast<const NkRow*>(data.urows),
                    static_cast<const float*>(data.chain_jacobian),
                    static_cast<const float*>(data.m_inv),
                    total_rows, p->max_dof, data.row_minv_jt);
-        LaunchCuda(ComputeRowMinvJtBKernel, dim3(wblocks), dim3(kBlockSize), 0u, stream,
+        LaunchCuda(ComputeRowMinvJtKernel<true>, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    reinterpret_cast<const NkRow*>(data.urows),
                    static_cast<const float*>(data.chain_jacobian_b),
                    static_cast<const float*>(data.m_inv),

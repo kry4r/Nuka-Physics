@@ -77,6 +77,7 @@ struct StudioScene {
     std::vector<DeformingSurface> surfaces;      // one per cooked particle medium (empty => none).
     std::vector<ParticleSkin> particle_skins;    // instanced-sphere media (empty => none).
     std::vector<DensitySurface> density_surfaces;
+    std::vector<runtime::fluid::FluidSurfaceBoundary> fluid_boundaries;
     std::vector<uint32_t> link_of_instance;      // per link-posed instance -> link index.
     std::vector<math::Transform> visual_local;   // per link-posed instance -> physics->visual offset.
     uint32_t link_instance_count = 0u;           // [0, link_instance_count) follow a link pose.

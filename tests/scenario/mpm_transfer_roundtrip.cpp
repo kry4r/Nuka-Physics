@@ -101,6 +101,8 @@ nphi::MpmParams MakeParams(const nk::Model& m) {
     p.particles_per_env = m.capacities.particles_per_env;
     p.env_count = 1u;
     p.nodes_per_env = m.capacities.mpm_grid_nodes_per_env;
+    p.point_endpoints_per_env = m.capacities.point_endpoints_per_env;
+    p.point_endpoint_terms_per_env = m.capacities.point_endpoint_terms_per_env;
     p.grid_dims[0] = kDim; p.grid_dims[1] = kDim; p.grid_dims[2] = kDim;
     p.grid_origin[0] = kOrigin.x; p.grid_origin[1] = kOrigin.y;
     p.grid_origin[2] = kOrigin.z;
@@ -117,8 +119,11 @@ nphi::MpmParams MakeParams(const nk::Model& m) {
 }
 
 bool RunTransfer(nk::World& w, const nphi::MpmParams& p) {
-    for (auto op : {nphi::NkOp::MpmPredict, nphi::NkOp::MpmExchange, nphi::NkOp::MpmCommit})
-        if (w.DispatchOp(op, &p) != nphi::Status::Ok) return false;
+    for (auto op : {nphi::NkOp::MpmPredict, nphi::NkOp::MpmExchange, nphi::NkOp::MpmCommit}) {
+        const auto status = w.DispatchOp(op, &p);
+        EXPECT_EQ(status, nphi::Status::Ok) << "MPM operator " << static_cast<unsigned>(op);
+        if (status != nphi::Status::Ok) return false;
+    }
     return true;
 }
 
