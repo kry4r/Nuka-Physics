@@ -237,8 +237,9 @@ def course(output, appearance):
     save(output / "course.nks", {"nks_version": 1, "imports": [{"file": str(appearance)}],
         "tree": nodes, "environment": {"shadow": {"center": [course_center, 0, 0.4],
                                                     "radius": course_half_length+0.5}}})
-    grid = {"dx": 0.04, "substeps": 4, "floor_normal": [0, 0, 1], "floor_d": -0.12,
-            "floor_friction": 0.0, "loft_headroom": 0.7}
+    # Implicit stress rows carry the Tait and Drucker-Prager stiffness, so one interval per step.
+    grid = {"dx": 0.04, "substeps": 1, "implicit_stress": True, "floor_normal": [0, 0, 1],
+            "floor_d": -0.12, "floor_friction": 0.0, "loft_headroom": 0.7}
     material = {"density": 1000, "model_kind": 3, "bulk_modulus": 50000, "tait_gamma": 7,
                 **grid}
     fills = []

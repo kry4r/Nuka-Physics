@@ -11,6 +11,7 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
+#include "nk/material/mpm_transfer.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
@@ -44,7 +45,7 @@ nk::Pipeline::SolverConfig Cfg() {
     return cfg;
 }
 
-constexpr uint32_t kDim = 6u;   // 6^3 = 216 nodes/env.
+constexpr uint32_t kDim = 6u;   // 6^3 nodes on each of the two lattices.
 constexpr float    kDx  = 0.1f;
 const Vec3 kOrigin{0.0f, 0.0f, 0.0f};
 
@@ -53,7 +54,7 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
     nk::Model m;
     nk::Model::ModelParticles& mp = m.particles;
     mp.mode = nk::Model::ParticleMode::Mpm;
-    // Particles inside [0.2, 0.4] (cells 2..4) so the full 3^3 stencil stays in grid.
+    // Particles inside [0.2, 0.4] (cells 2..4) so both lattice stencils stay in the grid.
     std::vector<Vec3> pos;
     for (int i = 0; i < 2; ++i)
         for (int j = 0; j < 2; ++j)
@@ -80,7 +81,7 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
 
     nk::ModelCapacities& cap = m.capacities;
     cap.particles_per_env = static_cast<uint32_t>(n);
-    cap.mpm_grid_nodes_per_env = kDim * kDim * kDim;
+    cap.mpm_grid_nodes_per_env = kDim * kDim * kDim * nk::kMpmLattices;
     cap.mpm_contact_capacity_per_env = cap.mpm_grid_nodes_per_env;
     cap.max_contacts_per_env = cap.mpm_contact_capacity_per_env;
     cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenParticleRowsPerSlot;
@@ -294,7 +295,25 @@ TEST(MpmTransferRoundtrip, StressedTransferConservesLinearAndAngularMomentum) {
     std::vector<float> affine(count * 9u, 0.0f);
     std::array<double, 3> expected_linear{}, expected_angular{};
     double linear_scale = 0.0, angular_scale = 0.0;
-    const double second_moment = 0.25 * double{kDx} * kDx;
+    // The APIC inertia D of the dual compact kernel, full off the diagonal.
+    const auto inertia = [](const Vec3& x) {
+        const nk::MpmCompactAxis axes[3] = {nk::MpmCompactWeights(x.x / kDx),
+            nk::MpmCompactWeights(x.y / kDx), nk::MpmCompactWeights(x.z / kDx)};
+        std::array<std::array<double, 3>, 3> D{};
+        for (uint32_t a = 0u; a < 3u; ++a)
+            for (uint32_t c = 0u; c < 3u; ++c) {
+                double value = 0.0;
+                if (a == c) {
+                    value = axes[a].moment;
+                } else {
+                    for (uint32_t lattice = 0u; lattice < nk::kMpmLattices; ++lattice)
+                        value += nk::kMpmLatticeShare * double{axes[a].first[lattice]} *
+                                 axes[c].first[lattice];
+                }
+                D[a][c] = value * kDx * kDx;
+            }
+        return D;
+    };
     for (uint32_t i = 0u; i < count; ++i) {
         const float sign = i < count / 2u ? 1.0f : -1.0f;
         auto& pos = particles.initial_pos[i];
@@ -312,10 +331,14 @@ TEST(MpmTransferRoundtrip, StressedTransferConservesLinearAndAngularMomentum) {
         C[2] = 0.2f; C[6] = -0.2f;
         C[5] = -0.3f; C[7] = 0.3f;
         const std::array<double, 3> x{pos.x, pos.y, pos.z}, v{vel.x, vel.y, vel.z};
+        const auto D = inertia(pos);
+        const auto affine_moment = [&](uint32_t r, uint32_t c) {
+            return C[r * 3u] * D[0][c] + C[r * 3u + 1u] * D[1][c] + C[r * 3u + 2u] * D[2][c];
+        };
         for (uint32_t axis = 0u; axis < 3u; ++axis) {
             const uint32_t j = (axis + 1u) % 3u, k = (axis + 2u) % 3u;
             const double angular = x[j] * v[k] - x[k] * v[j] +
-                second_moment * (double{C[k * 3u + j]} - C[j * 3u + k]);
+                affine_moment(k, j) - affine_moment(j, k);
             expected_linear[axis] += v[axis];
             expected_angular[axis] += angular;
             linear_scale += std::abs(v[axis]);
@@ -343,8 +366,11 @@ TEST(MpmTransferRoundtrip, StressedTransferConservesLinearAndAngularMomentum) {
         std::array<double, 3> linear{}, angular{};
         for (uint32_t node = 0u; node < nodes; ++node) {
             total_mass += mass[node];
-            const std::array<double, 3> x{(node % kDim) * double{kDx},
-                ((node / kDim) % kDim) * double{kDx}, (node / (kDim * kDim)) * double{kDx}};
+            const uint32_t lattice = node / (kDim * kDim * kDim);
+            const uint32_t local = node % (kDim * kDim * kDim);
+            const double shift = nk::MpmLatticeOffset(lattice);
+            const std::array<double, 3> x{(local % kDim + shift) * kDx,
+                ((local / kDim) % kDim + shift) * kDx, (local / (kDim * kDim) + shift) * kDx};
             const std::array<double, 3> q{momentum[node].x, momentum[node].y, momentum[node].z};
             for (uint32_t axis = 0u; axis < 3u; ++axis) {
                 const uint32_t j = (axis + 1u) % 3u, k = (axis + 2u) % 3u;

@@ -89,7 +89,7 @@ constexpr uint32_t kSubsteps = 25u;    // CFL headroom for the explicit step.
 // tank: the fluid spans the domain box cross-section so the domain-wall BC ring holds
 // it (no lateral slump) and it settles into a flat hydrostatic column against the
 // walls + floor.
-cook::MpmCookInput BuildPoolInput() {
+cook::MpmCookInput BuildPoolInput(bool implicit_stress = false) {
     cook::MpmCookInput in;
     const float pdx = kDx * 0.5f;
     const float lo_z = kFloorZ + pdx;
@@ -107,14 +107,16 @@ cook::MpmCookInput BuildPoolInput() {
     in.material.model_kind = 3.0f;     // weakly-compressible fluid.
     in.material.bulk_modulus = kBulk;
     in.material.tait_gamma = kTaitGamma;
-    in.material.viscosity = kViscosity;
+    // Implicit stress rows carry the Tait stiffness, so water runs inviscid at the robot interval.
+    in.material.viscosity = implicit_stress ? 0.0f : kViscosity;
     in.grid_origin = Vec3{-kTankHalfXY, -kTankHalfXY, kFloorZ - 3.0f * kDx};
     const float top = kPoolTopZ + 12.0f * kDx;     // vertical splash/settle headroom.
     in.grid_dims[0] = static_cast<uint32_t>(2.0f * kTankHalfXY / kDx) + 1u;
     in.grid_dims[1] = in.grid_dims[0];
     in.grid_dims[2] = static_cast<uint32_t>((top - in.grid_origin.z) / kDx) + 1u;
     in.dx = kDx;
-    in.substeps = kSubsteps;
+    in.substeps = implicit_stress ? 2u : kSubsteps;
+    in.implicit_stress = implicit_stress;
     in.floor_normal = Vec3{0.0f, 0.0f, 1.0f};
     in.floor_d = kFloorZ;
     in.floor_friction = 0.0f;          // free slip on the floor (a fluid).
@@ -156,13 +158,13 @@ void AddPoolWalls(nk::Model& model, uint32_t env_count) {
 }
 
 // The pool uses ordinary finite box colliders, independent of grid storage bounds.
-nk::Model BuildPoolModel() {
+nk::Model BuildPoolModel(bool implicit_stress = false) {
     nk::Model m;
     m.capacities.env_count = 1u;
     AddPoolWalls(m, 1u);
     cook::XpbdCookInput soft;
     soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, BuildPoolInput());
+    cook::CookSoftBodyParticles(m, 1u, soft, BuildPoolInput(implicit_stress));
     m.particles.mpm_body_friction = 0.0f;
     return m;
 }
@@ -356,14 +358,11 @@ nk::Model BuildPoolWithBodyModel(bool with_sdf, bool proxy, uint32_t env_count,
     return m;
 }
 
-}  // namespace
-
 // Hydrostatic rest: the column settles, pressure (compression, J<1) increases with
 // depth, the free surface stays near rest (J ~ 1), all finite, no grid escape.
-TEST(MpmFluidRest, HydrostaticPressureWithDepth) {
-    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+void CheckHydrostaticColumn(bool implicit_stress) {
     Backend b = GetBackend();
-    nk::Model m = BuildPoolModel();
+    nk::Model m = BuildPoolModel(implicit_stress);
     const uint32_t P = m.capacities.particles_per_env;
     ASSERT_GT(P, 1000u) << "the pool must be dense";
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
@@ -451,6 +450,19 @@ TEST(MpmFluidRest, HydrostaticPressureWithDepth) {
     // live-compressed (rejects a dead or too-stiff EOS) yet far from collapse.
     EXPECT_GT(deep_mean, 0.90f) << "deep compression must be live (not a dead/soft EOS)";
     EXPECT_LT(deep_mean, 0.995f) << "deep band compressed but not collapsed (cross-device margin)";
+}
+
+}  // namespace
+
+TEST(MpmFluidRest, HydrostaticPressureWithDepth) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    CheckHydrostaticColumn(false);
+}
+
+// Stress rows hold an inviscid Tait column through the shared solve at a 2 ms interval.
+TEST(MpmFluidRest, ImplicitStressHoldsHydrostaticColumn) {
+    if (GetBackend().backend == nullptr) GTEST_SKIP() << "no CUDA backend";
+    CheckHydrostaticColumn(true);
 }
 
 // Determinism: grid mass/momentum byte-identical run-to-run, and the grid mass sums

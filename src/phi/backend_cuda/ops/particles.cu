@@ -1,4 +1,3 @@
-#include "constraint/dihedral_bend.hpp"
 
 // Particle integration and projection use stable CSR neighbor lists and arena storage.
 
@@ -259,16 +258,6 @@ __global__ void ParticlePredictKernel(
     projection_delta[i] = {};
 }
 
-// XPBD multipliers reset to 0 at step start (Macklin 2016). One thread per
-// env-major constraint; race-free own-index write (D1, no atomics).
-__global__ void XpbdLambdaResetKernel(uint32_t count, float* __restrict__ lambda) {
-    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= count) {
-        return;
-    }
-    lambda[c] = 0.0f;
-}
-
 __global__ void ParticleProjectionVelocityKernel(
     uint32_t count, uint32_t per_env, uint32_t active_begin,
     const math::Vec3* __restrict__ previous, math::Vec3* __restrict__ projected,
@@ -317,145 +306,6 @@ __device__ __forceinline__ void ApplyProjectionDelta(math::Vec3* positions,
     positions[index] = Add(positions[index], delta);
     accumulated[index] = Add(accumulated[index], delta);
 }
-
-// Distance projection updates only the two particles owned by its constraint.
-struct XpbdDistanceProjector {
-    math::Vec3* __restrict__ positions;
-    math::Vec3* __restrict__ projection_delta;
-    const float* __restrict__ inv_masses;
-    const uint32_t* __restrict__ particle_a;
-    const uint32_t* __restrict__ particle_b;
-    const float* __restrict__ rest_length;
-    const float* __restrict__ compliance_alpha;
-    float* __restrict__ lambda;
-    float dt;
-
-    __device__ __forceinline__ void operator()(uint32_t c) const {
-        const float inv_dt2 = 1.0f / (dt * dt);
-        const uint32_t ia = particle_a[c];
-        const uint32_t ib = particle_b[c];
-        const float wa = inv_masses[ia];
-        const float wb = inv_masses[ib];
-        const float w_sum = wa + wb;
-        if (w_sum <= 0.0f) {
-            return;
-        }
-        const math::Vec3 pa = positions[ia];
-        const math::Vec3 pb = positions[ib];
-        const math::Vec3 r = Sub(pa, pb);
-        const float dist = sqrtf(Dot(r, r));
-        if (dist <= 0.0f) {
-            return;
-        }
-        const math::Vec3 n = Scale(r, 1.0f / dist);
-        const float constraint = dist - rest_length[c];
-        const float alpha_tilde = compliance_alpha[c] * inv_dt2;
-        const float lam = lambda[c];
-        const float delta_lambda =
-            (-constraint - alpha_tilde * lam) / (w_sum + alpha_tilde);
-        ApplyProjectionDelta(positions, projection_delta, ia, Scale(n, wa * delta_lambda));
-        ApplyProjectionDelta(positions, projection_delta, ib, Scale(n, -wb * delta_lambda));
-        lambda[c] = lam + delta_lambda;
-    }
-};
-
-// Signed dihedral bending recomputes gradients from the current geometry.
-struct XpbdBendProjector {
-    math::Vec3* __restrict__ positions;
-    math::Vec3* __restrict__ projection_delta;
-    const float* __restrict__ inv_masses;
-    const uint32_t* __restrict__ particles;
-    const float* __restrict__ rest_angles;
-    const float* __restrict__ compliance_alpha;
-    float* __restrict__ lambda;
-    float dt;
-
-    __device__ __forceinline__ void operator()(uint32_t c) const {
-        const float inv_dt2 = 1.0f / (dt * dt);
-        const size_t base = static_cast<size_t>(c) * 4u;
-        uint32_t idx[4];
-        math::Vec3 grad[4];
-        float w[4];
-        float denom = 0.0f;
-        for (uint32_t j = 0u; j < 4u; ++j) idx[j] = particles[base + j];
-        const auto geometry = constraint::EvaluateDihedralBend(
-            positions[idx[0]], positions[idx[1]], positions[idx[2]], positions[idx[3]]);
-        if (!geometry.valid) {
-            lambda[c] = 0.0f;
-            return;
-        }
-        const float constraint = nuka::constraint::DihedralBendError(geometry.angle, rest_angles[c]);
-        for (uint32_t j = 0u; j < 4u; ++j) {
-            grad[j] = geometry.gradients[j];
-            w[j] = inv_masses[idx[j]];
-            denom += w[j] * Dot(grad[j], grad[j]);
-        }
-        const float alpha_tilde = compliance_alpha[c] * inv_dt2;
-        denom += alpha_tilde;
-        if (denom <= 0.0f) {
-            return;
-        }
-        const float lam = lambda[c];
-        const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
-        for (uint32_t j = 0u; j < 4u; ++j) {
-            if (w[j] > 0.0f) {
-                ApplyProjectionDelta(positions, projection_delta, idx[j], Scale(grad[j], w[j] * delta_lambda));
-            }
-        }
-        lambda[c] = lam + delta_lambda;
-    }
-};
-
-// Tetrahedral volume projection uses the signed rest determinant.
-struct XpbdVolumeProjector {
-    math::Vec3* __restrict__ positions;
-    math::Vec3* __restrict__ projection_delta;
-    const float* __restrict__ inv_masses;
-    const uint32_t* __restrict__ particles;
-    const float* __restrict__ rest_times6;
-    const float* __restrict__ compliance_alpha;
-    float* __restrict__ lambda;
-    float dt;
-
-    __device__ __forceinline__ void operator()(uint32_t c) const {
-        const float inv_dt2 = 1.0f / (dt * dt);
-        const size_t base = static_cast<size_t>(c) * 4u;
-        const uint32_t i0 = particles[base + 0u];
-        const uint32_t i1 = particles[base + 1u];
-        const uint32_t i2 = particles[base + 2u];
-        const uint32_t i3 = particles[base + 3u];
-        const math::Vec3 p0 = positions[i0];
-        const math::Vec3 p1 = positions[i1];
-        const math::Vec3 p2 = positions[i2];
-        const math::Vec3 p3 = positions[i3];
-        const math::Vec3 e1 = Sub(p1, p0);
-        const math::Vec3 e2 = Sub(p2, p0);
-        const math::Vec3 e3 = Sub(p3, p0);
-        const math::Vec3 g1 = Cross(e2, e3);
-        const math::Vec3 g2 = Cross(e3, e1);
-        const math::Vec3 g3 = Cross(e1, e2);
-        const math::Vec3 g0 = Scale(Add(Add(g1, g2), g3), -1.0f);
-        const float det = Dot(e1, g1);
-        const float constraint = det - rest_times6[c];
-        const float w0 = inv_masses[i0];
-        const float w1 = inv_masses[i1];
-        const float w2 = inv_masses[i2];
-        const float w3 = inv_masses[i3];
-        const float alpha_tilde = compliance_alpha[c] * inv_dt2;
-        const float denom = w0 * Dot(g0, g0) + w1 * Dot(g1, g1) +
-                            w2 * Dot(g2, g2) + w3 * Dot(g3, g3) + alpha_tilde;
-        if (denom <= 0.0f) {
-            return;
-        }
-        const float lam = lambda[c];
-        const float delta_lambda = (-constraint - alpha_tilde * lam) / denom;
-        if (w0 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i0, Scale(g0, w0 * delta_lambda));
-        if (w1 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i1, Scale(g1, w1 * delta_lambda));
-        if (w2 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i2, Scale(g2, w2 * delta_lambda));
-        if (w3 > 0.0f) ApplyProjectionDelta(positions, projection_delta, i3, Scale(g3, w3 * delta_lambda));
-        lambda[c] = lam + delta_lambda;
-    }
-};
 
 // Shape matching uses row-major 3x3 matrices and a fixed-order polar iteration.
 struct SmMat3 {
@@ -648,15 +498,8 @@ template <typename Projector>
 Status ProjectXpbdFamily(Projector project, uint32_t blocks, uint32_t constraints,
                          uint32_t constraints_per_env, uint32_t env_count,
                          uint32_t colors, const uint32_t* color_segments,
-                         uint32_t iters, uint32_t iteration_start,
-                         float* lambda, cudaStream_t stream) {
+                         uint32_t iters, uint32_t iteration_start, cudaStream_t stream) {
     if (constraints == 0u) return Status::Ok;
-    if (lambda != nullptr && iteration_start == 0u) {
-        const uint32_t reset_blocks = (constraints - 1u) / kBlockSize + 1u;
-        LaunchCuda(XpbdLambdaResetKernel, dim3(reset_blocks), dim3(kBlockSize), 0u,
-                   stream, constraints, lambda);
-        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-    }
     const auto result = LaunchCooperativeCuda(
         XpbdColorSweepKernel<Projector>, dim3(blocks), dim3(kBlockSize), 0u, stream,
         project, color_segments, colors, constraints_per_env, env_count, iters,
@@ -1114,73 +957,22 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
                      const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const XpbdProjectParams*>(params);
     if (p == nullptr) return Status::InvalidArgument;
-    if (p->dist_con_count == 0u && p->bend_con_count == 0u &&
-        p->vol_con_count == 0u && p->shape_match_cluster_count == 0u) return Status::Ok;
+    if (p->shape_match_cluster_count == 0u) return Status::Ok;
     const uint32_t iters = p->iters == 0u ? 1u : p->iters;
     const uint32_t env_count = p->env_count == 0u ? 1u : p->env_count;
-    if (!(p->dt > 0.0f) || !std::isfinite(p->dt) ||
-        data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr ||
-        data.particle_projection_delta == nullptr)
-        return Status::InvalidArgument;
-    if ((p->dist_con_count > 0u &&
-         (model.dist_particle_a == nullptr || model.dist_particle_b == nullptr ||
-          model.dist_rest_length == nullptr || model.dist_compliance == nullptr ||
-          data.dist_lambda == nullptr)) ||
-        (p->bend_con_count > 0u &&
-         (model.bend_particles == nullptr || model.bend_rest_angle == nullptr ||
-          model.bend_compliance == nullptr || data.bend_lambda == nullptr)) ||
-        (p->vol_con_count > 0u &&
-         (model.vol_particles == nullptr || model.vol_rest_times6 == nullptr ||
-          model.vol_compliance == nullptr || data.vol_lambda == nullptr)) ||
-        (p->shape_match_cluster_count > 0u &&
-         (model.sm_cluster_offset == nullptr || model.sm_cluster_size == nullptr ||
-          model.sm_stiffness == nullptr || model.sm_rest_centroid == nullptr ||
-          model.sm_particles == nullptr || model.sm_rest_q == nullptr || model.sm_mass == nullptr)))
+    if (data.pbf_predicted_pos == nullptr || data.particle_inv_mass == nullptr ||
+        data.particle_projection_delta == nullptr || model.sm_cluster_offset == nullptr ||
+        model.sm_cluster_size == nullptr || model.sm_stiffness == nullptr ||
+        model.sm_rest_centroid == nullptr || model.sm_particles == nullptr ||
+        model.sm_rest_q == nullptr || model.sm_mass == nullptr)
         return Status::InvalidArgument;
     const auto cooperative = RequireCooperativeLaunch();
     if (cooperative == cudaErrorNotSupported) return Status::Unsupported;
     if (cooperative != cudaSuccess) return Status::Failed;
-
-    // Validate every family and its launch resources before modifying particle state.
-    uint32_t dist_blocks = 0u, bend_blocks = 0u, vol_blocks = 0u, sm_blocks = 0u;
-    auto status = PrepareXpbdSweep<XpbdDistanceProjector>(
-        p->dist_con_count, p->dist_cons_per_env, env_count, p->dist_colors,
-        p->dist_color_segments, model.dist_color_segments, &dist_blocks);
-    if (status != Status::Ok) return status;
-    status = PrepareXpbdSweep<XpbdBendProjector>(
-        p->bend_con_count, p->bend_cons_per_env, env_count, p->bend_colors,
-        p->bend_color_segments, model.bend_color_segments, &bend_blocks);
-    if (status != Status::Ok) return status;
-    status = PrepareXpbdSweep<XpbdVolumeProjector>(
-        p->vol_con_count, p->vol_cons_per_env, env_count, p->vol_colors,
-        p->vol_color_segments, model.vol_color_segments, &vol_blocks);
-    if (status != Status::Ok) return status;
-    status = PrepareXpbdSweep<XpbdShapeMatchProjector>(
+    uint32_t sm_blocks = 0u;
+    const auto status = PrepareXpbdSweep<XpbdShapeMatchProjector>(
         p->shape_match_cluster_count, p->sm_clusters_per_env, env_count, p->sm_colors,
         p->sm_color_segments, model.sm_color_segments, &sm_blocks);
-    if (status != Status::Ok) return status;
-
-    // Each call retains the material-family order and the step's accumulated lambdas.
-    status = ProjectXpbdFamily(
-        XpbdDistanceProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
-                             model.dist_particle_a, model.dist_particle_b,
-                             model.dist_rest_length, model.dist_compliance, data.dist_lambda, p->dt},
-        dist_blocks, p->dist_con_count, p->dist_cons_per_env, env_count, p->dist_colors,
-        model.dist_color_segments, iters, p->iteration_start, data.dist_lambda, stream);
-    if (status != Status::Ok) return status;
-    status = ProjectXpbdFamily(
-        XpbdBendProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
-                         model.bend_particles, model.bend_rest_angle,
-                         model.bend_compliance, data.bend_lambda, p->dt},
-        bend_blocks, p->bend_con_count, p->bend_cons_per_env, env_count, p->bend_colors,
-        model.bend_color_segments, iters, p->iteration_start, data.bend_lambda, stream);
-    if (status != Status::Ok) return status;
-    status = ProjectXpbdFamily(
-        XpbdVolumeProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
-                           model.vol_particles, model.vol_rest_times6,
-                           model.vol_compliance, data.vol_lambda, p->dt},
-        vol_blocks, p->vol_con_count, p->vol_cons_per_env, env_count, p->vol_colors,
-        model.vol_color_segments, iters, p->iteration_start, data.vol_lambda, stream);
     if (status != Status::Ok) return status;
     return ProjectXpbdFamily(
         XpbdShapeMatchProjector{data.pbf_predicted_pos, data.particle_projection_delta, data.particle_inv_mass,
@@ -1188,7 +980,7 @@ Status OpXpbdProject(const ModelView& model, const DataView& data,
                                model.sm_stiffness, model.sm_rest_centroid,
                                model.sm_particles, model.sm_rest_q, model.sm_mass},
         sm_blocks, p->shape_match_cluster_count, p->sm_clusters_per_env, env_count, p->sm_colors,
-        model.sm_color_segments, iters, p->iteration_start, nullptr, stream);
+        model.sm_color_segments, iters, p->iteration_start, stream);
 }
 
 // Density projection applies all but the last iteration here.

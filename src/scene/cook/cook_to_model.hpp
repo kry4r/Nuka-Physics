@@ -200,6 +200,8 @@ struct MpmCookInput {
     math::Vec3 floor_normal{0.0f, 0.0f, 1.0f};
     float      floor_d = 0.0f;
     float      floor_friction = 0.4f;
+    // Stress joins the shared row solve as one block of rows per occupied grid cell.
+    bool       implicit_stress = false;
 };
 
 // Stage an MLS-MPM bulk-soft body into the Model (single-env template; F=identity,

@@ -1091,8 +1091,10 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
             throw std::invalid_argument("grid contact identity exceeds handle range");
         const uint32_t surface_contacts = particle_surfaces_per_env > 0u ? mpm_contact_capacity_per_env : 0u;
         if (mpm_grid_nodes_per_env > 0u &&
-            (point_endpoints_per_env < MpmPointEndpointCount(particles_per_env, surface_contacts) ||
-             point_endpoint_terms_per_env < MpmPointEndpointTermCount(particles_per_env, surface_contacts)))
+            (point_endpoints_per_env <
+                 MpmPointEndpointCount(particles_per_env, surface_contacts, mpm_stress_cells_per_env) ||
+             point_endpoint_terms_per_env <
+                 MpmPointEndpointTermCount(particles_per_env, surface_contacts, mpm_stress_cells_per_env)))
             throw std::invalid_argument("material contacts exceed point endpoint capacity");
         const auto int_limit = static_cast<uint64_t>(std::numeric_limits<int>::max());
         if (links_per_env != 0u && CheckedProduct({max_rows_per_env, env_count, 2u}) > int_limit)

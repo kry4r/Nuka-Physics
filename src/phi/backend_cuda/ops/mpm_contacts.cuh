@@ -14,19 +14,24 @@ namespace nuka::phi::mpm_contact {
 template <class Visitor>
 __device__ bool VisitStencil(const MpmParams& p, uint32_t env, math::Vec3 point, Visitor visit) {
     const float inverse_dx = 1.0f / p.dx;
-    const auto x = nk::MpmQuadraticWeights((point.x - p.grid_origin[0]) * inverse_dx);
-    const auto y = nk::MpmQuadraticWeights((point.y - p.grid_origin[1]) * inverse_dx);
-    const auto z = nk::MpmQuadraticWeights((point.z - p.grid_origin[2]) * inverse_dx);
-    for (uint32_t c = 0u; c < nk::kMpmStencilWidth; ++c) {
-        for (uint32_t b = 0u; b < nk::kMpmStencilWidth; ++b) {
-            for (uint32_t a = 0u; a < nk::kMpmStencilWidth; ++a) {
-                const float weight = x.w[a] * y.w[b] * z.w[c];
-                if (!isfinite(weight)) return false;
-                if (!(weight > 0.0f)) continue;
-                const int64_t node = nk::MpmNodeIndex(env, x.base + a, y.base + b, z.base + c,
-                                                     p.grid_dims, p.nodes_per_env);
-                if (node < 0) return false;
-                visit(static_cast<uint32_t>(node), weight);
+    const nk::MpmCompactAxis axes[3] = {
+        nk::MpmCompactWeights((point.x - p.grid_origin[0]) * inverse_dx),
+        nk::MpmCompactWeights((point.y - p.grid_origin[1]) * inverse_dx),
+        nk::MpmCompactWeights((point.z - p.grid_origin[2]) * inverse_dx)};
+    for (uint32_t lattice = 0u; lattice < nk::kMpmLattices; ++lattice) {
+        for (uint32_t c = 0u; c < nk::kMpmStencilWidth; ++c) {
+            for (uint32_t b = 0u; b < nk::kMpmStencilWidth; ++b) {
+                for (uint32_t a = 0u; a < nk::kMpmStencilWidth; ++a) {
+                    const float weight = nk::kMpmLatticeShare * axes[0].w[lattice][a] *
+                        axes[1].w[lattice][b] * axes[2].w[lattice][c];
+                    if (!isfinite(weight)) return false;
+                    if (!(weight > 0.0f)) continue;
+                    const int64_t node = nk::MpmNodeIndex(env, lattice,
+                        axes[0].base[lattice] + a, axes[1].base[lattice] + b,
+                        axes[2].base[lattice] + c, p.grid_dims, p.nodes_per_env);
+                    if (node < 0) return false;
+                    visit(static_cast<uint32_t>(node), weight);
+                }
             }
         }
     }

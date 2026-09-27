@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 
@@ -291,6 +292,125 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmKirchhoff(
     return ConstitutiveStatus::Ok;
 }
 
+// Stress rows linearize the Kirchhoff stress: pressure = -tr(tau) / 3 with bulk = -dp / d ln J,
+// and the deviator grows at 2 shear per unit strain rate plus 2 viscosity per unit strain rate.
+struct MpmStressRowResponse {
+    float pressure = 0.0f;
+    float bulk = 0.0f;
+    float tension = 0.0f;
+    float shear = 0.0f;
+    float viscosity = 0.0f;
+    // The deviator norm stays within cone_slope * pressure + cone_offset.
+    float cone_slope = FLT_MAX;
+    float cone_offset = FLT_MAX;
+};
+
+// Fluids report their unclamped pressure, so a unilateral row opens once J exceeds one.
+NUKA_MPM_CONSTITUTIVE_HD inline MpmStressRowResponse EvaluateMpmStressRows(
+    const MpmMaterial& material, const float* F, const float* stress) {
+    MpmStressRowResponse response;
+    const float J = mpm_detail::Mat3Det(F);
+    if (!(J > 0.0f) || !std::isfinite(J)) return response;
+    response.pressure = -(stress[0] + stress[4] + stress[8]) / 3.0f;
+    const float kind = material.model_kind;
+    if (kind == 3.0f) {
+        const float gamma = material.tait_gamma, compression = powf(J, -gamma);
+        response.pressure += J * fminf(material.bulk_modulus * (compression - 1.0f), 0.0f);
+        response.bulk = J * material.bulk_modulus * ((gamma - 1.0f) * compression + 1.0f);
+        response.viscosity = J * fmaxf(material.viscosity, 0.0f);
+        return response;
+    }
+    const float youngs = material.youngs, poisson = material.poisson;
+    const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
+    const float mu = youngs / (2.0f * (1.0f + poisson));
+    const float lambda = (denom > 1e-9f) ? youngs * poisson / denom : 0.0f;
+    if (kind == 0.0f) {
+        const float stretch = cbrtf(J);
+        response.bulk = lambda * J * (2.0f * J - 1.0f) +
+                        (2.0f / 3.0f) * mu * stretch * (2.0f * stretch - 1.0f);
+        response.shear = mu * stretch * stretch;
+    } else if (kind == 2.0f) {
+        response.bulk = lambda + (2.0f / 3.0f) * mu * cbrtf(J * J);
+        response.shear = mu * cbrtf(J * J);
+    } else {
+        response.bulk = lambda + (2.0f / 3.0f) * mu;
+        response.shear = mu;
+    }
+    response.bulk = fmaxf(response.bulk, 0.0f);
+    response.shear = fmaxf(response.shear, 0.0f);
+    response.tension = FLT_MAX;
+    if (kind == 4.0f) {
+        // Drucker-Prager in Kirchhoff stress: |dev tau| <= alpha (3 pressure + cohesion).
+        const float sine = sinf(material.dp_friction * 0.017453292519943295f);
+        const float alpha = 1.632993161855452f * sine / fmaxf(3.0f - sine, 1.0e-6f);
+        response.tension = material.dp_cohesion / 3.0f;
+        response.cone_slope = 3.0f * alpha;
+        response.cone_offset = alpha * material.dp_cohesion;
+    } else if (kind == MpmMaterial::kHenckyJ2 && material.yield_stress > 0.0f) {
+        response.cone_slope = 0.0f;
+        response.cone_offset = 0.816496580927726f * material.yield_stress;
+    }
+    return response;
+}
+
+// Orthonormal traceless symmetric basis B_k: component k of a tensor T is B_k : T.
+NUKA_MPM_CONSTITUTIVE_HD inline void MpmDeviatorComponents(const float* T, float* out) {
+    constexpr float kHalfRoot = 0.70710678118654752f, kSixthRoot = 0.40824829046386302f;
+    out[0] = kHalfRoot * (T[1] + T[3]);
+    out[1] = kHalfRoot * (T[2] + T[6]);
+    out[2] = kHalfRoot * (T[5] + T[7]);
+    out[3] = kHalfRoot * (T[0] - T[4]);
+    out[4] = kSixthRoot * (T[0] + T[4] - 2.0f * T[8]);
+}
+
+// B_k g for a node gradient g, so a row of component k reads B_k : grad v.
+NUKA_MPM_CONSTITUTIVE_HD inline void MpmDeviatorGradient(uint32_t k, float gx, float gy, float gz,
+                                                         float* out) {
+    constexpr float kHalfRoot = 0.70710678118654752f, kSixthRoot = 0.40824829046386302f;
+    switch (k) {
+    case 0u: out[0] = kHalfRoot * gy; out[1] = kHalfRoot * gx; out[2] = 0.0f; break;
+    case 1u: out[0] = kHalfRoot * gz; out[1] = 0.0f; out[2] = kHalfRoot * gx; break;
+    case 2u: out[0] = 0.0f; out[1] = kHalfRoot * gz; out[2] = kHalfRoot * gy; break;
+    case 3u: out[0] = kHalfRoot * gx; out[1] = -kHalfRoot * gy; out[2] = 0.0f; break;
+    default: out[0] = kSixthRoot * gx; out[1] = kSixthRoot * gy; out[2] = -2.0f * kSixthRoot * gz;
+    }
+}
+
+// A stress block reads B_0 = I, then B_1..B_5 above. With S = sum m g g^T (xx yy zz xy xz yz),
+// its response is A_kl = tr(B_k B_l S).
+NUKA_MPM_CONSTITUTIVE_HD inline void MpmStressBlockResponse(const float* s, float (&A)[6][6]) {
+    constexpr float kRoot2 = 1.41421356237309505f, kHalfRoot = 0.70710678118654752f;
+    constexpr float kSixthRoot = 0.40824829046386302f, kThirdRoot = 0.57735026918962576f;
+    constexpr float kTwelfthRoot = 0.28867513459481288f;
+    const float a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5];
+    const float row[21] = {a + b + c, kRoot2 * d, kRoot2 * e, kRoot2 * f, kHalfRoot * (a - b),
+        kSixthRoot * (a + b - 2.0f * c), 0.5f * (a + b), 0.5f * f, 0.5f * e, 0.0f,
+        kThirdRoot * d, 0.5f * (a + c), 0.5f * d, 0.5f * e, -kTwelfthRoot * e, 0.5f * (b + c),
+        -0.5f * f, -kTwelfthRoot * f, 0.5f * (a + b), kTwelfthRoot * (a - b),
+        (a + b + 4.0f * c) / 6.0f};
+    uint32_t at = 0u;
+    for (uint32_t k = 0u; k < 6u; ++k)
+        for (uint32_t l = k; l < 6u; ++l) A[k][l] = A[l][k] = row[at++];
+}
+
+// Rates B_k : G of a symmetric velocity gradient G (xx yy zz xy xz yz).
+NUKA_MPM_CONSTITUTIVE_HD inline void MpmStressBlockRates(const float* g, float (&rate)[6]) {
+    const float T[9] = {g[0], g[3], g[4], g[3], g[1], g[5], g[4], g[5], g[2]};
+    rate[0] = g[0] + g[1] + g[2];
+    MpmDeviatorComponents(T, rate + 1);
+}
+
+// The symmetric tensor sum_k d_k B_k (xx yy zz xy xz yz).
+NUKA_MPM_CONSTITUTIVE_HD inline void MpmStressBlockTensor(const float (&d)[6], float* out) {
+    constexpr float kHalfRoot = 0.70710678118654752f, kSixthRoot = 0.40824829046386302f;
+    out[0] = d[0] + kHalfRoot * d[4] + kSixthRoot * d[5];
+    out[1] = d[0] - kHalfRoot * d[4] + kSixthRoot * d[5];
+    out[2] = d[0] - 2.0f * kSixthRoot * d[5];
+    out[3] = kHalfRoot * d[1];
+    out[4] = kHalfRoot * d[2];
+    out[5] = kHalfRoot * d[3];
+}
+
 // A failed evaluation leaves the output intact; plastic history belongs to the trial until commit.
 template <class Arithmetic = MpmArithmetic>
 NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmMaterialTrial(
@@ -318,7 +438,8 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmMaterialTrial(
         const float volume = mpm_detail::Mat3Det(history.elastic_f) *
             (1.0f + dt * (C[0] + C[4] + C[8]));
         if (!(volume > 0.0f) || !std::isfinite(volume)) return ConstitutiveStatus::SingularDeformation;
-        const float stretch = cbrtf(volume);
+        // Liquid bears no tension: separation opens voids instead of stretching the liquid.
+        const float stretch = cbrtf(fminf(volume, 1.0f));
         for (int k = 0; k < 9; ++k) next.elastic_f[k] = (k % 4 == 0) ? stretch : 0.0f;
     } else {
         float map[9];

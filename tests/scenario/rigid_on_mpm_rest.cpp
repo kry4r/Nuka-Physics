@@ -9,6 +9,7 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "nk/material/mpm_transfer.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
@@ -324,12 +325,16 @@ TEST(RigidOnMpmRest, FiniteMassMultipleOwnersConserveMomentum) {
                 EXPECT_LT(residual, 2.0e-5);
                 double coupled_mass = 0.0, grid_px = 0.0, grid_energy = 0.0;
                 Vec3 momentum{}, moment{};
+                const uint32_t lattice_nodes = static_cast<uint32_t>(mass.size()) / nk::kMpmLattices;
                 for (uint32_t n = 0u; n < mass.size(); ++n) {
                     if (touched[n]) coupled_mass += mass[n];
                     grid_px += mass[n] * grid[n].x;
                     grid_energy += 0.5 * mass[n] * grid[n].LengthSq();
-                    const Vec3 position{-0.3f + (n % 7u) * 0.1f,
-                        -0.3f + ((n / 7u) % 7u) * 0.1f, -0.3f + (n / 49u) * 0.1f};
+                    const uint32_t node = n % lattice_nodes;
+                    const float shift = nk::MpmLatticeOffset(n / lattice_nodes);
+                    const Vec3 position{-0.3f + (float(node % 7u) + shift) * 0.1f,
+                        -0.3f + (float((node / 7u) % 7u) + shift) * 0.1f,
+                        -0.3f + (float(node / 49u) + shift) * 0.1f};
                     momentum += grid[n] * mass[n];
                     moment += position.Cross(grid[n] * mass[n]);
                 }

@@ -671,6 +671,7 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         mp.Set("loft_headroom", Value::Float(mm.loft_headroom));
         mp.Set("yield_stress", Value::Float(mm.yield_stress));
         mp.Set("hardening_modulus", Value::Float(mm.hardening_modulus));
+        if (mm.implicit_stress) mp.Set("implicit_stress", Value::Bool(true));
         return mp;
     };
     o.Set("mpm", mpm_mat_json(m.mpm));
@@ -1683,6 +1684,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             mm.loft_headroom = f(mp, "loft_headroom", mm.loft_headroom);
             mm.yield_stress = f(mp, "yield_stress", mm.yield_stress);
             mm.hardening_modulus = f(mp, "hardening_modulus", mm.hardening_modulus);
+            mm.implicit_stress = b(mp, "implicit_stress", mm.implicit_stress);
         };
 
         for (const Value& mv : media->Elements()) {

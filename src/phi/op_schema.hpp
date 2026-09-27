@@ -487,13 +487,15 @@ struct MpmParams {
     uint32_t particle_surface_nodes_per_env;
     uint32_t point_endpoints_per_env;
     uint32_t point_endpoint_terms_per_env;
+    // Implicit stress cells per env, row blocks at the env row tail; zero transfers stress explicitly.
+    uint32_t stress_cells_per_env = 0u;
 };
 
-// Workspace bytes for MPM particles, grid nodes, contacts and body/boundary reaction targets.
+// Workspace bytes for MPM particles, grid nodes, contacts, reaction targets and stress cells.
 // Query before state allocation; zero particles require no workspace.
 uint64_t MpmSortScratchBytes(uint32_t particle_count, uint32_t node_count,
                              uint64_t collidables_per_env, uint64_t contact_count,
-                             uint64_t reaction_target_count);
+                             uint64_t reaction_target_count, uint64_t stress_cell_count);
 
 // --- narrowphase / contact rows -----------------------------------------
 // Contact-family selector shared by the narrowphase / assemble / solve params
@@ -705,6 +707,14 @@ struct AssembleRowsParams {
     float    baumgarte_max_velocity;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
+    // Distance, bend and volume constraints fill env rows from particle_constraint_row_first
+    // in that order; bend and volume rows read 4-term endpoints from the given firsts.
+    uint32_t particle_constraint_row_first = 0u;
+    uint32_t dist_cons_per_env = 0u;
+    uint32_t bend_cons_per_env = 0u;
+    uint32_t vol_cons_per_env = 0u;
+    uint32_t constraint_endpoint_first = 0u;
+    uint32_t constraint_term_first = 0u;
 };
 
 // Spec-fixed semantic fields : {dt, vel_iters, pos_iters}. The fields BELOW
@@ -825,31 +835,16 @@ struct ParticleContactDeltaParams {
 
 struct XpbdProjectParams {
     float    dt;
-    uint16_t iters;            // XPBD Gauss-Seidel sweep count
-    uint32_t dist_con_count;   // total env-major distance constraints
-    uint32_t bend_con_count;   // total env-major bend constraints
-    uint32_t vol_con_count;    // total env-major volume constraints
-    // Environment-major shape-match clusters run after distance, bend, and volume.
+    uint16_t iters;            // Gauss-Seidel sweep count
+    // Environment-major shape-match clusters; each color holds independent clusters.
     uint32_t shape_match_cluster_count;
-    // Each color contains independent constraints; colors execute in order.
-    // Per-environment strides map local constraint and cluster indices to global indices.
-    uint32_t dist_colors;
-    uint32_t bend_colors;
-    uint32_t vol_colors;
     uint32_t sm_colors;
     uint32_t env_count;
-    uint32_t dist_cons_per_env;
-    uint32_t bend_cons_per_env;
-    uint32_t vol_cons_per_env;
     uint32_t sm_clusters_per_env;
     uint32_t sm_members_per_env;
-    // Host {offset,count} color tables remain valid for the world's lifetime.
-    // Backends use their workload bounds while preserving ordered color dependencies.
-    const uint32_t* dist_color_segments;
-    const uint32_t* bend_color_segments;
-    const uint32_t* vol_color_segments;
+    // Host {offset,count} color table, valid for the world's lifetime.
     const uint32_t* sm_color_segments;
-    uint32_t iteration_start = 0u; // Zero starts the step's lambda accumulation.
+    uint32_t iteration_start = 0u;
 };
 
 struct PbfDensityLambdaParams {

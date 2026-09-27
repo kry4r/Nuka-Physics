@@ -238,7 +238,9 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
     const uint64_t total_rows =
         contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env) +
         static_cast<uint64_t>(cap.joint_friction_rows_per_env) +
-        static_cast<uint64_t>(cap.joint_drive_rows_per_env);
+        static_cast<uint64_t>(cap.joint_drive_rows_per_env) +
+        static_cast<uint64_t>(cap.mpm_stress_cells_per_env) * nk::kMpmStressRowsPerCell +
+        static_cast<uint64_t>(cap.dist_cons_per_env) + cap.bend_cons_per_env + cap.vol_cons_per_env;
     if (total_rows > 0xFFFFFFFFull) {
         throw std::runtime_error("CookToModel: row capacity overflows u32");
     }
@@ -281,8 +283,10 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
     SetRowCapacity(cap, rows);
     if (cap.mpm_grid_nodes_per_env > 0u) {
         const uint32_t surfaces = cap.particle_surfaces_per_env > 0u ? cap.mpm_contact_capacity_per_env : 0u;
-        const uint64_t endpoints = nk::MpmPointEndpointCount(cap.particles_per_env, surfaces);
-        const uint64_t terms = nk::MpmPointEndpointTermCount(cap.particles_per_env, surfaces);
+        const uint64_t endpoints = nk::MpmPointEndpointCount(
+            cap.particles_per_env, surfaces, cap.mpm_stress_cells_per_env);
+        const uint64_t terms = nk::MpmPointEndpointTermCount(
+            cap.particles_per_env, surfaces, cap.mpm_stress_cells_per_env);
         if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("material contact endpoint capacity exceeds device indexing");
         cap.point_endpoints_per_env = static_cast<uint32_t>(endpoints);
@@ -1654,7 +1658,7 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
         in.grid_dims[1] < nk::kMpmStencilWidth || in.grid_dims[2] < nk::kMpmStencilWidth) {
         throw std::runtime_error(
             "CookMpmParticles: an MLS-MPM medium needs a positive cell size dx and "
-            "at least three nodes per grid axis");
+            "at least two nodes per grid axis");
     }
 
     nk::Model::ModelParticles& mp = model.particles;
@@ -1726,13 +1730,16 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     // Env-private dense grid sizing (the node product, loud u32 overflow guard).
     const uint64_t nodes64 = static_cast<uint64_t>(in.grid_dims[0]) *
                              in.grid_dims[1] * in.grid_dims[2];
-    if (nodes64 > 0xFFFFFFFFull) {
+    if (nk::kMpmLattices * nodes64 > 0xFFFFFFFFull) {
         throw std::runtime_error(
             "CookMpmParticles: the MPM grid node count (dims product) overflows u32");
     }
-    cap.mpm_grid_nodes_per_env = static_cast<uint32_t>(nodes64);
+    cap.mpm_grid_nodes_per_env = static_cast<uint32_t>(nk::kMpmLattices * nodes64);
     cap.mpm_contact_capacity_per_env = in.contact_capacity != 0u ? in.contact_capacity :
         static_cast<uint32_t>(std::min(nodes64, uint64_t{nk::kMpmStencilNodes} * n));
+    // Every occupied cell holds at least one material point.
+    cap.mpm_stress_cells_per_env = in.implicit_stress
+        ? static_cast<uint32_t>(std::min<uint64_t>(nodes64, n)) : 0u;
     mp.mpm_grid_min = in.grid_origin;
     mp.mpm_grid_dims[0] = in.grid_dims[0];
     mp.mpm_grid_dims[1] = in.grid_dims[1];
@@ -2833,6 +2840,7 @@ static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
     in.dx = grid.dx;
     in.contact_capacity = grid.contact_capacity;
     in.substeps = grid.substeps;
+    in.implicit_stress = grid.implicit_stress;
     in.floor_normal = grid.floor_normal;
     in.floor_d = grid.floor_d;
     in.floor_friction = grid.floor_friction;
@@ -2913,6 +2921,7 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
     in.dx = mp.dx;
     in.contact_capacity = mp.contact_capacity;
     in.substeps = mp.substeps;
+    in.implicit_stress = mp.implicit_stress;
     in.floor_normal = mp.floor_normal;
     in.floor_d = mp.floor_d;
     in.floor_friction = mp.floor_friction;
@@ -2950,8 +2959,10 @@ MpmCookInput BuildMpmInput(const std::vector<MediaRecord>& media) {
             next.floor_normal.x != combined.floor_normal.x ||
             next.floor_normal.y != combined.floor_normal.y ||
             next.floor_normal.z != combined.floor_normal.z ||
-            next.floor_d != combined.floor_d || next.floor_friction != combined.floor_friction)
-            throw std::runtime_error("MLS-MPM media sharing a grid require matching dx and floor parameters");
+            next.floor_d != combined.floor_d || next.floor_friction != combined.floor_friction ||
+            next.implicit_stress != combined.implicit_stress)
+            throw std::runtime_error(
+                "MLS-MPM media sharing a grid require matching dx, floor and pressure integration");
         const auto materialize = [](MpmCookInput& input) {
             if (input.materials.empty()) {
                 input.materials.push_back(input.material);

@@ -270,9 +270,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     // particle launch geometry + mode (resolved once from the Model).
     const uint32_t particle_count = cap.particles_per_env * env_count;
-    const uint32_t dist_count = cap.dist_cons_per_env * env_count;
-    const uint32_t bend_count = cap.bend_cons_per_env * env_count;
-    const uint32_t vol_count  = cap.vol_cons_per_env * env_count;
     const uint32_t sm_cluster_count = cap.shape_match_slots_per_env * env_count;
     const Model::ModelParticles& mp = model.particles;
     const uint32_t particle_mode =
@@ -311,7 +308,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         (particle_mode == phi::kParticleModeCoupled &&
          coupled_internal == phi::kCoupledInternalPbf);
 
-    const uint32_t xpbd_iterations = (dist_count | bend_count | vol_count | sm_cluster_count) != 0u
+    // Distance, bend and volume constraints are rows of the common solve; shape matching projects.
+    const uint32_t xpbd_iterations = sm_cluster_count != 0u
         ? std::max<uint32_t>(mp.xpbd_iters, 1u) : 0u;
     const uint32_t pbf_iterations = runs_pbf ? std::max<uint32_t>(mp.pbf_iters, 1u) : 0u;
     const bool pp_contact = particle_mode == phi::kParticleModeSoftFluid || mp.pp_self_contact;
@@ -467,23 +465,11 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     if (has_particles) {
         p_xpbd_.dt = cfg.dt;
         p_xpbd_.iters = 1u;
-        p_xpbd_.dist_con_count = dist_count;
-        p_xpbd_.bend_con_count = bend_count;
-        p_xpbd_.vol_con_count = vol_count;
         p_xpbd_.shape_match_cluster_count = sm_cluster_count;
-        p_xpbd_.dist_colors = cap.xpbd_dist_colors;
-        p_xpbd_.bend_colors = cap.xpbd_bend_colors;
-        p_xpbd_.vol_colors = cap.xpbd_vol_colors;
         p_xpbd_.sm_colors = cap.xpbd_sm_colors;
         p_xpbd_.env_count = env_count;
-        p_xpbd_.dist_cons_per_env = cap.dist_cons_per_env;
-        p_xpbd_.bend_cons_per_env = cap.bend_cons_per_env;
-        p_xpbd_.vol_cons_per_env = cap.vol_cons_per_env;
         p_xpbd_.sm_clusters_per_env = cap.shape_match_slots_per_env;
         p_xpbd_.sm_members_per_env = cap.shape_match_members_per_env;
-        p_xpbd_.dist_color_segments = model.dist_color_segments.data();
-        p_xpbd_.bend_color_segments = model.bend_color_segments.data();
-        p_xpbd_.vol_color_segments = model.vol_color_segments.data();
         p_xpbd_.sm_color_segments = model.sm_color_segments.data();
         for (uint32_t pass = 0u; pass < projection_iterations; ++pass) {
             p_xpbd_iterations_[pass] = p_xpbd_;
@@ -689,6 +675,16 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.grid_nodes_per_env = cap.mpm_grid_nodes_per_env;
         p_assemble_.point_endpoints_per_env = cap.point_endpoints_per_env;
         p_assemble_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
+        // Particle constraint rows sit just before the stress tail; their endpoints end the pool.
+        const uint32_t constraint_rows = cap.dist_cons_per_env + cap.bend_cons_per_env + cap.vol_cons_per_env;
+        const uint32_t constraint_endpoints = cap.bend_cons_per_env + cap.vol_cons_per_env;
+        p_assemble_.dist_cons_per_env = cap.dist_cons_per_env;
+        p_assemble_.bend_cons_per_env = cap.bend_cons_per_env;
+        p_assemble_.vol_cons_per_env = cap.vol_cons_per_env;
+        p_assemble_.particle_constraint_row_first = cap.max_rows_per_env -
+            cap.mpm_stress_cells_per_env * kMpmStressRowsPerCell - constraint_rows;
+        p_assemble_.constraint_endpoint_first = cap.point_endpoints_per_env - constraint_endpoints;
+        p_assemble_.constraint_term_first = cap.point_endpoint_terms_per_env - 4u * constraint_endpoints;
         p_assemble_.dt = cfg.dt;
         p_assemble_.slot_count = slot_count;
         p_assemble_.max_dof = max_dof;

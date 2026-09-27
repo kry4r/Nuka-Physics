@@ -162,7 +162,8 @@ __global__ void AccumulateIslandFlagsKernel(
     uint32_t flags = 0u;
     if (row.a.kind == kNkSideArtic || row.b.kind == kNkSideArtic)
         flags |= nkops::kIslandHasArticulation;
-    if ((row.a.kind == nk::kNkSidePointEndpoint && endpoint_ranges[row.a.index].count > 1u) ||
+    if ((row.flags & nk::nk_row_flags::kMaterialBlock) ||
+        (row.a.kind == nk::kNkSidePointEndpoint && endpoint_ranges[row.a.index].count > 1u) ||
         (row.b.kind == nk::kNkSidePointEndpoint && endpoint_ranges[row.b.index].count > 1u))
         flags |= nkops::kIslandHasMultiplePointTerms;
     if (flags != 0u) atomicOr(&root_flags[root], flags);
