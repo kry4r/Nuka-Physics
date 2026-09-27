@@ -10,6 +10,7 @@
 #include "import/usd_importer.hpp"
 #include "import/mjcf_importer.hpp"
 #include "math/symmetric_mat3.hpp"
+#include "nk/material/mpm_material.hpp"
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/nk_row.hpp"
@@ -81,7 +82,7 @@ nk::Model ParticleModel() {
     model.mpm_materials = {material};
     model.capacities.articulations_per_env = 0u;
     model.capacities.particles_per_env = static_cast<uint32_t>(count);
-    model.capacities.mpm_grid_nodes_per_env = 6u * 6u * 6u;
+    model.capacities.mpm_grid_nodes_per_env = 6u * 6u * 6u * nk::kMpmLattices;
     model.capacities.mpm_contact_capacity_per_env = model.capacities.mpm_grid_nodes_per_env;
     model.capacities.max_contacts_per_env = model.capacities.mpm_contact_capacity_per_env;
     model.capacities.max_rows_per_env = model.capacities.max_contacts_per_env * nk::kPairDrivenParticleRowsPerSlot;

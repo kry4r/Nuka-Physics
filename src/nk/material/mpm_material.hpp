@@ -5,8 +5,20 @@
 
 namespace nuka::nk {
 
-inline constexpr uint32_t kMpmStencilWidth = 3u;
-inline constexpr uint32_t kMpmStencilNodes = kMpmStencilWidth * kMpmStencilWidth * kMpmStencilWidth;
+// The compact kernel spans one cell per axis on each of two staggered lattices.
+inline constexpr uint32_t kMpmLattices = 2u;
+inline constexpr uint32_t kMpmStencilWidth = 2u;
+inline constexpr uint32_t kMpmLatticeStencilNodes =
+    kMpmStencilWidth * kMpmStencilWidth * kMpmStencilWidth;
+inline constexpr uint32_t kMpmStencilNodes = kMpmLattices * kMpmLatticeStencilNodes;
+// Particles sort by half-cell, which fixes their cell on both lattices.
+inline constexpr uint32_t kMpmHalfCellsPerLatticeNode = 8u;
+// A stress cell touches lattice-0 nodes i..i+1 and lattice-1 nodes i-1..i+1 per axis.
+inline constexpr uint32_t kMpmCellStencilNodes = kMpmLatticeStencilNodes +
+    (kMpmStencilWidth + 1u) * (kMpmStencilWidth + 1u) * (kMpmStencilWidth + 1u);
+// A stress cell solves its mean stress and five deviator components as one block of rows.
+inline constexpr uint32_t kMpmDeviatorComponents = 5u;
+inline constexpr uint32_t kMpmStressRowsPerCell = 1u + kMpmDeviatorComponents;
 
 // Material rows use SI units and contain no execution-backend state.
 struct MpmMaterial {

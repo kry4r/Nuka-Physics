@@ -29,6 +29,7 @@
 #include "constraint/coulomb_contact.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/field_ids.hpp"
+#include "nk/material/mpm_transfer.hpp"
 #include "nk/model/model.hpp"
 #include "nk/pipeline/world.hpp"
 #include "nk/solve/point_endpoint.hpp"
@@ -373,10 +374,14 @@ TEST(NkMpmXpbdCoResidence, SurfaceContactFiniteMassFrictionAndMomentum) {
                         side_kind.begin() + (env + 1u) * cap.max_contacts_per_env, nk::kNkSidePointEndpoint), contacts);
                     Vec3 momentum{}, moment{}, transferred{}, reaction_moment{};
                     double energy = 0.0;
+                    const uint32_t lattice_nodes = cap.mpm_grid_nodes_per_env / nk::kMpmLattices;
                     for (uint32_t local = 0u; local < cap.mpm_grid_nodes_per_env; ++local) {
                         const uint32_t g = env * cap.mpm_grid_nodes_per_env + local;
-                        const Vec3 point{-0.3f + float(local % 7u) * 0.1f,
-                            -0.4f + float((local / 7u) % 9u) * 0.1f, -0.4f + float(local / 63u) * 0.1f};
+                        const uint32_t node = local % lattice_nodes;
+                        const float shift = nk::MpmLatticeOffset(local / lattice_nodes);
+                        const Vec3 point{-0.3f + (float(node % 7u) + shift) * 0.1f,
+                            -0.4f + (float((node / 7u) % 9u) + shift) * 0.1f,
+                            -0.4f + (float(node / 63u) + shift) * 0.1f};
                         momentum += grid[g] * grid_mass[g];
                         moment += point.Cross(grid[g] * grid_mass[g]);
                         energy += 0.5 * grid_mass[g] * grid[g].LengthSq();
@@ -402,7 +407,23 @@ TEST(NkMpmXpbdCoResidence, SurfaceContactFiniteMassFrictionAndMomentum) {
                     EXPECT_GT(transferred.Length(), 0.001f);
                     Vec3 final_momentum = velocity[first], final_moment = positions[first].Cross(velocity[first]);
                     const float* c = affine.data() + first * 9u;
-                    final_moment += Vec3{c[7] - c[5], c[2] - c[6], c[3] - c[1]} * (0.25f * 0.1f * 0.1f);
+                    // The affine moment is eps : (C D) with the full inertia D where the particle gathered.
+                    const nk::MpmCompactAxis axes[3] = {
+                        nk::MpmCompactWeights((initial[first].x + 0.3f) / 0.1f),
+                        nk::MpmCompactWeights((initial[first].y + 0.4f) / 0.1f),
+                        nk::MpmCompactWeights((initial[first].z + 0.4f) / 0.1f)};
+                    float D[3][3];
+                    for (uint32_t a = 0u; a < 3u; ++a)
+                        for (uint32_t b = 0u; b < 3u; ++b) {
+                            float value = a == b ? axes[a].moment : 0.0f;
+                            for (uint32_t lattice = 0u; a != b && lattice < nk::kMpmLattices; ++lattice)
+                                value += nk::kMpmLatticeShare * axes[a].first[lattice] * axes[b].first[lattice];
+                            D[a][b] = value * 0.1f * 0.1f;
+                        }
+                    const auto cd = [&](uint32_t r, uint32_t k) {
+                        return c[3u * r] * D[0][k] + c[3u * r + 1u] * D[1][k] + c[3u * r + 2u] * D[2][k];
+                    };
+                    final_moment += Vec3{cd(2u, 1u) - cd(1u, 2u), cd(0u, 2u) - cd(2u, 0u), cd(1u, 0u) - cd(0u, 1u)};
                     for (uint32_t local = 1u; local < cap.particles_per_env; ++local) {
                         const uint32_t p = first + local;
                         const Vec3 body_momentum = mass == 0.0f ? vertex_impulse[local] :

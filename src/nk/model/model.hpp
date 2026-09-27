@@ -125,6 +125,8 @@ struct ModelCapacities {
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
     uint32_t mpm_grid_nodes_per_env = 0;
     uint32_t mpm_contact_capacity_per_env = 0;  // Shared pool; multiple contacts may use one material point.
+    // Implicit stress cells, one row block per occupied grid cell, at the tail of each env's row span.
+    uint32_t mpm_stress_cells_per_env = 0;
     // Byte size of the mpm_sort_scratch field (the P2G deterministic-gather cub
     // sort temp + out buffers; sized at World construct; 0 == no MPM particles).
     uint64_t mpm_grid_sort_scratch_bytes = 0;

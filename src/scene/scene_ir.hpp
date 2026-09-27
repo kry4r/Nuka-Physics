@@ -372,6 +372,8 @@ struct MediaMpmMaterial {
     // not trip the +z escape clip. 0 (default) keeps today's motion headroom.
     float      loft_headroom  = 0.0f;
     float      yield_stress = 0.0f, hardening_modulus = 0.0f;
+    // Solve the stress with the contact rows instead of transferring it explicitly.
+    bool       implicit_stress = false;
 };
 
 // Render-skin metadata for surface baking. The cloth fields mirror the particle

@@ -23,9 +23,11 @@
 
 #include <cuda_runtime.h>
 
+#include "constraint/dihedral_bend.hpp"
 #include "constraint/solref_solimp.hpp"  // ComputeCompliantRow (HD)
 #include "nk/contact/contact_profile.hpp"
 #include "nk/solve/collidable_owner.hpp"
+#include "nk/solve/point_endpoint.hpp"
 #include "scene/contact_filter.hpp"
 #include "math/cuda_vec_ops.cuh"
 #include "phi/backend_cuda/launch.cuh"
@@ -949,6 +951,114 @@ __global__ void EmitJointDriveRowsKernel(
     urows[slot] = row;
 }
 
+// A particle constraint C(x) is a compliant row J v + (alpha / h^2) lambda = J v* - C(x*) / h,
+// linearized at the predicted positions x* = x + h v*; this is XPBD to first order.
+__global__ void EmitParticleConstraintRowsKernel(
+    uint32_t env_count, uint32_t dist_per_env, uint32_t bend_per_env, uint32_t vol_per_env,
+    uint32_t rows_per_env, uint32_t first_row, uint32_t endpoints_per_env,
+    uint32_t terms_per_env, uint32_t endpoint_first, uint32_t term_first, float dt,
+    const uint32_t* __restrict__ dist_a, const uint32_t* __restrict__ dist_b,
+    const float* __restrict__ dist_rest, const float* __restrict__ dist_compliance,
+    const uint32_t* __restrict__ bend_particles, const float* __restrict__ bend_rest,
+    const float* __restrict__ bend_compliance, const uint32_t* __restrict__ vol_particles,
+    const float* __restrict__ vol_rest, const float* __restrict__ vol_compliance,
+    const math::Vec3* __restrict__ predicted, const math::Vec3* __restrict__ velocity,
+    const float* __restrict__ inv_mass, NkRow* urows, float* lambda,
+    nk::PointEndpointRange* ranges, nk::PointEndpointTerm* terms,
+    uint32_t* row_cj_link, uint32_t* row_cj_link_b, float* row_penetration, uint32_t* row_count) {
+    const uint32_t per_env = dist_per_env + bend_per_env + vol_per_env;
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (per_env == 0u || item >= env_count * per_env) return;
+    const uint32_t env = item / per_env;
+    const uint32_t local = item - env * per_env;
+    const uint32_t slot = env * rows_per_env + first_row + local;
+    row_cj_link[slot] = row_cj_link_b[slot] = kInvalidLink;
+    row_penetration[slot] = 0.0f;
+    NkRow row{};
+    row.group_first = slot;
+    row.group_normal_count = 1u;
+    row.env = env;
+    row.lower = -kFltMax;
+    row.upper = kFltMax;
+    float error = 0.0f, alpha = 0.0f, jv = 0.0f;
+    bool valid = false;
+    if (local < dist_per_env) {
+        const uint32_t c = env * dist_per_env + local;
+        const uint32_t ia = dist_a[c], ib = dist_b[c];
+        const math::Vec3 r = predicted[ia] - predicted[ib];
+        const float length = sqrtf(r.Dot(r));
+        if (length > 0.0f && inv_mass[ia] + inv_mass[ib] > 0.0f) {
+            const math::Vec3 n = r * (1.0f / length);
+            row.a.kind = row.b.kind = kNkSideParticle;
+            row.a.index = ia;
+            row.b.index = ib;
+            row.a.jlin = n;
+            row.b.jlin = n * -1.0f;
+            error = length - dist_rest[c];
+            alpha = dist_compliance[c];
+            jv = n.Dot(velocity[ia] - velocity[ib]);
+            valid = true;
+        }
+    } else {
+        // Bend and volume rows read 4 particle gradients through one endpoint along x.
+        const bool bend = local < dist_per_env + bend_per_env;
+        const uint32_t member = local - dist_per_env - (bend ? 0u : bend_per_env);
+        const uint32_t c = env * (bend ? bend_per_env : vol_per_env) + member;
+        const uint32_t* particles = (bend ? bend_particles : vol_particles) + size_t{c} * 4u;
+        uint32_t index[4];
+        math::Vec3 p[4], gradient[4];
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            index[j] = particles[j];
+            p[j] = predicted[index[j]];
+        }
+        if (bend) {
+            const auto geometry = constraint::EvaluateDihedralBend(p[0], p[1], p[2], p[3]);
+            valid = geometry.valid;
+            error = constraint::DihedralBendError(geometry.angle, bend_rest[c]);
+            for (uint32_t j = 0u; j < 4u; ++j) gradient[j] = geometry.gradients[j];
+            alpha = bend_compliance[c];
+        } else {
+            const math::Vec3 e1 = p[1] - p[0], e2 = p[2] - p[0], e3 = p[3] - p[0];
+            gradient[1] = e2.Cross(e3);
+            gradient[2] = e3.Cross(e1);
+            gradient[3] = e1.Cross(e2);
+            gradient[0] = (gradient[1] + gradient[2] + gradient[3]) * -1.0f;
+            error = e1.Dot(gradient[1]) - vol_rest[c];
+            alpha = vol_compliance[c];
+            valid = true;
+        }
+        const uint32_t endpoint = env * endpoints_per_env + endpoint_first + local - dist_per_env;
+        const uint32_t first = env * terms_per_env + term_first + (local - dist_per_env) * 4u;
+        float response = 0.0f;
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            nk::PointEndpointTerm term;
+            term.kind = kNkSideParticle;
+            term.index = index[j];
+            term.column[0] = {gradient[j].x, 0.0f, 0.0f};
+            term.column[1] = {gradient[j].y, 0.0f, 0.0f};
+            term.column[2] = {gradient[j].z, 0.0f, 0.0f};
+            terms[first + j] = term;
+            jv += gradient[j].Dot(velocity[index[j]]);
+            response += inv_mass[index[j]] * gradient[j].Dot(gradient[j]);
+        }
+        valid = valid && response > 0.0f;
+        ranges[endpoint] = {first, valid ? 4u : 0u};
+        row.a.kind = nk::kNkSidePointEndpoint;
+        row.a.index = endpoint;
+        row.a.jlin = {1.0f, 0.0f, 0.0f};
+    }
+    if (valid && isfinite(error) && isfinite(jv)) {
+        row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kVelocityOnly;
+        row.compliance_alpha = fmaxf(alpha, 0.0f) / (dt * dt);
+        row.rhs = (jv - error / dt) / dt;
+        atomicAdd(row_count + env, 1u);
+    } else {
+        row = NkRow{};
+        lambda[slot] = 0.0f;
+    }
+    urows[slot] = row;
+}
+
 __device__ float PairDrivenSideCoupling(
     const NkRowSide& lhs, uint32_t lhs_side, uint32_t lhs_row,
     const NkRowSide& rhs, uint32_t rhs_side, uint32_t rhs_row,
@@ -1599,6 +1709,31 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->max_dof, data.drive_command, data.drive_dissipation, data.drive_lower, data.drive_upper,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda, data.chain_jacobian,
                    data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+    }
+
+    const uint32_t constraints = p->dist_cons_per_env + p->bend_cons_per_env + p->vol_cons_per_env;
+    if (constraints > 0u) {
+        const uint32_t blocks = (p->env_count * constraints + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(EmitParticleConstraintRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   p->env_count, p->dist_cons_per_env, p->bend_cons_per_env, p->vol_cons_per_env,
+                   p->rows_per_env, p->particle_constraint_row_first, p->point_endpoints_per_env,
+                   p->point_endpoint_terms_per_env, p->constraint_endpoint_first,
+                   p->constraint_term_first, p->dt,
+                   static_cast<const uint32_t*>(model.dist_particle_a),
+                   static_cast<const uint32_t*>(model.dist_particle_b),
+                   static_cast<const float*>(model.dist_rest_length),
+                   static_cast<const float*>(model.dist_compliance),
+                   static_cast<const uint32_t*>(model.bend_particles),
+                   static_cast<const float*>(model.bend_rest_angle),
+                   static_cast<const float*>(model.bend_compliance),
+                   static_cast<const uint32_t*>(model.vol_particles),
+                   static_cast<const float*>(model.vol_rest_times6),
+                   static_cast<const float*>(model.vol_compliance),
+                   data.pbf_predicted_pos, data.particle_vel,
+                   static_cast<const float*>(data.particle_inv_mass),
+                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
+                   data.point_endpoint_ranges, data.point_endpoint_terms,
+                   data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_count);
     }
 
     if (has_artic) {

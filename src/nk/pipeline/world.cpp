@@ -76,7 +76,10 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     const uint64_t row_count =
         (control_cap.max_contacts_per_env - point_slots) * kPairDrivenRowsPerSlot +
         point_slots * kPairDrivenParticleRowsPerSlot + control_cap.joint_limit_rows_per_env +
-        control_cap.joint_friction_rows_per_env + drive_rows;
+        control_cap.joint_friction_rows_per_env + drive_rows +
+        uint64_t{control_cap.mpm_stress_cells_per_env} * kMpmStressRowsPerCell +
+        uint64_t{control_cap.dist_cons_per_env} + control_cap.bend_cons_per_env +
+        control_cap.vol_cons_per_env;
     if (row_count > std::numeric_limits<uint32_t>::max()) {
         creation_status_ = phi::Status::InvalidArgument;
         creation_error_ = "actuator row capacity is invalid";
@@ -87,11 +90,17 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     control_cap.inverse_dynamics_controls =
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
-    if (control_cap.mpm_grid_nodes_per_env > 0u) {
+    // Bend and volume rows keep one 4-term particle endpoint each at the endpoint tail.
+    const uint64_t constraint_endpoints =
+        uint64_t{control_cap.bend_cons_per_env} + control_cap.vol_cons_per_env;
+    if (control_cap.mpm_grid_nodes_per_env > 0u || constraint_endpoints > 0u) {
         const uint32_t surfaces = control_cap.particle_surfaces_per_env > 0u
             ? control_cap.mpm_contact_capacity_per_env : 0u;
-        const uint64_t endpoints = MpmPointEndpointCount(control_cap.particles_per_env, surfaces);
-        const uint64_t terms = MpmPointEndpointTermCount(control_cap.particles_per_env, surfaces);
+        const bool grid = control_cap.mpm_grid_nodes_per_env > 0u;
+        const uint64_t endpoints = constraint_endpoints + (grid ? MpmPointEndpointCount(
+            control_cap.particles_per_env, surfaces, control_cap.mpm_stress_cells_per_env) : 0u);
+        const uint64_t terms = constraint_endpoints * 4u + (grid ? MpmPointEndpointTermCount(
+            control_cap.particles_per_env, surfaces, control_cap.mpm_stress_cells_per_env) : 0u);
         if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max()) {
             creation_status_ = phi::Status::InvalidArgument;
             creation_error_ = "point endpoint term capacity exceeds device indexing";
@@ -174,6 +183,8 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
                                         uint64_t{model_.capacities.mpm_contact_capacity_per_env} *
                                             model_.capacities.env_count,
                                         (uint64_t{model_.capacities.bodies_per_env} + kMpmBoundaryCount) *
+                                            model_.capacities.env_count,
+                                        uint64_t{model_.capacities.mpm_stress_cells_per_env} *
                                             model_.capacities.env_count)
             : 0u;
 

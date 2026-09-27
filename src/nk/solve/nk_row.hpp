@@ -78,6 +78,8 @@ inline constexpr uint32_t kJointLimit = kJointLimitLower | kJointLimitUpper;
 inline constexpr uint32_t kContactNormal = 1u << 6;
 inline constexpr uint32_t kVelocityOnly = 1u << 7;
 inline constexpr uint32_t kSpeculative = 1u << 8;
+// Heads a material stress block; the block's inactive rows follow it and store their data.
+inline constexpr uint32_t kMaterialBlock = 1u << 9;
 }  // namespace nk_row_flags
 
 // General contact pipeline (PairDriven family, Phase 1B): the FIXED per-candidate-
