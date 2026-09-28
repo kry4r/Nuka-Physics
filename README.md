@@ -42,13 +42,13 @@
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4"><img src="docs/media/nuka_go2_backflip.gif" width="100%" alt="Go2 performing a double backflip in Nuka"></a>
-  <br><b>Go2 Double Backflip</b>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4"><img src="docs/media/nuka_go2_backflip.gif" width="100%" alt="Go2 performing a backflip in the Nuka lab"></a>
+  <br><b>Go2 Backflip</b>
   <br>TorchScript policy inference
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_backflip.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4"><img src="docs/media/nuka_go2_front_handstand.gif" width="100%" alt="Go2 performing a handstand in Nuka"></a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4"><img src="docs/media/nuka_go2_front_handstand.gif" width="100%" alt="Go2 rising onto its hind legs and balancing in the Nuka lab"></a>
   <br><b>Go2 Handstand</b>
   <br>TorchScript policy inference
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/nuka_go2_front_handstand.mp4">1080p video</a>
@@ -64,16 +64,16 @@
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4"><img src="docs/media/elastoplastic_bunny.gif" width="100%" alt="A freely falling Stanford bunny indenting an MLS-MPM elastoplastic block"></a>
   <br><b>Bunny × Elastoplastic</b>
-  <br>Free fall · Plastic indentation
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4">Full video</a> · <a href="examples/demo/README.md#bunny-elastoplastic-impact">Run demo</a>
+  <br>Free fall · Plastic indentation · Real time
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4">1080p video</a> · <a href="examples/demo/README.md#bunny-elastoplastic-impact">Run demo</a>
 </td>
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="Rigid Stanford bunny dropped into an MLS-MPM water pool"></a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="A freely falling Stanford bunny splashing into MLS-MPM water in a glass tank"></a>
   <br><b>Bunny × Water</b>
-  <br>Two-way MLS-MPM coupling
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">Full video</a>
+  <br>Two-way MLS-MPM coupling · 2× slow motion
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">1080p video</a> · <a href="examples/demo/README.md#bunny-water-drop">Run demo</a>
 </td>
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4"><img src="docs/media/jelly_ball_drop.gif" width="100%" alt="MLS-MPM elastic jelly ball dropping and rebounding"></a>

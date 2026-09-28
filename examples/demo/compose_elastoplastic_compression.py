@@ -153,8 +153,10 @@ def encode_video(composer, args, stem, keyframes):
                "-vf", "hqdn3d=1.2:1.2:2.0:2.0", "-c:v", "libx264", "-crf", "18", "-preset", "medium",
                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(args.out_dir / (stem + ".mp4"))]
     process = subprocess.Popen(command, stdin=subprocess.PIPE)
+    stride = getattr(args, "frame_stride", 1)
+    indices = range(0, len(composer.data["time_s"]), stride)
     try:
-        for index in range(len(composer.data["time_s"])):
+        for index in indices:
             frame = composer.frame(index)
             process.stdin.write(frame.tobytes())
             if index in keyframes:
@@ -171,7 +173,7 @@ def encode_video(composer, args, stem, keyframes):
         "stream=codec_name,width,height,pix_fmt,r_frame_rate,nb_read_frames:format=duration",
         "-of", "json", str(args.out_dir / (stem + ".mp4"))], text=True))
     stream = probe["streams"][0]
-    frame_count = len(composer.data["time_s"])
+    frame_count = len(indices)
     if (int(stream["nb_read_frames"]) != frame_count or stream["width"] != width or
             stream["height"] != height or stream["r_frame_rate"] != f"{args.fps}/1" or
             abs(float(probe["format"]["duration"]) - frame_count / args.fps) > 0.001):
@@ -179,7 +181,7 @@ def encode_video(composer, args, stem, keyframes):
     metadata = {
         "capture": str(args.capture), "frames": str(args.frames), "frame_count": frame_count,
         "frame_rate": args.fps, "simulation_sample_hz": composer.config["sample_hz"],
-        "slow_motion_factor": composer.config["sample_hz"] / args.fps,
+        "slow_motion_factor": composer.config["sample_hz"] / (args.fps * stride),
         "overlay": "boundary force history, without labels", "state_interpolation": False,
         "encoding_command": command,
         "verification": probe,

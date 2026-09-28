@@ -116,7 +116,13 @@ constexpr uint32_t kControlChanged = 8u;
 constexpr uint32_t kControlOverflow = 12u;
 constexpr uint32_t kControlArticRows = 14u;
 constexpr uint32_t kControlScheduleChanged = 15u;
-constexpr uint32_t kControlWords = 16u;
+constexpr uint32_t kControlHubRows = 16u;
+constexpr uint32_t kControlWords = 17u;
+// A dynamic body in more active rows than this is a hub: it owns none of them, stays frozen
+// within a sweep, and a Schur step couples its rows as it couples an articulation's.
+constexpr uint32_t kHubRows = 64u;
+constexpr uint32_t kHubTriangle = 21u;
+constexpr uint32_t kHubItem = kHubTriangle + 6u;
 // Rows read articulation velocity frozen over a sweep; a Schur step per articulation then
 // couples them. Its entry sums split into at most this many fixed-order groups.
 constexpr uint32_t kSchurGroups = 128u;
@@ -738,6 +744,15 @@ struct ColorScratch {
     float* artic_step = nullptr;       // per articulation DOF: the Schur step
     float* artic_partial = nullptr;    // per group item: upper triangle of S, then J^T dlambda
     float* artic_summed = nullptr;     // per articulation: the group items summed
+    uint32_t* hub_count = nullptr;     // per body: active rows naming it
+    float* owner_inv_mass = nullptr;   // per body: inverse mass, zero for a hub
+    uint32_t* hub_rows = nullptr;      // live rows with a hub side, in live order
+    uint32_t* hub_excl = nullptr;      // per live position, then the total
+    uint32_t* hub_entries = nullptr;   // (slot << 2) | sides, grouped per hub
+    uint32_t* hub_range = nullptr;     // per body: first and end entry
+    float* hub_start = nullptr;        // per slot axis: impulse the hub already holds
+    float* hub_system = nullptr;       // per body: upper triangle of S, then J^T dlambda
+    float* hub_step = nullptr;         // per body: the Schur step
     uint32_t bodies = 0u;
     uint32_t particles = 0u;
     uint32_t grid = 0u;
@@ -806,6 +821,15 @@ uint64_t BindColorScratch(const SolveRowsBlockIslandParams& p, uint32_t* base, C
     s.artic_partial = take_float(items * (TriangleSize(p.max_dof) + p.max_dof));
     s.artic_summed =
         take_float(uint64_t{p.articulation_count} * (TriangleSize(p.max_dof) + p.max_dof));
+    s.hub_count = take(p.total_body_count);
+    s.owner_inv_mass = take_float(p.total_body_count);
+    s.hub_rows = take(rows);
+    s.hub_excl = take(rows + 1u);
+    s.hub_entries = take(2u * rows);
+    s.hub_range = take(2u * uint64_t{p.total_body_count});
+    s.hub_start = take_float(3u * rows);
+    s.hub_system = take_float(uint64_t{kHubItem} * p.total_body_count);
+    s.hub_step = take_float(6u * uint64_t{p.total_body_count});
     s.bodies = p.total_body_count;
     s.particles = p.total_particle_count;
     s.grid = p.total_grid_count;
@@ -852,6 +876,17 @@ __device__ bool HasArticulationSide(const NkRow& row) {
 __device__ inline bool IsSchurRow(const NkRow& row) {
     return (row.flags & nk::nk_row_flags::kActive) &&
            !(row.flags & nk::nk_row_flags::kBlockTangent) && HasArticulationSide(row);
+}
+
+__device__ inline bool IsHubSide(const NkRowSide& side, const ColorScratch& s) {
+    return side.kind == kNkSideRigid && side.index < s.bodies && s.hub_count[side.index] > kHubRows;
+}
+
+// Rows a hub's Schur step couples; a block normal carries its tangents' impulses.
+__device__ inline bool IsHubRow(const NkRow& row, const ColorScratch& s) {
+    return (row.flags & nk::nk_row_flags::kActive) &&
+           !(row.flags & nk::nk_row_flags::kBlockTangent) &&
+           (IsHubSide(row.a, s) || IsHubSide(row.b, s));
 }
 
 // Rows a position sweep projects; the others return at once, so a color without any is skipped.
@@ -3198,6 +3233,7 @@ struct LivePrepareArgs {
     uint32_t rows_per_env = 0u;
     uint32_t artics_per_env = 0u;
     uint32_t dof_stride = 0u;
+    uint32_t bodies_per_env = 0u;
     uint32_t owner_cache_slots = 0u;  // per warp, in the launch's dynamic shared memory
     float dt = 0.0f;
     float pos_slop = 0.0f;
@@ -3292,6 +3328,28 @@ __device__ __noinline__ void MarkLiveRows(const NkRow* urows, PointMassView poin
     }
     if (lane == 0u && valid_end != 0u)
         atomicMax(s.control + kControlValidRows, valid_end);
+}
+
+__global__ void CountHubRowsKernel(const NkRow* __restrict__ urows, uint32_t total_rows,
+                                   const float* __restrict__ body_inv_mass, ColorScratch s) {
+    for (uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x; slot < total_rows;
+         slot += gridDim.x * blockDim.x) {
+        const uint32_t flags = urows[slot].flags;
+        if (!(flags & nk::nk_row_flags::kActive) || (flags & nk::nk_row_flags::kBlockTangent))
+            continue;
+        for (uint32_t index = 0u; index < 2u; ++index) {
+            const NkRowSide& side = index == 0u ? urows[slot].a : urows[slot].b;
+            if (side.kind == kNkSideRigid && side.index < s.bodies && body_inv_mass[side.index] > 0.0f)
+                atomicAdd(s.hub_count + side.index, 1u);
+        }
+    }
+}
+
+// Coloring and the sweeps read this inverse mass, so no row writes a hub or takes it as owner.
+__global__ void MaskHubOwnersKernel(const float* __restrict__ body_inv_mass, ColorScratch s) {
+    for (uint32_t body = blockIdx.x * blockDim.x + threadIdx.x; body < s.bodies;
+         body += gridDim.x * blockDim.x)
+        s.owner_inv_mass[body] = s.hub_count[body] > kHubRows ? 0.0f : body_inv_mass[body];
 }
 
 // Pending rows pick a color free at all their owners; among rows picking one color at a shared
@@ -3762,6 +3820,78 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
         s.control[kControlArticRows] = artic_base;
     }
     grid.sync();
+
+    // Rows with a hub side keep live order too; each hub then lists its entries inside its
+    // island's span, so every sum over them runs in a fixed order.
+    if (threadIdx.x == 0u) block_chain = 0u;
+    __syncthreads();
+    uint32_t hub_rows = 0u;
+    for (uint32_t position = begin + threadIdx.x; position < end; position += blockDim.x)
+        hub_rows += IsHubRow(urows[live_order[position]], s) ? 1u : 0u;
+    hub_rows = __reduce_add_sync(0xffffffffu, hub_rows);
+    if (lane == 0u && hub_rows != 0u) atomicAdd(&block_chain, hub_rows);
+    __syncthreads();
+    if (threadIdx.x == 0u) s.block_count[blockIdx.x] = block_chain;
+    for (uint32_t i = thread; i < 2u * s.bodies; i += threads) s.hub_range[i] = 0u;
+    grid.sync();
+    earlier = 0u;
+    for (uint32_t b = threadIdx.x; b < blockIdx.x; b += blockDim.x) earlier += s.block_count[b];
+    uint32_t hub_base = 0u;
+    BlockScanT(scan_temp).ExclusiveSum(earlier, ignored, hub_base);
+    __syncthreads();
+    for (uint32_t tile = begin; tile < end; tile += blockDim.x) {
+        const uint32_t position = tile + threadIdx.x;
+        const uint32_t flag = position < end && IsHubRow(urows[live_order[position]], s) ? 1u : 0u;
+        uint32_t offset = 0u, tile_total = 0u;
+        BlockScanT(scan_temp).ExclusiveSum(flag, offset, tile_total);
+        if (position < end) s.hub_excl[position] = hub_base + offset;
+        if (flag != 0u) s.hub_rows[hub_base + offset] = live_order[position];
+        hub_base += tile_total;
+        __syncthreads();
+    }
+    if (blockIdx.x == gridDim.x - 1u && threadIdx.x == 0u) {
+        s.hub_excl[live] = hub_base;
+        s.control[kControlHubRows] = hub_base;
+    }
+    grid.sync();
+    // A row names at most two hubs, so an island's entries fit twice its row span.
+    if (LoadControl(s.control + kControlHubRows) != 0u && prep.bodies_per_env != 0u) {
+        for (uint32_t i = thread / warpSize; i < island_count; i += threads / warpSize) {
+            const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[i];
+            if (!(rec.flags & kIslandWarpWork) || rec.seg_cnt == 0u || !activity.Active(rec))
+                continue;
+            const uint32_t live_off = rec.seg_off == 0u ? 0u : live_scan[rec.seg_off - 1u];
+            const uint32_t first = s.hub_excl[live_off];
+            const uint32_t last = s.hub_excl[live_scan[rec.seg_off + rec.seg_cnt - 1u]];
+            if (first == last) continue;
+            uint32_t cursor = 2u * first;
+            for (uint32_t local = 0u; local < prep.bodies_per_env; ++local) {
+                const uint32_t body = rec.env * prep.bodies_per_env + local;
+                if (body >= s.bodies || s.hub_count[body] <= kHubRows) continue;
+                const uint32_t entry_begin = cursor;
+                for (uint32_t base = first; base < last; base += warpSize) {
+                    const uint32_t k = base + lane;
+                    uint32_t sides = 0u;
+                    uint32_t slot = 0u;
+                    if (k < last) {
+                        slot = s.hub_rows[k];
+                        const NkRowSide side_a = urows[slot].a;
+                        const NkRowSide side_b = urows[slot].b;
+                        sides = (side_a.kind == kNkSideRigid && side_a.index == body ? 1u : 0u) |
+                                (side_b.kind == kNkSideRigid && side_b.index == body ? 2u : 0u);
+                    }
+                    const uint32_t mask = __ballot_sync(0xffffffffu, sides != 0u);
+                    if (sides != 0u)
+                        s.hub_entries[cursor + __popc(mask & ((1u << lane) - 1u))] = (slot << 2u) | sides;
+                    cursor += __popc(mask);
+                }
+                if (lane == 0u && cursor != entry_begin) {
+                    s.hub_range[2u * body] = entry_begin;
+                    s.hub_range[2u * body + 1u] = cursor;
+                }
+            }
+        }
+    }
     if (prep.cc_root == nullptr || prep.cc_artic_first == nullptr || prep.artics_per_env == 0u)
         return;
     // A row names at most two articulations, so an island's entries fit twice its row span.
@@ -3821,7 +3951,8 @@ struct ColoredSolveArgs {
     float* qdot = nullptr;
     math::Vec3* body_linear = nullptr;
     math::Vec3* body_angular = nullptr;
-    const float* body_inv_mass = nullptr;
+    const float* body_inv_mass = nullptr;   // zero for a hub, which no sweep writes
+    const float* rigid_inv_mass = nullptr;  // every dynamic body's own
     const math::SymmetricMat3* body_inv_inertia = nullptr;
     PointMassView points;
     const uint32_t* islands = nullptr;
@@ -3967,6 +4098,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
     __shared__ float cache_jacobian[9u * kColorBlockSize];
     __shared__ uint32_t cache_shape[kBatchRows], batch_slot[kBatchRows];
     __shared__ float cache_scalar[kChainRowScalars * kBatchRows];
+    __shared__ float hub_partial[kBatchRows * kHubItem];
     const ChainPointCache cache{cache_key, cache_velocity, cache_error, cache_inverse_mass,
                                 cache_lane, cache_jacobian, cache_shape, cache_scalar};
     const uint32_t lane = threadIdx.x;
@@ -3992,7 +4124,8 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         return velocity != nullptr ? velocity + size_t{env * k_tiles} * dofs : nullptr;
     };
     const auto pending = [&](const NkRow& row, uint32_t slot) {
-        return HasArticulationSide(row) ? s.artic_pending + size_t{slot} * 3u : nullptr;
+        return HasArticulationSide(row) || IsHubSide(row.a, s) || IsHubSide(row.b, s)
+            ? s.artic_pending + size_t{slot} * 3u : nullptr;
     };
 
     // A color lists its lane rows first; each takes one thread, every other row a warp.
@@ -4352,6 +4485,206 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         schur_commit(pseudo);
     };
 
+    // A hub couples its rows through its six velocity DOFs as an articulation does through its
+    // own: S = sum J^T g J and P = J^T (lambda - start), then (M + S) du = P.
+    const uint32_t hub_rows = s.control[kControlHubRows];
+    const bool hubs = hub_rows != 0u && a.rigid_inv_mass != nullptr;
+    const auto hub_empty = [&](uint32_t body) {
+        return s.hub_range[2u * body] == s.hub_range[2u * body + 1u];
+    };
+    // Axis rows carry their own side terms; sides bit 0 is side a, bit 1 side b.
+    const auto hub_jacobian = [&](uint32_t j_row, uint32_t sides, float* j) {
+        const NkRow& row = a.urows[j_row];
+        math::Vec3 linear{}, angular{};
+        if (sides & 1u) { linear += row.a.jlin; angular += row.a.jang; }
+        if (sides & 2u) { linear += row.b.jlin; angular += row.b.jang; }
+        j[0] = linear.x; j[1] = linear.y; j[2] = linear.z;
+        j[3] = angular.x; j[4] = angular.y; j[5] = angular.z;
+    };
+
+    auto hub_snapshot = [&](bool pseudo, bool zero) {
+        const float* lambda = pseudo ? a.row_pseudo_lambda : a.lambda;
+        for (uint32_t i = blockIdx.x * blockDim.x + lane; i < hub_rows;
+             i += gridDim.x * blockDim.x) {
+            const uint32_t slot = s.hub_rows[i];
+            uint32_t j_rows[3];
+            const uint32_t axes = SchurAxes(a.urows[slot], slot, pseudo, j_rows);
+            for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                s.hub_start[size_t{slot} * 3u + axis] =
+                    axis < axes && !zero ? lambda[j_rows[axis]] : 0.0f;
+                s.artic_pending[size_t{slot} * 3u + axis] = 0.0f;
+            }
+        }
+        grid.sync();
+    };
+
+    // One block per hub: threads stride its entries, then warps and the block sum in fixed order.
+    auto hub_gather = [&](bool pseudo, bool matrix) {
+        for (uint32_t body = blockIdx.x; body < s.bodies; body += gridDim.x) {
+            if (hub_empty(body)) continue;
+            float sum[kHubItem]{};
+            for (uint32_t e = s.hub_range[2u * body] + lane; e < s.hub_range[2u * body + 1u];
+                 e += blockDim.x) {
+                const uint32_t entry = s.hub_entries[e];
+                const uint32_t slot = entry >> 2u;
+                const SchurRowTerms t = LoadSchurRowTerms(a, slot, pseudo);
+                for (uint32_t axis = 0u; axis < t.axes; ++axis) {
+                    float j[6];
+                    hub_jacobian(t.j_rows[axis], entry & 3u, j);
+                    const float delta = t.lambda[axis] - s.hub_start[size_t{slot} * 3u + axis];
+                    #pragma unroll
+                    for (uint32_t k = 0u; k < 6u; ++k) sum[kHubTriangle + k] += j[k] * delta;
+                    const float gain = matrix ? t.gain[axis] : 0.0f;
+                    if (gain == 0.0f) continue;
+                    uint32_t at = 0u;
+                    #pragma unroll
+                    for (uint32_t r = 0u; r < 6u; ++r)
+                        #pragma unroll
+                        for (uint32_t c = r; c < 6u; ++c) sum[at++] += gain * j[r] * j[c];
+                }
+            }
+            #pragma unroll
+            for (uint32_t k = 0u; k < kHubItem; ++k) {
+                const float value = WarpSum(sum[k]);
+                if (wlane == 0u) hub_partial[warp * kHubItem + k] = value;
+            }
+            __syncthreads();
+            if (lane < kHubItem) {
+                float total = 0.0f;
+                for (uint32_t w = 0u; w < nwarps; ++w) total += hub_partial[w * kHubItem + lane];
+                s.hub_system[size_t{body} * kHubItem + lane] = total;
+            }
+            __syncthreads();
+        }
+    };
+
+    // (I + M^-1 S) du = M^-1 P by pivoted elimination; M^-1 needs no inverted inertia.
+    auto hub_solve = [&]() {
+        for (uint32_t body = blockIdx.x * blockDim.x + lane; body < s.bodies;
+             body += gridDim.x * blockDim.x) {
+            if (hub_empty(body)) continue;
+            const float* system = s.hub_system + size_t{body} * kHubItem;
+            const float im = a.rigid_inv_mass[body];
+            const math::SymmetricMat3 inertia = a.body_inv_inertia[body];
+            const auto inverse_mass = [&](const float* x, float* out) {
+                const math::Vec3 w = inertia.Multiply({x[3], x[4], x[5]});
+                out[0] = im * x[0]; out[1] = im * x[1]; out[2] = im * x[2];
+                out[3] = w.x; out[4] = w.y; out[5] = w.z;
+            };
+            float m[6][7];
+            for (uint32_t c = 0u; c < 6u; ++c) {
+                float column[6];
+                for (uint32_t r = 0u; r < 6u; ++r) {
+                    const uint32_t lo = r < c ? r : c, hi = r < c ? c : r;
+                    column[r] = system[lo * 6u - lo * (lo - 1u) / 2u + (hi - lo)];
+                }
+                float scaled[6];
+                inverse_mass(column, scaled);
+                for (uint32_t r = 0u; r < 6u; ++r) m[r][c] = scaled[r] + (r == c ? 1.0f : 0.0f);
+            }
+            float rhs[6];
+            inverse_mass(system + kHubTriangle, rhs);
+            for (uint32_t r = 0u; r < 6u; ++r) m[r][6] = rhs[r];
+            for (uint32_t c = 0u; c < 6u; ++c) {
+                uint32_t pivot = c;
+                for (uint32_t r = c + 1u; r < 6u; ++r)
+                    if (fabsf(m[r][c]) > fabsf(m[pivot][c])) pivot = r;
+                if (pivot != c)
+                    for (uint32_t k = c; k < 7u; ++k) {
+                        const float swap = m[c][k];
+                        m[c][k] = m[pivot][k];
+                        m[pivot][k] = swap;
+                    }
+                const float inverse = 1.0f / m[c][c];
+                for (uint32_t r = c + 1u; r < 6u; ++r) {
+                    const float factor = m[r][c] * inverse;
+                    for (uint32_t k = c; k < 7u; ++k) m[r][k] -= factor * m[c][k];
+                }
+            }
+            for (uint32_t cc = 6u; cc > 0u; --cc) {
+                const uint32_t c = cc - 1u;
+                float value = m[c][6];
+                for (uint32_t k = c + 1u; k < 6u; ++k) value -= m[c][k] * m[k][6];
+                m[c][6] = value / m[c][c];
+            }
+            for (uint32_t k = 0u; k < 6u; ++k) s.hub_step[size_t{body} * 6u + k] = m[k][6];
+        }
+    };
+
+    // Each coupled row re-projects against the velocity du gives it; the change reaches its
+    // other sides at the row's next visit.
+    auto hub_correct = [&](bool pseudo) {
+        float* const lambda = pseudo ? a.row_pseudo_lambda : a.lambda;
+        for (uint32_t i = blockIdx.x * blockDim.x + lane; i < hub_rows;
+             i += gridDim.x * blockDim.x) {
+            const uint32_t slot = s.hub_rows[i];
+            const SchurRowTerms t = LoadSchurRowTerms(a, slot, pseudo);
+            if (t.gain[0] == 0.0f && t.gain[1] == 0.0f && t.gain[2] == 0.0f) continue;
+            const NkRow& row = a.urows[slot];
+            float w[3]{};
+            for (uint32_t side = 0u; side < 2u; ++side) {
+                const NkRowSide& endpoint = side == 0u ? row.a : row.b;
+                if (!IsHubSide(endpoint, s) || hub_empty(endpoint.index)) continue;
+                const float* step = s.hub_step + size_t{endpoint.index} * 6u;
+                for (uint32_t axis = 0u; axis < t.axes; ++axis) {
+                    if (t.gain[axis] == 0.0f) continue;
+                    float j[6];
+                    hub_jacobian(t.j_rows[axis], 1u << side, j);
+                    for (uint32_t k = 0u; k < 6u; ++k) w[axis] += j[k] * step[k];
+                }
+            }
+            float out[3];
+            ProjectSchurRow(row, t, w, pseudo, out);
+            for (uint32_t axis = 0u; axis < t.axes; ++axis) {
+                const float delta = out[axis] - t.lambda[axis];
+                if (delta == 0.0f) continue;
+                lambda[t.j_rows[axis]] = out[axis];
+                s.artic_pending[size_t{slot} * 3u + axis] += delta;
+            }
+        }
+    };
+
+    // v += M^-1 J^T (lambda - start); the hub then holds every row impulse.
+    auto hub_commit = [&](bool pseudo) {
+        hub_gather(pseudo, false);
+        grid.sync();
+        math::Vec3* const linear = pseudo ? a.body_pseudo_linear : a.body_linear;
+        math::Vec3* const angular = pseudo ? a.body_pseudo_angular : a.body_angular;
+        for (uint32_t body = blockIdx.x * blockDim.x + lane; body < s.bodies;
+             body += gridDim.x * blockDim.x) {
+            if (hub_empty(body)) continue;
+            const float* moment = s.hub_system + size_t{body} * kHubItem + kHubTriangle;
+            const float im = a.rigid_inv_mass[body];
+            AddVelocity(linear[body], pseudo ? nullptr : a.error.Linear(body),
+                        math::Vec3{moment[0], moment[1], moment[2]} * im);
+            AddVelocity(angular[body], pseudo ? nullptr : a.error.Angular(body),
+                        a.body_inv_inertia[body].Multiply({moment[3], moment[4], moment[5]}));
+        }
+        const float* lambda = pseudo ? a.row_pseudo_lambda : a.lambda;
+        for (uint32_t i = blockIdx.x * blockDim.x + lane; i < hub_rows;
+             i += gridDim.x * blockDim.x) {
+            const uint32_t slot = s.hub_rows[i];
+            uint32_t j_rows[3];
+            const uint32_t axes = SchurAxes(a.urows[slot], slot, pseudo, j_rows);
+            for (uint32_t axis = 0u; axis < axes; ++axis)
+                s.hub_start[size_t{slot} * 3u + axis] = lambda[j_rows[axis]];
+        }
+        grid.sync();
+    };
+
+    auto hub_step = [&](bool pseudo, bool correct) {
+        if (!hubs) return;
+        if (correct) {
+            hub_gather(pseudo, true);
+            grid.sync();
+            hub_solve();
+            grid.sync();
+            hub_correct(pseudo);
+            grid.sync();
+        }
+        hub_commit(pseudo);
+    };
+
     // After its row is staged, a warp stages the block's tangent rows and, when the sweep
     // measures velocities, every articulation arm's J.
     auto stage_chain_terms = [&](uint32_t slot, bool jacobian) {
@@ -4532,6 +4865,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
     };
 
     if (schur) schur_snapshot(false, a.apply_cached);
+    if (hubs) hub_snapshot(false, a.apply_cached);
     if (a.apply_cached) {
         color_sweep([&](uint32_t slot, uint32_t env, NkRow* staged) {
             SolveUnionRowWarp(slot - env * a.rows_per_env, slot, env * a.rows_per_env,
@@ -4549,6 +4883,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         chain_sweep(ChainSweep::WarmStart);
         grid.sync();
         schur_step(false, false);
+        hub_step(false, false);
     }
     for (uint32_t it = 0u; it < a.vel_iters; ++it) {
         if (blockIdx.x == 0u && threadIdx.x == 0u)
@@ -4587,6 +4922,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         grid.sync();
         const bool more = LoadControl(flag) != 0u;
         schur_step(false, more && it + 1u < a.vel_iters);
+        hub_step(false, more && it + 1u < a.vel_iters);
         if (!more) break;
     }
 
@@ -4611,6 +4947,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         }
         grid.sync();
         if (schur) schur_snapshot(true, false);
+        if (hubs) hub_snapshot(true, false);
         for (uint32_t it = 0u; it < a.pos_iters; ++it) {
             color_sweep([&](uint32_t slot, uint32_t env, const NkRow* staged) {
                 SolvePositionRowWarp(slot, env * a.rows_per_env, env * k_tiles, slot, wlane,
@@ -4628,6 +4965,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
             chain_sweep(ChainSweep::Position);
             grid.sync();
             schur_step(true, it + 1u < a.pos_iters);
+            hub_step(true, it + 1u < a.pos_iters);
         }
     }
 
@@ -4704,7 +5042,8 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
     args.qdot = data.qdot;
     args.body_linear = data.body_linear_velocity;
     args.body_angular = data.body_angular_velocity;
-    args.body_inv_mass = static_cast<const float*>(data.body_inv_mass);
+    args.body_inv_mass = scratch.owner_inv_mass;
+    args.rigid_inv_mass = static_cast<const float*>(data.body_inv_mass);
     args.body_inv_inertia = static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia);
     args.points = points;
     args.islands = data.island_quads;
@@ -5010,6 +5349,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             prep.rows_per_env = p->rows_per_env;
             prep.artics_per_env = artics_per_env;
             prep.dof_stride = p->max_dof;
+            prep.bodies_per_env = p->env_count != 0u ? p->total_body_count / p->env_count : 0u;
             prep.dt = p->dt;
             prep.pos_slop = p->pos_slop;
             prep.reuse_schedule = p->continue_impulses != 0u;
@@ -5027,13 +5367,28 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             if (ResidentGridSize(PrepareLiveColorsKernel, kColorBlockSize, owner_cache_bytes,
                                  kColorGridLimit, &prepare_blocks) != cudaSuccess)
                 return Status::Failed;
+            if (scratch.bodies != 0u) {
+                if (cudaMemsetAsync(scratch.hub_count, 0, sizeof(uint32_t) * scratch.bodies,
+                                    stream) != cudaSuccess)
+                    return Status::Failed;
+                const auto blocks = [](uint64_t items) {
+                    return static_cast<uint32_t>(std::min<uint64_t>((items + 255u) / 256u, 1024u));
+                };
+                if (total_rows != 0u)
+                    LaunchCuda(CountHubRowsKernel, dim3(blocks(total_rows)), dim3(256u), 0u, stream,
+                               reinterpret_cast<const NkRow*>(data.urows), total_rows,
+                               static_cast<const float*>(data.body_inv_mass), scratch);
+                LaunchCuda(MaskHubOwnersKernel, dim3(blocks(scratch.bodies)), dim3(256u), 0u,
+                           stream, static_cast<const float*>(data.body_inv_mass), scratch);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            }
             if (LaunchCooperativeCuda(PrepareLiveColorsKernel, dim3(prepare_blocks),
                     dim3(kColorBlockSize), owner_cache_bytes, stream,
                     reinterpret_cast<const NkRow*>(data.urows),
                     PointMassView{data.particle_inv_mass, data.particle_vel,
                         data.grid_inv_mass, data.grid_velocity,
                         data.point_endpoint_ranges, data.point_endpoint_terms},
-                    static_cast<const float*>(data.body_inv_mass),
+                    static_cast<const float*>(scratch.owner_inv_mass),
                     static_cast<const uint32_t*>(data.island_quads),
                     static_cast<const uint32_t*>(data.island_count), activity,
                     live_scan, live_order, scratch, prep) != cudaSuccess)

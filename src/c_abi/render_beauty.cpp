@@ -23,6 +23,7 @@
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_ir.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <exception>
@@ -106,6 +107,16 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
                                             s.particle_first, s.particle_count,
                                             s.grain_round != 0u, s.grain_radius_jitter,
                                             s.grain_tint_jitter);
+    }
+    // A scene that authors its own static set stands on it rather than on the studio floor.
+    nuka::render::StudioScene& studio = *bridge->scene;
+    if (studio.floor_instance + 1u == studio.world.instances.size() &&
+        std::any_of(studio.world.instances.begin(), studio.world.instances.end() - 1,
+                    [](const nuka::render::RenderInstance& instance) {
+                        return instance.pose_source.kind == nuka::render::PoseSource::Kind::Static;
+                    })) {
+        studio.world.instances.pop_back();
+        studio.floor_instance = ~std::size_t(0);
     }
     if (bridge->scene->world.instances.empty()) {
         return NUKA_RESULT_NOT_SUPPORTED;  // no renderable visual geometry.

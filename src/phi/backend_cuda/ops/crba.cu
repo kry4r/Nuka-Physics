@@ -451,7 +451,7 @@ Status OpCrbaComputeM(const ModelView& model, const DataView& data,
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, p->total_link_count, p->articulation_count);
     const float* joint_damping =
-        (p->fold_drive_damping != 0u) ? data.drive_damping : nullptr;
+        (p->fold_drive_damping != 0u) ? data.drive_dissipation : nullptr;
     LaunchCuda(ComputeArticulationInertiaMKernel, dim3(p->articulation_count),
                dim3(32u), 0u, stream, state, p->max_dof,
                reinterpret_cast<LinkSpatialInertia*>(data.link_composite_inertia),
@@ -502,12 +502,12 @@ Status OpApplyImplicitDamping(const ModelView& model, const DataView& data,
     // articulation tables (the damping kernel walks via the articulation offset
     // tables and never reads total_link_count, so 0 keeps the state honest about
     // that), inertia_M_inv == the freshly factored (M+dt*C)^-1 == data.m_inv, and
-    // joint_damping == the per-DOF c_j == data.drive_damping (indexed by global
-    // link). data.drive_damping may be null -> the kernel leaves qdot unchanged.
+    // joint_damping == the per-DOF c_j == data.drive_dissipation (indexed by global
+    // link). data.drive_dissipation may be null -> the kernel leaves qdot unchanged.
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, /*total_link_count=*/0u, p->articulation_count);
     LaunchCuda(ApplyImplicitJointDampingKernel, dim3(p->articulation_count),
-               dim3(32u), 0u, stream, state, data.m_inv, data.drive_damping,
+               dim3(32u), 0u, stream, state, data.m_inv, data.drive_dissipation,
                p->max_dof, p->dt);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

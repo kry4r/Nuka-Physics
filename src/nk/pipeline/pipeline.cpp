@@ -664,11 +664,20 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_crba_m_.max_dof = max_dof;
         p_crba_m_.articulation_count = articulation_cnt;
         p_crba_m_.total_link_count = total_link_count;
-        p_crba_m_.fold_drive_damping = 0u;
+        // Implicit actuators fold their impedance into the step's mass, so contacts, the
+        // position pass and the backward-Euler velocity all see the driven joints.
+        p_crba_m_.fold_drive_damping = p_apply_drives_.defer_velocity_damping;
         add(phi::NkOp::CrbaComputeM, &p_crba_m_);
         p_crba_factor_.max_dof = max_dof;
         p_crba_factor_.articulation_count = articulation_cnt;
         add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
+        if (p_crba_m_.fold_drive_damping != 0u) {
+            p_apply_damping_.dt = cfg.dt;
+            p_apply_damping_.max_dof = max_dof;
+            p_apply_damping_.articulation_count = articulation_cnt;
+            p_apply_damping_.total_link_count = total_link_count;
+            add(phi::NkOp::ApplyImplicitDamping, &p_apply_damping_);
+        }
     }
 
     if (has_contacts) {

@@ -7,10 +7,11 @@ The material examples load [Nuka Dynamics Lab](../../docs/nuka-stage.md), a shar
 | Demo | Entry point | Recording |
 |---|---|---|
 | π0.5 inference | [libero_pi05_play.py](libero_pi05_play.py) | [12 s, 1280 × 720](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/pi05_libero.mp4) |
-| G1 Shuffle dance | [g1_dance_play.py](g1_dance_play.py) | [20 s, 960 × 540](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4) |
+| G1 Shuffle dance | [g1_dance_play.py](g1_dance_play.py) | [20 s, 1920 × 1080](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4) |
 | G1 clothed water course | [g1_wading_demo.py](g1_wading_demo.py) | [Setup and training](../assets/g1_wading/README.md); traversal under validation |
 | Elastoplastic compression | [elastoplastic_compression_demo.cpp](elastoplastic_compression_demo.cpp) | [24.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4) |
-| Bunny elastoplastic impact | [elastoplastic_bunny_demo.cpp](elastoplastic_bunny_demo.cpp) | [18.04 s, 1600 × 1000](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4) |
+| Bunny elastoplastic impact | [elastoplastic_bunny_demo.cpp](elastoplastic_bunny_demo.cpp) | [3.63 s, 1920 × 1080](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4) |
+| Bunny water drop | [bunny_water_demo.cpp](bunny_water_demo.cpp) | [3.07 s at 2× slow motion, 1920 × 1080](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4) |
 | Dynamic elastoplastic gripper | [robot_elastoplastic_demo.cpp](robot_elastoplastic_demo.cpp) | [Full view](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4) · [Contact close-up](https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic_close.mp4) |
 
 Run commands from the repository root after the [CUDA build and Python installation](../../README.md#quick-start). Use Python 3.11, a CUDA-compatible PyTorch installation, Pillow, NumPy, and `ffmpeg` on `PATH`. Model weights and source assets stay in the ignored `.nuka-assets/` and `.nuka_cache/` directories; recordings and metrics go to `out/`.
@@ -88,11 +89,11 @@ hf download exptech/g1-moves --repo-type dataset \
   --local-dir .nuka-assets/src/g1-moves
 python tools/assets/convert_embodied_assets.py --asset g1
 python examples/demo/g1_dance_play.py \
-  --seconds 20 --video --fps 25 --width 960 --height 540 \
-  --out out/g1_shuffle
+  --seconds 20 --video --fps 30 --width 1920 --height 1080 --spp 32 \
+  --environment examples/assets/nuka_lab/stage.nks --out out/g1_lab
 ```
 
-The entry point creates the NKS/NKA scene bundle and writes `g1_dance.mp4`, `summary.json`, and `metrics.jsonl`. The showcased 20-second run passed the finite-state, upright, and visible-motion checks: minimum root height was 0.688 m, mean joint motion span was 1.145 rad, and mean joint tracking RMSE was 0.213 rad.
+The entry point creates the NKS/NKA scene bundle and writes `g1_dance.mp4`, `summary.json`, and `metrics.jsonl`. With `--environment`, the lab deck replaces the studio set and is the floor collider. The showcased 20-second run passed the finite-state, upright, and visible-motion checks: minimum root height was 0.645 m, mean joint motion span was 1.131 rad, and mean joint tracking RMSE was 0.211 rad.
 
 ## Elastoplastic compression
 
@@ -135,14 +136,32 @@ build-cuda128/tests/nuka_elastoplastic_bunny_demo \
 build-cuda128/tests/nuka_elastoplastic_bunny_demo \
   --replay out/elastoplastic/bunny \
   --out-dir out/elastoplastic/bunny_render \
-  --width 1600 --height 1000 --samples 128 --render-stride 1
+  --width 1920 --height 1080 --samples 128 --render-stride 4
 python examples/demo/compose_elastoplastic_bunny.py \
   --capture out/elastoplastic/bunny \
   --frames out/elastoplastic/bunny_render/frames \
-  --out-dir out/elastoplastic/bunny_video
+  --out-dir out/elastoplastic/bunny_video --fps 30 --frame-stride 4
 ```
 
-The bunny remains on the pad, whose center settles 20.82 mm below its initial surface. This is deformation under load. Particle-center penetration reaches 2.393 mm with a 5 mm contact envelope. This recording uses the earlier grid projection and reaction scheme. The dynamic gripper below uses shared finite-mass grid contacts.
+The recording renders every fourth 120 Hz state at 30 fps, so it plays in **real time** without state interpolation. The pad carries 80 Pa·s of Kelvin–Voigt viscosity on top of the Hencky J2 stress, so the bunny's rocking on the soft pad dies out within about 2.5 s instead of ringing through the lossless elastic range. The impact peaks at 270 N and settles to the bunny's 24.5 N weight. The bunny indents the pad by 26.2 mm and stays on it; the pad center settles 13.9 mm below its initial surface. This is deformation under load. Particle-center penetration peaks at 0.72 mm with a 5 mm contact envelope; the final bunny speed is 1.9 mm/s. Linear and angular momentum balance, non-increasing energy and the reset check all pass. The bunny, the material and the support share the common contact solve.
+
+## Bunny water drop
+
+A freely falling 0.41 kg Stanford bunny (density 1200 kg/m³, same closed mesh as above) drops 150 mm into a 360 × 280 mm glass tank holding 180 mm of water. The water is weakly compressible MLS-MPM: Tait pressure with bulk modulus 200 kPa and γ = 7, viscosity 1 mPa·s, 669,600 particles at 3 mm spacing on a 6 mm grid. Water keeps only its volume change, carries no tension and no negative pressure, so it splits into cavities and droplets instead of stretching like a gel. Physics runs at 14,400 Hz. The bunny, tank walls and water share the common contact solve, so the Worthington jet, the spray over the rim and the bunny's settling on the floor come from the same two-way coupling. The grid extends 0.5 m past the walls, and spray that lands on the deck grips it with friction 0.5. States saved at 60 Hz play back at 30 fps, so the recording runs in **2× slow motion**; it shows the first 1.53 s, from the drop through the jet and the spray settling.
+
+```bash
+cmake --build build-cuda128 --target nuka_bunny_water_demo -j
+build-cuda128/tests/nuka_bunny_water_demo \
+  --no-render --duration 3.5 --out-dir out/bunny_water/capture
+build-cuda128/tests/nuka_bunny_water_demo \
+  --replay out/bunny_water/capture --out-dir out/bunny_water/render \
+  --width 1920 --height 1080 --samples 128
+ffmpeg -framerate 30 -i out/bunny_water/render/frames/frame_%06d.ppm \
+  -vf hqdn3d=1.2:1.2:2.0:2.0 -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p \
+  out/bunny_water/bunny_water_drop.mp4
+```
+
+The capture writes `completion.json` with its physics checks: free-fall velocity error 1.9e-5 m/s, maximum particle volume-ratio error 0.18%, no particle escapes the grid, and a passing reset. The bunny enters the water at 0.18 s at 1.6 m/s, the jet peaks 0.60 m above the floor, and the bunny rests on the tank floor by 0.5 s with a final speed of 3.2 mm/s. The water surface is reconstructed from anisotropic particle kernels, reflected across the walls so it meets the glass flat, smoothed, and path traced as a dielectric nested inside the glass walls.
 
 ## Dynamic elastoplastic gripper
 
