@@ -73,8 +73,7 @@ def Xform "World"
             double radius = 0.025
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -95,8 +94,7 @@ def Xform "World"
             double radius = 0.0175
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -128,8 +126,7 @@ def Xform "World"
             double radius = 0.025
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -150,8 +147,7 @@ def Xform "World"
             double radius = 0.0175
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -183,8 +179,7 @@ def Xform "World"
             double radius = 0.025
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -205,8 +200,7 @@ def Xform "World"
             double radius = 0.0175
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -238,8 +232,7 @@ def Xform "World"
             double radius = 0.025
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 
@@ -260,8 +253,7 @@ def Xform "World"
             double radius = 0.0175
             double height = 0.213
             double3 xformOp:translate = (0, 0, -0.1065)
-            double3 xformOp:rotateXYZ = (90, 0, 0)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+            uniform token[] xformOpOrder = ["xformOp:translate"]
         }
     }
 

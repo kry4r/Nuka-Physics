@@ -43,6 +43,16 @@ def ensure_nuka_scene_bundle() -> Path:
     return SCENE_NKS
 
 
+def compose_lab_scene(stage: Path, environment: Path) -> Path:
+    """Place the robot in an environment whose deck replaces the studio set and its floor."""
+    document = json.loads(stage.read_text(encoding="utf-8"))
+    document["tree"] = [node for node in document["tree"] if node.get("name") != "g1_studio"]
+    document["imports"] = [{"file": str(environment.resolve())}]
+    path = stage.with_name(stage.stem + "_lab.nks")
+    path.write_text(json.dumps(document, indent=1) + "\n", encoding="utf-8")
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=float, default=12.0,
@@ -61,6 +71,8 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--spp", type=int, default=8)
     parser.add_argument("--out", default="out/g1_shuffle")
+    parser.add_argument("--environment", type=Path, default=None,
+                        help="lab NKS whose deck replaces the dance floor, e.g. examples/assets/nuka_lab/stage.nks")
     args = parser.parse_args()
     if args.seconds <= 0.0 or args.preroll < 0.0:
         raise ValueError("seconds must be positive and preroll must be non-negative")
@@ -74,6 +86,8 @@ def main() -> None:
         frames.mkdir(parents=True)
 
     scene_path = ensure_nuka_scene_bundle()
+    if args.environment is not None:
+        scene_path = compose_lab_scene(scene_path, args.environment)
     motion = load_g1_motion(MOTION)
     total_seconds = min(args.preroll + args.seconds, motion.duration)
     captured_seconds = total_seconds - args.preroll
@@ -92,7 +106,7 @@ def main() -> None:
             kp_scale=args.kp_scale, kd_scale=args.kd_scale)
         try:
             steps = int(total_seconds / args.dt)
-            frame_stride = max(1, int(round(1.0 / (args.fps * args.dt))))
+            frame_period = 1.0 / args.fps
             capture_start_step = int(round(args.preroll / args.dt))
             for step in range(steps):
                 time_s = step * args.dt
@@ -111,14 +125,21 @@ def main() -> None:
                         controller.q[0, 1:].detach().cpu().numpy().copy())
                     captured_root_xy.append(
                         controller.base[0, :2].detach().cpu().numpy().copy())
-                if args.video and capture_step % frame_stride == 0:
+                # A frame renders at the first physics step at or after its time.
+                if args.video and capture_step * args.dt >= frame_count * frame_period - 1e-9:
                     base = controller.base[0, :3].detach().cpu().numpy()
                     progress = min(1.0, capture_step * args.dt / captured_seconds)
-                    orbit = math.radians(-30.0 + 65.0 * progress)
                     radius = 2.72
+                    if args.environment is None:
+                        orbit = math.radians(-30.0 + 65.0 * progress)
+                        offset = (math.cos(orbit), math.sin(orbit))
+                    else:
+                        # The front arc keeps the lab backboard and its logo plaque behind the robot.
+                        orbit = math.radians(-25.0 + 50.0 * progress)
+                        offset = (math.sin(orbit), -math.cos(orbit))
                     eye = (
-                        float(base[0] + radius * math.cos(orbit)),
-                        float(base[1] + radius * math.sin(orbit)),
+                        float(base[0] + radius * offset[0]),
+                        float(base[1] + radius * offset[1]),
                         float(1.34 + 0.08 * math.sin(progress * math.pi)),
                     )
                     look = (float(base[0]), float(base[1]), 0.82)

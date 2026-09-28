@@ -120,9 +120,10 @@ def main():
     parser.add_argument("--analyze-only", action="store_true")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--frame-stride", type=int, default=1, help="encode every Nth captured sample")
     args = parser.parse_args()
-    if args.fps <= 0:
-        parser.error("fps must be positive")
+    if args.fps <= 0 or args.frame_stride <= 0:
+        parser.error("fps and frame stride must be positive")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     result = analyze(args.capture)
     result["comparisons"] = {str(path): compare(result, analyze(path)) for path in args.compare}
@@ -143,7 +144,7 @@ def main():
             index = int(path.stem.split("_")[-1])
             composer.frame(index).save(args.out_dir / f"frame_{index:06d}.png")
         return 0
-    end = len(composer.data["time_s"])-1
+    end = (len(composer.data["time_s"])-1) // args.frame_stride * args.frame_stride
     encode_video(composer, args, "elastoplastic_bunny", (0, 24, 36, 48, 120, end))
     return 0
 

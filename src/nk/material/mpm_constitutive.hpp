@@ -267,18 +267,6 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmKirchhoff(
         stress[0] = diag; stress[1] = 0.0f; stress[2] = 0.0f;
         stress[3] = 0.0f; stress[4] = diag; stress[5] = 0.0f;
         stress[6] = 0.0f; stress[7] = 0.0f; stress[8] = diag;
-        if (visc > 0.0f && C != nullptr) {
-            const float Jv = J * visc;
-            stress[0] += Jv * 2.0f * C[0];
-            stress[4] += Jv * 2.0f * C[4];
-            stress[8] += Jv * 2.0f * C[8];
-            const float s01 = Jv * (C[1] + C[3]);
-            const float s02 = Jv * (C[2] + C[6]);
-            const float s12 = Jv * (C[5] + C[7]);
-            stress[1] += s01; stress[3] += s01;
-            stress[2] += s02; stress[6] += s02;
-            stress[5] += s12; stress[7] += s12;
-        }
     } else if (kind == 0.0f || kind == 2.0f) {
         const float denom = (1.0f + poisson) * (1.0f - 2.0f * poisson);
         const float mu = youngs / (2.0f * (1.0f + poisson));
@@ -288,6 +276,19 @@ NUKA_MPM_CONSTITUTIVE_HD inline ConstitutiveStatus EvaluateMpmKirchhoff(
         mpm_detail::Mat3MulT<Arithmetic>(P, F, stress);
     } else {
         return ConstitutiveStatus::InvalidParameters;
+    }
+    // Every model carries the same Newtonian rate term, J visc (grad v + grad v^T).
+    if (visc > 0.0f && C != nullptr) {
+        const float Jv = mpm_detail::Mat3Det(F) * visc;
+        stress[0] += Jv * 2.0f * C[0];
+        stress[4] += Jv * 2.0f * C[4];
+        stress[8] += Jv * 2.0f * C[8];
+        const float s01 = Jv * (C[1] + C[3]);
+        const float s02 = Jv * (C[2] + C[6]);
+        const float s12 = Jv * (C[5] + C[7]);
+        stress[1] += s01; stress[3] += s01;
+        stress[2] += s02; stress[6] += s02;
+        stress[5] += s12; stress[7] += s12;
     }
     return ConstitutiveStatus::Ok;
 }
@@ -312,12 +313,12 @@ NUKA_MPM_CONSTITUTIVE_HD inline MpmStressRowResponse EvaluateMpmStressRows(
     const float J = mpm_detail::Mat3Det(F);
     if (!(J > 0.0f) || !std::isfinite(J)) return response;
     response.pressure = -(stress[0] + stress[4] + stress[8]) / 3.0f;
+    response.viscosity = J * fmaxf(material.viscosity, 0.0f);
     const float kind = material.model_kind;
     if (kind == 3.0f) {
         const float gamma = material.tait_gamma, compression = powf(J, -gamma);
         response.pressure += J * fminf(material.bulk_modulus * (compression - 1.0f), 0.0f);
         response.bulk = J * material.bulk_modulus * ((gamma - 1.0f) * compression + 1.0f);
-        response.viscosity = J * fmaxf(material.viscosity, 0.0f);
         return response;
     }
     const float youngs = material.youngs, poisson = material.poisson;

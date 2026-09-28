@@ -926,12 +926,16 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
     const float fr = FresnelSchlick(cosi, r0);
 
     // March the transmitted ray through bounded interfaces, attenuating each in-medium
-    // segment by Beer-Lambert. `inside` flips at every dielectric crossing.
+    // segment by Beer-Lambert. Closed outward-wound media nest: a crossing pushes or pops
+    // the medium it enters or leaves, so overlapping solids (water against glass) compose.
+    constexpr uint32_t kMaxMedia = 4u;
+    float media_ior[kMaxMedia];
+    Vec3 media_absorb[kMaxMedia];
+    uint32_t depth = 0u;
+    if (entering) { media_ior[0] = n_med; media_absorb[0] = mat.absorption; depth = 1u; }
     Vec3 thr{1.0f, 1.0f, 1.0f};  // running transmittance weight
     Vec3 ro = Vec3{hit.x - Nf.x * eps, hit.y - Nf.y * eps, hit.z - Nf.z * eps};
     Vec3 rd = tdir;
-    bool inside = entering;
-    Material medium = mat;
     Vec3 transmitted{0.0f, 0.0f, 0.0f};
     const uint32_t cap = sky.transmit_bounces < 1u ? 1u : sky.transmit_bounces;
     for (uint32_t b = 0; b < cap; ++b) {
@@ -942,16 +946,18 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
             transmitted = Vec3{thr.x * s.x, thr.y * s.y, thr.z * s.z};
             break;
         }
-        if (inside) {
-            // Beer-Lambert over the segment just traversed inside the medium.
-            thr.x *= expf(-medium.absorption.x * bt);
-            thr.y *= expf(-medium.absorption.y * bt);
-            thr.z *= expf(-medium.absorption.z * bt);
+        if (depth > 0u) {
+            // Beer-Lambert over the segment just traversed inside the innermost medium.
+            const Vec3& a = media_absorb[depth - 1u];
+            thr.x *= expf(-a.x * bt);
+            thr.y *= expf(-a.y * bt);
+            thr.z *= expf(-a.z * bt);
         }
         uint32_t hi, hlp; UnpackPrimId(bp, &hi, &hlp);
         Material hmat = materials[instances[hi].material_id];
         Vec3 hn; float hu, hv;
         ReconstructHit<float>(instances, bp, ro, rd, &hn, &hu, &hv);
+        const bool enters = rd.x * hn.x + rd.y * hn.y + rd.z * hn.z < 0.0f;
         hn = SmoothWorldNormal(instances, bp, hu, hv, hn);
         const Vec3 hpt{ro.x + bt * rd.x, ro.y + bt * rd.y, ro.z + bt * rd.z};
         if (hmat.transmission <= 0.0f) {
@@ -964,18 +970,37 @@ __device__ __noinline__ Vec3 ShadeTransmissive(const LbvhNode* __restrict__ tlas
             transmitted = Vec3{thr.x * sh.x, thr.y * sh.y, thr.z * sh.z};
             break;
         }
-        // Another dielectric interface: refract through it, flip inside, continue.
+        // Another dielectric interface: refract from the innermost medium into the one the
+        // crossing leaves innermost, then commit the push or pop unless it reflects totally.
         const float hvn = -(rd.x * hn.x + rd.y * hn.y + rd.z * hn.z);
         const Vec3 hnf = (hvn < 0.0f) ? Vec3{-hn.x, -hn.y, -hn.z} : hn;
         const float target_ior = hmat.ior > 1.0e-3f ? hmat.ior : 1.0f;
-        const float e2 = inside ? medium.ior / n_air : n_air / target_ior;
+        const float from_ior = depth > 0u ? media_ior[depth - 1u] : n_air;
+        uint32_t leave = depth;  // stack slot of the medium this crossing exits
+        if (!enters) {
+            for (uint32_t m = depth; m-- > 0u;) {
+                const Vec3& a = media_absorb[m];
+                if (media_ior[m] == target_ior && a.x == hmat.absorption.x &&
+                    a.y == hmat.absorption.y && a.z == hmat.absorption.z) { leave = m; break; }
+            }
+        }
+        float to_ior = target_ior;
+        if (!enters) {
+            const uint32_t top = leave + 1u == depth ? leave : depth;  // innermost after leaving
+            to_ior = top > 0u ? media_ior[top - 1u] : n_air;
+        }
         Vec3 nt;
-        const bool total_reflection = !Refract(rd, hnf, e2, &nt);
+        const bool total_reflection = !Refract(rd, hnf, from_ior / to_ior, &nt);
         if (total_reflection) {
             nt = RtNormalize<float>(Reflect(rd, hnf));
-        } else {
-            inside = !inside;
-            if (inside) medium = hmat;
+        } else if (enters) {
+            if (depth < kMaxMedia) { media_ior[depth] = target_ior; media_absorb[depth] = hmat.absorption; ++depth; }
+        } else if (leave < depth) {
+            for (uint32_t m = leave; m + 1u < depth; ++m) {
+                media_ior[m] = media_ior[m + 1u];
+                media_absorb[m] = media_absorb[m + 1u];
+            }
+            --depth;
         }
         rd = nt;
         const float offset = total_reflection ? eps : -eps;

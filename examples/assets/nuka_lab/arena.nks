@@ -1,0 +1,688 @@
+{
+  "nks_version": 1,
+  "imports": [
+    {
+      "file": "appearance.nks"
+    }
+  ],
+  "tree": [
+    {
+      "name": "laboratory",
+      "transform": {
+        "pos": [
+          0.55,
+          0,
+          0
+        ]
+      },
+      "rigid_body": {
+        "is_static": true,
+        "mass": 0
+      },
+      "children": [
+        {
+          "name": "cyclorama",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              0
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/106",
+            "material": "room"
+          }
+        },
+        {
+          "name": "lower_plinth",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              -0.18375
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/107",
+            "material": "graphite"
+          }
+        },
+        {
+          "name": "avocado_edge",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              -0.08925
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/108",
+            "material": "avocado"
+          }
+        },
+        {
+          "name": "plinth_shell",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              -0.042
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/109",
+            "material": "warm_shell"
+          }
+        },
+        {
+          "name": "work_deck",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              -0.014
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/110",
+            "material": "work_deck"
+          }
+        },
+        {
+          "name": "edge_light_-1",
+          "transform": {
+            "pos": [
+              -1.1725,
+              -1.8812499999999999,
+              -0.08750000000000001
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/111",
+            "material": "edge_light"
+          }
+        },
+        {
+          "name": "edge_light_1",
+          "transform": {
+            "pos": [
+              1.1725,
+              -1.8812499999999999,
+              -0.08750000000000001
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/111",
+            "material": "edge_light"
+          }
+        },
+        {
+          "name": "grid_minor",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              0
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/112",
+            "material": "grid_minor"
+          }
+        },
+        {
+          "name": "grid_major",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              0
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/113",
+            "material": "grid_major"
+          }
+        },
+        {
+          "name": "corner_marks",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              0
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/114",
+            "material": "avocado"
+          }
+        },
+        {
+          "name": "ruler",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              0
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/115",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "deck_mark",
+          "transform": {
+            "pos": [
+              0,
+              0,
+              0
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/116",
+            "material": "avocado"
+          }
+        },
+        {
+          "name": "backboard",
+          "transform": {
+            "pos": [
+              0,
+              1.9775,
+              0.9450000000000001
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/117",
+            "material": "graphite"
+          }
+        },
+        {
+          "name": "back_panel_-1",
+          "transform": {
+            "pos": [
+              -0.9800000000000001,
+              1.8935,
+              0.9800000000000001
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/118",
+            "material": "warm_shell"
+          }
+        },
+        {
+          "name": "back_frame_-1",
+          "transform": {
+            "pos": [
+              -1.86375,
+              1.841,
+              0.9800000000000001
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/119",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "back_panel_1",
+          "transform": {
+            "pos": [
+              0.9800000000000001,
+              1.8935,
+              0.9800000000000001
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/118",
+            "material": "warm_shell"
+          }
+        },
+        {
+          "name": "back_frame_1",
+          "transform": {
+            "pos": [
+              1.86375,
+              1.841,
+              0.9800000000000001
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/119",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "back_frame_top",
+          "transform": {
+            "pos": [
+              0,
+              1.841,
+              1.9075000000000002
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/120",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "plaque",
+          "transform": {
+            "pos": [
+              0.9275,
+              1.74475,
+              1.2075
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/121",
+            "material": "graphite"
+          }
+        },
+        {
+          "name": "plaque_mark",
+          "transform": {
+            "pos": [
+              0.9275,
+              1.7115,
+              1.33
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/122",
+            "material": "avocado"
+          }
+        },
+        {
+          "name": "plaque_name",
+          "transform": {
+            "pos": [
+              0.9275,
+              1.7115,
+              1.0150000000000001
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/123",
+            "material": "lettering"
+          }
+        },
+        {
+          "name": "plaque_label",
+          "transform": {
+            "pos": [
+              0.9275,
+              1.7115,
+              0.875
+            ],
+            "quat": [
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/124",
+            "material": "lettering"
+          }
+        },
+        {
+          "name": "vertical_inset_0",
+          "transform": {
+            "pos": [
+              -0.42,
+              1.8585,
+              0.9275
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/125",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "vertical_inset_1",
+          "transform": {
+            "pos": [
+              -0.60375,
+              1.8585,
+              0.9275
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/125",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "vertical_inset_2",
+          "transform": {
+            "pos": [
+              -0.7874999999999999,
+              1.8585,
+              0.9275
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/125",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "vertical_inset_3",
+          "transform": {
+            "pos": [
+              -0.97125,
+              1.8585,
+              0.9275
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/125",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "vertical_inset_4",
+          "transform": {
+            "pos": [
+              -1.1549999999999998,
+              1.8585,
+              0.9275
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/125",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "vertical_inset_5",
+          "transform": {
+            "pos": [
+              -1.33875,
+              1.8585,
+              0.9275
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/125",
+            "material": "edge_metal"
+          }
+        },
+        {
+          "name": "vertical_inset_6",
+          "transform": {
+            "pos": [
+              -1.5225,
+              1.8585,
+              0.9275
+            ],
+            "quat": [
+              0.7071067811865476,
+              0.7071067811865476,
+              0,
+              0
+            ]
+          },
+          "visual_mesh": {
+            "type": "trimesh",
+            "mesh": "lab_geometry.nka#MESH/125",
+            "material": "edge_metal"
+          }
+        }
+      ]
+    },
+    {
+      "name": "overview",
+      "camera": {
+        "local": {
+          "pos": [
+            1.9,
+            -2.3,
+            1.05
+          ],
+          "quat": [
+            0.7640740262405228,
+            0.5894054413855213,
+            0.16019912001069583,
+            0.20767366235884205
+          ]
+        },
+        "vertical_fov_degrees": 35,
+        "near_clip": 0.02,
+        "far_clip": 30,
+        "focus_distance": 2.757263135792447,
+        "shadow_radius": 0
+      }
+    },
+    {
+      "name": "key_light",
+      "light": {
+        "type": "directional",
+        "local": {
+          "quat": [
+            0.8885638173950177,
+            0.3425216460601597,
+            -0.1097662175982451,
+            -0.2847536511983776
+          ]
+        },
+        "color": [
+          3.4,
+          3.2,
+          2.9
+        ],
+        "intensity": 1
+      }
+    }
+  ],
+  "environment": {
+    "shadow": {
+      "center": [
+        0.55,
+        0,
+        0.3
+      ],
+      "radius": 1.4
+    }
+  }
+}

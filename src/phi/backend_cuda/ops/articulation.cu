@@ -690,7 +690,7 @@ DriveControlView MakeDriveControlView(const DataView& data) {
 // Passive joint damping stays in ABA; feedforward is an independent generalized load.
 __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
                                        DriveControlView drive, uint32_t mode,
-                                       uint32_t links_per_env, bool implicit) {
+                                       uint32_t links_per_env, bool implicit, float dt) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count) return;
     drive.command[link] = drive.dissipation[link] = 0.0f;
@@ -721,7 +721,8 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
     float damping = 0.0f;
     switch (control) {
         case ArticulationControlMode::PDPosition:
-            damping = drive.damping[link];
+            // An implicit spring is evaluated at the end of the step, adding dt kp to the damping.
+            damping = drive.damping[link] + (implicit ? dt * drive.stiffness[link] : 0.0f);
             bias = drive.stiffness[link] * (drive.target[link] - state.q[link]) +
                    damping * drive.velocity_target[link];
             break;
@@ -773,7 +774,7 @@ __global__ void ReadoutDrivesKernel(ArticulationDeviceState state,
     const uint32_t row = env * params.rows_per_env + params.first_drive_row + local;
     const float effort = drive.command[link] - drive.dissipation[link] * state.qdot[link];
     requested[link] = effort;
-    applied[link] = lambda[row] / params.dt;
+    applied[link] = lambda[row] / params.dt - drive.dissipation[link] * state.qdot[link];
     saturated[link] = effort < drive.lower[link] || effort > drive.upper[link] ? 1.0f : 0.0f;
     state.tau[link] += applied[link];
 }
@@ -1321,7 +1322,7 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
     const uint32_t blocks = (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
     LaunchCuda(ApplyAffineDriveKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
                state, MakeDriveControlView(data), p->mode, p->links_per_env,
-               p->defer_velocity_damping != 0u);
+               p->defer_velocity_damping != 0u, p->dt);
     return LaunchOk(stream);
 }
 

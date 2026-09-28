@@ -175,6 +175,7 @@ struct RasterOptions {
     float       beauty_exposure_ev  = 0.0f;                // post exposure in stops
     float       beauty_grade        = 0.0f;                // post contrast/saturation strength
     bool        beauty_specular_env = false;               // Cook-Torrance + env reflection (opaque arm)
+    uint32_t    beauty_transmit_bounces = 2u;              // dielectric interfaces a refracted ray crosses
 
     // ----- BEAUTY (M8.5 T4b): grounded look + hero framing -------------------
     // A tasteful ground plane the robot sits on (a large dark disc with a soft

@@ -16,7 +16,12 @@
     "impact_metal": {"base_color": [0.52, 0.58, 0.65, 1], "roughness": 0.40, "metallic": 0.70},
     "press_metal": {"base_color": [0.45, 0.50, 0.56, 1], "roughness": 0.24, "metallic": 0.90},
     "bench_surface": {"base_color": [0.055, 0.075, 0.10, 1], "roughness": 0.35, "metallic": 0},
-    "specimen_support": {"base_color": [0.28, 0.32, 0.38, 1], "roughness": 0.35, "metallic": 0}
+    "specimen_support": {"base_color": [0.28, 0.32, 0.38, 1], "roughness": 0.35, "metallic": 0},
+    "water": {"base_color": [0.70, 0.88, 0.93, 1], "roughness": 0.025, "metallic": 0,
+              "transmission": 1.0, "ior": 1.333, "absorption": [7.5, 2.4, 1.2]},
+    "ceramic": {"base_color": [0.78, 0.37, 0.15, 1], "roughness": 0.34, "metallic": 0},
+    "tank_glass": {"base_color": [0.92, 0.97, 0.96, 1], "roughness": 0.02, "metallic": 0,
+                   "transmission": 1.0, "ior": 1.5, "absorption": [1.8, 0.35, 0.9]}
   },
   "environment": {
     "use_scene_materials": true,

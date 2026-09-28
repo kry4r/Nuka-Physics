@@ -1,5 +1,6 @@
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
+#include "render/scene_asset.hpp"
 #include "render/studio_beauty.hpp"
 #include "scene/format/nks.hpp"
 #include "scene/scene_ir.hpp"
@@ -135,6 +136,8 @@ void update_showcase_contacts(nuka::render::StudioScene& studio,
 struct Args {
     std::string bin = "out/go2_skill_trajectory.bin";
     std::string out = "out/go2_cuda_frames";
+    std::string environment;
+    float fps = 0.0f;
     uint32_t frames = 0;
     uint32_t stride = 1;
     uint32_t width = 1280;
@@ -152,6 +155,8 @@ Args parse_args(int argc, char** argv) {
         };
         if (s == "--bin") next(&a.bin);
         else if (s == "--out-dir") next(&a.out);
+        else if (s == "--environment") next(&a.environment);
+        else if (s == "--fps" && i + 1 < argc) a.fps = static_cast<float>(std::atof(argv[++i]));
         else if (s == "--frames" && i + 1 < argc) a.frames = std::atoi(argv[++i]);
         else if (s == "--stride" && i + 1 < argc) a.stride = std::max(1, std::atoi(argv[++i]));
         else if (s == "--width" && i + 1 < argc) a.width = std::atoi(argv[++i]);
@@ -213,6 +218,16 @@ Transform pose_at(const std::vector<float>& flat, uint32_t link, uint32_t stride
     return Transform{Vec3{p[0], p[1], p[2]}, Quat{p[3], p[4], p[5], p[6]}};
 }
 
+// Frames between two recorded samples blend them: positions linearly, rotations by nlerp.
+Transform blend(const Transform& a, const Transform& b, float u) {
+    Quat q = b.rotation;
+    const float dot = a.rotation.w * q.w + a.rotation.x * q.x + a.rotation.y * q.y + a.rotation.z * q.z;
+    if (dot < 0.0f) q = Quat{-q.w, -q.x, -q.y, -q.z};
+    const Quat r{a.rotation.w + (q.w - a.rotation.w) * u, a.rotation.x + (q.x - a.rotation.x) * u,
+                 a.rotation.y + (q.y - a.rotation.y) * u, a.rotation.z + (q.z - a.rotation.z) * u};
+    return Transform{a.position * (1.0f - u) + b.position * u, r.Normalized()};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -229,18 +244,28 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[cuda-video] nks loaded\n");
     const nuka::scene::SceneMap map = make_visual_map(scene.Ecs());
     std::fprintf(stderr, "[cuda-video] visual map entries=%zu\n", map.Size());
+    const bool lab = !args.environment.empty();
     render::StudioScene studio = render::BuildStudioScene(
         scene.Ecs(), map, std::vector<nuka::runtime::soft::SurfaceTopology>{},
-        args.width, args.height);
-    add_showcase_floor(studio);
-    studio.options.draw_ground = true;
-    studio.options.ground_color[0] = 0.105f;
-    studio.options.ground_color[1] = 0.125f;
-    studio.options.ground_color[2] = 0.155f;
-    studio.options.beauty_sky_fill = 0.42f;
-    studio.options.beauty_exposure_ev = 0.25f;
-    studio.options.beauty_grade = 0.10f;
-    studio.options.beauty_specular_env = true;
+        args.width, args.height, !lab);
+    if (lab) {
+        const auto environment = nuka::scene::nks::Load(args.environment);
+        const auto asset = render::BuildSceneRenderAsset(
+            environment, std::filesystem::path(args.environment).parent_path().string());
+        render::RenderAssetBinding binding;
+        render::SetSceneRenderAsset(studio.world, binding, asset);
+        render::ApplySceneLighting(studio.options, asset);
+    } else {
+        add_showcase_floor(studio);
+        studio.options.draw_ground = true;
+        studio.options.ground_color[0] = 0.105f;
+        studio.options.ground_color[1] = 0.125f;
+        studio.options.ground_color[2] = 0.155f;
+        studio.options.beauty_sky_fill = 0.42f;
+        studio.options.beauty_exposure_ev = 0.25f;
+        studio.options.beauty_grade = 0.10f;
+        studio.options.beauty_specular_env = true;
+    }
     studio.options.contact_shadow_strength = 0.0f;
     std::fprintf(stderr, "[cuda-video] studio built instances=%zu\n", studio.world.instances.size());
     if (studio.world.instances.empty()) {
@@ -255,21 +280,31 @@ int main(int argc, char** argv) {
     }
     renderer.SetBeauty(true, args.samples);
     std::filesystem::create_directories(args.out);
-    const uint32_t limit = args.frames ? std::min(args.frames, traj.steps) : traj.steps;
+    // A frame rate resamples the recorded interval in time; otherwise every stride-th sample renders.
+    const float duration = static_cast<float>(traj.steps - 1u) * traj.dt;
+    uint32_t total = args.fps > 0.0f ? static_cast<uint32_t>(std::floor(duration * args.fps)) + 1u
+                                     : (traj.steps + args.stride - 1u) / args.stride;
+    if (args.frames) total = std::min(total, args.frames);
     std::vector<Transform> links(traj.links, Transform::Identity());
-    for (uint32_t i = 0, written = 0; i < limit; i += args.stride, ++written) {
+    for (uint32_t written = 0; written < total; ++written) {
+        const float sample = args.fps > 0.0f ? written / (args.fps * traj.dt)
+                                             : static_cast<float>(written * args.stride);
+        const uint32_t i = std::min(static_cast<uint32_t>(sample), traj.steps - 1u);
+        const uint32_t j = std::min(i + 1u, traj.steps - 1u);
         for (uint32_t link = 0; link < traj.links; ++link)
-            links[link] = pose_at(traj.poses[i], link, traj.pose_floats);
+            links[link] = blend(pose_at(traj.poses[i], link, traj.pose_floats),
+                                pose_at(traj.poses[j], link, traj.pose_floats), sample - i);
         const Vec3 base = links[0].position;
-        const float az = -0.65f + 0.35f * std::sin(static_cast<float>(i) * 0.01f);
+        const float az = -0.65f + 0.35f * std::sin(sample * 0.01f);
         const Vec3 look{base.x, base.y, 0.38f};
-        const float radius = 1.55f;
+        // The lab orbit stands back far enough to keep the signage wall in frame.
+        const float radius = lab ? 2.3f : 1.55f;
         studio.options.camera_target = look;
         studio.options.camera_eye = {
             look.x + radius * std::cos(az),
             look.y + radius * std::sin(az),
             look.z + 0.55f};
-        update_showcase_contacts(studio, links);
+        if (!lab) update_showcase_contacts(studio, links);
         render::PublishStudioScene(studio, links, {});
         const auto report = renderer.Render(studio.world, studio.options);
         char name[64];
@@ -282,7 +317,6 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
-    std::printf("CUDA RT rendered %u frames to %s\n",
-                (limit + args.stride - 1) / args.stride, args.out.c_str());
+    std::printf("CUDA RT rendered %u frames to %s\n", total, args.out.c_str());
     return 0;
 }

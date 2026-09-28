@@ -907,11 +907,12 @@ __global__ void EmitJointFrictionRowsKernel(
     urows[rs] = row;
 }
 
-// Implicit affine actuator effort is a bounded impulse with J = e_joint.
+// An actuator's bounded effort is a fixed impulse with J = e_joint; its implicit
+// dissipation is folded into the articulation mass instead.
 __global__ void EmitJointDriveRowsKernel(
     ArticulationDeviceState state, float dt, uint32_t base_link_count,
     uint32_t rows_per_env, uint32_t first_row, uint32_t dof_stride,
-    const float* command, const float* dissipation, const float* lower, const float* upper,
+    const float* command, const float* lower, const float* upper,
     NkRow* urows, float* lambda, float* chain_jacobian,
     uint32_t* row_cj_link, uint32_t* row_cj_link_b,
     float* row_penetration, float* row_damping, uint32_t* row_count) {
@@ -926,7 +927,7 @@ __global__ void EmitJointDriveRowsKernel(
     float* J = chain_jacobian + static_cast<size_t>(slot) * dof_stride;
     for (uint32_t d = 0u; d < dof_stride; ++d) J[d] = 0.0f;
     if (JointDofCountDevice(state.joint_type[link]) == 1u &&
-        (fminf(fmaxf(command[link], lower[link]), upper[link]) != 0.0f || dissipation[link] > 0.0f)) {
+        fminf(fmaxf(command[link], lower[link]), upper[link]) != 0.0f) {
         const uint32_t articulation = state.link_to_articulation[link];
         const uint32_t offset = state.articulation_link_offset[articulation];
         const uint32_t dof = LocalDofIndexDevice(state, offset, link);
@@ -937,15 +938,8 @@ __global__ void EmitJointDriveRowsKernel(
         row.a.kind = kNkSideArtic;
         row.a.index = articulation;
         J[dof] = 1.0f;
-        if (dissipation[link] > 0.0f) {
-            row.compliance_alpha = 1.0f / (dt * dissipation[link]);
-            row.rhs = command[link] * row.compliance_alpha;
-            row.lower = fmaxf(lower[link] * dt, -kFltMax);
-            row.upper = fminf(upper[link] * dt, kFltMax);
-        } else {
-            const float effort = fminf(fmaxf(command[link], lower[link]), upper[link]);
-            row.lower = row.upper = effort * dt;
-        }
+        const float effort = fminf(fmaxf(command[link], lower[link]), upper[link]);
+        row.lower = row.upper = effort * dt;
         atomicAdd(row_count + env, 1u);
     }
     urows[slot] = row;
@@ -1054,8 +1048,10 @@ __global__ void EmitParticleConstraintRowsKernel(
         atomicAdd(row_count + env, 1u);
     } else {
         row = NkRow{};
-        lambda[slot] = 0.0f;
     }
+    // As with XPBD multipliers, the impulse restarts each step: it holds this step's error
+    // correction, and a warm start would apply that correction again next step.
+    lambda[slot] = 0.0f;
     urows[slot] = row;
 }
 
@@ -1706,7 +1702,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         LaunchCuda(EmitJointDriveRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    state, p->dt, p->base_link_count, p->rows_per_env,
                    p->contact_rows_per_env + p->joint_limit_rows_per_env + p->joint_friction_rows_per_env,
-                   p->max_dof, data.drive_command, data.drive_dissipation, data.drive_lower, data.drive_upper,
+                   p->max_dof, data.drive_command, data.drive_lower, data.drive_upper,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda, data.chain_jacobian,
                    data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
     }

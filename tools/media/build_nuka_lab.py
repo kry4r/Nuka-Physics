@@ -169,10 +169,13 @@ class Layout:
         self.document["environment"] = {"shadow": {"center": list(center), "radius": radius}}
 
 
-def laboratory(library, marks, cell, cells, origin=(0, 0, 0), plinth=None):
+def laboratory(library, marks, cell, cells, origin=(0, 0, 0), plinth=None, deck_friction=None):
     layout = Layout(library, origin)
     scale = cell * cells
     x = y = scale
+    if deck_friction is not None:
+        layout.root["children"].append({"name": "deck_collision", "transform": {"pos": [0, 0, -0.05]},
+            "collision_shape": {"type": "box", "half_extents": [x, y, 0.05], "friction_mu": deck_friction}})
     half, line, elevation = cell * 64, cell * 0.002, cell * 0.0006
     room = Mesh()
     room.quad(-half, -half, half, half, -scale * 0.15)
@@ -277,7 +280,20 @@ def main():
     compression = laboratory(library, marks, 0.025, 4)
     compression.camera("overview", (0.20, -0.48, 0.245), (0, 0, 0.09), 30, 0.003, 30)
     compression.lighting((0, 0, 0.06), 0.2)
-    for name, layout in (("gripper", gripper), ("bunny", bunny), ("compression", compression)):
+    water = laboratory(library, marks, 0.125, 4)
+    water.camera("overview", (0.40, -0.66, 0.92), (0, 0.02, 0.19), 32, 0.01, 30)
+    water.camera("close", (0.32, -0.54, 0.70), (0, 0.01, 0.13), 32, 0.01, 30)
+    water.lighting((0, 0, 0.18), 0.7)
+    # The humanoid stage deck is a collision floor; the quadruped arena covers the backward flip
+    # and the forward rear-up travel.
+    stage = laboratory(library, marks, 0.5, 4, deck_friction=1.2)
+    stage.camera("overview", (0.4, -3.6, 1.5), (0.3, 0, 0.9), 35, 0.05, 60)
+    stage.lighting((0, 0, 0.8), 2.4)
+    arena = laboratory(library, marks, 0.35, 5, (0.55, 0, 0))
+    arena.camera("overview", (1.9, -2.3, 1.05), (0.55, 0, 0.35), 35, 0.02, 30)
+    arena.lighting((0.55, 0, 0.3), 1.4)
+    for name, layout in (("gripper", gripper), ("bunny", bunny), ("compression", compression),
+                         ("water", water), ("stage", stage), ("arena", arena)):
         (args.output / f"{name}.nks").write_text(json.dumps(layout.document, indent=2) + "\n", encoding="utf-8")
         print(f"{name}: {len(layout.root['children'])} editable visual nodes")
     library.write(args.output / "lab_geometry.nka")

@@ -50,6 +50,9 @@ constexpr Vec3 kPlateHalf{0.18f, 0.15f, kBase * 0.5f};
 constexpr float kDensity = 1000.0f, kYoungs = 50000.0f, kPoisson = 0.30f;
 constexpr float kYield = 12000.0f, kHardening = 3000.0f, kGravity = -9.81f;
 constexpr float kFriction = 0.20f;
+// A loss tangent near 0.15 at the bunny's 6 Hz rocking mode; explicit steps keep
+// eta dt below rho dx^2 / 10.
+constexpr float kViscosity = 80.0f;
 
 struct Args {
     std::filesystem::path out = "out/elastoplastic_bunny";
@@ -61,7 +64,7 @@ struct Args {
         ".nuka-assets/generated/bunny_solid_120mm.obj";
     float dx = 0.005f, mass = 2.5f, drop_height = 0.18f, duration = 3.6f;
     float contact_band = 0.0f;
-    uint32_t steps_per_frame = 64u, width = 1600u, height = 1000u, samples = 128u;
+    uint32_t steps_per_frame = 256u, width = 1600u, height = 1000u, samples = 128u;
     uint32_t render_stride = 1u;
     bool no_render = false;
 };
@@ -257,6 +260,7 @@ Scene BuildModel(const Args& args, const render::MeshGeometry& mesh) {
     material.material.model_kind = nk::MpmMaterial::kHenckyJ2;
     material.material.yield_stress = kYield;
     material.material.hardening_modulus = kHardening;
+    material.material.viscosity = kViscosity;
     material.dx = args.dx;
     material.substeps = 1u;
     material.grid_origin = {-0.20f, -0.18f, -0.02f};
@@ -437,7 +441,7 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
     config.Set("base_z", Json::Float(kBase)); config.Set("density", Json::Float(kDensity));
     config.Set("youngs", Json::Float(kYoungs)); config.Set("poisson", Json::Float(kPoisson));
     config.Set("yield_stress", Json::Float(kYield)); config.Set("hardening_modulus", Json::Float(kHardening));
-    config.Set("friction", Json::Float(kFriction));
+    config.Set("friction", Json::Float(kFriction)); config.Set("viscosity", Json::Float(kViscosity));
     config.Set("body_contact_band", Json::Float(args.contact_band > 0.0f ? args.contact_band : args.dx));
     config.Set("gravity_z", Json::Float(kGravity)); config.Set("collision_geometry", Json::Str("closed triangle surface"));
     config.Set("source_asset", scene.asset); config.Set("mass_model", Json::Str("uniform closed mesh volume"));

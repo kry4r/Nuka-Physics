@@ -385,6 +385,7 @@ struct StudioRtRenderer::Impl {
         b.sun_disc_radiance = Vec3{opts.beauty_sun_disc[0], opts.beauty_sun_disc[1],
                                    opts.beauty_sun_disc[2]};
         b.specular_env = opts.beauty_specular_env;
+        b.transmit_bounces = opts.beauty_transmit_bounces;
         b.download = rt::AovDownloadMask{};
         b.download.depth = false; b.download.normal = false;
         b.download.albedo = false; b.download.uv = false;

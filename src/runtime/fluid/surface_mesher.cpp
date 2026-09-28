@@ -15,6 +15,7 @@
 #include "import/cooker/fluid_cooker_types.hpp"  // Poly6FromR2Host / Poly6GradientHost
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -541,7 +542,7 @@ std::vector<AnisoKernel> BuildAnisoKernels(const std::vector<math::Vec3>& pts,
         ak.center = centers[i];
         if (cwsum <= 0.0f || cnt <= 1u) {
             // No neighborhood: a spherical kernel of radius ~h.
-            const float s = p.aniso_kn / h;
+            const float s = 1.0f / (p.aniso_kn * h);
             ak.g[0] = ak.g[1] = ak.g[2] = s; ak.g[3] = ak.g[4] = ak.g[5] = 0.0f;
             ak.det = s * s * s;
             out[i] = ak; return;
@@ -553,8 +554,10 @@ std::vector<AnisoKernel> BuildAnisoKernels(const std::vector<math::Vec3>& pts,
         float sigma[3];
         if (cnt > p.aniso_n_eps) {
             const float s1 = w[0];
-            for (int k = 0; k < 3; ++k)
-                sigma[k] = p.aniso_ks * std::max(w[k], s1 / p.aniso_kr);
+            for (int k = 0; k < 3; ++k) sigma[k] = std::max(w[k], s1 / p.aniso_kr);
+            // Unit volume keeps each kernel's mass; the covariance only sets its shape.
+            const float volume = std::cbrt(sigma[0] * sigma[1] * sigma[2]);
+            for (float& value : sigma) value = p.aniso_ks * value / volume;
         } else {
             sigma[0] = sigma[1] = sigma[2] = p.aniso_kn;
         }
@@ -617,12 +620,61 @@ float DensityAtAniso(const math::Vec3& x, const std::vector<AnisoKernel>& ker,
     return rho;
 }
 
+// Taubin lambda/mu passes remove voxel- and particle-scale relief without shrinking the
+// surface; area-weighted normals then follow the smoothed triangles' outward winding.
+void SmoothSurface(render::MeshGeometry& mesh, uint32_t iterations) {
+    const size_t vertices = mesh.positions.size() / 3u;
+    std::vector<uint32_t> start(vertices + 1u, 0u);
+    for (uint32_t index : mesh.indices) start[index + 1u] += 2u;
+    for (size_t v = 0u; v < vertices; ++v) start[v + 1u] += start[v];
+    std::vector<uint32_t> neighbors(start.back()), fill(start.begin(), start.end() - 1);
+    for (size_t t = 0u; t + 2u < mesh.indices.size(); t += 3u)
+        for (size_t k = 0u; k < 3u; ++k) {
+            const uint32_t v = mesh.indices[t + k];
+            neighbors[fill[v]++] = mesh.indices[t + (k + 1u) % 3u];
+            neighbors[fill[v]++] = mesh.indices[t + (k + 2u) % 3u];
+        }
+    std::vector<float> next(mesh.positions.size());
+    const auto pass = [&](float weight) {
+        core::ParallelFor(vertices, [&](size_t v) {
+            float sum[3] = {0.0f, 0.0f, 0.0f};
+            const uint32_t begin = start[v], end = start[v + 1u];
+            for (uint32_t i = begin; i < end; ++i)
+                for (size_t k = 0u; k < 3u; ++k) sum[k] += mesh.positions[size_t{neighbors[i]} * 3u + k];
+            for (size_t k = 0u; k < 3u; ++k) {
+                const float x = mesh.positions[v * 3u + k];
+                next[v * 3u + k] = end > begin ? x + weight * (sum[k] / float(end - begin) - x) : x;
+            }
+        });
+        mesh.positions.swap(next);
+    };
+    for (uint32_t i = 0u; i < iterations; ++i) { pass(0.5f); pass(-0.53f); }
+    std::fill(mesh.normals.begin(), mesh.normals.end(), 0.0f);
+    for (size_t t = 0u; t + 2u < mesh.indices.size(); t += 3u) {
+        const uint32_t a = mesh.indices[t], b = mesh.indices[t + 1u], c = mesh.indices[t + 2u];
+        const math::Vec3 pa{mesh.positions[a * 3u], mesh.positions[a * 3u + 1u], mesh.positions[a * 3u + 2u]};
+        const math::Vec3 pb{mesh.positions[b * 3u], mesh.positions[b * 3u + 1u], mesh.positions[b * 3u + 2u]};
+        const math::Vec3 pc{mesh.positions[c * 3u], mesh.positions[c * 3u + 1u], mesh.positions[c * 3u + 2u]};
+        const math::Vec3 n = (pb - pa).Cross(pc - pa);
+        for (uint32_t v : {a, b, c}) {
+            mesh.normals[v * 3u] += n.x; mesh.normals[v * 3u + 1u] += n.y; mesh.normals[v * 3u + 2u] += n.z;
+        }
+    }
+    core::ParallelFor(vertices, [&](size_t v) {
+        float* n = mesh.normals.data() + v * 3u;
+        const float length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (length > 1e-20f) { n[0] /= length; n[1] /= length; n[2] /= length; }
+        else { n[0] = 0.0f; n[1] = 0.0f; n[2] = 1.0f; }
+    });
+}
+
 }  // namespace
 
 struct FluidSurfaceBoundary::Geometry {
     render::MeshGeometry mesh;
     collision::StaticBVH tree;
     float orientation = 1.0f;
+    bool closed = false;
 };
 
 FluidSurfaceBoundary::FluidSurfaceBoundary(const render::MeshGeometry& mesh) {
@@ -657,6 +709,21 @@ FluidSurfaceBoundary::FluidSurfaceBoundary(const render::MeshGeometry& mesh) {
         volume += double(v[0].Dot(v[1].Cross(v[2])));
     }
     geometry->orientation = volume < 0.0 ? -1.0f : 1.0f;
+    // Only a watertight surface has an inside; edges weld by position across split face vertices.
+    using Point = std::array<float, 3>;
+    std::map<std::pair<Point, Point>, uint32_t> edges;
+    const auto point = [&](uint32_t index) {
+        const size_t at = size_t{index} * 3u;
+        return Point{mesh.positions[at], mesh.positions[at + 1u], mesh.positions[at + 2u]};
+    };
+    for (size_t t = 0u; t + 2u < mesh.indices.size(); t += 3u)
+        for (size_t k = 0u; k < 3u; ++k) {
+            Point a = point(mesh.indices[t + k]), b = point(mesh.indices[t + (k + 1u) % 3u]);
+            if (b < a) std::swap(a, b);
+            ++edges[{a, b}];
+        }
+    geometry->closed = !edges.empty() &&
+        std::all_of(edges.begin(), edges.end(), [](const auto& edge) { return edge.second % 2u == 0u; });
     geometry_ = std::move(geometry);
 }
 
@@ -696,7 +763,7 @@ bool FluidSurfaceBoundary::Sample(math::Vec3 point, float range, float& distance
         }
         const auto a = vertex(node.shape_index, 0u), b = vertex(node.shape_index, 1u),
                    c = vertex(node.shape_index, 2u);
-        if (ray && collision::MeshPositiveXRayCrosses(p, a, b, c)) inside = !inside;
+        if (ray && geometry_->closed && collision::MeshPositiveXRayCrosses(p, a, b, c)) inside = !inside;
         if (!near) continue;
         const auto q = collision::ClosestTrianglePoint(p, a, b, c).point;
         const float sq = (p - q).LengthSq();
@@ -726,6 +793,7 @@ FluidSurfaceParams DensitySurfaceParams(float spacing) {
     params.cell_size = 0.5f * spacing;
     params.particle_mass = spacing * spacing * spacing;
     params.rest_density_rho0 = 1.0f;
+    params.smooth_iterations = 8u;
     return params;
 }
 
@@ -756,7 +824,8 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
     const int gx = std::max(1, static_cast<int>(std::ceil((grid_hi.x - grid_lo.x) / ch)));
     const int gy = std::max(1, static_cast<int>(std::ceil((grid_hi.y - grid_lo.y) / ch)));
     const int gz = std::max(1, static_cast<int>(std::ceil((grid_hi.z - grid_lo.z) / ch)));
-    float iso = p.iso_fraction * p.rest_density_rho0;
+    float rho_ref = p.rest_density_rho0;
+    float iso = p.iso_fraction * rho_ref;
 
     // Anisotropic kernels (opt-in): precompute the per-particle ellipsoid transforms.
     // The unified `density`/`gradient` close over the active field so the rest of the
@@ -801,17 +870,16 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
         float rho = 0.0f;
         for (const auto& sample : samples) rho += particle_density(sample);
         // Reflect density at solids; bury the closing interface within one quarter voxel.
-        return std::min(rho, iso + p.rest_density_rho0 * (solid_distance + 0.25f * ch) / h);
+        return std::min(rho, iso + rho_ref * (solid_distance + 0.25f * ch) / h);
     };
     if (p.anisotropic) {
-        // Calibrate the iso level to the anisotropic field's own interior density so
-        // `iso_fraction` keeps its meaning regardless of k_s units: sample the field
-        // at every smoothed kernel center and take a robust upper percentile as rho0.
+        // Calibrate iso to the anisotropic field's interior density: the median over the
+        // smoothed kernel centers, read without solid reflection.
         std::vector<float> rho_at(n, 0.0f);
-        core::ParallelFor(n, [&](size_t i) { rho_at[i] = density(ker[i].center); });
+        core::ParallelFor(n, [&](size_t i) { rho_at[i] = particle_density(ker[i].center); });
         std::sort(rho_at.begin(), rho_at.end());
-        const float rho0 = rho_at[(rho_at.size() * 90u) / 100u];
-        iso = p.iso_fraction * rho0;
+        rho_ref = rho_at[rho_at.size() / 2u];
+        iso = p.iso_fraction * rho_ref;
     }
     auto gradient = [&](const math::Vec3& x) -> math::Vec3 {
         if (!p.anisotropic && boundaries.empty()) {
@@ -957,6 +1025,7 @@ render::MeshGeometry MarchFluidSurface(const std::vector<math::Vec3>& particle_p
         if (normal.Dot(math::Vec3{-grad.x, -grad.y, -grad.z}) < 0.0f)
             std::swap(out.indices[at + 1u], out.indices[at + 2u]);
     });
+    if (p.smooth_iterations > 0u) SmoothSurface(out, p.smooth_iterations);
     return out;
 }
 
