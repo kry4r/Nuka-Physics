@@ -6,17 +6,15 @@
 // mapping the authored material params. These tests assert, on the RETURNED host
 // constraint set (pure CPU -- no device upload / step), that:
 //
-//   1. CLOTH: a hand-verifiable 2-triangle quad cooks to the known edge + bend
-//      counts, and a 2x2 grid scales to the combinatorially-derived counts.
-//   2. SOFTBODY: a single tet cooks to 6 distance + 1 volume; emit_tet_edges=false
+//   1. SOFTBODY: a single tet cooks to 6 distance + 1 volume; emit_tet_edges=false
 //      isolates the 1 volume constraint.
-//   3. SHAPE-MATCH: a spec cooks to ONE cluster over all particles with the rest
+//   2. SHAPE-MATCH: a spec cooks to ONE cluster over all particles with the rest
 //      positions preserved.
-//   4. PARAM MAPPING: the TWO distinct mappings are exercised directly --
-//      cloth/tet stiffness 1e4 -> compliance_alpha 1e-4 (on every emitted row),
+//   3. PARAM MAPPING: the TWO distinct mappings are exercised directly --
+//      tet stiffness 1e4 -> compliance_alpha 1e-4 (on every emitted row),
 //      and shape_match stiffness 0.5 -> cluster.stiffness 0.5 (NOT 1/0.5). Edge
 //      cases: stiffness<=0 -> alpha 0 (rigid); shape_match clamps to [0,1].
-//   5. DETERMINISM: cooking the same spec twice yields a byte-identical
+//   4. DETERMINISM: cooking the same spec twice yields a byte-identical
 //      constraint list (CPU cook-time, but asserted).
 // ---------------------------------------------------------------------------
 
@@ -24,7 +22,6 @@
 
 #include "import/cooker/xpbd_cooker_types.hpp"  // XPBD constraint PODs (CUDA-free)
 #include "math/vec3.hpp"
-#include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"
 
 #include <gtest/gtest.h>
@@ -44,62 +41,10 @@ using nuka::import::cooker::ShapeMatchFractionFromStiffness;
 using nuka::import::cooker::SoftBodyType;
 using nuka::import::cooker::XpbdSoftBodySpec;
 using nuka::math::Vec3;
-using nuka::runtime::soft::ClothTriangle;
 using nuka::runtime::soft::TetMeshTet;
 using nuka::runtime::soft::XpbdConstraintSet;
 
 // --- Specs ----------------------------------------------------------------
-
-// A flat unit quad split into two triangles by the (v0,v2) diagonal. Vertices:
-//   2 --- 3        (0,0) (1,0) at y=0 row; (0,1) (1,1) at y=1 row.
-//   |  \  |        Triangles: {0,1,2} and {1,3,2}. Shared (interior) edge: 1-2.
-//   0 --- 1        5 unique edges: 0-1, 0-2, 1-2(diag/shared), 1-3, 2-3.
-XpbdSoftBodySpec QuadClothSpec(float stiffness) {
-    XpbdSoftBodySpec s;
-    s.type = SoftBodyType::Cloth;
-    s.rest_positions = {
-        Vec3{0.0f, 0.0f, 0.0f},  // 0
-        Vec3{1.0f, 0.0f, 0.0f},  // 1
-        Vec3{0.0f, 1.0f, 0.0f},  // 2
-        Vec3{1.0f, 1.0f, 0.0f},  // 3
-    };
-    s.triangles = {ClothTriangle{{0u, 1u, 2u}}, ClothTriangle{{1u, 3u, 2u}}};
-    s.stiffness = stiffness;
-    return s;
-}
-
-// A 2x2 cell grid (3x3 = 9 vertices), each cell split by its (lo-left, up-right)
-// diagonal into 2 triangles (8 triangles total). Combinatorial unique-edge count:
-//   horizontal edges : (rows=3) * (cells-per-row=2) = 6
-//   vertical   edges : (cols=3) * (cells-per-col=2) = 6
-//   diagonal   edges : one per cell = 2*2            = 4
-//   total distance   = 16.
-// Interior edges (shared by exactly two triangles) -> bend constraints:
-//   every diagonal is interior (the two tris of its own cell): 4
-//   shared horizontal edges (between vertically-adjacent cells): the middle row's
-//     2 horizontal edges = 2
-//   shared vertical edges (between horizontally-adjacent cells): the middle col's
-//     2 vertical edges = 2
-//   total bend = 8.
-XpbdSoftBodySpec GridClothSpec() {
-    XpbdSoftBodySpec s;
-    s.type = SoftBodyType::Cloth;
-    constexpr int kN = 2;  // cells per side
-    auto vid = [](int ix, int iy) { return static_cast<uint32_t>(iy * (kN + 1) + ix); };
-    for (int iy = 0; iy <= kN; ++iy)
-        for (int ix = 0; ix <= kN; ++ix)
-            s.rest_positions.push_back(Vec3{static_cast<float>(ix), static_cast<float>(iy), 0.0f});
-    for (int iy = 0; iy < kN; ++iy)
-        for (int ix = 0; ix < kN; ++ix) {
-            const uint32_t a = vid(ix, iy), b = vid(ix + 1, iy);
-            const uint32_t c = vid(ix, iy + 1), d = vid(ix + 1, iy + 1);
-            // Split by the a-d diagonal: triangles {a,b,d} and {a,d,c}.
-            s.triangles.push_back(ClothTriangle{{a, b, d}});
-            s.triangles.push_back(ClothTriangle{{a, d, c}});
-        }
-    s.stiffness = 1.0e4f;
-    return s;
-}
 
 // A single unit tet (the 4 corners). 6 edges, 1 volume.
 XpbdSoftBodySpec TetSpec(bool emit_edges, float stiffness) {
@@ -138,7 +83,6 @@ std::string ConstraintBytes(const XpbdConstraintSet& cs) {
         out.append(static_cast<const char*>(p), n);
     };
     for (const auto& d : cs.distance) put(&d, sizeof(d));
-    for (const auto& b : cs.bend) put(&b, sizeof(b));
     for (const auto& v : cs.volume) put(&v, sizeof(v));
     for (const auto& c : cs.shape_match) {
         put(c.particle.data(), c.particle.size() * sizeof(uint32_t));
@@ -170,50 +114,12 @@ TEST(XpbdCookerMapping, ShapeMatchStiffnessIsAGoalPullFractionNotACompliance) {
     EXPECT_FLOAT_EQ(ShapeMatchFractionFromStiffness(-1.0f), 0.0f);
 }
 
-// --- Cloth -----------------------------------------------------------------
-
-TEST(XpbdCookerCloth, QuadCooksKnownEdgeAndBendCounts) {
-    const auto cs = CookXpbdSoftBody(QuadClothSpec(1.0e4f));
-    // 5 unique edges; 1 interior (shared) edge -> 1 bend; no volume / cluster.
-    EXPECT_EQ(cs.distance.size(), 5u);
-    EXPECT_EQ(cs.bend.size(), 1u);
-    EXPECT_EQ(cs.volume.size(), 0u);
-    EXPECT_EQ(cs.shape_match.size(), 0u);
-
-    // Mapping applied on every emitted elastic row: 1e4 -> 1e-4.
-    for (const auto& d : cs.distance) EXPECT_FLOAT_EQ(d.compliance_alpha, 1.0e-4f);
-    for (const auto& b : cs.bend) EXPECT_FLOAT_EQ(b.compliance_alpha, 1.0e-4f);
-}
-
-TEST(XpbdCookerCloth, GridScalesToCombinatorialCounts) {
-    const auto cs = CookXpbdSoftBody(GridClothSpec());
-    EXPECT_EQ(cs.distance.size(), 16u);  // 6 horiz + 6 vert + 4 diag
-    EXPECT_EQ(cs.bend.size(), 8u);       // 4 diag + 2 shared-horiz + 2 shared-vert
-    EXPECT_EQ(cs.volume.size(), 0u);
-}
-
-TEST(XpbdCookerCloth, EmitBendFalseDropsBendKeepsDistance) {
-    auto spec = QuadClothSpec(1.0e4f);
-    spec.emit_bend = false;
-    const auto cs = CookXpbdSoftBody(spec);
-    EXPECT_EQ(cs.distance.size(), 5u);
-    EXPECT_EQ(cs.bend.size(), 0u);
-}
-
-TEST(XpbdCookerCloth, RigidStiffnessGivesZeroAlpha) {
-    const auto cs = CookXpbdSoftBody(QuadClothSpec(0.0f));
-    ASSERT_FALSE(cs.distance.empty());
-    for (const auto& d : cs.distance) EXPECT_FLOAT_EQ(d.compliance_alpha, 0.0f);
-    for (const auto& b : cs.bend) EXPECT_FLOAT_EQ(b.compliance_alpha, 0.0f);
-}
-
 // --- SoftBody (tet) --------------------------------------------------------
 
 TEST(XpbdCookerSoftBody, SingleTetCooks6EdgesAnd1Volume) {
     const auto cs = CookXpbdSoftBody(TetSpec(/*emit_edges=*/true, 1.0e4f));
     EXPECT_EQ(cs.distance.size(), 6u);
     EXPECT_EQ(cs.volume.size(), 1u);
-    EXPECT_EQ(cs.bend.size(), 0u);
     EXPECT_EQ(cs.shape_match.size(), 0u);
     for (const auto& d : cs.distance) EXPECT_FLOAT_EQ(d.compliance_alpha, 1.0e-4f);
     EXPECT_FLOAT_EQ(cs.volume[0].compliance_alpha, 1.0e-4f);
@@ -231,7 +137,6 @@ TEST(XpbdCookerShapeMatch, CooksOneClusterOverAllParticles) {
     const auto spec = ShapeMatchSpec(0.5f);
     const auto cs = CookXpbdSoftBody(spec);
     EXPECT_EQ(cs.distance.size(), 0u);
-    EXPECT_EQ(cs.bend.size(), 0u);
     EXPECT_EQ(cs.volume.size(), 0u);
     ASSERT_EQ(cs.shape_match.size(), 1u);
 
@@ -259,8 +164,7 @@ TEST(XpbdCookerShapeMatch, EmptySpecCooksNoCluster) {
 
 TEST(XpbdCookerDeterminism, RepeatedCooksAreByteIdentical) {
     const std::vector<XpbdSoftBodySpec> specs = {
-        QuadClothSpec(1.0e4f), GridClothSpec(), TetSpec(true, 250.0f),
-        ShapeMatchSpec(0.7f)};
+        TetSpec(true, 250.0f), ShapeMatchSpec(0.7f)};
     for (const auto& spec : specs) {
         const std::string golden = ConstraintBytes(CookXpbdSoftBody(spec));
         for (int run = 0; run < 4; ++run) {

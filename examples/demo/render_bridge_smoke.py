@@ -27,8 +27,8 @@ NX, NY = 55, 51                 # cloth lattice (~1.30 m x 1.20 m at 24 mm spaci
 SPACING = 0.024
 PARTICLE_MASS = 0.012
 FRICTION = 1.8                  # high Coulomb grip so the drape seats, not slides.
-BEND_ALPHA = 0.09               # soft folds, no sharp kinks.
-ITERS = 80
+STRETCH = 5.0e3                 # Young's modulus x thickness, N/m.
+BEND = 5.0e-5                   # soft folds, no sharp kinks.
 CONTACT_RADIUS = 0.022          # particle sphere radius (d_min = 44 mm).
 STAND_BASE_Z = 0.32             # base height for the crouch.
 LIFT = 0.58                     # release height above the crouch base.
@@ -96,7 +96,7 @@ def main():
         cloth_nx=NX, cloth_ny=NY, cloth_spacing=SPACING,
         cloth_origin_x=0.0, cloth_origin_y=0.0, cloth_origin_z=STAND_BASE_Z + LIFT,
         cloth_particle_mass=PARTICLE_MASS, cloth_friction=FRICTION,
-        cloth_bend_alpha=BEND_ALPHA, cloth_iters=ITERS, contact_radius=CONTACT_RADIUS,
+        cloth_stretch_stiffness=STRETCH, cloth_bend_stiffness=BEND, contact_radius=CONTACT_RADIUS,
         cloth_free=True, aero_normal=AERO_N, aero_tangent=AERO_T, aero_max_dv=AERO_CLAMP)
 
     L = int(world.base_link_count)

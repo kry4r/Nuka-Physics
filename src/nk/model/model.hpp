@@ -22,6 +22,7 @@
 #include "math/vec3.hpp"
 #include "nk/contact/contact_profile.hpp"
 #include "nk/material/mpm_material.hpp"
+#include "nk/solve/vertex_block.hpp"
 #include "sensor/state_types.hpp"
 #include "phi/backend.hpp"   // phi::ModelView, BufferType, Buffer (forward + wrappers)
 #include "nk/model/generated/field_ids.hpp"
@@ -59,7 +60,6 @@ struct ModelCapacities {
     uint32_t max_mesh_bvh_nodes   = 0;
     uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
     uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
-    uint32_t bend_cons_per_env    = 0;  // XPBD bend-constraint count / env.
     uint32_t vol_cons_per_env     = 0;  // XPBD volume-constraint count / env.
     // M9 T11 shape-match (XPBD id 9) capacities: per-env cluster slot count +
     // the total flat cluster-MEMBER pool size (sum_c n_c). 0 == no shape-match.
@@ -77,10 +77,16 @@ struct ModelCapacities {
     // is an independent constraint set sharing no particle). Built by
     // nk::XpbdColoring; size the per-family color-segment tables (pairs/color).
     uint32_t xpbd_dist_colors = 0;
-    uint32_t xpbd_bend_colors = 0;
     uint32_t xpbd_vol_colors  = 0;
     uint32_t xpbd_sm_colors   = 0;
     uint32_t particle_topology_incidence_count = 0;
+    // Vertex blocks occupy particles [vbd_particle_begin, + vbd_vertices_per_env) of each env.
+    uint32_t vbd_particle_begin = 0u;
+    uint32_t vbd_vertices_per_env = 0u;
+    uint32_t vbd_dynamic_vertices_per_env = 0u;
+    uint32_t vbd_elements_per_env = 0u;
+    uint32_t vbd_incidence_per_env = 0u;
+    uint32_t vbd_colors = 0u;
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
@@ -150,6 +156,9 @@ struct ModelCapacities {
     // scalar fields counted once per env unless they are global). mat_buckets is
     // the one symbolic per:scalar field; its count = num_material_buckets*8.
     uint64_t ElementCount(FieldId id) const;
+    // Body-particle contact slots of one env above the rigid budget; grid-owned particles hold none.
+    // Vertex blocks reserve them too, so a cloth world always runs the common solve.
+    uint64_t ParticleContactReserve(uint32_t grid_particles) const;
 };
 
 // A cook-time articulation template (one per env, replicated). The arrays are
@@ -334,7 +343,7 @@ public:
     float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
 
     // -- M6: particle (XPBD soft + PBF fluid) cook product --------------------
-    // The XPBD constraint templates (dist/bend/vol, owner:model) are staged by
+    // The XPBD constraint templates (dist/vol, owner:model) are staged by
     // UploadTo; the particle initial state (pos/prev/vel/inv_mass) is seeded by
     // World::SeedInitialState. PBF params are resolved into the ParticleGridBuild
     // + Pbf* op params by Pipeline::Build. A scene with no particles leaves these
@@ -380,9 +389,6 @@ public:
         // XPBD constraint templates (single-env; staged + dispatched per env).
         std::vector<uint32_t> dist_a, dist_b;     // distance endpoints
         std::vector<float>    dist_rest, dist_alpha;
-        std::vector<uint32_t> bend_particles;     // 4 / bend constraint
-        std::vector<float> bend_rest_angle;
-        std::vector<float>    bend_alpha;
         std::vector<uint32_t> vol_particles;      // 4 / volume constraint
         std::vector<float>    vol_rest6, vol_alpha;
         // M9 T11 XPBD SHAPE-MATCH (id 9) cluster templates (single-env; CSR
@@ -405,6 +411,12 @@ public:
         std::vector<uint32_t>   aero_particle_offset;
         std::vector<uint32_t>   aero_particle_count;
         std::vector<uint32_t>   aero_incident_tri;
+        // Vertex-block elastic elements and static color classes (see vertex_block.hpp).
+        std::vector<VbdElement> vbd_elements;
+        std::vector<uint32_t>   vbd_incidence_offsets;
+        std::vector<uint32_t>   vbd_incidence;
+        std::vector<uint32_t>   vbd_color_vertices;
+        std::vector<uint32_t>   vbd_color_segments;  // (first, count) per color
         // Anisotropic air-drag coefficients (lumped 0.5*rho*Cn, 0.5*rho*Ct). Both
         // default 0 -> the drag op is inert (a drag-free world stays byte-identical).
         // Cn >> Ct (normal-dominant) is what destabilizes a flat falling sheet into
@@ -525,7 +537,6 @@ public:
     // UploadTo; staged into the *_color_segments Model fields). Each is a flat
     // {offset, count} u32 PAIR per color over the single-env constraint template.
     std::vector<uint32_t> dist_color_segments;
-    std::vector<uint32_t> bend_color_segments;
     std::vector<uint32_t> vol_color_segments;
     std::vector<uint32_t> sm_color_segments;
     // Convex hull geometry + SDF grids are referenced by ModelShape indices and
@@ -629,6 +640,7 @@ public:
     // freed in the dtor. Returns Status::Ok / OutOfMemory.
     phi::Status UploadTo(phi::BufferType* bt, phi::ModelView* out_view);
     phi::Status ValidateTopology(std::string* reason = nullptr) const;
+    phi::Status ValidateVertexBlocks(std::string* reason = nullptr) const;
     void BuildAeroAdjacency();
     void BuildParticleTopology();
 

@@ -122,6 +122,27 @@ nuka_result_t nuka_world_upload_field(nuka_world_handle world,
         const auto status = record->world->GetData().UploadFieldStatus(
             row->field_id, bytes, static_cast<uint64_t>(nbytes),
             static_cast<uint64_t>(byte_offset));
+        if (status == nuka::phi::Status::Ok &&
+            (row->field_id == nuka::nk::FieldId::ParticlePos ||
+             row->field_id == nuka::nk::FieldId::ParticleVel)) {
+            const auto& caps = record->world->GetModel().capacities;
+            if (caps.vbd_vertices_per_env > 0u) {
+                const uint64_t first = byte_offset / sizeof(nuka::math::Vec3);
+                const uint64_t last = (byte_offset + nbytes - 1u) / sizeof(nuka::math::Vec3);
+                const uint32_t clear = 0u;
+                for (uint32_t env = 0u; env < caps.env_count; ++env) {
+                    const uint64_t begin = uint64_t{env} * caps.particles_per_env +
+                                           caps.vbd_particle_begin;
+                    const uint64_t end = begin + caps.vbd_vertices_per_env;
+                    if (first >= end || last < begin) continue;
+                    const auto cleared = record->world->GetData().UploadFieldStatus(
+                        nuka::nk::FieldId::VbdHistoryReady, &clear, sizeof(clear),
+                        uint64_t{env} * sizeof(clear));
+                    if (cleared != nuka::phi::Status::Ok)
+                        return nuka::c_abi::MapStatusToResult(cleared);
+                }
+            }
+        }
         return nuka::c_abi::MapStatusToResult(status);  // over-range == LOUD.
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

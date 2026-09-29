@@ -267,7 +267,7 @@ struct MjcfParseContext {
 
 scene::ShapeType MjcfGeomType(const char* type_str) {
     if (!type_str) {
-        return scene::ShapeType::Box;
+        return scene::ShapeType::Sphere;
     }
     const std::string t(type_str);
     if (t == "sphere") {
@@ -285,7 +285,7 @@ scene::ShapeType MjcfGeomType(const char* type_str) {
     if (t == "mesh") {
         return scene::ShapeType::TriMesh;
     }
-    return scene::ShapeType::Box;
+    throw std::runtime_error("MJCF: unsupported geom type '" + t + "'");
 }
 
 scene::DecomposeMode DecomposeModeFromToken(const char* token) {
@@ -795,9 +795,7 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         const char* geom_class = geom->Attribute("class");
         const MjcfGeomDefaults& gd =
             DefaultClassOrRoot(context.defaults, geom_class ? geom_class : child_class).geom;
-        // Type precedence (low -> high): record default (Box) < class default
-        // (if authored) < the geom's own explicit `type`. An explicit geom type
-        // wins; otherwise the class default supplies it.
+        // An explicit type overrides the class default; MJCF defaults to a sphere.
         if (const char* geom_type = geom->Attribute("type")) {
             shape.type = MjcfGeomType(geom_type);
         } else if (gd.has_type) {

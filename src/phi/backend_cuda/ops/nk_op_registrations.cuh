@@ -27,6 +27,7 @@ void RegisterNkAssembleRowsOps();     // assemble_rows.cu (M4)
 void RegisterNkBuildSolveIslandsOps(); // build_islands.cu (dynamic CC schedule)
 void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
 void RegisterNkParticleOps();         // particles.cu (M6)
+void RegisterNkVertexBlockOps();      // vertex_blocks.cu
 void RegisterNkMpmOps();              // mpm.cu (MLS-MPM transfers)
 void RegisterNkReadoutOps();          // readout.cu
 void RegisterNkSensorOps();

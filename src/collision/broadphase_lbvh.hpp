@@ -133,11 +133,8 @@ LbvhBroadphaseResult BuildLbvhBroadphase(const collision::AABB* device_aabbs,
                                          uint32_t count,
                                          uint32_t max_pairs_hint = 0u);
 
-// v0.7 p05: build an LBVH and RETAIN the node tree for subsequent traversal
-// (e.g. cross-system particle->rigid queries). Identical pipeline to
-// BuildLbvhBroadphase; the only difference is the result keeps the node buffer
-// (DeviceNodes() / HasNodes()) instead of destroying it. The pair list is still
-// produced (callers that only need the tree can ignore it).
+// Build and retain the LBVH nodes for traversal without enumerating overlap pairs.
+// PairCount() is zero; callers read DeviceNodes() and HasNodes().
 LbvhBroadphaseResult BuildLbvhForQuery(cudaStream_t stream, int device_id,
                                        const collision::AABB* device_aabbs,
                                        uint32_t count,

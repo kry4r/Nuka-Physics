@@ -542,25 +542,25 @@ cook::MpmCookInput BuildGranularColumn() {
     return in;
 }
 
-// A perimeter-pinned cloth membrane (XPBD), so the corners are anchored and the
+// A perimeter-pinned vertex-block cloth membrane, so the corners are anchored and the
 // interior sags -- a pinned particle would move only if the MPM transfer wrongly
 // overwrote it, so the anchors double as the no-cross-corruption probe.
 cook::XpbdCookInput BuildPinnedMembrane(uint32_t n) {
     ns::MediaRecord m;
     m.kind = ns::MediaRecord::Kind::Cloth;
-    m.method = ns::MediaRecord::Method::Xpbd;
+    m.method = ns::MediaRecord::Method::Vbd;
     m.cloth_grid.nx = n; m.cloth_grid.ny = n;
     m.cloth_grid.spacing = kClothSpacing;
     m.cloth_grid.origin = Vec3{0.0f, 0.0f, kClothZ};
     m.cloth_grid.free = false;    // pin the perimeter (interior sags).
     m.xpbd.particle_mass = 0.01f;
-    m.xpbd.iters = 8u;
-    m.xpbd.distance_alpha = 1.0e-7f;
-    m.xpbd.bend_alpha = 1.0e-4f;
+    m.xpbd.stretch_stiffness = 1.0e4f;
+    m.xpbd.poisson = 0.3f;
+    m.xpbd.bend_stiffness = 1.0e-4f;
     m.xpbd.aero_drag_normal = 0.6f;
     m.xpbd.aero_drag_tangent = 0.04f;
     m.xpbd.aero_drag_max_dv = 0.5f;
-    return cook::BuildClothXpbdInput(m);
+    return cook::BuildClothVertexBlockInput(m);
 }
 
 }  // namespace
@@ -595,10 +595,11 @@ TEST(NkMpmXpbdCoResidence, SupersetMatchesSingleSystemCook) {
         cook::CookXpbdParticles(b, 1u, cloth);
         EXPECT_EQ(a.particles.mode, nk::Model::ParticleMode::Xpbd);
         EXPECT_EQ(a.capacities.particles_per_env, b.capacities.particles_per_env);
-        EXPECT_EQ(a.capacities.dist_cons_per_env, b.capacities.dist_cons_per_env);
-        ASSERT_EQ(a.particles.dist_a.size(), b.particles.dist_a.size());
-        EXPECT_EQ(std::memcmp(a.particles.dist_a.data(), b.particles.dist_a.data(),
-                              a.particles.dist_a.size() * sizeof(uint32_t)), 0);
+        EXPECT_EQ(a.capacities.vbd_vertices_per_env, b.capacities.vbd_vertices_per_env);
+        EXPECT_EQ(a.capacities.vbd_colors, b.capacities.vbd_colors);
+        ASSERT_EQ(a.particles.vbd_elements.size(), b.particles.vbd_elements.size());
+        EXPECT_EQ(std::memcmp(a.particles.vbd_elements.data(), b.particles.vbd_elements.data(),
+                              a.particles.vbd_elements.size() * sizeof(nk::VbdElement)), 0);
     }
 }
 
@@ -624,10 +625,11 @@ TEST(NkMpmXpbdCoResidence, CoResidentCookLayout) {
     for (uint32_t i = 0; i < n_xpbd; ++i)
         EXPECT_EQ(std::memcmp(&mp.initial_pos[n_mpm + i], &cloth.positions[i],
                               sizeof(Vec3)), 0);
-    // Every XPBD distance constraint references the XPBD slice [n_mpm, P).
-    ASSERT_FALSE(mp.dist_a.empty());
-    for (uint32_t v : mp.dist_a) { EXPECT_GE(v, n_mpm); EXPECT_LT(v, n_mpm + n_xpbd); }
-    for (uint32_t v : mp.dist_b) { EXPECT_GE(v, n_mpm); EXPECT_LT(v, n_mpm + n_xpbd); }
+    // The cloth vertex blocks cover exactly the soft slice [n_mpm, P).
+    ASSERT_FALSE(mp.vbd_elements.empty());
+    EXPECT_EQ(m.capacities.vbd_particle_begin, n_mpm);
+    EXPECT_EQ(m.capacities.vbd_vertices_per_env, n_xpbd);
+    EXPECT_TRUE(mp.dist_a.empty());
     // The MPM continuum fields stay sized to the MPM slice.
     EXPECT_EQ(mp.initial_vol0.size(), n_mpm);
     EXPECT_EQ(mp.initial_material_id.size(), n_mpm);
@@ -644,7 +646,7 @@ TEST(NkMpmXpbdCoResidence, CoStepNoCrossCorruptionAndD1) {
     const uint32_t n_xpbd = static_cast<uint32_t>(cloth.positions.size());
     constexpr uint32_t E = 2u;   // catches per-env sub-slice striding bugs.
 
-    // The pinned cloth corners: perimeter particles (BuildClothXpbdInput pins the
+    // The pinned cloth corners: perimeter particles (BuildClothVertexBlockInput pins the
     // whole perimeter of the n x n lattice, laid out row-major).
     const uint32_t nx = 5u;
 
@@ -697,12 +699,11 @@ TEST(NkMpmXpbdCoResidence, CoStepNoCrossCorruptionAndD1) {
             EXPECT_NEAR(env[c].z, kClothZ, 1.0e-3f)
                 << "a pinned cloth corner moved (cross-corruption) env " << e;
         }
-        // The interior sags strictly below the pinned corners under gravity (a fully
-        // inert cloth would stay exactly at kClothZ). The stiff (alpha 1e-7) small
-        // membrane bows only microns, so the margin is small but deterministic (D1).
+        // The interior sags strictly below the pinned corners under gravity; a fully
+        // inert cloth would stay exactly at kClothZ.
         const uint32_t center = n_mpm + (nx / 2u) * nx + (nx / 2u);
         EXPECT_LT(env[center].z, kClothZ - 1.0e-5f)
-            << "the cloth interior did not sag -- XPBD inert? env " << e
+            << "the cloth interior did not sag -- vertex blocks inert? env " << e
             << " center_z " << env[center].z;
         EXPECT_GT(env[center].z, kClothZ - 0.10f)
             << "the cloth interior collapsed -- overwritten by G2P? env " << e;

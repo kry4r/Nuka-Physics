@@ -142,14 +142,13 @@ void CaptureArticulationHostMirror(const scene::SceneIR& scene, WorldRecord* rec
 }
 
 // Translate the compact coupled cloth slots into a first-class scene MediaRecord
-// (Cloth, XPBD by default / MLS-MPM when soft_sim_method selects it). The cook's
-// BuildClothXpbdInput reads this record; distance_alpha stays 0 (an inextensible
-// cloth), support fields are XPBD-only. Geometry-only when the extent is absent.
+// (vertex-block Cloth; MLS-MPM when soft_sim_method selects it, which the cook
+// rejects). BuildClothVertexBlockInput reads it. Geometry-only when the extent is absent.
 nuka::scene::MediaRecord ClothMediaFromDesc(const nuka_coupled_particles_desc_t& p) {
     nuka::scene::MediaRecord m;
     m.kind = nuka::scene::MediaRecord::Kind::Cloth;
     m.method = (p.soft_sim_method == 1u) ? nuka::scene::MediaRecord::Method::MlsMpm
-                                         : nuka::scene::MediaRecord::Method::Xpbd;
+                                         : nuka::scene::MediaRecord::Method::Vbd;
     m.cloth_grid.nx = p.cloth_nx;
     m.cloth_grid.ny = p.cloth_ny;
     m.cloth_grid.spacing = p.cloth_spacing;
@@ -157,9 +156,10 @@ nuka::scene::MediaRecord ClothMediaFromDesc(const nuka_coupled_particles_desc_t&
     m.cloth_grid.free = (p.cloth_free != 0u);
     m.xpbd.particle_mass = p.cloth_particle_mass;
     m.xpbd.friction = p.cloth_friction;
-    m.xpbd.distance_alpha = 0.0f;  // inextensible cloth (the legacy hardcoded value).
-    m.xpbd.bend_alpha = p.cloth_bend_alpha;
-    m.xpbd.iters = static_cast<uint16_t>(p.cloth_iters);
+    m.xpbd.stretch_stiffness = p.cloth_stretch_stiffness;
+    m.xpbd.bend_stiffness = p.cloth_bend_stiffness;
+    m.xpbd.poisson = p.cloth_poisson;
+    m.xpbd.damping = p.cloth_damping;
     m.xpbd.aero_drag_normal = p.aero_normal;
     m.xpbd.aero_drag_tangent = p.aero_tangent;
     m.xpbd.aero_drag_max_dv = p.aero_max_dv;
@@ -451,7 +451,9 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 uint32_t solver_vel_iters,
                                 uint32_t solver_pos_iters,
                                 float solver_contact_margin,
-                                uint32_t solver_max_pairs) {
+                                uint32_t solver_max_pairs,
+                                uint32_t cloth_integrator) {
+    if (cloth_integrator > 1u) return NUKA_RESULT_INVALID_ARG;
     // ApplyControlTerrainGravity ran before the Model move, but keep the public
     // task-link option explicit on the shared world-assembly path.
     cooked_model.osc_task_link = osc_task_link;
@@ -474,6 +476,7 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
     if (solver_pos_iters != 0u) cfg.pos_iters = static_cast<uint16_t>(solver_pos_iters);
     if (solver_contact_margin > 0.0f) cfg.contact_margin = solver_contact_margin;
     if (solver_max_pairs != 0u) cfg.max_pairs = solver_max_pairs;
+    cfg.cloth_integrator = cloth_integrator;
 
     record->world = std::make_unique<nuka::nk::World>(
         std::move(cooked_model), env_count, device_record->phi_device,
@@ -533,7 +536,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             desc->env_count, prepared.control_mode, prepared.gravity,
             desc->osc_task_link, out, desc->solver_vel_iters,
             desc->solver_pos_iters, desc->solver_contact_margin,
-            desc->solver_max_pairs);
+            desc->solver_max_pairs, desc->cloth_integrator);
         if (made == NUKA_RESULT_OK) {
             if (auto* rec = nuka::c_abi::WorldTable().Get(*out)) {
                 rec->scene_dir =
@@ -544,6 +547,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
+        std::fprintf(stderr, "[World] scene create: %s\n", error.what());
         return nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
@@ -620,7 +624,8 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             desc->env_count, prepared.control_mode, prepared.gravity,
             desc->osc_task_link, out,
             particles->solver_vel_iters, particles->solver_pos_iters,
-            particles->solver_contact_margin, particles->solver_max_pairs);
+            particles->solver_contact_margin, particles->solver_max_pairs,
+            particles->cloth_integrator);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr) {
                 record->particle_surfaces = std::move(media_surfaces);
@@ -632,6 +637,7 @@ nuka_result_t nuka_world_create_coupled_from_scene(
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
+        std::fprintf(stderr, "[World] coupled create: %s\n", error.what());
         return nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {
         return NUKA_RESULT_INTERNAL;

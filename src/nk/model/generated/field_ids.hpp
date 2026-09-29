@@ -130,10 +130,6 @@ enum class FieldId : uint16_t {
     DistRestLength,  // dist_rest_length (per:dist_con arena:persistent owner:model)
     DistCompliance,  // dist_compliance (per:dist_con arena:persistent owner:model flags:[param])
     DistLambda,  // dist_lambda (per:dist_con arena:persistent owner:data)
-    BendParticles,  // bend_particles (per:bend_con arena:persistent owner:model elem:4)
-    BendRestAngle,  // bend_rest_angle (per:bend_con arena:persistent owner:model)
-    BendCompliance,  // bend_compliance (per:bend_con arena:persistent owner:model flags:[param])
-    BendLambda,  // bend_lambda (per:bend_con arena:persistent owner:data)
     VolParticles,  // vol_particles (per:vol_con arena:persistent owner:model elem:4)
     VolRestTimes6,  // vol_rest_times6 (per:vol_con arena:persistent owner:model)
     VolCompliance,  // vol_compliance (per:vol_con arena:persistent owner:model flags:[param])
@@ -195,7 +191,6 @@ enum class FieldId : uint16_t {
     SnapshotParticlePrevPos,  // snapshot_particle_prev_pos (per:particle arena:persistent owner:data)
     SnapshotParticleVel,  // snapshot_particle_vel (per:particle arena:persistent owner:data)
     DistColorSegments,  // dist_color_segments (per:scalar arena:persistent owner:model count:xpbd_dist_colors*2)
-    BendColorSegments,  // bend_color_segments (per:scalar arena:persistent owner:model count:xpbd_bend_colors*2)
     VolColorSegments,  // vol_color_segments (per:scalar arena:persistent owner:model count:xpbd_vol_colors*2)
     SmColorSegments,  // sm_color_segments (per:scalar arena:persistent owner:model count:xpbd_sm_colors*2)
     GridSortScratch,  // grid_sort_scratch (per:scalar arena:scratch owner:data count:grid_sort_scratch_bytes)
@@ -351,6 +346,19 @@ enum class FieldId : uint16_t {
     ContactSolveCounts,  // contact_solve_counts (per:env arena:scratch owner:data elem:2 flags:[readout])
     PairSampleChunks,  // pair_sample_chunks (per:scalar arena:scratch owner:data count:pair_sample_chunk_words)
     SolveColorScratch,  // solve_color_scratch (per:scalar arena:scratch owner:data count:solve_color_scratch_words)
+    VbdElements,  // vbd_elements (per:scalar arena:persistent owner:model count:vbd_elements_per_env)
+    VbdIncidenceOffsets,  // vbd_incidence_offsets (per:scalar arena:persistent owner:model count:vbd_vertices_per_env+1)
+    VbdIncidence,  // vbd_incidence (per:scalar arena:persistent owner:model count:vbd_incidence_per_env)
+    VbdColorVertices,  // vbd_color_vertices (per:scalar arena:persistent owner:model count:vbd_dynamic_vertices_per_env)
+    VbdColorSegments,  // vbd_color_segments (per:scalar arena:persistent owner:model count:vbd_colors*2)
+    ParticleResponse,  // particle_response (per:particle arena:scratch owner:data)
+    VbdTarget,  // vbd_target (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    VbdOffset,  // vbd_offset (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    VbdInertia,  // vbd_inertia (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    VbdRowImpulse,  // vbd_row_impulse (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    VbdWritten,  // vbd_written (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    VbdHistoryVel,  // vbd_history_vel (per:scalar arena:persistent owner:data count:vbd_vertices_per_env*env_count)
+    VbdHistoryReady,  // vbd_history_ready (per:env arena:persistent owner:data)
     Count
 };
 
@@ -476,10 +484,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "dist_rest_length",
     "dist_compliance",
     "dist_lambda",
-    "bend_particles",
-    "bend_rest_angle",
-    "bend_compliance",
-    "bend_lambda",
     "vol_particles",
     "vol_rest_times6",
     "vol_compliance",
@@ -541,7 +545,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "snapshot_particle_prev_pos",
     "snapshot_particle_vel",
     "dist_color_segments",
-    "bend_color_segments",
     "vol_color_segments",
     "sm_color_segments",
     "grid_sort_scratch",
@@ -697,6 +700,19 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_solve_counts",
     "pair_sample_chunks",
     "solve_color_scratch",
+    "vbd_elements",
+    "vbd_incidence_offsets",
+    "vbd_incidence",
+    "vbd_color_vertices",
+    "vbd_color_segments",
+    "particle_response",
+    "vbd_target",
+    "vbd_offset",
+    "vbd_inertia",
+    "vbd_row_impulse",
+    "vbd_written",
+    "vbd_history_vel",
+    "vbd_history_ready",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

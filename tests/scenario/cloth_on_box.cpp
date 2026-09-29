@@ -57,17 +57,17 @@ nk::Pipeline::SolverConfig Cfg() {
 cook::XpbdCookInput MakeClothPanel(uint32_t n, float z) {
     ns::MediaRecord m;
     m.kind = ns::MediaRecord::Kind::Cloth;
-    m.method = ns::MediaRecord::Method::Xpbd;
+    m.method = ns::MediaRecord::Method::Vbd;
     m.cloth_grid.nx = n; m.cloth_grid.ny = n;
     m.cloth_grid.spacing = kSpacing;
     m.cloth_grid.origin = Vec3{0.0f, 0.0f, z};
     m.cloth_grid.free = true;  // a free drape (no pinned perimeter).
     m.xpbd.particle_mass = 0.01f;
-    m.xpbd.iters = 8u;
-    m.xpbd.distance_alpha = 1.0e-7f;
-    m.xpbd.bend_alpha = 1.0e-4f;
+    m.xpbd.stretch_stiffness = 1.0e4f;
+    m.xpbd.poisson = 0.3f;
+    m.xpbd.bend_stiffness = 1.0e-4f;
     m.xpbd.friction = 0.6f;
-    return cook::BuildClothXpbdInput(m);
+    return cook::BuildClothVertexBlockInput(m);
 }
 
 void AddBox(nk::Model& m, const Vec3& pos, float half, int32_t body_id,

@@ -74,11 +74,10 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx =
             tris.push_back(soft::ClothTriangle{{idx(i, j), idx(i + 1, j + 1),
                                                 idx(i, j + 1)}});
         }
-    soft::ClothTopologyOptions opts;
-    opts.distance_compliance_alpha = 0.0f;
-    opts.bend_compliance_alpha = 1.0e-4f;
-    soft::XpbdConstraintSet cs;
-    soft::BuildClothConstraints(rest, tris, opts, cs);
+    soft::ShellMaterial shell;
+    shell.stretch_stiffness = 1.0e4f;
+    shell.poisson = 0.3f;
+    shell.bend_stiffness = 1.0e-5f;
 
     cook::XpbdCookInput in;
     in.positions = rest;
@@ -89,19 +88,8 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx =
         in.inv_mass[idx(k, 0)] = 0.0f; in.inv_mass[idx(k, last)] = 0.0f;
         in.inv_mass[idx(0, k)] = 0.0f; in.inv_mass[idx(last, k)] = 0.0f;
     }
-    for (const auto& dc : cs.distance) {
-        cook::CookDistanceCon c;
-        c.a = dc.particle_a; c.b = dc.particle_b;
-        c.rest_length = dc.rest_length; c.compliance_alpha = dc.compliance_alpha;
-        in.distance.push_back(c);
-    }
-    for (const auto& bc : cs.bend) {
-        cook::CookBendCon c;
-        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
-        c.rest_angle = bc.rest_angle;
-        c.compliance_alpha = bc.compliance_alpha;
-        in.bend.push_back(c);
-    }
+    soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
+    in.vbd_count = static_cast<uint32_t>(rest.size());
     in.solver_iterations = kClothIters;
     for (const auto& triangle : tris)
         in.aero_triangles.push_back({triangle.v[0], triangle.v[1], triangle.v[2]});

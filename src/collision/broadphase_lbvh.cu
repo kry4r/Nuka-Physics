@@ -536,6 +536,12 @@ static LbvhBroadphaseResult BuildLbvhImpl(cudaStream_t stream, int device_id,
         static_cast<uint32_t*>(d_visit.Base()));
     CheckCuda(cudaGetLastError(), "PropagateAabbsKernel launch");
 
+    if (retain_nodes) {
+        OwnedBuffer empty_pairs(0u);
+        return LbvhBroadphaseResult(count, 0u, 0u, empty_pairs.Release(),
+                                    d_nodes.Release(), false);
+    }
+
     // --- 6. Overlap traversal -> compact pair list -------------------------
     OwnedBuffer d_pairs(pair_capacity * sizeof(collision::CollisionPair));
     OwnedBuffer d_pair_count(sizeof(uint32_t));

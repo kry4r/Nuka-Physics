@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "core/checked_size.hpp"
+#include "collision/contact_capacity.hpp"
 #include "collision/mesh_surface.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "nk/contact/contact_identity.hpp"
@@ -53,7 +54,7 @@ bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
         if (!std::isfinite(*value)) return false;
         *value = CanonicalZero(*value);
     }
-    if (p.mu1 < 0.0f || p.mu2 < 0.0f || p.margin != 0.0f || p.gap != 0.0f)
+    if (p.mu1 < 0.0f || p.mu2 < 0.0f || p.margin < 0.0f || p.gap < 0.0f)
         return false;
     *canonical = ModelMaterialBucket(p);
     return true;
@@ -71,7 +72,6 @@ uint64_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::RowDof:         return CheckedProduct({max_rows_per_env, dofs_per_env});
         case FieldPer::Particle:       return particles_per_env;
         case FieldPer::DistCon:        return dist_cons_per_env;
-        case FieldPer::BendCon:        return bend_cons_per_env;
         case FieldPer::VolCon:         return vol_cons_per_env;
         case FieldPer::ShapeMatchSlot:   return shape_match_slots_per_env;
         case FieldPer::ShapeMatchMember: return shape_match_members_per_env;
@@ -95,6 +95,13 @@ uint64_t ModelCapacities::PerEnvCount(FieldPer per) const {
 uint64_t ModelCapacities::NeighborPoolCapacity() const {
     if (neighbor_pool_capacity_per_env != 0u) return neighbor_pool_capacity_per_env;
     return static_cast<uint64_t>(particles_per_env) * phi::kDefaultParticleNeighborBudget;
+}
+
+uint64_t ModelCapacities::ParticleContactReserve(uint32_t grid_particles) const {
+    if ((bodies_per_env == 0u && vbd_vertices_per_env == 0u) || grid_particles >= particles_per_env)
+        return 0u;
+    return uint64_t{particles_per_env - grid_particles} *
+           collision::kBodyParticleContactSlotsPerParticle;
 }
 
 uint64_t ModelCapacities::ElementCount(FieldId id) const {
@@ -142,7 +149,18 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
          id == FieldId::GridNeighborIdx)) {
         return 0u;
     }
+    if (vbd_vertices_per_env == 0u &&
+        (id == FieldId::ParticleResponse || id == FieldId::VbdHistoryReady)) return 0u;
     if (lay.per == FieldPer::Scalar) {
+        if (id == FieldId::VbdElements) return vbd_elements_per_env;
+        if (id == FieldId::VbdIncidenceOffsets)
+            return vbd_vertices_per_env > 0u ? uint64_t{vbd_vertices_per_env} + 1u : 0u;
+        if (id == FieldId::VbdIncidence) return vbd_incidence_per_env;
+        if (id == FieldId::VbdColorVertices) return vbd_dynamic_vertices_per_env;
+        if (id == FieldId::VbdColorSegments) return uint64_t{vbd_colors} * 2u;
+        if (id == FieldId::VbdTarget || id == FieldId::VbdOffset || id == FieldId::VbdInertia ||
+            id == FieldId::VbdRowImpulse || id == FieldId::VbdWritten || id == FieldId::VbdHistoryVel)
+            return CheckedProduct({vbd_vertices_per_env, env_count});
         if (id == FieldId::ParticleSurfaceInfo || id == FieldId::ParticleSurfaceThickness ||
             id == FieldId::ParticleSurfaceFriction) return particle_surfaces_per_env;
         if (id == FieldId::ParticleSurfaceTriangles) return uint64_t{particle_surface_triangles} * 3u;
@@ -277,9 +295,6 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // color, GLOBAL (single-env template). 0 colors -> a zero-byte segment.
         if (id == FieldId::DistColorSegments) {
             return static_cast<uint64_t>(xpbd_dist_colors) * 2ull;
-        }
-        if (id == FieldId::BendColorSegments) {
-            return static_cast<uint64_t>(xpbd_bend_colors) * 2ull;
         }
         if (id == FieldId::VolColorSegments) {
             return static_cast<uint64_t>(xpbd_vol_colors) * 2ull;
@@ -675,11 +690,6 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                 std::memcpy(dst, dist_color_segments.data(),
                             dist_color_segments.size() * sizeof(uint32_t));
             break;
-        case FieldId::BendColorSegments:
-            if (!bend_color_segments.empty())
-                std::memcpy(dst, bend_color_segments.data(),
-                            bend_color_segments.size() * sizeof(uint32_t));
-            break;
         case FieldId::VolColorSegments:
             if (!vol_color_segments.empty())
                 std::memcpy(dst, vol_color_segments.data(),
@@ -692,6 +702,21 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         case FieldId::ParticleTopologyOffsets:
             std::memcpy(dst, particles.topology_offsets.data(), seg.bytes);
+            break;
+        case FieldId::VbdElements:
+            std::memcpy(dst, particles.vbd_elements.data(), seg.bytes);
+            break;
+        case FieldId::VbdIncidenceOffsets:
+            std::memcpy(dst, particles.vbd_incidence_offsets.data(), seg.bytes);
+            break;
+        case FieldId::VbdIncidence:
+            std::memcpy(dst, particles.vbd_incidence.data(), seg.bytes);
+            break;
+        case FieldId::VbdColorVertices:
+            std::memcpy(dst, particles.vbd_color_vertices.data(), seg.bytes);
+            break;
+        case FieldId::VbdColorSegments:
+            std::memcpy(dst, particles.vbd_color_segments.data(), seg.bytes);
             break;
         case FieldId::ParticleTopologyElements:
             std::memcpy(dst, particles.topology_elements.data(), seg.bytes);
@@ -726,30 +751,6 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         case FieldId::DistCompliance:
             StampPerLink(dst, particles.dist_alpha, capacities.dist_cons_per_env, E,
-                         sizeof(float));
-            break;
-        case FieldId::BendParticles: {
-            auto* p = reinterpret_cast<uint32_t*>(dst);
-            const uint32_t bn = capacities.bend_cons_per_env;
-            const uint32_t pn = capacities.particles_per_env;
-            for (uint32_t e = 0; e < E; ++e) {
-                for (uint32_t c = 0; c < bn; ++c) {
-                    for (uint32_t j = 0; j < 4u; ++j) {
-                        const size_t si = static_cast<size_t>(c) * 4u + j;
-                        if (si >= particles.bend_particles.size()) continue;
-                        p[(static_cast<size_t>(e) * bn + c) * 4u + j] =
-                            particles.bend_particles[si] + e * pn;
-                    }
-                }
-            }
-            break;
-        }
-        case FieldId::BendRestAngle:
-            StampPerLink(dst, particles.bend_rest_angle, capacities.bend_cons_per_env, E,
-                         sizeof(float));
-            break;
-        case FieldId::BendCompliance:
-            StampPerLink(dst, particles.bend_alpha, capacities.bend_cons_per_env, E,
                          sizeof(float));
             break;
         case FieldId::VolParticles: {
@@ -1046,9 +1047,6 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::DistParticleB:         v.dist_particle_b = static_cast<uint32_t*>(p); break;
         case FieldId::DistRestLength:        v.dist_rest_length = static_cast<float*>(p); break;
         case FieldId::DistCompliance:        v.dist_compliance = static_cast<float*>(p); break;
-        case FieldId::BendParticles:         v.bend_particles = static_cast<uint32_t*>(p); break;
-        case FieldId::BendRestAngle:         v.bend_rest_angle = static_cast<float*>(p); break;
-        case FieldId::BendCompliance:        v.bend_compliance = static_cast<float*>(p); break;
         case FieldId::VolParticles:          v.vol_particles = static_cast<uint32_t*>(p); break;
         case FieldId::VolRestTimes6:         v.vol_rest_times6 = static_cast<float*>(p); break;
         case FieldId::VolCompliance:         v.vol_compliance = static_cast<float*>(p); break;
@@ -1067,8 +1065,12 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ParticleTopologyOffsets: v.particle_topology_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleTopologyElements: v.particle_topology_elements = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleContactRestPos: v.particle_contact_rest_pos = static_cast<math::Vec3*>(p); break;
+        case FieldId::VbdElements:           v.vbd_elements = static_cast<VbdElement*>(p); break;
+        case FieldId::VbdIncidenceOffsets:   v.vbd_incidence_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdIncidence:          v.vbd_incidence = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdColorVertices:      v.vbd_color_vertices = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdColorSegments:      v.vbd_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::DistColorSegments:     v.dist_color_segments = static_cast<uint32_t*>(p); break;
-        case FieldId::BendColorSegments:     v.bend_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::VolColorSegments:      v.vol_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::SmColorSegments:       v.sm_color_segments = static_cast<uint32_t*>(p); break;
         default: break;  // a data-owned field id: not a ModelView member.
@@ -1296,8 +1298,6 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     const auto& p = particles;
     if (p.dist_a.size() != p.dist_b.size() || p.dist_a.size() != p.dist_rest.size() ||
         p.dist_a.size() != p.dist_alpha.size() || p.dist_a.size() > cap.dist_cons_per_env ||
-        p.bend_particles.size() != p.bend_alpha.size() * 4ull ||
-        p.bend_rest_angle.size() != p.bend_alpha.size() || p.bend_alpha.size() > cap.bend_cons_per_env ||
         p.vol_particles.size() != p.vol_alpha.size() * 4ull || p.vol_rest6.size() != p.vol_alpha.size() ||
         p.vol_alpha.size() > cap.vol_cons_per_env)
         return reject(Status::InvalidArgument, "incomplete particle constraint tables");
@@ -1307,9 +1307,8 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         p.sm_particles.size() != p.sm_rest_q.size() || p.sm_particles.size() != p.sm_mass.size() ||
         p.sm_particles.size() > cap.shape_match_members_per_env)
         return reject(Status::InvalidArgument, "incomplete shape-match cluster tables");
-    uint64_t incidences = p.dist_a.size() * 2ull + p.bend_particles.size() +
-                          p.vol_particles.size() + p.aero_tri_verts.size();
-    if (p.dist_a.size() + p.bend_alpha.size() + p.vol_alpha.size() + clusters +
+    uint64_t incidences = p.dist_a.size() * 2ull + p.vol_particles.size() + p.aero_tri_verts.size();
+    if (p.dist_a.size() + p.vol_alpha.size() + clusters +
         p.aero_tri_area.size() > limit)
         return reject(Status::InvalidArgument, "particle structural elements exceed device indexing");
     for (size_t cluster = 0u; cluster < clusters; ++cluster) {
@@ -1321,7 +1320,7 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     }
     if (incidences > limit)
         return reject(Status::InvalidArgument, "particle structural incidence exceeds device indexing");
-    for (const auto* indices : {&p.dist_a, &p.dist_b, &p.bend_particles, &p.vol_particles, &p.sm_particles})
+    for (const auto* indices : {&p.dist_a, &p.dist_b, &p.vol_particles, &p.sm_particles})
         for (uint32_t particle : *indices)
             if (particle >= cap.particles_per_env)
                 return reject(Status::InvalidArgument, "particle constraint index exceeds its environment");
@@ -1345,6 +1344,89 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
             !std::isfinite(p.aero_tri_area[t]) || p.aero_tri_area[t] < 0.0f)
             return reject(Status::InvalidArgument, "invalid aerodynamic triangle indices or area");
     }
+    return ValidateVertexBlocks(reason);
+}
+
+phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
+    auto reject = [&](phi::Status status, const std::string& message) {
+        if (reason) *reason = message;
+        return status;
+    };
+    using phi::Status;
+    const auto& cap = capacities;
+    const auto& p = particles;
+    const uint32_t vertices = cap.vbd_vertices_per_env;
+    if (vertices == 0u) {
+        if (!p.vbd_elements.empty() || !p.vbd_incidence.empty() || !p.vbd_color_vertices.empty() ||
+            cap.vbd_colors != 0u || cap.vbd_elements_per_env != 0u)
+            return reject(Status::InvalidArgument, "vertex-block tables without vertex-block particles");
+        return Status::Ok;
+    }
+    if (uint64_t{cap.vbd_particle_begin} + vertices > cap.particles_per_env ||
+        cap.vbd_particle_begin < p.n_mpm_particles || p.inv_mass.size() != cap.particles_per_env)
+        return reject(Status::InvalidArgument, "vertex-block range exceeds its row-coupled particles");
+    if (p.vbd_elements.size() != cap.vbd_elements_per_env ||
+        p.vbd_incidence_offsets.size() != uint64_t{vertices} + 1u ||
+        p.vbd_incidence.size() != cap.vbd_incidence_per_env ||
+        p.vbd_color_vertices.size() != cap.vbd_dynamic_vertices_per_env ||
+        p.vbd_color_segments.size() != uint64_t{cap.vbd_colors} * 2u ||
+        p.vbd_incidence_offsets.front() != 0u || p.vbd_incidence_offsets.back() != p.vbd_incidence.size())
+        return reject(Status::InvalidArgument, "incomplete vertex-block tables");
+    if (uint64_t{p.vbd_elements.size()} * 4u > std::numeric_limits<uint32_t>::max())
+        return reject(Status::InvalidArgument, "vertex-block elements exceed incidence packing");
+    for (const VbdElement& element : p.vbd_elements) {
+        if (element.kind > kVbdRodBend || !std::isfinite(element.damping) || element.damping < 0.0f)
+            return reject(Status::InvalidArgument, "invalid vertex-block element");
+        for (uint32_t j = 0u; j < VbdElementVertexCount(element.kind); ++j)
+            if (element.vertex[j] >= vertices)
+                return reject(Status::InvalidArgument, "vertex-block element index exceeds its range");
+        for (float value : element.rest)
+            if (!std::isfinite(value))
+                return reject(Status::InvalidArgument, "vertex-block rest data must be finite");
+    }
+    for (uint32_t v = 0u; v < vertices; ++v) {
+        if (p.vbd_incidence_offsets[v] > p.vbd_incidence_offsets[v + 1u])
+            return reject(Status::InvalidArgument, "vertex-block incidence offsets must not decrease");
+        for (uint32_t i = p.vbd_incidence_offsets[v]; i < p.vbd_incidence_offsets[v + 1u]; ++i) {
+            const uint32_t element = VbdIncidenceElement(p.vbd_incidence[i]);
+            const uint32_t local = VbdIncidenceLocal(p.vbd_incidence[i]);
+            if (element >= p.vbd_elements.size() ||
+                local >= VbdElementVertexCount(p.vbd_elements[element].kind) ||
+                p.vbd_elements[element].vertex[local] != v)
+                return reject(Status::InvalidArgument, "vertex-block incidence disagrees with its element");
+        }
+    }
+    std::vector<uint8_t> listed(vertices, 0u);
+    uint32_t next = 0u;
+    for (uint32_t color = 0u; color < cap.vbd_colors; ++color) {
+        if (p.vbd_color_segments[2u * color] != next)
+            return reject(Status::InvalidArgument, "vertex-block colors must tile their vertex list");
+        next += p.vbd_color_segments[2u * color + 1u];
+    }
+    if (next != p.vbd_color_vertices.size())
+        return reject(Status::InvalidArgument, "vertex-block colors must tile their vertex list");
+    for (uint32_t v : p.vbd_color_vertices) {
+        if (v >= vertices || listed[v] != 0u || !(p.inv_mass[cap.vbd_particle_begin + v] > 0.0f))
+            return reject(Status::InvalidArgument, "vertex-block colors must list each dynamic vertex once");
+        listed[v] = 1u;
+    }
+    for (uint32_t v = 0u; v < vertices; ++v)
+        if (listed[v] == 0u && p.inv_mass[cap.vbd_particle_begin + v] > 0.0f)
+            return reject(Status::InvalidArgument, "vertex-block colors must list each dynamic vertex once");
+    // One color's vertices share no element, so its blocks step in parallel.
+    std::vector<uint32_t> color_of(vertices, kVbdNoColor);
+    for (uint32_t color = 0u; color < cap.vbd_colors; ++color)
+        for (uint32_t i = 0u; i < p.vbd_color_segments[2u * color + 1u]; ++i)
+            color_of[p.vbd_color_vertices[p.vbd_color_segments[2u * color] + i]] = color;
+    for (const VbdElement& element : p.vbd_elements) {
+        const uint32_t count = VbdElementVertexCount(element.kind);
+        for (uint32_t j = 0u; j < count; ++j)
+            for (uint32_t k = j + 1u; k < count; ++k)
+                if (element.vertex[j] == element.vertex[k] ||
+                    (color_of[element.vertex[j]] != kVbdNoColor &&
+                     color_of[element.vertex[j]] == color_of[element.vertex[k]]))
+                    return reject(Status::InvalidArgument, "vertex-block element joins one color twice");
+    }
     return Status::Ok;
 }
 
@@ -1354,8 +1436,7 @@ void Model::BuildParticleTopology() {
     p.topology_elements.clear();
     capacities.particle_topology_incidence_count = 0u;
     std::vector<std::pair<uint32_t, uint32_t>> memberships;
-    size_t incidence_bound = p.dist_a.size() * 2u + p.bend_particles.size() +
-                             p.vol_particles.size() + p.aero_tri_verts.size();
+    size_t incidence_bound = p.dist_a.size() * 2u + p.vol_particles.size() + p.aero_tri_verts.size();
     for (uint32_t count : p.sm_cluster_size) incidence_bound += count;
     memberships.reserve(incidence_bound);
     uint32_t element = 0u;
@@ -1367,7 +1448,6 @@ void Model::BuildParticleTopology() {
         const std::array<uint32_t, 2> indices{p.dist_a[i], p.dist_b[i]};
         append(indices.data(), indices.size());
     }
-    for (size_t i = 0u; i < p.bend_particles.size(); i += 4u) append(p.bend_particles.data() + i, 4u);
     for (size_t i = 0u; i < p.vol_particles.size(); i += 4u) append(p.vol_particles.data() + i, 4u);
     for (size_t i = 0u; i < p.sm_cluster_size.size(); ++i)
         if (p.sm_cluster_size[i] > 0u)
@@ -1557,7 +1637,6 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.schedule_island_count = src.schedule_island_count;
     dst.schedule_segment_count = src.schedule_segment_count;
     dst.dist_color_segments = std::move(src.dist_color_segments);
-    dst.bend_color_segments = std::move(src.bend_color_segments);
     dst.vol_color_segments = std::move(src.vol_color_segments);
     dst.sm_color_segments = std::move(src.sm_color_segments);
     // M5 pair-driven / SDF tables (review fix: these were MISSING — a moved

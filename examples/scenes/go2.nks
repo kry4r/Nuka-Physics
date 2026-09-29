@@ -1351,12 +1351,12 @@
                     {
                       "name": "FL",
                       "collision_shape": {
-                        "type": "box",
+                        "type": "sphere",
                         "local": {
                           "pos": [
+                            -0.002,
                             0.0,
-                            0.0,
-                            0.0
+                            -0.213
                           ],
                           "quat": [
                             1.0,
@@ -1370,7 +1370,7 @@
                           0.5,
                           0.5
                         ],
-                        "radius": 0.5,
+                        "radius": 0.022,
                         "half_height": 0.5,
                         "material_id": 4294967295,
                         "contype": 1,
@@ -2242,12 +2242,12 @@
                     {
                       "name": "FR",
                       "collision_shape": {
-                        "type": "box",
+                        "type": "sphere",
                         "local": {
                           "pos": [
+                            -0.002,
                             0.0,
-                            0.0,
-                            0.0
+                            -0.213
                           ],
                           "quat": [
                             1.0,
@@ -2261,7 +2261,7 @@
                           0.5,
                           0.5
                         ],
-                        "radius": 0.5,
+                        "radius": 0.022,
                         "half_height": 0.5,
                         "material_id": 4294967295,
                         "contype": 1,
@@ -3133,12 +3133,12 @@
                     {
                       "name": "RL",
                       "collision_shape": {
-                        "type": "box",
+                        "type": "sphere",
                         "local": {
                           "pos": [
+                            -0.002,
                             0.0,
-                            0.0,
-                            0.0
+                            -0.213
                           ],
                           "quat": [
                             1.0,
@@ -3152,7 +3152,7 @@
                           0.5,
                           0.5
                         ],
-                        "radius": 0.5,
+                        "radius": 0.022,
                         "half_height": 0.5,
                         "material_id": 4294967295,
                         "contype": 1,
@@ -4024,12 +4024,12 @@
                     {
                       "name": "RR",
                       "collision_shape": {
-                        "type": "box",
+                        "type": "sphere",
                         "local": {
                           "pos": [
+                            -0.002,
                             0.0,
-                            0.0,
-                            0.0
+                            -0.213
                           ],
                           "quat": [
                             1.0,
@@ -4043,7 +4043,7 @@
                           0.5,
                           0.5
                         ],
-                        "radius": 0.5,
+                        "radius": 0.022,
                         "half_height": 0.5,
                         "material_id": 4294967295,
                         "contype": 1,

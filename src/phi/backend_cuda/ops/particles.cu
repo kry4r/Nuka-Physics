@@ -239,8 +239,10 @@ __global__ void ClothAeroGatherKernel(uint32_t particle_count,
 }
 
 // Prediction saves one step-start position and publishes one common working position.
+// Vertex blocks [block_begin, block_end) integrate at second order in ClothPredict.
 __global__ void ParticlePredictKernel(
-    uint32_t count, uint32_t per_env, uint32_t active_begin,
+    uint32_t count, uint32_t per_env, uint32_t active_begin, uint32_t block_begin,
+    uint32_t block_end,
     const math::Vec3* __restrict__ positions, math::Vec3* __restrict__ previous,
     math::Vec3* __restrict__ predicted, math::Vec3* __restrict__ velocities,
     math::Vec3* __restrict__ contact_reference, math::Vec3* __restrict__ projection_delta,
@@ -248,6 +250,7 @@ __global__ void ParticlePredictKernel(
     math::Vec3 gravity, float dt) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count || i % per_env < active_begin) return;
+    if (i % per_env >= block_begin && i % per_env < block_end) return;
     const math::Vec3 start = positions[i];
     previous[i] = start;
     math::Vec3 velocity = velocities[i];
@@ -795,6 +798,8 @@ __device__ __forceinline__ bool RestNeighbors(
 __global__ void PpContactHalfCorrectionKernel(
     uint32_t union_count,
     uint32_t per_env,
+    uint32_t block_begin,
+    uint32_t block_end,
     const math::Vec3* __restrict__ positions,
     const float* __restrict__ inv_mass,
     const uint32_t* __restrict__ topology_offsets,
@@ -810,6 +815,13 @@ __global__ void PpContactHalfCorrectionKernel(
     if (i >= union_count) {
         return;
     }
+    const auto in_blocks = [&](uint32_t particle) {
+        return particle % per_env >= block_begin && particle % per_env < block_end;
+    };
+    if (in_blocks(i)) {
+        out_delta[i] = {};
+        return;
+    }
     const math::Vec3 pi = positions[i];
     const float wi = inv_mass[i];
     const uint32_t base = neighbor_offsets[i];
@@ -820,6 +832,7 @@ __global__ void PpContactHalfCorrectionKernel(
     float dz = 0.0f;
     for (uint32_t k = 0u; k < n; ++k) {
         const uint32_t j = neighbor_indices[base + k];
+        if (in_blocks(j)) continue;
         const math::Vec3 r = Sub(pi, positions[j]);  // p_i - p_j
         const float dist = sqrtf(Dot(r, r));
         if (dist <= 0.0f) {
@@ -903,8 +916,12 @@ Status OpParticlePredict(const ModelView&, const DataView& data,
         data.particle_inv_mass == nullptr)
         return Status::InvalidArgument;
     const uint32_t blocks = (p->particle_count - 1u) / kBlockSize + 1u;
+    const uint32_t block_begin = p->vertex_blocks.begin;
+    const uint32_t block_end = block_begin + p->vertex_blocks.vertices;
+    if (block_end > per_env) return Status::InvalidArgument;
     LaunchCuda(ParticlePredictKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               p->particle_count, per_env, active_begin, data.particle_pos, data.particle_prev_pos,
+               p->particle_count, per_env, active_begin, block_begin, block_end,
+               data.particle_pos, data.particle_prev_pos,
                data.pbf_predicted_pos, data.particle_vel, data.particle_v_pre,
                data.particle_projection_delta, data.particle_inv_mass,
                math::Vec3{p->gravity[0], p->gravity[1], p->gravity[2]}, p->dt);
@@ -1123,7 +1140,9 @@ Status OpParticleParticleContact(const ModelView& model, const DataView& data,
         return Status::Ok;
     }
     const uint32_t N = p->particle_count;
-    if (p->particles_per_env == 0u || N % p->particles_per_env != 0u ||
+    const uint32_t block_begin = p->vertex_blocks.begin;
+    const uint32_t block_end = block_begin + p->vertex_blocks.vertices;
+    if (p->particles_per_env == 0u || N % p->particles_per_env != 0u || block_end > p->particles_per_env ||
         data.particle_projection_delta == nullptr ||
         (model.particle_topology_offsets != nullptr &&
          (model.particle_topology_elements == nullptr || model.particle_contact_rest_pos == nullptr)))
@@ -1134,7 +1153,8 @@ Status OpParticleParticleContact(const ModelView& model, const DataView& data,
     for (uint32_t it = 0u; it < iters; ++it) {
         // Density projection has consumed pbf_position_delta before contact gathers reuse it.
         LaunchCuda(PpContactHalfCorrectionKernel, dim3(blocks), dim3(kBlockSize), 0u,
-                   stream, N, p->particles_per_env, data.pbf_predicted_pos, data.particle_inv_mass,
+                   stream, N, p->particles_per_env, block_begin, block_end,
+                   data.pbf_predicted_pos, data.particle_inv_mass,
                    model.particle_topology_offsets, model.particle_topology_elements,
                    model.particle_contact_rest_pos,
                    p->contact_distance_d_min, alpha_tilde, data.grid_neighbor_count, data.grid_neighbor_offset,

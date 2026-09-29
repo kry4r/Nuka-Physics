@@ -320,6 +320,7 @@ nuka_result_t FinishWorldCreate(
     const nuka::math::Vec3& gravity, uint32_t osc_task_link,
     nuka_world_handle* out,
     uint32_t solver_vel_iters = 0u, uint32_t solver_pos_iters = 0u,
-    float solver_contact_margin = 0.0f, uint32_t solver_max_pairs = 0u);
+    float solver_contact_margin = 0.0f, uint32_t solver_max_pairs = 0u,
+    uint32_t cloth_integrator = 0u);
 
 } // namespace nuka::c_abi

@@ -512,6 +512,8 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     if (threadIdx.x == 0u) {
         data.contact_count[env] = 0u;
         data.env_status[env] = 0u;
+        // A restored state has no second-order history, so its next step is backward Euler.
+        if (data.vbd_history_ready != nullptr) data.vbd_history_ready[env] = 0u;
         if (data.grid_contact_peak != nullptr) {
             data.grid_contact_peak[env] = data.grid_contact_attempted[env] = 0u;
             data.grid_contact_overflow[env] = 0u;

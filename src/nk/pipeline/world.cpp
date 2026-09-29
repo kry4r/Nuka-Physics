@@ -10,7 +10,6 @@
 #include <limits>
 #include <utility>
 
-#include "collision/contact_capacity.hpp"
 #include "phi/articulation_contract.hpp"
 #include "nk/solve/schedule.hpp"
 #include "nk/solve/nk_row.hpp"
@@ -65,9 +64,8 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         return;
     }
     const uint64_t point_slots = control_cap.mpm_contact_capacity_per_env +
-        (control_cap.bodies_per_env > 0u && control_cap.max_contacts_per_env > 0u
-             ? uint64_t{control_cap.particles_per_env - grid_particles} *
-                   collision::kBodyParticleContactSlotsPerParticle : 0u);
+        (control_cap.max_contacts_per_env > 0u
+             ? control_cap.ParticleContactReserve(grid_particles) : 0u);
     if (point_slots > control_cap.max_contacts_per_env) {
         creation_status_ = phi::Status::InvalidArgument;
         creation_error_ = "particle contact reserve exceeds the contact capacity";
@@ -78,8 +76,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         point_slots * kPairDrivenParticleRowsPerSlot + control_cap.joint_limit_rows_per_env +
         control_cap.joint_friction_rows_per_env + drive_rows +
         uint64_t{control_cap.mpm_stress_cells_per_env} * kMpmStressRowsPerCell +
-        uint64_t{control_cap.dist_cons_per_env} + control_cap.bend_cons_per_env +
-        control_cap.vol_cons_per_env;
+        uint64_t{control_cap.dist_cons_per_env} + control_cap.vol_cons_per_env;
     if (row_count > std::numeric_limits<uint32_t>::max()) {
         creation_status_ = phi::Status::InvalidArgument;
         creation_error_ = "actuator row capacity is invalid";
@@ -90,9 +87,8 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     control_cap.inverse_dynamics_controls =
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
-    // Bend and volume rows keep one 4-term particle endpoint each at the endpoint tail.
-    const uint64_t constraint_endpoints =
-        uint64_t{control_cap.bend_cons_per_env} + control_cap.vol_cons_per_env;
+    // Volume rows keep one 4-term particle endpoint each at the endpoint tail.
+    const uint64_t constraint_endpoints = control_cap.vol_cons_per_env;
     if (control_cap.mpm_grid_nodes_per_env > 0u || constraint_endpoints > 0u) {
         const uint32_t surfaces = control_cap.particle_surfaces_per_env > 0u
             ? control_cap.mpm_contact_capacity_per_env : 0u;

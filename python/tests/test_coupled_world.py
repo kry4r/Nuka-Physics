@@ -175,8 +175,8 @@ def _media_kwargs(at_feet: bool) -> dict:
         cloth_nx=13, cloth_ny=13, cloth_spacing=0.018,
         cloth_origin_x=0.062, cloth_origin_y=0.0,
         cloth_origin_z=(FOOT_Z - 0.012) + dz,
-        cloth_particle_mass=0.01, cloth_friction=0.6, cloth_bend_alpha=1.0e-4,
-        cloth_iters=24,
+        cloth_particle_mass=0.01, cloth_friction=0.6, cloth_stretch_stiffness=1.0e4,
+        cloth_bend_stiffness=1.0e-5,
         fluid_min_x=-0.39, fluid_min_y=-0.06, fluid_min_z=(FOOT_Z - 0.10) + dz,
         fluid_max_x=-0.26, fluid_max_y=0.09, fluid_max_z=(FOOT_Z + 0.01) + dz,
         fluid_spacing=0.022, fluid_rest_density=1000.0,
@@ -879,7 +879,7 @@ def test_control_creation_entries(device, mode, entry):
         authored = Scene(SimOptions(**options))
         authored.add_entity(morphs.NKS(SCENE))
         authored.add_entity(morphs.Grid(5, 5, 0.018, origin=(0.062, 0.0, FOOT_Z)),
-                            materials.Cloth.XPBD())
+                            materials.Cloth.VBD())
         if entry == "author_built":
             authored.add_entity(morphs.Sphere(0.03, pos=(3.0, 0.0, 0.3)), materials.Rigid())
         world = authored.build(device)

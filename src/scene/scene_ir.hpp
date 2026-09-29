@@ -317,16 +317,19 @@ struct ContactPairOverride {
 // cook input; one geometry/material variant is used per MediaRecord::Kind.
 // ---------------------------------------------------------------------------
 
-// Constitutive material for an XPBD medium (cloth uses distance+bend, tet uses
-// distance+volume — one block). Fields map 1:1 to cook::XpbdCookInput.
+// Material of a soft medium: a tet body's distance and volume compliance, or a
+// vertex-block cloth or cable's elastic moduli. Fields map to cook::XpbdCookInput.
 struct MediaXpbdMaterial {
     float    particle_mass     = 0.0f;
     float    surface_density   = 0.0f;   // kg / m^2; mutually exclusive with particle_mass.
     float    half_thickness    = 0.0f;   // m from the cloth midsurface.
     float    friction          = 0.6f;   // body<->soft contact mu
-    float    distance_alpha    = 0.0f;   // distance-constraint compliance
-    float    bend_alpha        = 0.0f;   // cloth bend compliance
+    float    distance_alpha    = 0.0f;   // tet distance-constraint compliance
     float    volume_alpha      = 0.0f;   // tet volume compliance
+    float    stretch_stiffness = 0.0f;   // cloth Young's modulus times thickness (N/m); cable EA (N)
+    float    poisson           = 0.0f;   // cloth membrane Poisson ratio
+    float    bend_stiffness    = 0.0f;   // cloth hinge (N m); cable EI (N m^2)
+    float    damping           = 0.0f;   // Rayleigh coefficient on the elastic stiffness (s)
     uint16_t iters             = 1u;     // solver iterations
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
@@ -399,10 +402,10 @@ struct MediaRecord {
 
     // WHAT it is (solver routing) and HOW it solves (one method per medium).
     // Granular is an MLS-MPM Drucker-Prager sand/gravel bed (box geometry, model_kind 4).
-    // Cable is an XPBD inextensible distance chain (rope), optionally weighted by a
-    // shape-match rigid slab welded to its loaded end.
+    // Cable is a vertex-block rod, optionally weighted by a spring-lattice slab welded
+    // to its loaded end. Cloth and cable solve as vertex blocks (Vbd).
     enum class Kind   : uint8_t { Cloth, SoftTet, Fluid, Granular, Cable };
-    enum class Method : uint8_t { Xpbd, Pbf, MlsMpm };
+    enum class Method : uint8_t { Xpbd, Pbf, MlsMpm, Vbd };
     Kind   kind   = Kind::Cloth;
     Method method = Method::Xpbd;
 
@@ -441,18 +444,18 @@ struct MediaRecord {
         // 0 (default) => the exact lattice, byte-identical.
         float      position_jitter = 0.0f;
     };
-    // A cable / rope: an XPBD distance chain of `segments` links (segments+1
-    // particles) from `start` to `end`; `radius` is the render bead + contact size.
+    // A cable / rope: a vertex-block rod of `segments` links (segments+1 particles)
+    // from `start` to `end`; `radius` is the render bead + contact size.
     struct CableLine {
         // Which endpoint(s) are kinematic (inv_mass 0): the anchor, the loaded end,
         // both, or none (a free-falling chain).
         enum class Pin : uint8_t { Start = 0, End, Both, None };
-        // An optional rigid slab welded to the loaded end: a box of `half_extents`
-        // cooked as ONE shape-match cluster (id 9); all-zero extents => a bare cable.
+        // An optional slab welded to the loaded end: a box of `half_extents` whose 8
+        // corners form a 28-spring lattice; all-zero extents => a bare cable.
         struct Slab {
             math::Vec3 half_extents{0.0f, 0.0f, 0.0f};
             float      mass = 0.0f;       // per-corner mass (0 => the cable mass).
-            float      stiffness = 1.0f;  // shape-match goal-pull fraction in [0,1].
+            float      stiffness = 0.0f;  // lattice spring EA (N); 0 => the cable's.
             uint32_t   render_material_id = kInvalidMaterial;
         };
         math::Vec3 start{0.0f, 0.0f, 0.0f};
@@ -460,7 +463,6 @@ struct MediaRecord {
         uint32_t   segments = 0u;
         float      radius = 0.0f;
         Pin        pin = Pin::Start;
-        bool       bend = false;  // skip-one distance rows for a little stiffness.
         Slab       slab{};
     };
     // A heterogeneous MLS-MPM sub-fill: a sub-box region sampled with its OWN

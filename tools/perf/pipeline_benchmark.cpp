@@ -1,4 +1,3 @@
-#include "constraint/dihedral_bend.hpp"
 
 #include "robot_cloth_fluid_scene.hpp"
 #include "measurement_clock.hpp"
@@ -393,7 +392,6 @@ Json XpbdWorkload(const nk::Model& model) {
     };
     const auto& caps = model.capacities;
     family("distance", model.dist_color_segments, caps.dist_cons_per_env);
-    family("bend", model.bend_color_segments, caps.bend_cons_per_env);
     family("volume", model.vol_color_segments, caps.vol_cons_per_env);
     family("shape_match", model.sm_color_segments, caps.shape_match_slots_per_env);
     return result;
@@ -406,9 +404,9 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
     std::vector<nuka::math::Vec3> positions(size_t{caps.env_count} * caps.particles_per_env);
     fixture::Require(world.GetData().DownloadField(nk::FieldId::ParticlePos, positions.data(),
                      positions.size() * sizeof(positions.front())), "XPBD position download failed");
-    double distance_max = 0.0, distance_squared = 0.0, bend_max = 0.0, bend_squared = 0.0;
+    double distance_max = 0.0, distance_squared = 0.0;
     double pinned_max = 0.0, distance_rms_max_env = 0.0;
-    uint64_t distance_count = 0u, bend_count = 0u;
+    uint64_t distance_count = 0u;
     for (uint32_t env = 0u; env < caps.env_count; ++env) {
         const auto* points = positions.data() + size_t{env} * caps.particles_per_env;
         double env_distance_squared = 0.0;
@@ -423,32 +421,35 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
             const double dz = double{point.z} - initial.z;
             pinned_max = std::max(pinned_max, std::sqrt(dx * dx + dy * dy + dz * dz));
         }
-        for (uint32_t i = 0u; i < caps.dist_cons_per_env; ++i) {
-            const auto& a = points[particles.dist_a[i]];
-            const auto& b = points[particles.dist_b[i]];
+        uint64_t env_distance_count = 0u;
+        const auto strain = [&](uint32_t ia, uint32_t ib, double rest) {
+            const auto& a = points[ia];
+            const auto& b = points[ib];
             const double dx = double{a.x} - b.x, dy = double{a.y} - b.y, dz = double{a.z} - b.z;
-            const double rest = particles.dist_rest[i];
             fixture::Require(rest > 0.0, "distance strain requires positive rest length");
             const double error = std::abs(std::sqrt(dx * dx + dy * dy + dz * dz) / rest - 1.0);
             distance_max = std::max(distance_max, error);
             distance_squared += error * error;
             env_distance_squared += error * error;
             ++distance_count;
+            ++env_distance_count;
+        };
+        for (uint32_t i = 0u; i < caps.dist_cons_per_env; ++i)
+            strain(particles.dist_a[i], particles.dist_b[i], particles.dist_rest[i]);
+        // Vertex-block edges measure strain against the cooked rest shape.
+        for (const nk::VbdElement& element : particles.vbd_elements) {
+            const uint32_t n = element.kind == nk::kVbdTriangle ? 3u
+                : element.kind == nk::kVbdSpring ? 2u : 0u;
+            for (uint32_t j = 0u; j < n && (n == 3u || j == 0u); ++j) {
+                const uint32_t a = caps.vbd_particle_begin + element.vertex[j];
+                const uint32_t b = caps.vbd_particle_begin + element.vertex[(j + 1u) % n];
+                const auto d = particles.initial_pos[a] - particles.initial_pos[b];
+                strain(a, b, std::sqrt(double{d.x} * d.x + double{d.y} * d.y + double{d.z} * d.z));
+            }
         }
-        if (caps.dist_cons_per_env > 0u)
+        if (env_distance_count > 0u)
             distance_rms_max_env = std::max(distance_rms_max_env,
-                std::sqrt(env_distance_squared / caps.dist_cons_per_env));
-        for (uint32_t i = 0u; i < caps.bend_cons_per_env; ++i) {
-            const auto* ids = &particles.bend_particles[size_t{i} * 4u];
-            const auto geometry = nuka::constraint::EvaluateDihedralBend(
-                points[ids[0]], points[ids[1]], points[ids[2]], points[ids[3]]);
-            fixture::Require(geometry.valid, "degenerate cloth bending hinge");
-            const double constraint = nuka::constraint::DihedralBendError(
-                geometry.angle, particles.bend_rest_angle[i]);
-            bend_max = std::max(bend_max, std::abs(constraint));
-            bend_squared += constraint * constraint;
-            ++bend_count;
-        }
+                std::sqrt(env_distance_squared / static_cast<double>(env_distance_count)));
     }
     fixture::Require(pinned_max == 0.0, "pinned particle moved in quality replay");
     Json result = Json::Object();
@@ -458,10 +459,6 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
     result.Set("distance_strain_rms", Json::Float(distance_count ?
         std::sqrt(distance_squared / static_cast<double>(distance_count)) : 0.0));
     result.Set("distance_strain_rms_max_env", Json::Float(distance_rms_max_env));
-    result.Set("bend_count", Json::Int(bend_count));
-    result.Set("bend_angle_error_max_rad", Json::Float(bend_max));
-    result.Set("bend_angle_error_rms_rad", Json::Float(bend_count ?
-        std::sqrt(bend_squared / static_cast<double>(bend_count)) : 0.0));
     result.Set("pinned_displacement_max_m", Json::Float(pinned_max));
     return result;
 }

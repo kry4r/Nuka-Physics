@@ -12,7 +12,6 @@
 #include <cstdlib>
 #include <limits>
 
-#include "collision/contact_capacity.hpp"
 #include "collision/shape_kind.hpp"
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
 #include "nk/model/model.hpp"
@@ -115,6 +114,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     calls_.clear();
     missing_ops_.clear();
     const ModelCapacities& cap = model.capacities;
+    float contact_margin = cfg.contact_margin;
+    for (const auto& bucket : model.material_buckets)
+        contact_margin = std::max(contact_margin, bucket.Profile().margin);
 
     const bool has_articulation = cap.dofs_per_env > 0 || cap.links_per_env > 0;
     const bool has_bodies       = cap.bodies_per_env > 0;
@@ -159,9 +161,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
     // The same particle ownership sizes the cook reserve and the pipeline's row range.
-    const uint64_t particle_reserve64 = cap.bodies_per_env > 0u && cap.max_contacts_per_env > 0u
-        ? uint64_t{cap.particles_per_env - grid_particles_per_env} *
-              collision::kBodyParticleContactSlotsPerParticle : 0u;
+    const uint64_t particle_reserve64 = cap.max_contacts_per_env > 0u
+        ? cap.ParticleContactReserve(grid_particles_per_env) : 0u;
     if (particle_reserve64 + cap.mpm_contact_capacity_per_env > cap.max_contacts_per_env)
         return phi::Status::InvalidArgument;
     const uint32_t particle_reserve = static_cast<uint32_t>(particle_reserve64);
@@ -285,6 +286,13 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
                                 ? mp.n_soft_particles : 0u;
     const uint32_t n_mpm = grid_particles_per_env;
     const uint32_t per_env_particles = cap.particles_per_env;
+    phi::VertexBlockLayout vertex_blocks;
+    vertex_blocks.begin = cap.vbd_particle_begin;
+    vertex_blocks.vertices = cap.vbd_vertices_per_env;
+    vertex_blocks.dynamic_vertices = cap.vbd_dynamic_vertices_per_env;
+    vertex_blocks.colors = cap.vbd_colors;
+    vertex_blocks.particles_per_env = per_env_particles;
+    vertex_blocks.env_count = env_count;
     // Per-env soft-particle count selecting which per-system mu a particle side
     // reads: SoftFluid the explicit split, Xpbd all-soft, Pbf all-fluid, Coupled by type.
     const uint32_t friction_n_soft =
@@ -308,7 +316,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         (particle_mode == phi::kParticleModeCoupled &&
          coupled_internal == phi::kCoupledInternalPbf);
 
-    // Distance, bend and volume constraints are rows of the common solve; shape matching projects.
+    // Distance and volume constraints are rows of the common solve; shape matching projects.
     const uint32_t xpbd_iterations = sm_cluster_count != 0u
         ? std::max<uint32_t>(mp.xpbd_iters, 1u) : 0u;
     const uint32_t pbf_iterations = runs_pbf ? std::max<uint32_t>(mp.pbf_iters, 1u) : 0u;
@@ -354,7 +362,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     coupling_ctx.gravity[0] = cfg.gravity[0];
     coupling_ctx.gravity[1] = cfg.gravity[1];
     coupling_ctx.gravity[2] = cfg.gravity[2];
-    coupling_ctx.contact_margin = cfg.contact_margin;
+    coupling_ctx.contact_margin = contact_margin;
     coupling_ctx.pos_pass =
         (has_contacts && family == phi::kContactFamilyPairDriven &&
          cfg.pos_iters > 0u) ? 1u : 0u;
@@ -390,7 +398,15 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_part_predict_.n_soft_particles = n_soft;
         p_part_predict_.particles_per_env = per_env_particles;
         p_part_predict_.n_mpm_particles = n_mpm;
+        p_part_predict_.vertex_blocks = vertex_blocks;
         add(phi::NkOp::ParticlePredict, &p_part_predict_);
+        if (vertex_blocks.vertices > 0u) {
+            p_cloth_step_.dt = cfg.dt;
+            for (int k = 0; k < 3; ++k) p_cloth_step_.gravity[k] = cfg.gravity[k];
+            p_cloth_step_.layout = vertex_blocks;
+            p_cloth_step_.integrator = cfg.cloth_integrator;
+            add(phi::NkOp::ClothPredict, &p_cloth_step_);
+        }
     }
 
     mpm_coupling_provider_.PreCouple(coupling_ctx);
@@ -418,7 +434,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // the ONE general PairDriven contact path. The family + per-env body
         // geometry travel in the params (the views are pure pointer aggregates).
         const uint32_t bodies_per_env = cap.bodies_per_env;
-        p_aabbs_.margin = cfg.contact_margin;
+        p_aabbs_.margin = contact_margin;
         p_aabbs_.family = family;
         p_aabbs_.env_count = env_count;
         p_aabbs_.bodies_per_env = bodies_per_env;
@@ -515,6 +531,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_pp_contact_.particle_count = particle_count;
         p_pp_contact_.n_soft_particles = n_soft;
         p_pp_contact_.particles_per_env = per_env_particles;
+        p_pp_contact_.vertex_blocks = vertex_blocks;
     }
 
     const auto project_particles = [&](uint32_t pass) {
@@ -545,7 +562,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_collidables) {
-        p_np_prim_.contact_margin = cfg.contact_margin;
+        p_np_prim_.contact_margin = contact_margin;
         p_np_prim_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_prim_.ground_height = model.ground_height;
         p_np_prim_.foot_count = static_cast<uint32_t>(model.feet.size());
@@ -595,7 +612,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_np_hf_.bodies_per_env = cap.bodies_per_env;
         p_np_hf_.hull_vert_count =
             static_cast<uint32_t>(model.hull_verts.size() / 3u);
-        p_np_hf_.contact_margin = cfg.contact_margin;
+        p_np_hf_.contact_margin = contact_margin;
         // NarrowphaseHeightfieldParams carries ONE descriptor; a model with more
         // than one cooked heightfield would silently drop all but the first.
         assert(model.heightfields.size() <= 1 &&
@@ -619,7 +636,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         }
         add(phi::NkOp::NarrowphaseHeightfield, &p_np_hf_);
 
-        p_np_sdf_.contact_margin = cfg.contact_margin;
+        p_np_sdf_.contact_margin = contact_margin;
         p_np_sdf_.max_contacts_per_pair = kMaxContactsPerPair;
         p_np_sdf_.family = family;          // PairDriven => sample; else no-op.
         p_np_sdf_.env_count = env_count;
@@ -685,10 +702,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.point_endpoints_per_env = cap.point_endpoints_per_env;
         p_assemble_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
         // Particle constraint rows sit just before the stress tail; their endpoints end the pool.
-        const uint32_t constraint_rows = cap.dist_cons_per_env + cap.bend_cons_per_env + cap.vol_cons_per_env;
-        const uint32_t constraint_endpoints = cap.bend_cons_per_env + cap.vol_cons_per_env;
+        const uint32_t constraint_rows = cap.dist_cons_per_env + cap.vol_cons_per_env;
+        const uint32_t constraint_endpoints = cap.vol_cons_per_env;
         p_assemble_.dist_cons_per_env = cap.dist_cons_per_env;
-        p_assemble_.bend_cons_per_env = cap.bend_cons_per_env;
         p_assemble_.vol_cons_per_env = cap.vol_cons_per_env;
         p_assemble_.particle_constraint_row_first = cap.max_rows_per_env -
             cap.mpm_stress_cells_per_env * kMpmStressRowsPerCell - constraint_rows;
@@ -728,6 +744,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.particle_soft_friction = mp.soft_friction;
         p_assemble_.particle_fluid_friction = mp.fluid_friction;
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
+        p_assemble_.contact_margin = cfg.contact_margin;
+        p_assemble_.vertex_blocks = vertex_blocks;
         if constexpr (family == phi::kContactFamilyPairDriven) {
             p_warm_start_prepare_.phase = 0u;
             p_warm_start_prepare_.env_count = env_count;
@@ -778,6 +796,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // The per-articulation slot stride MUST match the detection/assembly
         // (slot_base = articulation * stride). Data-driven; 4 at K<=1.
         p_solve_.contact_slots_per_artic = contact_slots_per_artic;
+        p_solve_.vertex_blocks = vertex_blocks;
         // Validation A/B: force the cook-time static schedule (the byte-identity
         // reference for the dynamic islanding). Read once at Build (graph-safe).
         const char* fsi = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
@@ -855,6 +874,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     // Commit particle state once after all incremental coupling solves.
     if (has_particles) {
         row_coupling_provider_.PostCouple(coupling_ctx);
+        if (vertex_blocks.vertices > 0u) add(phi::NkOp::ClothFinalize, &p_cloth_step_);
     }
 
     // Public poses and velocities describe the completed interval before sensor sampling.

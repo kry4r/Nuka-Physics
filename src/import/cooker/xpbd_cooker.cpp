@@ -10,9 +10,7 @@
 namespace nuka::import::cooker {
 
 namespace {
-using runtime::soft::BuildClothConstraints;
 using runtime::soft::BuildTetMeshConstraints;
-using runtime::soft::ClothTopologyOptions;
 using runtime::soft::TetMeshTopologyOptions;
 using runtime::soft::XpbdConstraintSet;
 using runtime::soft::XpbdShapeMatchCluster;
@@ -36,16 +34,6 @@ XpbdConstraintSet CookXpbdSoftBody(const XpbdSoftBodySpec& spec) {
     XpbdConstraintSet out;
 
     switch (spec.type) {
-        case SoftBodyType::Cloth: {
-            ClothTopologyOptions opts;
-            const float alpha = ComplianceAlphaFromStiffness(spec.stiffness);
-            opts.distance_compliance_alpha = alpha;
-            opts.bend_compliance_alpha = alpha;
-            opts.emit_distance_constraints = true;
-            opts.emit_bend_constraints = spec.emit_bend;
-            BuildClothConstraints(spec.rest_positions, spec.triangles, opts, out);
-            break;
-        }
         case SoftBodyType::SoftBody: {
             TetMeshTopologyOptions opts;
             const float alpha = ComplianceAlphaFromStiffness(spec.stiffness);

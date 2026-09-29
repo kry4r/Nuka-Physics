@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include "math/symmetric_mat3.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/solve/nk_row.hpp"
@@ -30,6 +31,7 @@ __device__ __forceinline__ float WarpSum(float value) {
 }
 
 // Material particles and background nodes share scalar mass response with separate state.
+// A world with vertex blocks gives every particle a frozen 3x3 response instead.
 struct PointMassView {
     const float* particle_inv_mass = nullptr;
     math::Vec3* particle_velocity = nullptr;
@@ -37,6 +39,7 @@ struct PointMassView {
     math::Vec3* grid_velocity = nullptr;
     const nk::PointEndpointRange* ranges = nullptr;
     const nk::PointEndpointTerm* terms = nullptr;
+    const math::SymmetricMat3* particle_response = nullptr;
 
     struct Contribution {
         uint32_t kind;
@@ -61,6 +64,25 @@ struct PointMassView {
     }
     __device__ math::Vec3* Velocity(uint32_t kind) const {
         return kind == kNkSideGrid ? grid_velocity : particle_velocity;
+    }
+    __device__ bool Shaped(uint32_t kind) const {
+        return kind == kNkSideParticle && particle_response != nullptr;
+    }
+    // Velocity a unit impulse along `jacobian` gives one mass term of scalar inverse mass `inverse_mass`.
+    __device__ math::Vec3 Respond(uint32_t kind, uint32_t index, math::Vec3 jacobian,
+                                  float inverse_mass) const {
+        return Shaped(kind) ? particle_response[index].Multiply(jacobian) : jacobian * inverse_mass;
+    }
+    __device__ math::Vec3 Respond(uint32_t kind, uint32_t index, math::Vec3 jacobian,
+                                  float inverse_mass, float impulse) const {
+        return Shaped(kind) ? particle_response[index].Multiply(jacobian) * impulse
+                            : jacobian * (inverse_mass * impulse);
+    }
+    // u^T W v of one mass term.
+    __device__ float Quad(uint32_t kind, uint32_t index, math::Vec3 u, math::Vec3 v) const {
+        if (Shaped(kind)) return u.Dot(particle_response[index].Multiply(v));
+        const float* inv_mass = InverseMass(kind);
+        return inv_mass != nullptr ? inv_mass[index] * u.Dot(v) : 0.0f;
     }
     __device__ float RowVelocity(const NkRowSide& side) const {
         float result = 0.0f;
@@ -95,11 +117,7 @@ struct PointMassView {
             const auto b = At(rhs, j);
             const uint64_t a_key = (uint64_t{a.kind} << 32u) | a.index;
             const uint64_t b_key = (uint64_t{b.kind} << 32u) | b.index;
-            if (a_key == b_key) {
-                const float* inv_mass = InverseMass(a.kind);
-                if (inv_mass != nullptr)
-                    result += inv_mass[a.index] * a.jacobian.Dot(b.jacobian);
-            }
+            if (a_key == b_key) result += Quad(a.kind, a.index, a.jacobian, b.jacobian);
             if (a_key <= b_key) ++i;
             if (b_key <= a_key) ++j;
         }
@@ -112,6 +130,12 @@ struct PointMassView {
         return result;
     }
 };
+
+// Every solve stage sees particles through the response the vertex blocks froze for the step.
+__host__ __device__ inline PointMassView PointMasses(const DataView& data) {
+    return {data.particle_inv_mass, data.particle_vel, data.grid_inv_mass, data.grid_velocity,
+            data.point_endpoint_ranges, data.point_endpoint_terms, data.particle_response};
+}
 
 // Union slot classes / flags — MUST mirror nk::UnionSlot (model.hpp).
 inline constexpr uint32_t kUSlotInactive       = 0u;

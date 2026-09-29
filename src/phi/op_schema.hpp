@@ -196,6 +196,8 @@ enum class NkOp : uint16_t {
     AdvanceSensorTime,
     ReadoutSensorWrenches,
     ReadoutContactRegion,
+    ClothPredict,           // Vertex-block inertial target, initial guess and frozen row response.
+    ClothFinalize,          // Vertex-block velocity from the committed displacement; history advance.
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -671,6 +673,16 @@ struct ContactTangentBasisParams {
     uint32_t family = 0u;
 };
 
+// Vertex blocks occupy particles [begin, begin + vertices) of each env; vertices == 0 when absent.
+struct VertexBlockLayout {
+    uint32_t begin = 0u;
+    uint32_t vertices = 0u;
+    uint32_t dynamic_vertices = 0u;
+    uint32_t colors = 0u;
+    uint32_t particles_per_env = 0u;
+    uint32_t env_count = 0u;
+};
+
 struct AssembleRowsParams {
     uint32_t grid_nodes_per_env = 0u;
     float    dt;
@@ -705,16 +717,17 @@ struct AssembleRowsParams {
     // Cap on the contact normal aref so a deep contact recovers over several steps,
     // not in one fling. +inf default == non-binding (byte-identical). Model property.
     float    baumgarte_max_velocity;
+    float    contact_margin;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
-    // Distance, bend and volume constraints fill env rows from particle_constraint_row_first
-    // in that order; bend and volume rows read 4-term endpoints from the given firsts.
+    // Distance then volume constraints fill env rows from particle_constraint_row_first;
+    // volume rows read 4-term endpoints from the given firsts.
     uint32_t particle_constraint_row_first = 0u;
     uint32_t dist_cons_per_env = 0u;
-    uint32_t bend_cons_per_env = 0u;
     uint32_t vol_cons_per_env = 0u;
     uint32_t constraint_endpoint_first = 0u;
     uint32_t constraint_term_first = 0u;
+    VertexBlockLayout vertex_blocks{};
 };
 
 // Spec-fixed semantic fields : {dt, vel_iters, pos_iters}. The fields BELOW
@@ -768,6 +781,7 @@ struct SolveRowsBlockIslandParams {
     uint32_t measure_contact_residual = 0u;
     uint32_t total_grid_count = 0u;
     uint64_t workspace_bytes = 0u;
+    VertexBlockLayout vertex_blocks{};
 };
 
 // Word count of the solve_color_scratch field the dynamic island solve colors live rows in.
@@ -816,6 +830,14 @@ struct ParticlePredictParams {
     // MpmXpbd: the per-env MPM slice count. The XPBD predict SKIPS the low slice
     // [0, n_mpm) (the transfer loop owns it); 0 for every non-MpmXpbd mode.
     uint32_t n_mpm_particles;
+    VertexBlockLayout vertex_blocks{};  // predicted by ClothPredict instead
+};
+
+struct ClothStepParams {
+    float dt;
+    float gravity[3];
+    VertexBlockLayout layout;
+    uint32_t integrator;
 };
 
 // Non-MPM particles share one projected position buffer and one step-start position.
@@ -915,6 +937,7 @@ struct ParticleParticleContactParams {
     // per-env scoping. The math reads the FULL union (no soft/fluid branch).
     uint32_t n_soft_particles;
     uint32_t particles_per_env;
+    VertexBlockLayout vertex_blocks{};  // these particles collide through their surfaces.
 };
 
 // --- readout / RL substrate ---------------------------------------------

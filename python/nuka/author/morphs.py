@@ -161,23 +161,22 @@ class GranularBed:
 
 @_dc.dataclass(frozen=True)
 class CableSlab:
-    """The rigid weight welded to a cable's loaded end: a box of ``half_extents``
-    (cooked as one shape-match rigid cluster), ``mass`` per corner (``0`` => the
-    cable particle mass), and shape-match ``stiffness`` in [0,1] (``0`` => rigid)."""
+    """The weight welded to a cable's loaded end: a box of ``half_extents`` whose 8
+    corners form a 28-spring lattice, ``mass`` per corner (``0`` => the cable particle
+    mass), and lattice spring ``stiffness`` EA in N (``0`` => the cable's)."""
 
     half_extents: Tuple[float, float, float]
     mass: float = 0.0
-    stiffness: float = 1.0
+    stiffness: float = 0.0
 
 
 @_dc.dataclass(frozen=True)
 class Cable:
-    """An XPBD rope: an inextensible distance chain of ``segments`` links
-    (``segments+1`` particles) from ``start`` to ``end``, drawn as ``radius``-m
-    beads. ``pin`` picks the kinematic endpoint(s) (``start`` anchor / ``end`` /
-    ``both`` / ``none``); ``bend`` adds skip-one stiffness rows; an optional ``slab``
-    (``CableSlab``) hangs a rigid weight off the loaded end. Pair with a
-    ``materials.Cable.XPBD``. Maps to the ``cable_*`` add_media kwargs."""
+    """A vertex-block rope of ``segments`` links (``segments+1`` particles) from
+    ``start`` to ``end``, drawn as ``radius``-m beads. ``pin`` picks the kinematic
+    endpoint(s) (``start`` anchor / ``end`` / ``both`` / ``none``); an optional
+    ``slab`` (``CableSlab``) hangs a weight off the loaded end. Pair with a
+    ``materials.Cable.VBD``. Maps to the ``cable_*`` add_media kwargs."""
 
     MEDIA_KIND = "cable"
 
@@ -186,7 +185,6 @@ class Cable:
     segments: int
     radius: float
     pin: str = "start"
-    bend: bool = False
     slab: Optional[CableSlab] = None
 
     _PIN = {"start": 0, "end": 1, "both": 2, "none": 3}
@@ -201,7 +199,7 @@ class Cable:
             cable_start=[float(c) for c in self.start],
             cable_end=[float(c) for c in self.end],
             cable_segments=int(self.segments), cable_radius=float(self.radius),
-            cable_pin=int(Cable._PIN[self.pin]), cable_bend=bool(self.bend))
+            cable_pin=int(Cable._PIN[self.pin]))
         if self.slab is not None:
             kw.update(
                 cable_slab_half_extents=[float(c) for c in self.slab.half_extents],

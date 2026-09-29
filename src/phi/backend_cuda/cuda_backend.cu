@@ -88,11 +88,13 @@ const char* NkOpName(int op) {
         case NkOp::ParticleContactDelta: return "ParticleContactDelta";
         case NkOp::AccumulateStep: return "AccumulateStep";
         case NkOp::FkLinkVelocities: return "FkLinkVelocities";
+        case NkOp::ClothPredict: return "ClothPredict";
+        case NkOp::ClothFinalize: return "ClothFinalize";
         default: return "op";
     }
 }
 struct OpProfiler {
-    static constexpr int kN = 64;
+    static constexpr int kN = static_cast<int>(NkOp::Count);
     double ms[kN] = {0.0};
     unsigned long long calls[kN] = {0};
     cudaEvent_t a = nullptr, b = nullptr;

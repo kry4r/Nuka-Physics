@@ -146,7 +146,7 @@ void AddSphere(nk::Model& m, const Vec3& pos, float radius, float inv_mass,
     m.shape_table_rows.push_back(sh);
 }
 
-// Unpinned cloth drapes over the ridges with stretch and bend constraints.
+// Unpinned cloth drapes over the ridges as shell and hinge vertex blocks.
 cook::XpbdCookInput BuildCloth() {
     std::vector<Vec3> rest;
     rest.reserve(kGridN * kGridN);
@@ -167,30 +167,18 @@ cook::XpbdCookInput BuildCloth() {
                                                 idx(i, j + 1)}});
         }
     }
-    soft::ClothTopologyOptions opts;
-    opts.distance_compliance_alpha = 0.0f;     // inextensible stretch.
-    opts.bend_compliance_alpha = 1.0e-4f;      // soft bend so it drapes.
-    soft::XpbdConstraintSet cs;
-    soft::BuildClothConstraints(rest, tris, opts, cs);
+    soft::ShellMaterial shell;
+    shell.stretch_stiffness = 1.0e4f;  // near-inextensible stretch.
+    shell.poisson = 0.3f;
+    shell.bend_stiffness = 1.0e-5f;    // soft bend so it drapes.
 
     cook::XpbdCookInput in;
     in.positions = rest;
     // A tiny downward seed so the flat sheet commits to the ridge symmetrically.
     in.velocities.assign(rest.size(), Vec3{0.0f, 0.0f, -0.05f});
     in.inv_mass.assign(rest.size(), 1.0f / kParticleMass);  // UNPINNED free drape.
-    for (const auto& dc : cs.distance) {
-        cook::CookDistanceCon c;
-        c.a = dc.particle_a; c.b = dc.particle_b;
-        c.rest_length = dc.rest_length; c.compliance_alpha = dc.compliance_alpha;
-        in.distance.push_back(c);
-    }
-    for (const auto& bc : cs.bend) {
-        cook::CookBendCon c;
-        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
-        c.rest_angle = bc.rest_angle;
-        c.compliance_alpha = bc.compliance_alpha;
-        in.bend.push_back(c);
-    }
+    soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
+    in.vbd_count = static_cast<uint32_t>(rest.size());
     in.solver_iterations = kXpbdIters;
     in.friction = 0.6f;
     return in;

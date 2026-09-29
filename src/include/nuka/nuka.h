@@ -161,6 +161,7 @@ typedef struct nuka_world_desc_t {
     float    solver_contact_margin;        // 0.0 => cooked default; speculative margin, m.
     uint32_t solver_max_pairs;             // 0 => bodies_per_env * 4 broadphase emit cap.
     float    solver_baumgarte_max_velocity;// 0.0 => cooked model default.
+    uint32_t cloth_integrator;              // 0 = BDF2, 1 = backward Euler.
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -190,7 +191,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
 // count/extent zero; at least one medium must be present (else INVALID_ARG -- use
 // nuka_world_create_from_scene for a particle-free world).
 typedef struct nuka_coupled_particles_desc_t {
-    // --- cloth (XPBD soft) lattice; cloth_nx == 0 OR cloth_ny == 0 => no cloth ---
+    // --- cloth (vertex-block) lattice; cloth_nx == 0 OR cloth_ny == 0 => no cloth ---
     uint32_t cloth_nx;            // lattice columns (>= 2 to mesh; 0 => no cloth).
     uint32_t cloth_ny;            // lattice rows (>= 2 to mesh).
     float    cloth_spacing;       // lattice edge length, m (> 0 when present).
@@ -199,8 +200,10 @@ typedef struct nuka_coupled_particles_desc_t {
     float    cloth_origin_z;      // lattice plane Z, m.
     float    cloth_particle_mass; // per-particle mass, kg (> 0; e.g. 0.01).
     float    cloth_friction;      // body<->cloth mu (finite => the foot grips/drags).
-    float    cloth_bend_alpha;    // XPBD bend compliance (>= 0; 0 => stiff).
-    uint32_t cloth_iters;         // XPBD solver iterations (0 => 1).
+    float    cloth_stretch_stiffness;  // Young's modulus x thickness, N/m (> 0).
+    float    cloth_bend_stiffness;     // hinge bending stiffness, N m (>= 0).
+    float    cloth_poisson;            // membrane Poisson ratio in [0, 0.5).
+    float    cloth_damping;            // Rayleigh damping on the elastic stiffness, s (>= 0).
     // --- fluid (PBF) box; any fluid extent <= 0 => no fluid ---------------------
     float    fluid_min_x, fluid_min_y, fluid_min_z;  // box min corner, m.
     float    fluid_max_x, fluid_max_y, fluid_max_z;  // box max corner (> min).
@@ -238,6 +241,7 @@ typedef struct nuka_coupled_particles_desc_t {
     float    solver_contact_margin;
     uint32_t solver_max_pairs;
     float    baumgarte_max_velocity;
+    uint32_t cloth_integrator;       // 0 = BDF2, 1 = backward Euler.
 } nuka_coupled_particles_desc_t;
 
 // Create a coupled world. `desc` is the same robot/world descriptor

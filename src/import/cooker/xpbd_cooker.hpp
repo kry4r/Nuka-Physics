@@ -10,7 +10,6 @@
 // type) onto the engine's per-row fields and DISPATCHES to the existing p09-B/C
 // cook-time topology builders:
 //
-//   type == Cloth       -> runtime::soft::BuildClothConstraints   (stretch + bend)
 //   type == SoftBody     -> runtime::soft::BuildTetMeshConstraints (edge   + volume)
 //   type == ShapeMatch   -> a single XpbdShapeMatchCluster (id 9; built here --
 //                          there is no topology builder for the meshless cluster;
@@ -20,7 +19,7 @@
 // docs/architecture/xpbd-soft-schema.md). The mapping is TYPE-DEPENDENT because
 // the elastic rows and the shape-match cluster take DIFFERENT physical fields:
 //
-//   Cloth / SoftBody (elastic rows -- distance, bend, volume):
+//   SoftBody (elastic rows -- distance, volume):
 //       compliance_alpha = (stiffness > 0) ? 1/stiffness : 0   (0 == rigid)
 //     The row field IS a compliance (1/stiffness), so the inverse is the mapping.
 //
@@ -53,7 +52,6 @@
 
 #include "import/cooker/xpbd_cooker_types.hpp"  // XpbdConstraintSet/XpbdShapeMatchCluster (CUDA-free)
 #include "math/vec3.hpp"
-#include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"
 
 #include <cstdint>
@@ -67,31 +65,23 @@ namespace nuka::import::cooker {
 // cooker warns rather than silently discarding it (see WarnIfDampingUnwired).
 constexpr float kDefaultXpbdDamping = 0.01f;
 
-// The authored soft-body kind. Matches the `nuka:soft:type` USD token:
-//   Cloth     <- "cloth"        (triangle mesh -> distance + bend)
-//   SoftBody  <- "softbody"     (tet mesh      -> distance + volume)
-//   ShapeMatch<- "shape_match"  (one meshless cluster over all particles)
-enum class SoftBodyType : uint8_t { Cloth, SoftBody, ShapeMatch };
+// The authored soft-body kind: "softbody" (tet mesh -> distance + volume) or
+// "shape_match" (one meshless cluster over all particles); cloth cooks as vertex blocks.
+enum class SoftBodyType : uint8_t { SoftBody, ShapeMatch };
 
 // Programmatic description of one soft body to cook. The future USD/MJCF importer
 // (p16/#19) populates this; today the tests + any in-tree caller build it
-// directly. Exactly one of `triangles` / `tets` is used, per `type`:
-//   Cloth      -> triangles (each ClothTriangle = 3 particle indices)
-//   SoftBody   -> tets      (each TetMeshTet    = 4 particle indices)
-//   ShapeMatch -> neither   (the whole particle set is one cluster)
+// directly. SoftBody uses `tets`; ShapeMatch makes the whole particle set one cluster.
 struct XpbdSoftBodySpec {
-    SoftBodyType type = SoftBodyType::Cloth;
+    SoftBodyType type = SoftBodyType::SoftBody;
 
     // Rest geometry: one Vec3 per particle, indexed by the triangle/tet indices.
     std::vector<math::Vec3> rest_positions;
 
-    // Cloth topology (used iff type == Cloth).
-    std::vector<runtime::soft::ClothTriangle> triangles;
-
     // Tet topology (used iff type == SoftBody).
     std::vector<runtime::soft::TetMeshTet> tets;
 
-    // nuka:soft:stiffness. Cloth/SoftBody: 1/stiffness -> compliance_alpha
+    // nuka:soft:stiffness. SoftBody: 1/stiffness -> compliance_alpha
     // (<=0 => alpha 0 == rigid). ShapeMatch: clamped into [0,1] as the goal-pull
     // fraction. Default 1e4 (a fairly stiff elastic body).
     float stiffness = 1.0e4f;
@@ -101,11 +91,6 @@ struct XpbdSoftBodySpec {
     // default triggers a loud cook-time warning (WarnIfDampingUnwired) so the
     // caller is never silently given damping=0 behaviour.
     float damping = kDefaultXpbdDamping;
-
-    // Cloth-only: emit the bend constraints (interior-edge Bergou stencil). When
-    // false, only the stretch (distance) constraints are emitted. Mirrors
-    // ClothTopologyOptions::emit_bend_constraints. Ignored for non-Cloth types.
-    bool emit_bend = true;
 
     // SoftBody-only: emit the per-edge distance constraints alongside the volume
     // constraints. Mirrors TetMeshTopologyOptions::emit_distance_constraints.
@@ -141,7 +126,7 @@ float ShapeMatchFractionFromStiffness(float stiffness);
 
 // Cook one soft-body spec into an XpbdConstraintSet. PURE + deterministic:
 // dispatches on spec.type, maps the material params, and appends the constraints
-// (via the existing topology builders for Cloth/SoftBody, or a directly-assembled
+// (via the tet topology builder for SoftBody, or a directly-assembled
 // single cluster for ShapeMatch). The constraint MATH lives in the builders / the
 // id9 row; this only orchestrates. The result feeds the nk soft world cook
 // (nk::Model::ModelParticles, mode == Xpbd) by the caller. MUST call

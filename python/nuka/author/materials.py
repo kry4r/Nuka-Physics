@@ -1,7 +1,7 @@
 """Constitutive materials for the authoring facade.
 
 A material is a parameter bag that also SELECTS the solver method for its medium:
-``Cloth.XPBD`` (cloth, XPBD), ``Cable.XPBD`` (rope, XPBD), ``Soft.XPBD`` /
+``Cloth.VBD`` (cloth, vertex blocks), ``Cable.VBD`` (rope, vertex blocks), ``Soft.XPBD`` /
 ``Soft.MPM`` (tet soft body), ``Fluid.PBF`` / ``Fluid.MPM`` (fluid), and ``Rigid``
 (a rigid primitive). Each
 maps onto the ``SceneBuilder.add_media`` / ``add_rigid_primitive`` kwargs through a
@@ -20,87 +20,95 @@ from typing import Optional, Tuple
 
 @_dc.dataclass(frozen=True)
 class ClothMaterial:
-    """XPBD cloth parameters -> the cloth_* cook kwargs (fast path) or the xpbd_*
-    media block (builder path; the aero/free surface adds the rest)."""
+    """Vertex-block cloth parameters -> the cloth_* cook kwargs (fast path) or the
+    xpbd_*/vbd_* media block (builder path; the aero/free surface adds the rest)."""
 
     MEDIA_KIND = "cloth"
-    MEDIA_METHOD = "xpbd"
+    MEDIA_METHOD = "vbd"
 
     mass: float
     friction: float
-    bend_alpha: float
-    iters: int
+    stretch_stiffness: float
+    poisson: float
+    bend_stiffness: float
+    damping: float
 
     def cook_kwargs(self) -> dict:
         return dict(
             cloth_particle_mass=float(self.mass),
             cloth_friction=float(self.friction),
-            cloth_bend_alpha=float(self.bend_alpha),
-            cloth_iters=int(self.iters),
+            cloth_stretch_stiffness=float(self.stretch_stiffness),
+            cloth_bend_stiffness=float(self.bend_stiffness),
+            cloth_poisson=float(self.poisson),
+            cloth_damping=float(self.damping),
         )
 
     def media_material_kwargs(self) -> dict:
         return dict(
             xpbd_particle_mass=float(self.mass),
             xpbd_friction=float(self.friction),
-            xpbd_bend_alpha=float(self.bend_alpha),
-            xpbd_iters=int(self.iters),
+            vbd_stretch_stiffness=float(self.stretch_stiffness),
+            vbd_poisson=float(self.poisson),
+            vbd_bend_stiffness=float(self.bend_stiffness),
+            vbd_damping=float(self.damping),
         )
 
 
 class Cloth:
-    """Cloth constitutive models. ``Cloth.XPBD(...)`` builds an XPBD material."""
+    """Cloth constitutive models. ``Cloth.VBD(...)`` builds a vertex-block shell."""
 
     @staticmethod
-    def XPBD(mass: float = 0.01, friction: float = 0.6,
-             bend_alpha: float = 1.0e-4, iters: int = 24) -> ClothMaterial:
-        """An XPBD cloth membrane: per-particle ``mass`` kg, Coulomb ``friction``
-        (the cone bound is mu*normal-lambda, mu>1 honoured), ``bend_alpha`` bend
-        compliance (higher = softer folds), and ``iters`` solver iterations."""
-        if iters < 1:
-            raise ValueError("Cloth.XPBD: iters must be >= 1")
-        return ClothMaterial(mass, friction, bend_alpha, iters)
+    def VBD(mass: float = 0.01, friction: float = 0.6,
+            stretch_stiffness: float = 5.0e3, poisson: float = 0.3,
+            bend_stiffness: float = 5.0e-5, damping: float = 0.0) -> ClothMaterial:
+        """A StVK membrane with dihedral bending: per-vertex ``mass`` kg, Coulomb
+        ``friction``, ``stretch_stiffness`` Young's modulus x thickness (N/m),
+        ``poisson`` ratio, ``bend_stiffness`` (N m) and Rayleigh ``damping`` (s)."""
+        if not stretch_stiffness > 0.0:
+            raise ValueError("Cloth.VBD: stretch_stiffness must be > 0")
+        if not 0.0 <= poisson < 0.5:
+            raise ValueError("Cloth.VBD: poisson must be in [0, 0.5)")
+        return ClothMaterial(mass, friction, stretch_stiffness, poisson,
+                             bend_stiffness, damping)
 
 
 @_dc.dataclass(frozen=True)
 class CableMaterial:
-    """XPBD cable (rope) parameters -> the xpbd_* media block. ``distance_alpha`` 0
-    is an inextensible chain; ``bend_alpha`` is the skip-one compliance used when the
-    cable's ``bend`` is on. The optional slab weld reuses the same particle pool."""
+    """Vertex-block rod parameters -> the xpbd_*/vbd_* media block. The optional
+    slab lattice reuses the same particle pool."""
 
     MEDIA_KIND = "cable"
-    MEDIA_METHOD = "xpbd"
+    MEDIA_METHOD = "vbd"
 
     mass: float
     friction: float
-    distance_alpha: float
-    bend_alpha: float
-    iters: int
+    stretch_stiffness: float
+    bend_stiffness: float
+    damping: float
 
     def media_material_kwargs(self) -> dict:
         return dict(
             xpbd_particle_mass=float(self.mass),
             xpbd_friction=float(self.friction),
-            xpbd_distance_alpha=float(self.distance_alpha),
-            xpbd_bend_alpha=float(self.bend_alpha),
-            xpbd_iters=int(self.iters),
+            vbd_stretch_stiffness=float(self.stretch_stiffness),
+            vbd_bend_stiffness=float(self.bend_stiffness),
+            vbd_damping=float(self.damping),
         )
 
 
 class Cable:
-    """Cable (rope) constitutive models. ``Cable.XPBD(...)`` builds an XPBD material."""
+    """Cable (rope) constitutive models. ``Cable.VBD(...)`` builds a vertex-block rod."""
 
     @staticmethod
-    def XPBD(mass: float = 0.05, friction: float = 0.4,
-             distance_alpha: float = 0.0, bend_alpha: float = 1.0e-3,
-             iters: int = 32) -> CableMaterial:
-        """An XPBD rope: per-bead ``mass`` kg, contact ``friction``,
-        ``distance_alpha`` stretch compliance (0 = inextensible), ``bend_alpha`` the
-        skip-one bend compliance (applied when the cable ``bend`` is on), and
-        ``iters`` solver iterations."""
-        if iters < 1:
-            raise ValueError("Cable.XPBD: iters must be >= 1")
-        return CableMaterial(mass, friction, distance_alpha, bend_alpha, iters)
+    def VBD(mass: float = 0.05, friction: float = 0.4,
+            stretch_stiffness: float = 2.0e3, bend_stiffness: float = 0.0,
+            damping: float = 0.0) -> CableMaterial:
+        """A rope: per-bead ``mass`` kg, contact ``friction``, axial
+        ``stretch_stiffness`` EA (N), ``bend_stiffness`` EI (N m^2) and Rayleigh
+        ``damping`` (s)."""
+        if not stretch_stiffness > 0.0:
+            raise ValueError("Cable.VBD: stretch_stiffness must be > 0")
+        return CableMaterial(mass, friction, stretch_stiffness, bend_stiffness, damping)
 
 
 @_dc.dataclass(frozen=True)

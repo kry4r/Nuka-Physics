@@ -175,7 +175,8 @@ def case_cloth_fast_path_unchanged(dev):
         s.add_entity(morphs.NKS(GO2))
         s.add_entity(
             morphs.Grid(nx, ny, spacing, origin=(0.0, 0.0, 0.90)),
-            materials.Cloth.XPBD(mass=0.012, friction=1.8, bend_alpha=0.09, iters=80),
+            materials.Cloth.VBD(mass=0.012, friction=1.8, stretch_stiffness=5.0e3,
+                                bend_stiffness=5.0e-5),
             surfaces.Cloth(free=True, aero=(30.0, 0.12, 0.16)),
             contact_radius=0.022)
         w = s.build(dev)

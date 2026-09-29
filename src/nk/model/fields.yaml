@@ -11,7 +11,7 @@
 #   * runtime::rigid::BodyState (runtime/rigid/body_state.hpp) — movable rigid
 #     body SoA (per body).
 #   * XPBD soft (op-ified on nk, particles.cu) — XPBD particle + 4 constraint
-#     families (per particle / per dist_con / per bend_con / per vol_con / ...).
+#     families (per particle / per dist_con / per vol_con / ...).
 #   * PBF fluid (op-ified on nk, particles.cu) — PBF particle SoA (per particle).
 #   * unified row solve — contacts / rows / sides / lambda warm-start / m_inv /
 #     the SolveSchedule island tables / contact_count + row_count watermarks.
@@ -26,7 +26,7 @@
 #             the engine math types via views.hpp typedefs.)
 #   per    : the count-unit the array is sized by —
 #            env | dof | link | body | contact_slot | row_slot | particle |
-#            dist_con | bend_con | vol_con | shape_match_slot | shape_match_member
+#            dist_con | vol_con | shape_match_slot | shape_match_member
 #            | scalar | articulation | articulation_dof2
 #            (plus the §3.3 examples' env_dof2). `scalar` uses an explicit count.
 #            articulation       = per-ARTICULATION arrays (sized articulations_per_env);
@@ -56,7 +56,7 @@
 
 schema:
   dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36, symmat3]
-  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, bend_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2, articulation_dof, aero_tri]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2, articulation_dof, aero_tri]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
@@ -402,12 +402,6 @@ fields:
   - {name: dist_compliance,    dtype: f32, per: dist_con, arena: persistent, owner: model, flags: [param]}
   - {name: dist_lambda,        dtype: f32, per: dist_con, arena: persistent, owner: data}
 
-  # --- XPBD BEND constraints (per bend_con; 4 particles + 4 gradient vecs) ---
-  - {name: bend_particles,   dtype: u32,  per: bend_con, arena: persistent, owner: model, elem: 4}
-  - {name: bend_rest_angle,  dtype: f32, per: bend_con, arena: persistent, owner: model}
-  - {name: bend_compliance,  dtype: f32,  per: bend_con, arena: persistent, owner: model, flags: [param]}
-  - {name: bend_lambda,      dtype: f32,  per: bend_con, arena: persistent, owner: data}
-
   # --- XPBD VOLUME constraints (per vol_con; 4 particles) ---
   - {name: vol_particles,    dtype: u32, per: vol_con, arena: persistent, owner: model, elem: 4}
   - {name: vol_rest_times6,  dtype: f32, per: vol_con, arena: persistent, owner: model}
@@ -430,7 +424,7 @@ fields:
   #                          does not re-read it -- exactly the legacy kernel).
   #   PER-MEMBER (per: shape_match_member; the flat sum_c n_c pool):
   #     sm_particles       : member particle index (env-major OFFSET like the
-  #                          dist/bend/vol particle fields: +e*particles_per_env).
+  #                          dist/vol particle fields: +e*particles_per_env).
   #     sm_rest_q          : q_i = x_i^0 - c0 (rest offset; cooked once).
   #     sm_mass            : m_i shape-match WEIGHT (independent of inv_mass).
   # All owner:model (cook-constant); shape matching carries NO Lagrange
@@ -716,7 +710,6 @@ fields:
   # every pre-existing arena/Model offset is byte-stable (the D1 invariant).
   # =========================================================================
   - {name: dist_color_segments, dtype: u32, per: scalar, count: "xpbd_dist_colors*2", arena: persistent, owner: model}
-  - {name: bend_color_segments, dtype: u32, per: scalar, count: "xpbd_bend_colors*2", arena: persistent, owner: model}
   - {name: vol_color_segments,  dtype: u32, per: scalar, count: "xpbd_vol_colors*2",  arena: persistent, owner: model}
   - {name: sm_color_segments,   dtype: u32, per: scalar, count: "xpbd_sm_colors*2",   arena: persistent, owner: model}
 
@@ -1009,3 +1002,22 @@ fields:
 
   # Row colors and ordered chains the cooperative island solve rebuilds from each pass's live rows.
   - {name: solve_color_scratch, dtype: u32, per: scalar, count: "solve_color_scratch_words", arena: scratch, owner: data}
+
+  # Vertex blocks: elastic elements, vertex incidence (element << 2 | local) and static color
+  # classes of dynamic vertices. Indices are local to the environment's vertex-block range.
+  - {name: vbd_elements, dtype: vbd_element, per: scalar, count: "vbd_elements_per_env", arena: persistent, owner: model}
+  - {name: vbd_incidence_offsets, dtype: u32, per: scalar, count: "vbd_vertices_per_env+1", arena: persistent, owner: model}
+  - {name: vbd_incidence, dtype: u32, per: scalar, count: "vbd_incidence_per_env", arena: persistent, owner: model}
+  - {name: vbd_color_vertices, dtype: u32, per: scalar, count: "vbd_dynamic_vertices_per_env", arena: persistent, owner: model}
+  - {name: vbd_color_segments, dtype: u32, per: scalar, count: "vbd_colors*2", arena: persistent, owner: model}
+  # Rows see each particle through a response frozen for the step; vertex blocks keep their
+  # inertial target, integrator offset, mass over step squared, row impulse and last write.
+  - {name: particle_response, dtype: symmat3, per: particle, arena: scratch, owner: data}
+  - {name: vbd_target, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  - {name: vbd_offset, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  - {name: vbd_inertia, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  - {name: vbd_row_impulse, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  - {name: vbd_written, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  # Second-order history: the previous velocity, and whether it belongs to the current trajectory.
+  - {name: vbd_history_vel, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: persistent, owner: data}
+  - {name: vbd_history_ready, dtype: u32, per: env, arena: persistent, owner: data}

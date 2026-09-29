@@ -97,11 +97,9 @@ void XpbdColoring::Build(Model* model) {
     const uint32_t P = cap.particles_per_env;
 
     model->dist_color_segments.clear();
-    model->bend_color_segments.clear();
     model->vol_color_segments.clear();
     model->sm_color_segments.clear();
     cap.xpbd_dist_colors = 0u;
-    cap.xpbd_bend_colors = 0u;
     cap.xpbd_vol_colors = 0u;
     cap.xpbd_sm_colors = 0u;
 
@@ -119,25 +117,6 @@ void XpbdColoring::Build(Model* model) {
         Permute(mp.dist_rest, order, 1u);
         Permute(mp.dist_alpha, order, 1u);
         cap.xpbd_dist_colors = nc;
-    }
-
-    // Bend rows carry four particles and one signed rest angle.
-    const uint32_t bn = static_cast<uint32_t>(mp.bend_alpha.size());
-    if (bn > 0u) {
-        std::vector<std::vector<uint32_t>> members(bn);
-        for (uint32_t i = 0u; i < bn; ++i) {
-            const size_t b = static_cast<size_t>(i) * 4u;
-            members[i] = {mp.bend_particles[b + 0u], mp.bend_particles[b + 1u],
-                          mp.bend_particles[b + 2u], mp.bend_particles[b + 3u]};
-        }
-        uint32_t nc = 0u;
-        const std::vector<uint32_t> color = GreedyColor(members, P, &nc);
-        const std::vector<uint32_t> order =
-            ColorOrder(color, nc, &model->bend_color_segments);
-        Permute(mp.bend_particles, order, 4u);
-        Permute(mp.bend_rest_angle, order, 1u);
-        Permute(mp.bend_alpha, order, 1u);
-        cap.xpbd_bend_colors = nc;
     }
 
     // VOLUME: 4 particles per tet (vol_particles[4*c]; rest6/alpha parallel SoA).

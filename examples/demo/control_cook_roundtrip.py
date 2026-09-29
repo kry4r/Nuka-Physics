@@ -32,8 +32,8 @@ def make_world(dev, cloth_free=False, aero=(0.0, 0.0, 0.0)):
         device=dev, scene_path=SCENE, env_count=1, dt=1.0 / 240.0,
         cloth_nx=GRID_NX, cloth_ny=GRID_NY, cloth_spacing=SPACING,
         cloth_origin_x=ORIGIN[0], cloth_origin_y=ORIGIN[1], cloth_origin_z=ORIGIN[2],
-        cloth_particle_mass=0.01, cloth_friction=0.8, cloth_bend_alpha=0.09,
-        cloth_iters=20, cloth_free=cloth_free,
+        cloth_particle_mass=0.01, cloth_friction=0.8, cloth_stretch_stiffness=5.0e3,
+        cloth_bend_stiffness=5.0e-5, cloth_free=cloth_free,
         aero_normal=aero[0], aero_tangent=aero[1], aero_max_dv=aero[2])
 
 

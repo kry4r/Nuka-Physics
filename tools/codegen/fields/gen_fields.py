@@ -58,12 +58,13 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
     "mesh_bvh_node": {"cpp": "::nuka::collision::MeshBvhNode", "code": "kU8", "lanes": 32},
     "point_endpoint_range": {"cpp": "::nuka::nk::PointEndpointRange", "code": "kU8", "lanes": 8},
     "point_endpoint_term": {"cpp": "::nuka::nk::PointEndpointTerm", "code": "kU8", "lanes": 44},
+    "vbd_element": {"cpp": "::nuka::nk::VbdElement", "code": "kU8", "lanes": 64},
 }
 
 VALID_PER = {
     "env", "dof", "link", "body", "contact_slot", "row_slot", "slot_dof",
     "row_dof",
-    "particle", "dist_con", "bend_con", "vol_con", "shape_match_slot",
+    "particle", "dist_con", "vol_con", "shape_match_slot",
     "shape_match_member",
     "env_dof2", "scalar",
     # Multi-articulation co-residence (K Go2 in one env): per-articulation count
@@ -213,6 +214,7 @@ def gen_views(fields: list[dict[str, Any]]) -> str:
         '#include "math/symmetric_mat3.hpp"',
         '#include "collision/mesh_surface_types.hpp"',
         '#include "nk/solve/point_endpoint.hpp"',
+        '#include "nk/solve/vertex_block.hpp"',
         "",
         "namespace nuka::nk {",
         "// Spatial / matrix element types for the articulation device state",
@@ -262,7 +264,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "// concrete element count from the Model capacities x env_count.",
         "enum class FieldPer : uint8_t {",
         "    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,",
-        "    DistCon, BendCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,",
+        "    DistCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,",
         "    Scalar,",
         "    // Multi-articulation co-residence: per-articulation (= "
         "articulations_per_env)",
@@ -297,7 +299,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "contact_slot": "ContactSlot", "row_slot": "RowSlot", "slot_dof": "SlotDof",
         "row_dof": "RowDof",
         "particle": "Particle",
-        "dist_con": "DistCon", "bend_con": "BendCon", "vol_con": "VolCon",
+        "dist_con": "DistCon", "vol_con": "VolCon",
         "shape_match_slot": "ShapeMatchSlot", "shape_match_member": "ShapeMatchMember",
         "env_dof2": "EnvDof2", "scalar": "Scalar",
         "articulation": "Articulation", "articulation_dof2": "ArticulationDof2",
