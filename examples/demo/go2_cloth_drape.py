@@ -3,7 +3,7 @@
 
 Builds the coupled Go2 + free-cloth world through the nuka authoring facade
 (morphs + materials + surfaces -> Scene.build), parks the unpinned square sheet
-flat above a PD-standing Go2 (cooked from go2.nks for its full per-link collision
+flat above a PD-standing Go2 (cooked from go2_cloth_drape_contact3.nks for its per-link collision
 skeleton) while the dog settles, RELEASES it to flutter down under anisotropic
 aero drag and conform to the body on the ONE general body<->particle row solver,
 and beauty-renders the LIVE world each frame with World.render_beauty. The cloth
@@ -30,7 +30,7 @@ from nuka.author.control import ClothDrape, StandHold
 from nuka.author.render import hero_orbit, smoothstep
 
 # Cloth lattice + stance + render the C++ go2_cloth_drape demo uses (reproduced).
-SCENE = "examples/scenes/go2.nks"
+SCENE = "examples/scenes/go2_cloth_drape_contact3.nks"
 NX, NY, SPACING = 55, 51, 0.024
 STAND_BASE_Z, LIFT, PARK = 0.32, 0.58, 0.45
 CLOTH_ORIGIN = (0.0, 0.0, STAND_BASE_Z + LIFT)
@@ -47,7 +47,7 @@ def main():
     dev = nuka.Device.create(0)
 
     # Assemble the coupled world: the Go2 scene morph + a free cloth Grid with its
-    # XPBD material + drape surface, on a baked flat heightfield (contact_family=1).
+    # vertex-block material + drape surface, on a baked flat heightfield (contact_family=1).
     grid = morphs.Grid(NX, NY, SPACING, origin=CLOTH_ORIGIN)
     scene = Scene(SimOptions(
         dt=1.0 / 240.0, env_count=1, contact_family=1,
@@ -56,7 +56,8 @@ def main():
     scene.add_entity(morphs.NKS(SCENE))
     scene.add_entity(
         grid,
-        materials.Cloth.XPBD(mass=0.012, friction=1.8, bend_alpha=0.09, iters=80),
+        materials.Cloth.VBD(mass=0.012, friction=1.8, stretch_stiffness=5.0e3,
+                            bend_stiffness=5.0e-5),
         surfaces.Cloth(free=True, aero=(30.0, 0.12, 0.16)),
         contact_radius=0.022)
     world = scene.build(dev)
@@ -77,7 +78,11 @@ def main():
     for s in range(args.drape):
         stand.hold(); world.step(); cloth.damp()
         if s % args.stride == 0 or s + 1 == args.drape:
-            eye, look = hero_orbit(smoothstep(s / max(1, args.drape - 1)))
+            eye, look = hero_orbit(
+                smoothstep(s / max(1, args.drape - 1)),
+                center=(CLOTH_ORIGIN[0], CLOTH_ORIGIN[1],
+                        0.5 * (CLOTH_ORIGIN[2] + STAND_BASE_Z)),
+                pull_in=0.0, drop=0.0)
             img = world.render_beauty(eye=eye, look=look, width=WIDTH, height=HEIGHT, spp=SPP)
             path = os.path.join(args.out, f"frame_{len(frames):04d}.png")
             Image.fromarray(np.ascontiguousarray(img)).save(path)

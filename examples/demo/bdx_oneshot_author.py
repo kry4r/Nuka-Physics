@@ -63,9 +63,6 @@ GO2_CROUCH = {
     "RL_hip_joint": 0.1, "RL_thigh_joint": 1.0, "RL_calf_joint": -1.5,
     "RR_hip_joint": -0.1, "RR_thigh_joint": 1.0, "RR_calf_joint": -1.5,
 }
-GO2_FOOT_NAMES = ("FL", "FR", "RL", "RR")
-GO2_FOOT_RADIUS = 0.022
-GO2_FOOT_LOCAL = [0.0, 0.0, -0.213]
 BASE_OVER_FLOOR = 0.21              # duck base anchor height over the floor it stands on.
 SCENE_LIFT = 0.05                   # sit the scene above the render's z=0 studio disc.
 PLATFORM_TOP = 0.10
@@ -217,11 +214,11 @@ def add_cloth(b, fabric_id, robot="bdx"):
     # it aside instead of meeting a quasi-rigid wall.
     particle_mass = 0.0005 if robot == "go2" else 0.003
     friction = 0.6 if robot == "go2" else 1.0
-    b.add_media(nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_XPBD,
+    b.add_media(nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_VBD,
                 cloth_nx=CLOTH_NX, cloth_ny=CLOTH_NY, cloth_spacing=CLOTH_SPACING,
                 cloth_origin=list(CLOTH_ORIGIN), cloth_pin=nuka.CLOTH_PIN_EDGE_X1,
                 xpbd_particle_mass=particle_mass, xpbd_friction=friction,
-                xpbd_bend_alpha=0.02, xpbd_iters=30,
+                vbd_stretch_stiffness=5.0e3, vbd_poisson=0.3, vbd_bend_stiffness=2.0e-4,
                 xpbd_aero_normal=0.8, xpbd_aero_tangent=0.2, xpbd_aero_max_dv=0.5,
                 render_material_id=fabric_id)
 
@@ -264,27 +261,25 @@ def add_granular(b, mats, profile, *, trough=TROUGH, zone_c=ZONE_C):
 
 
 def add_cable(b, mats, robot="bdx"):
-    """The D04 hanging stone: an inextensible XPBD cord pinned under the beam with a
-    rigid stone slab welded to its loaded end. The slab's top face sits at the cord
+    """The D04 hanging stone: a stiff vertex-block cord pinned under the beam with a
+    spring-lattice stone slab welded to its loaded end. The slab's top face sits at the cord
     end and hangs downward, dangling at duck-head height for the head-strike swing."""
     go2 = robot == "go2"
-    cord = materials.Cable.XPBD(
-                                mass=(GO2_CABLE_PARTICLE_MASS if go2 else 0.04),
-                                friction=(0.05 if go2 else 0.4), distance_alpha=0.0,
-                                bend_alpha=1.0e-3, iters=32)
+    cord = materials.Cable.VBD(mass=(GO2_CABLE_PARTICLE_MASS if go2 else 0.04),
+                               friction=(0.05 if go2 else 0.4), stretch_stiffness=5.0e3)
     slab_half = GO2_SLAB_HALF if go2 else SLAB_HALF
     slab = morphs.CableSlab(
         half_extents=slab_half,
-        mass=(GO2_SLAB_CORNER_MASS if go2 else 0.075), stiffness=1.0)
+        mass=(GO2_SLAB_CORNER_MASS if go2 else 0.075), stiffness=5.0e4)
     end_z = GO2_CABLE_END_Z if go2 else CABLE_END_Z
     cable = morphs.Cable(start=(BEAM_X, 0.0, CABLE_ANCHOR_Z),
                          end=(BEAM_X, 0.0, end_z), segments=CABLE_SEGMENTS,
-                         radius=CABLE_RADIUS, pin="start", bend=False, slab=slab)
+                         radius=CABLE_RADIUS, pin="start", slab=slab)
     kw = cable.media_geometry_kwargs()
     kw.update(cord.media_material_kwargs())
     kw["render_material_id"] = mats["cord"]
     kw["cable_slab_render_material_id"] = mats["slab_stone"]
-    b.add_media(kind=nuka.MEDIA_CABLE, method=nuka.MEDIA_METHOD_XPBD, **kw)
+    b.add_media(kind=nuka.MEDIA_CABLE, method=nuka.MEDIA_METHOD_VBD, **kw)
 
 
 def sbox(b, half, pos, mat, quat=None, friction=0.9):
@@ -473,24 +468,6 @@ def _set_go2_crouch(node):
     return count
 
 
-def _fix_go2_feet(node):
-    count = 0
-    shape = node.get("collision_shape")
-    if node.get("name") in GO2_FOOT_NAMES and shape:
-        shape["type"] = "sphere"
-        shape["radius"] = GO2_FOOT_RADIUS
-        shape["half_extents"] = [GO2_FOOT_RADIUS] * 3
-        shape["half_height"] = GO2_FOOT_RADIUS
-        shape["local"] = {
-            "pos": list(GO2_FOOT_LOCAL),
-            "quat": [1.0, 0.0, 0.0, 0.0],
-        }
-        count += 1
-    for child in node.get("children", []):
-        count += _fix_go2_feet(child)
-    return count
-
-
 def _retarget_go2_meshes(node, output_nks):
     """Keep the source Go2 mesh indices while changing only the pack basename.
 
@@ -523,11 +500,8 @@ def post_process(out, spawn=SPAWN, robot="bdx"):
         source_robot = copy.deepcopy(source["tree"][0])
         assert source_robot.get("name") == "base", \
             "source Go2 root is not the base articulation"
-        feet = _fix_go2_feet(source_robot)
         joints = _set_go2_crouch(source_robot)
         meshes = _retarget_go2_meshes(source_robot, out)
-        assert feet == len(GO2_FOOT_NAMES), \
-            f"expected {len(GO2_FOOT_NAMES)} Go2 feet, rewrote {feet}"
         assert joints == len(GO2_CROUCH), \
             f"expected {len(GO2_CROUCH)} Go2 joints, set {joints}"
         assert meshes == 33, f"expected 33 Go2 visual meshes, retargeted {meshes}"

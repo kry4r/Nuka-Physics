@@ -11,8 +11,7 @@
 // header with NO GPU/World dependency (no phi::Buffer, no device context, no .cu).
 //
 // These are PURE host PODs that describe an XPBD soft-body BEFORE upload: the
-// particle set, the four constraint families (distance / bend / volume /
-// shape-match), and the constraint-set aggregate. The constraint MATH and the
+// particle set, the three constraint families (distance / volume / shape-match), and the constraint-set aggregate. The constraint MATH and the
 // per-step solve live on the nk path now; this header only carries the cook-time
 // description the topology builders emit and the nk cook transcribes.
 // ---------------------------------------------------------------------------
@@ -37,13 +36,6 @@ struct XpbdDistanceConstraint {
     uint32_t particle_b = 0u;
     float rest_length = 0.0f;
     float compliance_alpha = 0.0f;  // XPBD compliance (1/stiffness); 0 == rigid.
-};
-
-// Signed dihedral bend over a shared edge and two opposite vertices.
-struct XpbdBendConstraint {
-    uint32_t particle[4] = {0u, 0u, 0u, 0u};
-    float rest_angle = 0.0f;
-    float compliance_alpha = 0.0f;  // rad / (N m).
 };
 
 // Host-side description of one VOLUME constraint over the four particles of a tet
@@ -76,7 +68,6 @@ struct XpbdShapeMatchCluster {
 
 struct XpbdConstraintSet {
     std::vector<XpbdDistanceConstraint> distance;
-    std::vector<XpbdBendConstraint> bend;
     std::vector<XpbdVolumeConstraint> volume;
     std::vector<XpbdShapeMatchCluster> shape_match;
 };

@@ -70,6 +70,7 @@ from ._nuka_ext import (  # noqa: F401
     MEDIA_METHOD_XPBD,
     MEDIA_METHOD_PBF,
     MEDIA_METHOD_MLSMPM,
+    MEDIA_METHOD_VBD,
     # SceneBuilder.add_media(cloth_pin=...) pin-set codes.
     CLOTH_PIN_FROM_FREE,
     CLOTH_PIN_NONE,
@@ -326,6 +327,7 @@ __all__ = [
     "MEDIA_METHOD_XPBD",
     "MEDIA_METHOD_PBF",
     "MEDIA_METHOD_MLSMPM",
+    "MEDIA_METHOD_VBD",
     "author",
     "morphs",
     "materials",

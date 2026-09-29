@@ -18,6 +18,7 @@
 #include "math/symmetric_mat3.hpp"
 #include "collision/mesh_surface_types.hpp"
 #include "nk/solve/point_endpoint.hpp"
+#include "nk/solve/vertex_block.hpp"
 
 namespace nuka::nk {
 // Spatial / matrix element types for the articulation device state
@@ -65,9 +66,6 @@ struct ModelView {
     uint32_t* dist_particle_b = nullptr;  // per:dist_con arena:persistent owner:model
     float* dist_rest_length = nullptr;  // per:dist_con arena:persistent owner:model
     float* dist_compliance = nullptr;  // per:dist_con arena:persistent owner:model flags:[param]
-    uint32_t* bend_particles = nullptr;  // per:bend_con arena:persistent owner:model elem:4
-    float* bend_rest_angle = nullptr;  // per:bend_con arena:persistent owner:model
-    float* bend_compliance = nullptr;  // per:bend_con arena:persistent owner:model flags:[param]
     uint32_t* vol_particles = nullptr;  // per:vol_con arena:persistent owner:model elem:4
     float* vol_rest_times6 = nullptr;  // per:vol_con arena:persistent owner:model
     float* vol_compliance = nullptr;  // per:vol_con arena:persistent owner:model flags:[param]
@@ -87,7 +85,6 @@ struct ModelView {
     uint32_t* body_to_articulation = nullptr;  // per:body arena:persistent owner:model
     float* heights = nullptr;  // per:scalar arena:persistent owner:model count:max_heightfield_cells
     uint32_t* dist_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_dist_colors*2
-    uint32_t* bend_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_bend_colors*2
     uint32_t* vol_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_vol_colors*2
     uint32_t* sm_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:xpbd_sm_colors*2
     float* joint_frictionloss = nullptr;  // per:link arena:persistent owner:model flags:[param]
@@ -111,6 +108,11 @@ struct ModelView {
     ::nuka::collision::MeshBvhNode* particle_surface_tree = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_nodes_per_env
     float* particle_surface_thickness = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
     float* particle_surface_friction = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
+    ::nuka::nk::VbdElement* vbd_elements = nullptr;  // per:scalar arena:persistent owner:model count:vbd_elements_per_env
+    uint32_t* vbd_incidence_offsets = nullptr;  // per:scalar arena:persistent owner:model count:vbd_vertices_per_env+1
+    uint32_t* vbd_incidence = nullptr;  // per:scalar arena:persistent owner:model count:vbd_incidence_per_env
+    uint32_t* vbd_color_vertices = nullptr;  // per:scalar arena:persistent owner:model count:vbd_dynamic_vertices_per_env
+    uint32_t* vbd_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:vbd_colors*2
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena
@@ -203,7 +205,6 @@ struct DataView {
     float* particle_inv_mass = nullptr;  // per:particle arena:persistent owner:data flags:[param]
     ::nuka::math::Vec3* particle_v_pre = nullptr;  // per:particle arena:scratch owner:data
     float* dist_lambda = nullptr;  // per:dist_con arena:persistent owner:data
-    float* bend_lambda = nullptr;  // per:bend_con arena:persistent owner:data
     float* vol_lambda = nullptr;  // per:vol_con arena:persistent owner:data
     ::nuka::math::Vec3* pbf_predicted_pos = nullptr;  // per:particle arena:scratch owner:data
     ::nuka::math::Vec3* pbf_position_delta = nullptr;  // per:particle arena:scratch owner:data
@@ -378,6 +379,14 @@ struct DataView {
     uint32_t* contact_solve_counts = nullptr;  // per:env arena:scratch owner:data elem:2 flags:[readout]
     uint32_t* pair_sample_chunks = nullptr;  // per:scalar arena:scratch owner:data count:pair_sample_chunk_words
     uint32_t* solve_color_scratch = nullptr;  // per:scalar arena:scratch owner:data count:solve_color_scratch_words
+    ::nuka::math::SymmetricMat3* particle_response = nullptr;  // per:particle arena:scratch owner:data
+    ::nuka::math::Vec3* vbd_target = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
+    ::nuka::math::Vec3* vbd_offset = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
+    float* vbd_inertia = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
+    ::nuka::math::Vec3* vbd_row_impulse = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
+    ::nuka::math::Vec3* vbd_written = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
+    ::nuka::math::Vec3* vbd_history_vel = nullptr;  // per:scalar arena:persistent owner:data count:vbd_vertices_per_env*env_count
+    uint32_t* vbd_history_ready = nullptr;  // per:env arena:persistent owner:data
 };
 
 } // namespace nuka::phi

@@ -125,8 +125,8 @@ nuka_coupled_particles_desc_t MediaDesc(bool at_feet, float contact_radius = 0.0
     p.cloth_origin_z = (foot_z - 0.012f) + dz;  // membrane just under the foot centre.
     p.cloth_particle_mass = 0.01f;
     p.cloth_friction = 0.6f;
-    p.cloth_bend_alpha = 1.0e-4f;
-    p.cloth_iters = 24u;
+    p.cloth_stretch_stiffness = 1.0e4f;
+    p.cloth_bend_stiffness = 1.0e-5f;
     // A shallow pool under the rear-left foot (x ~ -0.325, y ~ 0.017); the surface at
     // ~the foot centre so the lower hemisphere is submerged from rest.
     const float pool_surf = foot_z + 0.0655f;
@@ -159,8 +159,8 @@ nuka_coupled_particles_desc_t ClothOnlyDesc(bool at_feet) {
     p.cloth_origin_z = 0.28f + dz;    // above the foot centres (~0.2545).
     p.cloth_particle_mass = 0.01f;
     p.cloth_friction = 0.6f;
-    p.cloth_bend_alpha = 1.0e-4f;
-    p.cloth_iters = 24u;
+    p.cloth_stretch_stiffness = 1.0e4f;
+    p.cloth_bend_stiffness = 1.0e-5f;
     p.fluid_spacing = 0.0f;           // cloth-only.
     p.contact_radius = 0.025f;
     return p;
@@ -717,7 +717,7 @@ TEST(CoupledWorldCAbi, DefaultsClothCookFnvMatchesFrozenCanary) {
     p.cloth_nx = 55u; p.cloth_ny = 51u; p.cloth_spacing = 0.024f;
     p.cloth_origin_x = 0.0f; p.cloth_origin_y = 0.0f; p.cloth_origin_z = 0.90f;
     p.cloth_particle_mass = 0.012f; p.cloth_friction = 1.8f;
-    p.cloth_bend_alpha = 0.09f; p.cloth_iters = 80u; p.cloth_free = 1u;
+    p.cloth_stretch_stiffness = 5.0e3f; p.cloth_bend_stiffness = 5.0e-5f; p.cloth_free = 1u;
     p.aero_normal = 30.0f; p.aero_tangent = 0.12f; p.aero_max_dv = 0.16f;
     p.contact_radius = 0.022f;
     ASSERT_EQ(nuka_world_create_coupled_from_scene(device.handle, &d, &p, &w.handle),

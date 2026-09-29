@@ -146,10 +146,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::DistRestLength, DlpackDtype::kF32, 1, false, false},  // dist_rest_length
     {FieldId::DistCompliance, DlpackDtype::kF32, 1, false, false},  // dist_compliance
     {FieldId::DistLambda, DlpackDtype::kF32, 1, false, false},  // dist_lambda
-    {FieldId::BendParticles, DlpackDtype::kU32, 2, false, false},  // bend_particles
-    {FieldId::BendRestAngle, DlpackDtype::kF32, 1, false, false},  // bend_rest_angle
-    {FieldId::BendCompliance, DlpackDtype::kF32, 1, false, false},  // bend_compliance
-    {FieldId::BendLambda, DlpackDtype::kF32, 1, false, false},  // bend_lambda
     {FieldId::VolParticles, DlpackDtype::kU32, 2, false, false},  // vol_particles
     {FieldId::VolRestTimes6, DlpackDtype::kF32, 1, false, false},  // vol_rest_times6
     {FieldId::VolCompliance, DlpackDtype::kF32, 1, false, false},  // vol_compliance
@@ -211,7 +207,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::SnapshotParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_prev_pos
     {FieldId::SnapshotParticleVel, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_vel
     {FieldId::DistColorSegments, DlpackDtype::kU32, 1, false, false},  // dist_color_segments
-    {FieldId::BendColorSegments, DlpackDtype::kU32, 1, false, false},  // bend_color_segments
     {FieldId::VolColorSegments, DlpackDtype::kU32, 1, false, false},  // vol_color_segments
     {FieldId::SmColorSegments, DlpackDtype::kU32, 1, false, false},  // sm_color_segments
     {FieldId::GridSortScratch, DlpackDtype::kU8, 1, false, false},  // grid_sort_scratch
@@ -367,6 +362,19 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactSolveCounts, DlpackDtype::kU32, 2, false, true},  // contact_solve_counts
     {FieldId::PairSampleChunks, DlpackDtype::kU32, 1, false, false},  // pair_sample_chunks
     {FieldId::SolveColorScratch, DlpackDtype::kU32, 1, false, false},  // solve_color_scratch
+    {FieldId::VbdElements, DlpackDtype::kU8, 2, false, false},  // vbd_elements
+    {FieldId::VbdIncidenceOffsets, DlpackDtype::kU32, 1, false, false},  // vbd_incidence_offsets
+    {FieldId::VbdIncidence, DlpackDtype::kU32, 1, false, false},  // vbd_incidence
+    {FieldId::VbdColorVertices, DlpackDtype::kU32, 1, false, false},  // vbd_color_vertices
+    {FieldId::VbdColorSegments, DlpackDtype::kU32, 1, false, false},  // vbd_color_segments
+    {FieldId::ParticleResponse, DlpackDtype::kF32, 2, false, false},  // particle_response
+    {FieldId::VbdTarget, DlpackDtype::kF32, 2, false, false},  // vbd_target
+    {FieldId::VbdOffset, DlpackDtype::kF32, 2, false, false},  // vbd_offset
+    {FieldId::VbdInertia, DlpackDtype::kF32, 1, false, false},  // vbd_inertia
+    {FieldId::VbdRowImpulse, DlpackDtype::kF32, 2, false, false},  // vbd_row_impulse
+    {FieldId::VbdWritten, DlpackDtype::kF32, 2, false, false},  // vbd_written
+    {FieldId::VbdHistoryVel, DlpackDtype::kF32, 2, false, false},  // vbd_history_vel
+    {FieldId::VbdHistoryReady, DlpackDtype::kU32, 1, false, false},  // vbd_history_ready
 };
 
 } // namespace nuka::nk

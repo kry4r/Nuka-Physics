@@ -4,7 +4,6 @@
 #include <cmath>
 #include <limits>
 
-#include "collision/contact_capacity.hpp"
 #include "nk/model/model.hpp"
 #include "nk/model/generated/views.hpp"
 #include "phi/articulation_contract.hpp"
@@ -16,9 +15,8 @@ namespace {
 phi::Status ContactLayout(const nk::Model& model, uint32_t env_count, phi::SensorContactLayout* layout) {
     const auto& cap = model.capacities;
     if (model.MpmParticlesPerEnv() > cap.particles_per_env) return phi::Status::InvalidArgument;
-    const uint64_t particle_slots = cap.bodies_per_env && cap.max_contacts_per_env
-        ? uint64_t{cap.particles_per_env - model.MpmParticlesPerEnv()} *
-              collision::kBodyParticleContactSlotsPerParticle : 0u;
+    const uint64_t particle_slots = cap.max_contacts_per_env
+        ? cap.ParticleContactReserve(model.MpmParticlesPerEnv()) : 0u;
     if (particle_slots + cap.mpm_contact_capacity_per_env > cap.max_contacts_per_env)
         return phi::Status::InvalidArgument;
     layout->env_count = env_count;

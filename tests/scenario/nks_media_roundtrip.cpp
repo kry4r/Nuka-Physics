@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 // A SceneIR carrying authored rigid primitives + a cloth / soft-tet MediaRecord
 // is Saved to .nks and Loaded back; the loaded records must be field-equal and
-// the cloth must cook (BuildClothXpbdInput) to the byte-identical lattice — the
+// the cloth must cook (BuildClothVertexBlockInput) to the byte-identical lattice — the
 // same FNV-1a the coupled / facade cloth cook produces. A separate case proves a
 // media-free scene (examples/scenes/go2.nks) is byte-identical through Save: the
 // new media section is additive (emitted only when media is present).
@@ -109,7 +109,7 @@ SceneIR BuildMediaScene() {
     MediaRecord cloth;
     cloth.name = "drape";
     cloth.kind = MediaRecord::Kind::Cloth;
-    cloth.method = MediaRecord::Method::Xpbd;
+    cloth.method = MediaRecord::Method::Vbd;
     cloth.cloth_grid.nx = 55u;
     cloth.cloth_grid.ny = 51u;
     cloth.cloth_grid.spacing = 0.024f;
@@ -117,8 +117,10 @@ SceneIR BuildMediaScene() {
     cloth.cloth_grid.free = true;
     cloth.xpbd.particle_mass = 0.012f;
     cloth.xpbd.friction = 1.8f;
-    cloth.xpbd.bend_alpha = 0.09f;
-    cloth.xpbd.iters = 80u;
+    cloth.xpbd.stretch_stiffness = 5.0e3f;
+    cloth.xpbd.poisson = 0.3f;
+    cloth.xpbd.bend_stiffness = 5.0e-5f;
+    cloth.xpbd.damping = 1.0e-3f;
     cloth.xpbd.aero_drag_normal = 30.0f;
     cloth.xpbd.aero_drag_tangent = 0.12f;
     cloth.xpbd.aero_drag_max_dv = 0.16f;
@@ -179,7 +181,10 @@ void ExpectMediaEqual(const MediaRecord& a, const MediaRecord& b) {
     EXPECT_FLOAT_EQ(a.xpbd.particle_mass, b.xpbd.particle_mass);
     EXPECT_FLOAT_EQ(a.xpbd.friction, b.xpbd.friction);
     EXPECT_FLOAT_EQ(a.xpbd.distance_alpha, b.xpbd.distance_alpha);
-    EXPECT_FLOAT_EQ(a.xpbd.bend_alpha, b.xpbd.bend_alpha);
+    EXPECT_FLOAT_EQ(a.xpbd.stretch_stiffness, b.xpbd.stretch_stiffness);
+    EXPECT_FLOAT_EQ(a.xpbd.poisson, b.xpbd.poisson);
+    EXPECT_FLOAT_EQ(a.xpbd.bend_stiffness, b.xpbd.bend_stiffness);
+    EXPECT_FLOAT_EQ(a.xpbd.damping, b.xpbd.damping);
     EXPECT_FLOAT_EQ(a.xpbd.volume_alpha, b.xpbd.volume_alpha);
     EXPECT_EQ(a.xpbd.iters, b.xpbd.iters);
     EXPECT_FLOAT_EQ(a.xpbd.aero_drag_normal, b.xpbd.aero_drag_normal);
@@ -251,8 +256,8 @@ TEST(NksMediaRoundtrip, MediaAndPrimitiveRoundtrip) {
 
     // the cloth cooks to the byte-identical lattice (orig == loaded), and matches
     // the frozen go2_cloth_drape canary FNV the coupled/facade cloth cook pins.
-    const cook::XpbdCookInput orig_cloth = cook::BuildClothXpbdInput(orig.GetMedia(0));
-    const cook::XpbdCookInput load_cloth = cook::BuildClothXpbdInput(loaded.GetMedia(0));
+    const cook::XpbdCookInput orig_cloth = cook::BuildClothVertexBlockInput(orig.GetMedia(0));
+    const cook::XpbdCookInput load_cloth = cook::BuildClothVertexBlockInput(loaded.GetMedia(0));
     ASSERT_FALSE(load_cloth.positions.empty());
     ASSERT_EQ(orig_cloth.positions.size(), load_cloth.positions.size());
     const uint64_t fnv_o = FnvPositions(orig_cloth.positions);

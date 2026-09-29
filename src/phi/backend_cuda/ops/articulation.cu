@@ -1544,6 +1544,7 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkBuildSolveIslandsOps(); // dynamic connected-component solve schedule
     RegisterNkSolveRowsOps();
     RegisterNkParticleOps();
+    RegisterNkVertexBlockOps();
     RegisterNkMpmOps();              // MLS-MPM transfers (inert round-trip scaffold)
     RegisterNkReadoutOps();
     RegisterNkSensorOps();

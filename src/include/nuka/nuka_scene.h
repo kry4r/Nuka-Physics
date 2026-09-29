@@ -242,13 +242,14 @@ typedef enum nuka_media_kind_t {
     NUKA_MEDIA_SOFT_TET = 1,
     NUKA_MEDIA_FLUID    = 2,
     NUKA_MEDIA_GRANULAR = 3,  /* Drucker-Prager sand/gravel bed (MLS-MPM only). */
-    NUKA_MEDIA_CABLE    = 4   /* XPBD inextensible distance chain / rope (XPBD only). */
+    NUKA_MEDIA_CABLE    = 4   /* Vertex-block rod / rope (VBD only). */
 } nuka_media_kind_t;
 
 typedef enum nuka_media_method_t {
     NUKA_MEDIA_METHOD_XPBD   = 0,
     NUKA_MEDIA_METHOD_PBF    = 1,
-    NUKA_MEDIA_METHOD_MLSMPM = 2
+    NUKA_MEDIA_METHOD_MLSMPM = 2,
+    NUKA_MEDIA_METHOD_VBD    = 3   /* Vertex blocks: cloth and cable. */
 } nuka_media_method_t;
 
 // A TAGGED media record: `kind` + `method` select which geometry block and which
@@ -282,30 +283,34 @@ typedef struct nuka_media_desc_t {
     float    fluid_max[3];
     float    fluid_spacing;
     float    fluid_position_jitter;
-    // CABLE: an XPBD distance chain of cable_segments links (cable_segments+1
+    // CABLE: a vertex-block rod of cable_segments links (cable_segments+1
     // particles) from cable_start to cable_end; cable_radius is the render bead +
-    // contact size. cable_pin: 0 anchor(start), 1 loaded end, 2 both, 3 none;
-    // cable_bend 1 adds skip-one stiffness rows. An optional rigid slab welded to the
-    // loaded end (a shape-match cluster): cable_slab_half_extents all > 0 => present,
-    // cable_slab_mass per corner (0 => the cable particle mass), stiffness in [0,1].
+    // contact size. cable_pin: 0 anchor(start), 1 loaded end, 2 both, 3 none.
+    // An optional slab welded to the loaded end (a 28-spring corner lattice):
+    // cable_slab_half_extents all > 0 => present, cable_slab_mass per corner
+    // (0 => the cable particle mass), stiffness the lattice EA in N (0 => the cable's).
     float    cable_start[3];
     float    cable_end[3];
     uint32_t cable_segments;
     float    cable_radius;
     uint32_t cable_pin;
-    uint32_t cable_bend;
     float    cable_slab_half_extents[3];
     float    cable_slab_mass;
     float    cable_slab_stiffness;
     uint32_t cable_slab_render_material_id;  // ~0u => inherit the medium material.
 
     // -- constitutive material (the block matching `method`) -----------------
-    // XPBD (cloth uses distance+bend; soft-tet uses distance+volume).
+    // XPBD soft-tet (distance+volume) and the shared soft mass/friction/aero block.
     float    xpbd_particle_mass;
     float    xpbd_friction;
     float    xpbd_distance_alpha;
-    float    xpbd_bend_alpha;
     float    xpbd_volume_alpha;
+    // VBD cloth: stretch = Young's modulus x thickness (N/m), bend = hinge (N m);
+    // cable: stretch = EA (N), bend = EI (N m^2). damping is Rayleigh (s).
+    float    vbd_stretch_stiffness;
+    float    vbd_poisson;
+    float    vbd_bend_stiffness;
+    float    vbd_damping;
     uint32_t xpbd_iters;
     float    xpbd_aero_drag_normal;
     float    xpbd_aero_drag_tangent;
@@ -473,6 +478,7 @@ typedef struct nuka_built_scene_options_t {
     // so particle/MPM contact rides the true silhouette (a foot engages the MPM grid BC).
     // 0 (default) leaves every existing cook byte-identical.
     uint32_t bake_link_sdf;
+    uint32_t cloth_integrator;       // 0 = BDF2, 1 = backward Euler.
 } nuka_built_scene_options_t;
 
 // Cook the built scene's SceneIR via the SAME cook::CookSceneToModel a file scene

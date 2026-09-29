@@ -59,6 +59,7 @@ public:
         uint32_t substeps = 1u;
         // Contact exchanges per interval; zero follows the material projection count.
         uint16_t coupling_passes = 0u;
+        uint32_t cloth_integrator = 0u;  // 0 = BDF2, 1 = backward Euler.
     };
 
     // Demand mask for pure-readout ops: a readout writes an output field no other
@@ -136,6 +137,7 @@ private:
     phi::PbfDensityLambdaParams       p_pbf_density_{};
     phi::PbfApplyDeltaParams          p_pbf_apply_{};
     phi::ParticleFinalizeParams       p_part_finalize_{};
+    phi::ClothStepParams              p_cloth_step_{};
     phi::ParticleParticleContactParams p_pp_contact_{};
     phi::MpmParams                    p_mpm_{};
     phi::ReadoutContactWrenchParams   p_readout_{};

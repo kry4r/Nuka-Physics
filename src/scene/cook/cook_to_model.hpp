@@ -114,8 +114,6 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
 
 // One XPBD distance constraint (the de-interleaved XpbdDistanceConstraint).
 struct CookDistanceCon { uint32_t a, b; float rest_length, compliance_alpha; };
-// One XPBD bend constraint (4 particles + 4 cooked gradient vectors K_i).
-struct CookBendCon { uint32_t p[4]; float rest_angle; float compliance_alpha; };
 // One XPBD volume constraint (4 particles + 6*rest_volume + compliance).
 struct CookVolumeCon { uint32_t p[4]; float rest_volume_times6, compliance_alpha; };
 // One XPBD shape-match cluster (; the de-interleaved XpbdShapeMatchCluster).
@@ -140,7 +138,6 @@ struct XpbdCookInput {
     std::vector<math::Vec3>      velocities;    // per-particle initial velocity
     std::vector<float>           inv_mass;      // 1/mass (0 == pinned)
     std::vector<CookDistanceCon> distance;
-    std::vector<CookBendCon>     bend;
     std::vector<CookVolumeCon>   volume;
     std::vector<CookShapeMatchCluster> shape_match;  // (id 9).
     // Cloth aerodynamic-drag surface triangles (3 particle indices / triangle).
@@ -160,6 +157,9 @@ struct XpbdCookInput {
     nk::Model::ParticleMode solver = nk::Model::ParticleMode::Xpbd;
     std::vector<CookParticleSurface> surfaces;
     bool self_contact = false;  // particles collide across folds and layers
+    // Vertex-block elements over input particles [vbd_begin, vbd_begin + vbd_count), indexed by input particle.
+    std::vector<nk::VbdElement> vbd_elements;
+    uint32_t vbd_begin = 0u, vbd_count = 0u;
 };
 
 // Stage an XPBD soft body into the Model (single-env template; SeedInitialState
@@ -294,29 +294,30 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
 
 // ---------------------------------------------------------------------------
 // Media records -> particle cook. The per-medium builders read a scene
-// MediaRecord and reuse the SAME constraint/lattice cookers
-// (soft::BuildClothConstraints / import::cooker::CookFluidBox) -- never
-// reimplemented. The dispatch concatenates XPBD media (cloth) into the soft slice
-// and the one PBF fluid into the fluid slice via CookSoftFluidParticles, so the
-// media list rides the EXISTING [soft | fluid] layout (no new ParticleMode).
+// MediaRecord and reuse the SAME topology/lattice cookers
+// (soft::BuildClothVertexBlocks / import::cooker::CookFluidBox) -- never
+// reimplemented. The dispatch concatenates tet media, then vertex-block media,
+// into the soft slice and the one PBF fluid into the fluid slice via
+// CookSoftFluidParticles, so the media list rides the [soft | fluid] layout.
 // ---------------------------------------------------------------------------
 
-// Build the XPBD cook input for a cloth MediaRecord: a flat (nx x ny) lattice at the
-// authored origin (perimeter pinned unless free), meshed into triangles whose
-// stretch+bend constraints come from soft::BuildClothConstraints. Empty when the
-// grid extent is absent (nx<2 / ny<2 / spacing<=0).
-XpbdCookInput BuildClothXpbdInput(const MediaRecord& media);
+// Whether a medium solves as vertex blocks (cloth and cable); these end the soft slice.
+bool IsVertexBlockMedium(const MediaRecord& media);
+
+// Build the soft-slice input of a cloth MediaRecord: a baked mesh or a flat (nx x ny)
+// lattice, lumped area masses, and StVK membrane plus hinge vertex blocks from
+// soft::BuildClothVertexBlocks. Empty when the geometry is absent.
+XpbdCookInput BuildClothVertexBlockInput(const MediaRecord& media);
 
 // Build the XPBD cook input for a tet-soft MediaRecord from its sphere rest-lattice
 // (soft::BuildSphereTetLattice + BuildTetMeshConstraints). Empty when extent absent.
 XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media);
 
-// Build the XPBD cook input for a cable MediaRecord: a distance chain of segments+1
-// particles from start to end (inextensible unless distance_alpha > 0), the pinned
-// endpoint(s) kinematic, an optional bend (skip-one) row set, and an optional rigid
-// slab (a shape-match cluster welded to the loaded end). Empty when segments < 1 or
-// radius <= 0. Mirrors BuildClothXpbdInput; slab corners follow the chain particles.
-XpbdCookInput BuildCableXpbdInput(const MediaRecord& media);
+// Build the soft-slice input of a cable MediaRecord: segments+1 vertex blocks from
+// start to end joined by axial springs and segment bends, the pinned endpoint(s)
+// kinematic, and an optional slab whose 8 corners form a 28-spring lattice welded to
+// the loaded end by 4 springs. Empty when segments < 1 or radius <= 0.
+XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media);
 
 // Build the MLS-MPM cook input for a tet-soft / fluid MediaRecord: particles sampled
 // from the geometry (sphere lattice / CookFluidBox), material + grid from MediaMpmMaterial.
@@ -326,7 +327,7 @@ MpmCookInput BuildMpmInput(const MediaRecord& media);
 MpmCookInput BuildMpmInput(const std::vector<MediaRecord>& media);
 
 // The cloth lattice render-surface triangle list (two triangles per quad, the SAME
-// row-major winding BuildClothXpbdInput meshes the constraints with). Empty when the
+// row-major winding BuildClothVertexBlockInput meshes the elements with). Empty when the
 // grid extent is absent. Indexes the [0, nx*ny) cloth particles (laid out first).
 std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media);
 

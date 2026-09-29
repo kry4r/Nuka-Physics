@@ -603,6 +603,7 @@ add_library(nuka_nk STATIC
     nk/pipeline/world.cpp
     nk/solve/schedule.cpp
     nk/solve/xpbd_coloring.cpp
+    nk/solve/vertex_block_schedule.cpp
     sensor/observation.cpp
     sensor/state_bank.cpp
 )
@@ -746,6 +747,7 @@ if(CMAKE_CUDA_COMPILER)
         # (predict / xpbd project / pbf density-lambda / pbf apply / finalize),
         # the particle side of the unified row solve.
         phi/backend_cuda/ops/particles.cu
+        phi/backend_cuda/ops/vertex_blocks.cu
         # MLS-MPM transfer ops (P2G deterministic gather + G2P + grid clear) — the
         # inert round-trip scaffold; reachable through RegisterNkMpmOps, not yet in
         # Pipeline::Build's op list.

@@ -187,10 +187,10 @@ def jacket(output, scale, offset, robot_info, clearance):
     save(output / "jacket.nks", {"nks_version": 1,
         "render_materials": {"jacket_avocado": {"base_color": [0.23, 0.34, 0.095, 1],
             "roughness": 0.88, "metallic": 0.0, "sheen": 0.28}},
-        "media": [{"name": "jacket", "kind": "cloth", "method": "xpbd", "baked": "jacket.nka#MESH/0",
+        "media": [{"name": "jacket", "kind": "cloth", "method": "vbd", "baked": "jacket.nka#MESH/0",
             "cloth_mesh": {"material_mesh": "jacket.nka#MESH/1", "pinned_vertices": []},
             "xpbd": {"surface_density": 0.5, "half_thickness": 0.003, "friction": 0.35,
-                "distance_alpha": 1e-6, "bend_alpha": 25000.0, "iters": 8},
+                "stretch_stiffness": 1.0e4, "poisson": 0.3, "bend_stiffness": 1.0e-5},
             "render_material_id": 0}]})
     shutil.copy2(source / "LICENSE", output / "JACKET_LICENSE")
     return {"source": json.loads((source / "manifest.json").read_text()), "scale": scale,

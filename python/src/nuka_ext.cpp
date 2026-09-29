@@ -180,6 +180,7 @@ public:
                                     uint32_t solver_pos_iters,
                                     float solver_contact_margin,
                                     uint32_t solver_max_pairs,
+                                    uint32_t cloth_integrator,
                                     float baumgarte_max_velocity,
                                     float gravity_x, float gravity_y, float gravity_z) {
         if (device == nullptr || !device->valid()) {
@@ -262,6 +263,7 @@ public:
         desc.solver_pos_iters = solver_pos_iters;
         desc.solver_contact_margin = solver_contact_margin;
         desc.solver_max_pairs = solver_max_pairs;
+        desc.cloth_integrator = cloth_integrator;
         desc.solver_baumgarte_max_velocity = baumgarte_max_velocity;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
@@ -294,14 +296,15 @@ public:
         float terrain_grid_width, float terrain_grid_height_max, uint32_t cloth_nx,
         uint32_t cloth_ny, float cloth_spacing, float cloth_origin_x,
         float cloth_origin_y, float cloth_origin_z, float cloth_particle_mass,
-        float cloth_friction, float cloth_bend_alpha, uint32_t cloth_iters,
-        float fluid_min_x, float fluid_min_y, float fluid_min_z, float fluid_max_x,
+        float cloth_friction, float cloth_stretch_stiffness, float cloth_bend_stiffness,
+        float cloth_poisson, float cloth_damping, float fluid_min_x, float fluid_min_y, float fluid_min_z, float fluid_max_x,
         float fluid_max_y, float fluid_max_z, float fluid_spacing,
         float fluid_rest_density, float fluid_floor_z, float fluid_friction,
         uint32_t fluid_iters, float contact_radius, uint32_t soft_sim_method,
         bool cloth_free, float aero_normal, float aero_tangent, float aero_max_dv,
         uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
+        uint32_t cloth_integrator,
         float baumgarte_max_velocity, uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_coupled_from_scene: invalid device");
@@ -333,8 +336,10 @@ public:
         parts.cloth_origin_z = cloth_origin_z;
         parts.cloth_particle_mass = cloth_particle_mass;
         parts.cloth_friction = cloth_friction;
-        parts.cloth_bend_alpha = cloth_bend_alpha;
-        parts.cloth_iters = cloth_iters;
+        parts.cloth_stretch_stiffness = cloth_stretch_stiffness;
+        parts.cloth_bend_stiffness = cloth_bend_stiffness;
+        parts.cloth_poisson = cloth_poisson;
+        parts.cloth_damping = cloth_damping;
         parts.fluid_min_x = fluid_min_x;
         parts.fluid_min_y = fluid_min_y;
         parts.fluid_min_z = fluid_min_z;
@@ -357,6 +362,7 @@ public:
         parts.solver_pos_iters = solver_pos_iters;
         parts.solver_contact_margin = solver_contact_margin;
         parts.solver_max_pairs = solver_max_pairs;
+        parts.cloth_integrator = cloth_integrator;
         parts.baumgarte_max_velocity = baumgarte_max_velocity;
 
         nuka_world_handle h = nullptr;
@@ -397,6 +403,7 @@ public:
         float terrain_grid_height_max, float gravity_x, float gravity_y,
         float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
+        uint32_t cloth_integrator,
         float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_built_scene: invalid device");
@@ -441,6 +448,7 @@ public:
         opts.solver_pos_iters = solver_pos_iters;
         opts.solver_contact_margin = solver_contact_margin;
         opts.solver_max_pairs = solver_max_pairs;
+        opts.cloth_integrator = cloth_integrator;
         opts.baumgarte_max_velocity = baumgarte_max_velocity;
         opts.bake_link_sdf = bake_link_sdf ? 1u : 0u;
 
@@ -1461,8 +1469,9 @@ public:
                    const std::vector<float>& fluid_max, float fluid_spacing,
                    float fluid_position_jitter, float mpm_loft_headroom,
                    float xpbd_particle_mass, float xpbd_friction,
-                   float xpbd_distance_alpha, float xpbd_bend_alpha,
-                   float xpbd_volume_alpha, uint32_t xpbd_iters,
+                   float xpbd_distance_alpha, float xpbd_volume_alpha,
+                   float vbd_stretch_stiffness, float vbd_poisson,
+                   float vbd_bend_stiffness, float vbd_damping, uint32_t xpbd_iters,
                    float xpbd_aero_normal, float xpbd_aero_tangent,
                    float xpbd_aero_max_dv, float pbf_rest_density,
                    float pbf_support_scale, uint32_t pbf_iters, float pbf_friction,
@@ -1481,7 +1490,7 @@ public:
                    float skin_grain_tint_jitter, uint32_t render_material_id,
                    const std::vector<float>& cable_start,
                    const std::vector<float>& cable_end, uint32_t cable_segments,
-                   float cable_radius, uint32_t cable_pin, bool cable_bend,
+                   float cable_radius, uint32_t cable_pin,
                    const std::vector<float>& cable_slab_half_extents,
                    float cable_slab_mass, float cable_slab_stiffness,
                    uint32_t cable_slab_render_material_id,
@@ -1514,8 +1523,11 @@ public:
         d.xpbd_particle_mass = xpbd_particle_mass;
         d.xpbd_friction = xpbd_friction;
         d.xpbd_distance_alpha = xpbd_distance_alpha;
-        d.xpbd_bend_alpha = xpbd_bend_alpha;
         d.xpbd_volume_alpha = xpbd_volume_alpha;
+        d.vbd_stretch_stiffness = vbd_stretch_stiffness;
+        d.vbd_poisson = vbd_poisson;
+        d.vbd_bend_stiffness = vbd_bend_stiffness;
+        d.vbd_damping = vbd_damping;
         d.xpbd_iters = xpbd_iters;
         d.xpbd_aero_drag_normal = xpbd_aero_normal;
         d.xpbd_aero_drag_tangent = xpbd_aero_tangent;
@@ -1557,7 +1569,6 @@ public:
         d.cable_segments = cable_segments;
         d.cable_radius = cable_radius;
         d.cable_pin = cable_pin;
-        d.cable_bend = cable_bend ? 1u : 0u;
         vec3(cable_slab_half_extents, d.cable_slab_half_extents,
              "cable_slab_half_extents");
         d.cable_slab_mass = cable_slab_mass;
@@ -1623,6 +1634,7 @@ public:
                  float terrain_grid_height_max, float gravity_x, float gravity_y,
                  float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
                  float solver_contact_margin, uint32_t solver_max_pairs,
+                 uint32_t cloth_integrator,
                  float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
         if (device == nullptr) {
             throw std::runtime_error("SceneBuilder.build: device is None");
@@ -1633,7 +1645,8 @@ public:
             heightfield_cell, terrain_step_height, terrain_step_width,
             terrain_platform_width, terrain_grid_width, terrain_grid_height_max,
             gravity_x, gravity_y, gravity_z, solver_vel_iters, solver_pos_iters,
-            solver_contact_margin, solver_max_pairs, baumgarte_max_velocity,
+            solver_contact_margin, solver_max_pairs, cloth_integrator,
+            baumgarte_max_velocity,
             bake_link_sdf, osc_task_link);
     }
 
@@ -1813,6 +1826,7 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("MEDIA_METHOD_XPBD") = uint32_t{0};
     m.attr("MEDIA_METHOD_PBF") = uint32_t{1};
     m.attr("MEDIA_METHOD_MLSMPM") = uint32_t{2};
+    m.attr("MEDIA_METHOD_VBD") = uint32_t{3};
     // SceneBuilder.add_media(cloth_pin=...) pin-set codes (MediaRecord::ClothPin):
     // which cloth node set cooks with inv_mass 0.
     m.attr("CLOTH_PIN_FROM_FREE") = uint32_t{0};
@@ -2050,6 +2064,7 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("solver_pos_iters") = uint32_t{0},
                     nb::arg("solver_contact_margin") = 0.0f,
                     nb::arg("solver_max_pairs") = uint32_t{0},
+                    nb::arg("cloth_integrator") = uint32_t{0},
                     nb::arg("baumgarte_max_velocity") = 0.0f,
                     nb::arg("gravity_x") = 0.0f,
                     nb::arg("gravity_y") = 0.0f,
@@ -2095,8 +2110,9 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("cloth_ny") = 0u, nb::arg("cloth_spacing") = 0.0f,
             nb::arg("cloth_origin_x") = 0.0f, nb::arg("cloth_origin_y") = 0.0f,
             nb::arg("cloth_origin_z") = 0.0f, nb::arg("cloth_particle_mass") = 0.01f,
-            nb::arg("cloth_friction") = 0.6f, nb::arg("cloth_bend_alpha") = 1.0e-4f,
-            nb::arg("cloth_iters") = 24u, nb::arg("fluid_min_x") = 0.0f,
+            nb::arg("cloth_friction") = 0.6f, nb::arg("cloth_stretch_stiffness") = 5.0e3f,
+            nb::arg("cloth_bend_stiffness") = 5.0e-5f, nb::arg("cloth_poisson") = 0.3f,
+            nb::arg("cloth_damping") = 0.0f, nb::arg("fluid_min_x") = 0.0f,
             nb::arg("fluid_min_y") = 0.0f, nb::arg("fluid_min_z") = 0.0f,
             nb::arg("fluid_max_x") = 0.0f, nb::arg("fluid_max_y") = 0.0f,
             nb::arg("fluid_max_z") = 0.0f, nb::arg("fluid_spacing") = 0.0f,
@@ -2107,6 +2123,7 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("aero_tangent") = 0.0f, nb::arg("aero_max_dv") = 0.0f,
             nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
             nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
+            nb::arg("cloth_integrator") = 0u,
             nb::arg("baumgarte_max_velocity") = 0.0f,
             nb::arg("osc_task_link") = 0u,
             nb::rv_policy::take_ownership,
@@ -3198,7 +3215,9 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("mpm_loft_headroom") = 0.0f,
              nb::arg("xpbd_particle_mass") = 0.0f,
              nb::arg("xpbd_friction") = 0.6f, nb::arg("xpbd_distance_alpha") = 0.0f,
-             nb::arg("xpbd_bend_alpha") = 0.0f, nb::arg("xpbd_volume_alpha") = 0.0f,
+             nb::arg("xpbd_volume_alpha") = 0.0f,
+             nb::arg("vbd_stretch_stiffness") = 0.0f, nb::arg("vbd_poisson") = 0.0f,
+             nb::arg("vbd_bend_stiffness") = 0.0f, nb::arg("vbd_damping") = 0.0f,
              nb::arg("xpbd_iters") = 0u, nb::arg("xpbd_aero_normal") = 0.0f,
              nb::arg("xpbd_aero_tangent") = 0.0f, nb::arg("xpbd_aero_max_dv") = 0.0f,
              nb::arg("pbf_rest_density") = 0.0f, nb::arg("pbf_support_scale") = 0.0f,
@@ -3225,7 +3244,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("cable_start") = std::vector<float>{},
              nb::arg("cable_end") = std::vector<float>{},
              nb::arg("cable_segments") = 0u, nb::arg("cable_radius") = 0.0f,
-             nb::arg("cable_pin") = 0u, nb::arg("cable_bend") = false,
+             nb::arg("cable_pin") = 0u,
              nb::arg("cable_slab_half_extents") = std::vector<float>{},
              nb::arg("cable_slab_mass") = 0.0f,
              nb::arg("cable_slab_stiffness") = 0.0f,
@@ -3267,6 +3286,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("gravity_y") = 0.0f, nb::arg("gravity_z") = 0.0f,
              nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
              nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
+             nb::arg("cloth_integrator") = 0u,
              nb::arg("baumgarte_max_velocity") = 0.0f,
              nb::arg("bake_link_sdf") = false,
              nb::arg("osc_task_link") = 0u,

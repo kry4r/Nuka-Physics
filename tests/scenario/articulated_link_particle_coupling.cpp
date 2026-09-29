@@ -108,11 +108,10 @@ cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
                                                 idx(i, j + 1)}});
         }
     }
-    soft::ClothTopologyOptions opts;
-    opts.distance_compliance_alpha = 0.0f;
-    opts.bend_compliance_alpha = 1.0e-4f;
-    soft::XpbdConstraintSet cs;
-    soft::BuildClothConstraints(rest, tris, opts, cs);
+    soft::ShellMaterial shell;
+    shell.stretch_stiffness = 1.0e4f;
+    shell.poisson = 0.3f;
+    shell.bend_stiffness = 1.0e-5f;
 
     cook::XpbdCookInput in;
     in.positions = rest;
@@ -123,19 +122,8 @@ cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
     for (uint32_t c : {idx(0, 0), idx(last, 0), idx(0, last), idx(last, last)}) {
         in.inv_mass[c] = 0.0f;
     }
-    for (const auto& dc : cs.distance) {
-        cook::CookDistanceCon c;
-        c.a = dc.particle_a; c.b = dc.particle_b;
-        c.rest_length = dc.rest_length; c.compliance_alpha = dc.compliance_alpha;
-        in.distance.push_back(c);
-    }
-    for (const auto& bc : cs.bend) {
-        cook::CookBendCon c;
-        for (uint32_t k = 0; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
-        c.rest_angle = bc.rest_angle;
-        c.compliance_alpha = bc.compliance_alpha;
-        in.bend.push_back(c);
-    }
+    soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
+    in.vbd_count = static_cast<uint32_t>(rest.size());
     in.solver_iterations = kXpbdIters;
     in.friction = 0.6f;
     return in;

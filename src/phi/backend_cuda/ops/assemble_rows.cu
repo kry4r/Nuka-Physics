@@ -23,7 +23,6 @@
 
 #include <cuda_runtime.h>
 
-#include "constraint/dihedral_bend.hpp"
 #include "constraint/solref_solimp.hpp"  // ComputeCompliantRow (HD)
 #include "nk/contact/contact_profile.hpp"
 #include "nk/solve/collidable_owner.hpp"
@@ -37,6 +36,7 @@
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"
+#include "phi/backend_cuda/ops/vertex_blocks.cuh"
 
 namespace nuka::phi {
 
@@ -554,7 +554,7 @@ __global__ void EmitPairDrivenRowsKernel(
     float particle_soft_friction, float particle_fluid_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
-    float dt, float baumgarte_max_velocity,
+    float dt, float baumgarte_max_velocity, float contact_margin,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
     uint32_t full_row_slot_count,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
@@ -677,7 +677,9 @@ __global__ void EmitPairDrivenRowsKernel(
 
     uint32_t active_rows = 0u;
     for (uint32_t p = 0u; p < points_per_slot; ++p) {
-        const bool live = p < n_active && p < 4u;
+        const bool live = p < n_active && p < 4u &&
+            ucontact_depth[static_cast<size_t>(gid) * 4u + p] >=
+                merged.gap - fmaxf(contact_margin, merged.margin);
         const size_t mp = static_cast<size_t>(gid) * 4u + p;
         const uint32_t normal_row = base + p;          // pts normal rows first.
         const uint32_t tangent1_row = base + points_per_slot + p;
@@ -948,19 +950,18 @@ __global__ void EmitJointDriveRowsKernel(
 // A particle constraint C(x) is a compliant row J v + (alpha / h^2) lambda = J v* - C(x*) / h,
 // linearized at the predicted positions x* = x + h v*; this is XPBD to first order.
 __global__ void EmitParticleConstraintRowsKernel(
-    uint32_t env_count, uint32_t dist_per_env, uint32_t bend_per_env, uint32_t vol_per_env,
+    uint32_t env_count, uint32_t dist_per_env, uint32_t vol_per_env,
     uint32_t rows_per_env, uint32_t first_row, uint32_t endpoints_per_env,
     uint32_t terms_per_env, uint32_t endpoint_first, uint32_t term_first, float dt,
     const uint32_t* __restrict__ dist_a, const uint32_t* __restrict__ dist_b,
     const float* __restrict__ dist_rest, const float* __restrict__ dist_compliance,
-    const uint32_t* __restrict__ bend_particles, const float* __restrict__ bend_rest,
-    const float* __restrict__ bend_compliance, const uint32_t* __restrict__ vol_particles,
+    const uint32_t* __restrict__ vol_particles,
     const float* __restrict__ vol_rest, const float* __restrict__ vol_compliance,
     const math::Vec3* __restrict__ predicted, const math::Vec3* __restrict__ velocity,
     const float* __restrict__ inv_mass, NkRow* urows, float* lambda,
     nk::PointEndpointRange* ranges, nk::PointEndpointTerm* terms,
     uint32_t* row_cj_link, uint32_t* row_cj_link_b, float* row_penetration, uint32_t* row_count) {
-    const uint32_t per_env = dist_per_env + bend_per_env + vol_per_env;
+    const uint32_t per_env = dist_per_env + vol_per_env;
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     if (per_env == 0u || item >= env_count * per_env) return;
     const uint32_t env = item / per_env;
@@ -994,33 +995,23 @@ __global__ void EmitParticleConstraintRowsKernel(
             valid = true;
         }
     } else {
-        // Bend and volume rows read 4 particle gradients through one endpoint along x.
-        const bool bend = local < dist_per_env + bend_per_env;
-        const uint32_t member = local - dist_per_env - (bend ? 0u : bend_per_env);
-        const uint32_t c = env * (bend ? bend_per_env : vol_per_env) + member;
-        const uint32_t* particles = (bend ? bend_particles : vol_particles) + size_t{c} * 4u;
+        // Volume rows read 4 particle gradients through one endpoint along x.
+        const uint32_t c = env * vol_per_env + local - dist_per_env;
+        const uint32_t* particles = vol_particles + size_t{c} * 4u;
         uint32_t index[4];
         math::Vec3 p[4], gradient[4];
         for (uint32_t j = 0u; j < 4u; ++j) {
             index[j] = particles[j];
             p[j] = predicted[index[j]];
         }
-        if (bend) {
-            const auto geometry = constraint::EvaluateDihedralBend(p[0], p[1], p[2], p[3]);
-            valid = geometry.valid;
-            error = constraint::DihedralBendError(geometry.angle, bend_rest[c]);
-            for (uint32_t j = 0u; j < 4u; ++j) gradient[j] = geometry.gradients[j];
-            alpha = bend_compliance[c];
-        } else {
-            const math::Vec3 e1 = p[1] - p[0], e2 = p[2] - p[0], e3 = p[3] - p[0];
-            gradient[1] = e2.Cross(e3);
-            gradient[2] = e3.Cross(e1);
-            gradient[3] = e1.Cross(e2);
-            gradient[0] = (gradient[1] + gradient[2] + gradient[3]) * -1.0f;
-            error = e1.Dot(gradient[1]) - vol_rest[c];
-            alpha = vol_compliance[c];
-            valid = true;
-        }
+        const math::Vec3 e1 = p[1] - p[0], e2 = p[2] - p[0], e3 = p[3] - p[0];
+        gradient[1] = e2.Cross(e3);
+        gradient[2] = e3.Cross(e1);
+        gradient[3] = e1.Cross(e2);
+        gradient[0] = (gradient[1] + gradient[2] + gradient[3]) * -1.0f;
+        error = e1.Dot(gradient[1]) - vol_rest[c];
+        alpha = vol_compliance[c];
+        valid = true;
         const uint32_t endpoint = env * endpoints_per_env + endpoint_first + local - dist_per_env;
         const uint32_t first = env * terms_per_env + term_first + (local - dist_per_env) * 4u;
         float response = 0.0f;
@@ -1087,8 +1078,7 @@ __device__ float PairDrivenSideCoupling(
         }
         case kNkSideParticle:
         case kNkSideGrid: {
-            const float* inv_mass = point_masses.InverseMass(lhs.kind);
-            return inv_mass != nullptr ? inv_mass[lhs.index] * Dot3(lhs.jlin, rhs.jlin) : 0.0f;
+            return point_masses.Quad(lhs.kind, lhs.index, lhs.jlin, rhs.jlin);
         }
         default:
             return 0.0f;
@@ -1140,14 +1130,12 @@ __device__ void SharedPointCouplings(const PointMassView& points, const NkRowSid
             index = entry.index;
             for (uint32_t r = 0u; r < 3u; ++r) u[r] = entry.TransposeMultiply(jlin[r]);
         }
-        const float* inv_mass = points.InverseMass(kind);
-        if (inv_mass == nullptr) continue;
-        const float m = inv_mass[index];
-        coupling[0] += m * u[1].Dot(u[1]);
-        coupling[1] += m * u[2].Dot(u[2]);
-        coupling[2] += m * u[0].Dot(u[1]);
-        coupling[3] += m * u[0].Dot(u[2]);
-        coupling[4] += m * u[1].Dot(u[2]);
+        if (points.InverseMass(kind) == nullptr) continue;
+        coupling[0] += points.Quad(kind, index, u[1], u[1]);
+        coupling[1] += points.Quad(kind, index, u[2], u[2]);
+        coupling[2] += points.Quad(kind, index, u[0], u[1]);
+        coupling[3] += points.Quad(kind, index, u[0], u[2]);
+        coupling[4] += points.Quad(kind, index, u[1], u[2]);
     }
 }
 
@@ -1209,7 +1197,7 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     const math::Vec3* __restrict__ step_body_linear,
     const math::Vec3* __restrict__ step_body_angular,
     const math::Vec3* __restrict__ step_particle,
-    uint32_t total_rows, uint32_t dof_stride, float dt,
+    uint32_t total_rows, uint32_t dof_stride, float dt, VertexBlockLayout vertex_blocks,
     float* __restrict__ row_meff) {
     const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
     if (rs >= total_rows) return;
@@ -1218,6 +1206,9 @@ __global__ void ComputeRowMeffPairDrivenKernel(
         return;
     }
     NkRow& row = urows[rs];
+    if (TouchesVertexBlock(row.a, point_masses, vertex_blocks) ||
+        TouchesVertexBlock(row.b, point_masses, vertex_blocks))
+        row.flags |= nk::nk_row_flags::kVertexBlock;
     uint32_t tangent_rows[2] = {0u, 0u};
     const bool block = BlockTangentRows(urows, rs, row, tangent_rows);
     const uint32_t tangent1_row = tangent_rows[0], tangent2_row = tangent_rows[1];
@@ -1655,7 +1646,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->particle_soft_friction, p->particle_fluid_friction,
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
-                   p->dt, p->baumgarte_max_velocity,
+                   p->dt, p->baumgarte_max_velocity, p->contact_margin,
                    p->env_count, p->union_slot_count, p->rows_per_env,
                    p->full_row_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,
@@ -1707,11 +1698,11 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
     }
 
-    const uint32_t constraints = p->dist_cons_per_env + p->bend_cons_per_env + p->vol_cons_per_env;
+    const uint32_t constraints = p->dist_cons_per_env + p->vol_cons_per_env;
     if (constraints > 0u) {
         const uint32_t blocks = (p->env_count * constraints + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(EmitParticleConstraintRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   p->env_count, p->dist_cons_per_env, p->bend_cons_per_env, p->vol_cons_per_env,
+                   p->env_count, p->dist_cons_per_env, p->vol_cons_per_env,
                    p->rows_per_env, p->particle_constraint_row_first, p->point_endpoints_per_env,
                    p->point_endpoint_terms_per_env, p->constraint_endpoint_first,
                    p->constraint_term_first, p->dt,
@@ -1719,9 +1710,6 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.dist_particle_b),
                    static_cast<const float*>(model.dist_rest_length),
                    static_cast<const float*>(model.dist_compliance),
-                   static_cast<const uint32_t*>(model.bend_particles),
-                   static_cast<const float*>(model.bend_rest_angle),
-                   static_cast<const float*>(model.bend_compliance),
                    static_cast<const uint32_t*>(model.vol_particles),
                    static_cast<const float*>(model.vol_rest_times6),
                    static_cast<const float*>(model.vol_compliance),
@@ -1780,12 +1768,10 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(data.row_minv_jt_b),
                    static_cast<const float*>(data.body_inv_mass),
                    static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
-                   PointMassView{data.particle_inv_mass, data.particle_vel,
-                                 data.grid_inv_mass, data.grid_velocity,
-                                 data.point_endpoint_ranges, data.point_endpoint_terms},
+                   PointMasses(data),
                    data.row_damping, data.step_qdot_flat, data.step_body_linear_velocity,
                    data.step_body_angular_velocity, data.step_particle_velocity,
-                   total_rows, p->max_dof, p->dt, data.row_meff);
+                   total_rows, p->max_dof, p->dt, p->vertex_blocks, data.row_meff);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

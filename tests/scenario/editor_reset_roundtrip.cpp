@@ -282,9 +282,10 @@ TEST_F(EditorReset, Cloth) {
   "render_materials": {},
   "tree": [],
   "media": [
-    { "name": "drape", "kind": "cloth", "method": "xpbd",
+    { "name": "drape", "kind": "cloth", "method": "vbd",
       "cloth_grid": { "nx": 8, "ny": 8, "spacing": 0.05, "origin": [0.0, 0.0, 0.9], "free": true },
-      "xpbd": { "particle_mass": 0.012, "friction": 1.0, "bend_alpha": 0.09, "iters": 20 } }
+      "xpbd": { "particle_mass": 0.012, "friction": 1.0, "stretch_stiffness": 5000.0,
+                "poisson": 0.3, "bend_stiffness": 5.0e-5 } }
   ]
 })");
     CheckResetRoundTrip(dev_, backend_, scene);

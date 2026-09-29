@@ -16,6 +16,10 @@ The material examples load [Nuka Dynamics Lab](../../docs/nuka-stage.md), a shar
 
 Run commands from the repository root after the [CUDA build and Python installation](../../README.md#quick-start). Use Python 3.11, a CUDA-compatible PyTorch installation, Pillow, NumPy, and `ffmpeg` on `PATH`. Model weights and source assets stay in the ignored `.nuka-assets/` and `.nuka_cache/` directories; recordings and metrics go to `out/`.
 
+## Go2 cloth drape
+
+Run `python examples/demo/go2_cloth_drape.py --drape 800 --stride 32 --out out/go2_cloth` to render the coupled robot and VBD cloth. The demo loads [go2_cloth_drape_contact3.nks](../scenes/go2_cloth_drape_contact3.nks), which shares the source Go2 mesh archive and uses 3D tangential Coulomb contact at its four feet. The source [go2.nks](../scenes/go2.nks) retains its authored 6D contact declaration. The current row solver does not implement the source model's 0.02 torsional and 0.01 rolling friction coefficients, so the demo asset is a declared contact-model difference, not a 6D validation result.
+
 ## pi0.5 inference
 
 The Franka Panda uses two rendered camera streams and an 8-value robot state to pick up the black bowl and place it on the plate in LIBERO Spatial task 2. Inference, physics, and camera rendering share one local process. The showcased run uses the full 3.62B-parameter checkpoint, OSC control, 500 Hz physics, and 20 Hz actions. It executes eight actions from each predicted 50-action chunk before updating its observation.

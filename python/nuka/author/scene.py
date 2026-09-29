@@ -37,14 +37,14 @@ _MEDIA_KIND = {"cloth": _nuka.MEDIA_CLOTH, "soft_tet": _nuka.MEDIA_SOFT_TET,
                "fluid": _nuka.MEDIA_FLUID, "granular": _nuka.MEDIA_GRANULAR,
                "cable": _nuka.MEDIA_CABLE}
 _MEDIA_METHOD = {"xpbd": _nuka.MEDIA_METHOD_XPBD, "pbf": _nuka.MEDIA_METHOD_PBF,
-                 "mlsmpm": _nuka.MEDIA_METHOD_MLSMPM}
+                 "mlsmpm": _nuka.MEDIA_METHOD_MLSMPM, "vbd": _nuka.MEDIA_METHOD_VBD}
 _PRIMITIVE = {"plane": _nuka.PRIMITIVE_PLANE, "box": _nuka.PRIMITIVE_BOX,
               "sphere": _nuka.PRIMITIVE_SPHERE, "capsule": _nuka.PRIMITIVE_CAPSULE}
-_DEFAULT_MEDIA_MATERIAL = {"cloth": _materials.Cloth.XPBD,
+_DEFAULT_MEDIA_MATERIAL = {"cloth": _materials.Cloth.VBD,
                            "soft_tet": _materials.Soft.XPBD,
                            "fluid": _materials.Fluid.PBF,
                            "granular": _materials.Granular.MPM,
-                           "cable": _materials.Cable.XPBD}
+                           "cable": _materials.Cable.VBD}
 
 
 @_dc.dataclass
@@ -78,6 +78,7 @@ class SimOptions:
     solver_pos_iters: int = 0
     solver_contact_margin: float = 0.0
     solver_max_pairs: int = 0
+    cloth_integrator: int = 0
     baumgarte_max_velocity: float = 0.0
     # Bake a per-link SDF from each link's VISUAL mesh so a foot engages the MPM grid
     # BC (rides the true silhouette). Default False keeps every cook byte-identical.
@@ -153,13 +154,13 @@ class Scene:
 
     def add_cable(self, start, end=None, *, hang: Optional[float] = None,
                   segments: int = 12, radius: float = 0.02, material=None,
-                  pin: str = "start", bend: bool = False, slab=None,
+                  pin: str = "start", slab=None,
                   render=None, slab_render=None) -> "Scene":
-        """Add an XPBD rope from ``start`` to ``end`` (or straight down by ``hang``
+        """Add a vertex-block rope from ``start`` to ``end`` (or straight down by ``hang``
         metres when ``end`` is omitted) as ``segments`` links of ``radius``-m beads.
-        ``material`` is a ``materials.Cable.XPBD`` (default when ``None``); ``pin``
+        ``material`` is a ``materials.Cable.VBD`` (default when ``None``); ``pin``
         picks the kinematic endpoint(s) (``start``/``end``/``both``/``none``);
-        ``slab`` is a ``morphs.CableSlab`` rigid weight welded to the loaded end.
+        ``slab`` is a ``morphs.CableSlab`` spring-lattice weight welded to the loaded end.
         ``render`` / ``slab_render`` bind beauty appearances (the slab inherits
         ``render`` when ``slab_render`` is ``None``). Returns ``self``.
         """
@@ -177,7 +178,7 @@ class Scene:
         morph = _morphs.Cable(
             start=tuple(float(c) for c in start),
             end=tuple(float(c) for c in end), segments=int(segments),
-            radius=float(radius), pin=str(pin), bend=bool(bend), slab=slab)
+            radius=float(radius), pin=str(pin), slab=slab)
         self._entities.append(
             _Entity(morph, material, None, None, render, slab_render))
         return self
@@ -250,6 +251,7 @@ class Scene:
             solver_pos_iters=int(o.solver_pos_iters),
             solver_contact_margin=float(o.solver_contact_margin),
             solver_max_pairs=int(o.solver_max_pairs),
+            cloth_integrator=int(o.cloth_integrator),
             baumgarte_max_velocity=float(o.baumgarte_max_velocity),
         )
         if len(scenes) != 1:
@@ -263,12 +265,12 @@ class Scene:
                 f"Scene.build supports one cloth Grid morph (got {len(grids)})")
         if grids:
             e = grids[0]
-            mat = e.material if e.material is not None else _materials.Cloth.XPBD()
+            mat = e.material if e.material is not None else _materials.Cloth.VBD()
             surf = e.surface if e.surface is not None else _surfaces.Cloth()
             if not isinstance(mat, _materials.ClothMaterial):
                 raise TypeError(
                     "Scene.build: a Grid morph needs a Cloth material "
-                    f"(materials.Cloth.XPBD); got {type(mat).__name__}")
+                    f"(materials.Cloth.VBD); got {type(mat).__name__}")
             if not isinstance(surf, _surfaces.ClothSurface):
                 raise TypeError(
                     "Scene.build: a Grid morph needs a Cloth surface "
@@ -337,6 +339,7 @@ class Scene:
                 solver_pos_iters=int(o.solver_pos_iters),
                 solver_contact_margin=float(o.solver_contact_margin),
                 solver_max_pairs=int(o.solver_max_pairs),
+                cloth_integrator=int(o.cloth_integrator),
                 baumgarte_max_velocity=float(o.baumgarte_max_velocity),
                 bake_link_sdf=bool(o.bake_link_sdf))
         finally:

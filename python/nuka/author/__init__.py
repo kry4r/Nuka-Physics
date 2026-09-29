@@ -17,8 +17,8 @@ Cloth drape over a robot (the fast path)::
     s = Scene(SimOptions(dt=1/240, env_count=1, contact_family=1))
     s.add_entity(morphs.NKS("examples/scenes/go2.nks"))
     s.add_entity(morphs.Grid(55, 51, 0.024, origin=(0, 0, 0.90)),
-                 materials.Cloth.XPBD(mass=0.012, friction=1.8,
-                                      bend_alpha=0.09, iters=80),
+                 materials.Cloth.VBD(mass=0.012, friction=1.8,
+                                     stretch_stiffness=5.0e3, bend_stiffness=5.0e-5),
                  surfaces.Cloth(free=True, aero=(30.0, 0.12, 0.16)),
                  contact_radius=0.022)
     with nuka.Device.create(0) as dev:

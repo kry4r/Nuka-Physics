@@ -1521,8 +1521,6 @@ if(CMAKE_CUDA_COMPILER)
         # device-solve gates.
         # v0.7 p09-A: XPBD distance analytic oscillation oracle + D1 two-run.
         runtime/test_xpbd_distance_oracle.cpp
-        # v0.7 p09-B: XPBD bend (cloth) + volume (tet) sim invariants + grad-C FD.
-        runtime/test_xpbd_bend_cloth.cpp
         runtime/test_xpbd_volume_tet.cpp
         # v0.7 p09-C: XPBD shape-match (cluster) sim + polar dR/dA host-FD.
         runtime/test_xpbd_shape_match.cpp

@@ -162,7 +162,8 @@ __global__ void AccumulateIslandFlagsKernel(
     uint32_t flags = 0u;
     if (row.a.kind == kNkSideArtic || row.b.kind == kNkSideArtic)
         flags |= nkops::kIslandHasArticulation;
-    if ((row.flags & nk::nk_row_flags::kMaterialBlock) ||
+    // Vertex blocks sweep inside the colored solve, so their rows join it.
+    if ((row.flags & (nk::nk_row_flags::kMaterialBlock | nk::nk_row_flags::kVertexBlock)) ||
         (row.a.kind == nk::kNkSidePointEndpoint && endpoint_ranges[row.a.index].count > 1u) ||
         (row.b.kind == nk::kNkSidePointEndpoint && endpoint_ranges[row.b.index].count > 1u))
         flags |= nkops::kIslandHasMultiplePointTerms;

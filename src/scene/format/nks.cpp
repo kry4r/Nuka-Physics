@@ -235,6 +235,7 @@ const char* MediaMethodName(MediaRecord::Method m) {
         case MediaRecord::Method::Xpbd:   return "xpbd";
         case MediaRecord::Method::Pbf:    return "pbf";
         case MediaRecord::Method::MlsMpm: return "mlsmpm";
+        case MediaRecord::Method::Vbd:    return "vbd";
     }
     return "xpbd";
 }
@@ -242,6 +243,7 @@ MediaRecord::Method MediaMethodFromName(const std::string& s) {
     if (s == "xpbd") return MediaRecord::Method::Xpbd;
     if (s == "pbf") return MediaRecord::Method::Pbf;
     if (s == "mlsmpm") return MediaRecord::Method::MlsMpm;
+    if (s == "vbd") return MediaRecord::Method::Vbd;
     throw std::runtime_error("nks: unknown media method '" + s + "'");
 }
 
@@ -613,7 +615,6 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     cl.Set("segments", Value::Int(m.cable_line.segments));
     cl.Set("radius", Value::Float(m.cable_line.radius));
     cl.Set("pin", Value::Int(static_cast<int64_t>(m.cable_line.pin)));
-    cl.Set("bend", Value::Bool(m.cable_line.bend));
     Value sl = Value::Object();
     sl.Set("half_extents", Vec3Json(m.cable_line.slab.half_extents));
     sl.Set("mass", Value::Float(m.cable_line.slab.mass));
@@ -629,8 +630,11 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     xp.Set("half_thickness", Value::Float(m.xpbd.half_thickness));
     xp.Set("friction", Value::Float(m.xpbd.friction));
     xp.Set("distance_alpha", Value::Float(m.xpbd.distance_alpha));
-    xp.Set("bend_alpha", Value::Float(m.xpbd.bend_alpha));
     xp.Set("volume_alpha", Value::Float(m.xpbd.volume_alpha));
+    xp.Set("stretch_stiffness", Value::Float(m.xpbd.stretch_stiffness));
+    xp.Set("poisson", Value::Float(m.xpbd.poisson));
+    xp.Set("bend_stiffness", Value::Float(m.xpbd.bend_stiffness));
+    xp.Set("damping", Value::Float(m.xpbd.damping));
     xp.Set("iters", Value::Int(m.xpbd.iters));
     xp.Set("aero_drag_normal", Value::Float(m.xpbd.aero_drag_normal));
     xp.Set("aero_drag_tangent", Value::Float(m.xpbd.aero_drag_tangent));
@@ -1737,7 +1741,6 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.cable_line.radius = f(*cl, "radius", rec.cable_line.radius);
                 rec.cable_line.pin = static_cast<MediaRecord::CableLine::Pin>(
                     u(*cl, "pin", static_cast<uint32_t>(rec.cable_line.pin)));
-                rec.cable_line.bend = b(*cl, "bend", rec.cable_line.bend);
                 if (const Value* sl = cl->Find("slab")) {
                     rec.cable_line.slab.half_extents =
                         v3(*sl, "half_extents", rec.cable_line.slab.half_extents);
@@ -1755,8 +1758,11 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.xpbd.half_thickness = f(*xp, "half_thickness", rec.xpbd.half_thickness);
                 rec.xpbd.friction = f(*xp, "friction", rec.xpbd.friction);
                 rec.xpbd.distance_alpha = f(*xp, "distance_alpha", rec.xpbd.distance_alpha);
-                rec.xpbd.bend_alpha = f(*xp, "bend_alpha", rec.xpbd.bend_alpha);
                 rec.xpbd.volume_alpha = f(*xp, "volume_alpha", rec.xpbd.volume_alpha);
+                rec.xpbd.stretch_stiffness = f(*xp, "stretch_stiffness", rec.xpbd.stretch_stiffness);
+                rec.xpbd.poisson = f(*xp, "poisson", rec.xpbd.poisson);
+                rec.xpbd.bend_stiffness = f(*xp, "bend_stiffness", rec.xpbd.bend_stiffness);
+                rec.xpbd.damping = f(*xp, "damping", rec.xpbd.damping);
                 rec.xpbd.iters = static_cast<uint16_t>(u(*xp, "iters", rec.xpbd.iters));
                 rec.xpbd.aero_drag_normal = f(*xp, "aero_drag_normal", rec.xpbd.aero_drag_normal);
                 rec.xpbd.aero_drag_tangent = f(*xp, "aero_drag_tangent", rec.xpbd.aero_drag_tangent);

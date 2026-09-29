@@ -36,7 +36,6 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "collision/contact_capacity.hpp"
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "scene/terrain/heightfield.hpp"  // HeightField (the cooked grid source)
 #include "scene/terrain/heightfield_loaders.hpp"  // parametric/image grid fill
@@ -48,7 +47,8 @@
 #include "scene/graph/scene_graph.hpp"
 // The cloth-topology + fluid-box cookers (CUDA-free POD products); the media cook
 // reuses them to build the particle inputs instead of reimplementing the math.
-#include "runtime/soft/cloth_topology.hpp"     // BuildClothConstraints
+#include "nk/solve/vertex_block_schedule.hpp"
+#include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"   // BuildSphereTetLattice / BuildTetMeshConstraints
 #include "import/cooker/fluid_cooker.hpp"       // CookFluidBox
 #include "import/cooker/mesh_surface_cooker.hpp"
@@ -180,7 +180,7 @@ uint32_t BucketFor(const CookedBlob& blob, uint32_t shape_row,
     if (!nk::CanonicalizeContactProfileForUpload(source, &row)) {
         throw std::runtime_error(
             "CookToModel: contact profile requires finite values, nonnegative friction, "
-            "condim 1/3, and zero margin/gap");
+            "condim 1/3, and nonnegative margin/gap");
     }
     for (uint32_t b = 0; b < buckets.size(); ++b) {
         if (std::memcmp(buckets[b].values, row.values, sizeof(row.values)) == 0) return b;
@@ -240,7 +240,7 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
         static_cast<uint64_t>(cap.joint_friction_rows_per_env) +
         static_cast<uint64_t>(cap.joint_drive_rows_per_env) +
         static_cast<uint64_t>(cap.mpm_stress_cells_per_env) * nk::kMpmStressRowsPerCell +
-        static_cast<uint64_t>(cap.dist_cons_per_env) + cap.bend_cons_per_env + cap.vol_cons_per_env;
+        static_cast<uint64_t>(cap.dist_cons_per_env) + cap.vol_cons_per_env;
     if (total_rows > 0xFFFFFFFFull) {
         throw std::runtime_error("CookToModel: row capacity overflows u32");
     }
@@ -265,10 +265,7 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
                                    uint32_t row_exempt) {
     if (row_exempt > cap.particles_per_env)
         throw std::runtime_error("CookToModel: grid particle slice exceeds its environment");
-    const uint32_t row_particles = cap.particles_per_env - row_exempt;
-    const uint64_t reserve =
-        static_cast<uint64_t>(cap.bodies_per_env > 0u ? row_particles : 0u) *
-        collision::kBodyParticleContactSlotsPerParticle;
+    const uint64_t reserve = cap.ParticleContactReserve(row_exempt);
     const uint64_t compact = reserve + cap.mpm_contact_capacity_per_env;
     const uint64_t total = static_cast<uint64_t>(rigid_base) + compact;
     const uint64_t rows =
@@ -1487,6 +1484,26 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 // particle cook.
 // ---------------------------------------------------------------------------
 
+// Stage the soft slice's vertex blocks, whose input particle 0 sits at `particle_base` in each env.
+static void StageVertexBlocks(nk::Model& model, const XpbdCookInput& in, uint32_t particle_base) {
+    nk::Model::ModelParticles& mp = model.particles;
+    nk::ModelCapacities& cap = model.capacities;
+    if (uint64_t{in.vbd_begin} + in.vbd_count > in.positions.size())
+        throw std::invalid_argument("vertex-block range exceeds its soft particles");
+    mp.vbd_elements.clear();
+    for (nk::VbdElement element : in.vbd_elements) {
+        for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
+            if (element.vertex[j] < in.vbd_begin || element.vertex[j] - in.vbd_begin >= in.vbd_count)
+                throw std::invalid_argument("vertex-block element leaves its vertex range");
+            element.vertex[j] -= in.vbd_begin;
+        }
+        mp.vbd_elements.push_back(element);
+    }
+    cap.vbd_particle_begin = in.vbd_count > 0u ? particle_base + in.vbd_begin : 0u;
+    cap.vbd_vertices_per_env = in.vbd_count;
+    nk::BuildVertexBlockSchedule(&model);
+}
+
 void CookXpbdParticles(nk::Model& model, uint32_t env_count,
                        const XpbdCookInput& in) {
     const uint32_t envs = env_count > 0 ? env_count : 1u;
@@ -1508,9 +1525,8 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     }
     mp.xpbd_iters = in.solver_iterations == 0u ? 1u : in.solver_iterations;
 
-    // De-interleave the constraint AoS into the per-field SoA (the EXACT
-    // legacy soft-upload layout: distance a/b/rest/alpha; bend 4-particle +
-    // 4-gradient; volume 4-particle + rest6/alpha).
+    // De-interleave the constraint AoS into the per-field SoA: distance a/b/rest/alpha;
+    // volume 4-particle + rest6/alpha.
     const uint32_t dn = static_cast<uint32_t>(in.distance.size());
     mp.dist_a.resize(dn); mp.dist_b.resize(dn);
     mp.dist_rest.resize(dn); mp.dist_alpha.resize(dn);
@@ -1519,17 +1535,6 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
         mp.dist_b[c] = in.distance[c].b;
         mp.dist_rest[c] = in.distance[c].rest_length;
         mp.dist_alpha[c] = in.distance[c].compliance_alpha;
-    }
-    const uint32_t bn = static_cast<uint32_t>(in.bend.size());
-    mp.bend_particles.resize(static_cast<size_t>(bn) * 4u);
-    mp.bend_rest_angle.resize(bn);
-    mp.bend_alpha.resize(bn);
-    for (uint32_t c = 0; c < bn; ++c) {
-        for (uint32_t j = 0; j < 4u; ++j) {
-            mp.bend_particles[static_cast<size_t>(c) * 4u + j] = in.bend[c].p[j];
-        }
-        mp.bend_rest_angle[c] = in.bend[c].rest_angle;
-        mp.bend_alpha[c] = in.bend[c].compliance_alpha;
     }
     const uint32_t vn = static_cast<uint32_t>(in.volume.size());
     mp.vol_particles.resize(static_cast<size_t>(vn) * 4u);
@@ -1635,12 +1640,12 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     cap.dist_cons_per_env = dn;
-    cap.bend_cons_per_env = bn;
     cap.vol_cons_per_env  = vn;
     cap.shape_match_slots_per_env   = scn;
     cap.shape_match_members_per_env =
         static_cast<uint32_t>(mp.sm_particles.size());
     cap.aero_tris_per_env = an;
+    StageVertexBlocks(model, in, 0u);
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget
     // (no-op when there are no body contacts -> particle-only cooks byte-identical).
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
@@ -1780,19 +1785,24 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
     for (const MediaRecord& m : media) {
         bool legal = false;
         switch (m.kind) {
-            case Kind::Cloth:   legal = m.method == Method::Xpbd; break;
+            case Kind::Cloth:   legal = m.method == Method::Vbd; break;
             case Kind::SoftTet: legal = m.method == Method::Xpbd ||
                                         m.method == Method::MlsMpm; break;
             case Kind::Fluid:   legal = m.method == Method::Pbf ||
                                         m.method == Method::MlsMpm; break;
             case Kind::Granular: legal = m.method == Method::MlsMpm; break;
-            case Kind::Cable:   legal = m.method == Method::Xpbd; break;
+            case Kind::Cable:   legal = m.method == Method::Vbd; break;
         }
         if (!legal) {
             throw std::runtime_error(
-                "ValidateMedia: illegal medium (kind x method) -- cloth must solve "
-                "with XPBD, a tet-soft body with XPBD or MLS-MPM, a fluid with PBF or "
-                "MLS-MPM, a granular bed with MLS-MPM only, a cable with XPBD only");
+                "ValidateMedia: illegal medium (kind x method) -- cloth and cable solve "
+                "as vertex blocks (vbd), a tet-soft body with XPBD or MLS-MPM, a fluid "
+                "with PBF or MLS-MPM, a granular bed with MLS-MPM only");
+        }
+        if (m.method == Method::Vbd && m.xpbd.self_contact) {
+            throw std::runtime_error(
+                "ValidateMedia: vertex-block media collide through their surfaces, "
+                "not particle self_contact");
         }
         // model_kind 4 (Drucker-Prager) and Kind::Granular imply each other: no
         // sand-tagged fluid/soft body and no granular bed cooking as another model.
@@ -2062,9 +2072,6 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     for (uint32_t v : xp.dist_b) mp.dist_b.push_back(v + n_mpm);
     mp.dist_rest = xp.dist_rest;
     mp.dist_alpha = xp.dist_alpha;
-    for (uint32_t v : xp.bend_particles) mp.bend_particles.push_back(v + n_mpm);
-    mp.bend_rest_angle = xp.bend_rest_angle;
-    mp.bend_alpha = xp.bend_alpha;
     for (uint32_t v : xp.vol_particles) mp.vol_particles.push_back(v + n_mpm);
     mp.vol_rest6 = xp.vol_rest6;
     mp.vol_alpha = xp.vol_alpha;
@@ -2101,11 +2108,11 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.n_mpm_particles = n_mpm;
     cap.particles_per_env = n_mpm + n_xpbd;
     cap.dist_cons_per_env = xtmp.capacities.dist_cons_per_env;
-    cap.bend_cons_per_env = xtmp.capacities.bend_cons_per_env;
     cap.vol_cons_per_env  = xtmp.capacities.vol_cons_per_env;
     cap.shape_match_slots_per_env   = xtmp.capacities.shape_match_slots_per_env;
     cap.shape_match_members_per_env = xtmp.capacities.shape_match_members_per_env;
     cap.aero_tris_per_env = xtmp.capacities.aero_tris_per_env;
+    StageVertexBlocks(model, soft, n_mpm);
     // Reserve body-particle rows for the XPBD slice above the rigid manifold budget.
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
@@ -2204,7 +2211,7 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
             out.rest.push_back(p);
         }
         std::vector<uint8_t> used(out.rest.size(), 0u);
-        std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, int>> edges;
+        std::map<std::pair<uint32_t, uint32_t>, uint32_t> edges;
         std::set<std::array<uint32_t, 3>> faces;
         for (size_t i = 0u; i < mesh.indices.size(); i += 3u) {
             const uint32_t a = mesh.indices[i], b = mesh.indices[i+1u], c = mesh.indices[i+2u];
@@ -2223,10 +2230,8 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
                 const uint32_t u = ids[j], v = ids[(j+1u)%3u];
                 used[u] = 1u;
                 auto& count = edges[{std::min(u,v), std::max(u,v)}];
-                ++count.first;
-                count.second += u < v ? 1 : -1;
-                if (count.first > 2u || (count.first == 2u && count.second != 0))
-                    throw std::invalid_argument("Cloth asset must have consistently wound manifold faces");
+                if (++count > 2u)
+                    throw std::invalid_argument("Cloth asset must have manifold edges");
             }
             out.triangles.push_back({{a, b, c}});
         }
@@ -2253,6 +2258,48 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
                 out.material_faces.push_back(face);
             }
         }
+        using Edge = std::pair<uint32_t, uint32_t>;
+        std::map<Edge, std::vector<std::pair<uint32_t, bool>>> adjacent;
+        for (uint32_t face = 0u; face < out.triangles.size(); ++face) {
+            const auto& tri = out.triangles[face].v;
+            for (uint32_t corner = 0u; corner < 3u; ++corner) {
+                const uint32_t a = tri[corner], b = tri[(corner + 1u) % 3u];
+                adjacent[{std::min(a, b), std::max(a, b)}].push_back({face, a < b});
+            }
+        }
+        std::vector<std::vector<std::pair<uint32_t, bool>>> neighbors(out.triangles.size());
+        for (const auto& [edge, faces_on_edge] : adjacent) {
+            if (faces_on_edge.size() != 2u) continue;
+            const auto [a, a_forward] = faces_on_edge[0];
+            const auto [b, b_forward] = faces_on_edge[1];
+            const bool opposite_flip = a_forward == b_forward;
+            neighbors[a].push_back({b, opposite_flip});
+            neighbors[b].push_back({a, opposite_flip});
+        }
+        std::vector<int8_t> flipped(out.triangles.size(), -1);
+        for (uint32_t seed = 0u; seed < out.triangles.size(); ++seed) {
+            if (flipped[seed] >= 0) continue;
+            flipped[seed] = 0;
+            std::vector<uint32_t> queue{seed};
+            for (size_t head = 0u; head < queue.size(); ++head) {
+                const uint32_t face = queue[head];
+                for (const auto [other, opposite_flip] : neighbors[face]) {
+                    const int8_t desired = flipped[face] ^ static_cast<int8_t>(opposite_flip);
+                    if (flipped[other] < 0) {
+                        flipped[other] = desired;
+                        queue.push_back(other);
+                    } else if (flipped[other] != desired) {
+                        throw std::invalid_argument("Cloth asset is not orientable");
+                    }
+                }
+            }
+        }
+        for (size_t face = 0u; face < flipped.size(); ++face) {
+            if (flipped[face] == 0) continue;
+            std::swap(out.triangles[face].v[1], out.triangles[face].v[2]);
+            if (!out.material_faces.empty())
+                std::swap(out.material_faces[face][1], out.material_faces[face][2]);
+        }
         return out;
     }
     const auto& g = media.cloth_grid;
@@ -2274,7 +2321,11 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
 
 }  // namespace
 
-XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
+bool IsVertexBlockMedium(const MediaRecord& media) {
+    return media.method == MediaRecord::Method::Vbd;
+}
+
+XpbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
     XpbdCookInput in;
     const auto geometry = BuildClothGeometry(media);
     const auto& rest = geometry.rest;
@@ -2286,29 +2337,16 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
         !std::isfinite(material.half_thickness) || material.half_thickness < 0.0f ||
         (material.surface_density > 0.0f && material.particle_mass > 0.0f))
         throw std::invalid_argument("Cloth requires finite nonnegative thickness and one mass definition");
-    runtime::soft::ClothTopologyOptions opts;
-    opts.distance_compliance_alpha = media.xpbd.distance_alpha;
-    opts.bend_compliance_alpha = media.xpbd.bend_alpha;
-    runtime::soft::XpbdConstraintSet cs;
-    runtime::soft::BuildClothConstraints(rest, tris, opts, cs);
-    if (!geometry.material_faces.empty()) {
-        std::map<std::pair<uint32_t, uint32_t>, std::pair<float, uint32_t>> lengths;
-        for (size_t i = 0u; i < tris.size(); ++i) {
-            const auto& face = geometry.material_faces[i];
-            for (uint32_t j = 0u; j < 3u; ++j) {
-                const uint32_t a = tris[i].v[j], b = tris[i].v[(j+1u)%3u];
-                auto& length = lengths[{std::min(a,b), std::max(a,b)}];
-                length.first += (face[j]-face[(j+1u)%3u]).Length();
-                ++length.second;
-            }
-        }
-        // Both panels contribute equally to a sewn edge's rest length.
-        for (auto& distance : cs.distance) {
-            const auto length = lengths.at({distance.particle_a, distance.particle_b});
-            distance.rest_length = length.first / static_cast<float>(length.second);
-        }
-        for (auto& bend : cs.bend) bend.rest_angle = 0.0f;
-    }
+    if (!(material.stretch_stiffness > 0.0f))
+        throw std::invalid_argument("Cloth requires a positive stretch_stiffness");
+    runtime::soft::ShellMaterial shell;
+    shell.stretch_stiffness = material.stretch_stiffness;
+    shell.poisson = material.poisson;
+    shell.bend_stiffness = material.bend_stiffness;
+    shell.damping = material.damping;
+    runtime::soft::BuildClothVertexBlocks(rest, tris, geometry.material_faces, shell, in.vbd_elements);
+    in.vbd_begin = 0u;
+    in.vbd_count = static_cast<uint32_t>(rest.size());
 
     in.positions = rest;
     CookParticleSurface collision_surface;
@@ -2370,21 +2408,7 @@ XpbdCookInput BuildClothXpbdInput(const MediaRecord& media) {
             for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
         }
     }
-    for (const auto& dc : cs.distance) {
-        in.distance.push_back(
-            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
-    }
-    for (const auto& bc : cs.bend) {
-        CookBendCon c;
-        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
-        c.rest_angle = bc.rest_angle;
-        c.compliance_alpha = bc.compliance_alpha;
-        in.bend.push_back(c);
-    }
-    in.solver_iterations =
-        static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
     in.friction = media.xpbd.friction;
-    in.self_contact = media.xpbd.self_contact;
     // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
     // triangles only when active (all-zero coeffs => no op => byte-identical cook).
     in.aero_drag_normal = media.xpbd.aero_drag_normal;
@@ -2500,10 +2524,9 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             base += n_mpm;
         }
     }
-    // Cloth + soft-tet concatenate into the XPBD slice in media order; track the
-    // running particle base exactly as AppendSoftMedium does (fluid/MPM skipped).
-    for (const MediaRecord& m : media) {
-        if (m.method == MediaRecord::Method::MlsMpm) continue;  // its sphere surface is above.
+    // The soft slice holds tet media, then vertex-block media, each in media order; track the
+    // running particle base exactly as CookSceneMedia appends them (fluid/MPM skipped).
+    const auto append_soft = [&](const MediaRecord& m) {
         // Cable: the rope renders as an instanced bead tube over its chain range; the
         // optional welded slab renders as a triangulated rigid box over its 8 corners.
         if (m.kind == MediaRecord::Kind::Cable) {
@@ -2527,7 +2550,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
                 surfaces.push_back(std::move(box));
             }
             base += cl.chain + cl.slab;
-            continue;
+            return;
         }
         std::vector<uint32_t> tris;
         uint32_t verts = 0u;
@@ -2546,7 +2569,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
                 verts = static_cast<uint32_t>(lat.rest.size());
             }
         } else {
-            continue;  // Fluid: no triangulated surface; it does not enter the soft slice.
+            return;  // Fluid: no triangulated surface; it does not enter the soft slice.
         }
         if (!tris.empty()) {
             for (uint32_t& t : tris) t += base;
@@ -2559,7 +2582,11 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             surfaces.push_back(std::move(s));
         }
         base += verts;
-    }
+    };
+    for (const MediaRecord& m : media)
+        if (m.method != MediaRecord::Method::MlsMpm && !IsVertexBlockMedium(m)) append_soft(m);
+    for (const MediaRecord& m : media)
+        if (IsVertexBlockMedium(m)) append_soft(m);
     return surfaces;
 }
 
@@ -2608,18 +2635,22 @@ XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
     return in;
 }
 
-XpbdCookInput BuildCableXpbdInput(const MediaRecord& media) {
+XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     XpbdCookInput in;
     const MediaRecord::CableLine& c = media.cable_line;
     const CableLayout layout = CableParticleLayout(media);
     if (layout.chain == 0u) return in;  // no cable (absent geometry).
+    if (!(media.xpbd.stretch_stiffness > 0.0f))
+        throw std::invalid_argument("Cable requires a positive stretch_stiffness");
 
     // Chain particles: segments+1 samples linearly interpolated start -> end.
     const uint32_t np = layout.chain;
     const float seg = static_cast<float>(c.segments);
+    std::vector<uint32_t> chain;
     for (uint32_t i = 0u; i < np; ++i) {
         const float t = static_cast<float>(i) / seg;
         in.positions.push_back(c.start * (1.0f - t) + c.end * t);
+        chain.push_back(i);
     }
     const float mass =
         media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
@@ -2629,52 +2660,38 @@ XpbdCookInput BuildCableXpbdInput(const MediaRecord& media) {
     using Pin = MediaRecord::CableLine::Pin;
     if (c.pin == Pin::Start || c.pin == Pin::Both) in.inv_mass[0] = 0.0f;
     if (c.pin == Pin::End || c.pin == Pin::Both) in.inv_mass[np - 1u] = 0.0f;
+    runtime::soft::RodMaterial rod;
+    rod.stretch_stiffness = media.xpbd.stretch_stiffness;
+    rod.bend_stiffness = media.xpbd.bend_stiffness;
+    rod.damping = media.xpbd.damping;
+    runtime::soft::BuildRodVertexBlocks(in.positions, chain, rod, in.vbd_elements);
 
-    // One distance row per link (alpha 0 == inextensible unless a stretch compliance
-    // is authored); optional skip-one rows add a little bending stiffness.
-    const float d_alpha = media.xpbd.distance_alpha;
-    for (uint32_t i = 0u; i + 1u < np; ++i) {
-        in.distance.push_back(
-            {i, i + 1u, (in.positions[i + 1u] - in.positions[i]).Length(), d_alpha});
-    }
-    if (c.bend) {
-        const float b_alpha = media.xpbd.bend_alpha;
-        for (uint32_t i = 0u; i + 2u < np; ++i) {
-            in.distance.push_back({i, i + 2u,
-                (in.positions[i + 2u] - in.positions[i]).Length(), b_alpha});
-        }
-    }
-
-    // Optional rigid slab welded to the loaded end: 8 box corners as ONE shape-match
-    // cluster (id 9), the 4 top corners distance-welded (alpha 0) to the end particle.
+    // Optional slab welded to the loaded end: its 8 corners joined pairwise by 28 springs
+    // and its 4 top corners welded to the end vertex by 4 more.
     if (layout.slab == 8u) {
         const std::array<math::Vec3, 8> corners = CableSlabCorners(c);
         const float slab_mass = c.slab.mass > 0.0f ? c.slab.mass : mass;
+        const float stiffness = c.slab.stiffness > 0.0f ? c.slab.stiffness : media.xpbd.stretch_stiffness;
         const uint32_t base = np;  // slab corners follow the chain in the pool.
-        CookShapeMatchCluster cluster;
-        // Goal-pull fraction in [0,1]; 0 (an unset desc) defaults to a rigid slab.
-        cluster.stiffness = c.slab.stiffness > 0.0f ? c.slab.stiffness : 1.0f;
         for (uint32_t k = 0u; k < 8u; ++k) {
             in.positions.push_back(corners[k]);
             in.inv_mass.push_back(1.0f / slab_mass);
-            cluster.particle.push_back(base + k);
-            cluster.rest_positions.push_back(corners[k]);
-            cluster.cluster_mass.push_back(slab_mass);
         }
-        in.shape_match.push_back(std::move(cluster));
-        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.xpbd.friction});
+        for (uint32_t i = 0u; i < 8u; ++i)
+            for (uint32_t j = i + 1u; j < 8u; ++j)
+                in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(base + i, base + j,
+                    (corners[j] - corners[i]).Length(), stiffness, media.xpbd.damping));
         const uint32_t end_p = np - 1u;
-        for (uint32_t k = 4u; k < 8u; ++k) {  // the 4 top corners (iz == 1).
-            in.distance.push_back({end_p, base + k,
-                (corners[k] - in.positions[end_p]).Length(), 0.0f});
-        }
+        for (uint32_t k = 4u; k < 8u; ++k)  // the 4 top corners (iz == 1).
+            in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(end_p, base + k,
+                (corners[k] - in.positions[end_p]).Length(), stiffness, media.xpbd.damping));
+        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.xpbd.friction});
     }
 
     in.velocities.assign(in.positions.size(), math::Vec3::Zero());
-    in.solver_iterations =
-        static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
     in.friction = media.xpbd.friction;
-    in.self_contact = media.xpbd.self_contact;
+    in.vbd_begin = 0u;
+    in.vbd_count = static_cast<uint32_t>(in.positions.size());
     return in;
 }
 
@@ -3046,10 +3063,6 @@ void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
     for (CookDistanceCon dc : src.distance) {
         dc.a += base; dc.b += base; dst.distance.push_back(dc);
     }
-    for (CookBendCon bc : src.bend) {
-        for (uint32_t k = 0u; k < 4u; ++k) bc.p[k] += base;
-        dst.bend.push_back(bc);
-    }
     for (CookVolumeCon vc : src.volume) {
         for (uint32_t k = 0u; k < 4u; ++k) vc.p[k] += base;
         dst.volume.push_back(vc);
@@ -3075,6 +3088,16 @@ void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
     dst.aero_drag_max_dv = src.aero_drag_max_dv;
     dst.solver = src.solver;
     dst.self_contact = dst.self_contact || src.self_contact;
+    if (src.vbd_count == 0u) return;
+    // Vertex-block media append last, so their ranges join into one.
+    if (dst.vbd_count != 0u && dst.vbd_begin + dst.vbd_count != base + src.vbd_begin)
+        throw std::invalid_argument("vertex-block media must be contiguous in the soft slice");
+    if (dst.vbd_count == 0u) dst.vbd_begin = base + src.vbd_begin;
+    dst.vbd_count += src.vbd_count;
+    for (nk::VbdElement element : src.vbd_elements) {
+        for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) element.vertex[j] += base;
+        dst.vbd_elements.push_back(element);
+    }
 }
 
 }  // namespace
@@ -3096,20 +3119,20 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     PbfCookInput fluid;
     bool have_soft = false, have_fluid = false;
     for (const MediaRecord& m : media) {
-        if (m.method == MediaRecord::Method::MlsMpm) continue;
-        if (m.kind == MediaRecord::Kind::Cloth) {
-            AppendSoftMedium(soft, BuildClothXpbdInput(m));
-            have_soft = true;
-        } else if (m.kind == MediaRecord::Kind::SoftTet) {
+        if (m.method == MediaRecord::Method::MlsMpm || IsVertexBlockMedium(m)) continue;
+        if (m.kind == MediaRecord::Kind::SoftTet) {
             AppendSoftMedium(soft, BuildSoftTetXpbdInput(m));
-            have_soft = true;
-        } else if (m.kind == MediaRecord::Kind::Cable) {
-            AppendSoftMedium(soft, BuildCableXpbdInput(m));
             have_soft = true;
         } else {  // Fluid (PBF; ValidateMedia guarantees at most one).
             fluid = BuildFluidPbfInput(m);
             have_fluid = true;
         }
+    }
+    for (const MediaRecord& m : media) {
+        if (!IsVertexBlockMedium(m)) continue;
+        AppendSoftMedium(soft, m.kind == MediaRecord::Kind::Cloth ? BuildClothVertexBlockInput(m)
+                                                                  : BuildCableVertexBlockInput(m));
+        have_soft = true;
     }
 
     SoftFluidContactInput contact;

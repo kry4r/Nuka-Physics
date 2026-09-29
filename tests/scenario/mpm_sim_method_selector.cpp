@@ -86,34 +86,37 @@ TEST(MpmSimMethodSelector, MlsMpmSolverCooksMpm) {
     }
 }
 
-// The media-list validator: cloth must be XPBD, a fluid PBF or MLS-MPM; an MLS-MPM
-// medium may co-reside with an XPBD medium but not with a PBF one. Illegal pairs /
-// mixes throw LOUDLY; legal cases (cloth XPBD, fluid PBF, mpm+xpbd) and empty pass.
+// The media-list validator: cloth solves as vertex blocks, a fluid as PBF or MLS-MPM; an
+// MLS-MPM medium may not co-reside with a PBF one. Illegal pairs throw; legal ones pass.
 TEST(MpmSimMethodSelector, MediaValidatorRejectsIllegalLoudly) {
     using MediaRecord = nuka::scene::MediaRecord;
     auto medium = [](MediaRecord::Kind k, MediaRecord::Method m) {
         MediaRecord r; r.kind = k; r.method = m; return r;
     };
-    const MediaRecord cloth_xpbd = medium(MediaRecord::Kind::Cloth,
-                                          MediaRecord::Method::Xpbd);
+    const MediaRecord cloth_vbd = medium(MediaRecord::Kind::Cloth,
+                                         MediaRecord::Method::Vbd);
     const MediaRecord fluid_pbf  = medium(MediaRecord::Kind::Fluid,
                                           MediaRecord::Method::Pbf);
 
     EXPECT_NO_THROW(cook::ValidateMedia({}))
         << "an empty media list is a no-op (byte-identical cook)";
-    EXPECT_NO_THROW(cook::ValidateMedia({cloth_xpbd, fluid_pbf}))
-        << "the wired legal pair (cloth XPBD + fluid PBF) must pass";
+    EXPECT_NO_THROW(cook::ValidateMedia({cloth_vbd, fluid_pbf}))
+        << "the wired legal pair (cloth VBD + fluid PBF) must pass";
     EXPECT_THROW(cook::ValidateMedia(
                      {medium(MediaRecord::Kind::Cloth, MediaRecord::Method::MlsMpm)}),
                  std::runtime_error)
-        << "cloth -> MLS-MPM must throw (cloth stays XPBD)";
+        << "cloth -> MLS-MPM must throw (cloth solves as vertex blocks)";
+    EXPECT_THROW(cook::ValidateMedia(
+                     {medium(MediaRecord::Kind::Cloth, MediaRecord::Method::Xpbd)}),
+                 std::runtime_error)
+        << "cloth -> XPBD must throw";
     EXPECT_THROW(cook::ValidateMedia(
                      {medium(MediaRecord::Kind::Fluid, MediaRecord::Method::Xpbd)}),
                  std::runtime_error)
         << "fluid -> XPBD must throw";
     EXPECT_NO_THROW(cook::ValidateMedia(
-        {medium(MediaRecord::Kind::SoftTet, MediaRecord::Method::MlsMpm), cloth_xpbd}))
-        << "an MLS-MPM medium co-resident with an XPBD medium is legal";
+        {medium(MediaRecord::Kind::SoftTet, MediaRecord::Method::MlsMpm), cloth_vbd}))
+        << "an MLS-MPM medium co-resident with a vertex-block medium is legal";
     EXPECT_THROW(cook::ValidateMedia(
                      {medium(MediaRecord::Kind::Granular, MediaRecord::Method::MlsMpm),
                       fluid_pbf}),

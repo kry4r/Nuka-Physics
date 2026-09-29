@@ -42,7 +42,7 @@ DEMO_BIN = os.path.join(REPO, "build-cuda128", "tests", "nuka_go2_cloth_drape_de
 NX, NY, SPACING = 55, 51, 0.024              # kGridNx/kGridNy/kSpacing.
 STAND_BASE_Z, LIFT, PARK = 0.32, 0.58, 0.45  # kStandBaseZ/kClothLift/kParkLift.
 ORIGIN = (0.0, 0.0, STAND_BASE_Z + LIFT)     # MakeClothRest centre (base_xy = 0,0).
-MASS, FRICTION, BEND, ITERS = 0.012, 1.8, 0.09, 80  # kParticleMass/1.8/kBendAlpha/80.
+MASS, FRICTION, STRETCH, BEND = 0.012, 1.8, 5.0e3, 5.0e-5
 AERO = (30.0, 0.12, 0.16)                    # aero normal / tangent / max_dv.
 CONTACT_RADIUS = 0.022                        # kContactDMin / 2.
 STAND = dict(thigh=0.80, calf=-1.50,
@@ -80,7 +80,8 @@ def build_facade(dev):
     scene.add_entity(morphs.NKS(SCENE))
     scene.add_entity(
         grid,
-        materials.Cloth.XPBD(mass=MASS, friction=FRICTION, bend_alpha=BEND, iters=ITERS),
+        materials.Cloth.VBD(mass=MASS, friction=FRICTION, stretch_stiffness=STRETCH,
+                            bend_stiffness=BEND),
         surfaces.Cloth(free=True, aero=AERO),
         contact_radius=CONTACT_RADIUS)
     return scene.build(dev)
@@ -92,8 +93,8 @@ def build_direct(dev):
         contact_family=1, heightfield_terrain_type=0,
         cloth_nx=NX, cloth_ny=NY, cloth_spacing=SPACING,
         cloth_origin_x=ORIGIN[0], cloth_origin_y=ORIGIN[1], cloth_origin_z=ORIGIN[2],
-        cloth_particle_mass=MASS, cloth_friction=FRICTION, cloth_bend_alpha=BEND,
-        cloth_iters=ITERS, contact_radius=CONTACT_RADIUS, cloth_free=True,
+        cloth_particle_mass=MASS, cloth_friction=FRICTION, cloth_stretch_stiffness=STRETCH,
+        cloth_bend_stiffness=BEND, contact_radius=CONTACT_RADIUS, cloth_free=True,
         aero_normal=AERO[0], aero_tangent=AERO[1], aero_max_dv=AERO[2], **SOLVER)
 
 
@@ -218,7 +219,7 @@ def solver_knob_smoke(dev):
                 heightfield_terrain_type=0, cloth_nx=NX, cloth_ny=NY,
                 cloth_spacing=SPACING, cloth_origin_x=ORIGIN[0], cloth_origin_y=ORIGIN[1],
                 cloth_origin_z=ORIGIN[2], cloth_particle_mass=MASS,
-                cloth_friction=FRICTION, cloth_bend_alpha=BEND, cloth_iters=ITERS,
+                cloth_friction=FRICTION, cloth_stretch_stiffness=STRETCH, cloth_bend_stiffness=BEND,
                 contact_radius=CONTACT_RADIUS, cloth_free=True, aero_normal=AERO[0],
                 aero_tangent=AERO[1], aero_max_dv=AERO[2])
     w_default = nuka.World.create_coupled_from_scene(device=dev, **base)

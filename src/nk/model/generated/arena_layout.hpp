@@ -20,7 +20,7 @@ enum class FieldOwner : uint8_t { Model, Data };
 // concrete element count from the Model capacities x env_count.
 enum class FieldPer : uint8_t {
     Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,
-    DistCon, BendCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,
+    DistCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,
     Scalar,
     // Multi-articulation co-residence: per-articulation (= articulations_per_env)
     // and per-articulation M-tile (= articulations_per_env * max_dof^2).
@@ -169,10 +169,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_rest_length
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_compliance
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::DistCon, 1, 1, 4, 0},  // dist_lambda
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::BendCon, 4, 1, 16, 0},  // bend_particles
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::BendCon, 1, 1, 4, 0},  // bend_rest_angle
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::BendCon, 1, 1, 4, 0},  // bend_compliance
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::BendCon, 1, 1, 4, 0},  // bend_lambda
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 4, 1, 16, 0},  // vol_particles
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 1, 1, 4, 0},  // vol_rest_times6
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 1, 1, 4, 0},  // vol_compliance
@@ -234,7 +230,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // snapshot_particle_prev_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // snapshot_particle_vel
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // dist_color_segments
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // bend_color_segments
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // vol_color_segments
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // sm_color_segments
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // grid_sort_scratch
@@ -390,6 +385,19 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 8, 0},  // contact_solve_counts
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // pair_sample_chunks
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // solve_color_scratch
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 64, 64, 0},  // vbd_elements
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // vbd_incidence_offsets
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // vbd_incidence
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // vbd_color_vertices
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // vbd_color_segments
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 6, 24, 0},  // particle_response
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_target
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_offset
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // vbd_inertia
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_row_impulse
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_written
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_history_vel
+    {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // vbd_history_ready
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

@@ -116,6 +116,7 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
         case NUKA_MEDIA_METHOD_XPBD:   m.method = Method::Xpbd; break;
         case NUKA_MEDIA_METHOD_PBF:    m.method = Method::Pbf; break;
         case NUKA_MEDIA_METHOD_MLSMPM: m.method = Method::MlsMpm; break;
+        case NUKA_MEDIA_METHOD_VBD:    m.method = Method::Vbd; break;
         default: return false;
     }
     // Geometry (one block read per kind).
@@ -148,7 +149,6 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
         return false;
     }
     m.cable_line.pin = static_cast<nscene::MediaRecord::CableLine::Pin>(d.cable_pin);
-    m.cable_line.bend = (d.cable_bend != 0u);
     m.cable_line.slab.half_extents = nmath::Vec3{d.cable_slab_half_extents[0],
         d.cable_slab_half_extents[1], d.cable_slab_half_extents[2]};
     m.cable_line.slab.mass = d.cable_slab_mass;
@@ -158,8 +158,11 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
     m.xpbd.particle_mass = d.xpbd_particle_mass;
     m.xpbd.friction = d.xpbd_friction;
     m.xpbd.distance_alpha = d.xpbd_distance_alpha;
-    m.xpbd.bend_alpha = d.xpbd_bend_alpha;
     m.xpbd.volume_alpha = d.xpbd_volume_alpha;
+    m.xpbd.stretch_stiffness = d.vbd_stretch_stiffness;
+    m.xpbd.poisson = d.vbd_poisson;
+    m.xpbd.bend_stiffness = d.vbd_bend_stiffness;
+    m.xpbd.damping = d.vbd_damping;
     m.xpbd.iters = static_cast<uint16_t>(d.xpbd_iters);
     m.xpbd.aero_drag_normal = d.xpbd_aero_drag_normal;
     m.xpbd.aero_drag_tangent = d.xpbd_aero_drag_tangent;
@@ -551,7 +554,8 @@ nuka_result_t nuka_world_create_from_built_scene(
             desc->osc_task_link, out, options ? options->solver_vel_iters : 0u,
             options ? options->solver_pos_iters : 0u,
             options ? options->solver_contact_margin : 0.0f,
-            options ? options->solver_max_pairs : 0u);
+            options ? options->solver_max_pairs : 0u,
+            options ? options->cloth_integrator : 0u);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
                 record->particle_surfaces = std::move(media_surfaces);

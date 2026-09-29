@@ -1,11 +1,10 @@
 // ---------------------------------------------------------------------------
 // MediaRecord -> cook-input equivalence (host cook assertions, no GPU).
 //
-// Proves the media-record path produces the SAME XpbdCookInput / PbfCookInput the
-// flat coupled descriptor produced before the cook orchestrator existed. The
-// REFERENCE here is a verbatim copy of the legacy c_abi cloth/fluid input builders
-// (the logic that lived in c_abi/world.cpp); the SUBJECT is cook::BuildClothXpbdInput
-// / cook::BuildFluidPbfInput fed a MediaRecord translated from the same flat slots.
+// Proves the media-record path produces the SAME XpbdCookInput / PbfCookInput as a
+// direct build from the flat coupled slots. The cloth reference calls the shell topology
+// builder itself, the fluid one the legacy c_abi builder; the SUBJECT is
+// cook::BuildClothVertexBlockInput / cook::BuildFluidPbfInput fed a MediaRecord.
 // Every field is compared bit-for-bit, on the go2_cloth_drape demo cloth params and
 // a representative fluid box. A divergence here is a translation / move bug.
 // ---------------------------------------------------------------------------
@@ -15,11 +14,12 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "import/cooker/fluid_cooker.hpp"     // CookFluidBox (legacy fluid reference)
 #include "math/vec3.hpp"
-#include "runtime/soft/cloth_topology.hpp"    // BuildClothConstraints (legacy reference)
+#include "runtime/soft/cloth_topology.hpp"    // BuildClothVertexBlocks (cloth reference)
 #include "runtime/soft/tetmesh_topology.hpp"  // BuildSphereTetLattice (legacy tet reference)
 #include "scene/cook/cook_to_model.hpp"
 #include "scene/scene_ir.hpp"
@@ -36,8 +36,9 @@ struct FlatDesc {
     uint32_t cloth_nx = 0u, cloth_ny = 0u;
     float cloth_spacing = 0.0f;
     float cloth_origin_x = 0.0f, cloth_origin_y = 0.0f, cloth_origin_z = 0.0f;
-    float cloth_particle_mass = 0.0f, cloth_friction = 0.0f, cloth_bend_alpha = 0.0f;
-    uint32_t cloth_iters = 0u, cloth_free = 0u;
+    float cloth_particle_mass = 0.0f, cloth_friction = 0.0f;
+    float cloth_stretch = 0.0f, cloth_bend = 0.0f;
+    uint32_t cloth_free = 0u;
     float aero_normal = 0.0f, aero_tangent = 0.0f, aero_max_dv = 0.0f;
     float fluid_min_x = 0.0f, fluid_min_y = 0.0f, fluid_min_z = 0.0f;
     float fluid_max_x = 0.0f, fluid_max_y = 0.0f, fluid_max_z = 0.0f;
@@ -48,9 +49,9 @@ struct FlatDesc {
     float contact_radius = 0.0f;
 };
 
-// ---- LEGACY references: verbatim copies of the pre-orchestrator c_abi builders ----
+// ---- references: the cloth from its topology builder, the fluid from the legacy c_abi ----
 
-cook::XpbdCookInput LegacyClothCookInput(const FlatDesc& p) {
+cook::XpbdCookInput ReferenceClothCookInput(const FlatDesc& p) {
     cook::XpbdCookInput in;
     if (p.cloth_nx < 2u || p.cloth_ny < 2u || p.cloth_spacing <= 0.0f) return in;
     const uint32_t nx = p.cloth_nx, ny = p.cloth_ny;
@@ -70,11 +71,11 @@ cook::XpbdCookInput LegacyClothCookInput(const FlatDesc& p) {
             tris.push_back({{idx(i, j), idx(i + 1u, j), idx(i + 1u, j + 1u)}});
             tris.push_back({{idx(i, j), idx(i + 1u, j + 1u), idx(i, j + 1u)}});
         }
-    nuka::runtime::soft::ClothTopologyOptions opts;
-    opts.distance_compliance_alpha = 0.0f;
-    opts.bend_compliance_alpha = p.cloth_bend_alpha;
-    nuka::runtime::soft::XpbdConstraintSet cs;
-    nuka::runtime::soft::BuildClothConstraints(rest, tris, opts, cs);
+    nuka::runtime::soft::ShellMaterial shell;
+    shell.stretch_stiffness = p.cloth_stretch;
+    shell.bend_stiffness = p.cloth_bend;
+    nuka::runtime::soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
+    in.vbd_count = static_cast<uint32_t>(rest.size());
     in.positions = rest;
     in.velocities.assign(rest.size(), Vec3::Zero());
     const float mass = p.cloth_particle_mass > 0.0f ? p.cloth_particle_mass : 0.01f;
@@ -90,18 +91,6 @@ cook::XpbdCookInput LegacyClothCookInput(const FlatDesc& p) {
             in.inv_mass[idx(last_i, k)] = 0.0f;
         }
     }
-    for (const auto& dc : cs.distance)
-        in.distance.push_back(
-            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
-    for (const auto& bc : cs.bend) {
-        cook::CookBendCon c;
-        for (uint32_t k = 0u; k < 4u; ++k) { c.p[k] = bc.particle[k]; }
-        c.rest_angle = bc.rest_angle;
-        c.compliance_alpha = bc.compliance_alpha;
-        in.bend.push_back(c);
-    }
-    in.solver_iterations =
-        static_cast<uint16_t>(p.cloth_iters != 0u ? p.cloth_iters : 1u);
     in.friction = p.cloth_friction;
     in.aero_drag_normal = p.aero_normal;
     in.aero_drag_tangent = p.aero_tangent;
@@ -155,7 +144,7 @@ MediaRecord ClothMedia(const FlatDesc& p) {
     MediaRecord m;
     m.kind = MediaRecord::Kind::Cloth;
     m.method = (p.soft_sim_method == 1u) ? MediaRecord::Method::MlsMpm
-                                         : MediaRecord::Method::Xpbd;
+                                         : MediaRecord::Method::Vbd;
     m.cloth_grid.nx = p.cloth_nx;
     m.cloth_grid.ny = p.cloth_ny;
     m.cloth_grid.spacing = p.cloth_spacing;
@@ -163,9 +152,8 @@ MediaRecord ClothMedia(const FlatDesc& p) {
     m.cloth_grid.free = (p.cloth_free != 0u);
     m.xpbd.particle_mass = p.cloth_particle_mass;
     m.xpbd.friction = p.cloth_friction;
-    m.xpbd.distance_alpha = 0.0f;
-    m.xpbd.bend_alpha = p.cloth_bend_alpha;
-    m.xpbd.iters = static_cast<uint16_t>(p.cloth_iters);
+    m.xpbd.stretch_stiffness = p.cloth_stretch;
+    m.xpbd.bend_stiffness = p.cloth_bend;
     m.xpbd.aero_drag_normal = p.aero_normal;
     m.xpbd.aero_drag_tangent = p.aero_tangent;
     m.xpbd.aero_drag_max_dv = p.aero_max_dv;
@@ -214,14 +202,12 @@ void ExpectXpbdEqual(const cook::XpbdCookInput& a, const cook::XpbdCookInput& b)
         EXPECT_EQ(a.distance[i].rest_length, b.distance[i].rest_length);
         EXPECT_EQ(a.distance[i].compliance_alpha, b.distance[i].compliance_alpha);
     }
-    ASSERT_EQ(a.bend.size(), b.bend.size()) << "bend size";
-    for (size_t i = 0; i < a.bend.size(); ++i) {
-        for (uint32_t k = 0; k < 4u; ++k) {
-            EXPECT_EQ(a.bend[i].p[k], b.bend[i].p[k]);
-        }
-        EXPECT_EQ(a.bend[i].rest_angle, b.bend[i].rest_angle);
-        EXPECT_EQ(a.bend[i].compliance_alpha, b.bend[i].compliance_alpha);
-    }
+    EXPECT_EQ(a.vbd_begin, b.vbd_begin);
+    EXPECT_EQ(a.vbd_count, b.vbd_count);
+    ASSERT_EQ(a.vbd_elements.size(), b.vbd_elements.size()) << "vertex-block size";
+    for (size_t i = 0; i < a.vbd_elements.size(); ++i)
+        EXPECT_EQ(std::memcmp(&a.vbd_elements[i], &b.vbd_elements[i],
+                              sizeof(a.vbd_elements[i])), 0) << "vertex block " << i;
     ASSERT_EQ(a.volume.size(), b.volume.size()) << "volume size";
     for (size_t i = 0; i < a.volume.size(); ++i) {
         for (uint32_t k = 0; k < 4u; ++k) EXPECT_EQ(a.volume[i].p[k], b.volume[i].p[k]);
@@ -269,7 +255,7 @@ FlatDesc DemoClothDesc() {
     p.cloth_nx = 55u; p.cloth_ny = 51u; p.cloth_spacing = 0.024f;
     p.cloth_origin_x = 0.0f; p.cloth_origin_y = 0.0f; p.cloth_origin_z = 0.90f;
     p.cloth_particle_mass = 0.012f; p.cloth_friction = 1.8f;
-    p.cloth_bend_alpha = 0.09f; p.cloth_iters = 80u;
+    p.cloth_stretch = 5.0e3f; p.cloth_bend = 5.0e-5f;
     p.cloth_free = 1u;
     p.aero_normal = 30.0f; p.aero_tangent = 0.12f; p.aero_max_dv = 0.16f;
     p.contact_radius = 0.022f;
@@ -278,17 +264,17 @@ FlatDesc DemoClothDesc() {
 
 }  // namespace
 
-// Cloth: BuildClothXpbdInput(ClothMedia(demo)) == the legacy cloth builder, free drape.
-TEST(MediaRecordCookEquivalence, ClothMatchesLegacyDrape) {
+// Cloth: BuildClothVertexBlockInput(ClothMedia(demo)) == the direct shell build, free drape.
+TEST(MediaRecordCookEquivalence, ClothMatchesReferenceDrape) {
     const FlatDesc p = DemoClothDesc();
-    ExpectXpbdEqual(cook::BuildClothXpbdInput(ClothMedia(p)), LegacyClothCookInput(p));
+    ExpectXpbdEqual(cook::BuildClothVertexBlockInput(ClothMedia(p)), ReferenceClothCookInput(p));
 }
 
 // Cloth: the perimeter-pinned membrane (cloth_free == 0) matches too.
-TEST(MediaRecordCookEquivalence, ClothMatchesLegacyPinned) {
+TEST(MediaRecordCookEquivalence, ClothMatchesReferencePinned) {
     FlatDesc p = DemoClothDesc();
     p.cloth_free = 0u;
-    ExpectXpbdEqual(cook::BuildClothXpbdInput(ClothMedia(p)), LegacyClothCookInput(p));
+    ExpectXpbdEqual(cook::BuildClothVertexBlockInput(ClothMedia(p)), ReferenceClothCookInput(p));
 }
 
 // The render-surface triangle list matches the legacy winding (record vs flat).
@@ -380,7 +366,7 @@ TEST(MediaRecordCookEquivalence, SoftTetMatchesDemoBall) {
     const cook::XpbdCookInput got = cook::BuildSoftTetXpbdInput(m);
     EXPECT_GT(got.positions.size(), 0u) << "the sphere lattice must produce particles";
     EXPECT_GT(got.volume.size(), 0u) << "a tet body must emit volume constraints";
-    EXPECT_EQ(got.bend.size(), 0u) << "a tet body has no bend constraints";
+    EXPECT_TRUE(got.vbd_elements.empty()) << "a tet body has no vertex blocks";
     ExpectXpbdEqual(got, LegacySoftTetCookInput(radius, cells, cell_len, center_z, mass,
                                                 dist_alpha, vol_alpha, iters, friction));
 }
