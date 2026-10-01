@@ -10,6 +10,7 @@
 #include "math/transform.hpp"
 
 #include <algorithm>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,9 @@ struct CookedJointTable {
     std::vector<float>      armatures;
     std::vector<float>      initial_positions;
     std::vector<float>      frictionlosses;
+    std::vector<JointId>    mimic_sources;
+    std::vector<float>      mimic_multipliers;
+    std::vector<float>      mimic_offsets;
 };
 
 // Sentinel: a shape row that carries no convex-hull geometry.
@@ -55,6 +59,7 @@ struct CookedShapeTable {
     std::vector<float>           half_heights;
     // Index into the shared triangle geometry table; primitives have no entry.
     std::vector<uint32_t>        convex_geometry_indices;
+    std::vector<uint8_t>         mesh_contact_modes;
 };
 
 // Shared geometry for convex pieces and authored triangle meshes.
@@ -69,6 +74,11 @@ struct CookedConvexGeometry {
     std::vector<float>    volumes;         // per-hull volume
     std::vector<collision::MeshSurfaceInfo> surface_info;
     std::vector<collision::MeshBvhNode> surface_nodes;
+    std::vector<collision::MeshEdgeInfo> edge_info;
+    std::vector<collision::MeshEdge> edges;
+    std::vector<collision::MeshBvhNode> edge_nodes;
+    std::vector<uint32_t> triangle_edges;
+    std::vector<uint32_t> triangle_vertex_owner;
     std::vector<import::cooker::ConvexCoverResult> surface_covers;
     std::vector<std::string> surface_cache_keys;
     std::vector<uint8_t> surface_cache_hits;
@@ -272,6 +282,18 @@ struct CookedActuatorTable {
     std::vector<float>        force_limits;
 };
 
+struct CookedMeshReport {
+    ShapeId shape_id = kInvalidShape;
+    BodyId body_id = kInvalidBody;
+    std::string name;
+    uint32_t target_triangles = 0u;
+    uint32_t actual_triangles = 0u;
+    uint32_t source_edges = 0u;
+    uint32_t nonmanifold_edges = 0u;
+    float sampled_one_sided_hausdorff = 0.0f;
+    float min_altitude = 0.0f;  // smallest triangle altitude of the cooked mesh, metres
+};
+
 struct CookedBlob {
     uint32_t body_count  = 0;
     uint32_t joint_count = 0;
@@ -288,6 +310,7 @@ struct CookedBlob {
     CookedContactParamTable contact_params;  // v0.8 C1a: per-shape contact params (parallel to shapes)
     CookedFilterPolicy filter_policy;        // v0.8 C1c: baked filter/exclude/explicit-pair policy
     CookedConvexGeometry convex_geometry;  // v0.7 p06: hull geometry for ConvexHull rows
+    std::vector<CookedMeshReport> mesh_reports;
     CookedSdfTable    sdfs;                 // v0.7 p07: narrow-band SDFs per unique piece
     CookedSensorTable sensors;
     CookedMaterialTable materials;

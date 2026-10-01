@@ -42,6 +42,8 @@ The contact capacity is an explicit storage budget. Check `ENV_STATUS` and `GRID
 
 Changing this setting preserves world state and buffer addresses and invalidates the captured execution graph. Fewer exchanges change the finite-iteration coupling response: compare contact residuals, deformation and timestep convergence before using a lower count. The G1 demo exposes the setting as `--coupling-passes` and records it in `metrics.json`.
 
+`world.set_velocity_iterations(count)` sets the contact solver's velocity sweeps per exchange (1..65535), and `world.velocity_iterations()` reads the current budget. Timestep and exchange count stay unchanged; the change preserves world state and buffer addresses and invalidates the captured execution graph. The C API provides `nuka_world_set_velocity_iterations` and `nuka_world_get_velocity_iterations`; C++ uses `World::SetVelocityIterations`. The diagnostic sweep-budget replay uses it to repeat one step at several budgets.
+
 MLS-MPM evaluates stress from the accepted particle history during particle-to-grid transfer. Contacts modify the grid velocity; the final grid velocity drives particle transfer and the material history update. Constitutive evaluation reads the accepted history into a separate trial, and a successful trial commits once per physical interval. Repeated trial evaluation leaves the accepted history unchanged.
 
 The material integration remains explicit. Contact exchanges do not iterate the material stress to convergence, so their count does not remove the material stiffness restriction on the timestep.

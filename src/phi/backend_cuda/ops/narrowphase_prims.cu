@@ -159,6 +159,7 @@ __global__ void PairDrivenNarrowphaseKernel(
     const uint32_t* __restrict__ candidate_pairs,   // elem:2 per slot
     const uint32_t* __restrict__ pair_count,        // per env
     const float* __restrict__ shape_table,
+    const uint8_t* __restrict__ mesh_contact_mode,
     const math::Transform* __restrict__ body_pose,
     const float* __restrict__ hull_verts,           // cooked hull pool (G5)
     uint32_t /*hull_vert_count*/,                    // L-RECON-D: per-shape slice now in shape_table
@@ -176,7 +177,9 @@ __global__ void PairDrivenNarrowphaseKernel(
     uint32_t* __restrict__ ucontact_gen,
     uint64_t* __restrict__ ucontact_id_pair,
     uint64_t* __restrict__ ucontact_id_feature,
-    uint32_t* __restrict__ contact_count) {
+    uint32_t* __restrict__ contact_count,
+    uint32_t* __restrict__ mesh_ogc_pair_count,
+    uint32_t* __restrict__ mesh_sdf_pair_count) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
 
     const uint32_t total = env_count * slot_stride;
@@ -195,15 +198,19 @@ __global__ void PairDrivenNarrowphaseKernel(
         b = candidate_pairs[static_cast<size_t>(gid) * 2u + 1u];
         const PrimShapeDev sa = LoadPrimShape(shape_table, a);
         const PrimShapeDev sb = LoadPrimShape(shape_table, b);
-        const math::Transform xa = body_pose[env * bodies_per_env + a];
-        const math::Transform xb = body_pose[env * bodies_per_env + b];
-        const amf::PrimParams pa = MakePrim(sa, xa);
-        const amf::PrimParams pb = MakePrim(sb, xb);
-        // L-RECON-D: each side carries its OWN hull slice (lanes 10/11) into the
-        // concatenated hull_verts pool; non-hull sides keep count 0 (no-op).
-        DispatchPair(sa.kind, pa, sb.kind, pb, hull_verts,
-                     sa.hull_vert_offset, sa.hull_vert_count,
-                     sb.hull_vert_offset, sb.hull_vert_count, &m);
+        const auto route = RouteMeshContact(sa.kind, sb.kind, mesh_contact_mode[a],
+                                            mesh_contact_mode[b]);
+        if (route == MeshContactRoute::Ogc) atomicAdd(&mesh_ogc_pair_count[env], 1u);
+        if (route == MeshContactRoute::Sdf) atomicAdd(&mesh_sdf_pair_count[env], 1u);
+        if (route == MeshContactRoute::Analytic) {
+            const math::Transform xa = body_pose[env * bodies_per_env + a];
+            const math::Transform xb = body_pose[env * bodies_per_env + b];
+            const amf::PrimParams pa = MakePrim(sa, xa);
+            const amf::PrimParams pb = MakePrim(sb, xb);
+            DispatchPair(sa.kind, pa, sb.kind, pb, hull_verts,
+                         sa.hull_vert_offset, sa.hull_vert_count,
+                         sb.hull_vert_offset, sb.hull_vert_count, &m);
+        }
     }
 
     const uint32_t n = m.point_count;
@@ -255,11 +262,15 @@ __global__ void PairDrivenNarrowphaseKernel(
 }
 
 __global__ void ZeroEnvKernel(uint32_t* __restrict__ contact_count,
-                              uint32_t* __restrict__ row_count, uint32_t n) {
+                              uint32_t* __restrict__ row_count,
+                              uint32_t* __restrict__ mesh_ogc_pair_count,
+                              uint32_t* __restrict__ mesh_sdf_pair_count, uint32_t n) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n) return;
     contact_count[e] = 0u;
     row_count[e] = 0u;
+    mesh_ogc_pair_count[e] = 0u;
+    mesh_sdf_pair_count[e] = 0u;
 }
 
 }  // namespace
@@ -274,7 +285,8 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
     {
         const uint32_t b = (p.env_count + kBlock - 1u) / kBlock;
         LaunchCuda(ZeroEnvKernel, dim3(b), dim3(kBlock), 0u, stream,
-                   data.contact_count, data.row_count, p.env_count);
+                   data.contact_count, data.row_count, data.mesh_ogc_pair_count,
+                   data.mesh_sdf_pair_count, p.env_count);
     }
     const uint32_t total = p.env_count * p.union_slot_count;
     const uint32_t blocks = (total + kBlock - 1u) / kBlock;
@@ -286,7 +298,7 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
     constexpr uint32_t kGen = 1u;
     LaunchCuda(PairDrivenNarrowphaseKernel, dim3(blocks), dim3(kBlock), 0u, stream,
                data.candidate_pairs, data.pair_count,
-               static_cast<const float*>(model.shape_table),
+               static_cast<const float*>(model.shape_table), model.mesh_contact_mode,
                static_cast<const math::Transform*>(data.body_pose),
                static_cast<const float*>(model.hull_verts), p.hull_vert_count, kGen,
                p.env_count, p.union_slot_count, p.rigid_slot_cap, p.bodies_per_env,
@@ -294,7 +306,8 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,
                data.ucontact_gen, data.ucontact_id_pair,
-               data.ucontact_id_feature, data.contact_count);
+               data.ucontact_id_feature, data.contact_count,
+               data.mesh_ogc_pair_count, data.mesh_sdf_pair_count);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

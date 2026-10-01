@@ -1,4 +1,6 @@
 #pragma once
+#include "nk/readout/energy_ledger.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 // ===========================================================================
 // c_abi/dlpack_table.hpp — the canonical, single-source-of-truth descriptor
 // table for the public RL state-buffer field enum (nuka_state_field_t).
@@ -31,6 +33,7 @@
 #include "nk/model/generated/arena_layout.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "nk/solve/point_endpoint.hpp"
+#include "nk/solve/vertex_block.hpp"
 #include "phi/op_schema.hpp"
 
 namespace nuka::c_abi {
@@ -44,10 +47,19 @@ static_assert(NUKA_CONTACT_SIDE_POINT_ENDPOINT == nk::kNkSidePointEndpoint);
 static_assert(sizeof(nuka_point_endpoint_range_t) == sizeof(nk::PointEndpointRange));
 static_assert(sizeof(nuka_point_endpoint_term_t) == sizeof(nk::PointEndpointTerm));
 static_assert(offsetof(nuka_point_endpoint_term_t, column) == offsetof(nk::PointEndpointTerm, column));
+static_assert(sizeof(nuka_vbd_element_t) == sizeof(nk::VbdElement));
+static_assert(NUKA_VBD_TRIANGLE == nk::kVbdTriangle);
+static_assert(NUKA_VBD_HINGE == nk::kVbdHinge);
+static_assert(NUKA_VBD_SPRING == nk::kVbdSpring);
+static_assert(NUKA_VBD_ROD_BEND == nk::kVbdRodBend);
+static_assert(offsetof(nuka_vbd_element_t, vertex) == offsetof(nk::VbdElement, vertex));
+static_assert(offsetof(nuka_vbd_element_t, rest) == offsetof(nk::VbdElement, rest));
+static_assert(offsetof(nuka_vbd_element_t, damping) == offsetof(nk::VbdElement, damping));
 static_assert(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW == phi::kEnvStatusGridContactOverflow);
 static_assert(NUKA_ENV_STATUS_GYRO_FAILURE == phi::kEnvStatusGyroFailure);
 static_assert(NUKA_ENV_STATUS_INVALID_ENDPOINT == phi::kEnvStatusInvalidEndpoint);
 static_assert(NUKA_ENV_STATUS_CONTACT_GEOMETRY_UNAVAILABLE == phi::kEnvStatusContactGeometryUnavailable);
+static_assert(NUKA_ENV_STATUS_DAT_FAILURE == phi::kEnvStatusDatFailure);
 static_assert(NUKA_ENV_STATUS_CONTROL_FAILURE == phi::kEnvStatusControlFailure);
 static_assert(NUKA_GYRO_NOT_CONVERGED == phi::kBodyGyroNotConverged);
 static_assert(NUKA_GYRO_INVALID_INPUT == phi::kBodyGyroInvalidInput);
@@ -192,14 +204,74 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeU64, nk::FieldId::ContactSolveMetrics},
     {NUKA_FIELD_CONTACT_SOLVE_COUNTS, nk::LayoutOf(nk::FieldId::ContactSolveCounts).elem_size,
         kWireDtypeU32, nk::FieldId::ContactSolveCounts},
+    {NUKA_FIELD_PARTICLE_INV_MASS, kStrideF32, kWireDtypeF32, nk::FieldId::ParticleInvMass},
+    {NUKA_FIELD_PARTICLE_KINEMATIC_TARGET, kStrideVec3, kWireDtypeF32,
+        nk::FieldId::ParticleKinematicTarget},
+    {NUKA_FIELD_OGC_CONTACT_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::OgcContactCount},
+    {NUKA_FIELD_DAT_TRUNCATION_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::DatTruncationCount},
+    {NUKA_FIELD_DAT_TRUNCATION_ENERGY, kStrideF32, kWireDtypeF32,
+        nk::FieldId::DatTruncationEnergy},
+    {NUKA_FIELD_DAT_FAILURE_COUNT, kStrideU32, kWireDtypeU32, nk::FieldId::DatFailureCount},
+    {NUKA_FIELD_DAT_QUERY_LIMIT_COUNT, kStrideU32, kWireDtypeU32, nk::FieldId::DatQueryLimitCount},
+    {NUKA_FIELD_CONTACT_WARM_START_COUNTS,
+        nk::LayoutOf(nk::FieldId::ContactWarmStartCounts).elem_size,
+        kWireDtypeU32, nk::FieldId::ContactWarmStartCounts},
+    {NUKA_FIELD_DAT_PARTICLE_TRUNCATION_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::DatParticleTruncationCount},
+    {NUKA_FIELD_DAT_PARTICLE_TRUNCATION_ENERGY, kStrideF32, kWireDtypeF32,
+        nk::FieldId::DatParticleTruncationEnergy},
+    {NUKA_FIELD_DAT_JOINT_TRUNCATION_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::DatJointTruncationCount},
+    {NUKA_FIELD_DAT_JOINT_TRUNCATION_ENERGY, kStrideF32, kWireDtypeF32,
+        nk::FieldId::DatJointTruncationEnergy},
+    {NUKA_FIELD_DAT_BODY_TRUNCATION_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::DatBodyTruncationCount},
+    {NUKA_FIELD_DAT_BODY_TRUNCATION_ENERGY, kStrideF32, kWireDtypeF32,
+        nk::FieldId::DatBodyTruncationEnergy},
+    {NUKA_FIELD_MESH_OGC_PAIR_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::MeshOgcPairCount},
+    {NUKA_FIELD_MESH_SDF_PAIR_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::MeshSdfPairCount},
+    {NUKA_FIELD_VBD_VELOCITY_SWEEP_COUNT, kStrideU32, kWireDtypeU32,
+        nk::FieldId::VbdVelocitySweepCount},
+    {NUKA_FIELD_SOLVER_COLOR_COUNTS, nk::LayoutOf(nk::FieldId::SolverColorCounts).elem_size,
+        kWireDtypeU32, nk::FieldId::SolverColorCounts},
+    {NUKA_FIELD_DAT_PARTICLE_MOTION_FRACTION,
+        nk::LayoutOf(nk::FieldId::DatParticleBeta).elem_size,
+        kWireDtypeF32, nk::FieldId::DatParticleBeta},
+    {NUKA_FIELD_VBD_SOLVE_METRICS, nk::LayoutOf(nk::FieldId::VbdSolveMetrics).elem_size,
+        kWireDtypeU64, nk::FieldId::VbdSolveMetrics},
+    {NUKA_FIELD_ENERGY_LEDGER, nk::LayoutOf(nk::FieldId::EnergyLedger).elem_size,
+        kWireDtypeF32, nk::FieldId::EnergyLedger},
+    {NUKA_FIELD_ENERGY_LEDGER_STATUS, nk::LayoutOf(nk::FieldId::EnergyLedgerStatus).elem_size,
+        kWireDtypeU32, nk::FieldId::EnergyLedgerStatus},
+    {NUKA_FIELD_VBD_FORCE_RESIDUAL_WORK, nk::LayoutOf(nk::FieldId::VbdForceResidualWork).elem_size,
+        kWireDtypeF32, nk::FieldId::VbdForceResidualWork},
+    {NUKA_FIELD_PHYSICS_STAGE_METRICS, nk::LayoutOf(nk::FieldId::PhysicsStageMetrics).elem_size,
+        kWireDtypeF32, nk::FieldId::PhysicsStageMetrics},
+    {NUKA_FIELD_CONTACT_AUDIT_COUNTS, nk::LayoutOf(nk::FieldId::ContactAuditCounts).elem_size,
+        kWireDtypeU32, nk::FieldId::ContactAuditCounts},
+    {NUKA_FIELD_CONTACT_AUDIT_METRICS, nk::LayoutOf(nk::FieldId::ContactAuditMetrics).elem_size,
+        kWireDtypeU64, nk::FieldId::ContactAuditMetrics},
+    {NUKA_FIELD_VBD_EFFECTIVE_DT, kStrideF32, kWireDtypeF32, nk::FieldId::VbdStep},
+    {NUKA_FIELD_VBD_ELEMENTS, nk::LayoutOf(nk::FieldId::VbdElements).elem_size,
+        kWireDtypeU32, nk::FieldId::VbdElements},
+    {NUKA_FIELD_DAT_FAILURE_WITNESS, nk::LayoutOf(nk::FieldId::DatFailureWitness).elem_size,
+        kWireDtypeU64, nk::FieldId::DatFailureWitness},
 };
 
 inline constexpr size_t kDlpackFieldCount =
     sizeof(kDlpackFieldTable) / sizeof(kDlpackFieldTable[0]);
+static_assert(NUKA_ENERGY_COLUMN_COUNT == nk::kEnergyColumnCount,
+              "public energy record columns must match the physics readout");
+static_assert(nk::LayoutOf(nk::FieldId::PhysicsStageMetrics).elem_size ==
+              nk::kEnergyStageCount * nk::kPhysicsStageColumnCount * sizeof(float));
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 63u,
-              "dlpack_table must hold exactly the 63 public state fields");
+static_assert(kDlpackFieldCount == 92u,
+              "public field table extent must match the append-only field enum");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,

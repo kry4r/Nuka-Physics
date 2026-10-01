@@ -88,7 +88,20 @@ NUKA_MESH_HD inline bool MeshSurfaceRangeValid(
 NUKA_MESH_HD inline math::Vec3 MeshSurfaceVertex(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info, uint32_t vertex) {
     const size_t at = (static_cast<size_t>(info.vertex_offset) + vertex) * 3u;
-    return {view.vertices[at], view.vertices[at + 1u], view.vertices[at + 2u]};
+    const math::Vec3 local{view.vertices[at], view.vertices[at + 1u], view.vertices[at + 2u]};
+    if (!view.transformed) return local;
+    const math::Vec3 q{view.rotation.x, view.rotation.y, view.rotation.z};
+    const math::Vec3 t = 2.0f * q.Cross(local);
+    return local + view.rotation.w * t + q.Cross(t) + view.position;
+}
+
+NUKA_MESH_HD inline math::Vec3 MeshSurfaceLocalPoint(
+    const MeshSurfaceView& view, math::Vec3 point) {
+    if (!view.transformed) return point;
+    const math::Vec3 local = point - view.position;
+    const math::Vec3 q{-view.rotation.x, -view.rotation.y, -view.rotation.z};
+    const math::Vec3 t = 2.0f * q.Cross(local);
+    return local + view.rotation.w * t + q.Cross(t);
 }
 
 NUKA_MESH_HD inline bool MeshSurfaceTriangle(

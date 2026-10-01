@@ -358,6 +358,8 @@ typedef struct nuka_media_desc_t {
     float    skin_grain_radius_jitter;
     float    skin_grain_tint_jitter;
     uint32_t render_material_id;     // ~0u (0xFFFFFFFF) => none.
+    float    xpbd_half_thickness;
+    float    xpbd_surface_density;
 } nuka_media_desc_t;
 
 // Create a built-scene handle owning one in-memory SceneIR. A non-empty

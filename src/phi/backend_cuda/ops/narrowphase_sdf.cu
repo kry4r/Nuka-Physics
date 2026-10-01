@@ -268,6 +268,7 @@ __device__ __forceinline__ bool PairSampleContact(
 __global__ void FlagPairSampleChunksKernel(const uint32_t* __restrict__ candidate_pairs,
                                            const uint32_t* __restrict__ pair_count,
                                            const float* __restrict__ shape_table,
+                                           const uint8_t* __restrict__ mesh_contact_mode,
                                            const float* __restrict__ samp_points,
                                            const uint32_t* __restrict__ samp_ranges,
                                            SurfaceQueryView surfaces,
@@ -291,6 +292,10 @@ __global__ void FlagPairSampleChunksKernel(const uint32_t* __restrict__ candidat
     const uint32_t bodies[2] = {candidate_pairs[static_cast<size_t>(gid) * 2u + 0u],
                                 candidate_pairs[static_cast<size_t>(gid) * 2u + 1u]};
     if (bodies[0] >= bodies_per_env || bodies[1] >= bodies_per_env) return;
+    const auto pair_a = LoadPrimShape(shape_table, bodies[0]);
+    const auto pair_b = LoadPrimShape(shape_table, bodies[1]);
+    if (RouteMeshContact(pair_a.kind, pair_b.kind, mesh_contact_mode[bodies[0]],
+                         mesh_contact_mode[bodies[1]]) != MeshContactRoute::Sdf) return;
     const uint32_t other = 1u - side;
     const PrimShapeDev sampled = LoadPrimShape(shape_table, bodies[side]);
     const PrimShapeDev target = LoadPrimShape(shape_table, bodies[other]);
@@ -321,6 +326,7 @@ __global__ void FlagPairSampleChunksKernel(const uint32_t* __restrict__ candidat
 __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs,
                                     const uint32_t* __restrict__ pair_count,
                                     const float* __restrict__ shape_table,
+                                    const uint8_t* __restrict__ mesh_contact_mode,
                                     const float* __restrict__ samp_points,
                                     const uint32_t* __restrict__ samp_ranges,
                                     SurfaceQueryView surfaces,
@@ -366,6 +372,8 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
         return;
     }
     const PrimShapeDev shapes[2] = {LoadPrimShape(shape_table, a), LoadPrimShape(shape_table, b)};
+    if (RouteMeshContact(shapes[0].kind, shapes[1].kind, mesh_contact_mode[a],
+                         mesh_contact_mode[b]) != MeshContactRoute::Sdf) return;
     const math::Transform poses[2] = {body_pose[env * bodies_per_env + a],
                                       body_pose[env * bodies_per_env + b]};
     const uint32_t bodies[2] = {a, b};
@@ -508,7 +516,8 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
     }
     const auto surfaces = MakeSurfaceQueryView(model, p->bodies_per_env, p->mesh_geometry,
                                                p->sdf_grid_count, p->sdf_cell_total);
-    if (!model.samp_ranges || !model.shape_table || !data.candidate_pairs || !data.body_pose ||
+    if (!model.samp_ranges || !model.shape_table || !model.mesh_contact_mode ||
+        !data.candidate_pairs || !data.body_pose ||
         (p->sample_point_count > 0u && !model.samp_points) || !SurfaceQueryStorageValid(surfaces))
         return Status::InvalidArgument;
     const uint32_t pair_slots = std::min(p->max_contacts_per_env, p->rigid_slot_cap);
@@ -530,7 +539,7 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
         const uint32_t spread = std::clamp(kSampleChunkBlockBudget / (blocks * 2u), 1u, sweeps);
         LaunchCuda(FlagPairSampleChunksKernel, dim3(blocks, 2u, spread), dim3(kSurfaceQueryThreads), 0u,
                    stream, data.candidate_pairs, data.pair_count,
-                   static_cast<const float*>(model.shape_table),
+                   static_cast<const float*>(model.shape_table), model.mesh_contact_mode,
                    static_cast<const float*>(model.samp_points),
                    static_cast<const uint32_t*>(model.samp_ranges),
                    surfaces,
@@ -541,7 +550,7 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
     }
     LaunchCuda(PairDrivenSdfKernel, dim3(blocks), dim3(kSurfaceQueryThreads), 0u, stream,
                data.candidate_pairs, data.pair_count,
-               static_cast<const float*>(model.shape_table),
+               static_cast<const float*>(model.shape_table), model.mesh_contact_mode,
                static_cast<const float*>(model.samp_points),
                static_cast<const uint32_t*>(model.samp_ranges),
                surfaces,

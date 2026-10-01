@@ -68,6 +68,10 @@ public:
     // Changes contact exchange frequency while retaining material iterations and interval length.
     phi::Status SetCouplingPasses(uint32_t passes);
 
+    // Changes the contact solve's velocity sweep budget (1..65535) while retaining the interval length.
+    phi::Status SetVelocityIterations(uint32_t iterations);
+    uint32_t VelocityIterations() const { return cfg_.vel_iters; }
+
     // Update one template link's spatial inertia in every environment without reallocating.
     phi::Status SetLinkInertia(uint32_t link_index, const Mat36& inertia);
 

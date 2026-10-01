@@ -98,6 +98,8 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
                                    uint32_t row_exempt = 0u);
 
+void SetOgcContactCapacity(nk::Model& model, uint32_t capacity);
+
 // ---------------------------------------------------------------------------
 // particle cook (the design "粒子 XPBD/PBF"). Stage an XPBD soft body or a
 // PBF fluid into the nk::Model particle block + set the particle/constraint
@@ -131,6 +133,7 @@ struct CookParticleSurface {
     std::vector<uint32_t> triangles;
     float half_thickness = 0.0f;
     float friction = 0.6f;
+    std::vector<uint32_t> edges;
 };
 
 struct XpbdCookInput {

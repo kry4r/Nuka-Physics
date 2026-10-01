@@ -45,10 +45,9 @@ void BuildVertexBlockSchedule(Model* model) {
     }
 
     // Highest degree first, ties by index; each vertex takes the lowest color no neighbor holds.
-    const auto dynamic = [&](uint32_t v) { return p.inv_mass[cap.vbd_particle_begin + v] > 0.0f; };
     std::vector<uint32_t> order;
     for (uint32_t v = 0u; v < vertices; ++v)
-        if (dynamic(v)) order.push_back(v);
+        if (p.inv_mass[cap.vbd_particle_begin + v] > 0.0f) order.push_back(v);
     std::stable_sort(order.begin(), order.end(),
                      [&](uint32_t a, uint32_t b) { return degree[a] > degree[b]; });
     std::vector<uint32_t> color(vertices, kVbdNoColor);

@@ -29,6 +29,7 @@ struct CouplingBuildCtx {
     uint32_t particles_per_env = 0u;
     uint32_t max_contacts_per_env = 0u;
     uint32_t rigid_cap = 0u;
+    uint32_t particle_slot_base = 0u;
     uint32_t particle_mode = 0u;
     uint32_t coupled_internal = 0u;
     uint32_t particle_count = 0u;

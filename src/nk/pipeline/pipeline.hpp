@@ -66,6 +66,9 @@ public:
     // op consumes, so it is emitted only when a consumer requested that field.
     enum ReadoutDemand : uint32_t {
         kReadoutContactWrench = 1u << 0,  // ContactForce + LinkContactWrench
+        kReadoutEnergyLedger = 1u << 1,
+        kReadoutPhysicsDiagnostics = 1u << 2,
+        kReadoutContactAudit = 1u << 3,
     };
 
     // All emitted physics ops are required; unsupported demands leave no runnable calls.
@@ -92,6 +95,7 @@ private:
     std::vector<phi::XpbdProjectParams> p_xpbd_iterations_;
     std::vector<phi::SolveRowsBlockIslandParams> p_solve_iterations_;
     std::vector<phi::AccumulateStepParams> p_accumulate_step_;
+    std::vector<phi::ReadoutEnergyLedgerParams> p_energy_;
     phi::FkLinkVelocitiesParams p_fk_velocity_{};
 
     // The build-time coupling providers (row path + MLS-MPM grid-transfer path).
@@ -106,6 +110,9 @@ private:
     phi::ApplyDynamicsDrivesParams    p_apply_dynamics_{};
     phi::ReadoutDrivesParams          p_readout_drives_{};
     phi::ParticleSurfacesParams       p_particle_surfaces_{};
+    phi::ParticleSurfacesParams       p_dat_refit_{};
+    phi::OgcDetectParams              p_ogc_detect_{};
+    phi::DatTruncateParams             p_dat_truncate_{};
     phi::AbaForwardParams             p_aba_{};
     phi::IntegrateVelocityParams      p_int_vel_{};
     phi::SnapshotStepVelocityParams   p_step_velocity_{};

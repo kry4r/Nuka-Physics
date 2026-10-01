@@ -15,6 +15,9 @@
 namespace nuka::nk {
 
 inline constexpr uint32_t kContactFeatureUnavailable = 0xffffffffu;
+inline constexpr uint32_t kContactKindGeneric = 0u;
+inline constexpr uint32_t kContactKindOgcVertexFace = 1u;
+inline constexpr uint32_t kContactKindOgcEdgeEdge = 2u;
 inline constexpr uint32_t kContactHandleBits = 28u;
 inline constexpr uint32_t kContactHandleMask = (1u << kContactHandleBits) - 1u;
 inline constexpr float kContactPointQuantization = 4096.0f;
@@ -49,6 +52,7 @@ struct CanonicalContactDescriptor {
     uint32_t manifold_slot = 0u;
     uint32_t topology_version = 0u;
     uint32_t material_version = 0u;
+    uint32_t contact_kind = kContactKindGeneric;
 };
 
 NUKA_CONTACT_HD inline uint32_t ContactSideKey(const constraint::CollidableRef& ref) {
@@ -145,6 +149,8 @@ NUKA_CONTACT_HD inline ContactId MakeContactId(
     feature_hash = ContactHashWord(feature_hash, descriptor.manifold_slot);
     feature_hash = ContactHashWord(feature_hash, descriptor.topology_version);
     feature_hash = ContactHashWord(feature_hash, descriptor.material_version);
+    if (descriptor.contact_kind != kContactKindGeneric)
+        feature_hash = ContactHashWord(feature_hash, descriptor.contact_kind);
     return {ContactPairKey(descriptor.a, descriptor.b), feature_hash};
 }
 

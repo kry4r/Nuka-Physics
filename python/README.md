@@ -1,5 +1,49 @@
 # `nuka` -- Python binding for the Nuka physics engine
 
+## Quantitative physics diagnostics
+
+See [PHYSICS_DIAGNOSTICS.md](PHYSICS_DIAGNOSTICS.md) for production sampling,
+energy and momentum balances, contact witnesses, external CCD and preserved evidence.
+
+## Energy readout
+
+Request the ledger before the first step. Each sample contains all physical
+substeps of the latest policy step, in environment order. The readout captures
+free velocity after force integration and cloth prediction, before row solving.
+
+```python
+from nuka.energy import EnergyLedgerSampler, EnergyColumn, summarize
+
+ledger = EnergyLedgerSampler(world, env_count=1)
+world.step()
+records, coverage = ledger.sample()
+kinetic = records[..., EnergyColumn.END_KINETIC]
+report = summarize(records[0], coverage[0])
+```
+
+Energy and work columns use joules; `DT` uses seconds. `VALID` is false before
+a requested interval completes and after reset or restore. Nonzero coverage
+flags identify unaccounted terms; residual and throughput are then NaN and
+cannot pass energy acceptance. Losses retain their sign, including DAT energy
+injection. Kinematic particle controllers have separate elastic and contact
+boundary work. Throughput sums individual absolute external work and signed
+physical dissipation, excluding guard loss and state-change proxies.
+Elastic boundary reactions use the same candidate end state as the implicit
+vertex solve, and act through the prescribed displacement of that controller.
+
+The ledger adds no operations when unrequested. Allocated analysis storage is
+60 bytes per particle, 24 per body, 88 per link, 4 per articulation DOF, and
+136 per environment per physical substep.
+
+`VBD_FORCE_RESIDUAL_WORK` reports the signed virtual work of the remaining
+vertex force equation error. It helps separate incomplete solving from
+integration error and leaves the energy residual and its gates unchanged.
+
+Saved traces with `ENERGY_LEDGER` and `ENERGY_LEDGER_STATUS` can be summarized
+with `python python/energy_report.py trace.json --output .nuka-runs/energy/run-tag --plot`.
+The report keeps each environment's time windows separate and exports the
+records, original energy gates, largest residual events, and scientific plots.
+
 A [nanobind](https://nanobind.readthedocs.io/) extension that replaces the
 ctypes stopgap (`examples/sim_val/nuka_cabi.py`) with a typed, **zero-copy**
 Python binding. Observations / state are handed to torch and PD drive targets
@@ -203,3 +247,24 @@ and live root `LINK_VELOCITY` on `go2_float`; writing `DRIVE_STIFFNESS`/
 * No explicit `base_link_count` accessor -- derived as
   `element_count(JOINT_POSITION) / env_count`.
 * `OBSERVATIONS` is not served on the batched (multi-env) path.
+
+### Authored towel scene assets
+
+Fetch pinned episode candidates and verify their source hashes:
+
+```bash
+python tools/assets/fetch_fold_towel.py --out .nuka-assets/datasets/g1_fold_towel
+```
+
+The manifest identifies candidates awaiting full video review. It does not certify flat initial cloth or absence of human intervention.
+
+Build a fixed upper body from the original Inspire URDF, one episode and the controller source:
+
+```bash
+PYTHONPATH=python python tools/assets/build_g1_inspire_fold.py \
+  --episode .nuka-assets/datasets/g1_fold_towel/data/chunk-000/episode_000000.parquet \
+  --controller-source /path/to/pinned/robot_arm.py \
+  --out .nuka-runs/artifacts/fold/my_scene
+```
+
+This tool requires NumPy, SciPy and PyArrow. It writes the reduced skeleton, robot NKS and a scene description with source hashes, material parameters and explicit drive settings. Hand gains are simulation inputs awaiting hardware calibration. `nuka.tasks.fold_scene.build_scene` assembles the description through the common production pipeline and applies the recorded arm gains through the public fields. Inspect initial intersections, coverage and finite state before running a replay; asset generation alone is not physics acceptance.

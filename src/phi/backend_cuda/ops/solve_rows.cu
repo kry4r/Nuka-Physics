@@ -74,10 +74,12 @@ __device__ void ApplyPointImpulse(const NkRowSide& side, float delta,
         const auto term = points.At(side, i);
         const auto* inverse_mass = points.InverseMass(term.kind);
         auto* velocity = points.Velocity(term.kind);
-        if (velocity != nullptr && inverse_mass != nullptr && inverse_mass[term.index] > 0.0f)
+        if (velocity != nullptr && inverse_mass != nullptr && inverse_mass[term.index] > 0.0f) {
             AddVelocity(velocity[term.index], error.Point(term.kind, term.index),
                         points.Respond(term.kind, term.index, term.jacobian,
                                        inverse_mass[term.index], delta));
+            points.RecordImpulse(term.kind, term.index, term.jacobian * delta);
+        }
     }
 }
 
@@ -554,6 +556,7 @@ __device__ void ApplySlimContactImpulse(
                         points.Respond(a.kind, a.index, a.jacobian, m),
                         points.Respond(a.kind, a.index, b.jacobian, m),
                         points.Respond(a.kind, a.index, c.jacobian, m), impulse);
+                    points.RecordBlockImpulse(a.kind, a.index, a.jacobian, b.jacobian, c.jacobian, impulse);
                     velocity[a.index] = value;
                 }
             } else if (lane == 0u) {
@@ -598,6 +601,7 @@ __device__ void ApplySlimContactImpulse(
                         points.Respond(a.kind, a.index, a.jacobian, m),
                         points.Respond(a.kind, a.index, b.jacobian, m),
                         points.Respond(a.kind, a.index, c.jacobian, m), impulse);
+                    points.RecordBlockImpulse(a.kind, a.index, a.jacobian, b.jacobian, c.jacobian, impulse);
                     velocity[a.index] = value;
                 }
             } else if (sides[0].kind == kNkSideRigid && lane == 0u) {
@@ -878,14 +882,25 @@ __device__ bool HasArticulationSide(const NkRow& row) {
     return row.a.kind == kNkSideArtic || row.b.kind == kNkSideArtic;
 }
 
-// Rows the articulation Schur step couples; a block normal carries its tangents' impulses.
-__device__ inline bool IsSchurRow(const NkRow& row) {
-    return (row.flags & nk::nk_row_flags::kActive) &&
-           !(row.flags & nk::nk_row_flags::kBlockTangent) && HasArticulationSide(row);
-}
-
 __device__ inline bool IsHubSide(const NkRowSide& side, const ColorScratch& s) {
     return side.kind == kNkSideRigid && side.index < s.bodies && s.hub_count[side.index] > kHubRows;
+}
+
+// A row joining an articulation to another dynamic body runs in the chain with both responses
+// applied at once; a frozen articulation would meet that body's inertia only through gains.
+__device__ inline bool IsSequentialArticRow(const NkRow& row, const ColorScratch& s) {
+    if (IsHubSide(row.a, s) || IsHubSide(row.b, s)) return false;
+    const bool a = row.a.kind == kNkSideArtic;
+    const bool b = row.b.kind == kNkSideArtic;
+    if (a && b) return row.a.index != row.b.index;
+    return a != b && (a ? row.b : row.a).kind != kNkSideStatic;
+}
+
+// Rows the articulation Schur step couples; a block normal carries its tangents' impulses.
+__device__ inline bool IsSchurRow(const NkRow& row, const ColorScratch& s) {
+    return (row.flags & nk::nk_row_flags::kActive) &&
+           !(row.flags & nk::nk_row_flags::kBlockTangent) && HasArticulationSide(row) &&
+           !IsSequentialArticRow(row, s);
 }
 
 // Rows a hub's Schur step couples; a block normal carries its tangents' impulses.
@@ -1001,6 +1016,7 @@ __device__ bool SolveLaneRecord(const LaneRecord& r, float* __restrict__ lambda,
         const uint32_t kind = (r.index[k] & kLaneGridBit) ? kNkSideGrid : kNkSideParticle;
         const math::Vec3 impulse =
             points.Respond(kind, r.index[k] & ~kLaneGridBit, j, r.inverse_mass[k], delta);
+        points.RecordImpulse(kind, r.index[k] & ~kLaneGridBit, j * delta);
         bool merged = false;
         #pragma unroll
         for (uint32_t m = 0u; m < k; ++m) {
@@ -1167,6 +1183,7 @@ __device__ void ApplyPreparedContactSide(
                 points.Respond(a.kind, a.index, a.jacobian, m),
                 points.Respond(a.kind, a.index, b.jacobian, m),
                 points.Respond(a.kind, a.index, c.jacobian, m), impulse);
+            points.RecordBlockImpulse(a.kind, a.index, a.jacobian, b.jacobian, c.jacobian, impulse);
             velocity[a.index] = value;
         }
     } else if (normal.kind == kNkSideRigid && lane == 0u) {
@@ -1288,6 +1305,7 @@ __device__ void ApplyPointLaneImpulse(const PointLaneTerm& term, uint32_t count,
     math::Vec3 value = term.velocity;
     AddVelocity(value, nullptr,
                 points.Respond(term.kind, term.index, term.jacobian[0], term.inverse_mass, delta));
+    points.RecordImpulse(term.kind, term.index, term.jacobian[0] * delta);
     velocity[term.index] = value;
 }
 
@@ -1306,6 +1324,8 @@ __device__ void ApplyPointSideTerm(const PointLaneTerm& term, uint32_t count, ui
         points.Respond(term.kind, term.index, term.jacobian[0], term.inverse_mass),
         points.Respond(term.kind, term.index, term.jacobian[1], term.inverse_mass),
         points.Respond(term.kind, term.index, term.jacobian[2], term.inverse_mass), impulse);
+    points.RecordBlockImpulse(term.kind, term.index, term.jacobian[0], term.jacobian[1],
+                              term.jacobian[2], impulse);
     velocity[term.index] = value;
     if (compensation != nullptr) *compensation = residue;
 }
@@ -1513,7 +1533,7 @@ __device__ inline math::Vec3 ChainLaneJacobian(const ChainPointCache& cache, uin
 }
 
 // A staged chain contact: its point side and old impulses come from the batch cache, and the
-// sums, step and side order match SolvePreparedContactBlockWarp with frozen articulations.
+// sums, step and side order match SolvePreparedContactBlockWarp for the same staged responses.
 __device__ bool SolveChainContactBlockWarp(
     uint32_t gslot, uint32_t row, uint32_t env_artic_base, uint32_t lane, const NkRow* rows,
     const ChainPointCache& cache, float* lambda, const float* J, const float* minv_j,
@@ -1566,7 +1586,9 @@ __device__ bool SolveChainContactBlockWarp(
     #pragma unroll
     for (uint32_t side = 0u; side < 2u; ++side) {
         if (side != point_side) {
-            if ((side == 0u ? rows[0].a.kind : rows[0].b.kind) == kNkSideArtic) continue;
+            // Deferred articulation sides take the impulse at the Schur commit instead.
+            if ((side == 0u ? rows[0].a.kind : rows[0].b.kind) == kNkSideArtic &&
+                (side == 0u ? minv_j : minv_j_b) == nullptr) continue;
             ApplyPreparedContactSide(rows, side, j_row, 1u, env_artic_base, lane, step.delta,
                 qdot, minv_j, minv_j_b, body_linear, body_angular, body_inv_mass,
                 body_inv_inertia, points, dofs, error);
@@ -1587,6 +1609,9 @@ __device__ bool SolveChainContactBlockWarp(
                 points.Respond(kind, index, ChainLaneJacobian(cache, term, 1u), inverse_mass),
                 points.Respond(kind, index, ChainLaneJacobian(cache, term, 2u), inverse_mass),
                 step.delta);
+            points.RecordBlockImpulse(kind, index, ChainLaneJacobian(cache, term, 0u),
+                                      ChainLaneJacobian(cache, term, 1u),
+                                      ChainLaneJacobian(cache, term, 2u), step.delta);
             cache.velocity[3u * at] = value.x;
             cache.velocity[3u * at + 1u] = value.y;
             cache.velocity[3u * at + 2u] = value.z;
@@ -1844,6 +1869,7 @@ __device__ bool SolveMaterialBlockGroup(uint32_t slot, const NkRow& head, const 
             math::Vec3 value = held_velocity[c];
             AddVelocity(value, residue != nullptr ? &held_error[c] : nullptr,
                         step.Multiply(held[c].jacobian) * held_mass[c]);
+            points.RecordImpulse(held[c].kind, held[c].index, step.Multiply(held[c].jacobian));
             points.Velocity(held[c].kind)[held[c].index] = value;
             if (residue != nullptr) *residue = held_error[c];
         }
@@ -1855,6 +1881,7 @@ __device__ bool SolveMaterialBlockGroup(uint32_t slot, const NkRow& head, const 
                 continue;
             AddVelocity(velocity[term.index], error.Point(term.kind, term.index),
                         step.Multiply(term.jacobian) * inverse_mass[term.index]);
+            points.RecordImpulse(term.kind, term.index, step.Multiply(term.jacobian));
         }
         __syncwarp(mask);
     };
@@ -2281,9 +2308,11 @@ __device__ void ApplyDynamicImpulseScalar(
             }
             const auto term = point_masses.At(sd, 0u);
             const float* inverse_mass = point_masses.InverseMass(term.kind);
-            if (inverse_mass != nullptr && inverse_mass[term.index] > 0.0f)
+            if (inverse_mass != nullptr && inverse_mass[term.index] > 0.0f) {
                 split->linear[side] += point_masses.Respond(term.kind, term.index, term.jacobian,
                                                             inverse_mass[term.index], delta);
+                point_masses.RecordSharedImpulse(term.kind, term.index, term.jacobian * delta);
+            }
         } else if (sd.kind == kNkSideRigid) {
             const float im = body_inv_mass[sd.index];
             if (im > 0.0f) {
@@ -3492,7 +3521,8 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
             LiveRowOwners(urows, live_order[position], points, body_inv_mass, s, lane);
         cache.Store(m, owners, lane);
         if (lane == 0u) {
-            s.pos_color[position] = owners.packed ? kColorPending : kColorChain;
+            const bool sequential = IsSequentialArticRow(urows[live_order[position]], s);
+            s.pos_color[position] = owners.packed && !sequential ? kColorPending : kColorChain;
             s.pos_tent[position] = kOwnerEmpty;
         }
     });
@@ -3810,7 +3840,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     __syncthreads();
     uint32_t schur_rows = 0u;
     for (uint32_t position = begin + threadIdx.x; position < end; position += blockDim.x)
-        schur_rows += IsSchurRow(urows[live_order[position]]) ? 1u : 0u;
+        schur_rows += IsSchurRow(urows[live_order[position]], s) ? 1u : 0u;
     schur_rows = __reduce_add_sync(0xffffffffu, schur_rows);
     if (lane == 0u && schur_rows != 0u) atomicAdd(&block_chain, schur_rows);
     __syncthreads();
@@ -3825,7 +3855,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     for (uint32_t tile = begin; tile < end; tile += blockDim.x) {
         const uint32_t position = tile + threadIdx.x;
         const uint32_t flag =
-            position < end && IsSchurRow(urows[live_order[position]]) ? 1u : 0u;
+            position < end && IsSchurRow(urows[live_order[position]], s) ? 1u : 0u;
         uint32_t offset = 0u, tile_total = 0u;
         BlockScanT(scan_temp).ExclusiveSum(flag, offset, tile_total);
         if (position < end) s.artic_excl[position] = artic_base + offset;
@@ -3992,6 +4022,8 @@ struct ColoredSolveArgs {
     math::Vec3* grid_pseudo = nullptr;
     VelocityErrorView error;
     nkops::VertexBlockView vertex_blocks;
+    uint32_t* vbd_velocity_sweep_count = nullptr;
+    uint32_t* solver_color_counts = nullptr;
     uint32_t rows_per_env = 0u;
     uint32_t artics_per_env = 0u;
     uint32_t articulation_count = 0u;
@@ -4102,7 +4134,7 @@ __device__ void ProjectSchurRow(const NkRow& row, const SchurRowTerms& t, const 
 }
 
 // Each color sweeps across the grid behind one barrier; chain rows then run per island in live
-// order on one block. Articulations stay frozen within a sweep and a Schur step couples them.
+// order on one block. Colors see articulations frozen, and a Schur step couples those rows.
 __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(ColoredSolveArgs a,
                                                                           ColorScratch s) {
     const auto grid = cooperative_groups::this_grid();
@@ -4128,6 +4160,8 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
     const uint32_t k_tiles = a.artics_per_env == 0u ? 1u : a.artics_per_env;
     float* const staged_j = reinterpret_cast<float*>(colored_shared);
     const size_t staged_size = size_t{3u} * nwarps * dofs;
+    // Sequential chain rows stage their articulation responses M^-1 J^T behind the Jacobians.
+    float* const staged_w = staged_j + 2u * staged_size;
     NkRow* const staged_rows = reinterpret_cast<NkRow*>(row_storage);
     // A color fills one warp of every block before a second warp of any block.
     const uint32_t color_warp = warp * gridDim.x + blockIdx.x;
@@ -4136,6 +4170,13 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
     const uint32_t chain_islands = s.control[kControlChainIslands];
     const uint32_t live = s.control[kControlLive];
     const bool pos_pass = a.pos_iters > 0u && a.row_penetration != nullptr;
+    if (a.solver_color_counts != nullptr) {
+        for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
+             env < a.vertex_blocks.layout.env_count; env += gridDim.x * blockDim.x) {
+            a.solver_color_counts[2u * env] = a.vertex_blocks.layout.colors;
+            a.solver_color_counts[2u * env + 1u] = colors;
+        }
+    }
     const PointMassView pseudo_points = a.points.Pseudo(a.particle_pseudo, a.grid_pseudo);
     bool changed = false;
 
@@ -4143,7 +4184,8 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         return velocity != nullptr ? velocity + size_t{env * k_tiles} * dofs : nullptr;
     };
     const auto pending = [&](const NkRow& row, uint32_t slot) {
-        return HasArticulationSide(row) || IsHubSide(row.a, s) || IsHubSide(row.b, s)
+        return !IsSequentialArticRow(row, s) &&
+               (HasArticulationSide(row) || IsHubSide(row.a, s) || IsHubSide(row.b, s))
             ? s.artic_pending + size_t{slot} * 3u : nullptr;
     };
 
@@ -4710,6 +4752,7 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         const NkRow& normal = staged_rows[3u * warp];
         const uint32_t axes = (normal.flags & nk::nk_row_flags::kBlockNormal)
             ? 3u : ((normal.flags & nk::nk_row_flags::kBlockTangent) ? 0u : 1u);
+        const bool sequential = IsSequentialArticRow(normal, s);
         for (uint32_t axis = 0u; axis < axes; ++axis) {
             const uint32_t at = slot + axis * normal.group_normal_count;
             if (axis != 0u) {
@@ -4719,13 +4762,18 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
                 memcpy(reinterpret_cast<unsigned char*>(staged_rows + 3u * warp + axis) +
                            wlane * sizeof(word), &word, sizeof(word));
             }
-            if (!jacobian) continue;
+            if (!jacobian && !sequential) continue;
             for (uint32_t k = wlane; k < dofs; k += warpSize) {
                 const size_t destination = size_t{3u * warp + axis} * dofs + k;
                 const size_t source = size_t{at} * dofs + k;
-                if (normal.a.kind == kNkSideArtic) staged_j[destination] = a.chain_jacobian[source];
-                if (normal.b.kind == kNkSideArtic)
-                    staged_j[staged_size + destination] = a.chain_jacobian_b[source];
+                if (normal.a.kind == kNkSideArtic) {
+                    if (jacobian) staged_j[destination] = a.chain_jacobian[source];
+                    if (sequential) staged_w[destination] = a.row_minv_jt[source];
+                }
+                if (normal.b.kind == kNkSideArtic) {
+                    if (jacobian) staged_j[staged_size + destination] = a.chain_jacobian_b[source];
+                    if (sequential) staged_w[staged_size + destination] = a.row_minv_jt_b[source];
+                }
             }
         }
         __syncwarp();
@@ -4733,6 +4781,9 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
 
     auto chain_velocity = [&](uint32_t first, uint32_t last, uint32_t env_row_base,
                               uint32_t env_artic_base, float* qdot) {
+        // Sequential rows move articulation velocities under the compensation the commit uses.
+        VelocityErrorView chain_error = a.error;
+        chain_error.qdot = s.qdot_error + size_t{env_artic_base} * dofs;
         for (uint32_t base = first; base < last; base += nwarps) {
             const uint32_t batch_count = min(nwarps, last - base);
             for (uint32_t i = lane; i < kChainCacheEntries; i += blockDim.x)
@@ -4776,24 +4827,27 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
                 if (prepared[0].flags & nk::nk_row_flags::kBlockTangent) continue;
                 const bool block = (prepared[0].flags & nk::nk_row_flags::kBlockNormal) != 0u;
                 float* const owed = pending(prepared[0], gslot);
+                const bool sequential = IsSequentialArticRow(prepared[0], s);
+                const float* const w = sequential ? staged_w : nullptr;
+                const float* const w_b = sequential ? staged_w + staged_size : nullptr;
                 const bool significant = block && cached
                     ? SolveChainContactBlockWarp(gslot, idx, env_artic_base, wlane, prepared,
-                          cache, a.lambda, staged_j, nullptr, staged_j + staged_size, nullptr,
+                          cache, a.lambda, staged_j, w, staged_j + staged_size, w_b,
                           qdot, a.body_linear, a.body_angular, a.body_inv_mass,
-                          a.body_inv_inertia, a.points, dofs, a.dt, a.vel_tolerance, a.error,
-                          3u * idx)
+                          a.body_inv_inertia, a.points, dofs, a.dt, a.vel_tolerance,
+                          chain_error, 3u * idx)
                     : block
                     ? SolvePreparedContactBlockWarp(gslot, env_artic_base, wlane, a.urows,
-                          prepared, a.lambda, a.row_damping, staged_j, nullptr,
-                          staged_j + staged_size, nullptr, qdot, a.body_linear, a.body_angular,
+                          prepared, a.lambda, a.row_damping, staged_j, w,
+                          staged_j + staged_size, w_b, qdot, a.body_linear, a.body_angular,
                           a.body_inv_mass, a.body_inv_inertia, a.points, dofs, a.dt,
-                          a.vel_tolerance, a.error, 3u * idx, 1u, true, owed)
+                          a.vel_tolerance, chain_error, 3u * idx, 1u, true, owed)
                     : SolveUnionRowWarp(gslot - env_row_base, gslot, env_row_base,
                           env_artic_base, 3u * idx, wlane, nullptr, nullptr, nullptr, nullptr,
-                          a.lambda, a.row_meff, a.row_damping, staged_j, nullptr,
-                          staged_j + staged_size, nullptr, qdot, a.urows, a.body_linear,
+                          a.lambda, a.row_meff, a.row_damping, staged_j, w,
+                          staged_j + staged_size, w_b, qdot, a.urows, a.body_linear,
                           a.body_angular, a.body_inv_mass, a.body_inv_inertia, a.points, dofs,
-                          a.dt, false, a.error, prepared, a.vel_tolerance, owed);
+                          a.dt, false, chain_error, prepared, a.vel_tolerance, owed);
                 if (significant && wlane == 0u) changed = true;
                 __syncwarp();
             }
@@ -4828,9 +4882,11 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
             }
             for (uint32_t idx = warp == 0u ? 0u : batch_count; idx < batch_count; ++idx) {
                 const uint32_t gslot = s.chain_rows[base + idx];
+                const bool sequential = IsSequentialArticRow(a.urows[gslot], s);
                 SolvePositionRowWarp(gslot, env_row_base, env_artic_base, gslot, wlane,
                     a.row_meff, a.row_penetration, a.row_pseudo_lambda, a.chain_jacobian,
-                    nullptr, a.chain_jacobian_b, nullptr, qdot, a.urows,
+                    sequential ? a.row_minv_jt : nullptr, a.chain_jacobian_b,
+                    sequential ? a.row_minv_jt_b : nullptr, qdot, a.urows,
                     a.body_pseudo_linear, a.body_pseudo_angular, a.body_inv_mass,
                     a.body_inv_inertia, pseudo_points, dofs, a.pos_beta, a.pos_slop, a.dt,
                     a.baumgarte_max_velocity, nullptr, pending(a.urows[gslot], gslot));
@@ -4852,6 +4908,8 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
             const uint32_t last = s.chain_excl[a.live_scan[rec.seg_off + rec.seg_cnt - 1u]];
             float* const qdot = env_qdot(velocity, rec.env);
             if (sweep == ChainSweep::WarmStart) {
+                VelocityErrorView chain_error = a.error;
+                chain_error.qdot = s.qdot_error + size_t{env_artic_base} * dofs;
                 // Every warp stages a row of the batch; one warp applies them in chain order.
                 for (uint32_t base = first; base < last; base += nwarps) {
                     const uint32_t batch_count = min(nwarps, last - base);
@@ -4864,12 +4922,15 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
                     for (uint32_t idx = warp == 0u ? 0u : batch_count; idx < batch_count; ++idx) {
                         const uint32_t slot = s.chain_rows[base + idx];
                         NkRow* const prepared = staged_rows + 3u * idx;
+                        const bool sequential = IsSequentialArticRow(prepared[0], s);
                         SolveUnionRowWarp(slot - env_row_base, slot, env_row_base,
                             env_artic_base, 3u * idx, wlane, nullptr, nullptr, nullptr, nullptr,
-                            a.lambda, a.row_meff, a.row_damping, staged_j, nullptr,
-                            staged_j + staged_size, nullptr, qdot, a.urows, a.body_linear,
-                            a.body_angular, a.body_inv_mass, a.body_inv_inertia, a.points, dofs,
-                            a.dt, true, a.error, prepared, 0.0f, pending(prepared[0], slot));
+                            a.lambda, a.row_meff, a.row_damping, staged_j,
+                            sequential ? staged_w : nullptr, staged_j + staged_size,
+                            sequential ? staged_w + staged_size : nullptr, qdot, a.urows,
+                            a.body_linear, a.body_angular, a.body_inv_mass, a.body_inv_inertia,
+                            a.points, dofs, a.dt, true, chain_error, prepared, 0.0f,
+                            pending(prepared[0], slot));
                         __syncwarp();
                     }
                     __syncthreads();
@@ -4921,7 +4982,9 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         schur_step(false, false);
         hub_step(false, false);
     }
+    uint32_t completed_sweeps = 0u;
     for (uint32_t it = 0u; it < a.vel_iters; ++it) {
+        completed_sweeps = it + 1u;
         if (blockIdx.x == 0u && threadIdx.x == 0u)
             s.control[kControlChanged + (it + 1u) % 3u] = 0u;
         changed = false;
@@ -4957,10 +5020,28 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         uint32_t* const flag = s.control + kControlChanged + it % 3u;
         if (__syncthreads_or(changed) && threadIdx.x == 0u) atomicOr(flag, 1u);
         grid.sync();
-        const bool more = LoadControl(flag) != 0u;
+        bool more = LoadControl(flag) != 0u;
         schur_step(false, more && it + 1u < a.vel_iters);
         hub_step(false, more && it + 1u < a.vel_iters);
+        if (!more && blocks.layout.vertices != 0u) {
+            bool nonstationary = false;
+            for (uint32_t item = color_warp;
+                 item < blocks.layout.vertices * blocks.layout.env_count; item += color_warps) {
+                const uint32_t env = item / blocks.layout.vertices;
+                const uint32_t vertex = item - env * blocks.layout.vertices;
+                nonstationary |= !nkops::VertexBlockStationaryWarp(
+                    blocks, a.points, a.error.particle, env, vertex, wlane, a.vel_tolerance);
+            }
+            if (__syncthreads_or(nonstationary) && threadIdx.x == 0u) atomicOr(flag, 1u);
+            grid.sync();
+            more = LoadControl(flag) != 0u;
+        }
         if (!more) break;
+    }
+    if (a.vbd_velocity_sweep_count != nullptr) {
+        for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
+             env < a.vertex_blocks.layout.env_count; env += gridDim.x * blockDim.x)
+            a.vbd_velocity_sweep_count[env] = completed_sweeps;
     }
 
     // Penetration drives a fresh pseudo-velocity field over the same colors and chains.
@@ -5051,9 +5132,10 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
     const uint32_t grid_bound = static_cast<uint32_t>(std::min<uint64_t>(
         kColorGridLimit, uint64_t{static_cast<uint32_t>(sm_count)} * kColorBlocksPerSm));
     constexpr uint32_t warps = kColorBlockSize / 32u;
-    // Chain J staging, a Schur gather batch, or one articulation's matrix, factor and right side.
+    // Chain J and M^-1 J^T staging, a Schur gather batch, or one articulation's matrix, factor
+    // and right side.
     const size_t staged = 3u * size_t{warps} * p.max_dof;
-    const size_t solve_shared = sizeof(float) * std::max({2u * staged, staged + 6u * warps,
+    const size_t solve_shared = sizeof(float) * std::max({4u * staged, staged + 6u * warps,
         2u * size_t{p.max_dof} * p.max_dof + size_t{p.max_dof}});
     uint32_t solve_blocks = 0u;
     if (ResidentGridSize(SolveColoredRowsKernel, kColorBlockSize, solve_shared, grid_bound,
@@ -5101,9 +5183,13 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
         args.grid_pseudo = data.grid_pseudo_vel;
     }
     args.error = error;
+    args.vbd_velocity_sweep_count = data.vbd_velocity_sweep_count;
+    args.solver_color_counts = data.solver_color_counts;
     if (p.vertex_blocks.colors != 0u) {
-        if (data.particle_response == nullptr || model.vbd_color_segments == nullptr ||
-            data.vbd_target == nullptr)
+        if (data.particle_response == nullptr || data.particle_row_impulse == nullptr ||
+            model.vbd_color_segments == nullptr ||
+            data.vbd_target == nullptr || data.vbd_inertia == nullptr || data.vbd_step == nullptr ||
+            (p.rows_per_env != 0u && data.cc_particle_first == nullptr))
             return Status::InvalidArgument;
         nkops::VertexBlockView& blocks = args.vertex_blocks;
         blocks.elements = model.vbd_elements;
@@ -5114,8 +5200,9 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
         blocks.start = data.particle_prev_pos;
         blocks.target = data.vbd_target;
         blocks.inertia = data.vbd_inertia;
-        blocks.row_impulse = data.vbd_row_impulse;
-        blocks.written = data.vbd_written;
+        blocks.effective_step = data.vbd_step;
+        blocks.row_first = p.rows_per_env != 0u ? data.cc_particle_first : nullptr;
+        blocks.env_status = data.env_status;
         blocks.layout = p.vertex_blocks;
         blocks.dt = p.dt;
     }
@@ -5194,6 +5281,58 @@ __global__ void WriteJointLimitImpulseKernel(
 
 // --- op entry point ---------------------------------------------------------
 
+// Vertex stationarity is measured after all row and vertex updates, without advancing state.
+__global__ void MeasureVertexResidualKernel(ModelView model, DataView data,
+                                            SolveRowsBlockIslandParams p,
+                                            const math::Vec3* particle_error) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    const uint32_t stride = gridDim.x * (blockDim.x / warpSize);
+    nkops::VertexBlockView b;
+    b.elements = model.vbd_elements;
+    b.offsets = model.vbd_incidence_offsets;
+    b.incidence = model.vbd_incidence;
+    b.start = data.particle_prev_pos;
+    b.target = data.vbd_target;
+    b.inertia = data.vbd_inertia;
+    b.layout = p.vertex_blocks;
+    b.dt = p.dt;
+    for (uint32_t item = warp; item < b.layout.dynamic_vertices * b.layout.env_count; item += stride) {
+        const uint32_t env = item / b.layout.dynamic_vertices;
+        const uint32_t vertex = model.vbd_color_vertices[item % b.layout.dynamic_vertices];
+        const uint32_t particle = b.Particle(env, vertex);
+        if (!(data.particle_inv_mass[particle] > 0.0f)) continue;
+        const uint32_t slot = b.Slot(env, vertex);
+        math::Vec3 gradient;
+        math::SymmetricMat3 hessian;
+        nkops::GatherVertexBlock(b, data.particle_vel, env, vertex, lane, warpSize, gradient, hessian);
+        gradient = {WarpSum(gradient.x), WarpSum(gradient.y), WarpSum(gradient.z)};
+        hessian = {WarpSum(hessian.xx), WarpSum(hessian.yy), WarpSum(hessian.zz),
+                   WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
+        if (lane != 0u) continue;
+        const math::Vec3 u = data.particle_vel[particle] -
+            (particle_error != nullptr ? particle_error[particle] : math::Vec3{});
+        const float inertia = b.inertia[slot];
+        const math::Vec3 force = (u * b.dt - b.target[slot]) * -inertia - gradient +
+                                data.particle_row_impulse[particle] / b.dt;
+        nk::vbd::AddIdentity(hessian, inertia);
+        math::SymmetricMat3 inverse;
+        const bool invertible = nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse);
+        const math::Vec3 correction = invertible ? inverse.Multiply(force) / b.dt : math::Vec3{};
+        const auto magnitude = [](math::Vec3 v) {
+            if (!(fabsf(v.x) <= FLT_MAX && fabsf(v.y) <= FLT_MAX && fabsf(v.z) <= FLT_MAX))
+                return FLT_MAX;
+            return fmaxf(fabsf(v.x), fmaxf(fabsf(v.y), fabsf(v.z)));
+        };
+        const float metrics[2] = {invertible ? magnitude(correction) : FLT_MAX, magnitude(force)};
+        for (uint32_t metric = 0u; metric < 2u; ++metric) {
+            const unsigned long long packed =
+                (static_cast<unsigned long long>(__float_as_uint(metrics[metric])) << 32u) | (~particle);
+            atomicMax(reinterpret_cast<unsigned long long*>(data.vbd_solve_metrics + env * 2u + metric), packed);
+        }
+    }
+}
+
 // Diagnostic reads occur after every island has committed its physical velocity and impulse.
 __global__ void MeasureContactResidualKernel(DataView data, SolveRowsBlockIslandParams p) {
     const uint32_t lane = threadIdx.x % warpSize;
@@ -5257,6 +5396,14 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
     if (row_capacity > uint64_t{kOwnerEmpty} -
             uint64_t{kColorGridLimit} * kColorBlockSize)
         return Status::InvalidArgument;
+    if (data.vbd_velocity_sweep_count == nullptr ||
+        cudaMemsetAsync(data.vbd_velocity_sweep_count, 0,
+                        size_t{p->env_count} * sizeof(uint32_t), stream) != cudaSuccess)
+        return Status::Failed;
+    if (data.solver_color_counts == nullptr ||
+        cudaMemsetAsync(data.solver_color_counts, 0,
+                        size_t{p->env_count} * 2u * sizeof(uint32_t), stream) != cudaSuccess)
+        return Status::Failed;
     if (p->measure_contact_residual != 0u) {
         if (data.contact_solve_metrics == nullptr || data.contact_solve_counts == nullptr)
             return Status::InvalidArgument;
@@ -5264,6 +5411,10 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 size_t{p->env_count} * constraint::kContactSolveMetricCount * sizeof(uint64_t), stream) != cudaSuccess ||
             cudaMemsetAsync(data.contact_solve_counts, 0,
                 size_t{p->env_count} * constraint::kContactSolveCountSize * sizeof(uint32_t), stream) != cudaSuccess)
+            return Status::Failed;
+        if (p->vertex_blocks.dynamic_vertices > 0u &&
+            (data.vbd_solve_metrics == nullptr || cudaMemsetAsync(data.vbd_solve_metrics, 0,
+                size_t{p->env_count} * 2u * sizeof(uint64_t), stream) != cudaSuccess))
             return Status::Failed;
     }
 
@@ -5546,6 +5697,16 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                        data.lambda, total_links, p->env_count,
                        p->base_link_count, p->rows_per_env,
                        p->contact_rows_per_env, data.joint_limit_impulse);
+        }
+        if (p->measure_contact_residual != 0u && p->vertex_blocks.dynamic_vertices > 0u) {
+            constexpr uint32_t block_size = 128u;
+            const uint32_t bound =
+                (p->vertex_blocks.dynamic_vertices * p->env_count - 1u) / (block_size / 32u) + 1u;
+            uint32_t blocks = 0u;
+            if (ResidentGridSize(MeasureVertexResidualKernel, block_size, 0u, bound, &blocks) != cudaSuccess)
+                return Status::Failed;
+            LaunchCuda(MeasureVertexResidualKernel, dim3(blocks), dim3(block_size), 0u, stream,
+                       model, data, *p, error.particle);
         }
         if (p->measure_contact_residual != 0u && p->rows_per_env > 0u) {
             constexpr uint32_t block_size = 128u;

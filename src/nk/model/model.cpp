@@ -24,6 +24,20 @@
 
 namespace nuka::nk {
 
+phi::Status Model::DownloadFieldStatus(FieldId id, void* destination, uint64_t bytes,
+                                      uint64_t byte_offset) const {
+    if (device_buffer_ == nullptr || LayoutOf(id).owner != FieldOwner::Model ||
+        (destination == nullptr && bytes != 0u)) return phi::Status::InvalidArgument;
+    uint64_t total = 0u;
+    for (const Segment& segment : ComputeModelSegments(&total)) {
+        if (segment.field != id) continue;
+        if (byte_offset > segment.bytes || bytes > segment.bytes - byte_offset)
+            return phi::Status::InvalidArgument;
+        return phi::BufferDownload(device_buffer_, destination, segment.offset + byte_offset, bytes);
+    }
+    return phi::Status::InvalidArgument;
+}
+
 namespace {
 
 constexpr uint64_t kAlign = 256;  // CUDA buffer-type alignment (BufferTypeAlignment).
@@ -98,9 +112,12 @@ uint64_t ModelCapacities::NeighborPoolCapacity() const {
 }
 
 uint64_t ModelCapacities::ParticleContactReserve(uint32_t grid_particles) const {
-    if ((bodies_per_env == 0u && vbd_vertices_per_env == 0u) || grid_particles >= particles_per_env)
-        return 0u;
-    return uint64_t{particles_per_env - grid_particles} *
+    if (bodies_per_env == 0u || grid_particles >= particles_per_env) return 0u;
+    const uint64_t vbd_end = uint64_t{vbd_particle_begin} + vbd_vertices_per_env;
+    const uint64_t overlap_begin = std::max<uint64_t>(grid_particles, vbd_particle_begin);
+    const uint64_t overlap_end = std::min<uint64_t>(particles_per_env, vbd_end);
+    const uint64_t excluded = overlap_end > overlap_begin ? overlap_end - overlap_begin : 0u;
+    return (uint64_t{particles_per_env - grid_particles} - excluded) *
            collision::kBodyParticleContactSlotsPerParticle;
 }
 
@@ -150,8 +167,19 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         return 0u;
     }
     if (vbd_vertices_per_env == 0u &&
-        (id == FieldId::ParticleResponse || id == FieldId::VbdHistoryReady)) return 0u;
+        (id == FieldId::ParticleResponse || id == FieldId::ParticleRowImpulse ||
+         id == FieldId::VbdHistoryReady)) return 0u;
     if (lay.per == FieldPer::Scalar) {
+        if (id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerStatus ||
+            id == FieldId::VbdForceResidualWork || id == FieldId::PhysicsStageMetrics ||
+            id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
+            return CheckedProduct({integration_substeps, env_count});
+        if (id == FieldId::OgcSourceOffsets)
+            return ogc_contacts_per_env > 0u
+                ? CheckedProduct({uint64_t{particles_per_env} + particle_surface_edges_per_env +
+                    ((mesh_vertex_source_count > 0u || mesh_edge_source_count > 0u)
+                        ? uint64_t{particles_per_env} + particle_surface_edges_per_env +
+                          mesh_vertex_source_count + mesh_edge_source_count : 0u), env_count}) : 0u;
         if (id == FieldId::VbdElements) return vbd_elements_per_env;
         if (id == FieldId::VbdIncidenceOffsets)
             return vbd_vertices_per_env > 0u ? uint64_t{vbd_vertices_per_env} + 1u : 0u;
@@ -159,16 +187,27 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::VbdColorVertices) return vbd_dynamic_vertices_per_env;
         if (id == FieldId::VbdColorSegments) return uint64_t{vbd_colors} * 2u;
         if (id == FieldId::VbdTarget || id == FieldId::VbdOffset || id == FieldId::VbdInertia ||
-            id == FieldId::VbdRowImpulse || id == FieldId::VbdWritten || id == FieldId::VbdHistoryVel)
+            id == FieldId::VbdHistoryVel ||
+            id == FieldId::VbdStep || id == FieldId::VbdRestart)
             return CheckedProduct({vbd_vertices_per_env, env_count});
-        if (id == FieldId::ParticleSurfaceInfo || id == FieldId::ParticleSurfaceThickness ||
+        if (id == FieldId::ParticleSurfaceInfo || id == FieldId::ParticleSurfaceEdgeInfo ||
+            id == FieldId::ParticleSurfaceThickness ||
             id == FieldId::ParticleSurfaceFriction) return particle_surfaces_per_env;
-        if (id == FieldId::ParticleSurfaceTriangles) return uint64_t{particle_surface_triangles} * 3u;
+        if (id == FieldId::ParticleSurfaceTriangles ||
+            id == FieldId::ParticleSurfaceTriangleEdges ||
+            id == FieldId::ParticleSurfaceTriangleVertexOwner)
+            return uint64_t{particle_surface_triangles} * 3u;
         if (id == FieldId::ParticleSurfaceTree) return particle_surface_nodes_per_env;
+        if (id == FieldId::ParticleSurfaceEdges) return particle_surface_edges_per_env;
+        if (id == FieldId::ParticleSurfaceEdgeTree) return particle_surface_edge_nodes_per_env;
         if (id == FieldId::ParticleSurfaceNodes)
-            return point_endpoints_per_env > 0u ? CheckedProduct({particle_surface_nodes_per_env, env_count}) : 0u;
-        if (id == FieldId::ParticleSurfaceMaxSpeed)
-            return point_endpoints_per_env > 0u ? CheckedProduct({particle_surfaces_per_env, env_count}) : 0u;
+            return point_endpoints_per_env > 0u || vbd_vertices_per_env > 0u
+                ? CheckedProduct({particle_surface_nodes_per_env, env_count}) : 0u;
+        if (id == FieldId::ParticleSurfaceEdgeNodes)
+            return CheckedProduct({particle_surface_edge_nodes_per_env, env_count});
+        if (id == FieldId::ParticleSurfaceMaxSpeed || id == FieldId::DatSurfaceMotion)
+            return point_endpoints_per_env > 0u || vbd_vertices_per_env > 0u
+                ? CheckedProduct({particle_surfaces_per_env, env_count}) : 0u;
         if (id == FieldId::PointEndpointRanges) return CheckedProduct({point_endpoints_per_env, env_count});
         if (id == FieldId::PointEndpointTerms) return CheckedProduct({point_endpoint_terms_per_env, env_count});
         if (id == FieldId::GridNeighborIdx)
@@ -189,11 +228,17 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             // GLOBAL convex-hull vertex pool, xyz packed.
             return static_cast<uint64_t>(max_hull_verts) * 3ull;
         }
-        if (id == FieldId::MeshSurfaceInfo)
+        if (id == FieldId::MeshSurfaceInfo || id == FieldId::MeshEdgeInfo)
             return max_mesh_triangles > 0u ? max_bodies_total : 0u;
-        if (id == FieldId::MeshTriangles)
+        if (id == FieldId::MeshTriangles || id == FieldId::MeshTriangleEdges ||
+            id == FieldId::MeshTriangleVertexOwner)
             return static_cast<uint64_t>(max_mesh_triangles) * 3u;
         if (id == FieldId::MeshBvhNodes) return max_mesh_bvh_nodes;
+        if (id == FieldId::MeshEdges) return max_mesh_edges;
+        if (id == FieldId::MeshEdgeNodes) return max_mesh_edge_nodes;
+        if (id == FieldId::MeshVertexSources) return mesh_vertex_source_count;
+        if (id == FieldId::MeshEdgeSources) return mesh_edge_source_count;
+        if (id == FieldId::MeshContactMode) return max_bodies_total;
         // M5 pair-driven / SDF GLOBAL tables (per-env template, base-relative).
         // R1: the shape_table record GREW 8 -> 10 f32/row (appended body_id +
         // group). L-RECON-D: it GREW 10 -> 12 f32/row (appended the per-shape
@@ -455,6 +500,23 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::JointLimitFlags:
             StampPerLink(dst, a.joint_limit_flags, L, E, sizeof(uint8_t));
             break;
+        case FieldId::MimicSourceLink: {
+            auto* p = reinterpret_cast<uint32_t*>(dst);
+            for (uint32_t e = 0u; e < E; ++e) {
+                for (uint32_t l = 0u; l < L; ++l) {
+                    const uint32_t source = l < a.mimic_source_link.size()
+                        ? a.mimic_source_link[l] : ~0u;
+                    p[static_cast<size_t>(e) * L + l] = source < L ? e * L + source : ~0u;
+                }
+            }
+            break;
+        }
+        case FieldId::MimicMultiplier:
+            StampPerLink(dst, a.mimic_multiplier, L, E, sizeof(float));
+            break;
+        case FieldId::MimicOffset:
+            StampPerLink(dst, a.mimic_offset, L, E, sizeof(float));
+            break;
         case FieldId::ArticulationLinkCount: {
             // K entries per replica (one per co-resident articulation). The per-dog
             // link counts come from a.articulation_link_count; the per-replica term
@@ -528,6 +590,27 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             if (!particles.surface_tree.empty()) std::memcpy(dst, particles.surface_tree.data(),
                 particles.surface_tree.size() * sizeof(collision::MeshBvhNode));
             break;
+        case FieldId::ParticleSurfaceEdgeInfo:
+            if (!particles.surface_edge_info.empty()) std::memcpy(dst, particles.surface_edge_info.data(),
+                particles.surface_edge_info.size() * sizeof(collision::MeshEdgeInfo));
+            break;
+        case FieldId::ParticleSurfaceEdges:
+            if (!particles.surface_edges.empty()) std::memcpy(dst, particles.surface_edges.data(),
+                particles.surface_edges.size() * sizeof(collision::MeshEdge));
+            break;
+        case FieldId::ParticleSurfaceEdgeTree:
+            if (!particles.surface_edge_tree.empty()) std::memcpy(dst, particles.surface_edge_tree.data(),
+                particles.surface_edge_tree.size() * sizeof(collision::MeshBvhNode));
+            break;
+        case FieldId::ParticleSurfaceTriangleEdges:
+            if (!particles.surface_triangle_edges.empty()) std::memcpy(dst, particles.surface_triangle_edges.data(),
+                particles.surface_triangle_edges.size() * sizeof(uint32_t));
+            break;
+        case FieldId::ParticleSurfaceTriangleVertexOwner:
+            if (!particles.surface_triangle_vertex_owner.empty()) std::memcpy(dst,
+                particles.surface_triangle_vertex_owner.data(),
+                particles.surface_triangle_vertex_owner.size() * sizeof(uint32_t));
+            break;
         case FieldId::ParticleSurfaceThickness:
             if (!particles.surface_thickness.empty()) std::memcpy(dst, particles.surface_thickness.data(),
                 particles.surface_thickness.size() * sizeof(float));
@@ -548,6 +631,41 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             if (!mesh_bvh_nodes.empty()) std::memcpy(dst, mesh_bvh_nodes.data(),
                 mesh_bvh_nodes.size() * sizeof(collision::MeshBvhNode));
             break;
+        case FieldId::MeshEdgeInfo:
+            if (!mesh_edge_info.empty()) std::memcpy(dst, mesh_edge_info.data(),
+                mesh_edge_info.size() * sizeof(collision::MeshEdgeInfo));
+            break;
+        case FieldId::MeshEdges:
+            if (!mesh_edges.empty()) std::memcpy(dst, mesh_edges.data(),
+                mesh_edges.size() * sizeof(collision::MeshEdge));
+            break;
+        case FieldId::MeshEdgeNodes:
+            if (!mesh_edge_nodes.empty()) std::memcpy(dst, mesh_edge_nodes.data(),
+                mesh_edge_nodes.size() * sizeof(collision::MeshBvhNode));
+            break;
+        case FieldId::MeshVertexSources:
+            if (!mesh_vertex_sources.empty()) std::memcpy(dst, mesh_vertex_sources.data(),
+                mesh_vertex_sources.size() * sizeof(uint64_t));
+            break;
+        case FieldId::MeshEdgeSources:
+            if (!mesh_edge_sources.empty()) std::memcpy(dst, mesh_edge_sources.data(),
+                mesh_edge_sources.size() * sizeof(uint64_t));
+            break;
+        case FieldId::MeshTriangleEdges:
+            if (!mesh_triangle_edges.empty()) std::memcpy(dst, mesh_triangle_edges.data(),
+                mesh_triangle_edges.size() * sizeof(uint32_t));
+            break;
+        case FieldId::MeshTriangleVertexOwner:
+            if (!mesh_triangle_vertex_owner.empty()) std::memcpy(dst,
+                mesh_triangle_vertex_owner.data(),
+                mesh_triangle_vertex_owner.size() * sizeof(uint32_t));
+            break;
+        case FieldId::MeshContactMode: {
+            auto* modes = static_cast<uint8_t*>(dst);
+            for (size_t body = 0u; body < shape_table_rows.size(); ++body)
+                modes[body] = shape_table_rows[body].mesh_contact_mode;
+            break;
+        }
         case FieldId::ShapeTable: {
             // GLOBAL pair-driven shape table: R1 GREW it 8 -> 10 packed f32 per
             // body row {kind(u32 bits), p0..p3, contype(u32), conaffinity(u32),
@@ -1016,6 +1134,9 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::JointLimitLower:       v.joint_limit_lower = static_cast<float*>(p); break;
         case FieldId::JointLimitUpper:       v.joint_limit_upper = static_cast<float*>(p); break;
         case FieldId::JointLimitFlags:       v.joint_limit_flags = static_cast<uint8_t*>(p); break;
+        case FieldId::MimicSourceLink:        v.mimic_source_link = static_cast<uint32_t*>(p); break;
+        case FieldId::MimicMultiplier:        v.mimic_multiplier = static_cast<float*>(p); break;
+        case FieldId::MimicOffset:            v.mimic_offset = static_cast<float*>(p); break;
         case FieldId::ArticulationLinkCount: v.articulation_link_count = static_cast<uint32_t*>(p); break;
         case FieldId::ArticulationLinkOffset:v.articulation_link_offset = static_cast<uint32_t*>(p); break;
         case FieldId::FootShape:             v.foot_shape = static_cast<float*>(p); break;
@@ -1025,10 +1146,23 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ParticleSurfaceInfo: v.particle_surface_info = static_cast<collision::MeshSurfaceInfo*>(p); break;
         case FieldId::ParticleSurfaceTriangles: v.particle_surface_triangles = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceTree: v.particle_surface_tree = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::ParticleSurfaceEdgeInfo: v.particle_surface_edge_info = static_cast<collision::MeshEdgeInfo*>(p); break;
+        case FieldId::ParticleSurfaceEdges: v.particle_surface_edges = static_cast<collision::MeshEdge*>(p); break;
+        case FieldId::ParticleSurfaceEdgeTree: v.particle_surface_edge_tree = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::ParticleSurfaceTriangleEdges: v.particle_surface_triangle_edges = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceTriangleVertexOwner: v.particle_surface_triangle_vertex_owner = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceThickness: v.particle_surface_thickness = static_cast<float*>(p); break;
         case FieldId::ParticleSurfaceFriction: v.particle_surface_friction = static_cast<float*>(p); break;
         case FieldId::MeshTriangles: v.mesh_triangles = static_cast<uint32_t*>(p); break;
         case FieldId::MeshBvhNodes: v.mesh_bvh_nodes = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::MeshEdgeInfo: v.mesh_edge_info = static_cast<collision::MeshEdgeInfo*>(p); break;
+        case FieldId::MeshEdges: v.mesh_edges = static_cast<collision::MeshEdge*>(p); break;
+        case FieldId::MeshEdgeNodes: v.mesh_edge_nodes = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::MeshVertexSources: v.mesh_vertex_sources = static_cast<uint64_t*>(p); break;
+        case FieldId::MeshEdgeSources: v.mesh_edge_sources = static_cast<uint64_t*>(p); break;
+        case FieldId::MeshTriangleEdges: v.mesh_triangle_edges = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshTriangleVertexOwner: v.mesh_triangle_vertex_owner = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshContactMode: v.mesh_contact_mode = static_cast<uint8_t*>(p); break;
         case FieldId::ShapeTable:            v.shape_table = static_cast<float*>(p); break;
         case FieldId::ExcludedPairs:         v.excluded_pairs = static_cast<uint64_t*>(p); break;
         case FieldId::SampPoints:            v.samp_points = static_cast<float*>(p); break;
@@ -1086,18 +1220,25 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
             throw std::invalid_argument("MPM grid requires a nonempty contact pool");
         if (mpm_contact_capacity_per_env > max_contacts_per_env)
             throw std::invalid_argument("grid contact pool exceeds contact capacity");
+        if (ogc_contacts_per_env > max_contacts_per_env - mpm_contact_capacity_per_env)
+            throw std::invalid_argument("mesh contact pool exceeds contact capacity");
         if (mpm_grid_nodes_per_env > 0u &&
             (CheckedProduct({particles_per_env, env_count}) > nk::kContactHandleMask ||
              CheckedProduct({env_count, kMpmBoundaryCount}) > nk::kContactHandleMask ||
              CheckedProduct({particle_surfaces_per_env, env_count}) > nk::kContactHandleMask))
             throw std::invalid_argument("grid contact identity exceeds handle range");
         const uint32_t surface_contacts = particle_surfaces_per_env > 0u ? mpm_contact_capacity_per_env : 0u;
-        if (mpm_grid_nodes_per_env > 0u &&
-            (point_endpoints_per_env <
-                 MpmPointEndpointCount(particles_per_env, surface_contacts, mpm_stress_cells_per_env) ||
-             point_endpoint_terms_per_env <
-                 MpmPointEndpointTermCount(particles_per_env, surface_contacts, mpm_stress_cells_per_env)))
-            throw std::invalid_argument("material contacts exceed point endpoint capacity");
+        const bool grid_endpoints = mpm_grid_nodes_per_env > 0u;
+        const uint64_t required_endpoints = uint64_t{ogc_contacts_per_env} * 2u +
+            vol_cons_per_env + (grid_endpoints ? MpmPointEndpointCount(
+                particles_per_env, surface_contacts, mpm_stress_cells_per_env) : 0u);
+        const uint64_t required_terms = uint64_t{ogc_contacts_per_env} * 6u +
+            uint64_t{vol_cons_per_env} * 4u +
+            (grid_endpoints ? MpmPointEndpointTermCount(
+                particles_per_env, surface_contacts, mpm_stress_cells_per_env) : 0u);
+        if (point_endpoints_per_env < required_endpoints ||
+            point_endpoint_terms_per_env < required_terms)
+            throw std::invalid_argument("contact endpoints exceed point endpoint capacity");
         const auto int_limit = static_cast<uint64_t>(std::numeric_limits<int>::max());
         if (links_per_env != 0u && CheckedProduct({max_rows_per_env, env_count, 2u}) > int_limit)
             throw std::invalid_argument("contact endpoints exceed device sort index range");
@@ -1151,6 +1292,11 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     if (MpmParticlesPerEnv() > cap.particles_per_env)
         return reject(Status::InvalidArgument, "MPM particle slice exceeds its environment");
     if (particles.surface_info.size() != cap.particle_surfaces_per_env ||
+        particles.surface_edge_info.size() != particles.surface_info.size() ||
+        particles.surface_edges.size() != cap.particle_surface_edges_per_env ||
+        particles.surface_edge_tree.size() != cap.particle_surface_edge_nodes_per_env ||
+        particles.surface_triangle_edges.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
+        particles.surface_triangle_vertex_owner.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
         particles.surface_thickness.size() != particles.surface_info.size() ||
         particles.surface_friction.size() != particles.surface_info.size() ||
         particles.surface_triangles.size() != uint64_t{cap.particle_surface_triangles} * 3u ||
@@ -1162,12 +1308,47 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
                                        cap.particle_surface_nodes_per_env}};
     for (uint32_t surface = 0u; surface < cap.particle_surfaces_per_env; ++surface) {
         const auto& info = particles.surface_info[surface];
-        if (!collision::MeshSurfaceRangeValid(particle_mesh, info) ||
+        const auto& edge_info = particles.surface_edge_info[surface];
+        const bool triangle_surface = info.triangle_count > 0u;
+        const bool geometry_valid = triangle_surface
+            ? collision::MeshSurfaceRangeValid(particle_mesh, info)
+            : info.node_count == 0u && info.vertex_count > 0u &&
+              info.vertex_offset <= cap.particles_per_env &&
+              info.vertex_count <= cap.particles_per_env - info.vertex_offset;
+        if (!geometry_valid ||
+            edge_info.vertex_offset != info.vertex_offset ||
+            edge_info.edge_offset > particles.surface_edges.size() ||
+            edge_info.edge_count > particles.surface_edges.size() - edge_info.edge_offset ||
+            edge_info.node_offset > particles.surface_edge_tree.size() ||
+            edge_info.node_count > particles.surface_edge_tree.size() - edge_info.node_offset ||
+            edge_info.edge_count == 0u ||
+            edge_info.node_count != 2u * edge_info.edge_count - 1u ||
             particles.initial_pos.size() != cap.particles_per_env ||
             !std::isfinite(particles.surface_thickness[surface]) || particles.surface_thickness[surface] < 0.0f ||
             !std::isfinite(particles.surface_friction[surface]) || particles.surface_friction[surface] < 0.0f ||
-            info.node_count != uint64_t{info.triangle_count} * 2u - 1u)
+            (triangle_surface && info.node_count != uint64_t{info.triangle_count} * 2u - 1u))
             return reject(Status::InvalidArgument, "invalid particle surface");
+        for (uint32_t triangle = 0u; triangle < info.triangle_count; ++triangle)
+            for (uint32_t side = 0u; side < 3u; ++side) {
+                const uint32_t owner = particles.surface_triangle_vertex_owner[
+                    static_cast<size_t>(info.triangle_offset + triangle) * 3u + side];
+                if (owner > triangle) return reject(Status::InvalidArgument,
+                    "particle surface vertex owner is invalid");
+                const uint32_t edge_id = particles.surface_triangle_edges[
+                    static_cast<size_t>(info.triangle_offset + triangle) * 3u + side];
+                if (edge_id == ~0u) {
+                    math::Vec3 v0, v1, v2;
+                    if (!collision::MeshSurfaceTriangle(particle_mesh, info, triangle, v0, v1, v2) ||
+                        (v1 - v0).Cross(v2 - v0).LengthSq() > 0.0f)
+                        return reject(Status::InvalidArgument, "particle surface has a missing edge");
+                    continue;
+                }
+                if (edge_id >= edge_info.edge_count) return reject(Status::InvalidArgument,
+                    "particle triangle has an invalid edge");
+                const auto& edge = particles.surface_edges[edge_info.edge_offset + edge_id];
+                if (edge.triangle0 != triangle && edge.triangle1 != triangle)
+                    return reject(Status::InvalidArgument, "particle triangle edge is not incident");
+            }
         std::vector<uint8_t> seen(info.triangle_count, 0u);
         for (uint32_t node = 0u; node < info.node_count; ++node) {
             const auto& entry = particles.surface_tree[info.node_offset + node];
@@ -1191,9 +1372,16 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
                 }
             }
         }
-        if (particles.surface_tree[info.node_offset].escape != info.node_count ||
+        if ((triangle_surface && particles.surface_tree[info.node_offset].escape != info.node_count) ||
             std::find(seen.begin(), seen.end(), 0u) != seen.end())
             return reject(Status::InvalidArgument, "particle surface tree omits geometry");
+        for (uint32_t edge_id = 0u; edge_id < edge_info.edge_count; ++edge_id) {
+            const auto& edge = particles.surface_edges[edge_info.edge_offset + edge_id];
+            if (edge.vertex0 >= info.vertex_count || edge.vertex1 >= info.vertex_count ||
+                info.vertex_offset + edge.vertex0 < MpmParticlesPerEnv() ||
+                info.vertex_offset + edge.vertex1 < MpmParticlesPerEnv())
+                return reject(Status::InvalidArgument, "particle surface edge has an invalid vertex");
+        }
     }
     if (mpm_materials.size() != cap.mpm_material_count)
         return reject(Status::InvalidArgument, "MPM material table count disagrees with capacity");
@@ -1508,8 +1696,15 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
         shape_table_rows.size() <= capacities.max_bodies_total &&
         hull_verts.size() <= static_cast<size_t>(capacities.max_hull_verts) * 3u &&
         mesh_surface_info.size() <= capacities.ElementCount(FieldId::MeshSurfaceInfo) &&
+        mesh_edge_info.size() <= capacities.ElementCount(FieldId::MeshEdgeInfo) &&
         mesh_triangles.size() <= static_cast<size_t>(capacities.max_mesh_triangles) * 3u &&
-        mesh_bvh_nodes.size() <= capacities.max_mesh_bvh_nodes;
+        mesh_bvh_nodes.size() <= capacities.max_mesh_bvh_nodes &&
+        mesh_edges.size() <= capacities.max_mesh_edges &&
+        mesh_edge_nodes.size() <= capacities.max_mesh_edge_nodes &&
+        mesh_vertex_sources.size() == capacities.mesh_vertex_source_count &&
+        mesh_edge_sources.size() == capacities.mesh_edge_source_count &&
+        mesh_triangle_edges.size() <= static_cast<size_t>(capacities.max_mesh_triangles) * 3u &&
+        mesh_triangle_vertex_owner.size() <= static_cast<size_t>(capacities.max_mesh_triangles) * 3u;
     assert(capacities_ok && "cooked table exceeds its capacity -> would truncate");
     if (!capacities_ok) {
         return phi::Status::Failed;
@@ -1519,6 +1714,61 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
             static_cast<uint32_t>(mesh_triangles.size() / 3u),
             static_cast<uint32_t>(mesh_bvh_nodes.size())}};
     if (mesh_triangles.size() % 3u != 0u) return phi::Status::InvalidArgument;
+    if (mesh_triangle_edges.size() != mesh_triangles.size()) return phi::Status::InvalidArgument;
+    if (mesh_triangle_vertex_owner.size() != mesh_triangles.size()) return phi::Status::InvalidArgument;
+    if (mesh_edge_info.size() != mesh_surface_info.size()) return phi::Status::InvalidArgument;
+    for (const uint64_t source : mesh_vertex_sources) {
+        const uint32_t body = static_cast<uint32_t>(source >> 32u);
+        const uint32_t vertex = static_cast<uint32_t>(source);
+        if (body >= mesh_surface_info.size() ||
+            vertex >= mesh_surface_info[body].vertex_count)
+            return phi::Status::InvalidArgument;
+    }
+    for (const uint64_t source : mesh_edge_sources) {
+        const uint32_t body = static_cast<uint32_t>(source >> 32u);
+        const uint32_t edge = static_cast<uint32_t>(source);
+        if (body >= mesh_edge_info.size() || edge >= mesh_edge_info[body].edge_count)
+            return phi::Status::InvalidArgument;
+    }
+    for (size_t shape = 0u; shape < mesh_edge_info.size(); ++shape) {
+        const auto& edge_info = mesh_edge_info[shape];
+        const auto& surface = mesh_surface_info[shape];
+        if (surface.triangle_count == 0u && edge_info.edge_count == 0u) continue;
+        if (edge_info.edge_count == 0u || edge_info.vertex_offset != surface.vertex_offset ||
+            edge_info.edge_offset > mesh_edges.size() ||
+            edge_info.edge_count > mesh_edges.size() - edge_info.edge_offset ||
+            edge_info.node_offset > mesh_edge_nodes.size() ||
+            edge_info.node_count > mesh_edge_nodes.size() - edge_info.node_offset ||
+            edge_info.node_count != 2u * edge_info.edge_count - 1u)
+            return phi::Status::InvalidArgument;
+        for (uint32_t i = 0u; i < edge_info.edge_count; ++i) {
+            const auto& edge = mesh_edges[edge_info.edge_offset + i];
+            if (edge.vertex0 >= surface.vertex_count || edge.vertex1 >= surface.vertex_count ||
+                edge.opposite0 >= surface.vertex_count || edge.triangle0 >= surface.triangle_count ||
+                (edge.triangle1 != ~0u &&
+                 (edge.opposite1 >= surface.vertex_count || edge.triangle1 >= surface.triangle_count)))
+                return phi::Status::InvalidArgument;
+        }
+        for (uint32_t triangle = 0u; triangle < surface.triangle_count; ++triangle)
+            for (uint32_t side = 0u; side < 3u; ++side) {
+                const uint32_t owner = mesh_triangle_vertex_owner[
+                    static_cast<size_t>(surface.triangle_offset + triangle) * 3u + side];
+                if (owner > triangle) return phi::Status::InvalidArgument;
+                const uint32_t edge_id = mesh_triangle_edges[
+                    static_cast<size_t>(surface.triangle_offset + triangle) * 3u + side];
+                if (edge_id == ~0u) {
+                    math::Vec3 v0, v1, v2;
+                    if (!collision::MeshSurfaceTriangle(mesh_view, surface, triangle, v0, v1, v2) ||
+                        (v1 - v0).Cross(v2 - v0).LengthSq() > 0.0f)
+                        return phi::Status::InvalidArgument;
+                    continue;
+                }
+                if (edge_id >= edge_info.edge_count) return phi::Status::InvalidArgument;
+                const auto& edge = mesh_edges[edge_info.edge_offset + edge_id];
+                if (edge.triangle0 != triangle && edge.triangle1 != triangle)
+                    return phi::Status::InvalidArgument;
+            }
+    }
     for (const auto& info : mesh_surface_info) {
         if (info.triangle_count == 0u && info.node_count == 0u) continue;
         if (!collision::MeshSurfaceRangeValid(mesh_view, info)) return phi::Status::InvalidArgument;
@@ -1624,6 +1874,13 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.mesh_surface_info = std::move(src.mesh_surface_info);
     dst.mesh_triangles = std::move(src.mesh_triangles);
     dst.mesh_bvh_nodes = std::move(src.mesh_bvh_nodes);
+    dst.mesh_edge_info = std::move(src.mesh_edge_info);
+    dst.mesh_edges = std::move(src.mesh_edges);
+    dst.mesh_edge_nodes = std::move(src.mesh_edge_nodes);
+    dst.mesh_vertex_sources = std::move(src.mesh_vertex_sources);
+    dst.mesh_edge_sources = std::move(src.mesh_edge_sources);
+    dst.mesh_triangle_edges = std::move(src.mesh_triangle_edges);
+    dst.mesh_triangle_vertex_owner = std::move(src.mesh_triangle_vertex_owner);
     // L1-c: union_slots / table_enabled_default copies were removed; union_solref/
     // union_solimp renamed to the general path's contact_solref/contact_solimp.
     for (int k = 0; k < 2; ++k) dst.contact_solref[k] = src.contact_solref[k];

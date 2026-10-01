@@ -40,6 +40,7 @@ struct PointMassView {
     const nk::PointEndpointRange* ranges = nullptr;
     const nk::PointEndpointTerm* terms = nullptr;
     const math::SymmetricMat3* particle_response = nullptr;
+    math::Vec3* particle_row_impulse = nullptr;
 
     struct Contribution {
         uint32_t kind;
@@ -77,6 +78,22 @@ struct PointMassView {
                                   float inverse_mass, float impulse) const {
         return Shaped(kind) ? particle_response[index].Multiply(jacobian) * impulse
                             : jacobian * (inverse_mass * impulse);
+    }
+    // Ordered velocity updates also retain their physical impulse for the vertex solve.
+    __device__ void RecordImpulse(uint32_t kind, uint32_t index, math::Vec3 impulse) const {
+        if (kind == kNkSideParticle && particle_row_impulse != nullptr)
+            particle_row_impulse[index] += impulse;
+    }
+    __device__ void RecordBlockImpulse(uint32_t kind, uint32_t index, math::Vec3 a,
+                                       math::Vec3 b, math::Vec3 c, math::Vec3 impulse) const {
+        RecordImpulse(kind, index, a * impulse.x + b * impulse.y + c * impulse.z);
+    }
+    // Shared scalar batches accumulate before their ordered velocity scatter.
+    __device__ void RecordSharedImpulse(uint32_t kind, uint32_t index, math::Vec3 impulse) const {
+        if (kind != kNkSideParticle || particle_row_impulse == nullptr) return;
+        atomicAdd(&particle_row_impulse[index].x, impulse.x);
+        atomicAdd(&particle_row_impulse[index].y, impulse.y);
+        atomicAdd(&particle_row_impulse[index].z, impulse.z);
     }
     // u^T W v of one mass term.
     __device__ float Quad(uint32_t kind, uint32_t index, math::Vec3 u, math::Vec3 v) const {
@@ -127,6 +144,7 @@ struct PointMassView {
         auto result = *this;
         result.particle_velocity = particle_pseudo;
         result.grid_velocity = grid_pseudo;
+        result.particle_row_impulse = nullptr;
         return result;
     }
 };
@@ -134,7 +152,8 @@ struct PointMassView {
 // Every solve stage sees particles through the response the vertex blocks froze for the step.
 __host__ __device__ inline PointMassView PointMasses(const DataView& data) {
     return {data.particle_inv_mass, data.particle_vel, data.grid_inv_mass, data.grid_velocity,
-            data.point_endpoint_ranges, data.point_endpoint_terms, data.particle_response};
+            data.point_endpoint_ranges, data.point_endpoint_terms, data.particle_response,
+            data.particle_row_impulse};
 }
 
 // Union slot classes / flags — MUST mirror nk::UnionSlot (model.hpp).

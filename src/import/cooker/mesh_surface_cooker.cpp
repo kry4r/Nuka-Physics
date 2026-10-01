@@ -119,6 +119,83 @@ void ValidateMeshSurfaceInput(const float* vertices, uint32_t vertex_count,
             throw std::invalid_argument("Collision mesh triangle has an invalid vertex index");
 }
 
+std::vector<uint32_t> OrientMeshWinding(const float* vertices, uint32_t vertex_count,
+                                        const uint32_t* indices, uint32_t triangle_count,
+                                        bool weld_vertices) {
+    ValidateMeshSurfaceInput(vertices, vertex_count, indices, triangle_count);
+    std::map<std::array<float, 3>, uint32_t> positions;
+    std::vector<uint32_t> welded(vertex_count);
+    for (uint32_t vertex = 0u; vertex < vertex_count; ++vertex) {
+        if (!weld_vertices) {
+            welded[vertex] = vertex;
+            continue;
+        }
+        const size_t at = static_cast<size_t>(vertex) * 3u;
+        const auto key = std::array<float, 3>{vertices[at], vertices[at + 1u], vertices[at + 2u]};
+        welded[vertex] = positions.emplace(key, static_cast<uint32_t>(positions.size())).first->second;
+    }
+    struct Incident { uint32_t triangle; bool forward; };
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<Incident>> edges;
+    for (uint32_t triangle = 0u; triangle < triangle_count; ++triangle) {
+        const uint32_t* tri = indices + static_cast<size_t>(triangle) * 3u;
+        for (uint32_t side = 0u; side < 3u; ++side) {
+            const uint32_t a = welded[tri[side]], b = welded[tri[(side + 1u) % 3u]];
+            if (a == b) continue;
+            edges[std::minmax(a, b)].push_back({triangle, a < b});
+        }
+    }
+    std::vector<std::vector<std::pair<uint32_t, bool>>> neighbors(triangle_count);
+    std::vector<uint8_t> boundary(triangle_count, 0u);
+    for (const auto& [edge, incident] : edges) {
+        if (incident.size() != 2u) {
+            for (const auto& side : incident) boundary[side.triangle] = 1u;
+            continue;
+        }
+        const bool flip = incident[0].forward == incident[1].forward;
+        neighbors[incident[0].triangle].push_back({incident[1].triangle, flip});
+        neighbors[incident[1].triangle].push_back({incident[0].triangle, flip});
+    }
+    std::vector<uint32_t> oriented(indices, indices + static_cast<size_t>(triangle_count) * 3u);
+    std::vector<int8_t> flip(triangle_count, -1);
+    const auto point = [&](uint32_t vertex) {
+        const size_t at = static_cast<size_t>(vertex) * 3u;
+        return Vec3{vertices[at], vertices[at + 1u], vertices[at + 2u]};
+    };
+    for (uint32_t seed = 0u; seed < triangle_count; ++seed) {
+        if (flip[seed] >= 0) continue;
+        flip[seed] = 0;
+        std::vector<uint32_t> component{seed};
+        bool closed = true;
+        for (size_t head = 0u; head < component.size(); ++head) {
+            const uint32_t triangle = component[head];
+            closed &= boundary[triangle] == 0u;
+            for (const auto& [other, parity] : neighbors[triangle]) {
+                const int8_t desired = flip[triangle] ^ static_cast<int8_t>(parity);
+                if (flip[other] < 0) {
+                    flip[other] = desired;
+                    component.push_back(other);
+                } else if (flip[other] != desired) {
+                    throw std::invalid_argument("Collision mesh has inconsistent nonorientable winding");
+                }
+            }
+        }
+        double volume6 = 0.0;
+        for (uint32_t triangle : component) {
+            uint32_t* tri = oriented.data() + static_cast<size_t>(triangle) * 3u;
+            if (flip[triangle] != 0) std::swap(tri[1], tri[2]);
+            if (closed) {
+                const Vec3 a = point(tri[0]), b = point(tri[1]), c = point(tri[2]);
+                volume6 += static_cast<double>(a.Dot(b.Cross(c)));
+            }
+        }
+        if (closed && volume6 < 0.0)
+            for (uint32_t triangle : component)
+                std::swap(oriented[static_cast<size_t>(triangle) * 3u + 1u],
+                          oriented[static_cast<size_t>(triangle) * 3u + 2u]);
+    }
+    return oriented;
+}
+
 CookedMeshSurface CookMeshSurface(const float* vertices, uint32_t vertex_count,
     const uint32_t* indices, uint32_t triangle_count, bool require_convex) {
     ValidateMeshSurfaceInput(vertices, vertex_count, indices, triangle_count);
@@ -177,6 +254,147 @@ CookedMeshSurface CookMeshSurface(const float* vertices, uint32_t vertex_count,
     std::vector<uint32_t> order(triangle_count);
     std::iota(order.begin(), order.end(), 0u);
     BuildNodes(result.nodes, order, leaves, 0u, triangle_count);
+    result.info.node_count = static_cast<uint32_t>(result.nodes.size());
+    return result;
+}
+
+CookedMeshEdges CookMeshEdges(const float* vertices, uint32_t vertex_count,
+                              const uint32_t* indices, uint32_t triangle_count,
+                              bool weld_vertices) {
+    ValidateMeshSurfaceInput(vertices, vertex_count, indices, triangle_count);
+    const auto vertex = [&](uint32_t i) -> Vec3 {
+        const size_t at = static_cast<size_t>(i) * 3u;
+        return {vertices[at], vertices[at + 1u], vertices[at + 2u]};
+    };
+    std::map<std::array<float, 3>, uint32_t> welded_ids;
+    std::vector<uint32_t> welded(vertex_count), representative;
+    for (uint32_t i = 0u; i < vertex_count; ++i) {
+        if (!weld_vertices) {
+            welded[i] = i;
+            representative.push_back(i);
+            continue;
+        }
+        const Vec3 p = vertex(i);
+        const auto [it, inserted] = welded_ids.emplace(
+            std::array<float, 3>{p.x, p.y, p.z}, static_cast<uint32_t>(representative.size()));
+        if (inserted) representative.push_back(i);
+        welded[i] = it->second;
+    }
+    struct Incident {
+        uint32_t triangle;
+        uint32_t opposite;
+        uint32_t side;
+    };
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<Incident>> adjacency;
+    for (uint32_t triangle = 0u; triangle < triangle_count; ++triangle) {
+        const uint32_t* tri = indices + static_cast<size_t>(triangle) * 3u;
+        for (uint32_t side = 0u; side < 3u; ++side) {
+            const uint32_t a = welded[tri[side]];
+            const uint32_t b = welded[tri[(side + 1u) % 3u]];
+            if (a == b) continue;
+            adjacency[std::minmax(a, b)].push_back({triangle, tri[(side + 2u) % 3u], side});
+        }
+    }
+    CookedMeshEdges result;
+    result.topology_edge_count = static_cast<uint32_t>(adjacency.size());
+    result.triangle_edges.assign(static_cast<size_t>(triangle_count) * 3u, ~0u);
+    result.triangle_vertex_owner.resize(static_cast<size_t>(triangle_count) * 3u);
+    std::vector<uint32_t> vertex_owner(representative.size(), ~0u);
+    for (uint32_t triangle = 0u; triangle < triangle_count; ++triangle) {
+        const size_t first = static_cast<size_t>(triangle) * 3u;
+        for (uint32_t corner = 0u; corner < 3u; ++corner) {
+            const uint32_t vertex_id = welded[indices[first + corner]];
+            vertex_owner[vertex_id] = std::min(vertex_owner[vertex_id], triangle);
+        }
+    }
+    for (uint32_t triangle = 0u; triangle < triangle_count; ++triangle) {
+        const size_t first = static_cast<size_t>(triangle) * 3u;
+        for (uint32_t corner = 0u; corner < 3u; ++corner)
+            result.triangle_vertex_owner[first + corner] =
+                vertex_owner[welded[indices[first + corner]]];
+    }
+    result.edges.reserve(adjacency.size());
+    std::vector<MeshBvhNode> leaves;
+    leaves.reserve(adjacency.size());
+    for (const auto& [pair, incident] : adjacency) {
+        const auto append = [&](uint32_t first, bool paired) {
+            collision::MeshEdge edge;
+            edge.vertex0 = representative[pair.first];
+            edge.vertex1 = representative[pair.second];
+            edge.triangle0 = incident[first].triangle;
+            edge.opposite0 = incident[first].opposite;
+            if (paired) {
+                edge.triangle1 = incident[1].triangle;
+                edge.opposite1 = incident[1].opposite;
+            }
+            const uint32_t edge_id = static_cast<uint32_t>(result.edges.size());
+            result.triangle_edges[static_cast<size_t>(incident[first].triangle) * 3u +
+                                  incident[first].side] = edge_id;
+            if (paired)
+                result.triangle_edges[static_cast<size_t>(incident[1].triangle) * 3u +
+                                      incident[1].side] = edge_id;
+            result.edges.push_back(edge);
+            const Vec3 a = vertex(edge.vertex0), b = vertex(edge.vertex1);
+            MeshBvhNode node;
+            node.lower = Min(a, b);
+            node.upper = Max(a, b);
+            leaves.push_back(node);
+        };
+        if (incident.size() > 2u) {
+            ++result.info.nonmanifold_count;
+            for (uint32_t face = 0u; face < incident.size(); ++face) append(face, false);
+        } else {
+            append(0u, incident.size() == 2u);
+        }
+    }
+    result.info.edge_count = static_cast<uint32_t>(result.edges.size());
+    if (!leaves.empty()) {
+        std::vector<uint32_t> order(leaves.size());
+        std::iota(order.begin(), order.end(), 0u);
+        BuildNodes(result.nodes, order, leaves, 0u, static_cast<uint32_t>(leaves.size()));
+    }
+    result.info.node_count = static_cast<uint32_t>(result.nodes.size());
+    return result;
+}
+
+CookedMeshEdges CookWireEdges(const float* vertices, uint32_t vertex_count,
+                              const uint32_t* indices, uint32_t edge_count) {
+    if (!vertices || !indices || vertex_count == 0u || edge_count == 0u ||
+        uint64_t(edge_count) * 2u - 1u > std::numeric_limits<uint32_t>::max())
+        throw std::invalid_argument("Wire has invalid geometry counts");
+    for (size_t i = 0u; i < size_t(vertex_count) * 3u; ++i)
+        if (!std::isfinite(vertices[i]))
+            throw std::invalid_argument("Wire contains a non-finite vertex");
+    CookedMeshEdges result;
+    result.topology_edge_count = edge_count;
+    result.edges.reserve(edge_count);
+    std::vector<MeshBvhNode> leaves;
+    leaves.reserve(edge_count);
+    for (uint32_t i = 0u; i < edge_count; ++i) {
+        const uint32_t a = indices[size_t(i) * 2u];
+        const uint32_t b = indices[size_t(i) * 2u + 1u];
+        if (a >= vertex_count || b >= vertex_count || a == b)
+            throw std::invalid_argument("Wire edge has invalid vertex indices");
+        const Vec3 va{vertices[size_t(a) * 3u], vertices[size_t(a) * 3u + 1u],
+                      vertices[size_t(a) * 3u + 2u]};
+        const Vec3 vb{vertices[size_t(b) * 3u], vertices[size_t(b) * 3u + 1u],
+                      vertices[size_t(b) * 3u + 2u]};
+        if (!((vb - va).LengthSq() > 0.0f))
+            throw std::invalid_argument("Wire edge has zero length");
+        collision::MeshEdge edge;
+        edge.vertex0 = a;
+        edge.vertex1 = b;
+        result.edges.push_back(edge);
+        MeshBvhNode leaf;
+        leaf.lower = Min(va, vb);
+        leaf.upper = Max(va, vb);
+        leaves.push_back(leaf);
+    }
+    result.info.edge_count = edge_count;
+    result.nodes.reserve(size_t(edge_count) * 2u - 1u);
+    std::vector<uint32_t> order(edge_count);
+    std::iota(order.begin(), order.end(), 0u);
+    BuildNodes(result.nodes, order, leaves, 0u, edge_count);
     result.info.node_count = static_cast<uint32_t>(result.nodes.size());
     return result;
 }

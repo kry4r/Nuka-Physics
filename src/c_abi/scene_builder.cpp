@@ -157,6 +157,8 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
     // Constitutive material (one block read per method).
     m.xpbd.particle_mass = d.xpbd_particle_mass;
     m.xpbd.friction = d.xpbd_friction;
+    m.xpbd.half_thickness = d.xpbd_half_thickness;
+    m.xpbd.surface_density = d.xpbd_surface_density;
     m.xpbd.distance_alpha = d.xpbd_distance_alpha;
     m.xpbd.volume_alpha = d.xpbd_volume_alpha;
     m.xpbd.stretch_stiffness = d.vbd_stretch_stiffness;
@@ -555,7 +557,7 @@ nuka_result_t nuka_world_create_from_built_scene(
             options ? options->solver_pos_iters : 0u,
             options ? options->solver_contact_margin : 0.0f,
             options ? options->solver_max_pairs : 0u,
-            options ? options->cloth_integrator : 0u);
+            options ? options->cloth_integrator : 0u, desc->ogc_contact_capacity);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
                 record->particle_surfaces = std::move(media_surfaces);

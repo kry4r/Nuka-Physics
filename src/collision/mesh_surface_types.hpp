@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "math/vec3.hpp"
+#include "math/quat.hpp"
 
 namespace nuka::collision {
 
@@ -36,14 +37,37 @@ struct MeshBvhNode {
     uint32_t triangle = ~0u;
 };
 
+struct MeshEdge {
+    uint32_t vertex0 = ~0u;
+    uint32_t vertex1 = ~0u;
+    uint32_t opposite0 = ~0u;
+    uint32_t opposite1 = ~0u;
+    uint32_t triangle0 = ~0u;
+    uint32_t triangle1 = ~0u;
+};
+
+struct MeshEdgeInfo {
+    uint32_t vertex_offset = 0u;
+    uint32_t edge_offset = 0u;
+    uint32_t edge_count = 0u;
+    uint32_t node_offset = 0u;
+    uint32_t node_count = 0u;
+    uint32_t nonmanifold_count = 0u;
+};
+
 static_assert(sizeof(MeshSurfaceInfo) == 32u, "MeshSurfaceInfo storage layout");
 static_assert(sizeof(MeshBvhNode) == 32u, "MeshBvhNode storage layout");
+static_assert(sizeof(MeshEdge) == 24u, "MeshEdge storage layout");
+static_assert(sizeof(MeshEdgeInfo) == 24u, "MeshEdgeInfo storage layout");
 
 struct MeshSurfaceView {
     const float* vertices = nullptr;
     const uint32_t* triangles = nullptr;
     const MeshBvhNode* nodes = nullptr;
     MeshGeometryCounts counts{};
+    math::Vec3 position{};
+    math::Quat rotation{};
+    bool transformed = false;
 };
 
 struct MeshSurfacePoint {

@@ -67,6 +67,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
@@ -432,6 +433,10 @@ Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink, bool is_visual) {
     o.Set("decompose_mode", Value::Str(DecomposeModeName(s.decompose_mode)));
     o.Set("decompose_max_pieces", Value::Int(s.decompose_max_pieces));
     if (s.mesh_oriented) o.Set("mesh_oriented", Value::Bool(true));
+    if (s.mesh_contact == CollisionShapeRecord::MeshContact::Sdf)
+        o.Set("mesh_contact", Value::Str("sdf"));
+    if (s.mesh_triangle_limit > 0u)
+        o.Set("mesh_triangle_limit", Value::Int(s.mesh_triangle_limit));
     // Inline mesh geometry -> .nka MESH (visual-only) / CMSH (colliding) chunk,
     // deduped; store the AssetRef text under the same "mesh" key. Routing matches
     // the facade projection so a non-colliding geom (the h1/go2 visual meshes)
@@ -481,6 +486,13 @@ Value SaveJoint(const JointRecord& j) {
     o.Set("stiffness", Value::Float(j.stiffness));
     o.Set("initial_position", Value::Float(j.initial_position));
     o.Set("frictionloss", Value::Float(j.frictionloss));
+    if (j.mimic_source != kInvalidJoint) {
+        Value mimic = Value::Object();
+        mimic.Set("source_joint", Value::Int(j.mimic_source));
+        mimic.Set("multiplier", Value::Float(j.mimic_multiplier));
+        mimic.Set("offset", Value::Float(j.mimic_offset));
+        o.Set("mimic", std::move(mimic));
+    }
     return o;
 }
 
@@ -1373,6 +1385,17 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             if (const Value* v = s->Find("condim")) rec.condim = static_cast<uint8_t>(v->AsInt());
             if (const Value* v = s->Find("decompose_mode")) rec.decompose_mode = DecomposeModeFromName(v->AsString());
             if (const Value* v = s->Find("mesh_oriented")) rec.mesh_oriented = v->AsBool();
+            if (const Value* v = s->Find("mesh_contact")) {
+                const std::string mode = v->AsString();
+                if (mode == "sdf") rec.mesh_contact = CollisionShapeRecord::MeshContact::Sdf;
+                else if (mode != "ogc") throw std::runtime_error("NKS: invalid mesh_contact mode");
+            }
+            if (const Value* v = s->Find("mesh_triangle_limit")) {
+                const auto count = v->AsInt();
+                if (count <= 0 || static_cast<uint64_t>(count) > std::numeric_limits<uint32_t>::max())
+                    throw std::runtime_error("NKS: invalid mesh_triangle_limit");
+                rec.mesh_triangle_limit = static_cast<uint32_t>(count);
+            }
             if (const Value* v = s->Find("decompose_max_pieces"))
                 rec.decompose_max_pieces = static_cast<uint32_t>(v->AsInt());
             if (const Value* mesh = s->Find("mesh")) {
@@ -1450,6 +1473,12 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
             rec.initial_position = j->At("initial_position").AsFloat();
             // Backward-compatible: a pre-frictionloss .nks lacks the key -> 0.
             if (const Value* fl = j->Find("frictionloss")) rec.frictionloss = fl->AsFloat();
+            if (const Value* mimic = j->Find("mimic")) {
+                rec.mimic_source = OffsetId(
+                    static_cast<JointId>(mimic->At("source_joint").AsInt()), joint_offset);
+                rec.mimic_multiplier = mimic->At("multiplier").AsFloat();
+                rec.mimic_offset = mimic->At("offset").AsFloat();
+            }
             scene.AddJoint(std::move(rec));
         };
         for (const BodyNode& bn : body_nodes) {

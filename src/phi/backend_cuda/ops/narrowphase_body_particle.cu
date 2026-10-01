@@ -375,11 +375,16 @@ __global__ void NarrowphaseBodyParticleKernel(
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t lane = kWarp ? (threadIdx.x & 31u) : 0u;
     const uint32_t gid = kWarp ? (tid >> 5u) : tid;
-    const uint32_t row_particles = pp.particles_per_env - pp.particle_row_base;
+    const uint32_t row_particles = pp.particles_per_env - pp.particle_row_base -
+                                   pp.excluded_particle_count;
     const uint32_t total = pp.env_count * row_particles;
     if (gid >= total) return;  // uniform per-warp: the whole warp exits together.
     const uint32_t env = gid / row_particles;
-    const uint32_t pi = pp.particle_row_base + gid - env * row_particles;
+    const uint32_t rank = gid - env * row_particles;
+    const uint32_t pi = pp.particle_row_base + rank +
+        (pp.excluded_particle_count != 0u &&
+         rank >= pp.excluded_particle_begin - pp.particle_row_base
+            ? pp.excluded_particle_count : 0u);
     const uint32_t N = pp.bodies_per_env;
 
     // Reserved contact-slot sub-range for THIS row-making particle: a fixed
@@ -387,7 +392,7 @@ __global__ void NarrowphaseBodyParticleKernel(
     // is bit-D1 by construction and lands in a deterministic sub-range relative to
     // the rigid slots [0, pair_count). Initialize all reserved slots to inactive.
     const uint32_t slot0 = pp.particle_slot_base +
-                           (pi - pp.particle_row_base) * pp.cands_per_particle;
+                           rank * pp.cands_per_particle;
     for (uint32_t point = lane; point < pp.cands_per_particle * nk::kPairDrivenPtsPerSlot;
          point += kWarp ? warpSize : 1u) {
         const uint32_t slot = slot0 + point / nk::kPairDrivenPtsPerSlot;
@@ -594,7 +599,13 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
     if (p == nullptr) return Status::Failed;
     if (p->family != kContactFamilyPairDriven) return Status::Ok;  // early-exit.
     if (p->particle_row_base > p->particles_per_env) return Status::InvalidArgument;
-    if (p->env_count == 0u || p->particles_per_env == p->particle_row_base ||
+    if (p->excluded_particle_count != 0u &&
+        (p->excluded_particle_begin < p->particle_row_base ||
+         uint64_t{p->excluded_particle_begin} + p->excluded_particle_count >
+             p->particles_per_env)) return Status::InvalidArgument;
+    const uint32_t row_particles = p->particles_per_env - p->particle_row_base -
+                                   p->excluded_particle_count;
+    if (p->env_count == 0u || row_particles == 0u ||
         p->slot_stride == 0u || p->cands_per_particle == 0u) {
         return Status::Ok;  // no particles or no reserved slots -> nothing to do.
     }
@@ -607,7 +618,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
     const auto surfaces = nkops::MakeSurfaceQueryView(model, p->bodies_per_env, p->mesh_geometry,
                                                      p->sdf_grid_count, p->sdf_cell_total);
     if (!nkops::SurfaceQueryStorageValid(surfaces)) return Status::InvalidArgument;
-    const uint32_t total = p->env_count * (p->particles_per_env - p->particle_row_base);
+    const uint32_t total = p->env_count * row_particles;
     // Warp-per-particle (a wide hull collider) launches 32 threads/particle (== the
     // serial block count *32); thread-per-particle launches one thread/particle.
     const bool warp = p->warp_per_particle != 0u;

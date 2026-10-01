@@ -41,6 +41,7 @@ const char* NkOpName(int op) {
         case NkOp::IntegrateVelocity: return "IntegrateVelocity";
         case NkOp::FkWorldPoses: return "FkWorldPoses";
         case NkOp::IntegratePosition: return "IntegratePosition";
+        case NkOp::DatSnapshot: return "DatSnapshot";
         case NkOp::CrbaComputeM: return "CrbaComputeM";
         case NkOp::CrbaFactorM: return "CrbaFactorM";
         case NkOp::ApplyImplicitDamping: return "ApplyImplicitDamping";
@@ -90,6 +91,10 @@ const char* NkOpName(int op) {
         case NkOp::FkLinkVelocities: return "FkLinkVelocities";
         case NkOp::ClothPredict: return "ClothPredict";
         case NkOp::ClothFinalize: return "ClothFinalize";
+        case NkOp::OgcDetect: return "OgcDetect";
+        case NkOp::DatTruncate: return "DatTruncate";
+        case NkOp::ReadoutEnergyLedger: return "ReadoutEnergyLedger";
+        case NkOp::ReadoutContactAudit: return "ReadoutContactAudit";
         default: return "op";
     }
 }

@@ -14,3 +14,15 @@ These rules OVERRIDE default behavior. Follow them in every file you write or ed
   same general code. Reject special-cased solvers, fused fast-paths, scene-specific
   cooks, and magic-numbered data layouts. When the general path lacks something,
   build it generally — never add a shortcut.
+
+## Debugging workflow
+- Measure first with the unified diagnostics (`nuka.diagnostics.DiagnosticSession` and
+  `python/physics_diagnostics.py`). When a measurement is missing, extend them generally;
+  do not write one-off probes for a single run.
+- When stuck, research the literature, documentation and issue trackers online.
+- Then compare with the reference engines MuJoCo, Newton and Genesis (sources under
+  `.nuka_cache/engine-review/`, runnable packages in `/root/nuka-physics-reference-20260909`):
+  find how each implements the same mechanism and record the concrete implementation differences.
+- Only after an implementation difference is confirmed with evidence, examine the architectural
+  differences behind it (data layout, stage order, solver coupling, contact representation).
+- Adopt nothing by guess; every change stays on the one general solving path.

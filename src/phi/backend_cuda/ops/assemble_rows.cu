@@ -529,6 +529,8 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
 __global__ void EmitPairDrivenRowsKernel(
     const uint32_t* __restrict__ ucontact_count,
     const math::Vec3* __restrict__ ucontact_point,
+    const math::Vec3* __restrict__ ucontact_witness_a,
+    const math::Vec3* __restrict__ ucontact_witness_b,
     const math::Vec3* __restrict__ ucontact_normal,
     const math::Vec3* __restrict__ ucontact_tangent1,
     const math::Vec3* __restrict__ ucontact_tangent2,
@@ -556,7 +558,7 @@ __global__ void EmitPairDrivenRowsKernel(
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt, float baumgarte_max_velocity, float contact_margin,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
-    uint32_t full_row_slot_count,
+    uint32_t full_row_slot_count, uint32_t ogc_slot_count,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
     uint32_t* __restrict__ row_cj_link, math::Vec3* __restrict__ row_cj_point,
@@ -665,7 +667,12 @@ __global__ void EmitPairDrivenRowsKernel(
         side_a = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
     if (kind_b == kNkSideGrid || kind_b == kNkSidePointEndpoint || side_kind_b == nk::kUContactSideBoundary)
         side_b = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
-    const scene::MergedContactParams merged = scene::MergeContactParams(side_a, side_b);
+    scene::MergedContactParams merged = scene::MergeContactParams(side_a, side_b);
+    if (slot >= full_row_slot_count &&
+        slot - full_row_slot_count < ogc_slot_count && n_active > 0u) {
+        merged.mu1 = endpoint_mu;
+        merged.mu2 = endpoint_mu;
+    }
     const float* solref = merged.solref;
     const float* solimp = merged.solimp;
     const float mu1 = merged.mu1;
@@ -677,9 +684,10 @@ __global__ void EmitPairDrivenRowsKernel(
 
     uint32_t active_rows = 0u;
     for (uint32_t p = 0u; p < points_per_slot; ++p) {
-        const bool live = p < n_active && p < 4u &&
+        // A speculative row closes its emitted gap exactly; the margin gate applies to compliant rows.
+        const bool live = p < n_active && p < 4u && (speculative ||
             ucontact_depth[static_cast<size_t>(gid) * 4u + p] >=
-                merged.gap - fmaxf(contact_margin, merged.margin);
+                merged.gap - fmaxf(contact_margin, merged.margin));
         const size_t mp = static_cast<size_t>(gid) * 4u + p;
         const uint32_t normal_row = base + p;          // pts normal rows first.
         const uint32_t tangent1_row = base + points_per_slot + p;
@@ -687,10 +695,15 @@ __global__ void EmitPairDrivenRowsKernel(
 
         math::Vec3 n{0, 0, 1};
         math::Vec3 point{0, 0, 0};
+        math::Vec3 point_a{0, 0, 0}, point_b{0, 0, 0};
         math::Vec3 t0{1, 0, 0}, t1v{0, 1, 0};
         if (live) {
             n = NormalizedHostExpr(ucontact_normal[mp]);
             point = ucontact_point[mp];
+            const bool ogc_slot = slot >= full_row_slot_count &&
+                slot - full_row_slot_count < ogc_slot_count;
+            point_a = ogc_slot ? ucontact_witness_a[mp] : point;
+            point_b = ogc_slot ? ucontact_witness_b[mp] : point;
             t0 = ucontact_tangent1[mp];
             t1v = ucontact_tangent2[mp];
         }
@@ -734,14 +747,14 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = n;
                 row.b.kind = kind_b; row.b.index = idx_b;
                 row.b.jlin = math::Vec3{-n.x, -n.y, -n.z};
-                if (kind_a == kNkSideRigid) row.a.jang = (point - com_a).Cross(row.a.jlin);
-                if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
+                if (kind_a == kNkSideRigid) row.a.jang = (point_a - com_a).Cross(row.a.jlin);
+                if (kind_b == kNkSideRigid) row.b.jang = (point_b - com_b).Cross(row.b.jlin);
                 if (kind_a == kNkSideArtic) {
-                    row_cj_link[rs] = link_a; row_cj_point[rs] = point;
+                    row_cj_link[rs] = link_a; row_cj_point[rs] = point_a;
                     row_cj_dir[rs] = row.a.jlin;
                 }
                 if (kind_b == kNkSideArtic) {
-                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point;
+                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point_b;
                     row_cj_dir_b[rs] = row.b.jlin;
                 }
                 ++active_rows;
@@ -775,14 +788,14 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.a.kind = kind_a; row.a.index = idx_a; row.a.jlin = dir;
                 row.b.kind = kind_b; row.b.index = idx_b;
                 row.b.jlin = math::Vec3{-dir.x, -dir.y, -dir.z};
-                if (kind_a == kNkSideRigid) row.a.jang = (point - com_a).Cross(row.a.jlin);
-                if (kind_b == kNkSideRigid) row.b.jang = (point - com_b).Cross(row.b.jlin);
+                if (kind_a == kNkSideRigid) row.a.jang = (point_a - com_a).Cross(row.a.jlin);
+                if (kind_b == kNkSideRigid) row.b.jang = (point_b - com_b).Cross(row.b.jlin);
                 if (kind_a == kNkSideArtic) {
-                    row_cj_link[rs] = link_a; row_cj_point[rs] = point;
+                    row_cj_link[rs] = link_a; row_cj_point[rs] = point_a;
                     row_cj_dir[rs] = row.a.jlin;
                 }
                 if (kind_b == kNkSideArtic) {
-                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point;
+                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point_b;
                     row_cj_dir_b[rs] = row.b.jlin;
                 }
                 ++active_rows;
@@ -943,6 +956,52 @@ __global__ void EmitJointDriveRowsKernel(
         const float effort = fminf(fmaxf(command[link], lower[link]), upper[link]);
         row.lower = row.upper = effort * dt;
         atomicAdd(row_count + env, 1u);
+    }
+    urows[slot] = row;
+}
+
+__global__ void EmitMimicRowsKernel(
+    ArticulationDeviceState state, const uint32_t* mimic_source_link,
+    const float* mimic_multiplier, const float* mimic_offset,
+    float dt, uint32_t base_link_count, uint32_t rows_per_env,
+    uint32_t first_row, uint32_t dof_stride,
+    NkRow* urows, float* lambda, float* chain_jacobian,
+    uint32_t* row_cj_link, uint32_t* row_cj_link_b,
+    float* row_penetration, float* row_damping, uint32_t* row_count) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) return;
+    const uint32_t env = link / base_link_count;
+    const uint32_t local = link - env * base_link_count;
+    const uint32_t slot = env * rows_per_env + first_row + local;
+    NkRow row{};
+    row_cj_link[slot] = row_cj_link_b[slot] = kInvalidLink;
+    row_penetration[slot] = row_damping[slot] = lambda[slot] = 0.0f;
+    float* const J = chain_jacobian + static_cast<size_t>(slot) * dof_stride;
+    for (uint32_t d = 0u; d < dof_stride; ++d) J[d] = 0.0f;
+    const uint32_t source = mimic_source_link[link];
+    if (source < state.total_link_count && dt > 0.0f &&
+        JointDofCountDevice(state.joint_type[link]) == 1u &&
+        JointDofCountDevice(state.joint_type[source]) == 1u) {
+        const uint32_t articulation = state.link_to_articulation[link];
+        if (articulation == state.link_to_articulation[source]) {
+            const uint32_t offset = state.articulation_link_offset[articulation];
+            const uint32_t target_dof = LocalDofIndexDevice(state, offset, link);
+            const uint32_t source_dof = LocalDofIndexDevice(state, offset, source);
+            const float multiplier = mimic_multiplier[link];
+            const float error = state.q[link] - multiplier * state.q[source] - mimic_offset[link];
+            row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kVelocityOnly;
+            row.group_first = slot;
+            row.group_normal_count = 1u;
+            row.env = env;
+            row.rhs = -error / (dt * dt);
+            row.lower = -kFltMax;
+            row.upper = kFltMax;
+            row.a.kind = kNkSideArtic;
+            row.a.index = articulation;
+            J[target_dof] = 1.0f;
+            J[source_dof] = -multiplier;
+            atomicAdd(row_count + env, 1u);
+        }
     }
     urows[slot] = row;
 }
@@ -1355,6 +1414,41 @@ __global__ void PrepareContactWarmStartKernel(
     lambda[tangent2_row] = tangent2;
 }
 
+__global__ void CountContactWarmStartsKernel(
+    const uint32_t* __restrict__ contact_count,
+    const math::Vec3* __restrict__ current_normal,
+    const math::Vec3* __restrict__ cache_normal,
+    const uint32_t* __restrict__ matches,
+    uint32_t slot_count, uint32_t* __restrict__ counts) {
+    const uint32_t env = blockIdx.x;
+    __shared__ uint32_t live[128];
+    __shared__ uint32_t warm[128];
+    uint32_t current = 0u, matched = 0u;
+    const uint32_t points_per_env = slot_count * nk::kPairDrivenPtsPerSlot;
+    for (uint32_t local = threadIdx.x; local < points_per_env; local += blockDim.x) {
+        const uint32_t point = env * points_per_env + local;
+        if (local % nk::kPairDrivenPtsPerSlot >=
+            contact_count[env * slot_count + local / nk::kPairDrivenPtsPerSlot]) continue;
+        ++current;
+        const uint32_t old = matches[point];
+        matched += old != ~0u && current_normal[point].Dot(cache_normal[old]) > 0.25f;
+    }
+    live[threadIdx.x] = current;
+    warm[threadIdx.x] = matched;
+    __syncthreads();
+    for (uint32_t half = blockDim.x / 2u; half > 0u; half /= 2u) {
+        if (threadIdx.x < half) {
+            live[threadIdx.x] += live[threadIdx.x + half];
+            warm[threadIdx.x] += warm[threadIdx.x + half];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        counts[env * 2u] = live[0];
+        counts[env * 2u + 1u] = warm[0];
+    }
+}
+
 __device__ void ClearContactCachePoint(
     uint32_t point_index, uint64_t* cache_pair, uint64_t* cache_feature,
     float* cache_lambda, math::Vec3* cache_normal,
@@ -1493,7 +1587,8 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         return Status::InvalidArgument;
     const uint64_t count = uint64_t{p->env_count} * p->slot_count * nk::kPairDrivenPtsPerSlot;
     const uint32_t point_count = static_cast<uint32_t>(count);
-    if (!data.contact_cache_scratch || p->workspace_bytes <= contact_cache::Layout(point_count, p->env_count).temp_offset)
+    if (!data.contact_cache_scratch || !data.contact_warm_start_counts ||
+        p->workspace_bytes <= contact_cache::Layout(point_count, p->env_count).temp_offset)
         return Status::InvalidArgument;
     contact_cache::Workspace workspace(data.contact_cache_scratch, p->workspace_bytes, point_count, p->env_count);
     constexpr uint32_t kBlock = 128u;
@@ -1502,6 +1597,10 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         const auto status = contact_cache::BuildIndex(data, point_count, p->slot_count * nk::kPairDrivenPtsPerSlot,
                                                      p->decay_steps, workspace, stream);
         if (status != cudaSuccess) return Status::Failed;
+        LaunchCuda(CountContactWarmStartsKernel, dim3(p->env_count), dim3(kBlock), 0u,
+                   stream, data.ucontact_count, data.ucontact_normal,
+                   data.contact_cache_normal, workspace.matches, p->slot_count,
+                   data.contact_warm_start_counts);
         LaunchCuda(PrepareContactWarmStartKernel, dim3(blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_normal, data.ucontact_tangent1,
                    data.ucontact_tangent2, data.contact_cache_lambda,
@@ -1623,6 +1722,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         LaunchCuda(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    static_cast<const uint32_t*>(data.ucontact_count),
                    static_cast<const math::Vec3*>(data.ucontact_point),
+                   static_cast<const math::Vec3*>(data.ucontact_witness_a),
+                   static_cast<const math::Vec3*>(data.ucontact_witness_b),
                    static_cast<const math::Vec3*>(data.ucontact_normal),
                    static_cast<const math::Vec3*>(data.ucontact_tangent1),
                    static_cast<const math::Vec3*>(data.ucontact_tangent2),
@@ -1648,7 +1749,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->baumgarte_max_velocity, p->contact_margin,
                    p->env_count, p->union_slot_count, p->rows_per_env,
-                   p->full_row_slot_count,
+                   p->full_row_slot_count, p->ogc_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,
@@ -1696,6 +1797,19 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->max_dof, data.drive_command, data.drive_lower, data.drive_upper,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda, data.chain_jacobian,
                    data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+    }
+
+    if (has_artic && p->mimic_rows_per_env >= p->base_link_count && p->base_link_count > 0u) {
+        const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
+        const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(EmitMimicRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   state, model.mimic_source_link, model.mimic_multiplier, model.mimic_offset,
+                   p->dt, p->base_link_count, p->rows_per_env,
+                   p->contact_rows_per_env + p->joint_limit_rows_per_env +
+                       p->joint_friction_rows_per_env + p->joint_drive_rows_per_env,
+                   p->max_dof, reinterpret_cast<NkRow*>(data.urows), data.lambda,
+                   data.chain_jacobian, data.row_cj_link, data.row_cj_link_b,
+                   data.row_penetration, data.row_damping, data.row_count);
     }
 
     const uint32_t constraints = p->dist_cons_per_env + p->vol_cons_per_env;

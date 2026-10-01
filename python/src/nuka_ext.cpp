@@ -180,7 +180,7 @@ public:
                                     uint32_t solver_pos_iters,
                                     float solver_contact_margin,
                                     uint32_t solver_max_pairs,
-                                    uint32_t cloth_integrator,
+                                    uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
                                     float baumgarte_max_velocity,
                                     float gravity_x, float gravity_y, float gravity_z) {
         if (device == nullptr || !device->valid()) {
@@ -203,6 +203,7 @@ public:
                 "5 (Actuator)");
         }
         nuka_world_desc_t desc{};
+        desc.ogc_contact_capacity = ogc_contact_capacity;
         desc.scene_path = scene_path.c_str();
         desc.env_count = env_count;
         desc.fixed_dt = dt;
@@ -304,7 +305,7 @@ public:
         bool cloth_free, float aero_normal, float aero_tangent, float aero_max_dv,
         uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
-        uint32_t cloth_integrator,
+        uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
         float baumgarte_max_velocity, uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_coupled_from_scene: invalid device");
@@ -314,6 +315,7 @@ public:
                 "create_coupled_from_scene: control_mode must be between 0 and 5");
         }
         nuka_world_desc_t desc{};
+        desc.ogc_contact_capacity = ogc_contact_capacity;
         desc.scene_path = scene_path.c_str();
         desc.env_count = env_count;
         desc.fixed_dt = dt;
@@ -403,7 +405,7 @@ public:
         float terrain_grid_height_max, float gravity_x, float gravity_y,
         float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
-        uint32_t cloth_integrator,
+        uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
         float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_built_scene: invalid device");
@@ -421,6 +423,7 @@ public:
                 "create_from_built_scene: control_mode must be between 0 and 5");
         }
         nuka_world_desc_t desc{};
+        desc.ogc_contact_capacity = ogc_contact_capacity;
         desc.scene_path = nullptr;  // the scene comes from the handle, not a file.
         desc.env_count = env_count;
         desc.fixed_dt = dt;
@@ -548,6 +551,16 @@ public:
 
     void set_coupling_passes(uint32_t passes) {
         check(nuka_world_set_coupling_passes(h_, passes), "nuka_world_set_coupling_passes");
+    }
+
+    void set_velocity_iterations(uint32_t iterations) {
+        check(nuka_world_set_velocity_iterations(h_, iterations), "nuka_world_set_velocity_iterations");
+    }
+
+    uint32_t velocity_iterations() const {
+        uint32_t iterations = 0u;
+        check(nuka_world_get_velocity_iterations(h_, &iterations), "nuka_world_get_velocity_iterations");
+        return iterations;
     }
 
     void set_sensor_noise(nuka_state_field_t field, int kind, float param1,
@@ -1495,7 +1508,8 @@ public:
                    float cable_slab_mass, float cable_slab_stiffness,
                    uint32_t cable_slab_render_material_id,
                    float mpm_yield_stress, float mpm_hardening_modulus,
-                   uint32_t mpm_contact_capacity) {
+                   uint32_t mpm_contact_capacity, float xpbd_half_thickness,
+                   float xpbd_surface_density) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1522,6 +1536,8 @@ public:
         d.fluid_position_jitter = fluid_position_jitter;
         d.xpbd_particle_mass = xpbd_particle_mass;
         d.xpbd_friction = xpbd_friction;
+        d.xpbd_half_thickness = xpbd_half_thickness;
+        d.xpbd_surface_density = xpbd_surface_density;
         d.xpbd_distance_alpha = xpbd_distance_alpha;
         d.xpbd_volume_alpha = xpbd_volume_alpha;
         d.vbd_stretch_stiffness = vbd_stretch_stiffness;
@@ -1634,7 +1650,7 @@ public:
                  float terrain_grid_height_max, float gravity_x, float gravity_y,
                  float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
                  float solver_contact_margin, uint32_t solver_max_pairs,
-                 uint32_t cloth_integrator,
+                 uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
                  float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
         if (device == nullptr) {
             throw std::runtime_error("SceneBuilder.build: device is None");
@@ -1645,7 +1661,7 @@ public:
             heightfield_cell, terrain_step_height, terrain_step_width,
             terrain_platform_width, terrain_grid_width, terrain_grid_height_max,
             gravity_x, gravity_y, gravity_z, solver_vel_iters, solver_pos_iters,
-            solver_contact_margin, solver_max_pairs, cloth_integrator,
+            solver_contact_margin, solver_max_pairs, cloth_integrator, ogc_contact_capacity,
             baumgarte_max_velocity,
             bake_link_sdf, osc_task_link);
     }
@@ -1892,6 +1908,35 @@ NB_MODULE(_nuka_ext, m) {
         // (element_count == 0) on a world with no particles.
         .value("PARTICLE_POSITION", NUKA_FIELD_PARTICLE_POSITION)
         .value("PARTICLE_VELOCITY", NUKA_FIELD_PARTICLE_VELOCITY)
+        .value("PARTICLE_INV_MASS", NUKA_FIELD_PARTICLE_INV_MASS)
+        .value("PARTICLE_KINEMATIC_TARGET", NUKA_FIELD_PARTICLE_KINEMATIC_TARGET)
+        .value("OGC_CONTACT_COUNT", NUKA_FIELD_OGC_CONTACT_COUNT)
+        .value("MESH_OGC_PAIR_COUNT", NUKA_FIELD_MESH_OGC_PAIR_COUNT)
+        .value("MESH_SDF_PAIR_COUNT", NUKA_FIELD_MESH_SDF_PAIR_COUNT)
+        .value("VBD_VELOCITY_SWEEP_COUNT", NUKA_FIELD_VBD_VELOCITY_SWEEP_COUNT)
+        .value("SOLVER_COLOR_COUNTS", NUKA_FIELD_SOLVER_COLOR_COUNTS)
+        .value("DAT_FAILURE_COUNT", NUKA_FIELD_DAT_FAILURE_COUNT)
+        .value("DAT_PARTICLE_MOTION_FRACTION", NUKA_FIELD_DAT_PARTICLE_MOTION_FRACTION)
+        .value("VBD_SOLVE_METRICS", NUKA_FIELD_VBD_SOLVE_METRICS)
+        .value("ENERGY_LEDGER", NUKA_FIELD_ENERGY_LEDGER)
+        .value("ENERGY_LEDGER_STATUS", NUKA_FIELD_ENERGY_LEDGER_STATUS)
+        .value("VBD_FORCE_RESIDUAL_WORK", NUKA_FIELD_VBD_FORCE_RESIDUAL_WORK)
+        .value("PHYSICS_STAGE_METRICS", NUKA_FIELD_PHYSICS_STAGE_METRICS)
+        .value("CONTACT_AUDIT_COUNTS", NUKA_FIELD_CONTACT_AUDIT_COUNTS)
+        .value("CONTACT_AUDIT_METRICS", NUKA_FIELD_CONTACT_AUDIT_METRICS)
+        .value("VBD_EFFECTIVE_DT", NUKA_FIELD_VBD_EFFECTIVE_DT)
+        .value("VBD_ELEMENTS", NUKA_FIELD_VBD_ELEMENTS)
+        .value("DAT_QUERY_LIMIT_COUNT", NUKA_FIELD_DAT_QUERY_LIMIT_COUNT)
+        .value("DAT_FAILURE_WITNESS", NUKA_FIELD_DAT_FAILURE_WITNESS)
+        .value("CONTACT_WARM_START_COUNTS", NUKA_FIELD_CONTACT_WARM_START_COUNTS)
+        .value("DAT_TRUNCATION_COUNT", NUKA_FIELD_DAT_TRUNCATION_COUNT)
+        .value("DAT_TRUNCATION_ENERGY", NUKA_FIELD_DAT_TRUNCATION_ENERGY)
+        .value("DAT_PARTICLE_TRUNCATION_COUNT", NUKA_FIELD_DAT_PARTICLE_TRUNCATION_COUNT)
+        .value("DAT_PARTICLE_TRUNCATION_ENERGY", NUKA_FIELD_DAT_PARTICLE_TRUNCATION_ENERGY)
+        .value("DAT_JOINT_TRUNCATION_COUNT", NUKA_FIELD_DAT_JOINT_TRUNCATION_COUNT)
+        .value("DAT_JOINT_TRUNCATION_ENERGY", NUKA_FIELD_DAT_JOINT_TRUNCATION_ENERGY)
+        .value("DAT_BODY_TRUNCATION_COUNT", NUKA_FIELD_DAT_BODY_TRUNCATION_COUNT)
+        .value("DAT_BODY_TRUNCATION_ENERGY", NUKA_FIELD_DAT_BODY_TRUNCATION_ENERGY)
         // Cooked rigid-body SoA world linear/angular velocity (per-body Vec3,
         // env-major). buffer_view shape (env_count, bodies_per_env, 3) float32; an
         // empty view on a body-free world. Writable via upload_field to park a body.
@@ -1939,6 +1984,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("OK", NUKA_GYRO_OK)
         .value("NOT_CONVERGED", NUKA_GYRO_NOT_CONVERGED)
         .value("INVALID_INPUT", NUKA_GYRO_INVALID_INPUT);
+    m.attr("ENV_STATUS_DAT_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_DAT_FAILURE);
+    m.attr("ENV_STATUS_SOLVER_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_SOLVER_FAILURE);
     m.attr("ENV_STATUS_GYRO_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_GYRO_FAILURE);
     m.attr("ENV_STATUS_CONSTITUTIVE_FAILURE") = static_cast<uint32_t>(NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE);
     m.attr("ENV_STATUS_GRID_CONTACT_OVERFLOW") = static_cast<uint32_t>(NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW);
@@ -2065,6 +2112,7 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("solver_contact_margin") = 0.0f,
                     nb::arg("solver_max_pairs") = uint32_t{0},
                     nb::arg("cloth_integrator") = uint32_t{0},
+                    nb::arg("ogc_contact_capacity") = uint32_t{0},
                     nb::arg("baumgarte_max_velocity") = 0.0f,
                     nb::arg("gravity_x") = 0.0f,
                     nb::arg("gravity_y") = 0.0f,
@@ -2124,6 +2172,7 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
             nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
             nb::arg("cloth_integrator") = 0u,
+            nb::arg("ogc_contact_capacity") = 0u,
             nb::arg("baumgarte_max_velocity") = 0.0f,
             nb::arg("osc_task_link") = 0u,
             nb::rv_policy::take_ownership,
@@ -2837,6 +2886,11 @@ NB_MODULE(_nuka_ext, m) {
              "Set contact exchanges per interval (0..65535; zero follows material iterations). "
              "Preserves material budgets and timestep, changes finite-iteration coupling, "
              "and invalidates the execution graph when the value changes.")
+        .def("set_velocity_iterations", &World::set_velocity_iterations, nb::arg("iterations"),
+             "Set the contact solve's velocity sweeps per coupling pass (1..65535). Preserves the "
+             "timestep and coupling passes, and invalidates the execution graph when the value changes.")
+        .def("velocity_iterations", &World::velocity_iterations,
+             "Velocity sweep budget of the contact solve per coupling pass.")
         .def("set_sensor_noise", &World::set_sensor_noise, nb::arg("field"),
              nb::arg("kind"), nb::arg("param1") = 0.0f, nb::arg("param2") = 0.0f,
              nb::arg("seed") = uint64_t{0},
@@ -3251,6 +3305,8 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("cable_slab_render_material_id") = uint32_t{0xFFFFFFFFu},
              nb::arg("mpm_yield_stress") = 0.0f, nb::arg("mpm_hardening_modulus") = 0.0f,
              nb::arg("mpm_contact_capacity") = 0u,
+             nb::arg("xpbd_half_thickness") = 0.0f,
+             nb::arg("xpbd_surface_density") = 0.0f,
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
              "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
@@ -3287,6 +3343,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
              nb::arg("solver_contact_margin") = 0.0f, nb::arg("solver_max_pairs") = 0u,
              nb::arg("cloth_integrator") = 0u,
+             nb::arg("ogc_contact_capacity") = 0u,
              nb::arg("baumgarte_max_velocity") = 0.0f,
              nb::arg("bake_link_sdf") = false,
              nb::arg("osc_task_link") = 0u,

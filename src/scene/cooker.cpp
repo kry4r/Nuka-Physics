@@ -4,8 +4,10 @@
 
 #include "scene/cooker.hpp"
 
+#include "collision/mesh_surface.hpp"
 #include "import/cooker/convex_decomposition.hpp"
 #include "import/cooker/mesh_surface_cooker.hpp"
+#include "import/cooker/mesh_simplifier.hpp"
 #include "import/cooker/sdf_bake_backend.hpp"
 #include "import/cooker/sparse_sdf_cooker.hpp"
 #include "runtime/sdf/sparse_sdf_query.cuh"  // PackSdfCellKey codec (shared)
@@ -13,8 +15,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <stdexcept>
 #include <unordered_map>
@@ -33,6 +37,124 @@ namespace {
 // on-disk store is regenerable and gitignored; a decomposition-logic change is
 // handled by clearing the dir (no input change => same key by design).
 constexpr const char* kDecomposeCacheDir = ".nuka_cache";
+
+float SampledOneSidedHausdorff(const std::vector<float>& source_vertices,
+                              const std::vector<uint32_t>& source_triangles,
+                              const import::cooker::SimplifiedMesh& reduced) {
+    const auto cooked = import::cooker::CookMeshSurface(
+        reduced.vertices.data(), static_cast<uint32_t>(reduced.vertices.size() / 3u),
+        reduced.indices.data(), static_cast<uint32_t>(reduced.indices.size() / 3u));
+    const collision::MeshSurfaceView view{
+        reduced.vertices.data(), reduced.indices.data(), cooked.nodes.data(),
+        {static_cast<uint32_t>(reduced.vertices.size() / 3u),
+         static_cast<uint32_t>(reduced.indices.size() / 3u),
+         static_cast<uint32_t>(cooked.nodes.size())}};
+    const auto info = cooked.info;
+    if (!collision::MeshSurfaceRangeValid(view, info))
+        throw std::invalid_argument("Reduced collision mesh has no queryable surface");
+    const auto point = [&](uint32_t index) {
+        const size_t at = size_t(index) * 3u;
+        return math::Vec3{source_vertices[at], source_vertices[at + 1u], source_vertices[at + 2u]};
+    };
+    float maximum_sq = 0.0f;
+    const auto sample = [&](math::Vec3 position) {
+        float squared = std::numeric_limits<float>::max();
+        collision::MeshSurfacePoint nearest;
+        math::Vec3 normal{};
+        if (!collision::MeshNearestSearch(view, info, position, squared, nearest, normal) ||
+            nearest.triangle == ~0u || !std::isfinite(squared))
+            throw std::invalid_argument("Reduced collision mesh nearest-point query failed");
+        maximum_sq = std::max(maximum_sq, squared);
+    };
+    for (size_t i = 0u; i < source_triangles.size(); i += 3u) {
+        const math::Vec3 a = point(source_triangles[i]);
+        const math::Vec3 b = point(source_triangles[i + 1u]);
+        const math::Vec3 c = point(source_triangles[i + 2u]);
+        sample(a);
+        sample(b);
+        sample(c);
+        sample((a + b) * 0.5f);
+        sample((b + c) * 0.5f);
+        sample((c + a) * 0.5f);
+        sample((a + b + c) * (1.0f / 3.0f));
+    }
+    return std::sqrt(maximum_sq);
+}
+
+// The smallest triangle altitude bounds both the shortest edge and the flattest face.
+float MinTriangleAltitude(const std::vector<float>& vertices, const std::vector<uint32_t>& indices) {
+    double minimum = std::numeric_limits<double>::infinity();
+    for (size_t i = 0u; i + 2u < indices.size(); i += 3u) {
+        double p[3][3];
+        for (uint32_t k = 0u; k < 3u; ++k)
+            for (uint32_t axis = 0u; axis < 3u; ++axis)
+                p[k][axis] = vertices[size_t(indices[i + k]) * 3u + axis];
+        double longest = 0.0;
+        for (uint32_t k = 0u; k < 3u; ++k) {
+            const double* a = p[k];
+            const double* b = p[(k + 1u) % 3u];
+            longest = std::max(longest, (b[0] - a[0]) * (b[0] - a[0]) +
+                (b[1] - a[1]) * (b[1] - a[1]) + (b[2] - a[2]) * (b[2] - a[2]));
+        }
+        const double u[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
+        const double v[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
+        const double cross[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2],
+                                 u[0] * v[1] - u[1] * v[0]};
+        const double twice_area = std::sqrt(cross[0] * cross[0] + cross[1] * cross[1] +
+                                            cross[2] * cross[2]);
+        minimum = std::min(minimum, longest > 0.0 ? twice_area / std::sqrt(longest) : 0.0);
+    }
+    return static_cast<float>(minimum);
+}
+
+struct AccuracyBoundedMesh {
+    import::cooker::SimplifiedMesh mesh;
+    float sampled_error = 0.0f;
+};
+
+AccuracyBoundedMesh SimplifyWithinError(const std::vector<float>& source_vertices,
+                                        const std::vector<uint32_t>& source_triangles,
+                                        uint32_t target_triangles, float max_error) {
+    const uint32_t input_triangles = static_cast<uint32_t>(source_triangles.size() / 3u);
+    const auto evaluate = [&](uint32_t target) {
+        AccuracyBoundedMesh result;
+        result.mesh = import::cooker::SimplifyMeshQem(
+            source_vertices.data(), static_cast<uint32_t>(source_vertices.size() / 3u),
+            source_triangles.data(), input_triangles, target);
+        result.sampled_error = target == input_triangles ? 0.0f
+            : SampledOneSidedHausdorff(source_vertices, source_triangles, result.mesh);
+        return result;
+    };
+    auto first = evaluate(target_triangles);
+    if (first.sampled_error <= max_error) return first;
+    uint32_t failed_target = target_triangles;
+    uint32_t passing_target = input_triangles;
+    AccuracyBoundedMesh passing;
+    for (uint32_t target = target_triangles; target < input_triangles;) {
+        const uint64_t doubled = std::max<uint64_t>(uint64_t{target} + 1u,
+                                                    uint64_t{target} * 2u);
+        target = static_cast<uint32_t>(std::min<uint64_t>(input_triangles, doubled));
+        auto trial = evaluate(target);
+        if (trial.sampled_error <= max_error) {
+            passing_target = target;
+            passing = std::move(trial);
+            break;
+        }
+        failed_target = target;
+    }
+    while (passing_target - failed_target >
+           std::max<uint32_t>(16u, passing_target / 100u)) {
+        const uint32_t middle = failed_target + (passing_target - failed_target) / 2u;
+        auto trial = evaluate(middle);
+        if (trial.sampled_error <= max_error) {
+            passing_target = middle;
+            passing = std::move(trial);
+        } else {
+            failed_target = middle;
+        }
+    }
+    return passing;
+}
 
 math::Transform ResolveWorldTransform(const SceneIR& scene, BodyId body_id) {
     const auto& body = scene.GetBody(body_id);
@@ -67,30 +189,46 @@ uint32_t AppendConvexGeometry(CookedConvexGeometry& geom,
                               const import::cooker::MeshSurfaceCookOptions& options = {}) {
     if (vertices.size() % 3u != 0u || indices.size() % 3u != 0u)
         throw std::invalid_argument("Collision mesh arrays must contain complete vertices and triangles");
-    auto surface = import::cooker::CookMeshSurfaceCached(vertices.data(),
+    const auto oriented_indices = import::cooker::OrientMeshWinding(vertices.data(),
         static_cast<uint32_t>(vertices.size() / 3u), indices.data(),
-        static_cast<uint32_t>(indices.size() / 3u), convex, options);
+        static_cast<uint32_t>(indices.size() / 3u));
+    auto surface = import::cooker::CookMeshSurfaceCached(vertices.data(),
+        static_cast<uint32_t>(vertices.size() / 3u), oriented_indices.data(),
+        static_cast<uint32_t>(oriented_indices.size() / 3u), convex, options);
+    surface.info.flags |= collision::kMeshSurfaceOriented;
     const auto found = std::find(geom.surface_cache_keys.begin(), geom.surface_cache_keys.end(),
                                  surface.cache_key);
     if (found != geom.surface_cache_keys.end())
         return static_cast<uint32_t>(found - geom.surface_cache_keys.begin());
+    auto edge_topology = import::cooker::CookMeshEdges(vertices.data(),
+        static_cast<uint32_t>(vertices.size() / 3u), oriented_indices.data(),
+        static_cast<uint32_t>(oriented_indices.size() / 3u));
     const uint32_t index = geom.Count();
     geom.vertex_offsets.push_back(static_cast<uint32_t>(geom.vertices.size() / 3));
     geom.vertex_counts.push_back(static_cast<uint32_t>(vertices.size() / 3));
     geom.index_offsets.push_back(static_cast<uint32_t>(geom.indices.size()));
-    geom.index_counts.push_back(static_cast<uint32_t>(indices.size()));
+    geom.index_counts.push_back(static_cast<uint32_t>(oriented_indices.size()));
     geom.volumes.push_back(volume);
     surface.info.vertex_offset = geom.vertex_offsets.back();
     surface.info.triangle_offset = geom.index_offsets.back() / 3u;
     surface.info.node_offset = static_cast<uint32_t>(geom.surface_nodes.size());
     geom.surface_info.push_back(surface.info);
+    edge_topology.info.edge_offset = static_cast<uint32_t>(geom.edges.size());
+    edge_topology.info.node_offset = static_cast<uint32_t>(geom.edge_nodes.size());
+    geom.edge_info.push_back(edge_topology.info);
+    geom.edges.insert(geom.edges.end(), edge_topology.edges.begin(), edge_topology.edges.end());
+    geom.edge_nodes.insert(geom.edge_nodes.end(), edge_topology.nodes.begin(), edge_topology.nodes.end());
+    geom.triangle_edges.insert(geom.triangle_edges.end(),
+        edge_topology.triangle_edges.begin(), edge_topology.triangle_edges.end());
+    geom.triangle_vertex_owner.insert(geom.triangle_vertex_owner.end(),
+        edge_topology.triangle_vertex_owner.begin(), edge_topology.triangle_vertex_owner.end());
     geom.surface_covers.push_back(std::move(surface.cover));
     geom.surface_cache_keys.push_back(std::move(surface.cache_key));
     geom.surface_cache_hits.push_back(surface.cache_hit ? 1u : 0u);
     geom.surface_cover_hierarchy.push_back(surface.cover_hierarchy ? 1u : 0u);
     geom.surface_nodes.insert(geom.surface_nodes.end(), surface.nodes.begin(), surface.nodes.end());
     geom.vertices.insert(geom.vertices.end(), vertices.begin(), vertices.end());
-    geom.indices.insert(geom.indices.end(), indices.begin(), indices.end());
+    geom.indices.insert(geom.indices.end(), oriented_indices.begin(), oriented_indices.end());
     return index;
 }
 
@@ -332,6 +470,7 @@ void PushShapeRow(CookedShapeTable& shapes,
     shapes.radii.push_back(src.radius);
     shapes.half_heights.push_back(src.half_height);
     shapes.convex_geometry_indices.push_back(convex_geometry_index);
+    shapes.mesh_contact_modes.push_back(static_cast<uint8_t>(src.mesh_contact));
 
     // Parallel contact-param row (copied verbatim except the resolved friction).
     contact_params.contypes.push_back(src.contype);
@@ -357,14 +496,13 @@ void PushShapeRow(CookedShapeTable& shapes,
 //
 //   excluded_body_pairs = union of:
 //     (a) scene.ExcludePairs()  -- authored <contact><exclude>, already (min,max)
-//     (b) parent-child auto-exclude -- each joint connects parent->child; that
-//         body pair is excluded (MuJoCo auto-excludes parent-child unless
-//         re-enabled). Joints with a kInvalidBody parent or child (e.g. a
-//         floating-base Free joint) are SKIPPED (no real body pair to exclude).
+//     (b) weld auto-exclude -- Fixed joints weld bodies into clusters; pairs within
+//         a cluster and between a cluster and its joint parent's cluster are excluded
+//         (MuJoCo's weldbody and filterparent rules). Joints with a kInvalidBody parent
+//         or child (e.g. a floating-base Free joint) are SKIPPED.
 //     ...canonicalized (min,max), deduplicated, ascending-sorted (binary search).
 //   LIMITATION: bodies welded together WITHOUT a joint (a Fixed weld expressed
-//   purely structurally, not as a JointRecord) are NOT auto-excluded in v0.8.
-//   Only joint-connected parent-child pairs auto-exclude.
+//   purely structurally, not as a JointRecord) do not form clusters in v0.8.
 //
 //   explicit_pairs = scene.ContactPairs() copied as-authored (NOT geom-merged):
 //     each ContactPairOverride's params are stored verbatim into the
@@ -387,14 +525,35 @@ void BuildFilteredPairPolicy(const SceneIR& scene, CookedBlob& blob) {
         if (b < a) std::swap(a, b);  // re-canonicalize defensively
         excludes.emplace_back(a, b);
     }
+    const BodyId body_count = static_cast<BodyId>(scene.Bodies().size());
+    std::vector<BodyId> parent(body_count, kInvalidBody);
+    std::vector<uint8_t> jointed(body_count, 0u), movable(body_count, 0u);
     for (const auto& j : scene.Joints()) {
-        if (j.parent_body == kInvalidBody || j.child_body == kInvalidBody) {
+        if (j.parent_body >= body_count || j.child_body >= body_count ||
+            j.parent_body == j.child_body) {
             continue;  // floating-base / parentless joint: no body pair
         }
-        BodyId a = j.parent_body, b = j.child_body;
-        if (a == b) continue;  // degenerate self-joint: nothing to exclude
-        if (b < a) std::swap(a, b);
-        excludes.emplace_back(a, b);
+        parent[j.child_body] = j.parent_body;
+        jointed[j.child_body] = 1u;
+        movable[j.child_body] |= j.type != JointType::Fixed;
+    }
+    auto weld = [&](BodyId body) {
+        for (BodyId hops = 0; hops < body_count && jointed[body] && !movable[body]; ++hops)
+            body = parent[body];
+        return body;
+    };
+    std::vector<std::vector<BodyId>> clusters(body_count);
+    for (BodyId body = 0; body < body_count; ++body) clusters[weld(body)].push_back(body);
+    auto exclude = [&](BodyId a, BodyId b) {
+        if (a != b) excludes.emplace_back(std::min(a, b), std::max(a, b));
+    };
+    for (BodyId root = 0; root < body_count; ++root) {
+        const auto& members = clusters[root];
+        for (size_t i = 0; i < members.size(); ++i)
+            for (size_t k = i + 1; k < members.size(); ++k) exclude(members[i], members[k]);
+        if (members.empty() || parent[root] == kInvalidBody) continue;
+        for (BodyId other : clusters[weld(parent[root])])
+            for (BodyId member : members) exclude(member, other);
     }
     std::sort(excludes.begin(), excludes.end());
     excludes.erase(std::unique(excludes.begin(), excludes.end()), excludes.end());
@@ -484,6 +643,9 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     blob.joints.armatures.reserve(joints.size());
     blob.joints.initial_positions.reserve(joints.size());
     blob.joints.frictionlosses.reserve(joints.size());
+    blob.joints.mimic_sources.reserve(joints.size());
+    blob.joints.mimic_multipliers.reserve(joints.size());
+    blob.joints.mimic_offsets.reserve(joints.size());
 
     for (const auto& j : joints) {
         blob.joints.types.push_back(j.type);
@@ -501,6 +663,9 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         blob.joints.armatures.push_back(j.armature);
         blob.joints.initial_positions.push_back(j.initial_position);
         blob.joints.frictionlosses.push_back(j.frictionloss);
+        blob.joints.mimic_sources.push_back(j.mimic_source);
+        blob.joints.mimic_multipliers.push_back(j.mimic_multiplier);
+        blob.joints.mimic_offsets.push_back(j.mimic_offset);
     }
 
     const auto& shapes = scene.Shapes();
@@ -512,6 +677,7 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
     blob.shapes.radii.reserve(shapes.size());
     blob.shapes.half_heights.reserve(shapes.size());
     blob.shapes.convex_geometry_indices.reserve(shapes.size());
+    blob.shapes.mesh_contact_modes.reserve(shapes.size());
     // Contact-param table is parallel to the shape rows (>= shapes.size() once
     // meshes decompose); reserve the lower bound. v0.8 C1a.
     blob.contact_params.contypes.reserve(shapes.size());
@@ -565,6 +731,8 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
             rowp = &baked;
         }
         const CollisionShapeRecord& r = *rowp;
+        const std::string shape_name = r.name.empty()
+            ? scene.GetBody(r.body_id).name : r.name;
         if (r.mesh_vertices.size() % 3u != 0u || r.mesh_indices.size() % 3u != 0u ||
             r.mesh_vertices.size() / 3u > uint64_t(~uint32_t(0)) ||
             r.mesh_indices.size() > uint64_t(~uint32_t(0)))
@@ -572,13 +740,74 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
 
         const auto mode = ToCookerMode(r.decompose_mode);
         if (mode != import::cooker::DecomposeMode::Force) {
+            uint32_t source_edges = 0u;
+            uint32_t nonmanifold_edges = 0u;
+            if (shape_collides && r.type == ShapeType::TriMesh) {
+                const auto topology = import::cooker::CookMeshEdges(
+                    r.mesh_vertices.data(), static_cast<uint32_t>(r.mesh_vertices.size() / 3u),
+                    r.mesh_indices.data(), static_cast<uint32_t>(r.mesh_indices.size() / 3u));
+                source_edges = topology.topology_edge_count;
+                nonmanifold_edges = topology.info.nonmanifold_count;
+                if (r.mesh_triangle_limit > 0u &&
+                    uint64_t{nonmanifold_edges} * 100u > source_edges)
+                    throw std::runtime_error("Collision shape " + std::to_string(r.id) +
+                        " (" + shape_name + ") has " + std::to_string(nonmanifold_edges) +
+                        " nonmanifold edges among " + std::to_string(source_edges));
+            }
             auto surface_options = options.mesh_surface;
             surface_options.oriented_surface = r.mesh_oriented;
             surface_options.decompose = surface_options.decompose && shape_collides &&
                 mode == import::cooker::DecomposeMode::Auto;
-            const uint32_t geom_index = AppendConvexGeometry(
-                blob.convex_geometry, r.mesh_vertices, r.mesh_indices, 0.0f,
+            const bool simplify = shape_collides && r.type == ShapeType::TriMesh &&
+                r.mesh_contact == CollisionShapeRecord::MeshContact::Ogc &&
+                r.mesh_triangle_limit > 0u &&
+                r.mesh_indices.size() / 3u > r.mesh_triangle_limit;
+            import::cooker::SimplifiedMesh reduced;
+            float sampled_error = 0.0f;
+            if (simplify) {
+                try {
+                    auto result = SimplifyWithinError(
+                        r.mesh_vertices, r.mesh_indices, r.mesh_triangle_limit, 0.001f);
+                    sampled_error = result.sampled_error;
+                    reduced = std::move(result.mesh);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("Collision shape " + std::to_string(r.id) +
+                        " (" + shape_name + "): " + error.what());
+                }
+            }
+            const uint32_t geom_index = AppendConvexGeometry(blob.convex_geometry,
+                simplify ? reduced.vertices : r.mesh_vertices,
+                simplify ? reduced.indices : r.mesh_indices, 0.0f,
                 r.type == ShapeType::ConvexHull, surface_options);
+            if (shape_collides && r.type == ShapeType::TriMesh) {
+                CookedMeshReport report;
+                report.shape_id = r.id;
+                report.body_id = r.body_id;
+                report.name = shape_name;
+                report.target_triangles = r.mesh_triangle_limit;
+                report.actual_triangles = simplify
+                    ? static_cast<uint32_t>(reduced.indices.size() / 3u)
+                    : static_cast<uint32_t>(r.mesh_indices.size() / 3u);
+                report.source_edges = source_edges;
+                report.nonmanifold_edges = nonmanifold_edges;
+                report.sampled_one_sided_hausdorff = sampled_error;
+                report.min_altitude = MinTriangleAltitude(
+                    simplify ? reduced.vertices : r.mesh_vertices,
+                    simplify ? reduced.indices : r.mesh_indices);
+                std::fprintf(stderr,
+                    "[MeshCook] shape=%s body=%u target=%u actual=%u sampled_error_mm=%.6g "
+                    "nonmanifold=%u/%u min_altitude_um=%.6g\n",
+                    report.name.c_str(), report.body_id, report.target_triangles,
+                    report.actual_triangles,
+                    static_cast<double>(report.sampled_one_sided_hausdorff) * 1000.0,
+                    report.nonmanifold_edges, report.source_edges,
+                    static_cast<double>(report.min_altitude) * 1.0e6);
+                if (r.mesh_triangle_limit > 0u &&
+                    report.sampled_one_sided_hausdorff > 0.001f)
+                    throw std::runtime_error("Collision shape " + std::to_string(r.id) +
+                        " (" + shape_name + ") sampled one-sided Hausdorff error exceeds 1 mm");
+                blob.mesh_reports.push_back(std::move(report));
+            }
             PushShapeRow(blob.shapes, blob.contact_params, r, r.type,
                          geom_index, resolved_friction);
             continue;

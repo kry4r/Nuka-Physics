@@ -54,10 +54,15 @@ struct ModelCapacities {
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
     uint32_t joint_friction_rows_per_env = 0; // one scalar slot per link when friction is authored
     uint32_t joint_drive_rows_per_env = 0;
+    uint32_t mimic_rows_per_env = 0;
     bool inverse_dynamics_controls = false;
     uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
     uint32_t max_mesh_triangles   = 0;
     uint32_t max_mesh_bvh_nodes   = 0;
+    uint32_t max_mesh_edges       = 0;
+    uint32_t max_mesh_edge_nodes  = 0;
+    uint32_t mesh_vertex_source_count = 0u;
+    uint32_t mesh_edge_source_count = 0u;
     uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
     uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
     uint32_t vol_cons_per_env     = 0;  // XPBD volume-constraint count / env.
@@ -71,6 +76,8 @@ struct ModelCapacities {
     uint32_t particle_surfaces_per_env = 0u;
     uint32_t particle_surface_triangles = 0u;
     uint32_t particle_surface_nodes_per_env = 0u;
+    uint32_t particle_surface_edges_per_env = 0u;
+    uint32_t particle_surface_edge_nodes_per_env = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
     // Graph-coloring color counts per XPBD family (single-env template; a color
@@ -131,6 +138,7 @@ struct ModelCapacities {
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
     uint32_t mpm_grid_nodes_per_env = 0;
     uint32_t mpm_contact_capacity_per_env = 0;  // Shared pool; multiple contacts may use one material point.
+    uint32_t ogc_contacts_per_env = 0u;
     // Implicit stress cells, one row block per occupied grid cell, at the tail of each env's row span.
     uint32_t mpm_stress_cells_per_env = 0;
     // Byte size of the mpm_sort_scratch field (the P2G deterministic-gather cub
@@ -181,6 +189,9 @@ struct ModelArticulation {
     std::vector<float>            joint_limit_lower;
     std::vector<float>            joint_limit_upper;
     std::vector<uint8_t>          joint_limit_flags;     // bit0 lower, bit1 upper
+    std::vector<uint32_t>         mimic_source_link;
+    std::vector<float>            mimic_multiplier;
+    std::vector<float>            mimic_offset;
     std::vector<float>            initial_q;             // per LINK (scalar slot per link)
     std::vector<math::Transform>  initial_link_pose;     // cook rest pose per link
     // M4 (union family): the SETTLED initial velocity state (the legacy
@@ -256,6 +267,7 @@ struct ModelShape {
     float            half_height = 0.5f;
     uint32_t         convex_geometry_index = ~uint32_t(0);
     uint32_t         sdf_index = ~uint32_t(0);
+    uint8_t          mesh_contact_mode = 0u;
 };
 
 // Compatibility aliases for hand-built models. Production contact reads the
@@ -378,6 +390,11 @@ public:
         std::vector<collision::MeshSurfaceInfo> surface_info;
         std::vector<uint32_t> surface_triangles;
         std::vector<collision::MeshBvhNode> surface_tree;
+        std::vector<collision::MeshEdgeInfo> surface_edge_info;
+        std::vector<collision::MeshEdge> surface_edges;
+        std::vector<collision::MeshBvhNode> surface_edge_tree;
+        std::vector<uint32_t> surface_triangle_edges;
+        std::vector<uint32_t> surface_triangle_vertex_owner;
         std::vector<float> surface_thickness;
         std::vector<float> surface_friction;
         // MLS-MPM per-particle init (single-env template; replicated env-major).
@@ -504,6 +521,13 @@ public:
     std::vector<collision::MeshSurfaceInfo> mesh_surface_info;
     std::vector<uint32_t> mesh_triangles;
     std::vector<collision::MeshBvhNode> mesh_bvh_nodes;
+    std::vector<collision::MeshEdgeInfo> mesh_edge_info;
+    std::vector<collision::MeshEdge> mesh_edges;
+    std::vector<collision::MeshBvhNode> mesh_edge_nodes;
+    std::vector<uint64_t> mesh_vertex_sources;
+    std::vector<uint64_t> mesh_edge_sources;
+    std::vector<uint32_t> mesh_triangle_edges;
+    std::vector<uint32_t> mesh_triangle_vertex_owner;
     // The ONE general path's contact-compliance defaults (solref/solimp). The
     // PairDriven row emitter (EmitPairDrivenRows) feeds these to ComputeCompliantRow.
     // (L1-c renamed these from union_solref/union_solimp; the values are unchanged.)
@@ -579,6 +603,7 @@ public:
         uint32_t   hull_vert_offset = 0; // base vertex index into hull_verts/3.
         uint32_t   hull_vert_count  = 0; // vertex count (0 == not a hull row).
         uint32_t   contact_profile_index = 0; // ContactProfileV1 table row.
+        uint8_t    mesh_contact_mode = 0u;
     };
     std::vector<PairDrivenShape> shape_table_rows;
     std::vector<float>           samp_points;     // xyz packed.
@@ -646,6 +671,8 @@ public:
 
     // The packed device buffer (null until UploadTo). Exposed for World teardown.
     phi::Buffer* DeviceBuffer() const { return device_buffer_; }
+    phi::Status DownloadFieldStatus(FieldId id, void* destination, uint64_t bytes,
+                                    uint64_t byte_offset = 0u) const;
 
     ~Model();
     Model(const Model&) = delete;
