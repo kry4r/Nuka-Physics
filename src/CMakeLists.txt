@@ -42,6 +42,7 @@ target_include_directories(nuka_math
 add_library(nuka_cooker STATIC
     import/cooker/convex_decomposition.cpp
     import/cooker/mesh_surface_cooker.cpp
+    import/cooker/mesh_simplifier.cpp
     import/cooker/mesh_surface_cache.cpp
     import/cooker/mesh_query_backend.cpp
     import/cooker/convex_cover.cpp
@@ -748,11 +749,14 @@ if(CMAKE_CUDA_COMPILER)
         # the particle side of the unified row solve.
         phi/backend_cuda/ops/particles.cu
         phi/backend_cuda/ops/vertex_blocks.cu
+        phi/backend_cuda/ops/ogc_detect.cu
+        phi/backend_cuda/ops/dat_truncate.cu
         # MLS-MPM transfer ops (P2G deterministic gather + G2P + grid clear) — the
         # inert round-trip scaffold; reachable through RegisterNkMpmOps, not yet in
         # Pipeline::Build's op list.
         phi/backend_cuda/ops/mpm.cu
         phi/backend_cuda/ops/readout.cu
+        phi/backend_cuda/ops/energy_ledger.cu
         phi/backend_cuda/ops/sensors.cu
         # M9 T7: NkOp::StepBackward — the diffsim contact-free single-step reverse
         # adjoint, kernel moved VERBATIM from the deleted diffsim/step_backward.cu

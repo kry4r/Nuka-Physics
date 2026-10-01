@@ -162,6 +162,7 @@ typedef struct nuka_world_desc_t {
     uint32_t solver_max_pairs;             // 0 => bodies_per_env * 4 broadphase emit cap.
     float    solver_baumgarte_max_velocity;// 0.0 => cooked model default.
     uint32_t cloth_integrator;              // 0 = BDF2, 1 = backward Euler.
+    uint32_t ogc_contact_capacity;          // Per-environment contact slots; 0 uses the cook estimate.
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -285,6 +286,10 @@ nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execut
 // Contact exchanges per interval, 0..65535; zero follows material iterations.
 // Material budgets and timestep stay fixed; a changed value invalidates the execution graph.
 nuka_result_t nuka_world_set_coupling_passes(nuka_world_handle world, uint32_t passes);
+// Velocity sweeps of the contact solve per pass, 1..65535; the timestep and coupling passes stay fixed.
+// A changed value invalidates the execution graph.
+nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32_t iterations);
+nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations);
 // Initialize struct_size and schema_version before querying execution information.
 nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out);
 // Wait for submitted physics work and report asynchronous device errors.
@@ -616,8 +621,100 @@ typedef enum nuka_state_field_t {
     // Order: normal/tangent velocity, normal velocity/impulse violation, complementarity, cone, work, dissipation.
     NUKA_FIELD_CONTACT_SOLVE_METRICS = 61,
     // Two uint32 counts per environment: evaluated contact blocks, invalid blocks; latest solve only.
-    NUKA_FIELD_CONTACT_SOLVE_COUNTS = 62
+    NUKA_FIELD_CONTACT_SOLVE_COUNTS = 62,
+    // WRITE: per-particle inverse mass. Zero selects a driven kinematic particle.
+    NUKA_FIELD_PARTICLE_INV_MASS = 63,
+    // WRITE: next position of each zero-inverse-mass particle, in world coordinates.
+    NUKA_FIELD_PARTICLE_KINEMATIC_TARGET = 64,
+    NUKA_FIELD_OGC_CONTACT_COUNT = 65,
+    // READ: per-environment particle, joint, and free-body truncations in the latest step.
+    NUKA_FIELD_DAT_TRUNCATION_COUNT = 66,
+    // READ: per-environment physical kinetic-energy loss from DAT; negative means energy gain.
+    NUKA_FIELD_DAT_TRUNCATION_ENERGY = 67,
+    // READ: per-environment invalid primitives or inseparable pairs in the latest step.
+    NUKA_FIELD_DAT_FAILURE_COUNT = 68,
+    // READ: per-environment 0 or 1, whether the latest step exceeded the 20 mm query limit.
+    NUKA_FIELD_DAT_QUERY_LIMIT_COUNT = 69,
+    // READ: per environment, current contact points and accepted warm starts.
+    NUKA_FIELD_CONTACT_WARM_START_COUNTS = 70,
+    NUKA_FIELD_DAT_PARTICLE_TRUNCATION_COUNT = 71,
+    NUKA_FIELD_DAT_PARTICLE_TRUNCATION_ENERGY = 72,
+    NUKA_FIELD_DAT_JOINT_TRUNCATION_COUNT = 73,
+    NUKA_FIELD_DAT_JOINT_TRUNCATION_ENERGY = 74,
+    NUKA_FIELD_DAT_BODY_TRUNCATION_COUNT = 75,
+    NUKA_FIELD_DAT_BODY_TRUNCATION_ENERGY = 76,
+    NUKA_FIELD_MESH_OGC_PAIR_COUNT = 77,
+    NUKA_FIELD_MESH_SDF_PAIR_COUNT = 78,
+    // READ: executed velocity sweeps in the colored VBD solve for the latest step.
+    NUKA_FIELD_VBD_VELOCITY_SWEEP_COUNT = 79,
+    // READ: per-environment vertex and dynamic contact-row color counts.
+    NUKA_FIELD_SOLVER_COLOR_COUNTS = 80,
+    // READ: actual per-particle DAT fraction; valid after a completed DAT step until reset.
+    NUKA_FIELD_DAT_PARTICLE_MOTION_FRACTION = 81,
+    // READ: [Newton correction m/s, stationarity force N], float bits high32 / ~particle low32.
+    // Valid after a completed solve with contact diagnostics enabled, until reset.
+    NUKA_FIELD_VBD_SOLVE_METRICS = 82,
+    // Interval records are env-major, with one record per physical substep; demand before stepping.
+    // Valid is cleared on reset; nonzero coverage status prevents energy acceptance.
+    NUKA_FIELD_ENERGY_LEDGER = 83,
+    NUKA_FIELD_ENERGY_LEDGER_STATUS = 84,
+    // Signed virtual work of the vertex force residual against its candidate displacement, in J.
+    // Same interval extent, demand and validity as ENERGY_LEDGER; does not alter its balance.
+    NUKA_FIELD_VBD_FORCE_RESIDUAL_WORK = 85,
+    // READ: env/substep/stage/column; five stages and 39 columns, reset invalidates energy VALID.
+    NUKA_FIELD_PHYSICS_STAGE_METRICS = 86,
+    // READ: env/substep/eight counts; valid when the corresponding energy VALID equals one.
+    NUKA_FIELD_CONTACT_AUDIT_COUNTS = 87,
+    // READ: seven maxima packed as float bits in high32 and complemented global row ID in low32.
+    NUKA_FIELD_CONTACT_AUDIT_METRICS = 88,
+    // READ: env-major VBD vertices, actual effective dt in seconds for the last physical substep.
+    // Energy VALID controls validity; use the recorded dt to distinguish mixed BE/BDF2 restarts.
+    NUKA_FIELD_VBD_EFFECTIVE_DT = 89,
+    // READ: shared cooked VBD elements as nuka_vbd_element_t, carried by sixteen uint32 words.
+    NUKA_FIELD_VBD_ELEMENTS = 90,
+    // READ: env/389 uint64 from the last DAT pass: radius/motion/degenerate/overlap totals, unrecorded, then
+    // (reason<<60|owner<<30|owner, count, max overlap f32 bits); owner = kind(body,link,surface,static)<<28|index.
+    NUKA_FIELD_DAT_FAILURE_WITNESS = 91
 } nuka_state_field_t;
+
+typedef enum nuka_vbd_element_kind_t {
+    NUKA_VBD_TRIANGLE = 0, NUKA_VBD_HINGE = 1, NUKA_VBD_SPRING = 2, NUKA_VBD_ROD_BEND = 3
+} nuka_vbd_element_kind_t;
+
+typedef struct nuka_vbd_element_t {
+    uint32_t kind;
+    uint32_t vertex[4];
+    float rest[8];
+    float damping;
+    uint32_t reserved[2];
+} nuka_vbd_element_t;
+
+typedef enum nuka_energy_column_t {
+    NUKA_ENERGY_BEGIN_KINETIC = 0, NUKA_ENERGY_BEGIN_GRAVITY, NUKA_ENERGY_BEGIN_ELASTIC,
+    NUKA_ENERGY_FREE_KINETIC, NUKA_ENERGY_SOLVED_KINETIC,
+    NUKA_ENERGY_BEFORE_DAT_KINETIC, NUKA_ENERGY_BEFORE_DAT_GRAVITY, NUKA_ENERGY_BEFORE_DAT_ELASTIC,
+    NUKA_ENERGY_END_KINETIC, NUKA_ENERGY_END_GRAVITY, NUKA_ENERGY_END_ELASTIC,
+    NUKA_ENERGY_DRIVE_WORK, NUKA_ENERGY_AERO_WORK, NUKA_ENERGY_EXTERNAL_WORK,
+    NUKA_ENERGY_KINEMATIC_ELASTIC_WORK, NUKA_ENERGY_KINEMATIC_CONTACT_WORK,
+    NUKA_ENERGY_FRICTION_LOSS, NUKA_ENERGY_NORMAL_LOSS, NUKA_ENERGY_LIMIT_LOSS,
+    NUKA_ENERGY_MIMIC_LOSS, NUKA_ENERGY_PASSIVE_LOSS, NUKA_ENERGY_RAYLEIGH_LOSS,
+    NUKA_ENERGY_POSITION_POTENTIAL, NUKA_ENERGY_DAT_KINETIC_LOSS, NUKA_ENERGY_DAT_POTENTIAL,
+    NUKA_ENERGY_RESIDUAL, NUKA_ENERGY_THROUGHPUT, NUKA_ENERGY_DT,
+    NUKA_ENERGY_ROW_RATE_WORK, NUKA_ENERGY_ROW_PHYSICAL_IMPULSE_WORK,
+    NUKA_ENERGY_UNCLASSIFIED_ROW_WORK, NUKA_ENERGY_VALID, NUKA_ENERGY_COLUMN_COUNT
+} nuka_energy_column_t;
+
+typedef enum nuka_energy_status_t {
+    NUKA_ENERGY_STATUS_NONFINITE = 1u << 0,
+    NUKA_ENERGY_STATUS_UNCLASSIFIED_ROWS = 1u << 1,
+    NUKA_ENERGY_STATUS_OTHER_PARTICLE_MATERIAL = 1u << 2,
+    NUKA_ENERGY_STATUS_GRID_MATERIAL = 1u << 3,
+    NUKA_ENERGY_STATUS_EXTERNAL_BODY_LOAD = 1u << 4,
+    NUKA_ENERGY_STATUS_FLOATING_POSITION_WORK = 1u << 5,
+    NUKA_ENERGY_STATUS_RIGID_ANGULAR_POSITION_WORK = 1u << 6,
+    NUKA_ENERGY_STATUS_ARMATURE_ENERGY = 1u << 7,
+    NUKA_ENERGY_STATUS_PHYSICS_FAILURE = 1u << 8
+} nuka_energy_status_t;
 
 typedef enum nuka_env_status_t {
     NUKA_ENV_STATUS_VALID = 0,
@@ -635,7 +732,11 @@ typedef enum nuka_env_status_t {
     NUKA_ENV_STATUS_CONSTITUTIVE_FAILURE = 1u << 8,
     NUKA_ENV_STATUS_GRID_CONTACT_OVERFLOW = 1u << 9,
     NUKA_ENV_STATUS_CONTROL_FAILURE = 1u << 10,
-    NUKA_ENV_STATUS_SENSOR_QUEUE_OVERFLOW = 1u << 11
+    NUKA_ENV_STATUS_SENSOR_QUEUE_OVERFLOW = 1u << 11,
+    // Invalid or initially intersecting DAT geometry; latched until reset.
+    NUKA_ENV_STATUS_DAT_FAILURE = 1u << 12,
+    // Invalid or nonfinite block response; latched until reset.
+    NUKA_ENV_STATUS_SOLVER_FAILURE = 1u << 13
 } nuka_env_status_t;
 
 typedef enum nuka_gyro_status_t {

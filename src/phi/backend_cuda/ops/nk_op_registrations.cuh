@@ -28,8 +28,11 @@ void RegisterNkBuildSolveIslandsOps(); // build_islands.cu (dynamic CC schedule)
 void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
 void RegisterNkParticleOps();         // particles.cu (M6)
 void RegisterNkVertexBlockOps();      // vertex_blocks.cu
+void RegisterNkOgcDetectOps();
+void RegisterNkDatTruncateOps();
 void RegisterNkMpmOps();              // mpm.cu (MLS-MPM transfers)
 void RegisterNkReadoutOps();          // readout.cu
+void RegisterNkEnergyLedgerOps();
 void RegisterNkSensorOps();
 void RegisterNkDiffsimBackwardOps();  // diffsim_backward.cu (M9 T7)
 

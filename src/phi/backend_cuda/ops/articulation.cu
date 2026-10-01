@@ -744,9 +744,16 @@ __global__ void ApplyAffineDriveKernel(ArticulationDeviceState state,
         case ArticulationControlMode::Osc:
             break;
     }
-    if (!implicit) {
-        bias -= damping * velocity;
+    // The force limit bounds the whole effort; as in MuJoCo, a drive clamped at the step
+    // start applies its clamped effort without the implicit damping derivative.
+    const float effort = bias - damping * velocity;
+    if (!implicit || effort < lower || effort > upper) {
+        bias = effort;
         damping = 0.0f;
+    } else {
+        // The row clamps the command bias = effort + damping * velocity.
+        lower += damping * velocity;
+        upper += damping * velocity;
     }
     const float feedforward = drive.feedforward[link];
     if (!isfinite(bias) || !isfinite(damping) || damping < 0.0f ||
@@ -775,7 +782,8 @@ __global__ void ReadoutDrivesKernel(ArticulationDeviceState state,
     const float effort = drive.command[link] - drive.dissipation[link] * state.qdot[link];
     requested[link] = effort;
     applied[link] = lambda[row] / params.dt - drive.dissipation[link] * state.qdot[link];
-    saturated[link] = effort < drive.lower[link] || effort > drive.upper[link] ? 1.0f : 0.0f;
+    saturated[link] = drive.command[link] < drive.lower[link] ||
+        drive.command[link] > drive.upper[link] ? 1.0f : 0.0f;
     state.tau[link] += applied[link];
 }
 
@@ -1545,8 +1553,11 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkSolveRowsOps();
     RegisterNkParticleOps();
     RegisterNkVertexBlockOps();
+    RegisterNkOgcDetectOps();
+    RegisterNkDatTruncateOps();
     RegisterNkMpmOps();              // MLS-MPM transfers (inert round-trip scaffold)
     RegisterNkReadoutOps();
+    RegisterNkEnergyLedgerOps();
     RegisterNkSensorOps();
     RegisterNkDiffsimBackwardOps();  // M9 T7: NkOp::StepBackward
 }

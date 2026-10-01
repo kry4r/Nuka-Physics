@@ -32,6 +32,8 @@
 #include "collision/mesh_surface_types.hpp"
 #include "sensor/observation_types.hpp"
 #include "sensor/state_types.hpp"
+#include "nk/readout/energy_ledger.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 
 namespace nuka::phi {
 
@@ -71,6 +73,8 @@ inline constexpr uint32_t kEnvStatusConstitutiveFailure = 1u << 8;
 inline constexpr uint32_t kEnvStatusGridContactOverflow = 1u << 9;
 inline constexpr uint32_t kEnvStatusControlFailure = 1u << 10;
 inline constexpr uint32_t kEnvStatusSensorQueueOverflow = 1u << 11;
+inline constexpr uint32_t kEnvStatusDatFailure = 1u << 12;
+inline constexpr uint32_t kEnvStatusSolverFailure = 1u << 13;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
 inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
@@ -198,6 +202,11 @@ enum class NkOp : uint16_t {
     ReadoutContactRegion,
     ClothPredict,           // Vertex-block inertial target, initial guess and frozen row response.
     ClothFinalize,          // Vertex-block velocity from the committed displacement; history advance.
+    OgcDetect,
+    DatTruncate,
+    DatSnapshot,
+    ReadoutEnergyLedger,
+    ReadoutContactAudit,
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -442,6 +451,65 @@ struct ParticleSurfacesParams {
     uint32_t surfaces_per_env;
     uint32_t triangles_per_env;
     uint32_t nodes_per_env;
+    uint32_t edge_nodes_per_env;
+    uint32_t position_source = 0u;
+};
+
+struct OgcDetectParams {
+    float dt = 0.0f;
+    float margin = 0.0f;
+    uint32_t env_count = 0u;
+    uint32_t particles_per_env = 0u;
+    uint32_t surfaces_per_env = 0u;
+    uint32_t triangles_per_env = 0u;
+    uint32_t nodes_per_env = 0u;
+    uint32_t edges_per_env = 0u;
+    uint32_t edge_nodes_per_env = 0u;
+    uint32_t bodies_per_env = 0u;
+    uint32_t links_per_env = 0u;
+    uint32_t mesh_vertex_sources = 0u;
+    uint32_t mesh_edge_sources = 0u;
+    uint32_t mesh_vertices = 0u;
+    uint32_t mesh_triangles = 0u;
+    uint32_t mesh_nodes = 0u;
+    uint32_t mesh_edges = 0u;
+    uint32_t mesh_edge_nodes = 0u;
+    uint32_t excluded_pairs = 0u;
+    uint32_t slot_stride = 0u;
+    uint32_t slot_base = 0u;
+    uint32_t slot_capacity = 0u;
+    uint32_t point_endpoints_per_env = 0u;
+    uint32_t point_endpoint_terms_per_env = 0u;
+};
+
+struct DatTruncateParams {
+    float dt = 0.0f;
+    float relaxation = 0.9f;
+    float margin = 0.0f;
+    uint32_t env_count = 0u;
+    uint32_t particles_per_env = 0u;
+    uint32_t vbd_particle_begin = 0u;
+    uint32_t vbd_vertices_per_env = 0u;
+    uint32_t surfaces_per_env = 0u;
+    uint32_t triangles_per_env = 0u;
+    uint32_t nodes_per_env = 0u;
+    uint32_t edges_per_env = 0u;
+    uint32_t edge_nodes_per_env = 0u;
+    uint32_t bodies_per_env = 0u;
+    uint32_t links_per_env = 0u;
+    uint32_t articulations_per_env = 0u;
+    uint32_t max_dof = 0u;
+    uint32_t mesh_vertices = 0u;
+    uint32_t mesh_triangles = 0u;
+    uint32_t mesh_nodes = 0u;
+    uint32_t mesh_edges = 0u;
+    uint32_t mesh_edge_nodes = 0u;
+    uint32_t mesh_vertex_sources = 0u;
+    uint32_t mesh_edge_sources = 0u;
+    uint32_t excluded_pairs = 0u;
+    uint32_t slot_stride = 0u;
+    uint32_t slot_base = 0u;
+    uint32_t slot_capacity = 0u;
 };
 
 struct MpmParams {
@@ -625,6 +693,8 @@ struct NarrowphaseBodyParticleParams {
     // [0, particle_row_base) couples via the grid, NOT rows; it owns no reserved
     // slots (the cook exempts it from the budget). 0 for every other mode.
     uint32_t particle_row_base;
+    uint32_t excluded_particle_begin;
+    uint32_t excluded_particle_count;
     // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
     // cooperatively); 0 == one thread per particle (analytic-only collider worlds,
     // no wide hull to split). BOTH paths are byte-identical; set by the cook-time max
@@ -699,10 +769,12 @@ struct AssembleRowsParams {
     uint32_t joint_limit_rows_per_env;
     uint32_t joint_friction_rows_per_env;
     uint32_t joint_drive_rows_per_env;
+    uint32_t mimic_rows_per_env;
     // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
     // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
     // Equal to union_slot_count when the model has no body-particle reserve.
     uint32_t full_row_slot_count;
+    uint32_t ogc_slot_count = 0u;
     uint32_t bodies_per_env;
     uint32_t base_link_count;   // links per env (replica stride)
     float    solref[2];         // merged contact solref (union family)
@@ -838,6 +910,7 @@ struct ClothStepParams {
     float gravity[3];
     VertexBlockLayout layout;
     uint32_t integrator;
+    uint32_t truncation;  // nonzero when displacement truncation precedes the finalize
 };
 
 // Non-MPM particles share one projected position buffer and one step-start position.
@@ -951,6 +1024,39 @@ struct ReadoutContactWrenchParams {
     uint64_t workspace_bytes;
 };
 
+struct ReadoutEnergyLedgerParams {
+    nk::EnergyStage stage = nk::EnergyStage::Begin;
+    float dt = 0.0f;
+    float gravity[3]{};
+    uint32_t env_count = 0u;
+    uint32_t substeps = 1u;
+    uint32_t slot = 0u;
+    uint32_t particles_per_env = 0u;
+    uint32_t vbd_begin = 0u;
+    uint32_t vbd_vertices = 0u;
+    uint32_t vbd_elements = 0u;
+    uint32_t bodies_per_env = 0u;
+    uint32_t links_per_env = 0u;
+    uint32_t artics_per_env = 0u;
+    uint32_t dofs_per_artic = 0u;
+    uint32_t rows_per_env = 0u;
+    uint32_t contact_rows = 0u;
+    uint32_t limit_rows = 0u;
+    uint32_t friction_rows = 0u;
+    uint32_t drive_rows = 0u;
+    uint32_t mimic_rows = 0u;
+    uint32_t has_aero = 0u;
+    uint32_t has_dat = 0u;
+    uint32_t pos_pass = 0u;
+    uint32_t coverage_status = 0u;
+    uint32_t physics_diagnostics = 0u;
+    uint32_t cloth_integrator = 0u;
+    uint32_t contact_slots_per_env = 0u;
+    uint32_t rigid_contact_slots = 0u;
+    uint32_t ogc_contact_slots = 0u;
+    float pos_slop = 0.0f;
+};
+
 struct ExportObsParams {
     uint32_t env_count;
     uint32_t base_link_count;
@@ -1052,6 +1158,7 @@ struct ResetObservationParams {
 
 // Restore selected environments and invalidate their contact state.
 struct ResetEnvsParams {
+    uint32_t energy_substeps = 1u;
     uint32_t count;
     uint32_t env_count;
     uint32_t base_link_count;       // links per env
@@ -1084,6 +1191,7 @@ struct SnapshotStateParams {
 
 // Restore all environments with the same state lifecycle as a masked reset.
 struct RestoreStateParams {
+    uint32_t energy_substeps = 1u;
     uint32_t total_link_count;
     uint32_t env_count;
     uint32_t articulation_count;

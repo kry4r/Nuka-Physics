@@ -321,6 +321,6 @@ nuka_result_t FinishWorldCreate(
     nuka_world_handle* out,
     uint32_t solver_vel_iters = 0u, uint32_t solver_pos_iters = 0u,
     float solver_contact_margin = 0.0f, uint32_t solver_max_pairs = 0u,
-    uint32_t cloth_integrator = 0u);
+    uint32_t cloth_integrator = 0u, uint32_t ogc_contact_capacity = 0u);
 
 } // namespace nuka::c_abi

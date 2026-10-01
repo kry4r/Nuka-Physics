@@ -31,6 +31,7 @@
 #include "nk/material/hencky_j2.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -239,6 +240,7 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
         contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env) +
         static_cast<uint64_t>(cap.joint_friction_rows_per_env) +
         static_cast<uint64_t>(cap.joint_drive_rows_per_env) +
+        static_cast<uint64_t>(cap.mimic_rows_per_env) +
         static_cast<uint64_t>(cap.mpm_stress_cells_per_env) * nk::kMpmStressRowsPerCell +
         static_cast<uint64_t>(cap.dist_cons_per_env) + cap.vol_cons_per_env;
     if (total_rows > 0xFFFFFFFFull) {
@@ -266,7 +268,8 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
     if (row_exempt > cap.particles_per_env)
         throw std::runtime_error("CookToModel: grid particle slice exceeds its environment");
     const uint64_t reserve = cap.ParticleContactReserve(row_exempt);
-    const uint64_t compact = reserve + cap.mpm_contact_capacity_per_env;
+    const uint64_t compact = reserve + cap.ogc_contacts_per_env +
+                             cap.mpm_contact_capacity_per_env;
     const uint64_t total = static_cast<uint64_t>(rigid_base) + compact;
     const uint64_t rows =
         static_cast<uint64_t>(rigid_base) * nk::kPairDrivenRowsPerSlot +
@@ -278,17 +281,31 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
     }
     cap.max_contacts_per_env = static_cast<uint32_t>(total);
     SetRowCapacity(cap, rows);
-    if (cap.mpm_grid_nodes_per_env > 0u) {
+    if (cap.mpm_grid_nodes_per_env > 0u || cap.ogc_contacts_per_env > 0u) {
         const uint32_t surfaces = cap.particle_surfaces_per_env > 0u ? cap.mpm_contact_capacity_per_env : 0u;
-        const uint64_t endpoints = nk::MpmPointEndpointCount(
-            cap.particles_per_env, surfaces, cap.mpm_stress_cells_per_env);
-        const uint64_t terms = nk::MpmPointEndpointTermCount(
-            cap.particles_per_env, surfaces, cap.mpm_stress_cells_per_env);
+        const bool grid = cap.mpm_grid_nodes_per_env > 0u;
+        const uint64_t endpoints = uint64_t{cap.ogc_contacts_per_env} * 2u +
+            (grid ? nk::MpmPointEndpointCount(cap.particles_per_env, surfaces,
+                                              cap.mpm_stress_cells_per_env) : 0u);
+        const uint64_t terms = uint64_t{cap.ogc_contacts_per_env} * 6u +
+            (grid ? nk::MpmPointEndpointTermCount(cap.particles_per_env, surfaces,
+                                                  cap.mpm_stress_cells_per_env) : 0u);
         if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("material contact endpoint capacity exceeds device indexing");
         cap.point_endpoints_per_env = static_cast<uint32_t>(endpoints);
         cap.point_endpoint_terms_per_env = static_cast<uint32_t>(terms);
     }
+}
+
+void SetOgcContactCapacity(nk::Model& model, uint32_t capacity) {
+    auto& cap = model.capacities;
+    const uint64_t compact = cap.ParticleContactReserve(model.MpmParticlesPerEnv()) +
+                             uint64_t{cap.ogc_contacts_per_env} + cap.mpm_contact_capacity_per_env;
+    if (compact > cap.max_contacts_per_env)
+        throw std::invalid_argument("contact capacity does not contain the material reserve");
+    const uint32_t rigid = cap.max_contacts_per_env - static_cast<uint32_t>(compact);
+    cap.ogc_contacts_per_env = capacity;
+    GrowContactBudgetForParticles(cap, rigid, model.MpmParticlesPerEnv());
 }
 
 namespace {
@@ -324,6 +341,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     cap.bodies_per_env = blob.body_count;
     struct MeshBinding {
         collision::MeshSurfaceInfo info{};
+        collision::MeshEdgeInfo edge_info{};
         uint32_t sample_offset = 0u;
         uint32_t sample_count = 0u;
         float radius = 0.0f;
@@ -332,6 +350,52 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     std::vector<MeshBinding> mesh_bindings(blob.convex_geometry.Count());
     const auto bind_mesh = [&](const nk::ModelShape& shape,
                                nk::Model::PairDrivenShape& row, uint32_t body) {
+        if (shape.kind == static_cast<uint8_t>(ShapeType::Box)) {
+            const auto h = shape.half_extents;
+            if (!(h.x > 0.0f && h.y > 0.0f && h.z > 0.0f))
+                throw std::invalid_argument("box mesh requires positive half extents");
+            const std::array<float, 24> vertices = {
+                -h.x, -h.y, -h.z,  h.x, -h.y, -h.z,
+                 h.x,  h.y, -h.z, -h.x,  h.y, -h.z,
+                -h.x, -h.y,  h.z,  h.x, -h.y,  h.z,
+                 h.x,  h.y,  h.z, -h.x,  h.y,  h.z};
+            const std::array<uint32_t, 36> triangles = {
+                0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+                0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5,
+                2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7};
+            auto surface = import::cooker::CookMeshSurface(
+                vertices.data(), 8u, triangles.data(), 12u);
+            auto edges = import::cooker::CookMeshEdges(
+                vertices.data(), 8u, triangles.data(), 12u, false);
+            surface.info.vertex_offset = static_cast<uint32_t>(model.hull_verts.size() / 3u);
+            surface.info.triangle_offset = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
+            surface.info.node_offset = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+            edges.info.vertex_offset = surface.info.vertex_offset;
+            edges.info.edge_offset = static_cast<uint32_t>(model.mesh_edges.size());
+            edges.info.node_offset = static_cast<uint32_t>(model.mesh_edge_nodes.size());
+            model.hull_verts.insert(model.hull_verts.end(), vertices.begin(), vertices.end());
+            model.mesh_triangles.insert(model.mesh_triangles.end(),
+                triangles.begin(), triangles.end());
+            model.mesh_bvh_nodes.insert(model.mesh_bvh_nodes.end(),
+                surface.nodes.begin(), surface.nodes.end());
+            model.mesh_edges.insert(model.mesh_edges.end(), edges.edges.begin(), edges.edges.end());
+            model.mesh_edge_nodes.insert(model.mesh_edge_nodes.end(),
+                edges.nodes.begin(), edges.nodes.end());
+            model.mesh_triangle_edges.insert(model.mesh_triangle_edges.end(),
+                edges.triangle_edges.begin(), edges.triangle_edges.end());
+            model.mesh_triangle_vertex_owner.insert(model.mesh_triangle_vertex_owner.end(),
+                edges.triangle_vertex_owner.begin(), edges.triangle_vertex_owner.end());
+            if (model.mesh_surface_info.size() <= body) model.mesh_surface_info.resize(body + 1u);
+            if (model.mesh_edge_info.size() <= body) model.mesh_edge_info.resize(body + 1u);
+            model.mesh_surface_info[body] = surface.info;
+            model.mesh_edge_info[body] = edges.info;
+            cap.max_hull_verts = static_cast<uint32_t>(model.hull_verts.size() / 3u);
+            cap.max_mesh_triangles = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
+            cap.max_mesh_bvh_nodes = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+            cap.max_mesh_edges = static_cast<uint32_t>(model.mesh_edges.size());
+            cap.max_mesh_edge_nodes = static_cast<uint32_t>(model.mesh_edge_nodes.size());
+            return;
+        }
         const uint32_t piece = shape.convex_geometry_index;
         const auto& geometry = blob.convex_geometry;
         if (piece >= geometry.Count()) return;
@@ -361,13 +425,39 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             model.mesh_bvh_nodes.insert(model.mesh_bvh_nodes.end(),
                 geometry.surface_nodes.begin() + source.node_offset,
                 geometry.surface_nodes.begin() + source.node_offset + source.node_count);
+            if (piece >= geometry.edge_info.size())
+                throw std::runtime_error("CookToModel: collision mesh has no edge topology");
+            const auto& source_edges = geometry.edge_info[piece];
+            collision::MeshEdgeInfo edge_binding = source_edges;
+            edge_binding.vertex_offset = binding.info.vertex_offset;
+            edge_binding.edge_offset = static_cast<uint32_t>(model.mesh_edges.size());
+            edge_binding.node_offset = static_cast<uint32_t>(model.mesh_edge_nodes.size());
+            model.mesh_edges.insert(model.mesh_edges.end(),
+                geometry.edges.begin() + source_edges.edge_offset,
+                geometry.edges.begin() + source_edges.edge_offset + source_edges.edge_count);
+            model.mesh_edge_nodes.insert(model.mesh_edge_nodes.end(),
+                geometry.edge_nodes.begin() + source_edges.node_offset,
+                geometry.edge_nodes.begin() + source_edges.node_offset + source_edges.node_count);
+            const size_t first_edge_ref = static_cast<size_t>(source.triangle_offset) * 3u;
+            model.mesh_triangle_edges.insert(model.mesh_triangle_edges.end(),
+                geometry.triangle_edges.begin() + first_edge_ref,
+                geometry.triangle_edges.begin() + first_edge_ref + static_cast<size_t>(source.triangle_count) * 3u);
+            model.mesh_triangle_vertex_owner.insert(model.mesh_triangle_vertex_owner.end(),
+                geometry.triangle_vertex_owner.begin() + first_edge_ref,
+                geometry.triangle_vertex_owner.begin() + first_edge_ref +
+                    static_cast<size_t>(source.triangle_count) * 3u);
+            binding.edge_info = edge_binding;
             binding.sample_offset = static_cast<uint32_t>(model.samp_points.size() / 3u);
             binding.sample_count = CookHullSamples(geometry, piece, model.samp_points);
             cap.max_mesh_triangles = static_cast<uint32_t>(model.mesh_triangles.size() / 3u);
             cap.max_mesh_bvh_nodes = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+            cap.max_mesh_edges = static_cast<uint32_t>(model.mesh_edges.size());
+            cap.max_mesh_edge_nodes = static_cast<uint32_t>(model.mesh_edge_nodes.size());
         }
         if (model.mesh_surface_info.size() <= body) model.mesh_surface_info.resize(body + 1u);
         model.mesh_surface_info[body] = binding.info;
+        if (model.mesh_edge_info.size() <= body) model.mesh_edge_info.resize(body + 1u);
+        model.mesh_edge_info[body] = binding.edge_info;
         if (model.samp_ranges.size() < static_cast<size_t>(body + 1u) * 2u)
             model.samp_ranges.resize(static_cast<size_t>(body + 1u) * 2u, 0u);
         model.samp_ranges[body * 2u] = binding.sample_offset;
@@ -428,6 +518,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         m.joint_limit_lower.assign(m.link_count, 0.0f);
         m.joint_limit_upper.assign(m.link_count, 0.0f);
         m.joint_limit_flags.assign(m.link_count, 0u);
+        std::vector<uint32_t> joint_link(blob.joint_count, ~0u);
         for (uint32_t link = 0; link < m.link_count; ++link) {
             const BodyId child = link < host.link_body.size()
                                      ? host.link_body[link] : kInvalidBody;
@@ -445,6 +536,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 if (joint < blob.joints.limit_flags.size()) {
                     m.joint_limit_flags[link] = blob.joints.limit_flags[joint];
                 }
+                joint_link[joint] = link;
                 break;
             }
         }
@@ -470,6 +562,43 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.joint_friction_rows_per_env =
             std::any_of(m.joint_frictionloss.begin(), m.joint_frictionloss.end(),
                         [](float friction) { return friction > 0.0f; })
+                ? m.link_count : 0u;
+        m.mimic_source_link.assign(m.link_count, ~0u);
+        m.mimic_multiplier.assign(m.link_count, 1.0f);
+        m.mimic_offset.assign(m.link_count, 0.0f);
+        for (uint32_t joint = 0u; joint < blob.joint_count; ++joint) {
+            const JointId source = joint < blob.joints.mimic_sources.size()
+                ? blob.joints.mimic_sources[joint] : kInvalidJoint;
+            if (source == kInvalidJoint) continue;
+            const uint32_t target_link = joint_link[joint];
+            const uint32_t source_link = source < joint_link.size() ? joint_link[source] : ~0u;
+            if (target_link >= m.link_count || source_link >= m.link_count ||
+                target_link == source_link ||
+                host.link_to_articulation[target_link] != host.link_to_articulation[source_link] ||
+                (blob.joints.types[joint] != JointType::Revolute &&
+                 blob.joints.types[joint] != JointType::Prismatic) ||
+                (blob.joints.types[source] != JointType::Revolute &&
+                 blob.joints.types[source] != JointType::Prismatic))
+                throw std::runtime_error("CookToModel: invalid mimic joint topology");
+            const float multiplier = blob.joints.mimic_multipliers[joint];
+            const float offset = blob.joints.mimic_offsets[joint];
+            if (!std::isfinite(multiplier) || !std::isfinite(offset))
+                throw std::runtime_error("CookToModel: nonfinite mimic joint coefficient");
+            m.mimic_source_link[target_link] = source_link;
+            m.mimic_multiplier[target_link] = multiplier;
+            m.mimic_offset[target_link] = offset;
+        }
+        for (uint32_t link = 0u; link < m.link_count; ++link) {
+            uint32_t source = m.mimic_source_link[link];
+            for (uint32_t hop = 0u; source < m.link_count; ++hop) {
+                if (source == link || hop >= m.link_count)
+                    throw std::runtime_error("CookToModel: cyclic mimic joint topology");
+                source = m.mimic_source_link[source];
+            }
+        }
+        cap.mimic_rows_per_env = std::any_of(
+            m.mimic_source_link.begin(), m.mimic_source_link.end(),
+            [count = m.link_count](uint32_t source) { return source < count; })
                 ? m.link_count : 0u;
         m.initial_q = host.q;                  // per LINK (scalar slot / link)
         m.initial_link_pose = host.link_pose;  // cook rest pose
@@ -747,6 +876,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         if (s < blob.shapes.half_heights.size())   sh.half_height = blob.shapes.half_heights[s];
         if (s < blob.shapes.convex_geometry_indices.size())
             sh.convex_geometry_index = blob.shapes.convex_geometry_indices[s];
+        if (s < blob.shapes.mesh_contact_modes.size())
+            sh.mesh_contact_mode = blob.shapes.mesh_contact_modes[s];
         sh.material_bucket = BucketFor(blob, s, model.material_buckets);
         model.shapes.push_back(sh);
 
@@ -962,6 +1093,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             const nk::ModelShape& sh = model.shapes[s];
             nk::Model::PairDrivenShape& row = model.shape_table_rows[sh.body_row];
             row.kind = sh.kind;
+            row.mesh_contact_mode = sh.mesh_contact_mode;
             // params: sphere r / capsule r,hh / box he.xyz, by kind.
             row.params[0] = sh.radius;
             row.params[1] = sh.half_height;
@@ -1160,6 +1292,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             // shape_table row for the proxy collidable (primitive from the cook).
             nk::Model::PairDrivenShape prow;
             prow.kind = sh.kind;
+            prow.mesh_contact_mode = sh.mesh_contact_mode;
             prow.params[0] = sh.radius;
             prow.params[1] = sh.half_height;
             prow.params[2] = sh.half_extents.z;
@@ -1241,6 +1374,40 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
             cap.max_contacts_per_env = 0u;
             SetRowCapacity(cap, 0u);
         }
+    }
+
+    for (uint32_t body = 0u; body < cap.bodies_per_env; ++body) {
+        if (body >= model.shape_table_rows.size() ||
+            model.shape_table_rows[body].contype == 0u ||
+            model.shape_table_rows[body].conaffinity == 0u) continue;
+        if (body < model.mesh_surface_info.size()) {
+            const auto& surface = model.mesh_surface_info[body];
+            for (uint32_t vertex = 0u; vertex < surface.vertex_count; ++vertex)
+                model.mesh_vertex_sources.push_back(
+                    (uint64_t{body} << 32u) | vertex);
+        }
+        if (body < model.mesh_edge_info.size()) {
+            const auto& edges = model.mesh_edge_info[body];
+            for (uint32_t edge = 0u; edge < edges.edge_count; ++edge)
+                model.mesh_edge_sources.push_back(
+                    (uint64_t{body} << 32u) | edge);
+        }
+    }
+    if (model.mesh_vertex_sources.size() > std::numeric_limits<uint32_t>::max() ||
+        model.mesh_edge_sources.size() > std::numeric_limits<uint32_t>::max())
+        throw std::invalid_argument("mesh source table exceeds device indexing");
+    cap.mesh_vertex_source_count = static_cast<uint32_t>(model.mesh_vertex_sources.size());
+    cap.mesh_edge_source_count = static_cast<uint32_t>(model.mesh_edge_sources.size());
+
+    if (enable_contacts && (cap.mesh_vertex_source_count > 0u ||
+                            cap.mesh_edge_source_count > 0u)) {
+        const uint64_t features = uint64_t{cap.mesh_vertex_source_count} +
+                                  cap.mesh_edge_source_count;
+        const uint64_t reserve = std::min<uint64_t>(features,
+            uint64_t{cap.max_contacts_per_env} * 2u * nk::kPairDrivenPtsPerSlot);
+        if (reserve > std::numeric_limits<uint32_t>::max())
+            throw std::invalid_argument("mesh contact capacity exceeds device indexing");
+        SetOgcContactCapacity(model, static_cast<uint32_t>(reserve));
     }
 
     for (const auto& sensor : scene.Sensors()) {
@@ -1615,30 +1782,86 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     mp.surface_info.clear();
     mp.surface_triangles.clear();
     mp.surface_tree.clear();
+    mp.surface_edge_info.clear();
+    mp.surface_edges.clear();
+    mp.surface_edge_tree.clear();
+    mp.surface_triangle_edges.clear();
+    mp.surface_triangle_vertex_owner.clear();
     mp.surface_thickness.clear();
     mp.surface_friction.clear();
     for (const auto& surface : in.surfaces) {
-        if (surface.triangles.empty() || surface.triangles.size() % 3u != 0u ||
+        if ((surface.triangles.empty() && surface.edges.empty()) ||
+            surface.triangles.size() % 3u != 0u || surface.edges.size() % 2u != 0u ||
+            (!surface.triangles.empty() && !surface.edges.empty()) ||
             !std::isfinite(surface.half_thickness) || surface.half_thickness < 0.0f ||
             !std::isfinite(surface.friction) || surface.friction < 0.0f)
             throw std::invalid_argument("invalid deformable collision surface");
-        auto cooked = import::cooker::CookMeshSurface(
-            reinterpret_cast<const float*>(mp.initial_pos.data()), static_cast<uint32_t>(mp.initial_pos.size()),
-            surface.triangles.data(), static_cast<uint32_t>(surface.triangles.size() / 3u));
+        const auto& vertices = surface.triangles.empty() ? surface.edges : surface.triangles;
+        const auto bounds = std::minmax_element(vertices.begin(), vertices.end());
+        const uint32_t begin = *bounds.first;
+        if (*bounds.second >= mp.initial_pos.size())
+            throw std::invalid_argument("deformable collision surface has invalid vertex indices");
+        const uint32_t count = *bounds.second - begin + 1u;
+        const float* positions = reinterpret_cast<const float*>(mp.initial_pos.data() + begin);
+        std::vector<uint32_t> local(vertices.size());
+        for (size_t i = 0u; i < vertices.size(); ++i) local[i] = vertices[i] - begin;
+        import::cooker::CookedMeshSurface cooked;
+        import::cooker::CookedMeshEdges cooked_edges;
+        std::vector<uint32_t> oriented;
+        if (surface.triangles.empty()) {
+            cooked.info.vertex_count = count;
+            cooked_edges = import::cooker::CookWireEdges(
+                positions, count, local.data(), static_cast<uint32_t>(local.size() / 2u));
+        } else {
+            oriented = import::cooker::OrientMeshWinding(
+                positions, count, local.data(), static_cast<uint32_t>(local.size() / 3u), false);
+            cooked = import::cooker::CookMeshSurface(
+                positions, count, oriented.data(), static_cast<uint32_t>(oriented.size() / 3u));
+            cooked.info.flags |= collision::kMeshSurfaceOriented;
+            cooked_edges = import::cooker::CookMeshEdges(
+                positions, count, oriented.data(), static_cast<uint32_t>(oriented.size() / 3u), false);
+        }
+        cooked.info.vertex_offset = begin;
         cooked.info.triangle_offset = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
         cooked.info.node_offset = static_cast<uint32_t>(mp.surface_tree.size());
         mp.surface_info.push_back(cooked.info);
-        mp.surface_triangles.insert(mp.surface_triangles.end(), surface.triangles.begin(), surface.triangles.end());
+        mp.surface_triangles.insert(mp.surface_triangles.end(), oriented.begin(), oriented.end());
         mp.surface_tree.insert(mp.surface_tree.end(), cooked.nodes.begin(), cooked.nodes.end());
+        cooked_edges.info.edge_offset = static_cast<uint32_t>(mp.surface_edges.size());
+        cooked_edges.info.node_offset = static_cast<uint32_t>(mp.surface_edge_tree.size());
+        cooked_edges.info.vertex_offset = cooked.info.vertex_offset;
+        mp.surface_edge_info.push_back(cooked_edges.info);
+        mp.surface_edges.insert(mp.surface_edges.end(), cooked_edges.edges.begin(), cooked_edges.edges.end());
+        mp.surface_edge_tree.insert(mp.surface_edge_tree.end(), cooked_edges.nodes.begin(), cooked_edges.nodes.end());
+        mp.surface_triangle_edges.insert(mp.surface_triangle_edges.end(),
+            cooked_edges.triangle_edges.begin(), cooked_edges.triangle_edges.end());
+        mp.surface_triangle_vertex_owner.insert(mp.surface_triangle_vertex_owner.end(),
+            cooked_edges.triangle_vertex_owner.begin(), cooked_edges.triangle_vertex_owner.end());
         mp.surface_thickness.push_back(surface.half_thickness);
         mp.surface_friction.push_back(surface.friction);
     }
     cap.particle_surfaces_per_env = static_cast<uint32_t>(mp.surface_info.size());
     cap.particle_surface_triangles = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
     cap.particle_surface_nodes_per_env = static_cast<uint32_t>(mp.surface_tree.size());
+    cap.particle_surface_edges_per_env = static_cast<uint32_t>(mp.surface_edges.size());
+    cap.particle_surface_edge_nodes_per_env = static_cast<uint32_t>(mp.surface_edge_tree.size());
 
-    const uint32_t rigid_base = cap.max_contacts_per_env;
+    const uint32_t rigid_base = cap.max_contacts_per_env - cap.ogc_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
+    const bool has_body_mesh = cap.mesh_vertex_source_count > 0u ||
+                               cap.mesh_edge_source_count > 0u;
+    const uint64_t cloth_sources = uint64_t{cap.particles_per_env} +
+                                   cap.particle_surface_edges_per_env;
+    const uint64_t body_features = uint64_t{cap.mesh_vertex_source_count} +
+                                   cap.mesh_edge_source_count;
+    const uint64_t body_reserve = std::min<uint64_t>(body_features,
+        uint64_t{rigid_base} * 2u * nk::kPairDrivenPtsPerSlot + cloth_sources);
+    const uint64_t ogc_slots = cloth_sources +
+        (has_body_mesh ? cloth_sources + body_reserve : 0u);
+    if (ogc_slots > std::numeric_limits<uint32_t>::max())
+        throw std::invalid_argument("mesh contact capacity exceeds device indexing");
+    cap.ogc_contacts_per_env = cap.particle_surfaces_per_env > 0u || has_body_mesh
+        ? static_cast<uint32_t>(ogc_slots) : 0u;
     cap.dist_cons_per_env = dn;
     cap.vol_cons_per_env  = vn;
     cap.shape_match_slots_per_env   = scn;
@@ -2096,10 +2319,18 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     for (auto& info : mp.surface_info) info.vertex_offset += n_mpm;
     mp.surface_triangles = xp.surface_triangles;
     mp.surface_tree = xp.surface_tree;
+    mp.surface_edge_info = xp.surface_edge_info;
+    for (auto& info : mp.surface_edge_info) info.vertex_offset += n_mpm;
+    mp.surface_edges = xp.surface_edges;
+    mp.surface_edge_tree = xp.surface_edge_tree;
+    mp.surface_triangle_edges = xp.surface_triangle_edges;
+    mp.surface_triangle_vertex_owner = xp.surface_triangle_vertex_owner;
     mp.surface_thickness = xp.surface_thickness;
     mp.surface_friction = xp.surface_friction;
     cap.particle_surfaces_per_env = xtmp.capacities.particle_surfaces_per_env;
     cap.particle_surface_triangles = xtmp.capacities.particle_surface_triangles;
+    cap.particle_surface_edges_per_env = xtmp.capacities.particle_surface_edges_per_env;
+    cap.particle_surface_edge_nodes_per_env = xtmp.capacities.particle_surface_edge_nodes_per_env;
     cap.particle_surface_nodes_per_env = xtmp.capacities.particle_surface_nodes_per_env;
 
     // 3) The body<->particle cloth contact radius + the co-residence schema.
@@ -2258,46 +2489,18 @@ ClothGeometry BuildClothGeometry(const MediaRecord& media) {
                 out.material_faces.push_back(face);
             }
         }
-        using Edge = std::pair<uint32_t, uint32_t>;
-        std::map<Edge, std::vector<std::pair<uint32_t, bool>>> adjacent;
-        for (uint32_t face = 0u; face < out.triangles.size(); ++face) {
-            const auto& tri = out.triangles[face].v;
-            for (uint32_t corner = 0u; corner < 3u; ++corner) {
-                const uint32_t a = tri[corner], b = tri[(corner + 1u) % 3u];
-                adjacent[{std::min(a, b), std::max(a, b)}].push_back({face, a < b});
-            }
-        }
-        std::vector<std::vector<std::pair<uint32_t, bool>>> neighbors(out.triangles.size());
-        for (const auto& [edge, faces_on_edge] : adjacent) {
-            if (faces_on_edge.size() != 2u) continue;
-            const auto [a, a_forward] = faces_on_edge[0];
-            const auto [b, b_forward] = faces_on_edge[1];
-            const bool opposite_flip = a_forward == b_forward;
-            neighbors[a].push_back({b, opposite_flip});
-            neighbors[b].push_back({a, opposite_flip});
-        }
-        std::vector<int8_t> flipped(out.triangles.size(), -1);
-        for (uint32_t seed = 0u; seed < out.triangles.size(); ++seed) {
-            if (flipped[seed] >= 0) continue;
-            flipped[seed] = 0;
-            std::vector<uint32_t> queue{seed};
-            for (size_t head = 0u; head < queue.size(); ++head) {
-                const uint32_t face = queue[head];
-                for (const auto [other, opposite_flip] : neighbors[face]) {
-                    const int8_t desired = flipped[face] ^ static_cast<int8_t>(opposite_flip);
-                    if (flipped[other] < 0) {
-                        flipped[other] = desired;
-                        queue.push_back(other);
-                    } else if (flipped[other] != desired) {
-                        throw std::invalid_argument("Cloth asset is not orientable");
-                    }
-                }
-            }
-        }
-        for (size_t face = 0u; face < flipped.size(); ++face) {
-            if (flipped[face] == 0) continue;
-            std::swap(out.triangles[face].v[1], out.triangles[face].v[2]);
-            if (!out.material_faces.empty())
+        std::vector<uint32_t> original;
+        original.reserve(out.triangles.size() * 3u);
+        for (const auto& triangle : out.triangles)
+            original.insert(original.end(), {triangle.v[0], triangle.v[1], triangle.v[2]});
+        const auto oriented = import::cooker::OrientMeshWinding(
+            reinterpret_cast<const float*>(out.rest.data()), static_cast<uint32_t>(out.rest.size()),
+            original.data(), static_cast<uint32_t>(out.triangles.size()), false);
+        for (size_t face = 0u; face < out.triangles.size(); ++face) {
+            const size_t at = face * 3u;
+            for (size_t corner = 0u; corner < 3u; ++corner)
+                out.triangles[face].v[corner] = oriented[at + corner];
+            if (!out.material_faces.empty() && oriented[at + 1u] != original[at + 1u])
                 std::swap(out.material_faces[face][1], out.material_faces[face][2]);
         }
         return out;
@@ -2612,7 +2815,7 @@ XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
 
     in.positions = init;
     in.surfaces.push_back({runtime::soft::ExtractBoundaryTriangles(lat.rest, lat.tets),
-                           0.0f, media.xpbd.friction});
+                           0.0f, media.xpbd.friction, {}});
     in.velocities.assign(init.size(), math::Vec3::Zero());
     const float mass =
         media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
@@ -2666,6 +2869,16 @@ XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     rod.damping = media.xpbd.damping;
     runtime::soft::BuildRodVertexBlocks(in.positions, chain, rod, in.vbd_elements);
 
+    CookParticleSurface wire;
+    wire.half_thickness = c.radius;
+    wire.friction = media.xpbd.friction;
+    wire.edges.reserve(size_t(c.segments) * 2u);
+    for (uint32_t i = 0u; i < c.segments; ++i) {
+        wire.edges.push_back(i);
+        wire.edges.push_back(i + 1u);
+    }
+    in.surfaces.push_back(std::move(wire));
+
     // Optional slab welded to the loaded end: its 8 corners joined pairwise by 28 springs
     // and its 4 top corners welded to the end vertex by 4 more.
     if (layout.slab == 8u) {
@@ -2685,7 +2898,7 @@ XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
         for (uint32_t k = 4u; k < 8u; ++k)  // the 4 top corners (iz == 1).
             in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(end_p, base + k,
                 (corners[k] - in.positions[end_p]).Length(), stiffness, media.xpbd.damping));
-        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.xpbd.friction});
+        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.xpbd.friction, {}});
     }
 
     in.velocities.assign(in.positions.size(), math::Vec3::Zero());
@@ -3077,6 +3290,7 @@ void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
     }
     for (auto surface : src.surfaces) {
         for (uint32_t& vertex : surface.triangles) vertex += base;
+        for (uint32_t& vertex : surface.edges) vertex += base;
         dst.surfaces.push_back(std::move(surface));
     }
     // The soft slice carries one solver/friction/aero set (per-medium override is the

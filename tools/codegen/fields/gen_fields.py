@@ -56,6 +56,8 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
     "mat36":     {"cpp": "::nuka::nk::Mat36",       "code": "kF32", "lanes": 36},
     "mesh_surface_info": {"cpp": "::nuka::collision::MeshSurfaceInfo", "code": "kU8", "lanes": 32},
     "mesh_bvh_node": {"cpp": "::nuka::collision::MeshBvhNode", "code": "kU8", "lanes": 32},
+    "mesh_edge": {"cpp": "::nuka::collision::MeshEdge", "code": "kU8", "lanes": 24},
+    "mesh_edge_info": {"cpp": "::nuka::collision::MeshEdgeInfo", "code": "kU8", "lanes": 24},
     "point_endpoint_range": {"cpp": "::nuka::nk::PointEndpointRange", "code": "kU8", "lanes": 8},
     "point_endpoint_term": {"cpp": "::nuka::nk::PointEndpointTerm", "code": "kU8", "lanes": 44},
     "vbd_element": {"cpp": "::nuka::nk::VbdElement", "code": "kU8", "lanes": 64},

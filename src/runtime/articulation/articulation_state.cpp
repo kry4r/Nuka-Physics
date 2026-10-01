@@ -413,8 +413,13 @@ ArticulationHostState BuildArticulationHostState(
                 local_link < topology.parent_frames.size()
                     ? topology.parent_frames[local_link]
                     : math::Transform::Identity();
+            const math::Transform local_pose = LocalPoseForBody(bodies, body);
             result.link_pose.push_back(PoseForBody(bodies, body));
-            result.link_local_pose.push_back(LocalPoseForBody(bodies, body));
+            // Parent to child is parent_frame * local_pose * joint(q); FK adds
+            // parent_frame.position separately as parent_offset.
+            result.link_local_pose.push_back(math::Transform(
+                parent_frame.rotation.Rotate(local_pose.position),
+                parent_frame.rotation * local_pose.rotation));
             result.link_inertial_frame.push_back(inertial_frame);
             result.q.push_back(local_link < topology.initial_positions.size()
                 ? topology.initial_positions[local_link]

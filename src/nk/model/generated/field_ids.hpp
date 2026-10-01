@@ -92,6 +92,8 @@ enum class FieldId : uint16_t {
     ContactForce,  // contact_force (per:contact_slot arena:scratch owner:data elem:3 flags:[readout])
     UcontactCount,  // ucontact_count (per:contact_slot arena:scratch owner:data)
     UcontactPoint,  // ucontact_point (per:contact_slot arena:scratch owner:data elem:4)
+    UcontactWitnessA,  // ucontact_witness_a (per:contact_slot arena:scratch owner:data elem:4)
+    UcontactWitnessB,  // ucontact_witness_b (per:contact_slot arena:scratch owner:data elem:4)
     UcontactNormal,  // ucontact_normal (per:contact_slot arena:scratch owner:data elem:4)
     UcontactDepth,  // ucontact_depth (per:contact_slot arena:scratch owner:data elem:4)
     RowCount,  // row_count (per:env arena:scratch owner:data)
@@ -252,6 +254,9 @@ enum class FieldId : uint16_t {
     JointLimitLower,  // joint_limit_lower (per:link arena:persistent owner:model flags:[param])
     JointLimitUpper,  // joint_limit_upper (per:link arena:persistent owner:model flags:[param])
     JointLimitFlags,  // joint_limit_flags (per:link arena:persistent owner:model flags:[param])
+    MimicSourceLink,  // mimic_source_link (per:link arena:persistent owner:model)
+    MimicMultiplier,  // mimic_multiplier (per:link arena:persistent owner:model)
+    MimicOffset,  // mimic_offset (per:link arena:persistent owner:model)
     JointLimitImpulse,  // joint_limit_impulse (per:link arena:scratch owner:data elem:2 flags:[readout])
     ActuatorEffortRequested,  // actuator_effort_requested (per:link arena:scratch owner:data flags:[readout])
     ActuatorEffort,  // actuator_effort (per:link arena:scratch owner:data flags:[readout])
@@ -294,6 +299,14 @@ enum class FieldId : uint16_t {
     MeshSurfaceInfo,  // mesh_surface_info (per:scalar arena:persistent owner:model count:mesh_surface_info_count)
     MeshTriangles,  // mesh_triangles (per:scalar arena:persistent owner:model count:max_mesh_triangles*3)
     MeshBvhNodes,  // mesh_bvh_nodes (per:scalar arena:persistent owner:model count:max_mesh_bvh_nodes)
+    MeshEdgeInfo,  // mesh_edge_info (per:scalar arena:persistent owner:model count:mesh_surface_info_count)
+    MeshEdges,  // mesh_edges (per:scalar arena:persistent owner:model count:max_mesh_edges)
+    MeshEdgeNodes,  // mesh_edge_nodes (per:scalar arena:persistent owner:model count:max_mesh_edge_nodes)
+    MeshTriangleEdges,  // mesh_triangle_edges (per:scalar arena:persistent owner:model count:max_mesh_triangles*3)
+    MeshTriangleVertexOwner,  // mesh_triangle_vertex_owner (per:scalar arena:persistent owner:model count:max_mesh_triangles*3)
+    MeshVertexSources,  // mesh_vertex_sources (per:scalar arena:persistent owner:model count:mesh_vertex_source_count)
+    MeshEdgeSources,  // mesh_edge_sources (per:scalar arena:persistent owner:model count:mesh_edge_source_count)
+    MeshContactMode,  // mesh_contact_mode (per:scalar arena:persistent owner:model count:max_bodies_total)
     StepEnvStatus,  // step_env_status (per:env arena:scratch owner:data)
     StepMpmBodyImpulse,  // step_mpm_body_impulse (per:body arena:scratch owner:data)
     StepMpmBodyMoment,  // step_mpm_body_moment (per:body arena:scratch owner:data)
@@ -334,15 +347,22 @@ enum class FieldId : uint16_t {
     ParticleSurfaceInfo,  // particle_surface_info (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
     ParticleSurfaceTriangles,  // particle_surface_triangles (per:scalar arena:persistent owner:model count:particle_surface_triangles*3)
     ParticleSurfaceTree,  // particle_surface_tree (per:scalar arena:persistent owner:model count:particle_surface_nodes_per_env)
+    ParticleSurfaceEdgeInfo,  // particle_surface_edge_info (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
+    ParticleSurfaceEdges,  // particle_surface_edges (per:scalar arena:persistent owner:model count:particle_surface_edges_per_env)
+    ParticleSurfaceEdgeTree,  // particle_surface_edge_tree (per:scalar arena:persistent owner:model count:particle_surface_edge_nodes_per_env)
+    ParticleSurfaceTriangleEdges,  // particle_surface_triangle_edges (per:scalar arena:persistent owner:model count:particle_surface_triangles*3)
+    ParticleSurfaceTriangleVertexOwner,  // particle_surface_triangle_vertex_owner (per:scalar arena:persistent owner:model count:particle_surface_triangles*3)
     ParticleSurfaceThickness,  // particle_surface_thickness (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
     ParticleSurfaceFriction,  // particle_surface_friction (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
     ParticleSurfaceNodes,  // particle_surface_nodes (per:scalar arena:scratch owner:data count:particle_surface_nodes_per_env*env_count)
+    ParticleSurfaceEdgeNodes,  // particle_surface_edge_nodes (per:scalar arena:scratch owner:data count:particle_surface_edge_nodes_per_env*env_count)
     PointEndpointRanges,  // point_endpoint_ranges (per:scalar arena:scratch owner:data count:point_endpoints_per_env*env_count flags:[readout])
     PointEndpointTerms,  // point_endpoint_terms (per:scalar arena:scratch owner:data count:point_endpoint_terms_per_env*env_count flags:[readout])
     ParticleProjectionDelta,  // particle_projection_delta (per:particle arena:scratch owner:data)
     ParticleSurfaceMaxSpeed,  // particle_surface_max_speed (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
     GridPseudoVel,  // grid_pseudo_vel (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     ContactSolveMetrics,  // contact_solve_metrics (per:env arena:scratch owner:data elem:8 flags:[readout])
+    VbdSolveMetrics,  // vbd_solve_metrics (per:env arena:scratch owner:data elem:2 flags:[readout])
     ContactSolveCounts,  // contact_solve_counts (per:env arena:scratch owner:data elem:2 flags:[readout])
     PairSampleChunks,  // pair_sample_chunks (per:scalar arena:scratch owner:data count:pair_sample_chunk_words)
     SolveColorScratch,  // solve_color_scratch (per:scalar arena:scratch owner:data count:solve_color_scratch_words)
@@ -352,13 +372,67 @@ enum class FieldId : uint16_t {
     VbdColorVertices,  // vbd_color_vertices (per:scalar arena:persistent owner:model count:vbd_dynamic_vertices_per_env)
     VbdColorSegments,  // vbd_color_segments (per:scalar arena:persistent owner:model count:vbd_colors*2)
     ParticleResponse,  // particle_response (per:particle arena:scratch owner:data)
+    ParticleRowImpulse,  // particle_row_impulse (per:particle arena:scratch owner:data)
     VbdTarget,  // vbd_target (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
     VbdOffset,  // vbd_offset (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
     VbdInertia,  // vbd_inertia (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
-    VbdRowImpulse,  // vbd_row_impulse (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
-    VbdWritten,  // vbd_written (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
     VbdHistoryVel,  // vbd_history_vel (per:scalar arena:persistent owner:data count:vbd_vertices_per_env*env_count)
     VbdHistoryReady,  // vbd_history_ready (per:env arena:persistent owner:data)
+    ParticleKinematicTarget,  // particle_kinematic_target (per:particle arena:persistent owner:data flags:[param])
+    OgcContactCount,  // ogc_contact_count (per:env arena:scratch owner:data)
+    DatParticleBeta,  // dat_particle_beta (per:particle arena:scratch owner:data flags:[readout])
+    DatBodyBeta,  // dat_body_beta (per:body arena:scratch owner:data)
+    DatArticBeta,  // dat_artic_beta (per:articulation arena:scratch owner:data)
+    DatPrevQ,  // dat_prev_q (per:link arena:scratch owner:data)
+    DatPrevBasePose,  // dat_prev_base_pose (per:articulation arena:scratch owner:data)
+    DatPrevBodyPose,  // dat_prev_body_pose (per:body arena:scratch owner:data)
+    DatBodySpeed,  // dat_body_speed (per:body arena:scratch owner:data)
+    DatBodyQueryRadius,  // dat_body_query_radius (per:body arena:scratch owner:data)
+    DatPairKind,  // dat_pair_kind (per:contact_slot arena:scratch owner:data)
+    DatPairOwnerA,  // dat_pair_owner_a (per:contact_slot arena:scratch owner:data)
+    DatPairOwnerB,  // dat_pair_owner_b (per:contact_slot arena:scratch owner:data)
+    DatPairFeatureA,  // dat_pair_feature_a (per:contact_slot arena:scratch owner:data)
+    DatPairFeatureB,  // dat_pair_feature_b (per:contact_slot arena:scratch owner:data)
+    DatTruncationCount,  // dat_truncation_count (per:env arena:scratch owner:data)
+    OgcSourceOffsets,  // ogc_source_offsets (per:scalar arena:scratch owner:data count:ogc_source_count*env_count)
+    DatTruncationEnergy,  // dat_truncation_energy (per:env arena:scratch owner:data)
+    DatParticleTruncationCount,  // dat_particle_truncation_count (per:env arena:scratch owner:data)
+    DatParticleTruncationEnergy,  // dat_particle_truncation_energy (per:env arena:scratch owner:data)
+    DatParticleTruncationMomentum,  // dat_particle_truncation_momentum (per:env arena:scratch owner:data)
+    DatJointTruncationCount,  // dat_joint_truncation_count (per:env arena:scratch owner:data)
+    DatJointTruncationEnergy,  // dat_joint_truncation_energy (per:env arena:scratch owner:data)
+    DatBodyTruncationCount,  // dat_body_truncation_count (per:env arena:scratch owner:data)
+    DatBodyTruncationEnergy,  // dat_body_truncation_energy (per:env arena:scratch owner:data)
+    VbdStep,  // vbd_step (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    VbdRestart,  // vbd_restart (per:scalar arena:persistent owner:data count:vbd_vertices_per_env*env_count)
+    DatFailureCount,  // dat_failure_count (per:env arena:scratch owner:data)
+    DatQueryLimitCount,  // dat_query_limit_count (per:env arena:scratch owner:data)
+    DatFailureWitness,  // dat_failure_witness (per:env arena:scratch owner:data elem:389)
+    ContactWarmStartCounts,  // contact_warm_start_counts (per:env arena:scratch owner:data elem:2)
+    MeshOgcPairCount,  // mesh_ogc_pair_count (per:env arena:scratch owner:data)
+    MeshSdfPairCount,  // mesh_sdf_pair_count (per:env arena:scratch owner:data)
+    VbdVelocitySweepCount,  // vbd_velocity_sweep_count (per:env arena:scratch owner:data)
+    SolverColorCounts,  // solver_color_counts (per:env arena:scratch owner:data elem:2)
+    DatSurfaceMotion,  // dat_surface_motion (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
+    EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:32 count:integration_substeps*env_count flags:[readout])
+    EnergyLedgerStatus,  // energy_ledger_status (per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout])
+    PhysicsStageMetrics,  // physics_stage_metrics (per:scalar arena:scratch owner:data elem:195 count:integration_substeps*env_count flags:[readout])
+    ContactAuditCounts,  // contact_audit_counts (per:scalar arena:scratch owner:data elem:8 count:integration_substeps*env_count flags:[readout])
+    ContactAuditMetrics,  // contact_audit_metrics (per:scalar arena:scratch owner:data elem:7 count:integration_substeps*env_count flags:[readout])
+    EnergyParticleStart,  // energy_particle_start (per:particle arena:scratch owner:data)
+    EnergyParticleFree,  // energy_particle_free (per:particle arena:scratch owner:data)
+    EnergyParticleFreeRate,  // energy_particle_free_rate (per:particle arena:scratch owner:data)
+    EnergyAeroImpulse,  // energy_aero_impulse (per:particle arena:scratch owner:data)
+    EnergyKinematicContactImpulse,  // energy_kinematic_contact_impulse (per:particle arena:scratch owner:data)
+    EnergyBodyFreeLinear,  // energy_body_free_linear (per:body arena:scratch owner:data)
+    EnergyBodyFreeAngular,  // energy_body_free_angular (per:body arena:scratch owner:data)
+    EnergyLinkStartQ,  // energy_link_start_q (per:link arena:scratch owner:data)
+    EnergyLinkStartQdot,  // energy_link_start_qdot (per:link arena:scratch owner:data)
+    EnergyLinkPose,  // energy_link_pose (per:link arena:scratch owner:data)
+    EnergyLinkUnprojectedPose,  // energy_link_unprojected_pose (per:link arena:scratch owner:data)
+    EnergyLinkVelocity,  // energy_link_velocity (per:link arena:scratch owner:data)
+    EnergyQdotFree,  // energy_qdot_free (per:articulation_dof arena:scratch owner:data)
+    VbdForceResidualWork,  // vbd_force_residual_work (per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout])
     Count
 };
 
@@ -446,6 +520,8 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_force",
     "ucontact_count",
     "ucontact_point",
+    "ucontact_witness_a",
+    "ucontact_witness_b",
     "ucontact_normal",
     "ucontact_depth",
     "row_count",
@@ -606,6 +682,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "joint_limit_lower",
     "joint_limit_upper",
     "joint_limit_flags",
+    "mimic_source_link",
+    "mimic_multiplier",
+    "mimic_offset",
     "joint_limit_impulse",
     "actuator_effort_requested",
     "actuator_effort",
@@ -648,6 +727,14 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "mesh_surface_info",
     "mesh_triangles",
     "mesh_bvh_nodes",
+    "mesh_edge_info",
+    "mesh_edges",
+    "mesh_edge_nodes",
+    "mesh_triangle_edges",
+    "mesh_triangle_vertex_owner",
+    "mesh_vertex_sources",
+    "mesh_edge_sources",
+    "mesh_contact_mode",
     "step_env_status",
     "step_mpm_body_impulse",
     "step_mpm_body_moment",
@@ -688,15 +775,22 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_surface_info",
     "particle_surface_triangles",
     "particle_surface_tree",
+    "particle_surface_edge_info",
+    "particle_surface_edges",
+    "particle_surface_edge_tree",
+    "particle_surface_triangle_edges",
+    "particle_surface_triangle_vertex_owner",
     "particle_surface_thickness",
     "particle_surface_friction",
     "particle_surface_nodes",
+    "particle_surface_edge_nodes",
     "point_endpoint_ranges",
     "point_endpoint_terms",
     "particle_projection_delta",
     "particle_surface_max_speed",
     "grid_pseudo_vel",
     "contact_solve_metrics",
+    "vbd_solve_metrics",
     "contact_solve_counts",
     "pair_sample_chunks",
     "solve_color_scratch",
@@ -706,13 +800,67 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "vbd_color_vertices",
     "vbd_color_segments",
     "particle_response",
+    "particle_row_impulse",
     "vbd_target",
     "vbd_offset",
     "vbd_inertia",
-    "vbd_row_impulse",
-    "vbd_written",
     "vbd_history_vel",
     "vbd_history_ready",
+    "particle_kinematic_target",
+    "ogc_contact_count",
+    "dat_particle_beta",
+    "dat_body_beta",
+    "dat_artic_beta",
+    "dat_prev_q",
+    "dat_prev_base_pose",
+    "dat_prev_body_pose",
+    "dat_body_speed",
+    "dat_body_query_radius",
+    "dat_pair_kind",
+    "dat_pair_owner_a",
+    "dat_pair_owner_b",
+    "dat_pair_feature_a",
+    "dat_pair_feature_b",
+    "dat_truncation_count",
+    "ogc_source_offsets",
+    "dat_truncation_energy",
+    "dat_particle_truncation_count",
+    "dat_particle_truncation_energy",
+    "dat_particle_truncation_momentum",
+    "dat_joint_truncation_count",
+    "dat_joint_truncation_energy",
+    "dat_body_truncation_count",
+    "dat_body_truncation_energy",
+    "vbd_step",
+    "vbd_restart",
+    "dat_failure_count",
+    "dat_query_limit_count",
+    "dat_failure_witness",
+    "contact_warm_start_counts",
+    "mesh_ogc_pair_count",
+    "mesh_sdf_pair_count",
+    "vbd_velocity_sweep_count",
+    "solver_color_counts",
+    "dat_surface_motion",
+    "energy_ledger",
+    "energy_ledger_status",
+    "physics_stage_metrics",
+    "contact_audit_counts",
+    "contact_audit_metrics",
+    "energy_particle_start",
+    "energy_particle_free",
+    "energy_particle_free_rate",
+    "energy_aero_impulse",
+    "energy_kinematic_contact_impulse",
+    "energy_body_free_linear",
+    "energy_body_free_angular",
+    "energy_link_start_q",
+    "energy_link_start_qdot",
+    "energy_link_pose",
+    "energy_link_unprojected_pose",
+    "energy_link_velocity",
+    "energy_qdot_free",
+    "vbd_force_residual_work",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

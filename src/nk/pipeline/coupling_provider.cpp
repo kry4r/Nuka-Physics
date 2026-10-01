@@ -30,14 +30,13 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // same uniform radius the particle-particle co-step uses).
     const uint32_t cands_per_particle =
         collision::kBodyParticleContactSlotsPerParticle;
-    // particle_base == rigid_cap by construction: particles take the top
-    // [rigid_cap, total) range above the rigid [0, rigid_cap) sub-range.
+    // Particle slots follow the rigid and mesh-contact ranges.
     p_np_body_particle.family = ctx.family;
     p_np_body_particle.env_count = ctx.env_count;
     p_np_body_particle.bodies_per_env = ctx.bodies_per_env;
     p_np_body_particle.particles_per_env = ctx.particles_per_env;
     p_np_body_particle.slot_stride = ctx.max_contacts_per_env;
-    p_np_body_particle.particle_slot_base = ctx.rigid_cap;
+    p_np_body_particle.particle_slot_base = ctx.particle_slot_base;
     p_np_body_particle.cands_per_particle = cands_per_particle;
     // A particle is a sphere of d_min/2 on the ONE path (the cooked uniform
     // contact radius); 0 leaves the op inert (no collision radius cooked).
@@ -48,6 +47,8 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     p_np_body_particle.n_soft_particles = 0u;
     // Grid-owned particles do not emit body-particle manifolds.
     p_np_body_particle.particle_row_base = ctx.n_mpm;
+    p_np_body_particle.excluded_particle_begin = model.capacities.vbd_particle_begin;
+    p_np_body_particle.excluded_particle_count = model.capacities.vbd_vertices_per_env;
     p_np_body_particle.sdf_grid_count = model.capacities.max_sdf_grids;
     p_np_body_particle.sdf_cell_total = model.capacities.max_sdf_cells;
     p_np_body_particle.mesh_geometry = {model.capacities.max_hull_verts,
@@ -81,7 +82,9 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     } else {
         p_np_body_particle.has_heightfield = 0u;
     }
-    ctx.Emit(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle);
+    if (model.capacities.vbd_vertices_per_env == 0u ||
+        ctx.particles_per_env - ctx.n_mpm > model.capacities.vbd_vertices_per_env)
+        ctx.Emit(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle);
 }
 
 void RowCouplingProvider::Couple(const CouplingBuildCtx&) const {

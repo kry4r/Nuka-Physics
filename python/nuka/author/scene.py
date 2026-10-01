@@ -79,6 +79,7 @@ class SimOptions:
     solver_contact_margin: float = 0.0
     solver_max_pairs: int = 0
     cloth_integrator: int = 0
+    ogc_contact_capacity: int = 0
     baumgarte_max_velocity: float = 0.0
     # Bake a per-link SDF from each link's VISUAL mesh so a foot engages the MPM grid
     # BC (rides the true silhouette). Default False keeps every cook byte-identical.
@@ -230,7 +231,10 @@ class Scene:
         # (the SceneBuilder carries the material + environment records).
         appearance = self._environment is not None or any(
             e.render is not None for e in self._entities)
-        if tets or fluids or grans or cables or rigids or appearance:
+        thick_grid = any(getattr(e.material, "half_thickness", 0.0) > 0.0 or
+                         getattr(e.material, "surface_density", 0.0) > 0.0
+                         for e in grids)
+        if not scenes or tets or fluids or grans or cables or rigids or appearance or thick_grid:
             return self._build_general(device, scenes, grids, tets, fluids + grans,
                                        rigids, cables)
         return self._build_coupled(device, scenes, grids)
@@ -252,6 +256,7 @@ class Scene:
             solver_contact_margin=float(o.solver_contact_margin),
             solver_max_pairs=int(o.solver_max_pairs),
             cloth_integrator=int(o.cloth_integrator),
+            ogc_contact_capacity=int(o.ogc_contact_capacity),
             baumgarte_max_velocity=float(o.baumgarte_max_velocity),
         )
         if len(scenes) != 1:
@@ -340,6 +345,7 @@ class Scene:
                 solver_contact_margin=float(o.solver_contact_margin),
                 solver_max_pairs=int(o.solver_max_pairs),
                 cloth_integrator=int(o.cloth_integrator),
+                ogc_contact_capacity=int(o.ogc_contact_capacity),
                 baumgarte_max_velocity=float(o.baumgarte_max_velocity),
                 bake_link_sdf=bool(o.bake_link_sdf))
         finally:

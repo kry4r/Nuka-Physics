@@ -17,8 +17,29 @@ namespace {
 // default (those are ModelView members, not here).
 void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
     switch (id) {
+        case FieldId::EnergyLedger: v.energy_ledger = static_cast<float*>(p); break;
+        case FieldId::EnergyLedgerStatus: v.energy_ledger_status = static_cast<uint32_t*>(p); break;
+        case FieldId::PhysicsStageMetrics: v.physics_stage_metrics = static_cast<float*>(p); break;
+        case FieldId::ContactAuditCounts: v.contact_audit_counts = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactAuditMetrics: v.contact_audit_metrics = static_cast<uint64_t*>(p); break;
+        case FieldId::VbdForceResidualWork: v.vbd_force_residual_work = static_cast<float*>(p); break;
+        case FieldId::EnergyParticleStart: v.energy_particle_start = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyParticleFree: v.energy_particle_free = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyParticleFreeRate: v.energy_particle_free_rate = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyAeroImpulse: v.energy_aero_impulse = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyKinematicContactImpulse: v.energy_kinematic_contact_impulse = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyBodyFreeLinear: v.energy_body_free_linear = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyBodyFreeAngular: v.energy_body_free_angular = static_cast<math::Vec3*>(p); break;
+        case FieldId::EnergyLinkStartQ: v.energy_link_start_q = static_cast<float*>(p); break;
+        case FieldId::EnergyLinkStartQdot: v.energy_link_start_qdot = static_cast<float*>(p); break;
+        case FieldId::EnergyLinkPose: v.energy_link_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::EnergyLinkUnprojectedPose: v.energy_link_unprojected_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::EnergyLinkVelocity: v.energy_link_velocity = static_cast<Spatial6*>(p); break;
+        case FieldId::EnergyQdotFree: v.energy_qdot_free = static_cast<float*>(p); break;
         case FieldId::ParticleSurfaceNodes: v.particle_surface_nodes = static_cast<collision::MeshBvhNode*>(p); break;
+        case FieldId::ParticleSurfaceEdgeNodes: v.particle_surface_edge_nodes = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ParticleSurfaceMaxSpeed: v.particle_surface_max_speed = static_cast<float*>(p); break;
+        case FieldId::DatSurfaceMotion: v.dat_surface_motion = static_cast<float*>(p); break;
         case FieldId::PointEndpointRanges: v.point_endpoint_ranges = static_cast<PointEndpointRange*>(p); break;
         case FieldId::PointEndpointTerms: v.point_endpoint_terms = static_cast<PointEndpointTerm*>(p); break;
         case FieldId::Q:                   v.q = static_cast<float*>(p); break;
@@ -119,6 +140,8 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactSideBIndex:   v.contact_side_b_index = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactCount:       v.ucontact_count = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactPoint:       v.ucontact_point = static_cast<math::Vec3*>(p); break;
+        case FieldId::UcontactWitnessA:    v.ucontact_witness_a = static_cast<math::Vec3*>(p); break;
+        case FieldId::UcontactWitnessB:    v.ucontact_witness_b = static_cast<math::Vec3*>(p); break;
         case FieldId::UcontactNormal:      v.ucontact_normal = static_cast<math::Vec3*>(p); break;
         case FieldId::UcontactDepth:       v.ucontact_depth = static_cast<float*>(p); break;
         // C1 (general contact pipeline Phase 0): per-slot collidable-id + gen
@@ -195,6 +218,42 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ParticlePrevPos:     v.particle_prev_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleVel:         v.particle_vel = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleInvMass:     v.particle_inv_mass = static_cast<float*>(p); break;
+        case FieldId::ParticleKinematicTarget: v.particle_kinematic_target = static_cast<math::Vec3*>(p); break;
+        case FieldId::OgcContactCount: v.ogc_contact_count = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshOgcPairCount: v.mesh_ogc_pair_count = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshSdfPairCount: v.mesh_sdf_pair_count = static_cast<uint32_t*>(p); break;
+        case FieldId::OgcSourceOffsets: v.ogc_source_offsets = static_cast<uint64_t*>(p); break;
+        case FieldId::DatParticleBeta: v.dat_particle_beta = static_cast<float*>(p); break;
+        case FieldId::DatBodyBeta: v.dat_body_beta = static_cast<uint32_t*>(p); break;
+        case FieldId::DatArticBeta: v.dat_artic_beta = static_cast<uint32_t*>(p); break;
+        case FieldId::DatPrevQ: v.dat_prev_q = static_cast<float*>(p); break;
+        case FieldId::DatPrevBasePose: v.dat_prev_base_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::DatPrevBodyPose: v.dat_prev_body_pose = static_cast<math::Transform*>(p); break;
+        case FieldId::DatBodySpeed: v.dat_body_speed = static_cast<float*>(p); break;
+        case FieldId::DatBodyQueryRadius: v.dat_body_query_radius = static_cast<float*>(p); break;
+        case FieldId::DatPairKind: v.dat_pair_kind = static_cast<uint32_t*>(p); break;
+        case FieldId::DatPairOwnerA: v.dat_pair_owner_a = static_cast<uint32_t*>(p); break;
+        case FieldId::DatPairOwnerB: v.dat_pair_owner_b = static_cast<uint32_t*>(p); break;
+        case FieldId::DatPairFeatureA: v.dat_pair_feature_a = static_cast<uint32_t*>(p); break;
+        case FieldId::DatPairFeatureB: v.dat_pair_feature_b = static_cast<uint32_t*>(p); break;
+        case FieldId::DatTruncationCount: v.dat_truncation_count = static_cast<uint32_t*>(p); break;
+        case FieldId::DatTruncationEnergy: v.dat_truncation_energy = static_cast<float*>(p); break;
+        case FieldId::DatParticleTruncationCount: v.dat_particle_truncation_count = static_cast<uint32_t*>(p); break;
+        case FieldId::DatParticleTruncationEnergy: v.dat_particle_truncation_energy = static_cast<float*>(p); break;
+        case FieldId::DatParticleTruncationMomentum: v.dat_particle_truncation_momentum = static_cast<math::Vec3*>(p); break;
+        case FieldId::DatJointTruncationCount: v.dat_joint_truncation_count = static_cast<uint32_t*>(p); break;
+        case FieldId::DatJointTruncationEnergy: v.dat_joint_truncation_energy = static_cast<float*>(p); break;
+        case FieldId::DatBodyTruncationCount: v.dat_body_truncation_count = static_cast<uint32_t*>(p); break;
+        case FieldId::DatBodyTruncationEnergy: v.dat_body_truncation_energy = static_cast<float*>(p); break;
+        case FieldId::DatFailureCount: v.dat_failure_count = static_cast<uint32_t*>(p); break;
+        case FieldId::DatQueryLimitCount: v.dat_query_limit_count = static_cast<uint32_t*>(p); break;
+        case FieldId::DatFailureWitness: v.dat_failure_witness = static_cast<uint64_t*>(p); break;
+        case FieldId::VbdVelocitySweepCount: v.vbd_velocity_sweep_count = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdSolveMetrics: v.vbd_solve_metrics = static_cast<uint64_t*>(p); break;
+        case FieldId::SolverColorCounts: v.solver_color_counts = static_cast<uint32_t*>(p); break;
+        case FieldId::ContactWarmStartCounts: v.contact_warm_start_counts = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdStep: v.vbd_step = static_cast<float*>(p); break;
+        case FieldId::VbdRestart: v.vbd_restart = static_cast<uint32_t*>(p); break;
         // Particle snapshot fields (restore source for a coupled-world Reset). Bound
         // here so OpSnapshotState/OpRestoreState/OpResetEnvs see live arena pointers
         // (an unbound field stays null and the snapshot/restore copy would fail).
@@ -267,8 +326,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::VbdTarget: v.vbd_target = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdOffset: v.vbd_offset = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdInertia: v.vbd_inertia = static_cast<float*>(p); break;
-        case FieldId::VbdRowImpulse: v.vbd_row_impulse = static_cast<math::Vec3*>(p); break;
-        case FieldId::VbdWritten: v.vbd_written = static_cast<math::Vec3*>(p); break;
+        case FieldId::ParticleRowImpulse: v.particle_row_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdHistoryVel: v.vbd_history_vel = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdHistoryReady: v.vbd_history_ready = static_cast<uint32_t*>(p); break;
         case FieldId::PbfPositionDelta:    v.pbf_position_delta = static_cast<math::Vec3*>(p); break;

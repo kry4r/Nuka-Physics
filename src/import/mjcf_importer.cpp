@@ -873,6 +873,19 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
         // nuka:decompose="auto|force|skip" + optional nuka:decompose:max_pieces
         // on a mesh geom (v0.7 p06).
         if (shape.type == scene::ShapeType::TriMesh) {
+            if (const char* mode = geom->Attribute("nuka:mesh_contact")) {
+                if (std::string(mode) == "sdf")
+                    shape.mesh_contact = scene::CollisionShapeRecord::MeshContact::Sdf;
+                else if (std::string(mode) != "ogc")
+                    throw std::runtime_error("MJCF: invalid mesh contact mode");
+            }
+            if (geom->Attribute("nuka:mesh_triangle_limit")) {
+                unsigned int count = 0u;
+                if (geom->QueryUnsignedAttribute("nuka:mesh_triangle_limit", &count) !=
+                        tinyxml2::XML_SUCCESS || count == 0u)
+                    throw std::runtime_error("MJCF: invalid mesh triangle limit");
+                shape.mesh_triangle_limit = count;
+            }
             shape.decompose_mode = DecomposeModeFromToken(geom->Attribute("nuka:decompose"));
             if (const char* orientation = geom->Attribute("nuka:mesh_orientation")) {
                 if (std::string(orientation) != "automatic" && std::string(orientation) != "outward")
@@ -1209,9 +1222,46 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
             record.type = scene::ActuatorType::Force;
         }
         record.joint_id = ResolveJoint(actuator->Attribute("joint"), context);
+        if (record.joint_id != scene::kInvalidJoint &&
+            scene.GetJoint(record.joint_id).mimic_source != scene::kInvalidJoint)
+            throw std::runtime_error("MJCF: mimic joint cannot be driven directly");
         actuator->QueryFloatAttribute("gear", &record.gain);
         ParseRange(actuator->Attribute("forcerange"), record.force_limit, record.force_limit);
         scene.AddActuator(std::move(record));
+    }
+}
+
+void ParseJointEqualities(tinyxml2::XMLElement* mujoco, scene::SceneIR& scene,
+                          const MjcfParseContext& context) {
+    auto* equality = mujoco->FirstChildElement("equality");
+    if (equality == nullptr) return;
+    for (auto* item = equality->FirstChildElement("joint");
+         item != nullptr; item = item->NextSiblingElement("joint")) {
+        bool active = true;
+        item->QueryBoolAttribute("active", &active);
+        if (!active) continue;
+        const scene::JointId target = ResolveJoint(item->Attribute("joint1"), context);
+        const scene::JointId source = ResolveJoint(item->Attribute("joint2"), context);
+        if (target == scene::kInvalidJoint || source == scene::kInvalidJoint || target == source)
+            throw std::runtime_error("MJCF: joint equality needs two distinct scalar joints");
+        float coefficient[5] = {0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+        if (const char* values = item->Attribute("polycoef")) {
+            if (ParseFloatList(values, coefficient, 5) == 0)
+                throw std::runtime_error("MJCF: invalid joint equality coefficients");
+        }
+        for (float value : coefficient)
+            if (!std::isfinite(value))
+                throw std::runtime_error("MJCF: nonfinite joint equality coefficient");
+        if (coefficient[2] != 0.0f || coefficient[3] != 0.0f || coefficient[4] != 0.0f)
+            throw std::runtime_error("MJCF: nonlinear joint equality is unsupported");
+        const auto& source_joint = scene.GetJoint(source);
+        auto& target_joint = scene.GetJointMut(target);
+        if (target_joint.mimic_source != scene::kInvalidJoint)
+            throw std::runtime_error("MJCF: duplicate joint equality target");
+        target_joint.mimic_source = source;
+        target_joint.mimic_multiplier = coefficient[1];
+        target_joint.mimic_offset = target_joint.initial_position + coefficient[0] -
+                                    coefficient[1] * source_joint.initial_position;
     }
 }
 
@@ -1410,6 +1460,7 @@ scene::SceneIR LoadMjcf(const std::string& path) {
         ParseBody(body, scene::kInvalidBody, scene, context, nullptr);
     }
 
+    ParseJointEqualities(mujoco, scene, context);
     ParseActuators(mujoco, scene, context);
     ParseSensors(mujoco, scene, context);
     // <contact> is parsed LAST so all body + geom names already resolve.

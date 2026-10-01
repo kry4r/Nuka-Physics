@@ -452,8 +452,11 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 uint32_t solver_pos_iters,
                                 float solver_contact_margin,
                                 uint32_t solver_max_pairs,
-                                uint32_t cloth_integrator) {
+                                uint32_t cloth_integrator,
+                                uint32_t ogc_contact_capacity) {
     if (cloth_integrator > 1u) return NUKA_RESULT_INVALID_ARG;
+    if (ogc_contact_capacity > 0u)
+        nuka::scene::cook::SetOgcContactCapacity(cooked_model, ogc_contact_capacity);
     // ApplyControlTerrainGravity ran before the Model move, but keep the public
     // task-link option explicit on the shared world-assembly path.
     cooked_model.osc_task_link = osc_task_link;
@@ -536,7 +539,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             desc->env_count, prepared.control_mode, prepared.gravity,
             desc->osc_task_link, out, desc->solver_vel_iters,
             desc->solver_pos_iters, desc->solver_contact_margin,
-            desc->solver_max_pairs, desc->cloth_integrator);
+            desc->solver_max_pairs, desc->cloth_integrator, desc->ogc_contact_capacity);
         if (made == NUKA_RESULT_OK) {
             if (auto* rec = nuka::c_abi::WorldTable().Get(*out)) {
                 rec->scene_dir =
@@ -625,7 +628,7 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             desc->osc_task_link, out,
             particles->solver_vel_iters, particles->solver_pos_iters,
             particles->solver_contact_margin, particles->solver_max_pairs,
-            particles->cloth_integrator);
+            particles->cloth_integrator, desc->ogc_contact_capacity);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr) {
                 record->particle_surfaces = std::move(media_surfaces);
@@ -713,6 +716,30 @@ nuka_result_t nuka_world_set_coupling_passes(nuka_world_handle world, uint32_t p
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }
+}
+
+nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32_t iterations) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        return nuka::c_abi::MapStatusToResult(record->world->SetVelocityIterations(iterations));
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations) {
+    if (out_iterations == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (!record) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    *out_iterations = record->world->VelocityIterations();
+    return NUKA_RESULT_OK;
 }
 
 nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out) {

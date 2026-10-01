@@ -71,6 +71,9 @@ struct CollisionShapeRecord {
     DecomposeMode decompose_mode           = DecomposeMode::Auto;
     uint32_t      decompose_max_pieces     = 32;
     bool          mesh_oriented           = false;
+    enum class MeshContact : uint8_t { Ogc = 0, Sdf = 1 };
+    MeshContact   mesh_contact            = MeshContact::Ogc;
+    uint32_t      mesh_triangle_limit     = 0u;
     std::vector<float>    mesh_vertices;   // x,y,z triples (source mesh)
     std::vector<uint32_t> mesh_indices;    // triangle indices (source mesh)
     // Authored per-vertex normals (x,y,z triples, 1:1 with mesh_vertices in
@@ -131,6 +134,9 @@ struct JointRecord {
     float stiffness                        = 0.0f;
     float initial_position                 = 0.0f;
     float frictionloss                     = 0.0f;   // MuJoCo joint dry friction
+    JointId mimic_source                   = kInvalidJoint;
+    float mimic_multiplier                 = 1.0f;
+    float mimic_offset                     = 0.0f;
 };
 
 // Render-camera intrinsics carried inside a Camera/Depth SensorDesc. Width/height

@@ -383,6 +383,12 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     if (slot >= p.count) return;
     const uint32_t env = p.use_env_ids ? data.reset_env_ids[slot] : slot;
     if (env >= p.env_count) return;
+    for (uint32_t interval = threadIdx.x; interval < p.energy_substeps; interval += blockDim.x) {
+        const size_t record = size_t{env} * p.energy_substeps + interval;
+        data.energy_ledger[record * nk::kEnergyColumnCount + static_cast<uint32_t>(nk::EnergyColumn::Valid)] = 0.0f;
+        data.energy_ledger_status[record] = 0u;
+        data.vbd_force_residual_work[record] = 0.0f;
+    }
     for (uint32_t metric = threadIdx.x; metric < constraint::kContactSolveMetricCount; metric += blockDim.x)
         data.contact_solve_metrics[env * constraint::kContactSolveMetricCount + metric] = 0u;
     for (uint32_t count = threadIdx.x; count < constraint::kContactSolveCountSize; count += blockDim.x)
@@ -492,6 +498,7 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.particle_pos[particle] = data.snapshot_particle_pos[particle];
         data.particle_prev_pos[particle] = data.snapshot_particle_prev_pos[particle];
         data.particle_vel[particle] = data.snapshot_particle_vel[particle];
+        data.particle_kinematic_target[particle] = data.snapshot_particle_pos[particle];
         data.particle_pseudo_vel[particle] = {};
         if (p.has_particle_grid != 0u) {
             data.grid_neighbor_count[particle] = data.grid_neighbor_offset[particle] = 0u;
@@ -750,6 +757,7 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
         p->total_body_count % envs || p->total_particle_count % envs ||
         p->row_slot_count % envs || p->contact_slot_count % envs) return Status::Failed;
     ResetEnvsParams reset{};
+    reset.energy_substeps = p->energy_substeps;
     reset.count = envs;
     reset.env_count = envs;
     reset.articulation_count = p->articulation_count;

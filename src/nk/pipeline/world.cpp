@@ -63,18 +63,19 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         creation_error_ = "grid particle count exceeds the particle capacity";
         return;
     }
-    const uint64_t point_slots = control_cap.mpm_contact_capacity_per_env +
+    const uint64_t point_slots = control_cap.ogc_contacts_per_env +
+        control_cap.mpm_contact_capacity_per_env +
         (control_cap.max_contacts_per_env > 0u
              ? control_cap.ParticleContactReserve(grid_particles) : 0u);
     if (point_slots > control_cap.max_contacts_per_env) {
         creation_status_ = phi::Status::InvalidArgument;
-        creation_error_ = "particle contact reserve exceeds the contact capacity";
+        creation_error_ = "compact contact reserve exceeds the contact capacity";
         return;
     }
     const uint64_t row_count =
         (control_cap.max_contacts_per_env - point_slots) * kPairDrivenRowsPerSlot +
         point_slots * kPairDrivenParticleRowsPerSlot + control_cap.joint_limit_rows_per_env +
-        control_cap.joint_friction_rows_per_env + drive_rows +
+        control_cap.joint_friction_rows_per_env + control_cap.mimic_rows_per_env + drive_rows +
         uint64_t{control_cap.mpm_stress_cells_per_env} * kMpmStressRowsPerCell +
         uint64_t{control_cap.dist_cons_per_env} + control_cap.vol_cons_per_env;
     if (row_count > std::numeric_limits<uint32_t>::max()) {
@@ -89,14 +90,19 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
     // Volume rows keep one 4-term particle endpoint each at the endpoint tail.
     const uint64_t constraint_endpoints = control_cap.vol_cons_per_env;
-    if (control_cap.mpm_grid_nodes_per_env > 0u || constraint_endpoints > 0u) {
+    if (control_cap.mpm_grid_nodes_per_env > 0u ||
+        control_cap.ogc_contacts_per_env > 0u || constraint_endpoints > 0u) {
         const uint32_t surfaces = control_cap.particle_surfaces_per_env > 0u
             ? control_cap.mpm_contact_capacity_per_env : 0u;
         const bool grid = control_cap.mpm_grid_nodes_per_env > 0u;
-        const uint64_t endpoints = constraint_endpoints + (grid ? MpmPointEndpointCount(
-            control_cap.particles_per_env, surfaces, control_cap.mpm_stress_cells_per_env) : 0u);
-        const uint64_t terms = constraint_endpoints * 4u + (grid ? MpmPointEndpointTermCount(
-            control_cap.particles_per_env, surfaces, control_cap.mpm_stress_cells_per_env) : 0u);
+        const uint64_t endpoints = constraint_endpoints +
+            uint64_t{control_cap.ogc_contacts_per_env} * 2u +
+            (grid ? MpmPointEndpointCount(control_cap.particles_per_env, surfaces,
+                                          control_cap.mpm_stress_cells_per_env) : 0u);
+        const uint64_t terms = constraint_endpoints * 4u +
+            uint64_t{control_cap.ogc_contacts_per_env} * 6u +
+            (grid ? MpmPointEndpointTermCount(control_cap.particles_per_env, surfaces,
+                                              control_cap.mpm_stress_cells_per_env) : 0u);
         if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max()) {
             creation_status_ = phi::Status::InvalidArgument;
             creation_error_ = "point endpoint term capacity exceeds device indexing";
@@ -314,6 +320,7 @@ bool World::SeedInitialState() {
     snapshot_params_.total_body_count = total_body_count;
     snapshot_params_.total_particle_count = total_particle_count;
     restore_params_.total_link_count = L * E;
+    restore_params_.energy_substeps = cap.integration_substeps;
     restore_params_.env_count = E;
     restore_params_.articulation_count = cap.articulations_per_env * E;
     restore_params_.dofs_per_articulation = cap.dofs_per_env;
@@ -322,6 +329,7 @@ bool World::SeedInitialState() {
     restore_params_.total_body_count = total_body_count;
     restore_params_.total_particle_count = total_particle_count;
     reset_params_.count = 0;
+    reset_params_.energy_substeps = cap.integration_substeps;
     reset_params_.env_count = E;
     reset_params_.base_link_count = L;
     reset_params_.lambda_stride = cap.max_rows_per_env;
@@ -447,6 +455,8 @@ bool World::SeedInitialState() {
                                pos.size() * sizeof(math::Vec3)) ||
             !data_.UploadField(FieldId::ParticleVel, vel.data(),
                                vel.size() * sizeof(math::Vec3)) ||
+            !data_.UploadField(FieldId::ParticleKinematicTarget, pos.data(),
+                               pos.size() * sizeof(math::Vec3)) ||
             !data_.UploadField(FieldId::ParticleInvMass, inv_mass.data(),
                                inv_mass.size() * sizeof(float))) {
             return false;
@@ -818,6 +828,28 @@ phi::Status World::SetCouplingPasses(uint32_t passes) {
     return last_status_ = phi::Status::Ok;
 }
 
+phi::Status World::SetVelocityIterations(uint32_t iterations) {
+    if (!ready_ || iterations == 0u || iterations > UINT16_MAX)
+        return last_status_ = phi::Status::InvalidArgument;
+    if (iterations == cfg_.vel_iters) return last_status_ = phi::Status::Ok;
+    auto config = cfg_;
+    config.vel_iters = static_cast<uint16_t>(iterations);
+    auto candidate = std::make_unique<Pipeline>();
+    last_status_ = candidate->Build(model_, config, device_, readout_demand_, &state_sensors_);
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    if (plan_ != nullptr) {
+        phi::BackendPlanFree(backend_, plan_);
+        plan_ = nullptr;
+    }
+    plan_attempted_ = false;
+    graph_error_ = {};
+    pipeline_ = std::move(candidate);
+    cfg_ = config;
+    return last_status_ = phi::Status::Ok;
+}
+
 phi::Status World::SetLinkInertia(uint32_t link_index, const Mat36& inertia) {
     constexpr size_t width = sizeof(inertia.m) / sizeof(float);
     const uint32_t links = model_.capacities.links_per_env;
@@ -851,6 +883,13 @@ phi::Status World::SetLinkInertia(uint32_t link_index, const Mat36& inertia) {
 
 phi::Status World::DemandReadout(FieldId id) {
     uint32_t bit = 0u;
+    if (id == FieldId::PhysicsStageMetrics)
+        bit = Pipeline::kReadoutEnergyLedger | Pipeline::kReadoutPhysicsDiagnostics;
+    if (id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
+        bit = Pipeline::kReadoutEnergyLedger | Pipeline::kReadoutContactAudit;
+    if (id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerStatus ||
+        id == FieldId::VbdForceResidualWork || id == FieldId::VbdStep)
+        bit = Pipeline::kReadoutEnergyLedger;
     // Every field OpReadoutContactWrench produces (geometry + {Fn,Ft1,Ft2} +
     // owning link + per-link wrench) shares the one readout bit.
     if (id == FieldId::LinkContactWrench || id == FieldId::ContactForce ||
@@ -860,7 +899,7 @@ phi::Status World::DemandReadout(FieldId id) {
         id == FieldId::ContactSideBIndex) {
         bit = Pipeline::kReadoutContactWrench;
     }
-    if (bit == 0u || (readout_demand_ & bit) != 0u) {
+    if (bit == 0u || (readout_demand_ & bit) == bit) {
         return last_status_ = phi::Status::Ok;
     }
     auto candidate = std::make_unique<Pipeline>();

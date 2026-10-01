@@ -123,6 +123,14 @@ nuka_result_t nuka_world_upload_field(nuka_world_handle world,
             row->field_id, bytes, static_cast<uint64_t>(nbytes),
             static_cast<uint64_t>(byte_offset));
         if (status == nuka::phi::Status::Ok &&
+            row->field_id == nuka::nk::FieldId::ParticlePos) {
+            const auto mirrored = record->world->GetData().UploadFieldStatus(
+                nuka::nk::FieldId::ParticleKinematicTarget, bytes,
+                static_cast<uint64_t>(nbytes), static_cast<uint64_t>(byte_offset));
+            if (mirrored != nuka::phi::Status::Ok)
+                return nuka::c_abi::MapStatusToResult(mirrored);
+        }
+        if (status == nuka::phi::Status::Ok &&
             (row->field_id == nuka::nk::FieldId::ParticlePos ||
              row->field_id == nuka::nk::FieldId::ParticleVel)) {
             const auto& caps = record->world->GetModel().capacities;
@@ -183,9 +191,11 @@ nuka_result_t nuka_world_download_field(nuka_world_handle world,
                 return nuka::c_abi::MapStatusToResult(record->world->LastStatus());
             return NUKA_RESULT_NOT_SUPPORTED;
         }
-        const auto status = record->world->GetData().DownloadFieldStatus(
-            row->field_id, bytes, static_cast<uint64_t>(nbytes),
-            static_cast<uint64_t>(byte_offset));
+        const auto status = nuka::nk::LayoutOf(row->field_id).owner == nuka::nk::FieldOwner::Model
+            ? record->world->GetModel().DownloadFieldStatus(row->field_id, bytes,
+                static_cast<uint64_t>(nbytes), static_cast<uint64_t>(byte_offset))
+            : record->world->GetData().DownloadFieldStatus(row->field_id, bytes,
+                static_cast<uint64_t>(nbytes), static_cast<uint64_t>(byte_offset));
         return nuka::c_abi::MapStatusToResult(status);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;

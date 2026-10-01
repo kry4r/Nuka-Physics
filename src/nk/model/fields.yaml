@@ -246,6 +246,8 @@ fields:
   # keep their exact 1-point-per-slot layout.
   - {name: ucontact_count,  dtype: u32,  per: contact_slot,  arena: scratch, owner: data}
   - {name: ucontact_point,  dtype: vec3, per: contact_slot,  arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_witness_a, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
+  - {name: ucontact_witness_b, dtype: vec3, per: contact_slot, arena: scratch, owner: data, elem: 4}
   - {name: ucontact_normal, dtype: vec3, per: contact_slot,  arena: scratch, owner: data, elem: 4}
   - {name: ucontact_depth,  dtype: f32,  per: contact_slot,  arena: scratch, owner: data, elem: 4}
 
@@ -849,6 +851,9 @@ fields:
   - {name: joint_limit_lower, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
   - {name: joint_limit_upper, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
   - {name: joint_limit_flags, dtype: u8,  per: link, arena: persistent, owner: model, flags: [param]}
+  - {name: mimic_source_link, dtype: u32, per: link, arena: persistent, owner: model}
+  - {name: mimic_multiplier, dtype: f32, per: link, arena: persistent, owner: model}
+  - {name: mimic_offset, dtype: f32, per: link, arena: persistent, owner: model}
   - {name: joint_limit_impulse, dtype: f32, per: link, arena: scratch, owner: data, elem: 2, flags: [readout]}
   - {name: actuator_effort_requested, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
   - {name: actuator_effort, dtype: f32, per: link, arena: scratch, owner: data, flags: [readout]}
@@ -919,6 +924,14 @@ fields:
   - {name: mesh_surface_info, dtype: mesh_surface_info, per: scalar, count: "mesh_surface_info_count", arena: persistent, owner: model}
   - {name: mesh_triangles, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
   - {name: mesh_bvh_nodes, dtype: mesh_bvh_node, per: scalar, count: "max_mesh_bvh_nodes", arena: persistent, owner: model}
+  - {name: mesh_edge_info, dtype: mesh_edge_info, per: scalar, count: "mesh_surface_info_count", arena: persistent, owner: model}
+  - {name: mesh_edges, dtype: mesh_edge, per: scalar, count: "max_mesh_edges", arena: persistent, owner: model}
+  - {name: mesh_edge_nodes, dtype: mesh_bvh_node, per: scalar, count: "max_mesh_edge_nodes", arena: persistent, owner: model}
+  - {name: mesh_triangle_edges, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
+  - {name: mesh_triangle_vertex_owner, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
+  - {name: mesh_vertex_sources, dtype: u64, per: scalar, count: "mesh_vertex_source_count", arena: persistent, owner: model}
+  - {name: mesh_edge_sources, dtype: u64, per: scalar, count: "mesh_edge_source_count", arena: persistent, owner: model}
+  - {name: mesh_contact_mode, dtype: u8, per: scalar, count: "max_bodies_total", arena: persistent, owner: model}
 
   # Outer-step impulses use world-origin moments until the final reference-point shift.
   - {name: step_env_status, dtype: u32, per: env, arena: scratch, owner: data}
@@ -979,9 +992,15 @@ fields:
   - {name: particle_surface_info, dtype: mesh_surface_info, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
   - {name: particle_surface_triangles, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
   - {name: particle_surface_tree, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_nodes_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_edge_info, dtype: mesh_edge_info, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_edges, dtype: mesh_edge, per: scalar, count: "particle_surface_edges_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_edge_tree, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_edge_nodes_per_env", arena: persistent, owner: model}
+  - {name: particle_surface_triangle_edges, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
+  - {name: particle_surface_triangle_vertex_owner, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
   - {name: particle_surface_thickness, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
   - {name: particle_surface_friction, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
   - {name: particle_surface_nodes, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_nodes_per_env*env_count", arena: scratch, owner: data}
+  - {name: particle_surface_edge_nodes, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_edge_nodes_per_env*env_count", arena: scratch, owner: data}
 
   # Endpoint maps are frozen with the contact geometry during each physical interval.
   - {name: point_endpoint_ranges, dtype: point_endpoint_range, per: scalar, count: "point_endpoints_per_env*env_count", arena: scratch, owner: data, flags: [readout]}
@@ -995,6 +1014,7 @@ fields:
 
   # Latest contact solve diagnostics are disposable and never restore physical state.
   - {name: contact_solve_metrics, dtype: u64, per: env, elem: 8, arena: scratch, owner: data, flags: [readout]}
+  - {name: vbd_solve_metrics, dtype: u64, per: env, elem: 2, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_solve_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data, flags: [readout]}
 
   # Pair sample chunks that yield contacts or geometry status, flagged before each manifold pass.
@@ -1011,13 +1031,70 @@ fields:
   - {name: vbd_color_vertices, dtype: u32, per: scalar, count: "vbd_dynamic_vertices_per_env", arena: persistent, owner: model}
   - {name: vbd_color_segments, dtype: u32, per: scalar, count: "vbd_colors*2", arena: persistent, owner: model}
   # Rows see each particle through a response frozen for the step; vertex blocks keep their
-  # inertial target, integrator offset, mass over step squared, row impulse and last write.
+  # inertial target, integrator offset and mass over step squared, with applied particle impulses.
   - {name: particle_response, dtype: symmat3, per: particle, arena: scratch, owner: data}
+  - {name: particle_row_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: vbd_target, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   - {name: vbd_offset, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   - {name: vbd_inertia, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
-  - {name: vbd_row_impulse, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
-  - {name: vbd_written, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   # Second-order history: the previous velocity, and whether it belongs to the current trajectory.
   - {name: vbd_history_vel, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: persistent, owner: data}
   - {name: vbd_history_ready, dtype: u32, per: env, arena: persistent, owner: data}
+  - {name: particle_kinematic_target, dtype: vec3, per: particle, arena: persistent, owner: data, flags: [param]}
+  - {name: ogc_contact_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: dat_particle_beta, dtype: f32, per: particle, arena: scratch, owner: data, flags: [readout]}
+  - {name: dat_body_beta, dtype: u32, per: body, arena: scratch, owner: data}
+  - {name: dat_artic_beta, dtype: u32, per: articulation, arena: scratch, owner: data}
+  - {name: dat_prev_q, dtype: f32, per: link, arena: scratch, owner: data}
+  - {name: dat_prev_base_pose, dtype: transform, per: articulation, arena: scratch, owner: data}
+  - {name: dat_prev_body_pose, dtype: transform, per: body, arena: scratch, owner: data}
+  - {name: dat_body_speed, dtype: f32, per: body, arena: scratch, owner: data}
+  - {name: dat_body_query_radius, dtype: f32, per: body, arena: scratch, owner: data}
+  - {name: dat_pair_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data}
+  - {name: dat_pair_owner_a, dtype: u32, per: contact_slot, arena: scratch, owner: data}
+  - {name: dat_pair_owner_b, dtype: u32, per: contact_slot, arena: scratch, owner: data}
+  - {name: dat_pair_feature_a, dtype: u32, per: contact_slot, arena: scratch, owner: data}
+  - {name: dat_pair_feature_b, dtype: u32, per: contact_slot, arena: scratch, owner: data}
+  - {name: dat_truncation_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: ogc_source_offsets, dtype: u64, per: scalar, count: "ogc_source_count*env_count", arena: scratch, owner: data}
+  - {name: dat_truncation_energy, dtype: f32, per: env, arena: scratch, owner: data}
+  - {name: dat_particle_truncation_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: dat_particle_truncation_energy, dtype: f32, per: env, arena: scratch, owner: data}
+  - {name: dat_particle_truncation_momentum, dtype: vec3, per: env, arena: scratch, owner: data}
+  - {name: dat_joint_truncation_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: dat_joint_truncation_energy, dtype: f32, per: env, arena: scratch, owner: data}
+  - {name: dat_body_truncation_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: dat_body_truncation_energy, dtype: f32, per: env, arena: scratch, owner: data}
+  # Step of each vertex's inertial target, and whether its next target restarts at backward Euler
+  # because a row pushed it or its displacement was truncated.
+  - {name: vbd_step, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  - {name: vbd_restart, dtype: u32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: persistent, owner: data}
+  - {name: dat_failure_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: dat_query_limit_count, dtype: u32, per: env, arena: scratch, owner: data}
+  # Last DAT pass per env: failures by reason, unrecorded events, then (key, count, depth) per owner pair.
+  - {name: dat_failure_witness, dtype: u64, per: env, elem: 389, arena: scratch, owner: data}
+  - {name: contact_warm_start_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}
+  - {name: mesh_ogc_pair_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: mesh_sdf_pair_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: vbd_velocity_sweep_count, dtype: u32, per: env, arena: scratch, owner: data}
+  - {name: solver_color_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}
+  - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
+  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 32, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
+  - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 195, arena: scratch, owner: data, flags: [readout]}
+  - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}
+  - {name: contact_audit_metrics, dtype: u64, per: scalar, count: "integration_substeps*env_count", elem: 7, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_particle_start, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: energy_particle_free, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: energy_particle_free_rate, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: energy_aero_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: energy_kinematic_contact_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
+  - {name: energy_body_free_linear, dtype: vec3, per: body, arena: scratch, owner: data}
+  - {name: energy_body_free_angular, dtype: vec3, per: body, arena: scratch, owner: data}
+  - {name: energy_link_start_q, dtype: f32, per: link, arena: scratch, owner: data}
+  - {name: energy_link_start_qdot, dtype: f32, per: link, arena: scratch, owner: data}
+  - {name: energy_link_pose, dtype: transform, per: link, arena: scratch, owner: data}
+  - {name: energy_link_unprojected_pose, dtype: transform, per: link, arena: scratch, owner: data}
+  - {name: energy_link_velocity, dtype: spatial6, per: link, arena: scratch, owner: data}
+  - {name: energy_qdot_free, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
+  - {name: vbd_force_residual_work, dtype: f32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}

@@ -352,6 +352,11 @@ bool SceneIR::RemoveBodySubtree(BodyId root) {
             kept[i].id = static_cast<JointId>(i);
             kept[i].parent_body = remap_body(kept[i].parent_body);
             kept[i].child_body = remap_body(kept[i].child_body);
+            if (kept[i].mimic_source != kInvalidJoint) {
+                const JointId source = kept[i].mimic_source;
+                kept[i].mimic_source = source < joint_map.size() ? joint_map[source]
+                                                             : kInvalidJoint;
+            }
         }
         joints_ = std::move(kept);
     }

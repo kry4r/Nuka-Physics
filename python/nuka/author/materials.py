@@ -32,6 +32,8 @@ class ClothMaterial:
     poisson: float
     bend_stiffness: float
     damping: float
+    half_thickness: float = 0.0
+    surface_density: float = 0.0
 
     def cook_kwargs(self) -> dict:
         return dict(
@@ -51,6 +53,8 @@ class ClothMaterial:
             vbd_poisson=float(self.poisson),
             vbd_bend_stiffness=float(self.bend_stiffness),
             vbd_damping=float(self.damping),
+            xpbd_half_thickness=float(self.half_thickness),
+            xpbd_surface_density=float(self.surface_density),
         )
 
 
@@ -60,16 +64,22 @@ class Cloth:
     @staticmethod
     def VBD(mass: float = 0.01, friction: float = 0.6,
             stretch_stiffness: float = 5.0e3, poisson: float = 0.3,
-            bend_stiffness: float = 5.0e-5, damping: float = 0.0) -> ClothMaterial:
-        """A StVK membrane with dihedral bending: per-vertex ``mass`` kg, Coulomb
-        ``friction``, ``stretch_stiffness`` Young's modulus x thickness (N/m),
-        ``poisson`` ratio, ``bend_stiffness`` (N m) and Rayleigh ``damping`` (s)."""
+            bend_stiffness: float = 5.0e-5, damping: float = 0.0,
+            thickness: float = 0.0, areal_density: float = 0.0) -> ClothMaterial:
+        """StVK membrane with dihedral bending and optional areal density (kg/m²).
+        ``thickness`` sets the contact shell; ``mass`` is per vertex when density is zero."""
         if not stretch_stiffness > 0.0:
             raise ValueError("Cloth.VBD: stretch_stiffness must be > 0")
         if not 0.0 <= poisson < 0.5:
             raise ValueError("Cloth.VBD: poisson must be in [0, 0.5)")
+        if not _math.isfinite(thickness) or thickness < 0.0:
+            raise ValueError("Cloth.VBD: thickness must be finite and nonnegative")
+        if not _math.isfinite(areal_density) or areal_density < 0.0:
+            raise ValueError("Cloth.VBD: areal_density must be finite and nonnegative")
+        if areal_density > 0.0:
+            mass = 0.0
         return ClothMaterial(mass, friction, stretch_stiffness, poisson,
-                             bend_stiffness, damping)
+                             bend_stiffness, damping, thickness * 0.5, areal_density)
 
 
 @_dc.dataclass(frozen=True)

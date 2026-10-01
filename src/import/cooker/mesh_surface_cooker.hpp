@@ -16,6 +16,15 @@ struct CookedMeshSurface {
     bool cover_hierarchy = false;
 };
 
+struct CookedMeshEdges {
+    collision::MeshEdgeInfo info{};
+    uint32_t topology_edge_count = 0u;
+    std::vector<collision::MeshEdge> edges;
+    std::vector<collision::MeshBvhNode> nodes;
+    std::vector<uint32_t> triangle_edges;
+    std::vector<uint32_t> triangle_vertex_owner;
+};
+
 struct MeshSurfaceCookOptions {
     ConvexCoverParams cover;
     bool decompose = true;
@@ -27,8 +36,17 @@ struct MeshSurfaceCookOptions {
 void ValidateMeshSurfaceInput(const float* vertices, uint32_t vertex_count,
     const uint32_t* indices, uint32_t triangle_count);
 
+std::vector<uint32_t> OrientMeshWinding(const float* vertices, uint32_t vertex_count,
+    const uint32_t* indices, uint32_t triangle_count, bool weld_vertices = true);
+
 CookedMeshSurface CookMeshSurface(const float* vertices, uint32_t vertex_count,
     const uint32_t* indices, uint32_t triangle_count, bool require_convex = false);
+
+CookedMeshEdges CookMeshEdges(const float* vertices, uint32_t vertex_count,
+    const uint32_t* indices, uint32_t triangle_count, bool weld_vertices = true);
+
+CookedMeshEdges CookWireEdges(const float* vertices, uint32_t vertex_count,
+    const uint32_t* indices, uint32_t edge_count);
 
 CookedMeshSurface CookMeshSurfaceCached(const float* vertices, uint32_t vertex_count,
     const uint32_t* indices, uint32_t triangle_count, bool require_convex,
