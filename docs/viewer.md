@@ -13,6 +13,11 @@ be built on a host without CUDA.
   entity-edit path. Releasing Ctrl or the mouse, losing focus, or replacing the
   scene cancels the drag
 - UI and gizmo input capture stop camera gestures
+- Frame Selected (`F`) uses render instances carrying the selected entity; Frame
+  All (`Home`) uses all real render geometry. Both preserve the view orientation
+  and set the orbit pivot to the bounds center. Debug geometry is excluded
+- `F` / `Home` shortcuts require the pointer over the viewport, window focus,
+  no active text/keyboard capture, no gizmo operation, and no modifier keys
 - The transport has its own top strip. Full-height sidebars group Scene, Load,
   Stats, and Script on the left, and Physics Debug, Camera, Drive, and Entity on
   the right. Tabs and panels can be rearranged
@@ -42,6 +47,8 @@ instance count is reported separately.
 Install CMake, a C++20 compiler, Vulkan headers/loader, `glslc`, Vulkan validation
 layers, and a Vulkan driver. Linux builds also need X11/XCB development headers.
 Mesa software Vulkan can validate correctness without a discrete GPU.
+Linux viewer builds additionally require xkbcommon, xkbcommon-x11, and xcb-xkb
+headers/libraries (Debian: `libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev`).
 
 ```sh
 cmake -S . -B build-viewer-host -G Ninja \
@@ -74,6 +81,19 @@ counts exclude failed presents.
 
 The interactive and offscreen renderers share shading code but do not expose
 identical capabilities. The present path does not yet match offline lighting,
-textures, shadows, or transmission. Linux text/key forwarding is also incomplete.
+textures, shadows, or transmission.
+
+Linux XCB forwards layout-aware key bindings and committed UTF-8 text through
+xkbcommon. Locale-dependent Compose/dead-key sequences are supported when a
+Compose table is available. This is not an XIM/IBus/Fcitx preedit or full IME
+integration. Glyph display depends on the loaded fonts. Detectable autorepeat
+is requested; legacy release/press repeat pairs are filtered. Focus loss clears
+held input even if focus returns before the next frame. The Windows viewer keeps
+its existing GLFW ImGui backend and does not duplicate Linux event forwarding.
+
+Frame Selected does not infer descendants of a hierarchy-only node without
+render geometry. Invalid/non-finite or unrepresentable bounds leave the camera
+unchanged; the renderer still uses its existing full-frame projection.
+
 The host-only tests do not validate CUDA physics, CUDA/Vulkan interop, or hardware
 GPU performance; use the production regression pipeline for those guarantees.

@@ -368,7 +368,11 @@ if(NK_BUILD_VULKAN_VALIDATION)
     if(WIN32)
         set(NUKA_WINDOW_SURFACE_SRC render/window/window_surface_glfw.cpp)
     else()
-        set(NUKA_WINDOW_SURFACE_SRC render/window/window_surface.cpp)
+        set(NUKA_WINDOW_SURFACE_SRC render/window/window_surface.cpp render/window/xcb_keyboard.c)
+        find_path(NUKA_XKB_INCLUDE_DIR xkbcommon/xkbcommon-x11.h REQUIRED)
+        find_library(NUKA_XKB_LIBRARY xkbcommon REQUIRED)
+        find_library(NUKA_XKB_X11_LIBRARY xkbcommon-x11 REQUIRED)
+        find_library(NUKA_XCB_XKB_LIBRARY xcb-xkb REQUIRED)
     endif()
     add_library(nuka_present STATIC
         render/raster/vulkan_present_renderer.cpp
@@ -381,7 +385,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             ${CMAKE_SOURCE_DIR}/src
     )
     if(NOT WIN32)
-        target_include_directories(nuka_present PUBLIC ${X11_INCLUDE_DIR})
+        target_include_directories(nuka_present PUBLIC ${X11_INCLUDE_DIR} ${NUKA_XKB_INCLUDE_DIR})
     endif()
 
     target_compile_definitions(nuka_present
@@ -414,6 +418,9 @@ if(NK_BUILD_VULKAN_VALIDATION)
                 nuka_render
                 Vulkan::Vulkan
                 ${NUKA_XCB_LIB}
+                ${NUKA_XKB_LIBRARY}
+                ${NUKA_XKB_X11_LIBRARY}
+                ${NUKA_XCB_XKB_LIBRARY}
                 ${CMAKE_DL_LIBS}
         )
     endif()
@@ -427,6 +434,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/camera_controller.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
+        runtime/app/viewer/window_input.cpp
     )
     set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_viewer PUBLIC ${CMAKE_SOURCE_DIR}/src)

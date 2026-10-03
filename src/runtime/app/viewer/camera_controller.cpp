@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace nuka::runtime::app::viewer {
 
@@ -19,6 +20,27 @@ namespace {
 // Shift is tracked so Shift+LMB acts as pan.
 constexpr uint32_t kKeyShiftL = 0xffe1u;  // XKB_KEY_Shift_L / XK_Shift_L
 constexpr uint32_t kKeyShiftR = 0xffe2u;  // XKB_KEY_Shift_R / XK_Shift_R
+
+bool RenderBounds(const render::RenderWorld& world, const scene::EntityId* selected,
+                  math::Vec3& lo, math::Vec3& hi) {
+    const float limit = std::numeric_limits<float>::max();
+    lo = {limit, limit, limit};
+    hi = {-limit, -limit, -limit};
+    bool found = false;
+    for (const auto& instance : world.instances) {
+        if (selected && instance.entity != *selected) continue;
+        if (instance.mesh_id >= world.meshes.Count()) continue;
+        const auto& positions = world.meshes.Geometry(instance.mesh_id).positions;
+        for (size_t i = 0; i + 2u < positions.size(); i += 3u) {
+            const auto point = instance.world_xform.TransformPoint({positions[i], positions[i + 1u], positions[i + 2u]});
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
+            lo.x = std::min(lo.x, point.x); lo.y = std::min(lo.y, point.y); lo.z = std::min(lo.z, point.z);
+            hi.x = std::max(hi.x, point.x); hi.y = std::max(hi.y, point.y); hi.z = std::max(hi.z, point.z);
+            found = true;
+        }
+    }
+    return found;
+}
 
 }  // namespace
 
@@ -184,25 +206,59 @@ bool CameraController::RayPlaneHit(const Ray& ray, const math::Vec3& plane_point
     return true;
 }
 
-void CameraController::FrameAabb(const math::Vec3& aabb_min, const math::Vec3& aabb_max) {
-    const math::Vec3 center{0.5f * (aabb_min.x + aabb_max.x),
-                            0.5f * (aabb_min.y + aabb_max.y),
-                            0.5f * (aabb_min.z + aabb_max.z)};
-    const math::Vec3 extent{aabb_max.x - aabb_min.x,
-                            aabb_max.y - aabb_min.y,
-                            aabb_max.z - aabb_min.z};
-    float radius = 0.5f * extent.Length();
-    if (!(radius > 0.0f) || std::isnan(radius)) radius = 1.0f;  // degenerate AABB.
-
+bool CameraController::FrameAabb(const math::Vec3& aabb_min, const math::Vec3& aabb_max, float aspect) {
+    if (!std::isfinite(aabb_min.x) || !std::isfinite(aabb_min.y) || !std::isfinite(aabb_min.z) ||
+        !std::isfinite(aabb_max.x) || !std::isfinite(aabb_max.y) || !std::isfinite(aabb_max.z) ||
+        aabb_min.x > aabb_max.x || aabb_min.y > aabb_max.y || aabb_min.z > aabb_max.z ||
+        !std::isfinite(fov_degrees)) return false;
+    const math::Vec3 center{
+        static_cast<float>((static_cast<double>(aabb_min.x) + aabb_max.x) * 0.5),
+        static_cast<float>((static_cast<double>(aabb_min.y) + aabb_max.y) * 0.5),
+        static_cast<float>((static_cast<double>(aabb_min.z) + aabb_max.z) * 0.5)};
+    const double dx = static_cast<double>(aabb_max.x) - aabb_min.x;
+    const double dy = static_cast<double>(aabb_max.y) - aabb_min.y;
+    const double dz = static_cast<double>(aabb_max.z) - aabb_min.z;
+    double radius = 0.5 * std::hypot(dx, dy, dz);
+    if (radius == 0.0) radius = 1.0;
+    const double ratio = std::isfinite(aspect) && aspect > 0.0f ? aspect : 1.0;
+    const double fov = std::clamp(static_cast<double>(fov_degrees), 10.0, 170.0) * 3.14159265358979323846 / 180.0;
+    const double half_fov = std::atan(std::tan(fov * 0.5) * std::min(ratio, 1.0));
+    const double fit = radius / std::sin(half_fov) * 1.25;
+    if (!std::isfinite(fit) || fit > kMaxDistance) return false;
+    const float distance = std::max(static_cast<float>(fit), kMinDistance);
+    const math::Vec3 direction{std::cos(0.45f) * std::cos(0.9f), std::cos(0.45f) * std::sin(0.9f), std::sin(0.45f)};
+    const auto eye = center + direction * distance;
+    if (!std::isfinite(eye.x) || !std::isfinite(eye.y) || !std::isfinite(eye.z) ||
+        (eye - center).LengthSq() == 0.0f) return false;
     target_ = center;
-    // Fit the bounding sphere into the vertical fov with a little margin.
-    const float fov_rad = std::max(fov_degrees, 10.0f) * 3.14159265358979323846f / 180.0f;
-    const float fit = radius / std::sin(fov_rad * 0.5f);
-    distance_ = std::clamp(fit * 1.25f, kMinDistance, kMaxDistance);
-
-    // A pleasant default 3/4 view.
-    yaw_   = 0.9f;
+    distance_ = distance;
+    yaw_ = 0.9f;
     pitch_ = 0.45f;
+    return true;
+}
+
+bool CameraController::FramePreservingView(const math::Vec3& lo, const math::Vec3& hi, float aspect) {
+    CameraController framed = *this;
+    if (!framed.FrameAabb(lo, hi, aspect)) return false;
+    framed.yaw_ = yaw_;
+    framed.pitch_ = pitch_;
+    const auto eye = framed.ResolvedEye();
+    if (!std::isfinite(eye.x) || !std::isfinite(eye.y) || !std::isfinite(eye.z) ||
+        (eye - framed.target_).LengthSq() == 0.0f) return false;
+    framed.orbiting_ = framed.panning_ = false;
+    *this = framed;
+    return true;
+}
+
+bool CameraController::FrameAll(const render::RenderWorld& world, float aspect) {
+    math::Vec3 lo, hi;
+    return RenderBounds(world, nullptr, lo, hi) && FramePreservingView(lo, hi, aspect);
+}
+
+bool CameraController::FrameSelected(const render::RenderWorld& world, scene::EntityId selected, float aspect) {
+    if (selected == scene::kInvalidEntity) return false;
+    math::Vec3 lo, hi;
+    return RenderBounds(world, &selected, lo, hi) && FramePreservingView(lo, hi, aspect);
 }
 
 void CameraController::SetView(const math::Vec3& target, float distance, float yaw,

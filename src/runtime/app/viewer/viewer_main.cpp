@@ -53,6 +53,7 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/debug_overlay.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
+#include "runtime/app/viewer/window_input.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/editor_undo.hpp"     // EditStack + reversible op factories
@@ -197,13 +198,6 @@ void SceneAabb(const render::RenderWorld& world, bool movable_only,
         }
     }
     if (!any) { *lo = {-1.0f, -1.0f, 0.0f}; *hi = {1.0f, 1.0f, 1.0f}; }
-}
-
-// Map a window MouseButton (0=L,1=M,2=R) to ImGui's button index (0=L,1=R,2=M).
-int ToImGuiMouseButton(uint32_t b) {
-    if (b == 0u) return 0;       // left
-    if (b == 2u) return 1;       // right
-    return 2;                    // middle
 }
 
 // World-space AABB of one render instance (transform its mesh positions). Empty
@@ -1049,6 +1043,9 @@ int main(int argc, char** argv) {
 
     bool script_ran = false;  // --run-script fires once, after the first load settles
     std::vector<window::WindowEvent> events;
+#ifndef _WIN32
+    viewer::WindowInput window_input;
+#endif
     while (!present->ShouldClose()) {
         if (max_frames > 0 && static_cast<int>(frame_index) >= max_frames) break;
 
@@ -1119,39 +1116,34 @@ int main(int argc, char** argv) {
         const uint32_t vp_h = present->Report().height;
         for (const window::WindowEvent& ev : events) {
             entity_drag.Observe(ev);
+#ifndef _WIN32
+            window_input.Feed(ev);
+            ui_state.layout_modifier_down = window_input.LayoutModifierDown();
+#endif
             // On Windows the GLFW ImGui backend feeds io mouse/wheel directly, so
             // the manual io feeds are skipped there (else double input); the camera
             // + picker still read the WindowEvents below on both platforms.
             switch (ev.type) {
                 case window::WindowEvent::Type::MouseMove:
-#ifndef _WIN32
-                    io.AddMousePosEvent(static_cast<float>(ev.mouse_x),
-                                        static_cast<float>(ev.mouse_y));
-#endif
                     last_mouse_x = static_cast<float>(ev.mouse_x);
                     last_mouse_y = static_cast<float>(ev.mouse_y);
                     break;
                 case window::WindowEvent::Type::MouseButton:
-#ifndef _WIN32
-                    io.AddMouseButtonEvent(ToImGuiMouseButton(ev.button), ev.pressed);
-#endif
                     break;
                 case window::WindowEvent::Type::Scroll:
-#ifndef _WIN32
-                    io.AddMouseWheelEvent(0.0f, static_cast<float>(ev.scroll_delta));
-#endif
                     break;
                 case window::WindowEvent::Type::Key:
                     if (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR) ctrl_down = ev.pressed;
                     break;
+                case window::WindowEvent::Type::FocusGained:
+                    ui_state.window_focused = true;
+                    break;
                 case window::WindowEvent::Type::FocusLost:
+                    ui_state.window_focused = false;
                     // Releases go to the newly focused window: drop latched state
                     // so Ctrl / a drag can never stick across a focus switch.
                     ctrl_down = false;
                     entity_drag.Cancel();
-#ifndef _WIN32
-                    io.AddFocusEvent(false);  // GLFW backend feeds this on Windows
-#endif
                     break;
                 default:
                     break;
@@ -1584,6 +1576,7 @@ int main(int argc, char** argv) {
                 camera.Move(cf, cr, cu, static_cast<float>(frame_dt) * (sprint ? 4.0f : 1.0f));
             }
         }
+        ui.HandleCameraShortcuts(render_world, camera, ui_state);
         ImGui::Render();
 
         // Upload any drive sliders that moved this frame into the LIVE nk
