@@ -48,8 +48,9 @@ namespace nuka::render {
 // The result of one DrawFrame call.
 enum class PresentFrameResult : uint8_t {
     Presented,   // acquire -> draw -> present succeeded this frame
-    Recreated,   // swapchain was OUT_OF_DATE/SUBOPTIMAL and rebuilt; no present this call
+    Recreated,   // swapchain rebuilt; a suboptimal frame may have been presented
     Error,       // an unrecoverable Vulkan error -- caller should stop the loop
+    Suspended,   // framebuffer has zero extent; keep pumping events until restored
 };
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ struct PresentReport {
     uint32_t    width = 0;
     uint32_t    height = 0;
     uint64_t    frames_presented = 0;
+    bool        capture_supported = false;
 };
 
 // An optional per-frame ImGui (or any extra) recording callback. It is invoked

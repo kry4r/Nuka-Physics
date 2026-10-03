@@ -55,6 +55,8 @@ public:
     uint32_t LastColliderCount() const { return last_colliders_; }
     uint32_t LastContactCount()  const { return last_contacts_; }
     uint32_t LastSkippedShapes() const { return last_skipped_; }
+    bool CollidersAvailable() const { return colliders_available_; }
+    bool ContactsAvailable() const { return contacts_available_; }
 
 private:
     // Append the three debug materials (dynamic / static / contact) to the
@@ -74,6 +76,8 @@ private:
     bool     materials_ready_ = false;
     bool     overflow_logged_ = false;
 
+    bool colliders_available_ = false;
+    bool contacts_available_ = false;
     uint32_t last_colliders_ = 0u;
     uint32_t last_contacts_  = 0u;
     uint32_t last_skipped_   = 0u;

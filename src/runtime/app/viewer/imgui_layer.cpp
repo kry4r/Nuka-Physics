@@ -81,14 +81,23 @@ void SectionHeader(const char* label) {
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
 }
 
-// A labeled stat row: dim label left, value in the second column. The label
-// column width follows the FONT (not a fixed pixel literal) so it stays aligned
-// at non-default font sizes / HiDPI. ~11 glyphs wide covers the longest label.
-constexpr float kStatLabelGlyphs = 11.0f;
+// Flexible columns wrap long values without hiding them outside narrow panels.
 void StatRow(const char* label, const char* value, const ImVec4& value_col) {
-    ImGui::TextColored(kTextDim, "%s", label);
-    ImGui::SameLine(ImGui::CalcTextSize("M").x * kStatLabelGlyphs);
-    ImGui::TextColored(value_col, "%s", value);
+    ImGui::PushID(label);
+    if (ImGui::BeginTable("##stat", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+        ImGui::TableNextColumn();
+        ImGui::TextColored(kTextDim, "%s", label);
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Text, value_col);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(value);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        ImGui::EndTable();
+    }
+    ImGui::PopID();
 }
 
 // A small filled rounded "badge" (custom-drawn): accent for good, muted for idle.
@@ -296,35 +305,27 @@ void ProjMatrixGL(float fov_y_rad, float aspect, float znear, float zfar, float*
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// The one-time default dock layout: a left column (Stats over Scene Tree) and a
-// right column (Camera), central node passthru so the rendered viewport shows.
+// Full-height tabbed sidebars leave enough room for diagnostics and property editing.
+// The central node stays transparent so the rendered viewport shows through.
 // ---------------------------------------------------------------------------
 static void BuildDefaultDockLayout(ImGuiID dockspace_id) {
     ImGui::DockBuilderRemoveNode(dockspace_id);
-    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace |
+    ImGui::DockBuilderAddNode(dockspace_id, static_cast<ImGuiDockNodeFlags>(ImGuiDockNodeFlags_DockSpace) |
                                                 ImGuiDockNodeFlags_PassthruCentralNode);
-    ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
+    ImGui::DockBuilderSetNodePos(dockspace_id, ImGui::GetMainViewport()->WorkPos);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->WorkSize);
 
     ImGuiID central = dockspace_id;
     ImGuiID left  = ImGui::DockBuilderSplitNode(central, ImGuiDir_Left, 0.24f, nullptr, &central);
     ImGuiID right = ImGui::DockBuilderSplitNode(central, ImGuiDir_Right, 0.26f, nullptr, &central);
-    // The left column is three stacked nodes: Load (top), Stats (middle), Scene
-    // (bottom) -- the Load panel leads so an empty editor still offers it first.
-    ImGuiID left_mid    = ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.68f, nullptr, &left);
-    ImGuiID left_bottom = ImGui::DockBuilderSplitNode(left_mid, ImGuiDir_Down, 0.5f, nullptr, &left_mid);
-
-    ImGuiID right_bottom =
-        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.55f, nullptr, &right);
-
+    ImGui::DockBuilderDockWindow("Scene", left);
     ImGui::DockBuilderDockWindow("Load", left);
-    ImGui::DockBuilderDockWindow("Stats", left_mid);
-    ImGui::DockBuilderDockWindow("Scene", left_bottom);
-    // The live-world Script console shares the lower-left node (tabbed with Scene).
-    ImGui::DockBuilderDockWindow("Script", left_bottom);
+    ImGui::DockBuilderDockWindow("Stats", left);
+    ImGui::DockBuilderDockWindow("Script", left);
+    ImGui::DockBuilderDockWindow("Physics Debug", right);
     ImGui::DockBuilderDockWindow("Camera", right);
-    // The Drive editor + the Entity inspector share the lower-right node.
-    ImGui::DockBuilderDockWindow("Drive", right_bottom);
-    ImGui::DockBuilderDockWindow("Entity", right_bottom);
+    ImGui::DockBuilderDockWindow("Drive", right);
+    ImGui::DockBuilderDockWindow("Entity", right);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
@@ -341,14 +342,6 @@ void ImGuiLayer::EnableDocking() {
 void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& stats,
                           CameraController& camera, ViewerUiState& ui_state,
                           const nuka::scene::SceneIR* scene) {
-    // -- the host dockspace (passthru central node -> viewport shows through) ---
-    const ImGuiID dockspace_id =
-        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
-                                     ImGuiDockNodeFlags_PassthruCentralNode);
-    if (!dock_built_) {
-        BuildDefaultDockLayout(dockspace_id);
-        dock_built_ = true;
-    }
 
     // Arm ImGuizmo for this frame (perspective camera). DrawGizmo runs after the
     // panels so its handles overlay the central viewport.
@@ -359,38 +352,39 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // TRANSPORT TOOLBAR -- a slim accent-styled bar pinned to the top.
     // ======================================================================
     {
-        const ImGuiViewport* vp = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 12.0f, vp->WorkPos.y + 8.0f));
-        ImGui::SetNextWindowBgAlpha(0.92f);
-        ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
-                                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav |
-                                 ImGuiWindowFlags_NoMove;
-        if (ImGui::Begin("##transport", nullptr, flags)) {
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float height = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f;
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+                                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
+        if (ImGui::BeginViewportSideBar("##transport", vp, ImGuiDir_Up, height, flags)) {
             PushHeadingFont();
             ImGui::TextColored(kAccent, "NUKA EDITOR");
             PopFont();
             ImGui::SameLine();
-            ImGui::TextColored(kTextDim, ui_state.has_scene ? "| live" : "| no scene");
+            ImGui::TextColored(kTextDim, ui_state.has_scene ? (ui_state.playing ? "| running" : "| paused") : "| no scene");
             ImGui::SameLine(0.0f, 18.0f);
 
             // Transport drives the live world; disabled until a scene is loaded.
             if (!ui_state.has_scene) ImGui::BeginDisabled();
 
             // Play / Pause -- accent-FILLED when active (the showcase accent use).
-            if (ui_state.playing) {
+            const bool was_playing = ui_state.playing;
+            if (was_playing) {
                 ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccent);
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccentDim);
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.06f, 0.07f, 1.0f));
             }
-            if (ImGui::Button(ui_state.playing ? "Pause" : "Play")) {
+            if (ImGui::Button(was_playing ? "Pause" : "Play")) {
                 ui_state.playing = !ui_state.playing;
                 ui_state.play_toggled = true;
             }
-            if (ui_state.playing) ImGui::PopStyleColor(4);
+            if (was_playing) ImGui::PopStyleColor(4);
 
             ImGui::SameLine();
+            ImGui::BeginDisabled(ui_state.playing);
             if (ImGui::Button("Step")) ui_state.step_requested = true;
+            ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Reset")) ui_state.reset_requested = true;
 
@@ -408,23 +402,32 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             if (!ui_state.has_scene) ImGui::EndDisabled();
 
             ImGui::SameLine(0.0f, 18.0f);
-            ImGui::TextColored(kTextDim, "speed");
-            ImGui::SameLine();
-            const float kSpeeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
-            const char* kSpeedLbl[] = {"x.25", "x.5", "x1", "x2", "x4"};
-            for (int i = 0; i < static_cast<int>(std::size(kSpeeds)); ++i) {
-                const bool sel = (ui_state.speed == kSpeeds[i]);
-                if (sel) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.06f, 0.07f, 1.0f));
+            const float speeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
+            const char* labels[] = {"0.25x", "0.5x", "1x", "2x", "4x"};
+            char speed_label[32];
+            std::snprintf(speed_label, sizeof(speed_label), "Speed %.2gx", ui_state.speed);
+            if (ImGui::Button(speed_label)) ImGui::OpenPopup("##speed");
+            if (ImGui::BeginPopup("##speed")) {
+                for (int i = 0; i < static_cast<int>(std::size(speeds)); ++i) {
+                    if (ImGui::Selectable(labels[i], ui_state.speed == speeds[i])) {
+                        ui_state.speed = speeds[i];
+                    }
                 }
-                if (i > 0) ImGui::SameLine();
-                if (ImGui::Button(kSpeedLbl[i])) ui_state.speed = kSpeeds[i];
-                if (sel) ImGui::PopStyleColor(2);
+                ImGui::EndPopup();
             }
         }
         ImGui::End();
     }
+
+    // -- the host dockspace (passthru central node -> viewport shows through) ---
+    const ImGuiID dockspace_id =
+        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
+                                     ImGuiDockNodeFlags_PassthruCentralNode);
+    if (!dock_built_) {
+        BuildDefaultDockLayout(dockspace_id);
+        dock_built_ = true;
+    }
+
 
     // ======================================================================
     // LOAD PANEL -- "Open Scene" runs the native OS file dialog (filtered to .nks);
@@ -434,7 +437,9 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         SectionHeader("Scene");
         if (ui_state.has_scene) {
             ImGui::TextColored(kTextDim, "loaded");
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextColored(kAccent, "%s", ui_state.loaded_path.c_str());
+            ImGui::PopTextWrapPos();
             ImGui::Dummy(ImVec2(0.0f, 4.0f));
             if (ImGui::Button("Unload", ImVec2(-1.0f, 0.0f))) ui_state.unload_request = true;
         } else {
@@ -493,13 +498,15 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // ======================================================================
     // STATS PANEL -- hero step-time + tidy labeled rows + a LIVE/IDLE badge.
     // ======================================================================
-    if (ImGui::Begin("Stats")) {
-        SectionHeader("Performance");
+    if (ImGui::Begin("Stats", nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) {
+        SectionHeader("CPU update");
+        ImGui::TextColored(kTextDim, "step + state publish");
 
         // Hero: big step time in the heading font + a live/idle badge.
         PushHeadingFont();
         char hero[32];
-        std::snprintf(hero, sizeof(hero), "%.2f ms", stats.step_time_ms);
+        if (stats.cpu_timing_available) std::snprintf(hero, sizeof(hero), "%.2f ms", stats.step_time_ms);
+        else std::snprintf(hero, sizeof(hero), "N/A");
         ImGui::TextColored(stats.step_healthy ? kAccent : kWarn, "%s", hero);
         PopFont();
         ImGui::SameLine();
@@ -510,12 +517,15 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
 
         char buf[64];
         std::snprintf(buf, sizeof(buf), "%.0f", stats.fps);
-        StatRow("fps", buf, kText);
+        StatRow("fps", stats.frame_timing_available ? buf : "N/A", kText);
+        std::snprintf(buf, sizeof(buf), "%.2f ms", stats.frame_time_ms);
+        StatRow("frame", stats.frame_timing_available ? buf : "N/A", kText);
+        StatRow("GPU time", "N/A", kTextDim);
         std::snprintf(buf, sizeof(buf), "x%u", stats.sub_steps);
         StatRow("sub-steps", buf, kText);
         std::snprintf(buf, sizeof(buf), "%llu",
                       static_cast<unsigned long long>(stats.frame_index));
-        StatRow("frame", buf, kTextDim);
+        StatRow("frame index", buf, kTextDim);
 
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
         SectionHeader("Model");
@@ -533,14 +543,59 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
         SectionHeader("Render");
         std::snprintf(buf, sizeof(buf), "%u", stats.draw_calls);
-        StatRow("draw calls", buf, kText);
+        StatRow("draw calls", stats.draw_calls_available ? buf : "N/A", kText);
+        std::snprintf(buf, sizeof(buf), "%u", world.InstanceCount());
+        StatRow("instances", buf, kText);
         std::snprintf(buf, sizeof(buf), "%llu",
                       static_cast<unsigned long long>(stats.non_bg_pixels));
-        StatRow("lit pixels", buf, kText);
+        StatRow("lit pixels", stats.pixel_count_available ? buf : "N/A", kText);
         if (!stats.device_name.empty()) {
             ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            ImGui::PushTextWrapPos(0.0f);
             ImGui::TextColored(kTextDim, "%s", stats.device_name.c_str());
+            ImGui::PopTextWrapPos();
         }
+    }
+    ImGui::End();
+
+    if (ImGui::Begin("Physics Debug")) {
+        SectionHeader("Physics Debug");
+        Badge("READ ONLY", kBgRaised, kAccent);
+        ImGui::Spacing();
+        ImGui::BeginDisabled(!ui_state.has_scene);
+        ImGui::Checkbox("Collider proxies", &ui_state.show_colliders);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("See-through wireframe; translucent fill on devices without wireframe support");
+        ImGui::Checkbox("Contact points", &ui_state.show_contacts);
+        if (ImGui::Button("Hide all")) {
+            ui_state.show_colliders = false;
+            ui_state.show_contacts = false;
+        }
+        ImGui::EndDisabled();
+        if (!ui_state.has_scene) ImGui::TextWrapped("Load a scene to inspect its published state.");
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.15f, 0.85f, 0.25f, 1.0f), "Dynamic collider");
+        ImGui::TextColored(ImVec4(0.85f, 0.18f, 0.85f, 1.0f), "Static collider");
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.05f, 1.0f), "Contact marker");
+        ImGui::Spacing();
+        ImGui::TextColored(kTextDim, "Previous overlay snapshot");
+        char count[48];
+        std::snprintf(count, sizeof(count), "%u", stats.debug_colliders);
+        StatRow("colliders", stats.debug_colliders_available ? count : "N/A", kText);
+        std::snprintf(count, sizeof(count), "%u", stats.debug_contacts);
+        StatRow("contacts", stats.debug_contacts_available ? count : "N/A", kText);
+        if (ui_state.has_scene && stats.debug_skipped_shapes != 0u) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+            ImGui::TextWrapped("%u unsupported collider shapes skipped", stats.debug_skipped_shapes);
+            ImGui::PopStyleColor();
+        }
+        if (ui_state.has_scene && stats.debug_capacity > 0u &&
+            stats.debug_colliders + stats.debug_contacts >= stats.debug_capacity) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+            ImGui::TextWrapped("Overlay limit reached (%u); some geometry may be omitted", stats.debug_capacity);
+            ImGui::PopStyleColor();
+        }
+        ImGui::TextWrapped("N/A: overlay disabled or readback unavailable. Markers show positions, not forces.");
     }
     ImGui::End();
 
@@ -548,22 +603,11 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // SCENE TREE -- the SceneGraph hierarchy (robots as collapsible subtrees,
     // terrain/media at root) with kind badges; selection keyed on node->entity.
     // ======================================================================
-    if (ImGui::Begin("Scene")) {
+    if (ImGui::Begin("Scene", nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) {
         if (scene == nullptr) {
             SectionHeader("Scene Tree");
-            ImGui::TextColored(kTextDim, "no scene loaded");
+            ImGui::TextWrapped(ui_state.has_scene ? "Scene hierarchy unavailable" : "No scene loaded");
         } else {
-            // Read-only debug-draw toggles (Isaac-style Show-by-Type): see-through
-            // collider wireframes + live contact points. The viewer rebuilds the
-            // overlay between frames from these flags; nothing here mutates the scene.
-            SectionHeader("Show");
-            ImGui::Checkbox("colliders (wireframe)", &ui_state.show_colliders);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Overlay collider wireframes through the meshes (off by default)");
-            ImGui::SameLine();
-            ImGui::Checkbox("contacts", &ui_state.show_contacts);
-            ImGui::Dummy(ImVec2(0.0f, 8.0f));
-
             // Add picker: spawn a primitive as a free movable body near the selection
             // (the lightweight analog of a content-browser drag-drop spawn).
             SectionHeader("Add");
@@ -586,7 +630,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // ======================================================================
     // CAMERA PANEL -- orbit/pan/zoom readout + reset + fov slider (wires camera).
     // ======================================================================
-    if (ImGui::Begin("Camera")) {
+    if (ImGui::Begin("Camera", nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) {
         SectionHeader("Camera");
         const math::Vec3 eye = camera.ResolvedEye();
         const math::Vec3 tgt = camera.ResolvedTarget();
@@ -626,7 +670,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // choreography table (a flat per-DOF editor, never scene-specific). With a
     // FIXED ui_state this records deterministically.
     // ======================================================================
-    if (ImGui::Begin("Drive")) {
+    if (ImGui::Begin("Drive", nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) {
         SectionHeader("Drive Targets");
         const size_t n = ui_state.drive_targets.size();
         if (n == 0u) {
@@ -698,7 +742,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // values + dirty/commit latches are applied by the viewer through the general
     // edit seam (the SAME pattern as the Drive panel above).
     // ======================================================================
-    if (ImGui::Begin("Entity")) {
+    if (ImGui::Begin("Entity", nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) {
         SectionHeader("Selection");
         const bool has_sel = ui_state.selected_entity != nuka::scene::kInvalidEntity;
         const render::RenderInstance* inst = nullptr;
@@ -759,20 +803,17 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 ImGui::Dummy(ImVec2(0.0f, 4.0f));
                 GizmoState& gz = ui_state.gizmo;
                 ImGui::Checkbox("gizmo", &gz.enabled);
-                ImGui::SameLine();
                 ImGui::BeginDisabled(!gz.enabled);
                 if (ImGui::RadioButton("move", gz.op == GizmoState::Op::Translate))
                     gz.op = GizmoState::Op::Translate;
                 ImGui::SameLine();
                 if (ImGui::RadioButton("rotate", gz.op == GizmoState::Op::Rotate))
                     gz.op = GizmoState::Op::Rotate;
-                ImGui::SameLine();
                 bool local = gz.local;
                 if (ImGui::Checkbox("local", &local)) gz.local = local;
                 ImGui::SameLine();
                 ImGui::Checkbox("snap", &gz.snap_on);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(90.0f);
+                ImGui::SetNextItemWidth(-1.0f);
                 ImGui::BeginDisabled(!gz.snap_on);
                 // ONE step field: world units (Translate) or degrees (Rotate).
                 if (gz.op == GizmoState::Op::Rotate)
@@ -837,7 +878,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // execs it) and a read-only Console of the captured output. It touches ONLY plain
     // ui_state (no interpreter / time input), so a fixed state records deterministic.
     // ======================================================================
-    if (ImGui::Begin("Script")) {
+    if (ImGui::Begin("Script", nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) {
         SectionHeader("Live Script");
         ImGui::TextColored(kTextDim, ui_state.has_scene
                                          ? "runs against the loaded world (nuka.*)"
