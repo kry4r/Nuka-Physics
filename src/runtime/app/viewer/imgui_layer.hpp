@@ -248,6 +248,7 @@ struct ViewerUiState {
 struct ViewerStats {
     float    step_time_ms   = 0.0f;
     float    fps            = 0.0f;
+    float    frame_time_ms  = 0.0f;
     uint32_t sub_steps      = 1u;
     uint32_t dof            = 0u;
     uint32_t links          = 0u;
@@ -257,6 +258,16 @@ struct ViewerStats {
     uint64_t non_bg_pixels  = 0u;
     uint64_t frame_index    = 0u;
     bool     step_healthy   = true;
+    bool     cpu_timing_available = false;
+    bool     frame_timing_available = false;
+    bool     draw_calls_available = false;
+    bool     pixel_count_available = false;
+    uint32_t debug_colliders = 0u;
+    uint32_t debug_contacts = 0u;
+    uint32_t debug_skipped_shapes = 0u;
+    uint32_t debug_capacity = 0u;
+    bool     debug_colliders_available = false;
+    bool     debug_contacts_available = false;
     std::string device_name;
 };
 

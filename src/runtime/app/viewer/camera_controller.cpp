@@ -64,6 +64,10 @@ bool CameraController::HandleEvent(const window::WindowEvent& ev, bool allow_dra
             const int32_t dy = ev.mouse_y - last_y_;
             last_x_ = ev.mouse_x;
             last_y_ = ev.mouse_y;
+            if (!allow_drag) {
+                orbiting_ = panning_ = false;
+                return false;
+            }
             if (orbiting_) {
                 yaw_   -= static_cast<float>(dx) * orbit_speed;
                 pitch_ += static_cast<float>(dy) * orbit_speed;

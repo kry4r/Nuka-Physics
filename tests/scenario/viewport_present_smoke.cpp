@@ -20,10 +20,12 @@
 #include <gtest/gtest.h>
 
 #include "render/raster/vulkan_present_renderer.hpp"
+#include "render/raster/present_surface.hpp"
 #include "render/render_world.hpp"
 #include "render/window/window_surface.hpp"
 
 #include <cstdint>
+#include <fstream>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -76,7 +78,72 @@ RenderWorld BuildSyntheticWorld() {
     return world;
 }
 
+class ControlledSurface final : public nuka::render::window::WindowSurface {
+public:
+    explicit ControlledSurface(std::unique_ptr<WindowSurface> surface)
+        : surface_(std::move(surface)), width_(surface_->Width()), height_(surface_->Height()) {}
+
+    nuka::render::window::WindowVkSurface CreateSurface(
+        nuka::render::window::WindowVkInstance instance) override {
+        return surface_->CreateSurface(instance);
+    }
+    void PollEvents(std::vector<nuka::render::window::WindowEvent>& events) override {
+        surface_->PollEvents(events);
+        if (resize_pending_) {
+            nuka::render::window::WindowEvent event;
+            event.type = nuka::render::window::WindowEvent::Type::Resize;
+            event.width = width_;
+            event.height = height_;
+            events.push_back(event);
+            resize_pending_ = false;
+        }
+    }
+    uint32_t Width() const override { return width_; }
+    uint32_t Height() const override { return height_; }
+    const char* BackendName() const override { return surface_->BackendName(); }
+    std::vector<std::string> RequiredInstanceExtensions() const override {
+        return surface_->RequiredInstanceExtensions();
+    }
+    void SetExtent(uint32_t width, uint32_t height) {
+        width_ = width;
+        height_ = height;
+        resize_pending_ = true;
+    }
+
+private:
+    std::unique_ptr<WindowSurface> surface_;
+    uint32_t width_;
+    uint32_t height_;
+    bool resize_pending_ = false;
+};
+
 }  // namespace
+
+TEST(ViewportSurface, NegotiatesOptionalCapabilitiesAndZeroExtent) {
+    using namespace nuka::render::detail;
+    VkSurfaceCapabilitiesKHR caps{};
+    caps.currentExtent = {~uint32_t(0), ~uint32_t(0)};
+    caps.minImageExtent = {16u, 16u};
+    caps.maxImageExtent = {4096u, 4096u};
+    EXPECT_EQ(ChooseSwapchainExtent(caps, 0u, 720u).width, 0u);
+    EXPECT_EQ(ChooseSwapchainExtent(caps, 1280u, 0u).height, 0u);
+    EXPECT_EQ(ChooseSwapchainExtent(caps, 8u, 8000u).width, 16u);
+    EXPECT_EQ(ChooseSwapchainExtent(caps, 8u, 8000u).height, 4096u);
+    caps.currentExtent = {0u, 0u};
+    EXPECT_EQ(ChooseSwapchainExtent(caps, 1280u, 720u).width, 0u);
+    EXPECT_EQ(ChooseCompositeAlpha(VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR),
+              VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR);
+    EXPECT_EQ(ChooseCompositeAlpha(VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR |
+                                  VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR),
+              VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
+    EXPECT_THROW(ChooseCompositeAlpha(0u), std::runtime_error);
+    const auto color_only = SwapchainImageUsage(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    EXPECT_EQ(color_only, static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT));
+    EXPECT_FALSE(CanCaptureSwapchain(color_only, VK_FORMAT_B8G8R8A8_UNORM));
+    const auto capture = SwapchainImageUsage(color_only | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    EXPECT_TRUE(CanCaptureSwapchain(capture, VK_FORMAT_B8G8R8A8_UNORM));
+    EXPECT_FALSE(CanCaptureSwapchain(capture, VK_FORMAT_R16G16B16A16_SFLOAT));
+}
 
 TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
     const RenderWorld world = BuildSyntheticWorld();
@@ -96,10 +163,11 @@ TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
                         "-s '-screen 0 1280x720x24' <binary>";
     }
 
-    // 2. Stand up the present renderer (swapchain + pipeline + sync).
+    auto controlled = std::make_unique<ControlledSurface>(std::move(surface));
+    ControlledSurface* control = controlled.get();
     std::unique_ptr<nuka::render::PresentRenderer> present;
     try {
-        present = std::make_unique<nuka::render::PresentRenderer>(std::move(surface));
+        present = std::make_unique<nuka::render::PresentRenderer>(std::move(controlled));
     } catch (const std::exception& e) {
         GTEST_SKIP() << "PresentRenderer ctor failed (no Vulkan device / swapchain): " << e.what();
     }
@@ -113,7 +181,10 @@ TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
     options.width = present->Report().width;
     options.height = present->Report().height;
 
-    constexpr int kFrames = 3;
+    const char* capture_path = "/tmp/nuka_present_lifecycle.ppm";
+    std::remove(capture_path);
+    if (present->Report().capture_supported) present->SetCaptureFrame(0, capture_path);
+    constexpr int kFrames = 32;
     int presented = 0;
     bool had_error = false;
     for (int i = 0; i < kFrames; ++i) {
@@ -137,6 +208,30 @@ TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
 
     EXPECT_FALSE(had_error) << "present loop hit a VkError";
     EXPECT_EQ(presented, kFrames) << "expected " << kFrames << " successful presents";
+
+    EXPECT_EQ(present->Report().frames_presented, static_cast<uint64_t>(kFrames));
+    if (present->Report().capture_supported) {
+        std::ifstream capture(capture_path, std::ios::binary | std::ios::ate);
+        ASSERT_TRUE(capture.good());
+        EXPECT_GT(capture.tellg(), static_cast<std::streamoff>(options.width) * options.height * 3);
+    }
+    std::vector<nuka::render::window::WindowEvent> events;
+    for (int cycle = 0; cycle < 8; ++cycle) {
+        control->SetExtent(0u, 0u);
+        events.clear();
+        present->PollEvents(events);
+        const auto before = present->Report().frames_presented;
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Suspended);
+        }
+        EXPECT_EQ(present->Report().frames_presented, before);
+        control->SetExtent(cycle % 2 ? 1280u : 800u, cycle % 2 ? 720u : 450u);
+        events.clear();
+        present->PollEvents(events);
+        EXPECT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Recreated);
+        EXPECT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Presented);
+        EXPECT_EQ(present->Report().frames_presented, before + 1u);
+    }
 
     const auto& report = present->Report();
     std::printf("[viewport_present_smoke] backend=%s device=%s images=%u "
