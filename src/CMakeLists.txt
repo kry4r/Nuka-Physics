@@ -421,6 +421,20 @@ if(NK_BUILD_VULKAN_VALIDATION)
     nuka_set_warnings(nuka_present)
 endif()
 
+# The viewer panels and camera use render snapshots without a physics backend.
+if(NK_BUILD_VULKAN_VALIDATION)
+    add_library(nuka_viewer STATIC
+        runtime/app/viewer/camera_controller.cpp
+        runtime/app/viewer/file_dialog.cpp
+        runtime/app/viewer/imgui_layer.cpp
+    )
+    set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(nuka_viewer PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(nuka_viewer PUBLIC NK_BUILD_VULKAN_VALIDATION)
+    target_link_libraries(nuka_viewer PUBLIC nuka_scene nuka_present nuka_imgui imgui)
+    nuka_set_warnings(nuka_viewer)
+endif()
+
 # M9 T11-core-b2: nuka_scene_pipeline (scene/scene_pipeline.cpp + the co-orphaned
 # scene/pose_graph.*) deleted. Its sole consumer (test_scene_pipeline.cpp) was
 # dropped in T11 and the remaining scene units relinked to nuka_scene.
@@ -906,39 +920,7 @@ if(CMAKE_CUDA_COMPILER)
 
     nuka_set_warnings(nuka_app)
 
-    # -------------------------------------------------------------------------
-    # nuka_viewer -- the editor UI static lib: imgui_layer (the custom-beautified
-    # UI panels) + camera_controller (orbit/pan/zoom). The nuka_editor exe links it.
-    # Drives Simulation::FramePublish (step + publish) and presents each frame via
-    # nuka_present, with the imgui_layer as the present-pass overlay. GATED behind
-    # NK_BUILD_VULKAN_VALIDATION: the default build-cuda128 config never sees it. It
-    # links nuka_present (swapchain), nuka_imgui (Dear ImGui glue + theme),
-    # nuka_app (the frame-loop spine), and the nk physics libs (for the cook +
-    # nk::World fixture). HOST-ONLY / zero-CUDA-token.
-    # -------------------------------------------------------------------------
     if(NK_BUILD_VULKAN_VALIDATION)
-        add_library(nuka_viewer STATIC
-            runtime/app/viewer/camera_controller.cpp
-            runtime/app/viewer/file_dialog.cpp
-            runtime/app/viewer/imgui_layer.cpp
-        )
-        set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
-        target_include_directories(nuka_viewer
-            PUBLIC
-                ${CMAKE_SOURCE_DIR}/src
-        )
-        target_compile_definitions(nuka_viewer PUBLIC NK_BUILD_VULKAN_VALIDATION)
-        # imgui_layer.cpp includes the vendored ImGui (SYSTEM via the `imgui`
-        # target); camera_controller is pure host math (nuka_app/render types).
-        target_link_libraries(nuka_viewer
-            PUBLIC
-                nuka_app
-                nuka_present
-                nuka_imgui
-                imgui
-        )
-        nuka_set_warnings(nuka_viewer)
-
         # nuka_editor -- the windowed scene EDITOR exe (viewer_main + editor_scene,
         # the runtime .nks load path). Opens EMPTY and loads / swaps scenes at runtime
         # through ONE LoadEditorScene path the --scene flag also drives. OUTPUT_NAME is

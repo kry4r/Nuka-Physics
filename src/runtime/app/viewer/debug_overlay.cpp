@@ -163,6 +163,7 @@ void DebugOverlay::Reset() {
     materials_ready_ = false;
     overflow_logged_ = false;
     last_colliders_ = last_contacts_ = last_skipped_ = 0u;
+    colliders_available_ = contacts_available_ = false;
 }
 
 void DebugOverlay::EnsureMaterials(render::RenderWorld& render_world) {
@@ -193,7 +194,7 @@ uint32_t DebugOverlay::AppendColliders(nk::World& world,
     const auto& shapes = model.shape_table_rows;
     const uint32_t bodies = model.capacities.bodies_per_env;
     const uint32_t env_count = model.capacities.env_count;
-    if (shapes.empty()) return 0u;
+    if (shapes.empty()) { colliders_available_ = true; return 0u; }
     const uint32_t env = (env_count > 0u) ? (env_index % env_count) : 0u;
 
     // A body-attached collider's live frame: an articulation LINK reads
@@ -227,6 +228,7 @@ uint32_t DebugOverlay::AppendColliders(nk::World& world,
         return 0u;
     }
 
+    colliders_available_ = true;
     uint32_t emitted = 0u;
     char key[96];
     for (uint32_t i = 0; i < shapes.size(); ++i) {
@@ -305,7 +307,7 @@ uint32_t DebugOverlay::AppendContacts(nk::World& world,
     const nk::Model& model = world.GetModel();
     const uint32_t max_c = model.capacities.max_contacts_per_env;
     const uint32_t env_count = model.capacities.env_count;
-    if (max_c == 0u) return 0u;
+    if (max_c == 0u) { contacts_available_ = true; return 0u; }
     const uint32_t env = (env_count > 0u) ? (env_index % env_count) : 0u;
 
     ucontact_counts_.assign(max_c, 0u);
@@ -322,6 +324,7 @@ uint32_t DebugOverlay::AppendContacts(nk::World& world,
         return 0u;
     }
 
+    contacts_available_ = true;
     const float r = kContactMarkerRadius;
     const uint32_t mesh_id = render_world.meshes.InternPrimitive(
         "dbgcontact:marker", [&] { return MakeSphere(r, 8u, 10u); });
@@ -347,6 +350,7 @@ void DebugOverlay::Rebuild(nk::World& world, render::RenderWorld& render_world,
     // The real `instances` set is never touched, so a non-overlay frame is untouched.
     render_world.debug_instances.clear();
     last_colliders_ = last_contacts_ = last_skipped_ = 0u;
+    colliders_available_ = contacts_available_ = false;
     if (!show_colliders && !show_contacts) return;
 
     EnsureMaterials(render_world);

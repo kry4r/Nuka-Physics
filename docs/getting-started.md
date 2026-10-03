@@ -156,3 +156,8 @@ python tools/lint/physics_smell.py
 The lint enforces the deterministic physics rules, public-header constraints,
 and generated-file policy. Contribution requirements live in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+
+## Viewer and renderer checks
+
+See [Viewer and renderer validation](viewer.md) for the docked interface,
+read-only debug overlays, host-only graphics checks, and platform limitations.
