@@ -23,12 +23,14 @@
 #include "ImGuizmo.h"        // in-viewport transform gizmo (vendored, MIT)
 
 #include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/window_input.hpp"
 #include "runtime/app/viewer/file_dialog.hpp"
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_ir.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <iterator>  // std::size for array-derived loop bounds
@@ -652,6 +654,20 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ImGui::SliderFloat("##fov", &camera.fov_degrees, 20.0f, 90.0f, "%.0f deg");
 
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        const float aspect = display.y > 0.0f ? display.x / display.y : 1.0f;
+        ImGui::BeginDisabled(world.instances.empty());
+        if (ImGui::Button("Frame All (Home)", ImVec2(-1.0f, 0.0f))) camera.FrameAll(world, aspect);
+        ImGui::EndDisabled();
+        const bool can_frame_selected = ui_state.selected_entity != scene::kInvalidEntity &&
+            std::any_of(world.instances.begin(), world.instances.end(), [&](const auto& instance) {
+                return instance.entity == ui_state.selected_entity && instance.mesh_id < world.meshes.Count() &&
+                       !world.meshes.Geometry(instance.mesh_id).Empty();
+            });
+        ImGui::BeginDisabled(!can_frame_selected);
+        if (ImGui::Button("Frame Selected (F)", ImVec2(-1.0f, 0.0f)))
+            camera.FrameSelected(world, ui_state.selected_entity, aspect);
+        ImGui::EndDisabled();
         if (ImGui::Button("Reset View", ImVec2(-1.0f, 0.0f))) ui_state.camera_reset = true;
 
         ImGui::Dummy(ImVec2(0.0f, 10.0f));
@@ -659,6 +675,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ImGui::TextColored(kTextDim, "LMB drag  orbit");
         ImGui::TextColored(kTextDim, "MMB / Shift  pan");
         ImGui::TextColored(kTextDim, "wheel  zoom");
+        ImGui::TextWrapped("F / Home: frame selection / all while the pointer is over the viewport");
         ImGui::TextColored(kTextDim, "Ctrl+LMB  pick / drag entity");
     }
     ImGui::End();
@@ -935,6 +952,17 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ImGui::EndChild();
     }
     ImGui::End();
+    const ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(dockspace_id);
+    const ImVec2 mouse = ImGui::GetMousePos();
+    viewport_hovered_ = central && ui_state.window_focused && !ui_state.layout_modifier_down &&
+        !ImGui::GetIO().WantCaptureMouse &&
+        mouse.x >= central->Pos.x && mouse.y >= central->Pos.y &&
+        mouse.x < central->Pos.x + central->Size.x && mouse.y < central->Pos.y + central->Size.y;
+}
+
+void ImGuiLayer::HandleCameraShortcuts(const render::RenderWorld& world, CameraController& camera,
+                                      const ViewerUiState& ui_state) {
+    ApplyCameraShortcuts(world, camera, ui_state.selected_entity, viewport_hovered_, ui_state.gizmo.active);
 }
 
 // ---------------------------------------------------------------------------

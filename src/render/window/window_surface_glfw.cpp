@@ -197,10 +197,9 @@ private:
 
     static void WindowFocusCb(GLFWwindow* w, int focused) {
         GlfwWindowSurface* self = Self(w);
-        if (self == nullptr || focused != 0) return;
-        // Focus left: releases are lost; consumers reset latched key state.
+        if (self == nullptr) return;
         WindowEvent ev;
-        ev.type = WindowEvent::Type::FocusLost;
+        ev.type = focused ? WindowEvent::Type::FocusGained : WindowEvent::Type::FocusLost;
         self->queue_.push_back(ev);
     }
 

@@ -39,7 +39,7 @@ using WindowVkSurface  = void*;  // reinterpret to VkSurfaceKHR in the .cpp
 
 // ---------------------------------------------------------------------------
 // WindowEvent -- the minimal-but-real input the viewer consumes. One flat
-// POD per platform event; the viewer maps these onto the CommandQueue (play/
+// value per platform event; the viewer maps these onto the CommandQueue (play/
 // pause/camera) + ImGui io. Kept small on purpose (this is a showcase viewer,
 // not a game-engine input system).
 // ---------------------------------------------------------------------------
@@ -52,8 +52,9 @@ struct WindowEvent {
         MouseButton,    // button + pressed
         Key,            // key (raw keycode) + keysym (resolved) + pressed
         Scroll,         // scroll_delta carries wheel ticks (+up / -down)
-        FocusLost,      // keyboard focus left the window (releases are lost:
-                        // consumers must reset any latched modifier/drag state)
+        FocusLost,      // releases may be lost; clear latched input
+        FocusGained,
+        TextInput,      // committed UTF-8 text, separate from key bindings
     };
     Type     type = Type::None;
     uint32_t width = 0;
@@ -65,6 +66,7 @@ struct WindowEvent {
     uint32_t keysym = 0;     // resolved X11 keysym (XK_*/XKB_KEY_*); keymap-independent, 0 if unresolved
     bool     pressed = false;
     int32_t  scroll_delta = 0;
+    std::string text;
 };
 
 // ---------------------------------------------------------------------------
