@@ -23,6 +23,7 @@
 #include "render/raster/present_surface.hpp"
 #include "render/render_world.hpp"
 #include "render/window/window_surface.hpp"
+#include "runtime/app/viewer/debug_draw.hpp"
 
 #include <cstdint>
 #include <fstream>
@@ -146,7 +147,7 @@ TEST(ViewportSurface, NegotiatesOptionalCapabilitiesAndZeroExtent) {
 }
 
 TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
-    const RenderWorld world = BuildSyntheticWorld();
+    RenderWorld world = BuildSyntheticWorld();
 
     // 1. Create a surface (xcb under Xvfb here, headless on a modern loader).
     nuka::render::window::SurfaceBackendKind kind =
@@ -232,6 +233,33 @@ TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
         EXPECT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Presented);
         EXPECT_EQ(present->Report().frames_presented, before + 1u);
     }
+
+    nuka::runtime::app::viewer::DebugDrawBatch debug;
+    nuka::scene::RenderMaterial green;
+    green.base_color[0] = 0.15f; green.base_color[1] = 0.85f; green.base_color[2] = 0.25f;
+    green.emissive[0] = 0.1f; green.emissive[1] = 0.4f; green.emissive[2] = 0.1f;
+    green.opacity = 0.5f;
+    world.materials.push_back(green);
+    const float sphere[4] = {0.4f, 0.0f, 0.0f, 0.0f};
+    const float box[4] = {0.25f, 0.25f, 0.3f, 0.0f};
+    debug.AppendCollider(world, 0u, sphere, world.instances[0].world_xform, 2u);
+    debug.AppendCollider(world, 2u, box, world.instances[1].world_xform, 2u);
+    debug.AppendContact(world, {0.0f, 0.0f, 0.1f}, 2u);
+    ASSERT_EQ(world.debug_instances.size(), 3u);
+    const char* debug_capture = "/tmp/nuka_debug_proxies.ppm";
+    std::remove(debug_capture);
+    if (present->Report().capture_supported)
+        present->SetCaptureFrame(static_cast<int>(present->Report().frames_presented), debug_capture);
+    EXPECT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Presented);
+    if (present->Report().capture_supported) {
+        std::ifstream capture(debug_capture, std::ios::binary | std::ios::ate);
+        ASSERT_TRUE(capture.good());
+        EXPECT_GT(capture.tellg(), static_cast<std::streamoff>(options.width) * options.height * 3);
+    }
+    world.debug_instances.clear();
+    debug.Reset();
+    EXPECT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Presented);
+    EXPECT_EQ(world.instances.size(), 2u);
 
     const auto& report = present->Report();
     std::printf("[viewport_present_smoke] backend=%s device=%s images=%u "

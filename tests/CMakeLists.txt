@@ -602,6 +602,7 @@ add_executable(nuka_editor_debug_overlay_test
     scenario/editor_debug_overlay.cpp
     ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/editor_scene.cpp
     ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/debug_overlay.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/debug_draw.cpp
 )
 add_dependencies(nuka_editor_debug_overlay_test nuka_codegen)
 target_include_directories(nuka_editor_debug_overlay_test
@@ -3986,6 +3987,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
     #     tests/nuka_viewport_present_smoke_test
     add_executable(nuka_viewport_present_smoke_test
         scenario/viewport_present_smoke.cpp
+        ${CMAKE_SOURCE_DIR}/src/runtime/app/viewer/debug_draw.cpp
     )
     add_dependencies(nuka_viewport_present_smoke_test nuka_render_shaders)
     target_compile_definitions(nuka_viewport_present_smoke_test

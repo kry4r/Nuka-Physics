@@ -33,8 +33,15 @@ objects. Hide all disables both overlays.
 - Orange: contact-position marker, not a force or impulse visualization
 
 Counts describe the previous overlay snapshot's emitted geometry. N/A means the
-layer was disabled or its data was unavailable. Unsupported collider shapes and
-an exhausted overlay budget are reported. Primitive colliders are supported;
+layer was disabled, unavailable, or not read because collider proxies used the
+budget. This last case reports an unknown contact omission count, never a sampled
+zero. Filling the budget exactly does not imply omitted geometry; known valid
+instances that do not fit are counted separately. Invalid dimensions, non-finite
+points/poses, and rotations outside a unit-quaternion squared-norm tolerance of
+0.001 are skipped and reported separately from
+unsupported shapes. Primitive cache keys preserve the exact effective dimensions;
+finite nonpositive plane extents retain the finite ground-patch fallback.
+Primitive colliders are supported;
 convex, SDF, and heightfield proxy coverage is incomplete. Wireframe falls back
 to translucent fill when the device lacks non-solid polygon support.
 

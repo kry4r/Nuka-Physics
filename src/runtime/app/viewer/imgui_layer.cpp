@@ -583,21 +583,32 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ImGui::TextColored(kTextDim, "Previous overlay snapshot");
         char count[48];
         std::snprintf(count, sizeof(count), "%u", stats.debug_colliders);
-        StatRow("colliders", stats.debug_colliders_available ? count : "N/A", kText);
+        StatRow("proxies", stats.debug_colliders_available ? count : "N/A", kText);
         std::snprintf(count, sizeof(count), "%u", stats.debug_contacts);
-        StatRow("contacts", stats.debug_contacts_available ? count : "N/A", kText);
+        StatRow("markers", stats.debug_contacts_available ? count : "N/A", kText);
         if (ui_state.has_scene && stats.debug_skipped_shapes != 0u) {
             ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
             ImGui::TextWrapped("%u unsupported collider shapes skipped", stats.debug_skipped_shapes);
             ImGui::PopStyleColor();
         }
-        if (ui_state.has_scene && stats.debug_capacity > 0u &&
-            stats.debug_colliders + stats.debug_contacts >= stats.debug_capacity) {
+        if (ui_state.has_scene && (stats.debug_invalid_colliders != 0u || stats.debug_invalid_contacts != 0u)) {
             ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
-            ImGui::TextWrapped("Overlay limit reached (%u); some geometry may be omitted", stats.debug_capacity);
+            ImGui::TextWrapped("Invalid data skipped: %u colliders, %u contact points",
+                               stats.debug_invalid_colliders, stats.debug_invalid_contacts);
             ImGui::PopStyleColor();
         }
-        ImGui::TextWrapped("N/A: overlay disabled or readback unavailable. Markers show positions, not forces.");
+        if (ui_state.has_scene && stats.debug_omitted_instances != 0u) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+            ImGui::TextWrapped("Overlay limit %u: %llu valid instances omitted", stats.debug_capacity,
+                               static_cast<unsigned long long>(stats.debug_omitted_instances));
+            ImGui::PopStyleColor();
+        }
+        if (ui_state.has_scene && stats.debug_contacts_budget_skipped) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+            ImGui::TextWrapped("Contacts not read: collider proxies used the overlay budget. Omitted count unknown.");
+            ImGui::PopStyleColor();
+        }
+        ImGui::TextWrapped("N/A: disabled, unavailable, or not read. Markers show positions, not forces.");
     }
     ImGui::End();
 
