@@ -15,7 +15,7 @@
 // HOST-ONLY / zero-CUDA-token: device reads go only through Data::DownloadField.
 // ---------------------------------------------------------------------------
 
-#include "render/render_world.hpp"
+#include "runtime/app/viewer/debug_draw.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -25,14 +25,6 @@ class World;
 }  // namespace nuka::nk
 
 namespace nuka::runtime::app::viewer {
-
-// One uniform cap on the total debug instances (collider proxies + contact
-// markers) appended per frame. Overflow drops the remainder with a loud one-shot
-// log -- no magic per-scene number (the project's cap discipline).
-inline constexpr uint32_t kMaxDebugOverlayInstances = 8192u;
-
-// Fixed marker radius (metres) for a contact-point sphere.
-inline constexpr float kContactMarkerRadius = 0.02f;
 
 class DebugOverlay {
 public:
@@ -52,11 +44,12 @@ public:
                  uint32_t env_index, bool show_colliders, bool show_contacts);
 
     // Counts emitted by the most recent Rebuild (the data-path gate reads these).
-    uint32_t LastColliderCount() const { return last_colliders_; }
-    uint32_t LastContactCount()  const { return last_contacts_; }
-    uint32_t LastSkippedShapes() const { return last_skipped_; }
+    uint32_t LastColliderCount() const { return batch_.Report().colliders; }
+    uint32_t LastContactCount()  const { return batch_.Report().contacts; }
+    uint32_t LastSkippedShapes() const { return batch_.Report().unsupported_shapes; }
     bool CollidersAvailable() const { return colliders_available_; }
     bool ContactsAvailable() const { return contacts_available_; }
+    const DebugDrawReport& DrawReport() const { return batch_.Report(); }
 
 private:
     // Append the three debug materials (dynamic / static / contact) to the
@@ -64,10 +57,10 @@ private:
     // (the rebuilt RenderWorld dropped the prior materials).
     void EnsureMaterials(render::RenderWorld& render_world);
 
-    uint32_t AppendColliders(nk::World& world, render::RenderWorld& render_world,
-                             uint32_t env_index, uint32_t& budget);
-    uint32_t AppendContacts(nk::World& world, render::RenderWorld& render_world,
-                            uint32_t env_index, uint32_t& budget);
+    void AppendColliders(nk::World& world, render::RenderWorld& render_world,
+                         uint32_t env_index);
+    void AppendContacts(nk::World& world, render::RenderWorld& render_world,
+                        uint32_t env_index);
 
     // Material ids into RenderWorld::materials; valid only while materials_ready_.
     uint32_t mat_dynamic_ = 0u;
@@ -78,9 +71,7 @@ private:
 
     bool colliders_available_ = false;
     bool contacts_available_ = false;
-    uint32_t last_colliders_ = 0u;
-    uint32_t last_contacts_  = 0u;
-    uint32_t last_skipped_   = 0u;
+    DebugDrawBatch batch_;
 
     // Reused host staging for the per-frame field downloads (allocation-free after
     // the first rebuild).

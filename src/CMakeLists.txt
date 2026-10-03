@@ -432,6 +432,7 @@ endif()
 if(NK_BUILD_VULKAN_VALIDATION)
     add_library(nuka_viewer STATIC
         runtime/app/viewer/camera_controller.cpp
+        runtime/app/viewer/debug_draw.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
         runtime/app/viewer/window_input.cpp
