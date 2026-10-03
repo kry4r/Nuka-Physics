@@ -268,6 +268,10 @@ struct ViewerStats {
     uint32_t debug_contacts = 0u;
     uint32_t debug_skipped_shapes = 0u;
     uint32_t debug_capacity = 0u;
+    uint32_t debug_invalid_colliders = 0u;
+    uint32_t debug_invalid_contacts = 0u;
+    uint64_t debug_omitted_instances = 0u;
+    bool     debug_contacts_budget_skipped = false;
     bool     debug_colliders_available = false;
     bool     debug_contacts_available = false;
     std::string device_name;

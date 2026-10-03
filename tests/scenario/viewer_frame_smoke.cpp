@@ -37,6 +37,7 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
+#include "runtime/app/viewer/debug_draw.hpp"
 #include "runtime/app/viewer/window_input.hpp"
 #ifndef _WIN32
 #include "render/window/xcb_keyboard.h"
@@ -128,6 +129,150 @@ void WritePpm(const std::string& path, const std::vector<VulkanRgba8>& pixels,
 // VIEW-1: camera screen->world ray + drag-plane unproject (pure host, NO Vulkan
 // -- runs even with no graphics device). Center pixel -> a ray along the camera
 // forward; a known ground plane is hit at the expected world point.
+TEST(ViewerDebugDraw, ExactPrimitiveKeysKeepDistinctGeometryAndReuseIdenticalInputs) {
+    using namespace nuka::runtime::app::viewer;
+    RenderWorld world = BuildSyntheticWorld();
+    const auto real = world.instances;
+    DebugDrawBatch batch;
+    const auto pose = nuka::math::Transform::Identity();
+    for (uint32_t kind = 0u; kind < 4u; ++kind) {
+        const uint32_t count = kind == 0u ? 1u : (kind == 2u ? 3u : 2u);
+        for (uint32_t axis = 0u; axis < count; ++axis) {
+            float a[4] = {0.00001f, 0.00001f, 0.00001f, 0.0f};
+            float b[4] = {0.00001f, 0.00001f, 0.00001f, 0.0f};
+            b[axis] = 0.00002f;
+            batch.AppendCollider(world, kind, a, pose, 0u);
+            const auto first = world.debug_instances.back().mesh_id;
+            batch.AppendCollider(world, kind, b, pose, 0u);
+            const auto second = world.debug_instances.back().mesh_id;
+            EXPECT_NE(first, second);
+            EXPECT_NE(world.meshes.Geometry(first).positions, world.meshes.Geometry(second).positions);
+            batch.AppendCollider(world, kind, a, pose, 0u);
+            EXPECT_EQ(first, world.debug_instances.back().mesh_id);
+            b[axis] = std::nextafter(a[axis], 1.0f);
+            batch.AppendCollider(world, kind, b, pose, 0u);
+            EXPECT_NE(first, world.debug_instances.back().mesh_id);
+        }
+    }
+    float plane[4] = {};
+    batch.AppendCollider(world, 3u, plane, pose, 0u);
+    const auto fallback = world.debug_instances.back().mesh_id;
+    plane[0] = -1.0f; plane[1] = -0.0f;
+    batch.AppendCollider(world, 3u, plane, pose, 0u);
+    EXPECT_EQ(fallback, world.debug_instances.back().mesh_id);
+    float sphere[4] = {0.00002f, 0.0f, 0.0f, 0.0f};
+    batch.AppendCollider(world, 0u, sphere, pose, 0u);
+    float extent = 0.0f;
+    for (float p : world.meshes.Geometry(world.debug_instances.back().mesh_id).positions)
+        extent = std::max(extent, std::abs(p));
+    EXPECT_FLOAT_EQ(extent, sphere[0]);
+    ASSERT_EQ(world.instances.size(), real.size());
+    for (size_t i = 0u; i < real.size(); ++i) {
+        EXPECT_EQ(world.instances[i].mesh_id, real[i].mesh_id);
+        EXPECT_EQ(world.instances[i].world_xform.position, real[i].world_xform.position);
+        EXPECT_EQ(world.instances[i].entity, real[i].entity);
+    }
+}
+
+TEST(ViewerDebugDraw, RejectsInvalidInputsAndKeepsTinyAndLargeNormalsFinite) {
+    using namespace nuka::runtime::app::viewer;
+    using nuka::math::Transform;
+    RenderWorld world;
+    DebugDrawBatch batch;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    float p[4] = {nan, 0.1f, 0.1f, 0.0f};
+    for (uint32_t kind = 0u; kind < 4u; ++kind) batch.AppendCollider(world, kind, p, Transform::Identity(), 0u);
+    p[0] = -1.0f;
+    for (uint32_t kind = 0u; kind < 3u; ++kind) batch.AppendCollider(world, kind, p, Transform::Identity(), 0u);
+    p[0] = 0.1f;
+    Transform bad;
+    bad.position.x = inf;
+    batch.AppendCollider(world, 0u, p, bad, 0u);
+    bad = Transform::Identity(); bad.rotation.w = 0.0f;
+    batch.AppendCollider(world, 0u, p, bad, 0u);
+    bad.rotation.w = nan;
+    batch.AppendCollider(world, 0u, p, bad, 0u);
+    bad.rotation.w = 2.0f;
+    batch.AppendCollider(world, 0u, p, bad, 0u);
+    p[0] = p[1] = std::numeric_limits<float>::max();
+    batch.AppendCollider(world, 1u, p, Transform::Identity(), 0u);
+    p[0] = 0.0f;
+    batch.AppendCollider(world, 0u, p, Transform::Identity(), 0u);
+    p[0] = 0.1f; p[1] = -0.1f;
+    batch.AppendCollider(world, 1u, p, Transform::Identity(), 0u);
+    p[1] = 0.1f; p[2] = 0.0f;
+    batch.AppendCollider(world, 2u, p, Transform::Identity(), 0u);
+    p[1] = inf;
+    batch.AppendCollider(world, 3u, p, Transform::Identity(), 0u);
+    p[0] = p[1] = p[2] = 2e38f;
+    bad = Transform::Identity(); bad.position.x = 2e38f;
+    batch.AppendCollider(world, 2u, p, bad, 0u);
+    batch.AppendCollider(world, 4u, p, Transform::Identity(), 0u);
+    batch.AppendContact(world, {nan, 0.0f, 0.0f}, 0u);
+    batch.AppendContact(world, {0.0f, inf, 0.0f}, 0u);
+    EXPECT_EQ(batch.Report().invalid_colliders, 17u);
+    EXPECT_EQ(batch.Report().unsupported_shapes, 1u);
+    EXPECT_EQ(batch.Report().invalid_contacts, 2u);
+    EXPECT_TRUE(world.debug_instances.empty());
+    EXPECT_EQ(world.meshes.Count(), 0u);
+    for (float size : {1e-20f, 1e30f}) {
+        p[0] = p[1] = p[2] = size;
+        batch.AppendCollider(world, 2u, p, Transform::Identity(), 0u);
+        const auto& geometry = world.meshes.Geometry(world.debug_instances.back().mesh_id);
+        for (float v : geometry.positions) EXPECT_TRUE(std::isfinite(v));
+        for (size_t i = 0; i < geometry.normals.size(); i += 3u) {
+            const double n = std::hypot(geometry.normals[i], geometry.normals[i + 1u], geometry.normals[i + 2u]);
+            EXPECT_NEAR(n, 1.0, 1e-6);
+        }
+    }
+    batch.AppendContact(world, {0.0f, 0.0f, 0.0f}, 0u);
+    EXPECT_EQ(batch.Report().contacts, 1u);
+    batch.Reset();
+    EXPECT_EQ(batch.Remaining(), kMaxDebugOverlayInstances);
+    EXPECT_EQ(batch.Report().invalid_colliders, 0u);
+    EXPECT_EQ(batch.Report().invalid_contacts, 0u);
+    EXPECT_EQ(batch.Report().unsupported_shapes, 0u);
+}
+
+TEST(ViewerDebugDraw, BudgetSeparatesExactCapacityKnownOmissionsAndUnreadContacts) {
+    using namespace nuka::runtime::app::viewer;
+    RenderWorld world;
+    DebugDrawBatch batch;
+    EXPECT_FALSE(batch.ShouldReadContacts(0u));
+    EXPECT_FALSE(batch.Report().contacts_budget_skipped);
+    EXPECT_TRUE(batch.ShouldReadContacts(64u));
+    for (uint32_t i = 0u; i < kMaxDebugOverlayInstances - 1u; ++i)
+        batch.AppendContact(world, {}, 0u);
+    EXPECT_EQ(batch.Remaining(), 1u);
+    batch.AppendContact(world, {}, 0u);
+    EXPECT_EQ(batch.Remaining(), 0u);
+    EXPECT_EQ(batch.Report().omitted_instances, 0u);
+    EXPECT_FALSE(batch.ShouldReadContacts(64u));
+    EXPECT_TRUE(batch.Report().contacts_budget_skipped);
+    EXPECT_FALSE(batch.ShouldReadContacts(0u));
+    EXPECT_FALSE(batch.Report().contacts_budget_skipped);
+    batch.AppendContact(world, {}, 0u);
+    EXPECT_EQ(batch.Report().omitted_instances, 1u);
+    float p[4] = {0.123456f, 0.0f, 0.0f, 0.0f};
+    const auto meshes = world.meshes.Count();
+    batch.AppendCollider(world, 0u, p, nuka::math::Transform::Identity(), 0u);
+    EXPECT_EQ(batch.Report().omitted_instances, 2u);
+    EXPECT_EQ(world.meshes.Count(), meshes);
+    EXPECT_EQ(world.debug_instances.size(), kMaxDebugOverlayInstances);
+    batch.Reset();
+    world.debug_instances.clear();
+    for (uint32_t i = 0u; i < kMaxDebugOverlayInstances; ++i)
+        batch.AppendCollider(world, 0u, p, nuka::math::Transform::Identity(), 0u);
+    EXPECT_EQ(batch.Report().omitted_instances, 0u);
+    EXPECT_FALSE(batch.ShouldReadContacts(64u));
+    EXPECT_TRUE(batch.Report().contacts_budget_skipped);
+    EXPECT_EQ(batch.Report().contacts, 0u);
+    batch.Reset();
+    EXPECT_EQ(batch.Report().omitted_instances, 0u);
+    EXPECT_FALSE(batch.Report().contacts_budget_skipped);
+}
+
 TEST(ViewerInput, Utf8EditingModifiersAndFocusUseProductionAdapter) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -626,6 +771,41 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
         imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
     });
     WritePpm("/tmp/nuka_viewer_camera.ppm", selected_view.pixels, selected_view.width, selected_view.height);
+
+    ASSERT_TRUE(camera.FrameAll(world, static_cast<float>(options.width) / static_cast<float>(options.height)));
+    camera.WriteOptions(options);
+    stats.debug_invalid_colliders = 3u;
+    stats.debug_invalid_contacts = 0u;
+    stats.debug_omitted_instances = 1u;
+    stats.debug_contacts_budget_skipped = true;
+    stats.debug_colliders_available = true;
+    stats.debug_colliders = 8192u;
+    ui_state.show_colliders = ui_state.show_contacts = true;
+    ImGui::SetWindowFocus("Physics Debug");
+    for (int i = 0; i < 4; ++i) build_ui();
+    const auto diagnostics = renderer->Render(world, options, [&imgui](void* cmd) {
+        imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    });
+    WritePpm("/tmp/nuka_debug_diagnostics.ppm", diagnostics.pixels, diagnostics.width, diagnostics.height);
+
+    options.width = 960u; options.height = 600u;
+    for (int i = 0; i < 4; ++i) build_ui();
+    const auto diagnostics_narrow = renderer->Render(world, options, [&imgui](void* cmd) {
+        imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    });
+    WritePpm("/tmp/nuka_debug_diagnostics_narrow.ppm", diagnostics_narrow.pixels,
+             diagnostics_narrow.width, diagnostics_narrow.height);
+
+    ImGuiWindow* debug_panel = ImGui::FindWindowByName("Physics Debug");
+    ASSERT_NE(debug_panel, nullptr);
+    ASSERT_GT(debug_panel->ScrollMax.y, 0.0f);
+    ImGui::SetScrollY(debug_panel, debug_panel->ScrollMax.y);
+    for (int i = 0; i < 2; ++i) build_ui();
+    const auto diagnostics_scrolled = renderer->Render(world, options, [&imgui](void* cmd) {
+        imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    });
+    WritePpm("/tmp/nuka_debug_diagnostics_scrolled.ppm", diagnostics_scrolled.pixels,
+             diagnostics_scrolled.width, diagnostics_scrolled.height);
 
     imgui.Shutdown();
 }
