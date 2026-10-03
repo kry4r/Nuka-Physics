@@ -119,6 +119,8 @@ struct GizmoState {
 // (no time input) is what makes the recorded composite deterministic.
 // ---------------------------------------------------------------------------
 struct ViewerUiState {
+    bool     window_focused = true;
+    bool     layout_modifier_down = false;
     bool     playing   = false;   // open PAUSED on the authored pose; Play/Step advances
     // Simulated-seconds per wall-second target: the frame loop accumulates
     // speed * real frame time and consumes it in fixed-dt physics steps.
@@ -301,6 +303,9 @@ public:
     // when the gizmo is hovered/dragged (the viewer suppresses orbit + picking).
     // Call AFTER RecordUi each frame; a no-op when the gizmo is disabled. Uses the
     // CameraController's resolved basis/fov so it aligns with the rendered image.
+    void HandleCameraShortcuts(const render::RenderWorld& world, CameraController& camera,
+                               const ViewerUiState& ui_state);
+
     void DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h,
                    ViewerUiState& ui_state, math::Transform& world, bool& changed);
 
@@ -308,6 +313,7 @@ private:
     // The docking layout is built ONCE (the first frame the dockspace exists). A
     // latch so we do not re-split every frame (which would fight a user re-dock).
     bool dock_built_ = false;
+    bool viewport_hovered_ = false;
 };
 
 }  // namespace nuka::runtime::app::viewer

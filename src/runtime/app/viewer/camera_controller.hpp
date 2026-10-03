@@ -76,11 +76,13 @@ public:
     void WriteOptions(render::RasterOptions& out) const;
 
     // ---- framing -----------------------------------------------------------
-    // Frame an AABB: center the target, set distance to fit the bounding sphere
-    // for the current fov, reset to a pleasant 3/4 view angle. The viewer calls
-    // this once at startup (and on the "reset camera" command) with the scene
-    // AABB so SOMETHING is always well-composed. Safe with a degenerate AABB.
-    void FrameAabb(const math::Vec3& aabb_min, const math::Vec3& aabb_max);
+    // Center the bounds in a 3/4 view; fit the sphere to the limiting field of view.
+    // Invalid or unrepresentable bounds return false without changing the camera.
+    bool FrameAabb(const math::Vec3& aabb_min, const math::Vec3& aabb_max, float aspect = 1.0f);
+
+    // Frame actual render geometry, including baked scale, without changing world data.
+    bool FrameAll(const render::RenderWorld& world, float aspect = 1.0f);
+    bool FrameSelected(const render::RenderWorld& world, scene::EntityId selected, float aspect = 1.0f);
 
     // Set the orbit state directly (the --cam override): focus `target`, dolly
     // `distance`, `yaw`/`pitch` in radians. Clamped to the same sane bounds.
@@ -119,6 +121,7 @@ public:
     float move_speed  = 1.5f;    // WASD world units/sec at dolly distance 1
 
 private:
+    bool FramePreservingView(const math::Vec3& lo, const math::Vec3& hi, float aspect);
     // Spherical orbit state about `target_`.
     float yaw_      = 0.9f;    // ~52deg around +Z -> a 3/4 view
     float pitch_    = 0.45f;   // ~26deg elevation

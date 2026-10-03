@@ -37,6 +37,11 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
+#include "runtime/app/viewer/window_input.hpp"
+#ifndef _WIN32
+#include "render/window/xcb_keyboard.h"
+#include <xcb/xcb.h>
+#endif
 #include "scene/asset/asset_ref.hpp"
 #include "scene/asset/nka.hpp"
 
@@ -44,6 +49,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -122,6 +128,204 @@ void WritePpm(const std::string& path, const std::vector<VulkanRgba8>& pixels,
 // VIEW-1: camera screen->world ray + drag-plane unproject (pure host, NO Vulkan
 // -- runs even with no graphics device). Center pixel -> a ray along the camera
 // forward; a known ground plane is hit at the expected world point.
+TEST(ViewerInput, Utf8EditingModifiersAndFocusUseProductionAdapter) {
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(960.0f, 600.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    io.IniFilename = nullptr;
+    unsigned char* pixels = nullptr;
+    int width = 0, height = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    nuka::runtime::app::viewer::WindowInput input;
+    char buffer[128] = {};
+    bool focus_lost_event = false;
+    auto frame = [&](bool focus = false) {
+        ImGui::NewFrame();
+        focus_lost_event = io.AppFocusLost;
+        ImGui::Begin("Input fixture");
+        if (focus) ImGui::SetKeyboardFocusHere();
+        ImGui::InputText("text", buffer, sizeof(buffer));
+        ImGui::End();
+        ImGui::Render();
+    };
+    auto key = [&](uint32_t code, uint32_t symbol, bool pressed) {
+        nuka::render::window::WindowEvent event;
+        event.type = nuka::render::window::WindowEvent::Type::Key;
+        event.key = code; event.keysym = symbol; event.pressed = pressed;
+        input.Feed(event);
+        frame();
+    };
+    frame(true); frame();
+    nuka::render::window::WindowEvent event;
+    event.type = nuka::render::window::WindowEvent::Type::TextInput;
+    event.text = "Nuka \xc3\xa9\xce\xa9";
+    input.Feed(event); frame();
+    EXPECT_STREQ(buffer, "Nuka \xc3\xa9\xce\xa9");
+    key(22u, 0xff08u, true);
+    EXPECT_STREQ(buffer, "Nuka \xc3\xa9");
+    key(22u, 0xff08u, false);
+    key(37u, 0xffe3u, true);
+    key(105u, 0xffe4u, true);
+    key(37u, 0xffe3u, false);
+    EXPECT_TRUE(io.KeyCtrl);
+    key(38u, 'a', true);
+    key(38u, 'q', true);
+    EXPECT_TRUE(ImGui::IsKeyDown(ImGuiKey_A));
+    EXPECT_FALSE(ImGui::IsKeyDown(ImGuiKey_Q));
+    key(38u, 'q', false);
+    EXPECT_FALSE(ImGui::IsKeyDown(ImGuiKey_A));
+    key(105u, 0xffe4u, false);
+    event.text = "edited";
+    input.Feed(event); frame();
+    EXPECT_STREQ(buffer, "edited");
+    key(37u, 0xffe3u, true);
+    event.type = nuka::render::window::WindowEvent::Type::FocusLost;
+    input.Feed(event); frame();
+    EXPECT_FALSE(io.KeyCtrl);
+    EXPECT_TRUE(focus_lost_event);
+    event.type = nuka::render::window::WindowEvent::Type::FocusGained;
+    input.Feed(event); frame(true); frame();
+    EXPECT_FALSE(io.AppFocusLost);
+    event.type = nuka::render::window::WindowEvent::Type::TextInput;
+    event.text = "ready";
+    input.Feed(event); frame();
+    EXPECT_NE(std::strstr(buffer, "ready"), nullptr);
+    key(37u, 0xffe3u, true);
+    key(38u, 'a', true);
+    event.type = nuka::render::window::WindowEvent::Type::MouseButton;
+    event.button = 0u; event.pressed = true;
+    input.Feed(event); frame();
+    event.type = nuka::render::window::WindowEvent::Type::FocusLost;
+    input.Feed(event);
+    event.type = nuka::render::window::WindowEvent::Type::FocusGained;
+    input.Feed(event); frame();
+    EXPECT_FALSE(io.KeyCtrl);
+    EXPECT_FALSE(ImGui::IsKeyDown(ImGuiKey_A));
+    EXPECT_FALSE(io.MouseDown[0]);
+    key(108u, 0xfe03u, true);
+    EXPECT_TRUE(input.LayoutModifierDown());
+    key(108u, 0xfe03u, false);
+    EXPECT_FALSE(input.LayoutModifierDown());
+    ImGui::DestroyContext();
+}
+
+#ifndef _WIN32
+TEST(ViewerInput, XkbComposeProducesCommittedUtf8AndResets) {
+    std::unique_ptr<NukaXkbText, decltype(&NukaXkbTextDestroy)> text(
+        NukaXkbTextCreate("en_US.UTF-8"), &NukaXkbTextDestroy);
+    ASSERT_NE(text, nullptr);
+    EXPECT_STREQ(NukaXkbTextFeed(text.get(), 0xfe51u), "");
+    EXPECT_STREQ(NukaXkbTextFeed(text.get(), 'a'), "\xc3\xa1");
+    EXPECT_STREQ(NukaXkbTextFeed(text.get(), 0x010003a9u), "\xce\xa9");
+    EXPECT_STREQ(NukaXkbTextFeed(text.get(), 0xfe51u), "");
+    NukaXkbTextReset(text.get());
+    EXPECT_STREQ(NukaXkbTextFeed(text.get(), 'a'), "a");
+    EXPECT_STREQ(NukaXkbTextFeed(text.get(), 0xff0du), "");
+    xcb_key_release_event_t release{};
+    release.response_type = XCB_KEY_RELEASE; release.detail = 38u; release.time = 123u;
+    xcb_key_press_event_t press{};
+    press.response_type = XCB_KEY_PRESS; press.detail = 38u; press.time = 123u;
+    EXPECT_TRUE(NukaXcbAutoRepeatPair(&release, &press));
+    press.time = 124u;
+    EXPECT_FALSE(NukaXcbAutoRepeatPair(&release, &press));
+    EXPECT_FALSE(NukaXcbAutoRepeatPair(&release, nullptr));
+}
+#endif
+
+TEST(ViewerCameraFraming, SelectionUsesTransformedGeometryAndExcludesDebug) {
+    auto world = BuildSyntheticWorld();
+    auto geometry = world.meshes.Geometry(world.instances[1].mesh_id);
+    for (size_t i = 0; i + 2u < geometry.positions.size(); i += 3u) {
+        geometry.positions[i] *= 3.0f;
+        geometry.positions[i + 1u] *= 0.5f;
+        geometry.positions[i + 2u] *= 2.0f;
+    }
+    world.meshes.ReplaceGeometry(world.instances[1].mesh_id, std::move(geometry));
+    world.instances[1].world_xform.rotation = nuka::math::Quat::FromAxisAngle({0, 0, 1}, 1.57079633f);
+    auto debug = world.instances[1];
+    debug.world_xform.position = {1000.0f, 1000.0f, 1000.0f};
+    world.debug_instances.push_back(debug);
+    nuka::runtime::app::viewer::CameraController camera;
+    camera.SetView({5, 5, 5}, 10.0f, 0.5f, 0.2f);
+    const auto before = world.instances[1].world_xform;
+    ASSERT_TRUE(camera.FrameSelected(world, world.instances[1].entity));
+    EXPECT_NEAR(camera.ResolvedTarget().x, 0.5f, 1e-5f);
+    EXPECT_NEAR(camera.ResolvedTarget().z, 0.25f, 1e-5f);
+    EXPECT_FLOAT_EQ(camera.Yaw(), 0.5f);
+    EXPECT_FLOAT_EQ(camera.Pitch(), 0.2f);
+    EXPECT_LT(camera.Distance(), 10.0f);
+    const float wide_distance = camera.Distance();
+    ASSERT_TRUE(camera.FrameSelected(world, world.instances[1].entity, 0.5f));
+    EXPECT_GT(camera.Distance(), wide_distance);
+    EXPECT_FLOAT_EQ(world.instances[1].world_xform.position.x, before.position.x);
+    EXPECT_FLOAT_EQ(world.instances[1].world_xform.rotation.w, before.rotation.w);
+    EXPECT_FALSE(camera.FrameSelected(world, nuka::scene::kInvalidEntity));
+    EXPECT_FALSE(camera.FrameSelected(world, {999u, 0u}));
+    ASSERT_TRUE(camera.FrameAll(world));
+    EXPECT_LT(camera.Distance(), 10.0f);
+    RenderWorld empty;
+    const float unchanged = camera.Distance();
+    EXPECT_FALSE(camera.FrameAll(empty));
+    EXPECT_FLOAT_EQ(camera.Distance(), unchanged);
+    const auto target = camera.ResolvedTarget();
+    const float huge = std::numeric_limits<float>::max();
+    EXPECT_FALSE(camera.FrameAabb({huge, huge, huge}, {huge, huge, huge}));
+    EXPECT_FALSE(camera.FrameAabb({-huge, -huge, -huge}, {huge, huge, huge}));
+    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, target.x);
+    EXPECT_FLOAT_EQ(camera.Distance(), unchanged);
+    camera.fov_degrees = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(camera.FrameAll(world));
+    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, target.x);
+    EXPECT_FLOAT_EQ(camera.Distance(), unchanged);
+    camera.fov_degrees = 45.0f;
+    camera.SetView({0, 0, 0}, 10.0f, 0.0f, 0.0f);
+    world.instances[1].world_xform.position = {1e9f, 0.0f, 0.0f};
+    EXPECT_FALSE(camera.FrameSelected(world, world.instances[1].entity));
+    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, 0.0f);
+    EXPECT_FLOAT_EQ(camera.Distance(), 10.0f);
+}
+
+TEST(ViewerInput, CameraShortcutsRespectTextFocusAndViewportOwnership) {
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(960.0f, 600.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    io.IniFilename = nullptr;
+    unsigned char* pixels = nullptr;
+    int width = 0, height = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    auto world = BuildSyntheticWorld();
+    nuka::runtime::app::viewer::WindowInput input;
+    nuka::runtime::app::viewer::CameraController camera;
+    auto press = [&](bool hovered, bool typing, bool gizmo, uint32_t symbol = 'f') {
+        camera.SetView({10, 10, 10}, 20.0f, 0.5f, 0.2f);
+        nuka::render::window::WindowEvent event;
+        event.type = nuka::render::window::WindowEvent::Type::Key;
+        event.key = 41u; event.keysym = symbol; event.pressed = true;
+        input.Feed(event);
+        ImGui::NewFrame();
+        io.WantCaptureKeyboard = typing;
+        io.WantTextInput = typing;
+        nuka::runtime::app::viewer::ApplyCameraShortcuts(world, camera, world.instances[1].entity, hovered, gizmo);
+        ImGui::Render();
+        event.pressed = false;
+        input.Feed(event);
+        ImGui::NewFrame(); ImGui::Render();
+    };
+    press(true, true, false);
+    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, 10.0f);
+    press(false, false, false);
+    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, 10.0f);
+    press(true, false, true);
+    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, 10.0f);
+    press(true, false, false);
+    EXPECT_NEAR(camera.ResolvedTarget().x, 0.5f, 1e-5f);
+    press(true, false, false, 0xff50u);
+    EXPECT_LT(camera.ResolvedTarget().x, 0.5f);
+    ImGui::DestroyContext();
+}
+
 TEST(ViewerInteraction, TransportTogglesKeepStyleStackBalanced) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -407,6 +611,21 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
         imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
     });
     WritePpm("/tmp/nuka_viewer_inspector.ppm", inspector.pixels, inspector.width, inspector.height);
+    options.width = 1280u; options.height = 720u;
+    ImGui::SetWindowFocus("Camera");
+    for (int i = 0; i < 4; ++i) build_ui();
+    ImGuiWindow* camera_panel = ImGui::FindWindowByName("Camera");
+    ASSERT_NE(camera_panel, nullptr);
+    ImGui::ActivateItemByID(camera_panel->GetID("Frame Selected (F)"));
+    build_ui();
+    EXPECT_NEAR(camera.ResolvedTarget().x, world.instances[1].world_xform.position.x, 1e-5f);
+    EXPECT_NEAR(camera.ResolvedTarget().z, world.instances[1].world_xform.position.z, 1e-5f);
+    build_ui();
+    camera.WriteOptions(options);
+    const auto selected_view = renderer->Render(world, options, [&imgui](void* cmd) {
+        imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    });
+    WritePpm("/tmp/nuka_viewer_camera.ppm", selected_view.pixels, selected_view.width, selected_view.height);
 
     imgui.Shutdown();
 }
