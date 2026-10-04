@@ -319,7 +319,7 @@ scene::JointType MjcfJointType(const char* type_str) {
     if (t == "free") {
         return scene::JointType::Free;
     }
-    return scene::JointType::Revolute;
+    throw std::runtime_error("MJCF: unsupported joint type '" + t + "'");
 }
 
 const MjcfDefaultClass& DefaultClassOrRoot(const MjcfDefaults& defaults,
@@ -886,6 +886,13 @@ void ParseBody(tinyxml2::XMLElement* body_elem,
                     throw std::runtime_error("MJCF: invalid mesh triangle limit");
                 shape.mesh_triangle_limit = count;
             }
+            if (geom->Attribute("nuka:mesh_error_limit")) {
+                float limit = 0.0f;
+                if (geom->QueryFloatAttribute("nuka:mesh_error_limit", &limit) !=
+                        tinyxml2::XML_SUCCESS || !(limit > 0.0f && limit <= 0.001f))
+                    throw std::runtime_error("MJCF: invalid mesh error limit");
+                shape.mesh_error_limit = limit;
+            }
             shape.decompose_mode = DecomposeModeFromToken(geom->Attribute("nuka:decompose"));
             if (const char* orientation = geom->Attribute("nuka:mesh_orientation")) {
                 if (std::string(orientation) != "automatic" && std::string(orientation) != "outward")
@@ -1222,8 +1229,9 @@ void ParseActuators(tinyxml2::XMLElement* mujoco,
             record.type = scene::ActuatorType::Force;
         }
         record.joint_id = ResolveJoint(actuator->Attribute("joint"), context);
-        if (record.joint_id != scene::kInvalidJoint &&
-            scene.GetJoint(record.joint_id).mimic_source != scene::kInvalidJoint)
+        if (record.joint_id == scene::kInvalidJoint)
+            throw std::runtime_error("MJCF: actuator '" + record.name + "' needs a known joint transmission");
+        if (scene.GetJoint(record.joint_id).mimic_source != scene::kInvalidJoint)
             throw std::runtime_error("MJCF: mimic joint cannot be driven directly");
         actuator->QueryFloatAttribute("gear", &record.gain);
         ParseRange(actuator->Attribute("forcerange"), record.force_limit, record.force_limit);
@@ -1235,6 +1243,12 @@ void ParseJointEqualities(tinyxml2::XMLElement* mujoco, scene::SceneIR& scene,
                           const MjcfParseContext& context) {
     auto* equality = mujoco->FirstChildElement("equality");
     if (equality == nullptr) return;
+    for (auto* item = equality->FirstChildElement(); item != nullptr; item = item->NextSiblingElement()) {
+        bool active = true;
+        item->QueryBoolAttribute("active", &active);
+        if (active && std::string(item->Name()) != "joint")
+            throw std::runtime_error(std::string("MJCF: <equality><") + item->Name() + "> is unsupported");
+    }
     for (auto* item = equality->FirstChildElement("joint");
          item != nullptr; item = item->NextSiblingElement("joint")) {
         bool active = true;
@@ -1417,6 +1431,20 @@ void ParseNukaEnvironment(tinyxml2::XMLElement* mujoco, scene::SceneIR& scene) {
     scene.EnvironmentMut() = std::move(record);
 }
 
+// Elements that add bodies, joints or couplings must be supported, never skipped.
+void RejectUnsupportedElements(const tinyxml2::XMLElement* element) {
+    for (const auto* child = element->FirstChildElement(); child != nullptr;
+         child = child->NextSiblingElement()) {
+        const std::string tag = child->Name();
+        if (tag == "include" || tag == "frame" || tag == "replicate" || tag == "attach" ||
+            tag == "composite" || tag == "flexcomp")
+            throw std::runtime_error("MJCF: <" + tag + "> is unsupported");
+        RejectUnsupportedElements(child);
+    }
+    if (std::string(element->Name()) == "tendon" && element->FirstChildElement() != nullptr)
+        throw std::runtime_error("MJCF: tendons are unsupported");
+}
+
 } // namespace
 
 scene::SceneIR LoadMjcf(const std::string& path) {
@@ -1436,6 +1464,7 @@ scene::SceneIR LoadMjcf(const std::string& path) {
     if (!worldbody) {
         throw std::runtime_error("MJCF: missing <worldbody> element in " + path);
     }
+    RejectUnsupportedElements(mujoco);
 
     scene::SceneIR scene;
     MjcfParseContext context;

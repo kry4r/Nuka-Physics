@@ -110,50 +110,23 @@ float MinTriangleAltitude(const std::vector<float>& vertices, const std::vector<
 struct AccuracyBoundedMesh {
     import::cooker::SimplifiedMesh mesh;
     float sampled_error = 0.0f;
+    float reverse_error = 0.0f;
 };
 
+// The simplifier admits only collapses within max_error both ways; both distances are measured
+// again on the result.
 AccuracyBoundedMesh SimplifyWithinError(const std::vector<float>& source_vertices,
                                         const std::vector<uint32_t>& source_triangles,
                                         uint32_t target_triangles, float max_error) {
-    const uint32_t input_triangles = static_cast<uint32_t>(source_triangles.size() / 3u);
-    const auto evaluate = [&](uint32_t target) {
-        AccuracyBoundedMesh result;
-        result.mesh = import::cooker::SimplifyMeshQem(
-            source_vertices.data(), static_cast<uint32_t>(source_vertices.size() / 3u),
-            source_triangles.data(), input_triangles, target);
-        result.sampled_error = target == input_triangles ? 0.0f
-            : SampledOneSidedHausdorff(source_vertices, source_triangles, result.mesh);
-        return result;
-    };
-    auto first = evaluate(target_triangles);
-    if (first.sampled_error <= max_error) return first;
-    uint32_t failed_target = target_triangles;
-    uint32_t passing_target = input_triangles;
-    AccuracyBoundedMesh passing;
-    for (uint32_t target = target_triangles; target < input_triangles;) {
-        const uint64_t doubled = std::max<uint64_t>(uint64_t{target} + 1u,
-                                                    uint64_t{target} * 2u);
-        target = static_cast<uint32_t>(std::min<uint64_t>(input_triangles, doubled));
-        auto trial = evaluate(target);
-        if (trial.sampled_error <= max_error) {
-            passing_target = target;
-            passing = std::move(trial);
-            break;
-        }
-        failed_target = target;
-    }
-    while (passing_target - failed_target >
-           std::max<uint32_t>(16u, passing_target / 100u)) {
-        const uint32_t middle = failed_target + (passing_target - failed_target) / 2u;
-        auto trial = evaluate(middle);
-        if (trial.sampled_error <= max_error) {
-            passing_target = middle;
-            passing = std::move(trial);
-        } else {
-            failed_target = middle;
-        }
-    }
-    return passing;
+    AccuracyBoundedMesh result;
+    result.mesh = import::cooker::SimplifyMeshQem(
+        source_vertices.data(), static_cast<uint32_t>(source_vertices.size() / 3u),
+        source_triangles.data(), static_cast<uint32_t>(source_triangles.size() / 3u),
+        target_triangles, max_error);
+    result.sampled_error = SampledOneSidedHausdorff(source_vertices, source_triangles, result.mesh);
+    result.reverse_error = SampledOneSidedHausdorff(result.mesh.vertices, result.mesh.indices,
+                                                    {source_vertices, source_triangles});
+    return result;
 }
 
 math::Transform ResolveWorldTransform(const SceneIR& scene, BodyId body_id) {
@@ -586,6 +559,42 @@ void BuildFilteredPairPolicy(const SceneIR& scene, CookedBlob& blob) {
     // -- system_pairs: default all-enabled (SystemPairMatrix ctor). ----------
 }
 
+// Joints must form trees of revolute, prismatic and fixed joints rooted at fixed or free bodies.
+void ValidateJointTopology(const SceneIR& scene) {
+    const auto& bodies = scene.Bodies();
+    const auto& joints = scene.Joints();
+    const BodyId body_count = static_cast<BodyId>(bodies.size());
+    std::vector<JointId> incoming(body_count, kInvalidJoint);
+    std::vector<BodyId> group(body_count);
+    for (BodyId body = 0u; body < body_count; ++body) group[body] = body;
+    auto root = [&](BodyId body) {
+        while (group[body] != body) body = group[body] = group[group[body]];
+        return body;
+    };
+    for (JointId id = 0u; id < joints.size(); ++id) {
+        const JointRecord& joint = joints[id];
+        const std::string name = "Joint '" + joint.name + "'";
+        if (joint.child_body >= body_count || joint.child_body == joint.parent_body)
+            throw std::invalid_argument(name + " needs a child body distinct from its parent");
+        const std::string child = "body '" + bodies[joint.child_body].name + "'";
+        if (joint.type == JointType::Spherical)
+            throw std::invalid_argument(name + " is spherical; articulations support revolute, "
+                                        "prismatic, fixed and free joints");
+        if (incoming[joint.child_body] != kInvalidJoint)
+            throw std::invalid_argument(name + " gives " + child + " a second parent joint after '" +
+                                        joints[incoming[joint.child_body]].name + "'");
+        incoming[joint.child_body] = id;
+        if (joint.type == JointType::Free) continue;
+        if (joint.parent_body >= body_count)
+            throw std::invalid_argument(name + " attaches " + child + " to the world; articulation "
+                                        "roots must be fixed bodies or use a free joint");
+        const BodyId a = root(joint.parent_body);
+        const BodyId b = root(joint.child_body);
+        if (a == b) throw std::invalid_argument(name + " closes a kinematic loop at " + child);
+        group[a] = b;
+    }
+}
+
 } // namespace
 
 CookedBlob CookScene(const SceneIR& scene) {
@@ -593,6 +602,7 @@ CookedBlob CookScene(const SceneIR& scene) {
 }
 
 CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
+    ValidateJointTopology(scene);
     CookedBlob blob;
 
     const auto& bodies = scene.Bodies();
@@ -742,14 +752,17 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
         if (mode != import::cooker::DecomposeMode::Force) {
             uint32_t source_edges = 0u;
             uint32_t nonmanifold_edges = 0u;
+            // An error limit alone asks for the fewest triangles within it, down to 64.
+            const bool reduce = r.mesh_triangle_limit > 0u || r.mesh_error_limit > 0.0f;
+            const float error_limit = r.mesh_error_limit > 0.0f ? r.mesh_error_limit : 0.001f;
+            const uint32_t seed_triangles = r.mesh_triangle_limit > 0u ? r.mesh_triangle_limit : 64u;
             if (shape_collides && r.type == ShapeType::TriMesh) {
                 const auto topology = import::cooker::CookMeshEdges(
                     r.mesh_vertices.data(), static_cast<uint32_t>(r.mesh_vertices.size() / 3u),
                     r.mesh_indices.data(), static_cast<uint32_t>(r.mesh_indices.size() / 3u));
                 source_edges = topology.topology_edge_count;
                 nonmanifold_edges = topology.info.nonmanifold_count;
-                if (r.mesh_triangle_limit > 0u &&
-                    uint64_t{nonmanifold_edges} * 100u > source_edges)
+                if (reduce && uint64_t{nonmanifold_edges} * 100u > source_edges)
                     throw std::runtime_error("Collision shape " + std::to_string(r.id) +
                         " (" + shape_name + ") has " + std::to_string(nonmanifold_edges) +
                         " nonmanifold edges among " + std::to_string(source_edges));
@@ -759,16 +772,16 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
             surface_options.decompose = surface_options.decompose && shape_collides &&
                 mode == import::cooker::DecomposeMode::Auto;
             const bool simplify = shape_collides && r.type == ShapeType::TriMesh &&
-                r.mesh_contact == CollisionShapeRecord::MeshContact::Ogc &&
-                r.mesh_triangle_limit > 0u &&
-                r.mesh_indices.size() / 3u > r.mesh_triangle_limit;
+                r.mesh_contact == CollisionShapeRecord::MeshContact::Ogc && reduce &&
+                r.mesh_indices.size() / 3u > seed_triangles;
             import::cooker::SimplifiedMesh reduced;
-            float sampled_error = 0.0f;
+            float sampled_error = 0.0f, reverse_error = 0.0f;
             if (simplify) {
                 try {
                     auto result = SimplifyWithinError(
-                        r.mesh_vertices, r.mesh_indices, r.mesh_triangle_limit, 0.001f);
+                        r.mesh_vertices, r.mesh_indices, seed_triangles, error_limit);
                     sampled_error = result.sampled_error;
+                    reverse_error = result.reverse_error;
                     reduced = std::move(result.mesh);
                 } catch (const std::exception& error) {
                     throw std::runtime_error("Collision shape " + std::to_string(r.id) +
@@ -791,21 +804,26 @@ CookedBlob CookScene(const SceneIR& scene, const CookSceneOptions& options) {
                 report.source_edges = source_edges;
                 report.nonmanifold_edges = nonmanifold_edges;
                 report.sampled_one_sided_hausdorff = sampled_error;
+                report.sampled_reverse_hausdorff = reverse_error;
                 report.min_altitude = MinTriangleAltitude(
                     simplify ? reduced.vertices : r.mesh_vertices,
                     simplify ? reduced.indices : r.mesh_indices);
                 std::fprintf(stderr,
                     "[MeshCook] shape=%s body=%u target=%u actual=%u sampled_error_mm=%.6g "
-                    "nonmanifold=%u/%u min_altitude_um=%.6g\n",
+                    "reverse_error_mm=%.6g nonmanifold=%u/%u min_altitude_um=%.6g "
+                    "error_limit_mm=%.6g source=%u\n",
                     report.name.c_str(), report.body_id, report.target_triangles,
                     report.actual_triangles,
                     static_cast<double>(report.sampled_one_sided_hausdorff) * 1000.0,
+                    static_cast<double>(report.sampled_reverse_hausdorff) * 1000.0,
                     report.nonmanifold_edges, report.source_edges,
-                    static_cast<double>(report.min_altitude) * 1.0e6);
-                if (r.mesh_triangle_limit > 0u &&
-                    report.sampled_one_sided_hausdorff > 0.001f)
+                    static_cast<double>(report.min_altitude) * 1.0e6,
+                    reduce ? static_cast<double>(error_limit) * 1000.0 : 0.0,
+                    static_cast<uint32_t>(r.mesh_indices.size() / 3u));
+                if (reduce && (report.sampled_one_sided_hausdorff > error_limit ||
+                               report.sampled_reverse_hausdorff > error_limit))
                     throw std::runtime_error("Collision shape " + std::to_string(r.id) +
-                        " (" + shape_name + ") sampled one-sided Hausdorff error exceeds 1 mm");
+                        " (" + shape_name + ") sampled Hausdorff error exceeds its limit");
                 blob.mesh_reports.push_back(std::move(report));
             }
             PushShapeRow(blob.shapes, blob.contact_params, r, r.type,

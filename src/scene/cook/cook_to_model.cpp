@@ -240,7 +240,6 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
         contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env) +
         static_cast<uint64_t>(cap.joint_friction_rows_per_env) +
         static_cast<uint64_t>(cap.joint_drive_rows_per_env) +
-        static_cast<uint64_t>(cap.mimic_rows_per_env) +
         static_cast<uint64_t>(cap.mpm_stress_cells_per_env) * nk::kMpmStressRowsPerCell +
         static_cast<uint64_t>(cap.dist_cons_per_env) + cap.vol_cons_per_env;
     if (total_rows > 0xFFFFFFFFull) {
@@ -321,7 +320,8 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     const uint32_t envs = env_count > 0 ? static_cast<uint32_t>(env_count) : 1u;
 
     // 1. Drive the existing cook (the heavy lifting: V-HACD / SDF / filters).
-    const CookedBlob blob = CookScene(scene, cook_options);
+    const auto cooked_blob = std::make_shared<const CookedBlob>(CookScene(scene, cook_options));
+    const CookedBlob& blob = *cooked_blob;
     if (!blob.filter_policy.explicit_pairs.empty()) {
         throw std::runtime_error(
             "CookToModel: PairDriven explicit contact pairs require source-shape provenance");
@@ -332,6 +332,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         runtime::articulation::CookArticulations(blob);
 
     CookToModelResult result;
+    result.blob = cooked_blob;
     nk::Model& model = result.model;
     SceneMap& smap = result.scene_map;
 
@@ -596,10 +597,9 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                 source = m.mimic_source_link[source];
             }
         }
-        cap.mimic_rows_per_env = std::any_of(
+        cap.mimic_couplings_per_env = static_cast<uint32_t>(std::count_if(
             m.mimic_source_link.begin(), m.mimic_source_link.end(),
-            [count = m.link_count](uint32_t source) { return source < count; })
-                ? m.link_count : 0u;
+            [count = m.link_count](uint32_t source) { return source < count; }));
         m.initial_q = host.q;                  // per LINK (scalar slot / link)
         m.initial_link_pose = host.link_pose;  // cook rest pose
         m.base_pose = host.base_pose.empty() ? math::Transform::Identity()

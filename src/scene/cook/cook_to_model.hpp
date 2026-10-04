@@ -24,7 +24,12 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
+
+namespace nuka::scene {
+struct CookedBlob;
+}
 
 namespace nuka::scene::cook {
 
@@ -35,6 +40,8 @@ struct CookToModelResult {
     // otherwise). Retained so obs/spawn/render sample the SAME grid the cook staged
     // for contact (SampleHeightFieldZ). IsValid(terrain) == false for a terrain-free scene.
     ::nuka::terrain::HeightField terrain;
+    // The cooked tables this model was transcribed from, for host-side mirrors.
+    std::shared_ptr<const CookedBlob> blob;
 };
 
 // Cook a SceneIR into an nk::Model replicated across `env_count` envs, plus the
