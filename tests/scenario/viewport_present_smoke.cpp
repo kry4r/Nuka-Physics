@@ -24,6 +24,16 @@
 #include "render/render_world.hpp"
 #include "render/window/window_surface.hpp"
 #include "runtime/app/viewer/debug_draw.hpp"
+#include "runtime/app/viewer/imgui_layer.hpp"
+#include "runtime/app/viewer/camera_controller.hpp"
+#include "render/imgui/nuka_imgui.hpp"
+#include "render/viewer_resources.hpp"
+#include "scene/format/nks.hpp"
+#include "scene/scene_map.hpp"
+#include "imgui.h"
+#include "imgui_internal.h"
+#include <filesystem>
+#include <set>
 
 #include <cstdint>
 #include <fstream>
@@ -77,6 +87,24 @@ RenderWorld BuildSyntheticWorld() {
     b.mesh_id = mesh_b; b.render_material_id = 1; b.world_xform.position = {0.5f, 0.0f, 0.25f};
     world.instances.push_back(b);
     return world;
+}
+
+struct CaptureImage {
+    uint32_t width = 0u, height = 0u;
+    std::vector<unsigned char> rgb;
+};
+
+CaptureImage ReadCapture(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    CaptureImage image;
+    std::string magic; int maximum = 0;
+    input >> magic >> image.width >> image.height >> maximum;
+    if (!input || magic != "P6" || maximum != 255) throw std::runtime_error("Invalid present capture");
+    input.get();
+    image.rgb.resize(static_cast<size_t>(image.width) * image.height * 3u);
+    if (!input.read(reinterpret_cast<char*>(image.rgb.data()), static_cast<std::streamsize>(image.rgb.size())))
+        throw std::runtime_error("Truncated present capture");
+    return image;
 }
 
 class ControlledSurface final : public nuka::render::window::WindowSurface {
@@ -261,6 +289,33 @@ TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
     EXPECT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Presented);
     EXPECT_EQ(world.instances.size(), 2u);
 
+    if (present->Report().capture_supported) {
+        options.scene_viewport = {true, 100u, 80u, 640u, 400u};
+        present->SetCaptureFrame(static_cast<int>(present->Report().frames_presented), "/tmp/nuka_viewport_offset.ppm");
+        ASSERT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Presented);
+        const auto image = ReadCapture("/tmp/nuka_viewport_offset.ppm");
+        uint32_t outside = 0u, inside = 0u;
+        for (uint32_t y = 0u; y < image.height; ++y) for (uint32_t x = 0u; x < image.width; ++x) {
+            const size_t at = (static_cast<size_t>(y) * image.width + x) * 3u;
+            const bool colored = image.rgb[at] != options.background.r || image.rgb[at + 1u] != options.background.g ||
+                                 image.rgb[at + 2u] != options.background.b;
+            if (!colored) continue;
+            if (x >= 100u && x < 740u && y >= 80u && y < 480u) ++inside;
+            else ++outside;
+        }
+        EXPECT_EQ(outside, 0u);
+        EXPECT_GT(inside, 100u);
+        options.scene_viewport.width = 0u;
+        present->SetCaptureFrame(static_cast<int>(present->Report().frames_presented), "/tmp/nuka_viewport_empty.ppm");
+        ASSERT_EQ(present->DrawFrame(world, options), nuka::render::PresentFrameResult::Presented);
+        const auto empty = ReadCapture("/tmp/nuka_viewport_empty.ppm");
+        uint32_t unexpected = 0u;
+        for (size_t i = 0u; i < empty.rgb.size(); i += 3u)
+            if (empty.rgb[i] != options.background.r || empty.rgb[i + 1u] != options.background.g ||
+                empty.rgb[i + 2u] != options.background.b) ++unexpected;
+        EXPECT_EQ(unexpected, 0u);
+    }
+
     const auto& report = present->Report();
     std::printf("[viewport_present_smoke] backend=%s device=%s images=%u "
                 "format=%d present_mode=%d %ux%u frames_presented=%llu\n",
@@ -270,4 +325,97 @@ TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
                 static_cast<unsigned long long>(report.frames_presented));
 
     present->WaitIdle();
+}
+
+TEST(ViewerWorkspace, RealLabAssetsRenderInTheModernViewport) {
+    namespace viewer = nuka::runtime::app::viewer;
+    namespace render = nuka::render;
+    const auto path = render::ViewerResource("examples/assets/nuka_lab/gripper.nks",
+                                             NUKA_SOURCE_DIR "/examples/assets/nuka_lab/gripper.nks");
+    EXPECT_EQ(std::filesystem::path(path).lexically_normal(),
+              (render::ViewerExecutableDirectory() / "examples/assets/nuka_lab/gripper.nks").lexically_normal());
+    const auto scene = nuka::scene::nks::Load(path);
+    const RenderWorld world = render::BuildRenderWorld(scene.Ecs(), nuka::scene::SceneMap{});
+    ASSERT_GT(world.InstanceCount(), 10u);
+    ASSERT_FALSE(world.cameras.empty());
+    for (int variant = 0; variant < 4; ++variant) {
+        const ImVec2 sizes[] = {ImVec2(1280.0f, 720.0f), ImVec2(960.0f, 600.0f), ImVec2(1920.0f, 1080.0f), ImVec2(1920.0f, 1080.0f)};
+        const ImVec2 size = sizes[variant];
+        const float dpi = variant == 3 ? 1.5f : 1.0f;
+        render::window::SurfaceBackendKind kind = render::window::SurfaceBackendKind::None;
+        auto surface = render::window::MakeSurface("Nuka Lab preview", static_cast<uint32_t>(size.x),
+                                                    static_cast<uint32_t>(size.y), &kind);
+        if (!surface) GTEST_SKIP() << "No window surface available";
+        render::PresentRenderer present(std::move(surface));
+        const auto vk = present.VulkanHandles();
+        render::imgui::NukaImGuiInitInfo info;
+        info.api_version = vk.api_version;
+        info.instance = reinterpret_cast<NukaVkInstance>(vk.instance);
+        info.physical_device = reinterpret_cast<NukaVkPhysicalDevice>(vk.physical_device);
+        info.device = reinterpret_cast<NukaVkDevice>(vk.device);
+        info.queue_family = vk.graphics_family;
+        info.queue = reinterpret_cast<NukaVkQueue>(vk.graphics_queue);
+        info.descriptor_pool = reinterpret_cast<NukaVkDescriptorPool>(vk.imgui_descriptor_pool);
+        info.min_image_count = present.MinImageCount();
+        info.image_count = present.SwapchainImageCount();
+        info.render_pass = reinterpret_cast<NukaVkRenderPass>(vk.offscreen_render_pass);
+        render::imgui::NukaImGuiContext imgui;
+        ASSERT_TRUE(imgui.Init(info));
+        viewer::ImGuiLayer ui;
+        ui.EnableDocking();
+        viewer::ViewerUiState state;
+        state.has_scene = true;
+        state.loaded_path = path;
+        viewer::ViewerStats stats;
+        stats.session_note = variant == 3 ? "Nuka Dynamics Lab | 实验室预览 / physics not running" : "Nuka Dynamics Lab | render snapshot, physics not running";
+        viewer::CameraController camera;
+        ASSERT_TRUE(camera.UseSceneCamera(world));
+        render::RasterOptions options;
+        options.width = present.Report().width; options.height = present.Report().height;
+        const auto background = scene.Environment().sky.background;
+        const auto byte = [](float v) { return static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); };
+        options.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
+        ImGuiIO& io = ImGui::GetIO();
+        io.DisplaySize = ImVec2(size.x / dpi, size.y / dpi);
+        io.DisplayFramebufferScale = ImVec2(dpi, dpi);
+        io.DeltaTime = 1.0f / 60.0f;
+        const std::string capture = "/tmp/nuka_modern_lab_" + std::to_string(options.width) + (variant == 3 ? "_dpi150.ppm" : ".ppm");
+        if (present.Report().capture_supported) present.SetCaptureFrame(5, capture);
+        for (int frame = 0; frame < 6; ++frame) {
+            imgui.NewFrame();
+            ui.RecordUi(world, stats, camera, state, &scene, options.width, options.height);
+            EXPECT_GT(ImGui::CalcTextSize("WWW").x, ImGui::CalcTextSize("iii").x * 2.0f);
+            for (const ImWchar codepoint : {static_cast<ImWchar>(0x5b9e), static_cast<ImWchar>(0x9f98), static_cast<ImWchar>(0x2000b)})
+                EXPECT_NE(ImGui::GetFontBaked()->FindGlyphNoFallback(codepoint), nullptr);
+            options.scene_viewport = ui.Viewport().pixels;
+            if (frame < 3) ASSERT_TRUE(camera.UseSceneCamera(world, ui.Viewport().Aspect(), static_cast<float>(options.width) / static_cast<float>(options.height)));
+            camera.WriteOptions(options);
+            ImGui::Render();
+            EXPECT_EQ(present.DrawFrame(world, options, [&imgui](void* command) {
+                imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(command));
+            }), render::PresentFrameResult::Presented);
+        }
+        if (present.Report().capture_supported) {
+            const auto image = ReadCapture(capture);
+            const auto rect = ui.Viewport().pixels;
+            std::set<uint32_t> scene_colors;
+            for (uint32_t y = rect.y + 4u; y + 4u < rect.y + rect.height; y += 4u)
+                for (uint32_t x = rect.x + 4u; x + 4u < rect.x + rect.width; x += 4u) {
+                    const size_t at = (static_cast<size_t>(y) * image.width + x) * 3u;
+                    scene_colors.insert((static_cast<uint32_t>(image.rgb[at]) << 16u) |
+                                        (static_cast<uint32_t>(image.rgb[at + 1u]) << 8u) | image.rgb[at + 2u]);
+                }
+            EXPECT_GT(scene_colors.size(), 64u) << "Scene pixels must not be hidden by an opaque UI background";
+        }
+        EXPECT_TRUE(ui.Viewport().Valid());
+        EXPECT_GT(ui.Viewport().pixels.x, 0u);
+        EXPECT_LT(ui.Viewport().pixels.width, options.width);
+        EXPECT_TRUE(render::imgui::HasNukaCjkFont());
+        std::printf("[modern_lab] backend=%s framebuffer=%ux%u viewport=%u,%u,%u,%u font_atlas=%dx%d\n",
+                    present.Report().backend_name.c_str(), options.width, options.height,
+                    ui.Viewport().pixels.x, ui.Viewport().pixels.y, ui.Viewport().pixels.width,
+                    ui.Viewport().pixels.height, io.Fonts->TexData->Width, io.Fonts->TexData->Height);
+        present.WaitIdle();
+        imgui.Shutdown();
+    }
 }

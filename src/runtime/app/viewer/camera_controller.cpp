@@ -261,6 +261,33 @@ bool CameraController::FrameSelected(const render::RenderWorld& world, scene::En
     return RenderBounds(world, &selected, lo, hi) && FramePreservingView(lo, hi, aspect);
 }
 
+bool CameraController::UseSceneCamera(const render::RenderWorld& world, float viewport_aspect, float reference_aspect) {
+    if (world.cameras.empty()) return false;
+    const auto& authored = world.cameras.front();
+    const float distance = authored.focus_distance;
+    const auto offset = authored.world_xform.TransformDirection({0.0f, 0.0f, 1.0f});
+    const auto target = authored.world_xform.position - offset * distance;
+    if (!std::isfinite(distance) || distance <= 0.0f || !std::isfinite(authored.vertical_fov_degrees) ||
+        !std::isfinite(target.x) || !std::isfinite(target.y) || !std::isfinite(target.z) ||
+        !std::isfinite(offset.x) || !std::isfinite(offset.y) || !std::isfinite(offset.z)) return false;
+    if (!(authored.vertical_fov_degrees > 0.0f && authored.vertical_fov_degrees < 180.0f) ||
+        !std::isfinite(viewport_aspect) || !std::isfinite(reference_aspect) ||
+        viewport_aspect <= 0.0f || reference_aspect <= 0.0f) return false;
+    const double fit = static_cast<double>(distance) * std::max(1.0, static_cast<double>(reference_aspect) / viewport_aspect);
+    if (!std::isfinite(fit) || fit > kMaxDistance) return false;
+    CameraController candidate = *this;
+    candidate.SetView(target, static_cast<float>(fit), std::atan2(offset.y, offset.x), std::asin(std::clamp(offset.z, -1.0f, 1.0f)));
+    candidate.fov_degrees = authored.vertical_fov_degrees;
+    const auto eye = candidate.ResolvedEye();
+    const auto delta = eye - candidate.ResolvedTarget();
+    const double separation = std::hypot(delta.x, delta.y, delta.z);
+    if (!std::isfinite(eye.x) || !std::isfinite(eye.y) || !std::isfinite(eye.z) ||
+        !std::isfinite(separation) || separation < static_cast<double>(candidate.Distance()) * 0.5) return false;
+    candidate.CancelInteraction();
+    *this = candidate;
+    return true;
+}
+
 void CameraController::SetView(const math::Vec3& target, float distance, float yaw,
                               float pitch) {
     target_   = target;

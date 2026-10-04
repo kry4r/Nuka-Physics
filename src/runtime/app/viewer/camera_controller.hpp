@@ -68,6 +68,8 @@ public:
     // seconds. forward/right walk the horizon-projected view plane (W/S, A/D), up is
     // world +Z (Q/E); inputs in [-1,1], speed scales with dolly distance.
     void Move(float forward, float right, float up, float dt);
+    void CancelInteraction() { orbiting_ = panning_ = false; }
+    bool UseSceneCamera(const render::RenderWorld& world, float viewport_aspect = 1.0f, float reference_aspect = 1.0f);
 
     // ---- per-frame ---------------------------------------------------------
     // Recompute eye/up from yaw/pitch/distance/target and write the override into

@@ -1,16 +1,9 @@
-// ---------------------------------------------------------------------------
-// nuka::render::imgui -- glue implementation (M8.5 T1).
-//
-// Wraps the vendored Dear ImGui (external/imgui, v1.92.8-docking) + its Vulkan
-// backend behind the thin nuka API in nuka_imgui.hpp, and defines the custom
-// "Nuka" theme + the JetBrains Mono font load.
-//
-// The vendored ImGui headers/impl are SYSTEM includes (set in src/CMakeLists.txt)
-// so their warnings are suppressed and they stay out of the zero-CUDA lint scope.
-// This TU itself is plain host C++/Vulkan -- no CUDA.
-// ---------------------------------------------------------------------------
 
 #include "render/imgui/nuka_imgui.hpp"
+#include "render/imgui/nuka_theme.hpp"
+#include "render/texture_image.hpp"
+#include "render/viewer_resources.hpp"
+#include "viewer_ui_font.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -18,10 +11,12 @@
 #include "backends/imgui_impl_vulkan.h"
 
 #include <cstdio>
+#include <filesystem>
+#include <cstring>
+#include <algorithm>
+#include <fstream>
+#include <vector>
 
-// Font paths are injected by CMake (target_compile_definitions), mirroring how the
-// raster renderer receives its compiled-SPV paths. If they are somehow absent we
-// fall back to the built-in default font.
 #ifndef NUKA_IMGUI_FONT_UI_TTF
 #define NUKA_IMGUI_FONT_UI_TTF ""
 #endif
@@ -33,43 +28,7 @@ namespace nuka::render::imgui {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// THE NUKA PALETTE (documented for T3 so its panels stay consistent).
-//
-// Aesthetic target: a polished engineering / physics-sim PRO TOOL -- a deep,
-// slightly blue-tinted charcoal base (not pure black, not gray) with ONE warm-cool
-// accent: a bright TEAL/CYAN ("nuka teal"). Think a precision instrument: dark,
-// calm, high-contrast text, with the accent reserved for interactive/active state
-// (sliders, selected headers, active buttons, the resize grip). No second accent.
-//
-// All values are linear-ish sRGB 0..1 (ImGui stores colors that way). Names are
-// the design tokens; T3 should reuse these rather than inventing new colors.
-//
-//   Base (darkest -> lightest):
-//     bg_void     #0E1116  the window/app void (deepest)
-//     bg_panel    #151A21  panel / child / popup background
-//     bg_raised   #1C232C  frames (inputs, sliders, combo) -- one step raised
-//     bg_hover    #232C37  hovered frame
-//     bg_active   #2B3645  active/pressed frame
-//     line        #2A323D  subtle borders / separators
-//   Text:
-//     text        #C6D0DA  primary text (soft off-white, easy on the eyes)
-//     text_dim    #6E7A88  disabled / secondary text
-//   Accent (the single teal):
-//     accent      #2DD4BF  nuka teal -- active/selected/grab
-//     accent_dim  #1E9C8C  teal pressed / darker
-//     accent_soft #2DD4BF @ ~0.30a  teal wash (header bg, selected row)
-// ---------------------------------------------------------------------------
-constexpr ImVec4 kBgVoid    = ImVec4(0.055f, 0.067f, 0.086f, 1.00f);  // #0E1116
-constexpr ImVec4 kBgPanel   = ImVec4(0.082f, 0.102f, 0.129f, 1.00f);  // #151A21
-constexpr ImVec4 kBgRaised  = ImVec4(0.110f, 0.137f, 0.173f, 1.00f);  // #1C232C
-constexpr ImVec4 kBgHover   = ImVec4(0.137f, 0.173f, 0.216f, 1.00f);  // #232C37
-constexpr ImVec4 kBgActive  = ImVec4(0.169f, 0.212f, 0.271f, 1.00f);  // #2B3645
-constexpr ImVec4 kLine      = ImVec4(0.165f, 0.196f, 0.239f, 1.00f);  // #2A323D
-constexpr ImVec4 kText      = ImVec4(0.776f, 0.816f, 0.855f, 1.00f);  // #C6D0DA
-constexpr ImVec4 kTextDim   = ImVec4(0.431f, 0.478f, 0.533f, 1.00f);  // #6E7A88
-constexpr ImVec4 kAccent    = ImVec4(0.176f, 0.831f, 0.749f, 1.00f);  // #2DD4BF
-constexpr ImVec4 kAccentDim = ImVec4(0.118f, 0.612f, 0.549f, 1.00f);  // #1E9C8C
+using namespace theme;
 
 ImVec4 WithAlpha(const ImVec4& c, float a) { return ImVec4(c.x, c.y, c.z, a); }
 
@@ -79,18 +38,18 @@ void ApplyNukaTheme() {
     ImGuiStyle& style = ImGui::GetStyle();
 
     // ---- Geometry: modern rounded panels, generous-but-tidy spacing ----------
-    style.WindowRounding    = 8.0f;   // rounded modern window corners
-    style.ChildRounding     = 6.0f;
-    style.PopupRounding     = 6.0f;
+    style.WindowRounding    = 0.0f;   // rounded modern window corners
+    style.ChildRounding     = 0.0f;
+    style.PopupRounding     = 8.0f;
     style.FrameRounding     = 5.0f;   // inputs/sliders/buttons
     style.GrabRounding      = 5.0f;   // slider grab pills
     style.TabRounding       = 5.0f;
     style.ScrollbarRounding = 8.0f;
 
-    style.WindowPadding     = ImVec2(12.0f, 12.0f);
-    style.FramePadding      = ImVec2(10.0f, 6.0f);
+    style.WindowPadding     = ImVec2(14.0f, 12.0f);
+    style.FramePadding      = ImVec2(8.0f, 7.0f);
     style.CellPadding       = ImVec2(8.0f, 5.0f);
-    style.ItemSpacing       = ImVec2(10.0f, 8.0f);
+    style.ItemSpacing       = ImVec2(8.0f, 6.0f);
     style.ItemInnerSpacing  = ImVec2(7.0f, 6.0f);
     style.IndentSpacing     = 18.0f;
     style.ScrollbarSize     = 12.0f;
@@ -100,7 +59,7 @@ void ApplyNukaTheme() {
     style.WindowBorderSize  = 1.0f;
     style.ChildBorderSize   = 1.0f;
     style.PopupBorderSize   = 1.0f;
-    style.FrameBorderSize   = 1.0f;
+    style.FrameBorderSize   = 0.0f;
     style.TabBorderSize     = 0.0f;
 
     style.WindowTitleAlign  = ImVec2(0.02f, 0.5f);  // title nudged off the corner
@@ -117,11 +76,9 @@ void ApplyNukaTheme() {
     c[ImGuiCol_Text]                 = kText;
     c[ImGuiCol_TextDisabled]         = kTextDim;
 
-    // Window is SEMI-TRANSPARENT (0.96) -- a hint of the viewport beneath, the
-    // "instrument glass" feel, without hurting readability.
-    c[ImGuiCol_WindowBg]             = WithAlpha(kBgPanel, 0.96f);
+    c[ImGuiCol_WindowBg]             = kBgPanel;
     c[ImGuiCol_ChildBg]              = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_PopupBg]              = WithAlpha(kBgVoid, 0.98f);
+    c[ImGuiCol_PopupBg]              = kTopBar;
 
     c[ImGuiCol_Border]               = kLine;
     c[ImGuiCol_BorderShadow]         = ImVec4(0, 0, 0, 0);
@@ -134,7 +91,7 @@ void ApplyNukaTheme() {
     c[ImGuiCol_TitleBg]              = kBgVoid;
     c[ImGuiCol_TitleBgActive]        = kBgRaised;
     c[ImGuiCol_TitleBgCollapsed]     = WithAlpha(kBgVoid, 0.80f);
-    c[ImGuiCol_MenuBarBg]            = kBgVoid;
+    c[ImGuiCol_MenuBarBg]            = kTopBar;
 
     c[ImGuiCol_ScrollbarBg]          = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_ScrollbarGrab]        = kBgActive;
@@ -148,12 +105,11 @@ void ApplyNukaTheme() {
 
     c[ImGuiCol_Button]               = kBgRaised;
     c[ImGuiCol_ButtonHovered]        = kBgHover;
-    c[ImGuiCol_ButtonActive]         = WithAlpha(kAccent, 0.85f);
+    c[ImGuiCol_ButtonActive]         = kBgActive;
 
-    // Headers (collapsing/selectable/tree): a teal WASH so selection reads clearly.
-    c[ImGuiCol_Header]               = WithAlpha(kAccent, 0.18f);
-    c[ImGuiCol_HeaderHovered]        = WithAlpha(kAccent, 0.30f);
-    c[ImGuiCol_HeaderActive]         = WithAlpha(kAccent, 0.42f);
+    c[ImGuiCol_Header]               = kBgActive;
+    c[ImGuiCol_HeaderHovered]        = kBgHover;
+    c[ImGuiCol_HeaderActive]         = kBgActive;
 
     c[ImGuiCol_Separator]            = kLine;
     c[ImGuiCol_SeparatorHovered]     = WithAlpha(kAccent, 0.55f);
@@ -194,44 +150,103 @@ void ApplyNukaTheme() {
     c[ImGuiCol_DockingEmptyBg]       = kBgVoid;
 }
 
+namespace {
+struct FontRoles {
+    ImFontAtlas* atlas = nullptr;
+    ImFont* body = nullptr;
+    ImFont* heading = nullptr;
+    ImFont* mono = nullptr;
+    ImFontAtlasRectId logo = ImFontAtlasRectId_Invalid;
+    bool cjk = false;
+    std::vector<unsigned char> cjk_data;
+};
+FontRoles fonts;
+
+bool FontExists(const char* path) {
+    std::error_code error;
+    return path && path[0] && std::filesystem::is_regular_file(path, error);
+}
+
+void MergeCjk(float size) {
+    if (fonts.cjk_data.empty()) {
+        const auto path = nuka::render::ViewerResource("assets/viewer/fonts/NotoSansCJKsc-Regular.otf", NUKA_IMGUI_FONT_CJK);
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        if (!input) return;
+        const auto bytes = input.tellg();
+        if (bytes <= 0 || bytes > 32 * 1024 * 1024) return;
+        fonts.cjk_data.resize(static_cast<size_t>(bytes));
+        input.seekg(0);
+        if (!input.read(reinterpret_cast<char*>(fonts.cjk_data.data()), bytes)) { fonts.cjk_data.clear(); return; }
+    }
+    ImFontConfig cfg;
+    cfg.MergeMode = true;
+    cfg.FontDataOwnedByAtlas = false;
+    fonts.cjk = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(fonts.cjk_data.data(),
+                 static_cast<int>(fonts.cjk_data.size()), size, &cfg) != nullptr;
+}
+
+}  // namespace
+
+bool HasNukaCjkFont() { return fonts.atlas == ImGui::GetIO().Fonts && fonts.cjk; }
+
+ImFont* GetNukaFont(FontRole role) {
+    if (fonts.atlas != ImGui::GetIO().Fonts) return nullptr;
+    if (role == FontRole::Heading) return fonts.heading;
+    if (role == FontRole::Mono) return fonts.mono;
+    return fonts.body;
+}
+
+bool DrawNukaLogo(float size) {
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    ImFontAtlasRect rect;
+    if (fonts.atlas != atlas || fonts.logo == ImFontAtlasRectId_Invalid || !atlas->GetCustomRect(fonts.logo, &rect)) return false;
+    ImGui::Image(atlas->TexRef, ImVec2(size, size), rect.uv0, rect.uv1);
+    return true;
+}
+
 bool LoadNukaFonts() {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
-
-    // Sizes: a UI body size + a larger heading size (panel titles / hero stats).
-    constexpr float kUiSize      = 16.0f;
-    constexpr float kHeadingSize = 21.0f;
-
-    const char* ui_ttf      = NUKA_IMGUI_FONT_UI_TTF;
-    const char* heading_ttf = NUKA_IMGUI_FONT_HEADING_TTF;
-
-    bool ui_loaded = false;
-    if (ui_ttf && ui_ttf[0] != '\0') {
-        // The default (first-added) font is the UI body font: JetBrains Mono.
-        if (io.Fonts->AddFontFromFileTTF(ui_ttf, kUiSize) != nullptr) {
-            ui_loaded = true;
+    fonts = {};
+    fonts.atlas = io.Fonts;
+    const auto body_path = nuka::render::ViewerResource("assets/viewer/fonts/Inter-Regular.ttf", NUKA_IMGUI_FONT_UI_TTF);
+    const auto heading_path = nuka::render::ViewerResource("assets/viewer/fonts/Inter-SemiBold.ttf", NUKA_IMGUI_FONT_HEADING_TTF);
+    const auto mono_path = nuka::render::ViewerResource("assets/viewer/fonts/JetBrainsMono-Regular.ttf", NUKA_IMGUI_FONT_MONO);
+    if (FontExists(body_path.c_str()))
+        fonts.body = io.Fonts->AddFontFromFileTTF(body_path.c_str(), 14.0f);
+    if (!fonts.body) {
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;
+        fonts.body = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kEmbeddedUiFont),
+                                                   static_cast<int>(sizeof(kEmbeddedUiFont)), 14.0f, &cfg);
+    }
+    MergeCjk(14.0f);
+    io.FontDefault = fonts.body;
+    if (FontExists(heading_path.c_str())) {
+        fonts.heading = io.Fonts->AddFontFromFileTTF(heading_path.c_str(), 14.0f);
+        MergeCjk(14.0f);
+    } else fonts.heading = fonts.body;
+    if (FontExists(mono_path.c_str())) {
+        fonts.mono = io.Fonts->AddFontFromFileTTF(mono_path.c_str(), 13.0f);
+        MergeCjk(13.0f);
+    } else fonts.mono = fonts.body;
+    const auto logo = nuka::render::LoadTexture(nuka::render::ViewerResource("docs/media/nuka-logo.png", NUKA_IMGUI_LOGO), false);
+    if (logo.width > 0u && logo.height > 0u && logo.channels == 4u) {
+        ImFontAtlasRect rect;
+        io.Fonts->TexPixelsUseColors = true;
+        fonts.logo = io.Fonts->AddCustomRect(static_cast<int>(logo.width), static_cast<int>(logo.height), &rect);
+        if (fonts.logo != ImFontAtlasRectId_Invalid) {
+            for (uint32_t y = 0u; y < logo.height; ++y) {
+                auto* dst = static_cast<unsigned char*>(io.Fonts->TexData->GetPixelsAt(rect.x, rect.y + static_cast<int>(y)));
+                for (uint32_t x = 0u; x < logo.width * 4u; ++x)
+                    dst[x] = static_cast<unsigned char>(std::clamp(logo.texels[static_cast<size_t>(y) * logo.width * 4u + x] * 255.0f + 0.5f, 0.0f, 255.0f));
+            }
         }
     }
-    if (heading_ttf && heading_ttf[0] != '\0') {
-        // Heading font (JetBrains Mono Bold); T3 pushes it for titles via index 1.
-        io.Fonts->AddFontFromFileTTF(heading_ttf, kHeadingSize);
-    }
-
-    if (!ui_loaded) {
-        // Vendored TTF unreadable -> fall back so the UI still renders. The custom
-        // FONT requirement is then unmet (flagged here); the THEME still applies.
-        std::fprintf(stderr,
-            "[nuka_imgui] WARNING: vendored JetBrains Mono not loaded "
-            "(ui_ttf='%s'); falling back to ImGui default font.\n",
-            ui_ttf ? ui_ttf : "(null)");
-        io.Fonts->AddFontDefault();
-    }
-    return ui_loaded;
+    if (!fonts.cjk) std::fprintf(stderr, "[nuka_imgui] CJK font missing: package assets/viewer/fonts/NotoSansCJKsc-Regular.otf; Chinese glyphs unavailable\n");
+    return fonts.body != nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// NukaImGuiContext
-// ---------------------------------------------------------------------------
 NukaImGuiContext::~NukaImGuiContext() { Shutdown(); }
 
 NukaImGuiContext::NukaImGuiContext(NukaImGuiContext&& other) noexcept
@@ -287,6 +302,7 @@ bool NukaImGuiContext::Init(const NukaImGuiInitInfo& info) {
     ImGui_ImplVulkan_InitInfo vk = ToVulkanInitInfo(info);
     if (!ImGui_ImplVulkan_Init(&vk)) {
         ImGui::DestroyContext();
+        fonts = {};
         return false;
     }
 
@@ -303,9 +319,6 @@ void NukaImGuiContext::NotifySwapchainRecreated(uint32_t min_image_count) {
 
 void NukaImGuiContext::NewFrame() {
     if (!initialized_) return;
-    // NOTE (seam): the platform (xcb) backend -- T2 -- must already have set
-    // io.DisplaySize / io.DeltaTime / mouse+keyboard for this frame. This glue only
-    // drives the Vulkan backend half + ImGui::NewFrame.
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
 }
@@ -322,6 +335,7 @@ void NukaImGuiContext::Shutdown() {
     if (!initialized_) return;
     ImGui_ImplVulkan_Shutdown();
     ImGui::DestroyContext();
+    fonts = {};
     initialized_ = false;
 }
 
