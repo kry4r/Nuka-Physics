@@ -147,44 +147,183 @@ def predict_linear_modes(mass, stiffness, displacement, velocity, dt, steps, *, 
 
 def compare_runs(sources):
     """Align completed state samples at common physical times without interpolating contacts."""
+    sources = tuple(Path(source) for source in sources)
     if len(sources) < 2:
         raise ValueError("comparison requires at least two independent runs")
+    if len({source.resolve() for source in sources}) != len(sources):
+        raise ValueError("comparison requires distinct source captures")
     runs = [load_records(source, states=True) for source in sources]
     baseline, base_manifest = runs[0]
-    results = []
-    for source, (values, manifest) in zip(sources[1:], runs[1:]):
-        a, b = base_manifest["metadata"], manifest["metadata"]
-        if a.get("physical_input_sha256") is None or a.get("physical_input_sha256") != b.get("physical_input_sha256"):
+    physical_input = base_manifest["metadata"].get("physical_input_sha256")
+    if not isinstance(physical_input, str) or not physical_input:
+        raise ValueError("comparison requires a recorded physical input hash")
+    position_key, velocity_key = "state_PARTICLE_POSITION", "state_PARTICLE_VELOCITY"
+    timesteps, horizons, energy_totals, evidence = [], [], [], []
+    baseline_initial, initial_matches = None, []
+
+    def initial_state(source, manifest, values):
+        path = source / "initial.npz"
+        if not path.is_file() or not manifest.get("initial_geometry_sha256"):
+            raise ValueError(f"comparison requires hash-bound initial particle states: {source}")
+        initial_hash = sha256(path)
+        if initial_hash != manifest["initial_geometry_sha256"]:
+            raise ValueError(f"comparison initial state hash mismatch: {source}")
+        with np.load(path, allow_pickle=False) as initial:
+            position_name = next((name for name in ("positions", "position") if name in initial), None)
+            if position_name is None and manifest["metadata"].get("initial_positions_equal_rest") is True and "rest" in initial:
+                position_name = "rest"
+            mass_name = next((name for name in ("inverse_mass", "inv_mass") if name in initial), None)
+            if position_name is None or "velocity" not in initial or mass_name is None:
+                raise ValueError(f"comparison requires actual initial positions, velocity and inverse mass: {source}")
+            position, velocity, inverse_mass = initial[position_name], initial["velocity"], initial[mass_name]
+        count = manifest["env_count"]
+        if not position.size or position.size % (count * 3):
+            raise ValueError(f"comparison initial particle extent differs from the environment count: {source}")
+        particles = position.size // (count * 3)
+        shape = (count, particles, 3)
+        for value in (position, velocity):
+            if (value.size != position.size or value.ndim not in (1, 2, 3) or
+                    value.ndim == 2 and value.shape[-1] != 3 or
+                    value.ndim == 3 and value.shape != shape):
+                raise ValueError(f"comparison initial position/velocity extents must match: {source}")
+        if inverse_mass.shape not in ((count * particles,), (count, particles)):
+            raise ValueError(f"comparison initial inverse mass extent differs from particle states: {source}")
+        if any(value.dtype.kind not in "fiu" or not np.isfinite(value).all() for value in (position, velocity, inverse_mass)):
+            raise ValueError(f"comparison requires finite numeric initial particle states: {source}")
+        if (inverse_mass < 0).any():
+            raise ValueError(f"comparison requires nonnegative initial inverse mass: {source}")
+        if any(values[key].size != manifest["steps"] * position.size for key in (position_key, velocity_key)):
+            raise ValueError(f"comparison initial and recorded particle extents differ: {source}")
+        state = {"positions": position.reshape(shape), "velocity": velocity.reshape(shape),
+                 "inverse_mass": inverse_mass.reshape(count, particles)}
+        match = {"source": str(source), "initial_geometry_sha256": initial_hash,
+                 "positions_field": position_name, "inverse_mass_field": mass_name,
+                 "env_count": count, "particles_per_env": particles}
+        return state, match
+
+    for source, (values, manifest) in zip(sources, runs):
+        metadata = manifest["metadata"]
+        if manifest.get("status") != "closed" or manifest.get("stop_reason") != "completed" or manifest.get("error") is not None:
+            raise ValueError("comparison requires closed, completed captures without capture errors")
+        expected = metadata.get("expected_policy_steps")
+        if type(expected) is not int or expected < 1 or expected != manifest["steps"]:
+            raise ValueError("comparison requires the complete declared physical horizon")
+        if physical_input != metadata.get("physical_input_sha256"):
             raise ValueError("comparison requires identical recorded physical inputs and control law")
-        if base_manifest["substeps"] != 1 or manifest["substeps"] != 1:
+        if manifest["substeps"] != 1:
             raise ValueError("comparison requires state samples at every physics interval")
         if base_manifest["env_count"] != manifest["env_count"]:
             raise ValueError("comparison requires identical environment extents")
-        dt_a, dt_b = float(a["dt"]), float(b["dt"])
-        time_a = np.arange(1, len(baseline["energy"]) + 1) * dt_a
-        candidates = np.rint(time_a / dt_b).astype(np.int64) - 1
-        mask = (candidates >= 0) & (candidates < len(values["energy"]))
-        mask &= np.isclose((candidates + 1) * dt_b, time_a, rtol=1e-10, atol=1e-12)
-        selected_a, selected_b = np.flatnonzero(mask), candidates[mask]
-        if not len(selected_a):
-            raise ValueError("runs have no common sampled physical times")
-        position_key = "state_PARTICLE_POSITION"
-        velocity_key = "state_PARTICLE_VELOCITY"
-        if any(key not in run for run in (baseline, values) for key in (position_key, velocity_key)):
+        dt = metadata.get("dt")
+        if type(dt) not in (int, float) or not np.isfinite(dt) or dt <= 0:
+            raise ValueError("comparison requires positive finite recorded timesteps")
+        dt = float(dt)
+        horizon = manifest["steps"] * dt
+        if not np.isfinite(horizon) or horizon <= 0:
+            raise ValueError("comparison requires a positive finite physical horizon")
+        for name in ("duration", "duration_s"):
+            if name in metadata and (type(metadata[name]) not in (int, float) or
+                    not np.isfinite(metadata[name]) or metadata[name] <= 0 or
+                    not np.isclose(horizon, metadata[name], rtol=1e-10, atol=0)):
+                raise ValueError("comparison trace does not cover its declared physical duration")
+        if timesteps and dt >= timesteps[-1]:
+            raise ValueError("comparison timesteps must be distinct and ordered from coarse to fine")
+        if horizons and not np.isclose(horizon, horizons[0], rtol=1e-10, atol=0):
+            raise ValueError("comparison requires identical complete physical horizons")
+        if not (values["energy"][..., E.VALID] == 1).all() or np.any(values["energy_status"]) or np.any(values["env_status"]):
+            raise ValueError("comparison requires valid production readouts and environment states")
+        if not np.allclose(values["energy"][..., E.DT], dt, rtol=4 * np.finfo(np.float32).eps, atol=0):
+            raise ValueError("comparison timestep differs from recorded production intervals")
+        if any(key not in values or not values[key].size for key in (position_key, velocity_key)):
             raise ValueError("comparison requires captured physical states")
         if any(baseline[key].shape[1:] != values[key].shape[1:] for key in (position_key, velocity_key)):
             raise ValueError("comparison requires matching physical state extents")
-        delta_x = baseline[position_key][selected_a].astype(np.float64) - values[position_key][selected_b]
-        delta_v = baseline[velocity_key][selected_a].astype(np.float64) - values[velocity_key][selected_b]
-        energy_a = baseline["energy"][selected_a, ..., E.END_KINETIC:E.END_ELASTIC + 1].sum(axis=-1)
-        energy_b = values["energy"][selected_b, ..., E.END_KINETIC:E.END_ELASTIC + 1].sum(axis=-1)
-        results.append({"source": str(source), "common_samples": len(selected_a),
-            "common_end_s": float(time_a[selected_a[-1]]), "baseline_dt_s": dt_a, "candidate_dt_s": dt_b,
-            "position_rms_m": float(np.sqrt(np.mean(delta_x * delta_x))),
+        initial, match = initial_state(source, manifest, values)
+        if baseline_initial is None:
+            baseline_initial = initial
+        for name in ("positions", "velocity", "inverse_mass"):
+            if not np.array_equal(initial[name], baseline_initial[name]):
+                raise ValueError(f"comparison initial {name} differs from the baseline: {source}")
+        initial_matches.append(match)
+        physical_arrays = [value for name, value in values.items() if name.startswith("state_")]
+        physical_arrays += [values["energy"], values["stages"], values["force_residual_work"]]
+        if any(not np.isfinite(value).all() for value in physical_arrays):
+            raise ValueError("comparison requires finite physical states and readouts")
+        if np.any(values["stages"][..., C.NONFINITE_PARTICLES:C.NONFINITE_LINKS + 1]):
+            raise ValueError("comparison rejects recorded nonfinite entity states")
+        totals = values["energy"][..., E.END_KINETIC:E.END_ELASTIC + 1].astype(np.float64).sum(axis=-1, dtype=np.float64)
+        if not np.isfinite(totals).all():
+            raise ValueError("comparison total energy must be representable in float64")
+        timesteps.append(dt)
+        horizons.append(horizon)
+        energy_totals.append(totals)
+        evidence.append({"source": str(source), "source_manifest_sha256": sha256(source / "manifest.json"),
+            "physical_input_sha256": physical_input, "initial_geometry_sha256": manifest.get("initial_geometry_sha256"),
+            "chunks": [{"file": entry["file"], "sha256": entry["sha256"]} for entry in manifest["chunks"]]})
+
+    def common_samples(indices):
+        times = np.arange(1, base_manifest["steps"] + 1, dtype=np.float64) * timesteps[0]
+        selected = [np.arange(base_manifest["steps"], dtype=np.int64)]
+        mask = np.ones(len(times), dtype=bool)
+        for index in indices[1:]:
+            candidates = np.rint(times / timesteps[index]).astype(np.int64) - 1
+            mask &= (candidates >= 0) & (candidates < runs[index][1]["steps"])
+            mask &= np.isclose((candidates + 1) * timesteps[index], times, rtol=1e-10, atol=0)
+            selected.append(candidates)
+        if not mask.any():
+            raise ValueError("runs have no common sampled physical times")
+        return times[mask], [selection[mask] for selection in selected]
+
+    def rms(delta):
+        if not np.isfinite(delta).all():
+            raise ValueError("comparison differences must be representable in float64")
+        scale = float(np.max(np.abs(delta)))
+        return 0.0 if scale == 0 else float(scale * np.sqrt(np.mean((delta / scale) ** 2, dtype=np.float64)))
+
+    def differences(first, second, selected_first, selected_second):
+        a, b = runs[first][0], runs[second][0]
+        delta_x = a[position_key][selected_first].astype(np.float64) - b[position_key][selected_second].astype(np.float64)
+        delta_v = a[velocity_key][selected_first].astype(np.float64) - b[velocity_key][selected_second].astype(np.float64)
+        delta_energy = energy_totals[first][selected_first] - energy_totals[second][selected_second]
+        return {"position_rms_m": rms(delta_x), "velocity_rms_mps": rms(delta_v),
+            "energy_rms_j": rms(delta_energy),
             "position_max_m": float(np.max(np.abs(delta_x))),
-            "velocity_rms_mps": float(np.sqrt(np.mean(delta_v * delta_v))),
-            "energy_difference_max_j": float(np.max(np.abs(energy_a - energy_b))),
-            "baseline_max_momentum_velocity_defect_mps": float(np.max(baseline["stages"][selected_a, ..., Stage.SOLVED, C.VBD_MOMENTUM_VELOCITY_ERROR])),
-            "candidate_max_momentum_velocity_defect_mps": float(np.max(values["stages"][selected_b, ..., Stage.SOLVED, C.VBD_MOMENTUM_VELOCITY_ERROR])),
+            "energy_difference_max_j": float(np.max(np.abs(delta_energy)))}
+
+    results = []
+    for index, source in enumerate(sources[1:], start=1):
+        times, (selected_a, selected_b) = common_samples((0, index))
+        values = runs[index][0]
+        results.append({"source": str(source), "source_manifest_sha256": evidence[index]["source_manifest_sha256"],
+            "initial_particle_state_matched": True,
+            "common_samples": len(times), "common_start_s": float(times[0]), "common_end_s": float(times[-1]),
+            "baseline_dt_s": timesteps[0], "candidate_dt_s": timesteps[index],
+            **differences(0, index, selected_a, selected_b),
+            "baseline_max_momentum_velocity_defect_mps": float(np.max(baseline["stages"][selected_a, ..., Stage.SOLVED, C.VBD_MOMENTUM_VELOCITY_ERROR].astype(np.float64))),
+            "candidate_max_momentum_velocity_defect_mps": float(np.max(values["stages"][selected_b, ..., Stage.SOLVED, C.VBD_MOMENTUM_VELOCITY_ERROR].astype(np.float64))),
+            "claims_physical_acceptance": False,
             "claims_speedup": False, "scope": "Matched state differences; independent physical acceptance remains required"})
-    return {"baseline": str(sources[0]), "comparisons": results}
+    convergence = {"status": "unmeasured", "reason": "Observed order requires three inputs at h, h/2, h/4"}
+    if len(runs) == 3 and np.allclose(np.asarray(timesteps[:-1]) / np.asarray(timesteps[1:]), 2.0, rtol=1e-10, atol=0):
+        times, selected = common_samples((0, 1, 2))
+        pairs = {"coarse_medium": differences(0, 1, selected[0], selected[1]),
+                 "medium_fine": differences(1, 2, selected[1], selected[2]),
+                 "coarse_fine": differences(0, 2, selected[0], selected[2])}
+        orders = {}
+        for name in ("position_rms_m", "velocity_rms_mps", "energy_rms_j"):
+            numerator, denominator = pairs["coarse_medium"][name], pairs["medium_fine"][name]
+            if numerator == 0 or denominator == 0:
+                orders[name] = {"status": "roundoff_limited", "observed_order": None,
+                    "reason": "A sampled pairwise difference is zero; a finite observed order cannot be inferred"}
+            else:
+                orders[name] = {"status": "measured", "observed_order": float(np.log2(numerator) - np.log2(denominator))}
+        convergence = {"status": "measured_differences", "dt_s": timesteps, "common_samples": len(times),
+            "common_physical_times_s": times.tolist(), "pairwise": pairs, "observed_order": orders,
+            "claims_physical_acceptance": False,
+            "scope": "All pairs use the intersection of the three sampled physical timelines; no state interpolation"}
+    return {"baseline": str(sources[0]), "source_manifest_sha256": evidence[0]["source_manifest_sha256"],
+            "source_hashes": evidence, "physical_input_sha256": physical_input, "physical_horizon_s": horizons[0],
+            "initial_state_match": {"status": "matched", "method": "np.array_equal without tolerance",
+                "fields": ["positions", "velocity", "inverse_mass"], "sources": initial_matches,
+                "scope": "Particle initial states only; effective timestep and topology are not inferred from END states"},
+            "comparisons": results, "timestep_convergence": convergence, "claims_physical_acceptance": False}

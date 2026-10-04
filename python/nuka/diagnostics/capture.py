@@ -9,7 +9,8 @@ import numpy as np
 
 from .._nuka_ext import Field
 from ..energy import EnergyColumn, EnergyLedgerSampler
-from .schema import AuditCount, AuditMetric, DiagnosticThresholds, Stage, StageColumn, stage_units
+from .schema import (AuditCount, AuditMetric, DiagnosticThresholds, Stage, StageColumn,
+                     VbdSolveAuditColumn, stage_units, vbd_solve_audit_units)
 
 
 def sha256(path):
@@ -70,6 +71,11 @@ class DiagnosticSession:
             "state_fields": [f.name for f in state_fields],
             "timing_scope": "Host step call wall time; excludes capture and file I/O; not GPU event latency.",
         }
+        audit_field = getattr(Field, "VBD_SOLVE_AUDIT", None)
+        if audit_field is not None and audit_field in self.state_fields:
+            self.manifest["vbd_solve_audit_columns"] = [c.name for c in VbdSolveAuditColumn]
+            self.manifest["vbd_solve_audit_units"] = [vbd_solve_audit_units(c) for c in VbdSolveAuditColumn]
+            self.manifest["vbd_solve_audit_scope"] = "last solve call"
         write_json(self.output / "manifest.json", self.manifest)
 
     def read(self, *, step_wall_seconds=np.nan, controls=None, state_fields=None):
@@ -117,28 +123,59 @@ class DiagnosticSession:
         return self.record(step_wall_seconds=elapsed, controls=controls)
 
     def replay_budgets(self, budgets, *, state_fields=(), controls=None):
-        """Replay the next step from one checkpoint per velocity sweep budget.
+        """Replay the next step from one checkpoint per active solve iteration budget.
         The world returns to the checkpoint at the production budget, so the record is unchanged."""
+        if self.closed:
+            raise RuntimeError("diagnostic session is closed")
+        budgets = tuple(int(budget) for budget in budgets)
+        state_fields = tuple(state_fields)
+        if not budgets or any(budget < 1 or budget > 65535 for budget in budgets):
+            raise ValueError("replay budgets must contain iteration counts in 1..65535")
         path = self.output / f"budget_replay_step_{self.steps + 1:06d}.npz"
         if path.exists():
             raise FileExistsError(path)
         production = self.world.velocity_iterations()
-        samples = []
+        if not 1 <= production <= 65535:
+            raise ValueError("the production iteration budget cannot be restored through the runtime API")
+        samples, actual_budgets = [], []
         with self.world.capture_checkpoint() as checkpoint:
             try:
                 for budget in budgets:
-                    self.world.set_velocity_iterations(int(budget))
+                    self.world.set_velocity_iterations(budget)
+                    actual = self.world.velocity_iterations()
+                    if actual != budget:
+                        raise RuntimeError(f"requested iteration budget {budget}, active budget is {actual}")
                     self.world.restore_checkpoint(checkpoint)
+                    self.world.synchronize()
                     started = time.perf_counter()
                     self.world.step()
+                    self.world.synchronize()
                     elapsed = time.perf_counter() - started
                     samples.append(self.read(step_wall_seconds=elapsed, controls=controls, state_fields=state_fields))
+                    actual_budgets.append(actual)
             finally:
-                self.world.set_velocity_iterations(production)
-                self.world.restore_checkpoint(checkpoint)
+                try:
+                    self.world.set_velocity_iterations(production)
+                finally:
+                    self.world.restore_checkpoint(checkpoint)
         payload = {key: np.stack([sample[key] for sample in samples]) for key in samples[0]}
         with path.open("xb") as target:
-            np.savez_compressed(target, budgets=np.asarray(budgets, dtype=np.uint32), **payload)
+            np.savez_compressed(target, budgets=np.asarray(budgets, dtype=np.uint32),
+                actual_budgets=np.asarray(actual_budgets, dtype=np.uint32),
+                timing_scope=np.asarray("Host step wall time through World.synchronize(); excludes checkpoint restore, "
+                    "budget changes, diagnostic readout and file I/O; includes GPU completion and synchronization overhead; "
+                    "may include graph capture after a budget rebuild; not GPU event latency."), **payload)
+        replay_record = {
+            "file": path.name, "sha256": sha256(path), "checkpoint_policy_step": self.steps,
+            "requested_budgets": list(budgets), "actual_budgets": actual_budgets,
+            "production_budget": production}
+        audit_field = getattr(Field, "VBD_SOLVE_AUDIT", None)
+        if audit_field is not None and audit_field in state_fields:
+            replay_record["vbd_solve_audit_columns"] = [c.name for c in VbdSolveAuditColumn]
+            replay_record["vbd_solve_audit_units"] = [vbd_solve_audit_units(c) for c in VbdSolveAuditColumn]
+            replay_record["vbd_solve_audit_scope"] = "last solve call"
+        self.manifest.setdefault("budget_replays", []).append(replay_record)
+        write_json(self.output / "manifest.json", self.manifest)
         return path
 
     def flush(self):
@@ -173,10 +210,15 @@ class DiagnosticSession:
         self.close("exception" if error else "completed", error=None if error is None else repr(error))
 
 
-def load_records(root, *, states=False):
-    root = Path(root)
+def iter_record_blocks(root, *, states=False):
+    """Yield validated chunks; exhaust the iterator to verify the declared complete step extent."""
+    root = Path(root).resolve()
     manifest = json.loads((root / "manifest.json").read_text())
-    if manifest["schema_version"] != 1:
+    if not isinstance(manifest, dict):
+        raise ValueError("diagnostic manifest must be an object")
+    if not isinstance(manifest.get("metadata"), dict):
+        raise ValueError("diagnostic metadata must be an object")
+    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
         raise ValueError("unsupported diagnostic schema")
     columns = {"stages": Stage, "stage_columns": StageColumn,
                "audit_counts": AuditCount, "audit_metrics": AuditMetric}
@@ -185,37 +227,92 @@ def load_records(root, *, states=False):
             raise ValueError(f"diagnostic column order mismatch: {name}")
     if "energy_columns" in manifest and manifest["energy_columns"] != [c.name for c in EnergyColumn]:
         raise ValueError("diagnostic energy column order mismatch")
-    if min(manifest["env_count"], manifest["substeps"]) < 1:
-        raise ValueError("diagnostic environment and substep extents must be positive")
+    for name in ("env_count", "substeps", "steps"):
+        if type(manifest.get(name)) is not int or manifest[name] < 1:
+            raise ValueError(f"diagnostic {name} must be a positive integer")
+    state_fields = manifest.get("state_fields", [])
+    if (not isinstance(state_fields, list) or
+            any(not isinstance(name, str) or not name for name in state_fields) or
+            len(state_fields) != len(set(state_fields))):
+        raise ValueError("diagnostic state_fields must contain distinct field names")
+    if not isinstance(manifest.get("chunks"), list) or not manifest["chunks"]:
+        raise ValueError("no completed physics records")
     extent = (manifest["env_count"], manifest["substeps"])
+    environments = (manifest["env_count"],)
     shapes = {"energy": extent + (len(EnergyColumn),), "energy_status": extent,
               "stages": extent + (len(Stage), len(StageColumn)),
               "audit_counts": extent + (len(AuditCount),),
-              "audit_metrics": extent + (len(AuditMetric),), "force_residual_work": extent}
-    blocks = []
+              "audit_metrics": extent + (len(AuditMetric),), "force_residual_work": extent,
+              "env_status": environments, "ogc_contacts": environments,
+              "dat_truncations": environments, "dat_failures": environments,
+              "dat_query_limits": environments, "sweeps": environments,
+              "newton_metrics": environments + (2,), "contact_metrics": environments + (8,),
+              "step_wall_seconds": (), "policy_step": ()}
+    floating = {"energy", "stages", "force_residual_work", "step_wall_seconds"}
+    unsigned = shapes.keys() - floating
+    required_states = {"state_" + name for name in state_fields}
+    state_shapes, columns, paths = {}, None, set()
     next_step = 1
     for entry in manifest["chunks"]:
-        path = root / entry["file"]
+        if not isinstance(entry, dict):
+            raise ValueError("diagnostic chunk entries must be objects")
+        for name in ("steps", "first_policy_step"):
+            if type(entry.get(name)) is not int or entry[name] < 1:
+                raise ValueError(f"diagnostic chunk {name} must be a positive integer")
+        filename = entry.get("file")
+        if not isinstance(filename, str) or not filename or Path(filename).is_absolute():
+            raise ValueError("diagnostic chunk requires a relative filename")
+        path = (root / filename).resolve()
+        if path == root or not path.is_relative_to(root) or path in paths:
+            raise ValueError("diagnostic chunk filenames must be distinct and stay inside the source")
+        paths.add(path)
         if sha256(path) != entry["sha256"]:
             raise ValueError(f"evidence hash mismatch: {path}")
         with np.load(path, allow_pickle=False) as data:
-            block = {key: data[key].copy() for key in data.files
-                     if states or not key.startswith("state_") and key != "controls"}
-        if len(block["policy_step"]) != entry["steps"]:
-            raise ValueError("chunk extent does not match its manifest")
+            keys = set(data.files)
+            if len(keys) != len(data.files) or not shapes.keys() <= keys or not required_states <= keys:
+                raise ValueError("diagnostic chunk has missing or duplicate columns")
+            if columns is not None and keys != columns:
+                raise ValueError("diagnostic capture columns changed between chunks")
+            columns = keys
+            block = {}
+            for name in data.files:
+                value = data[name]
+                if value.ndim < 1 or value.shape[0] != entry["steps"]:
+                    raise ValueError(f"diagnostic step extent mismatch: {name}")
+                if name in shapes and value.shape != (entry["steps"],) + shapes[name]:
+                    raise ValueError(f"diagnostic extent mismatch: {name}")
+                if name in unsigned and value.dtype.kind != "u":
+                    raise ValueError(f"diagnostic unsigned integer dtype required: {name}")
+                if name in ("audit_metrics", "newton_metrics", "contact_metrics") and value.dtype.itemsize != 8:
+                    raise ValueError(f"diagnostic packed maxima require 64-bit words: {name}")
+                if name in floating and value.dtype.kind != "f":
+                    raise ValueError(f"diagnostic floating dtype required: {name}")
+                if name.startswith("state_"):
+                    if value.dtype.kind not in "fiu":
+                        raise ValueError(f"diagnostic state fields require numeric data: {name}")
+                    shape = value.shape[1:]
+                    if name in state_shapes and state_shapes[name] != shape:
+                        raise ValueError(f"diagnostic state extent changed between chunks: {name}")
+                    state_shapes[name] = shape
+                if states or not name.startswith("state_") and name != "controls":
+                    block[name] = value
         if entry["first_policy_step"] != next_step or not np.array_equal(
-                block["policy_step"], np.arange(next_step, next_step + entry["steps"])):
+                block["policy_step"], np.arange(next_step, next_step + entry["steps"], dtype=np.uint64)):
             raise ValueError("physics evidence has a discontinuity")
-        for name, shape in shapes.items():
-            if block[name].shape != (entry["steps"],) + shape:
-                raise ValueError(f"diagnostic extent mismatch: {name}")
-        if blocks and block.keys() != blocks[0].keys():
-            raise ValueError("diagnostic capture columns changed between chunks")
         next_step += entry["steps"]
+        if next_step - 1 > manifest["steps"]:
+            raise ValueError("diagnostic chunks exceed the declared total steps")
+        yield block, manifest
+    if next_step - 1 != manifest["steps"]:
+        raise ValueError("diagnostic chunks do not cover the declared total steps")
+
+
+def load_records(root, *, states=False):
+    blocks, manifest = [], None
+    for block, manifest in iter_record_blocks(root, states=states):
         blocks.append(block)
     if not blocks:
         raise ValueError("no completed physics records")
     values = {key: np.concatenate([block[key] for block in blocks]) for key in blocks[0]}
-    if not np.array_equal(values["policy_step"], np.arange(1, manifest["steps"] + 1)):
-        raise ValueError("physics evidence has a discontinuity")
     return values, manifest

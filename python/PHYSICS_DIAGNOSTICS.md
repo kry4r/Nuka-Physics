@@ -39,6 +39,7 @@ diagnostic decisions remain unmeasured until a complete interval is recorded.
 | `CONTACT_AUDIT_METRICS` | 7 uint64 values | Maximum audit values and their global row witnesses |
 | `VBD_EFFECTIVE_DT` | One float32 per VBD vertex, latest substep | Actual BE/BDF2 step, including per-vertex restarts |
 | `VBD_ELEMENTS` | Shared cooked model, sixteen uint32 words per element | Exact elastic topology and material parameters |
+| `VBD_SOLVE_AUDIT` | 20 float32 values per VBD vertex, latest solve call | Final force and Newton correction; local descent direction, scale, energy change and counters |
 
 Stages are `BEGIN`, `FREE`, `SOLVED`, `PROJECTED`, `END`.
 `FREE` follows gravity and controls. Contact impulses and work are measured at
@@ -46,6 +47,19 @@ Stages are `BEGIN`, `FREE`, `SOLVED`, `PROJECTED`, `END`.
 Python enums in `nuka.diagnostics.schema` define column order and stage units.
 `decode_maxima` in `nuka.diagnostics.report` decodes packed values and row IDs.
 A row ID belongs to its recorded interval; slots can be reused in later steps.
+
+Request `VBD_SOLVE_AUDIT` in `state_fields` before stepping to record individual
+vertex descents. Its scope is the last solve call of the latest substep, including
+the verification call when the solver uses one. Static vertices remain zero;
+`TOTAL_STEPS > 0` identifies recorded dynamic vertices. `ACCEPTED_STEPS`,
+`REJECTED_STEPS` and `ZERO_SLOPE_STEPS` sum to `TOTAL_STEPS`; `ROUNDED_STEPS`
+counts accepted moves whose stored velocity is unchanged. `LAST_ENERGY_CHANGE`
+is the accepted local potential change, or zero when no trial was accepted.
+Final force is measured after neighboring blocks and dual updates; the last
+primal force belongs to the local step before those updates. These quantities
+serve diagnosis and do not replace solver or conservation acceptance gates.
+The manifest declares optional columns and units for main records and budget
+replays separately. Reports emit `vertex_solver_audit.json` when present.
 
 Energy uses joules, time uses seconds, linear momentum uses kg·m/s and angular
 momentum uses kg·m²/s. VBD force-equation velocity defect uses m/s. The physical
@@ -145,6 +159,87 @@ contact behavior. Frozen-Jacobian gap estimates are auxiliary; only actual
 closest-feature gaps enter the gap decision. Force residual work is never
 subtracted from the original energy residual. Signed negative dissipation and
 the first nonfinite stage remain visible.
+
+## Required coverage and numeric evidence
+
+Declare `required_physical_systems` and `required_ccd_contact_domains` in capture
+metadata. Measured energy and linear momentum channels currently support `vbd`. Declare dynamic
+rigid bodies, articulations, MPM and other particle systems when present; their
+missing complete balances keep full acceptance unmeasured. Static boundaries
+belong in the contact-domain inventory. The mesh audit covers
+`particle_mesh_self`; `particle_static`, `particle_articulation` and
+`articulation_self` need their own complete geometry evidence.
+
+The geometry artifact must contain actual initial `positions` or `position`,
+initial velocity, masses and topology. Material rest coordinates alone cannot
+establish the first trajectory segment. A legacy `rest` array is accepted only
+with the explicit metadata contract `initial_positions_equal_rest: true`.
+Particle positions are read a chunk at a time through `iter_record_blocks`;
+consuming the complete iterator verifies hashes, extents and continuity.
+The audit independently checks initial mesh intersections and exact degenerate
+edges/faces before CCD. Invalid initial environments retain their failure and
+recorded segment counts; their trajectories are skipped and cannot pass.
+Zero-distance CCD does not certify finite contact offsets or rotating rigid trajectories.
+
+The original relative momentum gate and the independently recomputed
+solver-tolerance closure must both pass. Newton and contact residuals need valid
+packed measurements; absent readouts cannot pass as zero. Energy and stage
+intervals must have the same positive finite timestep. Replay artifacts are
+registered in the manifest with a SHA256, checkpoint step, requested and active
+budgets, and the restored production budget. The largest replay budget must
+meet the production residual tolerance; this does not waive quality at the
+production budget.
+
+Independent state and elastic checks are required report layers. Declare
+nonnegative absolute measurement bounds in `independent_readout_limits` before
+capture for `kinetic_j`, `gravity_j`, `mass_kg`, `linear_momentum_kg_mps`,
+`angular_momentum_kg_m2ps`, `discrete_momentum_kg_mps`, `elastic_energy_j` and
+`internal_gradient_sum_n`. Derive these bounds from the diagnostic arithmetic
+and input scale; they measure readout accuracy and do not replace conservation
+or solver thresholds. Missing bounds, hashes, environments or intervals leave
+these checks unmeasured. Incorrect BE/BDF2 vertex counts fail the state check.
+
+Analytic/convergence, reference-engine and angular balance results can enter the report through
+`analytic_acceptance.json`, `reference_acceptance.json` and `angular_momentum_acceptance.json`. Define required checks
+in `metadata.quantitative_acceptance` under the report layer names
+`L1_analytic_and_convergence`, `reference_engines` and `L2_angular_momentum`. Each definition has a unique
+`name`, a `unit` and a finite `minimum` and/or `maximum`. The corresponding result
+contains the source `source_manifest_sha256`, matching `physical_input_sha256`,
+and a `checks` object keyed by name. Each check stores its numeric `value`, the
+same `unit`, and a nonempty list of `artifacts` with run-relative `file` and
+`sha256`. The reporter recomputes decisions from values and declared bounds;
+an external `passed` flag is insufficient.
+
+Angular balance must account for external and boundary torque, contact impulse
+moments and the actual integrator. State angular momentum or the force-equation
+angular defect alone cannot establish conservation; missing balance evidence
+keeps this required layer unmeasured.
+
+Those producers must preserve the actual initial conditions, controls,
+constitutive parameters, integrator and reference-engine versions and model
+differences. A bounded shape difference alone does not establish conservation.
+Modal energy predictions apply to isolated linear models; integration losses
+remain separate from friction, material damping and solver defects, and are not
+subtracted from the original residual.
+
+`compare` requires closed completed captures, identical declared physical inputs
+and initial particle states, valid finite readouts and the same complete physical
+horizon. Supply runs in decreasing timestep order. Three runs at `h`, `h/2` and
+`h/4` report pairwise position, velocity and energy RMS at their common sample
+times and the observed convergence order. Zero differences are marked
+`roundoff_limited`; observed order alone does not pass physical acceptance.
+
+Full engine acceptance additionally needs the complete control/reset/state/sensor
+and rendering pipeline. Performance acceptance needs five independent processes,
+GPU completion timing, complete pipelines at equal physical quality, memory and
+capacity accounting, and latency distributions. `perf.json` continues to mark
+these requirements unmeasured when their evidence is absent.
+
+The pipeline benchmark additionally requires active rows and positive normal
+impulse in each environment's timed window for every required system pair.
+Warmup impulses and timed zero-impulse rows cannot establish workload coverage.
+Its `status.valid` covers the reported lifecycle, state, render, deformation and
+coupling contracts; separate fields mark full physics acceptance unmeasured.
 
 The current measured balances cover the VBD particle subsystem and particle
 VF/EE contact features. General stage sampling includes bodies and articulated

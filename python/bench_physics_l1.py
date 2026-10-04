@@ -16,6 +16,9 @@ import nuka
 from nuka.author import Scene, SimOptions, materials, morphs, surfaces
 from nuka.diagnostics import DiagnosticSession, DiagnosticThresholds
 from nuka.diagnostics.capture import sha256, write_json
+from nuka.diagnostics.analysis import particle_state_quantities, vbd_discrete_momentum, verify_particle_trace
+from nuka.diagnostics.constitutive import elastic_quantities, unpack_elements, verify_elastic_trace
+from nuka.diagnostics.report import make_report
 from nuka.diagnostics.schema import Stage, StageColumn
 
 from bench_cloth_twist import topology
@@ -146,6 +149,377 @@ def base_metadata(args, physical, steps, tolerance, vertices):
         "binary_hashes": (args.build_record / "binaries.sha256").read_text(), "fixture_sha256": sha256(__file__)}
 
 
+def cloth_linear_reference(rest, inv_mass, elements, spacing, output):
+    """Linearize the independent cooked elastic gradient without removing rigid modes."""
+    result = {"status": "invalid", "precision": "float64", "difference_step_m": spacing * 1e-5,
+              "error_estimate": "central difference at h and h/2, plus float64 roundoff",
+              "negative_eigenvalues_clamped": False, "rigid_modes_removed": False}
+    try:
+        rest = np.asarray(rest, dtype=np.float64)
+        inv_mass = np.asarray(inv_mass, dtype=np.float64).reshape(-1)
+        if not np.isfinite(inv_mass).all() or not (inv_mass > 0).all():
+            raise ValueError("the full free-cloth modal reference requires finite positive inverse masses")
+        _, _, _, damping = unpack_elements(elements)
+        if not len(damping) or not np.isfinite(damping).all() or not (damping == damping[0]).all():
+            result.update(status="unmeasured", reason="cooked element damping is not one finite uniform beta")
+            return result, None
+        beta = float(damping[0])
+        if beta < 0:
+            raise ValueError("negative cooked damping cannot define a passive modal reference")
+        base = elastic_quantities(elements, rest, precision=np.float64)
+        gradient = base["gradient_n"].reshape(-1)
+        matrices, actual_steps, gradient_scale = [], [], np.linalg.norm(gradient)
+        for step in (spacing * 1e-5, spacing * .5e-5):
+            stiffness = np.empty((rest.size, rest.size), dtype=np.float64)
+            actual = []
+            for column in range(rest.size):
+                plus, minus = rest.copy(), rest.copy()
+                plus.flat[column] += step
+                minus.flat[column] -= step
+                extent = plus.flat[column] - minus.flat[column]
+                if not extent > 0:
+                    raise ValueError("the central difference step is not representable")
+                positive = elastic_quantities(elements, plus, precision=np.float64)["gradient_n"].reshape(-1)
+                negative = elastic_quantities(elements, minus, precision=np.float64)["gradient_n"].reshape(-1)
+                gradient_scale = max(gradient_scale, np.linalg.norm(positive), np.linalg.norm(negative))
+                stiffness[:, column] = (positive - negative) / extent
+                actual.append(extent / 2)
+            matrices.append(stiffness)
+            actual_steps.append(actual)
+        stiffness, refined = matrices
+        if not all(np.isfinite(value).all() for value in (stiffness, refined, gradient)):
+            raise ValueError("nonfinite elastic linearization")
+        scale = float(np.linalg.norm(stiffness, ord="fro"))
+        roundoff = 64 * np.finfo(np.float64).eps * gradient_scale * math.sqrt(rest.size) / min(actual_steps[1])
+        uncertainty = float(4 * np.linalg.norm(stiffness - refined, ord="fro") / 3 + roundoff)
+        asymmetry = float(np.linalg.norm(stiffness - stiffness.T, ord="fro"))
+        matrix_path = output / "linear_reference_matrices.npz"
+        np.savez_compressed(matrix_path, stiffness_raw_npm=stiffness, stiffness_half_step_npm=refined,
+            rest_gradient_n=gradient, actual_difference_steps_m=np.asarray(actual_steps))
+        result.update(actual_difference_steps_m=actual_steps, stiffness_frobenius_npm=scale,
+            stiffness_difference_error_bound_npm=uncertainty, stiffness_symmetry_error_npm=asymmetry,
+            stiffness_symmetry_relative_error=asymmetry / scale if scale > 0 else 0,
+            elastic_base_energy_j=base["energy_j"], rest_gradient_norm_n=float(np.linalg.norm(gradient)),
+            rest_gradient_sum_n=base["elastic_gradient_sum_n"].tolist(), damping_beta_s=beta,
+            matrices={"file": matrix_path.name, "sha256": sha256(matrix_path)})
+        if asymmetry > 2 * uncertainty:
+            raise ValueError("stiffness asymmetry exceeds the measured finite difference uncertainty")
+        stiffness = .5 * (stiffness + stiffness.T)
+        inverse_sqrt_mass = np.repeat(np.sqrt(inv_mass), 3)
+        weighted = inverse_sqrt_mass[:, None] * stiffness * inverse_sqrt_mass[None, :]
+        eigenvalues, modes = np.linalg.eigh(weighted)
+        spectral_error = uncertainty * float(inv_mass.max())
+        result.update(eigenvalues_per_s2=eigenvalues.tolist(), mode_count=rest.size,
+            negative_eigenvalues=int((eigenvalues < 0).sum()), eigenvalue_error_bound_per_s2=spectral_error,
+            lowest_eigenvalue_per_s2=float(eigenvalues.min()),
+            eigenvector_orthogonality_error=float(np.linalg.norm(modes.T @ modes - np.eye(rest.size))))
+        if not np.isfinite(eigenvalues).all() or not np.isfinite(modes).all():
+            raise ValueError("nonfinite eigendecomposition")
+        if (eigenvalues < -spectral_error).any():
+            raise ValueError("negative eigenvalues exceed the measured finite difference uncertainty")
+        result["status"] = "measured"
+        return result, {"stiffness": stiffness, "gradient": gradient, "eigenvalues": eigenvalues,
+            "modes": modes, "sqrt_mass": 1 / inverse_sqrt_mass,
+            "affine_force": modes.T @ (inverse_sqrt_mass * gradient), "beta": beta}
+    except (ValueError, FloatingPointError, np.linalg.LinAlgError) as error:
+        result["reason"] = str(error)
+        return result, None
+
+
+def cloth_fixture_metrics(args, session, reason, rest, initial_position, initial_velocity, inv_mass,
+                          samples, reference, linear):
+    """Keep raw trajectories and every modal contribution alongside explicit measurement limits."""
+    positions = np.stack([initial_position, *[s["state_PARTICLE_POSITION"].reshape(-1, 3) for s in samples]]).astype(np.float64)
+    velocities = np.stack([initial_velocity, *[s["state_PARTICLE_VELOCITY"].reshape(-1, 3) for s in samples]]).astype(np.float64)
+    rest = np.asarray(rest, dtype=np.float64)
+    h = float(np.float32(args.dt))
+    times = np.arange(len(positions), dtype=np.float64) * h
+    mass = 1 / np.asarray(inv_mass, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(positions).all(axis=(1, 2)) & np.isfinite(velocities).all(axis=(1, 2))
+    flags = [np.asarray(s["env_status"]).tolist() for s in samples]
+    first_failure = next((i + 1 for i, s in enumerate(samples) if np.any(s["env_status"])), None)
+    first_nonfinite = next((int(i) for i in np.flatnonzero(~finite)), None)
+    field_finite = {field.name: [bool(np.isfinite(s["state_" + field.name]).all()) for s in samples]
+                    for field in PARTICLE_FIELDS}
+    first_field_nonfinite = next((i + 1 for i in range(len(samples))
+        if any(not values[i] for values in field_finite.values())), None)
+    constant_mass = all(np.array_equal(s["state_PARTICLE_INV_MASS"].reshape(-1), inv_mass.reshape(-1)) for s in samples)
+    metrics = {"policy_steps": session.steps, "stop_reason": reason,
+        "production_status": {"status": "completed" if reason == "completed" else "failed_or_incomplete",
+            "first_env_status_policy_step": first_failure, "env_status": flags,
+            "energy_status": [np.asarray(s["energy_status"]).tolist() for s in samples],
+            "first_nonfinite_state_policy_step": first_nonfinite, "finite_state": finite.tolist(),
+            "particle_field_finite": field_finite, "first_nonfinite_particle_field_policy_step": first_field_nonfinite,
+            "cooked_masses_unchanged": constant_mass},
+        "window": {"first_policy_step": 0, "last_policy_step": session.steps,
+            "nominal_duration_s": session.steps * args.dt, "physical_float32_step_s": h,
+            "recorded_duration_s": float(times[-1]), "expected_policy_steps": session.manifest["metadata"]["expected_policy_steps"]},
+        "bindings": {"manifest_sha256": sha256(args.output / "manifest.json"),
+            "initial_geometry_sha256": session.manifest["initial_geometry_sha256"],
+            "physical_input_sha256": session.manifest["metadata"]["physical_input_sha256"],
+            "fixture_sha256": session.manifest["metadata"]["fixture_sha256"],
+            "binary_hashes": session.manifest["metadata"]["binary_hashes"]},
+        "modal_reference": reference, "claims_full_physics_acceptance": False,
+        "angular_momentum_convergence": {"status": "unmeasured", "required_timesteps": [args.dt, args.dt / 2, args.dt / 4],
+            "reason": "full nonlinear spin and angular momentum need matched h, h/2, h/4 production runs"}}
+    curves = {"time_s": times, "positions": positions, "physical_velocity": velocities,
+              "finite_state": finite}
+    momentum, angular, angular_com, centers, discrete, discrete_production = [], [], [], [], [], []
+    for index, (position, velocity) in enumerate(zip(positions, velocities)):
+        if not finite[index]:
+            for values in (momentum, angular, angular_com, centers, discrete):
+                values.append(np.full(3, np.nan))
+            continue
+        values = particle_state_quantities(position, velocity, inv_mass.reshape(-1), (0, 0, 0))
+        center = (mass[:, None] * position).sum(axis=0) / mass.sum()
+        momentum.append(values["linear_momentum_kg_mps"])
+        angular.append(values["angular_momentum_kg_m2ps"])
+        angular_com.append(np.cross(position - center, mass[:, None] * velocity).sum(axis=0))
+        centers.append(center)
+        if index == 0:
+            discrete.append(momentum[-1])
+        else:
+            try:
+                discrete.append(vbd_discrete_momentum(velocity, velocities[index - 1], inv_mass.reshape(-1),
+                    samples[index - 1]["state_VBD_EFFECTIVE_DT"].reshape(-1), args.dt))
+            except ValueError:
+                discrete.append(np.full(3, np.nan))
+    for sample in samples:
+        end = sample["stages"][0, 0, Stage.END]
+        discrete_production.append(end[StageColumn.VBD_DISCRETE_MOMENTUM_X:StageColumn.VBD_DISCRETE_MOMENTUM_Z + 1])
+    momentum, centers, discrete = np.asarray(momentum), np.asarray(centers), np.asarray(discrete)
+    curves.update(linear_momentum_kg_mps=momentum, angular_momentum_origin_kg_m2ps=np.asarray(angular),
+        angular_momentum_com_kg_m2ps=np.asarray(angular_com), center_of_mass_m=centers,
+        bdf_discrete_momentum_kg_mps=discrete,
+        production_bdf_discrete_momentum_kg_mps=np.asarray(discrete_production))
+    drift = np.linalg.norm(momentum[1:] - momentum[0], axis=1)
+    baseline = float(np.linalg.norm(momentum[0]))
+    relative_rate = drift / (baseline * times[1:]) if baseline > 0 else np.full(len(drift), np.nan)
+    drift_measured = bool(len(drift) and constant_mass and np.isfinite(relative_rate).all())
+    complete = reason == "completed" and session.steps == session.manifest["metadata"]["expected_policy_steps"]
+    threshold = session.thresholds.momentum_relative_per_second
+    curves["linear_momentum_relative_drift_per_s"] = relative_rate
+    curves["center_of_mass_translation_error_m"] = centers - centers[0] - times[:, None] * momentum[0] / mass.sum()
+    curves["displacement_mass_rms_m"] = np.sqrt((mass[None, :, None] * (positions - initial_position) ** 2).sum(axis=(1, 2)) / mass.sum())
+    metrics["linear_momentum"] = {"status": "unmeasured" if not drift_measured else
+        "passed" if complete and (relative_rate < threshold).all() else "failed",
+        "initial_kg_mps": momentum[0].tolist(), "threshold_relative_per_s": threshold,
+        "max_relative_drift_per_s": float(relative_rate.max()) if drift_measured else None,
+        "normalization": "norm(P(t)-P(0))/(norm(P(0))*t), every recorded prefix",
+        "reason": None if baseline > 0 else "initial linear momentum is zero; relative drift is unmeasured"}
+    metrics["displacement"] = {"final_mass_rms_m": float(curves["displacement_mass_rms_m"][-1]),
+        "max_center_translation_error_m": float(np.linalg.norm(curves["center_of_mass_translation_error_m"], axis=1).max())}
+    metrics["discrete_momentum"] = {"status": "measured" if samples and constant_mass and np.isfinite(discrete).all() else "unmeasured",
+        "max_change_kg_mps": float(np.linalg.norm(discrete - discrete[0], axis=1).max()),
+        "scope": "independent actual per-vertex BE/BDF2 momentum; original physical P drift is retained"}
+    metrics["modal_total_energy"] = {"status": "unmeasured", "threshold_relative_error": .05}
+    metrics["per_mode_energy"] = {"status": "unmeasured", "threshold_relative_error": .05,
+        "reason": "a valid full modal reference is required"}
+    metrics["resolvable_elastic_mode_energy"] = {"status": "unmeasured",
+        "reason": "a valid full modal reference is required", "scope": "reference observability only"}
+    if linear is not None:
+        modes, sqrt_mass = linear["modes"], linear["sqrt_mass"]
+        eigenvalues, force, beta = linear["eigenvalues"], linear["affine_force"], linear["beta"]
+        actual_q = ((positions - rest).reshape(len(positions), -1) * sqrt_mass) @ modes
+        actual_w = (velocities.reshape(len(velocities), -1) * sqrt_mass) @ modes
+        predicted_q, predicted_w = [actual_q[0].copy()], [actual_w[0].copy()]
+        for index in range(1, len(positions)):
+            second_order = args.integrator == "bdf2" and index > 1
+            ht = 2 * h / 3 if second_order else h
+            offset = (predicted_q[-1] - predicted_q[-2]) / 3 if second_order else np.zeros_like(predicted_q[-1])
+            velocity_target = 4 * predicted_w[-1] / 3 - predicted_w[-2] / 3 if second_order else predicted_w[-1]
+            target = predicted_q[-1] + offset + ht * velocity_target
+            damping = beta * eigenvalues * ht * ht / h
+            q = (target + damping * predicted_q[-1] - ht * ht * force) / (1 + eigenvalues * ht * ht + damping)
+            w = (q - predicted_q[-1] - offset) / ht
+            predicted_q.append(q)
+            predicted_w.append(w)
+        predicted_q, predicted_w = np.asarray(predicted_q), np.asarray(predicted_w)
+        actual_energy = .5 * actual_w ** 2 + .5 * eigenvalues * actual_q ** 2 + force * actual_q
+        predicted_energy = .5 * predicted_w ** 2 + .5 * eigenvalues * predicted_q ** 2 + force * predicted_q
+        actual_total, predicted_total = actual_energy.sum(axis=1), predicted_energy.sum(axis=1)
+        relative_error = np.abs(actual_total - predicted_total) / np.abs(predicted_total)
+        energy_finite = constant_mass and np.isfinite(relative_error).all() and np.isfinite(actual_energy).all() and np.isfinite(predicted_energy).all()
+        curves.update(actual_mode_displacement=actual_q, actual_mode_physical_velocity=actual_w,
+            predicted_mode_displacement=predicted_q, predicted_mode_velocity=predicted_w,
+            actual_mode_energy_j=actual_energy, predicted_mode_energy_j=predicted_energy,
+            actual_linear_total_energy_j=actual_total, predicted_linear_total_energy_j=predicted_total,
+            modal_total_energy_relative_error=relative_error, eigenvalues_per_s2=eigenvalues,
+            modes=modes, mass_sqrt=sqrt_mass, stiffness_npm=linear["stiffness"], rest_gradient_n=linear["gradient"],
+            affine_modal_force=force)
+        metrics["modal_total_energy"].update({"status": "unmeasured" if not energy_finite else
+            "passed" if complete and (relative_error < .05).all() else "failed",
+            "max_relative_error": float(relative_error.max()) if energy_finite else None,
+            "mode_count": len(eigenvalues), "energy_definition": "all-mode kinetic + g0 dot displacement + 0.5 displacement.T K displacement",
+            "elastic_base_energy_j": reference["elastic_base_energy_j"],
+            "normalization": "absolute error divided by absolute predicted linear total energy at every sample",
+            "scope": "linearized cooked material, uniform beta; nonlinear spin still requires timestep convergence"})
+        denominator = np.abs(predicted_energy)
+        denominator_valid = np.isfinite(denominator) & (denominator > 0)
+        mode_error = np.divide(np.abs(actual_energy - predicted_energy), denominator,
+            out=np.full_like(denominator, np.nan), where=denominator_valid)
+        spectral_error = reference["eigenvalue_error_bound_per_s2"]
+        resolvable = eigenvalues > spectral_error
+        translation_only = args.stretch_strain == 0 and not np.any(np.asarray(args.spin))
+        per_mode = []
+        for mode in range(len(eigenvalues)):
+            measured = bool(samples and constant_mass and denominator_valid[:, mode].all() and
+                np.isfinite(mode_error[:, mode]).all())
+            decay_observable = bool(measured and resolvable[mode] and not translation_only)
+            status = ("unmeasured" if not measured or translation_only else
+                "passed" if complete and (mode_error[:, mode] < .05).all() else "failed")
+            per_mode.append({"mode": mode, "eigenvalue_per_s2": float(eigenvalues[mode]), "status": status,
+                "max_relative_error": float(mode_error[:, mode].max()) if measured else None,
+                "invalid_reference_energy_samples": int((~denominator_valid[:, mode]).sum()),
+                "resolvable_elastic_mode": bool(resolvable[mode]),
+                "decay_status": status if decay_observable else "unmeasured",
+                "reason": "zero or nonfinite reference energy, nonfinite error, no intervals or changed mass"
+                    if not measured else "translation-only input does not establish modal decay excitation"
+                    if translation_only else None})
+        metrics["per_mode_energy"] = {"status": "failed" if any(mode["status"] == "failed" for mode in per_mode)
+            else "unmeasured" if any(mode["status"] == "unmeasured" for mode in per_mode) else "passed",
+            "threshold_relative_error": .05, "normalization": "absolute per-mode energy error divided by absolute corresponding predicted mode energy",
+            "zero_or_nonfinite_denominator": "unmeasured; no floor", "translation_only_input": bool(translation_only),
+            "modes": per_mode, "scope": "every reference mode retained; decay requires excited resolvable elastic modes"}
+        elastic_actual = actual_energy[:, resolvable].sum(axis=1)
+        elastic_predicted = predicted_energy[:, resolvable].sum(axis=1)
+        elastic_denominator = np.abs(elastic_predicted)
+        elastic_valid = np.isfinite(elastic_denominator) & (elastic_denominator > 0)
+        elastic_error = np.divide(np.abs(elastic_actual - elastic_predicted), elastic_denominator,
+            out=np.full_like(elastic_denominator, np.nan), where=elastic_valid)
+        elastic_measured = bool(samples and constant_mass and resolvable.any() and elastic_valid.all() and
+            np.isfinite(elastic_error).all())
+        metrics["resolvable_elastic_mode_energy"] = {"status": "measured" if elastic_measured else "unmeasured",
+            "mode_count": int(resolvable.sum()), "outside_range_mode_count": int((~resolvable).sum()),
+            "eigenvalue_lower_bound_per_s2": spectral_error,
+            "max_relative_error": float(elastic_error.max()) if elastic_measured else None,
+            "normalization": "absolute aggregate energy error divided by absolute predicted aggregate energy",
+            "scope": "eigenvalue > measured spectral error; reference observability only, no modes removed from prediction or individual acceptance",
+            "replaces_per_mode_acceptance": False, "claims_full_physics_acceptance": False}
+        curves.update(mode_energy_relative_error=mode_error, mode_reference_energy_denominator_valid=denominator_valid,
+            resolvable_elastic_modes=resolvable, resolvable_elastic_actual_energy_j=elastic_actual,
+            resolvable_elastic_predicted_energy_j=elastic_predicted,
+            resolvable_elastic_energy_relative_error=elastic_error)
+    path = args.output / "fixture_curves.npz"
+    np.savez_compressed(path, **curves)
+    metrics["curves"] = {"file": path.name, "sha256": sha256(path)}
+    return metrics
+
+
+def run_s1_fixture(args):
+    if args.output.exists():
+        raise FileExistsError(args.output)
+    steps = policy_steps(args.duration, args.dt)
+    tolerance = production_tolerance()
+    if args.gravity_z != 0:
+        raise ValueError("the free-cloth invariant fixture requires zero gravity")
+    if args.nx < 2 or args.ny < 2 or not np.isfinite(args.spacing) or not args.spacing > 0:
+        raise ValueError("the free cloth needs a finite positive spacing and at least two vertices per axis")
+    if not np.isfinite(args.damping) or args.damping < 0:
+        raise ValueError("damping must be finite and nonnegative")
+    if not np.isfinite([*args.translation, *args.spin, args.stretch_strain, args.height]).all() or args.stretch_strain <= -1:
+        raise ValueError("initial motion and height must be finite and stretch strain must exceed -1")
+    physical = {key: getattr(args, key) for key in ("nx", "ny", "spacing", "height", "duration", "density", "stretch",
+        "poisson", "bend", "thickness", "friction", "gravity_z", "damping", "translation", "spin", "stretch_strain")}
+    metadata = {"fixture": args.fixture.upper(), **base_metadata(args, physical, steps, tolerance, args.nx * args.ny),
+        "state_system": "dynamic_particles", "required_physical_systems": ["vbd"], "required_ccd_contact_domains": [],
+        "boundary": "Free flat cooked cloth without external contact objects; prescribed translation, spin and in-plane dilation",
+        "reference": "Full mass-orthonormal linearization of float64 cooked elastic gradients; BE startup, then selected integrator"}
+    grid = morphs.Grid(args.nx, args.ny, args.spacing, origin=(0, 0, args.height))
+    scene = Scene(SimOptions(dt=args.dt, gravity=(0, 0, 0),
+        cloth_integrator=0 if args.integrator == "bdf2" else 1, solver_vel_iters=args.sweeps, solver_pos_iters=4,
+        ogc_contact_capacity=args.contact_capacity, baumgarte_max_velocity=0))
+    scene.add_entity(grid, materials.Cloth.VBD(areal_density=args.density, friction=args.friction,
+        stretch_stiffness=args.stretch, poisson=args.poisson, bend_stiffness=args.bend, thickness=args.thickness,
+        damping=args.damping), surfaces.Cloth(free=True))
+    device = nuka.Device.create(0)
+    world = scene.build(device)
+    session, samples, reason = None, [], "completed"
+    try:
+        world.set_gravity_z(0)
+        rest = np.asarray(world.download_field(nuka.Field.PARTICLE_POSITION)).reshape(-1, 3).copy()
+        cooked_velocity = np.asarray(world.download_field(nuka.Field.PARTICLE_VELOCITY)).reshape(-1, 3).copy()
+        inv_mass = np.asarray(world.download_field(nuka.Field.PARTICLE_INV_MASS)).reshape(-1).copy()
+        elements = np.asarray(world.download_field(nuka.Field.VBD_ELEMENTS), dtype=np.uint32).reshape(-1, 16).copy()
+        if not np.allclose(rest, grid.rest_positions(), atol=1e-6):
+            raise ValueError("the cooked cloth lattice differs from the authored grid")
+        if not np.isfinite(inv_mass).all() or not (inv_mass > 0).all():
+            raise ValueError("the free cloth requires finite positive cooked inverse masses")
+        mass = 1 / inv_mass.astype(np.float64)
+        center = (rest.astype(np.float64) * mass[:, None]).sum(axis=0) / mass.sum()
+        offset = rest.astype(np.float64) - center
+        positions = (offset * (1 + args.stretch_strain) + center).astype(rest.dtype)
+        velocity = (np.asarray(args.translation) + np.cross(np.asarray(args.spin), offset)).astype(cooked_velocity.dtype)
+        world.upload_field(nuka.Field.PARTICLE_POSITION, np.ascontiguousarray(positions))
+        world.upload_field(nuka.Field.PARTICLE_VELOCITY, np.ascontiguousarray(velocity))
+        audit = getattr(nuka.Field, "VBD_SOLVE_AUDIT", None)
+        fields = PARTICLE_FIELDS + CONTACT_FIELDS + (() if audit is None else (audit,))
+        session = DiagnosticSession(world, args.output, metadata, chunk_steps=args.chunk_steps,
+            state_fields=fields, thresholds=DiagnosticThresholds(velocity_tolerance_mps=tolerance))
+        if session.substeps != 1:
+            raise ValueError("the free-cloth modal fixture requires one recorded substep per policy step")
+        faces, edges = topology(args.nx, args.ny)
+        np.savez_compressed(args.output / "initial.npz", rest=positions, positions=positions, velocity=velocity,
+            flat_rest=rest, inv_mass=inv_mass, vbd_elements=elements, faces=faces, edges=edges)
+        session.manifest["initial_geometry_sha256"] = sha256(args.output / "initial.npz")
+        write_json(args.output / "inputs.json", {"parameters": {key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()}, "metadata": metadata})
+        reference, linear = cloth_linear_reference(rest, inv_mass, elements, args.spacing, args.output)
+        write_json(args.output / "linear_reference.json", reference)
+        try:
+            for step in range(steps):
+                if step + 1 == args.replay_step:
+                    replayed = session.replay_budgets(replay_budget_list(args.replay_budgets), state_fields=fields)
+                    print(json.dumps({"budget_replay": str(replayed)}), flush=True)
+                sample = session.step()
+                samples.append(sample)
+                if np.any(sample["env_status"]):
+                    reason = "physics_failure"
+                    break
+                if any(not np.isfinite(sample["state_" + field.name]).all() for field in PARTICLE_FIELDS):
+                    reason = "nonfinite_state"
+                    break
+                if step + 1 == args.replay_step and args.replay_stop:
+                    reason = "replay_complete"
+                    break
+        except BaseException as error:
+            reason = "exception"
+            session.close(reason, error=repr(error))
+            raise
+        finally:
+            session.close(reason)
+            metrics = cloth_fixture_metrics(args, session, reason, rest, positions, velocity, inv_mass,
+                samples, reference, linear)
+            write_json(args.output / "fixture_metrics.json", metrics)
+            if session.steps:
+                for filename, verify in (("particle_state_check.json", verify_particle_trace),
+                                          ("elastic_state_check.json", verify_elastic_trace)):
+                    try:
+                        check = verify(args.output, args.output / "initial.npz")
+                    except (ValueError, FloatingPointError) as error:
+                        check = {"status": "unmeasured", "reason": str(error), "claims_full_physics_acceptance": False}
+                    write_json(args.output / filename, check)
+                try:
+                    report = make_report(args.output, args.output / "report")
+                    metrics["production_report"] = {"status": "measured", "file": "report/report.json",
+                        "sha256": sha256(args.output / "report/report.json"),
+                        "passes_full_physics_acceptance": report["passes_full_physics_acceptance"]}
+                except (ValueError, ImportError, FloatingPointError) as error:
+                    metrics["production_report"] = {"status": "unmeasured", "reason": str(error)}
+            else:
+                metrics["production_report"] = {"status": "unmeasured", "reason": "no completed production intervals"}
+            write_json(args.output / "fixture_metrics.json", metrics)
+            print(json.dumps({"output": str(args.output), "policy_steps": session.steps, "stop_reason": reason,
+                "claims_full_physics_acceptance": False}), flush=True)
+    except BaseException as error:
+        if session is not None:
+            session.close("exception", error=repr(error))
+        raise
+    finally:
+        world.destroy()
+        device.close()
+
+
 def run_s5(args):
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -164,6 +538,8 @@ def run_s5(args):
         raise ValueError("the folded cloth must lie 2 cm inside the 0.4 m table top")
     metadata = {"fixture": "S5", **base_metadata(args, physical, steps, tolerance, args.nx * args.ny),
         "state_system": "dynamic_particles",
+        "required_physical_systems": ["vbd"],
+        "required_ccd_contact_domains": ["particle_mesh_self", "particle_static"],
         "boundary": "Static table top at z = 0; the cloth starts at rest folded over a semicircular hinge and a straight "
                     "ramp onto a flat upper layer, its lower layer at the given height, over a flat cooked rest shape",
         "gap_scope": "Exact vertex-to-triangle distance from the outer half of the flat upper layer to the lower layer; "
@@ -195,7 +571,7 @@ def run_s5(args):
             state_fields=PARTICLE_FIELDS + CONTACT_FIELDS,
             thresholds=DiagnosticThresholds(velocity_tolerance_mps=tolerance))
         faces, edges = topology(args.nx, args.ny)
-        np.savez_compressed(args.output / "initial.npz", rest=folded, velocity=velocity, vbd_elements=elements,
+        np.savez_compressed(args.output / "initial.npz", rest=folded, positions=folded, velocity=velocity, vbd_elements=elements,
                             faces=faces, edges=edges, inv_mass=inv_mass, flat_rest=rest)
         session.manifest["initial_geometry_sha256"] = sha256(args.output / "initial.npz")
         write_json(args.output / "inputs.json", {"parameters": vars(args) | {"output": str(args.output),
@@ -651,7 +1027,8 @@ def run_s7(args):
     scene_dir.mkdir(parents=True)
     urdf, scene_path = hand_scene(args, scene_dir, hand, geometry)
     metadata = {"fixture": "S7", **base_metadata(args, physical, steps, tolerance, args.nx * args.ny),
-        "state_system": "dynamic_particles",
+        "state_system": "particles_and_articulation", "required_physical_systems": ["vbd", "articulation"],
+        "required_ccd_contact_domains": ["particle_mesh_self", "particle_articulation", "articulation_self"],
         "boundary": "Static hand root placed so the pinch normal is world x and the strip hangs along world -z; the "
                     "thumb closes on a force-limited position drive with gravity feedforward while the index holds its "
                     "position; the strip's top row is kinematic until release, after which only the pads hold it",
@@ -718,7 +1095,7 @@ def run_s7(args):
         if session.substeps != 1:
             raise ValueError("the pinch fixture records one substep per policy step")
         faces, edges = topology(args.nx, args.ny)
-        np.savez_compressed(args.output / "initial.npz", rest=placed, velocity=velocity, vbd_elements=elements,
+        np.savez_compressed(args.output / "initial.npz", rest=placed, positions=placed, velocity=velocity, vbd_elements=elements,
                             faces=faces, edges=edges, inv_mass=free, flat_rest=rest, pinned=pinned)
         session.manifest["initial_geometry_sha256"] = sha256(args.output / "initial.npz")
         write_json(args.output / "inputs.json", {"parameters": {key: str(value) if isinstance(value, Path) else value
@@ -834,6 +1211,20 @@ def common_arguments(parser):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     fixtures = parser.add_subparsers(dest="fixture", required=True)
+    for name, integrator in (("s1", "bdf2"), ("s2", "be")):
+        free = fixtures.add_parser(name, help="free cloth translation, spin and small in-plane stretch")
+        common_arguments(free)
+        cloth_arguments(free)
+        free.set_defaults(integrator=integrator, gravity_z=0)
+        free.add_argument("--nx", type=int, default=10)
+        free.add_argument("--ny", type=int, default=10)
+        free.add_argument("--spacing", type=float, default=.01)
+        free.add_argument("--height", type=float, default=1)
+        free.add_argument("--duration", type=float, default=.1)
+        free.add_argument("--damping", type=float, default=.002)
+        free.add_argument("--translation", type=float, nargs=3, default=(.2, .1, -.05), metavar=("VX", "VY", "VZ"))
+        free.add_argument("--spin", type=float, nargs=3, default=(0, 0, .1), metavar=("WX", "WY", "WZ"))
+        free.add_argument("--stretch-strain", type=float, default=1e-4)
     s5 = fixtures.add_parser("s5", help="folded cloth dropped onto a static table (self-contact)")
     common_arguments(s5)
     s5.add_argument("--nx", type=int, default=133)
@@ -867,7 +1258,7 @@ def main():
     s7.add_argument("--settle", type=float, default=.4)
     s7.add_argument("--hold", type=float, default=.8)
     args = parser.parse_args()
-    {"s5": run_s5, "s7": run_s7}[args.fixture](args)
+    {"s1": run_s1_fixture, "s2": run_s1_fixture, "s5": run_s5, "s7": run_s7}[args.fixture](args)
 
 
 if __name__ == "__main__":
