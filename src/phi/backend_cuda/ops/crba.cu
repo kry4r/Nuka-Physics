@@ -1,18 +1,7 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M3b CRBA ops: CrbaComputeM / CrbaFactorM.
-//
-// KERNEL BODIES ARE LINE-BY-LINE PORTS (D1 byte-exact contract) of the CRBA
-// section of src/runtime/articulation/articulation_contacts.cu
-// (ComputeArticulationInertiaMKernel / FactorArticulationInertiaMKernel).
-// Input wiring is the only change: composite scratch = the
-// link_composite_inertia field, M tile = the m field, M^-1 = the m_inv field,
-// the implicit-damping fold reads the drive_damping field. The known capacity
-// constant kMaxFactorDof == kMaxArticulationDof (64) is ported AS-IS (G0
-// DOF-honesty is out of scope here; the host-side loud-throw guard becomes a
-// Status::Failed return).
-// ---------------------------------------------------------------------------
+// Articulation mass factorization, implicit damping and mimic projection use per-articulation workspace.
 
 #include <cuda_runtime.h>
+#include <limits>
 
 #include "math/cuda_spatial_ops.cuh"
 #include "math/cuda_vec_ops.cuh"
@@ -29,6 +18,59 @@ using namespace ::nuka::phi::nkops;
 
 constexpr uint32_t kInvalidLink = ~0u;
 constexpr float kMinDiagonal = 1.0e-6f;
+
+enum class CrbaVector : uint32_t {
+    Diagonal, Root, Scale, Compact, FreeDof, DofLink, DofComponent,
+    Velocity, Projected, Moment, QdotWork, DampingProduct, Count
+};
+constexpr uint32_t kCrbaVectorCount = static_cast<uint32_t>(CrbaVector::Count);
+static_assert(kCrbaVectorCount == 12u && sizeof(float) == sizeof(uint32_t));
+
+struct CrbaWorkspace {
+    uint32_t* words;
+    uint32_t max_dof;
+
+    __device__ float* Matrix() const {
+        return reinterpret_cast<float*>(words);
+    }
+    __device__ uint32_t* Indices(CrbaVector vector) const {
+        return words + size_t{max_dof} * max_dof +
+            size_t{static_cast<uint32_t>(vector)} * max_dof;
+    }
+    __device__ float* Values(CrbaVector vector) const {
+        return reinterpret_cast<float*>(Indices(vector));
+    }
+};
+
+__device__ CrbaWorkspace CrbaWorkspaceFor(
+    uint32_t* words, uint32_t articulation, uint32_t max_dof) {
+    const size_t stride = size_t{max_dof} * (size_t{max_dof} + kCrbaVectorCount);
+    return {words + size_t{articulation} * stride, max_dof};
+}
+
+bool CrbaWorkspaceFits(uint32_t articulations, uint32_t max_dof) {
+    const uint64_t limit = std::numeric_limits<size_t>::max() / sizeof(uint32_t);
+    const uint64_t width = uint64_t{max_dof} + kCrbaVectorCount;
+    if (max_dof == 0u || articulations == 0u) return true;
+    if (uint64_t{max_dof} > limit / width) return false;
+    const uint64_t words = uint64_t{max_dof} * width;
+    return uint64_t{articulations} <= limit / words;
+}
+
+__device__ uint32_t ActualCrbaDof(const ArticulationDeviceState& state,
+    uint32_t articulation, uint32_t max_dof, uint32_t* err_status) {
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    uint64_t dof = 0u;
+    for (uint32_t local = 0u; local < count; ++local) {
+        dof += JointDofCountDevice(state.joint_type[offset + local]);
+        if (dof > max_dof) {
+            atomicOr(err_status, kEnvStatusDofOverflow);
+            return kInvalidLink;
+        }
+    }
+    return static_cast<uint32_t>(dof);
+}
 
 namespace mg = ::nuka::math::gpu;
 
@@ -199,28 +241,13 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
     }
 }
 
-// (2) Per-articulation unpivoted LDL^T of the leading dof_count block, then the
-// explicit symmetric inverse. One block, single lane. The dense scratch lives
-// in STATIC SHARED memory (see articulation_contacts.cu for the rationale).
-constexpr uint32_t kMaxFactorDof = kMaxArticulationDof;
-
-// M4 perf note (NUMERICS UNCHANGED — the fused-family goldens pin this op):
-// the LDL^T decomposition stays on lane 0 VERBATIM (its loop carries the
-// factor's data dependence), but the n identity-COLUMN solves that form the
-// explicit inverse are mutually INDEPENDENT serial solves — they are now
-// distributed one-column-per-lane (col = lane, lane+blockDim, ...). Each
-// column's arithmetic (forward / diagonal / backward substitution, loop
-// order, operand order) is the byte-identical single-lane body; only WHICH
-// lane runs it changed, and columns write disjoint Minv elements. Measured:
-// the 51-DOF H1 inverse drops ~1.9 ms -> ~0.1 ms at N=1 (the M4 union
-// red-line's second-largest cost).
+// Each inverse column uses its output column for forward and backward substitution.
 __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
                                                  uint32_t max_dof,
                                                  const float* inertia_M,
                                                  float* out_inertia_M_inv,
+                                                 uint32_t* scratch,
                                                  uint32_t* err_status) {
-    __shared__ float a[kMaxFactorDof * kMaxFactorDof];
-    __shared__ float d[kMaxFactorDof];
     __shared__ uint32_t dof_sh;
 
     const uint32_t articulation = blockIdx.x;
@@ -232,22 +259,12 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
     const size_t tile_stride = static_cast<size_t>(max_dof) * max_dof;
     const float* const M = inertia_M + static_cast<size_t>(articulation) * tile_stride;
     float* const Minv = out_inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
+    const auto workspace = CrbaWorkspaceFor(scratch, articulation, max_dof);
+    float* const a = workspace.Matrix();
+    float* const d = workspace.Values(CrbaVector::Diagonal);
 
     if (lane == 0u) {
-        const uint32_t offset = state.articulation_link_offset[articulation];
-        const uint32_t count = state.articulation_link_count[articulation];
-        uint32_t dof = 0u;
-        for (uint32_t local = 0u; local < count; ++local) {
-            dof += JointDofCountDevice(state.joint_type[offset + local]);
-        }
-        if (dof > max_dof) {
-            // Memory-safety bound, but NEVER a silent clamp (G0 honesty): a
-            // truncated M^-1 is dishonest, so surface it in the err_status
-            // readout (env slot 0). The host checks it post-step.
-            if (err_status != nullptr) atomicOr(&err_status[0], kEnvStatusDofOverflow);
-            dof = max_dof;
-        }
-        dof_sh = dof;
+        dof_sh = ActualCrbaDof(state, articulation, max_dof, err_status);
     }
     __syncthreads();
     const uint32_t dof = dof_sh;
@@ -257,36 +274,35 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
     for (size_t i = lane; i < tile_stride; i += blockDim.x) {
         Minv[i] = 0.0f;
     }
-    if (dof == 0u) {
+    if (dof == 0u || dof == kInvalidLink) {
         return;
     }
 
     if (lane == 0u) {
-        // Copy the leading dof x dof block into the dense (shared) scratch.
+        // Copy the leading DOF block into this articulation's factor workspace.
         for (uint32_t r = 0u; r < dof; ++r) {
             for (uint32_t c = 0u; c < dof; ++c) {
-                a[r * kMaxFactorDof + c] = M[static_cast<size_t>(r) * max_dof + c];
+                a[size_t{r} * max_dof + c] = M[static_cast<size_t>(r) * max_dof + c];
             }
         }
 
         // Unpivoted LDL^T: A = L D L^T, L unit-lower-triangular, D diagonal.
         // L stored in the strict lower triangle of `a`, D on its diagonal.
-        // (VERBATIM single-lane body — the factor's loop-carried dependence.)
         for (uint32_t j = 0u; j < dof; ++j) {
-            float djj = a[j * kMaxFactorDof + j];
+            float djj = a[size_t{j} * max_dof + j];
             for (uint32_t k = 0u; k < j; ++k) {
-                djj -= a[j * kMaxFactorDof + k] * a[j * kMaxFactorDof + k] * d[k];
+                djj -= a[size_t{j} * max_dof + k] * a[size_t{j} * max_dof + k] * d[k];
             }
             if (djj < kMinDiagonal) {
                 djj = kMinDiagonal;  // SPD floor; guards a degenerate config.
             }
             d[j] = djj;
             for (uint32_t i = j + 1u; i < dof; ++i) {
-                float lij = a[i * kMaxFactorDof + j];
+                float lij = a[size_t{i} * max_dof + j];
                 for (uint32_t k = 0u; k < j; ++k) {
-                    lij -= a[i * kMaxFactorDof + k] * a[j * kMaxFactorDof + k] * d[k];
+                    lij -= a[size_t{i} * max_dof + k] * a[size_t{j} * max_dof + k] * d[k];
                 }
-                a[i * kMaxFactorDof + j] = lij / djj;
+                a[size_t{i} * max_dof + j] = lij / djj;
             }
         }
     }
@@ -295,64 +311,37 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
     // Solve A x = e_col for each identity column to form M^-1 (symmetric).
     // INDEPENDENT columns -> one per lane; per-column math byte-identical.
     for (uint32_t col = lane; col < dof; col += blockDim.x) {
-        float y[kMaxFactorDof];
         // Forward solve L y = e_col.
         for (uint32_t i = 0u; i < dof; ++i) {
             float value = (i == col) ? 1.0f : 0.0f;
             for (uint32_t k = 0u; k < i; ++k) {
-                value -= a[i * kMaxFactorDof + k] * y[k];
+                value -= a[size_t{i} * max_dof + k] * Minv[size_t{k} * max_dof + col];
             }
-            y[i] = value;
+            Minv[size_t{i} * max_dof + col] = value;
         }
         // Diagonal solve D z = y (in place).
         for (uint32_t i = 0u; i < dof; ++i) {
-            y[i] /= d[i];
+            Minv[size_t{i} * max_dof + col] /= d[i];
         }
         // Backward solve L^T x = z.
-        float x[kMaxFactorDof];
         for (uint32_t ii = dof; ii > 0u; --ii) {
             const uint32_t i = ii - 1u;
-            float value = y[i];
+            float value = Minv[size_t{i} * max_dof + col];
             for (uint32_t k = i + 1u; k < dof; ++k) {
-                value -= a[k * kMaxFactorDof + i] * x[k];
+                value -= a[size_t{k} * max_dof + i] * Minv[size_t{k} * max_dof + col];
             }
-            x[i] = value;
-        }
-        for (uint32_t r = 0u; r < dof; ++r) {
-            Minv[static_cast<size_t>(r) * max_dof + col] = x[r];
+            Minv[size_t{i} * max_dof + col] = value;
         }
     }
 }
 
-// (3) Standalone backward-Euler implicit joint viscous damping (no contacts).
-//
-// L1-b: the implicit joint-damping seed used to ride inside the deleted FUSED
-// contact solve kernel (SolveArticulatedContactRowsKernel). It is GENERAL
-// articulation physics, not a FUSED feature, so it is lifted here as its own op.
-//
-// KERNEL BODY IS A LINE-BY-LINE PORT (D1 byte-exact contract) of
-// src/runtime/articulation/articulation_contacts.cu::ApplyImplicitJointDamping-
-// Kernel (itself a verbatim transcription of the FUSED solve kernel's implicit-
-// damping seed + write-back). Reproduced here — rather than calling the runtime
-// launcher ApplyImplicitJointDamping — because the launcher wraps the chevrons
-// in a ScopedDeviceGuard (cudaGetDevice/cudaSetDevice), which the op layer
-// forbids inside the captured pipeline (the per-op LaunchCuda launches on the
-// given stream with NO device switch, mandatory for the StepPlanned CUDA-graph-
-// capture twin). The float sequence is identical to the runtime kernel, so a
-// zero-contact world's trajectory is byte-identical to the legacy standalone-
-// damping order.
-//
-// Minv == (M + dt*C)^-1: ComputeArticulationInertiaM folded dt*C into the joint
-// diagonals (fold_drive_damping), so backward-Euler joint damping is
-//   qdot_{n+1} = qdot_half - dt*(M + dt*C)^-1 * (C * qdot_half),
-// C diagonal (c_j = joint_damping[link] on scalar joint DOFs, 0 on the free
-// floating-base DOFs). joint_damping==nullptr || dt<=0 -> qdot unchanged.
-// One block per articulation, single lane, fixed loop order, no atomics => D1.
+// Backward-Euler damping uses the factored mass and applies its velocity correction once.
 __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
                                                const float* inertia_M_inv,
                                                const float* joint_damping,
                                                uint32_t dof_stride,
-                                               float dt) {
+                                               float dt, uint32_t* scratch,
+                                               uint32_t* err_status) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
     if (articulation >= state.articulation_count || lane != 0u) {
@@ -362,20 +351,18 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
 
-    // dof_to_link[k] / dof_to_component[k]: built EXACTLY as the FUSED solve /
-    // runtime damping kernel does (base-inclusive prefix sum; a FloatingBase
-    // root expands to 6 component DOFs tagged 0..5 living in
-    // link_velocity[root].v, scalar joints tagged kInvalidLink living in
-    // state.qdot).
-    uint32_t dof_to_link[kMaxArticulationDof];
-    uint32_t dof_to_component[kMaxArticulationDof];
+    const uint32_t actual_dof = ActualCrbaDof(state, articulation, dof_stride, err_status);
+    if (actual_dof == kInvalidLink) return;
+    const auto workspace = CrbaWorkspaceFor(scratch, articulation, dof_stride);
+    uint32_t* const dof_to_link = workspace.Indices(CrbaVector::DofLink);
+    uint32_t* const dof_to_component = workspace.Indices(CrbaVector::DofComponent);
     uint32_t dof = 0u;
-    for (uint32_t local = 0u; local < count && dof < kMaxArticulationDof; ++local) {
+    for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
         const ArticulationJointType type = state.joint_type[link];
         if (local == 0u && state.parent_link[link] == kInvalidLink &&
             type == ArticulationJointType::FloatingBase) {
-            for (uint32_t b = 0u; b < 6u && dof < kMaxArticulationDof; ++b) {
+            for (uint32_t b = 0u; b < 6u; ++b) {
                 dof_to_link[dof] = link;
                 dof_to_component[dof] = b;
                 ++dof;
@@ -394,7 +381,7 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
 
     // Working joint-velocity vector. Base DOFs seed from link_velocity[root].v
     // (the omega-first base spatial velocity); scalar joint DOFs from state.qdot.
-    float qdot_work[kMaxArticulationDof];
+    float* const qdot_work = workspace.Values(CrbaVector::QdotWork);
     for (uint32_t k = 0u; k < dof; ++k) {
         if (dof_to_component[k] != kInvalidLink) {
             qdot_work[k] = state.link_velocity[dof_to_link[k]].v[dof_to_component[k]];
@@ -408,7 +395,7 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
         inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
 
     if (joint_damping != nullptr && dt > 0.0f) {
-        float c_qdot[kMaxArticulationDof];
+        float* const c_qdot = workspace.Values(CrbaVector::DampingProduct);
         for (uint32_t k = 0u; k < dof; ++k) {
             const float c = (dof_to_component[k] == kInvalidLink)
                                 ? joint_damping[dof_to_link[k]]
@@ -425,14 +412,269 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
         }
     }
 
-    // Write the corrected velocity back for every DOF (same as the solve kernel's
-    // write-back): base DOFs -> link_velocity[root].v[component], scalar joint DOFs
-    // -> state.qdot[link].
+    // Base components write to spatial velocity; scalar joints write to qdot.
     for (uint32_t k = 0u; k < dof; ++k) {
         if (dof_to_component[k] != kInvalidLink) {
             state.link_velocity[dof_to_link[k]].v[dof_to_component[k]] = qdot_work[k];
         } else {
             state.qdot[dof_to_link[k]] = qdot_work[k];
+        }
+    }
+}
+
+// Mimic projection factors Z^T M Z and lifts its inverse back to the full DOF space.
+__global__ void MimicReduceKernel(ArticulationDeviceState state,
+                                  const uint32_t* __restrict__ mimic_source_link,
+                                  const float* __restrict__ mimic_multiplier,
+                                  const float* __restrict__ mimic_offset,
+                                  uint32_t max_dof,
+                                  const float* __restrict__ inertia_M,
+                                  const float* __restrict__ inertia_M_inv,
+                                  uint32_t* __restrict__ root_dof,
+                                  float* __restrict__ root_scale,
+                                  float* __restrict__ reduced_M,
+                                  float* __restrict__ coupled_M_inv,
+                                  float* __restrict__ projection_loss,
+                                  uint32_t* scratch, uint32_t* err_status) {
+    __shared__ uint32_t dof_sh;
+    __shared__ uint32_t free_sh;
+
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (articulation >= state.articulation_count) {
+        return;
+    }
+    const size_t tile_stride = static_cast<size_t>(max_dof) * max_dof;
+    const float* const M = inertia_M + static_cast<size_t>(articulation) * tile_stride;
+    const float* const Minv = inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
+    float* const Mr = reduced_M + static_cast<size_t>(articulation) * tile_stride;
+    float* const Wc = coupled_M_inv + static_cast<size_t>(articulation) * tile_stride;
+    const auto workspace = CrbaWorkspaceFor(scratch, articulation, max_dof);
+    float* const a = workspace.Matrix();
+    float* const d = workspace.Values(CrbaVector::Diagonal);
+    uint32_t* const root = workspace.Indices(CrbaVector::Root);
+    float* const scale = workspace.Values(CrbaVector::Scale);
+    uint32_t* const compact = workspace.Indices(CrbaVector::Compact);
+    uint32_t* const free_dof = workspace.Indices(CrbaVector::FreeDof);
+    uint32_t* const dof_link = workspace.Indices(CrbaVector::DofLink);
+    uint32_t* const dof_component = workspace.Indices(CrbaVector::DofComponent);
+    float* const velocity = workspace.Values(CrbaVector::Velocity);
+    float* const projected = workspace.Values(CrbaVector::Projected);
+    float* const moment = workspace.Values(CrbaVector::Moment);
+    if (lane == 0u) dof_sh = ActualCrbaDof(state, articulation, max_dof, err_status);
+    __syncthreads();
+    if (dof_sh == kInvalidLink) return;
+
+    // DOFs in the solver's order; a DOF whose root lies past the tile stays free.
+    if (lane == 0u) {
+        const uint32_t offset = state.articulation_link_offset[articulation];
+        const uint32_t count = state.articulation_link_count[articulation];
+        const uint32_t limit = max_dof;
+        uint32_t dof = 0u;
+        for (uint32_t local = 0u; local < count; ++local) {
+            const uint32_t link = offset + local;
+            const ArticulationJointType type = state.joint_type[link];
+            if (local == 0u && state.parent_link[link] == kInvalidLink &&
+                type == ArticulationJointType::FloatingBase) {
+                for (uint32_t b = 0u; b < 6u; ++b) {
+                    dof_link[dof] = link;
+                    dof_component[dof] = b;
+                    root[dof] = dof;
+                    scale[dof] = 1.0f;
+                    ++dof;
+                }
+                continue;
+            }
+            if (JointDofCountDevice(type) == 0u) {
+                continue;
+            }
+            float s = 1.0f;
+            float c = 0.0f;
+            const uint32_t source = MimicRootDevice(state, mimic_source_link, mimic_multiplier,
+                                                    mimic_offset, link, &s, &c);
+            const uint32_t source_dof =
+                source == link ? dof : LocalDofIndexDevice(state, offset, source);
+            dof_link[dof] = link;
+            dof_component[dof] = kInvalidLink;
+            root[dof] = source_dof < limit ? source_dof : dof;
+            scale[dof] = source_dof < limit ? s : 1.0f;
+            ++dof;
+        }
+        uint32_t n = 0u;
+        for (uint32_t k = 0u; k < dof; ++k) {
+            compact[k] = root[k] == k ? n : kInvalidLink;
+            if (root[k] == k) {
+                free_dof[n++] = k;
+            }
+        }
+        dof_sh = dof;
+        free_sh = n;
+    }
+    __syncthreads();
+    const uint32_t dof = dof_sh;
+    const uint32_t n = free_sh;
+    for (uint32_t k = lane; k < max_dof; k += blockDim.x) {
+        root_dof[static_cast<size_t>(articulation) * max_dof + k] = k < dof ? root[k] : k;
+        root_scale[static_cast<size_t>(articulation) * max_dof + k] = k < dof ? scale[k] : 1.0f;
+    }
+    if (n == dof) {
+        for (size_t i = lane; i < tile_stride; i += blockDim.x) {
+            Mr[i] = M[i];
+            Wc[i] = Minv[i];
+        }
+        if (lane == 0u) {
+            projection_loss[articulation] = 0.0f;
+        }
+        return;
+    }
+
+    // Z^T M Z: columns fold onto their roots, then rows, each sum in ascending DOF order.
+    for (size_t i = lane; i < tile_stride; i += blockDim.x) {
+        Mr[i] = 0.0f;
+        Wc[i] = 0.0f;
+    }
+    for (size_t i = lane; i < size_t{dof} * n; i += blockDim.x) {
+        const uint32_t r = static_cast<uint32_t>(i / n);
+        const uint32_t column = free_dof[i - size_t{r} * n];
+        float value = 0.0f;
+        for (uint32_t b = 0u; b < dof; ++b) {
+            if (root[b] == column) {
+                value += scale[b] * M[static_cast<size_t>(r) * max_dof + b];
+            }
+        }
+        a[size_t{r} * max_dof + i - size_t{r} * n] = value;
+    }
+    __syncthreads();
+    for (size_t i = lane; i < size_t{n} * n; i += blockDim.x) {
+        const uint32_t ci = static_cast<uint32_t>(i / n);
+        const uint32_t cj = static_cast<uint32_t>(i - size_t{ci} * n);
+        if (cj > ci) {
+            continue;
+        }
+        float value = 0.0f;
+        for (uint32_t r = 0u; r < dof; ++r) {
+            if (root[r] == free_dof[ci]) {
+                value += scale[r] * a[size_t{r} * max_dof + cj];
+            }
+        }
+        Mr[static_cast<size_t>(free_dof[ci]) * max_dof + free_dof[cj]] = value;
+        Mr[static_cast<size_t>(free_dof[cj]) * max_dof + free_dof[ci]] = value;
+    }
+    __syncthreads();
+    for (size_t i = lane; i < size_t{n} * n; i += blockDim.x) {
+        const uint32_t ci = static_cast<uint32_t>(i / n);
+        const uint32_t cj = static_cast<uint32_t>(i - size_t{ci} * n);
+        a[size_t{ci} * max_dof + cj] = Mr[static_cast<size_t>(free_dof[ci]) * max_dof + free_dof[cj]];
+    }
+    __syncthreads();
+
+    if (lane == 0u) {
+        for (uint32_t j = 0u; j < n; ++j) {
+            float djj = a[size_t{j} * max_dof + j];
+            for (uint32_t k = 0u; k < j; ++k) {
+                djj -= a[size_t{j} * max_dof + k] * a[size_t{j} * max_dof + k] * d[k];
+            }
+            if (djj < kMinDiagonal) {
+                djj = kMinDiagonal;  // SPD floor; guards a degenerate config.
+            }
+            d[j] = djj;
+            for (uint32_t i = j + 1u; i < n; ++i) {
+                float lij = a[size_t{i} * max_dof + j];
+                for (uint32_t k = 0u; k < j; ++k) {
+                    lij -= a[size_t{i} * max_dof + k] * a[size_t{j} * max_dof + k] * d[k];
+                }
+                a[size_t{i} * max_dof + j] = lij / djj;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Each lane solves reduced columns; W_c[r][b] = s_r s_b W_r[root r][root b] for the
+    // DOFs b that follow the column's DOF, so lanes write disjoint columns.
+    for (uint32_t col = lane; col < n; col += blockDim.x) {
+        for (uint32_t i = 0u; i < n; ++i) {
+            float value = (i == col) ? 1.0f : 0.0f;
+            for (uint32_t k = 0u; k < i; ++k) {
+                value -= a[size_t{i} * max_dof + k] * Wc[size_t{free_dof[k]} * max_dof + free_dof[col]];
+            }
+            Wc[size_t{free_dof[i]} * max_dof + free_dof[col]] = value;
+        }
+        for (uint32_t i = 0u; i < n; ++i) {
+            Wc[size_t{free_dof[i]} * max_dof + free_dof[col]] /= d[i];
+        }
+        for (uint32_t ii = n; ii > 0u; --ii) {
+            const uint32_t i = ii - 1u;
+            float value = Wc[size_t{free_dof[i]} * max_dof + free_dof[col]];
+            for (uint32_t k = i + 1u; k < n; ++k) {
+                value -= a[size_t{k} * max_dof + i] * Wc[size_t{free_dof[k]} * max_dof + free_dof[col]];
+            }
+            Wc[size_t{free_dof[i]} * max_dof + free_dof[col]] = value;
+        }
+        for (uint32_t b = 0u; b < dof; ++b) {
+            if (root[b] != free_dof[col]) {
+                continue;
+            }
+            for (uint32_t r = 0u; r < dof; ++r) {
+                Wc[static_cast<size_t>(r) * max_dof + b] = scale[r] * scale[b] *
+                    Wc[size_t{free_dof[compact[root[r]]]} * max_dof + free_dof[col]];
+            }
+        }
+    }
+    __syncthreads();
+
+    // The coupling impulse takes the step velocity to its M-orthogonal projection W_c M v;
+    // its work 1/2 (v + v_c)^T M (v - v_c) is booked like a row's.
+    for (uint32_t k = lane; k < dof; k += blockDim.x) {
+        velocity[k] = dof_component[k] != kInvalidLink
+                          ? state.link_velocity[dof_link[k]].v[dof_component[k]]
+                          : state.qdot[dof_link[k]];
+    }
+    __syncthreads();
+    for (uint32_t r = lane; r < dof; r += blockDim.x) {
+        float sum = 0.0f;
+        for (uint32_t b = 0u; b < dof; ++b) {
+            sum += M[static_cast<size_t>(r) * max_dof + b] * velocity[b];
+        }
+        moment[r] = sum;
+    }
+    __syncthreads();
+    for (uint32_t r = lane; r < dof; r += blockDim.x) {
+        if (root[r] != r) {
+            continue;
+        }
+        float sum = 0.0f;
+        for (uint32_t b = 0u; b < dof; ++b) {
+            sum += Wc[static_cast<size_t>(r) * max_dof + b] * moment[b];
+        }
+        projected[r] = sum;
+    }
+    __syncthreads();
+    for (uint32_t r = lane; r < dof; r += blockDim.x) {
+        if (root[r] != r) {
+            projected[r] = scale[r] * projected[root[r]];
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = lane; r < dof; r += blockDim.x) {
+        float sum = 0.0f;
+        for (uint32_t b = 0u; b < dof; ++b) {
+            sum += M[static_cast<size_t>(r) * max_dof + b] * (velocity[b] - projected[b]);
+        }
+        moment[r] = sum;
+    }
+    __syncthreads();
+    if (lane == 0u) {
+        double loss = 0.0;
+        for (uint32_t r = 0u; r < dof; ++r) {
+            loss += 0.5 * (double(velocity[r]) + projected[r]) * moment[r];
+        }
+        projection_loss[articulation] = static_cast<float>(loss);
+    }
+    for (uint32_t k = lane; k < dof; k += blockDim.x) {
+        if (dof_component[k] != kInvalidLink) {
+            state.link_velocity[dof_link[k]].v[dof_component[k]] = projected[k];
+        } else {
+            state.qdot[dof_link[k]] = projected[k];
         }
     }
 }
@@ -468,19 +710,18 @@ Status OpCrbaFactorM(const ModelView& model, const DataView& data,
     if (p->articulation_count == 0u || p->max_dof == 0u) {
         return Status::Ok;
     }
-    if (p->max_dof > kMaxArticulationDof) {
-        // Legacy loud-throw guard (G0 honesty: never a silent clamp).
+    if (!CrbaWorkspaceFits(p->articulation_count, p->max_dof) ||
+        data.crba_scratch == nullptr || data.env_status == nullptr ||
+        data.m == nullptr || data.m_inv == nullptr || model.joint_type == nullptr ||
+        model.articulation_link_offset == nullptr || model.articulation_link_count == nullptr) {
         return Status::Failed;
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, /*total_link_count=*/0u, p->articulation_count);
-    // err_status[0] (the env_status readout, slot 0) carries the dof-overflow
-    // diagnostic: a per-articulation actual-dof > max_dof is surfaced, not silently
-    // clamped. The kernel only OR-sets on overflow, so a healthy model is untouched;
-    // the host must clear/read env_status (it is the readout field).
+    // Actual DOFs beyond the allocated tile set the overflow diagnostic and skip factorization.
     LaunchCuda(FactorArticulationInertiaMKernel, dim3(p->articulation_count),
                dim3(32u), 0u, stream, state, p->max_dof, data.m, data.m_inv,
-               data.env_status);
+               data.crba_scratch, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -493,22 +734,52 @@ Status OpApplyImplicitDamping(const ModelView& model, const DataView& data,
     if (p->articulation_count == 0u || p->max_dof == 0u) {
         return Status::Ok;
     }
-    if (p->max_dof > kMaxArticulationDof) {
-        // Legacy loud-throw guard (G0 honesty: never a silent clamp). Matches the
-        // deleted FUSED dispatch + the runtime launcher's dof_stride guard.
+    if (!CrbaWorkspaceFits(p->articulation_count, p->max_dof) ||
+        data.crba_scratch == nullptr || data.env_status == nullptr ||
+        data.m_inv == nullptr || data.qdot == nullptr || data.link_velocity == nullptr ||
+        model.joint_type == nullptr || model.parent_link == nullptr ||
+        model.articulation_link_offset == nullptr || model.articulation_link_count == nullptr) {
         return Status::Failed;
     }
-    // Mirrors the deleted FUSED dispatch + OpCrbaFactorM: state from the
-    // articulation tables (the damping kernel walks via the articulation offset
-    // tables and never reads total_link_count, so 0 keeps the state honest about
-    // that), inertia_M_inv == the freshly factored (M+dt*C)^-1 == data.m_inv, and
-    // joint_damping == the per-DOF c_j == data.drive_dissipation (indexed by global
-    // link). data.drive_dissipation may be null -> the kernel leaves qdot unchanged.
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, /*total_link_count=*/0u, p->articulation_count);
     LaunchCuda(ApplyImplicitJointDampingKernel, dim3(p->articulation_count),
                dim3(32u), 0u, stream, state, data.m_inv, data.drive_dissipation,
-               p->max_dof, p->dt);
+               p->max_dof, p->dt, data.crba_scratch, data.env_status);
+    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+}
+
+Status OpMimicReduce(const ModelView& model, const DataView& data,
+                     const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const MimicReduceParams*>(params);
+    if (p == nullptr) {
+        return Status::Failed;
+    }
+    if (p->articulation_count == 0u || p->total_link_count == 0u || p->max_dof == 0u) {
+        return Status::Ok;
+    }
+    if (!CrbaWorkspaceFits(p->articulation_count, p->max_dof) ||
+        data.crba_scratch == nullptr || data.env_status == nullptr ||
+        data.m == nullptr || data.m_inv == nullptr ||
+        data.qdot == nullptr || data.link_velocity == nullptr ||
+        model.joint_type == nullptr || model.parent_link == nullptr ||
+        model.link_to_articulation == nullptr || model.articulation_link_offset == nullptr ||
+        model.articulation_link_count == nullptr || model.mimic_source_link == nullptr ||
+        model.mimic_multiplier == nullptr || model.mimic_offset == nullptr ||
+        data.m_reduced == nullptr || data.m_inv_coupled == nullptr ||
+        data.mimic_root_dof == nullptr || data.mimic_root_scale == nullptr ||
+        data.mimic_projection_loss == nullptr) {
+        return Status::Failed;
+    }
+    const ArticulationDeviceState state = MakeArticulationDeviceState(
+        model, data, p->total_link_count, p->articulation_count);
+    LaunchCuda(MimicReduceKernel, dim3(p->articulation_count), dim3(32u), 0u, stream, state,
+               static_cast<const uint32_t*>(model.mimic_source_link),
+               static_cast<const float*>(model.mimic_multiplier),
+               static_cast<const float*>(model.mimic_offset), p->max_dof,
+               static_cast<const float*>(data.m), static_cast<const float*>(data.m_inv),
+               data.mimic_root_dof, data.mimic_root_scale, data.m_reduced, data.m_inv_coupled,
+               data.mimic_projection_loss, data.crba_scratch, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -518,6 +789,7 @@ void RegisterNkCrbaOps() {
     SetCudaOp(NkOp::CrbaComputeM, &OpCrbaComputeM);
     SetCudaOp(NkOp::CrbaFactorM, &OpCrbaFactorM);
     SetCudaOp(NkOp::ApplyImplicitDamping, &OpApplyImplicitDamping);
+    SetCudaOp(NkOp::MimicReduce, &OpMimicReduce);
 }
 
 } // namespace nuka::phi
