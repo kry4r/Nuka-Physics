@@ -75,6 +75,42 @@ class AuditMetric(IntEnum):
     GAP_PENETRATION = 6
 
 
+class VbdSolveAuditColumn(IntEnum):
+    FORCE_X = 0
+    FORCE_Y = 1
+    FORCE_Z = 2
+    NEWTON_CORRECTION_X = 3
+    NEWTON_CORRECTION_Y = 4
+    NEWTON_CORRECTION_Z = 5
+    LAST_DIRECTION_X = 6
+    LAST_DIRECTION_Y = 7
+    LAST_DIRECTION_Z = 8
+    LAST_SCALE = 9
+    LAST_ENERGY_CHANGE = 10
+    LAST_HALVINGS = 11
+    ACCEPTED_STEPS = 12
+    REJECTED_STEPS = 13
+    ZERO_SLOPE_STEPS = 14
+    ROUNDED_STEPS = 15
+    TOTAL_STEPS = 16
+    LAST_PRIMAL_FORCE_X = 17
+    LAST_PRIMAL_FORCE_Y = 18
+    LAST_PRIMAL_FORCE_Z = 19
+
+
+def vbd_solve_audit_units(column):
+    c = VbdSolveAuditColumn(column)
+    if c <= VbdSolveAuditColumn.FORCE_Z or c >= VbdSolveAuditColumn.LAST_PRIMAL_FORCE_X:
+        return "N"
+    if c <= VbdSolveAuditColumn.LAST_DIRECTION_Z:
+        return "m/s"
+    if c == VbdSolveAuditColumn.LAST_SCALE:
+        return "dimensionless"
+    if c == VbdSolveAuditColumn.LAST_ENERGY_CHANGE:
+        return "J"
+    return "count"
+
+
 @dataclass(frozen=True)
 class DiagnosticThresholds:
     energy_net_ratio: float = 0.01

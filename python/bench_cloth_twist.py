@@ -53,6 +53,7 @@ def run(args):
         "solver_velocity_tolerance_mps": float(tolerance), "position_iterations": 4,
         "momentum_scope": "vbd_subsystem", "aerodynamic_forces": False,
         "state_system": "dynamic_particles", "gravity": [0, 0, args.gravity_z],
+        "required_physical_systems": ["vbd"], "required_ccd_contact_domains": ["particle_mesh_self"],
         "vbd_particle_begin": 0, "vbd_vertices": args.nx * args.ny,
         "physical_input_sha256": hashlib.sha256(json.dumps(physical, sort_keys=True).encode()).hexdigest(),
         "boundary": "Opposite x edges rotate by +/- pi*turns*t/duration about their initial y/z center",
@@ -92,7 +93,7 @@ def run(args):
         session = DiagnosticSession(world, args.output, metadata, chunk_steps=args.chunk_steps,
                                     state_fields=fields, thresholds=limits)
         faces, edges = topology(args.nx, args.ny)
-        np.savez_compressed(args.output / "initial.npz", rest=rest, velocity=initial_velocity,
+        np.savez_compressed(args.output / "initial.npz", rest=rest, positions=rest, velocity=initial_velocity,
                             vbd_elements=elements, faces=faces, edges=edges,
                             inv_mass=inv_mass, original_inv_mass=original_inv_mass, pinned=pinned)
         session.manifest["initial_geometry_sha256"] = sha256(args.output / "initial.npz")

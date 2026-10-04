@@ -1,6 +1,7 @@
 """Capture, analyze, audit and compare production physics evidence."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,29 +20,64 @@ from nuka.diagnostics.report import make_report
 def capture_scene(args):
     if args.output.exists():
         raise FileExistsError(args.output)
+    if args.steps < 1 or args.env_count < 1 or not np.isfinite(args.dt) or args.dt <= 0:
+        raise ValueError("capture requires positive steps, environment count and finite timestep")
     tolerance = os.environ.get("NUKA_SOLVER_VEL_TOLERANCE")
     if tolerance is None:
         raise ValueError("set the production NUKA_SOLVER_VEL_TOLERANCE explicitly for reproducibility")
+    tolerance = float(tolerance)
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("NUKA_SOLVER_VEL_TOLERANCE must be finite and positive")
+    scene_hash = sha256(args.scene)
+    physical_input = {"scene_sha256": scene_hash, "controls": "Authored scene defaults; no external inputs"}
+    physical_input_hash = hashlib.sha256(json.dumps(physical_input, sort_keys=True).encode()).hexdigest()
     fields = tuple(getattr(nuka.Field, name) for name in args.state_field)
     device = nuka.Device.create(0)
     world = nuka.World.create_from_scene(device, str(args.scene), env_count=args.env_count, dt=args.dt,
                                          solver_vel_iters=args.sweeps, ogc_contact_capacity=args.contact_capacity)
     session = None
     try:
-        metadata = {"scene": str(args.scene), "scene_sha256": sha256(args.scene), "dt": args.dt,
+        execution_info = json.loads(json.dumps(world.execution_info, default=str))
+        integrator = execution_info.get("integrator", execution_info.get("cloth_integrator"))
+        metadata = {"scene": str(args.scene), "scene_sha256": scene_hash, "dt": args.dt,
             "sweeps": args.sweeps, "expected_policy_steps": args.steps,
+            "duration_s": args.steps * args.dt, "physical_input": physical_input,
+            "physical_input_sha256": physical_input_hash,
             "ogc_contact_capacity": args.contact_capacity or None,
             "solver_velocity_tolerance_mps": float(tolerance),
-            "controls": "Authored scene defaults; no external inputs",
+            "controls": physical_input["controls"],
             "owner_names": {"LINK": list(world.dof_names())},
             "kinematic_tree": [{key: link[key] for key in ("parent_index", "articulation_index", "joint_type")}
                                for link in world.kinematic_tree()],
-            "execution_info": json.loads(json.dumps(world.execution_info, default=str)),
+            "execution_info": execution_info, "integrator": integrator,
+            "integrator_source": "world.execution_info" if integrator is not None else "unavailable_in_public_execution_info",
             "build_record": str(args.build_record),
             "binary_hashes": (args.build_record / "binaries.sha256").read_text(),
             "fixture_sha256": sha256(__file__)}
         session = DiagnosticSession(world, args.output, metadata, env_count=args.env_count, state_fields=fields,
                                     thresholds=DiagnosticThresholds(velocity_tolerance_mps=float(tolerance)))
+        positions = np.asarray(world.download_field(nuka.Field.PARTICLE_POSITION)).copy()
+        if positions.size:
+            if positions.size % (args.env_count * 3):
+                raise ValueError("initial particle positions do not match the environment extent")
+            count = positions.size // (args.env_count * 3)
+            positions = positions.reshape(args.env_count, count, 3)
+            velocity = np.asarray(world.download_field(nuka.Field.PARTICLE_VELOCITY)).reshape(positions.shape).copy()
+            inverse_mass = np.asarray(world.download_field(nuka.Field.PARTICLE_INV_MASS)).reshape(args.env_count, count).copy()
+            initial_path = args.output / "initial.npz"
+            with initial_path.open("xb") as target:
+                np.savez_compressed(target, positions=positions, rest=positions, velocity=velocity, inverse_mass=inverse_mass)
+            session.manifest["initial_geometry_sha256"] = sha256(initial_path)
+            metadata["initial_positions_equal_rest"] = True
+            metadata["initial_state_capture"] = {
+                "status": "recorded", "env_count": args.env_count, "particles_per_env": count,
+                "scope": "Particles only; no topology or rigid trajectories; rest aliases initial positions for the host state shape contract",
+                "is_complete_geometry_evidence": False}
+        else:
+            metadata["initial_state_capture"] = {
+                "status": "unmeasured", "reason": "Particle-free world; no initial particle input is fabricated",
+                "is_complete_geometry_evidence": False}
+        write_json(args.output / "manifest.json", session.manifest)
         reason = "completed"
         for _ in range(args.steps):
             if np.any(session.step()["env_status"]):
@@ -108,7 +144,8 @@ def main():
             raise FileExistsError(args.output)
         result = compare_runs(args.sources)
         write_json(args.output, result)
-        print(json.dumps({"output": str(args.output), "comparisons": len(result["comparisons"])}))
+        print(json.dumps({"output": str(args.output), "comparisons": len(result["comparisons"]),
+            "timestep_convergence": result["timestep_convergence"]["status"], "claims_physical_acceptance": False}))
 
 
 if __name__ == "__main__":

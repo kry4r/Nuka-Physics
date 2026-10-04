@@ -170,6 +170,7 @@ def verify_elastic_trace(source, geometry):
             gradient_sum.append(np.linalg.norm(result["elastic_gradient_sum_n"]))
     return {"status": "measured", "source_manifest_sha256": sha256(Path(source) / "manifest.json"),
         "geometry_sha256": sha256(geometry), "intervals_per_environment": manifest["steps"],
+        "environments": manifest["env_count"],
         "max_elastic_energy_difference_j": float(np.abs(energy_error).max()),
         "max_internal_gradient_sum_n": float(np.max(gradient_sum)),
         "scope": "Independent float64 cooked VBD elastic potential at recorded END positions",
