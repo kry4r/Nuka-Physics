@@ -17,6 +17,9 @@
 #include <string>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
+#include <functional>
+#include <limits>
 
 namespace nuka::import {
 
@@ -146,19 +149,7 @@ scene::DecomposeMode DecomposeModeFromToken(const char* token) {
 // Public API
 // ---------------------------------------------------------------------------
 
-scene::SceneIR LoadUrdf(const std::string& path) {
-    tinyxml2::XMLDocument doc;
-    const tinyxml2::XMLError err = doc.LoadFile(path.c_str());
-    if (err != tinyxml2::XML_SUCCESS) {
-        throw std::runtime_error("URDF: failed to load file: " + path +
-                                 " (error " + std::to_string(static_cast<int>(err)) + ")");
-    }
-
-    auto* robot = doc.FirstChildElement("robot");
-    if (!robot) {
-        throw std::runtime_error("URDF: missing <robot> root element in " + path);
-    }
-
+static scene::SceneIR ParseUrdf(tinyxml2::XMLElement* robot, const std::string& path) {
     scene::SceneIR scene;
 
     // Map from link name -> BodyId for joint resolution
@@ -360,6 +351,8 @@ scene::SceneIR LoadUrdf(const std::string& path) {
         scene::JointRecord jrec;
         jrec.name = joint_name;
         jrec.type = UrdfJointType(joint->Attribute("type"));
+        if (jrec.type == scene::JointType::Revolute || jrec.type == scene::JointType::Prismatic)
+            jrec.axis = math::Vec3::UnitX();
 
         // <parent link="..."/>
         if (auto* parent = joint->FirstChildElement("parent")) {
@@ -445,6 +438,251 @@ scene::SceneIR LoadUrdf(const std::string& path) {
     }
 
     return scene;
+}
+
+namespace {
+using Element = tinyxml2::XMLElement;
+
+void Diagnose(UrdfImportResult& r, const Element* e, UrdfDiagnosticKind kind,
+              const std::string& code, const std::string& message) {
+    r.diagnostics.push_back({kind, code, {}, e ? e->GetLineNum() : 0, e ? e->Name() : "", message});
+}
+
+bool Listed(const std::string& value, const std::string& list) {
+    std::istringstream tokens(list);
+    std::string token;
+    while (tokens >> token) if (token == value) return true;
+    return false;
+}
+
+void ValidateUrdf(Element* robot, UrdfImportResult& result) {
+    const std::unordered_map<std::string, std::pair<std::string, std::string>> schema{
+        {"robot", {"name", "link joint"}}, {"link", {"name", "inertial collision visual"}},
+        {"inertial", {"", "origin mass inertia"}}, {"mass", {"value", ""}},
+        {"inertia", {"ixx iyy izz ixy ixz iyz", ""}}, {"origin", {"xyz rpy", ""}},
+        {"collision", {"", "origin geometry"}}, {"visual", {"name", "origin geometry"}},
+        {"geometry", {"", "box sphere mesh"}}, {"box", {"size", ""}},
+        {"sphere", {"radius", ""}}, {"mesh", {"filename scale", ""}},
+        {"joint", {"name type", "parent child origin axis limit"}},
+        {"parent", {"link", ""}}, {"child", {"link", ""}},
+        {"axis", {"xyz", ""}}, {"limit", {"lower upper", ""}}
+    };
+    const std::unordered_map<std::string, std::string> required_attributes{
+        {"robot", "name"}, {"link", "name"}, {"joint", "name type"}, {"mass", "value"},
+        {"inertia", "ixx iyy izz"}, {"box", "size"}, {"sphere", "radius"},
+        {"mesh", "filename"}, {"axis", "xyz"}, {"parent", "link"}, {"child", "link"}
+    };
+    const std::unordered_map<std::string, std::string> required_children{
+        {"link", "inertial"}, {"inertial", "mass inertia"}, {"joint", "parent child"},
+        {"visual", "geometry"}, {"collision", "geometry"}
+    };
+    std::function<void(Element*)> walk = [&](Element* e) {
+        if (std::string(e->Name()) == "inertia") {
+            double x = 0, y = 0, z = 0;
+            if (e->QueryDoubleAttribute("ixx", &x) == tinyxml2::XML_SUCCESS &&
+                e->QueryDoubleAttribute("iyy", &y) == tinyxml2::XML_SUCCESS &&
+                e->QueryDoubleAttribute("izz", &z) == tinyxml2::XML_SUCCESS &&
+                std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+                const double tolerance = 1e-6 * std::max({std::abs(x), std::abs(y), std::abs(z)});
+                if (x > y + z + tolerance || y > x + z + tolerance || z > x + y + tolerance)
+                    Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_INERTIA_INVALID", "Principal inertia violates triangle inequalities");
+            }
+        }
+        const auto found = schema.find(e->Name());
+        if (found == schema.end()) return;
+        for (auto* a = e->FirstAttribute(); a; a = a->Next()) {
+            const std::string key = a->Name();
+            if (key == "xmlns") {
+                if (*a->Value()) Diagnose(result, e, UrdfDiagnosticKind::Unsupported,
+                    "URDF_NAMESPACE_UNSUPPORTED", "Default element namespace is not interpreted by this profile");
+                continue;
+            }
+            if (key.rfind("xmlns:", 0) == 0) continue;
+            if (!Listed(key, found->second.first)) {
+                Diagnose(result, e, UrdfDiagnosticKind::Unsupported, "URDF_ATTRIBUTE_UNSUPPORTED",
+                         "Unrepresented attribute: " + key);
+                continue;
+            }
+            if (Listed(key, "name type link filename")) continue;
+            const size_t count = Listed(key, "xyz rpy size scale") ? 3u : 1u;
+            std::istringstream input(a->Value());
+            std::vector<double> values(count);
+            bool valid = true;
+            for (auto& value : values) {
+                if (!(input >> value) || !std::isfinite(value) ||
+                    std::abs(value) > std::numeric_limits<float>::max()) valid = false;
+            }
+            input >> std::ws;
+            if (!valid || input.peek() != std::char_traits<char>::eof()) {
+                Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_NUMBER_INVALID",
+                         "Expected finite numeric value(s): " + key);
+                continue;
+            }
+            if (Listed(key, "ixy ixz iyz") && values[0] != 0.0)
+                Diagnose(result, e, UrdfDiagnosticKind::Unsupported, "URDF_FULL_INERTIA_UNSUPPORTED",
+                         "Nonzero inertia cross terms are not represented");
+            if (Listed(key, "value ixx iyy izz radius size") &&
+                std::any_of(values.begin(), values.end(), [](double v) { return static_cast<float>(v) <= 0.0f; }))
+                Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_POSITIVE_VALUE_REQUIRED",
+                         "Expected strictly positive value(s): " + key);
+            if (Listed(key, "value ixx iyy izz") &&
+                !std::isfinite(1.0f / static_cast<float>(values[0])))
+                Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_INVERSE_NONFINITE",
+                         "Value has no finite float inverse: " + key);
+            if (key == "size" && std::any_of(values.begin(), values.end(), [](double v) {
+                    return static_cast<float>(v) * 0.5f <= 0.0f;
+                }))
+                Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_DIMENSION_UNDERFLOW", "Half extents must remain positive");
+            if (key == "scale" && std::any_of(values.begin(), values.end(), [](double v) { return static_cast<float>(v) == 0.0f; }))
+                Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_SCALE_INVALID", "Mesh scale cannot be zero");
+            if (std::string(e->Name()) == "axis" && key == "xyz") {
+                const double squared = values[0] * values[0] + values[1] * values[1] + values[2] * values[2];
+                if (std::abs(squared - 1.0) > 1e-5)
+                    Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_AXIS_INVALID", "Strict joint axis must have unit length");
+            }
+        }
+        std::unordered_set<std::string> children;
+        for (auto* c = e->FirstChildElement(); c; c = c->NextSiblingElement()) {
+            const std::string tag = c->Name();
+            if (!Listed(tag, found->second.second)) {
+                Diagnose(result, c, UrdfDiagnosticKind::Unsupported, "URDF_ELEMENT_UNSUPPORTED",
+                         "Unrepresented element under " + std::string(e->Name()) + ": " + tag);
+                continue;
+            }
+            if (!children.insert(tag).second && std::string(e->Name()) != "robot" &&
+                !(std::string(e->Name()) == "link" && Listed(tag, "visual collision")))
+                Diagnose(result, c, UrdfDiagnosticKind::Invalid, "URDF_DUPLICATE_ELEMENT", "Repeated singleton element");
+            walk(c);
+        }
+        auto required = required_attributes.find(e->Name());
+        if (required != required_attributes.end()) {
+            std::istringstream keys(required->second);
+            std::string key;
+            while (keys >> key)
+                if (!e->Attribute(key.c_str()) || !*e->Attribute(key.c_str()))
+                    Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_ATTRIBUTE_REQUIRED", "Missing attribute: " + key);
+        }
+        auto required_child = required_children.find(e->Name());
+        if (required_child != required_children.end()) {
+            std::istringstream tags(required_child->second);
+            std::string tag;
+            while (tags >> tag)
+                if (!e->FirstChildElement(tag.c_str()))
+                    Diagnose(result, e, UrdfDiagnosticKind::Unsupported, "URDF_DEFAULT_UNREPRESENTED",
+                             "Strict profile requires explicit " + tag + " to avoid synthetic defaults");
+        }
+        if (std::string(e->Name()) == "geometry" &&
+            (!e->FirstChildElement() || e->FirstChildElement()->NextSiblingElement()))
+            Diagnose(result, e, UrdfDiagnosticKind::Invalid, "URDF_GEOMETRY_INVALID", "Expected exactly one geometry");
+    };
+    walk(robot);
+    if (robot->NextSiblingElement() || robot->PreviousSiblingElement())
+        Diagnose(result, robot, UrdfDiagnosticKind::Invalid, "URDF_ROOT_INVALID", "Expected a single robot root");
+    std::unordered_set<std::string> links, joints;
+    for (auto* link = robot->FirstChildElement("link"); link; link = link->NextSiblingElement("link")) {
+        const char* name = link->Attribute("name");
+        if (name && !links.insert(name).second)
+            Diagnose(result, link, UrdfDiagnosticKind::Invalid, "URDF_DUPLICATE_NAME", "Duplicate link name");
+    }
+    std::unordered_map<std::string, std::string> parents;
+    for (auto* joint = robot->FirstChildElement("joint"); joint; joint = joint->NextSiblingElement("joint")) {
+        const char* name = joint->Attribute("name");
+        if (name && !joints.insert(name).second)
+            Diagnose(result, joint, UrdfDiagnosticKind::Invalid, "URDF_DUPLICATE_NAME", "Duplicate joint name");
+        const char* type = joint->Attribute("type");
+        if (type && !Listed(type, "fixed revolute continuous prismatic floating"))
+            Diagnose(result, joint, UrdfDiagnosticKind::Unsupported, "URDF_JOINT_UNSUPPORTED", "Joint type is not represented exactly");
+        std::string endpoints[2];
+        for (int i = 0; i < 2; ++i) {
+            auto* endpoint = joint->FirstChildElement(i == 0 ? "parent" : "child");
+            const char* link = endpoint ? endpoint->Attribute("link") : nullptr;
+            if (link) endpoints[i] = link;
+            if (!link || !links.count(link))
+                Diagnose(result, endpoint ? endpoint : joint, UrdfDiagnosticKind::Invalid,
+                         "URDF_LINK_UNRESOLVED", "Joint endpoint does not resolve to a link");
+        }
+        if (endpoints[0] == endpoints[1] || !parents.emplace(endpoints[1], endpoints[0]).second)
+            Diagnose(result, joint, UrdfDiagnosticKind::Invalid, "URDF_TOPOLOGY_INVALID", "Self joint or multiple parents");
+        auto* limit = joint->FirstChildElement("limit");
+        if (type && Listed(type, "revolute prismatic") &&
+            (!limit || !limit->Attribute("lower") || !limit->Attribute("upper")))
+            Diagnose(result, limit ? limit : joint, UrdfDiagnosticKind::Unsupported,
+                     "URDF_LIMIT_DEFAULT_UNREPRESENTED", "Strict scalar joints require explicit lower and upper limits");
+        double lower = 0, upper = 0;
+        if (limit && limit->QueryDoubleAttribute("lower", &lower) == tinyxml2::XML_SUCCESS &&
+            limit->QueryDoubleAttribute("upper", &upper) == tinyxml2::XML_SUCCESS && lower > upper)
+            Diagnose(result, limit, UrdfDiagnosticKind::Invalid, "URDF_LIMIT_INVALID", "Lower limit exceeds upper limit");
+        if (type && std::string(type) == "continuous" && limit &&
+            (limit->Attribute("lower") || limit->Attribute("upper")))
+            Diagnose(result, limit, UrdfDiagnosticKind::Unsupported, "URDF_CONTINUOUS_LIMIT_UNSUPPORTED",
+                     "Continuous joints cannot acquire position limits in a strict projection");
+    }
+    size_t roots = 0;
+    for (const auto& link : links) {
+        if (!parents.count(link)) ++roots;
+        std::unordered_set<std::string> seen;
+        std::string cursor = link;
+        while (parents.count(cursor)) {
+            if (!seen.insert(cursor).second) {
+                Diagnose(result, robot, UrdfDiagnosticKind::Invalid, "URDF_TOPOLOGY_CYCLE", "Link hierarchy contains a cycle");
+                break;
+            }
+            cursor = parents.at(cursor);
+        }
+    }
+    if (!links.empty() && roots != 1u)
+        Diagnose(result, robot, UrdfDiagnosticKind::Invalid, "URDF_ROOT_COUNT_INVALID", "Expected one root link");
+    if (links.empty()) Diagnose(result, robot, UrdfDiagnosticKind::Invalid, "URDF_LINK_REQUIRED", "Robot has no links");
+}
+} // namespace
+
+UrdfImportResult ImportUrdf(const std::string& path, UrdfImportProfile profile) {
+    UrdfImportResult result;
+    result.profile = profile;
+    tinyxml2::XMLDocument doc;
+    const auto error = doc.LoadFile(path.c_str());
+    if (error != tinyxml2::XML_SUCCESS) {
+        const bool io = error == tinyxml2::XML_ERROR_FILE_NOT_FOUND ||
+                        error == tinyxml2::XML_ERROR_FILE_COULD_NOT_BE_OPENED ||
+                        error == tinyxml2::XML_ERROR_FILE_READ_ERROR;
+        result.diagnostics.push_back({io ? UrdfDiagnosticKind::Io : UrdfDiagnosticKind::Syntax,
+            io ? "URDF_IO_ERROR" : "URDF_XML_ERROR", path, doc.ErrorLineNum(), "", doc.ErrorStr()});
+        return result;
+    }
+    auto* robot = doc.FirstChildElement("robot");
+    if (!robot) {
+        result.diagnostics.push_back({UrdfDiagnosticKind::Invalid, "URDF_ROOT_REQUIRED", path, 0, "", "Missing robot root"});
+        return result;
+    }
+    ValidateUrdf(robot, result);
+    for (auto& diagnostic : result.diagnostics) diagnostic.source = path;
+    if (profile == UrdfImportProfile::Strict && !result.diagnostics.empty()) return result;
+    try {
+        result.scene = ParseUrdf(robot, path);
+        bool finite_mesh = true;
+        for (const auto& shape : result.scene->Shapes()) {
+            for (const auto* stream : {&shape.mesh_vertices, &shape.mesh_normals, &shape.mesh_uvs})
+                for (float value : *stream) if (!std::isfinite(value)) finite_mesh = false;
+        }
+        if (!finite_mesh) {
+            result.diagnostics.push_back({UrdfDiagnosticKind::Invalid, "URDF_MESH_NONFINITE", path,
+                robot->GetLineNum(), "robot", "Decoded or scaled mesh contains nonfinite values"});
+            if (profile == UrdfImportProfile::Strict) result.scene.reset();
+        }
+    } catch (const std::exception& failure) {
+        result.diagnostics.push_back({UrdfDiagnosticKind::Invalid, "URDF_PROJECTION_FAILED", path,
+                                      robot->GetLineNum(), "robot", failure.what()});
+    }
+    return result;
+}
+
+scene::SceneIR LoadUrdf(const std::string& path) {
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(path.c_str()) != tinyxml2::XML_SUCCESS)
+        throw std::runtime_error("URDF: failed to load file: " + path);
+    auto* robot = doc.FirstChildElement("robot");
+    if (!robot) throw std::runtime_error("URDF: missing <robot> root element in " + path);
+    return ParseUrdf(robot, path);
 }
 
 } // namespace nuka::import
