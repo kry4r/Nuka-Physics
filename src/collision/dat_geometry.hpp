@@ -34,6 +34,12 @@ NUKA_DAT_HD inline float DatQueryRadius(float radius) {
     return fminf(radius, kDatQueryRadiusMax);
 }
 
+// Uncapped mixed query radius whose relaxed half covers each side's predicted step displacement.
+NUKA_DAT_HD inline float DatMotionRadius(float base, float dt, float speed_a, float speed_b,
+                                         float relaxation) {
+    return base + dt * (speed_a + speed_b) * (2.0f / relaxation);
+}
+
 struct DatPrimitive {
     math::Vec3 vertex[kDatPrimitiveVertices]{};
     uint32_t count = 0u;
@@ -50,10 +56,49 @@ struct DatSweptPrimitive {
     uint32_t count = 0u;
 };
 
+// Float intervals decide the certificate below when they clear its threshold by a slack that
+// bounds every float and double rounding difference; -1 leaves the decision to double precision.
+NUKA_DAT_HD inline int DatSweptAxisFilter(math::Vec3 axis, const DatSweptPrimitive& a,
+                                          const DatSweptPrimitive& b, float minimum_gap) {
+    float minimum[2] = {FLT_MAX, FLT_MAX}, maximum[2] = {-FLT_MAX, -FLT_MAX};
+    float scale = 0.0f;
+    const math::Vec3 origin = b.vertex[0];
+    constexpr float interpolation_roundoff = 3.0f * FLT_EPSILON / (1.0f - 3.0f * FLT_EPSILON);
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        const DatSweptPrimitive& primitive = side == 0u ? a : b;
+        const uint32_t half = primitive.count / 2u;
+        for (uint32_t i = 0u; i < primitive.count; ++i) {
+            const auto point = primitive.vertex[i];
+            const auto start = primitive.vertex[i % half];
+            const auto end = primitive.vertex[i % half + half];
+            const float x = (point.x - origin.x) * axis.x;
+            const float y = (point.y - origin.y) * axis.y;
+            const float z = (point.z - origin.z) * axis.z;
+            const float value = (x + y) + z;
+            const float interpolation = interpolation_roundoff * (
+                fabsf(axis.x) * (fabsf(start.x) + fabsf(end.x)) +
+                fabsf(axis.y) * (fabsf(start.y) + fabsf(end.y)) +
+                fabsf(axis.z) * (fabsf(start.z) + fabsf(end.z)));
+            minimum[side] = fminf(minimum[side], value - interpolation);
+            maximum[side] = fmaxf(maximum[side], value + interpolation);
+            scale = fmaxf(scale, fabsf(x) + fabsf(y) + fabsf(z) + interpolation);
+        }
+    }
+    const float required = minimum_gap * sqrtf(axis.LengthSq());
+    const float slack = 64.0f * (FLT_EPSILON * (scale + required) + FLT_MIN);
+    const float gap0 = minimum[0] - maximum[1], gap1 = minimum[1] - maximum[0];
+    if (!(fabsf(gap0) <= FLT_MAX && fabsf(gap1) <= FLT_MAX && slack <= FLT_MAX)) return -1;
+    if (gap0 - slack > required || gap1 - slack > required) return 1;
+    if (gap0 + slack < required && gap1 + slack < required) return 0;
+    return -1;
+}
+
 // Outward projection intervals certify a fixed plane for every convex combination of the endpoints.
 NUKA_DAT_HD inline bool DatSweptAxisSeparates(math::Vec3 axis, const DatSweptPrimitive& a,
                                               const DatSweptPrimitive& b, float minimum_gap) {
     if (!(axis.LengthSq() > 0.0f && axis.LengthSq() <= FLT_MAX)) return false;
+    const int filtered = DatSweptAxisFilter(axis, a, b, minimum_gap);
+    if (filtered >= 0) return filtered == 1;
     double minimum[2] = {DBL_MAX, DBL_MAX}, maximum[2] = {-DBL_MAX, -DBL_MAX};
     const math::Vec3 origin = b.vertex[0];
     constexpr double roundoff = 8.0 * DBL_EPSILON / (1.0 - 8.0 * DBL_EPSILON);

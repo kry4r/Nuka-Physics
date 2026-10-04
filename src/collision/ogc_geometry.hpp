@@ -77,95 +77,69 @@ NUKA_OGC_HD inline bool OgcWireVertexFeasible(math::Vec3 query,
            offset.Dot(vertex - neighbor1) >= 0.0f;
 }
 
+// Vertex-major incidence indexed by the surface's vertex offset plus its local vertex.
+// Entries hold a global element << 1 | side for edges and << 2 | corner for triangles.
+struct MeshVertexIncidence {
+    const uint32_t* offsets = nullptr;
+    const uint32_t* entries = nullptr;
+};
+
 NUKA_OGC_HD inline bool OgcWireVertexFeasible(
     const MeshSurfaceView& view, const MeshSurfaceInfo& surface,
-    const MeshEdge* edges, const MeshBvhNode* nodes, const MeshEdgeInfo& info,
-    uint32_t vertex, math::Vec3 query, bool weld_by_position,
-    uint32_t* owner_edge = nullptr) {
-    if (!edges || !nodes || vertex >= surface.vertex_count ||
-        info.node_count == 0u) return false;
+    const MeshEdge* edges, MeshVertexIncidence incidence, const MeshEdgeInfo& info,
+    uint32_t vertex, math::Vec3 query, uint32_t* owner_edge = nullptr) {
+    if (!edges || !incidence.offsets || !incidence.entries ||
+        vertex >= surface.vertex_count) return false;
     const math::Vec3 center = MeshSurfaceVertex(view, surface, vertex);
     const math::Vec3 offset = query - center;
+    const uint32_t at = surface.vertex_offset + vertex;
     bool found = false;
-    uint32_t cursor = 0u;
-    while (cursor < info.node_count) {
-        const MeshBvhNode& node = nodes[info.node_offset + cursor];
-        if (node.escape <= cursor || node.escape > info.node_count) return false;
-        if (MeshBoundsDistanceSquared(MeshSurfaceLocalPoint(view, center), node) > 0.0f) {
-            cursor = node.escape;
-            continue;
-        }
-        if (node.triangle != ~0u) {
-            if (node.triangle >= info.edge_count) return false;
-            const MeshEdge& edge = edges[info.edge_offset + node.triangle];
-            const uint32_t ids[2] = {edge.vertex0, edge.vertex1};
-            if (ids[0] >= surface.vertex_count || ids[1] >= surface.vertex_count)
-                return false;
-            for (uint32_t side = 0u; side < 2u; ++side) {
-                const math::Vec3 endpoint = MeshSurfaceVertex(view, surface, ids[side]);
-                const bool same = weld_by_position
-                    ? endpoint.x == center.x && endpoint.y == center.y &&
-                      endpoint.z == center.z : ids[side] == vertex;
-                if (!same) continue;
-                found = true;
-                if (owner_edge && node.triangle < *owner_edge)
-                    *owner_edge = node.triangle;
-                const math::Vec3 neighbor = MeshSurfaceVertex(view, surface, ids[1u - side]);
-                if (offset.Dot(center - neighbor) < 0.0f) return false;
-            }
-        }
-        ++cursor;
+    for (uint32_t i = incidence.offsets[at]; i < incidence.offsets[at + 1u]; ++i) {
+        const uint32_t entry = incidence.entries[i];
+        const uint32_t edge_id = (entry >> 1u) - info.edge_offset;
+        if (edge_id >= info.edge_count) continue;
+        const MeshEdge& edge = edges[info.edge_offset + edge_id];
+        const uint32_t neighbor = (entry & 1u) != 0u ? edge.vertex0 : edge.vertex1;
+        if (neighbor >= surface.vertex_count) return false;
+        found = true;
+        if (owner_edge && edge_id < *owner_edge) *owner_edge = edge_id;
+        if (offset.Dot(center - MeshSurfaceVertex(view, surface, neighbor)) < 0.0f) return false;
     }
     return found;
 }
 
 NUKA_OGC_HD inline bool OgcSurfaceVertexFeasible(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info,
-    uint32_t vertex, math::Vec3 query, bool weld_by_position,
+    MeshVertexIncidence incidence, uint32_t vertex, math::Vec3 query,
     uint32_t* owner_triangle = nullptr) {
-    if (!MeshSurfaceRangeValid(view, info) || vertex >= info.vertex_count) return false;
+    if (!MeshSurfaceRangeValid(view, info) || vertex >= info.vertex_count ||
+        !incidence.offsets || !incidence.entries) return false;
     const math::Vec3 center = MeshSurfaceVertex(view, info, vertex);
     const math::Vec3 offset = query - center;
+    const uint32_t at = info.vertex_offset + vertex;
     bool found = false;
-    uint32_t cursor = 0u;
-    while (cursor < info.node_count) {
-        const MeshBvhNode& node = view.nodes[info.node_offset + cursor];
-        if (node.escape <= cursor || node.escape > info.node_count) return false;
-        if (MeshBoundsDistanceSquared(MeshSurfaceLocalPoint(view, center), node) > 0.0f) {
-            cursor = node.escape;
-            continue;
+    for (uint32_t i = incidence.offsets[at]; i < incidence.offsets[at + 1u]; ++i) {
+        const uint32_t entry = incidence.entries[i];
+        const uint32_t triangle = (entry >> 2u) - info.triangle_offset;
+        if (triangle >= info.triangle_count) continue;
+        const size_t first = (static_cast<size_t>(info.triangle_offset) + triangle) * 3u;
+        found = true;
+        if (owner_triangle && triangle < *owner_triangle) *owner_triangle = triangle;
+        for (uint32_t step = 1u; step < 3u; ++step) {
+            const uint32_t neighbor = view.triangles[first + ((entry & 3u) + step) % 3u];
+            if (neighbor >= info.vertex_count) return false;
+            if (offset.Dot(center - MeshSurfaceVertex(view, info, neighbor)) < 0.0f) return false;
         }
-        if (node.triangle != ~0u) {
-            const size_t first = (static_cast<size_t>(info.triangle_offset) + node.triangle) * 3u;
-            if (node.triangle >= info.triangle_count) return false;
-            const uint32_t ids[3] = {view.triangles[first], view.triangles[first + 1u],
-                                     view.triangles[first + 2u]};
-            for (uint32_t i = 0u; i < 3u; ++i) {
-                if (ids[i] >= info.vertex_count) return false;
-                const math::Vec3 face_vertex = MeshSurfaceVertex(view, info, ids[i]);
-                const bool same = weld_by_position
-                    ? (face_vertex.x == center.x && face_vertex.y == center.y &&
-                       face_vertex.z == center.z) : ids[i] == vertex;
-                if (!same) continue;
-                found = true;
-                if (owner_triangle && node.triangle < *owner_triangle)
-                    *owner_triangle = node.triangle;
-                for (uint32_t step = 1u; step < 3u; ++step) {
-                    const math::Vec3 neighbor = MeshSurfaceVertex(view, info, ids[(i + step) % 3u]);
-                    if (offset.Dot(center - neighbor) < 0.0f) return false;
-                }
-            }
-        }
-        ++cursor;
     }
     return found;
 }
 
+// Points farther than `reach` return infeasible before the feasibility tests.
 NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
     const MeshSurfaceView& view, const MeshSurfaceInfo& info,
     const MeshEdge* edges, const uint32_t* triangle_edges,
-    const MeshEdgeInfo& edge_info,
-    uint32_t triangle, math::Vec3 query, bool weld_by_position) {
+    const MeshEdgeInfo& edge_info, MeshVertexIncidence incidence,
+    uint32_t triangle, math::Vec3 query, float reach = INFINITY) {
     OgcTriangleFeature result;
     if (!MeshSurfaceRangeValid(view, info) || triangle >= info.triangle_count)
         return result;
@@ -186,12 +160,12 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
     result.distance = sqrtf(separation.LengthSq());
     result.normal = result.distance > 0.0f
         ? separation / result.distance : face_normal / sqrtf(face_normal.LengthSq());
+    if (!(result.distance <= reach)) return result;
     if (closest.feature < 3u) {
         result.kind = 0u;
         result.index = ids[closest.feature];
         result.feasible = OgcSurfaceVertexFeasible(
-            view, info, result.index, query, weld_by_position,
-            &result.owner_triangle);
+            view, info, incidence, result.index, query, &result.owner_triangle);
     } else if (closest.feature < 6u) {
         if (!edges || !triangle_edges) return result;
         const uint32_t side = closest.feature - 3u;
@@ -205,17 +179,8 @@ NUKA_OGC_HD inline OgcTriangleFeature OgcFacetFeature(
             (edge.triangle0 != triangle && edge.triangle1 != triangle)) return result;
         const math::Vec3 e0 = MeshSurfaceVertex(view, info, edge.vertex0);
         const math::Vec3 e1 = MeshSurfaceVertex(view, info, edge.vertex1);
-        const bool forward = weld_by_position
-            ? (e0.x == p[side].x && e0.y == p[side].y && e0.z == p[side].z &&
-               e1.x == p[(side + 1u) % 3u].x && e1.y == p[(side + 1u) % 3u].y &&
-               e1.z == p[(side + 1u) % 3u].z)
-            : (edge.vertex0 == a && edge.vertex1 == b);
-        const bool reverse = weld_by_position
-            ? (e1.x == p[side].x && e1.y == p[side].y && e1.z == p[side].z &&
-               e0.x == p[(side + 1u) % 3u].x && e0.y == p[(side + 1u) % 3u].y &&
-               e0.z == p[(side + 1u) % 3u].z)
-            : (edge.vertex1 == a && edge.vertex0 == b);
-        if (!forward && !reverse) return result;
+        if (!(edge.vertex0 == a && edge.vertex1 == b) &&
+            !(edge.vertex1 == a && edge.vertex0 == b)) return result;
         result.kind = 1u;
         result.index = edge_id;
         result.owner_triangle = edge.triangle1 == ~0u
@@ -262,14 +227,14 @@ NUKA_OGC_HD inline OgcSegmentPair OgcClosestSegments(
     return {a0 + u * s, b0 + v * t, s, t};
 }
 
+// Pairs farther apart than `reach` return infeasible before the endpoint feasibility tests.
 NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
     const MeshSurfaceView& surface_a, const MeshSurfaceInfo& info_a,
-    const MeshEdge* edges_a, const MeshBvhNode* nodes_a,
+    const MeshEdge* edges_a, MeshVertexIncidence incidence_a,
     const MeshEdgeInfo& edge_info_a, uint32_t edge_a,
     const MeshSurfaceView& surface_b, const MeshSurfaceInfo& info_b,
-    const MeshEdge* edges_b, const MeshBvhNode* nodes_b,
-    const MeshEdgeInfo& edge_info_b, uint32_t edge_b,
-    bool weld_a, bool weld_b) {
+    const MeshEdge* edges_b, MeshVertexIncidence incidence_b,
+    const MeshEdgeInfo& edge_info_b, uint32_t edge_b, float reach = INFINITY) {
     OgcEdgePair result;
     if (!edges_a || !edges_b || edge_a >= edge_info_a.edge_count ||
         edge_b >= edge_info_b.edge_count) return result;
@@ -296,14 +261,15 @@ NUKA_OGC_HD inline OgcEdgePair OgcEdgeContact(
         : cross_length > 0.0f ? cross / cross_length : math::Vec3{};
     result.owner_edge_a = edge_a;
     result.owner_edge_b = edge_b;
+    if (!(result.distance <= reach)) return result;
     const bool a_feasible = pair.weight_a > 0.0f && pair.weight_a < 1.0f
-        ? true : OgcWireVertexFeasible(surface_a, info_a, edges_a, nodes_a,
+        ? true : OgcWireVertexFeasible(surface_a, info_a, edges_a, incidence_a,
             edge_info_a, pair.weight_a <= 0.0f ? ea.vertex0 : ea.vertex1,
-            pair.b, weld_a, &result.owner_edge_a);
+            pair.b, &result.owner_edge_a);
     const bool b_feasible = pair.weight_b > 0.0f && pair.weight_b < 1.0f
-        ? true : OgcWireVertexFeasible(surface_b, info_b, edges_b, nodes_b,
+        ? true : OgcWireVertexFeasible(surface_b, info_b, edges_b, incidence_b,
             edge_info_b, pair.weight_b <= 0.0f ? eb.vertex0 : eb.vertex1,
-            pair.a, weld_b, &result.owner_edge_b);
+            pair.a, &result.owner_edge_b);
     result.feasible = a_feasible && b_feasible &&
         result.normal.LengthSq() > 0.0f;
     return result;
