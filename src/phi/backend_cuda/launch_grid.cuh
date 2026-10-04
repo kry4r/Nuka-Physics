@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -110,6 +111,28 @@ cudaError_t SpareSharedBytes(Kernel kernel, uint32_t block_size, size_t* shared_
     if (status != cudaSuccess) return status;
     spares.push_back({kernel, device, block_size, bytes});
     *shared_bytes = bytes;
+    return cudaSuccess;
+}
+
+// Threads that give each warp scheduler of the device one warp; every SM since Maxwell has four.
+inline cudaError_t SchedulerThreads(uint32_t* threads) {
+    if (!threads) return cudaErrorInvalidValue;
+    int device = -1;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    static thread_local std::vector<std::pair<int, uint32_t>> devices;
+    for (const auto& known : devices) {
+        if (known.first == device) { *threads = known.second; return cudaSuccess; }
+    }
+    int sm_count = 0, warp_size = 0;
+    status = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) return status;
+    status = cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, device);
+    if (status != cudaSuccess) return status;
+    if (sm_count <= 0 || warp_size <= 0) return cudaErrorInvalidConfiguration;
+    constexpr uint32_t kSchedulersPerSm = 4u;
+    *threads = static_cast<uint32_t>(sm_count) * kSchedulersPerSm * static_cast<uint32_t>(warp_size);
+    devices.emplace_back(device, *threads);
     return cudaSuccess;
 }
 

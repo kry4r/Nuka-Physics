@@ -207,6 +207,8 @@ enum class NkOp : uint16_t {
     DatSnapshot,
     ReadoutEnergyLedger,
     ReadoutContactAudit,
+    MimicReduce,            // Mass and step velocity over the DOFs the mimic couplings leave free.
+    BlockDescentSolve,
 
     Count                    // sentinel: number of ops (NOT an op)
 };
@@ -314,6 +316,8 @@ struct IntegratePositionParams {
     // Pseudo rotation changes geometry while preserving physical world angular momentum.
     uint32_t pos_pass;
     uint32_t env_count = 1u;
+    // Nonzero when coupled joints take their root's coordinate after the advance.
+    uint32_t mimic_couplings = 0u;
 };
 
 struct CrbaComputeMParams {
@@ -342,6 +346,14 @@ struct CrbaFactorMParams {
 struct ApplyImplicitDampingParams {
     float    dt;
     uint32_t max_dof;             // dof_stride == the M tile stride
+    uint32_t articulation_count;
+    uint32_t total_link_count;
+};
+
+// Runs after the step mass is factored: each coupled DOF follows its root, the mass and
+// inverse become Z^T M Z and Z (Z^T M Z)^-1 Z^T, and the step velocity is projected onto Z.
+struct MimicReduceParams {
+    uint32_t max_dof;
     uint32_t articulation_count;
     uint32_t total_link_count;
 };
@@ -455,9 +467,13 @@ struct ParticleSurfacesParams {
     uint32_t position_source = 0u;
 };
 
+// Share of a DAT query radius that two sides of an undetected pair may jointly travel.
+inline constexpr float kDatRelaxation = 0.9f;
+
 struct OgcDetectParams {
     float dt = 0.0f;
     float margin = 0.0f;
+    float relaxation = kDatRelaxation;
     uint32_t env_count = 0u;
     uint32_t particles_per_env = 0u;
     uint32_t surfaces_per_env = 0u;
@@ -467,6 +483,7 @@ struct OgcDetectParams {
     uint32_t edge_nodes_per_env = 0u;
     uint32_t bodies_per_env = 0u;
     uint32_t links_per_env = 0u;
+    uint32_t articulations_per_env = 0u;
     uint32_t mesh_vertex_sources = 0u;
     uint32_t mesh_edge_sources = 0u;
     uint32_t mesh_vertices = 0u;
@@ -484,7 +501,7 @@ struct OgcDetectParams {
 
 struct DatTruncateParams {
     float dt = 0.0f;
-    float relaxation = 0.9f;
+    float relaxation = kDatRelaxation;
     float margin = 0.0f;
     uint32_t env_count = 0u;
     uint32_t particles_per_env = 0u;
@@ -751,6 +768,7 @@ struct VertexBlockLayout {
     uint32_t colors = 0u;
     uint32_t particles_per_env = 0u;
     uint32_t env_count = 0u;
+    uint32_t elements = 0u;
 };
 
 struct AssembleRowsParams {
@@ -769,7 +787,8 @@ struct AssembleRowsParams {
     uint32_t joint_limit_rows_per_env;
     uint32_t joint_friction_rows_per_env;
     uint32_t joint_drive_rows_per_env;
-    uint32_t mimic_rows_per_env;
+    // Nonzero when articulation rows act on the reduced coordinates MimicReduce prepared.
+    uint32_t mimic_couplings_per_env;
     // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
     // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
     // Equal to union_slot_count when the model has no body-particle reserve.
@@ -790,6 +809,8 @@ struct AssembleRowsParams {
     // not in one fling. +inf default == non-binding (byte-identical). Model property.
     float    baumgarte_max_velocity;
     float    contact_margin;
+    // Nonzero when the split-impulse position pass runs; it then removes joint drift and overlap.
+    uint32_t position_pass = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
     // Distance then volume constraints fill env rows from particle_constraint_row_first;
@@ -854,11 +875,49 @@ struct SolveRowsBlockIslandParams {
     uint32_t total_grid_count = 0u;
     uint64_t workspace_bytes = 0u;
     VertexBlockLayout vertex_blocks{};
+    // Nonzero when articulations solve with the reduced mass and coupled inverse.
+    uint32_t mimic_couplings = 0u;
+    // A later pass of this step projects positions; penetrating rows still go live here.
+    uint32_t position_later = 0u;
+    // Rechecks the rows the previous pass left idle and sweeps only if the solved velocity
+    // moves one beyond the tolerance.
+    uint32_t verify_idle = 0u;
+    uint32_t measure_vertex_audit = 0u;
 };
 
 // Word count of the solve_color_scratch field the dynamic island solve colors live rows in.
 // Host-callable (defined in solve_rows.cu) so the World sizes it before allocation.
 uint64_t SolveColorScratchWords(const SolveRowsBlockIslandParams& params);
+
+struct BlockDescentSolveParams {
+    float dt;
+    uint32_t iterations = 10u;
+    uint32_t env_count = 0u;
+    uint32_t rows_per_env = 0u;
+    uint32_t total_particle_count = 0u;
+    uint32_t total_body_count = 0u;
+    uint32_t total_grid_count = 0u;
+    uint32_t articulation_count = 0u;
+    uint32_t max_dof = 0u;
+    uint32_t base_link_count = 0u;
+    uint32_t contact_rows_per_env = 0u;
+    uint32_t joint_limit_rows_per_env = 0u;
+    uint32_t max_point_terms = 1u;
+    uint32_t measure_contact_residual = 0u;
+    float penalty_scale = 100.0f;
+    uint64_t workspace_words = 0u;
+    VertexBlockLayout vertex_blocks{};
+    uint32_t measure_vertex_audit = 0u;
+    float acceleration_spectral_radius = 0.0f;
+    uint32_t mimic_couplings = 0u;
+    uint32_t material_cells_per_env = 0u;
+    uint32_t grid_particles_per_env = 0u;
+    uint32_t grid_dims[3] = {};
+    uint32_t clear_failure_diagnostics = 1u;
+    uint32_t substep_index = 0u;
+};
+
+uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params);
 
 // Particle modes select material constraints and ownership; all row-coupled particles share integration.
 inline constexpr uint32_t kParticleModeNone = 0u;
@@ -1044,7 +1103,7 @@ struct ReadoutEnergyLedgerParams {
     uint32_t limit_rows = 0u;
     uint32_t friction_rows = 0u;
     uint32_t drive_rows = 0u;
-    uint32_t mimic_rows = 0u;
+    uint32_t mimic_couplings = 0u;
     uint32_t has_aero = 0u;
     uint32_t has_dat = 0u;
     uint32_t pos_pass = 0u;
