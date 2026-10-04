@@ -303,6 +303,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             ${CMAKE_SOURCE_DIR}/external/imgui/backends/imgui_impl_glfw.cpp)
     endif()
     add_library(imgui STATIC ${NUKA_IMGUI_SOURCES})
+    target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)
     # SYSTEM include so ImGui's own warnings never reach -Werror and its sources are
     # not lint-scoped. The backend includes "imgui.h" relative to the imgui root and
     # "backends/imgui_impl_vulkan.h", so both external/imgui and external/imgui itself

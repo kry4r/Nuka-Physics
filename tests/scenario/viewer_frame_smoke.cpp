@@ -493,7 +493,7 @@ TEST(ViewerInteraction, TransportTogglesKeepStyleStackBalanced) {
         ImGui::Render();
     };
     for (int i = 0; i < 4; ++i) frame();
-    ImGuiWindow* transport = ImGui::FindWindowByName("##transport");
+    ImGuiWindow* transport = ImGui::FindWindowByName("##NukaTopBar");
     ASSERT_NE(transport, nullptr);
     for (int i = 0; i < 20; ++i) {
         const bool before = state.playing;
@@ -562,6 +562,146 @@ TEST(ViewerInteraction, CameraStopsWhenUiCapturesDrag) {
     event.mouse_x = 160;
     camera.HandleEvent(event, true, true);
     EXPECT_FLOAT_EQ(camera.Yaw(), yaw);
+}
+
+TEST(ViewerCameraFraming, AuthoredCameraFitsViewportAndRejectsUnrepresentableViews) {
+    nuka::runtime::app::viewer::CameraController camera;
+    RenderWorld world;
+    nuka::render::RenderCamera authored;
+    authored.world_xform.position = {0.0f, 0.0f, 4.0f};
+    authored.focus_distance = 4.0f;
+    authored.vertical_fov_degrees = 40.0f;
+    world.cameras.push_back(authored);
+    EXPECT_TRUE(camera.UseSceneCamera(world, 1.0f, 2.0f));
+    EXPECT_FLOAT_EQ(camera.Distance(), 8.0f);
+    EXPECT_FLOAT_EQ(camera.fov_degrees, 40.0f);
+    const auto saved = camera;
+    world.cameras[0].world_xform.position = {1e9f, 0.0f, 0.0f};
+    world.cameras[0].world_xform.rotation = {0.5f, 0.5f, 0.5f, 0.5f};
+    world.cameras[0].focus_distance = 1.0f;
+    EXPECT_FALSE(camera.UseSceneCamera(world));
+    EXPECT_EQ(camera.ResolvedTarget(), saved.ResolvedTarget());
+    EXPECT_EQ(camera.ResolvedEye(), saved.ResolvedEye());
+    world.cameras[0].world_xform.rotation = nuka::math::Quat::FromAxisAngle({0, 1, 0}, 1.57079632679f);
+    EXPECT_FALSE(camera.UseSceneCamera(world));
+    EXPECT_EQ(camera.ResolvedEye(), saved.ResolvedEye());
+    world.cameras[0].vertical_fov_degrees = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(camera.UseSceneCamera(world));
+    EXPECT_EQ(camera.ResolvedEye(), saved.ResolvedEye());
+}
+
+TEST(ViewerViewport, PixelAlignedOffsetAndDpiProduceTheSameCenterRay) {
+    using nuka::runtime::app::viewer::SceneViewportRect;
+    nuka::runtime::app::viewer::CameraController camera;
+    camera.FrameAabb({-1, -1, -1}, {1, 1, 1});
+    const auto forward = (camera.ResolvedTarget() - camera.ResolvedEye()).Normalized();
+    for (float scale : {1.0f, 1.5f, 2.0f}) {
+        const auto rect = SceneViewportRect::FromLogical(120.25f, 60.25f, 400.5f, 300.5f,
+                                                         0.0f, 0.0f, scale, scale, 1920u, 1080u);
+        ASSERT_TRUE(rect.Valid());
+        const float x = rect.x + (static_cast<float>(rect.pixels.width) * 0.5f - 0.5f) / scale;
+        const float y = rect.y + (static_cast<float>(rect.pixels.height) * 0.5f - 0.5f) / scale;
+        const auto ray = camera.ScreenRay(rect.LocalX(x), rect.LocalY(y), rect.pixels.width, rect.pixels.height);
+        EXPECT_GT(ray.dir.Dot(forward), 0.999999f);
+        EXPECT_TRUE(rect.Contains(x, y));
+        EXPECT_FALSE(rect.Contains(rect.x - 1.0f, y));
+        EXPECT_FALSE(rect.Contains(rect.x + rect.width, y));
+        EXPECT_NEAR(rect.LocalX(rect.x + rect.width), static_cast<float>(rect.pixels.width), 1e-3f);
+    }
+    EXPECT_FALSE(SceneViewportRect::FromLogical(0, 0, 20, 20, 0, 0, 1e-39f, 1e-39f, 100, 100).Valid());
+    EXPECT_FALSE(SceneViewportRect::FromLogical(0, 0, 20, 20, 0, 0, 1, 1, 0, 0).Valid());
+    EXPECT_FALSE(SceneViewportRect::FromLogical(0, 0, 0, 20, 0, 0, 1, 1, 100, 100).Valid());
+    const auto clipped = SceneViewportRect::FromLogical(-10, -20, 50, 80, 0, 0, 1, 1, 100, 100);
+    EXPECT_EQ(clipped.pixels.x, 0u); EXPECT_EQ(clipped.pixels.y, 0u);
+    EXPECT_EQ(clipped.pixels.width, 40u); EXPECT_EQ(clipped.pixels.height, 60u);
+    const auto full = nuka::render::ResolveSceneViewport({}, 1280u, 720u);
+    EXPECT_EQ(full.width, 1280u); EXPECT_EQ(full.height, 720u);
+}
+
+TEST(ViewerViewport, GizmoDragUsesTheSceneRegionAndReleasesCleanly) {
+    namespace viewer = nuka::runtime::app::viewer;
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(800.0f, 1100.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    unsigned char* pixels = nullptr; int w = 0, h = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
+    viewer::ImGuiLayer ui; ui.EnableDocking();
+    viewer::CameraController camera;
+    camera.FrameAabb({-1, -1, -1}, {1, 1, 1});
+    RenderWorld world = BuildSyntheticWorld();
+    viewer::ViewerUiState state;
+    state.has_scene = true;
+    state.selected_entity = world.instances[0].entity;
+    state.inspector.valid = true;
+    state.inspector.movable = true;
+    viewer::ViewerStats stats;
+    nuka::math::Transform model;
+    bool changed = false;
+    auto frame = [&]() {
+        ImGui::NewFrame();
+        ui.RecordUi(world, stats, camera, state);
+        ui.DrawGizmo(camera, 800u, 1100u, state, model, changed);
+        ImGui::Render();
+    };
+    for (int i = 0; i < 4; ++i) frame();
+    ASSERT_TRUE(ui.Viewport().Valid());
+    const auto rect = ui.Viewport();
+    const float x = rect.x + rect.width * 0.5f, y = rect.y + rect.height * 0.5f;
+    io.AddMousePosEvent(x, y); frame();
+    EXPECT_TRUE(ui.OwnsScenePointer());
+    EXPECT_TRUE(state.gizmo.active);
+    io.AddMouseButtonEvent(0, true); frame();
+    ASSERT_TRUE(state.gizmo.using_now);
+    io.AddMousePosEvent(x + 35.0f, y + 10.0f); frame();
+    EXPECT_TRUE(changed);
+    EXPECT_GT(model.position.LengthSq(), 0.0f);
+    io.AddMouseButtonEvent(0, false); frame();
+    EXPECT_FALSE(state.gizmo.using_now);
+    state.window_focused = false; frame();
+    EXPECT_FALSE(ui.OwnsScenePointer());
+    EXPECT_FALSE(state.gizmo.active);
+    state.window_focused = true;
+    frame();
+    ImGuiWindow* topbar = ImGui::FindWindowByName("##NukaTopBar");
+    ASSERT_NE(topbar, nullptr);
+    ImGui::ActivateItemByID(topbar->GetID("File")); frame();
+    EXPECT_FALSE(ui.OwnsScenePointer());
+    EXPECT_FALSE(state.gizmo.using_now);
+    io.AddKeyEvent(ImGuiKey_Escape, true); frame();
+    io.AddKeyEvent(ImGuiKey_Escape, false); frame();
+    state.show_file_panel = true; frame();
+    ImGuiWindow* file = ImGui::FindWindowByName("Open / Save");
+    ASSERT_NE(file, nullptr);
+    ImGui::ActivateItemByID(file->GetID("##loadpath")); frame();
+    EXPECT_FALSE(ui.OwnsScenePointer());
+    EXPECT_FALSE(state.gizmo.using_now);
+    io.AddKeyEvent(ImGuiKey_Escape, true); frame();
+    io.AddKeyEvent(ImGuiKey_Escape, false); frame();
+    state.show_file_panel = false;
+    state.can_undo = true;
+    ImGui::ActivateItemByID(topbar->GetID("Edit")); frame();
+    ASSERT_FALSE(GImGui->OpenPopupStack.empty());
+    ImGuiWindow* edit = GImGui->OpenPopupStack.back().Window;
+    ASSERT_NE(edit, nullptr);
+    ImGui::ActivateItemByID(edit->GetID("Undo")); frame();
+    EXPECT_TRUE(state.undo_request);
+    io.DisplayFramebufferScale = ImVec2(1.5f, 1.5f);
+    frame();
+    const auto scaled = ui.Viewport();
+    EXPECT_EQ(scaled.pixels.width, static_cast<uint32_t>(std::lround(scaled.width * 1.5f)));
+    io.AddMousePosEvent(scaled.x + scaled.width * 0.5f, scaled.y + scaled.height * 0.5f);
+    model = nuka::math::Transform::Identity(); frame();
+    EXPECT_TRUE(ui.OwnsScenePointer());
+    EXPECT_TRUE(state.gizmo.active);
+    ImGui::NewFrame();
+    ui.RecordUi(world, stats, camera, state, nullptr, 0u, 0u);
+    ui.DrawGizmo(camera, 0u, 0u, state, model, changed);
+    EXPECT_FALSE(ui.Viewport().Valid());
+    EXPECT_FALSE(ui.OwnsScenePointer());
+    EXPECT_FALSE(state.gizmo.active);
+    ImGui::Render();
+    ImGui::DestroyContext();
 }
 
 TEST(ViewerCameraRay, CenterRayAndKnownPlaneHit) {
@@ -681,6 +821,7 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
         io.DeltaTime = 1.0f / 60.0f;  // fixed (no time-seeded animation)
         imgui.NewFrame();
         ui.RecordUi(world, stats, camera, ui_state);
+        options.scene_viewport = ui.Viewport().pixels;
         ImGui::Render();
         ImDrawData* dd = ImGui::GetDrawData();
         return dd ? dd->CmdListsCount : 0;
@@ -750,13 +891,14 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
     ui_state.inspector.has_material = true;
     ui_state.inspector.pos[0] = world.instances[1].world_xform.position.x;
     ui_state.inspector.pos[2] = world.instances[1].world_xform.position.z;
-    ImGui::SetWindowFocus("Entity");
+    ImGui::SetWindowFocus("Inspector");
     for (int i = 0; i < 4; ++i) build_ui();
     const auto inspector = renderer->Render(world, options, [&imgui](void* cmd) {
         imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
     });
     WritePpm("/tmp/nuka_viewer_inspector.ppm", inspector.pixels, inspector.width, inspector.height);
     options.width = 1280u; options.height = 720u;
+    ui_state.show_camera_panel = true;
     ImGui::SetWindowFocus("Camera");
     for (int i = 0; i < 4; ++i) build_ui();
     ImGuiWindow* camera_panel = ImGui::FindWindowByName("Camera");
@@ -781,6 +923,8 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
     stats.debug_colliders_available = true;
     stats.debug_colliders = 8192u;
     ui_state.show_colliders = ui_state.show_contacts = true;
+    ui_state.show_camera_panel = false;
+    ui_state.show_debug_panel = true;
     ImGui::SetWindowFocus("Physics Debug");
     for (int i = 0; i < 4; ++i) build_ui();
     const auto diagnostics = renderer->Render(world, options, [&imgui](void* cmd) {

@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/app/viewer/scene_viewport.hpp"
 // ---------------------------------------------------------------------------
 // nuka::runtime::app::viewer::ImGuiLayer -- the viewer's UI.
 //
@@ -148,7 +149,15 @@ struct ViewerUiState {
     std::vector<float>       drive_targets;
     std::vector<uint8_t>     drive_dirty;   // per-DOF "changed this frame" latch
     std::vector<std::string> dof_labels;    // optional, size 0 or == drive_targets
-    bool                     show_drive_panel = true;
+    bool                     show_drive_panel = false;
+    bool show_hierarchy = true;
+    bool show_inspector = true;
+    bool show_file_panel = false;
+    bool show_stats_panel = false;
+    bool show_debug_panel = false;
+    bool show_camera_panel = false;
+    bool show_script_panel = false;
+    std::string load_error;
 
     // Interactive keyboard teleop: a THIRD drive producer beside the Drive sliders and
     // the --policy controller, applied in the input loop (never RecordUi) and gated on
@@ -275,6 +284,7 @@ struct ViewerStats {
     bool     debug_colliders_available = false;
     bool     debug_contacts_available = false;
     std::string device_name;
+    std::string session_note;
 };
 
 // ---------------------------------------------------------------------------
@@ -292,13 +302,14 @@ public:
     // ONCE after NukaImGuiContext::Init() and BEFORE the first NewFrame() (ImGui
     // asserts ConfigFlags_DockingEnable is set pre-first-frame so .ini docking
     // settings are not lost). Standalone (no Vulkan); idempotent.
-    void EnableDocking();
+    void EnableDocking(bool persist_layout = false);
 
     // Record all panels into the current ImGui frame. `scene` (nullable: empty
     // editor) drives the scene tree; deterministic given identical inputs.
     void RecordUi(const render::RenderWorld& world, const ViewerStats& stats,
                   CameraController& camera, ViewerUiState& ui_state,
-                  const nuka::scene::SceneIR* scene = nullptr);
+                  const nuka::scene::SceneIR* scene = nullptr,
+                  uint32_t framebuffer_width = ~uint32_t(0), uint32_t framebuffer_height = ~uint32_t(0));
 
     // Draw + run the transform gizmo for the selected entity over the viewport.
     // `world` is the entity's current WORLD pose; on a manipulation it is rewritten
@@ -313,7 +324,16 @@ public:
     void DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h,
                    ViewerUiState& ui_state, math::Transform& world, bool& changed);
 
+    const SceneViewportRect& Viewport() const { return viewport_; }
+    bool OwnsScenePointer() const { return viewport_hovered_; }
+
 private:
+    SceneViewportRect viewport_;
+    std::string layout_path_;
+    char hierarchy_filter_[128] = {};
+    bool narrow_ = false;
+    bool hierarchy_wide_open_ = true;
+    bool reset_layout_ = false;
     // The docking layout is built ONCE (the first frame the dockspace exists). A
     // latch so we do not re-split every frame (which would fight a user re-dock).
     bool dock_built_ = false;

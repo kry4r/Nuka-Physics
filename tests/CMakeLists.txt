@@ -3991,11 +3991,13 @@ if(NK_BUILD_VULKAN_VALIDATION)
     )
     add_dependencies(nuka_viewport_present_smoke_test nuka_render_shaders)
     target_compile_definitions(nuka_viewport_present_smoke_test
-        PRIVATE NK_BUILD_VULKAN_VALIDATION)
+        PRIVATE NK_BUILD_VULKAN_VALIDATION NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_include_directories(nuka_viewport_present_smoke_test
         PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(nuka_viewport_present_smoke_test
         PRIVATE
+            nuka_import
+            nuka_viewer
             nuka_present
             nuka_render
             GTest::gtest_main
@@ -4015,6 +4017,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
         scenario/viewer_frame_smoke.cpp
     )
     add_dependencies(nuka_viewer_frame_smoke_test nuka_render_shaders)
+    nuka_copy_viewer_resources(nuka_viewer_frame_smoke_test)
     target_compile_definitions(nuka_viewer_frame_smoke_test
         PRIVATE NK_BUILD_VULKAN_VALIDATION)
     target_include_directories(nuka_viewer_frame_smoke_test

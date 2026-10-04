@@ -37,6 +37,7 @@
 // few we expose so a caller that already includes <vulkan/vulkan.h> stays ABI
 // compatible (these are the same underlying types), and a caller that does not
 // can still see the struct layout. The .cpp includes the real <vulkan/vulkan.h>.
+struct ImFont;
 struct VkInstance_T;
 struct VkPhysicalDevice_T;
 struct VkDevice_T;
@@ -54,6 +55,12 @@ using NukaVkRenderPass     = VkRenderPass_T*;
 using NukaVkDescriptorPool = VkDescriptorPool_T*;
 
 namespace nuka::render::imgui {
+
+enum class FontRole { Body, Heading, Mono };
+ImFont* GetNukaFont(FontRole role);
+bool DrawNukaLogo(float size = 24.0f);
+bool HasNukaCjkFont();
+
 
 // ---------------------------------------------------------------------------
 // NukaImGuiInitInfo -- the flat handle bundle the caller fills from its Vulkan

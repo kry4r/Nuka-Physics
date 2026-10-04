@@ -55,6 +55,7 @@
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/window_input.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
+#include "render/viewer_resources.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/editor_undo.hpp"     // EditStack + reversible op factories
 #include "runtime/app/viewer/drive_hold.hpp"       // general PD-hold gain enable (teleop)
@@ -289,8 +290,9 @@ uint32_t PickInstance(const viewer::Ray& ray, const render::RenderWorld& w,
 }  // namespace
 
 int main(int argc, char** argv) {
-    // ---- args: scene path (OPTIONAL -> empty editor), frame budget, dt ----------
-    std::string scene_path;          // empty -> open EMPTY; --scene seeds a load.
+    // Scene selection, frame budget and transport options.
+    std::string scene_path;
+    bool empty_requested = false;
     int max_frames = 0;  // 0 -> run until the window closes (interactive).
     float dt = kDefaultDt;           // overridable physics timestep (--dt).
     int capture_frame = -1;          // -1 -> no swapchain readback capture.
@@ -338,6 +340,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene" && i + 1 < argc) scene_path = argv[++i];
+        else if (a == "--empty") empty_requested = true;
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--dt" && i + 1 < argc) { dt = static_cast<float>(std::atof(argv[++i])); dt_set = true; }
         else if (a == "--capture-frame" && i + 1 < argc) capture_frame = std::atoi(argv[++i]);
@@ -407,13 +410,15 @@ int main(int argc, char** argv) {
                         "  [--show-colliders / --show-contacts enable the read-only debug overlays]\n"
                         "  [--teleop-nudge DOF,DELTA PD-holds the robot + nudges one drive target]\n"
                         "  [--teleop-cmd VX,VY,WYAW feeds a command to a command-consuming controller]\n"
-                        "  no --scene -> opens the empty editor; load scenes from the UI\n"
+                        "  default -> Nuka Dynamics Lab; --empty opens a blank workspace\n"
                         "  --policy attaches a trained locomotion controller to each load\n"
                         "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
                         "  --cam overrides the auto-frame (default: fit the moving-instance cluster)\n");
             return 0;
         }
     }
+    if (scene_path.empty() && !empty_requested)
+        scene_path = render::ViewerResource("examples/assets/nuka_lab/gripper.nks", NUKA_VIEWER_DEFAULT_SCENE);
     if (const char* env = std::getenv("NUKA_VIEWER_FRAMES")) max_frames = std::atoi(env);
     // The trained control rate is 0.005s; default to it when a policy is attached and
     // no explicit --dt was given (an explicit --dt always wins).
@@ -541,7 +546,7 @@ int main(int argc, char** argv) {
 
     // ---- 4. UI + camera state (empty editor; nothing cooked yet) --------------
     viewer::ImGuiLayer ui;
-    ui.EnableDocking();  // MUST precede the first NewFrame (ImGui asserts this).
+    ui.EnableDocking(true);  // MUST precede the first NewFrame (ImGui asserts this).
     viewer::CameraController camera;
     viewer::ViewerUiState ui_state;
     // Read-only physics debug overlays: rebuilt from the live world between frames.
@@ -556,14 +561,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[nuka_editor] scripting unavailable (python init failed)\n");
     // Frame the world: honor an explicit --cam, else auto-fit the moving-instance
     // cluster (the robots) so they fill the view rather than the whole terrain.
+    bool frame_pending = false;
+    render::SceneViewport last_framing_rect;
     auto frame_world = [&](const render::RenderWorld& rw) {
         if (cam_on) {
             camera.SetView(cam_target, cam_dist, cam_yaw, cam_pitch);
             return;
         }
+        const auto& report = present->Report();
+        const float reference = report.height ? static_cast<float>(report.width) / static_cast<float>(report.height) : 1.0f;
+        if (camera.UseSceneCamera(rw, ui.Viewport().Aspect(), reference)) return;
         nuka::math::Vec3 lo, hi;
         SceneAabb(rw, /*movable_only=*/true, &lo, &hi);
-        camera.FrameAabb(lo, hi);
+        camera.FrameAabb(lo, hi, ui.Viewport().Aspect());
     };
     {
         // Frame a default box so the empty viewport has a sensible camera.
@@ -619,7 +629,14 @@ int main(int argc, char** argv) {
         present->WaitIdle();
         std::unique_ptr<viewer::EditorScene> next =
             viewer::LoadEditorScene(path, dev, backend, dt);
-        if (!next) return;
+        if (!next) {
+            ui_state.load_error = "Could not load scene: " + path + ". Check the application log for details.";
+            std::snprintf(ui_state.load_path, sizeof(ui_state.load_path), "%s", path.c_str());
+            ui_state.show_file_panel = true;
+            return;
+        }
+        ui_state.load_error.clear();
+        frame_pending = true;
         policy_ctrl.reset();       // drop any controller bound to the old scene
         entity_drag.Cancel();
         loaded = std::move(next);  // old scene (if any) destructed here
@@ -1033,6 +1050,7 @@ int main(int argc, char** argv) {
     constexpr uint32_t kKeyCtrlL = 0xffe3u;  // XKB_KEY_Control_L / XK_Control_L
     constexpr uint32_t kKeyCtrlR = 0xffe4u;  // XKB_KEY_Control_R / XK_Control_R
     bool     ctrl_down = false;
+    bool     surface_suspended = false;
     bool     teleop_hold_prev = false; // PD-hold rising-edge latch (apply gains once)
     bool     teleop_prev_enabled = false;  // teleop-toggle falling edge (send one zero)
     float    last_mouse_x = 0.0f;
@@ -1114,8 +1132,8 @@ int main(int argc, char** argv) {
         ImGuiIO& io = ImGui::GetIO();
         const uint32_t vp_w = present->Report().width;
         const uint32_t vp_h = present->Report().height;
+        const bool ctrl_before_events = ctrl_down;
         for (const window::WindowEvent& ev : events) {
-            entity_drag.Observe(ev);
 #ifndef _WIN32
             window_input.Feed(ev);
             ui_state.layout_modifier_down = window_input.LayoutModifierDown();
@@ -1135,6 +1153,9 @@ int main(int argc, char** argv) {
                 case window::WindowEvent::Type::Key:
                     if (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR) ctrl_down = ev.pressed;
                     break;
+                case window::WindowEvent::Type::Resize:
+                    surface_suspended = ev.width == 0u || ev.height == 0u;
+                    break;
                 case window::WindowEvent::Type::FocusGained:
                     ui_state.window_focused = true;
                     break;
@@ -1149,60 +1170,7 @@ int main(int argc, char** argv) {
                     break;
             }
 
-            // -- Ctrl+LMB pick + drag (only when a scene is loaded, ImGui
-            // isn't capturing the mouse, and Ctrl is held -> never fights orbit). ----
-            const bool over_ui = io.WantCaptureMouse;
-            if (loaded && ctrl_down && !over_ui && !ui_state.gizmo.active) {
-                app::Simulation& sim = *loaded->sim;
-                if (ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
-                    if (ev.pressed) {
-                        const viewer::Ray ray = camera.ScreenRay(
-                            static_cast<float>(ev.mouse_x),
-                            static_cast<float>(ev.mouse_y), vp_w, vp_h);
-                        const uint32_t hit = PickInstance(
-                            ray, sim.GetRenderWorld(),
-                            sim.GetWorld().GetModel().articulation);
-                        entity_drag.instance = hit;
-                        if (hit != ~0u) {
-                            ui_state.selected_entity =
-                                sim.GetRenderWorld().instances[hit].entity;
-                        }
-                    } else {
-                        entity_drag.Cancel();  // release ends the drag
-                    }
-                } else if (ev.type == window::WindowEvent::Type::MouseMove &&
-                           entity_drag.instance != ~0u &&
-                           entity_drag.instance < sim.GetRenderWorld().InstanceCount()) {
-                    // Unproject the cursor onto a view-facing plane through
-                    // the dragged entity's current position, then push a MoveEntity
-                    // (the GENERAL path: command_queue -> ApplyMoveEntity -> Data).
-                    const render::RenderInstance& inst =
-                        sim.GetRenderWorld().instances[entity_drag.instance];
-                    const nuka::math::Vec3 anchor = inst.world_xform.position;
-                    const viewer::Ray ray = camera.ScreenRay(
-                        static_cast<float>(ev.mouse_x),
-                        static_cast<float>(ev.mouse_y), vp_w, vp_h);
-                    const nuka::math::Vec3 fwd =
-                        (camera.ResolvedTarget() - camera.ResolvedEye()).Normalized();
-                    nuka::math::Vec3 hit;
-                    if (camera.RayPlaneHit(ray, anchor, fwd, &hit)) {
-                        nuka::math::Transform xf = inst.world_xform;
-                        xf.position = hit;  // keep rotation; teleport position
-                        sim.Commands().Push(nuka::runtime::app::Command::MakeMoveEntity(
-                            inst.entity, xf));
-                    }
-                }
-            }
-
-            // Camera gets the event only if ImGui is not capturing that input, a
-            // Ctrl-drag is not in progress, and the gizmo is not in use (so neither
-            // picking nor the transform handles ever spin the camera).
-            const bool cam_allow =
-                !io.WantCaptureMouse && !ctrl_down && !ui_state.gizmo.active;
-            camera.HandleEvent(ev, /*allow_drag=*/cam_allow,
-                               /*allow_scroll=*/!io.WantCaptureMouse);
         }
-        (void)last_mouse_x; (void)last_mouse_y;
 
         // -- timing -------------------------------------------------------------
         const auto now = Clock::now();
@@ -1292,6 +1260,7 @@ int main(int argc, char** argv) {
         if (ui_state.camera_reset) {
             frame_world(render_world);
             ui_state.camera_reset = false;
+            frame_pending = true;
         }
 
         // -- stats for the UI (zeroed model facts while empty) ------------------
@@ -1370,7 +1339,19 @@ int main(int argc, char** argv) {
         // Thread the loaded scene's SceneIR (its authoritative Tree + ECS) into the
         // UI for the hierarchical scene tree; null while the editor is empty.
         ui.RecordUi(render_world, stats, camera, ui_state,
-                    loaded ? &loaded->scene : nullptr);
+                    loaded ? &loaded->scene : nullptr,
+                    surface_suspended ? 0u : vp_w, surface_suspended ? 0u : vp_h);
+        if (frame_pending && ui.Viewport().Valid()) {
+            const auto rect = ui.Viewport().pixels;
+            if (rect.x == last_framing_rect.x && rect.y == last_framing_rect.y &&
+                rect.width == last_framing_rect.width && rect.height == last_framing_rect.height) {
+                frame_world(render_world);
+                frame_pending = false;
+            }
+            last_framing_rect = rect;
+        }
+
+        viewer::CameraController render_camera = camera;
 
         // In-viewport transform gizmo over the selected entity's LIVE world pose.
         // A drag rewrites the pose and routes it through the SAME edit seam the
@@ -1383,7 +1364,7 @@ int main(int argc, char** argv) {
                 const nuka::math::Transform pre_drag = gi->world_xform;
                 nuka::math::Transform gworld = pre_drag;
                 bool gizmo_changed = false;
-                ui.DrawGizmo(camera, vp_w, vp_h, ui_state, gworld, gizmo_changed);
+                ui.DrawGizmo(render_camera, vp_w, vp_h, ui_state, gworld, gizmo_changed);
                 const bool using_now = ui_state.gizmo.using_now;
                 // The drag (IsUsing rising->falling) is ONE coalesced op: BEFORE at
                 // the press, AFTER the latest pose, recorded on release.
@@ -1414,6 +1395,69 @@ int main(int argc, char** argv) {
             ui_state.gizmo.active = false;  // nothing to manipulate this frame
             ui_state.gizmo.using_now = false;
             gizmo_using_prev = false;
+        }
+
+        const auto& scene_rect = ui.Viewport();
+        if (!scene_rect.Valid()) { entity_drag.Cancel(); camera.CancelInteraction(); }
+        bool scene_ctrl = ctrl_before_events;
+        for (const window::WindowEvent& ev : events) {
+            entity_drag.Observe(ev);
+            if (ev.type == window::WindowEvent::Type::Key && (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR))
+                scene_ctrl = ev.pressed;
+            if (ev.type == window::WindowEvent::Type::FocusLost) scene_ctrl = false;
+            const float mouse_x = ev.type == window::WindowEvent::Type::Scroll ? last_mouse_x : static_cast<float>(ev.mouse_x);
+            const float mouse_y = ev.type == window::WindowEvent::Type::Scroll ? last_mouse_y : static_cast<float>(ev.mouse_y);
+            const bool over_ui = !ui.OwnsScenePointer() || !scene_rect.Contains(mouse_x, mouse_y) ||
+                                 !ui_state.window_focused || ui_state.layout_modifier_down || frame_pending;
+            if (loaded && scene_ctrl && !over_ui && !ui_state.gizmo.active) {
+                app::Simulation& sim = *loaded->sim;
+                if (ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
+                    if (ev.pressed) {
+                        const viewer::Ray ray = render_camera.ScreenRay(
+                            scene_rect.LocalX(mouse_x), scene_rect.LocalY(mouse_y),
+                            scene_rect.pixels.width, scene_rect.pixels.height);
+                        const uint32_t hit = PickInstance(
+                            ray, sim.GetRenderWorld(),
+                            sim.GetWorld().GetModel().articulation);
+                        entity_drag.instance = hit;
+                        if (hit != ~0u) {
+                            ui_state.selected_entity =
+                                sim.GetRenderWorld().instances[hit].entity;
+                        }
+                    } else {
+                        entity_drag.Cancel();  // release ends the drag
+                    }
+                } else if (ev.type == window::WindowEvent::Type::MouseMove &&
+                           entity_drag.instance != ~0u &&
+                           entity_drag.instance < sim.GetRenderWorld().InstanceCount()) {
+                    // Unproject the cursor onto a view-facing plane through
+                    // the dragged entity's current position, then push a MoveEntity
+                    // (the GENERAL path: command_queue -> ApplyMoveEntity -> Data).
+                    const render::RenderInstance& inst =
+                        sim.GetRenderWorld().instances[entity_drag.instance];
+                    const nuka::math::Vec3 anchor = inst.world_xform.position;
+                    const viewer::Ray ray = render_camera.ScreenRay(
+                        scene_rect.LocalX(mouse_x), scene_rect.LocalY(mouse_y),
+                        scene_rect.pixels.width, scene_rect.pixels.height);
+                    const nuka::math::Vec3 fwd =
+                        (render_camera.ResolvedTarget() - render_camera.ResolvedEye()).Normalized();
+                    nuka::math::Vec3 hit;
+                    if (render_camera.RayPlaneHit(ray, anchor, fwd, &hit)) {
+                        nuka::math::Transform xf = inst.world_xform;
+                        xf.position = hit;  // keep rotation; teleport position
+                        sim.Commands().Push(nuka::runtime::app::Command::MakeMoveEntity(
+                            inst.entity, xf));
+                    }
+                }
+            }
+
+            // Camera gets the event only if ImGui is not capturing that input, a
+            // Ctrl-drag is not in progress, and the gizmo is not in use (so neither
+            // picking nor the transform handles ever spin the camera).
+            const bool cam_allow =
+                !over_ui && !scene_ctrl && !ui_state.gizmo.active;
+            camera.HandleEvent(ev, /*allow_drag=*/cam_allow,
+                               /*allow_scroll=*/!over_ui && !ui_state.gizmo.active);
         }
 
         // Apply the inspector's pending edits (live + commit) through the general
@@ -1513,7 +1557,8 @@ int main(int argc, char** argv) {
             app::SceneController* ctrl = loaded ? loaded->sim->Controller() : nullptr;
             const bool cmd_ctrl = ctrl != nullptr && ctrl->AcceptsCommand();
             const bool active =
-                loaded && ui_state.teleop_enabled && !io.WantCaptureKeyboard;
+                loaded && ui_state.teleop_enabled && !io.WantCaptureKeyboard && !io.WantTextInput &&
+                ui.OwnsScenePointer() && ui_state.window_focused;
             viewer::TeleopKeys tk;
             if (active) {
                 tk.dof_minus = ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false) ||
@@ -1567,7 +1612,8 @@ int main(int argc, char** argv) {
 
             // WASD/QE fly the camera unless teleop owns WASD for the robot.
             float cf = 0.0f, cr = 0.0f, cu = 0.0f;
-            if (!teleop_owns_wasd) {
+            if (!teleop_owns_wasd && ui.OwnsScenePointer() && ui_state.window_focused &&
+                !ui_state.layout_modifier_down) {
                 if (ImGui::IsKeyDown(ImGuiKey_W)) cf += 1.0f;
                 if (ImGui::IsKeyDown(ImGuiKey_S)) cf -= 1.0f;
                 if (ImGui::IsKeyDown(ImGuiKey_D)) cr += 1.0f;
@@ -1608,7 +1654,14 @@ int main(int argc, char** argv) {
         render::RasterOptions opts;
         opts.width  = present->Report().width;
         opts.height = present->Report().height;
-        camera.WriteOptions(opts);
+        render_camera.WriteOptions(opts);
+        opts.scene_viewport = ui.Viewport().pixels;
+        if (loaded && loaded->scene.Environment().sky.enabled) {
+            const auto background = loaded->scene.Environment().sky.background;
+            const auto byte = [](float value) { return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f)); };
+            if (std::isfinite(background.x) && std::isfinite(background.y) && std::isfinite(background.z))
+                opts.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
+        }
 
         // Read-only debug overlays, rebuilt from the live world after this frame's
         // pose publishes + edits and just before the draw. Off by default -> the

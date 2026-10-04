@@ -11,7 +11,7 @@ namespace nuka::runtime::app::viewer {
 class CameraController;
 
 void ApplyCameraShortcuts(const render::RenderWorld& world, CameraController& camera,
-                          scene::EntityId selected, bool viewport_hovered, bool gizmo_active);
+                          scene::EntityId selected, bool viewport_hovered, bool gizmo_active, float aspect = 1.0f);
 
 class WindowInput {
 public:

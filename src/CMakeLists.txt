@@ -319,6 +319,9 @@ add_subdirectory(rhi)
 # TTFs by absolute path at runtime.
 # ---------------------------------------------------------------------------
 if(NK_BUILD_VULKAN_VALIDATION)
+    include("${CMAKE_SOURCE_DIR}/cmake/ViewerFonts.cmake")
+    nuka_resolve_viewer_fonts()
+
     add_library(nuka_imgui STATIC
         render/imgui/nuka_imgui.cpp
     )
@@ -338,10 +341,39 @@ if(NK_BUILD_VULKAN_VALIDATION)
 
     target_compile_definitions(nuka_imgui
         PRIVATE
-            NUKA_IMGUI_FONT_UI_TTF="${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Regular.ttf"
-            NUKA_IMGUI_FONT_HEADING_TTF="${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Bold.ttf"
+            NUKA_IMGUI_FONT_UI_TTF="${NUKA_VIEWER_INTER_REGULAR_FONT}"
+            NUKA_IMGUI_FONT_HEADING_TTF="${NUKA_VIEWER_INTER_SEMIBOLD_FONT}"
+            NUKA_IMGUI_FONT_CJK="${NUKA_VIEWER_CJK_FONT}"
+            NUKA_IMGUI_FONT_MONO="${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Regular.ttf"
+            NUKA_IMGUI_LOGO="${CMAKE_SOURCE_DIR}/docs/media/nuka-logo.png"
     )
 
+    file(READ "${NUKA_VIEWER_INTER_REGULAR_FONT}" NUKA_UI_FONT_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," NUKA_UI_FONT_BYTES "${NUKA_UI_FONT_HEX}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/viewer_ui_font.hpp"
+        "inline constexpr unsigned char kEmbeddedUiFont[] = {${NUKA_UI_FONT_BYTES}};\n")
+    target_include_directories(nuka_imgui PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(nuka_imgui PUBLIC nuka_render)
+    set_property(GLOBAL PROPERTY NUKA_VIEWER_INTER_REGULAR_RESOURCE "${NUKA_VIEWER_INTER_REGULAR_FONT}")
+    set_property(GLOBAL PROPERTY NUKA_VIEWER_INTER_SEMIBOLD_RESOURCE "${NUKA_VIEWER_INTER_SEMIBOLD_FONT}")
+    set_property(GLOBAL PROPERTY NUKA_VIEWER_CJK_RESOURCE "${NUKA_VIEWER_CJK_FONT}")
+    function(nuka_copy_viewer_resources target)
+        get_property(regular GLOBAL PROPERTY NUKA_VIEWER_INTER_REGULAR_RESOURCE)
+        get_property(semibold GLOBAL PROPERTY NUKA_VIEWER_INTER_SEMIBOLD_RESOURCE)
+        get_property(cjk GLOBAL PROPERTY NUKA_VIEWER_CJK_RESOURCE)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/viewer/fonts" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${regular}" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/Inter-Regular.ttf"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${semibold}" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/Inter-SemiBold.ttf"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${cjk}" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/NotoSansCJKsc-Regular.otf"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Regular.ttf" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/JetBrainsMono-Regular.ttf"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-OFL.txt" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/JetBrainsMono-OFL.txt"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/docs/media"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/docs/media/nuka-logo.png" "$<TARGET_FILE_DIR:${target}>/docs/media/nuka-logo.png"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab" "$<TARGET_FILE_DIR:${target}>/examples/assets/nuka_lab"
+            VERBATIM)
+    endfunction()
     nuka_set_warnings(nuka_imgui)
 endif()
 
@@ -952,6 +984,7 @@ if(CMAKE_CUDA_COMPILER)
         )
         add_dependencies(nuka_editor_exe nuka_render_shaders)
         set_target_properties(nuka_editor_exe PROPERTIES OUTPUT_NAME nuka_editor)
+        nuka_copy_viewer_resources(nuka_editor_exe)
         target_include_directories(nuka_editor_exe
             PRIVATE
                 ${CMAKE_SOURCE_DIR}/src
@@ -960,7 +993,8 @@ if(CMAKE_CUDA_COMPILER)
         target_include_directories(nuka_editor_exe SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
         target_compile_definitions(nuka_editor_exe PRIVATE
             NK_BUILD_VULKAN_VALIDATION
-            NUKA_PY_HOME="${NUKA_PY_HOME}")
+            NUKA_PY_HOME="${NUKA_PY_HOME}"
+            NUKA_VIEWER_DEFAULT_SCENE="${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab/gripper.nks")
         target_link_libraries(nuka_editor_exe
             PRIVATE
                 Python3::Python

@@ -1614,7 +1614,8 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     }
 
     // -- 2. Resolve camera + build view-projection --------------------------
-    const float aspect = static_cast<float>(options.width) / static_cast<float>(options.height);
+    const SceneViewport scene_rect = ResolveSceneViewport(options.scene_viewport, options.width, options.height);
+    const float aspect = scene_rect.Aspect();
     // Hero re-framing (beauty/viewer): only when the caller opted in AND there is
     // no explicit/authored camera to honour. The gates leave hero_framing off, so
     // their plain auto-frame (and thus their pixels) is untouched.
@@ -1954,20 +1955,21 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
     VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(options.width);
-    viewport.height = static_cast<float>(options.height);
+    viewport.x = static_cast<float>(scene_rect.x);
+    viewport.y = static_cast<float>(scene_rect.y);
+    viewport.width = static_cast<float>(std::max(scene_rect.width, 1u));
+    viewport.height = static_cast<float>(std::max(scene_rect.height, 1u));
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(cmd, 0u, 1u, &viewport);
-    VkRect2D scissor{{0, 0}, {options.width, options.height}};
+    VkRect2D scissor{{static_cast<int32_t>(scene_rect.x), static_cast<int32_t>(scene_rect.y)},
+                     {scene_rect.width, scene_rect.height}};
     vkCmdSetScissor(cmd, 0u, 1u, &scissor);
 
     // -- 4a. SKY GRADIENT backdrop (opt-in; default OFF -> not recorded, so the
     //        gated smokes' command stream + pixels are byte-identical, G2-safe).
     //        Drawn first (depth off) so the scene overwrites it where geometry is.
-    if (options.sky_gradient) {
+    if (!scene_rect.Empty() && options.sky_gradient) {
         float sky_push[8] = {
             options.sky_top[0], options.sky_top[1], options.sky_top[2], 1.0f,
             options.sky_bottom[0], options.sky_bottom[1], options.sky_bottom[2], 1.0f};
@@ -1981,7 +1983,7 @@ VulkanOffscreenReport VulkanRasterRenderer::Render(const RenderWorld& world,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline_layout,
                             0u, 1u, &scene_set, 0u, nullptr);
 
-    for (const InstanceDraw& draw : draws) {
+    if (!scene_rect.Empty()) for (const InstanceDraw& draw : draws) {
         PushBlock push{};
         std::memcpy(push.model, draw.model.m.data(), sizeof(push.model));
         std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));

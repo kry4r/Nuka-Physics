@@ -18,9 +18,54 @@ be built on a host without CUDA.
   and set the orbit pivot to the bounds center. Debug geometry is excluded
 - `F` / `Home` shortcuts require the pointer over the viewport, window focus,
   no active text/keyboard capture, no gizmo operation, and no modifier keys
-- The transport has its own top strip. Full-height sidebars group Scene, Load,
-  Stats, and Script on the left, and Physics Debug, Camera, Drive, and Entity on
-  the right. Tabs and panels can be rearranged
+- The silver-white workspace defaults to Hierarchy, Scene View and a contextual
+  Inspector. File contains Open, manual-path Open, Save As and Unload; Window
+  opens Camera, Drive/Teleop, Script, Statistics and Physics Debug on demand
+- World/Local changes the transform gizmo coordinate frame. It does not change
+  physics coordinates or data
+- The camera used by picking, gizmos and rendering is one frame-consistent
+  snapshot. Camera input updates become visible on the next rendered frame
+- Window > Reset workspace layout restores the default. The editor stores the
+  versioned layout in `%APPDATA%/nuka/viewer-layout-v2.ini` on Windows or
+  `$XDG_CONFIG_HOME/nuka/viewer-layout-v2.ini` (`~/.config` fallback) on Linux.
+  Tests disable persistence; old layout files are not deleted
+
+## Default Lab and resources
+
+Without `--scene`, the editor loads `examples/assets/nuka_lab/gripper.nks` through
+the ordinary scene loader. An explicit `--scene` takes precedence; `--empty`
+starts a blank workspace. The Lab uses the authored three-quarter camera, with
+framing adjusted to the usable scene viewport, and the authored background color.
+Loading errors keep the previous scene and expose the requested path for retry.
+
+This file is the full-size **Lab environment**, including the equipment cabinet.
+It does not contain the dynamic gripper shown in the [gallery preview](nuka-stage.md),
+which adds a recorded robot pose. The viewer does not inject or fabricate that robot.
+
+Inter 4.1 Regular/SemiBold and the full Noto Sans CJK SC font are fetched once at
+**build time** from official, pinned sources. The archive and individual files
+are SHA256-checked; see [font provenance](../assets/viewer/fonts/README.md).
+Inter Regular is also embedded as a proportional UI fallback, with OFL licenses
+retained in the repository and packaged output.
+For offline font provisioning, set these CMake options to the original files:
+
+- `-DNUKA_VIEWER_INTER_REGULAR_FONT=/absolute/path/to/Inter-Regular.ttf`
+- `-DNUKA_VIEWER_INTER_SEMIBOLD_FONT=/absolute/path/to/Inter-SemiBold.ttf`
+- `-DNUKA_VIEWER_CJK_FONT=/absolute/path/to/NotoSansCJKsc-Regular.otf`
+
+Other build dependencies must already be available. A missing file, failed
+download, or checksum mismatch stops configuration. No reduced-character subset
+is silently substituted. Default downloads are cached in `<build>/_deps/nuka-fonts`.
+
+Post-build packaging copies the fonts and licenses, original logo and complete
+Lab assets alongside the editor. Resource lookup first checks the executable
+folder, then `../share/nuka`, then the development-build path; it does not depend
+on the process working directory or download anything at runtime. Keep these
+resource directories with a relocated executable. Missing CJK resources produce
+a readable warning, not a claim of complete Chinese support. Glyphs are rasterized
+on demand, the CJK source bytes are shared between font roles, and ImGui uses
+32-bit Unicode; actual coverage is the source font's coverage. This does not add
+Linux IME composition support.
 
 ## Physics Debug
 
@@ -100,7 +145,11 @@ its existing GLFW ImGui backend and does not duplicate Linux event forwarding.
 
 Frame Selected does not infer descendants of a hierarchy-only node without
 render geometry. Invalid/non-finite or unrepresentable bounds leave the camera
-unchanged; the renderer still uses its existing full-frame projection.
+unchanged. The editor's scene viewport supplies the projection aspect, Vulkan
+viewport/scissor, local picking coordinates and clipped gizmo rectangle. Logical
+UI coordinates are converted to aligned framebuffer pixels. A hidden/zero-size
+viewport starts no new gestures. Renderer callers that do not request a scene
+subrectangle retain the full-frame default.
 
 The host-only tests do not validate CUDA physics, CUDA/Vulkan interop, or hardware
 GPU performance; use the production regression pipeline for those guarantees.
