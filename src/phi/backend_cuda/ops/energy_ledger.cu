@@ -54,8 +54,8 @@ __device__ Vec3 ParticleVelocity(const DataView& d, const ReadoutEnergyLedgerPar
         return d.particle_vel[particle];
     const uint32_t slot = (particle / p.particles_per_env) * p.vbd_vertices +
         particle % p.particles_per_env - p.vbd_begin;
-    return nk::vbd::PhysicalVelocity(d.particle_vel[particle], d.vbd_offset[slot],
-                                    p.dt, d.vbd_step[slot]);
+    return nk::vbd::PhysicalVelocity(d.particle_vel[particle], d.vbd_free_rate[slot],
+                                    d.vbd_free_velocity[slot], p.dt, d.vbd_step[slot]);
 }
 
 // Read-only FK uses private poses and world velocities; dynamics scratch stays untouched.
@@ -199,7 +199,20 @@ __device__ KinematicElasticResponse KinematicElasticReaction(const ModelView& m,
         }
         Vec3 gradient;
         math::SymmetricMat3 hessian;
-        nk::vbd::ElementBlock(element, nk::VbdIncidenceLocal(incidence), geometry, &gradient, &hessian);
+        const uint32_t local = nk::VbdIncidenceLocal(incidence);
+        nk::vbd::ElementBlock(element, local, geometry, &gradient, &hessian);
+        if (element.damping > 0.0f) {
+            nk::vbd::ElementGeometry frozen;
+            Vec3 rates[4];
+            for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
+                const uint32_t point = base + element.vertex[j];
+                frozen.start[j] = d.particle_prev_pos[point];
+                rates[j] = d.particle_vel[point];
+            }
+            Vec3 applied;
+            nk::vbd::ElementRayleighBlock(element, local, frozen, rates, &applied, &hessian);
+            gradient += applied * element.damping;
+        }
         total.gradient += gradient;
         total.work += Dot(gradient, d.particle_kinematic_target[particle] - d.energy_particle_start[particle]);
     }
@@ -268,11 +281,13 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             const uint32_t slot = env * p.vbd_vertices + vertex;
             VertexBlockView block;
             block.elements = m.vbd_elements;
+            block.membrane_start = d.vbd_membrane_start;
             block.offsets = m.vbd_incidence_offsets;
             block.incidence = m.vbd_incidence;
             block.start = d.particle_prev_pos;
             block.layout.begin = p.vbd_begin;
             block.layout.vertices = p.vbd_vertices;
+            block.layout.elements = p.vbd_elements;
             block.layout.particles_per_env = p.particles_per_env;
             block.layout.env_count = p.env_count;
             block.dt = p.dt;
@@ -280,7 +295,8 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             math::SymmetricMat3 hessian;
             GatherVertexBlock(block, d.particle_vel, env, vertex, 0u, 1u, gradient, hessian);
             const Vec3 displacement = d.particle_vel[particle] * p.dt;
-            const Vec3 force = (displacement - d.vbd_target[slot]) * -d.vbd_inertia[slot] -
+            const Vec3 force = -nk::vbd::InertialGradient(d.particle_vel[particle],
+                d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt) -
                 gradient + d.particle_row_impulse[particle] / p.dt;
             values[kForceWorkColumn] -= Dot(force, displacement);
         }
@@ -363,13 +379,16 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     for (uint32_t i = threadIdx.x; i < p.vbd_elements; i += blockDim.x) {
         const auto element = m.vbd_elements[i];
         const uint32_t count = nk::VbdElementVertexCount(element.kind);
-        nk::vbd::ElementGeometry x, unprojected;
+        nk::vbd::ElementGeometry x, unprojected, frozen;
+        Vec3 rates[4];
         const uint32_t anchor = env * p.particles_per_env + p.vbd_begin + element.vertex[0];
         for (uint32_t j = 0u; j < count; ++j) {
             const uint32_t particle = env * p.particles_per_env + p.vbd_begin + element.vertex[j];
             if (p.stage == EnergyStage::Solved) {
                 x.start[j] = d.particle_prev_pos[particle];
                 x.delta[j] = (d.particle_vel[particle] - d.particle_vel[anchor]) * p.dt;
+                frozen.start[j] = d.particle_prev_pos[particle];
+                rates[j] = d.particle_vel[particle];
             } else {
                 x.start[j] = d.particle_pos[particle];
             }
@@ -382,19 +401,18 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (p.stage != EnergyStage::Solved) continue;
         for (uint32_t j = 0u; j < count; ++j) {
             const uint32_t particle = env * p.particles_per_env + p.vbd_begin + element.vertex[j];
-            if (!(d.particle_inv_mass[particle] > 0.0f) || !(element.damping > 0.0f)) continue;
-            Vec3 gradient;
+            if (!(element.damping > 0.0f)) continue;
+            Vec3 applied;
             math::SymmetricMat3 hessian;
-            nk::vbd::ElementBlock(element, j, x, &gradient, &hessian);
+            nk::vbd::ElementRayleighBlock(element, j, frozen, rates, &applied, &hessian);
             const Vec3 average = (d.energy_particle_free[particle] + ParticleVelocity(d, p, particle)) * 0.5f;
             add(EnergyColumn::RayleighLoss, double(element.damping) * ParticleStep(d, p, particle) *
-                Dot(hessian.Multiply(d.particle_vel[particle]), average));
+                Dot(applied, average));
         }
     }
     if (p.stage == EnergyStage::Solved) {
         const uint32_t first_friction = p.contact_rows + p.limit_rows;
         const uint32_t first_drive = first_friction + p.friction_rows;
-        const uint32_t first_mimic = first_drive + p.drive_rows;
         const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
         for (uint32_t local = threadIdx.x; local < p.rows_per_env; local += blockDim.x) {
             const uint32_t row = env * p.rows_per_env + local;
@@ -407,19 +425,21 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             const double work = impulse * (a.physical + b.physical);
             add(EnergyColumn::RowRateWork, impulse * (a.rate + b.rate));
             add(EnergyColumn::RowPhysicalImpulseWork, impulse * (a.applied + b.applied));
-            if (local >= first_drive && local < first_mimic) continue;
+            if (local >= first_drive && local < first_drive + p.drive_rows) continue;
             if ((r.flags & nk::nk_row_flags::kBlockTangent) ||
                 (local >= first_friction && local < first_drive)) add(EnergyColumn::FrictionLoss, -work);
             else if (r.flags & (nk::nk_row_flags::kContactNormal | nk::nk_row_flags::kBlockNormal))
                 add(EnergyColumn::NormalLoss, -work);
             else if (r.flags & nk::nk_row_flags::kJointLimit) add(EnergyColumn::LimitLoss, -work);
-            else if (local >= first_mimic && local < first_mimic + p.mimic_rows)
-                add(EnergyColumn::MimicLoss, -work);
             else {
                 add(EnergyColumn::UnclassifiedRowWork, work);
                 atomicOr(coverage, nk::energy_status::kUnclassifiedRows);
             }
         }
+        // The coupling impulse that projected each articulation's step velocity.
+        if (p.mimic_couplings != 0u)
+            for (uint32_t a = threadIdx.x; a < p.artics_per_env; a += blockDim.x)
+                add(EnergyColumn::MimicLoss, d.mimic_projection_loss[env * p.artics_per_env + a]);
         add(EnergyColumn::SolvedKinetic, kinetic);
     } else if (p.stage == EnergyStage::Begin) {
         add(EnergyColumn::BeginKinetic, kinetic);
@@ -543,11 +563,13 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         if (p.stage != EnergyStage::Solved) continue;
         VertexBlockView block;
         block.elements = m.vbd_elements;
+        block.membrane_start = d.vbd_membrane_start;
         block.offsets = m.vbd_incidence_offsets;
         block.incidence = m.vbd_incidence;
         block.start = d.particle_prev_pos;
         block.layout.begin = p.vbd_begin;
         block.layout.vertices = p.vbd_vertices;
+        block.layout.elements = p.vbd_elements;
         block.layout.particles_per_env = p.particles_per_env;
         block.layout.env_count = p.env_count;
         block.dt = p.dt;
@@ -555,7 +577,8 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         math::SymmetricMat3 hessian;
         GatherVertexBlock(block, d.particle_vel, env, vertex, 0u, 1u, gradient, hessian);
         const Vec3 displacement = d.particle_vel[particle] * p.dt;
-        const Vec3 force = (displacement - d.vbd_target[slot]) * -d.vbd_inertia[slot] -
+        const Vec3 force = -nk::vbd::InertialGradient(d.particle_vel[particle],
+            d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt) -
             gradient + d.particle_row_impulse[particle] / p.dt;
         const Vec3 defect = force * p.dt;
         vector(C::VbdMomentumDefectX, defect);

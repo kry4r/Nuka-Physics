@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include "math/quotient.hpp"
 #include "math/symmetric_mat3.hpp"
 #include "math/vec3.hpp"
 
@@ -47,10 +48,42 @@ NUKA_VBD_HD constexpr uint32_t VbdIncidenceLocal(uint32_t packed) { return packe
 
 namespace vbd {
 
-// A displacement rate includes the integration offset; physical velocity removes it.
-NUKA_VBD_HD inline math::Vec3 PhysicalVelocity(math::Vec3 rate, math::Vec3 offset,
+// Line searches evaluate the same rounded candidate that the block commits.
+NUKA_VBD_HD inline float TrialValue(float base, float direction, float scale) {
+    return float(double(base) + double(scale) * direction);
+}
+
+// A displacement rate includes the integration offset and the effective physical step.
+NUKA_VBD_HD inline math::Vec3 DisplacementRate(math::Vec3 physical_velocity, math::Vec3 offset,
+                                              float dt, float effective_step) {
+    return {float((double(offset.x) + double(physical_velocity.x) * effective_step) / dt),
+            float((double(offset.y) + double(physical_velocity.y) * effective_step) / dt),
+            float((double(offset.z) + double(physical_velocity.z) * effective_step) / dt)};
+}
+
+// Physical velocity is the free velocity plus the change from the free displacement rate.
+NUKA_VBD_HD inline math::Vec3 PhysicalVelocity(math::Vec3 rate, math::Vec3 free_rate,
+                                               math::Vec3 free_velocity,
                                                float dt, float effective_step) {
-    return (rate * dt - offset) / effective_step;
+    return {float(double(free_velocity.x) + (double(rate.x) - free_rate.x) * dt / effective_step),
+            float(double(free_velocity.y) + (double(rate.y) - free_rate.y) * dt / effective_step),
+            float(double(free_velocity.z) + (double(rate.z) - free_rate.z) * dt / effective_step)};
+}
+
+NUKA_VBD_HD inline math::Vec3 InertialGradient(math::Vec3 rate, math::Vec3 free_rate,
+                                               float inertia, float dt) {
+    const double scale = double(inertia) * dt;
+    return {float(scale * (double(rate.x) - free_rate.x)),
+            float(scale * (double(rate.y) - free_rate.y)),
+            float(scale * (double(rate.z) - free_rate.z))};
+}
+
+NUKA_VBD_HD inline double InertialEnergyChange(math::Vec3 rate, math::Vec3 free_rate,
+                                               math::Vec3 move, float inertia, float dt) {
+    const double change = double(move.x) * (2.0 * (double(rate.x) - free_rate.x) + move.x) +
+                          double(move.y) * (2.0 * (double(rate.y) - free_rate.y) + move.y) +
+                          double(move.z) * (2.0 * (double(rate.z) - free_rate.z) + move.z);
+    return 0.5 * double(inertia) * dt * dt * change;
 }
 
 // The force equation's momentum defect expressed as a physical velocity error.
@@ -163,9 +196,15 @@ struct TriangleStrain {
     float area_change;
 };
 
-// The interval-start strain is formed in double from exact start edges; the in-step part
-// F_s^T F_d + F_d^T F_s + F_d^T F_d involves only the displacements.
-NUKA_VBD_HD inline TriangleStrain MembraneStrain(const VbdElement& e, const ElementGeometry& g) {
+struct MembraneStartState {
+    Vec3 f0, f1;
+    float g00, g11, g01;
+};
+
+static_assert(sizeof(MembraneStartState) == 36u);
+
+// The interval-start strain is formed in double from exact start edges.
+NUKA_VBD_HD inline MembraneStartState MembraneStart(const VbdElement& e, const ElementGeometry& g) {
     const double a = e.rest[0], b = e.rest[1], c = e.rest[2], d = e.rest[3];
     const double e1[3] = {double(g.start[1].x) - g.start[0].x, double(g.start[1].y) - g.start[0].y,
                           double(g.start[1].z) - g.start[0].z};
@@ -181,18 +220,29 @@ NUKA_VBD_HD inline TriangleStrain MembraneStrain(const VbdElement& e, const Elem
     const double s01 = 0.5 * (p0[0] * p1[0] + p0[1] * p1[1] + p0[2] * p1[2]);
     const Vec3 fs0{float(p0[0]), float(p0[1]), float(p0[2])};
     const Vec3 fs1{float(p1[0]), float(p1[1]), float(p1[2])};
+    return {fs0, fs1, float(s00), float(s11), float(s01)};
+}
+
+// F_s^T F_d + F_d^T F_s + F_d^T F_d involves only the displacements.
+NUKA_VBD_HD inline TriangleStrain MembraneStrain(
+    const VbdElement& e, const ElementGeometry& g, const MembraneStartState& start) {
+    const Vec3 fs0 = start.f0, fs1 = start.f1;
     const Vec3 m1 = g.delta[1] - g.delta[0], m2 = g.delta[2] - g.delta[0];
     const Vec3 fd0 = m1 * e.rest[0] + m2 * e.rest[2], fd1 = m1 * e.rest[1] + m2 * e.rest[3];
     TriangleStrain t;
     t.f0 = fs0 + fd0;
     t.f1 = fs1 + fd1;
-    t.g00 = float(s00) + (fs0.Dot(fd0) + 0.5f * fd0.Dot(fd0));
-    t.g11 = float(s11) + (fs1.Dot(fd1) + 0.5f * fd1.Dot(fd1));
-    t.g01 = float(s01) + 0.5f * (fs0.Dot(fd1) + fd0.Dot(fs1) + fd0.Dot(fd1));
+    t.g00 = start.g00 + (fs0.Dot(fd0) + 0.5f * fd0.Dot(fd0));
+    t.g11 = start.g11 + (fs1.Dot(fd1) + 0.5f * fd1.Dot(fd1));
+    t.g01 = start.g01 + 0.5f * (fs0.Dot(fd1) + fd0.Dot(fs1) + fd0.Dot(fd1));
     // J^2 = det(I + 2G) = 1 + s, so J - 1 = s / (J + 1) keeps its small value.
     const float s = 2.0f * (t.g00 + t.g11) + 4.0f * (t.g00 * t.g11 - t.g01 * t.g01);
     t.area_change = s > -1.0f ? s / (sqrtf(1.0f + s) + 1.0f) : -1.0f;
     return t;
+}
+
+NUKA_VBD_HD inline TriangleStrain MembraneStrain(const VbdElement& e, const ElementGeometry& g) {
+    return MembraneStrain(e, g, MembraneStart(e, g));
 }
 
 // Weights of vertex `local` in the two columns of F.
@@ -264,33 +314,102 @@ NUKA_VBD_HD inline bool HingeAngle(const Vec3* x, float* theta) {
 }
 
 // The same angle from double coordinates; both atan2 arguments carry the factor |m1| |m2|.
+// A flat hinge takes atan2(+-0, x > 0) = +-0 directly.
 NUKA_VBD_HD inline bool HingeAngle(const Point* x, double* theta) {
     const Point edge = x[1] - x[0];
     const Point m1 = edge.Cross(x[2] - x[0]), m2 = (x[3] - x[0]).Cross(edge);
     const double edge_sq = edge.Dot(edge);
     if (!(edge_sq > 0.0) || !(m1.Dot(m1) > 0.0) || !(m2.Dot(m2) > 0.0)) return false;
-    *theta = atan2(m1.Cross(m2).Dot(edge) / sqrt(edge_sq), m1.Dot(m2));
+    const double sine = math::Quotient(m1.Cross(m2).Dot(edge), sqrt(edge_sq)), cosine = m1.Dot(m2);
+    const bool flat = sine == 0.0 && cosine > 0.0;
+    const double angle = atan2(flat ? 1.0 : sine, cosine);
+    *theta = flat ? sine : angle;
     return true;
 }
 
+// Hinge angle and its change as vertex `local` moves by `move`. The change is one atan2 of the
+// relative rotation whose terms are products of the move, so a small turn is not lost to rounding.
+NUKA_VBD_HD inline void HingeAngleChange(const Vec3* x, uint32_t local, Vec3 move, bool* had,
+                                         bool* has, float* before, float* after, float* turn) {
+    const Vec3 edge = x[1] - x[0];
+    const float edge_sq = edge.LengthSq();
+    *had = *has = false;
+    if (!(edge_sq > 0.0f) || !(edge_sq <= FLT_MAX)) return;
+    // A power-of-two scale keeps the products of small edges clear of underflow.
+    int exponent = 0;
+    frexpf(sqrtf(edge_sq), &exponent);
+    const float scale = ldexpf(1.0f, -exponent);
+    const Vec3 e = edge * scale, a = (x[2] - x[0]) * scale, b = (x[3] - x[0]) * scale;
+    const Vec3 d = move * scale;
+    Vec3 de{}, dm1{}, dm2{};
+    if (local == 0u) {
+        de = -d;
+        dm1 = d.Cross(e - a);
+        dm2 = d.Cross(b - e);
+    } else if (local == 1u) {
+        de = d;
+        dm1 = d.Cross(a);
+        dm2 = b.Cross(d);
+    } else if (local == 2u) {
+        dm1 = e.Cross(d);
+    } else {
+        dm2 = d.Cross(e);
+    }
+    const Vec3 m1 = e.Cross(a), m2 = b.Cross(e), p = m1.Cross(m2);
+    const float length = sqrtf(e.LengthSq());
+    const float t = p.Dot(e), c = m1.Dot(m2);
+    *had = m1.LengthSq() > 0.0f && m2.LengthSq() > 0.0f;
+    if (*had) *before = atan2f(t, c * length);
+    const Vec3 n1 = m1 + dm1, n2 = m2 + dm2, moved = e + de;
+    const float moved_sq = moved.LengthSq();
+    *has = moved_sq > 0.0f && n1.LengthSq() > 0.0f && n2.LengthSq() > 0.0f;
+    if (!*has) return;
+    const Vec3 dp = dm1.Cross(m2) + m1.Cross(dm2) + dm1.Cross(dm2);
+    const float dt = dp.Dot(e) + p.Dot(de) + dp.Dot(de);
+    const float dc = dm1.Dot(m2) + m1.Dot(dm2) + dm1.Dot(dm2);
+    const float moved_length = sqrtf(moved_sq);
+    if (!*had) {
+        *after = atan2f(t + dt, (c + dc) * moved_length);
+        return;
+    }
+    const float dl = (2.0f * e.Dot(de) + de.Dot(de)) / (moved_length + length);
+    *turn = atan2f(dt * (c * length) - t * (dc * length + c * dl + dc * dl),
+                   (c + dc) * moved_length * (c * length) + (t + dt) * t);
+    // Past +-pi the moved angle wraps, as one atan2 of the moved hinge would.
+    const float pi = 3.14159265358979323846f, sum = *before + *turn;
+    *after = sum > pi ? sum - 2.0f * pi : sum <= -pi ? sum + 2.0f * pi : sum;
+}
+
 // The angle gradient uses the opposite-vertex heights and edge projections.
+NUKA_VBD_HD inline bool HingeAngleGradient(const Vec3* x, Vec3* q, float* theta = nullptr) {
+    const Vec3 edge = x[1] - x[0];
+    const float edge_sq = edge.LengthSq();
+    const Vec3 m1 = edge.Cross(x[2] - x[0]), m2 = (x[3] - x[0]).Cross(edge);
+    const float m1_sq = m1.LengthSq(), m2_sq = m2.LengthSq();
+    if (!(edge_sq > 0.0f) || !(m1_sq > 0.0f) || !(m2_sq > 0.0f)) return false;
+    if (theta != nullptr) {
+        const Vec3 n1 = m1 / sqrtf(m1_sq), n2 = m2 / sqrtf(m2_sq);
+        *theta = atan2f(n1.Cross(n2).Dot(edge) / sqrtf(edge_sq), n1.Dot(n2));
+    }
+    const float edge_len = sqrtf(edge_sq);
+    // d(theta)/dx2 = -n1/h1 with h1 = |m1|/|e|, likewise for x3.
+    const Vec3 g2 = m1 * (-edge_len / m1_sq), g3 = m2 * (-edge_len / m2_sq);
+    const float s1 = (x[2] - x[0]).Dot(edge) / edge_sq, s2 = (x[3] - x[0]).Dot(edge) / edge_sq;
+    q[0] = g2 * -(1.0f - s1) - g3 * (1.0f - s2);
+    q[1] = g2 * -s1 - g3 * s2;
+    q[2] = g2;
+    q[3] = g3;
+    return true;
+}
+
 NUKA_VBD_HD inline void HingeBlock(const VbdElement& e, uint32_t local, const Vec3* x,
                                    Vec3* gradient, SymmetricMat3* hessian) {
     *gradient = {};
     *hessian = {};
     float theta = 0.0f;
-    if (!HingeAngle(x, &theta)) return;
-    const Vec3 edge = x[1] - x[0];
-    const float edge_sq = edge.LengthSq();
-    const Vec3 m1 = edge.Cross(x[2] - x[0]), m2 = (x[3] - x[0]).Cross(edge);
-    const float m1_sq = m1.LengthSq(), m2_sq = m2.LengthSq();
-    const float edge_len = sqrtf(edge_sq);
-    // d(theta)/dx2 = -n1/h1 with h1 = |m1|/|e|, likewise for x3.
-    const Vec3 g2 = m1 * (-edge_len / m1_sq), g3 = m2 * (-edge_len / m2_sq);
-    const float s1 = (x[2] - x[0]).Dot(edge) / edge_sq, s2 = (x[3] - x[0]).Dot(edge) / edge_sq;
-    const Vec3 g = local == 0u ? g2 * -(1.0f - s1) - g3 * (1.0f - s2)
-                 : local == 1u ? g2 * -s1 - g3 * s2
-                 : local == 2u ? g2 : g3;
+    Vec3 q[4];
+    if (!HingeAngleGradient(x, q, &theta)) return;
+    const Vec3 g = q[local];
     const float stiffness = e.rest[1];
     *gradient = g * (2.0f * stiffness * (theta - e.rest[0]));
     *hessian = Outer(g, 2.0f * stiffness);
@@ -347,6 +466,110 @@ NUKA_VBD_HD inline void RodBendBlock(const VbdElement& e, uint32_t local, const 
     }
 }
 
+// Frozen material Jacobians apply the full element stiffness to all nodal rates.
+// The returned action and diagonal omit the element's Rayleigh coefficient.
+NUKA_VBD_HD inline void ElementRayleighBlock(const VbdElement& e, uint32_t local,
+                                             const ElementGeometry& start, const Vec3* rate,
+                                             Vec3* applied, SymmetricMat3* diagonal,
+                                             const MembraneStartState* cached = nullptr) {
+    *applied = {};
+    *diagonal = {};
+    const Vec3 v1 = rate[1] - rate[0];
+    if (e.kind == kVbdTriangle) {
+        const TriangleStrain t = cached != nullptr ? MembraneStrain(e, start, *cached)
+                                                   : MembraneStrain(e, start);
+        const Vec3 f0 = t.f0, f1 = t.f1, v2 = rate[2] - rate[0];
+        const Vec3 df0 = v1 * e.rest[0] + v2 * e.rest[2];
+        const Vec3 df1 = v1 * e.rest[1] + v2 * e.rest[3];
+        const float dg00 = f0.Dot(df0), dg11 = f1.Dot(df1);
+        const float dg01 = 0.5f * (f0.Dot(df1) + f1.Dot(df0));
+        const float area = e.rest[4], mu = e.rest[5], lambda = e.rest[6];
+        const float trace = dg00 + dg11;
+        const float s00 = 2.0f * mu * dg00 + lambda * trace;
+        const float s11 = 2.0f * mu * dg11 + lambda * trace, s01 = 2.0f * mu * dg01;
+        float bx, by;
+        MembraneWeights(e, local, &bx, &by);
+        *applied = (f0 * (s00 * bx + s01 * by) + f1 * (s01 * bx + s11 * by)) * area;
+        SymmetricMat3 h = Outer(f0 * bx + f1 * by, mu + lambda);
+        AddTo(h, Outer(f0, mu * (bx * bx + by * by)));
+        AddTo(h, Outer(f1, mu * (bx * bx + by * by)));
+        const Vec3 n = f0.Cross(f1);
+        const float normal_length = Norm(n), J = 1.0f + t.area_change;
+        if (!(J > 0.0f && normal_length > 0.0f)) {
+            *applied = {NAN, NAN, NAN};
+            *diagonal = {NAN, NAN, NAN, NAN, NAN, NAN};
+            return;
+        }
+        if (t.area_change < 0.0f && J > 0.0f && normal_length > 0.0f) {
+            const Vec3 unit_n = n / normal_length;
+            const Vec3 q = (f1 * bx - f0 * by).Cross(unit_n);
+            const float dj = unit_n.Dot(df0.Cross(f1) + f0.Cross(df1));
+            const float coefficient = mu / (J * J);
+            *applied = *applied + q * (area * coefficient * dj);
+            AddTo(h, Outer(q, coefficient));
+        }
+        *diagonal = Scaled(h, area);
+        return;
+    }
+    Vec3 x[4];
+    for (uint32_t j = 0u; j < VbdElementVertexCount(e.kind); ++j) x[j] = start.Relative(j);
+    if (e.kind == kVbdHinge) {
+        Vec3 q[4];
+        if (!HingeAngleGradient(x, q)) return;
+        float angle_rate = 0.0f;
+        for (uint32_t j = 1u; j < 4u; ++j) angle_rate += q[j].Dot(rate[j] - rate[0]);
+        const float coefficient = 2.0f * e.rest[1];
+        *applied = q[local] * (coefficient * angle_rate);
+        *diagonal = Outer(q[local], coefficient);
+        return;
+    }
+    if (e.kind == kVbdSpring) {
+        const Vec3 edge = x[1] - x[0];
+        const float length = Norm(edge);
+        if (!(length > 0.0f)) return;
+        const Vec3 n = edge / length;
+        const float k = e.rest[1];
+        const Vec3 action = n * (k * n.Dot(v1));
+        *applied = local == 0u ? -action : action;
+        *diagonal = Outer(n, k);
+        return;
+    }
+    const Vec3 e1 = x[1] - x[0], e2 = x[2] - x[1];
+    const float l1 = Norm(e1), l2 = Norm(e2);
+    if (!(l1 > 0.0f) || !(l2 > 0.0f)) return;
+    const Vec3 t1 = e1 / l1, t2 = e2 / l2, v2 = rate[2] - rate[0];
+    const Vec3 axis = t1.Cross(t2);
+    const float sine = Norm(axis), k = e.rest[0];
+    if (sine > 0.0f) {
+        const Vec3 n = axis / sine;
+        const Vec3 q0 = n.Cross(t1) / l1, q2 = n.Cross(t2) / l2, q1 = -q0 - q2;
+        const Vec3 q = local == 0u ? q0 : local == 1u ? q1 : q2;
+        const float angle_rate = q1.Dot(v1) + q2.Dot(v2);
+        *applied = q * (k * angle_rate);
+        *diagonal = Outer(q, k);
+        return;
+    }
+    const float sign = t1.Dot(t2) >= 0.0f ? 1.0f : -1.0f;
+    SymmetricMat3 p1 = Outer(t1, -1.0f), p2 = Outer(t2, -1.0f);
+    AddIdentity(p1, 1.0f);
+    AddIdentity(p2, 1.0f);
+    const Vec3 w = p1.Multiply(v1) / l1 - p2.Multiply(v2 - v1) * (sign / l2);
+    SymmetricMat3 b;
+    if (local == 0u) {
+        b = Scaled(p1, -1.0f / l1);
+    } else if (local == 1u) {
+        b = Scaled(p1, 1.0f / l1);
+        AddTo(b, Scaled(p2, sign / l2));
+    } else {
+        b = Scaled(p2, -sign / l2);
+    }
+    *applied = b.Multiply(w) * k;
+    SymmetricMat3 h = Outer({b.xx, b.xy, b.xz}, k);
+    AddTo(h, Outer({b.xy, b.yy, b.yz}, k));
+    AddTo(h, Outer({b.xz, b.yz, b.zz}, k));
+    *diagonal = h;
+}
+
 NUKA_VBD_HD inline float BendCosine(const Vec3* x) {
     const Vec3 e1 = x[1] - x[0], e2 = x[2] - x[1];
     const float l1 = Norm(e1), l2 = Norm(e2);
@@ -356,9 +579,10 @@ NUKA_VBD_HD inline float BendCosine(const Vec3* x) {
 // Energy change of an element when vertex `local` moves by `move`, as products of the change
 // so that a small move is not lost to cancellation; a degenerate hinge or bend stores none.
 NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local,
-                                             const ElementGeometry& g, Vec3 move) {
+                                             const ElementGeometry& g, Vec3 move,
+                                             const MembraneStartState* start = nullptr) {
     if (e.kind == kVbdTriangle) {
-        const TriangleStrain t = MembraneStrain(e, g);
+        const TriangleStrain t = start != nullptr ? MembraneStrain(e, g, *start) : MembraneStrain(e, g);
         float bx, by;
         MembraneWeights(e, local, &bx, &by);
         const Vec3 d0 = move * bx, d1 = move * by;
@@ -379,16 +603,17 @@ NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local
                             0.5f * e.rest[6] * change * (2.0f * trace + change));
     }
     if (e.kind == kVbdHinge) {
-        // A tolerance-sized move turns the hinge by less than float angles resolve.
-        Point x[4], moved[4];
-        for (uint32_t j = 0u; j < 4u; ++j) x[j] = moved[j] = g.Precise(j);
-        moved[local] = {x[local].x + move.x, x[local].y + move.y, x[local].z + move.z};
-        double before = 0.0, after = 0.0;
-        const bool had = HingeAngle(x, &before), has = HingeAngle(moved, &after);
-        const double k = e.rest[1], rest = e.rest[0];
-        if (had && has) return float(k * (after - before) * (after + before - 2.0 * rest));
-        return float((has ? k * (after - rest) * (after - rest) : 0.0) -
-                     (had ? k * (before - rest) * (before - rest) : 0.0));
+        Vec3 x[4];
+        for (uint32_t j = 0u; j < 4u; ++j) x[j] = g.Relative(j);
+        bool had = false, has = false;
+        float before = 0.0f, after = 0.0f, turn = 0.0f;
+        HingeAngleChange(x, local, move, &had, &has, &before, &after, &turn);
+        const float k = e.rest[1], rest = e.rest[0];
+        const bool wrapped = after != before + turn;
+        if (had && has && !wrapped)
+            return k * turn * (turn + 2.0f * (before - rest));
+        return (has ? k * (after - rest) * (after - rest) : 0.0f) -
+               (had ? k * (before - rest) * (before - rest) : 0.0f);
     }
     Vec3 x[4], moved[4];
     for (uint32_t j = 0u; j < VbdElementVertexCount(e.kind); ++j) x[j] = moved[j] = g.Relative(j);
@@ -428,9 +653,11 @@ NUKA_VBD_HD inline float ElementEnergy(const VbdElement& e, const ElementGeometr
 
 // Energy gradient and Hessian block of one element at vertex `local`.
 NUKA_VBD_HD inline void ElementBlock(const VbdElement& e, uint32_t local, const ElementGeometry& g,
-                                     Vec3* gradient, SymmetricMat3* hessian) {
+                                     Vec3* gradient, SymmetricMat3* hessian,
+                                     const MembraneStartState* start = nullptr) {
     if (e.kind == kVbdTriangle) {
-        TriangleBlock(e, local, MembraneStrain(e, g), gradient, hessian);
+        const TriangleStrain t = start != nullptr ? MembraneStrain(e, g, *start) : MembraneStrain(e, g);
+        TriangleBlock(e, local, t, gradient, hessian);
         return;
     }
     Vec3 x[4];

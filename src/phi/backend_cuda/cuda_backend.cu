@@ -54,6 +54,7 @@ const char* NkOpName(int op) {
         case NkOp::ContactTangentBasis: return "ContactTangentBasis";
         case NkOp::AssembleRows: return "AssembleRows";
         case NkOp::SolveRowsBlockIsland: return "SolveRowsBlockIsland";
+        case NkOp::BlockDescentSolve: return "BlockDescentSolve";
         case NkOp::ParticleAeroDrag: return "ParticleAeroDrag";
         case NkOp::ParticlePredict: return "ParticlePredict";
         case NkOp::XpbdProject: return "XpbdProject";
@@ -95,6 +96,7 @@ const char* NkOpName(int op) {
         case NkOp::DatTruncate: return "DatTruncate";
         case NkOp::ReadoutEnergyLedger: return "ReadoutEnergyLedger";
         case NkOp::ReadoutContactAudit: return "ReadoutContactAudit";
+        case NkOp::MimicReduce: return "MimicReduce";
         default: return "op";
     }
 }

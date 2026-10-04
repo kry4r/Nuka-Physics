@@ -39,6 +39,8 @@ public:
         // default (runtime::articulation::kContactSolverIterations == 48); kept at
         // 32 here so existing cooked worlds stay byte-identical.
         uint16_t vel_iters = 32;
+        // Explicit runtime budgets take precedence over solver initialization defaults.
+        bool velocity_iterations_override = false;
         bool measure_contact_residual = false;
         // Split-impulse position-correction sweeps (the general PairDriven path).
         // 0 keeps the velocity-only solve; the production default runs a small pass
@@ -69,6 +71,7 @@ public:
         kReadoutEnergyLedger = 1u << 1,
         kReadoutPhysicsDiagnostics = 1u << 2,
         kReadoutContactAudit = 1u << 3,
+        kReadoutVbdSolveAudit = 1u << 4,
     };
 
     // All emitted physics ops are required; unsupported demands leave no runnable calls.
@@ -76,6 +79,9 @@ public:
                phi::Device* device = nullptr, uint32_t readout_demand = 0u,
                const sensor::StateSensorBank* sensors = nullptr);
     static uint32_t SubstepCount(const Model& model, const SolverConfig& cfg);
+    uint32_t VelocityIterations(uint32_t configured) const {
+        return use_block_descent_ ? p_block_descent_.iterations : configured;
+    }
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }
     size_t Size() const { return calls_.size(); }
@@ -94,6 +100,7 @@ private:
     std::vector<phi::NkOp> missing_ops_;
     std::vector<phi::XpbdProjectParams> p_xpbd_iterations_;
     std::vector<phi::SolveRowsBlockIslandParams> p_solve_iterations_;
+    std::vector<phi::BlockDescentSolveParams> p_block_descent_substeps_;
     std::vector<phi::AccumulateStepParams> p_accumulate_step_;
     std::vector<phi::ReadoutEnergyLedgerParams> p_energy_;
     phi::FkLinkVelocitiesParams p_fk_velocity_{};
@@ -121,6 +128,7 @@ private:
     phi::CrbaComputeMParams           p_crba_m_{};
     phi::CrbaFactorMParams            p_crba_factor_{};
     phi::ApplyImplicitDampingParams   p_apply_damping_{};  // L1-b standalone damping
+    phi::MimicReduceParams            p_mimic_reduce_{};
     phi::SyncLinkBodyPoseParams       p_sync_body_pose_{};  // general contact B2
     phi::BuildAabbsParams             p_aabbs_{};
     phi::LbvhBuildParams              p_lbvh_build_{};
@@ -136,6 +144,9 @@ private:
     phi::ContactWarmStartParams       p_warm_start_prepare_{};
     phi::ContactWarmStartParams       p_warm_start_commit_{};
     phi::SolveRowsBlockIslandParams   p_solve_{};
+    phi::SolveRowsBlockIslandParams   p_solve_verify_{};
+    bool use_block_descent_ = false;
+    phi::BlockDescentSolveParams      p_block_descent_{};
     phi::AeroDragParams               p_aero_drag_{};
     phi::ParticlePredictParams        p_part_predict_{};
     phi::ParticleProjectionVelocityParams p_part_projection_velocity_{};

@@ -6,6 +6,7 @@
 
 #include "math/symmetric_mat3.hpp"
 #include "math/vec3.hpp"
+#include "nk/readout/physics_diagnostics.hpp"
 #include "nk/solve/vertex_block.hpp"
 #include "phi/backend_cuda/ops/union_types.cuh"
 #include "phi/op_schema.hpp"
@@ -14,15 +15,17 @@ namespace nuka::phi::nkops {
 
 struct VertexBlockView {
     const nk::VbdElement* elements = nullptr;
+    const nk::vbd::MembraneStartState* membrane_start = nullptr;
     const uint32_t* offsets = nullptr;
     const uint32_t* incidence = nullptr;
     const uint32_t* color_vertices = nullptr;
     const uint32_t* color_segments = nullptr;
     const math::Vec3* start = nullptr;  // interval-start positions
-    const math::Vec3* target = nullptr;
+    const math::Vec3* free_rate = nullptr;
     const float* inertia = nullptr;
     const float* effective_step = nullptr;
     const uint32_t* row_first = nullptr;
+    float* solver_audit = nullptr;
     uint32_t* env_status = nullptr;
     VertexBlockLayout layout{};
     float dt = 0.0f;
@@ -34,6 +37,50 @@ struct VertexBlockView {
         return env * layout.vertices + vertex;
     }
 };
+
+__device__ inline void RecordVertexDescentAudit(const VertexBlockView& b, uint32_t env,
+                                               uint32_t vertex, math::Vec3 force,
+                                               math::Vec3 direction, math::Vec3 from,
+                                               math::Vec3 next, float scale, float change,
+                                               uint32_t halvings, bool accepted, bool descending) {
+    if (b.solver_audit == nullptr) return;
+    using Column = nk::VbdSolveAuditColumn;
+    float* record = b.solver_audit + size_t{b.Slot(env, vertex)} * nk::kVbdSolveAuditColumnCount;
+    const auto set = [&](Column column, float value) { record[static_cast<uint32_t>(column)] = value; };
+    const auto add = [&](Column column) { record[static_cast<uint32_t>(column)] += 1.0f; };
+    set(Column::LastDirectionX, direction.x);
+    set(Column::LastDirectionY, direction.y);
+    set(Column::LastDirectionZ, direction.z);
+    set(Column::LastScale, accepted ? scale : 0.0f);
+    set(Column::LastEnergyChange, accepted ? change : 0.0f);
+    set(Column::LastHalvings, static_cast<float>(halvings));
+    set(Column::LastPrimalForceX, force.x);
+    set(Column::LastPrimalForceY, force.y);
+    set(Column::LastPrimalForceZ, force.z);
+    add(Column::TotalSteps);
+    if (accepted) {
+        add(Column::AcceptedSteps);
+        if (next.x == from.x && next.y == from.y && next.z == from.z) add(Column::RoundedSteps);
+    } else if (descending) {
+        add(Column::RejectedSteps);
+    } else {
+        add(Column::ZeroSlopeSteps);
+    }
+}
+
+__device__ inline void RecordVertexEquationAudit(const VertexBlockView& b, uint32_t env,
+                                                uint32_t vertex, math::Vec3 force,
+                                                math::Vec3 correction) {
+    if (b.solver_audit == nullptr) return;
+    using Column = nk::VbdSolveAuditColumn;
+    float* record = b.solver_audit + size_t{b.Slot(env, vertex)} * nk::kVbdSolveAuditColumnCount;
+    record[static_cast<uint32_t>(Column::ForceX)] = force.x;
+    record[static_cast<uint32_t>(Column::ForceY)] = force.y;
+    record[static_cast<uint32_t>(Column::ForceZ)] = force.z;
+    record[static_cast<uint32_t>(Column::NewtonCorrectionX)] = correction.x;
+    record[static_cast<uint32_t>(Column::NewtonCorrectionY)] = correction.y;
+    record[static_cast<uint32_t>(Column::NewtonCorrectionZ)] = correction.z;
+}
 
 // Whether a point side moves a vertex-block particle.
 __device__ inline bool TouchesVertexBlock(const NkRowSide& side, const PointMassView& points,
@@ -63,7 +110,43 @@ __device__ inline nk::vbd::ElementGeometry ElementStepGeometry(const VertexBlock
     return geometry;
 }
 
-// Rayleigh damping contributes d H u to the gradient.
+// Element damping uses all nodal rates and a material metric frozen at the interval start.
+__device__ inline void VertexElementRayleigh(const VertexBlockView& b, const math::Vec3* velocity,
+                                            const nk::VbdElement& element, uint32_t env,
+                                            uint32_t local, math::Vec3 own,
+                                            math::Vec3& applied, math::SymmetricMat3& diagonal,
+                                            const nk::vbd::MembraneStartState* membrane = nullptr) {
+    nk::vbd::ElementGeometry start;
+    math::Vec3 rates[4];
+    for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
+        const uint32_t particle = b.Particle(env, element.vertex[j]);
+        start.start[j] = b.start[particle];
+        rates[j] = j == local ? own : velocity[particle];
+    }
+    nk::vbd::ElementRayleighBlock(element, local, start, rates, &applied, &diagonal, membrane);
+}
+
+// Rayleigh forces and their local curvature come from the same complete element potential.
+__device__ inline void VertexElementBlock(const VertexBlockView& b, const math::Vec3* velocity,
+                                          uint32_t env, math::Vec3 own, uint32_t packed,
+                                          math::Vec3& g, math::SymmetricMat3& h) {
+    const uint32_t element_index = nk::VbdIncidenceElement(packed);
+    const nk::VbdElement element = b.elements[element_index];
+    const auto* start = b.membrane_start != nullptr
+        ? b.membrane_start + env * b.layout.elements + element_index : nullptr;
+    const nk::vbd::ElementGeometry geometry = ElementStepGeometry(b, velocity, element, env);
+    const uint32_t local = nk::VbdIncidenceLocal(packed);
+    nk::vbd::ElementBlock(element, local, geometry, &g, &h, start);
+    if (element.damping > 0.0f) {
+        math::Vec3 damping_force;
+        math::SymmetricMat3 damping_diagonal;
+        VertexElementRayleigh(b, velocity, element, env, local, own,
+                              damping_force, damping_diagonal, start);
+        g = g + damping_force * element.damping;
+        nk::vbd::AddTo(h, nk::vbd::Scaled(damping_diagonal, element.damping / b.dt));
+    }
+}
+
 __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::Vec3* velocity,
                                          uint32_t env, uint32_t vertex, uint32_t lane,
                                          uint32_t width, math::Vec3& gradient,
@@ -72,16 +155,9 @@ __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::V
     hessian = {};
     const math::Vec3 own = velocity[b.Particle(env, vertex)];
     for (uint32_t i = b.offsets[vertex] + lane; i < b.offsets[vertex + 1u]; i += width) {
-        const uint32_t packed = b.incidence[i];
-        const nk::VbdElement element = b.elements[nk::VbdIncidenceElement(packed)];
-        const nk::vbd::ElementGeometry geometry = ElementStepGeometry(b, velocity, element, env);
         math::Vec3 g;
         math::SymmetricMat3 h;
-        nk::vbd::ElementBlock(element, nk::VbdIncidenceLocal(packed), geometry, &g, &h);
-        if (element.damping > 0.0f) {
-            g = g + h.Multiply(own) * element.damping;
-            h = nk::vbd::Scaled(h, 1.0f + element.damping / b.dt);
-        }
+        VertexElementBlock(b, velocity, env, own, b.incidence[i], g, h);
         gradient = gradient + g;
         nk::vbd::AddTo(hessian, h);
     }
@@ -96,26 +172,92 @@ constexpr float kVertexStepDecrease = 1.0e-4f;
 constexpr float kVertexStepRelaxation = 1.9f;
 
 // Change of the elastic and Rayleigh energy at a vertex whose rate moves from `from` by `move`.
-// Rayleigh damping is the dissipation (d h / 2) u^T H u with H at the current iterate.
+// The Rayleigh change is d h (move^T K u + move^T K_ii move / 2) with a frozen element K.
+// One element's share: the elastic change, the Rayleigh power factor and its damping coefficient.
+struct VertexElementChangeTerms {
+    float elastic;
+    float rayleigh;
+    float damping;
+};
+
+__device__ inline VertexElementChangeTerms VertexElementChange(
+    const VertexBlockView& b, const math::Vec3* velocity, uint32_t env, uint32_t packed,
+    math::Vec3 from, math::Vec3 move) {
+    const uint32_t element_index = nk::VbdIncidenceElement(packed);
+    const nk::VbdElement element = b.elements[element_index];
+    const auto* start = b.membrane_start != nullptr
+        ? b.membrane_start + env * b.layout.elements + element_index : nullptr;
+    const uint32_t local = nk::VbdIncidenceLocal(packed);
+    nk::vbd::ElementGeometry geometry = ElementStepGeometry(b, velocity, element, env);
+    geometry.delta[local] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
+    VertexElementChangeTerms terms{
+        nk::vbd::ElementEnergyChange(element, local, geometry, move * b.dt, start), 0.0f,
+        element.damping};
+    if (element.damping > 0.0f) {
+        math::Vec3 damping_force;
+        math::SymmetricMat3 damping_diagonal;
+        VertexElementRayleigh(b, velocity, element, env, local, from,
+                              damping_force, damping_diagonal, start);
+        terms.rayleigh = move.Dot(damping_force + damping_diagonal.Multiply(move) * 0.5f);
+    }
+    return terms;
+}
+
+__device__ inline void AddVertexElementChange(const VertexBlockView& b,
+                                              const VertexElementChangeTerms& terms, float& change) {
+    change += terms.elastic;
+    if (terms.damping > 0.0f) change += terms.damping * b.dt * terms.rayleigh;
+}
+
 __device__ inline float VertexEnergyChange(const VertexBlockView& b, const math::Vec3* velocity,
                                            uint32_t env, uint32_t vertex, math::Vec3 from,
                                            math::Vec3 move, uint32_t lane, uint32_t width) {
     float change = 0.0f;
+    for (uint32_t i = b.offsets[vertex] + lane; i < b.offsets[vertex + 1u]; i += width)
+        AddVertexElementChange(b, VertexElementChange(b, velocity, env, b.incidence[i], from, move),
+                               change);
+    return change;
+}
+
+__device__ inline bool VertexEnergyStateValid(const VertexBlockView& b, const math::Vec3* velocity,
+                                              uint32_t env, uint32_t vertex, math::Vec3 from,
+                                              uint32_t lane, uint32_t width) {
+    bool valid = true;
     for (uint32_t i = b.offsets[vertex] + lane; i < b.offsets[vertex + 1u]; i += width) {
         const uint32_t packed = b.incidence[i];
-        const nk::VbdElement element = b.elements[nk::VbdIncidenceElement(packed)];
+        const uint32_t element_index = nk::VbdIncidenceElement(packed);
+        const nk::VbdElement element = b.elements[element_index];
+        const auto* start = b.membrane_start != nullptr
+            ? b.membrane_start + env * b.layout.elements + element_index : nullptr;
         const uint32_t local = nk::VbdIncidenceLocal(packed);
         nk::vbd::ElementGeometry geometry = ElementStepGeometry(b, velocity, element, env);
         geometry.delta[local] = (from - velocity[b.Particle(env, element.vertex[0])]) * b.dt;
-        change += nk::vbd::ElementEnergyChange(element, local, geometry, move * b.dt);
+        valid &= fabsf(nk::vbd::ElementEnergy(element, geometry)) <= FLT_MAX;
+        if (element.kind == nk::kVbdTriangle) {
+            const auto strain = start != nullptr ? nk::vbd::MembraneStrain(element, geometry, *start)
+                                                  : nk::vbd::MembraneStrain(element, geometry);
+            valid &= strain.area_change > -1.0f;
+        }
         if (element.damping > 0.0f) {
-            math::Vec3 g;
-            math::SymmetricMat3 h;
-            nk::vbd::ElementBlock(element, local, geometry, &g, &h);
-            change += 0.5f * element.damping * b.dt * move.Dot(h.Multiply(from * 2.0f + move));
+            nk::vbd::ElementGeometry frozen;
+            math::Vec3 rates[4];
+            const uint32_t count = nk::VbdElementVertexCount(element.kind);
+            for (uint32_t j = 0u; j < count; ++j) {
+                const uint32_t particle = b.Particle(env, element.vertex[j]);
+                frozen.start[j] = b.start[particle];
+                rates[j] = j == local ? from : velocity[particle];
+            }
+            float power = 0.0f;
+            for (uint32_t j = 0u; j < count; ++j) {
+                math::Vec3 applied;
+                math::SymmetricMat3 diagonal;
+                nk::vbd::ElementRayleighBlock(element, j, frozen, rates, &applied, &diagonal);
+                power += rates[j].Dot(applied);
+            }
+            valid &= fabsf(0.5f * element.damping * b.dt * power) <= FLT_MAX;
         }
     }
-    return change;
+    return valid;
 }
 
 __device__ inline void VertexBlockEquationWarp(const VertexBlockView& b, PointMassView points,
@@ -135,8 +277,7 @@ __device__ inline void VertexBlockEquationWarp(const VertexBlockView& b, PointMa
     const math::Vec3 impulse = points.particle_row_impulse[particle];
     const float inertia = b.inertia[slot];
     const float h = b.dt;
-    const math::Vec3 target = b.target[slot];
-    force = (u * h - target) * -inertia - gradient + impulse / h;
+    force = -nk::vbd::InertialGradient(u, b.free_rate[slot], inertia, h) - gradient + impulse / h;
     nk::vbd::AddIdentity(hessian, inertia);
 }
 
@@ -177,7 +318,7 @@ __device__ inline bool SolveVertexBlockWarp(const VertexBlockView& b, PointMassV
     const uint32_t slot = b.Slot(env, vertex);
     const math::Vec3 impulse = points.particle_row_impulse[particle];
     const float inertia = b.inertia[slot], h = b.dt;
-    const math::Vec3 target = b.target[slot];
+    const math::Vec3 free_rate = b.free_rate[slot];
     if (!(fabsf(force.x) <= FLT_MAX && fabsf(force.y) <= FLT_MAX && fabsf(force.z) <= FLT_MAX)) {
         if (lane == 0u) atomicOr(b.env_status + env, kEnvStatusSolverFailure);
         return true;
@@ -214,14 +355,25 @@ __device__ inline bool SolveVertexBlockWarp(const VertexBlockView& b, PointMassV
     const float slope = -h * force.Dot(step);
     math::Vec3 next = u;
     float scale = rows ? 1.0f : kVertexStepRelaxation;
+    float last_change = 0.0f;
+    uint32_t last_halving = 0u;
+    bool accepted = false;
     for (uint32_t halving = 0u; halving <= kVertexStepHalvings && slope < 0.0f; ++halving) {
-        const math::Vec3 move = step * scale;
+        const math::Vec3 candidate{nk::vbd::TrialValue(u.x, step.x, scale),
+                                  nk::vbd::TrialValue(u.y, step.y, scale),
+                                  nk::vbd::TrialValue(u.z, step.z, scale)};
+        const math::Vec3 move = candidate - u;
+        const double trial_slope = -double(h) * (double(force.x) * move.x +
+            double(force.y) * move.y + double(force.z) * move.z);
         const float elastic = WarpSum(VertexEnergyChange(b, points.particle_velocity, env, vertex,
                                                          u, move, lane, warpSize));
-        const float change = elastic - impulse.Dot(move) +
-                             0.5f * inertia * h * move.Dot((u * 2.0f + move) * h - target * 2.0f);
-        if (change <= kVertexStepDecrease * scale * slope) {
-            next = u + move;
+        const float change = static_cast<float>(double(elastic) - impulse.Dot(move) +
+            nk::vbd::InertialEnergyChange(u, free_rate, move, inertia, h));
+        last_change = change;
+        last_halving = halving;
+        if (trial_slope <= 0.0 && double(change) <= double(kVertexStepDecrease) * trial_slope) {
+            next = candidate;
+            accepted = true;
             break;
         }
         scale *= 0.5f;
@@ -229,6 +381,8 @@ __device__ inline bool SolveVertexBlockWarp(const VertexBlockView& b, PointMassV
     // Every lane has read the vertex state before lane 0 overwrites it.
     __syncwarp();
     if (lane == 0u) {
+        RecordVertexDescentAudit(b, env, vertex, force, step, u, next, scale, last_change,
+                                 last_halving, accepted, slope < 0.0f);
         points.particle_velocity[particle] = next;
         if (particle_error != nullptr) particle_error[particle] = {};
     }
