@@ -1,6 +1,7 @@
 #pragma once
 
 #include "math/cuda_vec_ops.cuh"
+#include "phi/backend_cuda/ops/dat_chain.cuh"
 #include "phi/backend_cuda/ops/kinematics.cuh"
 
 namespace nuka::phi {
@@ -50,30 +51,11 @@ __device__ math::Vec3 DatBodyLocalPoint(const ModelView& model, uint32_t body,
     return {model.hull_verts[at], model.hull_verts[at + 1u], model.hull_verts[at + 2u]};
 }
 
-__device__ bool DatBodyLink(const DatTruncateParams& p, const ModelView& model,
-                            uint32_t env, uint32_t body, uint32_t* link,
-                            math::Transform* local) {
-    const uint32_t global = env * p.bodies_per_env + body;
-    const uint32_t proxy = model.body_collidable_link
-        ? model.body_collidable_link[global] : ~0u;
-    if (proxy != ~0u) {
-        *link = env * p.links_per_env + proxy;
-        *local = model.body_collidable_local[global];
-        return true;
-    }
-    const uint32_t primary = model.body_to_link
-        ? model.body_to_link[body] : ~0u;
-    if (primary == ~0u) return false;
-    *link = env * p.links_per_env + primary;
-    *local = model.link_geom_kind[*link] != 0u
-        ? model.link_geom_local[*link] : math::Transform{};
-    return true;
-}
-
+// Pose of a body at a step fraction, in the world or, given a frame link, relative to that link.
 __device__ math::Transform DatBodyPoseAt(const DatTruncateParams& p,
                                          const ModelView& model,
                                          const DataView& data, uint32_t env,
-                                         uint32_t body, float s) {
+                                         uint32_t body, float s, uint32_t frame = ~0u) {
     const uint32_t global = env * p.bodies_per_env + body;
     uint32_t link = ~0u;
     math::Transform local{};
@@ -84,6 +66,7 @@ __device__ math::Transform DatBodyPoseAt(const DatTruncateParams& p,
         const uint32_t count = model.articulation_link_count[articulation];
         math::Transform result = local;
         for (uint32_t traversed = 0u; traversed < count; ++traversed) {
+            if (link == frame) return result;
             const uint32_t parent = model.parent_link[link];
             const auto type = static_cast<ArticulationJointType>(model.joint_type[link]);
             if (parent == ~0u && type == ArticulationJointType::FloatingBase) {
@@ -116,18 +99,32 @@ __device__ math::Transform DatBodyPoseAt(const DatTruncateParams& p,
 
 __device__ math::Vec3 DatPointAt(const DatTruncateParams& p, const ModelView& model,
                                  const DataView& data, uint32_t env,
-                                 DatPointRef ref, float s) {
+                                 DatPointRef ref, float s, uint32_t frame = ~0u) {
     if (ref.particle) {
         const auto start = data.particle_prev_pos[ref.owner];
         return start + (data.particle_pos[ref.owner] - start) * s;
     }
-    const auto pose = DatBodyPoseAt(p, model, data, env, ref.owner, s);
+    const auto pose = DatBodyPoseAt(p, model, data, env, ref.owner, s, frame);
     return pose.position + math::gpu::RotateByQuatNormalized(
         pose.rotation, DatBodyLocalPoint(model, ref.owner, ref.vertex));
 }
 
+// Interpolated joints bound the path curvature by 3 * turn * speed, with turn the rotation they
+// sum to, so the path speed is at most the chord plus half that, with a slack for FK rounding.
+__device__ float DatTightSpeed(const DatTruncateParams& p, const ModelView& model,
+                               const DataView& data, uint32_t env, DatPointRef ref,
+                               uint32_t frame, float speed, float turn) {
+    if (!(speed > 0.0f && speed <= FLT_MAX) || !(1.5f * turn < 1.0f)) return speed;
+    const auto a = DatPointAt(p, model, data, env, ref, 0.0f, frame);
+    const auto b = DatPointAt(p, model, data, env, ref, 1.0f, frame);
+    const float rounding = 64.0f * FLT_EPSILON *
+        fmaxf(sqrtf(a.LengthSq()), sqrtf(b.LengthSq()));
+    return fminf(speed, sqrtf((b - a).LengthSq()) + 1.5f * turn * speed + rounding);
+}
+
 __device__ float DatPointLipschitz(const DatTruncateParams& p, const ModelView& model,
-                                   const DataView& data, uint32_t env, DatPointRef ref) {
+                                   const DataView& data, uint32_t env, DatPointRef ref,
+                                   uint32_t frame = ~0u) {
     if (ref.particle)
         return sqrtf((data.particle_pos[ref.owner] -
                       data.particle_prev_pos[ref.owner]).LengthSq());
@@ -142,24 +139,30 @@ __device__ float DatPointLipschitz(const DatTruncateParams& p, const ModelView& 
         const uint32_t count = model.articulation_link_count[articulation];
         float radius = sqrtf((local.position + math::gpu::RotateByQuatNormalized(
             local.rotation, vertex)).LengthSq());
-        float speed = 0.0f;
+        float speed = 0.0f, turn = 0.0f;
         for (uint32_t traversed = 0u; traversed < count; ++traversed) {
+            if (link == frame) return DatTightSpeed(p, model, data, env, ref, frame, speed, turn);
             const uint32_t parent = model.parent_link[link];
             const auto type = static_cast<ArticulationJointType>(model.joint_type[link]);
             if (parent == ~0u && type == ArticulationJointType::FloatingBase) {
                 const auto a = data.dat_prev_base_pose[articulation];
                 const auto b = data.base_pose[articulation];
-                return speed + sqrtf((b.position - a.position).LengthSq()) +
-                    DatQuatArc(a.rotation, b.rotation) * radius;
+                const float arc = DatQuatArc(a.rotation, b.rotation);
+                return DatTightSpeed(p, model, data, env, ref, frame,
+                    speed + sqrtf((b.position - a.position).LengthSq()) + arc * radius,
+                    turn + arc);
             }
             const float delta = fabsf(data.q[link] - data.dat_prev_q[link]);
-            if (type == ArticulationJointType::Revolute) speed += delta * radius;
+            if (type == ArticulationJointType::Revolute) {
+                speed += delta * radius;
+                turn += delta;
+            }
             if (type == ArticulationJointType::Prismatic) speed += delta;
             radius += sqrtf((model.link_local_pose[link].position +
                              model.parent_offset[link]).LengthSq());
             if (type == ArticulationJointType::Prismatic)
                 radius += fmaxf(fabsf(data.dat_prev_q[link]), fabsf(data.q[link]));
-            if (parent == ~0u) return speed;
+            if (parent == ~0u) return DatTightSpeed(p, model, data, env, ref, frame, speed, turn);
             if (parent >= count) break;
             link = offset + parent;
         }
@@ -177,13 +180,25 @@ __device__ float DatPointLipschitz(const DatTruncateParams& p, const ModelView& 
     }
     const auto a = data.dat_prev_body_pose[owner];
     const auto b = data.body_pose[owner];
-    return sqrtf((b.position - a.position).LengthSq()) +
-        DatQuatArc(a.rotation, b.rotation) * sqrtf(local_point.LengthSq());
+    const float arc = DatQuatArc(a.rotation, b.rotation);
+    return DatTightSpeed(p, model, data, env, ref, frame,
+        sqrtf((b.position - a.position).LengthSq()) + arc * sqrtf(local_point.LengthSq()), arc);
+}
+
+// Bound kinds of the articulation witness: vertex motion, particle pair, body pair, chain travel.
+constexpr uint32_t kDatBoundMotion = 0u, kDatBoundParticlePair = 1u, kDatBoundBodyPair = 2u,
+                   kDatBoundChain = 3u, kDatBoundKinds = 4u, kDatNoCounterpart = 0xFFFFu;
+
+// Env-local index of a witness counterpart: a particle or a body.
+__device__ uint32_t DatCounterpart(const DatTruncateParams& p, const DatPointRef& ref) {
+    return (ref.particle && p.particles_per_env > 0u ? ref.owner % p.particles_per_env
+                                                     : ref.owner) & 0xFFFFu;
 }
 
 __device__ void DatMinOwnerBeta(const DatTruncateParams& p, const ModelView& model,
                                 const DataView& data, uint32_t env,
-                                DatPointRef ref, float beta) {
+                                DatPointRef ref, float beta, uint32_t bound,
+                                uint32_t counterpart) {
     beta = fminf(1.0f, fmaxf(0.0f, beta));
     if (ref.particle) {
         atomicMin(reinterpret_cast<uint32_t*>(data.dat_particle_beta + ref.owner), __float_as_uint(beta));
@@ -196,6 +211,13 @@ __device__ void DatMinOwnerBeta(const DatTruncateParams& p, const ModelView& mod
         const uint32_t articulation = env * p.articulations_per_env +
             model.link_to_articulation[link];
         atomicMin(data.dat_artic_beta + articulation, __float_as_uint(beta));
+        if (data.dat_artic_witness != nullptr && bound < kDatBoundKinds) {
+            const unsigned long long key =
+                (static_cast<unsigned long long>(__float_as_uint(beta)) << 32u) |
+                ((ref.owner & 0xFFFFu) << 16u) | (counterpart & 0xFFFFu);
+            atomicMin(reinterpret_cast<unsigned long long*>(data.dat_artic_witness) +
+                      size_t{articulation} * kDatBoundKinds + bound, key);
+        }
         return;
     }
     const uint32_t owner_local = model.body_collidable_body
@@ -214,12 +236,13 @@ struct DatInterval {
 __device__ float DatPlaneFraction(const DatTruncateParams& p, const ModelView& model,
                                   const DataView& data, uint32_t env, DatPointRef ref,
                                   math::Vec3 origin, math::Vec3 normal,
-                                  float offset, float speed) {
+                                  float offset, float speed, uint32_t frame = ~0u) {
     if (!(speed < FLT_MAX)) return 0.0f;
     if (speed == 0.0f) return 1.0f;
     float values[5];
     for (uint32_t i = 0u; i <= 4u; ++i)
-        values[i] = (DatPointAt(p, model, data, env, ref, 0.25f * i) - origin).Dot(normal) - offset;
+        values[i] = (DatPointAt(p, model, data, env, ref, 0.25f * i, frame) - origin)
+            .Dot(normal) - offset;
     if (!(values[0] > 0.0f)) return 0.0f;
     DatInterval stack[20];
     uint32_t top = 0u;
@@ -233,7 +256,8 @@ __device__ float DatPlaneFraction(const DatTruncateParams& p, const ModelView& m
             continue;
         if (interval.depth == 12u) return interval.start;
         const float mid = 0.5f * (interval.start + interval.end);
-        const float value_mid = (DatPointAt(p, model, data, env, ref, mid) - origin).Dot(normal) - offset;
+        const float value_mid = (DatPointAt(p, model, data, env, ref, mid, frame) - origin)
+            .Dot(normal) - offset;
         stack[top++] = {mid, interval.end, value_mid,
                         interval.value_end, interval.depth + 1u};
         stack[top++] = {interval.start, mid, interval.value_start,

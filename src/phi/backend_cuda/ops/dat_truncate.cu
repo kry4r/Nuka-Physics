@@ -16,6 +16,7 @@
 #include "phi/backend_cuda/ops/registry.cuh"
 #include "phi/op_schema.hpp"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/bvh_work_share.cuh"
 #include "phi/backend_cuda/ops/dat_motion.cuh"
 #include "phi/backend_cuda/ops/rigid_types.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
@@ -108,67 +109,101 @@ __device__ float QueryRadius(const DatTruncateParams& p, const ModelView& model,
     return collision::DatQueryRadius(RequestedRadius(p, model, data, env, source, target));
 }
 
+__device__ bool DatBodyPairAllowed(DatTruncateParams p, ModelView model,
+                                   uint32_t a, uint32_t b) {
+    if (a == b) return false;
+    const auto sa = nkops::LoadPrimShape(model.shape_table, a);
+    const auto sb = nkops::LoadPrimShape(model.shape_table, b);
+    if (nkops::RouteMeshContact(sa.kind, sb.kind, model.mesh_contact_mode[a],
+                                model.mesh_contact_mode[b]) != nkops::MeshContactRoute::Ogc)
+        return false;
+    if (((sa.contype & sb.conaffinity) | (sb.contype & sa.conaffinity)) == 0u)
+        return false;
+    const int32_t ga = static_cast<int32_t>(sa.group);
+    const int32_t gb = static_cast<int32_t>(sb.group);
+    if (ga != 0 && gb != 0 &&
+        (ga > 0 ? ga != gb && gb > 0 : ga == gb)) return false;
+    const uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+    const uint64_t key = (uint64_t{lo} << 32u) | hi;
+    uint32_t first = 0u, last = p.excluded_pairs;
+    while (first < last) {
+        const uint32_t mid = first + (last - first) / 2u;
+        const uint64_t value = model.excluded_pairs[mid];
+        if (value < key) first = mid + 1u;
+        else if (value > key) last = mid;
+        else return false;
+    }
+    return true;
+}
+
 __global__ void ClearDatCountersKernel(DatTruncateParams p, ModelView model, DataView data) {
-    const uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
-    if (env >= p.env_count) return;
-    data.dat_failure_count[env] = 0u;
-    uint32_t capped = 0u;
-    for (uint32_t source = 0u; source < p.surfaces_per_env; ++source)
-        for (uint32_t target = source; target < p.surfaces_per_env; ++target) {
-            const float radius = RequestedRadius(p, model, data, env, source, target);
-            const float base = model.particle_surface_thickness[source] +
-                               model.particle_surface_thickness[target] + p.margin;
-            if (!(radius >= 0.0f && radius <= FLT_MAX) ||
-                !(base <= collision::kDatQueryRadiusMax)) {
-                atomicOr(data.env_status + env, kEnvStatusDatFailure);
-                data.dat_failure_count[env] = 1u;
-                RecordDatFailure(data, env, base <= collision::kDatQueryRadiusMax
-                    ? collision::kDatFailureMotion : collision::kDatFailureRadius,
-                    collision::DatWitnessOwner(collision::kDatWitnessSurface, source),
-                    collision::DatWitnessOwner(collision::kDatWitnessSurface, target), 0.0f);
+    const uint32_t env = blockIdx.x;
+    bool capped = false;
+    if (threadIdx.x == 0u) {
+        data.dat_failure_count[env] = 0u;
+        for (uint32_t source = 0u; source < p.surfaces_per_env; ++source)
+            for (uint32_t target = source; target < p.surfaces_per_env; ++target) {
+                const float radius = RequestedRadius(p, model, data, env, source, target);
+                const float base = model.particle_surface_thickness[source] +
+                                   model.particle_surface_thickness[target] + p.margin;
+                if (!(radius >= 0.0f && radius <= FLT_MAX) ||
+                    !(base <= collision::kDatQueryRadiusMax)) {
+                    atomicOr(data.env_status + env, kEnvStatusDatFailure);
+                    data.dat_failure_count[env] = 1u;
+                    RecordDatFailure(data, env, base <= collision::kDatQueryRadiusMax
+                        ? collision::kDatFailureMotion : collision::kDatFailureRadius,
+                        collision::DatWitnessOwner(collision::kDatWitnessSurface, source),
+                        collision::DatWitnessOwner(collision::kDatWitnessSurface, target), 0.0f);
+                }
+                capped |= radius > collision::kDatQueryRadiusMax;
             }
-            capped |= radius > collision::kDatQueryRadiusMax;
+    }
+    __syncthreads();
+    const uint64_t mixed = uint64_t{p.surfaces_per_env} * p.bodies_per_env;
+    for (uint64_t item = threadIdx.x; item < mixed; item += blockDim.x) {
+        const uint32_t source = static_cast<uint32_t>(item / p.bodies_per_env);
+        const uint32_t body = static_cast<uint32_t>(item % p.bodies_per_env);
+        if (model.mesh_surface_info[body].vertex_count == 0u) continue;
+        const float base = model.particle_surface_thickness[source] + p.margin;
+        const float radius = collision::DatMotionRadius(base, p.dt,
+            data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + source],
+            data.dat_body_speed[size_t{env} * p.bodies_per_env + body], p.relaxation);
+        if (!(radius >= 0.0f && radius <= FLT_MAX) ||
+            !(base <= collision::kDatQueryRadiusMax)) {
+            atomicOr(data.env_status + env, kEnvStatusDatFailure);
+            atomicAdd(data.dat_failure_count + env, 1u);
+            RecordDatFailure(data, env, base <= collision::kDatQueryRadiusMax
+                ? collision::kDatFailureMotion : collision::kDatFailureRadius,
+                collision::DatWitnessOwner(collision::kDatWitnessSurface, source),
+                DatBodyWitness(p, model, env, body), 0.0f);
         }
-    for (uint32_t source = 0u; source < p.surfaces_per_env; ++source)
-        for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
-            if (model.mesh_surface_info[body].vertex_count == 0u) continue;
-            const float base = model.particle_surface_thickness[source] + p.margin;
-            const float radius = base + p.dt * (
-                data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + source] +
-                data.dat_body_speed[size_t{env} * p.bodies_per_env + body]);
-            if (!(radius >= 0.0f && radius <= FLT_MAX) ||
-                !(base <= collision::kDatQueryRadiusMax)) {
-                atomicOr(data.env_status + env, kEnvStatusDatFailure);
-                data.dat_failure_count[env] += 1u;
-                RecordDatFailure(data, env, base <= collision::kDatQueryRadiusMax
-                    ? collision::kDatFailureMotion : collision::kDatFailureRadius,
-                    collision::DatWitnessOwner(collision::kDatWitnessSurface, source),
-                    DatBodyWitness(p, model, env, body), 0.0f);
-            }
-            capped |= radius > collision::kDatQueryRadiusMax;
+        capped |= radius > collision::kDatQueryRadiusMax;
+    }
+    const uint64_t pairs = uint64_t{p.bodies_per_env} * p.bodies_per_env;
+    for (uint64_t item = threadIdx.x; item < pairs; item += blockDim.x) {
+        const uint32_t source = static_cast<uint32_t>(item / p.bodies_per_env);
+        const uint32_t target = static_cast<uint32_t>(item % p.bodies_per_env);
+        if (target <= source ||
+            model.mesh_surface_info[source].vertex_count == 0u ||
+            model.mesh_surface_info[target].vertex_count == 0u ||
+            !DatBodyPairAllowed(p, model, source, target)) continue;
+        const uint32_t frame = DatCommonFrame(p, model, env, source, target);
+        const float radius = frame != ~0u
+            ? DatArticMotionRadius(p, model, data, env, source, target, frame, data.dat_prev_q)
+            : collision::DatMotionRadius(0.0005f + p.margin, p.dt,
+                  data.dat_body_speed[size_t{env} * p.bodies_per_env + source],
+                  data.dat_body_speed[size_t{env} * p.bodies_per_env + target], p.relaxation);
+        if (!(radius >= 0.0f && radius <= FLT_MAX)) {
+            atomicOr(data.env_status + env, kEnvStatusDatFailure);
+            atomicAdd(data.dat_failure_count + env, 1u);
+            RecordDatFailure(data, env, collision::kDatFailureMotion,
+                             DatBodyWitness(p, model, env, source),
+                             DatBodyWitness(p, model, env, target), 0.0f);
         }
-    for (uint32_t source = 0u; source < p.bodies_per_env; ++source)
-        for (uint32_t target = source + 1u; target < p.bodies_per_env; ++target) {
-            if (model.mesh_surface_info[source].vertex_count == 0u ||
-                model.mesh_surface_info[target].vertex_count == 0u) continue;
-            const auto sa = nkops::LoadPrimShape(model.shape_table, source);
-            const auto sb = nkops::LoadPrimShape(model.shape_table, target);
-            if (nkops::RouteMeshContact(sa.kind, sb.kind,
-                    model.mesh_contact_mode[source], model.mesh_contact_mode[target]) !=
-                nkops::MeshContactRoute::Ogc) continue;
-            const float radius = 0.0005f + p.margin + p.dt * (
-                data.dat_body_speed[size_t{env} * p.bodies_per_env + source] +
-                data.dat_body_speed[size_t{env} * p.bodies_per_env + target]);
-            if (!(radius >= 0.0f && radius <= FLT_MAX)) {
-                atomicOr(data.env_status + env, kEnvStatusDatFailure);
-                data.dat_failure_count[env] += 1u;
-                RecordDatFailure(data, env, collision::kDatFailureMotion,
-                                 DatBodyWitness(p, model, env, source),
-                                 DatBodyWitness(p, model, env, target), 0.0f);
-            }
-            capped |= radius > collision::kDatQueryRadiusMax;
-        }
-    data.dat_query_limit_count[env] = capped;
+        capped |= radius > collision::kDatQueryRadiusMax;
+    }
+    capped = __syncthreads_or(capped) != 0;
+    if (threadIdx.x == 0u) data.dat_query_limit_count[env] = capped;
 }
 
 __device__ void FailPrimitivePair(const DatTruncateParams& p, const ModelView& model,
@@ -250,6 +285,14 @@ __device__ void ClipPrimitivePair(const DatTruncateParams& p, const ModelView& m
     }
 }
 
+// A primitive pair one lane's traversal reached, tested by whichever lane of its warp is free.
+struct DatCandidate {
+    uint32_t a[2];
+    uint32_t b[3];
+    uint32_t env;
+    float query;
+};
+
 __global__ void ClearDatKernel(DatTruncateParams p, ModelView model, DataView data) {
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     if (item >= p.env_count * p.particles_per_env) return;
@@ -268,10 +311,10 @@ __global__ void ClearDatKernel(DatTruncateParams p, ModelView model, DataView da
         }
         for (uint32_t body = 0u; body < p.bodies_per_env; ++body) {
             if (model.mesh_surface_info[body].vertex_count == 0u) continue;
-            const float radius = model.particle_surface_thickness[source] + p.margin +
-                p.dt * (data.particle_surface_max_speed[
-                    size_t{env} * p.surfaces_per_env + source] +
-                    data.dat_body_speed[size_t{env} * p.bodies_per_env + body]);
+            const float radius = collision::DatMotionRadius(
+                model.particle_surface_thickness[source] + p.margin, p.dt,
+                data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + source],
+                data.dat_body_speed[size_t{env} * p.bodies_per_env + body], p.relaxation);
             bound = fminf(bound, 0.5f * p.relaxation *
                 collision::DatQueryRadius(radius));
         }
@@ -283,116 +326,164 @@ __global__ void ClearDatKernel(DatTruncateParams p, ModelView model, DataView da
 }
 
 __global__ void DatVertexFaceKernel(DatTruncateParams p, ModelView model, DataView data) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    if (item >= p.env_count * p.particles_per_env) return;
+    __shared__ DatCandidate queue[kBlockSize / kWarpLanes][2u * kWarpLanes];
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t item = thread / kTreeShares, share = thread % kTreeShares;
+    bool active = item < p.env_count * p.particles_per_env;
     const uint32_t env = item / p.particles_per_env;
     const uint32_t local = item % p.particles_per_env;
     const auto view = ReferenceView(p, model, data, env);
-    const math::Vec3 vertex = data.particle_prev_pos[item];
-    for (uint32_t source = 0u; source < p.surfaces_per_env; ++source) {
-        const auto source_info = model.particle_surface_info[source];
-        if (local < source_info.vertex_offset ||
-            local - source_info.vertex_offset >= source_info.vertex_count) continue;
-        for (uint32_t target = 0u; target < p.surfaces_per_env; ++target) {
-            const auto info = model.particle_surface_info[target];
-            const float query = QueryRadius(p, model, data, env, source, target);
-            uint32_t cursor = 0u;
-            while (cursor < info.node_count) {
-                const auto& node = view.nodes[info.node_offset + cursor];
-                if (node.escape <= cursor || node.escape > info.node_count) {
-                    atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                    break;
-                }
-                if (collision::MeshBoundsDistanceSquared(vertex, node) > query * query) {
-                    cursor = node.escape;
-                    continue;
-                }
-                if (node.triangle != ~0u) {
-                    if (node.triangle >= info.triangle_count) {
-                        atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                        break;
-                    }
-                    const size_t at = (size_t{info.triangle_offset} + node.triangle) * 3u;
-                    uint32_t ids[3];
-                    bool incident = false;
-                    for (uint32_t j = 0u; j < 3u; ++j) {
-                        ids[j] = env * p.particles_per_env + info.vertex_offset + view.triangles[at + j];
-                        incident |= ids[j] == item;
-                    }
-                    if (!incident) {
-                        const auto closest = collision::ClosestTrianglePoint(vertex,
-                            data.particle_prev_pos[ids[0]], data.particle_prev_pos[ids[1]],
-                            data.particle_prev_pos[ids[2]]);
-                        if ((closest.point - vertex).LengthSq() <= query * query)
-                            ClipPrimitivePair(p, model, data, env, &item, 1u, ids, 3u);
-                    }
-                }
-                ++cursor;
-            }
-        }
+    // Surfaces partition the vertices, so at most one source surface holds this one.
+    uint32_t source = 0u;
+    for (; active && source < p.surfaces_per_env; ++source) {
+        const auto info = model.particle_surface_info[source];
+        if (local >= info.vertex_offset && local - info.vertex_offset < info.vertex_count) break;
     }
+    active = active && source < p.surfaces_per_env;
+    const math::Vec3 vertex = active ? data.particle_prev_pos[item] : math::Vec3{};
+    uint32_t target = 0u, cursor = 0u, end = 0u;
+    collision::MeshSurfaceInfo info{};
+    float query = 0.0f;
+    const auto enter = [&]() {
+        if (target >= p.surfaces_per_env) return;
+        info = model.particle_surface_info[target];
+        query = QueryRadius(p, model, data, env, source, target);
+        if (!TreeShare(view.nodes + info.node_offset, info.node_count, share, &cursor, &end))
+            atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+    };
+    if (active) enter();
+    const auto next = [&](DatCandidate* candidate) {
+        while (target < p.surfaces_per_env) {
+            if (cursor >= end) {
+                ++target;
+                enter();
+                continue;
+            }
+            const auto& node = view.nodes[info.node_offset + cursor];
+            if (node.escape <= cursor || node.escape > info.node_count) {
+                atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                cursor = end;
+                continue;
+            }
+            if (collision::MeshBoundsDistanceSquared(vertex, node) > query * query) {
+                cursor = node.escape;
+                continue;
+            }
+            ++cursor;
+            if (node.triangle == ~0u) continue;
+            if (node.triangle >= info.triangle_count) {
+                atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                cursor = end;
+                continue;
+            }
+            const size_t at = (size_t{info.triangle_offset} + node.triangle) * 3u;
+            bool incident = false;
+            for (uint32_t j = 0u; j < 3u; ++j) {
+                candidate->b[j] = env * p.particles_per_env + info.vertex_offset +
+                                  view.triangles[at + j];
+                incident |= candidate->b[j] == item;
+            }
+            if (incident) continue;
+            candidate->a[0] = item;
+            candidate->env = env;
+            candidate->query = query;
+            return true;
+        }
+        return false;
+    };
+    TestInWarpBatches(queue[threadIdx.x / kWarpLanes], active, next, [&](const DatCandidate& c) {
+        const math::Vec3 point = data.particle_prev_pos[c.a[0]];
+        const auto closest = collision::ClosestTrianglePoint(point, data.particle_prev_pos[c.b[0]],
+            data.particle_prev_pos[c.b[1]], data.particle_prev_pos[c.b[2]]);
+        if ((closest.point - point).LengthSq() <= c.query * c.query)
+            ClipPrimitivePair(p, model, data, c.env, c.a, 1u, c.b, 3u);
+    });
 }
 
 __global__ void DatEdgeEdgeKernel(DatTruncateParams p, ModelView model, DataView data) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    if (item >= p.env_count * p.edges_per_env) return;
+    __shared__ DatCandidate queue[kBlockSize / kWarpLanes][2u * kWarpLanes];
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t item = thread / kTreeShares, share = thread % kTreeShares;
+    bool active = item < p.env_count * p.edges_per_env;
     const uint32_t env = item / p.edges_per_env;
     const uint32_t local = item % p.edges_per_env;
     const auto* nodes = data.particle_surface_edge_nodes + size_t{env} * p.edge_nodes_per_env;
-    for (uint32_t source = 0u; source < p.surfaces_per_env; ++source) {
-        const auto info_a = model.particle_surface_info[source];
-        const auto edges_a = model.particle_surface_edge_info[source];
-        if (local < edges_a.edge_offset || local - edges_a.edge_offset >= edges_a.edge_count)
-            continue;
+    // Surfaces partition the edges, so at most one source surface holds this one.
+    uint32_t source = 0u;
+    for (; active && source < p.surfaces_per_env; ++source) {
+        const auto edges = model.particle_surface_edge_info[source];
+        if (local >= edges.edge_offset && local - edges.edge_offset < edges.edge_count) break;
+    }
+    active = active && source < p.surfaces_per_env;
+    uint32_t ids_a[2] = {};
+    math::Vec3 midpoint{};
+    float half_length = 0.0f;
+    if (active) {
         const auto edge_a = model.particle_surface_edges[local];
-        const uint32_t base_a = env * p.particles_per_env + info_a.vertex_offset;
-        const uint32_t ids_a[2] = {base_a + edge_a.vertex0, base_a + edge_a.vertex1};
+        const uint32_t base_a = env * p.particles_per_env +
+                                model.particle_surface_info[source].vertex_offset;
+        ids_a[0] = base_a + edge_a.vertex0;
+        ids_a[1] = base_a + edge_a.vertex1;
         const math::Vec3 a0 = data.particle_prev_pos[ids_a[0]];
         const math::Vec3 a1 = data.particle_prev_pos[ids_a[1]];
-        const math::Vec3 midpoint = (a0 + a1) * 0.5f;
-        const float half_length = sqrtf((a1 - a0).LengthSq()) * 0.5f;
-        for (uint32_t target = source; target < p.surfaces_per_env; ++target) {
-            const auto info_b = model.particle_surface_info[target];
-            const auto edges_b = model.particle_surface_edge_info[target];
-            const float query = QueryRadius(p, model, data, env, source, target);
-            const float broad_radius = query + half_length;
-            uint32_t cursor = 0u;
-            while (cursor < edges_b.node_count) {
-                const auto& node = nodes[edges_b.node_offset + cursor];
-                if (node.escape <= cursor || node.escape > edges_b.node_count) {
-                    atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                    break;
-                }
-                if (collision::MeshBoundsDistanceSquared(midpoint, node) > broad_radius * broad_radius) {
-                    cursor = node.escape;
-                    continue;
-                }
-                if (node.triangle != ~0u) {
-                    if (node.triangle >= edges_b.edge_count) {
-                        atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-                        break;
-                    }
-                    const uint32_t target_edge = edges_b.edge_offset + node.triangle;
-                    if (target_edge <= local) {
-                        ++cursor;
-                        continue;
-                    }
-                    const auto edge_b = model.particle_surface_edges[target_edge];
-                    const uint32_t base_b = env * p.particles_per_env + info_b.vertex_offset;
-                    const uint32_t ids_b[2] = {base_b + edge_b.vertex0, base_b + edge_b.vertex1};
-                    const bool incident = ids_a[0] == ids_b[0] || ids_a[0] == ids_b[1] ||
-                                          ids_a[1] == ids_b[0] || ids_a[1] == ids_b[1];
-                    if (!incident) {
-                        const auto closest = collision::OgcClosestSegments(a0, a1,
-                            data.particle_prev_pos[ids_b[0]], data.particle_prev_pos[ids_b[1]]);
-                        if ((closest.a - closest.b).LengthSq() <= query * query)
-                            ClipPrimitivePair(p, model, data, env, ids_a, 2u, ids_b, 2u);
-                    }
-                }
-                ++cursor;
-            }
-        }
+        midpoint = (a0 + a1) * 0.5f;
+        half_length = sqrtf((a1 - a0).LengthSq()) * 0.5f;
     }
+    uint32_t target = source, cursor = 0u, end = 0u, base_b = 0u;
+    collision::MeshEdgeInfo edges_b{};
+    float query = 0.0f, broad_radius = 0.0f;
+    const auto enter = [&]() {
+        if (target >= p.surfaces_per_env) return;
+        edges_b = model.particle_surface_edge_info[target];
+        base_b = env * p.particles_per_env + model.particle_surface_info[target].vertex_offset;
+        query = QueryRadius(p, model, data, env, source, target);
+        broad_radius = query + half_length;
+        if (!TreeShare(nodes + edges_b.node_offset, edges_b.node_count, share, &cursor, &end))
+            atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+    };
+    if (active) enter();
+    const auto next = [&](DatCandidate* candidate) {
+        while (target < p.surfaces_per_env) {
+            if (cursor >= end) {
+                ++target;
+                enter();
+                continue;
+            }
+            const auto& node = nodes[edges_b.node_offset + cursor];
+            if (node.escape <= cursor || node.escape > edges_b.node_count) {
+                atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                cursor = end;
+                continue;
+            }
+            if (collision::MeshBoundsDistanceSquared(midpoint, node) > broad_radius * broad_radius) {
+                cursor = node.escape;
+                continue;
+            }
+            ++cursor;
+            if (node.triangle == ~0u) continue;
+            if (node.triangle >= edges_b.edge_count) {
+                atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                cursor = end;
+                continue;
+            }
+            const uint32_t target_edge = edges_b.edge_offset + node.triangle;
+            if (target_edge <= local) continue;
+            const auto edge_b = model.particle_surface_edges[target_edge];
+            const uint32_t ids_b[2] = {base_b + edge_b.vertex0, base_b + edge_b.vertex1};
+            if (ids_a[0] == ids_b[0] || ids_a[0] == ids_b[1] ||
+                ids_a[1] == ids_b[0] || ids_a[1] == ids_b[1]) continue;
+            *candidate = {{ids_a[0], ids_a[1]}, {ids_b[0], ids_b[1], 0u}, env, query};
+            return true;
+        }
+        return false;
+    };
+    TestInWarpBatches(queue[threadIdx.x / kWarpLanes], active, next, [&](const DatCandidate& c) {
+        const auto closest = collision::OgcClosestSegments(
+            data.particle_prev_pos[c.a[0]], data.particle_prev_pos[c.a[1]],
+            data.particle_prev_pos[c.b[0]], data.particle_prev_pos[c.b[1]]);
+        if ((closest.a - closest.b).LengthSq() <= c.query * c.query)
+            ClipPrimitivePair(p, model, data, c.env, c.a, 2u, c.b, 2u);
+    });
 }
 
 __global__ void DatTriangleValidityKernel(DatTruncateParams p, ModelView model,
@@ -423,7 +514,8 @@ __global__ void DatTriangleValidityKernel(DatTruncateParams p, ModelView model,
 
 __global__ void DatInitialEdgeFaceKernel(DatTruncateParams p, ModelView model,
                                          DataView data) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t item = thread / kTreeShares, share = thread % kTreeShares;
     if (item >= p.env_count * p.edges_per_env) return;
     const uint32_t env = item / p.edges_per_env;
     const uint32_t local = item % p.edges_per_env;
@@ -441,16 +533,21 @@ __global__ void DatInitialEdgeFaceKernel(DatTruncateParams p, ModelView model,
         segment.vertex[0] = data.particle_prev_pos[ids_a[0]];
         segment.vertex[1] = data.particle_prev_pos[ids_a[1]];
         if (!collision::DatPrimitiveValid(segment)) {
-            FailPrimitivePair(p, model, data, env, collision::kDatFailureDegenerate, 0.0f,
-                              ids_a, 2u, ids_a, 0u);
+            if (share == 0u)
+                FailPrimitivePair(p, model, data, env, collision::kDatFailureDegenerate, 0.0f,
+                                  ids_a, 2u, ids_a, 0u);
             return;
         }
         const math::Vec3 midpoint = (segment.vertex[0] + segment.vertex[1]) * 0.5f;
         const float half_length = sqrtf((segment.vertex[1] - segment.vertex[0]).LengthSq()) * 0.5f;
         for (uint32_t target = 0u; target < p.surfaces_per_env; ++target) {
             const auto info_b = model.particle_surface_info[target];
-            uint32_t cursor = 0u;
-            while (cursor < info_b.node_count) {
+            uint32_t cursor = 0u, end = 0u;
+            if (!TreeShare(view.nodes + info_b.node_offset, info_b.node_count, share, &cursor, &end)) {
+                atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                continue;
+            }
+            while (cursor < end) {
                 const auto& node = view.nodes[info_b.node_offset + cursor];
                 if (node.escape <= cursor || node.escape > info_b.node_count) {
                     atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
@@ -500,8 +597,16 @@ __global__ void ClearDatOwnersKernel(DatTruncateParams p, DataView data) {
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t bodies = p.env_count * p.bodies_per_env;
     const uint32_t articulations = p.env_count * p.articulations_per_env;
-    if (item < bodies) data.dat_body_beta[item] = __float_as_uint(1.0f);
-    if (item < articulations) data.dat_artic_beta[item] = __float_as_uint(1.0f);
+    if (item < bodies) {
+        data.dat_body_beta[item] = __float_as_uint(1.0f);
+        data.dat_body_motion[item] = 0.0f;
+    }
+    if (item < articulations) {
+        data.dat_artic_beta[item] = __float_as_uint(1.0f);
+        if (data.dat_artic_witness != nullptr)
+            for (uint32_t k = 0u; k < kDatBoundKinds; ++k)
+                data.dat_artic_witness[size_t{item} * kDatBoundKinds + k] = ~0ull;
+    }
     if (item < p.env_count) {
         data.dat_joint_truncation_count[item] = 0u;
         data.dat_joint_truncation_energy[item] = 0.0f;
@@ -532,12 +637,15 @@ __global__ void DatBodyMotionBoundKernel(DatTruncateParams p, ModelView model,
         RecordDatFailure(data, env, speed >= 0.0f && speed <= FLT_MAX
             ? collision::kDatFailureRadius : collision::kDatFailureMotion,
             DatBodyWitness(p, model, env, body), collision::kDatWitnessNone, 0.0f);
-        DatMinOwnerBeta(p, model, data, env, ref, 0.0f);
+        DatMinOwnerBeta(p, model, data, env, ref, 0.0f, kDatBoundMotion, vertex);
         return;
     }
+    // Non-negative float bits order like the values, so the maximum is order independent.
+    atomicMax(reinterpret_cast<uint32_t*>(data.dat_body_motion) + size_t{env} * p.bodies_per_env +
+              body, __float_as_uint(speed / p.dt));
     const float bound = 0.5f * p.relaxation * query;
     if (speed > bound)
-        DatMinOwnerBeta(p, model, data, env, ref, bound / speed);
+        DatMinOwnerBeta(p, model, data, env, ref, bound / speed, kDatBoundMotion, vertex);
 }
 
 __device__ bool DatMixedRefs(DatTruncateParams p, ModelView model, DataView data,
@@ -624,37 +732,14 @@ __device__ void FailMixedPair(DatTruncateParams p, ModelView model, DataView dat
     atomicAdd(data.dat_failure_count + env, 1u);
     RecordDatFailure(data, env, reason, DatRefWitness(p, model, env, a[0]), count_b > 0u
         ? DatRefWitness(p, model, env, b[0]) : collision::kDatWitnessNone, depth);
+    const bool particle_a = a[0].particle, particle_b = count_b > 0u && b[0].particle;
     for (uint32_t i = 0u; i < count_a; ++i)
-        DatMinOwnerBeta(p, model, data, env, a[i], 0.0f);
+        DatMinOwnerBeta(p, model, data, env, a[i], 0.0f,
+            particle_b ? kDatBoundParticlePair : kDatBoundBodyPair,
+            count_b > 0u ? DatCounterpart(p, b[0]) : kDatNoCounterpart);
     for (uint32_t i = 0u; i < count_b; ++i)
-        DatMinOwnerBeta(p, model, data, env, b[i], 0.0f);
-}
-
-__device__ bool DatBodyPairAllowed(DatTruncateParams p, ModelView model,
-                                   uint32_t a, uint32_t b) {
-    if (a == b) return false;
-    const auto sa = nkops::LoadPrimShape(model.shape_table, a);
-    const auto sb = nkops::LoadPrimShape(model.shape_table, b);
-    if (nkops::RouteMeshContact(sa.kind, sb.kind, model.mesh_contact_mode[a],
-                                model.mesh_contact_mode[b]) != nkops::MeshContactRoute::Ogc)
-        return false;
-    if (((sa.contype & sb.conaffinity) | (sb.contype & sa.conaffinity)) == 0u)
-        return false;
-    const int32_t ga = static_cast<int32_t>(sa.group);
-    const int32_t gb = static_cast<int32_t>(sb.group);
-    if (ga != 0 && gb != 0 &&
-        (ga > 0 ? ga != gb && gb > 0 : ga == gb)) return false;
-    const uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
-    const uint64_t key = (uint64_t{lo} << 32u) | hi;
-    uint32_t first = 0u, last = p.excluded_pairs;
-    while (first < last) {
-        const uint32_t mid = first + (last - first) / 2u;
-        const uint64_t value = model.excluded_pairs[mid];
-        if (value < key) first = mid + 1u;
-        else if (value > key) last = mid;
-        else return false;
-    }
-    return true;
+        DatMinOwnerBeta(p, model, data, env, b[i], 0.0f,
+            particle_a ? kDatBoundParticlePair : kDatBoundBodyPair, DatCounterpart(p, a[0]));
 }
 
 __device__ collision::MeshSurfaceView DatOldBodyView(
@@ -664,6 +749,11 @@ __device__ collision::MeshSurfaceView DatOldBodyView(
     return {model.hull_verts, model.mesh_triangles, model.mesh_bvh_nodes,
             {p.mesh_vertices, p.mesh_triangles, p.mesh_nodes},
             pose.position, pose.rotation, true};
+}
+
+// Whether segment ab meets the node box widened by the 1 um slack of the bounding sphere it refines.
+__device__ bool DatSegmentNearBounds(math::Vec3 a, math::Vec3 b, const collision::MeshBvhNode& node) {
+    return collision::SegmentWithinBox(a, b, node.lower, node.upper, 1.0e-6f);
 }
 
 __global__ void DatInitialMixedEdgeFaceKernel(DatTruncateParams p,
@@ -715,28 +805,36 @@ __global__ void DatInitialMixedEdgeFaceKernel(DatTruncateParams p,
     }
     collision::DatPrimitive segment;
     segment.count = 2u;
-    segment.vertex[0] = DatPointAt(p, model, data, env, source[0], 0.0f);
-    segment.vertex[1] = DatPointAt(p, model, data, env, source[1], 0.0f);
+    if (source_particle) {
+        segment.vertex[0] = DatPointAt(p, model, data, env, source[0], 0.0f);
+        segment.vertex[1] = DatPointAt(p, model, data, env, source[1], 0.0f);
+    } else {
+        const auto pose = DatBodyPoseAt(p, model, data, env, source_body, 0.0f);
+        for (uint32_t j = 0u; j < 2u; ++j)
+            segment.vertex[j] = pose.position + math::gpu::RotateByQuatNormalized(
+                pose.rotation, DatBodyLocalPoint(model, source_body, source[j].vertex));
+    }
     if (!collision::DatPrimitiveValid(segment)) {
         FailMixedPair(p, model, data, env, collision::kDatFailureDegenerate, 0.0f,
                       source, 2u, source, 0u);
         return;
     }
-    const auto midpoint = (segment.vertex[0] + segment.vertex[1]) * 0.5f;
-    const float half_length = 0.5f * sqrtf(
-        (segment.vertex[1] - segment.vertex[0]).LengthSq()) + 1.0e-6f;
     for (uint32_t group = 0u; group < (source_particle ? 1u : 2u); ++group) {
         const bool target_particle = !source_particle && group == 0u;
         const uint32_t targets = target_particle ? p.surfaces_per_env : p.bodies_per_env;
         for (uint32_t target = 0u; target < targets; ++target) {
-            if (!target_particle && !source_particle &&
-                !DatBodyPairAllowed(p, model, source_body, target)) continue;
             const auto info = target_particle ? model.particle_surface_info[target]
                                               : model.mesh_surface_info[target];
             const auto view = target_particle ? ReferenceView(p, model, data, env)
                 : DatOldBodyView(p, model, data, env, target);
-            if (!collision::MeshSurfaceRangeValid(view, info)) continue;
-            const auto query = collision::MeshSurfaceLocalPoint(view, midpoint);
+            if (info.node_count == 0u || !collision::MeshSurfaceRangeValid(view, info)) continue;
+            const auto local_a = collision::MeshSurfaceLocalPoint(view, segment.vertex[0]);
+            const auto local_b = collision::MeshSurfaceLocalPoint(view, segment.vertex[1]);
+            if (!DatSegmentNearBounds(local_a, local_b, view.nodes[info.node_offset])) continue;
+            if (!target_particle && !source_particle &&
+                !DatBodyPairAllowed(p, model, source_body, target)) continue;
+            const auto pose = target_particle ? math::Transform{}
+                : DatBodyPoseAt(p, model, data, env, target, 0.0f);
             uint32_t cursor = 0u;
             while (cursor < info.node_count) {
                 const auto node = view.nodes[info.node_offset + cursor];
@@ -744,8 +842,7 @@ __global__ void DatInitialMixedEdgeFaceKernel(DatTruncateParams p,
                     atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
                     break;
                 }
-                if (collision::MeshBoundsDistanceSquared(query, node) >
-                    half_length * half_length) {
+                if (!DatSegmentNearBounds(local_a, local_b, node)) {
                     cursor = node.escape;
                     continue;
                 }
@@ -775,7 +872,10 @@ __global__ void DatInitialMixedEdgeFaceKernel(DatTruncateParams p,
                         collision::DatPrimitive triangle;
                         triangle.count = 3u;
                         for (uint32_t j = 0u; j < 3u; ++j)
-                            triangle.vertex[j] = DatPointAt(p, model, data, env, face[j], 0.0f);
+                            triangle.vertex[j] = target_particle
+                                ? DatPointAt(p, model, data, env, face[j], 0.0f)
+                                : pose.position + math::gpu::RotateByQuatNormalized(
+                                      pose.rotation, DatBodyLocalPoint(model, target, face[j].vertex));
                         const uint32_t reason = collision::DatPrimitiveValid(triangle)
                             ? collision::kDatFailureOverlap : collision::kDatFailureDegenerate;
                         if (reason == collision::kDatFailureDegenerate ||
@@ -807,13 +907,16 @@ __global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataVi
         atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
         return;
     }
+    // Links of one articulation are certified relative to their lowest common ancestor.
+    const uint32_t frame = refs_a[0].particle || refs_b[0].particle ? ~0u
+        : DatCommonFrame(p, model, env, refs_a[0].owner, refs_b[0].owner);
     collision::DatPrimitive a, b;
     a.count = count_a;
     b.count = count_b;
     for (uint32_t i = 0u; i < count_a; ++i)
-        a.vertex[i] = DatPointAt(p, model, data, env, refs_a[i], 0.0f);
+        a.vertex[i] = DatPointAt(p, model, data, env, refs_a[i], 0.0f, frame);
     for (uint32_t i = 0u; i < count_b; ++i)
-        b.vertex[i] = DatPointAt(p, model, data, env, refs_b[i], 0.0f);
+        b.vertex[i] = DatPointAt(p, model, data, env, refs_b[i], 0.0f, frame);
     const auto separator = collision::DatFindSeparator(a, b);
     if (!(separator.gap > 0.0f)) {
         const bool valid = collision::DatPrimitiveValid(a) && collision::DatPrimitiveValid(b);
@@ -825,7 +928,7 @@ __global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataVi
     float speed_a[3], speed_b[3];
     float bound_a = 0.0f, bound_b = 0.0f;
     for (uint32_t i = 0u; i < count_a; ++i) {
-        speed_a[i] = DatPointLipschitz(p, model, data, env, refs_a[i]);
+        speed_a[i] = DatPointLipschitz(p, model, data, env, refs_a[i], frame);
         if (!(speed_a[i] >= 0.0f && speed_a[i] < FLT_MAX)) {
             FailMixedPair(p, model, data, env, collision::kDatFailureMotion, 0.0f,
                           refs_a, count_a, refs_b, count_b);
@@ -834,7 +937,7 @@ __global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataVi
         bound_a = fmaxf(bound_a, speed_a[i]);
     }
     for (uint32_t i = 0u; i < count_b; ++i) {
-        speed_b[i] = DatPointLipschitz(p, model, data, env, refs_b[i]);
+        speed_b[i] = DatPointLipschitz(p, model, data, env, refs_b[i], frame);
         if (!(speed_b[i] >= 0.0f && speed_b[i] < FLT_MAX)) {
             FailMixedPair(p, model, data, env, collision::kDatFailureMotion, 0.0f,
                           refs_a, count_a, refs_b, count_b);
@@ -845,13 +948,18 @@ __global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataVi
     if (bound_a + bound_b < separator.gap) return;
     float approach_a = 0.0f, approach_b = 0.0f;
     for (uint32_t i = 0u; i < count_a; ++i)
-        approach_a = fmaxf(approach_a, -(
-            DatPointAt(p, model, data, env, refs_a[i], 1.0f) - a.vertex[i]).Dot(separator.normal));
+        approach_a = fmaxf(approach_a, -(DatPointAt(p, model, data, env, refs_a[i], 1.0f, frame) -
+                                         a.vertex[i]).Dot(separator.normal));
     for (uint32_t i = 0u; i < count_b; ++i)
-        approach_b = fmaxf(approach_b, (
-            DatPointAt(p, model, data, env, refs_b[i], 1.0f) - b.vertex[i]).Dot(separator.normal));
+        approach_b = fmaxf(approach_b, (DatPointAt(p, model, data, env, refs_b[i], 1.0f, frame) -
+                                        b.vertex[i]).Dot(separator.normal));
     const float total = approach_a + approach_b;
-    const float fraction = total > 0.0f ? approach_b / total : 0.5f;
+    // A side that can move keeps half the relaxation slack of the gap, so a side whose endpoint
+    // does not approach is never pinned to the plane.
+    const float slack = 0.5f * (1.0f - p.relaxation);
+    const float share = total > 0.0f ? approach_b / total : bound_b / (bound_a + bound_b);
+    const float fraction = fminf(fmaxf(share, bound_b > 0.0f ? slack : 0.0f),
+                                 bound_a > 0.0f ? 1.0f - slack : 1.0f);
     const float plane_offset = separator.gap * fraction;
     for (uint32_t side = 0u; side < 2u; ++side) {
         const DatPointRef* refs = side == 0u ? refs_a : refs_b;
@@ -861,11 +969,48 @@ __global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataVi
             const float offset = side == 0u ? plane_offset : -plane_offset;
             const float speed = side == 0u ? speed_a[i] : speed_b[i];
             const float root = DatPlaneFraction(p, model, data, env, refs[i],
-                separator.negative_support, normal, offset, speed);
+                separator.negative_support, normal, offset, speed, frame);
+            const DatPointRef& other = side == 0u ? refs_b[0] : refs_a[0];
             if (root < 1.0f)
-                DatMinOwnerBeta(p, model, data, env, refs[i], p.relaxation * root);
+                DatMinOwnerBeta(p, model, data, env, refs[i], p.relaxation * root,
+                    other.particle ? kDatBoundParticlePair : kDatBoundBodyPair,
+                    DatCounterpart(p, other));
         }
     }
+}
+
+// Two links of one articulation travel, relative to their common ancestor, less than the relaxed
+// share of their pair radius, so a pair that detection kept apart cannot meet within the step.
+__global__ void DatArticPairsKernel(DatTruncateParams p, ModelView model, DataView data) {
+    const uint64_t pairs = uint64_t{p.bodies_per_env} * p.bodies_per_env;
+    const uint64_t item = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (item >= pairs * p.env_count) return;
+    const uint32_t env = static_cast<uint32_t>(item / pairs);
+    const uint32_t source = static_cast<uint32_t>(item % pairs / p.bodies_per_env);
+    const uint32_t target = static_cast<uint32_t>(item % p.bodies_per_env);
+    if (target <= source || model.mesh_surface_info[source].vertex_count == 0u ||
+        model.mesh_surface_info[target].vertex_count == 0u ||
+        !DatBodyPairAllowed(p, model, source, target)) return;
+    const uint32_t frame = DatCommonFrame(p, model, env, source, target);
+    if (frame == ~0u) return;
+    const float radius = collision::DatQueryRadius(
+        DatArticMotionRadius(p, model, data, env, source, target, frame, data.dat_prev_q));
+    const float travel = p.dt *
+        (DatChainSpeed(p, model, data, env, source, frame, nullptr, data.dat_prev_q) +
+         DatChainSpeed(p, model, data, env, target, frame, nullptr, data.dat_prev_q));
+    if (travel <= p.relaxation * radius) return;
+    const DatPointRef ref{source, 0u, false};
+    if (!(travel <= FLT_MAX)) {
+        atomicOr(data.env_status + env, kEnvStatusDatFailure);
+        atomicAdd(data.dat_failure_count + env, 1u);
+        RecordDatFailure(data, env, collision::kDatFailureMotion,
+                         DatBodyWitness(p, model, env, source),
+                         DatBodyWitness(p, model, env, target), 0.0f);
+        DatMinOwnerBeta(p, model, data, env, ref, 0.0f, kDatBoundChain, target);
+        return;
+    }
+    DatMinOwnerBeta(p, model, data, env, ref, p.relaxation * radius / travel, kDatBoundChain,
+                    target);
 }
 
 __global__ void DatSnapshotKernel(DatTruncateParams p, DataView data) {
@@ -950,9 +1095,12 @@ __global__ void ApplyDatArticulationKernel(DatTruncateParams p, ModelView model,
     const uint32_t articulation = blockIdx.x * blockDim.x + threadIdx.x;
     if (articulation >= p.env_count * p.articulations_per_env) return;
     const float beta = __uint_as_float(data.dat_artic_beta[articulation]);
-    if (!(beta < 1.0f)) return;
     const uint32_t offset = model.articulation_link_offset[articulation];
     const uint32_t count = model.articulation_link_count[articulation];
+    for (uint32_t i = 0u; i < count; ++i)
+        data.dat_joint_motion[offset + i] =
+            fabsf(data.q[offset + i] - data.dat_prev_q[offset + i]) / p.dt;
+    if (!(beta < 1.0f)) return;
     for (uint32_t i = 0u; i < count; ++i) {
         const uint32_t link = offset + i;
         data.q[link] = data.dat_prev_q[link] +
@@ -1023,10 +1171,11 @@ __global__ void TallyDatKernel(DatTruncateParams p, DataView data) {
             if (local >= p.vbd_particle_begin &&
                 local - p.vbd_particle_begin < p.vbd_vertices_per_env) {
                 const uint32_t slot = env * p.vbd_vertices_per_env + local - p.vbd_particle_begin;
-                const math::Vec3 offset = data.vbd_offset[slot];
                 const float effective_step = data.vbd_step[slot];
-                before = nk::vbd::PhysicalVelocity(before, offset, p.dt, effective_step);
-                after = nk::vbd::PhysicalVelocity(after, offset, p.dt, effective_step);
+                before = nk::vbd::PhysicalVelocity(before, data.vbd_free_rate[slot],
+                    data.vbd_free_velocity[slot], p.dt, effective_step);
+                after = nk::vbd::PhysicalVelocity(after, data.vbd_free_rate[slot],
+                    data.vbd_free_velocity[slot], p.dt, effective_step);
             }
             const double loss =
                 (double(before.x) - after.x) * (double(before.x) + after.x) +
@@ -1076,7 +1225,8 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
         !(p->margin >= 0.0f) || !std::isfinite(p->margin)) return Status::InvalidArgument;
     if (p->env_count == 0u) return Status::Ok;
     if (uint64_t{p->vbd_particle_begin} + p->vbd_vertices_per_env > p->particles_per_env ||
-        (p->vbd_vertices_per_env > 0u && (!data.vbd_offset || !data.vbd_step)))
+        (p->vbd_vertices_per_env > 0u &&
+         (!data.vbd_free_rate || !data.vbd_free_velocity || !data.vbd_step)))
         return Status::InvalidArgument;
     if ((p->surfaces_per_env > 0u &&
          (!model.particle_surface_info || !model.particle_surface_edge_info ||
@@ -1090,11 +1240,11 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
           !data.particle_prev_pos || !data.particle_pos || !data.particle_vel)) ||
         (p->bodies_per_env > 0u &&
          (!model.mesh_surface_info || !model.mesh_edge_info || !model.mesh_triangles ||
-          !model.mesh_bvh_nodes || !model.shape_table ||
+          !model.mesh_bvh_nodes || !model.shape_table || !model.mesh_vertex_reach ||
           (p->excluded_pairs > 0u && !model.excluded_pairs) ||
           !model.mesh_edges || !model.hull_verts || !model.mesh_vertex_sources ||
           !data.body_pose || !data.dat_prev_body_pose || !data.dat_body_beta ||
-          !data.dat_body_speed || !data.dat_body_query_radius ||
+          !data.dat_body_speed || !data.dat_body_query_radius || !data.dat_body_motion ||
           !data.body_inv_mass || !data.body_linear_velocity ||
           !data.body_angular_velocity || !data.body_inertial_frame ||
           !data.body_inv_inertia || !data.body_world_inv_inertia)) ||
@@ -1105,6 +1255,7 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
           !model.parent_offset || !model.link_geom_kind || !model.link_geom_local ||
           !data.q || !data.qdot || !data.dat_prev_q || !data.base_pose ||
           !data.dat_prev_base_pose || !data.link_velocity ||
+          !data.dat_joint_motion || !data.dat_joint_rate ||
           !data.dat_artic_beta || !data.m || !data.qdot_flat)) ||
         (p->slot_capacity > 0u &&
          (!data.ogc_contact_count || !data.dat_pair_kind ||
@@ -1124,8 +1275,10 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
     const uint64_t triangles = uint64_t{p->env_count} * p->triangles_per_env;
     const uint64_t body_vertices = uint64_t{p->env_count} * p->mesh_vertex_sources;
     const uint64_t slots = uint64_t{p->env_count} * p->slot_capacity;
-    if (particles > UINT32_MAX || edges > UINT32_MAX || triangles > UINT32_MAX ||
-        body_vertices > UINT32_MAX || slots > UINT32_MAX ||
+    const uint64_t body_pairs = uint64_t{p->env_count} * p->bodies_per_env * p->bodies_per_env;
+    if (particles > UINT32_MAX / kTreeShares || edges > UINT32_MAX / kTreeShares ||
+        triangles > UINT32_MAX ||
+        body_vertices > UINT32_MAX || slots > UINT32_MAX || body_pairs > UINT32_MAX ||
         uint64_t{p->env_count} * (p->edges_per_env + p->mesh_edge_sources) > UINT32_MAX ||
         p->slot_base > p->slot_stride ||
         p->slot_capacity > p->slot_stride - p->slot_base)
@@ -1134,7 +1287,7 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
     if (cudaMemsetAsync(data.dat_failure_witness, 0, size_t{p->env_count} *
             collision::kDatWitnessWords * sizeof(uint64_t), stream) != cudaSuccess)
         return Status::Failed;
-    LaunchCuda(ClearDatCountersKernel, dim3((p->env_count + kBlockSize - 1u) / kBlockSize),
+    LaunchCuda(ClearDatCountersKernel, dim3(p->env_count),
                dim3(kBlockSize), 0u, stream, *p, model, data);
     const uint32_t owners = p->env_count *
         std::max(p->bodies_per_env, std::max(p->articulations_per_env, 1u));
@@ -1147,14 +1300,16 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
                    dim3((static_cast<uint32_t>(triangles) + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (particles > 0u && p->surfaces_per_env > 0u)
-        LaunchCuda(DatVertexFaceKernel, particle_grid, dim3(kBlockSize), 0u, stream, *p, model, data);
+        LaunchCuda(DatVertexFaceKernel,
+                   dim3((static_cast<uint32_t>(particles) * kTreeShares + kBlockSize - 1u) / kBlockSize),
+                   dim3(kBlockSize), 0u, stream, *p, model, data);
     if (edges > 0u)
         LaunchCuda(DatEdgeEdgeKernel,
-                   dim3((static_cast<uint32_t>(edges) + kBlockSize - 1u) / kBlockSize),
+                   dim3((static_cast<uint32_t>(edges) * kTreeShares + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (edges > 0u)
         LaunchCuda(DatInitialEdgeFaceKernel,
-                   dim3((static_cast<uint32_t>(edges) + kBlockSize - 1u) / kBlockSize),
+                   dim3((static_cast<uint32_t>(edges) * kTreeShares + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     const uint64_t mixed_edges = uint64_t{p->env_count} *
         (p->edges_per_env + p->mesh_edge_sources);
@@ -1169,6 +1324,10 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
     if (slots > 0u)
         LaunchCuda(DatMixedPairsKernel,
                    dim3((static_cast<uint32_t>(slots) + kBlockSize - 1u) / kBlockSize),
+                   dim3(kBlockSize), 0u, stream, *p, model, data);
+    if (p->articulations_per_env > 0u && p->bodies_per_env > 1u)
+        LaunchCuda(DatArticPairsKernel,
+                   dim3(static_cast<uint32_t>((body_pairs + kBlockSize - 1u) / kBlockSize)),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     LaunchCuda(TallyDatKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream, *p, data);
     if (p->bodies_per_env > 0u || p->articulations_per_env > 0u)

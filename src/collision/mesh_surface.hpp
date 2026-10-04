@@ -128,6 +128,29 @@ NUKA_MESH_HD inline float MeshBoundsDistanceSquared(
     return delta.LengthSq();
 }
 
+// Whether segment ab meets the box widened by reach on every axis, which holds every point
+// within reach of the box.
+NUKA_MESH_HD inline bool SegmentWithinBox(math::Vec3 a, math::Vec3 b, math::Vec3 lower,
+                                          math::Vec3 upper, float reach) {
+    const float origin[3] = {a.x, a.y, a.z};
+    const float delta[3] = {b.x - a.x, b.y - a.y, b.z - a.z};
+    const float low[3] = {lower.x - reach, lower.y - reach, lower.z - reach};
+    const float high[3] = {upper.x + reach, upper.y + reach, upper.z + reach};
+    float enter = 0.0f, leave = 1.0f;
+    for (uint32_t axis = 0u; axis < 3u; ++axis) {
+        if (delta[axis] == 0.0f) {
+            if (origin[axis] < low[axis] || origin[axis] > high[axis]) return false;
+            continue;
+        }
+        const float t0 = (low[axis] - origin[axis]) / delta[axis];
+        const float t1 = (high[axis] - origin[axis]) / delta[axis];
+        enter = fmaxf(enter, fminf(t0, t1));
+        leave = fminf(leave, fmaxf(t0, t1));
+        if (enter > leave) return false;
+    }
+    return true;
+}
+
 // Half-open projected edges count a shared edge once, including ray/vertex ties.
 NUKA_MESH_HD inline bool MeshRayEdgeOwned(math::Vec3 a, math::Vec3 b) {
     return b.z > a.z || (b.z == a.z && b.y < a.y);
