@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <chrono>
+#include <stdexcept>
 
 namespace {
 
@@ -44,6 +46,36 @@ std::filesystem::path WriteFingerStl(const char* name) {
         "endsolid finger\n";
     return WriteTemp(name, stl);
 }
+
+class UrdfMeshFixture {
+public:
+    UrdfMeshFixture() {
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (unsigned int attempt = 0; attempt < 100u; ++attempt) {
+            directory_ = std::filesystem::temp_directory_path() /
+                ("nuka-urdf-decompose-" + std::to_string(stamp) + "-" + std::to_string(attempt));
+            if (std::filesystem::create_directory(directory_)) {
+                Write("finger.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
+                return;
+            }
+        }
+        throw std::runtime_error("Could not allocate a private URDF fixture directory");
+    }
+    ~UrdfMeshFixture() {
+        std::error_code error;
+        std::filesystem::remove_all(directory_, error);
+    }
+    std::filesystem::path Write(const char* name, const std::string& text) const {
+        const auto path = directory_ / name;
+        std::ofstream output(path);
+        output << text;
+        output.close();
+        if (!output) throw std::runtime_error("Could not write URDF fixture");
+        return path;
+    }
+private:
+    std::filesystem::path directory_;
+};
 
 // --- USD --------------------------------------------------------------------
 // A Mesh collision shape carrying the custom nuka:decompose token + max_pieces.
@@ -122,7 +154,8 @@ TEST(DecomposeAttribute, UrdfParsesMaxPiecesSpecForm) {
   </link>
 </robot>
 )URDF";
-    const auto path = WriteTemp("nuka_decompose_test.urdf", urdf);
+    UrdfMeshFixture fixture;
+    const auto path = fixture.Write("scene.urdf", urdf);
     const auto scene = nuka::import::LoadUrdf(path.string());
 
     ASSERT_EQ(scene.ShapeCount(), 1u);
@@ -145,7 +178,8 @@ TEST(DecomposeAttribute, UrdfParsesExplicitModeAttribute) {
   </link>
 </robot>
 )URDF";
-    const auto path = WriteTemp("nuka_decompose_skip.urdf", urdf);
+    UrdfMeshFixture fixture;
+    const auto path = fixture.Write("scene.urdf", urdf);
     const auto scene = nuka::import::LoadUrdf(path.string());
 
     ASSERT_EQ(scene.ShapeCount(), 1u);
