@@ -101,12 +101,21 @@ struct PointMassView {
         const float* inv_mass = InverseMass(kind);
         return inv_mass != nullptr ? inv_mass[index] * u.Dot(v) : 0.0f;
     }
+    // Terms load independently before their ordered sum, so unrolled terms keep their loads in flight.
     __device__ float RowVelocity(const NkRowSide& side) const {
         float result = 0.0f;
-        for (uint32_t i = 0u; i < Count(side); ++i) {
-            const auto term = At(side, i);
-            const auto* velocity = Velocity(term.kind);
-            if (velocity != nullptr) result += term.jacobian.Dot(velocity[term.index]);
+        if (side.kind != nk::kNkSidePointEndpoint) {
+            const auto* velocity = Velocity(side.kind);
+            if (velocity != nullptr) result += side.jlin.Dot(velocity[side.index]);
+            return result;
+        }
+        const nk::PointEndpointRange range = ranges[side.index];
+#pragma unroll 4
+        for (uint32_t i = 0u; i < range.count; ++i) {
+            const auto& entry = terms[range.first + i];
+            const auto* velocity = Velocity(entry.kind);
+            if (velocity != nullptr)
+                result += entry.TransposeMultiply(side.jlin).Dot(velocity[entry.index]);
         }
         return result;
     }

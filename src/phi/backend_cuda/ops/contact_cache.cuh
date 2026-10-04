@@ -84,9 +84,17 @@ struct Layout {
           temp_offset(Align(end_offset + size_t{envs} * sizeof(uint32_t))) {}
 };
 
+// Buckets only index entries that full keys then compare in stable order, so an env's entry
+// count bounds the bits they need.
+inline int BucketBits(uint32_t entries_per_env) {
+    int bits = 1;
+    while (bits < 32 && (uint64_t{1} << bits) < entries_per_env) ++bits;
+    return bits;
+}
+
 // Keys hold env, an invalid-tail bit, then the bucket; the index range keeps env below 2^30.
-inline int SortBits(uint32_t envs) {
-    int bits = 33;
+inline int SortBits(uint32_t envs, uint32_t entries_per_env) {
+    int bits = BucketBits(entries_per_env) + 1;
     for (uint32_t value = envs - 1u; value != 0u; value >>= 1u) ++bits;
     return bits;
 }
@@ -100,7 +108,7 @@ inline uint64_t ScratchBytes(uint32_t points, uint32_t envs) {
     cub::DoubleBuffer<uint64_t> keys(nullptr, nullptr);
     cub::DoubleBuffer<uint32_t> order(nullptr, nullptr);
     auto status = cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, keys, order,
-        static_cast<int>(points * 2u), 0, SortBits(envs));
+        static_cast<int>(points * 2u), 0, SortBits(envs, points / envs * 2u));
     if (status == cudaSuccess)
         status = cub::DeviceScan::ExclusiveScan(nullptr, scan_bytes,
             static_cast<const Ranks*>(nullptr), static_cast<Ranks*>(nullptr),
@@ -173,15 +181,15 @@ static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* vali
 
 // Unused tail slots sort after their env's entries, so each env keeps its fixed segment.
 static __global__ void BucketKeysKernel(KeySource source, uint32_t* order,
-                                        const uint32_t* ends, uint64_t* keys) {
+                                        const uint32_t* ends, int bucket_bits, uint64_t* keys) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= source.points * 2u) return;
     const uint32_t env = i / (source.points_per_env * 2u);
-    const uint64_t prefix = uint64_t{env} << 33u;
+    const uint64_t prefix = uint64_t{env} << (bucket_bits + 1);
     if (i < ends[env]) {
-        keys[i] = prefix | source.Bucket(order[i]);
+        keys[i] = prefix | (source.Bucket(order[i]) >> (32 - bucket_bits));
     } else {
-        keys[i] = prefix | (uint64_t{1u} << 32u);
+        keys[i] = prefix | (uint64_t{1u} << bucket_bits);
         order[i] = 0u;
     }
 }
@@ -250,11 +258,11 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
     cub::DoubleBuffer<uint64_t> key_buffers(workspace.keys, workspace.alternate_keys);
     cub::DoubleBuffer<uint32_t> order_buffers(workspace.order, workspace.alternate);
     BucketKeysKernel<<<blocks, block, 0u, stream>>>(keys, order_buffers.Current(),
-        workspace.ends, key_buffers.Current());
+        workspace.ends, BucketBits(points_per_env * 2u), key_buffers.Current());
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
     temp_bytes = workspace.temp_bytes;
     status = cub::DeviceRadixSort::SortPairs(workspace.temp, temp_bytes, key_buffers,
-        order_buffers, static_cast<int>(points * 2u), 0, SortBits(envs), stream);
+        order_buffers, static_cast<int>(points * 2u), 0, SortBits(envs, points_per_env * 2u), stream);
     if (status != cudaSuccess) return status;
     MergeGroupsKernel<<<blocks, block, 0u, stream>>>(keys,
         order_buffers.Current(), key_buffers.Current(), workspace.begins, workspace.ends,

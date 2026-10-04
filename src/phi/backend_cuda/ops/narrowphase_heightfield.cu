@@ -641,13 +641,6 @@ __global__ void NarrowphaseHeightfieldKernel(
             const ::nuka::nk::ContactId id = ::nuka::nk::MakeContactId(descriptor);
             ucontact_id_pair[at] = id.pair;
             ucontact_id_feature[at] = id.feature;
-        } else {
-            upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
-            ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
-            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
-            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
-            ucontact_id_pair[at] = 0u;
-            ucontact_id_feature[at] = 0u;
         }
     }
     if (kept > 0 && contact_count != nullptr) {

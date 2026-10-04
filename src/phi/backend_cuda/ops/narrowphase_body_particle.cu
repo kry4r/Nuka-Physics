@@ -393,24 +393,13 @@ __global__ void NarrowphaseBodyParticleKernel(
     // the rigid slots [0, pair_count). Initialize all reserved slots to inactive.
     const uint32_t slot0 = pp.particle_slot_base +
                            rank * pp.cands_per_particle;
-    for (uint32_t point = lane; point < pp.cands_per_particle * nk::kPairDrivenPtsPerSlot;
-         point += kWarp ? warpSize : 1u) {
-        const uint32_t slot = slot0 + point / nk::kPairDrivenPtsPerSlot;
+    // Readers bound a slot's points by its count, so only counts and laws are reset.
+    for (uint32_t candidate = lane; candidate < pp.cands_per_particle;
+         candidate += kWarp ? warpSize : 1u) {
+        const uint32_t slot = slot0 + candidate;
         if (slot >= pp.slot_stride) break;
-        const size_t cell = (static_cast<size_t>(env) * pp.slot_stride + slot) *
-            nk::kPairDrivenPtsPerSlot + point % nk::kPairDrivenPtsPerSlot;
-        if (point % nk::kPairDrivenPtsPerSlot == 0u) {
-            ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = 0u;
-            ucontact_law[static_cast<size_t>(env) * pp.slot_stride + slot] = nk::kContactLawSpeculative;
-        }
-        upoint[cell] = {0, 0, 0}; unormal[cell] = {0, 0, 0};
-        udepth[cell] = 0.0f;
-        ucontact_a[cell] = 0u; ucontact_b[cell] = 0u;
-        ucontact_a_kind[cell] = nk::kUContactSideBody;
-        ucontact_b_kind[cell] = nk::kUContactSideBody;
-        ucontact_gen[cell] = 0u;
-        ucontact_id_pair[cell] = 0u;
-        ucontact_id_feature[cell] = 0u;
+        ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = 0u;
+        ucontact_law[static_cast<size_t>(env) * pp.slot_stride + slot] = nk::kContactLawSpeculative;
     }
     if constexpr (kWarp) __syncwarp();
     if (N == 0u) return;  // uniform per-warp.

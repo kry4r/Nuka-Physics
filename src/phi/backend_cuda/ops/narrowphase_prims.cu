@@ -216,6 +216,7 @@ __global__ void PairDrivenNarrowphaseKernel(
     const uint32_t n = m.point_count;
     ucount[gid] = n;
 
+    // Every reader bounds a slot's points by its count, so points past it stay unwritten.
     for (uint32_t i = 0u; i < 4u; ++i) {
         const size_t at = static_cast<size_t>(gid) * 4u + i;
         if (i < n) {
@@ -247,13 +248,6 @@ __global__ void PairDrivenNarrowphaseKernel(
             const ::nuka::nk::ContactId id = ::nuka::nk::MakeContactId(descriptor);
             ucontact_id_pair[at] = id.pair;
             ucontact_id_feature[at] = id.feature;
-        } else {
-            upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
-            ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
-            ucontact_a_kind[at] = ::nuka::nk::kUContactSideBody;
-            ucontact_b_kind[at] = ::nuka::nk::kUContactSideBody;
-            ucontact_id_pair[at] = 0u;
-            ucontact_id_feature[at] = 0u;
         }
     }
     if (n > 0u && contact_count != nullptr) {
