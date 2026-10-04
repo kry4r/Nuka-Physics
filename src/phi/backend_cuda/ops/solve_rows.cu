@@ -121,7 +121,8 @@ constexpr uint32_t kControlOverflow = 12u;
 constexpr uint32_t kControlArticRows = 14u;
 constexpr uint32_t kControlScheduleChanged = 15u;
 constexpr uint32_t kControlHubRows = 16u;
-constexpr uint32_t kControlWords = 17u;
+constexpr uint32_t kControlIdleViolations = 17u;
+constexpr uint32_t kControlWords = 18u;
 // A dynamic body in more active rows than this is a hub: it owns none of them, stays frozen
 // within a sweep, and a Schur step couples its rows as it couples an articulation's.
 constexpr uint32_t kHubRows = 64u;
@@ -886,14 +887,13 @@ __device__ inline bool IsHubSide(const NkRowSide& side, const ColorScratch& s) {
     return side.kind == kNkSideRigid && side.index < s.bodies && s.hub_count[side.index] > kHubRows;
 }
 
-// A row joining an articulation to another dynamic body runs in the chain with both responses
-// applied at once; a frozen articulation would meet that body's inertia only through gains.
+// Articulation rows between heavy sides run in the chain: frozen rows corrected only on their
+// active set leave sliding friction uncoupled. Point-mass rows color with their own masses.
 __device__ inline bool IsSequentialArticRow(const NkRow& row, const ColorScratch& s) {
     if (IsHubSide(row.a, s) || IsHubSide(row.b, s)) return false;
-    const bool a = row.a.kind == kNkSideArtic;
-    const bool b = row.b.kind == kNkSideArtic;
-    if (a && b) return row.a.index != row.b.index;
-    return a != b && (a ? row.b : row.a).kind != kNkSideStatic;
+    const bool a = row.a.kind == kNkSideArtic, b = row.b.kind == kNkSideArtic;
+    if (a == b) return a;
+    return !PointMassView::IsPointSide((a ? row.b : row.a).kind);
 }
 
 // Rows the articulation Schur step couples; a block normal carries its tangents' impulses.
@@ -1642,8 +1642,13 @@ __device__ void CommitChainPoints(const ChainPointCache& cache, PointMassView po
     }
 }
 
-// Velocity test of an active row whose own and block impulses are all zero.
-__device__ bool RowVelocityNeedsSolveWarp(
+// The projected impulse of an active row's next step, and the velocity that step moves.
+struct IdleRowStep {
+    float impulse;
+    float velocity;
+};
+
+__device__ IdleRowStep IdleRowStepWarp(
     const NkRow* urows, const NkRow& row, uint32_t slot, uint32_t env_row_base,
     uint32_t env_artic_base, const float* lambda, const float* row_meff, const float* row_damping,
     const float* chain_jacobian, const float* chain_jacobian_b, const float* qdot,
@@ -1657,12 +1662,30 @@ __device__ bool RowVelocityNeedsSolveWarp(
     const float damping_scale = 1.0f / (1.0f + row_damping[slot] * dt);
     const float residual = row.rhs * dt * damping_scale - jv -
                            row.compliance_alpha * damping_scale * old_impulse;
-    if (row.flags & nk::nk_row_flags::kBlockNormal)
-        return constraint::ProjectedContactNormal(row.contact_response.xx, residual, old_impulse) != 0.0f;
+    if (row.flags & nk::nk_row_flags::kBlockNormal) {
+        const float impulse =
+            constraint::ProjectedContactNormal(row.contact_response.xx, residual, old_impulse);
+        return {impulse, fabsf(impulse - old_impulse) * row.contact_response.xx};
+    }
     const float effective_mass = row_meff[slot];
     const float implicit_mass = effective_mass /
         (1.0f - effective_mass * row.compliance_alpha * (1.0f - damping_scale));
-    return fminf(fmaxf(old_impulse + implicit_mass * residual, row.lower), row.upper) != 0.0f;
+    const float impulse =
+        fminf(fmaxf(old_impulse + implicit_mass * residual, row.lower), row.upper);
+    const float step = fabsf(impulse - old_impulse);
+    return {impulse, effective_mass > 0.0f ? step / effective_mass : step};
+}
+
+// Velocity test of an active row whose own and block impulses are all zero.
+__device__ bool RowVelocityNeedsSolveWarp(
+    const NkRow* urows, const NkRow& row, uint32_t slot, uint32_t env_row_base,
+    uint32_t env_artic_base, const float* lambda, const float* row_meff, const float* row_damping,
+    const float* chain_jacobian, const float* chain_jacobian_b, const float* qdot,
+    const math::Vec3* body_lin_vel, const math::Vec3* body_ang_vel,
+    PointMassView point_masses, uint32_t dof_stride, float dt, uint32_t lane) {
+    return IdleRowStepWarp(urows, row, slot, env_row_base, env_artic_base, lambda, row_meff,
+        row_damping, chain_jacobian, chain_jacobian_b, qdot, body_lin_vel, body_ang_vel,
+        point_masses, dof_stride, dt, lane).impulse != 0.0f;
 }
 
 __device__ bool RowNeedsVelocitySolveWarp(
@@ -3284,6 +3307,7 @@ struct LivePrepareArgs {
     float dt = 0.0f;
     float pos_slop = 0.0f;
     bool reuse_schedule = false;
+    bool verify_idle = false;
 };
 
 // The first owner_cache_slots positions of each warp keep their owners in shared memory, one per
@@ -3416,13 +3440,17 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t threads = gridDim.x * blockDim.x;
+    // A verifying pass keeps the schedule it continues unless an idle row broke.
+    if (prep.verify_idle && s.control[kControlIdleViolations] == 0u) return;
     const uint32_t previous_live = prep.reuse_schedule ? s.control[kControlLive] : 0u;
     if (thread == 0u) {
         s.control[kControlValidRows] = 0u;
         s.control[kControlScheduleChanged] = prep.reuse_schedule ? 0u : 1u;
     }
-    for (uint32_t i = thread; i < prep.total_rows; i += threads)
-        activity.needs_solve[i] &= ~kIslandNeedsSolve;
+    // Islands stay active through verification, so every one still advances its positions.
+    if (!prep.verify_idle)
+        for (uint32_t i = thread; i < prep.total_rows; i += threads)
+            activity.needs_solve[i] &= ~kIslandNeedsSolve;
     grid.sync();
 
     MarkLiveRows(urows, points, activity, live_scan, s, prep);
@@ -3477,7 +3505,9 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     grid.sync();
 
     const uint32_t live = s.control[kControlLive];
-    for (uint32_t i = thread; i < s.artic_dofs; i += threads) s.qdot_error[i] = 0.0f;
+    // Verification continues the compensated articulation velocities it inherits.
+    if (!prep.verify_idle)
+        for (uint32_t i = thread; i < s.artic_dofs; i += threads) s.qdot_error[i] = 0.0f;
     if (thread < 3u) s.control[kControlChanged + thread] = 0u;
     if (LoadControl(s.control + kControlScheduleChanged) == 0u) {
         PackLaneRecords(urows, points, s, prep.row_meff, prep.row_damping, prep.dt);
@@ -4024,6 +4054,8 @@ struct ColoredSolveArgs {
     nkops::VertexBlockView vertex_blocks;
     uint32_t* vbd_velocity_sweep_count = nullptr;
     uint32_t* solver_color_counts = nullptr;
+    uint64_t* solver_phase_time = nullptr;
+    uint32_t env_count = 0u;
     uint32_t rows_per_env = 0u;
     uint32_t artics_per_env = 0u;
     uint32_t articulation_count = 0u;
@@ -4037,9 +4069,23 @@ struct ColoredSolveArgs {
     float vel_tolerance = 0.0f;
     float baumgarte_max_velocity = 0.0f;
     bool apply_cached = false;
+    bool verify_idle = false;
 };
 
 enum class ChainSweep : uint32_t { WarmStart, Velocity, Position };
+
+// Words of solver_color_counts, and the timed phases of solver_phase_time in order.
+constexpr uint32_t kSolverCountWords = 6u;
+enum SolverPhase : uint32_t {
+    kPhaseWarmStart, kPhaseVertex, kPhaseColor, kPhaseChain, kPhaseSchur, kPhaseHub,
+    kPhaseStationary, kPhasePosition, kSolverPhases
+};
+
+__device__ inline uint64_t GlobalNanoseconds() {
+    uint64_t now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    return now;
+}
 
 __host__ __device__ inline uint32_t TriangleIndex(uint32_t row, uint32_t col, uint32_t n) {
     return row * (2u * n - row + 1u) / 2u + (col - row);
@@ -4170,13 +4216,34 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
     const uint32_t chain_islands = s.control[kControlChainIslands];
     const uint32_t live = s.control[kControlLive];
     const bool pos_pass = a.pos_iters > 0u && a.row_penetration != nullptr;
-    if (a.solver_color_counts != nullptr) {
-        for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
-             env < a.vertex_blocks.layout.env_count; env += gridDim.x * blockDim.x) {
-            a.solver_color_counts[2u * env] = a.vertex_blocks.layout.colors;
-            a.solver_color_counts[2u * env + 1u] = colors;
+    if (a.solver_color_counts != nullptr && blockIdx.x == 0u && threadIdx.x == 0u) {
+        // One block runs each island's chain rows in order, so the longest island paces a sweep.
+        uint32_t longest = 0u;
+        for (uint32_t k = 0u; k < chain_islands; ++k) {
+            const IslandRecord rec =
+                reinterpret_cast<const IslandRecord*>(a.islands)[s.chain_islands[k]];
+            const uint32_t live_off = rec.seg_off == 0u ? 0u : a.live_scan[rec.seg_off - 1u];
+            longest = max(longest, s.chain_excl[a.live_scan[rec.seg_off + rec.seg_cnt - 1u]] -
+                                   s.chain_excl[live_off]);
         }
+        const uint32_t counts[kSolverCountWords] = {a.vertex_blocks.layout.colors, colors,
+            s.chain_excl[live], chain_islands, longest, s.control[kControlArticRows]};
+        for (uint32_t env = 0u; env < a.env_count; ++env)
+            for (uint32_t k = 0u; k < kSolverCountWords; ++k)
+                a.solver_color_counts[kSolverCountWords * env + k] = counts[k];
     }
+    // Shared, so the timing thread adds no registers to the sweeps.
+    __shared__ unsigned long long phase_time[kSolverPhases];
+    const bool timed = a.solver_phase_time != nullptr && blockIdx.x == 0u && threadIdx.x == 0u;
+    if (timed)
+        for (uint32_t k = 0u; k < kSolverPhases; ++k) phase_time[k] = 0ull;
+    uint64_t phase_mark = timed ? GlobalNanoseconds() : 0u;
+    const auto lap = [&](uint32_t phase) {
+        if (!timed) return;
+        const uint64_t now = GlobalNanoseconds();
+        phase_time[phase] += now - phase_mark;
+        phase_mark = now;
+    };
     const PointMassView pseudo_points = a.points.Pseudo(a.particle_pseudo, a.grid_pseudo);
     bool changed = false;
 
@@ -4961,9 +5028,11 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         }
     };
 
-    if (schur) schur_snapshot(false, a.apply_cached);
-    if (hubs) hub_snapshot(false, a.apply_cached);
-    if (a.apply_cached) {
+    // A verifying pass sweeps velocity only when the solved velocity broke an idle row.
+    const bool sweep_velocity = !a.verify_idle || s.control[kControlIdleViolations] != 0u;
+    if (sweep_velocity && schur) schur_snapshot(false, a.apply_cached);
+    if (sweep_velocity && hubs) hub_snapshot(false, a.apply_cached);
+    if (sweep_velocity && a.apply_cached) {
         color_sweep([&](uint32_t slot, uint32_t env, NkRow* staged) {
             SolveUnionRowWarp(slot - env * a.rows_per_env, slot, env * a.rows_per_env,
                 env * k_tiles, slot, wlane, nullptr, nullptr, nullptr, nullptr, a.lambda,
@@ -4982,13 +5051,15 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
         schur_step(false, false);
         hub_step(false, false);
     }
+    lap(kPhaseWarmStart);
     uint32_t completed_sweeps = 0u;
-    for (uint32_t it = 0u; it < a.vel_iters; ++it) {
+    for (uint32_t it = 0u; sweep_velocity && it < a.vel_iters; ++it) {
         completed_sweeps = it + 1u;
         if (blockIdx.x == 0u && threadIdx.x == 0u)
             s.control[kControlChanged + (it + 1u) % 3u] = 0u;
         changed = false;
         vertex_sweep();
+        lap(kPhaseVertex);
         color_sweep([&](uint32_t slot, uint32_t env, NkRow* staged) {
             const uint32_t env_row_base = env * a.rows_per_env;
             float* const qdot = env_qdot(a.qdot_flat, env);
@@ -5016,13 +5087,17 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
             changed |= SolveMaterialBlockGroup<kPairRowWidth>(slot, a.urows[slot], a.urows,
                 a.lambda, a.points, a.dt, false, a.vel_tolerance, a.error, lane, mask);
         });
+        lap(kPhaseColor);
         chain_sweep(ChainSweep::Velocity);
         uint32_t* const flag = s.control + kControlChanged + it % 3u;
         if (__syncthreads_or(changed) && threadIdx.x == 0u) atomicOr(flag, 1u);
         grid.sync();
+        lap(kPhaseChain);
         bool more = LoadControl(flag) != 0u;
         schur_step(false, more && it + 1u < a.vel_iters);
+        lap(kPhaseSchur);
         hub_step(false, more && it + 1u < a.vel_iters);
+        lap(kPhaseHub);
         if (!more && blocks.layout.vertices != 0u) {
             bool nonstationary = false;
             for (uint32_t item = color_warp;
@@ -5036,12 +5111,13 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
             grid.sync();
             more = LoadControl(flag) != 0u;
         }
+        lap(kPhaseStationary);
         if (!more) break;
     }
     if (a.vbd_velocity_sweep_count != nullptr) {
         for (uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
-             env < a.vertex_blocks.layout.env_count; env += gridDim.x * blockDim.x)
-            a.vbd_velocity_sweep_count[env] = completed_sweeps;
+             env < a.env_count; env += gridDim.x * blockDim.x)
+            a.vbd_velocity_sweep_count[env] += completed_sweeps;
     }
 
     // Penetration drives a fresh pseudo-velocity field over the same colors and chains.
@@ -5085,6 +5161,12 @@ __global__ void __launch_bounds__(kColorBlockSize) SolveColoredRowsKernel(Colore
             schur_step(true, it + 1u < a.pos_iters);
             hub_step(true, it + 1u < a.pos_iters);
         }
+    }
+    lap(kPhasePosition);
+    if (timed) {
+        for (uint32_t env = 0u; env < a.env_count; ++env)
+            for (uint32_t k = 0u; k < kSolverPhases; ++k)
+                a.solver_phase_time[size_t{env} * kSolverPhases + k] += phase_time[k];
     }
 
     // Every articulation tile scatters through the cooked DOF maps, solved or not.
@@ -5152,8 +5234,9 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
     args.row_minv_jt_b = static_cast<const float*>(data.row_minv_jt_b);
     args.row_meff = static_cast<const float*>(data.row_meff);
     args.row_damping = static_cast<const float*>(data.row_damping);
-    args.articulation_mass = data.m;
-    args.articulation_mass_inv = data.m_inv;
+    // Mimic couplings leave the reduced mass, with empty coupled rows, and the coupled inverse.
+    args.articulation_mass = p.mimic_couplings != 0u ? data.m_reduced : data.m;
+    args.articulation_mass_inv = p.mimic_couplings != 0u ? data.m_inv_coupled : data.m_inv;
     args.qdot_flat = data.qdot_flat;
     args.link_velocity = reinterpret_cast<Spatial6*>(data.link_velocity);
     args.qdot = data.qdot;
@@ -5185,22 +5268,26 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
     args.error = error;
     args.vbd_velocity_sweep_count = data.vbd_velocity_sweep_count;
     args.solver_color_counts = data.solver_color_counts;
+    args.solver_phase_time = data.solver_phase_time;
+    args.env_count = p.env_count;
     if (p.vertex_blocks.colors != 0u) {
         if (data.particle_response == nullptr || data.particle_row_impulse == nullptr ||
             model.vbd_color_segments == nullptr ||
-            data.vbd_target == nullptr || data.vbd_inertia == nullptr || data.vbd_step == nullptr ||
+            data.vbd_free_rate == nullptr || data.vbd_inertia == nullptr || data.vbd_step == nullptr ||
             (p.rows_per_env != 0u && data.cc_particle_first == nullptr))
             return Status::InvalidArgument;
         nkops::VertexBlockView& blocks = args.vertex_blocks;
         blocks.elements = model.vbd_elements;
+        blocks.membrane_start = data.vbd_membrane_start;
         blocks.offsets = model.vbd_incidence_offsets;
         blocks.incidence = model.vbd_incidence;
         blocks.color_vertices = model.vbd_color_vertices;
         blocks.color_segments = model.vbd_color_segments;
         blocks.start = data.particle_prev_pos;
-        blocks.target = data.vbd_target;
+        blocks.free_rate = data.vbd_free_rate;
         blocks.inertia = data.vbd_inertia;
         blocks.effective_step = data.vbd_step;
+        blocks.solver_audit = p.measure_vertex_audit != 0u ? data.vbd_solve_audit : nullptr;
         blocks.row_first = p.rows_per_env != 0u ? data.cc_particle_first : nullptr;
         blocks.env_status = data.env_status;
         blocks.layout = p.vertex_blocks;
@@ -5219,6 +5306,7 @@ Status SolveColoredIslands(const ModelView& model, const DataView& data,
     args.vel_tolerance = p.vel_tolerance;
     args.baumgarte_max_velocity = p.baumgarte_max_velocity;
     args.apply_cached = p.continue_impulses == 0u;
+    args.verify_idle = p.verify_idle != 0u;
     if (LaunchCooperativeCuda(SolveColoredRowsKernel, dim3(solve_blocks), dim3(kColorBlockSize),
             solve_shared, stream, args, scratch) != cudaSuccess)
         return Status::Failed;
@@ -5263,6 +5351,50 @@ __global__ void UpdateIdlePenetrationKernel(
     }
 }
 
+// Rows an active island left idle are tested at the solved velocity; a row whose next step
+// would move it beyond the sweep tolerance counts as broken.
+__global__ void CountViolatedIdleRowsKernel(
+    const NkRow* __restrict__ urows, const float* __restrict__ lambda,
+    const float* __restrict__ row_meff, const float* __restrict__ row_damping,
+    const float* __restrict__ chain_jacobian, const float* __restrict__ chain_jacobian_b,
+    const float* __restrict__ qdot_flat, const math::Vec3* __restrict__ body_lin_vel,
+    const math::Vec3* __restrict__ body_ang_vel, PointMassView point_masses,
+    const uint32_t* __restrict__ islands, const uint32_t* __restrict__ island_count_dev,
+    IslandActivityView activity, const uint32_t* __restrict__ row_order,
+    const uint32_t* __restrict__ live_scan, uint32_t* __restrict__ violations,
+    uint32_t rows_per_env, uint32_t artics_per_env, uint32_t dof_stride, float dt,
+    float vel_tolerance) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    const uint32_t stride = gridDim.x * (blockDim.x / warpSize);
+    const uint32_t k_tiles = artics_per_env == 0u ? 1u : artics_per_env;
+    const uint32_t island_count = *island_count_dev;
+    uint32_t broken = 0u;
+    for (uint32_t island = 0u; island < island_count; ++island) {
+        const IslandRecord rec = reinterpret_cast<const IslandRecord*>(islands)[island];
+        if (!(rec.flags & kIslandWarpWork) || !activity.Active(rec)) continue;
+        const uint32_t env_artic_base = rec.env * k_tiles;
+        const float* const qdot = qdot_flat != nullptr
+            ? qdot_flat + static_cast<size_t>(env_artic_base) * dof_stride : nullptr;
+        const uint32_t end = rec.seg_off + rec.seg_cnt;
+        for (uint32_t idx = rec.seg_off + (warp + stride - rec.seg_off % stride) % stride;
+             idx < end; idx += stride) {
+            if (live_scan[idx] != (idx == 0u ? 0u : live_scan[idx - 1u])) continue;
+            const uint32_t slot = row_order[idx];
+            const uint32_t flags = urows[slot].flags;
+            if (!(flags & nk::nk_row_flags::kActive) || (flags & nk::nk_row_flags::kBlockTangent))
+                continue;
+            const NkRow row = LoadRowWarp(urows, slot, lane);
+            const IdleRowStep step = IdleRowStepWarp(urows, row, slot, rec.env * rows_per_env,
+                env_artic_base, lambda, row_meff, row_damping, chain_jacobian, chain_jacobian_b,
+                qdot, body_lin_vel, body_ang_vel, point_masses, dof_stride, dt, lane);
+            if (vel_tolerance > 0.0f ? step.velocity > vel_tolerance : step.impulse != 0.0f)
+                ++broken;
+        }
+    }
+    if (lane == 0u && broken != 0u) atomicAdd(violations, broken);
+}
+
 // Expose lower/upper impulses independently from contact and actuator telemetry.
 __global__ void WriteJointLimitImpulseKernel(
     const float* __restrict__ lambda, uint32_t total_link_count,
@@ -5290,11 +5422,13 @@ __global__ void MeasureVertexResidualKernel(ModelView model, DataView data,
     const uint32_t stride = gridDim.x * (blockDim.x / warpSize);
     nkops::VertexBlockView b;
     b.elements = model.vbd_elements;
+    b.membrane_start = data.vbd_membrane_start;
     b.offsets = model.vbd_incidence_offsets;
     b.incidence = model.vbd_incidence;
     b.start = data.particle_prev_pos;
-    b.target = data.vbd_target;
+    b.free_rate = data.vbd_free_rate;
     b.inertia = data.vbd_inertia;
+    b.solver_audit = p.measure_vertex_audit != 0u ? data.vbd_solve_audit : nullptr;
     b.layout = p.vertex_blocks;
     b.dt = p.dt;
     for (uint32_t item = warp; item < b.layout.dynamic_vertices * b.layout.env_count; item += stride) {
@@ -5313,12 +5447,13 @@ __global__ void MeasureVertexResidualKernel(ModelView model, DataView data,
         const math::Vec3 u = data.particle_vel[particle] -
             (particle_error != nullptr ? particle_error[particle] : math::Vec3{});
         const float inertia = b.inertia[slot];
-        const math::Vec3 force = (u * b.dt - b.target[slot]) * -inertia - gradient +
+        const math::Vec3 force = -nk::vbd::InertialGradient(u, b.free_rate[slot], inertia, b.dt) - gradient +
                                 data.particle_row_impulse[particle] / b.dt;
         nk::vbd::AddIdentity(hessian, inertia);
         math::SymmetricMat3 inverse;
         const bool invertible = nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse);
         const math::Vec3 correction = invertible ? inverse.Multiply(force) / b.dt : math::Vec3{};
+        nkops::RecordVertexEquationAudit(b, env, vertex, force, correction);
         const auto magnitude = [](math::Vec3 v) {
             if (!(fabsf(v.x) <= FLT_MAX && fabsf(v.y) <= FLT_MAX && fabsf(v.z) <= FLT_MAX))
                 return FLT_MAX;
@@ -5392,17 +5527,36 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
+    // Deferred positions and verification continue the dynamic schedule of the same step.
+    if ((p->position_later != 0u || p->verify_idle != 0u) &&
+        (p->family != kContactFamilyPairDriven || p->force_static_islands != 0u ||
+         (p->position_later != 0u && p->pos_iters != 0u) ||
+         (p->verify_idle != 0u && p->continue_impulses == 0u)))
+        return Status::InvalidArgument;
     const uint64_t row_capacity = uint64_t{p->rows_per_env} * p->env_count;
     if (row_capacity > uint64_t{kOwnerEmpty} -
             uint64_t{kColorGridLimit} * kColorBlockSize)
         return Status::InvalidArgument;
+    // A verifying pass adds its sweeps and phase times to those of the pass it continues.
+    if (p->measure_vertex_audit != 0u && p->vertex_blocks.vertices > 0u &&
+        (data.vbd_solve_audit == nullptr || cudaMemsetAsync(data.vbd_solve_audit, 0,
+            size_t{p->vertex_blocks.vertices} * p->env_count * nk::kVbdSolveAuditColumnCount * sizeof(float),
+            stream) != cudaSuccess)) return Status::Failed;
     if (data.vbd_velocity_sweep_count == nullptr ||
-        cudaMemsetAsync(data.vbd_velocity_sweep_count, 0,
-                        size_t{p->env_count} * sizeof(uint32_t), stream) != cudaSuccess)
+        (p->verify_idle == 0u &&
+         cudaMemsetAsync(data.vbd_velocity_sweep_count, 0,
+                         size_t{p->env_count} * sizeof(uint32_t), stream) != cudaSuccess))
         return Status::Failed;
     if (data.solver_color_counts == nullptr ||
         cudaMemsetAsync(data.solver_color_counts, 0,
-                        size_t{p->env_count} * 2u * sizeof(uint32_t), stream) != cudaSuccess)
+                        size_t{p->env_count} * kSolverCountWords * sizeof(uint32_t),
+                        stream) != cudaSuccess)
+        return Status::Failed;
+    if (data.solver_phase_time == nullptr ||
+        (p->verify_idle == 0u &&
+         cudaMemsetAsync(data.solver_phase_time, 0,
+                         size_t{p->env_count} * kSolverPhases * sizeof(uint64_t),
+                         stream) != cudaSuccess))
         return Status::Failed;
     if (p->measure_contact_residual != 0u) {
         if (data.contact_solve_metrics == nullptr || data.contact_solve_counts == nullptr)
@@ -5432,7 +5586,9 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             (error_bytes > 0u && data.solver_velocity_scratch == nullptr)) return Status::InvalidArgument;
         VelocityErrorView error;
         if (error_bytes > 0u) {
-            if (cudaMemsetAsync(data.solver_velocity_scratch, 0, error_bytes, stream) != cudaSuccess)
+            // Verification keeps the compensation of the velocities it continues.
+            if (p->verify_idle == 0u &&
+                cudaMemsetAsync(data.solver_velocity_scratch, 0, error_bytes, stream) != cudaSuccess)
                 return Status::Failed;
             error.body_linear = reinterpret_cast<math::Vec3*>(data.solver_velocity_scratch);
             error.body_angular = error.body_linear + p->total_body_count;
@@ -5464,6 +5620,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
         const uint32_t qdot_floats = static_cast<uint32_t>(qdot_count);
         // Split-impulse position pass runs ONLY on the PairDriven path (pos_iters>0).
         const bool pos_pass = (p->pos_iters > 0u) && with_b_arm;
+        // Rows a later pass will project go live now, so the velocity sweeps include them.
+        const bool penetration_live = pos_pass || p->position_later != 0u;
         // Static schedules solve each island on one block with its optional row cache.
         const size_t shared_bytes = IslandSharedBytes(p->rows_per_env, p->max_dof,
                                                       qdot_floats, !with_b_arm, pos_pass);
@@ -5547,8 +5705,8 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             prep.row_order = data.island_rows;
             prep.cc_root = data.cc_root;
             prep.cc_artic_first = p->articulation_count > 0u ? data.cc_artic_first : nullptr;
-            prep.row_penetration = pos_pass ? data.row_penetration : nullptr;
-            prep.row_pseudo_lambda = pos_pass ? data.row_pseudo_lambda : nullptr;
+            prep.row_penetration = penetration_live ? data.row_penetration : nullptr;
+            prep.row_pseudo_lambda = penetration_live ? data.row_pseudo_lambda : nullptr;
             prep.total_rows = total_rows;
             prep.rows_per_env = p->rows_per_env;
             prep.artics_per_env = artics_per_env;
@@ -5557,6 +5715,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             prep.dt = p->dt;
             prep.pos_slop = p->pos_slop;
             prep.reuse_schedule = p->continue_impulses != 0u;
+            prep.verify_idle = p->verify_idle != 0u;
             // Preparing is a chain of dependent loads per row, so it fills every resident slot.
             // Owner caches take the shared memory those resident blocks leave unused.
             size_t spare_shared = 0u;
@@ -5571,7 +5730,30 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             if (ResidentGridSize(PrepareLiveColorsKernel, kColorBlockSize, owner_cache_bytes,
                                  kColorGridLimit, &prepare_blocks) != cudaSuccess)
                 return Status::Failed;
-            if (scratch.bodies != 0u) {
+            if (p->verify_idle != 0u) {
+                constexpr uint32_t verify_block_size = 128u;
+                uint32_t verify_blocks = 0u;
+                uint32_t* const violations = scratch.control + kControlIdleViolations;
+                if (cudaMemsetAsync(violations, 0, sizeof(uint32_t), stream) != cudaSuccess ||
+                    ResidentGridSize(CountViolatedIdleRowsKernel, verify_block_size, 0u,
+                        (total_rows + verify_block_size / 32u - 1u) / (verify_block_size / 32u),
+                        &verify_blocks) != cudaSuccess)
+                    return Status::Failed;
+                LaunchCuda(CountViolatedIdleRowsKernel, dim3(verify_blocks),
+                    dim3(verify_block_size), 0u, stream,
+                    reinterpret_cast<const NkRow*>(data.urows), data.lambda,
+                    static_cast<const float*>(data.row_meff),
+                    static_cast<const float*>(data.row_damping),
+                    static_cast<const float*>(data.chain_jacobian),
+                    static_cast<const float*>(data.chain_jacobian_b), data.qdot_flat,
+                    data.body_linear_velocity, data.body_angular_velocity, PointMasses(data),
+                    data.island_quads, data.island_count, activity, data.island_rows, live_scan,
+                    violations, p->rows_per_env, artics_per_env, p->max_dof, p->dt,
+                    p->vel_tolerance);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            }
+            // Verification continues the same rows, so the hub masses it inherits still hold.
+            if (scratch.bodies != 0u && p->verify_idle == 0u) {
                 if (cudaMemsetAsync(scratch.hub_count, 0, sizeof(uint32_t) * scratch.bodies,
                                     stream) != cudaSuccess)
                     return Status::Failed;
@@ -5597,6 +5779,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 return Status::Failed;
             const uint32_t scalar_blocks = max_island_bound < kScalarIslandGridBlocks
                 ? max_island_bound : kScalarIslandGridBlocks;
+            // Scalar islands sweep every row they hold, so verification only projects them.
             LaunchCuda(
                 SolveRowsScalarIslandsKernel, dim3(scalar_blocks),
                 dim3(kScalarIslandBlockSize), 0u, stream,
@@ -5615,7 +5798,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
                 pos_pass ? data.particle_pseudo_vel : nullptr,
                 pos_pass ? data.grid_pseudo_vel : nullptr,
                 data.island_count, activity, p->rows_per_env, artics_per_env,
-                static_cast<uint32_t>(p->vel_iters),
+                p->verify_idle != 0u ? 0u : static_cast<uint32_t>(p->vel_iters),
                 static_cast<uint32_t>(p->pos_iters),
                 p->pos_beta, p->pos_slop, p->dt,
                 p->baumgarte_max_velocity, p->continue_impulses == 0u, error);
