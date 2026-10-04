@@ -68,10 +68,8 @@ __device__ void TangentBasis(math::Vec3 n, math::Vec3* t1, math::Vec3* t2) {
     *t2 = tangent_b;
 }
 
-// C4: tangent basis over the UNIFIED contact buffer. One thread per contact slot;
-// for each of the <=4 manifold points (ucontact_count[slot]) build (t1,t2) from
-// ucontact_normal (elem:4). Inactive points (i >= count) get zero tangents.
-// Deterministic (per-point, element-independent), so two runs are byte-identical.
+// One thread per contact slot builds (t1,t2) for each of its counted manifold points;
+// readers bound points by the count, so points past it stay unwritten.
 __global__ void ComputeUnionContactTangentBasisKernel(
     const uint32_t* ucontact_count,
     const math::Vec3* ucontact_normal,   // elem:4 per slot
@@ -81,18 +79,13 @@ __global__ void ComputeUnionContactTangentBasisKernel(
     const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= slot_count) return;
     const uint32_t n = ucontact_count[slot];
-    for (uint32_t i = 0u; i < 4u; ++i) {
+    for (uint32_t i = 0u; i < n && i < 4u; ++i) {
         const size_t at = static_cast<size_t>(slot) * 4u + i;
-        if (i < n) {
-            const math::Vec3 normal = NormalizeOrUpLocal(ucontact_normal[at]);
-            math::Vec3 t1, t2;
-            TangentBasis(normal, &t1, &t2);
-            out_tangent1[at] = t1;
-            out_tangent2[at] = t2;
-        } else {
-            out_tangent1[at] = {0.0f, 0.0f, 0.0f};
-            out_tangent2[at] = {0.0f, 0.0f, 0.0f};
-        }
+        const math::Vec3 normal = NormalizeOrUpLocal(ucontact_normal[at]);
+        math::Vec3 t1, t2;
+        TangentBasis(normal, &t1, &t2);
+        out_tangent1[at] = t1;
+        out_tangent2[at] = t2;
     }
 }
 

@@ -23,6 +23,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 #include "constraint/solref_solimp.hpp"  // ComputeCompliantRow (HD)
 #include "nk/contact/contact_profile.hpp"
 #include "nk/solve/collidable_owner.hpp"
@@ -366,34 +368,43 @@ __global__ void PackQdotFlatKernel(const Spatial6* __restrict__ link_velocity,
 // EmitUnionRowsKernel (the UnionCsr K2 row emitter) was DELETED here. The
 // ONE general path emits its rows via EmitPairDrivenRowsKernel below.
 
-// K1 (PairDriven): pack the per-ARTICULATION flat qdot tiles. One thread per
-// (global artic x DOF). dof_to_link/component are the per:dog TEMPLATE map; for
-// co-resident dog a the same template-local (link, component) applies to the
-// articulation's links, which live contiguously at a*links_per_dog within the env
-// (the multi-dog cook concatenates dogs' links). At K==1 (k_tiles == 1) this is
-// EXACTLY the legacy PackQdotFlat (env tile 0).
-__global__ void PackQdotFlatMultiKernel(const Spatial6* __restrict__ link_velocity,
-                                        const float* __restrict__ qdot,
-                                        const uint32_t* __restrict__ dof_to_link,
-                                        const uint32_t* __restrict__ dof_to_component,
-                                        uint32_t artic_count, uint32_t dof_stride,
-                                        uint32_t base_link_count, uint32_t k_tiles,
+// Each articulation's flat velocity tile follows its actual joint DOF prefix; padding is zero.
+__global__ void PackQdotFlatMultiKernel(ArticulationDeviceState state, uint32_t dof_stride,
                                         float* __restrict__ qdot_flat) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t total = artic_count * dof_stride;
+    const uint32_t total = state.articulation_count * dof_stride;
     if (gid >= total) return;
-    const uint32_t ag = gid / dof_stride;          // global articulation
-    const uint32_t k = gid - ag * dof_stride;      // DOF within tile
-    const uint32_t kt = (k_tiles == 0u) ? 1u : k_tiles;
-    const uint32_t env = ag / kt;
-    const uint32_t a = ag - env * kt;              // env-local artic
-    const uint32_t links_per_dog = base_link_count / kt;
-    const size_t tmpl = static_cast<size_t>(env) * dof_stride + k;  // per:dof template idx
-    const uint32_t tmpl_link = dof_to_link[tmpl];
-    const uint32_t comp = dof_to_component[tmpl];
-    const uint32_t link = tmpl_link + a * links_per_dog;
-    const size_t gl = static_cast<size_t>(env) * base_link_count + link;
-    qdot_flat[gid] = (comp != ~0u) ? link_velocity[gl].v[comp] : qdot[gl];
+    const uint32_t articulation = gid / dof_stride;
+    const uint32_t dof = gid - articulation * dof_stride;
+    uint32_t link = ~0u, component = ~0u;
+    if (!ArticulationDofLocation(state, articulation, dof, &link, &component)) {
+        qdot_flat[gid] = 0.0f;
+        return;
+    }
+    qdot_flat[gid] = component != ~0u ? state.link_velocity[link].v[component] : state.qdot[link];
+}
+
+// A coupled DOF moves with its root, v_t = s v_root, so each row's Jacobian folds onto the
+// root columns, J <- J Z. Root columns are never folded themselves, so the order is fixed.
+template <bool side_b>
+__global__ void FoldMimicJacobianKernel(const NkRow* __restrict__ urows,
+                                        const uint32_t* __restrict__ root_dof,
+                                        const float* __restrict__ root_scale,
+                                        uint32_t total_rows,
+                                        uint32_t dof_stride,
+                                        float* __restrict__ chain_jacobian) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= total_rows || !(urows[row].flags & nk::nk_row_flags::kActive)) return;
+    const NkRowSide& endpoint = side_b ? urows[row].b : urows[row].a;
+    if (endpoint.kind != kNkSideArtic) return;
+    const size_t tile = size_t{endpoint.index} * dof_stride;
+    float* const jacobian = chain_jacobian + size_t{row} * dof_stride;
+    for (uint32_t k = 0u; k < dof_stride; ++k) {
+        const uint32_t root = root_dof[tile + k];
+        if (root == k || root >= dof_stride) continue;
+        jacobian[root] += root_scale[tile + k] * jacobian[k];
+        jacobian[k] = 0.0f;
+    }
 }
 
 // A warp screens consecutive rows, then evaluates each active articulation row in DOF order.
@@ -523,6 +534,34 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
 // Particle systems have no collidable profile row, so they use the canonical
 // model defaults with only their authored per-system isotropic friction replaced.
 
+// One thread per footprint row: clears every pair-driven row; occupied slots are re-emitted.
+// Clear flags are left untouched so empty 128-byte rows avoid partial-sector writes.
+__global__ void ClearPairDrivenRowsKernel(
+    uint32_t env_count, uint32_t slot_count, uint32_t full_row_slot_count, uint32_t rows_per_env,
+    NkRow* __restrict__ urows, float* __restrict__ lambda,
+    uint32_t* __restrict__ row_cj_link, uint32_t* __restrict__ row_cj_link_b,
+    float* __restrict__ row_penetration, float* __restrict__ row_damping,
+    uint64_t* __restrict__ contact_material) {
+    const uint32_t full_slots = min(full_row_slot_count, slot_count);
+    const uint32_t footprint =
+        full_slots * kPdRowsPerSlot + (slot_count - full_slots) * kPdParticleRowsPerSlot;
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * footprint;
+         item += stride) {
+        const uint32_t env = item / footprint;
+        const uint32_t row = env * rows_per_env + (item - env * footprint);
+        lambda[row] = 0.0f;
+        row_penetration[row] = 0.0f;
+        row_damping[row] = 0.0f;
+        row_cj_link[row] = kInvalidLink;
+        row_cj_link_b[row] = kInvalidLink;
+        if (urows[row].flags != 0u) urows[row].flags = 0u;
+    }
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * slot_count;
+         item += stride)
+        contact_material[item] = 0u;
+}
+
 // One thread per (env x candidate slot). Emits the slot's NkRow block from the
 // unified manifold. Uses ComputeCompliantRow and the canonical tangent basis
 // shared with warm-start persistence; side A/B are the candidate collidables.
@@ -583,6 +622,8 @@ __global__ void EmitPairDrivenRowsKernel(
              : slot * kPdRowsPerSlot);
 
     uint32_t n_active = ucontact_count[gid];
+    // An empty slot keeps the rows ClearPairDrivenRowsKernel cleared.
+    if (n_active == 0u) return;
     const uint32_t law = ucontact_law != nullptr ? ucontact_law[gid] : nk::kContactLawCompliant;
     const bool speculative = law == nk::kContactLawSpeculative;
     const bool velocity_only = law == nk::kContactLawVelocity || speculative;
@@ -759,7 +800,8 @@ __global__ void EmitPairDrivenRowsKernel(
                 }
                 ++active_rows;
             }
-            urows[rs] = row;
+            if (row.flags & nk::nk_row_flags::kActive) urows[rs] = row;
+            else urows[rs].flags = 0u;
         }
 
         // ---- tangent rows ----------------------------------------------------
@@ -800,7 +842,8 @@ __global__ void EmitPairDrivenRowsKernel(
                 }
                 ++active_rows;
             }
-            urows[rs] = row;
+            if (row.flags & nk::nk_row_flags::kActive) urows[rs] = row;
+            else urows[rs].flags = 0u;
         }
     }
     if (active_rows > 0u) atomicAdd(&row_count[env], active_rows);
@@ -813,7 +856,7 @@ __global__ void EmitJointLimitRowsKernel(
     const float* __restrict__ lower_limits,
     const float* __restrict__ upper_limits,
     const uint8_t* __restrict__ limit_flags,
-    float dt, float baumgarte_max_velocity,
+    float dt, float baumgarte_max_velocity, bool position_pass,
     uint32_t env_count, uint32_t base_link_count,
     uint32_t rows_per_env, uint32_t contact_rows_per_env,
     uint32_t dof_stride,
@@ -855,7 +898,9 @@ __global__ void EmitJointLimitRowsKernel(
             const float bound = side == 0u ? lower_limits[link] : upper_limits[link];
             const float signed_distance =
                 side == 0u ? state.q[link] - bound : bound - state.q[link];
-            const float target_velocity = -signed_distance / dt;
+            // With a position pass the row only stops further violation; that pass removes it.
+            const float target_velocity =
+                -(position_pass ? fmaxf(signed_distance, 0.0f) : signed_distance) / dt;
             const float capped_velocity =
                 fminf(target_velocity, baumgarte_max_velocity);
             row.flags = nk::nk_row_flags::kActive |
@@ -908,7 +953,7 @@ __global__ void EmitJointFrictionRowsKernel(
         const uint32_t articulation = state.link_to_articulation[link];
         const uint32_t offset = state.articulation_link_offset[articulation];
         const uint32_t dof = LocalDofIndexDevice(state, offset, link);
-        row.flags = nk::nk_row_flags::kActive;
+        row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kVelocityOnly;
         row.group_first = rs;
         row.group_normal_count = 1u;
         row.env = env;
@@ -956,52 +1001,6 @@ __global__ void EmitJointDriveRowsKernel(
         const float effort = fminf(fmaxf(command[link], lower[link]), upper[link]);
         row.lower = row.upper = effort * dt;
         atomicAdd(row_count + env, 1u);
-    }
-    urows[slot] = row;
-}
-
-__global__ void EmitMimicRowsKernel(
-    ArticulationDeviceState state, const uint32_t* mimic_source_link,
-    const float* mimic_multiplier, const float* mimic_offset,
-    float dt, uint32_t base_link_count, uint32_t rows_per_env,
-    uint32_t first_row, uint32_t dof_stride,
-    NkRow* urows, float* lambda, float* chain_jacobian,
-    uint32_t* row_cj_link, uint32_t* row_cj_link_b,
-    float* row_penetration, float* row_damping, uint32_t* row_count) {
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) return;
-    const uint32_t env = link / base_link_count;
-    const uint32_t local = link - env * base_link_count;
-    const uint32_t slot = env * rows_per_env + first_row + local;
-    NkRow row{};
-    row_cj_link[slot] = row_cj_link_b[slot] = kInvalidLink;
-    row_penetration[slot] = row_damping[slot] = lambda[slot] = 0.0f;
-    float* const J = chain_jacobian + static_cast<size_t>(slot) * dof_stride;
-    for (uint32_t d = 0u; d < dof_stride; ++d) J[d] = 0.0f;
-    const uint32_t source = mimic_source_link[link];
-    if (source < state.total_link_count && dt > 0.0f &&
-        JointDofCountDevice(state.joint_type[link]) == 1u &&
-        JointDofCountDevice(state.joint_type[source]) == 1u) {
-        const uint32_t articulation = state.link_to_articulation[link];
-        if (articulation == state.link_to_articulation[source]) {
-            const uint32_t offset = state.articulation_link_offset[articulation];
-            const uint32_t target_dof = LocalDofIndexDevice(state, offset, link);
-            const uint32_t source_dof = LocalDofIndexDevice(state, offset, source);
-            const float multiplier = mimic_multiplier[link];
-            const float error = state.q[link] - multiplier * state.q[source] - mimic_offset[link];
-            row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kVelocityOnly;
-            row.group_first = slot;
-            row.group_normal_count = 1u;
-            row.env = env;
-            row.rhs = -error / (dt * dt);
-            row.lower = -kFltMax;
-            row.upper = kFltMax;
-            row.a.kind = kNkSideArtic;
-            row.a.index = articulation;
-            J[target_dof] = 1.0f;
-            J[source_dof] = -multiplier;
-            atomicAdd(row_count + env, 1u);
-        }
     }
     urows[slot] = row;
 }
@@ -1419,13 +1418,15 @@ __global__ void CountContactWarmStartsKernel(
     const math::Vec3* __restrict__ current_normal,
     const math::Vec3* __restrict__ cache_normal,
     const uint32_t* __restrict__ matches,
-    uint32_t slot_count, uint32_t* __restrict__ counts) {
-    const uint32_t env = blockIdx.x;
+    uint32_t slot_count, uint32_t blocks_per_env, uint32_t* __restrict__ counts) {
+    const uint32_t env = blockIdx.x / blocks_per_env;
+    const uint32_t part = blockIdx.x % blocks_per_env;
     __shared__ uint32_t live[128];
     __shared__ uint32_t warm[128];
     uint32_t current = 0u, matched = 0u;
     const uint32_t points_per_env = slot_count * nk::kPairDrivenPtsPerSlot;
-    for (uint32_t local = threadIdx.x; local < points_per_env; local += blockDim.x) {
+    for (uint32_t local = part * blockDim.x + threadIdx.x; local < points_per_env;
+         local += blocks_per_env * blockDim.x) {
         const uint32_t point = env * points_per_env + local;
         if (local % nk::kPairDrivenPtsPerSlot >=
             contact_count[env * slot_count + local / nk::kPairDrivenPtsPerSlot]) continue;
@@ -1444,8 +1445,8 @@ __global__ void CountContactWarmStartsKernel(
         __syncthreads();
     }
     if (threadIdx.x == 0u) {
-        counts[env * 2u] = live[0];
-        counts[env * 2u + 1u] = warm[0];
+        atomicAdd(counts + env * 2u, live[0]);
+        atomicAdd(counts + env * 2u + 1u, warm[0]);
     }
 }
 
@@ -1467,8 +1468,10 @@ __device__ void ClearContactCachePoint(
 }
 
 
+// The rebuild reads the snapshot only at retained points, so only those are copied.
 __global__ void SnapshotContactCacheKernel(
     uint32_t point_count,
+    const uint32_t* __restrict__ old_keep,
     const uint64_t* __restrict__ cache_pair,
     const uint64_t* __restrict__ cache_feature,
     const float* __restrict__ cache_lambda,
@@ -1486,7 +1489,7 @@ __global__ void SnapshotContactCacheKernel(
     uint64_t* __restrict__ snapshot_material,
     uint32_t* __restrict__ snapshot_age) {
     const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (point_index >= point_count) return;
+    if (point_index >= point_count || old_keep[point_index] == 0u) return;
     snapshot_pair[point_index] = cache_pair[point_index];
     snapshot_feature[point_index] = cache_feature[point_index];
     for (uint32_t k = 0u; k < 3u; ++k)
@@ -1597,10 +1600,16 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         const auto status = contact_cache::BuildIndex(data, point_count, p->slot_count * nk::kPairDrivenPtsPerSlot,
                                                      p->decay_steps, workspace, stream);
         if (status != cudaSuccess) return Status::Failed;
-        LaunchCuda(CountContactWarmStartsKernel, dim3(p->env_count), dim3(kBlock), 0u,
+        const uint32_t count_needed =
+            (p->slot_count * nk::kPairDrivenPtsPerSlot + kBlock - 1u) / kBlock;
+        const uint32_t count_blocks = count_needed < 256u ? count_needed : 256u;
+        if (cudaMemsetAsync(data.contact_warm_start_counts, 0,
+                            size_t{p->env_count} * 2u * sizeof(uint32_t), stream) != cudaSuccess)
+            return Status::Failed;
+        LaunchCuda(CountContactWarmStartsKernel, dim3(p->env_count * count_blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_count, data.ucontact_normal,
                    data.contact_cache_normal, workspace.matches, p->slot_count,
-                   data.contact_warm_start_counts);
+                   count_blocks, data.contact_warm_start_counts);
         LaunchCuda(PrepareContactWarmStartKernel, dim3(blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_normal, data.ucontact_tangent1,
                    data.ucontact_tangent2, data.contact_cache_lambda,
@@ -1609,7 +1618,7 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    p->slot_count, p->rows_per_env, p->full_row_slot_count, data.lambda);
     } else {
         LaunchCuda(SnapshotContactCacheKernel, dim3(blocks), dim3(kBlock), 0u,
-                   stream, point_count, data.contact_cache_pair,
+                   stream, point_count, data.contact_cache_old_keep, data.contact_cache_pair,
                    data.contact_cache_feature, data.contact_cache_lambda,
                    data.contact_cache_normal, data.contact_cache_tangent1,
                    data.contact_cache_tangent2, data.contact_cache_material,
@@ -1656,12 +1665,10 @@ Status OpSnapshotStepVelocity(const ModelView& model, const DataView& data,
     if (p->articulation_count > 0u && p->max_dof > 0u) {
         constexpr uint32_t block_size = 128u;
         const uint32_t total = p->articulation_count * p->max_dof;
+        const auto state = MakeArticulationDeviceState(
+            model, data, p->base_link_count * p->env_count, p->articulation_count);
         LaunchCuda(PackQdotFlatMultiKernel, dim3((total + block_size - 1u) / block_size),
-                   dim3(block_size), 0u, stream,
-                   reinterpret_cast<const Spatial6*>(data.link_velocity), data.qdot,
-                   model.dof_to_link, model.dof_to_component,
-                   p->articulation_count, p->max_dof, p->base_link_count,
-                   p->articulation_count / p->env_count, data.step_qdot_flat);
+                   dim3(block_size), 0u, stream, state, p->max_dof, data.step_qdot_flat);
     }
     if (p->total_body_count > 0u) {
         const size_t bytes = static_cast<size_t>(p->total_body_count) * sizeof(math::Vec3);
@@ -1698,27 +1705,29 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         (p->articulation_count > 0u && p->env_count > 0u)
             ? (p->articulation_count / p->env_count) : 0u;
 
-    // K1: pack the per-articulation flat qdot tiles (one tile per co-resident
-    // articulation, qdot_flat[artic_global*max_dof + k]). PackQdotFlatKernel is
-    // keyed per env*max_dof -> for K>1 launch over articulation_count*max_dof so
-    // every dog's tile is packed. dof_to_link/component are per:dof (TEMPLATE),
-    // so the kernel re-uses them per artic via the env stride.
+    // Pack each articulation's actual DOFs into its padded flat velocity tile.
     if (has_artic) {
         const uint32_t total = p->articulation_count * p->max_dof;
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
+        const auto state = MakeArticulationDeviceState(
+            model, data, p->total_link_count, p->articulation_count);
         LaunchCuda(PackQdotFlatMultiKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   reinterpret_cast<const Spatial6*>(data.link_velocity),
-                   static_cast<const float*>(data.qdot),
-                   static_cast<const uint32_t*>(model.dof_to_link),
-                   static_cast<const uint32_t*>(model.dof_to_component),
-                   p->articulation_count, p->max_dof, p->base_link_count,
-                   artics_per_env, data.qdot_flat);
+                   state, p->max_dof, data.qdot_flat);
     }
 
     // K2: emit the pair-driven contact rows.
     if (p->union_slot_count > 0u) {
         const uint32_t total = p->env_count * p->union_slot_count;
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
+        const uint32_t full_slots = std::min(p->full_row_slot_count, p->union_slot_count);
+        const uint32_t clear_rows = p->env_count * (full_slots * kPdRowsPerSlot +
+            (p->union_slot_count - full_slots) * kPdParticleRowsPerSlot);
+        const uint32_t clear_blocks = (std::max(clear_rows, total) + kBlockSize - 1u) / kBlockSize;
+        LaunchCuda(ClearPairDrivenRowsKernel, dim3(clear_blocks), dim3(kBlockSize), 0u, stream,
+                   p->env_count, p->union_slot_count, p->full_row_slot_count, p->rows_per_env,
+                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
+                   data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping,
+                   data.contact_material);
         LaunchCuda(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    static_cast<const uint32_t*>(data.ucontact_count),
                    static_cast<const math::Vec3*>(data.ucontact_point),
@@ -1766,7 +1775,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         LaunchCuda(EmitJointLimitRowsKernel, dim3(limit_blocks), dim3(kBlockSize),
                    0u, stream, state, model.joint_limit_lower,
                    model.joint_limit_upper, model.joint_limit_flags,
-                   p->dt, p->baumgarte_max_velocity, p->env_count,
+                   p->dt, p->baumgarte_max_velocity, p->position_pass != 0u, p->env_count,
                    p->base_link_count, p->rows_per_env,
                    p->contact_rows_per_env, p->max_dof,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
@@ -1797,19 +1806,6 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->max_dof, data.drive_command, data.drive_lower, data.drive_upper,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda, data.chain_jacobian,
                    data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
-    }
-
-    if (has_artic && p->mimic_rows_per_env >= p->base_link_count && p->base_link_count > 0u) {
-        const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
-        const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitMimicRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   state, model.mimic_source_link, model.mimic_multiplier, model.mimic_offset,
-                   p->dt, p->base_link_count, p->rows_per_env,
-                   p->contact_rows_per_env + p->joint_limit_rows_per_env +
-                       p->joint_friction_rows_per_env + p->joint_drive_rows_per_env,
-                   p->max_dof, reinterpret_cast<NkRow*>(data.urows), data.lambda,
-                   data.chain_jacobian, data.row_cj_link, data.row_cj_link_b,
-                   data.row_penetration, data.row_damping, data.row_count);
     }
 
     const uint32_t constraints = p->dist_cons_per_env + p->vol_cons_per_env;
@@ -1858,17 +1854,32 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    0u, stream, reinterpret_cast<const NkRow*>(data.urows),
                    total_rows, p->max_dof, data.chain_jacobian, data.chain_jacobian_b);
 
+        // With mimic couplings the rows act on the reduced coordinates MimicReduce prepared.
+        const bool mimic = p->mimic_couplings_per_env > 0u;
+        if (mimic) {
+            LaunchCuda(FoldMimicJacobianKernel<false>, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                       reinterpret_cast<const NkRow*>(data.urows),
+                       static_cast<const uint32_t*>(data.mimic_root_dof),
+                       static_cast<const float*>(data.mimic_root_scale),
+                       total_rows, p->max_dof, data.chain_jacobian);
+            LaunchCuda(FoldMimicJacobianKernel<true>, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                       reinterpret_cast<const NkRow*>(data.urows),
+                       static_cast<const uint32_t*>(data.mimic_root_dof),
+                       static_cast<const float*>(data.mimic_root_scale),
+                       total_rows, p->max_dof, data.chain_jacobian_b);
+        }
+        const float* const inverse =
+            static_cast<const float*>(mimic ? data.m_inv_coupled : data.m_inv);
+
         // Both articulation endpoints use the same row compaction and matrix product.
         LaunchCuda(ComputeRowMinvJtKernel<false>, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    reinterpret_cast<const NkRow*>(data.urows),
                    static_cast<const float*>(data.chain_jacobian),
-                   static_cast<const float*>(data.m_inv),
-                   total_rows, p->max_dof, data.row_minv_jt);
+                   inverse, total_rows, p->max_dof, data.row_minv_jt);
         LaunchCuda(ComputeRowMinvJtKernel<true>, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    reinterpret_cast<const NkRow*>(data.urows),
                    static_cast<const float*>(data.chain_jacobian_b),
-                   static_cast<const float*>(data.m_inv),
-                   total_rows, p->max_dof, data.row_minv_jt_b);
+                   inverse, total_rows, p->max_dof, data.row_minv_jt_b);
     }
 
     // K4b: per-row effective mass over both arms (correct arrays per side).

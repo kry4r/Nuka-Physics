@@ -490,16 +490,6 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
         __syncthreads();
     }
     if (threadIdx.x == 0u) ucount[gid] = kept;
-    for (uint32_t i = threadIdx.x; i < kManifoldPoints; i += blockDim.x) {
-        const size_t at = static_cast<size_t>(gid) * kManifoldPoints + i;
-        if (i < kept) continue;
-        upoint[at] = {0, 0, 0}; unormal[at] = {0, 0, 0}; udepth[at] = 0.0f;
-        ucontact_a[at] = 0u; ucontact_b[at] = 0u; ucontact_gen[at] = 0u;
-        ucontact_a_kind[at] = nk::kUContactSideBody;
-        ucontact_b_kind[at] = nk::kUContactSideBody;
-        ucontact_id_pair[at] = 0u;
-        ucontact_id_feature[at] = 0u;
-    }
     if (kept > 0u && contact_count != nullptr && threadIdx.x == 0u) {
         atomicAdd(&contact_count[env], kept);
     }
