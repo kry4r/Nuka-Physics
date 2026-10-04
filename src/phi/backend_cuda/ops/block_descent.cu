@@ -39,11 +39,6 @@ constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
 constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
 
-struct AugmentedRowCoefficients {
-    Vec3 impulse;
-    SymmetricMat3 curvature;
-};
-
 struct AugmentedRowState {
     Vec3 residual;
     Vec3 dual;
@@ -123,6 +118,7 @@ struct BlockScratch {
     float* articulation_force;
     float* articulation_direction;
     float* articulation_diagonal;
+    float* articulation_velocity;
     uint32_t* rigid_dimensions;
     float* rigid_free;
     float* rigid_snapshot;
@@ -131,13 +127,13 @@ struct BlockScratch {
     float* rigid_force;
     float* rigid_direction;
     float* rigid_diagonal;
+    float* rigid_velocity;
     Vec3* grid_free;
     Vec3* grid_snapshot;
     uint32_t* grid_active;
     uint32_t* grid_active_count;
     uint32_t* grid_color_offsets;
     MaterialRowState* material_state;
-    AugmentedRowCoefficients* row_coefficients;
     AugmentedRowState* row_state;
     void* scan;
     size_t scan_bytes;
@@ -212,9 +208,10 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     if (incidence >= uint64_t{std::numeric_limits<uint32_t>::max()}) return 0u;
     const uint64_t word_limit = std::numeric_limits<size_t>::max() / sizeof(uint32_t);
     if (incidence > word_limit) return 0u;
-    const bool point_owners = p.total_particle_count > 0u || p.total_grid_count > 0u;
-    if (point_owners && incidence > word_limit / kPointJacobianWords) return 0u;
-    const uint64_t point_jacobian_words = point_owners ? incidence * kPointJacobianWords : 0u;
+    const bool incidence_terms = p.total_particle_count > 0u || p.total_grid_count > 0u ||
+                                 p.total_body_count > 0u || p.articulation_count > 0u;
+    if (incidence_terms && incidence > word_limit / kPointJacobianWords) return 0u;
+    const uint64_t point_jacobian_words = incidence_terms ? incidence * kPointJacobianWords : 0u;
     const uint64_t cache_colors = uint64_t{p.vertex_blocks.colors} + 2u +
         (p.total_grid_count > 0u ? nk::kMpmCellStencilNodes : 0u);
     if (cache_colors > uint64_t{std::numeric_limits<uint32_t>::max()}) return 0u;
@@ -226,7 +223,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
         dofs > word_limit || (dofs > 0u && p.max_dof > word_limit / dofs)) return 0u;
     const uint64_t matrix_words = dofs * p.max_dof;
     if (matrix_words > word_limit - dofs ||
-        dofs > (word_limit - matrix_words) / 6u) return 0u;
+        dofs > (word_limit - matrix_words) / 7u) return 0u;
     size_t scan_bytes = 0u;
     if (cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<int>(blocks + 1u)) != cudaSuccess)
@@ -288,6 +285,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.articulation_force = reinterpret_cast<float*>(take(dofs));
     s.articulation_direction = reinterpret_cast<float*>(take(dofs));
     s.articulation_diagonal = reinterpret_cast<float*>(take(dofs));
+    s.articulation_velocity = reinterpret_cast<float*>(take(dofs));
     const uint64_t rigid_dofs = uint64_t{p.total_body_count} * kRigidBlockDof;
     s.rigid_dimensions = take(p.total_body_count);
     s.rigid_free = reinterpret_cast<float*>(take(rigid_dofs));
@@ -297,6 +295,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.rigid_force = reinterpret_cast<float*>(take(rigid_dofs));
     s.rigid_direction = reinterpret_cast<float*>(take(rigid_dofs));
     s.rigid_diagonal = reinterpret_cast<float*>(take(rigid_dofs));
+    s.rigid_velocity = reinterpret_cast<float*>(take(rigid_dofs));
     s.grid_free = reinterpret_cast<Vec3*>(take(3u * uint64_t{p.total_grid_count}));
     s.grid_snapshot = reinterpret_cast<Vec3*>(take(3u * uint64_t{p.total_grid_count}));
     s.grid_active = take(p.total_grid_count);
@@ -305,9 +304,6 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.material_state = reinterpret_cast<MaterialRowState*>(take(
         uint64_t{p.material_cells_per_env} * p.env_count *
         sizeof(MaterialRowState) / sizeof(uint32_t)));
-    s.row_coefficients = reinterpret_cast<AugmentedRowCoefficients*>(take(
-        p.articulation_count > 0u || p.total_body_count > 0u
-            ? rows * sizeof(AugmentedRowCoefficients) / sizeof(uint32_t) : 0u));
     at = (at + 63u) & ~uint64_t{63u};
     s.scan = take(scan_bytes / sizeof(uint32_t) + (scan_bytes % sizeof(uint32_t) != 0u));
     s.scan_bytes = scan_bytes;
@@ -1082,6 +1078,7 @@ __device__ bool Finite(Vec3 value) {
     return fabsf(value.x) <= FLT_MAX && fabsf(value.y) <= FLT_MAX && fabsf(value.z) <= FLT_MAX;
 }
 
+#include "phi/backend_cuda/ops/block_descent_dense.cuh"
 #include "phi/backend_cuda/ops/block_descent_articulation.cuh"
 #include "phi/backend_cuda/ops/block_descent_rigid.cuh"
 #include "phi/backend_cuda/ops/block_descent_material.cuh"
@@ -1120,21 +1117,12 @@ __global__ void PackBlockArticulationVelocityKernel(ArticulationDeviceState stat
     }
 }
 
-// Caches a row's assembled state with, if asked, its potential and, for body rows, its coefficients.
+// Caches a row's assembled state with, if asked, its potential.
 __device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                  uint32_t slot, const NkRow& row, const AugmentedRowState& state,
-                                  bool potential, bool coefficients) {
+                                  uint32_t slot, const AugmentedRowState& state, bool potential) {
     s.row_state[slot] = state;
     if (!potential) return;
-    const LocalTerm term = LoadLocalTerm(data, p, s, slot, ~0u, true);
-    const bool store_coefficients = coefficients &&
-        (row.a.kind == kNkSideArtic || row.b.kind == kNkSideArtic ||
-         row.a.kind == kNkSideRigid || row.b.kind == kNkSideRigid);
-    AugmentedRowCoefficients value{};
-    s.row_state[slot].potential = EvaluateAugmentedResidual(term, {},
-        store_coefficients ? &value.impulse : nullptr,
-        store_coefficients ? &value.curvature : nullptr);
-    if (store_coefficients) s.row_coefficients[slot] = value;
+    s.row_state[slot].potential = EvaluateLocalResidual(LoadLocalTerm(data, p, s, slot, ~0u, true), {});
 }
 
 // Rows too few to give every warp scheduler a warp are latency-bound, so adjacent lanes evaluate one
@@ -1142,20 +1130,20 @@ __device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, Bloc
 constexpr uint32_t kRowAxisLanes = 4u;
 
 __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                        uint32_t cache_color, bool coefficients, uint32_t spread_rows) {
+                                        uint32_t cache_color, uint32_t spread_rows) {
     const uint32_t threads = gridDim.x * blockDim.x;
     const uint32_t count = *s.active_count;
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    // Particle descents integrate potential changes directly; only later colors read the potential.
-    const bool potential = cache_color > p.vertex_blocks.colors;
+    // Particle descents integrate potential changes and dense descents search slopes; only grid
+    // descents read the cached potential.
+    const bool potential = cache_color > p.vertex_blocks.colors + 1u;
     if (count > spread_rows) {
         for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < count; item += threads) {
             const uint32_t slot = s.active_rows[item];
             if (!RowUsesCacheColor(s, slot, cache_color)) continue;
             const NkRow row = rows[slot];
             if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
-            CacheAugmentedRow(data, p, s, slot, row, ComputeAugmentedRowState(data, p, s, slot, true),
-                              potential, coefficients);
+            CacheAugmentedRow(data, p, s, slot, ComputeAugmentedRowState(data, p, s, slot, true), potential);
         }
         return;
     }
@@ -1179,7 +1167,7 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
                       __shfl_sync(group_mask, dual, 2, kRowAxisLanes)};
         if (axis != 0u) continue;
         state.normal_bound = AugmentedRowBound(s, row, slot, scale, state);
-        CacheAugmentedRow(data, p, s, slot, row, state, potential, coefficients);
+        CacheAugmentedRow(data, p, s, slot, state, potential);
     }
 }
 
@@ -1834,10 +1822,6 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     const uint64_t words = BindScratch(*p, data.block_descent_scratch, &s);
     if (words == 0u || words > p->workspace_words || data.block_descent_scratch == nullptr)
         return Status::InvalidArgument;
-    const uint64_t articulation_tiles = (uint64_t{p->max_dof} + 7u) / 8u;
-    const uint64_t articulation_grid = articulation_tiles * articulation_tiles * p->articulation_count;
-    if (articulation_grid >= uint64_t{std::numeric_limits<int>::max()})
-        return Status::InvalidArgument;
     const ArticulationDeviceState articulation_state = MakeArticulationDeviceState(
         model, data, p->base_link_count * p->env_count, p->articulation_count);
     const auto clear = [&](void* ptr, size_t bytes) {
@@ -1946,7 +1930,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             if (!elastic && p->total_particle_count == p->vertex_blocks.vertices * p->env_count)
                 continue;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                    data, *p, particle_s, color, false, spread_rows) != cudaSuccess) return Status::Failed;
+                    data, *p, particle_s, color, spread_rows) != cudaSuccess) return Status::Failed;
             const auto descent_status = elastic
                 ? LaunchWork(DescendParticlesKernel<true>, work, kDescendTileVertices, stream,
                              model, data, *p, particle_s, color)
@@ -1958,20 +1942,17 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             if (particle_bytes > 0u && cudaMemcpyAsync(s.particle_snapshot, data.particle_vel,
                     particle_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                    data, *p, s, p->vertex_blocks.colors + 1u, true, spread_rows) != cudaSuccess) return Status::Failed;
-        }
-        if (p->articulation_count > 0u) {
-            LaunchCuda(AssembleArticulationBlocksKernel, dim3(static_cast<uint32_t>(articulation_grid)),
-                       dim3(kThreads), 0u, stream, data, *p, s);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-            LaunchCuda(DescendArticulationsKernel, dim3(p->articulation_count), dim3(kThreads),
-                       0u, stream, articulation_state, data, *p, s);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-        }
-        if (p->total_body_count > 0u) {
-            LaunchCuda(DescendRigidBlocksKernel, dim3(p->total_body_count), dim3(kThreads),
-                       0u, stream, data, *p, s);
-            if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+                    data, *p, s, p->vertex_blocks.colors + 1u, spread_rows) != cudaSuccess) return Status::Failed;
+            if (p->articulation_count > 0u) {
+                LaunchCuda(DescendArticulationsKernel, dim3(p->articulation_count), dim3(kThreads),
+                           0u, stream, articulation_state, data, *p, s);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            }
+            if (p->total_body_count > 0u) {
+                LaunchCuda(DescendRigidBlocksKernel, dim3(p->total_body_count), dim3(kThreads),
+                           0u, stream, data, *p, s);
+                if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+            }
         }
         if (p->total_grid_count > 0u) {
             if (articulation_bytes > 0u && cudaMemcpyAsync(s.articulation_snapshot, data.qdot_flat,
@@ -1983,7 +1964,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             for (uint32_t color = 0u; color < nk::kMpmCellStencilNodes; ++color) {
                 const uint32_t cache_color = p->vertex_blocks.colors + 2u + color;
                 if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                        data, *p, grid_s, cache_color, false, spread_rows) != cudaSuccess) return Status::Failed;
+                        data, *p, grid_s, cache_color, spread_rows) != cudaSuccess) return Status::Failed;
                 if (p->material_cells_per_env > 0u &&
                     LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                         data, *p, grid_s, true, cache_color) != cudaSuccess) return Status::Failed;
