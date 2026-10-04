@@ -4,6 +4,9 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
+#include <limits>
+
+#include "core/checked_size.hpp"
 
 #include "math/cuda_spatial_ops.cuh"
 #include "math/cuda_vec_ops.cuh"
@@ -558,6 +561,24 @@ __global__ void IntegratePositionArticulationKernel(ArticulationDeviceState stat
     }
 }
 
+// A coupled joint takes its root's coordinate exactly; roots are never written here.
+__global__ void SnapMimicJointsKernel(ArticulationDeviceState state,
+                                      const uint32_t* __restrict__ mimic_source_link,
+                                      const float* __restrict__ mimic_multiplier,
+                                      const float* __restrict__ mimic_offset) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) {
+        return;
+    }
+    float scale = 1.0f;
+    float shift = 0.0f;
+    const uint32_t root = MimicRootDevice(state, mimic_source_link, mimic_multiplier,
+                                          mimic_offset, link, &scale, &shift);
+    if (root != link) {
+        state.q[link] = scale * state.q[root] + shift;
+    }
+}
+
 __device__ math::Vec3 RotateByQuatForward(math::Quat q, math::Vec3 v) {
     const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
     if (norm_sq > 1.0e-12f) {
@@ -671,6 +692,7 @@ struct DriveControlView {
     float* jacobian;
     float* response;
     float* task_map;
+    uint32_t* scratch;
     uint32_t* status;
 };
 
@@ -683,7 +705,7 @@ DriveControlView MakeDriveControlView(const DataView& data) {
             data.drive_command, data.drive_dissipation, data.drive_lower,
             data.drive_upper, data.control_mass, data.control_factor,
             data.control_jacobian, data.control_response, data.control_task_map,
-            data.env_status};
+            data.control_scratch, data.env_status};
 }
 
 // Controllers provide an affine effort and its bounds to the common row solver.
@@ -935,6 +957,30 @@ __device__ math::Transform RelativeTransform(const ArticulationDeviceState& stat
 
 constexpr uint32_t kTaskDimension = 6u;
 
+enum class ControlVector : uint32_t {
+    Links, Dofs, Chain, Diagonal, Rhs, Solution, Bias, Posture, Count
+};
+constexpr uint32_t kControlVectorCount = static_cast<uint32_t>(ControlVector::Count);
+static_assert(kControlVectorCount == 8u && sizeof(float) == sizeof(uint32_t));
+
+struct ControlScratch {
+    uint32_t* words;
+    uint32_t max_dof;
+
+    __device__ uint32_t* Indices(ControlVector vector) const {
+        return words + size_t{static_cast<uint32_t>(vector)} * max_dof;
+    }
+    __device__ float* Values(ControlVector vector) const {
+        return reinterpret_cast<float*>(Indices(vector));
+    }
+};
+
+__device__ ControlScratch BindControlScratch(uint32_t* words, uint32_t articulation,
+                                              uint32_t max_dof) {
+    const size_t stride = size_t{max_dof} * kControlVectorCount;
+    return {words + size_t{articulation} * stride, max_dof};
+}
+
 // LDL factors use arena storage sized from the articulation, without a controller-specific DOF cap.
 __device__ bool FactorControlMass(float* matrix, uint32_t n, uint32_t stride,
                                    float* diagonal) {
@@ -1066,6 +1112,18 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
     const uint32_t stride = params.max_dof;
+    uint64_t actual_dof = 0u;
+    for (uint32_t local = 0u; local < count; ++local)
+        actual_dof += JointDofCountDevice(state.joint_type[offset + local]);
+    if (actual_dof > stride) {
+        atomicOr(drive.status + offset / params.links_per_env, kEnvStatusDofOverflow);
+        return;
+    }
+    if (params.mode == static_cast<uint32_t>(ArticulationControlMode::Osc) &&
+        params.task_link >= count) {
+        atomicOr(drive.status + offset / params.links_per_env, kEnvStatusControlFailure);
+        return;
+    }
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
         if (JointDofCountDevice(state.joint_type[link]) == 1u &&
@@ -1090,8 +1148,9 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
             return;
         }
     }
-    uint32_t links[kMaxArticulationDof];
-    uint32_t dofs[kMaxArticulationDof];
+    const auto scratch = BindControlScratch(drive.scratch, articulation, stride);
+    uint32_t* const links = scratch.Indices(ControlVector::Links);
+    uint32_t* const dofs = scratch.Indices(ControlVector::Dofs);
     uint32_t active = 0u;
     for (uint32_t local = 0u; local < count; ++local) {
         const uint32_t link = offset + local;
@@ -1107,9 +1166,9 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
     const float* inverse_mass = drive.inverse_mass + matrix_offset;
     float* factor = drive.factor + matrix_offset;
     float* mass = drive.mass + matrix_offset;
-    float diagonal[kMaxArticulationDof];
-    float rhs[kMaxArticulationDof];
-    float solution[kMaxArticulationDof];
+    float* const diagonal = scratch.Values(ControlVector::Diagonal);
+    float* const rhs = scratch.Values(ControlVector::Rhs);
+    float* const solution = scratch.Values(ControlVector::Solution);
     for (uint32_t r = 0u; r < active; ++r)
         for (uint32_t c = 0u; c < active; ++c)
             factor[r * stride + c] = 0.5f *
@@ -1123,7 +1182,7 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
         SolveControlMass(factor, diagonal, active, stride, rhs, solution);
         for (uint32_t r = 0u; r < active; ++r) mass[r * stride + c] = solution[r];
     }
-    float bias[kMaxArticulationDof];
+    float* const bias = scratch.Values(ControlVector::Bias);
     for (uint32_t r = 0u; r < active; ++r) {
         double value = -state.joint_damping[links[r]] * state.qdot[links[r]];
         for (uint32_t c = 0u; c < active; ++c)
@@ -1153,7 +1212,8 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
         float* response = drive.response + task_offset;
         float* task_map = drive.task_map + task_offset;
         for (uint32_t i = 0u; i < stride * kTaskDimension; ++i) jacobian[i] = 0.0f;
-        uint8_t chain[kMaxArticulationDof] = {};
+        uint32_t* const chain = scratch.Indices(ControlVector::Chain);
+        for (uint32_t i = 0u; i < stride; ++i) chain[i] = 0u;
         uint32_t walk = task_link;
         while (walk != kInvalidLink) {
             const auto type = state.joint_type[walk];
@@ -1242,7 +1302,7 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
                 null_kp * (drive.target[link] - state.q[link]) +
                 null_kd * (drive.velocity_target[link] - state.qdot[link]) : 0.0f;
         }
-        float posture[kMaxArticulationDof];
+        float* const posture = scratch.Values(ControlVector::Posture);
         for (uint32_t r = 0u; r < active; ++r) {
             double value = 0.0;
             for (uint32_t c = 0u; c < active; ++c)
@@ -1337,15 +1397,29 @@ Status OpApplyDrives(const ModelView& model, const DataView& data,
 Status OpApplyDynamicsDrives(const ModelView& model, const DataView& data,
                              const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const ApplyDynamicsDrivesParams*>(params);
-    if (!p || p->max_dof > kMaxArticulationDof ||
+    if (!p ||
         (p->mode != static_cast<uint32_t>(ArticulationControlMode::ComputedTorque) &&
          p->mode != static_cast<uint32_t>(ArticulationControlMode::Osc)))
         return Status::InvalidArgument;
     if (p->articulation_count == 0u || p->total_link_count == 0u || p->max_dof == 0u)
         return Status::Ok;
     if (!data.m_inv || !data.control_mass || !data.control_factor || !data.control_jacobian ||
-        !data.control_response || !data.control_task_map || p->links_per_env == 0u)
+        !data.control_response || !data.control_task_map || !data.control_scratch || !data.env_status ||
+        !model.joint_type || !model.articulation_link_offset || !model.articulation_link_count ||
+        p->links_per_env == 0u || p->total_link_count % p->links_per_env != 0u)
         return Status::InvalidArgument;
+    try {
+        const uint64_t words = CheckedProduct({p->articulation_count, p->max_dof, kControlVectorCount});
+        const uint64_t matrix_words = CheckedProduct({p->max_dof, p->max_dof});
+        if (words > std::numeric_limits<size_t>::max() / sizeof(uint32_t) ||
+            matrix_words > std::numeric_limits<uint32_t>::max() ||
+            CheckedProduct({p->max_dof, kTaskDimension}) > std::numeric_limits<uint32_t>::max() ||
+            CheckedProduct({p->articulation_count, matrix_words, sizeof(float)}) >
+                std::numeric_limits<size_t>::max())
+            return Status::InvalidArgument;
+    } catch (const std::overflow_error&) {
+        return Status::InvalidArgument;
+    }
     const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
     LaunchCuda(ApplyDynamicsDriveKernel, dim3(p->articulation_count), dim3(32u), 0u,
                stream, state, MakeDriveControlView(data), *p);
@@ -1490,6 +1564,15 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
                      : nullptr;
         LaunchCuda(IntegratePositionArticulationKernel, dim3(blocks),
                    dim3(kAbaBlockSize), 0u, stream, state, qdot_pseudo, p->dt);
+        if (p->mimic_couplings != 0u) {
+            if (model.mimic_source_link == nullptr || model.mimic_multiplier == nullptr ||
+                model.mimic_offset == nullptr)
+                return Status::Failed;
+            LaunchCuda(SnapMimicJointsKernel, dim3(blocks), dim3(kAbaBlockSize), 0u, stream,
+                       state, static_cast<const uint32_t*>(model.mimic_source_link),
+                       static_cast<const float*>(model.mimic_multiplier),
+                       static_cast<const float*>(model.mimic_offset));
+        }
         if (p->articulation_count > 0u) {
             LaunchCuda(IntegrateFloatingBasePoseKernel, dim3(p->articulation_count),
                        dim3(kAbaBlockSize), 0u, stream, state, link_vel_pseudo, p->dt);
@@ -1551,6 +1634,7 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkAssembleRowsOps();
     RegisterNkBuildSolveIslandsOps(); // dynamic connected-component solve schedule
     RegisterNkSolveRowsOps();
+    RegisterNkBlockDescentOps();
     RegisterNkParticleOps();
     RegisterNkVertexBlockOps();
     RegisterNkOgcDetectOps();

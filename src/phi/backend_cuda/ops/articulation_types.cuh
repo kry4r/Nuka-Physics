@@ -184,6 +184,57 @@ __forceinline__ __device__ uint32_t LocalDofIndexDevice(const ArticulationDevice
     return index;
 }
 
+__device__ inline bool ArticulationDofLocation(
+    const ArticulationDeviceState& state, uint32_t articulation, uint32_t dof,
+    uint32_t* link, uint32_t* component) {
+    if (link == nullptr || component == nullptr || articulation >= state.articulation_count ||
+        state.articulation_link_offset == nullptr || state.articulation_link_count == nullptr ||
+        state.joint_type == nullptr) return false;
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    if (offset > state.total_link_count || count > state.total_link_count - offset) return false;
+    for (uint32_t local = 0u; local < count; ++local) {
+        const uint32_t candidate = offset + local;
+        const ArticulationJointType type = state.joint_type[candidate];
+        const uint32_t width = JointDofCountDevice(type);
+        if (dof < width) {
+            if (type == ArticulationJointType::FloatingBase &&
+                (local != 0u || state.parent_link == nullptr ||
+                 state.parent_link[candidate] != ~0u)) return false;
+            *link = candidate;
+            *component = width == 1u ? ~0u : dof;
+            return true;
+        }
+        dof -= width;
+    }
+    return false;
+}
+
+// The free joint a mimic chain ends at, with q_link = scale * q_root + shift along it.
+__forceinline__ __device__ uint32_t MimicRootDevice(const ArticulationDeviceState& state,
+                                                    const uint32_t* source_link,
+                                                    const float* multiplier,
+                                                    const float* offset, uint32_t link,
+                                                    float* scale, float* shift) {
+    const uint32_t articulation = state.link_to_articulation[link];
+    float s = 1.0f;
+    float c = 0.0f;
+    uint32_t root = link;
+    for (uint32_t hop = 0u; hop < state.articulation_link_count[articulation]; ++hop) {
+        const uint32_t from = source_link[root];
+        if (from >= state.total_link_count || state.link_to_articulation[from] != articulation ||
+            JointDofCountDevice(state.joint_type[root]) != 1u ||
+            JointDofCountDevice(state.joint_type[from]) != 1u)
+            break;
+        c += s * offset[root];
+        s *= multiplier[root];
+        root = from;
+    }
+    *scale = s;
+    *shift = c;
+    return root;
+}
+
 // Generalized force g[dof] += J_dof^T . wrench for ONE joint, the chain-Jacobian
 // column builder generalized from a unit scalar direction to a full spatial
 // wrench (force f, torque tau at `point`). The scalar-direction case (the
