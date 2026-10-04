@@ -28,6 +28,15 @@ inline void Require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
 }
 
+inline void RequireStep(nk::World& world, const std::string& message, uint32_t index) {
+    const auto result = world.Step();
+    if (result.AllOk()) return;
+    throw std::runtime_error(message + " at step " + std::to_string(index) +
+        " (op " + std::to_string(static_cast<uint32_t>(result.failed_op)) +
+        ", status " + std::to_string(static_cast<uint32_t>(result.result)) + "): " +
+        world.LastExecutionError().message);
+}
+
 constexpr float kContactDMin = 0.030f;
 constexpr uint32_t kClothNx = 13u;          // 13x13 = 169 cloth particles.
 constexpr float kClothSpacing = 0.016f;     // ~0.19 m square (spans both front feet).
@@ -206,7 +215,7 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
 
     nk::World wp(std::move(probe), 1u, device, backend, config);
     Require(wp.Ready(), wp.CreationError());
-    for (uint32_t s = 0; s < kSettleSteps; ++s) Require(wp.Step().AllOk(), "robot calibration step failed");
+    for (uint32_t s = 0; s < kSettleSteps; ++s) RequireStep(wp, "robot calibration step failed", s);
     std::vector<Transform> link_pose(L);
     Require(wp.GetData().DownloadField(nk::FieldId::LinkPose, link_pose.data(),
                                            L * sizeof(Transform)), "calibration pose download failed");
@@ -255,7 +264,7 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
         m.particles.pp_contact_d_min = kContactDMin;
         nk::World w(std::move(m), 1u, device, backend, config);
         Require(w.Ready(), w.CreationError());
-        for (uint32_t s = 0; s < kSettleSteps; ++s) Require(w.Step().AllOk(), "pool calibration step failed");
+        for (uint32_t s = 0; s < kSettleSteps; ++s) RequireStep(w, "pool calibration step failed", s);
         std::vector<Transform> lp(L);
         Require(w.GetData().DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform)), "calibration pose download failed");
         front_foot_z_loaded = (lp[front_link] * link_geom_local[front_link]).position.z;
@@ -316,7 +325,7 @@ inline std::vector<uint32_t> LatticeBoundary(const std::array<uint32_t, 3>& dime
 }
 
 inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
-                                SceneVisuals* visuals = nullptr) {
+                                SceneVisuals* visuals = nullptr, bool implicit_stress = false) {
     constexpr float radius = 0.028f, mass = 0.15f, dx = 0.02f;
     const float cloth_z = prepared.cloth_z - 0.0175f;
     auto scene = RobotScene(prepared.path, true);
@@ -358,6 +367,7 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
                             2.0f * kClothSpacing / float(kClothNx - 1u));
     cloth.aero_drag_normal = cloth.aero_drag_tangent = cloth.aero_drag_max_dv = 0.0f;
     cook::MpmCookInput mpm;
+    mpm.implicit_stress = implicit_stress;
     const Vec3 centre{prepared.front_centre.x + 0.01f, prepared.front_centre.y, cloth_z};
     const float spacing = 0.5f * dx;
     constexpr std::array<uint32_t, 3> dimensions{13u, 9u, 4u};
