@@ -311,6 +311,11 @@ nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
 nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
                                             nuka_checkpoint_handle checkpoint);
 void nuka_checkpoint_destroy(nuka_checkpoint_handle checkpoint);
+// Writes a checkpoint's persistent physics bytes and step count with the layout hash to a file.
+nuka_result_t nuka_checkpoint_write(nuka_checkpoint_handle checkpoint, const char* path);
+// Reads a written checkpoint into a world of the same layout; host configuration comes from that world.
+nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* path,
+                                         nuka_checkpoint_handle* out);
 // Hashes persistent physics, observation output/history, and host state in fixed order.
 nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash);
 
@@ -647,7 +652,8 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_MESH_SDF_PAIR_COUNT = 78,
     // READ: executed velocity sweeps in the colored VBD solve for the latest step.
     NUKA_FIELD_VBD_VELOCITY_SWEEP_COUNT = 79,
-    // READ: per-environment vertex and dynamic contact-row color counts.
+    // READ: per environment, vertex colors, dynamic row colors, chain rows, chain islands, rows of
+    // the longest island chain, and articulation Schur rows of the latest colored solve.
     NUKA_FIELD_SOLVER_COLOR_COUNTS = 80,
     // READ: actual per-particle DAT fraction; valid after a completed DAT step until reset.
     NUKA_FIELD_DAT_PARTICLE_MOTION_FRACTION = 81,
@@ -674,7 +680,25 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_VBD_ELEMENTS = 90,
     // READ: env/389 uint64 from the last DAT pass: radius/motion/degenerate/overlap totals, unrecorded, then
     // (reason<<60|owner<<30|owner, count, max overlap f32 bits); owner = kind(body,link,surface,static)<<28|index.
-    NUKA_FIELD_DAT_FAILURE_WITNESS = 91
+    NUKA_FIELD_DAT_FAILURE_WITNESS = 91,
+    // READ: per articulation, four uint64 for the vertex motion, particle pair, body pair and chain
+    // travel bounds of the last DAT pass: f32 fraction bits high32, body << 16 | counterpart low32.
+    NUKA_FIELD_DAT_ARTICULATION_WITNESS = 92,
+    // READ: per articulation, the motion fraction the last DAT pass applied.
+    NUKA_FIELD_DAT_ARTICULATION_FRACTION = 93,
+    // READ: per body, the predicted vertex speed bound and query radius of the last detection.
+    NUKA_FIELD_DAT_BODY_SPEED = 94,
+    NUKA_FIELD_DAT_BODY_QUERY_RADIUS = 95,
+    // READ: per body, the largest untruncated vertex displacement rate of the last DAT pass.
+    NUKA_FIELD_DAT_BODY_MOTION = 96,
+    // READ: per link, the untruncated joint speed of the last DAT pass and the detection bound.
+    NUKA_FIELD_DAT_JOINT_MOTION = 97,
+    NUKA_FIELD_DAT_JOINT_RATE = 98,
+    // READ: per environment, eight uint64 nanoseconds of the latest colored solve: warm start,
+    // vertex, color, chain, Schur, hub, stationarity and position phases.
+    NUKA_FIELD_SOLVER_PHASE_TIME = 99,
+    // READ: per VBD vertex, twenty float32 columns from the last solve call, environment-major.
+    NUKA_FIELD_VBD_SOLVE_AUDIT = 100
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

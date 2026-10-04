@@ -111,9 +111,14 @@ struct ModelView {
     ::nuka::collision::MeshBvhNode* mesh_edge_nodes = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_edge_nodes
     uint32_t* mesh_triangle_edges = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_triangles*3
     uint32_t* mesh_triangle_vertex_owner = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_triangles*3
+    uint32_t* mesh_vertex_edge_offsets = nullptr;  // per:scalar arena:persistent owner:model count:max_hull_verts+1
+    uint32_t* mesh_vertex_edges = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_edges*2
+    uint32_t* mesh_vertex_triangle_offsets = nullptr;  // per:scalar arena:persistent owner:model count:max_hull_verts+1
+    uint32_t* mesh_vertex_triangles = nullptr;  // per:scalar arena:persistent owner:model count:max_mesh_triangles*3
     uint64_t* mesh_vertex_sources = nullptr;  // per:scalar arena:persistent owner:model count:mesh_vertex_source_count
     uint64_t* mesh_edge_sources = nullptr;  // per:scalar arena:persistent owner:model count:mesh_edge_source_count
     uint8_t* mesh_contact_mode = nullptr;  // per:scalar arena:persistent owner:model count:max_bodies_total
+    float* mesh_vertex_reach = nullptr;  // per:scalar arena:persistent owner:model count:mesh_surface_info_count
     ::nuka::collision::MeshSurfaceInfo* particle_surface_info = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
     uint32_t* particle_surface_triangles = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_triangles*3
     ::nuka::collision::MeshBvhNode* particle_surface_tree = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_nodes_per_env
@@ -122,6 +127,10 @@ struct ModelView {
     ::nuka::collision::MeshBvhNode* particle_surface_edge_tree = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_edge_nodes_per_env
     uint32_t* particle_surface_triangle_edges = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_triangles*3
     uint32_t* particle_surface_triangle_vertex_owner = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_triangles*3
+    uint32_t* particle_surface_vertex_edge_offsets = nullptr;  // per:scalar arena:persistent owner:model count:particles_per_env+1
+    uint32_t* particle_surface_vertex_edges = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_edges_per_env*2
+    uint32_t* particle_surface_vertex_triangle_offsets = nullptr;  // per:scalar arena:persistent owner:model count:particles_per_env+1
+    uint32_t* particle_surface_vertex_triangles = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_triangles*3
     float* particle_surface_thickness = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
     float* particle_surface_friction = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
     ::nuka::nk::VbdElement* vbd_elements = nullptr;  // per:scalar arena:persistent owner:model count:vbd_elements_per_env
@@ -399,9 +408,10 @@ struct DataView {
     uint32_t* contact_solve_counts = nullptr;  // per:env arena:scratch owner:data elem:2 flags:[readout]
     uint32_t* pair_sample_chunks = nullptr;  // per:scalar arena:scratch owner:data count:pair_sample_chunk_words
     uint32_t* solve_color_scratch = nullptr;  // per:scalar arena:scratch owner:data count:solve_color_scratch_words
+    uint32_t* block_descent_scratch = nullptr;  // per:scalar arena:scratch owner:data count:block_descent_scratch_words
     ::nuka::math::SymmetricMat3* particle_response = nullptr;  // per:particle arena:scratch owner:data
     ::nuka::math::Vec3* particle_row_impulse = nullptr;  // per:particle arena:scratch owner:data
-    ::nuka::math::Vec3* vbd_target = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
+    ::nuka::math::Vec3* vbd_free_rate = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
     ::nuka::math::Vec3* vbd_offset = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
     float* vbd_inertia = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
     ::nuka::math::Vec3* vbd_history_vel = nullptr;  // per:scalar arena:persistent owner:data count:vbd_vertices_per_env*env_count
@@ -411,11 +421,15 @@ struct DataView {
     float* dat_particle_beta = nullptr;  // per:particle arena:scratch owner:data flags:[readout]
     uint32_t* dat_body_beta = nullptr;  // per:body arena:scratch owner:data
     uint32_t* dat_artic_beta = nullptr;  // per:articulation arena:scratch owner:data
+    uint64_t* dat_artic_witness = nullptr;  // per:articulation arena:scratch owner:data elem:4
     float* dat_prev_q = nullptr;  // per:link arena:scratch owner:data
     ::nuka::math::Transform* dat_prev_base_pose = nullptr;  // per:articulation arena:scratch owner:data
     ::nuka::math::Transform* dat_prev_body_pose = nullptr;  // per:body arena:scratch owner:data
     float* dat_body_speed = nullptr;  // per:body arena:scratch owner:data
     float* dat_body_query_radius = nullptr;  // per:body arena:scratch owner:data
+    float* dat_body_motion = nullptr;  // per:body arena:persistent owner:data
+    float* dat_joint_motion = nullptr;  // per:link arena:persistent owner:data
+    float* dat_joint_rate = nullptr;  // per:link arena:scratch owner:data
     uint32_t* dat_pair_kind = nullptr;  // per:contact_slot arena:scratch owner:data
     uint32_t* dat_pair_owner_a = nullptr;  // per:contact_slot arena:scratch owner:data
     uint32_t* dat_pair_owner_b = nullptr;  // per:contact_slot arena:scratch owner:data
@@ -440,7 +454,8 @@ struct DataView {
     uint32_t* mesh_ogc_pair_count = nullptr;  // per:env arena:scratch owner:data
     uint32_t* mesh_sdf_pair_count = nullptr;  // per:env arena:scratch owner:data
     uint32_t* vbd_velocity_sweep_count = nullptr;  // per:env arena:scratch owner:data
-    uint32_t* solver_color_counts = nullptr;  // per:env arena:scratch owner:data elem:2
+    uint32_t* solver_color_counts = nullptr;  // per:env arena:scratch owner:data elem:6
+    uint64_t* solver_phase_time = nullptr;  // per:env arena:scratch owner:data elem:8
     float* dat_surface_motion = nullptr;  // per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count
     float* energy_ledger = nullptr;  // per:scalar arena:scratch owner:data elem:32 count:integration_substeps*env_count flags:[readout]
     uint32_t* energy_ledger_status = nullptr;  // per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout]
@@ -461,6 +476,16 @@ struct DataView {
     ::nuka::nk::Spatial6* energy_link_velocity = nullptr;  // per:link arena:scratch owner:data
     float* energy_qdot_free = nullptr;  // per:articulation_dof arena:scratch owner:data
     float* vbd_force_residual_work = nullptr;  // per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout]
+    float* m_inv_coupled = nullptr;  // per:articulation_dof2 arena:scratch owner:data
+    float* m_reduced = nullptr;  // per:articulation_dof2 arena:scratch owner:data
+    uint32_t* mimic_root_dof = nullptr;  // per:articulation_dof arena:scratch owner:data
+    float* mimic_root_scale = nullptr;  // per:articulation_dof arena:scratch owner:data
+    float* mimic_projection_loss = nullptr;  // per:articulation arena:scratch owner:data
+    ::nuka::nk::vbd::MembraneStartState* vbd_membrane_start = nullptr;  // per:scalar arena:scratch owner:data count:vbd_elements_per_env*env_count
+    uint32_t* crba_scratch = nullptr;  // per:scalar arena:scratch owner:data count:articulations_per_env*env_count*dofs_per_env*(dofs_per_env+12)
+    float* vbd_solve_audit = nullptr;  // per:scalar arena:scratch owner:data elem:20 count:vbd_vertices_per_env*env_count flags:[readout]
+    uint32_t* control_scratch = nullptr;  // per:articulation_dof arena:scratch owner:data elem:8
+    ::nuka::math::Vec3* vbd_free_velocity = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
 };
 
 } // namespace nuka::phi

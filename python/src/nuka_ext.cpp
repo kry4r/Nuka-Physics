@@ -141,6 +141,14 @@ public:
     ~StateCheckpoint() { close(); }
 
     nuka_checkpoint_handle raw() const { return h_; }
+    void write(const std::string& path) const {
+        check(nuka_checkpoint_write(h_, path.c_str()), "nuka_checkpoint_write");
+    }
+    static StateCheckpoint* read(nuka_world_handle world, const std::string& path) {
+        nuka_checkpoint_handle checkpoint = nullptr;
+        check(nuka_world_checkpoint_read(world, path.c_str(), &checkpoint), "nuka_world_checkpoint_read");
+        return new StateCheckpoint(checkpoint);
+    }
 
 private:
     explicit StateCheckpoint(nuka_checkpoint_handle checkpoint) : h_(checkpoint) {}
@@ -524,6 +532,9 @@ public:
 
     StateCheckpoint* capture_checkpoint() {
         return StateCheckpoint::capture(h_);
+    }
+    StateCheckpoint* read_checkpoint(const std::string& path) {
+        return StateCheckpoint::read(h_, path);
     }
     void restore_checkpoint(StateCheckpoint* checkpoint) {
         if (checkpoint == nullptr || checkpoint->raw() == nullptr) {
@@ -1928,6 +1939,15 @@ NB_MODULE(_nuka_ext, m) {
         .value("VBD_ELEMENTS", NUKA_FIELD_VBD_ELEMENTS)
         .value("DAT_QUERY_LIMIT_COUNT", NUKA_FIELD_DAT_QUERY_LIMIT_COUNT)
         .value("DAT_FAILURE_WITNESS", NUKA_FIELD_DAT_FAILURE_WITNESS)
+        .value("DAT_ARTICULATION_WITNESS", NUKA_FIELD_DAT_ARTICULATION_WITNESS)
+        .value("DAT_ARTICULATION_FRACTION", NUKA_FIELD_DAT_ARTICULATION_FRACTION)
+        .value("DAT_BODY_SPEED", NUKA_FIELD_DAT_BODY_SPEED)
+        .value("DAT_BODY_QUERY_RADIUS", NUKA_FIELD_DAT_BODY_QUERY_RADIUS)
+        .value("DAT_BODY_MOTION", NUKA_FIELD_DAT_BODY_MOTION)
+        .value("DAT_JOINT_MOTION", NUKA_FIELD_DAT_JOINT_MOTION)
+        .value("DAT_JOINT_RATE", NUKA_FIELD_DAT_JOINT_RATE)
+        .value("SOLVER_PHASE_TIME", NUKA_FIELD_SOLVER_PHASE_TIME)
+        .value("VBD_SOLVE_AUDIT", NUKA_FIELD_VBD_SOLVE_AUDIT)
         .value("CONTACT_WARM_START_COUNTS", NUKA_FIELD_CONTACT_WARM_START_COUNTS)
         .value("DAT_TRUNCATION_COUNT", NUKA_FIELD_DAT_TRUNCATION_COUNT)
         .value("DAT_TRUNCATION_ENERGY", NUKA_FIELD_DAT_TRUNCATION_ENERGY)
@@ -2070,6 +2090,8 @@ NB_MODULE(_nuka_ext, m) {
 
     nb::class_<StateCheckpoint>(m, "StateCheckpoint")
         .def("close", &StateCheckpoint::close, "Destroy the checkpoint handle.")
+        .def("write", &StateCheckpoint::write, nb::arg("path"),
+             "Write the persistent physics bytes and step count to a file.")
         .def("__enter__", [](StateCheckpoint& checkpoint) -> StateCheckpoint& {
             return checkpoint;
         }, nb::rv_policy::reference)
@@ -2242,6 +2264,10 @@ NB_MODULE(_nuka_ext, m) {
              "Restore a checkpoint captured from this world: rewinds device bytes "
              "plus the host step counter, options, noise/DR state, and the "
              "link-inertia/armature mirror.")
+        .def("read_checkpoint", &World::read_checkpoint, nb::arg("path"),
+             nb::rv_policy::take_ownership,
+             "Read a written checkpoint for this world's layout; host configuration "
+             "comes from this world. Apply it with restore_checkpoint.")
         .def("state_hash", &World::state_hash,
              "Return the deterministic 64-bit hash of the world: persistent "
              "simulation bytes plus host step/config/noise/DR state.")

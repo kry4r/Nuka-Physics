@@ -46,6 +46,8 @@ public:
     // Capture or restore the complete persistent arena. This is the production
     // checkpoint boundary for all cross-step state, including warm-start caches.
     uint64_t PersistentByteSize() const;
+    // FNV-1a hash of the persistent segment table, so saved bytes only load into the same layout.
+    uint64_t PersistentLayoutHash() const;
     bool DownloadPersistent(std::vector<uint8_t>* out) const;
     bool UploadPersistent(const std::vector<uint8_t>& bytes) const;
 

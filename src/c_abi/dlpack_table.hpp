@@ -260,6 +260,20 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeU32, nk::FieldId::VbdElements},
     {NUKA_FIELD_DAT_FAILURE_WITNESS, nk::LayoutOf(nk::FieldId::DatFailureWitness).elem_size,
         kWireDtypeU64, nk::FieldId::DatFailureWitness},
+    {NUKA_FIELD_DAT_ARTICULATION_WITNESS, nk::LayoutOf(nk::FieldId::DatArticWitness).elem_size,
+        kWireDtypeU64, nk::FieldId::DatArticWitness},
+    // The fraction is stored as float bits for an order-independent atomic minimum.
+    {NUKA_FIELD_DAT_ARTICULATION_FRACTION, kStrideF32, kWireDtypeF32, nk::FieldId::DatArticBeta},
+    {NUKA_FIELD_DAT_BODY_SPEED, kStrideF32, kWireDtypeF32, nk::FieldId::DatBodySpeed},
+    {NUKA_FIELD_DAT_BODY_QUERY_RADIUS, kStrideF32, kWireDtypeF32,
+        nk::FieldId::DatBodyQueryRadius},
+    {NUKA_FIELD_DAT_BODY_MOTION, kStrideF32, kWireDtypeF32, nk::FieldId::DatBodyMotion},
+    {NUKA_FIELD_DAT_JOINT_MOTION, kStrideF32, kWireDtypeF32, nk::FieldId::DatJointMotion},
+    {NUKA_FIELD_DAT_JOINT_RATE, kStrideF32, kWireDtypeF32, nk::FieldId::DatJointRate},
+    {NUKA_FIELD_SOLVER_PHASE_TIME, nk::LayoutOf(nk::FieldId::SolverPhaseTime).elem_size,
+        kWireDtypeU64, nk::FieldId::SolverPhaseTime},
+    {NUKA_FIELD_VBD_SOLVE_AUDIT, nk::LayoutOf(nk::FieldId::VbdSolveAudit).elem_size,
+        kWireDtypeF32, nk::FieldId::VbdSolveAudit},
 };
 
 inline constexpr size_t kDlpackFieldCount =
@@ -268,9 +282,11 @@ static_assert(NUKA_ENERGY_COLUMN_COUNT == nk::kEnergyColumnCount,
               "public energy record columns must match the physics readout");
 static_assert(nk::LayoutOf(nk::FieldId::PhysicsStageMetrics).elem_size ==
               nk::kEnergyStageCount * nk::kPhysicsStageColumnCount * sizeof(float));
+static_assert(nk::LayoutOf(nk::FieldId::VbdSolveAudit).elem_size ==
+              nk::kVbdSolveAuditColumnCount * sizeof(float));
 
 // Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 92u,
+static_assert(kDlpackFieldCount == 101u,
               "public field table extent must match the append-only field enum");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");

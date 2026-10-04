@@ -52,6 +52,11 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::Rows:                v.rows = static_cast<float*>(p); break;
         case FieldId::Lambda:              v.lambda = static_cast<float*>(p); break;
         case FieldId::MInv:                v.m_inv = static_cast<float*>(p); break;
+        case FieldId::MInvCoupled:         v.m_inv_coupled = static_cast<float*>(p); break;
+        case FieldId::MReduced:            v.m_reduced = static_cast<float*>(p); break;
+        case FieldId::MimicRootDof:        v.mimic_root_dof = static_cast<uint32_t*>(p); break;
+        case FieldId::MimicRootScale:      v.mimic_root_scale = static_cast<float*>(p); break;
+        case FieldId::MimicProjectionLoss: v.mimic_projection_loss = static_cast<float*>(p); break;
         case FieldId::ParticlePos:         v.particle_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::MatBuckets:          v.mat_buckets = static_cast<float*>(p); break;
         case FieldId::MatIndex:            v.mat_index = static_cast<uint32_t*>(p); break;
@@ -226,11 +231,15 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::DatParticleBeta: v.dat_particle_beta = static_cast<float*>(p); break;
         case FieldId::DatBodyBeta: v.dat_body_beta = static_cast<uint32_t*>(p); break;
         case FieldId::DatArticBeta: v.dat_artic_beta = static_cast<uint32_t*>(p); break;
+        case FieldId::DatArticWitness: v.dat_artic_witness = static_cast<uint64_t*>(p); break;
         case FieldId::DatPrevQ: v.dat_prev_q = static_cast<float*>(p); break;
         case FieldId::DatPrevBasePose: v.dat_prev_base_pose = static_cast<math::Transform*>(p); break;
         case FieldId::DatPrevBodyPose: v.dat_prev_body_pose = static_cast<math::Transform*>(p); break;
         case FieldId::DatBodySpeed: v.dat_body_speed = static_cast<float*>(p); break;
         case FieldId::DatBodyQueryRadius: v.dat_body_query_radius = static_cast<float*>(p); break;
+        case FieldId::DatBodyMotion: v.dat_body_motion = static_cast<float*>(p); break;
+        case FieldId::DatJointMotion: v.dat_joint_motion = static_cast<float*>(p); break;
+        case FieldId::DatJointRate: v.dat_joint_rate = static_cast<float*>(p); break;
         case FieldId::DatPairKind: v.dat_pair_kind = static_cast<uint32_t*>(p); break;
         case FieldId::DatPairOwnerA: v.dat_pair_owner_a = static_cast<uint32_t*>(p); break;
         case FieldId::DatPairOwnerB: v.dat_pair_owner_b = static_cast<uint32_t*>(p); break;
@@ -250,7 +259,9 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::DatFailureWitness: v.dat_failure_witness = static_cast<uint64_t*>(p); break;
         case FieldId::VbdVelocitySweepCount: v.vbd_velocity_sweep_count = static_cast<uint32_t*>(p); break;
         case FieldId::VbdSolveMetrics: v.vbd_solve_metrics = static_cast<uint64_t*>(p); break;
+        case FieldId::VbdSolveAudit: v.vbd_solve_audit = static_cast<float*>(p); break;
         case FieldId::SolverColorCounts: v.solver_color_counts = static_cast<uint32_t*>(p); break;
+        case FieldId::SolverPhaseTime: v.solver_phase_time = static_cast<uint64_t*>(p); break;
         case FieldId::ContactWarmStartCounts: v.contact_warm_start_counts = static_cast<uint32_t*>(p); break;
         case FieldId::VbdStep: v.vbd_step = static_cast<float*>(p); break;
         case FieldId::VbdRestart: v.vbd_restart = static_cast<uint32_t*>(p); break;
@@ -323,7 +334,9 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::PbfPredictedPos:     v.pbf_predicted_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleProjectionDelta: v.particle_projection_delta = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleResponse: v.particle_response = static_cast<math::SymmetricMat3*>(p); break;
-        case FieldId::VbdTarget: v.vbd_target = static_cast<math::Vec3*>(p); break;
+        case FieldId::VbdFreeRate: v.vbd_free_rate = static_cast<math::Vec3*>(p); break;
+        case FieldId::VbdFreeVelocity: v.vbd_free_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::VbdMembraneStart: v.vbd_membrane_start = static_cast<vbd::MembraneStartState*>(p); break;
         case FieldId::VbdOffset: v.vbd_offset = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdInertia: v.vbd_inertia = static_cast<float*>(p); break;
         case FieldId::ParticleRowImpulse: v.particle_row_impulse = static_cast<math::Vec3*>(p); break;
@@ -356,6 +369,9 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::SolverVelocityScratch: v.solver_velocity_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSampleChunks: v.pair_sample_chunks = static_cast<uint32_t*>(p); break;
         case FieldId::SolveColorScratch: v.solve_color_scratch = static_cast<uint32_t*>(p); break;
+        case FieldId::CrbaScratch: v.crba_scratch = static_cast<uint32_t*>(p); break;
+        case FieldId::ControlScratch: v.control_scratch = static_cast<uint32_t*>(p); break;
+        case FieldId::BlockDescentScratch: v.block_descent_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::ContactSolveMetrics: v.contact_solve_metrics = static_cast<uint64_t*>(p); break;
         case FieldId::ContactSolveCounts: v.contact_solve_counts = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
@@ -410,6 +426,20 @@ uint64_t Data::PersistentByteSize() const {
         }
     }
     return span == 0u ? 256u : span;
+}
+
+uint64_t Data::PersistentLayoutHash() const {
+    uint64_t hash = 14695981039346656037ull;
+    const auto mix = [&hash](uint64_t value) {
+        for (int byte = 0; byte < 8; ++byte, value >>= 8u) hash = (hash ^ (value & 0xFFu)) * 1099511628211ull;
+    };
+    for (const Arena::Segment& segment : arena_.Segments()) {
+        if (segment.arena != 0u) continue;
+        mix(static_cast<uint64_t>(segment.field));
+        mix(segment.offset);
+        mix(segment.bytes);
+    }
+    return hash;
 }
 
 bool Data::DownloadPersistent(std::vector<uint8_t>* out) const {

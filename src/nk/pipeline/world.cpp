@@ -75,7 +75,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     const uint64_t row_count =
         (control_cap.max_contacts_per_env - point_slots) * kPairDrivenRowsPerSlot +
         point_slots * kPairDrivenParticleRowsPerSlot + control_cap.joint_limit_rows_per_env +
-        control_cap.joint_friction_rows_per_env + control_cap.mimic_rows_per_env + drive_rows +
+        control_cap.joint_friction_rows_per_env + drive_rows +
         uint64_t{control_cap.mpm_stress_cells_per_env} * kMpmStressRowsPerCell +
         uint64_t{control_cap.dist_cons_per_env} + control_cap.vol_cons_per_env;
     if (row_count > std::numeric_limits<uint32_t>::max()) {
@@ -215,6 +215,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         if (call.op == phi::NkOp::SolveRowsBlockIsland)
             model_.capacities.solve_color_scratch_words = std::max(model_.capacities.solve_color_scratch_words,
                 phi::SolveColorScratchWords(*static_cast<const phi::SolveRowsBlockIslandParams*>(call.params)));
+        if (call.op == phi::NkOp::BlockDescentSolve)
+            model_.capacities.block_descent_scratch_words = std::max(model_.capacities.block_descent_scratch_words,
+                phi::BlockDescentScratchWords(*static_cast<const phi::BlockDescentSolveParams*>(call.params)));
     }
     model_.capacities.pair_sort_scratch_bytes =
         (pair_sort_slots > 0u &&
@@ -831,9 +834,10 @@ phi::Status World::SetCouplingPasses(uint32_t passes) {
 phi::Status World::SetVelocityIterations(uint32_t iterations) {
     if (!ready_ || iterations == 0u || iterations > UINT16_MAX)
         return last_status_ = phi::Status::InvalidArgument;
-    if (iterations == cfg_.vel_iters) return last_status_ = phi::Status::Ok;
+    if (iterations == VelocityIterations()) return last_status_ = phi::Status::Ok;
     auto config = cfg_;
     config.vel_iters = static_cast<uint16_t>(iterations);
+    config.velocity_iterations_override = true;
     auto candidate = std::make_unique<Pipeline>();
     last_status_ = candidate->Build(model_, config, device_, readout_demand_, &state_sensors_);
     if (last_status_ != phi::Status::Ok) return last_status_;
@@ -883,6 +887,8 @@ phi::Status World::SetLinkInertia(uint32_t link_index, const Mat36& inertia) {
 
 phi::Status World::DemandReadout(FieldId id) {
     uint32_t bit = 0u;
+    if (id == FieldId::VbdSolveAudit)
+        bit = Pipeline::kReadoutVbdSolveAudit;
     if (id == FieldId::PhysicsStageMetrics)
         bit = Pipeline::kReadoutEnergyLedger | Pipeline::kReadoutPhysicsDiagnostics;
     if (id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
