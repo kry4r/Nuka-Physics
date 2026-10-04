@@ -551,7 +551,8 @@ nuka_result_t nuka_world_create_from_built_scene(
         // Build + insert the live world through the SAME record-assembly path. The
         // SolverConfig overrides ride `options`; all-zero/NULL keeps today's cfg.
         const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
-            std::move(cooked.model), std::move(built), std::move(cooked_terrain),
+            std::move(cooked.model), std::move(cooked.blob), std::move(built),
+            std::move(cooked_terrain),
             device_record, desc->fixed_dt, desc->env_count, control_mode, gravity,
             desc->osc_task_link, out, options ? options->solver_vel_iters : 0u,
             options ? options->solver_pos_iters : 0u,

@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -28,6 +30,10 @@ bool IsSupportedJoint(scene::JointType type) {
     return type == scene::JointType::Revolute ||
            type == scene::JointType::Prismatic ||
            type == scene::JointType::Fixed;
+}
+
+[[noreturn]] void RejectJoint(uint32_t joint_index, const char* reason) {
+    throw std::invalid_argument("articulation cook: joint " + std::to_string(joint_index) + " " + reason);
 }
 
 math::Vec3 BodyInertia(const scene::CookedBlob& blob, scene::BodyId body) {
@@ -95,22 +101,34 @@ float FloatOrDefault(const std::vector<float>& values, uint32_t index, float fal
 std::vector<ArticulationCookedTopology> CookArticulations(const scene::CookedBlob& blob) {
     std::vector<uint32_t> child_joint(blob.body_count, scene::kInvalidJoint);
     std::vector<std::vector<uint32_t>> children(blob.body_count);
+    std::vector<uint8_t> attached(blob.body_count, 0u);
 
     for (uint32_t joint_index = 0u; joint_index < blob.joint_count; ++joint_index) {
         if (joint_index >= blob.joints.parent_bodies.size() ||
             joint_index >= blob.joints.child_bodies.size()) {
-            continue;
+            RejectJoint(joint_index, "has no parent or child entry");
         }
         const scene::JointType type = joint_index < blob.joints.types.size()
             ? blob.joints.types[joint_index]
             : scene::JointType::Revolute;
-        if (!IsSupportedJoint(type)) {
-            continue;
-        }
         const scene::BodyId parent = blob.joints.parent_bodies[joint_index];
         const scene::BodyId child = blob.joints.child_bodies[joint_index];
-        if (parent >= blob.body_count || child >= blob.body_count) {
+        if (child >= blob.body_count || child == parent) {
+            RejectJoint(joint_index, "has no distinct child body");
+        }
+        if (attached[child] != 0u) {
+            RejectJoint(joint_index, "gives its child a second parent joint");
+        }
+        attached[child] = 1u;
+        // A free joint leaves its child a floating root.
+        if (type == scene::JointType::Free) {
             continue;
+        }
+        if (!IsSupportedJoint(type)) {
+            RejectJoint(joint_index, "has a type the articulation does not support");
+        }
+        if (parent >= blob.body_count) {
+            RejectJoint(joint_index, "attaches its child to the world");
         }
         child_joint[child] = joint_index;
         children[parent].push_back(joint_index);
@@ -212,6 +230,12 @@ std::vector<ArticulationCookedTopology> CookArticulations(const scene::CookedBlo
 
         if (topology.link_bodies.size() > 1u) {
             result.push_back(std::move(topology));
+        }
+    }
+
+    for (scene::BodyId body = 0u; body < blob.body_count; ++body) {
+        if (has_parent[body] != 0u && visited[body] == 0u) {
+            RejectJoint(child_joint[body], "closes a kinematic loop");
         }
     }
 

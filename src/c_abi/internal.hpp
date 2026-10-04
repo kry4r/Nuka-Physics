@@ -313,7 +313,8 @@ nuka_result_t ApplyControlTerrainGravity(
 // SolverConfig (each 0 keeps the engine default). On success writes *out and
 // returns OK; on a failed build returns INTERNAL and leaves *out null.
 nuka_result_t FinishWorldCreate(
-    nuka::nk::Model&& cooked_model, nuka::scene::SceneIR&& scene,
+    nuka::nk::Model&& cooked_model, std::shared_ptr<const nuka::scene::CookedBlob> blob,
+    nuka::scene::SceneIR&& scene,
     nuka::terrain::HeightField&& cooked_terrain, DeviceRecord* device_record,
     float fixed_dt, uint32_t env_count,
     runtime::articulation::ControlMode control_mode,

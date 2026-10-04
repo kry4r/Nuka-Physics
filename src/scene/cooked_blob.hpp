@@ -291,6 +291,7 @@ struct CookedMeshReport {
     uint32_t source_edges = 0u;
     uint32_t nonmanifold_edges = 0u;
     float sampled_one_sided_hausdorff = 0.0f;
+    float sampled_reverse_hausdorff = 0.0f;  // the cooked surface from the source, metres
     float min_altitude = 0.0f;  // smallest triangle altitude of the cooked mesh, metres
 };
 

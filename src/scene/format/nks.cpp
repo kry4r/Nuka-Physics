@@ -437,6 +437,8 @@ Value SaveShape(const CollisionShapeRecord& s, MeshSink& sink, bool is_visual) {
         o.Set("mesh_contact", Value::Str("sdf"));
     if (s.mesh_triangle_limit > 0u)
         o.Set("mesh_triangle_limit", Value::Int(s.mesh_triangle_limit));
+    if (s.mesh_error_limit > 0.0f)
+        o.Set("mesh_error_limit", Value::Float(s.mesh_error_limit));
     // Inline mesh geometry -> .nka MESH (visual-only) / CMSH (colliding) chunk,
     // deduped; store the AssetRef text under the same "mesh" key. Routing matches
     // the facade projection so a non-colliding geom (the h1/go2 visual meshes)
@@ -1395,6 +1397,12 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 if (count <= 0 || static_cast<uint64_t>(count) > std::numeric_limits<uint32_t>::max())
                     throw std::runtime_error("NKS: invalid mesh_triangle_limit");
                 rec.mesh_triangle_limit = static_cast<uint32_t>(count);
+            }
+            if (const Value* v = s->Find("mesh_error_limit")) {
+                const float limit = v->AsFloat();
+                if (!(limit > 0.0f && limit <= 0.001f))
+                    throw std::runtime_error("NKS: invalid mesh_error_limit");
+                rec.mesh_error_limit = limit;
             }
             if (const Value* v = s->Find("decompose_max_pieces"))
                 rec.decompose_max_pieces = static_cast<uint32_t>(v->AsInt());

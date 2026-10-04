@@ -36,6 +36,8 @@ struct UsdPrim {
     bool has_collision_api = false;
     bool rigid_body_enabled = false;
     bool kinematic_enabled = false;
+    bool exclude_from_articulation = false;  // physics:excludeFromArticulation
+    bool joint_enabled = true;               // physics:jointEnabled
     float mass = 1.0f;
     math::Vec3 diagonal_inertia = {1.0f, 1.0f, 1.0f};
     math::Vec3 translate = math::Vec3::Zero();
@@ -167,11 +169,12 @@ bool ParseBoolValue(const std::string& line, std::string_view key, bool& value) 
         return false;
     }
     const std::string rhs = Lowercase(Trim(std::string_view(line).substr(equals + 1)));
-    if (StartsWith(rhs, "true")) {
+    const std::string token = rhs.substr(0, rhs.find_first_of(" \t()"));
+    if (StartsWith(rhs, "true") || token == "1") {
         value = true;
         return true;
     }
-    if (StartsWith(rhs, "false")) {
+    if (StartsWith(rhs, "false") || token == "0") {
         value = false;
         return true;
     }
@@ -394,6 +397,8 @@ void ApplyPropertyLine(const std::string& line, UsdPrim& prim) {
     ApplyApiSchemas(line, prim);
     (void)ParseBoolValue(line, "physics:rigidBodyEnabled", prim.rigid_body_enabled);
     (void)ParseBoolValue(line, "physics:kinematicEnabled", prim.kinematic_enabled);
+    (void)ParseBoolValue(line, "physics:excludeFromArticulation", prim.exclude_from_articulation);
+    (void)ParseBoolValue(line, "physics:jointEnabled", prim.joint_enabled);
     (void)ParseFloatValue(line, "physics:mass", prim.mass);
     (void)ParseVec3Value(line, "physics:diagonalInertia", prim.diagonal_inertia);
     (void)ParseVec3Value(line, "xformOp:translate", prim.translate);
@@ -896,10 +901,11 @@ std::vector<uint32_t> FanTriangulate(const std::vector<int>& indices,
 }
 
 bool IsJointPrim(const UsdPrim& prim) {
-    return StartsWith(prim.type, "Physics") && prim.type.find("Joint") != std::string::npos;
+    return (StartsWith(prim.type, "Physics") || StartsWith(prim.type, "Physx")) &&
+           prim.type.find("Joint") != std::string::npos;
 }
 
-scene::JointType JointTypeFromUsdType(const std::string& type) {
+scene::JointType JointTypeFromUsdType(const std::string& type, const std::string& name) {
     if (type == "PhysicsRevoluteJoint") {
         return scene::JointType::Revolute;
     }
@@ -912,7 +918,7 @@ scene::JointType JointTypeFromUsdType(const std::string& type) {
     if (type == "PhysicsFixedJoint") {
         return scene::JointType::Fixed;
     }
-    return scene::JointType::Fixed;
+    throw std::runtime_error("USD: joint '" + name + "' has unsupported type '" + type + "'");
 }
 
 math::Vec3 AxisFromUsdToken(const std::string& axis) {
@@ -1126,6 +1132,13 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         if (!IsJointPrim(prim)) {
             continue;
         }
+        if (prim.exclude_from_articulation) {
+            throw std::runtime_error("USD: joint '" + prim.name +
+                                     "' is excluded from the articulation; loop joints are unsupported");
+        }
+        if (!prim.joint_enabled) {
+            throw std::runtime_error("USD: joint '" + prim.name + "' is disabled; disabled joints are unsupported");
+        }
         const auto parent_it = body_map.find(prim.body0_path);
         const auto child_it = body_map.find(prim.body1_path);
         if (parent_it == body_map.end() || child_it == body_map.end()) {
@@ -1133,7 +1146,7 @@ scene::SceneIR BuildSceneFromUsdPrims(const std::vector<UsdPrim>& prims) {
         }
         scene::JointRecord joint;
         joint.name = prim.name;
-        joint.type = JointTypeFromUsdType(prim.type);
+        joint.type = JointTypeFromUsdType(prim.type, prim.name);
         joint.parent_body = parent_it->second;
         joint.child_body = child_it->second;
         joint.axis = AxisFromUsdToken(prim.axis_token);

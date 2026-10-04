@@ -109,15 +109,13 @@ void LoadUrdfMesh(const tinyxml2::XMLElement* element, const std::filesystem::pa
 }
 
 /// Map URDF joint type strings to JointType.
-scene::JointType UrdfJointType(const char* type_str) {
-    if (!type_str) return scene::JointType::Fixed;
-    const std::string t(type_str);
+scene::JointType UrdfJointType(const char* type_str, const std::string& joint_name) {
+    const std::string t = type_str ? type_str : "";
     if (t == "revolute"   || t == "continuous") return scene::JointType::Revolute;
     if (t == "prismatic")                       return scene::JointType::Prismatic;
     if (t == "fixed")                           return scene::JointType::Fixed;
     if (t == "floating")                        return scene::JointType::Free;
-    if (t == "planar")                          return scene::JointType::Free;
-    return scene::JointType::Fixed;
+    throw std::runtime_error("URDF: joint '" + joint_name + "' has unsupported type '" + t + "'");
 }
 
 /// Map URDF collision geometry to ShapeType.
@@ -263,6 +261,13 @@ scene::SceneIR LoadUrdf(const std::string& path) {
                     throw std::runtime_error("URDF: invalid mesh triangle limit");
                 shape.mesh_triangle_limit = limit;
             }
+            if (auto* error = collision->FirstChildElement("nuka:mesh_error_limit")) {
+                float limit = 0.0f;
+                if (error->QueryFloatAttribute("value", &limit) != tinyxml2::XML_SUCCESS ||
+                    !(limit > 0.0f && limit <= 0.001f))
+                    throw std::runtime_error("URDF: invalid mesh error limit");
+                shape.mesh_error_limit = limit;
+            }
 
             scene.AddCollisionShape(std::move(shape));
         }
@@ -359,29 +364,19 @@ scene::SceneIR LoadUrdf(const std::string& path) {
 
         scene::JointRecord jrec;
         jrec.name = joint_name;
-        jrec.type = UrdfJointType(joint->Attribute("type"));
+        jrec.type = UrdfJointType(joint->Attribute("type"), joint_name);
 
-        // <parent link="..."/>
-        if (auto* parent = joint->FirstChildElement("parent")) {
-            const char* plink = parent->Attribute("link");
-            if (plink) {
-                auto it = link_map.find(plink);
-                if (it != link_map.end()) {
-                    jrec.parent_body = it->second;
-                }
-            }
-        }
-
-        // <child link="..."/>
-        if (auto* child = joint->FirstChildElement("child")) {
-            const char* clink = child->Attribute("link");
-            if (clink) {
-                auto it = link_map.find(clink);
-                if (it != link_map.end()) {
-                    jrec.child_body = it->second;
-                }
-            }
-        }
+        // <parent link="..."/> and <child link="..."/> must name declared links.
+        auto link_body = [&](const char* tag) {
+            const auto* element = joint->FirstChildElement(tag);
+            const char* link = element ? element->Attribute("link") : nullptr;
+            const auto it = link ? link_map.find(link) : link_map.end();
+            if (it == link_map.end())
+                throw std::runtime_error("URDF: joint '" + joint_name + "' has no declared " + tag + " link");
+            return it->second;
+        };
+        jrec.parent_body = link_body("parent");
+        jrec.child_body = link_body("child");
 
         // <origin xyz="..."/>
         jrec.parent_frame = ParseOrigin(joint->FirstChildElement("origin"));

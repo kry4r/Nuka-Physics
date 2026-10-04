@@ -74,6 +74,8 @@ struct CollisionShapeRecord {
     enum class MeshContact : uint8_t { Ogc = 0, Sdf = 1 };
     MeshContact   mesh_contact            = MeshContact::Ogc;
     uint32_t      mesh_triangle_limit     = 0u;
+    // Largest sampled one-sided Hausdorff error of the reduced surface, metres; zero keeps 1 mm.
+    float         mesh_error_limit        = 0.0f;
     std::vector<float>    mesh_vertices;   // x,y,z triples (source mesh)
     std::vector<uint32_t> mesh_indices;    // triangle indices (source mesh)
     // Authored per-vertex normals (x,y,z triples, 1:1 with mesh_vertices in

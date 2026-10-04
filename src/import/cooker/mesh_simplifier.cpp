@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "collision/mesh_surface.hpp"
 #include "import/cooker/mesh_surface_cooker.hpp"
 #include "math/vec3.hpp"
 
@@ -331,11 +332,96 @@ void Collapse(std::vector<Vertex>& vertices, std::vector<Face>& faces,
         queue->push(MakeCandidate(vertices, edge.first, edge.second));
 }
 
+// Every source sample owned by a face around the collapse must lie within max_error of a face
+// that remains there; region and assignment receive those faces and the new owners.
+bool SamplesStayCovered(const std::vector<Vertex>& vertices, const std::vector<Face>& faces,
+                        const Candidate& candidate, const std::set<uint32_t>& removed,
+                        const std::vector<Vec3>& samples,
+                        const std::vector<std::vector<uint32_t>>& owned, float max_error,
+                        std::vector<uint32_t>* region,
+                        std::vector<std::pair<uint32_t, uint32_t>>* assignment) {
+    const uint32_t a = candidate.a, b = candidate.b;
+    region->clear();
+    assignment->clear();
+    for (uint32_t vertex : {a, b})
+        for (uint32_t face_id : vertices[vertex].faces)
+            if (faces[face_id].alive &&
+                std::find(region->begin(), region->end(), face_id) == region->end())
+                region->push_back(face_id);
+    struct Triangle {
+        uint32_t id;
+        Vec3 p[3];
+    };
+    std::vector<Triangle> next;
+    for (uint32_t face_id : *region) {
+        if (removed.contains(face_id)) continue;
+        Triangle triangle{face_id, {}};
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const uint32_t vertex = faces[face_id].vertices[i];
+            triangle.p[i] = vertex == a || vertex == b ? candidate.position
+                                                       : vertices[vertex].position;
+        }
+        if (!((triangle.p[1] - triangle.p[0]).Cross(triangle.p[2] - triangle.p[0]).LengthSq() > 0.0f))
+            continue;
+        next.push_back(triangle);
+    }
+    for (uint32_t face_id : *region)
+        for (uint32_t sample : owned[face_id]) {
+            float best = std::numeric_limits<float>::max();
+            uint32_t best_face = ~0u;
+            for (const Triangle& triangle : next) {
+                const auto closest = collision::ClosestTrianglePoint(
+                    samples[sample], triangle.p[0], triangle.p[1], triangle.p[2]);
+                const float squared = (samples[sample] - closest.point).LengthSq();
+                if (squared < best) {
+                    best = squared;
+                    best_face = triangle.id;
+                }
+            }
+            if (best_face == ~0u || !(std::sqrt(best) <= max_error)) return false;
+            assignment->push_back({sample, best_face});
+        }
+    return true;
+}
+
+// The points of the result that the collapse moves (its vertex, spoke midpoints and the centroids
+// of its faces) must lie within max_error of the source surface.
+bool SurfaceStaysNear(const collision::MeshSurfaceView& source, const collision::MeshSurfaceInfo& info,
+                      const std::vector<Vertex>& vertices, const std::vector<Face>& faces,
+                      const Candidate& candidate, const std::set<uint32_t>& removed,
+                      const std::vector<uint32_t>& region, float max_error) {
+    const auto near = [&](Vec3 point) {
+        float squared = 4.0f * max_error * max_error;
+        collision::MeshSurfacePoint nearest;
+        Vec3 normal{};
+        return collision::MeshNearestSearch(source, info, point, squared, nearest, normal) &&
+               nearest.triangle != ~0u && std::sqrt(squared) <= max_error;
+    };
+    const uint32_t a = candidate.a, b = candidate.b;
+    const Vec3 p = candidate.position;
+    if (!near(p)) return false;
+    std::set<uint32_t> ring;
+    for (uint32_t face_id : region) {
+        if (removed.contains(face_id)) continue;
+        Vec3 q[3];
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const uint32_t vertex = faces[face_id].vertices[i];
+            const bool moved = vertex == a || vertex == b;
+            q[i] = moved ? p : vertices[vertex].position;
+            if (!moved) ring.insert(vertex);
+        }
+        if (!near((q[0] + q[1] + q[2]) * (1.0f / 3.0f))) return false;
+    }
+    for (uint32_t vertex : ring)
+        if (!near((p + vertices[vertex].position) * 0.5f)) return false;
+    return true;
+}
+
 }  // namespace
 
 SimplifiedMesh SimplifyMeshQem(const float* positions, uint32_t vertex_count,
                                const uint32_t* indices, uint32_t triangle_count,
-                               uint32_t triangle_limit) {
+                               uint32_t triangle_limit, float max_error) {
     ValidateMeshSurfaceInput(positions, vertex_count, indices, triangle_count);
     if (triangle_limit == 0u)
         throw std::invalid_argument("Collision mesh triangle limit must be positive");
@@ -410,20 +496,73 @@ SimplifiedMesh SimplifyMeshQem(const float* positions, uint32_t vertex_count,
             }
         }
     }
+    const bool bounded = max_error > 0.0f;
+    // The points the sampled distances measure: source vertices, edge midpoints and centroids,
+    // each owned by one current face.
+    std::vector<Vec3> samples;
+    std::vector<std::vector<uint32_t>> owned(bounded ? faces.size() : 0u);
+    CookedMeshSurface source_surface;
+    collision::MeshSurfaceView source_view{};
+    if (bounded) {
+        std::vector<bool> vertex_seen(vertices.size(), false);
+        std::set<Edge> edge_seen;
+        for (uint32_t triangle = 0u; triangle < triangle_count; ++triangle) {
+            const size_t base = static_cast<size_t>(triangle) * 3u;
+            const Vec3 p[3] = {Position(positions, indices[base]),
+                               Position(positions, indices[base + 1u]),
+                               Position(positions, indices[base + 2u])};
+            const uint32_t ids[3] = {remap[indices[base]], remap[indices[base + 1u]],
+                                     remap[indices[base + 2u]]};
+            for (uint32_t k = 0u; k < 3u; ++k)
+                if (!vertex_seen[ids[k]]) {
+                    vertex_seen[ids[k]] = true;
+                    owned[triangle].push_back(static_cast<uint32_t>(samples.size()));
+                    samples.push_back(p[k]);
+                }
+            for (uint32_t k = 0u; k < 3u; ++k)
+                if (edge_seen.insert(std::minmax(ids[k], ids[(k + 1u) % 3u])).second) {
+                    owned[triangle].push_back(static_cast<uint32_t>(samples.size()));
+                    samples.push_back((p[k] + p[(k + 1u) % 3u]) * 0.5f);
+                }
+            owned[triangle].push_back(static_cast<uint32_t>(samples.size()));
+            samples.push_back((p[0] + p[1] + p[2]) * (1.0f / 3.0f));
+        }
+        source_surface = CookMeshSurface(positions, vertex_count, indices, triangle_count);
+        source_view = {positions, indices, source_surface.nodes.data(),
+                       {vertex_count, triangle_count,
+                        static_cast<uint32_t>(source_surface.nodes.size())}};
+    }
     std::priority_queue<Candidate> queue;
     for (const auto& [edge, count] : edge_counts)
         queue.push(MakeCandidate(vertices, edge.first, edge.second));
     uint32_t remaining = triangle_count;
+    std::vector<uint32_t> region;
+    std::vector<std::pair<uint32_t, uint32_t>> assignment;
     while (remaining > triangle_limit && !queue.empty()) {
         Candidate candidate = queue.top();
         queue.pop();
         if (candidate.version_a != vertices[candidate.a].version ||
             candidate.version_b != vertices[candidate.b].version) continue;
         std::set<uint32_t> removed;
-        if (!ValidCollapse(vertices, faces, candidate, &removed) &&
-            !FeasibleOnEdge(vertices, faces, &candidate, &removed)) continue;
+        if (!ValidCollapse(vertices, faces, candidate, &removed)) {
+            if (!FeasibleOnEdge(vertices, faces, &candidate, &removed)) continue;
+            // A substitute position can cost more than queued collapses; it waits for its turn.
+            if (!queue.empty() && candidate < queue.top()) {
+                queue.push(candidate);
+                continue;
+            }
+        }
+        if (bounded &&
+            (!SamplesStayCovered(vertices, faces, candidate, removed, samples, owned, max_error,
+                                 &region, &assignment) ||
+             !SurfaceStaysNear(source_view, source_surface.info, vertices, faces, candidate,
+                               removed, region, max_error))) continue;
         remaining -= static_cast<uint32_t>(removed.size());
         Collapse(vertices, faces, candidate, removed, &queue);
+        if (bounded) {
+            for (uint32_t face_id : region) owned[face_id].clear();
+            for (const auto& [sample, face_id] : assignment) owned[face_id].push_back(sample);
+        }
     }
     SimplifiedMesh result;
     std::vector<uint32_t> compact(vertices.size(), ~0u);

@@ -94,29 +94,17 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
     return false;
 }
 
-// Capture the transitional diffsim/noise host mirror from the SAME SceneIR the
-// live model consumed (CookArticulations -> BuildArticulationHostState over the
+// Capture the transitional diffsim/noise host mirror from the SAME cooked blob the
+// live model was transcribed from (CookArticulations -> BuildArticulationHostState over the
 // FIRST articulation, single-env). This reproduces topo.masses/inertias/
 // inertial_frames + joint_armature + link_inertia BYTE-IDENTICALLY, so
 // BuildMassParams (diffsim) / ResolveLinkInertiaParams (DR + set_link_mass) /
 // CaptureNominalBaseline stay bit-exact. It is HOST-ONLY (no device upload): the
 // live device inertia is the nk arena's LinkInertia field; set_link_mass / DR
 // write THAT in place (world.cpp does not own a legacy ArticulationDeviceBuffers).
-void CaptureArticulationHostMirror(const scene::SceneIR& scene, WorldRecord* record) {
-    // The mirror consumes ONLY body/joint/inertial tables. Running the legacy
-    // one-argument CookScene here used to re-run V-HACD and bake a sparse SDF for
-    // every convex piece even though neither product reaches the mirror. On the
-    // BDX corridor that dead second cook materialized 893 unique SDFs / 1.149 GB
-    // of transient host storage after the live PairDriven model had correctly
-    // opted out of piece SDFs. Use the same general stage gates as the live cook:
-    // they change only collision-geometry products, never the body/joint tables
-    // BuildArticulationHostState reads. Link-visual SDFs are likewise unnecessary
-    // here; the live model already owns the opt-in copy used by MPM coupling.
-    scene::CookSceneOptions mirror_options;
-    mirror_options.bake_sdf = false;
-    mirror_options.general_single_hull = true;
-    mirror_options.bake_link_sdf = false;
-    const scene::CookedBlob blob = scene::CookScene(scene, mirror_options);
+void CaptureArticulationHostMirror(const scene::CookedBlob& blob, WorldRecord* record) {
+    // The mirror consumes ONLY body/joint/inertial tables, read from the blob the live
+    // model was cooked from, so no collision geometry is cooked a second time.
     const std::vector<articulation::ArticulationCookedTopology> arts =
         articulation::CookArticulations(blob);
     if (arts.empty()) {
@@ -197,6 +185,7 @@ nuka::scene::MediaRecord FluidMediaFromDesc(const nuka_coupled_particles_desc_t&
 // entries; the coupled entry cooks particles onto `model` before FinishWorldCreate.
 struct PreparedWorld {
     nuka::nk::Model model;
+    std::shared_ptr<const nuka::scene::CookedBlob> blob;
     nuka::scene::SceneIR scene;
     nuka::terrain::HeightField terrain;
     nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
@@ -262,6 +251,7 @@ nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
     }
 
     out->model = std::move(cooked.model);
+    out->blob = std::move(cooked.blob);
     out->scene = std::move(scene);
     out->terrain = std::move(cooked_terrain);
     out->gravity = gravity;
@@ -440,6 +430,7 @@ nuka_result_t ApplyControlTerrainGravity(
 // scene-only entry never passes them and stays byte-identical). The coupled entry
 // forwards the desc's solver knobs here.
 nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
+                                std::shared_ptr<const nuka::scene::CookedBlob> blob,
                                 nuka::scene::SceneIR&& scene,
                                 nuka::terrain::HeightField&& cooked_terrain,
                                 DeviceRecord* device_record, float fixed_dt,
@@ -455,6 +446,7 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 uint32_t cloth_integrator,
                                 uint32_t ogc_contact_capacity) {
     if (cloth_integrator > 1u) return NUKA_RESULT_INVALID_ARG;
+    if (!blob) return NUKA_RESULT_INTERNAL;
     if (ogc_contact_capacity > 0u)
         nuka::scene::cook::SetOgcContactCapacity(cooked_model, ogc_contact_capacity);
     // ApplyControlTerrainGravity ran before the Model move, but keep the public
@@ -492,7 +484,7 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
     // Transitional host mirror for the diffsim backward + set_link_mass + DR
     // (host dI/dmass + spatial-inertia rebuild). HOST-ONLY -- device writes target
     // the nk arena. Particles carry no articulation, so this covers the robot only.
-    CaptureArticulationHostMirror(scene, record.get());
+    CaptureArticulationHostMirror(*blob, record.get());
 
     // Retain the FINAL composed scene so a camera-sensor attach builds the per-env
     // visual binding from the SAME ECS the cook saw (host data only).
@@ -534,7 +526,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
         }
         // Build + insert the live world (the shared record-assembly path).
         const nuka_result_t made = nuka::c_abi::FinishWorldCreate(
-            std::move(prepared.model), std::move(prepared.scene),
+            std::move(prepared.model), std::move(prepared.blob), std::move(prepared.scene),
             std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
             desc->env_count, prepared.control_mode, prepared.gravity,
             desc->osc_task_link, out, desc->solver_vel_iters,
@@ -622,7 +614,7 @@ nuka_result_t nuka_world_create_coupled_from_scene(
         // Build + insert the live coupled world (the SAME record-assembly path). The
         // SolverConfig overrides ride the coupled desc; all-zero keeps today's cfg.
         const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
-            std::move(prepared.model), std::move(prepared.scene),
+            std::move(prepared.model), std::move(prepared.blob), std::move(prepared.scene),
             std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
             desc->env_count, prepared.control_mode, prepared.gravity,
             desc->osc_task_link, out,
