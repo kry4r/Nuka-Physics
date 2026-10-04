@@ -929,9 +929,16 @@ fields:
   - {name: mesh_edge_nodes, dtype: mesh_bvh_node, per: scalar, count: "max_mesh_edge_nodes", arena: persistent, owner: model}
   - {name: mesh_triangle_edges, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
   - {name: mesh_triangle_vertex_owner, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
+  # Vertex incidence over hull vertices: global edge << 1 | side and global triangle << 2 | corner.
+  - {name: mesh_vertex_edge_offsets, dtype: u32, per: scalar, count: "max_hull_verts+1", arena: persistent, owner: model}
+  - {name: mesh_vertex_edges, dtype: u32, per: scalar, count: "max_mesh_edges*2", arena: persistent, owner: model}
+  - {name: mesh_vertex_triangle_offsets, dtype: u32, per: scalar, count: "max_hull_verts+1", arena: persistent, owner: model}
+  - {name: mesh_vertex_triangles, dtype: u32, per: scalar, count: "max_mesh_triangles*3", arena: persistent, owner: model}
   - {name: mesh_vertex_sources, dtype: u64, per: scalar, count: "mesh_vertex_source_count", arena: persistent, owner: model}
   - {name: mesh_edge_sources, dtype: u64, per: scalar, count: "mesh_edge_source_count", arena: persistent, owner: model}
   - {name: mesh_contact_mode, dtype: u8, per: scalar, count: "max_bodies_total", arena: persistent, owner: model}
+  # Largest distance of a collidable's mesh vertices from its origin.
+  - {name: mesh_vertex_reach, dtype: f32, per: scalar, count: "mesh_surface_info_count", arena: persistent, owner: model}
 
   # Outer-step impulses use world-origin moments until the final reference-point shift.
   - {name: step_env_status, dtype: u32, per: env, arena: scratch, owner: data}
@@ -997,6 +1004,11 @@ fields:
   - {name: particle_surface_edge_tree, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_edge_nodes_per_env", arena: persistent, owner: model}
   - {name: particle_surface_triangle_edges, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
   - {name: particle_surface_triangle_vertex_owner, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
+  # Vertex incidence over environment particles, encoded as for mesh vertices.
+  - {name: particle_surface_vertex_edge_offsets, dtype: u32, per: scalar, count: "particles_per_env+1", arena: persistent, owner: model}
+  - {name: particle_surface_vertex_edges, dtype: u32, per: scalar, count: "particle_surface_edges_per_env*2", arena: persistent, owner: model}
+  - {name: particle_surface_vertex_triangle_offsets, dtype: u32, per: scalar, count: "particles_per_env+1", arena: persistent, owner: model}
+  - {name: particle_surface_vertex_triangles, dtype: u32, per: scalar, count: "particle_surface_triangles*3", arena: persistent, owner: model}
   - {name: particle_surface_thickness, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
   - {name: particle_surface_friction, dtype: f32, per: scalar, count: "particle_surfaces_per_env", arena: persistent, owner: model}
   - {name: particle_surface_nodes, dtype: mesh_bvh_node, per: scalar, count: "particle_surface_nodes_per_env*env_count", arena: scratch, owner: data}
@@ -1022,6 +1034,7 @@ fields:
 
   # Row colors and ordered chains the cooperative island solve rebuilds from each pass's live rows.
   - {name: solve_color_scratch, dtype: u32, per: scalar, count: "solve_color_scratch_words", arena: scratch, owner: data}
+  - {name: block_descent_scratch, dtype: u32, per: scalar, count: "block_descent_scratch_words", arena: scratch, owner: data}
 
   # Vertex blocks: elastic elements, vertex incidence (element << 2 | local) and static color
   # classes of dynamic vertices. Indices are local to the environment's vertex-block range.
@@ -1034,7 +1047,7 @@ fields:
   # inertial target, integrator offset and mass over step squared, with applied particle impulses.
   - {name: particle_response, dtype: symmat3, per: particle, arena: scratch, owner: data}
   - {name: particle_row_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
-  - {name: vbd_target, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  - {name: vbd_free_rate, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   - {name: vbd_offset, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   - {name: vbd_inertia, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
   # Second-order history: the previous velocity, and whether it belongs to the current trajectory.
@@ -1045,11 +1058,20 @@ fields:
   - {name: dat_particle_beta, dtype: f32, per: particle, arena: scratch, owner: data, flags: [readout]}
   - {name: dat_body_beta, dtype: u32, per: body, arena: scratch, owner: data}
   - {name: dat_artic_beta, dtype: u32, per: articulation, arena: scratch, owner: data}
+  # Per DAT bound kind (vertex motion, particle pair, body pair, chain travel): smallest fraction
+  # bits in high32, then limiting body << 16 | counterpart; all ones when the bound never applied.
+  - {name: dat_artic_witness, dtype: u64, per: articulation, elem: 4, arena: scratch, owner: data}
   - {name: dat_prev_q, dtype: f32, per: link, arena: scratch, owner: data}
   - {name: dat_prev_base_pose, dtype: transform, per: articulation, arena: scratch, owner: data}
   - {name: dat_prev_body_pose, dtype: transform, per: body, arena: scratch, owner: data}
   - {name: dat_body_speed, dtype: f32, per: body, arena: scratch, owner: data}
   - {name: dat_body_query_radius, dtype: f32, per: body, arena: scratch, owner: data}
+  # Largest untruncated vertex displacement rate of each body in the last DAT pass.
+  - {name: dat_body_motion, dtype: f32, per: body, arena: persistent, owner: data}
+  # Untruncated joint speed of each link in the last DAT pass, and the joint speed bound
+  # predicted at contact detection.
+  - {name: dat_joint_motion, dtype: f32, per: link, arena: persistent, owner: data}
+  - {name: dat_joint_rate, dtype: f32, per: link, arena: scratch, owner: data}
   - {name: dat_pair_kind, dtype: u32, per: contact_slot, arena: scratch, owner: data}
   - {name: dat_pair_owner_a, dtype: u32, per: contact_slot, arena: scratch, owner: data}
   - {name: dat_pair_owner_b, dtype: u32, per: contact_slot, arena: scratch, owner: data}
@@ -1077,7 +1099,10 @@ fields:
   - {name: mesh_ogc_pair_count, dtype: u32, per: env, arena: scratch, owner: data}
   - {name: mesh_sdf_pair_count, dtype: u32, per: env, arena: scratch, owner: data}
   - {name: vbd_velocity_sweep_count, dtype: u32, per: env, arena: scratch, owner: data}
-  - {name: solver_color_counts, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}
+  # Vertex colors, row colors, chain rows, chain islands, longest island chain, Schur rows.
+  - {name: solver_color_counts, dtype: u32, per: env, elem: 6, arena: scratch, owner: data}
+  # Nanoseconds of the last colored solve per phase, timed by its first block between barriers.
+  - {name: solver_phase_time, dtype: u64, per: env, elem: 8, arena: scratch, owner: data}
   - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
   - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 32, arena: scratch, owner: data, flags: [readout]}
   - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
@@ -1098,3 +1123,17 @@ fields:
   - {name: energy_link_velocity, dtype: spatial6, per: link, arena: scratch, owner: data}
   - {name: energy_qdot_free, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
   - {name: vbd_force_residual_work, dtype: f32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
+  # Z (Z^T M Z)^-1 Z^T of each articulation; impulses applied through it keep the mimic couplings.
+  - {name: m_inv_coupled, dtype: f32, per: articulation_dof2, arena: scratch, owner: data}
+  # The mass over the DOFs the mimic couplings leave free; a dependent DOF has an empty row and column.
+  - {name: m_reduced, dtype: f32, per: articulation_dof2, arena: scratch, owner: data}
+  # The free DOF each articulation DOF follows (itself when free) and its velocity ratio to it.
+  - {name: mimic_root_dof, dtype: u32, per: articulation_dof, arena: scratch, owner: data}
+  - {name: mimic_root_scale, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
+  # Kinetic energy the coupling impulse took from each articulation's free velocity this step.
+  - {name: mimic_projection_loss, dtype: f32, per: articulation, arena: scratch, owner: data}
+  - {name: vbd_membrane_start, dtype: vbd_membrane_start, per: scalar, count: "vbd_elements_per_env*env_count", arena: scratch, owner: data}
+  - {name: crba_scratch, dtype: u32, per: scalar, count: "articulations_per_env*env_count*dofs_per_env*(dofs_per_env+12)", arena: scratch, owner: data}
+  - {name: vbd_solve_audit, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", elem: 20, arena: scratch, owner: data, flags: [readout]}
+  - {name: control_scratch, dtype: u32, per: articulation_dof, elem: 8, arena: scratch, owner: data}
+  - {name: vbd_free_velocity, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}

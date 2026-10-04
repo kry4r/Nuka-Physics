@@ -17,7 +17,9 @@ phi::Status ContactLayout(const nk::Model& model, uint32_t env_count, phi::Senso
     if (model.MpmParticlesPerEnv() > cap.particles_per_env) return phi::Status::InvalidArgument;
     const uint64_t particle_slots = cap.max_contacts_per_env
         ? cap.ParticleContactReserve(model.MpmParticlesPerEnv()) : 0u;
-    if (particle_slots + cap.mpm_contact_capacity_per_env > cap.max_contacts_per_env)
+    const uint64_t reserved_slots = particle_slots + cap.ogc_contacts_per_env +
+        cap.mpm_contact_capacity_per_env;
+    if (reserved_slots > cap.max_contacts_per_env)
         return phi::Status::InvalidArgument;
     layout->env_count = env_count;
     layout->links_per_env = cap.links_per_env;
@@ -25,7 +27,7 @@ phi::Status ContactLayout(const nk::Model& model, uint32_t env_count, phi::Senso
     layout->articulations_per_env = cap.articulations_per_env;
     layout->slots_per_env = cap.max_contacts_per_env;
     layout->rigid_slots_per_env = cap.max_contacts_per_env -
-        static_cast<uint32_t>(particle_slots) - cap.mpm_contact_capacity_per_env;
+        static_cast<uint32_t>(reserved_slots);
     layout->rows_per_env = cap.max_rows_per_env;
     return phi::Status::Ok;
 }

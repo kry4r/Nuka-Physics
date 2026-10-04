@@ -61,6 +61,7 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
     "point_endpoint_range": {"cpp": "::nuka::nk::PointEndpointRange", "code": "kU8", "lanes": 8},
     "point_endpoint_term": {"cpp": "::nuka::nk::PointEndpointTerm", "code": "kU8", "lanes": 44},
     "vbd_element": {"cpp": "::nuka::nk::VbdElement", "code": "kU8", "lanes": 64},
+    "vbd_membrane_start": {"cpp": "::nuka::nk::vbd::MembraneStartState", "code": "kU8", "lanes": 36},
 }
 
 VALID_PER = {

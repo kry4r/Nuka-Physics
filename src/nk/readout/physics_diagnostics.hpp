@@ -36,4 +36,16 @@ enum class ContactAuditMetric : uint32_t {
 inline constexpr uint32_t kContactAuditCountSize = static_cast<uint32_t>(ContactAuditCount::Count);
 inline constexpr uint32_t kContactAuditMetricCount = static_cast<uint32_t>(ContactAuditMetric::Count);
 
+enum class VbdSolveAuditColumn : uint32_t {
+    ForceX, ForceY, ForceZ,
+    NewtonCorrectionX, NewtonCorrectionY, NewtonCorrectionZ,
+    LastDirectionX, LastDirectionY, LastDirectionZ,
+    LastScale, LastEnergyChange, LastHalvings,
+    AcceptedSteps, RejectedSteps, ZeroSlopeSteps, RoundedSteps, TotalSteps,
+    LastPrimalForceX, LastPrimalForceY, LastPrimalForceZ, Count
+};
+
+inline constexpr uint32_t kVbdSolveAuditColumnCount =
+    static_cast<uint32_t>(VbdSolveAuditColumn::Count);
+
 }  // namespace nuka::nk

@@ -126,7 +126,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
     if (!inverse_dynamics_controls &&
         (id == FieldId::ControlMass || id == FieldId::ControlFactor ||
          id == FieldId::ControlJacobian || id == FieldId::ControlResponse ||
-         id == FieldId::ControlTaskMap)) return 0u;
+         id == FieldId::ControlTaskMap || id == FieldId::ControlScratch)) return 0u;
     if (mpm_grid_nodes_per_env == 0u &&
         (id == FieldId::GridContactAttempted || id == FieldId::GridContactRetained ||
          id == FieldId::GridContactPeak || id == FieldId::GridContactOverflow)) return 0u;
@@ -186,17 +186,25 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::VbdIncidence) return vbd_incidence_per_env;
         if (id == FieldId::VbdColorVertices) return vbd_dynamic_vertices_per_env;
         if (id == FieldId::VbdColorSegments) return uint64_t{vbd_colors} * 2u;
-        if (id == FieldId::VbdTarget || id == FieldId::VbdOffset || id == FieldId::VbdInertia ||
+        if (id == FieldId::VbdFreeRate || id == FieldId::VbdFreeVelocity ||
+            id == FieldId::VbdOffset || id == FieldId::VbdInertia ||
             id == FieldId::VbdHistoryVel ||
-            id == FieldId::VbdStep || id == FieldId::VbdRestart)
+            id == FieldId::VbdStep || id == FieldId::VbdRestart || id == FieldId::VbdSolveAudit)
             return CheckedProduct({vbd_vertices_per_env, env_count});
         if (id == FieldId::ParticleSurfaceInfo || id == FieldId::ParticleSurfaceEdgeInfo ||
             id == FieldId::ParticleSurfaceThickness ||
             id == FieldId::ParticleSurfaceFriction) return particle_surfaces_per_env;
         if (id == FieldId::ParticleSurfaceTriangles ||
             id == FieldId::ParticleSurfaceTriangleEdges ||
-            id == FieldId::ParticleSurfaceTriangleVertexOwner)
+            id == FieldId::ParticleSurfaceTriangleVertexOwner ||
+            id == FieldId::ParticleSurfaceVertexTriangles)
             return uint64_t{particle_surface_triangles} * 3u;
+        if (id == FieldId::ParticleSurfaceVertexEdges)
+            return uint64_t{particle_surface_edges_per_env} * 2u;
+        if (id == FieldId::ParticleSurfaceVertexEdgeOffsets)
+            return particle_surface_edges_per_env > 0u ? uint64_t{particles_per_env} + 1u : 0u;
+        if (id == FieldId::ParticleSurfaceVertexTriangleOffsets)
+            return particle_surface_triangles > 0u ? uint64_t{particles_per_env} + 1u : 0u;
         if (id == FieldId::ParticleSurfaceTree) return particle_surface_nodes_per_env;
         if (id == FieldId::ParticleSurfaceEdges) return particle_surface_edges_per_env;
         if (id == FieldId::ParticleSurfaceEdgeTree) return particle_surface_edge_nodes_per_env;
@@ -210,6 +218,9 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
                 ? CheckedProduct({particle_surfaces_per_env, env_count}) : 0u;
         if (id == FieldId::PointEndpointRanges) return CheckedProduct({point_endpoints_per_env, env_count});
         if (id == FieldId::PointEndpointTerms) return CheckedProduct({point_endpoint_terms_per_env, env_count});
+        if (id == FieldId::VbdMembraneStart) return CheckedProduct({vbd_elements_per_env, env_count});
+        if (id == FieldId::CrbaScratch)
+            return CheckedProduct({articulations_per_env, env_count, dofs_per_env, uint64_t{dofs_per_env} + 12u});
         if (id == FieldId::GridNeighborIdx)
             return CheckedProduct({NeighborPoolCapacity(), env_count});
         // Symbolic scalar counts require an explicit field-specific extent.
@@ -228,11 +239,17 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             // GLOBAL convex-hull vertex pool, xyz packed.
             return static_cast<uint64_t>(max_hull_verts) * 3ull;
         }
-        if (id == FieldId::MeshSurfaceInfo || id == FieldId::MeshEdgeInfo)
+        if (id == FieldId::MeshSurfaceInfo || id == FieldId::MeshEdgeInfo ||
+            id == FieldId::MeshVertexReach)
             return max_mesh_triangles > 0u ? max_bodies_total : 0u;
         if (id == FieldId::MeshTriangles || id == FieldId::MeshTriangleEdges ||
-            id == FieldId::MeshTriangleVertexOwner)
+            id == FieldId::MeshTriangleVertexOwner || id == FieldId::MeshVertexTriangles)
             return static_cast<uint64_t>(max_mesh_triangles) * 3u;
+        if (id == FieldId::MeshVertexEdges) return static_cast<uint64_t>(max_mesh_edges) * 2u;
+        if (id == FieldId::MeshVertexEdgeOffsets)
+            return max_mesh_edges > 0u ? uint64_t{max_hull_verts} + 1u : 0u;
+        if (id == FieldId::MeshVertexTriangleOffsets)
+            return max_mesh_triangles > 0u ? uint64_t{max_hull_verts} + 1u : 0u;
         if (id == FieldId::MeshBvhNodes) return max_mesh_bvh_nodes;
         if (id == FieldId::MeshEdges) return max_mesh_edges;
         if (id == FieldId::MeshEdgeNodes) return max_mesh_edge_nodes;
@@ -286,6 +303,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::SolverVelocityScratch) return solver_velocity_scratch_bytes;
         if (id == FieldId::PairSampleChunks) return pair_sample_chunk_words;
         if (id == FieldId::SolveColorScratch) return solve_color_scratch_words;
+        if (id == FieldId::BlockDescentScratch) return block_descent_scratch_words;
         // Dynamic-island component count (BuildSolveIslands): the solve grid
         // watermark — one global u32.
         if (id == FieldId::IslandCount) {
@@ -405,6 +423,38 @@ void StampPerLink(uint8_t* dst, const std::vector<T>& tpl, uint32_t links,
                         &tpl[l], elem_size);
         }
     }
+}
+
+// Stages the offsets or entries of a vertex-major incidence over element ranges
+// {vertex offset, first element, count}; ranges sharing a first element are cooked once.
+template <typename VertexOf>
+void StageVertexIncidence(uint8_t* dst, uint64_t bytes, bool offsets, uint64_t vertices,
+                          const std::vector<std::array<uint32_t, 3>>& ranges, uint32_t slots,
+                          uint32_t shift, const VertexOf& vertex_of) {
+    std::vector<uint32_t> start(vertices + 1u, 0u), entries;
+    std::vector<std::array<uint32_t, 3>> unique;
+    for (const auto& range : ranges)
+        if (range[2] > 0u && std::none_of(unique.begin(), unique.end(),
+                [&](const auto& seen) { return seen[1] == range[1]; })) unique.push_back(range);
+    std::sort(unique.begin(), unique.end(),
+              [](const auto& a, const auto& b) { return a[1] < b[1]; });
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            for (uint64_t v = 0u; v < vertices; ++v) start[v + 1u] += start[v];
+            entries.resize(start[vertices]);
+        }
+        std::vector<uint32_t> cursor(start.begin(), start.end() - 1);
+        for (const auto& range : unique)
+            for (uint32_t element = range[1]; element < range[1] + range[2]; ++element)
+                for (uint32_t slot = 0u; slot < slots; ++slot) {
+                    const uint64_t vertex = uint64_t{range[0]} + vertex_of(element, slot);
+                    if (vertex >= vertices) continue;
+                    if (pass == 0) ++start[vertex + 1u];
+                    else entries[cursor[vertex]++] = element << shift | slot;
+                }
+    }
+    const auto& source = offsets ? start : entries;
+    std::memcpy(dst, source.data(), std::min<uint64_t>(bytes, source.size() * sizeof(uint32_t)));
 }
 
 }  // namespace
@@ -611,6 +661,29 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                 particles.surface_triangle_vertex_owner.data(),
                 particles.surface_triangle_vertex_owner.size() * sizeof(uint32_t));
             break;
+        case FieldId::ParticleSurfaceVertexEdgeOffsets:
+        case FieldId::ParticleSurfaceVertexEdges: {
+            std::vector<std::array<uint32_t, 3>> ranges;
+            for (const auto& info : particles.surface_edge_info)
+                ranges.push_back({info.vertex_offset, info.edge_offset, info.edge_count});
+            StageVertexIncidence(dst, seg.bytes, id == FieldId::ParticleSurfaceVertexEdgeOffsets,
+                capacities.particles_per_env, ranges, 2u, 1u, [&](uint32_t edge, uint32_t side) {
+                    const auto& e = particles.surface_edges[edge];
+                    return side == 0u ? e.vertex0 : e.vertex1;
+                });
+            break;
+        }
+        case FieldId::ParticleSurfaceVertexTriangleOffsets:
+        case FieldId::ParticleSurfaceVertexTriangles: {
+            std::vector<std::array<uint32_t, 3>> ranges;
+            for (const auto& info : particles.surface_info)
+                ranges.push_back({info.vertex_offset, info.triangle_offset, info.triangle_count});
+            StageVertexIncidence(dst, seg.bytes, id == FieldId::ParticleSurfaceVertexTriangleOffsets,
+                capacities.particles_per_env, ranges, 3u, 2u, [&](uint32_t triangle, uint32_t corner) {
+                    return particles.surface_triangles[size_t{triangle} * 3u + corner];
+                });
+            break;
+        }
         case FieldId::ParticleSurfaceThickness:
             if (!particles.surface_thickness.empty()) std::memcpy(dst, particles.surface_thickness.data(),
                 particles.surface_thickness.size() * sizeof(float));
@@ -660,10 +733,51 @@ void Model::StageModelField(FieldId id, const Segment& seg,
                 mesh_triangle_vertex_owner.data(),
                 mesh_triangle_vertex_owner.size() * sizeof(uint32_t));
             break;
+        case FieldId::MeshVertexEdgeOffsets:
+        case FieldId::MeshVertexEdges: {
+            std::vector<std::array<uint32_t, 3>> ranges;
+            for (const auto& info : mesh_edge_info)
+                ranges.push_back({info.vertex_offset, info.edge_offset, info.edge_count});
+            StageVertexIncidence(dst, seg.bytes, id == FieldId::MeshVertexEdgeOffsets,
+                capacities.max_hull_verts, ranges, 2u, 1u, [&](uint32_t edge, uint32_t side) {
+                    const auto& e = mesh_edges[edge];
+                    return side == 0u ? e.vertex0 : e.vertex1;
+                });
+            break;
+        }
+        case FieldId::MeshVertexTriangleOffsets:
+        case FieldId::MeshVertexTriangles: {
+            std::vector<std::array<uint32_t, 3>> ranges;
+            for (const auto& info : mesh_surface_info)
+                ranges.push_back({info.vertex_offset, info.triangle_offset, info.triangle_count});
+            StageVertexIncidence(dst, seg.bytes, id == FieldId::MeshVertexTriangleOffsets,
+                capacities.max_hull_verts, ranges, 3u, 2u, [&](uint32_t triangle, uint32_t corner) {
+                    return mesh_triangles[size_t{triangle} * 3u + corner];
+                });
+            break;
+        }
         case FieldId::MeshContactMode: {
             auto* modes = static_cast<uint8_t*>(dst);
             for (size_t body = 0u; body < shape_table_rows.size(); ++body)
                 modes[body] = shape_table_rows[body].mesh_contact_mode;
+            break;
+        }
+        case FieldId::MeshVertexReach: {
+            auto* reach = reinterpret_cast<float*>(dst);
+            const size_t vertices = hull_verts.size() / 3u;
+            const size_t count = std::min(mesh_surface_info.size(),
+                                          static_cast<size_t>(seg.bytes / sizeof(float)));
+            for (size_t body = 0u; body < count; ++body) {
+                const auto& info = mesh_surface_info[body];
+                const size_t last = std::min(vertices, size_t{info.vertex_offset} + info.vertex_count);
+                float distance = 0.0f;
+                for (size_t vertex = info.vertex_offset; vertex < last; ++vertex) {
+                    const float* point = hull_verts.data() + vertex * 3u;
+                    distance = std::max(distance, std::sqrt(point[0] * point[0] +
+                        point[1] * point[1] + point[2] * point[2]));
+                }
+                reach[body] = distance;
+            }
             break;
         }
         case FieldId::ShapeTable: {
@@ -1151,6 +1265,10 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ParticleSurfaceEdgeTree: v.particle_surface_edge_tree = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ParticleSurfaceTriangleEdges: v.particle_surface_triangle_edges = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceTriangleVertexOwner: v.particle_surface_triangle_vertex_owner = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceVertexEdgeOffsets: v.particle_surface_vertex_edge_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceVertexEdges: v.particle_surface_vertex_edges = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceVertexTriangleOffsets: v.particle_surface_vertex_triangle_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::ParticleSurfaceVertexTriangles: v.particle_surface_vertex_triangles = static_cast<uint32_t*>(p); break;
         case FieldId::ParticleSurfaceThickness: v.particle_surface_thickness = static_cast<float*>(p); break;
         case FieldId::ParticleSurfaceFriction: v.particle_surface_friction = static_cast<float*>(p); break;
         case FieldId::MeshTriangles: v.mesh_triangles = static_cast<uint32_t*>(p); break;
@@ -1162,7 +1280,12 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::MeshEdgeSources: v.mesh_edge_sources = static_cast<uint64_t*>(p); break;
         case FieldId::MeshTriangleEdges: v.mesh_triangle_edges = static_cast<uint32_t*>(p); break;
         case FieldId::MeshTriangleVertexOwner: v.mesh_triangle_vertex_owner = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshVertexEdgeOffsets: v.mesh_vertex_edge_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshVertexEdges: v.mesh_vertex_edges = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshVertexTriangleOffsets: v.mesh_vertex_triangle_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::MeshVertexTriangles: v.mesh_vertex_triangles = static_cast<uint32_t*>(p); break;
         case FieldId::MeshContactMode: v.mesh_contact_mode = static_cast<uint8_t*>(p); break;
+        case FieldId::MeshVertexReach: v.mesh_vertex_reach = static_cast<float*>(p); break;
         case FieldId::ShapeTable:            v.shape_table = static_cast<float*>(p); break;
         case FieldId::ExcludedPairs:         v.excluded_pairs = static_cast<uint64_t*>(p); break;
         case FieldId::SampPoints:            v.samp_points = static_cast<float*>(p); break;

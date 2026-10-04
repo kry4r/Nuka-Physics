@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <vector>
 
@@ -16,6 +17,7 @@ namespace nuka::c_abi {
 struct WorldCheckpointRecord {
     nuka_world_handle owner = nullptr;
     std::vector<uint8_t> persistent;
+    uint64_t layout_hash = 0u;
     std::vector<runtime::articulation::LinkSpatialInertia> link_inertia;
     std::vector<float> joint_armature;
     uint32_t simulated_step_count = 0u;
@@ -43,6 +45,7 @@ namespace {
 
 constexpr uint64_t kFnvOffset = 14695981039346656037ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
+constexpr uint64_t kCheckpointFileMagic = 0x3130504B43414B4Eull;
 
 void HashBytes(uint64_t* hash, const void* bytes, size_t count) {
     const auto* data = static_cast<const uint8_t*>(bytes);
@@ -362,6 +365,7 @@ nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
         if (!record->world->GetData().DownloadPersistent(&checkpoint->persistent)) {
             return NUKA_RESULT_INTERNAL;
         }
+        checkpoint->layout_hash = record->world->GetData().PersistentLayoutHash();
         const auto status = nuka::c_abi::CopyHostState(*record, checkpoint.get());
         if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
         *out = nuka::c_abi::CheckpointTable().Insert(std::move(checkpoint));
@@ -419,6 +423,61 @@ nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
 
 void nuka_checkpoint_destroy(nuka_checkpoint_handle checkpoint) {
     (void)nuka::c_abi::CheckpointTable().Remove(checkpoint);
+}
+
+nuka_result_t nuka_checkpoint_write(nuka_checkpoint_handle checkpoint, const char* path) {
+    auto* saved = nuka::c_abi::CheckpointTable().Get(checkpoint);
+    if (saved == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (path == nullptr) return NUKA_RESULT_INVALID_ARG;
+    try {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        const uint64_t header[] = {nuka::c_abi::kCheckpointFileMagic, saved->layout_hash,
+                                   saved->simulated_step_count, saved->persistent.size()};
+        file.write(reinterpret_cast<const char*>(header), sizeof(header));
+        file.write(reinterpret_cast<const char*>(saved->persistent.data()),
+                   static_cast<std::streamsize>(saved->persistent.size()));
+        return file.good() ? NUKA_RESULT_OK : NUKA_RESULT_INTERNAL;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* path,
+                                         nuka_checkpoint_handle* out) {
+    if (out == nullptr || path == nullptr) return NUKA_RESULT_INVALID_ARG;
+    *out = nullptr;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        std::ifstream file(path, std::ios::binary);
+        uint64_t header[4] = {};
+        file.read(reinterpret_cast<char*>(header), sizeof(header));
+        const auto& data = record->world->GetData();
+        if (!file.good() || header[0] != nuka::c_abi::kCheckpointFileMagic ||
+            header[1] != data.PersistentLayoutHash() || header[3] != data.PersistentByteSize())
+            return NUKA_RESULT_INVALID_ARG;
+        auto checkpoint = std::make_unique<nuka::c_abi::WorldCheckpointRecord>();
+        checkpoint->owner = world;
+        checkpoint->layout_hash = header[1];
+        checkpoint->persistent.resize(header[3]);
+        file.read(reinterpret_cast<char*>(checkpoint->persistent.data()),
+                  static_cast<std::streamsize>(header[3]));
+        if (!file.good()) return NUKA_RESULT_INVALID_ARG;
+        const auto status = nuka::c_abi::CopyHostState(*record, checkpoint.get());
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        checkpoint->simulated_step_count = static_cast<uint32_t>(header[2]);
+        *out = nuka::c_abi::CheckpointTable().Insert(std::move(checkpoint));
+        return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
 }
 
 nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash) {

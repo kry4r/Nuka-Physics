@@ -54,7 +54,7 @@ struct ModelCapacities {
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
     uint32_t joint_friction_rows_per_env = 0; // one scalar slot per link when friction is authored
     uint32_t joint_drive_rows_per_env = 0;
-    uint32_t mimic_rows_per_env = 0;
+    uint32_t mimic_couplings_per_env = 0;  // links whose joint follows another; they take no rows
     bool inverse_dynamics_controls = false;
     uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
     uint32_t max_mesh_triangles   = 0;
@@ -133,6 +133,7 @@ struct ModelCapacities {
     uint64_t solver_velocity_scratch_bytes = 0;
     uint64_t pair_sample_chunk_words = 0;
     uint64_t solve_color_scratch_words = 0;
+    uint64_t block_descent_scratch_words = 0;
 
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
     // for a non-MPM world). Sizes the grid_mass/momentum/velocity/force fields.
