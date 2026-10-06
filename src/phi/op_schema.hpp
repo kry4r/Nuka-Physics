@@ -437,6 +437,7 @@ uint64_t IslandSortScratchBytes(uint32_t total_rows);
 uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count);
 uint64_t LbvhSortScratchBytes(uint32_t env_count, uint32_t bodies_per_env);
 uint64_t ContactCacheScratchBytes(uint32_t point_count, uint32_t env_count);
+uint64_t OgcOrderScratchBytes(uint32_t slot_capacity, uint32_t env_count);
 uint64_t ContactIndexScratchBytes(uint32_t row_count, uint32_t env_count);
 uint64_t SolverVelocityScratchBytes(uint32_t body_count, uint32_t particle_count,
                                     uint32_t grid_count);
@@ -497,6 +498,10 @@ struct OgcDetectParams {
     uint32_t slot_capacity = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
+    // OGC endpoints follow the MPM endpoints of each env pool.
+    uint32_t point_endpoint_first = 0u;
+    uint32_t point_endpoint_term_first = 0u;
+    uint64_t workspace_bytes = 0u;
 };
 
 struct DatTruncateParams {

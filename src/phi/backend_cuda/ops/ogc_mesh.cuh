@@ -205,8 +205,10 @@ __device__ void OgcEmitMixedFace(
     data.ucontact_a_kind[at] = source_particle
         ? nk::kUContactSideParticle : nk::kUContactSideBody;
     if (target_particle) {
-        const uint32_t endpoint = env * p.point_endpoints_per_env + ordinal * 2u + 1u;
-        const uint32_t first = env * p.point_endpoint_terms_per_env + ordinal * 6u + 3u;
+        const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first +
+                                  ordinal * 2u + 1u;
+        const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
+                               ordinal * 6u + 3u;
         const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
         const float weights[3] = {feature.barycentric.x, feature.barycentric.y,
                                   feature.barycentric.z};
@@ -411,8 +413,10 @@ __device__ void OgcEmitMixedEdge(
     data.dat_pair_feature_a[slot] = source_edge;
     data.dat_pair_feature_b[slot] = target_edge;
     if (source_particle) {
-        const uint32_t endpoint = env * p.point_endpoints_per_env + ordinal * 2u;
-        const uint32_t first = env * p.point_endpoint_terms_per_env + ordinal * 6u;
+        const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first +
+                                  ordinal * 2u;
+        const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
+                               ordinal * 6u;
         const auto info = model.particle_surface_info[source_surface];
         const uint32_t vertices[2] = {edge_a.vertex0, edge_a.vertex1};
         for (uint32_t j = 0u; j < 2u; ++j) {

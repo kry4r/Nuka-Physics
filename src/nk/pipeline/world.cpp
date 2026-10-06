@@ -232,6 +232,11 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         ? phi::ContactCacheScratchBytes(static_cast<uint32_t>(contact_slots * kPairDrivenPtsPerSlot),
                                         model_.capacities.env_count) : 0u;
     const auto& cap = model_.capacities;
+    // OGC slot ordering uses the same scratch earlier in the step.
+    if (cap.ogc_contacts_per_env > 0u &&
+        (cap.particle_surfaces_per_env > 0u || cap.mesh_vertex_source_count > 0u))
+        model_.capacities.contact_cache_scratch_bytes = std::max(cap.contact_cache_scratch_bytes,
+            phi::OgcOrderScratchBytes(cap.ogc_contacts_per_env, cap.env_count));
     model_.capacities.contact_index_scratch_bytes = cap.links_per_env > 0u && cap.max_contacts_per_env > 0u
         ? phi::ContactIndexScratchBytes(cap.max_rows_per_env * cap.env_count, cap.env_count) : 0u;
     model_.capacities.solver_velocity_scratch_bytes = cap.max_rows_per_env > 0u
