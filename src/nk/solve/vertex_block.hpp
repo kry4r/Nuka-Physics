@@ -327,8 +327,36 @@ NUKA_VBD_HD inline bool HingeAngle(const Point* x, double* theta) {
     return true;
 }
 
-// Hinge angle and its change as vertex `local` moves by `move`. The change is one atan2 of the
-// relative rotation whose terms are products of the move, so a small turn is not lost to rounding.
+// Hinge angle and its change as the scaled edge e and the normal products m1 = e x a, m2 = b x e move
+// by de, dm1 and dm2: one atan2 of the relative rotation, so a small turn is not lost to rounding.
+NUKA_VBD_HD inline void HingeTurn(Vec3 e, Vec3 m1, Vec3 m2, Vec3 de, Vec3 dm1, Vec3 dm2, bool* had,
+                                  bool* has, float* before, float* after, float* turn) {
+    const Vec3 p = m1.Cross(m2);
+    const float length = sqrtf(e.LengthSq());
+    const float t = p.Dot(e), c = m1.Dot(m2);
+    *had = m1.LengthSq() > 0.0f && m2.LengthSq() > 0.0f;
+    if (*had) *before = atan2f(t, c * length);
+    const Vec3 n1 = m1 + dm1, n2 = m2 + dm2, moved = e + de;
+    const float moved_sq = moved.LengthSq();
+    *has = moved_sq > 0.0f && n1.LengthSq() > 0.0f && n2.LengthSq() > 0.0f;
+    if (!*has) return;
+    const Vec3 dp = dm1.Cross(m2) + m1.Cross(dm2) + dm1.Cross(dm2);
+    const float dt = dp.Dot(e) + p.Dot(de) + dp.Dot(de);
+    const float dc = dm1.Dot(m2) + m1.Dot(dm2) + dm1.Dot(dm2);
+    const float moved_length = sqrtf(moved_sq);
+    if (!*had) {
+        *after = atan2f(t + dt, (c + dc) * moved_length);
+        return;
+    }
+    const float dl = (2.0f * e.Dot(de) + de.Dot(de)) / (moved_length + length);
+    *turn = atan2f(dt * (c * length) - t * (dc * length + c * dl + dc * dl),
+                   (c + dc) * moved_length * (c * length) + (t + dt) * t);
+    // Past +-pi the moved angle wraps, as one atan2 of the moved hinge would.
+    const float pi = 3.14159265358979323846f, sum = *before + *turn;
+    *after = sum > pi ? sum - 2.0f * pi : sum <= -pi ? sum + 2.0f * pi : sum;
+}
+
+// Hinge angle and its change as vertex `local` moves by `move`, with the terms of the move exact.
 NUKA_VBD_HD inline void HingeAngleChange(const Vec3* x, uint32_t local, Vec3 move, bool* had,
                                          bool* has, float* before, float* after, float* turn) {
     const Vec3 edge = x[1] - x[0];
@@ -355,29 +383,7 @@ NUKA_VBD_HD inline void HingeAngleChange(const Vec3* x, uint32_t local, Vec3 mov
     } else {
         dm2 = d.Cross(e);
     }
-    const Vec3 m1 = e.Cross(a), m2 = b.Cross(e), p = m1.Cross(m2);
-    const float length = sqrtf(e.LengthSq());
-    const float t = p.Dot(e), c = m1.Dot(m2);
-    *had = m1.LengthSq() > 0.0f && m2.LengthSq() > 0.0f;
-    if (*had) *before = atan2f(t, c * length);
-    const Vec3 n1 = m1 + dm1, n2 = m2 + dm2, moved = e + de;
-    const float moved_sq = moved.LengthSq();
-    *has = moved_sq > 0.0f && n1.LengthSq() > 0.0f && n2.LengthSq() > 0.0f;
-    if (!*has) return;
-    const Vec3 dp = dm1.Cross(m2) + m1.Cross(dm2) + dm1.Cross(dm2);
-    const float dt = dp.Dot(e) + p.Dot(de) + dp.Dot(de);
-    const float dc = dm1.Dot(m2) + m1.Dot(dm2) + dm1.Dot(dm2);
-    const float moved_length = sqrtf(moved_sq);
-    if (!*had) {
-        *after = atan2f(t + dt, (c + dc) * moved_length);
-        return;
-    }
-    const float dl = (2.0f * e.Dot(de) + de.Dot(de)) / (moved_length + length);
-    *turn = atan2f(dt * (c * length) - t * (dc * length + c * dl + dc * dl),
-                   (c + dc) * moved_length * (c * length) + (t + dt) * t);
-    // Past +-pi the moved angle wraps, as one atan2 of the moved hinge would.
-    const float pi = 3.14159265358979323846f, sum = *before + *turn;
-    *after = sum > pi ? sum - 2.0f * pi : sum <= -pi ? sum + 2.0f * pi : sum;
+    HingeTurn(e, e.Cross(a), b.Cross(e), de, dm1, dm2, had, has, before, after, turn);
 }
 
 // The angle gradient uses the opposite-vertex heights and edge projections.

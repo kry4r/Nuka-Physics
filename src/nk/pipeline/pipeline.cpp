@@ -384,6 +384,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     vertex_blocks.particles_per_env = per_env_particles;
     vertex_blocks.env_count = env_count;
     vertex_blocks.elements = cap.vbd_elements_per_env;
+    vertex_blocks.coarse_levels = cap.vbd_coarse_levels;
+    vertex_blocks.coarse_nodes = cap.vbd_coarse_nodes;
+    vertex_blocks.coarse_dense_nodes = cap.vbd_coarse_dense_nodes;
     if (use_block_descent_) {
         p_block_descent_.dt = cfg.dt;
         p_block_descent_.env_count = env_count;

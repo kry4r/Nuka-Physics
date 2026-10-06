@@ -1,6 +1,6 @@
 #pragma once
-// Galerkin correction of each point-owner family along one uniform translation per environment.
-// Elastic and Rayleigh energies depend only on rate differences, so inertia and rows span it exactly.
+// Galerkin correction of the free particles along one uniform translation per environment; inertia
+// and rows span it exactly. Vertex blocks take the multilevel correction instead.
 
 __device__ inline double WarpSumDouble(double value) {
     for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u)
@@ -54,28 +54,19 @@ __device__ inline uint32_t CoarseFamily(const BlockDescentSolveParams& p, uint32
 }
 
 // Inertia and free rate exactly as the particle descent uses them.
-__device__ inline bool CoarseParticle(const VertexBlockView& b, const DataView& data,
-                                      const BlockDescentSolveParams& p, const BlockScratch& s,
-                                      uint32_t particle, uint32_t family,
+__device__ inline bool CoarseParticle(const DataView& data, const BlockDescentSolveParams& p,
+                                      const BlockScratch& s, uint32_t particle,
                                       float* inertia, Vec3* free_rate) {
-    if (particle >= p.total_particle_count || CoarseFamily(p, particle) != family ||
+    if (particle >= p.total_particle_count || CoarseFamily(p, particle) != kCoarseParticleFamily ||
         !(data.particle_inv_mass[particle] > 0.0f)) return false;
-    if (family == kCoarseVertexFamily) {
-        const uint32_t env = particle / b.layout.particles_per_env;
-        const uint32_t vertex = particle % b.layout.particles_per_env - b.layout.begin;
-        *inertia = b.inertia[b.Slot(env, vertex)];
-        *free_rate = b.free_rate[b.Slot(env, vertex)];
-    } else {
-        *inertia = 1.0f / (data.particle_inv_mass[particle] * p.dt * p.dt);
-        *free_rate = s.particle_free[particle];
-    }
+    *inertia = 1.0f / (data.particle_inv_mass[particle] * p.dt * p.dt);
+    *free_rate = s.particle_free[particle];
     return true;
 }
 
-// The family's share of each row axis: the sum of its dynamic particle Jacobians.
+// The free particles' share of each row axis: the sum of their dynamic Jacobians.
 __device__ inline bool CoarseRowJacobians(const DataView& data, const BlockDescentSolveParams& p,
-                                          PointMassView points, uint32_t slot, Vec3 jacobian[3],
-                                          uint32_t family) {
+                                          PointMassView points, uint32_t slot, Vec3 jacobian[3]) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const NkRow normal = rows[slot];
     const bool contact = (normal.flags & nk::nk_row_flags::kBlockNormal) != 0u;
@@ -90,7 +81,7 @@ __device__ inline bool CoarseRowJacobians(const DataView& data, const BlockDesce
             for (uint32_t term = 0u; term < points.Count(side); ++term) {
                 const auto entry = points.At(side, term);
                 if (entry.kind != kNkSideParticle || entry.index >= p.total_particle_count ||
-                    CoarseFamily(p, entry.index) != family ||
+                    CoarseFamily(p, entry.index) != kCoarseParticleFamily ||
                     !(data.particle_inv_mass[entry.index] > 0.0f)) continue;
                 jacobian[axis] += entry.jacobian;
                 touched = true;
@@ -100,12 +91,12 @@ __device__ inline bool CoarseRowJacobians(const DataView& data, const BlockDesce
     return touched;
 }
 
-// A selected row head with the family's Jacobians; tangent axes travel with their normal head.
+// A selected row head with the free particles' Jacobians; tangent axes travel with their normal head.
 __device__ inline bool CoarseRowTerm(const DataView& data, const BlockDescentSolveParams& p,
                                      const BlockScratch& s, PointMassView points, uint32_t slot,
-                                     uint32_t family, LocalTerm* term) {
+                                     LocalTerm* term) {
     Vec3 jacobian[3];
-    if (!CoarseRowJacobians(data, p, points, slot, jacobian, family)) return false;
+    if (!CoarseRowJacobians(data, p, points, slot, jacobian)) return false;
     *term = LoadLocalTerm(data, p, s, slot, ~0u, false);
     for (uint32_t axis = 0u; axis < 3u; ++axis) term->jacobian[axis] = jacobian[axis];
     return true;
@@ -130,32 +121,15 @@ __global__ void CoarseRowRangesKernel(BlockDescentSolveParams p, BlockScratch s)
         s.coarse_row_offsets[env] = CoarseRowLowerBound(s, count, uint64_t{env} * p.rows_per_env);
 }
 
-// The environment's selected rows split into equal contiguous chunks over its blocks.
-__device__ inline void CoarseRowChunk(const BlockDescentSolveParams& p, const BlockScratch& s,
-                                      uint32_t env, uint32_t part, uint32_t* begin, uint32_t* end) {
+// The environment's selected rows split into equal contiguous chunks over `parts` blocks.
+__device__ inline void CoarseRowChunk(const BlockScratch& s, uint32_t parts, uint32_t env,
+                                      uint32_t part, uint32_t* begin, uint32_t* end) {
     const uint32_t first = s.coarse_row_offsets[env];
     const uint32_t last = s.coarse_row_offsets[env + 1u];
-    const uint64_t chunk = (uint64_t{last - first} + s.coarse_parts - 1u) / s.coarse_parts;
+    const uint64_t chunk = (uint64_t{last - first} + parts - 1u) / parts;
     const uint64_t from = first + part * chunk;
     *begin = static_cast<uint32_t>(from < last ? from : last);
     *end = static_cast<uint32_t>(from + chunk < last ? from + chunk : last);
-}
-
-// An element joining moving and fixed vertices stores energy under translation, so its mesh is anchored.
-__global__ void MarkCoarseAnchorsKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                                        BlockScratch s) {
-    const VertexBlockView b = Vertices(model, data, p);
-    const uint64_t count = uint64_t{b.layout.elements} * p.env_count;
-    for (uint64_t item = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x; item < count;
-         item += uint64_t{gridDim.x} * blockDim.x) {
-        const uint32_t env = static_cast<uint32_t>(item / b.layout.elements);
-        const nk::VbdElement element = b.elements[item % b.layout.elements];
-        uint32_t moving = 0u;
-        const uint32_t vertices = nk::VbdElementVertexCount(element.kind);
-        for (uint32_t j = 0u; j < vertices; ++j)
-            moving += data.particle_inv_mass[b.Particle(env, element.vertex[j])] > 0.0f ? 1u : 0u;
-        if (moving > 0u && moving < vertices) atomicExch(s.coarse_anchored + env, 1u);
-    }
 }
 
 __device__ inline float CoarseTrialScale(uint32_t trial) {
@@ -165,8 +139,7 @@ __device__ inline float CoarseTrialScale(uint32_t trial) {
 // Blocks own fixed strided slices of one environment, so every partial sum has a fixed order.
 // Owner threads keep the sums; each round evaluates kCoarseHelpers rows per owner at once.
 __global__ void __launch_bounds__(kThreads * kCoarseHelpers)
-CoarseGradientKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                     BlockScratch s, uint32_t family) {
+CoarseGradientKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     __shared__ double shared[kCoarseGradientTerms][kThreads / 32u];
     __shared__ float row_terms[kCoarseHelpers][kCoarseGradientTerms][kThreads];
     __shared__ bool row_live[kCoarseHelpers][kThreads];
@@ -175,17 +148,15 @@ CoarseGradientKernel(ModelView model, DataView data, BlockDescentSolveParams p,
     const uint32_t env = blockIdx.x / s.coarse_parts;
     const uint32_t part = blockIdx.x % s.coarse_parts;
     const uint32_t stride = s.coarse_parts * kThreads;
-    const VertexBlockView b = Vertices(model, data, p);
     const auto points = PointMasses(data);
     const uint32_t per_env = p.total_particle_count / p.env_count;
-    const bool anchored = family == kCoarseVertexFamily && s.coarse_anchored[env] != 0u;
     double sums[kCoarseGradientTerms] = {};
-    for (uint32_t local = part * kThreads + owner; helper == 0u && !anchored && local < per_env;
+    for (uint32_t local = part * kThreads + owner; helper == 0u && local < per_env;
          local += stride) {
         const uint32_t particle = env * per_env + local;
         float inertia = 0.0f;
         Vec3 free_rate{};
-        if (!CoarseParticle(b, data, p, s, particle, family, &inertia, &free_rate)) continue;
+        if (!CoarseParticle(data, p, s, particle, &inertia, &free_rate)) continue;
         const Vec3 u = data.particle_vel[particle];
         const double mass = double(inertia) * p.dt * p.dt;
         sums[0] -= mass * (double(u.x) - free_rate.x);
@@ -196,12 +167,12 @@ CoarseGradientKernel(ModelView model, DataView data, BlockDescentSolveParams p,
         sums[5] += mass;
     }
     uint32_t begin = 0u, end = 0u;
-    if (!anchored) CoarseRowChunk(p, s, env, part, &begin, &end);
+    CoarseRowChunk(s, s.coarse_parts, env, part, &begin, &end);
     for (uint32_t round = begin; round < end; round += kThreads * kCoarseHelpers) {
         const uint32_t item = round + helper * kThreads + owner;
         LocalTerm term{};
         const bool live = item < end &&
-            CoarseRowTerm(data, p, s, points, s.coarse_rows[item], family, &term);
+            CoarseRowTerm(data, p, s, points, s.coarse_rows[item], &term);
         if (live) {
             Vec3 impulse{};
             SymmetricMat3 curvature{};
@@ -234,8 +205,7 @@ __device__ inline double CoarsePartialSum(const BlockScratch& s, uint32_t env, u
 }
 
 // One block per environment.
-__global__ void CoarseDirectionKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                      uint32_t family) {
+__global__ void CoarseDirectionKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     __shared__ double shared[kCoarseGradientTerms][kThreads / 32u];
     const uint32_t env = blockIdx.x;
     double terms[kCoarseGradientTerms] = {};
@@ -250,7 +220,7 @@ __global__ void CoarseDirectionKernel(DataView data, BlockDescentSolveParams p, 
     state.slope = 0.0;
     state.scale = 0.0f;
     for (uint32_t axis = 0u; axis < 3u; ++axis) state.direction[axis] = 0.0f;
-    if (!(h[0] > 0.0) || (family == kCoarseVertexFamily && s.coarse_anchored[env] != 0u)) return;
+    if (!(h[0] > 0.0)) return;
     const double cxx = h[1] * h[2] - h[5] * h[5], cyy = h[0] * h[2] - h[4] * h[4];
     const double czz = h[0] * h[1] - h[3] * h[3], cxy = h[4] * h[5] - h[3] * h[2];
     const double cxz = h[3] * h[5] - h[4] * h[1], cyz = h[3] * h[4] - h[0] * h[5];
@@ -272,8 +242,7 @@ __global__ void CoarseDirectionKernel(DataView data, BlockDescentSolveParams p, 
 
 // The unit step, one particle or row per owner thread; most environments accept it.
 __global__ void __launch_bounds__(kThreads * kCoarseHelpers)
-CoarseUnitTrialKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                      BlockScratch s, uint32_t family) {
+CoarseUnitTrialKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     __shared__ double shared[kThreads / 32u];
     __shared__ double row_changes[kCoarseHelpers][kThreads];
     __shared__ bool row_live[kCoarseHelpers][kThreads];
@@ -285,7 +254,6 @@ CoarseUnitTrialKernel(ModelView model, DataView data, BlockDescentSolveParams p,
     const CoarseState state = s.coarse[env];
     const Vec3 direction{state.direction[0], state.direction[1], state.direction[2]};
     const bool descending = state.slope < 0.0;
-    const VertexBlockView b = Vertices(model, data, p);
     const auto points = PointMasses(data);
     const uint32_t per_env = p.total_particle_count / p.env_count;
     double change = 0.0;
@@ -294,7 +262,7 @@ CoarseUnitTrialKernel(ModelView model, DataView data, BlockDescentSolveParams p,
         const uint32_t particle = env * per_env + local;
         float inertia = 0.0f;
         Vec3 free_rate{};
-        if (!CoarseParticle(b, data, p, s, particle, family, &inertia, &free_rate)) continue;
+        if (!CoarseParticle(data, p, s, particle, &inertia, &free_rate)) continue;
         const Vec3 u = data.particle_vel[particle];
         const Vec3 candidate{nk::vbd::TrialValue(u.x, direction.x, 1.0f),
                              nk::vbd::TrialValue(u.y, direction.y, 1.0f),
@@ -302,12 +270,12 @@ CoarseUnitTrialKernel(ModelView model, DataView data, BlockDescentSolveParams p,
         change += nk::vbd::InertialEnergyChange(u, free_rate, candidate - u, inertia, p.dt);
     }
     uint32_t begin = 0u, end = 0u;
-    if (descending) CoarseRowChunk(p, s, env, part, &begin, &end);
+    if (descending) CoarseRowChunk(s, s.coarse_parts, env, part, &begin, &end);
     for (uint32_t round = begin; round < end; round += kThreads * kCoarseHelpers) {
         const uint32_t item = round + helper * kThreads + owner;
         LocalTerm term{};
         const bool live = item < end &&
-            CoarseRowTerm(data, p, s, points, s.coarse_rows[item], family, &term);
+            CoarseRowTerm(data, p, s, points, s.coarse_rows[item], &term);
         if (live) row_changes[helper][owner] = EvaluateLocalChange(term, direction);
         row_live[helper][owner] = live;
         __syncthreads();
@@ -321,8 +289,7 @@ CoarseUnitTrialKernel(ModelView model, DataView data, BlockDescentSolveParams p,
 
 // Halving search where the unit step failed. Lanes are trials: a warp loads each particle or row
 // once and evaluates every scale on the rounded candidate the apply kernel would write.
-__global__ void CoarseTrialsKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                                   BlockScratch s, uint32_t family) {
+__global__ void CoarseTrialsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     static_assert(kCoarseTrials <= 32u);
     __shared__ double shared[kThreads / 32u][32];
     const uint32_t env = blockIdx.x / s.coarse_parts;
@@ -333,7 +300,6 @@ __global__ void CoarseTrialsKernel(ModelView model, DataView data, BlockDescentS
     const Vec3 direction{state.direction[0], state.direction[1], state.direction[2]};
     const bool descending = state.scale < 0.0f;
     if (!descending) return;
-    const VertexBlockView b = Vertices(model, data, p);
     const auto points = PointMasses(data);
     const uint32_t per_env = p.total_particle_count / p.env_count;
     double change = 0.0;
@@ -342,7 +308,7 @@ __global__ void CoarseTrialsKernel(ModelView model, DataView data, BlockDescentS
         const uint32_t particle = env * per_env + local;
         float inertia = 0.0f;
         Vec3 free_rate{};
-        if (!CoarseParticle(b, data, p, s, particle, family, &inertia, &free_rate)) continue;
+        if (!CoarseParticle(data, p, s, particle, &inertia, &free_rate)) continue;
         const Vec3 u = data.particle_vel[particle];
         const Vec3 candidate{nk::vbd::TrialValue(u.x, direction.x, scale),
                              nk::vbd::TrialValue(u.y, direction.y, scale),
@@ -350,10 +316,10 @@ __global__ void CoarseTrialsKernel(ModelView model, DataView data, BlockDescentS
         change += nk::vbd::InertialEnergyChange(u, free_rate, candidate - u, inertia, p.dt);
     }
     uint32_t begin = 0u, end = 0u;
-    if (descending) CoarseRowChunk(p, s, env, part, &begin, &end);
+    if (descending) CoarseRowChunk(s, s.coarse_parts, env, part, &begin, &end);
     for (uint32_t item = begin + warp; item < end; item += warps) {
         LocalTerm term{};
-        if (!CoarseRowTerm(data, p, s, points, s.coarse_rows[item], family, &term)) continue;
+        if (!CoarseRowTerm(data, p, s, points, s.coarse_rows[item], &term)) continue;
         change += EvaluateLocalChange(term, direction * scale);
     }
     shared[warp][lane] = change;
@@ -392,15 +358,13 @@ __global__ void CoarseAcceptKernel(BlockDescentSolveParams p, BlockScratch s, bo
     if (threadIdx.x == 0u) s.coarse[env].scale = accepted;
 }
 
-__global__ void CoarseApplyKernel(ModelView model, DataView data, BlockDescentSolveParams p,
-                                  BlockScratch s, uint32_t family) {
-    const VertexBlockView b = Vertices(model, data, p);
+__global__ void CoarseApplyKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
     const uint32_t per_env = p.total_particle_count / p.env_count;
     for (uint32_t particle = blockIdx.x * blockDim.x + threadIdx.x; particle < p.total_particle_count;
          particle += gridDim.x * blockDim.x) {
         float inertia = 0.0f;
         Vec3 free_rate{};
-        if (!CoarseParticle(b, data, p, s, particle, family, &inertia, &free_rate)) continue;
+        if (!CoarseParticle(data, p, s, particle, &inertia, &free_rate)) continue;
         const CoarseState& state = s.coarse[particle / per_env];
         if (!(state.scale > 0.0f)) continue;
         const Vec3 u = data.particle_vel[particle];
