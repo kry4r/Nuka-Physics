@@ -13,6 +13,7 @@
 #include "phi/op_schema.hpp"
 #include "phi/backend_cuda/ops/ogc_mesh.cuh"
 #include "phi/backend_cuda/ops/bvh_work_share.cuh"
+#include "phi/backend_cuda/ops/ogc_order.cuh"
 
 namespace nuka::phi {
 namespace {
@@ -91,8 +92,10 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
     }
     const uint32_t slot = env * p.slot_stride + p.slot_base + ordinal;
     const size_t at = size_t{slot} * nk::kPairDrivenPtsPerSlot;
-    const uint32_t endpoint = env * p.point_endpoints_per_env + ordinal * 2u + 1u;
-    const uint32_t first = env * p.point_endpoint_terms_per_env + ordinal * 6u + 3u;
+    const uint32_t endpoint = env * p.point_endpoints_per_env + p.point_endpoint_first +
+                              ordinal * 2u + 1u;
+    const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
+                           ordinal * 6u + 3u;
     const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
     const float weights[3] = {feature.barycentric.x, feature.barycentric.y,
                               feature.barycentric.z};
@@ -170,9 +173,11 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     }
     const uint32_t slot = env * p.slot_stride + p.slot_base + ordinal;
     const size_t at = size_t{slot} * nk::kPairDrivenPtsPerSlot;
-    const uint32_t endpoint_a = env * p.point_endpoints_per_env + ordinal * 2u;
+    const uint32_t endpoint_a = env * p.point_endpoints_per_env + p.point_endpoint_first +
+                                ordinal * 2u;
     const uint32_t endpoint_b = endpoint_a + 1u;
-    const uint32_t first_a = env * p.point_endpoint_terms_per_env + ordinal * 6u;
+    const uint32_t first_a = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
+                             ordinal * 6u;
     const uint32_t first_b = first_a + 3u;
     const uint32_t vertices_a[2] = {edge_a.vertex0, edge_a.vertex1};
     const uint32_t vertices_b[2] = {edge_b.vertex0, edge_b.vertex1};
@@ -397,8 +402,9 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
         return Status::Ok;
     if (p->slot_base > p->slot_stride ||
         p->slot_capacity > p->slot_stride - p->slot_base ||
-        uint64_t{p->slot_capacity} * 2u > p->point_endpoints_per_env ||
-        uint64_t{p->slot_capacity} * 6u > p->point_endpoint_terms_per_env ||
+        p->point_endpoint_first + uint64_t{p->slot_capacity} * 2u > p->point_endpoints_per_env ||
+        p->point_endpoint_term_first + uint64_t{p->slot_capacity} * 6u >
+            p->point_endpoint_terms_per_env ||
         (p->surfaces_per_env > 0u &&
             (!model.particle_surface_info ||
              (p->triangles_per_env > 0u && (!model.particle_surface_triangles ||
@@ -456,6 +462,9 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
         vertices > UINT32_MAX || mixed_edges > UINT32_MAX || sources > UINT32_MAX ||
         links > UINT32_MAX)
         return Status::InvalidArgument;
+    if (slots > static_cast<uint64_t>(std::numeric_limits<int>::max()) || !data.contact_cache_scratch ||
+        p->workspace_bytes <= ogc_order::Layout(static_cast<uint32_t>(slots)).temp_offset)
+        return Status::InvalidArgument;
     LaunchCuda(ClearOgcSlotsKernel,
                dim3((static_cast<uint32_t>(slots) + kBlockSize - 1u) / kBlockSize),
                dim3(kBlockSize), 0u, stream, *p, data);
@@ -486,10 +495,18 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
     LaunchCuda(FinalizeOgcCountKernel,
                dim3((p->env_count - 1u) / kBlockSize + 1u),
                dim3(kBlockSize), 0u, stream, *p, data);
+    // Slot order follows the contact records, not the order in which threads claimed slots.
+    const ogc_order::Workspace workspace(data.contact_cache_scratch, p->workspace_bytes,
+                                         static_cast<uint32_t>(slots));
+    if (ogc_order::Canonicalize(*p, data, workspace, stream) != cudaSuccess) return Status::Failed;
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
 }  // namespace
+
+uint64_t OgcOrderScratchBytes(uint32_t slot_capacity, uint32_t env_count) {
+    return ogc_order::ScratchBytes(slot_capacity, env_count);
+}
 
 void RegisterNkOgcDetectOps() {
     SetCudaOp(NkOp::OgcDetect, &OpOgcDetect);

@@ -837,6 +837,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_ogc_detect_.slot_capacity = cap.ogc_contacts_per_env;
         p_ogc_detect_.point_endpoints_per_env = cap.point_endpoints_per_env;
         p_ogc_detect_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
+        const bool mpm_grid = cap.mpm_grid_nodes_per_env > 0u;
+        const uint32_t mpm_surfaces =
+            cap.particle_surfaces_per_env > 0u ? cap.mpm_contact_capacity_per_env : 0u;
+        p_ogc_detect_.point_endpoint_first = mpm_grid ? static_cast<uint32_t>(MpmPointEndpointCount(
+            cap.particles_per_env, mpm_surfaces, cap.mpm_stress_cells_per_env)) : 0u;
+        p_ogc_detect_.point_endpoint_term_first = mpm_grid ? static_cast<uint32_t>(MpmPointEndpointTermCount(
+            cap.particles_per_env, mpm_surfaces, cap.mpm_stress_cells_per_env)) : 0u;
+        p_ogc_detect_.workspace_bytes = cap.contact_cache_scratch_bytes;
         add(phi::NkOp::OgcDetect, &p_ogc_detect_);
     }
     if (cap.max_contacts_per_env > 0u) {
