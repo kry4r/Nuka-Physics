@@ -516,6 +516,19 @@ __device__ bool RowUsesCacheColor(BlockScratch s, uint32_t slot, uint32_t cache_
          (uint32_t{1u} << (cache_color % 32u))) != 0u;
 }
 
+// The lowest cache color of a row whose owners all descend in particle colors, else kNoCacheColor.
+__device__ uint32_t ParticleRowFirstColor(BlockScratch s, uint32_t colors, uint32_t slot) {
+    const uint32_t* words = s.row_cache_colors + size_t{slot} * s.color_words;
+    uint32_t first = kNoCacheColor;
+    for (uint32_t word = 0u; word < s.color_words; ++word) {
+        const uint32_t bits = words[word];
+        if (bits == 0u) continue;
+        if (first == kNoCacheColor) first = word * 32u + static_cast<uint32_t>(__ffs(bits)) - 1u;
+        if (word * 32u + 31u - static_cast<uint32_t>(__clz(bits)) >= colors) return kNoCacheColor;
+    }
+    return first;
+}
+
 __global__ void InitializeOwnerCacheColorsKernel(
     DataView data, BlockDescentSolveParams p, BlockScratch s) {
     const uint32_t dense_first = p.total_particle_count;
@@ -1287,7 +1300,7 @@ __device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, Bloc
 // Rows too few to give every warp scheduler a warp are latency-bound, so adjacent lanes evaluate one
 // row's axes and the group's first lane caches it; otherwise each lane caches whole rows.
 __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                        uint32_t cache_color, uint32_t spread_rows) {
+                                        uint32_t cache_color, uint32_t spread_rows, bool seeded) {
     const uint32_t threads = gridDim.x * blockDim.x;
     const uint32_t count = *s.active_count;
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
@@ -1298,6 +1311,7 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
         for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < count; item += threads) {
             const uint32_t slot = s.active_rows[item];
             if (!RowUsesCacheColor(s, slot, cache_color)) continue;
+            if (seeded && ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) == cache_color) continue;
             const NkRow row = rows[slot];
             if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
             CacheAugmentedRow(data, p, s, slot, ComputeAugmentedRowState(data, p, s, slot, true), potential);
@@ -1310,6 +1324,7 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
          item += threads / kRowAxisLanes) {
         const uint32_t slot = s.active_rows[item];
         if (!RowUsesCacheColor(s, slot, cache_color)) continue;
+        if (seeded && ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) == cache_color) continue;
         const NkRow row = rows[slot];
         if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
         const bool contact = (row.flags & nk::nk_row_flags::kBlockNormal) != 0u;
@@ -1336,6 +1351,8 @@ constexpr uint32_t kDescendTileRows = 256u;
 constexpr uint32_t kDescendElementKinds = 4u;
 constexpr uint32_t kElementSampleWords = 9u;
 constexpr uint32_t kRowSampleWords = 7u;
+constexpr uint32_t kDescendSolveWords = 12u;
+static_assert(kDescendTileVertices * kDescendSolveWords <= kDescendTileRows);
 
 struct DescendTileVertex {
     uint32_t active;
@@ -1356,6 +1373,8 @@ struct DescendTileVertex {
     float primal_force[3];
     float inertia;
     float slope;
+    double unit_slope;
+    double unit_move;
 };
 
 // The tile vertex owning tile-local sample `k`: the last one whose samples start at or before it.
@@ -1379,6 +1398,17 @@ __device__ void SetTileVec3(float* value, Vec3 v) {
     value[0] = v.x;
     value[1] = v.y;
     value[2] = v.z;
+}
+
+// At scale 1 TrialValue rounds an exact sum to double, then to float; binary64 holds 2*24+2 bits, so
+// one float add gives the same value. A NaN sum keeps TrialValue's payload.
+__device__ Vec3 VertexTrial(Vec3 u, Vec3 direction, float scale) {
+    if (scale == 1.0f) {
+        const Vec3 sum{__fadd_rn(u.x, direction.x), __fadd_rn(u.y, direction.y), __fadd_rn(u.z, direction.z)};
+        if (sum.x == sum.x && sum.y == sum.y && sum.z == sum.z) return sum;
+    }
+    return {nk::vbd::TrialValue(u.x, direction.x, scale), nk::vbd::TrialValue(u.y, direction.y, scale),
+            nk::vbd::TrialValue(u.z, direction.z, scale)};
 }
 
 template <bool elastic>
@@ -1531,32 +1561,61 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             hessian = {WarpSum(hessian.xx), WarpSum(hessian.yy), WarpSum(hessian.zz),
                        WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
             if (lane == 0u) {
-                Vec3 direction{};
-                Vec3 primal_force{};
-                float slope = 0.0f;
-                uint32_t valid = 0u;
-                nk::vbd::AddIdentity(hessian, inertia);
-                const Vec3 force = -nk::vbd::InertialGradient(u, free_rate, inertia, p.dt) -
-                                   gradient + impulse / p.dt;
-                primal_force = force;
-                SymmetricMat3 inverse{};
-                if (Finite(force) && nk::vbd::Invert(hessian, 0.0f, &inverse)) {
-                    direction = inverse.Multiply(force) / p.dt;
-                    slope = -p.dt * force.Dot(direction);
-                    if (Finite(direction) && fabsf(slope) <= FLT_MAX) valid = 1u;
-                    else RecordBlockFailure(data, p, s, particle, nk::BlockSolveFailure::InvalidDirection);
-                } else {
-                    RecordBlockFailure(data, p, s, particle, Finite(force)
-                        ? nk::BlockSolveFailure::Factorization : nk::BlockSolveFailure::InvalidEquation);
-                }
+                float* sums = row_changes + j * kDescendSolveWords;
+                SetTileVec3(sums, gradient);
+                SetTileVec3(sums + 3, impulse);
+                sums[6] = hessian.xx;
+                sums[7] = hessian.yy;
+                sums[8] = hessian.zz;
+                sums[9] = hessian.xy;
+                sums[10] = hessian.xz;
+                sums[11] = hessian.yz;
                 SetTileVec3(v.u, u);
                 SetTileVec3(v.free_rate, free_rate);
-                SetTileVec3(v.direction, direction);
-                SetTileVec3(v.primal_force, primal_force);
                 v.inertia = inertia;
-                v.slope = slope;
-                v.descend = valid;
-                v.trial = valid != 0u && slope < 0.0f ? 1u : 0u;
+            }
+        }
+        __syncthreads();
+        // Each vertex's 3x3 solve runs on its own lane of the first warp, from the sums its warp stored;
+        // row_changes is free until the trial pass below.
+        if (threadIdx.x < kDescendTileVertices && tile[threadIdx.x].active != 0u) {
+            DescendTileVertex& v = tile[threadIdx.x];
+            const float* sums = row_changes + threadIdx.x * kDescendSolveWords;
+            const Vec3 u = TileVec3(v.u);
+            const Vec3 free_rate = TileVec3(v.free_rate);
+            const float inertia = v.inertia;
+            const Vec3 gradient = TileVec3(sums);
+            const Vec3 impulse = TileVec3(sums + 3);
+            SymmetricMat3 hessian{sums[6], sums[7], sums[8], sums[9], sums[10], sums[11]};
+            Vec3 direction{};
+            Vec3 primal_force{};
+            float slope = 0.0f;
+            uint32_t valid = 0u;
+            nk::vbd::AddIdentity(hessian, inertia);
+            const Vec3 force = -nk::vbd::InertialGradient(u, free_rate, inertia, p.dt) -
+                               gradient + impulse / p.dt;
+            primal_force = force;
+            SymmetricMat3 inverse{};
+            if (Finite(force) && nk::vbd::Invert(hessian, 0.0f, &inverse)) {
+                direction = inverse.Multiply(force) / p.dt;
+                slope = -p.dt * force.Dot(direction);
+                if (Finite(direction) && fabsf(slope) <= FLT_MAX) valid = 1u;
+                else RecordBlockFailure(data, p, s, v.particle, nk::BlockSolveFailure::InvalidDirection);
+            } else {
+                RecordBlockFailure(data, p, s, v.particle, Finite(force)
+                    ? nk::BlockSolveFailure::Factorization : nk::BlockSolveFailure::InvalidEquation);
+            }
+            SetTileVec3(v.direction, direction);
+            SetTileVec3(v.primal_force, primal_force);
+            v.slope = slope;
+            v.descend = valid;
+            v.trial = valid != 0u && slope < 0.0f ? 1u : 0u;
+            // The line search starts at the unit step, whose slope and inertial factors are formed here once.
+            if (v.trial != 0u) {
+                const Vec3 move = VertexTrial(u, direction, 1.0f) - u;
+                v.unit_slope = -double(p.dt) * (double(primal_force.x) * move.x +
+                    double(primal_force.y) * move.y + double(primal_force.z) * move.z);
+                v.unit_move = nk::vbd::InertialMoveChange(u, free_rate, move);
             }
         }
         __syncthreads();
@@ -1567,9 +1626,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             if (v.trial == 0u) continue;
             const Vec3 u = TileVec3(v.u);
             const Vec3 direction = TileVec3(v.direction);
-            const Vec3 candidate{nk::vbd::TrialValue(u.x, direction.x, 1.0f),
-                                 nk::vbd::TrialValue(u.y, direction.y, 1.0f),
-                                 nk::vbd::TrialValue(u.z, direction.z, 1.0f)};
+            const Vec3 candidate = VertexTrial(u, direction, 1.0f);
             const Vec3 move = candidate - u;
             if (element) {
                 const VertexElementChangeTerms terms = VertexElementChange(b, data.particle_vel, v.env,
@@ -1602,13 +1659,12 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             uint32_t last_halving = 0u;
             bool accepted = false;
             for (uint32_t halving = 0u; halving <= kVertexStepHalvings && slope < 0.0f; ++halving) {
-                const Vec3 candidate{nk::vbd::TrialValue(u.x, direction.x, scale),
-                                     nk::vbd::TrialValue(u.y, direction.y, scale),
-                                     nk::vbd::TrialValue(u.z, direction.z, scale)};
+                const Vec3 candidate = VertexTrial(u, direction, scale);
                 const Vec3 move = candidate - u;
-                const double trial_slope = __shfl_sync(0xffffffffu, -double(p.dt) * (
-                    double(primal_force.x) * move.x + double(primal_force.y) * move.y +
-                    double(primal_force.z) * move.z), 0u);
+                const double trial_slope = halving == 0u ? v.unit_slope
+                    : __shfl_sync(0xffffffffu, -double(p.dt) * (
+                          double(primal_force.x) * move.x + double(primal_force.y) * move.y +
+                          double(primal_force.z) * move.z), 0u);
                 const bool sampled = halving == 0u;
                 float elastic_change = 0.0f;
                 if constexpr (elastic) {
@@ -1626,9 +1682,11 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                 for (uint32_t at = cached_at; at < end; at += warpSize)
                     row_change += sampled && dense_rows ? row_changes[v.row_first + (at - begin)]
                         : EvaluateLocalChange(LoadPointLocalTerm(data, p, s, at), move);
-                const float change = static_cast<float>(
-                    double(WarpSum(elastic_change + row_change)) +
-                    nk::vbd::InertialEnergyChange(u, free_rate, move, inertia, p.dt));
+                // The unit step's fused add matches the contracted sum of the general branch.
+                const double energy = double(WarpSum(elastic_change + row_change));
+                const float change = halving == 0u
+                    ? static_cast<float>(fma(nk::vbd::InertialEnergyScale(inertia, p.dt), v.unit_move, energy))
+                    : static_cast<float>(energy + nk::vbd::InertialEnergyChange(u, free_rate, move, inertia, p.dt));
                 last_change = change;
                 last_halving = halving;
                 if (!Finite(candidate) || !Finite(move) || !isfinite(trial_slope) ||
@@ -1666,7 +1724,9 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
     }
 }
 
-__global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+// A seeded row's endpoints keep their velocities until its lowest color's next cache, so the state
+// stored here from the new duals is the state that cache would compute.
+__global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seed) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
          item += gridDim.x * blockDim.x) {
@@ -1677,11 +1737,20 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         }
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
         data.lambda[slot] = t.normal_bound;
+        AugmentedRowState next{};
+        next.residual = t.residual;
+        next.dual.x = t.normal_bound;
         if (t.contact) {
             const auto f = nk::augmented::EvaluateTangentImpulse(t.dual, t.penalty, t.residual,
                                                                  t.normal_bound, t.mu_first, t.mu_second);
             data.lambda[slot + rows[slot].group_normal_count] = f.impulse.y;
             data.lambda[slot + 2u * rows[slot].group_normal_count] = f.impulse.z;
+            next.dual.y = f.impulse.y;
+            next.dual.z = f.impulse.z;
+        }
+        if (seed && ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor) {
+            next.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), next);
+            s.row_state[slot] = next;
         }
     }
 }
@@ -2165,6 +2234,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
          !clear(s.multilevel, size_t{p->env_count} * sizeof(MultilevelState)) ||
          !clear(s.multilevel_previous, size_t{layout.vertices} * p->env_count * sizeof(Vec3))))
         return Status::Failed;
+    // Grid descents can move particles that carry no cache color, so rows are seeded only without grids.
+    const bool seed_rows = p->total_grid_count == 0u;
     for (uint32_t iteration = 0u; iteration < p->iterations; ++iteration) {
         s.diagnostic_iteration = iteration;
         if (grid_bytes > 0u && cudaMemcpyAsync(s.grid_snapshot, data.grid_velocity, grid_bytes,
@@ -2182,7 +2253,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             if (!elastic && p->total_particle_count == p->vertex_blocks.vertices * p->env_count)
                 continue;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                    data, *p, particle_s, color, spread_rows) != cudaSuccess) return Status::Failed;
+                    data, *p, particle_s, color, spread_rows, elastic && seed_rows && iteration > 0u)
+                != cudaSuccess) return Status::Failed;
             const auto descent_status = elastic
                 ? LaunchWork(DescendParticlesKernel<true>, work, kDescendTileVertices, stream,
                              model, data, *p, particle_s, color)
@@ -2194,7 +2266,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             if (particle_bytes > 0u && cudaMemcpyAsync(s.particle_snapshot, data.particle_vel,
                     particle_bytes, cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                    data, *p, s, p->vertex_blocks.colors + 1u, spread_rows) != cudaSuccess) return Status::Failed;
+                    data, *p, s, p->vertex_blocks.colors + 1u, spread_rows, false) != cudaSuccess)
+                return Status::Failed;
             if (p->articulation_count > 0u) {
                 LaunchCuda(DescendArticulationsKernel, dim3(p->articulation_count), dim3(kThreads),
                            0u, stream, articulation_state, data, *p, s);
@@ -2216,7 +2289,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             for (uint32_t color = 0u; color < nk::kMpmCellStencilNodes; ++color) {
                 const uint32_t cache_color = p->vertex_blocks.colors + 2u + color;
                 if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                        data, *p, grid_s, cache_color, spread_rows) != cudaSuccess) return Status::Failed;
+                        data, *p, grid_s, cache_color, spread_rows, false) != cudaSuccess)
+                    return Status::Failed;
                 if (p->material_cells_per_env > 0u &&
                     LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                         data, *p, grid_s, true, cache_color) != cudaSuccess) return Status::Failed;
@@ -2263,7 +2337,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (p->material_cells_per_env > 0u &&
             LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                 data, *p, s, false, kAllCacheColors) != cudaSuccess) return Status::Failed;
-        if (LaunchWork(DualUpdateKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess)
+        if (LaunchWork(DualUpdateKernel, s.rows, kThreads, stream, data, *p, s,
+                       seed_rows && iteration + 1u < p->iterations) != cudaSuccess)
             return Status::Failed;
     }
     if (LaunchWork(GatherImpulseKernel, p->total_particle_count, kThreads / 32u, stream, data, *p, s) != cudaSuccess ||

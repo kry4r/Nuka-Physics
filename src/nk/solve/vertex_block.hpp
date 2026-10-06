@@ -78,6 +78,18 @@ NUKA_VBD_HD inline math::Vec3 InertialGradient(math::Vec3 rate, math::Vec3 free_
             float(scale * (double(rate.z) - free_rate.z))};
 }
 
+// The two factors of InertialEnergyChange, for callers that fuse its final multiply into their own sum;
+// InertialEnergyChange keeps its single expression so existing callers compile unchanged.
+NUKA_VBD_HD inline double InertialMoveChange(math::Vec3 rate, math::Vec3 free_rate, math::Vec3 move) {
+    return double(move.x) * (2.0 * (double(rate.x) - free_rate.x) + move.x) +
+           double(move.y) * (2.0 * (double(rate.y) - free_rate.y) + move.y) +
+           double(move.z) * (2.0 * (double(rate.z) - free_rate.z) + move.z);
+}
+
+NUKA_VBD_HD inline double InertialEnergyScale(float inertia, float dt) {
+    return 0.5 * double(inertia) * dt * dt;
+}
+
 NUKA_VBD_HD inline double InertialEnergyChange(math::Vec3 rate, math::Vec3 free_rate,
                                                math::Vec3 move, float inertia, float dt) {
     const double change = double(move.x) * (2.0 * (double(rate.x) - free_rate.x) + move.x) +
