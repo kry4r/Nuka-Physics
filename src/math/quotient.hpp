@@ -21,6 +21,15 @@ NUKA_QUOTIENT_HD inline double Quotient(double n, double d) {
     return n != 0.0 && divisor_regular ? q : n * factor;
 }
 
+// The IEEE float quotient n / d with the same exact case split.
+NUKA_QUOTIENT_HD inline float Quotient(float n, float d) {
+    const bool divisor_regular = fabsf(d) > 0.0f && fabsf(d) <= FLT_MAX;
+    const float q = (n != 0.0f ? n : 1.0f) / (divisor_regular ? d : 1.0f);
+    const float factor = d == 0.0f ? copysignf(INFINITY, d)
+        : divisor_regular ? copysignf(1.0f, d) : d == d ? copysignf(0.0f, d) : d;
+    return n != 0.0f && divisor_regular ? q : n * factor;
+}
+
 }  // namespace nuka::math
 
 #undef NUKA_QUOTIENT_HD

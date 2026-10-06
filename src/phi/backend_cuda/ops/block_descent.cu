@@ -15,6 +15,8 @@
 #include "nk/solve/augmented_row.hpp"
 #include "nk/solve/block_row_schedule.hpp"
 #include "nk/solve/chebyshev_iteration.hpp"
+#include "nk/solve/vertex_block_forms.hpp"
+#include "nk/solve/vertex_block_hierarchy.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/launch_grid.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
@@ -35,6 +37,7 @@ constexpr uint32_t kSolverCountWords = 6u;
 constexpr uint32_t kSolverPhaseWords = 8u;
 constexpr uint32_t kNoCacheColor = ~0u;
 constexpr uint32_t kAllCacheColors = ~0u;
+constexpr uint32_t kRowAxisLanes = 4u;
 constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
 constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
@@ -54,7 +57,6 @@ struct MaterialRowState {
 
 constexpr uint32_t kCoarseVertexFamily = 0u;
 constexpr uint32_t kCoarseParticleFamily = 1u;
-constexpr uint32_t kCoarseFamilies = 2u;
 constexpr uint32_t kNoCoarseFamily = ~0u;
 constexpr uint32_t kCoarseTrials = kVertexStepHalvings + 1u;
 // Force (3) and symmetric curvature (6) of one translation system.
@@ -78,6 +80,61 @@ uint32_t CoarseParts(const BlockDescentSolveParams& p) {
     return static_cast<uint32_t>(std::max<uint64_t>(1u, parts));
 }
 
+// One environment's multilevel step: plane coefficients, accepted scale and pending trial, the dense
+// factor flag, the fixed-point exponent with its bound, and the finished blocks of the running kernel.
+struct MultilevelState {
+    double slope;
+    float alpha;
+    float beta;
+    float scale;
+    float trial;
+    uint32_t dense;
+    int32_t exponent;
+    uint32_t bound;
+    uint32_t done;
+};
+static_assert(sizeof(MultilevelState) % sizeof(double) == 0u);
+// Plane sums: force work along the correction and the previous step, then their three curvatures.
+constexpr uint32_t kMultilevelSums = 5u;
+// Blocks per environment that share its live rows in the multilevel kernels, about a row per thread.
+constexpr uint32_t kMultilevelRowParts = 256u;
+// Upper triangle of an element Hessian over the moves of up to three vertices relative to vertex 0.
+constexpr uint32_t kMultilevelElementHessian = 45u;
+// Threads of a restriction block, one coarse node per warp.
+constexpr uint32_t kMultilevelCorrectThreads = 256u;
+// Vertex-block particles one row group may move; a group with more fails its environment.
+constexpr uint32_t kMultilevelRowPoints = 8u;
+
+// Operator words per environment: a symmetric block per node above the dense level, then the packed
+// upper triangle of the dense level.
+__host__ __device__ inline uint64_t MultilevelOperatorEntries(const VertexBlockLayout& l) {
+    const uint64_t rank = 3u * uint64_t{l.coarse_dense_nodes};
+    return 6u * uint64_t{l.coarse_nodes - l.coarse_dense_nodes} + rank * (rank + 1u) / 2u;
+}
+
+// Words of one environment's dense factor: the upper factor by columns, then its scales.
+__host__ __device__ inline uint64_t MultilevelDenseFactorWords(uint32_t rank) {
+    return uint64_t{rank} * (rank + 3u) / 2u;
+}
+
+// Blocks per environment of the multilevel plane kernels: up to kMultilevelRowParts blocks striding over
+// the rows, then one vertex or element per thread.
+uint32_t MultilevelItemParts(const BlockDescentSolveParams& p) {
+    const uint64_t items = uint64_t{p.vertex_blocks.vertices} + p.vertex_blocks.elements;
+    return static_cast<uint32_t>(std::max<uint64_t>(1u, (items + kThreads - 1u) / kThreads));
+}
+
+uint32_t MultilevelParts(const BlockDescentSolveParams& p) {
+    return MultilevelItemParts(p) + static_cast<uint32_t>(std::min<uint64_t>(
+        kMultilevelRowParts, (uint64_t{p.rows_per_env} + kThreads - 1u) / kThreads));
+}
+
+// Blocks per environment of the restriction.
+uint32_t MultilevelCorrectParts(const VertexBlockLayout& l) {
+    constexpr uint32_t warps = kMultilevelCorrectThreads / 32u;
+    return std::max<uint32_t>(1u, (l.coarse_nodes + warps - 1u) / warps);
+}
+
 // Live point-row heads, selected in slot order so the coarse sums keep a fixed order.
 struct CoarseRowSelect {
     const NkRow* rows;
@@ -88,6 +145,19 @@ struct CoarseRowSelect {
                (PointMassView::IsPointSide(row.a.kind) || PointMassView::IsPointSide(row.b.kind));
     }
 };
+
+// Row coefficients remain fixed during a solve; its residual, dual and bound are refreshed separately.
+struct MultilevelRowTerm {
+    float penalty;
+    float compliance;
+    float lower;
+    float upper;
+    float mu_first;
+    float mu_second;
+    bool contact;
+    nk::augmented::ScalarResponse response;
+};
+static_assert(sizeof(MultilevelRowTerm) % sizeof(double) == 0u);
 
 struct BlockScratch {
     uint32_t* counts;
@@ -150,7 +220,6 @@ struct BlockScratch {
     nk::augmented::ScalarResponse* scalar_response;
     CoarseState* coarse;
     double* coarse_partials;
-    uint32_t* coarse_anchored;
     uint32_t* coarse_rows;
     uint32_t* coarse_row_count;
     uint8_t* coarse_flags;
@@ -158,6 +227,27 @@ struct BlockScratch {
     void* coarse_select;
     size_t coarse_select_bytes;
     uint32_t coarse_parts;
+    MultilevelState* multilevel;
+    double* multilevel_partials;
+    unsigned long long* multilevel_operator;
+    Vec3* multilevel_force;
+    Vec3* multilevel_direction;
+    Vec3* multilevel_previous;
+    Vec3* multilevel_correction;
+    float* multilevel_restricted;
+    SymmetricMat3* multilevel_block_inverse;
+    float* multilevel_dense_factor;
+    float* multilevel_dense_inverse;
+    float* multilevel_element_hessian;
+    Vec3* multilevel_element_gradient;
+    Vec3* multilevel_row_impulse;
+    float* multilevel_row_curvature;
+    Vec3* multilevel_row_along;
+    uint2* multilevel_touch;
+    MultilevelRowTerm* multilevel_row_terms;
+    uint8_t* multilevel_touch_count;
+    uint32_t multilevel_parts;
+    uint32_t multilevel_item_parts;
 };
 
 // Incidence entries are row slots, so sorting the bits that index every slot orders them fully.
@@ -331,11 +421,60 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.coarse_partials = reinterpret_cast<double*>(take(coarse
         ? uint64_t{p.env_count} * s.coarse_parts * kCoarseTrials * (sizeof(double) / sizeof(uint32_t))
         : 0u));
-    s.coarse_anchored = take(coarse ? p.env_count : 0u);
     s.coarse_rows = take(coarse ? rows : 0u);
     s.coarse_row_count = take(coarse ? 1u : 0u);
     s.coarse_flags = reinterpret_cast<uint8_t*>(take(coarse ? (rows + 3u) / 4u : 0u));
     s.coarse_row_offsets = take(coarse ? uint64_t{p.env_count} + 1u : 0u);
+    const VertexBlockLayout& layout = p.vertex_blocks;
+    const bool multilevel = layout.dynamic_vertices > 0u && layout.coarse_levels > 0u;
+    s.multilevel_parts = multilevel ? MultilevelParts(p) : 0u;
+    s.multilevel_item_parts = multilevel ? MultilevelItemParts(p) : 0u;
+    const uint64_t assemble_parts =
+        uint64_t{layout.coarse_levels} * (s.multilevel_parts - s.multilevel_item_parts) + s.multilevel_item_parts;
+    const uint64_t correct_parts = MultilevelCorrectParts(layout);
+    if (uint64_t{p.env_count} * std::max({uint64_t{s.multilevel_parts}, assemble_parts, correct_parts,
+                                          MultilevelOperatorEntries(layout)}) >=
+            uint64_t{std::numeric_limits<int>::max()} ||
+        layout.coarse_dense_nodes > layout.coarse_nodes) return 0u;
+    const uint64_t element_slots = uint64_t{nk::PackVbdIncidence(1u, 0u)} * layout.elements * p.env_count;
+    if (multilevel && element_slots > uint64_t{std::numeric_limits<uint32_t>::max()} - kThreads + 1u)
+        return 0u;
+    const uint64_t vertex_words = multilevel ? 3u * uint64_t{layout.vertices} * p.env_count : 0u;
+    const uint64_t rank = 3u * uint64_t{layout.coarse_dense_nodes};
+    at = (at + 1u) & ~uint64_t{1u};
+    s.multilevel = reinterpret_cast<MultilevelState*>(take(
+        multilevel ? uint64_t{p.env_count} * sizeof(MultilevelState) / sizeof(uint32_t) : 0u));
+    s.multilevel_partials = reinterpret_cast<double*>(take(multilevel
+        ? uint64_t{p.env_count} * s.multilevel_parts * kMultilevelSums * (sizeof(double) / sizeof(uint32_t))
+        : 0u));
+    s.multilevel_operator = reinterpret_cast<unsigned long long*>(take(multilevel
+        ? uint64_t{p.env_count} * MultilevelOperatorEntries(layout) * (sizeof(uint64_t) / sizeof(uint32_t))
+        : 0u));
+    s.multilevel_force = reinterpret_cast<Vec3*>(take(vertex_words));
+    s.multilevel_direction = reinterpret_cast<Vec3*>(take(vertex_words));
+    s.multilevel_previous = reinterpret_cast<Vec3*>(take(vertex_words));
+    s.multilevel_correction = reinterpret_cast<Vec3*>(take(
+        multilevel ? 3u * uint64_t{layout.coarse_nodes} * p.env_count : 0u));
+    s.multilevel_restricted = reinterpret_cast<float*>(take(multilevel ? rank * p.env_count : 0u));
+    s.multilevel_block_inverse = reinterpret_cast<SymmetricMat3*>(take(multilevel
+        ? 6u * uint64_t{layout.coarse_nodes - layout.coarse_dense_nodes} * p.env_count : 0u));
+    s.multilevel_dense_inverse = reinterpret_cast<float*>(take(multilevel ? rank * rank * p.env_count : 0u));
+    s.multilevel_dense_factor = reinterpret_cast<float*>(
+        take(multilevel ? MultilevelDenseFactorWords(static_cast<uint32_t>(rank)) * p.env_count : 0u));
+    s.multilevel_element_hessian = reinterpret_cast<float*>(take(multilevel
+        ? uint64_t{kMultilevelElementHessian} * layout.elements * p.env_count : 0u));
+    s.multilevel_element_gradient = reinterpret_cast<Vec3*>(take(multilevel
+        ? 3u * element_slots : 0u));
+    s.multilevel_row_impulse = reinterpret_cast<Vec3*>(take(multilevel ? 3u * rows : 0u));
+    s.multilevel_row_curvature = reinterpret_cast<float*>(take(multilevel ? 4u * rows : 0u));
+    s.multilevel_row_along = reinterpret_cast<Vec3*>(take(multilevel ? 6u * rows : 0u));
+    at = (at + 1u) & ~uint64_t{1u};
+    s.multilevel_touch = reinterpret_cast<uint2*>(
+        take(multilevel ? 2u * uint64_t{kMultilevelRowPoints} * rows : 0u));
+    s.multilevel_touch_count = reinterpret_cast<uint8_t*>(take(multilevel ? (rows + 3u) / 4u : 0u));
+    at = (at + 1u) & ~uint64_t{1u};
+    s.multilevel_row_terms = reinterpret_cast<MultilevelRowTerm*>(take(multilevel
+        ? rows * sizeof(MultilevelRowTerm) / sizeof(uint32_t) : 0u));
     at = (at + 63u) & ~uint64_t{63u};
     s.coarse_select = take(coarse_select_bytes / sizeof(uint32_t) +
                            (coarse_select_bytes % sizeof(uint32_t) != 0u));
@@ -897,10 +1036,15 @@ __device__ void AugmentedRowAxis(DataView data, BlockDescentSolveParams p, Block
     *dual = data.lambda[row_slot];
 }
 
+__device__ nk::augmented::ScalarTerm AugmentedRowBoundTerm(BlockScratch s, const NkRow& normal, uint32_t slot,
+                                                           float scale, const AugmentedRowState& state) {
+    return nk::augmented::EvaluateScalarImpulse(state.dual.x, s.penalty[slot], state.residual.x,
+        normal.compliance_alpha * scale, normal.lower, normal.upper, s.scalar_response[slot]);
+}
+
 __device__ float AugmentedRowBound(BlockScratch s, const NkRow& normal, uint32_t slot, float scale,
                                    const AugmentedRowState& state) {
-    return nk::augmented::EvaluateScalarImpulse(state.dual.x, s.penalty[slot], state.residual.x,
-        normal.compliance_alpha * scale, normal.lower, normal.upper, s.scalar_response[slot]).impulse;
+    return AugmentedRowBoundTerm(s, normal, slot, scale, state).impulse;
 }
 
 __device__ AugmentedRowState ComputeAugmentedRowState(
@@ -919,7 +1063,8 @@ __device__ AugmentedRowState ComputeAugmentedRowState(
 }
 
 __device__ LocalTerm LoadLocalTerm(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                   uint32_t slot, uint32_t particle, bool snapshot) {
+                                   uint32_t slot, uint32_t particle, bool snapshot,
+                                   const AugmentedRowState* current = nullptr) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const NkRow normal = rows[slot];
     auto points = PointMasses(data);
@@ -941,7 +1086,7 @@ __device__ LocalTerm LoadLocalTerm(DataView data, BlockDescentSolveParams p, Blo
         const NkRow row = rows[row_slot];
         t.jacobian[axis] = particle != ~0u ? ParticleJacobian(row, points, particle) : Vec3{};
     }
-    const AugmentedRowState state = snapshot ? s.row_state[slot]
+    const AugmentedRowState state = current != nullptr ? *current : snapshot ? s.row_state[slot]
         : ComputeAugmentedRowState(data, p, s, slot, false);
     t.residual = state.residual;
     t.dual = state.dual;
@@ -1007,11 +1152,9 @@ __device__ double EvaluateLocal(const LocalTerm& t, Vec3 move, Vec3* impulse,
     return potential;
 }
 
-// EvaluateAugmentedResidual's impulse and curvature without the potential; the cone runs in float.
-__device__ void EvaluateAugmentedResponse(const LocalTerm& t, Vec3 row_move, Vec3* impulse,
-                                          SymmetricMat3* curvature) {
-    const auto n = nk::augmented::EvaluateScalarImpulse(t.dual.x, t.penalty, t.residual.x - row_move.x,
-        t.compliance, t.lower, t.upper, t.response);
+// EvaluateAugmentedResponse given the normal term `n` already evaluated at the residual less row_move.x.
+__device__ void EvaluateAugmentedResponse(const LocalTerm& t, const nk::augmented::ScalarTerm& n, Vec3 row_move,
+                                          Vec3* impulse, SymmetricMat3* curvature) {
     *impulse = {n.impulse, 0.0f, 0.0f};
     *curvature = {n.curvature, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (!t.contact) return;
@@ -1025,6 +1168,13 @@ __device__ void EvaluateAugmentedResponse(const LocalTerm& t, Vec3 row_move, Vec
     curvature->yz = f.curvature.yz;
 }
 
+// EvaluateAugmentedResidual's impulse and curvature without the potential; the cone runs in float.
+__device__ void EvaluateAugmentedResponse(const LocalTerm& t, Vec3 row_move, Vec3* impulse,
+                                          SymmetricMat3* curvature) {
+    EvaluateAugmentedResponse(t, nk::augmented::EvaluateScalarImpulse(t.dual.x, t.penalty, t.residual.x - row_move.x,
+        t.compliance, t.lower, t.upper, t.response), row_move, impulse, curvature);
+}
+
 __device__ void EvaluateLocalResponse(const LocalTerm& t, Vec3 move, Vec3* impulse,
                                       SymmetricMat3* curvature) {
     Vec3 f{};
@@ -1034,15 +1184,19 @@ __device__ void EvaluateLocalResponse(const LocalTerm& t, Vec3 move, Vec3* impul
     AddLocalResponse(t.jacobian, f, c, impulse, curvature);
 }
 
-// EvaluateLocal(t, move) - EvaluateLocal(t, 0), integrated along the move instead of subtracted.
-__device__ float EvaluateLocalChange(const LocalTerm& t, Vec3 move) {
-    const Vec3 drop{t.jacobian[0].Dot(move), t.jacobian[1].Dot(move), t.jacobian[2].Dot(move)};
+// The row potential change as its residual drops by `drop`, integrated along it instead of subtracted.
+__device__ float EvaluateDropChange(const LocalTerm& t, Vec3 drop) {
     float change = nk::augmented::ScalarPotentialChange(t.dual.x, t.penalty, t.residual.x, drop.x,
         t.compliance, t.lower, t.upper, t.response);
     if (t.contact)
         change += nk::augmented::TangentPotentialChange(t.dual, t.penalty, t.residual, drop,
                                                         t.normal_bound, t.mu_first, t.mu_second);
     return change;
+}
+
+// EvaluateLocal(t, move) - EvaluateLocal(t, 0), integrated along the move instead of subtracted.
+__device__ float EvaluateLocalChange(const LocalTerm& t, Vec3 move) {
+    return EvaluateDropChange(t, {t.jacobian[0].Dot(move), t.jacobian[1].Dot(move), t.jacobian[2].Dot(move)});
 }
 
 // One point incidence's row response at the block rate.
@@ -1088,6 +1242,7 @@ __device__ bool Finite(Vec3 value) {
 #include "phi/backend_cuda/ops/block_descent_material.cuh"
 #include "phi/backend_cuda/ops/block_descent_grid.cuh"
 #include "phi/backend_cuda/ops/block_descent_coarse.cuh"
+#include "phi/backend_cuda/ops/block_descent_multilevel.cuh"
 
 __global__ void PackBlockRigidSnapshotKernel(DataView data, BlockDescentSolveParams p,
                                             BlockScratch s) {
@@ -1131,8 +1286,6 @@ __device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, Bloc
 
 // Rows too few to give every warp scheduler a warp are latency-bound, so adjacent lanes evaluate one
 // row's axes and the group's first lane caches it; otherwise each lane caches whole rows.
-constexpr uint32_t kRowAxisLanes = 4u;
-
 __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                         uint32_t cache_color, uint32_t spread_rows) {
     const uint32_t threads = gridDim.x * blockDim.x;
@@ -1779,6 +1932,89 @@ cudaError_t LaunchWork(Kernel kernel, uint32_t work, uint32_t items_per_block,
     return cudaGetLastError();
 }
 
+// The multilevel correction of the vertex blocks builds its operators and dense factors when asked.
+cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& data,
+                                       const BlockDescentSolveParams& p, const BlockScratch& s,
+                                       bool assemble, cudaStream_t stream) {
+    const VertexBlockLayout& l = p.vertex_blocks;
+    const uint32_t vertices = l.vertices * p.env_count;
+    const uint32_t jacobi = (l.coarse_nodes - l.coarse_dense_nodes) * p.env_count;
+    const uint32_t rank = 3u * l.coarse_dense_nodes, packed = rank * (rank + 1u) / 2u;
+    const dim3 parts(p.env_count * s.multilevel_parts);
+    cudaError_t status = LaunchWork(MultilevelRowsKernel, s.rows, kThreads / kRowAxisLanes, stream, data, p, s);
+    if (status == cudaSuccess)
+        status = LaunchWork(MultilevelElementGradientKernel,
+            static_cast<uint32_t>(uint64_t{nk::PackVbdIncidence(1u, 0u)} * l.elements * p.env_count),
+            kThreads, stream, model, data, p, s);
+    if (status == cudaSuccess)
+        status = LaunchWork(MultilevelForceKernel, vertices, kMultilevelForceTile, stream, model, data, p, s);
+    if (status == cudaSuccess && assemble) {
+        status = cudaMemsetAsync(s.multilevel_operator, 0, size_t{p.env_count} *
+                                 MultilevelOperatorEntries(l) * sizeof(unsigned long long), stream);
+        if (status == cudaSuccess) {
+            LaunchCuda(MultilevelBoundKernel, parts, dim3(kThreads), 0u, stream, model, data, p, s);
+            status = cudaGetLastError();
+        }
+        if (status == cudaSuccess)
+            status = LaunchWork(MultilevelScaleKernel, p.env_count, kThreads, stream, data, p, s);
+        if (status == cudaSuccess) {
+            const uint32_t row_parts = s.multilevel_parts - s.multilevel_item_parts;
+            LaunchCuda(MultilevelAssembleKernel,
+                       dim3(p.env_count * (row_parts * l.coarse_levels + s.multilevel_item_parts)),
+                       dim3(kThreads), 0u, stream, model, data, p, s);
+            status = cudaGetLastError();
+        }
+        if (status == cudaSuccess)
+            status = LaunchWork(MultilevelJacobiFactorKernel, jacobi + rank * p.env_count, kThreads, stream, p, s);
+        if (status == cudaSuccess && rank > 0u)
+            status = LaunchWork(MultilevelDenseScaleKernel, packed * p.env_count, kThreads, stream, p, s);
+        const size_t factor_shared = MultilevelFactorSharedBytes(rank);
+        uint32_t factor_grid = 0u;
+        if (status == cudaSuccess && rank > 0u)
+            status = ResidentGridSize(MultilevelDenseFactorKernel, 32u * kMultilevelFactorWarps, factor_shared,
+                                      p.env_count, &factor_grid);
+        if (status == cudaSuccess && rank > 0u) {
+            LaunchCuda(MultilevelDenseFactorKernel, dim3(factor_grid), dim3(32u * kMultilevelFactorWarps),
+                       factor_shared, stream, p, s);
+            status = cudaGetLastError();
+        }
+        const uint32_t groups = (rank + kMultilevelInverseWarps - 1u) / kMultilevelInverseWarps;
+        const size_t inverse_shared =
+            (size_t{packed} + size_t{rank}) * sizeof(float);
+        uint32_t inverse_grid = 0u;
+        if (status == cudaSuccess && rank > 0u)
+            status = ResidentGridSize(MultilevelDenseInverseKernel, 32u * kMultilevelInverseWarps,
+                                      inverse_shared, p.env_count * groups, &inverse_grid);
+        if (status == cudaSuccess && rank > 0u) {
+            LaunchCuda(MultilevelDenseInverseKernel, dim3(inverse_grid), dim3(32u * kMultilevelInverseWarps),
+                       inverse_shared, stream, p, s);
+            status = cudaGetLastError();
+        }
+    }
+    if (status == cudaSuccess) {
+        const uint32_t correct_parts = MultilevelCorrectParts(l);
+        LaunchCuda(MultilevelCorrectKernel, dim3(p.env_count * correct_parts), dim3(kMultilevelCorrectThreads),
+                   0u, stream, model, p, s, correct_parts);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess && rank > 0u) {
+        const uint32_t tiles = (rank + 31u) / 32u;
+        LaunchCuda(MultilevelDenseCorrectKernel, dim3(p.env_count * tiles), dim3(kMultilevelCorrectThreads),
+                   0u, stream, p, s, tiles);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess)
+        status = LaunchWork(MultilevelProlongKernel, vertices, kThreads, stream, model, data, p, s);
+    if (status != cudaSuccess) return status;
+    LaunchCuda(MultilevelFormsKernel, parts, dim3(kThreads), 0u, stream, model, data, p, s);
+    for (uint32_t trial = 0u; trial <= kMultilevelBacktracks; ++trial)
+        LaunchCuda(MultilevelTrialKernel, parts, dim3(kThreads), 0u, stream, model, data, p, s,
+                   trial == kMultilevelBacktracks);
+    status = cudaGetLastError();
+    return status == cudaSuccess
+        ? LaunchWork(MultilevelApplyKernel, vertices, kThreads, stream, data, p, s) : status;
+}
+
 Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                            const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const BlockDescentSolveParams*>(params);
@@ -1792,6 +2028,16 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     if (vertex_color_items > p->total_particle_count ||
         (vertex_color_items > 0u && (model.vbd_color_vertices == nullptr ||
                                   model.vbd_color_segments == nullptr)))
+        return Status::InvalidArgument;
+    const VertexBlockLayout& layout = p->vertex_blocks;
+    const bool multilevel = layout.dynamic_vertices > 0u && layout.coarse_levels > 0u;
+    if (multilevel && (layout.coarse_dense_nodes > nk::kVbdCoarseDenseNodes ||
+        layout.coarse_dense_nodes > layout.coarse_nodes ||
+        layout.particles_per_env != p->total_particle_count / p->env_count ||
+        model.vbd_coarse_parents == nullptr || model.vbd_coarse_weights == nullptr ||
+        model.vbd_coarse_child_offsets == nullptr || model.vbd_coarse_children == nullptr ||
+        model.vbd_coarse_child_weights == nullptr || data.vbd_inertia == nullptr ||
+        data.vbd_free_rate == nullptr))
         return Status::InvalidArgument;
     if (p->total_grid_count > 0u) {
         if (p->total_grid_count % p->env_count != 0u || data.grid_inv_mass == nullptr ||
@@ -1908,14 +2154,16 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             p->total_particle_count + p->total_grid_count, kThreads / 32u, stream,
             data, *p, s) != cudaSuccess) return Status::Failed;
     if (p->total_particle_count > 0u &&
-        (!clear(s.coarse_anchored, size_t{p->env_count} * sizeof(uint32_t)) ||
-         LaunchWork(MarkCoarseAnchorsKernel, p->vertex_blocks.elements * p->env_count, kThreads,
-             stream, model, data, *p, s) != cudaSuccess ||
-         !clear(s.coarse_row_count, sizeof(uint32_t)) ||
+        (!clear(s.coarse_row_count, sizeof(uint32_t)) ||
          (s.rows > 0u && cub::DeviceSelect::Flagged(s.coarse_select, s.coarse_select_bytes,
              thrust::counting_iterator<uint32_t>(0u), s.coarse_flags, s.coarse_rows,
              s.coarse_row_count, static_cast<int>(s.rows), stream) != cudaSuccess) ||
          LaunchWork(CoarseRowRangesKernel, p->env_count + 1u, kThreads, stream, *p, s) != cudaSuccess))
+        return Status::Failed;
+    if (multilevel &&
+        (LaunchWork(MultilevelTouchKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
+         !clear(s.multilevel, size_t{p->env_count} * sizeof(MultilevelState)) ||
+         !clear(s.multilevel_previous, size_t{layout.vertices} * p->env_count * sizeof(Vec3))))
         return Status::Failed;
     for (uint32_t iteration = 0u; iteration < p->iterations; ++iteration) {
         s.diagnostic_iteration = iteration;
@@ -1976,28 +2224,26 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                         stream, data, *p, grid_s, color) != cudaSuccess) return Status::Failed;
             }
         }
-        for (uint32_t family = 0u; family < kCoarseFamilies; ++family) {
-            const uint32_t per_env = p->total_particle_count / p->env_count;
-            const bool present = family == kCoarseVertexFamily
-                ? p->vertex_blocks.dynamic_vertices > 0u
-                : per_env > p->grid_particles_per_env + p->vertex_blocks.vertices;
-            if (!present) continue;
+        if (multilevel &&
+            LaunchMultilevelCorrection(model, data, *p, s, iteration == 0u, stream) != cudaSuccess)
+            return Status::Failed;
+        if (p->total_particle_count / p->env_count > p->grid_particles_per_env + layout.vertices) {
             const dim3 coarse_grid(p->env_count * s.coarse_parts);
             LaunchCuda(CoarseGradientKernel, coarse_grid, dim3(kThreads * kCoarseHelpers), 0u, stream,
-                       model, data, *p, s, family);
+                       data, *p, s);
             LaunchCuda(CoarseDirectionKernel, dim3(p->env_count), dim3(kThreads), 0u, stream,
-                       data, *p, s, family);
+                       data, *p, s);
             LaunchCuda(CoarseUnitTrialKernel, coarse_grid, dim3(kThreads * kCoarseHelpers), 0u, stream,
-                       model, data, *p, s, family);
+                       data, *p, s);
             LaunchCuda(CoarseAcceptKernel, dim3(p->env_count), dim3(kThreads), 0u, stream,
                        *p, s, false);
             LaunchCuda(CoarseTrialsKernel, coarse_grid, dim3(kThreads), 0u, stream,
-                       model, data, *p, s, family);
+                       data, *p, s);
             LaunchCuda(CoarseAcceptKernel, dim3(p->env_count), dim3(kThreads), 0u, stream,
                        *p, s, true);
             if (cudaGetLastError() != cudaSuccess ||
                 LaunchWork(CoarseApplyKernel, p->total_particle_count, kThreads, stream,
-                    model, data, *p, s, family) != cudaSuccess) return Status::Failed;
+                    data, *p, s) != cudaSuccess) return Status::Failed;
         }
         if (accelerate) {
             if (!clear(s.acceleration_merit, size_t{p->env_count} * 2u * sizeof(double)) ||

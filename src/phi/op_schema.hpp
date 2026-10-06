@@ -774,6 +774,10 @@ struct VertexBlockLayout {
     uint32_t particles_per_env = 0u;
     uint32_t env_count = 0u;
     uint32_t elements = 0u;
+    // Coarse levels of the vertex blocks, their nodes and the nodes of the dense last level.
+    uint32_t coarse_levels = 0u;
+    uint32_t coarse_nodes = 0u;
+    uint32_t coarse_dense_nodes = 0u;
 };
 
 struct AssembleRowsParams {
