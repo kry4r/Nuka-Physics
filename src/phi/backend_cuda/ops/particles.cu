@@ -89,12 +89,14 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
         __syncthreads();
     }
     const uint32_t total = p.env_count * p.nodes_per_env;
+    const uint32_t edge_total = p.env_count * p.edge_nodes_per_env;
+    const uint32_t items = total + edge_total;
     const uint32_t stride = gridDim.x * blockDim.x;
     const uint32_t first = blockIdx.x * blockDim.x + lane;
-    for (uint32_t item = first; item < total; item += stride) {
+    const auto triangle_leaf = [&](uint32_t item) {
         const uint32_t env = item / p.nodes_per_env;
         collision::MeshSurfaceInfo info;
-        if (!SurfaceOfNode(model, p, item % p.nodes_per_env, &info)) continue;
+        if (!SurfaceOfNode(model, p, item % p.nodes_per_env, &info)) return;
         auto node = model.particle_surface_tree[item % p.nodes_per_env];
         if (node.triangle == ~0u) {
             node.triangle = kRefitPending;
@@ -116,15 +118,13 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
             }
         }
         data.particle_surface_nodes[item] = node;
-    }
-    grid.sync();
-    // Descending order always leaves the highest pending node with final children, so waits progress.
-    for (uint32_t item = total - 1u - first; item < total; item -= stride) {
+    };
+    const auto triangle_internal = [&](uint32_t item) {
         const uint32_t env = item / p.nodes_per_env;
         collision::MeshSurfaceInfo info;
-        if (!SurfaceOfNode(model, p, item % p.nodes_per_env, &info)) continue;
+        if (!SurfaceOfNode(model, p, item % p.nodes_per_env, &info)) return;
         auto node = model.particle_surface_tree[item % p.nodes_per_env];
-        if (node.triangle != ~0u) continue;
+        if (node.triangle != ~0u) return;
         auto* nodes = data.particle_surface_nodes + size_t{env} * p.nodes_per_env + info.node_offset;
         const uint32_t local = item % p.nodes_per_env - info.node_offset;
         const uint32_t left_index = local + 1u;
@@ -151,13 +151,11 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
         nodes[local].escape = node.escape;
         cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(nodes[local].triangle)
             .store(~0u, cuda::memory_order_release);
-    }
-    grid.sync();
-    const uint32_t edge_total = p.env_count * p.edge_nodes_per_env;
-    for (uint32_t item = first; item < edge_total; item += stride) {
+    };
+    const auto edge_leaf = [&](uint32_t item) {
         const uint32_t env = item / p.edge_nodes_per_env;
         collision::MeshEdgeInfo info;
-        if (!SurfaceOfEdgeNode(model, p, item % p.edge_nodes_per_env, &info)) continue;
+        if (!SurfaceOfEdgeNode(model, p, item % p.edge_nodes_per_env, &info)) return;
         auto node = model.particle_surface_edge_tree[item % p.edge_nodes_per_env];
         if (node.triangle == ~0u) {
             node.triangle = kRefitPending;
@@ -178,14 +176,13 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
             }
         }
         data.particle_surface_edge_nodes[item] = node;
-    }
-    grid.sync();
-    for (uint32_t item = edge_total - 1u - first; item < edge_total; item -= stride) {
+    };
+    const auto edge_internal = [&](uint32_t item) {
         const uint32_t env = item / p.edge_nodes_per_env;
         collision::MeshEdgeInfo info;
-        if (!SurfaceOfEdgeNode(model, p, item % p.edge_nodes_per_env, &info)) continue;
+        if (!SurfaceOfEdgeNode(model, p, item % p.edge_nodes_per_env, &info)) return;
         auto node = model.particle_surface_edge_tree[item % p.edge_nodes_per_env];
-        if (node.triangle != ~0u) continue;
+        if (node.triangle != ~0u) return;
         auto* nodes = data.particle_surface_edge_nodes +
             size_t{env} * p.edge_nodes_per_env + info.node_offset;
         const uint32_t local = item % p.edge_nodes_per_env - info.node_offset;
@@ -212,6 +209,17 @@ __global__ void RefitParticleSurfacesKernel(ParticleSurfacesParams p, ModelView 
         nodes[local].escape = node.escape;
         cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(nodes[local].triangle)
             .store(~0u, cuda::memory_order_release);
+    };
+    for (uint32_t item = first; item < items; item += stride) {
+        if (item < total) triangle_leaf(item);
+        else edge_leaf(item - total);
+    }
+    grid.sync();
+    // Descending order always leaves the highest pending node with final children, so waits progress;
+    // the trees share one pass because a node's children follow it within its own tree.
+    for (uint32_t item = items - 1u - first; item < items; item -= stride) {
+        if (item < total) triangle_internal(item);
+        else edge_internal(item - total);
     }
 }
 
@@ -233,10 +241,9 @@ Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
         return Status::InvalidArgument;
     const uint64_t nodes = uint64_t{p->env_count} * p->nodes_per_env;
     const uint64_t edge_nodes = uint64_t{p->env_count} * p->edge_nodes_per_env;
-    if (nodes > std::numeric_limits<uint32_t>::max() ||
-        edge_nodes > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
+    if (nodes + edge_nodes > std::numeric_limits<uint32_t>::max()) return Status::InvalidArgument;
     const uint32_t bound = std::max(p->env_count * p->surfaces_per_env,
-        static_cast<uint32_t>((std::max(nodes, edge_nodes) + kBlockSize - 1u) / kBlockSize));
+        static_cast<uint32_t>((nodes + edge_nodes + kBlockSize - 1u) / kBlockSize));
     uint32_t blocks = 0u;
     if (RequireCooperativeLaunch() != cudaSuccess ||
         ResidentGridSize(RefitParticleSurfacesKernel, kBlockSize, 0u, bound, &blocks) != cudaSuccess)
