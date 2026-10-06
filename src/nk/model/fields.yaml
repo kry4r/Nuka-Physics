@@ -1148,3 +1148,6 @@ fields:
   # Per env, the contact-row end plus one of the previous and of the current pair-driven assembly;
   # 0 leaves every contact row unbounded.
   - {name: contact_row_extent, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}
+  # Per env, one past the last contact-cache point that may hold an entry (0 leaves it unbounded),
+  # then the end of this step's owners, which the rebuild bound replaces.
+  - {name: contact_cache_extent, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}

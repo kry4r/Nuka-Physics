@@ -98,6 +98,12 @@ inline uint32_t EnvBlocks(uint32_t entries_per_env, uint32_t envs) {
     return needed < share ? needed : share;
 }
 
+// Every cache point at or past an env's previous bound holds no entry.
+__device__ inline uint32_t PreviousBound(const uint32_t* extent, uint32_t env, uint32_t points_per_env) {
+    if (extent == nullptr || extent[2u * env] == 0u) return points_per_env;
+    return extent[2u * env] - 1u < points_per_env ? extent[2u * env] - 1u : points_per_env;
+}
+
 // Scan prefixes, first-entry tables and ranks occupy the shared region at different times.
 struct Layout {
     size_t slots_offset, shared_offset, warm_offset, match_offset;
@@ -166,7 +172,7 @@ struct Workspace {
 // Adjacent exclusive prefixes give each validity flag; only the final entry has no successor.
 static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* prefix,
                                              uint32_t* order, uint32_t* begins, uint32_t* ends,
-                                             uint32_t* owner, uint32_t* keep) {
+                                             uint32_t* owner, uint32_t* keep, uint32_t* extent) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = keys.points * 2u;
     if (i >= total) return;
@@ -181,6 +187,7 @@ static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* pref
     if (i == begin + stride - 1u) {
         begins[env] = begin;
         ends[env] = begin + prefix[i] + valid - prefix[begin];
+        if (extent != nullptr) extent[2u * env + 1u] = 0u;
     }
     if (valid != 0u) order[begin + prefix[i] - prefix[begin]] = keys.Source(i);
 }
@@ -234,10 +241,11 @@ static __global__ void ResolveEntriesKernel(KeySource keys, const uint32_t* orde
                                             uint32_t env_blocks, uint64_t stride,
                                             const uint32_t* first, const uint32_t* warm,
                                             const uint32_t* slots, uint32_t* matches,
-                                            uint32_t* owner, uint32_t* keep) {
+                                            uint32_t* owner, uint32_t* keep, uint32_t* extent) {
     const uint32_t env = blockIdx.x / env_blocks;
     const uint32_t part = blockIdx.x - env * env_blocks;
     const uint32_t end = ends[env];
+    uint32_t owned = 0u;
     for (uint32_t entry = begins[env] + part * blockDim.x + threadIdx.x; entry < end;
          entry += env_blocks * blockDim.x) {
         const uint32_t id = order[entry];
@@ -245,11 +253,16 @@ static __global__ void ResolveEntriesKernel(KeySource keys, const uint32_t* orde
         const bool head = first[slot] == entry;
         if (id < keys.points) {
             matches[id] = head ? warm[slot] : ~0u;
-            if (head) owner[id] = 1u;
+            if (head) {
+                owner[id] = 1u;
+                owned = max(owned, id - env * keys.points_per_env + 1u);
+            }
         } else if (head && decay_steps > 1u && age[id - keys.points] < decay_steps - 1u) {
             keep[id - keys.points] = 1u;
         }
     }
+    owned = __reduce_max_sync(0xffffffffu, owned);
+    if (extent != nullptr && owned != 0u && (threadIdx.x & 31u) == 0u) atomicMax(extent + 2u * env + 1u, owned);
 }
 
 inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
@@ -268,7 +281,7 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
     if (status != cudaSuccess) return status;
     CompactSourcesKernel<<<blocks, block, 0u, stream>>>(keys, workspace.prefix, workspace.order,
         workspace.begins, workspace.ends, data.contact_cache_current_owner,
-        data.contact_cache_old_keep);
+        data.contact_cache_old_keep, data.contact_cache_extent);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
     ClearTableKernel<<<envs * env_blocks, block, 0u, stream>>>(workspace.begins, workspace.ends,
         env_blocks, stride, workspace.first, workspace.warm);
@@ -280,7 +293,7 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
     ResolveEntriesKernel<<<envs * env_blocks, block, 0u, stream>>>(keys, workspace.order,
         workspace.begins, workspace.ends, data.contact_cache_age, decay_steps, env_blocks, stride,
         workspace.first, workspace.warm, workspace.slots, workspace.matches,
-        data.contact_cache_current_owner, data.contact_cache_old_keep);
+        data.contact_cache_current_owner, data.contact_cache_old_keep, data.contact_cache_extent);
     return cudaGetLastError();
 }
 
@@ -291,6 +304,21 @@ static __global__ void RetainedSourcesKernel(uint32_t points, uint32_t points_pe
     if (i >= points || keep[i] == 0u) return;
     const uint32_t begin = (i / points_per_env) * points_per_env;
     sources[begin + ranks[i].old - ranks[begin].old] = i;
+}
+
+// Owners and the retained entries that fill the first free points end before the bound kept for the
+// next step; the rebuild also covers the points the previous step may have filled.
+static __global__ void CacheExtentKernel(uint32_t envs, uint32_t points_per_env, const uint32_t* owner,
+                                         const uint32_t* keep, const Ranks* ranks, uint32_t* extent) {
+    const uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
+    if (env >= envs) return;
+    const uint32_t begin = env * points_per_env, last = begin + points_per_env - 1u;
+    const uint32_t unowned = ranks[last].free + (owner[last] == 0u ? 1u : 0u) - ranks[begin].free;
+    const uint32_t retained = ranks[last].old + keep[last] - ranks[begin].old;
+    const uint32_t next = min(max(extent[2u * env + 1u], points_per_env - unowned + retained), points_per_env);
+    const uint32_t previous = PreviousBound(extent, env, points_per_env);
+    extent[2u * env] = next + 1u;
+    extent[2u * env + 1u] = max(previous, next);
 }
 
 // Retained sources reuse the match array once prepare has read it.
@@ -304,6 +332,13 @@ inline cudaError_t BuildRanks(const DataView& data, uint32_t points,
     if (scanned != cudaSuccess) return scanned;
     RetainedSourcesKernel<<<(points + block - 1u) / block, block, 0u, stream>>>(points,
         points_per_env, data.contact_cache_old_keep, workspace.ranks, workspace.matches);
+    if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
+    if (data.contact_cache_extent != nullptr) {
+        const uint32_t envs = points / points_per_env;
+        CacheExtentKernel<<<(envs + block - 1u) / block, block, 0u, stream>>>(envs, points_per_env,
+            data.contact_cache_current_owner, data.contact_cache_old_keep, workspace.ranks,
+            data.contact_cache_extent);
+    }
     return cudaGetLastError();
 }
 }  // namespace nuka::phi::contact_cache

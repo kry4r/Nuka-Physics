@@ -481,6 +481,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ControlScratch, DlpackDtype::kU32, 2, false, false},  // control_scratch
     {FieldId::VbdFreeVelocity, DlpackDtype::kF32, 2, false, false},  // vbd_free_velocity
     {FieldId::ContactRowExtent, DlpackDtype::kU32, 2, false, false},  // contact_row_extent
+    {FieldId::ContactCacheExtent, DlpackDtype::kU32, 2, false, false},  // contact_cache_extent
 };
 
 } // namespace nuka::nk

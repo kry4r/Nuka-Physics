@@ -271,7 +271,8 @@ void CheckpointManager::Restore(
                               contact_cache->tangent1 != nullptr &&
                               contact_cache->tangent2 != nullptr &&
                               contact_cache->material != nullptr &&
-                              contact_cache->age != nullptr;
+                              contact_cache->age != nullptr &&
+                              contact_cache->extent != nullptr;
         if (!complete) {
             throw std::invalid_argument(
                 "nuka::diffsim::CheckpointManager::Restore: incomplete contact cache state");
@@ -308,6 +309,9 @@ void CheckpointManager::Restore(
         copy(contact_age_, const_cast<uint32_t*>(contact_cache->age),
              static_cast<size_t>(contact_point_count_) * sizeof(uint32_t),
              "Restore contact age");
+        CheckCuda(cudaMemsetAsync(contact_cache->extent, 0,
+                                  static_cast<size_t>(contact_cache->extent_words) * sizeof(uint32_t), stream),
+                  "Restore contact cache extent");
     }
 }
 

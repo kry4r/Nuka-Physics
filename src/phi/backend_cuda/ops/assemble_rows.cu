@@ -1511,9 +1511,11 @@ __device__ void ClearContactCachePoint(
 }
 
 
-// The rebuild reads the snapshot only at retained points, so only those are copied.
+// The rebuild reads the snapshot only at retained points, so only those are copied; they all lie
+// below the env's previous cache bound.
 __global__ void SnapshotContactCacheKernel(
-    uint32_t point_count,
+    uint32_t points_per_env, uint32_t env_blocks,
+    const uint32_t* __restrict__ extent,
     const uint32_t* __restrict__ old_keep,
     const uint64_t* __restrict__ cache_pair,
     const uint64_t* __restrict__ cache_feature,
@@ -1531,19 +1533,26 @@ __global__ void SnapshotContactCacheKernel(
     math::Vec3* __restrict__ snapshot_tangent2,
     uint64_t* __restrict__ snapshot_material,
     uint32_t* __restrict__ snapshot_age) {
-    const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (point_index >= point_count || old_keep[point_index] == 0u) return;
-    snapshot_pair[point_index] = cache_pair[point_index];
-    snapshot_feature[point_index] = cache_feature[point_index];
-    for (uint32_t k = 0u; k < 3u; ++k)
-        snapshot_lambda[point_index * 3u + k] = cache_lambda[point_index * 3u + k];
-    snapshot_normal[point_index] = cache_normal[point_index];
-    snapshot_tangent1[point_index] = cache_tangent1[point_index];
-    snapshot_tangent2[point_index] = cache_tangent2[point_index];
-    snapshot_material[point_index] = cache_material[point_index];
-    snapshot_age[point_index] = cache_age[point_index];
+    const uint32_t env = blockIdx.x / env_blocks;
+    const uint32_t part = blockIdx.x - env * env_blocks;
+    const uint32_t bound = contact_cache::PreviousBound(extent, env, points_per_env);
+    for (uint32_t local = part * blockDim.x + threadIdx.x; local < bound;
+         local += env_blocks * blockDim.x) {
+        const uint32_t point_index = env * points_per_env + local;
+        if (old_keep[point_index] == 0u) continue;
+        snapshot_pair[point_index] = cache_pair[point_index];
+        snapshot_feature[point_index] = cache_feature[point_index];
+        for (uint32_t k = 0u; k < 3u; ++k)
+            snapshot_lambda[point_index * 3u + k] = cache_lambda[point_index * 3u + k];
+        snapshot_normal[point_index] = cache_normal[point_index];
+        snapshot_tangent1[point_index] = cache_tangent1[point_index];
+        snapshot_tangent2[point_index] = cache_tangent2[point_index];
+        snapshot_material[point_index] = cache_material[point_index];
+        snapshot_age[point_index] = cache_age[point_index];
+    }
 }
 
+// Points at or past the env's rebuild bound are already clear, which is all a rebuild would leave there.
 __global__ void RebuildContactCacheKernel(
     const uint64_t* __restrict__ current_pair,
     const uint64_t* __restrict__ current_feature,
@@ -1564,7 +1573,8 @@ __global__ void RebuildContactCacheKernel(
     const uint32_t* __restrict__ old_keep,
     const contact_cache::Ranks* __restrict__ ranks,
     const uint32_t* __restrict__ retained_sources,
-    uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
+    const uint32_t* __restrict__ extent, uint32_t env_blocks,
+    uint32_t slot_count, uint32_t rows_per_env,
     uint32_t full_row_slot_count,
     uint64_t* __restrict__ cache_pair,
     uint64_t* __restrict__ cache_feature,
@@ -1574,53 +1584,55 @@ __global__ void RebuildContactCacheKernel(
     math::Vec3* __restrict__ cache_tangent2,
     uint64_t* __restrict__ cache_material,
     uint32_t* __restrict__ cache_age) {
-    const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t points_per_env = slot_count * 4u;
-    if (point_index >= env_count * points_per_env) return;
-    const uint32_t env = point_index / points_per_env;
-    const uint32_t local_point = point_index - env * points_per_env;
-    const uint32_t slot = local_point / 4u;
-    const uint32_t point = local_point & 3u;
+    const uint32_t env = blockIdx.x / env_blocks;
+    const uint32_t part = blockIdx.x - env * env_blocks;
     const uint32_t begin = env * points_per_env;
     const uint32_t end = begin + points_per_env;
-
-    if (current_owner[point_index] != 0u) {
-        uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
-        if (ContactRowOffsets(env, slot, point, rows_per_env,
-                              full_row_slot_count, &normal_row, &tangent1_row,
-                              &tangent2_row)) {
-            cache_pair[point_index] = current_pair[point_index];
-            cache_feature[point_index] = current_feature[point_index];
-            cache_lambda[point_index * 3u] = fmaxf(lambda[normal_row], 0.0f);
-            cache_lambda[point_index * 3u + 1u] = lambda[tangent1_row];
-            cache_lambda[point_index * 3u + 2u] = lambda[tangent2_row];
-            cache_normal[point_index] = current_normal[point_index];
-            cache_tangent1[point_index] = current_tangent1[point_index];
-            cache_tangent2[point_index] = current_tangent2[point_index];
-            cache_material[point_index] = current_material[point_index / 4u];
-            cache_age[point_index] = 0u;
-            return;
+    const uint32_t bound = extent != nullptr ? min(extent[2u * env + 1u], points_per_env) : points_per_env;
+    for (uint32_t local_point = part * blockDim.x + threadIdx.x; local_point < bound;
+         local_point += env_blocks * blockDim.x) {
+        const uint32_t point_index = begin + local_point;
+        const uint32_t slot = local_point / 4u;
+        const uint32_t point = local_point & 3u;
+        if (current_owner[point_index] != 0u) {
+            uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
+            if (ContactRowOffsets(env, slot, point, rows_per_env,
+                                  full_row_slot_count, &normal_row, &tangent1_row,
+                                  &tangent2_row)) {
+                cache_pair[point_index] = current_pair[point_index];
+                cache_feature[point_index] = current_feature[point_index];
+                cache_lambda[point_index * 3u] = fmaxf(lambda[normal_row], 0.0f);
+                cache_lambda[point_index * 3u + 1u] = lambda[tangent1_row];
+                cache_lambda[point_index * 3u + 2u] = lambda[tangent2_row];
+                cache_normal[point_index] = current_normal[point_index];
+                cache_tangent1[point_index] = current_tangent1[point_index];
+                cache_tangent2[point_index] = current_tangent2[point_index];
+                cache_material[point_index] = current_material[point_index / 4u];
+                cache_age[point_index] = 0u;
+                continue;
+            }
         }
-    }
 
-    const uint32_t free_rank = ranks[point_index].free - ranks[begin].free;
-    const uint32_t old_count = ranks[end - 1u].old + old_keep[end - 1u] - ranks[begin].old;
-    const uint32_t source = free_rank < old_count ? retained_sources[begin + free_rank] : ~0u;
-    if (source != ~0u) {
-        cache_pair[point_index] = snapshot_pair[source];
-        cache_feature[point_index] = snapshot_feature[source];
-        for (uint32_t k = 0u; k < 3u; ++k)
-            cache_lambda[point_index * 3u + k] = snapshot_lambda[source * 3u + k];
-        cache_normal[point_index] = snapshot_normal[source];
-        cache_tangent1[point_index] = snapshot_tangent1[source];
-        cache_tangent2[point_index] = snapshot_tangent2[source];
-        cache_material[point_index] = snapshot_material[source];
-        cache_age[point_index] = snapshot_age[source] + 1u;
-        return;
+        const uint32_t free_rank = ranks[point_index].free - ranks[begin].free;
+        const uint32_t old_count = ranks[end - 1u].old + old_keep[end - 1u] - ranks[begin].old;
+        const uint32_t source = free_rank < old_count ? retained_sources[begin + free_rank] : ~0u;
+        if (source != ~0u) {
+            cache_pair[point_index] = snapshot_pair[source];
+            cache_feature[point_index] = snapshot_feature[source];
+            for (uint32_t k = 0u; k < 3u; ++k)
+                cache_lambda[point_index * 3u + k] = snapshot_lambda[source * 3u + k];
+            cache_normal[point_index] = snapshot_normal[source];
+            cache_tangent1[point_index] = snapshot_tangent1[source];
+            cache_tangent2[point_index] = snapshot_tangent2[source];
+            cache_material[point_index] = snapshot_material[source];
+            cache_age[point_index] = snapshot_age[source] + 1u;
+            continue;
+        }
+        ClearContactCachePoint(point_index, cache_pair, cache_feature, cache_lambda,
+                               cache_normal, cache_tangent1, cache_tangent2,
+                               cache_material, cache_age);
     }
-    ClearContactCachePoint(point_index, cache_pair, cache_feature, cache_lambda,
-                           cache_normal, cache_tangent1, cache_tangent2,
-                           cache_material, cache_age);
 }
 
 Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
@@ -1638,7 +1650,6 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         return Status::InvalidArgument;
     contact_cache::Workspace workspace(data.contact_cache_scratch, p->workspace_bytes, point_count, p->env_count);
     constexpr uint32_t kBlock = 128u;
-    const uint32_t blocks = (point_count + kBlock - 1u) / kBlock;
     if (p->phase == 0u) {
         const auto status = contact_cache::BuildIndex(data, point_count, p->slot_count * nk::kPairDrivenPtsPerSlot,
                                                      p->decay_steps, workspace, stream);
@@ -1663,8 +1674,11 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    workspace.begins, workspace.ends, p->env_count, p->slot_count,
                    p->rows_per_env, p->full_row_slot_count, env_blocks, data.lambda);
     } else {
-        LaunchCuda(SnapshotContactCacheKernel, dim3(blocks), dim3(kBlock), 0u,
-                   stream, point_count, data.contact_cache_old_keep, data.contact_cache_pair,
+        const uint32_t points_per_env = p->slot_count * nk::kPairDrivenPtsPerSlot;
+        const uint32_t point_blocks = contact_cache::EnvBlocks(points_per_env, p->env_count);
+        LaunchCuda(SnapshotContactCacheKernel, dim3(p->env_count * point_blocks), dim3(kBlock), 0u,
+                   stream, points_per_env, point_blocks, data.contact_cache_extent,
+                   data.contact_cache_old_keep, data.contact_cache_pair,
                    data.contact_cache_feature, data.contact_cache_lambda,
                    data.contact_cache_normal, data.contact_cache_tangent1,
                    data.contact_cache_tangent2, data.contact_cache_material,
@@ -1677,10 +1691,9 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    data.contact_cache_snapshot_material,
                    data.contact_cache_snapshot_age);
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
-        const auto status = contact_cache::BuildRanks(data, point_count, p->slot_count * nk::kPairDrivenPtsPerSlot,
-                                                     workspace, stream);
+        const auto status = contact_cache::BuildRanks(data, point_count, points_per_env, workspace, stream);
         if (status != cudaSuccess) return Status::Failed;
-        LaunchCuda(RebuildContactCacheKernel, dim3(blocks), dim3(kBlock), 0u,
+        LaunchCuda(RebuildContactCacheKernel, dim3(p->env_count * point_blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_id_pair, data.ucontact_id_feature,
                    data.ucontact_normal, data.ucontact_tangent1,
                    data.ucontact_tangent2, data.contact_material, data.lambda,
@@ -1694,7 +1707,7 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    data.contact_cache_snapshot_age,
                    data.contact_cache_current_owner,
                    data.contact_cache_old_keep, workspace.ranks, workspace.matches,
-                   p->env_count, p->slot_count,
+                   data.contact_cache_extent, point_blocks, p->slot_count,
                    p->rows_per_env, p->full_row_slot_count,
                    data.contact_cache_pair, data.contact_cache_feature,
                    data.contact_cache_lambda, data.contact_cache_normal,
