@@ -1376,6 +1376,7 @@ __device__ bool ContactRowOffsets(uint32_t env, uint32_t slot, uint32_t point,
 }
 
 
+// Only compacted current entries can hold a match; rows of other points keep their lambda.
 __global__ void PrepareContactWarmStartKernel(
     const math::Vec3* __restrict__ current_normal,
     const math::Vec3* __restrict__ current_tangent1,
@@ -1385,51 +1386,59 @@ __global__ void PrepareContactWarmStartKernel(
     const math::Vec3* __restrict__ cache_tangent1,
     const math::Vec3* __restrict__ cache_tangent2,
     const uint32_t* __restrict__ matches,
+    const uint32_t* __restrict__ order,
+    const uint32_t* __restrict__ begins,
+    const uint32_t* __restrict__ ends,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
-    uint32_t full_row_slot_count, float* __restrict__ lambda) {
-    const uint32_t point_index = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t full_row_slot_count, uint32_t blocks_per_env, float* __restrict__ lambda) {
     const uint32_t points_per_env = slot_count * 4u;
-    if (point_index >= env_count * points_per_env) return;
-    const uint32_t match = matches[point_index];
-    if (match == ~0u) return;
-    const uint32_t env = point_index / points_per_env;
-    const uint32_t local_point = point_index - env * points_per_env;
-    const uint32_t slot = local_point / 4u;
-    const uint32_t point = local_point & 3u;
-    const math::Vec3 n = current_normal[point_index];
-    if (n.Dot(cache_normal[match]) <= 0.25f) return;
-    uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
-    if (!ContactRowOffsets(env, slot, point, rows_per_env,
-                           full_row_slot_count, &normal_row, &tangent1_row,
-                           &tangent2_row)) return;
-    const float normal_impulse = fmaxf(cache_lambda[match * 3u], 0.0f);
-    const math::Vec3 old_tangent_impulse =
-        cache_tangent1[match] * cache_lambda[match * 3u + 1u] +
-        cache_tangent2[match] * cache_lambda[match * 3u + 2u];
-    const float tangent1 = old_tangent_impulse.Dot(current_tangent1[point_index]);
-    const float tangent2 = old_tangent_impulse.Dot(current_tangent2[point_index]);
-    lambda[normal_row] = normal_impulse;
-    lambda[tangent1_row] = tangent1;
-    lambda[tangent2_row] = tangent2;
+    const uint32_t env = blockIdx.x / blocks_per_env;
+    const uint32_t part = blockIdx.x % blocks_per_env;
+    for (uint32_t entry = begins[env] + part * blockDim.x + threadIdx.x; entry < ends[env];
+         entry += blocks_per_env * blockDim.x) {
+        const uint32_t point_index = order[entry];
+        if (point_index >= env_count * points_per_env) continue;
+        const uint32_t match = matches[point_index];
+        if (match == ~0u) continue;
+        const uint32_t local_point = point_index - env * points_per_env;
+        const uint32_t slot = local_point / 4u;
+        const uint32_t point = local_point & 3u;
+        const math::Vec3 n = current_normal[point_index];
+        if (n.Dot(cache_normal[match]) <= 0.25f) continue;
+        uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
+        if (!ContactRowOffsets(env, slot, point, rows_per_env,
+                               full_row_slot_count, &normal_row, &tangent1_row,
+                               &tangent2_row)) continue;
+        const float normal_impulse = fmaxf(cache_lambda[match * 3u], 0.0f);
+        const math::Vec3 old_tangent_impulse =
+            cache_tangent1[match] * cache_lambda[match * 3u + 1u] +
+            cache_tangent2[match] * cache_lambda[match * 3u + 2u];
+        const float tangent1 = old_tangent_impulse.Dot(current_tangent1[point_index]);
+        const float tangent2 = old_tangent_impulse.Dot(current_tangent2[point_index]);
+        lambda[normal_row] = normal_impulse;
+        lambda[tangent1_row] = tangent1;
+        lambda[tangent2_row] = tangent2;
+    }
 }
 
+// Each env's compacted sources list its live current points, then its live cache points.
 __global__ void CountContactWarmStartsKernel(
-    const uint32_t* __restrict__ contact_count,
     const math::Vec3* __restrict__ current_normal,
     const math::Vec3* __restrict__ cache_normal,
     const uint32_t* __restrict__ matches,
-    uint32_t slot_count, uint32_t blocks_per_env, uint32_t* __restrict__ counts) {
+    const uint32_t* __restrict__ order,
+    const uint32_t* __restrict__ begins,
+    const uint32_t* __restrict__ ends,
+    uint32_t point_count, uint32_t blocks_per_env, uint32_t* __restrict__ counts) {
     const uint32_t env = blockIdx.x / blocks_per_env;
     const uint32_t part = blockIdx.x % blocks_per_env;
     __shared__ uint32_t live[128];
     __shared__ uint32_t warm[128];
     uint32_t current = 0u, matched = 0u;
-    const uint32_t points_per_env = slot_count * nk::kPairDrivenPtsPerSlot;
-    for (uint32_t local = part * blockDim.x + threadIdx.x; local < points_per_env;
-         local += blocks_per_env * blockDim.x) {
-        const uint32_t point = env * points_per_env + local;
-        if (local % nk::kPairDrivenPtsPerSlot >=
-            contact_count[env * slot_count + local / nk::kPairDrivenPtsPerSlot]) continue;
+    for (uint32_t entry = begins[env] + part * blockDim.x + threadIdx.x; entry < ends[env];
+         entry += blocks_per_env * blockDim.x) {
+        const uint32_t point = order[entry];
+        if (point >= point_count) continue;
         ++current;
         const uint32_t old = matches[point];
         matched += old != ~0u && current_normal[point].Dot(cache_normal[old]) > 0.25f;
@@ -1607,15 +1616,18 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                             size_t{p->env_count} * 2u * sizeof(uint32_t), stream) != cudaSuccess)
             return Status::Failed;
         LaunchCuda(CountContactWarmStartsKernel, dim3(p->env_count * count_blocks), dim3(kBlock), 0u,
-                   stream, data.ucontact_count, data.ucontact_normal,
-                   data.contact_cache_normal, workspace.matches, p->slot_count,
+                   stream, data.ucontact_normal, data.contact_cache_normal, workspace.matches,
+                   workspace.order, workspace.begins, workspace.ends, point_count,
                    count_blocks, data.contact_warm_start_counts);
-        LaunchCuda(PrepareContactWarmStartKernel, dim3(blocks), dim3(kBlock), 0u,
+        const uint32_t env_blocks = contact_cache::EnvBlocks(
+            p->slot_count * nk::kPairDrivenPtsPerSlot * 2u, p->env_count);
+        LaunchCuda(PrepareContactWarmStartKernel, dim3(p->env_count * env_blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_normal, data.ucontact_tangent1,
                    data.ucontact_tangent2, data.contact_cache_lambda,
                    data.contact_cache_normal, data.contact_cache_tangent1,
-                   data.contact_cache_tangent2, workspace.matches, p->env_count,
-                   p->slot_count, p->rows_per_env, p->full_row_slot_count, data.lambda);
+                   data.contact_cache_tangent2, workspace.matches, workspace.order,
+                   workspace.begins, workspace.ends, p->env_count, p->slot_count,
+                   p->rows_per_env, p->full_row_slot_count, env_blocks, data.lambda);
     } else {
         LaunchCuda(SnapshotContactCacheKernel, dim3(blocks), dim3(kBlock), 0u,
                    stream, point_count, data.contact_cache_old_keep, data.contact_cache_pair,
