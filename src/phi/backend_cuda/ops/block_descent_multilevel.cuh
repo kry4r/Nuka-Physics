@@ -181,23 +181,31 @@ __device__ inline uint32_t VertexParticleSlot(const BlockDescentSolveParams& p, 
 }
 
 // The plane step of one vertex at `scale`, rounded explicitly so every kernel forms the same candidate.
+template <bool kUnit = false>
 __device__ inline Vec3 MultilevelCandidate(const BlockScratch& s, const MultilevelState& state,
                                            uint32_t slot, Vec3 u, float scale) {
     const Vec3 d = s.multilevel_direction[slot], q = s.multilevel_previous[slot];
     const Vec3 step{__fmaf_rn(state.beta, q.x, __fmul_rn(state.alpha, d.x)),
                     __fmaf_rn(state.beta, q.y, __fmul_rn(state.alpha, d.y)),
                     __fmaf_rn(state.beta, q.z, __fmul_rn(state.alpha, d.z))};
+    if constexpr (kUnit) {
+        // At scale 1 TrialValue rounds an exact sum to double, then to float; binary64 holds 2*24+2
+        // bits, so one float add gives the same value. A NaN sum keeps TrialValue's payload.
+        const Vec3 sum{__fadd_rn(u.x, step.x), __fadd_rn(u.y, step.y), __fadd_rn(u.z, step.z)};
+        if (sum.x == sum.x && sum.y == sum.y && sum.z == sum.z) return sum;
+    }
     return {nk::vbd::TrialValue(u.x, step.x, scale), nk::vbd::TrialValue(u.y, step.y, scale),
             nk::vbd::TrialValue(u.z, step.z, scale)};
 }
 
 // A vertex's rate change under the plane step at `scale`; vertices the sweeps skip keep their rate.
+template <bool kUnit = false>
 __device__ inline Vec3 MultilevelMove(const DataView& data, const BlockScratch& s,
                                       const MultilevelState& state, uint32_t particle, uint32_t slot,
                                       float scale) {
     if (!MultilevelDynamic(s, particle)) return {};
     const Vec3 u = data.particle_vel[particle];
-    return MultilevelCandidate(s, state, slot, u, scale) - u;
+    return MultilevelCandidate<kUnit>(s, state, slot, u, scale) - u;
 }
 
 // Entry of an owner's incidence segment that holds the row group headed by `slot`, or ~0u: a segment
@@ -417,6 +425,7 @@ __device__ inline void AddElementForms(const VertexBlockView& b, const DataView&
 }
 
 // Elastic and Rayleigh energy change of an element as its vertices take the plane step at `scale`.
+template <bool kUnit = false>
 __device__ inline float MultilevelElementChange(const VertexBlockView& b, const DataView& data,
                                                 const BlockScratch& s, const MultilevelState& state,
                                                 uint32_t env, uint32_t index, float scale) {
@@ -426,7 +435,7 @@ __device__ inline float MultilevelElementChange(const VertexBlockView& b, const 
     for (uint32_t j = 0u; j < nk::VbdElementVertexCount(element.kind); ++j) {
         const uint32_t particle = b.Particle(env, element.vertex[j]);
         rate[j] = data.particle_vel[particle];
-        move[j] = MultilevelMove(data, s, state, particle, b.Slot(env, element.vertex[j]), scale);
+        move[j] = MultilevelMove<kUnit>(data, s, state, particle, b.Slot(env, element.vertex[j]), scale);
         shift[j] = move[j] * b.dt;
     }
     float change = nk::vbd::ElementMovesEnergyChange(
@@ -1627,6 +1636,26 @@ __global__ void MultilevelFormsKernel(ModelView model, DataView data, BlockDesce
     state.trial = state.slope < 0.0 ? 1.0f : 0.0f;
 }
 
+// Inertial and element energy changes of one part's items under the trial plane step.
+template <bool kUnit>
+__device__ __forceinline__ void MultilevelTrialItems(const ModelView& model, const DataView& data,
+                                                     const BlockDescentSolveParams& p, const BlockScratch& s,
+                                                     const MultilevelState& state, uint32_t env, uint32_t part,
+                                                     double* change) {
+    const VertexBlockView b = Vertices(model, data, p);
+    VisitPlaneItems(s, b.layout, env, part,
+        [&](uint32_t vertex) {
+            const uint32_t particle = b.Particle(env, vertex), slot = b.Slot(env, vertex);
+            if (!MultilevelDynamic(s, particle)) return;
+            change[0] += nk::vbd::InertialEnergyChange(data.particle_vel[particle], b.free_rate[slot],
+                MultilevelMove<kUnit>(data, s, state, particle, slot, state.trial), b.inertia[slot], p.dt);
+        },
+        [&](uint32_t element) {
+            change[0] += MultilevelElementChange<kUnit>(b, data, s, state, env, element, state.trial);
+        },
+        [&](uint32_t) {});
+}
+
 // Row drops scale the kept products by the step coefficients and items add their energy changes; a sufficient
 // decrease is accepted, otherwise the quadratic minimizer opens the next trial within [0.1, 0.5] of the scale.
 __global__ void __launch_bounds__(kThreads, kMultilevelPlaneBlocks)
@@ -1651,19 +1680,10 @@ MultilevelTrialKernel(ModelView model, DataView data, BlockDescentSolveParams p,
                             __fmul_rn(state.trial, __fmaf_rn(state.beta, q.z, __fmul_rn(state.alpha, d.z)))};
             change[0] += EvaluateDropChange(LoadMultilevelRowTerm(s, item, s.row_state[slot]), drop);
         }
+    } else if (state.trial == 1.0f) {
+        MultilevelTrialItems<true>(model, data, p, s, state, env, part, change);
     } else {
-        const VertexBlockView b = Vertices(model, data, p);
-        VisitPlaneItems(s, b.layout, env, part,
-            [&](uint32_t vertex) {
-                const uint32_t particle = b.Particle(env, vertex), slot = b.Slot(env, vertex);
-                if (!MultilevelDynamic(s, particle)) return;
-                change[0] += nk::vbd::InertialEnergyChange(data.particle_vel[particle], b.free_rate[slot],
-                    MultilevelMove(data, s, state, particle, slot, state.trial), b.inertia[slot], p.dt);
-            },
-            [&](uint32_t element) {
-                change[0] += MultilevelElementChange(b, data, s, state, env, element, state.trial);
-            },
-            [&](uint32_t) {});
+        MultilevelTrialItems<false>(model, data, p, s, state, env, part, change);
     }
     BlockSumsDouble(change, shared);
     if (threadIdx.x == 0u) {
@@ -1698,7 +1718,8 @@ __global__ void MultilevelApplyKernel(DataView data, BlockDescentSolveParams p, 
         Vec3 previous{};
         if (state.scale > 0.0f && MultilevelDynamic(s, particle)) {
             const Vec3 u = data.particle_vel[particle];
-            const Vec3 candidate = MultilevelCandidate(s, state, slot, u, state.scale);
+            const Vec3 candidate = state.scale == 1.0f ? MultilevelCandidate<true>(s, state, slot, u, state.scale)
+                                                      : MultilevelCandidate(s, state, slot, u, state.scale);
             data.particle_vel[particle] = candidate;
             previous = candidate - u;
         }
