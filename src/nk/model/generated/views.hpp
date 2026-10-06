@@ -493,6 +493,7 @@ struct DataView {
     uint32_t* control_scratch = nullptr;  // per:articulation_dof arena:scratch owner:data elem:8
     ::nuka::math::Vec3* vbd_free_velocity = nullptr;  // per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count
     uint32_t* contact_row_extent = nullptr;  // per:env arena:scratch owner:data elem:2
+    uint32_t* contact_cache_extent = nullptr;  // per:env arena:scratch owner:data elem:2
 };
 
 } // namespace nuka::phi

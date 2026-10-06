@@ -58,6 +58,8 @@ struct ContactWarmStartDeviceState {
     const nuka::math::Vec3* tangent2 = nullptr;
     const uint64_t* material = nullptr;
     const uint32_t* age = nullptr;
+    uint32_t* extent = nullptr;  // contact_cache_extent, cleared by a restore so the next rebuild
+    uint32_t extent_words = 0u;  // covers every restored entry
 };
 
 // The per-checkpoint device storage (one contiguous block per buffer, sliced by
