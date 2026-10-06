@@ -1,7 +1,8 @@
 #pragma once
 
-#include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <limits>
@@ -33,7 +34,7 @@ struct KeySource {
     uint32_t points, points_per_env;
 
     __device__ uint32_t Point(uint32_t id) const { return id < points ? id : id - points; }
-    __device__ bool Valid(uint32_t id) const {
+    __host__ __device__ bool Valid(uint32_t id) const {
         return id < points ? (id % nk::kPairDrivenPtsPerSlot < counts[id / nk::kPairDrivenPtsPerSlot])
             : cache_pair[id - points] != 0u;
     }
@@ -56,7 +57,7 @@ struct KeySource {
         return Valid(a) && Valid(b) && Point(a) / points_per_env == Point(b) / points_per_env &&
                Pair(a) == Pair(b) && Feature(a) == Feature(b) && Material(a) == Material(b);
     }
-    __device__ uint32_t Source(uint32_t index) const {
+    __host__ __device__ uint32_t Source(uint32_t index) const {
         const uint32_t env = index / (points_per_env * 2u);
         const uint32_t local = index - env * points_per_env * 2u;
         return env * points_per_env + (local < points_per_env ? local : points + local - points_per_env);
@@ -69,65 +70,76 @@ inline KeySource Keys(const DataView& data, uint32_t points, uint32_t points_per
             data.contact_cache_material, points, points_per_env};
 }
 
+struct ValidEntry {
+    KeySource keys;
+    __host__ __device__ uint32_t operator()(uint32_t index) const {
+        return keys.Valid(keys.Source(index)) ? 1u : 0u;
+    }
+};
+using ValidInput = thrust::transform_iterator<ValidEntry, thrust::counting_iterator<uint32_t>>;
+
+struct RankEntry {
+    const uint32_t* owner;
+    const uint32_t* keep;
+    __host__ __device__ Ranks operator()(uint32_t point) const {
+        return {owner[point] == 0u ? 1u : 0u, keep[point]};
+    }
+};
+using RankInput = thrust::transform_iterator<RankEntry, thrust::counting_iterator<uint32_t>>;
+
+// An env's table has 2n+1 slots for its n entries, so linear probing always ends.
+inline uint64_t TableStride(uint32_t entries_per_env) { return uint64_t{entries_per_env} * 2u + 1u; }
+
+// Entry loops give each env a fixed share of blocks, so launch shapes depend only on capacities.
+inline uint32_t EnvBlocks(uint32_t entries_per_env, uint32_t envs) {
+    constexpr uint32_t block = 128u, target = 2048u;
+    const uint32_t needed = (entries_per_env + block - 1u) / block;
+    const uint32_t share = envs < target ? target / envs : 1u;
+    return needed < share ? needed : share;
+}
+
+// Scan prefixes, first-entry tables and ranks occupy the shared region at different times.
 struct Layout {
-    size_t alternate_offset, keys_offset, alternate_keys_offset;
-    size_t ranks_offset, match_offset, begin_offset, end_offset, temp_offset;
+    size_t slots_offset, shared_offset, warm_offset, match_offset;
+    size_t begin_offset, end_offset, temp_offset;
     static size_t Align(size_t value) { return CheckedAlignUp(value, 256u); }
+    static size_t TableBytes(uint32_t points, uint32_t envs) {
+        return size_t{envs} * TableStride(points / envs * 2u) * sizeof(uint32_t);
+    }
     Layout(uint32_t points, uint32_t envs)
-        : alternate_offset(Align(size_t{points} * 2u * sizeof(uint32_t))),
-          keys_offset(Align(alternate_offset + size_t{points} * 2u * sizeof(uint32_t))),
-          alternate_keys_offset(Align(keys_offset + size_t{points} * 2u * sizeof(uint64_t))),
-          ranks_offset(Align(alternate_keys_offset + size_t{points} * 2u * sizeof(uint64_t))),
-          match_offset(Align(ranks_offset + size_t{points} * sizeof(Ranks))),
+        : slots_offset(Align(size_t{points} * 2u * sizeof(uint32_t))),
+          shared_offset(Align(slots_offset + size_t{points} * 2u * sizeof(uint32_t))),
+          warm_offset(Align(shared_offset + TableBytes(points, envs))),
+          match_offset(Align(warm_offset + TableBytes(points, envs))),
           begin_offset(Align(match_offset + size_t{points} * sizeof(uint32_t))),
           end_offset(Align(begin_offset + size_t{envs} * sizeof(uint32_t))),
           temp_offset(Align(end_offset + size_t{envs} * sizeof(uint32_t))) {}
 };
 
-// Buckets only index entries that full keys then compare in stable order, so an env's entry
-// count bounds the bits they need.
-inline int BucketBits(uint32_t entries_per_env) {
-    int bits = 1;
-    while (bits < 32 && (uint64_t{1} << bits) < entries_per_env) ++bits;
-    return bits;
-}
-
-// Keys hold env, an invalid-tail bit, then the bucket; the index range keeps env below 2^30.
-inline int SortBits(uint32_t envs, uint32_t entries_per_env) {
-    int bits = BucketBits(entries_per_env) + 1;
-    for (uint32_t value = envs - 1u; value != 0u; value >>= 1u) ++bits;
-    return bits;
-}
-
 inline uint64_t ScratchBytes(uint32_t points, uint32_t envs) {
     if (points == 0u) return 0u;
     if (envs == 0u || points % envs != 0u ||
         uint64_t{points} * 2u > static_cast<uint64_t>(std::numeric_limits<int>::max()))
-        throw std::invalid_argument("contact cache exceeds sort index range");
-    size_t sort_bytes = 0u, scan_bytes = 0u, compact_bytes = 0u;
-    cub::DoubleBuffer<uint64_t> keys(nullptr, nullptr);
-    cub::DoubleBuffer<uint32_t> order(nullptr, nullptr);
-    auto status = cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, keys, order,
-        static_cast<int>(points * 2u), 0, SortBits(envs, points / envs * 2u));
-    if (status == cudaSuccess)
-        status = cub::DeviceScan::ExclusiveScan(nullptr, scan_bytes,
-            static_cast<const Ranks*>(nullptr), static_cast<Ranks*>(nullptr),
-            AddRanks{}, Ranks{}, static_cast<int>(points));
+        throw std::invalid_argument("contact cache exceeds scan index range");
+    size_t scan_bytes = 0u, compact_bytes = 0u;
+    auto status = cub::DeviceScan::ExclusiveScan(nullptr, scan_bytes,
+        RankInput(thrust::counting_iterator<uint32_t>(0u), RankEntry{}),
+        static_cast<Ranks*>(nullptr), AddRanks{}, Ranks{}, static_cast<int>(points));
     if (status == cudaSuccess)
         status = cub::DeviceScan::ExclusiveSum(nullptr, compact_bytes,
-            static_cast<const uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-            static_cast<int>(points * 2u));
+            ValidInput(thrust::counting_iterator<uint32_t>(0u), ValidEntry{}),
+            static_cast<uint32_t*>(nullptr), static_cast<int>(points * 2u));
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-    if (scan_bytes > sort_bytes) sort_bytes = scan_bytes;
-    if (compact_bytes > sort_bytes) sort_bytes = compact_bytes;
-    return CheckedAdd(Layout(points, envs).temp_offset, sort_bytes);
+    if (compact_bytes > scan_bytes) scan_bytes = compact_bytes;
+    return CheckedAdd(Layout(points, envs).temp_offset, scan_bytes);
 }
 
 struct Workspace {
     uint32_t* order;
-    uint32_t* alternate;
-    uint64_t* keys;
-    uint64_t* alternate_keys;
+    uint32_t* slots;
+    uint32_t* prefix;
+    uint32_t* first;
+    uint32_t* warm;
     Ranks* ranks;
     uint32_t* matches;
     uint32_t* begins;
@@ -138,10 +150,11 @@ struct Workspace {
         const Layout layout(points, envs);
         auto* data = static_cast<uint8_t*>(base);
         order = reinterpret_cast<uint32_t*>(data);
-        alternate = reinterpret_cast<uint32_t*>(data + layout.alternate_offset);
-        keys = reinterpret_cast<uint64_t*>(data + layout.keys_offset);
-        alternate_keys = reinterpret_cast<uint64_t*>(data + layout.alternate_keys_offset);
-        ranks = reinterpret_cast<Ranks*>(data + layout.ranks_offset);
+        slots = reinterpret_cast<uint32_t*>(data + layout.slots_offset);
+        prefix = reinterpret_cast<uint32_t*>(data + layout.shared_offset);
+        first = prefix;
+        warm = reinterpret_cast<uint32_t*>(data + layout.warm_offset);
+        ranks = reinterpret_cast<Ranks*>(data + layout.shared_offset);
         matches = reinterpret_cast<uint32_t*>(data + layout.match_offset);
         begins = reinterpret_cast<uint32_t*>(data + layout.begin_offset);
         ends = reinterpret_cast<uint32_t*>(data + layout.end_offset);
@@ -150,88 +163,91 @@ struct Workspace {
     }
 };
 
-static __global__ void InitValidKernel(KeySource keys, uint32_t* valid,
-                                       uint32_t* matches, uint32_t* owner, uint32_t* keep) {
+// Adjacent exclusive prefixes give each validity flag; only the final entry has no successor.
+static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* prefix,
+                                             uint32_t* order, uint32_t* begins, uint32_t* ends,
+                                             uint32_t* owner, uint32_t* keep) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= keys.points * 2u) return;
-    valid[i] = keys.Valid(keys.Source(i)) ? 1u : 0u;
+    const uint32_t total = keys.points * 2u;
+    if (i >= total) return;
     if (i < keys.points) {
-        matches[i] = ~0u;
         owner[i] = 0u;
         keep[i] = 0u;
     }
-}
-
-static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* valid,
-                                             const uint32_t* prefix, uint32_t* order,
-                                             uint32_t* begins, uint32_t* ends) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= keys.points * 2u) return;
-    const uint32_t envs = keys.points / keys.points_per_env;
     const uint32_t stride = keys.points_per_env * 2u;
-    if (i < envs) {
-        const uint32_t begin = i * stride, last = begin + stride - 1u;
-        begins[i] = begin;
-        ends[i] = begin + prefix[last] + valid[last] - prefix[begin];
+    const uint32_t env = i / stride, begin = env * stride;
+    const uint32_t valid = i + 1u < total ? prefix[i + 1u] - prefix[i]
+                                          : (keys.Valid(keys.Source(i)) ? 1u : 0u);
+    if (i == begin + stride - 1u) {
+        begins[env] = begin;
+        ends[env] = begin + prefix[i] + valid - prefix[begin];
     }
-    if (valid[i] == 0u) return;
-    const uint32_t begin = (i / stride) * stride;
-    order[begin + prefix[i] - prefix[begin]] = keys.Source(i);
+    if (valid != 0u) order[begin + prefix[i] - prefix[begin]] = keys.Source(i);
 }
 
-// Unused tail slots sort after their env's entries, so each env keeps its fixed segment.
-static __global__ void BucketKeysKernel(KeySource source, uint32_t* order,
-                                        const uint32_t* ends, int bucket_bits, uint64_t* keys) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= source.points * 2u) return;
-    const uint32_t env = i / (source.points_per_env * 2u);
-    const uint64_t prefix = uint64_t{env} << (bucket_bits + 1);
-    if (i < ends[env]) {
-        keys[i] = prefix | (source.Bucket(order[i]) >> (32 - bucket_bits));
-    } else {
-        keys[i] = prefix | (uint64_t{1u} << bucket_bits);
-        order[i] = 0u;
+// Only the live part of each env's table is cleared and probed.
+static __global__ void ClearTableKernel(const uint32_t* begins, const uint32_t* ends,
+                                        uint32_t env_blocks, uint64_t stride,
+                                        uint32_t* first, uint32_t* warm) {
+    const uint32_t env = blockIdx.x / env_blocks;
+    const uint32_t part = blockIdx.x - env * env_blocks;
+    const uint64_t live = uint64_t{ends[env] - begins[env]} * 2u + 1u;
+    for (uint64_t slot = uint64_t{part} * blockDim.x + threadIdx.x; slot < live;
+         slot += uint64_t{env_blocks} * blockDim.x) {
+        first[env * stride + slot] = ~0u;
+        warm[env * stride + slot] = ~0u;
     }
 }
 
-// Hashes index buckets only; complete keys determine matches and ownership.
-static __global__ void MergeGroupsKernel(KeySource keys, const uint32_t* order,
-                                          const uint64_t* buckets,
-                                          const uint32_t* begins, const uint32_t* ends,
-                                          const uint32_t* age, uint32_t decay_steps,
-                                          uint32_t* matches, uint32_t* owner, uint32_t* keep) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= keys.points * 2u) return;
-    const uint32_t env = i / (keys.points_per_env * 2u);
-    if (i >= ends[env]) return;
-    const uint64_t bucket = buckets[i];
-    if (i != begins[env] && buckets[i - 1u] == bucket) return;
-    uint32_t end = i + 1u;
-    while (end < ends[env] && buckets[end] == bucket) ++end;
-    for (uint32_t entry = i; entry < end; ++entry) {
-        const uint32_t source = order[entry];
-        bool seen = false;
-        for (uint32_t prior = i; prior < entry; ++prior) {
-            if (keys.Same(order[prior], source)) { seen = true; break; }
+// Hashes choose where probing starts and complete keys choose the slot; integer minima make the
+// first entry and warm point of each key independent of thread order.
+static __global__ void InsertEntriesKernel(KeySource keys, const uint32_t* order,
+                                           const uint32_t* begins, const uint32_t* ends,
+                                           const uint32_t* age, uint32_t decay_steps,
+                                           uint32_t env_blocks, uint64_t stride,
+                                           uint32_t* first, uint32_t* warm, uint32_t* slots) {
+    const uint32_t env = blockIdx.x / env_blocks;
+    const uint32_t part = blockIdx.x - env * env_blocks;
+    const uint32_t begin = begins[env], end = ends[env];
+    const uint64_t live = uint64_t{end - begin} * 2u + 1u;
+    uint32_t* const table = first + env * stride;
+    for (uint32_t entry = begin + part * blockDim.x + threadIdx.x; entry < end;
+         entry += env_blocks * blockDim.x) {
+        const uint32_t id = order[entry];
+        uint64_t slot = (uint64_t{keys.Bucket(id)} * live) >> 32u;
+        for (;;) {
+            const uint32_t held = atomicCAS(table + slot, ~0u, entry);
+            if (held == ~0u || keys.Same(order[held], id)) break;
+            if (++slot == live) slot = 0u;
         }
-        if (seen) continue;
-        uint32_t current = ~0u, old = ~0u, warm = ~0u;
-        for (uint32_t j = entry; j < end; ++j) {
-            const uint32_t id = order[j];
-            if (!keys.Same(source, id)) continue;
-            if (id < keys.points) {
-                if (current == ~0u) current = id;
-            } else {
-                const uint32_t point = id - keys.points;
-                if (old == ~0u) old = point;
-                if (warm == ~0u && age[point] < decay_steps) warm = point;
-            }
-        }
-        if (current != ~0u) {
-            owner[current] = 1u;
-            matches[current] = warm;
-        } else if (old != ~0u && decay_steps > 1u && age[old] < decay_steps - 1u) {
-            keep[old] = 1u;
+        slots[entry] = static_cast<uint32_t>(slot);
+        atomicMin(table + slot, entry);
+        if (id >= keys.points && age[id - keys.points] < decay_steps)
+            atomicMin(warm + env * stride + slot, id - keys.points);
+    }
+}
+
+// Current entries precede cache entries in each env, so a cache head has no current twin.
+static __global__ void ResolveEntriesKernel(KeySource keys, const uint32_t* order,
+                                            const uint32_t* begins, const uint32_t* ends,
+                                            const uint32_t* age, uint32_t decay_steps,
+                                            uint32_t env_blocks, uint64_t stride,
+                                            const uint32_t* first, const uint32_t* warm,
+                                            const uint32_t* slots, uint32_t* matches,
+                                            uint32_t* owner, uint32_t* keep) {
+    const uint32_t env = blockIdx.x / env_blocks;
+    const uint32_t part = blockIdx.x - env * env_blocks;
+    const uint32_t end = ends[env];
+    for (uint32_t entry = begins[env] + part * blockDim.x + threadIdx.x; entry < end;
+         entry += env_blocks * blockDim.x) {
+        const uint32_t id = order[entry];
+        const uint64_t slot = env * stride + slots[entry];
+        const bool head = first[slot] == entry;
+        if (id < keys.points) {
+            matches[id] = head ? warm[slot] : ~0u;
+            if (head) owner[id] = 1u;
+        } else if (head && decay_steps > 1u && age[id - keys.points] < decay_steps - 1u) {
+            keep[id - keys.points] = 1u;
         }
     }
 }
@@ -242,39 +258,30 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
     constexpr uint32_t block = 128u;
     const uint32_t blocks = (points * 2u + block - 1u) / block;
     const uint32_t envs = points / points_per_env;
+    const uint32_t env_blocks = EnvBlocks(points_per_env * 2u, envs);
+    const uint64_t stride = TableStride(points_per_env * 2u);
     const auto keys = Keys(data, points, points_per_env);
-    auto* valid = reinterpret_cast<uint32_t*>(workspace.keys);
-    auto* prefix = reinterpret_cast<uint32_t*>(workspace.alternate_keys);
-    InitValidKernel<<<blocks, block, 0u, stream>>>(keys, valid,
-        workspace.matches, data.contact_cache_current_owner, data.contact_cache_old_keep);
-    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     size_t temp_bytes = workspace.temp_bytes;
-    auto status = cub::DeviceScan::ExclusiveSum(workspace.temp, temp_bytes,
-        valid, prefix, static_cast<int>(points * 2u), stream);
+    const auto status = cub::DeviceScan::ExclusiveSum(workspace.temp, temp_bytes,
+        ValidInput(thrust::counting_iterator<uint32_t>(0u), ValidEntry{keys}), workspace.prefix,
+        static_cast<int>(points * 2u), stream);
     if (status != cudaSuccess) return status;
-    CompactSourcesKernel<<<blocks, block, 0u, stream>>>(keys, valid, prefix,
-        workspace.order, workspace.begins, workspace.ends);
+    CompactSourcesKernel<<<blocks, block, 0u, stream>>>(keys, workspace.prefix, workspace.order,
+        workspace.begins, workspace.ends, data.contact_cache_current_owner,
+        data.contact_cache_old_keep);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
-    cub::DoubleBuffer<uint64_t> key_buffers(workspace.keys, workspace.alternate_keys);
-    cub::DoubleBuffer<uint32_t> order_buffers(workspace.order, workspace.alternate);
-    BucketKeysKernel<<<blocks, block, 0u, stream>>>(keys, order_buffers.Current(),
-        workspace.ends, BucketBits(points_per_env * 2u), key_buffers.Current());
+    ClearTableKernel<<<envs * env_blocks, block, 0u, stream>>>(workspace.begins, workspace.ends,
+        env_blocks, stride, workspace.first, workspace.warm);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
-    temp_bytes = workspace.temp_bytes;
-    status = cub::DeviceRadixSort::SortPairs(workspace.temp, temp_bytes, key_buffers,
-        order_buffers, static_cast<int>(points * 2u), 0, SortBits(envs, points_per_env * 2u), stream);
-    if (status != cudaSuccess) return status;
-    MergeGroupsKernel<<<blocks, block, 0u, stream>>>(keys,
-        order_buffers.Current(), key_buffers.Current(), workspace.begins, workspace.ends,
-        data.contact_cache_age, decay_steps, workspace.matches,
+    InsertEntriesKernel<<<envs * env_blocks, block, 0u, stream>>>(keys, workspace.order,
+        workspace.begins, workspace.ends, data.contact_cache_age, decay_steps, env_blocks, stride,
+        workspace.first, workspace.warm, workspace.slots);
+    if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
+    ResolveEntriesKernel<<<envs * env_blocks, block, 0u, stream>>>(keys, workspace.order,
+        workspace.begins, workspace.ends, data.contact_cache_age, decay_steps, env_blocks, stride,
+        workspace.first, workspace.warm, workspace.slots, workspace.matches,
         data.contact_cache_current_owner, data.contact_cache_old_keep);
     return cudaGetLastError();
-}
-
-static __global__ void RankInputKernel(uint32_t points, const uint32_t* owner,
-                                       const uint32_t* keep, Ranks* output) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < points) output[i] = {owner[i] == 0u ? 1u : 0u, keep[i]};
 }
 
 static __global__ void RetainedSourcesKernel(uint32_t points, uint32_t points_per_env,
@@ -286,14 +293,12 @@ static __global__ void RetainedSourcesKernel(uint32_t points, uint32_t points_pe
     sources[begin + ranks[i].old - ranks[begin].old] = i;
 }
 
-// The sorted permutation becomes scan input after prepare; matches become retained sources.
+// Retained sources reuse the match array once prepare has read it.
 inline cudaError_t BuildRanks(const DataView& data, uint32_t points,
                                uint32_t points_per_env, Workspace workspace, cudaStream_t stream) {
     constexpr uint32_t block = 128u;
-    auto* input = reinterpret_cast<Ranks*>(workspace.order);
-    RankInputKernel<<<(points + block - 1u) / block, block, 0u, stream>>>(points,
-        data.contact_cache_current_owner, data.contact_cache_old_keep, input);
-    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    const RankInput input(thrust::counting_iterator<uint32_t>(0u),
+                          RankEntry{data.contact_cache_current_owner, data.contact_cache_old_keep});
     const auto scanned = cub::DeviceScan::ExclusiveScan(workspace.temp, workspace.temp_bytes,
         input, workspace.ranks, AddRanks{}, Ranks{}, static_cast<int>(points), stream);
     if (scanned != cudaSuccess) return scanned;
