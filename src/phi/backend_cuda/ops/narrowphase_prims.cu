@@ -152,7 +152,7 @@ __device__ void DispatchPair(uint32_t ka, const amf::PrimParams& a,
     // covers it. (Plane pairs are all handled analytically above.)
 }
 
-// One thread per (env x candidate slot). Reads candidate_pairs[(env,slot)] =
+// One thread per (env x body<->body slot). Reads candidate_pairs[(env,slot)] =
 // (a,b) template-local body rows, builds both prims from body_pose + the
 // shape_table, dispatches, and writes the (<=4 pt) manifold into ucontact[gid].
 __global__ void PairDrivenNarrowphaseKernel(
@@ -180,12 +180,12 @@ __global__ void PairDrivenNarrowphaseKernel(
     uint32_t* __restrict__ contact_count,
     uint32_t* __restrict__ mesh_ogc_pair_count,
     uint32_t* __restrict__ mesh_sdf_pair_count) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    const uint32_t total = env_count * slot_stride;
-    if (gid >= total) return;
-    const uint32_t env = gid / slot_stride;
-    const uint32_t slot = gid - env * slot_stride;
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    // Threads cover only the body<->body sub-range; ZeroEnvKernel empties the counts above it.
+    if (item >= env_count * rigid_slot_cap) return;
+    const uint32_t env = item / rigid_slot_cap;
+    const uint32_t slot = item - env * rigid_slot_cap;
+    const uint32_t gid = env * slot_stride + slot;
     const uint32_t live = pair_count[env];
 
     ContactManifold m;
@@ -255,11 +255,19 @@ __global__ void PairDrivenNarrowphaseKernel(
     }
 }
 
+// Per-environment counters, and the counts of the slots above the body<->body range.
 __global__ void ZeroEnvKernel(uint32_t* __restrict__ contact_count,
                               uint32_t* __restrict__ row_count,
                               uint32_t* __restrict__ mesh_ogc_pair_count,
-                              uint32_t* __restrict__ mesh_sdf_pair_count, uint32_t n) {
+                              uint32_t* __restrict__ mesh_sdf_pair_count, uint32_t n,
+                              uint32_t* __restrict__ ucount, uint32_t slot_stride,
+                              uint32_t rigid_slots) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t compact = slot_stride - rigid_slots;
+    if (e < n * compact) {
+        const uint32_t env = e / compact;
+        ucount[env * slot_stride + rigid_slots + (e - env * compact)] = 0u;
+    }
     if (e >= n) return;
     contact_count[e] = 0u;
     row_count[e] = 0u;
@@ -276,13 +284,18 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
         return Status::Ok;
     }
     constexpr uint32_t kBlock = 128u;
+    const uint32_t rigid_slots =
+        p.rigid_slot_cap < p.union_slot_count ? p.rigid_slot_cap : p.union_slot_count;
     {
-        const uint32_t b = (p.env_count + kBlock - 1u) / kBlock;
+        const uint32_t zero = p.env_count * (p.union_slot_count - rigid_slots);
+        const uint32_t b = ((zero > p.env_count ? zero : p.env_count) + kBlock - 1u) / kBlock;
         LaunchCuda(ZeroEnvKernel, dim3(b), dim3(kBlock), 0u, stream,
                    data.contact_count, data.row_count, data.mesh_ogc_pair_count,
-                   data.mesh_sdf_pair_count, p.env_count);
+                   data.mesh_sdf_pair_count, p.env_count, data.ucontact_count,
+                   p.union_slot_count, rigid_slots);
     }
-    const uint32_t total = p.env_count * p.union_slot_count;
+    if (rigid_slots == 0u) return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
+    const uint32_t total = p.env_count * rigid_slots;
     const uint32_t blocks = (total + kBlock - 1u) / kBlock;
     // gen: a constant ACTIVE marker (1) this step. The ucontact_gen field is for a
     // future collide-once / reuse-across-substeps optimization; a per-step
@@ -295,7 +308,7 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
                static_cast<const float*>(model.shape_table), model.mesh_contact_mode,
                static_cast<const math::Transform*>(data.body_pose),
                static_cast<const float*>(model.hull_verts), p.hull_vert_count, kGen,
-               p.env_count, p.union_slot_count, p.rigid_slot_cap, p.bodies_per_env,
+               p.env_count, p.union_slot_count, rigid_slots, p.bodies_per_env,
                data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                data.ucontact_depth, data.ucontact_a, data.ucontact_b,
                data.ucontact_a_kind, data.ucontact_b_kind,

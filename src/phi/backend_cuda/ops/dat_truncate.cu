@@ -93,6 +93,45 @@ __device__ float DatOverlapDepth(const collision::DatPrimitive& a,
     return fmaxf(0.0f, -collision::DatFindSeparator(a, b, -FLT_MAX).gap);
 }
 
+// DatFindSeparator(a, b).gap > 0. Each axis gap is independent of the others, so any order decides;
+// the face normal of b and the edge pairs come first because they separate most nearby pairs.
+__device__ bool DatSeparated(const collision::DatPrimitive& a, const collision::DatPrimitive& b) {
+    if (!collision::DatPrimitiveValid(a) || !collision::DatPrimitiveValid(b)) return false;
+    collision::DatSeparator best;
+    const auto separates = [&](math::Vec3 axis) {
+        collision::DatConsiderAxis(axis, a, b, &best);
+        return best.gap > 0.0f;
+    };
+    if (b.count == collision::kDatPrimitiveVertices &&
+        separates((b.vertex[1] - b.vertex[0]).Cross(b.vertex[2] - b.vertex[0]))) return true;
+    const uint32_t edges_a = a.count == 1u ? 0u : a.count == 2u ? 1u : a.count;
+    const uint32_t edges_b = b.count == 1u ? 0u : b.count == 2u ? 1u : b.count;
+    for (uint32_t i = 0u; i < edges_a; ++i) {
+        const math::Vec3 edge = a.vertex[(i + 1u) % a.count] - a.vertex[i];
+        for (uint32_t j = 0u; j < edges_b; ++j)
+            if (separates(edge.Cross(b.vertex[(j + 1u) % b.count] - b.vertex[j]))) return true;
+    }
+    for (uint32_t i = 0u; i < a.count; ++i)
+        for (uint32_t j = 0u; j < b.count; ++j)
+            if (separates(a.vertex[i] - b.vertex[j])) return true;
+    for (uint32_t i = 0u; i < edges_a; ++i) {
+        const math::Vec3 edge = a.vertex[(i + 1u) % a.count] - a.vertex[i];
+        for (uint32_t j = 0u; j < b.count; ++j) {
+            const math::Vec3 offset = a.vertex[i] - b.vertex[j];
+            if (separates(edge.Cross(offset.Cross(edge)))) return true;
+        }
+    }
+    for (uint32_t j = 0u; j < edges_b; ++j) {
+        const math::Vec3 edge = b.vertex[(j + 1u) % b.count] - b.vertex[j];
+        for (uint32_t i = 0u; i < a.count; ++i) {
+            const math::Vec3 offset = a.vertex[i] - b.vertex[j];
+            if (separates(edge.Cross(offset.Cross(edge)))) return true;
+        }
+    }
+    return a.count == collision::kDatPrimitiveVertices &&
+           separates((a.vertex[1] - a.vertex[0]).Cross(a.vertex[2] - a.vertex[0]));
+}
+
 __device__ float RequestedRadius(const DatTruncateParams& p, const ModelView& model,
                                  const DataView& data, uint32_t env,
                                  uint32_t source, uint32_t target) {
@@ -579,7 +618,7 @@ __global__ void DatInitialEdgeFaceKernel(DatTruncateParams p, ModelView model,
                         const uint32_t reason = collision::DatPrimitiveValid(triangle)
                             ? collision::kDatFailureOverlap : collision::kDatFailureDegenerate;
                         if (reason == collision::kDatFailureDegenerate ||
-                            !(collision::DatFindSeparator(segment, triangle).gap > 0.0f))
+                            !DatSeparated(segment, triangle))
                             FailPrimitivePair(p, model, data, env, reason,
                                 reason == collision::kDatFailureOverlap
                                     ? DatOverlapDepth(segment, triangle) : 0.0f,
@@ -879,7 +918,7 @@ __global__ void DatInitialMixedEdgeFaceKernel(DatTruncateParams p,
                         const uint32_t reason = collision::DatPrimitiveValid(triangle)
                             ? collision::kDatFailureOverlap : collision::kDatFailureDegenerate;
                         if (reason == collision::kDatFailureDegenerate ||
-                            !(collision::DatFindSeparator(segment, triangle).gap > 0.0f))
+                            !DatSeparated(segment, triangle))
                             FailMixedPair(p, model, data, env, reason,
                                 reason == collision::kDatFailureOverlap
                                     ? DatOverlapDepth(segment, triangle) : 0.0f,
