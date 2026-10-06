@@ -682,8 +682,11 @@ __global__ void DatBodyMotionBoundKernel(DatTruncateParams p, ModelView model,
     // Non-negative float bits order like the values, so the maximum is order independent.
     atomicMax(reinterpret_cast<uint32_t*>(data.dat_body_motion) + size_t{env} * p.bodies_per_env +
               body, __float_as_uint(speed / p.dt));
+    // A vertex on a triangle past this bound is certified with its triangles by the reach pass.
     const float bound = 0.5f * p.relaxation * query;
-    if (speed > bound)
+    const uint32_t at = model.mesh_surface_info[body].vertex_offset + vertex;
+    if (speed > bound &&
+        model.mesh_vertex_triangle_offsets[at + 1u] == model.mesh_vertex_triangle_offsets[at])
         DatMinOwnerBeta(p, model, data, env, ref, bound / speed, kDatBoundMotion, vertex);
 }
 
@@ -931,24 +934,12 @@ __global__ void DatInitialMixedEdgeFaceKernel(DatTruncateParams p,
     }
 }
 
-__global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataView data) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    if (item >= p.env_count * p.slot_capacity) return;
-    const uint32_t env = item / p.slot_capacity;
-    const uint32_t ordinal = item % p.slot_capacity;
-    if (ordinal >= data.ogc_contact_count[env]) return;
-    const uint32_t slot = env * p.slot_stride + p.slot_base + ordinal;
-    if (data.dat_pair_kind[slot] == 0u) return;
-    DatPointRef refs_a[3], refs_b[3];
-    uint32_t count_a = 0u, count_b = 0u;
-    if (!DatMixedRefs(p, model, data, env, slot, refs_a, &count_a,
-                      refs_b, &count_b)) {
-        atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
-        return;
-    }
-    // Links of one articulation are certified relative to their lowest common ancestor.
-    const uint32_t frame = refs_a[0].particle || refs_b[0].particle ? ~0u
-        : DatCommonFrame(p, model, env, refs_a[0].owner, refs_b[0].owner);
+// Certifies a primitive pair by the separating plane of its start positions: each point keeps to its
+// side's share of the gap, or its owner is truncated to the step fraction where it would cross.
+__device__ void DatCertifyPair(const DatTruncateParams& p, const ModelView& model,
+                               const DataView& data, uint32_t env,
+                               const DatPointRef* refs_a, uint32_t count_a,
+                               const DatPointRef* refs_b, uint32_t count_b, uint32_t frame) {
     collision::DatPrimitive a, b;
     a.count = count_a;
     b.count = count_b;
@@ -1014,6 +1005,193 @@ __global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataVi
                 DatMinOwnerBeta(p, model, data, env, refs[i], p.relaxation * root,
                     other.particle ? kDatBoundParticlePair : kDatBoundBodyPair,
                     DatCounterpart(p, other));
+        }
+    }
+}
+
+__global__ void DatMixedPairsKernel(DatTruncateParams p, ModelView model, DataView data) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= p.env_count * p.slot_capacity) return;
+    const uint32_t env = item / p.slot_capacity;
+    const uint32_t ordinal = item % p.slot_capacity;
+    if (ordinal >= data.ogc_contact_count[env]) return;
+    const uint32_t slot = env * p.slot_stride + p.slot_base + ordinal;
+    if (data.dat_pair_kind[slot] == 0u) return;
+    DatPointRef refs_a[3], refs_b[3];
+    uint32_t count_a = 0u, count_b = 0u;
+    if (!DatMixedRefs(p, model, data, env, slot, refs_a, &count_a,
+                      refs_b, &count_b)) {
+        atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+        return;
+    }
+    // Links of one articulation are certified relative to their lowest common ancestor.
+    const uint32_t frame = refs_a[0].particle || refs_b[0].particle ? ~0u
+        : DatCommonFrame(p, model, env, refs_a[0].owner, refs_b[0].owner);
+    DatCertifyPair(p, model, data, env, refs_a, count_a, refs_b, count_b, frame);
+}
+
+constexpr uint32_t kDatReachTriangles = 0u, kDatReachSegments = 1u, kDatReachBody = 2u;
+
+// A tree a reaching body triangle searches, with its start sphere center in the tree frame.
+struct DatReachTree {
+    const collision::MeshBvhNode* nodes = nullptr;
+    uint32_t node_count = 0u, leaf_count = 0u, first = 0u, base = 0u;
+    uint32_t vertex_count = 0u, owner = 0u, kind = kDatReachTriangles;
+    math::Vec3 center{};
+    float reach = 0.0f;
+};
+
+// Particle surfaces are searched by triangle, or by segment when they have none, and bodies only
+// outside the triangle's articulation frame, whose pairs the chain bound covers.
+__device__ bool DatReachTarget(const DatTruncateParams& p, const ModelView& model,
+                               const DataView& data, uint32_t env, uint32_t body,
+                               uint32_t index, math::Vec3 center, float radius, float travel,
+                               DatReachTree* tree) {
+    if (index < p.surfaces_per_env) {
+        const auto info = model.particle_surface_info[index];
+        if (info.vertex_count == 0u) return false;
+        // Particles keep within half the relaxed radius their surface shares with this body.
+        const float other = 0.5f * p.relaxation * collision::DatQueryRadius(
+            collision::DatMotionRadius(model.particle_surface_thickness[index] + p.margin, p.dt,
+                data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + index],
+                data.dat_body_speed[size_t{env} * p.bodies_per_env + body], p.relaxation));
+        tree->base = env * p.particles_per_env + info.vertex_offset;
+        tree->vertex_count = info.vertex_count;
+        tree->center = center;
+        tree->reach = radius + (travel + other) / p.relaxation;
+        if (info.triangle_count > 0u) {
+            tree->nodes = data.particle_surface_nodes + size_t{env} * p.nodes_per_env +
+                          info.node_offset;
+            tree->node_count = info.node_count;
+            tree->leaf_count = info.triangle_count;
+            tree->first = info.triangle_offset;
+            tree->kind = kDatReachTriangles;
+        } else {
+            const auto edges = model.particle_surface_edge_info[index];
+            tree->nodes = data.particle_surface_edge_nodes + size_t{env} * p.edge_nodes_per_env +
+                          edges.node_offset;
+            tree->node_count = edges.node_count;
+            tree->leaf_count = edges.edge_count;
+            tree->first = edges.edge_offset;
+            tree->kind = kDatReachSegments;
+        }
+        return tree->node_count > 0u;
+    }
+    const uint32_t other = index - p.surfaces_per_env;
+    const auto info = model.mesh_surface_info[other];
+    if (info.vertex_count == 0u || info.node_count == 0u ||
+        !DatBodyPairAllowed(p, model, body, other) ||
+        DatCommonFrame(p, model, env, body, other) != ~0u) return false;
+    const auto view = DatOldBodyView(p, model, data, env, other);
+    tree->nodes = view.nodes + info.node_offset;
+    tree->node_count = info.node_count;
+    tree->leaf_count = info.triangle_count;
+    tree->first = info.triangle_offset;
+    tree->vertex_count = info.vertex_count;
+    tree->owner = other;
+    tree->kind = kDatReachBody;
+    tree->center = collision::MeshSurfaceLocalPoint(view, center);
+    // The other body's motion is its farthest vertex travel over the step, per unit time.
+    tree->reach = radius + (travel + data.dat_body_motion[size_t{env} * p.bodies_per_env + other] *
+                            p.dt) / p.relaxation;
+    return true;
+}
+
+__device__ bool DatReachLeaf(const ModelView& model, const DatReachTree& tree, uint32_t leaf,
+                             DatPointRef* refs, uint32_t* count) {
+    if (leaf >= tree.leaf_count) return false;
+    if (tree.kind == kDatReachSegments) {
+        const auto edge = model.particle_surface_edges[tree.first + leaf];
+        if (edge.vertex0 >= tree.vertex_count || edge.vertex1 >= tree.vertex_count) return false;
+        refs[0] = {tree.base + edge.vertex0, 0u, true};
+        refs[1] = {tree.base + edge.vertex1, 0u, true};
+        *count = 2u;
+        return true;
+    }
+    const size_t at = (size_t{tree.first} + leaf) * 3u;
+    for (uint32_t k = 0u; k < 3u; ++k) {
+        const uint32_t vertex = tree.kind == kDatReachBody ? model.mesh_triangles[at + k]
+                                                           : model.particle_surface_triangles[at + k];
+        if (vertex >= tree.vertex_count) return false;
+        refs[k] = tree.kind == kDatReachBody ? DatPointRef{tree.owner, vertex, false}
+                                             : DatPointRef{tree.base + vertex, 0u, true};
+    }
+    *count = 3u;
+    return true;
+}
+
+// A body past its motion bound can meet primitives detection did not reach, so each of its
+// triangles certifies every primitive its swept start sphere reaches in place of that bound.
+__global__ void DatBodyReachKernel(DatTruncateParams p, ModelView model, DataView data) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= p.env_count * p.mesh_vertex_sources) return;
+    const uint32_t env = item / p.mesh_vertex_sources;
+    const uint64_t packed = model.mesh_vertex_sources[item % p.mesh_vertex_sources];
+    const uint32_t body = static_cast<uint32_t>(packed >> 32u);
+    const uint32_t vertex = static_cast<uint32_t>(packed);
+    if (body >= p.bodies_per_env) return;
+    const auto info = model.mesh_surface_info[body];
+    const size_t owner = size_t{env} * p.bodies_per_env + body;
+    const float query = data.dat_body_query_radius[owner];
+    if (vertex >= info.vertex_count || !(query > 0.0f && query <= collision::kDatQueryRadiusMax))
+        return;
+    // Division rounding keeps order, so a motion rate below the bound rate clears every vertex.
+    if (data.dat_body_motion[owner] < 0.5f * p.relaxation * query / p.dt) return;
+    const uint32_t at = info.vertex_offset + vertex;
+    for (uint32_t i = model.mesh_vertex_triangle_offsets[at];
+         i < model.mesh_vertex_triangle_offsets[at + 1u]; ++i) {
+        // The first corner of each triangle certifies it.
+        const uint32_t entry = model.mesh_vertex_triangles[i];
+        const uint32_t triangle = (entry >> 2u) - info.triangle_offset;
+        if ((entry & 3u) != 0u || triangle >= info.triangle_count) continue;
+        const size_t first = (size_t{info.triangle_offset} + triangle) * 3u;
+        DatPointRef face[3];
+        bool valid = true;
+        for (uint32_t j = 0u; j < 3u; ++j) {
+            face[j] = {body, model.mesh_triangles[first + j], false};
+            valid &= face[j].vertex < info.vertex_count;
+        }
+        if (!valid) {
+            atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+            continue;
+        }
+        math::Vec3 corner[3];
+        float travel = 0.0f;
+        for (uint32_t j = 0u; j < 3u; ++j) {
+            travel = fmaxf(travel, DatPointLipschitz(p, model, data, env, face[j]));
+            corner[j] = DatPointAt(p, model, data, env, face[j], 0.0f);
+        }
+        if (!(travel <= FLT_MAX)) continue;
+        const math::Vec3 center = (corner[0] + corner[1] + corner[2]) * (1.0f / 3.0f);
+        const float radius = sqrtf(fmaxf(fmaxf((corner[0] - center).LengthSq(),
+            (corner[1] - center).LengthSq()), (corner[2] - center).LengthSq()));
+        for (uint32_t index = 0u; index < p.surfaces_per_env + p.bodies_per_env; ++index) {
+            DatReachTree tree;
+            if (!DatReachTarget(p, model, data, env, body, index, center, radius, travel, &tree))
+                continue;
+            uint32_t cursor = 0u;
+            while (cursor < tree.node_count) {
+                const auto node = tree.nodes[cursor];
+                if (node.escape <= cursor || node.escape > tree.node_count) {
+                    atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                    break;
+                }
+                if (collision::MeshBoundsDistanceSquared(tree.center, node) >
+                    tree.reach * tree.reach) {
+                    cursor = node.escape;
+                    continue;
+                }
+                if (node.triangle != ~0u) {
+                    DatPointRef target[3];
+                    uint32_t count = 0u;
+                    if (!DatReachLeaf(model, tree, node.triangle, target, &count)) {
+                        atomicOr(data.env_status + env, kEnvStatusContactGeometryUnavailable);
+                        break;
+                    }
+                    DatCertifyPair(p, model, data, env, face, 3u, target, count, ~0u);
+                }
+                ++cursor;
+            }
         }
     }
 }
@@ -1282,6 +1460,7 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
           !model.mesh_bvh_nodes || !model.shape_table || !model.mesh_vertex_reach ||
           (p->excluded_pairs > 0u && !model.excluded_pairs) ||
           !model.mesh_edges || !model.hull_verts || !model.mesh_vertex_sources ||
+          !model.mesh_vertex_triangle_offsets || !model.mesh_vertex_triangles ||
           !data.body_pose || !data.dat_prev_body_pose || !data.dat_body_beta ||
           !data.dat_body_speed || !data.dat_body_query_radius || !data.dat_body_motion ||
           !data.body_inv_mass || !data.body_linear_velocity ||
@@ -1358,6 +1537,10 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (body_vertices > 0u)
         LaunchCuda(DatBodyMotionBoundKernel,
+                   dim3((static_cast<uint32_t>(body_vertices) + kBlockSize - 1u) / kBlockSize),
+                   dim3(kBlockSize), 0u, stream, *p, model, data);
+    if (body_vertices > 0u)
+        LaunchCuda(DatBodyReachKernel,
                    dim3((static_cast<uint32_t>(body_vertices) + kBlockSize - 1u) / kBlockSize),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
     if (slots > 0u)
