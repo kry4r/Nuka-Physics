@@ -534,10 +534,22 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
 // Particle systems have no collidable profile row, so they use the canonical
 // model defaults with only their authored per-system isotropic friction replaced.
 
-// One thread per footprint row: clears every pair-driven row; occupied slots are re-emitted.
+// One thread per environment: the finished assembly's extent becomes the one to clear.
+__global__ void BeginPairDrivenRowsKernel(uint32_t env_count, uint32_t* __restrict__ row_count,
+                                          uint32_t* __restrict__ extent) {
+    const uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
+    if (env >= env_count) return;
+    row_count[env] = 0u;
+    if (extent == nullptr) return;
+    extent[2u * env] = extent[2u * env + 1u];
+    extent[2u * env + 1u] = 1u;
+}
+
+// One thread per footprint row below the bound: clears rows the last assembly may have filled.
 // Clear flags are left untouched so empty 128-byte rows avoid partial-sector writes.
 __global__ void ClearPairDrivenRowsKernel(
     uint32_t env_count, uint32_t slot_count, uint32_t full_row_slot_count, uint32_t rows_per_env,
+    const uint32_t* __restrict__ extent,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
     uint32_t* __restrict__ row_cj_link, uint32_t* __restrict__ row_cj_link_b,
     float* __restrict__ row_penetration, float* __restrict__ row_damping,
@@ -549,7 +561,9 @@ __global__ void ClearPairDrivenRowsKernel(
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * footprint;
          item += stride) {
         const uint32_t env = item / footprint;
-        const uint32_t row = env * rows_per_env + (item - env * footprint);
+        const uint32_t local = item - env * footprint;
+        if (local >= ContactRowBound(extent, env, footprint)) continue;
+        const uint32_t row = env * rows_per_env + local;
         lambda[row] = 0.0f;
         row_penetration[row] = 0.0f;
         row_damping[row] = 0.0f;
@@ -558,8 +572,13 @@ __global__ void ClearPairDrivenRowsKernel(
         if (urows[row].flags != 0u) urows[row].flags = 0u;
     }
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * slot_count;
-         item += stride)
-        contact_material[item] = 0u;
+         item += stride) {
+        const uint32_t env = item / slot_count;
+        const uint32_t slot = item - env * slot_count;
+        const uint32_t first = slot < full_slots ? slot * kPdRowsPerSlot
+            : full_slots * kPdRowsPerSlot + (slot - full_slots) * kPdParticleRowsPerSlot;
+        if (first < ContactRowBound(extent, env, footprint)) contact_material[item] = 0u;
+    }
 }
 
 // One thread per (env x candidate slot). Emits the slot's NkRow block from the
@@ -606,7 +625,8 @@ __global__ void EmitPairDrivenRowsKernel(
     math::Vec3* __restrict__ row_cj_dir_b,
     uint32_t* __restrict__ row_count,
     float* __restrict__ row_penetration,
-    float* __restrict__ row_damping, uint32_t* __restrict__ env_status) {
+    float* __restrict__ row_damping, uint32_t* __restrict__ env_status,
+    uint32_t* __restrict__ contact_row_extent) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * slot_count;
     if (gid >= total) return;
@@ -622,6 +642,15 @@ __global__ void EmitPairDrivenRowsKernel(
              : slot * kPdRowsPerSlot);
 
     uint32_t n_active = ucontact_count[gid];
+    // The last occupied slot of each environment in the warp raises the extent past its rows.
+    if (contact_row_extent != nullptr) {
+        const uint32_t active = __activemask();
+        const uint32_t filled = __ballot_sync(active, n_active > 0u) & __match_any_sync(active, env);
+        if (filled != 0u &&
+            (threadIdx.x & 31u) == 31u - static_cast<uint32_t>(__clz(static_cast<int>(filled))))
+            atomicMax(contact_row_extent + 2u * env + 1u,
+                      base - env * rows_per_env + (1u + kPdTangentRows) * points_per_slot + 1u);
+    }
     // An empty slot keeps the rows ClearPairDrivenRowsKernel cleared.
     if (n_active == 0u) return;
     const uint32_t law = ucontact_law != nullptr ? ucontact_law[gid] : nk::kContactLawCompliant;
@@ -1256,9 +1285,14 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     const math::Vec3* __restrict__ step_body_angular,
     const math::Vec3* __restrict__ step_particle,
     uint32_t total_rows, uint32_t dof_stride, float dt, VertexBlockLayout vertex_blocks,
-    float* __restrict__ row_meff) {
+    uint32_t rows_per_env, uint32_t contact_rows_per_env,
+    const uint32_t* __restrict__ contact_row_extent, float* __restrict__ row_meff) {
     const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
     if (rs >= total_rows) return;
+    // Contact rows past the bound are empty and their effective mass is already zero.
+    const uint32_t env_row = rs % rows_per_env;
+    if (env_row < contact_rows_per_env &&
+        env_row >= ContactRowBound(contact_row_extent, rs / rows_per_env, contact_rows_per_env)) return;
     if (!(urows[rs].flags & nk::nk_row_flags::kActive)) {
         row_meff[rs] = 0.0f;
         return;
@@ -1707,11 +1741,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     }
     constexpr uint32_t kBlockSize = 128u;
     const uint32_t total_rows = p->env_count * p->rows_per_env;
-    if (cudaMemsetAsync(data.row_count, 0,
-                        static_cast<size_t>(p->env_count) * sizeof(uint32_t),
-                        stream) != cudaSuccess) {
-        return Status::Failed;
-    }
+    LaunchCuda(BeginPairDrivenRowsKernel, dim3((p->env_count + kBlockSize - 1u) / kBlockSize),
+               dim3(kBlockSize), 0u, stream, p->env_count, data.row_count, data.contact_row_extent);
     const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;
     const uint32_t artics_per_env =
         (p->articulation_count > 0u && p->env_count > 0u)
@@ -1737,6 +1768,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         const uint32_t clear_blocks = (std::max(clear_rows, total) + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(ClearPairDrivenRowsKernel, dim3(clear_blocks), dim3(kBlockSize), 0u, stream,
                    p->env_count, p->union_slot_count, p->full_row_slot_count, p->rows_per_env,
+                   data.contact_row_extent,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping,
                    data.contact_material);
@@ -1775,7 +1807,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_point, data.row_cj_dir,
                    data.row_cj_link_b, data.row_cj_point_b, data.row_cj_dir_b,
-                   data.row_count, data.row_penetration, data.row_damping, data.env_status);
+                   data.row_count, data.row_penetration, data.row_damping, data.env_status,
+                   data.contact_row_extent);
     }
 
     if (has_artic &&
@@ -1908,7 +1941,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    PointMasses(data),
                    data.row_damping, data.step_qdot_flat, data.step_body_linear_velocity,
                    data.step_body_angular_velocity, data.step_particle_velocity,
-                   total_rows, p->max_dof, p->dt, p->vertex_blocks, data.row_meff);
+                   total_rows, p->max_dof, p->dt, p->vertex_blocks, p->rows_per_env,
+                   p->contact_rows_per_env, data.contact_row_extent, data.row_meff);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

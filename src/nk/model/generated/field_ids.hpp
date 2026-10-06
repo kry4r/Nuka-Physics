@@ -458,6 +458,7 @@ enum class FieldId : uint16_t {
     VbdSolveAudit,  // vbd_solve_audit (per:scalar arena:scratch owner:data elem:20 count:vbd_vertices_per_env*env_count flags:[readout])
     ControlScratch,  // control_scratch (per:articulation_dof arena:scratch owner:data elem:8)
     VbdFreeVelocity,  // vbd_free_velocity (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
+    ContactRowExtent,  // contact_row_extent (per:env arena:scratch owner:data elem:2)
     Count
 };
 
@@ -911,6 +912,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "vbd_solve_audit",
     "control_scratch",
     "vbd_free_velocity",
+    "contact_row_extent",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

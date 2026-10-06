@@ -165,6 +165,16 @@ __host__ __device__ inline PointMassView PointMasses(const DataView& data) {
             data.particle_row_impulse};
 }
 
+// Contact rows at or past the bound are empty in this and the previous pair-driven assembly and
+// hold cleared values; extent stores each assembly's row end plus one, and 0 leaves it open.
+__device__ __forceinline__ uint32_t ContactRowBound(const uint32_t* extent, uint32_t env,
+                                                    uint32_t contact_rows) {
+    if (extent == nullptr) return contact_rows;
+    const uint32_t previous = extent[2u * env], current = extent[2u * env + 1u];
+    return previous == 0u || current == 0u ? contact_rows
+                                            : min(max(previous, current) - 1u, contact_rows);
+}
+
 // Union slot classes / flags — MUST mirror nk::UnionSlot (model.hpp).
 inline constexpr uint32_t kUSlotInactive       = 0u;
 inline constexpr uint32_t kUSlotFootSpherePlane = 1u;

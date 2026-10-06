@@ -336,6 +336,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ParticleResponse: v.particle_response = static_cast<math::SymmetricMat3*>(p); break;
         case FieldId::VbdFreeRate: v.vbd_free_rate = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdFreeVelocity: v.vbd_free_velocity = static_cast<math::Vec3*>(p); break;
+        case FieldId::ContactRowExtent: v.contact_row_extent = static_cast<uint32_t*>(p); break;
         case FieldId::VbdMembraneStart: v.vbd_membrane_start = static_cast<vbd::MembraneStartState*>(p); break;
         case FieldId::VbdOffset: v.vbd_offset = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdInertia: v.vbd_inertia = static_cast<float*>(p); break;
@@ -458,7 +459,8 @@ bool Data::UploadPersistent(const std::vector<uint8_t>& bytes) const {
     }
     if (phi::BufferUpload(buffer, bytes.data(), 0, bytes.size()) != phi::Status::Ok) return false;
     for (const auto& segment : arena_.Segments()) {
-        if (segment.field != FieldId::ContactSolveMetrics && segment.field != FieldId::ContactSolveCounts)
+        if (segment.field != FieldId::ContactSolveMetrics && segment.field != FieldId::ContactSolveCounts &&
+            segment.field != FieldId::ContactRowExtent)
             continue;
         if (phi::BufferMemset(arena_.ScratchBuffer(), 0, segment.offset, segment.bytes) != phi::Status::Ok)
             return false;
