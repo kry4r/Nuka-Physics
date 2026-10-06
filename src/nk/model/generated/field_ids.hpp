@@ -381,6 +381,12 @@ enum class FieldId : uint16_t {
     VbdIncidence,  // vbd_incidence (per:scalar arena:persistent owner:model count:vbd_incidence_per_env)
     VbdColorVertices,  // vbd_color_vertices (per:scalar arena:persistent owner:model count:vbd_dynamic_vertices_per_env)
     VbdColorSegments,  // vbd_color_segments (per:scalar arena:persistent owner:model count:vbd_colors*2)
+    VbdCoarseLevelNodes,  // vbd_coarse_level_nodes (per:scalar arena:persistent owner:model count:vbd_coarse_levels+1)
+    VbdCoarseParents,  // vbd_coarse_parents (per:scalar arena:persistent owner:model count:vbd_coarse_levels*vbd_vertices_per_env*3)
+    VbdCoarseWeights,  // vbd_coarse_weights (per:scalar arena:persistent owner:model count:vbd_coarse_levels*vbd_vertices_per_env*3)
+    VbdCoarseChildOffsets,  // vbd_coarse_child_offsets (per:scalar arena:persistent owner:model count:vbd_coarse_nodes+1)
+    VbdCoarseChildren,  // vbd_coarse_children (per:scalar arena:persistent owner:model count:vbd_coarse_children)
+    VbdCoarseChildWeights,  // vbd_coarse_child_weights (per:scalar arena:persistent owner:model count:vbd_coarse_children)
     ParticleResponse,  // particle_response (per:particle arena:scratch owner:data)
     ParticleRowImpulse,  // particle_row_impulse (per:particle arena:scratch owner:data)
     VbdFreeRate,  // vbd_free_rate (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
@@ -835,6 +841,12 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "vbd_incidence",
     "vbd_color_vertices",
     "vbd_color_segments",
+    "vbd_coarse_level_nodes",
+    "vbd_coarse_parents",
+    "vbd_coarse_weights",
+    "vbd_coarse_child_offsets",
+    "vbd_coarse_children",
+    "vbd_coarse_child_weights",
     "particle_response",
     "particle_row_impulse",
     "vbd_free_rate",

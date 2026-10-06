@@ -1043,6 +1043,14 @@ fields:
   - {name: vbd_incidence, dtype: u32, per: scalar, count: "vbd_incidence_per_env", arena: persistent, owner: model}
   - {name: vbd_color_vertices, dtype: u32, per: scalar, count: "vbd_dynamic_vertices_per_env", arena: persistent, owner: model}
   - {name: vbd_color_segments, dtype: u32, per: scalar, count: "vbd_colors*2", arena: persistent, owner: model}
+  # Coarse levels of the vertex blocks: node range per level, three (node, weight) parents per level
+  # and vertex (~0u unused), and each node's children as (vertex, weight) lists.
+  - {name: vbd_coarse_level_nodes, dtype: u32, per: scalar, count: "vbd_coarse_levels+1", arena: persistent, owner: model}
+  - {name: vbd_coarse_parents, dtype: u32, per: scalar, count: "vbd_coarse_levels*vbd_vertices_per_env*3", arena: persistent, owner: model}
+  - {name: vbd_coarse_weights, dtype: f32, per: scalar, count: "vbd_coarse_levels*vbd_vertices_per_env*3", arena: persistent, owner: model}
+  - {name: vbd_coarse_child_offsets, dtype: u32, per: scalar, count: "vbd_coarse_nodes+1", arena: persistent, owner: model}
+  - {name: vbd_coarse_children, dtype: u32, per: scalar, count: "vbd_coarse_children", arena: persistent, owner: model}
+  - {name: vbd_coarse_child_weights, dtype: f32, per: scalar, count: "vbd_coarse_children", arena: persistent, owner: model}
   # Rows see each particle through a response frozen for the step; vertex blocks keep their
   # inertial target, integrator offset and mass over step squared, with applied particle impulses.
   - {name: particle_response, dtype: symmat3, per: particle, arena: scratch, owner: data}

@@ -17,6 +17,7 @@
 #include "collision/contact_capacity.hpp"
 #include "collision/mesh_surface.hpp"
 #include "nk/solve/nk_row.hpp"
+#include "nk/solve/vertex_block_hierarchy.hpp"
 #include "nk/contact/contact_identity.hpp"
 #include "nk/material/hencky_j2.hpp"
 #include "phi/op_schema.hpp"  // phi::kShapeTableRowStride / kSdfHeaderStride (host-safe)
@@ -186,6 +187,14 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::VbdIncidence) return vbd_incidence_per_env;
         if (id == FieldId::VbdColorVertices) return vbd_dynamic_vertices_per_env;
         if (id == FieldId::VbdColorSegments) return uint64_t{vbd_colors} * 2u;
+        if (id == FieldId::VbdCoarseLevelNodes)
+            return vbd_coarse_levels > 0u ? uint64_t{vbd_coarse_levels} + 1u : 0u;
+        if (id == FieldId::VbdCoarseParents || id == FieldId::VbdCoarseWeights)
+            return CheckedProduct({vbd_coarse_levels, vbd_vertices_per_env, kVbdCoarseParents});
+        if (id == FieldId::VbdCoarseChildOffsets)
+            return vbd_coarse_nodes > 0u ? uint64_t{vbd_coarse_nodes} + 1u : 0u;
+        if (id == FieldId::VbdCoarseChildren || id == FieldId::VbdCoarseChildWeights)
+            return vbd_coarse_children;
         if (id == FieldId::VbdFreeRate || id == FieldId::VbdFreeVelocity ||
             id == FieldId::VbdOffset || id == FieldId::VbdInertia ||
             id == FieldId::VbdHistoryVel ||
@@ -950,6 +959,24 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::VbdColorSegments:
             std::memcpy(dst, particles.vbd_color_segments.data(), seg.bytes);
             break;
+        case FieldId::VbdCoarseLevelNodes:
+            std::memcpy(dst, particles.vbd_coarse_level_nodes.data(), seg.bytes);
+            break;
+        case FieldId::VbdCoarseParents:
+            std::memcpy(dst, particles.vbd_coarse_parents.data(), seg.bytes);
+            break;
+        case FieldId::VbdCoarseWeights:
+            std::memcpy(dst, particles.vbd_coarse_weights.data(), seg.bytes);
+            break;
+        case FieldId::VbdCoarseChildOffsets:
+            std::memcpy(dst, particles.vbd_coarse_child_offsets.data(), seg.bytes);
+            break;
+        case FieldId::VbdCoarseChildren:
+            std::memcpy(dst, particles.vbd_coarse_children.data(), seg.bytes);
+            break;
+        case FieldId::VbdCoarseChildWeights:
+            std::memcpy(dst, particles.vbd_coarse_child_weights.data(), seg.bytes);
+            break;
         case FieldId::ParticleTopologyElements:
             std::memcpy(dst, particles.topology_elements.data(), seg.bytes);
             break;
@@ -1327,6 +1354,12 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::VbdIncidence:          v.vbd_incidence = static_cast<uint32_t*>(p); break;
         case FieldId::VbdColorVertices:      v.vbd_color_vertices = static_cast<uint32_t*>(p); break;
         case FieldId::VbdColorSegments:      v.vbd_color_segments = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdCoarseLevelNodes:   v.vbd_coarse_level_nodes = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdCoarseParents:      v.vbd_coarse_parents = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdCoarseWeights:      v.vbd_coarse_weights = static_cast<float*>(p); break;
+        case FieldId::VbdCoarseChildOffsets: v.vbd_coarse_child_offsets = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdCoarseChildren:     v.vbd_coarse_children = static_cast<uint32_t*>(p); break;
+        case FieldId::VbdCoarseChildWeights: v.vbd_coarse_child_weights = static_cast<float*>(p); break;
         case FieldId::DistColorSegments:     v.dist_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::VolColorSegments:      v.vol_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::SmColorSegments:       v.sm_color_segments = static_cast<uint32_t*>(p); break;
@@ -1669,7 +1702,8 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
     const uint32_t vertices = cap.vbd_vertices_per_env;
     if (vertices == 0u) {
         if (!p.vbd_elements.empty() || !p.vbd_incidence.empty() || !p.vbd_color_vertices.empty() ||
-            cap.vbd_colors != 0u || cap.vbd_elements_per_env != 0u)
+            cap.vbd_colors != 0u || cap.vbd_elements_per_env != 0u || cap.vbd_coarse_levels != 0u ||
+            cap.vbd_coarse_nodes != 0u || cap.vbd_coarse_children != 0u || !p.vbd_coarse_parents.empty())
             return reject(Status::InvalidArgument, "vertex-block tables without vertex-block particles");
         return Status::Ok;
     }
@@ -1738,7 +1772,77 @@ phi::Status Model::ValidateVertexBlocks(std::string* reason) const {
                      color_of[element.vertex[j]] == color_of[element.vertex[k]]))
                     return reject(Status::InvalidArgument, "vertex-block element joins one color twice");
     }
-    return Status::Ok;
+    return ValidateVertexBlockLevels(reason);
+}
+
+phi::Status Model::ValidateVertexBlockLevels(std::string* reason) const {
+    auto reject = [&](const std::string& message) {
+        if (reason) *reason = message;
+        return phi::Status::InvalidArgument;
+    };
+    const auto& cap = capacities;
+    const auto& p = particles;
+    const uint32_t vertices = cap.vbd_vertices_per_env;
+    const uint32_t levels = cap.vbd_coarse_levels;
+    const uint64_t slots = uint64_t{levels} * vertices * kVbdCoarseParents;
+    if (p.vbd_coarse_level_nodes.size() != (levels > 0u ? uint64_t{levels} + 1u : 0u) ||
+        p.vbd_coarse_parents.size() != slots || p.vbd_coarse_weights.size() != slots ||
+        p.vbd_coarse_child_offsets.size() !=
+            (cap.vbd_coarse_nodes > 0u ? uint64_t{cap.vbd_coarse_nodes} + 1u : 0u) ||
+        p.vbd_coarse_children.size() != cap.vbd_coarse_children ||
+        p.vbd_coarse_child_weights.size() != cap.vbd_coarse_children ||
+        (levels == 0u) != (cap.vbd_coarse_nodes == 0u))
+        return reject("incomplete vertex-block coarse levels");
+    if (levels == 0u) return cap.vbd_coarse_dense_nodes == 0u ? phi::Status::Ok
+                                                               : reject("dense level without coarse levels");
+    if (p.vbd_coarse_level_nodes.front() != 0u || p.vbd_coarse_level_nodes.back() != cap.vbd_coarse_nodes ||
+        p.vbd_coarse_child_offsets.front() != 0u ||
+        p.vbd_coarse_child_offsets.back() != cap.vbd_coarse_children)
+        return reject("vertex-block coarse tables must tile their nodes");
+    const uint32_t last = cap.vbd_coarse_nodes - p.vbd_coarse_level_nodes[levels - 1u];
+    if (cap.vbd_coarse_dense_nodes != (last <= kVbdCoarseDenseNodes ? last : 0u))
+        return reject("vertex-block dense level disagrees with the last level");
+    // Every vertex's parents lie in its level with positive weights summing to one; children mirror them.
+    std::vector<uint32_t> children(cap.vbd_coarse_nodes, 0u);
+    for (uint32_t level = 0u; level < levels; ++level) {
+        const uint32_t first = p.vbd_coarse_level_nodes[level], end = p.vbd_coarse_level_nodes[level + 1u];
+        if (end <= first) return reject("vertex-block coarse levels must hold nodes");
+        for (uint32_t v = 0u; v < vertices; ++v) {
+            double sum = 0.0;
+            for (uint32_t j = 0u; j < kVbdCoarseParents; ++j) {
+                const uint64_t slot = (uint64_t{level} * vertices + v) * kVbdCoarseParents + j;
+                const uint32_t node = p.vbd_coarse_parents[slot];
+                const float weight = p.vbd_coarse_weights[slot];
+                if (node == ~0u) {
+                    if (weight != 0.0f) return reject("unused vertex-block coarse parent with weight");
+                    continue;
+                }
+                if (node < first || node >= end || !(weight > 0.0f) || !std::isfinite(weight))
+                    return reject("invalid vertex-block coarse parent");
+                sum += weight;
+                ++children[node];
+            }
+            if (sum != 0.0 && std::abs(sum - 1.0) > 1e-5)
+                return reject("vertex-block coarse weights must sum to one");
+        }
+        for (uint32_t node = first; node < end; ++node) {
+            const uint32_t begin = p.vbd_coarse_child_offsets[node];
+            if (p.vbd_coarse_child_offsets[node + 1u] < begin ||
+                p.vbd_coarse_child_offsets[node + 1u] - begin != children[node])
+                return reject("vertex-block coarse children disagree with their parents");
+            for (uint32_t i = begin; i < p.vbd_coarse_child_offsets[node + 1u]; ++i) {
+                const uint32_t v = p.vbd_coarse_children[i];
+                bool listed = false;
+                for (uint32_t j = 0u; v < vertices && j < kVbdCoarseParents; ++j) {
+                    const uint64_t slot = (uint64_t{level} * vertices + v) * kVbdCoarseParents + j;
+                    listed = listed || (p.vbd_coarse_parents[slot] == node &&
+                                        p.vbd_coarse_weights[slot] == p.vbd_coarse_child_weights[i]);
+                }
+                if (!listed) return reject("vertex-block coarse children disagree with their parents");
+            }
+        }
+    }
+    return phi::Status::Ok;
 }
 
 void Model::BuildParticleTopology() {

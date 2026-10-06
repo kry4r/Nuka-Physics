@@ -397,6 +397,12 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::VbdIncidence, DlpackDtype::kU32, 1, false, false},  // vbd_incidence
     {FieldId::VbdColorVertices, DlpackDtype::kU32, 1, false, false},  // vbd_color_vertices
     {FieldId::VbdColorSegments, DlpackDtype::kU32, 1, false, false},  // vbd_color_segments
+    {FieldId::VbdCoarseLevelNodes, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_level_nodes
+    {FieldId::VbdCoarseParents, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_parents
+    {FieldId::VbdCoarseWeights, DlpackDtype::kF32, 1, false, false},  // vbd_coarse_weights
+    {FieldId::VbdCoarseChildOffsets, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_child_offsets
+    {FieldId::VbdCoarseChildren, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_children
+    {FieldId::VbdCoarseChildWeights, DlpackDtype::kF32, 1, false, false},  // vbd_coarse_child_weights
     {FieldId::ParticleResponse, DlpackDtype::kF32, 2, false, false},  // particle_response
     {FieldId::ParticleRowImpulse, DlpackDtype::kF32, 2, false, false},  // particle_row_impulse
     {FieldId::VbdFreeRate, DlpackDtype::kF32, 2, false, false},  // vbd_free_rate

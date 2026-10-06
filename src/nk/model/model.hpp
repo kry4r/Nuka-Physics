@@ -94,6 +94,12 @@ struct ModelCapacities {
     uint32_t vbd_elements_per_env = 0u;
     uint32_t vbd_incidence_per_env = 0u;
     uint32_t vbd_colors = 0u;
+    // Coarse levels of the vertex blocks, their nodes and node children; the last level is solved
+    // densely with vbd_coarse_dense_nodes nodes, or zero when it stays too large.
+    uint32_t vbd_coarse_levels = 0u;
+    uint32_t vbd_coarse_nodes = 0u;
+    uint32_t vbd_coarse_children = 0u;
+    uint32_t vbd_coarse_dense_nodes = 0u;
     uint32_t num_material_buckets = 0;  // physics-material bucket table rows.
     uint32_t obs_width            = 64; // per-env observation export width.
 
@@ -435,6 +441,14 @@ public:
         std::vector<uint32_t>   vbd_incidence;
         std::vector<uint32_t>   vbd_color_vertices;
         std::vector<uint32_t>   vbd_color_segments;  // (first, count) per color
+        // Coarse levels (see vertex_block_hierarchy.hpp): node range per level, (node, weight) parents
+        // per level and vertex with ~0u unused, and each node's (vertex, weight) children.
+        std::vector<uint32_t>   vbd_coarse_level_nodes;
+        std::vector<uint32_t>   vbd_coarse_parents;
+        std::vector<float>      vbd_coarse_weights;
+        std::vector<uint32_t>   vbd_coarse_child_offsets;
+        std::vector<uint32_t>   vbd_coarse_children;
+        std::vector<float>      vbd_coarse_child_weights;
         // Anisotropic air-drag coefficients (lumped 0.5*rho*Cn, 0.5*rho*Ct). Both
         // default 0 -> the drag op is inert (a drag-free world stays byte-identical).
         // Cn >> Ct (normal-dominant) is what destabilizes a flat falling sheet into
@@ -667,6 +681,7 @@ public:
     phi::Status UploadTo(phi::BufferType* bt, phi::ModelView* out_view);
     phi::Status ValidateTopology(std::string* reason = nullptr) const;
     phi::Status ValidateVertexBlocks(std::string* reason = nullptr) const;
+    phi::Status ValidateVertexBlockLevels(std::string* reason = nullptr) const;
     void BuildAeroAdjacency();
     void BuildParticleTopology();
 

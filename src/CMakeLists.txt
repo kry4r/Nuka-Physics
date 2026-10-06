@@ -604,6 +604,7 @@ add_library(nuka_nk STATIC
     nk/pipeline/world.cpp
     nk/solve/schedule.cpp
     nk/solve/xpbd_coloring.cpp
+    nk/solve/vertex_block_hierarchy.cpp
     nk/solve/vertex_block_schedule.cpp
     sensor/observation.cpp
     sensor/state_bank.cpp

@@ -48,6 +48,7 @@
 #include "scene/graph/scene_graph.hpp"
 // The cloth-topology + fluid-box cookers (CUDA-free POD products); the media cook
 // reuses them to build the particle inputs instead of reimplementing the math.
+#include "nk/solve/vertex_block_hierarchy.hpp"
 #include "nk/solve/vertex_block_schedule.hpp"
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"   // BuildSphereTetLattice / BuildTetMeshConstraints
@@ -1669,6 +1670,7 @@ static void StageVertexBlocks(nk::Model& model, const XpbdCookInput& in, uint32_
     cap.vbd_particle_begin = in.vbd_count > 0u ? particle_base + in.vbd_begin : 0u;
     cap.vbd_vertices_per_env = in.vbd_count;
     nk::BuildVertexBlockSchedule(&model);
+    nk::BuildVertexBlockHierarchy(&model);
 }
 
 void CookXpbdParticles(nk::Model& model, uint32_t env_count,

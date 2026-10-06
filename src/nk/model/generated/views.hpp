@@ -138,6 +138,12 @@ struct ModelView {
     uint32_t* vbd_incidence = nullptr;  // per:scalar arena:persistent owner:model count:vbd_incidence_per_env
     uint32_t* vbd_color_vertices = nullptr;  // per:scalar arena:persistent owner:model count:vbd_dynamic_vertices_per_env
     uint32_t* vbd_color_segments = nullptr;  // per:scalar arena:persistent owner:model count:vbd_colors*2
+    uint32_t* vbd_coarse_level_nodes = nullptr;  // per:scalar arena:persistent owner:model count:vbd_coarse_levels+1
+    uint32_t* vbd_coarse_parents = nullptr;  // per:scalar arena:persistent owner:model count:vbd_coarse_levels*vbd_vertices_per_env*3
+    float* vbd_coarse_weights = nullptr;  // per:scalar arena:persistent owner:model count:vbd_coarse_levels*vbd_vertices_per_env*3
+    uint32_t* vbd_coarse_child_offsets = nullptr;  // per:scalar arena:persistent owner:model count:vbd_coarse_nodes+1
+    uint32_t* vbd_coarse_children = nullptr;  // per:scalar arena:persistent owner:model count:vbd_coarse_children
+    float* vbd_coarse_child_weights = nullptr;  // per:scalar arena:persistent owner:model count:vbd_coarse_children
 };
 
 // Data-owned, mutable per-World state. Pointers index into the nk::Arena
