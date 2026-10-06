@@ -717,7 +717,11 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
     const auto points = PointMasses(data);
     for (uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x; slot < s.rows;
          slot += gridDim.x * blockDim.x) {
-        // Every slot passes here, so the coarse selection reads one byte per row instead of the row.
+        // Contact rows past the bound are empty and keep the zero coarse flag written earlier.
+        const uint32_t env_row = slot % p.rows_per_env;
+        if (env_row < p.contact_rows_per_env && env_row >= ContactRowBound(
+                data.contact_row_extent, slot / p.rows_per_env, p.contact_rows_per_env)) continue;
+        // Every row that can be live passes here, so the coarse selection reads one byte per row.
         if (p.total_particle_count > 0u) s.coarse_flags[slot] = CoarseRowSelect{rows}(slot);
         const uint32_t flags = rows[slot].flags;
         if (!(flags & nk::nk_row_flags::kActive) || (flags & nk::nk_row_flags::kBlockTangent))

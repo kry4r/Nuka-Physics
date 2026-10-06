@@ -497,6 +497,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 20, 1, 80, 0},  // vbd_solve_audit
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 8, 1, 32, 0},  // control_scratch
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_free_velocity
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 8, 0},  // contact_row_extent
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

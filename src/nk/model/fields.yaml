@@ -1137,3 +1137,6 @@ fields:
   - {name: vbd_solve_audit, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", elem: 20, arena: scratch, owner: data, flags: [readout]}
   - {name: control_scratch, dtype: u32, per: articulation_dof, elem: 8, arena: scratch, owner: data}
   - {name: vbd_free_velocity, dtype: vec3, per: scalar, count: "vbd_vertices_per_env*env_count", arena: scratch, owner: data}
+  # Per env, the contact-row end plus one of the previous and of the current pair-driven assembly;
+  # 0 leaves every contact row unbounded.
+  - {name: contact_row_extent, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}

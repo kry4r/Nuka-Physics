@@ -474,6 +474,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::VbdSolveAudit, DlpackDtype::kF32, 2, false, true},  // vbd_solve_audit
     {FieldId::ControlScratch, DlpackDtype::kU32, 2, false, false},  // control_scratch
     {FieldId::VbdFreeVelocity, DlpackDtype::kF32, 2, false, false},  // vbd_free_velocity
+    {FieldId::ContactRowExtent, DlpackDtype::kU32, 2, false, false},  // contact_row_extent
 };
 
 } // namespace nuka::nk
