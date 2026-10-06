@@ -9,23 +9,25 @@ import nuka
 from nuka.author import Scene, SimOptions, materials, morphs, surfaces
 
 
-def build_scene(device, description, *, dt=1.0 / 600.0, sweeps=512, contact_capacity=524288):
+def build_scene(device, description, *, dt=1.0 / 600.0, sweeps=512, contact_capacity=524288, robot_only=False):
+    """The authored world; ``robot_only`` keeps the robot with its drives and leaves out the cloth and table."""
     path = Path(description)
     config = json.loads(path.read_text())
     cloth, table = config["cloth"], config["table"]
     scene = Scene(SimOptions(dt=dt, gravity=(0.0, 0.0, -9.81), solver_vel_iters=sweeps,
                              solver_pos_iters=4, ogc_contact_capacity=contact_capacity))
     scene.add_entity(morphs.NKS(str(path.parent / config["robot"])))
-    scene.add_entity(morphs.Grid(cloth["nx"], cloth["ny"], cloth["spacing"],
-                                origin=tuple(cloth["origin"])),
-                     materials.Cloth.VBD(areal_density=cloth["density"], friction=cloth["friction"],
-                                         stretch_stiffness=cloth["stretch"], poisson=cloth["poisson"],
-                                         bend_stiffness=cloth["bend"], thickness=cloth["thickness"]),
-                     surfaces.Cloth(free=True))
-    half_extents = tuple(0.5 * value for value in table["size"])
-    scene.add_entity(morphs.Box(half_extents, pos=tuple(table["position"]),
-                                quat=tuple(table.get("quat", (1.0, 0.0, 0.0, 0.0)))),
-                     materials.Rigid(static=True, friction=table["friction"]))
+    if not robot_only:
+        scene.add_entity(morphs.Grid(cloth["nx"], cloth["ny"], cloth["spacing"],
+                                    origin=tuple(cloth["origin"])),
+                         materials.Cloth.VBD(areal_density=cloth["density"], friction=cloth["friction"],
+                                             stretch_stiffness=cloth["stretch"], poisson=cloth["poisson"],
+                                             bend_stiffness=cloth["bend"], thickness=cloth["thickness"]),
+                         surfaces.Cloth(free=True))
+        half_extents = tuple(0.5 * value for value in table["size"])
+        scene.add_entity(morphs.Box(half_extents, pos=tuple(table["position"]),
+                                    quat=tuple(table.get("quat", (1.0, 0.0, 0.0, 0.0)))),
+                         materials.Rigid(static=True, friction=table["friction"]))
     world = scene.build(device)
     try:
         names = world.dof_names()

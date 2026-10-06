@@ -227,14 +227,16 @@ class Scene:
                 f"{type(unknown[0].morph).__name__} (use morphs.NKS / Grid / "
                 "TetSphere / FluidBox / GranularBed / Cable / Box / Sphere / "
                 "Capsule / Plane / Ground)")
-        # Any authored appearance / environment routes to the general builder path
-        # (the SceneBuilder carries the material + environment records).
+        # Authored gravity, appearance or environment routes to the general builder path
+        # (the SceneBuilder carries the gravity and the material + environment records).
         appearance = self._environment is not None or any(
             e.render is not None for e in self._entities)
+        gravity = any(float(g) != 0.0 for g in self.options.gravity)
         thick_grid = any(getattr(e.material, "half_thickness", 0.0) > 0.0 or
                          getattr(e.material, "surface_density", 0.0) > 0.0
                          for e in grids)
-        if not scenes or tets or fluids or grans or cables or rigids or appearance or thick_grid:
+        if (not scenes or tets or fluids or grans or cables or rigids or appearance or thick_grid
+                or gravity):
             return self._build_general(device, scenes, grids, tets, fluids + grans,
                                        rigids, cables)
         return self._build_coupled(device, scenes, grids)
@@ -242,10 +244,6 @@ class Scene:
     # -- the cloth fast path (one NKS + optional one cloth Grid) --------------
     def _build_coupled(self, device, scenes, grids) -> "_nuka.World":
         o = self.options
-        if any(float(g) != 0.0 for g in o.gravity):
-            raise ValueError(
-                "Scene.build: the cloth fast path runs at the engine default "
-                "(Earth) gravity; author a Ground/Plane + media to set gravity.")
         kw = dict(
             device=device, env_count=int(o.env_count), dt=float(o.dt),
             control_mode=int(o.control_mode), osc_task_link=int(o.osc_task_link),
