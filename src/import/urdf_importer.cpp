@@ -4,6 +4,7 @@
 
 #include "import/urdf_importer.hpp"
 #include "import/mesh_file_loader.hpp"
+#include "import/principal_inertia.hpp"
 #include "scene/canonical_types.hpp"
 #include "math/vec3.hpp"
 #include "math/transform.hpp"
@@ -175,6 +176,9 @@ scene::SceneIR LoadUrdf(const std::string& path) {
 
         scene::RigidBodyRecord rec;
         rec.name = link_name;
+        // A link without <inertial> is massless, as the URDF format defines.
+        rec.mass = 0.0f;
+        rec.inertia = math::Vec3::Zero();
 
         // Parse <inertial>
         if (auto* inertial = link->FirstChildElement("inertial")) {
@@ -185,13 +189,14 @@ scene::SceneIR LoadUrdf(const std::string& path) {
 
             rec.inertial_transform = ParseOrigin(inertial->FirstChildElement("origin"));
 
-            // <inertia ixx="..." iyy="..." izz="..."/>
+            // The full tensor in the inertial frame becomes principal moments about rotated axes.
             if (auto* inertia = inertial->FirstChildElement("inertia")) {
-                float ixx = 1.0f, iyy = 1.0f, izz = 1.0f;
-                inertia->QueryFloatAttribute("ixx", &ixx);
-                inertia->QueryFloatAttribute("iyy", &iyy);
-                inertia->QueryFloatAttribute("izz", &izz);
-                rec.inertia = math::Vec3{ixx, iyy, izz};
+                const char* keys[6] = {"ixx", "iyy", "izz", "ixy", "ixz", "iyz"};
+                float full[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                for (int k = 0; k < 6; ++k) inertia->QueryFloatAttribute(keys[k], &full[k]);
+                math::Quat axes;
+                DiagonalizeInertia(full, rec.inertia, axes);
+                rec.inertial_transform.rotation = rec.inertial_transform.rotation * axes;
             }
         }
 
