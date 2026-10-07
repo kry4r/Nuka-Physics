@@ -356,11 +356,12 @@ def run(scene, camera_fit, plan, args):
         inset = 0.5 * args.open_width + args.edge_margin
         alignment = {side: Alignment(plan[f"{side}_events"], plan[f"{side}_command_p"],
                                      plan[f"{side}_command_R"][:, :, 1], window, inset,
-                                     args.press_depth + 0.5 * scene["cloth"]["thickness"])
+                                     max(args.press_depth) + 0.5 * scene["cloth"]["thickness"])
                      for side in fk.SIDES}
         x_run = {side: plan[f"{side}_retarget"].copy() for side in fk.SIDES}
         h_run = {side: plan[f"{side}_hand"].copy() for side in fk.SIDES}
         delta = {side: np.zeros((plan["frames"], 3)) for side in fk.SIDES}
+        held = {side: None for side in fk.SIDES}
         sim = fk.Kinematics(scene["directory"] / "upper_body.urdf")
         retarget = {side: fk.PinchRetarget(sim, side, scene["hand"][side], contact=args.pinch_contact)
                     for side in fk.SIDES}
@@ -480,9 +481,13 @@ def run(scene, camera_fit, plan, args):
                         g = plan["closure"][j, fk.SIDES.index(side)]
                         R_t = R_s.T @ plan[f"{side}_command_R"][j]
                         p_t = R_s.T @ (plan[f"{side}_command_p"][j] + delta[side][j] - p_s)
-                        floors = finger_floors(scene, positions, R_s, p_s, R_t, p_t, args.open_width,
-                                               retarget[side].sign)
-                        target = retarget[side].target(R_t, p_t, jaw_width(args, g), support_plane(scene, R_s, p_s),
+                        support = support_plane(scene, R_s, p_s)
+                        floors = held[side] if held[side] is not None else finger_floors(
+                            scene, positions, R_s, p_s, R_t, p_t, args.open_width, retarget[side].sign)
+                        # Supports are held while the pinch is within a contact band of them, so cloth gathered
+                        # under a landing point cannot shift one tip's goal against the other's.
+                        held[side] = floors if support[0] @ p_t - max(floors) < retarget[side].band else None
+                        target = retarget[side].target(R_t, p_t, jaw_width(args, g), support,
                                                        x_run[side][j - 1], args.press_depth, floors)
                         x_run[side][j], info = retarget[side].solve(x_run[side][j - 1], target)
                         h_run[side][j] = retarget[side].hand(x_run[side][j], jaw_width(args, g))
@@ -560,8 +565,9 @@ def main():
                         help="seconds over which the lift eases out before a grasp and back in after its release")
     parser.add_argument("--edge-margin", type=float, default=0.005,
                         help="distance of the outer open fingertip inside the cloth edge (m)")
-    parser.add_argument("--press-depth", type=float, default=0.008,
-                        help="fingertip target depth below the support each tip lands on (m)")
+    parser.add_argument("--press-depth", type=float, nargs="+", default=[0.008],
+                        help="target depth of the thumb and index tips below the support each lands on (m), one "
+                             "value for both or a thumb and index pair")
     parser.add_argument("--pinch-contact", choices=("pad", "tip"), default="tip",
                         help="thumb and index contact points the retarget places on the gripper's jaw pads")
     parser.add_argument("--frames", type=int, help="replay only this many recorded frames")
