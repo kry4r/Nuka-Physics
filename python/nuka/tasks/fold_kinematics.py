@@ -83,8 +83,17 @@ class Kinematics:
         for link in root.findall("link"):
             name, inertial = link.get("name"), link.find("inertial")
             if inertial is not None:
+                tensor = inertial.find("inertia")
+                inertia = np.zeros((3, 3))
+                if tensor is not None:
+                    value = lambda key: float(tensor.get(key, "0"))
+                    inertia = np.array([[value("ixx"), value("ixy"), value("ixz")],
+                                        [value("ixy"), value("iyy"), value("iyz")],
+                                        [value("ixz"), value("iyz"), value("izz")]])
+                # Mass, centre and rotational inertia about the centre, all in the link frame.
+                rotation = Rotation.from_euler("xyz", _vector(inertial.find("origin"), "rpy")).as_matrix()
                 self.inertials[name] = (float(inertial.find("mass").get("value")),
-                                        _vector(inertial.find("origin"), "xyz"))
+                                        _vector(inertial.find("origin"), "xyz"), rotation @ inertia @ rotation.T)
             for collision in link.findall("collision"):
                 mesh = collision.find("geometry/mesh")
                 if mesh is None:
@@ -211,21 +220,65 @@ class Kinematics:
         return (np.concatenate([block for block, _ in placed]),
                 np.repeat(np.array([link for _, link in placed]), [len(block) for block, _ in placed]))
 
-    def holding_torques(self, frames, names, gravity):
-        """Torques that hold joints ``names`` against ``gravity`` acting on the subtree below each; ``frames``
-        are link frames in the gravity frame (zero velocity and acceleration, as a recursive Newton-Euler
-        evaluation reduces to)."""
-        torques = np.zeros(len(names))
+    def rate(self, name, rates):
+        """Time derivative of joint ``name`` from ``rates``; a mimic joint scales its source's unless it is given."""
+        joint = self.joint(name)
+        if name in rates or joint["mimic"] is None:
+            return rates.get(name, 0.0)
+        source, multiplier, _ = joint["mimic"]
+        return multiplier * self.rate(source, rates)
+
+    def inverse_dynamics(self, base, pose, q, qd, qdd, names, gravity):
+        """Forces at joints ``names`` that move the tree below a fixed ``base`` at ``pose`` with the coordinates
+        ``q``, rates ``qd`` and accelerations ``qdd`` (maps by joint name) under ``gravity``."""
+        frames = self.frames(base, q, pose)
+        # Recursive Newton-Euler in the gravity frame, with the base accelerating against gravity instead.
+        motion = {base: (np.zeros(3), np.zeros(3), -np.asarray(gravity, np.float64))}
+        pending, order = [base], []
+        while pending:
+            parent = pending.pop()
+            omega_p, alpha_p, accel_p = motion[parent]
+            for child in self.children.get(parent, []):
+                joint = self.joints[child]
+                R, origin = frames[child]
+                r = origin - frames[parent][1]
+                omega, alpha = omega_p, alpha_p
+                accel = accel_p + np.cross(alpha_p, r) + np.cross(omega_p, np.cross(omega_p, r))
+                if joint["type"] != "fixed":
+                    axis = R @ joint["axis"]
+                    rate, acceleration = self.rate(joint["name"], qd), self.rate(joint["name"], qdd)
+                    if joint["type"] == "prismatic":
+                        accel = accel + axis * acceleration + 2.0 * np.cross(omega_p, axis * rate)
+                    else:
+                        omega = omega_p + axis * rate
+                        alpha = alpha_p + axis * acceleration + np.cross(omega_p, axis * rate)
+                motion[child] = (omega, alpha, accel)
+                order.append(child)
+                pending.append(child)
+        loads = {}
+        for link in order:
+            if link not in self.inertials:
+                continue
+            mass, centre, inertia = self.inertials[link]
+            omega, alpha, accel = motion[link]
+            R, origin = frames[link]
+            arm = R @ centre
+            inertia = R @ inertia @ R.T
+            loads[link] = (origin + arm, mass * (accel + np.cross(alpha, arm) + np.cross(omega, np.cross(omega, arm))),
+                           inertia @ alpha + np.cross(omega, inertia @ omega))
+        forces = np.zeros(len(names))
         for k, name in enumerate(names):
             link = self.link_of[name]
             R, origin = frames[link]
-            moment = np.zeros(3)
+            force, moment = np.zeros(3), np.zeros(3)
             for body in self.subtree(link):
-                if body in self.inertials and body in frames:
-                    mass, centre = self.inertials[body]
-                    moment += np.cross(frames[body][0] @ centre + frames[body][1] - origin, mass * gravity)
-            torques[k] = -(R @ self.joints[link]["axis"]) @ moment
-        return torques
+                if body in loads:
+                    centre, body_force, body_moment = loads[body]
+                    force += body_force
+                    moment += body_moment + np.cross(centre - origin, body_force)
+            axis = R @ self.joints[link]["axis"]
+            forces[k] = axis @ (force if self.joints[link]["type"] == "prismatic" else moment)
+        return forces
 
 
 def solve_ik(kin, tip, base, names, target, q0, tool=None, rotation_weight=0.1, damping=1e-3, max_step=0.2,

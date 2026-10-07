@@ -26,14 +26,19 @@ def production_tolerance():
 
 
 def recorded_inputs(run, steps):
-    """Per-step drive targets and feedforward of a replay, with the replay's own frame-0 settle and blends."""
+    """Per-step drive targets, velocity targets and feedforward of a replay; a replay that recorded no feedforward
+    gets its plan's gravity feedforward with the replay's own frame-0 settle and blends, and no velocity targets."""
     meta = json.loads((run / "session/manifest.json").read_text())["metadata"]
     chunks = [np.load(c) for c in sorted((run / "session").glob("chunk_*.npz"))]
     controls = np.concatenate([c["controls"] for c in chunks])
     recorded = np.concatenate([c["state_JOINT_POSITION"] for c in chunks])
+    steps = len(controls) if steps is None else min(steps, len(controls))
+    if "state_JOINT_FEEDFORWARD" in chunks[0].files:
+        feed = np.concatenate([c["state_JOINT_FEEDFORWARD"] for c in chunks])[:steps]
+        velocity = np.concatenate([c["state_VELOCITY_TARGET"] for c in chunks])[:steps]
+        return meta, controls[:steps], velocity, feed, list(meta["owner_names"]["LINK"]), recorded[:steps]
     plan = np.load(run / "plan.npz")
     ff, settle, per_frame = plan["feedforward"], meta["settle_steps"], meta["substeps_per_frame"]
-    steps = len(controls) if steps is None else min(steps, len(controls))
     feed = np.empty((steps, ff.shape[1]))
     for step in range(1, steps + 1):
         if step <= settle:
@@ -42,7 +47,8 @@ def recorded_inputs(run, steps):
         k, m = divmod(step - settle - 1, per_frame)
         tau = (m + 1) / per_frame
         feed[step - 1] = (1 - tau) * ff[k] + tau * ff[k + 1]
-    return meta, controls[:steps], feed, [str(n) for n in plan["feedforward_names"]], recorded[:steps]
+    return (meta, controls[:steps], np.zeros(controls[:steps].shape, np.float32), feed,
+            [str(n) for n in plan["feedforward_names"]], recorded[:steps])
 
 
 def nks_couplings(nks):
@@ -241,7 +247,7 @@ def main():
     args.output.mkdir(parents=True)
     device = nuka.Device.create(0)
     if args.run is not None:
-        meta, controls, feed, feed_names, recorded = recorded_inputs(args.run, args.steps)
+        meta, controls, velocity, feed, feed_names, recorded = recorded_inputs(args.run, args.steps)
         dt = float(meta["dt"])
         robot = args.scene / json.loads((args.scene / "scene.json").read_text())["robot"]
         world, config = build_scene(device, args.scene / "scene.json", dt=dt, sweeps=args.sweeps, robot_only=True)
@@ -261,11 +267,12 @@ def main():
         initial = np.asarray(world.download_field(nuka.Field.JOINT_POSITION), np.float32).reshape(-1).copy()
         if args.run is None:
             controls = np.tile(initial, (args.steps, 1))
+            velocity = np.zeros(controls.shape, np.float32)
             feed = np.zeros((args.steps, 0))
             kinds = {node["joint"]["name"]: "joint" for node in nks["tree"] if node.get("joint") is not None
                      and node["joint"]["type"] == "revolute" and node["joint"]["name"] not in couplings}
         else:
-            feed_slots = [config["active_indices"][name] for name in feed_names]
+            feed_slots = [names.index(name) for name in feed_names]
         base_feed = np.asarray(world.download_field(nuka.Field.JOINT_FEEDFORWARD), np.float32).reshape(-1).copy()
         metadata = {"fixture": "robot only", **source, "max_pairs": args.max_pairs, "contact_capacity": args.contact_capacity, "robot": str(robot), "robot_sha256": sha256(robot), "dt": dt,
                     "sweeps": args.sweeps, "steps": len(controls), "solver_velocity_tolerance_mps": tolerance,
@@ -286,6 +293,7 @@ def main():
                 values = base_feed.copy()
                 values[feed_slots] = feed[step]
                 world.set_drive_targets(targets)
+                world.upload_field(nuka.Field.VELOCITY_TARGET, np.ascontiguousarray(velocity[step].astype(np.float32)))
                 world.upload_field(nuka.Field.JOINT_FEEDFORWARD, np.ascontiguousarray(values))
             sample = session.step(controls=targets.copy())
             if np.any(sample["env_status"]):
@@ -306,10 +314,18 @@ def main():
         (args.output / "reference.xml").write_text(reference_xml)
         # The stiff couplings on the light finger links need a finer MuJoCo step; twice as fine bounds its error.
         coarse, fine = args.reference_substeps, 2 * args.reference_substeps
+        # MuJoCo takes the drive damping on the velocity targets as applied force next to the feedforward.
+        moving = {node["joint"]["name"] for node in nks["tree"]
+                  if node.get("joint") is not None and node["joint"]["type"] == "revolute"}
+        applied = {name: feed[:steps, i].astype(np.float64) for i, name in enumerate(feed_names) if name in moving}
+        for name, (_, kd, _) in drives.items():
+            applied[name] = applied.get(name, 0.0) + kd * velocity[:steps, names.index(name)]
+        applied_names = list(applied)
+        applied = np.stack([applied[name] for name in applied_names], axis=1) if applied else np.zeros((steps, 0))
         references = {}
         for substeps in (coarse, fine):
             mq, mqd, kinetic = run_mujoco(mujoco_xml(nks, drives, dt / substeps, 2.0 * dt), names, initial,
-                                          controls[:steps], list(drives), feed[:steps], feed_names, substeps)
+                                          controls[:steps], list(drives), applied, applied_names, substeps)
             references[substeps] = (mq, mqd, kinetic)
             np.savez_compressed(args.output / f"mujoco_substeps_{substeps}.npz", q=mq, qd=mqd, kinetic=kinetic)
         reference_q, reference_qd, _ = references[fine]
