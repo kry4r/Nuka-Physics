@@ -32,6 +32,15 @@ def catmull_rom(values, k, tau):
                   + (3.0 * p1 - p0 - 3.0 * p2 + p3) * tau ** 3)
 
 
+def catmull_rom_rates(values, k, tau, period):
+    """Rate and acceleration of the Catmull-Rom curve between rows k and k + 1 spaced ``period`` apart."""
+    last = len(values) - 1
+    p0, p1, p2, p3 = (values[min(max(index, 0), last)] for index in (k - 1, k, k + 1, k + 2))
+    c, d = 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3, 3.0 * p1 - p0 - 3.0 * p2 + p3
+    return (0.5 * ((p2 - p0) + 2.0 * c * tau + 3.0 * d * tau ** 2) / period,
+            (c + 3.0 * d * tau) / period ** 2)
+
+
 def quat_matrix(wxyz):
     w, x, y, z = wxyz
     return Rotation.from_quat([x, y, z, w]).as_matrix()
@@ -103,9 +112,8 @@ def hover_lift(events, frames, height, approach):
 
 
 def make_plan(scene, camera_fit, args):
-    """World pinch commands, retargeted arm and hand targets, waist targets, closures and gravity feedforward per
-    recorded frame. The first frame's arm seeds from the pinch-tool IK branch search at the recorded,
-    unlifted command."""
+    """World pinch commands, retargeted arm and hand targets, waist targets and closures per recorded frame.
+    The first frame's arm seeds from the pinch-tool IK branch search at the recorded, unlifted command."""
     episode = scene["episode"]["index"]
     columns = fk.episode_columns(DATA / f"data/chunk-000/episode_{episode:06d}.parquet")
     body = columns["observation.body"]
@@ -191,18 +199,6 @@ def make_plan(scene, camera_fit, args):
                                                         "p95": float(np.percentile(lag, 95))},
             "grasps": [{"grasp_frame": g, "release_frame": r, "grasp_s": g / fk.FPS, "release_s": r / fk.FPS,
                         "command_pinch_m": p_cmd[g].tolist()} for g, r in events]}
-    names = fk.waist_joints() + fk.arm_joints("left") + fk.arm_joints("right")
-    feedforward = np.zeros((frames, len(names)))
-    for k in range(frames):
-        q = {**{name: waist[k, i] for i, name in enumerate(fk.waist_joints())},
-             **{name: plan["left_arm"][k, i] for i, name in enumerate(fk.arm_joints("left"))},
-             **{name: plan["right_arm"][k, i] for i, name in enumerate(fk.arm_joints("right"))},
-             **dict(zip(scene["hand"]["left"]["targets_open_closed"], plan["left_hand"][k])),
-             **dict(zip(scene["hand"]["right"]["targets_open_closed"], plan["right_hand"][k]))}
-        feedforward[k] = sim.holding_torques(sim.frames("pelvis", q, (pelvis_R, pelvis_p)), names, GRAVITY)
-    plan["feedforward"], plan["feedforward_names"] = feedforward, np.array(names)
-    report["feedforward_nm"] = {name: [float(feedforward[:, i].min()), float(feedforward[:, i].max())]
-                                for i, name in enumerate(names)}
     report["pelvis_travel_m"] = np.ptp(p_wp, axis=0).tolist()
     report["hover"] = {"height_m": args.hover, "approach_s": args.hover_approach}
     return plan, report
@@ -316,10 +312,14 @@ def run(scene, camera_fit, plan, args):
         slots = config["active_indices"]
         arm = {side: [slots[name] for name in fk.arm_joints(side)] for side in fk.SIDES}
         waist_slots = [slots[name] for name in fk.waist_joints()]
-        ff_slots = [slots[name] for name in plan["feedforward_names"]]
-        hand_slots = {side: [slots[name] for name in scene["hand"][side]["targets_open_closed"]] for side in fk.SIDES}
+        ff_names = fk.waist_joints() + fk.arm_joints("left") + fk.arm_joints("right")
+        ff_slots = [slots[name] for name in ff_names]
+        hand_names = {side: list(scene["hand"][side]["targets_open_closed"]) for side in fk.SIDES}
+        hand_slots = {side: [slots[name] for name in hand_names[side]] for side in fk.SIDES}
+        pelvis = (quat_matrix(scene["world"]["pelvis_quat_wxyz"]), np.array(scene["world"]["pelvis_position_m"]))
         targets = np.asarray(world.download_field(nuka.Field.DRIVE_TARGET), np.float32).reshape(-1).copy()
         feed = np.asarray(world.download_field(nuka.Field.JOINT_FEEDFORWARD), np.float32).reshape(-1).copy()
+        velocity = np.asarray(world.download_field(nuka.Field.VELOCITY_TARGET), np.float32).reshape(-1).copy()
         initial = np.asarray(world.download_field(nuka.Field.JOINT_POSITION), np.float32).reshape(-1).copy()
         cloth = config["cloth"]
         nx, ny = cloth["nx"], cloth["ny"]
@@ -335,6 +335,8 @@ def run(scene, camera_fit, plan, args):
                     "dt": args.dt, "sweeps": args.sweeps, "substeps_per_frame": substeps, "settle_steps": settle,
                     "align_window_frames": window, "replayed_frames": frames, "pinch_contact": args.pinch_contact,
                     "open_width_m": args.open_width, "edge_margin_m": args.edge_margin, "press_depth_m": args.press_depth,
+                    "drive_inputs": "spline targets, their rates as velocity targets and the inverse dynamics of the "
+                                    "commanded motion as waist and arm feedforward",
                     "first_step": settle + start * substeps + 1 if start else 1,
                     "resume_checkpoint": None if start == 0 else str(args.resume_checkpoint),
                     "solver_velocity_tolerance_mps": float(tolerance), "ogc_contact_capacity": args.contact_capacity,
@@ -346,7 +348,8 @@ def run(scene, camera_fit, plan, args):
         session = DiagnosticSession(world, output / "session", metadata, chunk_steps=args.chunk_steps,
                                     state_fields=(nuka.Field.ARTICULATION_LINK_POSE, nuka.Field.JOINT_POSITION,
                                                   nuka.Field.JOINT_VELOCITY, nuka.Field.JOINT_LIMIT_IMPULSE,
-                                                  nuka.Field.LINK_CONTACT_WRENCH),
+                                                  nuka.Field.LINK_CONTACT_WRENCH, nuka.Field.JOINT_FEEDFORWARD,
+                                                  nuka.Field.VELOCITY_TARGET),
                                     thresholds=DiagnosticThresholds(velocity_tolerance_mps=float(tolerance)))
         np.savez_compressed(output / "initial.npz", folded=placed, flat_rest=rest, faces=faces,
                             joint_position=initial)
@@ -370,14 +373,32 @@ def run(scene, camera_fit, plan, args):
         buffers, particle_chunks, frame_log = [], [], []
         reason, wall = None, time.perf_counter()
 
-        def set_controls(arm_targets, waist_target, hands, feedforward):
-            for side in fk.SIDES:
-                targets[arm[side]] = arm_targets[side]
-                targets[hand_slots[side]] = hands[side]
-            targets[waist_slots] = waist_target
-            feed[ff_slots] = feedforward
+        def set_controls(q, qd, qdd):
+            """Drive targets ``q`` with velocity targets ``qd``, and the inverse dynamics of the commanded motion
+            as the waist and arm feedforward."""
+            for name, value in q.items():
+                targets[slots[name]] = value
+                velocity[slots[name]] = qd[name]
+            feed[ff_slots] = sim.inverse_dynamics("pelvis", pelvis, q, qd, qdd, ff_names, GRAVITY)
             world.set_drive_targets(np.ascontiguousarray(targets))
+            world.upload_field(nuka.Field.VELOCITY_TARGET, np.ascontiguousarray(velocity))
             world.upload_field(nuka.Field.JOINT_FEEDFORWARD, np.ascontiguousarray(feed))
+
+        def command(k, tau):
+            """Commanded coordinates, rates and accelerations at fraction ``tau`` of recorded frame k."""
+            period = 1.0 / fk.FPS
+            q, qd, qdd = {}, {}, {}
+            splines = [(fk.arm_joints(side), x_run[side][:, :7]) for side in fk.SIDES]
+            splines.append((fk.waist_joints(), plan["waist"]))
+            for names, values in splines:
+                rate, acceleration = catmull_rom_rates(values, k, tau, period)
+                q.update(zip(names, catmull_rom(values, k, tau)))
+                qd.update(zip(names, rate))
+                qdd.update(zip(names, acceleration))
+            for side in fk.SIDES:
+                q.update(zip(hand_names[side], (1 - tau) * h_run[side][k] + tau * h_run[side][k + 1]))
+                qd.update(zip(hand_names[side], (h_run[side][k + 1] - h_run[side][k]) / period))
+            return q, qd, qdd
 
         def advance():
             sample = session.step(controls=targets.copy())
@@ -422,12 +443,21 @@ def run(scene, camera_fit, plan, args):
             checkpoint = world.read_checkpoint(str(args.resume_checkpoint))
             world.restore_checkpoint(checkpoint)
             checkpoint.close()
+        settle_from = dict(zip(fk.waist_joints(), initial[waist_slots]))
+        settle_to = dict(zip(fk.waist_joints(), plan["waist"][0]))
+        for side in fk.SIDES:
+            settle_from.update(zip(fk.arm_joints(side) + hand_names[side],
+                                   np.concatenate([initial[arm[side]], initial[hand_slots[side]]])))
+            settle_to.update(zip(fk.arm_joints(side) + hand_names[side], np.concatenate([first[side], h_run[side][0]])))
         for step in range(0 if start else settle):
-            blend = smoothstep((step + 1) / hold)
-            arm_targets = {side: (1 - blend) * initial[arm[side]] + blend * first[side] for side in fk.SIDES}
-            waist_target = (1 - blend) * initial[waist_slots] + blend * plan["waist"][0]
-            hands = {side: (1 - blend) * initial[hand_slots[side]] + blend * h_run[side][0] for side in fk.SIDES}
-            set_controls(arm_targets, waist_target, hands, plan["feedforward"][0])
+            x = min((step + 1) / hold, 1.0)
+            blend = smoothstep(x)
+            # The smoothstep's rate and acceleration, zero once the blend has finished.
+            rate = 6.0 * x * (1.0 - x) / (hold * args.dt) if x < 1.0 else 0.0
+            acceleration = 6.0 * (1.0 - 2.0 * x) / (hold * args.dt) ** 2 if x < 1.0 else 0.0
+            set_controls({n: (1 - blend) * settle_from[n] + blend * settle_to[n] for n in settle_from},
+                         {n: rate * (settle_to[n] - settle_from[n]) for n in settle_from},
+                         {n: acceleration * (settle_to[n] - settle_from[n]) for n in settle_from})
             reason = advance()
             if reason:
                 break
@@ -465,11 +495,7 @@ def run(scene, camera_fit, plan, args):
                                           "finger_overlap_m": info["finger_overlap_m"]})
                 for m in range(1, substeps + 1):
                     tau = m / substeps
-                    arm_targets = {side: catmull_rom(x_run[side][:, :7], k, tau) for side in fk.SIDES}
-                    waist_target = catmull_rom(plan["waist"], k, tau)
-                    hands = {side: (1 - tau) * h_run[side][k] + tau * h_run[side][k + 1] for side in fk.SIDES}
-                    feedforward = (1 - tau) * plan["feedforward"][k] + tau * plan["feedforward"][k + 1]
-                    set_controls(arm_targets, waist_target, hands, feedforward)
+                    set_controls(*command(k, tau))
                     reason = advance()
                     if reason:
                         break
