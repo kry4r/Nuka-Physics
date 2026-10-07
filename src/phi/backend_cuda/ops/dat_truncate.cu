@@ -1197,7 +1197,7 @@ __global__ void DatBodyReachKernel(DatTruncateParams p, ModelView model, DataVie
 }
 
 // Two links of one articulation travel, relative to their common ancestor, less than the relaxed
-// share of their pair radius, so a pair that detection kept apart cannot meet within the step.
+// share of their pair radius or of their start sphere gap, so a pair kept apart cannot meet.
 __global__ void DatArticPairsKernel(DatTruncateParams p, ModelView model, DataView data) {
     const uint64_t pairs = uint64_t{p.bodies_per_env} * p.bodies_per_env;
     const uint64_t item = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
@@ -1216,6 +1216,12 @@ __global__ void DatArticPairsKernel(DatTruncateParams p, ModelView model, DataVi
         (DatChainSpeed(p, model, data, env, source, frame, nullptr, data.dat_prev_q) +
          DatChainSpeed(p, model, data, env, target, frame, nullptr, data.dat_prev_q));
     if (travel <= p.relaxation * radius) return;
+    // Spheres about the start origins through the farthest vertices bound the pair's start separation.
+    const size_t first = size_t{env} * p.bodies_per_env;
+    const float clear = fmaxf(radius, sqrtf((data.dat_prev_body_pose[first + source].position -
+                                             data.dat_prev_body_pose[first + target].position).LengthSq()) -
+                                          model.mesh_vertex_reach[source] - model.mesh_vertex_reach[target]);
+    if (travel <= p.relaxation * clear) return;
     const DatPointRef ref{source, 0u, false};
     if (!(travel <= FLT_MAX)) {
         atomicOr(data.env_status + env, kEnvStatusDatFailure);
@@ -1226,7 +1232,7 @@ __global__ void DatArticPairsKernel(DatTruncateParams p, ModelView model, DataVi
         DatMinOwnerBeta(p, model, data, env, ref, 0.0f, kDatBoundChain, target);
         return;
     }
-    DatMinOwnerBeta(p, model, data, env, ref, p.relaxation * radius / travel, kDatBoundChain,
+    DatMinOwnerBeta(p, model, data, env, ref, p.relaxation * clear / travel, kDatBoundChain,
                     target);
 }
 
