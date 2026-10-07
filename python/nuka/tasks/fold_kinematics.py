@@ -330,9 +330,10 @@ class PinchRetarget:
     parallel gripper pose. Damped Gauss-Newton on both pad positions, the pinch approach axis against the gripper's,
     the step from a reference, the depth of the hand's proximal hull vertices below a support plane, the depth of
     each distal thumb hull vertex inside the distal index hulls and back, so closing stops where the fingers meet,
-    and each finger's lowest distal point held at its jaw pad's height (no deeper than the target's press below
-    that finger's support), so both tips stay loaded on their supports while the thumb arcs closed; that term fades out as
-    the jaw pad rises one contact band above the support.
+    and each finger's lowest distal point following the jaw pads' centre down to its own press below that finger's
+    support, with the fingers' final height differences kept on the way, so a tip pressed shallower than the other
+    stays clear of its support while the thumb arcs closed; that term fades out as the centre rises one contact
+    band above the highest support.
     The middle, ring and little fingers start tucked at full curl, clear of the support and of the closing thumb. ``contact`` "pad"
     takes the closed pinch's closest pad points, "tip" each distal link's hull vertex farthest from its finger root
     (a tip pinch, whose contact points are the fingers' lowest points on a flat support)."""
@@ -389,8 +390,10 @@ class PinchRetarget:
     def target(self, R, p, width, support, reference, press=0.0, floors=None):
         """Gripper pinch frame (R, p) in ``base``, jaw pad distance, support plane (normal, offset) with
         normal . x >= offset, the reference coordinates, the thumb and index support heights (offsets along the
-        normal, the plane's by default) and how far the fingertips may be driven below them."""
+        normal, the plane's by default) and how far the thumb and index tips are driven below them (one value for
+        both or a pair)."""
         floors = (support[1], support[1]) if floors is None else tuple(floors)
+        press = tuple(np.broadcast_to(np.asarray(press, np.float64), (2,)))
         return R, p, max(width, self.gap), support, np.asarray(reference, np.float64), press, floors
 
     def points(self, x):
@@ -421,12 +424,15 @@ class PinchRetarget:
         return np.concatenate(depths)
 
     def contact(self, distal, pads, normal, floors, press):
-        """Height of each finger's lowest distal point over its jaw pad's height, held no deeper than ``press``
-        below that finger's support, so both tips keep loading their supports while the closing thumb arcs.
-        Each term fades out as its jaw pad rises one contact band above that support."""
-        return np.array([np.clip(1.0 - (pad @ normal - floor) / self.band, 0.0, 1.0) *
-                         ((points @ normal).min() - max(pad @ normal, floor - press))
-                         for points, pad, floor in zip(distal, pads, floors)])
+        """Height of each finger's lowest distal point over its goal: its final depth, ``press`` below its support,
+        lifted by the jaw pads' centre height over the highest final depth, so the tips descend with their final
+        height differences already set and the closing thumb keeps its load. The terms fade out as the centre rises
+        one contact band above the highest support, so both act fully once either tip can touch."""
+        final = [floor - depth for floor, depth in zip(floors, press)]
+        centre = 0.5 * (pads[0] + pads[1]) @ normal
+        weight = np.clip(1.0 - (centre - max(floors)) / self.band, 0.0, 1.0)
+        return np.array([weight * ((points @ normal).min() - (goal + max(0.0, centre - max(final))))
+                         for points, goal in zip(distal, final)])
 
     def residual(self, x, target):
         R, p, width, (normal, offset), reference, press, floors = target
