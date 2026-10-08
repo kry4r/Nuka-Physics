@@ -84,10 +84,10 @@
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4"><img src="docs/media/go2_climb_terrain.gif" width="100%" alt="Go2 robots crossing procedural terrain"></a>
-  <br><b>Go2 Terrain</b>
-  <br>RL locomotion · Procedural terrain
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/go2_climb_terrain.mp4">1080p video</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4"><img src="docs/media/microduck_ball_dynamic_lab.gif" width="100%" alt="Microduck taking alternating steps while balancing on a freely rolling ball in Nuka Dynamics Lab"></a>
+  <br><b>Microduck Ball Balance</b>
+  <br>Newton-trained RL · Nuka physics
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4"><img src="docs/media/robot_elastoplastic.gif" width="100%" alt="A dynamically driven Panda gripper loading and releasing an MLS-MPM elastoplastic specimen"></a>
@@ -98,7 +98,7 @@
 </tr>
 </table>
 
-Material demos load the shared [Nuka Dynamics Lab assets](docs/nuka-stage.md), with a layered experiment deck, warm grey panels and avocado green accents. Layouts, materials, lights and cameras are editable in NKS. Existing gallery recordings retain their recorded environment and physics.
+Material demos load the shared [Nuka Dynamics Lab assets](docs/nuka-stage.md), with a layered experiment deck, warm grey panels and avocado green accents. Layouts, materials, lights and cameras are editable in NKS. Existing gallery recordings retain their recorded environment and physics. The Microduck clip replays recorded Nuka physics with a Newton-trained balancing policy on a freely moving ball.
 
 ## Why Nuka
 
