@@ -1,32 +1,6 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// PHI v2 — op schema: the closed enumeration of physics ops the backend layer
-// dispatches, plus one POD `<Op>Params` struct per op.
-//
-// ggml/llama.cpp analogy: NkOp is the GGML_OP enum; each <Op>Params is the
-// op-specific parameter block that travels with an OpCall (phi/backend.hpp).
-//
-// CONTRACT (, frozen plan spec):
-// * NkOp has exactly 30 named ops + a trailing `Count` sentinel. (
-// appended StepBackward, the diffsim contact-free single-step adjoint; 
-// Appended ParticleParticleContact, the cross-system
-// particle-particle non-penetration co-step. Optional RL initial-condition randomization appended
-// ReadoutUnionContactObs, the union-only per-env contact observation
-// readout — strictly ADDITIVE, emitted ONLY for the UnionCsr family. 
-// appended ApplyImplicitDamping, the standalone backward-Euler joint
-// viscous-damping velocity correction extracted from the deleted FUSED
-// contact solve — strictly ADDITIVE, emitted ONLY when fold_drive_damping.)
-// * Every op gets a trivially-copyable aggregate `<Op>Params`. Two are
-// spec-fixed (SolveRowsBlockIslandParams, NarrowphaseSdfParams); the rest
-// carry a minimal plausible field set where obvious, or a reserved POD
-// otherwise. They are fleshed out when each op is actually implemented
-// (-). DO NOT depend on any field below being final outside .
-// * Pure C++ — ZERO CUDA types. The op *implementations* (+) live in the
-// backend and receive `const void* params` re-cast to the matching POD.
-//
-// This header is included by both host (.cpp) and device (.cu) TUs, so it must
-// stay free of STL containers and of anything not trivially copyable.
-// ---------------------------------------------------------------------------
+// Closed physics operators and their trivially copyable parameter blocks.
+// Operator numbering and resource contracts share one backend-independent catalog.
 
 #include <cstdint>
 #include "collision/mesh_surface_types.hpp"
@@ -84,133 +58,10 @@ inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
 // and the enum can be stored in compact tables.
 // ---------------------------------------------------------------------------
 enum class NkOp : uint16_t {
-    // --- articulated-body dynamics --------------------------------------
-    ApplyDrives,           // PD / motor drives -> generalized forces
-    ApplyDynamicsDrives,   // computed-torque and task control from free ABA + M^-1
-    AbaForward,            // Featherstone ABA forward dynamics (q,qd -> qdd)
-    IntegrateVelocity,     // qd += qdd * dt
-    FkWorldPoses,          // forward kinematics -> per-link world poses
-    IntegratePosition,     // q += qd * dt
-    CrbaComputeM,          // composite rigid-body M (joint-space inertia)
-    CrbaFactorM,           // LTDL / Cholesky factorization of M
-    ApplyImplicitDamping,  // standalone backward-Euler joint viscous-damping
-                           // velocity correction qdot -= dt*(M+dt*C)^-1*(C*qdot).
-                           // General articulation physics that USED to ride
-                           // inside the deleted FUSED contact solve kernel; now a
-                           // standalone op gated on fold_drive_damping (so the
-                           // damping survives the FUSED-path deletion). Reads the
-                           // factored (M+dt*C)^-1 = data.m_inv (must run AFTER
-                           // CrbaFactorM) and the per-DOF c_j = data.drive_damping.
-
-    // --- broadphase / spatial acceleration ------------------------------
-    BuildAabbs,            // per-collidable world-space AABB build
-    LbvhBuild,             // Karras LBVH build over the AABB set
-    LbvhQueryPairs,        // overlap query -> candidate pair stream
-    ParticleGridBuild,     // uniform spatial hash grid for particles
-
-    // --- narrowphase / contact rows -------------------------------------
-    NarrowphasePrimitives, // analytic primitive x primitive narrowphase
-    NarrowphaseSdf,        // SDF / mesh narrowphase
-    ContactTangentBasis,   // per-contact tangent frame
-    AssembleRows,          // constraint-row assembly (J, bounds, bias)
-    SolveRowsBlockIsland,  // block-island PGS/row solve
-
-    // --- particle (XPBD / PBF) substep ----------------------------------
-    ParticleAeroDrag,      // cloth anisotropic air-drag velocity impulse (pre-predict)
-    ParticlePredict,       // predict x* = x + v*dt + g
-    XpbdProject,           // XPBD constraint projection sweep
-    PbfDensityLambda,      // PBF density constraint lambda
-    PbfApplyDelta,         // PBF position delta apply
-    ParticleFinalize,      // v = (x* - x)/dt; commit x
-
-    // MLS-MPM grid state remains available between prediction and commit.
-    MpmPredict,            // P2G, stress and external-force grid prediction.
-    MpmExchange,           // Grid boundary impulse and endpoint reaction.
-    MpmCommit,             // G2P, particle advection and material history.
-
-    // --- readout / RL substrate -----------------------------------------
-    ReadoutContactWrench,  // per-link contact wrench readout
-    ExportObs,             // whole-body observation export
-    ResetEnvs,             // per-env reset to initial state
-    SnapshotState,         // capture full world state
-    RestoreState,          // restore from a snapshot
-    // ReadoutUnionContactObs (union-only per-env contact obs) was DELETED.
-    // Removing the enum value is safe — NkOp ids are runtime-only dispatch, never
-    // serialized (goldens byte-exact across the enum shifts).
-
-    // --- domain randomization -------------------------------------------
-    RandomizeMaterialBuckets, // per-env material bucket randomization
-    RandomizeBodyParams,      // per-env body/inertia randomization
-
-    // --- differentiable rollout ---------------------------------
-    StepBackward,          // diffsim contact-free single-step reverse adjoint
-
-    // --- cross-system particle contact (Cross-system) -----------------
-    ParticleParticleContact, // class-blind unilateral non-penetration co-step
-
-    // --- general contact pipeline (B2) --------------------------
-    SyncLinkBodyPose,      // copy each articulation link's FK world pose into its
-                           // owning body_pose row (composing link_geom_local) so
-                           // artic links enter the LBVH as collidables. Gated to
-                           // the PairDriven family (early-exit otherwise), so the
-                           // UnionCsr graph is byte-untouched.
-
-    // --- body/artic <-> particle contact --------------------------------
-    NarrowphaseBodyParticle, // body/artic <-> soft/fluid particle narrowphase: one
-                            // thread per (env x particle) traverses the env LBVH for
-                            // overlapping collidables, treats the particle as a sphere
-                            // of its radius, and writes the sphere-vs-shape manifold
-                            // into the particle's RESERVED contact-slot sub-range with
-                            // the particle-side index-kind tag + global particle id.
-                            // Runs AFTER the rigid narrowphase + BEFORE AssembleRows;
-                            // PairDriven-family-gated (early-exit otherwise).
-
-    // --- general contact pipeline (H3) --------------------------
-    NarrowphaseHeightfield, // per-cell heightfield midphase: for each broadphase
-                            // (convex, heightfield) candidate pair, walk the
-                            // overlapped grid cells, emit 2 TRIANGLE_PRISM
-                            // colliders/cell, route each through the EXISTING cvx
-                            // GJK/EPA, and write the manifolds into the unified
-                            // ucontact_* buffer (side a = convex, side b = the
-                            // static heightfield). APPENDED after SyncLinkBodyPose
-                            // (stable prior NkOp values). PairDriven-family-gated
-                            // (early-exit for UnionCsr).
-
-    // --- dynamic solve islanding --------------------------------------
-    BuildSolveIslands,      // per-step connected-components over the ACTIVE contact
-                            // rows -> one island per independent component, emitted
-                            // as the dynamic schedule SolveRowsBlockIsland reads.
-                            // Runs AFTER AssembleRows + BEFORE SolveRowsBlockIsland;
-                            // PairDriven-family-gated. APPENDED after the prior ops
-                            // (stable NkOp values; execution order is the pipeline's,
-                            // not the enum value).
-    ContactWarmStart,       // ContactId-indexed warm-start prepare/commit.
-    SnapshotStepVelocity,   // Capture the contact acceleration reference before forces.
-    ParticleProjectionVelocity, // Publish projected particle velocities before contact solving.
-    ParticleContactDelta,   // Apply only the new contact impulse to particle working positions.
-    AccumulateStep,         // Aggregate impulses and diagnostics across physical intervals.
-    FkLinkVelocities,       // Refresh link spatial velocities from current generalized state.
-
-    ReadoutDrives,         // actual bounded effort from the common velocity solve
-    RefitParticleSurfaces,
-    SampleObservation,
-    ResetObservation,
-    ReadoutMotion,
-    SampleStateSensor,
-    AdvanceSensorTime,
-    ReadoutSensorWrenches,
-    ReadoutContactRegion,
-    ClothPredict,           // Vertex-block inertial target, initial guess and frozen row response.
-    ClothFinalize,          // Vertex-block velocity from the committed displacement; history advance.
-    OgcDetect,
-    DatTruncate,
-    DatSnapshot,
-    ReadoutEnergyLedger,
-    ReadoutContactAudit,
-    MimicReduce,            // Mass and step velocity over the DOFs the mimic couplings leave free.
-    BlockDescentSolve,
-
-    Count                    // sentinel: number of ops (NOT an op)
+#define NUKA_OP(name, read, write) name,
+#include "phi/op_catalog.inc"
+#undef NUKA_OP
+    Count
 };
 
 // ---------------------------------------------------------------------------
