@@ -17,11 +17,13 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/array.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -46,6 +48,7 @@ int cudaDeviceSynchronize(void);
 namespace {
 constexpr int kCudaMemcpyHostToDevice = 1;
 constexpr int kCudaMemcpyDeviceToDevice = 3;
+constexpr uintptr_t kCudaLegacyStreamHandle = 1u;
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -90,12 +93,14 @@ using Uint32Array = nb::ndarray<nb::pytorch, uint32_t>;
 // ---------------------------------------------------------------------------
 class Device {
 public:
-    // A nonzero stream_ptr is borrowed for the device's lifetime.
-    // Zero gives the backend an owned execution stream.
-    static Device* create(uint32_t ordinal, uintptr_t stream_ptr) {
+    // Omitted streams are owned; explicit streams are borrowed.
+    // CUDA's legacy token denotes an explicitly supplied zero stream.
+    static Device* create(uint32_t ordinal, std::optional<uintptr_t> stream_ptr) {
         nuka_device_desc_t desc{};
         desc.gpu_index = ordinal;
-        desc.cuda_stream = reinterpret_cast<void*>(stream_ptr);
+        if (stream_ptr.has_value())
+            desc.cuda_stream = reinterpret_cast<void*>(
+                *stream_ptr == 0u ? kCudaLegacyStreamHandle : *stream_ptr);
         desc.backend_selection_layer_enabled = 1u;
         nuka_device_handle h = nullptr;
         check(nuka_device_create(&desc, &h), "nuka_device_create");
@@ -2138,13 +2143,13 @@ NB_MODULE(_nuka_ext, m) {
     nb::class_<Device>(m, "Device")
         .def("resource_info", &Device::resource_info)
         .def_static("create", &Device::create, nb::arg("ordinal") = 0,
-                    nb::arg("stream_ptr") = uintptr_t{0},
+                    nb::arg("stream_ptr") = nb::none(),
                     nb::rv_policy::take_ownership,
                     "Create a CUDA device handle for the given ordinal. "
-                    "stream_ptr (uintptr_t, default 0): when non-zero it is the "
-                    "caller-supplied cudaStream_t the engine runs on (e.g. "
-                    "torch.cuda.current_stream().cuda_stream); 0 lets the engine "
-                    "own a default stream. Device.create(0) is unchanged.")
+                    "stream_ptr (uintptr_t or None): an explicit value is borrowed, "
+                    "including zero for the legacy default stream. None gives the "
+                    "engine an owned stream. Use nuka.torch_stream_ptr() to share "
+                    "the current torch stream.")
         .def("close", &Device::close, "Destroy the device handle.")
         .def("__enter__", [](Device& d) -> Device& { return d; }, nb::rv_policy::reference)
         .def("__exit__",
