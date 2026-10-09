@@ -511,32 +511,37 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
 // Particle systems have no collidable profile row, so they use the canonical
 // model defaults with only their authored per-system isotropic friction replaced.
 
-// Row damping is overwritten; each environment retains the finished assembly's extent.
-__global__ void BeginPairDrivenRowsKernel(uint32_t env_count, uint32_t rows_per_env,
-                                          float* __restrict__ row_damping,
-                                          uint32_t* __restrict__ row_count,
-                                          uint32_t* __restrict__ extent) {
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    if (item < env_count * rows_per_env) row_damping[item] = 0.0f;
-    if (item >= env_count) return;
-    const uint32_t env = item;
-    row_count[env] = 0u;
-    if (extent == nullptr) return;
-    extent[2u * env] = extent[2u * env + 1u];
-    extent[2u * env + 1u] = 1u;
-}
-
-// One thread per footprint row below the bound: clears rows the last assembly may have filled.
-// Clear flags are left untouched so empty 128-byte rows avoid partial-sector writes.
-__global__ void BuildContactRowRangesKernel(
+// Each environment assigns contact ranges and initializes the rows it owns.
+__global__ void InitializePairDrivenRowsKernel(
     const uint32_t* counts, uint32_t slot_count, uint32_t rigid_slots,
-    uint32_t rigid_rows, uint32_t rows_per_env, uint32_t* ranges) {
+    uint32_t rigid_rows, uint32_t rows_per_env, uint32_t contact_rows, uint32_t* ranges,
+    uint32_t* row_count, uint32_t* extent, NkRow* urows, float* lambda,
+    uint32_t* row_cj_link, uint32_t* row_cj_link_b,
+    float* row_penetration, float* row_damping, uint64_t* contact_material) {
     using Scan = cub::BlockScan<uint32_t, kContactRowsBlock>;
     __shared__ typename Scan::TempStorage scratch;
     __shared__ uint32_t carry;
     const uint32_t env = blockIdx.x;
-    if (threadIdx.x == 0u) carry = 0u;
+    if (threadIdx.x == 0u) {
+        carry = 0u;
+        row_count[env] = 0u;
+        if (extent != nullptr) {
+            extent[2u * env] = extent[2u * env + 1u];
+            extent[2u * env + 1u] = 1u;
+        }
+    }
     __syncthreads();
+    const uint32_t bound = ContactRowBound(extent, env, contact_rows);
+    for (uint32_t local = threadIdx.x; local < rows_per_env; local += blockDim.x) {
+        const uint32_t row = env * rows_per_env + local;
+        row_damping[row] = 0.0f;
+        if (local >= bound) continue;
+        lambda[row] = 0.0f;
+        row_penetration[row] = 0.0f;
+        row_cj_link[row] = kInvalidLink;
+        row_cj_link_b[row] = kInvalidLink;
+        if (urows[row].flags != 0u) urows[row].flags = 0u;
+    }
     for (uint32_t tile = 0u; tile < rigid_slots; tile += blockDim.x) {
         const uint32_t slot = tile + threadIdx.x;
         const uint32_t points = slot < rigid_slots ? counts[env * slot_count + slot] : 0u;
@@ -547,6 +552,7 @@ __global__ void BuildContactRowRangesKernel(
             const size_t index = size_t{env * slot_count + slot} * 2u;
             ranges[index] = first;
             ranges[index + 1u] = points;
+            if (first - env * rows_per_env < bound) contact_material[env * slot_count + slot] = 0u;
         }
         __syncthreads();
         if (threadIdx.x + 1u == blockDim.x) carry += prefix + points;
@@ -554,40 +560,11 @@ __global__ void BuildContactRowRangesKernel(
     }
     for (uint32_t slot = rigid_slots + threadIdx.x; slot < slot_count; slot += blockDim.x) {
         const size_t index = size_t{env * slot_count + slot} * 2u;
-        ranges[index] = env * rows_per_env + rigid_rows +
+        const uint32_t first = env * rows_per_env + rigid_rows +
             (slot - rigid_slots) * nk::kPairDrivenParticleRowsPerSlot;
+        ranges[index] = first;
         ranges[index + 1u] = nk::kPairDrivenParticlePtsPerSlot;
-    }
-}
-
-__global__ void ClearPairDrivenRowsKernel(
-    uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env, uint32_t contact_rows,
-    const uint32_t* __restrict__ row_ranges,
-    const uint32_t* __restrict__ extent,
-    NkRow* __restrict__ urows, float* __restrict__ lambda,
-    uint32_t* __restrict__ row_cj_link, uint32_t* __restrict__ row_cj_link_b,
-    float* __restrict__ row_penetration, float* __restrict__ row_damping,
-    uint64_t* __restrict__ contact_material) {
-    const uint32_t footprint = contact_rows;
-    const uint32_t stride = gridDim.x * blockDim.x;
-    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * footprint;
-         item += stride) {
-        const uint32_t env = item / footprint;
-        const uint32_t local = item - env * footprint;
-        if (local >= ContactRowBound(extent, env, footprint)) continue;
-        const uint32_t row = env * rows_per_env + local;
-        lambda[row] = 0.0f;
-        row_penetration[row] = 0.0f;
-        row_damping[row] = 0.0f;
-        row_cj_link[row] = kInvalidLink;
-        row_cj_link_b[row] = kInvalidLink;
-        if (urows[row].flags != 0u) urows[row].flags = 0u;
-    }
-    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * slot_count;
-         item += stride) {
-        const uint32_t env = item / slot_count;
-        const uint32_t first = nkops::ContactRowRangeFor(row_ranges, item).first - env * rows_per_env;
-        if (first < ContactRowBound(extent, env, footprint)) contact_material[item] = 0u;
+        if (first - env * rows_per_env < bound) contact_material[env * slot_count + slot] = 0u;
     }
 }
 
@@ -656,7 +633,7 @@ __global__ void EmitPairDrivenRowsKernel(
             atomicMax(contact_row_extent + 2u * env + 1u,
                       base - env * rows_per_env + (1u + kPdTangentRows) * points_per_slot + 1u);
     }
-    // An empty slot keeps the rows ClearPairDrivenRowsKernel cleared.
+    // Empty slots retain their initialized rows.
     if (n_active == 0u) return;
     const uint32_t law = ucontact_law != nullptr ? ucontact_law[gid] : nk::kContactLawCompliant;
     const bool speculative = law == nk::kContactLawSpeculative;
@@ -885,8 +862,8 @@ __global__ void EmitPairDrivenRowsKernel(
 
 // Stable per-link lower/upper slots appended after the contact footprint.
 // A scalar joint bound is a one-sided row with J = +/-e_joint.
-__global__ void EmitJointLimitRowsKernel(
-    ArticulationDeviceState state,
+__device__ void EmitJointLimitRows(
+    uint32_t link, const ArticulationDeviceState& state,
     const float* __restrict__ lower_limits,
     const float* __restrict__ upper_limits,
     const uint8_t* __restrict__ limit_flags,
@@ -902,8 +879,6 @@ __global__ void EmitJointLimitRowsKernel(
     float* __restrict__ row_penetration,
     float* __restrict__ row_damping,
     uint32_t* __restrict__ row_count) {
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) return;
     const uint32_t env = link / base_link_count;
     if (env >= env_count) return;
     const uint32_t local_link = link - env * base_link_count;
@@ -960,8 +935,8 @@ __global__ void EmitJointLimitRowsKernel(
 
 // Joint dry friction is a bounded impulse in the shared coupled velocity solve.
 // Its Jacobian is e_joint, with no geometric position correction.
-__global__ void EmitJointFrictionRowsKernel(
-    ArticulationDeviceState state, float dt,
+__device__ void EmitJointFrictionRows(
+    uint32_t link, const ArticulationDeviceState& state, float dt,
     uint32_t base_link_count, uint32_t rows_per_env,
     uint32_t first_row_per_env, uint32_t dof_stride,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
@@ -969,8 +944,6 @@ __global__ void EmitJointFrictionRowsKernel(
     uint32_t* __restrict__ row_cj_link, uint32_t* __restrict__ row_cj_link_b,
     float* __restrict__ row_penetration, float* __restrict__ row_damping,
     uint32_t* __restrict__ row_count) {
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) return;
     const uint32_t env = link / base_link_count;
     const uint32_t local_link = link - env * base_link_count;
     const uint32_t rs = env * rows_per_env + first_row_per_env + local_link;
@@ -1003,15 +976,13 @@ __global__ void EmitJointFrictionRowsKernel(
 
 // An actuator's bounded effort is a fixed impulse with J = e_joint; its implicit
 // dissipation is folded into the articulation mass instead.
-__global__ void EmitJointDriveRowsKernel(
-    ArticulationDeviceState state, float dt, uint32_t base_link_count,
+__device__ void EmitJointDriveRows(
+    uint32_t link, const ArticulationDeviceState& state, float dt, uint32_t base_link_count,
     uint32_t rows_per_env, uint32_t first_row, uint32_t dof_stride,
     const float* command, const float* lower, const float* upper,
     NkRow* urows, float* lambda, float* chain_jacobian,
     uint32_t* row_cj_link, uint32_t* row_cj_link_b,
     float* row_penetration, float* row_damping, uint32_t* row_count) {
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) return;
     const uint32_t env = link / base_link_count;
     const uint32_t local = link - env * base_link_count;
     const uint32_t slot = env * rows_per_env + first_row + local;
@@ -1037,6 +1008,32 @@ __global__ void EmitJointDriveRowsKernel(
         atomicAdd(row_count + env, 1u);
     }
     urows[slot] = row;
+}
+
+__global__ void EmitJointRowsKernel(
+    ArticulationDeviceState state, AssembleRowsParams p,
+    const float* lower_limits, const float* upper_limits, const uint8_t* limit_flags,
+    DataView data) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) return;
+    auto* const urows = reinterpret_cast<NkRow*>(data.urows);
+    if (p.joint_limit_rows_per_env >= p.base_link_count * 2u)
+        EmitJointLimitRows(link, state, lower_limits, upper_limits, limit_flags,
+            p.dt, p.baumgarte_max_velocity, p.position_pass != 0u, p.env_count,
+            p.base_link_count, p.rows_per_env, p.contact_rows_per_env, p.max_dof,
+            urows, data.lambda, data.chain_jacobian, data.row_cj_link,
+            data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+    if (p.joint_friction_rows_per_env >= p.base_link_count && p.base_link_count > 0u)
+        EmitJointFrictionRows(link, state, p.dt, p.base_link_count, p.rows_per_env,
+            p.contact_rows_per_env + p.joint_limit_rows_per_env, p.max_dof,
+            urows, data.lambda, data.chain_jacobian, data.row_cj_link,
+            data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+    if (p.joint_drive_rows_per_env >= p.base_link_count && p.base_link_count > 0u)
+        EmitJointDriveRows(link, state, p.dt, p.base_link_count, p.rows_per_env,
+            p.contact_rows_per_env + p.joint_limit_rows_per_env + p.joint_friction_rows_per_env,
+            p.max_dof, data.drive_command, data.drive_lower, data.drive_upper,
+            urows, data.lambda, data.chain_jacobian, data.row_cj_link,
+            data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
 }
 
 // A particle constraint C(x) is a compliant row J v + (alpha / h^2) lambda = J v* - C(x*) / h,
@@ -1449,44 +1446,6 @@ __global__ void PrepareContactWarmStartKernel(
     }
 }
 
-// Each env's compacted sources list its live current points, then its live cache points.
-__global__ void CountContactWarmStartsKernel(
-    const math::Vec3* __restrict__ current_normal,
-    const math::Vec3* __restrict__ cache_normal,
-    const uint32_t* __restrict__ matches,
-    const uint32_t* __restrict__ order,
-    const uint32_t* __restrict__ begins,
-    const uint32_t* __restrict__ ends,
-    uint32_t point_count, uint32_t blocks_per_env, uint32_t* __restrict__ counts) {
-    const uint32_t env = blockIdx.x / blocks_per_env;
-    const uint32_t part = blockIdx.x % blocks_per_env;
-    __shared__ uint32_t live[128];
-    __shared__ uint32_t warm[128];
-    uint32_t current = 0u, matched = 0u;
-    for (uint32_t entry = begins[env] + part * blockDim.x + threadIdx.x; entry < ends[env];
-         entry += blocks_per_env * blockDim.x) {
-        const uint32_t point = order[entry];
-        if (point >= point_count) continue;
-        ++current;
-        const uint32_t old = matches[point];
-        matched += old != ~0u && current_normal[point].Dot(cache_normal[old]) > 0.25f;
-    }
-    live[threadIdx.x] = current;
-    warm[threadIdx.x] = matched;
-    __syncthreads();
-    for (uint32_t half = blockDim.x / 2u; half > 0u; half /= 2u) {
-        if (threadIdx.x < half) {
-            live[threadIdx.x] += live[threadIdx.x + half];
-            warm[threadIdx.x] += warm[threadIdx.x + half];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0u) {
-        atomicAdd(counts + env * 2u, live[0]);
-        atomicAdd(counts + env * 2u + 1u, warm[0]);
-    }
-}
-
 __device__ void ClearContactCachePoint(
     uint32_t point_index, uint64_t* cache_pair, uint64_t* cache_feature,
     float* cache_lambda, math::Vec3* cache_normal,
@@ -1646,13 +1605,6 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         const auto status = contact_cache::BuildIndex(data, point_count, p->slot_count * nk::kPairDrivenPtsPerSlot,
                                                      p->decay_steps, workspace, stream);
         if (status != cudaSuccess) return Status::Failed;
-        const uint32_t count_needed =
-            (p->slot_count * nk::kPairDrivenPtsPerSlot + kBlock - 1u) / kBlock;
-        const uint32_t count_blocks = count_needed < 256u ? count_needed : 256u;
-        LaunchCuda(CountContactWarmStartsKernel, dim3(p->env_count * count_blocks), dim3(kBlock), 0u,
-                   stream, data.ucontact_normal, data.contact_cache_normal, workspace.matches,
-                   workspace.order, workspace.begins, workspace.ends, point_count,
-                   count_blocks, data.contact_warm_start_counts);
         const uint32_t env_blocks = contact_cache::EnvBlocks(
             p->slot_count * nk::kPairDrivenPtsPerSlot * 2u, p->env_count);
         LaunchCuda(PrepareContactWarmStartKernel, dim3(p->env_count * env_blocks), dim3(kBlock), 0u,
@@ -1743,9 +1695,15 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     }
     constexpr uint32_t kBlockSize = kContactRowsBlock;
     const uint32_t total_rows = p->env_count * p->rows_per_env;
-    LaunchCuda(BeginPairDrivenRowsKernel, dim3((total_rows + kBlockSize - 1u) / kBlockSize),
-               dim3(kBlockSize), 0u, stream, p->env_count, p->rows_per_env, data.row_damping,
-               data.row_count, data.contact_row_extent);
+    const uint32_t full_slots = std::min(p->full_row_slot_count, p->union_slot_count);
+    const uint32_t rigid_rows = p->contact_rows_per_env -
+        (p->union_slot_count - full_slots) * nk::kPairDrivenParticleRowsPerSlot;
+    LaunchCuda(InitializePairDrivenRowsKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream,
+               data.ucontact_count, p->union_slot_count, full_slots, rigid_rows,
+               p->rows_per_env, p->contact_rows_per_env, data.ucontact_row_range,
+               data.row_count, data.contact_row_extent, reinterpret_cast<NkRow*>(data.urows),
+               data.lambda, data.row_cj_link, data.row_cj_link_b, data.row_penetration,
+               data.row_damping, data.contact_material);
     const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;
     const uint32_t artics_per_env =
         (p->articulation_count > 0u && p->env_count > 0u)
@@ -1765,20 +1723,6 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     if (p->union_slot_count > 0u) {
         const uint32_t total = p->env_count * p->union_slot_count;
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
-        const uint32_t full_slots = std::min(p->full_row_slot_count, p->union_slot_count);
-        const uint32_t rigid_rows = p->contact_rows_per_env -
-            (p->union_slot_count - full_slots) * nk::kPairDrivenParticleRowsPerSlot;
-        LaunchCuda(BuildContactRowRangesKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream,
-                   data.ucontact_count, p->union_slot_count, full_slots, rigid_rows,
-                   p->rows_per_env, data.ucontact_row_range);
-        const uint32_t clear_rows = p->env_count * p->contact_rows_per_env;
-        const uint32_t clear_blocks = (std::max(clear_rows, total) + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ClearPairDrivenRowsKernel, dim3(clear_blocks), dim3(kBlockSize), 0u, stream,
-                   p->env_count, p->union_slot_count, p->rows_per_env, p->contact_rows_per_env,
-                   data.ucontact_row_range, data.contact_row_extent,
-                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
-                   data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping,
-                   data.contact_material);
         LaunchCuda(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    static_cast<const uint32_t*>(data.ucontact_count), data.ucontact_row_range,
                    static_cast<const math::Vec3*>(data.ucontact_point),
@@ -1818,46 +1762,14 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    data.contact_row_extent);
     }
 
-    if (has_artic &&
-        p->joint_limit_rows_per_env >= p->base_link_count * 2u) {
-        const ArticulationDeviceState state = MakeArticulationDeviceState(
-            model, data, p->total_link_count, p->articulation_count);
-        const uint32_t limit_blocks =
-            (p->total_link_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitJointLimitRowsKernel, dim3(limit_blocks), dim3(kBlockSize),
-                   0u, stream, state, model.joint_limit_lower,
-                   model.joint_limit_upper, model.joint_limit_flags,
-                   p->dt, p->baumgarte_max_velocity, p->position_pass != 0u, p->env_count,
-                   p->base_link_count, p->rows_per_env,
-                   p->contact_rows_per_env, p->max_dof,
-                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
-                   data.chain_jacobian, data.row_cj_link,
-                   data.row_cj_link_b, data.row_penetration, data.row_damping,
-                   data.row_count);
-    }
-
-    if (has_artic && p->joint_friction_rows_per_env >= p->base_link_count &&
-        p->base_link_count > 0u) {
-        const ArticulationDeviceState state = MakeArticulationDeviceState(
-            model, data, p->total_link_count, p->articulation_count);
-        const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitJointFrictionRowsKernel, dim3(blocks), dim3(kBlockSize),
-                   0u, stream, state, p->dt, p->base_link_count, p->rows_per_env,
-                   p->contact_rows_per_env + p->joint_limit_rows_per_env, p->max_dof,
-                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
-                   data.chain_jacobian, data.row_cj_link, data.row_cj_link_b,
-                   data.row_penetration, data.row_damping, data.row_count);
-    }
-
-    if (has_artic && p->joint_drive_rows_per_env >= p->base_link_count && p->base_link_count > 0u) {
+    if (has_artic && (p->joint_limit_rows_per_env >= p->base_link_count * 2u ||
+        (p->base_link_count > 0u && (p->joint_friction_rows_per_env >= p->base_link_count ||
+                                    p->joint_drive_rows_per_env >= p->base_link_count)))) {
         const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
         const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitJointDriveRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   state, p->dt, p->base_link_count, p->rows_per_env,
-                   p->contact_rows_per_env + p->joint_limit_rows_per_env + p->joint_friction_rows_per_env,
-                   p->max_dof, data.drive_command, data.drive_lower, data.drive_upper,
-                   reinterpret_cast<NkRow*>(data.urows), data.lambda, data.chain_jacobian,
-                   data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
+        LaunchCuda(EmitJointRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+                   state, *p, model.joint_limit_lower, model.joint_limit_upper,
+                   model.joint_limit_flags, data);
     }
 
     const uint32_t constraints = p->dist_cons_per_env + p->vol_cons_per_env;

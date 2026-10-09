@@ -245,18 +245,23 @@ static __global__ void ResolveEntriesKernel(KeySource keys, const uint32_t* orde
                                             uint32_t env_blocks, uint64_t stride,
                                             const uint32_t* first, const uint32_t* warm,
                                             const uint32_t* slots, uint32_t* matches,
-                                            uint32_t* owner, uint32_t* keep, uint32_t* extent) {
+                                            uint32_t* owner, uint32_t* keep, uint32_t* extent,
+                                            const math::Vec3* current_normal,
+                                            const math::Vec3* cache_normal, uint32_t* counts) {
     const uint32_t env = blockIdx.x / env_blocks;
     const uint32_t part = blockIdx.x - env * env_blocks;
     const uint32_t end = ends[env];
-    uint32_t owned = 0u;
+    uint32_t owned = 0u, current = 0u, matched = 0u;
     for (uint32_t entry = begins[env] + part * blockDim.x + threadIdx.x; entry < end;
          entry += env_blocks * blockDim.x) {
         const uint32_t id = order[entry];
         const uint64_t slot = env * stride + slots[entry];
         const bool head = first[slot] == entry;
         if (id < keys.points) {
-            matches[id] = head ? warm[slot] : ~0u;
+            const uint32_t old = head ? warm[slot] : ~0u;
+            matches[id] = old;
+            ++current;
+            matched += old != ~0u && current_normal[id].Dot(cache_normal[old]) > 0.25f;
             if (head) {
                 owner[id] = 1u;
                 owned = max(owned, id - env * keys.points_per_env + 1u);
@@ -266,6 +271,12 @@ static __global__ void ResolveEntriesKernel(KeySource keys, const uint32_t* orde
         }
     }
     owned = __reduce_max_sync(0xffffffffu, owned);
+    current = __reduce_add_sync(0xffffffffu, current);
+    matched = __reduce_add_sync(0xffffffffu, matched);
+    if ((threadIdx.x & 31u) == 0u) {
+        atomicAdd(counts + 2u * env, current);
+        atomicAdd(counts + 2u * env + 1u, matched);
+    }
     if (extent != nullptr && owned != 0u && (threadIdx.x & 31u) == 0u) atomicMax(extent + 2u * env + 1u, owned);
 }
 
@@ -297,7 +308,8 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
     ResolveEntriesKernel<<<envs * env_blocks, block, 0u, stream>>>(keys, workspace.order,
         workspace.begins, workspace.ends, data.contact_cache_age, decay_steps, env_blocks, stride,
         workspace.first, workspace.warm, workspace.slots, workspace.matches,
-        data.contact_cache_current_owner, data.contact_cache_old_keep, data.contact_cache_extent);
+        data.contact_cache_current_owner, data.contact_cache_old_keep, data.contact_cache_extent,
+        data.ucontact_normal, data.contact_cache_normal, data.contact_warm_start_counts);
     return cudaGetLastError();
 }
 

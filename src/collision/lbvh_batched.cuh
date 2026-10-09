@@ -140,7 +140,10 @@ template <typename Src>
 __global__ void EnvInitNodesKernel(Src src,
                                    const uint32_t* __restrict__ sorted_index,
                                    uint32_t leaves_per_env,
-                                   LbvhNode* __restrict__ nodes) {
+                                   LbvhNode* __restrict__ nodes,
+                                   const uint64_t* __restrict__ sorted_keys,
+                                   uint32_t* __restrict__ morton,
+                                   uint32_t* __restrict__ visit) {
     const uint32_t env = blockIdx.y;
     const uint32_t N = leaves_per_env;
     const uint32_t node_count = 2u * N - 1u;
@@ -149,6 +152,10 @@ __global__ void EnvInitNodesKernel(Src src,
     if (idx >= node_count) return;
     const uint32_t nbase = env * node_count;
     const uint32_t bbase = env * N;
+    if (N > 1u && idx < N) {
+        morton[bbase + idx] = static_cast<uint32_t>(sorted_keys[bbase + idx]);
+        visit[bbase + idx] = 0u;
+    }
     if (idx < internal) {
         nodes[nbase + idx].parent = -1;
         return;
@@ -238,7 +245,8 @@ static __global__ void EnvPropagateKernel(uint32_t leaves_per_env,
 template <typename Src>
 __global__ void EnvRefitLeavesKernel(Src src,
                                      uint32_t leaves_per_env,
-                                     LbvhNode* __restrict__ nodes) {
+                                     LbvhNode* __restrict__ nodes,
+                                     uint32_t* __restrict__ visit) {
     const uint32_t env = blockIdx.y;
     const uint32_t N = leaves_per_env;
     const uint32_t internal = N - 1u;
@@ -249,17 +257,7 @@ __global__ void EnvRefitLeavesKernel(Src src,
     const uint32_t node_idx = nbase + internal + lane;
     const int32_t local_leaf = nodes[node_idx].left;  // env-local id at build
     nodes[node_idx].aabb = src.Load(bbase + local_leaf);
-}
-
-static __global__ void ZeroU32Kernel(uint32_t* __restrict__ a, uint32_t n) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] = 0u;
-}
-
-static __global__ void SortedMortonKernel(const uint64_t* __restrict__ keys,
-                                          uint32_t* __restrict__ morton, uint32_t count) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) morton[i] = static_cast<uint32_t>(keys[i]);
+    if (N > 1u) visit[bbase + lane] = 0u;
 }
 
 // Shared launch body over any AABB source. Both public launchers forward here.
@@ -279,7 +277,7 @@ inline cudaError_t BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
         return cudaErrorInvalidValue;
     if (N == 1u) {
         EnvInitNodesKernel<Src><<<dim3(1u, E), dim3(kBlockSize), 0, stream>>>(
-            src, nullptr, N, out_nodes);
+            src, nullptr, N, out_nodes, nullptr, nullptr, nullptr);
         return cudaGetLastError();
     }
     const LbvhWorkspaceLayout layout(static_cast<uint32_t>(count));
@@ -289,12 +287,6 @@ inline cudaError_t BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
     auto* keys_in = reinterpret_cast<uint64_t*>(bytes);
     auto* indices_in = reinterpret_cast<uint32_t*>(bytes + layout.index_offset);
     size_t temp_bytes = workspace_bytes - layout.temp_offset;
-    {  // zero the per-leaf visit counters.
-        const uint32_t n = E * N;
-        const uint32_t b = (n + kBlockSize - 1u) / kBlockSize;
-        ZeroU32Kernel<<<b, kBlockSize, 0, stream>>>(visit, n);
-    }
-    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     EnvMortonKernel<Src><<<dim3(E), dim3(kMortonBlockSize), 0, stream>>>(
         src, N, morton, indices_in, keys_in);
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
@@ -302,13 +294,10 @@ inline cudaError_t BuildLbvhBatchedNodesImpl(cudaStream_t stream, Src src,
         bytes + layout.temp_offset, temp_bytes, keys_in, sortkey,
         indices_in, index, static_cast<int>(count), 0, 64, stream);
     if (sorted != cudaSuccess) return sorted;
-    SortedMortonKernel<<<(static_cast<uint32_t>(count) + kBlockSize - 1u) / kBlockSize,
-                          kBlockSize, 0, stream>>>(sortkey, morton, static_cast<uint32_t>(count));
-    if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     const uint32_t node_count = 2u * N - 1u;
     const uint32_t node_blocks = (node_count + kBlockSize - 1u) / kBlockSize;
     EnvInitNodesKernel<Src><<<dim3(node_blocks, E), dim3(kBlockSize), 0, stream>>>(
-        src, index, N, out_nodes);
+        src, index, N, out_nodes, sortkey, morton, visit);
     if (const auto status = cudaGetLastError(); status != cudaSuccess) return status;
     const uint32_t internal_blocks = ((N - 1u) + kBlockSize - 1u) / kBlockSize;
     EnvBuildInternalKernel<<<dim3(internal_blocks, E), dim3(kBlockSize), 0, stream>>>(
@@ -328,17 +317,12 @@ inline void RefitLbvhBatchedImpl(cudaStream_t stream, LbvhNode* nodes, Src src,
     const uint32_t N = leaves_per_env;
     if (E == 0u || N == 0u) return;
     if (N == 1u) {
-        EnvRefitLeavesKernel<Src><<<dim3(1u, E), dim3(kBlockSize), 0, stream>>>(src, N, nodes);
+        EnvRefitLeavesKernel<Src><<<dim3(1u, E), dim3(kBlockSize), 0, stream>>>(src, N, nodes, visit);
         return;
-    }
-    {
-        const uint32_t n = E * N;
-        const uint32_t b = (n + kBlockSize - 1u) / kBlockSize;
-        ZeroU32Kernel<<<b, kBlockSize, 0, stream>>>(visit, n);
     }
     const uint32_t leaf_blocks = (N + kBlockSize - 1u) / kBlockSize;
     EnvRefitLeavesKernel<Src><<<dim3(leaf_blocks, E), dim3(kBlockSize), 0, stream>>>(
-        src, N, nodes);
+        src, N, nodes, visit);
     EnvPropagateKernel<<<dim3(leaf_blocks, E), dim3(kBlockSize), 0, stream>>>(
         N, nodes, visit);
 }

@@ -577,18 +577,19 @@ __global__ void GridFillKernel(uint32_t particle_count,
     }
 }
 
-__global__ void ZeroU32Kernel(uint32_t* __restrict__ a, uint32_t n) {
+__global__ void BeginPairQueryKernel(uint32_t* pair_count, uint32_t* env_status, uint32_t n) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] = 0u;
+    if (i >= n) return;
+    pair_count[i] = 0u;
+    if (env_status != nullptr) env_status[i] &= ~kEnvStatusPairOverflow;
 }
 
-// Clear ONLY `bit` in each of the n words. env_status is shared across the
-// broadphase + particle-grid ops (different bits), so each clears its own bit
-// at start (order-independent) rather than zeroing the whole readout word.
-__global__ void ClearBitU32Kernel(uint32_t* __restrict__ a, uint32_t n,
-                                  uint32_t bit) {
+// Cell ranges and the query's overflow bit have independent array elements.
+__global__ void BeginGridCellsKernel(uint32_t* start, uint32_t* end, uint32_t n,
+                                      uint32_t* env_status, uint32_t envs) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) a[i] &= ~bit;
+    if (i < n) start[i] = end[i] = 0u;
+    if (i < envs && env_status != nullptr) env_status[i] &= ~kEnvStatusNeighborOverflow;
 }
 
 // --- op entry points ---------------------------------------------------------
@@ -638,15 +639,11 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
     const uint32_t N = p->bodies_per_env;
     const uint32_t E = p->env_count;
     if (E == 0u) return Status::Ok;
-    // Zero the per-env pair watermark + clear THIS op's env_status overflow bit.
+    // Initialize each environment's query count and its overflow bit.
     {
         const uint32_t b = (E + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
-                   data.pair_count, E);
-        if (data.env_status != nullptr) {
-            LaunchCuda(ClearBitU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
-                       data.env_status, E, kEnvStatusPairOverflow);
-        }
+        LaunchCuda(BeginPairQueryKernel, dim3(b), dim3(kBlockSize), 0u, stream,
+                   data.pair_count, data.env_status, E);
     }
     if (N < 2u) return Status::Ok;
     auto* nodes = reinterpret_cast<const cg::LbvhNode*>(data.lbvh_nodes);
@@ -770,18 +767,11 @@ Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
                           cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
     if (cudaMemcpyAsync(data.grid_particle_idx, idx_out, Np * sizeof(uint32_t),
                           cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
-    {  // zero the per-env cell ranges (cells x env_count entries).
+    {
         const uint32_t zn = cells * E;
         const uint32_t b = (zn + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
-                   data.grid_cell_start, zn);
-        LaunchCuda(ZeroU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
-                   data.grid_cell_end, zn);
-    }
-    if (data.env_status != nullptr) {  // clear THIS op's neighbor-overflow bit.
-        const uint32_t b = (E + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ClearBitU32Kernel, dim3(b), dim3(kBlockSize), 0u, stream,
-                   data.env_status, E, kEnvStatusNeighborOverflow);
+        LaunchCuda(BeginGridCellsKernel, dim3(b), dim3(kBlockSize), 0u, stream,
+                   data.grid_cell_start, data.grid_cell_end, zn, data.env_status, E);
     }
     LaunchCuda(GridCellRangesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                Np, data.grid_cell_key, data.grid_cell_start, data.grid_cell_end);
