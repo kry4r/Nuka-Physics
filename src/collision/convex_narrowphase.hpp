@@ -464,6 +464,13 @@ struct EpaFace {
     bool alive;
 };
 
+struct EpaWorkspace {
+    MinkPoint verts[kEpaMaxVerts];
+    EpaFace faces[kEpaMaxFaces];
+    int edge_a[kEpaMaxEdges];
+    int edge_b[kEpaMaxEdges];
+};
+
 struct EpaResult {
     bool  ok = false;
     // Set when the polytope hit a fixed-capacity cap (kEpaMaxVerts/Faces/Edges)
@@ -530,11 +537,9 @@ enum class EpaInsert : uint8_t { Inserted = 0, NoVisible = 1, Overflow = 2 };
 //   fan normals point outward even when the origin is on the polytope boundary.
 NUKA_CVX_HD inline EpaInsert EpaInsertSupport(MinkPoint* verts, int& nverts,
                                               EpaFace* faces, int& nfaces,
-                                              const MinkPoint& p) {
+                                              const MinkPoint& p, int* edge_a, int* edge_b) {
     if (nverts >= kEpaMaxVerts) return EpaInsert::Overflow;
     // --- find + kill visible faces, toggle horizon edges (fixed order). ---
-    int edge_a[kEpaMaxEdges];
-    int edge_b[kEpaMaxEdges];
     int nedges = 0;
     bool any_visible = false;
     for (int i = 0; i < nfaces; ++i) {
@@ -578,10 +583,10 @@ NUKA_CVX_HD inline EpaInsert EpaInsertSupport(MinkPoint* verts, int& nverts,
 }
 
 NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy& B,
-                                       const GjkResult& gjk) {
+                                       const GjkResult& gjk, EpaWorkspace& workspace) {
     EpaResult res;
     // --- 1) Promote the GJK simplex to a non-degenerate tetrahedron (D1). ---
-    MinkPoint verts[kEpaMaxVerts];
+    MinkPoint* verts = workspace.verts;
     int nverts = 0;
     for (int i = 0; i < gjk.count && i < 4; ++i) verts[nverts++] = gjk.simplex[i];
     // Blow up to 4 along FIXED basis directions in fixed order if needed.
@@ -608,7 +613,7 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
     // centroid-orientation `face.dist` is the SIGNED origin->plane distance: <=0
     // means the origin is on/outside that face -> the seed does NOT strictly
     // contain the origin and must be expanded (step 2b) before the metric loop. ---
-    EpaFace faces[kEpaMaxFaces];
+    EpaFace* faces = workspace.faces;
     int nfaces = 0;
     {
         const Vec3 c0 = PolytopeCentroid(verts, nverts);
@@ -654,7 +659,7 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
             res.ok = false;
             return res;
         }
-        const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p);
+        const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p, workspace.edge_a, workspace.edge_b);
         if (st == EpaInsert::Overflow) res.overflowed = true;  // surface, not silent
         if (st != EpaInsert::Inserted) break;  // overflow / no-progress -> best-so-far
     }
@@ -701,7 +706,7 @@ NUKA_CVX_HD inline EpaResult EpaExpand(const SupportProxy& A, const SupportProxy
             break;
         }
         // --- 5) Insert + rebuild horizon (shared helper; centroid-oriented fan). ---
-        const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p);
+        const EpaInsert st = EpaInsertSupport(verts, nverts, faces, nfaces, p, workspace.edge_a, workspace.edge_b);
         if (st == EpaInsert::Overflow) res.overflowed = true;  // surface, not silent
         if (st != EpaInsert::Inserted) break;  // overflow / no-progress -> best-so-far
     }
@@ -756,6 +761,14 @@ struct FacePoly {
     Vec3     v[kFaceMax];
     uint32_t idx[kFaceMax];  // source vertex index (feature)
     int      count = 0;
+};
+
+struct ConvexWorkspace {
+    EpaWorkspace epa;
+    FacePoly reference;
+    FacePoly incident;
+    amf::ClipPoly polygon;
+    amf::ManifoldPointCand candidates[amf::kClipMax];
 };
 
 // Gather the supporting-vertex set of a HULL along world dir.
@@ -840,7 +853,7 @@ NUKA_CVX_HD inline void OrderFaceCCW(FacePoly& fp, Vec3 normal) {
 NUKA_CVX_HD inline void BuildConvexManifold(const SupportProxy& A,
                                             const SupportProxy& B,
                                             const EpaResult& epa,
-                                            ContactManifold* out) {
+                                            ContactManifold* out, ConvexWorkspace& workspace) {
     out->Clear();
     if (!epa.ok || epa.depth <= 0.0f) return;
     // nA = epa.normal = the CSO outward normal at the closest face (points from the
@@ -867,9 +880,11 @@ NUKA_CVX_HD inline void BuildConvexManifold(const SupportProxy& A,
 
     // --- Reference (A) face along +nA ; incident (B) face along -nA. ---
     const float kFaceTol = 1.0e-3f;
-    FacePoly ref = (A.kind == SupportKind::Box) ? GatherBoxFace(*A.prim, nA)
+    FacePoly& ref = workspace.reference;
+    ref = (A.kind == SupportKind::Box) ? GatherBoxFace(*A.prim, nA)
                                                 : GatherHullFace(*A.hull, nA, kFaceTol);
-    FacePoly inc = (B.kind == SupportKind::Box) ? GatherBoxFace(*B.prim, -nA)
+    FacePoly& inc = workspace.incident;
+    inc = (B.kind == SupportKind::Box) ? GatherBoxFace(*B.prim, -nA)
                                                 : GatherHullFace(*B.hull, -nA, kFaceTol);
     OrderFaceCCW(ref, nA);
     OrderFaceCCW(inc, -nA);
@@ -889,7 +904,8 @@ NUKA_CVX_HD inline void BuildConvexManifold(const SupportProxy& A,
     ref_c = ref_c / static_cast<float>(ref.count);
 
     // Load the incident polygon into a ClipPoly (feature = incident vertex idx).
-    amf::ClipPoly poly;
+    amf::ClipPoly& poly = workspace.polygon;
+    poly.count = 0;
     for (int i = 0; i < inc.count && i < amf::kClipMax; ++i) poly.Add(inc.v[i], inc.idx[i]);
 
     // Clip against each reference-face SIDE plane (edge i -> i+1), outward normal
@@ -905,7 +921,7 @@ NUKA_CVX_HD inline void BuildConvexManifold(const SupportProxy& A,
 
     // Keep survivors BELOW the reference face (penetrating); project onto the ref
     // plane for the contact position; penetration = depth below the ref face.
-    amf::ManifoldPointCand cand[amf::kClipMax];
+    amf::ManifoldPointCand* cand = workspace.candidates;
     int ncand = 0;
     for (int k = 0; k < poly.count; ++k) {
         const float depth = (ref_c - poly.v[k]).Dot(nA);  // >0 == below ref face
@@ -1453,7 +1469,7 @@ NUKA_CVX_HD inline bool CapsuleConvex(const SupportProxy& cap,
 // keeps the EPA path (its own contact regime), unchanged.
 NUKA_CVX_HD inline void ConvexNarrowphase(const SupportProxy& A,
                                           const SupportProxy& B,
-                                          ContactManifold* out) {
+                                          ContactManifold* out, ConvexWorkspace& workspace) {
     out->Clear();
     const bool a_cap = A.kind == SupportKind::Capsule;
     const bool b_cap = B.kind == SupportKind::Capsule;
@@ -1463,8 +1479,14 @@ NUKA_CVX_HD inline void ConvexNarrowphase(const SupportProxy& A,
     else if (b_cap && a_poly) { if (CapsuleConvex(B, A, false, out)) return; }
     const GjkResult gjk = GjkIntersect(A, B);
     if (!gjk.intersect) return;  // separated -> no contact
-    const EpaResult epa = EpaExpand(A, B, gjk);
-    BuildConvexManifold(A, B, epa, out);
+    const EpaResult epa = EpaExpand(A, B, gjk, workspace.epa);
+    BuildConvexManifold(A, B, epa, out, workspace);
+}
+
+NUKA_CVX_HD inline void ConvexNarrowphase(const SupportProxy& A, const SupportProxy& B,
+                                          ContactManifold* out) {
+    ConvexWorkspace workspace;
+    ConvexNarrowphase(A, B, out, workspace);
 }
 
 } // namespace nuka::collision::cvx
