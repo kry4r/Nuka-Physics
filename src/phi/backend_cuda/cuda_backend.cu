@@ -1,21 +1,5 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — Backend / Device / RegistryEntry implementations.
-//
-// ggml analogy: this is the CUDA `ggml_backend` + `ggml_backend_device` +
-// `ggml_backend_reg`. It owns:
-//   * dispatch       — look up g_ops[op]; null slot => Status::Unsupported;
-//                      else call the op fn on the backend's MAIN stream.
-//   * synchronize    — sync the main stream.
-//   * plan_create    — stream-capture the OpCall list on a dedicated CAPTURE
-//                      stream into a cudaGraph, instantiate a cudaGraphExec,
-//                      cache it in the Plan. (D1 replay vehicle.)
-//   * plan_execute   — cudaGraphLaunch the cached exec on the MAIN stream.
-//   * plan_free      — destroy the exec + graph.
-//   * event_*        — cudaEvent new / record / wait / free.
-//
-// The backend owns its OWN streams (main + capture) — it deliberately does NOT
-// pull in the legacy phi/owned_stream.hpp (that belongs to nuka_phi).
-// ---------------------------------------------------------------------------
+// CUDA dispatch, events and graph replay share the backend execution stream.
+// Graphs are recorded on a separate owned capture stream.
 
 #include "phi/backend_cuda/cuda_internal.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
@@ -173,7 +157,7 @@ void BackendFreeImpl(Backend* b) {
         return;
     }
     if (cb->capture != nullptr) { (void)cudaStreamDestroy(cb->capture); }
-    if (cb->main != nullptr)    { (void)cudaStreamDestroy(cb->main); }
+    if (cb->owns_main)          { (void)cudaStreamDestroy(cb->main); }
     delete cb;
 }
 
@@ -587,6 +571,12 @@ bool g_cuda_registered = false;
 // ---------------------------------------------------------------------------
 cudaStream_t CudaBackendMainStream(CudaBackend* b) {
     return (b != nullptr) ? b->main : static_cast<cudaStream_t>(nullptr);
+}
+
+void CudaBackendUseCallerStream(CudaBackend* b, cudaStream_t stream) {
+    (void)cudaStreamDestroy(b->main);
+    b->main = stream;
+    b->owns_main = false;
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"  // DeviceBufferType, InitBestDevice
+#include "phi/backend_cuda/cuda_internal.cuh"
 #include "phi/buffer.hpp"   // phi v2 Buffer*, BufferAlloc / BufferBase / BufferFree
 #include "runtime/articulation/articulation_state.hpp"
 
@@ -131,18 +132,11 @@ nuka_result_t nuka_tape_create(nuka_world_handle world,
         record->desc.max_checkpoints = desc->max_checkpoints;
         record->desc.recompute_on_backward = desc->recompute_on_backward;
 
-        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const auto stream = nuka::phi::CudaBackendMainStream(
+            reinterpret_cast<nuka::phi::CudaBackend*>(world_record->world->Backend()));
         const int device_id = world_record->device->device_id;
-        // M9 SEAM (now LIVE): the diffsim machinery consumes ArticulationDeviceState
-        // -- a pure pointer view. The pointers now come from the nk arena via
-        // MakeArticulationDeviceStateFromViews(ModelView, DataView, links, artics):
-        // algorithm/kernels are UNTOUCHED (proven bit-exact by
-        // AbaReverse.NkArenaSeamForwardReverseBitExact). The legacy backward .cu
-        // kernels still run on stream 0 (the diffsim launchers are driven on the
-        // handle's stream, now the NULL stream) until the backward op-ifies at
-        // T7. The diffsim path is single-env (the tape tests create
-        // env_count == 1), so the host mirror's single-env link/articulation
-        // counts == the arena's.
+        // The arena pointer view and tape share the world's execution stream.
+        // The host articulation mirror contains single-environment topology.
         const uint32_t total_link_count =
             world_record->articulation_host.TotalLinkCount();
         const uint32_t articulation_count =
@@ -202,7 +196,8 @@ nuka_result_t nuka_world_step_with_tape(nuka_world_handle world,
     }
     if (world_record->world->StateSensors().HasActive()) return NUKA_RESULT_NOT_SUPPORTED;
     try {
-        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const auto stream = nuka::phi::CudaBackendMainStream(
+            reinterpret_cast<nuka::phi::CudaBackend*>(world_record->world->Backend()));
         // The action this step is the world's current DRIVE_TARGET arena field
         // (the policy writes it through the buffer view before each step). The
         // cook seeds it to the hold-pose targets (SeedInitialState), so an
@@ -263,7 +258,8 @@ nuka_result_t nuka_tape_backward(nuka_tape_handle tape,
         return NUKA_RESULT_INVALID_ARG;
     }
     try {
-        const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+        const auto stream = nuka::phi::CudaBackendMainStream(
+            reinterpret_cast<nuka::phi::CudaBackend*>(world_record->world->Backend()));
         const int device_id = world_record->device->device_id;
         const uint32_t n = record->total_link_count;
         const uint32_t step_count = record->tape->StepCount();

@@ -52,30 +52,11 @@ namespace nuka::c_abi {
 nuka_result_t MapStatusToResult(phi::Status status) noexcept;
 
 struct DeviceRecord {
-    // --- CUDA device ordinal (BUF-14) ---------------------------------------
-    // The validated CUDA device this handle was created on. Read by the legacy
-    // diffsim/noise orchestration (ScopedDeviceGuard) + recorder.cpp's
-    // SelectDeviceByOrdinal. The legacy orchestration that used to own a created
-    // stream now runs on STREAM 0 (the NULL/default stream): single-stream
-    // ordering + NULL-stream implicit serialization preserve the exact
-    // happens-before the owned stream gave, and the v2 backward op (on
-    // backend->main) coordinates with stream 0 via that same implicit sync.
+    // Device ordinal shared by physics, noise and differentiable orchestration.
     int device_id = 0;
 
-    // --- phi v2 owned device/backend (M9 T2) -------------------------------
-    // An OWNED phi v2 Backend (and the registry-owned Device it was init'd on),
-    // acquired in nuka_device_create. These feed the nk::World ctor + cook::Settle
-    // from the C-ABI. M9 COMPLETE: T2 (phi_device/backend acquisition here), T4
-    // (scene.cpp settle calls cook::Settle on this backend) and T5 (world.cpp
-    // build nk::World(model, n, phi_device, backend, cfg)) are all wired as of the
-    // M9 push.
-    // LIFETIME (mirrors RecorderRecord, commit fcae2a6): the Backend is OWNED
-    // and freed in the destructor; nk::World only BORROWS it
-    // (World::~World -> BackendPlanFree(backend_), never frees the backend), so
-    // any future borrowing member must be torn down BEFORE the BackendFree. The
-    // Device is registry-OWNED (RegistryEntryGetDevice / InitBestDevice) and is
-    // NOT freed here. Null when no phi v2 device/backend is available (e.g. no
-    // CUDA backend registered); the legacy paths still function in that case.
+    // The registry owns the device; this record owns the backend borrowed by worlds.
+    // Physics and orchestration use that backend's execution stream.
     phi::Device* phi_device = nullptr;   // registry-owned; do NOT free
     phi::Backend* backend = nullptr;     // OWNED; BackendFree'd in dtor
 

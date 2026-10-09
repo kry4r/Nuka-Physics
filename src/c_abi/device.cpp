@@ -2,6 +2,7 @@
 #include "c_abi/internal.hpp"
 
 #include "phi/backend.hpp"
+#include "phi/backend_cuda/cuda_internal.cuh"
 
 #include <cuda_runtime.h>
 
@@ -65,23 +66,7 @@ nuka_result_t nuka_device_create(const nuka_device_desc_t* desc,
         }
         record->device_id = device_id;
 
-        // BUF-14: the legacy orchestration that used to run on a per-handle
-        // OWNED stream now runs on STREAM 0 (the NULL/default stream). desc->
-        // cuda_stream is accepted by the public ABI but the legacy paths only
-        // ever ran their kernels + explicit syncs on the handle's stream, which
-        // is now stream 0; the NULL stream serializes with the v2 backend's
-        // blocking `main` stream exactly as the owned stream did before.
-
-        // --- phi v2 device/backend acquisition (M9 T2) ---------------------
-        // Acquire the OWNED phi v2 Backend on the requested CUDA ordinal so the
-        // C-ABI can later build an nk::World + call cook::Settle (T4/T5). Mirrors
-        // recorder.cpp (commit fcae2a6): honor the validated ordinal via
-        // SelectDeviceByOrdinal, then take ownership IMMEDIATELY so any failure
-        // path frees the backend through the DeviceRecord destructor. The Device
-        // is registry-owned (not freed); the Backend is freed in ~DeviceRecord.
-        // TODO(M9-T5): feed record->phi_device + record->backend into the
-        //              nk::World ctor in world.cpp create.
-        // TODO(M9-T4): use them for cook::Settle in nuka_scene.cpp.
+        // The device owns the backend and borrows any caller-supplied execution stream.
         nphi::Device* dev = SelectDeviceByOrdinal(device_id);
         if (dev == nullptr) {
             return NUKA_RESULT_NOT_SUPPORTED;  // no phi v2 backend/device.
@@ -89,6 +74,10 @@ nuka_result_t nuka_device_create(const nuka_device_desc_t* desc,
         nphi::Backend* backend = nphi::DeviceInitBackend(dev, nullptr);
         if (backend == nullptr) {
             return NUKA_RESULT_NOT_SUPPORTED;
+        }
+        if (desc->cuda_stream != nullptr) {
+            nphi::CudaBackendUseCallerStream(reinterpret_cast<nphi::CudaBackend*>(backend),
+                                            static_cast<cudaStream_t>(desc->cuda_stream));
         }
         record->phi_device = dev;     // registry-owned; not freed.
         record->backend = backend;    // OWNED; freed by ~DeviceRecord.

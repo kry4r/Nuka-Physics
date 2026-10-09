@@ -42,6 +42,7 @@ const char* nuka_result_message(nuka_result_t result);
 
 typedef struct nuka_device_desc_t {
     uint32_t gpu_index;
+    // Non-null streams are borrowed until device destruction; null creates an owned stream.
     void* cuda_stream;
     uint8_t backend_selection_layer_enabled;
 } nuka_device_desc_t;

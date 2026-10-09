@@ -18,7 +18,7 @@
 
 namespace nuka::phi {
 
-// Forward: the backend owns the streams every buffer op runs on.
+// Buffer operations use the backend execution stream.
 struct CudaBackend;
 
 // The two buffer-type vtables (device + pinned host) live in cuda_buffer.cu.
@@ -49,14 +49,14 @@ struct CudaBuffer {
 };
 
 // ---------------------------------------------------------------------------
-// Concrete Backend: holds a main stream + a dedicated capture stream, the two
-// buffer types, and the device id. The capture stream is used ONLY for
-// CUDA-graph stream-capture in plan_create; everything else runs on `main`.
+// The backend owns capture and either owns main or borrows the caller's stream.
+// Buffer transfers, eager dispatch and graph replay share main.
 // ---------------------------------------------------------------------------
 struct CudaBackend {
     const BackendI* iface;   // MUST be first
     int             device_id;
     cudaStream_t    main;
+    bool            owns_main = true;
     cudaStream_t    capture;
     CudaBufferType  device_bt;
     CudaBufferType  host_bt;
@@ -64,6 +64,9 @@ struct CudaBackend {
 
 // Stream accessor used by cuda_buffer.cu (a null backend => stream 0).
 cudaStream_t CudaBackendMainStream(CudaBackend* b);
+
+// Borrow the caller's stream for this backend's remaining lifetime.
+void CudaBackendUseCallerStream(CudaBackend* b, cudaStream_t stream);
 
 // Factory for a CudaBuffer (defined in cuda_buffer.cu). Returns nullptr on OOM.
 Buffer* CudaBufferAlloc(CudaBackend* backend, size_t bytes, bool is_host, Status* status = nullptr);

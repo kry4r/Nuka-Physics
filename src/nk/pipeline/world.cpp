@@ -254,9 +254,8 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     creation_status_ = model_.capacities.Validate(&creation_error_);
     if (creation_status_ != phi::Status::Ok) return;
 
-    // The init-time buffer type (stream-less default-stream device type — fine
-    // for the one-shot Model upload + Arena alloc, per the plan's note).
-    phi::BufferType* bt = phi::DeviceBufferType(device);
+    // Model uploads, state transfers and physics share the backend execution queue.
+    phi::BufferType* bt = phi::BackendDeviceBufferType(backend);
     if (bt == nullptr) {
         creation_status_ = phi::Status::Failed;
         creation_error_ = "device has no buffer type";

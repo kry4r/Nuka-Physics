@@ -16,6 +16,8 @@
 #include <sstream>
 
 #include "phi/backend_cuda/cuda_internal.cuh"
+#include "c_abi/handle_table.hpp"
+#include "c_abi/internal.hpp"
 #include "core/checked_size.hpp"
 #include "phi/articulation_contract.hpp"
 #include "nk/solve/block_row_schedule.hpp"
@@ -126,9 +128,15 @@ Options Parse(int argc, char** argv) {
     return options;
 }
 
-struct BackendOwner {
-    phi::Backend* backend = nullptr;
-    ~BackendOwner() { if (backend) phi::BackendFree(backend); }
+struct StreamOwner {
+    cudaStream_t stream = nullptr;
+    StreamOwner() { CheckCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)); }
+    ~StreamOwner() { (void)cudaStreamDestroy(stream); }
+};
+
+struct DeviceOwner {
+    nuka_device_handle device = nullptr;
+    ~DeviceOwner() { nuka_device_destroy(device); }
 };
 
 struct Events {
@@ -1638,12 +1646,15 @@ Json RenderMeasurements(nk::World& world, const fixture::SceneVisuals& visuals,
 }
 
 Json Run(const Options& options) {
-    auto* device = phi::InitBestDevice();
-    fixture::Require(device != nullptr, "no physics device");
-    BackendOwner owner{phi::DeviceInitBackend(device, nullptr)};
-    fixture::Require(owner.backend != nullptr && std::strcmp(phi::BackendName(owner.backend), "cuda") == 0,
-                     "CUDA completion events require a CUDA backend");
-    auto* backend = reinterpret_cast<phi::CudaBackend*>(owner.backend);
+    StreamOwner caller;
+    DeviceOwner owner;
+    nuka_device_desc_t desc{};
+    desc.cuda_stream = caller.stream;
+    desc.backend_selection_layer_enabled = 1u;
+    fixture::Require(nuka_device_create(&desc, &owner.device) == NUKA_RESULT_OK, "no physics device");
+    auto* record = nuka::c_abi::DeviceTable().Get(owner.device);
+    auto* device = record->phi_device;
+    auto* backend = reinterpret_cast<phi::CudaBackend*>(record->backend);
     CheckCuda(cudaSetDevice(backend->device_id));
     const auto stream = phi::CudaBackendMainStream(backend);
     auto config = fixture::Cfg();
@@ -1656,7 +1667,7 @@ Json Run(const Options& options) {
         : std::filesystem::path(options.scene);
     const auto prepare_start = Clock::now();
     const auto fixture_config = fixture::Cfg();
-    const auto prepared = fixture::Prepare(scene_path, device, owner.backend, fixture_config);
+    const auto prepared = fixture::Prepare(scene_path, device, record->backend, fixture_config);
     const double preparation_ms = Milliseconds(prepare_start);
     const auto cook_start = Clock::now();
     fixture::SceneVisuals visuals;
@@ -1671,7 +1682,7 @@ Json Run(const Options& options) {
     }
     const double cook_ms = Milliseconds(cook_start);
     const auto create_start = Clock::now();
-    nk::World world(std::move(model), options.envs, device, owner.backend, config);
+    nk::World world(std::move(model), options.envs, device, record->backend, config);
     fixture::Require(world.Ready(), world.CreationError());
     AttachStateSensors(world, options);
     AttachTactileSensors(world, options, prepared);
@@ -1891,6 +1902,12 @@ Json Run(const Options& options) {
     configuration.Set("initial_state_fnv1a64", Json::Str(Digest(initial)));
     result.Set("config", std::move(configuration));
     execution.Set("mode", Json::Str(options.execution));
+    execution.Set("stream", Json::Str("nonblocking caller"));
+    const auto graph = world.GraphMetrics();
+    execution.Set("graph_nodes", Json::Int(graph.nodes));
+    execution.Set("graph_kernels", Json::Int(graph.kernels));
+    execution.Set("graph_clears", Json::Int(graph.clears));
+    execution.Set("graph_copies", Json::Int(graph.copies));
     execution.Set("warmup", Json::Int(options.warmup));
     execution.Set("steps", Json::Int(options.steps));
     execution.Set("boundary", Json::Str("full physics pipeline with contact readout; held control; per-step GPU events; no timed D2H"));

@@ -9,6 +9,7 @@
 #include "nk/model/generated/field_ids.hpp"
 #include "nk/pipeline/world.hpp"
 #include "phi/scoped_device_guard.hpp"
+#include "phi/backend_cuda/cuda_internal.cuh"
 #include "runtime/articulation/articulation_state.hpp"
 #include "sensor/noise/n2_domain_randomization.hpp"
 #include "sensor/noise/noise_config.hpp"
@@ -155,7 +156,8 @@ nuka_result_t ApplyPerEpisodeRandomization(
     const uint32_t env_count = (record.env_count == 0u) ? 1u : record.env_count;
     const uint32_t total_links = links_per_env * env_count;
 
-    const cudaStream_t stream = nullptr;  // BUF-14: stream 0
+    const auto stream = nuka::phi::CudaBackendMainStream(
+        reinterpret_cast<nuka::phi::CudaBackend*>(record.world->Backend()));
     const int device_id = record.device->device_id;
     nuka::phi::ScopedDeviceGuard guard(device_id);
 

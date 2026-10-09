@@ -1554,7 +1554,7 @@ if(CMAKE_CUDA_COMPILER)
     target_include_directories(nuka_pipeline_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_definitions(nuka_pipeline_benchmark PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_link_libraries(nuka_pipeline_benchmark PRIVATE
-        nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2 nuka_runtime_gpu nuka_runtime
+        nuka nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2 nuka_runtime_gpu nuka_runtime
         nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi CUDA::cudart)
     nuka_set_warnings(nuka_pipeline_benchmark)
 
