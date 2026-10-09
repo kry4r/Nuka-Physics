@@ -743,6 +743,7 @@ struct ColorScratch {
     uint32_t* chain_rows = nullptr;
     uint32_t* chain_excl = nullptr;    // per live position, then the total
     uint32_t* chain_islands = nullptr;
+    uint32_t* env_live_begin = nullptr; // first compact live position per environment
     uint32_t* block_count = nullptr;   // kColorGridLimit
     uint32_t* control = nullptr;       // kControlWords
     float* qdot_error = nullptr;       // per articulation DOF
@@ -819,6 +820,7 @@ uint64_t BindColorScratch(const SolveRowsBlockIslandParams& p, uint32_t* base, C
     s.chain_rows = take(rows);
     s.chain_excl = take(rows + 1u);
     s.chain_islands = take(rows);
+    s.env_live_begin = take(p.env_count);
     s.block_count = take(kColorGridLimit);
     s.control = take(kControlWords);
     s.qdot_error = take_float(uint64_t{p.articulation_count} * p.max_dof);
@@ -1111,8 +1113,8 @@ __device__ inline void VisitRowOwners(const NkRow& row, PointMassView points,
     }
 }
 
-// A bijective integer mix, so distinct row slots keep distinct coloring priorities.
-__device__ inline uint32_t MixSlot(uint32_t x) {
+// A bijective integer mix keeps live-row priorities distinct.
+__device__ inline uint32_t MixLiveOrdinal(uint32_t x) {
     x = (x ^ 61u) ^ (x >> 16u);
     x *= 9u;
     x ^= x >> 4u;
@@ -1479,7 +1481,7 @@ __device__ bool StageChainPoints(const NkRow* rows, uint32_t gslot, uint32_t row
                 jacobian[axis] = entry.TransposeMultiply(sides[axis].jlin);
         }
         const unsigned long long key = (static_cast<unsigned long long>(kind) << 32u) | index;
-        uint32_t at = MixSlot(index ^ (kind << 28u)) & (kChainCacheEntries - 1u);
+        uint32_t at = MixLiveOrdinal(index ^ (kind << 28u)) & (kChainCacheEntries - 1u);
         unsigned long long prior = atomicCAS(cache.key + at, kChainCacheEmpty, key);
         while (prior != kChainCacheEmpty && prior != key) {
             at = (at + 1u) & (kChainCacheEntries - 1u);
@@ -3285,6 +3287,7 @@ __device__ __noinline__ void PackLaneRecords(const NkRow* urows, PointMassView p
 }
 
 struct LivePrepareArgs {
+    uint32_t env_count = 0u;
     const float* lambda = nullptr;
     const float* row_meff = nullptr;
     const float* row_damping = nullptr;
@@ -3442,6 +3445,8 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
     const uint32_t threads = gridDim.x * blockDim.x;
     // A verifying pass keeps the schedule it continues unless an idle row broke.
     if (prep.verify_idle && s.control[kControlIdleViolations] == 0u) return;
+    for (uint32_t env = thread; env < prep.env_count; env += threads)
+        s.env_live_begin[env] = ~0u;
     const uint32_t previous_live = prep.reuse_schedule ? s.control[kControlLive] : 0u;
     if (thread == 0u) {
         s.control[kControlValidRows] = 0u;
@@ -3500,11 +3505,15 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
             if (prep.reuse_schedule && prefix <= previous_live && live_order[prefix - 1u] != slot)
                 atomicOr(s.control + kControlScheduleChanged, 1u);
             live_order[prefix - 1u] = slot;
+            atomicMin(s.env_live_begin + slot / prep.rows_per_env, prefix - 1u);
         }
     }
     grid.sync();
 
     const uint32_t live = s.control[kControlLive];
+    const auto live_ordinal = [&](uint32_t position, uint32_t slot) {
+        return position - s.env_live_begin[slot / prep.rows_per_env];
+    };
     // Verification continues the compensated articulation velocities it inherits.
     if (!prep.verify_idle)
         for (uint32_t i = thread; i < s.artic_dofs; i += threads) s.qdot_error[i] = 0.0f;
@@ -3589,7 +3598,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
                         taken[w] |= s.used[size_t{owner} * kColorWords + w];
                 }
                 const uint32_t color = FirstFreeColor(
-                    taken, MixSlot((slot % prep.rows_per_env) ^ (round * 0x9e3779b9u)) % kColorPalette);
+                    taken, MixLiveOrdinal(live_ordinal(position, slot) ^ (round * 0x9e3779b9u)) % kColorPalette);
                 if (color == kColorPalette) {
                     overflow = true;
                     s.pos_color[position] = kColorOverflow;
@@ -3619,7 +3628,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
                     for (uint32_t w = 0u; w < kColorWords; ++w)
                         taken[w] = __reduce_or_sync(0xffffffffu, taken[w]);
                     const uint32_t color = FirstFreeColor(
-                        taken, MixSlot((slot % prep.rows_per_env) ^ (round * 0x9e3779b9u)) % kColorPalette);
+                        taken, MixLiveOrdinal(live_ordinal(position, slot) ^ (round * 0x9e3779b9u)) % kColorPalette);
                     if (color == kColorPalette) {
                         overflow = true;
                         if (lane == 0u) s.pos_color[position] = kColorOverflow;
@@ -3638,7 +3647,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
 
             for_lane_rows(true, [&](uint32_t position, uint32_t owners) {
                 const uint32_t color = s.pos_tent[position];
-                const uint32_t priority = MixSlot(live_order[position] % prep.rows_per_env);
+                const uint32_t priority = MixLiveOrdinal(live_ordinal(position, live_order[position]));
                 for (uint32_t j = 0u; j < owners; ++j) {
                     const uint32_t owner = table.Owner(j, position);
                     if (s.dup[size_t{owner} * kColorWords + color / 32u] & (1u << (color % 32u)))
@@ -3649,7 +3658,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
                 const uint32_t slot = live_order[position];
                 const LaneOwners owners = owners_at(position, m);
                 const uint32_t color = s.pos_tent[position];
-                const uint32_t priority = MixSlot(slot % prep.rows_per_env);
+                const uint32_t priority = MixLiveOrdinal(live_ordinal(position, slot));
                 VisitLaneOwners(owners, [&](uint32_t owner) {
                     if (s.dup[size_t{owner} * kColorWords + color / 32u] & (1u << (color % 32u)))
                         atomicMax(s.claim + owner, priority);
@@ -3660,7 +3669,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
             bool left = false;
             for_lane_rows(true, [&](uint32_t position, uint32_t owners) {
                 const uint32_t color = s.pos_tent[position];
-                const uint32_t priority = MixSlot(live_order[position] % prep.rows_per_env);
+                const uint32_t priority = MixLiveOrdinal(live_ordinal(position, live_order[position]));
                 const uint32_t bit = 1u << (color % 32u);
                 bool keep = true;
                 for (uint32_t j = 0u; j < owners; ++j) {
@@ -3682,7 +3691,7 @@ __global__ void __launch_bounds__(kColorBlockSize) PrepareLiveColorsKernel(
                 const uint32_t slot = live_order[position];
                 const LaneOwners owners = owners_at(position, m);
                 const uint32_t color = s.pos_tent[position];
-                const uint32_t priority = MixSlot(slot % prep.rows_per_env);
+                const uint32_t priority = MixLiveOrdinal(live_ordinal(position, slot));
                 const uint32_t bit = 1u << (color % 32u);
                 bool keep = true;
                 VisitLaneOwners(owners, [&](uint32_t owner) {
@@ -5694,6 +5703,7 @@ Status OpSolveRowsBlockIsland(const ModelView& model, const DataView& data,
             (void)BindColorScratch(*p, data.solve_color_scratch, &scratch);
             if (scratch.control == nullptr) return Status::InvalidArgument;
             LivePrepareArgs prep;
+            prep.env_count = p->env_count;
             prep.lambda = data.lambda;
             prep.row_meff = static_cast<const float*>(data.row_meff);
             prep.row_damping = static_cast<const float*>(data.row_damping);

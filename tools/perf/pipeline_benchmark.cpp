@@ -2,6 +2,7 @@
 #include "robot_cloth_fluid_scene.hpp"
 #include "measurement_clock.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -301,6 +302,29 @@ std::vector<uint32_t> MismatchedReplicas(nk::World& world, const std::vector<uin
     fixture::Require(offset == state.size(), "incomplete environment state comparison");
     std::vector<uint32_t> result;
     for (uint32_t env = 1u; env < capacities.env_count; ++env)
+        if (mismatch[env]) result.push_back(env);
+    return result;
+}
+
+std::vector<uint32_t> MaskedResetMismatches(nk::World& world,
+    const std::vector<uint8_t>& initial, const std::vector<uint8_t>& stepped,
+    const std::vector<uint8_t>& reset, const std::vector<uint32_t>& selected) {
+    const auto& cap = world.GetModel().capacities;
+    std::vector<bool> mismatch(cap.env_count, false);
+    size_t offset = 0u;
+    for (const auto field : kPhysicalFields) {
+        const size_t bytes = cap.ElementCount(field) * nk::LayoutOf(field).elem_size;
+        const size_t stride = bytes / cap.env_count;
+        for (uint32_t env = 0u; env < cap.env_count; ++env) {
+            const auto& expected = std::binary_search(selected.begin(), selected.end(), env) ? initial : stepped;
+            const size_t start = offset + size_t{env} * stride;
+            mismatch[env] = mismatch[env] ||
+                std::memcmp(reset.data() + start, expected.data() + start, stride) != 0;
+        }
+        offset += bytes;
+    }
+    std::vector<uint32_t> result;
+    for (uint32_t env = 0u; env < cap.env_count; ++env)
         if (mismatch[env]) result.push_back(env);
     return result;
 }
@@ -1777,6 +1801,10 @@ Json Run(const Options& options) {
         output.write(reinterpret_cast<const char*>(replay_state.data()), replay_state.size());
         fixture::Require(output.good(), "cannot write state output");
     }
+    const std::vector<uint32_t> reset_envs{0u};
+    fixture::Require(world.Reset(reset_envs) == phi::Status::Ok, "masked reset failed");
+    const auto masked_reset_errors = MaskedResetMismatches(world, initial, physical_state,
+                                                         State(world, false), reset_envs);
     const double quality_ms = Milliseconds(quality_start);
 
     Json result = Json::Object(), execution = Json::Object(), timing = Json::Object();
@@ -1938,6 +1966,10 @@ Json Run(const Options& options) {
     quality.Set("status_first_failure_scope",
                 Json::Str("untimed quality replay including warmup; 1-based steps, zero step/flags means no observed failure"));
     quality.Set("reset_state_equal", Json::Bool(reset_equal));
+    quality.Set("masked_reset_state_equal", Json::Bool(masked_reset_errors.empty()));
+    Json masked_errors = Json::Array();
+    for (uint32_t env : masked_reset_errors) masked_errors.PushBack(Json::Int(env));
+    quality.Set("masked_reset_mismatch_envs", std::move(masked_errors));
     quality.Set("timed_replay_bit_equal", Json::Bool(timed_state == replay_state));
     quality.Set("state_fnv1a64", Json::Str(Digest(replay_state)));
     quality.Set("authoritative_state_fnv1a64", Json::Str(Digest(
@@ -1970,7 +2002,7 @@ Json Run(const Options& options) {
     hardware.Set("total_device_bytes", Json::Int(properties.totalGlobalMem));
     result.Set("hardware", std::move(hardware));
     Json validity = Json::Object(), unavailable = Json::Array();
-    const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && timed_state == replay_state &&
+    const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && masked_reset_errors.empty() && timed_state == replay_state &&
                        solver_workload_valid &&
                        coupling_valid && mismatched_envs.empty() && xpbd_acceptance.Valid() && render_valid &&
                        timed_sensors == replay_sensors;
@@ -1987,6 +2019,7 @@ Json Run(const Options& options) {
     if (xpbd_acceptance.first_undefined_strain_step != 0u) failures.PushBack(Json::Str("cloth strain is undefined in quality replay"));
     if (xpbd_acceptance.first_strain_failure_step != 0u) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
     if (!coupling_valid) failures.PushBack(Json::Str("missing rows or positive impulse for a required system pair in the timed window of an environment"));
+    if (!masked_reset_errors.empty()) failures.PushBack(Json::Str("masked reset changed unselected state or missed selected state"));
     if (!render_valid) failures.PushBack(Json::Str("sensor lifecycle, output or physics parity failed"));
     if (timed_sensors != replay_sensors) failures.PushBack(Json::Str("mounted sensor replay mismatch"));
     validity.Set("failures", std::move(failures));

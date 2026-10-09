@@ -46,7 +46,7 @@ struct ModelView {
     float* joint_armature = nullptr;  // per:link arena:persistent owner:model flags:[param]
     uint32_t* articulation_link_count = nullptr;  // per:articulation arena:persistent owner:model
     uint32_t* articulation_link_offset = nullptr;  // per:articulation arena:persistent owner:model
-    float* foot_shape = nullptr;  // per:scalar arena:persistent owner:model count:max_contacts_per_env*5
+    float* foot_shape = nullptr;  // per:scalar arena:persistent owner:model count:foot_shape_count*5
     float* hull_verts = nullptr;  // per:scalar arena:persistent owner:model count:max_hull_verts*3
     uint32_t* dof_to_link = nullptr;  // per:dof arena:persistent owner:model
     uint32_t* dof_to_component = nullptr;  // per:dof arena:persistent owner:model
@@ -59,9 +59,9 @@ struct ModelView {
     uint64_t* sdf_cell_keys = nullptr;  // per:scalar arena:persistent owner:model count:max_sdf_cells
     float* sdf_cell_values = nullptr;  // per:scalar arena:persistent owner:model count:max_sdf_cells
     ::nuka::math::Vec3* sdf_cell_gradients = nullptr;  // per:scalar arena:persistent owner:model count:max_sdf_cells
-    uint32_t* island_row_offsets = nullptr;  // per:row_slot arena:persistent owner:model elem:4
-    uint32_t* island_color_segments = nullptr;  // per:row_slot arena:persistent owner:model elem:2
-    uint32_t* row_order = nullptr;  // per:row_slot arena:persistent owner:model
+    uint32_t* island_row_offsets = nullptr;  // per:scalar arena:persistent owner:model elem:4 count:schedule_island_elements
+    uint32_t* island_color_segments = nullptr;  // per:scalar arena:persistent owner:model elem:2 count:schedule_color_elements
+    uint32_t* row_order = nullptr;  // per:scalar arena:persistent owner:model count:schedule_row_elements
     uint32_t* dist_particle_a = nullptr;  // per:dist_con arena:persistent owner:model
     uint32_t* dist_particle_b = nullptr;  // per:dist_con arena:persistent owner:model
     float* dist_rest_length = nullptr;  // per:dist_con arena:persistent owner:model

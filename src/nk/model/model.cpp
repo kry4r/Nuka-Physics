@@ -171,6 +171,9 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         (id == FieldId::ParticleResponse || id == FieldId::ParticleRowImpulse ||
          id == FieldId::VbdHistoryReady)) return 0u;
     if (lay.per == FieldPer::Scalar) {
+        if (id == FieldId::IslandRowOffsets) return schedule_island_elements;
+        if (id == FieldId::IslandColorSegments) return schedule_color_elements;
+        if (id == FieldId::RowOrder) return schedule_row_elements;
         if (id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerStatus ||
             id == FieldId::VbdForceResidualWork || id == FieldId::PhysicsStageMetrics ||
             id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
@@ -238,11 +241,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
             return static_cast<uint64_t>(num_material_buckets) *
                    ModelMaterialBucket::kValueCount;
         }
-        if (id == FieldId::FootShape) {
-            // GLOBAL foot table (shared by every env, base-relative indices):
-            // 5 packed scalars per slot, max_contacts_per_env slots.
-            return static_cast<uint64_t>(max_contacts_per_env) * 5ull;
-        }
+        if (id == FieldId::FootShape) return uint64_t{foot_shape_count} * 5u;
         // L1-c: FieldId::UnionSlots staging size was DELETED with the field.
         if (id == FieldId::HullVerts) {
             // GLOBAL convex-hull vertex pool, xyz packed.
@@ -614,8 +613,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
         case FieldId::FootShape: {
             // GLOBAL table: 5 packed scalars per slot {link bits, off.xyz, radius}.
             auto* p = reinterpret_cast<float*>(dst);
-            const uint32_t slots = capacities.max_contacts_per_env;
-            for (uint32_t f = 0; f < feet.size() && f < slots; ++f) {
+            for (uint32_t f = 0; f < feet.size(); ++f) {
                 uint32_t link_bits = feet[f].calf_local_link;
                 std::memcpy(&p[static_cast<size_t>(f) * 5 + 0], &link_bits, 4);
                 p[static_cast<size_t>(f) * 5 + 1] = feet[f].local_offset.x;
@@ -899,28 +897,19 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         case FieldId::RowOrder: {
             if (!schedule_row_order.empty()) {
-                const size_t cap = static_cast<size_t>(capacities.max_rows_per_env) * E;
-                const size_t n = schedule_row_order.size() < cap
-                                     ? schedule_row_order.size() : cap;
-                std::memcpy(dst, schedule_row_order.data(), n * sizeof(uint32_t));
+                std::memcpy(dst, schedule_row_order.data(), schedule_row_order.size() * sizeof(uint32_t));
             }
             break;
         }
         case FieldId::IslandColorSegments: {
             if (!schedule_color_segments.empty()) {
-                const size_t cap = static_cast<size_t>(capacities.max_rows_per_env) * E * 2u;
-                const size_t n = schedule_color_segments.size() < cap
-                                     ? schedule_color_segments.size() : cap;
-                std::memcpy(dst, schedule_color_segments.data(), n * sizeof(uint32_t));
+                std::memcpy(dst, schedule_color_segments.data(), schedule_color_segments.size() * sizeof(uint32_t));
             }
             break;
         }
         case FieldId::IslandRowOffsets: {
             if (!schedule_islands.empty()) {
-                const size_t cap = static_cast<size_t>(capacities.max_rows_per_env) * E * 4u;
-                const size_t n = schedule_islands.size() < cap
-                                     ? schedule_islands.size() : cap;
-                std::memcpy(dst, schedule_islands.data(), n * sizeof(uint32_t));
+                std::memcpy(dst, schedule_islands.data(), schedule_islands.size() * sizeof(uint32_t));
             }
             break;
         }
@@ -1911,6 +1900,7 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     if (topology_status != phi::Status::Ok) return topology_status;
     BuildAeroAdjacency();
     BuildParticleTopology();
+    capacities.foot_shape_count = static_cast<uint32_t>(feet.size());
     // Capacity contracts (loud-failure discipline): the cooked host tables MUST
     // fit their advertised capacities, else staging would SILENTLY drop the tail
     // (a truncated device model that simulates wrong with no diagnostic). The
@@ -1919,7 +1909,6 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     // NDEBUG strips) when a data-driven count overflows its capacity -- never a
     // silent truncate.
     const bool capacities_ok =
-        feet.size() <= capacities.max_contacts_per_env &&
         shape_table_rows.size() <= capacities.max_bodies_total &&
         hull_verts.size() <= static_cast<size_t>(capacities.max_hull_verts) * 3u &&
         mesh_surface_info.size() <= capacities.ElementCount(FieldId::MeshSurfaceInfo) &&

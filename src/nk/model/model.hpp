@@ -51,6 +51,10 @@ struct ModelCapacities {
     uint32_t bodies_per_env  = 0;   // movable rigid body count / env.
     uint32_t max_contacts_per_env = 0;  // contact-slot capacity / env.
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
+    uint32_t foot_shape_count = 0u;
+    uint64_t schedule_island_elements = 0u;
+    uint64_t schedule_color_elements = 0u;
+    uint64_t schedule_row_elements = 0u;
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
     uint32_t joint_friction_rows_per_env = 0; // one scalar slot per link when friction is authored
     uint32_t joint_drive_rows_per_env = 0;

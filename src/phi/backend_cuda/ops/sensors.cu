@@ -144,30 +144,34 @@ __global__ void ReadoutContactImpulseKernel(ModelView model, DataView data, Read
     const auto origin = MidpointOrigin(p, frame);
     const auto* rows = reinterpret_cast<const nk::NkRow*>(data.urows);
     sensor::WrenchImpulse sum{};
-    for (uint32_t slot = threadIdx.x; slot < p.slots_per_env; slot += blockDim.x) {
-        const uint32_t global_slot = env * p.slots_per_env + slot;
-        const uint32_t points = data.ucontact_count[global_slot];
-        if (!points) continue;
-        const uint32_t point_base = global_slot * nk::kPairDrivenPtsPerSlot;
-        const bool side_a = ContactMountMatches(model, p, env, local,
-            data.ucontact_a_kind[point_base], data.ucontact_a[point_base]);
-        const bool side_b = ContactMountMatches(model, p, env, local,
-            data.ucontact_b_kind[point_base], data.ucontact_b[point_base]);
-        if (!side_a && !side_b) continue;
-        uint32_t count;
-        const uint32_t base = ContactRowBase(p, env, slot, count);
-        for (uint32_t point = 0u; point < points && point < count; ++point) {
-            const auto arm = data.ucontact_point[point_base + point] - origin;
-            for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
-                const uint32_t index = base + axis * count + point;
-                const auto& row = rows[index];
-                if (!(row.flags & nk::nk_row_flags::kActive)) continue;
-                math::Vec3 direction{};
-                if (side_a) direction += row.a.jlin;
-                if (side_b) direction += row.b.jlin;
-                const auto impulse = direction * data.lambda[index];
-                sum.linear += impulse;
-                sum.angular += arm.Cross(impulse);
+    for (uint32_t family = 0u; family < 2u; ++family) {
+        const uint32_t begin = family == 0u ? 0u : p.rigid_slots_per_env;
+        const uint32_t end = family == 0u ? p.rigid_slots_per_env : p.slots_per_env;
+        for (uint32_t slot = begin + threadIdx.x; slot < end; slot += blockDim.x) {
+            const uint32_t global_slot = env * p.slots_per_env + slot;
+            const uint32_t points = data.ucontact_count[global_slot];
+            if (!points) continue;
+            const uint32_t point_base = global_slot * nk::kPairDrivenPtsPerSlot;
+            const bool side_a = ContactMountMatches(model, p, env, local,
+                data.ucontact_a_kind[point_base], data.ucontact_a[point_base]);
+            const bool side_b = ContactMountMatches(model, p, env, local,
+                data.ucontact_b_kind[point_base], data.ucontact_b[point_base]);
+            if (!side_a && !side_b) continue;
+            uint32_t count;
+            const uint32_t base = ContactRowBase(p, env, slot, count);
+            for (uint32_t point = 0u; point < points && point < count; ++point) {
+                const auto arm = data.ucontact_point[point_base + point] - origin;
+                for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
+                    const uint32_t index = base + axis * count + point;
+                    const auto& row = rows[index];
+                    if (!(row.flags & nk::nk_row_flags::kActive)) continue;
+                    math::Vec3 direction{};
+                    if (side_a) direction += row.a.jlin;
+                    if (side_b) direction += row.b.jlin;
+                    const auto impulse = direction * data.lambda[index];
+                    sum.linear += impulse;
+                    sum.angular += arm.Cross(impulse);
+                }
             }
         }
     }
@@ -242,43 +246,47 @@ __global__ void ReadoutContactRegionKernel(ModelView model, DataView data, Reado
     const auto inverse = InverseRotation(RotationMidpoint(before.pose.rotation, after.pose.rotation));
     const auto* rows = reinterpret_cast<const nk::NkRow*>(data.urows);
     math::Vec3 sum{};
-    for (uint32_t slot = threadIdx.x; slot < p.slots_per_env; slot += blockDim.x) {
-        const uint32_t global_slot = env * p.slots_per_env + slot;
-        const uint32_t points = data.ucontact_count[global_slot];
-        if (!points) continue;
-        const uint32_t point_base = global_slot * nk::kPairDrivenPtsPerSlot;
-        const bool sides[] = {
-            ContactMountMatches(model, p, env, p.frame, data.ucontact_a_kind[point_base], data.ucontact_a[point_base]),
-            ContactMountMatches(model, p, env, p.frame, data.ucontact_b_kind[point_base], data.ucontact_b[point_base])};
-        if (!sides[0] && !sides[1]) continue;
-        uint32_t count;
-        const uint32_t base = ContactRowBase(p, env, slot, count);
-        for (uint32_t point = 0u; point < points && point < count; ++point) {
-            const auto& normal_row = rows[base + point];
-            if (!(normal_row.flags & nk::nk_row_flags::kActive)) continue;
-            const auto position = mg::RotateByQuatNormalized(inverse, data.ucontact_point[point_base + point] - origin);
-            for (uint32_t side = 0u; side < 2u; ++side) {
-                if (!sides[side]) continue;
-                const auto normal = side == 0u ? normal_row.a.jlin : normal_row.b.jlin;
-                const auto local_normal = mg::RotateByQuatNormalized(inverse, normal);
-                if (p.kind == sensor::StateSensorKind::Touch) {
-                    const float magnitude = sqrtf(normal.Dot(normal)) * data.lambda[base + point];
-                    if (magnitude > 0.0f && sensor::TouchRegionIntersectsRay(p.config, position, local_normal * -1.0f))
-                        sum.x += magnitude;
-                    continue;
+    for (uint32_t family = 0u; family < 2u; ++family) {
+        const uint32_t begin = family == 0u ? 0u : p.rigid_slots_per_env;
+        const uint32_t end = family == 0u ? p.rigid_slots_per_env : p.slots_per_env;
+        for (uint32_t slot = begin + threadIdx.x; slot < end; slot += blockDim.x) {
+            const uint32_t global_slot = env * p.slots_per_env + slot;
+            const uint32_t points = data.ucontact_count[global_slot];
+            if (!points) continue;
+            const uint32_t point_base = global_slot * nk::kPairDrivenPtsPerSlot;
+            const bool sides[] = {
+                ContactMountMatches(model, p, env, p.frame, data.ucontact_a_kind[point_base], data.ucontact_a[point_base]),
+                ContactMountMatches(model, p, env, p.frame, data.ucontact_b_kind[point_base], data.ucontact_b[point_base])};
+            if (!sides[0] && !sides[1]) continue;
+            uint32_t count;
+            const uint32_t base = ContactRowBase(p, env, slot, count);
+            for (uint32_t point = 0u; point < points && point < count; ++point) {
+                const auto& normal_row = rows[base + point];
+                if (!(normal_row.flags & nk::nk_row_flags::kActive)) continue;
+                const auto position = mg::RotateByQuatNormalized(inverse, data.ucontact_point[point_base + point] - origin);
+                for (uint32_t side = 0u; side < 2u; ++side) {
+                    if (!sides[side]) continue;
+                    const auto normal = side == 0u ? normal_row.a.jlin : normal_row.b.jlin;
+                    const auto local_normal = mg::RotateByQuatNormalized(inverse, normal);
+                    if (p.kind == sensor::StateSensorKind::Touch) {
+                        const float magnitude = sqrtf(normal.Dot(normal)) * data.lambda[base + point];
+                        if (magnitude > 0.0f && sensor::TouchRegionIntersectsRay(p.config, position, local_normal * -1.0f))
+                            sum.x += magnitude;
+                        continue;
+                    }
+                    if (!(local_normal.z < 0.0f)) continue;
+                    const float weight = sensor::TaxelWeight(p.config, position);
+                    if (!(weight > 0.0f)) continue;
+                    math::Vec3 impulse{};
+                    for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
+                        const uint32_t index = base + axis * count + point;
+                        const auto& row = rows[index];
+                        if (!(row.flags & nk::nk_row_flags::kActive)) continue;
+                        impulse += (side == 0u ? row.a.jlin : row.b.jlin) * data.lambda[index];
+                    }
+                    const auto local_impulse = mg::RotateByQuatNormalized(inverse, impulse) * weight;
+                    sum += math::Vec3{local_impulse.x, local_impulse.y, -local_impulse.z};
                 }
-                if (!(local_normal.z < 0.0f)) continue;
-                const float weight = sensor::TaxelWeight(p.config, position);
-                if (!(weight > 0.0f)) continue;
-                math::Vec3 impulse{};
-                for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
-                    const uint32_t index = base + axis * count + point;
-                    const auto& row = rows[index];
-                    if (!(row.flags & nk::nk_row_flags::kActive)) continue;
-                    impulse += (side == 0u ? row.a.jlin : row.b.jlin) * data.lambda[index];
-                }
-                const auto local_impulse = mg::RotateByQuatNormalized(inverse, impulse) * weight;
-                sum += math::Vec3{local_impulse.x, local_impulse.y, -local_impulse.z};
             }
         }
     }

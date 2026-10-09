@@ -38,4 +38,19 @@ enum ShapeKind : uint32_t {
     kShapeTrianglePrism = 7u, // per-cell midphase prism (G2/H3; inert Phase 0)
 };
 
+#if defined(__CUDACC__)
+#define NUKA_COLLISION_HD __host__ __device__
+#else
+#define NUKA_COLLISION_HD
+#endif
+
+NUKA_COLLISION_HD inline bool ShapeFilterAdmits(uint32_t contype_a, uint32_t conaffinity_a,
+                                               uint32_t group_a, uint32_t contype_b,
+                                               uint32_t conaffinity_b, uint32_t group_b) {
+    if (((contype_a & conaffinity_b) | (contype_b & conaffinity_a)) == 0u) return false;
+    const int32_t ga = static_cast<int32_t>(group_a);
+    const int32_t gb = static_cast<int32_t>(group_b);
+    return !(ga != 0 && gb != 0 && (ga > 0 ? ga != gb && gb > 0 : ga == gb));
+}
+
 }  // namespace nuka::collision

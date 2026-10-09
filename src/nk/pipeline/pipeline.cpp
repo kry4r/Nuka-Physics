@@ -169,14 +169,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
          uint64_t{cap.vbd_particle_begin} + cap.vbd_vertices_per_env > cap.particles_per_env))
         return phi::Status::InvalidArgument;
     const bool has_mpm = grid_particles_per_env > 0u && cap.mpm_grid_nodes_per_env > 0u;
-    // gate the contact pipeline (SyncLinkBodyPose / broadphase / narrowphase)
-    // on actual contact capacity. For every cooked-with-contacts world this equals
-    // the old structural test -- the cook sizes max_contacts_per_env ==
-    // (bodies+links)*4 > 0 whenever a body/link exists, so op selection is
-    // byte-identical. A contacts-OFF cook (CookToModelOptions::enable_contacts ==
-    // false) zeroes max_contacts_per_env, so the broadphase + narrowphase + the
-    // FK->body_pose sync are all skipped -> the world runs pure articulation+rigid
-    // dynamics and StepPlanned captures cleanly (no thrust LBVH mid-graph).
     const bool has_collidables  =
         (has_bodies || cap.links_per_env > 0) && cap.max_contacts_per_env > 0;
     std::printf("[Pipeline] has_bodies=%d links_per_env=%u max_contacts_per_env=%u -> has_collidables=%d\n",
@@ -215,10 +207,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     const uint32_t particle_reserve = static_cast<uint32_t>(particle_reserve64);
     const uint32_t rigid_cap = cap.max_contacts_per_env - particle_reserve -
                                cap.ogc_contacts_per_env - cap.mpm_contact_capacity_per_env;
-    const uint32_t default_pair_cap =
-        cap.bodies_per_env * 4u < rigid_cap ? cap.bodies_per_env * 4u : rigid_cap;
     const uint32_t pair_emit_cap =
-        cfg.max_pairs == 0u ? default_pair_cap
+        cfg.max_pairs == 0u ? rigid_cap
                             : (cfg.max_pairs < rigid_cap ? cfg.max_pairs : rigid_cap);
     const uint32_t contact_rows_per_env =
         rigid_cap * kPairDrivenRowsPerSlot +
@@ -556,19 +546,15 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::FkWorldPoses, &p_fk_);
     }
 
-    if (has_collidables) {
-        // General contact pipeline (B2): SyncLinkBodyPose. Runs AFTER
-        // FkWorldPoses (the link_pose it reads) and BEFORE BuildAabbs (the
-        // body_pose it writes, which the AABB build consumes) so articulation
-        // links enter the LBVH. PairDriven-family-gated -> a no-op for the
-        // UnionCsr family (the captured graph still ENQUEUES it, but the op
-        // early-exits and writes nothing), so the union goldens are byte-identical.
+    if (has_bodies) {
         p_sync_body_pose_.family = family;
         p_sync_body_pose_.env_count = env_count;
-        p_sync_body_pose_.links_per_env = cap.links_per_env;  // PER-ENV stride
+        p_sync_body_pose_.links_per_env = cap.links_per_env;
         p_sync_body_pose_.bodies_per_env = cap.bodies_per_env;
         add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
+    }
 
+    if (has_collidables) {
         // broadphase (BuildAabbs/LbvhBuild/LbvhQueryPairs). These ops drive
         // the ONE general PairDriven contact path. The family + per-env body
         // geometry travel in the params (the views are pure pointer aggregates).
@@ -1120,7 +1106,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     if (cap.ogc_contacts_per_env > 0u) {
         if (has_articulation) add(phi::NkOp::FkWorldPoses, &p_fk_);
-        if (has_collidables) add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
+        if (has_bodies) add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
         if (cap.particle_surfaces_per_env > 0u) {
             p_dat_refit_ = p_particle_surfaces_;
             p_dat_refit_.position_source = 1u;
@@ -1145,7 +1131,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_fk_velocity_.total_link_count = total_link_count;
         add(phi::NkOp::FkLinkVelocities, &p_fk_velocity_);
     }
-    if (has_collidables) add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
+    if (has_bodies) add(phi::NkOp::SyncLinkBodyPose, &p_sync_body_pose_);
 
     energy(EnergyStage::End);
 

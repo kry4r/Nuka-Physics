@@ -159,9 +159,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 8, 0},  // sdf_cell_keys
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // sdf_cell_values
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 3, 12, 0},  // sdf_cell_gradients
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 4, 1, 16, 0},  // island_row_offsets
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 2, 1, 8, 0},  // island_color_segments
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::RowSlot, 1, 1, 4, 0},  // row_order
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 4, 1, 16, 0},  // island_row_offsets
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 2, 1, 8, 0},  // island_color_segments
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // row_order
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_prev_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_vel
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_inv_mass

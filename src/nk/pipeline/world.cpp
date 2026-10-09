@@ -237,7 +237,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         (cap.particle_surfaces_per_env > 0u || cap.mesh_vertex_source_count > 0u))
         model_.capacities.contact_cache_scratch_bytes = std::max(cap.contact_cache_scratch_bytes,
             phi::OgcOrderScratchBytes(cap.ogc_contacts_per_env, cap.env_count));
-    model_.capacities.contact_index_scratch_bytes = cap.links_per_env > 0u && cap.max_contacts_per_env > 0u
+    model_.capacities.contact_index_scratch_bytes = cap.links_per_env > 0u && cap.max_rows_per_env > 0u
         ? phi::ContactIndexScratchBytes(cap.max_rows_per_env * cap.env_count, cap.env_count) : 0u;
     model_.capacities.solver_velocity_scratch_bytes = cap.max_rows_per_env > 0u
         ? phi::SolverVelocityScratchBytes(cap.bodies_per_env * cap.env_count,
@@ -264,6 +264,9 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     // BEFORE UploadTo, which stages the triple into the Model device buffer.
     // Runtime steps never re-color (the plan-replay anchor).
     SolveSchedule::Build(&model_);
+    model_.capacities.schedule_island_elements = model_.schedule_islands.size() / 4u;
+    model_.capacities.schedule_color_elements = model_.schedule_color_segments.size() / 2u;
+    model_.capacities.schedule_row_elements = model_.schedule_row_order.size();
 
     // 0b. Graph-color the XPBD constraint families ONCE (a general solver
     // property): reorder each family into color-contiguous order so the device

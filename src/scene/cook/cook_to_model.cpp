@@ -64,11 +64,6 @@ namespace {
 // DERIVE obs_width from the cooked link count instead of a baked buffer width.
 constexpr uint32_t kObsBasePoseFloats = 7u;        // pos.xyz + quat.wxyz
 constexpr uint32_t kObsChannelsPerLink = 2u;       // q + qdot per link
-// Per-collidable candidate-pair budget for the general LBVH broadphase: the
-// per-env candidate-slot capacity == collidable_count * this. Named (not a baked
-// FusedFoot foot count) so the contact buffer grows with the cooked geometry.
-constexpr uint32_t kCandidatePairsPerCollidable = 4u;
-
 // One EXTRA collision shape of a multi-collidable owner. Materialized into an
 // appended collidable body row so an owner can hold several collidables. The
 // owner is EITHER an articulation link (owner_link set; its FIRST shape folds
@@ -249,14 +244,22 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
     cap.max_rows_per_env = static_cast<uint32_t>(total_rows);
 }
 
-static uint32_t DefaultRigidCandidatePairs(uint32_t collidables) {
-    const uint64_t pairs = static_cast<uint64_t>(collidables) *
-                           static_cast<uint64_t>(kCandidatePairsPerCollidable);
-    if (pairs > 0xFFFFFFFFull) {
-        throw std::runtime_error(
-            "CookToModel: default rigid candidate-pair capacity overflows u32");
+static uint64_t RigidCandidatePairs(const nk::Model& model) {
+    uint64_t admitted = 0u;
+    const uint32_t collidables = model.capacities.bodies_per_env;
+    for (uint32_t a = 0u; a < collidables; ++a) {
+        const auto& sa = model.shape_table_rows[a];
+        for (uint32_t b = a + 1u; b < collidables; ++b) {
+            const auto& sb = model.shape_table_rows[b];
+            if ((sa.body_id < 0 && sb.body_id < 0) ||
+                !::nuka::collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
+                    sb.contype, sb.conaffinity, sb.group) ||
+                std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
+                                   (uint64_t{a} << 32u) | b)) continue;
+            ++admitted;
+        }
     }
-    return static_cast<uint32_t>(pairs);
+    return admitted;
 }
 
 }  // namespace
@@ -991,18 +994,6 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     // collide); the cooked filter pair lists ride the blob for .
     model.filter_cross_env = false;
 
-    // 9. Contact / row capacities. Ordinary scenes use a bounded default reserve
-    // that scales with cooked collidables. Explicit `solver_max_pairs` is clamped
-    // to this reserve; broadphase overflow is surfaced through env_status rather
-    // than silently writing out of bounds. Terrain cooking recomputes the same
-    // reserve after adding its explicit heightfield leaf.
-    {
-        cap.max_contacts_per_env = cap.bodies_per_env > 1u
-            ? DefaultRigidCandidatePairs(cap.bodies_per_env) : 0u;
-        SetRowCapacity(cap,
-                       static_cast<uint64_t>(cap.max_contacts_per_env) *
-                           nk::kPairDrivenRowsPerSlot);
-    }
     // Contacts-OFF dynamics world (the general-path equivalent of the legacy
     // single-env enable_contacts==false): zero the per-env contact/candidate
     // budget so the pipeline emits NO broadphase/narrowphase/solve ops (has_-
@@ -1366,16 +1357,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_hull_verts = static_cast<uint32_t>(model.hull_verts.size() / 3u);
         cap.max_samp_points = static_cast<uint32_t>(model.samp_points.size() / 3u);
         cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
-        if (enable_contacts) {
-            cap.max_contacts_per_env = DefaultRigidCandidatePairs(final_bodies);
-            SetRowCapacity(cap,
-                           static_cast<uint64_t>(cap.max_contacts_per_env) *
-                               nk::kPairDrivenRowsPerSlot);
-        } else {
-            cap.max_contacts_per_env = 0u;
-            SetRowCapacity(cap, 0u);
-        }
     }
+
+    const uint64_t rigid_pairs = enable_contacts ? RigidCandidatePairs(model) : 0u;
+    SetRowCapacity(cap, rigid_pairs * nk::kPairDrivenRowsPerSlot);
+    cap.max_contacts_per_env = static_cast<uint32_t>(rigid_pairs);
 
     for (uint32_t body = 0u; body < cap.bodies_per_env; ++body) {
         if (body >= model.shape_table_rows.size() ||
@@ -1404,8 +1390,7 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                             cap.mesh_edge_source_count > 0u)) {
         const uint64_t features = uint64_t{cap.mesh_vertex_source_count} +
                                   cap.mesh_edge_source_count;
-        const uint64_t reserve = std::min<uint64_t>(features,
-            uint64_t{cap.max_contacts_per_env} * 2u * nk::kPairDrivenPtsPerSlot);
+        const uint64_t reserve = features;
         if (reserve > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("mesh contact capacity exceeds device indexing");
         SetOgcContactCapacity(model, static_cast<uint32_t>(reserve));
@@ -1539,17 +1524,6 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count,
             }
         }
     }
-    // The general per-candidate-slot row budget. The broadphase emits up to
-    // max_contacts_per_env candidate slots per env; the assembly expands each into
-    // kPairDrivenRowsPerSlot NkRows. The schedule + the assembly both read this.
-    nk::ModelCapacities& cap = model.capacities;
-    if (cap.max_contacts_per_env > 0u) {
-        SetRowCapacity(cap,
-                       static_cast<uint64_t>(cap.max_contacts_per_env) *
-                           nk::kPairDrivenRowsPerSlot);
-    } else {
-        SetRowCapacity(cap, 0u);
-    }
     return result;
 }
 
@@ -1632,18 +1606,12 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
     const uint32_t body_row = CookHeightfieldGrid(model, hf);
 
     nk::ModelCapacities& cap = model.capacities;
-    // bodies_per_env (the LBVH leaf count) now includes the static terrain collidable;
-    // the CONTACT budget is the dynamic collidables (+1 static) at the shared
-    // per-collidable slot rate -- the SAME rule the body cook uses.
     cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
     cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
-    const uint32_t rigid_base = DefaultRigidCandidatePairs(cap.bodies_per_env);
+    const uint64_t rigid_pairs = RigidCandidatePairs(model);
+    SetRowCapacity(cap, rigid_pairs * nk::kPairDrivenRowsPerSlot);
+    const uint32_t rigid_base = static_cast<uint32_t>(rigid_pairs);
     cap.max_contacts_per_env = rigid_base;
-    SetRowCapacity(cap,
-                   static_cast<uint64_t>(cap.max_contacts_per_env) *
-                       nk::kPairDrivenRowsPerSlot);
-    // A coupled world (terrain AND particles) keeps the body<->particle slot reserve
-    // disjoint above the rigid base -- no-op when particles_per_env == 0.
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
     return body_row;
 }
@@ -1856,8 +1824,7 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
                                    cap.particle_surface_edges_per_env;
     const uint64_t body_features = uint64_t{cap.mesh_vertex_source_count} +
                                    cap.mesh_edge_source_count;
-    const uint64_t body_reserve = std::min<uint64_t>(body_features,
-        uint64_t{rigid_base} * 2u * nk::kPairDrivenPtsPerSlot + cloth_sources);
+    const uint64_t body_reserve = body_features;
     const uint64_t ogc_slots = cloth_sources +
         (has_body_mesh ? cloth_sources + body_reserve : 0u);
     if (ogc_slots > std::numeric_limits<uint32_t>::max())

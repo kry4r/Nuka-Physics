@@ -164,10 +164,9 @@ fields:
   # the count is articulations_per_env == 1 == per:env, so the bytes are identical.
   - {name: articulation_link_count,  dtype: u32, per: articulation, arena: persistent, owner: model}
   - {name: articulation_link_offset, dtype: u32, per: articulation, arena: persistent, owner: model}
-  # Foot-shape table (legacy articulation::FootShape feet_ buffer 1:1): a GLOBAL
-  # table (shared by all envs, base-relative link indices), 5 scalars per slot
-  # {calf_local_link(u32 bits), offset.xyz, radius}, max_contacts_per_env slots.
-  - {name: foot_shape, dtype: f32, per: scalar, count: "max_contacts_per_env*5", arena: persistent, owner: model}
+  # Shared foot rows use base-relative link indices and five scalars per foot:
+  # calf-local-link bits, local offset.xyz and radius.
+  - {name: foot_shape, dtype: f32, per: scalar, count: "foot_shape_count*5", arena: persistent, owner: model}
 
   # =========================================================================
   # RIGID BODY SoA — DATA. Source: runtime::rigid::BodyState. body_pose +
@@ -384,9 +383,9 @@ fields:
   #                               articulation rows -> owns the qdot scatter).
   # Capacities: islands <= row slots, segments <= row slots.
   # =========================================================================
-  - {name: island_row_offsets,    dtype: u32, per: row_slot, arena: persistent, owner: model, elem: 4}
-  - {name: island_color_segments, dtype: u32, per: row_slot, arena: persistent, owner: model, elem: 2}
-  - {name: row_order,             dtype: u32, per: row_slot, arena: persistent, owner: model}
+  - {name: island_row_offsets,    dtype: u32, per: scalar, count: "schedule_island_elements", arena: persistent, owner: model, elem: 4}
+  - {name: island_color_segments, dtype: u32, per: scalar, count: "schedule_color_elements", arena: persistent, owner: model, elem: 2}
+  - {name: row_order,             dtype: u32, per: scalar, count: "schedule_row_elements", arena: persistent, owner: model}
 
   # =========================================================================
   # PARTICLE (XPBD soft) — DATA. Source: nk soft ops. particle_pos above (§3.3).
