@@ -86,7 +86,7 @@
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4"><img src="docs/media/microduck_ball_dynamic_lab.gif" width="100%" alt="Microduck taking alternating steps while balancing on a freely rolling ball in Nuka Dynamics Lab"></a>
   <br><b>Microduck Ball Balance</b>
-  <br>Newton-trained RL · Nuka physics
+  <br>Pure Nuka Physics RL
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4">1080p video</a>
 </td>
 <td width="50%" align="center" valign="top">
