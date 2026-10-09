@@ -110,16 +110,16 @@ __forceinline__ __device__ uint32_t LocalDofIndex(const ArticulationDeviceState&
     return LocalDofIndexDevice(state, offset, link);
 }
 
-// (1) Dense symmetric M per articulation via CRBA. One block, single lane.
+// Composite inertia preserves child order; independent columns fill the symmetric mass tile.
 __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
                                                   uint32_t max_dof,
                                                   LinkSpatialInertia* composite,
                                                   float* out_inertia_M,
                                                   const float* joint_damping,
-                                                  float dt) {
+                                                  float dt, ArticulationTreeView tree) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
+    if (articulation >= state.articulation_count) {
         return;
     }
 
@@ -128,59 +128,45 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
     const size_t tile_stride = static_cast<size_t>(max_dof) * max_dof;
     float* const M = out_inertia_M + static_cast<size_t>(articulation) * tile_stride;
 
-    // Zero the whole tile (leading dof_count block filled below; padding stays 0).
-    for (size_t i = 0u; i < tile_stride; ++i) {
+    for (size_t i = lane; i < tile_stride; i += blockDim.x) {
         M[i] = 0.0f;
     }
 
-    // Seed composite inertia from the rigid-body spatial inertia. We must NOT
-    // read link_articulated_I (ABA Pass-2 clobbers it); link_inertia is the
-    // pristine rigid-body inertia in each link's own frame.
-    for (uint32_t local = 0u; local < count; ++local) {
+    for (uint32_t local = lane; local < count; local += blockDim.x) {
         const uint32_t link = offset + local;
         Copy36Local(state.link_inertia[link].I, composite[link].I);
     }
 
-    // Composite leaf->root: Ic[parent] += X^T Ic[link] X (ABA Pass-2 without the
-    // articulated-inertia reduction). Fixed-DOF links still propagate their mass.
-    for (uint32_t reverse = count; reverse > 0u; --reverse) {
-        const uint32_t link = offset + reverse - 1u;
-        const uint32_t parent_local = state.parent_link[link];
-        if (parent_local == kInvalidLink) {
-            continue;
+    __syncthreads();
+    for (uint32_t depth = tree.max_depth[articulation]; depth > 0u; --depth) {
+        for (uint32_t local = lane; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] + 1u != depth) continue;
+            for (uint32_t index = tree.child_range[2u * link]; index < tree.child_range[2u * link + 1u]; ++index) {
+                const uint32_t child = tree.children[index];
+                float parent_delta[36];
+                TransformInertiaToParentLocal(state.link_xup[child], composite[child].I, parent_delta);
+                for (uint32_t i = 0u; i < 36u; ++i) composite[link].I[i] += parent_delta[i];
+            }
         }
-        float parent_delta[36];
-        TransformInertiaToParentLocal(state.link_xup[link], composite[link].I, parent_delta);
-        const uint32_t parent_link = offset + parent_local;
-        for (uint32_t i = 0u; i < 36u; ++i) {
-            composite[parent_link].I[i] += parent_delta[i];
-        }
+        __syncthreads();
     }
 
-    // T8b: floating-base leading 6x6 block (see articulation_contacts.cu).
     const bool floating_root =
         (count > 0u) &&
         (state.parent_link[offset] == kInvalidLink) &&
         (state.joint_type[offset] == ArticulationJointType::FloatingBase);
     if (floating_root && max_dof >= 6u) {
         const float* const root_I = composite[offset].I;
-        for (uint32_t r = 0u; r < 6u; ++r) {
-            for (uint32_t c = 0u; c < 6u; ++c) {
-                M[static_cast<size_t>(r) * max_dof + c] = root_I[r * 6u + c];
-            }
-        }
+        for (uint32_t entry = lane; entry < 36u; entry += blockDim.x)
+            M[size_t{entry / 6u} * max_dof + entry % 6u] = root_I[entry];
     }
 
-    // For each non-fixed joint i: F = Ic_i S_i (force in i's frame). M[i][i] =
-    // S_i^T F. Then walk to the root pushing F up by X^T at each step; at every
-    // non-fixed ancestor j, M[i][j] = M[j][i] = S_j^T F (F now in j's frame).
-    for (uint32_t local = 0u; local < count; ++local) {
+    for (uint32_t local = lane; local < count; local += blockDim.x) {
         const uint32_t link = offset + local;
         if (JointDofCountDevice(state.joint_type[link]) == 0u) {
             continue;
         }
-        // T8b: the floating root's leading block is filled above (S_base = I6); skip
-        // it here -- the scalar S_i path is meaningless for the 6-DOF base.
         if (local == 0u && floating_root) {
             continue;
         }
@@ -193,11 +179,8 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
         Mat66MulVec6Local(composite[link].I, state.joint_motion_subspace[link].s, force);
 
         float diagonal = Dot6Local(state.joint_motion_subspace[link].s, force);
-        // Reflected rotor inertia + floor (matches ABA Pass-2 diagonal guard).
         diagonal += state.joint_armature[link];
         diagonal += kInertiaDiagonalEpsilon;
-        // General implicit joint viscous damping (opt-in): fold dt*c into the
-        // joint diagonal (see articulation_contacts.cu for the full rationale).
         if (joint_damping != nullptr) {
             diagonal += dt * joint_damping[link];
         }
@@ -209,7 +192,6 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
             if (parent_local == kInvalidLink) {
                 break;
             }
-            // Push F from `walk`'s frame to its parent's frame.
             float pushed[6];
             TransformForceTransposeLocal(state.link_xup[walk], force, pushed);
             for (uint32_t i = 0u; i < 6u; ++i) {
@@ -223,7 +205,6 @@ __global__ void ComputeArticulationInertiaMKernel(ArticulationDeviceState state,
             if (dof_j >= max_dof) {
                 continue;
             }
-            // T8b: base<->joint coupling (see articulation_contacts.cu).
             if (walk == offset && floating_root) {
                 for (uint32_t b = 0u; b < 6u; ++b) {
                     if (b >= max_dof) {
@@ -337,88 +318,67 @@ __global__ void FactorArticulationInertiaMKernel(ArticulationDeviceState state,
 
 // Backward-Euler damping uses the factored mass and applies its velocity correction once.
 __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
-                                               const float* inertia_M_inv,
-                                               const float* joint_damping,
-                                               uint32_t dof_stride,
-                                               float dt, uint32_t* scratch,
-                                               uint32_t* err_status) {
+    const float* inertia_M_inv, const float* joint_damping, uint32_t dof_stride,
+    float dt, uint32_t* err_status) {
     const uint32_t articulation = blockIdx.x;
     const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
-        return;
-    }
-
+    if (articulation >= state.articulation_count) return;
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
-
-    const uint32_t actual_dof = ActualCrbaDof(state, articulation, dof_stride, err_status);
-    if (actual_dof == kInvalidLink) return;
-    const auto workspace = CrbaWorkspaceFor(scratch, articulation, dof_stride);
-    uint32_t* const dof_to_link = workspace.Indices(CrbaVector::DofLink);
-    uint32_t* const dof_to_component = workspace.Indices(CrbaVector::DofComponent);
-    uint32_t dof = 0u;
-    for (uint32_t local = 0u; local < count; ++local) {
-        const uint32_t link = offset + local;
-        const ArticulationJointType type = state.joint_type[link];
-        if (local == 0u && state.parent_link[link] == kInvalidLink &&
-            type == ArticulationJointType::FloatingBase) {
-            for (uint32_t b = 0u; b < 6u; ++b) {
-                dof_to_link[dof] = link;
-                dof_to_component[dof] = b;
-                ++dof;
+    extern __shared__ uint32_t words[];
+    uint32_t* const dof_to_link = words;
+    uint32_t* const dof_to_component = words + dof_stride;
+    float* const qdot_work = reinterpret_cast<float*>(words + 2u * dof_stride);
+    float* const c_qdot = qdot_work + dof_stride;
+    __shared__ uint32_t dof;
+    if (lane == 0u) {
+        dof = ActualCrbaDof(state, articulation, dof_stride, err_status);
+        if (dof != kInvalidLink) {
+            uint32_t index = 0u;
+            for (uint32_t local = 0u; local < count; ++local) {
+                const uint32_t link = offset + local;
+                const auto type = state.joint_type[link];
+                if (local == 0u && state.parent_link[link] == kInvalidLink &&
+                    type == ArticulationJointType::FloatingBase) {
+                    for (uint32_t component = 0u; component < 6u; ++component) {
+                        dof_to_link[index] = link;
+                        dof_to_component[index++] = component;
+                    }
+                } else if (JointDofCountDevice(type) != 0u) {
+                    dof_to_link[index] = link;
+                    dof_to_component[index++] = kInvalidLink;
+                }
             }
-            continue;
-        }
-        if (JointDofCountDevice(type) != 0u) {
-            dof_to_link[dof] = link;
-            dof_to_component[dof] = kInvalidLink;
-            ++dof;
         }
     }
-    if (dof == 0u || dof_stride == 0u) {
-        return;
-    }
-
-    // Working joint-velocity vector. Base DOFs seed from link_velocity[root].v
-    // (the omega-first base spatial velocity); scalar joint DOFs from state.qdot.
-    float* const qdot_work = workspace.Values(CrbaVector::QdotWork);
-    for (uint32_t k = 0u; k < dof; ++k) {
-        if (dof_to_component[k] != kInvalidLink) {
-            qdot_work[k] = state.link_velocity[dof_to_link[k]].v[dof_to_component[k]];
-        } else {
-            qdot_work[k] = state.qdot[dof_to_link[k]];
-        }
-    }
-
-    const size_t tile_stride = static_cast<size_t>(dof_stride) * dof_stride;
-    const float* const Minv =
-        inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
-
+    __syncthreads();
+    if (dof == kInvalidLink || dof == 0u || dof_stride == 0u) return;
+    for (uint32_t k = lane; k < dof; k += blockDim.x)
+        qdot_work[k] = dof_to_component[k] != kInvalidLink
+            ? state.link_velocity[dof_to_link[k]].v[dof_to_component[k]]
+            : state.qdot[dof_to_link[k]];
+    __syncthreads();
+    const size_t tile_stride = size_t{dof_stride} * dof_stride;
+    const float* const Minv = inertia_M_inv + size_t{articulation} * tile_stride;
     if (joint_damping != nullptr && dt > 0.0f) {
-        float* const c_qdot = workspace.Values(CrbaVector::DampingProduct);
-        for (uint32_t k = 0u; k < dof; ++k) {
-            const float c = (dof_to_component[k] == kInvalidLink)
-                                ? joint_damping[dof_to_link[k]]
-                                : 0.0f;
-            c_qdot[k] = c * qdot_work[k];  // C * qdot_half (qdot_half = seeded qdot_work)
+        for (uint32_t k = lane; k < dof; k += blockDim.x) {
+            const float c = dof_to_component[k] == kInvalidLink ? joint_damping[dof_to_link[k]] : 0.0f;
+            c_qdot[k] = c * qdot_work[k];
         }
-        for (uint32_t r = 0u; r < dof; ++r) {
+        __syncthreads();
+        for (uint32_t r = lane; r < dof; r += blockDim.x) {
             float acc = 0.0f;
-            const float* const minv_row = Minv + static_cast<size_t>(r) * dof_stride;
-            for (uint32_t c = 0u; c < dof; ++c) {
-                acc += minv_row[c] * c_qdot[c];
-            }
+            const float* const minv_row = Minv + size_t{r} * dof_stride;
+            for (uint32_t c = 0u; c < dof; ++c) acc += minv_row[c] * c_qdot[c];
             qdot_work[r] -= dt * acc;
         }
     }
-
-    // Base components write to spatial velocity; scalar joints write to qdot.
-    for (uint32_t k = 0u; k < dof; ++k) {
-        if (dof_to_component[k] != kInvalidLink) {
+    __syncthreads();
+    for (uint32_t k = lane; k < dof; k += blockDim.x) {
+        if (dof_to_component[k] != kInvalidLink)
             state.link_velocity[dof_to_link[k]].v[dof_to_component[k]] = qdot_work[k];
-        } else {
+        else
             state.qdot[dof_to_link[k]] = qdot_work[k];
-        }
     }
 }
 
@@ -697,7 +657,7 @@ Status OpCrbaComputeM(const ModelView& model, const DataView& data,
     LaunchCuda(ComputeArticulationInertiaMKernel, dim3(p->articulation_count),
                dim3(32u), 0u, stream, state, p->max_dof,
                reinterpret_cast<LinkSpatialInertia*>(data.link_composite_inertia),
-               data.m, joint_damping, p->dt);
+               data.m, joint_damping, p->dt, MakeArticulationTreeView(model));
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
@@ -744,8 +704,8 @@ Status OpApplyImplicitDamping(const ModelView& model, const DataView& data,
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, /*total_link_count=*/0u, p->articulation_count);
     LaunchCuda(ApplyImplicitJointDampingKernel, dim3(p->articulation_count),
-               dim3(32u), 0u, stream, state, data.m_inv, data.drive_dissipation,
-               p->max_dof, p->dt, data.crba_scratch, data.env_status);
+               dim3(32u), size_t{p->max_dof} * 4u * sizeof(uint32_t), stream,
+               state, data.m_inv, data.drive_dissipation, p->max_dof, p->dt, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

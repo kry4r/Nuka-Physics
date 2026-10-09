@@ -482,6 +482,10 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::VbdFreeVelocity, DlpackDtype::kF32, 2, false, false},  // vbd_free_velocity
     {FieldId::ContactRowExtent, DlpackDtype::kU32, 2, false, false},  // contact_row_extent
     {FieldId::ContactCacheExtent, DlpackDtype::kU32, 2, false, false},  // contact_cache_extent
+    {FieldId::LinkTreeDepth, DlpackDtype::kU32, 1, false, false},  // link_tree_depth
+    {FieldId::ArticulationTreeDepth, DlpackDtype::kU32, 1, false, false},  // articulation_tree_depth
+    {FieldId::LinkChildRange, DlpackDtype::kU32, 2, false, false},  // link_child_range
+    {FieldId::LinkChildren, DlpackDtype::kU32, 1, false, false},  // link_children
 };
 
 } // namespace nuka::nk

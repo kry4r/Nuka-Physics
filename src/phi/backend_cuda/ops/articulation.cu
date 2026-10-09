@@ -294,33 +294,74 @@ __device__ LinkSpatialTransform JointTransform(const ArticulationDeviceState& st
     return MakeMotionTransform(Mat3Transpose(rotation), translation);
 }
 
-__global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state) {
+__global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state, ArticulationTreeView tree) {
     const uint32_t articulation = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
+    if (articulation >= state.articulation_count) {
         return;
     }
 
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
-    for (uint32_t local = 0u; local < count; ++local) {
-        const uint32_t link = offset + local;
-
-        // T8a: free-floating root (see featherstone_aba.cu for the full note).
-        if (state.parent_link[link] == kInvalidLink &&
-            state.joint_type[link] == ArticulationJointType::FloatingBase) {
-            state.link_xup[link] = MakeMotionTransform(Mat3Identity(),
-                                                       MakeVec3(0.0f, 0.0f, 0.0f));
-            Zero6(state.joint_motion_subspace[link].s);
+    for (uint32_t depth = 0u; depth <= tree.max_depth[articulation]; ++depth) {
+        for (uint32_t local = threadIdx.x; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] != depth) continue;
+    
+            if (state.parent_link[link] == kInvalidLink &&
+                state.joint_type[link] == ArticulationJointType::FloatingBase) {
+                state.link_xup[link] = MakeMotionTransform(Mat3Identity(),
+                                                           MakeVec3(0.0f, 0.0f, 0.0f));
+                Zero6(state.joint_motion_subspace[link].s);
+                CopySpatialInertia(state.link_inertia[link], &state.link_articulated_I[link]);
+    
+                float velocity[6];
+                SpatialToArray(state.link_velocity[link], velocity);
+    
+                float velocity_bias[6];
+                Zero6(velocity_bias);
+                ArrayToSpatial(velocity_bias, &state.link_velocity_bias[link]);
+    
+                float inertia_velocity[6];
+                Mat66MulVec6(state.link_inertia[link].I, velocity, inertia_velocity);
+                float bias_force[6];
+                ForceCross(velocity, inertia_velocity, bias_force);
+                ArrayToForce(bias_force, &state.link_bias_force[link]);
+                state.joint_diagonal[link] = 0.0f;
+                state.joint_force[link] = 0.0f;
+                Zero6(state.link_u_spatial[link].p);
+                continue;
+            }
+    
+            state.link_xup[link] = JointTransform(state, link);
+            MotionSubspaceForJoint(state.joint_type[link],
+                                   state.joint_axis[link],
+                                   state.joint_motion_subspace[link].s);
             CopySpatialInertia(state.link_inertia[link], &state.link_articulated_I[link]);
-
+    
+            float v_parent[6];
+            Zero6(v_parent);
+            const uint32_t parent = state.parent_link[link];
+            if (parent != kInvalidLink) {
+                SpatialToArray(state.link_velocity[offset + parent], v_parent);
+            }
+    
+            float transformed_parent[6];
+            TransformMotion(state.link_xup[link], v_parent, transformed_parent);
+            float joint_velocity[6];
+            for (uint32_t i = 0u; i < 6u; ++i) {
+                joint_velocity[i] = state.joint_motion_subspace[link].s[i] * state.qdot[link];
+            }
+    
             float velocity[6];
-            SpatialToArray(state.link_velocity[link], velocity);
-
+            for (uint32_t i = 0u; i < 6u; ++i) {
+                velocity[i] = transformed_parent[i] + joint_velocity[i];
+            }
+            ArrayToSpatial(velocity, &state.link_velocity[link]);
+    
             float velocity_bias[6];
-            Zero6(velocity_bias);
+            MotionCross(velocity, joint_velocity, velocity_bias);
             ArrayToSpatial(velocity_bias, &state.link_velocity_bias[link]);
-
+    
             float inertia_velocity[6];
             Mat66MulVec6(state.link_inertia[link].I, velocity, inertia_velocity);
             float bias_force[6];
@@ -329,69 +370,34 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state) {
             state.joint_diagonal[link] = 0.0f;
             state.joint_force[link] = 0.0f;
             Zero6(state.link_u_spatial[link].p);
-            continue;
         }
-
-        state.link_xup[link] = JointTransform(state, link);
-        MotionSubspaceForJoint(state.joint_type[link],
-                               state.joint_axis[link],
-                               state.joint_motion_subspace[link].s);
-        CopySpatialInertia(state.link_inertia[link], &state.link_articulated_I[link]);
-
-        float v_parent[6];
-        Zero6(v_parent);
-        const uint32_t parent = state.parent_link[link];
-        if (parent != kInvalidLink) {
-            SpatialToArray(state.link_velocity[offset + parent], v_parent);
-        }
-
-        float transformed_parent[6];
-        TransformMotion(state.link_xup[link], v_parent, transformed_parent);
-        float joint_velocity[6];
-        for (uint32_t i = 0u; i < 6u; ++i) {
-            joint_velocity[i] = state.joint_motion_subspace[link].s[i] * state.qdot[link];
-        }
-
-        float velocity[6];
-        for (uint32_t i = 0u; i < 6u; ++i) {
-            velocity[i] = transformed_parent[i] + joint_velocity[i];
-        }
-        ArrayToSpatial(velocity, &state.link_velocity[link]);
-
-        float velocity_bias[6];
-        MotionCross(velocity, joint_velocity, velocity_bias);
-        ArrayToSpatial(velocity_bias, &state.link_velocity_bias[link]);
-
-        float inertia_velocity[6];
-        Mat66MulVec6(state.link_inertia[link].I, velocity, inertia_velocity);
-        float bias_force[6];
-        ForceCross(velocity, inertia_velocity, bias_force);
-        ArrayToForce(bias_force, &state.link_bias_force[link]);
-        state.joint_diagonal[link] = 0.0f;
-        state.joint_force[link] = 0.0f;
-        Zero6(state.link_u_spatial[link].p);
+        __syncthreads();
     }
 }
 
-__global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state) {
+__global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state, ArticulationTreeView tree) {
     const uint32_t articulation = blockIdx.x;
-    if (articulation >= state.articulation_count || threadIdx.x != 0u) return;
+    if (articulation >= state.articulation_count) return;
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
-    for (uint32_t local = 0u; local < count; ++local) {
-        const uint32_t link = offset + local;
-        const uint32_t parent = state.parent_link[link];
-        if (parent == kInvalidLink && state.joint_type[link] == ArticulationJointType::FloatingBase)
-            continue;
-        float parent_velocity[6] = {};
-        if (parent != kInvalidLink) SpatialToArray(state.link_velocity[offset + parent], parent_velocity);
-        float velocity[6];
-        TransformMotion(JointTransform(state, link), parent_velocity, velocity);
-        float subspace[6];
-        MotionSubspaceForJoint(state.joint_type[link], state.joint_axis[link], subspace);
-        for (uint32_t component = 0u; component < 6u; ++component)
-            velocity[component] += subspace[component] * state.qdot[link];
-        ArrayToSpatial(velocity, &state.link_velocity[link]);
+    for (uint32_t depth = 0u; depth <= tree.max_depth[articulation]; ++depth) {
+        for (uint32_t local = threadIdx.x; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] != depth) continue;
+            const uint32_t parent = state.parent_link[link];
+            if (parent == kInvalidLink && state.joint_type[link] == ArticulationJointType::FloatingBase)
+                continue;
+            float parent_velocity[6] = {};
+            if (parent != kInvalidLink) SpatialToArray(state.link_velocity[offset + parent], parent_velocity);
+            float velocity[6];
+            TransformMotion(JointTransform(state, link), parent_velocity, velocity);
+            float subspace[6];
+            MotionSubspaceForJoint(state.joint_type[link], state.joint_axis[link], subspace);
+            for (uint32_t component = 0u; component < 6u; ++component)
+                velocity[component] += subspace[component] * state.qdot[link];
+            ArrayToSpatial(velocity, &state.link_velocity[link]);
+        }
+        __syncthreads();
     }
 }
 
@@ -536,30 +542,29 @@ __global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
 }
 
 __global__ void IntegrateVelocityArticulationKernel(ArticulationDeviceState state,
-                                                    float dt) {
+                                                    float dt, math::Vec3 gravity) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count) {
         return;
     }
     state.qdot[link] += state.qddot[link] * dt;
+    if (state.parent_link[link] == kInvalidLink &&
+        state.joint_type[link] == ArticulationJointType::FloatingBase) {
+        const uint32_t articulation = state.link_to_articulation[link];
+        float g_world_arr[6];
+        GravityAcceleration(gravity, g_world_arr);
+        const math::Quat base_rot = state.base_pose[articulation].rotation;
+        const math::Vec3 g_body =
+            RotateByQuatInverse(base_rot, MakeVec3(g_world_arr[3], g_world_arr[4],
+                                                   g_world_arr[5]));
+        float a_grav[6] = {0.0f, 0.0f, 0.0f, g_body.x, g_body.y, g_body.z};
+        for (uint32_t i = 0u; i < 6u; ++i) {
+            const float real_accel = state.link_acceleration[link].a[i] - a_grav[i];
+            state.link_velocity[link].v[i] += real_accel * dt;
+        }
+    }
 }
 
-__global__ void IntegratePositionArticulationKernel(ArticulationDeviceState state,
-                                                    const float* __restrict__ qdot_pseudo,
-                                                    float dt) {
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) {
-        return;
-    }
-    // Split-impulse: advance by (real+pseudo)*dt; the persisted qdot stays = real.
-    // The null branch is the EXACT velocity-only expression (byte-identical; no
-    // +0.0f that could flip a signed-zero).
-    if (qdot_pseudo != nullptr) {
-        state.q[link] += (state.qdot[link] + qdot_pseudo[link]) * dt;
-    } else {
-        state.q[link] += state.qdot[link] * dt;
-    }
-}
 
 // A coupled joint takes its root's coordinate exactly; roots are never written here.
 __global__ void SnapMimicJointsKernel(ArticulationDeviceState state,
@@ -601,51 +606,12 @@ __forceinline__ __device__ math::Quat QuatNormalizeForward(math::Quat q) {
     return mg::QuatNormalizeForwardRsqrt(q, 1.0e-24f);
 }
 
-__global__ void IntegrateFloatingBaseVelocityKernel(ArticulationDeviceState state,
-                                                    float dt,
-                                                    math::Vec3 gravity) {
-    const uint32_t articulation = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
-        return;
-    }
-    const uint32_t root = state.articulation_link_offset[articulation];
-    if (state.parent_link[root] != kInvalidLink ||
-        state.joint_type[root] != ArticulationJointType::FloatingBase) {
-        return;
-    }
-    float g_world_arr[6];
-    GravityAcceleration(gravity, g_world_arr);
-    const math::Quat base_rot = state.base_pose[articulation].rotation;
-    const math::Vec3 g_body =
-        RotateByQuatInverse(base_rot, MakeVec3(g_world_arr[3], g_world_arr[4],
-                                               g_world_arr[5]));
-    float a_grav[6] = {0.0f, 0.0f, 0.0f, g_body.x, g_body.y, g_body.z};
-    for (uint32_t i = 0u; i < 6u; ++i) {
-        const float real_accel = state.link_acceleration[root].a[i] - a_grav[i];
-        state.link_velocity[root].v[i] += real_accel * dt;
-    }
-}
 
-__global__ void IntegrateFloatingBasePoseKernel(ArticulationDeviceState state,
-                                                const LinkSpatialVel* __restrict__ link_velocity_pseudo,
-                                                float dt) {
-    const uint32_t articulation = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
-        return;
-    }
-    const uint32_t root = state.articulation_link_offset[articulation];
-    if (state.parent_link[root] != kInvalidLink ||
-        state.joint_type[root] != ArticulationJointType::FloatingBase) {
-        return;
-    }
+__device__ void IntegrateFloatingBasePose(ArticulationDeviceState state,
+    uint32_t root, uint32_t articulation, const LinkSpatialVel* link_velocity_pseudo, float dt) {
     const float* rv = state.link_velocity[root].v;
     math::Transform pose = state.base_pose[articulation];
 
-    // Split-impulse: the root pose integrates from (real+pseudo) root velocity.
-    // The null branch is the EXACT velocity-only expression (byte-identical; no
-    // +0.0f that could flip a signed-zero).
     float v[6];
     if (link_velocity_pseudo != nullptr) {
         const float* pv = link_velocity_pseudo[root].v;
@@ -666,6 +632,23 @@ __global__ void IntegrateFloatingBasePoseKernel(ArticulationDeviceState state,
     pose.rotation = QuatNormalizeForward(QuatMulForward(pose.rotation, dq));
 
     state.base_pose[articulation] = pose;
+}
+
+__global__ void IntegratePositionArticulationKernel(ArticulationDeviceState state,
+                                                    const float* __restrict__ qdot_pseudo,
+                                                    const LinkSpatialVel* link_velocity_pseudo, float dt) {
+    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
+    if (link >= state.total_link_count) {
+        return;
+    }
+    if (qdot_pseudo != nullptr) {
+        state.q[link] += (state.qdot[link] + qdot_pseudo[link]) * dt;
+    } else {
+        state.q[link] += state.qdot[link] * dt;
+    }
+    if (state.parent_link[link] == kInvalidLink &&
+        state.joint_type[link] == ArticulationJointType::FloatingBase)
+        IntegrateFloatingBasePose(state, link, state.link_to_articulation[link], link_velocity_pseudo, dt);
 }
 
 struct DriveControlView {
@@ -1343,33 +1326,35 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
 __global__ void UpdateWorldLinkPosesKernel(ArticulationDeviceState state,
                                            math::Transform* out_world_pose,
                                            const uint32_t* env_ids,
-                                           uint32_t articulations_per_env) {
+                                           uint32_t articulations_per_env, ArticulationTreeView tree) {
     const uint32_t articulation = env_ids
         ? env_ids[blockIdx.x / articulations_per_env] * articulations_per_env +
               blockIdx.x % articulations_per_env
         : blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
+    if (articulation >= state.articulation_count) {
         return;
     }
 
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
-    for (uint32_t local = 0u; local < count; ++local) {
-        const uint32_t link = offset + local;
-        const math::Transform relative = RelativeTransform(state, link);
-        const uint32_t parent_local = state.parent_link[link];
-        if (parent_local == kInvalidLink) {
-            if (state.joint_type[link] == ArticulationJointType::FloatingBase) {
-                out_world_pose[link] = state.base_pose[articulation];
+    for (uint32_t depth = 0u; depth <= tree.max_depth[articulation]; ++depth) {
+        for (uint32_t local = threadIdx.x; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] != depth) continue;
+            const math::Transform relative = RelativeTransform(state, link);
+            const uint32_t parent_local = state.parent_link[link];
+            if (parent_local == kInvalidLink) {
+                if (state.joint_type[link] == ArticulationJointType::FloatingBase) {
+                    out_world_pose[link] = state.base_pose[articulation];
+                } else {
+                    out_world_pose[link] = relative;
+                }
             } else {
-                // Root: world = identity o relative = relative.
-                out_world_pose[link] = relative;
+                out_world_pose[link] =
+                    ComposeTransform(out_world_pose[offset + parent_local], relative);
             }
-        } else {
-            out_world_pose[link] =
-                ComposeTransform(out_world_pose[offset + parent_local], relative);
         }
+        __syncthreads();
     }
 }
 
@@ -1455,7 +1440,7 @@ Status OpAbaForward(const ModelView& model, const DataView& data,
     const math::Vec3 gravity{p->gravity[0], p->gravity[1], p->gravity[2]};
     dim3 grid(p->articulation_count);
     dim3 block(kAbaBlockSize);
-    LaunchCuda(AbaPass1KinematicsKernel, grid, block, 0u, stream, state);
+    LaunchCuda(AbaPass1KinematicsKernel, grid, block, 0u, stream, state, MakeArticulationTreeView(model));
     LaunchCuda(AbaPass2ArticulatedInertiaKernel, grid, block, 0u, stream, state);
     LaunchCuda(AbaPass3AccelerationKernel, grid, block, 0u, stream, state, gravity);
     return LaunchOk(stream);
@@ -1476,15 +1461,9 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
             model, data, p->total_link_count, p->articulation_count);
         const uint32_t blocks =
             (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
-        // Joint velocity first, then the floating-base velocity — the production
-        // batched articulated order (the two write DISJOINT state: qdot vs
-        // link_velocity[root], so the single-env FB-first order is byte-equal).
+        // Joint and floating-base velocities occupy disjoint state.
         LaunchCuda(IntegrateVelocityArticulationKernel, dim3(blocks),
-                   dim3(kAbaBlockSize), 0u, stream, state, p->dt);
-        if (p->articulation_count > 0u) {
-            LaunchCuda(IntegrateFloatingBaseVelocityKernel, dim3(p->articulation_count),
-                       dim3(kAbaBlockSize), 0u, stream, state, p->dt, gravity);
-        }
+                   dim3(kAbaBlockSize), 0u, stream, state, p->dt, gravity);
     }
     // Free-body inertia and velocity are updated before the shared contact solve.
     if (p->total_body_count > 0u) {
@@ -1521,7 +1500,7 @@ Status OpFkWorldPoses(const ModelView& model, const DataView& data,
         ? p->selected_env_count * p->articulations_per_env : p->articulation_count;
     const uint32_t* env_ids = p->selected_env_count > 0u ? data.reset_env_ids : nullptr;
     LaunchCuda(UpdateWorldLinkPosesKernel, dim3(count), dim3(32u),
-               0u, stream, state, data.link_pose, env_ids, p->articulations_per_env);
+               0u, stream, state, data.link_pose, env_ids, p->articulations_per_env, MakeArticulationTreeView(model));
     return LaunchOk(stream);
 }
 
@@ -1536,7 +1515,7 @@ Status OpFkLinkVelocities(const ModelView& model, const DataView& data,
         return Status::InvalidArgument;
     const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
     LaunchCuda(FkLinkVelocitiesKernel, dim3(p->articulation_count), dim3(32u),
-               0u, stream, state);
+               0u, stream, state, MakeArticulationTreeView(model));
     return LaunchOk(stream);
 }
 
@@ -1563,7 +1542,7 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
             pos_pass ? reinterpret_cast<const LinkSpatialVel*>(data.link_velocity_pseudo)
                      : nullptr;
         LaunchCuda(IntegratePositionArticulationKernel, dim3(blocks),
-                   dim3(kAbaBlockSize), 0u, stream, state, qdot_pseudo, p->dt);
+                   dim3(kAbaBlockSize), 0u, stream, state, qdot_pseudo, link_vel_pseudo, p->dt);
         if (p->mimic_couplings != 0u) {
             if (model.mimic_source_link == nullptr || model.mimic_multiplier == nullptr ||
                 model.mimic_offset == nullptr)
@@ -1572,10 +1551,6 @@ Status OpIntegratePosition(const ModelView& model, const DataView& data,
                        state, static_cast<const uint32_t*>(model.mimic_source_link),
                        static_cast<const float*>(model.mimic_multiplier),
                        static_cast<const float*>(model.mimic_offset));
-        }
-        if (p->articulation_count > 0u) {
-            LaunchCuda(IntegrateFloatingBasePoseKernel, dim3(p->articulation_count),
-                       dim3(kAbaBlockSize), 0u, stream, state, link_vel_pseudo, p->dt);
         }
     }
     // Advance free bodies using the velocities from the shared contact solve.

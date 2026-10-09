@@ -505,6 +505,10 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // vbd_free_velocity
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 8, 0},  // contact_row_extent
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 8, 0},  // contact_cache_extent
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // link_tree_depth
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Articulation, 1, 1, 4, 0},  // articulation_tree_depth
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 2, 1, 8, 0},  // link_child_range
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // link_children
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

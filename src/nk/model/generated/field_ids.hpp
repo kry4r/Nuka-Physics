@@ -466,6 +466,10 @@ enum class FieldId : uint16_t {
     VbdFreeVelocity,  // vbd_free_velocity (per:scalar arena:scratch owner:data count:vbd_vertices_per_env*env_count)
     ContactRowExtent,  // contact_row_extent (per:env arena:scratch owner:data elem:2)
     ContactCacheExtent,  // contact_cache_extent (per:env arena:scratch owner:data elem:2)
+    LinkTreeDepth,  // link_tree_depth (per:link arena:persistent owner:model)
+    ArticulationTreeDepth,  // articulation_tree_depth (per:articulation arena:persistent owner:model)
+    LinkChildRange,  // link_child_range (per:link arena:persistent owner:model elem:2)
+    LinkChildren,  // link_children (per:link arena:persistent owner:model)
     Count
 };
 
@@ -927,6 +931,10 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "vbd_free_velocity",
     "contact_row_extent",
     "contact_cache_extent",
+    "link_tree_depth",
+    "articulation_tree_depth",
+    "link_child_range",
+    "link_children",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

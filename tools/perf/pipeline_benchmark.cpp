@@ -1788,6 +1788,7 @@ Json Run(const Options& options) {
     }
     const auto replay_state = State(world);
     const auto replay_sensors = StateSensorBytes(world);
+    const auto replay_existing_sensors = StateSensorBytes(world, false);
     bool finite = true;
     const auto physical_state = State(world, false);
     const auto mismatched_envs = MismatchedReplicas(world, physical_state);
@@ -1919,7 +1920,7 @@ Json Run(const Options& options) {
     sensors.Set("count", Json::Int(world.StateSensors().Count()));
     sensors.Set("timed_replay_bit_equal", Json::Bool(timed_sensors == replay_sensors));
     sensors.Set("state_fnv1a64", Json::Str(Digest(replay_sensors)));
-    sensors.Set("existing_state_fnv1a64", Json::Str(Digest(StateSensorBytes(world, false))));
+    sensors.Set("existing_state_fnv1a64", Json::Str(Digest(replay_existing_sensors)));
     sensors.Set("tactile_count", Json::Int(options.tactile_grid ? 1u + options.tactile_grid * options.tactile_grid : 0u));
     sensors.Set("scope", Json::Str(options.state_sensors >= 2u ?
         "IMU, pose and velocity per base; encoder, contact wrench and F/T on each articulation's first scalar joint" :

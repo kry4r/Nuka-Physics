@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 #include "nk/model/model.hpp"
+#include "nk/model/articulation_tree.hpp"
 
 #include <algorithm>
 #include <array>
@@ -518,6 +519,31 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             // tile unchanged — the kernels compute global = offset + parent.
             StampPerLink(dst, a.parent_link, L, E, sizeof(uint32_t));
             break;
+        case FieldId::LinkTreeDepth:
+        case FieldId::ArticulationTreeDepth:
+        case FieldId::LinkChildRange:
+        case FieldId::LinkChildren: {
+            const auto tree = BuildArticulationTree(a.parent_link);
+            if (id == FieldId::LinkTreeDepth) {
+                StampPerLink(dst, tree.depth, L, E, sizeof(uint32_t));
+            } else if (id == FieldId::ArticulationTreeDepth) {
+                StampPerLink(dst, tree.max_depth, capacities.articulations_per_env, E, sizeof(uint32_t));
+            } else {
+                auto* p = reinterpret_cast<uint32_t*>(dst);
+                for (uint32_t env = 0u; env < E; ++env) {
+                    for (uint32_t link = 0u; link < L; ++link) {
+                        const uint32_t global = env * L + link;
+                        if (id == FieldId::LinkChildren) {
+                            p[global] = env * L + tree.children[link];
+                        } else {
+                            p[2u * global] = env * L + tree.child_range[link][0];
+                            p[2u * global + 1u] = env * L + tree.child_range[link][1];
+                        }
+                    }
+                }
+            }
+            break;
+        }
         case FieldId::LinkBody:
             StampPerLink(dst, a.link_body, L, E, sizeof(uint32_t));
             break;
@@ -1246,6 +1272,10 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::ParentOffset:          v.parent_offset = static_cast<math::Vec3*>(p); break;
         case FieldId::JointType:             v.joint_type = static_cast<uint8_t*>(p); break;
         case FieldId::ParentLink:            v.parent_link = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkTreeDepth:         v.link_tree_depth = static_cast<uint32_t*>(p); break;
+        case FieldId::ArticulationTreeDepth: v.articulation_tree_depth = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkChildRange:        v.link_child_range = static_cast<uint32_t*>(p); break;
+        case FieldId::LinkChildren:          v.link_children = static_cast<uint32_t*>(p); break;
         case FieldId::LinkBody:              v.link_body = static_cast<uint32_t*>(p); break;
         case FieldId::LinkToArticulation:    v.link_to_articulation = static_cast<uint32_t*>(p); break;
         case FieldId::LinkGeomKind:          v.link_geom_kind = static_cast<uint32_t*>(p); break;

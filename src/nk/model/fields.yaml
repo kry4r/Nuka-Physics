@@ -1150,3 +1150,7 @@ fields:
   # Per env, one past the last contact-cache point that may hold an entry (0 leaves it unbounded),
   # then the end of this step's owners, which the rebuild bound replaces.
   - {name: contact_cache_extent, dtype: u32, per: env, elem: 2, arena: scratch, owner: data}
+  - {name: link_tree_depth, dtype: u32, per: link, arena: persistent, owner: model}
+  - {name: articulation_tree_depth, dtype: u32, per: articulation, arena: persistent, owner: model}
+  - {name: link_child_range, dtype: u32, per: link, elem: 2, arena: persistent, owner: model}
+  - {name: link_children, dtype: u32, per: link, arena: persistent, owner: model}

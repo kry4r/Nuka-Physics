@@ -66,6 +66,18 @@ struct LinkMotionSubspace {
     float s[6] = {};
 };
 
+struct ArticulationTreeView {
+    const uint32_t* depth;
+    const uint32_t* max_depth;
+    const uint32_t* child_range;
+    const uint32_t* children;
+};
+
+inline ArticulationTreeView MakeArticulationTreeView(const ModelView& model) {
+    return {model.link_tree_depth, model.articulation_tree_depth,
+            model.link_child_range, model.link_children};
+}
+
 struct ArticulationDeviceState {
     LinkSpatialInertia* link_inertia = nullptr;
     LinkSpatialVel* link_velocity = nullptr;
