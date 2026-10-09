@@ -1909,6 +1909,8 @@ Json Run(const Options& options) {
     execution.Set("graph_clears", Json::Int(graph.clears));
     execution.Set("graph_copies", Json::Int(graph.copies));
     execution.Set("graph_early_launch_dependencies", Json::Int(graph.early_launch_dependencies));
+    execution.Set("graph_capture_lanes", Json::Int(graph.capture_lanes));
+    execution.Set("graph_forked_operators", Json::Int(graph.forked_operators));
     execution.Set("warmup", Json::Int(options.warmup));
     execution.Set("steps", Json::Int(options.steps));
     execution.Set("boundary", Json::Str("full physics pipeline with contact readout; held control; per-step GPU events; no timed D2H"));

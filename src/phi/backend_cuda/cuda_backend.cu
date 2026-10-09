@@ -1,7 +1,8 @@
-// CUDA dispatch, events and graph replay share the backend execution stream.
-// Graphs are recorded on a separate owned capture stream.
+// CUDA dispatch and graph replay share the backend execution stream.
+// Graph capture maps physical resource dependencies to owned streams.
 
 #include "phi/backend_cuda/cuda_internal.cuh"
+#include "phi/op_access.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
@@ -142,6 +143,24 @@ struct CudaEvent {
     cudaEvent_t event;
 };
 
+struct CaptureEvents {
+    cudaEvent_t fork;
+    cudaEvent_t join;
+    std::vector<cudaEvent_t> completed;
+
+    explicit CaptureEvents(int count) : completed(count) {
+        cudaEventCreateWithFlags(&fork, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&join, cudaEventDisableTiming);
+        for (auto& event : completed) cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    }
+
+    ~CaptureEvents() {
+        for (auto event : completed) cudaEventDestroy(event);
+        cudaEventDestroy(join);
+        cudaEventDestroy(fork);
+    }
+};
+
 namespace {
 
 CudaBackend* AsBackend(Backend* b) { return reinterpret_cast<CudaBackend*>(b); }
@@ -158,6 +177,7 @@ void BackendFreeImpl(Backend* b) {
         return;
     }
     if (cb->capture != nullptr) { (void)cudaStreamDestroy(cb->capture); }
+    (void)cudaStreamDestroy(cb->capture_branch);
     if (cb->owns_main)          { (void)cudaStreamDestroy(cb->main); }
     delete cb;
 }
@@ -242,6 +262,10 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
         return nullptr;
     }
     auto native = cudaSetDevice(cb->device_id);
+    constexpr uint32_t capture_lanes = 2u;
+    const auto schedule = BuildOpSchedule(calls, n_calls, capture_lanes);
+    CaptureEvents events(n_calls);
+    const std::array<cudaStream_t, capture_lanes> streams{cb->capture, cb->capture_branch};
     if (native == cudaSuccess)
         native = cudaStreamBeginCapture(cb->capture, cudaStreamCaptureModeThreadLocal);
     if (native != cudaSuccess) {
@@ -249,10 +273,17 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
         return nullptr;
     }
     NkOp current = NkOp::Count;
+    cudaEventRecord(events.fork, cb->capture);
+    cudaStreamWaitEvent(cb->capture_branch, events.fork, 0u);
     try {
         for (int i = 0; i < n_calls; ++i) {
             current = calls[i].op;
-            const auto status = DispatchOn(model, data, calls[i], cb->capture, cb->programmatic_launch);
+            const auto lane = schedule[i].lane;
+            for (const int dependency : schedule[i].dependencies)
+                if (schedule[dependency].lane != lane)
+                    cudaStreamWaitEvent(streams[lane], events.completed[dependency], 0u);
+            const auto status = DispatchOn(model, data, calls[i], streams[lane], cb->programmatic_launch);
+            cudaEventRecord(events.completed[i], streams[lane]);
             if (status != Status::Ok) {
                 SetExecutionError(&failure, status, current, cudaSuccess,
                                   "operator failed during graph capture");
@@ -268,6 +299,8 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
                           "unknown exception during graph capture");
     }
     cudaGraph_t graph = nullptr;
+    cudaEventRecord(events.join, cb->capture_branch);
+    cudaStreamWaitEvent(cb->capture, events.join, 0u);
     native = cudaStreamEndCapture(cb->capture, &graph);
     if (failure.status != Status::Ok || native != cudaSuccess || graph == nullptr) {
         if (failure.status == Status::Ok)
@@ -286,6 +319,8 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
         return nullptr;
     }
     PlanMetrics metrics;
+    metrics.capture_lanes = capture_lanes;
+    for (const auto& entry : schedule) metrics.forked_operators += entry.lane != 0u;
     size_t count = 0;
     cudaGraphGetNodes(graph, nullptr, &count);
     std::vector<cudaGraphNode_t> nodes(count);
@@ -452,8 +487,10 @@ Backend* DeviceInitBackendImpl(Device* d, const char* /*params_json*/) {
     cb->device_id = cd->device_id;
     cb->programmatic_launch = cd->programmatic_launch;
     if (cudaStreamCreate(&cb->main) != cudaSuccess ||
-        cudaStreamCreate(&cb->capture) != cudaSuccess) {
+        cudaStreamCreate(&cb->capture) != cudaSuccess ||
+        cudaStreamCreate(&cb->capture_branch) != cudaSuccess) {
         (void)cudaGetLastError();
+        if (cb->capture_branch != nullptr) { (void)cudaStreamDestroy(cb->capture_branch); }
         if (cb->capture != nullptr) { (void)cudaStreamDestroy(cb->capture); }
         if (cb->main != nullptr)    { (void)cudaStreamDestroy(cb->main); }
         delete cb;
