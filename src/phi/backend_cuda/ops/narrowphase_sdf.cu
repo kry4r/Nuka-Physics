@@ -276,6 +276,7 @@ __global__ void FlagPairSampleChunksKernel(const uint32_t* __restrict__ candidat
                                            const uint32_t* __restrict__ ucount,
                                            uint32_t chunk_words,
                                            uint32_t* __restrict__ sample_chunks) {
+    BeginProgrammaticKernel();
     const uint32_t env = blockIdx.x / pair_slots;
     const uint32_t slot = blockIdx.x - env * pair_slots;
     const uint32_t side = blockIdx.y;
@@ -347,6 +348,7 @@ __global__ void PairDrivenSdfKernel(const uint32_t* __restrict__ candidate_pairs
                                     uint32_t* __restrict__ env_status,
                                     uint32_t chunk_words,
                                     const uint32_t* __restrict__ sample_chunks) {
+    BeginProgrammaticKernel();
     const uint32_t env = blockIdx.x / pair_slots;
     const uint32_t slot = blockIdx.x - env * pair_slots;
     if (env >= env_count) return;
@@ -529,7 +531,7 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
                    p->rigid_slot_cap, pair_slots, p->sample_point_count, p->contact_margin,
                    data.ucontact_count, chunk_words, data.pair_sample_chunks);
     }
-    LaunchCuda(PairDrivenSdfKernel, dim3(blocks), dim3(kSurfaceQueryThreads), 0u, stream,
+    LaunchCuda<true>(PairDrivenSdfKernel, dim3(blocks), dim3(kSurfaceQueryThreads), 0u, stream,
                data.candidate_pairs, data.pair_count,
                static_cast<const float*>(model.shape_table), model.mesh_contact_mode,
                static_cast<const float*>(model.samp_points),

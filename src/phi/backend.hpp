@@ -66,6 +66,7 @@ struct PlanMetrics {
     uint64_t kernels = 0;
     uint64_t clears = 0;
     uint64_t copies = 0;
+    uint64_t early_launch_dependencies = 0;
 };
 
 // --- OpCall --------------------------------------------------------------

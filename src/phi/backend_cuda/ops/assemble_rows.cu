@@ -352,6 +352,7 @@ __global__ void PackQdotFlatKernel(const Spatial6* __restrict__ link_velocity,
 // Each articulation's flat velocity tile follows its actual joint DOF prefix; padding is zero.
 __global__ void PackQdotFlatMultiKernel(ArticulationDeviceState state, uint32_t dof_stride,
                                         float* __restrict__ qdot_flat) {
+    BeginProgrammaticKernel();
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = state.articulation_count * dof_stride;
     if (gid >= total) return;
@@ -522,6 +523,7 @@ __global__ void InitializePairDrivenRowsKernel(
     __shared__ typename Scan::TempStorage scratch;
     __shared__ uint32_t carry;
     const uint32_t env = blockIdx.x;
+    BeginProgrammaticKernel();
     if (threadIdx.x == 0u) {
         carry = 0u;
         row_count[env] = 0u;
@@ -614,6 +616,7 @@ __global__ void EmitPairDrivenRowsKernel(
     float* __restrict__ row_penetration,
     float* __restrict__ row_damping, uint32_t* __restrict__ env_status,
     uint32_t* __restrict__ contact_row_extent) {
+    BeginProgrammaticKernel();
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t total = env_count * slot_count;
     if (gid >= total) return;
@@ -1014,6 +1017,7 @@ __global__ void EmitJointRowsKernel(
     ArticulationDeviceState state, AssembleRowsParams p,
     const float* lower_limits, const float* upper_limits, const uint8_t* limit_flags,
     DataView data) {
+    BeginProgrammaticKernel();
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count) return;
     auto* const urows = reinterpret_cast<NkRow*>(data.urows);
@@ -1050,6 +1054,7 @@ __global__ void EmitParticleConstraintRowsKernel(
     const float* __restrict__ inv_mass, NkRow* urows, float* lambda,
     nk::PointEndpointRange* ranges, nk::PointEndpointTerm* terms,
     uint32_t* row_cj_link, uint32_t* row_cj_link_b, float* row_penetration, uint32_t* row_count) {
+    BeginProgrammaticKernel();
     const uint32_t per_env = dist_per_env + vol_per_env;
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     if (per_env == 0u || item >= env_count * per_env) return;
@@ -1417,6 +1422,7 @@ __global__ void PrepareContactWarmStartKernel(
     const uint32_t* __restrict__ begins,
     const uint32_t* __restrict__ ends,
     uint32_t env_count, uint32_t slot_count, const uint32_t* row_ranges, uint32_t blocks_per_env, float* __restrict__ lambda) {
+    BeginProgrammaticKernel();
     const uint32_t points_per_env = slot_count * 4u;
     const uint32_t env = blockIdx.x / blocks_per_env;
     const uint32_t part = blockIdx.x % blocks_per_env;
@@ -1607,7 +1613,7 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         if (status != cudaSuccess) return Status::Failed;
         const uint32_t env_blocks = contact_cache::EnvBlocks(
             p->slot_count * nk::kPairDrivenPtsPerSlot * 2u, p->env_count);
-        LaunchCuda(PrepareContactWarmStartKernel, dim3(p->env_count * env_blocks), dim3(kBlock), 0u,
+        LaunchCuda<true>(PrepareContactWarmStartKernel, dim3(p->env_count * env_blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_normal, data.ucontact_tangent1,
                    data.ucontact_tangent2, data.contact_cache_lambda,
                    data.contact_cache_normal, data.contact_cache_tangent1,
@@ -1715,7 +1721,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
         const auto state = MakeArticulationDeviceState(
             model, data, p->total_link_count, p->articulation_count);
-        LaunchCuda(PackQdotFlatMultiKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+        LaunchCuda<true>(PackQdotFlatMultiKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    state, p->max_dof, data.qdot_flat);
     }
 
@@ -1723,7 +1729,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     if (p->union_slot_count > 0u) {
         const uint32_t total = p->env_count * p->union_slot_count;
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+        LaunchCuda<true>(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    static_cast<const uint32_t*>(data.ucontact_count), data.ucontact_row_range,
                    static_cast<const math::Vec3*>(data.ucontact_point),
                    static_cast<const math::Vec3*>(data.ucontact_witness_a),
@@ -1767,7 +1773,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                                     p->joint_drive_rows_per_env >= p->base_link_count)))) {
         const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
         const uint32_t blocks = (p->total_link_count + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitJointRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+        LaunchCuda<true>(EmitJointRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    state, *p, model.joint_limit_lower, model.joint_limit_upper,
                    model.joint_limit_flags, data);
     }
@@ -1775,7 +1781,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     const uint32_t constraints = p->dist_cons_per_env + p->vol_cons_per_env;
     if (constraints > 0u) {
         const uint32_t blocks = (p->env_count * constraints + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(EmitParticleConstraintRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
+        LaunchCuda<true>(EmitParticleConstraintRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    p->env_count, p->dist_cons_per_env, p->vol_cons_per_env,
                    p->rows_per_env, p->particle_constraint_row_first, p->point_endpoints_per_env,
                    p->point_endpoint_terms_per_env, p->constraint_endpoint_first,

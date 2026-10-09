@@ -57,6 +57,7 @@ struct CudaBackend {
     int             device_id;
     cudaStream_t    main;
     bool            owns_main = true;
+    bool            programmatic_launch = false;
     cudaStream_t    capture;
     CudaBufferType  device_bt;
     CudaBufferType  host_bt;

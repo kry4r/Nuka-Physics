@@ -13,6 +13,7 @@
 #include "nk/model/generated/views.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "phi/backend.hpp"
+#include "phi/backend_cuda/launch.cuh"
 
 namespace nuka::phi::contact_cache {
 
@@ -196,6 +197,7 @@ static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* pref
 static __global__ void ClearTableKernel(const uint32_t* begins, const uint32_t* ends,
                                         uint32_t env_blocks, uint64_t stride,
                                         uint32_t* first, uint32_t* warm, uint32_t* counts) {
+    BeginProgrammaticKernel();
     const uint32_t env = blockIdx.x / env_blocks;
     const uint32_t part = blockIdx.x - env * env_blocks;
     if (part == 0u && threadIdx.x == 0u) {
@@ -217,6 +219,7 @@ static __global__ void InsertEntriesKernel(KeySource keys, const uint32_t* order
                                            const uint32_t* age, uint32_t decay_steps,
                                            uint32_t env_blocks, uint64_t stride,
                                            uint32_t* first, uint32_t* warm, uint32_t* slots) {
+    BeginProgrammaticKernel();
     const uint32_t env = blockIdx.x / env_blocks;
     const uint32_t part = blockIdx.x - env * env_blocks;
     const uint32_t begin = begins[env], end = ends[env];
@@ -248,6 +251,7 @@ static __global__ void ResolveEntriesKernel(KeySource keys, const uint32_t* orde
                                             uint32_t* owner, uint32_t* keep, uint32_t* extent,
                                             const math::Vec3* current_normal,
                                             const math::Vec3* cache_normal, uint32_t* counts) {
+    BeginProgrammaticKernel();
     const uint32_t env = blockIdx.x / env_blocks;
     const uint32_t part = blockIdx.x - env * env_blocks;
     const uint32_t end = ends[env];
@@ -298,14 +302,17 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
         workspace.begins, workspace.ends, data.contact_cache_current_owner,
         data.contact_cache_old_keep, data.contact_cache_extent);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
-    ClearTableKernel<<<envs * env_blocks, block, 0u, stream>>>(workspace.begins, workspace.ends,
+    LaunchCuda(ClearTableKernel, dim3(envs * env_blocks), dim3(block), 0u, stream,
+        workspace.begins, workspace.ends,
         env_blocks, stride, workspace.first, workspace.warm, data.contact_warm_start_counts);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
-    InsertEntriesKernel<<<envs * env_blocks, block, 0u, stream>>>(keys, workspace.order,
+    LaunchCuda<true>(InsertEntriesKernel, dim3(envs * env_blocks), dim3(block), 0u, stream,
+        keys, workspace.order,
         workspace.begins, workspace.ends, data.contact_cache_age, decay_steps, env_blocks, stride,
         workspace.first, workspace.warm, workspace.slots);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
-    ResolveEntriesKernel<<<envs * env_blocks, block, 0u, stream>>>(keys, workspace.order,
+    LaunchCuda<true>(ResolveEntriesKernel, dim3(envs * env_blocks), dim3(block), 0u, stream,
+        keys, workspace.order,
         workspace.begins, workspace.ends, data.contact_cache_age, decay_steps, env_blocks, stride,
         workspace.first, workspace.warm, workspace.slots, workspace.matches,
         data.contact_cache_current_owner, data.contact_cache_old_keep, data.contact_cache_extent,

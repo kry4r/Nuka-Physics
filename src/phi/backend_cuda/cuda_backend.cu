@@ -2,6 +2,7 @@
 // Graphs are recorded on a separate owned capture stream.
 
 #include "phi/backend_cuda/cuda_internal.cuh"
+#include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
 
@@ -163,11 +164,12 @@ void BackendFreeImpl(Backend* b) {
 
 // Dispatch a single op onto an explicit stream (shared by dispatch + capture).
 Status DispatchOn(const ModelView& model, const DataView& data,
-                  const OpCall& call, cudaStream_t stream) {
+                  const OpCall& call, cudaStream_t stream, bool programmatic_launch) {
     OpFn fn = GetCudaOp(call.op);
     if (fn == nullptr) {
         return Status::Unsupported;
     }
+    CudaLaunchScope scope(programmatic_launch);
     return fn(model, data, call.params, stream);
 }
 
@@ -183,7 +185,7 @@ Status BackendDispatchImpl(Backend* b, const ModelView& model,
     OpProfiler& prof = OpProfiler::Get();
     prof.Ensure();
     if (!prof.on) {
-        return DispatchOn(model, data, call, cb->main);
+        return DispatchOn(model, data, call, cb->main, cb->programmatic_launch);
     }
     const int oid = static_cast<int>(call.op);
     // Repeated op ids define warmup groups, not physical steps or solver intervals.
@@ -196,7 +198,7 @@ Status BackendDispatchImpl(Backend* b, const ModelView& model,
     }
     const bool acc = (prof.step > prof.warmup) && oid >= 0 && oid < OpProfiler::kN;
     if (acc) cudaEventRecord(prof.a, cb->main);
-    const Status s = DispatchOn(model, data, call, cb->main);
+    const Status s = DispatchOn(model, data, call, cb->main, cb->programmatic_launch);
     if (acc) {
         cudaEventRecord(prof.b, cb->main);
         cudaEventSynchronize(prof.b);
@@ -250,7 +252,7 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
     try {
         for (int i = 0; i < n_calls; ++i) {
             current = calls[i].op;
-            const auto status = DispatchOn(model, data, calls[i], cb->capture);
+            const auto status = DispatchOn(model, data, calls[i], cb->capture, cb->programmatic_launch);
             if (status != Status::Ok) {
                 SetExecutionError(&failure, status, current, cudaSuccess,
                                   "operator failed during graph capture");
@@ -296,6 +298,13 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
         metrics.clears += type == cudaGraphNodeTypeMemset;
         metrics.copies += type == cudaGraphNodeTypeMemcpy;
     }
+    size_t edge_count = 0u;
+    cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &edge_count);
+    std::vector<cudaGraphNode_t> from(edge_count), to(edge_count);
+    std::vector<cudaGraphEdgeData> edges(edge_count);
+    cudaGraphGetEdges(graph, from.data(), to.data(), edges.data(), &edge_count);
+    for (const auto& edge : edges)
+        metrics.early_launch_dependencies += edge.type == cudaGraphDependencyTypeProgrammatic;
     CudaPlan* plan = new (std::nothrow) CudaPlan{graph, exec, metrics};
     if (!plan) {
         cudaGraphExecDestroy(exec);
@@ -413,6 +422,7 @@ const BackendI kCudaBackendI = {
 struct CudaDevice {
     const DeviceI* iface;   // MUST be first
     int            device_id;
+    bool           programmatic_launch = false;
     char           name[256];
     CudaBufferType device_bt;
     CudaBufferType host_bt;
@@ -440,6 +450,7 @@ Backend* DeviceInitBackendImpl(Device* d, const char* /*params_json*/) {
     CudaBackend* cb = new CudaBackend{};
     cb->iface     = &kCudaBackendI;
     cb->device_id = cd->device_id;
+    cb->programmatic_launch = cd->programmatic_launch;
     if (cudaStreamCreate(&cb->main) != cudaSuccess ||
         cudaStreamCreate(&cb->capture) != cudaSuccess) {
         (void)cudaGetLastError();
@@ -519,6 +530,7 @@ void EnsureEnumerated(CudaRegistryEntry* reg) {
         dev.host_bt = {&kCudaHostBufferTypeI, nullptr, true, i};
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, i) == cudaSuccess) {
+            dev.programmatic_launch = prop.major >= 9;
             // copy name, NUL-terminated
             size_t k = 0;
             for (; k < sizeof(dev.name) - 1 && prop.name[k] != '\0'; ++k) {
