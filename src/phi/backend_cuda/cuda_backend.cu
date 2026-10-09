@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <new>
 #include <exception>
+#include <vector>
 
 namespace nuka::phi {
 
@@ -149,6 +150,7 @@ struct OpProfiler {
 struct CudaPlan {
     cudaGraph_t     graph;
     cudaGraphExec_t exec;
+    PlanMetrics metrics{};
 };
 
 struct CudaEvent {
@@ -297,7 +299,20 @@ Plan* BackendPlanCreateImpl(Backend* b, const ModelView& model,
         cudaGraphDestroy(graph);
         return nullptr;
     }
-    CudaPlan* plan = new (std::nothrow) CudaPlan{graph, exec};
+    PlanMetrics metrics;
+    size_t count = 0;
+    cudaGraphGetNodes(graph, nullptr, &count);
+    std::vector<cudaGraphNode_t> nodes(count);
+    cudaGraphGetNodes(graph, nodes.data(), &count);
+    metrics.nodes = count;
+    for (auto node : nodes) {
+        cudaGraphNodeType type;
+        cudaGraphNodeGetType(node, &type);
+        metrics.kernels += type == cudaGraphNodeTypeKernel;
+        metrics.clears += type == cudaGraphNodeTypeMemset;
+        metrics.copies += type == cudaGraphNodeTypeMemcpy;
+    }
+    CudaPlan* plan = new (std::nothrow) CudaPlan{graph, exec, metrics};
     if (!plan) {
         cudaGraphExecDestroy(exec);
         cudaGraphDestroy(graph);
@@ -361,6 +376,36 @@ void BackendEventFreeImpl(Backend*, Event* e) {
     delete ce;
 }
 
+float BackendEventElapsedMsImpl(Backend*, Event* start, Event* end) {
+    float elapsed = 0.0f;
+    cudaEventSynchronize(AsEvent(end)->event);
+    cudaEventElapsedTime(&elapsed, AsEvent(start)->event, AsEvent(end)->event);
+    return elapsed;
+}
+
+ResourceInfo BackendResourceInfoImpl(Backend* backend) {
+    auto* cb = AsBackend(backend);
+    cudaSetDevice(cb->device_id);
+    ResourceInfo info;
+    size_t free_bytes, total_bytes, stack_bytes;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    cudaDeviceGetLimit(&stack_bytes, cudaLimitStackSize);
+    info.free_bytes = free_bytes;
+    info.total_bytes = total_bytes;
+    info.thread_stack_limit_bytes = stack_bytes;
+    cudaDeviceGetGraphMemAttribute(cb->device_id, cudaGraphMemAttrUsedMemCurrent, &info.graph_used_bytes);
+    cudaDeviceGetGraphMemAttribute(cb->device_id, cudaGraphMemAttrReservedMemCurrent, &info.graph_reserved_bytes);
+    cudaDeviceProp properties;
+    cudaGetDeviceProperties(&properties, cb->device_id);
+    info.compute_units = properties.multiProcessorCount;
+    info.threads_per_unit = properties.maxThreadsPerMultiProcessor;
+    return info;
+}
+
+PlanMetrics BackendPlanMetricsImpl(Backend*, Plan* plan) {
+    return AsPlan(plan)->metrics;
+}
+
 const BackendI kCudaBackendI = {
     /*get_name     =*/ &BackendGetName,
     /*free         =*/ &BackendFreeImpl,
@@ -373,6 +418,9 @@ const BackendI kCudaBackendI = {
     /*event_record =*/ &BackendEventRecordImpl,
     /*event_wait   =*/ &BackendEventWaitImpl,
     /*event_free   =*/ &BackendEventFreeImpl,
+    /*event_elapsed_ms =*/ &BackendEventElapsedMsImpl,
+    /*resource_info =*/ &BackendResourceInfoImpl,
+    /*plan_metrics =*/ &BackendPlanMetricsImpl,
 };
 
 // ---------------------------------------------------------------------------

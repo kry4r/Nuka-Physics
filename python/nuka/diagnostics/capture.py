@@ -38,6 +38,11 @@ def write_json(path, payload):
 class DiagnosticSession:
     """Request all readouts before the first step; preserve completed chunks on failure."""
 
+    @staticmethod
+    def performance(device, world, output, metadata):
+        from .performance import PerformanceCapture
+        return PerformanceCapture(device, world, output, metadata)
+
     def __init__(self, world, output, metadata, *, env_count=1, chunk_steps=128,
                  state_fields=(), thresholds=None):
         self.world = world

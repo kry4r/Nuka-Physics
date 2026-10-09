@@ -109,4 +109,13 @@ void nuka_device_destroy(nuka_device_handle device) {
     (void)nuka::c_abi::DeviceTable().Remove(device);
 }
 
+nuka_result_t nuka_device_get_resource_info(nuka_device_handle device, nuka_device_resource_info_t* out) {
+    auto* record = nuka::c_abi::DeviceTable().Get(device);
+    const auto info = nphi::BackendResourceInfo(record->backend);
+    *out = {info.free_bytes, info.total_bytes, info.thread_stack_limit_bytes,
+            info.graph_used_bytes, info.graph_reserved_bytes,
+            info.compute_units, info.threads_per_unit};
+    return NUKA_RESULT_OK;
+}
+
 } // extern "C"

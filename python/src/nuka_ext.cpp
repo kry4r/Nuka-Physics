@@ -118,6 +118,20 @@ public:
     nuka_device_handle raw() const { return h_; }
     bool valid() const { return h_ != nullptr; }
 
+    nb::dict resource_info() const {
+        nuka_device_resource_info_t info;
+        check(nuka_device_get_resource_info(h_, &info), "nuka_device_get_resource_info");
+        nb::dict output;
+        output["free_bytes"] = info.free_bytes;
+        output["total_bytes"] = info.total_bytes;
+        output["thread_stack_limit_bytes"] = info.thread_stack_limit_bytes;
+        output["graph_used_bytes"] = info.graph_used_bytes;
+        output["graph_reserved_bytes"] = info.graph_reserved_bytes;
+        output["compute_units"] = info.compute_units;
+        output["threads_per_unit"] = info.threads_per_unit;
+        return output;
+    }
+
 private:
     explicit Device(nuka_device_handle h) : h_(h) {}
     nuka_device_handle h_ = nullptr;
@@ -520,6 +534,59 @@ public:
         output["failed_op"] = info.failed_op;
         output["native_error"] = info.native_error;
         output["message"] = info.message;
+        return output;
+    }
+
+    nb::dict resource_info() const {
+        nuka_world_resource_info_t info;
+        check(nuka_world_get_resource_info(h_, &info), "nuka_world_get_resource_info");
+        nb::dict output;
+        output["model_bytes"] = info.model_bytes;
+        output["persistent_bytes"] = info.persistent_bytes;
+        output["scratch_bytes"] = info.scratch_bytes;
+        output["tape_bytes"] = info.tape_bytes;
+        output["env_count"] = info.env_count;
+        output["contacts_per_env"] = info.contacts_per_env;
+        output["rows_per_env"] = info.rows_per_env;
+        output["dofs_per_articulation"] = info.dofs_per_articulation;
+        output["bodies_per_env"] = info.bodies_per_env;
+        output["particles_per_env"] = info.particles_per_env;
+        return output;
+    }
+
+    nb::list resource_fields() const {
+        std::vector<nuka_resource_field_t> fields(nuka_world_resource_field_count(h_));
+        check(nuka_world_get_resource_fields(h_, fields.data()), "nuka_world_get_resource_fields");
+        nb::list output;
+        for (const auto& field : fields) {
+            nb::dict row;
+            row["name"] = field.name;
+            row["offset"] = field.offset;
+            row["bytes"] = field.bytes;
+            row["owner"] = field.owner;
+            row["arena"] = field.arena;
+            output.append(row);
+        }
+        return output;
+    }
+
+    uintptr_t begin_execution_window() {
+        void* window;
+        check(nuka_world_begin_execution_window(h_, &window), "nuka_world_begin_execution_window");
+        return reinterpret_cast<uintptr_t>(window);
+    }
+
+    nb::dict end_execution_window(uintptr_t window) {
+        nuka_execution_window_t info;
+        check(nuka_world_end_execution_window(h_, reinterpret_cast<void*>(window), &info),
+              "nuka_world_end_execution_window");
+        nb::dict output;
+        output["gpu_ms"] = info.gpu_ms;
+        output["graph_replays"] = info.graph_replays;
+        output["nodes"] = info.nodes;
+        output["kernels"] = info.kernels;
+        output["clears"] = info.clears;
+        output["copies"] = info.copies;
         return output;
     }
 
@@ -2073,6 +2140,7 @@ NB_MODULE(_nuka_ext, m) {
         .export_values();
 
     nb::class_<Device>(m, "Device")
+        .def("resource_info", &Device::resource_info)
         .def_static("create", &Device::create, nb::arg("ordinal") = 0,
                     nb::arg("stream_ptr") = uintptr_t{0},
                     nb::rv_policy::take_ownership,
@@ -2223,6 +2291,10 @@ NB_MODULE(_nuka_ext, m) {
              "Select eager or single-step graph execution; graph failures are explicit.")
         .def("synchronize", &World::synchronize, "Wait for physics completion and report device errors.")
         .def_prop_ro("execution_info", &World::execution_info)
+        .def("resource_info", &World::resource_info)
+        .def("resource_fields", &World::resource_fields)
+        .def("begin_execution_window", &World::begin_execution_window)
+        .def("end_execution_window", &World::end_execution_window)
         .def("step_n", &World::step_n, nb::arg("n"),
              "Advance the world n fixed steps.")
         .def("reset", &World::reset,

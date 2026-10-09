@@ -94,6 +94,9 @@ public:
     phi::Status Synchronize();
     ExecutionMode GetExecutionMode() const { return execution_mode_; }
     bool GraphReady() const { return plan_ != nullptr; }
+    phi::PlanMetrics GraphMetrics() const {
+        return plan_ ? phi::BackendPlanMetrics(backend_, plan_) : phi::PlanMetrics{};
+    }
     uint64_t CaptureAttempts() const { return capture_attempts_; }
     uint64_t GraphReplays() const { return graph_replays_; }
     const phi::ExecutionError& LastExecutionError() const { return execution_error_; }

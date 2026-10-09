@@ -51,6 +51,23 @@ struct ExecutionError {
     char message[256]{};
 };
 
+struct ResourceInfo {
+    uint64_t free_bytes = 0;
+    uint64_t total_bytes = 0;
+    uint64_t thread_stack_limit_bytes = 0;
+    uint64_t graph_used_bytes = 0;
+    uint64_t graph_reserved_bytes = 0;
+    uint32_t compute_units = 0;
+    uint32_t threads_per_unit = 0;
+};
+
+struct PlanMetrics {
+    uint64_t nodes = 0;
+    uint64_t kernels = 0;
+    uint64_t clears = 0;
+    uint64_t copies = 0;
+};
+
 // --- OpCall --------------------------------------------------------------
 // One unit of work: an op id + a pointer to that op's POD params (op_schema.hpp).
 // `params` lifetime is the owning Pipeline (the caller keeps it alive across
@@ -75,6 +92,9 @@ struct BackendI {
     void        (*event_record)(Backend*, Event*);
     void        (*event_wait)(Backend*, Event*);
     void        (*event_free)(Backend*, Event*);
+    float       (*event_elapsed_ms)(Backend*, Event*, Event*);
+    ResourceInfo (*resource_info)(Backend*);
+    PlanMetrics (*plan_metrics)(Backend*, Plan*);
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +150,11 @@ inline Event*      BackendEventNew(Backend* b)             { return IfaceOf(b)->
 inline void        BackendEventRecord(Backend* b, Event* e) { IfaceOf(b)->event_record(b, e); }
 inline void        BackendEventWait(Backend* b, Event* e)   { IfaceOf(b)->event_wait(b, e); }
 inline void        BackendEventFree(Backend* b, Event* e)   { IfaceOf(b)->event_free(b, e); }
+inline float BackendEventElapsedMs(Backend* b, Event* start, Event* end) {
+    return IfaceOf(b)->event_elapsed_ms(b, start, end);
+}
+inline ResourceInfo BackendResourceInfo(Backend* b) { return IfaceOf(b)->resource_info(b); }
+inline PlanMetrics BackendPlanMetrics(Backend* b, Plan* p) { return IfaceOf(b)->plan_metrics(b, p); }
 
 // --- Device convenience wrappers ----------------------------------------
 inline const char* DeviceName(Device* d) { return IfaceOf(d)->get_name(d); }

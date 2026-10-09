@@ -292,6 +292,36 @@ nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32
 nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations);
 // Initialize struct_size and schema_version before querying execution information.
 nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out);
+typedef struct nuka_device_resource_info_t {
+    uint64_t free_bytes, total_bytes, thread_stack_limit_bytes;
+    uint64_t graph_used_bytes, graph_reserved_bytes;
+    uint32_t compute_units, threads_per_unit;
+} nuka_device_resource_info_t;
+
+typedef struct nuka_world_resource_info_t {
+    uint64_t model_bytes, persistent_bytes, scratch_bytes, tape_bytes;
+    uint32_t env_count, contacts_per_env, rows_per_env, dofs_per_articulation;
+    uint32_t bodies_per_env, particles_per_env;
+} nuka_world_resource_info_t;
+
+typedef struct nuka_resource_field_t {
+    char name[64];
+    uint64_t offset, bytes;
+    uint32_t owner, arena;
+} nuka_resource_field_t;
+
+typedef struct nuka_execution_window_t {
+    double gpu_ms;
+    uint64_t graph_replays, nodes, kernels, clears, copies;
+} nuka_execution_window_t;
+
+nuka_result_t nuka_device_get_resource_info(nuka_device_handle device, nuka_device_resource_info_t* out);
+nuka_result_t nuka_world_get_resource_info(nuka_world_handle world, nuka_world_resource_info_t* out);
+uint32_t nuka_world_resource_field_count(nuka_world_handle world);
+// The caller allocates resource_field_count entries before reading the immutable layout.
+nuka_result_t nuka_world_get_resource_fields(nuka_world_handle world, nuka_resource_field_t* out);
+nuka_result_t nuka_world_begin_execution_window(nuka_world_handle world, void** window);
+nuka_result_t nuka_world_end_execution_window(nuka_world_handle world, void* window, nuka_execution_window_t* out);
 // Wait for submitted physics work and report asynchronous device errors.
 nuka_result_t nuka_world_synchronize(nuka_world_handle world);
 

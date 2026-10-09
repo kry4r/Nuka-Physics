@@ -755,6 +755,82 @@ nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_
     return NUKA_RESULT_OK;
 }
 
+struct ExecutionWindow {
+    nuka::phi::Event* start;
+    nuka::phi::Event* end;
+    uint64_t replays;
+};
+
+nuka_result_t nuka_world_get_resource_info(nuka_world_handle world, nuka_world_resource_info_t* out) {
+    auto& w = *nuka::c_abi::WorldTable().Get(world)->world;
+    const auto& model = w.GetModel();
+    const auto& c = model.capacities;
+    uint64_t model_bytes;
+    model.ComputeModelSegments(&model_bytes);
+    uint64_t arenas[3];
+    nuka::nk::Arena::ComputeSegments(c, arenas);
+    *out = {model_bytes, arenas[0], arenas[1], arenas[2], c.env_count,
+            c.max_contacts_per_env, c.max_rows_per_env, c.dofs_per_env,
+            c.bodies_per_env, c.particles_per_env};
+    return NUKA_RESULT_OK;
+}
+
+uint32_t nuka_world_resource_field_count(nuka_world_handle world) {
+    auto& w = *nuka::c_abi::WorldTable().Get(world)->world;
+    uint64_t bytes;
+    return static_cast<uint32_t>(w.GetModel().ComputeModelSegments(&bytes).size() +
+                                 w.GetData().Segments().size());
+}
+
+nuka_result_t nuka_world_get_resource_fields(nuka_world_handle world, nuka_resource_field_t* out) {
+    auto& w = *nuka::c_abi::WorldTable().Get(world)->world;
+    uint64_t bytes;
+    uint32_t index = 0;
+    for (const auto& segment : w.GetModel().ComputeModelSegments(&bytes)) {
+        auto& field = out[index++];
+        std::snprintf(field.name, sizeof(field.name), "%s", nuka::nk::FieldName(segment.field));
+        field.offset = segment.offset;
+        field.bytes = segment.bytes;
+        field.owner = 0;
+        field.arena = 0;
+    }
+    for (const auto& segment : w.GetData().Segments()) {
+        auto& field = out[index++];
+        std::snprintf(field.name, sizeof(field.name), "%s", nuka::nk::FieldName(segment.field));
+        field.offset = segment.offset;
+        field.bytes = segment.bytes;
+        field.owner = 1;
+        field.arena = segment.arena;
+    }
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_begin_execution_window(nuka_world_handle world, void** window) {
+    auto& w = *nuka::c_abi::WorldTable().Get(world)->world;
+    auto* backend = w.Backend();
+    auto* interval = new ExecutionWindow{nuka::phi::BackendEventNew(backend),
+                                        nuka::phi::BackendEventNew(backend), w.GraphReplays()};
+    nuka::phi::BackendEventRecord(backend, interval->start);
+    *window = interval;
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_end_execution_window(nuka_world_handle world, void* window,
+                                             nuka_execution_window_t* out) {
+    auto& w = *nuka::c_abi::WorldTable().Get(world)->world;
+    auto* backend = w.Backend();
+    auto* interval = static_cast<ExecutionWindow*>(window);
+    nuka::phi::BackendEventRecord(backend, interval->end);
+    const auto metrics = w.GraphMetrics();
+    *out = {nuka::phi::BackendEventElapsedMs(backend, interval->start, interval->end),
+            w.GraphReplays() - interval->replays, metrics.nodes,
+            metrics.kernels, metrics.clears, metrics.copies};
+    nuka::phi::BackendEventFree(backend, interval->start);
+    nuka::phi::BackendEventFree(backend, interval->end);
+    delete interval;
+    return NUKA_RESULT_OK;
+}
+
 nuka_result_t nuka_world_synchronize(nuka_world_handle world) {
     auto* record = nuka::c_abi::WorldTable().Get(world);
     if (!record) return NUKA_RESULT_NULL_HANDLE;
