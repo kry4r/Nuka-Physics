@@ -716,6 +716,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // per-articulation slot stride is the shared data-driven value (4 at K<=1).
         p_np_prim_.articulations_per_env = cap.articulations_per_env;
         p_np_prim_.max_foot_contacts = contact_slots_per_artic;
+        p_np_prim_.max_body_samples = 0u;
+        for (size_t i = 1u; i < model.samp_ranges.size(); i += 2u)
+            p_np_prim_.max_body_samples = std::max(p_np_prim_.max_body_samples, model.samp_ranges[i]);
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
         // (Multi-body collision — including artic-link<->artic-link and
@@ -776,9 +779,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_np_sdf_.sample_point_count = cap.max_samp_points;
         p_np_sdf_.sdf_cell_total = cap.max_sdf_cells;
         p_np_sdf_.mesh_geometry = {cap.max_hull_verts, cap.max_mesh_triangles, cap.max_mesh_bvh_nodes};
-        p_np_sdf_.max_body_samples = 0u;
-        for (size_t i = 1u; i < model.samp_ranges.size(); i += 2u)
-            p_np_sdf_.max_body_samples = std::max(p_np_sdf_.max_body_samples, model.samp_ranges[i]);
+        p_np_sdf_.max_body_samples = p_np_prim_.max_body_samples;
         const bool has_sampled_geometry = cap.max_samp_points > 0u || cap.max_sdf_grids > 0u ||
             std::any_of(model.shape_table_rows.begin(), model.shape_table_rows.end(),
                 [](const Model::PairDrivenShape& shape) {

@@ -511,11 +511,15 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
 // Particle systems have no collidable profile row, so they use the canonical
 // model defaults with only their authored per-system isotropic friction replaced.
 
-// One thread per environment: the finished assembly's extent becomes the one to clear.
-__global__ void BeginPairDrivenRowsKernel(uint32_t env_count, uint32_t* __restrict__ row_count,
+// Row damping is overwritten; each environment retains the finished assembly's extent.
+__global__ void BeginPairDrivenRowsKernel(uint32_t env_count, uint32_t rows_per_env,
+                                          float* __restrict__ row_damping,
+                                          uint32_t* __restrict__ row_count,
                                           uint32_t* __restrict__ extent) {
-    const uint32_t env = blockIdx.x * blockDim.x + threadIdx.x;
-    if (env >= env_count) return;
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item < env_count * rows_per_env) row_damping[item] = 0.0f;
+    if (item >= env_count) return;
+    const uint32_t env = item;
     row_count[env] = 0u;
     if (extent == nullptr) return;
     extent[2u * env] = extent[2u * env + 1u];
@@ -1645,9 +1649,6 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         const uint32_t count_needed =
             (p->slot_count * nk::kPairDrivenPtsPerSlot + kBlock - 1u) / kBlock;
         const uint32_t count_blocks = count_needed < 256u ? count_needed : 256u;
-        if (cudaMemsetAsync(data.contact_warm_start_counts, 0,
-                            size_t{p->env_count} * 2u * sizeof(uint32_t), stream) != cudaSuccess)
-            return Status::Failed;
         LaunchCuda(CountContactWarmStartsKernel, dim3(p->env_count * count_blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_normal, data.contact_cache_normal, workspace.matches,
                    workspace.order, workspace.begins, workspace.ends, point_count,
@@ -1742,8 +1743,9 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     }
     constexpr uint32_t kBlockSize = kContactRowsBlock;
     const uint32_t total_rows = p->env_count * p->rows_per_env;
-    LaunchCuda(BeginPairDrivenRowsKernel, dim3((p->env_count + kBlockSize - 1u) / kBlockSize),
-               dim3(kBlockSize), 0u, stream, p->env_count, data.row_count, data.contact_row_extent);
+    LaunchCuda(BeginPairDrivenRowsKernel, dim3((total_rows + kBlockSize - 1u) / kBlockSize),
+               dim3(kBlockSize), 0u, stream, p->env_count, p->rows_per_env, data.row_damping,
+               data.row_count, data.contact_row_extent);
     const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;
     const uint32_t artics_per_env =
         (p->articulation_count > 0u && p->env_count > 0u)
@@ -2036,6 +2038,9 @@ Status OpAssembleRows(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
+    if (p->family == kContactFamilyPairDriven) {
+        return OpAssembleRowsPairDriven(model, data, p, stream);
+    }
     if (p->rows_per_env > 0u) {
         const size_t damping_bytes =
             static_cast<size_t>(p->env_count) * p->rows_per_env * sizeof(float);
@@ -2044,11 +2049,6 @@ Status OpAssembleRows(const ModelView& model, const DataView& data,
             return Status::Failed;
         }
     }
-    if (p->family == kContactFamilyPairDriven) {
-        return OpAssembleRowsPairDriven(model, data, p, stream);
-    }
-    // dead fallthrough: the FUSED family is unreachable (no cooked
-    // model selects it). Retained until the enum collapse removes it.
     return OpAssembleRowsFused(model, data, p, stream);
 }
 

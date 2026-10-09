@@ -82,15 +82,8 @@ using namespace ::nuka::phi::nkops;
 namespace sdf = ::nuka::runtime::sdf;
 
 constexpr uint32_t kManifoldPoints = constraint::ContactManifold::kMaxPoints;
-constexpr uint32_t kSurfaceQueryThreads = 128u;
-// A sample chunk is one block-wide sweep; each flag word covers 32 chunks.
-constexpr uint32_t kSamplesPerChunkWord = kSurfaceQueryThreads * 32u;
 // Few pairs spread their chunks over the device; many pairs fill it on their own.
 constexpr uint32_t kSampleChunkBlockBudget = 1u << 14;
-
-__host__ __device__ inline uint32_t SampleChunkWords(uint32_t samples) {
-    return static_cast<uint32_t>((uint64_t{samples} + kSamplesPerChunkWord - 1u) / kSamplesPerChunkWord);
-}
 
 struct SampleContact {
     math::Vec3 point;
@@ -523,8 +516,6 @@ Status OpNarrowphaseSdf(const ModelView& model, const DataView& data,
     const uint64_t words = PairSampleChunkWords(*p);
     if (words > 0u) {
         if (data.pair_sample_chunks == nullptr) return Status::InvalidArgument;
-        if (cudaMemsetAsync(data.pair_sample_chunks, 0, words * sizeof(uint32_t), stream) != cudaSuccess)
-            return Status::Failed;
         const uint32_t sweeps = (p->max_body_samples + kSurfaceQueryThreads - 1u) / kSurfaceQueryThreads;
         const uint32_t spread = std::clamp(kSampleChunkBlockBudget / (blocks * 2u), 1u, sweeps);
         LaunchCuda(FlagPairSampleChunksKernel, dim3(blocks, 2u, spread), dim3(kSurfaceQueryThreads), 0u,

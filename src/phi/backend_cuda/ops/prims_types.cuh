@@ -1,9 +1,5 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M5 pair-driven NarrowphasePrimitives shared types + the
-// cross-TU launcher seam (contacts_foot.cu's OpNarrowphasePrimitives dispatches
-// the pair-driven family here).
-// ---------------------------------------------------------------------------
+// Shared CUDA shape records and pair-driven narrowphase launch contracts.
 
 #include <cstdint>
 
@@ -15,6 +11,14 @@
 #include "phi/op_schema.hpp"    // NarrowphasePrimitivesParams
 
 namespace nuka::phi::nkops {
+
+inline constexpr uint32_t kSurfaceQueryThreads = 128u;
+// A flag word covers 32 block-wide surface sample chunks.
+inline constexpr uint32_t kSamplesPerChunkWord = kSurfaceQueryThreads * 32u;
+
+__host__ __device__ inline uint32_t SampleChunkWords(uint32_t samples) {
+    return static_cast<uint32_t>((uint64_t{samples} + kSamplesPerChunkWord - 1u) / kSamplesPerChunkWord);
+}
 
 // Canonical shape_table row stride (packed f32 / body row). The appended lane
 // owns the represented collidable's ContactProfileV1 table index.

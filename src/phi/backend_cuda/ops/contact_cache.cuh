@@ -195,9 +195,13 @@ static __global__ void CompactSourcesKernel(KeySource keys, const uint32_t* pref
 // Only the live part of each env's table is cleared and probed.
 static __global__ void ClearTableKernel(const uint32_t* begins, const uint32_t* ends,
                                         uint32_t env_blocks, uint64_t stride,
-                                        uint32_t* first, uint32_t* warm) {
+                                        uint32_t* first, uint32_t* warm, uint32_t* counts) {
     const uint32_t env = blockIdx.x / env_blocks;
     const uint32_t part = blockIdx.x - env * env_blocks;
+    if (part == 0u && threadIdx.x == 0u) {
+        counts[2u * env] = 0u;
+        counts[2u * env + 1u] = 0u;
+    }
     const uint64_t live = uint64_t{ends[env] - begins[env]} * 2u + 1u;
     for (uint64_t slot = uint64_t{part} * blockDim.x + threadIdx.x; slot < live;
          slot += uint64_t{env_blocks} * blockDim.x) {
@@ -284,7 +288,7 @@ inline cudaError_t BuildIndex(const DataView& data, uint32_t points,
         data.contact_cache_old_keep, data.contact_cache_extent);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
     ClearTableKernel<<<envs * env_blocks, block, 0u, stream>>>(workspace.begins, workspace.ends,
-        env_blocks, stride, workspace.first, workspace.warm);
+        env_blocks, stride, workspace.first, workspace.warm, data.contact_warm_start_counts);
     if (const auto native = cudaGetLastError(); native != cudaSuccess) return native;
     InsertEntriesKernel<<<envs * env_blocks, block, 0u, stream>>>(keys, workspace.order,
         workspace.begins, workspace.ends, data.contact_cache_age, decay_steps, env_blocks, stride,

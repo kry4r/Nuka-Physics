@@ -233,8 +233,12 @@ __global__ void ZeroEnvKernel(uint32_t* __restrict__ contact_count,
                               uint32_t* __restrict__ mesh_ogc_pair_count,
                               uint32_t* __restrict__ mesh_sdf_pair_count, uint32_t n,
                               uint32_t* __restrict__ ucount, uint32_t slot_stride,
-                              uint32_t rigid_slots) {
+                              uint32_t rigid_slots, uint32_t chunk_words,
+                              uint32_t* __restrict__ sample_chunks) {
     const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint64_t word = e; word < uint64_t{n} * rigid_slots * 2u * chunk_words;
+         word += uint64_t{gridDim.x} * blockDim.x)
+        sample_chunks[word] = 0u;
     const uint32_t compact = slot_stride - rigid_slots;
     if (e < n * compact) {
         const uint32_t env = e / compact;
@@ -263,7 +267,8 @@ Status LaunchPairDrivenNarrowphase(const ModelView& model, const DataView& data,
         LaunchCuda(ZeroEnvKernel, dim3(b), dim3(kBlock), 0u, stream,
                    data.contact_count, data.row_count, data.mesh_ogc_pair_count,
                    data.mesh_sdf_pair_count, p.env_count, data.ucontact_count,
-                   p.union_slot_count, rigid_slots);
+                   p.union_slot_count, rigid_slots, SampleChunkWords(p.max_body_samples),
+                   data.pair_sample_chunks);
     }
     if (rigid_slots == 0u) return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
     const uint32_t total = p.env_count * rigid_slots;

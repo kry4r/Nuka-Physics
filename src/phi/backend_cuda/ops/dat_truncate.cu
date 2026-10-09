@@ -177,6 +177,9 @@ __device__ bool DatBodyPairAllowed(DatTruncateParams p, ModelView model,
 
 __global__ void ClearDatCountersKernel(DatTruncateParams p, ModelView model, DataView data) {
     const uint32_t env = blockIdx.x;
+    for (uint32_t word = threadIdx.x; word < collision::kDatWitnessWords; word += blockDim.x)
+        data.dat_failure_witness[size_t{env} * collision::kDatWitnessWords + word] = 0u;
+    __syncthreads();
     bool capped = false;
     if (threadIdx.x == 0u) {
         data.dat_failure_count[env] = 0u;
@@ -1508,9 +1511,6 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
         p->slot_capacity > p->slot_stride - p->slot_base)
         return Status::InvalidArgument;
     const dim3 particle_grid((static_cast<uint32_t>(particles) + kBlockSize - 1u) / kBlockSize);
-    if (cudaMemsetAsync(data.dat_failure_witness, 0, size_t{p->env_count} *
-            collision::kDatWitnessWords * sizeof(uint64_t), stream) != cudaSuccess)
-        return Status::Failed;
     LaunchCuda(ClearDatCountersKernel, dim3(p->env_count),
                dim3(kBlockSize), 0u, stream, *p, model, data);
     const uint32_t owners = p->env_count *

@@ -630,6 +630,7 @@ struct NarrowphasePrimitivesParams {
     // articulations_per_env; max_foot_contacts == the per-artic stride.
     uint32_t articulations_per_env;  // K (dead: FUSED foot slot re-key removed)
     uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (dead with FUSED)
+    uint32_t max_body_samples;      // largest per-body slice of the surface sample pool
 };
 
 // General contact pipeline (B2): SyncLinkBodyPose. One thread per
