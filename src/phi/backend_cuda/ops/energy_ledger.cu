@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include "phi/backend_cuda/ops/contact_row_layout.cuh"
 
 #include <cmath>
 #include <cfloat>
@@ -757,11 +758,11 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (!(normal.flags & nk::nk_row_flags::kActive) ||
             !(normal.flags & nk::nk_row_flags::kContactNormal)) continue;
         if (p.stage == EnergyStage::End) {
-            const uint32_t rigid_rows = p.rigid_contact_slots * nk::kPairDrivenRowsPerSlot;
-            const uint32_t local_contact = local < rigid_rows ? local / nk::kPairDrivenRowsPerSlot :
-                p.rigid_contact_slots + (local - rigid_rows) / nk::kPairDrivenParticleRowsPerSlot;
-            const uint32_t point = local < rigid_rows ? local % nk::kPairDrivenRowsPerSlot : 0u;
-            const size_t at = (size_t{env} * p.contact_slots_per_env + local_contact) * nk::kPairDrivenPtsPerSlot + point;
+            const uint32_t global_contact = nkops::ContactSlotForRow(d.ucontact_row_range,
+                env * p.contact_slots_per_env, p.contact_slots_per_env, slot);
+            const uint32_t local_contact = global_contact - env * p.contact_slots_per_env;
+            const uint32_t point = slot - nkops::ContactRowRangeFor(d.ucontact_row_range, global_contact).first;
+            const size_t at = size_t{global_contact} * nk::kPairDrivenPtsPerSlot + point;
             double gap = 0.0;
             const bool ogc = local_contact >= p.rigid_contact_slots &&
                 local_contact - p.rigid_contact_slots < p.ogc_contact_slots;

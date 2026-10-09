@@ -101,6 +101,7 @@ void MpmCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     p.contact_slot_base = ctx.max_contacts_per_env - p.contact_capacity;
     p.contact_slots_per_env = ctx.max_contacts_per_env;
     p.full_row_slot_count = ctx.rigid_cap;
+    p.rigid_rows_per_env = model.capacities.rigid_contact_rows_per_env;
     p.rows_per_env = model.capacities.max_rows_per_env;
     p.particle_surfaces_per_env = model.capacities.particle_surfaces_per_env;
     p.particle_surface_triangles = model.capacities.particle_surface_triangles;

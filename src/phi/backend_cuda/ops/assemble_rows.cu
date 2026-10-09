@@ -1,30 +1,11 @@
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — AssembleRows (the spec row-assembly op).
-//
-// Contact families behind the ONE op (params->family):
-//
-// FUSED (kContactFamilyFusedFoot) — DEAD as of : the FUSED contact RUNTIME
-// was deleted (solve_rows.cu / contacts_foot.cu kernels gone, and the pipeline
-// no longer selects this family). The OpAssembleRowsFused branch below is now
-// UNREACHABLE — no cooked model is FusedFoot anymore — and is retained, dead,
-// only until the enum collapse removes it wholesale. (Its kernels are the
-// line-by-line ports of articulation_jacobian.cu / articulation_contacts.cu.)
-//
-// UNION (kContactFamilyUnionCsr) — DELETED in : the legacy coresident
-// union world's CSR row assembly (EmitUnionRowsKernel / OpAssembleRowsUnion)
-// was removed wholesale. Grasp moved to RL; the ONE general path is PairDriven.
-//
-// PAIRDRIVEN (kContactFamilyPairDriven) — the ONE general path: the broadphase
-// -> narrowphase manifolds (ucontact_*) are turned into solver rows (urows) by
-// EmitPairDrivenRowsKernel + the shared chain-J / row_minv_jt / row_meff hoists.
-// Entirely arena-resident; ZERO host participation; every launch shape is a
-// fixed function of the capacities -> CUDA-graph capturable.
-// ---------------------------------------------------------------------------
+// All contact providers assemble solved rows and mass response through one common contract.
 
 #include <cuda_runtime.h>
+#include <cub/block/block_scan.cuh>
 
 #include <algorithm>
 
+#include "phi/backend_cuda/ops/contact_row_layout.cuh"
 #include "constraint/solref_solimp.hpp"  // ComputeCompliantRow (HD)
 #include "nk/contact/contact_profile.hpp"
 #include "nk/solve/collidable_owner.hpp"
@@ -465,13 +446,9 @@ __global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
 // the SHARED constants from nk_row.hpp so the cook (row budget), the schedule, and
 // this assembly all agree. Each point expands to one block normal and two
 // tangent rows; the normal row performs the analytic cone projection.
-constexpr uint32_t kPdPtsPerSlot = nk::kPairDrivenPtsPerSlot;   // 4
-constexpr uint32_t kPdTangentRows = nk::kPairDrivenTangentRowsPerPt; // 2
-constexpr uint32_t kPdRowsPerSlot = nk::kPairDrivenRowsPerSlot; // 12
-constexpr uint32_t kPdParticlePtsPerSlot =
-    nk::kPairDrivenParticlePtsPerSlot;                           // 1
-constexpr uint32_t kPdParticleRowsPerSlot =
-    nk::kPairDrivenParticleRowsPerSlot;                          // 3
+constexpr uint32_t kContactRowsBlock = 128u;
+constexpr uint32_t kPdTangentRows = nk::kPairDrivenTangentRowsPerPt;
+
 
 // Particle indices are global; body indices name environment-local collidables.
 // Invalid endpoints return ~0u and never read a state array.
@@ -547,16 +524,47 @@ __global__ void BeginPairDrivenRowsKernel(uint32_t env_count, uint32_t* __restri
 
 // One thread per footprint row below the bound: clears rows the last assembly may have filled.
 // Clear flags are left untouched so empty 128-byte rows avoid partial-sector writes.
+__global__ void BuildContactRowRangesKernel(
+    const uint32_t* counts, uint32_t slot_count, uint32_t rigid_slots,
+    uint32_t rigid_rows, uint32_t rows_per_env, uint32_t* ranges) {
+    using Scan = cub::BlockScan<uint32_t, kContactRowsBlock>;
+    __shared__ typename Scan::TempStorage scratch;
+    __shared__ uint32_t carry;
+    const uint32_t env = blockIdx.x;
+    if (threadIdx.x == 0u) carry = 0u;
+    __syncthreads();
+    for (uint32_t tile = 0u; tile < rigid_slots; tile += blockDim.x) {
+        const uint32_t slot = tile + threadIdx.x;
+        const uint32_t points = slot < rigid_slots ? counts[env * slot_count + slot] : 0u;
+        uint32_t prefix;
+        Scan(scratch).ExclusiveSum(points, prefix);
+        const uint32_t first = env * rows_per_env + (carry + prefix) * (1u + kPdTangentRows);
+        if (slot < rigid_slots) {
+            const size_t index = size_t{env * slot_count + slot} * 2u;
+            ranges[index] = first;
+            ranges[index + 1u] = points;
+        }
+        __syncthreads();
+        if (threadIdx.x + 1u == blockDim.x) carry += prefix + points;
+        __syncthreads();
+    }
+    for (uint32_t slot = rigid_slots + threadIdx.x; slot < slot_count; slot += blockDim.x) {
+        const size_t index = size_t{env * slot_count + slot} * 2u;
+        ranges[index] = env * rows_per_env + rigid_rows +
+            (slot - rigid_slots) * nk::kPairDrivenParticleRowsPerSlot;
+        ranges[index + 1u] = nk::kPairDrivenParticlePtsPerSlot;
+    }
+}
+
 __global__ void ClearPairDrivenRowsKernel(
-    uint32_t env_count, uint32_t slot_count, uint32_t full_row_slot_count, uint32_t rows_per_env,
+    uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env, uint32_t contact_rows,
+    const uint32_t* __restrict__ row_ranges,
     const uint32_t* __restrict__ extent,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
     uint32_t* __restrict__ row_cj_link, uint32_t* __restrict__ row_cj_link_b,
     float* __restrict__ row_penetration, float* __restrict__ row_damping,
     uint64_t* __restrict__ contact_material) {
-    const uint32_t full_slots = min(full_row_slot_count, slot_count);
-    const uint32_t footprint =
-        full_slots * kPdRowsPerSlot + (slot_count - full_slots) * kPdParticleRowsPerSlot;
+    const uint32_t footprint = contact_rows;
     const uint32_t stride = gridDim.x * blockDim.x;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * footprint;
          item += stride) {
@@ -574,18 +582,16 @@ __global__ void ClearPairDrivenRowsKernel(
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < env_count * slot_count;
          item += stride) {
         const uint32_t env = item / slot_count;
-        const uint32_t slot = item - env * slot_count;
-        const uint32_t first = slot < full_slots ? slot * kPdRowsPerSlot
-            : full_slots * kPdRowsPerSlot + (slot - full_slots) * kPdParticleRowsPerSlot;
+        const uint32_t first = nkops::ContactRowRangeFor(row_ranges, item).first - env * rows_per_env;
         if (first < ContactRowBound(extent, env, footprint)) contact_material[item] = 0u;
     }
 }
 
-// One thread per (env x candidate slot). Emits the slot's NkRow block from the
-// unified manifold. Uses ComputeCompliantRow and the canonical tangent basis
-// shared with warm-start persistence; side A/B are the candidate collidables.
+// Each candidate slot emits its manifold rows using ComputeCompliantRow.
+// The tangent basis and collidable sides are shared with warm-start persistence.
 __global__ void EmitPairDrivenRowsKernel(
     const uint32_t* __restrict__ ucontact_count,
+    const uint32_t* __restrict__ row_ranges,
     const math::Vec3* __restrict__ ucontact_point,
     const math::Vec3* __restrict__ ucontact_witness_a,
     const math::Vec3* __restrict__ ucontact_witness_b,
@@ -632,14 +638,9 @@ __global__ void EmitPairDrivenRowsKernel(
     if (gid >= total) return;
     const uint32_t env = gid / slot_count;
     const uint32_t slot = gid - env * slot_count;
-    const bool compact_particle_slot = slot >= full_row_slot_count;
-    const uint32_t points_per_slot =
-        compact_particle_slot ? kPdParticlePtsPerSlot : kPdPtsPerSlot;
-    const uint32_t base = env * rows_per_env +
-        (compact_particle_slot
-             ? full_row_slot_count * kPdRowsPerSlot +
-                   (slot - full_row_slot_count) * kPdParticleRowsPerSlot
-             : slot * kPdRowsPerSlot);
+    const auto range = nkops::ContactRowRangeFor(row_ranges, gid);
+    const uint32_t points_per_slot = range.points;
+    const uint32_t base = range.first;
 
     uint32_t n_active = ucontact_count[gid];
     // The last occupied slot of each environment in the warp raises the extent past its rows.
@@ -1390,22 +1391,13 @@ __global__ void ComputeRowMeffPairDrivenKernel(
 }
 
 __device__ bool ContactRowOffsets(uint32_t env, uint32_t slot, uint32_t point,
-                                  uint32_t rows_per_env,
-                                  uint32_t full_row_slot_count,
-                                  uint32_t* normal_row, uint32_t* tangent1_row,
-                                  uint32_t* tangent2_row) {
-    const bool compact = slot >= full_row_slot_count;
-    const uint32_t points_per_slot =
-        compact ? kPdParticlePtsPerSlot : kPdPtsPerSlot;
-    if (point >= points_per_slot) return false;
-    const uint32_t base = env * rows_per_env +
-        (compact
-             ? full_row_slot_count * kPdRowsPerSlot +
-                   (slot - full_row_slot_count) * kPdParticleRowsPerSlot
-             : slot * kPdRowsPerSlot);
-    *normal_row = base + point;
-    *tangent1_row = base + points_per_slot + point;
-    *tangent2_row = base + 2u * points_per_slot + point;
+    uint32_t slots_per_env, const uint32_t* ranges, uint32_t* normal_row,
+    uint32_t* tangent1_row, uint32_t* tangent2_row) {
+    const auto range = nkops::ContactRowRangeFor(ranges, env * slots_per_env + slot);
+    if (point >= range.points) return false;
+    *normal_row = range.first + point;
+    *tangent1_row = range.first + range.points + point;
+    *tangent2_row = range.first + 2u * range.points + point;
     return true;
 }
 
@@ -1423,8 +1415,7 @@ __global__ void PrepareContactWarmStartKernel(
     const uint32_t* __restrict__ order,
     const uint32_t* __restrict__ begins,
     const uint32_t* __restrict__ ends,
-    uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
-    uint32_t full_row_slot_count, uint32_t blocks_per_env, float* __restrict__ lambda) {
+    uint32_t env_count, uint32_t slot_count, const uint32_t* row_ranges, uint32_t blocks_per_env, float* __restrict__ lambda) {
     const uint32_t points_per_env = slot_count * 4u;
     const uint32_t env = blockIdx.x / blocks_per_env;
     const uint32_t part = blockIdx.x % blocks_per_env;
@@ -1440,8 +1431,7 @@ __global__ void PrepareContactWarmStartKernel(
         const math::Vec3 n = current_normal[point_index];
         if (n.Dot(cache_normal[match]) <= 0.25f) continue;
         uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
-        if (!ContactRowOffsets(env, slot, point, rows_per_env,
-                               full_row_slot_count, &normal_row, &tangent1_row,
+        if (!ContactRowOffsets(env, slot, point, slot_count, row_ranges, &normal_row, &tangent1_row,
                                &tangent2_row)) continue;
         const float normal_impulse = fmaxf(cache_lambda[match * 3u], 0.0f);
         const math::Vec3 old_tangent_impulse =
@@ -1574,8 +1564,7 @@ __global__ void RebuildContactCacheKernel(
     const contact_cache::Ranks* __restrict__ ranks,
     const uint32_t* __restrict__ retained_sources,
     const uint32_t* __restrict__ extent, uint32_t env_blocks,
-    uint32_t slot_count, uint32_t rows_per_env,
-    uint32_t full_row_slot_count,
+    uint32_t slot_count, const uint32_t* row_ranges,
     uint64_t* __restrict__ cache_pair,
     uint64_t* __restrict__ cache_feature,
     float* __restrict__ cache_lambda,
@@ -1597,8 +1586,7 @@ __global__ void RebuildContactCacheKernel(
         const uint32_t point = local_point & 3u;
         if (current_owner[point_index] != 0u) {
             uint32_t normal_row = 0u, tangent1_row = 0u, tangent2_row = 0u;
-            if (ContactRowOffsets(env, slot, point, rows_per_env,
-                                  full_row_slot_count, &normal_row, &tangent1_row,
+            if (ContactRowOffsets(env, slot, point, slot_count, row_ranges, &normal_row, &tangent1_row,
                                   &tangent2_row)) {
                 cache_pair[point_index] = current_pair[point_index];
                 cache_feature[point_index] = current_feature[point_index];
@@ -1672,7 +1660,7 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    data.contact_cache_normal, data.contact_cache_tangent1,
                    data.contact_cache_tangent2, workspace.matches, workspace.order,
                    workspace.begins, workspace.ends, p->env_count, p->slot_count,
-                   p->rows_per_env, p->full_row_slot_count, env_blocks, data.lambda);
+                   data.ucontact_row_range, env_blocks, data.lambda);
     } else {
         const uint32_t points_per_env = p->slot_count * nk::kPairDrivenPtsPerSlot;
         const uint32_t point_blocks = contact_cache::EnvBlocks(points_per_env, p->env_count);
@@ -1708,7 +1696,7 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    data.contact_cache_current_owner,
                    data.contact_cache_old_keep, workspace.ranks, workspace.matches,
                    data.contact_cache_extent, point_blocks, p->slot_count,
-                   p->rows_per_env, p->full_row_slot_count,
+                   data.ucontact_row_range,
                    data.contact_cache_pair, data.contact_cache_feature,
                    data.contact_cache_lambda, data.contact_cache_normal,
                    data.contact_cache_tangent1, data.contact_cache_tangent2,
@@ -1752,7 +1740,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     if (p->env_count == 0u || p->rows_per_env == 0u) {
         return Status::Ok;
     }
-    constexpr uint32_t kBlockSize = 128u;
+    constexpr uint32_t kBlockSize = kContactRowsBlock;
     const uint32_t total_rows = p->env_count * p->rows_per_env;
     LaunchCuda(BeginPairDrivenRowsKernel, dim3((p->env_count + kBlockSize - 1u) / kBlockSize),
                dim3(kBlockSize), 0u, stream, p->env_count, data.row_count, data.contact_row_extent);
@@ -1771,22 +1759,26 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    state, p->max_dof, data.qdot_flat);
     }
 
-    // K2: emit the pair-driven contact rows.
+    // Assemble contact rows from the unified manifold.
     if (p->union_slot_count > 0u) {
         const uint32_t total = p->env_count * p->union_slot_count;
         const uint32_t blocks = (total + kBlockSize - 1u) / kBlockSize;
         const uint32_t full_slots = std::min(p->full_row_slot_count, p->union_slot_count);
-        const uint32_t clear_rows = p->env_count * (full_slots * kPdRowsPerSlot +
-            (p->union_slot_count - full_slots) * kPdParticleRowsPerSlot);
+        const uint32_t rigid_rows = p->contact_rows_per_env -
+            (p->union_slot_count - full_slots) * nk::kPairDrivenParticleRowsPerSlot;
+        LaunchCuda(BuildContactRowRangesKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream,
+                   data.ucontact_count, p->union_slot_count, full_slots, rigid_rows,
+                   p->rows_per_env, data.ucontact_row_range);
+        const uint32_t clear_rows = p->env_count * p->contact_rows_per_env;
         const uint32_t clear_blocks = (std::max(clear_rows, total) + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(ClearPairDrivenRowsKernel, dim3(clear_blocks), dim3(kBlockSize), 0u, stream,
-                   p->env_count, p->union_slot_count, p->full_row_slot_count, p->rows_per_env,
-                   data.contact_row_extent,
+                   p->env_count, p->union_slot_count, p->rows_per_env, p->contact_rows_per_env,
+                   data.ucontact_row_range, data.contact_row_extent,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
                    data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_damping,
                    data.contact_material);
         LaunchCuda(EmitPairDrivenRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   static_cast<const uint32_t*>(data.ucontact_count),
+                   static_cast<const uint32_t*>(data.ucontact_count), data.ucontact_row_range,
                    static_cast<const math::Vec3*>(data.ucontact_point),
                    static_cast<const math::Vec3*>(data.ucontact_witness_a),
                    static_cast<const math::Vec3*>(data.ucontact_witness_b),
@@ -1969,7 +1961,7 @@ Status OpAssembleRowsFused(const ModelView& model, const DataView& data,
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
         model, data, p->total_link_count, p->articulation_count);
-    constexpr uint32_t kBlockSize = 128u;
+    constexpr uint32_t kBlockSize = kContactRowsBlock;
     const uint32_t block_count = (p->slot_count + kBlockSize - 1u) / kBlockSize;
 
     // Chain Jacobians (normal, t1, t2) — the legacy launcher zeroes the output

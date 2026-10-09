@@ -211,7 +211,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         cfg.max_pairs == 0u ? rigid_cap
                             : (cfg.max_pairs < rigid_cap ? cfg.max_pairs : rigid_cap);
     const uint32_t contact_rows_per_env =
-        rigid_cap * kPairDrivenRowsPerSlot +
+        cap.rigid_contact_rows_per_env +
         (particle_reserve + cap.ogc_contacts_per_env +
          cap.mpm_contact_capacity_per_env) * kPairDrivenParticleRowsPerSlot;
     // The per-ARTICULATION contact-slot stride the contact detection/assembly/solve
@@ -1147,6 +1147,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_readout_.max_contacts_per_env = cap.max_contacts_per_env;
         p_readout_.rows_per_env = cap.max_rows_per_env;
         p_readout_.full_row_slot_count = rigid_cap;
+        p_readout_.contact_rows_per_env = contact_rows_per_env;
         p_readout_.workspace_bytes = cap.contact_index_scratch_bytes;
         add(phi::NkOp::ReadoutContactWrench, &p_readout_);
     }

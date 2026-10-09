@@ -1154,3 +1154,4 @@ fields:
   - {name: articulation_tree_depth, dtype: u32, per: articulation, arena: persistent, owner: model}
   - {name: link_child_range, dtype: u32, per: link, elem: 2, arena: persistent, owner: model}
   - {name: link_children, dtype: u32, per: link, arena: persistent, owner: model}
+  - {name: ucontact_row_range, dtype: u32, per: contact_slot, elem: 2, arena: scratch, owner: data, flags: [readout]}

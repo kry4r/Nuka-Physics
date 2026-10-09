@@ -728,7 +728,9 @@ typedef enum nuka_state_field_t {
     // vertex, color, chain, Schur, hub, stationarity and position phases.
     NUKA_FIELD_SOLVER_PHASE_TIME = 99,
     // READ: per VBD vertex, twenty float32 columns from the last solve call, environment-major.
-    NUKA_FIELD_VBD_SOLVE_AUDIT = 100
+    NUKA_FIELD_VBD_SOLVE_AUDIT = 100,
+    // READ: per contact slot, the absolute row offset and normal point count.
+    NUKA_FIELD_UCONTACT_ROW_RANGE = 103
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

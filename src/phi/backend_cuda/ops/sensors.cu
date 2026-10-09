@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include "phi/backend_cuda/ops/contact_row_layout.cuh"
 #include <cub/block/block_reduce.cuh>
 #include <cmath>
 
@@ -122,13 +123,11 @@ __device__ bool ContactMountMatches(const ModelView& model, const SensorContactL
         owner.body == env * p.bodies_per_env + frame - p.links_per_env;
 }
 
-__device__ uint32_t ContactRowBase(const SensorContactLayout& p, uint32_t env, uint32_t slot,
-                                  uint32_t& count) {
-    const bool rigid = slot < p.rigid_slots_per_env;
-    count = rigid ? nk::kPairDrivenPtsPerSlot : nk::kPairDrivenParticlePtsPerSlot;
-    return env * p.rows_per_env + (rigid ? slot * nk::kPairDrivenRowsPerSlot :
-        p.rigid_slots_per_env * nk::kPairDrivenRowsPerSlot +
-        (slot - p.rigid_slots_per_env) * nk::kPairDrivenParticleRowsPerSlot);
+__device__ uint32_t ContactRowBase(const SensorContactLayout& p, const DataView& data,
+    uint32_t env, uint32_t slot, uint32_t& count) {
+    const auto range = nkops::ContactRowRangeFor(data.ucontact_row_range, env * p.slots_per_env + slot);
+    count = range.points;
+    return range.first;
 }
 
 // All contact providers publish the same solved rows and manifold points.
@@ -158,7 +157,7 @@ __global__ void ReadoutContactImpulseKernel(ModelView model, DataView data, Read
                 data.ucontact_b_kind[point_base], data.ucontact_b[point_base]);
             if (!side_a && !side_b) continue;
             uint32_t count;
-            const uint32_t base = ContactRowBase(p, env, slot, count);
+            const uint32_t base = ContactRowBase(p, data, env, slot, count);
             for (uint32_t point = 0u; point < points && point < count; ++point) {
                 const auto arm = data.ucontact_point[point_base + point] - origin;
                 for (uint32_t axis = 0u; axis <= nk::kPairDrivenTangentRowsPerPt; ++axis) {
@@ -216,8 +215,7 @@ Status OpReadoutSensorWrenches(const ModelView& model, const DataView& data,
         !(p->interval > 0.0) || !std::isfinite(p->interval) || p->rigid_slots_per_env > p->slots_per_env)
         return Status::InvalidArgument;
     const uint64_t frames = uint64_t{p->env_count} * (uint64_t{p->links_per_env} + p->bodies_per_env);
-    const uint64_t required_rows = uint64_t{p->rigid_slots_per_env} * nk::kPairDrivenRowsPerSlot +
-        uint64_t{p->slots_per_env - p->rigid_slots_per_env} * nk::kPairDrivenParticleRowsPerSlot;
+    const uint64_t required_rows = p->contact_rows_per_env;
     if (!frames || frames > UINT32_MAX || required_rows > p->rows_per_env ||
         uint64_t{p->env_count} * p->rows_per_env > UINT32_MAX ||
         uint64_t{p->env_count} * p->slots_per_env > UINT32_MAX / nk::kPairDrivenPtsPerSlot ||
@@ -259,7 +257,7 @@ __global__ void ReadoutContactRegionKernel(ModelView model, DataView data, Reado
                 ContactMountMatches(model, p, env, p.frame, data.ucontact_b_kind[point_base], data.ucontact_b[point_base])};
             if (!sides[0] && !sides[1]) continue;
             uint32_t count;
-            const uint32_t base = ContactRowBase(p, env, slot, count);
+            const uint32_t base = ContactRowBase(p, data, env, slot, count);
             for (uint32_t point = 0u; point < points && point < count; ++point) {
                 const auto& normal_row = rows[base + point];
                 if (!(normal_row.flags & nk::nk_row_flags::kActive)) continue;
@@ -304,8 +302,7 @@ Status OpReadoutContactRegion(const ModelView& model, const DataView& data,
         !sensor::ValidTactileConfig(p->config, p->kind == sensor::StateSensorKind::Touch) ||
         p->rigid_slots_per_env > p->slots_per_env) return Status::InvalidArgument;
     const uint64_t frames = uint64_t{p->links_per_env} + p->bodies_per_env;
-    const uint64_t required_rows = uint64_t{p->rigid_slots_per_env} * nk::kPairDrivenRowsPerSlot +
-        uint64_t{p->slots_per_env - p->rigid_slots_per_env} * nk::kPairDrivenParticleRowsPerSlot;
+    const uint64_t required_rows = p->contact_rows_per_env;
     if (p->frame >= frames || uint64_t{p->env_count} * frames > UINT32_MAX || required_rows > p->rows_per_env ||
         uint64_t{p->env_count} * p->rows_per_env > UINT32_MAX ||
         uint64_t{p->env_count} * p->slots_per_env > UINT32_MAX / nk::kPairDrivenPtsPerSlot ||

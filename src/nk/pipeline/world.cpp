@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "phi/articulation_contract.hpp"
+#include "nk/model/contact_capacity.hpp"
 #include "nk/solve/schedule.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "nk/solve/xpbd_coloring.hpp"
@@ -72,8 +73,10 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         creation_error_ = "compact contact reserve exceeds the contact capacity";
         return;
     }
+    const uint64_t rigid_rows =
+        ComputeRigidContactCapacity(model_).RowsForSlots(control_cap.max_contacts_per_env - point_slots);
     const uint64_t row_count =
-        (control_cap.max_contacts_per_env - point_slots) * kPairDrivenRowsPerSlot +
+        rigid_rows +
         point_slots * kPairDrivenParticleRowsPerSlot + control_cap.joint_limit_rows_per_env +
         control_cap.joint_friction_rows_per_env + drive_rows +
         uint64_t{control_cap.mpm_stress_cells_per_env} * kMpmStressRowsPerCell +
@@ -83,6 +86,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         creation_error_ = "actuator row capacity is invalid";
         return;
     }
+    control_cap.rigid_contact_rows_per_env = static_cast<uint32_t>(rigid_rows);
     control_cap.max_rows_per_env = std::max(control_cap.max_rows_per_env, static_cast<uint32_t>(row_count));
     control_cap.joint_drive_rows_per_env = drive_rows;
     control_cap.inverse_dynamics_controls =

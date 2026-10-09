@@ -539,6 +539,7 @@ struct MpmParams {
     uint32_t contact_capacity;
     uint32_t contact_slots_per_env;
     uint32_t full_row_slot_count;
+    uint32_t rigid_rows_per_env;
     uint32_t rows_per_env;
     uint32_t particle_count;     // total env-major particles (0 => inert no-op)
     uint32_t particles_per_env;  // per-env stride (for the env-offset cell key)
@@ -798,9 +799,8 @@ struct AssembleRowsParams {
     uint32_t joint_drive_rows_per_env;
     // Nonzero when articulation rows act on the reduced coordinates MimicReduce prepared.
     uint32_t mimic_couplings_per_env;
-    // Slots [0, full_row_slot_count) use the rigid 4-point/20-row layout; the
-    // body-particle provider's reserved tail uses its exact 1-point/5-row layout.
-    // Equal to union_slot_count when the model has no body-particle reserve.
+    // Rigid slots use their manifold row ranges; the compact tail reserves one point.
+    // Equal to union_slot_count when the model has no compact reserve.
     uint32_t full_row_slot_count;
     uint32_t ogc_slot_count = 0u;
     uint32_t bodies_per_env;
@@ -1088,7 +1088,8 @@ struct ReadoutContactWrenchParams {
     uint32_t base_link_count;
     uint32_t max_contacts_per_env;
     uint32_t rows_per_env;      // per-env solver row-slot span (max_rows_per_env)
-    uint32_t full_row_slot_count;  // rigid slots [0, this) use the 12-row layout
+    uint32_t full_row_slot_count;  // number of rigid slots before the compact tail
+    uint32_t contact_rows_per_env;
     uint64_t workspace_bytes;
 };
 
@@ -1169,6 +1170,7 @@ struct SensorContactLayout {
     uint32_t slots_per_env = 0u;
     uint32_t rigid_slots_per_env = 0u;
     uint32_t rows_per_env = 0u;
+    uint32_t contact_rows_per_env = 0u;
 };
 
 struct ReadoutSensorWrenchesParams : SensorContactLayout {

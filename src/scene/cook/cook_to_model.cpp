@@ -40,7 +40,8 @@
 #include "collision/shape_kind.hpp"  // nuka::collision::ShapeKind (R2: one enum)
 #include "scene/terrain/heightfield.hpp"  // HeightField (the cooked grid source)
 #include "scene/terrain/heightfield_loaders.hpp"  // parametric/image grid fill
-#include "nk/solve/nk_row.hpp"       // kPairDrivenRowsPerSlot (B1 row budget)
+#include "nk/model/contact_capacity.hpp"
+#include "nk/solve/nk_row.hpp"
 #include "runtime/articulation/articulation_cooker.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "scene/cooker.hpp"
@@ -244,28 +245,11 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
     cap.max_rows_per_env = static_cast<uint32_t>(total_rows);
 }
 
-static uint64_t RigidCandidatePairs(const nk::Model& model) {
-    uint64_t admitted = 0u;
-    const uint32_t collidables = model.capacities.bodies_per_env;
-    for (uint32_t a = 0u; a < collidables; ++a) {
-        const auto& sa = model.shape_table_rows[a];
-        for (uint32_t b = a + 1u; b < collidables; ++b) {
-            const auto& sb = model.shape_table_rows[b];
-            if ((sa.body_id < 0 && sb.body_id < 0) ||
-                !::nuka::collision::ShapeFilterAdmits(sa.contype, sa.conaffinity, sa.group,
-                    sb.contype, sb.conaffinity, sb.group) ||
-                std::binary_search(model.excluded_pairs.begin(), model.excluded_pairs.end(),
-                                   (uint64_t{a} << 32u) | b)) continue;
-            ++admitted;
-        }
-    }
-    return admitted;
-}
 
 }  // namespace
 
 // Reserve particle rows above the rigid budget, excluding grid-owned particles.
-// Rigid slots retain the full manifold footprint; particle slots contain one point.
+// Rigid slots retain their provider footprint; particle slots contain one point.
 void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base,
                                    uint32_t row_exempt) {
     if (row_exempt > cap.particles_per_env)
@@ -275,7 +259,7 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
                              cap.mpm_contact_capacity_per_env;
     const uint64_t total = static_cast<uint64_t>(rigid_base) + compact;
     const uint64_t rows =
-        static_cast<uint64_t>(rigid_base) * nk::kPairDrivenRowsPerSlot +
+        uint64_t{cap.rigid_contact_rows_per_env} +
         compact * nk::kPairDrivenParticleRowsPerSlot;
     if (total > 0xFFFFFFFFull || rows > 0xFFFFFFFFull) {
         throw std::runtime_error(
@@ -1359,8 +1343,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
         cap.max_excluded_pairs = static_cast<uint32_t>(model.excluded_pairs.size());
     }
 
-    const uint64_t rigid_pairs = enable_contacts ? RigidCandidatePairs(model) : 0u;
-    SetRowCapacity(cap, rigid_pairs * nk::kPairDrivenRowsPerSlot);
+    const auto rigid_capacity = nk::ComputeRigidContactCapacity(model);
+    const uint64_t rigid_pairs = enable_contacts ? rigid_capacity.CandidateCount() : 0u;
+    const uint64_t rigid_rows = rigid_capacity.RowsForSlots(rigid_pairs);
+    SetRowCapacity(cap, rigid_rows);
+    cap.rigid_contact_rows_per_env = static_cast<uint32_t>(rigid_rows);
     cap.max_contacts_per_env = static_cast<uint32_t>(rigid_pairs);
 
     for (uint32_t body = 0u; body < cap.bodies_per_env; ++body) {
@@ -1446,15 +1433,7 @@ CookToModelResult CookToModel(const SceneIR& scene, int env_count) {
     return CookToModel(scene, env_count, CookToModelOptions{});
 }
 
-// B1 (general contact pipeline (PairDriven)): the PairDriven (general) cook overload.
-// It runs the SAME cook (so the registry / shape_table / body_to_link / static
-// ground row / multi-artic foundation are all reused verbatim) then flips the model
-// to the GENERAL family: contact_family = PairDriven (the pipeline then routes the
-// ONE LBVH -> cvx -> mixed-island contact path), enables cross-env filtering so
-// candidate pairs stay env-local, and RE-SIZES the per-env row budget to the
-// general per-candidate-slot layout (max_contacts_per_env candidate slots x
-// kPairDrivenRowsPerSlot rows/slot). : the FUSED runtime is deleted, so this is
-// the ONLY general cook path — the options.contact_family no longer selects FUSED.
+// Cook collidable ownership, filtering and provider row capacities for the general contact path.
 CookToModelResult CookToModel(const SceneIR& scene, int env_count,
                               const CookToModelOptions& options) {
     // options.contact_family no longer selects FUSED; the cook is always
@@ -1608,8 +1587,11 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
     nk::ModelCapacities& cap = model.capacities;
     cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
     cap.max_bodies_total = static_cast<uint32_t>(model.shape_table_rows.size());
-    const uint64_t rigid_pairs = RigidCandidatePairs(model);
-    SetRowCapacity(cap, rigid_pairs * nk::kPairDrivenRowsPerSlot);
+    const auto rigid_capacity = nk::ComputeRigidContactCapacity(model);
+    const uint64_t rigid_pairs = rigid_capacity.CandidateCount();
+    const uint64_t rigid_rows = rigid_capacity.RowsForSlots(rigid_pairs);
+    SetRowCapacity(cap, rigid_rows);
+    cap.rigid_contact_rows_per_env = static_cast<uint32_t>(rigid_rows);
     const uint32_t rigid_base = static_cast<uint32_t>(rigid_pairs);
     cap.max_contacts_per_env = rigid_base;
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());

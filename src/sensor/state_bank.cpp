@@ -5,6 +5,7 @@
 #include <limits>
 
 #include "nk/model/model.hpp"
+#include "nk/solve/nk_row.hpp"
 #include "nk/model/generated/views.hpp"
 #include "phi/articulation_contract.hpp"
 
@@ -29,6 +30,8 @@ phi::Status ContactLayout(const nk::Model& model, uint32_t env_count, phi::Senso
     layout->rigid_slots_per_env = cap.max_contacts_per_env -
         static_cast<uint32_t>(reserved_slots);
     layout->rows_per_env = cap.max_rows_per_env;
+    layout->contact_rows_per_env = cap.rigid_contact_rows_per_env +
+        static_cast<uint32_t>(reserved_slots) * nk::kPairDrivenParticleRowsPerSlot;
     return phi::Status::Ok;
 }
 

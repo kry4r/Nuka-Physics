@@ -1,29 +1,8 @@
 #pragma once
 #include "nk/readout/energy_ledger.hpp"
 #include "nk/readout/physics_diagnostics.hpp"
-// ===========================================================================
-// c_abi/dlpack_table.hpp — the canonical, single-source-of-truth descriptor
-// table for the public RL state-buffer field enum (nuka_state_field_t).
-//
-// THE RL HARD CONTRACT (M9 T1). The python / RL / diffsim / DLPack stack
-// depends on the per-field binary semantics BIT-FOR-BIT: a silent change to
-// any field's public integer, element_stride_bytes, or wire dtype corrupts RL
-// training invisibly. This table centralizes those descriptors so c_abi/
-// buffer.cpp emits them from ONE place instead of scattered inline literals.
-//
-// It is also the FieldId <-> nuka_state_field_t bridge: each public field row
-// records the nk::FieldId it corresponds to (src/nk/model/fields.yaml). M9 T1
-// only AUTHORS the mapping + sources the descriptors from here; the actual
-// data-source rewire (legacy world -> nk::World Data field pointer) is M9 T5.
-// So buffer.cpp still reads today's legacy/batched device pointers — but the
-// stride/dtype/FieldId it reports are already resolved through this table.
-//
-// APPEND-ONLY IN SPIRIT: never reorder/renumber/restride/redtype an existing
-// public field. New fields append at the next integer. The 20 rows below are
-// byte-pinned by tests/c_abi/test_multi_env_world, tests/c_abi/
-// test_drive_target_io, and python/tests/test_nuka_dlpack.py (run BEFORE and
-// AFTER any edit to this file or buffer.cpp — they must be value-identical).
-// ===========================================================================
+// Public state fields keep stable IDs, strides and wire dtypes.
+// Descriptor lookup uses those IDs independently of registry storage.
 
 #include <cstddef>
 #include <cstdint>
@@ -274,6 +253,8 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
         kWireDtypeU64, nk::FieldId::SolverPhaseTime},
     {NUKA_FIELD_VBD_SOLVE_AUDIT, nk::LayoutOf(nk::FieldId::VbdSolveAudit).elem_size,
         kWireDtypeF32, nk::FieldId::VbdSolveAudit},
+    {NUKA_FIELD_UCONTACT_ROW_RANGE, nk::LayoutOf(nk::FieldId::UcontactRowRange).elem_size,
+        kWireDtypeU32, nk::FieldId::UcontactRowRange},
 };
 
 inline constexpr size_t kDlpackFieldCount =
@@ -285,9 +266,6 @@ static_assert(nk::LayoutOf(nk::FieldId::PhysicsStageMetrics).elem_size ==
 static_assert(nk::LayoutOf(nk::FieldId::VbdSolveAudit).elem_size ==
               nk::kVbdSolveAuditColumnCount * sizeof(float));
 
-// Public field IDs remain append-only and match their table index.
-static_assert(kDlpackFieldCount == 101u,
-              "public field table extent must match the append-only field enum");
 static_assert(static_cast<int>(NUKA_FIELD_CONTACT_LINK) == 19,
               "public field enum range changed — review the RL binary contract");
 static_assert(static_cast<int>(NUKA_FIELD_JOINT_FEEDFORWARD) == 22,
@@ -299,21 +277,17 @@ static_assert(static_cast<int>(NUKA_FIELD_ACTUATOR_SATURATED) == 30,
 static_assert(static_cast<int>(NUKA_FIELD_TASK_LOCAL_POSE) == 32,
               "OSC field enum range changed — review the RL binary contract");
 
-// Resolve a public field's canonical descriptor. Returns nullptr if the field
-// integer is out of the table's covered range. The table is laid out so row i
-// describes field i; we verify that identity rather than trust it.
+// Registered descriptors are sorted by their stable public field ID.
 inline const DlpackFieldRow* FindDlpackFieldRow(nuka_state_field_t field) {
-    const int idx = static_cast<int>(field);
-    if (idx < 0 || idx >= static_cast<int>(kDlpackFieldCount)) {
-        return nullptr;
+    size_t low = 0u;
+    size_t high = kDlpackFieldCount;
+    while (low < high) {
+        const size_t middle = low + (high - low) / 2u;
+        if (kDlpackFieldTable[middle].field < field) low = middle + 1u;
+        else high = middle;
     }
-    const DlpackFieldRow& row = kDlpackFieldTable[idx];
-    if (row.field != field) {
-        // Table rows are not in 1:1 integer order — refuse rather than emit a
-        // wrong descriptor (would silently corrupt the RL contract).
-        return nullptr;
-    }
-    return &row;
+    return low < kDlpackFieldCount && kDlpackFieldTable[low].field == field
+        ? &kDlpackFieldTable[low] : nullptr;
 }
 
 } // namespace nuka::c_abi

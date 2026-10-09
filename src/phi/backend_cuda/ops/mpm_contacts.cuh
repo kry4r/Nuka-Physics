@@ -453,7 +453,7 @@ __global__ void ClassifyReactions(MpmParams p, ModelView model, DataView data, u
         if (target == ~0u) continue;
         const uint32_t local_slot = p.contact_slot_base + c;
         const uint32_t base = env * p.rows_per_env +
-            p.full_row_slot_count * nk::kPairDrivenRowsPerSlot +
+            p.rigid_rows_per_env +
             (local_slot - p.full_row_slot_count) * nk::kPairDrivenParticleRowsPerSlot;
         const auto* rows = reinterpret_cast<const nk::NkRow*>(data.urows);
         math::Vec3 impulse{};

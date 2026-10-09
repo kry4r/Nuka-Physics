@@ -143,6 +143,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactSideBKind:    v.contact_side_b_kind = static_cast<uint32_t*>(p); break;
         case FieldId::ContactSideAIndex:   v.contact_side_a_index = static_cast<uint32_t*>(p); break;
         case FieldId::ContactSideBIndex:   v.contact_side_b_index = static_cast<uint32_t*>(p); break;
+        case FieldId::UcontactRowRange:    v.ucontact_row_range = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactCount:       v.ucontact_count = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactPoint:       v.ucontact_point = static_cast<math::Vec3*>(p); break;
         case FieldId::UcontactWitnessA:    v.ucontact_witness_a = static_cast<math::Vec3*>(p); break;

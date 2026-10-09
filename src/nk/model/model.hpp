@@ -50,6 +50,7 @@ struct ModelCapacities {
     uint32_t links_per_env   = 0;   // articulation link count / env (SUM across co-resident dogs).
     uint32_t bodies_per_env  = 0;   // movable rigid body count / env.
     uint32_t max_contacts_per_env = 0;  // contact-slot capacity / env.
+    uint32_t rigid_contact_rows_per_env = 0u;
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
     uint32_t foot_shape_count = 0u;
     uint64_t schedule_island_elements = 0u;

@@ -470,6 +470,7 @@ enum class FieldId : uint16_t {
     ArticulationTreeDepth,  // articulation_tree_depth (per:articulation arena:persistent owner:model)
     LinkChildRange,  // link_child_range (per:link arena:persistent owner:model elem:2)
     LinkChildren,  // link_children (per:link arena:persistent owner:model)
+    UcontactRowRange,  // ucontact_row_range (per:contact_slot arena:scratch owner:data elem:2 flags:[readout])
     Count
 };
 
@@ -935,6 +936,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "articulation_tree_depth",
     "link_child_range",
     "link_children",
+    "ucontact_row_range",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";
