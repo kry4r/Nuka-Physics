@@ -29,12 +29,14 @@
 #include <vulkan/vulkan.h>
 
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/raster/vulkan_raster_renderer.hpp"
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/imgui_layer.hpp"
+#include "runtime/app/viewer/entity_drag.hpp"
 #include "scene/asset/asset_ref.hpp"
 #include "scene/asset/nka.hpp"
 
@@ -120,6 +122,99 @@ void WritePpm(const std::string& path, const std::vector<VulkanRgba8>& pixels,
 // VIEW-1: camera screen->world ray + drag-plane unproject (pure host, NO Vulkan
 // -- runs even with no graphics device). Center pixel -> a ray along the camera
 // forward; a known ground plane is hit at the expected world point.
+TEST(ViewerInteraction, TransportTogglesKeepStyleStackBalanced) {
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1280.0f, 720.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    unsigned char* pixels = nullptr;
+    int width = 0, height = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    nuka::runtime::app::viewer::ImGuiLayer ui;
+    ui.EnableDocking();
+    nuka::runtime::app::viewer::CameraController camera;
+    nuka::runtime::app::viewer::ViewerStats stats;
+    nuka::runtime::app::viewer::ViewerUiState state;
+    state.has_scene = true;
+    const RenderWorld world = BuildSyntheticWorld();
+    auto frame = [&]() {
+        ImGui::NewFrame();
+        ui.RecordUi(world, stats, camera, state);
+        EXPECT_EQ(GImGui->ColorStack.Size, 0);
+        ImGui::Render();
+    };
+    for (int i = 0; i < 4; ++i) frame();
+    ImGuiWindow* transport = ImGui::FindWindowByName("##transport");
+    ASSERT_NE(transport, nullptr);
+    for (int i = 0; i < 20; ++i) {
+        const bool before = state.playing;
+        state.play_toggled = false;
+        ImGui::ActivateItemByID(transport->GetID(before ? "Pause" : "Play"));
+        frame();
+        EXPECT_NE(state.playing, before);
+        EXPECT_TRUE(state.play_toggled);
+    }
+    state.playing = true;
+    state.step_requested = false;
+    ImGui::ActivateItemByID(transport->GetID("Step"));
+    frame();
+    EXPECT_FALSE(state.step_requested);
+    state.playing = false;
+    ImGui::ActivateItemByID(transport->GetID("Step"));
+    frame();
+    EXPECT_TRUE(state.step_requested);
+    ImGui::DestroyContext();
+}
+
+TEST(ViewerInteraction, EntityDragCancelsBeforeInputCaptureGates) {
+    using nuka::render::window::WindowEvent;
+    nuka::runtime::app::viewer::EntityDrag drag;
+    WindowEvent event;
+    event.type = WindowEvent::Type::MouseButton;
+    event.button = 0u;
+    event.pressed = false;
+    drag.instance = 3u;
+    drag.Observe(event);
+    EXPECT_EQ(drag.instance, drag.kNone);
+    for (const uint32_t key : {0xffe3u, 0xffe4u}) {
+        drag.instance = 3u;
+        event.type = WindowEvent::Type::Key;
+        event.keysym = key;
+        drag.Observe(event);
+        EXPECT_EQ(drag.instance, drag.kNone);
+    }
+    for (const auto type : {WindowEvent::Type::FocusLost, WindowEvent::Type::Close}) {
+        drag.instance = 3u;
+        event.type = type;
+        drag.Observe(event);
+        EXPECT_EQ(drag.instance, drag.kNone);
+    }
+    drag.instance = 3u;
+    drag.Cancel();
+    event.type = WindowEvent::Type::MouseMove;
+    drag.Observe(event);
+    EXPECT_EQ(drag.instance, drag.kNone);
+}
+
+TEST(ViewerInteraction, CameraStopsWhenUiCapturesDrag) {
+    using nuka::render::window::WindowEvent;
+    nuka::runtime::app::viewer::CameraController camera;
+    camera.FrameAabb({-1.0f, -1.0f, -1.0f}, {1.0f, 1.0f, 1.0f});
+    WindowEvent event;
+    event.type = WindowEvent::Type::MouseButton;
+    event.button = 0u;
+    event.pressed = true;
+    camera.HandleEvent(event, true, true);
+    const float yaw = camera.Yaw();
+    event.type = WindowEvent::Type::MouseMove;
+    event.mouse_x = 80;
+    camera.HandleEvent(event, false, false);
+    EXPECT_FLOAT_EQ(camera.Yaw(), yaw);
+    event.mouse_x = 160;
+    camera.HandleEvent(event, true, true);
+    EXPECT_FLOAT_EQ(camera.Yaw(), yaw);
+}
+
 TEST(ViewerCameraRay, CenterRayAndKnownPlaneHit) {
     using nuka::runtime::app::viewer::CameraController;
     using nuka::runtime::app::viewer::Ray;
@@ -217,7 +312,10 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
     stats.bodies = 1u; stats.contact_cap = 64u; stats.draw_calls = 2u; stats.non_bg_pixels = 12345u;
     stats.frame_index = 7u; stats.device_name = "offscreen";
     nuka::runtime::app::viewer::ViewerUiState ui_state;
-    ui_state.playing = true; ui_state.speed = 1.0f;
+    ui_state.playing = false; ui_state.speed = 1.0f;
+    ui_state.has_scene = true;
+    ui_state.loaded_path = "Synthetic renderer fixture (no physics session)";
+    stats.debug_capacity = 8192u;
     // FIXED drive-panel + entity-selection state so the new panels record
     // DETERMINISTICALLY (no time/animation widget). Pre-seed a few DOF sliders to
     // fixed values + select the steel box's entity; drive_dirty stays all-zero so
@@ -291,6 +389,24 @@ TEST(ViewerFrameSmoke, OffscreenScenePlusImGuiCompositeIsDeterministic) {
                 "ppm=/tmp/m8_5_viewer_frame.ppm\n",
                 first.selected_device_name.c_str(), cmd_lists_a,
                 first.non_background_pixel_count, cmp == 0 ? "BYTE-IDENTICAL" : "MISMATCH");
+
+    options.width = 960u;
+    options.height = 600u;
+    for (int i = 0; i < 4; ++i) build_ui();
+    const auto narrow = renderer->Render(world, options, [&imgui](void* cmd) {
+        imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    });
+    WritePpm("/tmp/nuka_viewer_narrow.ppm", narrow.pixels, narrow.width, narrow.height);
+    ui_state.inspector.valid = true;
+    ui_state.inspector.has_material = true;
+    ui_state.inspector.pos[0] = world.instances[1].world_xform.position.x;
+    ui_state.inspector.pos[2] = world.instances[1].world_xform.position.z;
+    ImGui::SetWindowFocus("Entity");
+    for (int i = 0; i < 4; ++i) build_ui();
+    const auto inspector = renderer->Render(world, options, [&imgui](void* cmd) {
+        imgui.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    });
+    WritePpm("/tmp/nuka_viewer_inspector.ppm", inspector.pixels, inspector.width, inspector.height);
 
     imgui.Shutdown();
 }

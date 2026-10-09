@@ -177,7 +177,7 @@ private:
 
     static void FramebufferSizeCb(GLFWwindow* w, int width, int height) {
         GlfwWindowSurface* self = Self(w);
-        if (self == nullptr || width <= 0 || height <= 0) return;
+        if (self == nullptr || width < 0 || height < 0) return;
         self->width_ = static_cast<uint32_t>(width);
         self->height_ = static_cast<uint32_t>(height);
         WindowEvent ev;

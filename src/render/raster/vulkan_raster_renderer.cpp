@@ -1039,6 +1039,15 @@ struct VulkanRasterRenderer::Impl {
         create_info.pAttachments = attachments.data();
         create_info.subpassCount = 1u;
         create_info.pSubpasses = &subpass;
+        VkSubpassDependency readback{};
+        readback.srcSubpass = 0u;
+        readback.dstSubpass = VK_SUBPASS_EXTERNAL;
+        readback.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        readback.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        readback.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        readback.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        create_info.dependencyCount = 1u;
+        create_info.pDependencies = &readback;
         CheckVk(vkCreateRenderPass(device, &create_info, nullptr, &render_pass),
                 "vkCreateRenderPass");
     }
