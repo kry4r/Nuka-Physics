@@ -1,9 +1,7 @@
 #pragma once
 
-__global__ void InitializeRigidBlocksKernel(
-    DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const uint32_t body = blockIdx.x;
-    if (body >= p.total_body_count || threadIdx.x != 0u) return;
+// Free velocity, snapshot and mass matrix of a body; a static or invalid body keeps dimension 0.
+__device__ void InitializeRigidBlock(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t body) {
     const size_t base = size_t{body} * kRigidBlockDof;
     const Vec3 linear = data.body_linear_velocity[body];
     const Vec3 angular = data.body_angular_velocity[body];
@@ -47,6 +45,13 @@ __global__ void InitializeRigidBlocksKernel(
         }
     }
     s.rigid_dimensions[body] = kRigidBlockDof;
+}
+
+__global__ void InitializeRigidBlocksKernel(
+    DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t body = blockIdx.x;
+    if (body >= p.total_body_count || threadIdx.x != 0u) return;
+    InitializeRigidBlock(data, p, s, body);
 }
 
 struct RigidBlock {

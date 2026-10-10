@@ -159,6 +159,29 @@ struct MultilevelRowTerm {
 };
 static_assert(sizeof(MultilevelRowTerm) % sizeof(double) == 0u);
 
+constexpr uint32_t kTileLanes = 32u;
+constexpr uint32_t kTileWarps = 4u;
+// Per-head fields of a dense tile, each a run of the environment's head capacity: indices, the row's
+// coefficients, then the normal bound, residual, dual, move and step of the current block solve.
+constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner = 3u, kTileRow = 5u,
+                   kTileUnit = 7u, kTileUnitValue = 9u, kTileRho = 11u, kTileCompliance = 12u, kTileLower = 13u,
+                   kTileUpper = 14u, kTileMuFirst = 15u, kTileMuSecond = 16u, kTileNormalBound = 17u,
+                   kTileResidual = 18u, kTileDual = 21u, kTileMove = 24u, kTileStep = 27u, kTileFields = 30u;
+
+// Environments of articulations, with rigid bodies at most, whose blocks fit a warp of coordinates solve
+// as one warp each.
+bool DenseTileRoute(const BlockDescentSolveParams& p) {
+    return p.total_particle_count == 0u && p.total_grid_count == 0u && p.articulation_count > 0u &&
+           p.max_dof <= kTileLanes;
+}
+
+// Head rows an environment can hold in whole warps: a contact head takes two tangent rows, every other
+// row heads.
+uint32_t TileHeadCapacity(const BlockDescentSolveParams& p) {
+    const uint32_t heads = p.contact_rows_per_env / 3u + (p.rows_per_env - p.contact_rows_per_env);
+    return (heads + kTileLanes - 1u) / kTileLanes * kTileLanes;
+}
+
 struct BlockScratch {
     uint32_t* counts;
     uint32_t* offsets;
@@ -248,6 +271,11 @@ struct BlockScratch {
     uint8_t* multilevel_touch_count;
     uint32_t multilevel_parts;
     uint32_t multilevel_item_parts;
+    float* tile_fields;
+    double* tile_response;
+    float* tile_jacobian;
+    uint32_t tile_head_capacity;
+    uint32_t tile_row_capacity;
 };
 
 // Incidence entries are row slots, so sorting the bits that index every slot orders them fully.
@@ -298,8 +326,10 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     if (incidence >= uint64_t{std::numeric_limits<uint32_t>::max()}) return 0u;
     const uint64_t word_limit = std::numeric_limits<size_t>::max() / sizeof(uint32_t);
     if (incidence > word_limit) return 0u;
-    const bool incidence_terms = p.total_particle_count > 0u || p.total_grid_count > 0u ||
-                                 p.total_body_count > 0u || p.articulation_count > 0u;
+    // Dense tiles keep their rows per environment, without incidence lists, colors or row caches.
+    const bool tile = DenseTileRoute(p);
+    const bool incidence_terms = !tile && (p.total_particle_count > 0u || p.total_grid_count > 0u ||
+                                           p.total_body_count > 0u || p.articulation_count > 0u);
     if (incidence_terms && incidence > word_limit / kPointJacobianWords) return 0u;
     const uint64_t point_jacobian_words = incidence_terms ? incidence * kPointJacobianWords : 0u;
     const uint64_t cache_colors = uint64_t{p.vertex_blocks.colors} + 2u +
@@ -307,7 +337,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     if (cache_colors > uint64_t{std::numeric_limits<uint32_t>::max()}) return 0u;
     const uint64_t color_words = (cache_colors + 31u) / 32u;
     if (rows > word_limit / color_words) return 0u;
-    const uint64_t row_color_words = rows * color_words;
+    const uint64_t row_color_words = tile ? 0u : rows * color_words;
     const uint64_t dofs = uint64_t{p.articulation_count} * p.max_dof;
     if (dofs >= uint64_t{std::numeric_limits<uint32_t>::max()} ||
         dofs > word_limit || (dofs > 0u && p.max_dof > word_limit / dofs)) return 0u;
@@ -315,12 +345,12 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     if (matrix_words > word_limit - dofs ||
         dofs > (word_limit - matrix_words) / 7u) return 0u;
     size_t scan_bytes = 0u;
-    if (cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
+    if (!tile && cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
             static_cast<uint32_t*>(nullptr), static_cast<int>(blocks + 1u)) != cudaSuccess)
         return 0u;
     size_t incidence_sort_bytes = 0u;
     // Owner deduplication bounds each segment by rows, already below CUB's INT_MAX limit.
-    if (blocks > 0u && incidence > 0u &&
+    if (!tile && blocks > 0u && incidence > 0u &&
         cub::DeviceSegmentedRadixSort::SortKeys(nullptr, incidence_sort_bytes,
             static_cast<const uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
             static_cast<int64_t>(incidence), static_cast<int64_t>(blocks),
@@ -404,7 +434,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.incidence_sort_bytes = incidence_sort_bytes;
     at = (at + 1u) & ~uint64_t{1u};
     s.row_state = reinterpret_cast<AugmentedRowState*>(take(
-        rows * sizeof(AugmentedRowState) / sizeof(uint32_t)));
+        tile ? 0u : rows * sizeof(AugmentedRowState) / sizeof(uint32_t)));
     s.owner_cache_color = take(blocks);
     s.row_cache_colors = take(row_color_words);
     s.color_words = static_cast<uint32_t>(color_words);
@@ -412,7 +442,14 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     at = (at + 1u) & ~uint64_t{1u};
     s.scalar_response = reinterpret_cast<nk::augmented::ScalarResponse*>(take(
         rows * sizeof(nk::augmented::ScalarResponse) / sizeof(uint32_t)));
-    at = (at + 1u) & ~uint64_t{1u};
+    // Each head row stages at most one Jacobian row per incidence.
+    at = (at + kTileLanes - 1u) & ~uint64_t{kTileLanes - 1u};
+    s.tile_head_capacity = tile ? TileHeadCapacity(p) : 0u;
+    s.tile_row_capacity = tile ? 2u * p.rows_per_env : 0u;
+    s.tile_fields = reinterpret_cast<float*>(take(uint64_t{p.env_count} * kTileFields * s.tile_head_capacity));
+    s.tile_response = reinterpret_cast<double*>(take(
+        uint64_t{p.env_count} * 2u * s.tile_head_capacity * (sizeof(double) / sizeof(uint32_t))));
+    s.tile_jacobian = reinterpret_cast<float*>(take(uint64_t{p.env_count} * s.tile_row_capacity * kTileLanes));
     const bool coarse = p.total_particle_count > 0u;
     s.coarse_parts = CoarseParts(p);
     if (uint64_t{p.env_count} * s.coarse_parts >= uint64_t{std::numeric_limits<int>::max()}) return 0u;
@@ -1256,6 +1293,7 @@ __device__ bool Finite(Vec3 value) {
 #include "phi/backend_cuda/ops/block_descent_grid.cuh"
 #include "phi/backend_cuda/ops/block_descent_coarse.cuh"
 #include "phi/backend_cuda/ops/block_descent_multilevel.cuh"
+#include "phi/backend_cuda/ops/block_descent_tile.cuh"
 
 __global__ void PackBlockRigidSnapshotKernel(DataView data, BlockDescentSolveParams p,
                                             BlockScratch s) {
@@ -2084,6 +2122,22 @@ cudaError_t LaunchMultilevelCorrection(const ModelView& model, const DataView& d
         ? LaunchWork(MultilevelApplyKernel, vertices, kThreads, stream, data, p, s) : status;
 }
 
+// Contact and vertex residuals of the finished solve, when asked.
+Status MeasureSolve(const ModelView& model, const DataView& data, const BlockDescentSolveParams& p,
+                    const BlockScratch& s, cudaStream_t stream) {
+    if (p.measure_contact_residual == 0u) return Status::Ok;
+    const auto clear = [&](void* ptr, size_t bytes) {
+        return bytes == 0u || (ptr != nullptr && cudaMemsetAsync(ptr, 0, bytes, stream) == cudaSuccess);
+    };
+    if (!clear(data.contact_solve_metrics, size_t{p.env_count} * constraint::kContactSolveMetricCount * sizeof(uint64_t)) ||
+        !clear(data.contact_solve_counts, size_t{p.env_count} * constraint::kContactSolveCountSize * sizeof(uint32_t)) ||
+        !clear(data.vbd_solve_metrics, size_t{p.env_count} * 2u * sizeof(uint64_t))) return Status::Failed;
+    if (LaunchWork(MeasureRowsKernel, s.rows, kThreads, stream, data, p, s) != cudaSuccess ||
+        LaunchWork(MeasureVerticesKernel, p.vertex_blocks.dynamic_vertices * p.env_count,
+            kThreads / 32u, stream, model, data, p) != cudaSuccess) return Status::Failed;
+    return Status::Ok;
+}
+
 Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                            const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const BlockDescentSolveParams*>(params);
@@ -2146,6 +2200,19 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     const auto clear = [&](void* ptr, size_t bytes) {
         return bytes == 0u || (ptr != nullptr && cudaMemsetAsync(ptr, 0, bytes, stream) == cudaSuccess);
     };
+    if (DenseTileRoute(*p)) {
+        if (p->measure_contact_residual != 0u && !clear(s.active_count, sizeof(uint32_t))) return Status::Failed;
+        const uint32_t coordinates = std::max(8u, (p->max_dof + 3u) & ~3u);
+        if (coordinates == 8u) LaunchDenseTiles<8u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 12u) LaunchDenseTiles<12u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 16u) LaunchDenseTiles<16u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 20u) LaunchDenseTiles<20u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 24u) LaunchDenseTiles<24u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 28u) LaunchDenseTiles<28u>(articulation_state, data, *p, s, stream);
+        else LaunchDenseTiles<32u>(articulation_state, data, *p, s, stream);
+        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        return MeasureSolve(model, data, *p, s, stream);
+    }
     if (p->measure_vertex_audit != 0u && !clear(data.vbd_solve_audit,
             size_t{p->vertex_blocks.vertices} * p->env_count * nk::kVbdSolveAuditColumnCount * sizeof(float)))
         return Status::Failed;
@@ -2348,15 +2415,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         data.joint_limit_impulse != nullptr &&
         LaunchWork(WriteBlockJointLimitImpulsesKernel, p->base_link_count * p->env_count,
             kThreads, stream, data, *p) != cudaSuccess) return Status::Failed;
-    if (p->measure_contact_residual != 0u) {
-        if (!clear(data.contact_solve_metrics, size_t{p->env_count} * constraint::kContactSolveMetricCount * sizeof(uint64_t)) ||
-            !clear(data.contact_solve_counts, size_t{p->env_count} * constraint::kContactSolveCountSize * sizeof(uint32_t)) ||
-            !clear(data.vbd_solve_metrics, size_t{p->env_count} * 2u * sizeof(uint64_t))) return Status::Failed;
-        if (LaunchWork(MeasureRowsKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
-            LaunchWork(MeasureVerticesKernel, p->vertex_blocks.dynamic_vertices * p->env_count,
-                kThreads / 32u, stream, model, data, *p) != cudaSuccess) return Status::Failed;
-    }
-    return Status::Ok;
+    return MeasureSolve(model, data, *p, s, stream);
 }
 
 }  // namespace
