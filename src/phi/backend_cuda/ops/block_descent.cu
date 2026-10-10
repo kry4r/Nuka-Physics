@@ -269,8 +269,11 @@ struct BlockScratch {
     uint32_t multilevel_parts;
     uint32_t multilevel_item_parts;
     float* tile_fields;
-    double* tile_response;
+    float* tile_response;
     float* tile_jacobian;
+    uint32_t* tile_next;
+    uint32_t* tile_order;
+    uint32_t* tile_cost;
     float* articulation_pseudo;
     float* rigid_pseudo;
     uint32_t tile_head_capacity;
@@ -446,9 +449,11 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.tile_head_capacity = tile ? TileHeadCapacity(p) : 0u;
     s.tile_row_capacity = tile ? 2u * p.rows_per_env : 0u;
     s.tile_fields = reinterpret_cast<float*>(take(uint64_t{p.env_count} * kTileFields * s.tile_head_capacity));
-    s.tile_response = reinterpret_cast<double*>(take(
-        uint64_t{p.env_count} * 2u * s.tile_head_capacity * (sizeof(double) / sizeof(uint32_t))));
+    s.tile_response = reinterpret_cast<float*>(take(uint64_t{p.env_count} * 2u * s.tile_head_capacity));
     s.tile_jacobian = reinterpret_cast<float*>(take(uint64_t{p.env_count} * s.tile_row_capacity * kTileLanes));
+    s.tile_next = take(tile ? 1u : 0u);
+    s.tile_order = take(tile ? p.env_count : 0u);
+    s.tile_cost = take(tile ? p.env_count : 0u);
     // Block coordinates of the tiles' pseudo velocities.
     const bool positions = tile && p.position_iterations > 0u;
     s.articulation_pseudo = reinterpret_cast<float*>(take(positions ? dofs : 0u));
@@ -2205,15 +2210,18 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     };
     if (DenseTileRoute(*p)) {
         if (p->measure_contact_residual != 0u && !clear(s.active_count, sizeof(uint32_t))) return Status::Failed;
+        if (!clear(s.tile_next, sizeof(uint32_t))) return Status::Failed;
+        LaunchCuda(OrderTilesKernel, dim3(1u), dim3(kOrderTileThreads), 0u, stream, *p, s);
         const uint32_t coordinates = std::max(8u, (p->max_dof + 3u) & ~3u);
-        if (coordinates == 8u) LaunchDenseTiles<8u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 12u) LaunchDenseTiles<12u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 16u) LaunchDenseTiles<16u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 20u) LaunchDenseTiles<20u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 24u) LaunchDenseTiles<24u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 28u) LaunchDenseTiles<28u>(articulation_state, data, *p, s, stream);
-        else LaunchDenseTiles<32u>(articulation_state, data, *p, s, stream);
-        if (cudaGetLastError() != cudaSuccess) return Status::Failed;
+        cudaError_t launched = cudaSuccess;
+        if (coordinates == 8u) launched = LaunchDenseTiles<8u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 12u) launched = LaunchDenseTiles<12u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 16u) launched = LaunchDenseTiles<16u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 20u) launched = LaunchDenseTiles<20u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 24u) launched = LaunchDenseTiles<24u>(articulation_state, data, *p, s, stream);
+        else if (coordinates == 28u) launched = LaunchDenseTiles<28u>(articulation_state, data, *p, s, stream);
+        else launched = LaunchDenseTiles<32u>(articulation_state, data, *p, s, stream);
+        if (launched != cudaSuccess) return Status::Failed;
         return MeasureSolve(model, data, *p, s, stream);
     }
     if (p->measure_vertex_audit != 0u && !clear(data.vbd_solve_audit,

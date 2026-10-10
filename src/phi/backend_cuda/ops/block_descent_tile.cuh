@@ -72,7 +72,7 @@ struct TileContext {
     uint32_t first_articulation;
     uint32_t capacity;
     float* fields;
-    double* response;
+    float* response;
     float* jacobian;
     float* mass;
     float* factor;
@@ -88,7 +88,7 @@ struct TileContext {
         Value(field + 1u, h) = v.y;
         Value(field + 2u, h) = v.z;
     }
-    __device__ nk::augmented::ScalarResponse Response(uint32_t h) const {
+    __device__ nk::augmented::FloatScalarResponse Response(uint32_t h) const {
         return {response[h], response[capacity + h]};
     }
     // The head's incidence (0 or 1) on `block`, or kNoTileIncidence when it does not touch it.
@@ -175,7 +175,7 @@ struct TileHead {
     Vec3 dual;
     Vec3 move;
     Vec3 step;
-    nk::augmented::ScalarResponse response;
+    nk::augmented::FloatScalarResponse response;
 };
 
 __device__ TileHead LoadTileHead(const TileContext& c, uint32_t h) {
@@ -208,8 +208,13 @@ __device__ LocalTerm TileLocalTerm(const TileHead& t) {
     term.mu_second = t.mu_second;
     term.normal_bound = t.normal_bound;
     term.contact = t.axes == 3u;
-    term.response = t.response;
     return term;
+}
+
+// EvaluateAugmentedResponse at a move of the head, its normal impulse evaluated in float like the cone.
+__device__ void TileResponse(const TileHead& t, Vec3 move, Vec3* impulse, SymmetricMat3* curvature) {
+    EvaluateAugmentedResponse(TileLocalTerm(t), nk::augmented::EvaluateScalarImpulse(t.dual.x, t.rho,
+        t.residual.x - move.x, t.compliance, t.lower, t.upper, t.response), move, impulse, curvature);
 }
 
 // Lane c's share of a row side's velocity J u at the tile's current velocities.
@@ -225,7 +230,39 @@ __device__ float TileSideVelocity(BlockDescentSolveParams p, BlockScratch s, con
     return jacobian[size_t{slot} * p.max_dof + s.articulation_roots[base + c]] * s.articulation_velocity[base + c];
 }
 
-// Head row setup as CountIncidenceKernel: penalty, response and the row's fixed coefficients.
+// RowInertialResponse in float: J M^-1 J^T over the row's rigid bodies and articulations, with both sides
+// on one owner summed first.
+__device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, const NkRow& row, uint32_t slot) {
+    const NkRowSide sides[2] = {row.a, row.b};
+    const bool shared = row.a.kind == row.b.kind && row.a.index == row.b.index;
+    const size_t at = size_t{slot} * p.max_dof;
+    const auto* jacobian_b = static_cast<const float*>(data.chain_jacobian_b) + at;
+    const auto* inverse_b = static_cast<const float*>(data.row_minv_jt_b) + at;
+    float response = 0.0f;
+    bool valid = true;
+    for (uint32_t i = 0u; i < (shared ? 1u : 2u); ++i) {
+        const NkRowSide& side = sides[i];
+        float contribution = 0.0f;
+        if (side.kind == kNkSideRigid) {
+            const Vec3 linear = shared ? side.jlin + row.b.jlin : side.jlin;
+            const Vec3 angular = shared ? side.jang + row.b.jang : side.jang;
+            contribution = data.body_inv_mass[side.index] * linear.Dot(linear) +
+                           angular.Dot(data.body_world_inv_inertia[side.index].Multiply(angular));
+        } else if (side.kind == kNkSideArtic) {
+            const auto* jacobian = i == 0u ? static_cast<const float*>(data.chain_jacobian) + at : jacobian_b;
+            const auto* inverse = i == 0u ? static_cast<const float*>(data.row_minv_jt) + at : inverse_b;
+            for (uint32_t dof = 0u; dof < p.max_dof; ++dof)
+                contribution = fmaf(shared ? jacobian[dof] + jacobian_b[dof] : jacobian[dof],
+                                    shared ? inverse[dof] + inverse_b[dof] : inverse[dof], contribution);
+        }
+        valid &= contribution >= 0.0f && isfinite(contribution);
+        response += contribution;
+    }
+    return valid && isfinite(response) ? response : nanf("");
+}
+
+// Head row setup as CountIncidenceKernel in float: penalty, response and the row's fixed coefficients; the
+// double response stays for the residual measure.
 __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                    const TileContext& c, uint32_t slot, uint32_t h) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
@@ -234,23 +271,20 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     const uint32_t axes = (row.flags & nk::nk_row_flags::kBlockNormal) != 0u ? 3u : 1u;
     const uint32_t owner = TileOwner(s, c, row.a);
     const uint32_t other = TileOwner(s, c, row.b);
-    const auto points = PointMasses(data);
-    const double response = RowInertialResponse(row, data, p, points, slot);
-    const double penalty = response > 0.0 ? double(p.penalty_scale) / response : 0.0;
-    const bool valid_penalty = response == 0.0 ||
-        (penalty > 0.0 && penalty <= double(FLT_MAX) && static_cast<float>(penalty) > 0.0f);
-    float rho = static_cast<float>(penalty);
-    if (!(response >= 0.0 && isfinite(response)) || !valid_penalty) {
+    const float response = TileInertialResponse(data, p, row, slot);
+    float rho = response > 0.0f ? p.penalty_scale / response : 0.0f;
+    if (!(response == 0.0f || (response > 0.0f && rho > 0.0f && rho <= FLT_MAX))) {
         atomicOr(data.env_status + c.env, kEnvStatusSolverFailure);
-        VisitOwners(row, points, p, [&](uint32_t failed) {
+        VisitOwners(row, PointMasses(data), p, [&](uint32_t failed) {
             RecordBlockFailure(data, p, s, failed, nk::BlockSolveFailure::InvalidRow, slot);
         });
         rho = nanf("");
     }
     const float compliance = row.compliance_alpha * RowStateScale(data, p, slot);
-    const auto scalar = nk::augmented::ComputeScalarResponse(rho, compliance);
+    const auto scalar = nk::augmented::ComputeFloatScalarResponse(rho, compliance);
     s.penalty[slot] = rho;
-    s.scalar_response[slot] = scalar;
+    if (p.measure_contact_residual != 0u)
+        s.scalar_response[slot] = nk::augmented::ComputeScalarResponse(rho, compliance);
     c.Index(kTileSlot, h) = slot;
     c.Index(kTileStride, h) = stride;
     c.Index(kTileAxes, h) = axes;
@@ -472,7 +506,7 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
         float unit_value = 0.0f;
         if (incidence != kNoTileIncidence) {
             const TileHead t = LoadTileHead(c, own);
-            EvaluateAugmentedResponse(TileLocalTerm(t), t.move, &f, &curvature);
+            TileResponse(t, t.move, &f, &curvature);
             // A rounding of the residual or move changes the impulse by the curvature times it.
             noise = {fabsf(f.x) + curvature.xx * (fabsf(t.residual.x) + fabsf(t.move.x)),
                      fabsf(f.y) + curvature.yy * (fabsf(t.residual.y) + fabsf(t.move.y)),
@@ -625,7 +659,7 @@ __device__ void TileLineDerivatives(const TileContext& c, uint32_t block, float 
                          fmaf(alpha, t.step.z, t.move.z)};
         Vec3 f{};
         SymmetricMat3 response{};
-        EvaluateAugmentedResponse(TileLocalTerm(t), trial, &f, &response);
+        TileResponse(t, trial, &f, &response);
         TileAddProduct(row_slope, f.x, t.step.x);
         TileAddProduct(row_slope, f.y, t.step.y);
         TileAddProduct(row_slope, f.z, t.step.z);
@@ -845,7 +879,7 @@ __device__ uint32_t InitializeTilePositions(DataView data, BlockDescentSolvePara
             (penetration > p.position_slop || c.Value(kTileDual, h) != 0.0f);
         const float bias = position ? fminf(p.position_beta * fmaxf(penetration - p.position_slop, 0.0f) / p.dt,
                                             p.position_max_velocity) : 0.0f;
-        const auto scalar = nk::augmented::ComputeScalarResponse(c.Value(kTileRho, h), 0.0f);
+        const auto scalar = nk::augmented::ComputeFloatScalarResponse(c.Value(kTileRho, h), 0.0f);
         if (!position) c.Index(kTileOwner, h) = c.Index(kTileOwner + 1u, h) = kNoTileBlock;
         coupled |= c.Index(kTileOwner, h) != kNoTileBlock && c.Index(kTileOwner + 1u, h) != kNoTileBlock;
         c.Index(kTileAxes, h) = 1u;
@@ -904,27 +938,10 @@ __device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, Bloc
     }
 }
 
-// kN is the articulation coordinates rounded up to a multiple of four; rigid bodies descend at six.
+// An environment's velocity iterations, then its split-impulse position pass.
 template <uint32_t kN>
-__global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKernel(
-    ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    extern __shared__ float tile_shared[];
-    const uint32_t warp = threadIdx.x / kTileLanes;
-    TileContext c{};
-    c.env = blockIdx.x * kTileWarps + warp;
-    if (c.env >= p.env_count) return;
-    c.lane = threadIdx.x % kTileLanes;
-    c.bodies = p.total_body_count / p.env_count;
-    c.articulations = p.articulation_count / p.env_count;
-    c.first_body = c.env * c.bodies;
-    c.first_articulation = c.env * c.articulations;
-    c.capacity = s.tile_head_capacity;
-    c.fields = s.tile_fields + size_t{c.env} * kTileFields * c.capacity;
-    c.response = s.tile_response + size_t{c.env} * 2u * c.capacity;
-    c.jacobian = s.tile_jacobian + size_t{c.env} * s.tile_row_capacity * kTileLanes;
-    c.mass = tile_shared + size_t{warp} * 2u * kN * (kN + 1u);
-    c.factor = c.mass + kN * (kN + 1u);
-    c.iteration = ~0u;
+__device__ void DescendTile(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s,
+                            TileContext& c) {
     InitializeTile(state, data, p, s, c);
     for (uint32_t iteration = 0u; iteration < p.iterations; ++iteration) {
         c.iteration = iteration;
@@ -942,10 +959,81 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
     FinishTilePositions(state, data, p, s, c);
 }
 
+constexpr uint32_t kOrderTileThreads = 1024u;
+constexpr uint32_t kTileCostBuckets = 128u;
+
+// A solve's cycles in quarter octaves.
+__device__ uint32_t TileCostBucket(uint32_t cycles) {
+    const uint32_t octave = cycles != 0u ? 31u - __clz(cycles) : 0u;
+    return octave * 4u + (octave >= 2u ? (cycles >> (octave - 2u)) & 3u : 0u);
+}
+
+// Environments costliest first by their last solve, so the resident warps start the longest solves first.
+__global__ void __launch_bounds__(kOrderTileThreads) OrderTilesKernel(BlockDescentSolveParams p, BlockScratch s) {
+    __shared__ uint32_t offsets[kTileCostBuckets];
+    for (uint32_t k = threadIdx.x; k < kTileCostBuckets; k += blockDim.x) offsets[k] = 0u;
+    __syncthreads();
+    for (uint32_t env = threadIdx.x; env < p.env_count; env += blockDim.x)
+        atomicAdd(offsets + TileCostBucket(s.tile_cost[env]), 1u);
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        uint32_t total = 0u;
+        for (uint32_t k = kTileCostBuckets; k-- > 0u;) {
+            const uint32_t count = offsets[k];
+            offsets[k] = total;
+            total += count;
+        }
+    }
+    __syncthreads();
+    for (uint32_t env = threadIdx.x; env < p.env_count; env += blockDim.x)
+        s.tile_order[atomicAdd(offsets + TileCostBucket(s.tile_cost[env]), 1u)] = env;
+}
+
+// kN is the articulation coordinates rounded up to a multiple of four; rigid bodies descend at six. Resident
+// warps take environments in OrderTilesKernel's order, so a costly environment holds back only its own warp.
 template <uint32_t kN>
-void LaunchDenseTiles(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s,
-                      cudaStream_t stream) {
-    LaunchCuda(DescendDenseTilesKernel<kN>, dim3((p.env_count + kTileWarps - 1u) / kTileWarps),
-               dim3(kTileWarps * kTileLanes), size_t{kTileWarps} * 2u * kN * (kN + 1u) * sizeof(float), stream,
+__global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKernel(
+    ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    extern __shared__ float tile_shared[];
+    const uint32_t warp = threadIdx.x / kTileLanes;
+    const uint32_t lane = threadIdx.x % kTileLanes;
+    for (;;) {
+        uint32_t ticket = 0u;
+        if (lane == 0u) ticket = atomicAdd(s.tile_next, 1u);
+        ticket = __shfl_sync(~0u, ticket, 0u);
+        if (ticket >= p.env_count) return;
+        const uint32_t env = s.tile_order[ticket];
+        TileContext c{};
+        c.env = env;
+        c.lane = lane;
+        c.bodies = p.total_body_count / p.env_count;
+        c.articulations = p.articulation_count / p.env_count;
+        c.first_body = c.env * c.bodies;
+        c.first_articulation = c.env * c.articulations;
+        c.capacity = s.tile_head_capacity;
+        c.fields = s.tile_fields + size_t{c.env} * kTileFields * c.capacity;
+        c.response = s.tile_response + size_t{c.env} * 2u * c.capacity;
+        c.jacobian = s.tile_jacobian + size_t{c.env} * s.tile_row_capacity * kTileLanes;
+        c.mass = tile_shared + size_t{warp} * 2u * kN * (kN + 1u);
+        c.factor = c.mass + kN * (kN + 1u);
+        c.iteration = ~0u;
+        const long long start = clock64();
+        DescendTile<kN>(state, data, p, s, c);
+        if (lane == 0u) s.tile_cost[env] = static_cast<uint32_t>(min(clock64() - start, 0xffffffffll));
+    }
+}
+
+template <uint32_t kN>
+cudaError_t LaunchDenseTiles(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p,
+                             BlockScratch s, cudaStream_t stream) {
+    const size_t shared = size_t{kTileWarps} * 2u * kN * (kN + 1u) * sizeof(float);
+    cudaError_t status = PreferCacheCarveout(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, shared);
+    if (status != cudaSuccess) return status;
+    uint32_t blocks = 0u;
+    status = ResidentGridSize(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, shared,
+                              (p.env_count + kTileWarps - 1u) / kTileWarps, &blocks);
+    if (status != cudaSuccess) return status;
+    LaunchCuda(DescendDenseTilesKernel<kN>, dim3(blocks), dim3(kTileWarps * kTileLanes), shared, stream,
                state, data, p, s);
+    return cudaGetLastError();
 }

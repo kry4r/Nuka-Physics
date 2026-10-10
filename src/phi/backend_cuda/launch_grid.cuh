@@ -79,6 +79,45 @@ cudaError_t ResidentGridSize(Kernel kernel, uint32_t block_size, size_t shared_b
     return cudaSuccess;
 }
 
+// Prefers the smallest shared memory carveout that keeps the kernel's occupancy, so the rest of the unified
+// L1 caches the kernel's global and local memory.
+template <typename Kernel>
+cudaError_t PreferCacheCarveout(Kernel kernel, uint32_t block_size, size_t shared_bytes) {
+    int device = -1;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    struct Preference {
+        Kernel kernel;
+        int device;
+        uint32_t block_size;
+        size_t shared_bytes;
+    };
+    static thread_local std::vector<Preference> preferences;
+    for (const auto& preference : preferences) {
+        if (preference.kernel == kernel && preference.device == device &&
+            preference.block_size == block_size && preference.shared_bytes == shared_bytes) return cudaSuccess;
+    }
+    int blocks_per_sm = 0, capacity = 0, reserved = 0;
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel,
+                                                         static_cast<int>(block_size), shared_bytes);
+    if (status != cudaSuccess) return status;
+    status = cudaDeviceGetAttribute(&capacity, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+    if (status != cudaSuccess) return status;
+    status = cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, device);
+    if (status != cudaSuccess) return status;
+    cudaFuncAttributes attributes{};
+    status = cudaFuncGetAttributes(&attributes, kernel);
+    if (status != cudaSuccess) return status;
+    const uint64_t needed = uint64_t{static_cast<uint32_t>(blocks_per_sm)} *
+        (shared_bytes + attributes.sharedSizeBytes + static_cast<uint32_t>(reserved));
+    const auto percent = static_cast<int>(std::min<uint64_t>(
+        (needed * 100u + static_cast<uint32_t>(capacity) - 1u) / static_cast<uint32_t>(capacity), 100u));
+    status = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, percent);
+    if (status != cudaSuccess) return status;
+    preferences.push_back({kernel, device, block_size, shared_bytes});
+    return cudaSuccess;
+}
+
 // Dynamic shared memory a block can take without lowering the occupancy its other limits allow.
 template <typename Kernel>
 cudaError_t SpareSharedBytes(Kernel kernel, uint32_t block_size, size_t* shared_bytes) {

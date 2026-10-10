@@ -122,6 +122,34 @@ NUKA_AUGMENTED_HD inline ScalarTerm EvaluateScalarImpulse(
     return {float(f), float(curvature), 0.0};
 }
 
+// ScalarResponse in float, for impulses evaluated in float.
+struct FloatScalarResponse {
+    float dual_scale;
+    float residual_scale;
+};
+
+NUKA_AUGMENTED_HD inline FloatScalarResponse ComputeFloatScalarResponse(float rho, float compliance) {
+    const float denominator = fmaf(rho, compliance, 1.0f);
+    return {1.0f / denominator, rho / denominator};
+}
+
+// EvaluateScalarImpulse in float: the impulse argument takes one fma rounding past the float scales.
+NUKA_AUGMENTED_HD inline ScalarTerm EvaluateScalarImpulse(
+    float dual, float rho, float residual, float compliance, float lower, float upper,
+    const FloatScalarResponse& response) {
+    if (rho <= 0.0f) return {};
+    if (dual != dual || rho != rho || residual != residual || compliance != compliance ||
+        lower != lower || upper != upper) {
+        const float invalid = dual + rho + residual + compliance + lower + upper;
+        return {invalid, invalid, double(invalid)};
+    }
+    const float k = response.residual_scale;
+    const float x = fmaf(k, residual, response.dual_scale * dual);
+    const float f = x < lower ? lower : (x > upper ? upper : x);
+    const float curvature = x != x ? x : (lower < upper && x >= lower && x <= upper ? k : 0.0f);
+    return {f, curvature, 0.0};
+}
+
 // Change of EvaluateScalar's potential when the residual drops by `drop`: (1/k) times the
 // integral of the clamped impulse argument along the drop, so no two potentials are subtracted.
 NUKA_AUGMENTED_HD inline float ScalarPotentialChange(
