@@ -114,9 +114,23 @@ struct TileBlock {
     __device__ float Mass(uint32_t i, uint32_t j) const {
         return roots == nullptr ? mass[i * kRigidBlockDof + j] : mass[size_t{roots[i]} * mass_stride + roots[j]];
     }
-    __device__ float Jacobian(DataView data, BlockDescentSolveParams p, uint32_t slot, uint32_t i) const {
-        return roots == nullptr ? RigidJacobian(data, slot, index, i)
-                                : ArticulationJacobian(data, p, slot, index, roots[i]);
+    __device__ float Jacobian(DataView data, BlockDescentSolveParams p, const NkRow& row,
+                              uint32_t slot, uint32_t i) const {
+        float value = 0.0f;
+        if (roots == nullptr) {
+            const NkRowSide sides[2] = {row.a, row.b};
+            for (const NkRowSide& side : sides) {
+                if (side.kind == kNkSideRigid && side.index == index)
+                    value += AxisComponent(i < 3u ? side.jlin : side.jang, i % 3u);
+            }
+        } else {
+            const size_t at = size_t{slot} * p.max_dof + roots[i];
+            if (row.a.kind == kNkSideArtic && row.a.index == index)
+                value += static_cast<const float*>(data.chain_jacobian)[at];
+            if (row.b.kind == kNkSideArtic && row.b.index == index)
+                value += static_cast<const float*>(data.chain_jacobian_b)[at];
+        }
+        return value;
     }
 };
 
@@ -310,23 +324,38 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     c.Store3(kTileStep, h, {});
 }
 
-// Each head's Jacobian on the blocks it touches: the coordinate and value of a single-axis row on one
-// coordinate, else one row of block coordinates per axis.
-__device__ void StageTileJacobians(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
+// Jacobians on moving blocks and residuals at free velocities, including kinematic sides. Single-coordinate
+// rows store their coordinate and value; other rows store one vector of block coordinates per axis.
+__device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c) {
+    const auto* row_data = reinterpret_cast<const NkRow*>(data.urows);
+    const auto* chain_a = static_cast<const float*>(data.chain_jacobian);
+    const auto* chain_b = static_cast<const float*>(data.chain_jacobian_b);
     uint32_t rows = 0u;
     for (uint32_t h = 0u; h < c.heads; ++h) {
         const uint32_t slot = c.Index(kTileSlot, h);
         const uint32_t stride = c.Index(kTileStride, h);
         const uint32_t axes = c.Index(kTileAxes, h);
+        const float scale = RowStateScale(data, p, slot);
+        Vec3 velocity{}, rhs{};
         for (uint32_t incidence = 0u; incidence < 2u; ++incidence) {
             const uint32_t block = c.Index(kTileOwner + incidence, h);
-            if (block == kNoTileBlock) continue;
-            const TileBlock b = LoadTileBlock(data, p, s, c, block);
-            const bool coordinate = c.lane < b.dimension;
-            float value[3];
+            TileBlock b{};
+            if (block != kNoTileBlock) b = LoadTileBlock(data, p, s, c, block);
+            const bool coordinate = block != kNoTileBlock && c.lane < b.dimension;
+            float value[3]{};
 #pragma unroll
-            for (uint32_t axis = 0u; axis < 3u; ++axis)
-                value[axis] = axis < axes && coordinate ? b.Jacobian(data, p, slot + axis * stride, c.lane) : 0.0f;
+            for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                if (axis >= axes) continue;
+                const uint32_t row_slot = slot + axis * stride;
+                const NkRow& row = row_data[row_slot];
+                if (coordinate) value[axis] = b.Jacobian(data, p, row, row_slot, c.lane);
+                if (incidence == 0u) {
+                    SetAxisComponent(velocity, axis, TileSideVelocity(p, s, row.a, chain_a, row_slot, c.lane) +
+                                                     TileSideVelocity(p, s, row.b, chain_b, row_slot, c.lane));
+                    SetAxisComponent(rhs, axis, __fmul_rn(__fmul_rn(row.rhs, p.dt), axis == 0u ? scale : 1.0f));
+                }
+            }
+            if (block == kNoTileBlock) continue;
             const uint32_t support = __ballot_sync(~0u, value[0] != 0.0f);
             uint32_t row = ~0u, unit = ~0u;
             float unit_value = 0.0f;
@@ -345,31 +374,6 @@ __device__ void StageTileJacobians(DataView data, BlockDescentSolveParams p, Blo
                 c.Index(kTileUnit + incidence, h) = unit;
                 c.Value(kTileUnitValue + incidence, h) = unit_value;
             }
-        }
-    }
-    __syncwarp();
-}
-
-// Residuals at the free velocities with every side's velocity, kinematic bodies included.
-__device__ void InitializeTileResiduals(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                        const TileContext& c) {
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    const auto* chain_a = static_cast<const float*>(data.chain_jacobian);
-    const auto* chain_b = static_cast<const float*>(data.chain_jacobian_b);
-    for (uint32_t h = 0u; h < c.heads; ++h) {
-        const uint32_t slot = c.Index(kTileSlot, h);
-        const uint32_t stride = c.Index(kTileStride, h);
-        const uint32_t axes = c.Index(kTileAxes, h);
-        const float scale = RowStateScale(data, p, slot);
-        Vec3 velocity{}, rhs{};
-#pragma unroll
-        for (uint32_t axis = 0u; axis < 3u; ++axis) {
-            if (axis >= axes) continue;
-            const uint32_t row_slot = slot + axis * stride;
-            const NkRow& row = rows[row_slot];
-            SetAxisComponent(velocity, axis, TileSideVelocity(p, s, row.a, chain_a, row_slot, c.lane) +
-                                             TileSideVelocity(p, s, row.b, chain_b, row_slot, c.lane));
-            SetAxisComponent(rhs, axis, __fmul_rn(__fmul_rn(row.rhs, p.dt), axis == 0u ? scale : 1.0f));
         }
         velocity = TileWarpSum3(velocity);
         if (c.lane == 0u)
@@ -447,8 +451,7 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
             if (base + c.lane < heads) s.active_rows[at + c.lane] = c.Index(kTileSlot, base + c.lane);
         }
     }
-    StageTileJacobians(data, p, s, c);
-    InitializeTileResiduals(data, p, s, c);
+    InitializeTileRows(data, p, s, c);
 }
 
 // The normal bound each head on `block` holds through its solve, and a zero move.
@@ -652,12 +655,13 @@ __device__ void TileRowSteps(const TileContext& c, uint32_t block, float d) {
 
 // Slope and curvature of the local objective at `alpha` along the step, as DenseLineDerivatives.
 __device__ void TileLineDerivatives(const TileContext& c, uint32_t block, float alpha, float inertial_slope,
-                                    float inertial_curvature, float* slope, float* curvature, float* magnitude) {
+                                    float inertial_curvature, const TileHead& resident, bool resident_incidence,
+                                    float* slope, float* curvature, float* magnitude) {
     TileSum row_slope{};
     float row_curvature = 0.0f, row_magnitude = 0.0f;
     for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
-        if (c.Incidence(h, block) == kNoTileIncidence) continue;
-        const TileHead t = LoadTileHead(c, h);
+        if (h < kTileLanes ? !resident_incidence : c.Incidence(h, block) == kNoTileIncidence) continue;
+        const TileHead t = h < kTileLanes ? resident : LoadTileHead(c, h);
         const Vec3 trial{fmaf(alpha, t.step.x, t.move.x), fmaf(alpha, t.step.y, t.move.y),
                          fmaf(alpha, t.step.z, t.move.z)};
         Vec3 f{};
@@ -683,14 +687,19 @@ __device__ void TileLineDerivatives(const TileContext& c, uint32_t block, float 
 // Safeguarded Newton iteration on the slope as SearchDenseLine; 0 when the step does not descend.
 __device__ float SearchTileLine(const TileContext& c, uint32_t block, float inertial_slope,
                                 float inertial_curvature) {
+    const bool incident = c.lane < c.heads && c.Incidence(c.lane, block) != kNoTileIncidence;
+    TileHead resident{};
+    if (incident) resident = LoadTileHead(c, c.lane);
     float slope = 0.0f, curvature = 0.0f, magnitude = 0.0f;
-    TileLineDerivatives(c, block, 0.0f, inertial_slope, inertial_curvature, &slope, &curvature, &magnitude);
+    TileLineDerivatives(c, block, 0.0f, inertial_slope, inertial_curvature, resident, incident,
+                        &slope, &curvature, &magnitude);
     const float initial = slope;
     if (!(initial < 0.0f)) return 0.0f;
     float low = 0.0f, high = 0.0f, alpha = 1.0f;
     bool bounded = false;
     for (uint32_t step = 0u; step < kDenseLineSearchSteps; ++step) {
-        TileLineDerivatives(c, block, alpha, inertial_slope, inertial_curvature, &slope, &curvature, &magnitude);
+        TileLineDerivatives(c, block, alpha, inertial_slope, inertial_curvature, resident, incident,
+                            &slope, &curvature, &magnitude);
         if (!isfinite(slope) || !isfinite(curvature)) {
             high = alpha;
             bounded = true;
