@@ -776,7 +776,19 @@ struct BlockDescentSolveParams {
     uint32_t grid_dims[3] = {};
     uint32_t clear_failure_diagnostics = 1u;
     uint32_t substep_index = 0u;
+    // Split-impulse iterations after the velocity solve, as the row solve's position pass.
+    uint32_t position_iterations = 0u;
+    float position_beta = 0.0f;
+    float position_slop = 0.0f;
+    float position_max_velocity = 0.0f;
 };
+
+// Articulation environments without particles or grid nodes whose articulations fit a warp of coordinates
+// solve as one warp tile each; only the tiles run position iterations.
+inline bool BlockDescentTileRoute(uint32_t particles, uint32_t grid_nodes, uint32_t articulations,
+                                  uint32_t max_dof) {
+    return particles == 0u && grid_nodes == 0u && articulations > 0u && max_dof <= 32u;
+}
 
 uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params);
 

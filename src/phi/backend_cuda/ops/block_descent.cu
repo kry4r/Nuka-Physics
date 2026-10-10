@@ -168,11 +168,8 @@ constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner 
                    kTileUpper = 14u, kTileMuFirst = 15u, kTileMuSecond = 16u, kTileNormalBound = 17u,
                    kTileResidual = 18u, kTileDual = 21u, kTileMove = 24u, kTileStep = 27u, kTileFields = 30u;
 
-// Environments of articulations, with rigid bodies at most, whose blocks fit a warp of coordinates solve
-// as one warp each.
 bool DenseTileRoute(const BlockDescentSolveParams& p) {
-    return p.total_particle_count == 0u && p.total_grid_count == 0u && p.articulation_count > 0u &&
-           p.max_dof <= kTileLanes;
+    return BlockDescentTileRoute(p.total_particle_count, p.total_grid_count, p.articulation_count, p.max_dof);
 }
 
 // Head rows an environment can hold in whole warps: a contact head takes two tangent rows, every other
@@ -274,6 +271,8 @@ struct BlockScratch {
     float* tile_fields;
     double* tile_response;
     float* tile_jacobian;
+    float* articulation_pseudo;
+    float* rigid_pseudo;
     uint32_t tile_head_capacity;
     uint32_t tile_row_capacity;
 };
@@ -450,6 +449,10 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.tile_response = reinterpret_cast<double*>(take(
         uint64_t{p.env_count} * 2u * s.tile_head_capacity * (sizeof(double) / sizeof(uint32_t))));
     s.tile_jacobian = reinterpret_cast<float*>(take(uint64_t{p.env_count} * s.tile_row_capacity * kTileLanes));
+    // Block coordinates of the tiles' pseudo velocities.
+    const bool positions = tile && p.position_iterations > 0u;
+    s.articulation_pseudo = reinterpret_cast<float*>(take(positions ? dofs : 0u));
+    s.rigid_pseudo = reinterpret_cast<float*>(take(positions ? rigid_dofs : 0u));
     const bool coarse = p.total_particle_count > 0u;
     s.coarse_parts = CoarseParts(p);
     if (uint64_t{p.env_count} * s.coarse_parts >= uint64_t{std::numeric_limits<int>::max()}) return 0u;

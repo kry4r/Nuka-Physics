@@ -117,9 +117,10 @@ struct TileBlock {
     }
 };
 
-// Block `local` of the tile: its rigid bodies first, then its articulations.
+// Block `local` of the tile: its rigid bodies first, then its articulations. The position pass moves pseudo
+// velocities that start at rest without a free velocity.
 __device__ TileBlock LoadTileBlock(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                   const TileContext& c, uint32_t local) {
+                                   const TileContext& c, uint32_t local, bool position = false) {
     TileBlock b{};
     b.local = local;
     if (local < c.bodies) {
@@ -129,8 +130,8 @@ __device__ TileBlock LoadTileBlock(DataView data, BlockDescentSolveParams p, Blo
         b.mass_stride = kRigidBlockDof;
         const size_t base = size_t{b.index} * kRigidBlockDof;
         b.mass = s.rigid_mass + base * kRigidBlockDof;
-        b.free = s.rigid_free + base;
-        b.velocity = s.rigid_velocity + base;
+        b.free = position ? nullptr : s.rigid_free + base;
+        b.velocity = (position ? s.rigid_pseudo : s.rigid_velocity) + base;
         return b;
     }
     b.index = c.first_articulation + local - c.bodies;
@@ -140,8 +141,8 @@ __device__ TileBlock LoadTileBlock(DataView data, BlockDescentSolveParams p, Blo
     const size_t base = size_t{b.index} * p.max_dof;
     b.roots = s.articulation_roots + base;
     b.mass = (p.mimic_couplings != 0u ? data.m_reduced : data.m) + base * p.max_dof;
-    b.free = s.articulation_free + base;
-    b.velocity = s.articulation_velocity + base;
+    b.free = position ? nullptr : s.articulation_free + base;
+    b.velocity = (position ? s.articulation_pseudo : s.articulation_velocity) + base;
     return b;
 }
 
@@ -686,7 +687,7 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
         if (c.lane < kN) c.mass[i * kS + c.lane] = i < n && coordinate ? b.Mass(i, c.lane) : i == c.lane ? 1.0f : 0.0f;
     StartTileBlock(c, b.local);
     const float start = coordinate ? b.velocity[c.lane] : 0.0f;
-    const float free = coordinate ? b.free[c.lane] : 0.0f;
+    const float free = coordinate && b.free != nullptr ? b.free[c.lane] : 0.0f;
     float u = start;
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
     float first_decrement = 0.0f;
@@ -753,15 +754,16 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
     __syncwarp();
 }
 
-// Dual update as DualUpdateKernel at the velocities every block reached in this iteration.
-__device__ void UpdateTileDuals(DataView data, const TileContext& c) {
+// Dual update as DualUpdateKernel at the velocities every block reached in this iteration; position pass
+// impulses stay in the tile.
+__device__ void UpdateTileDuals(DataView data, const TileContext& c, bool velocity = true) {
     for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
         const TileHead t = LoadTileHead(c, h);
         const uint32_t slot = c.Index(kTileSlot, h);
         const uint32_t stride = c.Index(kTileStride, h);
         const float normal = nk::augmented::EvaluateScalarImpulse(t.dual.x, t.rho, t.residual.x, t.compliance,
                                                                   t.lower, t.upper, t.response).impulse;
-        data.lambda[slot] = normal;
+        if (velocity) data.lambda[slot] = normal;
         Vec3 dual{normal, 0.0f, 0.0f};
         if (t.axes == 3u) {
             const auto f = nk::augmented::EvaluateTangentImpulse(t.dual, t.rho, t.residual, normal,
@@ -829,6 +831,79 @@ __device__ void FinishTile(ArticulationDeviceState state, DataView data, BlockDe
     }
 }
 
+// Rows live as in the row solve's position pass push out from rest by beta of their excess over the slop; the
+// pass takes no iteration without a push and one unless a live row couples two blocks, as block solves are exact.
+__device__ uint32_t InitializeTilePositions(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                            const TileContext& c) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    bool push = false, coupled = false;
+    for (uint32_t h = c.lane; h < c.heads; h += kTileLanes) {
+        const uint32_t slot = c.Index(kTileSlot, h);
+        const float penetration = data.row_penetration[slot];
+        const bool position =
+            (rows[slot].flags & (nk::nk_row_flags::kFriction | nk::nk_row_flags::kVelocityOnly)) == 0u &&
+            (penetration > p.position_slop || c.Value(kTileDual, h) != 0.0f);
+        const float bias = position ? fminf(p.position_beta * fmaxf(penetration - p.position_slop, 0.0f) / p.dt,
+                                            p.position_max_velocity) : 0.0f;
+        const auto scalar = nk::augmented::ComputeScalarResponse(c.Value(kTileRho, h), 0.0f);
+        if (!position) c.Index(kTileOwner, h) = c.Index(kTileOwner + 1u, h) = kNoTileBlock;
+        coupled |= c.Index(kTileOwner, h) != kNoTileBlock && c.Index(kTileOwner + 1u, h) != kNoTileBlock;
+        c.Index(kTileAxes, h) = 1u;
+        c.Value(kTileCompliance, h) = 0.0f;
+        c.Value(kTileLower, h) = 0.0f;
+        c.Value(kTileUpper, h) = FLT_MAX;
+        c.response[h] = scalar.dual_scale;
+        c.response[c.capacity + h] = scalar.residual_scale;
+        c.Store3(kTileResidual, h, {bias, 0.0f, 0.0f});
+        c.Store3(kTileDual, h, {});
+        push |= bias > 0.0f;
+    }
+    for (uint32_t k = c.lane; k < c.bodies * kRigidBlockDof; k += kTileLanes)
+        s.rigid_pseudo[size_t{c.first_body} * kRigidBlockDof + k] = 0.0f;
+    for (uint32_t k = 0u; k < c.articulations; ++k)
+        if (c.lane < p.max_dof) s.articulation_pseudo[size_t{c.first_articulation + k} * p.max_dof + c.lane] = 0.0f;
+    __syncwarp();
+    if (!__any_sync(~0u, push)) return 0u;
+    return __any_sync(~0u, coupled) ? p.position_iterations : 1u;
+}
+
+// Pseudo velocities for IntegratePosition, expanded from block coordinates as FinishTile.
+__device__ void FinishTilePositions(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p,
+                                    BlockScratch s, const TileContext& c) {
+    auto* link_pseudo = reinterpret_cast<LinkSpatialVel*>(data.link_velocity_pseudo);
+    for (uint32_t k = 0u; k < c.articulations; ++k) {
+        const uint32_t articulation = c.first_articulation + k;
+        const size_t base = size_t{articulation} * p.max_dof;
+        uint32_t link = 0u, component = 0u;
+        if (c.lane >= p.max_dof || !ArticulationDofLocation(state, articulation, c.lane, &link, &component)) continue;
+        const uint32_t root = p.mimic_couplings != 0u ? data.mimic_root_dof[base + c.lane] : c.lane;
+        float value = 0.0f;
+        for (uint32_t compact = 0u; compact < s.articulation_dimensions[articulation]; ++compact)
+            if (s.articulation_roots[base + compact] == root) value = s.articulation_pseudo[base + compact];
+        if (p.mimic_couplings != 0u) value *= data.mimic_root_scale[base + c.lane];
+        if (component == ~0u) data.qdot_pseudo[link] = value;
+        else link_pseudo[link].v[component] = value;
+    }
+    for (uint32_t k = c.lane; k < c.bodies; k += kTileLanes) {
+        const uint32_t body = c.first_body + k;
+        const float* u = s.rigid_pseudo + size_t{body} * kRigidBlockDof;
+        data.body_pseudo_linear_velocity[body] = {u[0], u[1], u[2]};
+        data.body_pseudo_angular_velocity[body] = {u[3], u[4], u[5]};
+    }
+}
+
+// One Gauss-Seidel pass over the tile's blocks.
+template <uint32_t kN>
+__device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c,
+                                  bool position) {
+    for (uint32_t local = 0u; local < c.bodies + c.articulations; ++local) {
+        const TileBlock b = LoadTileBlock(data, p, s, c, local, position);
+        if (b.dimension == 0u) continue;
+        if (local < c.bodies) DescendTileBlock<kRigidBlockDof>(data, p, s, c, b);
+        else DescendTileBlock<kN>(data, p, s, c, b);
+    }
+}
+
 // kN is the articulation coordinates rounded up to a multiple of four; rigid bodies descend at six.
 template <uint32_t kN>
 __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKernel(
@@ -853,15 +928,18 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
     InitializeTile(state, data, p, s, c);
     for (uint32_t iteration = 0u; iteration < p.iterations; ++iteration) {
         c.iteration = iteration;
-        for (uint32_t local = 0u; local < c.bodies + c.articulations; ++local) {
-            const TileBlock b = LoadTileBlock(data, p, s, c, local);
-            if (b.dimension == 0u) continue;
-            if (local < c.bodies) DescendTileBlock<kRigidBlockDof>(data, p, s, c, b);
-            else DescendTileBlock<kN>(data, p, s, c, b);
-        }
+        DescendTileBlocks<kN>(data, p, s, c, false);
         UpdateTileDuals(data, c);
     }
     FinishTile(state, data, p, s, c);
+    if (p.position_iterations == 0u) return;
+    const uint32_t positions = InitializeTilePositions(data, p, s, c);
+    for (uint32_t iteration = 0u; iteration < positions; ++iteration) {
+        c.iteration = p.iterations + iteration;
+        DescendTileBlocks<kN>(data, p, s, c, true);
+        if (iteration + 1u < positions) UpdateTileDuals(data, c, false);
+    }
+    FinishTilePositions(state, data, p, s, c);
 }
 
 template <uint32_t kN>

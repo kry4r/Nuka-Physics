@@ -195,6 +195,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     const uint32_t max_dof          = cap.dofs_per_env;
     // Coupled joints follow their roots; the articulation then steps in reduced coordinates.
     const uint32_t mimic_couplings  = has_articulation ? cap.mimic_couplings_per_env : 0u;
+    // Split-impulse position passes run in the row solve, or in block descent's warp tiles.
+    const bool split_positions = !use_block_descent_ || phi::BlockDescentTileRoute(
+        cap.particles_per_env * env_count, cap.mpm_grid_nodes_per_env * env_count, articulation_cnt, max_dof);
     const bool use_inverse_dynamics =
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
@@ -269,7 +272,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.has_dat = cap.ogc_contacts_per_env > 0u;
         p.has_aero = cap.aero_tris_per_env > 0u &&
             (model.particles.aero_drag_normal != 0.0f || model.particles.aero_drag_tangent != 0.0f);
-        p.pos_pass = !use_block_descent_ && has_contacts && cfg.pos_iters > 0u;
+        p.pos_pass = split_positions && has_contacts && cfg.pos_iters > 0u;
         if (has_mpm) p.coverage_status |= energy_status::kGridMaterial;
         if (cap.particles_per_env != cap.vbd_vertices_per_env)
             p.coverage_status |= energy_status::kOtherParticleMaterial;
@@ -395,6 +398,10 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_block_descent_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
         p_block_descent_.workspace_words = cap.block_descent_scratch_words;
         p_block_descent_.vertex_blocks = vertex_blocks;
+        p_block_descent_.position_iterations = split_positions && has_contacts ? cfg.pos_iters : 0u;
+        p_block_descent_.position_beta = cfg.pos_beta;
+        p_block_descent_.position_slop = cfg.pos_slop;
+        p_block_descent_.position_max_velocity = model.baumgarte_max_velocity;
         const char* acceleration_radius = std::getenv("NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS");
         if (acceleration_radius != nullptr) {
             char* end = nullptr;
@@ -492,7 +499,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     coupling_ctx.gravity[2] = cfg.gravity[2];
     coupling_ctx.contact_margin = contact_margin;
     coupling_ctx.pos_pass =
-        (!use_block_descent_ && has_contacts && family == phi::kContactFamilyPairDriven &&
+        (split_positions && has_contacts && family == phi::kContactFamilyPairDriven &&
          cfg.pos_iters > 0u) ? 1u : 0u;
     coupling_ctx.p_np_body_particle = &p_np_body_particle_;
     coupling_ctx.p_part_finalize = &p_part_finalize_;
@@ -924,7 +931,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
         p_assemble_.contact_margin = cfg.contact_margin;
         p_assemble_.position_pass =
-            (!use_block_descent_ && family == phi::kContactFamilyPairDriven && cfg.pos_iters > 0u) ? 1u : 0u;
+            (split_positions && family == phi::kContactFamilyPairDriven && cfg.pos_iters > 0u) ? 1u : 0u;
         p_assemble_.vertex_blocks = vertex_blocks;
         if constexpr (family == phi::kContactFamilyPairDriven) {
             p_warm_start_prepare_.phase = 0u;
@@ -1097,7 +1104,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         // Read the split-impulse pseudo velocity additively when the position pass
         // is active (the general PairDriven path); else velocity-only (identical).
         p_int_pos_.pos_pass =
-            (!use_block_descent_ && has_contacts && family == phi::kContactFamilyPairDriven &&
+            (split_positions && has_contacts && family == phi::kContactFamilyPairDriven &&
              cfg.pos_iters > 0u) ? 1u : 0u;
         p_int_pos_.mimic_couplings = mimic_couplings;
         add(phi::NkOp::IntegratePosition, &p_int_pos_);
