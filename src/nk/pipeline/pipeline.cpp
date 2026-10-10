@@ -53,10 +53,16 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     p_accumulate_step_.clear();
     p_energy_.clear();
     p_block_descent_substeps_.clear();
+    const auto& cap = model.capacities;
+    const bool articulated = cap.dofs_per_env > 0u || cap.links_per_env > 0u;
+    const bool tile = phi::BlockDescentTileRoute(cap.particles_per_env * cap.env_count,
+        cap.mpm_grid_nodes_per_env * cap.env_count, articulated ? cap.articulations_per_env * cap.env_count : 0u,
+        cap.dofs_per_env);
+    // Scenes the warp tiles solve take block descent unless NUKA_BLOCK_DESCENT names the route.
     const char* block_descent = std::getenv("NUKA_BLOCK_DESCENT");
-    use_block_descent_ = block_descent != nullptr && block_descent[0] == '1' &&
-        block_descent[1] == '\0';
+    use_block_descent_ = block_descent == nullptr ? tile : block_descent[0] == '1' && block_descent[1] == '\0';
     p_block_descent_ = {};
+    if (use_block_descent_ && tile) p_block_descent_.iterations = phi::kBlockDescentTileIterations;
     if (use_block_descent_ && cfg.velocity_iterations_override)
         p_block_descent_.iterations = cfg.vel_iters;
     if (use_block_descent_ && !cfg.velocity_iterations_override) {
@@ -90,7 +96,6 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         for (const auto& call : sensors->After()) AddOp(call.op, call.params, device);
         if (!missing_ops_.empty()) { calls_.clear(); return phi::Status::Unsupported; }
     }
-    const auto& cap = model.capacities;
     const bool has_mpm = model.MpmParticlesPerEnv() > 0u && cap.mpm_grid_nodes_per_env > 0u;
     const bool mpm_reaction = has_mpm;
     if (substeps == 1u && !mpm_reaction) return phi::Status::Ok;
