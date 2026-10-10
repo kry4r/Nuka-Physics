@@ -71,14 +71,17 @@ struct TileContext {
     uint32_t first_body;
     uint32_t first_articulation;
     uint32_t capacity;
+    uint32_t staged;
     float* fields;
-    float* response;
     float* jacobian;
     float* mass;
     float* factor;
-    __device__ float& Value(uint32_t field, uint32_t h) const { return fields[size_t{field} * capacity + h]; }
+    __device__ float& Value(uint32_t field, uint32_t h) const {
+        return fields[size_t{h / kTileHeadGroup} * kTileFields * kTileHeadGroup +
+                      size_t{field} * kTileHeadGroup + h % kTileHeadGroup];
+    }
     __device__ uint32_t& Index(uint32_t field, uint32_t h) const {
-        return reinterpret_cast<uint32_t*>(fields)[size_t{field} * capacity + h];
+        return reinterpret_cast<uint32_t&>(Value(field, h));
     }
     __device__ Vec3 Load3(uint32_t field, uint32_t h) const {
         return {Value(field, h), Value(field + 1u, h), Value(field + 2u, h)};
@@ -89,7 +92,7 @@ struct TileContext {
         Value(field + 2u, h) = v.z;
     }
     __device__ nk::augmented::FloatScalarResponse Response(uint32_t h) const {
-        return {response[h], response[capacity + h]};
+        return {Value(kTileDualScale, h), Value(kTileResidualScale, h)};
     }
     // The head's incidence (0 or 1) on `block`, or kNoTileIncidence when it does not touch it.
     __device__ uint32_t Incidence(uint32_t h, uint32_t block) const {
@@ -298,8 +301,8 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     c.Value(kTileMuFirst, h) = row.mu;
     c.Value(kTileMuSecond, h) = row.friction_secondary;
     c.Value(kTileNormalBound, h) = 0.0f;
-    c.response[h] = scalar.dual_scale;
-    c.response[c.capacity + h] = scalar.residual_scale;
+    c.Value(kTileDualScale, h) = scalar.dual_scale;
+    c.Value(kTileResidualScale, h) = scalar.residual_scale;
     c.Store3(kTileDual, h, {data.lambda[slot], axes == 3u ? data.lambda[slot + stride] : 0.0f,
                             axes == 3u ? data.lambda[slot + 2u * stride] : 0.0f});
     c.Store3(kTileResidual, h, {});
@@ -711,14 +714,18 @@ __device__ float SearchTileLine(const TileContext& c, uint32_t block, float iner
 
 // Newton steps with an exact line search on the block's local augmented Lagrangian, as DescendDenseBlock.
 template <uint32_t kN>
-__device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c,
+__device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
                                  const TileBlock& b) {
     constexpr uint32_t kS = kN + 1u;
     const uint32_t n = b.dimension;
     const bool coordinate = c.lane < n;
     // Coordinates past the block's carry unit mass and no rows, so their step stays zero.
-    for (uint32_t i = 0u; i < kN; ++i)
-        if (c.lane < kN) c.mass[i * kS + c.lane] = i < n && coordinate ? b.Mass(i, c.lane) : i == c.lane ? 1.0f : 0.0f;
+    if (b.local != c.staged) {
+        for (uint32_t i = 0u; i < kN; ++i)
+            if (c.lane < kN)
+                c.mass[i * kS + c.lane] = i < n && coordinate ? b.Mass(i, c.lane) : i == c.lane ? 1.0f : 0.0f;
+        c.staged = b.local;
+    }
     StartTileBlock(c, b.local);
     const float start = coordinate ? b.velocity[c.lane] : 0.0f;
     const float free = coordinate && b.free != nullptr ? b.free[c.lane] : 0.0f;
@@ -886,8 +893,8 @@ __device__ uint32_t InitializeTilePositions(DataView data, BlockDescentSolvePara
         c.Value(kTileCompliance, h) = 0.0f;
         c.Value(kTileLower, h) = 0.0f;
         c.Value(kTileUpper, h) = FLT_MAX;
-        c.response[h] = scalar.dual_scale;
-        c.response[c.capacity + h] = scalar.residual_scale;
+        c.Value(kTileDualScale, h) = scalar.dual_scale;
+        c.Value(kTileResidualScale, h) = scalar.residual_scale;
         c.Store3(kTileResidual, h, {bias, 0.0f, 0.0f});
         c.Store3(kTileDual, h, {});
         push |= bias > 0.0f;
@@ -928,13 +935,19 @@ __device__ void FinishTilePositions(ArticulationDeviceState state, DataView data
 
 // One Gauss-Seidel pass over the tile's blocks.
 template <uint32_t kN>
-__device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, BlockScratch s, const TileContext& c,
+__device__ void DescendTileBlocks(DataView data, BlockDescentSolveParams p, BlockScratch s, TileContext& c,
                                   bool position) {
-    for (uint32_t local = 0u; local < c.bodies + c.articulations; ++local) {
-        const TileBlock b = LoadTileBlock(data, p, s, c, local, position);
-        if (b.dimension == 0u) continue;
-        if (local < c.bodies) DescendTileBlock<kRigidBlockDof>(data, p, s, c, b);
-        else DescendTileBlock<kN>(data, p, s, c, b);
+    for (uint32_t base = 0u; base < c.bodies + c.articulations; base += kTileLanes) {
+        const uint32_t own = base + c.lane;
+        const uint32_t dimension = own < c.bodies ? s.rigid_dimensions[c.first_body + own]
+            : own < c.bodies + c.articulations
+                ? s.articulation_dimensions[c.first_articulation + own - c.bodies] : 0u;
+        for (uint32_t pending = __ballot_sync(~0u, dimension != 0u); pending != 0u; pending &= pending - 1u) {
+            const uint32_t local = base + __ffs(pending) - 1u;
+            const TileBlock b = LoadTileBlock(data, p, s, c, local, position);
+            if (local < c.bodies) DescendTileBlock<kRigidBlockDof>(data, p, s, c, b);
+            else DescendTileBlock<kN>(data, p, s, c, b);
+        }
     }
 }
 
@@ -1011,8 +1024,8 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
         c.first_body = c.env * c.bodies;
         c.first_articulation = c.env * c.articulations;
         c.capacity = s.tile_head_capacity;
+        c.staged = kNoTileBlock;
         c.fields = s.tile_fields + size_t{c.env} * kTileFields * c.capacity;
-        c.response = s.tile_response + size_t{c.env} * 2u * c.capacity;
         c.jacobian = s.tile_jacobian + size_t{c.env} * s.tile_row_capacity * kTileLanes;
         c.mass = tile_shared + size_t{warp} * 2u * kN * (kN + 1u);
         c.factor = c.mass + kN * (kN + 1u);

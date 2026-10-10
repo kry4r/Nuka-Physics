@@ -183,11 +183,16 @@ NUKA_AUGMENTED_HD inline float ScalarPotentialChange(
     return float((y >= x ? integral : -integral) / k);
 }
 
-// dual / mu + rho * mu * residual to about one float ulp: the quotient's and products' rounding
-// errors are recovered with fma and added back after an error-free sum.
+// dual / mu + rho * mu * residual with fma-recovered rounding errors added after an error-free sum.
+// Zero numerators retain their sign while a nonzero substitute avoids the GPU division slow path.
 NUKA_AUGMENTED_HD inline float ConeArgument(float dual, float rho, float mu, float residual) {
-    const float d = dual / mu;
-    const float d_low = fmaf(-d, mu, dual) / mu;
+    const bool dual_zero = dual == 0.0f;
+    const float dual_quotient = (dual + float(dual_zero)) / mu;
+    const float d = dual_zero ? dual : dual_quotient;
+    const float low = fmaf(-d, mu, dual);
+    const bool low_zero = low == 0.0f;
+    const float low_quotient = (low + float(low_zero)) / mu;
+    const float d_low = low_zero ? low : low_quotient;
     const float p = rho * mu;
     const float t = p * residual;
     const float t_low = fmaf(p, residual, -t) + fmaf(rho, mu, -p) * residual;

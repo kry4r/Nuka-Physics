@@ -161,12 +161,14 @@ static_assert(sizeof(MultilevelRowTerm) % sizeof(double) == 0u);
 
 constexpr uint32_t kTileLanes = 32u;
 constexpr uint32_t kTileWarps = 4u;
-// Per-head fields of a dense tile, each a run of the environment's head capacity: indices, the row's
-// coefficients, then the normal bound, residual, dual, move and step of the current block solve.
+constexpr uint32_t kTileHeadGroup = 8u;
+// Per-head fields interleaved in groups of eight: indices, coefficients, normal bound, residual, dual,
+// move, step and scalar response of the current block solve.
 constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner = 3u, kTileRow = 5u,
                    kTileUnit = 7u, kTileUnitValue = 9u, kTileRho = 11u, kTileCompliance = 12u, kTileLower = 13u,
                    kTileUpper = 14u, kTileMuFirst = 15u, kTileMuSecond = 16u, kTileNormalBound = 17u,
-                   kTileResidual = 18u, kTileDual = 21u, kTileMove = 24u, kTileStep = 27u, kTileFields = 30u;
+                   kTileResidual = 18u, kTileDual = 21u, kTileMove = 24u, kTileStep = 27u,
+                   kTileDualScale = 30u, kTileResidualScale = 31u, kTileFields = 32u;
 
 bool DenseTileRoute(const BlockDescentSolveParams& p) {
     return BlockDescentTileRoute(p.total_particle_count, p.total_grid_count, p.articulation_count, p.max_dof);
@@ -269,7 +271,6 @@ struct BlockScratch {
     uint32_t multilevel_parts;
     uint32_t multilevel_item_parts;
     float* tile_fields;
-    float* tile_response;
     float* tile_jacobian;
     uint32_t* tile_next;
     uint32_t* tile_order;
@@ -449,7 +450,6 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.tile_head_capacity = tile ? TileHeadCapacity(p) : 0u;
     s.tile_row_capacity = tile ? 2u * p.rows_per_env : 0u;
     s.tile_fields = reinterpret_cast<float*>(take(uint64_t{p.env_count} * kTileFields * s.tile_head_capacity));
-    s.tile_response = reinterpret_cast<float*>(take(uint64_t{p.env_count} * 2u * s.tile_head_capacity));
     s.tile_jacobian = reinterpret_cast<float*>(take(uint64_t{p.env_count} * s.tile_row_capacity * kTileLanes));
     s.tile_next = take(tile ? 1u : 0u);
     s.tile_order = take(tile ? p.env_count : 0u);
