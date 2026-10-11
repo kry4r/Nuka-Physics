@@ -3,6 +3,7 @@
 // Operator numbering and resource contracts share one backend-independent catalog.
 
 #include <cstdint>
+#include "phi/articulation_contract.hpp"
 #include "collision/mesh_surface_types.hpp"
 #include "sensor/observation_types.hpp"
 #include "sensor/state_types.hpp"
@@ -773,6 +774,7 @@ struct BlockDescentSolveParams {
     uint32_t measure_vertex_audit = 0u;
     float acceleration_spectral_radius = 0.0f;
     uint32_t mimic_couplings = 0u;
+    uint32_t max_independent_dof = kMaxArticulationDof;
     uint32_t material_cells_per_env = 0u;
     uint32_t grid_particles_per_env = 0u;
     uint32_t grid_dims[3] = {};

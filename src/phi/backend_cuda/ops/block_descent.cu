@@ -2385,7 +2385,9 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                     data, *p, s, p->vertex_blocks.colors + 1u, spread_rows, false) != cudaSuccess)
                 return Status::Failed;
             if (p->articulation_count > 0u) {
-                LaunchCuda(DescendArticulationsKernel, dim3(p->articulation_count), dim3(kThreads),
+                const auto kernel = p->max_independent_dof <= 32u ? DescendArticulationsKernel<32u>
+                    : DescendArticulationsKernel<kMaxArticulationDof>;
+                LaunchCuda(kernel, dim3(p->articulation_count), dim3(kThreads),
                            0u, stream, articulation_state, data, *p, s);
                 if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }

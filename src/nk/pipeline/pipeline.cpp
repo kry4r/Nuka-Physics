@@ -201,6 +201,18 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     const uint32_t max_dof          = cap.dofs_per_env;
     // Coupled joints follow their roots; the articulation then steps in reduced coordinates.
     const uint32_t mimic_couplings  = has_articulation ? cap.mimic_couplings_per_env : 0u;
+    uint32_t max_independent_dof = 0u, independent_dof = 0u;
+    for (uint32_t link = 0u; link < model.articulation.link_count; ++link) {
+        const auto& a = model.articulation;
+        if (a.parent_link[link] == ~0u) independent_dof = 0u;
+        const auto type = static_cast<phi::ArticulationJointType>(a.joint_type[link]);
+        if (type == phi::ArticulationJointType::FloatingBase) independent_dof += 6u;
+        else if ((type == phi::ArticulationJointType::Revolute ||
+                  type == phi::ArticulationJointType::Prismatic) &&
+                 (mimic_couplings == 0u || a.mimic_source_link[link] == ~0u))
+            ++independent_dof;
+        max_independent_dof = std::max(max_independent_dof, independent_dof);
+    }
     // Split-impulse position passes run in the row solve, or in block descent's warp tiles.
     const bool split_positions = !use_block_descent_ || phi::BlockDescentTileRoute(
         cap.particles_per_env * env_count, cap.mpm_grid_nodes_per_env * env_count, articulation_cnt, max_dof);
@@ -400,6 +412,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_block_descent_.articulation_count = articulation_cnt;
         p_block_descent_.max_dof = max_dof;
         p_block_descent_.mimic_couplings = mimic_couplings;
+        p_block_descent_.max_independent_dof = max_independent_dof;
         p_block_descent_.material_cells_per_env = cap.mpm_stress_cells_per_env;
         p_block_descent_.grid_particles_per_env = grid_particles_per_env;
         std::copy(mp.mpm_grid_dims, mp.mpm_grid_dims + 3u, p_block_descent_.grid_dims);

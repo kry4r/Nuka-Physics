@@ -18,8 +18,9 @@ __global__ void InitializeArticulationBlocksKernel(
 }
 
 // An articulation block in its free (mimic root) coordinates.
+template <uint32_t capacity>
 struct ArticulationBlock {
-    static constexpr uint32_t kMaxDof = kMaxArticulationDof;
+    static constexpr uint32_t kMaxDof = capacity;
     uint32_t index, dimension, begin, end, stride;
     const uint32_t* roots;
     const float* mass;
@@ -39,13 +40,14 @@ struct ArticulationBlock {
 };
 static_assert(kMaxArticulationDof <= kThreads);
 
+template <uint32_t capacity>
 __global__ void DescendArticulationsKernel(
     ArticulationDeviceState state, DataView data, BlockDescentSolveParams p, BlockScratch s) {
     const uint32_t articulation = blockIdx.x;
     if (articulation >= p.articulation_count) return;
     const uint32_t owner = p.total_particle_count + p.total_body_count + articulation;
     const size_t base = size_t{articulation} * p.max_dof;
-    ArticulationBlock b{};
+    ArticulationBlock<capacity> b{};
     b.index = articulation;
     b.dimension = s.articulation_dimensions[articulation];
     b.begin = s.offsets[owner];
