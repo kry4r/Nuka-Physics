@@ -389,6 +389,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactSolveMetrics, DlpackDtype::kU64, 2, false, true},  // contact_solve_metrics
     {FieldId::VbdSolveMetrics, DlpackDtype::kU64, 2, false, true},  // vbd_solve_metrics
     {FieldId::ContactSolveCounts, DlpackDtype::kU32, 2, false, true},  // contact_solve_counts
+    {FieldId::ContactSolveWorstTerms, DlpackDtype::kF32, 2, false, true},  // contact_solve_worst_terms
     {FieldId::PairSampleChunks, DlpackDtype::kU32, 1, false, false},  // pair_sample_chunks
     {FieldId::SolveColorScratch, DlpackDtype::kU32, 1, false, false},  // solve_color_scratch
     {FieldId::BlockDescentScratch, DlpackDtype::kU32, 1, false, false},  // block_descent_scratch

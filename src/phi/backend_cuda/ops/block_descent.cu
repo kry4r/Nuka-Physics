@@ -2044,6 +2044,29 @@ __global__ void MeasureRowsKernel(DataView data, BlockDescentSolveParams p, Bloc
     }
 }
 
+// Terms of each metric's worst row, read back from the slot its packed record names.
+__global__ void MeasureWorstRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    constexpr uint32_t kColumns = constraint::kContactSolveWorstColumns;
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+         item < p.env_count * constraint::kContactSolveMetricCount; item += gridDim.x * blockDim.x) {
+        const uint64_t packed = data.contact_solve_metrics[item];
+        if (packed == 0u) continue;
+        const uint32_t slot = ~static_cast<uint32_t>(packed);
+        const NkRow row = rows[slot];
+        const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
+        const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
+        const auto f = nk::augmented::EvaluateTangent(t.dual, t.penalty, {0.0f, t.residual.y, t.residual.z},
+                                                      t.normal_bound, t.mu_first, t.mu_second);
+        const SymmetricMat3& w = row.contact_response;
+        const float terms[kColumns] = {t.dual.x, t.dual.y, t.dual.z, velocity.x, velocity.y, velocity.z,
+            t.normal_bound, f.impulse.y, f.impulse.z, t.penalty, t.compliance, w.xx, w.yy, w.zz, w.xy, w.xz,
+            w.yz, t.mu_first, t.mu_second, __uint_as_float(slot)};
+        for (uint32_t column = 0u; column < kColumns; ++column)
+            data.contact_solve_worst_terms[size_t{item} * kColumns + column] = terms[column];
+    }
+}
+
 __global__ void MeasureVerticesKernel(ModelView model, DataView data, BlockDescentSolveParams p) {
     const uint32_t lane = threadIdx.x % warpSize;
     const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
@@ -2174,8 +2197,12 @@ Status MeasureSolve(const ModelView& model, const DataView& data, const BlockDes
     };
     if (!clear(data.contact_solve_metrics, size_t{p.env_count} * constraint::kContactSolveMetricCount * sizeof(uint64_t)) ||
         !clear(data.contact_solve_counts, size_t{p.env_count} * constraint::kContactSolveCountSize * sizeof(uint32_t)) ||
-        !clear(data.vbd_solve_metrics, size_t{p.env_count} * 2u * sizeof(uint64_t))) return Status::Failed;
+        !clear(data.vbd_solve_metrics, size_t{p.env_count} * 2u * sizeof(uint64_t)) ||
+        !clear(data.contact_solve_worst_terms, size_t{p.env_count} * constraint::kContactSolveMetricCount *
+            constraint::kContactSolveWorstColumns * sizeof(float))) return Status::Failed;
     if (LaunchWork(MeasureRowsKernel, s.rows, kThreads, stream, data, p, s) != cudaSuccess ||
+        LaunchWork(MeasureWorstRowsKernel, p.env_count * constraint::kContactSolveMetricCount, kThreads,
+            stream, data, p, s) != cudaSuccess ||
         LaunchWork(MeasureVerticesKernel, p.vertex_blocks.dynamic_vertices * p.env_count,
             kThreads / 32u, stream, model, data, p) != cudaSuccess) return Status::Failed;
     return Status::Ok;

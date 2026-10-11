@@ -377,6 +377,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ControlScratch: v.control_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::BlockDescentScratch: v.block_descent_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::ContactSolveMetrics: v.contact_solve_metrics = static_cast<uint64_t*>(p); break;
+        case FieldId::ContactSolveWorstTerms: v.contact_solve_worst_terms = static_cast<float*>(p); break;
         case FieldId::ContactSolveCounts: v.contact_solve_counts = static_cast<uint32_t*>(p); break;
         case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
         case FieldId::GridSortScratch:     v.grid_sort_scratch = static_cast<uint8_t*>(p); break;
@@ -463,6 +464,7 @@ bool Data::UploadPersistent(const std::vector<uint8_t>& bytes) const {
     if (phi::BufferUpload(buffer, bytes.data(), 0, bytes.size()) != phi::Status::Ok) return false;
     for (const auto& segment : arena_.Segments()) {
         if (segment.field != FieldId::ContactSolveMetrics && segment.field != FieldId::ContactSolveCounts &&
+            segment.field != FieldId::ContactSolveWorstTerms &&
             segment.field != FieldId::ContactRowExtent && segment.field != FieldId::ContactCacheExtent)
             continue;
         if (phi::BufferMemset(arena_.ScratchBuffer(), 0, segment.offset, segment.bytes) != phi::Status::Ok)

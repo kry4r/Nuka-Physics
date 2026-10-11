@@ -373,6 +373,7 @@ enum class FieldId : uint16_t {
     ContactSolveMetrics,  // contact_solve_metrics (per:env arena:scratch owner:data elem:8 flags:[readout])
     VbdSolveMetrics,  // vbd_solve_metrics (per:env arena:scratch owner:data elem:2 flags:[readout])
     ContactSolveCounts,  // contact_solve_counts (per:env arena:scratch owner:data elem:2 flags:[readout])
+    ContactSolveWorstTerms,  // contact_solve_worst_terms (per:env arena:scratch owner:data elem:160 flags:[readout])
     PairSampleChunks,  // pair_sample_chunks (per:scalar arena:scratch owner:data count:pair_sample_chunk_words)
     SolveColorScratch,  // solve_color_scratch (per:scalar arena:scratch owner:data count:solve_color_scratch_words)
     BlockDescentScratch,  // block_descent_scratch (per:scalar arena:scratch owner:data count:block_descent_scratch_words)
@@ -840,6 +841,7 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_solve_metrics",
     "vbd_solve_metrics",
     "contact_solve_counts",
+    "contact_solve_worst_terms",
     "pair_sample_chunks",
     "solve_color_scratch",
     "block_descent_scratch",

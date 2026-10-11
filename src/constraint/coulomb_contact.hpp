@@ -21,6 +21,8 @@ enum class ContactSolveMetric : uint32_t {
 };
 inline constexpr uint32_t kContactSolveMetricCount = static_cast<uint32_t>(ContactSolveMetric::Count);
 inline constexpr uint32_t kContactSolveCountSize = 2u;
+// Dual, velocity, projected normal/tangent impulse, penalty, compliance, response, mu pair, row slot.
+inline constexpr uint32_t kContactSolveWorstColumns = 20u;
 
 NUKA_COULOMB_HD inline float ProjectedContactNormal(float response, float residual, float impulse) {
     if (!(response > 0.0f) || !(response <= FLT_MAX)) return 0.0f;

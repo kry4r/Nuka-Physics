@@ -256,6 +256,8 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_UCONTACT_ROW_RANGE, nk::LayoutOf(nk::FieldId::UcontactRowRange).elem_size,
         kWireDtypeU32, nk::FieldId::UcontactRowRange},
     {NUKA_FIELD_LINK_WRENCH, kStrideSpat6, kWireDtypeF32, nk::FieldId::LinkWrench},
+    {NUKA_FIELD_CONTACT_SOLVE_WORST_TERMS, nk::LayoutOf(nk::FieldId::ContactSolveWorstTerms).elem_size,
+        kWireDtypeF32, nk::FieldId::ContactSolveWorstTerms},
 };
 
 inline constexpr size_t kDlpackFieldCount =

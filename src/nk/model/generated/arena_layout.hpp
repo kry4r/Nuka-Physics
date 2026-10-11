@@ -412,6 +412,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 8, 1, 64, 0},  // contact_solve_metrics
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 16, 0},  // vbd_solve_metrics
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 2, 1, 8, 0},  // contact_solve_counts
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 160, 1, 640, 0},  // contact_solve_worst_terms
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // pair_sample_chunks
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // solve_color_scratch
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // block_descent_scratch

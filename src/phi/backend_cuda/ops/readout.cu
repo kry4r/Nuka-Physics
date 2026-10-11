@@ -370,6 +370,10 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
     }
     for (uint32_t metric = threadIdx.x; metric < constraint::kContactSolveMetricCount; metric += blockDim.x)
         data.contact_solve_metrics[env * constraint::kContactSolveMetricCount + metric] = 0u;
+    for (uint32_t column = threadIdx.x; column < constraint::kContactSolveMetricCount *
+             constraint::kContactSolveWorstColumns; column += blockDim.x)
+        data.contact_solve_worst_terms[env * constraint::kContactSolveMetricCount *
+            constraint::kContactSolveWorstColumns + column] = 0.0f;
     for (uint32_t count = threadIdx.x; count < constraint::kContactSolveCountSize; count += blockDim.x)
         data.contact_solve_counts[env * constraint::kContactSolveCountSize + count] = 0u;
     const bool has_contact_index = p.base_link_count != 0u && p.lambda_stride != 0u && p.contact_slot_count != 0u;

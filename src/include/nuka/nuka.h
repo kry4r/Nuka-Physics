@@ -734,7 +734,10 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_UCONTACT_ROW_RANGE = 103,
     // WRITE: per link, world force [N] through its COM followed by world torque [N*m], env-major.
     // Dynamics consume it over one outer step, then clear it with BODY_FORCE.
-    NUKA_FIELD_LINK_WRENCH = 105
+    NUKA_FIELD_LINK_WRENCH = 105,
+    // READ: per environment and CONTACT_SOLVE_METRICS entry, 20 float32 terms of that worst row: dual[3],
+    // velocity[3], projected normal and tangent[2] impulse, penalty, compliance, response xx yy zz xy xz yz, mu[2], slot bits.
+    NUKA_FIELD_CONTACT_SOLVE_WORST_TERMS = 106
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {
