@@ -237,6 +237,10 @@ struct BlockScratch {
     uint32_t diagnostic_iteration = ~0u;
     uint32_t* owner_cache_color;
     uint32_t* row_cache_colors;
+    uint32_t* cache_counts;
+    uint32_t* cache_offsets;
+    uint32_t* cache_rows;
+    uint32_t cache_color_count;
     uint32_t color_words;
     float* point_jacobian;
     nk::augmented::ScalarResponse* scalar_response;
@@ -440,6 +444,10 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
         tile ? 0u : rows * sizeof(AugmentedRowState) / sizeof(uint32_t)));
     s.owner_cache_color = take(blocks);
     s.row_cache_colors = take(row_color_words);
+    s.cache_color_count = tile ? 0u : static_cast<uint32_t>(cache_colors);
+    s.cache_counts = take(s.cache_color_count);
+    s.cache_offsets = take(tile ? 0u : cache_colors + 1u);
+    s.cache_rows = s.sorted_incidence;
     s.color_words = static_cast<uint32_t>(color_words);
     s.point_jacobian = reinterpret_cast<float*>(take(point_jacobian_words));
     at = (at + 1u) & ~uint64_t{1u};
@@ -553,12 +561,6 @@ __device__ uint32_t GridNodeColor(const BlockDescentSolveParams& p, uint32_t nod
     const uint32_t width = nk::kMpmStencilWidth + lattice;
     const uint32_t first = lattice == 0u ? 0u : nk::kMpmLatticeStencilNodes;
     return first + x % width + width * (y % width + width * (z % width));
-}
-
-__device__ bool RowUsesCacheColor(BlockScratch s, uint32_t slot, uint32_t cache_color) {
-    return cache_color == kAllCacheColors ||
-        (s.row_cache_colors[size_t{slot} * s.color_words + cache_color / 32u] &
-         (uint32_t{1u} << (cache_color % 32u))) != 0u;
 }
 
 // The lowest cache color of a row whose owners all descend in particle colors, else kNoCacheColor.
@@ -969,7 +971,41 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
             if (color != kNoCacheColor)
                 cache_colors[color / 32u] |= uint32_t{1u} << (color % 32u);
         });
+        for (uint32_t word = 0u; word < s.color_words; ++word)
+            for (uint32_t bits = cache_colors[word]; bits != 0u; bits &= bits - 1u)
+                atomicAdd(s.cache_counts + word * 32u + __ffs(bits) - 1u, 1u);
         s.active_rows[atomicAdd(s.active_count, 1u)] = slot;
+    }
+}
+
+// Sorted rows return to CSR storage before the temporary array becomes color buckets.
+__global__ void PrepareCacheBucketsKernel(BlockScratch s) {
+    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint32_t at = item; at < s.offsets[s.blocks]; at += gridDim.x * blockDim.x)
+        s.incidence[at] = s.sorted_incidence[at];
+    if (item == 0u) {
+        uint32_t offset = 0u;
+        for (uint32_t color = 0u; color < s.cache_color_count; ++color) {
+            s.cache_offsets[color] = offset;
+            offset += s.cache_counts[color];
+            s.cache_counts[color] = 0u;
+        }
+        s.cache_offsets[s.cache_color_count] = offset;
+    }
+}
+
+__global__ void FillCacheBucketsKernel(BlockScratch s) {
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        const uint32_t slot = s.active_rows[item];
+        for (uint32_t word = 0u; word < s.color_words; ++word) {
+            const uint32_t colors = s.row_cache_colors[size_t{slot} * s.color_words + word];
+            for (uint32_t bits = colors; bits != 0u; bits &= bits - 1u) {
+                const uint32_t color = word * 32u + __ffs(bits) - 1u;
+                const uint32_t at = s.cache_offsets[color] + atomicAdd(s.cache_counts + color, 1u);
+                s.cache_rows[at] = slot;
+            }
+        }
     }
 }
 
@@ -1348,15 +1384,15 @@ __device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, Bloc
 __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                         uint32_t cache_color, uint32_t spread_rows, bool seeded) {
     const uint32_t threads = gridDim.x * blockDim.x;
-    const uint32_t count = *s.active_count;
+    const uint32_t first = s.cache_offsets[cache_color];
+    const uint32_t count = s.cache_offsets[cache_color + 1u] - first;
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     // Particle descents integrate potential changes and dense descents search slopes; only grid
     // descents read the cached potential.
     const bool potential = cache_color > p.vertex_blocks.colors + 1u;
     if (count > spread_rows) {
         for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < count; item += threads) {
-            const uint32_t slot = s.active_rows[item];
-            if (!RowUsesCacheColor(s, slot, cache_color)) continue;
+            const uint32_t slot = s.cache_rows[first + item];
             if (seeded && ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) == cache_color) continue;
             const NkRow row = rows[slot];
             if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
@@ -1368,8 +1404,7 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
     const uint32_t group_mask = ((1u << kRowAxisLanes) - 1u) << (threadIdx.x % warpSize - axis);
     for (uint32_t item = (blockIdx.x * blockDim.x + threadIdx.x) / kRowAxisLanes; item < count;
          item += threads / kRowAxisLanes) {
-        const uint32_t slot = s.active_rows[item];
-        if (!RowUsesCacheColor(s, slot, cache_color)) continue;
+        const uint32_t slot = s.cache_rows[first + item];
         if (seeded && ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) == cache_color) continue;
         const NkRow row = rows[slot];
         if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
@@ -2228,6 +2263,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             size_t{p->vertex_blocks.vertices} * p->env_count * nk::kVbdSolveAuditColumnCount * sizeof(float)))
         return Status::Failed;
     if (!clear(s.counts, size_t{s.blocks + 1u} * sizeof(uint32_t)) ||
+        !clear(s.cache_counts, size_t{s.cache_color_count} * sizeof(uint32_t)) ||
         !clear(s.active_count, sizeof(uint32_t)) ||
         !clear(data.solver_color_counts, size_t{p->env_count} * kSolverCountWords * sizeof(uint32_t)) ||
         !clear(data.solver_phase_time, size_t{p->env_count} * kSolverPhaseWords * sizeof(uint64_t))) return Status::Failed;
@@ -2295,8 +2331,10 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                 0, RowSlotBits(s.rows), stream) != cudaSuccess ||
             LaunchWork(SortSmallIncidenceKernel, s.blocks, kThreads / 32u, stream, s) != cudaSuccess)
             return Status::Failed;
-        s.incidence = s.sorted_incidence;
     }
+    if (LaunchWork(PrepareCacheBucketsKernel, s.incidence_capacity, kThreads, stream, s) != cudaSuccess ||
+        LaunchWork(FillCacheBucketsKernel, s.rows, kThreads, stream, s) != cudaSuccess)
+        return Status::Failed;
     if (LaunchWork(CachePointIncidenceJacobiansKernel,
             p->total_particle_count + p->total_grid_count, kThreads / 32u, stream,
             data, *p, s) != cudaSuccess) return Status::Failed;

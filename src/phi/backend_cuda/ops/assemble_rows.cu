@@ -512,13 +512,11 @@ __device__ uint32_t ResolvePairSide(uint32_t side_kind,
 // Particle systems have no collidable profile row, so they use the canonical
 // model defaults with only their authored per-system isotropic friction replaced.
 
-// Each environment assigns contact ranges and initializes the rows it owns.
-__global__ void InitializePairDrivenRowsKernel(
+// Each environment prefixes rigid contact ranges and advances its occupied row extent.
+__global__ void InitializePairDrivenRangesKernel(
     const uint32_t* counts, uint32_t slot_count, uint32_t rigid_slots,
-    uint32_t rigid_rows, uint32_t rows_per_env, uint32_t contact_rows, uint32_t* ranges,
-    uint32_t* row_count, uint32_t* extent, NkRow* urows, float* lambda,
-    uint32_t* row_cj_link, uint32_t* row_cj_link_b,
-    float* row_penetration, float* row_damping, uint64_t* contact_material) {
+    uint32_t rows_per_env, uint32_t contact_rows, uint32_t* ranges,
+    uint32_t* row_count, uint32_t* extent, uint64_t* contact_material) {
     using Scan = cub::BlockScan<uint32_t, kContactRowsBlock>;
     __shared__ typename Scan::TempStorage scratch;
     __shared__ uint32_t carry;
@@ -534,16 +532,6 @@ __global__ void InitializePairDrivenRowsKernel(
     }
     __syncthreads();
     const uint32_t bound = ContactRowBound(extent, env, contact_rows);
-    for (uint32_t local = threadIdx.x; local < rows_per_env; local += blockDim.x) {
-        const uint32_t row = env * rows_per_env + local;
-        row_damping[row] = 0.0f;
-        if (local >= bound) continue;
-        lambda[row] = 0.0f;
-        row_penetration[row] = 0.0f;
-        row_cj_link[row] = kInvalidLink;
-        row_cj_link_b[row] = kInvalidLink;
-        if (urows[row].flags != 0u) urows[row].flags = 0u;
-    }
     for (uint32_t tile = 0u; tile < rigid_slots; tile += blockDim.x) {
         const uint32_t slot = tile + threadIdx.x;
         const uint32_t points = slot < rigid_slots ? counts[env * slot_count + slot] : 0u;
@@ -560,13 +548,36 @@ __global__ void InitializePairDrivenRowsKernel(
         if (threadIdx.x + 1u == blockDim.x) carry += prefix + points;
         __syncthreads();
     }
-    for (uint32_t slot = rigid_slots + threadIdx.x; slot < slot_count; slot += blockDim.x) {
-        const size_t index = size_t{env * slot_count + slot} * 2u;
-        const uint32_t first = env * rows_per_env + rigid_rows +
-            (slot - rigid_slots) * nk::kPairDrivenParticleRowsPerSlot;
-        ranges[index] = first;
-        ranges[index + 1u] = nk::kPairDrivenParticlePtsPerSlot;
-        if (first - env * rows_per_env < bound) contact_material[env * slot_count + slot] = 0u;
+}
+
+// Row initialization and fixed particle ranges span the device independently of environment count.
+__global__ void ClearPairDrivenRowsKernel(
+    uint32_t total_rows, uint32_t rows_per_env, uint32_t contact_rows,
+    uint32_t slot_count, uint32_t rigid_slots, uint32_t rigid_rows, const uint32_t* extent,
+    uint32_t* ranges, NkRow* urows, float* lambda, uint32_t* row_cj_link, uint32_t* row_cj_link_b,
+    float* row_penetration, float* row_damping, uint64_t* contact_material) {
+    BeginProgrammaticKernel();
+    for (uint32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < total_rows;
+         row += gridDim.x * blockDim.x) {
+        const uint32_t env = row / rows_per_env;
+        const uint32_t local = row % rows_per_env;
+        const uint32_t bound = ContactRowBound(extent, env, contact_rows);
+        row_damping[row] = 0.0f;
+        if (local < bound) {
+            lambda[row] = 0.0f;
+            row_penetration[row] = 0.0f;
+            row_cj_link[row] = kInvalidLink;
+            row_cj_link_b[row] = kInvalidLink;
+            if (urows[row].flags != 0u) urows[row].flags = 0u;
+        }
+        if (local < slot_count - rigid_slots) {
+            const uint32_t slot = env * slot_count + rigid_slots + local;
+            const uint32_t first = env * rows_per_env + rigid_rows +
+                local * nk::kPairDrivenParticleRowsPerSlot;
+            ranges[size_t{slot} * 2u] = first;
+            ranges[size_t{slot} * 2u + 1u] = nk::kPairDrivenParticlePtsPerSlot;
+            if (first - env * rows_per_env < bound) contact_material[slot] = 0u;
+        }
     }
 }
 
@@ -1704,10 +1715,15 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
     const uint32_t full_slots = std::min(p->full_row_slot_count, p->union_slot_count);
     const uint32_t rigid_rows = p->contact_rows_per_env -
         (p->union_slot_count - full_slots) * nk::kPairDrivenParticleRowsPerSlot;
-    LaunchCuda(InitializePairDrivenRowsKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream,
-               data.ucontact_count, p->union_slot_count, full_slots, rigid_rows,
+    LaunchCuda(InitializePairDrivenRangesKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream,
+               data.ucontact_count, p->union_slot_count, full_slots,
                p->rows_per_env, p->contact_rows_per_env, data.ucontact_row_range,
-               data.row_count, data.contact_row_extent, reinterpret_cast<NkRow*>(data.urows),
+               data.row_count, data.contact_row_extent, data.contact_material);
+    LaunchCuda<true>(ClearPairDrivenRowsKernel,
+               dim3((total_rows + kBlockSize - 1u) / kBlockSize), dim3(kBlockSize), 0u, stream,
+               total_rows, p->rows_per_env, p->contact_rows_per_env,
+               p->union_slot_count, full_slots, rigid_rows, data.contact_row_extent,
+               data.ucontact_row_range, reinterpret_cast<NkRow*>(data.urows),
                data.lambda, data.row_cj_link, data.row_cj_link_b, data.row_penetration,
                data.row_damping, data.contact_material);
     const bool has_artic = p->max_dof > 0u && p->articulation_count > 0u;

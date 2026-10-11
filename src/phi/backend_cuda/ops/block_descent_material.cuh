@@ -36,9 +36,11 @@ __global__ void CacheMaterialRowsKernel(DataView data, BlockDescentSolveParams p
         points.grid_velocity = s.grid_snapshot;
         points.particle_velocity = s.particle_snapshot;
     }
-    for (uint32_t item = warp; item < *s.active_count; item += stride) {
-        const uint32_t slot = s.active_rows[item];
-        if (!RowUsesCacheColor(s, slot, cache_color)) continue;
+    const bool all = cache_color == kAllCacheColors;
+    const uint32_t first = all ? 0u : s.cache_offsets[cache_color];
+    const uint32_t count = all ? *s.active_count : s.cache_offsets[cache_color + 1u] - first;
+    for (uint32_t item = warp; item < count; item += stride) {
+        const uint32_t slot = all ? s.active_rows[item] : s.cache_rows[first + item];
         const NkRow head = rows[slot];
         if (!(head.flags & nk::nk_row_flags::kMaterialBlock)) continue;
         double moment[6] = {};
