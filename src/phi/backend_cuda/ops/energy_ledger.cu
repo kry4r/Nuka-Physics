@@ -59,6 +59,13 @@ __device__ Vec3 ParticleVelocity(const DataView& d, const ReadoutEnergyLedgerPar
                                     d.vbd_free_velocity[slot], p.dt, d.vbd_step[slot]);
 }
 
+// Skip cleared contact rows while retaining each thread's row order and noncontact assignments.
+__device__ uint32_t LedgerRow(uint32_t row, uint32_t bound, uint32_t contacts) {
+    if (row < contacts && row >= bound)
+        row += ((contacts - row - 1u) / blockDim.x + 1u) * blockDim.x;
+    return row;
+}
+
 // Read-only FK uses private poses and world velocities; dynamics scratch stays untouched.
 __global__ void EnergyLinkFramesKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p) {
     const uint32_t art = blockIdx.x;
@@ -418,7 +425,9 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         const uint32_t first_friction = p.contact_rows + p.limit_rows;
         const uint32_t first_drive = first_friction + p.friction_rows;
         const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
-        for (uint32_t local = threadIdx.x; local < p.rows_per_env; local += blockDim.x) {
+        const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
+        for (uint32_t local = LedgerRow(threadIdx.x, bound, p.contact_rows); local < p.rows_per_env;
+             local = LedgerRow(local + blockDim.x, bound, p.contact_rows)) {
             const uint32_t row = env * p.rows_per_env + local;
             const double impulse = d.lambda[row];
             if (impulse == 0.0) continue;
@@ -635,7 +644,9 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
     if (p.stage == EnergyStage::Solved) {
         const auto* rows = reinterpret_cast<const NkRow*>(d.urows);
         const uint32_t first_drive = p.contact_rows + p.limit_rows + p.friction_rows;
-        for (uint32_t local = threadIdx.x; local < p.rows_per_env; local += blockDim.x) {
+        const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
+        for (uint32_t local = LedgerRow(threadIdx.x, bound, p.contact_rows); local < p.rows_per_env;
+             local = LedgerRow(local + blockDim.x, bound, p.contact_rows)) {
             const uint32_t row = env * p.rows_per_env + local;
             const auto r = rows[row];
             if (!(r.flags & nk::nk_row_flags::kActive)) continue;
@@ -755,7 +766,8 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         const unsigned long long packed = (static_cast<unsigned long long>(__float_as_uint(magnitude)) << 32u) | ~row;
         atomicMax(reinterpret_cast<unsigned long long*>(metrics + static_cast<uint32_t>(column)), packed);
     };
-    for (uint32_t local = threadIdx.x; local < p.contact_rows; local += blockDim.x) {
+    const uint32_t bound = ContactRowBound(d.contact_row_extent, env, p.contact_rows);
+    for (uint32_t local = threadIdx.x; local < bound; local += blockDim.x) {
         const uint32_t slot = env * p.rows_per_env + local;
         const auto normal = rows[slot];
         if (!(normal.flags & nk::nk_row_flags::kActive) ||
