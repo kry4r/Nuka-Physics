@@ -278,6 +278,8 @@ __global__ void AccumulateStepKernel(ModelView model, DataView data,
             if (p.last != 0u) data.joint_limit_impulse[slot] = data.step_joint_limit_impulse[slot];
         }
     }
+    if (p.last != 0u && (p.flags & kFinalizeLinkWrench) != 0u && i < links)
+        data.link_wrench[i] = {};
     if (p.last != 0u && (p.flags & kAccumulateMpmOutput) != 0u && i < boundaries) {
         data.mpm_boundary_impulse[i] = data.step_mpm_boundary_impulse[i];
         data.mpm_boundary_moment[i] = data.step_mpm_boundary_moment[i];
@@ -299,7 +301,8 @@ Status OpAccumulateStep(const ModelView& model, const DataView& data,
                          const void* params, cudaStream_t stream) {
     const auto* p = static_cast<const AccumulateStepParams*>(params);
     constexpr uint32_t allowed_flags = kAccumulateMpmImpulse | kAccumulateOutputs |
-        kAccumulateLinkWrench | kAccumulateJointLimit | kAccumulateMpmOutput | kFinalizeBodyForces;
+        kAccumulateLinkWrench | kAccumulateJointLimit | kAccumulateMpmOutput | kFinalizeBodyForces |
+        kFinalizeLinkWrench;
     if (p == nullptr || (p->flags & ~allowed_flags) != 0u || p->first > 1u || p->last > 1u ||
         !(p->substep_dt > 0.0f) || !std::isfinite(p->substep_dt) ||
         !(p->inv_outer_dt > 0.0f) || !std::isfinite(p->inv_outer_dt)) return Status::InvalidArgument;
@@ -390,6 +393,7 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.qdot_pseudo[link] = 0.0f;
         data.link_velocity_pseudo[link] = {};
         data.link_contact_wrench[link] = {};
+        data.link_wrench[link] = {};
         if (has_contact_index) data.link_contact_begin[link] = data.link_contact_end[link] = 0u;
     }
     for (uint32_t local = threadIdx.x; local < p.articulations_per_env; local += blockDim.x) {

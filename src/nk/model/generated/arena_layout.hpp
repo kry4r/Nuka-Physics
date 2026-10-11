@@ -510,6 +510,7 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 2, 1, 8, 0},  // link_child_range
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Link, 1, 1, 4, 0},  // link_children
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 2, 1, 8, 0},  // ucontact_row_range
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_wrench
 };
 
 inline constexpr const FieldLayout& LayoutOf(FieldId id) {

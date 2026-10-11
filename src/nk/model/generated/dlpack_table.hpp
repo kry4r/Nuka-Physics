@@ -487,6 +487,7 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::LinkChildRange, DlpackDtype::kU32, 2, false, false},  // link_child_range
     {FieldId::LinkChildren, DlpackDtype::kU32, 1, false, false},  // link_children
     {FieldId::UcontactRowRange, DlpackDtype::kU32, 2, false, true},  // ucontact_row_range
+    {FieldId::LinkWrench, DlpackDtype::kF32, 2, false, false},  // link_wrench
 };
 
 } // namespace nuka::nk

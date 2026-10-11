@@ -106,6 +106,7 @@ struct AbaForwardParams {
     float    gravity[3];   // world-frame acceleration in m/s^2
     uint32_t articulation_count;
     uint32_t total_link_count;
+    uint32_t apply_link_wrench = 0u;
 };
 
 struct IntegrateVelocityParams {
@@ -133,6 +134,7 @@ inline constexpr uint32_t kAccumulateLinkWrench = 1u << 2;
 inline constexpr uint32_t kAccumulateJointLimit = 1u << 3;
 inline constexpr uint32_t kAccumulateMpmOutput = 1u << 4;
 inline constexpr uint32_t kFinalizeBodyForces = 1u << 5;
+inline constexpr uint32_t kFinalizeLinkWrench = 1u << 6;
 
 struct AccumulateStepParams {
     uint32_t env_count = 0u;

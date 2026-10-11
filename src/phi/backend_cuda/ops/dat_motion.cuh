@@ -60,8 +60,7 @@ __device__ math::Transform DatBodyPoseAt(const DatTruncateParams& p,
     uint32_t link = ~0u;
     math::Transform local{};
     if (DatBodyLink(p, model, env, body, &link, &local)) {
-        const uint32_t articulation = env * p.articulations_per_env +
-            model.link_to_articulation[link];
+        const uint32_t articulation = model.link_to_articulation[link];
         const uint32_t offset = model.articulation_link_offset[articulation];
         const uint32_t count = model.articulation_link_count[articulation];
         math::Transform result = local;
@@ -133,8 +132,7 @@ __device__ float DatPointLipschitz(const DatTruncateParams& p, const ModelView& 
     uint32_t link = ~0u;
     math::Transform local{};
     if (DatBodyLink(p, model, env, ref.owner, &link, &local)) {
-        const uint32_t articulation = env * p.articulations_per_env +
-            model.link_to_articulation[link];
+        const uint32_t articulation = model.link_to_articulation[link];
         const uint32_t offset = model.articulation_link_offset[articulation];
         const uint32_t count = model.articulation_link_count[articulation];
         float radius = sqrtf((local.position + math::gpu::RotateByQuatNormalized(
@@ -208,8 +206,7 @@ __device__ void DatMinOwnerBeta(const DatTruncateParams& p, const ModelView& mod
     uint32_t link = ~0u;
     math::Transform local{};
     if (DatBodyLink(p, model, env, ref.owner, &link, &local)) {
-        const uint32_t articulation = env * p.articulations_per_env +
-            model.link_to_articulation[link];
+        const uint32_t articulation = model.link_to_articulation[link];
         atomicMin(data.dat_artic_beta + articulation, __float_as_uint(beta));
         if (data.dat_artic_witness != nullptr && bound < kDatBoundKinds) {
             const unsigned long long key =

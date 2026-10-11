@@ -341,6 +341,9 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (p.stage == EnergyStage::Begin) {
             d.energy_link_start_q[link] = d.q[link];
             d.energy_link_start_qdot[link] = d.qdot[link];
+            bool external = false;
+            for (uint32_t k = 0u; k < 6u; ++k) external |= d.link_wrench[link].v[k] != 0.0f;
+            if (external) atomicOr(coverage, nk::energy_status::kExternalBodyLoad);
         }
         const auto pose = d.energy_link_pose[link];
         const auto world = d.energy_link_velocity[link];

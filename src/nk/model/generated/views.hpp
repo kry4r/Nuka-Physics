@@ -499,6 +499,7 @@ struct DataView {
     uint32_t* contact_row_extent = nullptr;  // per:env arena:scratch owner:data elem:2
     uint32_t* contact_cache_extent = nullptr;  // per:env arena:scratch owner:data elem:2
     uint32_t* ucontact_row_range = nullptr;  // per:contact_slot arena:scratch owner:data elem:2 flags:[readout]
+    ::nuka::nk::Spatial6* link_wrench = nullptr;  // per:link arena:scratch owner:data
 };
 
 } // namespace nuka::phi

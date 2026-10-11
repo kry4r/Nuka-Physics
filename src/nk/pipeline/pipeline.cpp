@@ -125,6 +125,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         outputs = capture;
         outputs.flags = phi::kAccumulateOutputs;
         if (cap.bodies_per_env > 0u) outputs.flags |= phi::kFinalizeBodyForces;
+        if (cap.links_per_env > 0u) outputs.flags |= phi::kFinalizeLinkWrench;
         if (mpm_reaction) outputs.flags |= phi::kAccumulateMpmOutput;
         if (substeps > 1u && (readout_demand & kReadoutContactWrench) != 0u &&
             cap.max_contacts_per_env > 0u)
@@ -310,15 +311,18 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_aba_.gravity[2] = cfg.gravity[2];
         p_aba_.articulation_count = articulation_cnt;
         p_aba_.total_link_count = total_link_count;
+        p_aba_.apply_link_wrench = 1u;
+        p_fk_.articulation_count = articulation_cnt;
+        p_fk_.total_link_count = total_link_count;
 
         if (use_inverse_dynamics) {
             // Current kinematics and force-free acceleration share the same mass response.
             // Controllers remove passive damping from bias compensation.
-            p_fk_.articulation_count = articulation_cnt;
-            p_fk_.total_link_count = total_link_count;
+            p_aba_force_free_ = p_aba_;
+            p_aba_force_free_.apply_link_wrench = 0u;
             add(phi::NkOp::FkWorldPoses, &p_fk_);
             add(phi::NkOp::ApplyDrives, &p_apply_drives_);
-            add(phi::NkOp::AbaForward, &p_aba_);
+            add(phi::NkOp::AbaForward, &p_aba_force_free_);
 
             // Inverse dynamics and contacts consume the same physical M^-1.
             p_crba_m_.dt = cfg.dt;
@@ -341,6 +345,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             add(phi::NkOp::ApplyDynamicsDrives, &p_apply_dynamics_);
             add(phi::NkOp::AbaForward, &p_aba_);
         } else {
+            add(phi::NkOp::FkWorldPoses, &p_fk_);
             add(phi::NkOp::ApplyDrives, &p_apply_drives_);
             add(phi::NkOp::AbaForward, &p_aba_);
         }
@@ -551,12 +556,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     }
 
     mpm_coupling_provider_.PreCouple(coupling_ctx);
-
-    if (has_articulation && !use_inverse_dynamics) {
-        p_fk_.articulation_count = articulation_cnt;
-        p_fk_.total_link_count = total_link_count;
-        add(phi::NkOp::FkWorldPoses, &p_fk_);
-    }
 
     if (has_bodies) {
         p_sync_body_pose_.family = family;

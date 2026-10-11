@@ -294,7 +294,26 @@ __device__ LinkSpatialTransform JointTransform(const ArticulationDeviceState& st
     return MakeMotionTransform(Mat3Transpose(rotation), translation);
 }
 
-__global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state, ArticulationTreeView tree) {
+// A world wrench through the link COM contributes [R^T torque + COM x R^T force; R^T force].
+__device__ void SubtractLinkWrench(const ArticulationDeviceState& state, uint32_t link,
+                                   const nk::Spatial6* wrench, float bias_force[6]) {
+    const nk::Spatial6 w = wrench[link];
+    if (w.v[0] == 0.0f && w.v[1] == 0.0f && w.v[2] == 0.0f && w.v[3] == 0.0f &&
+        w.v[4] == 0.0f && w.v[5] == 0.0f) return;
+    const math::Quat rotation = state.link_pose[link].rotation;
+    const math::Vec3 force = RotateByQuatInverse(rotation, MakeVec3(w.v[0], w.v[1], w.v[2]));
+    const math::Vec3 torque = RotateByQuatInverse(rotation, MakeVec3(w.v[3], w.v[4], w.v[5]));
+    const math::Vec3 moment = torque + state.link_inertial_frame[link].position.Cross(force);
+    bias_force[0] -= moment.x;
+    bias_force[1] -= moment.y;
+    bias_force[2] -= moment.z;
+    bias_force[3] -= force.x;
+    bias_force[4] -= force.y;
+    bias_force[5] -= force.z;
+}
+
+__global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
+    const nk::Spatial6* __restrict__ link_wrench, uint32_t apply_link_wrench, ArticulationTreeView tree) {
     const uint32_t articulation = blockIdx.x;
     if (articulation >= state.articulation_count) {
         return;
@@ -325,6 +344,7 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state, Articula
                 Mat66MulVec6(state.link_inertia[link].I, velocity, inertia_velocity);
                 float bias_force[6];
                 ForceCross(velocity, inertia_velocity, bias_force);
+                if (apply_link_wrench != 0u) SubtractLinkWrench(state, link, link_wrench, bias_force);
                 ArrayToForce(bias_force, &state.link_bias_force[link]);
                 state.joint_diagonal[link] = 0.0f;
                 state.joint_force[link] = 0.0f;
@@ -366,6 +386,7 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state, Articula
             Mat66MulVec6(state.link_inertia[link].I, velocity, inertia_velocity);
             float bias_force[6];
             ForceCross(velocity, inertia_velocity, bias_force);
+            if (apply_link_wrench != 0u) SubtractLinkWrench(state, link, link_wrench, bias_force);
             ArrayToForce(bias_force, &state.link_bias_force[link]);
             state.joint_diagonal[link] = 0.0f;
             state.joint_force[link] = 0.0f;
@@ -542,12 +563,13 @@ __global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
 }
 
 __global__ void IntegrateVelocityArticulationKernel(ArticulationDeviceState state,
-                                                    float dt, math::Vec3 gravity) {
+    float dt, nk::Spatial6* link_wrench, uint32_t clear_forces, math::Vec3 gravity) {
     const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
     if (link >= state.total_link_count) {
         return;
     }
     state.qdot[link] += state.qddot[link] * dt;
+    if (clear_forces != 0u) link_wrench[link] = {};
     if (state.parent_link[link] == kInvalidLink &&
         state.joint_type[link] == ArticulationJointType::FloatingBase) {
         const uint32_t articulation = state.link_to_articulation[link];
@@ -1440,7 +1462,8 @@ Status OpAbaForward(const ModelView& model, const DataView& data,
     const math::Vec3 gravity{p->gravity[0], p->gravity[1], p->gravity[2]};
     dim3 grid(p->articulation_count);
     dim3 block(kAbaBlockSize);
-    LaunchCuda(AbaPass1KinematicsKernel, grid, block, 0u, stream, state, MakeArticulationTreeView(model));
+    LaunchCuda(AbaPass1KinematicsKernel, grid, block, 0u, stream, state,
+               data.link_wrench, p->apply_link_wrench, MakeArticulationTreeView(model));
     LaunchCuda(AbaPass2ArticulatedInertiaKernel, grid, block, 0u, stream, state);
     LaunchCuda(AbaPass3AccelerationKernel, grid, block, 0u, stream, state, gravity);
     return LaunchOk(stream);
@@ -1463,7 +1486,8 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
             (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
         // Joint and floating-base velocities occupy disjoint state.
         LaunchCuda(IntegrateVelocityArticulationKernel, dim3(blocks),
-                   dim3(kAbaBlockSize), 0u, stream, state, p->dt, gravity);
+                   dim3(kAbaBlockSize), 0u, stream, state, p->dt,
+                   data.link_wrench, p->clear_body_forces, gravity);
     }
     // Free-body inertia and velocity are updated before the shared contact solve.
     if (p->total_body_count > 0u) {

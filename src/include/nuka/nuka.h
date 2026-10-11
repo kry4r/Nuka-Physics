@@ -731,7 +731,10 @@ typedef enum nuka_state_field_t {
     // READ: per VBD vertex, twenty float32 columns from the last solve call, environment-major.
     NUKA_FIELD_VBD_SOLVE_AUDIT = 100,
     // READ: per contact slot, the absolute row offset and normal point count.
-    NUKA_FIELD_UCONTACT_ROW_RANGE = 103
+    NUKA_FIELD_UCONTACT_ROW_RANGE = 103,
+    // WRITE: per link, world force [N] through its COM followed by world torque [N*m], env-major.
+    // Dynamics consume it over one outer step, then clear it with BODY_FORCE.
+    NUKA_FIELD_LINK_WRENCH = 105
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {

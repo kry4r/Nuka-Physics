@@ -121,6 +121,7 @@ private:
     phi::OgcDetectParams              p_ogc_detect_{};
     phi::DatTruncateParams             p_dat_truncate_{};
     phi::AbaForwardParams             p_aba_{};
+    phi::AbaForwardParams             p_aba_force_free_{};
     phi::IntegrateVelocityParams      p_int_vel_{};
     phi::SnapshotStepVelocityParams   p_step_velocity_{};
     phi::FkWorldPosesParams           p_fk_{};

@@ -41,8 +41,7 @@ __device__ uint32_t DatCommonFrame(const Params& p, const ModelView& model, uint
     if (p.articulations_per_env == 0u || !DatBodyLink(p, model, env, body_a, &a, &local) ||
         !DatBodyLink(p, model, env, body_b, &b, &local) ||
         model.link_to_articulation[a] != model.link_to_articulation[b]) return ~0u;
-    const uint32_t articulation = env * p.articulations_per_env +
-        model.link_to_articulation[a];
+    const uint32_t articulation = model.link_to_articulation[a];
     const uint32_t offset = model.articulation_link_offset[articulation];
     const uint32_t count = model.articulation_link_count[articulation];
     uint32_t depth_a = 0u, depth_b = 0u;
@@ -69,8 +68,7 @@ __device__ float DatChainSpeed(const Params& p, const ModelView& model, const Da
     uint32_t link = ~0u;
     math::Transform local{};
     if (!DatBodyLink(p, model, env, body, &link, &local)) return INFINITY;
-    const uint32_t articulation = env * p.articulations_per_env +
-        model.link_to_articulation[link];
+    const uint32_t articulation = model.link_to_articulation[link];
     const uint32_t offset = model.articulation_link_offset[articulation];
     const uint32_t count = model.articulation_link_count[articulation];
     float radius = sqrtf(local.position.LengthSq()) + model.mesh_vertex_reach[body];

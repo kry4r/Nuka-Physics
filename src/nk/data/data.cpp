@@ -106,6 +106,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::BodyAngularVelocity: v.body_angular_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyForce:           v.body_force = static_cast<math::Vec3*>(p); break;
         case FieldId::BodyTorque:          v.body_torque = static_cast<math::Vec3*>(p); break;
+        case FieldId::LinkWrench:          v.link_wrench = static_cast<Spatial6*>(p); break;
         case FieldId::BodyGyroResidual:    v.body_gyro_residual = static_cast<float*>(p); break;
         case FieldId::BodyGyroIterations:  v.body_gyro_iterations = static_cast<uint32_t*>(p); break;
         case FieldId::BodyGyroStatus:      v.body_gyro_status = static_cast<uint32_t*>(p); break;
