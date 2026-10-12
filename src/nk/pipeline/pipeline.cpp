@@ -56,7 +56,8 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     const auto& cap = model.capacities;
     const bool articulated = cap.dofs_per_env > 0u || cap.links_per_env > 0u;
     const bool tile = phi::BlockDescentTileRoute(cap.particles_per_env * cap.env_count,
-        cap.mpm_grid_nodes_per_env * cap.env_count, articulated ? cap.articulations_per_env * cap.env_count : 0u,
+        cap.mpm_grid_nodes_per_env * cap.env_count,
+        (articulated ? cap.articulations_per_env : 0u) * cap.env_count + cap.bodies_per_env * cap.env_count,
         cap.dofs_per_env);
     // Scenes the warp tiles solve take block descent unless NUKA_BLOCK_DESCENT names the route.
     const char* block_descent = std::getenv("NUKA_BLOCK_DESCENT");
@@ -215,7 +216,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     }
     // Split-impulse position passes run in the row solve, or in block descent's warp tiles.
     const bool split_positions = !use_block_descent_ || phi::BlockDescentTileRoute(
-        cap.particles_per_env * env_count, cap.mpm_grid_nodes_per_env * env_count, articulation_cnt, max_dof);
+        cap.particles_per_env * env_count, cap.mpm_grid_nodes_per_env * env_count,
+        articulation_cnt + cap.bodies_per_env * env_count, max_dof);
     const bool use_inverse_dynamics =
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);

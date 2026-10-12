@@ -171,7 +171,8 @@ constexpr uint32_t kTileSlot = 0u, kTileStride = 1u, kTileAxes = 2u, kTileOwner 
                    kTileDualScale = 30u, kTileResidualScale = 31u, kTileFields = 32u;
 
 bool DenseTileRoute(const BlockDescentSolveParams& p) {
-    return BlockDescentTileRoute(p.total_particle_count, p.total_grid_count, p.articulation_count, p.max_dof);
+    return BlockDescentTileRoute(p.total_particle_count, p.total_grid_count,
+                                 p.articulation_count + p.total_body_count, p.max_dof);
 }
 
 // Head rows an environment can hold in whole warps: a contact head takes two tangent rows, every other
