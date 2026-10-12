@@ -203,6 +203,13 @@ Scene BuildModel(const Args& args, const render::MeshGeometry& mesh) {
     model.mesh_triangles = mesh.indices;
     model.mesh_bvh_nodes = std::move(surface.nodes);
     model.mesh_surface_info.push_back(surface.info);
+    auto edges = nuka::import::cooker::CookMeshEdges(mesh.positions.data(), mesh.VertexCount(),
+        mesh.indices.data(), static_cast<uint32_t>(mesh.indices.size() / 3u));
+    model.mesh_edges = std::move(edges.edges);
+    model.mesh_edge_nodes = std::move(edges.nodes);
+    model.mesh_triangle_edges = std::move(edges.triangle_edges);
+    model.mesh_triangle_vertex_owner = std::move(edges.triangle_vertex_owner);
+    model.mesh_edge_info.push_back(edges.info);
     float radius = 0.0f;
     for (uint32_t i = 0u; i < mesh.VertexCount(); ++i) {
         const auto p = Vertex(mesh, i);
@@ -230,12 +237,15 @@ Scene BuildModel(const Args& args, const render::MeshGeometry& mesh) {
     shape.params[0] = kPlateHalf.x; shape.params[1] = kPlateHalf.y; shape.params[2] = kPlateHalf.z;
     model.shape_table_rows.push_back(shape);
     model.mesh_surface_info.resize(model.body_init.size());
+    model.mesh_edge_info.resize(model.body_init.size());
     model.samp_ranges.resize(model.body_init.size() * 2u);
     cap.bodies_per_env = static_cast<uint32_t>(model.body_init.size());
     cap.max_bodies_total = cap.bodies_per_env;
     cap.max_hull_verts = mesh.VertexCount();
     cap.max_mesh_triangles = static_cast<uint32_t>(mesh.indices.size() / 3u);
     cap.max_mesh_bvh_nodes = static_cast<uint32_t>(model.mesh_bvh_nodes.size());
+    cap.max_mesh_edges = static_cast<uint32_t>(model.mesh_edges.size());
+    cap.max_mesh_edge_nodes = static_cast<uint32_t>(model.mesh_edge_nodes.size());
     cap.max_samp_points = mesh.VertexCount();
     cap.max_contacts_per_env = 16u;
     cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
