@@ -222,18 +222,12 @@ TEST(SceneIr, AddMediaReturnsValidIdAndRoundTripsFields) {
     MediaRecord rec;
     rec.name   = "pool";
     rec.kind   = MediaRecord::Kind::Fluid;
-    rec.method = MediaRecord::Method::Pbf;
+    rec.method = MediaRecord::Method::MlsMpm;
     rec.fluid_box.min     = {-0.5f, -0.5f, 0.0f};
     rec.fluid_box.max     = {0.5f, 0.5f, 0.4f};
     rec.fluid_box.spacing = 0.02f;
-    rec.pbf.rest_density  = 1000.0f;
-    rec.pbf.support_scale = 2.0f;
-    rec.pbf.iters         = 6u;
-    rec.pbf.walls_enabled   = true;
-    rec.pbf.walls_min       = {-0.5f, -0.5f, 0.0f};
-    rec.pbf.walls_max       = {0.5f, 0.5f, 1.0f};
-    rec.pbf.floor_z         = 0.0f;
-    rec.pbf.boundary_layers = 2u;
+    rec.mpm.density = 1000.0f;
+    rec.mpm.dx      = 0.04f;
     rec.render_skin.normal_offset = 0.004f;
     rec.render_skin.smooth_iters  = 3u;
     rec.baked = ParseAssetRef("pool.nka#TETM/0");
@@ -249,13 +243,11 @@ TEST(SceneIr, AddMediaReturnsValidIdAndRoundTripsFields) {
     EXPECT_EQ(back.id, id);                      // AddMedia stamps the dense id
     EXPECT_EQ(back.name, "pool");
     EXPECT_EQ(back.kind, MediaRecord::Kind::Fluid);
-    EXPECT_EQ(back.method, MediaRecord::Method::Pbf);
+    EXPECT_EQ(back.method, MediaRecord::Method::MlsMpm);
     EXPECT_FLOAT_EQ(back.fluid_box.spacing, 0.02f);
     EXPECT_FLOAT_EQ(back.fluid_box.max.z, 0.4f);
-    EXPECT_FLOAT_EQ(back.pbf.rest_density, 1000.0f);
-    EXPECT_EQ(back.pbf.iters, 6u);
-    EXPECT_TRUE(back.pbf.walls_enabled);
-    EXPECT_EQ(back.pbf.boundary_layers, 2u);
+    EXPECT_FLOAT_EQ(back.mpm.density, 1000.0f);
+    EXPECT_FLOAT_EQ(back.mpm.dx, 0.04f);
     EXPECT_FLOAT_EQ(back.render_skin.normal_offset, 0.004f);
     EXPECT_EQ(back.render_skin.smooth_iters, 3u);
     EXPECT_EQ(back.baked, ParseAssetRef("pool.nka#TETM/0"));
@@ -270,10 +262,9 @@ TEST(SceneIr, ProjectMediaClothWritesSystemKindAndSoftBody) {
     MediaRecord rec;
     rec.name   = "drape";
     rec.kind   = MediaRecord::Kind::Cloth;
-    rec.method = MediaRecord::Method::Xpbd;
+    rec.method = MediaRecord::Method::Vbd;
     rec.cloth_grid.nx = 8u;
     rec.cloth_grid.ny = 8u;
-    rec.xpbd.distance_alpha = 1.0e-5f;
     const auto id = scene.AddMedia(rec);
 
     const EntityId media = scene.EntityOfMedia(id);
@@ -287,8 +278,7 @@ TEST(SceneIr, ProjectMediaClothWritesSystemKindAndSoftBody) {
 
     const auto* sb = scene.Ecs().Get<SoftBodyComponent>(media);
     ASSERT_NE(sb, nullptr);
-    EXPECT_EQ(sb->sim_method, SoftBodyComponent::SimMethod::Xpbd);
-    EXPECT_FLOAT_EQ(sb->xpbd_compliance, 1.0e-5f);
+    EXPECT_EQ(sb->sim_method, SoftBodyComponent::SimMethod::Vbd);
     EXPECT_EQ(scene.Ecs().Get<FluidComponent>(media), nullptr);
 }
 
@@ -322,9 +312,9 @@ TEST(SceneIr, ProjectMediaFluidWritesFluidComponent) {
     MediaRecord rec;
     rec.name   = "water";
     rec.kind   = MediaRecord::Kind::Fluid;
-    rec.method = MediaRecord::Method::Pbf;
+    rec.method = MediaRecord::Method::MlsMpm;
     rec.fluid_box.spacing = 0.025f;
-    rec.pbf.rest_density  = 998.0f;
+    rec.mpm.density = 998.0f;
     const auto id = scene.AddMedia(rec);
 
     const EntityId media = scene.EntityOfMedia(id);
@@ -345,7 +335,7 @@ TEST(SceneIr, CopyCtorPreservesMediaAndReprojects) {
     MediaRecord rec;
     rec.name   = "drape";
     rec.kind   = MediaRecord::Kind::Cloth;
-    rec.method = MediaRecord::Method::Xpbd;
+    rec.method = MediaRecord::Method::Vbd;
     const auto id = scene.AddMedia(rec);
 
     SceneIR copy(scene);

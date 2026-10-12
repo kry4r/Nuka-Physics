@@ -692,7 +692,7 @@ $$\text{d/dJ 通道:}\quad \mathbf{d}\mathbf{A} = \mathbf{d}\mathbf{J}\,\mathbf{
 - **Overlay**：`Load(base, overlay)` 应用 `{"overrides": {"<derived/path>": {<部分组件对象>}}}` 补丁——只改命中节点记录（位姿、质量、材质字段…），其余不动（RL 参数扫描的轻量入口）；
 - `imports` 在 Load 期按扩展名解析（MJCF/USD/URDF）再 `Compose`（attach_at 前缀）。
 
-示例（`examples/scenes/soft_ball.nks`）：`physics_materials`（摩擦）+ `render_materials`（PBR 参数）+ `tree`（前序节点）+ `sensors/exclude_pairs/contact_pairs` + `media`（软体：`kind=soft_tet, method=xpbd`，`tet_sphere` 球网格 + `xpbd` 参数（particle_mass/distance_alpha/volume_alpha/iters）+ `render_skin` 皮肤）。`bdx_oneshot*.nks` 的 `media` 含 `cloth`（§2.6 参数）、`granular`（mlsmpm：`fluid_box` 填充 + `mpm` 材料 + `mpm_fills` 多区填充）、`cable`（`cable_line` 线段 + bend）。
+示例（`examples/scenes/bdx_oneshot.nks`）：`physics_materials`（摩擦）+ `render_materials`（PBR 参数）+ `tree`（前序节点）+ `sensors/exclude_pairs/contact_pairs` + `media`；`bdx_oneshot*.nks` 的 `media` 含 `cloth`（§2.6 参数）、`granular`（mlsmpm：`fluid_box` 填充 + `mpm` 材料 + `mpm_fills` 多区填充）、`cable`（`cable_line` 线段 + bend）。
 
 ### 6.3 导入与合成
 

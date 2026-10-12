@@ -127,35 +127,9 @@ enum class FieldId : uint16_t {
     ParticleVel,  // particle_vel (per:particle arena:persistent owner:data flags:[diff])
     ParticleInvMass,  // particle_inv_mass (per:particle arena:persistent owner:data flags:[param])
     ParticleVPre,  // particle_v_pre (per:particle arena:scratch owner:data)
-    DistParticleA,  // dist_particle_a (per:dist_con arena:persistent owner:model)
-    DistParticleB,  // dist_particle_b (per:dist_con arena:persistent owner:model)
-    DistRestLength,  // dist_rest_length (per:dist_con arena:persistent owner:model)
-    DistCompliance,  // dist_compliance (per:dist_con arena:persistent owner:model flags:[param])
-    DistLambda,  // dist_lambda (per:dist_con arena:persistent owner:data)
-    VolParticles,  // vol_particles (per:vol_con arena:persistent owner:model elem:4)
-    VolRestTimes6,  // vol_rest_times6 (per:vol_con arena:persistent owner:model)
-    VolCompliance,  // vol_compliance (per:vol_con arena:persistent owner:model flags:[param])
-    VolLambda,  // vol_lambda (per:vol_con arena:persistent owner:data)
-    SmClusterOffset,  // sm_cluster_offset (per:shape_match_slot arena:persistent owner:model)
-    SmClusterSize,  // sm_cluster_size (per:shape_match_slot arena:persistent owner:model)
-    SmStiffness,  // sm_stiffness (per:shape_match_slot arena:persistent owner:model flags:[param])
-    SmRestCentroid,  // sm_rest_centroid (per:shape_match_slot arena:persistent owner:model)
-    SmParticles,  // sm_particles (per:shape_match_member arena:persistent owner:model)
-    SmRestQ,  // sm_rest_q (per:shape_match_member arena:persistent owner:model)
-    SmMass,  // sm_mass (per:shape_match_member arena:persistent owner:model)
     AeroTriVerts,  // aero_tri_verts (per:aero_tri arena:persistent owner:model elem:3)
     AeroTriArea,  // aero_tri_area (per:aero_tri arena:persistent owner:model)
     PbfPredictedPos,  // pbf_predicted_pos (per:particle arena:scratch owner:data)
-    PbfPositionDelta,  // pbf_position_delta (per:particle arena:scratch owner:data)
-    PbfDensity,  // pbf_density (per:particle arena:scratch owner:data)
-    PbfLambda,  // pbf_lambda (per:particle arena:scratch owner:data)
-    GridCellKey,  // grid_cell_key (per:particle arena:scratch owner:data)
-    GridParticleIdx,  // grid_particle_idx (per:particle arena:scratch owner:data)
-    GridCellStart,  // grid_cell_start (per:scalar arena:scratch owner:data count:max_grid_cells*env_count)
-    GridCellEnd,  // grid_cell_end (per:scalar arena:scratch owner:data count:max_grid_cells*env_count)
-    GridNeighborOffset,  // grid_neighbor_offset (per:particle arena:scratch owner:data)
-    GridNeighborCount,  // grid_neighbor_count (per:particle arena:scratch owner:data flags:[readout])
-    GridNeighborIdx,  // grid_neighbor_idx (per:scalar arena:scratch owner:data count:neighbor_pool_capacity*env_count)
     RngState,  // rng_state (per:env arena:persistent owner:data flags:[param])
     EnvStatus,  // env_status (per:env arena:scratch owner:data flags:[readout])
     ObsBuffer,  // obs_buffer (per:scalar arena:scratch owner:data count:obs_width*env_count flags:[readout])
@@ -192,10 +166,6 @@ enum class FieldId : uint16_t {
     SnapshotParticlePos,  // snapshot_particle_pos (per:particle arena:persistent owner:data)
     SnapshotParticlePrevPos,  // snapshot_particle_prev_pos (per:particle arena:persistent owner:data)
     SnapshotParticleVel,  // snapshot_particle_vel (per:particle arena:persistent owner:data)
-    DistColorSegments,  // dist_color_segments (per:scalar arena:persistent owner:model count:xpbd_dist_colors*2)
-    VolColorSegments,  // vol_color_segments (per:scalar arena:persistent owner:model count:xpbd_vol_colors*2)
-    SmColorSegments,  // sm_color_segments (per:scalar arena:persistent owner:model count:xpbd_sm_colors*2)
-    GridSortScratch,  // grid_sort_scratch (per:scalar arena:scratch owner:data count:grid_sort_scratch_bytes)
     GridMass,  // grid_mass (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     GridMomentum,  // grid_momentum (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     GridVelocity,  // grid_velocity (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
@@ -282,8 +252,6 @@ enum class FieldId : uint16_t {
     BodyGyroResidual,  // body_gyro_residual (per:body arena:scratch owner:data flags:[readout])
     BodyGyroIterations,  // body_gyro_iterations (per:body arena:scratch owner:data flags:[readout])
     BodyGyroStatus,  // body_gyro_status (per:body arena:scratch owner:data flags:[readout])
-    GridNeighborAttempted,  // grid_neighbor_attempted (per:particle arena:scratch owner:data flags:[readout])
-    GridNeighborScanOffset,  // grid_neighbor_scan_offset (per:particle arena:scratch owner:data)
     LbvhSortScratch,  // lbvh_sort_scratch (per:scalar arena:scratch owner:data count:lbvh_sort_scratch_bytes)
     ContactCacheScratch,  // contact_cache_scratch (per:scalar arena:scratch owner:data count:contact_cache_scratch_bytes)
     ActiveRowIds,  // active_row_ids (per:row_slot arena:scratch owner:data)
@@ -293,9 +261,6 @@ enum class FieldId : uint16_t {
     LinkContactBegin,  // link_contact_begin (per:link arena:scratch owner:data)
     LinkContactEnd,  // link_contact_end (per:link arena:scratch owner:data)
     ContactIndexScratch,  // contact_index_scratch (per:scalar arena:scratch owner:data count:contact_index_scratch_bytes)
-    ParticleTopologyOffsets,  // particle_topology_offsets (per:scalar arena:persistent owner:model count:particle_topology_offsets)
-    ParticleTopologyElements,  // particle_topology_elements (per:scalar arena:persistent owner:model count:particle_topology_incidence_count)
-    ParticleContactRestPos,  // particle_contact_rest_pos (per:scalar arena:persistent owner:model count:particle_contact_rest_positions)
     MeshSurfaceInfo,  // mesh_surface_info (per:scalar arena:persistent owner:model count:mesh_surface_info_count)
     MeshTriangles,  // mesh_triangles (per:scalar arena:persistent owner:model count:max_mesh_triangles*3)
     MeshBvhNodes,  // mesh_bvh_nodes (per:scalar arena:persistent owner:model count:max_mesh_bvh_nodes)
@@ -595,35 +560,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_vel",
     "particle_inv_mass",
     "particle_v_pre",
-    "dist_particle_a",
-    "dist_particle_b",
-    "dist_rest_length",
-    "dist_compliance",
-    "dist_lambda",
-    "vol_particles",
-    "vol_rest_times6",
-    "vol_compliance",
-    "vol_lambda",
-    "sm_cluster_offset",
-    "sm_cluster_size",
-    "sm_stiffness",
-    "sm_rest_centroid",
-    "sm_particles",
-    "sm_rest_q",
-    "sm_mass",
     "aero_tri_verts",
     "aero_tri_area",
     "pbf_predicted_pos",
-    "pbf_position_delta",
-    "pbf_density",
-    "pbf_lambda",
-    "grid_cell_key",
-    "grid_particle_idx",
-    "grid_cell_start",
-    "grid_cell_end",
-    "grid_neighbor_offset",
-    "grid_neighbor_count",
-    "grid_neighbor_idx",
     "rng_state",
     "env_status",
     "obs_buffer",
@@ -660,10 +599,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "snapshot_particle_pos",
     "snapshot_particle_prev_pos",
     "snapshot_particle_vel",
-    "dist_color_segments",
-    "vol_color_segments",
-    "sm_color_segments",
-    "grid_sort_scratch",
     "grid_mass",
     "grid_momentum",
     "grid_velocity",
@@ -750,8 +685,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "body_gyro_residual",
     "body_gyro_iterations",
     "body_gyro_status",
-    "grid_neighbor_attempted",
-    "grid_neighbor_scan_offset",
     "lbvh_sort_scratch",
     "contact_cache_scratch",
     "active_row_ids",
@@ -761,9 +694,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "link_contact_begin",
     "link_contact_end",
     "contact_index_scratch",
-    "particle_topology_offsets",
-    "particle_topology_elements",
-    "particle_contact_rest_pos",
     "mesh_surface_info",
     "mesh_triangles",
     "mesh_bvh_nodes",

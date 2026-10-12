@@ -425,16 +425,9 @@ __global__ void NarrowphaseBodyParticleKernel(
     } else if (!(radius > 0.0f)) {
         return;  // uniform per-warp.
     }
-    // The fluid slice [n_soft, P) under PBF/SoftFluid reads the predicted position
-    // (the gravity-integrated pos the density solve uses), consistent with the
-    // particle-particle grid; the soft slice + pure-Xpbd/Coupled keep particle_pos
-    // (their predict already wrote it).
-    const bool fluid_predicted = !vertex_block && pp.fluid_pos_source != 0u &&
-                                 pi >= pp.n_soft_particles &&
-                                 pbf_predicted_pos != nullptr;
-    const Vec3 center =
-        fluid_predicted ? pbf_predicted_pos[global_particle]
-                        : particle_pos[global_particle];
+    // Row-coupled particles detect at the shared projected position.
+    const Vec3 center = !vertex_block && pbf_predicted_pos != nullptr
+        ? pbf_predicted_pos[global_particle] : particle_pos[global_particle];
     const collision::AABB query = ParticleAabb(center, vertex_block
         ? ::nuka::collision::kDatQueryRadiusMax : radius + pp.contact_margin);
 

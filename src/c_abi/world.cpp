@@ -159,26 +159,6 @@ nuka::scene::MediaRecord ClothMediaFromDesc(const nuka_coupled_particles_desc_t&
     return m;
 }
 
-// Translate the compact coupled fluid slots into a MediaRecord (Fluid, PBF by
-// default / MLS-MPM when selected). support_scale 1.5 reproduces the legacy
-// support_radius = 1.5*spacing. Geometry-only when the box extent is absent.
-nuka::scene::MediaRecord FluidMediaFromDesc(const nuka_coupled_particles_desc_t& p) {
-    nuka::scene::MediaRecord m;
-    m.kind = nuka::scene::MediaRecord::Kind::Fluid;
-    m.method = (p.soft_sim_method == 1u) ? nuka::scene::MediaRecord::Method::MlsMpm
-                                         : nuka::scene::MediaRecord::Method::Pbf;
-    m.fluid_box.min = {p.fluid_min_x, p.fluid_min_y, p.fluid_min_z};
-    m.fluid_box.max = {p.fluid_max_x, p.fluid_max_y, p.fluid_max_z};
-    m.fluid_box.spacing = p.fluid_spacing;
-    m.pbf.rest_density = p.fluid_rest_density;
-    m.pbf.support_scale = 1.5f;  // SPH support over the lattice spacing.
-    m.pbf.iters = static_cast<uint16_t>(p.fluid_iters);
-    m.pbf.friction = p.fluid_friction;
-    m.pbf.floor_z = p.fluid_floor_z;
-    m.pbf.clamp_overdensity = true;
-    return m;
-}
-
 // The cooked products a world-create entry assembles before building the live world:
 // the robot Model, the composed scene, the baked terrain grid, the resolved gravity,
 // the control mode + the validated device. Shared by the scene-only and coupled
@@ -573,27 +553,15 @@ nuka_result_t nuka_world_create_coupled_from_scene(
         const bool has_cloth = particles->cloth_nx >= 2u &&
                                particles->cloth_ny >= 2u &&
                                particles->cloth_spacing > 0.0f;
-        const bool has_fluid =
-            particles->fluid_spacing > 0.0f &&
-            particles->fluid_max_x > particles->fluid_min_x &&
-            particles->fluid_max_y > particles->fluid_min_y &&
-            particles->fluid_max_z > particles->fluid_min_z;
-        if (!has_cloth && !has_fluid) {
+        if (!has_cloth) {
             // A particle-free world must use nuka_world_create_from_scene.
             return NUKA_RESULT_INVALID_ARG;
         }
-        nuka::scene::MediaRecord cloth_media;
-        if (has_cloth) {
-            cloth_media = nuka::c_abi::ClothMediaFromDesc(*particles);
-            prepared.scene.AddMedia(cloth_media);
-        }
-        if (has_fluid) {
-            prepared.scene.AddMedia(nuka::c_abi::FluidMediaFromDesc(*particles));
-        }
+        nuka::scene::MediaRecord cloth_media = nuka::c_abi::ClothMediaFromDesc(*particles);
+        prepared.scene.AddMedia(cloth_media);
 
-        // Cook the media onto the robot Model via the ONE general media dispatch (the
-        // [soft|fluid] layout, validated against the legal kind x method set: cloth
-        // XPBD + fluid PBF; soft_sim_method == mlsmpm throws LOUDLY here). The disjoint
+        // Cook the media onto the robot Model via the ONE general media dispatch
+        // (cloth VBD; soft_sim_method == mlsmpm throws LOUDLY here). The disjoint
         // body<->particle slot reserve sits above the rigid budget the prepare step
         // set; the contact diameter rides the descriptor radius.
         nuka::scene::cook::CookSceneMedia(prepared.model, desc->env_count,

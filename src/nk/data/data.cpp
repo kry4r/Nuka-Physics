@@ -331,8 +331,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::IslandQuads:         v.island_quads = static_cast<uint32_t*>(p); break;
         case FieldId::IslandCount:         v.island_count = static_cast<uint32_t*>(p); break;
         case FieldId::IslandCubTemp:       v.island_cub_temp = static_cast<uint8_t*>(p); break;
-        case FieldId::DistLambda:          v.dist_lambda = static_cast<float*>(p); break;
-        case FieldId::VolLambda:           v.vol_lambda = static_cast<float*>(p); break;
         case FieldId::PbfPredictedPos:     v.pbf_predicted_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleProjectionDelta: v.particle_projection_delta = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleResponse: v.particle_response = static_cast<math::SymmetricMat3*>(p); break;
@@ -346,21 +344,10 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ParticleRowImpulse: v.particle_row_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdHistoryVel: v.vbd_history_vel = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdHistoryReady: v.vbd_history_ready = static_cast<uint32_t*>(p); break;
-        case FieldId::PbfPositionDelta:    v.pbf_position_delta = static_cast<math::Vec3*>(p); break;
-        case FieldId::PbfDensity:          v.pbf_density = static_cast<float*>(p); break;
-        case FieldId::PbfLambda:           v.pbf_lambda = static_cast<float*>(p); break;
         // M6 coupled v_pre scratch + the M5 particle uniform-grid CSR fields (the
         // grid build op's neighbor structure — bound here so the ported thrust /
         // CSR kernels see live arena pointers instead of null).
         case FieldId::ParticleVPre:        v.particle_v_pre = static_cast<math::Vec3*>(p); break;
-        case FieldId::GridCellKey:         v.grid_cell_key = static_cast<uint32_t*>(p); break;
-        case FieldId::GridParticleIdx:     v.grid_particle_idx = static_cast<uint32_t*>(p); break;
-        case FieldId::GridCellStart:       v.grid_cell_start = static_cast<uint32_t*>(p); break;
-        case FieldId::GridCellEnd:         v.grid_cell_end = static_cast<uint32_t*>(p); break;
-        case FieldId::GridNeighborOffset:  v.grid_neighbor_offset = static_cast<uint32_t*>(p); break;
-        case FieldId::GridNeighborCount:   v.grid_neighbor_count = static_cast<uint32_t*>(p); break;
-        case FieldId::GridNeighborIdx:     v.grid_neighbor_idx = static_cast<uint32_t*>(p); break;
-        case FieldId::GridNeighborAttempted: v.grid_neighbor_attempted = static_cast<uint32_t*>(p); break;
         case FieldId::LbvhSortScratch: v.lbvh_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::ContactCacheScratch: v.contact_cache_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::ActiveRowIds: v.active_row_ids = static_cast<uint32_t*>(p); break;
@@ -379,8 +366,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactSolveMetrics: v.contact_solve_metrics = static_cast<uint64_t*>(p); break;
         case FieldId::ContactSolveWorstTerms: v.contact_solve_worst_terms = static_cast<float*>(p); break;
         case FieldId::ContactSolveCounts: v.contact_solve_counts = static_cast<uint32_t*>(p); break;
-        case FieldId::GridNeighborScanOffset: v.grid_neighbor_scan_offset = static_cast<uint64_t*>(p); break;
-        case FieldId::GridSortScratch:     v.grid_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSortScratch:     v.pair_sort_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::RngState:            v.rng_state = static_cast<uint64_t*>(p); break;
         case FieldId::EnvStatus:           v.env_status = static_cast<uint32_t*>(p); break;

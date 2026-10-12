@@ -67,8 +67,7 @@ DTYPE_INFO: dict[str, dict[str, Any]] = {
 VALID_PER = {
     "env", "dof", "link", "body", "contact_slot", "row_slot", "slot_dof",
     "row_dof",
-    "particle", "dist_con", "vol_con", "shape_match_slot",
-    "shape_match_member",
+    "particle",
     "env_dof2", "scalar",
     # Multi-articulation co-residence (K Go2 in one env): per-articulation count
     # unit (= articulations_per_env) and per-articulation M-tile unit
@@ -267,7 +266,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "// concrete element count from the Model capacities x env_count.",
         "enum class FieldPer : uint8_t {",
         "    Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,",
-        "    DistCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,",
+        "    EnvDof2,",
         "    Scalar,",
         "    // Multi-articulation co-residence: per-articulation (= "
         "articulations_per_env)",
@@ -302,8 +301,6 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "contact_slot": "ContactSlot", "row_slot": "RowSlot", "slot_dof": "SlotDof",
         "row_dof": "RowDof",
         "particle": "Particle",
-        "dist_con": "DistCon", "vol_con": "VolCon",
-        "shape_match_slot": "ShapeMatchSlot", "shape_match_member": "ShapeMatchMember",
         "env_dof2": "EnvDof2", "scalar": "Scalar",
         "articulation": "Articulation", "articulation_dof2": "ArticulationDof2",
         "articulation_dof": "ArticulationDof",

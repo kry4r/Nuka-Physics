@@ -608,10 +608,10 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ mat_buckets,
     uint32_t num_material_buckets,
     uint64_t* __restrict__ contact_material,
-    uint32_t n_soft_particles, uint32_t particles_per_env, uint32_t grid_nodes_per_env,
+    uint32_t particles_per_env, uint32_t grid_nodes_per_env,
     uint32_t endpoints_per_env, uint32_t terms_per_env,
     const nk::PointEndpointRange* endpoint_ranges, const nk::PointEndpointTerm* endpoint_terms,
-    float particle_soft_friction, float particle_fluid_friction,
+    float particle_soft_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt, float baumgarte_max_velocity, float contact_margin,
@@ -717,18 +717,10 @@ __global__ void EmitPairDrivenRowsKernel(
         mat_buckets, num_material_buckets, profile_a, default_profile);
     scene::ContactParamsIn side_b = ReadContactProfile(
         mat_buckets, num_material_buckets, profile_b, default_profile);
-    if (kind_a == kNkSideParticle) {
-        const uint32_t local = particles_per_env > 0u ? part_a % particles_per_env : part_a;
-        const float mu = local < n_soft_particles ? particle_soft_friction
-                                                   : particle_fluid_friction;
-        side_a = DefaultProfile(mu, solref0, solref1, default_solimp);
-    }
-    if (kind_b == kNkSideParticle) {
-        const uint32_t local = particles_per_env > 0u ? part_b % particles_per_env : part_b;
-        const float mu = local < n_soft_particles ? particle_soft_friction
-                                                   : particle_fluid_friction;
-        side_b = DefaultProfile(mu, solref0, solref1, default_solimp);
-    }
+    if (kind_a == kNkSideParticle)
+        side_a = DefaultProfile(particle_soft_friction, solref0, solref1, default_solimp);
+    if (kind_b == kNkSideParticle)
+        side_b = DefaultProfile(particle_soft_friction, solref0, solref1, default_solimp);
     if (kind_a == kNkSideGrid || kind_a == kNkSidePointEndpoint || side_kind_a == nk::kUContactSideBoundary)
         side_a = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
     if (kind_b == kNkSideGrid || kind_b == kNkSidePointEndpoint || side_kind_b == nk::kUContactSideBoundary)
@@ -1049,106 +1041,6 @@ __global__ void EmitJointRowsKernel(
             p.max_dof, data.drive_command, data.drive_lower, data.drive_upper,
             urows, data.lambda, data.chain_jacobian, data.row_cj_link,
             data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
-}
-
-// A particle constraint C(x) is a compliant row J v + (alpha / h^2) lambda = J v* - C(x*) / h,
-// linearized at the predicted positions x* = x + h v*; this is XPBD to first order.
-__global__ void EmitParticleConstraintRowsKernel(
-    uint32_t env_count, uint32_t dist_per_env, uint32_t vol_per_env,
-    uint32_t rows_per_env, uint32_t first_row, uint32_t endpoints_per_env,
-    uint32_t terms_per_env, uint32_t endpoint_first, uint32_t term_first, float dt,
-    const uint32_t* __restrict__ dist_a, const uint32_t* __restrict__ dist_b,
-    const float* __restrict__ dist_rest, const float* __restrict__ dist_compliance,
-    const uint32_t* __restrict__ vol_particles,
-    const float* __restrict__ vol_rest, const float* __restrict__ vol_compliance,
-    const math::Vec3* __restrict__ predicted, const math::Vec3* __restrict__ velocity,
-    const float* __restrict__ inv_mass, NkRow* urows, float* lambda,
-    nk::PointEndpointRange* ranges, nk::PointEndpointTerm* terms,
-    uint32_t* row_cj_link, uint32_t* row_cj_link_b, float* row_penetration, uint32_t* row_count) {
-    BeginProgrammaticKernel();
-    const uint32_t per_env = dist_per_env + vol_per_env;
-    const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
-    if (per_env == 0u || item >= env_count * per_env) return;
-    const uint32_t env = item / per_env;
-    const uint32_t local = item - env * per_env;
-    const uint32_t slot = env * rows_per_env + first_row + local;
-    row_cj_link[slot] = row_cj_link_b[slot] = kInvalidLink;
-    row_penetration[slot] = 0.0f;
-    NkRow row{};
-    row.group_first = slot;
-    row.group_normal_count = 1u;
-    row.env = env;
-    row.lower = -kFltMax;
-    row.upper = kFltMax;
-    float error = 0.0f, alpha = 0.0f, jv = 0.0f;
-    bool valid = false;
-    if (local < dist_per_env) {
-        const uint32_t c = env * dist_per_env + local;
-        const uint32_t ia = dist_a[c], ib = dist_b[c];
-        const math::Vec3 r = predicted[ia] - predicted[ib];
-        const float length = sqrtf(r.Dot(r));
-        if (length > 0.0f && inv_mass[ia] + inv_mass[ib] > 0.0f) {
-            const math::Vec3 n = r * (1.0f / length);
-            row.a.kind = row.b.kind = kNkSideParticle;
-            row.a.index = ia;
-            row.b.index = ib;
-            row.a.jlin = n;
-            row.b.jlin = n * -1.0f;
-            error = length - dist_rest[c];
-            alpha = dist_compliance[c];
-            jv = n.Dot(velocity[ia] - velocity[ib]);
-            valid = true;
-        }
-    } else {
-        // Volume rows read 4 particle gradients through one endpoint along x.
-        const uint32_t c = env * vol_per_env + local - dist_per_env;
-        const uint32_t* particles = vol_particles + size_t{c} * 4u;
-        uint32_t index[4];
-        math::Vec3 p[4], gradient[4];
-        for (uint32_t j = 0u; j < 4u; ++j) {
-            index[j] = particles[j];
-            p[j] = predicted[index[j]];
-        }
-        const math::Vec3 e1 = p[1] - p[0], e2 = p[2] - p[0], e3 = p[3] - p[0];
-        gradient[1] = e2.Cross(e3);
-        gradient[2] = e3.Cross(e1);
-        gradient[3] = e1.Cross(e2);
-        gradient[0] = (gradient[1] + gradient[2] + gradient[3]) * -1.0f;
-        error = e1.Dot(gradient[1]) - vol_rest[c];
-        alpha = vol_compliance[c];
-        valid = true;
-        const uint32_t endpoint = env * endpoints_per_env + endpoint_first + local - dist_per_env;
-        const uint32_t first = env * terms_per_env + term_first + (local - dist_per_env) * 4u;
-        float response = 0.0f;
-        for (uint32_t j = 0u; j < 4u; ++j) {
-            nk::PointEndpointTerm term;
-            term.kind = kNkSideParticle;
-            term.index = index[j];
-            term.column[0] = {gradient[j].x, 0.0f, 0.0f};
-            term.column[1] = {gradient[j].y, 0.0f, 0.0f};
-            term.column[2] = {gradient[j].z, 0.0f, 0.0f};
-            terms[first + j] = term;
-            jv += gradient[j].Dot(velocity[index[j]]);
-            response += inv_mass[index[j]] * gradient[j].Dot(gradient[j]);
-        }
-        valid = valid && response > 0.0f;
-        ranges[endpoint] = {first, valid ? 4u : 0u};
-        row.a.kind = nk::kNkSidePointEndpoint;
-        row.a.index = endpoint;
-        row.a.jlin = {1.0f, 0.0f, 0.0f};
-    }
-    if (valid && isfinite(error) && isfinite(jv)) {
-        row.flags = nk::nk_row_flags::kActive | nk::nk_row_flags::kVelocityOnly;
-        row.compliance_alpha = fmaxf(alpha, 0.0f) / (dt * dt);
-        row.rhs = (jv - error / dt) / dt;
-        atomicAdd(row_count + env, 1u);
-    } else {
-        row = NkRow{};
-    }
-    // As with XPBD multipliers, the impulse restarts each step: it holds this step's error
-    // correction, and a warm start would apply that correction again next step.
-    lambda[slot] = 0.0f;
-    urows[slot] = row;
 }
 
 __device__ float PairDrivenSideCoupling(
@@ -1767,10 +1659,10 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const uint32_t*>(model.body_collidable_body),
                    static_cast<const float*>(data.mat_buckets),
                    p->num_material_buckets, data.contact_material,
-                   p->n_soft_particles, p->particles_per_env, p->grid_nodes_per_env,
+                   p->particles_per_env, p->grid_nodes_per_env,
                    p->point_endpoints_per_env, p->point_endpoint_terms_per_env,
                    data.point_endpoint_ranges, data.point_endpoint_terms,
-                   p->particle_soft_friction, p->particle_fluid_friction,
+                   p->particle_soft_friction,
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->baumgarte_max_velocity, p->contact_margin,
@@ -1792,28 +1684,6 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         LaunchCuda<true>(EmitJointRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
                    state, *p, model.joint_limit_lower, model.joint_limit_upper,
                    model.joint_limit_flags, data);
-    }
-
-    const uint32_t constraints = p->dist_cons_per_env + p->vol_cons_per_env;
-    if (constraints > 0u) {
-        const uint32_t blocks = (p->env_count * constraints + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda<true>(EmitParticleConstraintRowsKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   p->env_count, p->dist_cons_per_env, p->vol_cons_per_env,
-                   p->rows_per_env, p->particle_constraint_row_first, p->point_endpoints_per_env,
-                   p->point_endpoint_terms_per_env, p->constraint_endpoint_first,
-                   p->constraint_term_first, p->dt,
-                   static_cast<const uint32_t*>(model.dist_particle_a),
-                   static_cast<const uint32_t*>(model.dist_particle_b),
-                   static_cast<const float*>(model.dist_rest_length),
-                   static_cast<const float*>(model.dist_compliance),
-                   static_cast<const uint32_t*>(model.vol_particles),
-                   static_cast<const float*>(model.vol_rest_times6),
-                   static_cast<const float*>(model.vol_compliance),
-                   data.pbf_predicted_pos, data.particle_vel,
-                   static_cast<const float*>(data.particle_inv_mass),
-                   reinterpret_cast<NkRow*>(data.urows), data.lambda,
-                   data.point_endpoint_ranges, data.point_endpoint_terms,
-                   data.row_cj_link, data.row_cj_link_b, data.row_penetration, data.row_count);
     }
 
     if (has_artic) {

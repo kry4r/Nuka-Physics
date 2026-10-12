@@ -111,15 +111,10 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
             mass=MASS, material="load_body",
         )
         builder.add_media(
-            nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_XPBD,
+            nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_VBD,
             cloth_nx=9, cloth_ny=9, cloth_spacing=0.025,
-            cloth_origin=[0.1, -0.1, 0.07], xpbd_iters=24,
+            cloth_origin=[0.1, -0.1, 0.07],
             xpbd_aero_normal=0.6, xpbd_aero_tangent=0.04, xpbd_aero_max_dv=0.5,
-        )
-        builder.add_media(
-            nuka.MEDIA_FLUID, nuka.MEDIA_METHOD_PBF,
-            fluid_min=[-0.3, -0.2, 0.025], fluid_max=[-0.2, -0.1, 0.1],
-            fluid_spacing=0.025, pbf_floor_z=0.0, pbf_iters=4,
         )
         world = builder.build(
             device, env_count=2, dt=dt, gravity_x=float(GRAVITY[0]),
@@ -184,9 +179,6 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
         env_status = world.download_field(nuka.ENV_STATUS).copy()
         assert not np.any(gyro_status)
         assert not np.any(env_status), env_status
-        neighbor_attempted = read(world, nuka.PARTICLE_NEIGHBOR_ATTEMPTED, 1)
-        neighbor_count = read(world, nuka.PARTICLE_NEIGHBOR_COUNT, 1)
-        np.testing.assert_array_equal(neighbor_count, neighbor_attempted)
         assert float(gyro_residual.max()) <= 1e-6
         gyro_view = torch.from_dlpack(world.buffer_view(nuka.BODY_GYRO_STATUS))
         assert gyro_view.dtype == torch.uint32
@@ -217,11 +209,6 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
         for field, before in ((nuka.BODY_GYRO_RESIDUAL, gyro_residual),
                               (nuka.BODY_GYRO_ITERATIONS, gyro_iterations),
                               (nuka.BODY_GYRO_STATUS, gyro_status)):
-            restored = read(world, field, 1)
-            assert not np.any(restored[0])
-            np.testing.assert_array_equal(restored[1], before[1])
-        for field, before in ((nuka.PARTICLE_NEIGHBOR_ATTEMPTED, neighbor_attempted),
-                              (nuka.PARTICLE_NEIGHBOR_COUNT, neighbor_count)):
             restored = read(world, field, 1)
             assert not np.any(restored[0])
             np.testing.assert_array_equal(restored[1], before[1])

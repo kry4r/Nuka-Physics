@@ -132,7 +132,6 @@ Representative authoring examples:
 ```bash
 python examples/demo/render_realism_demo.py --spp 64
 python examples/demo/go2_cloth_drape.py
-python examples/demo/soft_ball_py.py --steps 180
 ```
 
 ## Train a vectorized task

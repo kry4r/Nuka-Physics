@@ -273,9 +273,7 @@ Scene BuildModel(const Args& args, const render::MeshGeometry& mesh) {
     water.floor_d = 0.0f;
     // Spray that lands on the deck grips it as a wetting film instead of skating off the grid.
     water.floor_friction = 0.5f;
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(model, 1u, soft, water);
+    cook::CookMpmParticles(model, 1u, water);
     model.particles.mpm_body_friction = 0.0f;
     return scene;
 }

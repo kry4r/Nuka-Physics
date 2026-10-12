@@ -83,7 +83,7 @@ float FluidParticleMass(const FluidBoxSpec& spec);
 // Cook a BOX fluid volume into a PbfParticleSet. PURE + deterministic: samples the
 // cell-centered uniform lattice (x fastest), zero initial velocities, and the
 // uniform mass = rest_density * spacing^3. The result feeds the nk PBF world cook
-// (nk::Model::ModelParticles, mode == Pbf). Invalid spec (spacing <= 0,
+// (nk::Model::ModelParticles). Invalid spec (spacing <= 0,
 // rest_density <= 0, or an empty box) cooks to an EMPTY set (no throw -- mirrors
 // the xpbd_cooker's empty-input tolerance).
 runtime::fluid::PbfParticleSet CookFluidBox(const FluidBoxSpec& spec);

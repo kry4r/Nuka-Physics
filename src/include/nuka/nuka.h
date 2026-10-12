@@ -171,7 +171,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
                                            nuka_world_handle* out);
 
 // A COUPLED world: a rigid/articulated robot cooked from `desc->scene_path` PLUS
-// cloth (XPBD) and/or fluid (PBF) particles, all stepping on the ONE general
+// VBD cloth particles, all stepping on the ONE general
 // contact pipeline with two-way body<->particle coupling (a robot link is just a
 // collidable body, a particle is a sphere; the medium difference is DATA -- per-
 // system friction). The robot is cooked through the SAME scene->CookToModel path
@@ -188,9 +188,7 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
 //
 // A cloth patch is a flat (cloth_nx x cloth_ny) lattice (>=2 each) at
 // cloth_origin_{x,y,z} with cloth_spacing edge; its perimeter is pinned (a taut
-// membrane). A fluid box fills the AABB [fluid_min, fluid_max] at fluid_spacing on a
-// z-up boundary floor at fluid_floor_z. Either medium is OMITTED by leaving its
-// count/extent zero; at least one medium must be present (else INVALID_ARG -- use
+// membrane). The cloth must be present (else INVALID_ARG -- use
 // nuka_world_create_from_scene for a particle-free world).
 typedef struct nuka_coupled_particles_desc_t {
     // --- cloth (vertex-block) lattice; cloth_nx == 0 OR cloth_ny == 0 => no cloth ---
@@ -206,22 +204,11 @@ typedef struct nuka_coupled_particles_desc_t {
     float    cloth_bend_stiffness;     // hinge bending stiffness, N m (>= 0).
     float    cloth_poisson;            // membrane Poisson ratio in [0, 0.5).
     float    cloth_damping;            // Rayleigh damping on the elastic stiffness, s (>= 0).
-    // --- fluid (PBF) box; any fluid extent <= 0 => no fluid ---------------------
-    float    fluid_min_x, fluid_min_y, fluid_min_z;  // box min corner, m.
-    float    fluid_max_x, fluid_max_y, fluid_max_z;  // box max corner (> min).
-    float    fluid_spacing;       // lattice spacing / support cell, m (> 0).
-    float    fluid_rest_density;  // rho0, kg/m^3 (> 0; e.g. 1000).
-    float    fluid_floor_z;       // z-up PBF boundary floor, m.
-    float    fluid_friction;      // body<->fluid mu (~0 => the foot slides).
-    uint32_t fluid_iters;         // PBF density iterations (0 => 4).
-    // Particle collision radius for BOTH media: a foot touches a particle when their
+    // Particle collision radius: a foot touches a particle when their
     // spheres overlap. The body<->particle contact d_min == 2*this (0 => engine
     // default sized from the smaller medium spacing).
     float    contact_radius;
-    // Per-medium solver selection (0 = xpbd/PB default => byte-identical cook;
-    // 1 = mlsmpm). cloth + mlsmpm and fluid + mlsmpm are rejected LOUDLY at cook
-    // (cloth stays XPBD, fluid stays PBF in the first batch). A zero-initialized
-    // desc selects the PB default, so an existing caller is unaffected.
+    // Cloth solver selection (0 = VBD default; 1 = mlsmpm, rejected LOUDLY at cook).
     uint32_t soft_sim_method;
     // Cloth perimeter pin. 0 (default) pins the whole perimeter (a taut membrane);
     // 1 skips the pin so the sheet is a free drape (every particle dynamic).
@@ -575,10 +562,9 @@ typedef enum nuka_state_field_t {
     // is picked up by the NEXT Step. Persistent => round-trips reset.
     NUKA_FIELD_JOINT_FEEDFORWARD = 22,
     // READ (per-particle). The live particle WORLD positions of a coupled world
-    // (cloth/fluid), env-major: float3[env_count * particles_per_env], index
+    // (cloth/MPM), env-major: float3[env_count * particles_per_env], index
     // (env * particles_per_env + particle), element_stride_bytes == 3*sizeof(float),
-    // dtype == 0 (FLOAT32). The soft slice occupies [0, n_soft), the fluid slice
-    // [n_soft, particles_per_env) (the cook's [soft|fluid] layout). On a world with
+    // dtype == 0 (FLOAT32). MPM points occupy [0, n_mpm), vertex blocks the rest. On a world with
     // no particles it RESOLVES as an empty view (element_count == 0), not an error.
     // Read of the coupled medium's state; a write is overwritten by the NEXT Step.
     NUKA_FIELD_PARTICLE_POSITION = 23,
@@ -625,9 +611,6 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_BODY_GYRO_RESIDUAL = 40,
     NUKA_FIELD_BODY_GYRO_ITERATIONS = 41,
     NUKA_FIELD_BODY_GYRO_STATUS = 42,
-    // READ: exact and retained neighbors per particle at the last grid build, uint32.
-    NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED = 43,
-    NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT = 44,
     // READ: row-major 3x3 per particle, env-major; elastic Fe for plastic materials.
     NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT = 45,
     // READ: multiplicative Fp; empty when no material requires plastic history.

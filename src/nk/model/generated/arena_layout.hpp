@@ -20,7 +20,7 @@ enum class FieldOwner : uint8_t { Model, Data };
 // concrete element count from the Model capacities x env_count.
 enum class FieldPer : uint8_t {
     Env, Dof, Link, Body, ContactSlot, RowSlot, SlotDof, RowDof, Particle,
-    DistCon, VolCon, ShapeMatchSlot, ShapeMatchMember, EnvDof2,
+    EnvDof2,
     Scalar,
     // Multi-articulation co-residence: per-articulation (= articulations_per_env)
     // and per-articulation M-tile (= articulations_per_env * max_dof^2).
@@ -166,35 +166,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_vel
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // particle_inv_mass
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_v_pre
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_particle_a
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_particle_b
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_rest_length
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::DistCon, 1, 1, 4, 0},  // dist_compliance
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::DistCon, 1, 1, 4, 0},  // dist_lambda
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 4, 1, 16, 0},  // vol_particles
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 1, 1, 4, 0},  // vol_rest_times6
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::VolCon, 1, 1, 4, 0},  // vol_compliance
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::VolCon, 1, 1, 4, 0},  // vol_lambda
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 1, 4, 0},  // sm_cluster_offset
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 1, 4, 0},  // sm_cluster_size
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 1, 4, 0},  // sm_stiffness
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchSlot, 1, 3, 12, 0},  // sm_rest_centroid
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 1, 4, 0},  // sm_particles
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 3, 12, 0},  // sm_rest_q
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::ShapeMatchMember, 1, 1, 4, 0},  // sm_mass
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 3, 1, 12, 0},  // aero_tri_verts
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::AeroTri, 1, 1, 4, 0},  // aero_tri_area
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_predicted_pos
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // pbf_position_delta
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // pbf_density
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // pbf_lambda
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_cell_key
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_particle_idx
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_cell_start
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_cell_end
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_offset
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_count
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_neighbor_idx
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Env, 1, 1, 8, 0},  // rng_state
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // env_status
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // obs_buffer
@@ -231,10 +205,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // snapshot_particle_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // snapshot_particle_prev_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // snapshot_particle_vel
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // dist_color_segments
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // vol_color_segments
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // sm_color_segments
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // grid_sort_scratch
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // grid_mass
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_momentum
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 3, 12, 0},  // grid_velocity
@@ -321,8 +291,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_gyro_residual
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_gyro_iterations
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_gyro_status
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 4, 0},  // grid_neighbor_attempted
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Particle, 1, 1, 8, 0},  // grid_neighbor_scan_offset
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // lbvh_sort_scratch
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // contact_cache_scratch
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // active_row_ids
@@ -332,9 +300,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // link_contact_begin
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // link_contact_end
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 1, 0},  // contact_index_scratch
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_topology_offsets
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_topology_elements
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 3, 12, 0},  // particle_contact_rest_pos
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // mesh_surface_info
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // mesh_triangles
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 32, 32, 0},  // mesh_bvh_nodes

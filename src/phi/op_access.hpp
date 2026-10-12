@@ -19,7 +19,6 @@ enum class OpResource : uint8_t {
     Parameters,
     Drives,
     Particles,
-    ParticleGrid,
     MaterialGrid,
     Collision,
     Contacts,
@@ -55,7 +54,6 @@ inline constexpr uint64_t BodyDynamics = uint64_t{1} << static_cast<uint8_t>(OpR
 inline constexpr uint64_t Parameters = uint64_t{1} << static_cast<uint8_t>(OpResource::Parameters);
 inline constexpr uint64_t Drives = uint64_t{1} << static_cast<uint8_t>(OpResource::Drives);
 inline constexpr uint64_t Particles = uint64_t{1} << static_cast<uint8_t>(OpResource::Particles);
-inline constexpr uint64_t ParticleGrid = uint64_t{1} << static_cast<uint8_t>(OpResource::ParticleGrid);
 inline constexpr uint64_t MaterialGrid = uint64_t{1} << static_cast<uint8_t>(OpResource::MaterialGrid);
 inline constexpr uint64_t Collision = uint64_t{1} << static_cast<uint8_t>(OpResource::Collision);
 inline constexpr uint64_t Contacts = uint64_t{1} << static_cast<uint8_t>(OpResource::Contacts);

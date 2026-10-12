@@ -6,17 +6,15 @@
 //                       watermark), with TAGGED FILTERING folded in (contype/
 //                       conaffinity bitmask + sorted excluded-pair binary search
 //                       + same-body drop + cross-env gating).
-//   ParticleGridBuild : uniform spatial hash grid CSR neighbors (the M6 PBF/
-//                       XPBD co-step input).
 //
 // KERNEL BODIES ARE LINE-BY-LINE PORTS of the standalone collision sources
-// (broadphase_lbvh.cu / lbvh_traversal.cuh / particle_uniform_grid.cu) — the
-// algorithm + the particle-grid stable radix sort + exclusive scan D1 anchors are
+// (broadphase_lbvh.cu / lbvh_traversal.cuh) — the
+// algorithm + the pair stable radix sort + exclusive scan D1 anchors are
 // preserved (cub::DeviceRadixSort::SortPairs + DeviceScan::ExclusiveScan, the very
 // primitives thrust dispatched to, drawing from a pre-allocated scratch so the op
 // captures into a CUDA graph). Only the I/O wiring changes (inputs are the arena/
 // Model device pointers; node/morton/visit + sort scratch are arena-resident; the
-// output is the candidate_pairs / grid_* Data fields).
+// output is the candidate_pairs Data fields).
 //
 // FAMILY GATING (plan §3.5 / op_schema kContactFamily*): the broadphase ops do
 // real work ONLY for kContactFamilyPairDriven. The union slot-template family
@@ -48,8 +46,6 @@ namespace { using NkScanSumOp = ::cub::Sum; }
 #include "collision/lbvh_node.cuh"      // LbvhNode (query traversal)
 #include "collision/mesh_surface_types.hpp"
 #include "collision/shape_kind.hpp"     // nuka::collision::ShapeKind (R2: one enum)
-#include "collision/particle_grid_traversal.cuh"  // ParticleGridConfigDevice / QueryParticleNeighbors
-#include "collision/particle_uniform_grid.hpp"     // kParticleGridMaxNeighbors (canonical)
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
 #include "nk/model/generated/views.hpp"  // ModelView / DataView (complete types)
@@ -67,37 +63,11 @@ namespace cg = ::nuka::collision::gpu;
 constexpr uint32_t kBlockSize = 128u;
 
 // Round up to the 256B section alignment the Arena lays the scratch out at (so
-// every sub-region of grid_sort_scratch is 256B-aligned device memory).
+// every scratch sub-region is 256B-aligned device memory).
 constexpr uint64_t kScratchAlign = 256u;
 inline __host__ uint64_t AlignScratch(uint64_t v) {
     return (v + (kScratchAlign - 1u)) & ~(kScratchAlign - 1u);
 }
-
-// 256B-aligned partition of grid_sort_scratch [cub temp | keys-out | idx-out].
-// Sizes the segment (World construct) and partitions it (the op) identically.
-struct GridSortScratchLayout {
-    uint64_t temp_bytes = 0u;     // cub temp-storage region size (max of sort/scan).
-    uint64_t keys_off   = 0u;     // byte offset of the sorted-keys out buffer.
-    uint64_t idx_off    = 0u;     // byte offset of the sorted-idx out buffer.
-    uint64_t total      = 0u;     // full segment byte size.
-    explicit GridSortScratchLayout(uint32_t particle_count) {
-        const int n = static_cast<int>(particle_count);
-        size_t sort_bytes = 0u;
-        if (cub::DeviceRadixSort::SortPairs<uint32_t, uint32_t>(
-            nullptr, sort_bytes, static_cast<const uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), static_cast<const uint32_t*>(nullptr),
-            static_cast<uint32_t*>(nullptr), n) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
-        size_t scan_bytes = 0u;
-        if (cub::DeviceScan::ExclusiveScan(
-            nullptr, scan_bytes, static_cast<uint32_t*>(nullptr),
-            static_cast<uint64_t*>(nullptr), NkScanSumOp{}, uint64_t{0}, n) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
-        temp_bytes = sort_bytes > scan_bytes ? sort_bytes : scan_bytes;
-        const uint64_t nbytes = static_cast<uint64_t>(particle_count) * sizeof(uint32_t);
-        keys_off = AlignScratch(temp_bytes);
-        idx_off  = AlignScratch(keys_off + nbytes);
-        total    = AlignScratch(idx_off + nbytes);
-    }
-};
 
 // Sorting keys, permutations, and pair snapshots share the compact rigid-slot domain.
 // Per-environment counts and prefixes occupy separate aligned regions.
@@ -138,8 +108,7 @@ struct PairSortScratchLayout {
     }
 };
 // env_status diagnostic bits (kEnvStatus*) are shared in op_schema.hpp so the
-// broadphase, particle-grid, and CRBA ops agree on the readout layout.
-// The per-particle neighbor cap is the canonical cg::kParticleGridMaxNeighbors.
+// broadphase and CRBA ops agree on the readout layout.
 
 // shape_table record: R1 GREW it 8 -> 10 packed f32 / body row
 // (Model::PairDrivenShape). Lanes 0..7 unchanged; lanes 8/9 = body_id (int32) +
@@ -481,115 +450,11 @@ __global__ void PairSortScatterKernel(
     pairs[dst_at + 1] = snap[src_at + 1];
 }
 
-// --- ParticleGridBuild (CSR neighbors) --------------------------------------
-// Cell keys are ENV-OFFSET (key = env*cells_per_env + local key) so each env
-// owns a private cell span: env-major replicated particles occupy identical
-// coordinates, and a shared grid would have every particle neighbor its own
-// clones in other envs (review fix — cross-env coupling). The query kernels
-// below offset the cell_start/cell_end base by env*cells_per_env so the LOCAL
-// keys QueryParticleNeighbors computes index the env's own span. For
-// env_count == 1 the offset is 0 and the behavior is byte-identical to the
-// legacy single-world grid.
-__global__ void GridCellKeysKernel(uint32_t particle_count,
-                                   const math::Vec3* __restrict__ pos,
-                                   cg::ParticleGridConfigDevice cfg,
-                                   uint32_t particles_per_env,
-                                   uint32_t cells_per_env,
-                                   uint32_t* __restrict__ keys,
-                                   uint32_t* __restrict__ idx) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) return;
-    const math::Vec3 p = pos[i];
-    const uint32_t env = i / particles_per_env;
-    keys[i] = env * cells_per_env +
-              cg::CellKeyFromPos(make_float3(p.x, p.y, p.z), cfg);
-    idx[i] = i;
-}
-
-__global__ void GridCellRangesKernel(uint32_t particle_count,
-                                     const uint32_t* __restrict__ sorted_keys,
-                                     uint32_t* __restrict__ cell_start,
-                                     uint32_t* __restrict__ cell_end) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) return;
-    const uint32_t key = sorted_keys[i];
-    if (i == 0u) cell_start[key] = 0u;
-    else {
-        const uint32_t prev = sorted_keys[i - 1u];
-        if (prev != key) { cell_end[prev] = i; cell_start[key] = i; }
-    }
-    if (i == particle_count - 1u) cell_end[key] = particle_count;
-}
-
-__global__ void GridCountKernel(uint32_t particle_count,
-                                const math::Vec3* __restrict__ pos, float radius,
-                                cg::ParticleGridConfigDevice cfg,
-                                uint32_t particles_per_env,
-                                uint32_t cells_per_env,
-                                const uint32_t* __restrict__ cell_start,
-                                const uint32_t* __restrict__ cell_end,
-                                const uint32_t* __restrict__ idx_sorted,
-                                uint32_t* __restrict__ counts) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) return;
-    const math::Vec3 pm = pos[i];
-    const size_t cbase = static_cast<size_t>(i / particles_per_env) * cells_per_env;
-    const uint32_t n = cg::QueryParticleNeighbors(
-        make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
-        cell_end + cbase, idx_sorted, pos, nullptr, 0u,
-        nullptr);
-    counts[i] = n;
-}
-
-__global__ void GridFillKernel(uint32_t particle_count,
-                               const math::Vec3* __restrict__ pos, float radius,
-                               cg::ParticleGridConfigDevice cfg,
-                               uint32_t particles_per_env,
-                               uint32_t cells_per_env,
-                               const uint32_t* __restrict__ cell_start,
-                               const uint32_t* __restrict__ cell_end,
-                               const uint32_t* __restrict__ idx_sorted,
-                               const uint64_t* __restrict__ scanned_offsets,
-                               uint32_t* __restrict__ offsets,
-                               uint32_t pool_capacity,
-                               uint32_t* __restrict__ neighbor_idx,
-                               uint32_t* __restrict__ counts,
-                               uint32_t* __restrict__ env_status) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= particle_count) return;
-    const math::Vec3 pm = pos[i];
-    const uint32_t env = i / particles_per_env;
-    const size_t cbase = static_cast<size_t>(env) * cells_per_env;
-    const uint64_t local_offset = scanned_offsets[i] - scanned_offsets[env * particles_per_env];
-    const uint32_t retained_offset = static_cast<uint32_t>(
-        local_offset < pool_capacity ? local_offset : pool_capacity);
-    offsets[i] = env * pool_capacity + retained_offset;
-    uint32_t* slice = neighbor_idx + offsets[i];
-    bool overflow = false;
-    const uint32_t n = cg::QueryParticleNeighbors(
-        make_float3(pm.x, pm.y, pm.z), i, radius, cfg, cell_start + cbase,
-        cell_end + cbase, idx_sorted, pos, slice, pool_capacity - retained_offset, &overflow);
-    counts[i] = n;
-    // Surface a dropped neighbor (cap exhausted) per-env -> env_status readout;
-    // PBF density would otherwise silently lose interactions in dense regions.
-    if (overflow && env_status != nullptr) {
-        atomicOr(&env_status[env], kEnvStatusNeighborOverflow);
-    }
-}
-
 __global__ void BeginPairQueryKernel(uint32_t* pair_count, uint32_t* env_status, uint32_t n) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     pair_count[i] = 0u;
     if (env_status != nullptr) env_status[i] &= ~kEnvStatusPairOverflow;
-}
-
-// Cell ranges and the query's overflow bit have independent array elements.
-__global__ void BeginGridCellsKernel(uint32_t* start, uint32_t* end, uint32_t n,
-                                      uint32_t* env_status, uint32_t envs) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) start[i] = end[i] = 0u;
-    if (i < envs && env_status != nullptr) env_status[i] &= ~kEnvStatusNeighborOverflow;
 }
 
 // --- op entry points ---------------------------------------------------------
@@ -705,103 +570,7 @@ Status OpLbvhQueryPairs(const ModelView& model, const DataView& data,
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
-Status OpParticleGridBuild(const ModelView& /*model*/, const DataView& data,
-                           const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const ParticleGridBuildParams*>(params);
-    if (p == nullptr) return Status::Failed;
-    if (p->particle_count == 0u || p->cell_size <= 0.0f) return Status::Ok;
-    cg::ParticleGridConfigDevice cfg;
-    cfg.cell_size = make_float3(p->cell_size, p->cell_size, p->cell_size);
-    const float inv = 1.0f / p->cell_size;
-    cfg.inv_cell_size = make_float3(inv, inv, inv);
-    cfg.grid_min = make_float3(p->grid_min[0], p->grid_min[1], p->grid_min[2]);
-    cfg.grid_dims = make_uint3(p->grid_dims[0], p->grid_dims[1], p->grid_dims[2]);
-    const uint32_t Np = p->particle_count;
-    const uint64_t cells64 = static_cast<uint64_t>(p->grid_dims[0]) *
-                             p->grid_dims[1] * p->grid_dims[2];
-    if (cells64 == 0u) return Status::Ok;
-    const uint32_t E = p->env_count == 0u ? 1u : p->env_count;
-    const uint32_t Ppe = p->particles_per_env == 0u ? Np : p->particles_per_env;
-    const uint64_t pool_capacity = p->neighbor_capacity != 0u ? p->neighbor_capacity
-        : static_cast<uint64_t>(Ppe) * kDefaultParticleNeighborBudget;
-    if (static_cast<uint64_t>(E) * Ppe != Np || pool_capacity * E > 0xFFFFFFFFull ||
-        Np > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
-        !std::isfinite(p->cell_size) || !std::isfinite(p->query_radius) ||
-        p->query_radius < 0.0f || p->query_radius > p->cell_size)
-        return Status::InvalidArgument;
-    // LOUD capacity guards (review fix): the cell-range arrays are sized
-    // max_grid_cells x env_count — a dims product beyond the cooked capacity
-    // would scatter cell keys past the segment (silent arena corruption), and
-    // cells*env_count must fit the u32 env-offset key.
-    if (cells64 > p->cells_capacity) return Status::Failed;
-    if (cells64 * E > 0xFFFFFFFFull) return Status::Failed;
-    const uint32_t cells = static_cast<uint32_t>(cells64);
-    const uint32_t blocks = (Np + kBlockSize - 1u) / kBlockSize;
-    // M6: PBF builds the neighbor grid on the PREDICTED positions (legacy PBF
-    // step order), so pos_source routes the op to pbf_predicted_pos; the M5
-    // default (0) keeps the particle_pos source. All downstream PBF density /
-    // lambda / correction kernels read pbf_predicted_pos, so the neighbor list
-    // and the queries are over the SAME positions (D1 + the legacy semantics).
-    const auto* pos =
-        (p->pos_source == kGridPosSourcePbfPredicted)
-            ? static_cast<const math::Vec3*>(data.pbf_predicted_pos)
-            : static_cast<const math::Vec3*>(data.particle_pos);
-
-    // Partition the pre-allocated scratch [cub temp | keys-out | idx-out] so the
-    // sort/scan never cudaMalloc/sync mid-capture (the grid op joins the graph).
-    const GridSortScratchLayout sl(Np);
-    char* sbase = reinterpret_cast<char*>(data.grid_sort_scratch);
-    void* sort_temp = sbase;
-    uint32_t* keys_out = reinterpret_cast<uint32_t*>(sbase + sl.keys_off);
-    uint32_t* idx_out  = reinterpret_cast<uint32_t*>(sbase + sl.idx_off);
-    size_t sort_temp_bytes = static_cast<size_t>(sl.temp_bytes);
-    LaunchCuda(GridCellKeysKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               Np, pos, cfg, Ppe, cells, data.grid_cell_key,
-               data.grid_particle_idx);
-    // Stable radix sort (byte-identical to the prior thrust stable_sort_by_key,
-    // which dispatched here); out-of-place, then D2D-copied back to keep in-place.
-    if (cub::DeviceRadixSort::SortPairs(
-        sort_temp, sort_temp_bytes, data.grid_cell_key, keys_out,
-        data.grid_particle_idx, idx_out, static_cast<int>(Np), 0, 32, stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
-    if (cudaMemcpyAsync(data.grid_cell_key, keys_out, Np * sizeof(uint32_t),
-                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
-    if (cudaMemcpyAsync(data.grid_particle_idx, idx_out, Np * sizeof(uint32_t),
-                          cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
-    {
-        const uint32_t zn = cells * E;
-        const uint32_t b = (zn + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(BeginGridCellsKernel, dim3(b), dim3(kBlockSize), 0u, stream,
-                   data.grid_cell_start, data.grid_cell_end, zn, data.env_status, E);
-    }
-    LaunchCuda(GridCellRangesKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               Np, data.grid_cell_key, data.grid_cell_start, data.grid_cell_end);
-    LaunchCuda(GridCountKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
-               data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_attempted);
-    // Exclusive scan of the count -> flat CSR offset (byte-identical to the prior
-    // thrust exclusive_scan; out-of-place, reusing the capture-safe temp region).
-    {
-        size_t scan_temp_bytes = static_cast<size_t>(sl.temp_bytes);
-        if (cub::DeviceScan::ExclusiveScan(
-            sort_temp, scan_temp_bytes, data.grid_neighbor_attempted,
-            data.grid_neighbor_scan_offset, NkScanSumOp{}, uint64_t{0}, static_cast<int>(Np), stream) != cudaSuccess) throw std::runtime_error("CUB workspace operation failed");
-    }
-    LaunchCuda(GridFillKernel, dim3(blocks), dim3(kBlockSize), 0u, stream,
-               Np, pos, p->query_radius, cfg, Ppe, cells, data.grid_cell_start,
-               data.grid_cell_end, data.grid_particle_idx, data.grid_neighbor_scan_offset,
-               data.grid_neighbor_offset, static_cast<uint32_t>(pool_capacity), data.grid_neighbor_idx,
-               data.grid_neighbor_count, data.env_status);
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-}
-
 }  // namespace
-
-uint64_t GridSortScratchBytes(uint32_t particle_count) {
-    if (particle_count == 0u) {
-        return 0u;
-    }
-    return GridSortScratchLayout(particle_count).total;
-}
 
 uint64_t PairSortScratchBytes(uint32_t total_sort_slots, uint32_t env_count) {
     if (total_sort_slots == 0u || env_count == 0u) {
@@ -821,7 +590,6 @@ void RegisterNkBroadphaseOps() {
     SetCudaOp(NkOp::BuildAabbs, &OpBuildAabbs);
     SetCudaOp(NkOp::LbvhBuild, &OpLbvhBuild);
     SetCudaOp(NkOp::LbvhQueryPairs, &OpLbvhQueryPairs);
-    SetCudaOp(NkOp::ParticleGridBuild, &OpParticleGridBuild);
 }
 
 }  // namespace nuka::phi

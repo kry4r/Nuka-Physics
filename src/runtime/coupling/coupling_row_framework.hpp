@@ -20,7 +20,7 @@
 // per-side ReactionProvider (RigidInvMass / ArticulationChainJ / ParticleInvMass
 // / StaticNull) at solve time. So EmitCouplingRows REUSES EmitCompliantContactRows
 // (C4b) verbatim and only RE-CLASSES the emitted rows to RowClassId
-// CouplingContactRow (id13). The SOLVE dispatches on the Compliant flag + the
+// CouplingContactRow (id 6). The SOLVE dispatches on the Compliant flag + the
 // per-side react, NOT on row_class_id, so the re-class is a pure classification
 // label (the framework contract: cross-system coupling rows are id13, distinct
 // from the same-system MaximalContactRow id0 and the particle-particle id10).

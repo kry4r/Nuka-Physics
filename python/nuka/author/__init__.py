@@ -29,7 +29,7 @@ Soft/fluid media on a ground (the general builder path)::
     s = Scene(SimOptions(dt=1/240, env_count=1))
     s.add_entity(morphs.Ground(), materials.Rigid(friction=0.8))
     s.add_entity(morphs.TetSphere((0, 0, 0.3), 0.10, 8),
-                 materials.Soft.XPBD(volume_alpha=1.5e-6, iters=40))
+                 materials.Soft.MPM(youngs=1.0e5, dx=0.02))
     with nuka.Device.create(0) as dev:
         world = s.build(dev)
 """

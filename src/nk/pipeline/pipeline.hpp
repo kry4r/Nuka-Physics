@@ -98,7 +98,6 @@ private:
     // Parameter storage is sized before emission so captured calls retain stable addresses.
     std::vector<phi::OpCall> calls_;
     std::vector<phi::NkOp> missing_ops_;
-    std::vector<phi::XpbdProjectParams> p_xpbd_iterations_;
     std::vector<phi::SolveRowsBlockIslandParams> p_solve_iterations_;
     std::vector<phi::BlockDescentSolveParams> p_block_descent_substeps_;
     std::vector<phi::AccumulateStepParams> p_accumulate_step_;
@@ -134,7 +133,6 @@ private:
     phi::BuildAabbsParams             p_aabbs_{};
     phi::LbvhBuildParams              p_lbvh_build_{};
     phi::LbvhQueryPairsParams         p_lbvh_query_{};
-    phi::ParticleGridBuildParams      p_grid_{};
     phi::NarrowphasePrimitivesParams  p_np_prim_{};
     phi::NarrowphaseHeightfieldParams p_np_hf_{};    // general contact H3 heightfield
     phi::NarrowphaseBodyParticleParams p_np_body_particle_{};  // body<->particle
@@ -152,12 +150,8 @@ private:
     phi::ParticlePredictParams        p_part_predict_{};
     phi::ParticleProjectionVelocityParams p_part_projection_velocity_{};
     phi::ParticleContactDeltaParams   p_part_contact_delta_{};
-    phi::XpbdProjectParams            p_xpbd_{};
-    phi::PbfDensityLambdaParams       p_pbf_density_{};
-    phi::PbfApplyDeltaParams          p_pbf_apply_{};
     phi::ParticleFinalizeParams       p_part_finalize_{};
     phi::ClothStepParams              p_cloth_step_{};
-    phi::ParticleParticleContactParams p_pp_contact_{};
     phi::MpmParams                    p_mpm_{};
     phi::ReadoutContactWrenchParams   p_readout_{};
     // L1-c: p_union_obs_ (the union-only per-env contact-obs readout params)

@@ -161,8 +161,6 @@ inline constexpr DlpackFieldRow kDlpackFieldTable[] = {
     {NUKA_FIELD_BODY_GYRO_RESIDUAL,   kStrideF32,   kWireDtypeF32, nk::FieldId::BodyGyroResidual},
     {NUKA_FIELD_BODY_GYRO_ITERATIONS, kStrideU32,   kWireDtypeU32, nk::FieldId::BodyGyroIterations},
     {NUKA_FIELD_BODY_GYRO_STATUS,     kStrideU32,   kWireDtypeU32, nk::FieldId::BodyGyroStatus},
-    {NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED, kStrideU32, kWireDtypeU32, nk::FieldId::GridNeighborAttempted},
-    {NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT, kStrideU32, kWireDtypeU32, nk::FieldId::GridNeighborCount},
     {NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticleF},
     {NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT, kStrideMat3, kWireDtypeF32, nk::FieldId::ParticlePlasticF},
     {NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN, kStrideF32, kWireDtypeF32, nk::FieldId::ParticlePlastic},

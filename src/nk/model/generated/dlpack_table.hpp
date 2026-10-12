@@ -143,35 +143,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticleVel, DlpackDtype::kF32, 2, true, false},  // particle_vel
     {FieldId::ParticleInvMass, DlpackDtype::kF32, 1, false, false},  // particle_inv_mass
     {FieldId::ParticleVPre, DlpackDtype::kF32, 2, false, false},  // particle_v_pre
-    {FieldId::DistParticleA, DlpackDtype::kU32, 1, false, false},  // dist_particle_a
-    {FieldId::DistParticleB, DlpackDtype::kU32, 1, false, false},  // dist_particle_b
-    {FieldId::DistRestLength, DlpackDtype::kF32, 1, false, false},  // dist_rest_length
-    {FieldId::DistCompliance, DlpackDtype::kF32, 1, false, false},  // dist_compliance
-    {FieldId::DistLambda, DlpackDtype::kF32, 1, false, false},  // dist_lambda
-    {FieldId::VolParticles, DlpackDtype::kU32, 2, false, false},  // vol_particles
-    {FieldId::VolRestTimes6, DlpackDtype::kF32, 1, false, false},  // vol_rest_times6
-    {FieldId::VolCompliance, DlpackDtype::kF32, 1, false, false},  // vol_compliance
-    {FieldId::VolLambda, DlpackDtype::kF32, 1, false, false},  // vol_lambda
-    {FieldId::SmClusterOffset, DlpackDtype::kU32, 1, false, false},  // sm_cluster_offset
-    {FieldId::SmClusterSize, DlpackDtype::kU32, 1, false, false},  // sm_cluster_size
-    {FieldId::SmStiffness, DlpackDtype::kF32, 1, false, false},  // sm_stiffness
-    {FieldId::SmRestCentroid, DlpackDtype::kF32, 2, false, false},  // sm_rest_centroid
-    {FieldId::SmParticles, DlpackDtype::kU32, 1, false, false},  // sm_particles
-    {FieldId::SmRestQ, DlpackDtype::kF32, 2, false, false},  // sm_rest_q
-    {FieldId::SmMass, DlpackDtype::kF32, 1, false, false},  // sm_mass
     {FieldId::AeroTriVerts, DlpackDtype::kU32, 2, false, false},  // aero_tri_verts
     {FieldId::AeroTriArea, DlpackDtype::kF32, 1, false, false},  // aero_tri_area
     {FieldId::PbfPredictedPos, DlpackDtype::kF32, 2, false, false},  // pbf_predicted_pos
-    {FieldId::PbfPositionDelta, DlpackDtype::kF32, 2, false, false},  // pbf_position_delta
-    {FieldId::PbfDensity, DlpackDtype::kF32, 1, false, false},  // pbf_density
-    {FieldId::PbfLambda, DlpackDtype::kF32, 1, false, false},  // pbf_lambda
-    {FieldId::GridCellKey, DlpackDtype::kU32, 1, false, false},  // grid_cell_key
-    {FieldId::GridParticleIdx, DlpackDtype::kU32, 1, false, false},  // grid_particle_idx
-    {FieldId::GridCellStart, DlpackDtype::kU32, 1, false, false},  // grid_cell_start
-    {FieldId::GridCellEnd, DlpackDtype::kU32, 1, false, false},  // grid_cell_end
-    {FieldId::GridNeighborOffset, DlpackDtype::kU32, 1, false, false},  // grid_neighbor_offset
-    {FieldId::GridNeighborCount, DlpackDtype::kU32, 1, false, true},  // grid_neighbor_count
-    {FieldId::GridNeighborIdx, DlpackDtype::kU32, 1, false, false},  // grid_neighbor_idx
     {FieldId::RngState, DlpackDtype::kU64, 1, false, false},  // rng_state
     {FieldId::EnvStatus, DlpackDtype::kU32, 1, false, true},  // env_status
     {FieldId::ObsBuffer, DlpackDtype::kF32, 1, false, true},  // obs_buffer
@@ -208,10 +182,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::SnapshotParticlePos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_pos
     {FieldId::SnapshotParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_prev_pos
     {FieldId::SnapshotParticleVel, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_vel
-    {FieldId::DistColorSegments, DlpackDtype::kU32, 1, false, false},  // dist_color_segments
-    {FieldId::VolColorSegments, DlpackDtype::kU32, 1, false, false},  // vol_color_segments
-    {FieldId::SmColorSegments, DlpackDtype::kU32, 1, false, false},  // sm_color_segments
-    {FieldId::GridSortScratch, DlpackDtype::kU8, 1, false, false},  // grid_sort_scratch
     {FieldId::GridMass, DlpackDtype::kF32, 1, false, false},  // grid_mass
     {FieldId::GridMomentum, DlpackDtype::kF32, 2, false, false},  // grid_momentum
     {FieldId::GridVelocity, DlpackDtype::kF32, 2, false, false},  // grid_velocity
@@ -298,8 +268,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::BodyGyroResidual, DlpackDtype::kF32, 1, false, true},  // body_gyro_residual
     {FieldId::BodyGyroIterations, DlpackDtype::kU32, 1, false, true},  // body_gyro_iterations
     {FieldId::BodyGyroStatus, DlpackDtype::kU32, 1, false, true},  // body_gyro_status
-    {FieldId::GridNeighborAttempted, DlpackDtype::kU32, 1, false, true},  // grid_neighbor_attempted
-    {FieldId::GridNeighborScanOffset, DlpackDtype::kU64, 1, false, false},  // grid_neighbor_scan_offset
     {FieldId::LbvhSortScratch, DlpackDtype::kU8, 1, false, false},  // lbvh_sort_scratch
     {FieldId::ContactCacheScratch, DlpackDtype::kU8, 1, false, false},  // contact_cache_scratch
     {FieldId::ActiveRowIds, DlpackDtype::kU32, 1, false, false},  // active_row_ids
@@ -309,9 +277,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::LinkContactBegin, DlpackDtype::kU32, 1, false, false},  // link_contact_begin
     {FieldId::LinkContactEnd, DlpackDtype::kU32, 1, false, false},  // link_contact_end
     {FieldId::ContactIndexScratch, DlpackDtype::kU8, 1, false, false},  // contact_index_scratch
-    {FieldId::ParticleTopologyOffsets, DlpackDtype::kU32, 1, false, false},  // particle_topology_offsets
-    {FieldId::ParticleTopologyElements, DlpackDtype::kU32, 1, false, false},  // particle_topology_elements
-    {FieldId::ParticleContactRestPos, DlpackDtype::kF32, 2, false, false},  // particle_contact_rest_pos
     {FieldId::MeshSurfaceInfo, DlpackDtype::kU8, 2, false, false},  // mesh_surface_info
     {FieldId::MeshTriangles, DlpackDtype::kU32, 1, false, false},  // mesh_triangles
     {FieldId::MeshBvhNodes, DlpackDtype::kU8, 2, false, false},  // mesh_bvh_nodes

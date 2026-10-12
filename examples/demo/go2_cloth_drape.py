@@ -7,7 +7,7 @@ flat above a PD-standing Go2 (cooked from go2_cloth_drape_contact3.nks for its p
 skeleton) while the dog settles, RELEASES it to flutter down under anisotropic
 aero drag and conform to the body on the ONE general body<->particle row solver,
 and beauty-renders the LIVE world each frame with World.render_beauty. The cloth
-params + the stand/drape choreography reproduce examples/demo/go2_cloth_drape_demo.cpp.
+params + the stand/drape choreography follow the Go2 cloth gate scene.
 
 Pure Python over the prebuilt nuka module -- NO recompile. Writes
 out/cloth_py/frame_####.png (and an mp4 when ffmpeg is on PATH).

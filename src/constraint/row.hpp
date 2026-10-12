@@ -63,14 +63,6 @@ inline constexpr uint32_t kFeatherstoneContactRowClassId = 3u;
 // generated header. A codegen-roundtrip test guards that the ids stay in sync.
 inline constexpr uint32_t kRigidSdfContactRowClassId = 4u;
 inline constexpr uint32_t kFeatherstoneSdfContactRowClassId = 5u;
-// v0.7 p09-A: XPBD soft-body distance constraint row class. Hand-mirrors the id
-// in the generated registry (= 6), same rationale as ids 0-5 above; the
-// codegen-roundtrip test guards that this stays in sync with the registry.
-inline constexpr uint32_t kXpbdDistanceRowClassId = 6u;
-// v0.7 p11 (K3): cross-system particle-particle contact row class. Hand-mirrors
-// the id in the generated registry (= 10), same rationale as ids 0-6 above; the
-// codegen-roundtrip test guards that this stays in sync with the registry.
-inline constexpr uint32_t kParticleParticleContactRowClassId = 10u;
 inline constexpr uint32_t kInvalidBodyIndex = ~0u;
 inline constexpr float kRowHugeLimit = 1.0e6f;
 

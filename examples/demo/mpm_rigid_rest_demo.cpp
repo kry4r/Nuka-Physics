@@ -215,9 +215,7 @@ nk::Model BuildModel() {
     m.contact_family = nk::ContactFamily::PairDriven;
     m.filter_cross_env = true;
 
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, BuildBedInput());
+    cook::CookMpmParticles(m, 1u, BuildBedInput());
     m.particles.mpm_body_friction = 0.5f;
     return m;
 }

@@ -108,33 +108,9 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
 void SetOgcContactCapacity(nk::Model& model, uint32_t capacity);
 
 // ---------------------------------------------------------------------------
-// particle cook (the design "粒子 XPBD/PBF"). Stage an XPBD soft body or a
-// PBF fluid into the nk::Model particle block + set the particle/constraint
-// capacities. The cook layer is PURE C++ (nk_engine lint scope: zero CUDA
-// tokens), so it CANNOT include the legacy runtime::soft/fluid world headers
-// (those pull <cuda_runtime.h>). Instead the cook takes the cookers' PLAIN
-// PRODUCTS as POD arrays (the caller runs import::cooker::CookXpbdSoftBody /
-// CookFluidBox — which ARE the reuse — and hands the de-interleaved constraint
-// arrays + the rest state here). The de-interleave mirrors the legacy
-// soft-upload / fluid-upload byte layout, so the device-staged particle /
-// constraint tables (after env-major replication) reproduce the legacy world's
-// layout — the byte-exact port contract for the XPBD/PBF 件套.
+// Particle cook: stage vertex-block cloth/cable or MLS-MPM material points into the
+// nk::Model particle block. The cook layer is pure C++ and takes the cookers' POD products.
 // ---------------------------------------------------------------------------
-
-// One XPBD distance constraint (the de-interleaved XpbdDistanceConstraint).
-struct CookDistanceCon { uint32_t a, b; float rest_length, compliance_alpha; };
-// One XPBD volume constraint (4 particles + 6*rest_volume + compliance).
-struct CookVolumeCon { uint32_t p[4]; float rest_volume_times6, compliance_alpha; };
-// One XPBD shape-match cluster (; the de-interleaved XpbdShapeMatchCluster).
-// Variable-size cluster pulled toward the rigid transform of its rest shape.
-// particle[i] indexes the soft particle set; rest_positions[i] is x_i^0; the
-// cluster weight m_i defaults to the particle's mass when omitted (see the cook).
-struct CookShapeMatchCluster {
-    std::vector<uint32_t>   particle;        // cluster particle indices (size n>=1)
-    std::vector<math::Vec3> rest_positions;  // x_i^0, size n (same order)
-    std::vector<float>      cluster_mass;    // m_i weight, size n (>0)
-    float stiffness = 1.0f;                  // goal-pull fraction in [0,1].
-};
 
 struct CookParticleSurface {
     std::vector<uint32_t> triangles;
@@ -147,9 +123,6 @@ struct XpbdCookInput {
     std::vector<math::Vec3>      positions;     // per-particle rest state
     std::vector<math::Vec3>      velocities;    // per-particle initial velocity
     std::vector<float>           inv_mass;      // 1/mass (0 == pinned)
-    std::vector<CookDistanceCon> distance;
-    std::vector<CookVolumeCon>   volume;
-    std::vector<CookShapeMatchCluster> shape_match;  // (id 9).
     // Cloth aerodynamic-drag surface triangles (3 particle indices / triangle).
     // Empty => no drag (the drag op is inert; the cook stays byte-identical).
     std::vector<std::array<uint32_t, 3>> aero_triangles;
@@ -158,22 +131,16 @@ struct XpbdCookInput {
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;
-    uint16_t solver_iterations = 1u;
     // body<->soft contact mu, finite so a foot grips/drags the cloth (solmix=max).
     float    friction = 0.6f;
-    // Per-medium solver selection carried from the Scene IR SoftBodyComponent.
-    // Xpbd (default) cooks the existing XPBD soft body byte-identically; Mpm
-    // routes the cook to CookMpmParticles instead (ParticleMode::Mpm + material).
-    nk::Model::ParticleMode solver = nk::Model::ParticleMode::Xpbd;
     std::vector<CookParticleSurface> surfaces;
-    bool self_contact = false;  // particles collide across folds and layers
     // Vertex-block elements over input particles [vbd_begin, vbd_begin + vbd_count), indexed by input particle.
     std::vector<nk::VbdElement> vbd_elements;
     uint32_t vbd_begin = 0u, vbd_count = 0u;
 };
 
-// Stage an XPBD soft body into the Model (single-env template; SeedInitialState
-// replicates env-major). Sets particles_per_env / dist/bend/vol_cons_per_env.
+// Stage a vertex-block soft body into the Model (single-env template;
+// SeedInitialState replicates env-major).
 void CookXpbdParticles(nk::Model& model, uint32_t env_count,
                        const XpbdCookInput& in);
 
@@ -220,95 +187,21 @@ struct MpmCookInput {
 void CookMpmParticles(nk::Model& model, uint32_t env_count,
                       const MpmCookInput& in);
 
-// Per-medium solver dispatch for a BULK-SOFT body (the only medium MPM admits).
-// Routes by in.solver: Xpbd -> CookXpbdParticles (byte-identical default); Mpm ->
-// CookMpmParticles built from `mpm` (the grid/material the XpbdCookInput lacks).
-// `mpm` is consulted ONLY for the Mpm branch. Throws LOUDLY on an unsupported
-// in.solver (anything but Xpbd/Mpm).
-void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
-                           const XpbdCookInput& in, const MpmCookInput& mpm);
-
-// Validate material methods and grid compatibility: MPM can share a world with XPBD, but not PBF.
+// Validate the (kind x method) of every medium: vertex blocks for cloth/cable, MLS-MPM otherwise.
 void ValidateMedia(const std::vector<MediaRecord>& media);
 
-struct PbfCookInput {
-    std::vector<math::Vec3> positions;     // CookFluidBox lattice
-    std::vector<math::Vec3> velocities;    // initial velocity (usually zero)
-    std::vector<float>      inv_mass;      // 1/mass (0 == pinned boundary)
-    float    particle_mass   = 0.0f;       // uniform mass = rho0 * spacing^3
-    float    rest_density    = 0.0f;       // rho0
-    float    support_radius  = 0.0f;       // h (== grid cell size + query radius)
-    float    cfm_epsilon     = 1.0e-6f;
-    uint16_t iters           = 4u;
-    bool     clamp_overdensity = true;
-    float    xsph_viscosity  = 0.0f;
-    float    surface_tension = 0.0f;
-    // Uniform grid domain (the op rebuilds the grid each step over the predicted
-    // positions but sizes it from this cooked AABB + cell size == support radius).
-    math::Vec3 grid_min{0.0f, 0.0f, 0.0f};
-    uint32_t   grid_dims[3] = {0u, 0u, 0u};
-    bool       boundary_enabled = false;
-    float      floor_z = 0.0f;             // z-up boundary floor.
-    // body<->fluid contact mu, ~0 so a foot slides (splash stays normal/PBF-driven).
-    float      friction = 0.0f;
-    // Pinned-boundary confinement: walls_enabled appends boundary_layers floor-slab
-    // layers + a side-wall ring (all inv_mass 0). Off => byte-identical fluid cook.
-    bool       walls_enabled   = false;
-    math::Vec3 walls_min{0.0f, 0.0f, 0.0f};
-    math::Vec3 walls_max{0.0f, 0.0f, 0.0f};
-    uint32_t   boundary_layers = 0u;
-};
 
-// Stage a PBF fluid into the Model (single-env template; SeedInitialState
-// replicates env-major). Sets particles_per_env.
-void CookPbfParticles(nk::Model& model, uint32_t env_count,
-                      const PbfCookInput& in);
-
-// Cross-system — cross-system contact params for the co-residence cook.
-// The class-blind unilateral non-penetration co-step over the FULL [soft | fluid]
-// union (op-ified cross-system particle co-step). d_min ==
-// 2*contact_radius (uniform radius); <= 0 disables the op (the default). The cook
-// widens the union grid query_radius/cell_size to >= d_min so the neighbor list
-// covers every contact pair (the grid is built over the union by ParticleGridBuild).
-struct SoftFluidContactInput {
-    float    contact_d_min      = 0.0f;  // 2*contact_radius (<= 0 => no cross-contact)
-    float    compliance_alpha   = 0.0f;  // XPBD alpha (0 == rigid)
-    uint32_t solver_iterations  = 1u;    // Jacobi gather+apply sweeps (>= 1)
-};
-
-// Two-system cook: stage BOTH a soft (XPBD) particle set AND a fluid (PBF)
-// particle set co-resident into ONE Model with a contiguous [soft | fluid] layout
-// (the soft particles occupy [0, n_soft), the fluid [n_soft, particles_per_env)).
-// The soft XPBD constraint indices stay in the soft slice; the fluid particles are
-// appended AFTER the soft set, so the PBF density solve (scoped to [n_soft, P) by
-// the SoftFluid ops) never sees a soft particle. Mode = ParticleMode::SoftFluid.
-// STRICT SUPERSET: a soft-only cook (fluid empty) is byte-identical to
-// CookXpbdParticles + the shape-match block; a fluid-only cook (soft empty,
-// n_soft 0) is byte-identical to CookPbfParticles. The two single-system cooks
-// remain the canonical paths; this is the co-residence composer. The optional
-// `contact` block enables the cross-system non-penetration co-step over the
-// union (default-off => behavior: the two slices co-step independently).
-void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
-                            const XpbdCookInput& soft, const PbfCookInput& fluid,
-                            const SoftFluidContactInput& contact = {});
-
-// Two-system cook: stage BOTH an MLS-MPM medium AND an XPBD (cloth/tet) set
-// co-resident into ONE Model with a contiguous [mpm | xpbd] layout (MPM occupies
-// [0, n_mpm), the XPBD set [n_mpm, particles_per_env)). The XPBD constraint indices
-// are rebased by n_mpm; the MPM continuum fields stay sized to the MPM slice.
-// Mode = ParticleMode::MpmXpbd. STRICT SUPERSET: an MPM-only cook (soft empty) is
-// byte-identical to CookMpmParticles, an XPBD-only cook (mpm empty) to
-// CookXpbdParticles, each plus the same body<->particle contact setup.
+// Co-resident [mpm | vertex blocks] cook: MPM occupies [0, n_mpm), the soft set the rest.
+// One empty side reduces to the single-medium cook; contact_d_min is the body<->particle diameter.
 void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
-                 const XpbdCookInput& soft, const SoftFluidContactInput& contact = {});
+                 const XpbdCookInput& soft, float contact_d_min = 0.0f);
 
 // ---------------------------------------------------------------------------
 // Media records -> particle cook. The per-medium builders read a scene
 // MediaRecord and reuse the SAME topology/lattice cookers
 // (soft::BuildClothVertexBlocks / import::cooker::CookFluidBox) -- never
-// reimplemented. The dispatch concatenates tet media, then vertex-block media,
-// into the soft slice and the one PBF fluid into the fluid slice via
-// CookSoftFluidParticles, so the media list rides the [soft | fluid] layout.
+// reimplemented. The dispatch concatenates vertex-block media into the soft slice and
+// MLS-MPM media onto one grid, composing them with CookMpmXpbd when both are present.
 // ---------------------------------------------------------------------------
 
 // Whether a medium solves as vertex blocks (cloth and cable); these end the soft slice.
@@ -318,10 +211,6 @@ bool IsVertexBlockMedium(const MediaRecord& media);
 // lattice, lumped area masses, and StVK membrane plus hinge vertex blocks from
 // soft::BuildClothVertexBlocks. Empty when the geometry is absent.
 XpbdCookInput BuildClothVertexBlockInput(const MediaRecord& media);
-
-// Build the XPBD cook input for a tet-soft MediaRecord from its sphere rest-lattice
-// (soft::BuildSphereTetLattice + BuildTetMeshConstraints). Empty when extent absent.
-XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media);
 
 // Build the soft-slice input of a cable MediaRecord: segments+1 vertex blocks from
 // start to end joined by axial springs and segment bends, the pinned endpoint(s)
@@ -345,13 +234,8 @@ std::vector<uint32_t> BuildClothSurfaceTriangles(const MediaRecord& media);
 std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     const std::vector<MediaRecord>& media);
 
-// Build the PBF cook input for a fluid MediaRecord: an AABB box filled on a uniform
-// lattice by import::cooker::CookFluidBox, the uniform grid sized to enclose the box
-// + headroom. Empty when the box extent is absent.
-PbfCookInput BuildFluidPbfInput(const MediaRecord& media);
-
-// Dispatch a validated media list onto an ALREADY-cooked Model: an all-XPBD/PBF list
-// routes through CookSoftFluidParticles, a lone MLS-MPM medium through CookSoftBodyParticles.
+// Dispatch a validated media list onto an ALREADY-cooked Model: vertex-block media through
+// CookXpbdParticles, MLS-MPM media through CookMpmParticles, both through CookMpmXpbd.
 void CookSceneMedia(nk::Model& model, uint32_t env_count,
                     const std::vector<MediaRecord>& media,
                     float particle_contact_radius = 0.0f);

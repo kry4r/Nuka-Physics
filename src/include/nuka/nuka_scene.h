@@ -235,8 +235,8 @@ typedef struct nuka_environment_desc_t {
 nuka_result_t nuka_scene_set_environment(nuka_scene_handle scene,
                                          const nuka_environment_desc_t* desc);
 
-// The cook validator rejects unsupported kind/method pairs and MPM + PBF worlds.
-// MPM + XPBD worlds support two-way contact with authored particle surfaces.
+// The cook validator rejects unsupported kind/method pairs.
+// MPM + VBD worlds support two-way contact with authored particle surfaces.
 typedef enum nuka_media_kind_t {
     NUKA_MEDIA_CLOTH    = 0,
     NUKA_MEDIA_SOFT_TET = 1,
@@ -246,8 +246,6 @@ typedef enum nuka_media_kind_t {
 } nuka_media_kind_t;
 
 typedef enum nuka_media_method_t {
-    NUKA_MEDIA_METHOD_XPBD   = 0,
-    NUKA_MEDIA_METHOD_PBF    = 1,
     NUKA_MEDIA_METHOD_MLSMPM = 2,
     NUKA_MEDIA_METHOD_VBD    = 3   /* Vertex blocks: cloth and cable. */
 } nuka_media_method_t;
@@ -300,33 +298,18 @@ typedef struct nuka_media_desc_t {
     uint32_t cable_slab_render_material_id;  // ~0u => inherit the medium material.
 
     // -- constitutive material (the block matching `method`) -----------------
-    // XPBD soft-tet (distance+volume) and the shared soft mass/friction/aero block.
+    // The shared soft mass/friction/aero block.
     float    xpbd_particle_mass;
     float    xpbd_friction;
-    float    xpbd_distance_alpha;
-    float    xpbd_volume_alpha;
     // VBD cloth: stretch = Young's modulus x thickness (N/m), bend = hinge (N m);
     // cable: stretch = EA (N), bend = EI (N m^2). damping is Rayleigh (s).
     float    vbd_stretch_stiffness;
     float    vbd_poisson;
     float    vbd_bend_stiffness;
     float    vbd_damping;
-    uint32_t xpbd_iters;
     float    xpbd_aero_drag_normal;
     float    xpbd_aero_drag_tangent;
     float    xpbd_aero_drag_max_dv;
-    // PBF (fluid). support_radius = pbf_support_scale * fluid_spacing. The walls
-    // fields generate a pinned boundary slab + side ring (box confinement).
-    float    pbf_rest_density;
-    float    pbf_support_scale;
-    uint32_t pbf_iters;
-    float    pbf_friction;
-    uint32_t pbf_clamp_overdensity;  // 1 => clamp over-density (the default).
-    uint32_t pbf_walls_enabled;      // 1 => append the pinned confinement container.
-    float    pbf_walls_min[3];
-    float    pbf_walls_max[3];
-    float    pbf_floor_z;
-    uint32_t pbf_boundary_layers;
     // MLS-MPM (soft-tet / fluid / granular). model_kind 0 corotated, 2 neo-hookean,
     // 3 fluid, 4 granular Drucker-Prager (dp_friction deg, dp_cohesion Pa).
     float    mpm_youngs;
@@ -405,7 +388,7 @@ nuka_result_t nuka_scene_add_collision_shape(nuka_scene_handle scene,
 // Add a media record (cloth / soft-tet / fluid) to the built scene via
 // SceneIR::AddMedia. The single record's (kind x method) legality is checked
 // immediately by the cook's ValidateMedia -> INVALID_ARG on an illegal pair (the
-// cross-medium MPM+XPBD/PBF mix is checked at cook). Returns NULL_HANDLE on a bad
+// cross-medium mix is checked at cook). Returns NULL_HANDLE on a bad
 // handle, INVALID_ARG on a NULL / unknown-kind / unknown-method / illegal-pair desc.
 // out_media_id (optional) receives the new record's MediaId (the target for
 // nuka_scene_add_mpm_fill).

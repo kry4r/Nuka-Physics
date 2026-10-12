@@ -303,14 +303,13 @@ public:
         return new World(h, env_count, base_link_count, dt);
     }
 
-    // Create a COUPLED world: a robot cooked from `scene_path` PLUS cloth (XPBD)
-    // and/or fluid (PBF) particles, stepping on the ONE general contact pipeline with
+    // Create a COUPLED world: a robot cooked from `scene_path` PLUS VBD cloth
+    // particles, stepping on the ONE general contact pipeline with
     // two-way body<->particle coupling. The MINIMAL reachability surface (create +
     // step + read) for a coupled world; full RL obs/action/reward over the particle
     // state is a separate RL-track follow-on, NOT built here. Read the live media via
     // buffer_view(Field.PARTICLE_POSITION / PARTICLE_VELOCITY). A cloth patch is a
-    // flat (cloth_nx x cloth_ny) lattice (perimeter pinned); a fluid box fills an AABB
-    // on a z-up floor; either is omitted by leaving its extent zero (>= one required).
+    // flat (cloth_nx x cloth_ny) lattice (perimeter pinned); the cloth is required.
     static World* create_coupled_from_scene(
         Device* device, const std::string& scene_path, uint32_t env_count, float dt,
         uint32_t control_mode, uint32_t contact_family,
@@ -320,10 +319,7 @@ public:
         uint32_t cloth_ny, float cloth_spacing, float cloth_origin_x,
         float cloth_origin_y, float cloth_origin_z, float cloth_particle_mass,
         float cloth_friction, float cloth_stretch_stiffness, float cloth_bend_stiffness,
-        float cloth_poisson, float cloth_damping, float fluid_min_x, float fluid_min_y, float fluid_min_z, float fluid_max_x,
-        float fluid_max_y, float fluid_max_z, float fluid_spacing,
-        float fluid_rest_density, float fluid_floor_z, float fluid_friction,
-        uint32_t fluid_iters, float contact_radius, uint32_t soft_sim_method,
+        float cloth_poisson, float cloth_damping, float contact_radius, uint32_t soft_sim_method,
         bool cloth_free, float aero_normal, float aero_tangent, float aero_max_dv,
         uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
@@ -364,19 +360,8 @@ public:
         parts.cloth_bend_stiffness = cloth_bend_stiffness;
         parts.cloth_poisson = cloth_poisson;
         parts.cloth_damping = cloth_damping;
-        parts.fluid_min_x = fluid_min_x;
-        parts.fluid_min_y = fluid_min_y;
-        parts.fluid_min_z = fluid_min_z;
-        parts.fluid_max_x = fluid_max_x;
-        parts.fluid_max_y = fluid_max_y;
-        parts.fluid_max_z = fluid_max_z;
-        parts.fluid_spacing = fluid_spacing;
-        parts.fluid_rest_density = fluid_rest_density;
-        parts.fluid_floor_z = fluid_floor_z;
-        parts.fluid_friction = fluid_friction;
-        parts.fluid_iters = fluid_iters;
         parts.contact_radius = contact_radius;
-        parts.soft_sim_method = soft_sim_method;  // 0 = xpbd default, 1 = mlsmpm.
+        parts.soft_sim_method = soft_sim_method;  // 0 = VBD default, 1 = mlsmpm.
         parts.cloth_free = cloth_free ? 1u : 0u;   // 1 = skip perimeter pin (free drape).
         parts.aero_normal = aero_normal;           // anisotropic aero drag (0 = off).
         parts.aero_tangent = aero_tangent;
@@ -1560,16 +1545,10 @@ public:
                    const std::vector<float>& fluid_max, float fluid_spacing,
                    float fluid_position_jitter, float mpm_loft_headroom,
                    float xpbd_particle_mass, float xpbd_friction,
-                   float xpbd_distance_alpha, float xpbd_volume_alpha,
                    float vbd_stretch_stiffness, float vbd_poisson,
-                   float vbd_bend_stiffness, float vbd_damping, uint32_t xpbd_iters,
+                   float vbd_bend_stiffness, float vbd_damping,
                    float xpbd_aero_normal, float xpbd_aero_tangent,
-                   float xpbd_aero_max_dv, float pbf_rest_density,
-                   float pbf_support_scale, uint32_t pbf_iters, float pbf_friction,
-                   bool pbf_clamp_overdensity, bool pbf_walls_enabled,
-                   const std::vector<float>& pbf_walls_min,
-                   const std::vector<float>& pbf_walls_max, float pbf_floor_z,
-                   uint32_t pbf_boundary_layers, float mpm_youngs,
+                   float xpbd_aero_max_dv, float mpm_youngs,
                    float mpm_poisson, float mpm_density, float mpm_dp_friction,
                    float mpm_dp_cohesion, float mpm_model_kind,
                    float mpm_bulk_modulus, float mpm_tait_gamma, float mpm_viscosity,
@@ -1616,26 +1595,13 @@ public:
         d.xpbd_friction = xpbd_friction;
         d.xpbd_half_thickness = xpbd_half_thickness;
         d.xpbd_surface_density = xpbd_surface_density;
-        d.xpbd_distance_alpha = xpbd_distance_alpha;
-        d.xpbd_volume_alpha = xpbd_volume_alpha;
         d.vbd_stretch_stiffness = vbd_stretch_stiffness;
         d.vbd_poisson = vbd_poisson;
         d.vbd_bend_stiffness = vbd_bend_stiffness;
         d.vbd_damping = vbd_damping;
-        d.xpbd_iters = xpbd_iters;
         d.xpbd_aero_drag_normal = xpbd_aero_normal;
         d.xpbd_aero_drag_tangent = xpbd_aero_tangent;
         d.xpbd_aero_drag_max_dv = xpbd_aero_max_dv;
-        d.pbf_rest_density = pbf_rest_density;
-        d.pbf_support_scale = pbf_support_scale;
-        d.pbf_iters = pbf_iters;
-        d.pbf_friction = pbf_friction;
-        d.pbf_clamp_overdensity = pbf_clamp_overdensity ? 1u : 0u;
-        d.pbf_walls_enabled = pbf_walls_enabled ? 1u : 0u;
-        vec3(pbf_walls_min, d.pbf_walls_min, "pbf_walls_min");
-        vec3(pbf_walls_max, d.pbf_walls_max, "pbf_walls_max");
-        d.pbf_floor_z = pbf_floor_z;
-        d.pbf_boundary_layers = pbf_boundary_layers;
         d.mpm_youngs = mpm_youngs;
         d.mpm_poisson = mpm_poisson;
         d.mpm_density = mpm_density;
@@ -1910,15 +1876,13 @@ NB_MODULE(_nuka_ext, m) {
     m.attr("PRIMITIVE_SPHERE") = uint32_t{2};
     m.attr("PRIMITIVE_CAPSULE") = uint32_t{3};
     // SceneBuilder.add_media(kind=...) / (method=...) codes (nuka_media_kind_t /
-    // nuka_media_method_t). Legal pairs: cloth=XPBD; soft_tet=XPBD|MLSMPM;
-    // fluid=PBF|MLSMPM; granular=MLSMPM; cable=XPBD (an illegal pair raises at add_media).
+    // nuka_media_method_t). Legal pairs: cloth=VBD; soft_tet=MLSMPM;
+    // fluid=MLSMPM; granular=MLSMPM; cable=VBD (an illegal pair raises at add_media).
     m.attr("MEDIA_CLOTH") = uint32_t{0};
     m.attr("MEDIA_SOFT_TET") = uint32_t{1};
     m.attr("MEDIA_FLUID") = uint32_t{2};
     m.attr("MEDIA_GRANULAR") = uint32_t{3};
     m.attr("MEDIA_CABLE") = uint32_t{4};
-    m.attr("MEDIA_METHOD_XPBD") = uint32_t{0};
-    m.attr("MEDIA_METHOD_PBF") = uint32_t{1};
     m.attr("MEDIA_METHOD_MLSMPM") = uint32_t{2};
     m.attr("MEDIA_METHOD_VBD") = uint32_t{3};
     // SceneBuilder.add_media(cloth_pin=...) pin-set codes (MediaRecord::ClothPin):
@@ -1980,9 +1944,8 @@ NB_MODULE(_nuka_ext, m) {
         // tau += joint_f in every control mode, after actuator saturation. Same
         // layout/slot map as DRIVE_TARGET; writable zero-copy. Default 0 => no-op.
         .value("JOINT_FEEDFORWARD", NUKA_FIELD_JOINT_FEEDFORWARD)
-        // Coupled-world (cloth/tet/fluid) live particle state (read; per-particle
-        // Vec3, env-major). buffer_view shape (env_count*particles_per_env, 3) float32
-        // -- the soft slice [0, n_soft), the fluid slice [n_soft, P). An empty view
+        // Coupled-world live particle state (read; per-particle Vec3, env-major).
+        // buffer_view shape (env_count*particles_per_env, 3) float32. An empty view
         // (element_count == 0) on a world with no particles.
         .value("PARTICLE_POSITION", NUKA_FIELD_PARTICLE_POSITION)
         .value("PARTICLE_VELOCITY", NUKA_FIELD_PARTICLE_VELOCITY)
@@ -2055,8 +2018,6 @@ NB_MODULE(_nuka_ext, m) {
         .value("BODY_GYRO_RESIDUAL", NUKA_FIELD_BODY_GYRO_RESIDUAL)
         .value("BODY_GYRO_ITERATIONS", NUKA_FIELD_BODY_GYRO_ITERATIONS)
         .value("BODY_GYRO_STATUS", NUKA_FIELD_BODY_GYRO_STATUS)
-        .value("PARTICLE_NEIGHBOR_ATTEMPTED", NUKA_FIELD_PARTICLE_NEIGHBOR_ATTEMPTED)
-        .value("PARTICLE_NEIGHBOR_COUNT", NUKA_FIELD_PARTICLE_NEIGHBOR_COUNT)
         .value("PARTICLE_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_DEFORMATION_GRADIENT)
         .value("PARTICLE_PLASTIC_DEFORMATION_GRADIENT", NUKA_FIELD_PARTICLE_PLASTIC_DEFORMATION_GRADIENT)
         .value("PARTICLE_EQUIVALENT_PLASTIC_STRAIN", NUKA_FIELD_PARTICLE_EQUIVALENT_PLASTIC_STRAIN)
@@ -2253,13 +2214,7 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("cloth_origin_z") = 0.0f, nb::arg("cloth_particle_mass") = 0.01f,
             nb::arg("cloth_friction") = 0.6f, nb::arg("cloth_stretch_stiffness") = 5.0e3f,
             nb::arg("cloth_bend_stiffness") = 5.0e-5f, nb::arg("cloth_poisson") = 0.3f,
-            nb::arg("cloth_damping") = 0.0f, nb::arg("fluid_min_x") = 0.0f,
-            nb::arg("fluid_min_y") = 0.0f, nb::arg("fluid_min_z") = 0.0f,
-            nb::arg("fluid_max_x") = 0.0f, nb::arg("fluid_max_y") = 0.0f,
-            nb::arg("fluid_max_z") = 0.0f, nb::arg("fluid_spacing") = 0.0f,
-            nb::arg("fluid_rest_density") = 1000.0f, nb::arg("fluid_floor_z") = 0.0f,
-            nb::arg("fluid_friction") = 0.0f, nb::arg("fluid_iters") = 4u,
-            nb::arg("contact_radius") = 0.0f, nb::arg("soft_sim_method") = 0u,
+            nb::arg("cloth_damping") = 0.0f, nb::arg("contact_radius") = 0.0f, nb::arg("soft_sim_method") = 0u,
             nb::arg("cloth_free") = false, nb::arg("aero_normal") = 0.0f,
             nb::arg("aero_tangent") = 0.0f, nb::arg("aero_max_dv") = 0.0f,
             nb::arg("solver_vel_iters") = 0u, nb::arg("solver_pos_iters") = 0u,
@@ -2269,17 +2224,15 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("baumgarte_max_velocity") = 0.0f,
             nb::arg("osc_task_link") = 0u,
             nb::rv_policy::take_ownership,
-            "Create a COUPLED world: a robot cooked from scene_path PLUS cloth (XPBD) "
-            "and/or fluid (PBF) particles, stepping on the ONE general contact "
+            "Create a COUPLED world: a robot cooked from scene_path PLUS VBD cloth "
+            "particles, stepping on the ONE general contact "
             "pipeline with two-way body<->particle coupling. The MINIMAL create + "
             "step + read floor for a coupled world (full RL obs/action over the "
             "particle state is a separate follow-on, NOT here). Read the live media "
             "via buffer_view(Field.PARTICLE_POSITION / PARTICLE_VELOCITY); "
             "particle_count gives the per-env count. A cloth patch is a flat "
-            "(cloth_nx x cloth_ny) perimeter-pinned lattice at cloth_origin_*; a "
-            "fluid box fills the AABB [fluid_min, fluid_max] on a z-up floor at "
-            "fluid_floor_z. Omit a medium by leaving its extent zero (>= one "
-            "required). contact_family == 1 also bakes a heightfield collidable "
+            "(cloth_nx x cloth_ny) perimeter-pinned lattice at cloth_origin_* (required). "
+            "contact_family == 1 also bakes a heightfield collidable "
             "(the same terrain_* knobs create_from_scene takes). cloth_free (default "
             "False): when True the cloth perimeter is NOT pinned -> a free drape "
             "instead of a taut membrane. aero_normal/aero_tangent/aero_max_dv (default "
@@ -2352,8 +2305,7 @@ NB_MODULE(_nuka_ext, m) {
         .def_prop_ro("particle_count", &World::particle_count,
                      "Per-env particle count of a coupled world (0 if particle-free). "
                      "buffer_view(Field.PARTICLE_POSITION) has element_count == "
-                     "env_count * particle_count, each element a Vec3 (the soft slice "
-                     "[0,n_soft), the fluid slice [n_soft,particle_count)).")
+                     "env_count * particle_count, each element a Vec3.")
         .def_prop_ro("action_dim", &World::action_dim,
                      "Actuated joint DOFs a policy controls (12 for Go2) == "
                      "base_link_count - 1. The DRIVE_TARGET / JOINT_POSITION "
@@ -3369,19 +3321,11 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("fluid_position_jitter") = 0.0f,
              nb::arg("mpm_loft_headroom") = 0.0f,
              nb::arg("xpbd_particle_mass") = 0.0f,
-             nb::arg("xpbd_friction") = 0.6f, nb::arg("xpbd_distance_alpha") = 0.0f,
-             nb::arg("xpbd_volume_alpha") = 0.0f,
+             nb::arg("xpbd_friction") = 0.6f,
              nb::arg("vbd_stretch_stiffness") = 0.0f, nb::arg("vbd_poisson") = 0.0f,
              nb::arg("vbd_bend_stiffness") = 0.0f, nb::arg("vbd_damping") = 0.0f,
-             nb::arg("xpbd_iters") = 0u, nb::arg("xpbd_aero_normal") = 0.0f,
+             nb::arg("xpbd_aero_normal") = 0.0f,
              nb::arg("xpbd_aero_tangent") = 0.0f, nb::arg("xpbd_aero_max_dv") = 0.0f,
-             nb::arg("pbf_rest_density") = 0.0f, nb::arg("pbf_support_scale") = 0.0f,
-             nb::arg("pbf_iters") = 0u, nb::arg("pbf_friction") = 0.0f,
-             nb::arg("pbf_clamp_overdensity") = true,
-             nb::arg("pbf_walls_enabled") = false,
-             nb::arg("pbf_walls_min") = std::vector<float>{},
-             nb::arg("pbf_walls_max") = std::vector<float>{},
-             nb::arg("pbf_floor_z") = 0.0f, nb::arg("pbf_boundary_layers") = 0u,
              nb::arg("mpm_youngs") = 0.0f, nb::arg("mpm_poisson") = 0.0f,
              nb::arg("mpm_density") = 0.0f, nb::arg("mpm_dp_friction") = 0.0f,
              nb::arg("mpm_dp_cohesion") = 0.0f, nb::arg("mpm_model_kind") = 0.0f,
@@ -3409,13 +3353,13 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("xpbd_half_thickness") = 0.0f,
              nb::arg("xpbd_surface_density") = 0.0f,
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
-             "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (XPBD/PBF/MLSMPM). kind "
+             "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (MLSMPM/VBD). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
-             "material block (xpbd_*/pbf_*/mpm_*). A cable is XPBD: cable_start/end + "
+             "material block (xpbd_*/vbd_*/mpm_*). A cable is VBD: cable_start/end + "
              "cable_segments links, cable_radius bead size, cable_pin endpoint, optional "
              "cable_slab_* rigid weight welded to the loaded end. Material scalars at 0 take "
              "the cook's own defaults. An illegal (kind x method) pair raises here; an "
-             "MPM + XPBD supports two-way surface contact; MPM + PBF raises at build(). "
+             "MPM + VBD supports two-way surface contact. "
              "Returns the new record's media id.")
         .def("add_mpm_fill", &SceneBuilder::add_mpm_fill, nb::arg("media_id"),
              nb::arg("box_min"), nb::arg("box_max"), nb::arg("spacing"),

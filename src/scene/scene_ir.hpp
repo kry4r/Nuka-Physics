@@ -325,40 +325,20 @@ struct ContactPairOverride {
 // cook input; one geometry/material variant is used per MediaRecord::Kind.
 // ---------------------------------------------------------------------------
 
-// Material of a soft medium: a tet body's distance and volume compliance, or a
-// vertex-block cloth or cable's elastic moduli. Fields map to cook::XpbdCookInput.
+// Material of a vertex-block cloth or cable: mass, friction, elastic moduli and drag.
+// Fields map to cook::XpbdCookInput.
 struct MediaXpbdMaterial {
     float    particle_mass     = 0.0f;
     float    surface_density   = 0.0f;   // kg / m^2; mutually exclusive with particle_mass.
     float    half_thickness    = 0.0f;   // m from the cloth midsurface.
     float    friction          = 0.6f;   // body<->soft contact mu
-    float    distance_alpha    = 0.0f;   // tet distance-constraint compliance
-    float    volume_alpha      = 0.0f;   // tet volume compliance
     float    stretch_stiffness = 0.0f;   // cloth Young's modulus times thickness (N/m); cable EA (N)
     float    poisson           = 0.0f;   // cloth membrane Poisson ratio
     float    bend_stiffness    = 0.0f;   // cloth hinge (N m); cable EI (N m^2)
     float    damping           = 0.0f;   // Rayleigh coefficient on the elastic stiffness (s)
-    uint16_t iters             = 1u;     // solver iterations
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;
-    bool     self_contact      = false;  // particles collide across folds and layers
-};
-
-// Constitutive material for a PBF fluid. rest_density / support_scale / iters /
-// friction map to cook::PbfCookInput; the wall fields carry box confinement.
-struct MediaPbfMaterial {
-    float    rest_density      = 0.0f;
-    float    support_scale     = 0.0f;   // support_radius = support_scale * spacing
-    uint16_t iters             = 4u;
-    float    friction          = 0.0f;
-    bool     clamp_overdensity = true;
-    // Box confinement; the cook generates a pinned boundary slab from boundary_layers.
-    bool       walls_enabled   = false;
-    math::Vec3 walls_min{0.0f, 0.0f, 0.0f};
-    math::Vec3 walls_max{0.0f, 0.0f, 0.0f};
-    float      floor_z         = 0.0f;
-    uint32_t   boundary_layers = 0u;
 };
 
 // Constitutive material for an MLS-MPM medium. Mirrors cook::MpmMaterialInput
@@ -413,9 +393,9 @@ struct MediaRecord {
     // Cable is a vertex-block rod, optionally weighted by a spring-lattice slab welded
     // to its loaded end. Cloth and cable solve as vertex blocks (Vbd).
     enum class Kind   : uint8_t { Cloth, SoftTet, Fluid, Granular, Cable };
-    enum class Method : uint8_t { Xpbd, Pbf, MlsMpm, Vbd };
+    enum class Method : uint8_t { MlsMpm, Vbd };
     Kind   kind   = Kind::Cloth;
-    Method method = Method::Xpbd;
+    Method method = Method::Vbd;
 
     // Procedural geometry (one populated per kind); a baked .obj/.nka mesh
     // medium references its chunk via `baked` instead.
@@ -443,7 +423,7 @@ struct MediaRecord {
         float      cell_len = 0.0f;
     };
     // A box of particles sampled on a uniform lattice; the geometry for a Fluid
-    // (PBF/MPM) and a Granular (MPM sand/gravel) medium alike.
+    // and a Granular (sand/gravel) MPM medium alike.
     struct FluidBox {
         math::Vec3 min{0.0f, 0.0f, 0.0f};
         math::Vec3 max{0.0f, 0.0f, 0.0f};
@@ -492,7 +472,6 @@ struct MediaRecord {
     AssetRef  baked;            // .nka tet/cloth chunk; empty => procedural.
 
     MediaXpbdMaterial xpbd{};
-    MediaPbfMaterial  pbf{};
     MediaMpmMaterial  mpm{};
 
     MediaRenderSkin render_skin{};

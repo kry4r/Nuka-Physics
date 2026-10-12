@@ -25,14 +25,7 @@ enum class RowClassId : uint32_t {
     FeatherstoneContactRow = 3u,
     RigidSDFContactRow = 4u,
     FeatherstoneSDFContactRow = 5u,
-    XPBDDistanceRow = 6u,
-    XPBDBendRow = 7u,
-    XPBDVolumeRow = 8u,
-    XPBDShapeMatchRow = 9u,
-    ParticleParticleContactRow = 10u,
-    XpbdCosseratStretchShearRow = 11u,
-    XpbdCosseratBendTwistRow = 12u,
-    CouplingContactRow = 13u,
+    CouplingContactRow = 6u,
 };
 
 // Reverse-mode gradient mode; index matches the uint8 stored in Row.gradient_mode.
@@ -62,7 +55,7 @@ struct Row {
     uint8_t contact_softness = 0u;
 };
 
-inline constexpr uint32_t kRowClassCount = 14u;
+inline constexpr uint32_t kRowClassCount = 7u;
 inline constexpr uint32_t kMaximalContactRowId = 0u;
 inline constexpr uint32_t kMaximalContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kMaximalContactRowGradientMode = 1u;
@@ -87,35 +80,7 @@ inline constexpr uint32_t kFeatherstoneSDFContactRowId = 5u;
 inline constexpr uint32_t kFeatherstoneSDFContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kFeatherstoneSDFContactRowGradientMode = 2u;
 inline constexpr uint16_t kFeatherstoneSDFContactRowAdjointKernelId = 0u;
-inline constexpr uint32_t kXPBDDistanceRowId = 6u;
-inline constexpr uint32_t kXPBDDistanceRowMaxRowsPerBlock = 6u;
-inline constexpr uint8_t kXPBDDistanceRowGradientMode = 0u;
-inline constexpr uint16_t kXPBDDistanceRowAdjointKernelId = 5u;
-inline constexpr uint32_t kXPBDBendRowId = 7u;
-inline constexpr uint32_t kXPBDBendRowMaxRowsPerBlock = 6u;
-inline constexpr uint8_t kXPBDBendRowGradientMode = 0u;
-inline constexpr uint16_t kXPBDBendRowAdjointKernelId = 6u;
-inline constexpr uint32_t kXPBDVolumeRowId = 8u;
-inline constexpr uint32_t kXPBDVolumeRowMaxRowsPerBlock = 6u;
-inline constexpr uint8_t kXPBDVolumeRowGradientMode = 0u;
-inline constexpr uint16_t kXPBDVolumeRowAdjointKernelId = 7u;
-inline constexpr uint32_t kXPBDShapeMatchRowId = 9u;
-inline constexpr uint32_t kXPBDShapeMatchRowMaxRowsPerBlock = 6u;
-inline constexpr uint8_t kXPBDShapeMatchRowGradientMode = 0u;
-inline constexpr uint16_t kXPBDShapeMatchRowAdjointKernelId = 8u;
-inline constexpr uint32_t kParticleParticleContactRowId = 10u;
-inline constexpr uint32_t kParticleParticleContactRowMaxRowsPerBlock = 6u;
-inline constexpr uint8_t kParticleParticleContactRowGradientMode = 0u;
-inline constexpr uint16_t kParticleParticleContactRowAdjointKernelId = 9u;
-inline constexpr uint32_t kXpbdCosseratStretchShearRowId = 11u;
-inline constexpr uint32_t kXpbdCosseratStretchShearRowMaxRowsPerBlock = 6u;
-inline constexpr uint8_t kXpbdCosseratStretchShearRowGradientMode = 3u;
-inline constexpr uint16_t kXpbdCosseratStretchShearRowAdjointKernelId = 0u;
-inline constexpr uint32_t kXpbdCosseratBendTwistRowId = 12u;
-inline constexpr uint32_t kXpbdCosseratBendTwistRowMaxRowsPerBlock = 6u;
-inline constexpr uint8_t kXpbdCosseratBendTwistRowGradientMode = 3u;
-inline constexpr uint16_t kXpbdCosseratBendTwistRowAdjointKernelId = 0u;
-inline constexpr uint32_t kCouplingContactRowId = 13u;
+inline constexpr uint32_t kCouplingContactRowId = 6u;
 inline constexpr uint32_t kCouplingContactRowMaxRowsPerBlock = 6u;
 inline constexpr uint8_t kCouplingContactRowGradientMode = 3u;
 inline constexpr uint16_t kCouplingContactRowAdjointKernelId = 0u;

@@ -28,7 +28,6 @@
 #include <string>
 #include <vector>
 
-#include "import/cooker/xpbd_cooker_types.hpp"
 #include "import/usd_importer.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -53,7 +52,6 @@ constexpr float kContactDMin = 0.030f;       // particle sphere radius = d_min/2
 constexpr float kParticleMass = 0.05f;       // 50 g per particle (resists the arm).
 constexpr uint32_t kGridN = 11u;             // 11x11 = 121 particles (a patch).
 constexpr float kSpacing = 0.02f;            // ~0.20 m square patch.
-constexpr uint16_t kXpbdIters = 20u;
 constexpr uint32_t kSettleSteps = 400u;
 // The arm starts horizontal (q==0, tip out at +X); a positive revolute target
 // rotates it DOWN about +Y so the descending tip presses a patch placed under it.
@@ -124,7 +122,6 @@ cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
     }
     soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
-    in.solver_iterations = kXpbdIters;
     in.friction = 0.6f;
     return in;
 }

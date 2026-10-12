@@ -36,13 +36,12 @@ from . import surfaces as _surfaces
 _MEDIA_KIND = {"cloth": _nuka.MEDIA_CLOTH, "soft_tet": _nuka.MEDIA_SOFT_TET,
                "fluid": _nuka.MEDIA_FLUID, "granular": _nuka.MEDIA_GRANULAR,
                "cable": _nuka.MEDIA_CABLE}
-_MEDIA_METHOD = {"xpbd": _nuka.MEDIA_METHOD_XPBD, "pbf": _nuka.MEDIA_METHOD_PBF,
-                 "mlsmpm": _nuka.MEDIA_METHOD_MLSMPM, "vbd": _nuka.MEDIA_METHOD_VBD}
+_MEDIA_METHOD = {"mlsmpm": _nuka.MEDIA_METHOD_MLSMPM, "vbd": _nuka.MEDIA_METHOD_VBD}
 _PRIMITIVE = {"plane": _nuka.PRIMITIVE_PLANE, "box": _nuka.PRIMITIVE_BOX,
               "sphere": _nuka.PRIMITIVE_SPHERE, "capsule": _nuka.PRIMITIVE_CAPSULE}
 _DEFAULT_MEDIA_MATERIAL = {"cloth": _materials.Cloth.VBD,
-                           "soft_tet": _materials.Soft.XPBD,
-                           "fluid": _materials.Fluid.PBF,
+                           "soft_tet": _materials.Soft.MPM,
+                           "fluid": _materials.Fluid.MPM,
                            "granular": _materials.Granular.MPM,
                            "cable": _materials.Cable.VBD}
 

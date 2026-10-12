@@ -381,19 +381,12 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     // particle launch geometry + mode (resolved once from the Model).
     const uint32_t particle_count = cap.particles_per_env * env_count;
-    const uint32_t sm_cluster_count = cap.shape_match_slots_per_env * env_count;
     const Model::ModelParticles& mp = model.particles;
     const uint32_t particle_mode =
         mp.mode == Model::ParticleMode::Xpbd ? phi::kParticleModeXpbd
-        : mp.mode == Model::ParticleMode::Pbf ? phi::kParticleModePbf
-        : mp.mode == Model::ParticleMode::Coupled ? phi::kParticleModeCoupled
-        : mp.mode == Model::ParticleMode::SoftFluid ? phi::kParticleModeSoftFluid
         : mp.mode == Model::ParticleMode::Mpm ? phi::kParticleModeMpm
         : mp.mode == Model::ParticleMode::MpmXpbd ? phi::kParticleModeMpmXpbd
                                                   : phi::kParticleModeNone;
-    // SoftFluid: the per-env [soft | fluid] split + stride (0 elsewhere).
-    const uint32_t n_soft = mp.mode == Model::ParticleMode::SoftFluid
-                                ? mp.n_soft_particles : 0u;
     const uint32_t n_mpm = grid_particles_per_env;
     const uint32_t per_env_particles = cap.particles_per_env;
     phi::VertexBlockLayout vertex_blocks;
@@ -439,14 +432,12 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             p_block_descent_.acceleration_spectral_radius = radius;
         }
         // Only head rows enter the incidence: one owner per plain side, every term of a point endpoint.
-        constexpr uint32_t kTetrahedronEndpointTerms = 4u;
         p_block_descent_.incidence_per_env =
             2u * (uint64_t{cap.rigid_contact_rows_per_env} / (1u + kPairDrivenTangentRowsPerPt) +
                   particle_reserve + cap.joint_limit_rows_per_env + cap.joint_friction_rows_per_env +
-                  cap.joint_drive_rows_per_env + cap.dist_cons_per_env) +
+                  cap.joint_drive_rows_per_env) +
             uint64_t{cap.ogc_contacts_per_env} * 2u * kTriangleEndpointTerms +
             uint64_t{cap.mpm_contact_capacity_per_env} * (kMpmStencilNodes + kTriangleEndpointTerms) +
-            uint64_t{cap.vol_cons_per_env} * kTetrahedronEndpointTerms +
             uint64_t{cap.mpm_stress_cells_per_env} * kMpmCellStencilNodes;
         const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
         p_block_descent_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
@@ -455,41 +446,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
             (diagnostics != nullptr && diagnostics[0] == '1');
     }
-    // Per-env soft-particle count selecting which per-system mu a particle side
-    // reads: SoftFluid the explicit split, Xpbd all-soft, Pbf all-fluid, Coupled by type.
-    const uint32_t friction_n_soft =
-        mp.mode == Model::ParticleMode::SoftFluid ? mp.n_soft_particles
-        : mp.mode == Model::ParticleMode::Xpbd ? per_env_particles
-        : mp.mode == Model::ParticleMode::MpmXpbd ? per_env_particles
-        : mp.mode == Model::ParticleMode::Pbf ? 0u
-        : mp.mode == Model::ParticleMode::Coupled
-              ? (mp.coupled_internal == Model::CoupledInternal::Pbf ? 0u
-                                                                    : per_env_particles)
-        : 0u;
-    const uint32_t coupled_internal =
-        mp.coupled_internal == Model::CoupledInternal::Xpbd ? phi::kCoupledInternalXpbd
-        : mp.coupled_internal == Model::CoupledInternal::Pbf ? phi::kCoupledInternalPbf
-                                                             : phi::kCoupledInternalNone;
-    // The PBF density-projection runs when the body IS a fluid: standalone PBF
-    // mode, coupled mode with the Pbf internal sub-type, OR the SoftFluid
-    // co-residence mode (which always carries a PBF fluid slice).
-    const bool runs_pbf = (particle_mode == phi::kParticleModePbf) ||
-        (particle_mode == phi::kParticleModeSoftFluid) ||
-        (particle_mode == phi::kParticleModeCoupled &&
-         coupled_internal == phi::kCoupledInternalPbf);
-
-    // Distance and volume constraints are rows of the common solve; shape matching projects.
-    const uint32_t xpbd_iterations = sm_cluster_count != 0u
-        ? std::max<uint32_t>(mp.xpbd_iters, 1u) : 0u;
-    const uint32_t pbf_iterations = runs_pbf ? std::max<uint32_t>(mp.pbf_iters, 1u) : 0u;
-    const bool pp_contact = particle_mode == phi::kParticleModeSoftFluid || mp.pp_self_contact;
-    // Contact runs in every pass that projects the soft constraints it competes with.
-    const uint32_t pp_iterations = pp_contact && mp.pp_contact_d_min > 0.0f
-        ? std::max({mp.pp_contact_iters, xpbd_iterations, 1u}) : 0u;
-    const uint32_t projection_iterations = std::max({1u, xpbd_iterations, pbf_iterations, pp_iterations});
-    const uint32_t coupling_iterations = cfg.coupling_passes != 0u
-        ? cfg.coupling_passes : projection_iterations;
-    p_xpbd_iterations_.resize(projection_iterations);
+    const uint32_t coupling_iterations = cfg.coupling_passes != 0u ? cfg.coupling_passes : 1u;
     p_solve_iterations_.resize(coupling_iterations);
     const auto iterations_before = [](uint32_t pass, uint32_t budget, uint32_t passes) {
         return static_cast<uint32_t>((static_cast<uint64_t>(pass) * budget + passes - 1u) / passes);
@@ -517,9 +474,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     coupling_ctx.rigid_cap = rigid_cap;
     coupling_ctx.particle_slot_base = rigid_cap + cap.ogc_contacts_per_env;
     coupling_ctx.particle_mode = particle_mode;
-    coupling_ctx.coupled_internal = coupled_internal;
     coupling_ctx.particle_count = particle_count;
-    coupling_ctx.n_soft = n_soft;
     coupling_ctx.n_mpm = n_mpm;
     coupling_ctx.dt = cfg.dt;
     coupling_ctx.gravity[0] = cfg.gravity[0];
@@ -531,7 +486,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
          cfg.pos_iters > 0u) ? 1u : 0u;
     coupling_ctx.p_np_body_particle = &p_np_body_particle_;
     coupling_ctx.p_part_finalize = &p_part_finalize_;
-    coupling_ctx.p_pp_contact = &p_pp_contact_;
     coupling_ctx.p_mpm = &p_mpm_;
     coupling_ctx.has_mpm = has_mpm ? 1u : 0u;
 
@@ -557,8 +511,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_part_predict_.gravity[2] = cfg.gravity[2];
         p_part_predict_.mode = particle_mode;
         p_part_predict_.particle_count = particle_count;
-        p_part_predict_.coupled_internal = coupled_internal;
-        p_part_predict_.n_soft_particles = n_soft;
         p_part_predict_.particles_per_env = per_env_particles;
         p_part_predict_.n_mpm_particles = n_mpm;
         p_part_predict_.vertex_blocks = vertex_blocks;
@@ -614,60 +566,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     }
 
     if (has_particles) {
-        // Spatial constraints rebuild neighbors from the current shared working positions.
-        p_grid_.cell_size = runs_pbf || pp_iterations != 0u ? mp.cell_size : 0.0f;
-        p_grid_.query_radius = mp.query_radius;
-        p_grid_.particle_count = particle_count;
-        for (int k = 0; k < 3; ++k) {
-            p_grid_.grid_min[k] = (&mp.grid_min.x)[k];
-            p_grid_.grid_dims[k] = mp.grid_dims[k];
-        }
-        // The projected buffer is shared by every row-coupled particle material.
-        p_grid_.pos_source = phi::kGridPosSourcePbfPredicted;
-        // Env-private grids: per-env cell-key offsets + the cooked cell
-        // capacity (the grid_cell_start/end arena sizing the op guards).
-        p_grid_.env_count = env_count;
-        p_grid_.particles_per_env = cap.particles_per_env;
-        p_grid_.cells_capacity = cap.max_grid_cells;
-        p_grid_.neighbor_capacity = static_cast<uint32_t>(cap.NeighborPoolCapacity());
-    }
-
-    if (has_particles) {
-        p_xpbd_.dt = cfg.dt;
-        p_xpbd_.iters = 1u;
-        p_xpbd_.shape_match_cluster_count = sm_cluster_count;
-        p_xpbd_.sm_colors = cap.xpbd_sm_colors;
-        p_xpbd_.env_count = env_count;
-        p_xpbd_.sm_clusters_per_env = cap.shape_match_slots_per_env;
-        p_xpbd_.sm_members_per_env = cap.shape_match_members_per_env;
-        p_xpbd_.sm_color_segments = model.sm_color_segments.data();
-        for (uint32_t pass = 0u; pass < projection_iterations; ++pass) {
-            p_xpbd_iterations_[pass] = p_xpbd_;
-            p_xpbd_iterations_[pass].iteration_start =
-                iterations_before(pass, xpbd_iterations, projection_iterations);
-        }
-
-        p_pbf_density_.rest_density = mp.pbf_rest_density;
-        p_pbf_density_.relaxation = mp.pbf_cfm_epsilon;
-        p_pbf_density_.support_radius = mp.pbf_support_radius;
-        p_pbf_density_.particle_mass = mp.pbf_particle_mass;
-        p_pbf_density_.particle_count = particle_count;
-        p_pbf_density_.iters = 1u;
-        p_pbf_density_.clamp_overdensity = mp.pbf_clamp_overdensity ? 1u : 0u;
-        p_pbf_density_.dt = cfg.dt;
-        p_pbf_density_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
-        p_pbf_density_.floor_z = mp.floor_z;
-        p_pbf_density_.n_soft_particles = n_soft;
-        p_pbf_density_.particles_per_env = per_env_particles;
-
-        p_pbf_apply_.support_radius = mp.pbf_support_radius;
-        p_pbf_apply_.particle_mass = mp.pbf_particle_mass;
-        p_pbf_apply_.particle_count = particle_count;
-        p_pbf_apply_.boundary_enabled = mp.boundary_enabled ? 1u : 0u;
-        p_pbf_apply_.floor_z = mp.floor_z;
-        p_pbf_apply_.n_soft_particles = n_soft;
-        p_pbf_apply_.particles_per_env = per_env_particles;
-
         p_part_projection_velocity_.dt = cfg.dt;
         p_part_projection_velocity_.particle_count = particle_count;
         p_part_projection_velocity_.particles_per_env = per_env_particles;
@@ -677,39 +575,10 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_part_contact_delta_.particle_count = particle_count;
         p_part_contact_delta_.particles_per_env = per_env_particles;
         p_part_contact_delta_.active_begin_per_env = p_part_projection_velocity_.active_begin_per_env;
-
-        p_pp_contact_.contact_distance_d_min = pp_iterations != 0u ? mp.pp_contact_d_min : 0.0f;
-        p_pp_contact_.compliance_alpha = mp.pp_contact_compliance;
-        p_pp_contact_.solver_iterations = 1u;
-        p_pp_contact_.mode = particle_mode;
-        p_pp_contact_.particle_count = particle_count;
-        p_pp_contact_.n_soft_particles = n_soft;
-        p_pp_contact_.particles_per_env = per_env_particles;
-        p_pp_contact_.vertex_blocks = vertex_blocks;
     }
 
-    const auto project_particles = [&](uint32_t pass) {
-        if (!has_particles) return;
-        const uint32_t begin = iterations_before(pass, projection_iterations, coupling_iterations);
-        const uint32_t end = iterations_before(pass + 1u, projection_iterations, coupling_iterations);
-        for (uint32_t iteration = begin; iteration < end; ++iteration) {
-            if (iteration_work(iteration, xpbd_iterations, projection_iterations) != 0u)
-                add(phi::NkOp::XpbdProject, &p_xpbd_iterations_[iteration]);
-            const bool density_work = iteration_work(iteration, pbf_iterations, projection_iterations) != 0u;
-            const bool contact_work = iteration_work(iteration, pp_iterations, projection_iterations) != 0u;
-            if (density_work || contact_work) add(phi::NkOp::ParticleGridBuild, &p_grid_);
-            if (density_work) {
-                add(phi::NkOp::PbfDensityLambda, &p_pbf_density_);
-                add(phi::NkOp::PbfApplyDelta, &p_pbf_apply_);
-            }
-            if (contact_work) add(phi::NkOp::ParticleParticleContact, &p_pp_contact_);
-            if (p_part_projection_velocity_.active_begin_per_env < per_env_particles)
-                add(phi::NkOp::ParticleProjectionVelocity, &p_part_projection_velocity_);
-        }
-    };
-    project_particles(0u);
-    if (use_block_descent_)
-        for (uint32_t pass = 1u; pass < coupling_iterations; ++pass) project_particles(pass);
+    if (has_particles && p_part_projection_velocity_.active_begin_per_env < per_env_particles)
+        add(phi::NkOp::ParticleProjectionVelocity, &p_part_projection_velocity_);
 
     if ((cap.point_endpoints_per_env > 0u || cap.vbd_vertices_per_env > 0u) &&
         cap.particle_surfaces_per_env > 0u) {
@@ -906,15 +775,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.grid_nodes_per_env = cap.mpm_grid_nodes_per_env;
         p_assemble_.point_endpoints_per_env = cap.point_endpoints_per_env;
         p_assemble_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
-        // Particle constraint rows sit just before the stress tail; their endpoints end the pool.
-        const uint32_t constraint_rows = cap.dist_cons_per_env + cap.vol_cons_per_env;
-        const uint32_t constraint_endpoints = cap.vol_cons_per_env;
-        p_assemble_.dist_cons_per_env = cap.dist_cons_per_env;
-        p_assemble_.vol_cons_per_env = cap.vol_cons_per_env;
-        p_assemble_.particle_constraint_row_first = cap.max_rows_per_env -
-            cap.mpm_stress_cells_per_env * kMpmStressRowsPerCell - constraint_rows;
-        p_assemble_.constraint_endpoint_first = cap.point_endpoints_per_env - constraint_endpoints;
-        p_assemble_.constraint_term_first = cap.point_endpoint_terms_per_env - 4u * constraint_endpoints;
         p_assemble_.dt = cfg.dt;
         p_assemble_.slot_count = slot_count;
         p_assemble_.max_dof = max_dof;
@@ -945,11 +805,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
         p_assemble_.num_material_buckets = cap.num_material_buckets;
         p_assemble_.particles_per_env = cap.particles_per_env;  // coupling.
-        // Per-particle-system friction for a body<->particle contact side: the
-        // [soft | fluid] split + each slice's mu (a particle has no body material).
-        p_assemble_.n_soft_particles = friction_n_soft;
+        // Body<->particle contact sides take the particle mu (a particle has no body material).
         p_assemble_.particle_soft_friction = mp.soft_friction;
-        p_assemble_.particle_fluid_friction = mp.fluid_friction;
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
         p_assemble_.contact_margin = cfg.contact_margin;
         p_assemble_.position_pass =
@@ -1037,7 +894,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             const bool verify_idle =
                 family == phi::kContactFamilyPairDriven && p_solve_.force_static_islands == 0u;
             for (uint32_t pass = 0u; pass < coupling_iterations; ++pass) {
-                if (pass != 0u) project_particles(pass);
                 const bool last = pass + 1u == coupling_iterations;
                 auto& solve = p_solve_iterations_[pass];
                 solve = p_solve_;
@@ -1067,8 +923,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             add(phi::NkOp::ContactWarmStart, &p_warm_start_commit_);
         }
     } else {
-        if (!use_block_descent_)
-            for (uint32_t pass = 1u; pass < coupling_iterations; ++pass) project_particles(pass);
         if (use_block_descent_) add(phi::NkOp::BlockDescentSolve, &p_block_descent_);
     }
 

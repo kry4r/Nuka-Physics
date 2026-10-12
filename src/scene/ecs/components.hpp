@@ -159,11 +159,10 @@ struct SoftBodyComponent {
     AssetRef tet_or_cloth_mesh;
     float    young            = 0.0f;
     float    poisson          = 0.0f;
-    float    xpbd_compliance  = 0.0f;
-    // Per-medium solver selection: Xpbd the position-based tet solver, MlsMpm the
-    // continuum MPM medium, Vbd the vertex-block cloth and cable.
-    enum class SimMethod : uint8_t { Xpbd = 0, MlsMpm = 1, Vbd = 2 };
-    SimMethod sim_method = SimMethod::Xpbd;
+    // Per-medium solver selection: MlsMpm the continuum MPM medium, Vbd the
+    // vertex-block cloth and cable.
+    enum class SimMethod : uint8_t { MlsMpm = 1, Vbd = 2 };
+    SimMethod sim_method = SimMethod::Vbd;
 };
 
 struct FluidComponent {

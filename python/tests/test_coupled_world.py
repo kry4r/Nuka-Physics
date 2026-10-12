@@ -1,19 +1,16 @@
-"""pytest: a COUPLED world (robot + cloth/fluid particles) through the python binding.
+"""pytest: a COUPLED world (robot + cloth particles) through the python binding.
 
 Run (single GPU only):
     export CUDA_VISIBLE_DEVICES=0
     python -m pytest python/tests/test_coupled_world.py -v
 
 Proves the reachability FLOOR for a coupled world through the python surface:
-  * nuka.World.create_coupled_from_scene cooks a Go2 + cloth + fluid world on the
+  * nuka.World.create_coupled_from_scene cooks a Go2 + cloth world on the
     ONE general contact pipeline (the SAME scene->cook path create_from_scene uses,
     plus the engine particle cook);
   * the live particle state is readable zero-copy via
     buffer_view(Field.PARTICLE_POSITION / PARTICLE_VELOCITY) -> torch CUDA tensors,
-    shaped (env_count * particle_count, 3);
-  * stepping advances the world and the foot two-way couples the media: the at-feet
-    fluid is held above its floor more than an identical control whose media are sunk
-    far out of reach (the body<->particle reaction acts through the python step path).
+    shaped (env_count * particle_count, 3).
 
 This is NOT a full RL stack on coupled worlds (obs/action/reward over the particle
 state) -- that is a separate RL-track follow-on. This test only proves create + step
@@ -162,14 +159,9 @@ def test_g1_course_observations_checkpoint_and_policy(tmp_path, perception):
 # The Go2 (fixed base z=0.445) settles with its four foot spheres centred at z~0.2545
 # (front pair x~0.062, rear pair x~-0.325) -- the media sit just under the feet.
 FOOT_Z = 0.2545
-N_CLOTH = 13 * 13  # the soft slice [0, N_CLOTH); the fluid is the upper slice.
 
 
 def _media_kwargs(at_feet: bool) -> dict:
-    # The control sinks the SAME geometry below the feet (a small offset so the
-    # CookFluidBox floor(L/s) lattice count is invariant -- a large offset would
-    # cancel float bits in the box span and recount the lattice). At dz=-0.30 the
-    # fluid surface sits at ~ -0.045 m, far below the foot spheres at z~0.237.
     dz = 0.0 if at_feet else -0.30
     return dict(
         cloth_nx=13, cloth_ny=13, cloth_spacing=0.018,
@@ -177,10 +169,6 @@ def _media_kwargs(at_feet: bool) -> dict:
         cloth_origin_z=(FOOT_Z - 0.012) + dz,
         cloth_particle_mass=0.01, cloth_friction=0.6, cloth_stretch_stiffness=1.0e4,
         cloth_bend_stiffness=1.0e-5,
-        fluid_min_x=-0.39, fluid_min_y=-0.06, fluid_min_z=(FOOT_Z - 0.10) + dz,
-        fluid_max_x=-0.26, fluid_max_y=0.09, fluid_max_z=(FOOT_Z + 0.01) + dz,
-        fluid_spacing=0.022, fluid_rest_density=1000.0,
-        fluid_floor_z=(FOOT_Z - 0.105) + dz, fluid_friction=0.0, fluid_iters=4,
         contact_radius=0.012,
     )
 
@@ -194,58 +182,9 @@ def device():
     dev.close()
 
 
-def test_create_step_read_couples_through_python(device):
-    """A coupled world is creatable + steppable + its particle state readable, and
-    the foot two-way couples the media through the python step path."""
-
-    def run(at_feet: bool):
-        with nuka.World.create_coupled_from_scene(
-            device, SCENE, env_count=1, **_media_kwargs(at_feet)
-        ) as w:
-            # The particle fields RESOLVE zero-copy as CUDA float tensors.
-            pos = torch.from_dlpack(w.buffer_view(nuka.Field.PARTICLE_POSITION))
-            vel = torch.from_dlpack(w.buffer_view(nuka.Field.PARTICLE_VELOCITY))
-            assert w.particle_count > 0
-            assert pos.is_cuda and vel.is_cuda
-            assert pos.numel() == w.particle_count * 3
-            assert pos.shape[-1] == 3
-            assert w.download_field(nuka.PARTICLE_PLASTIC_DEFORMATION_GRADIENT).size == 0
-            for _ in range(200):
-                w.step()
-            # Copy out the final particle positions (env 0; single-env world).
-            return pos.reshape(-1, 3).detach().clone().cpu()
-
-    at_feet = run(at_feet=True)
-    control = run(at_feet=False)
-    assert at_feet.shape == control.shape, "the two worlds cooked different counts"
-    assert torch.isfinite(at_feet).all(), "coupled-world particles went non-finite"
-    assert torch.isfinite(control).all(), "control-world particles went non-finite"
-
-    # Floor-relative fluid-slice comparison cancels the control's -0.30 m offset:
-    # WITHOUT coupling the two would settle identically (same box, same physics); the
-    # residual is the foot displacing the at-feet pool (the two-way reaction through
-    # the python step path). Each world's fluid floor: FOOT_Z-0.105 (+dz for control).
-    at_floor = FOOT_Z - 0.105
-    ctl_floor = at_floor - 0.30
-    fluid_at = at_feet[N_CLOTH:, 2] - at_floor
-    fluid_ctl = control[N_CLOTH:, 2] - ctl_floor
-    l1 = (fluid_at - fluid_ctl).abs().sum().item()
-    surf_at = fluid_at.max().item()
-    surf_ctl = fluid_ctl.max().item()
-    print(
-        f"[py-coupled] particles={at_feet.shape[0]} fluid={fluid_at.numel()} "
-        f"at_feet_surf(rel)={surf_at:.4f} control_surf(rel)={surf_ctl:.4f} "
-        f"fluid_floor_rel_L1={l1:.4f}"
-    )
-    assert l1 > 0.02, (
-        "the at-feet fluid settled identically to the undisturbed control -> no "
-        "body<->particle coupling acted through the python step path"
-    )
-
-
 def test_coupled_world_requires_a_medium(device):
-    """A coupled-create with NEITHER medium present is rejected (use
-    create_from_scene for a particle-free world)."""
+    """A coupled-create without cloth is rejected (use create_from_scene for a
+    particle-free world)."""
     with pytest.raises(RuntimeError):
         nuka.World.create_coupled_from_scene(device, SCENE, env_count=1)
 
@@ -437,16 +376,17 @@ def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
         tet_material = builder.add_material("soft", base_color=[0.8, 0.1, 0.1])
         water_material = builder.add_material("water", base_color=[0.2, 0.5, 0.8])
         grain_material = builder.add_material("grains", base_color=[0.6, 0.4, 0.2])
-        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
                           cloth_nx=7, cloth_ny=7, cloth_spacing=0.08,
                           cloth_origin=[0.0, 0.0, 0.5], cloth_free=True,
-                          xpbd_particle_mass=0.02, xpbd_iters=8,
+                          xpbd_particle_mass=0.02,
                           skin_normal_offset=0.007, skin_smooth_iters=2,
                           skin_smooth_lambda=0.2, render_material_id=cloth_material)
-        builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_XPBD,
+        builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
                           tet_center=[0.8, 0.0, 0.5], tet_radius=0.12,
                           tet_cells=8, tet_cell_len=0.04,
-                          xpbd_particle_mass=0.02, xpbd_iters=8,
+                          mpm_youngs=1000, mpm_density=1000, mpm_dx=0.08,
+                          mpm_substeps=2, mpm_floor_d=-1,
                           render_material_id=tet_material)
         builder.add_media(kind=nuka.MEDIA_FLUID, method=nuka.MEDIA_METHOD_MLSMPM,
                           fluid_min=[1.48, -0.12, 0.38], fluid_max=[1.72, 0.12, 0.5],
@@ -553,7 +493,7 @@ def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
     np.testing.assert_array_equal(*recorded)
 
     with nuka.SceneBuilder.create() as builder:
-        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
                           cloth_nx=3, cloth_ny=3, cloth_spacing=0.1,
                           cloth_origin=[0.0, 0.0, 0.5], cloth_free=True)
         with builder.build(device, env_count=2) as world:
@@ -583,10 +523,10 @@ def test_primitive_axes_halfspace_contacts_and_observations(device, execution, s
                                     pos=[2_000_000, 0, -0.12], friction=0)
         builder.add_rigid_primitive(nuka.PRIMITIVE_CAPSULE, dims=[0.1, 0.3],
                                     pos=[0, 2, 1], mass=1.7)
-        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+        builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
                           cloth_nx=3, cloth_ny=3, cloth_spacing=0.04,
                           cloth_origin=[0, 0, -0.08], cloth_free=True,
-                          xpbd_particle_mass=0.02, xpbd_iters=8)
+                          xpbd_particle_mass=0.02)
         builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
                           tet_center=[-1.5, 0, -0.15], tet_radius=0.025,
                           tet_cells=8, tet_cell_len=0.01,
@@ -786,10 +726,10 @@ def test_mpm_surface_endpoints_roundtrip_graph_and_reset(device, tmp_path):
     assert term_dtype.itemsize == 44
     with nuka.SceneBuilder.create() as builder:
         for x in (-0.04, 0.04):
-            builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+            builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
                               cloth_nx=6, cloth_ny=6, cloth_spacing=0.016,
                               cloth_origin=[x, 0.0, 0.06], cloth_free=True,
-                              xpbd_particle_mass=0.01, xpbd_iters=8)
+                              xpbd_particle_mass=0.01)
         builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
                           tet_center=[0.0, 0.0, 0.085], tet_radius=0.04,
                           tet_cells=8, tet_cell_len=0.012,

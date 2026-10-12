@@ -152,9 +152,7 @@ void FillMaterialAndGrid(cook::MpmCookInput& in, float friction_deg,
 nk::Model BuildPileModel(cook::MpmCookInput in) {
     nk::Model m;
     m.capacities.env_count = 1u;
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, in);
+    cook::CookMpmParticles(m, 1u, in);
     return m;
 }
 
@@ -357,9 +355,7 @@ nk::Model BuildBedWithCapsuleModel(float cap_z0) {
     m.contact_family = nk::ContactFamily::PairDriven;
     m.filter_cross_env = true;
 
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, BuildBedInput());
+    cook::CookMpmParticles(m, 1u, BuildBedInput());
     m.particles.mpm_body_friction = 0.5f;
     return m;
 }
@@ -605,10 +601,6 @@ TEST(MpmGranular, ValidatorAndNksRoundtrip) {
     using Me = ns::MediaRecord::Method;
     EXPECT_NO_THROW(cook::ValidateMedia({make(K::Granular, Me::MlsMpm, 4.0f)}));
     EXPECT_NO_THROW(cook::ValidateMedia({make(K::Granular, Me::MlsMpm, 0.0f)}));
-    EXPECT_THROW(cook::ValidateMedia({make(K::Granular, Me::Xpbd, 4.0f)}),
-                 std::runtime_error);
-    EXPECT_THROW(cook::ValidateMedia({make(K::Granular, Me::Pbf, 4.0f)}),
-                 std::runtime_error);
     EXPECT_THROW(cook::ValidateMedia({make(K::Fluid, Me::MlsMpm, 4.0f)}),
                  std::runtime_error) << "model_kind 4 demands a Granular medium";
     EXPECT_THROW(cook::ValidateMedia({make(K::Granular, Me::MlsMpm, 3.0f)}),
@@ -763,9 +755,7 @@ TEST(MpmGranular, DISABLED_Throughput200k) {
     in.grid_dims[2] = static_cast<uint32_t>((top + 12.0f * kDx) / kDx) + 4u;
     in.dx = kDx; in.substeps = kSubsteps;
     in.floor_normal = Vec3{0, 0, 1}; in.floor_d = 0.0f; in.floor_friction = 0.7f;
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, in);
+    cook::CookMpmParticles(m, 1u, in);
     const uint32_t P = m.capacities.particles_per_env;
     nk::World w(std::move(m), 1u, b.dev, b.backend, Cfg());
     ASSERT_TRUE(w.Ready());

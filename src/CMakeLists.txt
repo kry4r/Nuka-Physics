@@ -603,7 +603,6 @@ add_library(nuka_nk STATIC
     nk/pipeline/coupling_provider.cpp
     nk/pipeline/world.cpp
     nk/solve/schedule.cpp
-    nk/solve/xpbd_coloring.cpp
     nk/solve/vertex_block_hierarchy.cpp
     nk/solve/vertex_block_schedule.cpp
     sensor/observation.cpp
@@ -646,17 +645,6 @@ if(CMAKE_CUDA_COMPILER)
         codegen/v3_validation/fd_harness.cu
         codegen/v3_validation/numerical_jacobian.cu
         codegen/v3_validation/box_pgs_fd.cu
-        # v0.7 p09-A: XPBD distance-row adjoint FD validator (dense_adjoint).
-        codegen/v3_validation/xpbd_distance_fd.cu
-        # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint FD validators.
-        codegen/v3_validation/xpbd_bend_fd.cu
-        codegen/v3_validation/xpbd_volume_fd.cu
-        # v0.7 p09-C: XPBD shape-match (id 9) goal-projection adjoint FD validator.
-        codegen/v3_validation/xpbd_shape_match_fd.cu
-        # v0.7 p11 (K3): particle-particle contact (id 10) adjoint FD validator --
-        # the SAME multilinear XPBD multiplier law as the distance row (only the
-        # unilateral box / active-contact sampling differs).
-        codegen/v3_validation/particle_particle_contact_fd.cu
     )
     set_target_properties(nuka_codegen_v3_validation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -734,7 +722,7 @@ if(CMAKE_CUDA_COMPILER)
         # Body/artic <-> soft/fluid particle narrowphase (particle = sphere on the
         # ONE path; PairDriven-family-gated).
         phi/backend_cuda/ops/narrowphase_body_particle.cu
-        # M5 full-GPU collision: broadphase (BuildAabbs/Lbvh*/ParticleGridBuild)
+        # M5 full-GPU collision: broadphase (BuildAabbs/Lbvh*)
         # + generalized pair-driven narrowphase (analytic prim set + sphere x
         # hull) + the SDF main path (SAMP x cooked sparse SDF grid). Ports of
         # collision/broadphase_lbvh / particle_uniform_grid + the shared
@@ -746,9 +734,8 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/build_islands.cu
         phi/backend_cuda/ops/solve_rows.cu
         phi/backend_cuda/ops/block_descent.cu
-        # M6 multi-physics coupled co-step: XPBD soft + PBF fluid kernel ports
-        # (predict / xpbd project / pbf density-lambda / pbf apply / finalize),
-        # the particle side of the unified row solve.
+        # Particle predict / projection velocity / finalize, aero drag and surface
+        # refits: the particle side of the unified row solve.
         phi/backend_cuda/ops/particles.cu
         phi/backend_cuda/ops/vertex_blocks.cu
         phi/backend_cuda/ops/ogc_detect.cu
@@ -810,9 +797,8 @@ if(CMAKE_CUDA_COMPILER)
             nuka_scene
             nuka_articulation
         PRIVATE
-            # The media cook (cook_to_model.cpp BuildClothXpbdInput / BuildFluidPbfInput)
-            # reuses the cloth-topology + fluid-box cookers (BuildClothConstraints /
-            # CookFluidBox), which compile into nuka_runtime_gpu as CUDA-free TUs.
+            # The media cook reuses the cloth-topology + lattice cookers
+            # (BuildClothVertexBlocks / CookFluidBox) compiled into nuka_runtime_gpu.
             nuka_runtime_gpu
     )
 
@@ -1005,31 +991,10 @@ if(CMAKE_CUDA_COMPILER)
         # only remaining consumer is the LBVH-vs-SAP differential gate (the legacy
         # whole-world AABB-generation path was removed in the M0 cleanup).
         collision/gpu/broadphase.cu
-        # M9 T11 Phase 2b: the legacy XPBD soft, PBF fluid, and cross-system
-        # particle-particle co-step STEPPERS were DELETED -- the forward sim is
-        # op-ified onto the unified nk core (phi/backend_cuda/ops/particles.cu, run
-        # by nk::World). The shared PBF device-kernel headers (runtime/fluid/
-        # pbf_kernels.cuh + pbf_polish.cuh) survive: the nk op TU includes them. The
-        # id-10 particle-particle CONTACT row class (codegen forward/adjoint + v3 FD)
-        # is the M11-deferred IFT family, distinct from the deleted runtime co-step,
-        # and is unaffected.
-        # v0.7 p09-B: cook-time HOST topology builders (cloth stretch+bend,
-        # tet edge+volume) -> XpbdConstraintSet the nk soft solve iterates. Cook-time
-        # CPU is allowed (same posture as the p06/p07 cookers). Now depend only on
-        # the CUDA-free import/cooker/xpbd_cooker_types.hpp PODs.
+        # Cook-time HOST builders: cloth/rod vertex blocks, tet lattices and skins.
         runtime/soft/cloth_topology.cpp
         runtime/soft/tetmesh_topology.cpp
-        # v0.7 p09-D: the XPBD soft-body COOKER (programmatic XpbdSoftBodySpec ->
-        # XpbdConstraintSet). THIN cook-time CPU orchestration: maps the authored
-        # material params (the USD MaterialX soft schema) + dispatches to the
-        # topology builders above (and assembles the id9 cluster). Stays in this
-        # library because it calls the builders here (which compile as CUDA-lang TUs).
-        import/cooker/xpbd_cooker.cpp
-        # v0.7 p10-B: the PBF fluid COOKER (programmatic FluidBoxSpec ->
-        # runtime::fluid::PbfParticleSet). THIN cook-time CPU: samples a
-        # cell-centered uniform lattice filling an AABB (optional inscribed-sphere
-        # carve) + the uniform mass = rest_density*spacing^3. Now depends only on the
-        # CUDA-free import/cooker/fluid_cooker_types.hpp PODs.
+        # The box/sphere lattice sampler (FluidBoxSpec) the MLS-MPM media cook uses.
         import/cooker/fluid_cooker.cpp
         # COL-5 (M11): runtime/sdf/sdf_device_world.cu DELETED. Its sole duty (upload
         # a cooked scene::CookedSdfTable to the device) now lives in nk::Model

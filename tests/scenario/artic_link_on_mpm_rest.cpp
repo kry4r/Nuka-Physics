@@ -24,7 +24,6 @@
 #include <string>
 #include <vector>
 
-#include "import/cooker/xpbd_cooker_types.hpp"
 #include "import/usd_importer.hpp"
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
@@ -196,9 +195,7 @@ nk::Model BuildModel(bool bite, uint32_t env_count = 1u) {
     for (uint32_t l = 0; l < L; ++l)
         if (l < kind.size() && kind[l] != 0u) m.articulation.joint_damping[l] = 8.0f;
 
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, env_count, soft, BuildBedInput());
+    cook::CookMpmParticles(m, env_count, BuildBedInput());
 
     m.particles.mpm_body_friction = 0.5f;
     m.particles.mpm_bite_disable_dynamic_bc = bite;

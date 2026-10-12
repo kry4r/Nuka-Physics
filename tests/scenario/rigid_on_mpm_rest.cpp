@@ -202,9 +202,7 @@ nk::Model BuildModel(bool bite, float box_x = 0.0f) {
 
     // The MPM bed (sim_method=mlsmpm). CookMpmParticles preserves the rigid contact
     // budget (rigid_base) and grows the particle reserve on top.
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, BuildBedInput());
+    cook::CookMpmParticles(m, 1u, BuildBedInput());
 
     m.particles.mpm_body_friction = 0.5f;
     m.particles.mpm_bite_disable_dynamic_bc = bite;

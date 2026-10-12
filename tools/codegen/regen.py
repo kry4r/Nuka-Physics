@@ -40,44 +40,7 @@ ALLOWED_ROW_CLASSES = {
     # unilateral_with_friction PGS update (RowKind::Contact path).
     "RigidSDFContactRow",
     "FeatherstoneSDFContactRow",
-    # v0.7 p09-A: XPBD soft-body distance constraint (id 6). The FIRST soft row
-    # class; ships a GENUINE dispatchable per-row adjoint (dense_adjoint), the
-    # local projection Jacobian of one distance projection. shape-match row (id 9)
-    # arrives in p09-C and is NOT registered here.
-    "XPBDDistanceRow",
-    # v0.7 p09-B: XPBD soft-body BEND (id 7) + VOLUME (id 8) constraints. Both
-    # ship a GENUINE dispatchable per-row adjoint (dense_adjoint) -- the SAME
-    # multilinear XPBD multiplier-update Jacobian as the distance row (only the
-    # geometric grad C, which is downstream of this local adjoint, differs:
-    # Bergou quadratic-bending stencil for bend, determinant gradients for volume).
-    "XPBDBendRow",
-    "XPBDVolumeRow",
-    # v0.7 p09-C: XPBD soft-body SHAPE-MATCHING (id 9) -- the meshless cluster
-    # regularizer (Mueller et al. 2005). Ships a GENUINE dispatchable per-row
-    # adjoint (dense_adjoint), but NOT the scalar XPBD multiplier law of the other
-    # three rows: shape matching is a PER-PARTICLE GOAL PROJECTION (position_new =
-    # position + stiffness*(goal - position)), multilinear in {position, goal,
-    # stiffness}. body_count_mode: variable (the cluster size never enters the
-    # local adjoint). The polar-decomposition dR/dA is downstream geometry,
-    # host-FD validated in the cluster sim test (analog of grad C for volume).
-    "XPBDShapeMatchRow",
-    # v0.7 p11 (K3): CROSS-SYSTEM particle-particle CONTACT (id 10) -- the v0.7
-    # infrastructure deliverable for cross-system coupling. A SINGLE class-blind
-    # unilateral non-penetration row (two particle pseudo-bodies + an inverse-mass
-    # each) couples the XPBD soft (ids 6-9) and PBF fluid subsystems (soft<->soft,
-    # incl. self-collision, and soft<->fluid). Ships a GENUINE dispatchable per-row
-    # adjoint (dense_adjoint) -- the SAME multilinear XPBD multiplier-update Jacobian
-    # as the distance/volume rows (only the geometric grad C, the contact normal,
-    # which is downstream of this local adjoint, differs; plus the unilateral box).
-    "ParticleParticleContactRow",
-    # v0.8 C6b RESERVED PLACEHOLDERS (OPEN-C, owner-ruled): ids 11/12 are reserved
-    # for v0.9 Cosserat rods (R2a/R2b) so the C6b coupling row can take id13 with
-    # kRowClassCount=14 and v0.9 fills them with ZERO renumber/rename. Both emit a
-    # FORWARD-ONLY stub (no adjoint_evaluator) and are never EMITTED as rows in
-    # v0.8 -- the stub kernels reserve the registry symbols only.
-    "XpbdCosseratStretchShearRow",
-    "XpbdCosseratBendTwistRow",
-    # v0.8 C6b: the generic CROSS-SYSTEM coupling-row class (id13, architecture
+    # v0.8 C6b: the generic CROSS-SYSTEM coupling-row class (id 6, architecture
     # 0.7) -- a solver-resolved compliant non-penetration + friction row whose two
     # CollidableRef sides may be any two CollidableTypes. FORWARD-ONLY this
     # milestone (the SDF id4/id5 precedent); the adjoint is the named downstream

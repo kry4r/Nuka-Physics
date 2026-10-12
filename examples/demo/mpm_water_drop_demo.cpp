@@ -298,9 +298,7 @@ nk::Model BuildModel(float release_z, const soft::TriMesh& bunny) {
     m.contact_family = nk::ContactFamily::PairDriven;
     m.filter_cross_env = true;
 
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, BuildPoolInput());
+    cook::CookMpmParticles(m, 1u, BuildPoolInput());
     m.particles.mpm_body_friction = 0.0f;       // fluid: free slip on the body too.
     m.particles.mpm_bite_disable_dynamic_bc = 0u;
     return m;

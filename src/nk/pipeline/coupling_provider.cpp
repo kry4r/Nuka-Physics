@@ -26,8 +26,7 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // AssembleRows. It treats each particle as a SPHERE of its radius and writes
     // its body manifolds into a RESERVED contact-slot sub-range at the TOP of the
     // per-env block, deterministic relative to the rigid slots (the cross-stream
-    // ordering guard). The particle collision radius is the cooked d_min/2 (the
-    // same uniform radius the particle-particle co-step uses).
+    // ordering guard). The particle collision radius is the cooked d_min/2.
     const uint32_t cands_per_particle =
         collision::kBodyParticleContactSlotsPerParticle;
     // Particle slots follow the rigid and mesh-contact ranges.
@@ -42,9 +41,6 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     // contact radius); 0 leaves the op inert (no collision radius cooked).
     p_np_body_particle.particle_radius = 0.5f * model.particles.pp_contact_d_min;
     p_np_body_particle.contact_margin = ctx.contact_margin;
-    // Every row-coupled particle uses the same projected geometry.
-    p_np_body_particle.fluid_pos_source = 1u;
-    p_np_body_particle.n_soft_particles = 0u;
     // Grid-owned particles do not emit body-particle manifolds.
     p_np_body_particle.particle_row_base = ctx.n_mpm;
     const bool vbd_rows = model.capacities.analytic_collidable_bodies > 0u;
@@ -168,20 +164,11 @@ void MpmCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {
 }
 
 void RowCouplingProvider::PostCouple(const CouplingBuildCtx& ctx) const {
-    const Model& model = *ctx.model;
     phi::ParticleFinalizeParams& p_part_finalize = *ctx.p_part_finalize;
 
     p_part_finalize.dt = ctx.dt;
     p_part_finalize.mode = ctx.particle_mode;
     p_part_finalize.particle_count = ctx.particle_count;
-    p_part_finalize.coupled_internal = ctx.coupled_internal;
-    // PBF post-finalize polish (gated inert when the coefficient is 0).
-    p_part_finalize.support_radius = model.particles.pbf_support_radius;
-    p_part_finalize.particle_mass  = model.particles.pbf_particle_mass;
-    p_part_finalize.xsph_viscosity_c = model.particles.pbf_xsph_viscosity;
-    p_part_finalize.surface_tension_gamma = model.particles.pbf_surface_tension;
-    p_part_finalize.rest_density = model.particles.pbf_rest_density;
-    p_part_finalize.n_soft_particles = ctx.n_soft;
     p_part_finalize.particles_per_env = ctx.particles_per_env;
     p_part_finalize.n_mpm_particles = ctx.n_mpm;
     // Carry the split-impulse pseudo velocity onto the final particle position

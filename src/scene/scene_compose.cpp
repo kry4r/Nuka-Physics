@@ -191,9 +191,6 @@ SceneIR Compose(const SceneIR& base, const SceneIR& addon,
         rec.fluid_box.max += offset;
         rec.cable_line.start += offset;
         rec.cable_line.end += offset;
-        rec.pbf.walls_min += offset;
-        rec.pbf.walls_max += offset;
-        rec.pbf.floor_z += offset.z;
         rec.mpm.floor_d += rec.mpm.floor_normal.Dot(offset);
         for (auto& fill : rec.mpm_fills) {
             fill.box.min += offset;

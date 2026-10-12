@@ -11,7 +11,7 @@
 // not-root, leaves the drive edit), fails a specific assertion.
 //
 // ONE general path coverage: the SAME reset is exercised across the demo media that
-// span every restore family -- soft (soft_ball.nks), cloth, fluid, and articulation /
+// span every restore family -- cloth and articulation /
 // multi-dog (go2.nks) -- because World::Reset round-trips articulation + body +
 // particle slices uniformly.
 //
@@ -267,14 +267,7 @@ TEST_F(EditorReset, Go2RootFreeFallRestore) {
         << "link world poses not restored after free-fall (stale render)";
 }
 
-// Soft body (XPBD tet): particle positions + velocities restore.
-TEST_F(EditorReset, SoftTet) {
-    const std::string scene = "examples/scenes/soft_ball.nks";
-    if (!fs::exists(scene)) GTEST_SKIP() << "soft_ball.nks missing";
-    CheckResetRoundTrip(dev_, backend_, scene);
-}
-
-// Cloth (XPBD grid): the free drape falls, then its particle state restores.
+// Cloth (VBD grid): the free drape falls, then its particle state restores.
 TEST_F(EditorReset, Cloth) {
     const std::string scene = Author("cloth.nks", R"({
   "nks_version": 1,
@@ -286,22 +279,6 @@ TEST_F(EditorReset, Cloth) {
       "cloth_grid": { "nx": 8, "ny": 8, "spacing": 0.05, "origin": [0.0, 0.0, 0.9], "free": true },
       "xpbd": { "particle_mass": 0.012, "friction": 1.0, "stretch_stiffness": 5000.0,
                 "poisson": 0.3, "bend_stiffness": 5.0e-5 } }
-  ]
-})");
-    CheckResetRoundTrip(dev_, backend_, scene);
-}
-
-// Fluid (PBF box): the pool of particles falls, then its particle state restores.
-TEST_F(EditorReset, Fluid) {
-    const std::string scene = Author("fluid.nks", R"({
-  "nks_version": 1,
-  "physics_materials": {},
-  "render_materials": {},
-  "tree": [],
-  "media": [
-    { "name": "pool", "kind": "fluid", "method": "pbf",
-      "fluid_box": { "min": [-0.1, -0.1, 0.5], "max": [0.1, 0.1, 0.7], "spacing": 0.04 },
-      "pbf": { "rest_density": 1000.0, "support_scale": 2.0, "iters": 4, "friction": 0.1 } }
   ]
 })");
     CheckResetRoundTrip(dev_, backend_, scene);

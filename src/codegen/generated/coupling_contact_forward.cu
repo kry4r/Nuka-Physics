@@ -33,7 +33,7 @@ __global__ void coupling_contact_forward_kernel(
     }
 
     const Row& row = rows[row_idx];
-    if (row.row_class_id != 13u) {
+    if (row.row_class_id != 6u) {
         return;
     }
 

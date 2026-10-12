@@ -417,7 +417,7 @@ endif()
 # gtest_discover'd); folding them into this gtest exe would re-expose their 12
 # inner TEST()s as 12 ctest entries (3 -> 12), CHANGING the count. Kept separate
 # to preserve the exact 663 ctest count. The CUDA-region cooker/scene/c_abi
-# members (scene_compose_h1, xpbd_cooker, fluid_cooker, the c_abi gtests) also
+# members (scene_compose_h1, fluid_cooker, the c_abi gtests) also
 # stay separate (they live behind if(CMAKE_CUDA_COMPILER); not folded here to
 # avoid a cross-region restructure -- still labeled).
 # =====================================================================
@@ -745,25 +745,6 @@ add_test(NAME VisualMeshCook
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(VisualMeshCook PROPERTIES LABELS "full")
 
-# Fluid marching-cubes isosurface mesher (runtime::fluid::MarchFluidSurface).
-# HOST-ONLY (no Vulkan device / no CUDA): runs the mesher as a pure function of a
-# synthetic settled-pool / sphere particle set and asserts determinism (D1),
-# watertight-ish closure, envelope tracking, and unit gradient normals. Links
-# nuka_render (where the mesher lives) like the visual-mesh cook gate above.
-add_executable(nuka_fluid_surface_mesher_test
-    runtime/test_fluid_surface_mesher.cpp
-)
-target_include_directories(nuka_fluid_surface_mesher_test
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-)
-target_link_libraries(nuka_fluid_surface_mesher_test
-    PRIVATE
-        nuka_render
-        GTest::gtest_main
-)
-gtest_discover_tests(nuka_fluid_surface_mesher_test
-    PROPERTIES LABELS "fast_full")
 
 # --- Runtime tests ---------------------------------------------------------
 add_executable(nuka_runtime_test
@@ -1060,15 +1041,6 @@ if(CMAKE_CUDA_COMPILER)
         codegen/test_adjoint_fd_maximal_joint.cpp
         codegen/test_adjoint_fd_maximal_contact.cpp
         codegen/test_adjoint_fd_featherstone_contact.cpp
-        codegen/test_adjoint_fd_xpbd_distance.cpp
-        # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint FD validation.
-        codegen/test_adjoint_fd_xpbd_bend.cpp
-        codegen/test_adjoint_fd_xpbd_volume.cpp
-        # v0.7 p09-C: XPBD shape-match (id 9) goal-projection adjoint FD validation.
-        codegen/test_adjoint_fd_xpbd_shape_match.cpp
-        # v0.7 p11 (K3): particle-particle contact (id 10) contact-multiplier
-        # adjoint FD validation (active penetrating contacts, unilateral box).
-        codegen/test_adjoint_fd_particle_particle_contact.cpp
     )
 
     add_dependencies(nuka_adjoint_fd_test nuka_codegen)
@@ -1242,9 +1214,6 @@ if(CMAKE_CUDA_COMPILER)
     # =====================================================================
     add_executable(nuka_scenario_test
         scenario/cook_settle_determinism.cpp
-        scenario/nk_particle_equivalence.cpp
-        scenario/nk_soft_fluid_coresidence.cpp
-        scenario/nk_mpm_xpbd_coresidence.cpp
         scenario/cloth_on_box.cpp
         # Multi-articulation co-residence + GENERAL-PATH collision: K Go2
         # articulations co-resident in ONE env of ONE general nk::World. Proves K
@@ -1281,47 +1250,16 @@ if(CMAKE_CUDA_COMPILER)
         # the surface instead of tunnelling through -- closes the heightfield arm that
         # was a silent no-op stub (0 rows, 0 diagnostic); + two-run byte-identity.
         scenario/body_particle_heightfield.cpp
-        # Body<->particle FRICTION asymmetry: one SoftFluid Model presses a SOFT and a
-        # FLUID particle onto static boxes with the same (-z,+x) approach. Same pyramid,
-        # same row, same kernel -- only the per-system mu differs: the soft slice (finite
-        # mu) grips (friction lambda>0 + tangential bounded), the fluid slice (mu~0)
-        # slides (friction lambda~0 + tangential free) while its normal row still brakes.
-        scenario/body_particle_friction.cpp
-        # Body<->particle contact-BUDGET disjointness: a cooked scene with a static
-        # ground box, a dynamic box on it (a body<->body contact), AND >= 64 particles
-        # whose reserve dwarfs the rigid candidate budget. The cook grows
-        # max_contacts_per_env additively so the rigid [0, rigid_cap) and body<->particle
-        # [rigid_cap, total) slot sub-ranges are disjoint -- the rigid contact SURVIVES
-        # the particle writes (pre-reserve it was clobbered). + a particle over its
-        # body-contact slots flags kEnvStatusPairOverflow LOUD (no silent drop).
-        scenario/body_particle_budget_disjoint.cpp
-        # SoftFluid finalize composition: a soft particle braked by a static-floor
-        # coupling row must STAY braked through a FULL World::Step. The SoftFluid
-        # finalize reproduces the projection velocity AND composes the contact
-        # correction (v_now - v_pre) so the impulse the solve wrote into particle_vel
-        # survives instead of being overwritten by a plain v = (pos_proj - prev)/dt.
-        scenario/soft_fluid_coupling_finalize.cpp
         # Cloth <-> presser two-way coupling: a 576-particle XPBD cloth drapes over a
         # low static ridge, a rigid presser dips it (cloth Δz down + spring-back on
         # lift) and a dynamic presser is arrested by the cloth (body-side reaction
         # lambda>0 vs a no-cloth control) -- all via the body<->particle row solver.
         scenario/cloth_presser_two_way.cpp
-        # 3D soft tet body <-> rigid two-way coupling on the same body<->particle row
-        # a cloth particle uses (deform + rest-on-floor reaction + volume recovery).
-        scenario/soft_tet_presser_two_way.cpp
-        # PBF fluid <-> rigid foot two-way coupling on the same body<->particle row: a
-        # foot plunges a shallow pool (splash + displacement) and is resisted by the
-        # fluid (body-side reaction lambda>0 + decel vs a no-fluid control); the
-        # resistance emerges from the contact rows + PBF incompressibility, no buoyancy.
-        scenario/foot_splash_two_way.cpp
         # Articulated LINK <-> particle two-way coupling on the same body<->particle
         # row a foot uses on the ground: a minimal one-revolute pendulum arm presses a
         # cloth patch (coupling row whose BODY side maps to an articulation link, and
         # the reaction reaches the single revolute qdot + tip pose vs a no-patch control).
         scenario/articulated_link_particle_coupling.cpp
-        # Go2 articulation + cloth (XPBD) + fluid (PBF) co-resident in ONE world, feet
-        # coupling to both media's slices through the SAME body<->particle row solver.
-        scenario/robot_cloth_fluid_coresident.cpp
         # Phase 1B dog cases: artic x rigid (free box on a dog's back = mixed island)
         # and artic x artic (two dogs collide via the GENERAL path; the ONE path).
         scenario/pairdriven_dog_solve.cpp
@@ -1346,14 +1284,6 @@ if(CMAKE_CUDA_COMPILER)
         # gather is byte-identical run-to-run; snapshot/restore round-trips F; an
         # out-of-AABB particle flags the env-status escape bit.
         scenario/mpm_transfer_roundtrip.cpp
-        # Per-medium solver selector + the media-list (kind x method) validator (host
-        # cook): a bulk-soft body cooks XPBD by default (byte-identical) and MPM when
-        # selected; cloth -> MLS-MPM and MPM+XPBD/PBF mixes throw LOUDLY.
-        scenario/mpm_sim_method_selector.cpp
-        # MediaRecord -> cook-input equivalence (host cook): the cloth/fluid builders
-        # over a translated MediaRecord match the legacy flat-descriptor builders
-        # field-by-field (the byte-identity proof for the cook-orchestrator re-point).
-        scenario/media_record_cook_equivalence.cpp
         # MLS-MPM elastic jelly-ball gate: a fixed-corotated ball drops onto the static
         # floor plane (grid BC), squashes <= ~25%, recovers, no collapse/spike/escape,
         # >= 5 s, finite, two-run byte-identical (the deterministic gather).
@@ -1362,12 +1292,6 @@ if(CMAKE_CUDA_COMPILER)
         # the per-substep grid->body reaction balances gravity (m*g*dt), the free-fall
         # BITE drops the box, two runs byte-identical (the deterministic per-body gather).
         scenario/rigid_on_mpm_rest.cpp
-        # MLS-MPM weakly-compressible FLUID constitutive gate (model_kind == 3): a
-        # fluid column settles in the domain box -> hydrostatic pressure (1-J) rises
-        # with depth + flat free surface (J~1); grid mass/momentum byte-identical
-        # run-to-run + grid mass == particle mass; a heavy body into the pool
-        # decelerates with a non-zero reaction sink (two-way through the same grid).
-        scenario/mpm_fluid_rest.cpp
         # Articulated-LINK <-> MPM coupling gate: a fixed-base prismatic-Z link rests
         # on an MPM bed; the link's grid reaction seeds qdot_flat via M^-1 J^T (support,
         # balance, BITE, two-run byte-identical, one-way bit cleared, 2-link reduction).
@@ -1438,44 +1362,6 @@ if(CMAKE_CUDA_COMPILER)
         TEST_PREFIX "ContactIdentityCuda."
         PROPERTIES LABELS "fast_full")
 
-    add_executable(nuka_pairdriven_solve_cuda_test
-        scenario/pairdriven_solve.cpp
-    )
-    add_dependencies(nuka_pairdriven_solve_cuda_test nuka_codegen)
-    target_include_directories(nuka_pairdriven_solve_cuda_test
-        PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(nuka_pairdriven_solve_cuda_test
-        PRIVATE
-            nuka_nk
-            nuka_phi2
-            GTest::gtest_main
-    )
-    gtest_discover_tests(nuka_pairdriven_solve_cuda_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        TEST_PREFIX "PairDrivenSolveCuda."
-        PROPERTIES LABELS "fast_full")
-
-    # --- CouplingProvider op-list identity (the body↔particle row provider) -----
-    # Pure-host structural proof: builds a cooked-Model matrix through
-    # Pipeline::Build and asserts the emitted OpCall sequence + a FULL byte memcmp
-    # of each moved Params POD is identical build-to-build and at the canonical
-    # positions. No CUDA at runtime (Build with device==nullptr); links nuka_nk
-    # (Pipeline/Model) + nuka_phi2 (the op-schema/backend types nuka_nk needs).
-    add_executable(nuka_coupling_provider_test
-        scenario/coupling_provider_op_list.cpp
-    )
-    add_dependencies(nuka_coupling_provider_test nuka_codegen)
-    target_include_directories(nuka_coupling_provider_test
-        PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(nuka_coupling_provider_test
-        PRIVATE
-            nuka_nk
-            nuka_phi2
-            GTest::gtest_main
-    )
-    gtest_discover_tests(nuka_coupling_provider_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "fast_full")
 
     # M9 T14: nuka_cook_settle_determinism_test MERGED into nuka_scenario_test
     # (scenario/cook_settle_determinism.cpp; the scenario category exe above).
@@ -1514,70 +1400,6 @@ if(CMAKE_CUDA_COMPILER)
     # MERGED into nuka_scenario_test (scenario/nk_particle_equivalence.cpp +
     # scenario/nk_soft_fluid_coresidence.cpp; the scenario category exe above).
 
-    add_executable(nuka_cuda_runtime_test
-        # M9 T11-core-b2: test_cuda_solver.cpp (legacy CudaRowSolver device-kernel
-        # tests) deleted with row_solver.cu; the nk device solve is covered by
-        # test_unified_solve.cpp NkWorld* + the nk_solve_harness foot_*/link_rigid
-        # device-solve gates.
-        # v0.7 p09-A: XPBD distance analytic oscillation oracle + D1 two-run.
-        runtime/test_xpbd_distance_oracle.cpp
-        runtime/test_xpbd_volume_tet.cpp
-        # v0.7 p09-C: XPBD shape-match (cluster) sim + polar dR/dA host-FD.
-        runtime/test_xpbd_shape_match.cpp
-        # v0.7 p11 (K3): cross-system particle-particle contact co-step oracles
-        # (separation, mass-weighted momentum, soft<->fluid, segment-reduction, D1,
-        # inert byte-identity).
-        runtime/test_particle_particle_contact.cpp
-    )
-
-    target_link_libraries(nuka_cuda_runtime_test
-        PRIVATE
-            nuka_runtime_gpu
-            nuka_runtime
-            nuka_articulation_gpu
-            # M9 T11: the re-pointed XPBD shape-match / bend-cloth / distance /
-            # volume + PBF + cross-system contact tests cook a scene -> nk::World ->
-            # Step on the nk particle ops (the legacy soft/fluid steppers were
-            # DELETED in Phase 2b; the cook is the scene-cook layer).
-            nuka_nk
-            nuka_scene_cook
-            nuka_phi2
-            nuka_phi
-            nuka_core
-            GTest::gtest_main
-    )
-    add_dependencies(nuka_cuda_runtime_test nuka_codegen)
-    target_include_directories(nuka_cuda_runtime_test
-        PRIVATE ${CMAKE_SOURCE_DIR}/src)
-
-    gtest_discover_tests(nuka_cuda_runtime_test
-        PROPERTIES LABELS "full")
-
-    # --- .nks media + rigid-primitive roundtrip. Host/CPU only (no device step):
-    # Saves/Loads a SceneIR with cloth + soft-tet media + an authored ground box and
-    # asserts the records round-trip field-equal + the cloth cooks to the frozen
-    # lattice FNV. Links nuka_scene_cook for BuildClothXpbdInput (CUDA-language lib,
-    # hence inside the CMAKE_CUDA_COMPILER guard; the test runs no device code).
-    add_executable(nuka_nks_media_roundtrip_test
-        scenario/nks_media_roundtrip.cpp
-    )
-    target_include_directories(nuka_nks_media_roundtrip_test
-        PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(nuka_nks_media_roundtrip_test
-        PRIVATE
-            nuka_scene_cook
-            nuka_cooker
-            nuka_scene
-            nuka_import
-            nuka_runtime_gpu
-            nuka_nk
-            GTest::gtest_main
-    )
-    add_dependencies(nuka_nks_media_roundtrip_test nuka_codegen)
-    add_test(NAME NksMediaRoundtrip
-             COMMAND nuka_nks_media_roundtrip_test
-             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    set_tests_properties(NksMediaRoundtrip PROPERTIES LABELS "fast_full")
 
     # --- .nks /script node roundtrip. Host/CPU only (no device step): Saves/Loads a
     # SceneIR with /script nodes and asserts the records + the projected
@@ -1601,32 +1423,6 @@ if(CMAKE_CUDA_COMPILER)
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     set_tests_properties(NksScriptRoundtrip PROPERTIES LABELS "fast_full")
 
-    # --- v0.7 p09-D: XPBD soft-body COOKER tests (exit-crit 3) -------------
-    # PURE host/CPU: cooks programmatic XpbdSoftBodySpecs and asserts the
-    # returned XpbdConstraintSet (counts + the two param->engine mappings +
-    # two-cook determinism). No device upload / step, so it needs no GPU -- but
-    # it links nuka_runtime_gpu because the cooker + topology builders live
-    # there (the lib is CUDA-language, hence inside the CMAKE_CUDA_COMPILER
-    # guard). nuka:soft:* schema + mapping documented in
-    # docs/architecture/xpbd-soft-schema.md.
-    add_executable(nuka_xpbd_cooker_test
-        import/test_xpbd_cooker.cpp
-    )
-
-    target_include_directories(nuka_xpbd_cooker_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_xpbd_cooker_test
-        PRIVATE
-            nuka_runtime_gpu
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_xpbd_cooker_test
-        PROPERTIES LABELS "fast_full")
 
     # --- v0.7 p10-B: PBF fluid COOKER (programmatic FluidBoxSpec -> particles) --
     # PURE host/CPU: cooks a box volume + asserts the hand-computed lattice count,
@@ -1654,47 +1450,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_fluid_cooker_test
         PROPERTIES LABELS "fast_full")
 
-    # --- v0.7 p10-A: PBF fluid core (density iteration + volume + D1) -------
-    # Analytic/physical invariants for the forward density-projection fluid
-    # (Macklin & Mueller 2013): rest-density block, over-compressed relaxation,
-    # single column -> stable pool, density-drift volume conservation, and D1
-    # two-run byte-exact. NOT a Flex golden (Flex oracle deferred to p15). rho0 is
-    # calibrated numerically from the engine's own host Poly6 kernel (the CUDA-free
-    # ComputePbfDensities in fluid_cooker_types.hpp); the forward runs on nk::World.
-    # p10-B adds the polish-layer gates: XSPH viscosity (variance reduction +
-    # off-gate skip + D1), surface-tension cohesion (blob contraction + off-gate +
-    # D1 + stability), and the PBF V2 particle-count invariant (count conserved
-    # with viscosity + cohesion ON; the central V2 sampler is rigid-only, so this
-    # is the focused fluid count-conservation test -- see the file header).
-    add_executable(nuka_pbf_test
-        runtime/test_pbf_density_iteration.cpp
-        runtime/test_pbf_volume_conservation.cpp
-        runtime/test_pbf_viscosity.cpp
-        runtime/test_pbf_surface_tension.cpp
-        runtime/test_pbf_v2_invariant.cpp
-        # CUDA-graph capture parity: the PBF grid op now captures (StepPlanned Ok)
-        # and graph replay == eager Step byte-for-byte (pre-allocated sort scratch).
-        runtime/test_pbf_graph_capture.cpp
-    )
-
-    target_link_libraries(nuka_pbf_test
-        PRIVATE
-            nuka_runtime_gpu
-            # M9 T11 Phase 2b: ALL PBF tests cook a fluid -> nk::World -> Step on the
-            # nk particle ops; rho0 calibration uses the CUDA-free host
-            # ComputePbfDensities. The legacy soft/fluid steppers were DELETED.
-            nuka_nk
-            nuka_phi2
-            nuka_phi
-            nuka_core
-            GTest::gtest_main
-    )
-    add_dependencies(nuka_pbf_test nuka_codegen)
-    target_include_directories(nuka_pbf_test
-        PRIVATE ${CMAKE_SOURCE_DIR}/src)
-
-    gtest_discover_tests(nuka_pbf_test
-        PROPERTIES LABELS "full")
 
     # --- v0.7 p08-A: GPU upload of cooked sparse SDFs ----------------------
     # COL-5 (M11): nuka_sdf_device_test (runtime/test_sdf_device_upload.cu) DELETED
@@ -3419,29 +3174,6 @@ target_link_libraries(nuka_texture_pipeline_test
 gtest_discover_tests(nuka_texture_pipeline_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "fast_full")
 
-# Reusable whole-solver capacity probe: real scene cook/upload plus exact
-# Model/Data arena segments and the emitted op list (not a local unit test).
-add_executable(nuka_solver_arena_profile
-    ${CMAKE_SOURCE_DIR}/examples/demo/solver_arena_profile.cpp
-)
-add_dependencies(nuka_solver_arena_profile nuka_codegen)
-target_compile_definitions(nuka_solver_arena_profile
-    PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_include_directories(nuka_solver_arena_profile
-    PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-target_link_libraries(nuka_solver_arena_profile
-    PRIVATE
-        nuka_scene_cook
-        nuka_nk
-        nuka_phi2
-        nuka_runtime
-        nuka_import
-        nuka_cooker
-        nuka_articulation_gpu
-        nuka_collision_gpu
-        nuka_core
-        nuka_phi
-)
 
 # --- Vulkan renderer tests -------------------------------------------------
 if(NK_BUILD_VULKAN_VALIDATION)
@@ -3567,68 +3299,6 @@ if(NK_BUILD_VULKAN_VALIDATION)
         nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
         nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
 
-    # ridges, pressed + released by a rigid sphere on the ONE general row solver.
-    # Unlike the pose-replay video tools this one STEPS nk::World on CUDA (settle +
-    # the scripted press) and renders the live deforming cloth offscreen. Links the
-    # cloth topology builder (nuka_runtime_gpu) + the full physics + render stack.
-    add_executable(nuka_cloth_presser_demo
-        ${CMAKE_SOURCE_DIR}/examples/demo/cloth_presser_demo.cpp
-    )
-    add_dependencies(nuka_cloth_presser_demo nuka_codegen)
-    target_compile_definitions(nuka_cloth_presser_demo
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-            NK_BUILD_VULKAN_VALIDATION)
-    target_include_directories(nuka_cloth_presser_demo
-        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-    target_link_libraries(nuka_cloth_presser_demo
-        PRIVATE
-            nuka_scene_cook
-            nuka_render
-            nuka_nk
-            nuka_phi2
-            nuka_runtime_gpu
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-    )
-
-    # Soft<->rigid coupling headline clip: a soft tet ball (a sphere rest-lattice
-    # tessellated into distance + volume tets) dropped onto a static ground plane on
-    # the ONE general body<->particle row solver. STEPS nk::World on CUDA and renders
-    # the live deforming surface mesh on the CUDA RT backend (--gpu --beauty) or
-    # lavapipe raster. Links the tet topology builder (nuka_runtime_gpu) + the CUDA
-    # ray tracer (nuka_phi2_rt) + the full physics + render stack.
-    add_executable(nuka_soft_ball_demo
-        ${CMAKE_SOURCE_DIR}/examples/demo/soft_ball_demo.cpp
-    )
-    add_dependencies(nuka_soft_ball_demo nuka_codegen)
-    target_compile_definitions(nuka_soft_ball_demo
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-            NK_BUILD_VULKAN_VALIDATION)
-    target_include_directories(nuka_soft_ball_demo
-        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-    target_link_libraries(nuka_soft_ball_demo
-        PRIVATE
-            nuka_scene_cook
-            nuka_render
-            nuka_phi2_rt
-            nuka_nk
-            nuka_phi2
-            nuka_runtime_gpu
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-    )
 
     # MLS-MPM headline clip: a fixed-corotated elastic jelly ball (densely sampled
     # on a lattice, sim_method=mlsmpm via the config selector) dropped onto the
@@ -3694,59 +3364,6 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_phi
     )
 
-    # Cloth<->rigid coupling headline clip: a free unpinned square cloth sheet released
-    # above a PD-standing Go2 (full per-link collision skeleton cooked from go2.nks)
-    # drapes over the body on the ONE general body<->particle row solver. STEPS nk::World
-    # on CUDA and renders the live deforming cloth surface mesh + the FK-posed Go2 visuals
-    # on the CUDA RT backend (--gpu --beauty) or lavapipe raster.
-    add_executable(nuka_go2_cloth_drape_demo
-        ${CMAKE_SOURCE_DIR}/examples/demo/go2_cloth_drape_demo.cpp
-    )
-    add_dependencies(nuka_go2_cloth_drape_demo nuka_codegen)
-    target_compile_definitions(nuka_go2_cloth_drape_demo
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-            NK_BUILD_VULKAN_VALIDATION)
-    target_include_directories(nuka_go2_cloth_drape_demo
-        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-    target_link_libraries(nuka_go2_cloth_drape_demo
-        PRIVATE
-            nuka_scene_cook
-            nuka_render
-            nuka_phi2_rt
-            nuka_nk
-            nuka_phi2
-            nuka_runtime_gpu
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-    )
-
-    # XPBD constraint-solve micro-benchmark (serial vs colored solver timing).
-    add_executable(nuka_xpbd_solve_bench
-        ${CMAKE_SOURCE_DIR}/examples/demo/xpbd_solve_bench.cpp
-    )
-    add_dependencies(nuka_xpbd_solve_bench nuka_codegen)
-    target_include_directories(nuka_xpbd_solve_bench
-        PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-    target_link_libraries(nuka_xpbd_solve_bench
-        PRIVATE
-            nuka_scene_cook
-            nuka_nk
-            nuka_phi2
-            nuka_runtime_gpu
-            nuka_runtime
-            nuka_import
-            nuka_cooker
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-    )
 
     # Go2 HANDSTAND (倒立) hero clip -- the same offscreen GO2W-replay renderer as
     # go2_walk_video (Load(go2.nks) -> CookToModel SceneMap -> BuildRenderWorld ->

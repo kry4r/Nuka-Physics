@@ -237,8 +237,7 @@ static void SetRowCapacity(nk::ModelCapacities& cap, uint64_t contact_rows) {
         contact_rows + static_cast<uint64_t>(cap.joint_limit_rows_per_env) +
         static_cast<uint64_t>(cap.joint_friction_rows_per_env) +
         static_cast<uint64_t>(cap.joint_drive_rows_per_env) +
-        static_cast<uint64_t>(cap.mpm_stress_cells_per_env) * nk::kMpmStressRowsPerCell +
-        static_cast<uint64_t>(cap.dist_cons_per_env) + cap.vol_cons_per_env;
+        static_cast<uint64_t>(cap.mpm_stress_cells_per_env) * nk::kMpmStressRowsPerCell;
     if (total_rows > 0xFFFFFFFFull) {
         throw std::runtime_error("CookToModel: row capacity overflows u32");
     }
@@ -1658,7 +1657,6 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     nk::Model::ModelParticles& mp = model.particles;
     mp.mode = nk::Model::ParticleMode::Xpbd;
     mp.soft_friction = in.friction;  // body<->soft contact mu (solmix=max).
-    mp.pp_self_contact = in.self_contact;
     mp.initial_pos = in.positions;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
@@ -1668,67 +1666,6 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     if (mp.inv_mass.size() != mp.initial_pos.size()) {
         mp.inv_mass.assign(mp.initial_pos.size(), 1.0f);
     }
-    mp.xpbd_iters = in.solver_iterations == 0u ? 1u : in.solver_iterations;
-
-    // De-interleave the constraint AoS into the per-field SoA: distance a/b/rest/alpha;
-    // volume 4-particle + rest6/alpha.
-    const uint32_t dn = static_cast<uint32_t>(in.distance.size());
-    mp.dist_a.resize(dn); mp.dist_b.resize(dn);
-    mp.dist_rest.resize(dn); mp.dist_alpha.resize(dn);
-    for (uint32_t c = 0; c < dn; ++c) {
-        mp.dist_a[c] = in.distance[c].a;
-        mp.dist_b[c] = in.distance[c].b;
-        mp.dist_rest[c] = in.distance[c].rest_length;
-        mp.dist_alpha[c] = in.distance[c].compliance_alpha;
-    }
-    const uint32_t vn = static_cast<uint32_t>(in.volume.size());
-    mp.vol_particles.resize(static_cast<size_t>(vn) * 4u);
-    mp.vol_rest6.resize(vn); mp.vol_alpha.resize(vn);
-    for (uint32_t c = 0; c < vn; ++c) {
-        for (uint32_t j = 0; j < 4u; ++j) {
-            mp.vol_particles[static_cast<size_t>(c) * 4u + j] = in.volume[c].p[j];
-        }
-        mp.vol_rest6[c] = in.volume[c].rest_volume_times6;
-        mp.vol_alpha[c] = in.volume[c].compliance_alpha;
-    }
-
-    // SHAPE-MATCH (id 9): flatten the variable-size clusters into the CSR
-    // (offset, size) layout over flat particle / rest-offset / weight pools. Cook
-    // the rest centroid c0 = (sum_i m_i x_i^0)/sum_i m_i and the per-member rest
-    // OFFSET q_i = x_i^0 - c0 ONCE -- BYTE-FAITHFUL to the legacy soft-upload
-    // shape-match flatten (same fixed-order ascending accumulation).
-    const uint32_t scn = static_cast<uint32_t>(in.shape_match.size());
-    mp.sm_cluster_offset.clear(); mp.sm_cluster_size.clear();
-    mp.sm_stiffness.clear(); mp.sm_rest_centroid.clear();
-    mp.sm_particles.clear(); mp.sm_rest_q.clear(); mp.sm_mass.clear();
-    mp.sm_cluster_offset.resize(scn); mp.sm_cluster_size.resize(scn);
-    mp.sm_stiffness.resize(scn); mp.sm_rest_centroid.resize(scn);
-    for (uint32_t cl = 0; cl < scn; ++cl) {
-        const CookShapeMatchCluster& smc = in.shape_match[cl];
-        const size_t n = smc.particle.size();
-        // Cook c0 = (sum_i m_i x_i^0)/sum_i m_i (fixed-order ascending sum).
-        float mass_sum = 0.0f;
-        math::Vec3 c0{0.0f, 0.0f, 0.0f};
-        for (size_t j = 0; j < n; ++j) {
-            const float mi = j < smc.cluster_mass.size() ? smc.cluster_mass[j] : 1.0f;
-            mass_sum += mi;
-            if (j < smc.rest_positions.size()) c0 = c0 + smc.rest_positions[j] * mi;
-        }
-        if (mass_sum > 0.0f) c0 = c0 * (1.0f / mass_sum);
-        mp.sm_cluster_offset[cl] = static_cast<uint32_t>(mp.sm_particles.size());
-        mp.sm_cluster_size[cl] = static_cast<uint32_t>(n);
-        mp.sm_stiffness[cl] = smc.stiffness;
-        mp.sm_rest_centroid[cl] = c0;
-        for (size_t j = 0; j < n; ++j) {
-            mp.sm_particles.push_back(smc.particle[j]);
-            const math::Vec3 x0 = j < smc.rest_positions.size()
-                                      ? smc.rest_positions[j] : math::Vec3::Zero();
-            mp.sm_rest_q.push_back(x0 - c0);  // q_i = x_i^0 - c0
-            mp.sm_mass.push_back(j < smc.cluster_mass.size() ? smc.cluster_mass[j]
-                                                             : 1.0f);
-        }
-    }
-
     // Cloth AERODYNAMIC-DRAG surface triangles: store the 3 indices + the cooked
     // rest area (||(b-a)x(c-a)||/2 from the rest positions). The coeffs default 0
     // (drag off); only a caller that opts in makes the drag op live.
@@ -1827,19 +1764,11 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     const uint32_t rigid_base = RigidContactBase(model);
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     SetParticleOgcCapacity(cap, cap.particles_per_env);
-    cap.dist_cons_per_env = dn;
-    cap.vol_cons_per_env  = vn;
-    cap.shape_match_slots_per_env   = scn;
-    cap.shape_match_members_per_env =
-        static_cast<uint32_t>(mp.sm_particles.size());
     cap.aero_tris_per_env = an;
     StageVertexBlocks(model, in, 0u);
     // Reserve a disjoint body<->particle slot sub-range above the rigid budget
     // (no-op when there are no body contacts -> particle-only cooks byte-identical).
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
-    // n_soft_particles is left at its default (0); it is only consulted for the
-    // SoftFluid mode (CookSoftFluidParticles sets it). The single-system Xpbd
-    // ops ignore it (mode-gated), so the device-staged bytes are unaffected.
 }
 
 void CookMpmParticles(nk::Model& model, uint32_t env_count,
@@ -1952,45 +1881,23 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
-void CookSoftBodyParticles(nk::Model& model, uint32_t env_count,
-                           const XpbdCookInput& in, const MpmCookInput& mpm) {
-    if (in.solver == nk::Model::ParticleMode::Xpbd) {
-        CookXpbdParticles(model, env_count, in);
-        return;
-    }
-    if (in.solver == nk::Model::ParticleMode::Mpm) {
-        CookMpmParticles(model, env_count, mpm);
-        return;
-    }
-    throw std::runtime_error(
-        "CookSoftBodyParticles: a bulk-soft body solver must be Xpbd or Mpm");
-}
-
 void ValidateMedia(const std::vector<MediaRecord>& media) {
     using Kind = MediaRecord::Kind;
     using Method = MediaRecord::Method;
-    uint32_t n_mpm = 0u, n_pbf_fluid = 0u;
     for (const MediaRecord& m : media) {
         bool legal = false;
         switch (m.kind) {
             case Kind::Cloth:   legal = m.method == Method::Vbd; break;
-            case Kind::SoftTet: legal = m.method == Method::Xpbd ||
-                                        m.method == Method::MlsMpm; break;
-            case Kind::Fluid:   legal = m.method == Method::Pbf ||
-                                        m.method == Method::MlsMpm; break;
+            case Kind::SoftTet: legal = m.method == Method::MlsMpm; break;
+            case Kind::Fluid:   legal = m.method == Method::MlsMpm; break;
             case Kind::Granular: legal = m.method == Method::MlsMpm; break;
             case Kind::Cable:   legal = m.method == Method::Vbd; break;
         }
         if (!legal) {
             throw std::runtime_error(
                 "ValidateMedia: illegal medium (kind x method) -- cloth and cable solve "
-                "as vertex blocks (vbd), a tet-soft body with XPBD or MLS-MPM, a fluid "
-                "with PBF or MLS-MPM, a granular bed with MLS-MPM only");
-        }
-        if (m.method == Method::Vbd && m.xpbd.self_contact) {
-            throw std::runtime_error(
-                "ValidateMedia: vertex-block media collide through their surfaces, "
-                "not particle self_contact");
+                "as vertex blocks (vbd), a tet-soft body, a fluid and a granular bed "
+                "with MLS-MPM");
         }
         // model_kind 4 (Drucker-Prager) and Kind::Granular imply each other: no
         // sand-tagged fluid/soft body and no granular bed cooking as another model.
@@ -2014,205 +1921,13 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
             throw std::runtime_error(
                 "ValidateMedia: mpm_fills require a box MLS-MPM medium (fluid or granular)");
         }
-        if (m.method == Method::MlsMpm) ++n_mpm;
-        if (m.kind == Kind::Fluid && m.method == Method::Pbf) ++n_pbf_fluid;
-    }
-    // An MLS-MPM medium may co-reside with XPBD (cloth/tet) media in the MpmXpbd
-    // [mpm | xpbd] layout, but NOT with a PBF fluid: MPM owns the env-private grid
-    // and PBF its own neighbor grid, so the two grids cannot share one Model.
-    if (n_mpm > 0u && n_pbf_fluid > 0u) {
-        throw std::runtime_error(
-            "ValidateMedia: an MLS-MPM medium may not co-reside with a PBF fluid in "
-            "one Model (each owns a background grid); pair MPM with XPBD media only");
-    }
-    if (n_pbf_fluid > 1u) {
-        throw std::runtime_error(
-            "ValidateMedia: a Model carries one PBF fluid slice; a second PBF fluid "
-            "medium is not representable");
     }
 }
 
-void CookPbfParticles(nk::Model& model, uint32_t env_count,
-                      const PbfCookInput& in) {
-    const uint32_t envs = env_count > 0 ? env_count : 1u;
-    nk::ModelCapacities& cap = model.capacities;
-    if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
-    const uint32_t rigid_base = RigidContactBase(model);
-
-    nk::Model::ModelParticles& mp = model.particles;
-    mp.mode = nk::Model::ParticleMode::Pbf;
-    mp.fluid_friction = in.friction;  // body<->fluid contact mu (solmix=max).
-    mp.initial_pos = in.positions;
-    mp.initial_vel = in.velocities;
-    mp.inv_mass = in.inv_mass;
-    if (mp.initial_vel.size() != mp.initial_pos.size()) {
-        mp.initial_vel.assign(mp.initial_pos.size(), math::Vec3::Zero());
-    }
-    if (mp.inv_mass.size() != mp.initial_pos.size()) {
-        // Uniform-mass fluid: inv_mass = 1/particle_mass (a free particle).
-        const float im = in.particle_mass > 0.0f ? 1.0f / in.particle_mass : 0.0f;
-        mp.inv_mass.assign(mp.initial_pos.size(), im);
-    }
-    mp.pbf_rest_density   = in.rest_density;
-    mp.pbf_support_radius = in.support_radius;
-    mp.pbf_particle_mass  = in.particle_mass;
-    mp.pbf_cfm_epsilon    = in.cfm_epsilon;
-    mp.pbf_iters          = in.iters == 0u ? 1u : in.iters;
-    mp.pbf_clamp_overdensity = in.clamp_overdensity;
-    mp.pbf_xsph_viscosity = in.xsph_viscosity;
-    mp.pbf_surface_tension= in.surface_tension;
-    mp.grid_min = in.grid_min;
-    mp.grid_dims[0] = in.grid_dims[0];
-    mp.grid_dims[1] = in.grid_dims[1];
-    mp.grid_dims[2] = in.grid_dims[2];
-    mp.cell_size = in.support_radius;
-    mp.query_radius = in.support_radius;
-    mp.boundary_enabled = in.boundary_enabled;
-    mp.floor_z = in.floor_z;
-
-    cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
-    // Per-env uniform-grid cell capacity (sizes grid_cell_start/end; the
-    // ParticleGridBuild op fails loudly if the live dims exceed it).
-    cap.max_grid_cells = in.grid_dims[0] * in.grid_dims[1] * in.grid_dims[2];
-    // Reserve a disjoint body<->particle slot sub-range above the rigid budget
-    // (no-op when there are no body contacts -> particle-only cooks byte-identical).
-    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
-}
-
-// Wire the body<->particle contact radius + cross-system non-penetration co-step
-// onto a cooked particle set. The body<->particle narrowphase derives its sphere
-// radius from pp_contact_d_min, so this must run for a single-medium coupled world
-// too or the robot tunnels through the medium. The neighbor grid is built over
-// query_radius, so widen cell/query to >= d_min so it covers every penetrating pair
-// (a no-op when d_min <= the cooked grid radius). The cross-system co-step is mode-
-// gated to SoftFluid downstream, so a single-medium cook carries it inert.
-static void ApplyParticleBodyContact(nk::Model::ModelParticles& mp,
-                                     const SoftFluidContactInput& contact) {
-    mp.pp_contact_d_min      = contact.contact_d_min;
-    mp.pp_contact_compliance = contact.compliance_alpha;
-    mp.pp_contact_iters = contact.solver_iterations == 0u ? 1u
-                                                          : contact.solver_iterations;
-    if (mp.pp_contact_d_min > 0.0f && mp.pp_contact_d_min > mp.query_radius) {
-        mp.cell_size    = mp.pp_contact_d_min;
-        mp.query_radius = mp.pp_contact_d_min;
-    }
-}
-
-// Self-contact without a fluid grid gets a periodic neighbor table sized to the particle
-// count; the wrapped cells serve a medium wherever it moves.
-static void SizeSelfContactGrid(nk::Model& model) {
-    nk::Model::ModelParticles& mp = model.particles;
-    nk::ModelCapacities& cap = model.capacities;
-    if (!mp.pp_self_contact || !(mp.pp_contact_d_min > 0.0f) || cap.max_grid_cells != 0u) return;
-    const uint32_t side = std::max(
-        3u, static_cast<uint32_t>(std::ceil(std::cbrt(2.0 * cap.particles_per_env))));
-    mp.grid_min = math::Vec3::Zero();
-    for (uint32_t& dim : mp.grid_dims) dim = side;
-    mp.cell_size = mp.query_radius = std::max(mp.query_radius, mp.pp_contact_d_min);
-    cap.max_grid_cells = side * side * side;
-}
-
-// ---------------------------------------------------------------------------
-// Two-system cook: soft (XPBD) + fluid (PBF) co-resident in ONE Model.
-// ---------------------------------------------------------------------------
-
-void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
-                            const XpbdCookInput& soft, const PbfCookInput& fluid,
-                            const SoftFluidContactInput& contact) {
-    const uint32_t envs = env_count > 0 ? env_count : 1u;
-    nk::ModelCapacities& cap = model.capacities;
-    if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
-    // The body<->body budget before any particle growth; the final reserve recomputes
-    // from this for the full [soft|fluid] count so the soft slice is not double-counted.
-    const uint32_t rigid_base = RigidContactBase(model);
-
-    // STRICT-SUPERSET FAST PATHS: a soft-only / fluid-only co-residence cook is
-    // byte-identical to the single-system cook PLUS the same body<->particle contact
-    // setup the composite path applies (so a single-medium coupled world couples).
-    // Only when BOTH sides are present do we build the [soft | fluid] composite + set
-    // the SoftFluid mode; the cross-system particle-particle co-step is mode-gated to
-    // SoftFluid downstream, so a single-system fast path carries it inert.
-    const uint32_t n_soft = static_cast<uint32_t>(soft.positions.size());
-    const uint32_t n_fluid = static_cast<uint32_t>(fluid.positions.size());
-    if (n_fluid == 0u) {
-        // Soft-only: the canonical XPBD cook + the body<->particle contact setup so a
-        // robot+cloth-only world couples (incl. shape-match).
-        CookXpbdParticles(model, env_count, soft);
-        ApplyParticleBodyContact(model.particles, contact);
-        return;
-    }
-    if (n_soft == 0u) {
-        // Fluid-only: the canonical PBF cook + the body<->particle contact setup so a
-        // robot+fluid-only world couples.
-        CookPbfParticles(model, env_count, fluid);
-        ApplyParticleBodyContact(model.particles, contact);
-        return;
-    }
-
-    // 1) Cook the SOFT set first (fills the XPBD + shape-match templates, sets
-    // particles_per_env = n_soft, mode = Xpbd). The soft constraint indices
-    // already point into [0, n_soft) -- exactly where the soft particles land.
-    CookXpbdParticles(model, env_count, soft);
-
-    nk::Model::ModelParticles& mp = model.particles;
-
-    // 2) APPEND the fluid particles AFTER the soft set ([soft | fluid] layout).
-    // The fluid particles are NOT referenced by any soft constraint, so no
-    // index remap is needed; the SoftFluid PBF ops scope the density solve to
-    // the fluid slice [n_soft, n_soft+n_fluid) by the n_soft split.
-    const float fluid_im =
-        fluid.particle_mass > 0.0f ? 1.0f / fluid.particle_mass : 0.0f;
-    for (uint32_t i = 0; i < n_fluid; ++i) {
-        mp.initial_pos.push_back(fluid.positions[i]);
-        mp.initial_vel.push_back(
-            i < fluid.velocities.size() ? fluid.velocities[i] : math::Vec3::Zero());
-        mp.inv_mass.push_back(
-            i < fluid.inv_mass.size() ? fluid.inv_mass[i] : fluid_im);
-    }
-
-    // 3) Carry the PBF fluid params + uniform-grid domain (the fluid slice solve).
-    // The soft slice mu was set by the CookXpbdParticles call above; the fluid
-    // slice carries its own (body<->particle contact, solmix=max with the body).
-    mp.fluid_friction     = fluid.friction;
-    mp.pbf_rest_density   = fluid.rest_density;
-    mp.pbf_support_radius = fluid.support_radius;
-    mp.pbf_particle_mass  = fluid.particle_mass;
-    mp.pbf_cfm_epsilon    = fluid.cfm_epsilon;
-    mp.pbf_iters          = fluid.iters == 0u ? 1u : fluid.iters;
-    mp.pbf_clamp_overdensity = fluid.clamp_overdensity;
-    mp.pbf_xsph_viscosity = fluid.xsph_viscosity;
-    mp.pbf_surface_tension= fluid.surface_tension;
-    mp.grid_min = fluid.grid_min;
-    mp.grid_dims[0] = fluid.grid_dims[0];
-    mp.grid_dims[1] = fluid.grid_dims[1];
-    mp.grid_dims[2] = fluid.grid_dims[2];
-    mp.cell_size = fluid.support_radius;
-    mp.query_radius = fluid.support_radius;
-    mp.boundary_enabled = fluid.boundary_enabled;
-    mp.floor_z = fluid.floor_z;
-
-    // 4) The body<->particle contact radius + the cross-system non-penetration
-    // co-step over the FULL union (the same setup the single-medium fast paths
-    // apply, so the body<->particle radius and grid coverage are uniform).
-    ApplyParticleBodyContact(mp, contact);
-
-    // 5) The co-residence schema: mode + split index + the new total particle
-    // count. The grid is sized over the FULL union per-env (the soft particles
-    // occupy grid cells too, but the fluid density solve skips them via n_soft).
-    mp.mode = nk::Model::ParticleMode::SoftFluid;
-    mp.n_soft_particles = n_soft;
-    cap.particles_per_env = n_soft + n_fluid;
-    cap.max_grid_cells =
-        fluid.grid_dims[0] * fluid.grid_dims[1] * fluid.grid_dims[2];
-    // Reserve a disjoint body<->particle slot sub-range above the rigid budget for
-    // the FULL union (recomputed from rigid_base, overriding the inner soft growth).
-    GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
-}
-
-// Grid transfer owns [0, n_mpm); XPBD and particle contact rows own the remaining slice.
+// Grid transfer owns [0, n_mpm); vertex blocks and their contact rows own the remaining slice.
 
 void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
-                 const XpbdCookInput& soft, const SoftFluidContactInput& contact) {
+                 const XpbdCookInput& soft, float contact_d_min) {
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
@@ -2226,12 +1941,12 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     // the single-medium cook plus the same body<->particle contact setup.
     if (n_xpbd == 0u) {
         CookMpmParticles(model, env_count, mpm);
-        ApplyParticleBodyContact(model.particles, contact);
+        model.particles.pp_contact_d_min = contact_d_min;
         return;
     }
     if (n_mpm == 0u) {
         CookXpbdParticles(model, env_count, soft);
-        ApplyParticleBodyContact(model.particles, contact);
+        model.particles.pp_contact_d_min = contact_d_min;
         return;
     }
 
@@ -2248,36 +1963,16 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     nk::Model xtmp;
     CookXpbdParticles(xtmp, env_count, soft);
     const nk::Model::ModelParticles& xp = xtmp.particles;
-    // Particle contact would also push material points that the MPM grid already couples.
-    if (xp.pp_self_contact)
-        throw std::invalid_argument("xpbd self_contact cannot share a world with an MLS-MPM medium");
     mp.initial_pos.insert(mp.initial_pos.end(), xp.initial_pos.begin(),
                           xp.initial_pos.end());
     mp.initial_vel.insert(mp.initial_vel.end(), xp.initial_vel.begin(),
                           xp.initial_vel.end());
     mp.inv_mass.insert(mp.inv_mass.end(), xp.inv_mass.begin(), xp.inv_mass.end());
-    for (uint32_t v : xp.dist_a) mp.dist_a.push_back(v + n_mpm);
-    for (uint32_t v : xp.dist_b) mp.dist_b.push_back(v + n_mpm);
-    mp.dist_rest = xp.dist_rest;
-    mp.dist_alpha = xp.dist_alpha;
-    for (uint32_t v : xp.vol_particles) mp.vol_particles.push_back(v + n_mpm);
-    mp.vol_rest6 = xp.vol_rest6;
-    mp.vol_alpha = xp.vol_alpha;
-    // Shape-match: the CSR offsets/sizes/centroids are pool-local (the MPM slice has
-    // none, so the appended pool starts at 0); only the member particle indices rebase.
-    mp.sm_cluster_offset = xp.sm_cluster_offset;
-    mp.sm_cluster_size = xp.sm_cluster_size;
-    mp.sm_stiffness = xp.sm_stiffness;
-    mp.sm_rest_centroid = xp.sm_rest_centroid;
-    for (uint32_t v : xp.sm_particles) mp.sm_particles.push_back(v + n_mpm);
-    mp.sm_rest_q = xp.sm_rest_q;
-    mp.sm_mass = xp.sm_mass;
     for (uint32_t v : xp.aero_tri_verts) mp.aero_tri_verts.push_back(v + n_mpm);
     mp.aero_tri_area = xp.aero_tri_area;
     mp.aero_drag_normal = xp.aero_drag_normal;
     mp.aero_drag_tangent = xp.aero_drag_tangent;
     mp.aero_drag_max_dv = xp.aero_drag_max_dv;
-    mp.xpbd_iters = xp.xpbd_iters;
     mp.soft_friction = xp.soft_friction;
 
     mp.surface_info = xp.surface_info;
@@ -2299,15 +1994,11 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     cap.particle_surface_nodes_per_env = xtmp.capacities.particle_surface_nodes_per_env;
 
     // 3) The body<->particle cloth contact radius + the co-residence schema.
-    ApplyParticleBodyContact(mp, contact);
+    mp.pp_contact_d_min = contact_d_min;
     mp.mode = nk::Model::ParticleMode::MpmXpbd;
     mp.n_mpm_particles = n_mpm;
     cap.particles_per_env = n_mpm + n_xpbd;
     SetParticleOgcCapacity(cap, n_xpbd);
-    cap.dist_cons_per_env = xtmp.capacities.dist_cons_per_env;
-    cap.vol_cons_per_env  = xtmp.capacities.vol_cons_per_env;
-    cap.shape_match_slots_per_env   = xtmp.capacities.shape_match_slots_per_env;
-    cap.shape_match_members_per_env = xtmp.capacities.shape_match_members_per_env;
     cap.aero_tris_per_env = xtmp.capacities.aero_tris_per_env;
     StageVertexBlocks(model, soft, n_mpm);
     // Reserve body-particle rows for the XPBD slice above the rigid manifold budget.
@@ -2668,7 +2359,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     const std::vector<MediaRecord>& media) {
     std::vector<MediaRenderSurface> surfaces;
     if (media.empty()) return surfaces;
-    // MPM media concatenate before XPBD; each medium retains its own surface definition.
+    // MPM media concatenate before vertex-block media; each medium retains its own surface definition.
     uint32_t base = 0u;
     for (const MediaRecord& m : media) {
         if (m.method != MediaRecord::Method::MlsMpm) continue;
@@ -2693,8 +2384,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             base += n_mpm;
         }
     }
-    // The soft slice holds tet media, then vertex-block media, each in media order; track the
-    // running particle base exactly as CookSceneMedia appends them (fluid/MPM skipped).
+    // The soft slice holds vertex-block media in media order; track the running particle
+    // base exactly as CookSceneMedia appends them (fluid/MPM skipped).
     const auto append_soft = [&](const MediaRecord& m) {
         // Cable: the rope renders as an instanced bead tube over its chain range; the
         // optional welded slab renders as a triangulated rigid box over its 8 corners.
@@ -2722,24 +2413,10 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             return;
         }
         std::vector<uint32_t> tris;
-        uint32_t verts = 0u;
-        if (m.kind == MediaRecord::Kind::Cloth) {
-            const auto geometry = BuildClothGeometry(m);
-            verts = static_cast<uint32_t>(geometry.rest.size());
-            for (const auto& tri : geometry.triangles)
-                tris.insert(tris.end(), {tri.v[0], tri.v[1], tri.v[2]});
-        } else if (m.kind == MediaRecord::Kind::SoftTet) {
-            const MediaRecord::TetSphere& ts = m.tet_sphere;
-            if (ts.radius > 0.0f && ts.cells >= 2u && ts.cell_len > 0.0f) {
-                const runtime::soft::TetLattice lat =
-                    runtime::soft::BuildSphereTetLattice(
-                        math::Vec3{0.0f, 0.0f, 0.0f}, ts.radius, ts.cells, ts.cell_len);
-                tris = runtime::soft::ExtractBoundaryTriangles(lat.rest, lat.tets);
-                verts = static_cast<uint32_t>(lat.rest.size());
-            }
-        } else {
-            return;  // Fluid: no triangulated surface; it does not enter the soft slice.
-        }
+        const auto geometry = BuildClothGeometry(m);
+        const uint32_t verts = static_cast<uint32_t>(geometry.rest.size());
+        for (const auto& tri : geometry.triangles)
+            tris.insert(tris.end(), {tri.v[0], tri.v[1], tri.v[2]});
         if (!tris.empty()) {
             for (uint32_t& t : tris) t += base;
             MediaRenderSurface s;
@@ -2753,55 +2430,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
         base += verts;
     };
     for (const MediaRecord& m : media)
-        if (m.method != MediaRecord::Method::MlsMpm && !IsVertexBlockMedium(m)) append_soft(m);
-    for (const MediaRecord& m : media)
         if (IsVertexBlockMedium(m)) append_soft(m);
     return surfaces;
-}
-
-XpbdCookInput BuildSoftTetXpbdInput(const MediaRecord& media) {
-    XpbdCookInput in;
-    const MediaRecord::TetSphere& ts = media.tet_sphere;
-    if (ts.radius <= 0.0f || ts.cells < 2u || ts.cell_len <= 0.0f) {
-        return in;  // no tet body (an empty soft set is treated as none).
-    }
-    // The lattice is built at the origin and translated to the authored center, so the
-    // rest constraints (translation-invariant lengths/volumes) come from the origin set.
-    const runtime::soft::TetLattice lat = runtime::soft::BuildSphereTetLattice(
-        math::Vec3{0.0f, 0.0f, 0.0f}, ts.radius, ts.cells, ts.cell_len);
-    std::vector<math::Vec3> init = lat.rest;
-    for (math::Vec3& p : init) p = p + ts.center;
-
-    runtime::soft::TetMeshTopologyOptions opts;
-    opts.distance_compliance_alpha = media.xpbd.distance_alpha;
-    opts.volume_compliance_alpha = media.xpbd.volume_alpha;
-    opts.emit_distance_constraints = true;
-    runtime::soft::XpbdConstraintSet cs;
-    runtime::soft::BuildTetMeshConstraints(lat.rest, lat.tets, opts, cs);
-
-    in.positions = init;
-    in.surfaces.push_back({runtime::soft::ExtractBoundaryTriangles(lat.rest, lat.tets),
-                           0.0f, media.xpbd.friction, {}});
-    in.velocities.assign(init.size(), math::Vec3::Zero());
-    const float mass =
-        media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
-    in.inv_mass.assign(init.size(), 1.0f / mass);  // free (unpinned) solid.
-    for (const auto& dc : cs.distance) {
-        in.distance.push_back(
-            {dc.particle_a, dc.particle_b, dc.rest_length, dc.compliance_alpha});
-    }
-    for (const auto& vc : cs.volume) {
-        CookVolumeCon c;
-        for (uint32_t j = 0u; j < 4u; ++j) c.p[j] = vc.particle[j];
-        c.rest_volume_times6 = vc.rest_volume_times6;
-        c.compliance_alpha = vc.compliance_alpha;
-        in.volume.push_back(c);
-    }
-    in.solver_iterations =
-        static_cast<uint16_t>(media.xpbd.iters != 0u ? media.xpbd.iters : 1u);
-    in.friction = media.xpbd.friction;
-    in.self_contact = media.xpbd.self_contact;
-    return in;
 }
 
 XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
@@ -2871,112 +2501,6 @@ XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     in.friction = media.xpbd.friction;
     in.vbd_begin = 0u;
     in.vbd_count = static_cast<uint32_t>(in.positions.size());
-    return in;
-}
-
-// Append the pinned-boundary container (floor slab + side-wall ring) for a confined PBF
-// pool, then fill in.inv_mass (free fluid = 1/mass, every boundary particle pinned 0).
-static void AppendFluidConfinement(PbfCookInput& in, const MediaRecord& media) {
-    const MediaRecord::FluidBox& fb = media.fluid_box;
-    const MediaPbfMaterial& pbf = media.pbf;
-    const uint32_t n_free = static_cast<uint32_t>(in.positions.size());
-    const float s = fb.spacing;
-    const int L = static_cast<int>(pbf.boundary_layers);
-
-    const float wc_x = 0.5f * (pbf.walls_min.x + pbf.walls_max.x);
-    const float wc_y = 0.5f * (pbf.walls_min.y + pbf.walls_max.y);
-    const int nbx = static_cast<int>(std::ceil(0.5f * (pbf.walls_max.x - pbf.walls_min.x) / s));
-    const int nby = static_cast<int>(std::ceil(0.5f * (pbf.walls_max.y - pbf.walls_min.y) / s));
-    // CookFluidBox samples cell-centered, so the first fluid layer sits half a cell
-    // above the box floor; the slab stacks downward from there.
-    const float pool_bottom = fb.min.z + 0.5f * s;
-
-    // Floor slab: `boundary_layers` filled pinned layers below the fluid bottom.
-    for (int layer = 1; layer <= L; ++layer) {
-        const float bz = pool_bottom - static_cast<float>(layer) * s;
-        for (int iy = -nby; iy <= nby; ++iy)
-            for (int ix = -nbx; ix <= nbx; ++ix)
-                in.positions.push_back(
-                    math::Vec3{wc_x + static_cast<float>(ix) * s,
-                               wc_y + static_cast<float>(iy) * s, bz});
-    }
-    // Side walls: a pinned ring `boundary_layers` thick just outside the box footprint,
-    // from the fluid bottom up to the box top, confining the column laterally.
-    for (float z = pool_bottom; z <= pbf.walls_max.z + 1.0e-4f; z += s)
-        for (int iy = -(nby + L); iy <= nby + L; ++iy)
-            for (int ix = -(nbx + L); ix <= nbx + L; ++ix) {
-                if (std::abs(ix) <= nbx && std::abs(iy) <= nby) continue;  // box interior.
-                in.positions.push_back(
-                    math::Vec3{wc_x + static_cast<float>(ix) * s,
-                               wc_y + static_cast<float>(iy) * s, z});
-            }
-
-    const float im = in.particle_mass > 0.0f ? 1.0f / in.particle_mass : 0.0f;
-    in.inv_mass.assign(in.positions.size(), 0.0f);  // boundary pinned.
-    for (uint32_t i = 0; i < n_free; ++i) in.inv_mass[i] = im;  // free fluid.
-}
-
-PbfCookInput BuildFluidPbfInput(const MediaRecord& media) {
-    PbfCookInput in;
-    const MediaRecord::FluidBox& b = media.fluid_box;
-    if (b.spacing <= 0.0f || b.max.x <= b.min.x || b.max.y <= b.min.y ||
-        b.max.z <= b.min.z) {
-        return in;  // no fluid.
-    }
-    import::cooker::FluidBoxSpec spec;
-    spec.min_corner = b.min;
-    spec.max_corner = b.max;
-    spec.spacing = b.spacing;
-    spec.rest_density = media.pbf.rest_density > 0.0f ? media.pbf.rest_density : 1000.0f;
-    spec.position_jitter = b.position_jitter;
-    const runtime::fluid::PbfParticleSet box = import::cooker::CookFluidBox(spec);
-
-    in.positions = box.positions;
-    in.particle_mass = box.particle_mass;
-    in.rest_density = spec.rest_density;
-    const float support_scale =
-        media.pbf.support_scale > 0.0f ? media.pbf.support_scale : 1.5f;
-    const float h = support_scale * b.spacing;  // SPH support over the lattice spacing.
-    in.support_radius = h;
-    in.cfm_epsilon = 1.0e-6f;
-    in.iters = static_cast<uint16_t>(media.pbf.iters != 0u ? media.pbf.iters : 4u);
-    in.clamp_overdensity = media.pbf.clamp_overdensity;
-    in.boundary_enabled = true;
-    in.floor_z = media.pbf.floor_z;
-    in.friction = media.pbf.friction;
-    auto cells = [h](float extent) {
-        return static_cast<uint32_t>(std::ceil(extent / h)) + 1u;
-    };
-    const math::Vec3 lo = spec.min_corner, hi = spec.max_corner;
-    if (!media.pbf.walls_enabled) {
-        // Uniform-grid domain: enclose the box + lateral/vertical headroom so a
-        // particle pushed out of the box still finds neighbours (rebuilt per step).
-        in.velocities.assign(in.positions.size(), math::Vec3::Zero());
-        in.grid_min = math::Vec3{lo.x - 3.0f * h, lo.y - 3.0f * h,
-                                 std::min(lo.z, media.pbf.floor_z) - h};
-        in.grid_dims[0] = cells((hi.x - lo.x) + 6.0f * h);
-        in.grid_dims[1] = cells((hi.y - lo.y) + 6.0f * h);
-        in.grid_dims[2] = cells((hi.z - in.grid_min.z) + 4.0f * h);
-        return in;
-    }
-    // Confined pool: append the pinned container, then size the grid over the union
-    // of the fluid + boundary particles + a crown headroom above the box top.
-    in.walls_enabled = true;
-    in.walls_min = media.pbf.walls_min;
-    in.walls_max = media.pbf.walls_max;
-    in.boundary_layers = media.pbf.boundary_layers;
-    AppendFluidConfinement(in, media);
-    in.velocities.assign(in.positions.size(), math::Vec3::Zero());
-    math::Vec3 pmin{1.0e30f, 1.0e30f, 1.0e30f}, pmax{-1.0e30f, -1.0e30f, -1.0e30f};
-    for (const math::Vec3& p : in.positions) {
-        pmin = math::Vec3{std::min(pmin.x, p.x), std::min(pmin.y, p.y), std::min(pmin.z, p.z)};
-        pmax = math::Vec3{std::max(pmax.x, p.x), std::max(pmax.y, p.y), std::max(pmax.z, p.z)};
-    }
-    const float headroom = (hi.z - lo.z) + 4.0f * h;  // crown room above the box top.
-    in.grid_min = math::Vec3{pmin.x - 2.0f * h, pmin.y - 2.0f * h, pmin.z - 2.0f * h};
-    in.grid_dims[0] = cells((pmax.x - pmin.x) + 4.0f * h);
-    in.grid_dims[1] = cells((pmax.y - pmin.y) + 4.0f * h);
-    in.grid_dims[2] = cells((pmax.z - in.grid_min.z) + headroom);
     return in;
 }
 
@@ -3239,17 +2763,6 @@ void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
     dst.velocities.insert(dst.velocities.end(), src.velocities.begin(),
                           src.velocities.end());
     dst.inv_mass.insert(dst.inv_mass.end(), src.inv_mass.begin(), src.inv_mass.end());
-    for (CookDistanceCon dc : src.distance) {
-        dc.a += base; dc.b += base; dst.distance.push_back(dc);
-    }
-    for (CookVolumeCon vc : src.volume) {
-        for (uint32_t k = 0u; k < 4u; ++k) vc.p[k] += base;
-        dst.volume.push_back(vc);
-    }
-    for (CookShapeMatchCluster sm : src.shape_match) {
-        for (uint32_t& pi : sm.particle) pi += base;
-        dst.shape_match.push_back(std::move(sm));
-    }
     for (std::array<uint32_t, 3> t : src.aero_triangles) {
         t[0] += base; t[1] += base; t[2] += base;
         dst.aero_triangles.push_back(t);
@@ -3259,15 +2772,12 @@ void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
         for (uint32_t& vertex : surface.edges) vertex += base;
         dst.surfaces.push_back(std::move(surface));
     }
-    // The soft slice carries one solver/friction/aero set (per-medium override is the
+    // The soft slice carries one friction/aero set (per-medium override is the
     // medium's own); a single soft medium sets them verbatim.
-    dst.solver_iterations = src.solver_iterations;
     dst.friction = src.friction;
     dst.aero_drag_normal = src.aero_drag_normal;
     dst.aero_drag_tangent = src.aero_drag_tangent;
     dst.aero_drag_max_dv = src.aero_drag_max_dv;
-    dst.solver = src.solver;
-    dst.self_contact = dst.self_contact || src.self_contact;
     if (src.vbd_count == 0u) return;
     // Vertex-block media append last, so their ranges join into one.
     if (dst.vbd_count != 0u && dst.vbd_begin + dst.vbd_count != base + src.vbd_begin)
@@ -3293,21 +2803,9 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
         if (m.method == MediaRecord::Method::MlsMpm) have_mpm = true;
     }
 
-    // XPBD soft (cloth + tet-soft, concatenated) + the one PBF fluid. The MLS-MPM
-    // medium is handled by its own composer below (skipped here).
+    // Vertex-block media concatenate into one soft slice; MLS-MPM media compose below.
     XpbdCookInput soft;
-    PbfCookInput fluid;
-    bool have_soft = false, have_fluid = false;
-    for (const MediaRecord& m : media) {
-        if (m.method == MediaRecord::Method::MlsMpm || IsVertexBlockMedium(m)) continue;
-        if (m.kind == MediaRecord::Kind::SoftTet) {
-            AppendSoftMedium(soft, BuildSoftTetXpbdInput(m));
-            have_soft = true;
-        } else {  // Fluid (PBF; ValidateMedia guarantees at most one).
-            fluid = BuildFluidPbfInput(m);
-            have_fluid = true;
-        }
-    }
+    bool have_soft = false;
     for (const MediaRecord& m : media) {
         if (!IsVertexBlockMedium(m)) continue;
         AppendSoftMedium(soft, m.kind == MediaRecord::Kind::Cloth ? BuildClothVertexBlockInput(m)
@@ -3315,24 +2813,19 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
         have_soft = true;
     }
 
-    SoftFluidContactInput contact;
-    contact.contact_d_min = CrossContactDMin(media, particle_contact_radius);
-
+    const float contact_d_min = CrossContactDMin(media, particle_contact_radius);
     if (have_mpm) {
         const auto mpm = BuildMpmInput(media);
         if (have_soft) {
-            CookMpmXpbd(model, env_count, mpm, soft, contact);
+            CookMpmXpbd(model, env_count, mpm, soft, contact_d_min);
         } else {
-            XpbdCookInput soft_mpm;
-            soft_mpm.solver = nk::Model::ParticleMode::Mpm;  // the cook dispatch selector.
-            CookSoftBodyParticles(model, env_count, soft_mpm, mpm);
+            CookMpmParticles(model, env_count, mpm);
         }
         return;
     }
-
-    if (!have_soft && !have_fluid) return;
-    CookSoftFluidParticles(model, env_count, soft, fluid, contact);
-    SizeSelfContactGrid(model);
+    if (!have_soft) return;
+    CookXpbdParticles(model, env_count, soft);
+    model.particles.pp_contact_d_min = contact_d_min;
 }
 
 CookToModelResult CookSceneToModel(const SceneIR& scene, int env_count,

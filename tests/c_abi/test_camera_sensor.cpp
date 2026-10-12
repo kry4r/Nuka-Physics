@@ -292,13 +292,12 @@ TEST(CameraSensor, ParticleSurfaceWorldMountGraphAndReset) {
     ASSERT_NE(scene.handle, nullptr);
     nuka_media_desc_t cloth{};
     cloth.kind = NUKA_MEDIA_CLOTH;
-    cloth.method = NUKA_MEDIA_METHOD_XPBD;
+    cloth.method = NUKA_MEDIA_METHOD_VBD;
     cloth.cloth_nx = cloth.cloth_ny = 3u;
     cloth.cloth_spacing = 0.1f;
     cloth.cloth_origin[2] = 0.5f;
     cloth.cloth_free = 1u;
     cloth.xpbd_particle_mass = 0.02f;
-    cloth.xpbd_iters = 8u;
     cloth.skin_normal_offset = 0.007f;
     cloth.skin_smooth_iters = 2u;
     cloth.skin_smooth_lambda = 0.2f;

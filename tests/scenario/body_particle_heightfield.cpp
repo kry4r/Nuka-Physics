@@ -109,7 +109,6 @@ nk::Model BuildModel(const terrain::HeightField& hf, float start_z) {
     mp.initial_pos = {Vec3{0.0f, 0.0f, start_z}};
     mp.initial_vel = {Vec3{0.0f, 0.0f, -1.0f}};
     mp.inv_mass = {1.0f / 0.01f};
-    mp.xpbd_iters = 1;
     mp.pp_contact_d_min = 0.04f;
     return m;
 }

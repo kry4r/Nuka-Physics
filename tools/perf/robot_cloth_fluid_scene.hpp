@@ -41,12 +41,6 @@ constexpr float kContactDMin = 0.030f;
 constexpr uint32_t kClothNx = 13u;          // 13x13 = 169 cloth particles.
 constexpr float kClothSpacing = 0.016f;     // ~0.19 m square (spans both front feet).
 constexpr float kClothParticleMass = 0.01f; // 10 g per particle (light cloth).
-constexpr uint16_t kClothIters = 24u;       // tighter stretch solve = taut patch.
-constexpr float kPoolSpacing = 0.025f;
-constexpr float kPoolSupport = kPoolSpacing * 1.5f;
-constexpr float kPoolRestDensity = 1000.0f;
-constexpr uint32_t kPoolNx = 5u;            // 5x5 footprint.
-constexpr uint32_t kPoolNz = 4u;            // 4 layers deep.
 
 constexpr uint32_t kSettleSteps = 250u;     // settle the robot stance + the media.
 constexpr uint32_t kHoldSteps = 200u;       // co-step the held stance over the media.
@@ -99,7 +93,6 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx =
     }
     soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
-    in.solver_iterations = kClothIters;
     for (const auto& triangle : tris)
         in.aero_triangles.push_back({triangle.v[0], triangle.v[1], triangle.v[2]});
     in.aero_drag_normal = 0.6f;
@@ -113,39 +106,6 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx =
     in.surfaces.push_back(std::move(surface));
     return in;
 }
-inline cook::PbfCookInput BuildPool(float cx, float cy, float floor_z) {
-    cook::PbfCookInput in;
-    const float s = kPoolSpacing, h = kPoolSupport, rho0 = kPoolRestDensity;
-    const float c0 = -0.5f * static_cast<float>(kPoolNx - 1u) * s;
-    const float bottom = floor_z + 0.5f * s;
-    for (uint32_t iz = 0; iz < kPoolNz; ++iz)
-        for (uint32_t iy = 0; iy < kPoolNx; ++iy)
-            for (uint32_t ix = 0; ix < kPoolNx; ++ix)
-                in.positions.push_back(Vec3{cx + c0 + static_cast<float>(ix) * s,
-                                            cy + c0 + static_cast<float>(iy) * s,
-                                            bottom + static_cast<float>(iz) * s});
-    in.velocities.assign(in.positions.size(), Vec3::Zero());
-    in.particle_mass = rho0 * s * s * s;
-    in.rest_density = rho0;
-    in.support_radius = h;
-    in.cfm_epsilon = 1.0e-6f;
-    in.iters = 4u;
-    in.clamp_overdensity = true;
-    in.boundary_enabled = true;
-    in.floor_z = floor_z;
-    in.friction = 0.0f;   // fluid mu ~= 0: the foot slides; splash stays normal-driven.
-    const float half = 0.5f * static_cast<float>(kPoolNx - 1u) * s + 3.0f * h;
-    const float top = floor_z + kPoolNz * s + 4.0f * h;
-    in.grid_min = Vec3{cx - half - h, cy - half - h, floor_z - h};
-    auto cells = [&](float extent) {
-        return static_cast<uint32_t>(std::ceil(extent / h)) + 1u;
-    };
-    in.grid_dims[0] = cells(2.0f * half);
-    in.grid_dims[1] = cells(2.0f * half);
-    in.grid_dims[2] = cells(top - (floor_z - h));
-    return in;
-}
-
 
 inline nuka::scene::SceneIR RobotScene(const std::filesystem::path& path, bool with_free_body = false) {
     nuka::scene::SceneIR scene = nuka::import::LoadUsd(path.string());
@@ -192,9 +152,9 @@ inline nk::Model CookRobot(const std::filesystem::path& path, bool with_free_bod
 struct PreparedScene {
     std::filesystem::path path;
     nk::Pipeline::SolverConfig config;
-    Vec3 front_centre, rear_foot;
-    float cloth_z, pool_floor;
-    uint32_t front_link, rear_link;
+    Vec3 front_centre;
+    float cloth_z;
+    uint32_t front_link;
     std::vector<Transform> link_geom_local;
     std::vector<float> settled_q, settled_qdot;
 };
@@ -233,49 +193,19 @@ inline PreparedScene Prepare(const std::filesystem::path& path, phi::Device* dev
     auto by_x = foot_world;
     std::sort(by_x.begin(), by_x.end(),
               [](const Vec3& a, const Vec3& c) { return a.x < c.x; });
-    const float front_x = by_x.back().x, rear_x = by_x.front().x;
+    const float mid_x = 0.5f * (by_x.back().x + by_x.front().x);
     Vec3 front_centre{0, 0, 0}; uint32_t nf = 0;
-    Vec3 rear_foot{0, 0, 0}; float rear_best = 1e9f;
-    float foot_rest_z = 0.0f;
-    uint32_t front_link = foot_links[0], rear_link = foot_links[0];
-    for (size_t i = 0; i < foot_world.size(); ++i) {
-        const Vec3& f = foot_world[i];
-        foot_rest_z += f.z;
-        if (f.x > 0.5f * (front_x + rear_x)) {
-            front_centre = front_centre + f; ++nf; front_link = foot_links[i];
-        } else if (f.x < rear_best) {
-            rear_best = f.x; rear_foot = f; rear_link = foot_links[i];
+    uint32_t front_link = foot_links[0];
+    float cloth_z = 0.0f;
+    for (size_t i = 0; i < foot_world.size(); ++i)
+        if (foot_world[i].x > mid_x) {
+            front_centre = front_centre + foot_world[i]; ++nf;
+            front_link = foot_links[i]; cloth_z = foot_world[i].z;
         }
-    }
-    foot_rest_z /= static_cast<float>(foot_world.size());
     front_centre = front_centre * (1.0f / static_cast<float>(nf));
-    std::fprintf(stderr,
-                 "[robot-coupling] front_centre=(%.4f,%.4f) rear_foot=(%.4f,%.4f) "
-                 "foot_rest_z=%.4f\n",
-                 front_centre.x, front_centre.y, rear_foot.x, rear_foot.y, foot_rest_z);
-    const float pool_top = foot_rest_z;
-    const float pool_floor = pool_top - static_cast<float>(kPoolNz - 1u) * kPoolSpacing -
-                             0.5f * kPoolSpacing;
-    float front_foot_z_loaded = foot_rest_z;
-    {
-        nk::Model m = CookRobot(path);
-        cook::PbfCookInput pool = BuildPool(rear_foot.x, rear_foot.y, pool_floor);
-        cook::CookSoftFluidParticles(m, 1u, cook::XpbdCookInput{}, pool);
-        m.particles.pp_contact_d_min = kContactDMin;
-        nk::World w(std::move(m), 1u, device, backend, config);
-        Require(w.Ready(), w.CreationError());
-        for (uint32_t s = 0; s < kSettleSteps; ++s) RequireStep(w, "pool calibration step failed", s);
-        std::vector<Transform> lp(L);
-        Require(w.GetData().DownloadField(nk::FieldId::LinkPose, lp.data(), L * sizeof(Transform)), "calibration pose download failed");
-        front_foot_z_loaded = (lp[front_link] * link_geom_local[front_link]).position.z;
-    }
-    std::fprintf(stderr, "[robot-coupling] front_foot_z_loaded=%.4f\n",
-                 front_foot_z_loaded);
-    const float cloth_z = front_foot_z_loaded;
-
-
-    return {path, config, front_centre, rear_foot, cloth_z, pool_floor,
-            front_link, rear_link, link_geom_local, std::move(settled_q), std::move(settled_qdot)};
+    std::fprintf(stderr, "[robot-coupling] front_centre=(%.4f,%.4f) cloth_z=%.4f\n",
+                 front_centre.x, front_centre.y, cloth_z);
+    return {path, config, front_centre, cloth_z, front_link, link_geom_local, std::move(settled_q), std::move(settled_qdot)};
 }
 
 inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
@@ -283,14 +213,9 @@ inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
                               SceneVisuals* visuals = nullptr) {
     nk::Model model = CookRobot(scene.path, true, visuals);
     auto cloth = BuildCloth(scene.front_centre.x, scene.front_centre.y, scene.cloth_z, cloth_nx);
-    auto pool = BuildPool(scene.rear_foot.x, scene.rear_foot.y, scene.pool_floor);
-    if (!patch_present) {
+    if (!patch_present)
         for (auto& position : cloth.positions) position.z -= 10.0f;
-        for (auto& position : pool.positions) position.z -= 10.0f;
-        pool.grid_min.z -= 10.0f;
-        pool.floor_z -= 10.0f;
-    }
-    cook::CookSoftFluidParticles(model, envs, cloth, pool);
+    cook::CookXpbdParticles(model, envs, cloth);
     model.particles.pp_contact_d_min = kContactDMin;
     for (auto& body : model.body_init)
         if (body.inv_mass > 0.0f) body.angular_velocity = {5.0f, -3.0f, 2.0f};

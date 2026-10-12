@@ -1,8 +1,8 @@
 """Constitutive materials for the authoring facade.
 
 A material is a parameter bag that also SELECTS the solver method for its medium:
-``Cloth.VBD`` (cloth, vertex blocks), ``Cable.VBD`` (rope, vertex blocks), ``Soft.XPBD`` /
-``Soft.MPM`` (tet soft body), ``Fluid.PBF`` / ``Fluid.MPM`` (fluid), and ``Rigid``
+``Cloth.VBD`` (cloth, vertex blocks), ``Cable.VBD`` (rope, vertex blocks),
+``Soft.MPM`` (tet soft body), ``Fluid.MPM`` (fluid), and ``Rigid``
 (a rigid primitive). Each
 maps onto the ``SceneBuilder.add_media`` / ``add_rigid_primitive`` kwargs through a
 small ``*_kwargs`` method (mirroring ``ClothMaterial.cook_kwargs``) and declares
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import dataclasses as _dc
 import math as _math
-from typing import Optional, Tuple
+from typing import Tuple
 
 
 @_dc.dataclass(frozen=True)
@@ -122,29 +122,6 @@ class Cable:
 
 
 @_dc.dataclass(frozen=True)
-class SoftXpbdMaterial:
-    """XPBD tet-soft parameters -> the xpbd_* media block (distance + volume)."""
-
-    MEDIA_KIND = "soft_tet"
-    MEDIA_METHOD = "xpbd"
-
-    mass: float
-    friction: float
-    distance_alpha: float
-    volume_alpha: float
-    iters: int
-
-    def media_material_kwargs(self) -> dict:
-        return dict(
-            xpbd_particle_mass=float(self.mass),
-            xpbd_friction=float(self.friction),
-            xpbd_distance_alpha=float(self.distance_alpha),
-            xpbd_volume_alpha=float(self.volume_alpha),
-            xpbd_iters=int(self.iters),
-        )
-
-
-@_dc.dataclass(frozen=True)
 class MpmMaterial:
     """MLS-MPM parameters -> the mpm_* media block. ``model_kind`` 0 corotated,
     2 neo-hookean, 3 weakly-compressible fluid, 4 granular Drucker-Prager;
@@ -226,19 +203,7 @@ class MpmMaterial:
 
 
 class Soft:
-    """Tet-soft constitutive models: ``Soft.XPBD`` (distance+volume) or
-    ``Soft.MPM`` (a continuum solid)."""
-
-    @staticmethod
-    def XPBD(mass: float = 0.01, friction: float = 0.5,
-             distance_alpha: float = 0.0, volume_alpha: float = 1.5e-6,
-             iters: int = 40) -> SoftXpbdMaterial:
-        """An XPBD tet soft body: per-vertex ``mass`` kg, contact ``friction``,
-        ``distance_alpha`` / ``volume_alpha`` edge + tet-volume compliance (higher
-        = softer), and ``iters`` solver iterations."""
-        if iters < 1:
-            raise ValueError("Soft.XPBD: iters must be >= 1")
-        return SoftXpbdMaterial(mass, friction, distance_alpha, volume_alpha, iters)
+    """Tet-soft constitutive models: ``Soft.MPM`` (a continuum solid)."""
 
     @staticmethod
     def MPM(youngs: float = 1.0e5, poisson: float = 0.3, density: float = 1000.0,
@@ -280,57 +245,8 @@ class Soft:
                         hardening_modulus=hardening_modulus)
 
 
-@_dc.dataclass(frozen=True)
-class FluidPbfMaterial:
-    """Position-based-fluid parameters -> the pbf_* media block. ``walls`` is
-    ``None`` (open domain) or a ``(min_xyz, max_xyz)`` confinement box."""
-
-    MEDIA_KIND = "fluid"
-    MEDIA_METHOD = "pbf"
-
-    rest_density: float
-    support_scale: float
-    iters: int
-    friction: float
-    walls: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]
-    clamp_overdensity: bool
-    floor_z: float
-    boundary_layers: int
-
-    def media_material_kwargs(self) -> dict:
-        kw = dict(
-            pbf_rest_density=float(self.rest_density),
-            pbf_support_scale=float(self.support_scale),
-            pbf_iters=int(self.iters), pbf_friction=float(self.friction),
-            pbf_clamp_overdensity=bool(self.clamp_overdensity),
-            pbf_floor_z=float(self.floor_z),
-        )
-        if self.walls is not None:
-            wmin, wmax = self.walls
-            kw.update(pbf_walls_enabled=True,
-                      pbf_walls_min=[float(c) for c in wmin],
-                      pbf_walls_max=[float(c) for c in wmax],
-                      pbf_boundary_layers=int(self.boundary_layers))
-        return kw
-
-
 class Fluid:
-    """Fluid constitutive models: ``Fluid.PBF`` (incompressible PBD) or
-    ``Fluid.MPM`` (a weakly-compressible MLS-MPM fluid)."""
-
-    @staticmethod
-    def PBF(rest_density: float = 1000.0, support_scale: float = 1.5,
-            iters: int = 4, friction: float = 0.1, walls=None,
-            clamp_overdensity: bool = True, floor_z: float = 0.0,
-            boundary_layers: int = 2) -> FluidPbfMaterial:
-        """A position-based fluid: ``rest_density`` kg/m^3, SPH support radius =
-        ``support_scale`` * lattice spacing, ``iters`` density iterations, contact
-        ``friction``. ``walls=(min_xyz, max_xyz)`` builds a pinned confinement
-        container (with ``boundary_layers`` thickness); ``None`` is an open pool."""
-        if iters < 1:
-            raise ValueError("Fluid.PBF: iters must be >= 1")
-        return FluidPbfMaterial(rest_density, support_scale, iters, friction,
-                                walls, clamp_overdensity, floor_z, boundary_layers)
+    """Fluid constitutive models: ``Fluid.MPM`` (a weakly-compressible MLS-MPM fluid)."""
 
     @staticmethod
     def MPM(density: float = 1000.0, bulk_modulus: float = 2.0e5,
@@ -452,6 +368,6 @@ def Render(name: str, base_color: Tuple[float, float, float] = (1.0, 1.0, 1.0),
 
 __all__ = [
     "Cloth", "ClothMaterial", "Cable", "CableMaterial", "Soft",
-    "SoftXpbdMaterial", "MpmMaterial", "Fluid", "FluidPbfMaterial", "Granular",
+    "MpmMaterial", "Fluid", "Granular",
     "Rigid", "RigidMaterial", "Render", "RenderAppearance",
 ]

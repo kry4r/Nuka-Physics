@@ -101,9 +101,7 @@ cook::MpmCookInput BuildJellyInput() {
 nk::Model BuildJellyModel() {
     nk::Model m;
     m.capacities.env_count = 1u;
-    cook::XpbdCookInput soft;          // the bulk-soft descriptor; selector = Mpm.
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(m, 1u, soft, BuildJellyInput());
+    cook::CookMpmParticles(m, 1u, BuildJellyInput());
     return m;
 }
 

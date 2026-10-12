@@ -110,7 +110,6 @@ nk::Model BuildModel() {
     mp.initial_pos = {Vec3{0.0f, 0.0f, 0.115f}};
     mp.initial_vel = {Vec3{0.0f, 0.0f, -1.0f}};   // approaching the box top, downward.
     mp.inv_mass = {1.0f / 0.01f};                 // 10 g particle.
-    mp.xpbd_iters = 1;
     // A particle is a SPHERE of d_min/2 on the ONE path; radius 0.02 -> d_min 0.04.
     mp.pp_contact_d_min = 0.04f;
     return m;

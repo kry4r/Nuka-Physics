@@ -87,10 +87,6 @@ uint64_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::SlotDof:        return CheckedProduct({max_contacts_per_env, dofs_per_env});
         case FieldPer::RowDof:         return CheckedProduct({max_rows_per_env, dofs_per_env});
         case FieldPer::Particle:       return particles_per_env;
-        case FieldPer::DistCon:        return dist_cons_per_env;
-        case FieldPer::VolCon:         return vol_cons_per_env;
-        case FieldPer::ShapeMatchSlot:   return shape_match_slots_per_env;
-        case FieldPer::ShapeMatchMember: return shape_match_members_per_env;
         case FieldPer::EnvDof2:        return CheckedProduct({dofs_per_env, dofs_per_env});
         // Multi-articulation co-residence: per-artic count == articulations_per_env;
         // the per-artic M-tile == articulations_per_env * max_dof^2. At
@@ -106,11 +102,6 @@ uint64_t ModelCapacities::PerEnvCount(FieldPer per) const {
         case FieldPer::Scalar:         return 0u;  // resolved by ElementCount
     }
     return 0u;
-}
-
-uint64_t ModelCapacities::NeighborPoolCapacity() const {
-    if (neighbor_pool_capacity_per_env != 0u) return neighbor_pool_capacity_per_env;
-    return static_cast<uint64_t>(particles_per_env) * phi::kDefaultParticleNeighborBudget;
 }
 
 uint64_t ModelCapacities::ParticleContactReserve(uint32_t grid_particles) const {
@@ -150,23 +141,12 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
     if (aero_tris_per_env == 0u &&
         (id == FieldId::AeroParticleOffset || id == FieldId::AeroParticleCount))
         return 0u;
-    if (grid_sort_scratch_bytes == 0u &&
-        (id == FieldId::GridNeighborAttempted || id == FieldId::GridNeighborScanOffset))
-        return 0u;
-    // MPM transfer scratch is absent from pure XPBD/PBF worlds. The MPM op is not
+    // MPM transfer scratch is absent from vertex-block-only worlds. The MPM op is not
     // emitted there, so these per-particle buffers must stay byte-inert just like
     // the scalar CUB workspace that owns their lifetime.
     if (mpm_grid_sort_scratch_bytes == 0u &&
         (id == FieldId::MpmGridCellKey || id == FieldId::MpmGridPartIdx ||
          id == FieldId::MpmParticleStress)) {
-        return 0u;
-    }
-    // The particle-neighbor grid is absent in XPBD/MPM worlds. Its op is inert
-    // there (cell_size==0), so none of these per-particle CSR fields is consumed.
-    if (grid_sort_scratch_bytes == 0u &&
-        (id == FieldId::GridCellKey || id == FieldId::GridParticleIdx ||
-         id == FieldId::GridNeighborOffset || id == FieldId::GridNeighborCount ||
-         id == FieldId::GridNeighborIdx)) {
         return 0u;
     }
     if (vbd_vertices_per_env == 0u &&
@@ -235,8 +215,6 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::VbdMembraneStart) return CheckedProduct({vbd_elements_per_env, env_count});
         if (id == FieldId::CrbaScratch)
             return CheckedProduct({articulations_per_env, env_count, dofs_per_env, uint64_t{dofs_per_env} + 12u});
-        if (id == FieldId::GridNeighborIdx)
-            return CheckedProduct({NeighborPoolCapacity(), env_count});
         // Symbolic scalar counts require an explicit field-specific extent.
         // Unresolved fields are rejected instead of allocating a smaller buffer.
         if (id == FieldId::MatBuckets) {
@@ -292,17 +270,6 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::SdfCellKeys || id == FieldId::SdfCellValues ||
             id == FieldId::SdfCellGradients) {
             return static_cast<uint64_t>(max_sdf_cells);
-        }
-        // M6 particle uniform-grid cell ranges: per-env cell count x env_count
-        // (the keys are env-offset, so every env owns a private cell span).
-        if (id == FieldId::GridCellStart || id == FieldId::GridCellEnd) {
-            return static_cast<uint64_t>(max_grid_cells) *
-                   static_cast<uint64_t>(env_count);
-        }
-        // Particle-grid sort/scan scratch (u8 bytes): one GLOBAL buffer for the
-        // single grid op, sized by World construct; 0 for a particle-free world.
-        if (id == FieldId::GridSortScratch) {
-            return grid_sort_scratch_bytes;
         }
         if (id == FieldId::PairSortScratch) {
             return pair_sort_scratch_bytes;
@@ -363,24 +330,6 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         // for every current scene (no cook fills it yet) -> a zero-byte segment.
         if (id == FieldId::Heights) {
             return static_cast<uint64_t>(max_heightfield_cells);
-        }
-        // XPBD graph-coloring color-segment tables: a {offset,count} PAIR per
-        // color, GLOBAL (single-env template). 0 colors -> a zero-byte segment.
-        if (id == FieldId::DistColorSegments) {
-            return static_cast<uint64_t>(xpbd_dist_colors) * 2ull;
-        }
-        if (id == FieldId::VolColorSegments) {
-            return static_cast<uint64_t>(xpbd_vol_colors) * 2ull;
-        }
-        if (id == FieldId::SmColorSegments) {
-            return static_cast<uint64_t>(xpbd_sm_colors) * 2ull;
-        }
-        if (id == FieldId::ParticleTopologyOffsets) {
-            return particle_topology_incidence_count > 0u ? uint64_t{particles_per_env} + 1u : 0u;
-        }
-        if (id == FieldId::ParticleTopologyElements) return particle_topology_incidence_count;
-        if (id == FieldId::ParticleContactRestPos) {
-            return particle_topology_incidence_count > 0u ? particles_per_env : 0u;
         }
         // LBVH per-env Karras tree: (2N-1) nodes/env (N = bodies_per_env), 9 f32
         // lanes/node, env_count envs. The kernel strides by env*(2N-1) so the
@@ -940,26 +889,6 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             }
             break;
         }
-        // XPBD color-segment tables: copy the flat {offset,count}/color pairs
-        // (GLOBAL single-env template; the ElementCount sizes the segment exactly).
-        case FieldId::DistColorSegments:
-            if (!dist_color_segments.empty())
-                std::memcpy(dst, dist_color_segments.data(),
-                            dist_color_segments.size() * sizeof(uint32_t));
-            break;
-        case FieldId::VolColorSegments:
-            if (!vol_color_segments.empty())
-                std::memcpy(dst, vol_color_segments.data(),
-                            vol_color_segments.size() * sizeof(uint32_t));
-            break;
-        case FieldId::SmColorSegments:
-            if (!sm_color_segments.empty())
-                std::memcpy(dst, sm_color_segments.data(),
-                            sm_color_segments.size() * sizeof(uint32_t));
-            break;
-        case FieldId::ParticleTopologyOffsets:
-            std::memcpy(dst, particles.topology_offsets.data(), seg.bytes);
-            break;
         case FieldId::VbdElements:
             std::memcpy(dst, particles.vbd_elements.data(), seg.bytes);
             break;
@@ -992,118 +921,6 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             break;
         case FieldId::VbdCoarseChildWeights:
             std::memcpy(dst, particles.vbd_coarse_child_weights.data(), seg.bytes);
-            break;
-        case FieldId::ParticleTopologyElements:
-            std::memcpy(dst, particles.topology_elements.data(), seg.bytes);
-            break;
-        case FieldId::ParticleContactRestPos:
-            std::memcpy(dst, particles.initial_pos.data(), seg.bytes);
-            break;
-        // ---------------------------------------------------------------
-        // M6 XPBD constraint templates (owner:model). The single-env template
-        // is replicated env-major; env e's constraints get their particle
-        // indices offset by e*particles_per_env (the device particle arrays
-        // are env-major, so a constraint must point at its own env's particles).
-        // This mirrors the legacy per-world soft-upload layout tiled E times.
-        // ---------------------------------------------------------------
-        case FieldId::DistParticleA:
-        case FieldId::DistParticleB: {
-            const auto& src = (id == FieldId::DistParticleA) ? particles.dist_a
-                                                             : particles.dist_b;
-            auto* p = reinterpret_cast<uint32_t*>(dst);
-            const uint32_t dn = capacities.dist_cons_per_env;
-            const uint32_t pn = capacities.particles_per_env;
-            for (uint32_t e = 0; e < E; ++e) {
-                for (uint32_t c = 0; c < dn && c < src.size(); ++c) {
-                    p[static_cast<size_t>(e) * dn + c] = src[c] + e * pn;
-                }
-            }
-            break;
-        }
-        case FieldId::DistRestLength:
-            StampPerLink(dst, particles.dist_rest, capacities.dist_cons_per_env, E,
-                         sizeof(float));
-            break;
-        case FieldId::DistCompliance:
-            StampPerLink(dst, particles.dist_alpha, capacities.dist_cons_per_env, E,
-                         sizeof(float));
-            break;
-        case FieldId::VolParticles: {
-            auto* p = reinterpret_cast<uint32_t*>(dst);
-            const uint32_t vn = capacities.vol_cons_per_env;
-            const uint32_t pn = capacities.particles_per_env;
-            for (uint32_t e = 0; e < E; ++e) {
-                for (uint32_t c = 0; c < vn; ++c) {
-                    for (uint32_t j = 0; j < 4u; ++j) {
-                        const size_t si = static_cast<size_t>(c) * 4u + j;
-                        if (si >= particles.vol_particles.size()) continue;
-                        p[(static_cast<size_t>(e) * vn + c) * 4u + j] =
-                            particles.vol_particles[si] + e * pn;
-                    }
-                }
-            }
-            break;
-        }
-        case FieldId::VolRestTimes6:
-            StampPerLink(dst, particles.vol_rest6, capacities.vol_cons_per_env, E,
-                         sizeof(float));
-            break;
-        case FieldId::VolCompliance:
-            StampPerLink(dst, particles.vol_alpha, capacities.vol_cons_per_env, E,
-                         sizeof(float));
-            break;
-        // ---------------------------------------------------------------
-        // M9 T11 XPBD SHAPE-MATCH (id 9) cluster templates (owner:model).
-        // The single-env CSR template is replicated env-major. The per-cluster
-        // member OFFSET is shifted by e*members_per_env (the device member pool
-        // is env-major) and the per-member PARTICLE index by e*particles_per_env
-        // (the device particle arrays are env-major). The legacy single-world
-        // CSR layout tiled E times -- byte-faithful to the legacy soft flatten.
-        // ---------------------------------------------------------------
-        case FieldId::SmClusterOffset: {
-            auto* p = reinterpret_cast<uint32_t*>(dst);
-            const uint32_t cn = capacities.shape_match_slots_per_env;
-            const uint32_t mn = capacities.shape_match_members_per_env;
-            for (uint32_t e = 0; e < E; ++e) {
-                for (uint32_t c = 0; c < cn && c < particles.sm_cluster_offset.size();
-                     ++c) {
-                    p[static_cast<size_t>(e) * cn + c] =
-                        particles.sm_cluster_offset[c] + e * mn;
-                }
-            }
-            break;
-        }
-        case FieldId::SmClusterSize:
-            StampPerLink(dst, particles.sm_cluster_size,
-                         capacities.shape_match_slots_per_env, E, sizeof(uint32_t));
-            break;
-        case FieldId::SmStiffness:
-            StampPerLink(dst, particles.sm_stiffness,
-                         capacities.shape_match_slots_per_env, E, sizeof(float));
-            break;
-        case FieldId::SmRestCentroid:
-            StampPerLink(dst, particles.sm_rest_centroid,
-                         capacities.shape_match_slots_per_env, E, sizeof(math::Vec3));
-            break;
-        case FieldId::SmParticles: {
-            auto* p = reinterpret_cast<uint32_t*>(dst);
-            const uint32_t mn = capacities.shape_match_members_per_env;
-            const uint32_t pn = capacities.particles_per_env;
-            for (uint32_t e = 0; e < E; ++e) {
-                for (uint32_t m = 0; m < mn && m < particles.sm_particles.size(); ++m) {
-                    p[static_cast<size_t>(e) * mn + m] =
-                        particles.sm_particles[m] + e * pn;
-                }
-            }
-            break;
-        }
-        case FieldId::SmRestQ:
-            StampPerLink(dst, particles.sm_rest_q,
-                         capacities.shape_match_members_per_env, E, sizeof(math::Vec3));
-            break;
-        case FieldId::SmMass:
-            StampPerLink(dst, particles.sm_mass,
-                         capacities.shape_match_members_per_env, E, sizeof(float));
             break;
         // Cloth aero-drag templates (owner:model). The single-env triangle list is
         // replicated env-major; each triangle's 3 particle indices are shifted by
@@ -1347,28 +1164,11 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::IslandRowOffsets:      v.island_row_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::IslandColorSegments:   v.island_color_segments = static_cast<uint32_t*>(p); break;
         case FieldId::RowOrder:              v.row_order = static_cast<uint32_t*>(p); break;
-        case FieldId::DistParticleA:         v.dist_particle_a = static_cast<uint32_t*>(p); break;
-        case FieldId::DistParticleB:         v.dist_particle_b = static_cast<uint32_t*>(p); break;
-        case FieldId::DistRestLength:        v.dist_rest_length = static_cast<float*>(p); break;
-        case FieldId::DistCompliance:        v.dist_compliance = static_cast<float*>(p); break;
-        case FieldId::VolParticles:          v.vol_particles = static_cast<uint32_t*>(p); break;
-        case FieldId::VolRestTimes6:         v.vol_rest_times6 = static_cast<float*>(p); break;
-        case FieldId::VolCompliance:         v.vol_compliance = static_cast<float*>(p); break;
-        case FieldId::SmClusterOffset:       v.sm_cluster_offset = static_cast<uint32_t*>(p); break;
-        case FieldId::SmClusterSize:         v.sm_cluster_size = static_cast<uint32_t*>(p); break;
-        case FieldId::SmStiffness:           v.sm_stiffness = static_cast<float*>(p); break;
-        case FieldId::SmRestCentroid:        v.sm_rest_centroid = static_cast<math::Vec3*>(p); break;
-        case FieldId::SmParticles:           v.sm_particles = static_cast<uint32_t*>(p); break;
-        case FieldId::SmRestQ:               v.sm_rest_q = static_cast<math::Vec3*>(p); break;
-        case FieldId::SmMass:                v.sm_mass = static_cast<float*>(p); break;
         case FieldId::AeroTriVerts:          v.aero_tri_verts = static_cast<uint32_t*>(p); break;
         case FieldId::AeroTriArea:           v.aero_tri_area = static_cast<float*>(p); break;
         case FieldId::AeroParticleOffset:    v.aero_particle_offset = static_cast<uint32_t*>(p); break;
         case FieldId::AeroParticleCount:     v.aero_particle_count = static_cast<uint32_t*>(p); break;
         case FieldId::AeroIncidentTri:       v.aero_incident_tri = static_cast<uint32_t*>(p); break;
-        case FieldId::ParticleTopologyOffsets: v.particle_topology_offsets = static_cast<uint32_t*>(p); break;
-        case FieldId::ParticleTopologyElements: v.particle_topology_elements = static_cast<uint32_t*>(p); break;
-        case FieldId::ParticleContactRestPos: v.particle_contact_rest_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::VbdElements:           v.vbd_elements = static_cast<VbdElement*>(p); break;
         case FieldId::VbdIncidenceOffsets:   v.vbd_incidence_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::VbdIncidence:          v.vbd_incidence = static_cast<uint32_t*>(p); break;
@@ -1380,9 +1180,6 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::VbdCoarseChildOffsets: v.vbd_coarse_child_offsets = static_cast<uint32_t*>(p); break;
         case FieldId::VbdCoarseChildren:     v.vbd_coarse_children = static_cast<uint32_t*>(p); break;
         case FieldId::VbdCoarseChildWeights: v.vbd_coarse_child_weights = static_cast<float*>(p); break;
-        case FieldId::DistColorSegments:     v.dist_color_segments = static_cast<uint32_t*>(p); break;
-        case FieldId::VolColorSegments:      v.vol_color_segments = static_cast<uint32_t*>(p); break;
-        case FieldId::SmColorSegments:       v.sm_color_segments = static_cast<uint32_t*>(p); break;
         default: break;  // a data-owned field id: not a ModelView member.
     }
 }
@@ -1406,10 +1203,9 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
         const uint32_t surface_contacts = particle_surfaces_per_env > 0u ? mpm_contact_capacity_per_env : 0u;
         const bool grid_endpoints = mpm_grid_nodes_per_env > 0u;
         const uint64_t required_endpoints = uint64_t{ogc_contacts_per_env} * 2u +
-            vol_cons_per_env + (grid_endpoints ? MpmPointEndpointCount(
+            (grid_endpoints ? MpmPointEndpointCount(
                 particles_per_env, surface_contacts, mpm_stress_cells_per_env) : 0u);
         const uint64_t required_terms = uint64_t{ogc_contacts_per_env} * 6u +
-            uint64_t{vol_cons_per_env} * 4u +
             (grid_endpoints ? MpmPointEndpointTermCount(
                 particles_per_env, surface_contacts, mpm_stress_cells_per_env) : 0u);
         if (point_endpoints_per_env < required_endpoints ||
@@ -1424,8 +1220,6 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
                            CheckedProduct({mpm_grid_nodes_per_env, env_count})}) {
             if (count > int_limit) throw std::invalid_argument("capacity exceeds device sort index range");
         }
-        if (CheckedProduct({NeighborPoolCapacity(), env_count}) > std::numeric_limits<uint32_t>::max())
-            throw std::invalid_argument("neighbor pool exceeds device index range");
         uint64_t total = 0u;
         for (int i = 0; i < kFieldCount; ++i) {
             const auto id = static_cast<FieldId>(i);
@@ -1576,8 +1370,6 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
     }
     if (cap.dofs_per_env > phi::kMaxArticulationDof)
         return reject(Status::Unsupported, "articulation DOF exceeds the solver capacity");
-    if (cap.NeighborPoolCapacity() * cap.env_count > limit)
-        return reject(Status::InvalidArgument, "neighbor pool exceeds 32-bit device indexing");
     if (drive_mode > static_cast<uint32_t>(phi::ArticulationControlMode::Actuator))
         return reject(Status::InvalidArgument, "unknown articulation control mode");
     if (n == 0u && cap.dofs_per_env != 0u)
@@ -1660,34 +1452,11 @@ phi::Status Model::ValidateTopology(std::string* reason) const {
         }
     }
     const auto& p = particles;
-    if (p.dist_a.size() != p.dist_b.size() || p.dist_a.size() != p.dist_rest.size() ||
-        p.dist_a.size() != p.dist_alpha.size() || p.dist_a.size() > cap.dist_cons_per_env ||
-        p.vol_particles.size() != p.vol_alpha.size() * 4ull || p.vol_rest6.size() != p.vol_alpha.size() ||
-        p.vol_alpha.size() > cap.vol_cons_per_env)
-        return reject(Status::InvalidArgument, "incomplete particle constraint tables");
-    const auto clusters = p.sm_cluster_size.size();
-    if (p.sm_cluster_offset.size() != clusters || p.sm_stiffness.size() != clusters ||
-        p.sm_rest_centroid.size() != clusters || clusters > cap.shape_match_slots_per_env ||
-        p.sm_particles.size() != p.sm_rest_q.size() || p.sm_particles.size() != p.sm_mass.size() ||
-        p.sm_particles.size() > cap.shape_match_members_per_env)
-        return reject(Status::InvalidArgument, "incomplete shape-match cluster tables");
-    uint64_t incidences = p.dist_a.size() * 2ull + p.vol_particles.size() + p.aero_tri_verts.size();
-    if (p.dist_a.size() + p.vol_alpha.size() + clusters +
-        p.aero_tri_area.size() > limit)
+    const uint64_t incidences = p.aero_tri_verts.size();
+    if (p.aero_tri_area.size() > limit)
         return reject(Status::InvalidArgument, "particle structural elements exceed device indexing");
-    for (size_t cluster = 0u; cluster < clusters; ++cluster) {
-        if (uint64_t{p.sm_cluster_offset[cluster]} + p.sm_cluster_size[cluster] > p.sm_particles.size())
-            return reject(Status::InvalidArgument, "shape-match member span exceeds its pool");
-        incidences += p.sm_cluster_size[cluster];
-        if (incidences > limit)
-            return reject(Status::InvalidArgument, "particle structural incidence exceeds device indexing");
-    }
     if (incidences > limit)
         return reject(Status::InvalidArgument, "particle structural incidence exceeds device indexing");
-    for (const auto* indices : {&p.dist_a, &p.dist_b, &p.vol_particles, &p.sm_particles})
-        for (uint32_t particle : *indices)
-            if (particle >= cap.particles_per_env)
-                return reject(Status::InvalidArgument, "particle constraint index exceeds its environment");
     if (incidences > 0u) {
         if (p.initial_pos.size() != cap.particles_per_env)
             return reject(Status::InvalidArgument, "particle topology requires complete rest positions");
@@ -1865,43 +1634,6 @@ phi::Status Model::ValidateVertexBlockLevels(std::string* reason) const {
     return phi::Status::Ok;
 }
 
-void Model::BuildParticleTopology() {
-    auto& p = particles;
-    p.topology_offsets.clear();
-    p.topology_elements.clear();
-    capacities.particle_topology_incidence_count = 0u;
-    std::vector<std::pair<uint32_t, uint32_t>> memberships;
-    size_t incidence_bound = p.dist_a.size() * 2u + p.vol_particles.size() + p.aero_tri_verts.size();
-    for (uint32_t count : p.sm_cluster_size) incidence_bound += count;
-    memberships.reserve(incidence_bound);
-    uint32_t element = 0u;
-    const auto append = [&](const uint32_t* indices, size_t count) {
-        for (size_t i = 0u; i < count; ++i) memberships.emplace_back(indices[i], element);
-        ++element;
-    };
-    for (size_t i = 0u; i < p.dist_a.size(); ++i) {
-        const std::array<uint32_t, 2> indices{p.dist_a[i], p.dist_b[i]};
-        append(indices.data(), indices.size());
-    }
-    for (size_t i = 0u; i < p.vol_particles.size(); i += 4u) append(p.vol_particles.data() + i, 4u);
-    for (size_t i = 0u; i < p.sm_cluster_size.size(); ++i)
-        if (p.sm_cluster_size[i] > 0u)
-            append(p.sm_particles.data() + p.sm_cluster_offset[i], p.sm_cluster_size[i]);
-    for (size_t i = 0u; i < p.aero_tri_verts.size(); i += 3u) append(p.aero_tri_verts.data() + i, 3u);
-    if (memberships.empty()) return;
-    std::sort(memberships.begin(), memberships.end());
-    memberships.erase(std::unique(memberships.begin(), memberships.end()), memberships.end());
-    p.topology_offsets.assign(size_t{capacities.particles_per_env} + 1u, 0u);
-    p.topology_elements.reserve(memberships.size());
-    for (const auto& [particle, group] : memberships) {
-        ++p.topology_offsets[size_t{particle} + 1u];
-        p.topology_elements.push_back(group);
-    }
-    for (size_t i = 1u; i < p.topology_offsets.size(); ++i)
-        p.topology_offsets[i] += p.topology_offsets[i - 1u];
-    capacities.particle_topology_incidence_count = static_cast<uint32_t>(memberships.size());
-}
-
 void Model::BuildAeroAdjacency() {
     auto& p = particles;
     p.aero_particle_offset.clear();
@@ -1930,7 +1662,6 @@ phi::Status Model::UploadTo(phi::BufferType* bt, phi::ModelView* out_view) {
     const auto topology_status = ValidateTopology();
     if (topology_status != phi::Status::Ok) return topology_status;
     BuildAeroAdjacency();
-    BuildParticleTopology();
     capacities.foot_shape_count = static_cast<uint32_t>(feet.size());
     // Capacity contracts (loud-failure discipline): the cooked host tables MUST
     // fit their advertised capacities, else staging would SILENTLY drop the tail
@@ -2140,9 +1871,6 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.schedule_islands = std::move(src.schedule_islands);
     dst.schedule_island_count = src.schedule_island_count;
     dst.schedule_segment_count = src.schedule_segment_count;
-    dst.dist_color_segments = std::move(src.dist_color_segments);
-    dst.vol_color_segments = std::move(src.vol_color_segments);
-    dst.sm_color_segments = std::move(src.sm_color_segments);
     // M5 pair-driven / SDF tables (review fix: these were MISSING — a moved
     // Model silently dropped every pair-driven collision table, staging zeros).
     dst.excluded_pairs = std::move(src.excluded_pairs);

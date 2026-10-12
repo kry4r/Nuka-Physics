@@ -802,9 +802,8 @@ SystemKindComponent::K SystemKindFromMediaKind(MediaRecord::Kind kind) {
 }
 
 SoftBodyComponent::SimMethod SimMethodFromMediaMethod(MediaRecord::Method method) {
-    if (method == MediaRecord::Method::MlsMpm) return SoftBodyComponent::SimMethod::MlsMpm;
-    if (method == MediaRecord::Method::Vbd) return SoftBodyComponent::SimMethod::Vbd;
-    return SoftBodyComponent::SimMethod::Xpbd;
+    return method == MediaRecord::Method::MlsMpm ? SoftBodyComponent::SimMethod::MlsMpm
+                                                 : SoftBodyComponent::SimMethod::Vbd;
 }
 
 // Stable node name for an UNNAMED record: derive from the RECORD identity
@@ -1155,8 +1154,7 @@ void SceneIR::ProjectMedia(const MediaRecord& rec) {
     if (rec.kind == MediaRecord::Kind::Fluid) {
         FluidComponent fl;
         fl.particle_size = rec.fluid_box.spacing;
-        fl.rho0 = (rec.method == MediaRecord::Method::MlsMpm) ? rec.mpm.density
-                                                              : rec.pbf.rest_density;
+        fl.rho0 = rec.mpm.density;
         ecs_.Add(entity, std::move(fl));
     } else {
         SoftBodyComponent sb;
@@ -1165,11 +1163,9 @@ void SceneIR::ProjectMedia(const MediaRecord& rec) {
         if (rec.method == MediaRecord::Method::MlsMpm) {
             sb.young   = rec.mpm.youngs;
             sb.poisson = rec.mpm.poisson;
-        } else if (rec.method == MediaRecord::Method::Vbd) {
+        } else {
             sb.young   = rec.xpbd.stretch_stiffness;
             sb.poisson = rec.xpbd.poisson;
-        } else {
-            sb.xpbd_compliance = rec.xpbd.distance_alpha;
         }
         ecs_.Add(entity, std::move(sb));
     }

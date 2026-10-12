@@ -113,8 +113,6 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
         default: return false;
     }
     switch (d.method) {
-        case NUKA_MEDIA_METHOD_XPBD:   m.method = Method::Xpbd; break;
-        case NUKA_MEDIA_METHOD_PBF:    m.method = Method::Pbf; break;
         case NUKA_MEDIA_METHOD_MLSMPM: m.method = Method::MlsMpm; break;
         case NUKA_MEDIA_METHOD_VBD:    m.method = Method::Vbd; break;
         default: return false;
@@ -159,28 +157,13 @@ bool MediaFromDesc(const nuka_media_desc_t& d, nscene::MediaRecord* out) {
     m.xpbd.friction = d.xpbd_friction;
     m.xpbd.half_thickness = d.xpbd_half_thickness;
     m.xpbd.surface_density = d.xpbd_surface_density;
-    m.xpbd.distance_alpha = d.xpbd_distance_alpha;
-    m.xpbd.volume_alpha = d.xpbd_volume_alpha;
     m.xpbd.stretch_stiffness = d.vbd_stretch_stiffness;
     m.xpbd.poisson = d.vbd_poisson;
     m.xpbd.bend_stiffness = d.vbd_bend_stiffness;
     m.xpbd.damping = d.vbd_damping;
-    m.xpbd.iters = static_cast<uint16_t>(d.xpbd_iters);
     m.xpbd.aero_drag_normal = d.xpbd_aero_drag_normal;
     m.xpbd.aero_drag_tangent = d.xpbd_aero_drag_tangent;
     m.xpbd.aero_drag_max_dv = d.xpbd_aero_drag_max_dv;
-    m.pbf.rest_density = d.pbf_rest_density;
-    m.pbf.support_scale = d.pbf_support_scale;
-    m.pbf.iters = static_cast<uint16_t>(d.pbf_iters);
-    m.pbf.friction = d.pbf_friction;
-    m.pbf.clamp_overdensity = (d.pbf_clamp_overdensity != 0u);
-    m.pbf.walls_enabled = (d.pbf_walls_enabled != 0u);
-    m.pbf.walls_min = nmath::Vec3{d.pbf_walls_min[0], d.pbf_walls_min[1],
-                                  d.pbf_walls_min[2]};
-    m.pbf.walls_max = nmath::Vec3{d.pbf_walls_max[0], d.pbf_walls_max[1],
-                                  d.pbf_walls_max[2]};
-    m.pbf.floor_z = d.pbf_floor_z;
-    m.pbf.boundary_layers = d.pbf_boundary_layers;
     m.mpm.youngs = d.mpm_youngs;
     m.mpm.poisson = d.mpm_poisson;
     m.mpm.density = d.mpm_density;
@@ -419,7 +402,7 @@ nuka_result_t nuka_scene_add_media_ex(nuka_scene_handle scene,
             (plasticity != nullptr && media.method != nscene::MediaRecord::Method::MlsMpm))
             return NUKA_RESULT_INVALID_ARG;
         // Reject an illegal (kind x method) immediately via the SAME cook validator
-        // (a single-record list; the cross-medium MPM+XPBD/PBF mix is caught at cook).
+        // (a single-record list; the cross-medium mix is caught at cook).
         cook::ValidateMedia(std::vector<nscene::MediaRecord>{media});
         media.name = "media_" + std::to_string(sr->scene->MediaCount());
         const nscene::MediaId id = sr->scene->AddMedia(std::move(media));

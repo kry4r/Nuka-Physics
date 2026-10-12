@@ -14,7 +14,6 @@
 #include "nk/model/contact_capacity.hpp"
 #include "nk/solve/schedule.hpp"
 #include "nk/solve/nk_row.hpp"
-#include "nk/solve/xpbd_coloring.hpp"
 
 namespace nuka::nk {
 
@@ -79,8 +78,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         rigid_rows +
         point_slots * kPairDrivenParticleRowsPerSlot + control_cap.joint_limit_rows_per_env +
         control_cap.joint_friction_rows_per_env + drive_rows +
-        uint64_t{control_cap.mpm_stress_cells_per_env} * kMpmStressRowsPerCell +
-        uint64_t{control_cap.dist_cons_per_env} + control_cap.vol_cons_per_env;
+        uint64_t{control_cap.mpm_stress_cells_per_env} * kMpmStressRowsPerCell;
     if (row_count > std::numeric_limits<uint32_t>::max()) {
         creation_status_ = phi::Status::InvalidArgument;
         creation_error_ = "actuator row capacity is invalid";
@@ -92,19 +90,14 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     control_cap.inverse_dynamics_controls =
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
-    // Volume rows keep one 4-term particle endpoint each at the endpoint tail.
-    const uint64_t constraint_endpoints = control_cap.vol_cons_per_env;
-    if (control_cap.mpm_grid_nodes_per_env > 0u ||
-        control_cap.ogc_contacts_per_env > 0u || constraint_endpoints > 0u) {
+    if (control_cap.mpm_grid_nodes_per_env > 0u || control_cap.ogc_contacts_per_env > 0u) {
         const uint32_t surfaces = control_cap.particle_surfaces_per_env > 0u
             ? control_cap.mpm_contact_capacity_per_env : 0u;
         const bool grid = control_cap.mpm_grid_nodes_per_env > 0u;
-        const uint64_t endpoints = constraint_endpoints +
-            uint64_t{control_cap.ogc_contacts_per_env} * 2u +
+        const uint64_t endpoints = uint64_t{control_cap.ogc_contacts_per_env} * 2u +
             (grid ? MpmPointEndpointCount(control_cap.particles_per_env, surfaces,
                                           control_cap.mpm_stress_cells_per_env) : 0u);
-        const uint64_t terms = constraint_endpoints * 4u +
-            uint64_t{control_cap.ogc_contacts_per_env} * 6u +
+        const uint64_t terms = uint64_t{control_cap.ogc_contacts_per_env} * 6u +
             (grid ? MpmPointEndpointTermCount(control_cap.particles_per_env, surfaces,
                                               control_cap.mpm_stress_cells_per_env) : 0u);
         if (endpoints > std::numeric_limits<uint32_t>::max() || terms > std::numeric_limits<uint32_t>::max()) {
@@ -149,25 +142,7 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     if (creation_status_ != phi::Status::Ok) return;
     creation_status_ = phi::Status::Failed;
 
-    // Size the particle-grid sort/scan scratch so ParticleGridBuild captures into
-    // the graph (no mid-capture cudaMalloc); 0 for a particle-free world (inert).
     try {
-    const bool runs_pbf =
-        model_.particles.mode == Model::ParticleMode::Pbf ||
-        model_.particles.mode == Model::ParticleMode::SoftFluid ||
-        (model_.particles.mode == Model::ParticleMode::Coupled &&
-         model_.particles.coupled_internal == Model::CoupledInternal::Pbf);
-    const bool particle_contact = model_.particles.pp_self_contact && model_.particles.pp_contact_d_min > 0.0f;
-    const uint32_t particle_grid_count = runs_pbf || particle_contact
-        ? model_.capacities.particles_per_env * model_.capacities.env_count : 0u;
-    if (particle_grid_count > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-        creation_status_ = phi::Status::InvalidArgument;
-        creation_error_ = "particle grid exceeds the sort item limit";
-        return;
-    }
-    model_.capacities.grid_sort_scratch_bytes =
-        phi::GridSortScratchBytes(particle_grid_count);
-
     // Particle transfers and grid indexing retain their own workspace capacities.
     const uint32_t mpm_per_env = model_.MpmParticlesPerEnv();
     const uint64_t mpm_particle_sort_count =
@@ -271,12 +246,6 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
     model_.capacities.schedule_color_elements = model_.schedule_color_segments.size() / 2u;
     model_.capacities.schedule_row_elements = model_.schedule_row_order.size();
 
-    // 0b. Graph-color the XPBD constraint families ONCE (a general solver
-    // property): reorder each family into color-contiguous order so the device
-    // projects a color's constraints in parallel (no shared particle => race-
-    // free, no atomics) while colors run in fixed order — deterministic.
-    XpbdColoring::Build(&model_);
-
     // 1. Upload the Model's constant tables into ONE device buffer + fill view.
     creation_status_ = model_.UploadTo(bt, &model_view_);
     if (creation_status_ != phi::Status::Ok) {
@@ -359,8 +328,6 @@ bool World::SeedInitialState() {
     fk_params_.total_link_count = L * E;
     fk_params_.articulations_per_env = cap.articulations_per_env;
     reset_params_.particle_count = cap.particles_per_env;
-    reset_params_.has_particle_grid = cap.grid_sort_scratch_bytes != 0u;
-    restore_params_.has_particle_grid = reset_params_.has_particle_grid;
     reset_params_.point_endpoints_per_env = cap.point_endpoints_per_env;
     reset_params_.point_endpoint_terms_per_env = cap.point_endpoint_terms_per_env;
     restore_params_.point_endpoints_per_env = cap.point_endpoints_per_env;

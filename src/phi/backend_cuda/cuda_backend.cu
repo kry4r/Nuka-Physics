@@ -35,7 +35,6 @@ const char* NkOpName(int op) {
         case NkOp::BuildAabbs: return "BuildAabbs";
         case NkOp::LbvhBuild: return "LbvhBuild";
         case NkOp::LbvhQueryPairs: return "LbvhQueryPairs";
-        case NkOp::ParticleGridBuild: return "ParticleGridBuild";
         case NkOp::NarrowphasePrimitives: return "NarrowphasePrimitives";
         case NkOp::NarrowphaseSdf: return "NarrowphaseSdf";
         case NkOp::ContactTangentBasis: return "ContactTangentBasis";
@@ -44,9 +43,6 @@ const char* NkOpName(int op) {
         case NkOp::BlockDescentSolve: return "BlockDescentSolve";
         case NkOp::ParticleAeroDrag: return "ParticleAeroDrag";
         case NkOp::ParticlePredict: return "ParticlePredict";
-        case NkOp::XpbdProject: return "XpbdProject";
-        case NkOp::PbfDensityLambda: return "PbfDensityLambda";
-        case NkOp::PbfApplyDelta: return "PbfApplyDelta";
         case NkOp::ParticleFinalize: return "ParticleFinalize";
         case NkOp::MpmPredict: return "MpmPredict";
         case NkOp::MpmExchange: return "MpmExchange";
@@ -66,7 +62,6 @@ const char* NkOpName(int op) {
         case NkOp::RandomizeMaterialBuckets: return "RandomizeMaterialBuckets";
         case NkOp::RandomizeBodyParams: return "RandomizeBodyParams";
         case NkOp::StepBackward: return "StepBackward";
-        case NkOp::ParticleParticleContact: return "ParticleParticleContact";
         case NkOp::SyncLinkBodyPose: return "SyncLinkBodyPose";
         case NkOp::NarrowphaseBodyParticle: return "NarrowphaseBodyParticle";
         case NkOp::NarrowphaseHeightfield: return "NarrowphaseHeightfield";

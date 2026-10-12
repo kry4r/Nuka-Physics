@@ -177,9 +177,7 @@ SceneModel BuildModel(const Args& args) {
     material.grid_dims[2] = static_cast<uint32_t>(std::ceil(0.26f / args.dx)) + 1u;
     material.floor_d = -1.0f;
     material.floor_friction = 0.0f;
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(model, 1u, soft, material);
+    cook::CookMpmParticles(model, 1u, material);
     model.particles.mpm_body_friction = 0.0f;
     model.particles.mpm_body_band = kContactBand;
     return scene;

@@ -10,8 +10,6 @@
 #     Featherstone ABA / FK / CRBA state (per dof / per link / per env).
 #   * runtime::rigid::BodyState (runtime/rigid/body_state.hpp) — movable rigid
 #     body SoA (per body).
-#   * XPBD soft (op-ified on nk, particles.cu) — XPBD particle + 4 constraint
-#     families (per particle / per dist_con / per vol_con / ...).
 #   * PBF fluid (op-ified on nk, particles.cu) — PBF particle SoA (per particle).
 #   * unified row solve — contacts / rows / sides / lambda warm-start / m_inv /
 #     the SolveSchedule island tables / contact_count + row_count watermarks.
@@ -26,8 +24,7 @@
 #             the engine math types via views.hpp typedefs.)
 #   per    : the count-unit the array is sized by —
 #            env | dof | link | body | contact_slot | row_slot | particle |
-#            dist_con | vol_con | shape_match_slot | shape_match_member
-#            | scalar | articulation | articulation_dof2
+#            scalar | articulation | articulation_dof2
 #            (plus the §3.3 examples' env_dof2). `scalar` uses an explicit count.
 #            articulation       = per-ARTICULATION arrays (sized articulations_per_env);
 #                                 the multi-dog co-residence root pose + per-artic link
@@ -37,9 +34,6 @@
 #                                 block per co-resident articulation (was env_dof2).
 #            At articulations_per_env == 1 BOTH collapse element-for-element onto
 #            env / env_dof2 -> every single-articulation golden stays byte-identical.
-#            shape_match_slot = per-CLUSTER arrays (offset/count/stiffness/centroid);
-#            shape_match_member = per flat-cluster-MEMBER arrays (the CSR particle /
-#            rest-offset / weight pool, sized sum_c n_c per env).
 #   arena  : persistent | scratch | tape   (which of the 3 phi Buffers it lives in)
 #   owner  : model | data
 #            model = immutable cook product (topology / templates / capacities),
@@ -56,7 +50,7 @@
 
 schema:
   dtype: [f32, u32, u64, u8, vec3, quat, transform, spatial6, mat36, symmat3]
-  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, dist_con, vol_con, shape_match_slot, shape_match_member, env_dof2, scalar, articulation, articulation_dof2, articulation_dof, aero_tri]
+  per:   [env, dof, link, body, contact_slot, row_slot, slot_dof, row_dof, particle, env_dof2, scalar, articulation, articulation_dof2, articulation_dof, aero_tri]
   arena: [persistent, scratch, tape]
   owner: [model, data]
   flags: [diff, param, readout]
@@ -388,56 +382,13 @@ fields:
   - {name: row_order,             dtype: u32, per: scalar, count: "schedule_row_elements", arena: persistent, owner: model}
 
   # =========================================================================
-  # PARTICLE (XPBD soft) — DATA. Source: nk soft ops. particle_pos above (§3.3).
+  # PARTICLE (soft) — DATA. Source: nk soft ops. particle_pos above (§3.3).
   # =========================================================================
   - {name: particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data, flags: [diff]}
   - {name: particle_inv_mass, dtype: f32,  per: particle, arena: persistent, owner: data, flags: [param]}
   # Current projected velocity reference; subtract it to apply each new contact increment once.
   - {name: particle_v_pre,    dtype: vec3, per: particle, arena: scratch,    owner: data}
-
-  # --- XPBD DISTANCE constraints (per dist_con) ---
-  - {name: dist_particle_a,    dtype: u32, per: dist_con, arena: persistent, owner: model}
-  - {name: dist_particle_b,    dtype: u32, per: dist_con, arena: persistent, owner: model}
-  - {name: dist_rest_length,   dtype: f32, per: dist_con, arena: persistent, owner: model}
-  - {name: dist_compliance,    dtype: f32, per: dist_con, arena: persistent, owner: model, flags: [param]}
-  - {name: dist_lambda,        dtype: f32, per: dist_con, arena: persistent, owner: data}
-
-  # --- XPBD VOLUME constraints (per vol_con; 4 particles) ---
-  - {name: vol_particles,    dtype: u32, per: vol_con, arena: persistent, owner: model, elem: 4}
-  - {name: vol_rest_times6,  dtype: f32, per: vol_con, arena: persistent, owner: model}
-  - {name: vol_compliance,   dtype: f32, per: vol_con, arena: persistent, owner: model, flags: [param]}
-  - {name: vol_lambda,       dtype: f32, per: vol_con, arena: persistent, owner: data}
-
-  # =========================================================================
-  # M9 T11 — XPBD SHAPE-MATCH (id 9) cluster constraints (Mueller et al. 2005).
-  # The 4th XPBD row family, op-ified on the nk core (particles.cu
-  # SolveShapeMatchConstraintsKernel). A cluster of VARIABLE size is pulled
-  # toward the best rigid transform of its rest shape. CSR layout (the legacy
-  # soft-upload flatten 1:1):
-  #   PER-CLUSTER (per: shape_match_slot):
-  #     sm_cluster_offset  : base into the flat member pool for this cluster.
-  #     sm_cluster_size    : member count n_c of this cluster.
-  #     sm_stiffness       : goal-pull fraction s in [0,1] (XPBD shape-match
-  #                          stiffness; from compliance_alpha).
-  #     sm_rest_centroid   : cooked rest centroid c0 (kept for completeness; the
-  #                          per-member q_i is already c0-offset, so the kernel
-  #                          does not re-read it -- exactly the legacy kernel).
-  #   PER-MEMBER (per: shape_match_member; the flat sum_c n_c pool):
-  #     sm_particles       : member particle index (env-major OFFSET like the
-  #                          dist/vol particle fields: +e*particles_per_env).
-  #     sm_rest_q          : q_i = x_i^0 - c0 (rest offset; cooked once).
-  #     sm_mass            : m_i shape-match WEIGHT (independent of inv_mass).
-  # All owner:model (cook-constant); shape matching carries NO Lagrange
-  # multiplier, so there is no per-step data-owned lambda field.
-  # =========================================================================
-  - {name: sm_cluster_offset, dtype: u32,  per: shape_match_slot,   arena: persistent, owner: model}
-  - {name: sm_cluster_size,   dtype: u32,  per: shape_match_slot,   arena: persistent, owner: model}
-  - {name: sm_stiffness,      dtype: f32,  per: shape_match_slot,   arena: persistent, owner: model, flags: [param]}
-  - {name: sm_rest_centroid,  dtype: vec3, per: shape_match_slot,   arena: persistent, owner: model}
-  - {name: sm_particles,      dtype: u32,  per: shape_match_member, arena: persistent, owner: model}
-  - {name: sm_rest_q,         dtype: vec3, per: shape_match_member, arena: persistent, owner: model}
-  - {name: sm_mass,           dtype: f32,  per: shape_match_member, arena: persistent, owner: model}
 
   # =========================================================================
   # CLOTH AERODYNAMIC DRAG — MODEL. Per surface triangle: the 3 particle indices
@@ -449,26 +400,8 @@ fields:
   - {name: aero_tri_verts,    dtype: u32,  per: aero_tri, arena: persistent, owner: model, elem: 3}
   - {name: aero_tri_area,     dtype: f32,  per: aero_tri, arena: persistent, owner: model}
 
-  # =========================================================================
-  # PARTICLE (PBF fluid) — DATA. Source: nk fluid ops. The fluid shares particle_pos/
-  # particle_vel with XPBD; PBF-specific scratch is predicted pos / density /
-  # lambda / position deltas.
-  # =========================================================================
   # Shared working positions for all row-coupled particle materials; committed once at finalize.
   - {name: pbf_predicted_pos,  dtype: vec3, per: particle, arena: scratch, owner: data}
-  - {name: pbf_position_delta, dtype: vec3, per: particle, arena: scratch, owner: data}
-  - {name: pbf_density,        dtype: f32,  per: particle, arena: scratch, owner: data}
-  - {name: pbf_lambda,         dtype: f32,  per: particle, arena: scratch, owner: data}
-
-  # Stable cell ranges and environment-private pools use actual CSR offsets.
-  # Attempted counts precede clipping; retained counts bound every consumer.
-  - {name: grid_cell_key,       dtype: u32, per: particle, arena: scratch, owner: data}
-  - {name: grid_particle_idx,   dtype: u32, per: particle, arena: scratch, owner: data}
-  - {name: grid_cell_start,     dtype: u32, per: scalar, count: "max_grid_cells*env_count", arena: scratch, owner: data}
-  - {name: grid_cell_end,       dtype: u32, per: scalar, count: "max_grid_cells*env_count", arena: scratch, owner: data}
-  - {name: grid_neighbor_offset,dtype: u32, per: particle, arena: scratch, owner: data}
-  - {name: grid_neighbor_count, dtype: u32, per: particle, arena: scratch, owner: data, flags: [readout]}
-  - {name: grid_neighbor_idx,   dtype: u32, per: scalar, count: "neighbor_pool_capacity*env_count", arena: scratch, owner: data}
 
   # =========================================================================
   # DOMAIN RANDOMIZATION / RNG — DATA. mat_buckets/mat_index above (§3.3).
@@ -696,36 +629,6 @@ fields:
   - {name: snapshot_particle_prev_pos, dtype: vec3, per: particle, arena: persistent, owner: data}
   - {name: snapshot_particle_vel,      dtype: vec3, per: particle, arena: persistent, owner: data}
 
-  # =========================================================================
-  # XPBD GRAPH-COLORING color-segment tables — MODEL (cook-constant solver
-  # property, built by nk::XpbdColoring at World construct from the cooked
-  # constraint SoA). Each family's constraints are REORDERED into color-
-  # contiguous order; a color is an independent set sharing no particle, so all
-  # of a color's constraints project in PARALLEL (one thread per constraint, no
-  # write race, no atomics) while colors run in fixed order — parallel
-  # Gauss-Seidel, deterministic. Each table is a flat {offset, count} u32 PAIR
-  # per color, GLOBAL (the single-env template; the device kernel adds the
-  # per-env constraint stride). Sized 2*<family>_colors. A particle-free or
-  # constraint-free world resolves <family>_colors == 0 -> a zero-byte segment
-  # (byte-inert; rigid-only worlds keep every field offset). APPENDED LAST so
-  # every pre-existing arena/Model offset is byte-stable (the D1 invariant).
-  # =========================================================================
-  - {name: dist_color_segments, dtype: u32, per: scalar, count: "xpbd_dist_colors*2", arena: persistent, owner: model}
-  - {name: vol_color_segments,  dtype: u32, per: scalar, count: "xpbd_vol_colors*2",  arena: persistent, owner: model}
-  - {name: sm_color_segments,   dtype: u32, per: scalar, count: "xpbd_sm_colors*2",   arena: persistent, owner: model}
-
-  # =========================================================================
-  # PARTICLE-GRID SORT SCRATCH — DATA (scratch). The pre-allocated byte arena the
-  # ParticleGridBuild cub radix sort + exclusive scan draw temp storage + the sort
-  # output buffers from, so they never cudaMalloc mid CUDA-graph capture (cub takes
-  # explicit temp storage and never synchronizes -> capture-safe). Sized at World
-  # construction from the cub temp-storage query + the two out buffers for the total
-  # particle count (grid_sort_scratch_bytes); 0 bytes for a particle-free world ->
-  # zero-byte segment (byte-inert). APPENDED LAST so every pre-existing arena offset
-  # is byte-stable (the D1 invariant).
-  # =========================================================================
-  - {name: grid_sort_scratch, dtype: u8, per: scalar, count: "grid_sort_scratch_bytes", arena: scratch, owner: data}
-
   # MLS-MPM env-private background grid (dense Cartesian nodes; scratch, rebuilt
   # every transfer). 0 nodes for a non-MPM world -> zero-byte segment. APPENDED LAST.
   - {name: grid_mass,     dtype: f32,  per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
@@ -899,9 +802,6 @@ fields:
   - {name: body_gyro_iterations, dtype: u32, per: body, arena: scratch, owner: data, flags: [readout]}
   - {name: body_gyro_status, dtype: u32, per: body, arena: scratch, owner: data, flags: [readout]}
 
-  # Exact neighbor counts and a 64-bit prefix for environment-private CSR pools.
-  - {name: grid_neighbor_attempted, dtype: u32, per: particle, arena: scratch, owner: data, flags: [readout]}
-  - {name: grid_neighbor_scan_offset, dtype: u64, per: particle, arena: scratch, owner: data}
   - {name: lbvh_sort_scratch, dtype: u8, per: scalar, count: "lbvh_sort_scratch_bytes", arena: scratch, owner: data}
   - {name: contact_cache_scratch, dtype: u8, per: scalar, count: "contact_cache_scratch_bytes", arena: scratch, owner: data}
 
@@ -913,11 +813,6 @@ fields:
   - {name: link_contact_begin, dtype: u32, per: link, arena: scratch, owner: data}
   - {name: link_contact_end, dtype: u32, per: link, arena: scratch, owner: data}
   - {name: contact_index_scratch, dtype: u8, per: scalar, count: "contact_index_scratch_bytes", arena: scratch, owner: data}
-
-  # Shared rest geometry and structural incidence for particle contact exclusions.
-  - {name: particle_topology_offsets, dtype: u32, per: scalar, count: "particle_topology_offsets", arena: persistent, owner: model}
-  - {name: particle_topology_elements, dtype: u32, per: scalar, count: "particle_topology_incidence_count", arena: persistent, owner: model}
-  - {name: particle_contact_rest_pos, dtype: vec3, per: scalar, count: "particle_contact_rest_positions", arena: persistent, owner: model}
 
   # Mesh topology is shared by all environments and indexed by collidable.
   - {name: mesh_surface_info, dtype: mesh_surface_info, per: scalar, count: "mesh_surface_info_count", arena: persistent, owner: model}

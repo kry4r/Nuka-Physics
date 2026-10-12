@@ -5,7 +5,7 @@
 // above a ground plane, then a simple rigid body presses it. The cloth particles
 // are SPHERE collidables flowing through the SAME body<->particle row solver a
 // foot uses on the ground: detection -> body<->particle narrowphase -> emit ->
-// SolveRowsBlockIsland -> SoftFluid finalize compose. No bespoke coupler: the
+// SolveRowsBlockIsland -> particle finalize. No bespoke coupler: the
 // presser is a general rigid body, the cloth is particles, both on one path.
 //
 // The two directions of the two-way effect, proven numerically:
@@ -66,7 +66,6 @@ constexpr float kRidgeHalfZ = 0.05f;
 constexpr float kRidgeTopZ = kRidgeHalfZ * 2.0f;  // ridges sit on the ground -> 0.10.
 constexpr float kPresserRadius = 0.06f;
 constexpr float kRidgeCenterX = kRidgeHalfX + kPresserRadius + kContactDMin;
-constexpr uint16_t kXpbdIters = 20u;
 constexpr uint32_t kSettleSteps = 800u;
 constexpr uint32_t kPresserBody = 3u;     // ground(0) + ridge x2(1,2) + presser(3).
 
@@ -179,7 +178,6 @@ cook::XpbdCookInput BuildCloth() {
     in.inv_mass.assign(rest.size(), 1.0f / kParticleMass);  // UNPINNED free drape.
     soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
-    in.solver_iterations = kXpbdIters;
     in.friction = 0.6f;
     return in;
 }

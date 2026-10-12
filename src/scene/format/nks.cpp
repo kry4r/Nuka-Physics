@@ -233,16 +233,12 @@ MediaRecord::Kind MediaKindFromName(const std::string& s) {
 
 const char* MediaMethodName(MediaRecord::Method m) {
     switch (m) {
-        case MediaRecord::Method::Xpbd:   return "xpbd";
-        case MediaRecord::Method::Pbf:    return "pbf";
         case MediaRecord::Method::MlsMpm: return "mlsmpm";
         case MediaRecord::Method::Vbd:    return "vbd";
     }
-    return "xpbd";
+    return "vbd";
 }
 MediaRecord::Method MediaMethodFromName(const std::string& s) {
-    if (s == "xpbd") return MediaRecord::Method::Xpbd;
-    if (s == "pbf") return MediaRecord::Method::Pbf;
     if (s == "mlsmpm") return MediaRecord::Method::MlsMpm;
     if (s == "vbd") return MediaRecord::Method::Vbd;
     throw std::runtime_error("nks: unknown media method '" + s + "'");
@@ -643,31 +639,14 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     xp.Set("surface_density", Value::Float(m.xpbd.surface_density));
     xp.Set("half_thickness", Value::Float(m.xpbd.half_thickness));
     xp.Set("friction", Value::Float(m.xpbd.friction));
-    xp.Set("distance_alpha", Value::Float(m.xpbd.distance_alpha));
-    xp.Set("volume_alpha", Value::Float(m.xpbd.volume_alpha));
     xp.Set("stretch_stiffness", Value::Float(m.xpbd.stretch_stiffness));
     xp.Set("poisson", Value::Float(m.xpbd.poisson));
     xp.Set("bend_stiffness", Value::Float(m.xpbd.bend_stiffness));
     xp.Set("damping", Value::Float(m.xpbd.damping));
-    xp.Set("iters", Value::Int(m.xpbd.iters));
     xp.Set("aero_drag_normal", Value::Float(m.xpbd.aero_drag_normal));
     xp.Set("aero_drag_tangent", Value::Float(m.xpbd.aero_drag_tangent));
     xp.Set("aero_drag_max_dv", Value::Float(m.xpbd.aero_drag_max_dv));
-    if (m.xpbd.self_contact) xp.Set("self_contact", Value::Bool(true));
     o.Set("xpbd", std::move(xp));
-
-    Value pb = Value::Object();
-    pb.Set("rest_density", Value::Float(m.pbf.rest_density));
-    pb.Set("support_scale", Value::Float(m.pbf.support_scale));
-    pb.Set("iters", Value::Int(m.pbf.iters));
-    pb.Set("friction", Value::Float(m.pbf.friction));
-    pb.Set("clamp_overdensity", Value::Bool(m.pbf.clamp_overdensity));
-    pb.Set("walls_enabled", Value::Bool(m.pbf.walls_enabled));
-    pb.Set("walls_min", Vec3Json(m.pbf.walls_min));
-    pb.Set("walls_max", Vec3Json(m.pbf.walls_max));
-    pb.Set("floor_z", Value::Float(m.pbf.floor_z));
-    pb.Set("boundary_layers", Value::Int(m.pbf.boundary_layers));
-    o.Set("pbf", std::move(pb));
 
     auto mpm_mat_json = [](const MediaMpmMaterial& mm) {
         Value mp = Value::Object();
@@ -1794,29 +1773,13 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 rec.xpbd.surface_density = f(*xp, "surface_density", rec.xpbd.surface_density);
                 rec.xpbd.half_thickness = f(*xp, "half_thickness", rec.xpbd.half_thickness);
                 rec.xpbd.friction = f(*xp, "friction", rec.xpbd.friction);
-                rec.xpbd.distance_alpha = f(*xp, "distance_alpha", rec.xpbd.distance_alpha);
-                rec.xpbd.volume_alpha = f(*xp, "volume_alpha", rec.xpbd.volume_alpha);
                 rec.xpbd.stretch_stiffness = f(*xp, "stretch_stiffness", rec.xpbd.stretch_stiffness);
                 rec.xpbd.poisson = f(*xp, "poisson", rec.xpbd.poisson);
                 rec.xpbd.bend_stiffness = f(*xp, "bend_stiffness", rec.xpbd.bend_stiffness);
                 rec.xpbd.damping = f(*xp, "damping", rec.xpbd.damping);
-                rec.xpbd.iters = static_cast<uint16_t>(u(*xp, "iters", rec.xpbd.iters));
                 rec.xpbd.aero_drag_normal = f(*xp, "aero_drag_normal", rec.xpbd.aero_drag_normal);
                 rec.xpbd.aero_drag_tangent = f(*xp, "aero_drag_tangent", rec.xpbd.aero_drag_tangent);
                 rec.xpbd.aero_drag_max_dv = f(*xp, "aero_drag_max_dv", rec.xpbd.aero_drag_max_dv);
-                rec.xpbd.self_contact = b(*xp, "self_contact", rec.xpbd.self_contact);
-            }
-            if (const Value* pb = mv.Find("pbf")) {
-                rec.pbf.rest_density = f(*pb, "rest_density", rec.pbf.rest_density);
-                rec.pbf.support_scale = f(*pb, "support_scale", rec.pbf.support_scale);
-                rec.pbf.iters = static_cast<uint16_t>(u(*pb, "iters", rec.pbf.iters));
-                rec.pbf.friction = f(*pb, "friction", rec.pbf.friction);
-                rec.pbf.clamp_overdensity = b(*pb, "clamp_overdensity", rec.pbf.clamp_overdensity);
-                rec.pbf.walls_enabled = b(*pb, "walls_enabled", rec.pbf.walls_enabled);
-                rec.pbf.walls_min = v3(*pb, "walls_min", rec.pbf.walls_min);
-                rec.pbf.walls_max = v3(*pb, "walls_max", rec.pbf.walls_max);
-                rec.pbf.floor_z = f(*pb, "floor_z", rec.pbf.floor_z);
-                rec.pbf.boundary_layers = u(*pb, "boundary_layers", rec.pbf.boundary_layers);
             }
             if (const Value* mp = mv.Find("mpm")) read_mpm(*mp, rec.mpm);
             if (const Value* fills = mv.Find("mpm_fills")) {

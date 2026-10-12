@@ -101,43 +101,8 @@ set(NUKA_CODEGEN_GENERATED_SOURCES
     # p08-C adds the IFT-at-convergence adjoint_evaluator to their IR.
     "${NUKA_CODEGEN_OUTPUT_DIR}/rigid_sdf_contact_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_sdf_contact_forward.cu"
-    # v0.7 p09-A: XPBD soft-body distance row (id 6). Ships a GENUINE dispatchable
-    # per-row adjoint (dense_adjoint), so BOTH the forward and the adjoint kernel
-    # __global__ symbols must be compiled into nuka_codegen_generated (mirror the
-    # maximal rows' _forward.cu + _adjoint.cu pairing -- NOT the forward-only SDF
-    # rows). Omitting the adjoint .cu would leave RowClassAdjointKernelSymbol(6)
-    # advertising an uncompiled symbol (a non-dispatchable orphan).
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_forward.cu"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_adjoint.cu"
-    # v0.7 p09-B: XPBD soft-body BEND (id 7) + VOLUME (id 8) rows. Like the
-    # distance row each ships a GENUINE dispatchable per-row adjoint, so BOTH the
-    # forward and adjoint __global__ symbols must be compiled into
-    # nuka_codegen_generated (regen alone leaves the adjoint .cu orphaned -- the
-    # p09-A lesson). Mirror the _forward.cu + _adjoint.cu pairing.
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_forward.cu"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_adjoint.cu"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_forward.cu"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_adjoint.cu"
-    # v0.7 p09-C: XPBD soft-body SHAPE-MATCH (id 9). Ships a GENUINE dispatchable
-    # per-row adjoint (the per-particle goal-projection law), so BOTH the forward
-    # and adjoint __global__ symbols must compile into nuka_codegen_generated
-    # (regen alone leaves the adjoint .cu orphaned -- the p09-A lesson).
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_forward.cu"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_adjoint.cu"
-    # v0.7 p11 (K3): cross-system particle-particle CONTACT row (id 10). Ships a
-    # GENUINE dispatchable per-row adjoint (the multilinear XPBD multiplier law, as
-    # the distance row), so BOTH the forward and adjoint __global__ symbols must
-    # compile into nuka_codegen_generated (regen alone leaves the adjoint .cu
-    # orphaned -- the p09-A lesson). Mirror the _forward.cu + _adjoint.cu pairing.
-    "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_forward.cu"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_adjoint.cu"
-    # v0.8 C6b: ids 11/12 RESERVED placeholders (v0.9 Cosserat R2a/R2b) + id13 the
-    # cross-system coupling-row class. All THREE are FORWARD-ONLY (no adjoint_evaluator
-    # in their IR -> regen emits no _adjoint.* for them, like the id4/id5 SDF rows), so
-    # only the _forward.cu stubs compile into nuka_codegen_generated. They reserve the
-    # registry symbols (kRowClassCount=14); v0.8 never EMITS rows of 11/12.
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_cosserat_stretch_shear_forward.cu"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_cosserat_bend_twist_forward.cu"
+    # v0.8 C6b: the cross-system coupling-row class (id 6). FORWARD-ONLY (no
+    # adjoint_evaluator in its IR, like the id4/id5 SDF rows).
     "${NUKA_CODEGEN_OUTPUT_DIR}/coupling_contact_forward.cu"
     "${NUKA_CODEGEN_OUTPUT_DIR}/row_dispatch.cu"
 )
@@ -147,14 +112,6 @@ set(NUKA_CODEGEN_GENERATED_HEADERS
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_joint_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/maximal_drive_adjoint.cuh"
     "${NUKA_CODEGEN_OUTPUT_DIR}/featherstone_contact_adjoint.cuh"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_distance_adjoint.cuh"
-    # v0.7 p09-B: XPBD bend (id 7) + volume (id 8) adjoint headers.
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_bend_adjoint.cuh"
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_volume_adjoint.cuh"
-    # v0.7 p09-C: XPBD shape-match (id 9) adjoint header.
-    "${NUKA_CODEGEN_OUTPUT_DIR}/xpbd_shape_match_adjoint.cuh"
-    # v0.7 p11 (K3): particle-particle contact (id 10) adjoint header.
-    "${NUKA_CODEGEN_OUTPUT_DIR}/particle_particle_contact_adjoint.cuh"
     # v0.8 C2a: the collidable-type registry header (enum CollidableType + static
     # metadata table). Emitted by regen.py's SECOND, parallel collidable pass.
     "${NUKA_CODEGEN_OUTPUT_DIR}/collidable_registry.hpp"

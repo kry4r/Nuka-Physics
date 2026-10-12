@@ -31,9 +31,7 @@ struct CouplingBuildCtx {
     uint32_t rigid_cap = 0u;
     uint32_t particle_slot_base = 0u;
     uint32_t particle_mode = 0u;
-    uint32_t coupled_internal = 0u;
     uint32_t particle_count = 0u;
-    uint32_t n_soft = 0u;
     // Grid transfer owns [0,n_mpm); particle prediction and rows own [n_mpm,P).
     uint32_t n_mpm = 0u;
     float    dt = 0.0f;
@@ -44,7 +42,6 @@ struct CouplingBuildCtx {
     // Pipeline-owned Params storage the emissions fill (lifetime == Pipeline).
     phi::NarrowphaseBodyParticleParams* p_np_body_particle = nullptr;
     phi::ParticleFinalizeParams*        p_part_finalize = nullptr;
-    phi::ParticleParticleContactParams* p_pp_contact = nullptr;
     phi::MpmParams*                     p_mpm = nullptr;
 
     // Grid operations are present only when the model owns MPM particles.

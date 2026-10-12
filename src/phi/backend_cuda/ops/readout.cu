@@ -486,10 +486,6 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.particle_vel[particle] = data.snapshot_particle_vel[particle];
         data.particle_kinematic_target[particle] = data.snapshot_particle_pos[particle];
         data.particle_pseudo_vel[particle] = {};
-        if (p.has_particle_grid != 0u) {
-            data.grid_neighbor_count[particle] = data.grid_neighbor_offset[particle] = 0u;
-            data.grid_neighbor_attempted[particle] = 0u;
-        }
         if (data.particle_F != nullptr) {
             for (uint32_t component = 0u; component < 9u; ++component) {
                 data.particle_F[particle * 9u + component] = data.snapshot_particle_F[particle * 9u + component];
@@ -751,7 +747,6 @@ Status OpRestoreState(const ModelView& model, const DataView& data,
     reset.base_link_count = p->total_link_count / envs;
     reset.body_count = p->total_body_count / envs;
     reset.particle_count = p->total_particle_count / envs;
-    reset.has_particle_grid = p->has_particle_grid;
     reset.point_endpoints_per_env = p->point_endpoints_per_env;
     reset.point_endpoint_terms_per_env = p->point_endpoint_terms_per_env;
     reset.lambda_stride = p->row_slot_count / envs;

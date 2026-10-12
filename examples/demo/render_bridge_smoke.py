@@ -22,7 +22,7 @@ import numpy as np
 
 import nuka
 
-# ---- cloth + stance parameters (mirror go2_cloth_drape_demo.cpp) -------------
+# ---- cloth + stance parameters ------------------------------------------------
 NX, NY = 55, 51                 # cloth lattice (~1.30 m x 1.20 m at 24 mm spacing).
 SPACING = 0.024
 PARTICLE_MASS = 0.012

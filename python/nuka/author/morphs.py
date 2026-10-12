@@ -2,7 +2,7 @@
 
 A morph carries GEOMETRY, never physics behavior. ``NKS`` names a cooked scene
 file (the robot/world); the media lattices are ``Grid`` (cloth), ``TetSphere``
-(solid soft body), ``FluidBox``, ``GranularBed`` and ``Cable`` (an XPBD rope, with
+(solid soft body), ``FluidBox``, ``GranularBed`` and ``Cable`` (a VBD rope, with
 an optional ``CableSlab`` weight); the rigid primitives are ``Box`` / ``Sphere``
 / ``Capsule`` / ``Plane`` / ``Ground``. The constitutive material + the surface
 are attached at ``Scene.add_entity`` and the per-step choreography lives in
@@ -35,7 +35,7 @@ class NKS:
 class Grid:
     """A flat ``nx`` x ``ny`` cloth lattice at ``spacing`` m, centred on ``origin``.
 
-    Geometry only -- the XPBD params come from a ``materials.Cloth`` and the
+    Geometry only -- the VBD params come from a ``materials.Cloth`` and the
     membrane/aero from a ``surfaces.Cloth``. Maps to the
     ``cloth_nx/ny/spacing/origin_*`` cook kwargs.
     """
@@ -77,7 +77,7 @@ class Grid:
 class TetSphere:
     """A solid sphere soft body: a tet rest-lattice of ``cells`` per axis spanning
     ``radius`` at ``center``, each grid cell ``cell_len`` m (``0`` => a snug
-    ``2*radius/cells``). Pair with a ``materials.Soft`` (XPBD or MLS-MPM)."""
+    ``2*radius/cells``). Pair with a ``materials.Soft`` (MLS-MPM)."""
 
     MEDIA_KIND = "soft_tet"
 
@@ -119,7 +119,7 @@ class MpmFill:
 class FluidBox:
     """A fluid volume: the AABB ``[min, max]`` sampled on a uniform ``spacing``
     lattice (``position_jitter`` breaks the perfect grid). Pair with a
-    ``materials.Fluid`` (PBF or MLS-MPM). ``fills`` appends heterogeneous MLS-MPM
+    ``materials.Fluid`` (MLS-MPM). ``fills`` appends heterogeneous MLS-MPM
     sub-regions (each its own material) onto this base bed."""
 
     MEDIA_KIND = "fluid"

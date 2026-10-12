@@ -25,20 +25,6 @@ const char* RowClassName(uint32_t row_class_id) noexcept {
     case 5u:
         return "FeatherstoneSDFContactRow";
     case 6u:
-        return "XPBDDistanceRow";
-    case 7u:
-        return "XPBDBendRow";
-    case 8u:
-        return "XPBDVolumeRow";
-    case 9u:
-        return "XPBDShapeMatchRow";
-    case 10u:
-        return "ParticleParticleContactRow";
-    case 11u:
-        return "XpbdCosseratStretchShearRow";
-    case 12u:
-        return "XpbdCosseratBendTwistRow";
-    case 13u:
         return "CouplingContactRow";
     default:
         return "Unknown";
@@ -60,20 +46,6 @@ const char* RowClassForwardKernelSymbol(uint32_t row_class_id) noexcept {
     case 5u:
         return "featherstone_sdf_contact_forward_kernel";
     case 6u:
-        return "xpbd_distance_forward_kernel";
-    case 7u:
-        return "xpbd_bend_forward_kernel";
-    case 8u:
-        return "xpbd_volume_forward_kernel";
-    case 9u:
-        return "xpbd_shape_match_forward_kernel";
-    case 10u:
-        return "particle_particle_contact_forward_kernel";
-    case 11u:
-        return "xpbd_cosserat_stretch_shear_forward_kernel";
-    case 12u:
-        return "xpbd_cosserat_bend_twist_forward_kernel";
-    case 13u:
         return "coupling_contact_forward_kernel";
     default:
         return nullptr;
@@ -95,20 +67,6 @@ uint32_t RowClassMaxRowsPerBlock(uint32_t row_class_id) noexcept {
     case 5u:
         return 6u;
     case 6u:
-        return 6u;
-    case 7u:
-        return 6u;
-    case 8u:
-        return 6u;
-    case 9u:
-        return 6u;
-    case 10u:
-        return 6u;
-    case 11u:
-        return 6u;
-    case 12u:
-        return 6u;
-    case 13u:
         return 6u;
     default:
         return 0u;
@@ -134,20 +92,6 @@ uint8_t RowClassGradientMode(uint32_t row_class_id) noexcept {
     case 5u:
         return 2u;
     case 6u:
-        return 0u;
-    case 7u:
-        return 0u;
-    case 8u:
-        return 0u;
-    case 9u:
-        return 0u;
-    case 10u:
-        return 0u;
-    case 11u:
-        return 3u;
-    case 12u:
-        return 3u;
-    case 13u:
         return 3u;
     default:
         return 0u;
@@ -169,20 +113,6 @@ uint16_t RowClassAdjointKernelId(uint32_t row_class_id) noexcept {
     case 5u:
         return 0u;
     case 6u:
-        return 5u;
-    case 7u:
-        return 6u;
-    case 8u:
-        return 7u;
-    case 9u:
-        return 8u;
-    case 10u:
-        return 9u;
-    case 11u:
-        return 0u;
-    case 12u:
-        return 0u;
-    case 13u:
         return 0u;
     default:
         return 0u;
@@ -199,16 +129,6 @@ const char* RowClassAdjointKernelSymbol(uint32_t row_class_id) noexcept {
         return "maximal_drive_adjoint_kernel";
     case 3u:
         return "featherstone_contact_adjoint_kernel";
-    case 6u:
-        return "xpbd_distance_adjoint_kernel";
-    case 7u:
-        return "xpbd_bend_adjoint_kernel";
-    case 8u:
-        return "xpbd_volume_adjoint_kernel";
-    case 9u:
-        return "xpbd_shape_match_adjoint_kernel";
-    case 10u:
-        return "particle_particle_contact_adjoint_kernel";
     default:
         return nullptr;
     }

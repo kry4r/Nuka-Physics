@@ -18,7 +18,7 @@ NOT part of the scene asset. The tight-contact ``solver_*`` overrides are likewi
 create-time. Both are CLI flags here, defaulting to the soft-body demo's settings.
 
 Run from the repo root:
-    python examples/demo/nks_render_demo.py --scene examples/scenes/soft_ball.nks
+    python examples/demo/nks_render_demo.py --scene examples/scenes/bdx_oneshot.nks
 """
 
 import argparse
@@ -49,7 +49,7 @@ def hero_camera(centroid, elapsed, radius):
 
 def main():
     ap = argparse.ArgumentParser(description="declarative .nks media render loader")
-    ap.add_argument("--scene", default="examples/scenes/soft_ball.nks",
+    ap.add_argument("--scene", default="examples/scenes/bdx_oneshot.nks",
                     help="the .nks asset to load + render")
     ap.add_argument("--out", default="out/nks_demo")
     ap.add_argument("--steps", type=int, default=300)

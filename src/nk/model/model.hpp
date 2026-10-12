@@ -69,12 +69,6 @@ struct ModelCapacities {
     uint32_t mesh_vertex_source_count = 0u;
     uint32_t mesh_edge_source_count = 0u;
     uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
-    uint32_t dist_cons_per_env    = 0;  // XPBD distance-constraint count / env.
-    uint32_t vol_cons_per_env     = 0;  // XPBD volume-constraint count / env.
-    // M9 T11 shape-match (XPBD id 9) capacities: per-env cluster slot count +
-    // the total flat cluster-MEMBER pool size (sum_c n_c). 0 == no shape-match.
-    uint32_t shape_match_slots_per_env   = 0;  // XPBD shape-match cluster count / env.
-    uint32_t shape_match_members_per_env = 0;  // flat cluster-member pool / env.
     // Cloth aerodynamic-drag element count / env (one per surface triangle). 0 ==
     // no drag (the drag op is not emitted -> a drag-free cook is byte-identical).
     uint32_t aero_tris_per_env           = 0;
@@ -85,13 +79,6 @@ struct ModelCapacities {
     uint32_t particle_surface_edge_nodes_per_env = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
-    // Graph-coloring color counts per XPBD family (single-env template; a color
-    // is an independent constraint set sharing no particle). Built by
-    // nk::XpbdColoring; size the per-family color-segment tables (pairs/color).
-    uint32_t xpbd_dist_colors = 0;
-    uint32_t xpbd_vol_colors  = 0;
-    uint32_t xpbd_sm_colors   = 0;
-    uint32_t particle_topology_incidence_count = 0;
     // Vertex blocks occupy particles [vbd_particle_begin, + vbd_vertices_per_env) of each env.
     uint32_t vbd_particle_begin = 0u;
     uint32_t vbd_vertices_per_env = 0u;
@@ -119,18 +106,6 @@ struct ModelCapacities {
     uint32_t max_samp_points      = 0;  // SDF sampling-point pool size.
     uint32_t max_sdf_grids        = 0;  // cooked sparse-SDF grid count.
     uint32_t max_sdf_cells        = 0;  // total cooked narrow-band SDF cells.
-
-    // M6 — particle uniform-grid cell capacity PER ENV (= the cooked
-    // grid_dims product; 0 for a scene with no PBF grid). Sizes the
-    // grid_cell_start/grid_cell_end arena fields (cells x env_count); the
-    // ParticleGridBuild op fails LOUDLY if the live dims product exceeds it.
-    uint32_t max_grid_cells       = 0;
-
-    // Byte size of the grid_sort_scratch arena field (the ParticleGridBuild cub
-    // sort/scan temp + out buffers; sized at World construct, 0 == no particles).
-    uint64_t grid_sort_scratch_bytes = 0;
-    uint32_t neighbor_pool_capacity_per_env = 0u;
-    uint64_t NeighborPoolCapacity() const;
 
     // Byte size of the island_cub_temp field (the BuildSolveIslands cub radix-sort
     // temp over the total row capacity; sized at World construct, 0 == no rows).
@@ -368,39 +343,16 @@ public:
     float friction_coefficient   = 0.8f;   // legacy kContactFriction
     float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
 
-    // -- M6: particle (XPBD soft + PBF fluid) cook product --------------------
-    // The XPBD constraint templates (dist/vol, owner:model) are staged by
-    // UploadTo; the particle initial state (pos/prev/vel/inv_mass) is seeded by
-    // World::SeedInitialState. PBF params are resolved into the ParticleGridBuild
-    // + Pbf* op params by Pipeline::Build. A scene with no particles leaves these
-    // empty and particles_per_env == 0 (Pipeline emits no particle ops).
-    // Coupled: particles co-step against rigid/artic bodies through the unified
-    // row solve (the kUSlotParticleSphere* contact classes); the internal XPBD
-    // soft constraints (if any) still run. None/Xpbd/Pbf are the standalone modes.
-    // M9 T11 SoftFluid: ONE Model holds BOTH a soft (XPBD) particle set AND a
-    // fluid (PBF) particle set co-resident in a contiguous [soft | fluid] layout
-    // with split index n_soft_particles (the fluid occupies [n_soft, P)). The
-    // XPBD solve runs over the soft slice (edge-based constraints reference only
-    // soft particle indices) and the PBF density/lambda/neighbor solve is SCOPED
-    // to the fluid slice. This mirrors the co-step's existing [xpbd | pbf] union
-    // (split n_x) 1:1, so the Phase-2 id-10 cross-contact port is near-verbatim
-    // (global g < n_soft => soft, else fluid).
-    // MpmXpbd assigns [0, n_mpm) to grid transfer and [n_mpm, P) to XPBD.
-    enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Pbf = 2, Coupled = 3,
-                                        SoftFluid = 4, Mpm = 5, MpmXpbd = 6 };
-    // In Coupled mode, which internal dynamics run alongside the contact coupling:
-    // None (free point masses), Xpbd (soft constraints), Pbf (fluid density).
-    enum class CoupledInternal : uint8_t { None = 0, Xpbd = 1, Pbf = 2 };
+    // -- particle cook product: vertex-block cloth/cable and MLS-MPM material points.
+    // MpmXpbd assigns [0, n_mpm) to grid transfer and [n_mpm, P) to the vertex blocks.
+    enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Mpm = 5, MpmXpbd = 6 };
     struct ModelParticles {
         ParticleMode mode = ParticleMode::None;
-        CoupledInternal coupled_internal = CoupledInternal::None;
         // Initial per-particle state (env-major replicated by SeedInitialState;
         // these are the SINGLE-ENV template, length == particles_per_env).
         std::vector<math::Vec3> initial_pos;
         std::vector<math::Vec3> initial_vel;
         std::vector<float>      inv_mass;
-        std::vector<uint32_t> topology_offsets;
-        std::vector<uint32_t> topology_elements;
         std::vector<collision::MeshSurfaceInfo> surface_info;
         std::vector<uint32_t> surface_triangles;
         std::vector<collision::MeshBvhNode> surface_tree;
@@ -417,23 +369,6 @@ public:
         std::vector<float>      initial_F;           // 9 floats/particle (identity)
         std::vector<float>      initial_vol0;         // 1/particle
         std::vector<uint32_t>   initial_material_id;  // 1/particle
-        // XPBD constraint templates (single-env; staged + dispatched per env).
-        std::vector<uint32_t> dist_a, dist_b;     // distance endpoints
-        std::vector<float>    dist_rest, dist_alpha;
-        std::vector<uint32_t> vol_particles;      // 4 / volume constraint
-        std::vector<float>    vol_rest6, vol_alpha;
-        // M9 T11 XPBD SHAPE-MATCH (id 9) cluster templates (single-env; CSR
-        // layout, mirrors the legacy soft-upload flatten 1:1). Per-cluster:
-        // sm_cluster_offset/size into the flat member pool, sm_stiffness goal-pull
-        // fraction, sm_rest_centroid c0. Per-member (flat sum_c n_c pool):
-        // sm_particles index, sm_rest_q = x_i^0 - c0, sm_mass weight m_i.
-        std::vector<uint32_t>   sm_cluster_offset;  // per cluster
-        std::vector<uint32_t>   sm_cluster_size;    // per cluster (n_c)
-        std::vector<float>      sm_stiffness;       // per cluster (s in [0,1])
-        std::vector<math::Vec3> sm_rest_centroid;   // per cluster (c0)
-        std::vector<uint32_t>   sm_particles;       // flat pool (sum n_c)
-        std::vector<math::Vec3> sm_rest_q;          // flat pool (q_i = x_i^0 - c0)
-        std::vector<float>      sm_mass;            // flat pool (m_i weight)
         // Cloth AERODYNAMIC-DRAG element templates (single-env; one per surface
         // triangle). aero_tri_verts = 3 particle indices / triangle, aero_tri_area
         // = rest-space area / triangle. Empty for a drag-free cook.
@@ -463,37 +398,10 @@ public:
         float    aero_drag_normal    = 0.0f;
         float    aero_drag_tangent   = 0.0f;
         float    aero_drag_max_dv    = 0.0f;
-        uint16_t xpbd_iters = 1;
-        // M9 T11 two-system [soft | fluid] split index: the fluid particles
-        // occupy [n_soft_particles, particles_per_env). For SoftFluid mode the
-        // PBF density/lambda/neighbor ops are scoped to the fluid slice; the XPBD
-        // constraints (edge-based) reference only the soft slice. For the
-        // single-system modes (Xpbd/Pbf/Coupled) it is 0 (Xpbd) or unused.
-        uint32_t n_soft_particles = 0u;
         // MpmXpbd divides grid-owned [0, n_mpm_particles) from row-coupled particles.
         uint32_t n_mpm_particles = 0u;
-        // Per-system body<->particle contact mu: soft finite (a foot grips cloth),
-        // fluid ~0 (a foot slides); mixed with the body side by solmix=max.
+        // Body<->particle contact mu, mixed with the body side by solmix=max.
         float    soft_friction  = 0.6f;
-        float    fluid_friction = 0.0f;
-        // PBF fluid params (Macklin & Mueller 2013 + p10-B polish).
-        float    pbf_rest_density   = 0.0f;   // rho0 (0 disables PBF)
-        float    pbf_support_radius = 0.0f;   // h (== grid query radius / cell)
-        float    pbf_particle_mass  = 0.0f;
-        float    pbf_cfm_epsilon    = 1.0e-6f;
-        uint16_t pbf_iters          = 4;
-        bool     pbf_clamp_overdensity = true;
-        float    pbf_xsph_viscosity = 0.0f;
-        float    pbf_surface_tension= 0.0f;
-        // Uniform grid domain (cook-derived; the grid is built every step over
-        // the predicted positions but sized from this cooked AABB + cell size).
-        math::Vec3 grid_min{0.0f, 0.0f, 0.0f};
-        uint32_t   grid_dims[3] = {0u, 0u, 0u};
-        float      cell_size  = 0.0f;        // == support radius (>= query radius).
-        float      query_radius = 0.0f;      // == support radius.
-        // Boundary floor (z-up; the M5 grid + particle ops are z-up).
-        bool  boundary_enabled = false;
-        float floor_z = 0.0f;
         // Environment-private MPM grid geometry supplies the shared MpmParams.
         math::Vec3 mpm_grid_min{0.0f, 0.0f, 0.0f};
         uint32_t   mpm_grid_dims[3] = {0u, 0u, 0u};
@@ -511,18 +419,8 @@ public:
         // Free-fall diagnostic: disable ONLY the dynamic-body BC (the static-plane
         // BC stays on). A test sets it to prove the held-up state is BC-caused.
         bool       mpm_bite_disable_dynamic_bc = false;
-        // M9 T11 Phase 2 — id-10 CROSS-SYSTEM particle-particle CONTACT params
-        // (the op-ified cross-system particle-particle co-step). The
-        // class-blind unilateral non-penetration co-step runs AFTER finalize over
-        // the FULL [soft | fluid] union; ONLY the SoftFluid mode emits it. d_min
-        // == 2*contact_radius (uniform radius); <= 0 disables the op. The grid
-        // neighbor list (built over query_radius) must cover d_min, so the cook
-        // sets query_radius/cell_size >= d_min for a SoftFluid scene.
-        float    pp_contact_d_min      = 0.0f;   // 2*contact_radius (0 => off)
-        float    pp_contact_compliance = 0.0f;   // XPBD alpha (0 => rigid)
-        uint32_t pp_contact_iters      = 1u;     // Jacobi gather+apply sweeps
-        // Authored self-contact runs the same particle contact over a single soft set.
-        bool     pp_self_contact       = false;
+        // Body<->particle contact diameter: a particle is a sphere of d_min/2 (0 => off).
+        float    pp_contact_d_min      = 0.0f;
     };
     ModelParticles particles;
 
@@ -579,12 +477,6 @@ public:
     std::vector<uint32_t> schedule_islands;         // quads {seg_off, seg_cnt, flags, env}
     uint32_t schedule_island_count  = 0;
     uint32_t schedule_segment_count = 0;
-    // XPBD graph-coloring color-segment tables (filled by nk::XpbdColoring BEFORE
-    // UploadTo; staged into the *_color_segments Model fields). Each is a flat
-    // {offset, count} u32 PAIR per color over the single-env constraint template.
-    std::vector<uint32_t> dist_color_segments;
-    std::vector<uint32_t> vol_color_segments;
-    std::vector<uint32_t> sm_color_segments;
     // Convex hull geometry + SDF grids are referenced by ModelShape indices and
     // packed into the .nka by the cooker; the device upload of those large
     // assets is the collision milestone's (M5) business, not M3a's.
@@ -690,7 +582,6 @@ public:
     phi::Status ValidateVertexBlocks(std::string* reason = nullptr) const;
     phi::Status ValidateVertexBlockLevels(std::string* reason = nullptr) const;
     void BuildAeroAdjacency();
-    void BuildParticleTopology();
 
     // The packed device buffer (null until UploadTo). Exposed for World teardown.
     phi::Buffer* DeviceBuffer() const { return device_buffer_; }

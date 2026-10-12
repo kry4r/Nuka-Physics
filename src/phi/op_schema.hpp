@@ -33,7 +33,6 @@ inline constexpr uint32_t kSdfHeaderStride = 8u;
 // Per-articulation / scalar diagnostics use env slot 0 (always present).
 // ---------------------------------------------------------------------------
 inline constexpr uint32_t kEnvStatusPairOverflow     = 1u << 0;  // candidate_pairs dropped
-inline constexpr uint32_t kEnvStatusNeighborOverflow = 1u << 1;  // particle neighbor dropped
 inline constexpr uint32_t kEnvStatusDofOverflow      = 1u << 2;  // artic dof > max_dof (CRBA)
 inline constexpr uint32_t kEnvStatusMpmGridEscape    = 1u << 3;  // MPM open-face escape / invalid F
 // A collidable has no supported surface representation and is skipped by MPM.
@@ -52,7 +51,6 @@ inline constexpr uint32_t kEnvStatusDatFailure = 1u << 12;
 inline constexpr uint32_t kEnvStatusSolverFailure = 1u << 13;
 inline constexpr uint32_t kBodyGyroNotConverged      = 1u;
 inline constexpr uint32_t kBodyGyroInvalidInput      = 2u;
-inline constexpr uint32_t kDefaultParticleNeighborBudget = 32u;
 
 // ---------------------------------------------------------------------------
 // NkOp — the closed op set. uint16_t backing so an op id fits a single field
@@ -246,37 +244,6 @@ struct LbvhQueryPairsParams {
     uint32_t rigid_slot_cap;
     uint64_t workspace_bytes;
 };
-
-struct ParticleGridBuildParams {
-    float    cell_size;         // uniform grid cell edge length
-    float    query_radius;      // neighbor search radius
-    uint32_t particle_count;    // total particles (env-major)
-    float    grid_min[3];       // grid lower corner
-    uint32_t grid_dims[3];      // grid resolution (PER ENV)
-    // which position field the grid is built over. PBF builds the neighbor
-    // list on the PREDICTED positions (legacy PBF step order), so pos_source == 1
-    // routes the op to pbf_predicted_pos; 0 == particle_pos (the default).
-    uint32_t pos_source;        // 0 = particle_pos, 1 = pbf_predicted_pos
-    // Env-private grids (review fix): cell keys are offset env*cells so envs
-    // never share a cell (env-major replicated particles would otherwise see
-    // their own clones as neighbors). cells_capacity mirrors
-    // ModelCapacities::max_grid_cells (the grid_cell_start/end per-env arena
-    // sizing); the op fails LOUDLY when the live dims product exceeds it or
-    // when cells*env_count overflows the u32 cell key.
-    uint32_t env_count;
-    uint32_t particles_per_env;
-    uint32_t cells_capacity;    // per-env cell capacity (max_grid_cells)
-    uint32_t neighbor_capacity; // total neighbor indices reserved per environment
-};
-inline constexpr uint32_t kGridPosSourceParticlePos = 0u;
-inline constexpr uint32_t kGridPosSourcePbfPredicted = 1u;
-
-// Byte size of the pre-allocated scratch ParticleGridBuild's cub radix sort +
-// exclusive scan draw temp storage + sort output buffers from, for
-// `particle_count` keys (cub size queries + the two out buffers, 256B-aligned).
-// Host-callable (defined in broadphase.cu) so the World sizes the grid_sort_scratch
-// arena field BEFORE allocation -> no mid-capture cudaMalloc. 0 for 0 particles.
-uint64_t GridSortScratchBytes(uint32_t particle_count);
 
 // Byte size of the pre-allocated island_cub_temp the BuildSolveIslands op draws its
 // cub radix-sort temp storage from, for `total_rows` row slots. Host-callable
@@ -561,12 +528,6 @@ struct NarrowphaseBodyParticleParams {
     uint32_t cands_per_particle;  // reserved contact slots per particle
     float    particle_radius;     // the particle collision radius (sphere on the path)
     float    contact_margin;
-    // The PBF/SoftFluid fluid-slice predict writes the gravity-integrated position
-    // into pbf_predicted_pos, leaving particle_pos at step-start. Route the fluid
-    // slice's detection at the predicted position (consistent with the grid build's
-    // pos_source) so a fast fluid particle brakes within one step instead of lagging.
-    uint32_t fluid_pos_source;    // 1 == fluid slice reads pbf_predicted_pos
-    uint32_t n_soft_particles;    // per-env soft/fluid split (fluid is [n_soft, P))
     // MpmXpbd: the first env-local particle that generates body rows. The MPM slice
     // [0, particle_row_base) couples via the grid, NOT rows; it owns no reserved
     // slots (the cook exempts it from the budget). 0 for every other mode.
@@ -669,11 +630,8 @@ struct AssembleRowsParams {
     float    solimp[5];         // merged contact solimp (union family)
     uint32_t particles_per_env; // particle coupling (kUSlotParticleSphere*).
     uint32_t num_material_buckets;  // 0 == no authored materials -> model defaults.
-    // Per-system body<->particle friction; n_soft_particles splits per-env
-    // [soft|fluid] so a side reads soft vs fluid mu, mixed with the body by solmix=max.
-    uint32_t n_soft_particles;       // per-env soft/fluid split (0 => no soft slice).
+    // Body<->particle friction, mixed with the body side by solmix=max.
     float    particle_soft_friction; // soft/cloth mu (finite: a foot grips/drags).
-    float    particle_fluid_friction;// fluid mu (~0: a foot slides tangentially).
     // Cap on the contact normal aref so a deep contact recovers over several steps,
     // not in one fling. +inf default == non-binding (byte-identical). Model property.
     float    baumgarte_max_velocity;
@@ -682,13 +640,6 @@ struct AssembleRowsParams {
     uint32_t position_pass = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
-    // Distance then volume constraints fill env rows from particle_constraint_row_first;
-    // volume rows read 4-term endpoints from the given firsts.
-    uint32_t particle_constraint_row_first = 0u;
-    uint32_t dist_cons_per_env = 0u;
-    uint32_t vol_cons_per_env = 0u;
-    uint32_t constraint_endpoint_first = 0u;
-    uint32_t constraint_term_first = 0u;
     VertexBlockLayout vertex_blocks{};
 };
 
@@ -806,16 +757,8 @@ uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params);
 // Particle modes select material constraints and ownership; all row-coupled particles share integration.
 inline constexpr uint32_t kParticleModeNone = 0u;
 inline constexpr uint32_t kParticleModeXpbd = 1u;
-inline constexpr uint32_t kParticleModePbf = 2u;
-inline constexpr uint32_t kParticleModeCoupled = 3u;
-inline constexpr uint32_t kParticleModeSoftFluid = 4u;
 inline constexpr uint32_t kParticleModeMpm = 5u;
 inline constexpr uint32_t kParticleModeMpmXpbd = 6u;
-
-// The internal material controls which projection equations apply to coupled point masses.
-inline constexpr uint32_t kCoupledInternalNone = 0u;
-inline constexpr uint32_t kCoupledInternalXpbd = 1u;
-inline constexpr uint32_t kCoupledInternalPbf = 2u;
 
 // Cloth anisotropic AERODYNAMIC DRAG (pre-predict velocity impulse). One thread
 // per surface triangle forms the outward normal + mean velocity from the current
@@ -838,9 +781,6 @@ struct ParticlePredictParams {
     float    gravity[3];
     uint32_t mode;             // kParticleMode*
     uint32_t particle_count;   // total env-major particles
-    uint32_t coupled_internal; // kCoupledInternal* (coupled mode only)
-    // The material split is independent of the shared prediction and finalization kernels.
-    uint32_t n_soft_particles; // per-env soft count (split index)
     uint32_t particles_per_env;// per-env particle stride
     // MpmXpbd: the per-env MPM slice count. The XPBD predict SKIPS the low slice
     // [0, n_mpm) (the transfer loop owns it); 0 for every non-MpmXpbd mode.
@@ -871,62 +811,10 @@ struct ParticleContactDeltaParams {
     uint32_t active_begin_per_env;
 };
 
-struct XpbdProjectParams {
-    float    dt;
-    uint16_t iters;            // Gauss-Seidel sweep count
-    // Environment-major shape-match clusters; each color holds independent clusters.
-    uint32_t shape_match_cluster_count;
-    uint32_t sm_colors;
-    uint32_t env_count;
-    uint32_t sm_clusters_per_env;
-    uint32_t sm_members_per_env;
-    // Host {offset,count} color table, valid for the world's lifetime.
-    const uint32_t* sm_color_segments;
-    uint32_t iteration_start = 0u;
-};
-
-struct PbfDensityLambdaParams {
-    float    rest_density;     // rho0
-    float    relaxation;       // CFM-style epsilon (cfm_epsilon)
-    float    support_radius;   // SPH support radius h (== grid query radius)
-    float    particle_mass;    // uniform per-particle mass
-    uint32_t particle_count;
-    uint16_t iters;            // density-projection iterations
-    uint16_t clamp_overdensity;// 1 => clamp C_i >= 0 (no surface cohesion pull)
-    float    dt;               // substep dt (for the boundary clamp + apply)
-    uint32_t boundary_enabled; // 1 => apply the floor clamp in the apply pass
-    float    floor_z;          // boundary floor (the grid is z-up; legacy y).
-    // SoftFluid: scope the density/lambda solve to the fluid slice. A soft
-    // particle (within-env local index < n_soft) must NOT contribute to fluid
-    // density. 0 == single-system PBF (every particle is fluid).
-    uint32_t n_soft_particles;  // per-env soft count (fluid slice = [n_soft, per_env))
-    uint32_t particles_per_env; // per-env particle stride
-};
-
-struct PbfApplyDeltaParams {
-    float    support_radius;
-    float    particle_mass;
-    uint32_t particle_count;
-    uint32_t boundary_enabled;
-    float    floor_z;
-    // SoftFluid: fluid slice scope (see PbfDensityLambdaParams).
-    uint32_t n_soft_particles;
-    uint32_t particles_per_env;
-};
-
 struct ParticleFinalizeParams {
     float    dt;
     uint32_t mode;             // kParticleMode*
     uint32_t particle_count;
-    uint32_t coupled_internal; // kCoupledInternal* (coupled mode only)
-    // PBF post-finalize polish (gated inert when the coefficient is 0).
-    float    support_radius;
-    float    particle_mass;
-    float    xsph_viscosity_c;     // XSPH velocity-smoothing coefficient
-    float    surface_tension_gamma;// Akinci cohesion coefficient
-    float    rest_density;         // rho0 (for the XSPH density normalization)
-    // Velocity polish is restricted to the fluid material range.
-    uint32_t n_soft_particles;
     uint32_t particles_per_env;
     // Split-impulse position pass active: carry the per-particle pseudo velocity
     // onto the final position (non-penetration push-out). 0 leaves it byte-identical.
@@ -934,26 +822,6 @@ struct ParticleFinalizeParams {
     // MpmXpbd: the per-env MPM slice count. The XPBD finalize SKIPS the low slice
     // [0, n_mpm) (the transfer loop set its final pos/vel); 0 for non-MpmXpbd.
     uint32_t n_mpm_particles;
-};
-
-// Particle contact gathers mass-weighted corrections from the current projected positions.
-// Both Jacobi passes use the shared neighbor CSR and temporary density-correction storage.
-struct ParticleParticleContactParams {
-    // Minimum contact distance d_min == 2*contact_radius (uniform-radius). A pair
-    // (i,j) penetrates iff |p_i - p_j| < d_min. <= 0 => the op is inert.
-    float    contact_distance_d_min;
-    // XPBD compliance alpha (1/stiffness); 0 == rigid (the full -C correction).
-    // The position-based co-step uses alpha_tilde = compliance_alpha (dt folded 1).
-    float    compliance_alpha;
-    uint32_t solver_iterations; // full Jacobi gather+apply sweeps per call (>=1).
-    uint32_t mode;              // kParticleMode* (SoftFluid, or an authored self-contact).
-    uint32_t particle_count;    // total env-major union particles.
-    // The per-env [soft | fluid] split + stride; the contact row is class-blind so
-    // these are carried only for symmetry with the other particle ops + future
-    // per-env scoping. The math reads the FULL union (no soft/fluid branch).
-    uint32_t n_soft_particles;
-    uint32_t particles_per_env;
-    VertexBlockLayout vertex_blocks{};  // these particles collide through their surfaces.
 };
 
 // --- readout / RL substrate ---------------------------------------------
@@ -1121,7 +989,6 @@ struct ResetEnvsParams {
     float    jitter_body_xyz[3];    // symmetric half-ranges; zero disables jitter
     float    jitter_base_pos[3];
     float    jitter_q;
-    uint32_t has_particle_grid = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
 };
@@ -1145,7 +1012,6 @@ struct RestoreStateParams {
     uint32_t contact_slot_count;
     uint32_t total_body_count;
     uint32_t total_particle_count;
-    uint32_t has_particle_grid = 0u;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
 };

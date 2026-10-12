@@ -408,37 +408,6 @@ Json Histogram(const std::map<uint32_t, uint64_t>& counts) {
     return result;
 }
 
-Json XpbdWorkload(const nk::Model& model) {
-    Json result = Json::Object();
-    const auto family = [&](const char* name, const std::vector<uint32_t>& segments,
-                            uint32_t constraints) {
-        Json item = Json::Object(), counts = Json::Array();
-        uint32_t maximum = 0u;
-        uint64_t total = 0u;
-        fixture::Require(segments.size() % 2u == 0u, "invalid XPBD color table");
-        for (size_t i = 0u; i < segments.size(); i += 2u) {
-            fixture::Require(segments[i] == total, "non-contiguous XPBD colors");
-            const auto count = segments[i + 1u];
-            counts.PushBack(Json::Int(count));
-            maximum = std::max(maximum, count);
-            total += count;
-        }
-        fixture::Require(total == constraints, "XPBD colors do not cover constraints");
-        item.Set("constraints_per_env", Json::Int(constraints));
-        item.Set("constraints_total", Json::Int(total * model.capacities.env_count));
-        item.Set("colors", Json::Int(segments.size() / 2u));
-        item.Set("constraints_per_color_per_env", std::move(counts));
-        item.Set("largest_color_total", Json::Int(uint64_t{maximum} * model.capacities.env_count));
-        item.Set("iterations", Json::Int(std::max<uint16_t>(model.particles.xpbd_iters, 1u)));
-        result.Set(name, std::move(item));
-    };
-    const auto& caps = model.capacities;
-    family("distance", model.dist_color_segments, caps.dist_cons_per_env);
-    family("volume", model.vol_color_segments, caps.vol_cons_per_env);
-    family("shape_match", model.sm_color_segments, caps.shape_match_slots_per_env);
-    return result;
-}
-
 Json VbdWorkload(const nk::Model& model) {
     const auto& caps = model.capacities;
     const auto& particles = model.particles;
@@ -478,7 +447,6 @@ Json VbdWorkload(const nk::Model& model) {
     result.Set("colored_vertices_per_env", Json::Int(colored_vertices));
     result.Set("vertices_per_color_per_env", std::move(colors));
     result.Set("particle_mode", Json::Int(static_cast<uint32_t>(particles.mode)));
-    result.Set("coupled_internal", Json::Int(static_cast<uint32_t>(particles.coupled_internal)));
     return result;
 }
 
@@ -487,10 +455,7 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
     const auto& particles = model.particles;
     const auto& caps = model.capacities;
     fixture::Require(particles.inv_mass.size() >= caps.particles_per_env &&
-                     particles.initial_pos.size() >= caps.particles_per_env &&
-                     particles.dist_a.size() >= caps.dist_cons_per_env &&
-                     particles.dist_b.size() >= caps.dist_cons_per_env &&
-                     particles.dist_rest.size() >= caps.dist_cons_per_env,
+                     particles.initial_pos.size() >= caps.particles_per_env,
                      "particle quality input extent is invalid");
     for (uint32_t i = 0u; i < caps.particles_per_env; ++i) {
         const auto& initial = particles.initial_pos[i];
@@ -504,7 +469,7 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
     double distance_max = 0.0, distance_squared = 0.0;
     double pinned_max = 0.0, distance_rms_max_env = 0.0;
     uint64_t distance_count = 0u, defined_distance_count = 0u;
-    uint64_t hard_distance_constraint_samples = 0u, vbd_edge_samples = 0u;
+    uint64_t vbd_edge_samples = 0u;
     bool finite = true, pinned_finite = true, strain_defined = true;
     std::vector<uint32_t> nonfinite_count(caps.env_count, 0u), first_nonfinite_index(caps.env_count, 0u);
     const auto point_finite = [](const nuka::math::Vec3& point) {
@@ -558,10 +523,6 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
             env_distance_squared += error * error;
             ++defined_distance_count;
         };
-        for (uint32_t i = 0u; i < caps.dist_cons_per_env; ++i) {
-            strain(particles.dist_a[i], particles.dist_b[i], particles.dist_rest[i]);
-            ++hard_distance_constraint_samples;
-        }
         // Vertex-block edges measure strain against the cooked rest shape.
         for (const nk::VbdElement& element : particles.vbd_elements) {
             const uint32_t n = element.kind == nk::kVbdTriangle ? 3u
@@ -596,9 +557,8 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
     result.Set("strain_defined", Json::Bool(strain_defined));
     result.Set("distance_count", Json::Int(distance_count));
     result.Set("defined_distance_count", Json::Int(defined_distance_count));
-    result.Set("hard_distance_constraint_samples", Json::Int(hard_distance_constraint_samples));
     result.Set("vbd_edge_samples", Json::Int(vbd_edge_samples));
-    result.Set("distance_count_scope", Json::Str("hard_distance_constraint_samples + vbd_edge_samples, including undefined samples"));
+    result.Set("distance_count_scope", Json::Str("vbd_edge_samples, including undefined samples"));
     result.Set("distance_strain_max", strain_defined ? Json::Float(distance_max) : Json::Null());
     result.Set("distance_strain_rms", strain_defined ? Json::Float(distance_count ?
         std::sqrt(distance_squared / static_cast<double>(distance_count)) : 0.0) : Json::Null());
@@ -1225,10 +1185,10 @@ Json SolverWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
     return IslandWorkload(world, rows, step);
 }
 
-enum class ContactSystem : uint32_t { Rigid, Articulation, Xpbd, Mpm, Pbf, Fixed, Count };
+enum class ContactSystem : uint32_t { Rigid, Articulation, Xpbd, Mpm, Fixed, Count };
 constexpr uint32_t kContactSystems = static_cast<uint32_t>(ContactSystem::Count);
 constexpr std::array<const char*, kContactSystems> kContactSystemNames{
-    "rigid", "articulation", "xpbd", "mpm", "pbf", "fixed"};
+    "rigid", "articulation", "xpbd", "mpm", "fixed"};
 
 struct CouplingAcceptance {
     struct Pair {
@@ -1250,7 +1210,7 @@ struct CouplingAcceptance {
     bool Required(uint32_t a, uint32_t b) const {
         return four_systems ? a < 4u && b < 4u && a < b :
             a == static_cast<uint32_t>(ContactSystem::Articulation) &&
-            (b == static_cast<uint32_t>(ContactSystem::Xpbd) || b == static_cast<uint32_t>(ContactSystem::Pbf));
+            b == static_cast<uint32_t>(ContactSystem::Xpbd);
     }
 
     void Observe(nk::World& world, const std::vector<nk::NkRow>& rows,
@@ -1287,13 +1247,9 @@ struct CouplingAcceptance {
                 index / caps.particles_per_env == env, "invalid particle endpoint");
             const uint32_t local = index % caps.particles_per_env;
             if (local < model.MpmParticlesPerEnv()) return ContactSystem::Mpm;
-            if (model.particles.mode == nk::Model::ParticleMode::MpmXpbd ||
-                model.particles.mode == nk::Model::ParticleMode::Xpbd ||
-                (model.particles.mode == nk::Model::ParticleMode::SoftFluid && local < model.particles.n_soft_particles))
-                return ContactSystem::Xpbd;
-            fixture::Require(model.particles.mode == nk::Model::ParticleMode::Pbf ||
-                model.particles.mode == nk::Model::ParticleMode::SoftFluid, "unknown particle system in coupling report");
-            return ContactSystem::Pbf;
+            fixture::Require(model.particles.mode == nk::Model::ParticleMode::MpmXpbd ||
+                model.particles.mode == nk::Model::ParticleMode::Xpbd, "unknown particle system in coupling report");
+            return ContactSystem::Xpbd;
         };
         const auto category = [&](const nk::NkRowSide& side, uint32_t env) {
             if (side.kind != nk::kNkSidePointEndpoint) return classify(side.kind, side.index, env);
@@ -1893,7 +1849,6 @@ Json Run(const Options& options) {
     }
     solver.Set("environment", std::move(solver_environment));
     configuration.Set("solver", std::move(solver));
-    configuration.Set("cloth_iters", Json::Int(fixture::kClothIters));
     configuration.Set("cloth_grid", Json::Int(options.cloth_nx));
     configuration.Set("capacity_scale", Json::Int(options.capacity_scale));
     configuration.Set("contact_slots_per_env", Json::Int(caps.max_contacts_per_env));
@@ -1959,7 +1914,6 @@ Json Run(const Options& options) {
     workload.Set("scope", Json::Str("untimed quality replay; actual solver schedule and owner coverage checked"));
     workload.Set("samples", std::move(workload_samples));
     workload.Set("valid", Json::Bool(solver_workload_valid));
-    workload.Set("xpbd", XpbdWorkload(world.GetModel()));
     auto vbd_workload = VbdWorkload(world.GetModel());
     vbd_workload.Set("integrator", Json::Null());
     for (const auto& call : world.GetPipeline().Calls()) {

@@ -278,9 +278,7 @@ Scene BuildModel(const Args& args, const render::MeshGeometry& mesh) {
     material.grid_dims[1] = static_cast<uint32_t>(std::ceil(0.36f/args.dx)) + 1u;
     material.grid_dims[2] = static_cast<uint32_t>(std::ceil(0.30f/args.dx)) + 1u;
     material.floor_d = -1.0f;
-    cook::XpbdCookInput soft;
-    soft.solver = nk::Model::ParticleMode::Mpm;
-    cook::CookSoftBodyParticles(model, 1u, soft, material);
+    cook::CookMpmParticles(model, 1u, material);
     model.particles.mpm_body_friction = kFriction;
     model.particles.mpm_body_band = args.contact_band;
     return scene;
