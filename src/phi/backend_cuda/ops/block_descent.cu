@@ -329,7 +329,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     const uint64_t rows = uint64_t{p.rows_per_env} * p.env_count;
     if (blocks >= uint64_t{std::numeric_limits<int>::max()} ||
         rows >= uint64_t{std::numeric_limits<int>::max()}) return 0u;
-    const auto schedule = nk::MakeBlockRowScheduleLayout(blocks, rows, p.max_point_terms);
+    const auto schedule = nk::MakeBlockRowScheduleLayout(blocks, rows, p.incidence_per_env, p.env_count);
     const uint64_t incidence = schedule.incidence_capacity;
     if (incidence >= uint64_t{std::numeric_limits<uint32_t>::max()}) return 0u;
     const uint64_t word_limit = std::numeric_limits<size_t>::max() / sizeof(uint32_t);

@@ -47,8 +47,8 @@ struct BlockRowScheduleLayout {
 };
 
 inline BlockRowScheduleLayout MakeBlockRowScheduleLayout(
-    uint64_t owners, uint64_t rows, uint32_t max_point_terms) {
-    return {owners, rows, CheckedProduct({2u, rows, std::max(1u, max_point_terms)})};
+    uint64_t owners, uint64_t rows, uint64_t incidence_per_env, uint64_t envs) {
+    return {owners, rows, CheckedProduct({incidence_per_env, envs})};
 }
 
 }  // namespace nuka::nk

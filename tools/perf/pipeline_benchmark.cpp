@@ -776,7 +776,7 @@ Json BlockWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_
     const uint64_t row_count = nuka::CheckedProduct({p.rows_per_env, p.env_count});
     fixture::Require(owners <= UINT32_MAX && row_count <= UINT32_MAX && row_count == rows.size(),
                      "block schedule exceeds row or owner index extent");
-    const auto layout = nk::MakeBlockRowScheduleLayout(owners, row_count, p.max_point_terms);
+    const auto layout = nk::MakeBlockRowScheduleLayout(owners, row_count, p.incidence_per_env, p.env_count);
     fixture::Require(layout.Words() <= caps.ElementCount(nk::FieldId::BlockDescentScratch),
                      "block schedule prefix exceeds scratch storage");
     const auto download = [&](uint64_t word, void* destination, uint64_t count, const char* message) {

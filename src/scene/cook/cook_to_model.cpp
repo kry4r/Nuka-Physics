@@ -284,15 +284,36 @@ void GrowContactBudgetForParticles(nk::ModelCapacities& cap, uint32_t rigid_base
     }
 }
 
-void SetOgcContactCapacity(nk::Model& model, uint32_t capacity) {
-    auto& cap = model.capacities;
+// The body<->body slots of the contact budget, below its particle, mesh and grid reserves.
+static uint32_t RigidContactBase(const nk::Model& model) {
+    const auto& cap = model.capacities;
     const uint64_t compact = cap.ParticleContactReserve(model.MpmParticlesPerEnv()) +
                              uint64_t{cap.ogc_contacts_per_env} + cap.mpm_contact_capacity_per_env;
     if (compact > cap.max_contacts_per_env)
         throw std::invalid_argument("contact capacity does not contain the material reserve");
-    const uint32_t rigid = cap.max_contacts_per_env - static_cast<uint32_t>(compact);
-    cap.ogc_contacts_per_env = capacity;
-    GrowContactBudgetForParticles(cap, rigid, model.MpmParticlesPerEnv());
+    return cap.max_contacts_per_env - static_cast<uint32_t>(compact);
+}
+
+// Mesh contact slots: each cloth vertex and surface edge, again against body mesh features when bodies carry them.
+static void SetParticleOgcCapacity(nk::ModelCapacities& cap, uint32_t cloth_vertices) {
+    const bool has_body_mesh = cap.mesh_vertex_source_count > 0u ||
+                               cap.mesh_edge_source_count > 0u;
+    const uint64_t cloth_sources = uint64_t{cloth_vertices} +
+                                   cap.particle_surface_edges_per_env;
+    const uint64_t body_features = uint64_t{cap.mesh_vertex_source_count} +
+                                   cap.mesh_edge_source_count;
+    const uint64_t ogc_slots = cloth_sources +
+        (has_body_mesh ? cloth_sources + body_features : 0u);
+    if (ogc_slots > std::numeric_limits<uint32_t>::max())
+        throw std::invalid_argument("mesh contact capacity exceeds device indexing");
+    cap.ogc_contacts_per_env = cap.particle_surfaces_per_env > 0u || has_body_mesh
+        ? static_cast<uint32_t>(ogc_slots) : 0u;
+}
+
+void SetOgcContactCapacity(nk::Model& model, uint32_t capacity) {
+    const uint32_t rigid = RigidContactBase(model);
+    model.capacities.ogc_contacts_per_env = capacity;
+    GrowContactBudgetForParticles(model.capacities, rigid, model.MpmParticlesPerEnv());
 }
 
 namespace {
@@ -1803,21 +1824,9 @@ void CookXpbdParticles(nk::Model& model, uint32_t env_count,
     cap.particle_surface_edges_per_env = static_cast<uint32_t>(mp.surface_edges.size());
     cap.particle_surface_edge_nodes_per_env = static_cast<uint32_t>(mp.surface_edge_tree.size());
 
-    const uint32_t rigid_base = cap.max_contacts_per_env - cap.ogc_contacts_per_env;
+    const uint32_t rigid_base = RigidContactBase(model);
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
-    const bool has_body_mesh = cap.mesh_vertex_source_count > 0u ||
-                               cap.mesh_edge_source_count > 0u;
-    const uint64_t cloth_sources = uint64_t{cap.particles_per_env} +
-                                   cap.particle_surface_edges_per_env;
-    const uint64_t body_features = uint64_t{cap.mesh_vertex_source_count} +
-                                   cap.mesh_edge_source_count;
-    const uint64_t body_reserve = body_features;
-    const uint64_t ogc_slots = cloth_sources +
-        (has_body_mesh ? cloth_sources + body_reserve : 0u);
-    if (ogc_slots > std::numeric_limits<uint32_t>::max())
-        throw std::invalid_argument("mesh contact capacity exceeds device indexing");
-    cap.ogc_contacts_per_env = cap.particle_surfaces_per_env > 0u || has_body_mesh
-        ? static_cast<uint32_t>(ogc_slots) : 0u;
+    SetParticleOgcCapacity(cap, cap.particles_per_env);
     cap.dist_cons_per_env = dn;
     cap.vol_cons_per_env  = vn;
     cap.shape_match_slots_per_env   = scn;
@@ -1838,6 +1847,7 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+    const uint32_t rigid_base = RigidContactBase(model);
     if (in.dx <= 0.0f || in.grid_dims[0] < nk::kMpmStencilWidth ||
         in.grid_dims[1] < nk::kMpmStencilWidth || in.grid_dims[2] < nk::kMpmStencilWidth) {
         throw std::runtime_error(
@@ -1937,7 +1947,6 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     mp.mpm_floor_d = in.floor_d;
     mp.mpm_floor_friction = in.floor_friction;
 
-    const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(n);
     // Grid contacts share a compact pool without a per-node owner limit.
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
@@ -2028,6 +2037,7 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
+    const uint32_t rigid_base = RigidContactBase(model);
 
     nk::Model::ModelParticles& mp = model.particles;
     mp.mode = nk::Model::ParticleMode::Pbf;
@@ -2060,7 +2070,6 @@ void CookPbfParticles(nk::Model& model, uint32_t env_count,
     mp.boundary_enabled = in.boundary_enabled;
     mp.floor_z = in.floor_z;
 
-    const uint32_t rigid_base = cap.max_contacts_per_env;
     cap.particles_per_env = static_cast<uint32_t>(mp.initial_pos.size());
     // Per-env uniform-grid cell capacity (sizes grid_cell_start/end; the
     // ParticleGridBuild op fails loudly if the live dims exceed it).
@@ -2115,7 +2124,7 @@ void CookSoftFluidParticles(nk::Model& model, uint32_t env_count,
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
     // The body<->body budget before any particle growth; the final reserve recomputes
     // from this for the full [soft|fluid] count so the soft slice is not double-counted.
-    const uint32_t rigid_base = cap.max_contacts_per_env;
+    const uint32_t rigid_base = RigidContactBase(model);
 
     // STRICT-SUPERSET FAST PATHS: a soft-only / fluid-only co-residence cook is
     // byte-identical to the single-system cook PLUS the same body<->particle contact
@@ -2209,7 +2218,7 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
     // The body<->body budget before any particle growth; the final reserve recomputes
     // from this for the full [mpm|xpbd] count so no slice is double-counted.
-    const uint32_t rigid_base = cap.max_contacts_per_env;
+    const uint32_t rigid_base = RigidContactBase(model);
 
     const uint32_t n_mpm = static_cast<uint32_t>(mpm.positions.size());
     const uint32_t n_xpbd = static_cast<uint32_t>(soft.positions.size());
@@ -2294,6 +2303,7 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.mode = nk::Model::ParticleMode::MpmXpbd;
     mp.n_mpm_particles = n_mpm;
     cap.particles_per_env = n_mpm + n_xpbd;
+    SetParticleOgcCapacity(cap, n_xpbd);
     cap.dist_cons_per_env = xtmp.capacities.dist_cons_per_env;
     cap.vol_cons_per_env  = xtmp.capacities.vol_cons_per_env;
     cap.shape_match_slots_per_env   = xtmp.capacities.shape_match_slots_per_env;

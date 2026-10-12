@@ -435,16 +435,16 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
                 radius < 0.0f || radius >= 1.0f) return phi::Status::InvalidArgument;
             p_block_descent_.acceleration_spectral_radius = radius;
         }
-        if (cap.ogc_contacts_per_env > 0u)
-            p_block_descent_.max_point_terms = kTriangleEndpointTerms;
-        if (cap.vol_cons_per_env > 0u) {
-            constexpr uint32_t kTetrahedronEndpointTerms = 4u;
-            p_block_descent_.max_point_terms =
-                std::max(p_block_descent_.max_point_terms, kTetrahedronEndpointTerms);
-        }
-        if (has_mpm)
-            p_block_descent_.max_point_terms = std::max(
-                {p_block_descent_.max_point_terms, kMpmStencilNodes, kMpmCellStencilNodes});
+        // Only head rows enter the incidence: one owner per plain side, every term of a point endpoint.
+        constexpr uint32_t kTetrahedronEndpointTerms = 4u;
+        p_block_descent_.incidence_per_env =
+            2u * (uint64_t{cap.rigid_contact_rows_per_env} / (1u + kPairDrivenTangentRowsPerPt) +
+                  particle_reserve + cap.joint_limit_rows_per_env + cap.joint_friction_rows_per_env +
+                  cap.joint_drive_rows_per_env + cap.dist_cons_per_env) +
+            uint64_t{cap.ogc_contacts_per_env} * 2u * kTriangleEndpointTerms +
+            uint64_t{cap.mpm_contact_capacity_per_env} * (kMpmStencilNodes + kTriangleEndpointTerms) +
+            uint64_t{cap.vol_cons_per_env} * kTetrahedronEndpointTerms +
+            uint64_t{cap.mpm_stress_cells_per_env} * kMpmCellStencilNodes;
         const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
         p_block_descent_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
         p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
