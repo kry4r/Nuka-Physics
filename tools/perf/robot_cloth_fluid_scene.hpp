@@ -327,7 +327,8 @@ inline std::vector<uint32_t> LatticeBoundary(const std::array<uint32_t, 3>& dime
 inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
                                 SceneVisuals* visuals = nullptr, bool implicit_stress = false) {
     constexpr float radius = 0.028f, mass = 0.15f, dx = 0.02f;
-    const float cloth_z = prepared.cloth_z - 0.0175f;
+    // The membrane starts 1 mm into the loaded front feet, so they rest on it.
+    const float cloth_z = prepared.cloth_z - 0.0175f + 0.001f;
     auto scene = RobotScene(prepared.path, true);
     auto free_body = nuka::scene::kInvalidBody;
     for (const auto& body : scene.Bodies())
@@ -362,9 +363,10 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     nk::Model model = std::move(cooked.model);
     model.articulation.initial_q = prepared.settled_q;
     model.articulation.initial_qdot = prepared.settled_qdot;
-    // A narrow membrane leaves exposed material beneath both contact bodies.
+    // The membrane reaches past both contact points, so half of each body's footprint stays over bare material.
+    const float cloth_span = body.local_transform.position.x - prepared.front_centre.x + 0.25f * radius;
     auto cloth = BuildCloth(cloth_x, prepared.front_centre.y, cloth_z, kClothNx,
-                            2.0f * kClothSpacing / float(kClothNx - 1u));
+                            cloth_span / float(kClothNx - 1u));
     cloth.aero_drag_normal = cloth.aero_drag_tangent = cloth.aero_drag_max_dv = 0.0f;
     cook::MpmCookInput mpm;
     mpm.implicit_stress = implicit_stress;
