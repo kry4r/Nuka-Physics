@@ -59,9 +59,12 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         cap.mpm_grid_nodes_per_env * cap.env_count,
         (articulated ? cap.articulations_per_env : 0u) * cap.env_count + cap.bodies_per_env * cap.env_count,
         cap.dofs_per_env);
-    // Scenes the warp tiles solve take block descent unless NUKA_BLOCK_DESCENT names the route.
+    const bool cloth = cap.vbd_vertices_per_env > 0u && cap.particles_per_env == cap.vbd_vertices_per_env &&
+        cap.mpm_grid_nodes_per_env == 0u;
+    // Warp-tile and VBD cloth scenes take block descent unless NUKA_BLOCK_DESCENT names the route.
     const char* block_descent = std::getenv("NUKA_BLOCK_DESCENT");
-    use_block_descent_ = block_descent == nullptr ? tile : block_descent[0] == '1' && block_descent[1] == '\0';
+    use_block_descent_ = block_descent == nullptr ? tile || cloth
+                                                  : block_descent[0] == '1' && block_descent[1] == '\0';
     p_block_descent_ = {};
     if (use_block_descent_ && tile) p_block_descent_.iterations = phi::kBlockDescentTileIterations;
     if (use_block_descent_ && cfg.velocity_iterations_override)
