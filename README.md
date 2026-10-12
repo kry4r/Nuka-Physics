@@ -9,7 +9,7 @@
 
 <p align="center">
   <strong>GPU-resident, bit-deterministic, differentiable CUDA physics.</strong><br>
-  One general solver for articulated robots, rigid bodies, cloth, soft bodies, and fluids.
+  One block-descent solver for articulated robots, rigid bodies, VBD cloth, and MLS-MPM continua.
 </p>
 
 <p align="center">
@@ -105,7 +105,7 @@ Material demos load the shared [Nuka Dynamics Lab assets](docs/nuka-stage.md), w
 - **GPU-resident at scale.** One cooked world template drives thousands of independent environments on one GPU.
 - **D1 deterministic.** Fixed reduction order and no floating-point atomics produce byte-for-byte repeatable runs.
 - **Differentiable.** Analytical reverse-mode adjoints cover rigid and articulated dynamics with PyTorch and JAX interop.
-- **One contact path.** Robot-ground, robot-object, rigid-particle, and continuum coupling share the same solver architecture.
+- **One solver.** Robot, rigid, cloth, and MLS-MPM contacts all run through one unified block-descent (UABD) solve.
 - **Self-written stack.** CUDA physics, importers, Vulkan rendering, and a CUDA path tracer, with no external physics or rendering SDK.
 
 ## Architecture
@@ -117,7 +117,7 @@ Material demos load the shared [Nuka Dynamics Lab assets](docs/nuka-stage.md), w
 | Layer | Core modules | Responsibility |
 | --- | --- | --- |
 | Authoring | `scene`, `import` | NKS, MJCF, URDF, and text-USD → SceneIR → cooked model |
-| Simulation | `nk`, `collision`, `constraint` | GPU world, broadphase, narrowphase, universal rows, deterministic solve |
+| Simulation | `nk`, `collision`, `constraint` | GPU world, broadphase, narrowphase, universal rows, block-descent solve |
 | Systems | `diffsim`, `sensor`, `codegen` | Reverse-mode adjoint, sensor queries, generated forward/adjoint kernels |
 | Platform | `phi`, `render`, `rt` | CUDA backend, Vulkan raster, CUDA path tracer |
 
@@ -127,9 +127,10 @@ Material demos load the shared [Nuka Dynamics Lab assets](docs/nuka-stage.md), w
 | --- | --- |
 | Rigid + articulated dynamics (Featherstone / ABA) | Production |
 | General contact + terrain / heightfields | Production |
-| XPBD cloth and soft bodies | Functional |
-| PBF fluid and MLS-MPM continuum | Functional |
-| Two-way rigid / articulation / MLS-MPM / XPBD coupling | [Functional](docs/concepts/coupling.md) |
+| Unified block-descent contact solve (UABD) | Production |
+| VBD cloth | Functional |
+| MLS-MPM elastic and elastoplastic continuum | Functional |
+| Two-way rigid / articulation / MLS-MPM / VBD cloth coupling | [Functional](docs/concepts/coupling.md) |
 | Independent observations, calibration and stochastic error | [Scalar field models](docs/concepts/sensors.md) |
 | Differentiable rigid + articulated simulation | Functional, contact-free |
 | Batched RL, PyTorch, JAX, DLPack | Functional |
