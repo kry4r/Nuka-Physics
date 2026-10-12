@@ -29,11 +29,9 @@
 //
 // SCOPE / honesty:
 //  * p02's tape/backward is CONTACT-FREE -- there is NO contact-tape to compare
-//    against. PRIMARY validation is finite-difference through the REAL engine
-//    contact step (tests/diffsim/test_ift_vs_tape_backward.cpp); the dense
-//    Eigen::LDLT solve+distribute is the second oracle. "IFT vs tape" is N/A here.
-//  * The IFT assumes the forward CONVERGED. The forward runs a FIXED 48 PGS iters,
-//    so the test scene must be near-converged (resting normal-dominant contact);
+//    against. Its FD test through the articulated PGS step was deleted with that
+//    solver. "IFT vs tape" is N/A here.
+//  * The IFT assumes the forward CONVERGED, so a scene must be near-converged (resting normal-dominant contact);
 //    sliding / at-the-cone-boundary friction is genuinely nonsmooth and out of
 //    scope (matches the kkt_builder sticking-row assumption).
 //
@@ -73,7 +71,7 @@ struct IftContactInputs {
     // The dof column -> global qdot index map source (joint_type / parent_link /
     // articulation_link_offset / articulation_link_count). The runner reads ONLY
     // these topology fields; q/qdot are not read (the forward already ran). NOTE:
-    // the dof_to_link map mirrors SolveArticulatedContactRowsKernel for SCALAR
+    // the dof_to_link map mirrors ApplyImplicitJointDampingKernel for SCALAR
     // joint DOFs (state.qdot[link]); a FloatingBase root's 6 base-velocity DOFs
     // live in link_velocity[root].v and are NOT mapped here -- this round supports
     // fixed-base articulations (the validated path). See ift_runner.cu.

@@ -136,7 +136,6 @@ struct FootShape {
 
 constexpr float kInertiaDiagonalEpsilon = 1.0e-6f;
 constexpr float kEffectiveMassDenomEpsilon = 1.0e-9f;
-constexpr uint32_t kContactSolverIterations = 48u;
 constexpr float kBaumgarteBeta = 0.2f;
 constexpr float kPenetrationSlop = 1.0e-4f;
 

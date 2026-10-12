@@ -34,12 +34,8 @@ public:
     struct SolverConfig {
         float    dt = 1.0f / 240.0f;
         float    gravity[3] = {0.0f, 0.0f, -9.81f};
-        // Per-world contact PGS sweep count (the general SolveRowsBlockIsland loop).
-        // This IS the runtime promotion of the legacy articulated path's named
-        // default (runtime::articulation::kContactSolverIterations == 48); kept at
-        // 32 here so existing cooked worlds stay byte-identical.
+        // Block-descent iteration budget, applied only with velocity_iterations_override.
         uint16_t vel_iters = 32;
-        // Explicit runtime budgets take precedence over solver initialization defaults.
         bool velocity_iterations_override = false;
         bool measure_contact_residual = false;
         // Split-impulse position-correction sweeps (the general PairDriven path).
@@ -49,9 +45,6 @@ public:
         uint16_t pos_iters = 4;
         float    pos_beta = 0.3f;      // penetration-closing fraction per step.
         float    pos_slop = 0.001f;    // allowed residual penetration (m).
-        // Velocity sweeps stop once every row's impulse correction moves the
-        // constraint by less than this (m/s); 0 runs the whole vel_iters budget.
-        float    vel_tolerance = 0.0f;
         float    contact_margin = 0.0f;
         uint32_t max_pairs = 0;
         // M3b articulation-pipeline knobs (both production paths use 1/1; the
@@ -59,8 +52,6 @@ public:
         uint32_t defer_velocity_damping = 1;  // solve affine velocity feedback implicitly
         uint32_t fold_drive_damping = 1;      // enable implicit feedback in the shared rows
         uint32_t substeps = 1u;
-        // Contact exchanges per interval; zero follows the material projection count.
-        uint16_t coupling_passes = 0u;
         uint32_t cloth_integrator = 0u;  // 0 = BDF2, 1 = backward Euler.
     };
 
@@ -79,9 +70,7 @@ public:
                phi::Device* device = nullptr, uint32_t readout_demand = 0u,
                const sensor::StateSensorBank* sensors = nullptr);
     static uint32_t SubstepCount(const Model& model, const SolverConfig& cfg);
-    uint32_t VelocityIterations(uint32_t configured) const {
-        return use_block_descent_ ? p_block_descent_.iterations : configured;
-    }
+    uint32_t VelocityIterations() const { return p_block_descent_.iterations; }
 
     const std::vector<phi::OpCall>& Calls() const { return calls_; }
     size_t Size() const { return calls_.size(); }
@@ -98,7 +87,6 @@ private:
     // Parameter storage is sized before emission so captured calls retain stable addresses.
     std::vector<phi::OpCall> calls_;
     std::vector<phi::NkOp> missing_ops_;
-    std::vector<phi::SolveRowsBlockIslandParams> p_solve_iterations_;
     std::vector<phi::BlockDescentSolveParams> p_block_descent_substeps_;
     std::vector<phi::AccumulateStepParams> p_accumulate_step_;
     std::vector<phi::ReadoutEnergyLedgerParams> p_energy_;
@@ -139,12 +127,8 @@ private:
     phi::NarrowphaseSdfParams         p_np_sdf_{};
     phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};
-    phi::BuildSolveIslandsParams      p_islands_{};  // dynamic CC solve schedule
     phi::ContactWarmStartParams       p_warm_start_prepare_{};
     phi::ContactWarmStartParams       p_warm_start_commit_{};
-    phi::SolveRowsBlockIslandParams   p_solve_{};
-    phi::SolveRowsBlockIslandParams   p_solve_verify_{};
-    bool use_block_descent_ = false;
     phi::BlockDescentSolveParams      p_block_descent_{};
     phi::AeroDragParams               p_aero_drag_{};
     phi::ParticlePredictParams        p_part_predict_{};

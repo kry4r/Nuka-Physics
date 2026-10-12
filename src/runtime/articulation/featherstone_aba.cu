@@ -707,7 +707,7 @@ __global__ void ApplyPositionDriveKernel(ArticulationDeviceState state,
     }
     // tau = Kp*(target-q) - Kd*qdot. When `defer_velocity_damping` is set the
     // -Kd*qdot term is OMITTED here and instead applied IMPLICITLY downstream in
-    // the constrained-velocity solve (SolveArticulatedContactRows seeds qdot with
+    // the constrained-velocity solve (ApplyImplicitJointDamping applies
     // -dt*(M+dt*C)^-1*(C*qdot), C the per-DOF joint-damping diag). Explicit -Kd*qdot
     // integrated by the semi-implicit Euler step is only conditionally stable
     // (instability ~ dt*Kd/m_eff, blows up at coarse dt / contact-shrunk m_eff);

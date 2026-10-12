@@ -153,9 +153,6 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         (id == FieldId::ParticleResponse || id == FieldId::ParticleRowImpulse ||
          id == FieldId::VbdHistoryReady)) return 0u;
     if (lay.per == FieldPer::Scalar) {
-        if (id == FieldId::IslandRowOffsets) return schedule_island_elements;
-        if (id == FieldId::IslandColorSegments) return schedule_color_elements;
-        if (id == FieldId::RowOrder) return schedule_row_elements;
         if (id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerStatus ||
             id == FieldId::VbdForceResidualWork || id == FieldId::PhysicsStageMetrics ||
             id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
@@ -277,19 +274,8 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         if (id == FieldId::LbvhSortScratch) return lbvh_sort_scratch_bytes;
         if (id == FieldId::ContactCacheScratch) return contact_cache_scratch_bytes;
         if (id == FieldId::ContactIndexScratch) return contact_index_scratch_bytes;
-        if (id == FieldId::SolverVelocityScratch) return solver_velocity_scratch_bytes;
         if (id == FieldId::PairSampleChunks) return pair_sample_chunk_words;
-        if (id == FieldId::SolveColorScratch) return solve_color_scratch_words;
         if (id == FieldId::BlockDescentScratch) return block_descent_scratch_words;
-        // Dynamic-island component count (BuildSolveIslands): the solve grid
-        // watermark — one global u32.
-        if (id == FieldId::IslandCount) {
-            return 1ull;
-        }
-        // BuildSolveIslands cub radix-sort temp (u8 bytes), sized at World construct.
-        if (id == FieldId::IslandCubTemp) {
-            return island_cub_temp_bytes;
-        }
         // MLS-MPM background grid node fields: per-env nodes x env_count (the keys
         // are env-offset, so each env owns a private node span). 0 for a non-MPM world.
         // grid_body_dp/grid_body_owner share the per-node extent (the body-BC handoff).
@@ -298,8 +284,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         }
         if (id == FieldId::GridMass || id == FieldId::GridMomentum ||
             id == FieldId::GridVelocity || id == FieldId::GridPseudoVel ||
-            id == FieldId::GridInvMass ||
-            id == FieldId::CcGridFirst) {
+            id == FieldId::GridInvMass) {
             return static_cast<uint64_t>(mpm_grid_nodes_per_env) *
                    static_cast<uint64_t>(env_count);
         }
@@ -871,24 +856,6 @@ void Model::StageModelField(FieldId id, const Segment& seg,
             StampPerLink(dst, dof_to_component, capacities.dofs_per_env, E,
                          sizeof(uint32_t));
             break;
-        case FieldId::RowOrder: {
-            if (!schedule_row_order.empty()) {
-                std::memcpy(dst, schedule_row_order.data(), schedule_row_order.size() * sizeof(uint32_t));
-            }
-            break;
-        }
-        case FieldId::IslandColorSegments: {
-            if (!schedule_color_segments.empty()) {
-                std::memcpy(dst, schedule_color_segments.data(), schedule_color_segments.size() * sizeof(uint32_t));
-            }
-            break;
-        }
-        case FieldId::IslandRowOffsets: {
-            if (!schedule_islands.empty()) {
-                std::memcpy(dst, schedule_islands.data(), schedule_islands.size() * sizeof(uint32_t));
-            }
-            break;
-        }
         case FieldId::VbdElements:
             std::memcpy(dst, particles.vbd_elements.data(), seg.bytes);
             break;
@@ -1161,9 +1128,6 @@ void BindModelPointer(phi::ModelView& v, FieldId id, void* p) {
         case FieldId::SdfCellGradients:      v.sdf_cell_gradients = static_cast<math::Vec3*>(p); break;
         case FieldId::DofToLink:             v.dof_to_link = static_cast<uint32_t*>(p); break;
         case FieldId::DofToComponent:        v.dof_to_component = static_cast<uint32_t*>(p); break;
-        case FieldId::IslandRowOffsets:      v.island_row_offsets = static_cast<uint32_t*>(p); break;
-        case FieldId::IslandColorSegments:   v.island_color_segments = static_cast<uint32_t*>(p); break;
-        case FieldId::RowOrder:              v.row_order = static_cast<uint32_t*>(p); break;
         case FieldId::AeroTriVerts:          v.aero_tri_verts = static_cast<uint32_t*>(p); break;
         case FieldId::AeroTriArea:           v.aero_tri_area = static_cast<float*>(p); break;
         case FieldId::AeroParticleOffset:    v.aero_particle_offset = static_cast<uint32_t*>(p); break;
@@ -1866,11 +1830,6 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.body_init = std::move(src.body_init);
     dst.dof_to_link = std::move(src.dof_to_link);
     dst.dof_to_component = std::move(src.dof_to_component);
-    dst.schedule_row_order = std::move(src.schedule_row_order);
-    dst.schedule_color_segments = std::move(src.schedule_color_segments);
-    dst.schedule_islands = std::move(src.schedule_islands);
-    dst.schedule_island_count = src.schedule_island_count;
-    dst.schedule_segment_count = src.schedule_segment_count;
     // M5 pair-driven / SDF tables (review fix: these were MISSING — a moved
     // Model silently dropped every pair-driven collision table, staging zeros).
     dst.excluded_pairs = std::move(src.excluded_pairs);

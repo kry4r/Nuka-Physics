@@ -5,7 +5,7 @@
 // production path a robot uses (LoadUsd -> CookToModel -> nk::World). The arm's
 // LINK is a collidable body row posed by SyncLinkBodyPose; a cloth patch is
 // placed under the resting tip. The link presses the particles through the SAME
-// detection -> body<->particle narrowphase -> emit -> SolveRowsBlockIsland the
+// detection -> body<->particle narrowphase -> emit -> BlockDescentSolve the
 // foot uses on the ground: no per-robot code, an articulation link is just
 // another collidable body row and a particle is a sphere.
 //

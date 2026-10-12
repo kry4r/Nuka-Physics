@@ -271,10 +271,7 @@ typedef struct nuka_world_execution_info_t {
 // Reset preserves the graph; changes to the operator sequence invalidate it.
 nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execution_mode_t mode);
 
-// Contact exchanges per interval, 0..65535; zero follows material iterations.
-// Material budgets and timestep stay fixed; a changed value invalidates the execution graph.
-nuka_result_t nuka_world_set_coupling_passes(nuka_world_handle world, uint32_t passes);
-// Velocity sweeps of the contact solve per pass, 1..65535; the timestep and coupling passes stay fixed.
+// Block-descent iterations of the contact solve, 1..65535; the timestep stays fixed.
 // A changed value invalidates the execution graph.
 nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32_t iterations);
 nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations);

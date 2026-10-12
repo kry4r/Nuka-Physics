@@ -12,7 +12,6 @@
 
 #include "phi/articulation_contract.hpp"
 #include "nk/model/contact_capacity.hpp"
-#include "nk/solve/schedule.hpp"
 #include "nk/solve/nk_row.hpp"
 
 namespace nuka::nk {
@@ -169,11 +168,6 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
                                             model_.capacities.env_count)
             : 0u;
 
-    // Size the dynamic-island cub radix-sort scratch (BuildSolveIslands) over the
-    // total row capacity so the sort captures into the graph; 0 if no rows (inert).
-    model_.capacities.island_cub_temp_bytes = phi::IslandSortScratchBytes(
-        model_.capacities.max_rows_per_env * model_.capacities.env_count);
-
     // Size the broadphase pair-stream canonicalization scratch (LbvhQueryPairs)
     // over the rigid candidate-slot capacity; 0 for a non-PairDriven world (the
     // op early-exits there, so the segment stays zero-byte / byte-inert).
@@ -191,9 +185,6 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         if (call.op == phi::NkOp::NarrowphaseSdf)
             model_.capacities.pair_sample_chunk_words = phi::PairSampleChunkWords(
                 *static_cast<const phi::NarrowphaseSdfParams*>(call.params));
-        if (call.op == phi::NkOp::SolveRowsBlockIsland)
-            model_.capacities.solve_color_scratch_words = std::max(model_.capacities.solve_color_scratch_words,
-                phi::SolveColorScratchWords(*static_cast<const phi::SolveRowsBlockIslandParams*>(call.params)));
         if (call.op == phi::NkOp::BlockDescentSolve)
             model_.capacities.block_descent_scratch_words = std::max(model_.capacities.block_descent_scratch_words,
                 phi::BlockDescentScratchWords(*static_cast<const phi::BlockDescentSolveParams*>(call.params)));
@@ -218,9 +209,6 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
             phi::OgcOrderScratchBytes(cap.ogc_contacts_per_env, cap.env_count));
     model_.capacities.contact_index_scratch_bytes = cap.links_per_env > 0u && cap.max_rows_per_env > 0u
         ? phi::ContactIndexScratchBytes(cap.max_rows_per_env * cap.env_count, cap.env_count) : 0u;
-    model_.capacities.solver_velocity_scratch_bytes = cap.max_rows_per_env > 0u
-        ? phi::SolverVelocityScratchBytes(cap.bodies_per_env * cap.env_count,
-            cap.particles_per_env * cap.env_count, cap.mpm_grid_nodes_per_env * cap.env_count) : 0u;
     } catch (const std::exception& error) {
         creation_status_ = phi::Status::Failed;
         creation_error_ = error.what();
@@ -236,15 +224,6 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         creation_error_ = "device has no buffer type";
         return;
     }
-
-    // 0. (M4, plan §3.4) Build the worst-case device-resident solve schedule
-    // ONCE on the host (the row_scheduler algorithms migrated to nk/solve) —
-    // BEFORE UploadTo, which stages the triple into the Model device buffer.
-    // Runtime steps never re-color (the plan-replay anchor).
-    SolveSchedule::Build(&model_);
-    model_.capacities.schedule_island_elements = model_.schedule_islands.size() / 4u;
-    model_.capacities.schedule_color_elements = model_.schedule_color_segments.size() / 2u;
-    model_.capacities.schedule_row_elements = model_.schedule_row_order.size();
 
     // 1. Upload the Model's constant tables into ONE device buffer + fill view.
     creation_status_ = model_.UploadTo(bt, &model_view_);
@@ -785,27 +764,6 @@ phi::Status World::SetGravity(const math::Vec3& gravity) {
     pipeline_ = std::move(candidate);
     cfg_ = config;
     state_sensors_.SetGravity(gravity);
-    return last_status_ = phi::Status::Ok;
-}
-
-phi::Status World::SetCouplingPasses(uint32_t passes) {
-    if (!ready_ || passes > UINT16_MAX) return last_status_ = phi::Status::InvalidArgument;
-    if (passes == cfg_.coupling_passes) return last_status_ = phi::Status::Ok;
-    auto config = cfg_;
-    config.coupling_passes = static_cast<uint16_t>(passes);
-    auto candidate = std::make_unique<Pipeline>();
-    last_status_ = candidate->Build(model_, config, device_, readout_demand_, &state_sensors_);
-    if (last_status_ != phi::Status::Ok) return last_status_;
-    last_status_ = Synchronize();
-    if (last_status_ != phi::Status::Ok) return last_status_;
-    if (plan_ != nullptr) {
-        phi::BackendPlanFree(backend_, plan_);
-        plan_ = nullptr;
-    }
-    plan_attempted_ = false;
-    graph_error_ = {};
-    pipeline_ = std::move(candidate);
-    cfg_ = config;
     return last_status_ = phi::Status::Ok;
 }
 

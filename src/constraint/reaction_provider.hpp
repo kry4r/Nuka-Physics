@@ -17,10 +17,10 @@
 //                         (maximal 6-DOF: invM = inv_mass I3 (+) inv_inertia
 //                          diagonal applied to the world-frame angular Jacobian).
 //   ArticulationChainJ -> articulation_contacts.cu ComputeContactEffectiveMass
-//                         (m_eff = 1/(J M^-1 J^T)) + the SolveArticulatedContactRows
+//                         (m_eff = 1/(J M^-1 J^T)) + the
 //                         qdot += M^-1 J^T dlambda apply loop. J is the PRE-BUILT
 //                         dof-wide chain row from ComputeContactChainJacobians.
-//   ParticleInvMass    -> the xpbd/pbf scalar inverse mass (particles are purely
+//   ParticleInvMass    -> the particle scalar inverse mass (particles are purely
 //                         translational: invM = inv_mass |J_linear|^2).
 //   StaticNull         -> immovable world collider: invM = 0, apply = no-op (so a
 //                         link<->static or rigid<->static row has a well-defined
@@ -169,13 +169,12 @@ NUKA_REACTION_HD inline float ArticulationEffectiveInvMass(
     return denom;
 }
 
-// apply_impulse: dqdot = dlambda * M^-1 J^T. BYTE-FOR-BYTE the apply loop in
-// SolveArticulatedContactRowsKernel (articulation_contacts.cu ~858-867):
+// apply_impulse: dqdot = dlambda * M^-1 J^T, the joint-space impulse apply:
 //   for r: acc = sum_c Minv[r*stride+c] * J[c]; qdot[r] += acc * dlambda
 //
 // ★ C5-WIRING WARNING (C4-review IMPORTANT-1) — flat-qdot vs scatter-by-link.
-// This writes a CONTIGUOUS qdot[0..dof_stride). Production
-// SolveArticulatedContactRowsKernel SCATTERS each logical DOF to either
+// This writes a CONTIGUOUS qdot[0..dof_stride). The articulation dof map
+// SCATTERS each logical DOF to either
 // state.qdot[link] (scalar joints) OR link_velocity[root].v[component] (a
 // FloatingBase base's 6 DOFs). For a FIXED-ROOT chain (v0.8's covered case) the
 // logical-DOF order maps monotonically to consecutive qdot slots, so a private

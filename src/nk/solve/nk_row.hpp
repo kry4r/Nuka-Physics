@@ -4,7 +4,7 @@
 //
 // ONE NkRow per row slot of the `urows` Data field (32 f32 / 128 B; the field
 // aliases this struct — static_assert'd). Written by the AssembleRows op,
-// consumed by SolveRowsBlockIsland. The semantics transcribe the legacy
+// consumed by BlockDescentSolve. The semantics transcribe the legacy
 // unified row solve 1:1:
 //   * rhs               == Row.rhs (aref, the solref/solimp reference accel)
 //   * compliance_alpha  == Row.compliance_alpha (R, the dual regularizer)

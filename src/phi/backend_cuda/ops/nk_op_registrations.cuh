@@ -24,8 +24,6 @@ void RegisterNkNarrowphaseBodyParticleOps(); // narrowphase_body_particle.cu
 void RegisterNkBroadphaseOps();       // broadphase.cu (M5)
 void RegisterNkNarrowphaseSdfOps();   // narrowphase_sdf.cu (M5)
 void RegisterNkAssembleRowsOps();     // assemble_rows.cu (M4)
-void RegisterNkBuildSolveIslandsOps(); // build_islands.cu (dynamic CC schedule)
-void RegisterNkSolveRowsOps();        // solve_rows.cu (M4)
 void RegisterNkBlockDescentOps();
 void RegisterNkParticleOps();         // particles.cu (M6)
 void RegisterNkVertexBlockOps();      // vertex_blocks.cu

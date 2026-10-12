@@ -136,9 +136,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::SdfCellKeys, DlpackDtype::kU64, 1, false, false},  // sdf_cell_keys
     {FieldId::SdfCellValues, DlpackDtype::kF32, 1, false, false},  // sdf_cell_values
     {FieldId::SdfCellGradients, DlpackDtype::kF32, 2, false, false},  // sdf_cell_gradients
-    {FieldId::IslandRowOffsets, DlpackDtype::kU32, 2, false, false},  // island_row_offsets
-    {FieldId::IslandColorSegments, DlpackDtype::kU32, 2, false, false},  // island_color_segments
-    {FieldId::RowOrder, DlpackDtype::kU32, 1, false, false},  // row_order
     {FieldId::ParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // particle_prev_pos
     {FieldId::ParticleVel, DlpackDtype::kF32, 2, true, false},  // particle_vel
     {FieldId::ParticleInvMass, DlpackDtype::kF32, 1, false, false},  // particle_inv_mass
@@ -168,7 +165,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::RowCjLinkB, DlpackDtype::kU32, 1, false, false},  // row_cj_link_b
     {FieldId::RowCjPointB, DlpackDtype::kF32, 2, false, false},  // row_cj_point_b
     {FieldId::RowCjDirB, DlpackDtype::kF32, 2, false, false},  // row_cj_dir_b
-    {FieldId::PdSolveScratch, DlpackDtype::kU32, 2, false, false},  // pd_solve_scratch
     {FieldId::RowPenetration, DlpackDtype::kF32, 1, false, false},  // row_penetration
     {FieldId::QdotPseudo, DlpackDtype::kF32, 1, false, false},  // qdot_pseudo
     {FieldId::LinkVelocityPseudo, DlpackDtype::kF32, 2, false, false},  // link_velocity_pseudo
@@ -203,16 +199,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::GridBodyOwner, DlpackDtype::kU32, 1, false, false},  // grid_body_owner
     {FieldId::MpmBodyReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_reaction
     {FieldId::MpmBodyAngReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_ang_reaction
-    {FieldId::CcParent, DlpackDtype::kU32, 1, false, false},  // cc_parent
-    {FieldId::CcRoot, DlpackDtype::kU32, 1, false, false},  // cc_root
-    {FieldId::CcArticFirst, DlpackDtype::kU32, 1, false, false},  // cc_artic_first
-    {FieldId::CcBodyFirst, DlpackDtype::kU32, 1, false, false},  // cc_body_first
-    {FieldId::CcParticleFirst, DlpackDtype::kU32, 1, false, false},  // cc_particle_first
-    {FieldId::IslandRootSorted, DlpackDtype::kU32, 1, false, false},  // island_root_sorted
-    {FieldId::IslandRows, DlpackDtype::kU32, 1, false, false},  // island_rows
-    {FieldId::IslandQuads, DlpackDtype::kU32, 2, false, false},  // island_quads
-    {FieldId::IslandCount, DlpackDtype::kU32, 1, false, false},  // island_count
-    {FieldId::IslandCubTemp, DlpackDtype::kU8, 1, false, false},  // island_cub_temp
     {FieldId::JointFrictionloss, DlpackDtype::kF32, 1, false, false},  // joint_frictionloss
     {FieldId::BodyCollidableLink, DlpackDtype::kU32, 1, false, false},  // body_collidable_link
     {FieldId::BodyCollidableLocal, DlpackDtype::kF32, 2, false, false},  // body_collidable_local
@@ -302,7 +288,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // particle_plastic_F
     {FieldId::SnapshotParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_plastic_F
     {FieldId::GridInvMass, DlpackDtype::kF32, 1, false, false},  // grid_inv_mass
-    {FieldId::CcGridFirst, DlpackDtype::kU32, 1, false, false},  // cc_grid_first
     {FieldId::GridContactCount, DlpackDtype::kU64, 1, false, false},  // grid_contact_count
     {FieldId::GridContactOffset, DlpackDtype::kU64, 1, false, false},  // grid_contact_offset
     {FieldId::UcontactLaw, DlpackDtype::kU32, 1, false, false},  // ucontact_law
@@ -315,7 +300,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::MpmBoundaryMoment, DlpackDtype::kF32, 2, false, true},  // mpm_boundary_moment
     {FieldId::StepMpmBoundaryImpulse, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_impulse
     {FieldId::StepMpmBoundaryMoment, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_moment
-    {FieldId::SolverVelocityScratch, DlpackDtype::kU8, 1, false, false},  // solver_velocity_scratch
     {FieldId::VelocityTarget, DlpackDtype::kF32, 1, false, false},  // velocity_target
     {FieldId::AccelerationTarget, DlpackDtype::kF32, 1, false, false},  // acceleration_target
     {FieldId::ActuatorNoloadSpeed, DlpackDtype::kF32, 1, false, false},  // actuator_noload_speed
@@ -356,7 +340,6 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactSolveCounts, DlpackDtype::kU32, 2, false, true},  // contact_solve_counts
     {FieldId::ContactSolveWorstTerms, DlpackDtype::kF32, 2, false, true},  // contact_solve_worst_terms
     {FieldId::PairSampleChunks, DlpackDtype::kU32, 1, false, false},  // pair_sample_chunks
-    {FieldId::SolveColorScratch, DlpackDtype::kU32, 1, false, false},  // solve_color_scratch
     {FieldId::BlockDescentScratch, DlpackDtype::kU32, 1, false, false},  // block_descent_scratch
     {FieldId::VbdElements, DlpackDtype::kU8, 2, false, false},  // vbd_elements
     {FieldId::VbdIncidenceOffsets, DlpackDtype::kU32, 1, false, false},  // vbd_incidence_offsets

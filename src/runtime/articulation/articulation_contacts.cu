@@ -677,343 +677,12 @@ __global__ void AssembleArticulatedContactRowsKernel(
     out_rows[slot] = row;
 }
 
-// Fused block-per-articulation PGS solve + apply. One block, single lane. Reads
-// the env's fixed-stride row slots, seeds qdot_work from state.qdot (= qdot_free),
-// sweeps the rows in fixed order, and writes the corrected qdot_work back. The
-// dof column -> global qdot index map is the base-inclusive prefix sum over the
-// articulation's links (== T3 dof_index == T4 LocalDofIndex), realized as the
-// dof_to_link table built once per block.
-__global__ void SolveArticulatedContactRowsKernel(ArticulationDeviceState state,
-                                                  const ArticulatedContactRow* rows,
-                                                  const float* normal_jacobian,
-                                                  const float* tangent1_jacobian,
-                                                  const float* tangent2_jacobian,
-                                                  const float* inertia_M_inv,
-                                                  uint32_t dof_stride,
-                                                  float dt,
-                                                  uint32_t solver_iterations,
-                                                  float friction_coefficient,
-                                                  float baumgarte_max_velocity,
-                                                  float* inout_lambda,
-                                                  const float* joint_damping) {
-    const uint32_t articulation = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
-        return;
-    }
-
-    const uint32_t offset = state.articulation_link_offset[articulation];
-    const uint32_t count = state.articulation_link_count[articulation];
-
-    // dof_to_link[k] = global link of the k-th DOF (base-inclusive prefix sum).
-    // T8b: a FloatingBase root expands into its 6 component DOFs (columns 0..5 ->
-    // root link, sub-component 0..5), which live in link_velocity[root].v[0..5]
-    // (omega-first), NOT in state.qdot. dof_to_component[k] tags each working DOF:
-    // a value < 6 is base component k; kInvalidLink marks a scalar joint DOF held
-    // in state.qdot[link]. The expansion is gated on FloatingBase, so a fixed root
-    // yields the exact same one-entry-per-link map as before (byte-identical solve).
-    uint32_t dof_to_link[kMaxArticulationDof];
-    uint32_t dof_to_component[kMaxArticulationDof];
-    uint32_t dof = 0u;
-    for (uint32_t local = 0u; local < count && dof < kMaxArticulationDof; ++local) {
-        const uint32_t link = offset + local;
-        const ArticulationJointType type = state.joint_type[link];
-        if (local == 0u && state.parent_link[link] == kInvalidLink &&
-            type == ArticulationJointType::FloatingBase) {
-            for (uint32_t b = 0u; b < 6u && dof < kMaxArticulationDof; ++b) {
-                dof_to_link[dof] = link;
-                dof_to_component[dof] = b;
-                ++dof;
-            }
-            continue;
-        }
-        if (JointDofCountDevice(type) != 0u) {
-            dof_to_link[dof] = link;
-            dof_to_component[dof] = kInvalidLink;
-            ++dof;
-        }
-    }
-    if (dof == 0u || dof_stride == 0u) {
-        return;
-    }
-
-    // Working joint-velocity vector. Base DOFs seed from link_velocity[root].v
-    // (the omega-first base spatial velocity); scalar joint DOFs from state.qdot.
-    float qdot_work[kMaxArticulationDof];
-    for (uint32_t k = 0u; k < dof; ++k) {
-        if (dof_to_component[k] != kInvalidLink) {
-            qdot_work[k] = state.link_velocity[dof_to_link[k]].v[dof_to_component[k]];
-        } else {
-            qdot_work[k] = state.qdot[dof_to_link[k]];
-        }
-    }
-
-    const size_t tile_stride = static_cast<size_t>(dof_stride) * dof_stride;
-    const float* const Minv =
-        inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
-
-    // -- General implicit joint viscous damping (deferred from the drive). --------
-    // The drive ran with defer_velocity_damping=true (stiffness torque only), and
-    // Minv here is (M + dt*C)^-1 (ComputeArticulationInertiaM folded dt*C into the
-    // joint diagonals). Backward-Euler joint damping is
-    //   (M + dt*C) qdot_{n+1} = M qdot_half
-    //   => qdot_{n+1} = qdot_half - dt*(M + dt*C)^-1 * (C * qdot_half).
-    // C is diagonal (c_j = joint_damping[link] on scalar joint DOFs, 0 on the free
-    // floating-base DOFs). Because (M+dt*C)^-1 is DENSE, damping a leg joint reacts
-    // back onto the floating base through the off-diagonal coupling -- exactly the
-    // coupling a per-joint diagonal velocity-decay cannot reproduce. The subsequent
-    // contact rows use the SAME (M+dt*C)^-1 admittance, so damping and contacts are
-    // co-resolved consistently. Unconditionally stable: replaces the explicit
-    // -Kd*qdot that buzzed at coarse dt. joint_damping==nullptr -> exact prior path.
-    if (joint_damping != nullptr && dt > 0.0f) {
-        float c_qdot[kMaxArticulationDof];
-        for (uint32_t k = 0u; k < dof; ++k) {
-            const float c = (dof_to_component[k] == kInvalidLink)
-                                ? joint_damping[dof_to_link[k]]
-                                : 0.0f;
-            c_qdot[k] = c * qdot_work[k];  // C * qdot_half (qdot_half = seeded qdot_work)
-        }
-        for (uint32_t r = 0u; r < dof; ++r) {
-            float acc = 0.0f;
-            const float* const minv_row = Minv + static_cast<size_t>(r) * dof_stride;
-            for (uint32_t c = 0u; c < dof; ++c) {
-                acc += minv_row[c] * c_qdot[c];
-            }
-            qdot_work[r] -= dt * acc;
-        }
-    }
-
-    // This articulation's contact slots (env-major; env == articulation in the
-    // 1-articulation-per-env design). lambda_n[slot] accumulates the normal
-    // impulse used by the friction cone.
-    const uint32_t slot_base = articulation * kMaxFootContactsPerEnv;
-    float lambda_n[kMaxFootContactsPerEnv];
-    float lambda_t1[kMaxFootContactsPerEnv];
-    float lambda_t2[kMaxFootContactsPerEnv];
-    for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
-        // Warm-start from the persisted buffer when present AND the same link
-        // still occupies the slot (else cold start at 0). Warm-start affects
-        // convergence only -- never determinism (the determinism gate runs cold).
-        float ln = 0.0f;
-        float lt1 = 0.0f;
-        float lt2 = 0.0f;
-        if (inout_lambda != nullptr) {
-            const size_t base = static_cast<size_t>(slot_base + s) * 3u;
-            ln = inout_lambda[base + 0u];
-            lt1 = inout_lambda[base + 1u];
-            lt2 = inout_lambda[base + 2u];
-        }
-        lambda_n[s] = ln;
-        lambda_t1[s] = lt1;
-        lambda_t2[s] = lt2;
-    }
-
-    const float inv_dt = (dt > 0.0f) ? (1.0f / dt) : 0.0f;
-    const float mu = fmaxf(friction_coefficient, 0.0f);
-
-    // Apply any warm-started impulse so qdot_work reflects the seed lambda before
-    // the first sweep (qdot_work += M^-1 J^T * actual). Inlined (no device lambda)
-    // so the local qdot_work array is updated in place unambiguously.
-    for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
-        const ArticulatedContactRow row = rows[slot_base + s];
-        if (row.row_type != ContactRowType::kRowNormal ||
-            row.articulation != articulation) {
-            continue;
-        }
-        const size_t row_base = static_cast<size_t>(slot_base + s) * dof_stride;
-        const float* const jrows[3] = {normal_jacobian + row_base,
-                                       tangent1_jacobian + row_base,
-                                       tangent2_jacobian + row_base};
-        const float seeds[3] = {lambda_n[s], lambda_t1[s], lambda_t2[s]};
-        for (uint32_t which = 0u; which < 3u; ++which) {
-            const float actual = seeds[which];
-            if (actual == 0.0f) {
-                continue;
-            }
-            const float* const jac_row = jrows[which];
-            for (uint32_t r = 0u; r < dof; ++r) {
-                float acc = 0.0f;
-                const float* minv_row = Minv + static_cast<size_t>(r) * dof_stride;
-                for (uint32_t c = 0u; c < dof; ++c) {
-                    acc += minv_row[c] * jac_row[c];
-                }
-                qdot_work[r] += acc * actual;
-            }
-        }
-    }
-
-    for (uint32_t iter = 0u; iter < solver_iterations; ++iter) {
-        // -- Normal rows first, fixed slot order. ---------------------------
-        for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
-            const ArticulatedContactRow row = rows[slot_base + s];
-            if (row.row_type != ContactRowType::kRowNormal ||
-                row.articulation != articulation) {
-                continue;
-            }
-            const float* const jn =
-                normal_jacobian + static_cast<size_t>(slot_base + s) * dof_stride;
-            const float bias = fminf(
-                kBaumgarteBeta * inv_dt * fmaxf(row.depth - kPenetrationSlop, 0.0f),
-                baumgarte_max_velocity);
-            float jv = 0.0f;
-            for (uint32_t k = 0u; k < dof; ++k) {
-                jv += jn[k] * qdot_work[k];
-            }
-            const float delta = row.effective_mass * (bias - jv);
-            const float old_lambda = lambda_n[s];
-            // Normal impulse: lower = 0, upper = +inf.
-            float new_lambda = old_lambda + delta;
-            if (new_lambda < 0.0f) {
-                new_lambda = 0.0f;
-            }
-            const float actual = new_lambda - old_lambda;
-            lambda_n[s] = new_lambda;
-            if (actual != 0.0f) {
-                for (uint32_t r = 0u; r < dof; ++r) {
-                    float acc = 0.0f;
-                    const float* minv_row = Minv + static_cast<size_t>(r) * dof_stride;
-                    for (uint32_t c = 0u; c < dof; ++c) {
-                        acc += minv_row[c] * jn[c];
-                    }
-                    qdot_work[r] += acc * actual;
-                }
-            }
-        }
-        // -- Friction tangent rows, fixed slot order. -----------------------
-        for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
-            const ArticulatedContactRow row = rows[slot_base + s];
-            if (row.row_type != ContactRowType::kRowNormal ||
-                row.articulation != articulation) {
-                continue;
-            }
-            const float limit = mu * fmaxf(lambda_n[s], 0.0f);
-            const size_t row_base = static_cast<size_t>(slot_base + s) * dof_stride;
-            // Tangent 1 then tangent 2, fixed order.
-            for (uint32_t which = 0u; which < 2u; ++which) {
-                const float* const jt =
-                    (which == 0u ? tangent1_jacobian : tangent2_jacobian) + row_base;
-                const float meff = (which == 0u) ? row.effective_mass_t1
-                                                 : row.effective_mass_t2;
-                float jv = 0.0f;
-                for (uint32_t k = 0u; k < dof; ++k) {
-                    jv += jt[k] * qdot_work[k];
-                }
-                const float delta = meff * (0.0f - jv);
-                const float old_lambda = (which == 0u) ? lambda_t1[s] : lambda_t2[s];
-                float new_lambda = old_lambda + delta;
-                new_lambda = fminf(fmaxf(new_lambda, -limit), limit);
-                const float actual = new_lambda - old_lambda;
-                if (which == 0u) {
-                    lambda_t1[s] = new_lambda;
-                } else {
-                    lambda_t2[s] = new_lambda;
-                }
-                if (actual != 0.0f) {
-                    for (uint32_t r = 0u; r < dof; ++r) {
-                        float acc = 0.0f;
-                        const float* minv_row = Minv + static_cast<size_t>(r) * dof_stride;
-                        for (uint32_t c = 0u; c < dof; ++c) {
-                            acc += minv_row[c] * jt[c];
-                        }
-                        qdot_work[r] += acc * actual;
-                    }
-                }
-            }
-        }
-    }
-
-    // Final normal-row sweep. The interleaved normal+friction PGS converges to the
-    // correct boxed-friction LCP fixed point, but the last update in the loop is a
-    // FRICTION row, so qdot_work leaves the loop with the normal velocities slightly
-    // perturbed by friction's final application (the system is strongly coupled:
-    // J_n M^-1 J_t^T is O(1) here for the bent Go2 stance). The normal constraint is
-    // a single row, so one more normal-only sweep re-imposes jv_n = bias EXACTLY
-    // (delta = m_eff*(bias - jv) drives the unclamped row to the target in one step)
-    // without disturbing the converged friction impulses. This makes the returned
-    // qdot satisfy the non-penetration constraint to machine precision; the friction
-    // cone (|lambda_t| <= mu*lambda_n) is preserved because lambda_n only grows here.
-    for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
-        const ArticulatedContactRow row = rows[slot_base + s];
-        if (row.row_type != ContactRowType::kRowNormal ||
-            row.articulation != articulation) {
-            continue;
-        }
-        const float* const jn =
-            normal_jacobian + static_cast<size_t>(slot_base + s) * dof_stride;
-        const float bias = fminf(
-            kBaumgarteBeta * inv_dt * fmaxf(row.depth - kPenetrationSlop, 0.0f),
-            baumgarte_max_velocity);
-        float jv = 0.0f;
-        for (uint32_t k = 0u; k < dof; ++k) {
-            jv += jn[k] * qdot_work[k];
-        }
-        const float delta = row.effective_mass * (bias - jv);
-        const float old_lambda = lambda_n[s];
-        float new_lambda = old_lambda + delta;
-        if (new_lambda < 0.0f) {
-            new_lambda = 0.0f;
-        }
-        const float actual = new_lambda - old_lambda;
-        lambda_n[s] = new_lambda;
-        if (actual != 0.0f) {
-            for (uint32_t r = 0u; r < dof; ++r) {
-                float acc = 0.0f;
-                const float* minv_row = Minv + static_cast<size_t>(r) * dof_stride;
-                for (uint32_t c = 0u; c < dof; ++c) {
-                    acc += minv_row[c] * jn[c];
-                }
-                qdot_work[r] += acc * actual;
-            }
-        }
-    }
-
-#ifdef NUKA_T5_KERNEL_DEBUG
-    if (articulation == 0u) {
-        printf("[kdbg] dof=%u Minv00=%.4f Minv11=%.4f qdot_work[0..2]=%.6g %.6g %.6g "
-               "lambda_n0=%.4f\n",
-               dof, Minv[0], Minv[static_cast<size_t>(dof_stride) + 1u],
-               qdot_work[0], qdot_work[1], qdot_work[2], lambda_n[0]);
-    }
-#endif
-
-    // Write the corrected velocity back for every DOF of the articulation. Base
-    // DOFs go to link_velocity[root].v[component] -- this is the coupling that makes
-    // contacts push the floating base, and it feeds the post-contact pose
-    // integrator (IntegrateFloatingBasePose reads link_velocity[root]). Scalar joint
-    // DOFs go to state.qdot[link] as before.
-    for (uint32_t k = 0u; k < dof; ++k) {
-        if (dof_to_component[k] != kInvalidLink) {
-            state.link_velocity[dof_to_link[k]].v[dof_to_component[k]] = qdot_work[k];
-        } else {
-            state.qdot[dof_to_link[k]] = qdot_work[k];
-        }
-    }
-
-    // Persist this step's impulses for the next step's warm start.
-    if (inout_lambda != nullptr) {
-        for (uint32_t s = 0u; s < kMaxFootContactsPerEnv; ++s) {
-            const size_t base = static_cast<size_t>(slot_base + s) * 3u;
-            inout_lambda[base + 0u] = lambda_n[s];
-            inout_lambda[base + 1u] = lambda_t1[s];
-            inout_lambda[base + 2u] = lambda_t2[s];
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // General standalone implicit joint damping (no contacts).
 // ---------------------------------------------------------------------------
 //
-// The damping-only sibling of SolveArticulatedContactRowsKernel's implicit
-// joint-damping seed. The single-env oracle path (c_abi StepWorldGpu) runs the
-// SAME general implicit joint damping as the batched contacts path, but without
-// any contact rows -- so it needs exactly the seed block (build dof maps, seed
-// qdot_work, apply qdot -= dt*(M+dt*C)^-1*(C*qdot), write back) and nothing
-// else. The float sequence here is a VERBATIM transcription of lines ~712..781
-// + the write-back of SolveArticulatedContactRowsKernel so the single-env path
-// is bit-for-bit identical to the batched contacts-OFF path (where the solve's
-// warm-start / sweeps / final sweep are all no-ops because no contact fires).
-// One block per articulation, single lane, fixed loop order, no atomics => D1.
+// Builds the dof maps, seeds qdot_work, applies qdot -= dt*(M+dt*C)^-1*(C*qdot) and
+// writes back. One block per articulation, single lane, fixed loop order => D1.
 __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
                                                const float* inertia_M_inv,
                                                const float* joint_damping,
@@ -1028,12 +697,8 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
     const uint32_t offset = state.articulation_link_offset[articulation];
     const uint32_t count = state.articulation_link_count[articulation];
 
-    // dof_to_link[k] / dof_to_component[k]: built EXACTLY as
-    // SolveArticulatedContactRowsKernel does (base-inclusive prefix sum; a
-    // FloatingBase root expands to 6 component DOFs tagged 0..5 living in
-    // link_velocity[root].v, scalar joints tagged kInvalidLink living in
-    // state.qdot). Gated on FloatingBase, so a fixed root yields the exact
-    // one-entry-per-link map (byte-identical to the solve kernel).
+    // Base-inclusive prefix sum: a FloatingBase root expands to 6 DOFs tagged 0..5 in
+    // link_velocity[root].v; scalar joints are tagged kInvalidLink and live in state.qdot.
     uint32_t dof_to_link[kMaxArticulationDof];
     uint32_t dof_to_component[kMaxArticulationDof];
     uint32_t dof = 0u;
@@ -1075,8 +740,7 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
         inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
 
     // -- General implicit joint viscous damping (deferred from the drive). --------
-    // IDENTICAL float sequence to SolveArticulatedContactRowsKernel's seed: the
-    // drive ran with defer_velocity_damping=true (stiffness torque only), Minv is
+    // The drive ran with defer_velocity_damping=true (stiffness torque only), Minv is
     // (M + dt*C)^-1 (ComputeArticulationInertiaM folded dt*C into the joint
     // diagonals), and backward-Euler joint damping is
     //   qdot_{n+1} = qdot_half - dt*(M + dt*C)^-1 * (C * qdot_half).
@@ -1100,8 +764,7 @@ __global__ void ApplyImplicitJointDampingKernel(ArticulationDeviceState state,
         }
     }
 
-    // Write the corrected velocity back for every DOF (same as the solve kernel's
-    // write-back): base DOFs -> link_velocity[root].v[component], scalar joint DOFs
+    // Write the corrected velocity back for every DOF: base DOFs -> link_velocity[root].v[component], scalar joint DOFs
     // -> state.qdot[link].
     for (uint32_t k = 0u; k < dof; ++k) {
         if (dof_to_component[k] != kInvalidLink) {
@@ -1383,60 +1046,6 @@ void AssembleArticulatedContactRows(cudaStream_t stream, int device_id,
         slot_count,
         out_rows);
     CheckCuda(cudaGetLastError(), "AssembleArticulatedContactRowsKernel launch");
-}
-
-void SolveArticulatedContactRows(cudaStream_t stream, int device_id,
-                                 ArticulationDeviceState state,
-                                 const ArticulatedContactRow* rows,
-                                 const float* normal_jacobian,
-                                 const float* tangent1_jacobian,
-                                 const float* tangent2_jacobian,
-                                 const float* inertia_M_inv,
-                                 uint32_t env_count,
-                                 uint32_t dof_stride,
-                                 float dt,
-                                 float* inout_lambda,
-                                 uint32_t solver_iterations,
-                                 float friction_coefficient,
-                                 float baumgarte_max_velocity,
-                                 const float* joint_damping) {
-    if (state.articulation_count == 0u || env_count == 0u || dof_stride == 0u) {
-        return;
-    }
-    if (dof_stride > kMaxArticulationDof) {
-        throw std::runtime_error(
-            "SolveArticulatedContactRows: dof_stride (" + std::to_string(dof_stride) +
-            ") exceeds kMaxArticulationDof (" +
-            std::to_string(kMaxArticulationDof) + ")");
-    }
-    if (rows == nullptr || normal_jacobian == nullptr ||
-        tangent1_jacobian == nullptr || tangent2_jacobian == nullptr ||
-        inertia_M_inv == nullptr) {
-        throw std::runtime_error(
-            "SolveArticulatedContactRows requires device input buffers");
-    }
-
-    // env_count is documented for the caller's buffer sizing; the kernel derives
-    // each articulation's slot block from its own index (env == articulation in
-    // the 1-articulation-per-env design).
-    (void)env_count;
-
-    phi::ScopedDeviceGuard guard(device_id);
-    SolveArticulatedContactRowsKernel<<<state.articulation_count, 32u, 0u, stream>>>(
-        state,
-        rows,
-        normal_jacobian,
-        tangent1_jacobian,
-        tangent2_jacobian,
-        inertia_M_inv,
-        dof_stride,
-        dt,
-        solver_iterations,
-        friction_coefficient,
-        baumgarte_max_velocity,
-        inout_lambda,
-        joint_damping);
-    CheckCuda(cudaGetLastError(), "SolveArticulatedContactRowsKernel launch");
 }
 
 } // namespace nuka::runtime::articulation

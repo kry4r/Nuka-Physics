@@ -19,8 +19,8 @@ Nuka 遵循"**一个通用物理求解路径**"的架构约束：机器人+地�
 | 模型 | `mjModel`（不可变、cook 一次） | `nk::Model`（不可变 cook 表） |
 | 状态 | `mjData`（大块连续内存，固定容量） | `nk::Data`（Arena 三缓冲，固定容量） |
 | 每步执行 | `mj_step` 固定函数序 | `nk::Pipeline` 固定 op 列表 |
-| 接触 | `mj_contact` + 解算行 | `NkRow` 槽位 + block-island PGS |
-| 求解 | `mj_solve`（PGS/PGD） | `SolveRowsBlockIsland`（PGS） |
+| 接触 | `mj_contact` + 解算行 | `NkRow` 槽位 + 块下降 |
+| 求解 | `mj_solve`（PGS/PGD） | `BlockDescentSolve`（块坐标下降） |
 
 两者共同的工程哲学：**一次性分配的大块连续内存 + 固定容量的槽位布局 + 固定的执行顺序**，使每步无主机参与、可 CUDA-graph 捕获、可逐位复现。
 
@@ -54,7 +54,7 @@ SceneIR ──CookToModel──▶ nk::Model（不可变 cook 表）
 ApplyDrives → AbaForward → IntegrateVelocity(+ParticlePredict)
 → FkWorldPoses → BuildAabbs → LbvhBuild → LbvhQueryPairs(+ParticleGridBuild)
 → NarrowphasePrimitives → NarrowphaseSdf → ContactTangentBasis
-→ CrbaComputeM → CrbaFactorM → AssembleRows → SolveRowsBlockIsland
+→ CrbaComputeM → CrbaFactorM → AssembleRows → BlockDescentSolve
    (+XpbdProject / PbfDensityLambda 内联于解缝)
 → IntegratePosition(+ParticleFinalize) → ReadoutContactWrench
 ```
@@ -71,48 +71,24 @@ ApplyDrives → AbaForward → IntegrateVelocity(+ParticlePredict)
 | 窄相位 | `Narrowphase*` | 图元/凸包/SDF/高度场/粒子-刚体流形 |
 | 质量 | `CrbaComputeM / CrbaFactorM` | 关节空间质量阵 CRBA + LDLT 分解 |
 | 装配 | `AssembleRows` | 候选流形 → `NkRow` 槽位（含预计算 $\mathbf{w} = \mathbf{M}^{-1}\mathbf{J}^\top$、$m_{\mathrm{eff}}$） |
-| 解算 | `SolveRowsBlockIsland` | 岛级颜色化 PGS（+ XPBD/PBF 内联投影） |
+| 解算 | `BlockDescentSolve` | 块坐标下降（刚体、关节、VBD、MPM 同一扫描） |
 | 后积分 | `IntegratePosition` | $\mathbf{q} \mathrel{+}= \dot{\mathbf{q}}'\,dt$；浮基位姿；分裂冲量推挤 |
 | 读回 | `ReadoutContactWrench` | 接触力/力矩读回 |
 
-### 1.4 统一行求解：SolveSchedule + NkRow + block-island PGS
+### 1.4 统一行求解：NkRow + 块下降
 
 **`NkRow`**（`src/nk/solve/nk_row.hpp`）：一个约束行的槽位记录，**32 个 f32 = 128B**（与 `urows` 字段元素大小 static_assert 绑定）。字段：`rhs`（=aref 参考加速度）、`compliance_alpha`（=R 对偶正则化）、`lower/upper`（法向 $[0, \infty)$；摩擦 spoke 用内核内 $[0, \mu\cdot\text{TotalNormalLambda}]$ 锥界）、`mu`、`group_first/group_normal_count`（摩擦锥的分组锚）、双侧 `NkRowSide{kind, index, jlin, jang}`（kind ∈ {Rigid, Artic, Particle, Static}，$\mathbf{j}_{\mathrm{ang}} = \mathbf{r}\times\mathbf{j}_{\mathrm{lin}}$ 刚性增强）。每候选槽位固定扩展为 4 触点 ×（1 法向 + 4 spoke）= **20 行**（粒子槽位 5 行）——布局由 cook 与装配共享。
 
-**`SolveSchedule`**（`src/nk/solve/schedule.*`）：主机在 World 构造时**一次**构建的"最坏情况"调度，上传设备后常驻：
+**`BlockDescentSolve`**（`src/phi/backend_cuda/ops/block_descent*`）是所有场景共用的接触与内部约束求解。每个可动实体（刚体、关节树、VBD 顶点、MPM 网格节点与应力单元）是一个块；约束行以增广拉格朗日罚项进入相关块的局部求解，块按颜色并行、按 Gauss–Seidel 顺序扫描，扫描后做对偶更新。
 
-- 每个最坏情况行槽位描述冲突键（≤2 个共享可变状态键：稠密 body/关节 tile 键 + λ 组锚 + 关节索引）；
-- **贪心最低可用色**按行索引序着色（冲突图边着色）→ 稠密槽位重映射 → union-find 连通分量（岛）→ $(color, \text{intra-color})$ 段发射；
-- **最坏情况槽位有效性不变量**：调度按"全部槽位活跃"计算，运行时任意子集活跃仍然有效——着色是超图的合法着色（去激活只删边）；岛是最坏分量界的细化（活跃子集的真分量是最坏岛的并的子集，块内串行化只多不少）；λ 组锚保证摩擦和与紧凑发射相等（非活跃槽位 λ=0 不贡献）；
-- 运行时 `SolveRowsBlockIsland` 内核**零主机参与**遍历 $\{\text{island\_row\_offsets},\ \text{island\_color\_segments},\ \text{row\_order}\}$ 三元组，逐块逐颜色 `__syncthreads` 并行行更新。
-
-**PGS 更新公式**（每行每迭代，保持旧解算器数值逐位一致）。先合成两侧投影速度：
-
-$$jv = jv_A + jv_B,\qquad
-jv = \begin{cases}
-\mathbf{j}_{\mathrm{lin}}\cdot\mathbf{v} + \mathbf{j}_{\mathrm{ang}}\cdot\boldsymbol\omega & \text{rigid}\\[2pt]
-\sum_r \mathbf{J}[r]\,\dot{\mathbf{q}}[r] & \text{artic（升序 } r\text{）}\\[2pt]
-\mathbf{j}_{\mathrm{lin}}\cdot\mathbf{v} & \text{particle}\\
-0 & \text{static}
-\end{cases}$$
-
-再更新乘子并应用冲量（$\Delta\lambda = \lambda' - \lambda$，$R$ = compliance_alpha）：
-
-$$\lambda' = \mathrm{clamp}\big(\lambda + m_{\mathrm{eff}}\cdot(\mathrm{rhs}\cdot dt - jv - R\,\lambda),\ \ \mathrm{lower},\ \mathrm{upper}\big)$$
-
-$$\text{rigid:}\ \ \mathbf{v} \mathrel{+}= \mathbf{j}_{\mathrm{lin}}(m^{-1}\Delta\lambda),\quad \boldsymbol\omega \mathrel{+}= \mathbf{j}_{\mathrm{ang}}(\mathbf{I}^{-1}\Delta\lambda)$$
-$$\text{artic:}\ \ \dot{\mathbf{q}}[r] \mathrel{+}= \mathbf{w}[r]\,\Delta\lambda,\quad \mathbf{w} = \mathbf{M}^{-1}\mathbf{J}^\top\ (\text{装配期预计算})$$
-$$\text{particle:}\ \ \mathbf{v} \mathrel{+}= \mathbf{j}_{\mathrm{lin}}(m^{-1}\Delta\lambda)$$
-
-- $m_{\mathrm{eff}}$ 是装配期预计算的 Compliant 有效质量（迭代间为常量，避免每迭代重算 51-DOF 的 $\mathbf{M}^{-1}\mathbf{J}^\top$ 内积）；
-- 摩擦 spoke 的边界 $[0,\ \mu\cdot\text{TotalNormalLambda}(group)]$ 是单侧耦合金字塔锥（`IsCompliantFrictionRow` 语义）；
-- 关节 $\dot{\mathbf{q}}$ tile 在岛的**共享内存**中加载/回写（块内串行）；无接触环境回写自身原值（空操作）；
-- 非活跃槽位（水位标志 bit0 清除）立即早退——最大网格 + 早退使内核保持可图形捕获；
-- `pos_iters` 仅在 PairDriven 路径生效：分裂冲量位置推挤（pseudo velocity），旧 Union 路径保持纯速度（Baumgarte 位置投影为 0）。
+- 每步按活跃行重建行-块关联，不需要构造期的静态岛调度；
+- 默认 10 次迭代；纯关节/刚体场景走 warp tile，默认 6 次；
+- 含 MPM 网格主人的行罚系数取 1，其余行取 100；
+- `pos_iters` 的分裂冲量位置推挤只在 warp tile 路径生效。
 
 ### 1.5 单一路径的落实
 
-- 刚体-刚体、粒子-刚体、关节-刚体全部经 `ucontact_*` 缓冲 → `AssembleRows` → 同一 `SolveRowsBlockIsland`；
+- 刚体-刚体、粒子-刚体、关节-刚体全部经 `ucontact_*` 缓冲 → `AssembleRows` → 同一 `BlockDescentSolve`；
 - XPBD 约束投影（`XpbdProject`）与 PBF 密度投影在解缝内联——同一时间步内先解接触行再投影内部约束，位置修正与速度解通过 $v_{\mathrm{pre}}$/$dv$ 合成（§2.4）；
 - MPM 作为一个"网格传递"耦合提供者，`Couple` 在预解缝发出**一个** `MpmStep` op（§3.6）。
 
@@ -228,7 +204,7 @@ $$\mathbf{p} \mathrel{+}= (dv + \mathbf{v}_{\mathrm{pseudo}})\,dt \qquad\text{�
 2. 对每个候选刚体跑 **sphere-vs-shape** 流形：图元对用闭式；凸包用 `cvx::SphereHull`（EPA 旁路最近点查询，规避 EPA 浅穿透死区）；高度场用面处理；
 3. 流形写入粒子的**保留槽位子区间**——基址是粒子索引的**固定函数**（非原子），body-particle 槽位流天然 D1，且与刚性-刚性槽位有确定性的子区间排序；
 4. 行侧：A = 粒子（全局 id + `kUContactSideParticle` 标签），B = 刚体 collidable（`kUContactSideBody`）；流形法向 = 粒子的分离方向（把粒子推出刚体）；
-5. 同一 `AssembleRows` 扩展成 `NkRow`，同一 `SolveRowsBlockIsland` 求解。
+5. 同一 `AssembleRows` 扩展成 `NkRow`，同一 `BlockDescentSolve` 求解。
 
 **反向**：刚体在解中通过行 Jacobian 收到粒子冲量（$\mathbf{v} \mathrel{+}= \mathbf{j}_{\mathrm{lin}}\,m^{-1}\Delta\lambda$）——布料压在机器人上，机器人被布料拖拽，双向耦合自然成立。
 
@@ -644,7 +620,7 @@ $$\frac{d\dot{\mathbf{q}}_{\mathrm{post}}}{d\mathbf{b}_c} = \mathbf{M}^{-1}\math
 - 为什么 CG 足够：$\mathbf{A}$ 是 **SPD**（不是鞍点 $[\mathbf{M}\ \mathbf{J}^\top; \mathbf{J}\ 0]$），`sparse_solver_cg.cu` 是自写确定性 CG（与 Eigen-oracle 对比验证）；
 - **活动集判据**：接触槽位装配为法向行**且 depth > 0** 即接合（与正向装配器同一活动标志），产生粘滞等式行（切向速度 ~0 时粘滞 Jacobian 是正确局部约束集）；滑动/锥边界行是 v0.7+ 精化；
 - D1：每关节一个 warp、固定序 fp64 累加、$\mathbf{A}$ 显式"上三角再镜像"使 $\mathbf{A}$ 逐位对称、零浮点原子；
-- 主验证：`test_ift_vs_tape_backward.cpp` 走真实引擎接触步的有限差分；稠密 Eigen::LDLT 作为第二 oracle。
+- 验证：原先走铰链体 PGS 接触步的有限差分测试已随 PGS 删除。
 
 ### 5.5 p08-C：SDF 接触 IFT（d/dM、d/dJ 通道）
 
@@ -743,7 +719,7 @@ nk::World（GPU-resident；Pipeline 由 cook 维度推导）
 
 | 主题 | 主要源文件 |
 |---|---|
-| 统一求解器 | `src/nk/solve/{schedule,nk_row,xpbd_coloring}.*`, `src/phi/backend_cuda/ops/solve_rows.cu`, `src/nk/pipeline/pipeline.cpp`, `src/nk/data/arena.*` |
+| 统一求解器 | `src/nk/solve/{nk_row,block_row_schedule}.*`, `src/phi/backend_cuda/ops/block_descent.cu`, `src/nk/pipeline/pipeline.cpp`, `src/nk/data/arena.*` |
 | XPBD 布料 | `src/phi/backend_cuda/ops/particles.cu`, `src/runtime/soft/cloth_topology.*`, `src/nk/solve/xpbd_coloring.*`, `src/phi/backend_cuda/ops/narrowphase_body_particle.cu` |
 | MLS-MPM | `src/phi/backend_cuda/ops/mpm.cu`, `examples/demo/mpm_water_drop_demo.cpp`, `examples/demo/mpm_jelly_demo.cpp` |
 | 可微 | `src/diffsim/{step_backward,tape,checkpoint,recompute_orchestrator,backward_runner,kkt_builder,ift_runner,sdf_contact_ift}.*` |

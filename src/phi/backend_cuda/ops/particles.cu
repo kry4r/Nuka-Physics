@@ -249,13 +249,6 @@ Status OpRefitParticleSurfaces(const ModelView& model, const DataView& data,
                                  *p, model, data) == cudaSuccess ? Status::Ok : Status::Failed;
 }
 
-// Particles are environment-major; the initial per-environment slice contains soft material.
-__device__ __forceinline__ bool SfIsSoft(uint32_t i, uint32_t n_soft,
-                                         uint32_t per_env) {
-    const uint32_t local = per_env > 0u ? (i % per_env) : i;
-    return local < n_soft;
-}
-
 // Faces read one velocity time layer; particles gather impulses in stable triangle order.
 __global__ void ClothAeroImpulseKernel(uint32_t tri_count,
                                      const uint32_t* __restrict__ tri_verts,

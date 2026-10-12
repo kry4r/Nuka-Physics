@@ -39,7 +39,6 @@ const char* NkOpName(int op) {
         case NkOp::NarrowphaseSdf: return "NarrowphaseSdf";
         case NkOp::ContactTangentBasis: return "ContactTangentBasis";
         case NkOp::AssembleRows: return "AssembleRows";
-        case NkOp::SolveRowsBlockIsland: return "SolveRowsBlockIsland";
         case NkOp::BlockDescentSolve: return "BlockDescentSolve";
         case NkOp::ParticleAeroDrag: return "ParticleAeroDrag";
         case NkOp::ParticlePredict: return "ParticlePredict";
@@ -65,7 +64,6 @@ const char* NkOpName(int op) {
         case NkOp::SyncLinkBodyPose: return "SyncLinkBodyPose";
         case NkOp::NarrowphaseBodyParticle: return "NarrowphaseBodyParticle";
         case NkOp::NarrowphaseHeightfield: return "NarrowphaseHeightfield";
-        case NkOp::BuildSolveIslands: return "BuildSolveIslands";
         case NkOp::ContactWarmStart: return "ContactWarmStart";
         case NkOp::SnapshotStepVelocity: return "SnapshotStepVelocity";
         case NkOp::ParticleProjectionVelocity: return "ParticleProjectionVelocity";

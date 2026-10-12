@@ -864,47 +864,6 @@ target_link_libraries(nuka_compliant_rows_test
 gtest_discover_tests(nuka_compliant_rows_test
     PROPERTIES LABELS "fast_full")
 
-# --- Solver tests ----------------------------------------------------------
-# M9 T11-core-b2: test_row_scheduler_bridge.cpp (legacy BuildRowColorPartitions +
-# DiffTestBridge/row_solver.cu replay) and test_row_scheduler_coloring_equivalence.cpp
-# (the legacy O(rows^2)->O(rows*K) coloring-rewrite gate) were DELETED with the
-# legacy solver trio. The coloring algorithm migrated to nk BuildColors (inside
-# nk::SolveSchedule::Partition) and is exercised end-to-end by the byte-exact nk
-# union gates + the nk_solve_harness foot_*/link_rigid device-solve tests.
-add_executable(nuka_solver_test
-    # L1-c: test_unified_solve.cpp was DELETED. It was WHOLLY a UnionCsr box-on-
-    # plane oracle (MakeNkBoxModel built an nk::UnionSlot kBodyBoxPlane model with
-    # contact_family=UnionCsr + union_solref/solimp -- all deleted with the
-    # UnionCsr path). The general (PairDriven) box-rests-on-static-ground +
-    # solref/solimp + friction-pyramid + D1 coverage lives in
-    # scenario/pairdriven_solve.cpp (nuka_scenario_test). See the L1-c report:
-    # this file was on the "keep" list but had no general-path content to preserve.
-    # v0.8 C5b-core: ArticulationChainJ reaction arm wired into UnifiedSolve
-    # (closed-form chain oracle + same-articulation coloring + link<->rigid two-
-    # way + D1). Hand-built ArticulationReactionState data (no device CRBA).
-    solver/test_link_rigid_twoway.cpp
-    # v0.8 C5b-core: compliant-PGS regularizer R-SWEEP guard (210c11f). Drives a
-    # coupled full-rank SPD A = J M^-1 J^T (dof_stride==N) compliant system through
-    # UnifiedSolve and matches the converged lambda to a double-precision dense
-    # (A+diag(R))lambda=b solve across R/A from ~1e-3 to ~1e+1, + a large-R
-    # discriminator vs the pre-fix A*lambda=b fixed point + D1. MJX-FREE.
-    solver/test_compliant_pgs_regularizer.cpp
-)
-
-target_link_libraries(nuka_solver_test
-    PRIVATE
-        nuka_solver
-        nuka_articulation
-        GTest::gtest_main
-)
-if(CMAKE_CUDA_COMPILER)
-    # M4 re-point: the nk-driven UnifiedSolve oracle scenarios
-    # (test_unified_solve.cpp NkWorld* cases).
-    target_link_libraries(nuka_solver_test PRIVATE nuka_nk nuka_phi2)
-endif()
-
-gtest_discover_tests(nuka_solver_test
-    PROPERTIES LABELS "fast_full")
 
 # --- Articulation tests ----------------------------------------------------
 add_executable(nuka_articulation_test
@@ -1238,18 +1197,6 @@ if(CMAKE_CUDA_COMPILER)
         # (box rests on a static ground plane), and two-run byte-identity for the new
         # mixed-island solve path (S1-S6 fed into the existing coupling engine).
         scenario/pairdriven_solve.cpp
-        # Body/artic <-> soft/fluid particle coupling: a static box overlapping ONE
-        # particle emits a kNkSideParticle row through the SAME EmitPairDrivenRows ->
-        # ComputeRowMeff -> SolveRowsBlockIsland the body rows use (particle = sphere
-        # on the ONE path); asserts the particle-side row solves (lambda>0 + braked
-        # approach velocity) + two-run byte-identity of the coupling stream.
-        scenario/body_particle_coupling.cpp
-        # Body<->particle coupling against a HEIGHTFIELD: a particle dropped onto a
-        # cooked terrain grid emits a kNkSideParticle face contact (the SAME deep-sink
-        # SphereTriangleFace the rigid sphere-vs-heightfield handler uses) and rests at
-        # the surface instead of tunnelling through -- closes the heightfield arm that
-        # was a silent no-op stub (0 rows, 0 diagnostic); + two-run byte-identity.
-        scenario/body_particle_heightfield.cpp
         # Cloth <-> presser two-way coupling: a 576-particle XPBD cloth drapes over a
         # low static ridge, a rigid presser dips it (cloth Δz down + spring-back on
         # lift) and a dynamic presser is arrested by the cloth (body-side reaction
@@ -1301,9 +1248,6 @@ if(CMAKE_CUDA_COMPILER)
         # control flattens, elastic control stands); a scripted capsule press leaves
         # a >= 3 s persistent crater; particle state byte-identical run-to-run.
         scenario/mpm_granular.cpp
-        # Dynamic island solve == the static one-island-per-env schedule, bit-for-bit,
-        # in the contact->airborne (pos_iters>0) and multi-env mixed-contact regimes.
-        scenario/island_byte_identity.cpp
         scenario/pairdriven_rigid_release.cpp
         scenario/osc_passive_damping.cpp
         scenario/free_rigid_dynamics.cpp
@@ -2495,29 +2439,6 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
-    # --- Articulated contact rows + block-PGS solve (p01-F T5) --------------
-    add_executable(nuka_articulation_contact_rows_test
-        runtime/test_articulation_contact_rows.cpp
-    )
-
-    target_compile_definitions(nuka_articulation_contact_rows_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_articulation_contact_rows_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_articulation_contact_rows_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
     # --- v0.5 p02-A: differentiable single-step ABA reverse (FD ladder) -----
     add_executable(nuka_diffsim_aba_reverse_test
         diffsim/test_aba_reverse_fd.cpp
@@ -2708,36 +2629,6 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "fast_full")
 
-    # --- v0.5 p03 R3a: IFT-at-convergence contact gradient ------------------
-    # IFT analytic vs finite-difference through the REAL engine contact step
-    # (< 1e-3 rel, the PRIMARY oracle -- p02 is contact-free so there is no
-    # contact-tape to compare against), vs a dense Eigen::LDLT solve+distribute
-    # reference (< 1e-5, second oracle), and the D1 two-run byte-exact gate.
-    # Eigen is linked test-only.
-    add_executable(nuka_diffsim_ift_backward_test
-        diffsim/test_ift_vs_tape_backward.cpp
-    )
-
-    target_compile_definitions(nuka_diffsim_ift_backward_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_diffsim_ift_backward_test
-        PRIVATE
-            nuka_diffsim
-            nuka_articulation_gpu
-            nuka_articulation
-            nuka_core
-            nuka_phi
-            nuka_eigen_testonly
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_diffsim_ift_backward_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
     # --- v0.7 p08-C Channel 1 (§4.B): SDF-contact IFT d/dM, d/dJ ------------
     # The §4.B acceptance the v0.5 ift_runner DEFERRED. The FD PERTURBS actual
     # entries of M^-1 / J and RE-SOLVES the constraint system to convergence with
@@ -2822,50 +2713,6 @@ if(CMAKE_CUDA_COMPILER)
     # contact-recoil through the 18-wide chain-J survives via foot_ground_subsume +
     # h1_grasp_lift + articulation_contact_rows. go2-stance remainder -> M10.
 
-    # --- v0.8 C5c-1: floating-base go2 foot<->ground contact through the UNIFIED
-    # collision/contact spine (contact_stream_driver -> sphere x plane narrowphase
-    # -> EmitCompliantContactRows -> UnifiedSolve C5b-core ArticulationChainJ arm).
-    # PROVES the foot contact force recoils into the floating base via the 18-wide
-    # foot chain Jacobian (6 base + 12 leg): a structural base-column J check
-    # (roll=+lever_y, pitch=-lever_x, lin_z=1), the base-z recoil through the
-    # unified solve, a summed-normal-impulse ~ m_total*g*dt weight balance, and D1
-    # two-run byte-identity. Compiles the host contact_stream_driver.cpp directly
-    # (validated-not-wired: it is in no production lib); needs nuka_codegen for the
-    # generated collidable_registry.hpp.
-    add_executable(nuka_foot_ground_subsume_test
-        solver/test_foot_ground_subsume.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_foot_ground_subsume_test nuka_codegen)
-
-    target_compile_definitions(nuka_foot_ground_subsume_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_foot_ground_subsume_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_foot_ground_subsume_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            # M9 T11 re-point: the nk SolveRowsBlockIsland harness (sole solve path).
-            nuka_nk
-            nuka_phi2
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_foot_ground_subsume_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
 
     # --- v0.8 co-residence PEAK (commit 1/3): per-link/per-shape WORLD AABB
     # extraction from articulation FK (src/collision/link_aabb.hpp). The
@@ -2907,146 +2754,6 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "fast_full")
 
-    # --- v0.8 C5c-2: MJX-parity ACCEPTANCE for the foot-ground subsume.
-    # At a FIXED penetrating contact state (go2 feet pressed delta into a +Z
-    # ground plane, qpos fixed, qvel=0) one mjx.forward -> qacc is compared to
-    # the qacc Nuka produces through the UNIFIED contact pipeline (reuses the
-    # C5c-1 wiring). PRIMARY assertion: the BASE-6 qacc match (the foot contact
-    # force recoils into the floating base MJX-exactly). The MJX golden
-    # (go2_foot_contact_step.bin, generated via generate_mjx_golden.py --mode
-    # floating-contact-step) is a SOURCE TRANSLATION of the SAME go2_float.usda
-    # Nuka cooks, so both sides share M by construction. Single-step, NOT a
-    # rollout. Same host contact_stream_driver.cpp compile as the subsume test.
-    add_executable(nuka_foot_ground_mjx_parity_test
-        solver/test_foot_ground_mjx_parity.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_foot_ground_mjx_parity_test nuka_codegen)
-
-    target_compile_definitions(nuka_foot_ground_mjx_parity_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_foot_ground_mjx_parity_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_foot_ground_mjx_parity_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            # M4 re-point: the nk SolveRowsBlockIsland harness.
-            nuka_nk
-            nuka_phi2
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_foot_ground_mjx_parity_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.8 co-residence commit 3/3: THE GATE (the grasp crux). A go2
-    # articulation FOOT and a MOVABLE RIGID BODY box co-resident in ONE unified
-    # contact solve, BOTH reaction arms firing (foot=ArticulationChainJ, box=
-    # RigidInvMass) and the box GPU BodyState velocity actually changing. De-orphans
-    # commit 1 (link_aabb.hpp ExtractLinkShapeAabbs) + commit 2 (rigid_candidate_
-    # pairs.cu BuildArticulationRigidCandidatePairs) by driving the FULL stack:
-    # per-link AABB -> cross-type broadphase -> sphere x box narrowphase ->
-    # compliant rows -> UnifiedSolve. PRIMARY: kernel lambda vs the DOUBLE exact
-    # (A+R) solve of the co-resident system (J_foot M^-1 J_foot^T + box inv-mass).
-    # STRUCTURAL: box linear velocity changes (sign-checked away from the foot), the
-    # articulation qdot recoils (two-way), box angular ~0 (the linear-only-emitter
-    # grasp-blocker finding, reported). VALIDATED-NOT-WIRED. Links nuka_collision_gpu
-    # (rigid_candidate_pairs.cu) + compiles contact_stream_driver.cpp like the
-    # subsume/parity tests; needs nuka_codegen for the generated registry.
-    add_executable(nuka_foot_box_coresidence_test
-        solver/test_foot_box_coresidence.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_foot_box_coresidence_test nuka_codegen)
-
-    target_compile_definitions(nuka_foot_box_coresidence_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_foot_box_coresidence_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_foot_box_coresidence_test
-        PRIVATE
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            # M9 T11 re-point: the nk SolveRowsBlockIsland harness (sole solve path).
-            nuka_nk
-            nuka_phi2
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_foot_box_coresidence_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.8 W1b: the CO-RESIDENT FREE-BOX foot-contact STEP-0 MJX-parity
-    # capstone -- the box-side REALITY ANCHOR to MuJoCo for the unified co-resident
-    # contact path. A go2 FL foot penetrates a FREE rigid box; one mjx.forward gives
-    # the ground-truth qacc for the articulation base 6 + legs 12 AND the box 6 free
-    # DOFs. Nuka's unified pipeline (per-link AABB -> cross-type broadphase ->
-    # sphere x box narrowphase -> compliant rows -> UnifiedSolve) must reproduce the
-    # BOX 6-DOF qacc (PRIMARY) + the base-6 (SECONDARY, the C5c-2 anchor with the box
-    # present). The box mass+inertia are pinned to match MJX exactly (GATE 1). New
-    # golden go2_foot_box_contact_step.bin (generated, NOT hand-edited).
-    # VALIDATED-NOT-WIRED. Same dep set as nuka_foot_box_coresidence_test.
-    add_executable(nuka_foot_box_mjx_parity_test
-        solver/test_foot_box_mjx_parity.cpp
-        ${CMAKE_SOURCE_DIR}/src/collision/contact_stream_driver.cpp
-    )
-    add_dependencies(nuka_foot_box_mjx_parity_test nuka_codegen)
-
-    target_compile_definitions(nuka_foot_box_mjx_parity_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_foot_box_mjx_parity_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_foot_box_mjx_parity_test
-        PRIVATE
-            # M4 re-point: the nk SolveRowsBlockIsland harness.
-            nuka_nk
-            nuka_phi2
-            nuka_solver
-            nuka_constraint
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_collision_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_foot_box_mjx_parity_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
 
     # M9 T11: the coresident validated-not-wired test estate DELETED with the
     # legacy classes (the co-resident stepper / the batched union world / the grasp
@@ -3087,7 +2794,7 @@ if(CMAKE_CUDA_COMPILER)
     # validated-not-wired; rebuild on the nk world at M10 per the SG freeze.
 
     # M6 RE-POINT: the ParticleInvMass reaction arm on the nk path (the device-
-    # resident nk::SolveRowsBlockIsland, the union kUSlotParticleSphereBox class).
+    # resident nk::BlockDescentSolve, the union kUSlotParticleSphereBox class).
     # A particle presses a free rigid box -> both react two-way (momentum balance);
     # the box held on a static plane supports the particle through the
     # particle->box->plane chain in ONE unified solve; D1. (The legacy host
@@ -3101,7 +2808,7 @@ if(CMAKE_CUDA_COMPILER)
     # phase: a PBD particle system consumes unified manifolds + reacts TWO-WAY
     # M6 RE-POINT: a particle system co-steps against a rigid box through the ONE
     # unified row solve (nk::World, the kUSlotParticleSphereBox union class ->
-    # AssembleRows -> SolveRowsBlockIsland ParticleInvMass arm). The legacy host
+    # AssembleRows -> BlockDescentSolve ParticleInvMass arm). The legacy host
     # bridge (unified_costep.cpp, the M6 deletion target) is no longer consumed.
     # CASE A: multi-particle drop, TOTAL-energy non-increasing + settle + two-way.
     # CASE C: rest-on-box. CASE D: D1.

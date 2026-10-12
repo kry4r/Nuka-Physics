@@ -1631,8 +1631,6 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkBroadphaseOps();
     RegisterNkNarrowphaseSdfOps();
     RegisterNkAssembleRowsOps();
-    RegisterNkBuildSolveIslandsOps(); // dynamic connected-component solve schedule
-    RegisterNkSolveRowsOps();
     RegisterNkBlockDescentOps();
     RegisterNkParticleOps();
     RegisterNkVertexBlockOps();

@@ -51,8 +51,7 @@ double RelErr(double a, double b) {
 // an oracle that does NOT share the module's AssembleDelassus / CholeskySolve, or
 // a transpose/index bug in either would pass on both sides. So we assemble
 // A = J M^-1 J^T and re-solve A lambda = r with EIGEN's LDLT (the exact island
-// solve == the converged PGS/CG fixed point; the same dense-reference pattern as
-// test_ift_vs_tape_backward). Analytical and FD now share ONLY the inputs + the
+// solve == the converged CG fixed point). Analytical and FD now share ONLY the inputs + the
 // linearization-point lambda (also Eigen-sourced).
 Eigen::MatrixXd EigenJ(const SdfContactDenseSystem& s) {
     Eigen::MatrixXd J(s.n, s.dof);

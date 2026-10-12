@@ -34,8 +34,7 @@ def relevant_environment(environment):
     prefixes = ("NUKA_", "PHI_", "CUDA_", "NVIDIA_", "NV_", "CUBLAS_", "CUDNN_",
                 "PTXAS_", "LD_", "OMP_", "TBB_", "OPENBLAS_", "GL_", "EGL_", "VK_")
     names = ("PATH", "PYTHONPATH", "DISPLAY", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES",
-             "NUKA_BLOCK_DESCENT", "NUKA_BLOCK_DESCENT_ITERATIONS",
-             "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS", "NUKA_SOLVER_VEL_TOLERANCE")
+             "NUKA_BLOCK_DESCENT_ITERATIONS", "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS")
     return {key: environment.get(key) for key in sorted(set(names) | {
         key for key in environment if key.startswith(prefixes)})}
 
@@ -201,9 +200,8 @@ def budget_evidence(configuration, requested, environment):
                configuration.get("vel_iters") == requested and solver.get("request_explicit") is True)
     recorded = solver.get("environment", {})
     matches &= all(recorded.get(key) == environment.get(key) for key in
-                   ("NUKA_BLOCK_DESCENT", "NUKA_BLOCK_DESCENT_ITERATIONS",
-                    "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS", "NUKA_SOLVER_VEL_TOLERANCE"))
-    expected = requested if solver.get("mode") == "row_island" or solver.get("velocity_iterations_override") is True else None
+                   ("NUKA_BLOCK_DESCENT_ITERATIONS", "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS"))
+    expected = requested if solver.get("velocity_iterations_override") is True else None
     if solver.get("mode") == "block_descent" and expected is None:
         value = environment.get("NUKA_BLOCK_DESCENT_ITERATIONS")
         if value is not None:
@@ -433,7 +431,7 @@ def main():
                             "wall_range_ms": [min(wall), max(wall)] if wall else None,
                             "final_state_digests": states, "wrench_trace_digests": wrenches,
                             "wrench_trace_available": bool(wrenches),
-                            "island_schedule_digests": schedules, "island_schedule_available": bool(schedules),
+                            "workload_digests": schedules, "workload_available": bool(schedules),
                             "input_configuration_digests": identities,
                             "cross_process_d1": cross_process})
     report = {"schema_version": 2, "source_id": args.source_id, "binary_sha256": binary_hash,

@@ -18,7 +18,6 @@
 namespace nuka::nk {
 
 // The fixed-capacity solve schedule depends on immutable topology and survives reset.
-class SolveSchedule;
 
 // Per-op step outcome — World surfaces the status of EVERY dispatched op so a
 // caller can see which ops are unimplemented (Unsupported) vs failed.
@@ -66,12 +65,11 @@ public:
     math::Vec3 Gravity() const { return {cfg_.gravity[0], cfg_.gravity[1], cfg_.gravity[2]}; }
 
     // Changes contact exchange frequency while retaining material iterations and interval length.
-    phi::Status SetCouplingPasses(uint32_t passes);
 
     // Changes the active solve iteration budget (1..65535) while retaining the interval length.
     phi::Status SetVelocityIterations(uint32_t iterations);
     uint32_t VelocityIterations() const {
-        return pipeline_ ? pipeline_->VelocityIterations(cfg_.vel_iters) : cfg_.vel_iters;
+        return pipeline_ ? pipeline_->VelocityIterations() : cfg_.vel_iters;
     }
 
     // Update one template link's spatial inertia in every environment without reallocating.

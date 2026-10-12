@@ -245,12 +245,6 @@ struct LbvhQueryPairsParams {
     uint64_t workspace_bytes;
 };
 
-// Byte size of the pre-allocated island_cub_temp the BuildSolveIslands op draws its
-// cub radix-sort temp storage from, for `total_rows` row slots. Host-callable
-// (defined in build_islands.cu) so the World sizes the field BEFORE allocation ->
-// no mid-capture cudaMalloc. 0 for 0 rows.
-uint64_t IslandSortScratchBytes(uint32_t total_rows);
-
 // Byte size of the pre-allocated pair_sort_scratch the LbvhQueryPairs op draws its
 // canonicalizing cub radix sort (u64 key -> u32 slot perm) + per-env prefix + pair
 // snapshot from. Host-callable (defined in broadphase.cu) so the World sizes the
@@ -260,22 +254,6 @@ uint64_t LbvhSortScratchBytes(uint32_t env_count, uint32_t bodies_per_env);
 uint64_t ContactCacheScratchBytes(uint32_t point_count, uint32_t env_count);
 uint64_t OgcOrderScratchBytes(uint32_t slot_capacity, uint32_t env_count);
 uint64_t ContactIndexScratchBytes(uint32_t row_count, uint32_t env_count);
-uint64_t SolverVelocityScratchBytes(uint32_t body_count, uint32_t particle_count,
-                                    uint32_t grid_count);
-
-// Dynamic solve-island build (connected components over the active contact rows).
-// All launch geometry is a fixed function of the capacities (graph-capturable); the
-// op partitions the rows by union-find each step and emits the device schedule the
-// SolveRowsBlockIsland op reads (island_rows/island_quads/island_tiles/island_count).
-struct BuildSolveIslandsParams {
-    uint32_t family;             // kContactFamily* (PairDriven runs; else early-exit)
-    uint32_t env_count;
-    uint32_t rows_per_env;       // row-slot capacity per env
-    uint32_t articulation_count; // global artic count (== artics_per_env * env_count)
-    uint32_t bodies_per_env;     // movable rigid body count per env
-    uint32_t particles_per_env;  // particle count per env
-    uint32_t grid_nodes_per_env = 0u;
-};
 
 // All MPM operations share one physical interval and environment-private grid.
 // Prediction owns grid initialization; commit alone advances particles and history.
@@ -642,72 +620,6 @@ struct AssembleRowsParams {
     uint32_t point_endpoint_terms_per_env = 0u;
     VertexBlockLayout vertex_blocks{};
 };
-
-// Spec-fixed semantic fields : {dt, vel_iters, pos_iters}. The fields BELOW
-// the spec triplet are the precedent LAUNCH-GEOMETRY transport (op_schema
-// header note: "ops carry the launch-geometry counts in their params because
-// ModelView/DataView are pure pointer aggregates") plus the per-family solver
-// constants that are Model properties (the fused family's legacy knobs). They
-// are filled by Pipeline::Build from the Model — the three semantic fields
-// keep their spec meaning and position.
-struct SolveRowsBlockIslandParams {
-    float dt;
-    uint16_t vel_iters;
-    uint16_t pos_iters;
-    // -- appended launch geometry + Model-derived solver constants ------
-    uint32_t family;             // kContactFamily*
-    uint32_t total_islands;      // union family: schedule island count (grid x)
-    uint32_t max_dof;            // dof_stride == the M tile stride
-    uint32_t env_count;
-    uint32_t articulation_count;
-    uint32_t rows_per_env;       // row slots per env (union family)
-    uint32_t contact_rows_per_env; // fixed contact footprint before joint rows
-    uint32_t joint_limit_rows_per_env;
-    uint32_t base_link_count;    // links per env (qdot scatter)
-    uint32_t total_body_count;   // env-major rigid body count
-    // Fused-family legacy knobs (Model properties; unused by the union family):
-    float    friction_coefficient;
-    float    baumgarte_max_velocity;
-    // (: the FUSED-family `apply_implicit_damping` knob was REMOVED — the
-    // implicit joint-damping seed moved out of the deleted FUSED solve kernel
-    // into the standalone NkOp::ApplyImplicitDamping op; nothing in the solve op
-    // reads it any more.)
-    // The solver's per-articulation contact-slot STRIDE (slot_base = articulation *
-    // contact_slots_per_artic), the data-driven quotient max_contacts_per_env /
-    // articulations_per_env bounded by kMaxContactsPerArtic. At K<=1 ==
-    // kMaxFootContactsPerEnv (4) -> byte-identical; at K>1 the grown stride gives
-    // each co-resident articulation room for end-effector + body-terrain +
-    // inter-articulation rows in one block.
-    uint32_t contact_slots_per_artic;
-    // Split-impulse position pass (PairDriven only; pos_iters>0). total_particle_count
-    // sizes the pseudo-velocity memsets; beta/slop tune the geometric projection
-    // (target pseudo separating vel = beta*max(depth-slop,0)/dt).
-    uint32_t total_particle_count;
-    float    pos_beta;
-    float    pos_slop;
-    // Sweep convergence bound in velocity units (m/s); 0 sweeps the full budget.
-    float    vel_tolerance;
-    // Validation hook (NUKA_FORCE_STATIC_ISLANDS): run the conservative cook-time
-    // one-island-per-env schedule instead of the dynamic CC pass, to A/B them. 0 == off.
-    uint32_t force_static_islands;
-    uint32_t continue_impulses = 0u; // Continue the same assembled rows without reapplying impulses.
-    uint32_t measure_contact_residual = 0u;
-    uint32_t total_grid_count = 0u;
-    uint64_t workspace_bytes = 0u;
-    VertexBlockLayout vertex_blocks{};
-    // Nonzero when articulations solve with the reduced mass and coupled inverse.
-    uint32_t mimic_couplings = 0u;
-    // A later pass of this step projects positions; penetrating rows still go live here.
-    uint32_t position_later = 0u;
-    // Rechecks the rows the previous pass left idle and sweeps only if the solved velocity
-    // moves one beyond the tolerance.
-    uint32_t verify_idle = 0u;
-    uint32_t measure_vertex_audit = 0u;
-};
-
-// Word count of the solve_color_scratch field the dynamic island solve colors live rows in.
-// Host-callable (defined in solve_rows.cu) so the World sizes it before allocation.
-uint64_t SolveColorScratchWords(const SolveRowsBlockIslandParams& params);
 
 struct BlockDescentSolveParams {
     float dt;

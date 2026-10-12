@@ -4,7 +4,7 @@
 // Proves the GENERAL mixed-island solver: a detected PairDriven manifold
 // (broadphase LBVH -> cvx narrowphase -> the unified contact buffer) becomes a
 // COUPLED two-sided NkRow assembled by OpAssembleRowsPairDriven (S1/S2/S5) and
-// solved by the generalized SolveRowsBlockIsland (S3 per-articulation qdot tiles
+// solved by the generalized BlockDescentSolve (S3 per-articulation qdot tiles
 // + S4 two-key schedule), scattering reaction into BOTH sides. NO special-casing:
 // a free rigid body, an articulation link, and a static collidable are all just
 // physics bodies fed into the EXISTING coupling engine (SolveUnionRowWarp).

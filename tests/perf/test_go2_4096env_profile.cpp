@@ -48,7 +48,6 @@ const char* OpName(nuka::phi::NkOp op) {
         case NkOp::NarrowphaseHeightfield: return "NarrowphaseHeightfield";
         case NkOp::ContactTangentBasis: return "ContactTangentBasis";
         case NkOp::AssembleRows: return "AssembleRows";
-        case NkOp::SolveRowsBlockIsland: return "SolveRowsBlockIsland";
         case NkOp::ReadoutContactWrench: return "ReadoutContactWrench";
         case NkOp::SyncLinkBodyPose: return "SyncLinkBodyPose";
         default: return "<other>";

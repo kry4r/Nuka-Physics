@@ -28,28 +28,6 @@ Backend& Device() {
     return backend;
 }
 
-class IslandMode {
-public:
-    explicit IslandMode(bool force_static) {
-        const char* previous = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
-        had_value_ = previous != nullptr;
-        if (previous) previous_ = previous;
-        Set(force_static ? "1" : "0");
-    }
-    ~IslandMode() { Set(had_value_ ? previous_.c_str() : nullptr); }
-private:
-    static void Set(const char* value) {
-#ifdef _WIN32
-        _putenv_s("NUKA_FORCE_STATIC_ISLANDS", value ? value : "");
-#else
-        if (value) setenv("NUKA_FORCE_STATIC_ISLANDS", value, 1);
-        else unsetenv("NUKA_FORCE_STATIC_ISLANDS");
-#endif
-    }
-    bool had_value_ = false;
-    std::string previous_;
-};
-
 void AddBody(nk::Model& model, uint32_t kind, Vec3 position, float size, float mass) {
     nk::Model::BodyInit body;
     body.pose = Transform::Identity();
@@ -128,34 +106,31 @@ TEST(PairDrivenRigidRelease, ManifoldPointsStayOnTheContactingGeometry) {
 }
 
 // Physical impulses and geometric push-out preserve the center of mass without
-// external forces, for either body order and both island schedules.
-TEST(PairDrivenRigidRelease, SeparationPreservesCenterOfMassForBothIslandSchedules) {
+// external forces, for either body order.
+TEST(PairDrivenRigidRelease, SeparationPreservesCenterOfMass) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
-    for (bool force_static : {false, true}) {
-        IslandMode mode(force_static);
-        for (bool reverse : {false, true}) {
-            SCOPED_TRACE(::testing::Message() << "static=" << force_static << " reverse=" << reverse);
-            nk::Model model;
-            AddBody(model, nuka::collision::kShapeSphere,
-                    {reverse ? 0.09f : -0.09f, 0, 0}, 0.1f, reverse ? 0.3f : 0.2f);
-            AddBody(model, nuka::collision::kShapeSphere,
-                    {reverse ? -0.09f : 0.09f, 0, 0}, 0.1f, reverse ? 0.2f : 0.3f);
-            Finish(model);
-            nk::World world(std::move(model), 2u, backend.device, backend.backend, Config());
-            ASSERT_TRUE(world.Ready());
-            for (uint32_t step = 0; step < 20u; ++step) ASSERT_TRUE(world.Step().AllOk());
-            const auto poses = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
-            const auto velocities = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
-            for (uint32_t env = 0; env < 2u; ++env) {
-                const uint32_t left = env * 2u + (reverse ? 1u : 0u);
-                const uint32_t right = env * 2u + (reverse ? 0u : 1u);
-                const float center = (0.2f * poses[left].position.x + 0.3f * poses[right].position.x) / 0.5f;
-                EXPECT_NEAR(center, 0.018f, 2.0e-6f) << "env=" << env;
-                EXPECT_NEAR(0.2f * velocities[left].x + 0.3f * velocities[right].x,
-                            0.0f, 2.0e-6f);
-                EXPECT_GT(poses[right].position.x - poses[left].position.x, 0.199f);
-            }
+    for (bool reverse : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "reverse=" << reverse);
+        nk::Model model;
+        AddBody(model, nuka::collision::kShapeSphere,
+                {reverse ? 0.09f : -0.09f, 0, 0}, 0.1f, reverse ? 0.3f : 0.2f);
+        AddBody(model, nuka::collision::kShapeSphere,
+                {reverse ? -0.09f : 0.09f, 0, 0}, 0.1f, reverse ? 0.2f : 0.3f);
+        Finish(model);
+        nk::World world(std::move(model), 2u, backend.device, backend.backend, Config());
+        ASSERT_TRUE(world.Ready());
+        for (uint32_t step = 0; step < 20u; ++step) ASSERT_TRUE(world.Step().AllOk());
+        const auto poses = Read<Transform>(world, nk::FieldId::BodyPose, 4u);
+        const auto velocities = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+        for (uint32_t env = 0; env < 2u; ++env) {
+            const uint32_t left = env * 2u + (reverse ? 1u : 0u);
+            const uint32_t right = env * 2u + (reverse ? 0u : 1u);
+            const float center = (0.2f * poses[left].position.x + 0.3f * poses[right].position.x) / 0.5f;
+            EXPECT_NEAR(center, 0.018f, 2.0e-6f) << "env=" << env;
+            EXPECT_NEAR(0.2f * velocities[left].x + 0.3f * velocities[right].x,
+                        0.0f, 2.0e-6f);
+            EXPECT_GT(poses[right].position.x - poses[left].position.x, 0.199f);
         }
     }
 }
@@ -224,7 +199,7 @@ TEST(PairDrivenRigidRelease, ContactReadoutMatchesSolvedRowsAcrossEnvironments) 
 }
 
 // Implicit damping must not reverse or amplify the incoming normal velocity.
-// Scalar and block contacts must agree under either island schedule.
+// Scalar and block contacts must agree.
 TEST(PairDrivenRigidRelease, ImplicitDampingRemainsStableForScalarAndBlockContacts) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
@@ -235,92 +210,84 @@ TEST(PairDrivenRigidRelease, ImplicitDampingRemainsStableForScalarAndBlockContac
         for (float mass : {0.2f, 2.0f}) {
             float reference = 0.0f;
             bool have_reference = false;
-            for (bool force_static : {false, true}) {
-                IslandMode mode(force_static);
-                for (uint32_t condim : {1u, 3u}) {
-                        SCOPED_TRACE(::testing::Message() << "static=" << force_static
-                            << " condim=" << condim << " damping=" << damping
-                            << " mass=" << mass);
-                        nk::Model model;
-                        AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
-                        AddBody(model, nuka::collision::kShapeSphere,
-                                {0, 0, 0.0995f}, 0.1f, mass);
-                        model.body_init[1].linear_velocity = {0, 0, approach};
-                        nk::ContactProfileV1 profile;
-                        profile.condim = condim;
-                        profile.solref[0] = 0.0f;
-                        profile.solref[1] = -damping * impedance;
-                        profile.solimp[0] = profile.solimp[1] = impedance;
-                        model.material_buckets.emplace_back(profile);
-                        Finish(model);
-                        model.capacities.num_material_buckets = 1u;
-                        auto config = Config();
-                        config.dt = dt;
-                        config.pos_iters = 0u;
-                        nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
-                        ASSERT_TRUE(world.Ready());
-                        ASSERT_TRUE(world.Step().AllOk());
-                        const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
-                        for (uint32_t env = 0; env < 2u; ++env) {
-                            const float actual = velocity[env * 2u + 1u].z;
-                            EXPECT_GE(actual, approach - 3.0e-6f);
-                            EXPECT_LE(actual, 3.0e-6f);
-                            if (have_reference) EXPECT_NEAR(actual, reference, 3.0e-6f);
-                            else {
-                                reference = actual;
-                                have_reference = true;
-                            }
+            for (uint32_t condim : {1u, 3u}) {
+                    SCOPED_TRACE(::testing::Message() << "condim=" << condim << " damping=" << damping
+                        << " mass=" << mass);
+                    nk::Model model;
+                    AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
+                    AddBody(model, nuka::collision::kShapeSphere,
+                            {0, 0, 0.0995f}, 0.1f, mass);
+                    model.body_init[1].linear_velocity = {0, 0, approach};
+                    nk::ContactProfileV1 profile;
+                    profile.condim = condim;
+                    profile.solref[0] = 0.0f;
+                    profile.solref[1] = -damping * impedance;
+                    profile.solimp[0] = profile.solimp[1] = impedance;
+                    model.material_buckets.emplace_back(profile);
+                    Finish(model);
+                    model.capacities.num_material_buckets = 1u;
+                    auto config = Config();
+                    config.dt = dt;
+                    config.pos_iters = 0u;
+                    nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+                    ASSERT_TRUE(world.Ready());
+                    ASSERT_TRUE(world.Step().AllOk());
+                    const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+                    for (uint32_t env = 0; env < 2u; ++env) {
+                        const float actual = velocity[env * 2u + 1u].z;
+                        EXPECT_GE(actual, approach - 3.0e-6f);
+                        EXPECT_LE(actual, 3.0e-6f);
+                        if (have_reference) EXPECT_NEAR(actual, reference, 3.0e-6f);
+                        else {
+                            reference = actual;
+                            have_reference = true;
                         }
-                }
+                    }
             }
         }
     }
 }
 
 // Soft contact must retain incoming velocity and scale its impulse with mass.
-// The analytic decay includes external gravity and both island schedules.
+// The analytic decay includes external gravity.
 TEST(PairDrivenRigidRelease, CompliantDampingPreservesReferenceVelocityAcrossMasses) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     constexpr float approach = -0.2f;
     constexpr float dt = 0.002f;
     constexpr float impedance = 0.95f;
-    for (bool force_static : {false, true}) {
-        IslandMode mode(force_static);
-        for (uint32_t condim : {1u, 3u}) {
-            for (float damping : {0.0f, 100.0f, 10000.0f}) {
-                for (float mass : {0.2f, 2.0f}) {
-                    for (float gravity : {0.0f, -9.81f}) {
-                        SCOPED_TRACE(::testing::Message() << "static=" << force_static
-                            << " condim=" << condim << " damping=" << damping
-                            << " mass=" << mass << " gravity=" << gravity);
-                        nk::Model model;
-                        AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
-                        AddBody(model, nuka::collision::kShapeSphere,
-                                {0, 0, 0.0995f}, 0.1f, mass);
-                        model.body_init[1].linear_velocity = {0, 0, approach};
-                        nk::ContactProfileV1 profile;
-                        profile.condim = condim;
-                        profile.solref[0] = 0.0f;
-                        profile.solref[1] = -damping * impedance;
-                        profile.solimp[0] = profile.solimp[1] = impedance;
-                        model.material_buckets.emplace_back(profile);
-                        Finish(model);
-                        model.capacities.num_material_buckets = 1u;
-                        auto config = Config();
-                        config.dt = dt;
-                        config.gravity[2] = gravity;
-                        config.pos_iters = 0u;
-                        nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
-                        ASSERT_TRUE(world.Ready());
-                        ASSERT_TRUE(world.Step().AllOk());
-                        const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
-                        const float expected =
-                            (approach + (1.0f - impedance) * gravity * dt) /
-                            (1.0f + impedance * damping * dt);
-                        for (uint32_t env = 0; env < 2u; ++env) {
-                            EXPECT_NEAR(velocity[env * 2u + 1u].z, expected, 3.0e-6f);
-                        }
+    for (uint32_t condim : {1u, 3u}) {
+        for (float damping : {0.0f, 100.0f, 10000.0f}) {
+            for (float mass : {0.2f, 2.0f}) {
+                for (float gravity : {0.0f, -9.81f}) {
+                    SCOPED_TRACE(::testing::Message() << "condim=" << condim << " damping=" << damping
+                        << " mass=" << mass << " gravity=" << gravity);
+                    nk::Model model;
+                    AddBody(model, nuka::collision::kShapePlane, {0, 0, 0}, 0.0f, 0.0f);
+                    AddBody(model, nuka::collision::kShapeSphere,
+                            {0, 0, 0.0995f}, 0.1f, mass);
+                    model.body_init[1].linear_velocity = {0, 0, approach};
+                    nk::ContactProfileV1 profile;
+                    profile.condim = condim;
+                    profile.solref[0] = 0.0f;
+                    profile.solref[1] = -damping * impedance;
+                    profile.solimp[0] = profile.solimp[1] = impedance;
+                    model.material_buckets.emplace_back(profile);
+                    Finish(model);
+                    model.capacities.num_material_buckets = 1u;
+                    auto config = Config();
+                    config.dt = dt;
+                    config.gravity[2] = gravity;
+                    config.pos_iters = 0u;
+                    nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+                    ASSERT_TRUE(world.Ready());
+                    ASSERT_TRUE(world.Step().AllOk());
+                    const auto velocity = Read<Vec3>(world, nk::FieldId::BodyLinearVelocity, 4u);
+                    const float expected =
+                        (approach + (1.0f - impedance) * gravity * dt) /
+                        (1.0f + impedance * damping * dt);
+                    for (uint32_t env = 0; env < 2u; ++env) {
+                        EXPECT_NEAR(velocity[env * 2u + 1u].z, expected, 3.0e-6f);
                     }
                 }
             }

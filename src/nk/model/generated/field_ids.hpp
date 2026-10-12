@@ -120,9 +120,6 @@ enum class FieldId : uint16_t {
     SdfCellKeys,  // sdf_cell_keys (per:scalar arena:persistent owner:model count:max_sdf_cells)
     SdfCellValues,  // sdf_cell_values (per:scalar arena:persistent owner:model count:max_sdf_cells)
     SdfCellGradients,  // sdf_cell_gradients (per:scalar arena:persistent owner:model count:max_sdf_cells)
-    IslandRowOffsets,  // island_row_offsets (per:scalar arena:persistent owner:model elem:4 count:schedule_island_elements)
-    IslandColorSegments,  // island_color_segments (per:scalar arena:persistent owner:model elem:2 count:schedule_color_elements)
-    RowOrder,  // row_order (per:scalar arena:persistent owner:model count:schedule_row_elements)
     ParticlePrevPos,  // particle_prev_pos (per:particle arena:persistent owner:data)
     ParticleVel,  // particle_vel (per:particle arena:persistent owner:data flags:[diff])
     ParticleInvMass,  // particle_inv_mass (per:particle arena:persistent owner:data flags:[param])
@@ -152,7 +149,6 @@ enum class FieldId : uint16_t {
     RowCjLinkB,  // row_cj_link_b (per:row_slot arena:scratch owner:data)
     RowCjPointB,  // row_cj_point_b (per:row_slot arena:scratch owner:data)
     RowCjDirB,  // row_cj_dir_b (per:row_slot arena:scratch owner:data)
-    PdSolveScratch,  // pd_solve_scratch (per:row_slot arena:scratch owner:data elem:3)
     RowPenetration,  // row_penetration (per:row_slot arena:scratch owner:data)
     QdotPseudo,  // qdot_pseudo (per:link arena:scratch owner:data)
     LinkVelocityPseudo,  // link_velocity_pseudo (per:link arena:scratch owner:data)
@@ -187,16 +183,6 @@ enum class FieldId : uint16_t {
     GridBodyOwner,  // grid_body_owner (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     MpmBodyReaction,  // mpm_body_reaction (per:body arena:scratch owner:data flags:[readout])
     MpmBodyAngReaction,  // mpm_body_ang_reaction (per:body arena:scratch owner:data flags:[readout])
-    CcParent,  // cc_parent (per:row_slot arena:scratch owner:data)
-    CcRoot,  // cc_root (per:row_slot arena:scratch owner:data)
-    CcArticFirst,  // cc_artic_first (per:articulation arena:scratch owner:data)
-    CcBodyFirst,  // cc_body_first (per:body arena:scratch owner:data)
-    CcParticleFirst,  // cc_particle_first (per:particle arena:scratch owner:data)
-    IslandRootSorted,  // island_root_sorted (per:row_slot arena:scratch owner:data)
-    IslandRows,  // island_rows (per:row_slot arena:scratch owner:data)
-    IslandQuads,  // island_quads (per:row_slot arena:scratch owner:data elem:4)
-    IslandCount,  // island_count (per:scalar arena:scratch owner:data count:1)
-    IslandCubTemp,  // island_cub_temp (per:scalar arena:scratch owner:data count:island_cub_temp_bytes)
     JointFrictionloss,  // joint_frictionloss (per:link arena:persistent owner:model flags:[param])
     BodyCollidableLink,  // body_collidable_link (per:body arena:persistent owner:model)
     BodyCollidableLocal,  // body_collidable_local (per:body arena:persistent owner:model)
@@ -286,7 +272,6 @@ enum class FieldId : uint16_t {
     ParticlePlasticF,  // particle_plastic_F (per:particle arena:persistent owner:data elem:9)
     SnapshotParticlePlasticF,  // snapshot_particle_plastic_F (per:particle arena:persistent owner:data elem:9)
     GridInvMass,  // grid_inv_mass (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
-    CcGridFirst,  // cc_grid_first (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     GridContactCount,  // grid_contact_count (per:scalar arena:scratch owner:data count:particles_per_env*env_count)
     GridContactOffset,  // grid_contact_offset (per:scalar arena:scratch owner:data count:particles_per_env*env_count)
     UcontactLaw,  // ucontact_law (per:contact_slot arena:scratch owner:data)
@@ -299,7 +284,6 @@ enum class FieldId : uint16_t {
     MpmBoundaryMoment,  // mpm_boundary_moment (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count flags:[readout])
     StepMpmBoundaryImpulse,  // step_mpm_boundary_impulse (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count)
     StepMpmBoundaryMoment,  // step_mpm_boundary_moment (per:scalar arena:scratch owner:data count:mpm_boundary_count*env_count)
-    SolverVelocityScratch,  // solver_velocity_scratch (per:scalar arena:scratch owner:data count:solver_velocity_scratch_bytes)
     VelocityTarget,  // velocity_target (per:link arena:persistent owner:data flags:[param])
     AccelerationTarget,  // acceleration_target (per:link arena:persistent owner:data flags:[param])
     ActuatorNoloadSpeed,  // actuator_noload_speed (per:link arena:persistent owner:data flags:[param])
@@ -340,7 +324,6 @@ enum class FieldId : uint16_t {
     ContactSolveCounts,  // contact_solve_counts (per:env arena:scratch owner:data elem:2 flags:[readout])
     ContactSolveWorstTerms,  // contact_solve_worst_terms (per:env arena:scratch owner:data elem:160 flags:[readout])
     PairSampleChunks,  // pair_sample_chunks (per:scalar arena:scratch owner:data count:pair_sample_chunk_words)
-    SolveColorScratch,  // solve_color_scratch (per:scalar arena:scratch owner:data count:solve_color_scratch_words)
     BlockDescentScratch,  // block_descent_scratch (per:scalar arena:scratch owner:data count:block_descent_scratch_words)
     VbdElements,  // vbd_elements (per:scalar arena:persistent owner:model count:vbd_elements_per_env)
     VbdIncidenceOffsets,  // vbd_incidence_offsets (per:scalar arena:persistent owner:model count:vbd_vertices_per_env+1)
@@ -553,9 +536,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "sdf_cell_keys",
     "sdf_cell_values",
     "sdf_cell_gradients",
-    "island_row_offsets",
-    "island_color_segments",
-    "row_order",
     "particle_prev_pos",
     "particle_vel",
     "particle_inv_mass",
@@ -585,7 +565,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "row_cj_link_b",
     "row_cj_point_b",
     "row_cj_dir_b",
-    "pd_solve_scratch",
     "row_penetration",
     "qdot_pseudo",
     "link_velocity_pseudo",
@@ -620,16 +599,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "grid_body_owner",
     "mpm_body_reaction",
     "mpm_body_ang_reaction",
-    "cc_parent",
-    "cc_root",
-    "cc_artic_first",
-    "cc_body_first",
-    "cc_particle_first",
-    "island_root_sorted",
-    "island_rows",
-    "island_quads",
-    "island_count",
-    "island_cub_temp",
     "joint_frictionloss",
     "body_collidable_link",
     "body_collidable_local",
@@ -719,7 +688,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_plastic_F",
     "snapshot_particle_plastic_F",
     "grid_inv_mass",
-    "cc_grid_first",
     "grid_contact_count",
     "grid_contact_offset",
     "ucontact_law",
@@ -732,7 +700,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "mpm_boundary_moment",
     "step_mpm_boundary_impulse",
     "step_mpm_boundary_moment",
-    "solver_velocity_scratch",
     "velocity_target",
     "acceleration_target",
     "actuator_noload_speed",
@@ -773,7 +740,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_solve_counts",
     "contact_solve_worst_terms",
     "pair_sample_chunks",
-    "solve_color_scratch",
     "block_descent_scratch",
     "vbd_elements",
     "vbd_incidence_offsets",

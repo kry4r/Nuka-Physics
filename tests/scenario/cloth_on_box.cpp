@@ -4,7 +4,7 @@
 // box top instead of tunnelling through it. The cloth particles are spheres of
 // d_min/2 gathered from the SAME body LBVH the rigid narrowphase uses; the box is
 // an analytic kKindBox row (amf::SphereBox, no EPA dead band). No cloth-specific
-// contact code -- cloth rides path (a) (body<->particle rows -> SolveRowsBlockIsland).
+// contact code -- cloth rides path (a) (body<->particle rows -> BlockDescentSolve).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>

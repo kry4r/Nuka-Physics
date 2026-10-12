@@ -632,87 +632,6 @@ struct XpbdAcceptance {
     }
 };
 
-Json IslandWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_t step) {
-    const auto& caps = world.GetModel().capacities;
-    uint32_t island_count = 0u, active_count = 0u;
-    uint64_t articulation_sides = 0u;
-    for (const auto& row : rows) {
-        if (!(row.flags & nk::nk_row_flags::kActive)) continue;
-        ++active_count;
-        articulation_sides += (row.a.kind == nk::kNkSideArtic) + (row.b.kind == nk::kNkSideArtic);
-    }
-    fixture::Require(world.GetData().DownloadField(nk::FieldId::IslandCount,
-                     &island_count, sizeof(island_count)), "island count download failed");
-    fixture::Require(island_count <= active_count, "island count exceeds active rows");
-    std::vector<std::array<uint32_t, 4>> islands(island_count);
-    std::vector<uint32_t> order(active_count);
-    if (island_count != 0u)
-        fixture::Require(world.GetData().DownloadField(nk::FieldId::IslandQuads, islands.data(),
-                         islands.size() * sizeof(islands.front())), "island span download failed");
-    if (active_count != 0u)
-        fixture::Require(world.GetData().DownloadField(nk::FieldId::IslandRows, order.data(),
-                         order.size() * sizeof(uint32_t)), "island rows download failed");
-    std::vector<bool> visited(rows.size(), false);
-    uint32_t visited_count = 0u, scheduled_count = 0u, articulation_islands = 0u;
-    std::map<uint32_t, uint64_t> row_histogram, articulation_row_histogram, tree_histogram;
-    for (const auto& island : islands) {
-        const auto [offset, count, flags, env] = island;
-        fixture::Require(env < caps.env_count && count != 0u &&
-                         uint64_t{offset} + count <= order.size(), "invalid island span");
-        std::set<uint32_t> trees;
-        const auto visit = [&](uint32_t id) {
-            fixture::Require(id < rows.size() && id / caps.max_rows_per_env == env && !visited[id] &&
-                             (rows[id].flags & nk::nk_row_flags::kActive), "invalid island row ownership");
-            visited[id] = true;
-            ++visited_count;
-            for (const auto& side : {rows[id].a, rows[id].b}) {
-                if (side.kind == nk::kNkSideArtic) trees.insert(side.index);
-            }
-        };
-        for (uint32_t i = 0u; i < count; ++i) {
-            const uint32_t id = order[offset + i];
-            fixture::Require(id < rows.size() && !(rows[id].flags & nk::nk_row_flags::kBlockTangent) &&
-                             (i == 0u || order[offset + i - 1u] < id), "invalid island row ownership or order");
-            visit(id);
-            ++scheduled_count;
-            if (rows[id].flags & nk::nk_row_flags::kBlockNormal) {
-                for (uint32_t tangent = 1u; tangent <= 2u; ++tangent) {
-                    const uint32_t spoke = id + tangent * rows[id].group_normal_count;
-                    fixture::Require(spoke < rows.size() &&
-                        (rows[spoke].flags & nk::nk_row_flags::kBlockTangent), "invalid friction block ownership");
-                    visit(spoke);
-                }
-            }
-        }
-        fixture::Require(((flags & 1u) != 0u) == !trees.empty(), "invalid island articulation flag");
-        ++row_histogram[count];
-        ++tree_histogram[static_cast<uint32_t>(trees.size())];
-        if (!trees.empty()) { ++articulation_islands; ++articulation_row_histogram[count]; }
-    }
-    fixture::Require(visited_count == active_count, "active rows missing from island schedule");
-    std::sort(islands.begin(), islands.end(), [&](const auto& a, const auto& b) {
-        return order[a[0]] < order[b[0]];
-    });
-    uint64_t hash = 14695981039346656037ull;
-    for (const auto& island : islands) {
-        hash = UpdateDigest(hash, island.data() + 1u, 3u * sizeof(uint32_t));
-        hash = UpdateDigest(hash, order.data() + island[0], island[1] * sizeof(uint32_t));
-    }
-    Json result = Json::Object();
-    result.Set("step", Json::Int(step));
-    result.Set("schedule_type", Json::Str("island"));
-    result.Set("active_rows", Json::Int(active_count));
-    result.Set("scheduled_contact_blocks_and_rows", Json::Int(scheduled_count));
-    result.Set("articulation_sides", Json::Int(articulation_sides));
-    result.Set("islands", Json::Int(island_count));
-    result.Set("articulation_islands", Json::Int(articulation_islands));
-    result.Set("rows_per_island", Histogram(row_histogram));
-    result.Set("rows_per_articulation_island", Histogram(articulation_row_histogram));
-    result.Set("trees_per_island", Histogram(tree_histogram));
-    result.Set("canonical_schedule_fnv1a64", Json::Str(FormatDigest(hash)));
-    return result;
-}
-
 Json BlockWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32_t step,
                    const phi::BlockDescentSolveParams& p) {
     const auto& model = world.GetModel();
@@ -1182,7 +1101,8 @@ Json SolverWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
         fixture::Require(call.params != nullptr, "block solve parameters are missing");
         return BlockWorkload(world, rows, step, *static_cast<const phi::BlockDescentSolveParams*>(call.params));
     }
-    return IslandWorkload(world, rows, step);
+    fixture::Require(false, "block solve call is missing");
+    return Json::Object();
 }
 
 enum class ContactSystem : uint32_t { Rigid, Articulation, Xpbd, Mpm, Fixed, Count };
@@ -1807,43 +1727,30 @@ Json Run(const Options& options) {
     solver.Set("request_explicit", Json::Bool(options.velocity_iterations_explicit));
     solver.Set("configured_velocity_iterations", Json::Int(config.vel_iters));
     solver.Set("velocity_iterations_override", Json::Bool(config.velocity_iterations_override));
-    solver.Set("actual_velocity_iterations", Json::Int(world.GetPipeline().VelocityIterations(config.vel_iters)));
+    solver.Set("actual_velocity_iterations", Json::Int(world.GetPipeline().VelocityIterations()));
     solver.Set("actual_budget_scope", Json::Str("built pipeline budget per interval; individual solve calls are listed separately"));
     solver.Set("executed_iterations_status", Json::Str("unmeasured"));
-    bool block_descent_solver = false;
     uint32_t solve_call_count = 0u;
     for (const auto& call : world.GetPipeline().Calls()) {
         Json solve = Json::Object();
         if (call.op == phi::NkOp::BlockDescentSolve) {
             const auto& params = *static_cast<const phi::BlockDescentSolveParams*>(call.params);
-            block_descent_solver = true;
             solve.Set("solver", Json::Str("block_descent"));
             solve.Set("iterations", Json::Int(params.iterations));
             solve.Set("substep", Json::Int(params.substep_index));
             solve.Set("dt", Json::Float(params.dt));
             solve.Set("spectral_radius", Json::Float(params.acceleration_spectral_radius));
-            solve.Set("velocity_tolerance", Json::Null());
-        } else if (call.op == phi::NkOp::SolveRowsBlockIsland) {
-            const auto& params = *static_cast<const phi::SolveRowsBlockIslandParams*>(call.params);
-            solve.Set("solver", Json::Str("row_island"));
-            solve.Set("iterations", Json::Int(params.vel_iters));
-            solve.Set("dt", Json::Float(params.dt));
-            solve.Set("velocity_tolerance", std::isfinite(params.vel_tolerance) ? Json::Float(params.vel_tolerance) : Json::Null());
-            solve.Set("verify_idle", Json::Bool(params.verify_idle != 0u));
-            solve.Set("continue_impulses", Json::Bool(params.continue_impulses != 0u));
         } else continue;
         solve_calls.PushBack(std::move(solve));
         ++solve_call_count;
     }
-    solver.Set("mode", Json::Str(solve_call_count == 0u ? "no_solve_calls" : block_descent_solver ? "block_descent" : "row_island"));
+    solver.Set("mode", Json::Str(solve_call_count == 0u ? "no_solve_calls" : "block_descent"));
     solver.Set("solve_call_count", Json::Int(solve_call_count));
     solver.Set("budget_priority", Json::Str(solve_call_count == 0u ? "no scheduled solve calls" :
-        !block_descent_solver ? "configured row budget" :
         config.velocity_iterations_override ? "explicit world override" :
         std::getenv("NUKA_BLOCK_DESCENT_ITERATIONS") != nullptr ? "solver environment" : "solver default"));
     solver.Set("solve_calls", std::move(solve_calls));
-    for (const char* key : {"NUKA_BLOCK_DESCENT", "NUKA_BLOCK_DESCENT_ITERATIONS",
-                            "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS", "NUKA_SOLVER_VEL_TOLERANCE"}) {
+    for (const char* key : {"NUKA_BLOCK_DESCENT_ITERATIONS", "NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS"}) {
         const char* value = std::getenv(key);
         solver_environment.Set(key, value != nullptr ? Json::Str(value) : Json::Null());
     }

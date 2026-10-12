@@ -31,11 +31,11 @@
 //   * Fixed-base dof_to_link map only (scalar joint DOFs -> state.qdot[link]). A
 //     FloatingBase root's 6 base-velocity DOFs (link_velocity[root].v) are not
 //     mapped here; the validated scene is fixed-base. Mirrors the SCALAR-joint
-//     branch of SolveArticulatedContactRowsKernel exactly.
+//     branch of ApplyImplicitJointDampingKernel's dof map.
 //   * Sticking-equality active set (kkt_builder); sliding / cone-boundary friction
 //     is nonsmooth and out of scope.
 //
-// VALIDATION COVERAGE (see test_ift_vs_tape_backward.cpp, honest):
+// VALIDATION COVERAGE (historical; that FD test was deleted with the articulated PGS):
 //   * FD oracle runs on a PLANAR scene (mechanism in the XZ plane) so the 48-iter
 //     PGS converges EXACTLY (a clean gate) -- there the second friction tangent
 //     (t2, the Y direction) is identically zero (J_t2 == 0), so FD exercises the
@@ -130,7 +130,7 @@ __device__ __forceinline__ uint32_t JointDofCount(art::ArticulationJointType typ
 // Build the SCALAR-joint dof column -> global link map for an articulation, into
 // `dof_to_link` (length <= kMaxDof). Returns the DOF count. Fixed loop order
 // (base-inclusive prefix sum over [offset, offset+count)) == LocalDofIndex /
-// SolveArticulatedContactRowsKernel for fixed-base models.
+// ApplyImplicitJointDampingKernel for fixed-base models.
 //
 // HONESTY (no silent truncation / no silently-wrong scene branch):
 //  * Overflow past kMaxDof __trap()s LOUDLY rather than silently dropping the

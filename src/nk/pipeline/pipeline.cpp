@@ -59,17 +59,11 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
         cap.mpm_grid_nodes_per_env * cap.env_count,
         (articulated ? cap.articulations_per_env : 0u) * cap.env_count + cap.bodies_per_env * cap.env_count,
         cap.dofs_per_env);
-    const bool cloth = cap.vbd_vertices_per_env > 0u && cap.particles_per_env == cap.vbd_vertices_per_env &&
-        cap.mpm_grid_nodes_per_env == 0u;
-    // Warp-tile and VBD cloth scenes take block descent unless NUKA_BLOCK_DESCENT names the route.
-    const char* block_descent = std::getenv("NUKA_BLOCK_DESCENT");
-    use_block_descent_ = block_descent == nullptr ? tile || cloth
-                                                  : block_descent[0] == '1' && block_descent[1] == '\0';
     p_block_descent_ = {};
-    if (use_block_descent_ && tile) p_block_descent_.iterations = phi::kBlockDescentTileIterations;
-    if (use_block_descent_ && cfg.velocity_iterations_override)
+    if (tile) p_block_descent_.iterations = phi::kBlockDescentTileIterations;
+    if (cfg.velocity_iterations_override)
         p_block_descent_.iterations = cfg.vel_iters;
-    if (use_block_descent_ && !cfg.velocity_iterations_override) {
+    if (!cfg.velocity_iterations_override) {
         const char* iterations = std::getenv("NUKA_BLOCK_DESCENT_ITERATIONS");
         if (iterations != nullptr) {
             uint32_t count = 0u;
@@ -113,7 +107,7 @@ phi::Status Pipeline::Build(const Model& model, const SolverConfig& cfg,
     calls_.clear();
     calls_.reserve(static_cast<size_t>(call_count));
     p_accumulate_step_.resize(static_cast<size_t>(substeps) * 2u);
-    if (use_block_descent_) p_block_descent_substeps_.resize(substeps);
+    p_block_descent_substeps_.resize(substeps);
     for (uint32_t step = 0u; step < substeps; ++step) {
         auto& capture = p_accumulate_step_[static_cast<size_t>(step) * 2u];
         capture.env_count = cap.env_count;
@@ -217,8 +211,8 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             ++independent_dof;
         max_independent_dof = std::max(max_independent_dof, independent_dof);
     }
-    // Split-impulse position passes run in the row solve, or in block descent's warp tiles.
-    const bool split_positions = !use_block_descent_ || phi::BlockDescentTileRoute(
+    // Split-impulse position passes run in block descent's warp tiles.
+    const bool split_positions = phi::BlockDescentTileRoute(
         cap.particles_per_env * env_count, cap.mpm_grid_nodes_per_env * env_count,
         articulation_cnt + cap.bodies_per_env * env_count, max_dof);
     const bool use_inverse_dynamics =
@@ -400,61 +394,50 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     vertex_blocks.coarse_levels = cap.vbd_coarse_levels;
     vertex_blocks.coarse_nodes = cap.vbd_coarse_nodes;
     vertex_blocks.coarse_dense_nodes = cap.vbd_coarse_dense_nodes;
-    if (use_block_descent_) {
-        p_block_descent_.dt = cfg.dt;
-        p_block_descent_.env_count = env_count;
-        p_block_descent_.rows_per_env = cap.max_rows_per_env;
-        p_block_descent_.total_particle_count = particle_count;
-        p_block_descent_.total_body_count = cap.bodies_per_env * env_count;
-        p_block_descent_.total_grid_count = cap.mpm_grid_nodes_per_env * env_count;
-        p_block_descent_.articulation_count = articulation_cnt;
-        p_block_descent_.max_dof = max_dof;
-        p_block_descent_.mimic_couplings = mimic_couplings;
-        p_block_descent_.max_independent_dof = max_independent_dof;
-        p_block_descent_.material_cells_per_env = cap.mpm_stress_cells_per_env;
-        p_block_descent_.grid_particles_per_env = grid_particles_per_env;
-        std::copy(mp.mpm_grid_dims, mp.mpm_grid_dims + 3u, p_block_descent_.grid_dims);
-        p_block_descent_.base_link_count = base_link_count;
-        p_block_descent_.contact_rows_per_env = contact_rows_per_env;
-        p_block_descent_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
-        p_block_descent_.workspace_words = cap.block_descent_scratch_words;
-        p_block_descent_.vertex_blocks = vertex_blocks;
-        p_block_descent_.position_iterations = split_positions && has_contacts ? cfg.pos_iters : 0u;
-        p_block_descent_.position_beta = cfg.pos_beta;
-        p_block_descent_.position_slop = cfg.pos_slop;
-        p_block_descent_.position_max_velocity = model.baumgarte_max_velocity;
-        const char* acceleration_radius = std::getenv("NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS");
-        if (acceleration_radius != nullptr) {
-            char* end = nullptr;
-            const float radius = std::strtof(acceleration_radius, &end);
-            if (end == acceleration_radius || *end != '\0' || !std::isfinite(radius) ||
-                radius < 0.0f || radius >= 1.0f) return phi::Status::InvalidArgument;
-            p_block_descent_.acceleration_spectral_radius = radius;
-        }
-        // Only head rows enter the incidence: one owner per plain side, every term of a point endpoint.
-        p_block_descent_.incidence_per_env =
-            2u * (uint64_t{cap.rigid_contact_rows_per_env} / (1u + kPairDrivenTangentRowsPerPt) +
-                  particle_reserve + cap.joint_limit_rows_per_env + cap.joint_friction_rows_per_env +
-                  cap.joint_drive_rows_per_env) +
-            uint64_t{cap.ogc_contacts_per_env} * 2u * kTriangleEndpointTerms +
-            uint64_t{cap.mpm_contact_capacity_per_env} * (kMpmStencilNodes + kTriangleEndpointTerms) +
-            uint64_t{cap.mpm_stress_cells_per_env} * kMpmCellStencilNodes;
-        const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
-        p_block_descent_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
-        p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
-            p_block_descent_.measure_vertex_audit != 0u ||
-            (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
-            (diagnostics != nullptr && diagnostics[0] == '1');
+    p_block_descent_.dt = cfg.dt;
+    p_block_descent_.env_count = env_count;
+    p_block_descent_.rows_per_env = cap.max_rows_per_env;
+    p_block_descent_.total_particle_count = particle_count;
+    p_block_descent_.total_body_count = cap.bodies_per_env * env_count;
+    p_block_descent_.total_grid_count = cap.mpm_grid_nodes_per_env * env_count;
+    p_block_descent_.articulation_count = articulation_cnt;
+    p_block_descent_.max_dof = max_dof;
+    p_block_descent_.mimic_couplings = mimic_couplings;
+    p_block_descent_.max_independent_dof = max_independent_dof;
+    p_block_descent_.material_cells_per_env = cap.mpm_stress_cells_per_env;
+    p_block_descent_.grid_particles_per_env = grid_particles_per_env;
+    std::copy(mp.mpm_grid_dims, mp.mpm_grid_dims + 3u, p_block_descent_.grid_dims);
+    p_block_descent_.base_link_count = base_link_count;
+    p_block_descent_.contact_rows_per_env = contact_rows_per_env;
+    p_block_descent_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
+    p_block_descent_.workspace_words = cap.block_descent_scratch_words;
+    p_block_descent_.vertex_blocks = vertex_blocks;
+    p_block_descent_.position_iterations = split_positions && has_contacts ? cfg.pos_iters : 0u;
+    p_block_descent_.position_beta = cfg.pos_beta;
+    p_block_descent_.position_slop = cfg.pos_slop;
+    p_block_descent_.position_max_velocity = model.baumgarte_max_velocity;
+    const char* acceleration_radius = std::getenv("NUKA_BLOCK_DESCENT_SPECTRAL_RADIUS");
+    if (acceleration_radius != nullptr) {
+        char* end = nullptr;
+        const float radius = std::strtof(acceleration_radius, &end);
+        if (end == acceleration_radius || *end != '\0' || !std::isfinite(radius) ||
+            radius < 0.0f || radius >= 1.0f) return phi::Status::InvalidArgument;
+        p_block_descent_.acceleration_spectral_radius = radius;
     }
-    const uint32_t coupling_iterations = cfg.coupling_passes != 0u ? cfg.coupling_passes : 1u;
-    p_solve_iterations_.resize(coupling_iterations);
-    const auto iterations_before = [](uint32_t pass, uint32_t budget, uint32_t passes) {
-        return static_cast<uint32_t>((static_cast<uint64_t>(pass) * budget + passes - 1u) / passes);
-    };
-    const auto iteration_work = [&](uint32_t pass, uint32_t budget, uint32_t passes) {
-        return iterations_before(pass + 1u, budget, passes) - iterations_before(pass, budget, passes);
-    };
-
+    // Only head rows enter the incidence: one owner per plain side, every term of a point endpoint.
+    p_block_descent_.incidence_per_env =
+        2u * (uint64_t{cap.rigid_contact_rows_per_env} / (1u + kPairDrivenTangentRowsPerPt) +
+              particle_reserve + cap.joint_limit_rows_per_env + cap.joint_friction_rows_per_env +
+              cap.joint_drive_rows_per_env) +
+        uint64_t{cap.ogc_contacts_per_env} * 2u * kTriangleEndpointTerms +
+        uint64_t{cap.mpm_contact_capacity_per_env} * (kMpmStencilNodes + kTriangleEndpointTerms) +
+        uint64_t{cap.mpm_stress_cells_per_env} * kMpmCellStencilNodes;
+    const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
+    p_block_descent_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
+    p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
+        p_block_descent_.measure_vertex_audit != 0u ||
+        (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
+        (diagnostics != nullptr && diagnostics[0] == '1');
     // The build-time coupling context: the row provider's PreCouple/PostCouple
     // fill the Pipeline-owned PODs from these resolved scalars at their original
     // insertion points; Couple is wired (inert for the row path) before the solve.
@@ -829,101 +812,17 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
 
     energy(EnergyStage::Free);
     if (has_contacts) {
-        if (use_block_descent_) {
-            if (has_particles) row_coupling_provider_.Couple(coupling_ctx);
-            add(phi::NkOp::BlockDescentSolve, &p_block_descent_);
-            if (has_particles && p_part_contact_delta_.active_begin_per_env < per_env_particles)
-                add(phi::NkOp::ParticleContactDelta, &p_part_contact_delta_);
-        } else {
-            p_solve_.dt = cfg.dt;
-            p_solve_.vel_iters = cfg.vel_iters;
-            p_solve_.vel_tolerance = cfg.vel_tolerance;
-            // The general contact solve projects overlap using split-impulse position sweeps.
-            p_solve_.pos_iters =
-                (family == phi::kContactFamilyPairDriven) ? cfg.pos_iters : 0u;
-            p_solve_.pos_beta = cfg.pos_beta;
-            p_solve_.pos_slop = cfg.pos_slop;
-            p_solve_.total_particle_count = particle_count;
-            p_solve_.total_grid_count = cap.mpm_grid_nodes_per_env * env_count;
-            p_solve_.workspace_bytes = cap.solver_velocity_scratch_bytes;
-            p_solve_.family = family;
-            p_solve_.total_islands = model.schedule_island_count;
-            p_solve_.max_dof = max_dof;
-            p_solve_.env_count = env_count;
-            p_solve_.articulation_count = articulation_cnt;
-            p_solve_.rows_per_env = cap.max_rows_per_env;
-            p_solve_.contact_rows_per_env = contact_rows_per_env;
-            p_solve_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
-            p_solve_.base_link_count = base_link_count;
-            p_solve_.total_body_count = cap.bodies_per_env * env_count;
-            p_solve_.friction_coefficient = model.friction_coefficient;
-            p_solve_.baumgarte_max_velocity = model.baumgarte_max_velocity;
-            // The per-articulation slot stride MUST match the detection/assembly
-            // (slot_base = articulation * stride). Data-driven; 4 at K<=1.
-            p_solve_.contact_slots_per_artic = contact_slots_per_artic;
-            p_solve_.vertex_blocks = vertex_blocks;
-            p_solve_.mimic_couplings = mimic_couplings;
-            // Validation A/B: force the cook-time static schedule (the byte-identity
-            // reference for the dynamic islanding). Read once at Build (graph-safe).
-            const char* fsi = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
-            p_solve_.force_static_islands = (fsi != nullptr && fsi[0] == '1') ? 1u : 0u;
-            // Validation A/B: sweep the convergence bound without recooking a scene.
-            const char* tolerance = std::getenv("NUKA_SOLVER_VEL_TOLERANCE");
-            if (tolerance != nullptr) p_solve_.vel_tolerance = std::strtof(tolerance, nullptr);
-            const char* diagnostics = std::getenv("NUKA_CONTACT_SOLVER_DIAGNOSTICS");
-            p_solve_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
-            p_solve_.measure_contact_residual = cfg.measure_contact_residual ||
-                p_solve_.measure_vertex_audit != 0u ||
-                (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
-                (diagnostics != nullptr && diagnostics[0] == '1');
-            // Particle rows exchange their impulses in the common solve.
-            if (has_particles) {
-                row_coupling_provider_.Couple(coupling_ctx);
-            }
-            // The active rows define independent solve islands after assembly.
-            p_islands_.family = family;
-            p_islands_.env_count = env_count;
-            p_islands_.rows_per_env = cap.max_rows_per_env;
-            p_islands_.articulation_count = articulation_cnt;
-            p_islands_.bodies_per_env = cap.bodies_per_env;
-            p_islands_.particles_per_env = cap.particles_per_env;
-            p_islands_.grid_nodes_per_env = cap.mpm_grid_nodes_per_env;
-            add(phi::NkOp::BuildSolveIslands, &p_islands_);
-            // Rows the screened sweeps leave idle are rechecked against the solved velocity by a
-            // final pass, which sweeps again only if one broke and then projects positions.
-            const bool verify_idle =
-                family == phi::kContactFamilyPairDriven && p_solve_.force_static_islands == 0u;
-            for (uint32_t pass = 0u; pass < coupling_iterations; ++pass) {
-                const bool last = pass + 1u == coupling_iterations;
-                auto& solve = p_solve_iterations_[pass];
-                solve = p_solve_;
-                solve.vel_iters = static_cast<uint16_t>(iteration_work(pass, cfg.vel_iters, coupling_iterations));
-                solve.pos_iters = last && !verify_idle ? p_solve_.pos_iters : 0u;
-                solve.position_later = last && verify_idle && p_solve_.pos_iters != 0u ? 1u : 0u;
-                solve.measure_contact_residual =
-                    last && !verify_idle ? p_solve_.measure_contact_residual : 0u;
-                solve.measure_vertex_audit =
-                    last && !verify_idle ? p_solve_.measure_vertex_audit : 0u;
-                solve.continue_impulses = pass != 0u ? 1u : 0u;
-                add(phi::NkOp::SolveRowsBlockIsland, &solve);
-                if (last && verify_idle) {
-                    p_solve_verify_ = p_solve_;
-                    p_solve_verify_.vel_iters = static_cast<uint16_t>((cfg.vel_iters + 3u) / 4u);
-                    p_solve_verify_.continue_impulses = 1u;
-                    p_solve_verify_.verify_idle = 1u;
-                    add(phi::NkOp::SolveRowsBlockIsland, &p_solve_verify_);
-                }
-                if (has_particles && p_part_contact_delta_.active_begin_per_env < per_env_particles)
-                    add(phi::NkOp::ParticleContactDelta, &p_part_contact_delta_);
-            }
-        }
+        if (has_particles) row_coupling_provider_.Couple(coupling_ctx);
+        add(phi::NkOp::BlockDescentSolve, &p_block_descent_);
+        if (has_particles && p_part_contact_delta_.active_begin_per_env < per_env_particles)
+            add(phi::NkOp::ParticleContactDelta, &p_part_contact_delta_);
         if constexpr (family == phi::kContactFamilyPairDriven) {
             p_warm_start_commit_ = p_warm_start_prepare_;
             p_warm_start_commit_.phase = 1u;
             add(phi::NkOp::ContactWarmStart, &p_warm_start_commit_);
         }
     } else {
-        if (use_block_descent_) add(phi::NkOp::BlockDescentSolve, &p_block_descent_);
+        add(phi::NkOp::BlockDescentSolve, &p_block_descent_);
     }
 
     if (cap.joint_drive_rows_per_env > 0u) {

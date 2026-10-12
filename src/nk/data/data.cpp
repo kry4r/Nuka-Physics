@@ -202,7 +202,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::RowCjDirB:           v.row_cj_dir_b = static_cast<math::Vec3*>(p); break;
         // PairDriven block-island GLOBAL order/segment scratch (3 u32 per row slot:
         // rows_per_env order + 2*rows_per_env segments per env, disjoint per env).
-        case FieldId::PdSolveScratch:      v.pd_solve_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::QdotFlat:            v.qdot_flat = static_cast<float*>(p); break;
         case FieldId::StepQdotFlat:        v.step_qdot_flat = static_cast<float*>(p); break;
         case FieldId::StepBodyLinearVelocity: v.step_body_linear_velocity = static_cast<math::Vec3*>(p); break;
@@ -298,7 +297,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::MpmMaterialTable:    v.mpm_material_table = static_cast<float*>(p); break;
         case FieldId::GridBodyDp:          v.grid_body_dp = static_cast<math::Vec3*>(p); break;
         case FieldId::GridInvMass:         v.grid_inv_mass = static_cast<float*>(p); break;
-        case FieldId::CcGridFirst:         v.cc_grid_first = static_cast<uint32_t*>(p); break;
         case FieldId::GridContactCount:    v.grid_contact_count = static_cast<uint64_t*>(p); break;
         case FieldId::GridContactOffset:   v.grid_contact_offset = static_cast<uint64_t*>(p); break;
         case FieldId::UcontactLaw:         v.ucontact_law = static_cast<uint32_t*>(p); break;
@@ -320,17 +318,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::StepLinkImpulse:     v.step_link_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::StepLinkMoment:      v.step_link_moment = static_cast<math::Vec3*>(p); break;
         case FieldId::StepJointLimitImpulse: v.step_joint_limit_impulse = static_cast<float*>(p); break;
-        // Dynamic solve islands (BuildSolveIslands union-find + emit working set).
-        case FieldId::CcParent:            v.cc_parent = static_cast<uint32_t*>(p); break;
-        case FieldId::CcRoot:              v.cc_root = static_cast<uint32_t*>(p); break;
-        case FieldId::CcArticFirst:        v.cc_artic_first = static_cast<uint32_t*>(p); break;
-        case FieldId::CcBodyFirst:         v.cc_body_first = static_cast<uint32_t*>(p); break;
-        case FieldId::CcParticleFirst:     v.cc_particle_first = static_cast<uint32_t*>(p); break;
-        case FieldId::IslandRootSorted:    v.island_root_sorted = static_cast<uint32_t*>(p); break;
-        case FieldId::IslandRows:          v.island_rows = static_cast<uint32_t*>(p); break;
-        case FieldId::IslandQuads:         v.island_quads = static_cast<uint32_t*>(p); break;
-        case FieldId::IslandCount:         v.island_count = static_cast<uint32_t*>(p); break;
-        case FieldId::IslandCubTemp:       v.island_cub_temp = static_cast<uint8_t*>(p); break;
         case FieldId::PbfPredictedPos:     v.pbf_predicted_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleProjectionDelta: v.particle_projection_delta = static_cast<math::Vec3*>(p); break;
         case FieldId::ParticleResponse: v.particle_response = static_cast<math::SymmetricMat3*>(p); break;
@@ -357,9 +344,7 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::LinkContactBegin: v.link_contact_begin = static_cast<uint32_t*>(p); break;
         case FieldId::LinkContactEnd: v.link_contact_end = static_cast<uint32_t*>(p); break;
         case FieldId::ContactIndexScratch: v.contact_index_scratch = static_cast<uint8_t*>(p); break;
-        case FieldId::SolverVelocityScratch: v.solver_velocity_scratch = static_cast<uint8_t*>(p); break;
         case FieldId::PairSampleChunks: v.pair_sample_chunks = static_cast<uint32_t*>(p); break;
-        case FieldId::SolveColorScratch: v.solve_color_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::CrbaScratch: v.crba_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::ControlScratch: v.control_scratch = static_cast<uint32_t*>(p); break;
         case FieldId::BlockDescentScratch: v.block_descent_scratch = static_cast<uint32_t*>(p); break;

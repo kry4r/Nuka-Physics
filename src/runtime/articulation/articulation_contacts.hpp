@@ -167,17 +167,16 @@ void FactorArticulationInertiaM(cudaStream_t stream, int device_id,
                                 const float* inertia_M,
                                 float* out_inertia_M_inv);
 
-// General standalone implicit joint damping (no contacts). The damping-only
-// sibling of SolveArticulatedContactRows' implicit-damping seed: applies the
-// SAME backward-Euler joint damping qdot -= dt*(M+dt*C)^-1*(C*qdot) in place,
+// General standalone implicit joint damping (no contacts). Applies the
+// backward-Euler joint damping qdot -= dt*(M+dt*C)^-1*(C*qdot) in place,
 // where `inertia_M_inv` is the (M+dt*C)^-1 tile from FactorArticulationInertiaM
 // (fed ComputeArticulationInertiaM the SAME joint_damping + dt). `joint_damping`
 // is the per-DOF c_j indexed by global link (the deferred drive damping). Base
 // (free floating-base) DOFs are never damped (c=0). Used by the single-env
 // oracle path to run the same implicit damping scheme as the batched contacts
 // path WITHOUT any contact rows. `dof_stride` == max_dof. One block per
-// articulation, single lane, fixed loop order, no atomics => D1-deterministic;
-// bit-for-bit identical to the batched contacts-OFF solve. joint_damping==nullptr
+// articulation, single lane, fixed loop order, no atomics => D1-deterministic.
+// joint_damping==nullptr
 // || dt<=0 -> qdot unchanged.
 void ApplyImplicitJointDamping(cudaStream_t stream, int device_id,
                                ArticulationDeviceState state,
@@ -229,46 +228,7 @@ void ComputeContactEffectiveMass(cudaStream_t stream, int device_id,
 //    upper limit fields, so there is no data to drive them. T6/a later task adds
 //    limit data + emission.
 //
-//  SolveArticulatedContactRowsKernel -- block-per-articulation fused PGS.
-//    Seeds a working joint-velocity vector qdot_work from state.qdot (which at
-//    call time holds qdot_free = the post-velocity-integration joint velocity),
-//    runs `solver_iterations` sweeps (default kContactSolverIterations) over the
-//    rows in fixed order (all normal rows of the articulation's contacts, then the
-//    friction rows), and
-//    for each row i:
-//        jv    = dot(J_i, qdot_work)          (over the articulation's dof cols)
-//        delta = m_eff_i * (b_i - jv)         (row_solver.cu:289 convention:
-//                                              lambda = m_eff*(rhs - jv))
-//        new   = clamp(lambda_i + delta, lower, upper)
-//        qdot_work += (M^-1 tile) . (J_i^T * (new - lambda_i)); lambda_i = new
-//    NORMAL row:  b_i = kBaumgarteBeta/dt * max(depth_i - kPenetrationSlop, 0)
-//                 (positional bias; restitution = 0), lower=0, upper=+inf.
-//    FRICTION row: b_i = 0, lower=-mu*sum_lambda_n, upper=+mu*sum_lambda_n with
-//                 mu = kContactFriction and sum_lambda_n the contact's
-//                 accumulated normal impulse (Coulomb cone, mirroring
-//                 row_solver.cu:293-301). Finally writes qdot_work back into
-//                 state.qdot for every DOF of the articulation. The dof column ->
-//                 global qdot index map is the SAME base-inclusive prefix-sum
-//                 convention as T3's dof_index / T4's LocalDofIndex, so J_i,
-//                 M^-1 and the joint velocities all share one column ordering.
-//
-//  Warm-start: SolveArticulatedContactRowsKernel can be seeded from a persisted
-//    per-slot lambda buffer (keyed by the fixed contact slot
-//    [env*kMaxFootContactsPerEnv + slot] and row type) to accelerate convergence
-//    across steps. Warm-start affects CONVERGENCE ONLY -- never determinism or
-//    correctness. A cold start (all-zero lambda, the default when warm_start is
-//    null) is fully acceptable and is NOT a defect; the determinism gate runs
-//    cold so two runs are trivially comparable.
 // ---------------------------------------------------------------------------
-
-// DEFAULT PGS sweep count for the articulated contact solve; the actual count is a
-// per-call runtime argument (SolveArticulatedContactRows' solver_iterations), and
-// the general path carries it per-world via SolverConfig/SolveRowsBlockIslandParams.
-// Strongly-coupled normal/friction rows (Jn.M^-1.Jt^T is O(1)) slow Gauss-Seidel;
-// ~40 sweeps drive a sticking contact's tangential velocity to ~0, 48 clears it with
-// margin while staying cheap at one block per articulation. A fixed count + fixed
-// row order keeps the solve D1.
-constexpr uint32_t kContactSolverIterations = 48u;
 
 // Baumgarte positional-stabilization coefficient (fraction of penetration error
 // fed back as a target separating velocity per step). 0.2 is the standard mild
@@ -373,51 +333,6 @@ void ComputeContactTangentBasis(cudaStream_t stream, int device_id,
                                 uint32_t env_count,
                                 math::Vec3* out_tangent1,
                                 math::Vec3* out_tangent2);
-
-// Fused block-per-articulation PGS solve + joint-space impulse apply. Reads the
-// assembled rows and the per-contact normal / tangent chain Jacobians (each a
-// [env_count*kMaxFootContactsPerEnv*dof_stride] buffer, row-major per slot) plus
-// the per-articulation M^-1 tiles (stride max_dof*max_dof, dof_stride == max_dof).
-// Modifies state.qdot IN PLACE: on entry qdot holds qdot_free, on exit qdot holds
-// the post-contact joint velocity. `dt` is the integration step (drives the
-// Baumgarte bias). `inout_lambda` (optional, may be null) is the warm-start /
-// persisted impulse buffer, length env_count*kMaxFootContactsPerEnv*3 (normal,
-// tangent1, tangent2 per slot); when null the solve cold-starts at zero. On
-// return it holds this step's converged impulses for the next step's warm start.
-// `friction_coefficient` (default kContactFriction == the default-material
-// fallback) is the Coulomb mu used by the friction-cone clamp; passing 0 makes the
-// friction rows inert (a frictionless baseline). Per the per-material contract the
-// caller passes the contact's combined shape friction here. It is a uniform
-// scalar, so threading it preserves D1 determinism.
-// `baumgarte_max_velocity` (default +inf == non-binding, so prior calls are
-// unaffected bit-for-bit) caps the normal-row positional bias at
-// min(kBaumgarteBeta/dt*max(depth-slop,0), baumgarte_max_velocity); a finite
-// tuned value prevents large-penetration one-step velocity transients. It is a
-// uniform scalar applied identically at every normal-row bias site, so it
-// preserves D1 determinism.
-// One block per articulation, single lane, fixed order, no atomics => D1.
-// `joint_damping` (optional, per-DOF c_j indexed by global link): when non-null
-// AND `inertia_M_inv` was factored from (M + dt*C), the solve first applies implicit
-// joint damping (qdot -= dt*(M+dt*C)^-1 * (C*qdot)) before the contact sweeps, so
-// joint damping and contacts share one consistent (M+dt*C)^-1 admittance. null ->
-// no implicit damping (prior behaviour, bit-for-bit). It is a per-DOF coefficient
-// applied in fixed order with no atomics, so it preserves D1 determinism.
-void SolveArticulatedContactRows(cudaStream_t stream, int device_id,
-                                 ArticulationDeviceState state,
-                                 const ArticulatedContactRow* rows,
-                                 const float* normal_jacobian,
-                                 const float* tangent1_jacobian,
-                                 const float* tangent2_jacobian,
-                                 const float* inertia_M_inv,
-                                 uint32_t env_count,
-                                 uint32_t dof_stride,
-                                 float dt,
-                                 float* inout_lambda,
-                                 uint32_t solver_iterations = kContactSolverIterations,
-                                 float friction_coefficient = kContactFriction,
-                                 float baumgarte_max_velocity =
-                                     std::numeric_limits<float>::infinity(),
-                                 const float* joint_damping = nullptr);
 
 // (B) Detect foot-vs-ground contacts. One thread per environment; each env
 // inspects its `foot_count` feet (device buffer of FootShape, length foot_count,

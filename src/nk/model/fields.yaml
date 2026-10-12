@@ -12,7 +12,7 @@
 #     body SoA (per body).
 #   * PBF fluid (op-ified on nk, particles.cu) — PBF particle SoA (per particle).
 #   * unified row solve — contacts / rows / sides / lambda warm-start / m_inv /
-#     the SolveSchedule island tables / contact_count + row_count watermarks.
+#     contact_count + row_count watermarks.
 #   * material buckets (CookedContactParamTable upgrade, Isaac bucketing) +
 #     per-body bucket index + RNG state for domain randomization.
 #
@@ -249,7 +249,7 @@ fields:
   # urows: the per-row-slot NkRow record (src/nk/solve/nk_row.hpp, 32 f32 =
   # 128 B: flags/group/rhs/R/bounds/mu + both reaction sides incl. their 6-dof
   # contact Jacobians). Written by AssembleRows, read/λ-companion by
-  # SolveRowsBlockIsland. chain_jacobian: per-(row_slot x dof) articulation
+  # BlockDescentSolve. chain_jacobian: per-(row_slot x dof) articulation
   # chain Jacobian row J (COALESCED row-major [slot*dof_stride + k] — within a
   # color, consecutive ROWS are touched by consecutive threads, and within one
   # row's serial k-loop the reads stream a contiguous 51-float line, the same
@@ -362,24 +362,6 @@ fields:
   - {name: sdf_cell_keys,     dtype: u64,  per: scalar, count: "max_sdf_cells",      arena: persistent, owner: model}
   - {name: sdf_cell_values,   dtype: f32,  per: scalar, count: "max_sdf_cells",      arena: persistent, owner: model}
   - {name: sdf_cell_gradients,dtype: vec3, per: scalar, count: "max_sdf_cells",      arena: persistent, owner: model}
-
-  # =========================================================================
-  # SOLVE SCHEDULE (island/color) — MODEL. Built worst-case at World construct
-  # by nk::SolveSchedule (the row_scheduler algorithms migrated to
-  # src/nk/solve/schedule.cpp) over MAX-CAPACITY row slots, uploaded once,
-  # device-resident, never recomputed per step (plan §3.4). Layout:
-  #   row_order[k]              : global row-slot ids, grouped per island, in
-  #                               ascending (color, intra-color) order.
-  #   island_color_segments[s]  : {row_order offset, row count} u32 pair per
-  #                               color segment.
-  #   island_row_offsets[i]     : {segment offset, segment count, flags, env}
-  #                               u32 quad per island (flags bit0 = island has
-  #                               articulation rows -> owns the qdot scatter).
-  # Capacities: islands <= row slots, segments <= row slots.
-  # =========================================================================
-  - {name: island_row_offsets,    dtype: u32, per: scalar, count: "schedule_island_elements", arena: persistent, owner: model, elem: 4}
-  - {name: island_color_segments, dtype: u32, per: scalar, count: "schedule_color_elements", arena: persistent, owner: model, elem: 2}
-  - {name: row_order,             dtype: u32, per: scalar, count: "schedule_row_elements", arena: persistent, owner: model}
 
   # =========================================================================
   # PARTICLE (soft) — DATA. Source: nk soft ops. particle_pos above (§3.3).
@@ -575,16 +557,6 @@ fields:
   - {name: row_cj_dir_b,     dtype: vec3, per: row_slot, arena: scratch, owner: data}
 
   # =========================================================================
-  # PairDriven block-island solver GLOBAL scratch (pd_solve_scratch). The
-  # PairDriven family schedules ONE island per env holding ALL rows_per_env rows;
-  # the per-row staged order and segment table cannot live in dynamic shared when
-  # rows_per_env is large. They use one disjoint 3-u32-per-row region per env.
-  # Dynamic solves reuse the order region for cached disjoint-batch flags; the
-  # Union family stages its order and segments in shared. APPENDED LAST so every
-  # pre-existing arena offset is byte-stable.
-  - {name: pd_solve_scratch, dtype: u32, per: row_slot, arena: scratch, owner: data, elem: 3}
-
-  # =========================================================================
   # Split-impulse position-correction pass: SEPARATE pseudo-velocity buffers
   # (never the persisted velocity state). The solve op runs pos_iters Gauss-
   # Seidel sweeps that drive a pseudo velocity from the geometric penetration
@@ -680,30 +652,6 @@ fields:
   # the link-row gather sums, which the per-articulation deposit chain-walks into
   # qdot_flat. The free-rigid path applies its torque inline and leaves this zero.
   - {name: mpm_body_ang_reaction, dtype: vec3, per: body, arena: scratch, owner: data, flags: [readout]}
-
-  # =========================================================================
-  # DYNAMIC SOLVE ISLANDS (PairDriven connected-components). A per-step device
-  # pass (BuildSolveIslands) partitions the ACTIVE contact rows into independent
-  # components by union-find over the GLOBAL coupling keys each row touches (artic
-  # side a/b, rigid body, particle) + the friction-group anchor, then emits one
-  # island per component so the solve runs disjoint components on PARALLEL blocks.
-  # Each component keeps its rows in ASCENDING slot order (bit-identical to the
-  # single-island-per-env sweep). cc_* = the union-find + radix-sort working set;
-  # island_* = the emitted schedule the solve reads (island_quads stride 4 =
-  # {row_off,row_cnt,flags,env} indexing island_rows; the solve derives each
-  # component's articulation tile subset from its own rows). Sized to the row/entity
-  # capacity. APPENDED LAST so every pre-existing arena offset is byte-stable.
-  # =========================================================================
-  - {name: cc_parent,          dtype: u32, per: row_slot,     arena: scratch, owner: data}
-  - {name: cc_root,            dtype: u32, per: row_slot,     arena: scratch, owner: data}
-  - {name: cc_artic_first,     dtype: u32, per: articulation, arena: scratch, owner: data}
-  - {name: cc_body_first,      dtype: u32, per: body,         arena: scratch, owner: data}
-  - {name: cc_particle_first,  dtype: u32, per: particle,     arena: scratch, owner: data}
-  - {name: island_root_sorted, dtype: u32, per: row_slot,     arena: scratch, owner: data}
-  - {name: island_rows,        dtype: u32, per: row_slot,     arena: scratch, owner: data}
-  - {name: island_quads,       dtype: u32, per: row_slot,     arena: scratch, owner: data, elem: 4}
-  - {name: island_count,       dtype: u32, per: scalar, count: "1",                     arena: scratch, owner: data}
-  - {name: island_cub_temp,    dtype: u8,  per: scalar, count: "island_cub_temp_bytes", arena: scratch, owner: data}
 
   # Joint dry friction is a per-link bound on the shared solver impulse divided by dt.
   - {name: joint_frictionloss, dtype: f32, per: link, arena: persistent, owner: model, flags: [param]}
@@ -848,7 +796,6 @@ fields:
 
   # Finite grid endpoints and deterministic contact compaction.
   - {name: grid_inv_mass, dtype: f32, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
-  - {name: cc_grid_first, dtype: u32, per: scalar, count: "mpm_grid_nodes_per_env*env_count", arena: scratch, owner: data}
   - {name: grid_contact_count, dtype: u64, per: scalar, count: "particles_per_env*env_count", arena: scratch, owner: data}
   - {name: grid_contact_offset, dtype: u64, per: scalar, count: "particles_per_env*env_count", arena: scratch, owner: data}
   - {name: ucontact_law, dtype: u32, per: contact_slot, arena: scratch, owner: data}
@@ -865,9 +812,6 @@ fields:
   - {name: mpm_boundary_moment, dtype: vec3, per: scalar, count: "mpm_boundary_count*env_count", arena: scratch, owner: data, flags: [readout]}
   - {name: step_mpm_boundary_impulse, dtype: vec3, per: scalar, count: "mpm_boundary_count*env_count", arena: scratch, owner: data}
   - {name: step_mpm_boundary_moment, dtype: vec3, per: scalar, count: "mpm_boundary_count*env_count", arena: scratch, owner: data}
-
-  # Backend workspace for compensated contact velocity accumulation.
-  - {name: solver_velocity_scratch, dtype: u8, per: scalar, count: "solver_velocity_scratch_bytes", arena: scratch, owner: data}
 
   # Control inputs persist across state reset, independently of the position target.
   - {name: velocity_target, dtype: f32, per: link, arena: persistent, owner: data, flags: [param]}
@@ -928,8 +872,6 @@ fields:
   # Pair sample chunks that yield contacts or geometry status, flagged before each manifold pass.
   - {name: pair_sample_chunks, dtype: u32, per: scalar, count: "pair_sample_chunk_words", arena: scratch, owner: data}
 
-  # Row colors and ordered chains the cooperative island solve rebuilds from each pass's live rows.
-  - {name: solve_color_scratch, dtype: u32, per: scalar, count: "solve_color_scratch_words", arena: scratch, owner: data}
   - {name: block_descent_scratch, dtype: u32, per: scalar, count: "block_descent_scratch_words", arena: scratch, owner: data}
 
   # Vertex blocks: elastic elements, vertex incidence (element << 2 | local) and static color

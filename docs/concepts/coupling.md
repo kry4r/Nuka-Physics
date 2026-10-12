@@ -36,13 +36,9 @@ with nuka.SceneBuilder.create("robot.nks") as scene:
 
 The contact capacity is an explicit storage budget. Check `ENV_STATUS` and `GRID_CONTACT_OVERFLOW`: a nonzero overflow means some candidate contacts were not retained. `GRID_CONTACT_ATTEMPTED`, `GRID_CONTACT_RETAINED` and `GRID_CONTACT_PEAK` expose the corresponding counts.
 
-## Contact exchange frequency
+## Contact solver budget
 
-`world.set_coupling_passes(count)` sets the number of contact exchanges in each physical substep. The default, `0`, follows the largest material projection budget. Positive values distribute the same XPBD, PBF, particle-contact and contact-solver iteration budgets across that many exchanges. Material projection order, timestep and substep count remain unchanged. The C API provides `nuka_world_set_coupling_passes`; C++ uses `Pipeline::SolverConfig::coupling_passes` or `World::SetCouplingPasses`.
-
-Changing this setting preserves world state and buffer addresses and invalidates the captured execution graph. Fewer exchanges change the finite-iteration coupling response: compare contact residuals, deformation and timestep convergence before using a lower count. The G1 demo exposes the setting as `--coupling-passes` and records it in `metrics.json`.
-
-`world.set_velocity_iterations(count)` sets the contact solver's velocity sweeps per exchange (1..65535), and `world.velocity_iterations()` reads the current budget. Timestep and exchange count stay unchanged; the change preserves world state and buffer addresses and invalidates the captured execution graph. The C API provides `nuka_world_set_velocity_iterations` and `nuka_world_get_velocity_iterations`; C++ uses `World::SetVelocityIterations`. The diagnostic sweep-budget replay uses it to repeat one step at several budgets.
+`world.set_velocity_iterations(count)` sets the block-descent iterations of the contact solve (1..65535), and `world.velocity_iterations()` reads the current budget. The timestep stays unchanged; the change preserves world state and buffer addresses and invalidates the captured execution graph. The C API provides `nuka_world_set_velocity_iterations` and `nuka_world_get_velocity_iterations`; C++ uses `World::SetVelocityIterations`. The diagnostic sweep-budget replay uses it to repeat one step at several budgets.
 
 MLS-MPM evaluates stress from the accepted particle history during particle-to-grid transfer. Contacts modify the grid velocity; the final grid velocity drives particle transfer and the material history update. Constitutive evaluation reads the accepted history into a separate trial, and a successful trial commits once per physical interval. Repeated trial evaluation leaves the accepted history unchanged.
 

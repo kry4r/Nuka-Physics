@@ -505,8 +505,8 @@ nuka_set_warnings(nuka_constraint)
 # ---------------------------------------------------------------------------
 # M9 T11-core-b2: the legacy row solver/scheduler estate (row_solver.cu /
 # row_scheduler.* / unified_solve.* / diff_test_bridge.*) was deleted -- the
-# algorithm migrated to src/nk/solve/schedule.hpp + the phi assemble_rows/
-# solve_rows ops in M4. The only surviving source here is solver_config.hpp
+# algorithm migrated to the phi assemble_rows / block-descent ops. The only
+# surviving source here is solver_config.hpp
 # (the SolverConfig tuning POD the foot_*/link_rigid nk gates still reference),
 # so nuka_solver is now an INTERFACE library that just carries the `src` include
 # path. All `target_link_libraries(... nuka_solver)` consumers keep resolving
@@ -602,7 +602,6 @@ add_library(nuka_nk STATIC
     nk/pipeline/pipeline.cpp
     nk/pipeline/coupling_provider.cpp
     nk/pipeline/world.cpp
-    nk/solve/schedule.cpp
     nk/solve/vertex_block_hierarchy.cpp
     nk/solve/vertex_block_schedule.cpp
     sensor/observation.cpp
@@ -702,7 +701,7 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/registry.cu
         # M3b articulation pipeline op implementations (line-by-line kernel
         # ports; see each file's header). The contact pipeline (assemble_rows /
-        # solve_rows — the §3.4 device-resident unified row solve). L1-c DELETED
+        # block_descent — the device-resident unified row solve). L1-c DELETED
         # contacts_union.cu (the UnionCsr narrowphase) with the rest of the
         # UnionCsr path; PairDriven is the one general contact path.
         phi/backend_cuda/ops/articulation.cu
@@ -731,8 +730,6 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/narrowphase_prims.cu
         phi/backend_cuda/ops/narrowphase_sdf.cu
         phi/backend_cuda/ops/assemble_rows.cu
-        phi/backend_cuda/ops/build_islands.cu
-        phi/backend_cuda/ops/solve_rows.cu
         phi/backend_cuda/ops/block_descent.cu
         # Particle predict / projection velocity / finalize, aero drag and surface
         # refits: the particle side of the unified row solve.

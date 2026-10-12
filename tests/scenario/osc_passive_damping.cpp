@@ -25,79 +25,54 @@ Backend& Device() {
     return backend;
 }
 
-class IslandMode {
-public:
-    explicit IslandMode(bool force_static) {
-        const char* previous = std::getenv("NUKA_FORCE_STATIC_ISLANDS");
-        had_value_ = previous != nullptr;
-        if (previous) previous_ = previous;
-        Set(force_static ? "1" : "0");
-    }
-    ~IslandMode() { Set(had_value_ ? previous_.c_str() : nullptr); }
-private:
-    static void Set(const char* value) {
-#ifdef _WIN32
-        _putenv_s("NUKA_FORCE_STATIC_ISLANDS", value ? value : "");
-#else
-        if (value) setenv("NUKA_FORCE_STATIC_ISLANDS", value, 1);
-        else unsetenv("NUKA_FORCE_STATIC_ISLANDS");
-#endif
-    }
-    bool had_value_ = false;
-    std::string previous_;
-};
-
 void CheckDryFrictionResponse(bool coupled) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     const auto fixture = std::filesystem::path(NUKA_SOURCE_DIR) /
         "tests/data/osc_passive_damping.xml";
-    for (bool force_static : {false, true}) {
-        IslandMode schedule(force_static);
-        for (uint32_t drive_mode : {1u, 4u}) {
-            for (uint32_t fold_damping : {0u, 1u}) {
-                for (float speed : {0.05f, 0.0001f}) {
-                    SCOPED_TRACE(::testing::Message() << "coupled=" << coupled
-                        << " static=" << force_static << " mode=" << drive_mode
-                        << " fold=" << fold_damping << " speed=" << speed);
-                    auto scene = nuka::import::LoadMjcf(fixture.string());
-                    auto& joint = scene.GetJointMut(scene.Joints().back().id);
-                    joint.damping = 0.0f;
-                    joint.frictionloss = 1.0f;
-                    if (coupled) joint.axis = {1.0f, 0.0f, 0.0f};
-                    nuka::scene::cook::CookToModelOptions options;
-                    options.enable_contacts = false;
-                    auto model = nuka::scene::cook::CookToModel(scene, 1, options).model;
-                    ASSERT_EQ(model.capacities.max_contacts_per_env, 0u);
-                    ASSERT_FLOAT_EQ(model.articulation.joint_frictionloss[2], 1.0f);
-                    model.drive_mode = drive_mode;
-                    model.osc_task_link = 1u;
-                    nk::Pipeline::SolverConfig config;
-                    config.dt = 0.002f;
-                    config.fold_drive_damping = fold_damping;
-                    config.gravity[0] = config.gravity[1] = config.gravity[2] = 0.0f;
-                    nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
-                    ASSERT_TRUE(world.Ready());
-                    auto& data = world.GetData();
-                    const std::vector<float> zero(6, 0.0f);
-                    const std::vector<float> velocity{0.0f, 0.0f, speed, 0.0f, 0.0f, -speed};
-                    ASSERT_TRUE(data.UploadField(nk::FieldId::Qdot, velocity.data(), velocity.size() * sizeof(float)));
-                    for (auto field : {nk::FieldId::DriveStiffness, nk::FieldId::DriveDamping, nk::FieldId::DriveTarget}) {
-                        ASSERT_TRUE(data.UploadField(field, zero.data(), zero.size() * sizeof(float)));
-                    }
-                    ASSERT_TRUE(world.Step().AllOk());
-                    std::vector<float> after(6);
-                    ASSERT_TRUE(data.DownloadField(nk::FieldId::Qdot, after.data(), after.size() * sizeof(float)));
-                    const float inverse_diagonal = coupled ? 1.1f / 1.2f : 1.0f / 1.1f;
-                    const float inverse_cross = coupled ? -0.1f / 1.2f : 0.0f;
-                    for (uint32_t env = 0; env < 2u; ++env) {
-                        const uint32_t hand = env * 3u + 1u;
-                        const uint32_t finger = hand + 1u;
-                        const float impulse = -std::copysign(
-                            std::min(config.dt, speed / inverse_diagonal), velocity[finger]);
-                        EXPECT_NEAR(after[finger], velocity[finger] + inverse_diagonal * impulse, 2.0e-6f);
-                        EXPECT_NEAR(after[hand], inverse_cross * impulse, 2.0e-6f);
-                    }
+    for (uint32_t drive_mode : {1u, 4u}) {
+        for (uint32_t fold_damping : {0u, 1u}) {
+            for (float speed : {0.05f, 0.0001f}) {
+                SCOPED_TRACE(::testing::Message() << "coupled=" << coupled
+                    << " mode=" << drive_mode
+                    << " fold=" << fold_damping << " speed=" << speed);
+                auto scene = nuka::import::LoadMjcf(fixture.string());
+                auto& joint = scene.GetJointMut(scene.Joints().back().id);
+                joint.damping = 0.0f;
+                joint.frictionloss = 1.0f;
+                if (coupled) joint.axis = {1.0f, 0.0f, 0.0f};
+                nuka::scene::cook::CookToModelOptions options;
+                options.enable_contacts = false;
+                auto model = nuka::scene::cook::CookToModel(scene, 1, options).model;
+                ASSERT_EQ(model.capacities.max_contacts_per_env, 0u);
+                ASSERT_FLOAT_EQ(model.articulation.joint_frictionloss[2], 1.0f);
+                model.drive_mode = drive_mode;
+                model.osc_task_link = 1u;
+                nk::Pipeline::SolverConfig config;
+                config.dt = 0.002f;
+                config.fold_drive_damping = fold_damping;
+                config.gravity[0] = config.gravity[1] = config.gravity[2] = 0.0f;
+                nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
+                ASSERT_TRUE(world.Ready());
+                auto& data = world.GetData();
+                const std::vector<float> zero(6, 0.0f);
+                const std::vector<float> velocity{0.0f, 0.0f, speed, 0.0f, 0.0f, -speed};
+                ASSERT_TRUE(data.UploadField(nk::FieldId::Qdot, velocity.data(), velocity.size() * sizeof(float)));
+                for (auto field : {nk::FieldId::DriveStiffness, nk::FieldId::DriveDamping, nk::FieldId::DriveTarget}) {
+                    ASSERT_TRUE(data.UploadField(field, zero.data(), zero.size() * sizeof(float)));
+                }
+                ASSERT_TRUE(world.Step().AllOk());
+                std::vector<float> after(6);
+                ASSERT_TRUE(data.DownloadField(nk::FieldId::Qdot, after.data(), after.size() * sizeof(float)));
+                const float inverse_diagonal = coupled ? 1.1f / 1.2f : 1.0f / 1.1f;
+                const float inverse_cross = coupled ? -0.1f / 1.2f : 0.0f;
+                for (uint32_t env = 0; env < 2u; ++env) {
+                    const uint32_t hand = env * 3u + 1u;
+                    const uint32_t finger = hand + 1u;
+                    const float impulse = -std::copysign(
+                        std::min(config.dt, speed / inverse_diagonal), velocity[finger]);
+                    EXPECT_NEAR(after[finger], velocity[finger] + inverse_diagonal * impulse, 2.0e-6f);
+                    EXPECT_NEAR(after[hand], inverse_cross * impulse, 2.0e-6f);
                 }
             }
         }

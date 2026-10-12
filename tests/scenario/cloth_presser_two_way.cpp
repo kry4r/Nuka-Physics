@@ -5,7 +5,7 @@
 // above a ground plane, then a simple rigid body presses it. The cloth particles
 // are SPHERE collidables flowing through the SAME body<->particle row solver a
 // foot uses on the ground: detection -> body<->particle narrowphase -> emit ->
-// SolveRowsBlockIsland -> particle finalize. No bespoke coupler: the
+// BlockDescentSolve -> particle finalize. No bespoke coupler: the
 // presser is a general rigid body, the cloth is particles, both on one path.
 //
 // The two directions of the two-way effect, proven numerically:

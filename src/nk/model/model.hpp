@@ -53,9 +53,6 @@ struct ModelCapacities {
     uint32_t rigid_contact_rows_per_env = 0u;
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
     uint32_t foot_shape_count = 0u;
-    uint64_t schedule_island_elements = 0u;
-    uint64_t schedule_color_elements = 0u;
-    uint64_t schedule_row_elements = 0u;
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
     uint32_t joint_friction_rows_per_env = 0; // one scalar slot per link when friction is authored
     uint32_t joint_drive_rows_per_env = 0;
@@ -107,10 +104,6 @@ struct ModelCapacities {
     uint32_t max_sdf_grids        = 0;  // cooked sparse-SDF grid count.
     uint32_t max_sdf_cells        = 0;  // total cooked narrow-band SDF cells.
 
-    // Byte size of the island_cub_temp field (the BuildSolveIslands cub radix-sort
-    // temp over the total row capacity; sized at World construct, 0 == no rows).
-    uint64_t island_cub_temp_bytes = 0;
-
     // Byte size of the pair_sort_scratch field (the LbvhQueryPairs canonicalizing
     // radix sort over the rigid slot capacity; sized at World construct,
     // 0 == non-PairDriven world -> the emitted stream stays as-is).
@@ -118,9 +111,7 @@ struct ModelCapacities {
     uint64_t lbvh_sort_scratch_bytes = 0;
     uint64_t contact_cache_scratch_bytes = 0;
     uint64_t contact_index_scratch_bytes = 0;
-    uint64_t solver_velocity_scratch_bytes = 0;
     uint64_t pair_sample_chunk_words = 0;
-    uint64_t solve_color_scratch_words = 0;
     uint64_t block_descent_scratch_words = 0;
 
     // MLS-MPM background grid node count PER ENV (the cooked grid dims product; 0
@@ -284,7 +275,7 @@ bool CanonicalizeContactProfileForUpload(const ModelMaterialBucket& source,
 // ---------------------------------------------------------------------------
 
 // Which contact pipeline this Model runs through the AssembleRows /
-// SolveRowsBlockIsland ops:
+// BlockDescentSolve ops:
 //   FusedFoot — DEAD (L1-b): the legacy M3 articulation foot pipeline runtime
 //               was DELETED. The enum value is retained (not renumbered) until
 //               the L1-d enum collapse; no runtime branch reads it anymore.
@@ -469,14 +460,6 @@ public:
     std::vector<uint32_t> dof_to_link;
     std::vector<uint32_t> dof_to_component;
 
-    // -- M4: the device-resident solve schedule (filled by nk::SolveSchedule
-    // BEFORE World::UploadTo; staged into the island_row_offsets /
-    // island_color_segments / row_order Model fields). See solve/schedule.hpp.
-    std::vector<uint32_t> schedule_row_order;       // [total rows in order]
-    std::vector<uint32_t> schedule_color_segments;  // pairs {offset, count}
-    std::vector<uint32_t> schedule_islands;         // quads {seg_off, seg_cnt, flags, env}
-    uint32_t schedule_island_count  = 0;
-    uint32_t schedule_segment_count = 0;
     // Convex hull geometry + SDF grids are referenced by ModelShape indices and
     // packed into the .nka by the cooker; the device upload of those large
     // assets is the collision milestone's (M5) business, not M3a's.

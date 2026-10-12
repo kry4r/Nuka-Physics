@@ -21,8 +21,7 @@
 // t2*lambda_t2)/dt, where n / t1 / t2 are the world contact normal and the two
 // world friction tangents the solver built its chain Jacobians from (so lambda_n
 // / lambda_t1 / lambda_t2 are signed magnitudes along those world directions --
-// see SolveArticulatedContactRows: it applies qdot += M^-1 J^T lambda with J built
-// from n / t1 / t2).
+// the solver applies qdot += M^-1 J^T lambda with J built from n / t1 / t2).
 //
 // (A) Net per-link wrench. For each link g, summed over the contact slots tagged
 // to g (a slot is tagged via contact_link[slot] == g):
