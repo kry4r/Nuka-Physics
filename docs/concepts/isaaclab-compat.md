@@ -104,7 +104,7 @@ termination evaluation, then masked autoreset.
 
 - Nuka does not include Omniverse Kit, an RTX viewport, extensions, or the
   complete Isaac Lab configuration hierarchy.
-- Physics results are Nuka's deterministic CUDA dynamics, not PhysX numerics.
+- Physics results are Nuka's CUDA dynamics, not PhysX numerics.
 - Text USD is supported; binary `.usdc` and `.usdz` are not.
 - The manager compatibility layer is focused on RL. Scene authoring and beauty
   rendering use `nuka.author` and `World.render_beauty` directly.

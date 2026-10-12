@@ -39,7 +39,7 @@ stamp = world.state_sensor_stamp(imu, env=0)
 
 IMU acquisition integrates velocity changes over physical substeps and subtracts gravity. Free fall therefore gives zero specific force at the center of mass; supported rest measures the opposing gravity vector. Off-center mounts include angular acceleration and centripetal acceleration. Solved contact impulses are included. Each substep uses the midpoint sensor orientation; high angular rates still require adequate integration resolution. Position and velocity sensors acquire the endpoint state.
 
-Contact transducers sum normal and friction impulses on all collision shapes belonging to the mounting body or link. Dynamic bodies and static force plates use the same contact rows, including contacts with XPBD particles and MLS-MPM grid endpoints. Torque includes the lever arm to `local_offset`; there is no spatial patch filter. A body mount must select the owning body, not an extra collision-shape proxy.
+Contact transducers sum normal and friction impulses on all collision shapes belonging to the mounting body or link. Dynamic bodies and static force plates use the same contact rows, including contacts with VBD particles and MLS-MPM grid endpoints. Torque includes the lever arm to `local_offset`; there is no spatial patch filter. A body mount must select the owning body, not an extra collision-shape proxy.
 
 `FORCE_TORQUE` measures the load transmitted from the parent into the selected link and its descendants. It uses live spatial inertias, changes in linear and spin momentum, gravity, and solved external contacts, then accumulates child loads through the articulation tree. Static weight, actuator effort transmitted to links, joint limits, friction and contact reactions contribute to this balance. Off-center centers of mass and rotated inertia frames are included. A fixed articulation root measures support from the world; free bodies and floating roots have no parent interface and are rejected. Place the sensor on a supported articulation link, such as a wrist or fixed tool attachment.
 
@@ -70,7 +70,7 @@ MJCF accelerometer/gyro, joint position/velocity, frame pose, velocimeter, force
 
 ## Touch volumes and tactile taxels
 
-Touch and tactile sensors read the actual impulses from the common contact solver, including friction and contacts with XPBD and MLS-MPM. Their mounts select an owning rigid body or articulation link. The spatial mask selects contacts on that mount; it does not create contacts or add stiffness to the simulation. A deforming particle surface cannot itself carry these rigidly mounted sensors.
+Touch and tactile sensors read the actual impulses from the common contact solver, including friction and contacts with VBD cloth and MLS-MPM. Their mounts select an owning rigid body or articulation link. The spatial mask selects contacts on that mount; it does not create contacts or add stiffness to the simulation. A deforming particle surface cannot itself carry these rigidly mounted sensors.
 
 `TOUCH` sums positive normal forces. A contact contributes when the ray from its contact point along the mounting body's outward contact normal intersects the sensing volume. This follows MuJoCo's touch-region convention, including projection of soft contacts into a site. Sphere, box, ellipsoid, capsule and cylinder regions are supported. Box and ellipsoid `size` contains three half-axes; sphere uses `(radius, 0, 0)`; capsule and cylinder use `(radius, half_height, 0)` along local Z.
 
@@ -159,7 +159,7 @@ Observation views retain their addresses across configuration, acquisition, rese
 
 ## Cameras and lidar
 
-Camera and lidar attachment APIs use the same scene geometry and ray traversal. Articulated links, rigid bodies, and fixed-topology particle surfaces are visible: XPBD cloth and tetrahedral soft bodies update from each environment's live particle positions before tracing. A scene containing only one surface or one rigid instance is supported.
+Camera and lidar attachment APIs use the same scene geometry and ray traversal. Articulated links, rigid bodies, and fixed-topology particle surfaces are visible: VBD cloth and tetrahedral soft bodies update from each environment's live particle positions before tracing. A scene containing only one surface or one rigid instance is supported.
 
 Use `nuka.SensorMount.WORLD.value` for a fixed camera or lidar: `local_offset` is its world pose and `mount_index` is ignored. This also works in particle-only scenes without a rigid body or articulation. NKS sensor records use `"mount": "world"`. Mounted state sensors continue to require a body or articulation link.
 
@@ -167,7 +167,7 @@ Particle surfaces retain their authored material and render skin. `skin_smooth_i
 
 Camera depth is distance along the center ray, in meters, rather than optical-axis Z depth. Normal, albedo and primitive ID also use that center ray; color integrates the configured shading samples. Lidar range uses its beam ray, with the configured maximum range for a miss. Equal camera and lidar rays therefore measure the same surface distance. Monte Carlo color samples depend on the global camera index as well as the configured seed; comparing a batched tile with a standalone camera requires matching those sample indices.
 
-Image and range observations are ideal unless their response model is enabled. MLS-MPM density surfaces, individual grains and PBF fluid surfaces are not yet included in camera/lidar rendering.
+Image and range observations are ideal unless their response model is enabled. MLS-MPM density surfaces and individual grains are not yet included in camera/lidar rendering.
 
 ### Electronic image formation
 

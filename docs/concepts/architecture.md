@@ -11,8 +11,6 @@ operation schedule advances one or thousands of environments.
 - **GPU-resident production path.** CUDA owns simulation state and execution.
   CPU implementations are reference and validation tools, never a silent
   production fallback.
-- **D1 determinism.** Physics kernels use fixed ordering and avoid
-  floating-point atomics so identical inputs reproduce bit-for-bit.
 - **Batched by model.** Immutable cooked tables are shared while each
   environment owns independent mutable state.
 - **One contact architecture.** Rigid, articulated, particle, deformable, and
@@ -63,15 +61,15 @@ state
   -> broadphase / candidate pairs
   -> narrowphase / contact streams
   -> universal constraint and coupling rows
-  -> deterministic scheduling and solve
+  -> block-descent solve (UABD)
   -> articulation and particle/continuum updates
   -> integration
   -> sensors, tensor views, and rendering
 ```
 
-Rigid and articulated dynamics use the same model and world as XPBD cloth,
-soft bodies, cables, PBF fluid, and MLS-MPM media. A `CouplingProvider` connects
-cross-system contacts to the shared row scheduler and body-side reaction sink;
+Rigid and articulated dynamics use the same model and world as VBD cloth,
+cables, and MLS-MPM media. A `CouplingProvider` connects cross-system contacts
+to the shared block-descent solve and body-side reaction sink;
 media-specific constitutive updates remain inside their own operators.
 
 ## Core objects
@@ -93,7 +91,7 @@ media-specific constitutive updates remain inside their own operators.
 | Engine model and execution | `src/nk`, `src/phi`, `src/runtime` |
 | Scene import and cooking | `src/scene`, `src/import` |
 | Contacts and solve | `src/collision`, `src/constraint`, `src/solver` |
-| Differentiation and generated kernels | `src/diffsim`, `src/codegen` |
+| Generated kernels | `src/codegen` |
 | Sensors and rendering | `src/sensor`, `src/render`, `src/rt` |
 | Stable integration boundary | `src/include/nuka`, `src/c_abi` |
 | Python bindings and authoring | `python/nuka`, `python/nuka/author` |
@@ -104,7 +102,7 @@ media-specific constitutive updates remain inside their own operators.
 - The C ABI in `src/include/nuka` is the stable embedding surface.
 - Nanobind exposes device, world, scene-builder, sensor, rendering, and buffer
   APIs through `python/nuka`.
-- DLPack aliases engine buffers into PyTorch or JAX without host copies.
+- DLPack aliases engine buffers into PyTorch without host copies.
 - `nuka.author.Scene` is the high-level simulation assembler. Geometry,
   constitutive material, appearance, and control remain separate inputs.
 - `nuka.gym` and `nuka.isaaclab_compat` build RL environments on the same world

@@ -74,7 +74,7 @@ The high-level authoring API separates four concerns:
 | Part | API | Purpose |
 |---|---|---|
 | Geometry | `nuka.author.morphs` | Robots, rigid primitives, cloth grids, soft bodies, fluids, granular beds, and cables |
-| Physics | `nuka.author.materials` | Mass, friction, XPBD, PBF, and MLS-MPM parameters |
+| Physics | `nuka.author.materials` | Mass, friction, VBD, and MLS-MPM parameters |
 | Appearance | `materials.Render`, `surfaces` | PBR appearance and deformable render surfaces |
 | Assembly | `nuka.author.Scene` | Cook the entities into one GPU world |
 
@@ -152,6 +152,6 @@ pytest python/tests/
 python tools/lint/physics_smell.py
 ```
 
-The lint enforces the deterministic physics rules, public-header constraints,
+The lint enforces the physics-code rules, public-header constraints,
 and generated-file policy. Contribution requirements live in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md).

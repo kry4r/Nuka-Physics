@@ -8,8 +8,8 @@
 <h1 align="center">Nuka-Physics</h1>
 
 <p align="center">
-  <strong>GPU-resident, bit-deterministic, differentiable CUDA physics.</strong><br>
-  One block-descent solver for articulated robots, rigid bodies, VBD cloth, and MLS-MPM continua.
+  <strong>GPU-resident CUDA physics for robot learning.</strong><br>
+  One block-descent solver for articulated robots, rigid bodies, VBD cloth, and MLS-MPM solids.
 </p>
 
 <p align="center">
@@ -78,7 +78,7 @@
 <td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4"><img src="docs/media/jelly_ball_drop.gif" width="100%" alt="MLS-MPM elastic jelly ball dropping and rebounding"></a>
   <br><b>Elastic Jelly</b>
-  <br>Deterministic MLS-MPM elasticity
+  <br>MLS-MPM elasticity
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">Full video</a>
 </td>
 </tr>
@@ -103,42 +103,38 @@ Material demos load the shared [Nuka Dynamics Lab assets](docs/nuka-stage.md), w
 ## Why Nuka
 
 - **GPU-resident at scale.** One cooked world template drives thousands of independent environments on one GPU.
-- **D1 deterministic.** Fixed reduction order and no floating-point atomics produce byte-for-byte repeatable runs.
-- **Differentiable.** Analytical reverse-mode adjoints cover rigid and articulated dynamics with PyTorch and JAX interop.
 - **One solver.** Robot, rigid, cloth, and MLS-MPM contacts all run through one unified block-descent (UABD) solve.
 - **Self-written stack.** CUDA physics, importers, Vulkan rendering, and a CUDA path tracer, with no external physics or rendering SDK.
 
 ## Architecture
 
 <p align="center">
-  <img src="docs/media/nuka-architecture.png" width="100%" alt="Nuka Physics architecture: scene sources compile into a GPU-resident world, flow through one general contact path, and feed learning, sensors, and rendering">
+  <img src="docs/media/nuka-architecture.png" width="100%" alt="Nuka Physics architecture: scene sources cook into a GPU world whose rigid, VBD cloth and MLS-MPM systems share one block-descent contact solve">
 </p>
 
 | Layer | Core modules | Responsibility |
 | --- | --- | --- |
 | Authoring | `scene`, `import` | NKS, MJCF, URDF, and text-USD → SceneIR → cooked model |
-| Simulation | `nk`, `collision`, `constraint` | GPU world, broadphase, narrowphase, universal rows, block-descent solve |
-| Systems | `diffsim`, `sensor`, `codegen` | Reverse-mode adjoint, sensor queries, generated forward/adjoint kernels |
-| Platform | `phi`, `render`, `rt` | CUDA backend, Vulkan raster, CUDA path tracer |
+| Simulation | `nk`, `collision`, `constraint` | GPU world, broadphase, narrowphase, contact rows, block-descent solve |
+| Platform | `phi`, `sensor`, `render`, `rt` | CUDA backend, sensors, Vulkan raster, CUDA path tracer |
 
 ## Capabilities
 
 | System | Status |
 | --- | --- |
 | Rigid + articulated dynamics (Featherstone / ABA) | Production |
-| General contact + terrain / heightfields | Production |
+| Contact, terrain, and heightfields | Production |
 | Unified block-descent contact solve (UABD) | Production |
-| VBD cloth | Functional |
-| MLS-MPM elastic and elastoplastic continuum | Functional |
-| Two-way rigid / articulation / MLS-MPM / VBD cloth coupling | [Functional](docs/concepts/coupling.md) |
-| Independent observations, calibration and stochastic error | [Scalar field models](docs/concepts/sensors.md) |
-| Differentiable rigid + articulated simulation | Functional, contact-free |
-| Batched RL, PyTorch, JAX, DLPack | Functional |
+| VBD cloth and cables | Functional |
+| MLS-MPM elastic and elastoplastic solids | Functional |
+| Two-way robot / rigid / cloth / MLS-MPM coupling | [Functional](docs/concepts/coupling.md) |
+| Sensors with calibration and noise models | [Functional](docs/concepts/sensors.md) |
+| Batched RL with PyTorch and DLPack | Functional |
 | Vulkan raster + CUDA path tracing | Functional |
 
 ## Quick Start
 
-Linux, CUDA 12.8, g++-10, and a CUDA-capable GPU are required.
+Requires Linux, CUDA 12.8, g++-10, CMake 3.20+, Python 3.10+, and an NVIDIA GPU.
 
 ```bash
 export CC=gcc-10 CXX=g++-10
@@ -150,36 +146,28 @@ cmake --build build-cuda128 -j
 pip install -e python
 ```
 
-```bash
-# Train Go2 locomotion across 4096 environments
-CUDA_VISIBLE_DEVICES=0 python examples/training/train_go2_ppo.py --num_actors 4096
-```
-
-Differentiable rollout:
+Step 4096 Go2 environments from PyTorch:
 
 ```python
 import torch
 import nuka
-from nuka.autograd import differentiable_rollout
 
 with nuka.Device.create(0) as device:
     world = nuka.World.create_from_scene(
-        device, "examples/scenes/go2_system_id.usda", 1
+        device, "examples/scenes/go2_locomotion.usda", env_count=4096
     )
-    tape = nuka.Tape.create(world, checkpoint_interval=3)
-    mass = torch.nn.Parameter(torch.tensor([0.9], device="cuda"))
-    actions = torch.zeros(30, world.base_link_count - 1, device="cuda")
-    obs = differentiable_rollout(
-        world,
-        tape,
-        actions,
-        params=mass,
-        param_link_indices=[2],
-        obs="qdot",
-    )
-    obs.square().mean().backward()
-    tape.destroy()
+    q = torch.from_dlpack(world.buffer_view(nuka.JOINT_POSITION))
+    target = torch.from_dlpack(world.buffer_view(nuka.DRIVE_TARGET))
+    target[:, 1:].copy_(q[:, 1:])
+    world.step()
+    nuka.sync()
     world.destroy()
+```
+
+Train Go2 locomotion (needs `rl_games==1.6.5`), or run the [material demos](examples/demo/README.md):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/training/train_go2_ppo.py --num_actors 4096
 ```
 
 ## Documentation

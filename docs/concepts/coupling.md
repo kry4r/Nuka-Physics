@@ -1,17 +1,17 @@
 # Coupled physics
 
-Rigid bodies, articulations, MLS-MPM and XPBD exchange contact impulses through the same constraint rows. Dynamic endpoints contribute their finite mass and receive the opposite reaction; pinned vertices and static colliders act as supports.
+Rigid bodies, articulations, MLS-MPM and VBD cloth exchange contact impulses through the same constraint rows. Dynamic endpoints contribute their finite mass and receive the opposite reaction; pinned vertices and static colliders act as supports.
 
 | Pair | Contact geometry and reaction |
 | --- | --- |
 | Rigid ↔ articulation | Collider manifolds; rigid inertia and articulation Jacobians |
 | Rigid ↔ MLS-MPM | Material points against colliders; interpolated grid response and rigid inertia |
 | Articulation ↔ MLS-MPM | Material points against colliders; interpolated grid response and articulation Jacobians |
-| Rigid ↔ XPBD | Particle spheres against colliders; particle mass and rigid inertia |
-| Articulation ↔ XPBD | Particle spheres against colliders; particle mass and articulation Jacobians |
-| MLS-MPM ↔ XPBD | Material points against the deformed triangle surface; grid response and interpolated vertex reactions |
+| Rigid ↔ VBD | Particle spheres against colliders; particle mass and rigid inertia |
+| Articulation ↔ VBD | Particle spheres against colliders; particle mass and articulation Jacobians |
+| MLS-MPM ↔ VBD | Material points against the deformed triangle surface; grid response and interpolated vertex reactions |
 
-Cloth, tetrahedral soft bodies and cable slabs retain their authored surface topology when cooked. A point cloud or cable centreline alone does not define a collision surface. Multiple XPBD media can share a world with one MLS-MPM medium. An MLS-MPM/PBF mixture is currently rejected.
+Cloth, tetrahedral soft bodies and cable slabs retain their authored surface topology when cooked. A point cloud or cable centreline alone does not define a collision surface. Multiple VBD media can share a world with one MLS-MPM medium.
 
 ## Authoring
 
@@ -20,9 +20,9 @@ Add the media to the same `SceneBuilder` or `nuka.author.Scene`. The shared worl
 ```python
 with nuka.SceneBuilder.create("robot.nks") as scene:
     scene.add_media(
-        kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_XPBD,
+        kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
         cloth_nx=13, cloth_ny=13, cloth_spacing=0.02,
-        cloth_origin=[0.0, 0.0, 0.1], xpbd_particle_mass=0.01,
+        cloth_origin=[0.0, 0.0, 0.1], vbd_particle_mass=0.01,
     )
     scene.add_media(
         kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
@@ -48,7 +48,7 @@ The material integration remains explicit. Contact exchanges do not iterate the 
 
 `CONTACT_SIDE_A_KIND` and `CONTACT_SIDE_B_KIND` identify each reaction owner. Their companion `*_INDEX` fields address a world body, link, particle, grid node or interpolated point endpoint, according to the kind. Indices include the environment offset.
 
-`ContactSideKind.POINT_ENDPOINT` identifies an interpolated MLS-MPM grid or XPBD surface endpoint. Its index selects `POINT_ENDPOINT_RANGES`, a `uint32` array of `[first, count]` pairs. `first` addresses `POINT_ENDPOINT_TERMS` globally. A zero count denotes an unused range.
+`ContactSideKind.POINT_ENDPOINT` identifies an interpolated MLS-MPM grid or VBD surface endpoint. Its index selects `POINT_ENDPOINT_RANGES`, a `uint32` array of `[first, count]` pairs. `first` addresses `POINT_ENDPOINT_TERMS` globally. A zero count denotes an unused range.
 
 `POINT_ENDPOINT_TERMS` exposes the bytes of `nuka_point_endpoint_term_t` from `nuka.h`. Each 44-byte record contains a `uint32 kind`, a `uint32 index` and a column-major 3×3 float velocity map. The map interpolates endpoint velocity; its transpose distributes contact impulse to that term's point mass. Only records referenced by a nonempty range are valid.
 
@@ -71,7 +71,7 @@ MLS-MPM grid bounds describe allocated storage, not container walls. Containers 
 
 Liquid render surfaces are reconstructed from current particle positions. The shared mesher reflects the density field at rigid solid boundaries and closes the surface just inside the solid, preventing missing kernel support from rounding the water away from pool walls. This reconstruction changes neither particle positions nor material history. Display rendering and camera sensors use the same reconstruction and live boundary poses.
 
-The surface and its velocity maps are rebuilt each physical substep and held fixed during the contact solve. Thin layers sharing an MLS-MPM grid cell still share one grid velocity. Surface CCD and multilayer self-contact are not provided by this coupling. Rigid/XPBD collision currently samples particle spheres rather than the full cloth surface.
+The surface and its velocity maps are rebuilt each physical substep and held fixed during the contact solve. Thin layers sharing an MLS-MPM grid cell still share one grid velocity. Surface CCD and multilayer self-contact are not provided by this coupling. Rigid/VBD collision currently samples particle spheres rather than the full cloth surface.
 
 Large mass ratios and nearly redundant friction contacts can require substantially more solver iterations. Assess contact residuals and timestep convergence for the intended load and geometry. Offline `render_beauty` and camera sensors include the registered deforming surfaces.
 
