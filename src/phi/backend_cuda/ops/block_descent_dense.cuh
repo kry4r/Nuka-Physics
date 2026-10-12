@@ -201,6 +201,101 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
     return __syncthreads_or(!finite) == 0;
 }
 
+// AssembleDenseBlock for rigid-sized blocks: each thread folds whole rows into its own sums, which the
+// CTA then adds in warp order, so the assembly scales with the rows instead of a 32-row tile.
+template <typename Block>
+__device__ bool AssembleSmallDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
+                                        BlockScratch s, double* gradient, double* inertia, bool* converged) {
+    constexpr uint32_t kMaxDof = Block::kMaxDof;
+    constexpr uint32_t kPairs = kMaxDof * (kMaxDof + 1u) / 2u;
+    constexpr uint32_t kSums = kPairs + 2u * kMaxDof;
+    __shared__ double partial[32][kSums];
+    __shared__ double total[kSums];
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    const uint32_t n = b.dimension;
+    const float* u = b.velocity;
+    double sums[kSums] = {};
+    for (size_t at = size_t{b.begin} + threadIdx.x; at < b.end; at += blockDim.x) {
+        const uint32_t slot = s.incidence[at];
+        const LocalTerm term = LoadLocalTerm(data, p, s, slot, ~0u, true);
+        const Vec3 move = LoadIncidenceVec3(s, at, kDenseMoveColumn);
+        Vec3 f{};
+        SymmetricMat3 c{};
+        EvaluateAugmentedResponse(term, move, &f, &c);
+        const uint32_t axes = term.contact ? 3u : 1u;
+        const uint32_t stride = rows[slot].group_normal_count;
+        const float response[3] = {f.x, f.y, f.z};
+        const float noise[3] = {fabsf(f.x) + c.xx * (fabsf(term.residual.x) + fabsf(move.x)),
+                                fabsf(f.y) + c.yy * (fabsf(term.residual.y) + fabsf(move.y)),
+                                fabsf(f.z) + c.zz * (fabsf(term.residual.z) + fabsf(move.z))};
+        float jacobian[3][kMaxDof];
+        for (uint32_t axis = 0u; axis < 3u; ++axis)
+            for (uint32_t i = 0u; i < kMaxDof; ++i)
+                jacobian[axis][i] = axis < axes && i < n ? b.Jacobian(data, p, slot + axis * stride, i) : 0.0f;
+        for (uint32_t i = 0u, e = 0u; i < kMaxDof; ++i) {
+            for (uint32_t j = 0u; j <= i; ++j, ++e) {
+                float value = jacobian[0][i] * c.xx * jacobian[0][j];
+                if (axes > 1u)
+                    value += jacobian[1][i] * c.yy * jacobian[1][j] + jacobian[2][i] * c.zz * jacobian[2][j] +
+                             c.yz * (jacobian[1][i] * jacobian[2][j] + jacobian[2][i] * jacobian[1][j]);
+                sums[e] += value;
+            }
+            for (uint32_t axis = 0u; axis < axes; ++axis) {
+                sums[kPairs + i] += static_cast<double>(jacobian[axis][i]) * response[axis];
+                sums[kPairs + kMaxDof + i] += fabsf(jacobian[axis][i]) * noise[axis];
+            }
+        }
+    }
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t warp = threadIdx.x / warpSize;
+    for (uint32_t k = 0u; k < kSums; ++k) {
+        const double sum = SumDenseBlockWarp(sums[k]);
+        if (lane == 0u) partial[warp][k] = sum;
+    }
+    __syncthreads();
+    for (uint32_t k = threadIdx.x; k < kSums; k += blockDim.x) {
+        double value = 0.0;
+        for (uint32_t w = 0u; w < blockDim.x / warpSize; ++w) value += partial[w][k];
+        total[k] = value;
+    }
+    __syncthreads();
+    bool finite = true;
+    for (uint32_t e = threadIdx.x; e < n * (n + 1u) / 2u; e += blockDim.x) {
+        uint32_t i = 0u;
+        while ((i + 1u) * (i + 2u) / 2u <= e) ++i;
+        const uint32_t j = e - i * (i + 1u) / 2u;
+        const float h = b.Mass(i, j) + static_cast<float>(total[e]);
+        b.matrix[size_t{i} * b.stride + j] = h;
+        finite &= isfinite(h);
+    }
+    double force = 0.0;
+    float scale = 0.0f;
+    if (threadIdx.x < n) {
+        double inertial = 0.0;
+        for (uint32_t k = 0u; k < n; ++k) {
+            const double difference = static_cast<double>(u[k]) - static_cast<double>(b.Free(k));
+            const float mass = b.Mass(threadIdx.x, k);
+            inertial += static_cast<double>(mass) * difference;
+            scale += fabsf(mass) * static_cast<float>(fabs(difference));
+        }
+        force = total[kPairs + threadIdx.x] - inertial;
+        scale += static_cast<float>(total[kPairs + kMaxDof + threadIdx.x]);
+        gradient[threadIdx.x] = force;
+        inertia[threadIdx.x] = inertial;
+        b.force[threadIdx.x] = static_cast<float>(force);
+        finite &= isfinite(static_cast<float>(force));
+    }
+    __syncthreads();
+    bool small = true;
+    if (threadIdx.x < n) {
+        for (uint32_t k = 0u; k < n; ++k)
+            scale += fabsf(b.matrix[size_t{max(threadIdx.x, k)} * b.stride + min(threadIdx.x, k)]) * fabsf(u[k]);
+        small = fabs(force) <= static_cast<double>(kDenseRoundings * FLT_EPSILON) * scale;
+    }
+    *converged = __syncthreads_and(small) != 0;
+    return __syncthreads_or(!finite) == 0;
+}
+
 // w_j = J_j d for every incidence; a row group of lanes sums each row.
 template <typename Block>
 __device__ void StoreDenseRowSteps(const Block& b, DataView data, BlockDescentSolveParams p,
@@ -320,7 +415,12 @@ __device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data
     double first_decrement = 0.0;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
         bool converged = false;
-        if (!AssembleDenseBlock(b, data, p, s, gradient, inertia, &converged)) {
+        bool assembled = false;
+        if constexpr (kMaxDof <= kRigidBlockDof)
+            assembled = AssembleSmallDenseBlock(b, data, p, s, gradient, inertia, &converged);
+        else
+            assembled = AssembleDenseBlock(b, data, p, s, gradient, inertia, &converged);
+        if (!assembled) {
             failure = nk::BlockSolveFailure::InvalidEquation;
             break;
         }

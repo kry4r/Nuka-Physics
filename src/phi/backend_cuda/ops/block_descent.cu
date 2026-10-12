@@ -33,6 +33,8 @@ using math::Vec3;
 using math::SymmetricMat3;
 constexpr uint32_t kThreads = 128u;
 constexpr uint32_t kRigidBlockDof = 6u;
+// A rigid body solves all its rows in one CTA, so it takes a wider one than the other blocks.
+constexpr uint32_t kRigidThreads = 256u;
 constexpr uint32_t kSolverCountWords = 6u;
 constexpr uint32_t kSolverPhaseWords = 8u;
 constexpr uint32_t kNoCacheColor = ~0u;
@@ -549,6 +551,16 @@ __device__ uint32_t Owner(const BlockDescentSolveParams& p, uint32_t kind, uint3
     return ~0u;
 }
 
+// Stress cells reach lattice-1 nodes i-1..i+1; point rows span two nodes per axis on either lattice.
+__host__ __device__ inline uint32_t GridLatticeWidth(const BlockDescentSolveParams& p, uint32_t lattice) {
+    return nk::kMpmStencilWidth + (lattice != 0u && p.material_cells_per_env > 0u ? 1u : 0u);
+}
+
+__host__ __device__ inline uint32_t GridColorCount(const BlockDescentSolveParams& p) {
+    const uint32_t width = GridLatticeWidth(p, 1u);
+    return nk::kMpmLatticeStencilNodes + width * width * width;
+}
+
 __device__ uint32_t GridNodeColor(const BlockDescentSolveParams& p, uint32_t node) {
     const uint32_t nodes_per_env = p.total_grid_count / p.env_count;
     const uint32_t lattice_nodes = nodes_per_env / nk::kMpmLattices;
@@ -558,7 +570,7 @@ __device__ uint32_t GridNodeColor(const BlockDescentSolveParams& p, uint32_t nod
     const uint32_t x = local % p.grid_dims[0];
     const uint32_t y = (local / p.grid_dims[0]) % p.grid_dims[1];
     const uint32_t z = static_cast<uint32_t>(local / (size_t{p.grid_dims[0]} * p.grid_dims[1]));
-    const uint32_t width = nk::kMpmStencilWidth + lattice;
+    const uint32_t width = GridLatticeWidth(p, lattice);
     const uint32_t first = lattice == 0u ? 0u : nk::kMpmLatticeStencilNodes;
     return first + x % width + width * (y % width + width * (z % width));
 }
@@ -590,7 +602,10 @@ __global__ void InitializeOwnerCacheColorsKernel(
             if (!elastic && local >= p.grid_particles_per_env && data.particle_inv_mass[owner] > 0.0f)
                 color = p.vertex_blocks.colors;
         } else if (owner < grid_first) {
-            color = p.vertex_blocks.colors + 1u;
+            // Static bodies never descend, so their rows need no rigid cache.
+            const uint32_t body = owner - dense_first;
+            if (body >= p.total_body_count || data.body_inv_mass[body] > 0.0f)
+                color = p.vertex_blocks.colors + 1u;
         } else {
             const uint32_t node = owner - grid_first;
             if (data.grid_inv_mass[node] > 0.0f)
@@ -1333,6 +1348,14 @@ __device__ bool Finite(Vec3 value) {
     return fabsf(value.x) <= FLT_MAX && fabsf(value.y) <= FLT_MAX && fabsf(value.z) <= FLT_MAX;
 }
 
+// Caches a row's assembled state with, if asked, its potential.
+__device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                  uint32_t slot, const AugmentedRowState& state, bool potential) {
+    s.row_state[slot] = state;
+    if (!potential) return;
+    s.row_state[slot].potential = EvaluateLocalResidual(LoadLocalTerm(data, p, s, slot, ~0u, true), {});
+}
+
 #include "phi/backend_cuda/ops/block_descent_dense.cuh"
 #include "phi/backend_cuda/ops/block_descent_articulation.cuh"
 #include "phi/backend_cuda/ops/block_descent_rigid.cuh"
@@ -1372,14 +1395,6 @@ __global__ void PackBlockArticulationVelocityKernel(ArticulationDeviceState stat
         s.articulation_free[at] = value;
         s.articulation_snapshot[at] = value;
     }
-}
-
-// Caches a row's assembled state with, if asked, its potential.
-__device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                  uint32_t slot, const AugmentedRowState& state, bool potential) {
-    s.row_state[slot] = state;
-    if (!potential) return;
-    s.row_state[slot].potential = EvaluateLocalResidual(LoadLocalTerm(data, p, s, slot, ~0u, true), {});
 }
 
 // Rows too few to give every warp scheduler a warp are latency-bound, so adjacent lanes evaluate one
@@ -1424,6 +1439,24 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
         if (axis != 0u) continue;
         state.normal_bound = AugmentedRowBound(s, row, slot, scale, state);
         CacheAugmentedRow(data, p, s, slot, state, potential);
+    }
+}
+
+// Point rows of grid owners, cached once per grid sweep; grid descents then update them in place.
+__global__ void CacheGridRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    const uint32_t first = p.vertex_blocks.colors + 2u;
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        const uint32_t slot = s.active_rows[item];
+        if (rows[slot].flags & nk::nk_row_flags::kMaterialBlock) continue;
+        const uint32_t* words = s.row_cache_colors + size_t{slot} * s.color_words;
+        bool grid = false;
+        for (uint32_t word = first / 32u; word < s.color_words && !grid; ++word) {
+            const uint32_t low = word == first / 32u ? first % 32u : 0u;
+            grid = (words[word] >> low) != 0u;
+        }
+        if (grid) CacheAugmentedRow(data, p, s, slot, ComputeAugmentedRowState(data, p, s, slot, true), true);
     }
 }
 
@@ -2426,7 +2459,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                 if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }
             if (p->total_body_count > 0u) {
-                LaunchCuda(DescendRigidBlocksKernel, dim3(p->total_body_count), dim3(kThreads),
+                LaunchCuda(DescendRigidBlocksKernel, dim3(p->total_body_count), dim3(kRigidThreads),
                            0u, stream, data, *p, s);
                 if (cudaGetLastError() != cudaSuccess) return Status::Failed;
             }
@@ -2438,11 +2471,10 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                     data, *p, s) != cudaSuccess) return Status::Failed;
             BlockScratch grid_s = s;
             grid_s.grid_snapshot = data.grid_velocity;
-            for (uint32_t color = 0u; color < nk::kMpmCellStencilNodes; ++color) {
+            if (LaunchWork(CacheGridRowsKernel, s.rows, kThreads, stream, data, *p, grid_s) != cudaSuccess)
+                return Status::Failed;
+            for (uint32_t color = 0u; color < GridColorCount(*p); ++color) {
                 const uint32_t cache_color = p->vertex_blocks.colors + 2u + color;
-                if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                        data, *p, grid_s, cache_color, spread_rows, false) != cudaSuccess)
-                    return Status::Failed;
                 if (p->material_cells_per_env > 0u &&
                     LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                         data, *p, grid_s, true, cache_color) != cudaSuccess) return Status::Failed;

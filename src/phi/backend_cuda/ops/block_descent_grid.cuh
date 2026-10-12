@@ -2,7 +2,7 @@
 
 __host__ __device__ uint32_t GridColorCapacity(const BlockDescentSolveParams& p, uint32_t color) {
     const uint32_t lattice = color < nk::kMpmLatticeStencilNodes ? 0u : 1u;
-    const uint32_t width = nk::kMpmStencilWidth + lattice;
+    const uint32_t width = GridLatticeWidth(p, lattice);
     uint32_t residue = color - (lattice == 0u ? 0u : nk::kMpmLatticeStencilNodes);
     uint64_t capacity = p.env_count;
     for (uint32_t axis = 0u; axis < 3u; ++axis) {
@@ -18,7 +18,7 @@ __host__ __device__ uint32_t GridColorCapacity(const BlockDescentSolveParams& p,
 __global__ void InitializeGridColorScheduleKernel(
     DataView, BlockDescentSolveParams p, BlockScratch s) {
     for (uint32_t color = blockIdx.x * blockDim.x + threadIdx.x;
-         color < nk::kMpmCellStencilNodes; color += gridDim.x * blockDim.x) {
+         color < GridColorCount(p); color += gridDim.x * blockDim.x) {
         uint32_t first = 0u;
         for (uint32_t prior = 0u; prior < color; ++prior) first += GridColorCapacity(p, prior);
         s.grid_color_offsets[color] = first;
@@ -228,5 +228,21 @@ __global__ void DescendGridBlocksKernel(
         if (failed || !accepted) continue;
 
         if (lane == 0u) data.grid_velocity[node] = candidate;
+        // Same-color nodes share no rows, so each point row takes this node's move without races.
+        const Vec3 move = candidate - snapshot;
+        const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+        for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
+            const uint32_t slot = s.incidence[at];
+            const NkRow row = rows[slot];
+            if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
+            const LocalTerm term = LoadPointLocalTerm(data, p, s, at);
+            AugmentedRowState state = s.row_state[slot];
+            state.residual = {term.residual.x - term.jacobian[0].Dot(move),
+                              term.residual.y - term.jacobian[1].Dot(move),
+                              term.residual.z - term.jacobian[2].Dot(move)};
+            if (!term.contact) state.residual.y = state.residual.z = 0.0f;
+            state.normal_bound = AugmentedRowBound(s, row, slot, RowStateScale(data, p, slot), state);
+            CacheAugmentedRow(data, p, s, slot, state, true);
+        }
     }
 }
