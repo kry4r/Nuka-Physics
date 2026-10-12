@@ -573,6 +573,11 @@ struct NarrowphaseBodyParticleParams {
     uint32_t particle_row_base;
     uint32_t excluded_particle_begin;
     uint32_t excluded_particle_count;
+    // Vertex-block particles take their surface thickness and a motion-bounded query, and skip meshed bodies.
+    uint32_t vbd_particle_begin;
+    uint32_t vbd_particle_count;
+    uint32_t particle_surfaces;
+    float    dt;
     // 1 == launch ONE WARP per particle (the giant-hull SupportHull scan runs warp-
     // cooperatively); 0 == one thread per particle (analytic-only collider worlds,
     // no wide hull to split). BOTH paths are byte-identical; set by the cook-time max

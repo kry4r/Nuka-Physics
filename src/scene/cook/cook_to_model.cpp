@@ -1350,6 +1350,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     cap.rigid_contact_rows_per_env = static_cast<uint32_t>(rigid_rows);
     cap.max_contacts_per_env = static_cast<uint32_t>(rigid_pairs);
 
+    cap.analytic_collidable_bodies = 0u;
+    for (uint32_t body = 0u; body < cap.bodies_per_env && body < model.shape_table_rows.size(); ++body)
+        if ((model.shape_table_rows[body].contype | model.shape_table_rows[body].conaffinity) != 0u &&
+            (body >= model.mesh_surface_info.size() || model.mesh_surface_info[body].vertex_count == 0u))
+            ++cap.analytic_collidable_bodies;
     for (uint32_t body = 0u; body < cap.bodies_per_env; ++body) {
         if (body >= model.shape_table_rows.size() ||
             model.shape_table_rows[body].contype == 0u ||

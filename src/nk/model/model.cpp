@@ -118,7 +118,8 @@ uint64_t ModelCapacities::ParticleContactReserve(uint32_t grid_particles) const 
     const uint64_t vbd_end = uint64_t{vbd_particle_begin} + vbd_vertices_per_env;
     const uint64_t overlap_begin = std::max<uint64_t>(grid_particles, vbd_particle_begin);
     const uint64_t overlap_end = std::min<uint64_t>(particles_per_env, vbd_end);
-    const uint64_t excluded = overlap_end > overlap_begin ? overlap_end - overlap_begin : 0u;
+    const uint64_t excluded = analytic_collidable_bodies == 0u && overlap_end > overlap_begin
+        ? overlap_end - overlap_begin : 0u;
     return (uint64_t{particles_per_env - grid_particles} - excluded) *
            collision::kBodyParticleContactSlotsPerParticle;
 }

@@ -47,8 +47,13 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     p_np_body_particle.n_soft_particles = 0u;
     // Grid-owned particles do not emit body-particle manifolds.
     p_np_body_particle.particle_row_base = ctx.n_mpm;
+    const bool vbd_rows = model.capacities.analytic_collidable_bodies > 0u;
     p_np_body_particle.excluded_particle_begin = model.capacities.vbd_particle_begin;
-    p_np_body_particle.excluded_particle_count = model.capacities.vbd_vertices_per_env;
+    p_np_body_particle.excluded_particle_count = vbd_rows ? 0u : model.capacities.vbd_vertices_per_env;
+    p_np_body_particle.vbd_particle_begin = model.capacities.vbd_particle_begin;
+    p_np_body_particle.vbd_particle_count = model.capacities.vbd_vertices_per_env;
+    p_np_body_particle.particle_surfaces = model.capacities.particle_surfaces_per_env;
+    p_np_body_particle.dt = ctx.dt;
     p_np_body_particle.sdf_grid_count = model.capacities.max_sdf_grids;
     p_np_body_particle.sdf_cell_total = model.capacities.max_sdf_cells;
     p_np_body_particle.mesh_geometry = {model.capacities.max_hull_verts,
@@ -82,7 +87,7 @@ void RowCouplingProvider::PreCouple(const CouplingBuildCtx& ctx) const {
     } else {
         p_np_body_particle.has_heightfield = 0u;
     }
-    if (model.capacities.vbd_vertices_per_env == 0u ||
+    if (model.capacities.vbd_vertices_per_env == 0u || vbd_rows ||
         ctx.particles_per_env - ctx.n_mpm > model.capacities.vbd_vertices_per_env)
         ctx.Emit(phi::NkOp::NarrowphaseBodyParticle, &p_np_body_particle);
 }

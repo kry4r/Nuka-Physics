@@ -95,6 +95,8 @@ struct ModelCapacities {
     // Vertex blocks occupy particles [vbd_particle_begin, + vbd_vertices_per_env) of each env.
     uint32_t vbd_particle_begin = 0u;
     uint32_t vbd_vertices_per_env = 0u;
+    // Collidable bodies without a cooked surface mesh; vertex blocks meet them in the particle narrowphase.
+    uint32_t analytic_collidable_bodies = 0u;
     uint32_t vbd_dynamic_vertices_per_env = 0u;
     uint32_t vbd_elements_per_env = 0u;
     uint32_t vbd_incidence_per_env = 0u;
@@ -177,7 +179,7 @@ struct ModelCapacities {
     // the one symbolic per:scalar field; its count = num_material_buckets*8.
     uint64_t ElementCount(FieldId id) const;
     // Body-particle contact slots of one env above the rigid budget; grid-owned particles hold none.
-    // Vertex blocks reserve them too, so a cloth world always runs the common solve.
+    // Vertex blocks reserve them only when an analytic body exists; meshed bodies meet them in OGC.
     uint64_t ParticleContactReserve(uint32_t grid_particles) const;
 };
 

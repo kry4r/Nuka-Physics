@@ -38,6 +38,7 @@
 #include "collision/analytical_manifold.hpp"   // amf:: sphere handlers (HD)
 #include "collision/convex_narrowphase.hpp"    // cvx::SphereHull (EPA-bypass)
 #include "collision/cross_system_query.hpp"    // kCrossSystemMaxCandidates (the cap)
+#include "collision/dat_geometry.hpp"
 #include "collision/lbvh_node.cuh"             // LbvhNode (arena tree traversal)
 #include "collision/shape_kind.hpp"            // nuka::collision::ShapeKind
 #include "math/transform.hpp"
@@ -356,6 +357,11 @@ __global__ void NarrowphaseBodyParticleKernel(
     const Vec3* __restrict__ body_aabb_lo,
     const Vec3* __restrict__ body_aabb_hi,
     const float* __restrict__ heights,
+    const ::nuka::collision::MeshSurfaceInfo* __restrict__ surface_info,
+    const float* __restrict__ surface_thickness,
+    const float* __restrict__ surface_speed,
+    const Vec3* __restrict__ body_linear_velocity,
+    const Vec3* __restrict__ body_angular_velocity,
     nkops::SurfaceQueryView surfaces,
     NarrowphaseBodyParticleParams pp,
     uint32_t* __restrict__ ucount,
@@ -405,18 +411,32 @@ __global__ void NarrowphaseBodyParticleKernel(
     if (N == 0u) return;  // uniform per-warp.
 
     const uint32_t global_particle = env * pp.particles_per_env + pi;
+    // Vertex-block particles detect like OGC: surface thickness at the step-start position.
+    const bool vertex_block = pi - pp.vbd_particle_begin < pp.vbd_particle_count;
+    float radius = pp.particle_radius, surface_rate = 0.0f;
+    if (vertex_block) {
+        uint32_t surface = ~0u;
+        for (uint32_t s = 0u; s < pp.particle_surfaces && surface == ~0u; ++s)
+            if (pi >= surface_info[s].vertex_offset &&
+                pi - surface_info[s].vertex_offset < surface_info[s].vertex_count) surface = s;
+        if (surface == ~0u) return;  // uniform per-warp.
+        radius = surface_thickness[surface];
+        surface_rate = surface_speed[size_t{env} * pp.particle_surfaces + surface];
+    } else if (!(radius > 0.0f)) {
+        return;  // uniform per-warp.
+    }
     // The fluid slice [n_soft, P) under PBF/SoftFluid reads the predicted position
     // (the gravity-integrated pos the density solve uses), consistent with the
     // particle-particle grid; the soft slice + pure-Xpbd/Coupled keep particle_pos
     // (their predict already wrote it).
-    const bool fluid_predicted = pp.fluid_pos_source != 0u &&
+    const bool fluid_predicted = !vertex_block && pp.fluid_pos_source != 0u &&
                                  pi >= pp.n_soft_particles &&
                                  pbf_predicted_pos != nullptr;
     const Vec3 center =
         fluid_predicted ? pbf_predicted_pos[global_particle]
                         : particle_pos[global_particle];
-    const float radius = pp.particle_radius;
-    const collision::AABB query = ParticleAabb(center, radius + pp.contact_margin);
+    const collision::AABB query = ParticleAabb(center, vertex_block
+        ? ::nuka::collision::kDatQueryRadiusMax : radius + pp.contact_margin);
 
     // LANE 0 gathers the candidate list (the cand[] + traversal stack are local
     // memory -- holding them on every lane would spill); under kWarp ncand + each
@@ -434,7 +454,6 @@ __global__ void NarrowphaseBodyParticleKernel(
     }
     if (kWarp) ncand = __shfl_sync(0xffffffffu, ncand, 0);
 
-    const amf::PrimParams ps = MakeParticleSphere(center, radius);
     uint32_t written = 0u;
     uint32_t emitted_points = 0u;
     // Walk all gathered candidates: write the first cands_per_particle (deterministic
@@ -447,8 +466,25 @@ __global__ void NarrowphaseBodyParticleKernel(
         if (kWarp) body = __shfl_sync(0xffffffffu, body, 0);
         const PrimShapeDev sb = LoadPrimShape(shape_table, body);
         if ((sb.contype | sb.conaffinity) == 0u) continue;
+        // OGC owns vertex-block contacts with meshed bodies.
+        if (vertex_block && surfaces.mesh_info != nullptr && body < surfaces.shape_count &&
+            surfaces.mesh_info[body].vertex_count > 0u) continue;
         const math::Transform xb = body_pose[env * N + body];
         const amf::PrimParams pb = MakePrim(sb, xb);
+        // A vertex-block sphere spans OGC's motion-bounded query; depth is taken back to its thickness.
+        float sphere = radius;
+        if (vertex_block) {
+            const size_t at = size_t{env} * N + body;
+            const Vec3 lo = body_aabb_lo[at], hi = body_aabb_hi[at];
+            const Vec3 extent{fmaxf(fabsf(lo.x - xb.position.x), fabsf(hi.x - xb.position.x)),
+                              fmaxf(fabsf(lo.y - xb.position.y), fabsf(hi.y - xb.position.y)),
+                              fmaxf(fabsf(lo.z - xb.position.z), fabsf(hi.z - xb.position.z))};
+            const float body_rate = sqrtf(body_linear_velocity[at].LengthSq()) +
+                sqrtf(body_angular_velocity[at].LengthSq()) * sqrtf(extent.LengthSq());
+            sphere = ::nuka::collision::DatQueryRadius(::nuka::collision::DatMotionRadius(
+                radius + pp.contact_margin, pp.dt, surface_rate, body_rate, kDatRelaxation));
+        }
+        const amf::PrimParams ps = MakeParticleSphere(center, sphere);
 
         // Sphere(=particle, A) vs the body shape; the manifold normal is the
         // separation dir for the particle (push it off the body). sb.kind is uniform
@@ -489,7 +525,7 @@ __global__ void NarrowphaseBodyParticleKernel(
                 // surface the coverage miss loud (never a silent tunnel-through).
                 if (lane == 0u) {
                     if (pp.has_heightfield != 0u && heights != nullptr) {
-                        ParticleHeightfield(center, radius, pp.contact_margin, xb, pp,
+                        ParticleHeightfield(center, sphere, pp.contact_margin, xb, pp,
                                             heights, &m);
                     } else if (env_status != nullptr) {
                         atomicOr(&env_status[env], kEnvStatusContactGeometryUnavailable);
@@ -499,15 +535,15 @@ __global__ void NarrowphaseBodyParticleKernel(
             case kKindSdfMesh:
                 if (lane == 0u) {
                     const auto surface = nkops::QueryCollidableSurface(surfaces, body, sb,
-                        nkops::PrimInverseTransformPoint(xb, center), radius + pp.contact_margin);
+                        nkops::PrimInverseTransformPoint(xb, center), sphere + pp.contact_margin);
                     if (!surface.valid) {
                         if (env_status)
                             atomicOr(&env_status[env], kEnvStatusContactGeometryUnavailable);
-                    } else if (surface.distance < radius + pp.contact_margin) {
+                    } else if (surface.distance < sphere + pp.contact_margin) {
                         ::nuka::constraint::ContactPoint pt;
                         pt.position = nkops::SdfTransformPoint(xb, surface.point);
                         pt.normal = PrimRotate(xb.rotation, surface.normal);
-                        pt.penetration = radius - surface.distance;
+                        pt.penetration = sphere - surface.distance;
                         body_feature = surface.triangle != ~0u ? surface.triangle : surface.feature;
                         m.AddPoint(pt);
                     }
@@ -538,11 +574,16 @@ __global__ void NarrowphaseBodyParticleKernel(
                 ucount[static_cast<size_t>(env) * pp.slot_stride + slot] = n;
                 for (uint32_t i = 0u; i < 4u; ++i) {
                     if (i < n) {
+                        // Vertex-block points sit on the body surface below the inflated sphere.
+                        if (vertex_block)
+                            m.points[i].position = center - m.points[i].normal * (sphere - m.points[i].penetration);
                         upoint[scell + i] = m.points[i].position;
                         unormal[scell + i] = m.points[i].normal;
                         // The solver advances from the interval start, while detection uses projected positions.
-                        const Vec3 projected_offset = center - particle_prev_pos[global_particle];
-                        udepth[scell + i] = m.points[i].penetration + m.points[i].normal.Dot(projected_offset);
+                        const Vec3 projected_offset = vertex_block ? Vec3{0.0f, 0.0f, 0.0f}
+                            : center - particle_prev_pos[global_particle];
+                        udepth[scell + i] = m.points[i].penetration - (sphere - radius) +
+                                            m.points[i].normal.Dot(projected_offset);
                         // Side A == the particle (GLOBAL id + the particle index-kind
                         // tag); side B == the body collidable (env-local row + tag).
                         ucontact_a[scell + i] = global_particle;
@@ -598,7 +639,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
         p->slot_stride == 0u || p->cands_per_particle == 0u) {
         return Status::Ok;  // no particles or no reserved slots -> nothing to do.
     }
-    if (p->particle_radius <= 0.0f) return Status::Ok;  // no collision radius cooked.
+    if (p->particle_radius <= 0.0f && p->vbd_particle_count == 0u) return Status::Ok;
     if (data.particle_pos == nullptr || data.particle_prev_pos == nullptr ||
         data.ucontact_law == nullptr || data.body_pose == nullptr ||
         model.shape_table == nullptr) {
@@ -625,6 +666,10 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
                    static_cast<const Vec3*>(data.body_aabb_lo),
                    static_cast<const Vec3*>(data.body_aabb_hi),
                    static_cast<const float*>(model.heights),
+                   model.particle_surface_info, model.particle_surface_thickness,
+                   data.particle_surface_max_speed,
+                   static_cast<const Vec3*>(data.body_linear_velocity),
+                   static_cast<const Vec3*>(data.body_angular_velocity),
                    surfaces, *p,
                    data.ucontact_count, data.ucontact_point, data.ucontact_normal,
                    data.ucontact_depth, data.ucontact_a, data.ucontact_b,
