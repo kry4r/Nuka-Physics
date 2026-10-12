@@ -46,6 +46,8 @@ __global__ void InitializeGridBlocksKernel(
             RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidMass);
             continue;
         }
+        // A node without rows already sits at the minimum of its inertia term, its free velocity.
+        if (s.offsets[owner + 1u] == s.offsets[owner]) continue;
         const uint32_t color = GridNodeColor(p, static_cast<uint32_t>(node));
         const uint32_t item = atomicAdd(s.grid_active_count + color, 1u);
         s.grid_active[s.grid_color_offsets[color] + item] = static_cast<uint32_t>(node);

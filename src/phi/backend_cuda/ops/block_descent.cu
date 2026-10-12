@@ -232,6 +232,9 @@ struct BlockScratch {
     size_t scan_bytes;
     void* incidence_sort;
     size_t incidence_sort_bytes;
+    uint32_t* large_segments;
+    uint32_t* large_count;
+    uint32_t large_capacity;
     uint32_t blocks;
     uint32_t rows;
     uint64_t incidence_capacity;
@@ -301,27 +304,19 @@ __host__ __device__ inline uint32_t IncidenceOffset(const uint32_t* offsets, uin
     return offsets[segment] < capacity ? offsets[segment] : static_cast<uint32_t>(capacity);
 }
 
-struct IncidenceBegin {
+// The radix sort sees only the segments too long for a warp, listed in any order; spare entries are empty.
+struct LargeIncidenceBound {
     const uint32_t* offsets;
+    const uint32_t* segments;
+    const uint32_t* count;
     uint64_t capacity;
-    __host__ __device__ uint32_t operator()(uint32_t segment) const {
-        return IncidenceOffset(offsets, capacity, segment);
+    uint32_t end;
+    __host__ __device__ uint32_t operator()(uint32_t at) const {
+        return at < *count ? IncidenceOffset(offsets, capacity, segments[at] + end) : 0u;
     }
 };
-
-// Segment ends as the radix sort sees them: segments a warp sorts become empty.
-struct LargeIncidenceEnd {
-    const uint32_t* offsets;
-    uint64_t capacity;
-    __host__ __device__ uint32_t operator()(uint32_t segment) const {
-        const uint32_t begin = IncidenceOffset(offsets, capacity, segment);
-        const uint32_t end = IncidenceOffset(offsets, capacity, segment + 1u);
-        return end - begin > kWarpSortLimit ? end : begin;
-    }
-};
-using IncidenceBegins = thrust::transform_iterator<IncidenceBegin, thrust::counting_iterator<uint32_t>>;
-using LargeIncidenceEnds =
-    thrust::transform_iterator<LargeIncidenceEnd, thrust::counting_iterator<uint32_t>>;
+using LargeIncidenceBounds =
+    thrust::transform_iterator<LargeIncidenceBound, thrust::counting_iterator<uint32_t>>;
 
 uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScratch* result) {
     const uint64_t blocks = uint64_t{p.total_particle_count} + p.total_body_count +
@@ -357,13 +352,14 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
             static_cast<uint32_t*>(nullptr), static_cast<int>(blocks + 1u)) != cudaSuccess)
         return 0u;
     size_t incidence_sort_bytes = 0u;
+    const uint64_t large_capacity = std::min(blocks, incidence / (kWarpSortLimit + 1u) + 1u);
     // Owner deduplication bounds each segment by rows, already below CUB's INT_MAX limit.
     if (!tile && blocks > 0u && incidence > 0u &&
         cub::DeviceSegmentedRadixSort::SortKeys(nullptr, incidence_sort_bytes,
             static_cast<const uint32_t*>(nullptr), static_cast<uint32_t*>(nullptr),
-            static_cast<int64_t>(incidence), static_cast<int64_t>(blocks),
-            IncidenceBegins(thrust::counting_iterator<uint32_t>(0u), IncidenceBegin{nullptr, 0u}),
-            LargeIncidenceEnds(thrust::counting_iterator<uint32_t>(0u), LargeIncidenceEnd{nullptr, 0u}),
+            static_cast<int64_t>(incidence), static_cast<int64_t>(large_capacity),
+            LargeIncidenceBounds(thrust::counting_iterator<uint32_t>(0u), LargeIncidenceBound{}),
+            LargeIncidenceBounds(thrust::counting_iterator<uint32_t>(0u), LargeIncidenceBound{}),
             0, RowSlotBits(rows)) != cudaSuccess) return 0u;
     size_t coarse_select_bytes = 0u;
     if (p.total_particle_count > 0u && rows > 0u &&
@@ -440,6 +436,9 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.incidence_sort = take(incidence_sort_bytes / sizeof(uint32_t) +
                             (incidence_sort_bytes % sizeof(uint32_t) != 0u));
     s.incidence_sort_bytes = incidence_sort_bytes;
+    s.large_capacity = incidence_sort_bytes > 0u ? static_cast<uint32_t>(large_capacity) : 0u;
+    s.large_segments = take(s.large_capacity);
+    s.large_count = take(s.large_capacity > 0u ? 1u : 0u);
     at = (at + 1u) & ~uint64_t{1u};
     s.row_state = reinterpret_cast<AugmentedRowState*>(take(
         tile ? 0u : rows * sizeof(AugmentedRowState) / sizeof(uint32_t)));
@@ -1019,7 +1018,10 @@ __global__ void SortSmallIncidenceKernel(BlockScratch s) {
         const uint32_t begin = IncidenceOffset(s.offsets, s.incidence_capacity, segment);
         const uint32_t end = IncidenceOffset(s.offsets, s.incidence_capacity, segment + 1u);
         const uint32_t count = end - begin;
-        if (count > kWarpSortLimit) continue;
+        if (count > kWarpSortLimit) {
+            if (lane == 0u) s.large_segments[atomicAdd(s.large_count, 1u)] = segment;
+            continue;
+        }
         uint32_t keys[kWarpSortKeysPerLane], ranks[kWarpSortKeysPerLane];
 #pragma unroll
         for (uint32_t k = 0u; k < kWarpSortKeysPerLane; ++k) {
@@ -2322,11 +2324,6 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                    0u, stream, data, *p, s);
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
     }
-    if (p->total_grid_count > 0u &&
-        (LaunchWork(InitializeGridColorScheduleKernel, nk::kMpmCellStencilNodes, kThreads, stream,
-             data, *p, s) != cudaSuccess ||
-         LaunchWork(InitializeGridBlocksKernel, p->total_grid_count, kThreads, stream,
-             data, *p, s) != cudaSuccess)) return Status::Failed;
     const bool accelerate = p->acceleration_spectral_radius > 0.0f &&
                             p->acceleration_spectral_radius < 1.0f;
     if (accelerate && (!clear(s.acceleration_disabled, size_t{s.blocks} * sizeof(uint32_t)) ||
@@ -2346,18 +2343,26 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     if (cub::DeviceScan::ExclusiveSum(s.scan, s.scan_bytes, s.counts, s.offsets,
             static_cast<int>(s.blocks + 1u), stream) != cudaSuccess ||
         !clear(s.counts, size_t{s.blocks + 1u} * sizeof(uint32_t))) return Status::Failed;
+    // Grid colors list only the nodes with rows, so they follow the incidence offsets.
+    if (p->total_grid_count > 0u &&
+        (LaunchWork(InitializeGridColorScheduleKernel, nk::kMpmCellStencilNodes, kThreads, stream,
+             data, *p, s) != cudaSuccess ||
+         LaunchWork(InitializeGridBlocksKernel, p->total_grid_count, kThreads, stream,
+             data, *p, s) != cudaSuccess)) return Status::Failed;
     if (LaunchWork(FillIncidenceKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess)
         return Status::Failed;
     if (s.incidence_sort_bytes > 0u) {
-        if (cub::DeviceSegmentedRadixSort::SortKeys(s.incidence_sort, s.incidence_sort_bytes,
+        const LargeIncidenceBound bound{s.offsets, s.large_segments, s.large_count, s.incidence_capacity, 0u};
+        LargeIncidenceBound end_bound = bound;
+        end_bound.end = 1u;
+        if (!clear(s.large_count, sizeof(uint32_t)) ||
+            LaunchWork(SortSmallIncidenceKernel, s.blocks, kThreads / 32u, stream, s) != cudaSuccess ||
+            cub::DeviceSegmentedRadixSort::SortKeys(s.incidence_sort, s.incidence_sort_bytes,
                 s.incidence, s.sorted_incidence, static_cast<int64_t>(s.incidence_capacity),
-                static_cast<int64_t>(s.blocks),
-                IncidenceBegins(thrust::counting_iterator<uint32_t>(0u),
-                                IncidenceBegin{s.offsets, s.incidence_capacity}),
-                LargeIncidenceEnds(thrust::counting_iterator<uint32_t>(0u),
-                                   LargeIncidenceEnd{s.offsets, s.incidence_capacity}),
-                0, RowSlotBits(s.rows), stream) != cudaSuccess ||
-            LaunchWork(SortSmallIncidenceKernel, s.blocks, kThreads / 32u, stream, s) != cudaSuccess)
+                static_cast<int64_t>(s.large_capacity),
+                LargeIncidenceBounds(thrust::counting_iterator<uint32_t>(0u), bound),
+                LargeIncidenceBounds(thrust::counting_iterator<uint32_t>(0u), end_bound),
+                0, RowSlotBits(s.rows), stream) != cudaSuccess)
             return Status::Failed;
     }
     if (LaunchWork(PrepareCacheBucketsKernel, s.incidence_capacity, kThreads, stream, s) != cudaSuccess ||
@@ -2394,7 +2399,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             const bool elastic = color < p->vertex_blocks.colors;
             const uint32_t work = elastic ? p->vertex_blocks.dynamic_vertices * p->env_count
                                           : p->total_particle_count;
-            if (!elastic && p->total_particle_count == p->vertex_blocks.vertices * p->env_count)
+            if (!elastic && p->total_particle_count / p->env_count ==
+                    p->grid_particles_per_env + p->vertex_blocks.vertices)
                 continue;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
                     data, *p, particle_s, color, spread_rows, elastic && seed_rows && iteration > 0u)
