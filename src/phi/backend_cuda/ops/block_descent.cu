@@ -43,6 +43,9 @@ constexpr uint32_t kRowAxisLanes = 4u;
 constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
 constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
+// Penalty scale of rows with grid owners: they tie light nodes to each other and to heavier blocks, where a
+// stiffer penalty pins each block to its neighbours' stale velocities and stalls block Gauss-Seidel.
+constexpr double kGridRowPenaltyScale = 1.0;
 
 struct AugmentedRowState {
     Vec3 residual;
@@ -846,6 +849,35 @@ __device__ Vec3 LoadPointIncidenceJacobian(BlockScratch s, size_t at, uint32_t a
             s.point_jacobian[first + 2u * s.incidence_capacity]};
 }
 
+// PointJacobian of the first `axes` rows of the group headed by `head`; a contact group's rows share their
+// endpoints and differ only in direction, so one search per side serves every axis.
+__device__ void PointJacobians(const NkRow* rows, uint32_t slot, const NkRow& head, uint32_t axes,
+                               PointMassView points, uint32_t kind, uint32_t index, Vec3* jacobian) {
+    const NkRowSide sides[2] = {head.a, head.b};
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        if (!PointMassView::IsPointSide(sides[side].kind)) continue;
+        const uint32_t count = points.Count(sides[side]);
+        uint32_t first = 0u;
+        uint32_t last = count;
+        while (first < last) {
+            const uint32_t middle = first + (last - first) / 2u;
+            const auto term = points.At(sides[side], middle);
+            if (term.kind < kind || (term.kind == kind && term.index < index))
+                first = middle + 1u;
+            else
+                last = middle;
+        }
+        for (uint32_t i = first; i < count; ++i) {
+            const auto term = points.At(sides[side], i);
+            if (term.kind != kind || term.index != index) break;
+            for (uint32_t axis = 0u; axis < axes; ++axis) {
+                const NkRow& row = axis == 0u ? head : rows[slot + axis * head.group_normal_count];
+                jacobian[axis] += points.At(side == 0u ? row.a : row.b, i).jacobian;
+            }
+        }
+    }
+}
+
 __global__ void CachePointIncidenceJacobiansKernel(
     DataView data, BlockDescentSolveParams p, BlockScratch s) {
     const uint32_t lane = threadIdx.x % warpSize;
@@ -865,23 +897,23 @@ __global__ void CachePointIncidenceJacobiansKernel(
             const NkRow head = rows[slot];
             const uint32_t axes = (head.flags & nk::nk_row_flags::kBlockNormal) &&
                 !(head.flags & nk::nk_row_flags::kMaterialBlock) ? kPointJacobianAxes : 1u;
+            Vec3 jacobian[kPointJacobianAxes]{};
+            PointJacobians(rows, slot, head, axes, points, kind, index, jacobian);
             for (uint32_t axis = 0u; axis < kPointJacobianAxes; ++axis) {
-                const Vec3 jacobian = axis < axes
-                    ? PointJacobian(rows[slot + axis * head.group_normal_count], points, kind, index)
-                    : Vec3{};
                 const uint64_t first = uint64_t{axis} * kPointJacobianComponents *
                     s.incidence_capacity + at;
-                s.point_jacobian[first] = jacobian.x;
-                s.point_jacobian[first + s.incidence_capacity] = jacobian.y;
-                s.point_jacobian[first + 2u * s.incidence_capacity] = jacobian.z;
+                s.point_jacobian[first] = jacobian[axis].x;
+                s.point_jacobian[first + s.incidence_capacity] = jacobian[axis].y;
+                s.point_jacobian[first + 2u * s.incidence_capacity] = jacobian[axis].z;
             }
         }
     }
 }
 
+// J M^-1 J^T of a row over its owners; sets `grid` when a grid node owns it.
 __device__ double RowInertialResponse(const NkRow& row, const DataView& data,
                                      const BlockDescentSolveParams& p, PointMassView points,
-                                     uint32_t slot) {
+                                     uint32_t slot, bool* grid) {
     double response = 0.0;
     bool valid = true;
     VisitOwners(row, points, p, [&](uint32_t owner) {
@@ -891,6 +923,7 @@ __device__ double RowInertialResponse(const NkRow& row, const DataView& data,
             const uint32_t kind = owner < p.total_particle_count ? kNkSideParticle : kNkSideGrid;
             const uint32_t index = kind == kNkSideParticle ? owner
                 : owner - p.total_particle_count - p.total_body_count - p.articulation_count;
+            *grid |= kind == kNkSideGrid;
             const Vec3 jacobian = PointJacobian(row, points, kind, index);
             const double norm = double(jacobian.x) * jacobian.x + double(jacobian.y) * jacobian.y +
                                 double(jacobian.z) * jacobian.z;
@@ -971,8 +1004,10 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
                 continue;
             }
         }
-        const double response = RowInertialResponse(row, data, p, points, slot);
-        const double penalty = response > 0.0 ? double(p.penalty_scale) / response : 0.0;
+        bool grid = false;
+        const double response = RowInertialResponse(row, data, p, points, slot, &grid);
+        const double penalty = response > 0.0 ? (grid ? kGridRowPenaltyScale : double(p.penalty_scale)) / response
+                                              : 0.0;
         const bool valid_penalty = response == 0.0 ||
             (penalty > 0.0 && penalty <= double(FLT_MAX) && static_cast<float>(penalty) > 0.0f);
         if (!(response >= 0.0 && isfinite(response)) || !valid_penalty) {
@@ -1806,8 +1841,8 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
     }
 }
 
-// A seeded row's endpoints keep their velocities until its lowest color's next cache, so the state
-// stored here from the new duals is the state that cache would compute.
+// A seeded row's endpoints keep their velocities until its lowest color's next cache, which would compute
+// the state stored here; grid-only rows read the residuals grid descents keep current instead of recomputing.
 __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seed) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
@@ -1817,7 +1852,11 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             UpdateMaterialDual(data, p, s, slot);
             continue;
         }
-        const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
+        const bool grid_only = p.total_grid_count != 0u && GridOnlyRow(s, p.vertex_blocks.colors, slot);
+        AugmentedRowState current = grid_only ? s.row_state[slot] : ComputeAugmentedRowState(data, p, s, slot, false);
+        if (grid_only)
+            current.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), current);
+        const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false, &current);
         data.lambda[slot] = t.normal_bound;
         AugmentedRowState next{};
         next.residual = t.residual;
@@ -1831,8 +1870,7 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             next.dual.z = f.impulse.z;
         }
         if (seed && (p.total_grid_count == 0u
-                ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor
-                : GridOnlyRow(s, p.vertex_blocks.colors, slot))) {
+                ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor : grid_only)) {
             next.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), next);
             s.row_state[slot] = next;
         }
