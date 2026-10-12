@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Load + stability gates for bdx_oneshot.nks. Stages (run in order):
 
-  cook    : one MpmXpbd cook of the full scene; prints body/particle/media counts.
+  cook    : one MpmVbd cook of the full scene; prints body/particle/media counts.
   settle  : N steps PD stand; asserts static-prop zero drift, the curtain stays
             draped on the lintel, the gravel bed settles without escape/NaN, the
             micro objects come to rest, the slab hangs still, the duck stands.
@@ -58,7 +58,7 @@ def link_poses(w):
 
 
 def cloth_slice(w):
-    """The cloth particle rows: the XPBD slice sits ABOVE the MPM slice."""
+    """The cloth particle rows: the VBD slice sits ABOVE the MPM slice."""
     n_cloth = A.CLOTH_NX * A.CLOTH_NY
     p = particles(w)
     return p[-n_cloth:] if p is not None else None

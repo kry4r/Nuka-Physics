@@ -1540,11 +1540,11 @@ public:
                    const std::vector<float>& fluid_min,
                    const std::vector<float>& fluid_max, float fluid_spacing,
                    float fluid_position_jitter, float mpm_loft_headroom,
-                   float xpbd_particle_mass, float xpbd_friction,
+                   float vbd_particle_mass, float vbd_friction,
                    float vbd_stretch_stiffness, float vbd_poisson,
                    float vbd_bend_stiffness, float vbd_damping,
-                   float xpbd_aero_normal, float xpbd_aero_tangent,
-                   float xpbd_aero_max_dv, float mpm_youngs,
+                   float vbd_aero_normal, float vbd_aero_tangent,
+                   float vbd_aero_max_dv, float mpm_youngs,
                    float mpm_poisson, float mpm_density, float mpm_dp_friction,
                    float mpm_dp_cohesion, float mpm_model_kind,
                    float mpm_bulk_modulus, float mpm_tait_gamma, float mpm_viscosity,
@@ -1561,8 +1561,8 @@ public:
                    float cable_slab_mass, float cable_slab_stiffness,
                    uint32_t cable_slab_render_material_id,
                    float mpm_yield_stress, float mpm_hardening_modulus,
-                   uint32_t mpm_contact_capacity, float xpbd_half_thickness,
-                   float xpbd_surface_density) {
+                   uint32_t mpm_contact_capacity, float vbd_half_thickness,
+                   float vbd_surface_density) {
         auto vec3 = [](const std::vector<float>& v, float* out, const char* what) {
             if (v.empty()) return;
             if (v.size() != 3) {
@@ -1587,17 +1587,17 @@ public:
         vec3(fluid_max, d.fluid_max, "fluid_max");
         d.fluid_spacing = fluid_spacing;
         d.fluid_position_jitter = fluid_position_jitter;
-        d.xpbd_particle_mass = xpbd_particle_mass;
-        d.xpbd_friction = xpbd_friction;
-        d.xpbd_half_thickness = xpbd_half_thickness;
-        d.xpbd_surface_density = xpbd_surface_density;
+        d.vbd_particle_mass = vbd_particle_mass;
+        d.vbd_friction = vbd_friction;
+        d.vbd_half_thickness = vbd_half_thickness;
+        d.vbd_surface_density = vbd_surface_density;
         d.vbd_stretch_stiffness = vbd_stretch_stiffness;
         d.vbd_poisson = vbd_poisson;
         d.vbd_bend_stiffness = vbd_bend_stiffness;
         d.vbd_damping = vbd_damping;
-        d.xpbd_aero_drag_normal = xpbd_aero_normal;
-        d.xpbd_aero_drag_tangent = xpbd_aero_tangent;
-        d.xpbd_aero_drag_max_dv = xpbd_aero_max_dv;
+        d.vbd_aero_drag_normal = vbd_aero_normal;
+        d.vbd_aero_drag_tangent = vbd_aero_tangent;
+        d.vbd_aero_drag_max_dv = vbd_aero_max_dv;
         d.mpm_youngs = mpm_youngs;
         d.mpm_poisson = mpm_poisson;
         d.mpm_density = mpm_density;
@@ -3312,12 +3312,12 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("fluid_spacing") = 0.0f,
              nb::arg("fluid_position_jitter") = 0.0f,
              nb::arg("mpm_loft_headroom") = 0.0f,
-             nb::arg("xpbd_particle_mass") = 0.0f,
-             nb::arg("xpbd_friction") = 0.6f,
+             nb::arg("vbd_particle_mass") = 0.0f,
+             nb::arg("vbd_friction") = 0.6f,
              nb::arg("vbd_stretch_stiffness") = 0.0f, nb::arg("vbd_poisson") = 0.0f,
              nb::arg("vbd_bend_stiffness") = 0.0f, nb::arg("vbd_damping") = 0.0f,
-             nb::arg("xpbd_aero_normal") = 0.0f,
-             nb::arg("xpbd_aero_tangent") = 0.0f, nb::arg("xpbd_aero_max_dv") = 0.0f,
+             nb::arg("vbd_aero_normal") = 0.0f,
+             nb::arg("vbd_aero_tangent") = 0.0f, nb::arg("vbd_aero_max_dv") = 0.0f,
              nb::arg("mpm_youngs") = 0.0f, nb::arg("mpm_poisson") = 0.0f,
              nb::arg("mpm_density") = 0.0f, nb::arg("mpm_dp_friction") = 0.0f,
              nb::arg("mpm_dp_cohesion") = 0.0f, nb::arg("mpm_model_kind") = 0.0f,
@@ -3342,12 +3342,12 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("cable_slab_render_material_id") = uint32_t{0xFFFFFFFFu},
              nb::arg("mpm_yield_stress") = 0.0f, nb::arg("mpm_hardening_modulus") = 0.0f,
              nb::arg("mpm_contact_capacity") = 0u,
-             nb::arg("xpbd_half_thickness") = 0.0f,
-             nb::arg("xpbd_surface_density") = 0.0f,
+             nb::arg("vbd_half_thickness") = 0.0f,
+             nb::arg("vbd_surface_density") = 0.0f,
              "Add a TAGGED media record. kind is a MEDIA_* code (CLOTH/SOFT_TET/"
              "FLUID/GRANULAR/CABLE); method a MEDIA_METHOD_* code (MLSMPM/VBD). kind "
              "selects the geometry block (cloth_*/tet_*/fluid_*/cable_*); method selects the "
-             "material block (xpbd_*/vbd_*/mpm_*). A cable is VBD: cable_start/end + "
+             "material block (vbd_*/mpm_*). A cable is VBD: cable_start/end + "
              "cable_segments links, cable_radius bead size, cable_pin endpoint, optional "
              "cable_slab_* rigid weight welded to the loaded end. Material scalars at 0 take "
              "the cook's own defaults. An illegal (kind x method) pair raises here; an "

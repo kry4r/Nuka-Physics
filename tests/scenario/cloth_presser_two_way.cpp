@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // Cloth <-> presser TWO-WAY coupling on the ONE general row solver.
 //
-// A real XPBD cloth grid (24x24 = 576 particles) drapes over a low static ridge
+// A real VBD cloth grid (24x24 = 576 particles) drapes over a low static ridge
 // above a ground plane, then a simple rigid body presses it. The cloth particles
 // are SPHERE collidables flowing through the SAME body<->particle row solver a
 // foot uses on the ground: detection -> body<->particle narrowphase -> emit ->
@@ -146,7 +146,7 @@ void AddSphere(nk::Model& m, const Vec3& pos, float radius, float inv_mass,
 }
 
 // Unpinned cloth drapes over the ridges as shell and hinge vertex blocks.
-cook::XpbdCookInput BuildCloth() {
+cook::VbdCookInput BuildCloth() {
     std::vector<Vec3> rest;
     rest.reserve(kGridN * kGridN);
     const float c0 = -0.5f * static_cast<float>(kGridN - 1u) * kSpacing;
@@ -171,7 +171,7 @@ cook::XpbdCookInput BuildCloth() {
     shell.poisson = 0.3f;
     shell.bend_stiffness = 1.0e-5f;    // soft bend so it drapes.
 
-    cook::XpbdCookInput in;
+    cook::VbdCookInput in;
     in.positions = rest;
     // A tiny downward seed so the flat sheet commits to the ridge symmetrically.
     in.velocities.assign(rest.size(), Vec3{0.0f, 0.0f, -0.05f});
@@ -183,7 +183,7 @@ cook::XpbdCookInput BuildCloth() {
 }
 
 // Cook ground + two ridges + a presser sphere + the cloth into ONE model;
-// CookXpbdParticles grows the rigid budget additively for the body<->particle reserve.
+// CookVbdParticles grows the rigid budget additively for the body<->particle reserve.
 // presser_inv_mass picks kinematic(0)/dynamic(>0); the resist test passes a gap radius.
 nk::Model BuildScene(const Vec3& presser_pos, float presser_inv_mass,
                      float presser_radius = kPresserRadius) {
@@ -204,8 +204,8 @@ nk::Model BuildScene(const Vec3& presser_pos, float presser_inv_mass,
     m.contact_family = nk::ContactFamily::PairDriven;
     m.filter_cross_env = true;
 
-    const cook::XpbdCookInput cloth = BuildCloth();
-    cook::CookXpbdParticles(m, 1u, cloth);    // appends cloth + grows the budget.
+    const cook::VbdCookInput cloth = BuildCloth();
+    cook::CookVbdParticles(m, 1u, cloth);    // appends cloth + grows the budget.
     m.particles.pp_contact_d_min = kContactDMin;
     return m;
 }

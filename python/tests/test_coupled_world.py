@@ -379,7 +379,7 @@ def test_particle_surfaces_camera_lidar_graph_and_reset(device, tmp_path):
         builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
                           cloth_nx=7, cloth_ny=7, cloth_spacing=0.08,
                           cloth_origin=[0.0, 0.0, 0.5], cloth_free=True,
-                          xpbd_particle_mass=0.02,
+                          vbd_particle_mass=0.02,
                           skin_normal_offset=0.007, skin_smooth_iters=2,
                           skin_smooth_lambda=0.2, render_material_id=cloth_material)
         builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
@@ -526,7 +526,7 @@ def test_primitive_axes_halfspace_contacts_and_observations(device, execution, s
         builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
                           cloth_nx=3, cloth_ny=3, cloth_spacing=0.04,
                           cloth_origin=[0, 0, -0.08], cloth_free=True,
-                          xpbd_particle_mass=0.02)
+                          vbd_particle_mass=0.02)
         builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
                           tet_center=[-1.5, 0, -0.15], tet_radius=0.025,
                           tet_cells=8, tet_cell_len=0.01,
@@ -729,7 +729,7 @@ def test_mpm_surface_endpoints_roundtrip_graph_and_reset(device, tmp_path):
             builder.add_media(kind=nuka.MEDIA_CLOTH, method=nuka.MEDIA_METHOD_VBD,
                               cloth_nx=6, cloth_ny=6, cloth_spacing=0.016,
                               cloth_origin=[x, 0.0, 0.06], cloth_free=True,
-                              xpbd_particle_mass=0.01)
+                              vbd_particle_mass=0.01)
         builder.add_media(kind=nuka.MEDIA_SOFT_TET, method=nuka.MEDIA_METHOD_MLSMPM,
                           tet_center=[0.0, 0.0, 0.085], tet_radius=0.04,
                           tet_cells=8, tet_cell_len=0.012,

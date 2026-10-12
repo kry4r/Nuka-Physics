@@ -119,7 +119,7 @@ struct CookParticleSurface {
     std::vector<uint32_t> edges;
 };
 
-struct XpbdCookInput {
+struct VbdCookInput {
     std::vector<math::Vec3>      positions;     // per-particle rest state
     std::vector<math::Vec3>      velocities;    // per-particle initial velocity
     std::vector<float>           inv_mass;      // 1/mass (0 == pinned)
@@ -141,8 +141,8 @@ struct XpbdCookInput {
 
 // Stage a vertex-block soft body into the Model (single-env template;
 // SeedInitialState replicates env-major).
-void CookXpbdParticles(nk::Model& model, uint32_t env_count,
-                       const XpbdCookInput& in);
+void CookVbdParticles(nk::Model& model, uint32_t env_count,
+                       const VbdCookInput& in);
 
 // One MLS-MPM material the cook appends to model.mpm_materials (the constitutive
 // branch, later, reads it). Mirrors nk::MpmMaterial 1:1.
@@ -183,7 +183,7 @@ struct MpmCookInput {
 
 // Stage an MLS-MPM bulk-soft body into the Model (single-env template; F=identity,
 // C=0, vol0 from the lattice). Sets ParticleMode::Mpm + the grid/material caps;
-// reuses the SAME particle-slot reserve as CookXpbdParticles (coupling one-path).
+// reuses the SAME particle-slot reserve as CookVbdParticles (coupling one-path).
 void CookMpmParticles(nk::Model& model, uint32_t env_count,
                       const MpmCookInput& in);
 
@@ -193,15 +193,15 @@ void ValidateMedia(const std::vector<MediaRecord>& media);
 
 // Co-resident [mpm | vertex blocks] cook: MPM occupies [0, n_mpm), the soft set the rest.
 // One empty side reduces to the single-medium cook; contact_d_min is the body<->particle diameter.
-void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
-                 const XpbdCookInput& soft, float contact_d_min = 0.0f);
+void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
+                 const VbdCookInput& soft, float contact_d_min = 0.0f);
 
 // ---------------------------------------------------------------------------
 // Media records -> particle cook. The per-medium builders read a scene
 // MediaRecord and reuse the SAME topology/lattice cookers
 // (soft::BuildClothVertexBlocks / import::cooker::CookFluidBox) -- never
 // reimplemented. The dispatch concatenates vertex-block media into the soft slice and
-// MLS-MPM media onto one grid, composing them with CookMpmXpbd when both are present.
+// MLS-MPM media onto one grid, composing them with CookMpmVbd when both are present.
 // ---------------------------------------------------------------------------
 
 // Whether a medium solves as vertex blocks (cloth and cable); these end the soft slice.
@@ -210,13 +210,13 @@ bool IsVertexBlockMedium(const MediaRecord& media);
 // Build the soft-slice input of a cloth MediaRecord: a baked mesh or a flat (nx x ny)
 // lattice, lumped area masses, and StVK membrane plus hinge vertex blocks from
 // soft::BuildClothVertexBlocks. Empty when the geometry is absent.
-XpbdCookInput BuildClothVertexBlockInput(const MediaRecord& media);
+VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media);
 
 // Build the soft-slice input of a cable MediaRecord: segments+1 vertex blocks from
 // start to end joined by axial springs and segment bends, the pinned endpoint(s)
 // kinematic, and an optional slab whose 8 corners form a 28-spring lattice welded to
 // the loaded end by 4 springs. Empty when segments < 1 or radius <= 0.
-XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media);
+VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media);
 
 // Build the MLS-MPM cook input for a tet-soft / fluid MediaRecord: particles sampled
 // from the geometry (sphere lattice / CookFluidBox), material + grid from MediaMpmMaterial.
@@ -235,7 +235,7 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     const std::vector<MediaRecord>& media);
 
 // Dispatch a validated media list onto an ALREADY-cooked Model: vertex-block media through
-// CookXpbdParticles, MLS-MPM media through CookMpmParticles, both through CookMpmXpbd.
+// CookVbdParticles, MLS-MPM media through CookMpmParticles, both through CookMpmVbd.
 void CookSceneMedia(nk::Model& model, uint32_t env_count,
                     const std::vector<MediaRecord>& media,
                     float particle_contact_radius = 0.0f);

@@ -142,15 +142,15 @@ nuka::scene::MediaRecord ClothMediaFromDesc(const nuka_coupled_particles_desc_t&
     m.cloth_grid.spacing = p.cloth_spacing;
     m.cloth_grid.origin = {p.cloth_origin_x, p.cloth_origin_y, p.cloth_origin_z};
     m.cloth_grid.free = (p.cloth_free != 0u);
-    m.xpbd.particle_mass = p.cloth_particle_mass;
-    m.xpbd.friction = p.cloth_friction;
-    m.xpbd.stretch_stiffness = p.cloth_stretch_stiffness;
-    m.xpbd.bend_stiffness = p.cloth_bend_stiffness;
-    m.xpbd.poisson = p.cloth_poisson;
-    m.xpbd.damping = p.cloth_damping;
-    m.xpbd.aero_drag_normal = p.aero_normal;
-    m.xpbd.aero_drag_tangent = p.aero_tangent;
-    m.xpbd.aero_drag_max_dv = p.aero_max_dv;
+    m.vbd.particle_mass = p.cloth_particle_mass;
+    m.vbd.friction = p.cloth_friction;
+    m.vbd.stretch_stiffness = p.cloth_stretch_stiffness;
+    m.vbd.bend_stiffness = p.cloth_bend_stiffness;
+    m.vbd.poisson = p.cloth_poisson;
+    m.vbd.damping = p.cloth_damping;
+    m.vbd.aero_drag_normal = p.aero_normal;
+    m.vbd.aero_drag_tangent = p.aero_tangent;
+    m.vbd.aero_drag_max_dv = p.aero_max_dv;
     // The studio render skin the live beauty render inflates/relaxes the cloth
     // surface with. Render-only -- not cooked, so the particle layout is unchanged.
     m.render_skin.normal_offset = 0.004f;

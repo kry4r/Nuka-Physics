@@ -1427,7 +1427,7 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
     if (p == nullptr) return Status::Failed;
     MpmProfiler& profiler = MpmProfiler::Get();
     if constexpr (operation == MpmOperation::Predict) profiler.BeginInterval();
-    if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmXpbd) || p->particle_count == 0u) {
+    if ((p->mode != kParticleModeMpm && p->mode != kParticleModeMpmVbd) || p->particle_count == 0u) {
         return Status::Ok;
     }
     if (p->env_count == 0u || p->nodes_per_env == 0u || !(p->dx > 0.0f) ||

@@ -450,7 +450,7 @@ Json VbdWorkload(const nk::Model& model) {
     return result;
 }
 
-Json XpbdQuality(nk::World& world, uint32_t step) {
+Json VbdQuality(nk::World& world, uint32_t step) {
     const auto& model = world.GetModel();
     const auto& particles = model.particles;
     const auto& caps = model.capacities;
@@ -465,7 +465,7 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
     }
     std::vector<nuka::math::Vec3> positions(size_t{caps.env_count} * caps.particles_per_env);
     fixture::Require(world.GetData().DownloadField(nk::FieldId::ParticlePos, positions.data(),
-                     positions.size() * sizeof(nuka::math::Vec3)), "XPBD position download failed");
+                     positions.size() * sizeof(nuka::math::Vec3)), "VBD position download failed");
     double distance_max = 0.0, distance_squared = 0.0;
     double pinned_max = 0.0, distance_rms_max_env = 0.0;
     uint64_t distance_count = 0u, defined_distance_count = 0u;
@@ -567,7 +567,7 @@ Json XpbdQuality(nk::World& world, uint32_t step) {
     return result;
 }
 
-struct XpbdAcceptance {
+struct VbdAcceptance {
     static constexpr double max_strain_limit = 0.05, rms_strain_limit = 0.01;
     double max_strain = 0.0, max_rms_strain = 0.0;
     uint32_t steps_checked = 0u, first_failed_step = 0u, first_nonfinite_step = 0u;
@@ -1105,10 +1105,10 @@ Json SolverWorkload(nk::World& world, const std::vector<nk::NkRow>& rows, uint32
     return Json::Object();
 }
 
-enum class ContactSystem : uint32_t { Rigid, Articulation, Xpbd, Mpm, Fixed, Count };
+enum class ContactSystem : uint32_t { Rigid, Articulation, Vbd, Mpm, Fixed, Count };
 constexpr uint32_t kContactSystems = static_cast<uint32_t>(ContactSystem::Count);
 constexpr std::array<const char*, kContactSystems> kContactSystemNames{
-    "rigid", "articulation", "xpbd", "mpm", "fixed"};
+    "rigid", "articulation", "vbd", "mpm", "fixed"};
 
 struct CouplingAcceptance {
     struct Pair {
@@ -1130,7 +1130,7 @@ struct CouplingAcceptance {
     bool Required(uint32_t a, uint32_t b) const {
         return four_systems ? a < 4u && b < 4u && a < b :
             a == static_cast<uint32_t>(ContactSystem::Articulation) &&
-            b == static_cast<uint32_t>(ContactSystem::Xpbd);
+            b == static_cast<uint32_t>(ContactSystem::Vbd);
     }
 
     void Observe(nk::World& world, const std::vector<nk::NkRow>& rows,
@@ -1167,9 +1167,9 @@ struct CouplingAcceptance {
                 index / caps.particles_per_env == env, "invalid particle endpoint");
             const uint32_t local = index % caps.particles_per_env;
             if (local < model.MpmParticlesPerEnv()) return ContactSystem::Mpm;
-            fixture::Require(model.particles.mode == nk::Model::ParticleMode::MpmXpbd ||
-                model.particles.mode == nk::Model::ParticleMode::Xpbd, "unknown particle system in coupling report");
-            return ContactSystem::Xpbd;
+            fixture::Require(model.particles.mode == nk::Model::ParticleMode::MpmVbd ||
+                model.particles.mode == nk::Model::ParticleMode::Vbd, "unknown particle system in coupling report");
+            return ContactSystem::Vbd;
         };
         const auto category = [&](const nk::NkRowSide& side, uint32_t env) {
             if (side.kind != nk::kNkSidePointEndpoint) return classify(side.kind, side.index, env);
@@ -1505,7 +1505,7 @@ Json RenderMeasurements(nk::World& world, const fixture::SceneVisuals& visuals,
     result.Set("output_layout", Json::Str("env-camera-major color f32x3, depth f32, normal f32x3, albedo f32x3, prim u32"));
     result.Set("output_fnv1a64", Json::Str(Digest(output)));
     result.Set("hit_pixels", Json::Int(hits));
-    result.Set("xpbd_visible_pixels", Json::Int(cloth_pixels));
+    result.Set("vbd_visible_pixels", Json::Int(cloth_pixels));
     result.Set("mpm_visible_pixels", Json::Int(mpm_pixels));
     const bool material_visible = options.scene != "robot-rigid-mpm-cloth" || (cloth_pixels > 0u && mpm_pixels > 0u);
     result.Set("material_visible", Json::Bool(material_visible));
@@ -1629,9 +1629,9 @@ Json Run(const Options& options) {
     }
     uint64_t wrench_hash = 14695981039346656037ull;
     bool wrench_finite = true;
-    Json workload_samples = Json::Array(), xpbd_samples = Json::Array();
+    Json workload_samples = Json::Array(), vbd_samples = Json::Array();
     bool solver_workload_valid = true;
-    XpbdAcceptance xpbd_acceptance;
+    VbdAcceptance vbd_acceptance;
     for (uint32_t i = 0; i < options.warmup + options.steps; ++i) {
         Step(world, options);
         fixture::Require(world.GetData().DownloadField(nk::FieldId::EnvStatus, status.data(),
@@ -1654,8 +1654,8 @@ Json Run(const Options& options) {
             wrench_output.write(reinterpret_cast<const char*>(wrench.data()), wrench_bytes);
             fixture::Require(wrench_output.good(), "cannot write wrench output");
         }
-        auto xpbd_quality = XpbdQuality(world, i + 1u);
-        xpbd_acceptance.Observe(xpbd_quality);
+        auto vbd_quality = VbdQuality(world, i + 1u);
+        vbd_acceptance.Observe(vbd_quality);
         fixture::Require(world.GetData().DownloadField(nk::FieldId::Urows, rows_host.data(),
                          rows_host.size() * sizeof(nk::NkRow)), "row download failed");
         fixture::Require(world.GetData().DownloadField(nk::FieldId::Lambda, impulses.data(),
@@ -1671,7 +1671,7 @@ Json Run(const Options& options) {
             }
             workload_samples.PushBack(std::move(sample));
         }
-        if (periodic_sample) xpbd_samples.PushBack(std::move(xpbd_quality));
+        if (periodic_sample) vbd_samples.PushBack(std::move(vbd_quality));
     }
     const auto replay_state = State(world);
     const auto replay_sensors = StateSensorBytes(world);
@@ -1863,8 +1863,8 @@ Json Run(const Options& options) {
     quality.Set("replica_mismatch_envs", std::move(replica_errors));
     const bool coupling_valid = coupling_acceptance.Valid();
     quality.Set("coupling_acceptance", coupling_acceptance.Report());
-    quality.Set("xpbd_samples", std::move(xpbd_samples));
-    quality.Set("xpbd_acceptance", xpbd_acceptance.Report());
+    quality.Set("vbd_samples", std::move(vbd_samples));
+    quality.Set("vbd_acceptance", vbd_acceptance.Report());
     result.Set("quality", std::move(quality));
     bool render_valid = true;
     if (options.render_sensors != 0u) {
@@ -1886,7 +1886,7 @@ Json Run(const Options& options) {
     Json validity = Json::Object(), unavailable = Json::Array();
     const bool valid = finite && wrench_finite && status_union == 0u && reset_equal && masked_reset_errors.empty() && timed_state == replay_state &&
                        solver_workload_valid &&
-                       coupling_valid && mismatched_envs.empty() && xpbd_acceptance.Valid() && render_valid &&
+                       coupling_valid && mismatched_envs.empty() && vbd_acceptance.Valid() && render_valid &&
                        timed_sensors == replay_sensors;
     validity.Set("valid", Json::Bool(valid));
     validity.Set("valid_scope", Json::Str("lifecycle/state/render/deformation/coupling workload contracts"));
@@ -1896,10 +1896,10 @@ Json Run(const Options& options) {
     Json failures = Json::Array();
     if (status_union != 0u) failures.PushBack(Json::Str("nonzero environment failure flags"));
     if (!solver_workload_valid) failures.PushBack(Json::Str("grid block coloring conflicts or lacks owner coverage"));
-    if (xpbd_acceptance.first_nonfinite_step != 0u) failures.PushBack(Json::Str("nonfinite particles in quality replay"));
-    if (xpbd_acceptance.first_pinned_failure_step != 0u) failures.PushBack(Json::Str("pinned particles moved or became nonfinite in quality replay"));
-    if (xpbd_acceptance.first_undefined_strain_step != 0u) failures.PushBack(Json::Str("cloth strain is undefined in quality replay"));
-    if (xpbd_acceptance.first_strain_failure_step != 0u) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
+    if (vbd_acceptance.first_nonfinite_step != 0u) failures.PushBack(Json::Str("nonfinite particles in quality replay"));
+    if (vbd_acceptance.first_pinned_failure_step != 0u) failures.PushBack(Json::Str("pinned particles moved or became nonfinite in quality replay"));
+    if (vbd_acceptance.first_undefined_strain_step != 0u) failures.PushBack(Json::Str("cloth strain is undefined in quality replay"));
+    if (vbd_acceptance.first_strain_failure_step != 0u) failures.PushBack(Json::Str("cloth length error exceeds the physical quality budget"));
     if (!coupling_valid) failures.PushBack(Json::Str("missing rows or positive impulse for a required system pair in the timed window of an environment"));
     if (!masked_reset_errors.empty()) failures.PushBack(Json::Str("masked reset changed unselected state or missed selected state"));
     if (!render_valid) failures.PushBack(Json::Str("sensor lifecycle, output or physics parity failed"));

@@ -242,7 +242,7 @@ TEST(ParticleAerodynamics, SharedFacesAreDissipativeBoundedAndDeterministic) {
     auto& backend = Device();
     if (!backend.backend) GTEST_SKIP() << "no CUDA backend";
     for (float coefficient : {0.0f, 1.0f, 1.0e6f}) {
-        scene::cook::XpbdCookInput input;
+        scene::cook::VbdCookInput input;
         input.positions = {{0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}};
         input.velocities = {{5, -3, 20}, {}, {-2, 4, 12}, {3, 1, -4}};
         input.inv_mass = {1.0f, 0.0f, 2.0f, 5.0f};
@@ -251,7 +251,7 @@ TEST(ParticleAerodynamics, SharedFacesAreDissipativeBoundedAndDeterministic) {
         input.aero_drag_tangent = coefficient * 0.1f;
         input.aero_drag_max_dv = 0.5f;
         nk::Model model;
-        scene::cook::CookXpbdParticles(model, 3u, input);
+        scene::cook::CookVbdParticles(model, 3u, input);
         auto config = Config();
         nk::World world(std::move(model), 3u, backend.device, backend.backend, config);
         ASSERT_TRUE(world.Ready()) << world.CreationError();

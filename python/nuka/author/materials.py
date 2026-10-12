@@ -21,7 +21,7 @@ from typing import Tuple
 @_dc.dataclass(frozen=True)
 class ClothMaterial:
     """Vertex-block cloth parameters -> the cloth_* cook kwargs (fast path) or the
-    xpbd_*/vbd_* media block (builder path; the aero/free surface adds the rest)."""
+    vbd_* media block (builder path; the aero/free surface adds the rest)."""
 
     MEDIA_KIND = "cloth"
     MEDIA_METHOD = "vbd"
@@ -47,14 +47,14 @@ class ClothMaterial:
 
     def media_material_kwargs(self) -> dict:
         return dict(
-            xpbd_particle_mass=float(self.mass),
-            xpbd_friction=float(self.friction),
+            vbd_particle_mass=float(self.mass),
+            vbd_friction=float(self.friction),
             vbd_stretch_stiffness=float(self.stretch_stiffness),
             vbd_poisson=float(self.poisson),
             vbd_bend_stiffness=float(self.bend_stiffness),
             vbd_damping=float(self.damping),
-            xpbd_half_thickness=float(self.half_thickness),
-            xpbd_surface_density=float(self.surface_density),
+            vbd_half_thickness=float(self.half_thickness),
+            vbd_surface_density=float(self.surface_density),
         )
 
 
@@ -84,7 +84,7 @@ class Cloth:
 
 @_dc.dataclass(frozen=True)
 class CableMaterial:
-    """Vertex-block rod parameters -> the xpbd_*/vbd_* media block. The optional
+    """Vertex-block rod parameters -> the vbd_* media block. The optional
     slab lattice reuses the same particle pool."""
 
     MEDIA_KIND = "cable"
@@ -98,8 +98,8 @@ class CableMaterial:
 
     def media_material_kwargs(self) -> dict:
         return dict(
-            xpbd_particle_mass=float(self.mass),
-            xpbd_friction=float(self.friction),
+            vbd_particle_mass=float(self.mass),
+            vbd_friction=float(self.friction),
             vbd_stretch_stiffness=float(self.stretch_stiffness),
             vbd_bend_stiffness=float(self.bend_stiffness),
             vbd_damping=float(self.damping),

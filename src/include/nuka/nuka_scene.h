@@ -299,17 +299,17 @@ typedef struct nuka_media_desc_t {
 
     // -- constitutive material (the block matching `method`) -----------------
     // The shared soft mass/friction/aero block.
-    float    xpbd_particle_mass;
-    float    xpbd_friction;
+    float    vbd_particle_mass;
+    float    vbd_friction;
     // VBD cloth: stretch = Young's modulus x thickness (N/m), bend = hinge (N m);
     // cable: stretch = EA (N), bend = EI (N m^2). damping is Rayleigh (s).
     float    vbd_stretch_stiffness;
     float    vbd_poisson;
     float    vbd_bend_stiffness;
     float    vbd_damping;
-    float    xpbd_aero_drag_normal;
-    float    xpbd_aero_drag_tangent;
-    float    xpbd_aero_drag_max_dv;
+    float    vbd_aero_drag_normal;
+    float    vbd_aero_drag_tangent;
+    float    vbd_aero_drag_max_dv;
     // MLS-MPM (soft-tet / fluid / granular). model_kind 0 corotated, 2 neo-hookean,
     // 3 fluid, 4 granular Drucker-Prager (dp_friction deg, dp_cohesion Pa).
     float    mpm_youngs;
@@ -341,8 +341,8 @@ typedef struct nuka_media_desc_t {
     float    skin_grain_radius_jitter;
     float    skin_grain_tint_jitter;
     uint32_t render_material_id;     // ~0u (0xFFFFFFFF) => none.
-    float    xpbd_half_thickness;
-    float    xpbd_surface_density;
+    float    vbd_half_thickness;
+    float    vbd_surface_density;
 } nuka_media_desc_t;
 
 // Create a built-scene handle owning one in-memory SceneIR. A non-empty

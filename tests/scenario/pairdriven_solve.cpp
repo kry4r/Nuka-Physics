@@ -381,11 +381,11 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
             EXPECT_EQ((model.mesh_surface_info[body].flags & nuka::collision::kMeshSurfaceOriented) != 0u,
                       mesh.mesh_oriented);
         }
-        cook::XpbdCookInput particle;
+        cook::VbdCookInput particle;
         particle.positions = {{0.1f, 0.08f, initial_height}};
         particle.velocities = {{0, 0, 0}};
         particle.inv_mass = {100.0f};
-        cook::CookXpbdParticles(model, envs, particle);
+        cook::CookVbdParticles(model, envs, particle);
         model.particles.pp_contact_d_min = 2.0f * radius;
         const uint32_t bodies = model.capacities.bodies_per_env;
         auto cfg = Cfg(-side * 9.81f);

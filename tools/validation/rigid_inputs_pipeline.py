@@ -114,7 +114,7 @@ def run_pipeline(device, output, dt=1.0 / 240.0, steps=STEPS, execution="eager")
             nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_VBD,
             cloth_nx=9, cloth_ny=9, cloth_spacing=0.025,
             cloth_origin=[0.1, -0.1, 0.07],
-            xpbd_aero_normal=0.6, xpbd_aero_tangent=0.04, xpbd_aero_max_dv=0.5,
+            vbd_aero_normal=0.6, vbd_aero_tangent=0.04, vbd_aero_max_dv=0.5,
         )
         world = builder.build(
             device, env_count=2, dt=dt, gravity_x=float(GRAVITY[0]),

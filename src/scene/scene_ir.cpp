@@ -1164,8 +1164,8 @@ void SceneIR::ProjectMedia(const MediaRecord& rec) {
             sb.young   = rec.mpm.youngs;
             sb.poisson = rec.mpm.poisson;
         } else {
-            sb.young   = rec.xpbd.stretch_stiffness;
-            sb.poisson = rec.xpbd.poisson;
+            sb.young   = rec.vbd.stretch_stiffness;
+            sb.poisson = rec.vbd.poisson;
         }
         ecs_.Add(entity, std::move(sb));
     }

@@ -6,14 +6,14 @@ along ONE compact indoor walkway (+x travel), saved as a self-contained
 Layout (world metres, +z up):
   A  x in [-0.6, 0.9]: raised wooden departure platform (top 0.10), TWO descending
      steps, chunky stair stringers, and a wooden door frame at x=0.30 whose lintel
-     carries a fabric curtain DRAPED over it (a free XPBD cloth held by contact +
+     carries a fabric curtain DRAPED over it (a free VBD cloth held by contact +
      friction, nothing pinned);
   B  x in [0.9, 2.3]: a full-lane gravel bed -- an MLS-MPM Drucker-Prager granular
      medium filling a shallow flush tray dug into the dirt floor, round-grain skin,
      dirt shoulder ramps all around, one half-buried probe pebble on the walk line;
   C  x in [2.3, 3.2]: a thin light foot-loftable MLS-MPM debris fill appended to the
      Zone B bed on the SAME grid -- coarse grains the passing foot sweeps and lofts;
-  D  x in [3.2, 4.6]: a portal frame at x=3.75 hanging an XPBD cord pinned under the
+  D  x in [3.2, 4.6]: a portal frame at x=3.75 hanging a VBD cord pinned under the
      beam with a rigid stone slab welded to its loaded end, dangling at duck-head
      height so the head strikes it and it swings in the x-z plane.
 
@@ -22,8 +22,8 @@ rafters, wall studs, crates/barrels/shelves off the walk line, a tool board, HDR
 sky light. The duck (bdx_stand.nks) spawns on the platform; its head + trunk gain
 colliding geoms via add_collision_shape.
 
-The media (cloth XPBD + gravel/debris MLS-MPM + cable XPBD) are DECLARED in the
-saved .nks and cook together into one world (ParticleMode::MpmXpbd). Build with
+The media (cloth VBD + gravel/debris MLS-MPM + cable VBD) are DECLARED in the
+saved .nks and cook together into one world (ParticleMode::MpmVbd). Build with
 ``bake_link_sdf=True`` so the duck feet gain visual-mesh SDFs and loft the debris.
 
 Run (repo root): python examples/demo/bdx_oneshot_author.py
@@ -217,9 +217,9 @@ def add_cloth(b, fabric_id, robot="bdx"):
     b.add_media(nuka.MEDIA_CLOTH, nuka.MEDIA_METHOD_VBD,
                 cloth_nx=CLOTH_NX, cloth_ny=CLOTH_NY, cloth_spacing=CLOTH_SPACING,
                 cloth_origin=list(CLOTH_ORIGIN), cloth_pin=nuka.CLOTH_PIN_EDGE_X1,
-                xpbd_particle_mass=particle_mass, xpbd_friction=friction,
+                vbd_particle_mass=particle_mass, vbd_friction=friction,
                 vbd_stretch_stiffness=5.0e3, vbd_poisson=0.3, vbd_bend_stiffness=2.0e-4,
-                xpbd_aero_normal=0.8, xpbd_aero_tangent=0.2, xpbd_aero_max_dv=0.5,
+                vbd_aero_normal=0.8, vbd_aero_tangent=0.2, vbd_aero_max_dv=0.5,
                 render_material_id=fabric_id)
 
 
@@ -436,7 +436,7 @@ def build(args):
     sbox(b, [0.25, 0.008, 0.13],
          [2.55, wall_y - 0.012, 0.30], "board")  # tool board
 
-    # -- media (all records live in the .nks; ONE MpmXpbd cook) -----------------
+    # -- media (all records live in the .nks; ONE MpmVbd cook) -----------------
     if not args.no_cloth:
         add_cloth(b, mat_ids["fabric"], robot)
     if not args.no_gravel:

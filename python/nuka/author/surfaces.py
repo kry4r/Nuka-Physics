@@ -35,8 +35,8 @@ class ClothSurface:
     def media_kwargs(self) -> dict:
         """The cloth free/aero block for ``SceneBuilder.add_media`` (builder path)."""
         n, t, dv = self._aero3()
-        return dict(cloth_free=bool(self.free), xpbd_aero_normal=n,
-                    xpbd_aero_tangent=t, xpbd_aero_max_dv=dv)
+        return dict(cloth_free=bool(self.free), vbd_aero_normal=n,
+                    vbd_aero_tangent=t, vbd_aero_max_dv=dv)
 
 
 @_dc.dataclass(frozen=True)

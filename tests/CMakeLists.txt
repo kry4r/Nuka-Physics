@@ -1197,7 +1197,7 @@ if(CMAKE_CUDA_COMPILER)
         # (box rests on a static ground plane), and two-run byte-identity for the new
         # mixed-island solve path (S1-S6 fed into the existing coupling engine).
         scenario/pairdriven_solve.cpp
-        # Cloth <-> presser two-way coupling: a 576-particle XPBD cloth drapes over a
+        # Cloth <-> presser two-way coupling: a 576-particle VBD cloth drapes over a
         # low static ridge, a rigid presser dips it (cloth Δz down + spring-back on
         # lift) and a dynamic presser is arrested by the cloth (body-side reaction
         # lambda>0 vs a no-cloth control) -- all via the body<->particle row solver.

@@ -635,18 +635,18 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     o.Set("cable_line", std::move(cl));
 
     Value xp = Value::Object();
-    xp.Set("particle_mass", Value::Float(m.xpbd.particle_mass));
-    xp.Set("surface_density", Value::Float(m.xpbd.surface_density));
-    xp.Set("half_thickness", Value::Float(m.xpbd.half_thickness));
-    xp.Set("friction", Value::Float(m.xpbd.friction));
-    xp.Set("stretch_stiffness", Value::Float(m.xpbd.stretch_stiffness));
-    xp.Set("poisson", Value::Float(m.xpbd.poisson));
-    xp.Set("bend_stiffness", Value::Float(m.xpbd.bend_stiffness));
-    xp.Set("damping", Value::Float(m.xpbd.damping));
-    xp.Set("aero_drag_normal", Value::Float(m.xpbd.aero_drag_normal));
-    xp.Set("aero_drag_tangent", Value::Float(m.xpbd.aero_drag_tangent));
-    xp.Set("aero_drag_max_dv", Value::Float(m.xpbd.aero_drag_max_dv));
-    o.Set("xpbd", std::move(xp));
+    xp.Set("particle_mass", Value::Float(m.vbd.particle_mass));
+    xp.Set("surface_density", Value::Float(m.vbd.surface_density));
+    xp.Set("half_thickness", Value::Float(m.vbd.half_thickness));
+    xp.Set("friction", Value::Float(m.vbd.friction));
+    xp.Set("stretch_stiffness", Value::Float(m.vbd.stretch_stiffness));
+    xp.Set("poisson", Value::Float(m.vbd.poisson));
+    xp.Set("bend_stiffness", Value::Float(m.vbd.bend_stiffness));
+    xp.Set("damping", Value::Float(m.vbd.damping));
+    xp.Set("aero_drag_normal", Value::Float(m.vbd.aero_drag_normal));
+    xp.Set("aero_drag_tangent", Value::Float(m.vbd.aero_drag_tangent));
+    xp.Set("aero_drag_max_dv", Value::Float(m.vbd.aero_drag_max_dv));
+    o.Set("vbd", std::move(xp));
 
     auto mpm_mat_json = [](const MediaMpmMaterial& mm) {
         Value mp = Value::Object();
@@ -1768,18 +1768,18 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                           rec.cable_line.slab.render_material_id), material_offset);
                 }
             }
-            if (const Value* xp = mv.Find("xpbd")) {
-                rec.xpbd.particle_mass = f(*xp, "particle_mass", rec.xpbd.particle_mass);
-                rec.xpbd.surface_density = f(*xp, "surface_density", rec.xpbd.surface_density);
-                rec.xpbd.half_thickness = f(*xp, "half_thickness", rec.xpbd.half_thickness);
-                rec.xpbd.friction = f(*xp, "friction", rec.xpbd.friction);
-                rec.xpbd.stretch_stiffness = f(*xp, "stretch_stiffness", rec.xpbd.stretch_stiffness);
-                rec.xpbd.poisson = f(*xp, "poisson", rec.xpbd.poisson);
-                rec.xpbd.bend_stiffness = f(*xp, "bend_stiffness", rec.xpbd.bend_stiffness);
-                rec.xpbd.damping = f(*xp, "damping", rec.xpbd.damping);
-                rec.xpbd.aero_drag_normal = f(*xp, "aero_drag_normal", rec.xpbd.aero_drag_normal);
-                rec.xpbd.aero_drag_tangent = f(*xp, "aero_drag_tangent", rec.xpbd.aero_drag_tangent);
-                rec.xpbd.aero_drag_max_dv = f(*xp, "aero_drag_max_dv", rec.xpbd.aero_drag_max_dv);
+            if (const Value* xp = mv.Find("vbd")) {
+                rec.vbd.particle_mass = f(*xp, "particle_mass", rec.vbd.particle_mass);
+                rec.vbd.surface_density = f(*xp, "surface_density", rec.vbd.surface_density);
+                rec.vbd.half_thickness = f(*xp, "half_thickness", rec.vbd.half_thickness);
+                rec.vbd.friction = f(*xp, "friction", rec.vbd.friction);
+                rec.vbd.stretch_stiffness = f(*xp, "stretch_stiffness", rec.vbd.stretch_stiffness);
+                rec.vbd.poisson = f(*xp, "poisson", rec.vbd.poisson);
+                rec.vbd.bend_stiffness = f(*xp, "bend_stiffness", rec.vbd.bend_stiffness);
+                rec.vbd.damping = f(*xp, "damping", rec.vbd.damping);
+                rec.vbd.aero_drag_normal = f(*xp, "aero_drag_normal", rec.vbd.aero_drag_normal);
+                rec.vbd.aero_drag_tangent = f(*xp, "aero_drag_tangent", rec.vbd.aero_drag_tangent);
+                rec.vbd.aero_drag_max_dv = f(*xp, "aero_drag_max_dv", rec.vbd.aero_drag_max_dv);
             }
             if (const Value* mp = mv.Find("mpm")) read_mpm(*mp, rec.mpm);
             if (const Value* fills = mv.Find("mpm_fills")) {

@@ -3,7 +3,7 @@
 // nuka::collision::gpu::ParticleUniformGrid -- spatial-hash uniform grid for
 // particle broadphase (v0.7 p05, Tasks 7.5.1 / 7.5.2).
 //
-// Standard PBF / XPBD broadphase: hash each particle to a grid cell, stable-sort
+// Standard particle broadphase: hash each particle to a grid cell, stable-sort
 // by cell key (radix; deterministic), build per-cell [start,end) index ranges
 // via a segmented scan, then answer per-particle neighbor queries over the 27
 // surrounding cells. Feeds the soft / fluid / coupling phases (p08-p11).

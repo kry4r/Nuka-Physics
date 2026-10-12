@@ -1,5 +1,5 @@
 # Media-on continuation for the final Go2 one-shot scene.  The coarse scene keeps
-# the same XPBD cloth, MLS-MPM gravel/debris, and XPBD cable/slab interactions as
+# the same VBD cloth, MLS-MPM gravel/debris, and VBD cable/slab interactions as
 # the beauty scene while reducing granular particle density/substeps for PPO.
 params:
   seed: 11

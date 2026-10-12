@@ -37,7 +37,7 @@
 // Co-step ordering (Genesis simulator.py, research-genesis.md:18,99):
 // preprocess -> pre_coupling (each system advances) -> couple (emit + solve these
 // rows) -> post_coupling. v0.8 ships the framework; C6a wires the PBD co-step
-// bridge (XPBD/PBF consume unified manifolds -> these rows).
+// bridge (VBD/MPM consume unified manifolds -> these rows).
 // ---------------------------------------------------------------------------
 
 #include "codegen/generated/row_class_registry.hpp"  // kCouplingContactRowId

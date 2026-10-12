@@ -410,7 +410,7 @@ void Model::StageModelField(FieldId id, const Segment& seg,
     // value-identical to ReplicateArticulationHostState's TileConcat; the two
     // index tables (link_to_articulation, articulation_link_offset) get the
     // per-replica offset exactly as TileConcatOffset does. Sections this model
-    // does not populate (solve-schedule M4, XPBD templates M6) stay zero.
+    // does not populate stay zero.
     uint8_t* dst = host.data() + seg.offset;
     const ModelArticulation& a = articulation;
     const uint32_t L = capacities.links_per_env;
@@ -1204,7 +1204,7 @@ phi::Status ModelCapacities::Validate(std::string* reason) const {
 
 uint32_t Model::MpmParticlesPerEnv() const {
     if (particles.mode == ParticleMode::Mpm) return capacities.particles_per_env;
-    if (particles.mode == ParticleMode::MpmXpbd) return particles.n_mpm_particles;
+    if (particles.mode == ParticleMode::MpmVbd) return particles.n_mpm_particles;
     return 0u;
 }
 

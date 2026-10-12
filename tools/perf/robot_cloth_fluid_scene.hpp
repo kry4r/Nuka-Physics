@@ -55,7 +55,7 @@ inline nk::Pipeline::SolverConfig Cfg() {
     cfg.max_pairs = 64u;
     return cfg;
 }
-inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = kClothNx,
+inline cook::VbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = kClothNx,
                                      float spacing_x = kClothSpacing) {
     Require(nx >= 3u && uint64_t{nx} * nx <= std::numeric_limits<uint32_t>::max() / 6u,
             "cloth grid exceeds topology index range");
@@ -82,7 +82,7 @@ inline cook::XpbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx =
     shell.poisson = 0.3f;
     shell.bend_stiffness = 1.0e-5f;
 
-    cook::XpbdCookInput in;
+    cook::VbdCookInput in;
     in.positions = rest;
     in.velocities.assign(rest.size(), Vec3::Zero());
     in.inv_mass.assign(rest.size(), 1.0f / kClothParticleMass);
@@ -215,7 +215,7 @@ inline nk::Model CookPrepared(const PreparedScene& scene, uint32_t envs = 1u,
     auto cloth = BuildCloth(scene.front_centre.x, scene.front_centre.y, scene.cloth_z, cloth_nx);
     if (!patch_present)
         for (auto& position : cloth.positions) position.z -= 10.0f;
-    cook::CookXpbdParticles(model, envs, cloth);
+    cook::CookVbdParticles(model, envs, cloth);
     model.particles.pp_contact_d_min = kContactDMin;
     for (auto& body : model.body_init)
         if (body.inv_mass > 0.0f) body.angular_velocity = {5.0f, -3.0f, 2.0f};
@@ -317,7 +317,7 @@ inline nk::Model CookMpmPrepared(const PreparedScene& prepared, uint32_t envs,
     mpm.floor_d = cloth_z - 0.04f;
     mpm.floor_friction = 0.6f;
     mpm.contact_capacity = 2048u;
-    cook::CookMpmXpbd(model, envs, mpm, cloth);
+    cook::CookMpmVbd(model, envs, mpm, cloth);
     model.particles.pp_contact_d_min = kClothSpacing;
     model.particles.mpm_body_friction = 0.6f;
     if (visuals) {

@@ -27,7 +27,7 @@
 // formula OUTPUTS D (the cost weight; warp's per-row cost is 0.5*Jaref^2*efc_D).
 // The DUAL regularizer that a PGS / co-solve adds to the effective-mass
 // denominator A is R = 1/D. C4b writes R into Row.compliance_alpha (the term
-// added to the denominator, exactly as XPBD adds alpha/dt^2) and aref into
+// added to the denominator as a compliance alpha/dt^2) and aref into
 // Row.rhs. This header only COMPUTES; it writes nothing to any Row.
 //
 // SIGN CONVENTION (sourced from the contact CALL SITE, not the spec prose) --

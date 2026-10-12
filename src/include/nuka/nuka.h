@@ -213,7 +213,7 @@ typedef struct nuka_coupled_particles_desc_t {
     // Cloth perimeter pin. 0 (default) pins the whole perimeter (a taut membrane);
     // 1 skips the pin so the sheet is a free drape (every particle dynamic).
     uint32_t cloth_free;
-    // Cloth anisotropic aerodynamic drag, passed straight to XpbdCookInput.aero_drag_*
+    // Cloth anisotropic aerodynamic drag, passed straight to VbdCookInput.aero_drag_*
     // (lumped 0.5*rho*Cn normal, 0.5*rho*Ct tangent, per-step velocity-delta clamp).
     // All 0 (default) => no drag op emitted => byte-identical cook; when any is > 0
     // the cloth surface triangles seed the drag op.

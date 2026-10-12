@@ -54,7 +54,7 @@ nk::Pipeline::SolverConfig Cfg() {
 }
 
 // A free (all-dynamic) cloth panel centred at (0,0,z), fitting on a box top.
-cook::XpbdCookInput MakeClothPanel(uint32_t n, float z) {
+cook::VbdCookInput MakeClothPanel(uint32_t n, float z) {
     ns::MediaRecord m;
     m.kind = ns::MediaRecord::Kind::Cloth;
     m.method = ns::MediaRecord::Method::Vbd;
@@ -62,11 +62,11 @@ cook::XpbdCookInput MakeClothPanel(uint32_t n, float z) {
     m.cloth_grid.spacing = kSpacing;
     m.cloth_grid.origin = Vec3{0.0f, 0.0f, z};
     m.cloth_grid.free = true;  // a free drape (no pinned perimeter).
-    m.xpbd.particle_mass = 0.01f;
-    m.xpbd.stretch_stiffness = 1.0e4f;
-    m.xpbd.poisson = 0.3f;
-    m.xpbd.bend_stiffness = 1.0e-4f;
-    m.xpbd.friction = 0.6f;
+    m.vbd.particle_mass = 0.01f;
+    m.vbd.stretch_stiffness = 1.0e4f;
+    m.vbd.poisson = 0.3f;
+    m.vbd.bend_stiffness = 1.0e-4f;
+    m.vbd.friction = 0.6f;
     return cook::BuildClothVertexBlockInput(m);
 }
 
@@ -90,7 +90,7 @@ void AddBox(nk::Model& m, const Vec3& pos, float half, int32_t body_id,
 }
 
 // Finish the capacities + cook the cloth on top of an already-populated body set.
-void FinishModel(nk::Model& m, const cook::XpbdCookInput& cloth) {
+void FinishModel(nk::Model& m, const cook::VbdCookInput& cloth) {
     nk::ContactProfileV1 profile{};
     profile.mu1 = 0.8f;
     profile.mu2 = 0.8f;
@@ -109,7 +109,7 @@ void FinishModel(nk::Model& m, const cook::XpbdCookInput& cloth) {
     m.contact_family = nk::ContactFamily::PairDriven;
     m.filter_cross_env = true;
 
-    cook::CookXpbdParticles(m, 1u, cloth);
+    cook::CookVbdParticles(m, 1u, cloth);
     m.particles.pp_contact_d_min = kSpacing;  // arm the body<->particle sphere radius.
 }
 
@@ -148,7 +148,7 @@ TEST(ClothOnBox, RestsOnStaticBox) {
     nk::Model m;
     AddBox(m, Vec3{0.0f, 0.0f, kBoxTop - kBoxHalf}, kBoxHalf, /*body_id=*/0, 0.0f);
     AddBox(m, Vec3{5.0f, 0.0f, 0.0f}, 0.05f, /*body_id=*/1, 0.0f);  // far filler.
-    const cook::XpbdCookInput cloth = MakeClothPanel(7u, /*z=*/kBoxTop + 0.25f);
+    const cook::VbdCookInput cloth = MakeClothPanel(7u, /*z=*/kBoxTop + 0.25f);
     FinishModel(m, cloth);
     const uint32_t P = m.capacities.particles_per_env;
     ASSERT_EQ(P, 49u);
@@ -190,7 +190,7 @@ TEST(ClothOnBox, RestsOnFreeBox) {
     AddBox(m, Vec3{0.0f, 0.0f, -kGroundHalf}, kGroundHalf, /*body_id=*/0, 0.0f);
     AddBox(m, Vec3{0.0f, 0.0f, kFreeCenter}, kFreeHalf, /*body_id=*/1,
            /*inv_mass=*/1.0f / 2.0f);   // 2 kg free box (heavy vs the 0.5 kg cloth).
-    const cook::XpbdCookInput cloth = MakeClothPanel(5u, /*z=*/free_top + 0.25f);
+    const cook::VbdCookInput cloth = MakeClothPanel(5u, /*z=*/free_top + 0.25f);
     FinishModel(m, cloth);
     const uint32_t P = m.capacities.particles_per_env;
     ASSERT_EQ(P, 25u);

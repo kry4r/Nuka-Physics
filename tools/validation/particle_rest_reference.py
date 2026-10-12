@@ -62,7 +62,7 @@ def run_mujoco(case, output):
         "version": mujoco.__version__, "solver": "Newton; flex edge equality",
         "device": "CPU", "precision": "float64", "max_contacts": max(contacts),
         "model_sha256": hashlib.sha256(xml.encode()).hexdigest(),
-        "scope": "zero-load equilibrium only; flex contact and compliance differ from particle XPBD",
+        "scope": "zero-load equilibrium only; flex contact and compliance differ from particle VBD",
     }
 
 
@@ -99,7 +99,7 @@ def run_newton(case, device):
         "precision": "float32", "iterations": 24, "triangle_stiffness": [1.0e5, 1.0e5],
         "self_contact_margin_m": case["contact_separation_m"], "self_contact_gap_m": 0.01,
         "topological_filter_threshold": 1, "rest_shape_exclusion_radius_m": 0.0,
-        "scope": "zero-load equilibrium only; finite triangle elasticity is not hard XPBD distance compliance",
+        "scope": "zero-load equilibrium only; finite triangle elasticity differs from VBD stretch stiffness",
     }
 
 

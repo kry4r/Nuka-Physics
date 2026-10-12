@@ -7,8 +7,7 @@
 // VOLUME spec into the runtime::fluid::PbfParticleSet the nk PBF world cooks. It
 // owns NO simulation math: it SAMPLES particle initial positions filling the
 // authored volume on a uniform lattice and computes the per-particle mass from
-// the rest density and the lattice cell volume. (Same posture as the p09-D
-// xpbd_cooker: a pure spec -> runtime-state mapping; the per-step sim is GPU.)
+// the rest density and the lattice cell volume.
 //
 // SAMPLING CONVENTION (cell-centered): for an AABB volume of size L along an axis
 // and a particle spacing s, the cooker places
@@ -29,8 +28,7 @@
 // VOLUME SCOPE (p10-B): the cooker fills an axis-aligned BOX (AABB). An OPTIONAL
 // coarse SPHERE inside-test (CookFluidSphere) is provided to demonstrate a
 // non-box volume by carving particles outside the inscribed sphere. A general
-// closed-MESH point-in-mesh fill is DEFERRED to the p16 asset pipeline (same
-// posture as the xpbd_cooker's deferred USD/MJCF file parsing): the importer will
+// closed-MESH point-in-mesh fill is DEFERRED to the p16 asset pipeline: the importer will
 // populate a richer spec and call into a mesh-aware fill there. This file does NOT
 // parse files (no USD nuka:fluid_volume reader -- that layers on at p16, #19/#26).
 // ---------------------------------------------------------------------------
@@ -84,8 +82,7 @@ float FluidParticleMass(const FluidBoxSpec& spec);
 // cell-centered uniform lattice (x fastest), zero initial velocities, and the
 // uniform mass = rest_density * spacing^3. The result feeds the nk PBF world cook
 // (nk::Model::ModelParticles). Invalid spec (spacing <= 0,
-// rest_density <= 0, or an empty box) cooks to an EMPTY set (no throw -- mirrors
-// the xpbd_cooker's empty-input tolerance).
+// rest_density <= 0, or an empty box) cooks to an EMPTY set (no throw).
 runtime::fluid::PbfParticleSet CookFluidBox(const FluidBoxSpec& spec);
 
 // OPTIONAL non-box demo: cook the box lattice, then KEEP only particles whose

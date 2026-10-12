@@ -123,7 +123,7 @@ __device__ __forceinline__ void SolveOneBlockGmres(
     // criterion (no stiff system exists until soft/fluid). Per the master plan, AMG is
     // a v0.7+ suite CAPABILITY (not a phase-pinned deliverable), so it is SEQUENCED to
     // the phase that first assembles a large sparse adjoint through this same
-    // SparseLinearSolver seam (p09 XPBD / p10 PBF / p11 coupling reverse mode). That
+    // SparseLinearSolver seam (coupling reverse mode). That
     // phase sizes the hierarchy against the REAL operator and adds the end-to-end test.
     // Until then this lambda falls through to the safe signed-diagonal Jacobi apply.
     auto apply_precond = [&](double r_i) -> double {

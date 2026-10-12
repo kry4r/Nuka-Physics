@@ -6,7 +6,7 @@
 // dropped onto the STATIC floor plane. The medium couples to the floor entirely
 // through the grid boundary condition (no dynamic body); the ball squashes on
 // impact, the grid BC pushes back, the constitutive stress recovers the shape, and
-// it bounces. This REPLACES the failing XPBD soft-ball on the showcase.
+// it bounces.
 //
 // RENDER: a high-res icosphere skin is bound ONCE to its NEAREST MPM particles
 // (runtime::soft::EmbedSurfaceInParticleSet -- a dense particle fill has no

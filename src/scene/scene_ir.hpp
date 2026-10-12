@@ -326,8 +326,8 @@ struct ContactPairOverride {
 // ---------------------------------------------------------------------------
 
 // Material of a vertex-block cloth or cable: mass, friction, elastic moduli and drag.
-// Fields map to cook::XpbdCookInput.
-struct MediaXpbdMaterial {
+// Fields map to cook::VbdCookInput.
+struct MediaVbdMaterial {
     float    particle_mass     = 0.0f;
     float    surface_density   = 0.0f;   // kg / m^2; mutually exclusive with particle_mass.
     float    half_thickness    = 0.0f;   // m from the cloth midsurface.
@@ -471,7 +471,7 @@ struct MediaRecord {
     std::vector<MpmFill> mpm_fills{};
     AssetRef  baked;            // .nka tet/cloth chunk; empty => procedural.
 
-    MediaXpbdMaterial xpbd{};
+    MediaVbdMaterial vbd{};
     MediaMpmMaterial  mpm{};
 
     MediaRenderSkin render_skin{};

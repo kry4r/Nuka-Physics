@@ -86,7 +86,7 @@ nk::Pipeline::SolverConfig Cfg() {
 
 // A flat cloth patch centred at (cx,cy) lying at height z. Two far corners pinned
 // so the patch does not slide out from under the tip while it is pressed.
-cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
+cook::VbdCookInput BuildCloth(float cx, float cy, float z) {
     std::vector<Vec3> rest;
     rest.reserve(kGridN * kGridN);
     const float c0 = -0.5f * static_cast<float>(kGridN - 1u) * kSpacing;
@@ -111,7 +111,7 @@ cook::XpbdCookInput BuildCloth(float cx, float cy, float z) {
     shell.poisson = 0.3f;
     shell.bend_stiffness = 1.0e-5f;
 
-    cook::XpbdCookInput in;
+    cook::VbdCookInput in;
     in.positions = rest;
     in.velocities.assign(rest.size(), Vec3::Zero());
     in.inv_mass.assign(rest.size(), 1.0f / kParticleMass);
@@ -139,8 +139,8 @@ nk::Model BuildScene(bool patch_present, float cx, float cy, float z) {
     cap.max_contacts_per_env = 16u;
     cap.max_rows_per_env = cap.max_contacts_per_env * nk::kPairDrivenRowsPerSlot;
     if (patch_present) {
-        const cook::XpbdCookInput cloth = BuildCloth(cx, cy, z);
-        cook::CookXpbdParticles(m, 1u, cloth);   // appends cloth + grows the budget.
+        const cook::VbdCookInput cloth = BuildCloth(cx, cy, z);
+        cook::CookVbdParticles(m, 1u, cloth);   // appends cloth + grows the budget.
         m.particles.pp_contact_d_min = kContactDMin;
     }
     return m;

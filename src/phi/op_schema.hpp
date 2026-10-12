@@ -351,7 +351,7 @@ struct MpmParams {
     float    grid_origin[3];     // world-space corner of node (0,0,0)
     float    dx;                 // uniform node spacing
     float    dt;                 // common physics interval
-    uint32_t mode;               // kParticleModeMpm or kParticleModeMpmXpbd.
+    uint32_t mode;               // kParticleModeMpm or kParticleModeMpmVbd.
     uint32_t substeps;           // zero or one; subdivision belongs to the pipeline
     uint32_t material_count;     // mpm_material_table rows (indexed by particle_material_id)
     float    gravity[3];         // world-frame gravity applied on the grid each substep
@@ -506,7 +506,7 @@ struct NarrowphaseBodyParticleParams {
     uint32_t cands_per_particle;  // reserved contact slots per particle
     float    particle_radius;     // the particle collision radius (sphere on the path)
     float    contact_margin;
-    // MpmXpbd: the first env-local particle that generates body rows. The MPM slice
+    // MpmVbd: the first env-local particle that generates body rows. The MPM slice
     // [0, particle_row_base) couples via the grid, NOT rows; it owns no reserved
     // slots (the cook exempts it from the budget). 0 for every other mode.
     uint32_t particle_row_base;
@@ -668,9 +668,9 @@ uint64_t BlockDescentScratchWords(const BlockDescentSolveParams& params);
 
 // Particle modes select material constraints and ownership; all row-coupled particles share integration.
 inline constexpr uint32_t kParticleModeNone = 0u;
-inline constexpr uint32_t kParticleModeXpbd = 1u;
+inline constexpr uint32_t kParticleModeVbd = 1u;
 inline constexpr uint32_t kParticleModeMpm = 5u;
-inline constexpr uint32_t kParticleModeMpmXpbd = 6u;
+inline constexpr uint32_t kParticleModeMpmVbd = 6u;
 
 // Cloth anisotropic AERODYNAMIC DRAG (pre-predict velocity impulse). One thread
 // per surface triangle forms the outward normal + mean velocity from the current
@@ -694,8 +694,8 @@ struct ParticlePredictParams {
     uint32_t mode;             // kParticleMode*
     uint32_t particle_count;   // total env-major particles
     uint32_t particles_per_env;// per-env particle stride
-    // MpmXpbd: the per-env MPM slice count. The XPBD predict SKIPS the low slice
-    // [0, n_mpm) (the transfer loop owns it); 0 for every non-MpmXpbd mode.
+    // MpmVbd: the per-env MPM slice count. The VBD predict SKIPS the low slice
+    // [0, n_mpm) (the transfer loop owns it); 0 for every non-MpmVbd mode.
     uint32_t n_mpm_particles;
     VertexBlockLayout vertex_blocks{};  // predicted by ClothPredict instead
 };
@@ -731,8 +731,8 @@ struct ParticleFinalizeParams {
     // Split-impulse position pass active: carry the per-particle pseudo velocity
     // onto the final position (non-penetration push-out). 0 leaves it byte-identical.
     uint32_t pos_pass;
-    // MpmXpbd: the per-env MPM slice count. The XPBD finalize SKIPS the low slice
-    // [0, n_mpm) (the transfer loop set its final pos/vel); 0 for non-MpmXpbd.
+    // MpmVbd: the per-env MPM slice count. The VBD finalize SKIPS the low slice
+    // [0, n_mpm) (the transfer loop set its final pos/vel); 0 for non-MpmVbd.
     uint32_t n_mpm_particles;
 };
 

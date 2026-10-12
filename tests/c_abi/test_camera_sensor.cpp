@@ -297,7 +297,7 @@ TEST(CameraSensor, ParticleSurfaceWorldMountGraphAndReset) {
     cloth.cloth_spacing = 0.1f;
     cloth.cloth_origin[2] = 0.5f;
     cloth.cloth_free = 1u;
-    cloth.xpbd_particle_mass = 0.02f;
+    cloth.vbd_particle_mass = 0.02f;
     cloth.skin_normal_offset = 0.007f;
     cloth.skin_smooth_iters = 2u;
     cloth.skin_smooth_lambda = 0.2f;

@@ -436,7 +436,7 @@ Status OpParticlePredict(const ModelView&, const DataView& data,
     if (p->mode == kParticleModeNone || p->mode == kParticleModeMpm || p->particle_count == 0u)
         return Status::Ok;
     const uint32_t per_env = p->particles_per_env != 0u ? p->particles_per_env : p->particle_count;
-    const uint32_t active_begin = p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
+    const uint32_t active_begin = p->mode == kParticleModeMpmVbd ? p->n_mpm_particles : 0u;
     if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particle_count % per_env != 0u ||
         active_begin > per_env || data.particle_pos == nullptr || data.particle_prev_pos == nullptr ||
         data.pbf_predicted_pos == nullptr || data.particle_vel == nullptr ||
@@ -506,7 +506,7 @@ Status OpParticleFinalize(const ModelView&, const DataView& data,
     if (p->mode == kParticleModeNone || p->mode == kParticleModeMpm || p->particle_count == 0u)
         return Status::Ok;
     const uint32_t per_env = p->particles_per_env != 0u ? p->particles_per_env : p->particle_count;
-    const uint32_t active_begin = p->mode == kParticleModeMpmXpbd ? p->n_mpm_particles : 0u;
+    const uint32_t active_begin = p->mode == kParticleModeMpmVbd ? p->n_mpm_particles : 0u;
     if (!(p->dt > 0.0f) || !std::isfinite(p->dt) || p->particle_count % per_env != 0u ||
         active_begin > per_env || data.particle_pos == nullptr || data.particle_prev_pos == nullptr ||
         data.pbf_predicted_pos == nullptr || data.particle_vel == nullptr ||

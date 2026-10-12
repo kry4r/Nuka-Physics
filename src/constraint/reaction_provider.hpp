@@ -204,7 +204,7 @@ NUKA_REACTION_HD inline void ArticulationApplyImpulse(
 }
 
 // ===========================================================================
-// ParticleInvMass -- translational point mass (mirror of the xpbd/pbf path)
+// ParticleInvMass -- translational point mass (mirror of the particle path)
 // ===========================================================================
 // A particle has only a scalar inverse mass and a linear velocity -- no angular
 // DOF. `inv_mass` mirrors CudaParticleSet::inv_masses[i]; `velocity` points at

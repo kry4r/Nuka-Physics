@@ -377,9 +377,9 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     const uint32_t particle_count = cap.particles_per_env * env_count;
     const Model::ModelParticles& mp = model.particles;
     const uint32_t particle_mode =
-        mp.mode == Model::ParticleMode::Xpbd ? phi::kParticleModeXpbd
+        mp.mode == Model::ParticleMode::Vbd ? phi::kParticleModeVbd
         : mp.mode == Model::ParticleMode::Mpm ? phi::kParticleModeMpm
-        : mp.mode == Model::ParticleMode::MpmXpbd ? phi::kParticleModeMpmXpbd
+        : mp.mode == Model::ParticleMode::MpmVbd ? phi::kParticleModeMpmVbd
                                                   : phi::kParticleModeNone;
     const uint32_t n_mpm = grid_particles_per_env;
     const uint32_t per_env_particles = cap.particles_per_env;

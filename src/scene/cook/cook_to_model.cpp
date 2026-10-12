@@ -1628,7 +1628,7 @@ uint32_t CookTerrainIntoModel(nk::Model& model,
 // ---------------------------------------------------------------------------
 
 // Stage the soft slice's vertex blocks, whose input particle 0 sits at `particle_base` in each env.
-static void StageVertexBlocks(nk::Model& model, const XpbdCookInput& in, uint32_t particle_base) {
+static void StageVertexBlocks(nk::Model& model, const VbdCookInput& in, uint32_t particle_base) {
     nk::Model::ModelParticles& mp = model.particles;
     nk::ModelCapacities& cap = model.capacities;
     if (uint64_t{in.vbd_begin} + in.vbd_count > in.positions.size())
@@ -1648,14 +1648,14 @@ static void StageVertexBlocks(nk::Model& model, const XpbdCookInput& in, uint32_
     nk::BuildVertexBlockHierarchy(&model);
 }
 
-void CookXpbdParticles(nk::Model& model, uint32_t env_count,
-                       const XpbdCookInput& in) {
+void CookVbdParticles(nk::Model& model, uint32_t env_count,
+                       const VbdCookInput& in) {
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
 
     nk::Model::ModelParticles& mp = model.particles;
-    mp.mode = nk::Model::ParticleMode::Xpbd;
+    mp.mode = nk::Model::ParticleMode::Vbd;
     mp.soft_friction = in.friction;  // body<->soft contact mu (solmix=max).
     mp.initial_pos = in.positions;
     mp.initial_vel = in.velocities;
@@ -1926,26 +1926,26 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
 
 // Grid transfer owns [0, n_mpm); vertex blocks and their contact rows own the remaining slice.
 
-void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
-                 const XpbdCookInput& soft, float contact_d_min) {
+void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
+                 const VbdCookInput& soft, float contact_d_min) {
     const uint32_t envs = env_count > 0 ? env_count : 1u;
     nk::ModelCapacities& cap = model.capacities;
     if (cap.env_count == 1u || cap.env_count == 0u) cap.env_count = envs;
     // The body<->body budget before any particle growth; the final reserve recomputes
-    // from this for the full [mpm|xpbd] count so no slice is double-counted.
+    // from this for the full [mpm|vbd] count so no slice is double-counted.
     const uint32_t rigid_base = RigidContactBase(model);
 
     const uint32_t n_mpm = static_cast<uint32_t>(mpm.positions.size());
-    const uint32_t n_xpbd = static_cast<uint32_t>(soft.positions.size());
+    const uint32_t n_vbd = static_cast<uint32_t>(soft.positions.size());
     // STRICT-SUPERSET fast paths: a one-medium co-residence cook is byte-identical to
     // the single-medium cook plus the same body<->particle contact setup.
-    if (n_xpbd == 0u) {
+    if (n_vbd == 0u) {
         CookMpmParticles(model, env_count, mpm);
         model.particles.pp_contact_d_min = contact_d_min;
         return;
     }
     if (n_mpm == 0u) {
-        CookXpbdParticles(model, env_count, soft);
+        CookVbdParticles(model, env_count, soft);
         model.particles.pp_contact_d_min = contact_d_min;
         return;
     }
@@ -1955,13 +1955,13 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     CookMpmParticles(model, env_count, mpm);
     nk::Model::ModelParticles& mp = model.particles;
 
-    // 2) Cook the XPBD set into a scratch Model (reuses the de-interleave / shape-
+    // 2) Cook the VBD set into a scratch Model (reuses the de-interleave / shape-
     // match flatten / aero-area cookers verbatim), then APPEND its particles and its
     // constraint SoA with every particle index REBASED by n_mpm (the cloth verts land
     // at [n_mpm, P)). The MPM continuum fields stay sized to the MPM slice; the seed's
-    // identity/0 fallback fills the XPBD slice (never read by the transfer loop).
+    // identity/0 fallback fills the VBD slice (never read by the transfer loop).
     nk::Model xtmp;
-    CookXpbdParticles(xtmp, env_count, soft);
+    CookVbdParticles(xtmp, env_count, soft);
     const nk::Model::ModelParticles& xp = xtmp.particles;
     mp.initial_pos.insert(mp.initial_pos.end(), xp.initial_pos.begin(),
                           xp.initial_pos.end());
@@ -1995,13 +1995,13 @@ void CookMpmXpbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
 
     // 3) The body<->particle cloth contact radius + the co-residence schema.
     mp.pp_contact_d_min = contact_d_min;
-    mp.mode = nk::Model::ParticleMode::MpmXpbd;
+    mp.mode = nk::Model::ParticleMode::MpmVbd;
     mp.n_mpm_particles = n_mpm;
-    cap.particles_per_env = n_mpm + n_xpbd;
-    SetParticleOgcCapacity(cap, n_xpbd);
+    cap.particles_per_env = n_mpm + n_vbd;
+    SetParticleOgcCapacity(cap, n_vbd);
     cap.aero_tris_per_env = xtmp.capacities.aero_tris_per_env;
     StageVertexBlocks(model, soft, n_mpm);
-    // Reserve body-particle rows for the XPBD slice above the rigid manifold budget.
+    // Reserve body-particle rows for the VBD slice above the rigid manifold budget.
     GrowContactBudgetForParticles(cap, rigid_base, model.MpmParticlesPerEnv());
 }
 
@@ -2185,13 +2185,13 @@ bool IsVertexBlockMedium(const MediaRecord& media) {
     return media.method == MediaRecord::Method::Vbd;
 }
 
-XpbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
-    XpbdCookInput in;
+VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
+    VbdCookInput in;
     const auto geometry = BuildClothGeometry(media);
     const auto& rest = geometry.rest;
     const auto& tris = geometry.triangles;
     if (rest.empty()) return in;
-    const auto& material = media.xpbd;
+    const auto& material = media.vbd;
     if (!std::isfinite(material.surface_density) || material.surface_density < 0.0f ||
         !std::isfinite(material.particle_mass) || material.particle_mass < 0.0f ||
         !std::isfinite(material.half_thickness) || material.half_thickness < 0.0f ||
@@ -2210,7 +2210,7 @@ XpbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
 
     in.positions = rest;
     CookParticleSurface collision_surface;
-    collision_surface.friction = media.xpbd.friction;
+    collision_surface.friction = media.vbd.friction;
     collision_surface.half_thickness = material.half_thickness;
     for (const auto& tri : tris)
         collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
@@ -2268,13 +2268,13 @@ XpbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
             for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
         }
     }
-    in.friction = media.xpbd.friction;
+    in.friction = media.vbd.friction;
     // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
     // triangles only when active (all-zero coeffs => no op => byte-identical cook).
-    in.aero_drag_normal = media.xpbd.aero_drag_normal;
-    in.aero_drag_tangent = media.xpbd.aero_drag_tangent;
-    in.aero_drag_max_dv = media.xpbd.aero_drag_max_dv;
-    if (media.xpbd.aero_drag_normal > 0.0f || media.xpbd.aero_drag_tangent > 0.0f) {
+    in.aero_drag_normal = media.vbd.aero_drag_normal;
+    in.aero_drag_tangent = media.vbd.aero_drag_tangent;
+    in.aero_drag_max_dv = media.vbd.aero_drag_max_dv;
+    if (media.vbd.aero_drag_normal > 0.0f || media.vbd.aero_drag_tangent > 0.0f) {
         in.aero_triangles.reserve(tris.size());
         for (const auto& t : tris) {
             in.aero_triangles.push_back({t.v[0], t.v[1], t.v[2]});
@@ -2434,12 +2434,12 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
     return surfaces;
 }
 
-XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
-    XpbdCookInput in;
+VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
+    VbdCookInput in;
     const MediaRecord::CableLine& c = media.cable_line;
     const CableLayout layout = CableParticleLayout(media);
     if (layout.chain == 0u) return in;  // no cable (absent geometry).
-    if (!(media.xpbd.stretch_stiffness > 0.0f))
+    if (!(media.vbd.stretch_stiffness > 0.0f))
         throw std::invalid_argument("Cable requires a positive stretch_stiffness");
 
     // Chain particles: segments+1 samples linearly interpolated start -> end.
@@ -2452,7 +2452,7 @@ XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
         chain.push_back(i);
     }
     const float mass =
-        media.xpbd.particle_mass > 0.0f ? media.xpbd.particle_mass : 0.01f;
+        media.vbd.particle_mass > 0.0f ? media.vbd.particle_mass : 0.01f;
     in.inv_mass.assign(np, 1.0f / mass);
     // Pin the authored endpoint(s) kinematic (inv_mass 0); the default hangs the
     // anchor and leaves the loaded end free to carry a weight.
@@ -2460,14 +2460,14 @@ XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     if (c.pin == Pin::Start || c.pin == Pin::Both) in.inv_mass[0] = 0.0f;
     if (c.pin == Pin::End || c.pin == Pin::Both) in.inv_mass[np - 1u] = 0.0f;
     runtime::soft::RodMaterial rod;
-    rod.stretch_stiffness = media.xpbd.stretch_stiffness;
-    rod.bend_stiffness = media.xpbd.bend_stiffness;
-    rod.damping = media.xpbd.damping;
+    rod.stretch_stiffness = media.vbd.stretch_stiffness;
+    rod.bend_stiffness = media.vbd.bend_stiffness;
+    rod.damping = media.vbd.damping;
     runtime::soft::BuildRodVertexBlocks(in.positions, chain, rod, in.vbd_elements);
 
     CookParticleSurface wire;
     wire.half_thickness = c.radius;
-    wire.friction = media.xpbd.friction;
+    wire.friction = media.vbd.friction;
     wire.edges.reserve(size_t(c.segments) * 2u);
     for (uint32_t i = 0u; i < c.segments; ++i) {
         wire.edges.push_back(i);
@@ -2480,7 +2480,7 @@ XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     if (layout.slab == 8u) {
         const std::array<math::Vec3, 8> corners = CableSlabCorners(c);
         const float slab_mass = c.slab.mass > 0.0f ? c.slab.mass : mass;
-        const float stiffness = c.slab.stiffness > 0.0f ? c.slab.stiffness : media.xpbd.stretch_stiffness;
+        const float stiffness = c.slab.stiffness > 0.0f ? c.slab.stiffness : media.vbd.stretch_stiffness;
         const uint32_t base = np;  // slab corners follow the chain in the pool.
         for (uint32_t k = 0u; k < 8u; ++k) {
             in.positions.push_back(corners[k]);
@@ -2489,16 +2489,16 @@ XpbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
         for (uint32_t i = 0u; i < 8u; ++i)
             for (uint32_t j = i + 1u; j < 8u; ++j)
                 in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(base + i, base + j,
-                    (corners[j] - corners[i]).Length(), stiffness, media.xpbd.damping));
+                    (corners[j] - corners[i]).Length(), stiffness, media.vbd.damping));
         const uint32_t end_p = np - 1u;
         for (uint32_t k = 4u; k < 8u; ++k)  // the 4 top corners (iz == 1).
             in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(end_p, base + k,
-                (corners[k] - in.positions[end_p]).Length(), stiffness, media.xpbd.damping));
-        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.xpbd.friction, {}});
+                (corners[k] - in.positions[end_p]).Length(), stiffness, media.vbd.damping));
+        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.vbd.friction, {}});
     }
 
     in.velocities.assign(in.positions.size(), math::Vec3::Zero());
-    in.friction = media.xpbd.friction;
+    in.friction = media.vbd.friction;
     in.vbd_begin = 0u;
     in.vbd_count = static_cast<uint32_t>(in.positions.size());
     return in;
@@ -2745,7 +2745,7 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
         if (any_row_media && m.method == MediaRecord::Method::MlsMpm) continue;
         float sp = 0.0f;
         if (m.kind == MediaRecord::Kind::Cloth)
-            sp = m.xpbd.half_thickness > 0.0f ? 2.0f * m.xpbd.half_thickness : m.cloth_grid.spacing;
+            sp = m.vbd.half_thickness > 0.0f ? 2.0f * m.vbd.half_thickness : m.cloth_grid.spacing;
         else if (m.kind == MediaRecord::Kind::SoftTet) sp = m.tet_sphere.cell_len;
         else if (m.kind == MediaRecord::Kind::Cable) sp = 2.0f * m.cable_line.radius;
         else sp = m.fluid_box.spacing;  // Fluid + Granular share the box lattice.
@@ -2754,9 +2754,9 @@ float CrossContactDMin(const std::vector<MediaRecord>& media,
     return d_min;
 }
 
-// Concatenate one XPBD medium into the soft slice, rebasing constraint particle
+// Concatenate one VBD medium into the soft slice, rebasing constraint particle
 // indices by the running particle count (base 0 for a single medium => a copy).
-void AppendSoftMedium(XpbdCookInput& dst, const XpbdCookInput& src) {
+void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
     const uint32_t base = static_cast<uint32_t>(dst.positions.size());
     dst.positions.insert(dst.positions.end(), src.positions.begin(),
                          src.positions.end());
@@ -2804,7 +2804,7 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     }
 
     // Vertex-block media concatenate into one soft slice; MLS-MPM media compose below.
-    XpbdCookInput soft;
+    VbdCookInput soft;
     bool have_soft = false;
     for (const MediaRecord& m : media) {
         if (!IsVertexBlockMedium(m)) continue;
@@ -2817,14 +2817,14 @@ void CookSceneMedia(nk::Model& model, uint32_t env_count,
     if (have_mpm) {
         const auto mpm = BuildMpmInput(media);
         if (have_soft) {
-            CookMpmXpbd(model, env_count, mpm, soft, contact_d_min);
+            CookMpmVbd(model, env_count, mpm, soft, contact_d_min);
         } else {
             CookMpmParticles(model, env_count, mpm);
         }
         return;
     }
     if (!have_soft) return;
-    CookXpbdParticles(model, env_count, soft);
+    CookVbdParticles(model, env_count, soft);
     model.particles.pp_contact_d_min = contact_d_min;
 }
 

@@ -3,7 +3,7 @@
 // nk::Model — the immutable cook product (plan §3.3).
 //
 // Model is the cook-constant half of an nk::World: joint/link topology, link
-// inertias + local poses, shape tables, XPBD constraint templates, PBF params,
+// inertias + local poses, shape tables, VBD and MLS-MPM particle data,
 // the physics-material bucket table initial values, the contact filter policy,
 // the max_* capacities, and the field schema. It holds host-side std::vectors
 // and a single UploadTo() that PACKS the model-owned tables into ONE device
@@ -65,7 +65,7 @@ struct ModelCapacities {
     uint32_t max_mesh_edge_nodes  = 0;
     uint32_t mesh_vertex_source_count = 0u;
     uint32_t mesh_edge_source_count = 0u;
-    uint32_t particles_per_env    = 0;  // XPBD/PBF particle count / env.
+    uint32_t particles_per_env    = 0;  // VBD/MPM particle count / env.
     // Cloth aerodynamic-drag element count / env (one per surface triangle). 0 ==
     // no drag (the drag op is not emitted -> a drag-free cook is byte-identical).
     uint32_t aero_tris_per_env           = 0;
@@ -335,8 +335,8 @@ public:
     float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
 
     // -- particle cook product: vertex-block cloth/cable and MLS-MPM material points.
-    // MpmXpbd assigns [0, n_mpm) to grid transfer and [n_mpm, P) to the vertex blocks.
-    enum class ParticleMode : uint8_t { None = 0, Xpbd = 1, Mpm = 5, MpmXpbd = 6 };
+    // MpmVbd assigns [0, n_mpm) to grid transfer and [n_mpm, P) to the vertex blocks.
+    enum class ParticleMode : uint8_t { None = 0, Vbd = 1, Mpm = 5, MpmVbd = 6 };
     struct ModelParticles {
         ParticleMode mode = ParticleMode::None;
         // Initial per-particle state (env-major replicated by SeedInitialState;
@@ -389,7 +389,7 @@ public:
         float    aero_drag_normal    = 0.0f;
         float    aero_drag_tangent   = 0.0f;
         float    aero_drag_max_dv    = 0.0f;
-        // MpmXpbd divides grid-owned [0, n_mpm_particles) from row-coupled particles.
+        // MpmVbd divides grid-owned [0, n_mpm_particles) from row-coupled particles.
         uint32_t n_mpm_particles = 0u;
         // Body<->particle contact mu, mixed with the body side by solmix=max.
         float    soft_friction  = 0.6f;
