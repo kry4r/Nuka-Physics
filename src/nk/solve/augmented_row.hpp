@@ -183,6 +183,37 @@ NUKA_AUGMENTED_HD inline float ScalarPotentialChange(
     return float((y >= x ? integral : -integral) / k);
 }
 
+// ScalarPotentialChange on float scales, for searches whose impulses run in float.
+NUKA_AUGMENTED_HD inline float ScalarPotentialChange(
+    float dual, float rho, float residual, float drop, float compliance, float lower, float upper,
+    const FloatScalarResponse& response) {
+    if (rho <= 0.0f) return 0.0f;
+    if (dual != dual || rho != rho || residual != residual || drop != drop ||
+        compliance != compliance || lower != lower || upper != upper)
+        return dual + rho + residual + drop + compliance + lower + upper;
+    const float s = response.dual_scale;
+    const float k = response.residual_scale;
+    if (!(fabsf(dual) <= FLT_MAX && fabsf(residual) <= FLT_MAX && fabsf(drop) <= FLT_MAX) ||
+        !(k > 0.0f && k <= FLT_MAX && fabsf(s) <= FLT_MAX)) return NAN;
+    const float x = fmaf(k, residual, s * dual);
+    const float y = x - k * drop;
+    if (lower > upper) {
+        const float fx = x < lower ? lower : (x > upper ? upper : x);
+        const float fy = y < lower ? lower : (y > upper ? upper : y);
+        return fy * (y - 0.5f * fy) / k - fx * (x - 0.5f * fx) / k;
+    }
+    if (x >= lower && x <= upper && y >= lower && y <= upper) return -drop * (x - 0.5f * k * drop);
+    if (x <= lower && y <= lower) return -lower * drop;
+    if (x >= upper && y >= upper) return -upper * drop;
+    const float a = fminf(x, y), b = fmaxf(x, y);
+    float integral = 0.0f;
+    if (a < lower) integral += lower * (fminf(b, lower) - a);
+    const float low = fmaxf(a, lower), high = fminf(b, upper);
+    if (low < high) integral += 0.5f * (high - low) * (high + low);
+    if (b > upper) integral += upper * (b - fmaxf(a, upper));
+    return (y >= x ? integral : -integral) / k;
+}
+
 // dual / mu + rho * mu * residual with fma-recovered rounding errors added after an error-free sum.
 // Zero numerators retain their sign while a nonzero substitute avoids the GPU division slow path.
 NUKA_AUGMENTED_HD inline float ConeArgument(float dual, float rho, float mu, float residual) {

@@ -54,6 +54,63 @@ __global__ void InitializeGridBlocksKernel(
     }
 }
 
+// nk::vbd::Invert at floor zero with lane k < 6 forming its k-th cofactor and inverse entry, so each double
+// product issues once per warp; every lane returns the same inverse.
+__device__ bool InvertAcrossLanes(const SymmetricMat3& m, uint32_t lane, SymmetricMat3* out) {
+    // Cofactor k is a * b - c * d in Invert's order cxx, cyy, czz, cxy, cxz, cyz.
+    const uint32_t k = lane < 6u ? lane : 0u;
+    const float a = k == 0u ? m.yy : k <= 2u ? m.xx : k == 3u ? m.xz : m.xy;
+    const float b = k <= 1u ? m.zz : k == 2u ? m.yy : k <= 4u ? m.yz : m.xz;
+    const float c = k == 0u ? m.yz : k == 1u || k == 4u ? m.xz : k <= 3u ? m.xy : m.xx;
+    const float d = k == 0u || k == 5u ? m.yz : k == 1u ? m.xz : k == 2u ? m.xy : k == 3u ? m.zz : m.yy;
+    const double cofactor = double(a) * double(b) - double(c) * double(d);
+    const double cxx = __shfl_sync(0xffffffffu, cofactor, 0u);
+    const double cxy = __shfl_sync(0xffffffffu, cofactor, 3u);
+    const double cxz = __shfl_sync(0xffffffffu, cofactor, 4u);
+    const double det = double(m.xx) * cxx + double(m.xy) * cxy + double(m.xz) * cxz;
+    if (!(det > 0.0 && det <= DBL_MAX)) return false;
+    const double inv = 1.0 / det;
+    const double value = cofactor * inv;
+    if (!__all_sync(0xffffffffu, lane >= 6u || (value >= -FLT_MAX && value <= FLT_MAX))) return false;
+    const float entry = float(value);
+    *out = {__shfl_sync(0xffffffffu, entry, 0u), __shfl_sync(0xffffffffu, entry, 1u),
+            __shfl_sync(0xffffffffu, entry, 2u), __shfl_sync(0xffffffffu, entry, 3u),
+            __shfl_sync(0xffffffffu, entry, 4u), __shfl_sync(0xffffffffu, entry, 5u)};
+    return true;
+}
+
+// The incident row of largest curvature trace (lowest slot on ties), searched only for a failed node's record.
+__device__ uint32_t DominantGridRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
+                                    uint32_t begin, uint32_t end, uint32_t lane, double* trace) {
+    uint32_t dominant_row = ~0u;
+    double dominant_trace = -DBL_MAX;
+    for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
+        Vec3 row_impulse{};
+        SymmetricMat3 row_curvature{};
+        EvaluateGridRow(data, p, s, at, {}, &row_impulse, &row_curvature);
+        const double row_trace = double(row_curvature.xx) + row_curvature.yy + row_curvature.zz;
+        const uint32_t slot = s.incidence[at];
+        if (dominant_row == ~0u || row_trace > dominant_trace ||
+            ((row_trace == dominant_trace || (isnan(row_trace) && isnan(dominant_trace))) && slot < dominant_row)) {
+            dominant_row = slot;
+            dominant_trace = row_trace;
+        }
+    }
+    for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u) {
+        const uint32_t other_row = __shfl_down_sync(0xffffffffu, dominant_row, offset);
+        const double other_trace = __shfl_down_sync(0xffffffffu, dominant_trace, offset);
+        if (lane + offset < warpSize && other_row != ~0u &&
+            (dominant_row == ~0u || other_trace > dominant_trace ||
+             ((other_trace == dominant_trace || (isnan(other_trace) && isnan(dominant_trace))) &&
+              other_row < dominant_row))) {
+            dominant_row = other_row;
+            dominant_trace = other_trace;
+        }
+    }
+    *trace = dominant_trace;
+    return dominant_row;
+}
+
 __global__ void DescendGridBlocksKernel(
     DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t color) {
     const uint32_t lane = threadIdx.x % warpSize;
@@ -68,77 +125,54 @@ __global__ void DescendGridBlocksKernel(
         const uint32_t end = s.offsets[owner + 1u];
         const Vec3 snapshot = s.grid_snapshot[node];
         const Vec3 free_velocity = s.grid_free[node];
-        const double mass = 1.0 / static_cast<double>(data.grid_inv_mass[node]);
+        const float mass = 1.0f / data.grid_inv_mass[node];
         Vec3 impulse{};
         SymmetricMat3 hessian{};
         bool rows_finite = true;
-        uint32_t dominant_row = ~0u;
-        double dominant_trace = -DBL_MAX;
         for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
             Vec3 row_impulse{};
             SymmetricMat3 row_curvature{};
-            const double potential = EvaluateGridRow(data, p, s, at,
-                                                     {}, &row_impulse, &row_curvature);
-            rows_finite &= isfinite(potential);
-            if (!isfinite(potential))
+            const double change = EvaluateGridRow(data, p, s, at, {}, &row_impulse, &row_curvature);
+            const bool finite = isfinite(change) && Finite(row_impulse);
+            rows_finite &= finite;
+            if (!finite)
                 RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidRow, s.incidence[at]);
             impulse += row_impulse;
             nk::vbd::AddTo(hessian, row_curvature);
-            const double trace = double(row_curvature.xx) + row_curvature.yy + row_curvature.zz;
-            const uint32_t slot = s.incidence[at];
-            if (dominant_row == ~0u || trace > dominant_trace ||
-                ((trace == dominant_trace || (isnan(trace) && isnan(dominant_trace))) && slot < dominant_row)) {
-                dominant_row = slot;
-                dominant_trace = trace;
-            }
         }
         impulse = {WarpSum(impulse.x), WarpSum(impulse.y), WarpSum(impulse.z)};
         hessian = {WarpSum(hessian.xx), WarpSum(hessian.yy), WarpSum(hessian.zz),
                    WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
-        for (uint32_t offset = warpSize / 2u; offset > 0u; offset /= 2u) {
-            const uint32_t other_row = __shfl_down_sync(0xffffffffu, dominant_row, offset);
-            const double other_trace = __shfl_down_sync(0xffffffffu, dominant_trace, offset);
-            if (lane + offset < warpSize && other_row != ~0u &&
-                (dominant_row == ~0u || other_trace > dominant_trace ||
-                 ((other_trace == dominant_trace || (isnan(other_trace) && isnan(dominant_trace))) &&
-                  other_row < dominant_row))) {
-                dominant_row = other_row;
-                dominant_trace = other_trace;
-            }
-        }
         if (!__all_sync(0xffffffffu, rows_finite)) {
             if (lane == 0u) RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidRow);
             continue;
         }
+        // Every lane holds the same warp-uniform node solve, in float apart from the inverse's cofactors.
+        const Vec3 force{fmaf(-mass, snapshot.x - free_velocity.x, impulse.x),
+                         fmaf(-mass, snapshot.y - free_velocity.y, impulse.y),
+                         fmaf(-mass, snapshot.z - free_velocity.z, impulse.z)};
         Vec3 direction{};
-        Vec3 force{};
-        double slope = 0.0;
-        uint32_t valid = 0u;
-        if (lane == 0u) {
-            const double fx = -mass * (double(snapshot.x) - double(free_velocity.x)) + impulse.x;
-            const double fy = -mass * (double(snapshot.y) - double(free_velocity.y)) + impulse.y;
-            const double fz = -mass * (double(snapshot.z) - double(free_velocity.z)) + impulse.z;
-            const bool force_finite = fx >= -double(FLT_MAX) && fx <= double(FLT_MAX) &&
-                fy >= -double(FLT_MAX) && fy <= double(FLT_MAX) &&
-                fz >= -double(FLT_MAX) && fz <= double(FLT_MAX);
-            nk::vbd::AddIdentity(hessian, static_cast<float>(mass));
-            SymmetricMat3 inverse{};
-            const bool equation_valid = mass > 0.0 && mass <= double(FLT_MAX) && force_finite &&
-                Finite({hessian.xx, hessian.yy, hessian.zz}) &&
-                Finite({hessian.xy, hessian.xz, hessian.yz});
-            nk::BlockSolveFailure reason = equation_valid ? nk::BlockSolveFailure::Factorization
-                                                          : nk::BlockSolveFailure::InvalidEquation;
-            if (equation_valid && nk::vbd::Invert(hessian, 0.0f, &inverse)) {
-                force = {static_cast<float>(fx), static_cast<float>(fy), static_cast<float>(fz)};
-                direction = inverse.Multiply(force);
-                slope = -(double(force.x) * direction.x + double(force.y) * direction.y +
-                          double(force.z) * direction.z);
-                reason = nk::BlockSolveFailure::InvalidDirection;
-                if (Finite(direction) && isfinite(slope)) valid = 1u;
-            }
-            if (valid == 0u) {
+        float slope = 0.0f;
+        bool valid = false;
+        nk::vbd::AddIdentity(hessian, mass);
+        SymmetricMat3 inverse{};
+        const bool equation_valid = mass > 0.0f && mass <= FLT_MAX && Finite(force) &&
+            Finite({hessian.xx, hessian.yy, hessian.zz}) &&
+            Finite({hessian.xy, hessian.xz, hessian.yz});
+        nk::BlockSolveFailure reason = equation_valid ? nk::BlockSolveFailure::Factorization
+                                                      : nk::BlockSolveFailure::InvalidEquation;
+        if (equation_valid && InvertAcrossLanes(hessian, lane, &inverse)) {
+            direction = inverse.Multiply(force);
+            slope = -force.Dot(direction);
+            reason = nk::BlockSolveFailure::InvalidDirection;
+            valid = Finite(direction) && fabsf(slope) <= FLT_MAX;
+        }
+        if (!valid) {
+            double dominant_trace = 0.0;
+            const uint32_t dominant_row = DominantGridRow(data, p, s, begin, end, lane, &dominant_trace);
+            if (lane == 0u) {
                 double equation[nk::kBlockSolveFailureEquationColumnCount] = {
-                    mass, fx, fy, fz,
+                    mass, force.x, force.y, force.z,
                     hessian.xx, hessian.yy, hessian.zz, hessian.xy, hessian.xz, hessian.yz,
                     snapshot.x, snapshot.y, snapshot.z,
                     free_velocity.x, free_velocity.y, free_velocity.z};
@@ -165,51 +199,34 @@ __global__ void DescendGridBlocksKernel(
                 }
                 RecordBlockFailure(data, p, s, owner, reason, ~0u, equation);
             }
+            continue;
         }
-        valid = __shfl_sync(0xffffffffu, valid, 0u);
-        direction = {__shfl_sync(0xffffffffu, direction.x, 0u),
-                     __shfl_sync(0xffffffffu, direction.y, 0u),
-                     __shfl_sync(0xffffffffu, direction.z, 0u)};
-        force = {__shfl_sync(0xffffffffu, force.x, 0u),
-                 __shfl_sync(0xffffffffu, force.y, 0u),
-                 __shfl_sync(0xffffffffu, force.z, 0u)};
-        slope = __shfl_sync(0xffffffffu, slope, 0u);
-        if (valid == 0u || !(slope < 0.0)) continue;
+        if (!(slope < 0.0f)) continue;
 
         float scale = 1.0f;
         Vec3 candidate{};
         bool accepted = false;
         bool failed = false;
         for (uint32_t halving = 0u; halving <= kVertexStepHalvings; ++halving) {
-            candidate = {nk::vbd::TrialValue(snapshot.x, direction.x, scale),
-                         nk::vbd::TrialValue(snapshot.y, direction.y, scale),
-                         nk::vbd::TrialValue(snapshot.z, direction.z, scale)};
+            candidate = {fmaf(scale, direction.x, snapshot.x), fmaf(scale, direction.y, snapshot.y),
+                         fmaf(scale, direction.z, snapshot.z)};
             const Vec3 move = candidate - snapshot;
-            const double dx = double(candidate.x) - snapshot.x;
-            const double dy = double(candidate.y) - snapshot.y;
-            const double dz = double(candidate.z) - snapshot.z;
-            const double actual_slope = -(double(force.x) * dx + double(force.y) * dy +
-                                          double(force.z) * dz);
-            double row_change = 0.0;
-            bool base_finite = true;
-            bool potentials_finite = Finite(candidate) && Finite(move);
-            for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
-                const uint32_t slot = s.incidence[at];
-                const double before = s.row_state[slot].potential;
-                const double after = EvaluateGridRow(data, p, s, at, move, nullptr, nullptr);
-                base_finite &= isfinite(before);
-                potentials_finite &= isfinite(before) && isfinite(after);
-                if (!isfinite(before))
-                    RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidPotential, slot);
-                row_change += after - before;
-            }
-            row_change = SumDenseBlockWarp(row_change);
-            const double mass_change = 0.5 * mass * (
-                dx * (2.0 * (double(snapshot.x) - double(free_velocity.x)) + dx) +
-                dy * (2.0 * (double(snapshot.y) - double(free_velocity.y)) + dy) +
-                dz * (2.0 * (double(snapshot.z) - double(free_velocity.z)) + dz));
-            const double change = mass_change + row_change;
-            if (!__all_sync(0xffffffffu, potentials_finite && isfinite(change) && isfinite(actual_slope))) {
+            const float actual_slope = -force.Dot(move);
+            float row_change = 0.0f;
+            for (size_t at = size_t{begin} + lane; at < end; at += warpSize)
+                row_change += static_cast<float>(EvaluateGridRow(data, p, s, at, move, nullptr, nullptr));
+            const float change = 0.5f * mass * move.Dot((snapshot - free_velocity) * 2.0f + move) +
+                WarpSum(row_change);
+            if (!__all_sync(0xffffffffu, Finite(candidate) && Finite(move) && fabsf(change) <= FLT_MAX &&
+                                         fabsf(actual_slope) <= FLT_MAX)) {
+                bool base_finite = true;
+                for (size_t at = size_t{begin} + lane; at < end; at += warpSize) {
+                    const bool finite = isfinite(EvaluateGridRow(data, p, s, at, {}, nullptr, nullptr));
+                    base_finite &= finite;
+                    if (!finite)
+                        RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidPotential,
+                                           s.incidence[at]);
+                }
                 if (!__all_sync(0xffffffffu, base_finite) || halving == kVertexStepHalvings) {
                     if (lane == 0u)
                         RecordBlockFailure(data, p, s, owner, nk::BlockSolveFailure::InvalidPotential);
@@ -219,7 +236,7 @@ __global__ void DescendGridBlocksKernel(
                 scale *= 0.5f;
                 continue;
             }
-            if (actual_slope <= 0.0 && change <= double(kVertexStepDecrease) * actual_slope) {
+            if (actual_slope <= 0.0f && change <= kVertexStepDecrease * actual_slope) {
                 accepted = true;
                 break;
             }
@@ -241,8 +258,10 @@ __global__ void DescendGridBlocksKernel(
                               term.residual.y - term.jacobian[1].Dot(move),
                               term.residual.z - term.jacobian[2].Dot(move)};
             if (!term.contact) state.residual.y = state.residual.z = 0.0f;
-            state.normal_bound = AugmentedRowBound(s, row, slot, RowStateScale(data, p, slot), state);
-            CacheAugmentedRow(data, p, s, slot, state, true);
+            state.normal_bound = nk::augmented::EvaluateScalarImpulse(state.dual.x, term.penalty, state.residual.x,
+                term.compliance, term.lower, term.upper,
+                nk::augmented::ComputeFloatScalarResponse(term.penalty, term.compliance)).impulse;
+            s.row_state[slot] = state;
         }
     }
 }

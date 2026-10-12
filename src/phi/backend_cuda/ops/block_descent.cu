@@ -575,6 +575,14 @@ __device__ uint32_t GridNodeColor(const BlockDescentSolveParams& p, uint32_t nod
     return first + x % width + width * (y % width + width * (z % width));
 }
 
+// Whether every descending owner of a row descends in a grid color.
+__device__ bool GridOnlyRow(BlockScratch s, uint32_t colors, uint32_t slot) {
+    const uint32_t* words = s.row_cache_colors + size_t{slot} * s.color_words;
+    for (uint32_t word = 0u; word < s.color_words; ++word)
+        if (words[word] != 0u) return word * 32u + static_cast<uint32_t>(__ffs(words[word])) - 1u >= colors + 2u;
+    return false;
+}
+
 // The lowest cache color of a row whose owners all descend in particle colors, else kNoCacheColor.
 __device__ uint32_t ParticleRowFirstColor(BlockScratch s, uint32_t colors, uint32_t slot) {
     const uint32_t* words = s.row_cache_colors + size_t{slot} * s.color_words;
@@ -1215,34 +1223,6 @@ __device__ LocalTerm LoadPointLocalTerm(DataView data, BlockDescentSolveParams p
     return term;
 }
 
-__device__ double EvaluateAugmentedResidual(const LocalTerm& t, Vec3 row_move,
-                                            Vec3* impulse, SymmetricMat3* curvature) {
-    const float residual = t.residual.x - row_move.x;
-    const auto n = nk::augmented::EvaluateScalar(t.dual.x, t.penalty, residual,
-                                                t.compliance, t.lower, t.upper, t.response);
-    if (impulse != nullptr) {
-        *impulse = {n.impulse, 0.0f, 0.0f};
-        *curvature = {n.curvature, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    }
-    if (!t.contact) return n.potential;
-    const Vec3 tangent_residual{0.0f, t.residual.y - row_move.y,
-                               t.residual.z - row_move.z};
-    const auto f = nk::augmented::EvaluateTangent(t.dual, t.penalty, tangent_residual,
-                                                  t.normal_bound, t.mu_first, t.mu_second);
-    if (impulse != nullptr) {
-        impulse->y = f.impulse.y;
-        impulse->z = f.impulse.z;
-        curvature->yy = f.curvature.yy;
-        curvature->zz = f.curvature.zz;
-        curvature->yz = f.curvature.yz;
-    }
-    return n.potential + f.potential;
-}
-
-__device__ double EvaluateLocalResidual(const LocalTerm& t, Vec3 row_move) {
-    return EvaluateAugmentedResidual(t, row_move, nullptr, nullptr);
-}
-
 // Folds a row's impulse and its curvature (xx, yy, zz, yz used) into a point block.
 __device__ void AddLocalResponse(const Vec3* jacobian, Vec3 f, const SymmetricMat3& c,
                                  Vec3* impulse, SymmetricMat3* curvature) {
@@ -1251,17 +1231,6 @@ __device__ void AddLocalResponse(const Vec3* jacobian, Vec3 f, const SymmetricMa
     AddOuter(*curvature, jacobian[1], c.yy - c.yz);
     AddOuter(*curvature, jacobian[2], c.zz - c.yz);
     AddOuter(*curvature, jacobian[1] + jacobian[2], c.yz);
-}
-
-__device__ double EvaluateLocal(const LocalTerm& t, Vec3 move, Vec3* impulse,
-                                 SymmetricMat3* curvature) {
-    Vec3 f{};
-    SymmetricMat3 c{};
-    const double potential = EvaluateAugmentedResidual(t,
-        {t.jacobian[0].Dot(move), t.jacobian[1].Dot(move), t.jacobian[2].Dot(move)},
-        impulse != nullptr ? &f : nullptr, impulse != nullptr ? &c : nullptr);
-    if (impulse != nullptr) AddLocalResponse(t.jacobian, f, c, impulse, curvature);
-    return potential;
 }
 
 // EvaluateAugmentedResponse given the normal term `n` already evaluated at the residual less row_move.x.
@@ -1280,7 +1249,7 @@ __device__ void EvaluateAugmentedResponse(const LocalTerm& t, const nk::augmente
     curvature->yz = f.curvature.yz;
 }
 
-// EvaluateAugmentedResidual's impulse and curvature without the potential; the cone runs in float.
+// A row's impulse and curvature at its residual less row_move; the cone runs in float.
 __device__ void EvaluateAugmentedResponse(const LocalTerm& t, Vec3 row_move, Vec3* impulse,
                                           SymmetricMat3* curvature) {
     EvaluateAugmentedResponse(t, nk::augmented::EvaluateScalarImpulse(t.dual.x, t.penalty, t.residual.x - row_move.x,
@@ -1297,16 +1266,21 @@ __device__ void EvaluateLocalResponse(const LocalTerm& t, Vec3 move, Vec3* impul
 }
 
 // The row potential change as its residual drops by `drop`, integrated along it instead of subtracted.
-__device__ float EvaluateDropChange(const LocalTerm& t, Vec3 drop) {
+template <typename Response>
+__device__ float EvaluateDropChange(const LocalTerm& t, Vec3 drop, const Response& response) {
     float change = nk::augmented::ScalarPotentialChange(t.dual.x, t.penalty, t.residual.x, drop.x,
-        t.compliance, t.lower, t.upper, t.response);
+        t.compliance, t.lower, t.upper, response);
     if (t.contact)
         change += nk::augmented::TangentPotentialChange(t.dual, t.penalty, t.residual, drop,
                                                         t.normal_bound, t.mu_first, t.mu_second);
     return change;
 }
 
-// EvaluateLocal(t, move) - EvaluateLocal(t, 0), integrated along the move instead of subtracted.
+__device__ float EvaluateDropChange(const LocalTerm& t, Vec3 drop) {
+    return EvaluateDropChange(t, drop, t.response);
+}
+
+// The row potential change as the block moves by `move`.
 __device__ float EvaluateLocalChange(const LocalTerm& t, Vec3 move) {
     return EvaluateDropChange(t, {t.jacobian[0].Dot(move), t.jacobian[1].Dot(move), t.jacobian[2].Dot(move)});
 }
@@ -1346,14 +1320,6 @@ __device__ void AddPointRowSample(BlockScratch s, size_t at, const PointRowSampl
 
 __device__ bool Finite(Vec3 value) {
     return fabsf(value.x) <= FLT_MAX && fabsf(value.y) <= FLT_MAX && fabsf(value.z) <= FLT_MAX;
-}
-
-// Caches a row's assembled state with, if asked, its potential.
-__device__ void CacheAugmentedRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
-                                  uint32_t slot, const AugmentedRowState& state, bool potential) {
-    s.row_state[slot] = state;
-    if (!potential) return;
-    s.row_state[slot].potential = EvaluateLocalResidual(LoadLocalTerm(data, p, s, slot, ~0u, true), {});
 }
 
 #include "phi/backend_cuda/ops/block_descent_dense.cuh"
@@ -1405,16 +1371,13 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
     const uint32_t first = s.cache_offsets[cache_color];
     const uint32_t count = s.cache_offsets[cache_color + 1u] - first;
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
-    // Particle descents integrate potential changes and dense descents search slopes; only grid
-    // descents read the cached potential.
-    const bool potential = cache_color > p.vertex_blocks.colors + 1u;
     if (count > spread_rows) {
         for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < count; item += threads) {
             const uint32_t slot = s.cache_rows[first + item];
             if (seeded && ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) == cache_color) continue;
             const NkRow row = rows[slot];
             if (row.flags & nk::nk_row_flags::kMaterialBlock) continue;
-            CacheAugmentedRow(data, p, s, slot, ComputeAugmentedRowState(data, p, s, slot, true), potential);
+            s.row_state[slot] = ComputeAugmentedRowState(data, p, s, slot, true);
         }
         return;
     }
@@ -1438,25 +1401,27 @@ __global__ void CacheAugmentedRowsKernel(DataView data, BlockDescentSolveParams 
                       __shfl_sync(group_mask, dual, 2, kRowAxisLanes)};
         if (axis != 0u) continue;
         state.normal_bound = AugmentedRowBound(s, row, slot, scale, state);
-        CacheAugmentedRow(data, p, s, slot, state, potential);
+        s.row_state[slot] = state;
     }
 }
 
-// Point rows of grid owners, cached once per grid sweep; grid descents then update them in place.
-__global__ void CacheGridRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+// Point rows of grid owners, cached once per grid sweep unless the dual update seeded them; grid
+// descents then update them in place.
+__global__ void CacheGridRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s, bool seeded) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const uint32_t first = p.vertex_blocks.colors + 2u;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
          item += gridDim.x * blockDim.x) {
         const uint32_t slot = s.active_rows[item];
         if (rows[slot].flags & nk::nk_row_flags::kMaterialBlock) continue;
+        if (seeded && GridOnlyRow(s, p.vertex_blocks.colors, slot)) continue;
         const uint32_t* words = s.row_cache_colors + size_t{slot} * s.color_words;
         bool grid = false;
         for (uint32_t word = first / 32u; word < s.color_words && !grid; ++word) {
             const uint32_t low = word == first / 32u ? first % 32u : 0u;
             grid = (words[word] >> low) != 0u;
         }
-        if (grid) CacheAugmentedRow(data, p, s, slot, ComputeAugmentedRowState(data, p, s, slot, true), true);
+        if (grid) s.row_state[slot] = ComputeAugmentedRowState(data, p, s, slot, true);
     }
 }
 
@@ -1865,7 +1830,9 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
             next.dual.y = f.impulse.y;
             next.dual.z = f.impulse.z;
         }
-        if (seed && ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor) {
+        if (seed && (p.total_grid_count == 0u
+                ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor
+                : GridOnlyRow(s, p.vertex_blocks.colors, slot))) {
             next.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), next);
             s.row_state[slot] = next;
         }
@@ -2416,7 +2383,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
          !clear(s.multilevel, size_t{p->env_count} * sizeof(MultilevelState)) ||
          !clear(s.multilevel_previous, size_t{layout.vertices} * p->env_count * sizeof(Vec3))))
         return Status::Failed;
-    // Grid descents can move particles that carry no cache color, so rows are seeded only without grids.
+    // Grid descents can move particles that carry no cache color, so particle rows are seeded only
+    // without grids; with grids, rows that only grid nodes move are seeded instead.
     const bool seed_rows = p->total_grid_count == 0u;
     for (uint32_t iteration = 0u; iteration < p->iterations; ++iteration) {
         s.diagnostic_iteration = iteration;
@@ -2471,8 +2439,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                     data, *p, s) != cudaSuccess) return Status::Failed;
             BlockScratch grid_s = s;
             grid_s.grid_snapshot = data.grid_velocity;
-            if (LaunchWork(CacheGridRowsKernel, s.rows, kThreads, stream, data, *p, grid_s) != cudaSuccess)
-                return Status::Failed;
+            if (LaunchWork(CacheGridRowsKernel, s.rows, kThreads, stream, data, *p, grid_s, iteration > 0u)
+                != cudaSuccess) return Status::Failed;
             for (uint32_t color = 0u; color < GridColorCount(*p); ++color) {
                 const uint32_t cache_color = p->vertex_blocks.colors + 2u + color;
                 if (p->material_cells_per_env > 0u &&
@@ -2522,7 +2490,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                 data, *p, s, false, kAllCacheColors) != cudaSuccess) return Status::Failed;
         if (LaunchWork(DualUpdateKernel, s.rows, kThreads, stream, data, *p, s,
-                       seed_rows && iteration + 1u < p->iterations) != cudaSuccess)
+                       iteration + 1u < p->iterations) != cudaSuccess)
             return Status::Failed;
     }
     if (LaunchWork(GatherImpulseKernel, p->total_particle_count, kThreads / 32u, stream, data, *p, s) != cudaSuccess ||

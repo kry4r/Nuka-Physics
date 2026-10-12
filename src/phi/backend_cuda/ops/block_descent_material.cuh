@@ -82,6 +82,8 @@ __global__ void CacheMaterialRowsKernel(DataView data, BlockDescentSolveParams p
     }
 }
 
+// A grid incidence's potential change along the node move from its cached state; with `impulse`, the
+// move is zero and its response is added too. Point rows run entirely on float scales.
 __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, BlockScratch s,
                                   size_t at, Vec3 move,
                                   Vec3* impulse, SymmetricMat3* curvature) {
@@ -90,7 +92,16 @@ __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, Bloc
     const NkRow head = rows[slot];
     if (!(head.flags & nk::nk_row_flags::kMaterialBlock)) {
         const LocalTerm term = LoadPointLocalTerm(data, p, s, at);
-        return EvaluateLocal(term, move, impulse, curvature);
+        const auto response = nk::augmented::ComputeFloatScalarResponse(term.penalty, term.compliance);
+        if (impulse == nullptr)
+            return EvaluateDropChange(term, {term.jacobian[0].Dot(move), term.jacobian[1].Dot(move),
+                                             term.jacobian[2].Dot(move)}, response);
+        Vec3 f{};
+        SymmetricMat3 c{};
+        EvaluateAugmentedResponse(term, nk::augmented::EvaluateScalarImpulse(term.dual.x, term.penalty,
+            term.residual.x, term.compliance, term.lower, term.upper, response), {}, &f, &c);
+        AddLocalResponse(term.jacobian, f, c, impulse, curvature);
+        return 0.0;
     }
     const auto& state = MaterialState(p, s, slot);
     Vec3 jacobian[nk::kMpmStressRowsPerCell];
@@ -120,7 +131,7 @@ __device__ double EvaluateGridRow(DataView data, BlockDescentSolveParams p, Bloc
             }
         }
     }
-    return pressure.potential + deviator.potential;
+    return pressure.potential + deviator.potential - s.row_state[slot].potential;
 }
 
 __device__ void UpdateMaterialDual(DataView data, BlockDescentSolveParams p, BlockScratch s,
