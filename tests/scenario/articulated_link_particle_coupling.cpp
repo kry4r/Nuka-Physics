@@ -146,20 +146,20 @@ nk::Model BuildScene(bool patch_present, float cx, float cy, float z) {
     return m;
 }
 
-// NkRow packs to 32 f32: [0]=flags [7]=upper, a.kind [16] a.index [17],
-// b.kind [24] b.index [25].
+// NkRow packs to 26 f32: [0]=flags [7]=upper, a.kind [10] a.index [11],
+// b.kind [18] b.index [19].
 struct RowSides {
     uint32_t a_kind, b_kind, a_index, b_index;
     bool active; float upper;
 };
 RowSides DecodeRow(const std::vector<float>& urows, uint32_t row) {
-    const float* r = urows.data() + static_cast<size_t>(row) * 32u;
+    const float* r = urows.data() + static_cast<size_t>(row) * 26u;
     auto u = [&](int i) { uint32_t v; std::memcpy(&v, &r[i], 4); return v; };
     RowSides s;
     s.active = (u(0) & 1u) != 0u;
     s.upper = r[7];
-    s.a_kind = u(16); s.a_index = u(17);
-    s.b_kind = u(24); s.b_index = u(25);
+    s.a_kind = u(10); s.a_index = u(11);
+    s.b_kind = u(18); s.b_index = u(19);
     return s;
 }
 
@@ -252,7 +252,7 @@ TEST(ArticulatedLinkParticleCoupling, ArmLinkPressesParticlesAndJointRecoils) {
         // Command the arm DOWN onto the patch (the production PD-hold drive).
         std::vector<float> tgt(L, 0.0f);
         tgt[tip_link] = kDriveTarget;
-        std::vector<float> urows(static_cast<size_t>(rows) * 32u, 0.0f);
+        std::vector<float> urows(static_cast<size_t>(rows) * 26u, 0.0f);
         std::vector<float> lambda(rows, 0.0f);
         std::vector<float> joint_position(L, 0.0f);
         for (uint32_t s = 0; s < kSettleSteps; ++s) {

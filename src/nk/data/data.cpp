@@ -148,16 +148,12 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactCacheFeature: v.contact_cache_feature = static_cast<uint64_t*>(p); break;
         case FieldId::ContactCacheLambda: v.contact_cache_lambda = static_cast<float*>(p); break;
         case FieldId::ContactCacheNormal: v.contact_cache_normal = static_cast<math::Vec3*>(p); break;
-        case FieldId::ContactCacheTangent1: v.contact_cache_tangent1 = static_cast<math::Vec3*>(p); break;
-        case FieldId::ContactCacheTangent2: v.contact_cache_tangent2 = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactCacheMaterial: v.contact_cache_material = static_cast<uint64_t*>(p); break;
         case FieldId::ContactCacheAge:     v.contact_cache_age = static_cast<uint32_t*>(p); break;
         case FieldId::ContactCacheSnapshotPair: v.contact_cache_snapshot_pair = static_cast<uint64_t*>(p); break;
         case FieldId::ContactCacheSnapshotFeature: v.contact_cache_snapshot_feature = static_cast<uint64_t*>(p); break;
         case FieldId::ContactCacheSnapshotLambda: v.contact_cache_snapshot_lambda = static_cast<float*>(p); break;
         case FieldId::ContactCacheSnapshotNormal: v.contact_cache_snapshot_normal = static_cast<math::Vec3*>(p); break;
-        case FieldId::ContactCacheSnapshotTangent1: v.contact_cache_snapshot_tangent1 = static_cast<math::Vec3*>(p); break;
-        case FieldId::ContactCacheSnapshotTangent2: v.contact_cache_snapshot_tangent2 = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactCacheSnapshotMaterial: v.contact_cache_snapshot_material = static_cast<uint64_t*>(p); break;
         case FieldId::ContactCacheSnapshotAge: v.contact_cache_snapshot_age = static_cast<uint32_t*>(p); break;
         case FieldId::ContactCacheCurrentOwner: v.contact_cache_current_owner = static_cast<uint32_t*>(p); break;
@@ -167,22 +163,17 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         // by this tag before the shape_table body-row lookup.
         case FieldId::UcontactAKind:       v.ucontact_a_kind = static_cast<uint32_t*>(p); break;
         case FieldId::UcontactBKind:       v.ucontact_b_kind = static_cast<uint32_t*>(p); break;
-        // C4 (general contact pipeline Phase 1A): per-point tangent basis for the
-        // unified PairDriven contact buffer (ComputeUnionContactTangentBasisKernel).
-        case FieldId::UcontactTangent1:    v.ucontact_tangent1 = static_cast<math::Vec3*>(p); break;
-        case FieldId::UcontactTangent2:    v.ucontact_tangent2 = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCount:            v.row_count = static_cast<uint32_t*>(p); break;
         case FieldId::Urows:               v.urows = static_cast<float*>(p); break;
+        case FieldId::RowContactResponse:  v.row_contact_response = static_cast<math::SymmetricMat3*>(p); break;
         case FieldId::ChainJacobian:       v.chain_jacobian = static_cast<float*>(p); break;
         case FieldId::RowDamping:          v.row_damping = static_cast<float*>(p); break;
         case FieldId::RowCjLink:           v.row_cj_link = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPoint:          v.row_cj_point = static_cast<math::Vec3*>(p); break;
-        case FieldId::RowCjDir:            v.row_cj_dir = static_cast<math::Vec3*>(p); break;
         // S2 (general contact pipeline Phase 1B): the second per-side arm fields.
         case FieldId::ChainJacobianB:      v.chain_jacobian_b = static_cast<float*>(p); break;
         case FieldId::RowCjLinkB:          v.row_cj_link_b = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPointB:         v.row_cj_point_b = static_cast<math::Vec3*>(p); break;
-        case FieldId::RowCjDirB:           v.row_cj_dir_b = static_cast<math::Vec3*>(p); break;
         // PairDriven block-island GLOBAL order/segment scratch (3 u32 per row slot:
         // rows_per_env order + 2*rows_per_env segments per env, disjoint per env).
         case FieldId::QdotFlat:            v.qdot_flat = static_cast<float*>(p); break;
@@ -374,6 +365,47 @@ void Data::FillView(phi::DataView* out_view) const {
     for (const Arena::Segment& seg : arena_.Segments()) {
         BindDataPointer(*out_view, seg.field, seg.bytes == 0u ? nullptr : arena_.Ptr(seg.field));
     }
+    for (const FieldBuffer& own : own_) BindDataPointer(*out_view, own.field, phi::BufferBase(own.buffer.get()));
+    // Each row then has at most one articulated side, whose gather and Jacobian share side A's storage.
+    if (out_view->chain_jacobian_b == nullptr) out_view->chain_jacobian_b = out_view->chain_jacobian;
+    if (out_view->row_cj_point_b == nullptr) out_view->row_cj_point_b = out_view->row_cj_point;
+}
+
+phi::Status Data::AllocateField(phi::BufferType* bt, FieldId id, uint64_t bytes) {
+    phi::Status status = phi::Status::Ok;
+    std::unique_ptr<phi::Buffer, BufferRelease> buffer(phi::BufferAlloc(bt, bytes, &status));
+    if (buffer == nullptr) return status;
+    status = phi::BufferMemset(buffer.get(), 0, 0, bytes);
+    if (status != phi::Status::Ok) return status;
+    own_.erase(std::remove_if(own_.begin(), own_.end(),
+        [id](const FieldBuffer& own) { return own.field == id; }), own_.end());
+    own_.push_back(FieldBuffer{id, bytes, std::move(buffer)});
+    return phi::Status::Ok;
+}
+
+const Data::FieldBuffer* Data::OwnBuffer(FieldId id) const {
+    for (const FieldBuffer& own : own_)
+        if (own.field == id) return &own;
+    return nullptr;
+}
+
+void* Data::Ptr(FieldId id) const {
+    const FieldBuffer* own = OwnBuffer(id);
+    return own != nullptr ? phi::BufferBase(own->buffer.get()) : arena_.Ptr(id);
+}
+
+phi::Status Data::UploadFieldStatus(FieldId id, const void* src, uint64_t bytes, uint64_t byte_offset) const {
+    const FieldBuffer* own = OwnBuffer(id);
+    if (own == nullptr) return arena_.UploadFieldStatus(id, src, bytes, byte_offset);
+    if (byte_offset > own->bytes || bytes > own->bytes - byte_offset) return phi::Status::InvalidArgument;
+    return phi::BufferUpload(own->buffer.get(), src, byte_offset, bytes);
+}
+
+phi::Status Data::DownloadFieldStatus(FieldId id, void* dst, uint64_t bytes, uint64_t byte_offset) const {
+    const FieldBuffer* own = OwnBuffer(id);
+    if (own == nullptr) return arena_.DownloadFieldStatus(id, dst, bytes, byte_offset);
+    if (byte_offset > own->bytes || bytes > own->bytes - byte_offset) return phi::Status::InvalidArgument;
+    return phi::BufferDownload(own->buffer.get(), dst, byte_offset, bytes);
 }
 
 uint64_t Data::PersistentByteSize() const {

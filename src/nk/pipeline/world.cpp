@@ -10,6 +10,7 @@
 #include <limits>
 #include <utility>
 
+#include "core/checked_size.hpp"
 #include "phi/articulation_contract.hpp"
 #include "nk/model/contact_capacity.hpp"
 #include "nk/solve/nk_row.hpp"
@@ -84,11 +85,16 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         return;
     }
     control_cap.rigid_contact_rows_per_env = static_cast<uint32_t>(rigid_rows);
+    const RigidContactCapacity distinct = DistinctOwnerContactCapacity(model_);
+    control_cap.distinct_owner_rows_per_env = static_cast<uint32_t>(
+        distinct.RowsForSlots(std::min(control_cap.max_contacts_per_env - point_slots, distinct.CandidateCount())) +
+        point_slots * kPairDrivenParticleRowsPerSlot);
     control_cap.max_rows_per_env = std::max(control_cap.max_rows_per_env, static_cast<uint32_t>(row_count));
     control_cap.joint_drive_rows_per_env = drive_rows;
     control_cap.inverse_dynamics_controls =
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::ComputedTorque) ||
         model_.drive_mode == static_cast<uint32_t>(phi::ArticulationControlMode::Osc);
+    control_cap.articulated_contact_pairs = ArticulatedContactPairs(model_);
     if (control_cap.mpm_grid_nodes_per_env > 0u || control_cap.ogc_contacts_per_env > 0u) {
         const uint32_t surfaces = control_cap.particle_surfaces_per_env > 0u
             ? control_cap.mpm_contact_capacity_per_env : 0u;
@@ -185,9 +191,12 @@ World::World(Model model, uint32_t env_count, phi::Device* device,
         if (call.op == phi::NkOp::NarrowphaseSdf)
             model_.capacities.pair_sample_chunk_words = phi::PairSampleChunkWords(
                 *static_cast<const phi::NarrowphaseSdfParams*>(call.params));
-        if (call.op == phi::NkOp::BlockDescentSolve)
+        if (call.op == phi::NkOp::BlockDescentSolve) {
+            const auto* solve = static_cast<const phi::BlockDescentSolveParams*>(call.params);
             model_.capacities.block_descent_scratch_words = std::max(model_.capacities.block_descent_scratch_words,
-                phi::BlockDescentScratchWords(*static_cast<const phi::BlockDescentSolveParams*>(call.params)));
+                phi::BlockDescentScratchWords(*solve));
+            model_.capacities.contact_response |= solve->measure_contact_residual != 0u;
+        }
     }
     model_.capacities.pair_sort_scratch_bytes =
         (pair_sort_slots > 0u &&
@@ -838,15 +847,61 @@ phi::Status World::DemandReadout(FieldId id) {
         id == FieldId::ContactPoint || id == FieldId::ContactNormal ||
         id == FieldId::ContactLink || id == FieldId::ContactSideAKind ||
         id == FieldId::ContactSideBKind || id == FieldId::ContactSideAIndex ||
-        id == FieldId::ContactSideBIndex) {
+        id == FieldId::ContactSideBIndex || id == FieldId::ActiveRowIds ||
+        id == FieldId::ActiveRowCount || id == FieldId::ContactEndpointKeys ||
+        id == FieldId::ContactEndpointCount || id == FieldId::LinkContactBegin ||
+        id == FieldId::LinkContactEnd || id == FieldId::ContactIndexScratch) {
         bit = Pipeline::kReadoutContactWrench;
     }
     if (bit == 0u || (readout_demand_ & bit) == bit) {
         return last_status_ = phi::Status::Ok;
     }
+    last_status_ = Synchronize();
+    if (last_status_ != phi::Status::Ok) return last_status_;
+    phi::BufferType* bt = phi::BackendDeviceBufferType(backend_);
+    auto& cap = model_.capacities;
+    if ((bit & Pipeline::kReadoutContactWrench) != 0u && !cap.contact_readout &&
+        cap.contact_index_scratch_bytes != 0u) {
+        ModelCapacities demanded = cap;
+        demanded.contact_readout = true;
+        for (FieldId field : {FieldId::ActiveRowIds, FieldId::ActiveRowCount, FieldId::ContactEndpointKeys,
+                              FieldId::ContactEndpointCount, FieldId::LinkContactBegin,
+                              FieldId::LinkContactEnd, FieldId::ContactIndexScratch}) {
+            last_status_ = data_.AllocateField(bt, field,
+                CheckedProduct({demanded.ElementCount(field), uint64_t{LayoutOf(field).elem_size}}));
+            if (last_status_ != phi::Status::Ok) return last_status_;
+        }
+        cap.contact_readout = true;
+    }
     auto candidate = std::make_unique<Pipeline>();
     last_status_ = candidate->Build(model_, cfg_, device_, readout_demand_ | bit, &state_sensors_);
     if (last_status_ != phi::Status::Ok) return last_status_;
+    // Solve measurements demanded later widen the solver scratch.
+    uint64_t solve_words = 0u;
+    bool measure_response = false;
+    for (const phi::OpCall& call : candidate->Calls())
+        if (call.op == phi::NkOp::BlockDescentSolve) {
+            const auto* solve = static_cast<const phi::BlockDescentSolveParams*>(call.params);
+            solve_words = std::max(solve_words, phi::BlockDescentScratchWords(*solve));
+            measure_response |= solve->measure_contact_residual != 0u;
+        }
+    if (measure_response && !cap.contact_response) {
+        ModelCapacities demanded = cap;
+        demanded.contact_response = true;
+        last_status_ = data_.AllocateField(bt, FieldId::RowContactResponse,
+            CheckedProduct({demanded.ElementCount(FieldId::RowContactResponse),
+                            uint64_t{LayoutOf(FieldId::RowContactResponse).elem_size}}));
+        if (last_status_ != phi::Status::Ok) return last_status_;
+        cap.contact_response = true;
+    }
+    if (solve_words > cap.block_descent_scratch_words) {
+        last_status_ = data_.AllocateField(bt, FieldId::BlockDescentScratch, solve_words * sizeof(uint32_t));
+        if (last_status_ != phi::Status::Ok) return last_status_;
+        cap.block_descent_scratch_words = solve_words;
+        last_status_ = candidate->Build(model_, cfg_, device_, readout_demand_ | bit, &state_sensors_);
+        if (last_status_ != phi::Status::Ok) return last_status_;
+    }
+    data_.FillView(&data_view_);
     for (const phi::OpCall& call : candidate->Calls()) {
         if (call.op == phi::NkOp::ReadoutContactWrench) {
             execution_error_ = {};

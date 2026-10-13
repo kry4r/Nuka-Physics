@@ -12,8 +12,7 @@
 //
 // Asserts: contact_count > 0; each manifold <= 4 pts; every point/normal finite
 // (no NaN); ucontact_a/b carry the candidate collidable ids; the normal is a
-// plausible unit separation dir for side A with positive depth; the tangent basis
-// (C4) is orthonormal to the normal; and TWO RUNS produce a byte-identical
+// plausible unit separation dir for side A with positive depth; and TWO RUNS produce a byte-identical
 // contact stream (the new path does NOT inherit single-dog D1 — proven here).
 // ---------------------------------------------------------------------------
 
@@ -80,7 +79,7 @@ nk::Pipeline::SolverConfig PairDrivenConfig() {
 //            OVERLAP by ~0.03 m. capsule x box is NOT in the analytic ladder, so
 //            DispatchPair routes it to cvx::ConvexNarrowphase (the G5 fallback).
 // No rows are cooked (max_rows_per_env == 0) so NO solver runs — this is a pure
-// detection gate (Phase 1A). The narrowphase/broadphase/tangent ops run under
+// detection gate. The narrowphase/broadphase ops run under
 // has_collidables regardless.
 nk::Model BuildTwoBodyPairDrivenModel() {
     nk::Model model;
@@ -131,8 +130,8 @@ nk::Model BuildTwoBodyPairDrivenModel() {
 }
 
 // One narrowphase pass: build the world, step once, download the unified contact
-// buffer. Returns the raw bytes of (count, point, normal, depth, a, b, gen,
-// tangent1, tangent2) for the slot range so the caller can both inspect AND
+// buffer. Returns the raw bytes of (count, point, normal, depth, a, b, gen)
+// for the slot range so the caller can both inspect AND
 // byte-compare two runs.
 struct ContactStream {
     bool ok = false;
@@ -151,8 +150,6 @@ struct ContactStream {
     std::vector<uint64_t> cache_feature;
     std::vector<float> cache_lambda;   // [kSlots*4*3]
     std::vector<float> lambda;         // [rows]
-    std::vector<Vec3>     tangent1;    // [kSlots*4]
-    std::vector<Vec3>     tangent2;    // [kSlots*4]
     std::vector<uint32_t> contact_count;  // [env]
 };
 
@@ -179,8 +176,6 @@ ContactStream RunOnce() {
     s.cache_feature.assign(pts, 0u);
     s.cache_lambda.assign(pts * 3u, 0.0f);
     s.lambda.assign(kSlots * nk::kPairDrivenRowsPerSlot, 0.0f);
-    s.tangent1.assign(pts, Vec3::Zero());
-    s.tangent2.assign(pts, Vec3::Zero());
     s.contact_count.assign(1u, 0u);
 
     nk::Data& d = world.GetData();
@@ -211,10 +206,6 @@ ContactStream RunOnce() {
                         s.cache_lambda.size() * sizeof(float)) &&
         d.DownloadField(nk::FieldId::Lambda, s.lambda.data(),
                         s.lambda.size() * sizeof(float)) &&
-        d.DownloadField(nk::FieldId::UcontactTangent1, s.tangent1.data(),
-                        s.tangent1.size() * sizeof(Vec3)) &&
-        d.DownloadField(nk::FieldId::UcontactTangent2, s.tangent2.data(),
-                        s.tangent2.size() * sizeof(Vec3)) &&
         d.DownloadField(nk::FieldId::ContactCount, s.contact_count.data(),
                         s.contact_count.size() * sizeof(uint32_t));
     if (!dl) { s.failure_stage = 4u; return s; }
@@ -289,15 +280,6 @@ TEST(PairDrivenNarrowphase, CvxDetectsOverlapWithIdsAndTangents) {
             EXPECT_NEAR(nlen, 1.0f, 1.0e-3f) << "normal must be unit length";
             EXPECT_GT(s.depth[at], 0.0f) << "penetration must be positive";
             EXPECT_LT(s.depth[at], 0.5f) << "penetration implausibly deep";
-
-            // (6) TANGENT BASIS (C4): (t1,t2) orthonormal + orthogonal to n.
-            const Vec3 t1 = s.tangent1[at], t2 = s.tangent2[at];
-            EXPECT_TRUE(Finite(t1)); EXPECT_TRUE(Finite(t2));
-            EXPECT_NEAR(std::sqrt(t1.Dot(t1)), 1.0f, 1.0e-3f) << "t1 not unit";
-            EXPECT_NEAR(std::sqrt(t2.Dot(t2)), 1.0f, 1.0e-3f) << "t2 not unit";
-            EXPECT_NEAR(t1.Dot(s.normal[at]), 0.0f, 1.0e-3f) << "t1 not perp to n";
-            EXPECT_NEAR(t2.Dot(s.normal[at]), 0.0f, 1.0e-3f) << "t2 not perp to n";
-            EXPECT_NEAR(t1.Dot(t2), 0.0f, 1.0e-3f) << "t1,t2 not orthogonal";
         }
         for (uint32_t i = n; i < 4u; ++i) {
             const size_t at = static_cast<size_t>(slot) * 4u + i;
@@ -349,8 +331,6 @@ TEST(PairDrivenNarrowphase, TwoRunsByteIdentical) {
         << "contact_cache_feature differs across runs";
     EXPECT_TRUE(SameBytes(a.cache_lambda, b.cache_lambda))
         << "contact_cache_lambda differs across runs";
-    EXPECT_TRUE(SameBytes(a.tangent1, b.tangent1)) << "ucontact_tangent1 differs across runs";
-    EXPECT_TRUE(SameBytes(a.tangent2, b.tangent2)) << "ucontact_tangent2 differs across runs";
     EXPECT_EQ(a.total_points, b.total_points);
 }
 

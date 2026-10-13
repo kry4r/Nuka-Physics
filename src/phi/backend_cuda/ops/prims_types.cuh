@@ -43,18 +43,9 @@ struct PrimShapeDev {
     uint32_t contact_profile_index; // ContactProfileV1 table row.
 };
 
-enum class MeshContactRoute : uint8_t { Analytic, Ogc, Sdf };
+using collision::MeshContactRoute;
+using collision::RouteMeshContact;
 
-__host__ __device__ inline MeshContactRoute RouteMeshContact(
-    uint32_t kind_a, uint32_t kind_b, uint8_t mode_a, uint8_t mode_b) {
-    const bool mesh_a = kind_a == collision::kShapeConvexHull ||
-                        kind_a == collision::kShapeSdfMesh;
-    const bool mesh_b = kind_b == collision::kShapeConvexHull ||
-                        kind_b == collision::kShapeSdfMesh;
-    if (!mesh_a && !mesh_b) return MeshContactRoute::Analytic;
-    return mesh_a && mesh_b && mode_a == 1u && mode_b == 1u
-        ? MeshContactRoute::Sdf : MeshContactRoute::Ogc;
-}
 // All 12 lanes are 4-byte scalars, so the packed row is exactly the stride; this
 // guards against a lane addition that forgets to bump kShapeTableRowStride.
 static_assert(sizeof(PrimShapeDev) == kShapeTableRowStride * sizeof(float),

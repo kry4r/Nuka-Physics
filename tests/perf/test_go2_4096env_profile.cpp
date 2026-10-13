@@ -43,7 +43,6 @@ const char* OpName(nuka::phi::NkOp op) {
         case NkOp::NarrowphasePrimitives: return "NarrowphasePrimitives";
         case NkOp::NarrowphaseSdf: return "NarrowphaseSdf";
         case NkOp::NarrowphaseHeightfield: return "NarrowphaseHeightfield";
-        case NkOp::ContactTangentBasis: return "ContactTangentBasis";
         case NkOp::AssembleRows: return "AssembleRows";
         case NkOp::ReadoutContactWrench: return "ReadoutContactWrench";
         case NkOp::SyncLinkBodyPose: return "SyncLinkBodyPose";

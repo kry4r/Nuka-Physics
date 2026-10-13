@@ -147,10 +147,9 @@ constexpr uint32_t kWrenchBlock = 256u;
 // Gather both contact endpoints into each link's world-frame wrench.
 // Endpoint terms load in parallel; one thread adds them in the fixed endpoint order without atomics.
 __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
+                                        const NkRow* __restrict__ rows,
                                         const Vec3* __restrict__ row_cj_point,
-                                        const Vec3* __restrict__ row_cj_dir,
                                         const Vec3* __restrict__ row_cj_point_b,
-                                        const Vec3* __restrict__ row_cj_dir_b,
                                         const Transform* __restrict__ link_world_pose,
                                         const uint64_t* __restrict__ endpoint_keys,
                                         const uint32_t* __restrict__ link_begin,
@@ -177,7 +176,7 @@ __global__ void LinkContactWrenchKernel(const float* __restrict__ lambda,
             const uint32_t rs = endpoint / contact_index::kEndpointsPerRow;
             const bool side_b = endpoint % contact_index::kEndpointsPerRow != 0u;
             const float l = lambda[rs];
-            const Vec3 f_slot = (side_b ? row_cj_dir_b[rs] : row_cj_dir[rs]) * (l * inv_dt);
+            const Vec3 f_slot = (side_b ? rows[rs].b.jlin : rows[rs].a.jlin) * (l * inv_dt);
             impulse[threadIdx.x] = f_slot;
             moment[threadIdx.x] = ((side_b ? row_cj_point_b[rs] : row_cj_point[rs]) - origin).Cross(f_slot);
         }
@@ -345,14 +344,11 @@ Status OpAccumulateStep(const ModelView& model, const DataView& data,
 
 __device__ void ClearWarmStartPoint(
     uint32_t point_index, uint64_t* cache_pair, uint64_t* cache_feature,
-    float* cache_lambda, Vec3* cache_normal, Vec3* cache_tangent1,
-    Vec3* cache_tangent2, uint64_t* cache_material, uint32_t* cache_age) {
+    float* cache_lambda, Vec3* cache_normal, uint64_t* cache_material, uint32_t* cache_age) {
     cache_pair[point_index] = 0u;
     cache_feature[point_index] = 0u;
     for (uint32_t k = 0u; k < 3u; ++k) cache_lambda[point_index * 3u + k] = 0.0f;
     cache_normal[point_index] = {0.0f, 0.0f, 0.0f};
-    cache_tangent1[point_index] = {0.0f, 0.0f, 0.0f};
-    cache_tangent2[point_index] = {0.0f, 0.0f, 0.0f};
     cache_material[point_index] = 0u;
     cache_age[point_index] = 0u;
 }
@@ -376,7 +372,8 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
             constraint::kContactSolveWorstColumns + column] = 0.0f;
     for (uint32_t count = threadIdx.x; count < constraint::kContactSolveCountSize; count += blockDim.x)
         data.contact_solve_counts[env * constraint::kContactSolveCountSize + count] = 0u;
-    const bool has_contact_index = p.base_link_count != 0u && p.lambda_stride != 0u && p.contact_slot_count != 0u;
+    // The contact index exists once a contact readout was demanded.
+    const bool has_contact_index = data.active_row_count != nullptr;
     if (has_contact_index && threadIdx.x == 0u) {
         data.active_row_count[env] = 0u;
         data.contact_endpoint_count[env] = 0u;
@@ -423,8 +420,6 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         data.row_cj_link_b[row] = ~0u;
         data.row_cj_point[row] = {};
         data.row_cj_point_b[row] = {};
-        data.row_cj_dir[row] = {};
-        data.row_cj_dir_b[row] = {};
     }
     for (uint32_t local = threadIdx.x; local < p.contact_slot_count; local += blockDim.x) {
         const uint32_t contact = env * p.contact_slot_count + local;
@@ -446,8 +441,7 @@ __global__ void ResetEnvsKernel(DataView data, ResetEnvsParams p) {
         for (uint32_t point = 0u; point < kPdPtsPerSlot; ++point) {
             ClearWarmStartPoint(contact * kPdPtsPerSlot + point, data.contact_cache_pair,
                 data.contact_cache_feature, data.contact_cache_lambda, data.contact_cache_normal,
-                data.contact_cache_tangent1, data.contact_cache_tangent2, data.contact_cache_material,
-                data.contact_cache_age);
+                data.contact_cache_material, data.contact_cache_age);
         }
     }
     for (uint32_t local = threadIdx.x; local < p.point_endpoints_per_env; local += blockDim.x)
@@ -610,10 +604,9 @@ Status OpReadoutContactWrench(const ModelView& /*model*/, const DataView& data,
     if (total_link_count != 0u) {
         LaunchCuda(LinkContactWrenchKernel, dim3(total_link_count), dim3(kWrenchBlock), 0u, stream,
                    static_cast<const float*>(data.lambda),
+                   reinterpret_cast<const NkRow*>(data.urows),
                    static_cast<const Vec3*>(data.row_cj_point),
-                   static_cast<const Vec3*>(data.row_cj_dir),
                    static_cast<const Vec3*>(data.row_cj_point_b),
-                   static_cast<const Vec3*>(data.row_cj_dir_b),
                    static_cast<const Transform*>(data.link_pose),
                    data.contact_endpoint_keys, data.link_contact_begin, data.link_contact_end,
                    total_link_count,

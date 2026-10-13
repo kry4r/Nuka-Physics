@@ -273,8 +273,7 @@ std::vector<uint8_t> State(nk::World& world, bool cache = true) {
     if (cache) {
         for (const auto field : {nk::FieldId::ContactCachePair, nk::FieldId::ContactCacheFeature,
                                 nk::FieldId::ContactCacheMaterial, nk::FieldId::ContactCacheAge,
-                                nk::FieldId::ContactCacheNormal, nk::FieldId::ContactCacheTangent1,
-                                nk::FieldId::ContactCacheTangent2, nk::FieldId::ContactCacheLambda,
+                                nk::FieldId::ContactCacheNormal, nk::FieldId::ContactCacheLambda,
                                 nk::FieldId::LinkContactWrench})
             fields.push_back(field);
     }

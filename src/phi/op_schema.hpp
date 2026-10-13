@@ -405,6 +405,7 @@ struct NarrowphasePrimitivesParams {
     uint32_t articulations_per_env;  // K (dead: FUSED foot slot re-key removed)
     uint32_t max_foot_contacts;      // == kMaxFootContactsPerEnv (dead with FUSED)
     uint32_t max_body_samples;      // largest per-body slice of the surface sample pool
+    uint32_t convex_pairs;          // nonzero when some filtered pair needs the convex narrowphase
 };
 
 // General contact pipeline (B2): SyncLinkBodyPose. One thread per
@@ -518,15 +519,6 @@ struct NarrowphaseSdfParams {
 // Host-callable (defined in narrowphase_sdf.cu) so the World sizes it before allocation.
 uint64_t PairSampleChunkWords(const NarrowphaseSdfParams& params);
 
-struct ContactTangentBasisParams {
-    uint32_t slot_count;        // env_count * max_contacts_per_env
-    // the FUSED tangent kernel was deleted. The op is now enqueued ONLY for
-    // the PairDriven family (the union family emits its tangent spokes inside
-    // AssembleRows), and it unconditionally reads the unified ucontact_normal
-    // (elem:4) -> ucontact_tangent1/2. The field is retained for layout/diagnostics.
-    uint32_t family = 0u;
-};
-
 // Vertex blocks occupy particles [begin, begin + vertices) of each env; vertices == 0 when absent.
 struct VertexBlockLayout {
     uint32_t begin = 0u;
@@ -581,6 +573,8 @@ struct AssembleRowsParams {
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
     VertexBlockLayout vertex_blocks{};
+    // Nonzero when the solve measures contact residuals against the Coulomb block response.
+    uint32_t measure_contact_response = 0u;
 };
 
 struct BlockDescentSolveParams {
@@ -595,6 +589,7 @@ struct BlockDescentSolveParams {
     uint32_t max_dof = 0u;
     uint32_t base_link_count = 0u;
     uint32_t contact_rows_per_env = 0u;
+    uint32_t distinct_owner_rows_per_env = 0u;
     uint32_t joint_limit_rows_per_env = 0u;
     uint64_t incidence_per_env = 0u;
     uint32_t measure_contact_residual = 0u;

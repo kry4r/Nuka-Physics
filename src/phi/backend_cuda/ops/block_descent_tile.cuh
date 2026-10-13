@@ -72,6 +72,7 @@ struct TileContext {
     uint32_t first_articulation;
     uint32_t capacity;
     uint32_t staged;
+    uint32_t width;
     float* fields;
     float* jacobian;
     float* mass;
@@ -364,7 +365,7 @@ __device__ void InitializeTileRows(DataView data, BlockDescentSolveParams p, Blo
                 row = rows;
 #pragma unroll
                 for (uint32_t axis = 0u; axis < 3u; ++axis)
-                    if (axis < axes) c.jacobian[size_t{row + axis} * kTileLanes + c.lane] = value[axis];
+                    if (axis < axes && c.lane < c.width) c.jacobian[size_t{row + axis} * c.width + c.lane] = value[axis];
                 rows += axes;
             }
             if (c.lane == 0u) {
@@ -543,11 +544,13 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
         for (uint32_t pending = __ballot_sync(~0u, incidence != kNoTileIncidence && unit == ~0u); pending != 0u;
              pending &= pending - 1u) {
             const uint32_t source = __ffs(pending) - 1u;
-            const float* jacobian = c.jacobian + size_t{__shfl_sync(~0u, first, source)} * kTileLanes + c.lane;
+            const bool staged = c.lane < c.width;
+            const float* jacobian = c.jacobian + size_t{__shfl_sync(~0u, first, source)} * c.width +
+                                    (staged ? c.lane : 0u);
             const uint32_t source_axes = __shfl_sync(~0u, axes, source);
             const float fx = __shfl_sync(~0u, f.x, source), cxx = __shfl_sync(~0u, curvature.xx, source);
             const float nx = __shfl_sync(~0u, noise.x, source);
-            const float j0 = jacobian[0];
+            const float j0 = staged ? jacobian[0] : 0.0f;
             TileAddProduct(g, j0, fx);
             scale += fabsf(j0) * nx;
             if (source_axes == 1u) {
@@ -560,7 +563,7 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
             const float cyy = __shfl_sync(~0u, curvature.yy, source), czz = __shfl_sync(~0u, curvature.zz, source);
             const float cyz = __shfl_sync(~0u, curvature.yz, source);
             const float ny = __shfl_sync(~0u, noise.y, source), nz = __shfl_sync(~0u, noise.z, source);
-            const float j1 = jacobian[kTileLanes], j2 = jacobian[2u * kTileLanes];
+            const float j1 = staged ? jacobian[c.width] : 0.0f, j2 = staged ? jacobian[2u * c.width] : 0.0f;
             TileAddProduct(g, j1, fy);
             TileAddProduct(g, j2, fz);
             scale += fabsf(j1) * ny + fabsf(j2) * nz;
@@ -648,10 +651,14 @@ __device__ void TileRowSteps(const TileContext& c, uint32_t block, float d) {
         if (unit != ~0u) step.x = c.Value(kTileUnitValue + incidence, own) * along;
         for (uint32_t pending = __ballot_sync(~0u, touches && unit == ~0u); pending != 0u; pending &= pending - 1u) {
             const uint32_t source = __ffs(pending) - 1u;
-            const float* jacobian = c.jacobian + size_t{__shfl_sync(~0u, first, source)} * kTileLanes + c.lane;
+            const bool staged = c.lane < c.width;
+            const float* jacobian = c.jacobian + size_t{__shfl_sync(~0u, first, source)} * c.width +
+                                    (staged ? c.lane : 0u);
+            const float j0 = staged ? jacobian[0] : 0.0f;
             Vec3 w{};
-            if (__shfl_sync(~0u, axes, source) == 1u) w.x = TileWarpSum(jacobian[0] * d);
-            else w = TileWarpSum3({jacobian[0] * d, jacobian[kTileLanes] * d, jacobian[2u * kTileLanes] * d});
+            if (__shfl_sync(~0u, axes, source) == 1u) w.x = TileWarpSum(j0 * d);
+            else w = TileWarpSum3({j0 * d, (staged ? jacobian[c.width] : 0.0f) * d,
+                                   (staged ? jacobian[2u * c.width] : 0.0f) * d});
             if (c.lane == source) step = w;
         }
         if (touches) c.Store3(kTileStep, own, step);
@@ -1025,6 +1032,7 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
     extern __shared__ float tile_shared[];
     const uint32_t warp = threadIdx.x / kTileLanes;
     const uint32_t lane = threadIdx.x % kTileLanes;
+    const uint32_t slot = blockIdx.x * kTileWarps + warp;
     for (;;) {
         uint32_t ticket = 0u;
         if (lane == 0u) ticket = atomicAdd(s.tile_next, 1u);
@@ -1040,8 +1048,9 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
         c.first_articulation = c.env * c.articulations;
         c.capacity = s.tile_head_capacity;
         c.staged = kNoTileBlock;
-        c.fields = s.tile_fields + size_t{c.env} * kTileFields * c.capacity;
-        c.jacobian = s.tile_jacobian + size_t{c.env} * s.tile_row_capacity * kTileLanes;
+        c.width = kN;
+        c.fields = s.tile_fields + size_t{slot} * kTileFields * c.capacity;
+        c.jacobian = s.tile_jacobian + size_t{slot} * s.tile_row_capacity * kN;
         c.mass = tile_shared + size_t{warp} * 2u * kN * (kN + 1u);
         c.factor = c.mass + kN * (kN + 1u);
         c.iteration = ~0u;
@@ -1052,16 +1061,49 @@ __global__ void __launch_bounds__(kTileWarps * kTileLanes) DescendDenseTilesKern
 }
 
 template <uint32_t kN>
+constexpr size_t TileSharedBytes() {
+    return size_t{kTileWarps} * 2u * kN * (kN + 1u) * sizeof(float);
+}
+
+// Blocks of the tile kernel resident for p's environments, with the cache carveout the launch uses.
+template <uint32_t kN>
+cudaError_t TileResidentBlocks(const BlockDescentSolveParams& p, uint32_t* blocks) {
+    const cudaError_t status =
+        PreferCacheCarveout(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, TileSharedBytes<kN>());
+    if (status != cudaSuccess) return status;
+    return ResidentGridSize(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, TileSharedBytes<kN>(),
+                            (p.env_count + kTileWarps - 1u) / kTileWarps, blocks);
+}
+
+template <uint32_t kN>
 cudaError_t LaunchDenseTiles(ArticulationDeviceState state, DataView data, BlockDescentSolveParams p,
                              BlockScratch s, cudaStream_t stream) {
-    const size_t shared = size_t{kTileWarps} * 2u * kN * (kN + 1u) * sizeof(float);
-    cudaError_t status = PreferCacheCarveout(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, shared);
-    if (status != cudaSuccess) return status;
     uint32_t blocks = 0u;
-    status = ResidentGridSize(DescendDenseTilesKernel<kN>, kTileWarps * kTileLanes, shared,
-                              (p.env_count + kTileWarps - 1u) / kTileWarps, &blocks);
+    const cudaError_t status = TileResidentBlocks<kN>(p, &blocks);
     if (status != cudaSuccess) return status;
-    LaunchCuda(DescendDenseTilesKernel<kN>, dim3(blocks), dim3(kTileWarps * kTileLanes), shared, stream,
-               state, data, p, s);
+    LaunchCuda(DescendDenseTilesKernel<kN>, dim3(blocks), dim3(kTileWarps * kTileLanes), TileSharedBytes<kN>(),
+               stream, state, data, p, s);
     return cudaGetLastError();
+}
+
+// Calls visit with p's tile width as an integral constant.
+template <typename Visit>
+cudaError_t VisitTileWidth(const BlockDescentSolveParams& p, Visit&& visit) {
+    switch (TileWidth(p)) {
+        case 8u: return visit(std::integral_constant<uint32_t, 8u>{});
+        case 12u: return visit(std::integral_constant<uint32_t, 12u>{});
+        case 16u: return visit(std::integral_constant<uint32_t, 16u>{});
+        case 20u: return visit(std::integral_constant<uint32_t, 20u>{});
+        case 24u: return visit(std::integral_constant<uint32_t, 24u>{});
+        case 28u: return visit(std::integral_constant<uint32_t, 28u>{});
+        default: return visit(std::integral_constant<uint32_t, 32u>{});
+    }
+}
+
+uint32_t TileWarpSlots(const BlockDescentSolveParams& p) {
+    uint32_t blocks = 0u;
+    const cudaError_t status = VisitTileWidth(p, [&](auto width) {
+        return TileResidentBlocks<decltype(width)::value>(p, &blocks);
+    });
+    return status == cudaSuccess ? blocks * kTileWarps : 0u;
 }

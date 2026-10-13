@@ -109,7 +109,7 @@ __global__ void ComputeContactChainJacobianKernel(
     ArticulationDeviceState state,
     const uint32_t* contact_link_indices,
     const math::Vec3* contact_point_world,
-    const math::Vec3* contact_normal_world,
+    const float* contact_normal_world, uint32_t normal_stride,
     uint32_t contact_count,
     uint32_t dof_stride,
     float* out_chain_jacobian) {
@@ -127,7 +127,8 @@ __global__ void ComputeContactChainJacobianKernel(
     const uint32_t offset = state.articulation_link_offset[articulation];
 
     const math::Vec3 point = contact_point_world[contact];
-    const math::Vec3 normal = NormalizeOrUp(contact_normal_world[contact]);
+    const math::Vec3 normal = NormalizeOrUp(
+        *reinterpret_cast<const math::Vec3*>(contact_normal_world + size_t{contact} * normal_stride));
     float* const out_row = out_chain_jacobian + static_cast<size_t>(contact) * dof_stride;
 
     // AccumulateChainJointForce uses +=. Zero exactly the live articulation row
@@ -382,8 +383,6 @@ __global__ void EmitPairDrivenRowsKernel(
     const math::Vec3* __restrict__ ucontact_witness_a,
     const math::Vec3* __restrict__ ucontact_witness_b,
     const math::Vec3* __restrict__ ucontact_normal,
-    const math::Vec3* __restrict__ ucontact_tangent1,
-    const math::Vec3* __restrict__ ucontact_tangent2,
     const float* __restrict__ ucontact_depth,
     const uint32_t* __restrict__ ucontact_a,
     const uint32_t* __restrict__ ucontact_b,
@@ -412,9 +411,7 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
     NkRow* __restrict__ urows, float* __restrict__ lambda,
     uint32_t* __restrict__ row_cj_link, math::Vec3* __restrict__ row_cj_point,
-    math::Vec3* __restrict__ row_cj_dir,
     uint32_t* __restrict__ row_cj_link_b, math::Vec3* __restrict__ row_cj_point_b,
-    math::Vec3* __restrict__ row_cj_dir_b,
     uint32_t* __restrict__ row_count,
     float* __restrict__ row_penetration,
     float* __restrict__ row_damping, uint32_t* __restrict__ env_status,
@@ -554,8 +551,7 @@ __global__ void EmitPairDrivenRowsKernel(
                 slot - full_row_slot_count < ogc_slot_count;
             point_a = ogc_slot ? ucontact_witness_a[mp] : point;
             point_b = ogc_slot ? ucontact_witness_b[mp] : point;
-            t0 = ucontact_tangent1[mp];
-            t1v = ucontact_tangent2[mp];
+            mg::ContactTangentBasis(ucontact_normal[mp], &t0, &t1v);
         }
 
         // ---- normal row ------------------------------------------------------
@@ -599,14 +595,8 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.b.jlin = math::Vec3{-n.x, -n.y, -n.z};
                 if (kind_a == kNkSideRigid) row.a.jang = (point_a - com_a).Cross(row.a.jlin);
                 if (kind_b == kNkSideRigid) row.b.jang = (point_b - com_b).Cross(row.b.jlin);
-                if (kind_a == kNkSideArtic) {
-                    row_cj_link[rs] = link_a; row_cj_point[rs] = point_a;
-                    row_cj_dir[rs] = row.a.jlin;
-                }
-                if (kind_b == kNkSideArtic) {
-                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point_b;
-                    row_cj_dir_b[rs] = row.b.jlin;
-                }
+                if (kind_a == kNkSideArtic) { row_cj_link[rs] = link_a; row_cj_point[rs] = point_a; }
+                if (kind_b == kNkSideArtic) { row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point_b; }
                 ++active_rows;
             }
             if (row.flags & nk::nk_row_flags::kActive) urows[rs] = row;
@@ -641,14 +631,8 @@ __global__ void EmitPairDrivenRowsKernel(
                 row.b.jlin = math::Vec3{-dir.x, -dir.y, -dir.z};
                 if (kind_a == kNkSideRigid) row.a.jang = (point_a - com_a).Cross(row.a.jlin);
                 if (kind_b == kNkSideRigid) row.b.jang = (point_b - com_b).Cross(row.b.jlin);
-                if (kind_a == kNkSideArtic) {
-                    row_cj_link[rs] = link_a; row_cj_point[rs] = point_a;
-                    row_cj_dir[rs] = row.a.jlin;
-                }
-                if (kind_b == kNkSideArtic) {
-                    row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point_b;
-                    row_cj_dir_b[rs] = row.b.jlin;
-                }
+                if (kind_a == kNkSideArtic) { row_cj_link[rs] = link_a; row_cj_point[rs] = point_a; }
+                if (kind_b == kNkSideArtic) { row_cj_link_b[rs] = link_b; row_cj_point_b[rs] = point_b; }
                 ++active_rows;
             }
             if (row.flags & nk::nk_row_flags::kActive) urows[rs] = row;
@@ -980,6 +964,7 @@ __device__ float ContactReferenceVelocity(
 // Prepares contact compliance, initial-velocity forcing and diagnostic block responses.
 __global__ void PrepareContactRowsKernel(
     NkRow* __restrict__ urows,
+    math::SymmetricMat3* __restrict__ contact_response,
     const float* __restrict__ chain_jacobian,
     const float* __restrict__ mass_factor,
     const float* __restrict__ chain_jacobian_b,
@@ -992,7 +977,7 @@ __global__ void PrepareContactRowsKernel(
     const math::Vec3* __restrict__ step_body_angular,
     const math::Vec3* __restrict__ step_particle,
     uint32_t total_rows, uint32_t dof_stride, float dt, VertexBlockLayout vertex_blocks,
-    uint32_t rows_per_env, uint32_t contact_rows_per_env,
+    uint32_t rows_per_env, uint32_t contact_rows_per_env, uint32_t measure,
     const uint32_t* __restrict__ contact_row_extent) {
     const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
     if (rs >= total_rows) return;
@@ -1009,9 +994,10 @@ __global__ void PrepareContactRowsKernel(
         row.flags |= nk::nk_row_flags::kVertexBlock;
     const bool reference = (row.flags & nk::nk_row_flags::kContactNormal) &&
         !(row.flags & (nk::nk_row_flags::kVelocityOnly | nk::nk_row_flags::kSpeculative));
-    if (!reference && !(row.flags & nk::nk_row_flags::kBlockNormal)) return;
+    const bool respond = measure != 0u && (row.flags & nk::nk_row_flags::kBlockNormal);
+    if (!reference && !respond) return;
     uint32_t tangent_rows[2] = {0u, 0u};
-    const bool block = BlockTangentRows(urows, rs, row, tangent_rows);
+    const bool block = respond && BlockTangentRows(urows, rs, row, tangent_rows);
     const uint32_t tangent1_row = tangent_rows[0], tangent2_row = tangent_rows[1];
     // Pairs 11, 22, 01, 02, 12 of the normal and its tangents.
     SharedSideCoupling shared[5];
@@ -1050,9 +1036,9 @@ __global__ void PrepareContactRowsKernel(
         row.rhs += initial_velocity / dt;
     }
     diagonal += row.compliance_alpha;
-    if (!(row.flags & nk::nk_row_flags::kBlockNormal)) return;
+    if (!respond) return;
     if (!block) {
-        row.contact_response = {};
+        contact_response[rs] = {};
         return;
     }
     const NkRow& tangent1 = urows[tangent1_row];
@@ -1085,7 +1071,7 @@ __global__ void PrepareContactRowsKernel(
                               body_world_inv_inertia, point_masses, dof_stride, shared[4]) +
         PairDrivenRowCoupling(tangent2, forward2, tangent1, forward1, mass_factor, body_inv_mass,
                               body_world_inv_inertia, point_masses, dof_stride, shared[4]));
-    row.contact_response = {k00, k11, k22, k01, k02, k12};
+    contact_response[rs] = {k00, k11, k22, k01, k02, k12};
 }
 
 __device__ bool ContactRowOffsets(uint32_t env, uint32_t slot, uint32_t point,
@@ -1103,12 +1089,8 @@ __device__ bool ContactRowOffsets(uint32_t env, uint32_t slot, uint32_t point,
 // Only compacted current entries can hold a match; rows of other points keep their lambda.
 __global__ void PrepareContactWarmStartKernel(
     const math::Vec3* __restrict__ current_normal,
-    const math::Vec3* __restrict__ current_tangent1,
-    const math::Vec3* __restrict__ current_tangent2,
     const float* __restrict__ cache_lambda,
     const math::Vec3* __restrict__ cache_normal,
-    const math::Vec3* __restrict__ cache_tangent1,
-    const math::Vec3* __restrict__ cache_tangent2,
     const uint32_t* __restrict__ matches,
     const uint32_t* __restrict__ order,
     const uint32_t* __restrict__ begins,
@@ -1133,11 +1115,13 @@ __global__ void PrepareContactWarmStartKernel(
         if (!ContactRowOffsets(env, slot, point, slot_count, row_ranges, &normal_row, &tangent1_row,
                                &tangent2_row)) continue;
         const float normal_impulse = fmaxf(cache_lambda[match * 3u], 0.0f);
+        math::Vec3 old_t1, old_t2, t1, t2;
+        mg::ContactTangentBasis(cache_normal[match], &old_t1, &old_t2);
+        mg::ContactTangentBasis(n, &t1, &t2);
         const math::Vec3 old_tangent_impulse =
-            cache_tangent1[match] * cache_lambda[match * 3u + 1u] +
-            cache_tangent2[match] * cache_lambda[match * 3u + 2u];
-        const float tangent1 = old_tangent_impulse.Dot(current_tangent1[point_index]);
-        const float tangent2 = old_tangent_impulse.Dot(current_tangent2[point_index]);
+            old_t1 * cache_lambda[match * 3u + 1u] + old_t2 * cache_lambda[match * 3u + 2u];
+        const float tangent1 = old_tangent_impulse.Dot(t1);
+        const float tangent2 = old_tangent_impulse.Dot(t2);
         lambda[normal_row] = normal_impulse;
         lambda[tangent1_row] = tangent1;
         lambda[tangent2_row] = tangent2;
@@ -1146,17 +1130,13 @@ __global__ void PrepareContactWarmStartKernel(
 
 __device__ void ClearContactCachePoint(
     uint32_t point_index, uint64_t* cache_pair, uint64_t* cache_feature,
-    float* cache_lambda, math::Vec3* cache_normal,
-    math::Vec3* cache_tangent1, math::Vec3* cache_tangent2,
-    uint64_t* cache_material, uint32_t* cache_age) {
+    float* cache_lambda, math::Vec3* cache_normal, uint64_t* cache_material, uint32_t* cache_age) {
     cache_pair[point_index] = 0u;
     cache_feature[point_index] = 0u;
     cache_lambda[point_index * 3u + 0u] = 0.0f;
     cache_lambda[point_index * 3u + 1u] = 0.0f;
     cache_lambda[point_index * 3u + 2u] = 0.0f;
     cache_normal[point_index] = {0.0f, 0.0f, 0.0f};
-    cache_tangent1[point_index] = {0.0f, 0.0f, 0.0f};
-    cache_tangent2[point_index] = {0.0f, 0.0f, 0.0f};
     cache_material[point_index] = 0u;
     cache_age[point_index] = 0u;
 }
@@ -1172,16 +1152,12 @@ __global__ void SnapshotContactCacheKernel(
     const uint64_t* __restrict__ cache_feature,
     const float* __restrict__ cache_lambda,
     const math::Vec3* __restrict__ cache_normal,
-    const math::Vec3* __restrict__ cache_tangent1,
-    const math::Vec3* __restrict__ cache_tangent2,
     const uint64_t* __restrict__ cache_material,
     const uint32_t* __restrict__ cache_age,
     uint64_t* __restrict__ snapshot_pair,
     uint64_t* __restrict__ snapshot_feature,
     float* __restrict__ snapshot_lambda,
     math::Vec3* __restrict__ snapshot_normal,
-    math::Vec3* __restrict__ snapshot_tangent1,
-    math::Vec3* __restrict__ snapshot_tangent2,
     uint64_t* __restrict__ snapshot_material,
     uint32_t* __restrict__ snapshot_age) {
     const uint32_t env = blockIdx.x / env_blocks;
@@ -1196,8 +1172,6 @@ __global__ void SnapshotContactCacheKernel(
         for (uint32_t k = 0u; k < 3u; ++k)
             snapshot_lambda[point_index * 3u + k] = cache_lambda[point_index * 3u + k];
         snapshot_normal[point_index] = cache_normal[point_index];
-        snapshot_tangent1[point_index] = cache_tangent1[point_index];
-        snapshot_tangent2[point_index] = cache_tangent2[point_index];
         snapshot_material[point_index] = cache_material[point_index];
         snapshot_age[point_index] = cache_age[point_index];
     }
@@ -1208,16 +1182,12 @@ __global__ void RebuildContactCacheKernel(
     const uint64_t* __restrict__ current_pair,
     const uint64_t* __restrict__ current_feature,
     const math::Vec3* __restrict__ current_normal,
-    const math::Vec3* __restrict__ current_tangent1,
-    const math::Vec3* __restrict__ current_tangent2,
     const uint64_t* __restrict__ current_material,
     const float* __restrict__ lambda,
     const uint64_t* __restrict__ snapshot_pair,
     const uint64_t* __restrict__ snapshot_feature,
     const float* __restrict__ snapshot_lambda,
     const math::Vec3* __restrict__ snapshot_normal,
-    const math::Vec3* __restrict__ snapshot_tangent1,
-    const math::Vec3* __restrict__ snapshot_tangent2,
     const uint64_t* __restrict__ snapshot_material,
     const uint32_t* __restrict__ snapshot_age,
     const uint32_t* __restrict__ current_owner,
@@ -1230,8 +1200,6 @@ __global__ void RebuildContactCacheKernel(
     uint64_t* __restrict__ cache_feature,
     float* __restrict__ cache_lambda,
     math::Vec3* __restrict__ cache_normal,
-    math::Vec3* __restrict__ cache_tangent1,
-    math::Vec3* __restrict__ cache_tangent2,
     uint64_t* __restrict__ cache_material,
     uint32_t* __restrict__ cache_age) {
     const uint32_t points_per_env = slot_count * 4u;
@@ -1255,8 +1223,6 @@ __global__ void RebuildContactCacheKernel(
                 cache_lambda[point_index * 3u + 1u] = lambda[tangent1_row];
                 cache_lambda[point_index * 3u + 2u] = lambda[tangent2_row];
                 cache_normal[point_index] = current_normal[point_index];
-                cache_tangent1[point_index] = current_tangent1[point_index];
-                cache_tangent2[point_index] = current_tangent2[point_index];
                 cache_material[point_index] = current_material[point_index / 4u];
                 cache_age[point_index] = 0u;
                 continue;
@@ -1272,15 +1238,12 @@ __global__ void RebuildContactCacheKernel(
             for (uint32_t k = 0u; k < 3u; ++k)
                 cache_lambda[point_index * 3u + k] = snapshot_lambda[source * 3u + k];
             cache_normal[point_index] = snapshot_normal[source];
-            cache_tangent1[point_index] = snapshot_tangent1[source];
-            cache_tangent2[point_index] = snapshot_tangent2[source];
             cache_material[point_index] = snapshot_material[source];
             cache_age[point_index] = snapshot_age[source] + 1u;
             continue;
         }
         ClearContactCachePoint(point_index, cache_pair, cache_feature, cache_lambda,
-                               cache_normal, cache_tangent1, cache_tangent2,
-                               cache_material, cache_age);
+                               cache_normal, cache_material, cache_age);
     }
 }
 
@@ -1306,10 +1269,8 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         const uint32_t env_blocks = contact_cache::EnvBlocks(
             p->slot_count * nk::kPairDrivenPtsPerSlot * 2u, p->env_count);
         LaunchCuda<true>(PrepareContactWarmStartKernel, dim3(p->env_count * env_blocks), dim3(kBlock), 0u,
-                   stream, data.ucontact_normal, data.ucontact_tangent1,
-                   data.ucontact_tangent2, data.contact_cache_lambda,
-                   data.contact_cache_normal, data.contact_cache_tangent1,
-                   data.contact_cache_tangent2, workspace.matches, workspace.order,
+                   stream, data.ucontact_normal, data.contact_cache_lambda,
+                   data.contact_cache_normal, workspace.matches, workspace.order,
                    workspace.begins, workspace.ends, p->env_count, p->slot_count,
                    data.ucontact_row_range, env_blocks, data.lambda);
     } else {
@@ -1319,14 +1280,11 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    stream, points_per_env, point_blocks, data.contact_cache_extent,
                    data.contact_cache_old_keep, data.contact_cache_pair,
                    data.contact_cache_feature, data.contact_cache_lambda,
-                   data.contact_cache_normal, data.contact_cache_tangent1,
-                   data.contact_cache_tangent2, data.contact_cache_material,
+                   data.contact_cache_normal, data.contact_cache_material,
                    data.contact_cache_age, data.contact_cache_snapshot_pair,
                    data.contact_cache_snapshot_feature,
                    data.contact_cache_snapshot_lambda,
                    data.contact_cache_snapshot_normal,
-                   data.contact_cache_snapshot_tangent1,
-                   data.contact_cache_snapshot_tangent2,
                    data.contact_cache_snapshot_material,
                    data.contact_cache_snapshot_age);
         if (cudaGetLastError() != cudaSuccess) return Status::Failed;
@@ -1334,14 +1292,11 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
         if (status != cudaSuccess) return Status::Failed;
         LaunchCuda(RebuildContactCacheKernel, dim3(p->env_count * point_blocks), dim3(kBlock), 0u,
                    stream, data.ucontact_id_pair, data.ucontact_id_feature,
-                   data.ucontact_normal, data.ucontact_tangent1,
-                   data.ucontact_tangent2, data.contact_material, data.lambda,
+                   data.ucontact_normal, data.contact_material, data.lambda,
                    data.contact_cache_snapshot_pair,
                    data.contact_cache_snapshot_feature,
                    data.contact_cache_snapshot_lambda,
                    data.contact_cache_snapshot_normal,
-                   data.contact_cache_snapshot_tangent1,
-                   data.contact_cache_snapshot_tangent2,
                    data.contact_cache_snapshot_material,
                    data.contact_cache_snapshot_age,
                    data.contact_cache_current_owner,
@@ -1350,7 +1305,6 @@ Status OpContactWarmStart(const ModelView& /*model*/, const DataView& data,
                    data.ucontact_row_range,
                    data.contact_cache_pair, data.contact_cache_feature,
                    data.contact_cache_lambda, data.contact_cache_normal,
-                   data.contact_cache_tangent1, data.contact_cache_tangent2,
                    data.contact_cache_material, data.contact_cache_age);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
@@ -1432,8 +1386,6 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const math::Vec3*>(data.ucontact_witness_a),
                    static_cast<const math::Vec3*>(data.ucontact_witness_b),
                    static_cast<const math::Vec3*>(data.ucontact_normal),
-                   static_cast<const math::Vec3*>(data.ucontact_tangent1),
-                   static_cast<const math::Vec3*>(data.ucontact_tangent2),
                    static_cast<const float*>(data.ucontact_depth),
                    static_cast<const uint32_t*>(data.ucontact_a),
                    static_cast<const uint32_t*>(data.ucontact_b),
@@ -1459,8 +1411,8 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->full_row_slot_count, p->ogc_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,
                    reinterpret_cast<NkRow*>(data.urows), data.lambda,
-                   data.row_cj_link, data.row_cj_point, data.row_cj_dir,
-                   data.row_cj_link_b, data.row_cj_point_b, data.row_cj_dir_b,
+                   data.row_cj_link, data.row_cj_point,
+                   data.row_cj_link_b, data.row_cj_point_b,
                    data.row_count, data.row_penetration, data.row_damping, data.env_status,
                    data.contact_row_extent);
     }
@@ -1477,22 +1429,25 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
 
     if (has_artic) {
         // K3: chain Jacobians for side A AND side B (the SAME multi-artic kernel,
-        // fed each side's per-row link/point/dir gather). Each live articulation
+        // fed each side's per-row link/point gather). Each live articulation
         // row clears its own slice before the fixed-order += walk.
         const ArticulationDeviceState state = MakeArticulationDeviceState(
             model, data, p->total_link_count, p->articulation_count);
+        // Each side's direction is read in place from the rows, normal_stride floats apart.
+        const NkRow* const rows = reinterpret_cast<const NkRow*>(data.urows);
+        constexpr uint32_t kRowFloats = sizeof(NkRow) / sizeof(float);
         const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(ComputeContactChainJacobianKernel, dim3(blocks), dim3(kBlockSize),
                    0u, stream, state,
                    static_cast<const uint32_t*>(data.row_cj_link),
                    static_cast<const math::Vec3*>(data.row_cj_point),
-                   static_cast<const math::Vec3*>(data.row_cj_dir),
+                   &rows->a.jlin.x, kRowFloats,
                    total_rows, p->max_dof, data.chain_jacobian);
         LaunchCuda(ComputeContactChainJacobianKernel, dim3(blocks), dim3(kBlockSize),
                    0u, stream, state,
                    static_cast<const uint32_t*>(data.row_cj_link_b),
                    static_cast<const math::Vec3*>(data.row_cj_point_b),
-                   static_cast<const math::Vec3*>(data.row_cj_dir_b),
+                   &rows->b.jlin.x, kRowFloats,
                    total_rows, p->max_dof, data.chain_jacobian_b);
 
         LaunchCuda(MergeSharedArticulationJacobianKernel, dim3(blocks), dim3(kBlockSize),
@@ -1520,6 +1475,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
         const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
         LaunchCuda(PrepareContactRowsKernel, dim3(blocks), dim3(kBlockSize), 0u,
                    stream, reinterpret_cast<NkRow*>(data.urows),
+                   data.row_contact_response,
                    static_cast<const float*>(data.chain_jacobian),
                    static_cast<const float*>(data.m_factor),
                    static_cast<const float*>(data.chain_jacobian_b),
@@ -1529,7 +1485,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    data.row_damping, data.step_qdot_flat, data.step_body_linear_velocity,
                    data.step_body_angular_velocity, data.step_particle_velocity,
                    total_rows, p->max_dof, p->dt, p->vertex_blocks, p->rows_per_env,
-                   p->contact_rows_per_env, data.contact_row_extent);
+                   p->contact_rows_per_env, p->measure_contact_response, data.contact_row_extent);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }

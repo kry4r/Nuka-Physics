@@ -102,11 +102,11 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::UcontactDepth, DlpackDtype::kF32, 2, false},  // ucontact_depth
     {FieldId::RowCount, DlpackDtype::kU32, 1, false},  // row_count
     {FieldId::Urows, DlpackDtype::kF32, 2, false},  // urows
+    {FieldId::RowContactResponse, DlpackDtype::kF32, 2, false},  // row_contact_response
     {FieldId::ChainJacobian, DlpackDtype::kF32, 1, false},  // chain_jacobian
     {FieldId::RowDamping, DlpackDtype::kF32, 1, false},  // row_damping
     {FieldId::RowCjLink, DlpackDtype::kU32, 1, false},  // row_cj_link
     {FieldId::RowCjPoint, DlpackDtype::kF32, 2, false},  // row_cj_point
-    {FieldId::RowCjDir, DlpackDtype::kF32, 2, false},  // row_cj_dir
     {FieldId::QdotFlat, DlpackDtype::kF32, 1, false},  // qdot_flat
     {FieldId::M, DlpackDtype::kF32, 1, false},  // m
     {FieldId::LinkCompositeInertia, DlpackDtype::kF32, 2, false},  // link_composite_inertia
@@ -144,12 +144,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::UcontactB, DlpackDtype::kU32, 2, false},  // ucontact_b
     {FieldId::UcontactGen, DlpackDtype::kU32, 2, false},  // ucontact_gen
     {FieldId::Heights, DlpackDtype::kF32, 1, false},  // heights
-    {FieldId::UcontactTangent1, DlpackDtype::kF32, 2, false},  // ucontact_tangent1
-    {FieldId::UcontactTangent2, DlpackDtype::kF32, 2, false},  // ucontact_tangent2
     {FieldId::ChainJacobianB, DlpackDtype::kF32, 1, false},  // chain_jacobian_b
     {FieldId::RowCjLinkB, DlpackDtype::kU32, 1, false},  // row_cj_link_b
     {FieldId::RowCjPointB, DlpackDtype::kF32, 2, false},  // row_cj_point_b
-    {FieldId::RowCjDirB, DlpackDtype::kF32, 2, false},  // row_cj_dir_b
     {FieldId::RowPenetration, DlpackDtype::kF32, 1, false},  // row_penetration
     {FieldId::QdotPseudo, DlpackDtype::kF32, 1, false},  // qdot_pseudo
     {FieldId::LinkVelocityPseudo, DlpackDtype::kF32, 2, false},  // link_velocity_pseudo
@@ -194,16 +191,12 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ContactCacheFeature, DlpackDtype::kU64, 2, false},  // contact_cache_feature
     {FieldId::ContactCacheLambda, DlpackDtype::kF32, 2, false},  // contact_cache_lambda
     {FieldId::ContactCacheNormal, DlpackDtype::kF32, 2, false},  // contact_cache_normal
-    {FieldId::ContactCacheTangent1, DlpackDtype::kF32, 2, false},  // contact_cache_tangent1
-    {FieldId::ContactCacheTangent2, DlpackDtype::kF32, 2, false},  // contact_cache_tangent2
     {FieldId::ContactCacheMaterial, DlpackDtype::kU64, 2, false},  // contact_cache_material
     {FieldId::ContactCacheAge, DlpackDtype::kU32, 2, false},  // contact_cache_age
     {FieldId::ContactCacheSnapshotPair, DlpackDtype::kU64, 2, false},  // contact_cache_snapshot_pair
     {FieldId::ContactCacheSnapshotFeature, DlpackDtype::kU64, 2, false},  // contact_cache_snapshot_feature
     {FieldId::ContactCacheSnapshotLambda, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_lambda
     {FieldId::ContactCacheSnapshotNormal, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_normal
-    {FieldId::ContactCacheSnapshotTangent1, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_tangent1
-    {FieldId::ContactCacheSnapshotTangent2, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_tangent2
     {FieldId::ContactCacheSnapshotMaterial, DlpackDtype::kU64, 2, false},  // contact_cache_snapshot_material
     {FieldId::ContactCacheSnapshotAge, DlpackDtype::kU32, 2, false},  // contact_cache_snapshot_age
     {FieldId::ContactCacheCurrentOwner, DlpackDtype::kU32, 2, false},  // contact_cache_current_owner

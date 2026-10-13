@@ -87,12 +87,12 @@ enum class FieldId : uint16_t {
     UcontactNormal,  // ucontact_normal (per:contact_slot arena:scratch owner:data elem:4)
     UcontactDepth,  // ucontact_depth (per:contact_slot arena:scratch owner:data elem:4)
     RowCount,  // row_count (per:env arena:scratch owner:data)
-    Urows,  // urows (per:row_slot arena:scratch owner:data elem:32)
+    Urows,  // urows (per:row_slot arena:scratch owner:data elem:26)
+    RowContactResponse,  // row_contact_response (per:row_slot arena:scratch owner:data)
     ChainJacobian,  // chain_jacobian (per:row_dof arena:scratch owner:data)
     RowDamping,  // row_damping (per:row_slot arena:scratch owner:data)
     RowCjLink,  // row_cj_link (per:row_slot arena:scratch owner:data)
     RowCjPoint,  // row_cj_point (per:row_slot arena:scratch owner:data)
-    RowCjDir,  // row_cj_dir (per:row_slot arena:scratch owner:data)
     QdotFlat,  // qdot_flat (per:articulation_dof arena:scratch owner:data)
     M,  // m (per:articulation_dof2 arena:scratch owner:data)
     LinkCompositeInertia,  // link_composite_inertia (per:link arena:scratch owner:data)
@@ -130,12 +130,9 @@ enum class FieldId : uint16_t {
     UcontactB,  // ucontact_b (per:contact_slot arena:scratch owner:data elem:4)
     UcontactGen,  // ucontact_gen (per:contact_slot arena:scratch owner:data elem:4)
     Heights,  // heights (per:scalar arena:persistent owner:model count:max_heightfield_cells)
-    UcontactTangent1,  // ucontact_tangent1 (per:contact_slot arena:scratch owner:data elem:4)
-    UcontactTangent2,  // ucontact_tangent2 (per:contact_slot arena:scratch owner:data elem:4)
     ChainJacobianB,  // chain_jacobian_b (per:row_dof arena:scratch owner:data)
     RowCjLinkB,  // row_cj_link_b (per:row_slot arena:scratch owner:data)
     RowCjPointB,  // row_cj_point_b (per:row_slot arena:scratch owner:data)
-    RowCjDirB,  // row_cj_dir_b (per:row_slot arena:scratch owner:data)
     RowPenetration,  // row_penetration (per:row_slot arena:scratch owner:data)
     QdotPseudo,  // qdot_pseudo (per:link arena:scratch owner:data)
     LinkVelocityPseudo,  // link_velocity_pseudo (per:link arena:scratch owner:data)
@@ -180,16 +177,12 @@ enum class FieldId : uint16_t {
     ContactCacheFeature,  // contact_cache_feature (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheLambda,  // contact_cache_lambda (per:contact_slot arena:persistent owner:data elem:12)
     ContactCacheNormal,  // contact_cache_normal (per:contact_slot arena:persistent owner:data elem:4)
-    ContactCacheTangent1,  // contact_cache_tangent1 (per:contact_slot arena:persistent owner:data elem:4)
-    ContactCacheTangent2,  // contact_cache_tangent2 (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheMaterial,  // contact_cache_material (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheAge,  // contact_cache_age (per:contact_slot arena:persistent owner:data elem:4)
     ContactCacheSnapshotPair,  // contact_cache_snapshot_pair (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheSnapshotFeature,  // contact_cache_snapshot_feature (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheSnapshotLambda,  // contact_cache_snapshot_lambda (per:contact_slot arena:scratch owner:data elem:12)
     ContactCacheSnapshotNormal,  // contact_cache_snapshot_normal (per:contact_slot arena:scratch owner:data elem:4)
-    ContactCacheSnapshotTangent1,  // contact_cache_snapshot_tangent1 (per:contact_slot arena:scratch owner:data elem:4)
-    ContactCacheSnapshotTangent2,  // contact_cache_snapshot_tangent2 (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheSnapshotMaterial,  // contact_cache_snapshot_material (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheSnapshotAge,  // contact_cache_snapshot_age (per:contact_slot arena:scratch owner:data elem:4)
     ContactCacheCurrentOwner,  // contact_cache_current_owner (per:contact_slot arena:scratch owner:data elem:4)
@@ -490,11 +483,11 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "ucontact_depth",
     "row_count",
     "urows",
+    "row_contact_response",
     "chain_jacobian",
     "row_damping",
     "row_cj_link",
     "row_cj_point",
-    "row_cj_dir",
     "qdot_flat",
     "m",
     "link_composite_inertia",
@@ -532,12 +525,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "ucontact_b",
     "ucontact_gen",
     "heights",
-    "ucontact_tangent1",
-    "ucontact_tangent2",
     "chain_jacobian_b",
     "row_cj_link_b",
     "row_cj_point_b",
-    "row_cj_dir_b",
     "row_penetration",
     "qdot_pseudo",
     "link_velocity_pseudo",
@@ -582,16 +572,12 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_cache_feature",
     "contact_cache_lambda",
     "contact_cache_normal",
-    "contact_cache_tangent1",
-    "contact_cache_tangent2",
     "contact_cache_material",
     "contact_cache_age",
     "contact_cache_snapshot_pair",
     "contact_cache_snapshot_feature",
     "contact_cache_snapshot_lambda",
     "contact_cache_snapshot_normal",
-    "contact_cache_snapshot_tangent1",
-    "contact_cache_snapshot_tangent2",
     "contact_cache_snapshot_material",
     "contact_cache_snapshot_age",
     "contact_cache_current_owner",

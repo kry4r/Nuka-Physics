@@ -93,14 +93,13 @@ struct NkRow {
     float    upper = 0.0f;
     float    mu = 0.0f;                // first tangent cone coefficient
     float    friction_secondary = 0.0f;
-    math::SymmetricMat3 contact_response{};
     NkRowSide a;
     NkRowSide b;
 };
 
 static_assert(sizeof(NkRowSide) == 8 * sizeof(float),
               "NkRowSide must pack to 8 scalars");
-static_assert(sizeof(NkRow) == 32 * sizeof(float),
-              "urows field elem:32 must match NkRow");
+static_assert(sizeof(NkRow) == 26 * sizeof(float),
+              "urows field elem:26 must match NkRow");
 
 }  // namespace nuka::nk

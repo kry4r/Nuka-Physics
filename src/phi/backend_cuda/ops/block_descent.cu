@@ -2,6 +2,7 @@
 #include <cfloat>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
@@ -187,6 +188,14 @@ uint32_t TileHeadCapacity(const BlockDescentSolveParams& p) {
     return (heads + kTileLanes - 1u) / kTileLanes * kTileLanes;
 }
 
+// Lanes of a tile block: the articulation coordinates rounded up to four, and at least a rigid body's six.
+uint32_t TileWidth(const BlockDescentSolveParams& p) {
+    return std::max(8u, (p.max_dof + 3u) & ~3u);
+}
+
+// Warps the tile kernel keeps resident; each stages one environment at a time in its own slot.
+uint32_t TileWarpSlots(const BlockDescentSolveParams& p);
+
 struct BlockScratch {
     uint32_t* counts;
     uint32_t* offsets;
@@ -329,13 +338,14 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     const uint64_t rows = uint64_t{p.rows_per_env} * p.env_count;
     if (blocks >= uint64_t{std::numeric_limits<int>::max()} ||
         rows >= uint64_t{std::numeric_limits<int>::max()}) return 0u;
-    const auto schedule = nk::MakeBlockRowScheduleLayout(blocks, rows, p.incidence_per_env, p.env_count);
+    // Dense tiles keep their rows per environment, without incidence lists, colors or row caches.
+    const bool tile = DenseTileRoute(p);
+    const auto schedule =
+        nk::MakeBlockRowScheduleLayout(blocks, rows, tile ? 0u : p.incidence_per_env, p.env_count);
     const uint64_t incidence = schedule.incidence_capacity;
     if (incidence >= uint64_t{std::numeric_limits<uint32_t>::max()}) return 0u;
     const uint64_t word_limit = std::numeric_limits<size_t>::max() / sizeof(uint32_t);
     if (incidence > word_limit) return 0u;
-    // Dense tiles keep their rows per environment, without incidence lists, colors or row caches.
-    const bool tile = DenseTileRoute(p);
     const bool incidence_terms = !tile && (p.total_particle_count > 0u || p.total_grid_count > 0u ||
                                            p.total_body_count > 0u || p.articulation_count > 0u);
     if (incidence_terms && incidence > word_limit / kPointJacobianWords) return 0u;
@@ -400,30 +410,34 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.particle_free = reinterpret_cast<Vec3*>(take(3u * p.total_particle_count));
     s.particle_previous = reinterpret_cast<Vec3*>(take(3u * p.total_particle_count));
     s.particle_older = reinterpret_cast<Vec3*>(take(3u * p.total_particle_count));
-    s.acceleration_disabled = take(blocks);
-    s.acceleration_iterations = take(p.env_count);
-    s.acceleration_accepted = take(p.env_count);
-    s.acceleration_ratio = reinterpret_cast<float*>(take(p.env_count));
+    // Tiles factor their blocks in shared memory, without the sweeps' search state or acceleration.
+    const uint64_t sweep_blocks = tile ? 0u : blocks, sweep_envs = tile ? 0u : p.env_count;
+    const uint64_t sweep_dofs = tile ? 0u : dofs, sweep_matrix = tile ? 0u : matrix_words;
+    s.acceleration_disabled = take(sweep_blocks);
+    s.acceleration_iterations = take(sweep_envs);
+    s.acceleration_accepted = take(sweep_envs);
+    s.acceleration_ratio = reinterpret_cast<float*>(take(sweep_envs));
     at = (at + 1u) & ~uint64_t{1u};
-    s.acceleration_merit = reinterpret_cast<double*>(take(4u * p.env_count));
+    s.acceleration_merit = reinterpret_cast<double*>(take(4u * sweep_envs));
     s.articulation_roots = take(dofs);
     s.articulation_dimensions = take(p.articulation_count);
     s.articulation_free = reinterpret_cast<float*>(take(dofs));
-    s.articulation_snapshot = reinterpret_cast<float*>(take(dofs));
-    s.articulation_matrix = reinterpret_cast<float*>(take(matrix_words));
-    s.articulation_force = reinterpret_cast<float*>(take(dofs));
-    s.articulation_direction = reinterpret_cast<float*>(take(dofs));
-    s.articulation_diagonal = reinterpret_cast<float*>(take(dofs));
+    s.articulation_snapshot = reinterpret_cast<float*>(take(sweep_dofs));
+    s.articulation_matrix = reinterpret_cast<float*>(take(sweep_matrix));
+    s.articulation_force = reinterpret_cast<float*>(take(sweep_dofs));
+    s.articulation_direction = reinterpret_cast<float*>(take(sweep_dofs));
+    s.articulation_diagonal = reinterpret_cast<float*>(take(sweep_dofs));
     s.articulation_velocity = reinterpret_cast<float*>(take(dofs));
     const uint64_t rigid_dofs = uint64_t{p.total_body_count} * kRigidBlockDof;
+    const uint64_t sweep_rigid_dofs = tile ? 0u : rigid_dofs;
     s.rigid_dimensions = take(p.total_body_count);
     s.rigid_free = reinterpret_cast<float*>(take(rigid_dofs));
     s.rigid_snapshot = reinterpret_cast<float*>(take(rigid_dofs));
     s.rigid_mass = reinterpret_cast<float*>(take(rigid_dofs * kRigidBlockDof));
-    s.rigid_matrix = reinterpret_cast<float*>(take(rigid_dofs * kRigidBlockDof));
-    s.rigid_force = reinterpret_cast<float*>(take(rigid_dofs));
-    s.rigid_direction = reinterpret_cast<float*>(take(rigid_dofs));
-    s.rigid_diagonal = reinterpret_cast<float*>(take(rigid_dofs));
+    s.rigid_matrix = reinterpret_cast<float*>(take(sweep_rigid_dofs * kRigidBlockDof));
+    s.rigid_force = reinterpret_cast<float*>(take(sweep_rigid_dofs));
+    s.rigid_direction = reinterpret_cast<float*>(take(sweep_rigid_dofs));
+    s.rigid_diagonal = reinterpret_cast<float*>(take(sweep_rigid_dofs));
     s.rigid_velocity = reinterpret_cast<float*>(take(rigid_dofs));
     s.grid_free = reinterpret_cast<Vec3*>(take(3u * uint64_t{p.total_grid_count}));
     s.grid_snapshot = reinterpret_cast<Vec3*>(take(3u * uint64_t{p.total_grid_count}));
@@ -447,7 +461,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     at = (at + 1u) & ~uint64_t{1u};
     s.row_state = reinterpret_cast<AugmentedRowState*>(take(
         tile ? 0u : rows * sizeof(AugmentedRowState) / sizeof(uint32_t)));
-    s.owner_cache_color = take(blocks);
+    s.owner_cache_color = take(sweep_blocks);
     s.row_cache_colors = take(row_color_words);
     s.cache_color_count = tile ? 0u : static_cast<uint32_t>(cache_colors);
     s.cache_counts = take(s.cache_color_count);
@@ -456,14 +470,18 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.color_words = static_cast<uint32_t>(color_words);
     s.point_jacobian = reinterpret_cast<float*>(take(point_jacobian_words));
     at = (at + 1u) & ~uint64_t{1u};
-    s.scalar_response = reinterpret_cast<nk::augmented::ScalarResponse*>(take(
-        rows * sizeof(nk::augmented::ScalarResponse) / sizeof(uint32_t)));
-    // Each head row stages at most one Jacobian row per incidence.
+    // Tiles hold their scalar responses in the head fields; the stored copy serves only the residual measure.
+    s.scalar_response = reinterpret_cast<nk::augmented::ScalarResponse*>(take(!tile || p.measure_contact_residual != 0u
+        ? rows * sizeof(nk::augmented::ScalarResponse) / sizeof(uint32_t) : 0u));
+    // Each head row stages one Jacobian row per incidence, a tile width of block coordinates; only rows
+    // between two moving owners have a second incidence.
     at = (at + kTileLanes - 1u) & ~uint64_t{kTileLanes - 1u};
     s.tile_head_capacity = tile ? TileHeadCapacity(p) : 0u;
-    s.tile_row_capacity = tile ? 2u * p.rows_per_env : 0u;
-    s.tile_fields = reinterpret_cast<float*>(take(uint64_t{p.env_count} * kTileFields * s.tile_head_capacity));
-    s.tile_jacobian = reinterpret_cast<float*>(take(uint64_t{p.env_count} * s.tile_row_capacity * kTileLanes));
+    s.tile_row_capacity = tile ? p.rows_per_env + p.distinct_owner_rows_per_env : 0u;
+    const uint64_t tile_slots = tile ? TileWarpSlots(p) : 0u;
+    if (tile && tile_slots == 0u) return 0u;
+    s.tile_fields = reinterpret_cast<float*>(take(tile_slots * kTileFields * s.tile_head_capacity));
+    s.tile_jacobian = reinterpret_cast<float*>(take(tile_slots * s.tile_row_capacity * TileWidth(p)));
     s.tile_next = take(tile ? 1u : 0u);
     s.tile_order = take(tile ? p.env_count : 0u);
     s.tile_cost = take(tile ? p.env_count : 0u);
@@ -2056,7 +2074,7 @@ __global__ void MeasureRowsKernel(DataView data, BlockDescentSolveParams p, Bloc
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
         const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
         const auto residual = constraint::EvaluateCoulombContactResidual(
-            row.contact_response, velocity, t.dual, row.mu, row.friction_secondary);
+            data.row_contact_response[slot], velocity, t.dual, row.mu, row.friction_secondary);
         const uint32_t env = slot / p.rows_per_env;
         atomicAdd(data.contact_solve_counts + env * constraint::kContactSolveCountSize, 1u);
         if (!residual.valid)
@@ -2077,19 +2095,17 @@ __global__ void MeasureRowsKernel(DataView data, BlockDescentSolveParams p, Bloc
 
 // Terms of each metric's worst row, read back from the slot its packed record names.
 __global__ void MeasureWorstRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     constexpr uint32_t kColumns = constraint::kContactSolveWorstColumns;
     for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
          item < p.env_count * constraint::kContactSolveMetricCount; item += gridDim.x * blockDim.x) {
         const uint64_t packed = data.contact_solve_metrics[item];
         if (packed == 0u) continue;
         const uint32_t slot = ~static_cast<uint32_t>(packed);
-        const NkRow row = rows[slot];
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
         const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
         const auto f = nk::augmented::EvaluateTangent(t.dual, t.penalty, {0.0f, t.residual.y, t.residual.z},
                                                       t.normal_bound, t.mu_first, t.mu_second);
-        const SymmetricMat3& w = row.contact_response;
+        const SymmetricMat3& w = data.row_contact_response[slot];
         const float terms[kColumns] = {t.dual.x, t.dual.y, t.dual.z, velocity.x, velocity.y, velocity.z,
             t.normal_bound, f.impulse.y, f.impulse.z, t.penalty, t.compliance, w.xx, w.yy, w.zz, w.xy, w.xz,
             w.yz, t.mu_first, t.mu_second, __uint_as_float(slot)};
@@ -2304,15 +2320,9 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (p->measure_contact_residual != 0u && !clear(s.active_count, sizeof(uint32_t))) return Status::Failed;
         if (!clear(s.tile_next, sizeof(uint32_t))) return Status::Failed;
         LaunchCuda(OrderTilesKernel, dim3(1u), dim3(kOrderTileThreads), 0u, stream, *p, s);
-        const uint32_t coordinates = std::max(8u, (p->max_dof + 3u) & ~3u);
-        cudaError_t launched = cudaSuccess;
-        if (coordinates == 8u) launched = LaunchDenseTiles<8u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 12u) launched = LaunchDenseTiles<12u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 16u) launched = LaunchDenseTiles<16u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 20u) launched = LaunchDenseTiles<20u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 24u) launched = LaunchDenseTiles<24u>(articulation_state, data, *p, s, stream);
-        else if (coordinates == 28u) launched = LaunchDenseTiles<28u>(articulation_state, data, *p, s, stream);
-        else launched = LaunchDenseTiles<32u>(articulation_state, data, *p, s, stream);
+        const cudaError_t launched = VisitTileWidth(*p, [&](auto width) {
+            return LaunchDenseTiles<decltype(width)::value>(articulation_state, data, *p, s, stream);
+        });
         if (launched != cudaSuccess) return Status::Failed;
         return MeasureSolve(model, data, *p, s, stream);
     }

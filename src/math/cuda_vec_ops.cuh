@@ -160,6 +160,28 @@ __forceinline__ __device__ Vec3 NormalizeOrUp(Vec3 normal) {
     return {0.0f, 0.0f, 1.0f};
 }
 
+// Branch-stable orthonormal friction basis (t1,t2) of a contact normal, rebuilt wherever it is read.
+__forceinline__ __device__ void ContactTangentBasis(Vec3 normal, Vec3* t1, Vec3* t2) {
+    const Vec3 n = NormalizeOrUp(normal);
+    Vec3 reference = {1.0f, 0.0f, 0.0f};
+    if (fabsf(n.x) > 0.9f) {
+        reference = {0.0f, 1.0f, 0.0f};
+    }
+    const float proj = Dot(reference, n);
+    Vec3 tangent_a = {reference.x - proj * n.x,
+                      reference.y - proj * n.y,
+                      reference.z - proj * n.z};
+    const float len_sq = Dot(tangent_a, tangent_a);
+    if (len_sq > 1.0e-12f) {
+        const float scale = rsqrtf(len_sq);
+        tangent_a = {tangent_a.x * scale, tangent_a.y * scale, tangent_a.z * scale};
+    } else {
+        tangent_a = {1.0f, 0.0f, 0.0f};
+    }
+    *t1 = tangent_a;
+    *t2 = Cross(n, tangent_a);
+}
+
 // Family C: rsqrtf(LengthSq)-scale, branch length_sq <= eps, caller fallback.
 //   Used by:  cuda_particle_world.cu NormalizeOr (eps 1e-12, caller fallback)
 // rsqrtf path => distinct from Family A; keep separate.

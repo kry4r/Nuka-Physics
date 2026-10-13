@@ -387,6 +387,7 @@ InterfaceMetrics MeasureInterface(nk::World& world, const std::vector<Vec3>& pos
     const uint64_t count = uint64_t(contacts) * nk::kPairDrivenParticleRowsPerSlot;
     const uint32_t dofs = cap.dofs_per_env;
     const auto rows = DownloadRange<nk::NkRow>(world, nk::FieldId::Urows, base, count);
+    const auto responses = DownloadRange<nuka::math::SymmetricMat3>(world, nk::FieldId::RowContactResponse, base, count);
     const auto impulse = DownloadRange<float>(world, nk::FieldId::Lambda, base, count);
     const auto ja = DownloadRange<float>(world, nk::FieldId::ChainJacobian, base * dofs, count * dofs);
     const auto jb = DownloadRange<float>(world, nk::FieldId::ChainJacobianB, base * dofs, count * dofs);
@@ -422,7 +423,7 @@ InterfaceMetrics MeasureInterface(nk::World& world, const std::vector<Vec3>& pos
     };
     for (uint64_t row = 0u; row < count; row += nk::kPairDrivenParticleRowsPerSlot) {
         const auto& normal = rows[row];
-        const double response = normal.contact_response.xx;
+        const double response = responses[row].xx;
         Require((normal.flags & nk::nk_row_flags::kVelocityOnly) != 0u && response > 0.0,
                 "Invalid grid contact row");
         const double velocity = side_velocity(normal.a, ja, row) + side_velocity(normal.b, jb, row) -
@@ -548,6 +549,8 @@ void Simulate(const Args& args, phi::Device* device, phi::Backend* backend) {
     config.dt = 1.0f / kHz;
     config.substeps = args.substeps;
     config.vel_iters = static_cast<uint16_t>(args.velocity_iterations);
+    // The grid contact readout checks residuals against the measured Coulomb response.
+    config.measure_contact_residual = true;
     nk::World world(std::move(scene_model.cooked.model), 1u, device, backend, config);
     Require(world.Ready(), "World creation: " + world.CreationError());
     Require(world.SetExecutionMode(args.execution) == phi::Status::Ok, "Execution configuration failed");

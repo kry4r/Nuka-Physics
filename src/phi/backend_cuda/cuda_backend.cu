@@ -34,7 +34,6 @@ const char* NkOpName(int op) {
         case NkOp::LbvhQueryPairs: return "LbvhQueryPairs";
         case NkOp::NarrowphasePrimitives: return "NarrowphasePrimitives";
         case NkOp::NarrowphaseSdf: return "NarrowphaseSdf";
-        case NkOp::ContactTangentBasis: return "ContactTangentBasis";
         case NkOp::AssembleRows: return "AssembleRows";
         case NkOp::BlockDescentSolve: return "BlockDescentSolve";
         case NkOp::ParticleAeroDrag: return "ParticleAeroDrag";

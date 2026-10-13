@@ -12,6 +12,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "phi/backend.hpp"   // DataView, BufferType
@@ -34,6 +35,9 @@ public:
     // consumer). No allocation.
     void FillView(phi::DataView* out_view) const;
 
+    // Give `id` a zeroed buffer of its own, replacing its arena segment; FillView then binds it.
+    phi::Status AllocateField(phi::BufferType* bt, FieldId id, uint64_t bytes);
+
     // Zero every data-owned field (Reset baseline; the per-env ResetEnvs op does
     // the selective reset in M3b — M3a's Reset just re-zeros for now).
     phi::Status ZeroAll() { return arena_.ZeroAll(); }
@@ -55,32 +59,39 @@ public:
     bool Restore();
     bool HasSnapshot() const { return !snapshot_persistent_.empty(); }
 
-    void* Ptr(FieldId id) const { return arena_.Ptr(id); }
-    template <class T> T* Ptr(FieldId id) const { return arena_.Ptr<T>(id); }
+    void* Ptr(FieldId id) const;
+    template <class T> T* Ptr(FieldId id) const { return static_cast<T*>(Ptr(id)); }
 
     // Host<->field transfer (init-time seeding / test readback; see Arena).
     bool UploadField(FieldId id, const void* src, uint64_t bytes,
                      uint64_t byte_offset = 0) const {
-        return arena_.UploadField(id, src, bytes, byte_offset);
+        return UploadFieldStatus(id, src, bytes, byte_offset) == phi::Status::Ok;
     }
     bool DownloadField(FieldId id, void* dst, uint64_t bytes,
                        uint64_t byte_offset = 0) const {
-        return arena_.DownloadField(id, dst, bytes, byte_offset);
+        return DownloadFieldStatus(id, dst, bytes, byte_offset) == phi::Status::Ok;
     }
 
     const Arena& GetArena() const { return arena_; }
     phi::Status UploadFieldStatus(FieldId id, const void* src, uint64_t bytes,
-                                   uint64_t byte_offset = 0) const {
-        return arena_.UploadFieldStatus(id, src, bytes, byte_offset);
-    }
+                                   uint64_t byte_offset = 0) const;
     phi::Status DownloadFieldStatus(FieldId id, void* dst, uint64_t bytes,
-                                     uint64_t byte_offset = 0) const {
-        return arena_.DownloadFieldStatus(id, dst, bytes, byte_offset);
-    }
+                                     uint64_t byte_offset = 0) const;
     const std::vector<Arena::Segment>& Segments() const { return arena_.Segments(); }
 
 private:
+    struct BufferRelease {
+        void operator()(phi::Buffer* buffer) const { phi::BufferFree(buffer); }
+    };
+    struct FieldBuffer {
+        FieldId field;
+        uint64_t bytes;
+        std::unique_ptr<phi::Buffer, BufferRelease> buffer;
+    };
+    const FieldBuffer* OwnBuffer(FieldId id) const;
+
     Arena arena_;
+    std::vector<FieldBuffer> own_;
     std::vector<uint8_t> snapshot_persistent_;  // host mirror of the Persistent buffer.
 };
 

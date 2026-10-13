@@ -1393,14 +1393,11 @@ CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
     cap.mesh_vertex_source_count = static_cast<uint32_t>(model.mesh_vertex_sources.size());
     cap.mesh_edge_source_count = static_cast<uint32_t>(model.mesh_edge_sources.size());
 
-    if (enable_contacts && (cap.mesh_vertex_source_count > 0u ||
-                            cap.mesh_edge_source_count > 0u)) {
-        const uint64_t features = uint64_t{cap.mesh_vertex_source_count} +
-                                  cap.mesh_edge_source_count;
-        const uint64_t reserve = features;
-        if (reserve > std::numeric_limits<uint32_t>::max())
+    const uint64_t paired_features = enable_contacts ? nk::PairedMeshFeatureCount(model) : 0u;
+    if (paired_features > 0u) {
+        if (paired_features > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("mesh contact capacity exceeds device indexing");
-        SetOgcContactCapacity(model, static_cast<uint32_t>(reserve));
+        SetOgcContactCapacity(model, static_cast<uint32_t>(paired_features));
     }
 
     for (const auto& sensor : scene.Sensors()) {

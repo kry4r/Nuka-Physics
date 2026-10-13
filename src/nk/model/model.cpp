@@ -121,6 +121,19 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         (id == FieldId::ControlMass || id == FieldId::ControlFactor ||
          id == FieldId::ControlJacobian || id == FieldId::ControlResponse ||
          id == FieldId::ControlTaskMap || id == FieldId::ControlScratch)) return 0u;
+    if (!articulated_contact_pairs &&
+        (id == FieldId::ChainJacobianB || id == FieldId::RowCjPointB)) return 0u;
+    // Discrete truncation state and OGC witnesses exist only with OGC slots; the per-env counters stay readable.
+    if (ogc_contacts_per_env == 0u &&
+        (id == FieldId::UcontactWitnessA || id == FieldId::UcontactWitnessB ||
+         id == FieldId::DatParticleBeta || id == FieldId::DatBodyBeta || id == FieldId::DatArticBeta ||
+         id == FieldId::DatArticWitness || id == FieldId::DatPrevQ || id == FieldId::DatPrevBasePose ||
+         id == FieldId::DatPrevBodyPose || id == FieldId::DatBodySpeed || id == FieldId::DatBodyQueryRadius ||
+         id == FieldId::DatBodyMotion || id == FieldId::DatJointMotion || id == FieldId::DatJointRate ||
+         id == FieldId::DatPairKind || id == FieldId::DatPairOwnerA || id == FieldId::DatPairOwnerB ||
+         id == FieldId::DatPairFeatureA || id == FieldId::DatPairFeatureB || id == FieldId::DatFailureWitness))
+        return 0u;
+    if (mimic_couplings_per_env == 0u && id == FieldId::MReduced) return 0u;
     if (mpm_grid_nodes_per_env == 0u &&
         (id == FieldId::GridContactAttempted || id == FieldId::GridContactRetained ||
          id == FieldId::GridContactPeak || id == FieldId::GridContactOverflow)) return 0u;
@@ -134,10 +147,12 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
     if (!mpm_reaction &&
         (id == FieldId::StepMpmBodyImpulse || id == FieldId::StepMpmBodyMoment)) return 0u;
     if (joint_limit_rows_per_env == 0u && id == FieldId::StepJointLimitImpulse) return 0u;
-    if (contact_index_scratch_bytes == 0u &&
+    if ((contact_index_scratch_bytes == 0u || !contact_readout) &&
         (id == FieldId::ActiveRowIds || id == FieldId::ActiveRowCount ||
          id == FieldId::ContactEndpointKeys || id == FieldId::ContactEndpointCount ||
-         id == FieldId::LinkContactBegin || id == FieldId::LinkContactEnd)) return 0u;
+         id == FieldId::LinkContactBegin || id == FieldId::LinkContactEnd ||
+         id == FieldId::ContactIndexScratch)) return 0u;
+    if (!contact_response && id == FieldId::RowContactResponse) return 0u;
     if (aero_tris_per_env == 0u &&
         (id == FieldId::AeroParticleOffset || id == FieldId::AeroParticleCount))
         return 0u;

@@ -120,7 +120,6 @@ private:
     phi::NarrowphaseHeightfieldParams p_np_hf_{};    // general contact H3 heightfield
     phi::NarrowphaseBodyParticleParams p_np_body_particle_{};  // body<->particle
     phi::NarrowphaseSdfParams         p_np_sdf_{};
-    phi::ContactTangentBasisParams    p_tangent_{};
     phi::AssembleRowsParams           p_assemble_{};
     phi::ContactWarmStartParams       p_warm_start_prepare_{};
     phi::ContactWarmStartParams       p_warm_start_commit_{};

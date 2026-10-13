@@ -126,12 +126,12 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_normal
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_depth
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // row_count
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 32, 1, 128, 0},  // urows
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 26, 1, 104, 0},  // urows
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 6, 24, 0},  // row_contact_response
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // chain_jacobian
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_damping
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // qdot_flat
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 36, 144, 0},  // link_composite_inertia
@@ -169,12 +169,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // ucontact_gen
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // heights
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_tangent1
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_tangent2
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // chain_jacobian_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point_b
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_penetration
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // qdot_pseudo
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_velocity_pseudo
@@ -219,16 +216,12 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_feature
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 12, 1, 48, 0},  // contact_cache_lambda
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_normal
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_tangent1
-    {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_tangent2
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_material
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // contact_cache_age
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_snapshot_pair
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_snapshot_feature
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 12, 1, 48, 0},  // contact_cache_snapshot_lambda
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_snapshot_normal
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_snapshot_tangent1
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // contact_cache_snapshot_tangent2
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 32, 0},  // contact_cache_snapshot_material
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // contact_cache_snapshot_age
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 1, 16, 0},  // contact_cache_current_owner

@@ -51,6 +51,7 @@ struct ModelCapacities {
     uint32_t bodies_per_env  = 0;   // movable rigid body count / env.
     uint32_t max_contacts_per_env = 0;  // contact-slot capacity / env.
     uint32_t rigid_contact_rows_per_env = 0u;
+    uint32_t distinct_owner_rows_per_env = 0u;  // rows whose sides can be two moving owners
     uint32_t max_rows_per_env     = 0;  // row-slot capacity / env.
     uint32_t foot_shape_count = 0u;
     uint32_t joint_limit_rows_per_env = 0; // stable lower/upper slots when any bound exists
@@ -58,6 +59,9 @@ struct ModelCapacities {
     uint32_t joint_drive_rows_per_env = 0;
     uint32_t mimic_couplings_per_env = 0;  // links whose joint follows another; they take no rows
     bool inverse_dynamics_controls = false;
+    // A row joins two articulated owners only when some filtered shape pair does;
+    // otherwise both row sides share one Jacobian.
+    bool articulated_contact_pairs = true;
     uint32_t max_hull_verts       = 0;  // convex-hull vertex pool capacity (global).
     uint32_t max_mesh_triangles   = 0;
     uint32_t max_mesh_bvh_nodes   = 0;
@@ -111,6 +115,10 @@ struct ModelCapacities {
     uint64_t lbvh_sort_scratch_bytes = 0;
     uint64_t contact_cache_scratch_bytes = 0;
     uint64_t contact_index_scratch_bytes = 0;
+    // The contact index exists once a contact readout is demanded, in buffers of its own.
+    bool contact_readout = false;
+    // Coulomb block responses exist only while a solve measures contact residuals.
+    bool contact_response = false;
     uint64_t pair_sample_chunk_words = 0;
     uint64_t block_descent_scratch_words = 0;
 

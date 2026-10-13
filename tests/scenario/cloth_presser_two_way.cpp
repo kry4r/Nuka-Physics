@@ -210,17 +210,17 @@ nk::Model BuildScene(const Vec3& presser_pos, float presser_inv_mass,
     return m;
 }
 
-// NkRow packs to 32 f32: [0]=flags [7]=upper, a.kind [16] a.index [17],
-// b.kind [24] b.index [25].
+// NkRow packs to 26 f32: [0]=flags [7]=upper, a.kind [10] a.index [11],
+// b.kind [18] b.index [19].
 struct RowSides { uint32_t a_kind, b_kind; bool active; float upper; uint32_t flags; };
 RowSides DecodeRow(const std::vector<float>& urows, uint32_t row) {
-    const float* r = urows.data() + static_cast<size_t>(row) * 32u;
+    const float* r = urows.data() + static_cast<size_t>(row) * 26u;
     auto u = [&](int i) { uint32_t v; std::memcpy(&v, &r[i], 4); return v; };
     RowSides s;
     s.active = (u(0) & 1u) != 0u;
     s.flags = u(0);
     s.upper = r[7];
-    s.a_kind = u(16); s.b_kind = u(24);
+    s.a_kind = u(10); s.b_kind = u(18);
     return s;
 }
 
@@ -370,7 +370,7 @@ TEST(ClothPresserTwoWay, DynamicPresserIsResistedByCloth) {
         d.UploadField(nk::FieldId::BodyLinearVelocity, &zero, sizeof(Vec3), kVec3Off);
         d.UploadField(nk::FieldId::BodyAngularVelocity, &zero, sizeof(Vec3), kVec3Off);
 
-        std::vector<float> urows(static_cast<size_t>(rows) * 32u, 0.0f);
+        std::vector<float> urows(static_cast<size_t>(rows) * 26u, 0.0f);
         std::vector<float> lambda(rows, 0.0f);
         float max_lambda = 0.0f;
         uint32_t particle_rows = 0u;

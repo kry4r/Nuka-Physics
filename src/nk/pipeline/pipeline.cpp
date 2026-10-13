@@ -14,6 +14,7 @@
 
 #include "collision/shape_kind.hpp"
 #include "constraint/contact_manifold.hpp"  // ContactManifold::kMaxPoints
+#include "nk/model/contact_capacity.hpp"
 #include "nk/model/model.hpp"
 #include "nk/solve/nk_row.hpp"
 #include "nk/solve/point_endpoint.hpp"
@@ -407,6 +408,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     std::copy(mp.mpm_grid_dims, mp.mpm_grid_dims + 3u, p_block_descent_.grid_dims);
     p_block_descent_.base_link_count = base_link_count;
     p_block_descent_.contact_rows_per_env = contact_rows_per_env;
+    p_block_descent_.distinct_owner_rows_per_env = cap.distinct_owner_rows_per_env;
     p_block_descent_.joint_limit_rows_per_env = cap.joint_limit_rows_per_env;
     p_block_descent_.workspace_words = cap.block_descent_scratch_words;
     p_block_descent_.vertex_blocks = vertex_blocks;
@@ -598,6 +600,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_np_prim_.max_body_samples = 0u;
         for (size_t i = 1u; i < model.samp_ranges.size(); i += 2u)
             p_np_prim_.max_body_samples = std::max(p_np_prim_.max_body_samples, model.samp_ranges[i]);
+        p_np_prim_.convex_pairs = ConvexContactPairs(model) ? 1u : 0u;
         add(phi::NkOp::NarrowphasePrimitives, &p_np_prim_);
 
         // (Multi-body collision — including artic-link<->artic-link and
@@ -716,12 +719,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_ogc_detect_.workspace_bytes = cap.contact_cache_scratch_bytes;
         add(phi::NkOp::OgcDetect, &p_ogc_detect_);
     }
-    if (cap.max_contacts_per_env > 0u) {
-        // All contact providers finish before tangent construction and row assembly.
-        p_tangent_.slot_count = slot_count;
-        p_tangent_.family = family;
-        add(phi::NkOp::ContactTangentBasis, &p_tangent_);
-    }
 
     // Coupled coordinates use the same mass factor and unconstrained step velocity.
     if (mimic_couplings > 0u) {
@@ -738,6 +735,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.dt = cfg.dt;
         p_assemble_.slot_count = slot_count;
         p_assemble_.max_dof = max_dof;
+        p_assemble_.measure_contact_response = p_block_descent_.measure_contact_residual;
         p_assemble_.env_count = env_count;
         p_assemble_.articulation_count = articulation_cnt;
         p_assemble_.total_link_count = total_link_count;
