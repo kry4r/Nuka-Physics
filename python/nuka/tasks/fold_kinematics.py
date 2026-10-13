@@ -352,8 +352,8 @@ class PinchRetarget:
         closed = {**opened, **dict(zip(self.fingers, (hand["thumb_rotation"], hand["thumb_bend"],
                                                       hand["index_bend"])))}
         frames = kin.frames(self.wrist, closed)
-        side_links = (kin.subtree(f"{side}_thumb_3"), kin.subtree(f"{side}_index_2"))
-        (first, owner), (second, other) = (kin.triangles(frames, links) for links in side_links)
+        self.distal = (kin.subtree(f"{side}_thumb_3"), kin.subtree(f"{side}_index_2"))
+        (first, owner), (second, other) = (kin.triangles(frames, links) for links in self.distal)
         p, i, q, j = closest_pair(first, second)
         self.pads = [(str(link), frames[str(link)][0].T @ (point - frames[str(link)][1]))
                      for link, point in ((owner[i], p), (other[j], q))]
@@ -615,12 +615,14 @@ def closest_pair(first, second, iterations=20):
     return p, i, q, j
 
 
-def inspire_pinch(kin, side, thickness, kp, pinch_force, thumb_rotation, thumb_bend, squeeze=5.0):
+def inspire_pinch(kin, side, thickness, kp, pinch_force, thumb_rotation, thumb_bend, squeeze=5.0, *, tip_forces):
     """Thumb-index pinch of one Inspire hand in its wrist yaw frame. The thumb holds ``thumb_rotation`` and bends
     to ``thumb_bend``; the index bends until the pads are one cloth thickness apart; the middle, ring and little
     fingers stay half closed. The pinch frame has x from the hand base towards the pad midpoint and y from the
-    thumb pad to the index pad. The closed thumb target passes contact by ``squeeze`` times its torque limit over
-    kp, so the drive saturates and the pads press with ``pinch_force``."""
+    thumb pad to the index pad. The closed thumb target passes contact by ``squeeze`` times the torque pressing
+    the thumb pad with ``pinch_force``, over kp. Each active hand drive is limited to the torque that gives its
+    finger's rated fingertip force (``tip_forces`` "thumb" or "finger") at that finger's tip, the hull point
+    farthest from the finger root, in the pinch posture."""
     wrist = f"{side}_wrist_yaw_link"
     joints = {name: kin.joint(f"{side}_{name}_joint") for name in HAND}
     upper = {name: joint["upper"] for name, joint in joints.items()}
@@ -669,6 +671,29 @@ def inspire_pinch(kin, side, thickness, kp, pinch_force, thumb_rotation, thumb_b
     if not lever > 0.0:
         raise ValueError("closing the thumb must move its pad towards the index")
     torque = pinch_force * lever
+    posture = pose(thumb_bend, index_bend)
+    posed = kin.frames(wrist, posture)
+
+    def tip_lever(name):
+        """Fingertip travel per radian of hand joint ``name`` in the pinch posture, mimic joints following."""
+        joint, finger = f"{side}_{name}_joint", f"{side}_{name.split('_')[0]}_1"
+        root = posed[finger][1]
+        tips = []
+        for link in kin.subtree(finger):
+            if len(kin.mesh(link)):
+                points = np.unique(kin.mesh(link).reshape(-1, 3), axis=0)
+                reach = np.linalg.norm(points @ posed[link][0].T + posed[link][1] - root, axis=1)
+                tips.append((float(reach.max()), link, points[np.argmax(reach)]))
+        _, link, point = max(tips, key=lambda tip: tip[0])
+
+        def tip(value):
+            moved = kin.frames(wrist, {**posture, joint: value})
+            return moved[link][0] @ point + moved[link][1]
+
+        return float(np.linalg.norm(tip(posture[joint] + 1e-6) - tip(posture[joint] - 1e-6)) / 2e-6)
+
+    levers = {f"{side}_{name}_joint": tip_lever(name) for name in HAND}
+    limits = {joint: tip_forces["thumb" if "_thumb_" in joint else "finger"] * value for joint, value in levers.items()}
     thumb_closed = thumb_bend + squeeze * torque / kp
     if thumb_closed > upper["thumb_2"]:
         raise ValueError("the closed thumb target exceeds its joint limit")
@@ -679,7 +704,7 @@ def inspire_pinch(kin, side, thickness, kp, pinch_force, thumb_rotation, thumb_b
             "index_bend": float(index_bend), "pad_gap_m": gap, "open_pad_gap_m": closing[0],
             "thumb_pad_link": thumb_link, "pad_links": thumb_links + index_links,
             "pinch_rotation": rotation.tolist(), "pinch_position_m": centre.tolist(), "thumb_lever_m": lever,
-            "thumb_torque_limit_nm": float(torque),
+            "pinch_torque_nm": float(torque), "tip_levers_m": levers, "torque_limits_nm": limits,
             "targets_open_closed": {f"{side}_{name}_joint": list(value) for name, value in targets.items()}}
 
 

@@ -30,25 +30,30 @@ def build_scene(device, description, *, dt=1.0 / 600.0, sweeps=512, contact_capa
                          materials.Rigid(static=True, friction=table["friction"]))
     world = scene.build(device)
     try:
-        names = world.dof_names()
-        indices = {name: names.index(name) for name in config["active"]}
-        stiffness = np.asarray(world.download_field(nuka.Field.DRIVE_STIFFNESS)).copy()
-        damping = np.asarray(world.download_field(nuka.Field.DRIVE_DAMPING)).copy()
-        limits = np.asarray(world.download_field(nuka.Field.DRIVE_FORCE_LIMIT)).copy()
-        for name, values in config["active"].items():
-            index = indices[name]
-            stiffness.reshape(-1)[index] = values["kp"]
-            damping.reshape(-1)[index] = values["kd"]
-            limits.reshape(-1)[index] = values["force_limit"]
-        world.upload_field(nuka.Field.DRIVE_STIFFNESS, np.ascontiguousarray(stiffness))
-        world.upload_field(nuka.Field.DRIVE_DAMPING, np.ascontiguousarray(damping))
-        world.upload_field(nuka.Field.DRIVE_FORCE_LIMIT, np.ascontiguousarray(limits))
-        config["active_indices"] = indices
-        config["dof_names"] = names
+        apply_drives(world, config)
         return world, config
     except BaseException:
         world.destroy()
         raise
+
+
+def apply_drives(world, config):
+    """Uploads the authored gains and force limits of the active joints; a restored checkpoint carries its own."""
+    names = world.dof_names()
+    indices = {name: names.index(name) for name in config["active"]}
+    stiffness = np.asarray(world.download_field(nuka.Field.DRIVE_STIFFNESS)).copy()
+    damping = np.asarray(world.download_field(nuka.Field.DRIVE_DAMPING)).copy()
+    limits = np.asarray(world.download_field(nuka.Field.DRIVE_FORCE_LIMIT)).copy()
+    for name, values in config["active"].items():
+        index = indices[name]
+        stiffness.reshape(-1)[index] = values["kp"]
+        damping.reshape(-1)[index] = values["kd"]
+        limits.reshape(-1)[index] = values["force_limit"]
+    world.upload_field(nuka.Field.DRIVE_STIFFNESS, np.ascontiguousarray(stiffness))
+    world.upload_field(nuka.Field.DRIVE_DAMPING, np.ascontiguousarray(damping))
+    world.upload_field(nuka.Field.DRIVE_FORCE_LIMIT, np.ascontiguousarray(limits))
+    config["active_indices"] = indices
+    config["dof_names"] = names
 
 
 def folded_cloth(config):

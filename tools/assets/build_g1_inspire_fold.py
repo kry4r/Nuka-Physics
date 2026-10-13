@@ -96,7 +96,8 @@ def build(args):
     hands = {}
     for side in fk.SIDES:
         pinch = fk.inspire_pinch(inspire, side, args.thickness, args.hand_kp, args.pinch_force,
-                                 args.thumb_rotation, args.thumb_bend)
+                                 args.thumb_rotation, args.thumb_bend,
+                                 tip_forces={"thumb": args.thumb_tip_force, "finger": args.finger_tip_force})
         dex1_R, dex1_p = fk.dex1_pinch_in_wrist(dex1, side)
         rotation = fk.match_closing_sign(dex1_R, np.array(pinch["pinch_rotation"]))
         pinch["pinch_rotation"] = rotation.tolist()
@@ -170,8 +171,7 @@ def build(args):
         node["joint"]["initial_position"] = config["initial_position"]
         effort = float(source_joint.find("limit").get("effort"))
         side = name.split("_")[0]
-        config["force_limit"] = (hands[side]["thumb_torque_limit_nm"] if name.endswith("thumb_2_joint")
-                                 else effort)
+        config["force_limit"] = hands[side]["torque_limits_nm"][name] if config["kind"] == "hand" else effort
         node["actuator"] = {"name": name + "_drive", "type": "position",
                             "joint_id": node["actuator"]["joint_id"],
                             "gain": config["kp"], "force_limit": config["force_limit"]}
@@ -207,6 +207,8 @@ def build(args):
                   "feedforward": "gravity holding torques on the waist and arm joints, as the source controller "
                                  "sends its inverse-dynamics gravity term with each arm command"},
         "hand": {"kp": args.hand_kp, "kd": args.hand_kd, "pinch_force_n": args.pinch_force,
+                 "tip_forces_n": {"thumb": args.thumb_tip_force, "finger": args.finger_tip_force,
+                                  "source": "Inspire RH56DFX rated fingertip forces"},
                  "thickness_m": args.thickness,
                  "posture": {"thumb_rotation": args.thumb_rotation, "thumb_bend": args.thumb_bend,
                              "selection": [{"path": str(path), "sha256": sha256(path)}
@@ -264,6 +266,8 @@ def main():
     parser.add_argument("--hand-kp", type=float, default=20.0)
     parser.add_argument("--hand-kd", type=float, default=0.2)
     parser.add_argument("--pinch-force", type=float, default=2.0)
+    parser.add_argument("--thumb-tip-force", type=float, default=15.0, help="rated thumb fingertip force (N)")
+    parser.add_argument("--finger-tip-force", type=float, default=10.0, help="rated fingertip force of the others (N)")
     parser.add_argument("--thumb-rotation", type=float, required=True, help="thumb_1 of the pinch posture, rad")
     parser.add_argument("--thumb-bend", type=float, required=True, help="thumb_2 of the pinch posture, rad")
     parser.add_argument("--posture-evidence", type=Path, nargs="+", required=True,
@@ -274,7 +278,8 @@ def main():
                         help="largest collision surface deviation on the other links, m")
     args = parser.parse_args()
     if not all(np.isfinite(value) and value > 0 for value in (
-            args.hand_kp, args.hand_kd, args.pinch_force, args.spacing, args.thickness, args.clearance,
+            args.hand_kp, args.hand_kd, args.pinch_force, args.thumb_tip_force, args.finger_tip_force,
+            args.spacing, args.thickness, args.clearance,
             args.hinge_radius, args.ramp_length, args.layer_gap, *args.towel_size, *args.table_size)):
         raise ValueError("Scene and control parameters must be finite and positive")
     if not all(0.0 < limit <= 1e-3 for limit in (args.hand_error_limit, args.body_error_limit)):
@@ -284,7 +289,7 @@ def main():
                       "mimic": len(result["mimic"]), "output": str(args.out), "status": result["status"],
                       "pinch": {side: {key: result["hand"][side][key] for key in
                                        ("index_bend", "pad_gap_m", "open_pad_gap_m", "thumb_lever_m",
-                                        "thumb_torque_limit_nm")}
+                                        "torque_limits_nm")}
                                 for side in fk.SIDES}}))
 
 
