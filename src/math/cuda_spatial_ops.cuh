@@ -2,24 +2,14 @@
 // ---------------------------------------------------------------------------
 // nuka::math::gpu - shared __device__ spatial (6-vector / 6x6) algebra
 //
-// Consolidates the Featherstone spatial-algebra helpers that are currently
-// duplicated between:
-//   src/runtime/articulation/featherstone_aba.cu        (Zero6, Zero36, Dot6,
-//       Add6InPlace, Mat66MulVec6, Copy36, TransformMotion, TransformForceTranspose,
-//       TransformInertiaToParent, MotionCross, ForceCross, SubtractOuterProduct36)
-//   src/runtime/articulation/articulation_contacts.cu   (Dot6Local, Copy36Local,
-//       Mat66MulVec6Local, TransformInertiaToParentLocal, TransformForceTransposeLocal)
+// Featherstone spatial-algebra helpers shared by the articulation device ops.
 //
 // All operands are flat float arrays in row-major order:
 //   * spatial 6-vector  : float[6]  (angular[0..2], linear[3..5])
 //   * spatial 6x6 matrix: float[36] (row-major, index = row*6 + col)
 //
-// DESIGN NOTE (T8b isolation): featherstone_aba.cu passes these the Plücker
-// matrix via `const LinkSpatialTransform&` and reads only `transform.X`
-// (a float[36]). To avoid any dependency on articulation_state.hpp (owned and
-// being edited by T8b), the transform-style functions here take the raw
-// `const float* X` directly. The Phase-2 migration at the call site is the
-// mechanical substitution `f(transform.X, ...)`; the body is byte-identical.
+// Transform-style functions take the raw row-major Plücker matrix `const float* X`
+// so this header stays independent of the articulation state types.
 //
 // DETERMINISM CONTRACT: float op order is reproduced exactly (left-to-right
 // accumulation in the `value +=` loops). Do not reassociate, do not insert FMA
@@ -97,8 +87,7 @@ __forceinline__ __device__ void Mat66MulVec6(const float* matrix,
 }
 
 // matrix -= (u u^T) / max(diagonal, min_diagonal). Featherstone rank-1 downdate.
-// featherstone_aba.cu uses kMinDiagonal = 1.0e-6f; parameterized here so the
-// constant stays a literal at the call site (bit-identical fmaxf path).
+// The pivot floor is a parameter so each call site keeps its literal constant.
 __forceinline__ __device__ void SubtractOuterProduct36(float* matrix,
                                                        const float* u,
                                                        float diagonal,
@@ -112,11 +101,10 @@ __forceinline__ __device__ void SubtractOuterProduct36(float* matrix,
 }
 
 // ---------------------------------------------------------------------------
-// Plücker transform applications (take the raw float[36] X matrix; see header
-// note on T8b isolation).
+// Plücker transform applications (take the raw float[36] X matrix).
 // ---------------------------------------------------------------------------
 
-// out = X * in   (TransformMotion in featherstone_aba.cu).
+// out = X * in.
 __forceinline__ __device__ void TransformMotion(const float* X,
                                                 const float* in,
                                                 float* out) {
@@ -171,8 +159,7 @@ __forceinline__ __device__ void TransformInertiaToParent(const float* X,
 
 // ---------------------------------------------------------------------------
 // Spatial cross products (Featherstone motion/force cross), float[6] in/out.
-// MotionCross / ForceCross in featherstone_aba.cu. Build through Vec3 Cross/Add
-// to keep the exact same float op order as the originals.
+// Built through Vec3 Cross/Add so the float op order is fixed.
 // ---------------------------------------------------------------------------
 
 // out = lhs (motion) x* rhs (motion).
@@ -193,19 +180,6 @@ __forceinline__ __device__ void MotionCross(const float* lhs,
     out[5] = linear.z;
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic fixed-pivot (unpivoted) 6x6 LDL^T solve of A x = b, A SPD.
-// Identical body in:
-//   featherstone_aba.cu     Solve6x6Ldlt
-//   src/diffsim/step_backward.cu  Solve6x6LdltRev
-// (the two differed only in brace style; bodies are arithmetically identical --
-// same kMinDiagonal floor, same fixed loop order -> D1-safe). The `min_diagonal`
-// floor is a parameter so the constant stays a literal at each call site (the
-// callers both pass kMinDiagonal = 1.0e-6f), bit-identical to the inlined form.
-// A is copied into local scratch and factored there; the caller's `matrix`
-// buffer is untouched. NOTE the triple/double products (a*a*d, a*y, a*out) are
-// single inline expressions here exactly as in the originals -- no stored,
-// multiply-used product is introduced, so FMA contraction is preserved.
 __forceinline__ __device__ void Solve6x6Ldlt(const float* __restrict__ matrix,
                                              const float* __restrict__ rhs,
                                              float* __restrict__ out,

@@ -74,20 +74,6 @@ scope_definitions:
       # under the guard (the by-design hole the lint scope must not reopen).
       - "src/runtime/**/*.cuh"
       - "src/math/**/*.cuh"
-      # v0.5 p03: the diff-sim backward / sparse-solver path is D1-critical (its
-      # grad/solve outputs must be two-run byte-exact), so the no-float-atomic ban
-      # now covers it too. NOTE: src/diffsim is added to physics_path ONLY (the
-      # float_atomic_add rule). It is deliberately NOT in hot_path: the IFT
-      # Delassus builder keeps a size-guarded lazy cudaMalloc (allocate-once, reuse
-      # across Run calls) which is not a per-step hot-path alloc and must not trip
-      # hot_path_cuda_malloc.
-      - "src/diffsim/**/*.cu"
-      - "src/diffsim/**/*.cuh"
-      # v0.5 p04 N1: the sensor-noise kernels are D1-critical (their noise must
-      # be two-run byte-exact via the counter-based Philox RNG -- no thread-order
-      # dependence, NO float atomicAdd). Same rationale as src/diffsim above; the
-      # noise path is NOT in hot_path (it is applied to a sensor buffer once, not
-      # inside a per-step physics kernel).
       - "src/sensor/noise/**/*.cu"
       - "src/sensor/noise/**/*.cuh"
       # p14a (v0.7): the contact-force readout kernel (sensor/contact_wrench.cu) is

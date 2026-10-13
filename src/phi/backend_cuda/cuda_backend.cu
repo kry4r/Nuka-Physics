@@ -24,14 +24,11 @@ const char* NkOpName(int op) {
         case NkOp::ApplyDynamicsDrives: return "ApplyDynamicsDrives";
         case NkOp::ReadoutDrives: return "ReadoutDrives";
         case NkOp::RefitParticleSurfaces: return "RefitParticleSurfaces";
-        case NkOp::AbaForward: return "AbaForward";
+        case NkOp::ArticulationDynamics: return "ArticulationDynamics";
         case NkOp::IntegrateVelocity: return "IntegrateVelocity";
         case NkOp::FkWorldPoses: return "FkWorldPoses";
         case NkOp::IntegratePosition: return "IntegratePosition";
         case NkOp::DatSnapshot: return "DatSnapshot";
-        case NkOp::CrbaComputeM: return "CrbaComputeM";
-        case NkOp::CrbaFactorM: return "CrbaFactorM";
-        case NkOp::ApplyImplicitDamping: return "ApplyImplicitDamping";
         case NkOp::BuildAabbs: return "BuildAabbs";
         case NkOp::LbvhBuild: return "LbvhBuild";
         case NkOp::LbvhQueryPairs: return "LbvhQueryPairs";
@@ -60,7 +57,6 @@ const char* NkOpName(int op) {
         case NkOp::RestoreState: return "RestoreState";
         case NkOp::RandomizeMaterialBuckets: return "RandomizeMaterialBuckets";
         case NkOp::RandomizeBodyParams: return "RandomizeBodyParams";
-        case NkOp::StepBackward: return "StepBackward";
         case NkOp::SyncLinkBodyPose: return "SyncLinkBodyPose";
         case NkOp::NarrowphaseBodyParticle: return "NarrowphaseBodyParticle";
         case NkOp::NarrowphaseHeightfield: return "NarrowphaseHeightfield";
@@ -649,9 +645,6 @@ void RegisterCudaBackendEntry() {
     }
     g_cuda_registered = true;
     RegisterBackend(reinterpret_cast<RegistryEntry*>(&g_cuda_registry_entry));
-    // M3b: explicitly register the articulation pipeline op implementations
-    // (the same static-lib linker de-risk as this entry itself — explicit
-    // calls, never static initializers).
     RegisterNkArticulationPipelineOps();
 }
 

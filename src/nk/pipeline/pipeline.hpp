@@ -47,8 +47,6 @@ public:
         float    pos_slop = 0.001f;    // allowed residual penetration (m).
         float    contact_margin = 0.0f;
         uint32_t max_pairs = 0;
-        // M3b articulation-pipeline knobs (both production paths use 1/1; the
-        // friction/baumgarte values default from the Model, see Build()).
         uint32_t defer_velocity_damping = 1;  // solve affine velocity feedback implicitly
         uint32_t fold_drive_damping = 1;      // enable implicit feedback in the shared rows
         uint32_t substeps = 1u;
@@ -107,15 +105,12 @@ private:
     phi::ParticleSurfacesParams       p_dat_refit_{};
     phi::OgcDetectParams              p_ogc_detect_{};
     phi::DatTruncateParams             p_dat_truncate_{};
-    phi::AbaForwardParams             p_aba_{};
-    phi::AbaForwardParams             p_aba_force_free_{};
+    phi::ArticulationDynamicsParams             p_dynamics_{};
+    phi::ArticulationDynamicsParams             p_dynamics_prepare_{};
     phi::IntegrateVelocityParams      p_int_vel_{};
     phi::SnapshotStepVelocityParams   p_step_velocity_{};
     phi::FkWorldPosesParams           p_fk_{};
     phi::IntegratePositionParams      p_int_pos_{};
-    phi::CrbaComputeMParams           p_crba_m_{};
-    phi::CrbaFactorMParams            p_crba_factor_{};
-    phi::ApplyImplicitDampingParams   p_apply_damping_{};  // L1-b standalone damping
     phi::MimicReduceParams            p_mimic_reduce_{};
     phi::SyncLinkBodyPoseParams       p_sync_body_pose_{};  // general contact B2
     phi::BuildAabbsParams             p_aabbs_{};

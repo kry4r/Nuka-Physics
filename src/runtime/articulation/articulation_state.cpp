@@ -179,10 +179,7 @@ ArticulationDeviceState ArticulationDeviceBuffers::View() {
     state.link_acceleration = static_cast<LinkSpatialAccel*>(BaseOrNull(link_acceleration));
     state.link_xup = static_cast<LinkSpatialTransform*>(BaseOrNull(link_xup));
     state.link_velocity_bias = static_cast<LinkSpatialVel*>(BaseOrNull(link_velocity_bias));
-    state.link_articulated_I =
-        static_cast<LinkArticulatedInertia*>(BaseOrNull(link_articulated_inertia));
     state.link_bias_force = static_cast<LinkBiasForce*>(BaseOrNull(link_bias_force));
-    state.link_u_spatial = static_cast<LinkBiasForce*>(BaseOrNull(link_u_spatial));
     state.joint_motion_subspace =
         static_cast<LinkMotionSubspace*>(BaseOrNull(joint_motion_subspace));
     state.link_pose = static_cast<math::Transform*>(BaseOrNull(link_pose));
@@ -196,8 +193,6 @@ ArticulationDeviceState ArticulationDeviceBuffers::View() {
     state.tau = static_cast<float*>(BaseOrNull(tau));
     state.joint_damping = static_cast<float*>(BaseOrNull(joint_damping));
     state.joint_armature = static_cast<float*>(BaseOrNull(joint_armature));
-    state.joint_diagonal = static_cast<float*>(BaseOrNull(joint_diagonal));
-    state.joint_force = static_cast<float*>(BaseOrNull(joint_force));
     state.joint_axis = static_cast<math::Vec3*>(BaseOrNull(joint_axis));
     state.parent_offset = static_cast<math::Vec3*>(BaseOrNull(parent_offset));
     state.joint_type = static_cast<ArticulationJointType*>(BaseOrNull(joint_type));
@@ -231,32 +226,28 @@ void BufferMemberPtrs(ArticulationDeviceBuffers* b, phi::Buffer** out[]) {
     out[2] = &b->link_acceleration;
     out[3] = &b->link_xup;
     out[4] = &b->link_velocity_bias;
-    out[5] = &b->link_articulated_inertia;
-    out[6] = &b->link_bias_force;
-    out[7] = &b->link_u_spatial;
-    out[8] = &b->joint_motion_subspace;
-    out[9] = &b->link_pose;
-    out[10] = &b->link_local_pose;
-    out[11] = &b->link_inertial_frame;
-    out[12] = &b->base_pose;
-    out[13] = &b->q;
-    out[14] = &b->qdot;
-    out[15] = &b->qddot;
-    out[16] = &b->tau;
-    out[17] = &b->joint_damping;
-    out[18] = &b->joint_armature;
-    out[19] = &b->joint_diagonal;
-    out[20] = &b->joint_force;
-    out[21] = &b->joint_axis;
-    out[22] = &b->parent_offset;
-    out[23] = &b->joint_type;
-    out[24] = &b->parent_link;
-    out[25] = &b->link_body;
-    out[26] = &b->link_to_articulation;
-    out[27] = &b->articulation_link_count;
-    out[28] = &b->articulation_link_offset;
+    out[5] = &b->link_bias_force;
+    out[6] = &b->joint_motion_subspace;
+    out[7] = &b->link_pose;
+    out[8] = &b->link_local_pose;
+    out[9] = &b->link_inertial_frame;
+    out[10] = &b->base_pose;
+    out[11] = &b->q;
+    out[12] = &b->qdot;
+    out[13] = &b->qddot;
+    out[14] = &b->tau;
+    out[15] = &b->joint_damping;
+    out[16] = &b->joint_armature;
+    out[17] = &b->joint_axis;
+    out[18] = &b->parent_offset;
+    out[19] = &b->joint_type;
+    out[20] = &b->parent_link;
+    out[21] = &b->link_body;
+    out[22] = &b->link_to_articulation;
+    out[23] = &b->articulation_link_count;
+    out[24] = &b->articulation_link_offset;
 }
-constexpr int kArticulationBufferCount = 29;
+constexpr int kArticulationBufferCount = 25;
 }  // namespace
 
 ArticulationDeviceBuffers::~ArticulationDeviceBuffers() {
@@ -379,11 +370,6 @@ ArticulationHostState BuildArticulationHostState(
         result.articulation_link_offset.push_back(global_offset);
         result.articulation_link_count.push_back(link_count);
 
-        // T8a: seed the live base pose from the root link's cook pose. The root
-        // is local_link 0 (the cooker emits the root first). For a fixed root
-        // this value is never read; for a floating root the first FK before any
-        // integration step must match the static cook seed, so initialize it to
-        // the same pose the FK would otherwise read from link_pose[root].
         {
             const scene::BodyId root_body = topology.link_bodies.empty()
                 ? scene::kInvalidBody
@@ -404,9 +390,7 @@ ArticulationHostState BuildArticulationHostState(
             result.link_acceleration.emplace_back();
             result.link_xup.emplace_back();
             result.link_velocity_bias.emplace_back();
-            result.link_articulated_inertia.emplace_back();
             result.link_bias_force.emplace_back();
-            result.link_u_spatial.emplace_back();
             result.joint_motion_subspace.emplace_back();
             const scene::BodyId body = topology.link_bodies[local_link];
             const math::Transform parent_frame =
@@ -433,8 +417,6 @@ ArticulationHostState BuildArticulationHostState(
                 local_link < topology.joint_frictionlosses.size()
                     ? topology.joint_frictionlosses[local_link]
                     : 0.0f);
-            result.joint_diagonal.push_back(0.0f);
-            result.joint_force.push_back(0.0f);
             result.joint_axis.push_back(topology.joint_axes[local_link]);
             result.parent_offset.push_back(parent_frame.position);
             result.joint_type.push_back(topology.joint_types[local_link]);
@@ -500,21 +482,14 @@ ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState
     TileConcat(base.articulations, env_count, &result.articulations);
 
     // --- Per-link / per-DOF state arrays: plain value tiling --------------------
-    // None of these carry a cross-replica index, so concatenation in replica order
-    // is correct. parent_link is articulation-LOCAL: the ABA kernels compute the
-    // global parent as `articulation_link_offset[artic] + parent_link[link]`
-    // (featherstone_aba.cu:388-390, 452-465, 505-509), so the stored values stay
-    // unchanged and the ~0u root sentinel is preserved automatically. link_body
-    // indexes the (un-replicated) CookedBodyTable and is read only at build time,
-    // never by the kernels, so it is also copied as-is.
+    // parent_link is articulation-local (global = link offset + parent), and link_body
+    // is read only at build time, so every array tiles by plain concatenation.
     TileConcat(base.link_inertia, env_count, &result.link_inertia);
     TileConcat(base.link_velocity, env_count, &result.link_velocity);
     TileConcat(base.link_acceleration, env_count, &result.link_acceleration);
     TileConcat(base.link_xup, env_count, &result.link_xup);
     TileConcat(base.link_velocity_bias, env_count, &result.link_velocity_bias);
-    TileConcat(base.link_articulated_inertia, env_count, &result.link_articulated_inertia);
     TileConcat(base.link_bias_force, env_count, &result.link_bias_force);
-    TileConcat(base.link_u_spatial, env_count, &result.link_u_spatial);
     TileConcat(base.joint_motion_subspace, env_count, &result.joint_motion_subspace);
     TileConcat(base.link_pose, env_count, &result.link_pose);
     TileConcat(base.link_local_pose, env_count, &result.link_local_pose);
@@ -525,8 +500,6 @@ ArticulationHostState ReplicateArticulationHostState(const ArticulationHostState
     TileConcat(base.tau, env_count, &result.tau);
     TileConcat(base.joint_damping, env_count, &result.joint_damping);
     TileConcat(base.joint_armature, env_count, &result.joint_armature);
-    TileConcat(base.joint_diagonal, env_count, &result.joint_diagonal);
-    TileConcat(base.joint_force, env_count, &result.joint_force);
     TileConcat(base.joint_axis, env_count, &result.joint_axis);
     TileConcat(base.parent_offset, env_count, &result.parent_offset);
     TileConcat(base.joint_type, env_count, &result.joint_type);
@@ -568,9 +541,7 @@ ArticulationDeviceBuffers UploadArticulationState(cudaStream_t stream, int devic
     result.link_acceleration = UploadVectorV2(bt, host_state.link_acceleration);
     result.link_xup = UploadVectorV2(bt, host_state.link_xup);
     result.link_velocity_bias = UploadVectorV2(bt, host_state.link_velocity_bias);
-    result.link_articulated_inertia = UploadVectorV2(bt, host_state.link_articulated_inertia);
     result.link_bias_force = UploadVectorV2(bt, host_state.link_bias_force);
-    result.link_u_spatial = UploadVectorV2(bt, host_state.link_u_spatial);
     result.joint_motion_subspace = UploadVectorV2(bt, host_state.joint_motion_subspace);
     result.link_pose = UploadVectorV2(bt, host_state.link_pose);
     result.link_local_pose = UploadVectorV2(bt, host_state.link_local_pose);
@@ -582,8 +553,6 @@ ArticulationDeviceBuffers UploadArticulationState(cudaStream_t stream, int devic
     result.tau = UploadVectorV2(bt, host_state.tau);
     result.joint_damping = UploadVectorV2(bt, host_state.joint_damping);
     result.joint_armature = UploadVectorV2(bt, host_state.joint_armature);
-    result.joint_diagonal = UploadVectorV2(bt, host_state.joint_diagonal);
-    result.joint_force = UploadVectorV2(bt, host_state.joint_force);
     result.joint_axis = UploadVectorV2(bt, host_state.joint_axis);
     result.parent_offset = UploadVectorV2(bt, host_state.parent_offset);
     result.joint_type = UploadVectorV2(bt, host_state.joint_type);
@@ -610,10 +579,7 @@ ArticulationDeviceState MakeArticulationDeviceStateFromViews(
     s.link_xup = reinterpret_cast<LinkSpatialTransform*>(data_view.link_xup);
     s.link_velocity_bias =
         reinterpret_cast<LinkSpatialVel*>(data_view.link_velocity_bias);
-    s.link_articulated_I =
-        reinterpret_cast<LinkArticulatedInertia*>(data_view.link_articulated_I);
     s.link_bias_force = reinterpret_cast<LinkBiasForce*>(data_view.link_bias_force);
-    s.link_u_spatial = reinterpret_cast<LinkBiasForce*>(data_view.link_u_spatial);
     s.joint_motion_subspace =
         reinterpret_cast<LinkMotionSubspace*>(data_view.joint_motion_subspace);
     s.link_pose = data_view.link_pose;
@@ -626,8 +592,6 @@ ArticulationDeviceState MakeArticulationDeviceStateFromViews(
     s.tau = data_view.tau;
     s.joint_damping = model_view.joint_damping;
     s.joint_armature = model_view.joint_armature;
-    s.joint_diagonal = data_view.joint_diagonal;
-    s.joint_force = data_view.joint_force;
     s.joint_axis = model_view.joint_axis;
     s.parent_offset = model_view.parent_offset;
     s.joint_type = reinterpret_cast<ArticulationJointType*>(model_view.joint_type);
@@ -658,10 +622,7 @@ void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,
     DownloadVectorV2(device_state.link_acceleration, &host_state->link_acceleration, links);
     DownloadVectorV2(device_state.link_xup, &host_state->link_xup, links);
     DownloadVectorV2(device_state.link_velocity_bias, &host_state->link_velocity_bias, links);
-    DownloadVectorV2(device_state.link_articulated_inertia,
-                     &host_state->link_articulated_inertia, links);
     DownloadVectorV2(device_state.link_bias_force, &host_state->link_bias_force, links);
-    DownloadVectorV2(device_state.link_u_spatial, &host_state->link_u_spatial, links);
     DownloadVectorV2(device_state.joint_motion_subspace,
                      &host_state->joint_motion_subspace, links);
     DownloadVectorV2(device_state.link_pose, &host_state->link_pose, links);
@@ -674,8 +635,6 @@ void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,
     DownloadVectorV2(device_state.tau, &host_state->tau, links);
     DownloadVectorV2(device_state.joint_damping, &host_state->joint_damping, links);
     DownloadVectorV2(device_state.joint_armature, &host_state->joint_armature, links);
-    DownloadVectorV2(device_state.joint_diagonal, &host_state->joint_diagonal, links);
-    DownloadVectorV2(device_state.joint_force, &host_state->joint_force, links);
     DownloadVectorV2(device_state.joint_axis, &host_state->joint_axis, links);
     DownloadVectorV2(device_state.parent_offset, &host_state->parent_offset, links);
     DownloadVectorV2(device_state.joint_type, &host_state->joint_type, links);

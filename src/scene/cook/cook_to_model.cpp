@@ -53,7 +53,7 @@
 #include "nk/solve/vertex_block_schedule.hpp"
 #include "runtime/soft/cloth_topology.hpp"
 #include "runtime/soft/tetmesh_topology.hpp"   // BuildSphereTetLattice / BuildTetMeshConstraints
-#include "import/cooker/fluid_cooker.hpp"       // CookFluidBox
+#include "import/cooker/particle_volume_cooker.hpp"       // CookParticleBox
 #include "import/cooker/mesh_surface_cooker.hpp"
 
 namespace nuka::scene::cook {
@@ -317,11 +317,6 @@ void SetOgcContactCapacity(nk::Model& model, uint32_t capacity) {
 
 namespace {
 
-// the shared cook implementation. The cook options gate the two HEAVY
-// per-shape stages (V-HACD vs single-hull, SDF bake). The public 2-arg overload
-// passes the DEFAULT options (legacy, byte-identical); the PairDriven 3-arg passes
-// the general-path options (single-hull + no SDF) so the whole-body union scene
-// cooks tractably. No entity/scene-name branch — the options are the only seam.
 CookToModelResult CookToModelImpl(const SceneIR& scene, int env_count,
                                   const CookSceneOptions& cook_options,
                                   bool enable_contacts = true) {
@@ -2327,11 +2322,11 @@ uint32_t AppendMpmFillSurfaces(std::vector<MediaRenderSurface>& out,
     uint32_t first = base;
     const size_t begin = out.size();
     for (const MpmBoxFill& f : MpmBoxFills(media)) {
-        import::cooker::FluidBoxSpec spec;
+        import::cooker::ParticleVolumeSpec spec;
         spec.min_corner = f.box.min;
         spec.max_corner = f.box.max;
         spec.spacing = f.box.spacing;
-        const uint32_t cnt = import::cooker::FluidBoxLatticeCounts(spec).total;
+        const uint32_t cnt = import::cooker::ParticleBoxLatticeCounts(spec).total;
         if (cnt == 0u) continue;  // empty sub-box: no particles, no skin (cook skips it too).
         MediaRenderSurface s;
         s.particle_radius = 0.5f * f.box.spacing;
@@ -2519,13 +2514,13 @@ static MpmCookInput BuildMpmInputFills(const MediaRecord& media) {
               b.max.z > b.min.z)) continue;  // empty/invalid sub-box: contributes nothing.
         const float density = f.material.model_kind == nk::MpmMaterial::kHenckyJ2 ?
             f.material.density : (f.material.density > 0.0f ? f.material.density : 1000.0f);
-        import::cooker::FluidBoxSpec spec;
+        import::cooker::ParticleVolumeSpec spec;
         spec.min_corner = b.min;
         spec.max_corner = b.max;
         spec.spacing = b.spacing;
         spec.rest_density = density;
         spec.position_jitter = b.position_jitter;
-        const std::vector<math::Vec3> pos = import::cooker::CookFluidBox(spec).positions;
+        const std::vector<math::Vec3> pos = import::cooker::CookParticleBox(spec).positions;
         if (pos.empty()) continue;  // sub-box smaller than one cell: no particles.
         const uint32_t mid = static_cast<uint32_t>(in.materials.size());
         const float vol0 = b.spacing * b.spacing * b.spacing;
@@ -2597,13 +2592,13 @@ MpmCookInput BuildMpmInput(const MediaRecord& media) {
         const MediaRecord::FluidBox& b = media.fluid_box;
         if (b.spacing > 0.0f && b.max.x > b.min.x && b.max.y > b.min.y &&
             b.max.z > b.min.z) {
-            import::cooker::FluidBoxSpec spec;
+            import::cooker::ParticleVolumeSpec spec;
             spec.min_corner = b.min;
             spec.max_corner = b.max;
             spec.spacing = b.spacing;
             spec.rest_density = density;
             spec.position_jitter = b.position_jitter;
-            in.positions = import::cooker::CookFluidBox(spec).positions;
+            in.positions = import::cooker::CookParticleBox(spec).positions;
             vol0 = b.spacing * b.spacing * b.spacing;
             lo = b.min;
             hi = b.max;

@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
 // v0.7 p10-B GATE 3: PBF fluid COOKER tests.
 //
-// The fluid cooker is a THIN cook-time CPU layer: a programmatic FluidBoxSpec ->
-// runtime::fluid::PbfParticleSet, by sampling a cell-centered uniform lattice
+// The fluid cooker is a THIN cook-time CPU layer: a programmatic ParticleVolumeSpec ->
+// runtime::fluid::ParticleLattice, by sampling a cell-centered uniform lattice
 // filling the AABB and computing the uniform mass = rest_density * spacing^3.
 // These tests assert, on the RETURNED particle set (pure CPU -- no device upload):
 //
@@ -20,9 +20,9 @@
 //      the box lattice (all within the sphere; fewer than the box).
 // ---------------------------------------------------------------------------
 
-#include "import/cooker/fluid_cooker.hpp"
+#include "import/cooker/particle_volume_cooker.hpp"
 
-#include "import/cooker/fluid_cooker_types.hpp"  // PbfParticleSet (CUDA-free)
+#include "import/cooker/particle_lattice.hpp"  // ParticleLattice (CUDA-free)
 #include "math/vec3.hpp"
 
 #include <gtest/gtest.h>
@@ -33,20 +33,20 @@
 
 namespace {
 
-using nuka::import::cooker::CookFluidBox;
-using nuka::import::cooker::CookFluidSphere;
-using nuka::import::cooker::FluidBoxLatticeCounts;
-using nuka::import::cooker::FluidBoxSpec;
-using nuka::import::cooker::FluidLatticeCounts;
-using nuka::import::cooker::FluidParticleMass;
+using nuka::import::cooker::CookParticleBox;
+using nuka::import::cooker::CookParticleSphere;
+using nuka::import::cooker::ParticleBoxLatticeCounts;
+using nuka::import::cooker::ParticleVolumeSpec;
+using nuka::import::cooker::ParticleLatticeCounts;
+using nuka::import::cooker::LatticeParticleMass;
 using nuka::math::Vec3;
-using nuka::runtime::fluid::PbfParticleSet;
+using nuka::runtime::fluid::ParticleLattice;
 
 } // namespace
 
 // Gate 3(1) + 3(2): a known box cooks to the hand-computed count + cell mass.
-TEST(FluidCooker, BoxCooksToExpectedCountAndMass) {
-    FluidBoxSpec spec;
+TEST(ParticleVolumeCooker, BoxCooksToExpectedCountAndMass) {
+    ParticleVolumeSpec spec;
     spec.min_corner = Vec3{0.0f, 0.0f, 0.0f};
     spec.max_corner = Vec3{1.0f, 0.5f, 0.2f};  // L = (1.0, 0.5, 0.2)
     spec.spacing = 0.1f;
@@ -55,20 +55,20 @@ TEST(FluidCooker, BoxCooksToExpectedCountAndMass) {
     // n = floor(L/s): floor(1.0/0.1)=10, floor(0.5/0.1)=5, floor(0.2/0.1)=2.
     // (Note: floor of exactly 10/5/2 is robust here -- the test below also accepts
     //  the float-floor result and asserts the cooked set matches the count fn.)
-    const FluidLatticeCounts counts = FluidBoxLatticeCounts(spec);
+    const ParticleLatticeCounts counts = ParticleBoxLatticeCounts(spec);
     EXPECT_EQ(counts.nx, 10u);
     EXPECT_EQ(counts.ny, 5u);
     EXPECT_EQ(counts.nz, 2u);
     EXPECT_EQ(counts.total, 10u * 5u * 2u);
 
-    const PbfParticleSet ps = CookFluidBox(spec);
+    const ParticleLattice ps = CookParticleBox(spec);
     EXPECT_EQ(static_cast<uint32_t>(ps.positions.size()), counts.total);
     EXPECT_EQ(ps.velocities.size(), ps.positions.size());
 
     // mass = rest_density * spacing^3 = 1000 * 0.001 = 1.0.
     const float expected_mass = 1000.0f * 0.1f * 0.1f * 0.1f;
     EXPECT_FLOAT_EQ(ps.particle_mass, expected_mass);
-    EXPECT_FLOAT_EQ(ps.particle_mass, FluidParticleMass(spec));
+    EXPECT_FLOAT_EQ(ps.particle_mass, LatticeParticleMass(spec));
 
     // Velocities seeded to zero.
     for (const Vec3& v : ps.velocities) {
@@ -78,22 +78,22 @@ TEST(FluidCooker, BoxCooksToExpectedCountAndMass) {
     }
 }
 
-TEST(FluidCooker, AdjacentTranslatedFillsPreserveLatticeAndVolume) {
-    FluidBoxSpec left;
+TEST(ParticleVolumeCooker, AdjacentTranslatedFillsPreserveLatticeAndVolume) {
+    ParticleVolumeSpec left;
     left.min_corner = {1.2f, -0.6f, 0.06f};
     left.max_corner = {4.2f, 0.6f, 0.24f};
     left.spacing = 0.02f;
     auto right = left;
     right.min_corner.x = left.max_corner.x;
     right.max_corner.x = 4.5f;
-    const auto lc = FluidBoxLatticeCounts(left), rc = FluidBoxLatticeCounts(right);
+    const auto lc = ParticleBoxLatticeCounts(left), rc = ParticleBoxLatticeCounts(right);
     ASSERT_EQ(lc.nx, 150u);
     ASSERT_EQ(lc.ny, 60u);
     ASSERT_EQ(lc.nz, 9u);
     ASSERT_EQ(rc.nx, 15u);
     EXPECT_EQ(rc.ny, lc.ny);
     EXPECT_EQ(rc.nz, lc.nz);
-    const auto a = CookFluidBox(left), b = CookFluidBox(right);
+    const auto a = CookParticleBox(left), b = CookParticleBox(right);
     const double mass = double(a.positions.size()) * a.particle_mass +
                         double(b.positions.size()) * b.particle_mass;
     EXPECT_NEAR(mass, 3.3 * 1.2 * 0.18 * 1000.0, 1.0e-3);
@@ -105,19 +105,19 @@ TEST(FluidCooker, AdjacentTranslatedFillsPreserveLatticeAndVolume) {
         EXPECT_EQ(head.z, tail.z);
     }
     right.max_corner.x -= 0.001f;
-    EXPECT_EQ(FluidBoxLatticeCounts(right).nx, 14u);
+    EXPECT_EQ(ParticleBoxLatticeCounts(right).nx, 14u);
 }
 
 // Gate 3(3): every particle sits at a cell center on the lattice, inside the box.
-TEST(FluidCooker, ParticlesAreCellCenteredInsideBox) {
-    FluidBoxSpec spec;
+TEST(ParticleVolumeCooker, ParticlesAreCellCenteredInsideBox) {
+    ParticleVolumeSpec spec;
     spec.min_corner = Vec3{-0.2f, 1.0f, 0.5f};
     spec.max_corner = Vec3{0.3f, 1.4f, 0.8f};
     spec.spacing = 0.05f;
     spec.rest_density = 1.0f;
 
-    const FluidLatticeCounts counts = FluidBoxLatticeCounts(spec);
-    const PbfParticleSet ps = CookFluidBox(spec);
+    const ParticleLatticeCounts counts = ParticleBoxLatticeCounts(spec);
+    const ParticleLattice ps = CookParticleBox(spec);
     ASSERT_EQ(static_cast<uint32_t>(ps.positions.size()), counts.total);
 
     const float s = spec.spacing;
@@ -149,15 +149,15 @@ TEST(FluidCooker, ParticlesAreCellCenteredInsideBox) {
 }
 
 // Gate 3(4): two cooks of the same spec are byte-identical.
-TEST(FluidCooker, CookIsDeterministic) {
-    FluidBoxSpec spec;
+TEST(ParticleVolumeCooker, CookIsDeterministic) {
+    ParticleVolumeSpec spec;
     spec.min_corner = Vec3{0.0f, 0.0f, 0.0f};
     spec.max_corner = Vec3{0.7f, 0.7f, 0.7f};
     spec.spacing = 0.05f;
     spec.rest_density = 998.0f;
 
-    const PbfParticleSet a = CookFluidBox(spec);
-    const PbfParticleSet b = CookFluidBox(spec);
+    const ParticleLattice a = CookParticleBox(spec);
+    const ParticleLattice b = CookParticleBox(spec);
 
     ASSERT_EQ(a.positions.size(), b.positions.size());
     ASSERT_EQ(a.velocities.size(), b.velocities.size());
@@ -171,45 +171,45 @@ TEST(FluidCooker, CookIsDeterministic) {
 }
 
 // Gate 3(5): degenerate specs cook to an empty set without throwing.
-TEST(FluidCooker, BadSpecsCookToEmpty) {
-    FluidBoxSpec base;
+TEST(ParticleVolumeCooker, BadSpecsCookToEmpty) {
+    ParticleVolumeSpec base;
     base.min_corner = Vec3{0.0f, 0.0f, 0.0f};
     base.max_corner = Vec3{1.0f, 1.0f, 1.0f};
     base.spacing = 0.1f;
     base.rest_density = 1.0f;
 
     {  // spacing <= 0
-        FluidBoxSpec s = base; s.spacing = 0.0f;
-        EXPECT_TRUE(CookFluidBox(s).positions.empty());
-        EXPECT_EQ(FluidBoxLatticeCounts(s).total, 0u);
+        ParticleVolumeSpec s = base; s.spacing = 0.0f;
+        EXPECT_TRUE(CookParticleBox(s).positions.empty());
+        EXPECT_EQ(ParticleBoxLatticeCounts(s).total, 0u);
     }
     {  // rest_density <= 0
-        FluidBoxSpec s = base; s.rest_density = 0.0f;
-        EXPECT_TRUE(CookFluidBox(s).positions.empty());
-        EXPECT_EQ(FluidBoxLatticeCounts(s).total, 0u);
+        ParticleVolumeSpec s = base; s.rest_density = 0.0f;
+        EXPECT_TRUE(CookParticleBox(s).positions.empty());
+        EXPECT_EQ(ParticleBoxLatticeCounts(s).total, 0u);
     }
     {  // inverted / empty box (max < min)
-        FluidBoxSpec s = base; s.max_corner = Vec3{-1.0f, -1.0f, -1.0f};
-        EXPECT_TRUE(CookFluidBox(s).positions.empty());
-        EXPECT_EQ(FluidBoxLatticeCounts(s).total, 0u);
+        ParticleVolumeSpec s = base; s.max_corner = Vec3{-1.0f, -1.0f, -1.0f};
+        EXPECT_TRUE(CookParticleBox(s).positions.empty());
+        EXPECT_EQ(ParticleBoxLatticeCounts(s).total, 0u);
     }
     {  // spacing larger than every extent -> floor(L/s) == 0 on each axis.
-        FluidBoxSpec s = base; s.spacing = 2.0f;
-        EXPECT_TRUE(CookFluidBox(s).positions.empty());
-        EXPECT_EQ(FluidBoxLatticeCounts(s).total, 0u);
+        ParticleVolumeSpec s = base; s.spacing = 2.0f;
+        EXPECT_TRUE(CookParticleBox(s).positions.empty());
+        EXPECT_EQ(ParticleBoxLatticeCounts(s).total, 0u);
     }
 }
 
 // Gate 3(6): the optional inscribed-sphere carve keeps a strict in-sphere subset.
-TEST(FluidCooker, SphereCarveKeepsInSphereSubset) {
-    FluidBoxSpec spec;
+TEST(ParticleVolumeCooker, SphereCarveKeepsInSphereSubset) {
+    ParticleVolumeSpec spec;
     spec.min_corner = Vec3{0.0f, 0.0f, 0.0f};
     spec.max_corner = Vec3{1.0f, 1.0f, 1.0f};
     spec.spacing = 0.1f;
     spec.rest_density = 1.0f;
 
-    const PbfParticleSet box = CookFluidBox(spec);
-    const PbfParticleSet sph = CookFluidSphere(spec);
+    const ParticleLattice box = CookParticleBox(spec);
+    const ParticleLattice sph = CookParticleSphere(spec);
 
     EXPECT_FLOAT_EQ(sph.particle_mass, box.particle_mass);
     EXPECT_EQ(sph.velocities.size(), sph.positions.size());

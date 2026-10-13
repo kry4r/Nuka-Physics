@@ -229,16 +229,14 @@ TEST_F(Phi2SmokeTest, UnregisteredOpReturnsUnsupported) {
     Backend* backend = DeviceInitBackend(dev, nullptr);
     ASSERT_NE(backend, nullptr);
 
-    // The probe op must be one with no implementation yet. M3b registered
-    // AbaForward; M5 registered LbvhBuild; M6 registered the particle spine. The
-    // next still-unimplemented milestone op is the M9 domain-randomization op
-    // RandomizeMaterialBuckets.
-    EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::AbaForward))
-        << "M3b: the real AbaForward op should be registered";
+    // The probe op must be one with no implementation yet; RandomizeMaterialBuckets is
+    // still unimplemented while the articulation, broadphase and particle ops are registered.
+    EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::ArticulationDynamics))
+        << "the ArticulationDynamics op should be registered";
     EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::LbvhBuild))
-        << "M5: the real LbvhBuild broadphase op should be registered";
+        << "the LbvhBuild broadphase op should be registered";
     EXPECT_TRUE(DeviceSupportsOp(dev, NkOp::ParticlePredict))
-        << "M6: the real ParticlePredict particle op should be registered";
+        << "the ParticlePredict particle op should be registered";
     EXPECT_FALSE(DeviceSupportsOp(dev, NkOp::RandomizeMaterialBuckets));
     OpCall call{NkOp::RandomizeMaterialBuckets, nullptr};
     ModelView model{};

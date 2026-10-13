@@ -22,7 +22,6 @@ struct WorldCheckpointRecord {
     std::vector<float> joint_armature;
     uint32_t simulated_step_count = 0u;
     runtime::WorldStepOptions step_options;
-    uint32_t sparse_solver_backend = 0u;
     std::map<nuka_state_field_t, sensor::ObservationSnapshot> observations;
     sensor::StateSensorBankSnapshot state_sensors;
     uint64_t sensor_revision = 0u;
@@ -184,7 +183,6 @@ phi::Status CopyHostState(const WorldRecord& source, WorldCheckpointRecord* targ
     }
     target->simulated_step_count = source.simulated_step_count;
     target->step_options = source.step_options;
-    target->sparse_solver_backend = source.sparse_solver_backend;
     target->link_inertia = source.articulation_host.link_inertia;
     target->joint_armature = source.articulation_host.joint_armature;
     for (const auto& entry : source.field_observations) {
@@ -204,7 +202,6 @@ phi::Status CopyHostState(const WorldRecord& source, WorldCheckpointRecord* targ
 void RestoreHostState(const WorldCheckpointRecord& source, WorldRecord* target) {
     target->simulated_step_count = source.simulated_step_count;
     target->step_options = source.step_options;
-    target->sparse_solver_backend = source.sparse_solver_backend;
     target->dr_config = source.dr_config;
     target->dr_baseline_captured = source.dr_baseline_captured;
     target->dr_nominal_link_mass = source.dr_nominal_link_mass;
@@ -277,7 +274,6 @@ phi::Status HashHostState(uint64_t* hash, const WorldRecord& record) {
     }
     const uint8_t mode = static_cast<uint8_t>(record.control_mode);
     HashValue(hash, mode);
-    HashValue(hash, record.sparse_solver_backend);
     HashValue(hash, record.step_options.gravity.x);
     HashValue(hash, record.step_options.gravity.y);
     HashValue(hash, record.step_options.gravity.z);

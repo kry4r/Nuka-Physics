@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // nk::Arena — the data-owned device memory (plan §3.3).
 //
-// Arena owns the THREE phi Buffers of an nk::Data (Persistent / Scratch / Tape)
+// Arena owns the TWO phi Buffers of an nk::Data (Persistent / Scratch)
 // sized from the Model capacities x env_count via the generated arena_layout
 // table. Each data-owned field gets one 256B-aligned segment within its arena's
 // buffer; the layout is env-major and DETERMINISTIC (same Model + env_count =>
@@ -32,7 +32,7 @@ public:
     Arena(Arena&&) noexcept;
     Arena& operator=(Arena&&) noexcept;
 
-    // Allocate the 3 arena buffers from the capacities and lay out + memset(0)
+    // Allocate the arena buffers from the capacities and lay out + memset(0)
     // every data-owned field. Returns Ok / OutOfMemory / Failed.
     phi::Status Allocate(phi::BufferType* bt, const ModelCapacities& caps);
 
@@ -61,7 +61,7 @@ public:
     // order). Public so the acceptance test can assert determinism.
     struct Segment {
         FieldId  field;
-        uint8_t  arena;    // FieldArena as uint8 (Persistent=0/Scratch=1/Tape=2)
+        uint8_t  arena;    // FieldArena as uint8 (Persistent=0/Scratch=1)
         uint64_t offset;   // byte offset within that arena's buffer
         uint64_t bytes;
     };
@@ -69,20 +69,19 @@ public:
 
     // Compute the segment table + per-arena totals WITHOUT allocating (the
     // determinism gate compares two of these). Pure function of `caps`.
+    static constexpr int kArenaCount = 2;
     static std::vector<Segment> ComputeSegments(const ModelCapacities& caps,
-                                                 uint64_t arena_bytes[3]);
+                                                 uint64_t arena_bytes[kArenaCount]);
 
     phi::Buffer* PersistentBuffer() const { return persistent_; }
     phi::Buffer* ScratchBuffer() const { return scratch_; }
-    phi::Buffer* TapeBuffer() const { return tape_; }
 
 private:
     void FreeAll();
 
     phi::Buffer* persistent_ = nullptr;
     phi::Buffer* scratch_    = nullptr;
-    phi::Buffer* tape_       = nullptr;
-    uint64_t     arena_bytes_[3] = {0, 0, 0};
+    uint64_t     arena_bytes_[kArenaCount] = {0, 0};
     std::vector<Segment> segments_;  // FieldId order, data-owned only.
 };
 

@@ -13,7 +13,7 @@
 #include "math/quat.hpp"
 #include "math/transform.hpp"
 #include "phi/backend_cuda/launch.cuh"
-#include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/articulation_mass.cuh"
 #include "phi/backend_cuda/ops/kinematics.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
@@ -33,11 +33,8 @@ struct Mat3 {
     float m[9];
 };
 
-// Small-vector and spatial (6-vector / 6x6) primitives come from the shared
-// device math libraries (math/cuda_vec_ops.cuh, math/cuda_spatial_ops.cuh) —
-// the SAME bodies the legacy featherstone_aba.cu consumes. The thin
-// __forceinline__ forwarders below are copied verbatim from that file so every
-// call site stays textually identical.
+// Small-vector and spatial primitives come from math/cuda_vec_ops.cuh and
+// math/cuda_spatial_ops.cuh.
 namespace mg = ::nuka::math::gpu;
 using mg::Add;
 using mg::Add6InPlace;
@@ -55,12 +52,6 @@ __forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
 
 __forceinline__ __device__ math::Vec3 Cross3(math::Vec3 a, math::Vec3 b) {
     return mg::Cross(a, b);
-}
-
-__forceinline__ __device__ void SubtractOuterProduct36(float* matrix,
-                                                       const float* u,
-                                                       float diagonal) {
-    mg::SubtractOuterProduct36(matrix, u, diagonal, kMinDiagonal);
 }
 
 __device__ Mat3 Mat3Transpose(const Mat3& matrix) {
@@ -241,17 +232,6 @@ __device__ math::Vec3 RotateByQuatInverse(math::Quat q, math::Vec3 v) {
     return Add(v, Add(Scale(t, q.w), Cross3(qv, t)));
 }
 
-__forceinline__ __device__ void Solve6x6Ldlt(const float* matrix, const float* rhs, float* out) {
-    mg::Solve6x6Ldlt(matrix, rhs, out, kMinDiagonal);
-}
-
-__device__ void CopySpatialInertia(const LinkSpatialInertia& src,
-                                   LinkArticulatedInertia* dst) {
-    for (uint32_t i = 0u; i < 36u; ++i) {
-        dst->Ia[i] = src.I[i];
-    }
-}
-
 __device__ void SpatialToArray(const LinkSpatialVel& value, float* out) {
     for (uint32_t i = 0u; i < 6u; ++i) {
         out[i] = value.v[i];
@@ -312,7 +292,7 @@ __device__ void SubtractLinkWrench(const ArticulationDeviceState& state, uint32_
     bias_force[5] -= force.z;
 }
 
-__global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
+__device__ void PrepareArticulationKinematics(ArticulationDeviceState state,
     const nk::Spatial6* __restrict__ link_wrench, uint32_t apply_link_wrench, ArticulationTreeView tree) {
     const uint32_t articulation = blockIdx.x;
     if (articulation >= state.articulation_count) {
@@ -331,7 +311,6 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
                 state.link_xup[link] = MakeMotionTransform(Mat3Identity(),
                                                            MakeVec3(0.0f, 0.0f, 0.0f));
                 Zero6(state.joint_motion_subspace[link].s);
-                CopySpatialInertia(state.link_inertia[link], &state.link_articulated_I[link]);
     
                 float velocity[6];
                 SpatialToArray(state.link_velocity[link], velocity);
@@ -346,9 +325,6 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
                 ForceCross(velocity, inertia_velocity, bias_force);
                 if (apply_link_wrench != 0u) SubtractLinkWrench(state, link, link_wrench, bias_force);
                 ArrayToForce(bias_force, &state.link_bias_force[link]);
-                state.joint_diagonal[link] = 0.0f;
-                state.joint_force[link] = 0.0f;
-                Zero6(state.link_u_spatial[link].p);
                 continue;
             }
     
@@ -356,7 +332,6 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
             MotionSubspaceForJoint(state.joint_type[link],
                                    state.joint_axis[link],
                                    state.joint_motion_subspace[link].s);
-            CopySpatialInertia(state.link_inertia[link], &state.link_articulated_I[link]);
     
             float v_parent[6];
             Zero6(v_parent);
@@ -388,9 +363,128 @@ __global__ void AbaPass1KinematicsKernel(ArticulationDeviceState state,
             ForceCross(velocity, inertia_velocity, bias_force);
             if (apply_link_wrench != 0u) SubtractLinkWrench(state, link, link_wrench, bias_force);
             ArrayToForce(bias_force, &state.link_bias_force[link]);
-            state.joint_diagonal[link] = 0.0f;
-            state.joint_force[link] = 0.0f;
-            Zero6(state.link_u_spatial[link].p);
+        }
+        __syncthreads();
+    }
+}
+
+// One articulation owns the kinematics, bias, mass factor and unconstrained velocity update.
+__global__ void ArticulationDynamicsKernel(ArticulationDeviceState state, DataView data,
+    ArticulationTreeView tree, ArticulationDynamicsParams p) {
+    const uint32_t articulation = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t offset = state.articulation_link_offset[articulation];
+    const uint32_t count = state.articulation_link_count[articulation];
+    const uint32_t stride = p.max_dof;
+    const uint32_t dof = ActualCrbaDof(state, articulation, stride, data.env_status);
+    if (dof == kInvalidLink) return;
+    const auto workspace = CrbaWorkspaceFor(data.crba_scratch, articulation, stride);
+    float* const velocity = workspace.Values(CrbaVector::Velocity);
+    float* const acceleration = workspace.Values(CrbaVector::Projected);
+    float* const bias = data.articulation_bias + size_t{articulation} * stride;
+    float* const factor = data.m_factor + size_t{articulation} * stride * stride;
+    const math::Vec3 gravity{p.gravity[0], p.gravity[1], p.gravity[2]};
+    PrepareArticulationKinematics(state, data.link_wrench, p.apply_link_wrench, tree);
+    for (uint32_t depth = 0u; depth <= tree.max_depth[articulation]; ++depth) {
+        for (uint32_t local = lane; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] != depth) continue;
+            float a[6];
+            const uint32_t parent = state.parent_link[link];
+            if (parent != kInvalidLink) {
+                TransformMotion(state.link_xup[link], state.link_acceleration[offset + parent].a, a);
+            } else if (state.joint_type[link] == ArticulationJointType::FloatingBase) {
+                const auto g = RotateByQuatInverse(state.base_pose[articulation].rotation, gravity);
+                Zero6(a);
+                a[3] = -g.x; a[4] = -g.y; a[5] = -g.z;
+            } else {
+                float world[6];
+                GravityAcceleration(gravity, world);
+                TransformMotion(state.link_xup[link], world, a);
+            }
+            Add6InPlace(a, state.link_velocity_bias[link].v);
+            ArrayToAccel(a, &state.link_acceleration[link]);
+            float force[6];
+            Mat66MulVec6(state.link_inertia[link].I, a, force);
+            Add6InPlace(state.link_bias_force[link].p, force);
+        }
+        __syncthreads();
+    }
+    for (uint32_t remaining = tree.max_depth[articulation] + 1u; remaining > 0u; --remaining) {
+        for (uint32_t local = lane; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] != remaining - 1u) continue;
+            for (uint32_t i = tree.child_range[2u * link]; i < tree.child_range[2u * link + 1u]; ++i) {
+                const uint32_t child = tree.children[i];
+                float force[6];
+                TransformForceTranspose(state.link_xup[child], state.link_bias_force[child].p, force);
+                Add6InPlace(state.link_bias_force[link].p, force);
+            }
+        }
+        __syncthreads();
+    }
+    for (uint32_t d = lane; d < stride; d += blockDim.x) {
+        uint32_t link = 0u, component = 0u;
+        if (d >= dof) { bias[d] = 0.0f; continue; }
+        ArticulationDofLocation(state, articulation, d, &link, &component);
+        const bool scalar = component == kInvalidLink;
+        velocity[d] = scalar ? state.qdot[link] : state.link_velocity[link].v[component];
+        bias[d] = scalar ? Dot6(state.joint_motion_subspace[link].s, state.link_bias_force[link].p)
+                         : state.link_bias_force[link].p[component];
+        const float damping = scalar ? state.joint_damping[link] +
+            (p.fold_drive_damping != 0u ? data.drive_dissipation[link] : 0.0f) : 0.0f;
+        acceleration[d] = (scalar ? state.tau[link] : 0.0f) - bias[d] - damping * velocity[d];
+    }
+    __syncthreads();
+    if (p.reuse_mass == 0u) {
+        ComputeArticulationMass(state, stride,
+            reinterpret_cast<LinkSpatialInertia*>(data.link_composite_inertia), data.m,
+            p.fold_drive_damping != 0u ? data.drive_dissipation : nullptr, p.dt, tree);
+        __syncthreads();
+        FactorMass(data.m + size_t{articulation} * stride * stride, factor, dof, stride);
+    }
+    if (lane == 0u) SolveMass(factor, acceleration, dof, stride);
+    __syncthreads();
+    for (uint32_t local = lane; local < count; local += blockDim.x) {
+        const uint32_t link = offset + local;
+        state.qddot[link] = 0.0f;
+        if (p.integrate_velocity != 0u) data.link_wrench[link] = {};
+    }
+    __syncthreads();
+    for (uint32_t d = lane; d < dof; d += blockDim.x) {
+        uint32_t link = 0u, component = 0u;
+        ArticulationDofLocation(state, articulation, d, &link, &component);
+        if (component == kInvalidLink) {
+            state.qddot[link] = acceleration[d];
+            if (p.integrate_velocity != 0u) state.qdot[link] = velocity[d] + p.dt * acceleration[d];
+        } else if (p.integrate_velocity != 0u) {
+            state.link_velocity[link].v[component] = velocity[d] + p.dt * acceleration[d];
+        }
+    }
+    __syncthreads();
+    for (uint32_t depth = 0u; depth <= tree.max_depth[articulation]; ++depth) {
+        for (uint32_t local = lane; local < count; local += blockDim.x) {
+            const uint32_t link = offset + local;
+            if (tree.depth[link] != depth) continue;
+            float a[6];
+            const uint32_t parent = state.parent_link[link];
+            if (state.joint_type[link] == ArticulationJointType::FloatingBase) {
+                const auto g = RotateByQuatInverse(state.base_pose[articulation].rotation, gravity);
+                for (uint32_t c = 0u; c < 6u; ++c) a[c] = acceleration[c];
+                a[3] -= g.x; a[4] -= g.y; a[5] -= g.z;
+            } else {
+                if (parent != kInvalidLink) {
+                    TransformMotion(state.link_xup[link], state.link_acceleration[offset + parent].a, a);
+                } else {
+                    float world[6];
+                    GravityAcceleration(gravity, world);
+                    TransformMotion(state.link_xup[link], world, a);
+                }
+                for (uint32_t c = 0u; c < 6u; ++c)
+                    a[c] += state.link_velocity_bias[link].v[c] +
+                            state.joint_motion_subspace[link].s[c] * state.qddot[link];
+            }
+            ArrayToAccel(a, &state.link_acceleration[link]);
         }
         __syncthreads();
     }
@@ -421,172 +515,6 @@ __global__ void FkLinkVelocitiesKernel(ArticulationDeviceState state, Articulati
         __syncthreads();
     }
 }
-
-__global__ void AbaPass2ArticulatedInertiaKernel(ArticulationDeviceState state) {
-    const uint32_t articulation = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
-        return;
-    }
-
-    const uint32_t offset = state.articulation_link_offset[articulation];
-    const uint32_t count = state.articulation_link_count[articulation];
-    for (uint32_t reverse = count; reverse > 0u; --reverse) {
-        const uint32_t link = offset + reverse - 1u;
-
-        // T8a: free-floating root (see featherstone_aba.cu).
-        if (state.parent_link[link] == kInvalidLink &&
-            state.joint_type[link] == ArticulationJointType::FloatingBase) {
-            Zero6(state.link_u_spatial[link].p);
-            state.joint_diagonal[link] = 0.0f;
-            state.joint_force[link] = 0.0f;
-            continue;
-        }
-
-        float u_spatial[6];
-        Mat66MulVec6(state.link_articulated_I[link].Ia,
-                     state.joint_motion_subspace[link].s,
-                     u_spatial);
-        ArrayToForce(u_spatial, &state.link_u_spatial[link]);
-
-        float diagonal = Dot6(state.joint_motion_subspace[link].s, u_spatial);
-        if (state.joint_type[link] == ArticulationJointType::Fixed) {
-            diagonal = 1.0f;
-        }
-        diagonal += state.joint_armature[link];
-        diagonal = fmaxf(diagonal, kMinDiagonal);
-        state.joint_diagonal[link] = diagonal;
-        state.joint_force[link] =
-            state.tau[link] -
-            state.joint_damping[link] * state.qdot[link] -
-            Dot6(state.joint_motion_subspace[link].s,
-                 state.link_bias_force[link].p);
-
-        const uint32_t parent = state.parent_link[link];
-        if (parent == kInvalidLink) {
-            continue;
-        }
-
-        float reduced_inertia[36];
-        Copy36(state.link_articulated_I[link].Ia, reduced_inertia);
-        if (state.joint_type[link] != ArticulationJointType::Fixed) {
-            SubtractOuterProduct36(reduced_inertia, u_spatial, diagonal);
-        }
-
-        float parent_delta[36];
-        TransformInertiaToParent(state.link_xup[link], reduced_inertia, parent_delta);
-        const uint32_t parent_link = offset + parent;
-        for (uint32_t i = 0u; i < 36u; ++i) {
-            state.link_articulated_I[parent_link].Ia[i] += parent_delta[i];
-        }
-
-        float pa[6];
-        for (uint32_t i = 0u; i < 6u; ++i) {
-            pa[i] = state.link_bias_force[link].p[i];
-        }
-        float inertia_bias[6];
-        Mat66MulVec6(reduced_inertia,
-                     state.link_velocity_bias[link].v,
-                     inertia_bias);
-        Add6InPlace(pa, inertia_bias);
-        if (state.joint_type[link] != ArticulationJointType::Fixed) {
-            const float inv_diagonal = 1.0f / diagonal;
-            for (uint32_t i = 0u; i < 6u; ++i) {
-                pa[i] += u_spatial[i] * state.joint_force[link] * inv_diagonal;
-            }
-        }
-
-        float parent_force[6];
-        TransformForceTranspose(state.link_xup[link], pa, parent_force);
-        Add6InPlace(state.link_bias_force[parent_link].p, parent_force);
-    }
-}
-
-__global__ void AbaPass3AccelerationKernel(ArticulationDeviceState state,
-                                           math::Vec3 gravity) {
-    const uint32_t articulation = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    if (articulation >= state.articulation_count || lane != 0u) {
-        return;
-    }
-
-    const uint32_t offset = state.articulation_link_offset[articulation];
-    const uint32_t count = state.articulation_link_count[articulation];
-    for (uint32_t local = 0u; local < count; ++local) {
-        const uint32_t link = offset + local;
-
-        // Uniform gravity is added to floating-root velocity after this bias solve.
-        if (state.parent_link[link] == kInvalidLink &&
-            state.joint_type[link] == ArticulationJointType::FloatingBase) {
-            float neg_p[6];
-            for (uint32_t i = 0u; i < 6u; ++i) {
-                neg_p[i] = -state.link_bias_force[link].p[i];
-            }
-            float a_free[6];
-            Zero6(a_free);
-            Solve6x6Ldlt(state.link_articulated_I[link].Ia, neg_p, a_free);
-            ArrayToAccel(a_free, &state.link_acceleration[link]);
-            state.qddot[link] = 0.0f;
-            continue;
-        }
-
-        float parent_accel[6];
-        const uint32_t parent = state.parent_link[link];
-        if (parent != kInvalidLink) {
-            TransformMotion(state.link_xup[link],
-                            state.link_acceleration[offset + parent].a,
-                            parent_accel);
-        } else {
-            float world_accel[6];
-            GravityAcceleration(gravity, world_accel);
-            TransformMotion(state.link_xup[link], world_accel, parent_accel);
-        }
-
-        float accel[6];
-        for (uint32_t i = 0u; i < 6u; ++i) {
-            accel[i] = parent_accel[i] + state.link_velocity_bias[link].v[i];
-        }
-
-        if (state.joint_type[link] == ArticulationJointType::Fixed) {
-            state.qddot[link] = 0.0f;
-        } else {
-            const float u_dot_a = Dot6(state.link_u_spatial[link].p, accel);
-            state.qddot[link] =
-                (state.joint_force[link] - u_dot_a) /
-                fmaxf(state.joint_diagonal[link], kMinDiagonal);
-            for (uint32_t i = 0u; i < 6u; ++i) {
-                accel[i] += state.joint_motion_subspace[link].s[i] * state.qddot[link];
-            }
-        }
-        ArrayToAccel(accel, &state.link_acceleration[link]);
-    }
-}
-
-__global__ void IntegrateVelocityArticulationKernel(ArticulationDeviceState state,
-    float dt, nk::Spatial6* link_wrench, uint32_t clear_forces, math::Vec3 gravity) {
-    const uint32_t link = blockIdx.x * blockDim.x + threadIdx.x;
-    if (link >= state.total_link_count) {
-        return;
-    }
-    state.qdot[link] += state.qddot[link] * dt;
-    if (clear_forces != 0u) link_wrench[link] = {};
-    if (state.parent_link[link] == kInvalidLink &&
-        state.joint_type[link] == ArticulationJointType::FloatingBase) {
-        const uint32_t articulation = state.link_to_articulation[link];
-        float g_world_arr[6];
-        GravityAcceleration(gravity, g_world_arr);
-        const math::Quat base_rot = state.base_pose[articulation].rotation;
-        const math::Vec3 g_body =
-            RotateByQuatInverse(base_rot, MakeVec3(g_world_arr[3], g_world_arr[4],
-                                                   g_world_arr[5]));
-        float a_grav[6] = {0.0f, 0.0f, 0.0f, g_body.x, g_body.y, g_body.z};
-        for (uint32_t i = 0u; i < 6u; ++i) {
-            const float real_accel = state.link_acceleration[link].a[i] - a_grav[i];
-            state.link_velocity[link].v[i] += real_accel * dt;
-        }
-    }
-}
-
 
 // A coupled joint takes its root's coordinate exactly; roots are never written here.
 __global__ void SnapMimicJointsKernel(ArticulationDeviceState state,
@@ -687,7 +615,7 @@ struct DriveControlView {
     const math::Transform* task_frame;
     const float* null_stiffness;
     const float* null_damping;
-    const float* inverse_mass;
+    const float* mass_factor;
     float* command;
     float* dissipation;
     float* lower;
@@ -706,7 +634,7 @@ DriveControlView MakeDriveControlView(const DataView& data) {
             data.drive_stiffness, data.drive_damping, data.drive_force_limit,
             data.actuator_noload_speed, data.joint_f, data.task_target,
             data.task_rotation_target, data.task_local_pose,
-            data.task_nullspace_stiffness, data.task_nullspace_damping, data.m_inv,
+            data.task_nullspace_stiffness, data.task_nullspace_damping, data.m_factor,
             data.drive_command, data.drive_dissipation, data.drive_lower,
             data.drive_upper, data.control_mass, data.control_factor,
             data.control_jacobian, data.control_response, data.control_task_map,
@@ -912,7 +840,7 @@ __global__ void BodyIntegratePositionKernel(math::Transform* body_pose,
     body_angular_velocity[body] = inverse_inertia.Multiply(momentum);
 }
 
-// --- FkWorldPoses (port of articulation_contacts.cu UpdateWorldLinkPoses) ---
+// --- FkWorldPoses ---
 
 __device__ math::Vec3 AddVec(math::Vec3 a, math::Vec3 b) {
     return {a.x + b.x, a.y + b.y, a.z + b.z};
@@ -1168,16 +1096,22 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
     }
     if (active == 0u) return;
     const size_t matrix_offset = static_cast<size_t>(articulation) * stride * stride;
-    const float* inverse_mass = drive.inverse_mass + matrix_offset;
+    const float* mass_factor = drive.mass_factor + matrix_offset;
     float* factor = drive.factor + matrix_offset;
     float* mass = drive.mass + matrix_offset;
     float* const diagonal = scratch.Values(ControlVector::Diagonal);
     float* const rhs = scratch.Values(ControlVector::Rhs);
     float* const solution = scratch.Values(ControlVector::Solution);
+    for (uint32_t c = 0u; c < active; ++c) {
+        for (uint32_t d = 0u; d < actual_dof; ++d) solution[d] = d == dofs[c] ? 1.0f : 0.0f;
+        SolveMass(mass_factor, solution, static_cast<uint32_t>(actual_dof), stride);
+        for (uint32_t r = 0u; r < active; ++r) factor[r * stride + c] = solution[dofs[r]];
+    }
     for (uint32_t r = 0u; r < active; ++r)
-        for (uint32_t c = 0u; c < active; ++c)
-            factor[r * stride + c] = 0.5f *
-                (inverse_mass[dofs[r] * stride + dofs[c]] + inverse_mass[dofs[c] * stride + dofs[r]]);
+        for (uint32_t c = 0u; c < r; ++c) {
+            const float value = 0.5f * (factor[r * stride + c] + factor[c * stride + r]);
+            factor[r * stride + c] = factor[c * stride + r] = value;
+        }
     if (!FactorControlMass(factor, active, stride, diagonal)) {
         atomicOr(drive.status + offset / params.links_per_env, kEnvStatusControlFailure);
         return;
@@ -1247,12 +1181,9 @@ __global__ void ApplyDynamicsDriveKernel(ArticulationDeviceState state,
             desired_rotation.z * desired_rotation.z;
         const uint32_t task_rows = rotation_norm > 1.0e-12f ? 6u : 3u;
         for (uint32_t r = 0u; r < task_rows; ++r) {
-            for (uint32_t c = 0u; c < active; ++c) {
-                double value = 0.0;
-                for (uint32_t d = 0u; d < stride; ++d)
-                    value += static_cast<double>(jacobian[r * stride + d]) * inverse_mass[d * stride + dofs[c]];
-                response[r * stride + c] = static_cast<float>(value);
-            }
+            for (uint32_t d = 0u; d < actual_dof; ++d) solution[d] = jacobian[r * stride + d];
+            SolveMass(mass_factor, solution, static_cast<uint32_t>(actual_dof), stride);
+            for (uint32_t c = 0u; c < active; ++c) response[r * stride + c] = solution[dofs[c]];
         }
         for (uint32_t r = 0u; r < task_rows; ++r) {
             for (uint32_t c = 0u; c < active; ++c) {
@@ -1410,7 +1341,7 @@ Status OpApplyDynamicsDrives(const ModelView& model, const DataView& data,
         return Status::InvalidArgument;
     if (p->articulation_count == 0u || p->total_link_count == 0u || p->max_dof == 0u)
         return Status::Ok;
-    if (!data.m_inv || !data.control_mass || !data.control_factor || !data.control_jacobian ||
+    if (!data.m_factor || !data.control_mass || !data.control_factor || !data.control_jacobian ||
         !data.control_response || !data.control_task_map || !data.control_scratch || !data.env_status ||
         !model.joint_type || !model.articulation_link_offset || !model.articulation_link_count ||
         p->links_per_env == 0u || p->total_link_count % p->links_per_env != 0u)
@@ -1448,24 +1379,14 @@ Status OpReadoutDrives(const ModelView& model, const DataView& data,
     return LaunchOk(stream);
 }
 
-Status OpAbaForward(const ModelView& model, const DataView& data,
-                    const void* params, cudaStream_t stream) {
-    const auto* p = static_cast<const AbaForwardParams*>(params);
-    if (p == nullptr) {
-        return Status::Failed;
-    }
-    if (p->articulation_count == 0u || p->total_link_count == 0u) {
-        return Status::Ok;
-    }
-    const ArticulationDeviceState state = MakeArticulationDeviceState(
-        model, data, p->total_link_count, p->articulation_count);
-    const math::Vec3 gravity{p->gravity[0], p->gravity[1], p->gravity[2]};
-    dim3 grid(p->articulation_count);
-    dim3 block(kAbaBlockSize);
-    LaunchCuda(AbaPass1KinematicsKernel, grid, block, 0u, stream, state,
-               data.link_wrench, p->apply_link_wrench, MakeArticulationTreeView(model));
-    LaunchCuda(AbaPass2ArticulatedInertiaKernel, grid, block, 0u, stream, state);
-    LaunchCuda(AbaPass3AccelerationKernel, grid, block, 0u, stream, state, gravity);
+Status OpArticulationDynamics(const ModelView& model, const DataView& data,
+    const void* params, cudaStream_t stream) {
+    const auto* p = static_cast<const ArticulationDynamicsParams*>(params);
+    if (p == nullptr) return Status::Failed;
+    if (p->articulation_count == 0u || p->total_link_count == 0u) return Status::Ok;
+    const auto state = MakeArticulationDeviceState(model, data, p->total_link_count, p->articulation_count);
+    LaunchCuda(ArticulationDynamicsKernel, dim3(p->articulation_count), dim3(32u), 0u,
+        stream, state, data, MakeArticulationTreeView(model), *p);
     return LaunchOk(stream);
 }
 
@@ -1479,16 +1400,6 @@ Status OpIntegrateVelocity(const ModelView& model, const DataView& data,
         return Status::Ok;
     }
     const math::Vec3 gravity{p->gravity[0], p->gravity[1], p->gravity[2]};
-    if (p->total_link_count > 0u) {
-        const ArticulationDeviceState state = MakeArticulationDeviceState(
-            model, data, p->total_link_count, p->articulation_count);
-        const uint32_t blocks =
-            (p->total_link_count + kAbaBlockSize - 1u) / kAbaBlockSize;
-        // Joint and floating-base velocities occupy disjoint state.
-        LaunchCuda(IntegrateVelocityArticulationKernel, dim3(blocks),
-                   dim3(kAbaBlockSize), 0u, stream, state, p->dt,
-                   data.link_wrench, p->clear_body_forces, gravity);
-    }
     // Free-body inertia and velocity are updated before the shared contact solve.
     if (p->total_body_count > 0u) {
         const uint32_t blocks =
@@ -1611,16 +1522,13 @@ void RegisterNkAbaOps() {
     SetCudaOp(NkOp::ApplyDrives, &OpApplyDrives);
     SetCudaOp(NkOp::ApplyDynamicsDrives, &OpApplyDynamicsDrives);
     SetCudaOp(NkOp::ReadoutDrives, &OpReadoutDrives);
-    SetCudaOp(NkOp::AbaForward, &OpAbaForward);
+    SetCudaOp(NkOp::ArticulationDynamics, &OpArticulationDynamics);
     SetCudaOp(NkOp::IntegrateVelocity, &OpIntegrateVelocity);
     SetCudaOp(NkOp::FkWorldPoses, &OpFkWorldPoses);
     SetCudaOp(NkOp::FkLinkVelocities, &OpFkLinkVelocities);
     SetCudaOp(NkOp::IntegratePosition, &OpIntegratePosition);
 }
 
-// Umbrella: the explicit static-lib-safe registration of the whole M3b
-// articulation pipeline, called from RegisterCudaBackendEntry(). Idempotent
-// (SetCudaOp last-wins; re-registering the same fns is a no-op).
 void RegisterNkArticulationPipelineOps() {
     RegisterNkAbaOps();
     RegisterNkCrbaOps();
@@ -1640,7 +1548,6 @@ void RegisterNkArticulationPipelineOps() {
     RegisterNkReadoutOps();
     RegisterNkEnergyLedgerOps();
     RegisterNkSensorOps();
-    RegisterNkDiffsimBackwardOps();  // M9 T7: NkOp::StepBackward
 }
 
 } // namespace nuka::phi

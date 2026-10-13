@@ -6,7 +6,7 @@
 // Per-field layout descriptor table, indexed by FieldId. The Arena and
 // Model use this to compute deterministic 256B-aligned segment offsets
 // (per-unit multiplier x env_count x capacity x elem_size). owner picks
-// the buffer (Model device buffer vs Arena Persistent/Scratch/Tape).
+// the buffer (Model device buffer vs Arena Persistent/Scratch).
 
 #include <cstdint>
 
@@ -14,7 +14,7 @@
 
 namespace nuka::nk {
 
-enum class FieldArena : uint8_t { Persistent, Scratch, Tape };
+enum class FieldArena : uint8_t { Persistent, Scratch };
 enum class FieldOwner : uint8_t { Model, Data };
 // The count-unit a field is sized by. ArenaLayout/Model resolve each to a
 // concrete element count from the Model capacities x env_count.
@@ -56,24 +56,20 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 7, 28, 0},  // body_pose
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // body_inv_mass
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // contact_count
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 16, 1, 64, 0},  // rows
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // lambda
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m_inv
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // articulation_bias
+    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m_factor
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Particle, 1, 3, 12, 0},  // particle_pos
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // mat_buckets
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Body, 1, 1, 4, 0},  // mat_index
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_contact_wrench
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // qddot
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // tau
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // joint_force
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // joint_diagonal
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_velocity
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_acceleration
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_velocity_bias
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 36, 144, 0},  // link_xup
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 36, 144, 0},  // link_articulated_I
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_bias_force
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // link_u_spatial
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // joint_motion_subspace
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // drive_target
     {FieldArena::Persistent, FieldOwner::Data, FieldPer::Link, 1, 1, 4, 0},  // drive_stiffness
@@ -122,12 +118,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 3, 12, 0},  // contact_tangent1
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 3, 12, 0},  // contact_tangent2
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 8, 0},  // contact_material
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::SlotDof, 1, 1, 4, 0},  // jac_normal
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::SlotDof, 1, 1, 4, 0},  // jac_tangent1
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::SlotDof, 1, 1, 4, 0},  // jac_tangent2
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_meff_normal
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_meff_tangent1
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // contact_meff_tangent2
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 3, 1, 12, 0},  // contact_force
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 1, 1, 4, 0},  // ucontact_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_point
@@ -138,8 +128,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Env, 1, 1, 4, 0},  // row_count
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 32, 1, 128, 0},  // urows
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // chain_jacobian
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // row_minv_jt
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_meff
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_damping
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point
@@ -184,7 +172,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_tangent1
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ContactSlot, 4, 3, 48, 0},  // ucontact_tangent2
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // chain_jacobian_b
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowDof, 1, 1, 4, 0},  // row_minv_jt_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 1, 4, 0},  // row_cj_link_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_point_b
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::RowSlot, 1, 3, 12, 0},  // row_cj_dir_b
@@ -442,7 +429,6 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Link, 1, 6, 24, 0},  // energy_link_velocity
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // energy_qdot_free
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 1, 4, 0},  // vbd_force_residual_work
-    {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m_inv_coupled
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof2, 1, 1, 4, 0},  // m_reduced
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // mimic_root_dof
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::ArticulationDof, 1, 1, 4, 0},  // mimic_root_scale

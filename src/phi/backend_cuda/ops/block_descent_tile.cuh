@@ -254,7 +254,6 @@ __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, 
     const bool shared = row.a.kind == row.b.kind && row.a.index == row.b.index;
     const size_t at = size_t{slot} * p.max_dof;
     const auto* jacobian_b = static_cast<const float*>(data.chain_jacobian_b) + at;
-    const auto* inverse_b = static_cast<const float*>(data.row_minv_jt_b) + at;
     float response = 0.0f;
     bool valid = true;
     for (uint32_t i = 0u; i < (shared ? 1u : 2u); ++i) {
@@ -267,10 +266,9 @@ __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, 
                            angular.Dot(data.body_world_inv_inertia[side.index].Multiply(angular));
         } else if (side.kind == kNkSideArtic) {
             const auto* jacobian = i == 0u ? static_cast<const float*>(data.chain_jacobian) + at : jacobian_b;
-            const auto* inverse = i == 0u ? static_cast<const float*>(data.row_minv_jt) + at : inverse_b;
-            for (uint32_t dof = 0u; dof < p.max_dof; ++dof)
-                contribution = fmaf(shared ? jacobian[dof] + jacobian_b[dof] : jacobian[dof],
-                                    shared ? inverse[dof] + inverse_b[dof] : inverse[dof], contribution);
+            const float* const factor = data.m_factor + size_t{side.index} * p.max_dof * p.max_dof;
+            contribution = MassCoupling<float>(factor, p.max_dof, jacobian, jacobian,
+                                               shared ? jacobian_b : nullptr, shared ? jacobian_b : nullptr);
         }
         valid &= contribution >= 0.0f && isfinite(contribution);
         response += contribution;
@@ -432,14 +430,19 @@ __device__ void InitializeTile(ArticulationDeviceState state, DataView data, Blo
     const uint32_t first = c.env * p.rows_per_env;
     const uint32_t bound = ContactRowBound(data.contact_row_extent, c.env, p.contact_rows_per_env);
     uint32_t heads = 0u;
-    for (uint32_t base = 0u; base < p.rows_per_env; base += kTileLanes) {
-        const uint32_t local = base + c.lane;
-        const bool live = local < p.rows_per_env && (local >= p.contact_rows_per_env || local < bound);
-        const uint32_t flags = live ? rows[first + local].flags : 0u;
-        const bool head = (flags & nk::nk_row_flags::kActive) != 0u && (flags & nk::nk_row_flags::kBlockTangent) == 0u;
-        const uint32_t mask = __ballot_sync(~0u, head);
-        if (head) InitializeTileHead(data, p, s, c, first + local, heads + __popc(mask & ((1u << c.lane) - 1u)));
-        heads += __popc(mask);
+    for (uint32_t range = 0u; range < 2u; ++range) {
+        const uint32_t begin = range == 0u ? 0u : p.contact_rows_per_env;
+        const uint32_t end = range == 0u ? bound : p.rows_per_env;
+        for (uint32_t base = begin; base < end; base += kTileLanes) {
+            const uint32_t local = base + c.lane;
+            const uint32_t flags = local < end ? rows[first + local].flags : 0u;
+            const bool head = (flags & nk::nk_row_flags::kActive) != 0u &&
+                              (flags & nk::nk_row_flags::kBlockTangent) == 0u;
+            const uint32_t mask = __ballot_sync(~0u, head);
+            if (head) InitializeTileHead(data, p, s, c, first + local,
+                heads + __popc(mask & ((1u << c.lane) - 1u)));
+            heads += __popc(mask);
+        }
     }
     c.heads = heads;
     __syncwarp();
@@ -585,11 +588,12 @@ __device__ bool AssembleTileBlock(const TileContext& c, const TileBlock& b, floa
 // Cholesky factor in place: lane i keeps row i of L and the reciprocal of its diagonal; false at a
 // nonpositive pivot.
 template <uint32_t kN>
-__device__ bool FactorTileBlock(float (&h)[kN], float* inverse, uint32_t lane) {
+__device__ bool FactorTileBlock(float (&h)[kN], float* inverse, uint32_t lane, uint32_t dimension) {
     bool valid = true;
     float reciprocal = 0.0f;
 #pragma unroll
     for (uint32_t k = 0u; k < kN; ++k) {
+        if (k >= dimension) break;
         float value = h[k];
 #pragma unroll
         for (uint32_t j = 0u; j < k; ++j) value -= h[j] * __shfl_sync(~0u, h[j], k);
@@ -606,11 +610,12 @@ __device__ bool FactorTileBlock(float (&h)[kN], float* inverse, uint32_t lane) {
 
 // d = H^-1 g: forward substitution on L's rows, back substitution on its columns stored transposed.
 template <uint32_t kN>
-__device__ float SolveTileBlock(const float (&h)[kN], float inverse, float g, const TileContext& c) {
+__device__ float SolveTileBlock(const float (&h)[kN], float inverse, float g, const TileContext& c, uint32_t dimension) {
     constexpr uint32_t kS = kN + 1u;
     float r = g;
 #pragma unroll
     for (uint32_t j = 0u; j < kN; ++j) {
+        if (j >= dimension) break;
         const float y = __shfl_sync(~0u, r * inverse, j);
         r = c.lane == j ? y : c.lane > j ? fmaf(-h[j], y, r) : r;
         if (c.lane > j && c.lane < kN) c.factor[j * kS + c.lane] = h[j];
@@ -618,6 +623,7 @@ __device__ float SolveTileBlock(const float (&h)[kN], float inverse, float g, co
     __syncwarp();
 #pragma unroll
     for (uint32_t k = kN; k > 0u; --k) {
+        if (k > dimension) continue;
         const uint32_t j = k - 1u;
         const float x = __shfl_sync(~0u, r * inverse, j);
         const float l = c.lane < j ? c.factor[c.lane * kS + j] : 0.0f;
@@ -750,11 +756,11 @@ __device__ void DescendTileBlock(DataView data, BlockDescentSolveParams p, Block
             break;
         }
         if (converged) break;
-        if (!FactorTileBlock<kN>(h, &inverse, c.lane)) {
+        if (!FactorTileBlock<kN>(h, &inverse, c.lane, n)) {
             failure = nk::BlockSolveFailure::Factorization;
             break;
         }
-        const float d = SolveTileBlock<kN>(h, inverse, force, c);
+        const float d = SolveTileBlock<kN>(h, inverse, force, c, n);
         float mass_step = 0.0f;
 #pragma unroll
         for (uint32_t k = 0u; k < kN; ++k)

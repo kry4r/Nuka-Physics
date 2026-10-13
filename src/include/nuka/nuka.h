@@ -157,7 +157,7 @@ typedef struct nuka_world_desc_t {
     float    terrain_feature_cell;   // curriculum tile edge, m (0 => 6.0).
     // SolverConfig overrides (1:1 with nk::Pipeline::SolverConfig). Each 0 keeps the
     // engine default, so a zero-initialized desc takes today's code path unchanged.
-    uint32_t solver_vel_iters;             // 0 => 32.
+    uint32_t solver_vel_iters;             // 0 => automatic block-descent budget.
     uint32_t solver_pos_iters;             // 0 => 4.
     float    solver_contact_margin;        // 0.0 => cooked default; speculative margin, m.
     uint32_t solver_max_pairs;             // 0 => bodies_per_env * 4 broadphase emit cap.
@@ -223,7 +223,7 @@ typedef struct nuka_coupled_particles_desc_t {
     // World SolverConfig overrides (1:1 with nk::Pipeline::SolverConfig), so a coupled
     // scene can author the contact solve. Each 0 keeps the engine default, so a
     // zero-initialized desc takes the SAME code path as today (byte-identical):
-    // solver_vel_iters 0=>32, solver_pos_iters 0=>4, solver_contact_margin 0.0=>0.0,
+    // solver_vel_iters 0=>automatic budget, solver_pos_iters 0=>4, solver_contact_margin 0.0=>0.0,
     // solver_max_pairs 0=>0; baumgarte_max_velocity 0.0 keeps the cooked model default.
     uint32_t solver_vel_iters;
     uint32_t solver_pos_iters;
@@ -273,6 +273,12 @@ nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execut
 
 // Block-descent iterations of the contact solve, 1..65535; the timestep stays fixed.
 // A changed value invalidates the execution graph.
+// Set one template link's mass in all environments, preserving its COM and rotational inertia.
+nuka_result_t nuka_world_set_link_mass(nuka_world_handle world, uint32_t link_index, float mass);
+
+// Change uniform gravity Z for the next production step, preserving X/Y.
+nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z);
+
 nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32_t iterations);
 nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations);
 // Initialize struct_size and schema_version before querying execution information.
@@ -284,7 +290,7 @@ typedef struct nuka_device_resource_info_t {
 } nuka_device_resource_info_t;
 
 typedef struct nuka_world_resource_info_t {
-    uint64_t model_bytes, persistent_bytes, scratch_bytes, tape_bytes;
+    uint64_t model_bytes, persistent_bytes, scratch_bytes;
     uint32_t env_count, contacts_per_env, rows_per_env, dofs_per_articulation;
     uint32_t bodies_per_env, particles_per_env;
 } nuka_world_resource_info_t;

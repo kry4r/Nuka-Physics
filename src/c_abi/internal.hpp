@@ -10,12 +10,6 @@
 #include "rt/sensor_fidelity.hpp"
 #include "sensor/imaging.hpp"
 #include "phi/backend.hpp"
-// M9 T5/T6: the C-ABI world is now ONE generic nk::World (Scene->CookToModel->
-// nk::World). The diffsim + noise + set_link_mass paths still consume the legacy
-// ArticulationHostState/ArticulationDeviceState VIEW types as a kernel-parameter
-// surface (the M3b seam MakeArticulationDeviceStateFromViews builds that view
-// over the nk arena fields — algorithm/kernels untouched, proven bit-exact by
-// AbaReverse.NkArenaSeamForwardReverseBitExact), so articulation_state.hpp stays.
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/articulation/control_mode.hpp"
 #include "runtime/step_options.hpp"
@@ -52,7 +46,7 @@ namespace nuka::c_abi {
 nuka_result_t MapStatusToResult(phi::Status status) noexcept;
 
 struct DeviceRecord {
-    // Device ordinal shared by physics, noise and differentiable orchestration.
+    // Device ordinal shared by physics and noise.
     int device_id = 0;
 
     // The registry owns the device; this record owns the backend borrowed by worlds.
@@ -161,24 +155,8 @@ struct WorldRecord {
 
     DeviceRecord* device = nullptr;
 
-    // dt / gravity scalars (formerly the legacy WorldStepOptions). Read by the
-    // diffsim RolloutParams + the InvariantWorldView; written by set_gravity_z /
-    // the DR gravity poke. enable_contacts/iters fields are inert here (the nk
-    // Pipeline owns its op schedule) but kept so the InvariantWorldView ctor and
-    // the diffsim/noise paths compile unchanged.
     runtime::WorldStepOptions step_options;
 
-    // --- Transitional diffsim/noise host mirror (M9 named gap; deleted at T7) -
-    // The diffsim backward family + set_link_mass + per-episode DR still consume
-    // the cooked per-link inertia params (mass / diagonal_inertia / inertial_frame
-    // / joint_armature) as HOST data to build dI/dmass + rebuild a link's spatial
-    // inertia in place. These are sourced from the SAME cook the legacy create
-    // used (CookArticulations -> BuildArticulationHostState), so BuildMassParams /
-    // ResolveLinkInertiaParams / CaptureNominalBaseline stay BYTE-IDENTICAL. The
-    // device writes (set_link_mass / DR) go to the nk arena's LinkInertia field
-    // (FieldPtr), NOT a legacy device buffer. Retired when the backward op-ifies
-    // at T7 (the dI/dmass slope then rides the Model). The articulations[] topo +
-    // link_inertia + joint_armature are the only members consumed.
     runtime::articulation::ArticulationHostState articulation_host;
 
     uint32_t simulated_step_count = 0u;
@@ -188,10 +166,7 @@ struct WorldRecord {
     // Default 0 == NUKA_SOLVER_BACKEND_SELF_CG (the only shipping backend); the
     // reserved MINRES/GMRES values are rejected at the setter until their phases
     // land. Read at solver-construction time. A plain host scalar; no device state.
-    uint32_t sparse_solver_backend = 0u;
 
-    // Env count the World was cooked/built at (== nk::World::EnvCount()). Cached
-    // for the DR env-tiling math + the diffsim total_link_count derivation.
     uint32_t env_count = 1u;
     // Stage-1 control mode chosen at world creation. M9: only PDPosition is wired
     // onto the generic nk::World; non-PD modes (Torque/Velocity/ComputedTorque/

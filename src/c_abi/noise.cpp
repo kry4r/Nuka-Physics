@@ -192,9 +192,6 @@ nuka_result_t ApplyPerEpisodeRandomization(
             }
             const articulation::LinkSpatialInertia new_inertia =
                 articulation::MakeSpatialInertia(new_mass, diag, frame);
-            // Keep the single-env host mirror in sync (overwritten each env, last
-            // env's value wins -- the legacy behavior, the mirror is only the
-            // diffsim dI/dmass source which DR does not gate on).
             host.link_inertia[local] = new_inertia;
             if (device_inertia != nullptr) {
                 cudaError_t copy_status = cudaMemcpyAsync(
@@ -210,9 +207,7 @@ nuka_result_t ApplyPerEpisodeRandomization(
 
     // --- joint armature: nominal + offset, per-link (env-tiled) --------------
     // The arena JointArmature field is per:link (env-replicated). The host mirror
-    // + nominal baseline are single-env (indexed by `local`). Present on the
-    // articulation state but INERT in the contact-free tape forward; set for RL
-    // completeness + a consistent host/device mirror.
+    // + nominal baseline are single-env (indexed by `local`); both stay in sync.
     auto* device_armature =
         record.world->FieldPtr<float>(nuka::nk::FieldId::JointArmature);
     if (!host.joint_armature.empty() && device_armature != nullptr) {
@@ -244,18 +239,12 @@ nuka_result_t ApplyPerEpisodeRandomization(
 
     // --- gravity.z: nominal + offset (one world scalar; env 0's sample) ------
     // Gravity is a single world property -> the SAME offset applies to all envs
-    // (it cannot be per-env). Read by nuka_tape_create into RolloutParams.
+    // (it cannot be per-env); the step options carry it.
     {
         const noise::SampledRandomization sampled =
             noise::SampleEpisodeRandomization(cfg, 0u);
         record.step_options.gravity.z =
             record.dr_nominal_gravity_z + sampled.gravity_z_offset;
-        // friction_multiplier: M9 named gap. The legacy batched contact step
-        // params (the only friction host scalar) are gone; contact friction now
-        // lives on the nk Model material buckets, which DR does not yet poke. The
-        // single-env contact-free diffsim tape has no contact solve -> inert
-        // either way. RL contact DR (incl. friction) is rebuilt on the nk world
-        // at M10. restitution_offset: likewise no buffer in this path -> inert.
         (void)sampled;
     }
 

@@ -1,17 +1,7 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — explicit op-registration entry points (M3b).
-//
-// One function per op TU, all EXPLICITLY called from
-// RegisterNkArticulationPipelineOps() (articulation.cu), which itself is
-// called from cuda_backend.cu::RegisterCudaBackendEntry(). Explicit calls —
-// not static initializers — so the static-lib linker can never drop an op TU
-// (the same de-risk as the CUDA registry entry itself).
-// ---------------------------------------------------------------------------
 
 namespace nuka::phi {
 
-// Umbrella (articulation.cu): registers the whole M3b articulation pipeline.
 void RegisterNkArticulationPipelineOps();
 
 // Per-TU registrars.
@@ -33,6 +23,5 @@ void RegisterNkMpmOps();              // mpm.cu (MLS-MPM transfers)
 void RegisterNkReadoutOps();          // readout.cu
 void RegisterNkEnergyLedgerOps();
 void RegisterNkSensorOps();
-void RegisterNkDiffsimBackwardOps();  // diffsim_backward.cu (M9 T7)
 
 } // namespace nuka::phi

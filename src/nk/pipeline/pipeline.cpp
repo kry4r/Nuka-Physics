@@ -317,34 +317,32 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_apply_drives_.links_per_env = base_link_count;
         p_apply_drives_.mode = model.drive_mode;
 
-        p_aba_.gravity[0] = cfg.gravity[0];
-        p_aba_.gravity[1] = cfg.gravity[1];
-        p_aba_.gravity[2] = cfg.gravity[2];
-        p_aba_.articulation_count = articulation_cnt;
-        p_aba_.total_link_count = total_link_count;
-        p_aba_.apply_link_wrench = 1u;
+        p_dynamics_.gravity[0] = cfg.gravity[0];
+        p_dynamics_.gravity[1] = cfg.gravity[1];
+        p_dynamics_.gravity[2] = cfg.gravity[2];
+        p_dynamics_.articulation_count = articulation_cnt;
+        p_dynamics_.total_link_count = total_link_count;
+        p_dynamics_.apply_link_wrench = 1u;
+        p_dynamics_.dt = cfg.dt;
+        p_dynamics_.max_dof = max_dof;
+        p_dynamics_.integrate_velocity = 1u;
+        p_dynamics_.fold_drive_damping = p_apply_drives_.defer_velocity_damping;
+        p_dynamics_.reuse_mass = 0u;
         p_fk_.articulation_count = articulation_cnt;
         p_fk_.total_link_count = total_link_count;
 
         if (use_inverse_dynamics) {
             // Current kinematics and force-free acceleration share the same mass response.
             // Controllers remove passive damping from bias compensation.
-            p_aba_force_free_ = p_aba_;
-            p_aba_force_free_.apply_link_wrench = 0u;
+            p_dynamics_prepare_ = p_dynamics_;
+            p_dynamics_prepare_.apply_link_wrench = 0u;
+            p_dynamics_prepare_.integrate_velocity = 0u;
+            p_dynamics_prepare_.fold_drive_damping = 0u;
+            p_dynamics_.fold_drive_damping = 0u;
+            p_dynamics_.reuse_mass = 1u;
             add(phi::NkOp::FkWorldPoses, &p_fk_);
             add(phi::NkOp::ApplyDrives, &p_apply_drives_);
-            add(phi::NkOp::AbaForward, &p_aba_force_free_);
-
-            // Inverse dynamics and contacts consume the same physical M^-1.
-            p_crba_m_.dt = cfg.dt;
-            p_crba_m_.max_dof = max_dof;
-            p_crba_m_.articulation_count = articulation_cnt;
-            p_crba_m_.total_link_count = total_link_count;
-            p_crba_m_.fold_drive_damping = 0u;
-            add(phi::NkOp::CrbaComputeM, &p_crba_m_);
-            p_crba_factor_.max_dof = max_dof;
-            p_crba_factor_.articulation_count = articulation_cnt;
-            add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
+            add(phi::NkOp::ArticulationDynamics, &p_dynamics_prepare_);
 
             p_apply_dynamics_.max_dof = max_dof;
             p_apply_dynamics_.articulation_count = articulation_cnt;
@@ -354,11 +352,11 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             p_apply_dynamics_.links_per_env = base_link_count;
             std::copy(std::begin(cfg.gravity), std::end(cfg.gravity), p_apply_dynamics_.gravity);
             add(phi::NkOp::ApplyDynamicsDrives, &p_apply_dynamics_);
-            add(phi::NkOp::AbaForward, &p_aba_);
+            add(phi::NkOp::ArticulationDynamics, &p_dynamics_);
         } else {
             add(phi::NkOp::FkWorldPoses, &p_fk_);
             add(phi::NkOp::ApplyDrives, &p_apply_drives_);
-            add(phi::NkOp::AbaForward, &p_aba_);
+            add(phi::NkOp::ArticulationDynamics, &p_dynamics_);
         }
     }
 
@@ -725,28 +723,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         add(phi::NkOp::ContactTangentBasis, &p_tangent_);
     }
 
-    if (has_articulation && !use_inverse_dynamics) {
-        p_crba_m_.dt = cfg.dt;
-        p_crba_m_.max_dof = max_dof;
-        p_crba_m_.articulation_count = articulation_cnt;
-        p_crba_m_.total_link_count = total_link_count;
-        // Implicit actuators fold their impedance into the step's mass, so contacts, the
-        // position pass and the backward-Euler velocity all see the driven joints.
-        p_crba_m_.fold_drive_damping = p_apply_drives_.defer_velocity_damping;
-        add(phi::NkOp::CrbaComputeM, &p_crba_m_);
-        p_crba_factor_.max_dof = max_dof;
-        p_crba_factor_.articulation_count = articulation_cnt;
-        add(phi::NkOp::CrbaFactorM, &p_crba_factor_);
-        if (p_crba_m_.fold_drive_damping != 0u) {
-            p_apply_damping_.dt = cfg.dt;
-            p_apply_damping_.max_dof = max_dof;
-            p_apply_damping_.articulation_count = articulation_cnt;
-            p_apply_damping_.total_link_count = total_link_count;
-            add(phi::NkOp::ApplyImplicitDamping, &p_apply_damping_);
-        }
-    }
-
-    // Both mass paths have factored this step's mass and formed the step velocity.
+    // Coupled coordinates use the same mass factor and unconstrained step velocity.
     if (mimic_couplings > 0u) {
         p_mimic_reduce_.max_dof = max_dof;
         p_mimic_reduce_.articulation_count = articulation_cnt;

@@ -375,14 +375,13 @@ Json Distribution(std::vector<double> values) {
 
 Json Memory(nk::World& world) {
     Json memory = Json::Object(), fields = Json::Array();
-    uint64_t model_bytes = 0u, arena_bytes[3]{};
+    uint64_t model_bytes = 0u, arena_bytes[nk::Arena::kArenaCount]{};
     world.GetModel().ComputeModelSegments(&model_bytes);
     nk::Arena::ComputeSegments(world.GetModel().capacities, arena_bytes);
     memory.Set("model_bytes", Json::Int(model_bytes));
     memory.Set("persistent_bytes", Json::Int(arena_bytes[0]));
     memory.Set("workspace_bytes", Json::Int(arena_bytes[1]));
-    memory.Set("tape_bytes", Json::Int(arena_bytes[2]));
-    memory.Set("data_bytes", Json::Int(arena_bytes[0] + arena_bytes[1] + arena_bytes[2]));
+    memory.Set("data_bytes", Json::Int(arena_bytes[0] + arena_bytes[1]));
     memory.Set("state_sensor_bytes", Json::Int(world.StateSensors().StorageBytes()));
     for (const auto& segment : world.GetData().Segments()) {
         Json item = Json::Object();

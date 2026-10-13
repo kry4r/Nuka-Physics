@@ -1,24 +1,3 @@
-// ---------------------------------------------------------------------------
-// nuka::c_abi -- C ABI for the offscreen RECORDER (M8 T5).
-//
-// A RecorderRecord owns the whole M8 host frame-loop stack bound to a device:
-// the cooked nk::World (Decision D2 -- the recorder reads/steps nk::World, NOT
-// the legacy WorldRecord), the RenderWorld built from the SAME cook's Registry +
-// SceneMap, a HostDownloadPublisher, a VulkanRasterRenderer, and the Simulation
-// that drives them. nuka_recorder_capture runs N Simulation::Frame()s and dumps
-// each frame's raw RGBA framebuffer to a binary PPM P6; nuka_recorder_to_video
-// shells ffmpeg over the captured sequence.
-//
-// VULKAN GATING (Decision D5). EVERYTHING that touches the render stack lives
-// behind NK_BUILD_VULKAN_VALIDATION. With the flag OFF this TU still compiles
-// (it includes NO Vulkan/render headers) and every entry point returns
-// NUKA_RESULT_NOT_SUPPORTED -- libnuka stays buildable with zero Vulkan deps and
-// the python binding still imports. With the flag ON the real recorder + the
-// nuka_app / nuka_render link come in (see src/CMakeLists.txt).
-//
-// Mirrors the diffsim.cpp / union_world.cpp per-module pattern: a file-local
-// HandleTable, null-guard at every entry, try/catch -> MapExceptionToResult.
-// ---------------------------------------------------------------------------
 
 #include "nuka/nuka_recorder.h"
 

@@ -1,39 +1,3 @@
-// ---------------------------------------------------------------------------
-// v0.8 co-residence PEAK (commit 1/3) -- per-link/per-shape WORLD AABB extraction
-// from articulation FK, validated.
-// ---------------------------------------------------------------------------
-// The artic-link<->rigid broadphase PREREQUISITE that C2b's rigid<->rigid
-// candidate stream deliberately excluded (it had no per-link AABB). This test
-// proves src/collision/link_aabb.hpp:
-//
-//   BoundsUnderFkPoseSweep  -- cook the floating-base go2, sweep >=3 distinct
-//       articulation poses (perturb base orientation/position AND joint angles so
-//       the calf links rotate/translate), run FK at each, compute each foot
-//       sphere's world AABB via the module, and assert that surface samples of
-//       the sphere (axis + oblique directions, world-transformed) all lie inside
-//       [min,max]; plus EXACT tightness (extent == 2r) and non-vacuous (min<max),
-//       and that the feet actually MOVE across poses (no-op perturb would make
-//       the bounds check trivially pass).
-//   BoxAabbUnderRotation    -- a synthetic (MJX-free) box under nontrivial
-//       link+local rotations: assert the module AABB equals an INDEPENDENT
-//       8-corner reference computed in the test body, and that a rotated box's
-//       AABB is strictly LARGER than the axis-aligned one (proves the rotation --
-//       including the LOCAL rotation -- is actually handled, not dropped).
-//   CapsuleAabbContainsEndpoints -- a synthetic capsule: assert both spherical
-//       caps' surface samples lie inside the module AABB (the box/capsule paths
-//       feed commit 2's rigid box even though go2 itself has no capsule shape).
-//   DeterministicTwoRun     -- the go2 foot AABBs computed twice are byte-identical
-//       (D1), memcmp over the raw AABB span (dodges any struct-padding question).
-//   DeviceCoreMatchesHost   -- a __global__ kernel calls the HD core
-//       (Sphere/Box/Capsule) on-device and writes the AABBs back; we assert
-//       device == host. This is what makes "annotated __host__ __device__" mean
-//       "actually compiles + runs on the device" (commit 2 calls the core in a
-//       .cu) rather than merely compiling host-side here.
-//
-// VALIDATED-NOT-WIRED: nothing here touches world_stepper / the production
-// broadphase / the C2b BuildRigidCandidatePairs. The module is a standalone,
-// tested capability commit 2 consumes.
-// ---------------------------------------------------------------------------
 
 #include "collision/aabb.hpp"
 #include "collision/link_aabb.hpp"
@@ -45,7 +9,9 @@
 #include "phi/buffer.hpp"
 #include "phi/scoped_device_guard.hpp"
 #include <cuda_runtime.h>
-#include "runtime/articulation/articulation_contacts.hpp"  // UpdateWorldLinkPoses
+#include "nk/pipeline/world.hpp"
+#include "phi/op_schema.hpp"
+#include "scene/cook/cook_to_model.hpp"
 #include "runtime/articulation/articulation_state.hpp"
 #include "runtime/world_builder.hpp"
 #include "scene/canonical_types.hpp"
@@ -62,11 +28,6 @@
 
 namespace {
 
-// Test-only RAII device buffer over the phi v2 opaque Buffer*. Mirrors the legacy
-// phi::Buffer surface (Data/Size/CopyFromHost/CopyToHost, move-only) so the test
-// bodies stay byte-identical after the buffer sweep. Device-level DEFAULT
-// (stream-0) allocation; CopyFromHost/CopyToHost run on stream 0 exactly like the
-// legacy synchronous cudaMemcpy this replaces.
 class OwnedDeviceBuffer {
 public:
     OwnedDeviceBuffer() = default;
@@ -116,8 +77,6 @@ std::filesystem::path SourcePath(const char* relative_path) {
     return std::filesystem::path(NUKA_SOURCE_DIR) / relative_path;
 }
 
-// --- go2_float cook + FK helpers (mirrors test_foot_ground_subsume.cpp) --------
-
 struct CookedFloat {
     articulation::ArticulationHostState host;
     nuka::scene::CookedShapeTable shapes;  // the cooked shape table (foot spheres).
@@ -136,18 +95,30 @@ CookedFloat CookGo2Float() {
     return result;
 }
 
-// Run FK at the current host state and return the world pose of every link.
-// (Same idiom as test_foot_ground_subsume.cpp ForwardKinematics.)
-std::vector<Transform> ForwardKinematics(cudaStream_t context, int context_dev,
+std::vector<Transform> ForwardKinematics(cudaStream_t, int,
                                          const articulation::ArticulationHostState& host) {
-    const uint32_t link_count = host.TotalLinkCount();
-    auto device = articulation::UploadArticulationState(context, context_dev, host);
-    OwnedDeviceBuffer pose_buf(static_cast<size_t>(link_count) * sizeof(Transform));
-    articulation::UpdateWorldLinkPoses(context, context_dev, device.View(),
-                                       static_cast<Transform*>(pose_buf.Data()));
-    cudaStreamSynchronize(context);
-    std::vector<Transform> poses(link_count);
-    pose_buf.CopyToHost(poses.data(), poses.size() * sizeof(Transform));
+    auto* device = nuka::phi::InitBestDevice();
+    auto* backend = nuka::phi::DeviceInitBackend(device, nullptr);
+    const auto scene = nuka::import::LoadUsd(SourcePath("examples/scenes/go2_float.usda").string());
+    auto cooked = nuka::scene::cook::CookToModel(scene, 1u);
+    std::vector<Transform> poses(host.TotalLinkCount());
+    {
+        nuka::nk::World world(std::move(cooked.model), 1u, device, backend);
+        EXPECT_TRUE(world.Ready());
+        EXPECT_TRUE(world.GetData().UploadField(nuka::nk::FieldId::Q,
+            host.q.data(), host.q.size() * sizeof(float)));
+        EXPECT_TRUE(world.GetData().UploadField(nuka::nk::FieldId::BasePose,
+            host.base_pose.data(), host.base_pose.size() * sizeof(Transform)));
+        nuka::phi::FkWorldPosesParams params{};
+        params.articulation_count = host.ArticulationCount();
+        params.total_link_count = host.TotalLinkCount();
+        EXPECT_EQ(world.DispatchOp(nuka::phi::NkOp::FkWorldPoses, &params),
+                  nuka::phi::Status::Ok);
+        nuka::phi::BackendSynchronize(backend);
+        EXPECT_TRUE(world.GetData().DownloadField(nuka::nk::FieldId::LinkPose,
+            poses.data(), poses.size() * sizeof(Transform)));
+    }
+    nuka::phi::BackendFree(backend);
     return poses;
 }
 
@@ -172,9 +143,6 @@ std::array<Vec3, 13> SphereSampleDirs() {
 
 // --- the FK pose sweep: 4 distinct articulation poses --------------------------
 
-// Apply one of N distinct perturbations to a freshly-cooked host state: vary base
-// orientation AND position AND a couple of revolute joint angles so the calf
-// links genuinely rotate/translate between poses.
 void ApplyPosePerturbation(articulation::ArticulationHostState& host, int pose_idx) {
     // Base orientation: rotate about a mixed axis by a pose-dependent angle.
     const Vec3 axis{0.3f, 0.7f, 0.64807407f};  // ~unit mixed axis.
@@ -183,10 +151,6 @@ void ApplyPosePerturbation(articulation::ArticulationHostState& host, int pose_i
     host.base_pose[0].rotation = Quat::FromAxisAngle(axis, base_angles[pose_idx]);
     host.base_pose[0].position.z += base_dz[pose_idx];
 
-    // Joint angles: q is LINK-indexed (featherstone_aba.cu reads state.q[link]).
-    // Bend a couple of revolute links by a pose-dependent amount so the calves
-    // swing. We touch the last two revolute links (deep in the chain -> moves the
-    // feet a lot) -- skip link 0 (the floating-base root has no scalar q).
     const uint32_t link_count = host.TotalLinkCount();
     const float joint_angles[4] = {0.0f, 0.4f, -0.6f, 0.9f};
     if (link_count >= 3u) {
@@ -196,7 +160,7 @@ void ApplyPosePerturbation(articulation::ArticulationHostState& host, int pose_i
 }
 
 TEST(LinkAabb, BoundsUnderFkPoseSweep) {
-    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const cudaStream_t context = nullptr;
     const int context_dev = 0;
     const auto base_cooked = CookGo2Float();
     const auto foot_shapes = FootSphereShapes(base_cooked);
@@ -220,12 +184,6 @@ TEST(LinkAabb, BoundsUnderFkPoseSweep) {
         const auto extracted =
             ExtractLinkShapeAabbs(cooked.shapes, poses, cooked.host.link_body);
 
-        // go2_float's link collision shapes are 4 foot SPHERES + 1 base CUBE
-        // (base_collision on the floating-base root link). ExtractLinkShapeAabbs
-        // emits ALL link-mapped Sphere/Box/Capsule shapes, so the count is
-        // foot_shapes + the base box -- NOT foot_shapes alone. Recompute the
-        // expected count from the cooked table so this stays correct if the asset's
-        // shape set changes, and assert both the feet AND the base box are present.
         uint32_t expected = 0u;
         for (uint32_t s = 0u; s < cooked.shapes.types.size(); ++s) {
             const ShapeType t = cooked.shapes.types[s];
@@ -301,11 +259,6 @@ TEST(LinkAabb, BoundsUnderFkPoseSweep) {
                     EXPECT_GE(p.z, box.min.z - kEps);
                 }
             } else if (type == ShapeType::Box) {
-                // The base cube under REAL FK: assert the module's world AABB bounds
-                // all 8 world corners computed via the INDEPENDENT engine Quat path
-                // (cross-validates the module's RotateByQuat composition vs
-                // Quat::Rotate/operator* under a live FK pose; BoxAabbUnderRotation
-                // covers it only synthetically).
                 const Vec3 he = shape < cooked.shapes.half_extents.size()
                                     ? cooked.shapes.half_extents[shape]
                                     : Vec3::Zero();
@@ -484,10 +437,8 @@ TEST(LinkAabb, CapsuleAabbContainsEndpoints) {
     EXPECT_LE(worst_outside, kEps);
 }
 
-// --- D1 determinism ------------------------------------------------------------
-
 TEST(LinkAabb, DeterministicTwoRun) {
-    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const cudaStream_t context = nullptr;
     const int context_dev = 0;
     const auto cooked = CookGo2Float();
 
@@ -509,11 +460,6 @@ TEST(LinkAabb, DeterministicTwoRun) {
 
 // --- device-callability proof (HD core on the GPU == host) ---------------------
 
-// One thread per shape-kind: call the HD core ShapeWorldAabb on the device for a
-// Sphere/Box/Capsule with fixed params and write each AABB out. If the HD path
-// touched any host-only / non-HD method, THIS kernel would fail to compile --
-// which is exactly the failure commit 2 (calling the core in a .cu) would
-// otherwise be the first to hit.
 __global__ void DeviceCoreKernel(Transform link, Transform local,
                                  Vec3 half_extents, float radius, float half_height,
                                  AABB* out /* [3]: sphere, box, capsule */) {
@@ -527,7 +473,7 @@ __global__ void DeviceCoreKernel(Transform link, Transform local,
 }
 
 TEST(LinkAabb, DeviceCoreMatchesHost) {
-    const cudaStream_t context = nullptr;  // BUF-14: stream 0
+    const cudaStream_t context = nullptr;
     const int context_dev = 0;
 
     const Transform link{Vec3{0.7f, -1.3f, 0.9f},
@@ -554,16 +500,6 @@ TEST(LinkAabb, DeviceCoreMatchesHost) {
     AABB dev_out[3];
     out_buf.CopyToHost(dev_out, sizeof(dev_out));
 
-    // Device == host to fp tolerance -- NOT byte-identical. nvcc contracts
-    // multiply-adds (fmad=true) on the device, so the cross-product / quaternion-
-    // rotate arithmetic in the HD core lands a few ULP off the host's IEEE path
-    // (the same host/device non-bitexactness C4a documented). That is fine here:
-    // an AABB feeds a broadphase, which never compares a host- against a device-
-    // computed bound (production computes them on ONE side; within-path D1 is
-    // covered by DeterministicTwoRun). What this test PROVES is the contract that
-    // matters -- the HD core COMPILES + RUNS on the device and agrees with the
-    // verified host result. (A bit-exact device path would need --fmad=false on
-    // this TU; not warranted for a broadphase bound.)
     float max_diff = 0.0f;
     for (int s = 0; s < 3; ++s) {
         max_diff = std::max({max_diff,

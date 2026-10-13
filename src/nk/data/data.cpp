@@ -49,10 +49,9 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::BodyPose:            v.body_pose = static_cast<math::Transform*>(p); break;
         case FieldId::BodyInvMass:         v.body_inv_mass = static_cast<float*>(p); break;
         case FieldId::ContactCount:        v.contact_count = static_cast<uint32_t*>(p); break;
-        case FieldId::Rows:                v.rows = static_cast<float*>(p); break;
         case FieldId::Lambda:              v.lambda = static_cast<float*>(p); break;
-        case FieldId::MInv:                v.m_inv = static_cast<float*>(p); break;
-        case FieldId::MInvCoupled:         v.m_inv_coupled = static_cast<float*>(p); break;
+        case FieldId::ArticulationBias: v.articulation_bias = static_cast<float*>(p); break;
+        case FieldId::MFactor:                v.m_factor = static_cast<float*>(p); break;
         case FieldId::MReduced:            v.m_reduced = static_cast<float*>(p); break;
         case FieldId::MimicRootDof:        v.mimic_root_dof = static_cast<uint32_t*>(p); break;
         case FieldId::MimicRootScale:      v.mimic_root_scale = static_cast<float*>(p); break;
@@ -63,15 +62,11 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::LinkContactWrench:   v.link_contact_wrench = static_cast<Spatial6*>(p); break;
         case FieldId::Qddot:               v.qddot = static_cast<float*>(p); break;
         case FieldId::Tau:                 v.tau = static_cast<float*>(p); break;
-        case FieldId::JointForce:          v.joint_force = static_cast<float*>(p); break;
-        case FieldId::JointDiagonal:       v.joint_diagonal = static_cast<float*>(p); break;
         case FieldId::LinkVelocity:        v.link_velocity = static_cast<Spatial6*>(p); break;
         case FieldId::LinkAcceleration:    v.link_acceleration = static_cast<Spatial6*>(p); break;
         case FieldId::LinkVelocityBias:    v.link_velocity_bias = static_cast<Spatial6*>(p); break;
         case FieldId::LinkXup:             v.link_xup = static_cast<Mat36*>(p); break;
-        case FieldId::LinkArticulatedI:    v.link_articulated_I = static_cast<Mat36*>(p); break;
         case FieldId::LinkBiasForce:       v.link_bias_force = static_cast<Spatial6*>(p); break;
-        case FieldId::LinkUSpatial:        v.link_u_spatial = static_cast<Spatial6*>(p); break;
         case FieldId::JointMotionSubspace: v.joint_motion_subspace = static_cast<Spatial6*>(p); break;
         case FieldId::VelocityTarget: v.velocity_target = static_cast<float*>(p); break;
         case FieldId::AccelerationTarget: v.acceleration_target = static_cast<float*>(p); break;
@@ -95,9 +90,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::SnapshotQdot:        v.snapshot_qdot = static_cast<float*>(p); break;
         case FieldId::SnapshotLinkVelocity:v.snapshot_link_velocity = static_cast<Spatial6*>(p); break;
         case FieldId::SnapshotBasePose:    v.snapshot_base_pose = static_cast<math::Transform*>(p); break;
-        // M7 T1: movable rigid-body snapshot fields (restore source for the M7
-        // settle consumer). Bound here so OpSnapshotState/OpRestoreState/
-        // OpResetEnvs see live arena pointers (the M5-binding-bug class).
         case FieldId::SnapshotBodyPose:    v.snapshot_body_pose = static_cast<math::Transform*>(p); break;
         case FieldId::SnapshotBodyLinearVelocity:  v.snapshot_body_linear_velocity = static_cast<math::Vec3*>(p); break;
         case FieldId::SnapshotBodyAngularVelocity: v.snapshot_body_angular_velocity = static_cast<math::Vec3*>(p); break;
@@ -133,12 +125,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::ContactTangent1:     v.contact_tangent1 = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactTangent2:     v.contact_tangent2 = static_cast<math::Vec3*>(p); break;
         case FieldId::ContactMaterial:     v.contact_material = static_cast<uint64_t*>(p); break;
-        case FieldId::JacNormal:           v.jac_normal = static_cast<float*>(p); break;
-        case FieldId::JacTangent1:         v.jac_tangent1 = static_cast<float*>(p); break;
-        case FieldId::JacTangent2:         v.jac_tangent2 = static_cast<float*>(p); break;
-        case FieldId::ContactMeffNormal:   v.contact_meff_normal = static_cast<float*>(p); break;
-        case FieldId::ContactMeffTangent1: v.contact_meff_tangent1 = static_cast<float*>(p); break;
-        case FieldId::ContactMeffTangent2: v.contact_meff_tangent2 = static_cast<float*>(p); break;
         case FieldId::ContactForce:        v.contact_force = static_cast<float*>(p); break;
         case FieldId::ContactSideAKind:    v.contact_side_a_kind = static_cast<uint32_t*>(p); break;
         case FieldId::ContactSideBKind:    v.contact_side_b_kind = static_cast<uint32_t*>(p); break;
@@ -188,15 +174,12 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::RowCount:            v.row_count = static_cast<uint32_t*>(p); break;
         case FieldId::Urows:               v.urows = static_cast<float*>(p); break;
         case FieldId::ChainJacobian:       v.chain_jacobian = static_cast<float*>(p); break;
-        case FieldId::RowMinvJt:           v.row_minv_jt = static_cast<float*>(p); break;
-        case FieldId::RowMeff:             v.row_meff = static_cast<float*>(p); break;
         case FieldId::RowDamping:          v.row_damping = static_cast<float*>(p); break;
         case FieldId::RowCjLink:           v.row_cj_link = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPoint:          v.row_cj_point = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCjDir:            v.row_cj_dir = static_cast<math::Vec3*>(p); break;
         // S2 (general contact pipeline Phase 1B): the second per-side arm fields.
         case FieldId::ChainJacobianB:      v.chain_jacobian_b = static_cast<float*>(p); break;
-        case FieldId::RowMinvJtB:          v.row_minv_jt_b = static_cast<float*>(p); break;
         case FieldId::RowCjLinkB:          v.row_cj_link_b = static_cast<uint32_t*>(p); break;
         case FieldId::RowCjPointB:         v.row_cj_point_b = static_cast<math::Vec3*>(p); break;
         case FieldId::RowCjDirB:           v.row_cj_dir_b = static_cast<math::Vec3*>(p); break;

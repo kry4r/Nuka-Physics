@@ -3,30 +3,6 @@
 # ---------------------------------------------------------------------------
 include(GoogleTest)
 
-# ---------------------------------------------------------------------------
-# M9 T14 -- test-suite reorganization
-# ---------------------------------------------------------------------------
-# 95 per-feature test exes -> 5 CATEGORY exes (oracle / scenario / perf / import
-# / render) with fast/full/perf LABELS.
-#
-# LABEL SCHEME (single-token, ctest -L is a REGEX so substrings match):
-#   full      -> EVERY test (the comprehensive run). Applied to all.
-#   fast_full -> the quick unit/oracle subset. `-L fast` matches it; `-L full`
-#                matches it too (contains "full").
-#   perf_full -> the throughput/timing gates. `-L perf` matches it; `-L full` too.
-# Therefore `-L full` == the whole suite, `-L full` + `-L perf` cover everything,
-# and `-L fast` is the quick subset. (A multi-value LABELS list cannot survive
-# gtest_discover_tests serialization in CMake 3.30 -- add_command flattens it --
-# so the tier is encoded in ONE token instead. See M9 T14 report.)
-#
-# SHARED VALIDATED-NOT-WIRED SOURCES
-# ----------------------------------
-# L1-c: the nuka_test_validated_sources static support lib was DELETED. It existed
-# to fold src/scene/cook/union_nk_model.cpp (the UnionCsr BuildNkUnionModel bridge)
-# + contact_stream_driver.cpp into ONE lib for the union grasp/perf gates. The
-# union path + union_nk_model.cpp are gone (cup-grasping moved to RL); the foot
-# collision/solver gates that still need contact_stream_driver.cpp compile it
-# directly as a per-exe extra source (they always did), so no shared lib remains.
 
 # --- Smoke test -----------------------------------------------------------
 add_executable(nuka_smoke_test
@@ -104,7 +80,6 @@ if(TARGET nuka)
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             PROPERTIES LABELS "fast_full")
 
-        # --- Multi-env C ABI surface (p01-F T7) ---------------------------
         add_executable(nuka_multi_env_world_test
             c_abi/test_multi_env_world.cpp
         )
@@ -276,33 +251,7 @@ if(TARGET nuka)
         message(STATUS "Skipping nuka.hpp RAII test: nuka::expected wrapper failed to compile")
     endif()
 
-    # --- v0.5 p02-B/C: differentiable rollout tape C ABI (runtime coverage) ---
-    add_executable(nuka_diffsim_tape_cabi_test
-        c_abi/test_diffsim_tape.cpp
-    )
 
-    target_compile_definitions(nuka_diffsim_tape_cabi_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_include_directories(nuka_diffsim_tape_cabi_test
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src/include
-    )
-
-    target_link_libraries(nuka_diffsim_tape_cabi_test
-        PRIVATE
-            nuka
-            CUDA::cudart
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_diffsim_tape_cabi_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.5 p04 N1: C-ABI sensor-noise surface (NONE no-op + apply + D1) ----
     add_executable(nuka_sensor_noise_cabi_test
         c_abi/test_sensor_noise.cpp
     )
@@ -328,10 +277,6 @@ if(TARGET nuka)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
-    # --- v0.5 p04 N2: per-episode domain randomization (sampling + apply + D1) -
-    # Reads c_abi/internal.hpp (WorldRecord) for mass/gravity readback + calls
-    # SampleEpisodeRandomization directly (nuka_sensor_noise), so it needs the
-    # src/ include + the runtime libs (same pattern as the mass-setter FD test).
     if(CMAKE_CUDA_COMPILER)
         add_executable(nuka_n2_domain_randomization_test
             sensor/test_n2_domain_randomization.cpp
@@ -353,7 +298,7 @@ if(TARGET nuka)
                 nuka
                 nuka_sensor_noise
                 nuka_runtime
-                nuka_articulation_gpu
+                nuka_contact_wrench
                 nuka_core
                 nuka_phi
                 CUDA::cudart
@@ -365,65 +310,12 @@ if(TARGET nuka)
             PROPERTIES LABELS "full")
     endif()
 
-    # --- v0.5 p04-A0: runtime link-mass setter + C-ABI mass-gradient FD proof --
-    # Operations under test are pure C-ABI (set_link_mass / step_with_tape /
-    # tape_backward); the internal libs are linked only for setup + reading the
-    # tape-evolved device state (the same readback pattern every diffsim test
-    # uses). Includes src/ for the c_abi/internal.hpp WorldRecord bridge.
     if(CMAKE_CUDA_COMPILER)
-        add_executable(nuka_diffsim_mass_setter_fd_test
-            diffsim/test_mass_setter_fd.cpp
-        )
 
-        target_compile_definitions(nuka_diffsim_mass_setter_fd_test
-            PRIVATE
-                NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-        )
 
-        target_include_directories(nuka_diffsim_mass_setter_fd_test
-            PRIVATE
-                ${CMAKE_SOURCE_DIR}/src/include
-                ${CMAKE_SOURCE_DIR}/src
-        )
-
-        target_link_libraries(nuka_diffsim_mass_setter_fd_test
-            PRIVATE
-                nuka
-                nuka_diffsim
-                nuka_runtime
-                nuka_articulation_gpu
-                nuka_core
-                nuka_phi
-                CUDA::cudart
-                GTest::gtest_main
-        )
-
-        gtest_discover_tests(nuka_diffsim_mass_setter_fd_test
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-            PROPERTIES LABELS "full")
     endif()
 endif()
 
-# =====================================================================
-# CATEGORY EXE 4/5: nuka_import_test -- cooker / scene / import (HOST).
-# Consolidates the pure-host scene-unit + importer + V-HACD + sparse-SDF cooker
-# gtest suites into ONE exe (all link nuka_scene/nuka_import/nuka_cooker; the
-# visual-mesh cook consumer adds nuka_render). No ODR collisions (distinct suite
-# names + no cross-file global-helper clashes -- verified M9 T14).
-#
-# NOTE: the 3 .nks/.nka roundtrip "whole-exe" gates (SceneRoundtrip,
-# NksGraspSceneRoundtrip, VisualMeshCook) stay as their OWN add_test(NAME) exes
-# below -- they are registered as single whole-binary ctest entries (NOT
-# gtest_discover'd); folding them into this gtest exe would re-expose their 12
-# inner TEST()s as 12 ctest entries (3 -> 12), CHANGING the count. Kept separate
-# to preserve the exact 663 ctest count. The CUDA-region cooker/scene/c_abi
-# members (scene_compose_h1, fluid_cooker, the c_abi gtests) also
-# stay separate (they live behind if(CMAKE_CUDA_COMPILER); not folded here to
-# avoid a cross-region restructure -- still labeled).
-# =====================================================================
-# M9 T11: test_scene_pipeline.cpp (the deleted ScenePipeline orphan) dropped; the
-# scene unit files only need compose/scene_ir/cooker (nuka_scene). vhacd_test_meshes.hpp
-# needs the source-root include dir (added below for the V-HACD sources).
 
 # --- M2c scenario gate: .nks/.nka scene roundtrip fidelity -----------------
 # Import -> Compose -> Save(.nks+.nka) -> Load -> assert structural + cook
@@ -487,7 +379,7 @@ target_link_libraries(nuka_editor_undo_roundtrip_test
         nuka_runtime
         nuka_import
         nuka_cooker
-        nuka_articulation_gpu
+        nuka_contact_wrench
         nuka_collision_gpu
         nuka_core
         nuka_phi
@@ -520,7 +412,7 @@ target_link_libraries(nuka_editor_spawn_roundtrip_test
         nuka_runtime
         nuka_import
         nuka_cooker
-        nuka_articulation_gpu
+        nuka_contact_wrench
         nuka_collision_gpu
         nuka_core
         nuka_phi
@@ -553,7 +445,7 @@ target_link_libraries(nuka_editor_delete_preserve_test
         nuka_runtime
         nuka_import
         nuka_cooker
-        nuka_articulation_gpu
+        nuka_contact_wrench
         nuka_collision_gpu
         nuka_core
         nuka_phi
@@ -584,7 +476,7 @@ target_link_libraries(nuka_editor_reset_roundtrip_test
         nuka_runtime
         nuka_import
         nuka_cooker
-        nuka_articulation_gpu
+        nuka_contact_wrench
         nuka_collision_gpu
         nuka_core
         nuka_phi
@@ -616,7 +508,7 @@ target_link_libraries(nuka_editor_debug_overlay_test
         nuka_runtime
         nuka_import
         nuka_cooker
-        nuka_articulation_gpu
+        nuka_contact_wrench
         nuka_collision_gpu
         nuka_core
         nuka_phi
@@ -648,7 +540,7 @@ target_link_libraries(nuka_editor_teleop_test
         nuka_runtime
         nuka_import
         nuka_cooker
-        nuka_articulation_gpu
+        nuka_contact_wrench
         nuka_collision_gpu
         nuka_core
         nuka_phi
@@ -694,7 +586,7 @@ if(Python3_FOUND)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -705,10 +597,6 @@ if(Python3_FOUND)
         PROPERTIES LABELS "full")
 endif()
 
-# --- M7 T3: the committed union grasp scene roundtrip + content gate. Loads
-# examples/scenes/h1_cup_table.nks (H1 via imports + cup + table + grasp config
-# + initial_state + settle) and asserts byte-identical re-save + section
-# exposure. Same lightweight deps as SceneRoundtrip (no factory).
 add_executable(nuka_nks_grasp_scene_roundtrip_test
     scenario/nks_grasp_scene_roundtrip.cpp
 )
@@ -724,11 +612,6 @@ add_test(NAME NksGraspSceneRoundtrip
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 set_tests_properties(NksGraspSceneRoundtrip PROPERTIES LABELS "fast_full")
 
-# --- M8.5 T5: the VISUAL-MESH COOK gate. Cooks go2 (+ h1_with_hand if present)
-# import -> .nks/.nka Save -> Load -> BuildRenderWorld and asserts the robot
-# renders as REAL .nka MESH triangles (MeshSource::NkaMesh), not placeholder
-# boxes. Scene-side only (no Vulkan device needed); links nuka_render for
-# BuildRenderWorld (the consumer) which is host-only.
 add_executable(nuka_visual_mesh_cook_smoke_test
     scenario/visual_mesh_cook_smoke.cpp
 )
@@ -812,8 +695,6 @@ target_link_libraries(nuka_import_test
 gtest_discover_tests(nuka_import_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     PROPERTIES LABELS "fast_full")
 
-# M9 T14: nuka_scene_test, nuka_vhacd_test, nuka_sparse_sdf_test MERGED into
-# nuka_import_test above (the host import/scene/cooker category exe).
 
 # --- Collision tests -------------------------------------------------------
 add_executable(nuka_collision_test
@@ -923,9 +804,8 @@ target_link_libraries(nuka_oracle_test
     PRIVATE
         nuka_runtime
         nuka_import
-        $<$<TARGET_EXISTS:nuka_articulation_gpu>:nuka_articulation_gpu>
+        $<$<TARGET_EXISTS:nuka_contact_wrench>:nuka_contact_wrench>
         $<$<TARGET_EXISTS:nuka_phi>:nuka_phi>
-        # M3b: the nk::World drive entries (CookToModel -> nk core -> phi v2).
         $<$<TARGET_EXISTS:nuka_scene_cook>:nuka_scene_cook>
         GTest::gtest_main
 )
@@ -991,10 +871,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_codegen_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "fast_full")
 
-    # --- V3 FD adjoint validation: all four base row classes (v0.5 p01) ------
-    # maximal_drive (dense), maximal_joint (dense), maximal_contact +
-    # featherstone_contact (stop_grad_on_event). Each validates the GENERATED
-    # primal/adjoint pair against a central-difference numerical Jacobian.
     add_executable(nuka_adjoint_fd_test
         codegen/test_adjoint_fd_maximal_drive.cpp
         codegen/test_adjoint_fd_maximal_joint.cpp
@@ -1065,21 +941,7 @@ if(CMAKE_CUDA_COMPILER)
     add_test(NAME phi2_smoke COMMAND nuka_phi2_smoke_test)
     set_tests_properties(phi2_smoke PROPERTIES LABELS "fast_full")
 
-    # M9 T11: nuka_h1_union_parity_test DELETED (deletion-order step 2). Its nk-vs-
-    # legacy coresident union-world step-0/window parity dies with the legacy class
-    # (golden/nk path is authority; the M7 vel-window benign-vs-masking verdict was
-    # rendered in T10 PART A while the oracle was alive). Its UNIQUE non-legacy
-    # coverage -- the union StepPlanned==Step plan-replay D1 -- was FOLDED into
-    # tests/scenario/h1_grasp_lift.cpp (T10 PART B).
 
-    # --- M8 T4: render_frame_loop_smoke — the frame-loop SPINE smoke
-    # (PosePublisher + systems + Simulation, nuka_app). The G5 render-OFF
-    # byte-identity assertion runs in the DEFAULT build (NOT behind the Vulkan
-    # flag); the G1 publish-contract + non-bg-pixels assertions are #ifdef'd on
-    # NK_BUILD_VULKAN_VALIDATION inside the source (they need a real raster
-    # device). The executable links nuka_app (the spine under test) + the .nks
-    # cook path (CookToModel in nuka_scene_cook, nks::Load in nuka_import) +
-    # nuka_render (BuildRenderWorld / RenderWorld). Asset-gated SKIP.
     add_executable(nuka_render_frame_loop_smoke_test
         scenario/render_frame_loop_smoke.cpp
     )
@@ -1102,7 +964,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -1149,7 +1011,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime_gpu
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_phi2_rt
             nuka_core
@@ -1161,16 +1023,6 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "perf_full")
 
-    # =====================================================================
-    # CATEGORY EXE 2/5: nuka_scenario_test -- physics integration SCENARIOS.
-    # Consolidates the nk-physics integration cluster: cook-settle determinism, nk
-    # particle/soft-fluid equivalence, the multi-dog + PairDriven general-path
-    # gates, and the general-path V-PROOFs. L1-c DELETED the UnionCsr-path members
-    # (coupled_grasp_soft / test_coupling_framework / test_pbd_costep_unified --
-    # the hand-assembled UnionSlot co-step gates -- plus the .nks union grasp gates
-    # h1_grasp_lift / union_cook_golden); cup-grasping moved to RL. All sources are
-    # anon-namespaced with distinct TEST suites (no ODR / name collision -- M9 T14).
-    # =====================================================================
     add_executable(nuka_scenario_test
         scenario/cook_settle_determinism.cpp
         scenario/cloth_on_box.cpp
@@ -1215,10 +1067,6 @@ if(CMAKE_CUDA_COMPILER)
         # EDGE settles finite + no 穿模 (the exact gate2 explosion fix); per-cell
         # TRIANGLE_PRISM contacts via the EXISTING cvx GJK/EPA; two-run identity.
         scenario/pairdriven_heightfield.cpp
-        # V-PROOF (one-general-solver-spec §4/§L0): physical-validity harness for the
-        # GENERAL contact path (PairDriven + CookHeightfieldGrid) on go2 feet-on-
-        # ground / terrain. (L1-b deleted the FUSED reference half; these now assert
-        # the general path alone is finite + feet-load + no-sink.)
         scenario/vproof_go2_ground.cpp
         scenario/vproof_go2_terrain.cpp
         scenario/vproof_h1_grasp.cpp
@@ -1279,7 +1127,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -1307,16 +1155,6 @@ if(CMAKE_CUDA_COMPILER)
         PROPERTIES LABELS "fast_full")
 
 
-    # M9 T14: nuka_cook_settle_determinism_test MERGED into nuka_scenario_test
-    # (scenario/cook_settle_determinism.cpp; the scenario category exe above).
-
-    # --- M7 T5b: the H1 x cup x kitchen-counter compose gate, UPGRADED to the
-    # FULL .nks pipeline (Compose -> FindRestPlacement seat -> Save(.nks+.nka) ->
-    # re-Save byte-identity -> Load -> CookToModel -> nk::World -> Step). GTEST_SKIPs
-    # without .nuka-assets / a CUDA backend. Moved out of nuka_scene_test (CUDA-free)
-    # into the CUDA region for the cook+World step. Flags the kitchen-scale cook gap
-    # (single-articulation cook can't represent the whole-body H1; the union
-    # h1_cup_table.nks path owns the real grasp world).
     add_executable(nuka_scene_compose_h1_cup_table_test
         scene/test_scene_compose_h1_cup_table.cpp
     )
@@ -1339,10 +1177,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_scene_compose_h1_cup_table_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
-
-    # M9 T14: nuka_nk_particle_equivalence_test + nuka_nk_soft_fluid_coresidence_test
-    # MERGED into nuka_scenario_test (scenario/nk_particle_equivalence.cpp +
-    # scenario/nk_soft_fluid_coresidence.cpp; the scenario category exe above).
 
 
     # --- .nks /script node roundtrip. Host/CPU only (no device step): Saves/Loads a
@@ -1368,40 +1202,27 @@ if(CMAKE_CUDA_COMPILER)
     set_tests_properties(NksScriptRoundtrip PROPERTIES LABELS "fast_full")
 
 
-    # --- v0.7 p10-B: PBF fluid COOKER (programmatic FluidBoxSpec -> particles) --
-    # PURE host/CPU: cooks a box volume + asserts the hand-computed lattice count,
-    # the uniform mass = rest_density*spacing^3, cell-centered placement, two-cook
-    # byte-identical determinism, degenerate-spec empties, and the optional
-    # inscribed-sphere carve. Links nuka_runtime_gpu because the fluid cooker +
-    # PbfParticleSet live there (the lib is CUDA-language, hence inside the
-    # CMAKE_CUDA_COMPILER guard) -- but the test itself runs no device code.
-    add_executable(nuka_fluid_cooker_test
-        import/test_fluid_cooker.cpp
+    # Particle volume cooker: lattice count, uniform mass, placement and sphere carve.
+    # Host-only, but the cooker lives in the CUDA-language nuka_runtime_gpu lib.
+    add_executable(nuka_particle_volume_cooker_test
+        import/test_particle_volume_cooker.cpp
     )
 
-    target_include_directories(nuka_fluid_cooker_test
+    target_include_directories(nuka_particle_volume_cooker_test
         PRIVATE
             ${CMAKE_SOURCE_DIR}
             ${CMAKE_SOURCE_DIR}/src
     )
 
-    target_link_libraries(nuka_fluid_cooker_test
+    target_link_libraries(nuka_particle_volume_cooker_test
         PRIVATE
             nuka_runtime_gpu
             GTest::gtest_main
     )
 
-    gtest_discover_tests(nuka_fluid_cooker_test
+    gtest_discover_tests(nuka_particle_volume_cooker_test
         PROPERTIES LABELS "fast_full")
 
-
-    # --- v0.7 p08-A: GPU upload of cooked sparse SDFs ----------------------
-    # COL-5 (M11): nuka_sdf_device_test (runtime/test_sdf_device_upload.cu) DELETED
-    # with SdfDeviceWorld. The cooked-table->device round-trip + cell-count coverage
-    # it provided is folded into the SDF precision oracle
-    # (SdfPrecisionOracle.CookedTableDeviceRoundTripAndCellCount in
-    # collision/test_gjk_epa_convex.cpp); device SDF sampling is covered by the rest
-    # of that oracle (NarrowphaseSdf op over uploaded cell tables).
 
     # --- v0.8 C4a: MuJoCo _efc_row solref/solimp compliance port -----------
     # Tests src/constraint/solref_solimp.hpp (header-only HD). Two regimes:
@@ -1431,7 +1252,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_solref_solimp_test
         PROPERTIES LABELS "fast_full")
 
-    # --- v0.7 p04: LBVH vs SAP differential gate + D1 byte-exact -----------
     add_executable(nuka_lbvh_vs_sap_test
         collision/test_lbvh_vs_sap_pair_set.cpp
     )
@@ -1489,10 +1309,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_point_endpoint_operator_test
         PROPERTIES LABELS "fast_full")
 
-    # --- v0.7 p05: particle uniform grid + cross-system broadphase ---------
-    # Correctness vs CPU brute-force + D1 two-run byte-exact for both the
-    # particle neighbor grid and the particle->rigid cross-system query (which
-    # traverses the LBVH retained by BuildLbvhForQuery).
     add_executable(nuka_particle_grid_test
         collision/test_particle_grid_correctness.cpp
         collision/test_particle_grid_determinism.cpp
@@ -1684,10 +1500,6 @@ if(CMAKE_CUDA_COMPILER)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
-    # M9 T11: nuka_sdf_tier_wired_test DELETED -- it tested the LEGACY SDF tier wired
-    # through ResolveNarrowphase + find_sdf_contact_newton (narrowphase_dispatch.hpp +
-    # sdf_contact.*), both deleted in T11 (the new core uses contacts_union.cu). SDF
-    # cook determinism survives separately in tests/import/test_sparse_sdf_determinism.cpp.
 
     # --- v0.8 C5a: contact stream DRIVER (CandidatePair -> ContactManifold) ------
     # Validates the resolver-decoupled host driver (contact_stream_driver.hpp/.cpp,
@@ -1775,16 +1587,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rt_traversal_test
         PROPERTIES LABELS "fast_full")
 
-    # --- v0.7 p13: the SENSOR renderer (real per-primitive leaf intersections
-    # triangle/sphere/sparse-SDF + Lambert+GGX shade + hard shadows + full AOV
-    # framebuffer). Matches a CPU brute-force ray-vs-all-prims oracle that REUSES
-    # the same __host__ __device__ intersection + shade + closest-hit functions
-    # the kernel uses (triangle hit + bary EXACT, sphere depth + normal EXACT,
-    # SDF hit within tolerance, Lambert/GGX == analytic, hard-shadow occlusion);
-    # NaN-guard for a surface-origin axis-parallel ray; D1 two-run byte-exact
-    # across ALL AOVs. Built -ffp-contract=off to pair with the kernel's
-    # --fmad=false so the shared fp64-internal intersection math is host==device
-    # bit-for-bit. Links nuka_cooker for the in-test cooked sparse SDF (p07).
     add_executable(nuka_rt_scene_render_test
         rt/test_scene_render.cpp
     )
@@ -2160,7 +1962,7 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_elastoplastic_compression_demo PRIVATE
         nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
         nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
-        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+        nuka_contact_wrench nuka_collision_gpu nuka_core nuka_phi)
 
     add_executable(nuka_robot_elastoplastic_demo
         ${CMAKE_SOURCE_DIR}/examples/demo/robot_elastoplastic_demo.cpp)
@@ -2171,7 +1973,7 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_robot_elastoplastic_demo PRIVATE
         nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
         nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
-        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+        nuka_contact_wrench nuka_collision_gpu nuka_core nuka_phi)
 
     add_executable(nuka_bunny_water_demo
         ${CMAKE_SOURCE_DIR}/examples/demo/bunny_water_demo.cpp)
@@ -2182,7 +1984,7 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_bunny_water_demo PRIVATE
         nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
         nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
-        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+        nuka_contact_wrench nuka_collision_gpu nuka_core nuka_phi)
 
     add_executable(nuka_elastoplastic_bunny_demo
         ${CMAKE_SOURCE_DIR}/examples/demo/elastoplastic_bunny_demo.cpp)
@@ -2193,7 +1995,7 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(nuka_elastoplastic_bunny_demo PRIVATE
         nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
         nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
-        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+        nuka_contact_wrench nuka_collision_gpu nuka_core nuka_phi)
 
     # --- Offline RHI replay gate: the host render layer (nuka_rhi) over the
     # PHI-unified tracer must add ZERO numeric change vs driving RtBackendI
@@ -2255,23 +2057,7 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_rhi_sensor_batch_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
-    # --- v0.7 G1-C: two-level (TLAS/BLAS) ray-tracer BENCHMARK harness -------
-    # MEASURES flat p13 RenderScene (rebuild-all every frame over N*~300 baked
-    # world triangles) vs the G1-A two-level RenderFrame (per-mesh BLAS built
-    # ONCE + cheap per-frame N-instance TLAS rebuild). Sweeps N=1,16,64,256,1024
-    # at 512x512, animates instances each frame, times the WHOLE host per-frame
-    # call (wall-clock), reports ms/frame + full-per-frame-wall-time MRays/s +
-    # speedup, and prints the explicit G1-B go/no-go verdict. Asserts ONLY the
-    # relative structural invariant (two-level < flat at N>=64); absolute numbers
-    # are hardware-dependent (nvidia-smi NVML-broken) and never asserted.
-    # M9 T14: nuka_rt_two_level_bench MERGED into nuka_perf_test (the perf
-    # category exe; rt/test_two_level_bench.cpp + its -ffp-contract=off there).
 
-    # --- p08-C Channel 2/3: envelope-theorem contact-geometry adjoint -------
-    # Cooks box+sphere SDFs, runs the SHIPPING find_sdf_contact_newton, and
-    # FD-validates the envelope depth + normal gradients by RE-RUNNING the descent
-    # under perturbation (cell value / pose). Channel 3: documents the contact
-    # point's valley-degeneracy (no point gradient produced/validated).
     add_executable(nuka_sdf_contact_adjoint_test
         collision/test_sdf_contact_adjoint_fd.cpp
     )
@@ -2293,397 +2079,7 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_sdf_contact_adjoint_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "full")
 
-    # --- Batched N-articulation replication (p01-F T1) ---------------------
-    add_executable(nuka_batched_articulation_replication_test
-        runtime/test_batched_articulation_replication.cpp
-    )
 
-    target_compile_definitions(nuka_batched_articulation_replication_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_batched_articulation_replication_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_batched_articulation_replication_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    add_executable(nuka_contact_chain_jacobian_test
-        runtime/test_contact_chain_jacobian.cpp
-    )
-
-    target_compile_definitions(nuka_contact_chain_jacobian_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_contact_chain_jacobian_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_contact_chain_jacobian_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    add_executable(nuka_articulation_contacts_test
-        runtime/test_articulation_contacts.cpp
-    )
-
-    target_compile_definitions(nuka_articulation_contacts_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_articulation_contacts_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_articulation_contacts_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- Joint-space inertia M (CRBA) + contact effective mass (p01-F T4) ---
-    add_executable(nuka_articulation_inertia_m_test
-        runtime/test_articulation_inertia_m.cpp
-    )
-
-    target_compile_definitions(nuka_articulation_inertia_m_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_articulation_inertia_m_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_articulation_inertia_m_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.8 SG G0: DOF honesty above 18 (whole-body H1 precondition) -------
-    # Synthetic >18-DOF chains: M^-1 factorization covers the FULL dof block,
-    # m_eff uses the full chain-J, implicit damping reaches DOF>18, and beyond
-    # kMaxArticulationDof the launchers fail LOUDLY (never a silent clamp).
-    add_executable(nuka_dof_above18_honesty_test
-        runtime/test_dof_above18_honesty.cpp
-    )
-
-    target_compile_definitions(nuka_dof_above18_honesty_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_dof_above18_honesty_test
-        PRIVATE
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_dof_above18_honesty_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.8 C4c: reaction providers (rigid invM / chain-J / particle invM) -
-    # Validates the NEW, VALIDATED-NOT-WIRED src/constraint/reaction_provider.hpp
-    # §0.5 interface: a 1-DOF pendulum chain-J vs a hand-computed J M^-1 J^T (with
-    # an OFF-origin contact point -- the C4c arbitrary-point generalization),
-    # rigid invM vs the analytic diagonal path, particle scalar invM, StaticNull
-    # zero/no-op, and 2-run byte-identity (D1). Round-trips the proven device CRBA
-    # M^-1 + chain-J builders the articulation provider consumes, so it links the
-    # articulation GPU libs + nuka_constraint (the header-only providers).
-    add_executable(nuka_reaction_providers_test
-        constraint/test_reaction_providers.cpp
-    )
-
-    target_compile_definitions(nuka_reaction_providers_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_reaction_providers_test
-        PRIVATE
-            nuka_constraint
-            nuka_runtime
-            nuka_articulation_gpu
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_reaction_providers_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.5 p02-A: differentiable single-step ABA reverse (FD ladder) -----
-    add_executable(nuka_diffsim_aba_reverse_test
-        diffsim/test_aba_reverse_fd.cpp
-    )
-
-    target_compile_definitions(nuka_diffsim_aba_reverse_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_diffsim_aba_reverse_test
-        PRIVATE
-            nuka_diffsim
-            nuka_runtime
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            # M3b: the nk-arena seam smoke (diffsim kernels on nk::World state).
-            nuka_nk
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_diffsim_aba_reverse_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.5 p02-B/C: multi-step diff-sim (tape/checkpoint/recompute/backward) -
-    add_executable(nuka_diffsim_multistep_backward_test
-        diffsim/test_multistep_backward.cpp
-    )
-
-    target_compile_definitions(nuka_diffsim_multistep_backward_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_diffsim_multistep_backward_test
-        PRIVATE
-            nuka_diffsim
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_diffsim_multistep_backward_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.5 p03 R1: self-written deterministic CG sparse solver (IFT backend) -
-    # CG-vs-Eigen-LDLT dense cross-check + D1 bit-exact gate. Eigen is linked here
-    # ONLY (nuka_eigen_testonly INTERFACE include dir), never into any production
-    # target.
-    add_executable(nuka_diffsim_cg_solver_test
-        diffsim/test_cg_vs_dense.cpp
-    )
-
-    target_compile_definitions(nuka_diffsim_cg_solver_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_diffsim_cg_solver_test
-        PRIVATE
-            nuka_diffsim
-            nuka_core
-            nuka_phi
-            nuka_eigen_testonly
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_diffsim_cg_solver_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "fast_full")
-
-    # --- v0.7 p01: hardened CG general-path solver tests --------------------
-    # The v0.5 CG solver hardened + generalized for worse-conditioned systems:
-    #   * test_cg_vs_dense          : Eigen-LDLT cross-check on kappa up to ~1e6 +
-    #                                 D1 bit-exact (worse-conditioned coverage).
-    #   * test_cg_convergence_rate  : CG A-norm error vs the kappa-theory bound in
-    #                                 the informative regime + residual-history diag.
-    #   * test_block_jacobi_tuning  : Jacobi-vs-BlockJacobi preconditioner quality
-    #                                 sweep + the host diagnostics summarizer.
-    # Eigen is linked test-only (the approved dense oracle), never a production path.
-    foreach(cg_test
-            test_cg_vs_dense
-            test_cg_convergence_rate
-            test_block_jacobi_tuning)
-        add_executable(nuka_diffsim_${cg_test}
-            diffsim/solver/${cg_test}.cpp)
-        target_compile_definitions(nuka_diffsim_${cg_test}
-            PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-        target_link_libraries(nuka_diffsim_${cg_test}
-            PRIVATE
-                nuka_diffsim
-                nuka_core
-                nuka_phi
-                nuka_eigen_testonly
-                GTest::gtest_main)
-        gtest_discover_tests(nuka_diffsim_${cg_test}
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-            PROPERTIES LABELS "fast_full")
-    endforeach()
-
-    # --- v0.7 p02: self-written MINRES (symmetric indefinite) + ILU(0) ----------
-    #   * test_minres_indefinite          : MINRES solves a known indefinite system
-    #                                       (||Ax-b|| small) + D1 bit-exact.
-    #   * test_minres_vs_dense_indefinite : MINRES vs Eigen FullPivLU on indefinite
-    #                                       blocks (< 1e-5; FullPivLU, NOT LDLT).
-    #   * test_ilu0_factorization         : ILU(0) factor matches a hand reference +
-    #                                       host==device + D1 bit-exact.
-    #   * test_ilu0_vs_jacobi_convergence : ILU(0)-MINRES converges in <= 0.5x iters
-    #                                       vs Jacobi-MINRES on an ill-conditioned
-    #                                       structurally-sparse DEFINITE block.
-    # Eigen is linked test-only (the approved dense oracle), never a production path.
-    foreach(minres_test
-            test_minres_indefinite
-            test_minres_vs_dense_indefinite
-            test_ilu0_factorization
-            test_ilu0_vs_jacobi_convergence)
-        add_executable(nuka_diffsim_${minres_test}
-            diffsim/solver/${minres_test}.cpp)
-        target_compile_definitions(nuka_diffsim_${minres_test}
-            PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-        target_link_libraries(nuka_diffsim_${minres_test}
-            PRIVATE
-                nuka_diffsim
-                nuka_core
-                nuka_phi
-                nuka_eigen_testonly
-                GTest::gtest_main)
-        gtest_discover_tests(nuka_diffsim_${minres_test}
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-            PROPERTIES LABELS "fast_full")
-    endforeach()
-
-    # --- v0.7 p03-A: self-written GMRES (general NON-SYMMETRIC Krylov) -----------
-    #   * test_gmres_nonsymmetric : GMRES vs Eigen PartialPivLU/FullPivLU on
-    #                               genuinely non-symmetric blocks (< 1e-5); the m<n
-    #                               restart-coverage case; the non-symmetric detector
-    #                               byte-safety (symmetric -> 0, non-symmetric -> 1);
-    #                               and the D1 two-run byte-exact gate.
-    # Eigen is linked test-only (the approved dense oracle), never a production path.
-    foreach(gmres_test
-            test_gmres_nonsymmetric)
-        add_executable(nuka_diffsim_${gmres_test}
-            diffsim/solver/${gmres_test}.cpp)
-        target_compile_definitions(nuka_diffsim_${gmres_test}
-            PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-        target_link_libraries(nuka_diffsim_${gmres_test}
-            PRIVATE
-                nuka_diffsim
-                nuka_core
-                nuka_phi
-                nuka_eigen_testonly
-                GTest::gtest_main)
-        gtest_discover_tests(nuka_diffsim_${gmres_test}
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-            PROPERTIES LABELS "fast_full")
-    endforeach()
-
-    # --- v0.5 p03 R2: contact KKT (Delassus) builder ------------------------
-    # Builder (A = J M^-1 J^T) vs an INDEPENDENT host Gram recompute (Eigen,
-    # < 1e-5 rel), exact bit-symmetry, the diagonal == 1/effective_mass identity,
-    # and the D1 two-run byte-exact gate. Eigen is linked test-only.
-    add_executable(nuka_diffsim_kkt_build_test
-        diffsim/test_kkt_build.cpp
-    )
-
-    target_compile_definitions(nuka_diffsim_kkt_build_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_diffsim_kkt_build_test
-        PRIVATE
-            nuka_diffsim
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            nuka_eigen_testonly
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_diffsim_kkt_build_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "fast_full")
-
-    # --- v0.7 p08-C Channel 1 (§4.B): SDF-contact IFT d/dM, d/dJ ------------
-    # The §4.B acceptance the v0.5 ift_runner DEFERRED. The FD PERTURBS actual
-    # entries of M^-1 / J and RE-SOLVES the constraint system to convergence with
-    # an INDEPENDENT Eigen LDLT oracle (not the module's own assemble/solve, so a
-    # transpose/index bug is caught), then compares to the analytical IFT
-    # dlambda = A^-1 (dr - dA lambda). Eigen linked test-only.
-    add_executable(nuka_sdf_contact_ift_test
-        diffsim/test_sdf_contact_ift_fd.cpp
-    )
-
-    target_link_libraries(nuka_sdf_contact_ift_test
-        PRIVATE
-            nuka_diffsim
-            nuka_phi
-            nuka_eigen_testonly
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_sdf_contact_ift_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.5 p03 R3b: OSC differentiable adjoint (R8 / R9) -----------------
-    # Reverse-mode gain (Kp,Kd) + task-target gradients of the REAL forward OSC
-    # drive kernel: analytic adjoint vs central finite-difference of the live
-    # LaunchApplyOscDriveKernels (< 1e-3 rel), the D1 two-run byte-exact gate, and
-    # the R9 clamp stop-grad (saturated component -> zero param grad). Links the
-    # engine (scene cook + world + forward kernel) AND nuka_diffsim (the adjoint).
-    add_executable(nuka_diffsim_osc_adjoint_test
-        diffsim/test_osc_adjoint.cpp
-    )
-
-    target_compile_definitions(nuka_diffsim_osc_adjoint_test
-        PRIVATE
-            NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    )
-
-    target_link_libraries(nuka_diffsim_osc_adjoint_test
-        PRIVATE
-            nuka_diffsim
-            nuka_runtime
-            nuka_import
-            nuka_articulation_gpu
-            nuka_core
-            nuka_phi
-            GTest::gtest_main
-    )
-
-    gtest_discover_tests(nuka_diffsim_osc_adjoint_test
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        PROPERTIES LABELS "full")
-
-    # --- v0.5 p04 N1: sim-to-real sensor noise (Philox Gaussian + Poisson) ---
-    # Launch-level gtests: Philox KAT + D1 two-run memcmp + statistics. Link the
-    # self-contained noise lib directly -- no world/scene needed (fast + robust).
     add_executable(nuka_sensor_noise_test
         sensor/test_n1_gaussian.cu
         sensor/test_n1_poisson.cu
@@ -2704,14 +2100,6 @@ if(CMAKE_CUDA_COMPILER)
     gtest_discover_tests(nuka_sensor_noise_test
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         PROPERTIES LABELS "fast_full")
-
-    # M9 T11: nuka_floating_base_aba_test (test_floating_base_aba.cpp) +
-    # nuka_floating_base_contact_test (test_floating_base_contact.cpp) DELETED with
-    # the legacy batched articulated world. Floating-base ABA correctness (legs+base
-    # byte-exact vs MJX golden) survives on nk via oracle
-    # NkWorldFloatingBaseGoldensMatchCudaAbaByteExact; the floating-base foot-ground
-    # contact-recoil through the 18-wide chain-J survives via foot_ground_subsume +
-    # h1_grasp_lift + articulation_contact_rows. go2-stance remainder -> M10.
 
 
     # --- v0.8 co-residence PEAK (commit 1/3): per-link/per-shape WORLD AABB
@@ -2744,7 +2132,8 @@ if(CMAKE_CUDA_COMPILER)
         PRIVATE
             nuka_runtime
             nuka_import
-            nuka_articulation_gpu
+            nuka_scene_cook
+            nuka_contact_wrench
             nuka_core
             nuka_phi
             GTest::gtest_main
@@ -2755,109 +2144,6 @@ if(CMAKE_CUDA_COMPILER)
         PROPERTIES LABELS "fast_full")
 
 
-    # M9 T11: the coresident validated-not-wired test estate DELETED with the
-    # legacy classes (the co-resident stepper / the batched union world / the grasp
-    # scene factory): nuka_unified_coresident_stepper_test, nuka_batched_unified_world_test,
-    # nuka_batched_unified_world_perf_test, nuka_grasp_hold_spike_test,
-    # nuka_h1_grasp_spike_test. Their unique coverage is folded/acceptable-loss per
-    # subagent-plans/m9-t10-coverage-fold.md (broadphase D1 / RNG D1 / Krylov etc.
-    # survive standalone; the grasp force-balance/BITE/D1 lives in h1_grasp_lift).
-
-    # --- M7 T6: the 4 H1 grasp DEV-SPIKE tests (power_grasp_lift /
-    # scaled_cup_grasp / dense_grasp / grasp_feasibility_probe) were DELETED.
-    # Their hard GO assertions (force-balance, BITE, disturbance, D1, the
-    # conjoint honest gate) consolidated into tests/scenario/h1_grasp_lift.cpp
-    # (the permanent .nks grasp gate); the rest were SKIP-with-finding spikes.
-
-    # M9 T11: nuka_batched_h1_hand_grasp_test (batched H1-hand grasp vs co-resident
-    # oracle byte-exact) DELETED with the coresident estate.
-
-    # M9 T11: nuka_batched_h1_union_world_test (SG G1 batched-union parity) DELETED
-    # with the coresident estate -- the batched union world vs co-resident oracle
-    # parity dies with the legacy classes (golden/nk path is authority).
-
-    # --- M7 T6: the factory byte-equality gate (nuka_h1_union_scene_factory_test)
-    # and the transitional cook==factory gate (nuka_union_cook_matches_factory_test)
-    # were DELETED with the factory they pinned. The permanent gate is
-    # nuka_h1_grasp_lift_test below (the pure .nks-cooked grasp gate).
-
-    # M9 T14: nuka_h1_grasp_lift_test (THE permanent .nks grasp gate) +
-    # nuka_union_cook_golden_test (the cook-fidelity golden) MERGED into
-    # nuka_scenario_test (scenario/h1_grasp_lift.cpp + scenario/union_cook_golden.cpp;
-    # union_nk_model.cpp + contact_stream_driver.cpp now come from the shared
-    # nuka_test_validated_sources lib, no longer a per-exe extra-source).
-
-    # M9 T11: the H1 co-resident demo/transfer/bridge spikes DELETED with the
-    # coresident estate: nuka_h1_cup_sequence_demo_test (C7b-2 stand+grasp scaffold),
-    # nuka_h1_costand_transfer_test (S3 full-DOF stand transfer),
-    # nuka_h1_bridge_spike_test (PPO->co-resident inference seam). RL-adjacent /
-    # validated-not-wired; rebuild on the nk world at M10 per the SG freeze.
-
-    # M6 RE-POINT: the ParticleInvMass reaction arm on the nk path (the device-
-    # resident nk::BlockDescentSolve, the union kUSlotParticleSphereBox class).
-    # A particle presses a free rigid box -> both react two-way (momentum balance);
-    # the box held on a static plane supports the particle through the
-    # particle->box->plane chain in ONE unified solve; D1. (The legacy host
-    # solver::UnifiedSolve + EmitCouplingRows are no longer consumed here.)
-    # M9 T14: nuka_coupling_test MERGED into nuka_scenario_test
-    # (coupling/test_coupling_framework.cpp; the scenario category exe above).
-
-    # --- v0.8 C6a: the PBD<->rigid unified-contact CO-STEP bridge -------------
-    # Drives the REAL front-end together (C2c broadphase -> C5 contact driver ->
-    # C6b coupling framework -> C6b unified solver) for the Genesis-style "couple"
-    # phase: a PBD particle system consumes unified manifolds + reacts TWO-WAY
-    # M6 RE-POINT: a particle system co-steps against a rigid box through the ONE
-    # unified row solve (nk::World, the kUSlotParticleSphereBox union class ->
-    # AssembleRows -> BlockDescentSolve ParticleInvMass arm). The legacy host
-    # bridge (unified_costep.cpp, the M6 deletion target) is no longer consumed.
-    # CASE A: multi-particle drop, TOTAL-energy non-increasing + settle + two-way.
-    # CASE C: rest-on-box. CASE D: D1.
-    # M9 T14: nuka_pbd_costep_test MERGED into nuka_scenario_test
-    # (coupling/test_pbd_costep_unified.cpp; the scenario category exe above).
-
-    # M9 T11: nuka_go2_pd_standing_test (test_go2_pd_standing.cpp) DELETED with the
-    # legacy batched articulated world. Pure go2-quadruped PD-stance locomotion
-    # precursor -> M10 carry-forward (crouch-hold height tracking, Sigma lambda=Mg/4
-    # per foot, COM-in-foot-polygon static balance, no-tip, 4096-env determinism;
-    # see subagent-plans/m9-t11-articulated-fold.md M10 carry-forward #1). Generic
-    # foot-ground recoil/friction/D1/scale already on nk via foot_ground_subsume +
-    # h1_grasp_lift + articulation_contact_rows + multi_env.
-
-    # M9 T11: nuka_link_contact_wrench_test (test_link_contact_wrench.cpp) DELETED
-    # with the legacy batched articulated world. The synthetic ComputeContactWrench-
-    # Outputs kernel arm + the LINK_CONTACT_WRENCH field binary contract survive
-    # (the kernel + multi_env SingleEnvStillSupported); the go2-stance-balances-
-    # weight + graph==wrench arms -> M10 carry-forward (per-link contact-wrench
-    # readback on a seated go2 nk world; ledger M10 carry-forward #2).
-
-    # M9 T11: nuka_batched_reset_test (RL autoreset) + nuka_base_pose_view_test
-    # (episode-boundary un-lagged base pose) DELETED -- batched-only / RL-adjacent,
-    # their contracts carried forward to M10 (rebuild on the nk world when RL
-    # returns; see subagent-plans/m9-t10-coverage-fold.md M10 carry-forward).
-
-    # M9 T11: nuka_batched_articulated_world_test (test_batched_articulated_world.cpp),
-    # nuka_batched_articulated_graph_test (test_batched_articulated_graph.cpp), and
-    # nuka_batched_articulated_world_perf_test (test_batched_articulated_world_perf_
-    # detail.cpp) ALL DELETED with the legacy batched articulated world. The class
-    # orchestration (env-major + cross-env/two-run D1 + 4096 scale) survives on nk
-    # via multi_env (DeterminismCrossEnvAndTwoRuns + HeadlineScale4096 +
-    # SingleEnvStillSupported); batched==engine bit-exact + graph==step survive via
-    # oracle NkWorldRandomSampleGoldensMatchCudaAbaByteExact +
-    # NkWorldBatchedContactStepPlannedByteExact (+ h1_grasp_lift plan-replay); perf
-    # via nuka_go2_4096env_step_time_test NkWorldStepPlannedMeetsGatePerEnv. The
-    # perf-detail file was self-documented "measurement harness, not a correctness
-    # gate" (zero physics). The velocity / non-PD control mode + per-mode two-run
-    # byte-exact contract (was nuka_control_modes_test) is carried forward to M10
-    # (rebuild on the nk world; see subagent-plans/m9-t10-coverage-fold.md).
-
-    # M9 T14: the 4096-env Go2 perf gate (test_go2_4096env_step_time.cpp), the
-    # cuda_perf throughput gates (test_lbvh_50k_bodies.cpp +
-    # test_1m_particles_grid_perf.cpp) and the perf-timing infra contract
-    # (test_perf_timing.cu) are MERGED into nuka_perf_test (the perf category exe,
-    # defined above). Their link sets (nuka_runtime/_gpu + articulation_gpu +
-    # collision_gpu + scene_cook + CUDA::cudart) are unioned there.
-    # (M9 T11: tools/perf/perf_harness.cpp was deleted; the live throughput gates
-    # are the nuka_perf_test gtest binaries, see tools/perf/run_perf_baseline.py.)
 endif()
 
 # --- Beauty texture pipeline (host: stb decode + texture library + adapter) --
@@ -2897,8 +2183,6 @@ if(NK_BUILD_VULKAN_VALIDATION)
     gtest_discover_tests(nuka_render_test
         PROPERTIES LABELS "fast_full")
 
-    # M8 T3a -- offscreen raster renderer smoke (synthetic RenderWorld; two
-    # renders byte-identical [G2] + non-background pixels > 0 [G3]).
     add_executable(nuka_render_raster_smoke_test
         scenario/render_raster_smoke.cpp
     )
@@ -2940,7 +2224,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -2987,7 +2271,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3004,7 +2288,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
     target_link_libraries(nuka_go2_skill_video_cuda PRIVATE
         nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2
         nuka_runtime_gpu nuka_runtime nuka_import nuka_cooker
-        nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi)
+        nuka_contact_wrench nuka_collision_gpu nuka_core nuka_phi)
 
 
     # MLS-MPM headline clip: a fixed-corotated elastic jelly ball (densely sampled
@@ -3033,7 +2317,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3065,7 +2349,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3097,7 +2381,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3134,7 +2418,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3164,7 +2448,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3193,7 +2477,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3225,7 +2509,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3263,7 +2547,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi
@@ -3295,7 +2579,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
             nuka_runtime
             nuka_import
             nuka_cooker
-            nuka_articulation_gpu
+            nuka_contact_wrench
             nuka_collision_gpu
             nuka_core
             nuka_phi

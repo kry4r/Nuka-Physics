@@ -746,6 +746,8 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
         model.body_init[1].linear_velocity = incoming;
         auto config = Config();
         config.pos_iters = position_iterations;
+        config.vel_iters = 32u;
+        config.velocity_iterations_override = true;
         nk::World world(std::move(model), 2u, backend.device, backend.backend, config);
         ASSERT_TRUE(world.Ready());
         nuka::sensor::StateSensorDesc contact;
@@ -766,6 +768,7 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
         const auto counts = Read<uint32_t>(world, nk::FieldId::UcontactCount,
                                           2u * capacity.max_contacts_per_env);
         const auto points = Read<Vec3>(world, nk::FieldId::UcontactPoint, 4u * counts.size());
+        const auto ranges = Read<uint32_t>(world, nk::FieldId::UcontactRowRange, 2u * counts.size());
         const Vec3 center = body.local_transform.position +
             body.local_transform.rotation.Rotate(body.inertial_transform.position);
         std::vector<float> body_load(12u), plate_load(12u);
@@ -778,9 +781,8 @@ TEST(FreeRigidDynamics, ContactImpulseUsesTheCenterOfMassAndWorldInertia) {
                 for (uint32_t point = 0; point < counts[contact]; ++point) {
                     const Vec3 lever = points[4u * contact + point] - center;
                     for (uint32_t axis = 0; axis < 3u; ++axis) {
-                        const uint32_t row_index = env * capacity.max_rows_per_env +
-                            slot * nk::kPairDrivenRowsPerSlot +
-                            axis * nk::kPairDrivenPtsPerSlot + point;
+                        const uint32_t row_index = ranges[2u * contact] +
+                            axis * ranges[2u * contact + 1u] + point;
                         const auto& row = rows[row_index];
                         for (const auto& side : {row.a, row.b}) {
                             if (side.kind != nk::kNkSideRigid || side.index != env * 2u + 1u) continue;

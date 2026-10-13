@@ -1498,7 +1498,7 @@ Status OpMpmStage(const ModelView& model, const DataView& data,
              static_cast<uint64_t>(p->base_link_count) * p->env_count > INT_MAX ||
              !data.link_pose || !data.link_velocity || !model.body_to_link ||
              !model.body_to_articulation ||
-             (p->max_dof > 0u && (!data.m_inv || !data.qdot_flat)))) return Status::InvalidArgument;
+             (p->max_dof > 0u && (!data.m_factor || !data.qdot_flat)))) return Status::InvalidArgument;
     }
     const uint32_t mpm_count = static_cast<uint32_t>(mpm_count64);
     const uint32_t cpe = static_cast<uint32_t>(cells_per_env);

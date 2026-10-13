@@ -19,7 +19,7 @@
 #include "nk/solve/vertex_block_hierarchy.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/launch_grid.cuh"
-#include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/articulation_mass.cuh"
 #include "phi/backend_cuda/ops/dense_block_solve.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
@@ -746,13 +746,9 @@ __device__ float SideResponse(const NkRowSide& side, const DataView& data,
     if (side.kind == kNkSideArtic) {
         const auto* jacobians = static_cast<const float*>(endpoint == 0u
             ? data.chain_jacobian : data.chain_jacobian_b);
-        const auto* response = static_cast<const float*>(endpoint == 0u
-            ? data.row_minv_jt : data.row_minv_jt_b);
-        double value = 0.0;
-        for (uint32_t dof = 0u; dof < p.max_dof; ++dof)
-            value += double(jacobians[size_t{slot} * p.max_dof + dof]) *
-                response[size_t{slot} * p.max_dof + dof];
-        return static_cast<float>(value);
+        const float* const J = jacobians + size_t{slot} * p.max_dof;
+        const float* const factor = data.m_factor + size_t{side.index} * p.max_dof * p.max_dof;
+        return static_cast<float>(MassCoupling<double>(factor, p.max_dof, J, J));
     }
     return 0.0f;
 }
@@ -947,19 +943,13 @@ __device__ double RowInertialResponse(const NkRow& row, const DataView& data,
                 z * (double(inverse.xz) * x + double(inverse.yz) * y + double(inverse.zz) * z);
         } else {
             const uint32_t articulation = owner - p.total_particle_count - p.total_body_count;
-            const NkRowSide sides[2] = {row.a, row.b};
-            for (uint32_t dof = 0u; dof < p.max_dof; ++dof) {
-                const size_t at = size_t{slot} * p.max_dof + dof;
-                double jacobian = 0.0, inverse_response = 0.0;
-                for (uint32_t endpoint = 0u; endpoint < 2u; ++endpoint) {
-                    if (sides[endpoint].kind != kNkSideArtic || sides[endpoint].index != articulation) continue;
-                    jacobian += static_cast<const float*>(endpoint == 0u
-                        ? data.chain_jacobian : data.chain_jacobian_b)[at];
-                    inverse_response += static_cast<const float*>(endpoint == 0u
-                        ? data.row_minv_jt : data.row_minv_jt_b)[at];
-                }
-                contribution += jacobian * inverse_response;
-            }
+            const size_t at = size_t{slot} * p.max_dof;
+            const bool side_a = row.a.kind == kNkSideArtic && row.a.index == articulation;
+            const bool side_b = row.b.kind == kNkSideArtic && row.b.index == articulation;
+            const float* const J = (side_a ? data.chain_jacobian : data.chain_jacobian_b) + at;
+            const float* const extra = side_a && side_b ? data.chain_jacobian_b + at : nullptr;
+            const float* const factor = data.m_factor + size_t{articulation} * p.max_dof * p.max_dof;
+            contribution = MassCoupling<double>(factor, p.max_dof, J, J, extra, extra);
         }
         valid &= contribution >= 0.0 && isfinite(contribution);
         response += contribution;
@@ -2296,9 +2286,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         p->articulation_count % p->env_count != 0u || model.articulation_link_offset == nullptr ||
         model.articulation_link_count == nullptr || model.joint_type == nullptr ||
         model.parent_link == nullptr || data.qdot == nullptr || data.qdot_flat == nullptr ||
-        data.link_velocity == nullptr || data.m == nullptr || data.m_inv == nullptr ||
+        data.link_velocity == nullptr || data.m == nullptr || data.m_factor == nullptr ||
         data.chain_jacobian == nullptr || data.chain_jacobian_b == nullptr ||
-        data.row_minv_jt == nullptr || data.row_minv_jt_b == nullptr ||
         (p->mimic_couplings > 0u && (data.m_reduced == nullptr ||
          data.mimic_root_dof == nullptr || data.mimic_root_scale == nullptr))))
         return Status::InvalidArgument;

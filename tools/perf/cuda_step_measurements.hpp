@@ -134,15 +134,14 @@ public:
                 group == 0u ? 1u : interval_ms_.size()));
             report.Set(group == 0u ? "first_interval" : "steady", std::move(timing));
         }
-        uint64_t model_bytes = 0u, arena_bytes[3]{};
+        uint64_t model_bytes = 0u, arena_bytes[nk::Arena::kArenaCount]{};
         model.ComputeModelSegments(&model_bytes);
         nk::Arena::ComputeSegments(model.capacities, arena_bytes);
         Json memory = Json::Object();
         memory.Set("model_bytes", Json::Int(model_bytes));
         memory.Set("persistent_bytes", Json::Int(arena_bytes[0]));
         memory.Set("workspace_bytes", Json::Int(arena_bytes[1]));
-        memory.Set("tape_bytes", Json::Int(arena_bytes[2]));
-        memory.Set("data_bytes", Json::Int(arena_bytes[0] + arena_bytes[1] + arena_bytes[2]));
+        memory.Set("data_bytes", Json::Int(arena_bytes[0] + arena_bytes[1]));
         memory.Set("timing_event_count", Json::Int(events_.size() * 2u));
         memory.Set("timing_event_device_bytes", Json::Null());
         memory.Set("timing_event_device_bytes_unavailable", Json::Str("CUDA does not expose event allocation sizes"));

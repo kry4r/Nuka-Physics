@@ -46,7 +46,7 @@ inline math::Vec3 Poly6GradientHost(math::Vec3 r_vec, float r2, float h) {
 }
 
 // A lattice-sampled particle set with uniform mass.
-struct PbfParticleSet {
+struct ParticleLattice {
     std::vector<math::Vec3> positions;
     std::vector<math::Vec3> velocities;
     float particle_mass = 1.0f;  // m (same for every particle).

@@ -232,7 +232,11 @@ TEST(ControlModes, BoundedEffortMatchesAnalyticFixedAndFloatingMassResponse) {
                     const float initial = env == 0u ? 0.2f : -0.2f;
                     const float free_speed = initial + cfg.dt * (0.25f - 0.7f * initial) / mass;
                     float expected_effort = 0.0f;
-                    if (mode == 0u) expected_effort = (3.6f - 4.0f * free_speed) / (1.0f + cfg.dt * 4.0f / mass);
+                    if (mode == 0u) {
+                        const float impedance = 4.0f + cfg.dt * 20.0f;
+                        expected_effort = (4.0f - impedance * (0.1f + free_speed)) /
+                                          (1.0f + cfg.dt * impedance / mass);
+                    }
                     if (mode == 1u || mode == 5u) expected_effort = env == 0u ? 5.0f : -5.0f;
                     if (mode == 2u) expected_effort = (-2.0f - 20.0f * free_speed) / (1.0f + cfg.dt * 20.0f / mass);
                     if (mode == 3u) expected_effort = mass * (0.8f + 4.0f + 4.0f * (-0.1f - initial));

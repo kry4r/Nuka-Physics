@@ -1,36 +1,5 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nk::NkRow — the union-family (CSR compliant) constraint-row record (M4).
-//
-// ONE NkRow per row slot of the `urows` Data field (32 f32 / 128 B; the field
-// aliases this struct — static_assert'd). Written by the AssembleRows op,
-// consumed by BlockDescentSolve. The semantics transcribe the legacy
-// unified row solve 1:1:
-//   * rhs               == Row.rhs (aref, the solref/solimp reference accel)
-//   * compliance_alpha  == Row.compliance_alpha (R, the dual regularizer)
-//   * lower/upper       == Row bounds (normal: [0, FLT_MAX]; friction spokes
-//                          get the in-kernel [0, mu*TotalNormalLambda] bound,
-//                          exactly row_solver.cu IsCompliantFrictionRow)
-//   * mu                == RowMaterial.friction (the per-class stamp)
-//   * group_first/group_normal_count == RowMaterial group_id/normal_row_count
-//                          re-keyed to FIXED worst-case row slots (inactive
-//                          normal slots carry lambda == 0, so the
-//                          TotalNormalLambda sum over the fixed span equals the
-//                          legacy sum over the compacted emission)
-//   * sides a/b         == ContactRowSides + RowArticulationRefs folded into
-//                          one record: per-side reaction kind + index + the
-//                          6-dof contact Jacobian (jlin = the emitted row
-//                          direction; jang = the C5c r x jlin rigid augment,
-//                          assembled once — the legacy kernel recomputed it
-//                          per iteration from the SAME constant inputs).
-//
-// The per-row articulation chain Jacobian J and its PRECOMPUTED companion
-// w = M^-1 J^T live in the chain_jacobian / row_minv_jt fields (row-major
-// [slot * dof_stride + k]); the precomputed effective mass in row_meff.
-//
-// PURE C++ POD (no CUDA tokens) so the schedule builder, tests, and the CUDA
-// ops all share the one definition.
-// ---------------------------------------------------------------------------
+// Articulation Jacobians are row-major; mass responses use the shared LDL factors.
 
 #include <cstdint>
 

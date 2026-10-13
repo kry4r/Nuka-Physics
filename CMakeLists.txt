@@ -285,14 +285,6 @@ if(NK_BUILD_TESTS)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
 
-    # -- Eigen (v0.5 p03): TEST-ONLY dense LDLT reference for the self-written
-    #    CG sparse solver. Header-only; pinned at 3.4.0. We FETCH but DO NOT
-    #    add_subdirectory()/MakeAvailable() Eigen's CMake project: that would
-    #    register install rules / an `Eigen3::Eigen` target that could leak into
-    #    libnuka or any production target. Instead we populate the sources and
-    #    expose ONLY the include dir via a private INTERFACE target consumed by
-    #    the single diffsim CG test executable (see tests/CMakeLists.txt). Eigen
-    #    never appears in any production link line.
     FetchContent_Declare(
         eigen
         GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git

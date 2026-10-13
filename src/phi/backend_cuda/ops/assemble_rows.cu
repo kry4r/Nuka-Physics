@@ -1,6 +1,7 @@
 // All contact providers assemble solved rows and mass response through one common contract.
 
 #include <cuda_runtime.h>
+#include "phi/backend_cuda/ops/articulation_mass.cuh"
 #include <cub/block/block_scan.cuh>
 
 #include <algorithm>
@@ -98,46 +99,12 @@ __forceinline__ __device__ float Dot3(math::Vec3 a, math::Vec3 b) {
     return mg::Dot(a, b);
 }
 
-__forceinline__ __device__ math::Vec3 Cross3(math::Vec3 a, math::Vec3 b) {
-    return mg::Cross(a, b);
-}
-
-__forceinline__ __device__ math::Vec3 NormalizeOrUpLocal(math::Vec3 normal) {
-    return mg::NormalizeOrUp(normal);
-}
-
-__device__ math::Vec3 ScaleVec(math::Vec3 v, float s) {
-    return {v.x * s, v.y * s, v.z * s};
-}
 
 __forceinline__ __device__ uint32_t JointDofCount(ArticulationJointType type) {
     return JointDofCountDevice(type);
 }
 
-// ===========================================================================
-// SHARED + FUSED-family kernels — MOVED VERBATIM from the transitional
-// ops/solve_articulated.cu , which this file replaces. Bodies are
-// line-by-line ports of articulation_jacobian.cu / articulation_contacts.cu.
-// ===========================================================================
 
-// One thread per contact. Walks the ancestor-joint chain (contact link -> root)
-// in fixed order, writing each ancestor DOF's Jacobian entry into the contact's
-// own dof_stride-wide output slice. No atomics, no cross-contact aliasing.
-// (The union family launches this over ROW slots — same kernel, the per-slot
-// inputs are gathered per row; an inactive row carries the kInvalidLink
-// sentinel and is skipped. Consumers gate on the current row side before reading
-// J, so only a live articulation row needs initialization.)
-// C3 (general contact pipeline) — CONTACT POINT/NORMAL FRAME DECISION.
-// The unified contact buffer (the FUSED contact_*, the union ucontact_*, and the
-// general PairDriven manifold) stores the contact POINT in WORLD space and the
-// contact NORMAL (A->B) in WORLD space. Newton stores points in BODY frame +
-// normal in world (contact_data.py); Nuka keeps WORLD point + world normal for
-// minimal D1 churn, because this chain-Jacobian kernel ALREADY consumes a world
-// point + world normal directly (contact_point_world / contact_normal_world
-// below) — re-keying to body-frame storage would require a per-row world-recompose
-// with no functional gain before the general path is wired. Body-frame storage is deferred to the
-// collide-once / reuse-across-substeps optimization (out of scope for the initial wiring). This
-// is the ONE documented representation feeding AssembleRows for every family.
 __global__ void ComputeContactChainJacobianKernel(
     ArticulationDeviceState state,
     const uint32_t* contact_link_indices,
@@ -202,116 +169,6 @@ __global__ void MergeSharedArticulationJacobianKernel(
     }
 }
 
-// Per-contact effective mass m_eff = 1 / (J M^-1 J^T).
-__global__ void ComputeContactEffectiveMassKernel(ArticulationDeviceState state,
-                                                  const uint32_t* contact_link_indices,
-                                                  const float* chain_jacobian,
-                                                  const float* inertia_M_inv,
-                                                  uint32_t contact_count,
-                                                  uint32_t dof_stride,
-                                                  float* out_effective_mass) {
-    const uint32_t contact = blockIdx.x * blockDim.x + threadIdx.x;
-    if (contact >= contact_count) {
-        return;
-    }
-
-    const uint32_t link = contact_link_indices[contact];
-    if (link >= state.total_link_count) {
-        out_effective_mass[contact] = 0.0f;
-        return;
-    }
-
-    const uint32_t articulation = state.link_to_articulation[link];
-    const size_t tile_stride = static_cast<size_t>(dof_stride) * dof_stride;
-    const float* const Minv =
-        inertia_M_inv + static_cast<size_t>(articulation) * tile_stride;
-    const float* const J =
-        chain_jacobian + static_cast<size_t>(contact) * dof_stride;
-
-    // denom = J M^-1 J^T. Padding columns of J are zero, so iterating the full
-    // stride is safe even though M^-1's padding rows/cols are zero.
-    float denom = 0.0f;
-    for (uint32_t r = 0u; r < dof_stride; ++r) {
-        float row = 0.0f;
-        for (uint32_t c = 0u; c < dof_stride; ++c) {
-            row += Minv[static_cast<size_t>(r) * dof_stride + c] * J[c];
-        }
-        denom += J[r] * row;
-    }
-
-    out_effective_mass[contact] = 1.0f / fmaxf(denom, kEffectiveMassDenomEpsilon);
-}
-
-// Branch-stable orthonormal tangent basis (t1,t2) for a unit normal n.
-__device__ void TangentBasis(math::Vec3 n, math::Vec3* t1, math::Vec3* t2) {
-    math::Vec3 reference = {1.0f, 0.0f, 0.0f};
-    if (fabsf(n.x) > 0.9f) {
-        reference = {0.0f, 1.0f, 0.0f};
-    }
-    const float proj = Dot3(reference, n);
-    math::Vec3 tangent_a = {reference.x - proj * n.x,
-                            reference.y - proj * n.y,
-                            reference.z - proj * n.z};
-    const float len_sq = Dot3(tangent_a, tangent_a);
-    if (len_sq > 1.0e-12f) {
-        tangent_a = ScaleVec(tangent_a, rsqrtf(len_sq));
-    } else {
-        tangent_a = {1.0f, 0.0f, 0.0f};
-    }
-    const math::Vec3 tangent_b = Cross3(n, tangent_a);
-    *t1 = tangent_a;
-    *t2 = tangent_b;
-}
-
-// One thread per contact slot. Assembles the per-contact row set (normal + the
-// two friction tangents) from the detection + m_eff inputs. Inactive slots get a
-// kRowInactive row the solver skips.
-__global__ void AssembleArticulatedContactRowsKernel(
-    ArticulationDeviceState state,
-    const uint32_t* contact_link,
-    const math::Vec3* contact_normal,
-    const float* contact_depth,
-    const float* normal_effective_mass,
-    const float* tangent1_effective_mass,
-    const float* tangent2_effective_mass,
-    uint32_t slot_count,
-    ArticulatedContactRow* out_rows) {
-    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    if (slot >= slot_count) {
-        return;
-    }
-
-    ArticulatedContactRow row;
-    const uint32_t link = contact_link[slot];
-    if (link == kInvalidLink || link >= state.total_link_count) {
-        row.row_type = ContactRowType::kRowInactive;
-        row.articulation = kInvalidLink;
-        row.contact_link = kInvalidLink;
-        out_rows[slot] = row;
-        return;
-    }
-
-    const math::Vec3 normal = NormalizeOrUpLocal(contact_normal[slot]);
-    math::Vec3 t1;
-    math::Vec3 t2;
-    TangentBasis(normal, &t1, &t2);
-
-    row.row_type = ContactRowType::kRowNormal;
-    row.articulation = state.link_to_articulation[link];
-    row.contact_link = link;
-    row.effective_mass = normal_effective_mass[slot];
-    row.effective_mass_t1 = tangent1_effective_mass[slot];
-    row.effective_mass_t2 = tangent2_effective_mass[slot];
-    row.depth = contact_depth[slot];
-    row.normal = normal;
-    row.tangent1 = t1;
-    row.tangent2 = t2;
-    out_rows[slot] = row;
-}
-
-// ===========================================================================
-// UNION-family kernels (NEW).
-// ===========================================================================
 
 // Vec3 normalize — EXACT host math::Vec3::Normalized expression (len = sqrt,
 // 1e-12 guard, component-wise division), so the emitted row directions match
@@ -322,32 +179,6 @@ __forceinline__ __device__ math::Vec3 NormalizedHostExpr(math::Vec3 v) {
     if (len < 1e-12f) return {0.0f, 0.0f, 0.0f};
     return {v.x / len, v.y / len, v.z / len};
 }
-
-// K1: per-(env x dof) flat prefix-sum qdot pack — the legacy host pack loop
-// (link_velocity[root].v[i] for base DOFs, qdot[link] for scalar joints) via
-// the cooked dof maps.
-__global__ void PackQdotFlatKernel(const Spatial6* __restrict__ link_velocity,
-                                   const float* __restrict__ qdot,
-                                   const uint32_t* __restrict__ dof_to_link,
-                                   const uint32_t* __restrict__ dof_to_component,
-                                   uint32_t env_count,
-                                   uint32_t dof_stride,
-                                   uint32_t base_link_count,
-                                   float* __restrict__ qdot_flat) {
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t total = env_count * dof_stride;
-    if (gid >= total) return;
-    const uint32_t env = gid / dof_stride;
-    const uint32_t k = gid - env * dof_stride;
-    const uint32_t link = dof_to_link[gid];
-    const uint32_t comp = dof_to_component[gid];
-    const size_t gl = static_cast<size_t>(env) * base_link_count + link;
-    qdot_flat[gid] = (comp != ~0u) ? link_velocity[gl].v[comp] : qdot[gl];
-    (void)k;
-}
-
-// EmitUnionRowsKernel (the UnionCsr K2 row emitter) was DELETED here. The
-// ONE general path emits its rows via EmitPairDrivenRowsKernel below.
 
 // Each articulation's flat velocity tile follows its actual joint DOF prefix; padding is zero.
 __global__ void PackQdotFlatMultiKernel(ArticulationDeviceState state, uint32_t dof_stride,
@@ -388,45 +219,6 @@ __global__ void FoldMimicJacobianKernel(const NkRow* __restrict__ urows,
         jacobian[k] = 0.0f;
     }
 }
-
-// A warp screens consecutive rows, then evaluates each active articulation row in DOF order.
-// Each dot product retains its ascending-column accumulation.
-template <bool side_b>
-__global__ void ComputeRowMinvJtKernel(const NkRow* __restrict__ urows,
-                                       const float* __restrict__ chain_jacobian,
-                                       const float* __restrict__ m_inv,
-                                       uint32_t total_rows,
-                                       uint32_t dof_stride,
-                                       float* __restrict__ row_minv_jt) {
-    const uint32_t lane = threadIdx.x % warpSize;
-    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t base = gid - lane;
-    uint32_t owner = 0u;
-    bool active = false;
-    if (gid < total_rows && (urows[gid].flags & nk::nk_row_flags::kActive)) {
-        const NkRowSide& endpoint = side_b ? urows[gid].b : urows[gid].a;
-        active = endpoint.kind == kNkSideArtic;
-        owner = endpoint.index;
-    }
-    uint32_t pending = __ballot_sync(0xffffffffu, active);
-    while (pending != 0u) {
-        const uint32_t first = static_cast<uint32_t>(__ffs(pending)) - 1u;
-        pending &= pending - 1u;
-        const uint32_t row = base + first;
-        const uint32_t articulation = __shfl_sync(0xffffffffu, owner, first);
-        const size_t tile = size_t{articulation} * dof_stride * dof_stride;
-        const float* const jacobian = chain_jacobian + size_t{row} * dof_stride;
-        for (uint32_t r = lane; r < dof_stride; r += warpSize) {
-            const float* const inverse_mass = m_inv + tile + size_t{r} * dof_stride;
-            float value = 0.0f;
-            for (uint32_t c = 0u; c < dof_stride; ++c) value += inverse_mass[c] * jacobian[c];
-            row_minv_jt[size_t{row} * dof_stride + r] = value;
-        }
-    }
-}
-
-// (union-era ComputeRowMeffKernel deleted — never launched; superseded by the
-// live ComputeRowMeffPairDrivenKernel and ComputeContactEffectiveMassKernel.)
 
 // ===========================================================================
 // GENERAL CONTACT PIPELINE (PairDriven) PairDriven-family assembly .
@@ -1043,13 +835,30 @@ __global__ void EmitJointRowsKernel(
             data.row_cj_link_b, data.row_penetration, data.row_damping, data.row_count);
 }
 
+// L^-1 J of a row's articulated sides; side 0 reads chain_jacobian, side 1 chain_jacobian_b.
+struct RowForward {
+    const float* side[2] = {nullptr, nullptr};
+};
+
+__device__ RowForward ForwardRowSides(const NkRow& row, uint32_t row_index,
+    const float* __restrict__ chain_jacobian, const float* __restrict__ chain_jacobian_b,
+    const float* __restrict__ mass_factor, uint32_t dof_stride, float* storage) {
+    RowForward forward;
+    const NkRowSide sides[2] = {row.a, row.b};
+    for (uint32_t s = 0u; s < 2u; ++s) {
+        if (sides[s].kind != kNkSideArtic) continue;
+        float* const y = storage + size_t{s} * dof_stride;
+        ForwardMass(mass_factor + size_t{sides[s].index} * dof_stride * dof_stride, dof_stride,
+                    (s == 0u ? chain_jacobian : chain_jacobian_b) + size_t{row_index} * dof_stride, nullptr, y);
+        forward.side[s] = y;
+    }
+    return forward;
+}
+
 __device__ float PairDrivenSideCoupling(
-    const NkRowSide& lhs, uint32_t lhs_side, uint32_t lhs_row,
-    const NkRowSide& rhs, uint32_t rhs_side, uint32_t rhs_row,
-    const float* __restrict__ chain_jacobian,
-    const float* __restrict__ row_minv_jt,
-    const float* __restrict__ chain_jacobian_b,
-    const float* __restrict__ row_minv_jt_b,
+    const NkRowSide& lhs, const float* lhs_forward,
+    const NkRowSide& rhs, const float* rhs_forward,
+    const float* __restrict__ mass_factor,
     const float* __restrict__ body_inv_mass,
     const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     PointMassView point_masses, uint32_t dof_stride) {
@@ -1063,15 +872,8 @@ __device__ float PairDrivenSideCoupling(
                    Dot3(lhs.jang, body_world_inv_inertia[lhs.index].Multiply(rhs.jang));
         }
         case kNkSideArtic: {
-            const float* const J = (lhs_side == 0u ? chain_jacobian
-                                                   : chain_jacobian_b) +
-                                   static_cast<size_t>(lhs_row) * dof_stride;
-            const float* const w = (rhs_side == 0u ? row_minv_jt
-                                                   : row_minv_jt_b) +
-                                   static_cast<size_t>(rhs_row) * dof_stride;
-            float coupling = 0.0f;
-            for (uint32_t r = 0u; r < dof_stride; ++r) coupling += J[r] * w[r];
-            return coupling;
+            const float* const factor = mass_factor + size_t{lhs.index} * dof_stride * dof_stride;
+            return MassDot(factor, dof_stride, lhs_forward, rhs_forward);
         }
         case kNkSideParticle:
         case kNkSideGrid: {
@@ -1089,11 +891,8 @@ struct SharedSideCoupling {
 };
 
 __device__ float PairDrivenRowCoupling(
-    const NkRow& lhs, uint32_t lhs_row, const NkRow& rhs, uint32_t rhs_row,
-    const float* __restrict__ chain_jacobian,
-    const float* __restrict__ row_minv_jt,
-    const float* __restrict__ chain_jacobian_b,
-    const float* __restrict__ row_minv_jt_b,
+    const NkRow& lhs, const RowForward& lhs_forward, const NkRow& rhs, const RowForward& rhs_forward,
+    const float* __restrict__ mass_factor,
     const float* __restrict__ body_inv_mass,
     const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     PointMassView point_masses, uint32_t dof_stride, SharedSideCoupling shared = {}) {
@@ -1104,9 +903,8 @@ __device__ float PairDrivenRowCoupling(
         for (uint32_t j = 0u; j < 2u; ++j) {
             coupling += i == j && ((shared.known >> i) & 1u) != 0u ? shared.value[i]
                 : PairDrivenSideCoupling(
-                      lhs_sides[i], i, lhs_row, rhs_sides[j], j, rhs_row,
-                      chain_jacobian, row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                      body_inv_mass, body_world_inv_inertia, point_masses, dof_stride);
+                      lhs_sides[i], lhs_forward.side[i], rhs_sides[j], rhs_forward.side[j],
+                      mass_factor, body_inv_mass, body_world_inv_inertia, point_masses, dof_stride);
         }
     }
     return coupling;
@@ -1179,13 +977,12 @@ __device__ float ContactReferenceVelocity(
     return velocity;
 }
 
-// Computes scalar masses and the symmetric response of each contact block.
-__global__ void ComputeRowMeffPairDrivenKernel(
+// Prepares contact compliance, initial-velocity forcing and diagnostic block responses.
+__global__ void PrepareContactRowsKernel(
     NkRow* __restrict__ urows,
     const float* __restrict__ chain_jacobian,
-    const float* __restrict__ row_minv_jt,
+    const float* __restrict__ mass_factor,
     const float* __restrict__ chain_jacobian_b,
-    const float* __restrict__ row_minv_jt_b,
     const float* __restrict__ body_inv_mass,
     const math::SymmetricMat3* __restrict__ body_world_inv_inertia,
     PointMassView point_masses,
@@ -1196,21 +993,23 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     const math::Vec3* __restrict__ step_particle,
     uint32_t total_rows, uint32_t dof_stride, float dt, VertexBlockLayout vertex_blocks,
     uint32_t rows_per_env, uint32_t contact_rows_per_env,
-    const uint32_t* __restrict__ contact_row_extent, float* __restrict__ row_meff) {
+    const uint32_t* __restrict__ contact_row_extent) {
     const uint32_t rs = blockIdx.x * blockDim.x + threadIdx.x;
     if (rs >= total_rows) return;
-    // Contact rows past the bound are empty and their effective mass is already zero.
+    // Contact rows past the active bound have no work.
     const uint32_t env_row = rs % rows_per_env;
     if (env_row < contact_rows_per_env &&
         env_row >= ContactRowBound(contact_row_extent, rs / rows_per_env, contact_rows_per_env)) return;
     if (!(urows[rs].flags & nk::nk_row_flags::kActive)) {
-        row_meff[rs] = 0.0f;
         return;
     }
     NkRow& row = urows[rs];
     if (TouchesVertexBlock(row.a, point_masses, vertex_blocks) ||
         TouchesVertexBlock(row.b, point_masses, vertex_blocks))
         row.flags |= nk::nk_row_flags::kVertexBlock;
+    const bool reference = (row.flags & nk::nk_row_flags::kContactNormal) &&
+        !(row.flags & (nk::nk_row_flags::kVelocityOnly | nk::nk_row_flags::kSpeculative));
+    if (!reference && !(row.flags & nk::nk_row_flags::kBlockNormal)) return;
     uint32_t tangent_rows[2] = {0u, 0u};
     const bool block = BlockTangentRows(urows, rs, row, tangent_rows);
     const uint32_t tangent1_row = tangent_rows[0], tangent2_row = tangent_rows[1];
@@ -1234,12 +1033,14 @@ __global__ void ComputeRowMeffPairDrivenKernel(
             }
         }
     }
+    // One forward solve per articulated side of the normal and its tangents; couplings are weighted dots.
+    float* const storage = static_cast<float*>(alloca(size_t{6u} * dof_stride * sizeof(float)));
+    const RowForward forward = ForwardRowSides(row, rs, chain_jacobian, chain_jacobian_b, mass_factor,
+                                               dof_stride, storage);
     float diagonal = PairDrivenRowCoupling(
-        row, rs, row, rs, chain_jacobian, row_minv_jt, chain_jacobian_b,
-        row_minv_jt_b, body_inv_mass, body_world_inv_inertia, point_masses,
+        row, forward, row, forward, mass_factor, body_inv_mass, body_world_inv_inertia, point_masses,
         dof_stride);
-    if ((row.flags & nk::nk_row_flags::kContactNormal) &&
-        !(row.flags & (nk::nk_row_flags::kVelocityOnly | nk::nk_row_flags::kSpeculative))) {
+    if (reference) {
         // Scale impedance by J*M^-1*J^T so compliance is independent of mass units.
         row.compliance_alpha *= fmaxf(diagonal, 0.0f);
         const float initial_velocity = ContactReferenceVelocity(
@@ -1249,7 +1050,6 @@ __global__ void ComputeRowMeffPairDrivenKernel(
         row.rhs += initial_velocity / dt;
     }
     diagonal += row.compliance_alpha;
-    row_meff[rs] = diagonal > 1.0e-12f ? 1.0f / diagonal : 0.0f;
     if (!(row.flags & nk::nk_row_flags::kBlockNormal)) return;
     if (!block) {
         row.contact_response = {};
@@ -1257,45 +1057,34 @@ __global__ void ComputeRowMeffPairDrivenKernel(
     }
     const NkRow& tangent1 = urows[tangent1_row];
     const NkRow& tangent2 = urows[tangent2_row];
+    const RowForward forward1 = ForwardRowSides(tangent1, tangent1_row, chain_jacobian, chain_jacobian_b,
+                                                mass_factor, dof_stride, storage + size_t{2u} * dof_stride);
+    const RowForward forward2 = ForwardRowSides(tangent2, tangent2_row, chain_jacobian, chain_jacobian_b,
+                                                mass_factor, dof_stride, storage + size_t{4u} * dof_stride);
     // Normalize by (1+b*dt) to retain a symmetric block with R/(1+b*dt).
-    // Keep row_meff's A+R for the geometric position pass.
     const float damping_scale = 1.0f / (1.0f + row_damping[rs] * dt);
     const float k00 = diagonal - row.compliance_alpha * (1.0f - damping_scale);
     const float k11 = PairDrivenRowCoupling(
-        tangent1, tangent1_row, tangent1, tangent1_row, chain_jacobian,
-        row_minv_jt, chain_jacobian_b, row_minv_jt_b, body_inv_mass,
+        tangent1, forward1, tangent1, forward1, mass_factor, body_inv_mass,
         body_world_inv_inertia, point_masses, dof_stride, shared[0]) + tangent1.compliance_alpha;
     const float k22 = PairDrivenRowCoupling(
-        tangent2, tangent2_row, tangent2, tangent2_row, chain_jacobian,
-        row_minv_jt, chain_jacobian_b, row_minv_jt_b, body_inv_mass,
+        tangent2, forward2, tangent2, forward2, mass_factor, body_inv_mass,
         body_world_inv_inertia, point_masses, dof_stride, shared[1]) + tangent2.compliance_alpha;
     const float k01 = 0.5f * (
-        PairDrivenRowCoupling(row, rs, tangent1, tangent1_row, chain_jacobian,
-                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                              body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride, shared[2]) +
-        PairDrivenRowCoupling(tangent1, tangent1_row, row, rs, chain_jacobian,
-                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                              body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride, shared[2]));
+        PairDrivenRowCoupling(row, forward, tangent1, forward1, mass_factor, body_inv_mass,
+                              body_world_inv_inertia, point_masses, dof_stride, shared[2]) +
+        PairDrivenRowCoupling(tangent1, forward1, row, forward, mass_factor, body_inv_mass,
+                              body_world_inv_inertia, point_masses, dof_stride, shared[2]));
     const float k02 = 0.5f * (
-        PairDrivenRowCoupling(row, rs, tangent2, tangent2_row, chain_jacobian,
-                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                              body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride, shared[3]) +
-        PairDrivenRowCoupling(tangent2, tangent2_row, row, rs, chain_jacobian,
-                              row_minv_jt, chain_jacobian_b, row_minv_jt_b,
-                              body_inv_mass, body_world_inv_inertia, point_masses,
-                              dof_stride, shared[3]));
+        PairDrivenRowCoupling(row, forward, tangent2, forward2, mass_factor, body_inv_mass,
+                              body_world_inv_inertia, point_masses, dof_stride, shared[3]) +
+        PairDrivenRowCoupling(tangent2, forward2, row, forward, mass_factor, body_inv_mass,
+                              body_world_inv_inertia, point_masses, dof_stride, shared[3]));
     const float k12 = 0.5f * (
-        PairDrivenRowCoupling(tangent1, tangent1_row, tangent2, tangent2_row,
-                              chain_jacobian, row_minv_jt, chain_jacobian_b,
-                              row_minv_jt_b, body_inv_mass, body_world_inv_inertia,
-                              point_masses, dof_stride, shared[4]) +
-        PairDrivenRowCoupling(tangent2, tangent2_row, tangent1, tangent1_row,
-                              chain_jacobian, row_minv_jt, chain_jacobian_b,
-                              row_minv_jt_b, body_inv_mass, body_world_inv_inertia,
-                              point_masses, dof_stride, shared[4]));
+        PairDrivenRowCoupling(tangent1, forward1, tangent2, forward2, mass_factor, body_inv_mass,
+                              body_world_inv_inertia, point_masses, dof_stride, shared[4]) +
+        PairDrivenRowCoupling(tangent2, forward2, tangent1, forward1, mass_factor, body_inv_mass,
+                              body_world_inv_inertia, point_masses, dof_stride, shared[4]));
     row.contact_response = {k00, k11, k22, k01, k02, k12};
 }
 
@@ -1724,117 +1513,28 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                        static_cast<const float*>(data.mimic_root_scale),
                        total_rows, p->max_dof, data.chain_jacobian_b);
         }
-        const float* const inverse =
-            static_cast<const float*>(mimic ? data.m_inv_coupled : data.m_inv);
-
-        // Both articulation endpoints use the same row compaction and matrix product.
-        LaunchCuda(ComputeRowMinvJtKernel<false>, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   reinterpret_cast<const NkRow*>(data.urows),
-                   static_cast<const float*>(data.chain_jacobian),
-                   inverse, total_rows, p->max_dof, data.row_minv_jt);
-        LaunchCuda(ComputeRowMinvJtKernel<true>, dim3(blocks), dim3(kBlockSize), 0u, stream,
-                   reinterpret_cast<const NkRow*>(data.urows),
-                   static_cast<const float*>(data.chain_jacobian_b),
-                   inverse, total_rows, p->max_dof, data.row_minv_jt_b);
     }
 
-    // K4b: per-row effective mass over both arms (correct arrays per side).
+    // Both endpoints contribute to contact preparation and diagnostic response.
     {
         const uint32_t blocks = (total_rows + kBlockSize - 1u) / kBlockSize;
-        LaunchCuda(ComputeRowMeffPairDrivenKernel, dim3(blocks), dim3(kBlockSize), 0u,
+        LaunchCuda(PrepareContactRowsKernel, dim3(blocks), dim3(kBlockSize), 0u,
                    stream, reinterpret_cast<NkRow*>(data.urows),
                    static_cast<const float*>(data.chain_jacobian),
-                   static_cast<const float*>(data.row_minv_jt),
+                   static_cast<const float*>(data.m_factor),
                    static_cast<const float*>(data.chain_jacobian_b),
-                   static_cast<const float*>(data.row_minv_jt_b),
                    static_cast<const float*>(data.body_inv_mass),
                    static_cast<const math::SymmetricMat3*>(data.body_world_inv_inertia),
                    PointMasses(data),
                    data.row_damping, data.step_qdot_flat, data.step_body_linear_velocity,
                    data.step_body_angular_velocity, data.step_particle_velocity,
                    total_rows, p->max_dof, p->dt, p->vertex_blocks, p->rows_per_env,
-                   p->contact_rows_per_env, data.contact_row_extent, data.row_meff);
+                   p->contact_rows_per_env, data.contact_row_extent);
     }
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 
 // --- op entry point ---------------------------------------------------------
-
-Status OpAssembleRowsFused(const ModelView& model, const DataView& data,
-                           const AssembleRowsParams* p, cudaStream_t stream) {
-    if (p->slot_count == 0u || p->max_dof == 0u || p->env_count == 0u) {
-        return Status::Ok;
-    }
-    const ArticulationDeviceState state = MakeArticulationDeviceState(
-        model, data, p->total_link_count, p->articulation_count);
-    constexpr uint32_t kBlockSize = kContactRowsBlock;
-    const uint32_t block_count = (p->slot_count + kBlockSize - 1u) / kBlockSize;
-
-    // Chain Jacobians (normal, t1, t2) — the legacy launcher zeroes the output
-    // first so untouched columns are zero; same here (a stream memset, captured
-    // fine by the plan path; NOT an allocation).
-    const size_t jac_bytes =
-        static_cast<size_t>(p->slot_count) * p->max_dof * sizeof(float);
-    if (cudaMemsetAsync(data.jac_normal, 0, jac_bytes, stream) != cudaSuccess ||
-        cudaMemsetAsync(data.jac_tangent1, 0, jac_bytes, stream) != cudaSuccess ||
-        cudaMemsetAsync(data.jac_tangent2, 0, jac_bytes, stream) != cudaSuccess) {
-        return Status::Failed;
-    }
-    LaunchCuda(ComputeContactChainJacobianKernel, dim3(block_count), dim3(kBlockSize),
-               0u, stream, state,
-               static_cast<const uint32_t*>(data.contact_link),
-               static_cast<const math::Vec3*>(data.contact_point),
-               static_cast<const math::Vec3*>(data.contact_normal),
-               p->slot_count, p->max_dof, data.jac_normal);
-    LaunchCuda(ComputeContactChainJacobianKernel, dim3(block_count), dim3(kBlockSize),
-               0u, stream, state,
-               static_cast<const uint32_t*>(data.contact_link),
-               static_cast<const math::Vec3*>(data.contact_point),
-               static_cast<const math::Vec3*>(data.contact_tangent1),
-               p->slot_count, p->max_dof, data.jac_tangent1);
-    LaunchCuda(ComputeContactChainJacobianKernel, dim3(block_count), dim3(kBlockSize),
-               0u, stream, state,
-               static_cast<const uint32_t*>(data.contact_link),
-               static_cast<const math::Vec3*>(data.contact_point),
-               static_cast<const math::Vec3*>(data.contact_tangent2),
-               p->slot_count, p->max_dof, data.jac_tangent2);
-
-    // Effective masses for normal + t1 + t2 rows.
-    LaunchCuda(ComputeContactEffectiveMassKernel, dim3(block_count), dim3(kBlockSize),
-               0u, stream, state,
-               static_cast<const uint32_t*>(data.contact_link),
-               static_cast<const float*>(data.jac_normal),
-               static_cast<const float*>(data.m_inv),
-               p->slot_count, p->max_dof, data.contact_meff_normal);
-    LaunchCuda(ComputeContactEffectiveMassKernel, dim3(block_count), dim3(kBlockSize),
-               0u, stream, state,
-               static_cast<const uint32_t*>(data.contact_link),
-               static_cast<const float*>(data.jac_tangent1),
-               static_cast<const float*>(data.m_inv),
-               p->slot_count, p->max_dof, data.contact_meff_tangent1);
-    LaunchCuda(ComputeContactEffectiveMassKernel, dim3(block_count), dim3(kBlockSize),
-               0u, stream, state,
-               static_cast<const uint32_t*>(data.contact_link),
-               static_cast<const float*>(data.jac_tangent2),
-               static_cast<const float*>(data.m_inv),
-               p->slot_count, p->max_dof, data.contact_meff_tangent2);
-
-    // Assemble the per-slot row set.
-    LaunchCuda(AssembleArticulatedContactRowsKernel, dim3(block_count), dim3(kBlockSize),
-               0u, stream, state,
-               static_cast<const uint32_t*>(data.contact_link),
-               static_cast<const math::Vec3*>(data.contact_normal),
-               static_cast<const float*>(data.contact_depth),
-               static_cast<const float*>(data.contact_meff_normal),
-               static_cast<const float*>(data.contact_meff_tangent1),
-               static_cast<const float*>(data.contact_meff_tangent2),
-               p->slot_count,
-               reinterpret_cast<ArticulatedContactRow*>(data.rows));
-    return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
-}
-
-// OpAssembleRowsUnion (the UnionCsr K1-K4 assembly orchestrator) was
-// DELETED here. The ONE general path assembles via OpAssembleRowsPairDriven.
 
 Status OpAssembleRows(const ModelView& model, const DataView& data,
                       const void* params, cudaStream_t stream) {
@@ -1842,18 +1542,8 @@ Status OpAssembleRows(const ModelView& model, const DataView& data,
     if (p == nullptr) {
         return Status::Failed;
     }
-    if (p->family == kContactFamilyPairDriven) {
-        return OpAssembleRowsPairDriven(model, data, p, stream);
-    }
-    if (p->rows_per_env > 0u) {
-        const size_t damping_bytes =
-            static_cast<size_t>(p->env_count) * p->rows_per_env * sizeof(float);
-        if (data.row_damping == nullptr ||
-            cudaMemsetAsync(data.row_damping, 0, damping_bytes, stream) != cudaSuccess) {
-            return Status::Failed;
-        }
-    }
-    return OpAssembleRowsFused(model, data, p, stream);
+    return p->family == kContactFamilyPairDriven
+        ? OpAssembleRowsPairDriven(model, data, p, stream) : Status::Failed;
 }
 
 } // namespace

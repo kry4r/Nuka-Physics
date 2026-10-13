@@ -2,12 +2,7 @@
 // ---------------------------------------------------------------------------
 // nuka::math::gpu - shared __device__ small-vector / quaternion primitives
 //
-// This header consolidates the per-TU `__device__` helper functions that are
-// currently re-declared inside the anonymous namespace of nearly every CUDA
-// physics translation unit (broadphase.cu, contact_generation.cu,
-// invariants_gpu.cu, cuda_particle_world.cu, batched_device_world.cu,
-// row_solver.cu, cuda_sensors.cu, articulation_jacobian.cu,
-// articulation_contacts.cu, featherstone_aba.cu, ...).
+// Shared `__device__` helpers for the CUDA physics translation units.
 //
 // DETERMINISM CONTRACT (D1 strong determinism):
 //   Every function body below reproduces the EXACT floating-point expression
@@ -46,7 +41,7 @@ namespace nuka::math::gpu {
 // Constructors (device aggregate builders)
 // ---------------------------------------------------------------------------
 
-// Brace-init form (featherstone_aba.cu style).
+// Brace-init form.
 // Marked __host__ __device__: batched_device_world.cu's MakeVec3 is the only
 // copy declared __host__ __device__ (the others are __device__-only); making the
 // shared symbol HD covers that signature so the batched migration compiles, and
@@ -155,9 +150,7 @@ __forceinline__ __device__ Vec3 NormalizeSqrt(Vec3 v, float eps, Vec3 fallback) 
 }
 
 // Family B: rsqrtf(Dot)-scale, branch on length_sq, fallback +Z (1e-10).
-//   Used by:  articulation_jacobian.cu NormalizeOrUp
-//             articulation_contacts.cu NormalizeOrUpLocal
-// Body is byte-identical between the two copies (rsqrtf, 1e-10, {0,0,1}).
+// rsqrtf scale with a 1e-10 floor and a {0,0,1} fallback.
 __forceinline__ __device__ Vec3 NormalizeOrUp(Vec3 normal) {
     const float length_sq = Dot(normal, normal);
     if (length_sq > 1.0e-10f) {
@@ -187,8 +180,7 @@ __forceinline__ __device__ Quat QuatIdentity() {
 }
 
 // Hamilton product a * b (w-first), mirroring math::Quat::operator*.
-// Identical body in articulation_contacts.cu (QuatMul), batched (Mul),
-// row_solver (Multiply); op order is fixed across all copies.
+// Op order is fixed.
 __forceinline__ __device__ Quat QuatMul(Quat a, Quat b) {
     return MakeQuat(
         a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
@@ -231,7 +223,6 @@ __forceinline__ __device__ Quat QuatNormalizeSqrtLt(Quat q, float eps) {
 }
 
 // Family Q-B: norm_sq then rsqrtf, branch norm_sq <= eps, fallback identity.
-// Used by articulation_contacts.cu QuatNormalize (eps 1e-12).
 __forceinline__ __device__ Quat QuatNormalizeRsqrt(Quat q, float eps) {
     const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
     if (norm_sq <= eps) {
@@ -242,8 +233,7 @@ __forceinline__ __device__ Quat QuatNormalizeRsqrt(Quat q, float eps) {
 }
 
 // Family Q-C: norm_sq then rsqrtf in-place, branch norm_sq < eps (strict),
-// fallback identity. Used by featherstone_aba.cu QuatNormalizeForward
-// (eps 1e-24, `<`). Distinct boundary => separate symbol.
+// fallback identity. The strict boundary is why this is a separate symbol.
 __forceinline__ __device__ Quat QuatNormalizeForwardRsqrt(Quat q, float eps) {
     const float norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
     if (norm_sq < eps) {

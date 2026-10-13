@@ -1,28 +1,4 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// PHI v2 CUDA backend — M3b articulation op shared types.
-//
-// VERBATIM local copies of the articulation device-state types
-// (runtime/articulation/articulation_state.hpp + articulation_contacts.hpp).
-// They were duplicated here (NOT #included) because the ops layer includes the
-// PHI v2 phi/buffer.hpp (opaque `struct Buffer`), which used to collide with the
-// legacy `class phi::Buffer` that articulation_state.hpp pulled in via the
-// (now-deleted) legacy buffer header. That collision is now GONE -- the legacy
-// RAII buffer was removed in the M11 BUF sweep and articulation_state.hpp is on the
-// v2 phi/buffer.hpp -- so these PODs can fold to the single runtime definition.
-// NAMED DEBT (M11 OD-18, fast-follow): the
-// collapse is deferred to keep the buffer sweep's blast radius off the byte-D1
-// ops kernel layer; the layouts are byte-identical (static_asserts below guard
-// the contract) so no behavioral risk while the duplication remains.
-//
-// LAYOUT CONTRACT (the byte-exact port hinges on it):
-//   * every struct is the exact legacy layout (float[6]/float[36] PODs);
-//   * ArticulationJointType is uint8_t-backed and the Model joint_type field is
-//     staged as u8, so the table aliases as ArticulationJointType* directly;
-//   * MakeArticulationDeviceState builds the legacy kernel-parameter struct
-//     from the generated ModelView/DataView — the ONLY thing the port changes
-//     is where the pointers come from (the plan §3.2 contract).
-// ---------------------------------------------------------------------------
 
 #include <cstdint>
 
@@ -35,7 +11,6 @@
 
 namespace nuka::phi::nkops {
 
-// --- runtime/articulation/articulation_state.hpp (verbatim) ----------------
 using phi::ArticulationJointType;
 
 struct LinkSpatialInertia {
@@ -52,10 +27,6 @@ struct LinkSpatialAccel {
 
 struct LinkSpatialTransform {
     float X[36] = {};
-};
-
-struct LinkArticulatedInertia {
-    float Ia[36] = {};
 };
 
 struct LinkBiasForce {
@@ -84,9 +55,7 @@ struct ArticulationDeviceState {
     LinkSpatialAccel* link_acceleration = nullptr;
     LinkSpatialTransform* link_xup = nullptr;
     LinkSpatialVel* link_velocity_bias = nullptr;
-    LinkArticulatedInertia* link_articulated_I = nullptr;
     LinkBiasForce* link_bias_force = nullptr;
-    LinkBiasForce* link_u_spatial = nullptr;
     LinkMotionSubspace* joint_motion_subspace = nullptr;
     math::Transform* link_pose = nullptr;
     math::Transform* link_local_pose = nullptr;
@@ -99,8 +68,6 @@ struct ArticulationDeviceState {
     float* joint_damping = nullptr;
     float* joint_armature = nullptr;
     float* joint_frictionloss = nullptr;
-    float* joint_diagonal = nullptr;
-    float* joint_force = nullptr;
     math::Vec3* joint_axis = nullptr;
     math::Vec3* parent_offset = nullptr;
     ArticulationJointType* joint_type = nullptr;
@@ -113,19 +80,8 @@ struct ArticulationDeviceState {
     uint32_t articulation_count = 0;
 };
 
-// --- runtime/articulation/articulation_contacts.hpp (verbatim) -------------
-// Compile-time MAX per-env end-effector contacts (capacity ceiling, not a robot
-// assumption; the live count is the cooked contact-capable link count).
 constexpr uint32_t kMaxFootContactsPerEnv = 4u;
 
-// Compile-time MAX per-ARTICULATION contact-slot stride sizing the solver's
-// per-slot register arrays (lambda_n/t1/t2). The ACTUAL stride is the data-driven
-// per-world quotient max_contacts_per_env / articulations_per_env, bounded by this
-// ceiling, so K co-resident articulations each get room for end-effector +
-// body-terrain + inter-articulation rows in ONE block. At K<=1 the live stride is
-// EXACTLY kMaxFootContactsPerEnv (4) -> byte-identical. Raising the array sizes
-// does not change any float op for a live stride <= 4 (the loop is bounded by the
-// runtime stride; extra slots are never visited at K==1).
 constexpr uint32_t kMaxContactsPerArtic = 12u;
 
 struct FootShape {
@@ -135,43 +91,9 @@ struct FootShape {
 };
 
 constexpr float kInertiaDiagonalEpsilon = 1.0e-6f;
-constexpr float kEffectiveMassDenomEpsilon = 1.0e-9f;
 constexpr float kBaumgarteBeta = 0.2f;
 constexpr float kPenetrationSlop = 1.0e-4f;
 
-enum class ContactRowType : uint32_t {
-    kRowInactive = 0u,
-    kRowNormal = 1u,
-    kRowFriction1 = 2u,
-    kRowFriction2 = 3u,
-    kRowJointLimit = 4u,
-};
-
-struct ArticulatedContactRow {
-    ContactRowType row_type = ContactRowType::kRowInactive;
-    uint32_t articulation = ~0u;
-    uint32_t contact_link = ~0u;
-    float effective_mass = 0.0f;
-    float effective_mass_t1 = 0.0f;
-    float effective_mass_t2 = 0.0f;
-    float depth = 0.0f;
-    math::Vec3 normal{};
-    math::Vec3 tangent1{};
-    math::Vec3 tangent2{};
-};
-
-using phi::kMaxArticulationDof;
-
-// The rows DataView field is f32 elem:16 per row_slot (64B) — the exact
-// ArticulatedContactRow footprint, so the field aliases as the struct.
-static_assert(sizeof(ArticulatedContactRow) == 16 * sizeof(float),
-              "rows field elem:16 must match ArticulatedContactRow");
-static_assert(sizeof(FootShape) == 5 * sizeof(float),
-              "foot_shape field packs 5 scalars per slot");
-static_assert(sizeof(math::Transform) == 7 * sizeof(float),
-              "transform dtype lanes==7");
-
-// --- runtime/articulation/articulation_device_helpers.cuh (verbatim bodies) -
 __forceinline__ __device__ uint32_t JointDofCountDevice(ArticulationJointType type) {
     switch (type) {
         case ArticulationJointType::Revolute:
@@ -300,9 +222,7 @@ inline ArticulationDeviceState MakeArticulationDeviceState(
     s.link_acceleration = reinterpret_cast<LinkSpatialAccel*>(data.link_acceleration);
     s.link_xup = reinterpret_cast<LinkSpatialTransform*>(data.link_xup);
     s.link_velocity_bias = reinterpret_cast<LinkSpatialVel*>(data.link_velocity_bias);
-    s.link_articulated_I = reinterpret_cast<LinkArticulatedInertia*>(data.link_articulated_I);
     s.link_bias_force = reinterpret_cast<LinkBiasForce*>(data.link_bias_force);
-    s.link_u_spatial = reinterpret_cast<LinkBiasForce*>(data.link_u_spatial);
     s.joint_motion_subspace =
         reinterpret_cast<LinkMotionSubspace*>(data.joint_motion_subspace);
     s.link_pose = data.link_pose;
@@ -316,8 +236,6 @@ inline ArticulationDeviceState MakeArticulationDeviceState(
     s.joint_damping = model.joint_damping;
     s.joint_armature = model.joint_armature;
     s.joint_frictionloss = model.joint_frictionloss;
-    s.joint_diagonal = data.joint_diagonal;
-    s.joint_force = data.joint_force;
     s.joint_axis = model.joint_axis;
     s.parent_offset = model.parent_offset;
     s.joint_type = reinterpret_cast<ArticulationJointType*>(model.joint_type);

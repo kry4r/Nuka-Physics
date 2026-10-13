@@ -199,7 +199,7 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
 // ---------------------------------------------------------------------------
 // Media records -> particle cook. The per-medium builders read a scene
 // MediaRecord and reuse the SAME topology/lattice cookers
-// (soft::BuildClothVertexBlocks / import::cooker::CookFluidBox) -- never
+// (soft::BuildClothVertexBlocks / import::cooker::CookParticleBox) -- never
 // reimplemented. The dispatch concatenates vertex-block media into the soft slice and
 // MLS-MPM media onto one grid, composing them with CookMpmVbd when both are present.
 // ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media);
 VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media);
 
 // Build the MLS-MPM cook input for a tet-soft / fluid MediaRecord: particles sampled
-// from the geometry (sphere lattice / CookFluidBox), material + grid from MediaMpmMaterial.
+// from the geometry (sphere lattice / CookParticleBox), material + grid from MediaMpmMaterial.
 MpmCookInput BuildMpmInput(const MediaRecord& media);
 
 // Concatenate MPM media and material tables onto one grid with matching spacing and floor.

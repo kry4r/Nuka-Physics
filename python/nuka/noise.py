@@ -160,15 +160,10 @@ class DomainRandomization:
     are MULTIPLIER ranges ``[lo, hi]`` applied as ``nominal * mult``;
     ``restitution_range`` / ``armature_range`` / ``gravity_range`` are OFFSET ranges
     applied as ``nominal + offset``. Each is sampled ONCE per env per episode-reset
-    as a pure function of ``(seed, env_idx, param)`` via counter-based Philox, so
-    the diff-sim backward stays D1 two-run bit-exact.
+    as a pure function of ``(seed, env_idx, param)`` via counter-based Philox.
 
     ``enabled=False`` (or never configuring) makes ``apply`` a byte no-op (V1
     oracle scenes stay byte-identical unless DR is explicitly enabled).
-
-    NOTE: ``apply`` must be called BEFORE ``nuka.Tape.create`` -- the tape
-    captures gravity at create time and mass must be in place before the first
-    ``step_with_tape``.
     """
 
     mass_range: Tuple[float, float] = (0.8, 1.2)
@@ -193,7 +188,7 @@ class DomainRandomization:
     def apply(self, world) -> None:
         """Record + sample + apply the randomization for ALL envs.
 
-        Call at episode reset, BEFORE creating a ``nuka.Tape``. ``enabled=False``
+        Call at episode reset, before stepping. ``enabled=False``
         -> a byte no-op. The first enabled apply snapshots a nominal baseline so
         repeated applies re-randomize AROUND nominal (idempotent), not compound.
         """

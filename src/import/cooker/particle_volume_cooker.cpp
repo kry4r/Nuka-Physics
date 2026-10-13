@@ -1,10 +1,6 @@
-// ---------------------------------------------------------------------------
-// nuka::import::cooker -- PBF fluid cooker (v0.7 p10-B). See fluid_cooker.hpp for
-// the sampling convention + scope. THIN: no simulation math here, only a
-// deterministic uniform-lattice fill + the uniform mass mapping.
-// ---------------------------------------------------------------------------
+// Host particle volume and surface sampling.
 
-#include "import/cooker/fluid_cooker.hpp"
+#include "import/cooker/particle_volume_cooker.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -16,7 +12,7 @@ namespace nuka::import::cooker {
 
 namespace {
 using math::Vec3;
-using runtime::fluid::PbfParticleSet;
+using runtime::fluid::ParticleLattice;
 
 double HalfUlp(float value) {
     const double upper = double(std::nextafter(value, std::numeric_limits<float>::infinity())) - value;
@@ -43,7 +39,7 @@ uint32_t AxisCount(float lower, float upper, float spacing) {
     return static_cast<uint32_t>(n);
 }
 
-bool SpecValid(const FluidBoxSpec& spec) {
+bool SpecValid(const ParticleVolumeSpec& spec) {
     return spec.spacing > 0.0f && std::isfinite(spec.spacing) &&
            spec.rest_density > 0.0f && std::isfinite(spec.rest_density);
 }
@@ -61,8 +57,8 @@ float CellJitterUnit(uint32_t ix, uint32_t iy, uint32_t iz, uint32_t axis) {
 }
 }  // namespace
 
-FluidLatticeCounts FluidBoxLatticeCounts(const FluidBoxSpec& spec) {
-    FluidLatticeCounts c;
+ParticleLatticeCounts ParticleBoxLatticeCounts(const ParticleVolumeSpec& spec) {
+    ParticleLatticeCounts c;
     if (!SpecValid(spec)) {
         return c;  // all-zero.
     }
@@ -77,22 +73,22 @@ FluidLatticeCounts FluidBoxLatticeCounts(const FluidBoxSpec& spec) {
     return c;
 }
 
-float FluidParticleMass(const FluidBoxSpec& spec) {
+float LatticeParticleMass(const ParticleVolumeSpec& spec) {
     // mass of fluid filling one cubic cell at the rest density.
     return spec.rest_density * spec.spacing * spec.spacing * spec.spacing;
 }
 
-PbfParticleSet CookFluidBox(const FluidBoxSpec& spec) {
-    PbfParticleSet out;
+ParticleLattice CookParticleBox(const ParticleVolumeSpec& spec) {
+    ParticleLattice out;
     if (!SpecValid(spec)) {
         return out;  // empty set on a bad spec (no throw).
     }
-    const FluidLatticeCounts counts = FluidBoxLatticeCounts(spec);
+    const ParticleLatticeCounts counts = ParticleBoxLatticeCounts(spec);
     if (counts.total == 0u) {
         return out;
     }
 
-    out.particle_mass = FluidParticleMass(spec);
+    out.particle_mass = LatticeParticleMass(spec);
     out.positions.reserve(counts.total);
     out.velocities.assign(counts.total, Vec3{0.0f, 0.0f, 0.0f});
 
@@ -122,9 +118,9 @@ PbfParticleSet CookFluidBox(const FluidBoxSpec& spec) {
     return out;
 }
 
-PbfParticleSet CookFluidSphere(const FluidBoxSpec& spec) {
-    const PbfParticleSet box = CookFluidBox(spec);
-    PbfParticleSet out;
+ParticleLattice CookParticleSphere(const ParticleVolumeSpec& spec) {
+    const ParticleLattice box = CookParticleBox(spec);
+    ParticleLattice out;
     out.particle_mass = box.particle_mass;
     if (box.positions.empty()) {
         return out;

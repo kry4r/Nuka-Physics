@@ -33,13 +33,10 @@ const char* OpName(nuka::phi::NkOp op) {
     using nuka::phi::NkOp;
     switch (op) {
         case NkOp::ApplyDrives: return "ApplyDrives";
-        case NkOp::AbaForward: return "AbaForward";
+        case NkOp::ArticulationDynamics: return "ArticulationDynamics";
         case NkOp::IntegrateVelocity: return "IntegrateVelocity";
         case NkOp::FkWorldPoses: return "FkWorldPoses";
         case NkOp::IntegratePosition: return "IntegratePosition";
-        case NkOp::CrbaComputeM: return "CrbaComputeM";
-        case NkOp::CrbaFactorM: return "CrbaFactorM";
-        case NkOp::ApplyImplicitDamping: return "ApplyImplicitDamping";
         case NkOp::BuildAabbs: return "BuildAabbs";
         case NkOp::LbvhBuild: return "LbvhBuild";
         case NkOp::LbvhQueryPairs: return "LbvhQueryPairs";

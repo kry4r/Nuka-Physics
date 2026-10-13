@@ -37,9 +37,6 @@ struct LinkSpatialTransform {
     float X[36] = {};
 };
 
-struct LinkArticulatedInertia {
-    float Ia[36] = {};
-};
 
 struct LinkBiasForce {
     float p[6] = {};
@@ -55,9 +52,7 @@ struct ArticulationDeviceState {
     LinkSpatialAccel* link_acceleration = nullptr;
     LinkSpatialTransform* link_xup = nullptr;
     LinkSpatialVel* link_velocity_bias = nullptr;
-    LinkArticulatedInertia* link_articulated_I = nullptr;
     LinkBiasForce* link_bias_force = nullptr;
-    LinkBiasForce* link_u_spatial = nullptr;
     LinkMotionSubspace* joint_motion_subspace = nullptr;
     math::Transform* link_pose = nullptr;
     math::Transform* link_local_pose = nullptr;
@@ -72,8 +67,6 @@ struct ArticulationDeviceState {
     float* tau = nullptr;
     float* joint_damping = nullptr;
     float* joint_armature = nullptr;
-    float* joint_diagonal = nullptr;
-    float* joint_force = nullptr;
     math::Vec3* joint_axis = nullptr;
     math::Vec3* parent_offset = nullptr;
     ArticulationJointType* joint_type = nullptr;
@@ -111,9 +104,7 @@ struct ArticulationHostState {
     std::vector<LinkSpatialAccel> link_acceleration;
     std::vector<LinkSpatialTransform> link_xup;
     std::vector<LinkSpatialVel> link_velocity_bias;
-    std::vector<LinkArticulatedInertia> link_articulated_inertia;
     std::vector<LinkBiasForce> link_bias_force;
-    std::vector<LinkBiasForce> link_u_spatial;
     std::vector<LinkMotionSubspace> joint_motion_subspace;
     std::vector<math::Transform> link_pose;
     std::vector<math::Transform> link_local_pose;
@@ -127,8 +118,6 @@ struct ArticulationHostState {
     std::vector<float> joint_damping;
     std::vector<float> joint_armature;
     std::vector<float> joint_frictionloss;
-    std::vector<float> joint_diagonal;
-    std::vector<float> joint_force;
     std::vector<math::Vec3> joint_axis;
     std::vector<math::Vec3> parent_offset;
     std::vector<ArticulationJointType> joint_type;
@@ -147,23 +136,13 @@ struct ArticulationHostState {
     }
 };
 
-// TEST-ORACLE HARNESS, NO PRODUCTION CONSUMER (M11 OD-17). The live engine path
-// serves articulation state DIRECTLY from the nk arena via
-// MakeArticulationDeviceStateFromViews (the M3b seam); this owned-buffer struct
-// is now consumed only by the oracle / parity / diffsim-FD test harnesses, which
-// upload a host state, run kernels, and read it back. The 29 members are phi v2
-// opaque Buffer* (allocated from the device-level DEFAULT, stream-0 BufferType in
-// UploadArticulationState -- byte+ordering identical to the legacy stream-0
-// host->device copy) with RAII teardown below.
 struct ArticulationDeviceBuffers {
     phi::Buffer* link_inertia = nullptr;
     phi::Buffer* link_velocity = nullptr;
     phi::Buffer* link_acceleration = nullptr;
     phi::Buffer* link_xup = nullptr;
     phi::Buffer* link_velocity_bias = nullptr;
-    phi::Buffer* link_articulated_inertia = nullptr;
     phi::Buffer* link_bias_force = nullptr;
-    phi::Buffer* link_u_spatial = nullptr;
     phi::Buffer* joint_motion_subspace = nullptr;
     phi::Buffer* link_pose = nullptr;
     phi::Buffer* link_local_pose = nullptr;
@@ -175,8 +154,6 @@ struct ArticulationDeviceBuffers {
     phi::Buffer* tau = nullptr;
     phi::Buffer* joint_damping = nullptr;
     phi::Buffer* joint_armature = nullptr;
-    phi::Buffer* joint_diagonal = nullptr;
-    phi::Buffer* joint_force = nullptr;
     phi::Buffer* joint_axis = nullptr;
     phi::Buffer* parent_offset = nullptr;
     phi::Buffer* joint_type = nullptr;
@@ -221,12 +198,6 @@ ArticulationDeviceBuffers UploadArticulationState(const ArticulationHostState& h
 void DownloadArticulationState(const ArticulationDeviceBuffers& device_state,
                                ArticulationHostState* host_state);
 
-// M3b nk seam: build the legacy kernel-parameter view from the nk arena views
-// (the generated phi::ModelView/DataView member names match these fields 1:1
-// BY DESIGN). The ONLY change for a consumer (diffsim StepBackward / Tape /
-// BackwardRunner, c_abi at M9) is where the pointers come from — the kernels
-// and algorithms run UNTOUCHED on arena-backed state. The nk Model stages
-// joint_type as the u8-backed ArticulationJointType, so the alias is exact.
 ArticulationDeviceState MakeArticulationDeviceStateFromViews(
     const phi::ModelView& model_view, const phi::DataView& data_view,
     uint32_t total_link_count, uint32_t articulation_count);

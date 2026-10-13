@@ -388,7 +388,6 @@ InterfaceMetrics MeasureInterface(nk::World& world, const std::vector<Vec3>& pos
     const uint32_t dofs = cap.dofs_per_env;
     const auto rows = DownloadRange<nk::NkRow>(world, nk::FieldId::Urows, base, count);
     const auto impulse = DownloadRange<float>(world, nk::FieldId::Lambda, base, count);
-    const auto mass = DownloadRange<float>(world, nk::FieldId::RowMeff, base, count);
     const auto ja = DownloadRange<float>(world, nk::FieldId::ChainJacobian, base * dofs, count * dofs);
     const auto jb = DownloadRange<float>(world, nk::FieldId::ChainJacobianB, base * dofs, count * dofs);
     const auto qdot = Download<float>(world, nk::FieldId::QdotFlat);
@@ -423,11 +422,12 @@ InterfaceMetrics MeasureInterface(nk::World& world, const std::vector<Vec3>& pos
     };
     for (uint64_t row = 0u; row < count; row += nk::kPairDrivenParticleRowsPerSlot) {
         const auto& normal = rows[row];
-        Require((normal.flags & nk::nk_row_flags::kVelocityOnly) != 0u && mass[row] > 0.0f,
+        const double response = normal.contact_response.xx;
+        Require((normal.flags & nk::nk_row_flags::kVelocityOnly) != 0u && response > 0.0,
                 "Invalid grid contact row");
         const double velocity = side_velocity(normal.a, ja, row) + side_velocity(normal.b, jb, row) -
                                 double(normal.rhs) * params->dt;
-        const double residual = std::fabs(std::min(velocity, double(impulse[row]) / mass[row]));
+        const double residual = std::fabs(std::min(velocity, double(impulse[row]) * response));
         result.normal_residual = std::max(result.normal_residual, residual);
         const double tangent = std::hypot(double(impulse[row + 1u]), double(impulse[row + 2u]));
         result.cone_violation = std::max(result.cone_violation, tangent - normal.mu * impulse[row]);

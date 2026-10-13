@@ -6,8 +6,7 @@
 // Per-field DLPack descriptor rows for the future c_abi buffer bridge
 // (plan §3.3: c_abi/buffer.cpp queries this table instead of hand-written
 // per-field branches). dtype_code is the scalar element code; ndim_hint is
-// a coarse rank hint (1 = flat scalar array, 2 = packed/vector array); diff
-// marks the tape-visible / autograd-exposed fields.
+// a coarse rank hint (1 = flat scalar array, 2 = packed/vector array).
 
 #include <cstdint>
 
@@ -21,422 +20,407 @@ struct DlpackRow {
     FieldId     field;
     DlpackDtype dtype_code;
     uint8_t     ndim_hint;
-    bool        diff;
     bool        readout;
 };
 
 inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
-    {FieldId::Q, DlpackDtype::kF32, 1, true, false},  // q
-    {FieldId::Qdot, DlpackDtype::kF32, 1, true, false},  // qdot
-    {FieldId::LinkPose, DlpackDtype::kF32, 2, false, false},  // link_pose
-    {FieldId::BasePose, DlpackDtype::kF32, 2, true, false},  // base_pose
-    {FieldId::BodyPose, DlpackDtype::kF32, 2, true, false},  // body_pose
-    {FieldId::BodyInvMass, DlpackDtype::kF32, 1, false, false},  // body_inv_mass
-    {FieldId::ContactCount, DlpackDtype::kU32, 1, false, false},  // contact_count
-    {FieldId::Rows, DlpackDtype::kF32, 2, false, false},  // rows
-    {FieldId::Lambda, DlpackDtype::kF32, 1, false, false},  // lambda
-    {FieldId::MInv, DlpackDtype::kF32, 1, false, false},  // m_inv
-    {FieldId::ParticlePos, DlpackDtype::kF32, 2, true, false},  // particle_pos
-    {FieldId::MatBuckets, DlpackDtype::kF32, 1, false, false},  // mat_buckets
-    {FieldId::MatIndex, DlpackDtype::kU32, 1, false, false},  // mat_index
-    {FieldId::LinkContactWrench, DlpackDtype::kF32, 2, false, true},  // link_contact_wrench
-    {FieldId::Qddot, DlpackDtype::kF32, 1, false, false},  // qddot
-    {FieldId::Tau, DlpackDtype::kF32, 1, false, false},  // tau
-    {FieldId::JointForce, DlpackDtype::kF32, 1, false, false},  // joint_force
-    {FieldId::JointDiagonal, DlpackDtype::kF32, 1, false, false},  // joint_diagonal
-    {FieldId::LinkVelocity, DlpackDtype::kF32, 2, true, false},  // link_velocity
-    {FieldId::LinkAcceleration, DlpackDtype::kF32, 2, false, false},  // link_acceleration
-    {FieldId::LinkVelocityBias, DlpackDtype::kF32, 2, false, false},  // link_velocity_bias
-    {FieldId::LinkXup, DlpackDtype::kF32, 2, false, false},  // link_xup
-    {FieldId::LinkArticulatedI, DlpackDtype::kF32, 2, false, false},  // link_articulated_I
-    {FieldId::LinkBiasForce, DlpackDtype::kF32, 2, false, false},  // link_bias_force
-    {FieldId::LinkUSpatial, DlpackDtype::kF32, 2, false, false},  // link_u_spatial
-    {FieldId::JointMotionSubspace, DlpackDtype::kF32, 2, false, false},  // joint_motion_subspace
-    {FieldId::DriveTarget, DlpackDtype::kF32, 1, false, false},  // drive_target
-    {FieldId::DriveStiffness, DlpackDtype::kF32, 1, false, false},  // drive_stiffness
-    {FieldId::DriveDamping, DlpackDtype::kF32, 1, false, false},  // drive_damping
-    {FieldId::DriveForceLimit, DlpackDtype::kF32, 1, false, false},  // drive_force_limit
-    {FieldId::SnapshotQ, DlpackDtype::kF32, 1, false, false},  // snapshot_q
-    {FieldId::SnapshotQdot, DlpackDtype::kF32, 1, false, false},  // snapshot_qdot
-    {FieldId::SnapshotLinkVelocity, DlpackDtype::kF32, 2, false, false},  // snapshot_link_velocity
-    {FieldId::SnapshotBasePose, DlpackDtype::kF32, 2, false, false},  // snapshot_base_pose
-    {FieldId::SnapshotBodyPose, DlpackDtype::kF32, 2, false, false},  // snapshot_body_pose
-    {FieldId::SnapshotBodyLinearVelocity, DlpackDtype::kF32, 2, false, false},  // snapshot_body_linear_velocity
-    {FieldId::SnapshotBodyAngularVelocity, DlpackDtype::kF32, 2, false, false},  // snapshot_body_angular_velocity
-    {FieldId::ResetEnvIds, DlpackDtype::kU32, 1, false, false},  // reset_env_ids
-    {FieldId::LinkInertia, DlpackDtype::kF32, 2, false, false},  // link_inertia
-    {FieldId::LinkLocalPose, DlpackDtype::kF32, 2, false, false},  // link_local_pose
-    {FieldId::LinkInertialFrame, DlpackDtype::kF32, 2, false, false},  // link_inertial_frame
-    {FieldId::JointAxis, DlpackDtype::kF32, 2, false, false},  // joint_axis
-    {FieldId::ParentOffset, DlpackDtype::kF32, 2, false, false},  // parent_offset
-    {FieldId::JointType, DlpackDtype::kU8, 1, false, false},  // joint_type
-    {FieldId::ParentLink, DlpackDtype::kU32, 1, false, false},  // parent_link
-    {FieldId::LinkBody, DlpackDtype::kU32, 1, false, false},  // link_body
-    {FieldId::LinkToArticulation, DlpackDtype::kU32, 1, false, false},  // link_to_articulation
-    {FieldId::JointDamping, DlpackDtype::kF32, 1, false, false},  // joint_damping
-    {FieldId::JointArmature, DlpackDtype::kF32, 1, false, false},  // joint_armature
-    {FieldId::ArticulationLinkCount, DlpackDtype::kU32, 1, false, false},  // articulation_link_count
-    {FieldId::ArticulationLinkOffset, DlpackDtype::kU32, 1, false, false},  // articulation_link_offset
-    {FieldId::FootShape, DlpackDtype::kF32, 1, false, false},  // foot_shape
-    {FieldId::BodyLinearVelocity, DlpackDtype::kF32, 2, true, false},  // body_linear_velocity
-    {FieldId::BodyAngularVelocity, DlpackDtype::kF32, 2, true, false},  // body_angular_velocity
-    {FieldId::BodyForce, DlpackDtype::kF32, 2, false, false},  // body_force
-    {FieldId::BodyTorque, DlpackDtype::kF32, 2, false, false},  // body_torque
-    {FieldId::BodyInvInertia, DlpackDtype::kF32, 2, false, false},  // body_inv_inertia
-    {FieldId::BodyAabbLo, DlpackDtype::kF32, 2, false, false},  // body_aabb_lo
-    {FieldId::BodyAabbHi, DlpackDtype::kF32, 2, false, false},  // body_aabb_hi
-    {FieldId::PairCount, DlpackDtype::kU32, 1, false, false},  // pair_count
-    {FieldId::CandidatePairs, DlpackDtype::kU32, 2, false, false},  // candidate_pairs
-    {FieldId::LbvhNodes, DlpackDtype::kF32, 1, false, false},  // lbvh_nodes
-    {FieldId::LbvhMorton, DlpackDtype::kU32, 1, false, false},  // lbvh_morton
-    {FieldId::LbvhIndex, DlpackDtype::kU32, 1, false, false},  // lbvh_index
-    {FieldId::LbvhVisit, DlpackDtype::kU32, 1, false, false},  // lbvh_visit
-    {FieldId::LbvhSortkey, DlpackDtype::kU64, 1, false, false},  // lbvh_sortkey
-    {FieldId::ContactLink, DlpackDtype::kU32, 1, false, false},  // contact_link
-    {FieldId::ContactPoint, DlpackDtype::kF32, 2, false, false},  // contact_point
-    {FieldId::ContactNormal, DlpackDtype::kF32, 2, false, false},  // contact_normal
-    {FieldId::ContactDepth, DlpackDtype::kF32, 1, false, false},  // contact_depth
-    {FieldId::ContactTangent1, DlpackDtype::kF32, 2, false, false},  // contact_tangent1
-    {FieldId::ContactTangent2, DlpackDtype::kF32, 2, false, false},  // contact_tangent2
-    {FieldId::ContactMaterial, DlpackDtype::kU64, 1, false, false},  // contact_material
-    {FieldId::JacNormal, DlpackDtype::kF32, 1, false, false},  // jac_normal
-    {FieldId::JacTangent1, DlpackDtype::kF32, 1, false, false},  // jac_tangent1
-    {FieldId::JacTangent2, DlpackDtype::kF32, 1, false, false},  // jac_tangent2
-    {FieldId::ContactMeffNormal, DlpackDtype::kF32, 1, false, false},  // contact_meff_normal
-    {FieldId::ContactMeffTangent1, DlpackDtype::kF32, 1, false, false},  // contact_meff_tangent1
-    {FieldId::ContactMeffTangent2, DlpackDtype::kF32, 1, false, false},  // contact_meff_tangent2
-    {FieldId::ContactForce, DlpackDtype::kF32, 2, false, true},  // contact_force
-    {FieldId::UcontactCount, DlpackDtype::kU32, 1, false, false},  // ucontact_count
-    {FieldId::UcontactPoint, DlpackDtype::kF32, 2, false, false},  // ucontact_point
-    {FieldId::UcontactWitnessA, DlpackDtype::kF32, 2, false, false},  // ucontact_witness_a
-    {FieldId::UcontactWitnessB, DlpackDtype::kF32, 2, false, false},  // ucontact_witness_b
-    {FieldId::UcontactNormal, DlpackDtype::kF32, 2, false, false},  // ucontact_normal
-    {FieldId::UcontactDepth, DlpackDtype::kF32, 2, false, false},  // ucontact_depth
-    {FieldId::RowCount, DlpackDtype::kU32, 1, false, false},  // row_count
-    {FieldId::Urows, DlpackDtype::kF32, 2, false, false},  // urows
-    {FieldId::ChainJacobian, DlpackDtype::kF32, 1, false, false},  // chain_jacobian
-    {FieldId::RowMinvJt, DlpackDtype::kF32, 1, false, false},  // row_minv_jt
-    {FieldId::RowMeff, DlpackDtype::kF32, 1, false, false},  // row_meff
-    {FieldId::RowDamping, DlpackDtype::kF32, 1, false, false},  // row_damping
-    {FieldId::RowCjLink, DlpackDtype::kU32, 1, false, false},  // row_cj_link
-    {FieldId::RowCjPoint, DlpackDtype::kF32, 2, false, false},  // row_cj_point
-    {FieldId::RowCjDir, DlpackDtype::kF32, 2, false, false},  // row_cj_dir
-    {FieldId::QdotFlat, DlpackDtype::kF32, 1, false, false},  // qdot_flat
-    {FieldId::M, DlpackDtype::kF32, 1, false, false},  // m
-    {FieldId::LinkCompositeInertia, DlpackDtype::kF32, 2, false, false},  // link_composite_inertia
-    {FieldId::HullVerts, DlpackDtype::kF32, 1, false, false},  // hull_verts
-    {FieldId::DofToLink, DlpackDtype::kU32, 1, false, false},  // dof_to_link
-    {FieldId::DofToComponent, DlpackDtype::kU32, 1, false, false},  // dof_to_component
-    {FieldId::ShapeTable, DlpackDtype::kF32, 1, false, false},  // shape_table
-    {FieldId::ExcludedPairs, DlpackDtype::kU64, 1, false, false},  // excluded_pairs
-    {FieldId::SampPoints, DlpackDtype::kF32, 1, false, false},  // samp_points
-    {FieldId::SampRanges, DlpackDtype::kU32, 1, false, false},  // samp_ranges
-    {FieldId::SdfHeaders, DlpackDtype::kF32, 1, false, false},  // sdf_headers
-    {FieldId::SdfCellCount, DlpackDtype::kU32, 1, false, false},  // sdf_cell_count
-    {FieldId::SdfCellKeys, DlpackDtype::kU64, 1, false, false},  // sdf_cell_keys
-    {FieldId::SdfCellValues, DlpackDtype::kF32, 1, false, false},  // sdf_cell_values
-    {FieldId::SdfCellGradients, DlpackDtype::kF32, 2, false, false},  // sdf_cell_gradients
-    {FieldId::ParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // particle_prev_pos
-    {FieldId::ParticleVel, DlpackDtype::kF32, 2, true, false},  // particle_vel
-    {FieldId::ParticleInvMass, DlpackDtype::kF32, 1, false, false},  // particle_inv_mass
-    {FieldId::ParticleVPre, DlpackDtype::kF32, 2, false, false},  // particle_v_pre
-    {FieldId::AeroTriVerts, DlpackDtype::kU32, 2, false, false},  // aero_tri_verts
-    {FieldId::AeroTriArea, DlpackDtype::kF32, 1, false, false},  // aero_tri_area
-    {FieldId::PbfPredictedPos, DlpackDtype::kF32, 2, false, false},  // pbf_predicted_pos
-    {FieldId::RngState, DlpackDtype::kU64, 1, false, false},  // rng_state
-    {FieldId::EnvStatus, DlpackDtype::kU32, 1, false, true},  // env_status
-    {FieldId::ObsBuffer, DlpackDtype::kF32, 1, false, true},  // obs_buffer
-    {FieldId::EnvTerrainType, DlpackDtype::kU32, 1, false, false},  // env_terrain_type
-    {FieldId::EnvTerrainDifficulty, DlpackDtype::kF32, 1, false, false},  // env_terrain_difficulty
-    {FieldId::JointF, DlpackDtype::kF32, 1, false, false},  // joint_f
-    {FieldId::LinkGeomKind, DlpackDtype::kU32, 1, false, false},  // link_geom_kind
-    {FieldId::LinkGeomParams, DlpackDtype::kF32, 2, false, false},  // link_geom_params
-    {FieldId::LinkGeomLocal, DlpackDtype::kF32, 2, false, false},  // link_geom_local
-    {FieldId::BodyToLink, DlpackDtype::kU32, 1, false, false},  // body_to_link
-    {FieldId::BodyToArticulation, DlpackDtype::kU32, 1, false, false},  // body_to_articulation
-    {FieldId::UcontactA, DlpackDtype::kU32, 2, false, false},  // ucontact_a
-    {FieldId::UcontactB, DlpackDtype::kU32, 2, false, false},  // ucontact_b
-    {FieldId::UcontactGen, DlpackDtype::kU32, 2, false, false},  // ucontact_gen
-    {FieldId::Heights, DlpackDtype::kF32, 1, false, false},  // heights
-    {FieldId::UcontactTangent1, DlpackDtype::kF32, 2, false, false},  // ucontact_tangent1
-    {FieldId::UcontactTangent2, DlpackDtype::kF32, 2, false, false},  // ucontact_tangent2
-    {FieldId::ChainJacobianB, DlpackDtype::kF32, 1, false, false},  // chain_jacobian_b
-    {FieldId::RowMinvJtB, DlpackDtype::kF32, 1, false, false},  // row_minv_jt_b
-    {FieldId::RowCjLinkB, DlpackDtype::kU32, 1, false, false},  // row_cj_link_b
-    {FieldId::RowCjPointB, DlpackDtype::kF32, 2, false, false},  // row_cj_point_b
-    {FieldId::RowCjDirB, DlpackDtype::kF32, 2, false, false},  // row_cj_dir_b
-    {FieldId::RowPenetration, DlpackDtype::kF32, 1, false, false},  // row_penetration
-    {FieldId::QdotPseudo, DlpackDtype::kF32, 1, false, false},  // qdot_pseudo
-    {FieldId::LinkVelocityPseudo, DlpackDtype::kF32, 2, false, false},  // link_velocity_pseudo
-    {FieldId::QdotPseudoFlat, DlpackDtype::kF32, 1, false, false},  // qdot_pseudo_flat
-    {FieldId::BodyPseudoLinearVelocity, DlpackDtype::kF32, 2, false, false},  // body_pseudo_linear_velocity
-    {FieldId::BodyPseudoAngularVelocity, DlpackDtype::kF32, 2, false, false},  // body_pseudo_angular_velocity
-    {FieldId::ParticlePseudoVel, DlpackDtype::kF32, 2, false, false},  // particle_pseudo_vel
-    {FieldId::RowPseudoLambda, DlpackDtype::kF32, 1, false, false},  // row_pseudo_lambda
-    {FieldId::UcontactAKind, DlpackDtype::kU32, 2, false, false},  // ucontact_a_kind
-    {FieldId::UcontactBKind, DlpackDtype::kU32, 2, false, false},  // ucontact_b_kind
-    {FieldId::SnapshotParticlePos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_pos
-    {FieldId::SnapshotParticlePrevPos, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_prev_pos
-    {FieldId::SnapshotParticleVel, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_vel
-    {FieldId::GridMass, DlpackDtype::kF32, 1, false, false},  // grid_mass
-    {FieldId::GridMomentum, DlpackDtype::kF32, 2, false, false},  // grid_momentum
-    {FieldId::GridVelocity, DlpackDtype::kF32, 2, false, false},  // grid_velocity
-    {FieldId::GridForce, DlpackDtype::kF32, 2, false, false},  // grid_force
-    {FieldId::ParticleF, DlpackDtype::kF32, 2, true, false},  // particle_F
-    {FieldId::ParticleC, DlpackDtype::kF32, 2, false, false},  // particle_C
-    {FieldId::ParticleVol0, DlpackDtype::kF32, 1, false, false},  // particle_vol0
-    {FieldId::ParticlePlastic, DlpackDtype::kF32, 1, false, false},  // particle_plastic
-    {FieldId::ParticleMaterialId, DlpackDtype::kU32, 1, false, false},  // particle_material_id
-    {FieldId::SnapshotParticleF, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_F
-    {FieldId::SnapshotParticleC, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_C
-    {FieldId::SnapshotParticlePlastic, DlpackDtype::kF32, 1, false, false},  // snapshot_particle_plastic
-    {FieldId::MpmGridCellKey, DlpackDtype::kU32, 1, false, false},  // mpm_grid_cell_key
-    {FieldId::MpmGridPartIdx, DlpackDtype::kU32, 1, false, false},  // mpm_grid_part_idx
-    {FieldId::MpmSortScratch, DlpackDtype::kU8, 1, false, false},  // mpm_sort_scratch
-    {FieldId::MpmParticleStress, DlpackDtype::kF32, 2, false, false},  // mpm_particle_stress
-    {FieldId::MpmMaterialTable, DlpackDtype::kF32, 1, false, false},  // mpm_material_table
-    {FieldId::GridBodyDp, DlpackDtype::kF32, 2, false, false},  // grid_body_dp
-    {FieldId::GridBodyOwner, DlpackDtype::kU32, 1, false, false},  // grid_body_owner
-    {FieldId::MpmBodyReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_reaction
-    {FieldId::MpmBodyAngReaction, DlpackDtype::kF32, 2, false, true},  // mpm_body_ang_reaction
-    {FieldId::JointFrictionloss, DlpackDtype::kF32, 1, false, false},  // joint_frictionloss
-    {FieldId::BodyCollidableLink, DlpackDtype::kU32, 1, false, false},  // body_collidable_link
-    {FieldId::BodyCollidableLocal, DlpackDtype::kF32, 2, false, false},  // body_collidable_local
-    {FieldId::BodyCollidableBody, DlpackDtype::kU32, 1, false, false},  // body_collidable_body
-    {FieldId::UcontactIdPair, DlpackDtype::kU64, 2, false, false},  // ucontact_id_pair
-    {FieldId::UcontactIdFeature, DlpackDtype::kU64, 2, false, false},  // ucontact_id_feature
-    {FieldId::ContactCachePair, DlpackDtype::kU64, 2, false, false},  // contact_cache_pair
-    {FieldId::ContactCacheFeature, DlpackDtype::kU64, 2, false, false},  // contact_cache_feature
-    {FieldId::ContactCacheLambda, DlpackDtype::kF32, 2, false, false},  // contact_cache_lambda
-    {FieldId::ContactCacheNormal, DlpackDtype::kF32, 2, false, false},  // contact_cache_normal
-    {FieldId::ContactCacheTangent1, DlpackDtype::kF32, 2, false, false},  // contact_cache_tangent1
-    {FieldId::ContactCacheTangent2, DlpackDtype::kF32, 2, false, false},  // contact_cache_tangent2
-    {FieldId::ContactCacheMaterial, DlpackDtype::kU64, 2, false, false},  // contact_cache_material
-    {FieldId::ContactCacheAge, DlpackDtype::kU32, 2, false, false},  // contact_cache_age
-    {FieldId::ContactCacheSnapshotPair, DlpackDtype::kU64, 2, false, false},  // contact_cache_snapshot_pair
-    {FieldId::ContactCacheSnapshotFeature, DlpackDtype::kU64, 2, false, false},  // contact_cache_snapshot_feature
-    {FieldId::ContactCacheSnapshotLambda, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_lambda
-    {FieldId::ContactCacheSnapshotNormal, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_normal
-    {FieldId::ContactCacheSnapshotTangent1, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_tangent1
-    {FieldId::ContactCacheSnapshotTangent2, DlpackDtype::kF32, 2, false, false},  // contact_cache_snapshot_tangent2
-    {FieldId::ContactCacheSnapshotMaterial, DlpackDtype::kU64, 2, false, false},  // contact_cache_snapshot_material
-    {FieldId::ContactCacheSnapshotAge, DlpackDtype::kU32, 2, false, false},  // contact_cache_snapshot_age
-    {FieldId::ContactCacheCurrentOwner, DlpackDtype::kU32, 2, false, false},  // contact_cache_current_owner
-    {FieldId::ContactCacheOldKeep, DlpackDtype::kU32, 2, false, false},  // contact_cache_old_keep
-    {FieldId::JointLimitLower, DlpackDtype::kF32, 1, false, false},  // joint_limit_lower
-    {FieldId::JointLimitUpper, DlpackDtype::kF32, 1, false, false},  // joint_limit_upper
-    {FieldId::JointLimitFlags, DlpackDtype::kU8, 1, false, false},  // joint_limit_flags
-    {FieldId::MimicSourceLink, DlpackDtype::kU32, 1, false, false},  // mimic_source_link
-    {FieldId::MimicMultiplier, DlpackDtype::kF32, 1, false, false},  // mimic_multiplier
-    {FieldId::MimicOffset, DlpackDtype::kF32, 1, false, false},  // mimic_offset
-    {FieldId::JointLimitImpulse, DlpackDtype::kF32, 2, false, true},  // joint_limit_impulse
-    {FieldId::ActuatorEffortRequested, DlpackDtype::kF32, 1, false, true},  // actuator_effort_requested
-    {FieldId::ActuatorEffort, DlpackDtype::kF32, 1, false, true},  // actuator_effort
-    {FieldId::ActuatorSaturated, DlpackDtype::kF32, 1, false, true},  // actuator_saturated
-    {FieldId::PairSortScratch, DlpackDtype::kU8, 1, false, false},  // pair_sort_scratch
-    {FieldId::TaskTarget, DlpackDtype::kF32, 2, false, false},  // task_target
-    {FieldId::TaskRotationTarget, DlpackDtype::kF32, 2, false, false},  // task_rotation_target
-    {FieldId::TaskLocalPose, DlpackDtype::kF32, 2, false, false},  // task_local_pose
-    {FieldId::BodyInertialFrame, DlpackDtype::kF32, 2, false, false},  // body_inertial_frame
-    {FieldId::BodyWorldInvInertia, DlpackDtype::kF32, 2, false, false},  // body_world_inv_inertia
-    {FieldId::StepQdotFlat, DlpackDtype::kF32, 1, false, false},  // step_qdot_flat
-    {FieldId::StepBodyLinearVelocity, DlpackDtype::kF32, 2, false, false},  // step_body_linear_velocity
-    {FieldId::StepBodyAngularVelocity, DlpackDtype::kF32, 2, false, false},  // step_body_angular_velocity
-    {FieldId::StepParticleVelocity, DlpackDtype::kF32, 2, false, false},  // step_particle_velocity
-    {FieldId::ContactSideAKind, DlpackDtype::kU32, 1, false, true},  // contact_side_a_kind
-    {FieldId::ContactSideBKind, DlpackDtype::kU32, 1, false, true},  // contact_side_b_kind
-    {FieldId::ContactSideAIndex, DlpackDtype::kU32, 1, false, true},  // contact_side_a_index
-    {FieldId::ContactSideBIndex, DlpackDtype::kU32, 1, false, true},  // contact_side_b_index
-    {FieldId::AeroParticleOffset, DlpackDtype::kU32, 1, false, false},  // aero_particle_offset
-    {FieldId::AeroParticleCount, DlpackDtype::kU32, 1, false, false},  // aero_particle_count
-    {FieldId::AeroIncidentTri, DlpackDtype::kU32, 2, false, false},  // aero_incident_tri
-    {FieldId::AeroTriImpulse, DlpackDtype::kF32, 2, false, false},  // aero_tri_impulse
-    {FieldId::BodyGyroResidual, DlpackDtype::kF32, 1, false, true},  // body_gyro_residual
-    {FieldId::BodyGyroIterations, DlpackDtype::kU32, 1, false, true},  // body_gyro_iterations
-    {FieldId::BodyGyroStatus, DlpackDtype::kU32, 1, false, true},  // body_gyro_status
-    {FieldId::LbvhSortScratch, DlpackDtype::kU8, 1, false, false},  // lbvh_sort_scratch
-    {FieldId::ContactCacheScratch, DlpackDtype::kU8, 1, false, false},  // contact_cache_scratch
-    {FieldId::ActiveRowIds, DlpackDtype::kU32, 1, false, false},  // active_row_ids
-    {FieldId::ActiveRowCount, DlpackDtype::kU32, 1, false, false},  // active_row_count
-    {FieldId::ContactEndpointKeys, DlpackDtype::kU64, 2, false, false},  // contact_endpoint_keys
-    {FieldId::ContactEndpointCount, DlpackDtype::kU32, 1, false, false},  // contact_endpoint_count
-    {FieldId::LinkContactBegin, DlpackDtype::kU32, 1, false, false},  // link_contact_begin
-    {FieldId::LinkContactEnd, DlpackDtype::kU32, 1, false, false},  // link_contact_end
-    {FieldId::ContactIndexScratch, DlpackDtype::kU8, 1, false, false},  // contact_index_scratch
-    {FieldId::MeshSurfaceInfo, DlpackDtype::kU8, 2, false, false},  // mesh_surface_info
-    {FieldId::MeshTriangles, DlpackDtype::kU32, 1, false, false},  // mesh_triangles
-    {FieldId::MeshBvhNodes, DlpackDtype::kU8, 2, false, false},  // mesh_bvh_nodes
-    {FieldId::MeshEdgeInfo, DlpackDtype::kU8, 2, false, false},  // mesh_edge_info
-    {FieldId::MeshEdges, DlpackDtype::kU8, 2, false, false},  // mesh_edges
-    {FieldId::MeshEdgeNodes, DlpackDtype::kU8, 2, false, false},  // mesh_edge_nodes
-    {FieldId::MeshTriangleEdges, DlpackDtype::kU32, 1, false, false},  // mesh_triangle_edges
-    {FieldId::MeshTriangleVertexOwner, DlpackDtype::kU32, 1, false, false},  // mesh_triangle_vertex_owner
-    {FieldId::MeshVertexEdgeOffsets, DlpackDtype::kU32, 1, false, false},  // mesh_vertex_edge_offsets
-    {FieldId::MeshVertexEdges, DlpackDtype::kU32, 1, false, false},  // mesh_vertex_edges
-    {FieldId::MeshVertexTriangleOffsets, DlpackDtype::kU32, 1, false, false},  // mesh_vertex_triangle_offsets
-    {FieldId::MeshVertexTriangles, DlpackDtype::kU32, 1, false, false},  // mesh_vertex_triangles
-    {FieldId::MeshVertexSources, DlpackDtype::kU64, 1, false, false},  // mesh_vertex_sources
-    {FieldId::MeshEdgeSources, DlpackDtype::kU64, 1, false, false},  // mesh_edge_sources
-    {FieldId::MeshContactMode, DlpackDtype::kU8, 1, false, false},  // mesh_contact_mode
-    {FieldId::MeshVertexReach, DlpackDtype::kF32, 1, false, false},  // mesh_vertex_reach
-    {FieldId::StepEnvStatus, DlpackDtype::kU32, 1, false, false},  // step_env_status
-    {FieldId::StepMpmBodyImpulse, DlpackDtype::kF32, 2, false, false},  // step_mpm_body_impulse
-    {FieldId::StepMpmBodyMoment, DlpackDtype::kF32, 2, false, false},  // step_mpm_body_moment
-    {FieldId::StepLinkImpulse, DlpackDtype::kF32, 2, false, false},  // step_link_impulse
-    {FieldId::StepLinkMoment, DlpackDtype::kF32, 2, false, false},  // step_link_moment
-    {FieldId::StepJointLimitImpulse, DlpackDtype::kF32, 2, false, false},  // step_joint_limit_impulse
-    {FieldId::ParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // particle_plastic_F
-    {FieldId::SnapshotParticlePlasticF, DlpackDtype::kF32, 2, false, false},  // snapshot_particle_plastic_F
-    {FieldId::GridInvMass, DlpackDtype::kF32, 1, false, false},  // grid_inv_mass
-    {FieldId::GridContactCount, DlpackDtype::kU64, 1, false, false},  // grid_contact_count
-    {FieldId::GridContactOffset, DlpackDtype::kU64, 1, false, false},  // grid_contact_offset
-    {FieldId::UcontactLaw, DlpackDtype::kU32, 1, false, false},  // ucontact_law
-    {FieldId::UcontactFriction, DlpackDtype::kF32, 1, false, false},  // ucontact_friction
-    {FieldId::GridContactAttempted, DlpackDtype::kU64, 1, false, true},  // grid_contact_attempted
-    {FieldId::GridContactRetained, DlpackDtype::kU32, 1, false, true},  // grid_contact_retained
-    {FieldId::GridContactPeak, DlpackDtype::kU64, 1, false, true},  // grid_contact_peak
-    {FieldId::GridContactOverflow, DlpackDtype::kU64, 1, false, true},  // grid_contact_overflow
-    {FieldId::MpmBoundaryImpulse, DlpackDtype::kF32, 2, false, true},  // mpm_boundary_impulse
-    {FieldId::MpmBoundaryMoment, DlpackDtype::kF32, 2, false, true},  // mpm_boundary_moment
-    {FieldId::StepMpmBoundaryImpulse, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_impulse
-    {FieldId::StepMpmBoundaryMoment, DlpackDtype::kF32, 2, false, false},  // step_mpm_boundary_moment
-    {FieldId::VelocityTarget, DlpackDtype::kF32, 1, false, false},  // velocity_target
-    {FieldId::AccelerationTarget, DlpackDtype::kF32, 1, false, false},  // acceleration_target
-    {FieldId::ActuatorNoloadSpeed, DlpackDtype::kF32, 1, false, false},  // actuator_noload_speed
-    {FieldId::TaskNullspaceStiffness, DlpackDtype::kF32, 1, false, false},  // task_nullspace_stiffness
-    {FieldId::TaskNullspaceDamping, DlpackDtype::kF32, 1, false, false},  // task_nullspace_damping
-    {FieldId::DriveCommand, DlpackDtype::kF32, 1, false, false},  // drive_command
-    {FieldId::DriveDissipation, DlpackDtype::kF32, 1, false, false},  // drive_dissipation
-    {FieldId::DriveLower, DlpackDtype::kF32, 1, false, false},  // drive_lower
-    {FieldId::DriveUpper, DlpackDtype::kF32, 1, false, false},  // drive_upper
-    {FieldId::ControlMass, DlpackDtype::kF32, 1, false, false},  // control_mass
-    {FieldId::ControlFactor, DlpackDtype::kF32, 1, false, false},  // control_factor
-    {FieldId::ControlJacobian, DlpackDtype::kF32, 2, false, false},  // control_jacobian
-    {FieldId::ControlResponse, DlpackDtype::kF32, 2, false, false},  // control_response
-    {FieldId::ControlTaskMap, DlpackDtype::kF32, 2, false, false},  // control_task_map
-    {FieldId::ParticleSurfaceInfo, DlpackDtype::kU8, 2, false, false},  // particle_surface_info
-    {FieldId::ParticleSurfaceTriangles, DlpackDtype::kU32, 1, false, false},  // particle_surface_triangles
-    {FieldId::ParticleSurfaceTree, DlpackDtype::kU8, 2, false, false},  // particle_surface_tree
-    {FieldId::ParticleSurfaceEdgeInfo, DlpackDtype::kU8, 2, false, false},  // particle_surface_edge_info
-    {FieldId::ParticleSurfaceEdges, DlpackDtype::kU8, 2, false, false},  // particle_surface_edges
-    {FieldId::ParticleSurfaceEdgeTree, DlpackDtype::kU8, 2, false, false},  // particle_surface_edge_tree
-    {FieldId::ParticleSurfaceTriangleEdges, DlpackDtype::kU32, 1, false, false},  // particle_surface_triangle_edges
-    {FieldId::ParticleSurfaceTriangleVertexOwner, DlpackDtype::kU32, 1, false, false},  // particle_surface_triangle_vertex_owner
-    {FieldId::ParticleSurfaceVertexEdgeOffsets, DlpackDtype::kU32, 1, false, false},  // particle_surface_vertex_edge_offsets
-    {FieldId::ParticleSurfaceVertexEdges, DlpackDtype::kU32, 1, false, false},  // particle_surface_vertex_edges
-    {FieldId::ParticleSurfaceVertexTriangleOffsets, DlpackDtype::kU32, 1, false, false},  // particle_surface_vertex_triangle_offsets
-    {FieldId::ParticleSurfaceVertexTriangles, DlpackDtype::kU32, 1, false, false},  // particle_surface_vertex_triangles
-    {FieldId::ParticleSurfaceThickness, DlpackDtype::kF32, 1, false, false},  // particle_surface_thickness
-    {FieldId::ParticleSurfaceFriction, DlpackDtype::kF32, 1, false, false},  // particle_surface_friction
-    {FieldId::ParticleSurfaceNodes, DlpackDtype::kU8, 2, false, false},  // particle_surface_nodes
-    {FieldId::ParticleSurfaceEdgeNodes, DlpackDtype::kU8, 2, false, false},  // particle_surface_edge_nodes
-    {FieldId::PointEndpointRanges, DlpackDtype::kU8, 2, false, true},  // point_endpoint_ranges
-    {FieldId::PointEndpointTerms, DlpackDtype::kU8, 2, false, true},  // point_endpoint_terms
-    {FieldId::ParticleProjectionDelta, DlpackDtype::kF32, 2, false, false},  // particle_projection_delta
-    {FieldId::ParticleSurfaceMaxSpeed, DlpackDtype::kF32, 1, false, false},  // particle_surface_max_speed
-    {FieldId::GridPseudoVel, DlpackDtype::kF32, 2, false, false},  // grid_pseudo_vel
-    {FieldId::ContactSolveMetrics, DlpackDtype::kU64, 2, false, true},  // contact_solve_metrics
-    {FieldId::VbdSolveMetrics, DlpackDtype::kU64, 2, false, true},  // vbd_solve_metrics
-    {FieldId::ContactSolveCounts, DlpackDtype::kU32, 2, false, true},  // contact_solve_counts
-    {FieldId::ContactSolveWorstTerms, DlpackDtype::kF32, 2, false, true},  // contact_solve_worst_terms
-    {FieldId::PairSampleChunks, DlpackDtype::kU32, 1, false, false},  // pair_sample_chunks
-    {FieldId::BlockDescentScratch, DlpackDtype::kU32, 1, false, false},  // block_descent_scratch
-    {FieldId::VbdElements, DlpackDtype::kU8, 2, false, false},  // vbd_elements
-    {FieldId::VbdIncidenceOffsets, DlpackDtype::kU32, 1, false, false},  // vbd_incidence_offsets
-    {FieldId::VbdIncidence, DlpackDtype::kU32, 1, false, false},  // vbd_incidence
-    {FieldId::VbdColorVertices, DlpackDtype::kU32, 1, false, false},  // vbd_color_vertices
-    {FieldId::VbdColorSegments, DlpackDtype::kU32, 1, false, false},  // vbd_color_segments
-    {FieldId::VbdCoarseLevelNodes, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_level_nodes
-    {FieldId::VbdCoarseParents, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_parents
-    {FieldId::VbdCoarseWeights, DlpackDtype::kF32, 1, false, false},  // vbd_coarse_weights
-    {FieldId::VbdCoarseChildOffsets, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_child_offsets
-    {FieldId::VbdCoarseChildren, DlpackDtype::kU32, 1, false, false},  // vbd_coarse_children
-    {FieldId::VbdCoarseChildWeights, DlpackDtype::kF32, 1, false, false},  // vbd_coarse_child_weights
-    {FieldId::ParticleResponse, DlpackDtype::kF32, 2, false, false},  // particle_response
-    {FieldId::ParticleRowImpulse, DlpackDtype::kF32, 2, false, false},  // particle_row_impulse
-    {FieldId::VbdFreeRate, DlpackDtype::kF32, 2, false, false},  // vbd_free_rate
-    {FieldId::VbdOffset, DlpackDtype::kF32, 2, false, false},  // vbd_offset
-    {FieldId::VbdInertia, DlpackDtype::kF32, 1, false, false},  // vbd_inertia
-    {FieldId::VbdHistoryVel, DlpackDtype::kF32, 2, false, false},  // vbd_history_vel
-    {FieldId::VbdHistoryReady, DlpackDtype::kU32, 1, false, false},  // vbd_history_ready
-    {FieldId::ParticleKinematicTarget, DlpackDtype::kF32, 2, false, false},  // particle_kinematic_target
-    {FieldId::OgcContactCount, DlpackDtype::kU32, 1, false, false},  // ogc_contact_count
-    {FieldId::DatParticleBeta, DlpackDtype::kF32, 1, false, true},  // dat_particle_beta
-    {FieldId::DatBodyBeta, DlpackDtype::kU32, 1, false, false},  // dat_body_beta
-    {FieldId::DatArticBeta, DlpackDtype::kU32, 1, false, false},  // dat_artic_beta
-    {FieldId::DatArticWitness, DlpackDtype::kU64, 2, false, false},  // dat_artic_witness
-    {FieldId::DatPrevQ, DlpackDtype::kF32, 1, false, false},  // dat_prev_q
-    {FieldId::DatPrevBasePose, DlpackDtype::kF32, 2, false, false},  // dat_prev_base_pose
-    {FieldId::DatPrevBodyPose, DlpackDtype::kF32, 2, false, false},  // dat_prev_body_pose
-    {FieldId::DatBodySpeed, DlpackDtype::kF32, 1, false, false},  // dat_body_speed
-    {FieldId::DatBodyQueryRadius, DlpackDtype::kF32, 1, false, false},  // dat_body_query_radius
-    {FieldId::DatBodyMotion, DlpackDtype::kF32, 1, false, false},  // dat_body_motion
-    {FieldId::DatJointMotion, DlpackDtype::kF32, 1, false, false},  // dat_joint_motion
-    {FieldId::DatJointRate, DlpackDtype::kF32, 1, false, false},  // dat_joint_rate
-    {FieldId::DatPairKind, DlpackDtype::kU32, 1, false, false},  // dat_pair_kind
-    {FieldId::DatPairOwnerA, DlpackDtype::kU32, 1, false, false},  // dat_pair_owner_a
-    {FieldId::DatPairOwnerB, DlpackDtype::kU32, 1, false, false},  // dat_pair_owner_b
-    {FieldId::DatPairFeatureA, DlpackDtype::kU32, 1, false, false},  // dat_pair_feature_a
-    {FieldId::DatPairFeatureB, DlpackDtype::kU32, 1, false, false},  // dat_pair_feature_b
-    {FieldId::DatTruncationCount, DlpackDtype::kU32, 1, false, false},  // dat_truncation_count
-    {FieldId::OgcSourceOffsets, DlpackDtype::kU64, 1, false, false},  // ogc_source_offsets
-    {FieldId::DatTruncationEnergy, DlpackDtype::kF32, 1, false, false},  // dat_truncation_energy
-    {FieldId::DatParticleTruncationCount, DlpackDtype::kU32, 1, false, false},  // dat_particle_truncation_count
-    {FieldId::DatParticleTruncationEnergy, DlpackDtype::kF32, 1, false, false},  // dat_particle_truncation_energy
-    {FieldId::DatParticleTruncationMomentum, DlpackDtype::kF32, 2, false, false},  // dat_particle_truncation_momentum
-    {FieldId::DatJointTruncationCount, DlpackDtype::kU32, 1, false, false},  // dat_joint_truncation_count
-    {FieldId::DatJointTruncationEnergy, DlpackDtype::kF32, 1, false, false},  // dat_joint_truncation_energy
-    {FieldId::DatBodyTruncationCount, DlpackDtype::kU32, 1, false, false},  // dat_body_truncation_count
-    {FieldId::DatBodyTruncationEnergy, DlpackDtype::kF32, 1, false, false},  // dat_body_truncation_energy
-    {FieldId::VbdStep, DlpackDtype::kF32, 1, false, false},  // vbd_step
-    {FieldId::VbdRestart, DlpackDtype::kU32, 1, false, false},  // vbd_restart
-    {FieldId::DatFailureCount, DlpackDtype::kU32, 1, false, false},  // dat_failure_count
-    {FieldId::DatQueryLimitCount, DlpackDtype::kU32, 1, false, false},  // dat_query_limit_count
-    {FieldId::DatFailureWitness, DlpackDtype::kU64, 2, false, false},  // dat_failure_witness
-    {FieldId::ContactWarmStartCounts, DlpackDtype::kU32, 2, false, false},  // contact_warm_start_counts
-    {FieldId::MeshOgcPairCount, DlpackDtype::kU32, 1, false, false},  // mesh_ogc_pair_count
-    {FieldId::MeshSdfPairCount, DlpackDtype::kU32, 1, false, false},  // mesh_sdf_pair_count
-    {FieldId::VbdVelocitySweepCount, DlpackDtype::kU32, 1, false, false},  // vbd_velocity_sweep_count
-    {FieldId::SolverColorCounts, DlpackDtype::kU32, 2, false, false},  // solver_color_counts
-    {FieldId::SolverPhaseTime, DlpackDtype::kU64, 2, false, false},  // solver_phase_time
-    {FieldId::DatSurfaceMotion, DlpackDtype::kF32, 1, false, false},  // dat_surface_motion
-    {FieldId::EnergyLedger, DlpackDtype::kF32, 2, false, true},  // energy_ledger
-    {FieldId::EnergyLedgerStatus, DlpackDtype::kU32, 1, false, true},  // energy_ledger_status
-    {FieldId::PhysicsStageMetrics, DlpackDtype::kF32, 2, false, true},  // physics_stage_metrics
-    {FieldId::ContactAuditCounts, DlpackDtype::kU32, 2, false, true},  // contact_audit_counts
-    {FieldId::ContactAuditMetrics, DlpackDtype::kU64, 2, false, true},  // contact_audit_metrics
-    {FieldId::EnergyParticleStart, DlpackDtype::kF32, 2, false, false},  // energy_particle_start
-    {FieldId::EnergyParticleFree, DlpackDtype::kF32, 2, false, false},  // energy_particle_free
-    {FieldId::EnergyParticleFreeRate, DlpackDtype::kF32, 2, false, false},  // energy_particle_free_rate
-    {FieldId::EnergyAeroImpulse, DlpackDtype::kF32, 2, false, false},  // energy_aero_impulse
-    {FieldId::EnergyKinematicContactImpulse, DlpackDtype::kF32, 2, false, false},  // energy_kinematic_contact_impulse
-    {FieldId::EnergyBodyFreeLinear, DlpackDtype::kF32, 2, false, false},  // energy_body_free_linear
-    {FieldId::EnergyBodyFreeAngular, DlpackDtype::kF32, 2, false, false},  // energy_body_free_angular
-    {FieldId::EnergyLinkStartQ, DlpackDtype::kF32, 1, false, false},  // energy_link_start_q
-    {FieldId::EnergyLinkStartQdot, DlpackDtype::kF32, 1, false, false},  // energy_link_start_qdot
-    {FieldId::EnergyLinkPose, DlpackDtype::kF32, 2, false, false},  // energy_link_pose
-    {FieldId::EnergyLinkUnprojectedPose, DlpackDtype::kF32, 2, false, false},  // energy_link_unprojected_pose
-    {FieldId::EnergyLinkVelocity, DlpackDtype::kF32, 2, false, false},  // energy_link_velocity
-    {FieldId::EnergyQdotFree, DlpackDtype::kF32, 1, false, false},  // energy_qdot_free
-    {FieldId::VbdForceResidualWork, DlpackDtype::kF32, 1, false, true},  // vbd_force_residual_work
-    {FieldId::MInvCoupled, DlpackDtype::kF32, 1, false, false},  // m_inv_coupled
-    {FieldId::MReduced, DlpackDtype::kF32, 1, false, false},  // m_reduced
-    {FieldId::MimicRootDof, DlpackDtype::kU32, 1, false, false},  // mimic_root_dof
-    {FieldId::MimicRootScale, DlpackDtype::kF32, 1, false, false},  // mimic_root_scale
-    {FieldId::MimicProjectionLoss, DlpackDtype::kF32, 1, false, false},  // mimic_projection_loss
-    {FieldId::VbdMembraneStart, DlpackDtype::kU8, 2, false, false},  // vbd_membrane_start
-    {FieldId::CrbaScratch, DlpackDtype::kU32, 1, false, false},  // crba_scratch
-    {FieldId::VbdSolveAudit, DlpackDtype::kF32, 2, false, true},  // vbd_solve_audit
-    {FieldId::ControlScratch, DlpackDtype::kU32, 2, false, false},  // control_scratch
-    {FieldId::VbdFreeVelocity, DlpackDtype::kF32, 2, false, false},  // vbd_free_velocity
-    {FieldId::ContactRowExtent, DlpackDtype::kU32, 2, false, false},  // contact_row_extent
-    {FieldId::ContactCacheExtent, DlpackDtype::kU32, 2, false, false},  // contact_cache_extent
-    {FieldId::LinkTreeDepth, DlpackDtype::kU32, 1, false, false},  // link_tree_depth
-    {FieldId::ArticulationTreeDepth, DlpackDtype::kU32, 1, false, false},  // articulation_tree_depth
-    {FieldId::LinkChildRange, DlpackDtype::kU32, 2, false, false},  // link_child_range
-    {FieldId::LinkChildren, DlpackDtype::kU32, 1, false, false},  // link_children
-    {FieldId::UcontactRowRange, DlpackDtype::kU32, 2, false, true},  // ucontact_row_range
-    {FieldId::LinkWrench, DlpackDtype::kF32, 2, false, false},  // link_wrench
+    {FieldId::Q, DlpackDtype::kF32, 1, false},  // q
+    {FieldId::Qdot, DlpackDtype::kF32, 1, false},  // qdot
+    {FieldId::LinkPose, DlpackDtype::kF32, 2, false},  // link_pose
+    {FieldId::BasePose, DlpackDtype::kF32, 2, false},  // base_pose
+    {FieldId::BodyPose, DlpackDtype::kF32, 2, false},  // body_pose
+    {FieldId::BodyInvMass, DlpackDtype::kF32, 1, false},  // body_inv_mass
+    {FieldId::ContactCount, DlpackDtype::kU32, 1, false},  // contact_count
+    {FieldId::Lambda, DlpackDtype::kF32, 1, false},  // lambda
+    {FieldId::ArticulationBias, DlpackDtype::kF32, 1, false},  // articulation_bias
+    {FieldId::MFactor, DlpackDtype::kF32, 1, false},  // m_factor
+    {FieldId::ParticlePos, DlpackDtype::kF32, 2, false},  // particle_pos
+    {FieldId::MatBuckets, DlpackDtype::kF32, 1, false},  // mat_buckets
+    {FieldId::MatIndex, DlpackDtype::kU32, 1, false},  // mat_index
+    {FieldId::LinkContactWrench, DlpackDtype::kF32, 2, true},  // link_contact_wrench
+    {FieldId::Qddot, DlpackDtype::kF32, 1, false},  // qddot
+    {FieldId::Tau, DlpackDtype::kF32, 1, false},  // tau
+    {FieldId::LinkVelocity, DlpackDtype::kF32, 2, false},  // link_velocity
+    {FieldId::LinkAcceleration, DlpackDtype::kF32, 2, false},  // link_acceleration
+    {FieldId::LinkVelocityBias, DlpackDtype::kF32, 2, false},  // link_velocity_bias
+    {FieldId::LinkXup, DlpackDtype::kF32, 2, false},  // link_xup
+    {FieldId::LinkBiasForce, DlpackDtype::kF32, 2, false},  // link_bias_force
+    {FieldId::JointMotionSubspace, DlpackDtype::kF32, 2, false},  // joint_motion_subspace
+    {FieldId::DriveTarget, DlpackDtype::kF32, 1, false},  // drive_target
+    {FieldId::DriveStiffness, DlpackDtype::kF32, 1, false},  // drive_stiffness
+    {FieldId::DriveDamping, DlpackDtype::kF32, 1, false},  // drive_damping
+    {FieldId::DriveForceLimit, DlpackDtype::kF32, 1, false},  // drive_force_limit
+    {FieldId::SnapshotQ, DlpackDtype::kF32, 1, false},  // snapshot_q
+    {FieldId::SnapshotQdot, DlpackDtype::kF32, 1, false},  // snapshot_qdot
+    {FieldId::SnapshotLinkVelocity, DlpackDtype::kF32, 2, false},  // snapshot_link_velocity
+    {FieldId::SnapshotBasePose, DlpackDtype::kF32, 2, false},  // snapshot_base_pose
+    {FieldId::SnapshotBodyPose, DlpackDtype::kF32, 2, false},  // snapshot_body_pose
+    {FieldId::SnapshotBodyLinearVelocity, DlpackDtype::kF32, 2, false},  // snapshot_body_linear_velocity
+    {FieldId::SnapshotBodyAngularVelocity, DlpackDtype::kF32, 2, false},  // snapshot_body_angular_velocity
+    {FieldId::ResetEnvIds, DlpackDtype::kU32, 1, false},  // reset_env_ids
+    {FieldId::LinkInertia, DlpackDtype::kF32, 2, false},  // link_inertia
+    {FieldId::LinkLocalPose, DlpackDtype::kF32, 2, false},  // link_local_pose
+    {FieldId::LinkInertialFrame, DlpackDtype::kF32, 2, false},  // link_inertial_frame
+    {FieldId::JointAxis, DlpackDtype::kF32, 2, false},  // joint_axis
+    {FieldId::ParentOffset, DlpackDtype::kF32, 2, false},  // parent_offset
+    {FieldId::JointType, DlpackDtype::kU8, 1, false},  // joint_type
+    {FieldId::ParentLink, DlpackDtype::kU32, 1, false},  // parent_link
+    {FieldId::LinkBody, DlpackDtype::kU32, 1, false},  // link_body
+    {FieldId::LinkToArticulation, DlpackDtype::kU32, 1, false},  // link_to_articulation
+    {FieldId::JointDamping, DlpackDtype::kF32, 1, false},  // joint_damping
+    {FieldId::JointArmature, DlpackDtype::kF32, 1, false},  // joint_armature
+    {FieldId::ArticulationLinkCount, DlpackDtype::kU32, 1, false},  // articulation_link_count
+    {FieldId::ArticulationLinkOffset, DlpackDtype::kU32, 1, false},  // articulation_link_offset
+    {FieldId::FootShape, DlpackDtype::kF32, 1, false},  // foot_shape
+    {FieldId::BodyLinearVelocity, DlpackDtype::kF32, 2, false},  // body_linear_velocity
+    {FieldId::BodyAngularVelocity, DlpackDtype::kF32, 2, false},  // body_angular_velocity
+    {FieldId::BodyForce, DlpackDtype::kF32, 2, false},  // body_force
+    {FieldId::BodyTorque, DlpackDtype::kF32, 2, false},  // body_torque
+    {FieldId::BodyInvInertia, DlpackDtype::kF32, 2, false},  // body_inv_inertia
+    {FieldId::BodyAabbLo, DlpackDtype::kF32, 2, false},  // body_aabb_lo
+    {FieldId::BodyAabbHi, DlpackDtype::kF32, 2, false},  // body_aabb_hi
+    {FieldId::PairCount, DlpackDtype::kU32, 1, false},  // pair_count
+    {FieldId::CandidatePairs, DlpackDtype::kU32, 2, false},  // candidate_pairs
+    {FieldId::LbvhNodes, DlpackDtype::kF32, 1, false},  // lbvh_nodes
+    {FieldId::LbvhMorton, DlpackDtype::kU32, 1, false},  // lbvh_morton
+    {FieldId::LbvhIndex, DlpackDtype::kU32, 1, false},  // lbvh_index
+    {FieldId::LbvhVisit, DlpackDtype::kU32, 1, false},  // lbvh_visit
+    {FieldId::LbvhSortkey, DlpackDtype::kU64, 1, false},  // lbvh_sortkey
+    {FieldId::ContactLink, DlpackDtype::kU32, 1, false},  // contact_link
+    {FieldId::ContactPoint, DlpackDtype::kF32, 2, false},  // contact_point
+    {FieldId::ContactNormal, DlpackDtype::kF32, 2, false},  // contact_normal
+    {FieldId::ContactDepth, DlpackDtype::kF32, 1, false},  // contact_depth
+    {FieldId::ContactTangent1, DlpackDtype::kF32, 2, false},  // contact_tangent1
+    {FieldId::ContactTangent2, DlpackDtype::kF32, 2, false},  // contact_tangent2
+    {FieldId::ContactMaterial, DlpackDtype::kU64, 1, false},  // contact_material
+    {FieldId::ContactForce, DlpackDtype::kF32, 2, true},  // contact_force
+    {FieldId::UcontactCount, DlpackDtype::kU32, 1, false},  // ucontact_count
+    {FieldId::UcontactPoint, DlpackDtype::kF32, 2, false},  // ucontact_point
+    {FieldId::UcontactWitnessA, DlpackDtype::kF32, 2, false},  // ucontact_witness_a
+    {FieldId::UcontactWitnessB, DlpackDtype::kF32, 2, false},  // ucontact_witness_b
+    {FieldId::UcontactNormal, DlpackDtype::kF32, 2, false},  // ucontact_normal
+    {FieldId::UcontactDepth, DlpackDtype::kF32, 2, false},  // ucontact_depth
+    {FieldId::RowCount, DlpackDtype::kU32, 1, false},  // row_count
+    {FieldId::Urows, DlpackDtype::kF32, 2, false},  // urows
+    {FieldId::ChainJacobian, DlpackDtype::kF32, 1, false},  // chain_jacobian
+    {FieldId::RowDamping, DlpackDtype::kF32, 1, false},  // row_damping
+    {FieldId::RowCjLink, DlpackDtype::kU32, 1, false},  // row_cj_link
+    {FieldId::RowCjPoint, DlpackDtype::kF32, 2, false},  // row_cj_point
+    {FieldId::RowCjDir, DlpackDtype::kF32, 2, false},  // row_cj_dir
+    {FieldId::QdotFlat, DlpackDtype::kF32, 1, false},  // qdot_flat
+    {FieldId::M, DlpackDtype::kF32, 1, false},  // m
+    {FieldId::LinkCompositeInertia, DlpackDtype::kF32, 2, false},  // link_composite_inertia
+    {FieldId::HullVerts, DlpackDtype::kF32, 1, false},  // hull_verts
+    {FieldId::DofToLink, DlpackDtype::kU32, 1, false},  // dof_to_link
+    {FieldId::DofToComponent, DlpackDtype::kU32, 1, false},  // dof_to_component
+    {FieldId::ShapeTable, DlpackDtype::kF32, 1, false},  // shape_table
+    {FieldId::ExcludedPairs, DlpackDtype::kU64, 1, false},  // excluded_pairs
+    {FieldId::SampPoints, DlpackDtype::kF32, 1, false},  // samp_points
+    {FieldId::SampRanges, DlpackDtype::kU32, 1, false},  // samp_ranges
+    {FieldId::SdfHeaders, DlpackDtype::kF32, 1, false},  // sdf_headers
+    {FieldId::SdfCellCount, DlpackDtype::kU32, 1, false},  // sdf_cell_count
+    {FieldId::SdfCellKeys, DlpackDtype::kU64, 1, false},  // sdf_cell_keys
+    {FieldId::SdfCellValues, DlpackDtype::kF32, 1, false},  // sdf_cell_values
+    {FieldId::SdfCellGradients, DlpackDtype::kF32, 2, false},  // sdf_cell_gradients
+    {FieldId::ParticlePrevPos, DlpackDtype::kF32, 2, false},  // particle_prev_pos
+    {FieldId::ParticleVel, DlpackDtype::kF32, 2, false},  // particle_vel
+    {FieldId::ParticleInvMass, DlpackDtype::kF32, 1, false},  // particle_inv_mass
+    {FieldId::ParticleVPre, DlpackDtype::kF32, 2, false},  // particle_v_pre
+    {FieldId::AeroTriVerts, DlpackDtype::kU32, 2, false},  // aero_tri_verts
+    {FieldId::AeroTriArea, DlpackDtype::kF32, 1, false},  // aero_tri_area
+    {FieldId::PbfPredictedPos, DlpackDtype::kF32, 2, false},  // pbf_predicted_pos
+    {FieldId::RngState, DlpackDtype::kU64, 1, false},  // rng_state
+    {FieldId::EnvStatus, DlpackDtype::kU32, 1, true},  // env_status
+    {FieldId::ObsBuffer, DlpackDtype::kF32, 1, true},  // obs_buffer
+    {FieldId::EnvTerrainType, DlpackDtype::kU32, 1, false},  // env_terrain_type
+    {FieldId::EnvTerrainDifficulty, DlpackDtype::kF32, 1, false},  // env_terrain_difficulty
+    {FieldId::JointF, DlpackDtype::kF32, 1, false},  // joint_f
+    {FieldId::LinkGeomKind, DlpackDtype::kU32, 1, false},  // link_geom_kind
+    {FieldId::LinkGeomParams, DlpackDtype::kF32, 2, false},  // link_geom_params
+    {FieldId::LinkGeomLocal, DlpackDtype::kF32, 2, false},  // link_geom_local
+    {FieldId::BodyToLink, DlpackDtype::kU32, 1, false},  // body_to_link
+    {FieldId::BodyToArticulation, DlpackDtype::kU32, 1, false},  // body_to_articulation
+    {FieldId::UcontactA, DlpackDtype::kU32, 2, false},  // ucontact_a
+    {FieldId::UcontactB, DlpackDtype::kU32, 2, false},  // ucontact_b
+    {FieldId::UcontactGen, DlpackDtype::kU32, 2, false},  // ucontact_gen
+    {FieldId::Heights, DlpackDtype::kF32, 1, false},  // heights
+    {FieldId::UcontactTangent1, DlpackDtype::kF32, 2, false},  // ucontact_tangent1
+    {FieldId::UcontactTangent2, DlpackDtype::kF32, 2, false},  // ucontact_tangent2
+    {FieldId::ChainJacobianB, DlpackDtype::kF32, 1, false},  // chain_jacobian_b
+    {FieldId::RowCjLinkB, DlpackDtype::kU32, 1, false},  // row_cj_link_b
+    {FieldId::RowCjPointB, DlpackDtype::kF32, 2, false},  // row_cj_point_b
+    {FieldId::RowCjDirB, DlpackDtype::kF32, 2, false},  // row_cj_dir_b
+    {FieldId::RowPenetration, DlpackDtype::kF32, 1, false},  // row_penetration
+    {FieldId::QdotPseudo, DlpackDtype::kF32, 1, false},  // qdot_pseudo
+    {FieldId::LinkVelocityPseudo, DlpackDtype::kF32, 2, false},  // link_velocity_pseudo
+    {FieldId::QdotPseudoFlat, DlpackDtype::kF32, 1, false},  // qdot_pseudo_flat
+    {FieldId::BodyPseudoLinearVelocity, DlpackDtype::kF32, 2, false},  // body_pseudo_linear_velocity
+    {FieldId::BodyPseudoAngularVelocity, DlpackDtype::kF32, 2, false},  // body_pseudo_angular_velocity
+    {FieldId::ParticlePseudoVel, DlpackDtype::kF32, 2, false},  // particle_pseudo_vel
+    {FieldId::RowPseudoLambda, DlpackDtype::kF32, 1, false},  // row_pseudo_lambda
+    {FieldId::UcontactAKind, DlpackDtype::kU32, 2, false},  // ucontact_a_kind
+    {FieldId::UcontactBKind, DlpackDtype::kU32, 2, false},  // ucontact_b_kind
+    {FieldId::SnapshotParticlePos, DlpackDtype::kF32, 2, false},  // snapshot_particle_pos
+    {FieldId::SnapshotParticlePrevPos, DlpackDtype::kF32, 2, false},  // snapshot_particle_prev_pos
+    {FieldId::SnapshotParticleVel, DlpackDtype::kF32, 2, false},  // snapshot_particle_vel
+    {FieldId::GridMass, DlpackDtype::kF32, 1, false},  // grid_mass
+    {FieldId::GridMomentum, DlpackDtype::kF32, 2, false},  // grid_momentum
+    {FieldId::GridVelocity, DlpackDtype::kF32, 2, false},  // grid_velocity
+    {FieldId::GridForce, DlpackDtype::kF32, 2, false},  // grid_force
+    {FieldId::ParticleF, DlpackDtype::kF32, 2, false},  // particle_F
+    {FieldId::ParticleC, DlpackDtype::kF32, 2, false},  // particle_C
+    {FieldId::ParticleVol0, DlpackDtype::kF32, 1, false},  // particle_vol0
+    {FieldId::ParticlePlastic, DlpackDtype::kF32, 1, false},  // particle_plastic
+    {FieldId::ParticleMaterialId, DlpackDtype::kU32, 1, false},  // particle_material_id
+    {FieldId::SnapshotParticleF, DlpackDtype::kF32, 2, false},  // snapshot_particle_F
+    {FieldId::SnapshotParticleC, DlpackDtype::kF32, 2, false},  // snapshot_particle_C
+    {FieldId::SnapshotParticlePlastic, DlpackDtype::kF32, 1, false},  // snapshot_particle_plastic
+    {FieldId::MpmGridCellKey, DlpackDtype::kU32, 1, false},  // mpm_grid_cell_key
+    {FieldId::MpmGridPartIdx, DlpackDtype::kU32, 1, false},  // mpm_grid_part_idx
+    {FieldId::MpmSortScratch, DlpackDtype::kU8, 1, false},  // mpm_sort_scratch
+    {FieldId::MpmParticleStress, DlpackDtype::kF32, 2, false},  // mpm_particle_stress
+    {FieldId::MpmMaterialTable, DlpackDtype::kF32, 1, false},  // mpm_material_table
+    {FieldId::GridBodyDp, DlpackDtype::kF32, 2, false},  // grid_body_dp
+    {FieldId::GridBodyOwner, DlpackDtype::kU32, 1, false},  // grid_body_owner
+    {FieldId::MpmBodyReaction, DlpackDtype::kF32, 2, true},  // mpm_body_reaction
+    {FieldId::MpmBodyAngReaction, DlpackDtype::kF32, 2, true},  // mpm_body_ang_reaction
+    {FieldId::JointFrictionloss, DlpackDtype::kF32, 1, false},  // joint_frictionloss
+    {FieldId::BodyCollidableLink, DlpackDtype::kU32, 1, false},  // body_collidable_link
+    {FieldId::BodyCollidableLocal, DlpackDtype::kF32, 2, false},  // body_collidable_local
+    {FieldId::BodyCollidableBody, DlpackDtype::kU32, 1, false},  // body_collidable_body
+    {FieldId::UcontactIdPair, DlpackDtype::kU64, 2, false},  // ucontact_id_pair
+    {FieldId::UcontactIdFeature, DlpackDtype::kU64, 2, false},  // ucontact_id_feature
+    {FieldId::ContactCachePair, DlpackDtype::kU64, 2, false},  // contact_cache_pair
+    {FieldId::ContactCacheFeature, DlpackDtype::kU64, 2, false},  // contact_cache_feature
+    {FieldId::ContactCacheLambda, DlpackDtype::kF32, 2, false},  // contact_cache_lambda
+    {FieldId::ContactCacheNormal, DlpackDtype::kF32, 2, false},  // contact_cache_normal
+    {FieldId::ContactCacheTangent1, DlpackDtype::kF32, 2, false},  // contact_cache_tangent1
+    {FieldId::ContactCacheTangent2, DlpackDtype::kF32, 2, false},  // contact_cache_tangent2
+    {FieldId::ContactCacheMaterial, DlpackDtype::kU64, 2, false},  // contact_cache_material
+    {FieldId::ContactCacheAge, DlpackDtype::kU32, 2, false},  // contact_cache_age
+    {FieldId::ContactCacheSnapshotPair, DlpackDtype::kU64, 2, false},  // contact_cache_snapshot_pair
+    {FieldId::ContactCacheSnapshotFeature, DlpackDtype::kU64, 2, false},  // contact_cache_snapshot_feature
+    {FieldId::ContactCacheSnapshotLambda, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_lambda
+    {FieldId::ContactCacheSnapshotNormal, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_normal
+    {FieldId::ContactCacheSnapshotTangent1, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_tangent1
+    {FieldId::ContactCacheSnapshotTangent2, DlpackDtype::kF32, 2, false},  // contact_cache_snapshot_tangent2
+    {FieldId::ContactCacheSnapshotMaterial, DlpackDtype::kU64, 2, false},  // contact_cache_snapshot_material
+    {FieldId::ContactCacheSnapshotAge, DlpackDtype::kU32, 2, false},  // contact_cache_snapshot_age
+    {FieldId::ContactCacheCurrentOwner, DlpackDtype::kU32, 2, false},  // contact_cache_current_owner
+    {FieldId::ContactCacheOldKeep, DlpackDtype::kU32, 2, false},  // contact_cache_old_keep
+    {FieldId::JointLimitLower, DlpackDtype::kF32, 1, false},  // joint_limit_lower
+    {FieldId::JointLimitUpper, DlpackDtype::kF32, 1, false},  // joint_limit_upper
+    {FieldId::JointLimitFlags, DlpackDtype::kU8, 1, false},  // joint_limit_flags
+    {FieldId::MimicSourceLink, DlpackDtype::kU32, 1, false},  // mimic_source_link
+    {FieldId::MimicMultiplier, DlpackDtype::kF32, 1, false},  // mimic_multiplier
+    {FieldId::MimicOffset, DlpackDtype::kF32, 1, false},  // mimic_offset
+    {FieldId::JointLimitImpulse, DlpackDtype::kF32, 2, true},  // joint_limit_impulse
+    {FieldId::ActuatorEffortRequested, DlpackDtype::kF32, 1, true},  // actuator_effort_requested
+    {FieldId::ActuatorEffort, DlpackDtype::kF32, 1, true},  // actuator_effort
+    {FieldId::ActuatorSaturated, DlpackDtype::kF32, 1, true},  // actuator_saturated
+    {FieldId::PairSortScratch, DlpackDtype::kU8, 1, false},  // pair_sort_scratch
+    {FieldId::TaskTarget, DlpackDtype::kF32, 2, false},  // task_target
+    {FieldId::TaskRotationTarget, DlpackDtype::kF32, 2, false},  // task_rotation_target
+    {FieldId::TaskLocalPose, DlpackDtype::kF32, 2, false},  // task_local_pose
+    {FieldId::BodyInertialFrame, DlpackDtype::kF32, 2, false},  // body_inertial_frame
+    {FieldId::BodyWorldInvInertia, DlpackDtype::kF32, 2, false},  // body_world_inv_inertia
+    {FieldId::StepQdotFlat, DlpackDtype::kF32, 1, false},  // step_qdot_flat
+    {FieldId::StepBodyLinearVelocity, DlpackDtype::kF32, 2, false},  // step_body_linear_velocity
+    {FieldId::StepBodyAngularVelocity, DlpackDtype::kF32, 2, false},  // step_body_angular_velocity
+    {FieldId::StepParticleVelocity, DlpackDtype::kF32, 2, false},  // step_particle_velocity
+    {FieldId::ContactSideAKind, DlpackDtype::kU32, 1, true},  // contact_side_a_kind
+    {FieldId::ContactSideBKind, DlpackDtype::kU32, 1, true},  // contact_side_b_kind
+    {FieldId::ContactSideAIndex, DlpackDtype::kU32, 1, true},  // contact_side_a_index
+    {FieldId::ContactSideBIndex, DlpackDtype::kU32, 1, true},  // contact_side_b_index
+    {FieldId::AeroParticleOffset, DlpackDtype::kU32, 1, false},  // aero_particle_offset
+    {FieldId::AeroParticleCount, DlpackDtype::kU32, 1, false},  // aero_particle_count
+    {FieldId::AeroIncidentTri, DlpackDtype::kU32, 2, false},  // aero_incident_tri
+    {FieldId::AeroTriImpulse, DlpackDtype::kF32, 2, false},  // aero_tri_impulse
+    {FieldId::BodyGyroResidual, DlpackDtype::kF32, 1, true},  // body_gyro_residual
+    {FieldId::BodyGyroIterations, DlpackDtype::kU32, 1, true},  // body_gyro_iterations
+    {FieldId::BodyGyroStatus, DlpackDtype::kU32, 1, true},  // body_gyro_status
+    {FieldId::LbvhSortScratch, DlpackDtype::kU8, 1, false},  // lbvh_sort_scratch
+    {FieldId::ContactCacheScratch, DlpackDtype::kU8, 1, false},  // contact_cache_scratch
+    {FieldId::ActiveRowIds, DlpackDtype::kU32, 1, false},  // active_row_ids
+    {FieldId::ActiveRowCount, DlpackDtype::kU32, 1, false},  // active_row_count
+    {FieldId::ContactEndpointKeys, DlpackDtype::kU64, 2, false},  // contact_endpoint_keys
+    {FieldId::ContactEndpointCount, DlpackDtype::kU32, 1, false},  // contact_endpoint_count
+    {FieldId::LinkContactBegin, DlpackDtype::kU32, 1, false},  // link_contact_begin
+    {FieldId::LinkContactEnd, DlpackDtype::kU32, 1, false},  // link_contact_end
+    {FieldId::ContactIndexScratch, DlpackDtype::kU8, 1, false},  // contact_index_scratch
+    {FieldId::MeshSurfaceInfo, DlpackDtype::kU8, 2, false},  // mesh_surface_info
+    {FieldId::MeshTriangles, DlpackDtype::kU32, 1, false},  // mesh_triangles
+    {FieldId::MeshBvhNodes, DlpackDtype::kU8, 2, false},  // mesh_bvh_nodes
+    {FieldId::MeshEdgeInfo, DlpackDtype::kU8, 2, false},  // mesh_edge_info
+    {FieldId::MeshEdges, DlpackDtype::kU8, 2, false},  // mesh_edges
+    {FieldId::MeshEdgeNodes, DlpackDtype::kU8, 2, false},  // mesh_edge_nodes
+    {FieldId::MeshTriangleEdges, DlpackDtype::kU32, 1, false},  // mesh_triangle_edges
+    {FieldId::MeshTriangleVertexOwner, DlpackDtype::kU32, 1, false},  // mesh_triangle_vertex_owner
+    {FieldId::MeshVertexEdgeOffsets, DlpackDtype::kU32, 1, false},  // mesh_vertex_edge_offsets
+    {FieldId::MeshVertexEdges, DlpackDtype::kU32, 1, false},  // mesh_vertex_edges
+    {FieldId::MeshVertexTriangleOffsets, DlpackDtype::kU32, 1, false},  // mesh_vertex_triangle_offsets
+    {FieldId::MeshVertexTriangles, DlpackDtype::kU32, 1, false},  // mesh_vertex_triangles
+    {FieldId::MeshVertexSources, DlpackDtype::kU64, 1, false},  // mesh_vertex_sources
+    {FieldId::MeshEdgeSources, DlpackDtype::kU64, 1, false},  // mesh_edge_sources
+    {FieldId::MeshContactMode, DlpackDtype::kU8, 1, false},  // mesh_contact_mode
+    {FieldId::MeshVertexReach, DlpackDtype::kF32, 1, false},  // mesh_vertex_reach
+    {FieldId::StepEnvStatus, DlpackDtype::kU32, 1, false},  // step_env_status
+    {FieldId::StepMpmBodyImpulse, DlpackDtype::kF32, 2, false},  // step_mpm_body_impulse
+    {FieldId::StepMpmBodyMoment, DlpackDtype::kF32, 2, false},  // step_mpm_body_moment
+    {FieldId::StepLinkImpulse, DlpackDtype::kF32, 2, false},  // step_link_impulse
+    {FieldId::StepLinkMoment, DlpackDtype::kF32, 2, false},  // step_link_moment
+    {FieldId::StepJointLimitImpulse, DlpackDtype::kF32, 2, false},  // step_joint_limit_impulse
+    {FieldId::ParticlePlasticF, DlpackDtype::kF32, 2, false},  // particle_plastic_F
+    {FieldId::SnapshotParticlePlasticF, DlpackDtype::kF32, 2, false},  // snapshot_particle_plastic_F
+    {FieldId::GridInvMass, DlpackDtype::kF32, 1, false},  // grid_inv_mass
+    {FieldId::GridContactCount, DlpackDtype::kU64, 1, false},  // grid_contact_count
+    {FieldId::GridContactOffset, DlpackDtype::kU64, 1, false},  // grid_contact_offset
+    {FieldId::UcontactLaw, DlpackDtype::kU32, 1, false},  // ucontact_law
+    {FieldId::UcontactFriction, DlpackDtype::kF32, 1, false},  // ucontact_friction
+    {FieldId::GridContactAttempted, DlpackDtype::kU64, 1, true},  // grid_contact_attempted
+    {FieldId::GridContactRetained, DlpackDtype::kU32, 1, true},  // grid_contact_retained
+    {FieldId::GridContactPeak, DlpackDtype::kU64, 1, true},  // grid_contact_peak
+    {FieldId::GridContactOverflow, DlpackDtype::kU64, 1, true},  // grid_contact_overflow
+    {FieldId::MpmBoundaryImpulse, DlpackDtype::kF32, 2, true},  // mpm_boundary_impulse
+    {FieldId::MpmBoundaryMoment, DlpackDtype::kF32, 2, true},  // mpm_boundary_moment
+    {FieldId::StepMpmBoundaryImpulse, DlpackDtype::kF32, 2, false},  // step_mpm_boundary_impulse
+    {FieldId::StepMpmBoundaryMoment, DlpackDtype::kF32, 2, false},  // step_mpm_boundary_moment
+    {FieldId::VelocityTarget, DlpackDtype::kF32, 1, false},  // velocity_target
+    {FieldId::AccelerationTarget, DlpackDtype::kF32, 1, false},  // acceleration_target
+    {FieldId::ActuatorNoloadSpeed, DlpackDtype::kF32, 1, false},  // actuator_noload_speed
+    {FieldId::TaskNullspaceStiffness, DlpackDtype::kF32, 1, false},  // task_nullspace_stiffness
+    {FieldId::TaskNullspaceDamping, DlpackDtype::kF32, 1, false},  // task_nullspace_damping
+    {FieldId::DriveCommand, DlpackDtype::kF32, 1, false},  // drive_command
+    {FieldId::DriveDissipation, DlpackDtype::kF32, 1, false},  // drive_dissipation
+    {FieldId::DriveLower, DlpackDtype::kF32, 1, false},  // drive_lower
+    {FieldId::DriveUpper, DlpackDtype::kF32, 1, false},  // drive_upper
+    {FieldId::ControlMass, DlpackDtype::kF32, 1, false},  // control_mass
+    {FieldId::ControlFactor, DlpackDtype::kF32, 1, false},  // control_factor
+    {FieldId::ControlJacobian, DlpackDtype::kF32, 2, false},  // control_jacobian
+    {FieldId::ControlResponse, DlpackDtype::kF32, 2, false},  // control_response
+    {FieldId::ControlTaskMap, DlpackDtype::kF32, 2, false},  // control_task_map
+    {FieldId::ParticleSurfaceInfo, DlpackDtype::kU8, 2, false},  // particle_surface_info
+    {FieldId::ParticleSurfaceTriangles, DlpackDtype::kU32, 1, false},  // particle_surface_triangles
+    {FieldId::ParticleSurfaceTree, DlpackDtype::kU8, 2, false},  // particle_surface_tree
+    {FieldId::ParticleSurfaceEdgeInfo, DlpackDtype::kU8, 2, false},  // particle_surface_edge_info
+    {FieldId::ParticleSurfaceEdges, DlpackDtype::kU8, 2, false},  // particle_surface_edges
+    {FieldId::ParticleSurfaceEdgeTree, DlpackDtype::kU8, 2, false},  // particle_surface_edge_tree
+    {FieldId::ParticleSurfaceTriangleEdges, DlpackDtype::kU32, 1, false},  // particle_surface_triangle_edges
+    {FieldId::ParticleSurfaceTriangleVertexOwner, DlpackDtype::kU32, 1, false},  // particle_surface_triangle_vertex_owner
+    {FieldId::ParticleSurfaceVertexEdgeOffsets, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_edge_offsets
+    {FieldId::ParticleSurfaceVertexEdges, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_edges
+    {FieldId::ParticleSurfaceVertexTriangleOffsets, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_triangle_offsets
+    {FieldId::ParticleSurfaceVertexTriangles, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_triangles
+    {FieldId::ParticleSurfaceThickness, DlpackDtype::kF32, 1, false},  // particle_surface_thickness
+    {FieldId::ParticleSurfaceFriction, DlpackDtype::kF32, 1, false},  // particle_surface_friction
+    {FieldId::ParticleSurfaceNodes, DlpackDtype::kU8, 2, false},  // particle_surface_nodes
+    {FieldId::ParticleSurfaceEdgeNodes, DlpackDtype::kU8, 2, false},  // particle_surface_edge_nodes
+    {FieldId::PointEndpointRanges, DlpackDtype::kU8, 2, true},  // point_endpoint_ranges
+    {FieldId::PointEndpointTerms, DlpackDtype::kU8, 2, true},  // point_endpoint_terms
+    {FieldId::ParticleProjectionDelta, DlpackDtype::kF32, 2, false},  // particle_projection_delta
+    {FieldId::ParticleSurfaceMaxSpeed, DlpackDtype::kF32, 1, false},  // particle_surface_max_speed
+    {FieldId::GridPseudoVel, DlpackDtype::kF32, 2, false},  // grid_pseudo_vel
+    {FieldId::ContactSolveMetrics, DlpackDtype::kU64, 2, true},  // contact_solve_metrics
+    {FieldId::VbdSolveMetrics, DlpackDtype::kU64, 2, true},  // vbd_solve_metrics
+    {FieldId::ContactSolveCounts, DlpackDtype::kU32, 2, true},  // contact_solve_counts
+    {FieldId::ContactSolveWorstTerms, DlpackDtype::kF32, 2, true},  // contact_solve_worst_terms
+    {FieldId::PairSampleChunks, DlpackDtype::kU32, 1, false},  // pair_sample_chunks
+    {FieldId::BlockDescentScratch, DlpackDtype::kU32, 1, false},  // block_descent_scratch
+    {FieldId::VbdElements, DlpackDtype::kU8, 2, false},  // vbd_elements
+    {FieldId::VbdIncidenceOffsets, DlpackDtype::kU32, 1, false},  // vbd_incidence_offsets
+    {FieldId::VbdIncidence, DlpackDtype::kU32, 1, false},  // vbd_incidence
+    {FieldId::VbdColorVertices, DlpackDtype::kU32, 1, false},  // vbd_color_vertices
+    {FieldId::VbdColorSegments, DlpackDtype::kU32, 1, false},  // vbd_color_segments
+    {FieldId::VbdCoarseLevelNodes, DlpackDtype::kU32, 1, false},  // vbd_coarse_level_nodes
+    {FieldId::VbdCoarseParents, DlpackDtype::kU32, 1, false},  // vbd_coarse_parents
+    {FieldId::VbdCoarseWeights, DlpackDtype::kF32, 1, false},  // vbd_coarse_weights
+    {FieldId::VbdCoarseChildOffsets, DlpackDtype::kU32, 1, false},  // vbd_coarse_child_offsets
+    {FieldId::VbdCoarseChildren, DlpackDtype::kU32, 1, false},  // vbd_coarse_children
+    {FieldId::VbdCoarseChildWeights, DlpackDtype::kF32, 1, false},  // vbd_coarse_child_weights
+    {FieldId::ParticleResponse, DlpackDtype::kF32, 2, false},  // particle_response
+    {FieldId::ParticleRowImpulse, DlpackDtype::kF32, 2, false},  // particle_row_impulse
+    {FieldId::VbdFreeRate, DlpackDtype::kF32, 2, false},  // vbd_free_rate
+    {FieldId::VbdOffset, DlpackDtype::kF32, 2, false},  // vbd_offset
+    {FieldId::VbdInertia, DlpackDtype::kF32, 1, false},  // vbd_inertia
+    {FieldId::VbdHistoryVel, DlpackDtype::kF32, 2, false},  // vbd_history_vel
+    {FieldId::VbdHistoryReady, DlpackDtype::kU32, 1, false},  // vbd_history_ready
+    {FieldId::ParticleKinematicTarget, DlpackDtype::kF32, 2, false},  // particle_kinematic_target
+    {FieldId::OgcContactCount, DlpackDtype::kU32, 1, false},  // ogc_contact_count
+    {FieldId::DatParticleBeta, DlpackDtype::kF32, 1, true},  // dat_particle_beta
+    {FieldId::DatBodyBeta, DlpackDtype::kU32, 1, false},  // dat_body_beta
+    {FieldId::DatArticBeta, DlpackDtype::kU32, 1, false},  // dat_artic_beta
+    {FieldId::DatArticWitness, DlpackDtype::kU64, 2, false},  // dat_artic_witness
+    {FieldId::DatPrevQ, DlpackDtype::kF32, 1, false},  // dat_prev_q
+    {FieldId::DatPrevBasePose, DlpackDtype::kF32, 2, false},  // dat_prev_base_pose
+    {FieldId::DatPrevBodyPose, DlpackDtype::kF32, 2, false},  // dat_prev_body_pose
+    {FieldId::DatBodySpeed, DlpackDtype::kF32, 1, false},  // dat_body_speed
+    {FieldId::DatBodyQueryRadius, DlpackDtype::kF32, 1, false},  // dat_body_query_radius
+    {FieldId::DatBodyMotion, DlpackDtype::kF32, 1, false},  // dat_body_motion
+    {FieldId::DatJointMotion, DlpackDtype::kF32, 1, false},  // dat_joint_motion
+    {FieldId::DatJointRate, DlpackDtype::kF32, 1, false},  // dat_joint_rate
+    {FieldId::DatPairKind, DlpackDtype::kU32, 1, false},  // dat_pair_kind
+    {FieldId::DatPairOwnerA, DlpackDtype::kU32, 1, false},  // dat_pair_owner_a
+    {FieldId::DatPairOwnerB, DlpackDtype::kU32, 1, false},  // dat_pair_owner_b
+    {FieldId::DatPairFeatureA, DlpackDtype::kU32, 1, false},  // dat_pair_feature_a
+    {FieldId::DatPairFeatureB, DlpackDtype::kU32, 1, false},  // dat_pair_feature_b
+    {FieldId::DatTruncationCount, DlpackDtype::kU32, 1, false},  // dat_truncation_count
+    {FieldId::OgcSourceOffsets, DlpackDtype::kU64, 1, false},  // ogc_source_offsets
+    {FieldId::DatTruncationEnergy, DlpackDtype::kF32, 1, false},  // dat_truncation_energy
+    {FieldId::DatParticleTruncationCount, DlpackDtype::kU32, 1, false},  // dat_particle_truncation_count
+    {FieldId::DatParticleTruncationEnergy, DlpackDtype::kF32, 1, false},  // dat_particle_truncation_energy
+    {FieldId::DatParticleTruncationMomentum, DlpackDtype::kF32, 2, false},  // dat_particle_truncation_momentum
+    {FieldId::DatJointTruncationCount, DlpackDtype::kU32, 1, false},  // dat_joint_truncation_count
+    {FieldId::DatJointTruncationEnergy, DlpackDtype::kF32, 1, false},  // dat_joint_truncation_energy
+    {FieldId::DatBodyTruncationCount, DlpackDtype::kU32, 1, false},  // dat_body_truncation_count
+    {FieldId::DatBodyTruncationEnergy, DlpackDtype::kF32, 1, false},  // dat_body_truncation_energy
+    {FieldId::VbdStep, DlpackDtype::kF32, 1, false},  // vbd_step
+    {FieldId::VbdRestart, DlpackDtype::kU32, 1, false},  // vbd_restart
+    {FieldId::DatFailureCount, DlpackDtype::kU32, 1, false},  // dat_failure_count
+    {FieldId::DatQueryLimitCount, DlpackDtype::kU32, 1, false},  // dat_query_limit_count
+    {FieldId::DatFailureWitness, DlpackDtype::kU64, 2, false},  // dat_failure_witness
+    {FieldId::ContactWarmStartCounts, DlpackDtype::kU32, 2, false},  // contact_warm_start_counts
+    {FieldId::MeshOgcPairCount, DlpackDtype::kU32, 1, false},  // mesh_ogc_pair_count
+    {FieldId::MeshSdfPairCount, DlpackDtype::kU32, 1, false},  // mesh_sdf_pair_count
+    {FieldId::VbdVelocitySweepCount, DlpackDtype::kU32, 1, false},  // vbd_velocity_sweep_count
+    {FieldId::SolverColorCounts, DlpackDtype::kU32, 2, false},  // solver_color_counts
+    {FieldId::SolverPhaseTime, DlpackDtype::kU64, 2, false},  // solver_phase_time
+    {FieldId::DatSurfaceMotion, DlpackDtype::kF32, 1, false},  // dat_surface_motion
+    {FieldId::EnergyLedger, DlpackDtype::kF32, 2, true},  // energy_ledger
+    {FieldId::EnergyLedgerStatus, DlpackDtype::kU32, 1, true},  // energy_ledger_status
+    {FieldId::PhysicsStageMetrics, DlpackDtype::kF32, 2, true},  // physics_stage_metrics
+    {FieldId::ContactAuditCounts, DlpackDtype::kU32, 2, true},  // contact_audit_counts
+    {FieldId::ContactAuditMetrics, DlpackDtype::kU64, 2, true},  // contact_audit_metrics
+    {FieldId::EnergyParticleStart, DlpackDtype::kF32, 2, false},  // energy_particle_start
+    {FieldId::EnergyParticleFree, DlpackDtype::kF32, 2, false},  // energy_particle_free
+    {FieldId::EnergyParticleFreeRate, DlpackDtype::kF32, 2, false},  // energy_particle_free_rate
+    {FieldId::EnergyAeroImpulse, DlpackDtype::kF32, 2, false},  // energy_aero_impulse
+    {FieldId::EnergyKinematicContactImpulse, DlpackDtype::kF32, 2, false},  // energy_kinematic_contact_impulse
+    {FieldId::EnergyBodyFreeLinear, DlpackDtype::kF32, 2, false},  // energy_body_free_linear
+    {FieldId::EnergyBodyFreeAngular, DlpackDtype::kF32, 2, false},  // energy_body_free_angular
+    {FieldId::EnergyLinkStartQ, DlpackDtype::kF32, 1, false},  // energy_link_start_q
+    {FieldId::EnergyLinkStartQdot, DlpackDtype::kF32, 1, false},  // energy_link_start_qdot
+    {FieldId::EnergyLinkPose, DlpackDtype::kF32, 2, false},  // energy_link_pose
+    {FieldId::EnergyLinkUnprojectedPose, DlpackDtype::kF32, 2, false},  // energy_link_unprojected_pose
+    {FieldId::EnergyLinkVelocity, DlpackDtype::kF32, 2, false},  // energy_link_velocity
+    {FieldId::EnergyQdotFree, DlpackDtype::kF32, 1, false},  // energy_qdot_free
+    {FieldId::VbdForceResidualWork, DlpackDtype::kF32, 1, true},  // vbd_force_residual_work
+    {FieldId::MReduced, DlpackDtype::kF32, 1, false},  // m_reduced
+    {FieldId::MimicRootDof, DlpackDtype::kU32, 1, false},  // mimic_root_dof
+    {FieldId::MimicRootScale, DlpackDtype::kF32, 1, false},  // mimic_root_scale
+    {FieldId::MimicProjectionLoss, DlpackDtype::kF32, 1, false},  // mimic_projection_loss
+    {FieldId::VbdMembraneStart, DlpackDtype::kU8, 2, false},  // vbd_membrane_start
+    {FieldId::CrbaScratch, DlpackDtype::kU32, 1, false},  // crba_scratch
+    {FieldId::VbdSolveAudit, DlpackDtype::kF32, 2, true},  // vbd_solve_audit
+    {FieldId::ControlScratch, DlpackDtype::kU32, 2, false},  // control_scratch
+    {FieldId::VbdFreeVelocity, DlpackDtype::kF32, 2, false},  // vbd_free_velocity
+    {FieldId::ContactRowExtent, DlpackDtype::kU32, 2, false},  // contact_row_extent
+    {FieldId::ContactCacheExtent, DlpackDtype::kU32, 2, false},  // contact_cache_extent
+    {FieldId::LinkTreeDepth, DlpackDtype::kU32, 1, false},  // link_tree_depth
+    {FieldId::ArticulationTreeDepth, DlpackDtype::kU32, 1, false},  // articulation_tree_depth
+    {FieldId::LinkChildRange, DlpackDtype::kU32, 2, false},  // link_child_range
+    {FieldId::LinkChildren, DlpackDtype::kU32, 1, false},  // link_children
+    {FieldId::UcontactRowRange, DlpackDtype::kU32, 2, true},  // ucontact_row_range
+    {FieldId::LinkWrench, DlpackDtype::kF32, 2, false},  // link_wrench
 };
 
 } // namespace nuka::nk

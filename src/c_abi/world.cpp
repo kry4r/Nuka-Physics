@@ -1,22 +1,3 @@
-// ---------------------------------------------------------------------------
-// nuka::c_abi -- the ONE generic world entry (M9 T5/T6 cutover).
-//
-// The C-ABI world is now exactly ONE nk::World built from
-// Scene -> CookToModel -> nk::World (mirroring c_abi/recorder.cpp's proven
-// create+ownership pattern). The two legacy steppers (single-env Featherstone
-// StepWorldGpu + the multi-env batched articulated world) are GONE: there is no
-// special world type and no per-case physics path (owner's highest directive --
-// a GENERAL solver). create cooks the authored scene, builds an
-// nk::World on the DeviceRecord's already-owned phi v2 device/backend (M9 T2),
-// and seeds the cooked IC + PD hold targets (the cook+SeedInitialState bake them,
-// so the legacy BuildHoldDriveTargets/Upload/Sync host plumbing is deleted).
-// step/reset/buffer-view drive that ONE nk::World directly.
-//
-// A transitional ArticulationHostState mirror (articulation_host) is captured at
-// create from the SAME cook for the diffsim backward family + set_link_mass + DR
-// (host dI/dmass + spatial-inertia rebuild); its device writes target the nk
-// arena LinkInertia field. That mirror retires when the backward op-ifies (T7).
-// ---------------------------------------------------------------------------
 
 #include "c_abi/handle_table.hpp"
 #include "c_abi/internal.hpp"
@@ -43,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -94,14 +76,6 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
     return false;
 }
 
-// Capture the transitional diffsim/noise host mirror from the SAME cooked blob the
-// live model was transcribed from (CookArticulations -> BuildArticulationHostState over the
-// FIRST articulation, single-env). This reproduces topo.masses/inertias/
-// inertial_frames + joint_armature + link_inertia BYTE-IDENTICALLY, so
-// BuildMassParams (diffsim) / ResolveLinkInertiaParams (DR + set_link_mass) /
-// CaptureNominalBaseline stay bit-exact. It is HOST-ONLY (no device upload): the
-// live device inertia is the nk arena's LinkInertia field; set_link_mass / DR
-// write THAT in place (world.cpp does not own a legacy ArticulationDeviceBuffers).
 void CaptureArticulationHostMirror(const scene::CookedBlob& blob, WorldRecord* record) {
     // The mirror consumes ONLY body/joint/inertial tables, read from the blob the live
     // model was cooked from, so no collision geometry is cooked a second time.
@@ -111,16 +85,10 @@ void CaptureArticulationHostMirror(const scene::CookedBlob& blob, WorldRecord* r
         record->articulation_host = articulation::ArticulationHostState{};
         return;
     }
-    // CookToModel transcribes only the FIRST articulation today (generic
-    // single-articulation cook debt, M7); mirror that exact choice so the host
-    // mirror's global-link ordering matches the arena's. Passing all arts here
-    // would DIVERGE the mirror from the single-articulation arena, so we keep the
-    // first and make the truncation LOUD (no silent data drop): the diffsim / DR /
-    // set_link_mass host mirror covers only articulation 0.
     if (arts.size() > 1u) {
         std::fprintf(stderr,
                      "[nuka] CaptureArticulationHostMirror: %zu articulations "
-                     "cooked; diffsim/DR/set_link_mass host mirror covers only "
+                     "cooked; noise/set_link_mass host mirror covers only "
                      "articulation 0 (multi-articulation mirror not yet "
                      "implemented).\n",
                      arts.size());
@@ -425,7 +393,7 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
                                 uint32_t solver_max_pairs,
                                 uint32_t cloth_integrator,
                                 uint32_t ogc_contact_capacity) {
-    if (cloth_integrator > 1u) return NUKA_RESULT_INVALID_ARG;
+    if (cloth_integrator > 1u || solver_vel_iters > UINT16_MAX) return NUKA_RESULT_INVALID_ARG;
     if (!blob) return NUKA_RESULT_INTERNAL;
     if (ogc_contact_capacity > 0u)
         nuka::scene::cook::SetOgcContactCapacity(cooked_model, ogc_contact_capacity);
@@ -447,7 +415,10 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
     cfg.gravity[2] = gravity.z;
     // Each non-zero override replaces a default; all-zero leaves cfg exactly as built
     // above (dt + gravity only), so an unset caller is byte-identical to today.
-    if (solver_vel_iters != 0u) cfg.vel_iters = static_cast<uint16_t>(solver_vel_iters);
+    if (solver_vel_iters != 0u) {
+        cfg.vel_iters = static_cast<uint16_t>(solver_vel_iters);
+        cfg.velocity_iterations_override = true;
+    }
     if (solver_pos_iters != 0u) cfg.pos_iters = static_cast<uint16_t>(solver_pos_iters);
     if (solver_contact_margin > 0.0f) cfg.contact_margin = solver_contact_margin;
     if (solver_max_pairs != 0u) cfg.max_pairs = solver_max_pairs;
@@ -461,9 +432,6 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
         return MapStatusToResult(record->world->CreationStatus());
     }
 
-    // Transitional host mirror for the diffsim backward + set_link_mass + DR
-    // (host dI/dmass + spatial-inertia rebuild). HOST-ONLY -- device writes target
-    // the nk arena. Particles carry no articulation, so this covers the robot only.
     CaptureArticulationHostMirror(*blob, record.get());
 
     // Retain the FINAL composed scene so a camera-sensor attach builds the per-env
@@ -720,9 +688,9 @@ nuka_result_t nuka_world_get_resource_info(nuka_world_handle world, nuka_world_r
     const auto& c = model.capacities;
     uint64_t model_bytes;
     model.ComputeModelSegments(&model_bytes);
-    uint64_t arenas[3];
+    uint64_t arenas[nuka::nk::Arena::kArenaCount];
     nuka::nk::Arena::ComputeSegments(c, arenas);
-    *out = {model_bytes, arenas[0], arenas[1], arenas[2], c.env_count,
+    *out = {model_bytes, arenas[0], arenas[1], c.env_count,
             c.max_contacts_per_env, c.max_rows_per_env, c.dofs_per_env,
             c.bodies_per_env, c.particles_per_env};
     return NUKA_RESULT_OK;
@@ -1055,6 +1023,100 @@ nuka_result_t nuka_world_get_kinematic_link(nuka_world_handle world,
         return NUKA_RESULT_OK;
     } catch (const std::exception& error) {
         return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
+                                       uint32_t link_index, float mass) {
+    nuka::c_abi::WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
+    if (world_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!world_record->world ||
+        world_record->articulation_host.TotalLinkCount() == 0u) {
+        return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
+    }
+    auto& host = world_record->articulation_host;
+    const uint32_t total_links = host.TotalLinkCount();
+    if (link_index >= total_links || link_index >= host.link_inertia.size()) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    if (!(mass > 0.0f) || !std::isfinite(mass)) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    try {
+        nuka::math::Vec3 diagonal_inertia{0.0f, 0.0f, 0.0f};
+        nuka::math::Transform inertial_frame =
+            nuka::math::Transform::Identity();
+        float* template_mass = nullptr;
+        {
+            uint32_t global = 0u;
+            bool resolved = false;
+            for (auto& topo : host.articulations) {
+                const uint32_t link_count =
+                    static_cast<uint32_t>(topo.link_bodies.size());
+                if (link_index < global + link_count) {
+                    const uint32_t local = link_index - global;
+                    if (local >= topo.masses.size()) return NUKA_RESULT_INVALID_ARG;
+                    template_mass = &topo.masses[local];
+                    diagonal_inertia = (local < topo.inertias.size())
+                                           ? topo.inertias[local]
+                                           : nuka::math::Vec3{0.0f, 0.0f, 0.0f};
+                    inertial_frame =
+                        (local < topo.inertial_frames.size())
+                            ? topo.inertial_frames[local]
+                            : nuka::math::Transform::Identity();
+                    resolved = true;
+                    break;
+                }
+                global += link_count;
+            }
+            if (!resolved) {
+                return NUKA_RESULT_INVALID_ARG;
+            }
+        }
+
+        // Scalar mass varies with COM and rotational inertia at the COM held fixed.
+        const nuka::runtime::articulation::LinkSpatialInertia new_inertia =
+            nuka::runtime::articulation::MakeSpatialInertia(
+                mass, diagonal_inertia, inertial_frame);
+
+        nuka::nk::Mat36 packed{};
+        static_assert(sizeof(packed) == sizeof(new_inertia));
+        std::memcpy(&packed, &new_inertia, sizeof(packed));
+        const auto status = world_record->world->SetLinkInertia(link_index, packed);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        host.link_inertia[link_index] = new_inertia;
+        *template_mass = mass;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        return nuka::c_abi::MapExceptionToResult(e);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z) {
+    nuka::c_abi::WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
+    if (world_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    if (!world_record->world || !std::isfinite(gravity_z)) return NUKA_RESULT_INVALID_ARG;
+    try {
+        auto gravity = world_record->world->Gravity();
+        gravity.z = gravity_z;
+        const auto status = world_record->world->SetGravity(gravity);
+        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        world_record->step_options.gravity = gravity;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        return nuka::c_abi::MapExceptionToResult(e);
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }

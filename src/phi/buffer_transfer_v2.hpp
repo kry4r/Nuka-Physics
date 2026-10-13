@@ -1,29 +1,4 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nuka::phi — PHI v2 host-side typed Buffer* <-> std::vector transfer helpers.
-//
-// The ONE host-side transfer header (its legacy RAII predecessor was deleted in the
-// M11 BUF sweep). Operates on the opaque v2 `Buffer*` (phi/buffer.hpp).
-//
-// Allocation is backend-owned via a BufferType*:
-//   * DeviceBufferType(device)        -> the device-level DEFAULT type, bound to
-//                                        the NULL/default stream (stream 0). Use
-//                                        for consumers whose kernels coordinate
-//                                        via NULL-stream implicit sync (the
-//                                        legacy oracle path) -> byte+timing
-//                                        IDENTICAL to the legacy stream-0 memcpy.
-//   * BackendDeviceBufferType(backend)-> the backend's MAIN-stream type. Use for
-//                                        consumers whose ops/kernels run on
-//                                        backend->main (the diffsim op path).
-// Stream choice is the D1 anchor: ALWAYS pick the BufferType whose stream matches
-// the consumer's kernels (m11-recon.md R1). The caller OWNS the returned Buffer*
-// (BufferFree it).
-//
-// HOST-ONLY header (no __device__ code); compiles under -Wall -Wextra -Wpedantic
-// -Wconversion -Wshadow -Werror and under nvcc -std=c++17. Byte arithmetic uses
-// size_t throughout, matching the legacy originals so migration is a pure
-// type+alloc swap with no behavioral change.
-// ---------------------------------------------------------------------------
 
 #include <cstddef>
 #include <cstdint>

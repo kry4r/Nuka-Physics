@@ -46,13 +46,7 @@ add_library(nuka_cooker STATIC
     import/cooker/mesh_surface_cache.cpp
     import/cooker/mesh_query_backend.cpp
     import/cooker/convex_cover.cpp
-    # v0.7 p07: narrow-band sparse SDF cooker (HOST CPU; the cooked SDF is a
-    # byte-reproducible golden, so it runs on the deterministic host path rather
-    # than taking the cook-time GPU exception). The runtime query header
-    # (runtime/sdf/sparse_sdf_query.cuh) is CUDA-free and is included here too.
     import/cooker/sparse_sdf_cooker.cpp
-    # v0.7 p07 seam: the swappable SDF bake backend (CpuSdfBakeBackend now; the
-    # v1.0 GPU backend slots in behind DefaultSdfBakeBackend). Owner 2026-06-02.
     import/cooker/sdf_bake_backend.cpp
 )
 set_target_properties(nuka_cooker PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -128,14 +122,8 @@ target_include_directories(nuka_runtime
 set(NUKA_PUBLIC_HEADERS
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka.hpp
-    ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_diffsim.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_noise.h
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_state_sensor.h
-    # M8 T5: the offscreen recorder C ABI (PPM P6 capture + ffmpeg mp4). Its
-    # IMPLEMENTATION (c_abi/recorder.cpp) is gated behind NK_BUILD_VULKAN_VALIDATION
-    # (Decision D5) but the header + the exported symbols are ALWAYS present so the
-    # python binding imports on a Vulkan-less build (every entry returns
-    # NUKA_RESULT_NOT_SUPPORTED there).
     ${CMAKE_SOURCE_DIR}/src/include/nuka/nuka_recorder.h
 )
 
@@ -197,8 +185,6 @@ add_custom_command(
     VERBATIM
 )
 
-# M8 T3a raster forward-pass shaders (mesh.vert / mesh_pbr.frag) -- same glslc
-# custom_command pattern as the compute debug_draw above.
 set(NUKA_RASTER_MESH_VERT "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/mesh.vert")
 set(NUKA_RASTER_MESH_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh.vert.spv")
 add_custom_command(
@@ -305,19 +291,6 @@ nuka_set_warnings(nuka_render)
 
 add_subdirectory(rhi)
 
-# ---------------------------------------------------------------------------
-# nuka_imgui (M8.5 T1) -- the nuka-side Dear ImGui glue + custom theme.
-#
-# Mirrors nuka_render: a STATIC lib that links Vulkan::Vulkan and the vendored
-# `imgui` lib (external/imgui, declared in the root CMakeLists, SYSTEM includes).
-# GATED behind NK_BUILD_VULKAN_VALIDATION (Decision D3): the default build-cuda128
-# config never builds it, so libnuka + core are untouched. HOST-ONLY / zero-CUDA;
-# the vendored ImGui is a SYSTEM include so it stays out of the src/render lint scope.
-#
-# The JetBrains Mono font paths are injected as compile-definitions (the same idiom
-# nuka_render uses for its compiled-SPV paths) so nuka_imgui.cpp loads the vendored
-# TTFs by absolute path at runtime.
-# ---------------------------------------------------------------------------
 if(NK_BUILD_VULKAN_VALIDATION)
     add_library(nuka_imgui STATIC
         render/imgui/nuka_imgui.cpp
@@ -345,23 +318,6 @@ if(NK_BUILD_VULKAN_VALIDATION)
     nuka_set_warnings(nuka_imgui)
 endif()
 
-# ---------------------------------------------------------------------------
-# nuka_present (M8.5 T2) -- the realtime SWAPCHAIN present renderer + the thin
-# self-written xcb windowing/surface backend (Decision D1).
-#
-# STRATEGY-SPLIT: this is a SEPARATE lib from nuka_render. It links nuka_render
-# (to borrow the present-capable VulkanRasterRenderer for device/queue/handles)
-# but owns the swapchain present path so the offscreen G2 determinism oracle in
-# nuka_render stays pristine. The realtime present loop is legitimately non-D1
-# (vsync / frames-in-flight) and is isolated here.
-#
-# GATED behind NK_BUILD_VULKAN_VALIDATION (Decision D3): the default build-cuda128
-# config never builds it -> libnuka + core untouched. Links libxcb + X11 (the
-# Decision-D1 windowing dep; find_package(X11) is wired in the root CMakeLists
-# under the same gate). The raster forward-pass SPV paths are re-injected here so
-# the present pipeline loads the SAME compiled shaders as the offscreen renderer.
-# HOST-ONLY / zero-CUDA-token: pure C++ / Vulkan / xcb.
-# ---------------------------------------------------------------------------
 if(NK_BUILD_VULKAN_VALIDATION)
     # Platform surface backend: GLFW on Windows, the self-written xcb backend on
     # Linux. Each TU carries its own MakeSurface factory, so only one is compiled.
@@ -420,12 +376,6 @@ if(NK_BUILD_VULKAN_VALIDATION)
 
     nuka_set_warnings(nuka_present)
 endif()
-
-# M9 T11-core-b2: nuka_scene_pipeline (scene/scene_pipeline.cpp + the co-orphaned
-# scene/pose_graph.*) deleted. Its sole consumer (test_scene_pipeline.cpp) was
-# dropped in T11 and the remaining scene units relinked to nuka_scene.
-# (M11 RT-6: the legacy render::RenderScene / BuildRenderScene scene-view path
-# was deleted too; the live render path is RenderWorld -> raster / rt_adapter.)
 
 # ---------------------------------------------------------------------------
 # nuka_import – MJCF and URDF importers
@@ -500,17 +450,6 @@ target_link_libraries(nuka_constraint
 
 nuka_set_warnings(nuka_constraint)
 
-# ---------------------------------------------------------------------------
-# nuka_solver – constraint-solver config carrier (header-only).
-# ---------------------------------------------------------------------------
-# M9 T11-core-b2: the legacy row solver/scheduler estate (row_solver.cu /
-# row_scheduler.* / unified_solve.* / diff_test_bridge.*) was deleted -- the
-# algorithm migrated to the phi assemble_rows / block-descent ops. The only
-# surviving source here is solver_config.hpp
-# (the SolverConfig tuning POD the foot_*/link_rigid nk gates still reference),
-# so nuka_solver is now an INTERFACE library that just carries the `src` include
-# path. All `target_link_libraries(... nuka_solver)` consumers keep resolving
-# `solver/solver_config.hpp` unchanged.
 add_library(nuka_solver INTERFACE)
 
 target_include_directories(nuka_solver
@@ -637,9 +576,6 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
-    # --- V3 finite-difference validation harness (v0.5 p01 adjoint slice) ----
-    # Validates each generated reverse-mode adjoint against a central-difference
-    # numerical Jacobian of the SAME generated primal. Slice: maximal_drive.
     add_library(nuka_codegen_v3_validation STATIC
         codegen/v3_validation/fd_harness.cu
         codegen/v3_validation/numerical_jacobian.cu
@@ -699,18 +635,9 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/cuda_backend.cu
         phi/backend_cuda/cuda_buffer.cu
         phi/backend_cuda/ops/registry.cu
-        # M3b articulation pipeline op implementations (line-by-line kernel
-        # ports; see each file's header). The contact pipeline (assemble_rows /
-        # block_descent — the device-resident unified row solve). L1-c DELETED
-        # contacts_union.cu (the UnionCsr narrowphase) with the rest of the
-        # UnionCsr path; PairDriven is the one general contact path.
         phi/backend_cuda/ops/articulation.cu
         phi/backend_cuda/ops/crba.cu
         phi/backend_cuda/ops/contacts_foot.cu
-        # General contact pipeline Phase 0 (B2): SyncLinkBodyPose — copies each
-        # articulation link's FK world pose into its owning body_pose row so artic
-        # links enter the LBVH. PairDriven-family-gated (inert for the UnionCsr
-        # graph; L1-b: PairDriven is now the general default).
         phi/backend_cuda/ops/sync_body_pose.cu
         # General contact pipeline Phase 2 (H3): the GENERAL heightfield narrowphase
         # — per-cell TRIANGLE_PRISM midphase routed through the EXISTING cvx GJK/EPA
@@ -744,12 +671,6 @@ if(CMAKE_CUDA_COMPILER)
         phi/backend_cuda/ops/readout.cu
         phi/backend_cuda/ops/energy_ledger.cu
         phi/backend_cuda/ops/sensors.cu
-        # M9 T7: NkOp::StepBackward — the diffsim contact-free single-step reverse
-        # adjoint, kernel moved VERBATIM from the deleted diffsim/step_backward.cu
-        # (same reduction order / launch config / nvcc flags -> D1 byte-exact).
-        # Also hosts the StepBackward kernel launcher + the backward runner's
-        # grad_mass accumulate kernel so diffsim's backward_runner stays host-only.
-        phi/backend_cuda/ops/diffsim_backward.cu
     )
     set_target_properties(nuka_phi2_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_phi2_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -767,10 +688,6 @@ if(CMAKE_CUDA_COMPILER)
     # -------------------------------------------------------------------------
     add_library(nuka_scene_cook STATIC
         scene/cook/cook_to_model.cpp
-        # M7 T2: the reusable cook primitives — the deterministic settle (runs an
-        # already-built nk::World, PD-holds named dof patterns, snapshots +
-        # downloads the settled IC) and the geometric rest-placement (drop-to-
-        # rest seat). Pure host C++ (the World device work goes through phi v2).
         scene/cook/settle.cpp
         scene/cook/placement.cpp
         # The general heightfield: the parametric grid generators + the self-written
@@ -795,7 +712,7 @@ if(CMAKE_CUDA_COMPILER)
             nuka_articulation
         PRIVATE
             # The media cook reuses the cloth-topology + lattice cookers
-            # (BuildClothVertexBlocks / CookFluidBox) compiled into nuka_runtime_gpu.
+            # (BuildClothVertexBlocks / CookParticleBox) compiled into nuka_runtime_gpu.
             nuka_runtime_gpu
     )
 
@@ -972,7 +889,7 @@ if(CMAKE_CUDA_COMPILER)
                 nuka_runtime
                 nuka_import
                 nuka_cooker
-                nuka_articulation_gpu
+                nuka_contact_wrench
                 nuka_collision_gpu
                 nuka_core
                 nuka_phi
@@ -991,8 +908,8 @@ if(CMAKE_CUDA_COMPILER)
         # Cook-time HOST builders: cloth/rod vertex blocks, tet lattices and skins.
         runtime/soft/cloth_topology.cpp
         runtime/soft/tetmesh_topology.cpp
-        # The box/sphere lattice sampler (FluidBoxSpec) the MLS-MPM media cook uses.
-        import/cooker/fluid_cooker.cpp
+        # The box/sphere lattice sampler (ParticleVolumeSpec) the MLS-MPM media cook uses.
+        import/cooker/particle_volume_cooker.cpp
         # COL-5 (M11): runtime/sdf/sdf_device_world.cu DELETED. Its sole duty (upload
         # a cooked scene::CookedSdfTable to the device) now lives in nk::Model
         # (model.hpp sdf_cell_* + cook_to_model.cpp + narrowphase_sdf.cu LoadSdfGrid);
@@ -1021,12 +938,6 @@ if(CMAKE_CUDA_COMPILER)
             nuka_collision_gpu
     )
 
-    # --- v0.7 p04: self-written LBVH rigid broadphase (Karras 2012) ----------
-    # Selectable backend (SAP in nuka_runtime_gpu stays the default). Produces a
-    # compact, deterministically-sorted candidate-pair list whose reduced SET
-    # equals the SAP overlap set. First Thrust user in the tree (CUDA 12.8 bundles
-    # Thrust; included directly, no extra find_package needed). D1-critical:
-    # integer-only atomics, stable_sort_by_key (radix), sorted compact output.
     add_library(nuka_collision_gpu STATIC
         collision/broadphase_lbvh.cu
         collision/lbvh_refit.cu
@@ -1035,20 +946,9 @@ if(CMAKE_CUDA_COMPILER)
         # by both the pair-driven broadphase op (phi backend) and the render
         # TLAS. Same library + default --fmad as the single-tree build above.
         collision/lbvh_batched.cu
-        # v0.7 p05: particle uniform grid (spatial hash) + cross-system query
-        # (particle AABB -> rigid LBVH). D1-deterministic broadphase primitives
-        # feeding the soft/fluid/coupling phases. Same lib as the LBVH (which
-        # the cross-system query traverses); integer-only atomics, sorted output.
         collision/particle_uniform_grid.cu
         collision/cross_system_query.cu
-        # v0.7 p08-B: Newton-on-summed-SDF contact. find_sdf_contact_newton is a
-        # header-inline NUKA_SDF_HD function (host tests call it directly); this
-        # TU carries the device emission kernel + the host RowBuffers builders.
         collision/sdf_contact.cu
-        # v0.7 p08-C (Channel 2/3): envelope-theorem depth+normal contact-geometry
-        # adjoint of the Newton-summed-SDF contact. Host fp32; differentiates the
-        # p07 trilinear sampler + pose at the FROZEN witness (valley-proof, no
-        # step_curvature). The contact POINT is degenerate -> NOT differentiated.
         collision/sdf_contact_adjoint.cpp
         # v0.8 C2a: the unified broadphase OUTPUT type. CandidatePairStream is a
         # D1 device container of type-tagged CandidatePairs sorted by stable_key
@@ -1236,16 +1136,7 @@ if(CMAKE_CUDA_COMPILER)
         )
     endif()
 
-    # M9 T11-core-b2: nuka_row_solver_gpu (row_scheduler.cu / row_solver.cu) and
-    # the nuka_solver CUDA define/link it fed are GONE -- the legacy GPU row solve
-    # migrated to the phi assemble_rows/solve_rows ops (M4). nuka_solver is now a
-    # header-only INTERFACE carrier (solver_config.hpp); no CUDA backing.
-
-    add_library(nuka_articulation_gpu STATIC
-        runtime/articulation/featherstone_aba.cu
-        runtime/articulation/articulation_drives.cu
-        runtime/articulation/articulation_jacobian.cu
-        runtime/articulation/articulation_contacts.cu
+    add_library(nuka_contact_wrench STATIC
         # p14a (v0.7): any-link contact-force readout (per-link wrench + per-slot
         # force). Pure readback of the solved lambda + stage-4/5 contact geometry;
         # depends only on nuka_core/nuka_phi + math, so compiling it INTO this lib
@@ -1253,14 +1144,14 @@ if(CMAKE_CUDA_COMPILER)
         # inter-library dependency cycle.
         sensor/contact_wrench.cu
     )
-    set_target_properties(nuka_articulation_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    set_target_properties(nuka_contact_wrench PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-    target_include_directories(nuka_articulation_gpu
+    target_include_directories(nuka_contact_wrench
         PUBLIC
             ${CMAKE_SOURCE_DIR}/src
     )
 
-    target_link_libraries(nuka_articulation_gpu
+    target_link_libraries(nuka_contact_wrench
         PUBLIC
             nuka_articulation
             nuka_core
@@ -1270,93 +1161,9 @@ if(CMAKE_CUDA_COMPILER)
 
     target_link_libraries(nuka_runtime
         PUBLIC
-            nuka_articulation_gpu
+            nuka_contact_wrench
     )
 
-    # --- v0.5 p02-A: differentiable single-step spine (ABA 3-pass reverse) ----
-    # Contact-free reverse-mode adjoint of drive -> ABA -> integrate. Internal /
-    # test-facing C++ API (NOT the tape / C-ABI; that is p02-B). One thread per
-    # articulation, atomic-free fixed-order tree accumulation (D1).
-    # p02-B/C: the multi-step tape / checkpoint / recompute orchestrator /
-    # backward runner ride on the p02-A single-step adjoint (step_backward).
-    add_library(nuka_diffsim STATIC
-        # M9 T7: step_backward.cu's StepBackwardKernel moved to the phi v2 op TU
-        # (NkOp::StepBackward); the host StepBackward() launcher + the host mass
-        # jacobian builder live in step_backward_host.cpp. tape.cu + backward_runner.cu
-        # held only D2D copies / host orchestration (+ one tiny accumulate kernel
-        # relocated to the op TU), so they are now pure-host tape.cpp / backward_runner.cpp.
-        diffsim/step_backward_host.cpp
-        diffsim/tape.cpp
-        diffsim/checkpoint.cu
-        diffsim/recompute_orchestrator.cu
-        diffsim/backward_runner.cpp
-        # v0.5 p03 R1: self-written deterministic CG sparse solver (IFT backend).
-        # Warp-per-articulation batched-dense SPD CG; D1 bit-exact, no atomics.
-        diffsim/sparse_solver_cg.cu
-        # v0.7 p01: CG convergence diagnostics host summarizer (the opt-in
-        # side-channel's CPU aggregation; the device side is a header consumed by
-        # sparse_solver_cg.cu). D1: a fixed-order pass, no device work here.
-        diffsim/solver/cg_diagnostics.cpp
-        # v0.7 p02: self-written MINRES backend (symmetric INDEFINITE Krylov) +
-        # ILU(0) preconditioner (incomplete LU, zero fill-in) + sparse triangular
-        # solve. Warp-per-block on the SAME batched-dense seam as the CG backend;
-        # D1 bit-exact (Lanczos/Givens are fixed-order per-block, no atomics).
-        diffsim/solver/minres_backend.cu
-        diffsim/solver/ilu0_preconditioner.cu
-        diffsim/solver/triangular_solve.cu
-        # v0.7 p03-A: self-written GMRES backend (general NON-SYMMETRIC Krylov,
-        # restarted GMRES(m): Arnoldi + modified Gram-Schmidt + Givens rotations) +
-        # the non-symmetric auto-routing detector. Warp-per-block on the SAME batched-
-        # dense seam as CG/MINRES; D1 bit-exact (MGS/Givens are fixed-order per-block,
-        # no atomics, the Krylov basis lives in shared mem). Jacobi precond; ILU0/AMG
-        # apply hook reserved for p03-B.
-        diffsim/solver/gmres_backend.cu
-        # v0.5 p03 R2: contact KKT (Delassus) builder -- assembles the batched
-        # per-articulation dense SPD A = J M^-1 J^T the CG backend solves.
-        diffsim/kkt_builder.cu
-        # v0.5 p03 R3a: IFT-at-convergence contact gradient runner -- backprops
-        # through the converged contact solve in ONE Delassus solve (z = A^-1 J M^-1 g),
-        # distributing grad_qdot_free = g - J^T z and grad_b_c = z. D1, no atomics.
-        diffsim/ift_runner.cu
-        # v0.7 p08-C (Channel 1, the §4.B acceptance): SDF-contact IFT d/dM, d/dJ.
-        # The v0.5 ift_runner DEFERRED these channels; §4.B owns them for the
-        # SDF-contact rows. System-level IFT of A lambda = r (A = J M^-1 J^T):
-        # dlambda = A^-1 (dr - dA lambda). Host fp64 reference (the GPU runner
-        # already owns the A^-1 apply); FD-validated by perturb-M/J-and-re-solve.
-        diffsim/sdf_contact_ift.cpp
-        # v0.5 p03 R3b: OSC (operational-space control) differentiable adjoint --
-        # reverse-mode gain (Kp,Kd) + task-target gradients of the forward OSC drive
-        # (tau = J^T A^-1 (Kp*e_x+Kd*edot_x)); reuses the forward's 3x3 LDL^T to
-        # apply A^-1. D1, warp-per-articulation, no atomics. (R8/R9.)
-        diffsim/osc_adjoint.cu
-    )
-    set_target_properties(nuka_diffsim PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    target_include_directories(nuka_diffsim
-        PUBLIC
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_diffsim
-        PUBLIC
-            nuka_articulation_gpu
-            nuka_articulation
-            nuka_core
-            nuka_phi
-            # M9 T7: the StepBackward kernel (NkOp::StepBackward) + its launcher +
-            # the grad_mass-accumulate kernel now live in the phi v2 op TU
-            # (phi/backend_cuda/ops/diffsim_backward.cu); the diffsim host
-            # StepBackward() + BackwardRunner drive them through that launcher.
-            nuka_phi2
-            CUDA::cudart
-    )
-
-    # --- v0.5 p04 N1: sim-to-real sensor noise (counter-based Philox) --------
-    # Self-contained counter-based Philox4x32-10 RNG + in-place Gaussian/Poisson
-    # noise kernels. D1 two-run bit-exact (a sample is a pure function of (seed,
-    # element_idx, seq); no atomics, no thread-order reductions). Separate static
-    # lib mirroring nuka_diffsim; linked into the `nuka` shared lib and the
-    # tests/sensor gtests. Header-only philox.cuh lives alongside.
     add_library(nuka_sensor_noise STATIC
         sensor/noise/n1_gaussian.cu
         sensor/noise/n1_poisson.cu
@@ -1381,22 +1188,9 @@ if(CMAKE_CUDA_COMPILER)
         c_abi/checkpoint.cpp
         c_abi/buffer.cpp
         c_abi/error.cpp
-        c_abi/diffsim.cpp
         c_abi/noise.cpp
         c_abi/state_sensor.cpp
-        # M8 T5: the offscreen RECORDER C ABI (frame loop -> raster -> PPM P6 ->
-        # ffmpeg mp4). ALWAYS compiled (so the symbols export for the python
-        # binding), but its render-touching body is behind NK_BUILD_VULKAN_VALIDATION
-        # (Decision D5): with the flag OFF this TU pulls NO Vulkan/render headers
-        # and every entry returns NUKA_RESULT_NOT_SUPPORTED -> libnuka stays
-        # buildable with zero Vulkan deps. With the flag ON the nuka_app + nuka_render
-        # link (added below) bring the real Simulation + VulkanRasterRenderer in.
         c_abi/recorder.cpp
-        # M9 T4: the GENERIC SCENE-AUTHORING C ABI (load/compose/find/set_local/
-        # set_physics_material/settle/save over nuka::scene::SceneIR). Host-only
-        # (zero CUDA tokens); nuka_scene_settle cooks Scene->CookToModel->nk::World
-        # on the device's OWNED phi v2 backend (mirrors recorder.cpp) and runs
-        # cook::Settle. NOT a special grasp/union type -- one entry, any format.
         c_abi/scene.cpp
         # The BUILT-SCENE authoring surface (program rigid primitives + TAGGED media
         # records, then cook via the SAME CookSceneToModel a file scene uses). Reuses
@@ -1428,13 +1222,9 @@ if(CMAKE_CUDA_COMPILER)
             nuka_core
             nuka_runtime
             nuka_import
-            nuka_articulation_gpu
-            nuka_diffsim
+            nuka_contact_wrench
             nuka_sensor_noise
             nuka_phi
-            # nuka_solver: header-only carrier for solver/solver_config.hpp (the
-            # legacy row solver/scheduler it once backed is deleted, M9 T11-core-b2);
-            # nuka_constraint = the unified collision/contact row types.
             nuka_solver
             nuka_constraint
             nuka_collision_gpu
@@ -1444,7 +1234,7 @@ if(CMAKE_CUDA_COMPILER)
             # nuka_articulation; nks::Load lives in nuka_import (already linked).
             nuka_scene_cook
             # The media cook (nuka_scene_cook) reuses the cloth-topology + fluid-box
-            # cookers (BuildClothConstraints / CookFluidBox) which live in
+            # cookers (BuildClothConstraints / CookParticleBox) which live in
             # nuka_runtime_gpu; other c_abi surfaces (sensor / render) link it too.
             nuka_runtime_gpu
             # The device-resident batched camera-sensor surface (c_abi/sensor.cpp):
@@ -1465,11 +1255,6 @@ if(CMAKE_CUDA_COMPILER)
     # GENERATED collidable registry (candidate_pair.hpp) -- ensure codegen runs first.
     add_dependencies(nuka nuka_codegen)
 
-    # M8 T5 (Decision D5): the offscreen recorder. ONLY when NK_BUILD_VULKAN_VALIDATION
-    # is ON does c_abi/recorder.cpp compile its real body + link the frame-loop
-    # (nuka_app) and the offscreen raster renderer (nuka_render). With the flag OFF
-    # the recorder TU is a pure stub (NUKA_RESULT_NOT_SUPPORTED, no Vulkan headers),
-    # so libnuka builds with NO Vulkan dependency and the python binding still imports.
     if(NK_BUILD_VULKAN_VALIDATION)
         set_source_files_properties(c_abi/recorder.cpp PROPERTIES
             COMPILE_DEFINITIONS NK_BUILD_VULKAN_VALIDATION)
@@ -1517,7 +1302,7 @@ if(CMAKE_CUDA_COMPILER)
     target_compile_definitions(nuka_pipeline_benchmark PRIVATE NUKA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_link_libraries(nuka_pipeline_benchmark PRIVATE
         nuka nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2 nuka_runtime_gpu nuka_runtime
-        nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu nuka_core nuka_phi CUDA::cudart)
+        nuka_import nuka_cooker nuka_contact_wrench nuka_collision_gpu nuka_core nuka_phi CUDA::cudart)
     nuka_set_warnings(nuka_pipeline_benchmark)
 
     # The water demo uses CUDA physics and ray tracing without a Vulkan dependency.
@@ -1529,30 +1314,9 @@ if(CMAKE_CUDA_COMPILER)
     target_include_directories(nuka_mpm_water_drop_demo PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
     target_link_libraries(nuka_mpm_water_drop_demo PRIVATE
         nuka_scene_cook nuka_render nuka_phi2_rt nuka_nk nuka_phi2 nuka_runtime_gpu
-        nuka_runtime nuka_import nuka_cooker nuka_articulation_gpu nuka_collision_gpu
+        nuka_runtime nuka_import nuka_cooker nuka_contact_wrench nuka_collision_gpu
         nuka_core nuka_phi CUDA::cudart)
 
-    add_executable(nuka_aba_cuda_probe
-        ${CMAKE_SOURCE_DIR}/tools/reference/aba_cuda_probe.cpp
-    )
-
-    target_include_directories(nuka_aba_cuda_probe
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-
-    target_link_libraries(nuka_aba_cuda_probe
-        PRIVATE
-            nuka_articulation_gpu
-            nuka_import
-            nuka_runtime
-    )
-
-    nuka_set_warnings(nuka_aba_cuda_probe)
-
-    # M8.5 T5: the visual-mesh cook CLI. HOST-ONLY (import -> .nks/.nka Save),
-    # routes visual-only geoms to .nka MESH chunks so robots render as real
-    # triangle geometry. Used to (re)generate examples/scenes/go2.nks etc.
     add_executable(nuka_cook_scene
         ${CMAKE_SOURCE_DIR}/tools/scene/cook_scene.cpp
     )

@@ -17,7 +17,7 @@ Typical use::
         world.step()            # next step applies them
         world.destroy()
 
-Optional torch surface (``nuka.autograd``, ``nuka.torch_stream_ptr``): imported
+Optional torch surface (``nuka.torch_stream_ptr``): imported
 **lazily** so ``import nuka`` never hard-requires torch. torch is only loaded
 the moment you touch one of those names. See ``python/README.md``.
 """
@@ -42,7 +42,6 @@ from ._nuka_ext import (  # noqa: F401
     ENV_STATUS_SENSOR_QUEUE_OVERFLOW,
     World,
     StateCheckpoint,
-    Tape,
     # Built-scene authoring: program rigid primitives + TAGGED media records, then
     # build() cooks them through the SAME CookSceneToModel a file scene uses (the
     # general media authoring substrate -- tet-soft / fluid / a second cloth).
@@ -128,9 +127,6 @@ class CameraCfg:
             float(self.vfov_deg), int(self.width), int(self.height),
         )
 
-# v0.5 p04 Task 5.4.9 sim-to-real noise config (PURE python -- no torch/jax dep,
-# so eager import is safe; see noise.py). GaussianNoise / PoissonNoise wrap the
-# per-field sensor-noise C-ABI; DomainRandomization wraps the per-episode DR.
 from .noise import (  # noqa: F401
     GaussianNoise,
     PoissonNoise,
@@ -143,10 +139,6 @@ from .noise import (  # noqa: F401
     NOISE_POISSON,
 )
 
-# M9 T4: the GENERIC scene-authoring surface (PURE python wrapper over the
-# _nuka_ext.Scene C-ABI; no torch dep, so eager import is safe -- mirrors noise).
-# ONE entry loads any format (mjcf/urdf/usd/nks); uniform compose/find/set_local/
-# set_physics_material/settle/save. NOT a special grasp/union type.
 from .scene import Scene  # noqa: F401
 
 # Authoring facade (pure python over the prebuilt bindings): geometry-only morphs,
@@ -236,8 +228,6 @@ TASK_LOCAL_POSE = Field.TASK_LOCAL_POSE
 ACCELERATION_TARGET = Field.ACCELERATION_TARGET
 TASK_NULLSPACE_STIFFNESS = Field.TASK_NULLSPACE_STIFFNESS
 TASK_NULLSPACE_DAMPING = Field.TASK_NULLSPACE_DAMPING
-# p03 episode-boundary fix: authoritative per-env root pose (un-lagged; correct
-# immediately after reset_envs). Shape (env_count, 7) == [px,py,pz, qw,qx,qy,qz].
 BASE_POSE = Field.BASE_POSE
 # p14a (v0.7) contact-force readout (batched/multi-env only). LINK_CONTACT_WRENCH:
 # net per-link world wrench, shape (env, base_link, 6) == [Fx,Fy,Fz, Tx,Ty,Tz],
@@ -263,9 +253,6 @@ POINT_ENDPOINT_TERMS = Field.POINT_ENDPOINT_TERMS
 # World.create_from_scene(terrain_step_height=..., ...).
 ENV_TERRAIN_TYPE = Field.ENV_TERRAIN_TYPE
 ENV_TERRAIN_DIFFICULTY = Field.ENV_TERRAIN_DIFFICULTY
-# T3 unified-actuator feed-forward joint force (per-link, default 0): tau += joint_f
-# in every control mode (gravcomp / computed-torque / RL residual). Writable
-# zero-copy; same layout/slot map as DRIVE_TARGET.
 JOINT_FEEDFORWARD = Field.JOINT_FEEDFORWARD
 # Constraint and actuator diagnostics are separate per-link readout surfaces.
 JOINT_LIMIT_IMPULSE = Field.JOINT_LIMIT_IMPULSE
@@ -298,25 +285,11 @@ def torch_stream_ptr() -> int:
     return torch.cuda.current_stream().cuda_stream
 
 
-# --- PEP 562 lazy submodule import (keeps torch optional) --------------------
-# `nuka.autograd` pulls in torch at its own import time. We must NOT eagerly
-# `from . import autograd` here, or `import nuka` would hard-require torch.
-# Instead resolve `nuka.autograd` on first attribute access; `import nuka`
-# (without torch) keeps working, and the torch ImportError surfaces only when
-# autograd is actually used.
 if TYPE_CHECKING:  # for type checkers / IDEs only; no runtime torch/jax import.
-    from . import autograd  # noqa: F401
-    from . import jax_frontend  # noqa: F401
     from . import jax_state_pytree  # noqa: F401
 
 
-# Submodules that pull in an OPTIONAL heavy dep at their own import time and so
-# must stay lazy (resolved on first attribute access) -- NEVER eagerly imported,
-# or `import nuka` would hard-require that dep:
-#   * "autograd"          -> torch
-#   * "jax_frontend"      -> jax + torch (the custom_vjp engine adjoint)
-#   * "jax_state_pytree"  -> jax (the NukaWorldState pytree)
-_LAZY_SUBMODULES = ("autograd", "jax_frontend", "jax_state_pytree")
+_LAZY_SUBMODULES = ("jax_state_pytree",)
 
 
 def __getattr__(name: str):
@@ -332,7 +305,6 @@ def __getattr__(name: str):
 __all__ = [
     "Device",
     "World",
-    "Tape",
     "Scene",
     "SceneBuilder",
     "PRIMITIVE_PLANE",
@@ -481,7 +453,6 @@ __all__ = [
     "LINK_POSE_FLOATS",
     "LINK_VELOCITY_FLOATS",
     "torch_stream_ptr",
-    # v0.5 p04 Task 5.4.9 sim-to-real noise config (pure-python, eager-safe).
     "GaussianNoise",
     "PoissonNoise",
     "MeasurementError",
@@ -491,10 +462,4 @@ __all__ = [
     "NOISE_NONE",
     "NOISE_GAUSSIAN",
     "NOISE_POISSON",
-    # NOTE: "autograd" is deliberately NOT in __all__. It is resolved lazily via
-    # __getattr__ (PEP 562) so `import nuka` / `nuka.autograd.step(...)` work
-    # without eagerly importing torch. Listing it here would make
-    # `from nuka import *` trigger the torch import (fails in a torch-less env).
-    # `torch_stream_ptr` is safe to export: its torch import is inside the body,
-    # not triggered by binding the name.
 ]

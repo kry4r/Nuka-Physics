@@ -10,31 +10,27 @@ namespace nuka::nk {
 // One stable enumerator per field (yaml order). FieldId is the key into
 // the arena segment table and the View member binding.
 enum class FieldId : uint16_t {
-    Q,  // q (per:link arena:persistent owner:data flags:[diff])
-    Qdot,  // qdot (per:link arena:persistent owner:data flags:[diff])
+    Q,  // q (per:link arena:persistent owner:data)
+    Qdot,  // qdot (per:link arena:persistent owner:data)
     LinkPose,  // link_pose (per:link arena:persistent owner:data)
-    BasePose,  // base_pose (per:articulation arena:persistent owner:data flags:[diff])
-    BodyPose,  // body_pose (per:body arena:persistent owner:data flags:[diff])
+    BasePose,  // base_pose (per:articulation arena:persistent owner:data)
+    BodyPose,  // body_pose (per:body arena:persistent owner:data)
     BodyInvMass,  // body_inv_mass (per:body arena:persistent owner:data flags:[param])
     ContactCount,  // contact_count (per:env arena:scratch owner:data)
-    Rows,  // rows (per:contact_slot arena:scratch owner:data elem:16)
     Lambda,  // lambda (per:row_slot arena:persistent owner:data)
-    MInv,  // m_inv (per:articulation_dof2 arena:scratch owner:data)
-    ParticlePos,  // particle_pos (per:particle arena:persistent owner:data flags:[diff])
+    ArticulationBias,  // articulation_bias (per:articulation_dof arena:scratch owner:data)
+    MFactor,  // m_factor (per:articulation_dof2 arena:scratch owner:data)
+    ParticlePos,  // particle_pos (per:particle arena:persistent owner:data)
     MatBuckets,  // mat_buckets (per:scalar arena:persistent owner:data count:num_buckets*16 flags:[param])
     MatIndex,  // mat_index (per:body arena:persistent owner:data flags:[param])
     LinkContactWrench,  // link_contact_wrench (per:link arena:scratch owner:data flags:[readout])
     Qddot,  // qddot (per:link arena:persistent owner:data)
     Tau,  // tau (per:link arena:persistent owner:data)
-    JointForce,  // joint_force (per:link arena:scratch owner:data)
-    JointDiagonal,  // joint_diagonal (per:link arena:scratch owner:data)
-    LinkVelocity,  // link_velocity (per:link arena:persistent owner:data flags:[diff])
+    LinkVelocity,  // link_velocity (per:link arena:persistent owner:data)
     LinkAcceleration,  // link_acceleration (per:link arena:scratch owner:data)
     LinkVelocityBias,  // link_velocity_bias (per:link arena:scratch owner:data)
     LinkXup,  // link_xup (per:link arena:scratch owner:data)
-    LinkArticulatedI,  // link_articulated_I (per:link arena:scratch owner:data)
     LinkBiasForce,  // link_bias_force (per:link arena:scratch owner:data)
-    LinkUSpatial,  // link_u_spatial (per:link arena:scratch owner:data)
     JointMotionSubspace,  // joint_motion_subspace (per:link arena:scratch owner:data)
     DriveTarget,  // drive_target (per:link arena:persistent owner:data flags:[param])
     DriveStiffness,  // drive_stiffness (per:link arena:persistent owner:data flags:[param])
@@ -62,8 +58,8 @@ enum class FieldId : uint16_t {
     ArticulationLinkCount,  // articulation_link_count (per:articulation arena:persistent owner:model)
     ArticulationLinkOffset,  // articulation_link_offset (per:articulation arena:persistent owner:model)
     FootShape,  // foot_shape (per:scalar arena:persistent owner:model count:foot_shape_count*5)
-    BodyLinearVelocity,  // body_linear_velocity (per:body arena:persistent owner:data flags:[diff])
-    BodyAngularVelocity,  // body_angular_velocity (per:body arena:persistent owner:data flags:[diff])
+    BodyLinearVelocity,  // body_linear_velocity (per:body arena:persistent owner:data)
+    BodyAngularVelocity,  // body_angular_velocity (per:body arena:persistent owner:data)
     BodyForce,  // body_force (per:body arena:scratch owner:data)
     BodyTorque,  // body_torque (per:body arena:scratch owner:data)
     BodyInvInertia,  // body_inv_inertia (per:body arena:persistent owner:data flags:[param])
@@ -83,12 +79,6 @@ enum class FieldId : uint16_t {
     ContactTangent1,  // contact_tangent1 (per:contact_slot arena:scratch owner:data)
     ContactTangent2,  // contact_tangent2 (per:contact_slot arena:scratch owner:data)
     ContactMaterial,  // contact_material (per:contact_slot arena:scratch owner:data)
-    JacNormal,  // jac_normal (per:slot_dof arena:scratch owner:data)
-    JacTangent1,  // jac_tangent1 (per:slot_dof arena:scratch owner:data)
-    JacTangent2,  // jac_tangent2 (per:slot_dof arena:scratch owner:data)
-    ContactMeffNormal,  // contact_meff_normal (per:contact_slot arena:scratch owner:data)
-    ContactMeffTangent1,  // contact_meff_tangent1 (per:contact_slot arena:scratch owner:data)
-    ContactMeffTangent2,  // contact_meff_tangent2 (per:contact_slot arena:scratch owner:data)
     ContactForce,  // contact_force (per:contact_slot arena:scratch owner:data elem:3 flags:[readout])
     UcontactCount,  // ucontact_count (per:contact_slot arena:scratch owner:data)
     UcontactPoint,  // ucontact_point (per:contact_slot arena:scratch owner:data elem:4)
@@ -99,8 +89,6 @@ enum class FieldId : uint16_t {
     RowCount,  // row_count (per:env arena:scratch owner:data)
     Urows,  // urows (per:row_slot arena:scratch owner:data elem:32)
     ChainJacobian,  // chain_jacobian (per:row_dof arena:scratch owner:data)
-    RowMinvJt,  // row_minv_jt (per:row_dof arena:scratch owner:data)
-    RowMeff,  // row_meff (per:row_slot arena:scratch owner:data)
     RowDamping,  // row_damping (per:row_slot arena:scratch owner:data)
     RowCjLink,  // row_cj_link (per:row_slot arena:scratch owner:data)
     RowCjPoint,  // row_cj_point (per:row_slot arena:scratch owner:data)
@@ -121,7 +109,7 @@ enum class FieldId : uint16_t {
     SdfCellValues,  // sdf_cell_values (per:scalar arena:persistent owner:model count:max_sdf_cells)
     SdfCellGradients,  // sdf_cell_gradients (per:scalar arena:persistent owner:model count:max_sdf_cells)
     ParticlePrevPos,  // particle_prev_pos (per:particle arena:persistent owner:data)
-    ParticleVel,  // particle_vel (per:particle arena:persistent owner:data flags:[diff])
+    ParticleVel,  // particle_vel (per:particle arena:persistent owner:data)
     ParticleInvMass,  // particle_inv_mass (per:particle arena:persistent owner:data flags:[param])
     ParticleVPre,  // particle_v_pre (per:particle arena:scratch owner:data)
     AeroTriVerts,  // aero_tri_verts (per:aero_tri arena:persistent owner:model elem:3)
@@ -145,7 +133,6 @@ enum class FieldId : uint16_t {
     UcontactTangent1,  // ucontact_tangent1 (per:contact_slot arena:scratch owner:data elem:4)
     UcontactTangent2,  // ucontact_tangent2 (per:contact_slot arena:scratch owner:data elem:4)
     ChainJacobianB,  // chain_jacobian_b (per:row_dof arena:scratch owner:data)
-    RowMinvJtB,  // row_minv_jt_b (per:row_dof arena:scratch owner:data)
     RowCjLinkB,  // row_cj_link_b (per:row_slot arena:scratch owner:data)
     RowCjPointB,  // row_cj_point_b (per:row_slot arena:scratch owner:data)
     RowCjDirB,  // row_cj_dir_b (per:row_slot arena:scratch owner:data)
@@ -166,7 +153,7 @@ enum class FieldId : uint16_t {
     GridMomentum,  // grid_momentum (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     GridVelocity,  // grid_velocity (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
     GridForce,  // grid_force (per:scalar arena:scratch owner:data count:mpm_grid_nodes_per_env*env_count)
-    ParticleF,  // particle_F (per:particle arena:persistent owner:data elem:9 flags:[diff])
+    ParticleF,  // particle_F (per:particle arena:persistent owner:data elem:9)
     ParticleC,  // particle_C (per:particle arena:persistent owner:data elem:9)
     ParticleVol0,  // particle_vol0 (per:particle arena:persistent owner:data)
     ParticlePlastic,  // particle_plastic (per:particle arena:persistent owner:data)
@@ -403,7 +390,6 @@ enum class FieldId : uint16_t {
     EnergyLinkVelocity,  // energy_link_velocity (per:link arena:scratch owner:data)
     EnergyQdotFree,  // energy_qdot_free (per:articulation_dof arena:scratch owner:data)
     VbdForceResidualWork,  // vbd_force_residual_work (per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout])
-    MInvCoupled,  // m_inv_coupled (per:articulation_dof2 arena:scratch owner:data)
     MReduced,  // m_reduced (per:articulation_dof2 arena:scratch owner:data)
     MimicRootDof,  // mimic_root_dof (per:articulation_dof arena:scratch owner:data)
     MimicRootScale,  // mimic_root_scale (per:articulation_dof arena:scratch owner:data)
@@ -433,24 +419,20 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "body_pose",
     "body_inv_mass",
     "contact_count",
-    "rows",
     "lambda",
-    "m_inv",
+    "articulation_bias",
+    "m_factor",
     "particle_pos",
     "mat_buckets",
     "mat_index",
     "link_contact_wrench",
     "qddot",
     "tau",
-    "joint_force",
-    "joint_diagonal",
     "link_velocity",
     "link_acceleration",
     "link_velocity_bias",
     "link_xup",
-    "link_articulated_I",
     "link_bias_force",
-    "link_u_spatial",
     "joint_motion_subspace",
     "drive_target",
     "drive_stiffness",
@@ -499,12 +481,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "contact_tangent1",
     "contact_tangent2",
     "contact_material",
-    "jac_normal",
-    "jac_tangent1",
-    "jac_tangent2",
-    "contact_meff_normal",
-    "contact_meff_tangent1",
-    "contact_meff_tangent2",
     "contact_force",
     "ucontact_count",
     "ucontact_point",
@@ -515,8 +491,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "row_count",
     "urows",
     "chain_jacobian",
-    "row_minv_jt",
-    "row_meff",
     "row_damping",
     "row_cj_link",
     "row_cj_point",
@@ -561,7 +535,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "ucontact_tangent1",
     "ucontact_tangent2",
     "chain_jacobian_b",
-    "row_minv_jt_b",
     "row_cj_link_b",
     "row_cj_point_b",
     "row_cj_dir_b",
@@ -819,7 +792,6 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "energy_link_velocity",
     "energy_qdot_free",
     "vbd_force_residual_work",
-    "m_inv_coupled",
     "m_reduced",
     "mimic_root_dof",
     "mimic_root_scale",

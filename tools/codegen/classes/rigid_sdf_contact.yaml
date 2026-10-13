@@ -13,29 +13,6 @@ default_gradient_mode: ift_at_convergence
 default_recompute_mode: checkpoint
 constraint_kind: unilateral_with_friction
 
-# v0.7 p08-B (FORWARD ONLY). Contact between two SDF-equipped rigid bodies,
-# detected by Newton's method on the summed field phi_a + phi_b
-# (src/collision/sdf_contact.{hpp,cu}). Once detected, the emitted rows are the
-# SAME maximal contact rows as MaximalContactRow (normal + 2 friction), so the
-# forward_evaluator REUSES the generic unilateral_with_friction lambda-update
-# (single-row PGS: u = lambda + m_eff*(rhs - jv); lambda_new = clamp(u, lo, hi)).
-# What is NEW in p08-B is the contact-DETECTION kernel (the Newton solve), not
-# the row solve -- the PGS solver dispatches on RowKind::Contact, not on
-# row_class_id, so these rows are resolved by the existing path unchanged.
-#
-# Reverse-mode (p08-C DONE): a per-row adjoint_evaluator is DELIBERATELY OMITTED
-# -- the row-class adjoint is NOT the channel. p08-C built the SDF-contact reverse
-# mode as: (1) SYSTEM-level IFT d/dM,d/dJ host fp64 reference (src/diffsim/
-# sdf_contact_ift.{hpp,cpp}), (2) envelope-theorem DEPTH adjoint (src/collision/
-# sdf_contact_adjoint.{hpp,cpp}). The contact NORMAL and POINT are flat-valley
-# degenerate at convergence (phi_a=-phi_b) -- no gradient is produced for them.
-# default_gradient_mode=ift_at_convergence records the TARGET reverse channel.
-# regen.py therefore emits a FORWARD-ONLY stub: RowClassHasAdjoint(4)==false is the
-# AUTHORITATIVE "no dispatchable adjoint" signal (locked by test_codegen_roundtrip).
-# ENGINE-grounding + backward WIRING of the IFT reference are DEFERRED to p11 (the
-# named consumer: coupling-row adjoint). Any backward consumer MUST gate on
-# RowClassHasAdjoint()==true and treat false as stop-gradient / hard error -- never
-# a silent zero. When p11 wires it, update this comment + the roundtrip test.
 forward_evaluator:
   input_fields:
     - body_a

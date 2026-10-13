@@ -101,7 +101,12 @@ struct ReadoutDrivesParams {
     uint32_t first_drive_row;
 };
 
-struct AbaForwardParams {
+struct ArticulationDynamicsParams {
+    float dt;
+    uint32_t max_dof;
+    uint32_t integrate_velocity = 1u;
+    uint32_t fold_drive_damping = 0u;
+    uint32_t reuse_mass = 0u;
     float    gravity[3];   // world-frame acceleration in m/s^2
     uint32_t articulation_count;
     uint32_t total_link_count;
@@ -172,38 +177,8 @@ struct IntegratePositionParams {
     uint32_t mimic_couplings = 0u;
 };
 
-struct CrbaComputeMParams {
-    float    dt;                  // dt*C fold (implicit joint damping)
-    uint32_t max_dof;             // M tile stride (== dofs_per_env)
-    uint32_t articulation_count;
-    uint32_t total_link_count;
-    // 1 => fold dt * drive_damping into the joint diagonals so the factored
-    // inverse is (M + dt*C)^-1 (both production paths). 0 => pure CRBA M.
-    uint32_t fold_drive_damping;
-};
-
-struct CrbaFactorMParams {
-    uint32_t max_dof;
-    uint32_t articulation_count;
-};
-
-// Standalone implicit joint-damping op. Applies the backward-Euler joint
-// viscous-damping velocity correction qdot -= dt*(M+dt*C)^-1*(C*qdot) using the
-// factored inverse data.m_inv (== (M+dt*C)^-1 when CrbaComputeM folded dt*C, so
-// this op MUST be scheduled AFTER CrbaFactorM and BEFORE the row solve /
-// IntegratePosition) and the per-DOF c_j == data.drive_damping. The float
-// sequence is the deleted FUSED solve kernel's implicit-damping seed +
-// write-back, so a zero-contact world's trajectory is byte-identical to the
-// legacy standalone-damping order (factor -> damping -> integrate).
-struct ApplyImplicitDampingParams {
-    float    dt;
-    uint32_t max_dof;             // dof_stride == the M tile stride
-    uint32_t articulation_count;
-    uint32_t total_link_count;
-};
-
 // Runs after the step mass is factored: each coupled DOF follows its root, the mass and
-// inverse become Z^T M Z and Z (Z^T M Z)^-1 Z^T, and the step velocity is projected onto Z.
+// factor describe Z^T M Z, and the step velocity is projected onto Z.
 struct MimicReduceParams {
     uint32_t max_dof;
     uint32_t articulation_count;
@@ -450,19 +425,6 @@ struct SyncLinkBodyPoseParams {
     uint32_t selected_env_count;  // 0 = all; otherwise index reset_env_ids
 };
 
-// General contact pipeline (H3): the per-cell heightfield midphase. One
-// thread per (env x candidate slot); when the slot's broadphase pair is (convex,
-// heightfield) it projects the convex's world AABB into heightfield-LOCAL space,
-// maps it to the overlapped grid cell range, and for EACH cell emits its 2
-// TRIANGLE_PRISM colliders (corner heights -> the Newton (p00,p10,p11)+(p00,p11,
-// p01) layout) routed through the EXISTING cvx GJK/EPA. The resulting <=4-pt
-// manifolds are fanned across FREE trailing ucontact slots (atomically reserved
-// from the per-env candidate-slot tail), so a body straddling a STEP gets
-// contacts from BOTH the tread AND the riser prisms. Side a == the convex body
-// (its body_id resolves the reaction side); side b == the heightfield (static,
-// body_id==-1 -> no reaction). The HeightfieldData descriptor travels in the
-// params (one heightfield/model in the first scope); the height grid rides the
-// model `heights` field. EARLY-EXITS unless family == kContactFamilyPairDriven.
 struct NarrowphaseHeightfieldParams {
     uint32_t family;            // kContactFamily* (PairDriven => run)
     uint32_t env_count;
@@ -946,51 +908,6 @@ struct RandomizeMaterialBucketsParams {
 struct RandomizeBodyParamsParams {
     uint64_t seed;
     float range;           // +/- fractional perturbation
-};
-
-// --- differentiable rollout -------------------------------------
-// StepBackward: the contact-free single-step reverse adjoint. The articulation
-// device state (q/qdot/link_*/joint_*) comes from ModelView/DataView like every
-// other articulation op; the EXTRA buffers the adjoint needs are caller-owned
-// scratch that does NOT live in the arena (the per-step pre-state snapshots, the
-// drive descriptors, the dI/dmass slope, and the in/out gradient buffers), so
-// they travel as raw device pointers in the params. The pointer/scalar/flag set
-// MIRRORS diffsim::StepBackwardInputs + StepBackwardGrads 1:1 (see
-// diffsim/step_backward.hpp); the op unpacks them back into those two structs and
-// launches the SINGLE kernel the direct host launcher also drives (so the op path
-// and the direct path are byte-identical by single-source). math::Transform*
-// fields are carried as void* to keep op_schema.hpp math-header-free; the op
-// reinterpret_casts them (the layout is fixed: Vec3 position + Quat rotation).
-struct StepBackwardParams {
-    uint32_t total_link_count;
-    uint32_t articulation_count;
-    float    dt;
-    float    gravity_z;
-    // flags (uint32_t to stay trivially-copyable + header-light).
-    uint32_t has_drive;        // 1 => convert dL/dtau through the PD drive
-    uint32_t has_integrate;    // 1 => reverse the velocity+position integrators
-    uint32_t enable_q_channel; // 1 => back-prop the link_xup = JointTransform(q) path
-    // --- StepBackwardInputs pointers (const device buffers) --------------
-    const float* q_pre;
-    const float* qdot_pre;
-    const float* v_root_pre;     // may be null (fixed-base fallback)
-    const void*  base_pose_pre;  // const math::Transform* (orientation channel; may be null)
-    const float* drive_targets;
-    const float* drive_stiffness;
-    const float* drive_damping;
-    const float* drive_force_limits;
-    const float* dI_dmass;
-    const float* grad_qddot_seed; // read only when has_integrate == 0; may be null
-    // --- StepBackwardGrads pointers (in/out device buffers) --------------
-    float* grad_q_out;
-    float* grad_qdot_out;
-    float* grad_target_out;
-    float* grad_mass_out;
-    float* grad_tau_out;
-    float* grad_link_velocity_out;
-    // per-articulation base-pose adjoint (7 floats/art: 3 pos + 4 quat); void* to
-    // mirror StepBackwardGrads::grad_base_pose_out (a float*); may be null.
-    void*  grad_base_pose_out;
 };
 
 } // namespace nuka::phi

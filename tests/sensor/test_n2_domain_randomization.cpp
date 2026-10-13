@@ -1,23 +1,5 @@
-// ---------------------------------------------------------------------------
-// p04-N2 -- per-episode domain randomization (engine-side, exit #5/#6 DR half).
-// ---------------------------------------------------------------------------
-//
-// Covers the four spec gates:
-//   (1) Deterministic sampling: same (seed, env) -> bit-exact multipliers;
-//       different seed OR env -> different; all within [lo, hi].
-//   (2) Application lands: after apply, link masses / gravity.z actually changed
-//       by the sampled multiplier/offset (read back + verify).
-//   (3) DR OFF default = no-op: a DR-disabled world is byte-unchanged by apply.
-//   (4) D1 two-run byte-exact BACKWARD with DR ON (the advisor-flagged headline):
-//       a single-env world with DR on (fixed seed) + apply, then a diff-sim tape
-//       rollout + backward; repeated with a FRESH world + SAME seed -> grad_actions
-//       + grad_parameters are byte-identical (memcmp == 0). AND DR-on grad !=
-//       DR-off grad (proves it actually applied, not a silent no-op): the contact-
-//       free tape responds to mass + gravity DR.
-// ---------------------------------------------------------------------------
 
 #include "nuka/nuka.h"
-#include "nuka/nuka_diffsim.h"
 #include "nuka/nuka_noise.h"
 
 #include "c_abi/handle_table.hpp"
@@ -76,13 +58,6 @@ struct WorldGuard {
     }
 };
 
-struct TapeGuard {
-    nuka_tape_handle handle = nullptr;
-    ~TapeGuard() {
-        if (handle != nullptr) nuka_tape_destroy(handle);
-    }
-};
-
 nuka_result_t CreateFloatWorld(nuka_device_handle device,
                                nuka_world_handle* out) {
     const std::string scene = Go2FloatScenePath();
@@ -93,8 +68,6 @@ nuka_result_t CreateFloatWorld(nuka_device_handle device,
     return nuka_world_create_from_scene(device, &desc, out);
 }
 
-// A DR desc with all ranges set wide + fixed seed. mass + gravity drive the
-// contact-free tape; friction/restitution/armature are sampled but inert there.
 nuka_domain_randomization_desc_t MakeDrDesc(uint64_t seed, int enabled) {
     nuka_domain_randomization_desc_t d{};
     d.mass_mul_lo = 0.8f;
@@ -147,55 +120,6 @@ uint32_t WorldLinkCount(nuka_world_handle world) {
 bool BitEqual(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size()) return false;
     return std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
-}
-
-// Runs DR (set + apply BEFORE tape_create -- gravity must be set before create,
-// mass takes effect before the first step) then a contact-free tape rollout +
-// backward, returning [grad_actions | grad_parameters]. `dr_enabled == 0` skips
-// the DR (the DR-off baseline). Fresh world per call -> identical init.
-std::vector<float> RunTapeWithDr(nuka_device_handle device, uint32_t n_steps,
-                                 uint64_t seed, int dr_enabled) {
-    WorldGuard world;
-    EXPECT_EQ(CreateFloatWorld(device, &world.handle), NUKA_RESULT_OK);
-
-    if (dr_enabled) {
-        const nuka_domain_randomization_desc_t d = MakeDrDesc(seed, 1);
-        EXPECT_EQ(nuka_world_set_domain_randomization(world.handle, &d),
-                  NUKA_RESULT_OK);
-        EXPECT_EQ(nuka_world_apply_domain_randomization(world.handle),
-                  NUKA_RESULT_OK);
-    }
-
-    nuka_tape_desc_t desc{};
-    desc.checkpoint_interval = 5u;
-    desc.max_tape_entries = 128u;
-    desc.max_checkpoints = 64u;
-    desc.recompute_on_backward = 1u;
-    TapeGuard tape;
-    EXPECT_EQ(nuka_tape_create(world.handle, &desc, &tape.handle), NUKA_RESULT_OK);
-
-    const uint32_t n = nuka_tape_link_count(tape.handle);
-    EXPECT_GT(n, 0u);
-
-    for (uint32_t s = 0u; s < n_steps; ++s) {
-        EXPECT_EQ(nuka_world_step_with_tape(world.handle, tape.handle),
-                  NUKA_RESULT_OK);
-    }
-    const uint32_t step_count = nuka_tape_step_count(tape.handle);
-    EXPECT_EQ(step_count, n_steps);
-
-    std::vector<float> seed_vec(2u * n + 6u * n, 0.0f);
-    for (uint32_t i = 0u; i < n; ++i) seed_vec[n + i] = 0.3f;  // dL/dqdot'
-
-    std::vector<float> grad_actions(static_cast<size_t>(step_count) * n, 0.0f);
-    std::vector<float> grad_params(n, 0.0f);
-    EXPECT_EQ(nuka_tape_backward(tape.handle, seed_vec.data(),
-                                 grad_actions.data(), grad_params.data()),
-              NUKA_RESULT_OK);
-
-    std::vector<float> out = grad_actions;
-    out.insert(out.end(), grad_params.begin(), grad_params.end());
-    return out;
 }
 
 }  // namespace
@@ -373,50 +297,3 @@ TEST(N2DomainRandomization, DisabledApplyIsByteNoOp) {
 // ---------------------------------------------------------------------------
 // (4) ★ D1 two-run byte-exact BACKWARD with DR ON, AND DR-on grad != DR-off grad.
 // ---------------------------------------------------------------------------
-TEST(N2DomainRandomization, BackwardBitIdenticalTwoRunWithDrOn) {
-    if (!Go2FloatSceneAvailable()) {
-        GTEST_SKIP() << "go2_float scene is not available";
-    }
-    DeviceGuard device;
-    ASSERT_NE(device.handle, nullptr);
-
-    const uint64_t seed = 0x5EEDu;
-    const uint32_t n_steps = 16u;
-
-    // Two FRESH worlds, SAME seed, DR ON -> backward must be byte-identical.
-    const std::vector<float> dr_on_1 =
-        RunTapeWithDr(device.handle, n_steps, seed, /*dr_enabled=*/1);
-    const std::vector<float> dr_on_2 =
-        RunTapeWithDr(device.handle, n_steps, seed, /*dr_enabled=*/1);
-    ASSERT_EQ(dr_on_1.size(), dr_on_2.size());
-
-    size_t mismatches = 0u;
-    for (size_t i = 0u; i < dr_on_1.size(); ++i)
-        if (dr_on_1[i] != dr_on_2[i]) ++mismatches;
-    std::printf("[n2 dr] D1 two-run (DR ON) mismatches=%zu of %zu\n", mismatches,
-                dr_on_1.size());
-    EXPECT_EQ(mismatches, 0u)
-        << "DR-on backward not bit-identical across two runs (D1 broken)";
-    EXPECT_TRUE(BitEqual(dr_on_1, dr_on_2));
-
-    // DR OFF baseline -> proves DR actually changed the gradient (not a silent
-    // no-op): the contact-free tape responds to mass + gravity DR.
-    const std::vector<float> dr_off =
-        RunTapeWithDr(device.handle, n_steps, seed, /*dr_enabled=*/0);
-    ASSERT_EQ(dr_off.size(), dr_on_1.size());
-    EXPECT_FALSE(BitEqual(dr_on_1, dr_off))
-        << "DR-on grad == DR-off grad: DR did not actually apply to the rollout";
-
-    float max_diff = 0.0f;
-    for (size_t i = 0u; i < dr_off.size(); ++i)
-        max_diff = std::max(max_diff, std::fabs(dr_on_1[i] - dr_off[i]));
-    std::printf("[n2 dr] max|grad_on - grad_off|=%.6e (proves DR applied)\n",
-                static_cast<double>(max_diff));
-    EXPECT_GT(max_diff, 0.0f);
-
-    // DR OFF must itself be D1 byte-exact across two runs (sanity).
-    const std::vector<float> dr_off_2 =
-        RunTapeWithDr(device.handle, n_steps, seed, /*dr_enabled=*/0);
-    EXPECT_TRUE(BitEqual(dr_off, dr_off_2))
-        << "DR-off backward not bit-identical across two runs";
-}

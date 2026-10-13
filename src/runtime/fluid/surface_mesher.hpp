@@ -25,7 +25,7 @@ private:
 
 // Marching cubes over sum(m * Poly6); the isovalue is iso_fraction * rest_density_rho0.
 struct FluidSurfaceParams {
-    float h = 0.1f;                  // SPH support radius (PBF kernel support).
+    float h = 0.1f;                  // Density reconstruction support radius.
     float rest_density_rho0 = 1.0f;  // rho0; iso = iso_fraction * rho0.
     float iso_fraction = 0.5f;       // surface at this fraction of rest density.
     float particle_mass = 1.0f;      // m (uniform across the fluid).

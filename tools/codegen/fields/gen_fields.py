@@ -83,9 +83,9 @@ VALID_PER = {
     # for any non-cloth or drag-free cook -> a zero-byte segment.
     "aero_tri",
 }
-VALID_ARENA = {"persistent", "scratch", "tape"}
+VALID_ARENA = {"persistent", "scratch"}
 VALID_OWNER = {"model", "data"}
-VALID_FLAGS = {"diff", "param", "readout"}
+VALID_FLAGS = {"param", "readout"}
 
 
 class GenError(Exception):
@@ -236,7 +236,7 @@ def gen_views(fields: list[dict[str, Any]]) -> str:
     lines.append("};")
     lines.append("")
     lines.append("// Data-owned, mutable per-World state. Pointers index into the nk::Arena")
-    lines.append("// (Persistent / Scratch / Tape phi Buffers), env-major.")
+    lines.append("// (Persistent / Scratch phi Buffers), env-major.")
     lines.append("struct DataView {")
     lines += members(data)
     lines.append("};")
@@ -252,7 +252,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "// Per-field layout descriptor table, indexed by FieldId. The Arena and",
         "// Model use this to compute deterministic 256B-aligned segment offsets",
         "// (per-unit multiplier x env_count x capacity x elem_size). owner picks",
-        "// the buffer (Model device buffer vs Arena Persistent/Scratch/Tape).",
+        "// the buffer (Model device buffer vs Arena Persistent/Scratch).",
         "",
         "#include <cstdint>",
         "",
@@ -260,7 +260,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "",
         "namespace nuka::nk {",
         "",
-        "enum class FieldArena : uint8_t { Persistent, Scratch, Tape };",
+        "enum class FieldArena : uint8_t { Persistent, Scratch };",
         "enum class FieldOwner : uint8_t { Model, Data };",
         "// The count-unit a field is sized by. ArenaLayout/Model resolve each to a",
         "// concrete element count from the Model capacities x env_count.",
@@ -313,7 +313,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         lanes = info["lanes"]
         elem = f["elem"]
         esize = elem * lanes * scalar_size[info["code"]]
-        arena = {"persistent": "Persistent", "scratch": "Scratch", "tape": "Tape"}[f["arena"]]
+        arena = {"persistent": "Persistent", "scratch": "Scratch"}[f["arena"]]
         owner = {"model": "Model", "data": "Data"}[f["owner"]]
         per = per_enum[f["per"]]
         lines.append(
@@ -337,8 +337,7 @@ def gen_dlpack_table(fields: list[dict[str, Any]]) -> str:
         "// Per-field DLPack descriptor rows for the future c_abi buffer bridge",
         "// (plan §3.3: c_abi/buffer.cpp queries this table instead of hand-written",
         "// per-field branches). dtype_code is the scalar element code; ndim_hint is",
-        "// a coarse rank hint (1 = flat scalar array, 2 = packed/vector array); diff",
-        "// marks the tape-visible / autograd-exposed fields.",
+        "// a coarse rank hint (1 = flat scalar array, 2 = packed/vector array).",
         "",
         "#include <cstdint>",
         "",
@@ -352,7 +351,6 @@ def gen_dlpack_table(fields: list[dict[str, Any]]) -> str:
         "    FieldId     field;",
         "    DlpackDtype dtype_code;",
         "    uint8_t     ndim_hint;",
-        "    bool        diff;",
         "    bool        readout;",
         "};",
         "",
@@ -362,10 +360,9 @@ def gen_dlpack_table(fields: list[dict[str, Any]]) -> str:
         code = DTYPE_INFO[f["dtype"]]["code"]
         lanes = DTYPE_INFO[f["dtype"]]["lanes"]
         ndim = 1 if (lanes == 1 and f["elem"] == 1) else 2
-        diff = "true" if "diff" in f["flags"] else "false"
         readout = "true" if "readout" in f["flags"] else "false"
         lines.append(
-            f"    {{FieldId::{f['camel']}, DlpackDtype::{code}, {ndim}, {diff}, {readout}}},"
+            f"    {{FieldId::{f['camel']}, DlpackDtype::{code}, {ndim}, {readout}}},"
             f"  // {f['name']}"
         )
     lines.append("};")

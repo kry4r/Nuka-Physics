@@ -14,16 +14,13 @@ contact-free rollout:
 
 Registering it as a pytree node means JAX transformations -- ``jax.jit``,
 ``jax.vmap``, ``jax.grad`` -- traverse it automatically: the three arrays are the
-*leaves* (the differentiable / batchable children) and the structure itself is
-static metadata (here: empty). This lets you ``jit``/``vmap``/``grad`` a PURE-JAX
-function of a ``NukaWorldState`` (e.g. a cost over the state arrays) WITHOUT
-touching the (side-effecting, foreign) engine step. The engine adjoint lives in
-:mod:`nuka.jax_frontend`'s ``custom_vjp``; this pytree is the complementary
-pure-array surface.
+*leaves* and the structure itself is static metadata (here: empty). This lets you
+``jit``/``vmap``/``grad`` a PURE-JAX function of a ``NukaWorldState`` (e.g. a cost
+over the state arrays). The engine step itself is not differentiable.
 
 jax is imported at this submodule's top level, so ``import nuka`` must NOT import
 this eagerly -- it is resolved lazily via ``nuka/__init__.py``'s PEP 562
-``__getattr__`` (mirroring ``nuka.autograd``).
+``__getattr__``.
 """
 
 from __future__ import annotations

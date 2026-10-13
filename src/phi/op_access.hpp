@@ -33,8 +33,6 @@ enum class OpResource : uint8_t {
     Observation,
     StepAccumulator,
     CapturedState,
-    Tape,
-    Adjoint,
     Count
 };
 
@@ -68,10 +66,8 @@ inline constexpr uint64_t Sensors = uint64_t{1} << static_cast<uint8_t>(OpResour
 inline constexpr uint64_t Observation = uint64_t{1} << static_cast<uint8_t>(OpResource::Observation);
 inline constexpr uint64_t StepAccumulator = uint64_t{1} << static_cast<uint8_t>(OpResource::StepAccumulator);
 inline constexpr uint64_t CapturedState = uint64_t{1} << static_cast<uint8_t>(OpResource::CapturedState);
-inline constexpr uint64_t Tape = uint64_t{1} << static_cast<uint8_t>(OpResource::Tape);
-inline constexpr uint64_t Adjoint = uint64_t{1} << static_cast<uint8_t>(OpResource::Adjoint);
 inline constexpr uint64_t World = (uint64_t{1} << static_cast<uint8_t>(OpResource::Count)) - 1u;
-inline constexpr uint64_t Physical = World & ~(Sensors | Observation | CapturedState | Tape | Adjoint);
+inline constexpr uint64_t Physical = World & ~(Sensors | Observation | CapturedState);
 inline constexpr std::array<OpAccess, static_cast<size_t>(NkOp::Count)> kAccess{{
 #define NUKA_OP(name, read, write) OpAccess{read, write},
 #include "phi/op_catalog.inc"

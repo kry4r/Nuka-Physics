@@ -1,18 +1,11 @@
-// ---------------------------------------------------------------------------
-// nuka::runtime::fluid -- PBF particle-set -> marching-cubes isosurface (host).
-// ---------------------------------------------------------------------------
-// HOST cook/render-bridge code (no device): samples the SPH density field on a
-// uniform voxel grid (uniform-grid neighbor accel), marches cubes to a watertight
-// triangle MeshGeometry, and assigns per-vertex normals from the analytic density
-// gradient. Pure host so nuka_render links it without CUDA.
-// ---------------------------------------------------------------------------
+// Host particle volume and surface sampling.
 
 #include "runtime/fluid/surface_mesher.hpp"
 #include "collision/static_bvh.hpp"
 #include "collision/mesh_surface.hpp"
 
 #include "core/parallel_for.hpp"
-#include "import/cooker/fluid_cooker_types.hpp"  // Poly6FromR2Host / Poly6GradientHost
+#include "import/cooker/particle_lattice.hpp"  // Poly6FromR2Host / Poly6GradientHost
 
 #include <algorithm>
 #include <array>
