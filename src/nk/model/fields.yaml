@@ -548,7 +548,7 @@ fields:
   - {name: body_inertial_frame, dtype: transform, per: body, arena: persistent, owner: data, flags: [param]}
   - {name: body_world_inv_inertia, dtype: symmat3, per: body, arena: scratch, owner: data}
 
-  # Velocities before forces provide the normal contact acceleration reference.
+  # Velocities before forces: the normal contact acceleration reference and the energy ledger's interval start.
   - {name: step_qdot_flat, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
   - {name: step_body_linear_velocity, dtype: vec3, per: body, arena: scratch, owner: data}
   - {name: step_body_angular_velocity, dtype: vec3, per: body, arena: scratch, owner: data}
@@ -774,24 +774,21 @@ fields:
   # Nanoseconds of the last colored solve per phase, timed by its first block between barriers.
   - {name: solver_phase_time, dtype: u64, per: env, elem: 8, arena: scratch, owner: data}
   - {name: dat_surface_motion, dtype: f32, per: scalar, count: "particle_surfaces_per_env*env_count", arena: scratch, owner: data}
-  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 32, arena: scratch, owner: data, flags: [readout]}
+  - {name: energy_ledger, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 31, arena: scratch, owner: data, flags: [readout]}
+  # The ledger record in double; residuals difference stage energies far larger than their change.
+  - {name: energy_ledger_sum, dtype: f64, per: scalar, count: "integration_substeps*env_count", elem: 31, arena: scratch, owner: data}
   - {name: energy_ledger_status, dtype: u32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
   - {name: physics_stage_metrics, dtype: f32, per: scalar, count: "integration_substeps*env_count", elem: 195, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_counts, dtype: u32, per: scalar, count: "integration_substeps*env_count", elem: 8, arena: scratch, owner: data, flags: [readout]}
   - {name: contact_audit_metrics, dtype: u64, per: scalar, count: "integration_substeps*env_count", elem: 7, arena: scratch, owner: data, flags: [readout]}
   - {name: energy_particle_start, dtype: vec3, per: particle, arena: scratch, owner: data}
-  - {name: energy_particle_free, dtype: vec3, per: particle, arena: scratch, owner: data}
-  - {name: energy_particle_free_rate, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: energy_aero_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
   - {name: energy_kinematic_contact_impulse, dtype: vec3, per: particle, arena: scratch, owner: data}
-  - {name: energy_body_free_linear, dtype: vec3, per: body, arena: scratch, owner: data}
-  - {name: energy_body_free_angular, dtype: vec3, per: body, arena: scratch, owner: data}
   - {name: energy_link_start_q, dtype: f32, per: link, arena: scratch, owner: data}
   - {name: energy_link_start_qdot, dtype: f32, per: link, arena: scratch, owner: data}
   - {name: energy_link_pose, dtype: transform, per: link, arena: scratch, owner: data}
   - {name: energy_link_unprojected_pose, dtype: transform, per: link, arena: scratch, owner: data}
   - {name: energy_link_velocity, dtype: spatial6, per: link, arena: scratch, owner: data}
-  - {name: energy_qdot_free, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
   - {name: vbd_force_residual_work, dtype: f32, per: scalar, count: "integration_substeps*env_count", arena: scratch, owner: data, flags: [readout]}
   # Z (Z^T M Z)^-1 Z^T of each articulation; impulses applied through it keep the mimic couplings.
   # The mass over the DOFs the mimic couplings leave free; a dependent DOF has an empty row and column.
@@ -799,8 +796,6 @@ fields:
   # The free DOF each articulation DOF follows (itself when free) and its velocity ratio to it.
   - {name: mimic_root_dof, dtype: u32, per: articulation_dof, arena: scratch, owner: data}
   - {name: mimic_root_scale, dtype: f32, per: articulation_dof, arena: scratch, owner: data}
-  # Kinetic energy the coupling impulse took from each articulation's free velocity this step.
-  - {name: mimic_projection_loss, dtype: f32, per: articulation, arena: scratch, owner: data}
   - {name: vbd_membrane_start, dtype: vbd_membrane_start, per: scalar, count: "vbd_elements_per_env*env_count", arena: scratch, owner: data}
   - {name: crba_scratch, dtype: u32, per: scalar, count: "articulations_per_env*env_count*dofs_per_env*(dofs_per_env+12)", arena: scratch, owner: data}
   - {name: vbd_solve_audit, dtype: f32, per: scalar, count: "vbd_vertices_per_env*env_count", elem: 20, arena: scratch, owner: data, flags: [readout]}

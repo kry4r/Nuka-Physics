@@ -420,7 +420,8 @@ def run(scene, camera_fit, plan, args):
         half = vertex_half_thickness(cloth)
         metadata = {"fixture": "towel fold replay", "scene": str(scene["directory"] / "scene.json"),
                     "scene_sha256": sha256(scene["directory"] / "scene.json"), "episode": scene["episode"],
-                    "dt": args.dt, "sweeps": args.sweeps, "substeps_per_frame": substeps, "settle_steps": settle,
+                    "dt": args.dt, "sweeps": args.sweeps, "execution": args.execution,
+                    "substeps_per_frame": substeps, "settle_steps": settle,
                     "align_window_frames": window, "replayed_frames": frames, "pinch_contact": args.pinch_contact,
                     "open_width_m": args.open_width, "edge_margin_m": args.edge_margin, "press_depth_m": args.press_depth,
                     "tactile": {name: getattr(args, name) for name in TACTILE_ARGS} if args.tactile else None,
@@ -429,6 +430,7 @@ def run(scene, camera_fit, plan, args):
                     "first_step": settle + start * substeps + 1 if start else 1,
                     "resume_checkpoint": None if start == 0 else str(args.resume_checkpoint),
                     "solver_velocity_tolerance_mps": float(tolerance), "ogc_contact_capacity": args.contact_capacity,
+                    "momentum_scope": "vbd_subsystem", "aerodynamic_forces": False,
                     "build_record": str(args.build_record),
                     "binary_hashes": (Path(args.build_record) / "binaries.sha256").read_text(),
                     "replay_sha256": sha256(__file__), "kinematics_sha256": sha256(fk.__file__),
@@ -438,8 +440,10 @@ def run(scene, camera_fit, plan, args):
                                     state_fields=(nuka.Field.ARTICULATION_LINK_POSE, nuka.Field.JOINT_POSITION,
                                                   nuka.Field.JOINT_VELOCITY, nuka.Field.JOINT_LIMIT_IMPULSE,
                                                   nuka.Field.LINK_CONTACT_WRENCH, nuka.Field.JOINT_FEEDFORWARD,
-                                                  nuka.Field.VELOCITY_TARGET),
+                                                  nuka.Field.VELOCITY_TARGET, nuka.Field.PARTICLE_VELOCITY,
+                                                  nuka.Field.PARTICLE_INV_MASS, nuka.Field.VBD_EFFECTIVE_DT),
                                     thresholds=DiagnosticThresholds(velocity_tolerance_mps=float(tolerance)))
+        world.set_execution_mode(args.execution)
         np.savez_compressed(output / "initial.npz", folded=placed, flat_rest=rest, faces=faces,
                             joint_position=initial)
         inset = 0.5 * args.open_width + args.edge_margin
@@ -548,6 +552,12 @@ def run(scene, camera_fit, plan, args):
             world.restore_checkpoint(checkpoint)
             checkpoint.close()
             apply_drives(world, config)
+        state_path = session.output / "initial.npz"
+        with state_path.open("xb") as target:
+            np.savez_compressed(target, rest=rest, faces=faces, positions=np.asarray(world.download_field(
+                nuka.Field.PARTICLE_POSITION)).reshape(-1, 3), velocity=np.asarray(world.download_field(
+                nuka.Field.PARTICLE_VELOCITY)).reshape(-1, 3))
+        session.manifest["initial_geometry_sha256"] = sha256(state_path)
         settle_from = dict(zip(fk.waist_joints(), initial[waist_slots]))
         settle_to = dict(zip(fk.waist_joints(), plan["waist"][0]))
         for side in fk.SIDES:
@@ -693,6 +703,8 @@ def main():
     parser.add_argument("--build-record", type=Path)
     parser.add_argument("--dt", type=float, default=1.0 / 600.0)
     parser.add_argument("--sweeps", type=int, default=512)
+    parser.add_argument("--execution", choices=("eager", "graph"), default="graph",
+                        help="step by operator dispatch or by replaying the captured step graph")
     parser.add_argument("--contact-capacity", type=int, default=524288)
     parser.add_argument("--chunk-steps", type=int, default=600)
     parser.add_argument("--settle", type=float, default=1.0, help="seconds before the first recorded frame")

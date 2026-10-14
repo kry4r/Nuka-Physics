@@ -18,24 +18,20 @@ namespace {
 void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
     switch (id) {
         case FieldId::EnergyLedger: v.energy_ledger = static_cast<float*>(p); break;
+        case FieldId::EnergyLedgerSum: v.energy_ledger_sum = static_cast<double*>(p); break;
         case FieldId::EnergyLedgerStatus: v.energy_ledger_status = static_cast<uint32_t*>(p); break;
         case FieldId::PhysicsStageMetrics: v.physics_stage_metrics = static_cast<float*>(p); break;
         case FieldId::ContactAuditCounts: v.contact_audit_counts = static_cast<uint32_t*>(p); break;
         case FieldId::ContactAuditMetrics: v.contact_audit_metrics = static_cast<uint64_t*>(p); break;
         case FieldId::VbdForceResidualWork: v.vbd_force_residual_work = static_cast<float*>(p); break;
         case FieldId::EnergyParticleStart: v.energy_particle_start = static_cast<math::Vec3*>(p); break;
-        case FieldId::EnergyParticleFree: v.energy_particle_free = static_cast<math::Vec3*>(p); break;
-        case FieldId::EnergyParticleFreeRate: v.energy_particle_free_rate = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyAeroImpulse: v.energy_aero_impulse = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyKinematicContactImpulse: v.energy_kinematic_contact_impulse = static_cast<math::Vec3*>(p); break;
-        case FieldId::EnergyBodyFreeLinear: v.energy_body_free_linear = static_cast<math::Vec3*>(p); break;
-        case FieldId::EnergyBodyFreeAngular: v.energy_body_free_angular = static_cast<math::Vec3*>(p); break;
         case FieldId::EnergyLinkStartQ: v.energy_link_start_q = static_cast<float*>(p); break;
         case FieldId::EnergyLinkStartQdot: v.energy_link_start_qdot = static_cast<float*>(p); break;
         case FieldId::EnergyLinkPose: v.energy_link_pose = static_cast<math::Transform*>(p); break;
         case FieldId::EnergyLinkUnprojectedPose: v.energy_link_unprojected_pose = static_cast<math::Transform*>(p); break;
         case FieldId::EnergyLinkVelocity: v.energy_link_velocity = static_cast<Spatial6*>(p); break;
-        case FieldId::EnergyQdotFree: v.energy_qdot_free = static_cast<float*>(p); break;
         case FieldId::ParticleSurfaceNodes: v.particle_surface_nodes = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ParticleSurfaceEdgeNodes: v.particle_surface_edge_nodes = static_cast<collision::MeshBvhNode*>(p); break;
         case FieldId::ParticleSurfaceMaxSpeed: v.particle_surface_max_speed = static_cast<float*>(p); break;
@@ -55,7 +51,6 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::MReduced:            v.m_reduced = static_cast<float*>(p); break;
         case FieldId::MimicRootDof:        v.mimic_root_dof = static_cast<uint32_t*>(p); break;
         case FieldId::MimicRootScale:      v.mimic_root_scale = static_cast<float*>(p); break;
-        case FieldId::MimicProjectionLoss: v.mimic_projection_loss = static_cast<float*>(p); break;
         case FieldId::ParticlePos:         v.particle_pos = static_cast<math::Vec3*>(p); break;
         case FieldId::MatBuckets:          v.mat_buckets = static_cast<float*>(p); break;
         case FieldId::MatIndex:            v.mat_index = static_cast<uint32_t*>(p); break;

@@ -11,9 +11,11 @@
 #include "collision/ogc_geometry.hpp"
 #include "phi/backend_cuda/launch.cuh"
 #include "phi/backend_cuda/ops/articulation_types.cuh"
+#include "phi/backend_cuda/ops/dat_motion.cuh"
 #include "phi/backend_cuda/ops/kinematics.cuh"
 #include "phi/backend_cuda/ops/nk_op_registrations.cuh"
 #include "phi/backend_cuda/ops/registry.cuh"
+#include "phi/backend_cuda/ops/surface_query.cuh"
 #include "phi/backend_cuda/ops/union_types.cuh"
 #include "phi/backend_cuda/ops/vertex_blocks.cuh"
 
@@ -29,7 +31,7 @@ constexpr uint32_t kThreads = 128u;
 constexpr uint32_t kColumns = nk::kEnergyColumnCount;
 constexpr uint32_t kForceWorkColumn = kColumns;
 constexpr uint32_t kReductionColumns = kColumns + 1u;
-static_assert(kColumns == 32u, "energy field record must match its named columns");
+static_assert(kColumns == 31u, "energy field record must match its named columns");
 
 __device__ uint32_t Column(EnergyColumn value) { return static_cast<uint32_t>(value); }
 __device__ double Dot(Vec3 a, Vec3 b) {
@@ -119,6 +121,7 @@ struct RowPower {
     double kinematic = 0.0;
 };
 
+// Row power at the interval mean velocity, so the gravity integrated before the solve does no row work.
 __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
     const ModelView&, const DataView& d, const ReadoutEnergyLedgerParams& p) {
     RowPower out;
@@ -127,12 +130,12 @@ __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
                                 size_t{row} * p.dofs_per_artic;
         const size_t tile = size_t{side.index} * p.dofs_per_artic;
         for (uint32_t k = 0u; k < p.dofs_per_artic; ++k)
-            out.physical += double(jacobian[k]) * 0.5 * (d.energy_qdot_free[tile + k] + d.qdot_flat[tile + k]);
+            out.physical += double(jacobian[k]) * 0.5 * (d.step_qdot_flat[tile + k] + d.qdot_flat[tile + k]);
         out.rate = out.applied = out.physical;
     } else if (side.kind == nk::kNkSideRigid) {
         const uint32_t body = side.index;
-        out.physical = 0.5 * (Dot(side.jlin, d.energy_body_free_linear[body] + d.body_linear_velocity[body]) +
-            Dot(side.jang, d.energy_body_free_angular[body] + d.body_angular_velocity[body]));
+        out.physical = 0.5 * (Dot(side.jlin, d.step_body_linear_velocity[body] + d.body_linear_velocity[body]) +
+            Dot(side.jang, d.step_body_angular_velocity[body] + d.body_angular_velocity[body]));
         out.rate = out.applied = out.physical;
     } else if (PointMassView::IsPointSide(side.kind)) {
         PointMassView points;
@@ -143,16 +146,40 @@ __device__ RowPower SidePower(const NkRowSide& side, bool second, uint32_t row,
             if (term.kind != nk::kNkSideParticle) continue;
             const uint32_t particle = term.index;
             const double physical = 0.5 * Dot(term.jacobian,
-                d.energy_particle_free[particle] + ParticleVelocity(d, p, particle));
+                d.step_particle_velocity[particle] + ParticleVelocity(d, p, particle));
             out.physical += physical;
             out.rate += 0.5 * Dot(term.jacobian,
-                d.energy_particle_free_rate[particle] + d.particle_vel[particle]);
+                d.step_particle_velocity[particle] + d.particle_vel[particle]);
             const bool dynamic = d.particle_inv_mass[particle] > 0.0f;
             out.applied += physical * (dynamic ? ParticleStep(d, p, particle) / p.dt : 1.0f);
             if (!dynamic) out.kinematic += physical;
         }
     }
     return out;
+}
+
+// Row rate at the solved displacement; contact and friction laws keep it nonpositive along the impulse.
+__device__ double SideDisplacementRate(const NkRowSide& side, bool second, uint32_t row,
+    const DataView& d, const ReadoutEnergyLedgerParams& p) {
+    double rate = 0.0;
+    if (side.kind == nk::kNkSideArtic) {
+        const float* jacobian = (second ? d.chain_jacobian_b : d.chain_jacobian) +
+                                size_t{row} * p.dofs_per_artic;
+        const size_t tile = size_t{side.index} * p.dofs_per_artic;
+        for (uint32_t k = 0u; k < p.dofs_per_artic; ++k) rate += double(jacobian[k]) * d.qdot_flat[tile + k];
+    } else if (side.kind == nk::kNkSideRigid) {
+        rate = Dot(side.jlin, d.body_linear_velocity[side.index]) +
+               Dot(side.jang, d.body_angular_velocity[side.index]);
+    } else if (PointMassView::IsPointSide(side.kind)) {
+        PointMassView points;
+        points.ranges = d.point_endpoint_ranges;
+        points.terms = d.point_endpoint_terms;
+        for (uint32_t k = 0u; k < points.Count(side); ++k) {
+            const auto term = points.At(side, k);
+            if (term.kind == nk::kNkSideParticle) rate += Dot(term.jacobian, d.particle_vel[term.index]);
+        }
+    }
+    return rate;
 }
 
 __device__ Vec3 ElementPosition(const DataView& d, const ReadoutEnergyLedgerParams& p,
@@ -237,13 +264,17 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
     if (env >= p.env_count) return;
     const size_t record = size_t{env} * p.substeps + p.slot;
     float* output = d.energy_ledger + record * kColumns;
+    double* sum = d.energy_ledger_sum + record * kColumns;
     uint32_t* coverage = d.energy_ledger_status + record;
     if (p.stage == EnergyStage::Begin) {
         if (threadIdx.x == 0u) {
             *coverage = p.coverage_status;
             d.vbd_force_residual_work[record] = 0.0f;
         }
-        for (uint32_t c = threadIdx.x; c < kColumns; c += blockDim.x) output[c] = 0.0f;
+        for (uint32_t c = threadIdx.x; c < kColumns; c += blockDim.x) {
+            output[c] = 0.0f;
+            sum[c] = 0.0;
+        }
     }
     __syncthreads();
     double values[kReductionColumns]{};
@@ -262,8 +293,6 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (p.stage == EnergyStage::Begin) d.energy_particle_start[particle] = d.particle_pos[particle];
         const Vec3 velocity = ParticleVelocity(d, p, particle);
         if (p.stage == EnergyStage::Free) {
-            d.energy_particle_free[particle] = velocity;
-            d.energy_particle_free_rate[particle] = d.particle_vel[particle];
             d.energy_kinematic_contact_impulse[particle] = {};
             Vec3 impulse{};
             if (p.has_aero && d.particle_inv_mass[particle] > 0.0f)
@@ -276,7 +305,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             if (p.stage == EnergyStage::Solved) {
                 const double elastic_work = KinematicElasticWork(m, d, p, particle);
                 const double contact_work = -0.5 * Dot(d.energy_kinematic_contact_impulse[particle],
-                    d.energy_particle_free[particle] + velocity);
+                    d.step_particle_velocity[particle] + velocity);
                 add(EnergyColumn::KinematicElasticWork, elastic_work);
                 add(EnergyColumn::KinematicContactWork, contact_work);
                 add(EnergyColumn::Throughput, fabs(elastic_work + contact_work));
@@ -322,10 +351,6 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (p.stage == EnergyStage::Begin &&
             (d.body_force[body].LengthSq() != 0.0f || d.body_torque[body].LengthSq() != 0.0f))
             atomicOr(coverage, nk::energy_status::kExternalBodyLoad);
-        if (p.stage == EnergyStage::Free) {
-            d.energy_body_free_linear[body] = d.body_linear_velocity[body];
-            d.energy_body_free_angular[body] = d.body_angular_velocity[body];
-        }
         const float inverse_mass = d.body_inv_mass[body];
         if (!(inverse_mass > 0.0f)) continue;
         const auto principal = ComposeFrame(d.body_pose[body], d.body_inertial_frame[body]);
@@ -382,11 +407,6 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 d.energy_link_start_qdot[link] * displacement);
         }
     }
-    if (p.stage == EnergyStage::Free)
-        for (uint32_t k = threadIdx.x; k < p.artics_per_env * p.dofs_per_artic; k += blockDim.x) {
-            const size_t index = size_t{env} * p.artics_per_env * p.dofs_per_artic + k;
-            d.energy_qdot_free[index] = d.qdot_flat[index];
-        }
     for (uint32_t i = threadIdx.x; i < p.vbd_elements; i += blockDim.x) {
         const auto element = m.vbd_elements[i];
         const uint32_t count = nk::VbdElementVertexCount(element.kind);
@@ -416,7 +436,7 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             Vec3 applied;
             math::SymmetricMat3 hessian;
             nk::vbd::ElementRayleighBlock(element, j, frozen, rates, &applied, &hessian);
-            const Vec3 average = (d.energy_particle_free[particle] + ParticleVelocity(d, p, particle)) * 0.5f;
+            const Vec3 average = (d.step_particle_velocity[particle] + ParticleVelocity(d, p, particle)) * 0.5f;
             add(EnergyColumn::RayleighLoss, double(element.damping) * ParticleStep(d, p, particle) *
                 Dot(applied, average));
         }
@@ -449,10 +469,6 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
                 atomicOr(coverage, nk::energy_status::kUnclassifiedRows);
             }
         }
-        // The coupling impulse that projected each articulation's step velocity.
-        if (p.mimic_couplings != 0u)
-            for (uint32_t a = threadIdx.x; a < p.artics_per_env; a += blockDim.x)
-                add(EnergyColumn::MimicLoss, d.mimic_projection_loss[env * p.artics_per_env + a]);
         add(EnergyColumn::SolvedKinetic, kinetic);
     } else if (p.stage == EnergyStage::Begin) {
         add(EnergyColumn::BeginKinetic, kinetic);
@@ -480,24 +496,26 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
         if (threadIdx.x == 0u) {
             if (!isfinite(reduction[0])) atomicOr(coverage, nk::energy_status::kNonfinite);
             if (c == kForceWorkColumn) d.vbd_force_residual_work[record] += float(reduction[0]);
-            else output[c] += float(reduction[0]);
+            else output[c] = float(sum[c] += reduction[0]);
         }
         __syncthreads();
     }
     if (p.stage != EnergyStage::End || threadIdx.x != 0u) return;
-    const auto get = [&](EnergyColumn column) { return double(output[Column(column)]); };
-    output[Column(EnergyColumn::DatKineticLoss)] =
-        float(get(EnergyColumn::BeforeDatKinetic) - get(EnergyColumn::EndKinetic));
-    output[Column(EnergyColumn::DatPotential)] = float(get(EnergyColumn::EndGravity) + get(EnergyColumn::EndElastic) -
+    const auto get = [&](EnergyColumn column) { return sum[Column(column)]; };
+    const auto set = [&](EnergyColumn column, double value) {
+        output[Column(column)] = float(sum[Column(column)] = value);
+    };
+    set(EnergyColumn::DatKineticLoss, get(EnergyColumn::BeforeDatKinetic) - get(EnergyColumn::EndKinetic));
+    set(EnergyColumn::DatPotential, get(EnergyColumn::EndGravity) + get(EnergyColumn::EndElastic) -
         get(EnergyColumn::BeforeDatGravity) - get(EnergyColumn::BeforeDatElastic));
     const double change = get(EnergyColumn::EndKinetic) + get(EnergyColumn::EndGravity) + get(EnergyColumn::EndElastic) -
         get(EnergyColumn::BeginKinetic) - get(EnergyColumn::BeginGravity) - get(EnergyColumn::BeginElastic);
     double work = 0.0, losses = 0.0;
     for (uint32_t c = Column(EnergyColumn::DriveWork); c <= Column(EnergyColumn::KinematicContactWork); ++c) {
-        work += output[c];
+        work += sum[c];
     }
     for (uint32_t c = Column(EnergyColumn::FrictionLoss); c <= Column(EnergyColumn::RayleighLoss); ++c) {
-        losses += output[c];
+        losses += sum[c];
     }
     const double residual = change - work + losses + get(EnergyColumn::DatKineticLoss) -
                              get(EnergyColumn::PositionPotential);
@@ -723,11 +741,10 @@ __device__ uint32_t AuditParticleFeature(const NkRowSide& side, PointMassView po
     return count;
 }
 
-__device__ bool AuditOgcParticleGap(const NkRow& row, PointMassView points,
+// Closest-feature gap less the contact radius the detection recorded.
+__device__ bool AuditFeatureGap(const Vec3* a, uint32_t na, const Vec3* b, uint32_t nb,
     const DataView& d, size_t at, double* gap) {
-    Vec3 a[3]{}, b[3]{}, point_a{}, point_b{};
-    const uint32_t na = AuditParticleFeature(row.a, points, d, a);
-    const uint32_t nb = AuditParticleFeature(row.b, points, d, b);
+    Vec3 point_a{}, point_b{};
     if (na == 1u && nb == 3u) {
         point_a = a[0]; point_b = collision::ClosestTrianglePoint(a[0], b[0], b[1], b[2]).point;
     } else if (na == 3u && nb == 1u) {
@@ -743,8 +760,52 @@ __device__ bool AuditOgcParticleGap(const NkRow& row, PointMassView points,
     return radius >= 0.0 && isfinite(*gap);
 }
 
+__device__ bool AuditOgcParticleGap(const NkRow& row, PointMassView points,
+    const DataView& d, size_t at, double* gap) {
+    Vec3 a[3]{}, b[3]{};
+    const uint32_t na = AuditParticleFeature(row.a, points, d, a);
+    const uint32_t nb = AuditParticleFeature(row.b, points, d, b);
+    return AuditFeatureGap(a, na, b, nb, d, at, gap);
+}
+
+// Mixed slots place their features at the committed poses the DAT certified.
+__device__ bool AuditMixedGap(const ModelView& m, const DataView& d, const ReadoutEnergyLedgerParams& p,
+    uint32_t env, uint32_t slot, size_t at, double* gap) {
+    if (d.dat_pair_kind == nullptr || d.dat_pair_kind[slot] == 0u) return false;
+    DatTruncateParams q;
+    q.particles_per_env = p.particles_per_env;
+    q.surfaces_per_env = p.surfaces_per_env;
+    q.bodies_per_env = p.bodies_per_env;
+    q.links_per_env = p.links_per_env;
+    DatPointRef ra[3], rb[3];
+    uint32_t na = 0u, nb = 0u;
+    if (!DatMixedRefs(q, m, d, env, slot, ra, &na, rb, &nb)) return false;
+    Vec3 a[3]{}, b[3]{};
+    for (uint32_t i = 0u; i < na; ++i)
+        a[i] = ra[i].particle ? d.particle_pos[ra[i].owner] : DatPointAt(q, m, d, env, ra[i], 1.0f);
+    for (uint32_t i = 0u; i < nb; ++i)
+        b[i] = rb[i].particle ? d.particle_pos[rb[i].owner] : DatPointAt(q, m, d, env, rb[i], 1.0f);
+    return AuditFeatureGap(a, na, b, nb, d, at, gap);
+}
+
+// Particle-body slots measure the particle sphere against the body surface at its committed pose.
+__device__ bool AuditBodyParticleGap(const ModelView& m, const DataView& d, const ReadoutEnergyLedgerParams& p,
+    const SurfaceQueryView& surfaces, uint32_t env, size_t at, double* gap) {
+    if (d.ucontact_a_kind[at] != nk::kUContactSideParticle || d.ucontact_b_kind[at] != nk::kUContactSideBody)
+        return false;
+    const uint32_t particle = d.ucontact_a[at], body = d.ucontact_b[at];
+    const uint32_t local = particle - env * p.particles_per_env;
+    if (local >= p.particles_per_env || body >= p.bodies_per_env) return false;
+    const auto pose = d.body_pose[size_t{env} * p.bodies_per_env + body];
+    const auto surface = QueryCollidableSurface(surfaces, body, LoadPrimShape(m.shape_table, body),
+        PrimInverseTransformPoint(pose, d.particle_pos[particle]), FLT_MAX);
+    *gap = double(surface.distance) -
+           (local - p.vbd_begin < p.vbd_vertices ? m.particle_half_thickness[local] : p.particle_radius);
+    return surface.valid && isfinite(*gap);
+}
+
 // Impulse laws use the solved state; closest-feature gaps use the committed state.
-__global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p) {
+__global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerParams p, SurfaceQueryView surfaces) {
     using C = nk::ContactAuditCount;
     using M = nk::ContactAuditMetric;
     const uint32_t env = blockIdx.x;
@@ -781,7 +842,9 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             double gap = 0.0;
             const bool ogc = local_contact >= p.rigid_contact_slots &&
                 local_contact - p.rigid_contact_slots < p.ogc_contact_slots;
-            if (ogc && AuditOgcParticleGap(normal, points, d, at, &gap)) {
+            if (ogc ? AuditOgcParticleGap(normal, points, d, at, &gap) ||
+                      AuditMixedGap(m, d, p, env, global_contact, at, &gap)
+                    : AuditBodyParticleGap(m, d, p, surfaces, env, at, &gap)) {
                 if (gap < -p.pos_slop) count(C::GapViolations);
                 maximum(M::GapPenetration, float(-gap), slot);
             } else count(C::UnmeasuredGaps);
@@ -813,10 +876,10 @@ __global__ void ContactAuditKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             if (!Finite(a) || !Finite(b) || !isfinite(impulse)) count(C::InvalidRows);
             if (relative > 1.0e-6) count(C::LinearClosureViolations);
             maximum(M::RelativeLinearClosure, float(relative), row);
-            const auto pa = SidePower(r.a, false, row, m, d, p);
-            const auto pb = SidePower(r.b, true, row, m, d, p);
-            maximum(axis == 0u ? M::PositiveNormalWork : M::PositiveTangentWork,
-                float(impulse * (pa.physical + pb.physical)), row);
+            if (impulse != 0.0)
+                maximum(axis == 0u ? M::NormalDisplacementRate : M::TangentDisplacementRate,
+                    float(copysign(1.0, impulse) * (SideDisplacementRate(r.a, false, row, d, p) +
+                                                    SideDisplacementRate(r.b, true, row, d, p))), row);
             if (axis != 0u) {
                 const float mu = axis == 1u ? normal.mu : normal.friction_secondary;
                 if (mu > 0.0f) scaled_tangent[axis - 1u] = impulse / mu;
@@ -833,8 +896,10 @@ Status OpReadoutContactAudit(const ModelView& m, const DataView& d, const void* 
     const auto* p = static_cast<const ReadoutEnergyLedgerParams*>(params);
     if (!p || p->slot >= p->substeps || !d.contact_audit_counts || !d.contact_audit_metrics)
         return Status::InvalidArgument;
+    const auto surfaces = MakeSurfaceQueryView(m, p->bodies_per_env, p->mesh_geometry,
+                                               p->sdf_grid_count, p->sdf_cell_total);
     if (p->env_count > 0u)
-        LaunchCuda(ContactAuditKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, m, d, *p);
+        LaunchCuda(ContactAuditKernel, dim3(p->env_count), dim3(kThreads), 0u, stream, m, d, *p, surfaces);
     return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
 }
 

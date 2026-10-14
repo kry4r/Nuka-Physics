@@ -1985,6 +1985,7 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("gravity_y") = 0.0f,
                     nb::arg("gravity_z") = 0.0f,
                     nb::rv_policy::take_ownership,
+                    nb::keep_alive<0, 1>(),
                     "Create a world from a scene. All six control modes support any positive "
                     "environment count: 0 PD position, 1 torque, 2 velocity, 3 computed "
                     "torque, 4 OSC, 5 actuator. VELOCITY_TARGET is independent of "
@@ -2037,6 +2038,7 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("baumgarte_max_velocity") = 0.0f,
             nb::arg("osc_task_link") = 0u,
             nb::rv_policy::take_ownership,
+            nb::keep_alive<0, 1>(),
             "Create a COUPLED world: a robot cooked from scene_path PLUS VBD cloth "
             "particles, stepping on the ONE general contact "
             "pipeline with two-way body<->particle coupling. The MINIMAL create + "
@@ -2915,6 +2917,7 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("height") = uint32_t{0},
                     nb::arg("env_index") = uint32_t{0}, nb::arg("dt") = 0.0f,
                     nb::rv_policy::take_ownership,
+                    nb::keep_alive<0, 1>(),
                     "Create an offscreen recorder over an nk::World cooked from "
                     "scene_path (an authored .nks). It builds the RenderWorld from "
                     "the SAME cook's Registry + SceneMap and stands up the Vulkan "
@@ -3141,6 +3144,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("bake_link_sdf") = false,
              nb::arg("osc_task_link") = 0u,
              nb::rv_policy::take_ownership,
+             nb::keep_alive<0, 2>(),
              "Cook the built scene to a live nuka.World on `device` via the SAME "
              "CookSceneToModel + record assembly a file scene uses (rigid + media, "
              "ONE cook). Steps/reads like any World; read media via "

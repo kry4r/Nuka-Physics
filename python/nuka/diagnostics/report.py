@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .._nuka_ext import ContactSideKind
-from ..energy import EnergyColumn as E, EnergyStatus
+from ..energy import EnergyColumn as E, EnergyStatus, window_ratios
 from .acceptance import evidence_path, independent_readout, quantitative_evidence, solver_budget_evidence
 from .analysis import vbd_discrete_momentum
 from .capture import load_records, sha256, write_json
@@ -90,17 +90,6 @@ def vertex_solver_audit(source, manifest, values):
     return result if result["replays"] or "policy_steps" in result else None
 
 
-def window_ratios(residual, throughput, dt, seconds):
-    elapsed = np.cumsum(dt)
-    positive = np.r_[0.0, np.cumsum(np.maximum(residual, 0))]
-    flow = np.r_[0.0, np.cumsum(throughput)]
-    start = np.searchsorted(elapsed, elapsed - seconds, side="right")
-    loss, work = positive[1:] - positive[start], flow[1:] - flow[start]
-    ratio = np.divide(loss, work, out=np.full_like(work, np.inf), where=work > 0)
-    ratio[(loss == 0) & (work == 0)] = 0
-    return ratio
-
-
 def energy_analysis(records, flags, limits):
     finite = np.isfinite(records).all(axis=1)
     covered = (flags == 0) & (records[:, E.VALID] == 1) & finite
@@ -112,7 +101,9 @@ def energy_analysis(records, flags, limits):
     ratios = window_ratios(r, flow, records[:, E.DT], limits.window_seconds)
     total_flow = float(flow.sum())
     losses = records[:, E.FRICTION_LOSS:E.RAYLEIGH_LOSS + 1]
-    negative = int((losses < -limits.negative_loss_tolerance_j).sum())
+    below = losses < -limits.negative_loss_tolerance_j
+    # Contact rows are attributed at the interval mean velocity; the contact audit gates their sign per row.
+    negative = int(below[:, E.LIMIT_LOSS - E.FRICTION_LOSS:].sum())
     trunc = records[:, E.DAT_KINETIC_LOSS]
     gates = {
         "net_residual": abs(r.sum()) <= limits.energy_net_ratio * total_flow,
@@ -127,8 +118,8 @@ def energy_analysis(records, flags, limits):
         net_residual_j=float(r.sum()), absolute_residual_j=float(np.abs(r).sum()),
         positive_residual_j=float(np.maximum(r, 0).sum()), throughput_j=total_flow,
         max_positive_window_ratio=float(ratios.max()), negative_loss_terms=negative,
-        negative_loss_terms_by_class={E(E.FRICTION_LOSS + i).name: int((losses[:, i] <
-            -limits.negative_loss_tolerance_j).sum()) for i in range(losses.shape[1])},
+        negative_loss_terms_by_class={E(E.FRICTION_LOSS + i).name: int(below[:, i].sum())
+                                      for i in range(losses.shape[1])},
         max_absolute_residual_j=float(np.abs(r).max()), dat_kinetic_loss_j=float(trunc.sum()),
         terms_j={c.name: float(records[:, c].sum()) for c in E if E.DRIVE_WORK <= c <= E.DAT_POTENTIAL})
 
@@ -178,10 +169,10 @@ def momentum_analysis(stages, records, flags, metadata, limits, tolerance, parti
     norm = np.linalg.norm(residual, axis=1)
     scale = np.maximum(np.linalg.norm(end[:, discrete], axis=1), np.linalg.norm(gravity, axis=1))
     relative = limits.momentum_relative_per_second * scale * dt
+    # Rayleigh element forces act on relative nodal rates, so they cancel like the elastic forces.
     covered = bool(metadata.get("momentum_scope") == "vbd_subsystem" and
         not metadata.get("aerodynamic_forces", True) and (flags == 0).all() and
-        (records[:, E.VALID] == 1).all() and
-        (records[:, E.RAYLEIGH_LOSS] == 0).all() and np.isfinite(residual).all() and
+        (records[:, E.VALID] == 1).all() and np.isfinite(residual).all() and
         (solved[:, C.VBD_DYNAMIC_PARTICLES] > 0).all())
     original = decision(covered, bool((norm <= relative).all()),
         momentum_relative_per_second=limits.momentum_relative_per_second,
@@ -231,7 +222,7 @@ def momentum_analysis(stages, records, flags, metadata, limits, tolerance, parti
     return report, residual
 
 
-def contact_analysis(counts, metrics, limits, readout_complete=True):
+def contact_analysis(counts, metrics, limits, tolerance, readout_complete=True):
     totals = counts.sum(axis=0, dtype=np.uint64)
     value, ids, valid = decode_maxima(metrics)
     worst = {}
@@ -240,19 +231,23 @@ def contact_analysis(counts, metrics, limits, readout_complete=True):
         worst[column.name] = {"value": float(value[i, column]), "interval": i + 1,
                               "global_row": int(ids[i, column]) if valid[i, column] else None}
     checked = totals[A.CONTACTS]
+    rates = value[:, [M.NORMAL_DISPLACEMENT_RATE, M.TANGENT_DISPLACEMENT_RATE]]
     complete = (readout_complete and checked > 0 and
                 totals[A.UNMEASURED_GAPS] == 0 and totals[A.INVALID_ROWS] == 0)
     passed = all(totals[c] == 0 for c in (A.INVALID_ROWS, A.LINEAR_CLOSURE_VIOLATIONS,
-        A.CONE_VIOLATIONS, A.NEGATIVE_NORMAL_IMPULSES, A.GAP_VIOLATIONS))
+        A.CONE_VIOLATIONS, A.NEGATIVE_NORMAL_IMPULSES, A.GAP_VIOLATIONS)) and bool((rates <= tolerance).all())
     return decision(bool(complete), bool(passed), contacts=int(checked),
         observed_contact_intervals=int(np.count_nonzero(counts[:, A.CONTACTS])),
         readout_valid=readout_complete,
         totals={c.name: int(totals[c]) for c in A}, worst=worst,
+        intervals_over_displacement_rate=int((rates > tolerance).any(axis=1).sum()),
         thresholds={"linear_impulse_relative": limits.linear_impulse_relative,
                     "cone_relative_slack": limits.friction_cone_relative_slack,
-                    "position_slop_m": limits.position_slop_m},
+                    "position_slop_m": limits.position_slop_m, "displacement_rate_mps": tolerance},
         time_layers={"impulse_and_work": "SOLVED", "closest_feature_gap": "END"},
-        gap_scope="Final OGC particle VF/EE features; unavailable feature kinds block acceptance.",
+        dissipation="sign(lambda) J u at the solved displacement u; the speculative and friction laws make it "
+                    "nonpositive, so each row may exceed zero only by the solver velocity tolerance.",
+        gap_scope="Final OGC VF/EE features and particle-body surfaces; unavailable feature kinds block acceptance.",
         frozen_gap="Auxiliary frozen-Jacobian estimate; excluded from the closest-feature gap gate.")
 
 
@@ -370,7 +365,7 @@ def stream_analysis(values, env, manifest, limits, initial_velocity=None, initia
     bad = np.argwhere(~finite)
     first = None if not len(bad) else {"interval": int(bad[0, 0] + 1), "stage": S(int(bad[0, 1])).name,
         "nonfinite_entities": bad_counts[tuple(bad[0])].tolist()}
-    contacts = contact_analysis(counts, metrics, limits, readout_complete)
+    contacts = contact_analysis(counts, metrics, limits, tolerance, readout_complete)
     equation_error = stages[:, S.SOLVED, C.VBD_MOMENTUM_VELOCITY_ERROR]
     newton, vertex, measured = decode_maxima(values["newton_metrics"][:, env])
     dynamic_vertices = stages[:, S.SOLVED, C.VBD_DYNAMIC_PARTICLES] > 0
@@ -401,9 +396,11 @@ def stream_analysis(values, env, manifest, limits, initial_velocity=None, initia
         (values["ogc_contacts"][:, env] <= capacity).all() and (values["env_status"][:, env] == 0).all()),
         ogc_peak=int(values["ogc_contacts"][:, env].max()), ogc_capacity=capacity,
         scope="OGC reserve and explicit environment failure flags; other capacities need their own counters.")
+    # A capped query also caps the motion it certifies, so capping surfaces as truncation.
     truncation = decision(readout_complete and manifest["substeps"] == 1, bool(dat_ratio < limits.dat_step_ratio and
-        (values["dat_failures"][:, env] == 0).all() and (values["dat_query_limits"][:, env] == 0).all()),
+        (values["dat_failures"][:, env] == 0).all()),
         clipped_policy_steps=int(np.count_nonzero(truncations)), clipped_step_ratio=dat_ratio,
+        capped_query_steps=int(np.count_nonzero(values["dat_query_limits"][:, env])),
         contract="Substep counts are required; last-substep fields cannot certify multi-substep rates.")
     elapsed = np.cumsum(records[:, E.DT])
     force_work = values["force_residual_work"][:, env].reshape(-1)

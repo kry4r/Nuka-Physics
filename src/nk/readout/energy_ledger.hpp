@@ -11,7 +11,7 @@ enum class EnergyColumn : uint32_t {
     BeforeDatKinetic, BeforeDatGravity, BeforeDatElastic,
     EndKinetic, EndGravity, EndElastic,
     DriveWork, AeroWork, ExternalWork, KinematicElasticWork, KinematicContactWork,
-    FrictionLoss, NormalLoss, LimitLoss, MimicLoss, PassiveLoss, RayleighLoss,
+    FrictionLoss, NormalLoss, LimitLoss, PassiveLoss, RayleighLoss,
     PositionPotential, DatKineticLoss, DatPotential, Residual, Throughput, Dt,
     RowRateWork, RowPhysicalImpulseWork, UnclassifiedRowWork, Valid, Count
 };

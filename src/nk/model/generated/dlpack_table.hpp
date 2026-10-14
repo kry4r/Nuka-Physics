@@ -14,7 +14,7 @@
 
 namespace nuka::nk {
 
-enum class DlpackDtype : uint8_t { kF32, kU32, kU64, kU8 };
+enum class DlpackDtype : uint8_t { kF32, kU32, kU64, kU8, kF64 };
 
 struct DlpackRow {
     FieldId     field;
@@ -381,28 +381,23 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::SolverPhaseTime, DlpackDtype::kU64, 2, false},  // solver_phase_time
     {FieldId::DatSurfaceMotion, DlpackDtype::kF32, 1, false},  // dat_surface_motion
     {FieldId::EnergyLedger, DlpackDtype::kF32, 2, true},  // energy_ledger
+    {FieldId::EnergyLedgerSum, DlpackDtype::kF64, 2, false},  // energy_ledger_sum
     {FieldId::EnergyLedgerStatus, DlpackDtype::kU32, 1, true},  // energy_ledger_status
     {FieldId::PhysicsStageMetrics, DlpackDtype::kF32, 2, true},  // physics_stage_metrics
     {FieldId::ContactAuditCounts, DlpackDtype::kU32, 2, true},  // contact_audit_counts
     {FieldId::ContactAuditMetrics, DlpackDtype::kU64, 2, true},  // contact_audit_metrics
     {FieldId::EnergyParticleStart, DlpackDtype::kF32, 2, false},  // energy_particle_start
-    {FieldId::EnergyParticleFree, DlpackDtype::kF32, 2, false},  // energy_particle_free
-    {FieldId::EnergyParticleFreeRate, DlpackDtype::kF32, 2, false},  // energy_particle_free_rate
     {FieldId::EnergyAeroImpulse, DlpackDtype::kF32, 2, false},  // energy_aero_impulse
     {FieldId::EnergyKinematicContactImpulse, DlpackDtype::kF32, 2, false},  // energy_kinematic_contact_impulse
-    {FieldId::EnergyBodyFreeLinear, DlpackDtype::kF32, 2, false},  // energy_body_free_linear
-    {FieldId::EnergyBodyFreeAngular, DlpackDtype::kF32, 2, false},  // energy_body_free_angular
     {FieldId::EnergyLinkStartQ, DlpackDtype::kF32, 1, false},  // energy_link_start_q
     {FieldId::EnergyLinkStartQdot, DlpackDtype::kF32, 1, false},  // energy_link_start_qdot
     {FieldId::EnergyLinkPose, DlpackDtype::kF32, 2, false},  // energy_link_pose
     {FieldId::EnergyLinkUnprojectedPose, DlpackDtype::kF32, 2, false},  // energy_link_unprojected_pose
     {FieldId::EnergyLinkVelocity, DlpackDtype::kF32, 2, false},  // energy_link_velocity
-    {FieldId::EnergyQdotFree, DlpackDtype::kF32, 1, false},  // energy_qdot_free
     {FieldId::VbdForceResidualWork, DlpackDtype::kF32, 1, true},  // vbd_force_residual_work
     {FieldId::MReduced, DlpackDtype::kF32, 1, false},  // m_reduced
     {FieldId::MimicRootDof, DlpackDtype::kU32, 1, false},  // mimic_root_dof
     {FieldId::MimicRootScale, DlpackDtype::kF32, 1, false},  // mimic_root_scale
-    {FieldId::MimicProjectionLoss, DlpackDtype::kF32, 1, false},  // mimic_projection_loss
     {FieldId::VbdMembraneStart, DlpackDtype::kU8, 2, false},  // vbd_membrane_start
     {FieldId::CrbaScratch, DlpackDtype::kU32, 1, false},  // crba_scratch
     {FieldId::VbdSolveAudit, DlpackDtype::kF32, 2, true},  // vbd_solve_audit

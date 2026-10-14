@@ -168,7 +168,7 @@ uint64_t ModelCapacities::ElementCount(FieldId id) const {
         (id == FieldId::ParticleResponse || id == FieldId::ParticleRowImpulse ||
          id == FieldId::VbdHistoryReady)) return 0u;
     if (lay.per == FieldPer::Scalar) {
-        if (id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerStatus ||
+        if (id == FieldId::EnergyLedger || id == FieldId::EnergyLedgerSum || id == FieldId::EnergyLedgerStatus ||
             id == FieldId::VbdForceResidualWork || id == FieldId::PhysicsStageMetrics ||
             id == FieldId::ContactAuditCounts || id == FieldId::ContactAuditMetrics)
             return CheckedProduct({integration_substeps, env_count});

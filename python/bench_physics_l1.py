@@ -9,17 +9,19 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
+from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 import nuka
 from nuka.author import Scene, SimOptions, materials, morphs, surfaces
 from nuka.diagnostics import DiagnosticSession, DiagnosticThresholds
-from nuka.diagnostics.capture import sha256, write_json
+from nuka.diagnostics.capture import load_records, sha256, write_json
 from nuka.diagnostics.analysis import particle_state_quantities, vbd_discrete_momentum, verify_particle_trace
 from nuka.diagnostics.constitutive import elastic_quantities, unpack_elements, verify_elastic_trace
 from nuka.diagnostics.report import make_report
-from nuka.diagnostics.schema import Stage, StageColumn
+from nuka.diagnostics.schema import AuditCount, Stage, StageColumn
+from nuka.energy import EnergyColumn
 
 from bench_cloth_twist import topology
 
@@ -619,6 +621,195 @@ def run_s5(args):
     finally:
         world.destroy()
         device.close()
+
+
+def cloth_box_world(args, box):
+    """A flat cooked cloth at ``args.height`` and a static box, both with ``args.friction``."""
+    scene = Scene(SimOptions(dt=args.dt, gravity=(0, 0, args.gravity_z),
+        cloth_integrator=0 if args.integrator == "bdf2" else 1, solver_vel_iters=args.sweeps, solver_pos_iters=4,
+        ogc_contact_capacity=args.contact_capacity, baumgarte_max_velocity=0))
+    scene.add_entity(morphs.Grid(args.nx, args.ny, args.spacing, origin=(0, 0, args.height)),
+        materials.Cloth.VBD(areal_density=args.density, friction=args.friction, stretch_stiffness=args.stretch,
+                            poisson=args.poisson, bend_stiffness=args.bend, thickness=args.thickness),
+        surfaces.Cloth(free=True))
+    scene.add_entity(box, materials.Rigid(static=True, friction=args.friction))
+    device = nuka.Device.create(0)
+    world = scene.build(device)
+    world.set_gravity_z(args.gravity_z)
+    return device, world
+
+
+def record_cloth_fixture(args, world, metadata, positions, velocity):
+    """Start the cloth from ``positions`` and ``velocity``, record every interval and return the records."""
+    world.upload_field(nuka.Field.PARTICLE_POSITION, np.ascontiguousarray(positions))
+    world.upload_field(nuka.Field.PARTICLE_VELOCITY, np.ascontiguousarray(velocity))
+    inv_mass = np.asarray(world.download_field(nuka.Field.PARTICLE_INV_MASS)).copy()
+    elements = np.asarray(world.download_field(nuka.Field.VBD_ELEMENTS), dtype=np.uint32).reshape(-1, 16).copy()
+    session = DiagnosticSession(world, args.output, metadata, chunk_steps=args.chunk_steps,
+        state_fields=PARTICLE_FIELDS + CONTACT_FIELDS,
+        thresholds=DiagnosticThresholds(velocity_tolerance_mps=metadata["solver_velocity_tolerance_mps"]))
+    faces, edges = topology(args.nx, args.ny)
+    np.savez_compressed(args.output / "initial.npz", rest=positions, positions=positions, velocity=velocity,
+                        vbd_elements=elements, faces=faces, edges=edges, inv_mass=inv_mass, flat_rest=positions)
+    session.manifest["initial_geometry_sha256"] = sha256(args.output / "initial.npz")
+    write_json(args.output / "inputs.json", {"parameters": vars(args) | {"output": str(args.output),
+        "build_record": str(args.build_record)}, "metadata": metadata})
+    reason = "completed"
+    for _ in range(metadata["expected_policy_steps"]):
+        if np.any(session.step()["env_status"]):
+            reason = "physics_failure"
+            break
+    session.close(reason)
+    report = make_report(args.output, args.output / "report")
+    values, _ = load_records(args.output, states=True)
+    return values, inv_mass.astype(np.float64), reason, report["environments"][0]["layers"]["L2_energy"]
+
+
+def run_s3(args):
+    steps = policy_steps(args.duration, args.dt)
+    physical = {key: getattr(args, key) for key in ("nx", "ny", "spacing", "height", "duration", "density", "stretch",
+        "poisson", "bend", "thickness", "friction", "gravity_z", "tangent_velocity")}
+    metadata = {"fixture": "S3", **base_metadata(args, physical, steps, production_tolerance(), args.nx * args.ny),
+        "state_system": "dynamic_particles", "required_physical_systems": ["vbd"],
+        "required_ccd_contact_domains": ["particle_static"],
+        "boundary": "Flat cloth released with a tangential velocity above a static plane at z = 0",
+        "reference": "Tangential momentum is conserved; the impact removes the normal momentum, losing it as D_normal"}
+    device, world = cloth_box_world(args, morphs.Box((0.5, 0.5, 0.01), pos=(0, 0, -0.01)))
+    try:
+        positions = np.asarray(world.download_field(nuka.Field.PARTICLE_POSITION)).reshape(-1, 3).copy()
+        velocity = np.zeros_like(positions)
+        velocity[:, 0] = args.tangent_velocity
+        values, _, reason, ledger = record_cloth_fixture(args, world, metadata, positions, velocity)
+    finally:
+        world.destroy()
+        device.close()
+    stages = values["stages"][:, 0, 0].astype(np.float64)
+    energy = values["energy"][:, 0, 0].astype(np.float64)
+    momentum = slice(StageColumn.VBD_DISCRETE_MOMENTUM_X, StageColumn.VBD_DISCRETE_MOMENTUM_Z + 1)
+    start, end = stages[0, Stage.BEGIN, momentum], stages[:, Stage.END, momentum]
+    rows = stages[:, Stage.SOLVED, StageColumn.VBD_ROW_IMPULSE_Z]
+    gravity = stages[:, Stage.SOLVED, StageColumn.VBD_GRAVITY_IMPULSE_Z]
+    first = int(np.argmax(values["audit_counts"][:, 0, 0, AuditCount.CONTACTS] > 0))
+    # The impact ends once the normal momentum lies within one interval's gravity impulse of rest.
+    last = first + int(np.argmax(end[first:, 2] >= gravity[first:, 2]))
+    window = slice(first, last + 1)
+    before = stages[first, Stage.BEGIN, momentum]
+    mechanical = [energy[:, getattr(EnergyColumn, f"{stage}_{kind}")] for stage in ("BEGIN", "END")
+                  for kind in ("KINETIC", "GRAVITY", "ELASTIC")]
+    loss = sum(mechanical[:3])[first] - sum(mechanical[3:])[last]
+    normal_loss = energy[window, EnergyColumn.NORMAL_LOSS].sum()
+    expected = -before[2] - gravity[window].sum()
+    drift = np.linalg.norm(end[:, :2] - start[:2], axis=1).max() / np.linalg.norm(start[:2]) / args.duration
+    metrics = {"policy_steps": len(end), "stop_reason": reason, "tangential_momentum_drift_per_s": float(drift),
+        "first_contact_interval": first + 1, "impact_end_interval": last + 1,
+        "pre_impact_normal_momentum_kg_mps": float(before[2]),
+        "impact_normal_row_impulse_kg_mps": float(rows[window].sum()),
+        "impact_expected_normal_impulse_kg_mps": float(expected),
+        "impact_normal_impulse_relative_error": float(abs(rows[window].sum() - expected) / abs(before[2])),
+        "rebound_normal_momentum_max_kg_mps": float(end[first:, 2].max()),
+        "impact_energy_loss_j": float(loss), "impact_normal_loss_j": float(normal_loss),
+        "impact_loss_relative_error": float(abs(loss - normal_loss) / loss),
+        "passes": {"tangential_momentum": bool(drift < 1e-5), "ledger_energy": ledger["status"]},
+        "ledger_energy": ledger, "claims_full_physics_acceptance": False}
+    write_json(args.output / "fixture_metrics.json", metrics)
+    print(json.dumps({"output": str(args.output), **{k: v for k, v in metrics.items() if k != "ledger_energy"}}),
+          flush=True)
+
+
+def run_s4(args):
+    steps = policy_steps(args.duration, args.dt)
+    physical = {key: getattr(args, key) for key in ("nx", "ny", "spacing", "height", "duration", "density", "stretch",
+        "poisson", "bend", "thickness", "friction", "gravity_z", "slope_deg", "settle")}
+    metadata = {"fixture": "S4", **base_metadata(args, physical, steps, production_tolerance(), args.nx * args.ny),
+        "state_system": "dynamic_particles", "required_physical_systems": ["vbd"],
+        "required_ccd_contact_domains": ["particle_static"],
+        "boundary": "Flat cloth at rest one thickness above a static incline through the origin",
+        "reference": "Static when mu > tan(slope); otherwise the centre of mass accelerates at g (sin - mu cos)"}
+    theta = math.radians(args.slope_deg)
+    rotation = Rotation.from_euler("y", theta).as_matrix()
+    quat = (math.cos(theta / 2), 0.0, math.sin(theta / 2), 0.0)
+    box = morphs.Box((0.4, 0.2, 0.01), pos=tuple(rotation @ (0.0, 0.0, -0.01)), quat=quat)
+    device, world = cloth_box_world(args, box)
+    try:
+        flat = np.asarray(world.download_field(nuka.Field.PARTICLE_POSITION)).reshape(-1, 3).astype(np.float64)
+        positions = ((flat - flat.mean(axis=0)) @ rotation.T + rotation[:, 2] * args.thickness).astype(np.float32)
+        values, inv_mass, reason, ledger = record_cloth_fixture(args, world, metadata, positions,
+                                                                np.zeros_like(positions))
+    finally:
+        world.destroy()
+        device.close()
+    mass = 1.0 / inv_mass
+    velocity = values["state_PARTICLE_VELOCITY"].reshape(len(values["sweeps"]), -1, 3).astype(np.float64)
+    speed = (velocity @ rotation[:, 0]) @ mass / mass.sum()
+    times = np.arange(1, len(speed) + 1) * args.dt
+    fit = times >= args.settle
+    acceleration = float(np.polyfit(times[fit], speed[fit], 1)[0])
+    sliding = args.friction < math.tan(theta)
+    expected = -args.gravity_z * (math.sin(theta) - args.friction * math.cos(theta)) if sliding else 0.0
+    error = abs(acceleration / expected - 1) if sliding else None
+    peak = float(np.abs(speed[fit]).max())
+    metrics = {"policy_steps": len(speed), "stop_reason": reason, "sliding_expected": sliding,
+        "downhill_acceleration_mps2": acceleration, "expected_acceleration_mps2": expected,
+        "acceleration_relative_error": error, "downhill_speed_max_after_settle_mps": peak,
+        "passes": {"motion": bool(error < 0.02) if sliding else bool(peak < 1e-4), "ledger_energy": ledger["status"]},
+        "ledger_energy": ledger, "claims_full_physics_acceptance": False}
+    write_json(args.output / "fixture_metrics.json", metrics)
+    print(json.dumps({"output": str(args.output), **{k: v for k, v in metrics.items() if k != "ledger_energy"}}),
+          flush=True)
+
+
+def run_s9(args):
+    steps = policy_steps(args.duration, args.dt)
+    physical = {key: getattr(args, key) for key in ("span", "height", "segments", "radius", "mass", "stretch", "bend",
+        "damping", "duration", "gravity_z")}
+    metadata = {"fixture": "S9", **base_metadata(args, physical, steps, production_tolerance(), args.segments + 1),
+        "state_system": "dynamic_particles", "required_physical_systems": ["vbd"],
+        "required_ccd_contact_domains": ["particle_edge_self"],
+        "boundary": "Cable pinned at both ends of a horizontal span, settling under gravity",
+        "reference": "Catenary z = a cosh(x / a) through both pinned ends, a fitted to the settled shape"}
+    scene = Scene(SimOptions(dt=args.dt, gravity=(0, 0, args.gravity_z), solver_vel_iters=args.sweeps,
+        solver_pos_iters=4, ogc_contact_capacity=args.contact_capacity, baumgarte_max_velocity=0))
+    scene.add_entity(morphs.Cable(start=(-args.span / 2, 0.0, args.height), end=(args.span / 2, 0.0, args.height),
+                                  segments=args.segments, radius=args.radius, pin="both"),
+                     materials.Cable.VBD(mass=args.mass, stretch_stiffness=args.stretch, bend_stiffness=args.bend,
+                                         damping=args.damping))
+    device = nuka.Device.create(0)
+    world = scene.build(device)
+    try:
+        world.set_gravity_z(args.gravity_z)
+        session = DiagnosticSession(world, args.output, metadata, chunk_steps=args.chunk_steps,
+            state_fields=PARTICLE_FIELDS + CONTACT_FIELDS,
+            thresholds=DiagnosticThresholds(velocity_tolerance_mps=metadata["solver_velocity_tolerance_mps"]))
+        reason = "completed"
+        for _ in range(steps):
+            if np.any(session.step()["env_status"]):
+                reason = "physics_failure"
+                break
+        session.close(reason)
+        ledger = make_report(args.output, args.output / "report")["environments"][0]["layers"]["L2_energy"]
+        values, _ = load_records(args.output, states=True)
+    finally:
+        world.destroy()
+        device.close()
+    x = values["state_PARTICLE_POSITION"][-1].reshape(-1, 3).astype(np.float64)
+    speed = float(np.linalg.norm(values["state_PARTICLE_VELOCITY"][-1].reshape(-1, 3), axis=1).max())
+    span = x[-1, 0] - x[0, 0]
+    centred = x[:, 0] - 0.5 * (x[0, 0] + x[-1, 0])
+    end = 0.5 * (x[0, 2] + x[-1, 2])
+
+    def deviation(a):
+        return end + a[0] * (np.cosh(centred / a[0]) - np.cosh(span / (2 * a[0]))) - x[:, 2]
+
+    sag = end - x[:, 2].min()
+    fit = least_squares(deviation, [span * span / (8 * sag)], bounds=(1e-6, np.inf))
+    error = float(np.abs(deviation(fit.x)).max() / span)
+    metrics = {"policy_steps": len(values["sweeps"]), "stop_reason": reason, "span_m": float(span),
+        "sag_m": float(sag), "catenary_a_m": float(fit.x[0]), "shape_error_over_span": error,
+        "final_speed_max_mps": speed, "passes": {"shape": bool(error < 0.01), "ledger_energy": ledger["status"]},
+        "ledger_energy": ledger, "claims_full_physics_acceptance": False}
+    write_json(args.output / "fixture_metrics.json", metrics)
+    print(json.dumps({"output": str(args.output), **{k: v for k, v in metrics.items() if k != "ledger_energy"}}),
+          flush=True)
 
 
 def urdf_vector(element, key, default="0 0 0"):
@@ -1225,6 +1416,37 @@ def main():
         free.add_argument("--translation", type=float, nargs=3, default=(.2, .1, -.05), metavar=("VX", "VY", "VZ"))
         free.add_argument("--spin", type=float, nargs=3, default=(0, 0, .1), metavar=("WX", "WY", "WZ"))
         free.add_argument("--stretch-strain", type=float, default=1e-4)
+    s3 = fixtures.add_parser("s3", help="frictionless undamped flat cloth dropped onto a static plane")
+    common_arguments(s3)
+    cloth_arguments(s3)
+    s3.set_defaults(friction=0.0)
+    s3.add_argument("--nx", type=int, default=10)
+    s3.add_argument("--ny", type=int, default=10)
+    s3.add_argument("--spacing", type=float, default=.01)
+    s3.add_argument("--height", type=float, default=.05, help="release height of the flat cloth (m)")
+    s3.add_argument("--duration", type=float, default=.4)
+    s3.add_argument("--tangent-velocity", type=float, default=.2, help="initial velocity along x (m/s)")
+    s4 = fixtures.add_parser("s4", help="cloth released on a static incline")
+    common_arguments(s4)
+    cloth_arguments(s4)
+    s4.add_argument("--nx", type=int, default=10)
+    s4.add_argument("--ny", type=int, default=10)
+    s4.add_argument("--spacing", type=float, default=.01)
+    s4.add_argument("--height", type=float, default=.1, help="height of the flat cooked lattice above the incline (m)")
+    s4.add_argument("--slope-deg", type=float, default=30.0)
+    s4.add_argument("--duration", type=float, default=.5)
+    s4.add_argument("--settle", type=float, default=.1, help="start of the acceleration fit (s)")
+    s9 = fixtures.add_parser("s9", help="cable pinned at both ends settling into a catenary")
+    common_arguments(s9)
+    s9.add_argument("--span", type=float, default=.5)
+    s9.add_argument("--height", type=float, default=.7)
+    s9.add_argument("--segments", type=int, default=40)
+    s9.add_argument("--radius", type=float, default=.002)
+    s9.add_argument("--mass", type=float, default=.01, help="mass per cable vertex (kg)")
+    s9.add_argument("--stretch", type=float, default=10.0)
+    s9.add_argument("--bend", type=float, default=1e-5)
+    s9.add_argument("--damping", type=float, default=.05)
+    s9.add_argument("--duration", type=float, default=25.0)
     s5 = fixtures.add_parser("s5", help="folded cloth dropped onto a static table (self-contact)")
     common_arguments(s5)
     s5.add_argument("--nx", type=int, default=133)
@@ -1258,7 +1480,8 @@ def main():
     s7.add_argument("--settle", type=float, default=.4)
     s7.add_argument("--hold", type=float, default=.8)
     args = parser.parse_args()
-    {"s1": run_s1_fixture, "s2": run_s1_fixture, "s5": run_s5, "s7": run_s7}[args.fixture](args)
+    {"s1": run_s1_fixture, "s2": run_s1_fixture, "s3": run_s3, "s4": run_s4, "s5": run_s5,
+     "s7": run_s7, "s9": run_s9}[args.fixture](args)
 
 
 if __name__ == "__main__":

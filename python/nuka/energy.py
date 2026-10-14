@@ -27,19 +27,18 @@ class EnergyColumn(IntEnum):
     FRICTION_LOSS = 16
     NORMAL_LOSS = 17
     LIMIT_LOSS = 18
-    MIMIC_LOSS = 19
-    PASSIVE_LOSS = 20
-    RAYLEIGH_LOSS = 21
-    POSITION_POTENTIAL = 22
-    DAT_KINETIC_LOSS = 23
-    DAT_POTENTIAL = 24
-    RESIDUAL = 25
-    THROUGHPUT = 26
-    DT = 27
-    ROW_RATE_WORK = 28
-    ROW_PHYSICAL_IMPULSE_WORK = 29
-    UNCLASSIFIED_ROW_WORK = 30
-    VALID = 31
+    PASSIVE_LOSS = 19
+    RAYLEIGH_LOSS = 20
+    POSITION_POTENTIAL = 21
+    DAT_KINETIC_LOSS = 22
+    DAT_POTENTIAL = 23
+    RESIDUAL = 24
+    THROUGHPUT = 25
+    DT = 26
+    ROW_RATE_WORK = 27
+    ROW_PHYSICAL_IMPULSE_WORK = 28
+    UNCLASSIFIED_ROW_WORK = 29
+    VALID = 30
 
 
 class EnergyStatus(IntFlag):
@@ -75,6 +74,18 @@ class EnergyLedgerSampler:
                 status.reshape(self.env_count, self.substeps).copy())
 
 
+def window_ratios(residual, throughput, dt, seconds):
+    """Positive residual over throughput in each window spanning `seconds`; a shorter stream is one window."""
+    elapsed = np.cumsum(dt)
+    positive = np.r_[0.0, np.cumsum(np.maximum(residual, 0))]
+    flow = np.r_[0.0, np.cumsum(throughput)]
+    start = np.searchsorted(elapsed, elapsed - seconds, side="right")
+    loss, work = positive[1:] - positive[start], flow[1:] - flow[start]
+    ratio = np.divide(loss, work, out=np.full_like(work, np.inf), where=work > 0)
+    ratio[(loss == 0) & (work == 0)] = 0
+    return ratio[elapsed >= min(seconds, elapsed[-1]) - 0.5 * dt]
+
+
 def _summarize_stream(values, status):
     """Report original energy gates; uncovered records cannot pass acceptance."""
     records = np.asarray(values, dtype=np.float64).reshape(-1, len(EnergyColumn))
@@ -97,23 +108,14 @@ def _summarize_stream(values, status):
         return report
     throughput = float(records[:, c.THROUGHPUT].sum())
     residual = records[:, c.RESIDUAL]
-    elapsed = np.cumsum(records[:, c.DT])
-    positive = np.cumsum(np.maximum(residual, 0.0))
-    flow = np.cumsum(records[:, c.THROUGHPUT])
-    prior = np.searchsorted(elapsed, elapsed - 1.0, side="right") - 1
-    prior_positive = np.where(prior >= 0, positive[np.maximum(prior, 0)], 0.0)
-    prior_flow = np.where(prior >= 0, flow[np.maximum(prior, 0)], 0.0)
-    window_positive, window_flow = positive - prior_positive, flow - prior_flow
-    ratios = np.divide(window_positive, window_flow, out=np.full_like(window_flow, np.inf),
-                       where=window_flow > 0)
-    ratios[(window_positive == 0) & (window_flow == 0)] = 0
+    ratios = window_ratios(residual, records[:, c.THROUGHPUT], records[:, c.DT], 1.0)
     absolute_residual = float(np.abs(residual).sum())
     net_residual = float(residual.sum())
     truncation = float(records[:, c.DAT_KINETIC_LOSS].sum())
     negative_losses = int((records[:, c.FRICTION_LOSS:c.RAYLEIGH_LOSS + 1] < -1e-9).sum())
     report.update({
         "throughput_j": throughput, "net_residual_j": net_residual,
-        "absolute_residual_j": absolute_residual, "positive_residual_j": float(positive[-1]),
+        "absolute_residual_j": absolute_residual, "positive_residual_j": float(np.maximum(residual, 0).sum()),
         "max_positive_window_ratio": float(ratios.max()), "negative_loss_terms": negative_losses,
         "negative_dat_records": int((records[:, c.DAT_KINETIC_LOSS] < -1e-9).sum()),
         "residual_gate": abs(net_residual) <= 0.01 * throughput,

@@ -30,7 +30,6 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
                                   float* __restrict__ root_scale,
                                   float* __restrict__ reduced_M,
                                   float* __restrict__ mass_factor,
-                                  float* __restrict__ projection_loss,
                                   uint32_t* scratch, uint32_t* err_status) {
     __shared__ uint32_t dof_sh;
     __shared__ uint32_t free_sh;
@@ -115,9 +114,6 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
         for (size_t i = lane; i < tile_stride; i += blockDim.x) {
             Mr[i] = M[i];
         }
-        if (lane == 0u) {
-            projection_loss[articulation] = 0.0f;
-        }
         return;
     }
 
@@ -170,8 +166,8 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
             factor[size_t{free_dof[i]} * max_dof + free_dof[j]] = a[size_t{i} * max_dof + j];
     __syncthreads();
 
-    // The coupling impulse takes the step velocity to its M-orthogonal projection W_c M v;
-    // its work 1/2 (v + v_c)^T M (v - v_c) is booked like a row's.
+    // The M-orthogonal projection of the step velocity onto the coupled coordinates is the reduced
+    // dynamics, so an ideal coupling does no work on the motion it admits.
     for (uint32_t k = lane; k < dof; k += blockDim.x) {
         velocity[k] = dof_component[k] != kInvalidLink
                           ? state.link_velocity[dof_link[k]].v[dof_component[k]]
@@ -199,21 +195,6 @@ __global__ void MimicReduceKernel(ArticulationDeviceState state,
     for (uint32_t r = lane; r < dof; r += blockDim.x)
         projected[r] = scale[r] * reduced_velocity[compact[root[r]]];
     __syncthreads();
-    for (uint32_t r = lane; r < dof; r += blockDim.x) {
-        float sum = 0.0f;
-        for (uint32_t b = 0u; b < dof; ++b) {
-            sum += M[static_cast<size_t>(r) * max_dof + b] * (velocity[b] - projected[b]);
-        }
-        moment[r] = sum;
-    }
-    __syncthreads();
-    if (lane == 0u) {
-        double loss = 0.0;
-        for (uint32_t r = 0u; r < dof; ++r) {
-            loss += 0.5 * (double(velocity[r]) + projected[r]) * moment[r];
-        }
-        projection_loss[articulation] = static_cast<float>(loss);
-    }
     for (uint32_t k = lane; k < dof; k += blockDim.x) {
         if (dof_component[k] != kInvalidLink) {
             state.link_velocity[dof_link[k]].v[dof_component[k]] = projected[k];
@@ -243,8 +224,7 @@ Status OpMimicReduce(const ModelView& model, const DataView& data,
         model.articulation_link_count == nullptr || model.mimic_source_link == nullptr ||
         model.mimic_multiplier == nullptr || model.mimic_offset == nullptr ||
         data.m_reduced == nullptr ||
-        data.mimic_root_dof == nullptr || data.mimic_root_scale == nullptr ||
-        data.mimic_projection_loss == nullptr) {
+        data.mimic_root_dof == nullptr || data.mimic_root_scale == nullptr) {
         return Status::Failed;
     }
     const ArticulationDeviceState state = MakeArticulationDeviceState(
@@ -255,7 +235,7 @@ Status OpMimicReduce(const ModelView& model, const DataView& data,
                static_cast<const float*>(model.mimic_offset), p->max_dof,
                static_cast<const float*>(data.m),
                data.mimic_root_dof, data.mimic_root_scale, data.m_reduced, data.m_factor,
-               data.mimic_projection_loss, data.crba_scratch, data.env_status);
+               data.crba_scratch, data.env_status);
     return (cudaGetLastError() == cudaSuccess) ? Status::Ok : Status::Failed;
 }
 

@@ -45,6 +45,7 @@ BANNER = (
 DTYPE_INFO: dict[str, dict[str, Any]] = {
     # name : { cpp (View member ptr element), code (dlpack), lanes (scalars/elem) }
     "f32":       {"cpp": "float",            "code": "kF32", "lanes": 1},
+    "f64":       {"cpp": "double",           "code": "kF64", "lanes": 1},
     "u32":       {"cpp": "uint32_t",         "code": "kU32", "lanes": 1},
     "u64":       {"cpp": "uint64_t",         "code": "kU64", "lanes": 1},
     "u8":        {"cpp": "uint8_t",          "code": "kU8",  "lanes": 1},
@@ -306,7 +307,7 @@ def gen_arena_layout(fields: list[dict[str, Any]]) -> str:
         "articulation_dof": "ArticulationDof",
         "aero_tri": "AeroTri",
     }
-    scalar_size = {"kF32": 4, "kU32": 4, "kU64": 8, "kU8": 1}
+    scalar_size = {"kF32": 4, "kF64": 8, "kU32": 4, "kU64": 8, "kU8": 1}
     lines.append("inline constexpr FieldLayout kFieldLayout[kFieldCount] = {")
     for f in fields:
         info = DTYPE_INFO[f["dtype"]]
@@ -345,7 +346,7 @@ def gen_dlpack_table(fields: list[dict[str, Any]]) -> str:
         "",
         "namespace nuka::nk {",
         "",
-        "enum class DlpackDtype : uint8_t { kF32, kU32, kU64, kU8 };",
+        "enum class DlpackDtype : uint8_t { kF32, kU32, kU64, kU8, kF64 };",
         "",
         "struct DlpackRow {",
         "    FieldId     field;",

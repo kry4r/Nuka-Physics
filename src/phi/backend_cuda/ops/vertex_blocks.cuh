@@ -150,7 +150,7 @@ __device__ inline void VertexElementBlock(const VertexBlockView& b, const math::
 __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::Vec3* velocity,
                                          uint32_t env, uint32_t vertex, uint32_t lane,
                                          uint32_t width, math::Vec3& gradient,
-                                         math::SymmetricMat3& hessian) {
+                                         math::SymmetricMat3& hessian, math::Vec3* magnitude = nullptr) {
     gradient = {};
     hessian = {};
     const math::Vec3 own = velocity[b.Particle(env, vertex)];
@@ -160,6 +160,7 @@ __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::V
         VertexElementBlock(b, velocity, env, own, b.incidence[i], g, h);
         gradient = gradient + g;
         nk::vbd::AddTo(hessian, h);
+        if (magnitude != nullptr) *magnitude = *magnitude + math::Vec3{fabsf(g.x), fabsf(g.y), fabsf(g.z)};
     }
 }
 
@@ -281,16 +282,26 @@ __device__ inline void VertexBlockEquationWarp(const VertexBlockView& b, PointMa
     nk::vbd::AddIdentity(hessian, inertia);
 }
 
-// A completed sweep must also satisfy the vertex equations after all neighboring row updates.
-__device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, PointMassView points,
-                                                 const math::Vec3* particle_error, uint32_t env,
+// A completed sweep must also satisfy the vertex equations after all neighboring row updates. Readouts sum the
+// force in other orders, so the momentum defect stays below the tolerance by the summation rounding bound.
+__device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, PointMassView points, uint32_t env,
                                                  uint32_t vertex, uint32_t lane, float tolerance) {
     const uint32_t particle = b.Particle(env, vertex);
     if (!(points.particle_inv_mass[particle] > 0.0f)) return true;
-    math::Vec3 u, force;
+    const uint32_t slot = b.Slot(env, vertex);
+    math::Vec3 gradient, magnitude{};
     math::SymmetricMat3 hessian, inverse;
-    VertexBlockEquationWarp(b, points, particle_error, env, vertex, lane, u, force, hessian);
-    const float inertia = b.inertia[b.Slot(env, vertex)];
+    GatherVertexBlock(b, points.particle_velocity, env, vertex, lane, warpSize, gradient, hessian, &magnitude);
+    gradient = {WarpSum(gradient.x), WarpSum(gradient.y), WarpSum(gradient.z)};
+    magnitude = {WarpSum(magnitude.x), WarpSum(magnitude.y), WarpSum(magnitude.z)};
+    hessian = {WarpSum(hessian.xx), WarpSum(hessian.yy), WarpSum(hessian.zz),
+               WarpSum(hessian.xy), WarpSum(hessian.xz), WarpSum(hessian.yz)};
+    const float inertia = b.inertia[slot];
+    const math::Vec3 inertial =
+        nk::vbd::InertialGradient(points.particle_velocity[particle], b.free_rate[slot], inertia, b.dt);
+    const math::Vec3 impulse = points.particle_row_impulse[particle] / b.dt;
+    const math::Vec3 force = -inertial - gradient + impulse;
+    nk::vbd::AddIdentity(hessian, inertia);
     if (!(fabsf(force.x) <= FLT_MAX && fabsf(force.y) <= FLT_MAX && fabsf(force.z) <= FLT_MAX)) {
         if (lane == 0u) atomicOr(b.env_status + env, kEnvStatusSolverFailure);
         return false;
@@ -298,8 +309,13 @@ __device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, Point
     if (!(tolerance > 0.0f)) return force.x == 0.0f && force.y == 0.0f && force.z == 0.0f;
     if (!nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse)) return false;
     const math::Vec3 correction = inverse.Multiply(force) / b.dt;
+    // Two orders of summing n terms differ by at most 2 (n + 1) eps times the sum of their magnitudes.
+    const float rounding = 2.0f * static_cast<float>(b.offsets[vertex + 1u] - b.offsets[vertex] + 3u) * FLT_EPSILON;
+    const math::Vec3 bound = (magnitude + math::Vec3{fabsf(inertial.x), fabsf(inertial.y), fabsf(inertial.z)} +
+                              math::Vec3{fabsf(impulse.x), fabsf(impulse.y), fabsf(impulse.z)}) * rounding;
     const math::Vec3 momentum_error = nk::vbd::MomentumResidualVelocity(
-        force, points.particle_inv_mass[particle], b.effective_step[b.Slot(env, vertex)]);
+        math::Vec3{fabsf(force.x), fabsf(force.y), fabsf(force.z)} + bound, points.particle_inv_mass[particle],
+        b.effective_step[slot]);
     return fabsf(correction.x) <= tolerance && fabsf(correction.y) <= tolerance &&
            fabsf(correction.z) <= tolerance && fabsf(momentum_error.x) <= tolerance &&
            fabsf(momentum_error.y) <= tolerance && fabsf(momentum_error.z) <= tolerance;

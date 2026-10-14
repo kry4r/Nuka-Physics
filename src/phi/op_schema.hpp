@@ -608,6 +608,8 @@ struct BlockDescentSolveParams {
     float position_beta = 0.0f;
     float position_slop = 0.0f;
     float position_max_velocity = 0.0f;
+    // Sweeps stop once the vertex equations and contact rows hold to this velocity; zero runs them all.
+    float velocity_tolerance = 0.0f;
 };
 
 // Environments of rigid bodies and articulations without particles or grid nodes, whose articulations fit a
@@ -711,6 +713,7 @@ struct ReadoutEnergyLedgerParams {
     uint32_t substeps = 1u;
     uint32_t slot = 0u;
     uint32_t particles_per_env = 0u;
+    uint32_t surfaces_per_env = 0u;
     uint32_t vbd_begin = 0u;
     uint32_t vbd_vertices = 0u;
     uint32_t vbd_elements = 0u;
@@ -723,7 +726,6 @@ struct ReadoutEnergyLedgerParams {
     uint32_t limit_rows = 0u;
     uint32_t friction_rows = 0u;
     uint32_t drive_rows = 0u;
-    uint32_t mimic_couplings = 0u;
     uint32_t has_aero = 0u;
     uint32_t has_dat = 0u;
     uint32_t pos_pass = 0u;
@@ -734,6 +736,10 @@ struct ReadoutEnergyLedgerParams {
     uint32_t rigid_contact_slots = 0u;
     uint32_t ogc_contact_slots = 0u;
     float pos_slop = 0.0f;
+    float particle_radius = 0.0f;
+    uint32_t sdf_grid_count = 0u;
+    uint32_t sdf_cell_total = 0u;
+    collision::MeshGeometryCounts mesh_geometry{};
 };
 
 struct ExportObsParams {

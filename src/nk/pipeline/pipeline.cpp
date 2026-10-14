@@ -269,11 +269,16 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.rigid_contact_slots = rigid_cap;
         p.ogc_contact_slots = cap.ogc_contacts_per_env;
         p.pos_slop = cfg.pos_slop;
+        p.particle_radius = 0.5f * model.particles.pp_contact_d_min;
+        p.sdf_grid_count = cap.max_sdf_grids;
+        p.sdf_cell_total = cap.max_sdf_cells;
+        p.mesh_geometry = {cap.max_hull_verts, cap.max_mesh_triangles, cap.max_mesh_bvh_nodes};
         p.dt = cfg.dt;
         std::copy(std::begin(cfg.gravity), std::end(cfg.gravity), p.gravity);
         p.env_count = env_count;
         p.substeps = cap.integration_substeps;
         p.particles_per_env = cap.particles_per_env;
+        p.surfaces_per_env = cap.particle_surfaces_per_env;
         p.vbd_begin = cap.vbd_particle_begin;
         p.vbd_vertices = cap.vbd_vertices_per_env;
         p.vbd_elements = cap.vbd_elements_per_env;
@@ -286,7 +291,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p.limit_rows = cap.joint_limit_rows_per_env;
         p.friction_rows = cap.joint_friction_rows_per_env;
         p.drive_rows = cap.joint_drive_rows_per_env;
-        p.mimic_couplings = mimic_couplings;
         p.has_dat = cap.ogc_contacts_per_env > 0u;
         p.has_aero = cap.aero_tris_per_env > 0u &&
             (model.particles.aero_drag_normal != 0.0f || model.particles.aero_drag_tangent != 0.0f);
@@ -424,6 +428,14 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             radius < 0.0f || radius >= 1.0f) return phi::Status::InvalidArgument;
         p_block_descent_.acceleration_spectral_radius = radius;
     }
+    const char* velocity_tolerance = std::getenv("NUKA_SOLVER_VEL_TOLERANCE");
+    if (velocity_tolerance != nullptr) {
+        char* end = nullptr;
+        const float tolerance = std::strtof(velocity_tolerance, &end);
+        if (end == velocity_tolerance || *end != '\0' || !std::isfinite(tolerance) || tolerance < 0.0f)
+            return phi::Status::InvalidArgument;
+        p_block_descent_.velocity_tolerance = tolerance;
+    }
     // Only head rows enter the incidence: one owner per plain side, every term of a point endpoint.
     p_block_descent_.incidence_per_env =
         2u * (uint64_t{cap.rigid_contact_rows_per_env} / (1u + kPairDrivenTangentRowsPerPt) +
@@ -436,6 +448,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
     p_block_descent_.measure_vertex_audit = (readout_demand & kReadoutVbdSolveAudit) != 0u;
     p_block_descent_.measure_contact_residual = cfg.measure_contact_residual ||
         p_block_descent_.measure_vertex_audit != 0u ||
+        p_block_descent_.velocity_tolerance > 0.0f ||
         (readout_demand & kReadoutPhysicsDiagnostics) != 0u ||
         (diagnostics != nullptr && diagnostics[0] == '1');
     // The build-time coupling context: the row provider's PreCouple/PostCouple

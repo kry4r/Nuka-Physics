@@ -366,29 +366,24 @@ enum class FieldId : uint16_t {
     SolverColorCounts,  // solver_color_counts (per:env arena:scratch owner:data elem:6)
     SolverPhaseTime,  // solver_phase_time (per:env arena:scratch owner:data elem:8)
     DatSurfaceMotion,  // dat_surface_motion (per:scalar arena:scratch owner:data count:particle_surfaces_per_env*env_count)
-    EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:32 count:integration_substeps*env_count flags:[readout])
+    EnergyLedger,  // energy_ledger (per:scalar arena:scratch owner:data elem:31 count:integration_substeps*env_count flags:[readout])
+    EnergyLedgerSum,  // energy_ledger_sum (per:scalar arena:scratch owner:data elem:31 count:integration_substeps*env_count)
     EnergyLedgerStatus,  // energy_ledger_status (per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout])
     PhysicsStageMetrics,  // physics_stage_metrics (per:scalar arena:scratch owner:data elem:195 count:integration_substeps*env_count flags:[readout])
     ContactAuditCounts,  // contact_audit_counts (per:scalar arena:scratch owner:data elem:8 count:integration_substeps*env_count flags:[readout])
     ContactAuditMetrics,  // contact_audit_metrics (per:scalar arena:scratch owner:data elem:7 count:integration_substeps*env_count flags:[readout])
     EnergyParticleStart,  // energy_particle_start (per:particle arena:scratch owner:data)
-    EnergyParticleFree,  // energy_particle_free (per:particle arena:scratch owner:data)
-    EnergyParticleFreeRate,  // energy_particle_free_rate (per:particle arena:scratch owner:data)
     EnergyAeroImpulse,  // energy_aero_impulse (per:particle arena:scratch owner:data)
     EnergyKinematicContactImpulse,  // energy_kinematic_contact_impulse (per:particle arena:scratch owner:data)
-    EnergyBodyFreeLinear,  // energy_body_free_linear (per:body arena:scratch owner:data)
-    EnergyBodyFreeAngular,  // energy_body_free_angular (per:body arena:scratch owner:data)
     EnergyLinkStartQ,  // energy_link_start_q (per:link arena:scratch owner:data)
     EnergyLinkStartQdot,  // energy_link_start_qdot (per:link arena:scratch owner:data)
     EnergyLinkPose,  // energy_link_pose (per:link arena:scratch owner:data)
     EnergyLinkUnprojectedPose,  // energy_link_unprojected_pose (per:link arena:scratch owner:data)
     EnergyLinkVelocity,  // energy_link_velocity (per:link arena:scratch owner:data)
-    EnergyQdotFree,  // energy_qdot_free (per:articulation_dof arena:scratch owner:data)
     VbdForceResidualWork,  // vbd_force_residual_work (per:scalar arena:scratch owner:data count:integration_substeps*env_count flags:[readout])
     MReduced,  // m_reduced (per:articulation_dof2 arena:scratch owner:data)
     MimicRootDof,  // mimic_root_dof (per:articulation_dof arena:scratch owner:data)
     MimicRootScale,  // mimic_root_scale (per:articulation_dof arena:scratch owner:data)
-    MimicProjectionLoss,  // mimic_projection_loss (per:articulation arena:scratch owner:data)
     VbdMembraneStart,  // vbd_membrane_start (per:scalar arena:scratch owner:data count:vbd_elements_per_env*env_count)
     CrbaScratch,  // crba_scratch (per:scalar arena:scratch owner:data count:articulations_per_env*env_count*dofs_per_env*(dofs_per_env+12))
     VbdSolveAudit,  // vbd_solve_audit (per:scalar arena:scratch owner:data elem:20 count:vbd_vertices_per_env*env_count flags:[readout])
@@ -764,28 +759,23 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "solver_phase_time",
     "dat_surface_motion",
     "energy_ledger",
+    "energy_ledger_sum",
     "energy_ledger_status",
     "physics_stage_metrics",
     "contact_audit_counts",
     "contact_audit_metrics",
     "energy_particle_start",
-    "energy_particle_free",
-    "energy_particle_free_rate",
     "energy_aero_impulse",
     "energy_kinematic_contact_impulse",
-    "energy_body_free_linear",
-    "energy_body_free_angular",
     "energy_link_start_q",
     "energy_link_start_qdot",
     "energy_link_pose",
     "energy_link_unprojected_pose",
     "energy_link_velocity",
-    "energy_qdot_free",
     "vbd_force_residual_work",
     "m_reduced",
     "mimic_root_dof",
     "mimic_root_scale",
-    "mimic_projection_loss",
     "vbd_membrane_start",
     "crba_scratch",
     "vbd_solve_audit",

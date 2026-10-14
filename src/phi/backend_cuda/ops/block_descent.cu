@@ -41,6 +41,9 @@ constexpr uint32_t kSolverPhaseWords = 8u;
 constexpr uint32_t kNoCacheColor = ~0u;
 constexpr uint32_t kAllCacheColors = ~0u;
 constexpr uint32_t kRowAxisLanes = 4u;
+// Loop words of a solve: finished sweeps, a flag any measure over the tolerance sets, and whether
+// another sweep runs.
+constexpr uint32_t kSweepCount = 0u, kSweepUnconverged = 1u, kSweepContinue = 2u, kSweepStateWords = 3u;
 constexpr uint32_t kPointJacobianAxes = 3u;
 constexpr uint32_t kPointJacobianComponents = 3u;
 constexpr uint32_t kPointJacobianWords = kPointJacobianAxes * kPointJacobianComponents;
@@ -253,6 +256,7 @@ struct BlockScratch {
     uint32_t rows;
     uint64_t incidence_capacity;
     uint32_t diagnostic_iteration = ~0u;
+    uint32_t* sweep_state;
     uint32_t* owner_cache_color;
     uint32_t* row_cache_colors;
     uint32_t* cache_counts;
@@ -466,6 +470,7 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.cache_color_count = tile ? 0u : static_cast<uint32_t>(cache_colors);
     s.cache_counts = take(s.cache_color_count);
     s.cache_offsets = take(tile ? 0u : cache_colors + 1u);
+    s.sweep_state = tile ? nullptr : take(kSweepStateWords);
     s.cache_rows = s.sorted_incidence;
     s.color_words = static_cast<uint32_t>(color_words);
     s.point_jacobian = reinterpret_cast<float*>(take(point_jacobian_words));
@@ -680,7 +685,8 @@ __device__ void RecordBlockFailure(DataView data, BlockDescentSolveParams p, Blo
             s.failure_equations[size_t{owner} * nk::kBlockSolveFailureEquationColumnCount + column] =
                 equation != nullptr ? equation[column] : 0.0;
         s.failure_equations[size_t{owner} * nk::kBlockSolveFailureEquationColumnCount +
-            static_cast<uint32_t>(nk::BlockSolveFailureEquationColumn::Iteration)] = s.diagnostic_iteration;
+            static_cast<uint32_t>(nk::BlockSolveFailureEquationColumn::Iteration)] =
+            s.sweep_state != nullptr ? s.sweep_state[kSweepCount] : s.diagnostic_iteration;
     }
     uint32_t env = 0u;
     if (owner < p.total_particle_count) env = owner / (p.total_particle_count / p.env_count);
@@ -2009,48 +2015,53 @@ __global__ void CommitAccelerationKernel(DataView data, BlockDescentSolveParams 
     }
 }
 
-// One warp per particle: lanes form the incidence terms, every lane sums them in incidence order.
-__global__ void GatherImpulseKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
-    if (data.particle_row_impulse == nullptr) return;
+// A warp sums a particle's row impulse: lanes form the incidence terms, every lane adds them in incidence order.
+__device__ Vec3 GatherParticleImpulse(DataView data, BlockScratch s, uint32_t particle, uint32_t lane) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const auto points = PointMasses(data);
+    const uint32_t first = s.offsets[particle];
+    const uint32_t last = s.offsets[particle + 1u];
+    Vec3 impulse{};
+    for (uint32_t chunk = first; chunk < last; chunk += warpSize) {
+        Vec3 jacobians[3] = {};
+        float weights[3] = {};
+        uint32_t axes = 0u;
+        if (chunk + lane < last) {
+            const uint32_t slot = s.incidence[chunk + lane];
+            const NkRow row = rows[slot];
+            axes = (row.flags & nk::nk_row_flags::kBlockNormal) ? 3u : 1u;
+#pragma unroll
+            for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                if (axis >= axes) continue;
+                const uint32_t index = slot + axis * row.group_normal_count;
+                jacobians[axis] = ParticleJacobian(rows[index], points, particle);
+                weights[axis] = data.lambda[index];
+            }
+        }
+        const uint32_t count = min(last - chunk, static_cast<uint32_t>(warpSize));
+        for (uint32_t source = 0u; source < count; ++source) {
+            const uint32_t source_axes = __shfl_sync(0xffffffffu, axes, source);
+#pragma unroll
+            for (uint32_t axis = 0u; axis < 3u; ++axis) {
+                const Vec3 jacobian{__shfl_sync(0xffffffffu, jacobians[axis].x, source),
+                                    __shfl_sync(0xffffffffu, jacobians[axis].y, source),
+                                    __shfl_sync(0xffffffffu, jacobians[axis].z, source)};
+                const float weight = __shfl_sync(0xffffffffu, weights[axis], source);
+                if (axis < source_axes) impulse += jacobian * weight;
+            }
+        }
+    }
+    return impulse;
+}
+
+__global__ void GatherImpulseKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    if (data.particle_row_impulse == nullptr) return;
     const uint32_t lane = threadIdx.x % warpSize;
     const size_t warp = (size_t{blockIdx.x} * blockDim.x + threadIdx.x) / warpSize;
     const size_t stride = size_t{gridDim.x} * blockDim.x / warpSize;
     for (size_t item = warp; item < p.total_particle_count; item += stride) {
         const uint32_t particle = static_cast<uint32_t>(item);
-        const uint32_t first = s.offsets[particle];
-        const uint32_t last = s.offsets[particle + 1u];
-        Vec3 impulse{};
-        for (uint32_t chunk = first; chunk < last; chunk += warpSize) {
-            Vec3 jacobians[3] = {};
-            float weights[3] = {};
-            uint32_t axes = 0u;
-            if (chunk + lane < last) {
-                const uint32_t slot = s.incidence[chunk + lane];
-                const NkRow row = rows[slot];
-                axes = (row.flags & nk::nk_row_flags::kBlockNormal) ? 3u : 1u;
-#pragma unroll
-                for (uint32_t axis = 0u; axis < 3u; ++axis) {
-                    if (axis >= axes) continue;
-                    const uint32_t index = slot + axis * row.group_normal_count;
-                    jacobians[axis] = ParticleJacobian(rows[index], points, particle);
-                    weights[axis] = data.lambda[index];
-                }
-            }
-            const uint32_t count = min(last - chunk, static_cast<uint32_t>(warpSize));
-            for (uint32_t source = 0u; source < count; ++source) {
-                const uint32_t source_axes = __shfl_sync(0xffffffffu, axes, source);
-#pragma unroll
-                for (uint32_t axis = 0u; axis < 3u; ++axis) {
-                    const Vec3 jacobian{__shfl_sync(0xffffffffu, jacobians[axis].x, source),
-                                        __shfl_sync(0xffffffffu, jacobians[axis].y, source),
-                                        __shfl_sync(0xffffffffu, jacobians[axis].z, source)};
-                    const float weight = __shfl_sync(0xffffffffu, weights[axis], source);
-                    if (axis < source_axes) impulse += jacobian * weight;
-                }
-            }
-        }
+        const Vec3 impulse = GatherParticleImpulse(data, s, particle, lane);
         if (lane == 0u) data.particle_row_impulse[particle] = impulse;
     }
 }
@@ -2059,9 +2070,18 @@ __global__ void RecordSolveKernel(ModelView model, DataView data, BlockDescentSo
                                   BlockScratch s) {
     for (uint32_t index = blockIdx.x * blockDim.x + threadIdx.x; index < p.env_count;
          index += gridDim.x * blockDim.x) {
-        data.vbd_velocity_sweep_count[index] = p.iterations;
+        data.vbd_velocity_sweep_count[index] = s.sweep_state[kSweepCount];
         data.solver_color_counts[index * kSolverCountWords] = p.vertex_blocks.colors;
     }
+}
+
+// Coulomb residual of a contact row at the current velocities and multipliers.
+__device__ constraint::CoulombContactResidual ContactRowResidual(DataView data, BlockDescentSolveParams p,
+                                                                 BlockScratch s, uint32_t slot, const NkRow& row) {
+    const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
+    const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
+    return constraint::EvaluateCoulombContactResidual(
+        data.row_contact_response[slot], velocity, t.dual, row.mu, row.friction_secondary);
 }
 
 __global__ void MeasureRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
@@ -2071,10 +2091,7 @@ __global__ void MeasureRowsKernel(DataView data, BlockDescentSolveParams p, Bloc
         const uint32_t slot = s.active_rows[item];
         const NkRow row = rows[slot];
         if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
-        const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
-        const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
-        const auto residual = constraint::EvaluateCoulombContactResidual(
-            data.row_contact_response[slot], velocity, t.dual, row.mu, row.friction_secondary);
+        const auto residual = ContactRowResidual(data, p, s, slot, row);
         const uint32_t env = slot / p.rows_per_env;
         atomicAdd(data.contact_solve_counts + env * constraint::kContactSolveCountSize, 1u);
         if (!residual.valid)
@@ -2138,6 +2155,56 @@ __global__ void MeasureVerticesKernel(ModelView model, DataView data, BlockDesce
             atomicMax(reinterpret_cast<unsigned long long*>(data.vbd_solve_metrics + env * 2u + metric), packed);
         }
     }
+}
+
+// The solver gate's vertex and contact measures after a sweep; the first one over the tolerance flags
+// the sweep unconverged and ends the check.
+__global__ void UnconvergedVerticesKernel(ModelView model, DataView data, BlockDescentSolveParams p,
+                                          BlockScratch s) {
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t first = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    const uint32_t stride = gridDim.x * blockDim.x / warpSize;
+    const VertexBlockView b = Vertices(model, data, p);
+    volatile uint32_t* unconverged = s.sweep_state + kSweepUnconverged;
+    for (uint32_t item = first; item < b.layout.dynamic_vertices * p.env_count; item += stride) {
+        if (__shfl_sync(0xffffffffu, *unconverged, 0) != 0u) return;
+        const uint32_t env = item / b.layout.dynamic_vertices;
+        const uint32_t vertex = b.color_vertices[item % b.layout.dynamic_vertices];
+        const uint32_t particle = b.Particle(env, vertex);
+        const Vec3 impulse = GatherParticleImpulse(data, s, particle, lane);
+        if (lane == 0u) data.particle_row_impulse[particle] = impulse;
+        __syncwarp();
+        const bool stationary = VertexBlockStationaryWarp(b, PointMasses(data), env, vertex, lane,
+                                                          p.velocity_tolerance);
+        if (!stationary && lane == 0u) *unconverged = 1u;
+    }
+}
+
+__global__ void UnconvergedRowsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    volatile uint32_t* unconverged = s.sweep_state + kSweepUnconverged;
+    for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < *s.active_count;
+         item += gridDim.x * blockDim.x) {
+        if (*unconverged != 0u) return;
+        const uint32_t slot = s.active_rows[item];
+        const NkRow row = rows[slot];
+        if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
+        const auto residual = ContactRowResidual(data, p, s, slot, row);
+        if (!residual.valid || !(residual.normal_natural_velocity <= p.velocity_tolerance) ||
+            !(residual.tangent_natural_velocity <= p.velocity_tolerance)) *unconverged = 1u;
+    }
+}
+
+// Counts the finished sweep and allows another while the budget lasts and a measure exceeds the tolerance.
+__global__ void FinishSweepKernel(BlockDescentSolveParams p, BlockScratch s,
+                                  cudaGraphConditionalHandle loop, bool graph) {
+    const uint32_t done = s.sweep_state[kSweepCount] + 1u;
+    const bool converged = p.velocity_tolerance > 0.0f && s.sweep_state[kSweepUnconverged] == 0u;
+    const uint32_t again = done < p.iterations && !converged ? 1u : 0u;
+    s.sweep_state[kSweepCount] = done;
+    s.sweep_state[kSweepUnconverged] = 0u;
+    s.sweep_state[kSweepContinue] = again;
+    if (graph) cudaGraphSetConditional(loop, again);
 }
 
 template <typename Kernel, typename... Args>
@@ -2332,6 +2399,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     if (!clear(s.counts, size_t{s.blocks + 1u} * sizeof(uint32_t)) ||
         !clear(s.cache_counts, size_t{s.cache_color_count} * sizeof(uint32_t)) ||
         !clear(s.active_count, sizeof(uint32_t)) ||
+        !clear(s.sweep_state, kSweepStateWords * sizeof(uint32_t)) ||
         !clear(data.solver_color_counts, size_t{p->env_count} * kSolverCountWords * sizeof(uint32_t)) ||
         !clear(data.solver_phase_time, size_t{p->env_count} * kSolverPhaseWords * sizeof(uint64_t))) return Status::Failed;
     if (p->clear_failure_diagnostics != 0u &&
@@ -2423,8 +2491,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     // Grid descents can move particles that carry no cache color, so particle rows are seeded only
     // without grids; with grids, rows that only grid nodes move are seeded instead.
     const bool seed_rows = p->total_grid_count == 0u;
-    for (uint32_t iteration = 0u; iteration < p->iterations; ++iteration) {
-        s.diagnostic_iteration = iteration;
+    // One sweep over every block; the first caches every row and builds the multilevel operators.
+    const auto sweep = [&](bool first, cudaStream_t stream) {
         if (grid_bytes > 0u && cudaMemcpyAsync(s.grid_snapshot, data.grid_velocity, grid_bytes,
                 cudaMemcpyDeviceToDevice, stream) != cudaSuccess) return Status::Failed;
         if (articulation_bytes > 0u && cudaMemcpyAsync(s.articulation_snapshot, data.qdot_flat,
@@ -2441,7 +2509,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                     p->grid_particles_per_env + p->vertex_blocks.vertices)
                 continue;
             if (LaunchWork(CacheAugmentedRowsKernel, s.rows, kThreads / kRowAxisLanes, stream,
-                    data, *p, particle_s, color, spread_rows, elastic && seed_rows && iteration > 0u)
+                    data, *p, particle_s, color, spread_rows, elastic && seed_rows && !first)
                 != cudaSuccess) return Status::Failed;
             const auto descent_status = elastic
                 ? LaunchWork(DescendParticlesKernel<true>, work, kDescendTileVertices, stream,
@@ -2476,7 +2544,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                     data, *p, s) != cudaSuccess) return Status::Failed;
             BlockScratch grid_s = s;
             grid_s.grid_snapshot = data.grid_velocity;
-            if (LaunchWork(CacheGridRowsKernel, s.rows, kThreads, stream, data, *p, grid_s, iteration > 0u)
+            if (LaunchWork(CacheGridRowsKernel, s.rows, kThreads, stream, data, *p, grid_s, !first)
                 != cudaSuccess) return Status::Failed;
             for (uint32_t color = 0u; color < GridColorCount(*p); ++color) {
                 const uint32_t cache_color = p->vertex_blocks.colors + 2u + color;
@@ -2488,7 +2556,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
             }
         }
         if (multilevel &&
-            LaunchMultilevelCorrection(model, data, *p, s, iteration == 0u, stream) != cudaSuccess)
+            LaunchMultilevelCorrection(model, data, *p, s, first, stream) != cudaSuccess)
             return Status::Failed;
         if (p->total_particle_count / p->env_count > p->grid_particles_per_env + layout.vertices) {
             const dim3 coarse_grid(p->env_count * s.coarse_parts);
@@ -2509,7 +2577,8 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
                     data, *p, s) != cudaSuccess) return Status::Failed;
         }
         if (accelerate) {
-            if (!clear(s.acceleration_merit, size_t{p->env_count} * 2u * sizeof(double)) ||
+            if (cudaMemsetAsync(s.acceleration_merit, 0, size_t{p->env_count} * 2u * sizeof(double),
+                    stream) != cudaSuccess ||
                 LaunchWork(MarkContactBlocksKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
                 LaunchWork(PrepareAccelerationKernel, p->env_count, kThreads, stream, *p, s) != cudaSuccess ||
                 LaunchWork(ParticleMeritKernel, p->total_particle_count, kThreads / 32u, stream,
@@ -2526,9 +2595,64 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         if (p->material_cells_per_env > 0u &&
             LaunchWork(CacheMaterialRowsKernel, s.rows, kThreads / 32u, stream,
                 data, *p, s, false, kAllCacheColors) != cudaSuccess) return Status::Failed;
-        if (LaunchWork(DualUpdateKernel, s.rows, kThreads, stream, data, *p, s,
-                       iteration + 1u < p->iterations) != cudaSuccess)
+        // The next solve's first sweep recaches every row, so the last sweep's seeds go unread.
+        if (LaunchWork(DualUpdateKernel, s.rows, kThreads, stream, data, *p, s, true) != cudaSuccess)
             return Status::Failed;
+        return Status::Ok;
+    };
+    const bool check = p->velocity_tolerance > 0.0f;
+    const auto finish = [&](cudaStream_t stream, cudaGraphConditionalHandle loop, bool graph) {
+        if (check &&
+            (LaunchWork(UnconvergedRowsKernel, s.rows, kThreads, stream, data, *p, s) != cudaSuccess ||
+             LaunchWork(UnconvergedVerticesKernel, p->vertex_blocks.dynamic_vertices * p->env_count,
+                 kThreads / 32u, stream, model, data, *p, s) != cudaSuccess))
+            return Status::Failed;
+        LaunchCuda(FinishSweepKernel, dim3(1u), dim3(1u), 0u, stream, *p, s, loop, graph);
+        return cudaGetLastError() == cudaSuccess ? Status::Ok : Status::Failed;
+    };
+    if (sweep(true, stream) != Status::Ok) return Status::Failed;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) return Status::Failed;
+    if (capture == cudaStreamCaptureStatusActive) {
+        // A captured solve loops on the device: a while node repeats the sweep that its last kernel allows.
+        cudaGraph_t graph = nullptr;
+        const cudaGraphNode_t* dependencies = nullptr;
+        const cudaGraphEdgeData* edges = nullptr;
+        size_t dependency_count = 0u;
+        cudaGraphConditionalHandle loop{};
+        if (cudaStreamGetCaptureInfo(stream, &capture, nullptr, &graph) != cudaSuccess ||
+            cudaGraphConditionalHandleCreate(&loop, graph, 0u, 0u) != cudaSuccess ||
+            finish(stream, loop, true) != Status::Ok ||
+            cudaStreamGetCaptureInfo(stream, &capture, nullptr, &graph, &dependencies, &edges,
+                &dependency_count) != cudaSuccess) return Status::Failed;
+        cudaGraphNodeParams node_params{};
+        node_params.type = cudaGraphNodeTypeConditional;
+        node_params.conditional.handle = loop;
+        node_params.conditional.type = cudaGraphCondTypeWhile;
+        node_params.conditional.size = 1u;
+        cudaGraphNode_t node = nullptr;
+        cudaStream_t body = nullptr;
+        if (cudaGraphAddNode(&node, graph, dependencies, edges, dependency_count, &node_params) != cudaSuccess ||
+            cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1u,
+                cudaStreamSetCaptureDependencies) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&body, cudaStreamNonBlocking) != cudaSuccess) return Status::Failed;
+        cudaGraph_t captured = nullptr;
+        const bool recorded = cudaStreamBeginCaptureToGraph(body, node_params.conditional.phGraph_out[0],
+                nullptr, nullptr, 0u, cudaStreamCaptureModeThreadLocal) == cudaSuccess &&
+            sweep(false, body) == Status::Ok && finish(body, loop, true) == Status::Ok;
+        const bool ended = cudaStreamEndCapture(body, &captured) == cudaSuccess;
+        if (cudaStreamDestroy(body) != cudaSuccess || !recorded || !ended) return Status::Failed;
+    } else {
+        if (finish(stream, {}, false) != Status::Ok) return Status::Failed;
+        for (uint32_t done = 1u; done < p->iterations; ++done) {
+            uint32_t again = 1u;
+            if (check && (cudaMemcpyAsync(&again, s.sweep_state + kSweepContinue, sizeof(again),
+                    cudaMemcpyDeviceToHost, stream) != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess))
+                return Status::Failed;
+            if (again == 0u) break;
+            if (sweep(false, stream) != Status::Ok || finish(stream, {}, false) != Status::Ok)
+                return Status::Failed;
+        }
     }
     if (LaunchWork(GatherImpulseKernel, p->total_particle_count, kThreads / 32u, stream, data, *p, s) != cudaSuccess ||
         LaunchWork(RecordSolveKernel, p->env_count, kThreads, stream,

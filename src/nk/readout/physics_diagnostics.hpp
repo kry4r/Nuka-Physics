@@ -30,7 +30,7 @@ enum class ContactAuditCount : uint32_t {
 
 enum class ContactAuditMetric : uint32_t {
     RelativeLinearClosure, ConeImpulseExcess, NegativeNormalImpulse,
-    FrozenGapPenetration, PositiveNormalWork, PositiveTangentWork, GapPenetration, Count
+    FrozenGapPenetration, NormalDisplacementRate, TangentDisplacementRate, GapPenetration, Count
 };
 
 inline constexpr uint32_t kContactAuditCountSize = static_cast<uint32_t>(ContactAuditCount::Count);

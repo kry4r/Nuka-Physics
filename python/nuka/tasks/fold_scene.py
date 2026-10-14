@@ -85,9 +85,9 @@ def folded_cloth(config):
 
     In the towel frame (x along the lattice rows, centred), the part beyond the fold line n.u = d wraps over a
     half cylinder, runs down a straight ramp and lies flat one layer gap above the base layer. The cross-section
-    is a unit-speed planar curve swept along the line, so lattice lengths along and across the line are kept and
-    the flat cooked rest shape stays the reference; chords over the curved hinge shorten by under one percent
-    when the radius is at least two lattice spacings.
+    is a planar curve swept along the line. Lattice columns, one row-edge share of the normal apart, sit that
+    same distance apart along the curve as chords, so every lattice edge keeps its rest length over the hinge and
+    ramp and the flat cooked rest shape stays the strain-free reference.
     """
     cloth = config["cloth"]
     layout = cloth["layout"]
@@ -97,20 +97,44 @@ def folded_cloth(config):
     if not 0.0 < drop < ramp or radius < 2.0 * spacing:
         raise ValueError("the ramp must descend from the hinge top to the layer gap, over a hinge of two spacings")
     slope = np.arcsin(drop / ramp)
+    arc = np.pi * radius
+
+    def profile(t):
+        """Cross-section point (out, height) at arc length t past the fold line."""
+        theta = np.clip(t, 0.0, arc) / radius
+        along = np.clip(t - arc, 0.0, ramp)
+        beyond = np.maximum(t - arc - ramp, 0.0)
+        out = np.where(t <= 0.0, t, np.where(t <= arc, radius * np.sin(theta), -along * np.cos(slope) - beyond))
+        height = np.where(t <= 0.0, 0.0, np.where(t <= arc, radius * (1.0 - np.cos(theta)),
+                                                 2.0 * radius - along * np.sin(slope)))
+        return np.stack([out, height], axis=-1)
+
     i, j = np.meshgrid(np.arange(nx), np.arange(ny))
     u = (i.ravel() - 0.5 * (nx - 1)) * spacing
     v = (j.ravel() - 0.5 * (ny - 1)) * spacing
     normal = np.asarray(layout["fold_normal"], dtype=np.float64)
     normal /= np.linalg.norm(normal)
     s = u * normal[0] + v * normal[1] - layout["fold_offset"]
-    arc = np.pi * radius
-    theta = np.clip(s, 0.0, arc) / radius
-    along = np.clip(s - arc, 0.0, ramp)
-    beyond = np.maximum(s - arc - ramp, 0.0)
-    out = np.where(s <= 0.0, s, np.where(s <= arc, radius * np.sin(theta),
-                                         -along * np.cos(slope) - beyond))
-    height = np.where(s <= 0.0, 0.0, np.where(s <= arc, radius * (1.0 - np.cos(theta)),
-                                              2.0 * radius - along * np.sin(slope)))
+    # Column knots from the last one on the flat side; each next knot's arc length puts it one chord from the
+    # last, by bisection between the chord and twice it (the curve turns under a radian per chord).
+    step = spacing * abs(normal[0])
+    columns = (np.arange(nx) - 0.5 * (nx - 1)) * step - layout["fold_offset"]
+    flat = columns[columns <= 0.0]
+    knots = [flat.max() if flat.size else columns.min() - step]
+    lengths = [knots[0]]
+    while knots[-1] < s.max():
+        start = profile(np.array(lengths[-1]))
+        low, high = lengths[-1] + step, lengths[-1] + 2.0 * step
+        for _ in range(64):
+            middle = 0.5 * (low + high)
+            if np.linalg.norm(profile(np.array(middle)) - start) < step:
+                low = middle
+            else:
+                high = middle
+        knots.append(knots[-1] + step)
+        lengths.append(0.5 * (low + high))
+    t = np.where(s <= knots[0], s, np.interp(s, knots, lengths))
+    out, height = profile(t).T
     planar = np.stack([u, v], axis=1) + ((out - s)[:, None] * normal[None, :])
     c, s_yaw = np.cos(layout["yaw"]), np.sin(layout["yaw"])
     x = layout["center_xy"][0] + c * planar[:, 0] - s_yaw * planar[:, 1]
