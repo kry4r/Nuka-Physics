@@ -2500,6 +2500,9 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
     if (LaunchWork(CachePointIncidenceJacobiansKernel,
             p->total_particle_count + p->total_grid_count, kThreads / 32u, stream,
             data, *p, s) != cudaSuccess) return Status::Failed;
+    if ((p->total_body_count > 0u || p->articulation_count > 0u) &&
+        LaunchWork(CacheDenseIncidenceBoundsKernel, s.incidence_capacity, kThreads, stream, data, *p, s) != cudaSuccess)
+        return Status::Failed;
     if (p->total_particle_count > 0u &&
         (!clear(s.coarse_row_count, sizeof(uint32_t)) ||
          (s.rows > 0u && cub::DeviceSelect::Flagged(s.coarse_select, s.coarse_select_bytes,

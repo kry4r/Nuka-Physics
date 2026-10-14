@@ -11,10 +11,13 @@ constexpr double kDenseLineSearchTolerance = 1.0e-6;
 // Gradients and steps within this many float roundings of their terms are converged.
 constexpr float kDenseRoundings = 8.0f;
 
-// Dense owners keep each incidence's row move and step in the point Jacobian columns, which only
-// point owners otherwise use.
+// Dense owners keep each incidence's row move, step, Jacobian bound, parked slack and working list
+// entry in the point Jacobian columns, which only point owners otherwise use.
 constexpr uint32_t kDenseMoveColumn = 0u;
 constexpr uint32_t kDenseStepColumn = 3u;
+constexpr uint32_t kDenseBoundColumn = 6u;
+constexpr uint32_t kDenseSlackColumn = 7u;
+constexpr uint32_t kDenseRowsColumn = 8u;
 
 __device__ Vec3 LoadIncidenceVec3(BlockScratch s, size_t at, uint32_t column) {
     const float* value = s.point_jacobian + uint64_t{column} * s.incidence_capacity + at;
@@ -26,6 +29,41 @@ __device__ void StoreIncidenceVec3(BlockScratch s, size_t at, uint32_t column, V
     value[0] = v.x;
     value[s.incidence_capacity] = v.y;
     value[2u * s.incidence_capacity] = v.z;
+}
+
+__device__ float& DenseIncidenceScalar(BlockScratch s, size_t at, uint32_t column) {
+    return s.point_jacobian[uint64_t{column} * s.incidence_capacity + at];
+}
+
+__device__ uint32_t* DenseRows(BlockScratch s) {
+    return reinterpret_cast<uint32_t*>(s.point_jacobian + uint64_t{kDenseRowsColumn} * s.incidence_capacity);
+}
+
+// Each dense incidence's normal Jacobian 1-norm, which bounds its row move by the block's largest
+// velocity change.
+__global__ void CacheDenseIncidenceBoundsKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    const uint32_t first = p.total_particle_count;
+    const uint32_t last = first + p.total_body_count + p.articulation_count;
+    const uint64_t end = s.offsets[last];
+    for (uint64_t at = s.offsets[first] + uint64_t{blockIdx.x} * blockDim.x + threadIdx.x; at < end;
+         at += uint64_t{gridDim.x} * blockDim.x) {
+        uint32_t owner = first, above = last;
+        while (above - owner > 1u) {
+            const uint32_t middle = owner + (above - owner) / 2u;
+            if (s.offsets[middle] <= at) owner = middle;
+            else above = middle;
+        }
+        const uint32_t slot = s.incidence[at];
+        double bound = 0.0;
+        if (owner < first + p.total_body_count) {
+            for (uint32_t dof = 0u; dof < kRigidBlockDof; ++dof)
+                bound += fabsf(RigidJacobian(data, slot, owner - first, dof));
+        } else {
+            for (uint32_t dof = 0u; dof < p.max_dof; ++dof)
+                bound += fabsf(ArticulationJacobian(data, p, slot, owner - first - p.total_body_count, dof));
+        }
+        DenseIncidenceScalar(s, at, kDenseBoundColumn) = static_cast<float>(bound);
+    }
 }
 
 // Every thread receives the CTA sums, added in warp order.
@@ -77,7 +115,8 @@ __device__ void MaxDenseBlock2(float* a, float* b) {
 // velocity; `converged` reports every |g_i| within rounding of the terms that form it.
 template <typename Block>
 __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
-                                   BlockScratch s, double* gradient, double* inertia, bool* converged) {
+                                   BlockScratch s, uint32_t working, double* gradient, double* inertia,
+                                   bool* converged) {
     constexpr uint32_t kMaxDof = Block::kMaxDof;
     constexpr uint32_t kEntries = (kMaxDof * (kMaxDof + 1u) / 2u + kThreads - 1u) / kThreads;
     static_assert(kMaxDof <= kThreads && kMaxDof <= 0xffffu);
@@ -117,10 +156,10 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
         }
         force = -inertial;
     }
-    for (uint32_t first = b.begin; first < b.end; first += kDenseTileRows) {
-        const uint32_t count = min(kDenseTileRows, b.end - first);
+    for (uint32_t first = 0u; first < working; first += kDenseTileRows) {
+        const uint32_t count = min(kDenseTileRows, working - first);
         if (threadIdx.x < count) {
-            const size_t at = size_t{first} + threadIdx.x;
+            const size_t at = DenseRows(s)[size_t{b.begin} + first + threadIdx.x];
             const uint32_t slot = s.incidence[at];
             const LocalTerm term = LoadLocalTerm(data, p, s, slot, ~0u, true);
             const Vec3 move = LoadIncidenceVec3(s, at, kDenseMoveColumn);
@@ -205,7 +244,8 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
 // CTA then adds in warp order, so the assembly scales with the rows instead of a 32-row tile.
 template <typename Block>
 __device__ bool AssembleSmallDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
-                                        BlockScratch s, double* gradient, double* inertia, bool* converged) {
+                                        BlockScratch s, uint32_t working, double* gradient, double* inertia,
+                                        bool* converged) {
     constexpr uint32_t kMaxDof = Block::kMaxDof;
     constexpr uint32_t kPairs = kMaxDof * (kMaxDof + 1u) / 2u;
     constexpr uint32_t kSums = kPairs + 2u * kMaxDof;
@@ -215,7 +255,8 @@ __device__ bool AssembleSmallDenseBlock(const Block& b, DataView data, BlockDesc
     const uint32_t n = b.dimension;
     const float* u = b.velocity;
     double sums[kSums] = {};
-    for (size_t at = size_t{b.begin} + threadIdx.x; at < b.end; at += blockDim.x) {
+    for (uint32_t item = threadIdx.x; item < working; item += blockDim.x) {
+        const size_t at = DenseRows(s)[size_t{b.begin} + item];
         const uint32_t slot = s.incidence[at];
         const LocalTerm term = LoadLocalTerm(data, p, s, slot, ~0u, true);
         const Vec3 move = LoadIncidenceVec3(s, at, kDenseMoveColumn);
@@ -299,7 +340,7 @@ __device__ bool AssembleSmallDenseBlock(const Block& b, DataView data, BlockDesc
 // w_j = J_j d for every incidence; a row group of lanes sums each row.
 template <typename Block>
 __device__ void StoreDenseRowSteps(const Block& b, DataView data, BlockDescentSolveParams p,
-                                   BlockScratch s) {
+                                   BlockScratch s, uint32_t working) {
     const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
     const uint32_t lane = threadIdx.x % warpSize;
     const uint32_t warp = threadIdx.x / warpSize;
@@ -308,11 +349,13 @@ __device__ void StoreDenseRowSteps(const Block& b, DataView data, BlockDescentSo
     const uint32_t groups = warpSize / width;
     const uint32_t group = lane / width;
     const uint32_t group_lane = lane % width;
-    for (size_t row_begin = size_t{b.begin} + warp; row_begin < b.end; row_begin += size_t{warps} * groups) {
-        const size_t at = row_begin + size_t{group} * warps;
-        const bool valid = at < b.end;
+    for (uint32_t row_begin = warp; row_begin < working; row_begin += warps * groups) {
+        const uint32_t item = row_begin + group * warps;
+        const bool valid = item < working;
+        size_t at = 0u;
         uint32_t slot = 0u, axes = 0u, stride = 0u;
         if (valid) {
+            at = DenseRows(s)[size_t{b.begin} + item];
             slot = s.incidence[at];
             const NkRow head = rows[slot];
             axes = (head.flags & nk::nk_row_flags::kBlockNormal) != 0u ? 3u : 1u;
@@ -335,11 +378,12 @@ __device__ void StoreDenseRowSteps(const Block& b, DataView data, BlockDescentSo
 // the terms whose roundings the slope carries.
 template <typename Block>
 __device__ void DenseLineDerivatives(const Block& b, DataView data, BlockDescentSolveParams p,
-                                     BlockScratch s, double alpha, double inertial_slope,
+                                     BlockScratch s, uint32_t working, double alpha, double inertial_slope,
                                      double inertial_curvature, double* slope, double* curvature,
                                      double* magnitude) {
     double row_slope = 0.0, row_curvature = 0.0, row_magnitude = 0.0;
-    for (size_t at = size_t{b.begin} + threadIdx.x; at < b.end; at += blockDim.x) {
+    for (uint32_t item = threadIdx.x; item < working; item += blockDim.x) {
+        const size_t at = DenseRows(s)[size_t{b.begin} + item];
         const LocalTerm term = LoadLocalTerm(data, p, s, s.incidence[at], ~0u, true);
         const Vec3 move = LoadIncidenceVec3(s, at, kDenseMoveColumn);
         const Vec3 step = LoadIncidenceVec3(s, at, kDenseStepColumn);
@@ -369,15 +413,18 @@ __device__ void DenseLineDerivatives(const Block& b, DataView data, BlockDescent
 // the local objective is convex. Returns the accepted scale, or 0 when the step does not descend.
 template <typename Block>
 __device__ double SearchDenseLine(const Block& b, DataView data, BlockDescentSolveParams p,
-                                  BlockScratch s, double inertial_slope, double inertial_curvature) {
+                                  BlockScratch s, uint32_t working, double inertial_slope,
+                                  double inertial_curvature) {
     double slope = 0.0, curvature = 0.0, magnitude = 0.0;
-    DenseLineDerivatives(b, data, p, s, 0.0, inertial_slope, inertial_curvature, &slope, &curvature, &magnitude);
+    DenseLineDerivatives(b, data, p, s, working, 0.0, inertial_slope, inertial_curvature, &slope, &curvature,
+                         &magnitude);
     const double initial = slope;
     if (!(initial < 0.0)) return 0.0;
     double low = 0.0, high = 0.0, alpha = 1.0;
     bool bounded = false;
     for (uint32_t step = 0u; step < kDenseLineSearchSteps; ++step) {
-        DenseLineDerivatives(b, data, p, s, alpha, inertial_slope, inertial_curvature, &slope, &curvature, &magnitude);
+        DenseLineDerivatives(b, data, p, s, working, alpha, inertial_slope, inertial_curvature, &slope, &curvature,
+                             &magnitude);
         if (!isfinite(slope) || !isfinite(curvature)) {
             high = alpha;
             bounded = true;
@@ -399,27 +446,118 @@ __device__ double SearchDenseLine(const Block& b, DataView data, BlockDescentSol
     return low;
 }
 
-// Leaves the block's final velocity in b.velocity (compact coordinates); returns the first failure.
+// Lists the flagged incidences of a CTA-wide chunk from `base` in thread order; returns their number.
+__device__ uint32_t AppendDenseRows(BlockScratch s, size_t base, bool flag, size_t at) {
+    __shared__ uint32_t warp_count[32];
+    const uint32_t lane = threadIdx.x % warpSize;
+    const uint32_t warp = threadIdx.x / warpSize;
+    const uint32_t ballot = __ballot_sync(~0u, flag);
+    if (lane == 0u) warp_count[warp] = __popc(ballot);
+    __syncthreads();
+    uint32_t before = 0u, total = 0u;
+    for (uint32_t w = 0u; w < blockDim.x / warpSize; ++w) {
+        before += w < warp ? warp_count[w] : 0u;
+        total += warp_count[w];
+    }
+    if (flag) DenseRows(s)[base + before + __popc(ballot & ((1u << lane) - 1u))] = static_cast<uint32_t>(at);
+    __syncthreads();
+    return total;
+}
+
+// The row move a dense row must exceed before its impulse leaves a zero bound, while its friction has
+// no normal bound; 0 when the row may act at once.
+__device__ float DenseRowSlack(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t slot) {
+    const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, true);
+    if (t.contact && !(t.normal_bound <= 0.0f)) return 0.0f;
+    if (t.penalty <= 0.0f) return INFINITY;
+    const double k = t.response.residual_scale;
+    const double x = t.response.dual_scale * t.dual.x + k * t.residual.x;
+    if (t.lower == 0.0f && x < 0.0) return static_cast<float>(-x / k);
+    if (t.upper == 0.0f && x > 0.0) return static_cast<float>(x / k);
+    return 0.0f;
+}
+
+// Rows with a slack wait outside the Newton working set, which lists the other rows in order with
+// zero moves; returns its size.
 template <typename Block>
-__device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
-                                                   BlockScratch s) {
+__device__ uint32_t ParkDenseRows(const Block& b, DataView data, BlockDescentSolveParams p, BlockScratch s) {
+    uint32_t working = 0u;
+    for (size_t first = b.begin; first < b.end; first += blockDim.x) {
+        const size_t at = first + threadIdx.x;
+        bool work = false;
+        if (at < b.end) {
+            const float slack = DenseRowSlack(data, p, s, s.incidence[at]);
+            work = !(slack > 0.0f);
+            DenseIncidenceScalar(s, at, kDenseSlackColumn) = work ? 0.0f : slack;
+            if (work) StoreIncidenceVec3(s, at, kDenseMoveColumn, {});
+        }
+        working += AppendDenseRows(s, size_t{b.begin} + working, work, at);
+    }
+    __syncthreads();
+    return working;
+}
+
+// Parked rows whose bounded move reaches their slack are evaluated at the block's velocity change and
+// join the working set when they act; returns whether any joined.
+template <typename Block>
+__device__ bool WakeDenseRows(const Block& b, DataView data, BlockDescentSolveParams p, BlockScratch s,
+                              uint32_t* working) {
+    const auto* rows = reinterpret_cast<const NkRow*>(data.urows);
+    float change = 0.0f, unused = 0.0f;
+    for (uint32_t i = threadIdx.x; i < b.dimension; i += blockDim.x)
+        change = fmaxf(change, fabsf(b.velocity[i] - b.Snapshot(i)));
+    MaxDenseBlock2(&change, &unused);
+    const uint32_t before = *working;
+    for (size_t first = b.begin; first < b.end; first += blockDim.x) {
+        const size_t at = first + threadIdx.x;
+        bool wake = false;
+        if (at < b.end) {
+            const float slack = DenseIncidenceScalar(s, at, kDenseSlackColumn);
+            const double reach = static_cast<double>(DenseIncidenceScalar(s, at, kDenseBoundColumn)) * change *
+                (1.0 + kDenseRoundings * FLT_EPSILON);
+            if (slack > 0.0f && !(reach < slack)) {
+                const uint32_t slot = s.incidence[at];
+                const LocalTerm term = LoadLocalTerm(data, p, s, slot, ~0u, true);
+                const uint32_t stride = rows[slot].group_normal_count;
+                double move[3] = {};
+                for (uint32_t axis = 0u; axis < (term.contact ? 3u : 1u); ++axis)
+                    for (uint32_t i = 0u; i < b.dimension; ++i)
+                        move[axis] += static_cast<double>(b.Jacobian(data, p, slot + axis * stride, i)) *
+                                      (static_cast<double>(b.velocity[i]) - b.Snapshot(i));
+                const Vec3 row_move{static_cast<float>(move[0]), static_cast<float>(move[1]),
+                                    static_cast<float>(move[2])};
+                Vec3 f{};
+                SymmetricMat3 c{};
+                EvaluateAugmentedResponse(term, row_move, &f, &c);
+                wake = f.x != 0.0f || c.xx != 0.0f;
+                if (wake) {
+                    StoreIncidenceVec3(s, at, kDenseMoveColumn, row_move);
+                    DenseIncidenceScalar(s, at, kDenseSlackColumn) = 0.0f;
+                }
+            }
+        }
+        *working += AppendDenseRows(s, size_t{b.begin} + *working, wake, at);
+    }
+    return *working > before;
+}
+
+// Newton steps with an exact line search over the working rows from b.velocity; returns the first failure.
+template <typename Block>
+__device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
+                                                  BlockScratch s, uint32_t working) {
     constexpr uint32_t kMaxDof = Block::kMaxDof;
     __shared__ double gradient[kMaxDof];
     __shared__ double inertia[kMaxDof];
     const uint32_t n = b.dimension;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) b.velocity[i] = b.Snapshot(i);
-    for (size_t at = size_t{b.begin} + threadIdx.x; at < b.end; at += blockDim.x)
-        StoreIncidenceVec3(s, at, kDenseMoveColumn, {});
-    __syncthreads();
     nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
     double first_decrement = 0.0;
     for (uint32_t step = 0u; step < kDenseNewtonSteps; ++step) {
         bool converged = false;
         bool assembled = false;
         if constexpr (kMaxDof <= kRigidBlockDof)
-            assembled = AssembleSmallDenseBlock(b, data, p, s, gradient, inertia, &converged);
+            assembled = AssembleSmallDenseBlock(b, data, p, s, working, gradient, inertia, &converged);
         else
-            assembled = AssembleDenseBlock(b, data, p, s, gradient, inertia, &converged);
+            assembled = AssembleDenseBlock(b, data, p, s, working, gradient, inertia, &converged);
         if (!assembled) {
             failure = nk::BlockSolveFailure::InvalidEquation;
             break;
@@ -447,9 +585,9 @@ __device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data
         if (!(decrement > 0.0)) break;
         if (step == 0u) first_decrement = decrement;
         else if (decrement <= kDenseDecrementRatio * first_decrement) break;
-        StoreDenseRowSteps(b, data, p, s);
+        StoreDenseRowSteps(b, data, p, s, working);
         __syncthreads();
-        const double alpha = SearchDenseLine(b, data, p, s, inertial_slope, inertial_curvature);
+        const double alpha = SearchDenseLine(b, data, p, s, working, inertial_slope, inertial_curvature);
         float largest_step = 0.0f, largest_value = 0.0f;
         bool finite = true;
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
@@ -467,7 +605,8 @@ __device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data
         if (!(alpha > 0.0)) break;
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x)
             b.velocity[i] = static_cast<float>(static_cast<double>(b.velocity[i]) + alpha * b.direction[i]);
-        for (size_t at = size_t{b.begin} + threadIdx.x; at < b.end; at += blockDim.x) {
+        for (uint32_t item = threadIdx.x; item < working; item += blockDim.x) {
+            const size_t at = DenseRows(s)[size_t{b.begin} + item];
             const Vec3 move = LoadIncidenceVec3(s, at, kDenseMoveColumn);
             const Vec3 row_step = LoadIncidenceVec3(s, at, kDenseStepColumn);
             StoreIncidenceVec3(s, at, kDenseMoveColumn, {static_cast<float>(move.x + alpha * row_step.x),
@@ -478,5 +617,17 @@ __device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data
         if (largest_step <= kDenseRoundings * FLT_EPSILON * largest_value) break;
     }
     __syncthreads();
+    return failure;
+}
+
+// Leaves the block's final velocity in b.velocity (compact coordinates); returns the first failure.
+template <typename Block>
+__device__ nk::BlockSolveFailure DescendDenseBlock(const Block& b, DataView data, BlockDescentSolveParams p,
+                                                   BlockScratch s) {
+    for (uint32_t i = threadIdx.x; i < b.dimension; i += blockDim.x) b.velocity[i] = b.Snapshot(i);
+    uint32_t working = ParkDenseRows(b, data, p, s);
+    nk::BlockSolveFailure failure = nk::BlockSolveFailure::None;
+    do failure = NewtonDenseBlock(b, data, p, s, working);
+    while (failure == nk::BlockSolveFailure::None && WakeDenseRows(b, data, p, s, &working));
     return failure;
 }
