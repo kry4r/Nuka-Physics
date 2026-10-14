@@ -291,7 +291,9 @@ enum class FieldId : uint16_t {
     ParticleSurfaceVertexTriangleOffsets,  // particle_surface_vertex_triangle_offsets (per:scalar arena:persistent owner:model count:particles_per_env+1)
     ParticleSurfaceVertexTriangles,  // particle_surface_vertex_triangles (per:scalar arena:persistent owner:model count:particle_surface_triangles*3)
     ParticleSurfaceThickness,  // particle_surface_thickness (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
-    ParticleSurfaceFriction,  // particle_surface_friction (per:scalar arena:persistent owner:model count:particle_surfaces_per_env)
+    ParticleHalfThickness,  // particle_half_thickness (per:scalar arena:persistent owner:model count:particles_per_env)
+    ParticleFriction,  // particle_friction (per:scalar arena:persistent owner:model count:particles_per_env)
+    ParticleRestPos,  // particle_rest_pos (per:scalar arena:persistent owner:model count:particles_per_env)
     ParticleSurfaceNodes,  // particle_surface_nodes (per:scalar arena:scratch owner:data count:particle_surface_nodes_per_env*env_count)
     ParticleSurfaceEdgeNodes,  // particle_surface_edge_nodes (per:scalar arena:scratch owner:data count:particle_surface_edge_nodes_per_env*env_count)
     PointEndpointRanges,  // point_endpoint_ranges (per:scalar arena:scratch owner:data count:point_endpoints_per_env*env_count flags:[readout])
@@ -686,7 +688,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "particle_surface_vertex_triangle_offsets",
     "particle_surface_vertex_triangles",
     "particle_surface_thickness",
-    "particle_surface_friction",
+    "particle_half_thickness",
+    "particle_friction",
+    "particle_rest_pos",
     "particle_surface_nodes",
     "particle_surface_edge_nodes",
     "point_endpoint_ranges",

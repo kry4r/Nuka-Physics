@@ -305,7 +305,9 @@ inline constexpr DlpackRow kDlpackTable[kFieldCount] = {
     {FieldId::ParticleSurfaceVertexTriangleOffsets, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_triangle_offsets
     {FieldId::ParticleSurfaceVertexTriangles, DlpackDtype::kU32, 1, false},  // particle_surface_vertex_triangles
     {FieldId::ParticleSurfaceThickness, DlpackDtype::kF32, 1, false},  // particle_surface_thickness
-    {FieldId::ParticleSurfaceFriction, DlpackDtype::kF32, 1, false},  // particle_surface_friction
+    {FieldId::ParticleHalfThickness, DlpackDtype::kF32, 1, false},  // particle_half_thickness
+    {FieldId::ParticleFriction, DlpackDtype::kF32, 1, false},  // particle_friction
+    {FieldId::ParticleRestPos, DlpackDtype::kF32, 2, false},  // particle_rest_pos
     {FieldId::ParticleSurfaceNodes, DlpackDtype::kU8, 2, false},  // particle_surface_nodes
     {FieldId::ParticleSurfaceEdgeNodes, DlpackDtype::kU8, 2, false},  // particle_surface_edge_nodes
     {FieldId::PointEndpointRanges, DlpackDtype::kU8, 2, true},  // point_endpoint_ranges

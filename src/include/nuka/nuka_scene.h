@@ -443,6 +443,26 @@ nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media
                                        const nuka_mpm_fill_desc_t* desc,
                                        const nuka_mpm_plasticity_desc_t* plasticity);
 
+// One cloth region: listed vertices take its contact half thickness, friction and particle mass;
+// faces with all three vertices listed take its density and moduli. Later regions win.
+typedef struct nuka_cloth_region_desc_t {
+    const uint32_t* vertices;
+    uint32_t vertex_count;
+    float    particle_mass;
+    float    surface_density;
+    float    half_thickness;
+    float    friction;
+    float    stretch_stiffness;
+    float    poisson;
+    float    bend_stiffness;
+    float    damping;
+} nuka_cloth_region_desc_t;
+
+// Append a region to the cloth medium `media_id`. INVALID_ARG on a NULL desc or vertex list, or a
+// non-cloth medium; vertex range and material checks run at cook.
+nuka_result_t nuka_scene_add_cloth_region(nuka_scene_handle scene, uint32_t media_id,
+                                          const nuka_cloth_region_desc_t* desc);
+
 // The environment-wide contact pool has no per-node limit; zero uses the cook default.
 nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,
                                                   uint32_t media_id, uint32_t capacity);

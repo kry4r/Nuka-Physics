@@ -74,6 +74,8 @@ nk::Model BuildMpmModel(const Vec3& seed_vel, bool escape = false) {
     }
     mp.initial_vol0.assign(n, kDx * kDx * kDx);
     mp.initial_material_id.assign(n, 0u);
+    mp.half_thickness.assign(n, 0.0f);
+    mp.friction.assign(n, 0.0f);
 
     nk::MpmMaterial mat;  // one elastic material with recognizable nonzero values.
     mat.youngs = 1.0e4f; mat.poisson = 0.3f; mat.density = 1000.0f;
@@ -290,6 +292,8 @@ TEST(MpmTransferRoundtrip, StressedTransferConservesLinearAndAngularMomentum) {
     particles.inv_mass.assign(count, 1.0f);
     particles.initial_vol0.assign(count, kDx * kDx * kDx);
     particles.initial_material_id.assign(count, 0u);
+    particles.half_thickness.assign(count, 0.0f);
+    particles.friction.assign(count, 0.0f);
     particles.initial_F.assign(count * 9u, 0.0f);
     model.capacities.particles_per_env = count;
     std::vector<float> affine(count * 9u, 0.0f);

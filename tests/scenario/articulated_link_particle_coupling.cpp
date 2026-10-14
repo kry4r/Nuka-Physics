@@ -120,9 +120,11 @@ cook::VbdCookInput BuildCloth(float cx, float cy, float z) {
     for (uint32_t c : {idx(0, 0), idx(last, 0), idx(0, last), idx(last, last)}) {
         in.inv_mass[c] = 0.0f;
     }
-    soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
+    soft::BuildClothVertexBlocks(rest, tris, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
+                                 in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
-    in.friction = 0.6f;
+    in.half_thickness.assign(rest.size(), 0.0f);
+    in.friction.assign(rest.size(), 0.6f);
     return in;
 }
 

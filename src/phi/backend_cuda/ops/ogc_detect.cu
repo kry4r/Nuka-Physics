@@ -69,11 +69,9 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
                                     const DataView& data, const OgcCandidate& c) {
     const uint32_t item = c.item;
     const uint32_t env = item / p.particles_per_env;
-    const uint32_t source_surface = c.source_surface, target_surface = c.target_surface;
+    const uint32_t target_surface = c.target_surface;
     const auto view = OgcParticleView(p, model, data, env);
     const auto target_info = model.particle_surface_info[target_surface];
-    const float radius = model.particle_surface_thickness[source_surface] +
-                         model.particle_surface_thickness[target_surface];
     const math::Vec3 source = data.particle_pos[item];
     const float query = c.query;
     const uint32_t triangle = c.target;
@@ -85,6 +83,19 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
         triangle, source, query);
     if (!(feature.feasible && feature.owner_triangle == triangle &&
           feature.distance <= query && feature.distance > 0.0f)) return;
+    const uint32_t source_local = item - env * p.particles_per_env;
+    const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
+    const auto face = OgcParticleFaceMaterial(model, view, target_info, triangle, feature.barycentric);
+    const float radius = model.particle_half_thickness[source_local] + face.half_thickness;
+    if (c.source_surface == target_surface) {
+        // Features of one surface already within their contact distance at rest are neighbours, not contacts.
+        math::Vec3 rest[3];
+        for (uint32_t j = 0u; j < 3u; ++j)
+            rest[j] = model.particle_rest_pos[target_info.vertex_offset + view.triangles[tri_at + j]];
+        const math::Vec3 source_rest = model.particle_rest_pos[source_local];
+        if ((collision::ClosestTrianglePoint(source_rest, rest[0], rest[1], rest[2]).point - source_rest)
+                .LengthSq() < radius * radius) return;
+    }
     const uint32_t ordinal = OgcClaimSlot(p, data, env);
     if (ordinal >= p.slot_capacity) {
         atomicOr(data.env_status + env, kEnvStatusPairOverflow);
@@ -96,7 +107,6 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
                               ordinal * 2u + 1u;
     const uint32_t first = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
                            ordinal * 6u + 3u;
-    const size_t tri_at = (size_t{target_info.triangle_offset} + triangle) * 3u;
     const float weights[3] = {feature.barycentric.x, feature.barycentric.y,
                               feature.barycentric.z};
     for (uint32_t j = 0u; j < 3u; ++j) {
@@ -120,9 +130,7 @@ __device__ void OgcEmitParticleFace(const OgcDetectParams& p, const ModelView& m
     data.ucontact_b_kind[at] = nk::kUContactSidePointEndpoint;
     data.ucontact_gen[at] = 1u;
     data.ucontact_law[slot] = nk::kContactLawSpeculative;
-    data.ucontact_friction[slot] = fmaxf(
-        model.particle_surface_friction[source_surface],
-        model.particle_surface_friction[target_surface]);
+    data.ucontact_friction[slot] = fmaxf(model.particle_friction[source_local], face.friction);
     nk::CanonicalContactDescriptor descriptor;
     descriptor.a.type = constraint::CollidableType::Particle;
     descriptor.a.handle = item;
@@ -154,8 +162,6 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     const uint32_t target_edge = c.target;
     const auto edge_a = model.particle_surface_edges[local_edge];
     const auto edge_b = model.particle_surface_edges[target_edges.edge_offset + target_edge];
-    const float radius = model.particle_surface_thickness[source_surface] +
-                         model.particle_surface_thickness[target_surface];
     const float query = c.query;
     const collision::MeshVertexIncidence incidence{
         model.particle_surface_vertex_edge_offsets, model.particle_surface_vertex_edges};
@@ -166,6 +172,23 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     if (!(pair.feasible && pair.owner_edge_a == source_edge &&
           pair.owner_edge_b == target_edge &&
           pair.distance <= query && pair.distance > 0.0f)) return;
+    const uint32_t vertices_a[2] = {edge_a.vertex0, edge_a.vertex1};
+    const uint32_t vertices_b[2] = {edge_b.vertex0, edge_b.vertex1};
+    // Each edge's thickness and friction interpolate its vertices at its witness point.
+    float radius = 0.0f, mu_a = 0.0f, mu_b = 0.0f;
+    for (uint32_t j = 0u; j < 2u; ++j) {
+        const float weight_a = j == 0u ? 1.0f - pair.weight_a : pair.weight_a;
+        const float weight_b = j == 0u ? 1.0f - pair.weight_b : pair.weight_b;
+        radius += weight_a * model.particle_half_thickness[source_info.vertex_offset + vertices_a[j]] +
+                  weight_b * model.particle_half_thickness[target_info.vertex_offset + vertices_b[j]];
+    }
+    if (source_surface == target_surface) {
+        const auto* rest = model.particle_rest_pos;
+        const auto at_rest = collision::OgcClosestSegments(
+            rest[source_info.vertex_offset + vertices_a[0]], rest[source_info.vertex_offset + vertices_a[1]],
+            rest[target_info.vertex_offset + vertices_b[0]], rest[target_info.vertex_offset + vertices_b[1]]);
+        if ((at_rest.a - at_rest.b).LengthSq() < radius * radius) return;
+    }
     const uint32_t ordinal = OgcClaimSlot(p, data, env);
     if (ordinal >= p.slot_capacity) {
         atomicOr(data.env_status + env, kEnvStatusPairOverflow);
@@ -179,19 +202,17 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     const uint32_t first_a = env * p.point_endpoint_terms_per_env + p.point_endpoint_term_first +
                              ordinal * 6u;
     const uint32_t first_b = first_a + 3u;
-    const uint32_t vertices_a[2] = {edge_a.vertex0, edge_a.vertex1};
-    const uint32_t vertices_b[2] = {edge_b.vertex0, edge_b.vertex1};
     for (uint32_t j = 0u; j < 2u; ++j) {
-        const uint32_t particle_a = env * p.particles_per_env +
-            source_info.vertex_offset + vertices_a[j];
-        const uint32_t particle_b = env * p.particles_per_env +
-            target_info.vertex_offset + vertices_b[j];
-        data.point_endpoint_terms[first_a + j] =
-            nk::WeightedPointEndpointTerm(nk::kNkSideParticle,
-                particle_a, j == 0u ? 1.0f - pair.weight_a : pair.weight_a);
-        data.point_endpoint_terms[first_b + j] =
-            nk::WeightedPointEndpointTerm(nk::kNkSideParticle,
-                particle_b, j == 0u ? 1.0f - pair.weight_b : pair.weight_b);
+        const uint32_t local_a = source_info.vertex_offset + vertices_a[j];
+        const uint32_t local_b = target_info.vertex_offset + vertices_b[j];
+        const float weight_a = j == 0u ? 1.0f - pair.weight_a : pair.weight_a;
+        const float weight_b = j == 0u ? 1.0f - pair.weight_b : pair.weight_b;
+        mu_a += weight_a * model.particle_friction[local_a];
+        mu_b += weight_b * model.particle_friction[local_b];
+        data.point_endpoint_terms[first_a + j] = nk::WeightedPointEndpointTerm(
+            nk::kNkSideParticle, env * p.particles_per_env + local_a, weight_a);
+        data.point_endpoint_terms[first_b + j] = nk::WeightedPointEndpointTerm(
+            nk::kNkSideParticle, env * p.particles_per_env + local_b, weight_b);
     }
     const uint32_t count_a = nk::CanonicalizePointEndpointTerms(
         data.point_endpoint_terms + first_a, 2u);
@@ -210,9 +231,7 @@ __device__ void OgcEmitParticleEdge(const OgcDetectParams& p, const ModelView& m
     data.ucontact_b_kind[at] = nk::kUContactSidePointEndpoint;
     data.ucontact_gen[at] = 1u;
     data.ucontact_law[slot] = nk::kContactLawSpeculative;
-    data.ucontact_friction[slot] = fmaxf(
-        model.particle_surface_friction[source_surface],
-        model.particle_surface_friction[target_surface]);
+    data.ucontact_friction[slot] = fmaxf(mu_a, mu_b);
     nk::CanonicalContactDescriptor descriptor;
     descriptor.a.type = constraint::CollidableType::ParticleSurface;
     descriptor.a.handle = env * p.surfaces_per_env + source_surface;
@@ -413,7 +432,8 @@ Status OpOgcDetect(const ModelView& model, const DataView& data,
              (p->edges_per_env > 0u && (!model.particle_surface_edges ||
                                        !data.particle_surface_edge_nodes)) ||
              !model.particle_surface_edge_info || !model.particle_surface_thickness ||
-             !model.particle_surface_friction || !data.particle_pos ||
+             !model.particle_half_thickness || !model.particle_friction || !model.particle_rest_pos ||
+             !data.particle_pos ||
              !data.particle_surface_max_speed)) ||
         (mixed && (!model.mesh_surface_info || !model.mesh_edge_info ||
                    !model.mesh_triangles || !model.mesh_bvh_nodes ||

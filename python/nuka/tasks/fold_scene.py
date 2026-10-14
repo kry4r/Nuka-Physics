@@ -19,10 +19,11 @@ def build_scene(device, description, *, dt=1.0 / 600.0, sweeps=512, contact_capa
     scene.add_entity(morphs.NKS(str(path.parent / config["robot"])))
     if not robot_only:
         scene.add_entity(morphs.Grid(cloth["nx"], cloth["ny"], cloth["spacing"],
-                                    origin=tuple(cloth["origin"])),
+                                    origin=tuple(cloth["origin"]), regions=binding_regions(cloth)),
                          materials.Cloth.VBD(areal_density=cloth["density"], friction=cloth["friction"],
                                              stretch_stiffness=cloth["stretch"], poisson=cloth["poisson"],
-                                             bend_stiffness=cloth["bend"], thickness=cloth["thickness"]),
+                                             bend_stiffness=cloth["bend"], damping=cloth["damping"],
+                                             thickness=cloth["thickness"]),
                          surfaces.Cloth(free=True))
         half_extents = tuple(0.5 * value for value in table["size"])
         scene.add_entity(morphs.Box(half_extents, pos=tuple(table["position"]),
@@ -35,6 +36,29 @@ def build_scene(device, description, *, dt=1.0 / 600.0, sweeps=512, contact_capa
     except BaseException:
         world.destroy()
         raise
+
+
+def binding_regions(cloth):
+    """The bound hem: lattice vertices within the binding width of the towel edge take the binding material."""
+    binding = cloth.get("binding")
+    if binding is None:
+        return ()
+    nx, ny = cloth["nx"], cloth["ny"]
+    i, j = np.meshgrid(np.arange(nx), np.arange(ny))
+    rows = np.minimum.reduce([i, nx - 1 - i, j, ny - 1 - j]).ravel()
+    band = np.flatnonzero(rows <= round(binding["width_m"] / cloth["spacing"]))
+    return (morphs.ClothRegion(tuple(int(v) for v in band), materials.Cloth.VBD(
+        areal_density=binding["density"], friction=binding["friction"], stretch_stiffness=binding["stretch"],
+        poisson=cloth["poisson"], bend_stiffness=binding["bend"], damping=cloth["damping"],
+        thickness=binding["thickness"])),)
+
+
+def vertex_half_thickness(cloth):
+    """Contact half thickness per lattice vertex: the towel's, replaced by the last region that lists the vertex."""
+    half = np.full(cloth["nx"] * cloth["ny"], 0.5 * cloth["thickness"])
+    for region in binding_regions(cloth):
+        half[list(region.vertices)] = region.material.half_thickness
+    return half
 
 
 def apply_drives(world, config):

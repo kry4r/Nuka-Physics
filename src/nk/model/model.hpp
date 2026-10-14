@@ -347,8 +347,8 @@ public:
     enum class ParticleMode : uint8_t { None = 0, Vbd = 1, Mpm = 5, MpmVbd = 6 };
     struct ModelParticles {
         ParticleMode mode = ParticleMode::None;
-        // Initial per-particle state (env-major replicated by SeedInitialState;
-        // these are the SINGLE-ENV template, length == particles_per_env).
+        // Single-env initial state, replicated env-major by SeedInitialState; initial_pos is
+        // also the rest shape that self contact excludes neighbours by.
         std::vector<math::Vec3> initial_pos;
         std::vector<math::Vec3> initial_vel;
         std::vector<float>      inv_mass;
@@ -361,7 +361,9 @@ public:
         std::vector<uint32_t> surface_triangle_edges;
         std::vector<uint32_t> surface_triangle_vertex_owner;
         std::vector<float> surface_thickness;
-        std::vector<float> surface_friction;
+        // Per-particle contact half thickness and friction; each surface thickness is the maximum over its vertices.
+        std::vector<float> half_thickness;
+        std::vector<float> friction;
         // MLS-MPM per-particle init (single-env template; replicated env-major).
         // F seeded identity, vol0 from the sampling lattice, material_id indexes
         // mpm_materials. Empty for a non-MPM cook (C is the arena zero default).
@@ -399,8 +401,6 @@ public:
         float    aero_drag_max_dv    = 0.0f;
         // MpmVbd divides grid-owned [0, n_mpm_particles) from row-coupled particles.
         uint32_t n_mpm_particles = 0u;
-        // Body<->particle contact mu, mixed with the body side by solmix=max.
-        float    soft_friction  = 0.6f;
         // Environment-private MPM grid geometry supplies the shared MpmParams.
         math::Vec3 mpm_grid_min{0.0f, 0.0f, 0.0f};
         uint32_t   mpm_grid_dims[3] = {0u, 0u, 0u};

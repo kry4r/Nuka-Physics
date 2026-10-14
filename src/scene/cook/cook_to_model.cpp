@@ -1648,8 +1648,9 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
 
     nk::Model::ModelParticles& mp = model.particles;
     mp.mode = nk::Model::ParticleMode::Vbd;
-    mp.soft_friction = in.friction;  // body<->soft contact mu (solmix=max).
     mp.initial_pos = in.positions;
+    mp.half_thickness = in.half_thickness;
+    mp.friction = in.friction;
     mp.initial_vel = in.velocities;
     mp.inv_mass = in.inv_mass;
     if (mp.initial_vel.size() != mp.initial_pos.size()) {
@@ -1695,18 +1696,15 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
     mp.surface_triangle_edges.clear();
     mp.surface_triangle_vertex_owner.clear();
     mp.surface_thickness.clear();
-    mp.surface_friction.clear();
     for (const auto& surface : in.surfaces) {
         if ((surface.triangles.empty() && surface.edges.empty()) ||
             surface.triangles.size() % 3u != 0u || surface.edges.size() % 2u != 0u ||
-            (!surface.triangles.empty() && !surface.edges.empty()) ||
-            !std::isfinite(surface.half_thickness) || surface.half_thickness < 0.0f ||
-            !std::isfinite(surface.friction) || surface.friction < 0.0f)
+            (!surface.triangles.empty() && !surface.edges.empty()))
             throw std::invalid_argument("invalid deformable collision surface");
         const auto& vertices = surface.triangles.empty() ? surface.edges : surface.triangles;
         const auto bounds = std::minmax_element(vertices.begin(), vertices.end());
         const uint32_t begin = *bounds.first;
-        if (*bounds.second >= mp.initial_pos.size())
+        if (*bounds.second >= mp.initial_pos.size() || *bounds.second >= mp.half_thickness.size())
             throw std::invalid_argument("deformable collision surface has invalid vertex indices");
         const uint32_t count = *bounds.second - begin + 1u;
         const float* positions = reinterpret_cast<const float*>(mp.initial_pos.data() + begin);
@@ -1744,8 +1742,8 @@ void CookVbdParticles(nk::Model& model, uint32_t env_count,
             cooked_edges.triangle_edges.begin(), cooked_edges.triangle_edges.end());
         mp.surface_triangle_vertex_owner.insert(mp.surface_triangle_vertex_owner.end(),
             cooked_edges.triangle_vertex_owner.begin(), cooked_edges.triangle_vertex_owner.end());
-        mp.surface_thickness.push_back(surface.half_thickness);
-        mp.surface_friction.push_back(surface.friction);
+        mp.surface_thickness.push_back(*std::max_element(mp.half_thickness.begin() + begin,
+                                                         mp.half_thickness.begin() + begin + count));
     }
     cap.particle_surfaces_per_env = static_cast<uint32_t>(mp.surface_info.size());
     cap.particle_surface_triangles = static_cast<uint32_t>(mp.surface_triangles.size() / 3u);
@@ -1782,7 +1780,6 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     mp.surface_triangles.clear();
     mp.surface_tree.clear();
     mp.surface_thickness.clear();
-    mp.surface_friction.clear();
     cap.particle_surfaces_per_env = 0u;
     cap.particle_surface_triangles = 0u;
     cap.particle_surface_nodes_per_env = 0u;
@@ -1807,6 +1804,9 @@ void CookMpmParticles(nk::Model& model, uint32_t env_count,
     }
     mp.initial_vol0 = in.vol0;
     if (mp.initial_vol0.size() != n) mp.initial_vol0.assign(n, in.dx * in.dx * in.dx);
+    // Grid-owned points meet bodies through grid rows, never particle contacts.
+    mp.half_thickness.assign(n, 0.0f);
+    mp.friction.assign(n, 0.0f);
 
     // Material validation is shared with direct model creation and device evaluation.
     auto to_material = [](const MpmMaterialInput& mi) {
@@ -1913,6 +1913,8 @@ void ValidateMedia(const std::vector<MediaRecord>& media) {
             throw std::runtime_error(
                 "ValidateMedia: mpm_fills require a box MLS-MPM medium (fluid or granular)");
         }
+        if (!m.cloth_regions.empty() && m.kind != Kind::Cloth)
+            throw std::runtime_error("ValidateMedia: cloth_regions require a cloth medium");
     }
 }
 
@@ -1965,7 +1967,8 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.aero_drag_normal = xp.aero_drag_normal;
     mp.aero_drag_tangent = xp.aero_drag_tangent;
     mp.aero_drag_max_dv = xp.aero_drag_max_dv;
-    mp.soft_friction = xp.soft_friction;
+    mp.half_thickness.insert(mp.half_thickness.end(), xp.half_thickness.begin(), xp.half_thickness.end());
+    mp.friction.insert(mp.friction.end(), xp.friction.begin(), xp.friction.end());
 
     mp.surface_info = xp.surface_info;
     for (auto& info : mp.surface_info) info.vertex_offset += n_mpm;
@@ -1978,7 +1981,6 @@ void CookMpmVbd(nk::Model& model, uint32_t env_count, const MpmCookInput& mpm,
     mp.surface_triangle_edges = xp.surface_triangle_edges;
     mp.surface_triangle_vertex_owner = xp.surface_triangle_vertex_owner;
     mp.surface_thickness = xp.surface_thickness;
-    mp.surface_friction = xp.surface_friction;
     cap.particle_surfaces_per_env = xtmp.capacities.particle_surfaces_per_env;
     cap.particle_surface_triangles = xtmp.capacities.particle_surface_triangles;
     cap.particle_surface_edges_per_env = xtmp.capacities.particle_surface_edges_per_env;
@@ -2183,41 +2185,68 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
     const auto& rest = geometry.rest;
     const auto& tris = geometry.triangles;
     if (rest.empty()) return in;
-    const auto& material = media.vbd;
-    if (!std::isfinite(material.surface_density) || material.surface_density < 0.0f ||
-        !std::isfinite(material.particle_mass) || material.particle_mass < 0.0f ||
-        !std::isfinite(material.half_thickness) || material.half_thickness < 0.0f ||
-        (material.surface_density > 0.0f && material.particle_mass > 0.0f))
-        throw std::invalid_argument("Cloth requires finite nonnegative thickness and one mass definition");
-    if (!(material.stretch_stiffness > 0.0f))
-        throw std::invalid_argument("Cloth requires a positive stretch_stiffness");
-    runtime::soft::ShellMaterial shell;
-    shell.stretch_stiffness = material.stretch_stiffness;
-    shell.poisson = material.poisson;
-    shell.bend_stiffness = material.bend_stiffness;
-    shell.damping = material.damping;
-    runtime::soft::BuildClothVertexBlocks(rest, tris, geometry.material_faces, shell, in.vbd_elements);
+    const bool areal = media.vbd.surface_density > 0.0f;
+    const auto validate = [areal](const MediaVbdMaterial& material) {
+        if (!std::isfinite(material.surface_density) || material.surface_density < 0.0f ||
+            !std::isfinite(material.particle_mass) || material.particle_mass < 0.0f ||
+            !std::isfinite(material.half_thickness) || material.half_thickness < 0.0f ||
+            (material.surface_density > 0.0f && material.particle_mass > 0.0f) ||
+            (material.surface_density > 0.0f) != areal)
+            throw std::invalid_argument("Cloth requires finite nonnegative thickness and one mass definition");
+        if (!(material.stretch_stiffness > 0.0f))
+            throw std::invalid_argument("Cloth requires a positive stretch_stiffness");
+    };
+    validate(media.vbd);
+    // Each vertex and face resolves to the last region that holds it, or to the medium.
+    std::vector<const MediaVbdMaterial*> vertex_material(rest.size(), &media.vbd);
+    std::vector<std::vector<bool>> member(media.cloth_regions.size(), std::vector<bool>(rest.size(), false));
+    for (size_t r = 0u; r < media.cloth_regions.size(); ++r) {
+        const auto& region = media.cloth_regions[r];
+        validate(region.material);
+        for (uint32_t vertex : region.vertices) {
+            if (vertex >= rest.size()) throw std::invalid_argument("Cloth region vertex is out of range");
+            member[r][vertex] = true;
+            vertex_material[vertex] = &region.material;
+        }
+    }
+    std::vector<const MediaVbdMaterial*> face_material(tris.size(), &media.vbd);
+    std::vector<runtime::soft::ShellMaterial> shells(tris.size());
+    for (size_t f = 0u; f < tris.size(); ++f) {
+        for (size_t r = media.cloth_regions.size(); r-- > 0u;)
+            if (member[r][tris[f].v[0]] && member[r][tris[f].v[1]] && member[r][tris[f].v[2]]) {
+                face_material[f] = &media.cloth_regions[r].material;
+                break;
+            }
+        shells[f].stretch_stiffness = face_material[f]->stretch_stiffness;
+        shells[f].poisson = face_material[f]->poisson;
+        shells[f].bend_stiffness = face_material[f]->bend_stiffness;
+        shells[f].damping = face_material[f]->damping;
+    }
+    runtime::soft::BuildClothVertexBlocks(rest, tris, geometry.material_faces, shells, in.vbd_elements);
     in.vbd_begin = 0u;
     in.vbd_count = static_cast<uint32_t>(rest.size());
 
     in.positions = rest;
     CookParticleSurface collision_surface;
-    collision_surface.friction = media.vbd.friction;
-    collision_surface.half_thickness = material.half_thickness;
     for (const auto& tri : tris)
         collision_surface.triangles.insert(collision_surface.triangles.end(), {tri.v[0], tri.v[1], tri.v[2]});
     in.surfaces.push_back(std::move(collision_surface));
     in.velocities.assign(rest.size(), math::Vec3::Zero());
-    std::vector<float> masses(rest.size(), material.particle_mass > 0.0f ? material.particle_mass : 0.01f);
-    if (material.surface_density > 0.0f) {
-        std::fill(masses.begin(), masses.end(), 0.0f);
+    std::vector<float> masses(rest.size(), 0.0f);
+    for (size_t vertex = 0u; vertex < rest.size(); ++vertex) {
+        in.half_thickness.push_back(vertex_material[vertex]->half_thickness);
+        in.friction.push_back(vertex_material[vertex]->friction);
+        if (!areal)
+            masses[vertex] = vertex_material[vertex]->particle_mass > 0.0f ? vertex_material[vertex]->particle_mass : 0.01f;
+    }
+    if (areal) {
         for (size_t i = 0u; i < tris.size(); ++i) {
             const auto& tri = tris[i];
             const auto face = geometry.material_faces.empty()
                 ? std::array<math::Vec3, 3>{rest[tri.v[0]], rest[tri.v[1]], rest[tri.v[2]]}
                 : geometry.material_faces[i];
             const auto a = face[0], b = face[1], c = face[2];
-            const float share = (b-a).Cross(c-a).Length() * (material.surface_density / 6.0f);
+            const float share = (b-a).Cross(c-a).Length() * (face_material[i]->surface_density / 6.0f);
             for (uint32_t vertex : tri.v) masses[vertex] += share;
         }
     }
@@ -2260,7 +2289,6 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
             for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
         }
     }
-    in.friction = media.vbd.friction;
     // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
     // triangles only when active (all-zero coeffs => no op => byte-identical cook).
     in.aero_drag_normal = media.vbd.aero_drag_normal;
@@ -2457,9 +2485,9 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
     rod.damping = media.vbd.damping;
     runtime::soft::BuildRodVertexBlocks(in.positions, chain, rod, in.vbd_elements);
 
+    in.half_thickness.assign(np, c.radius);
+    in.friction.assign(np, media.vbd.friction);
     CookParticleSurface wire;
-    wire.half_thickness = c.radius;
-    wire.friction = media.vbd.friction;
     wire.edges.reserve(size_t(c.segments) * 2u);
     for (uint32_t i = 0u; i < c.segments; ++i) {
         wire.edges.push_back(i);
@@ -2477,6 +2505,8 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
         for (uint32_t k = 0u; k < 8u; ++k) {
             in.positions.push_back(corners[k]);
             in.inv_mass.push_back(1.0f / slab_mass);
+            in.half_thickness.push_back(0.0f);
+            in.friction.push_back(media.vbd.friction);
         }
         for (uint32_t i = 0u; i < 8u; ++i)
             for (uint32_t j = i + 1u; j < 8u; ++j)
@@ -2486,11 +2516,10 @@ VbdCookInput BuildCableVertexBlockInput(const MediaRecord& media) {
         for (uint32_t k = 4u; k < 8u; ++k)  // the 4 top corners (iz == 1).
             in.vbd_elements.push_back(runtime::soft::VertexBlockSpring(end_p, base + k,
                 (corners[k] - in.positions[end_p]).Length(), stiffness, media.vbd.damping));
-        in.surfaces.push_back({CableSlabBoxTriangles(base), 0.0f, media.vbd.friction, {}});
+        in.surfaces.push_back({CableSlabBoxTriangles(base), {}});
     }
 
     in.velocities.assign(in.positions.size(), math::Vec3::Zero());
-    in.friction = media.vbd.friction;
     in.vbd_begin = 0u;
     in.vbd_count = static_cast<uint32_t>(in.positions.size());
     return in;
@@ -2755,6 +2784,8 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
     dst.velocities.insert(dst.velocities.end(), src.velocities.begin(),
                           src.velocities.end());
     dst.inv_mass.insert(dst.inv_mass.end(), src.inv_mass.begin(), src.inv_mass.end());
+    dst.half_thickness.insert(dst.half_thickness.end(), src.half_thickness.begin(), src.half_thickness.end());
+    dst.friction.insert(dst.friction.end(), src.friction.begin(), src.friction.end());
     for (std::array<uint32_t, 3> t : src.aero_triangles) {
         t[0] += base; t[1] += base; t[2] += base;
         dst.aero_triangles.push_back(t);
@@ -2764,9 +2795,8 @@ void AppendSoftMedium(VbdCookInput& dst, const VbdCookInput& src) {
         for (uint32_t& vertex : surface.edges) vertex += base;
         dst.surfaces.push_back(std::move(surface));
     }
-    // The soft slice carries one friction/aero set (per-medium override is the
-    // medium's own); a single soft medium sets them verbatim.
-    dst.friction = src.friction;
+    // The soft slice carries one aero set (per-medium override is the medium's own);
+    // a single soft medium sets it verbatim.
     dst.aero_drag_normal = src.aero_drag_normal;
     dst.aero_drag_tangent = src.aero_drag_tangent;
     dst.aero_drag_max_dv = src.aero_drag_max_dv;

@@ -73,6 +73,8 @@ nk::Model ParticleModel() {
     particles.inv_mass.assign(count, 1.0f);
     particles.initial_vol0.assign(count, 0.001f);
     particles.initial_material_id.assign(count, 0u);
+    particles.half_thickness.assign(count, 0.0f);
+    particles.friction.assign(count, 0.0f);
     particles.mpm_grid_dims[0] = particles.mpm_grid_dims[1] = particles.mpm_grid_dims[2] = 6u;
     particles.mpm_cell_size = 0.1f;
     nk::MpmMaterial material;

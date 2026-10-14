@@ -40,17 +40,17 @@ nk::VbdElement VertexBlockSpring(uint32_t a, uint32_t b, float rest_length, floa
 void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
                             const std::vector<ClothTriangle>& triangles,
                             const std::vector<std::array<math::Vec3, 3>>& material_faces,
-                            const ShellMaterial& material,
+                            const std::vector<ShellMaterial>& materials,
                             std::vector<nk::VbdElement>& out) {
-    if (!FiniteNonnegative(material.stretch_stiffness) || !FiniteNonnegative(material.bend_stiffness) ||
-        !FiniteNonnegative(material.damping) || !std::isfinite(material.poisson) ||
-        material.poisson < 0.0f || material.poisson >= 0.5f)
-        throw std::invalid_argument("Cloth shell material needs nonnegative stiffness and 0 <= poisson < 0.5");
+    if (materials.size() != triangles.size())
+        throw std::invalid_argument("Cloth shell materials must match its triangles");
+    for (const ShellMaterial& material : materials)
+        if (!FiniteNonnegative(material.stretch_stiffness) || !FiniteNonnegative(material.bend_stiffness) ||
+            !FiniteNonnegative(material.damping) || !std::isfinite(material.poisson) ||
+            material.poisson < 0.0f || material.poisson >= 0.5f)
+            throw std::invalid_argument("Cloth shell material needs nonnegative stiffness and 0 <= poisson < 0.5");
     if (!material_faces.empty() && material_faces.size() != triangles.size())
         throw std::invalid_argument("Cloth material faces must match its triangles");
-    const float youngs = material.stretch_stiffness, nu = material.poisson;
-    const float mu = youngs / (2.0f * (1.0f + nu));
-    const float lambda = youngs * nu / (1.0f - nu * nu);
     // Rest edge vectors of each face in its own plane, from the pattern or the 3D rest shape.
     std::vector<float> areas(triangles.size());
     using Edge = std::pair<uint32_t, uint32_t>;
@@ -80,6 +80,7 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
         const float det = u1 * v2 - u2 * v1;
         if (!(std::fabs(det) > 0.0f) || !std::isfinite(det))
             throw std::invalid_argument("Cloth rest triangle is degenerate");
+        const float youngs = materials[f].stretch_stiffness, nu = materials[f].poisson;
         nk::VbdElement e;
         e.kind = nk::kVbdTriangle;
         for (uint32_t j = 0u; j < 3u; ++j) e.vertex[j] = tri.v[j];
@@ -88,21 +89,22 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
         e.rest[2] = -v1 / det;
         e.rest[3] = u1 / det;
         e.rest[4] = areas[f] = 0.5f * std::fabs(det);
-        e.rest[5] = mu;
-        e.rest[6] = lambda;
-        e.damping = material.damping;
+        e.rest[5] = youngs / (2.0f * (1.0f + nu));
+        e.rest[6] = youngs * nu / (1.0f - nu * nu);
+        e.damping = materials[f].damping;
         out.push_back(e);
         for (uint32_t j = 0u; j < 3u; ++j) {
             const uint32_t a = tri.v[j], b = tri.v[(j + 1u) % 3u];
             edge_faces[{std::min(a, b), std::max(a, b)}].push_back({static_cast<uint32_t>(f), j});
         }
     }
-    if (!(material.bend_stiffness > 0.0f)) return;
     // Hinge weight 3 |e|^2 / (A1 + A2) over rest quantities: E = kb (theta - theta0)^2 |e| / h_e.
     for (const auto& entry : edge_faces) {
         if (entry.second.size() != 2u) continue;
         const auto [fa, ca] = entry.second[0];
         const auto [fb, cb] = entry.second[1];
+        const float bend = 0.5f * (materials[fa].bend_stiffness + materials[fb].bend_stiffness);
+        if (!(bend > 0.0f)) continue;
         const ClothTriangle& ta = triangles[fa];
         const ClothTriangle& tb = triangles[fb];
         // Face a runs x0 -> x1 along the edge and face b runs back, so both normals share one sense.
@@ -123,8 +125,8 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
         e.rest[0] = material_faces.empty()
             ? DihedralAngle(rest_positions[x0], rest_positions[x1], rest_positions[x2], rest_positions[x3])
             : 0.0f;
-        e.rest[1] = material.bend_stiffness * 3.0f * edge_len * edge_len / (areas[fa] + areas[fb]);
-        e.damping = material.damping;
+        e.rest[1] = bend * 3.0f * edge_len * edge_len / (areas[fa] + areas[fb]);
+        e.damping = 0.5f * (materials[fa].damping + materials[fb].damping);
         out.push_back(e);
     }
 }

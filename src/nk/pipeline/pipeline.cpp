@@ -763,8 +763,6 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         for (int k = 0; k < 5; ++k) p_assemble_.solimp[k] = model.contact_solimp[k];
         p_assemble_.num_material_buckets = cap.num_material_buckets;
         p_assemble_.particles_per_env = cap.particles_per_env;  // coupling.
-        // Body<->particle contact sides take the particle mu (a particle has no body material).
-        p_assemble_.particle_soft_friction = mp.soft_friction;
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
         p_assemble_.contact_margin = cfg.contact_margin;
         p_assemble_.position_pass =

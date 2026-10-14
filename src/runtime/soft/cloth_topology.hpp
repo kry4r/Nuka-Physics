@@ -28,12 +28,12 @@ struct RodMaterial {
     float damping = 0.0f;
 };
 
-// StVK membrane triangles and one dihedral hinge per interior edge; element indices are mesh vertices.
-// Planar material faces, when given, set the rest metric and a flat rest angle.
+// StVK membrane triangles of per-face materials and one dihedral hinge per interior edge at the
+// mean of its faces; planar material faces, when given, set the rest metric and a flat rest angle.
 void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
                             const std::vector<ClothTriangle>& triangles,
                             const std::vector<std::array<math::Vec3, 3>>& material_faces,
-                            const ShellMaterial& material,
+                            const std::vector<ShellMaterial>& materials,
                             std::vector<nk::VbdElement>& out);
 
 // Axial springs between consecutive chain vertices and a bend over each interior vertex.

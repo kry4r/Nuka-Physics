@@ -385,6 +385,8 @@ TEST(PairDrivenSolve, CookedConcaveAndOpenSurfacesSupportBodiesAndParticles) {
         particle.positions = {{0.1f, 0.08f, initial_height}};
         particle.velocities = {{0, 0, 0}};
         particle.inv_mass = {100.0f};
+        particle.half_thickness = {0.0f};
+        particle.friction = {0.6f};
         cook::CookVbdParticles(model, envs, particle);
         model.particles.pp_contact_d_min = 2.0f * radius;
         const uint32_t bodies = model.capacities.bodies_per_env;

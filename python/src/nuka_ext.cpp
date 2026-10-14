@@ -1489,6 +1489,25 @@ public:
               "nuka_scene_add_mpm_fill_ex");
     }
 
+    // Append a material region to the cloth medium `media_id` over the listed vertices.
+    void add_cloth_region(uint32_t media_id, const std::vector<uint32_t>& vertices,
+                          float particle_mass, float surface_density, float half_thickness,
+                          float friction, float stretch_stiffness, float poisson,
+                          float bend_stiffness, float damping) {
+        nuka_cloth_region_desc_t d{};
+        d.vertices = vertices.data();
+        d.vertex_count = static_cast<uint32_t>(vertices.size());
+        d.particle_mass = particle_mass;
+        d.surface_density = surface_density;
+        d.half_thickness = half_thickness;
+        d.friction = friction;
+        d.stretch_stiffness = stretch_stiffness;
+        d.poisson = poisson;
+        d.bend_stiffness = bend_stiffness;
+        d.damping = damping;
+        check(nuka_scene_add_cloth_region(h_, media_id, &d), "nuka_scene_add_cloth_region");
+    }
+
     // Cook the built scene to a live nk::World on `device` (the SAME cook + record
     // assembly a file scene uses). Returns a nuka.World stepped/read like any other.
     World* build(Device* device, uint32_t env_count, float dt, uint32_t control_mode,
@@ -3096,6 +3115,13 @@ NB_MODULE(_nuka_ext, m) {
              "`spacing`, position_jitter breaking the lattice, with its own "
              "constitutive) to the box MLS-MPM medium `media_id` (the add_media return). "
              "The base bed stays fill 0; the grid AABB grows to the union.")
+        .def("add_cloth_region", &SceneBuilder::add_cloth_region, nb::arg("media_id"),
+             nb::arg("vertices"), nb::arg("particle_mass"), nb::arg("surface_density"),
+             nb::arg("half_thickness"), nb::arg("friction"), nb::arg("stretch_stiffness"),
+             nb::arg("poisson"), nb::arg("bend_stiffness"), nb::arg("damping"),
+             "Append a material region to the cloth medium `media_id`: listed vertices take its "
+             "contact thickness, friction and particle mass; faces with all three vertices listed "
+             "take its density and moduli. Later regions win.")
         .def("build", &SceneBuilder::build, nb::arg("device"),
              nb::arg("env_count") = 1u, nb::arg("dt") = 1.0f / 240.0f,
              nb::arg("control_mode") = 0u, nb::arg("determinism") = 0u,

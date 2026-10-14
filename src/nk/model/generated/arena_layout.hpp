@@ -330,7 +330,9 @@ inline constexpr FieldLayout kFieldLayout[kFieldCount] = {
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_vertex_triangle_offsets
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_vertex_triangles
     {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_thickness
-    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_surface_friction
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_half_thickness
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 1, 4, 0},  // particle_friction
+    {FieldArena::Persistent, FieldOwner::Model, FieldPer::Scalar, 1, 3, 12, 0},  // particle_rest_pos
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 32, 32, 0},  // particle_surface_nodes
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 32, 32, 0},  // particle_surface_edge_nodes
     {FieldArena::Scratch, FieldOwner::Data, FieldPer::Scalar, 1, 8, 8, 0},  // point_endpoint_ranges

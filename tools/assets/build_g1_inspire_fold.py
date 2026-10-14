@@ -224,7 +224,8 @@ def build(args):
         "cloth": {"nx": nx, "ny": ny, "spacing": args.spacing,
                   "origin": [towel["center_xy"][0], towel["center_xy"][1], table_top + args.clearance],
                   "density": 0.4, "stretch": 5000.0, "poisson": 0.3, "bend": 5e-5, "thickness": args.thickness,
-                  "friction": 0.5, "measured_size_m": list(args.towel_size),
+                  "friction": args.towel_friction, "damping": args.towel_damping,
+                  "measured_size_m": list(args.towel_size),
                   "layout": {"center_xy": towel["center_xy"], "yaw": towel["yaw"],
                              "fold_normal": towel["fold"]["normal_towel_frame"], "fold_offset": towel["fold"]["offset"],
                              "base_height_m": table_top + args.clearance, "hinge_radius_m": args.hinge_radius,
@@ -237,6 +238,11 @@ def build(args):
                                          "measure": "sampled Hausdorff distance between the source and cooked "
                                                     "surfaces, both directions; fewest triangles within it"},
         "status": "requires_cook_report_initial_overlap_and_pinch_frame_validation"}
+    if args.binding is not None:
+        width, binding_thickness, density, stretch, bend, friction = args.binding
+        description["cloth"]["binding"] = {"width_m": width, "thickness": binding_thickness, "density": density,
+                                           "stretch": stretch, "bend": bend, "friction": friction,
+                                           "source": "authored estimate, not measured"}
     (args.out / "scene.json").write_text(json.dumps(description, indent=2) + "\n")
     return description
 
@@ -263,6 +269,13 @@ def main():
     parser.add_argument("--table-size", type=float, nargs=3, default=(0.8, 1.2, 0.05),
                         metavar=("DEPTH", "WIDTH", "THICKNESS"))
     parser.add_argument("--table-friction", type=float, default=0.4)
+    parser.add_argument("--towel-friction", type=float, default=0.5)
+    parser.add_argument("--towel-damping", type=float, default=0.01,
+                        help="Rayleigh stiffness damping of the towel and hem elements (s)")
+    parser.add_argument("--binding", type=float, nargs=6, default=None,
+                        metavar=("WIDTH", "THICKNESS", "DENSITY", "STRETCH", "BEND", "FRICTION"),
+                        help="bound hem along the towel edge: width m, total thickness m, areal density kg/m^2, "
+                             "stretch N/m, bend N m and friction")
     parser.add_argument("--hand-kp", type=float, default=20.0)
     parser.add_argument("--hand-kd", type=float, default=0.2)
     parser.add_argument("--pinch-force", type=float, default=2.0)
@@ -280,7 +293,8 @@ def main():
     if not all(np.isfinite(value) and value > 0 for value in (
             args.hand_kp, args.hand_kd, args.pinch_force, args.thumb_tip_force, args.finger_tip_force,
             args.spacing, args.thickness, args.clearance,
-            args.hinge_radius, args.ramp_length, args.layer_gap, *args.towel_size, *args.table_size)):
+            args.hinge_radius, args.ramp_length, args.layer_gap, args.towel_friction, *args.towel_size,
+            *args.table_size, *(args.binding or ()))):
         raise ValueError("Scene and control parameters must be finite and positive")
     if not all(0.0 < limit <= 1e-3 for limit in (args.hand_error_limit, args.body_error_limit)):
         raise ValueError("Collision mesh error limits must lie in (0, 1 mm]")

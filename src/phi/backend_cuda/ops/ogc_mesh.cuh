@@ -3,6 +3,7 @@
 #include "collision/dat_geometry.hpp"
 #include "collision/ogc_geometry.hpp"
 #include "nk/contact/contact_profile.hpp"
+#include "scene/contact_filter.hpp"
 #include "phi/backend_cuda/ops/dat_chain.cuh"
 #include "phi/backend_cuda/ops/prims_types.cuh"
 
@@ -151,9 +152,29 @@ __device__ float OgcBodyFriction(const ModelView& model, const DataView& data,
 
 __device__ float OgcPairFriction(bool source_particle, bool target_particle,
                                  float source_mu, float target_mu) {
-    if (source_particle && !target_particle) return target_mu;
-    if (!source_particle && target_particle) return source_mu;
+    if (source_particle != target_particle) return scene::ParticleBodyFriction(
+        source_particle ? source_mu : target_mu, source_particle ? target_mu : source_mu);
     return fmaxf(source_mu, target_mu);
+}
+
+struct OgcParticleMaterial {
+    float half_thickness = 0.0f;
+    float friction = 0.0f;
+};
+
+// Contact half thickness and friction of a particle face, interpolated at barycentric weights.
+__device__ OgcParticleMaterial OgcParticleFaceMaterial(
+    const ModelView& model, const collision::MeshSurfaceView& view,
+    const collision::MeshSurfaceInfo& info, uint32_t triangle, math::Vec3 weights) {
+    const size_t tri_at = (size_t{info.triangle_offset} + triangle) * 3u;
+    const float w[3] = {weights.x, weights.y, weights.z};
+    OgcParticleMaterial out;
+    for (uint32_t j = 0u; j < 3u; ++j) {
+        const uint32_t local = info.vertex_offset + view.triangles[tri_at + j];
+        out.half_thickness += w[j] * model.particle_half_thickness[local];
+        out.friction += w[j] * model.particle_friction[local];
+    }
+    return out;
 }
 
 __device__ constraint::CollidableRef OgcBodyReference(
@@ -284,9 +305,9 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model,
             const auto info = model.particle_surface_info[s];
             if (local >= info.vertex_offset && local - info.vertex_offset < info.vertex_count) {
                 source_surface = s;
-                source_radius = model.particle_surface_thickness[s];
+                source_radius = model.particle_half_thickness[local];
                 source_speed = data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + s];
-                source_mu = model.particle_surface_friction[s];
+                source_mu = model.particle_friction[local];
                 break;
             }
         }
@@ -376,13 +397,16 @@ __global__ void OgcMixedVertexFaceKernel(OgcDetectParams p, ModelView model,
                         feature.distance <= query && feature.distance >= 0.0f) {
                         const uint32_t ordinal = OgcClaimSlot(p, data, env);
                         if (ordinal < p.slot_capacity) {
+                            // A particle face contacts at its interpolated thickness, under the surface bound.
+                            const auto face = target_particle ? OgcParticleFaceMaterial(
+                                model, view, info, node.triangle, feature.barycentric) : OgcParticleMaterial{};
                             const float target_mu = target_particle
-                                ? model.particle_surface_friction[target]
-                                : OgcBodyFriction(model, data, target);
+                                ? face.friction : OgcBodyFriction(model, data, target);
                             OgcEmitMixedFace(p, model, data, env, ordinal,
                                 source_particle, source_index, source_body, source_vertex,
                                 target_particle, target, target, view, info,
-                                node.triangle, source, radius,
+                                node.triangle, source,
+                                target_particle ? source_radius + face.half_thickness : radius,
                                 OgcPairFriction(source_particle, target_particle,
                                                 source_mu, target_mu), feature);
                         }
@@ -497,7 +521,6 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model,
                                     model.particle_surface_vertex_edges};
                 source_radius = model.particle_surface_thickness[s];
                 source_speed = data.particle_surface_max_speed[size_t{env} * p.surfaces_per_env + s];
-                source_mu = model.particle_surface_friction[s];
                 break;
             }
         }
@@ -585,11 +608,21 @@ __global__ void OgcMixedEdgeEdgeKernel(OgcDetectParams p, ModelView model,
                 if (pair.feasible && pair.owner_edge_a == local_edge &&
                     pair.owner_edge_b == node.triangle &&
                     pair.distance >= 0.0f && pair.distance <= query) {
+                    // A particle edge contacts at its interpolated thickness, under the surface bound.
+                    float contact_radius = radius, mu = source_mu;
+                    if (source_particle) {
+                        const uint32_t v0 = source_info.vertex_offset + edge_a.vertex0;
+                        const uint32_t v1 = source_info.vertex_offset + edge_a.vertex1;
+                        contact_radius = (1.0f - pair.weight_a) * model.particle_half_thickness[v0] +
+                                         pair.weight_a * model.particle_half_thickness[v1];
+                        mu = (1.0f - pair.weight_a) * model.particle_friction[v0] +
+                             pair.weight_a * model.particle_friction[v1];
+                    }
                     const uint32_t ordinal = OgcClaimSlot(p, data, env);
                     if (ordinal < p.slot_capacity) OgcEmitMixedEdge(p, model, data, env, ordinal,
                         source_particle, source_surface, source_body, local_edge,
-                        target, node.triangle, edge_a, radius,
-                        OgcPairFriction(source_particle, false, source_mu,
+                        target, node.triangle, edge_a, contact_radius,
+                        OgcPairFriction(source_particle, false, mu,
                                         OgcBodyFriction(model, data, target)),
                         pair);
                 }

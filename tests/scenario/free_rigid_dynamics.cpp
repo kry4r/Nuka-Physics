@@ -246,6 +246,8 @@ TEST(ParticleAerodynamics, SharedFacesAreDissipativeBoundedAndDeterministic) {
         input.positions = {{0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}};
         input.velocities = {{5, -3, 20}, {}, {-2, 4, 12}, {3, 1, -4}};
         input.inv_mass = {1.0f, 0.0f, 2.0f, 5.0f};
+        input.half_thickness.assign(4u, 0.0f);
+        input.friction.assign(4u, 0.6f);
         input.aero_triangles = {{{0, 1, 2}}, {{0, 2, 3}}};
         input.aero_drag_normal = coefficient;
         input.aero_drag_tangent = coefficient * 0.1f;

@@ -463,8 +463,15 @@ struct MediaRecord {
         MediaMpmMaterial material{};   // constitutive only; grid scalars ignored here.
         uint32_t         render_material_id = kInvalidMaterial;  // ~0u => inherit medium.
     };
+    // Cloth vertices take a region's contact thickness, friction and particle mass; faces with all three
+    // vertices in it take its density and moduli. Later regions win; the drag stays the medium's.
+    struct ClothRegion {
+        std::vector<uint32_t> vertices;
+        MediaVbdMaterial      material{};
+    };
     ClothGrid cloth_grid{};
     ClothMesh cloth_mesh{};
+    std::vector<ClothRegion> cloth_regions{};
     TetSphere tet_sphere{};
     FluidBox  fluid_box{};
     CableLine cable_line{};

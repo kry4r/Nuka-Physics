@@ -21,6 +21,7 @@
 // atomics, fixed-order arithmetic => deterministic (D1) and order-stable.
 // ---------------------------------------------------------------------------
 
+#include <cmath>
 #include <cstdint>
 
 #if defined(__CUDACC__)
@@ -152,6 +153,11 @@ NUKA_CF_HD inline MergedContactParams MergeContactParams(const ContactParamsIn& 
     out.margin = CfMaxF(A.margin, B.margin);
     out.gap    = CfMaxF(A.gap, B.gap);
     return out;
+}
+
+// A deformable particle against a body grips with the geometric mean of both coefficients.
+NUKA_CF_HD inline float ParticleBodyFriction(float particle_mu, float body_mu) {
+    return sqrtf(particle_mu * body_mu);
 }
 
 }  // namespace nuka::scene

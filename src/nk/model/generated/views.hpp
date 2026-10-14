@@ -109,7 +109,9 @@ struct ModelView {
     uint32_t* particle_surface_vertex_triangle_offsets = nullptr;  // per:scalar arena:persistent owner:model count:particles_per_env+1
     uint32_t* particle_surface_vertex_triangles = nullptr;  // per:scalar arena:persistent owner:model count:particle_surface_triangles*3
     float* particle_surface_thickness = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
-    float* particle_surface_friction = nullptr;  // per:scalar arena:persistent owner:model count:particle_surfaces_per_env
+    float* particle_half_thickness = nullptr;  // per:scalar arena:persistent owner:model count:particles_per_env
+    float* particle_friction = nullptr;  // per:scalar arena:persistent owner:model count:particles_per_env
+    ::nuka::math::Vec3* particle_rest_pos = nullptr;  // per:scalar arena:persistent owner:model count:particles_per_env
     ::nuka::nk::VbdElement* vbd_elements = nullptr;  // per:scalar arena:persistent owner:model count:vbd_elements_per_env
     uint32_t* vbd_incidence_offsets = nullptr;  // per:scalar arena:persistent owner:model count:vbd_vertices_per_env+1
     uint32_t* vbd_incidence = nullptr;  // per:scalar arena:persistent owner:model count:vbd_incidence_per_env

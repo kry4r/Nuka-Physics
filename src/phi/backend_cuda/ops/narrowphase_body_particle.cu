@@ -358,7 +358,7 @@ __global__ void NarrowphaseBodyParticleKernel(
     const Vec3* __restrict__ body_aabb_hi,
     const float* __restrict__ heights,
     const ::nuka::collision::MeshSurfaceInfo* __restrict__ surface_info,
-    const float* __restrict__ surface_thickness,
+    const float* __restrict__ particle_half_thickness,
     const float* __restrict__ surface_speed,
     const Vec3* __restrict__ body_linear_velocity,
     const Vec3* __restrict__ body_angular_velocity,
@@ -411,7 +411,7 @@ __global__ void NarrowphaseBodyParticleKernel(
     if (N == 0u) return;  // uniform per-warp.
 
     const uint32_t global_particle = env * pp.particles_per_env + pi;
-    // Vertex-block particles detect like OGC: surface thickness at the step-start position.
+    // Vertex-block particles detect like OGC: their own thickness at the step-start position.
     const bool vertex_block = pi - pp.vbd_particle_begin < pp.vbd_particle_count;
     float radius = pp.particle_radius, surface_rate = 0.0f;
     if (vertex_block) {
@@ -420,7 +420,7 @@ __global__ void NarrowphaseBodyParticleKernel(
             if (pi >= surface_info[s].vertex_offset &&
                 pi - surface_info[s].vertex_offset < surface_info[s].vertex_count) surface = s;
         if (surface == ~0u) return;  // uniform per-warp.
-        radius = surface_thickness[surface];
+        radius = particle_half_thickness[pi];
         surface_rate = surface_speed[size_t{env} * pp.particle_surfaces + surface];
     } else if (!(radius > 0.0f)) {
         return;  // uniform per-warp.
@@ -659,7 +659,7 @@ Status OpNarrowphaseBodyParticle(const ModelView& model, const DataView& data,
                    static_cast<const Vec3*>(data.body_aabb_lo),
                    static_cast<const Vec3*>(data.body_aabb_hi),
                    static_cast<const float*>(model.heights),
-                   model.particle_surface_info, model.particle_surface_thickness,
+                   model.particle_surface_info, model.particle_half_thickness,
                    data.particle_surface_max_speed,
                    static_cast<const Vec3*>(data.body_linear_velocity),
                    static_cast<const Vec3*>(data.body_angular_velocity),

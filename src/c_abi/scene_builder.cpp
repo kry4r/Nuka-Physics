@@ -478,6 +478,37 @@ nuka_result_t nuka_scene_add_mpm_fill_ex(nuka_scene_handle scene, uint32_t media
     }
 }
 
+nuka_result_t nuka_scene_add_cloth_region(nuka_scene_handle scene, uint32_t media_id,
+                                          const nuka_cloth_region_desc_t* desc) {
+    if (desc == nullptr || (desc->vertices == nullptr && desc->vertex_count != 0u))
+        return NUKA_RESULT_INVALID_ARG;
+    SceneRecord* sr = SceneTable().Get(scene);
+    if (sr == nullptr || !sr->scene) return NUKA_RESULT_NULL_HANDLE;
+    if (media_id >= sr->scene->MediaCount()) return NUKA_RESULT_INVALID_ARG;
+    try {
+        nscene::MediaRecord& rec = sr->scene->GetMediaMut(media_id);
+        if (rec.kind != nscene::MediaRecord::Kind::Cloth) return NUKA_RESULT_INVALID_ARG;
+        nscene::MediaRecord::ClothRegion region;
+        region.vertices.assign(desc->vertices, desc->vertices + desc->vertex_count);
+        region.material.particle_mass = desc->particle_mass;
+        region.material.surface_density = desc->surface_density;
+        region.material.half_thickness = desc->half_thickness;
+        region.material.friction = desc->friction;
+        region.material.stretch_stiffness = desc->stretch_stiffness;
+        region.material.poisson = desc->poisson;
+        region.material.bend_stiffness = desc->bend_stiffness;
+        region.material.damping = desc->damping;
+        rec.cloth_regions.push_back(std::move(region));
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
 nuka_result_t nuka_world_create_from_built_scene(
     nuka_device_handle device, const nuka_world_desc_t* desc,
     nuka_scene_handle scene, const nuka_built_scene_options_t* options,

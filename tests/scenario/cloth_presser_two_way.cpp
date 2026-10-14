@@ -176,9 +176,11 @@ cook::VbdCookInput BuildCloth() {
     // A tiny downward seed so the flat sheet commits to the ridge symmetrically.
     in.velocities.assign(rest.size(), Vec3{0.0f, 0.0f, -0.05f});
     in.inv_mass.assign(rest.size(), 1.0f / kParticleMass);  // UNPINNED free drape.
-    soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
+    soft::BuildClothVertexBlocks(rest, tris, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
+                                 in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
-    in.friction = 0.6f;
+    in.half_thickness.assign(rest.size(), 0.0f);
+    in.friction.assign(rest.size(), 0.6f);
     return in;
 }
 

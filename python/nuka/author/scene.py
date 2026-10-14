@@ -232,7 +232,7 @@ class Scene:
             e.render is not None for e in self._entities)
         gravity = any(float(g) != 0.0 for g in self.options.gravity)
         thick_grid = any(getattr(e.material, "half_thickness", 0.0) > 0.0 or
-                         getattr(e.material, "surface_density", 0.0) > 0.0
+                         getattr(e.material, "surface_density", 0.0) > 0.0 or e.morph.regions
                          for e in grids)
         if (not scenes or tets or fluids or grans or cables or rigids or appearance or thick_grid
                 or gravity):
@@ -423,6 +423,18 @@ class Scene:
             if fl.render is not None and material_ids:
                 fkw["render_material_id"] = material_ids[fl.render.name]
             builder.add_mpm_fill(media_id, **fkw)
+        for region in getattr(morph, "regions", ()):
+            if not isinstance(region.material, _materials.ClothMaterial):
+                raise TypeError(
+                    "Scene.build: a ClothRegion needs a materials.Cloth material; got "
+                    f"{type(region.material).__name__}")
+            rkw = region.material.media_material_kwargs()
+            builder.add_cloth_region(
+                media_id, vertices=[int(v) for v in region.vertices],
+                particle_mass=rkw["vbd_particle_mass"], surface_density=rkw["vbd_surface_density"],
+                half_thickness=rkw["vbd_half_thickness"], friction=rkw["vbd_friction"],
+                stretch_stiffness=rkw["vbd_stretch_stiffness"], poisson=rkw["vbd_poisson"],
+                bend_stiffness=rkw["vbd_bend_stiffness"], damping=rkw["vbd_damping"])
 
 
 __all__ = ["Scene", "SimOptions", "Environment"]

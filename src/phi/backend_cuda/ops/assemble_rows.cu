@@ -402,7 +402,7 @@ __global__ void EmitPairDrivenRowsKernel(
     uint32_t particles_per_env, uint32_t grid_nodes_per_env,
     uint32_t endpoints_per_env, uint32_t terms_per_env,
     const nk::PointEndpointRange* endpoint_ranges, const nk::PointEndpointTerm* endpoint_terms,
-    float particle_soft_friction,
+    const float* __restrict__ particle_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
     float dt, float baumgarte_max_velocity, float contact_margin,
@@ -507,14 +507,23 @@ __global__ void EmitPairDrivenRowsKernel(
     scene::ContactParamsIn side_b = ReadContactProfile(
         mat_buckets, num_material_buckets, profile_b, default_profile);
     if (kind_a == kNkSideParticle)
-        side_a = DefaultProfile(particle_soft_friction, solref0, solref1, default_solimp);
+        side_a = DefaultProfile(particle_friction[part_a - env * particles_per_env],
+                                solref0, solref1, default_solimp);
     if (kind_b == kNkSideParticle)
-        side_b = DefaultProfile(particle_soft_friction, solref0, solref1, default_solimp);
+        side_b = DefaultProfile(particle_friction[part_b - env * particles_per_env],
+                                solref0, solref1, default_solimp);
     if (kind_a == kNkSideGrid || kind_a == kNkSidePointEndpoint || side_kind_a == nk::kUContactSideBoundary)
         side_a = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
     if (kind_b == kNkSideGrid || kind_b == kNkSidePointEndpoint || side_kind_b == nk::kUContactSideBoundary)
         side_b = DefaultProfile(endpoint_mu, solref0, solref1, default_solimp);
     scene::MergedContactParams merged = scene::MergeContactParams(side_a, side_b);
+    if (kind_a == kNkSideParticle && side_kind_b == nk::kUContactSideBody) {
+        merged.mu1 = scene::ParticleBodyFriction(side_a.mu1, side_b.mu1);
+        merged.mu2 = scene::ParticleBodyFriction(side_a.mu2, side_b.mu2);
+    } else if (kind_b == kNkSideParticle && side_kind_a == nk::kUContactSideBody) {
+        merged.mu1 = scene::ParticleBodyFriction(side_b.mu1, side_a.mu1);
+        merged.mu2 = scene::ParticleBodyFriction(side_b.mu2, side_a.mu2);
+    }
     if (slot >= full_row_slot_count &&
         slot - full_row_slot_count < ogc_slot_count && n_active > 0u) {
         merged.mu1 = endpoint_mu;
@@ -1403,7 +1412,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    p->particles_per_env, p->grid_nodes_per_env,
                    p->point_endpoints_per_env, p->point_endpoint_terms_per_env,
                    data.point_endpoint_ranges, data.point_endpoint_terms,
-                   p->particle_soft_friction,
+                   static_cast<const float*>(model.particle_friction),
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
                    p->dt, p->baumgarte_max_velocity, p->contact_margin,

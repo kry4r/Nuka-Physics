@@ -32,12 +32,23 @@ class NKS:
 
 
 @_dc.dataclass(frozen=True)
+class ClothRegion:
+    """A cloth sub-region over lattice ``vertices`` (``j*nx+i``) with its own ``materials.Cloth``:
+    the vertices take its contact thickness, friction and particle mass, and faces with all three
+    vertices listed take its density and moduli. Later regions win; drag stays the medium's."""
+
+    vertices: Tuple[int, ...]
+    material: object
+
+
+@_dc.dataclass(frozen=True)
 class Grid:
     """A flat ``nx`` x ``ny`` cloth lattice at ``spacing`` m, centred on ``origin``.
 
     Geometry only -- the VBD params come from a ``materials.Cloth`` and the
     membrane/aero from a ``surfaces.Cloth``. Maps to the
-    ``cloth_nx/ny/spacing/origin_*`` cook kwargs.
+    ``cloth_nx/ny/spacing/origin_*`` cook kwargs. ``regions`` overrides the
+    material over vertex subsets (a bound hem, a rough face).
     """
 
     MEDIA_KIND = "cloth"
@@ -46,6 +57,7 @@ class Grid:
     ny: int
     spacing: float
     origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    regions: Tuple[ClothRegion, ...] = ()
 
     def media_geometry_kwargs(self) -> dict:
         """The cloth geometry block for ``SceneBuilder.add_media`` (used when the
@@ -296,6 +308,6 @@ class Ground:
 
 
 __all__ = [
-    "NKS", "Grid", "TetSphere", "FluidBox", "GranularBed", "MpmFill", "Cable",
+    "NKS", "ClothRegion", "Grid", "TetSphere", "FluidBox", "GranularBed", "MpmFill", "Cable",
     "CableSlab", "Box", "Sphere", "Capsule", "Plane", "Ground",
 ]

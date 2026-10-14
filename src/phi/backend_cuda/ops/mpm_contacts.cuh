@@ -200,9 +200,16 @@ __device__ void VisitParticleSurfaces(const MpmParams& p, const ModelView& model
         const size_t at = size_t{info.triangle_offset + surface.triangle} * 3u;
         uint32_t indices[nk::kTriangleEndpointTerms];
         math::Vec3 vertices[nk::kTriangleEndpointTerms];
+        // The face contacts at its vertices' thickness and friction interpolated at the witness point.
+        const float weights[nk::kTriangleEndpointTerms] = {
+            surface.barycentric.x, surface.barycentric.y, surface.barycentric.z};
+        float face_thickness = 0.0f, face_mu = 0.0f;
         for (uint32_t i = 0u; i < nk::kTriangleEndpointTerms; ++i) {
-            indices[i] = env * p.particles_per_env + info.vertex_offset + model.particle_surface_triangles[at + i];
+            const uint32_t local = info.vertex_offset + model.particle_surface_triangles[at + i];
+            indices[i] = env * p.particles_per_env + local;
             vertices[i] = data.particle_pos[indices[i]];
+            face_thickness += weights[i] * model.particle_half_thickness[local];
+            face_mu += weights[i] * model.particle_friction[local];
         }
         nk::PointEndpointTerm terms[nk::kTriangleEndpointTerms];
         if (!nk::BuildTrianglePointEndpoint(indices, vertices, surface.barycentric, point, terms)) {
@@ -225,8 +232,8 @@ __device__ void VisitParticleSurfaces(const MpmParams& p, const ModelView& model
         }
         Visit<emit>(p, data, sample, mpm_per_env, count, nk::kUContactSidePointEndpoint, endpoint,
             {constraint::CollidableType::ParticleSurface, constraint::ReactionProviderKind::PointEndpoint,
-             env * p.particle_surfaces_per_env + mesh}, point, surface.normal, thickness - surface.distance,
-            fmaxf(p.body_mu, model.particle_surface_friction[mesh]), info.triangle_offset + surface.triangle, mesh);
+             env * p.particle_surfaces_per_env + mesh}, point, surface.normal, face_thickness - surface.distance,
+            fmaxf(p.body_mu, face_mu), info.triangle_offset + surface.triangle, mesh);
         if constexpr (!emit)
             contact_hit_mask[mask_base + bit / 32u] |= 1u << (bit % 32u);
     }

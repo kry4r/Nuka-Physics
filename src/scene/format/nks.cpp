@@ -634,19 +634,34 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
     cl.Set("slab", std::move(sl));
     o.Set("cable_line", std::move(cl));
 
-    Value xp = Value::Object();
-    xp.Set("particle_mass", Value::Float(m.vbd.particle_mass));
-    xp.Set("surface_density", Value::Float(m.vbd.surface_density));
-    xp.Set("half_thickness", Value::Float(m.vbd.half_thickness));
-    xp.Set("friction", Value::Float(m.vbd.friction));
-    xp.Set("stretch_stiffness", Value::Float(m.vbd.stretch_stiffness));
-    xp.Set("poisson", Value::Float(m.vbd.poisson));
-    xp.Set("bend_stiffness", Value::Float(m.vbd.bend_stiffness));
-    xp.Set("damping", Value::Float(m.vbd.damping));
-    xp.Set("aero_drag_normal", Value::Float(m.vbd.aero_drag_normal));
-    xp.Set("aero_drag_tangent", Value::Float(m.vbd.aero_drag_tangent));
-    xp.Set("aero_drag_max_dv", Value::Float(m.vbd.aero_drag_max_dv));
-    o.Set("vbd", std::move(xp));
+    auto vbd_json = [](const MediaVbdMaterial& mv) {
+        Value xp = Value::Object();
+        xp.Set("particle_mass", Value::Float(mv.particle_mass));
+        xp.Set("surface_density", Value::Float(mv.surface_density));
+        xp.Set("half_thickness", Value::Float(mv.half_thickness));
+        xp.Set("friction", Value::Float(mv.friction));
+        xp.Set("stretch_stiffness", Value::Float(mv.stretch_stiffness));
+        xp.Set("poisson", Value::Float(mv.poisson));
+        xp.Set("bend_stiffness", Value::Float(mv.bend_stiffness));
+        xp.Set("damping", Value::Float(mv.damping));
+        xp.Set("aero_drag_normal", Value::Float(mv.aero_drag_normal));
+        xp.Set("aero_drag_tangent", Value::Float(mv.aero_drag_tangent));
+        xp.Set("aero_drag_max_dv", Value::Float(mv.aero_drag_max_dv));
+        return xp;
+    };
+    o.Set("vbd", vbd_json(m.vbd));
+    if (!m.cloth_regions.empty()) {
+        Value regions = Value::Array();
+        for (const MediaRecord::ClothRegion& region : m.cloth_regions) {
+            Value ro = Value::Object();
+            Value vertices = Value::Array();
+            for (uint32_t vertex : region.vertices) vertices.PushBack(Value::Int(vertex));
+            ro.Set("vertices", std::move(vertices));
+            ro.Set("vbd", vbd_json(region.material));
+            regions.PushBack(std::move(ro));
+        }
+        o.Set("cloth_regions", std::move(regions));
+    }
 
     auto mpm_mat_json = [](const MediaMpmMaterial& mm) {
         Value mp = Value::Object();
@@ -1768,19 +1783,33 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                           rec.cable_line.slab.render_material_id), material_offset);
                 }
             }
-            if (const Value* xp = mv.Find("vbd")) {
-                rec.vbd.particle_mass = f(*xp, "particle_mass", rec.vbd.particle_mass);
-                rec.vbd.surface_density = f(*xp, "surface_density", rec.vbd.surface_density);
-                rec.vbd.half_thickness = f(*xp, "half_thickness", rec.vbd.half_thickness);
-                rec.vbd.friction = f(*xp, "friction", rec.vbd.friction);
-                rec.vbd.stretch_stiffness = f(*xp, "stretch_stiffness", rec.vbd.stretch_stiffness);
-                rec.vbd.poisson = f(*xp, "poisson", rec.vbd.poisson);
-                rec.vbd.bend_stiffness = f(*xp, "bend_stiffness", rec.vbd.bend_stiffness);
-                rec.vbd.damping = f(*xp, "damping", rec.vbd.damping);
-                rec.vbd.aero_drag_normal = f(*xp, "aero_drag_normal", rec.vbd.aero_drag_normal);
-                rec.vbd.aero_drag_tangent = f(*xp, "aero_drag_tangent", rec.vbd.aero_drag_tangent);
-                rec.vbd.aero_drag_max_dv = f(*xp, "aero_drag_max_dv", rec.vbd.aero_drag_max_dv);
-            }
+            auto read_vbd = [&](const Value& xp, MediaVbdMaterial& out) {
+                out.particle_mass = f(xp, "particle_mass", out.particle_mass);
+                out.surface_density = f(xp, "surface_density", out.surface_density);
+                out.half_thickness = f(xp, "half_thickness", out.half_thickness);
+                out.friction = f(xp, "friction", out.friction);
+                out.stretch_stiffness = f(xp, "stretch_stiffness", out.stretch_stiffness);
+                out.poisson = f(xp, "poisson", out.poisson);
+                out.bend_stiffness = f(xp, "bend_stiffness", out.bend_stiffness);
+                out.damping = f(xp, "damping", out.damping);
+                out.aero_drag_normal = f(xp, "aero_drag_normal", out.aero_drag_normal);
+                out.aero_drag_tangent = f(xp, "aero_drag_tangent", out.aero_drag_tangent);
+                out.aero_drag_max_dv = f(xp, "aero_drag_max_dv", out.aero_drag_max_dv);
+            };
+            if (const Value* xp = mv.Find("vbd")) read_vbd(*xp, rec.vbd);
+            if (const Value* regions = mv.Find("cloth_regions"))
+                for (const Value& rv : regions->Elements()) {
+                    MediaRecord::ClothRegion region;
+                    if (const Value* vertices = rv.Find("vertices"))
+                        for (const Value& vertex : vertices->Elements()) {
+                            const auto id = vertex.AsInt();
+                            if (id < 0 || static_cast<uint64_t>(id) > UINT32_MAX)
+                                throw std::invalid_argument("Cloth region vertex is out of range");
+                            region.vertices.push_back(static_cast<uint32_t>(id));
+                        }
+                    if (const Value* xp = rv.Find("vbd")) read_vbd(*xp, region.material);
+                    rec.cloth_regions.push_back(std::move(region));
+                }
             if (const Value* mp = mv.Find("mpm")) read_mpm(*mp, rec.mpm);
             if (const Value* fills = mv.Find("mpm_fills")) {
                 if (fills->IsArray()) {

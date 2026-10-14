@@ -91,16 +91,17 @@ inline cook::VbdCookInput BuildCloth(float cx, float cy, float z, uint32_t nx = 
         in.inv_mass[idx(k, 0)] = 0.0f; in.inv_mass[idx(k, last)] = 0.0f;
         in.inv_mass[idx(0, k)] = 0.0f; in.inv_mass[idx(last, k)] = 0.0f;
     }
-    soft::BuildClothVertexBlocks(rest, tris, {}, shell, in.vbd_elements);
+    soft::BuildClothVertexBlocks(rest, tris, {}, std::vector<soft::ShellMaterial>(tris.size(), shell),
+                                 in.vbd_elements);
     in.vbd_count = static_cast<uint32_t>(rest.size());
     for (const auto& triangle : tris)
         in.aero_triangles.push_back({triangle.v[0], triangle.v[1], triangle.v[2]});
     in.aero_drag_normal = 0.6f;
     in.aero_drag_tangent = 0.04f;
     in.aero_drag_max_dv = 0.5f;
-    in.friction = 0.6f;   // finite mu: the foot grips/drags the cloth.
+    in.half_thickness.assign(rest.size(), 0.0f);
+    in.friction.assign(rest.size(), 0.6f);  // finite mu: the foot grips/drags the cloth.
     cook::CookParticleSurface surface;
-    surface.friction = in.friction;
     for (const auto& triangle : tris)
         surface.triangles.insert(surface.triangles.end(), triangle.v, triangle.v + 3u);
     in.surfaces.push_back(std::move(surface));

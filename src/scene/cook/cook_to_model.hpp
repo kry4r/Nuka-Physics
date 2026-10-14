@@ -112,10 +112,9 @@ void SetOgcContactCapacity(nk::Model& model, uint32_t capacity);
 // nk::Model particle block. The cook layer is pure C++ and takes the cookers' POD products.
 // ---------------------------------------------------------------------------
 
+// A surface's contact thickness and friction bound those of its vertices.
 struct CookParticleSurface {
     std::vector<uint32_t> triangles;
-    float half_thickness = 0.0f;
-    float friction = 0.6f;
     std::vector<uint32_t> edges;
 };
 
@@ -131,8 +130,9 @@ struct VbdCookInput {
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;
-    // body<->soft contact mu, finite so a foot grips/drags the cloth (solmix=max).
-    float    friction = 0.6f;
+    // Per-particle contact half thickness and Coulomb mu.
+    std::vector<float> half_thickness;
+    std::vector<float> friction;
     std::vector<CookParticleSurface> surfaces;
     // Vertex-block elements over input particles [vbd_begin, vbd_begin + vbd_count), indexed by input particle.
     std::vector<nk::VbdElement> vbd_elements;

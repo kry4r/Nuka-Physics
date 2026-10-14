@@ -82,16 +82,17 @@ def support_plane(scene, R_s, p_s):
     return R_s[2].copy(), scene["table"]["top_m"] - p_s[2]
 
 
-def finger_floors(scene, positions, R_s, p_s, R, p, open_width, sign):
-    """Thumb and index support heights in the torso frame (R_s, p_s): the cloth top or the table under each open jaw
-    pad of the pinch frame (R, p), kept while the fingers close so each tip presses where it landed. A point lies
-    over the cloth within 0.75 lattice spacings of a particle, just above the largest gap of the square lattice."""
+def finger_floors(scene, positions, half, R_s, p_s, R, p, open_width, sign):
+    """Thumb and index support heights in the torso frame (R_s, p_s): the cloth top, each particle raised by its half
+    thickness ``half``, or the table under each open jaw pad of the pinch frame (R, p), kept while the fingers close
+    so each tip presses where it landed. A point lies over the cloth within 0.75 lattice spacings of a particle,
+    just above the largest gap of the square lattice."""
     cloth = scene["cloth"]
     floors = []
     for side in (-1.0, 1.0):
         point = R_s @ (p + side * 0.5 * open_width * sign * R[:, 1]) + p_s
         under = np.linalg.norm(positions[:, :2] - point[:2], axis=1) < 0.75 * cloth["spacing"]
-        top = positions[under, 2].max() + 0.5 * cloth["thickness"] if under.any() else -np.inf
+        top = (positions[under, 2] + half[under]).max() if under.any() else -np.inf
         floors.append(max(scene["table"]["top_m"], top) - p_s[2])
     return floors
 
@@ -100,13 +101,25 @@ def jaw_width(args, closure):
     return (1.0 - closure) * args.open_width
 
 
+def closing_onsets(closure, events):
+    """First frame of the recorded closure's monotone rise into each grasp frame."""
+    onsets = []
+    for grasp, _ in events:
+        onset = grasp
+        while onset > 0 and closure[onset - 1] < closure[onset]:
+            onset -= 1
+        onsets.append(int(onset))
+    return onsets
+
+
 def hover_lift(events, frames, height, approach):
     """Height added to a pinch command per frame: ``height`` away from grasps, easing to zero over ``approach``
-    frames before each grasp and after its release, and zero while it holds."""
+    frames before each grasp's closing onset and after its release, and zero while it holds; ``events`` pairs those
+    two frames."""
     k = np.arange(frames, dtype=np.float64)
     distance = np.full(frames, np.inf)
-    for grasp, release in events:
-        distance = np.minimum(distance, np.maximum(np.maximum(grasp - k, k - release), 0.0))
+    for onset, release in events:
+        distance = np.minimum(distance, np.maximum(np.maximum(onset - k, k - release), 0.0))
     s = np.clip(distance / max(approach, 1e-9), 0.0, 1.0)
     return height * s * s * (3.0 - 2.0 * s)
 
@@ -140,7 +153,9 @@ def make_plan(scene, camera_fit, args):
         _, p_obs = fk.dex1_pinch(dex1, columns, R_wt, p_wt, side, "observation")
         events = fk.grasp_events(closure[:, fk.SIDES.index(side)])
         p_rec = p_cmd
-        p_cmd = p_cmd + hover_lift(events, frames, args.hover, args.hover_approach * fk.FPS)[:, None] * np.array(
+        hover_events = [(onset, release) for onset, (_, release) in
+                        zip(closing_onsets(closure[:, fk.SIDES.index(side)], events), events)]
+        p_cmd = p_cmd + hover_lift(hover_events, frames, args.hover, args.hover_approach * fk.FPS)[:, None] * np.array(
             [0.0, 0.0, 1.0])
         tool = pinch_tool(scene, side)
         names = fk.arm_joints(side)
@@ -223,14 +238,17 @@ def grasp_candidates(positions, faces, nx, ny, threshold=0.25):
 
 
 class Alignment:
-    """Per-hand grasp offsets from the commanded pinch point to the nearest corner or fold-edge vertex, rising over
-    ``window`` frames before each grasp while following that vertex, held until release and falling after it.
+    """Per-hand grasp offsets from the commanded pinch point at each grasp's closing onset to the nearest corner or
+    fold-edge vertex, rising over ``window`` frames before that onset while following that vertex until the grasp,
+    held until release and falling after it; ``events`` are (onset, grasp, release) frames.
     The pinch centre sits ``inset`` along the closing axis into the cloth and ``press`` below the vertex's
-    underside, so each open fingertip loads its support through the arm drives as the fingers close."""
+    underside, the vertex lowered by its half thickness ``half``, so each open fingertip loads its support through
+    the arm drives as the fingers close."""
 
-    def __init__(self, events, command_p, closing_axis, window_frames, inset, press, radius=0.05):
+    def __init__(self, events, command_p, closing_axis, window_frames, inset, press, half, radius=0.05):
         self.events, self.command_p, self.window = [tuple(e) for e in events], command_p, window_frames
         self.closing_axis, self.inset, self.press, self.radius = closing_axis, inset, press, radius
+        self.half = half
         self.vertex, self.offset, self.log = {}, {}, []
 
     def inward(self, positions, vertex, grasp):
@@ -241,15 +259,15 @@ class Alignment:
         return axis if axis @ (near.mean(axis=0) - positions[vertex]) >= 0.0 else -axis
 
     def weight(self, index, frame):
-        grasp, release = self.events[index]
-        rise = smoothstep((frame - (grasp - self.window)) / self.window)
+        onset, _, release = self.events[index]
+        rise = smoothstep((frame - (onset - self.window)) / self.window)
         fall = 1.0 - smoothstep((frame - release) / self.window)
         return float(min(rise, fall))
 
     def update(self, frame, positions, faces, nx, ny):
-        for index, (grasp, release) in enumerate(self.events):
-            if grasp - self.window <= frame <= grasp:
-                point = self.command_p[grasp]
+        for index, (onset, grasp, _) in enumerate(self.events):
+            if onset - self.window <= frame <= grasp:
+                point = self.command_p[onset]
                 if index not in self.vertex:
                     candidates = grasp_candidates(positions, faces, nx, ny)
                     chosen = int(candidates[np.argmin(np.linalg.norm(positions[candidates] - point, axis=1))])
@@ -259,7 +277,7 @@ class Alignment:
                                      "distance_m": float(np.linalg.norm(positions[chosen] - point))})
                 vertex = self.vertex[index]
                 self.offset[index] = (positions[vertex] + self.inset * self.inward(positions, vertex, grasp)
-                                      - np.array([0.0, 0.0, self.press]) - point)
+                                      - np.array([0.0, 0.0, self.press + self.half[vertex]]) - point)
 
     def delta(self, frame):
         total, weights = np.zeros(3), 0.0
@@ -271,15 +289,19 @@ class Alignment:
 
 
 class TactilePinch:
-    """Closed-loop pinch of one hand from the contact wrench of its thumb and index distal links. Within the contact
-    band each tip's press moves its support load toward ``touch_force``; while the recording grips, the jaw follows
-    it until the pad squeeze reaches its target and then holds that squeeze, and cloth slipping in the jaw raises the
-    target up to ``squeeze_max``. Each step is half the force error over a stiffness prior, rate limited."""
+    """Closed-loop pinch of one hand from the contact wrench of its thumb and index distal links. Each tip enters the
+    contact ``band`` at its top and within it presses ``press_rate`` deeper per frame while its support load is below
+    ``touch_force``, a guarded move that never backs off; ``touching`` counts the frames each tip has carried
+    ``contact_force`` or pressed to ``press_max``. Both read the support load averaged over the last two frames, which
+    cancels the frame-rate alternation a rocking hand shows. While the recording grips and cloth lies in the jaw, the
+    jaw follows it until the pad squeeze reaches its target and then holds that squeeze, and cloth slipping in the jaw
+    raises the target up to ``squeeze_max``. Each width step is half the squeeze error over a stiffness prior, rate
+    limited."""
 
-    def __init__(self, rows, pad_rows, pad_local, press, args):
-        self.rows, self.pad_rows, self.pad_local, self.args = rows, pad_rows, pad_local, args
-        self.press = np.array(np.broadcast_to(np.asarray(press, np.float64), (2,)))
-        self.target, self.width, self.pads = args.squeeze_force, None, None
+    def __init__(self, rows, pad_rows, pad_local, band, args):
+        self.rows, self.pad_rows, self.pad_local, self.band, self.args = rows, pad_rows, pad_local, band, args
+        self.press = np.full(2, -band)
+        self.target, self.width, self.pads, self.touching, self.last = args.squeeze_force, None, None, 0, None
         self.log = []
 
     def update(self, frame, wrench, pose, positions, velocities, in_band, grip, width):
@@ -293,6 +315,8 @@ class TactilePinch:
         axis -= (axis @ normal) * normal
         axis /= max(np.linalg.norm(axis), 1e-12)
         load = np.array([force @ normal for force in forces])
+        felt = load if self.last is None else 0.5 * (load + self.last)
+        self.last = load
         squeeze = 0.5 * float(forces[1] @ axis - forces[0] @ axis)
         span = pads[1] - pads[0]
         t = (positions - pads[0]) @ span / max(span @ span, 1e-12)
@@ -304,9 +328,11 @@ class TactilePinch:
             slip = float(np.linalg.norm(velocities[held].mean(axis=0) - pad_rate))
         self.pads = pads
         if in_band:
-            step = np.clip(0.5 * (a.touch_force - load) / a.press_stiffness, -a.press_rate, a.press_rate)
-            self.press = np.clip(self.press + step, 0.0, a.press_max)
-        if not grip:
+            self.press = np.minimum(self.press + a.press_rate * (felt < a.touch_force), a.press_max)
+        else:
+            self.press = np.full(2, -self.band)
+        self.touching = self.touching + 1 if ((felt >= a.contact_force) | (self.press >= a.press_max)).all() else 0
+        if not grip or not held.any():
             self.width, self.target = None, a.squeeze_force
         elif self.width is None and squeeze >= self.target:
             self.width = width
@@ -315,17 +341,19 @@ class TactilePinch:
                 self.target = min(self.target + a.squeeze_step, a.squeeze_max)
             step = np.clip(0.5 * (self.target - squeeze) / a.squeeze_stiffness, -a.width_rate, a.width_rate)
             self.width = float(np.clip(self.width - step, 0.0, a.open_width))
-        self.log.append({"frame": frame, "load_n": load.tolist(), "squeeze_n": squeeze, "slip_mps": slip,
+        self.log.append({"frame": frame, "load_n": load.tolist(), "felt_n": felt.tolist(), "squeeze_n": squeeze,
+                         "slip_mps": slip,
                          "jaw_particles": int(held.sum()), "press_m": self.press.tolist(), "in_band": bool(in_band),
-                         "grip": bool(grip), "held_width_m": self.width, "squeeze_target_n": self.target})
+                         "grip": bool(grip), "held_width_m": self.width, "squeeze_target_n": self.target,
+                         "touching_frames": self.touching})
 
     def jaw(self, recorded):
         """The held jaw width once the squeeze reached its target, otherwise the recorded one."""
         return recorded if self.width is None else self.width
 
 
-TACTILE_ARGS = ("touch_force", "press_stiffness", "press_rate", "press_max", "squeeze_force", "squeeze_max",
-                "squeeze_step", "squeeze_stiffness", "width_rate", "slip_speed", "gap_radius")
+TACTILE_ARGS = ("touch_force", "contact_force", "touch_frames", "press_rate", "press_max", "squeeze_force",
+                "squeeze_max", "squeeze_step", "squeeze_stiffness", "width_rate", "slip_speed", "gap_radius")
 
 
 def render_maps(camera):
@@ -346,7 +374,7 @@ def run(scene, camera_fit, plan, args):
     import nuka
     from nuka.diagnostics import DiagnosticSession, DiagnosticThresholds
     from nuka.diagnostics.capture import sha256, write_json
-    from nuka.tasks.fold_scene import apply_drives, build_scene, folded_cloth
+    from nuka.tasks.fold_scene import apply_drives, build_scene, folded_cloth, vertex_half_thickness
 
     tolerance = os.environ.get("NUKA_SOLVER_VEL_TOLERANCE")
     if tolerance is None:
@@ -358,7 +386,8 @@ def run(scene, camera_fit, plan, args):
     settle = round(args.settle / args.dt)
     window = round(args.align_window * fk.FPS)
     start = 0 if args.resume_checkpoint is None else args.resume_frame
-    if start and start >= min([int(e[0]) for side in fk.SIDES for e in plan[f"{side}_events"]], default=frames) - window:
+    onsets = {side: closing_onsets(plan["closure"][:, i], plan[f"{side}_events"]) for i, side in enumerate(fk.SIDES)}
+    if start and start >= min([onset for side in fk.SIDES for onset in onsets[side]], default=frames) - window:
         raise ValueError("resume before the first grasp alignment window, where the run state is the world alone")
     output = Path(args.output)
     device = nuka.Device.create(0)
@@ -388,6 +417,7 @@ def run(scene, camera_fit, plan, args):
         world.upload_field(nuka.Field.PARTICLE_POSITION, np.ascontiguousarray(placed.reshape(-1)))
         positions, velocities = placed.astype(np.float64), np.zeros(placed.shape)
         faces = cloth_faces(nx, ny)
+        half = vertex_half_thickness(cloth)
         metadata = {"fixture": "towel fold replay", "scene": str(scene["directory"] / "scene.json"),
                     "scene_sha256": sha256(scene["directory"] / "scene.json"), "episode": scene["episode"],
                     "dt": args.dt, "sweeps": args.sweeps, "substeps_per_frame": substeps, "settle_steps": settle,
@@ -413,13 +443,15 @@ def run(scene, camera_fit, plan, args):
         np.savez_compressed(output / "initial.npz", folded=placed, flat_rest=rest, faces=faces,
                             joint_position=initial)
         inset = 0.5 * args.open_width + args.edge_margin
-        alignment = {side: Alignment(plan[f"{side}_events"], plan[f"{side}_command_p"],
-                                     plan[f"{side}_command_R"][:, :, 1], window, inset,
-                                     max(args.press_depth) + 0.5 * scene["cloth"]["thickness"])
+        alignment = {side: Alignment([(onset, grasp, release) for onset, (grasp, release) in
+                                      zip(onsets[side], plan[f"{side}_events"])], plan[f"{side}_command_p"],
+                                     plan[f"{side}_command_R"][:, :, 1], window, inset, max(args.press_depth), half)
                      for side in fk.SIDES}
         x_run = {side: plan[f"{side}_retarget"].copy() for side in fk.SIDES}
         h_run = {side: plan[f"{side}_hand"].copy() for side in fk.SIDES}
         delta = {side: np.zeros((plan["frames"], 3)) for side in fk.SIDES}
+        # Recorded frame of each replayed frame; a held grasp repeats one, so both hands and the waist wait together.
+        source, holds = np.arange(plan["frames"]), []
         held = {side: None for side in fk.SIDES}
         sim = fk.Kinematics(scene["directory"] / "upper_body.urdf")
         retarget = {side: fk.PinchRetarget(sim, side, scene["hand"][side], contact=args.pinch_contact)
@@ -434,7 +466,7 @@ def run(scene, camera_fit, plan, args):
                 rt = retarget[side]
                 tactile[side] = TactilePinch([rows_of(own) for own in rt.distal],
                                              [rows_of([link])[0] for link, _ in rt.pads],
-                                             [local for _, local in rt.pads], args.press_depth, args)
+                                             [local for _, local in rt.pads], rt.band, args)
         camera = fk.HeadCamera(camera_fit)
         map_x, map_y, render_w, render_h = render_maps(camera)
         fov = math.degrees(2.0 * math.atan(0.5 * render_h / camera.fy))
@@ -460,7 +492,7 @@ def run(scene, camera_fit, plan, args):
             period = 1.0 / fk.FPS
             q, qd, qdd = {}, {}, {}
             splines = [(fk.arm_joints(side), x_run[side][:, :7]) for side in fk.SIDES]
-            splines.append((fk.waist_joints(), plan["waist"]))
+            splines.append((fk.waist_joints(), plan["waist"][source]))
             for names, values in splines:
                 rate, acceleration = catmull_rom_rates(values, k, tau, period)
                 q.update(zip(names, catmull_rom(values, k, tau)))
@@ -494,19 +526,20 @@ def run(scene, camera_fit, plan, args):
                 flush_particles()
             return x, v
 
-        def render(frame):
-            nonlocal decoder
-            index, recorded = next(decoder)
-            while index < frame:
-                index, recorded = next(decoder)
+        decoded = [-1, None]
+
+        def render(row):
+            frame = int(source[row])
+            while decoded[0] < frame:
+                decoded[:] = next(decoder)
             R, c = plan["camera_R"][frame], plan["camera_c"][frame]
             pixels = np.asarray(world.render_beauty(eye=c.tolist(), look=(c + R[:, 2]).tolist(), up=(-R[:, 1]).tolist(),
                                                     fov_deg=fov, width=render_w, height=render_h, spp=args.spp))
             simulated = cv2.remap(cv2.cvtColor(pixels[..., :3], cv2.COLOR_RGB2BGR), map_x, map_y, cv2.INTER_LINEAR)
-            pair = np.hstack([recorded.to_ndarray(format="bgr24"), simulated])
-            cv2.putText(pair, f"ep{scene['episode']['index']} t={frame / fk.FPS:5.2f}s recorded | simulated",
-                        (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.imwrite(str(output / "render" / f"pair_{frame:05d}.png"), pair)
+            pair = np.hstack([decoded[1].to_ndarray(format="bgr24"), simulated])
+            cv2.putText(pair, f"ep{scene['episode']['index']} t={row / fk.FPS:5.2f}s recorded {frame / fk.FPS:5.2f}s"
+                        " | simulated", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.imwrite(str(output / "render" / f"pair_{row:05d}.png"), pair)
 
         first = {side: x_run[side][0, :7] for side in fk.SIDES}
         hold = max(settle // 2, 1)
@@ -538,36 +571,47 @@ def run(scene, camera_fit, plan, args):
             if args.render_every:
                 render(start)
             wrench_sum, wrench_steps = 0.0, 0
-            for k in range(start, frames - 1):
+            k = start
+            while source[k] < frames - 1:
                 if tactile and wrench_steps:
                     pose = np.asarray(world.download_field(nuka.Field.ARTICULATION_LINK_POSE)).reshape(-1, 7)
                     for side in fk.SIDES:
-                        g = plan["closure"][k, fk.SIDES.index(side)]
+                        g = plan["closure"][source[k], fk.SIDES.index(side)]
                         tactile[side].update(k, wrench_sum / wrench_steps, pose, positions, velocities, band[side],
                                              g >= 0.5, jaw_width(args, g))
+                    c = int(source[k])
+                    waiting = [side for side in fk.SIDES
+                               if c in onsets[side] and tactile[side].touching < args.touch_frames]
+                    if waiting:
+                        source = np.insert(source, k + 1, c)
+                        for rows in (x_run, h_run, delta):
+                            for side in fk.SIDES:
+                                rows[side] = np.insert(rows[side], k + 1, rows[side][k], axis=0)
+                        holds.append({"frame": k + 1, "plan_frame": c, "waiting": waiting})
                 wrench_sum, wrench_steps = 0.0, 0
                 for side in fk.SIDES:
-                    alignment[side].update(k, positions, faces, nx, ny)
+                    alignment[side].update(int(source[k]), positions, faces, nx, ny)
                     for j in (k + 1, k + 2):
-                        if j >= plan["frames"]:
+                        if j >= len(source):
                             continue
-                        delta[side][j] = alignment[side].delta(j)
+                        frame = int(source[j])
+                        delta[side][j] = alignment[side].delta(frame)
                         if not np.any(delta[side][j]):
                             band[side] = band[side] and j != k + 1
-                            x_run[side][j] = plan[f"{side}_retarget"][j]
-                            h_run[side][j] = plan[f"{side}_hand"][j]
+                            x_run[side][j] = plan[f"{side}_retarget"][frame]
+                            h_run[side][j] = plan[f"{side}_hand"][frame]
                             continue
-                        R_s, p_s = plan["sim_torso_R"][j], plan["sim_torso_p"][j]
-                        g = plan["closure"][j, fk.SIDES.index(side)]
+                        R_s, p_s = plan["sim_torso_R"][frame], plan["sim_torso_p"][frame]
+                        g = plan["closure"][frame, fk.SIDES.index(side)]
                         width = tactile[side].jaw(jaw_width(args, g)) if tactile else jaw_width(args, g)
                         press = tactile[side].press if tactile else args.press_depth
-                        R_t = R_s.T @ plan[f"{side}_command_R"][j]
-                        p_t = R_s.T @ (plan[f"{side}_command_p"][j] + delta[side][j] - p_s)
+                        R_t = R_s.T @ plan[f"{side}_command_R"][frame]
+                        p_t = R_s.T @ (plan[f"{side}_command_p"][frame] + delta[side][j] - p_s)
                         support = support_plane(scene, R_s, p_s)
                         floors = held[side] if held[side] is not None else finger_floors(
-                            scene, positions, R_s, p_s, R_t, p_t, args.open_width, retarget[side].sign)
+                            scene, positions, half, R_s, p_s, R_t, p_t, args.open_width, retarget[side].sign)
                         near = support[0] @ p_t - max(floors) < retarget[side].band
-                        gripping = any(grasp <= j < release for grasp, release in plan[f"{side}_events"])
+                        gripping = any(grasp <= frame < release for grasp, release in plan[f"{side}_events"])
                         # Supports are held within a contact band of them and through a grasp landed there, so neither
                         # cloth gathered under a landing point nor cloth lifted in the jaw moves a tip's goal.
                         held[side] = floors if near or (gripping and held[side] is not None) else None
@@ -576,11 +620,13 @@ def run(scene, camera_fit, plan, args):
                         target = retarget[side].target(R_t, p_t, width, support, x_run[side][j - 1], press, floors)
                         x_run[side][j], info = retarget[side].solve(x_run[side][j - 1], target)
                         h_run[side][j] = retarget[side].hand(x_run[side][j], width)
-                        frame_log.append({"frame": j, "side": side, "delta_m": delta[side][j].tolist(),
+                        frame_log.append({"frame": j, "plan_frame": frame, "side": side,
+                                          "delta_m": delta[side][j].tolist(),
                                           "ik_position_error_m": max(info["thumb_pad_error_m"],
                                                                      info["index_pad_error_m"]),
                                           "ik_rotation_error_rad": info["approach_error_rad"],
                                           "support_depth_m": info["support_depth_m"],
+                                          "contact_height_error_m": info["contact_height_error_m"],
                                           "finger_floors_m": [f + float(p_s[2]) for f in floors],
                                           "finger_overlap_m": info["finger_overlap_m"]})
                 for m in range(1, substeps + 1):
@@ -603,8 +649,9 @@ def run(scene, camera_fit, plan, args):
                     checkpoint = world.capture_checkpoint()
                     checkpoint.write(str(output / f"checkpoint_{k + 1:05d}.bin"))
                     checkpoint.close()
-                if args.render_every and ((k + 1) % args.render_every == 0 or k + 1 == frames - 1):
+                if args.render_every and ((k + 1) % args.render_every == 0 or source[k + 1] == frames - 1):
                     render(k + 1)
+                k += 1
         reason = reason or "completed"
         flush_particles()
         session.close(reason)
@@ -613,14 +660,14 @@ def run(scene, camera_fit, plan, args):
                    "host_wall_seconds": time.perf_counter() - wall,
                    "wall_scope": "host wall time of the whole run including capture, IK and rendering",
                    "particle_chunks": particle_chunks, "alignment": {side: alignment[side].log for side in fk.SIDES},
-                   "aligned_frames": len(frame_log),
+                   "aligned_frames": len(frame_log), "holds": holds,
                    "aligned_ik_position_error_max_m": max([e["ik_position_error_m"] for e in frame_log], default=0.0),
                    "final_speed_max_mps": float(speeds.max()), "cloth_lowest_z_m": float(positions[:, 2].min()),
                    "table_top_m": scene["table"]["top_m"], "render_size": [render_w, render_h], "render_fov_deg": fov,
                    "claims_full_physics_acceptance": False}
         np.savez_compressed(output / "replay_targets.npz", **{f"{side}_retarget": x_run[side] for side in fk.SIDES},
                             **{f"{side}_hand": h_run[side] for side in fk.SIDES},
-                            **{f"{side}_delta": delta[side] for side in fk.SIDES})
+                            **{f"{side}_delta": delta[side] for side in fk.SIDES}, plan_frame=source)
         write_json(output / "alignment_log.json", frame_log)
         if tactile:
             write_json(output / "tactile_log.json", {side: tactile[side].log for side in fk.SIDES})
@@ -662,10 +709,18 @@ def main():
     parser.add_argument("--pinch-contact", choices=("pad", "tip"), default="tip",
                         help="thumb and index contact points the retarget places on the gripper's jaw pads")
     parser.add_argument("--tactile", action="store_true",
-                        help="close the pinch on the thumb and index distal contact wrenches (TactilePinch)")
-    parser.add_argument("--touch-force", type=float, default=1.0, help="support load each tip seeks in the band (N)")
-    parser.add_argument("--press-stiffness", type=float, default=2e4, help="tip load per metre of press (N/m)")
-    parser.add_argument("--press-rate", type=float, default=2e-4, help="largest press change per frame (m)")
+                        help="close the pinch on the thumb and index distal contact wrenches (TactilePinch), holding "
+                             "the recorded frame at each closing onset until both tips touch")
+    parser.add_argument("--touch-force", type=float, default=1.0,
+                        help="support load below which each tip keeps pressing deeper in the band (N)")
+    parser.add_argument("--contact-force", type=float, default=0.5,
+                        help="support load each tip carries, unless pressed to --press-max, before the recorded "
+                             "closing proceeds (N)")
+    parser.add_argument("--touch-frames", type=int, default=3,
+                        help="consecutive frames both tips carry --contact-force, or are pressed to --press-max, before "
+                             "the recorded closing proceeds")
+    parser.add_argument("--press-rate", type=float, default=5e-4,
+                        help="press deepening per frame below --touch-force (m)")
     parser.add_argument("--press-max", type=float, default=0.012, help="deepest press below a support (m)")
     parser.add_argument("--squeeze-force", type=float, default=3.0, help="pad squeeze that ends closing (N)")
     parser.add_argument("--squeeze-max", type=float, default=8.0, help="largest squeeze target after slips (N)")
