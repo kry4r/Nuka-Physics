@@ -249,13 +249,14 @@ __device__ float TileSideVelocity(BlockDescentSolveParams p, BlockScratch s, con
 }
 
 // RowInertialResponse in float: J M^-1 J^T over the row's rigid bodies and articulations, with both sides
-// on one owner summed first.
-__device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, const NkRow& row, uint32_t slot) {
+// on one owner summed first; `coupling` is the product of the two owners' shares.
+__device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, const NkRow& row, uint32_t slot,
+                                      float* coupling) {
     const NkRowSide sides[2] = {row.a, row.b};
     const bool shared = row.a.kind == row.b.kind && row.a.index == row.b.index;
     const size_t at = size_t{slot} * p.max_dof;
     const auto* jacobian_b = static_cast<const float*>(data.chain_jacobian_b) + at;
-    float response = 0.0f;
+    float response = 0.0f, shares[2] = {0.0f, 0.0f};
     bool valid = true;
     for (uint32_t i = 0u; i < (shared ? 1u : 2u); ++i) {
         const NkRowSide& side = sides[i];
@@ -273,7 +274,9 @@ __device__ float TileInertialResponse(DataView data, BlockDescentSolveParams p, 
         }
         valid &= contribution >= 0.0f && isfinite(contribution);
         response += contribution;
+        shares[i] = contribution;
     }
+    *coupling = shares[0] * shares[1];
     return valid && isfinite(response) ? response : nanf("");
 }
 
@@ -287,8 +290,11 @@ __device__ void InitializeTileHead(DataView data, BlockDescentSolveParams p, Blo
     const uint32_t axes = (row.flags & nk::nk_row_flags::kBlockNormal) != 0u ? 3u : 1u;
     const uint32_t owner = TileOwner(s, c, row.a);
     const uint32_t other = TileOwner(s, c, row.b);
-    const float response = TileInertialResponse(data, p, row, slot);
-    float rho = response > 0.0f ? p.penalty_scale / response : 0.0f;
+    float coupling = 0.0f;
+    const float response = TileInertialResponse(data, p, row, slot, &coupling);
+    const float coupled = coupling > 0.0f
+        ? (response + sqrtf(response * response + 12.0f * coupling)) / (6.0f * coupling) : FLT_MAX;
+    float rho = response > 0.0f ? fminf(p.penalty_scale / response, coupled) : 0.0f;
     if (!(response == 0.0f || (response > 0.0f && rho > 0.0f && rho <= FLT_MAX))) {
         atomicOr(data.env_status + c.env, kEnvStatusSolverFailure);
         VisitOwners(row, PointMasses(data), p, [&](uint32_t failed) {

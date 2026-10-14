@@ -930,55 +930,67 @@ __global__ void CachePointIncidenceJacobiansKernel(
     }
 }
 
-// J M^-1 J^T of a row over its owners; sets `grid` when a grid node owns it.
+// One owner's share of a row's J M^-1 J^T; sets `grid` when a grid node is the owner.
+__device__ double OwnerInertialResponse(const NkRow& row, const DataView& data,
+                                        const BlockDescentSolveParams& p, PointMassView points,
+                                        uint32_t slot, uint32_t owner, bool* grid) {
+    if (owner < p.total_particle_count ||
+        owner >= p.total_particle_count + p.total_body_count + p.articulation_count) {
+        const uint32_t kind = owner < p.total_particle_count ? kNkSideParticle : kNkSideGrid;
+        const uint32_t index = kind == kNkSideParticle ? owner
+            : owner - p.total_particle_count - p.total_body_count - p.articulation_count;
+        *grid |= kind == kNkSideGrid;
+        const Vec3 jacobian = PointJacobian(row, points, kind, index);
+        const double norm = double(jacobian.x) * jacobian.x + double(jacobian.y) * jacobian.y +
+                            double(jacobian.z) * jacobian.z;
+        return double(InertialPointResponse(PointMassView::Contribution{kind, index, {}}, data, p, points)) * norm;
+    }
+    if (owner < p.total_particle_count + p.total_body_count) {
+        const uint32_t body = owner - p.total_particle_count;
+        Vec3 linear{}, angular{};
+        const NkRowSide sides[2] = {row.a, row.b};
+        for (const NkRowSide& side : sides) {
+            if (side.kind != kNkSideRigid || side.index != body) continue;
+            linear += side.jlin;
+            angular += side.jang;
+        }
+        const double x = angular.x, y = angular.y, z = angular.z;
+        const SymmetricMat3 inverse = data.body_world_inv_inertia[body];
+        return double(data.body_inv_mass[body]) *
+            (double(linear.x) * linear.x + double(linear.y) * linear.y + double(linear.z) * linear.z) +
+            x * (double(inverse.xx) * x + double(inverse.xy) * y + double(inverse.xz) * z) +
+            y * (double(inverse.xy) * x + double(inverse.yy) * y + double(inverse.yz) * z) +
+            z * (double(inverse.xz) * x + double(inverse.yz) * y + double(inverse.zz) * z);
+    }
+    const uint32_t articulation = owner - p.total_particle_count - p.total_body_count;
+    const size_t at = size_t{slot} * p.max_dof;
+    const bool side_a = row.a.kind == kNkSideArtic && row.a.index == articulation;
+    const bool side_b = row.b.kind == kNkSideArtic && row.b.index == articulation;
+    const float* const J = (side_a ? data.chain_jacobian : data.chain_jacobian_b) + at;
+    const float* const extra = side_a && side_b ? data.chain_jacobian_b + at : nullptr;
+    const float* const factor = data.m_factor + size_t{articulation} * p.max_dof * p.max_dof;
+    return MassCoupling<double>(factor, p.max_dof, J, J, extra, extra);
+}
+
+// J M^-1 J^T of a row over its owners; sets `grid` when a grid node owns it and `coupling` to the
+// largest product of one owner's share with the other owners' shares.
 __device__ double RowInertialResponse(const NkRow& row, const DataView& data,
                                      const BlockDescentSolveParams& p, PointMassView points,
-                                     uint32_t slot, bool* grid) {
+                                     uint32_t slot, bool* grid, double* coupling) {
     double response = 0.0;
     bool valid = true;
     VisitOwners(row, points, p, [&](uint32_t owner) {
-        double contribution = 0.0;
-        if (owner < p.total_particle_count ||
-            owner >= p.total_particle_count + p.total_body_count + p.articulation_count) {
-            const uint32_t kind = owner < p.total_particle_count ? kNkSideParticle : kNkSideGrid;
-            const uint32_t index = kind == kNkSideParticle ? owner
-                : owner - p.total_particle_count - p.total_body_count - p.articulation_count;
-            *grid |= kind == kNkSideGrid;
-            const Vec3 jacobian = PointJacobian(row, points, kind, index);
-            const double norm = double(jacobian.x) * jacobian.x + double(jacobian.y) * jacobian.y +
-                                double(jacobian.z) * jacobian.z;
-            contribution = double(InertialPointResponse(
-                PointMassView::Contribution{kind, index, {}}, data, p, points)) * norm;
-        } else if (owner < p.total_particle_count + p.total_body_count) {
-            const uint32_t body = owner - p.total_particle_count;
-            Vec3 linear{}, angular{};
-            const NkRowSide sides[2] = {row.a, row.b};
-            for (const NkRowSide& side : sides) {
-                if (side.kind != kNkSideRigid || side.index != body) continue;
-                linear += side.jlin;
-                angular += side.jang;
-            }
-            const double x = angular.x, y = angular.y, z = angular.z;
-            const SymmetricMat3 inverse = data.body_world_inv_inertia[body];
-            contribution = double(data.body_inv_mass[body]) *
-                (double(linear.x) * linear.x + double(linear.y) * linear.y + double(linear.z) * linear.z) +
-                x * (double(inverse.xx) * x + double(inverse.xy) * y + double(inverse.xz) * z) +
-                y * (double(inverse.xy) * x + double(inverse.yy) * y + double(inverse.yz) * z) +
-                z * (double(inverse.xz) * x + double(inverse.yz) * y + double(inverse.zz) * z);
-        } else {
-            const uint32_t articulation = owner - p.total_particle_count - p.total_body_count;
-            const size_t at = size_t{slot} * p.max_dof;
-            const bool side_a = row.a.kind == kNkSideArtic && row.a.index == articulation;
-            const bool side_b = row.b.kind == kNkSideArtic && row.b.index == articulation;
-            const float* const J = (side_a ? data.chain_jacobian : data.chain_jacobian_b) + at;
-            const float* const extra = side_a && side_b ? data.chain_jacobian_b + at : nullptr;
-            const float* const factor = data.m_factor + size_t{articulation} * p.max_dof * p.max_dof;
-            contribution = MassCoupling<double>(factor, p.max_dof, J, J, extra, extra);
-        }
+        const double contribution = OwnerInertialResponse(row, data, p, points, slot, owner, grid);
         valid &= contribution >= 0.0 && isfinite(contribution);
         response += contribution;
     });
-    return valid && isfinite(response) ? response : nan("");
+    *coupling = 0.0;
+    if (!valid || !isfinite(response)) return nan("");
+    VisitOwners(row, points, p, [&](uint32_t owner) {
+        const double contribution = OwnerInertialResponse(row, data, p, points, slot, owner, grid);
+        *coupling = fmax(*coupling, contribution * (response - contribution));
+    });
+    return response;
 }
 
 __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, BlockScratch s) {
@@ -1019,9 +1031,14 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
             }
         }
         bool grid = false;
-        const double response = RowInertialResponse(row, data, p, points, slot, &grid);
-        const double penalty = response > 0.0 ? (grid ? kGridRowPenaltyScale : double(p.penalty_scale)) / response
-                                              : 0.0;
+        double coupling = 0.0;
+        const double response = RowInertialResponse(row, data, p, points, slot, &grid, &coupling);
+        // Owners a row ties descend against each other's stale velocities at the block Gauss-Seidel factor
+        // rho^2 P / (1 + rho W + rho^2 P), P = max w_i (W - w_i); the root below keeps it at most 1/4.
+        const double penalty_scale = grid ? kGridRowPenaltyScale : double(p.penalty_scale);
+        const double coupled = coupling > 0.0
+            ? (response + sqrt(response * response + 12.0 * coupling)) / (6.0 * coupling) : HUGE_VAL;
+        const double penalty = response > 0.0 ? fmin(penalty_scale / response, coupled) : 0.0;
         const bool valid_penalty = response == 0.0 ||
             (penalty > 0.0 && penalty <= double(FLT_MAX) && static_cast<float>(penalty) > 0.0f);
         if (!(response >= 0.0 && isfinite(response)) || !valid_penalty) {
@@ -2075,11 +2092,16 @@ __global__ void RecordSolveKernel(ModelView model, DataView data, BlockDescentSo
     }
 }
 
-// Coulomb residual of a contact row at the current velocities and multipliers.
+// Coulomb residual of a contact row at the current velocities and multipliers; `rate` gets the largest
+// velocity of an axis along its own impulse, which the contact audit bounds by the tolerance.
 __device__ constraint::CoulombContactResidual ContactRowResidual(DataView data, BlockDescentSolveParams p,
-                                                                 BlockScratch s, uint32_t slot, const NkRow& row) {
+                                                                 BlockScratch s, uint32_t slot, const NkRow& row,
+                                                                 float* rate = nullptr) {
     const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false);
     const Vec3 velocity{-t.residual.x + t.compliance * t.dual.x, -t.residual.y, -t.residual.z};
+    const auto along = [](float impulse, float v) { return impulse > 0.0f ? v : impulse < 0.0f ? -v : 0.0f; };
+    if (rate != nullptr)
+        *rate = fmaxf(along(t.dual.x, velocity.x), fmaxf(along(t.dual.y, velocity.y), along(t.dual.z, velocity.z)));
     return constraint::EvaluateCoulombContactResidual(
         data.row_contact_response[slot], velocity, t.dual, row.mu, row.friction_secondary);
 }
@@ -2189,9 +2211,11 @@ __global__ void UnconvergedRowsKernel(DataView data, BlockDescentSolveParams p, 
         const uint32_t slot = s.active_rows[item];
         const NkRow row = rows[slot];
         if (!(row.flags & nk::nk_row_flags::kBlockNormal)) continue;
-        const auto residual = ContactRowResidual(data, p, s, slot, row);
+        float rate = 0.0f;
+        const auto residual = ContactRowResidual(data, p, s, slot, row, &rate);
         if (!residual.valid || !(residual.normal_natural_velocity <= p.velocity_tolerance) ||
-            !(residual.tangent_natural_velocity <= p.velocity_tolerance)) *unconverged = 1u;
+            !(residual.tangent_natural_velocity <= p.velocity_tolerance) || !(rate <= p.velocity_tolerance))
+            *unconverged = 1u;
     }
 }
 
