@@ -17,6 +17,7 @@ namespace nuka::scene::cook {
 
 struct MediaRenderSurface {
     std::vector<uint32_t> triangles;            // 3 global particle indices per triangle
+    std::vector<float>    corner_uvs;           // 6 per triangle: material-space metres at each corner, or empty
     float                 normal_offset = 0.0f;  // outward inflation along the smooth normal
     uint32_t              smooth_iters = 0u;      // Laplacian relaxation passes (render-only)
     float                 smooth_lambda = 0.5f;   // per-pass blend weight in [0,1]

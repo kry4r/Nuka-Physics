@@ -33,10 +33,12 @@ rt::BlasMesh MeshToBlas(const MeshGeometry& geo) {
     if (has_normals) {
         blas.tri_normals.reserve(tri_count);
     }
-    // Per-vertex UVs feed the beauty texture path; absent => triplanar fallback.
+    // Per-corner or per-vertex UVs feed the beauty texture path; absent => triplanar fallback.
+    const bool has_corner_uvs = geo.corner_uvs.size() == static_cast<size_t>(tri_count) * 6u &&
+                                tri_count > 0u;
     const bool has_uvs = geo.uvs.size() == (geo.positions.size() / 3u) * 2u &&
                          !geo.uvs.empty();
-    if (has_uvs) {
+    if (has_uvs || has_corner_uvs) {
         blas.tri_uvs.reserve(tri_count);
     }
     for (uint32_t t = 0; t < tri_count; ++t) {
@@ -59,7 +61,11 @@ rt::BlasMesh MeshToBlas(const MeshGeometry& geo) {
             };
             blas.tri_normals.push_back({nrm(i0), nrm(i1), nrm(i2)});
         }
-        if (has_uvs) {
+        if (has_corner_uvs) {
+            const float* c = geo.corner_uvs.data() + static_cast<size_t>(t) * 6u;
+            blas.tri_uvs.push_back({math::Vec3{c[0], c[1], 0.0f}, math::Vec3{c[2], c[3], 0.0f},
+                                    math::Vec3{c[4], c[5], 0.0f}});
+        } else if (has_uvs) {
             const auto uv = [&geo](uint32_t i) -> math::Vec3 {
                 return {geo.uvs[i * 2u + 0u], geo.uvs[i * 2u + 1u], 0.0f};
             };
@@ -107,6 +113,14 @@ rt::Material RenderMaterialToRt(const scene::RenderMaterial& m,
     out.normal_tex = textures.Resolve(m.normal_map, false);
     out.uv_scale = m.uv_scale > 0.0f ? m.uv_scale : 1.0f;
     out.triplanar = m.triplanar ? 1u : 0u;
+    out.weave = m.weave.pattern;
+    out.weft_albedo = {m.weave.weft_color[0], m.weave.weft_color[1], m.weave.weft_color[2]};
+    out.fiber_roughness = m.weave.fiber_roughness;
+    out.fiber_twist = m.weave.fiber_twist;
+    out.fiber_depth = m.weave.fiber_depth;
+    out.fiber_specular = m.weave.fiber_specular;
+    out.yarn_gap = m.weave.yarn_gap;
+    out.yarn_height = m.weave.yarn_height;
     return out;
 }
 

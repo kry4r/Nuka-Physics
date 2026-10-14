@@ -644,6 +644,7 @@ Value SaveMedia(const MediaRecord& m, MeshSink& sink) {
         xp.Set("poisson", Value::Float(mv.poisson));
         xp.Set("bend_stiffness", Value::Float(mv.bend_stiffness));
         xp.Set("damping", Value::Float(mv.damping));
+        if (mv.compression_ratio != 1.0f) xp.Set("compression_ratio", Value::Float(mv.compression_ratio));
         xp.Set("aero_drag_normal", Value::Float(mv.aero_drag_normal));
         xp.Set("aero_drag_tangent", Value::Float(mv.aero_drag_tangent));
         xp.Set("aero_drag_max_dv", Value::Float(mv.aero_drag_max_dv));
@@ -765,6 +766,38 @@ Value SaveScript(const ScriptRecord& s) {
 // carries the name, and the attached body is the parent body node — so there is
 // no record-array Save helper for them under the §3.7 tree form.
 
+// Woven-cloth block: "pattern" names the weave; every other key keeps its default when absent.
+ClothWeave WeaveFromJson(const Value& v) {
+    ClothWeave w;
+    const std::string pattern = v.At("pattern").AsString();
+    if (pattern != "plain") throw std::runtime_error("nks: unknown weave pattern '" + pattern + "'");
+    w.pattern = 1u;
+    if (const Value* c = v.Find("weft_color"))
+        for (size_t i = 0u; i < 3u; ++i) w.weft_color[i] = FloatAt(*c, i, "weft_color");
+    if (const Value* f = v.Find("fiber_roughness")) w.fiber_roughness = f->AsFloat();
+    if (const Value* f = v.Find("fiber_twist")) w.fiber_twist = f->AsFloat();
+    if (const Value* f = v.Find("fiber_depth")) w.fiber_depth = f->AsFloat();
+    if (const Value* f = v.Find("fiber_specular")) w.fiber_specular = f->AsFloat();
+    if (const Value* f = v.Find("yarn_gap")) w.yarn_gap = f->AsFloat();
+    if (const Value* f = v.Find("yarn_height")) w.yarn_height = f->AsFloat();
+    return w;
+}
+
+Value WeaveJson(const ClothWeave& w) {
+    Value o = Value::Object();
+    o.Set("pattern", Value::Str("plain"));
+    Value c = Value::Array();
+    for (float x : w.weft_color) c.PushBack(Value::Float(x));
+    o.Set("weft_color", std::move(c));
+    o.Set("fiber_roughness", Value::Float(w.fiber_roughness));
+    o.Set("fiber_twist", Value::Float(w.fiber_twist));
+    o.Set("fiber_depth", Value::Float(w.fiber_depth));
+    o.Set("fiber_specular", Value::Float(w.fiber_specular));
+    o.Set("yarn_gap", Value::Float(w.yarn_gap));
+    o.Set("yarn_height", Value::Float(w.yarn_height));
+    return o;
+}
+
 // The authored MaterialRecord (the cook-fidelity authority) carries BOTH render
 // fields (base_color/alpha/roughness/metallic) and a physics field (friction_mu).
 // §3.7 splits these into two keyed sections. We store the record's raw values so
@@ -801,6 +834,7 @@ Value SaveRenderMaterial(const MaterialRecord& m) {
     if (!m.normal_map.empty()) o.Set("normal_map", Value::Str(m.normal_map));
     if (m.uv_scale != 1.0f) o.Set("uv_scale", Value::Float(m.uv_scale));
     if (!m.triplanar) o.Set("triplanar", Value::Bool(false));
+    if (m.weave.pattern != 0u) o.Set("weave", WeaveJson(m.weave));
     return o;
 }
 
@@ -1262,6 +1296,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 if (const Value* nm = rm.Find("normal_map")) rec.normal_map = nm->AsString();
                 if (const Value* us = rm.Find("uv_scale")) rec.uv_scale = us->AsFloat();
                 if (const Value* tp = rm.Find("triplanar")) rec.triplanar = tp->AsBool();
+                if (const Value* wv = rm.Find("weave")) rec.weave = WeaveFromJson(*wv);
                 if (phys) {
                     if (const Value* pm = phys->Find(kv.first)) {
                         rec.friction_mu = pm->At("static_friction").AsFloat();
@@ -1792,6 +1827,7 @@ void LoadInto(SceneIR& scene, const Value& root, const std::filesystem::path& ba
                 out.poisson = f(xp, "poisson", out.poisson);
                 out.bend_stiffness = f(xp, "bend_stiffness", out.bend_stiffness);
                 out.damping = f(xp, "damping", out.damping);
+                out.compression_ratio = f(xp, "compression_ratio", out.compression_ratio);
                 out.aero_drag_normal = f(xp, "aero_drag_normal", out.aero_drag_normal);
                 out.aero_drag_tangent = f(xp, "aero_drag_tangent", out.aero_drag_tangent);
                 out.aero_drag_max_dv = f(xp, "aero_drag_max_dv", out.aero_drag_max_dv);

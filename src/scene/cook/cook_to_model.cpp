@@ -2221,6 +2221,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
         shells[f].poisson = face_material[f]->poisson;
         shells[f].bend_stiffness = face_material[f]->bend_stiffness;
         shells[f].damping = face_material[f]->damping;
+        shells[f].compression_ratio = face_material[f]->compression_ratio;
     }
     runtime::soft::BuildClothVertexBlocks(rest, tris, geometry.material_faces, shells, in.vbd_elements);
     in.vbd_begin = 0u;
@@ -2441,6 +2442,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             for (uint32_t& t : tris) t += base;
             MediaRenderSurface s;
             s.triangles = std::move(tris);
+            for (const auto& face : geometry.material_faces)
+                for (const auto& corner : face) s.corner_uvs.insert(s.corner_uvs.end(), {corner.x, corner.y});
             s.normal_offset = m.render_skin.normal_offset;
             s.smooth_iters = m.render_skin.smooth_iters;
             s.smooth_lambda = m.render_skin.smooth_lambda;

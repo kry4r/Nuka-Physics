@@ -136,8 +136,11 @@ RenderBeautyKernel(PinholeCamera camera,
             }
             Nsh = ApplyMaterialTextures(instances, textures, bp, hit, u, v, Nsh,
                                         &mat, true);
+            WeaveHit weave;
+            const bool woven = ApplyWeave(instances, bp, u, v, Nsh, &mat, &weave);
             col = ShadeBeauty(tlas_nodes, tlas_leaf_count, instances, materials,
-                              light, sky, hit, Nsh, Vv, mat, &rng, textures);
+                              light, sky, hit, Nsh, Vv, mat, &rng, textures, nullptr,
+                              woven ? &weave : nullptr);
         }
         // Height/distance fog toward the sky-horizon: blend by 1-exp(-density*t).
         if (sky.fog_density > 0.0f) {

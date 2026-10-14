@@ -19,6 +19,7 @@ struct ShellMaterial {
     float poisson = 0.0f;
     float bend_stiffness = 0.0f;     // N m
     float damping = 0.0f;            // Rayleigh coefficient, s
+    float compression_ratio = 1.0f;  // compressive over tensile membrane stiffness, (0, 1]
 };
 
 // Axial and bending response of a vertex-block rod.

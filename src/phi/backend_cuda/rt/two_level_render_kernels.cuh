@@ -1039,6 +1039,129 @@ __device__ __forceinline__ void ResolveLightVector(const Light& light,
     *out_dist = dist;
 }
 
+// Woven-cloth hit (Zhu et al. 2023): orthonormal UV frame on the shading normal, the
+// position in yarn spacings, and the world ply normal and fiber tangent of the visible yarn.
+struct WeaveHit {
+    Vec3 T, B, N;
+    float u, v;
+    Vec3 n_p, t;
+    int yarn;  // 0 warp, 1 weft, -1 gap
+};
+
+// Plain weave (Irawan & Marschner 2012 geometry) in spacings: warp i runs along v and lies
+// over weft j where i + j is even. Returns the visible height and its slopes.
+__device__ __forceinline__ float WeaveHeight(float u, float v, float gap, float h,
+                                             float* dhdu, float* dhdv, int* yarn) {
+    const float w = 1.0f - gap;
+    const float fu = floorf(u), fv = floorf(v);
+    const float a = u - fu - 0.5f, b = v - fv - 0.5f;
+    const float s = ((static_cast<int>(fu) + static_cast<int>(fv)) & 1) != 0 ? -1.0f : 1.0f;
+    const float pi = RtMathPi();
+    const float ca = 2.0f * a / w, cb = 2.0f * b / w;
+    float height = -2.0f * h;
+    *dhdu = 0.0f; *dhdv = 0.0f; *yarn = -1;
+    if (fabsf(ca) < 1.0f) {
+        const float e = sqrtf(fmaxf(1.0f - ca * ca, 1.0e-2f));
+        height = h * (s * cosf(pi * b) + e);
+        *dhdu = -h * ca * (2.0f / w) / e;
+        *dhdv = -h * s * pi * sinf(pi * b);
+        *yarn = 0;
+    }
+    if (fabsf(cb) < 1.0f) {
+        const float e = sqrtf(fmaxf(1.0f - cb * cb, 1.0e-2f));
+        const float weft = h * (e - s * cosf(pi * a));
+        if (*yarn < 0 || weft > height) {
+            height = weft;
+            *dhdu = h * s * pi * sinf(pi * a);
+            *dhdv = -h * cb * (2.0f / w) / e;
+            *yarn = 1;
+        }
+    }
+    return height;
+}
+
+// Weave frame and visible yarn at a triangle hit with authored UVs (false: shade as usual).
+// The yarn albedo replaces mat->albedo: warp base color, weft color, black through gaps.
+__device__ __forceinline__ bool ApplyWeave(const DevInstance* __restrict__ instances,
+                                           uint32_t packed_prim, float bu, float bv,
+                                           const Vec3& n_world, Material* mat, WeaveHit* out) {
+    if (mat->weave == 0u) return false;
+    uint32_t inst, local_prim;
+    UnpackPrimId(packed_prim, &inst, &local_prim);
+    const DevInstance& I = instances[inst];
+    const DevBlas& b = I.blas;
+    const DevPrim p = b.prims[local_prim];
+    if (b.tri_uv0 == nullptr || p.kind != static_cast<uint32_t>(PrimKind::Triangle)) return false;
+    const Vec3 uv0 = b.tri_uv0[p.sub], uv1 = b.tri_uv1[p.sub], uv2 = b.tri_uv2[p.sub];
+    const float du1 = uv1.x - uv0.x, dv1 = uv1.y - uv0.y;
+    const float du2 = uv2.x - uv0.x, dv2 = uv2.y - uv0.y;
+    const float det = du1 * dv2 - du2 * dv1;
+    if (det == 0.0f) return false;
+    const Vec3 e1 = b.tri_v1[p.sub] - b.tri_v0[p.sub];
+    const Vec3 e2 = b.tri_v2[p.sub] - b.tri_v0[p.sub];
+    const Vec3 Tw = QuatRotate(I.transform.rotation, (e1 * dv2 - e2 * dv1) * (1.0f / det));
+    const Vec3 Bw = QuatRotate(I.transform.rotation, (e2 * du1 - e1 * du2) * (1.0f / det));
+    // Mirrored pattern panels keep B on the +v side of the shading normal.
+    const Vec3& N = n_world;
+    const Vec3 T = RtNormalize<float>(Tw - N * N.Dot(Tw));
+    const Vec3 c = N.Cross(T);
+    const Vec3 B = c.Dot(Bw) < 0.0f ? -c : c;
+    const float w0 = 1.0f - bu - bv;
+    out->u = (w0 * uv0.x + bu * uv1.x + bv * uv2.x) * mat->uv_scale;
+    out->v = (w0 * uv0.y + bu * uv1.y + bv * uv2.y) * mat->uv_scale;
+    float gu, gv;
+    WeaveHeight(out->u, out->v, mat->yarn_gap, mat->yarn_height, &gu, &gv, &out->yarn);
+    const Vec3 n_ts = RtNormalize<float>(Vec3{-gu, -gv, 1.0f});
+    const Vec3 y_ts = out->yarn == 1 ? Vec3{1.0f, 0.0f, gu} : Vec3{0.0f, 1.0f, gv};
+    const Vec3 t0 = RtNormalize<float>(y_ts - n_ts * n_ts.Dot(y_ts));
+    const Vec3 t_ts = t0 * cosf(mat->fiber_twist) + n_ts.Cross(t0) * sinf(mat->fiber_twist);
+    out->T = T; out->B = B; out->N = N;
+    out->n_p = RtNormalize<float>(T * n_ts.x + B * n_ts.y + N * n_ts.z);
+    out->t = RtNormalize<float>(T * t_ts.x + B * t_ts.y + N * t_ts.z);
+    mat->albedo = out->yarn == 0 ? mat->albedo
+                                 : (out->yarn == 1 ? mat->weft_albedo : Vec3{0.0f, 0.0f, 0.0f});
+    return true;
+}
+
+// Meso visibility toward d: march one yarn spacing of the height field along d's heading.
+__device__ __forceinline__ float WeaveVisible(const WeaveHit& w, const Material& mat,
+                                              const Vec3& d) {
+    const float dx = d.Dot(w.T), dy = d.Dot(w.B), dz = d.Dot(w.N);
+    const float len = sqrtf(dx * dx + dy * dy);
+    if (dz <= 0.0f) return 0.0f;
+    if (len <= 0.0f) return 1.0f;
+    float gu, gv;
+    int yarn;
+    const float h0 = WeaveHeight(w.u, w.v, mat.yarn_gap, mat.yarn_height, &gu, &gv, &yarn);
+    const float slope = dz / len;
+    constexpr int kSteps = 8;
+    for (int k = 1; k <= kSteps; ++k) {
+        const float s = static_cast<float>(k) / static_cast<float>(kSteps);
+        if (WeaveHeight(w.u + dx / len * s, w.v + dy / len * s, mat.yarn_gap, mat.yarn_height,
+                        &gu, &gv, &yarn) > h0 + slope * s)
+            return 0.0f;
+    }
+    return 1.0f;
+}
+
+// Micro BSDF of the yarn without its albedo: SpongeCake single scattering from SGGX fiber
+// flakes along t at optical depth fiber_depth (Wang et al. 2022), plus the diffuse share.
+__device__ __forceinline__ float WeaveFiberBsdf(const WeaveHit& w, const Material& mat,
+                                                const Vec3& L, const Vec3& V) {
+    const float ci = w.n_p.Dot(L), co = w.n_p.Dot(V);
+    if (ci <= 0.0f || co <= 0.0f) return 0.0f;
+    const Vec3 h = RtNormalize<float>(L + V);
+    const float a = mat.fiber_roughness, a2 = a * a;
+    const float ht = h.Dot(w.t), lt = L.Dot(w.t), vt = V.Dot(w.t);
+    const float q = ht * ht / a2 + 1.0f - ht * ht;
+    const float D = 1.0f / (RtMathPi() * a * q * q);
+    const float li = sqrtf(fmaxf(0.0f, 1.0f - (1.0f - a2) * lt * lt)) / ci;
+    const float lo = sqrtf(fmaxf(0.0f, 1.0f - (1.0f - a2) * vt * vt)) / co;
+    const float sponge = D * (1.0f - expf(-mat.fiber_depth * (li + lo))) /
+                         (4.0f * ci * co * (li + lo));
+    return mat.fiber_specular * sponge + (1.0f - mat.fiber_specular) / RtMathPi();
+}
+
 template <typename Rng>
 __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_nodes,
                                   uint32_t tlas_leaf_count,
@@ -1048,7 +1171,8 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
                                   const Vec3& Nf, const Vec3& V, const Material& mat,
                                   Rng* rng,
                                   const DevTexture* __restrict__ textures = nullptr,
-                                  const Vec3* cam_pos = nullptr) {
+                                  const Vec3* cam_pos = nullptr,
+                                  const WeaveHit* weave = nullptr) {
     // Sun direction (toward the light) + a finite angular size -> penumbra.
     Vec3 Ls;
     float light_dist;
@@ -1092,7 +1216,16 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
 
     const float kd = (1.0f - mat.metallic) * (1.0f / RtMathPi());
     Vec3 direct;
-    if (sky.specular_env == 0u) {
+    if (weave != nullptr) {
+        // Woven cloth: one meso sample per pixel sample, weighted by its projected area over
+        // the macro normal and its meso visibility (Zhu et al. 2023, effective BSDF).
+        const float proj = weave->n_p.Dot(Ls) * weave->n_p.Dot(V) /
+                           (fmaxf(1.0e-4f, Nf.Dot(weave->n_p)) * fmaxf(1.0e-4f, Nf.Dot(V)));
+        const float f = WeaveFiberBsdf(*weave, mat, Ls, V) * proj * WeaveVisible(*weave, mat, Ls) *
+                        WeaveVisible(*weave, mat, V) * vis;
+        direct = Vec3{light_col.x * mat.albedo.x * f, light_col.y * mat.albedo.y * f,
+                      light_col.z * mat.albedo.z * f};
+    } else if (sky.specular_env == 0u) {
         // Achromatic D-only highlight -- the sensor/golden byte-identical arm.
         const float spec = (a2 / (RtMathPi() * dterm * dterm)) * (0.04f + mat.metallic);
         direct = Vec3{light_col.x * (mat.albedo.x * kd + spec) * NoL * vis,
@@ -1179,8 +1312,9 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
     const float inv_m = 1.0f / static_cast<float>(M);
     indirect.x *= inv_m; indirect.y *= inv_m; indirect.z *= inv_m;
 
-    // Indirect modulates the surface albedo (Lambert response to ambient/bounce).
-    if (sky.specular_env == 0u) {
+    // Indirect modulates the surface albedo (Lambert response to ambient/bounce); woven
+    // cloth has no mirror lobe.
+    if (sky.specular_env == 0u || weave != nullptr) {
         return Vec3{direct.x + mat.albedo.x * indirect.x,
                     direct.y + mat.albedo.y * indirect.y,
                     direct.z + mat.albedo.z * indirect.z};

@@ -220,6 +220,7 @@ struct MaterialRecord {
     std::string normal_map;
     float uv_scale                         = 1.0f;
     bool  triplanar                        = true;
+    ClothWeave weave;
 };
 
 // Scene-level HDR environment backing the offline beauty render (equirect
@@ -336,6 +337,7 @@ struct MediaVbdMaterial {
     float    poisson           = 0.0f;   // cloth membrane Poisson ratio
     float    bend_stiffness    = 0.0f;   // cloth hinge (N m); cable EI (N m^2)
     float    damping           = 0.0f;   // Rayleigh coefficient on the elastic stiffness (s)
+    float    compression_ratio = 1.0f;   // cloth compressive over tensile membrane stiffness, (0, 1]
     float    aero_drag_normal  = 0.0f;
     float    aero_drag_tangent = 0.0f;
     float    aero_drag_max_dv  = 0.0f;

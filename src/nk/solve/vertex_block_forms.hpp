@@ -36,11 +36,12 @@ NUKA_VBD_HD inline void PositiveStress(float s00, float s01, float s11, float* o
 }
 
 // One element's curvature: Gauss-Newton at the current geometry or the Rayleigh metric of the interval
-// start. Triangles keep F, the clamped stress, the unit normal and the area-barrier factor.
+// start. Triangles keep F, the clamped stress, the unit normal, the area-barrier factor and the tangent.
 struct ElementCurvature {
     Vec3 f0, f1, normal;
     float stress[3] = {};
     float barrier = 0.0f;
+    MembraneTangent tangent;
     // Hinges and bent rods act through angle gradients, springs along `normal` with a lateral share and
     // straight rods through their segment projectors with the segment-order sign.
     Vec3 q[4];
@@ -66,12 +67,19 @@ NUKA_VBD_HD inline ElementCurvature GaussNewtonCurvature(const VbdElement& e, co
         const float mu = e.rest[5], lambda = e.rest[6], trace = t.g00 + t.g11;
         c.f0 = t.f0;
         c.f1 = t.f1;
-        PositiveStress(2.0f * mu * t.g00 + lambda * trace, 2.0f * mu * t.g01,
-                       2.0f * mu * t.g11 + lambda * trace, c.stress);
+        if (e.rest[7] > 0.0f) {
+            c.tangent = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
+            float s[3];
+            SoftenedStress(c.tangent, mu, lambda, t.g00, t.g11, t.g01, s);
+            PositiveStress(s[0], s[2], s[1], c.stress);
+        } else {
+            PositiveStress(2.0f * mu * t.g00 + lambda * trace, 2.0f * mu * t.g01,
+                           2.0f * mu * t.g11 + lambda * trace, c.stress);
+        }
         const Vec3 n = t.f0.Cross(t.f1);
         const float length = Norm(n), J = 1.0f + t.area_change;
         if (length > 0.0f) c.normal = n / length;
-        if (t.area_change < 0.0f && J > 0.0f && length > 0.0f) c.barrier = mu / (J * J);
+        if (t.area_change < 0.0f && J > 0.0f && length > 0.0f) c.barrier = mu * (1.0f - e.rest[7]) / (J * J);
         return c;
     }
     Vec3 x[4];
@@ -118,7 +126,8 @@ NUKA_VBD_HD inline ElementCurvature RayleighCurvature(const VbdElement& e, const
             return c;
         }
         c.normal = n / length;
-        if (t.area_change < 0.0f) c.barrier = e.rest[5] / (J * J);
+        if (e.rest[7] > 0.0f) c.tangent = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
+        if (t.area_change < 0.0f) c.barrier = e.rest[5] * (1.0f - e.rest[7]) / (J * J);
         return c;
     }
     Vec3 x[4];
@@ -191,6 +200,13 @@ NUKA_VBD_HD inline float ElementForm(const VbdElement& e, const ElementCurvature
                                      const ElementVariation& x, const ElementVariation& y) {
     if (e.kind == kVbdTriangle) {
         const float mu = e.rest[5], lambda = e.rest[6];
+        if (e.rest[7] > 0.0f) {
+            float s[3];
+            SoftenedStress(c.tangent, mu, lambda, y.g00, y.g11, y.g01, s);
+            return e.rest[4] * (x.g00 * s[0] + x.g11 * s[1] + 2.0f * x.g01 * s[2] + c.stress[0] * x.a.Dot(y.a) +
+                                c.stress[2] * x.b.Dot(y.b) + c.stress[1] * (x.a.Dot(y.b) + x.b.Dot(y.a)) +
+                                c.barrier * x.s * y.s);
+        }
         return e.rest[4] * (2.0f * mu * (x.g00 * y.g00 + x.g11 * y.g11 + 2.0f * x.g01 * y.g01) +
                             lambda * (x.g00 + x.g11) * (y.g00 + y.g11) + c.stress[0] * x.a.Dot(y.a) +
                             c.stress[2] * x.b.Dot(y.b) + c.stress[1] * (x.a.Dot(y.b) + x.b.Dot(y.a)) +
@@ -256,6 +272,7 @@ NUKA_VBD_HD inline float ElementMovesEnergyChange(const VbdElement& e, const Ele
         const float area_step = n.Dot(n + turn) > 0.0f && moved_sq > 0.0f
             ? growth / (sqrtf(moved_sq) + J) : -1.0f - t.area_change;
         const float barrier = AreaBarrierChange(t.area_change, area_step);
+        if (e.rest[7] > 0.0f) return e.rest[4] * SoftenedEnergyChange(e, t, c00, c11, c01, barrier);
         return e.rest[4] * (e.rest[5] * (c00 * (2.0f * t.g00 + c00) + c11 * (2.0f * t.g11 + c11) +
                                          2.0f * c01 * (2.0f * t.g01 + c01) + barrier) +
                             0.5f * e.rest[6] * change * (2.0f * trace + change));

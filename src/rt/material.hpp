@@ -45,6 +45,17 @@ struct Material {
     int   normal_tex    = -1;
     float uv_scale      = 1.0f;    // tiles per world metre (triplanar) or per UV unit
     uint32_t triplanar  = 1u;      // 1 => world-space triplanar for no-UV geometry
+
+    // Woven cloth over authored UVs (uv_scale = yarns per metre), beauty-only; weave 0
+    // (default) is a strict no-op. Fields mirror scene::ClothWeave.
+    uint32_t weave = 0u;
+    math::Vec3 weft_albedo{0.8f, 0.8f, 0.8f};
+    float fiber_roughness = 0.2f;
+    float fiber_twist = 0.45f;
+    float fiber_depth = 3.0f;
+    float fiber_specular = 0.5f;
+    float yarn_gap = 0.1f;
+    float yarn_height = 0.18f;
 };
 
 // One decoded image texture (host). texels are row-major, `channels` floats per

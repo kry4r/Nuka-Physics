@@ -75,6 +75,7 @@ nuka_result_t EnsureBeautyBridge(WorldRecord* record, uint32_t width, uint32_t h
         if (s.triangles.empty()) continue;
         nuka::runtime::soft::SurfaceTopology topo;
         topo.triangles = s.triangles;
+        topo.corner_uvs = s.corner_uvs;
         topo.normal_offset = s.normal_offset;
         topo.smooth_iters = s.smooth_iters;
         topo.smooth_lambda = s.smooth_lambda;

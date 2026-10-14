@@ -849,6 +849,7 @@ void SceneIR::ProjectMaterial(const MaterialRecord& rec) {
     rm.normal_map    = rec.normal_map;
     rm.uv_scale      = rec.uv_scale;
     rm.triplanar     = rec.triplanar;
+    rm.weave         = rec.weave;
 
     PhysicsMaterial pm;
     if (rec.friction_mu >= 0.0f) {

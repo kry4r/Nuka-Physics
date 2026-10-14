@@ -32,6 +32,7 @@ namespace nuka::runtime::soft {
 // a sharp visual spike; `smooth_lambda` is the per-pass blend weight.
 struct SurfaceTopology {
     std::vector<uint32_t> triangles;       // 3 indices per triangle
+    std::vector<float>    corner_uvs;      // 6 per triangle, or empty
     float                 normal_offset = 0.0f;  // outward inflation along the smooth normal
     uint32_t              smooth_iters = 0u;      // Laplacian relaxation passes (render-only)
     float                 smooth_lambda = 0.5f;   // per-pass blend weight in [0,1]

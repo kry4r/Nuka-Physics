@@ -18,7 +18,7 @@
 
 namespace nuka::nk {
 
-// Membrane triangle: rest = inverse material edges (row-major 2x2), area, mu, lambda.
+// Membrane triangle: rest = inverse material edges (row-major 2x2), area, mu, lambda, compression softening.
 inline constexpr uint32_t kVbdTriangle = 0u;
 // Dihedral hinge over edge (v0, v1) with opposite vertices v2, v3: rest = angle, stiffness.
 inline constexpr uint32_t kVbdHinge = 1u;
@@ -283,8 +283,114 @@ NUKA_VBD_HD inline float AreaBarrierChange(float d, float s) {
     return s * d / (1.0f + d) + tail;
 }
 
+// Woven fabric buckles under a small share of its tensile stiffness (tension-field theory; Choi and Ko
+// 2002): softening s keeps 1 - s of the stiffness on negative principal strains, the trace and area loss.
+struct MembraneTangent {
+    float high = 1.0f, low = 1.0f, shear = 1.0f, trace = 1.0f;
+    float e_high = 0.0f, e_low = 0.0f, cosine = 1.0f, sine = 0.0f;
+};
+
+// Principal Green strains, the high principal direction and the stiffness share of each mode.
+NUKA_VBD_HD inline MembraneTangent SoftenedTangent(float soft, float g00, float g11, float g01) {
+    MembraneTangent m;
+    const float mean = 0.5f * (g00 + g11), half = 0.5f * (g00 - g11);
+    const float radius = sqrtf(half * half + g01 * g01);
+    m.e_high = mean + radius;
+    m.e_low = mean - radius;
+    m.high = m.e_high < 0.0f ? 1.0f - soft : 1.0f;
+    m.low = m.e_low < 0.0f ? 1.0f - soft : 1.0f;
+    m.trace = g00 + g11 < 0.0f ? 1.0f - soft : 1.0f;
+    // Shear share (k_h e_h - k_l e_l) / (e_h - e_l); only mixed signs differ from a common share.
+    m.shear = m.high == m.low ? m.high : (m.e_high - m.low * m.e_low) / (2.0f * radius);
+    const float a = half >= 0.0f ? half + radius : g01, b = half >= 0.0f ? g01 : radius - half;
+    const float length = sqrtf(a * a + b * b);
+    if (length > 0.0f) {
+        m.cosine = a / length;
+        m.sine = b / length;
+    }
+    return m;
+}
+
+// Tangent stress (s00, s11, s01) for the strain (x00, x11, x01); at the strain itself it is the stress.
+NUKA_VBD_HD inline void SoftenedStress(const MembraneTangent& m, float mu, float lambda,
+                                       float x00, float x11, float x01, float* out) {
+    const float c = m.cosine, s = m.sine;
+    const float hh = c * c * x00 + 2.0f * c * s * x01 + s * s * x11;
+    const float ll = s * s * x00 - 2.0f * c * s * x01 + c * c * x11;
+    const float hl = c * s * (x11 - x00) + (c * c - s * s) * x01;
+    const float volume = lambda * m.trace * (x00 + x11);
+    const float sh = 2.0f * mu * m.high * hh + volume, sl = 2.0f * mu * m.low * ll + volume;
+    const float shl = 2.0f * mu * m.shear * hl;
+    out[0] = c * c * sh - 2.0f * c * s * shl + s * s * sl;
+    out[1] = s * s * sh + 2.0f * c * s * shl + c * c * sl;
+    out[2] = c * s * (sh - sl) + (c * c - s * s) * shl;
+}
+
+// Material Hessian block at a vertex of weights (bx, by) along the principal deformed directions.
+NUKA_VBD_HD inline SymmetricMat3 SoftenedMaterialBlock(const MembraneTangent& m, float mu, float lambda,
+                                                      Vec3 f0, Vec3 f1, float bx, float by) {
+    const float c = m.cosine, s = m.sine;
+    const Vec3 ph = f0 * c + f1 * s, pl = f1 * c - f0 * s;
+    const float bh = bx * c + by * s, bl = by * c - bx * s;
+    SymmetricMat3 h = Outer(ph, 2.0f * mu * m.high * bh * bh);
+    AddTo(h, Outer(pl, 2.0f * mu * m.low * bl * bl));
+    AddTo(h, Outer(pl * bh + ph * bl, mu * m.shear));
+    AddTo(h, Outer(f0 * bx + f1 * by, lambda * m.trace));
+    return h;
+}
+
+// Change of k x^2, k = 1 - soft below zero, as x moves by d; a product of d while k stays.
+NUKA_VBD_HD inline float SoftenedSquareChange(float x, float d, float soft) {
+    const float moved = x + d;
+    const float kx = x < 0.0f ? 1.0f - soft : 1.0f, km = moved < 0.0f ? 1.0f - soft : 1.0f;
+    return kx == km ? kx * d * (2.0f * x + d) : km * moved * moved - kx * x * x;
+}
+
+// Softened energy change per rest area for the strain change (c00, c11, c01) and area-barrier change.
+NUKA_VBD_HD inline float SoftenedEnergyChange(const VbdElement& e, const TriangleStrain& t,
+                                              float c00, float c11, float c01, float barrier) {
+    const float soft = e.rest[7];
+    const float mean = 0.5f * (t.g00 + t.g11), half = 0.5f * (t.g00 - t.g11);
+    const float radius = sqrtf(half * half + t.g01 * t.g01);
+    const float d_half = 0.5f * (c00 - c11), moved_half = half + d_half, moved_shear = t.g01 + c01;
+    const float moved = sqrtf(moved_half * moved_half + moved_shear * moved_shear);
+    const float growth = d_half * (half + moved_half) + c01 * (t.g01 + moved_shear);
+    const float d_radius = radius + moved > 0.0f ? growth / (radius + moved) : 0.0f;
+    const float d_mean = 0.5f * (c00 + c11);
+    const float principal = SoftenedSquareChange(mean + radius, d_mean + d_radius, soft) +
+                            SoftenedSquareChange(mean - radius, d_mean - d_radius, soft);
+    return e.rest[5] * (principal + (1.0f - soft) * barrier) +
+           0.5f * e.rest[6] * SoftenedSquareChange(t.g00 + t.g11, c00 + c11, soft);
+}
+
+NUKA_VBD_HD inline void SoftenedTriangleBlock(const VbdElement& e, uint32_t local, const TriangleStrain& t,
+                                              Vec3* gradient, SymmetricMat3* hessian) {
+    const float area = e.rest[4], mu = e.rest[5], lambda = e.rest[6], kept = 1.0f - e.rest[7];
+    const MembraneTangent m = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
+    float s[3];
+    SoftenedStress(m, mu, lambda, t.g00, t.g11, t.g01, s);
+    float bx, by;
+    MembraneWeights(e, local, &bx, &by);
+    *gradient = (t.f0 * (s[0] * bx + s[2] * by) + t.f1 * (s[2] * bx + s[1] * by)) * area;
+    SymmetricMat3 h = SoftenedMaterialBlock(m, mu, lambda, t.f0, t.f1, bx, by);
+    const float bsb = bx * (s[0] * bx + s[2] * by) + by * (s[2] * bx + s[1] * by);
+    AddIdentity(h, bsb > 0.0f ? bsb : 0.0f);
+    const Vec3 n = t.f0.Cross(t.f1);
+    const float normal_length = Norm(n), J = 1.0f + t.area_change;
+    if (t.area_change < 0.0f && J > 0.0f && normal_length > 0.0f) {
+        const Vec3 q = (t.f1 * bx - t.f0 * by).Cross(n / normal_length);
+        *gradient = *gradient + q * (area * kept * mu * (t.area_change / J));
+        AddTo(h, Outer(q, kept * mu / (J * J)));
+    }
+    *hessian = Scaled(h, area);
+}
+
 NUKA_VBD_HD inline void TriangleBlock(const VbdElement& e, uint32_t local, const TriangleStrain& t,
                                       Vec3* gradient, SymmetricMat3* hessian) {
+    if (e.rest[7] > 0.0f) {
+        SoftenedTriangleBlock(e, local, t, gradient, hessian);
+        return;
+    }
     const float area = e.rest[4], mu = e.rest[5], lambda = e.rest[6];
     const Vec3 f0 = t.f0, f1 = t.f1;
     const float g00 = t.g00, g11 = t.g11, g01 = t.g01;
@@ -484,6 +590,36 @@ NUKA_VBD_HD inline void RodBendBlock(const VbdElement& e, uint32_t local, const 
     }
 }
 
+// ElementRayleighBlock of a softened membrane, with the tangent of the start strain.
+NUKA_VBD_HD inline void SoftenedRayleighBlock(const VbdElement& e, uint32_t local, const TriangleStrain& t,
+                                              Vec3 df0, Vec3 df1, Vec3* applied, SymmetricMat3* diagonal) {
+    const float area = e.rest[4], mu = e.rest[5], lambda = e.rest[6], kept = 1.0f - e.rest[7];
+    const Vec3 f0 = t.f0, f1 = t.f1;
+    const MembraneTangent m = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
+    float s[3];
+    SoftenedStress(m, mu, lambda, f0.Dot(df0), f1.Dot(df1), 0.5f * (f0.Dot(df1) + f1.Dot(df0)), s);
+    float bx, by;
+    MembraneWeights(e, local, &bx, &by);
+    *applied = (f0 * (s[0] * bx + s[2] * by) + f1 * (s[2] * bx + s[1] * by)) * area;
+    SymmetricMat3 h = SoftenedMaterialBlock(m, mu, lambda, f0, f1, bx, by);
+    const Vec3 n = f0.Cross(f1);
+    const float normal_length = Norm(n), J = 1.0f + t.area_change;
+    if (!(J > 0.0f && normal_length > 0.0f)) {
+        *applied = {NAN, NAN, NAN};
+        *diagonal = {NAN, NAN, NAN, NAN, NAN, NAN};
+        return;
+    }
+    if (t.area_change < 0.0f) {
+        const Vec3 unit_n = n / normal_length;
+        const Vec3 q = (f1 * bx - f0 * by).Cross(unit_n);
+        const float dj = unit_n.Dot(df0.Cross(f1) + f0.Cross(df1));
+        const float coefficient = kept * mu / (J * J);
+        *applied = *applied + q * (area * coefficient * dj);
+        AddTo(h, Outer(q, coefficient));
+    }
+    *diagonal = Scaled(h, area);
+}
+
 // Frozen material Jacobians apply the full element stiffness to all nodal rates.
 // The returned action and diagonal omit the element's Rayleigh coefficient.
 NUKA_VBD_HD inline void ElementRayleighBlock(const VbdElement& e, uint32_t local,
@@ -499,6 +635,10 @@ NUKA_VBD_HD inline void ElementRayleighBlock(const VbdElement& e, uint32_t local
         const Vec3 f0 = t.f0, f1 = t.f1, v2 = rate[2] - rate[0];
         const Vec3 df0 = v1 * e.rest[0] + v2 * e.rest[2];
         const Vec3 df1 = v1 * e.rest[1] + v2 * e.rest[3];
+        if (e.rest[7] > 0.0f) {
+            SoftenedRayleighBlock(e, local, t, df0, df1, applied, diagonal);
+            return;
+        }
         const float dg00 = f0.Dot(df0), dg11 = f1.Dot(df1);
         const float dg01 = 0.5f * (f0.Dot(df1) + f1.Dot(df0));
         const float area = e.rest[4], mu = e.rest[5], lambda = e.rest[6];
@@ -616,6 +756,7 @@ NUKA_VBD_HD inline float ElementEnergyChange(const VbdElement& e, uint32_t local
         const float area_step = n.Dot(n + turn) > 0.0f && moved_sq > 0.0f
             ? growth / (sqrtf(moved_sq) + J) : -1.0f - t.area_change;
         const float barrier = AreaBarrierChange(t.area_change, area_step);
+        if (e.rest[7] > 0.0f) return e.rest[4] * SoftenedEnergyChange(e, t, c00, c11, c01, barrier);
         return e.rest[4] * (e.rest[5] * (c00 * (2.0f * t.g00 + c00) + c11 * (2.0f * t.g11 + c11) +
                                          2.0f * c01 * (2.0f * t.g01 + c01) + barrier) +
                             0.5f * e.rest[6] * change * (2.0f * trace + change));
@@ -648,6 +789,11 @@ NUKA_VBD_HD inline float ElementEnergy(const VbdElement& e, const ElementGeometr
     if (e.kind == kVbdTriangle) {
         const TriangleStrain t = MembraneStrain(e, g);
         const float trace = t.g00 + t.g11;
+        if (e.rest[7] > 0.0f) {
+            const MembraneTangent m = SoftenedTangent(e.rest[7], t.g00, t.g11, t.g01);
+            return e.rest[4] * (e.rest[5] * (m.high * m.e_high * m.e_high + m.low * m.e_low * m.e_low +
+                (1.0f - e.rest[7]) * AreaBarrier(t.area_change)) + 0.5f * e.rest[6] * m.trace * trace * trace);
+        }
         return e.rest[4] * (e.rest[5] * (t.g00 * t.g00 + t.g11 * t.g11 +
             2.0f * t.g01 * t.g01 + AreaBarrier(t.area_change)) +
             0.5f * e.rest[6] * trace * trace);

@@ -83,6 +83,7 @@ void BuildSurfaceMesh(const std::vector<math::Vec3>& live_positions,
         out.positions[v * 3 + 2] = p.z;
     }
     out.uvs.clear();
+    out.corner_uvs = topo.corner_uvs;
     out.indices = topo.triangles;
     // Relax the surface BEFORE normals/inflation so a single proud particle does
     // not survive as a sharp spike under the divergent inflated normals.

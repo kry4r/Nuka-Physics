@@ -47,8 +47,10 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
     for (const ShellMaterial& material : materials)
         if (!FiniteNonnegative(material.stretch_stiffness) || !FiniteNonnegative(material.bend_stiffness) ||
             !FiniteNonnegative(material.damping) || !std::isfinite(material.poisson) ||
-            material.poisson < 0.0f || material.poisson >= 0.5f)
-            throw std::invalid_argument("Cloth shell material needs nonnegative stiffness and 0 <= poisson < 0.5");
+            material.poisson < 0.0f || material.poisson >= 0.5f ||
+            !(material.compression_ratio > 0.0f && material.compression_ratio <= 1.0f))
+            throw std::invalid_argument(
+                "Cloth shell material needs nonnegative stiffness, 0 <= poisson < 0.5 and 0 < compression ratio <= 1");
     if (!material_faces.empty() && material_faces.size() != triangles.size())
         throw std::invalid_argument("Cloth material faces must match its triangles");
     // Rest edge vectors of each face in its own plane, from the pattern or the 3D rest shape.
@@ -91,6 +93,7 @@ void BuildClothVertexBlocks(const std::vector<math::Vec3>& rest_positions,
         e.rest[4] = areas[f] = 0.5f * std::fabs(det);
         e.rest[5] = youngs / (2.0f * (1.0f + nu));
         e.rest[6] = youngs * nu / (1.0f - nu * nu);
+        e.rest[7] = 1.0f - materials[f].compression_ratio;
         e.damping = materials[f].damping;
         out.push_back(e);
         for (uint32_t j = 0u; j < 3u; ++j) {

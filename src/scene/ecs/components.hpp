@@ -55,6 +55,19 @@ struct PhysicsMaterial {
     uint16_t sdf_max_res   = 128;
 };
 
+// Woven cloth (Zhu et al. 2023): a procedural weave over the mesh's authored UVs with
+// uv_scale yarns per metre, consumed only by the offline beauty path; pattern 0 is a no-op.
+struct ClothWeave {
+    uint32_t pattern = 0u;                   // 0 off, 1 plain weave
+    float weft_color[3]{0.8f, 0.8f, 0.8f};   // linear weft albedo; base_color is the warp
+    float fiber_roughness = 0.2f;            // fiber SGGX alpha
+    float fiber_twist = 0.45f;               // fiber angle about the ply normal, radians
+    float fiber_depth = 3.0f;                // SpongeCake optical thickness
+    float fiber_specular = 0.5f;             // share of the yarn albedo in the fiber lobe
+    float yarn_gap = 0.1f;                   // free space between yarns, fraction of the spacing
+    float yarn_height = 0.18f;               // crimp amplitude and cross-section height, spacings
+};
+
 struct RenderMaterial {
     float base_color[4]{0.8f, 0.8f, 0.8f, 1.0f};
     float metallic  = 0.0f;
@@ -82,6 +95,7 @@ struct RenderMaterial {
     std::string normal_map;
     float uv_scale  = 1.0f;
     bool  triplanar = true;
+    ClothWeave weave;
 };
 
 // -- per-entity components ---------------------------------------------------
