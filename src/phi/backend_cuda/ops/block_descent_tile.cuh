@@ -225,6 +225,7 @@ __device__ LocalTerm TileLocalTerm(const TileHead& t) {
     term.mu_first = t.mu_first;
     term.mu_second = t.mu_second;
     term.normal_bound = t.normal_bound;
+    term.radius = t.normal_bound;
     term.contact = t.axes == 3u;
     return term;
 }

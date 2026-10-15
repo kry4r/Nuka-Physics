@@ -40,6 +40,25 @@ struct TangentTerm {
     double potential = 0.0;
 };
 
+// A contact multiplier's last unrelaxed step and the weight it took; weight 0 marks no last step.
+struct ContactRelaxation {
+    math::Vec3 step{};
+    float weight = 0.0f;
+};
+
+// Secant (Aitken) weight in (0, 1] on a contact multiplier step, so a step reversing the last one stops at the
+// secant root of the friction-normal feedback; convex weights keep the cone and the fixed point unchanged.
+NUKA_AUGMENTED_HD inline math::Vec3 RelaxContactImpulse(math::Vec3 dual, math::Vec3 next, ContactRelaxation* last) {
+    const math::Vec3 step{next.x - dual.x, next.y - dual.y, next.z - dual.z};
+    const math::Vec3 change{step.x - last->step.x, step.y - last->step.y, step.z - last->step.z};
+    const float square = change.x * change.x + change.y * change.y + change.z * change.z;
+    const float along = -(last->step.x * change.x + last->step.y * change.y + last->step.z * change.z);
+    float weight = 1.0f;
+    if (last->weight > 0.0f && along > 0.0f && square > 0.0f) weight = fminf(1.0f, last->weight * along / square);
+    *last = {step, weight};
+    return {dual.x + weight * step.x, dual.y + weight * step.y, dual.z + weight * step.z};
+}
+
 // Residual is rhs * dt * damping_scale - Ju; compliance includes damping_scale.
 NUKA_AUGMENTED_HD inline ScalarTerm EvaluateScalar(
     float dual, float rho, float residual, float compliance, float lower, float upper,

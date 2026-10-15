@@ -237,6 +237,7 @@ __device__ inline LocalTerm LoadMultilevelRowTerm(const BlockScratch& s, uint32_
     term.residual = state.residual;
     term.dual = state.dual;
     term.normal_bound = state.normal_bound;
+    term.radius = state.dual.x;
     return term;
 }
 

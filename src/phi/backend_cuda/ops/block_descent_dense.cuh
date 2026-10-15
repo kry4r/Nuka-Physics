@@ -465,10 +465,10 @@ __device__ uint32_t AppendDenseRows(BlockScratch s, size_t base, bool flag, size
 }
 
 // The row move a dense row must exceed before its impulse leaves a zero bound, while its friction has
-// no normal bound; 0 when the row may act at once.
+// no radius; 0 when the row may act at once.
 __device__ float DenseRowSlack(DataView data, BlockDescentSolveParams p, BlockScratch s, uint32_t slot) {
     const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, true);
-    if (t.contact && !(t.normal_bound <= 0.0f)) return 0.0f;
+    if (t.contact && !(t.radius <= 0.0f)) return 0.0f;
     if (t.penalty <= 0.0f) return INFINITY;
     const double k = t.response.residual_scale;
     const double x = t.response.dual_scale * t.dual.x + k * t.residual.x;

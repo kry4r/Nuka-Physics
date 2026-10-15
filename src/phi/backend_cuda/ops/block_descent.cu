@@ -245,6 +245,7 @@ struct BlockScratch {
     uint32_t* grid_color_offsets;
     MaterialRowState* material_state;
     AugmentedRowState* row_state;
+    nk::augmented::ContactRelaxation* contact_relaxation;
     void* scan;
     size_t scan_bytes;
     void* incidence_sort;
@@ -465,6 +466,8 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     at = (at + 1u) & ~uint64_t{1u};
     s.row_state = reinterpret_cast<AugmentedRowState*>(take(
         tile ? 0u : rows * sizeof(AugmentedRowState) / sizeof(uint32_t)));
+    s.contact_relaxation = reinterpret_cast<nk::augmented::ContactRelaxation*>(take(
+        tile ? 0u : rows * sizeof(nk::augmented::ContactRelaxation) / sizeof(uint32_t)));
     s.owner_cache_color = take(sweep_blocks);
     s.row_cache_colors = take(row_color_words);
     s.cache_color_count = tile ? 0u : static_cast<uint32_t>(cache_colors);
@@ -1190,6 +1193,8 @@ struct LocalTerm {
     float mu_first;
     float mu_second;
     float normal_bound;
+    // Friction cone radius held through a block solve: the normal multiplier, or a tile's block-start bound.
+    float radius;
     bool contact;
     nk::augmented::ScalarResponse response;
 };
@@ -1277,6 +1282,7 @@ __device__ LocalTerm LoadLocalTerm(DataView data, BlockDescentSolveParams p, Blo
     t.residual = state.residual;
     t.dual = state.dual;
     t.normal_bound = state.normal_bound;
+    t.radius = state.dual.x;
     t.response = s.scalar_response[slot];
     return t;
 }
@@ -1307,7 +1313,7 @@ __device__ void EvaluateAugmentedResponse(const LocalTerm& t, const nk::augmente
     if (!t.contact) return;
     const Vec3 tangent_residual{0.0f, t.residual.y - row_move.y, t.residual.z - row_move.z};
     const auto f = nk::augmented::EvaluateTangentImpulse(t.dual, t.penalty, tangent_residual,
-                                                         t.normal_bound, t.mu_first, t.mu_second);
+                                                         t.radius, t.mu_first, t.mu_second);
     impulse->y = f.impulse.y;
     impulse->z = f.impulse.z;
     curvature->yy = f.curvature.yy;
@@ -1338,7 +1344,7 @@ __device__ float EvaluateDropChange(const LocalTerm& t, Vec3 drop, const Respons
         t.compliance, t.lower, t.upper, response);
     if (t.contact)
         change += nk::augmented::TangentPotentialChange(t.dual, t.penalty, t.residual, drop,
-                                                        t.normal_bound, t.mu_first, t.mu_second);
+                                                        t.radius, t.mu_first, t.mu_second);
     return change;
 }
 
@@ -1900,18 +1906,19 @@ __global__ void DualUpdateKernel(DataView data, BlockDescentSolveParams p, Block
         if (grid_only)
             current.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), current);
         const LocalTerm t = LoadLocalTerm(data, p, s, slot, ~0u, false, &current);
-        data.lambda[slot] = t.normal_bound;
         AugmentedRowState next{};
         next.residual = t.residual;
         next.dual.x = t.normal_bound;
         if (t.contact) {
             const auto f = nk::augmented::EvaluateTangentImpulse(t.dual, t.penalty, t.residual,
                                                                  t.normal_bound, t.mu_first, t.mu_second);
-            data.lambda[slot + rows[slot].group_normal_count] = f.impulse.y;
-            data.lambda[slot + 2u * rows[slot].group_normal_count] = f.impulse.z;
             next.dual.y = f.impulse.y;
             next.dual.z = f.impulse.z;
+            next.dual = nk::augmented::RelaxContactImpulse(t.dual, next.dual, &s.contact_relaxation[slot]);
+            data.lambda[slot + rows[slot].group_normal_count] = next.dual.y;
+            data.lambda[slot + 2u * rows[slot].group_normal_count] = next.dual.z;
         }
+        data.lambda[slot] = next.dual.x;
         if (seed && (p.total_grid_count == 0u
                 ? ParticleRowFirstColor(s, p.vertex_blocks.colors, slot) != kNoCacheColor : grid_only)) {
             next.normal_bound = AugmentedRowBound(s, rows[slot], slot, RowStateScale(data, p, slot), next);
@@ -2434,6 +2441,7 @@ Status OpBlockDescentSolve(const ModelView& model, const DataView& data,
         return Status::Failed;
     if (!clear(s.counts, size_t{s.blocks + 1u} * sizeof(uint32_t)) ||
         !clear(s.cache_counts, size_t{s.cache_color_count} * sizeof(uint32_t)) ||
+        !clear(s.contact_relaxation, size_t{s.rows} * sizeof(nk::augmented::ContactRelaxation)) ||
         !clear(s.active_count, sizeof(uint32_t)) ||
         !clear(s.sweep_state, kSweepStateWords * sizeof(uint32_t)) ||
         !clear(data.solver_color_counts, size_t{p->env_count} * kSolverCountWords * sizeof(uint32_t)) ||
