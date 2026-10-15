@@ -30,7 +30,6 @@ struct ArticulationBlock {
     float* matrix;
     float* force;
     float* direction;
-    float* diagonal;
     __device__ float Mass(uint32_t i, uint32_t j) const { return mass[size_t{roots[i]} * stride + roots[j]]; }
     __device__ float Snapshot(uint32_t i) const { return snapshot[roots[i]]; }
     __device__ float Free(uint32_t i) const { return free[roots[i]]; }
@@ -61,7 +60,6 @@ __global__ void DescendArticulationsKernel(
     b.matrix = s.articulation_matrix + base * p.max_dof;
     b.force = s.articulation_force + base;
     b.direction = s.articulation_direction + base;
-    b.diagonal = s.articulation_diagonal + base;
     if (b.dimension == 0u) return;
     const nk::BlockSolveFailure failure = DescendDenseBlock(b, data, p, s);
 

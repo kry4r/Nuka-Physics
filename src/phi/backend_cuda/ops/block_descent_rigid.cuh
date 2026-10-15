@@ -64,7 +64,6 @@ struct RigidBlock {
     float* matrix;
     float* force;
     float* direction;
-    float* diagonal;
     __device__ float Mass(uint32_t i, uint32_t j) const { return mass[i * kRigidBlockDof + j]; }
     __device__ float Snapshot(uint32_t i) const { return snapshot[i]; }
     __device__ float Free(uint32_t i) const { return free[i]; }
@@ -92,7 +91,6 @@ __global__ void DescendRigidBlocksKernel(
     b.matrix = s.rigid_matrix + base * kRigidBlockDof;
     b.force = s.rigid_force + base;
     b.direction = s.rigid_direction + base;
-    b.diagonal = s.rigid_diagonal + base;
     const nk::BlockSolveFailure failure = DescendDenseBlock(b, data, p, s);
     if (threadIdx.x != 0u) return;
     if (failure != nk::BlockSolveFailure::None) RecordBlockFailure(data, p, s, owner, failure);

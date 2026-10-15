@@ -227,7 +227,6 @@ struct BlockScratch {
     float* articulation_matrix;
     float* articulation_force;
     float* articulation_direction;
-    float* articulation_diagonal;
     float* articulation_velocity;
     uint32_t* rigid_dimensions;
     float* rigid_free;
@@ -236,7 +235,6 @@ struct BlockScratch {
     float* rigid_matrix;
     float* rigid_force;
     float* rigid_direction;
-    float* rigid_diagonal;
     float* rigid_velocity;
     Vec3* grid_free;
     Vec3* grid_snapshot;
@@ -431,7 +429,6 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.articulation_matrix = reinterpret_cast<float*>(take(sweep_matrix));
     s.articulation_force = reinterpret_cast<float*>(take(sweep_dofs));
     s.articulation_direction = reinterpret_cast<float*>(take(sweep_dofs));
-    s.articulation_diagonal = reinterpret_cast<float*>(take(sweep_dofs));
     s.articulation_velocity = reinterpret_cast<float*>(take(dofs));
     const uint64_t rigid_dofs = uint64_t{p.total_body_count} * kRigidBlockDof;
     const uint64_t sweep_rigid_dofs = tile ? 0u : rigid_dofs;
@@ -442,7 +439,6 @@ uint64_t BindScratch(const BlockDescentSolveParams& p, uint32_t* base, BlockScra
     s.rigid_matrix = reinterpret_cast<float*>(take(sweep_rigid_dofs * kRigidBlockDof));
     s.rigid_force = reinterpret_cast<float*>(take(sweep_rigid_dofs));
     s.rigid_direction = reinterpret_cast<float*>(take(sweep_rigid_dofs));
-    s.rigid_diagonal = reinterpret_cast<float*>(take(sweep_rigid_dofs));
     s.rigid_velocity = reinterpret_cast<float*>(take(rigid_dofs));
     s.grid_free = reinterpret_cast<Vec3*>(take(3u * uint64_t{p.total_grid_count}));
     s.grid_snapshot = reinterpret_cast<Vec3*>(take(3u * uint64_t{p.total_grid_count}));

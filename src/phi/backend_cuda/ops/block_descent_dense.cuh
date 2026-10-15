@@ -563,7 +563,7 @@ __device__ nk::BlockSolveFailure NewtonDenseBlock(const Block& b, DataView data,
             break;
         }
         if (converged) break;
-        if (!SolveDensePositiveBlock(b.matrix, b.force, b.direction, b.diagonal, n, b.stride)) {
+        if (!SolveDensePositiveBlock<kMaxDof>(b.matrix, b.force, b.direction, n, b.stride)) {
             failure = nk::BlockSolveFailure::Factorization;
             break;
         }
