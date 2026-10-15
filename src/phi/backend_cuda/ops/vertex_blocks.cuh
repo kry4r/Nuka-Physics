@@ -164,6 +164,24 @@ __device__ inline void GatherVertexBlock(const VertexBlockView& b, const math::V
     }
 }
 
+// The vertex force with its terms summed in double, one rounding from their exact sum in any order.
+__device__ inline math::Vec3 VertexBlockForceDouble(const VertexBlockView& b, const math::Vec3* velocity,
+                                                    uint32_t env, uint32_t vertex, math::Vec3 inertial,
+                                                    math::Vec3 impulse) {
+    const math::Vec3 own = velocity[b.Particle(env, vertex)];
+    double force[3] = {double(impulse.x) - inertial.x, double(impulse.y) - inertial.y,
+                       double(impulse.z) - inertial.z};
+    for (uint32_t i = b.offsets[vertex]; i < b.offsets[vertex + 1u]; ++i) {
+        math::Vec3 g;
+        math::SymmetricMat3 h;
+        VertexElementBlock(b, velocity, env, own, b.incidence[i], g, h);
+        force[0] -= g.x;
+        force[1] -= g.y;
+        force[2] -= g.z;
+    }
+    return {static_cast<float>(force[0]), static_cast<float>(force[1]), static_cast<float>(force[2])};
+}
+
 // Backtracking covers the significand resolution of a single-precision step.
 constexpr uint32_t kVertexStepHalvings = 24u;
 // Fraction of the first-order decrease a vertex step must realize.
@@ -282,8 +300,8 @@ __device__ inline void VertexBlockEquationWarp(const VertexBlockView& b, PointMa
     nk::vbd::AddIdentity(hessian, inertia);
 }
 
-// A completed sweep must also satisfy the vertex equations after all neighboring row updates. Readouts sum the
-// force in other orders, so the momentum defect stays below the tolerance by the summation rounding bound.
+// A completed sweep must also satisfy the vertex equations after all neighboring row updates. The ledger sums
+// the force in double, so the momentum defect stays below the tolerance by this warp sum's rounding bound.
 __device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, PointMassView points, uint32_t env,
                                                  uint32_t vertex, uint32_t lane, float tolerance) {
     const uint32_t particle = b.Particle(env, vertex);
@@ -309,8 +327,10 @@ __device__ inline bool VertexBlockStationaryWarp(const VertexBlockView& b, Point
     if (!(tolerance > 0.0f)) return force.x == 0.0f && force.y == 0.0f && force.z == 0.0f;
     if (!nk::vbd::Invert(hessian, 1.0e-6f * inertia * inertia * inertia, &inverse)) return false;
     const math::Vec3 correction = inverse.Multiply(force) / b.dt;
-    // Two orders of summing n terms differ by at most 2 (n + 1) eps times the sum of their magnitudes.
-    const float rounding = 2.0f * static_cast<float>(b.offsets[vertex + 1u] - b.offsets[vertex] + 3u) * FLT_EPSILON;
+    // Each term passes at most ceil(n/32) + 6 roundings here (lane sum, five shuffle levels, assembly); with the
+    // ledger's own roundings its readout exceeds this force by at most (ceil(n/32) + 10) u per term magnitude.
+    const uint32_t lane_terms = (b.offsets[vertex + 1u] - b.offsets[vertex] + warpSize - 1u) / warpSize;
+    const float rounding = 0.5f * static_cast<float>(lane_terms + 10u) * FLT_EPSILON;
     const math::Vec3 bound = (magnitude + math::Vec3{fabsf(inertial.x), fabsf(inertial.y), fabsf(inertial.z)} +
                               math::Vec3{fabsf(impulse.x), fabsf(impulse.y), fabsf(impulse.z)}) * rounding;
     const math::Vec3 momentum_error = nk::vbd::MomentumResidualVelocity(

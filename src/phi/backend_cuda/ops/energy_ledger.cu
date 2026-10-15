@@ -328,13 +328,10 @@ __global__ void EnergyLedgerKernel(ModelView m, DataView d, ReadoutEnergyLedgerP
             block.layout.particles_per_env = p.particles_per_env;
             block.layout.env_count = p.env_count;
             block.dt = p.dt;
-            Vec3 gradient;
-            math::SymmetricMat3 hessian;
-            GatherVertexBlock(block, d.particle_vel, env, vertex, 0u, 1u, gradient, hessian);
             const Vec3 displacement = d.particle_vel[particle] * p.dt;
-            const Vec3 force = -nk::vbd::InertialGradient(d.particle_vel[particle],
-                d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt) -
-                gradient + d.particle_row_impulse[particle] / p.dt;
+            const Vec3 force = VertexBlockForceDouble(block, d.particle_vel, env, vertex,
+                nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt),
+                d.particle_row_impulse[particle] / p.dt);
             values[kForceWorkColumn] -= Dot(force, displacement);
         }
         kinetic += 0.5 * mass * Dot(velocity, velocity);
@@ -604,13 +601,10 @@ __global__ void PhysicsStageMetricsKernel(ModelView m, DataView d, ReadoutEnergy
         block.layout.particles_per_env = p.particles_per_env;
         block.layout.env_count = p.env_count;
         block.dt = p.dt;
-        Vec3 gradient;
-        math::SymmetricMat3 hessian;
-        GatherVertexBlock(block, d.particle_vel, env, vertex, 0u, 1u, gradient, hessian);
         const Vec3 displacement = d.particle_vel[particle] * p.dt;
-        const Vec3 force = -nk::vbd::InertialGradient(d.particle_vel[particle],
-            d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt) -
-            gradient + d.particle_row_impulse[particle] / p.dt;
+        const Vec3 force = VertexBlockForceDouble(block, d.particle_vel, env, vertex,
+            nk::vbd::InertialGradient(d.particle_vel[particle], d.vbd_free_rate[slot], d.vbd_inertia[slot], p.dt),
+            d.particle_row_impulse[particle] / p.dt);
         const Vec3 defect = force * p.dt;
         vector(C::VbdMomentumDefectX, defect);
         vector(C::VbdAngularDefectX, position.Cross(defect));
