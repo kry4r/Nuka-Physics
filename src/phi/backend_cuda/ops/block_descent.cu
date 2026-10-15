@@ -1491,9 +1491,9 @@ __global__ void CacheGridRowsKernel(DataView data, BlockDescentSolveParams p, Bl
     }
 }
 
-// A block descends a tile of vertices. Its threads first evaluate the tile's element blocks (grouped
-// by kind) and row responses densely; warps then sum them in the lane order of a warp per vertex.
-constexpr uint32_t kDescendTileVertices = 8u;
+// A block descends a tile of one vertex per warp. Its threads first evaluate the tile's element blocks
+// (grouped by kind) and row responses densely; each warp then sums, solves and searches its own vertex.
+constexpr uint32_t kDescendTileVertices = kThreads / 32u;
 constexpr uint32_t kDescendTileElements = 384u;
 constexpr uint32_t kDescendTileRows = 256u;
 constexpr uint32_t kDescendElementKinds = 4u;
@@ -1806,7 +1806,8 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
             float last_change = 0.0f;
             uint32_t last_halving = 0u;
             bool accepted = false;
-            for (uint32_t halving = 0u; halving <= kVertexStepHalvings && slope < 0.0f; ++halving) {
+            const float smallest = ldexpf(1.0f, -static_cast<int>(kVertexStepHalvings));
+            for (uint32_t halving = 0u; scale >= smallest && slope < 0.0f; ++halving) {
                 const Vec3 candidate = VertexTrial(u, direction, scale);
                 const Vec3 move = candidate - u;
                 const double trial_slope = halving == 0u ? v.unit_slope
@@ -1845,7 +1846,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                                                             u, lane, warpSize);
                     for (uint32_t at = cached_at; at < end; at += warpSize)
                         base_finite &= isfinite(EvaluateLocalChange(LoadPointLocalTerm(data, p, s, at), {}));
-                    if (!__all_sync(0xffffffffu, base_finite) || halving == kVertexStepHalvings) {
+                    if (!__all_sync(0xffffffffu, base_finite) || 0.5f * scale < smallest) {
                         if (lane == 0u)
                             RecordBlockFailure(data, p, s, particle, nk::BlockSolveFailure::InvalidPotential);
                         break;
@@ -1858,7 +1859,10 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                     accepted = true;
                     break;
                 }
-                scale *= 0.5f;
+                // Backtrack to the minimizer of the quadratic matching this trial's slope and change,
+                // safeguarded to between a tenth and a half of the rejected step.
+                const double curve = double(change) - trial_slope;
+                scale *= curve > 0.0 ? static_cast<float>(fmin(0.5, fmax(0.1, -trial_slope / (2.0 * curve)))) : 0.5f;
             }
             __syncwarp();
             if (lane == 0u) {
