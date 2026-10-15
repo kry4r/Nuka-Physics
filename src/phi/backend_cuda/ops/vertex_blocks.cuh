@@ -222,19 +222,22 @@ __device__ inline VertexElementChangeTerms VertexElementChange(
     return terms;
 }
 
-__device__ inline void AddVertexElementChange(const VertexBlockView& b,
-                                              const VertexElementChangeTerms& terms, float& change) {
+// `size` gathers the summed terms' magnitudes, which bound the sum's rounding.
+__device__ inline void AddVertexElementChange(const VertexBlockView& b, const VertexElementChangeTerms& terms,
+                                              float& change, float* size = nullptr) {
     change += terms.elastic;
     if (terms.damping > 0.0f) change += terms.damping * b.dt * terms.rayleigh;
+    if (size != nullptr) *size += fabsf(terms.elastic) + fabsf(terms.damping * b.dt * terms.rayleigh);
 }
 
 __device__ inline float VertexEnergyChange(const VertexBlockView& b, const math::Vec3* velocity,
                                            uint32_t env, uint32_t vertex, math::Vec3 from,
-                                           math::Vec3 move, uint32_t lane, uint32_t width) {
+                                           math::Vec3 move, uint32_t lane, uint32_t width,
+                                           float* size = nullptr) {
     float change = 0.0f;
     for (uint32_t i = b.offsets[vertex] + lane; i < b.offsets[vertex + 1u]; i += width)
         AddVertexElementChange(b, VertexElementChange(b, velocity, env, b.incidence[i], from, move),
-                               change);
+                               change, size);
     return change;
 }
 

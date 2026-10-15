@@ -1815,24 +1815,32 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                           double(primal_force.x) * move.x + double(primal_force.y) * move.y +
                           double(primal_force.z) * move.z), 0u);
                 const bool sampled = halving == 0u;
-                float elastic_change = 0.0f;
+                float elastic_change = 0.0f, size = 0.0f;
                 if constexpr (elastic) {
                     if (sampled && dense_elements) {
                         for (uint32_t i = lane; i < v.element_count; i += warpSize) {
                             const float* sample = element_samples[v.element_first + i];
-                            AddVertexElementChange(b, {sample[0], sample[1], sample[2]}, elastic_change);
+                            AddVertexElementChange(b, {sample[0], sample[1], sample[2]}, elastic_change, &size);
                         }
                     } else {
                         elastic_change = VertexEnergyChange(b, data.particle_vel, env, vertex, u, move,
-                                                            lane, warpSize);
+                                                            lane, warpSize, &size);
                     }
                 }
                 float row_change = 0.0f;
-                for (uint32_t at = cached_at; at < end; at += warpSize)
-                    row_change += sampled && dense_rows ? row_changes[v.row_first + (at - begin)]
+                for (uint32_t at = cached_at; at < end; at += warpSize) {
+                    const float term = sampled && dense_rows ? row_changes[v.row_first + (at - begin)]
                         : EvaluateLocalChange(LoadPointLocalTerm(data, p, s, at), move);
+                    row_change += term;
+                    size += fabsf(term);
+                }
                 // The unit step's fused add matches the contracted sum of the general branch.
                 const double energy = double(WarpSum(elastic_change + row_change));
+                // The float sum rounds by at most `depth` units of its terms' magnitude, and each term about as
+                // much inside; backtracking cannot resolve a change within that (Shi et al. 2022, relaxed Armijo).
+                const uint32_t depth = 2u * ((v.element_count + warpSize - 1u) / warpSize) +
+                                       (v.row_count + warpSize - 1u) / warpSize + 6u;
+                const double noise = double(depth) * FLT_EPSILON * double(WarpSum(size));
                 const float change = halving == 0u
                     ? static_cast<float>(fma(nk::vbd::InertialEnergyScale(inertia, p.dt), v.unit_move, energy))
                     : static_cast<float>(energy + nk::vbd::InertialEnergyChange(u, free_rate, move, inertia, p.dt));
@@ -1854,7 +1862,7 @@ __global__ void DescendParticlesKernel(ModelView model, DataView data, BlockDesc
                     scale *= 0.5f;
                     continue;
                 }
-                if (trial_slope <= 0.0 && double(change) <= double(kVertexStepDecrease) * trial_slope) {
+                if (trial_slope <= 0.0 && double(change) <= double(kVertexStepDecrease) * trial_slope + noise) {
                     next = candidate;
                     accepted = true;
                     break;
