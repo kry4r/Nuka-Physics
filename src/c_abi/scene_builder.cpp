@@ -556,6 +556,9 @@ nuka_result_t nuka_world_create_from_built_scene(
         if (options != nullptr && options->baumgarte_max_velocity > 0.0f) {
             cooked.model.baumgarte_max_velocity = options->baumgarte_max_velocity;
         }
+        if (options != nullptr && options->overlap_recovery_velocity > 0.0f) {
+            cooked.model.overlap_recovery_velocity = options->overlap_recovery_velocity;
+        }
 
         // Every cooked medium's render surface (built from the SAME media list before
         // the scene moves into the record), so a beauty render rebuilds each surface.

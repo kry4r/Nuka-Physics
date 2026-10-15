@@ -80,6 +80,8 @@ class SimOptions:
     cloth_integrator: int = 0
     ogc_contact_capacity: int = 0
     baumgarte_max_velocity: float = 0.0
+    # Speculative contact overlap push-out bound (m/s); 0 recovers none.
+    overlap_recovery_velocity: float = 0.0
     # Bake a per-link SDF from each link's VISUAL mesh so a foot engages the MPM grid
     # BC (rides the true silhouette). Default False keeps every cook byte-identical.
     bake_link_sdf: bool = False
@@ -255,6 +257,7 @@ class Scene:
             cloth_integrator=int(o.cloth_integrator),
             ogc_contact_capacity=int(o.ogc_contact_capacity),
             baumgarte_max_velocity=float(o.baumgarte_max_velocity),
+            overlap_recovery_velocity=float(o.overlap_recovery_velocity),
         )
         if len(scenes) != 1:
             raise ValueError(
@@ -344,6 +347,7 @@ class Scene:
                 cloth_integrator=int(o.cloth_integrator),
                 ogc_contact_capacity=int(o.ogc_contact_capacity),
                 baumgarte_max_velocity=float(o.baumgarte_max_velocity),
+                overlap_recovery_velocity=float(o.overlap_recovery_velocity),
                 bake_link_sdf=bool(o.bake_link_sdf))
         finally:
             builder.destroy()

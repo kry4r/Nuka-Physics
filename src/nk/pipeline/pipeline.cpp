@@ -777,6 +777,7 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
         p_assemble_.num_material_buckets = cap.num_material_buckets;
         p_assemble_.particles_per_env = cap.particles_per_env;  // coupling.
         p_assemble_.baumgarte_max_velocity = model.baumgarte_max_velocity;
+        p_assemble_.overlap_recovery_velocity = model.overlap_recovery_velocity;
         p_assemble_.contact_margin = cfg.contact_margin;
         p_assemble_.position_pass =
             (split_positions && family == phi::kContactFamilyPairDriven && cfg.pos_iters > 0u) ? 1u : 0u;

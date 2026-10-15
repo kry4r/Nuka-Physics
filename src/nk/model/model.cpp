@@ -1841,6 +1841,7 @@ void MoveModelMembers(Model& dst, Model&& src) {
     dst.ground_height = src.ground_height;
     dst.friction_coefficient = src.friction_coefficient;
     dst.baumgarte_max_velocity = src.baumgarte_max_velocity;
+    dst.overlap_recovery_velocity = src.overlap_recovery_velocity;
     dst.filter_cross_env = src.filter_cross_env;
     dst.contact_family = src.contact_family;
     dst.drive_mode = src.drive_mode;

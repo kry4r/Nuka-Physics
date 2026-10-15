@@ -164,6 +164,7 @@ typedef struct nuka_world_desc_t {
     float    solver_baumgarte_max_velocity;// 0.0 => cooked model default.
     uint32_t cloth_integrator;              // 0 = BDF2, 1 = backward Euler.
     uint32_t ogc_contact_capacity;          // Per-environment contact slots; 0 uses the cook estimate.
+    float    solver_overlap_recovery_velocity; // Speculative overlap push-out bound, m/s; 0 => none.
 } nuka_world_desc_t;
 
 nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
@@ -231,6 +232,7 @@ typedef struct nuka_coupled_particles_desc_t {
     uint32_t solver_max_pairs;
     float    baumgarte_max_velocity;
     uint32_t cloth_integrator;       // 0 = BDF2, 1 = backward Euler.
+    float    overlap_recovery_velocity; // Speculative overlap push-out bound, m/s; 0 => none.
 } nuka_coupled_particles_desc_t;
 
 // Create a coupled world. `desc` is the same robot/world descriptor

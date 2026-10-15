@@ -341,6 +341,7 @@ public:
     float ground_height          = 0.0f;
     float friction_coefficient   = 0.8f;   // legacy kContactFriction
     float baumgarte_max_velocity = 3.0e38f; // ~+inf (legacy default non-binding)
+    float overlap_recovery_velocity = 0.0f; // speculative overlap push-out bound, m/s (0 => none)
 
     // -- particle cook product: vertex-block cloth/cable and MLS-MPM material points.
     // MpmVbd assigns [0, n_mpm) to grid transfer and [n_mpm, P) to the vertex blocks.

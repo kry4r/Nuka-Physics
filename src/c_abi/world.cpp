@@ -480,6 +480,9 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
             prepared.model.baumgarte_max_velocity =
                 desc->solver_baumgarte_max_velocity;
         }
+        if (desc->solver_overlap_recovery_velocity > 0.0f) {
+            prepared.model.overlap_recovery_velocity = desc->solver_overlap_recovery_velocity;
+        }
         // Build + insert the live world (the shared record-assembly path).
         const nuka_result_t made = nuka::c_abi::FinishWorldCreate(
             std::move(prepared.model), std::move(prepared.blob), std::move(prepared.scene),
@@ -548,6 +551,9 @@ nuka_result_t nuka_world_create_coupled_from_scene(
         // leaves the cooked model default (so a zero-init desc is byte-identical).
         if (particles->baumgarte_max_velocity > 0.0f) {
             prepared.model.baumgarte_max_velocity = particles->baumgarte_max_velocity;
+        }
+        if (particles->overlap_recovery_velocity > 0.0f) {
+            prepared.model.overlap_recovery_velocity = particles->overlap_recovery_velocity;
         }
 
         // Every cooked medium's render surface (built from the SAME media list before

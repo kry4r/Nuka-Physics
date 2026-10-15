@@ -203,6 +203,7 @@ public:
                                     uint32_t solver_max_pairs,
                                     uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
                                     float baumgarte_max_velocity,
+                                    float overlap_recovery_velocity,
                                     float gravity_x, float gravity_y, float gravity_z) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_scene: invalid device");
@@ -285,6 +286,7 @@ public:
         desc.solver_max_pairs = solver_max_pairs;
         desc.cloth_integrator = cloth_integrator;
         desc.solver_baumgarte_max_velocity = baumgarte_max_velocity;
+        desc.solver_overlap_recovery_velocity = overlap_recovery_velocity;
         nuka_world_handle h = nullptr;
         check(nuka_world_create_from_scene(device->raw(), &desc, &h),
               "nuka_world_create_from_scene");
@@ -321,7 +323,7 @@ public:
         uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
         uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
-        float baumgarte_max_velocity, uint32_t osc_task_link) {
+        float baumgarte_max_velocity, float overlap_recovery_velocity, uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_coupled_from_scene: invalid device");
         }
@@ -370,6 +372,7 @@ public:
         parts.solver_max_pairs = solver_max_pairs;
         parts.cloth_integrator = cloth_integrator;
         parts.baumgarte_max_velocity = baumgarte_max_velocity;
+        parts.overlap_recovery_velocity = overlap_recovery_velocity;
 
         nuka_world_handle h = nullptr;
         check(nuka_world_create_coupled_from_scene(device->raw(), &desc, &parts, &h),
@@ -410,7 +413,8 @@ public:
         float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
         float solver_contact_margin, uint32_t solver_max_pairs,
         uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
-        float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
+        float baumgarte_max_velocity, float overlap_recovery_velocity, bool bake_link_sdf,
+        uint32_t osc_task_link) {
         if (device == nullptr || !device->valid()) {
             throw std::runtime_error("create_from_built_scene: invalid device");
         }
@@ -457,6 +461,7 @@ public:
         opts.solver_max_pairs = solver_max_pairs;
         opts.cloth_integrator = cloth_integrator;
         opts.baumgarte_max_velocity = baumgarte_max_velocity;
+        opts.overlap_recovery_velocity = overlap_recovery_velocity;
         opts.bake_link_sdf = bake_link_sdf ? 1u : 0u;
 
         nuka_world_handle h = nullptr;
@@ -1520,7 +1525,8 @@ public:
                  float gravity_z, uint32_t solver_vel_iters, uint32_t solver_pos_iters,
                  float solver_contact_margin, uint32_t solver_max_pairs,
                  uint32_t cloth_integrator, uint32_t ogc_contact_capacity,
-                 float baumgarte_max_velocity, bool bake_link_sdf, uint32_t osc_task_link) {
+                 float baumgarte_max_velocity, float overlap_recovery_velocity, bool bake_link_sdf,
+                 uint32_t osc_task_link) {
         if (device == nullptr) {
             throw std::runtime_error("SceneBuilder.build: device is None");
         }
@@ -1531,7 +1537,7 @@ public:
             terrain_platform_width, terrain_grid_width, terrain_grid_height_max,
             gravity_x, gravity_y, gravity_z, solver_vel_iters, solver_pos_iters,
             solver_contact_margin, solver_max_pairs, cloth_integrator, ogc_contact_capacity,
-            baumgarte_max_velocity,
+            baumgarte_max_velocity, overlap_recovery_velocity,
             bake_link_sdf, osc_task_link);
     }
 
@@ -1981,6 +1987,7 @@ NB_MODULE(_nuka_ext, m) {
                     nb::arg("cloth_integrator") = uint32_t{0},
                     nb::arg("ogc_contact_capacity") = uint32_t{0},
                     nb::arg("baumgarte_max_velocity") = 0.0f,
+                    nb::arg("overlap_recovery_velocity") = 0.0f,
                     nb::arg("gravity_x") = 0.0f,
                     nb::arg("gravity_y") = 0.0f,
                     nb::arg("gravity_z") = 0.0f,
@@ -2012,7 +2019,8 @@ NB_MODULE(_nuka_ext, m) {
                     "geometry needs so a fast-closing contact cannot tunnel), "
                     "solver_max_pairs (0 => bodies_per_env * 4, the broadphase "
                     "candidate-pair emission cap) and baumgarte_max_velocity (0.0 "
-                    "keeps the cooked model default). Each zero leaves the engine "
+                    "keeps the cooked model default); overlap_recovery_velocity (0.0 => none) "
+                    "bounds the speculative overlap push-out. Each zero leaves the engine "
                     "default untouched. gravity_x/y/z set world acceleration "
                     "at creation; all-zero selects standard Earth gravity.")
         .def_static(
@@ -2036,6 +2044,7 @@ NB_MODULE(_nuka_ext, m) {
             nb::arg("cloth_integrator") = 0u,
             nb::arg("ogc_contact_capacity") = 0u,
             nb::arg("baumgarte_max_velocity") = 0.0f,
+            nb::arg("overlap_recovery_velocity") = 0.0f,
             nb::arg("osc_task_link") = 0u,
             nb::rv_policy::take_ownership,
             nb::keep_alive<0, 1>(),
@@ -2055,7 +2064,8 @@ NB_MODULE(_nuka_ext, m) {
             "0.5*rho*Ct, per-step dv clamp); all-zero keeps the cook byte-identical. "
             "solver_vel_iters/solver_pos_iters/solver_contact_margin/solver_max_pairs "
             "+ baumgarte_max_velocity override the world SolverConfig (1:1 with "
-            "nk::Pipeline::SolverConfig); each 0 keeps the engine default, so a "
+            "nk::Pipeline::SolverConfig), overlap_recovery_velocity bounds the speculative "
+            "overlap push-out; each 0 keeps the engine default, so a "
             "defaults-only call is byte-identical to today.")
         .def("step", &World::step, "Advance the world one fixed step.")
         .def("set_execution_mode", &World::set_execution_mode, nb::arg("mode"),
@@ -3141,6 +3151,7 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("cloth_integrator") = 0u,
              nb::arg("ogc_contact_capacity") = 0u,
              nb::arg("baumgarte_max_velocity") = 0.0f,
+             nb::arg("overlap_recovery_velocity") = 0.0f,
              nb::arg("bake_link_sdf") = false,
              nb::arg("osc_task_link") = 0u,
              nb::rv_policy::take_ownership,
@@ -3151,7 +3162,7 @@ NB_MODULE(_nuka_ext, m) {
              "buffer_view(Field.PARTICLE_POSITION). contact_family == 1 bakes a "
              "heightfield collidable (the same terrain_* knobs create_from_scene "
              "takes). gravity_* default 0 => standard Earth. The solver_* / "
-             "baumgarte_max_velocity SolverConfig overrides default 0 => engine "
+             "baumgarte_max_velocity / overlap_recovery_velocity overrides default 0 => engine "
              "default => byte-identical to a defaults-only built scene.")
         .def("add_collision_shape", &SceneBuilder::add_collision_shape,
              nb::arg("node_path"), nb::arg("kind"),

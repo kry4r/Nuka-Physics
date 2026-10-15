@@ -568,6 +568,8 @@ struct AssembleRowsParams {
     float    contact_margin;
     // Nonzero when the split-impulse position pass runs; it then removes joint drift and overlap.
     uint32_t position_pass = 0u;
+    // Separating speed (m/s) at which speculative rows recover overlap; 0 recovers none.
+    float overlap_recovery_velocity = 0.0f;
     uint32_t point_endpoints_per_env = 0u;
     uint32_t point_endpoint_terms_per_env = 0u;
     VertexBlockLayout vertex_blocks{};

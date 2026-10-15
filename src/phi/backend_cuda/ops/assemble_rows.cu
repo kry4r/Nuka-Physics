@@ -405,7 +405,7 @@ __global__ void EmitPairDrivenRowsKernel(
     const float* __restrict__ particle_friction,
     float solref0, float solref1,
     float solimp0, float solimp1, float solimp2, float solimp3, float solimp4,
-    float dt, float baumgarte_max_velocity, float contact_margin,
+    float dt, float baumgarte_max_velocity, float contact_margin, float overlap_recovery_velocity,
     uint32_t env_count, uint32_t slot_count, uint32_t rows_per_env,
     uint32_t full_row_slot_count, uint32_t ogc_slot_count,
     uint32_t bodies_per_env, uint32_t base_link_count, uint32_t artics_per_env,
@@ -591,8 +591,9 @@ __global__ void EmitPairDrivenRowsKernel(
                 // Cap aref so the target separating velocity aref*dt <=
                 // baumgarte_max_velocity (+inf default => byte-identical): bounded recovery.
                 row.rhs = fminf(compliant.aref_bias, baumgarte_max_velocity / dt);
-                // Gap closure belongs to physical velocity; overlap recovery adds no kinetic energy.
-                if (speculative) row.rhs = fminf(ucontact_depth[mp], 0.0f) / (dt * dt);
+                // Gap closure belongs to physical velocity; overlap recovers at most overlap_recovery_velocity.
+                if (speculative) row.rhs = (fminf(ucontact_depth[mp], 0.0f) +
+                    fminf(fmaxf(ucontact_depth[mp], 0.0f), overlap_recovery_velocity * dt)) / (dt * dt);
                 row_damping[rs] = compliant.damping;
                 row.compliance_alpha = compliant.R;
                 row.lower = 0.0f;
@@ -1415,7 +1416,7 @@ Status OpAssembleRowsPairDriven(const ModelView& model, const DataView& data,
                    static_cast<const float*>(model.particle_friction),
                    p->solref[0], p->solref[1],
                    p->solimp[0], p->solimp[1], p->solimp[2], p->solimp[3], p->solimp[4],
-                   p->dt, p->baumgarte_max_velocity, p->contact_margin,
+                   p->dt, p->baumgarte_max_velocity, p->contact_margin, p->overlap_recovery_velocity,
                    p->env_count, p->union_slot_count, p->rows_per_env,
                    p->full_row_slot_count, p->ogc_slot_count,
                    p->bodies_per_env, p->base_link_count, artics_per_env,

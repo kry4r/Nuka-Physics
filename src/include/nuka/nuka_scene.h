@@ -484,6 +484,7 @@ typedef struct nuka_built_scene_options_t {
     // 0 (default) leaves every existing cook byte-identical.
     uint32_t bake_link_sdf;
     uint32_t cloth_integrator;       // 0 = BDF2, 1 = backward Euler.
+    float    overlap_recovery_velocity; // Speculative overlap push-out bound, m/s; 0 => none.
 } nuka_built_scene_options_t;
 
 // Cook the built scene's SceneIR via the SAME cook::CookSceneToModel a file scene
