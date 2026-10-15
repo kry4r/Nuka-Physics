@@ -815,3 +815,7 @@ fields:
   # World-frame force through each articulation link COM, followed by torque.
   # The outer step consumes and clears this input with the free-body forces.
   - {name: link_wrench, dtype: spatial6, per: link, arena: scratch, owner: data}
+  # Union-find parents of DAT owners whose pairs hold only under one shared step fraction.
+  - {name: dat_particle_parent, dtype: u32, per: particle, arena: scratch, owner: data}
+  - {name: dat_body_parent, dtype: u32, per: body, arena: scratch, owner: data}
+  - {name: dat_artic_parent, dtype: u32, per: articulation, arena: scratch, owner: data}

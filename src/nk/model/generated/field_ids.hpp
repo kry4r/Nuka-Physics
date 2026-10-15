@@ -397,6 +397,9 @@ enum class FieldId : uint16_t {
     LinkChildren,  // link_children (per:link arena:persistent owner:model)
     UcontactRowRange,  // ucontact_row_range (per:contact_slot arena:scratch owner:data elem:2 flags:[readout])
     LinkWrench,  // link_wrench (per:link arena:scratch owner:data)
+    DatParticleParent,  // dat_particle_parent (per:particle arena:scratch owner:data)
+    DatBodyParent,  // dat_body_parent (per:body arena:scratch owner:data)
+    DatArticParent,  // dat_artic_parent (per:articulation arena:scratch owner:data)
     Count
 };
 
@@ -789,6 +792,9 @@ inline constexpr const char* kFieldNames[kFieldCount] = {
     "link_children",
     "ucontact_row_range",
     "link_wrench",
+    "dat_particle_parent",
+    "dat_body_parent",
+    "dat_artic_parent",
 };
 inline constexpr const char* FieldName(FieldId id) {
     return static_cast<int>(id) < kFieldCount ? kFieldNames[static_cast<int>(id)] : "unknown";

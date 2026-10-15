@@ -365,6 +365,7 @@ __global__ void ClearDatKernel(DatTruncateParams p, ModelView model, DataView da
     const float beta = (data.env_status[env] & kEnvStatusDatFailure) != 0u
         ? 0.0f : motion > bound ? bound / motion : 1.0f;
     data.dat_particle_beta[item] = beta;
+    data.dat_particle_parent[item] = item;
 }
 
 __global__ void DatVertexFaceKernel(DatTruncateParams p, ModelView model, DataView data) {
@@ -639,12 +640,15 @@ __global__ void ClearDatOwnersKernel(DatTruncateParams p, DataView data) {
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t bodies = p.env_count * p.bodies_per_env;
     const uint32_t articulations = p.env_count * p.articulations_per_env;
+    const uint32_t particles = p.env_count * p.particles_per_env;
     if (item < bodies) {
         data.dat_body_beta[item] = __float_as_uint(1.0f);
         data.dat_body_motion[item] = 0.0f;
+        data.dat_body_parent[item] = particles + item;
     }
     if (item < articulations) {
         data.dat_artic_beta[item] = __float_as_uint(1.0f);
+        data.dat_artic_parent[item] = particles + bodies + item;
         if (data.dat_artic_witness != nullptr)
             for (uint32_t k = 0u; k < kDatBoundKinds; ++k)
                 data.dat_artic_witness[size_t{item} * kDatBoundKinds + k] = ~0ull;
@@ -860,8 +864,134 @@ __global__ void DatInitialMixedEdgeFaceKernel(DatTruncateParams p,
     }
 }
 
+// Owners are union-find nodes: particles, then bodies, then articulations. A join hooks the larger
+// root under the smaller one, so parents only decrease and every find ends.
+__device__ uint32_t* DatParentSlot(const DatTruncateParams& p, const DataView& data, uint32_t node) {
+    const uint32_t particles = p.env_count * p.particles_per_env;
+    const uint32_t bodies = p.env_count * p.bodies_per_env;
+    if (node < particles) return data.dat_particle_parent + node;
+    if (node < particles + bodies) return data.dat_body_parent + (node - particles);
+    return data.dat_artic_parent + (node - particles - bodies);
+}
+
+__device__ uint32_t* DatBetaSlot(const DatTruncateParams& p, const DataView& data, uint32_t node) {
+    const uint32_t particles = p.env_count * p.particles_per_env;
+    const uint32_t bodies = p.env_count * p.bodies_per_env;
+    if (node < particles) return reinterpret_cast<uint32_t*>(data.dat_particle_beta + node);
+    if (node < particles + bodies) return data.dat_body_beta + (node - particles);
+    return data.dat_artic_beta + (node - particles - bodies);
+}
+
+__device__ uint32_t DatFind(const DatTruncateParams& p, const DataView& data, uint32_t node) {
+    while (true) {
+        const uint32_t parent = *reinterpret_cast<volatile uint32_t*>(DatParentSlot(p, data, node));
+        if (parent == node) return node;
+        node = parent;
+    }
+}
+
+__device__ void DatJoin(const DatTruncateParams& p, const DataView& data, uint32_t a, uint32_t b) {
+    while (true) {
+        a = DatFind(p, data, a);
+        b = DatFind(p, data, b);
+        if (a == b) return;
+        const uint32_t child = a > b ? a : b, root = a > b ? b : a;
+        if (atomicCAS(DatParentSlot(p, data, child), child, root) == child) return;
+    }
+}
+
+// The node whose fraction moves a point, as DatMinOwnerBeta resolves it; false for a body that
+// no fraction moves.
+__device__ bool DatOwnerNode(const DatTruncateParams& p, const ModelView& model, const DataView& data,
+                             uint32_t env, DatPointRef ref, uint32_t* node) {
+    const uint32_t particles = p.env_count * p.particles_per_env;
+    const uint32_t bodies = p.env_count * p.bodies_per_env;
+    if (ref.particle) {
+        *node = ref.owner;
+        return true;
+    }
+    uint32_t link = ~0u;
+    math::Transform local{};
+    if (DatBodyLink(p, model, env, ref.owner, &link, &local)) {
+        *node = particles + bodies + model.link_to_articulation[link];
+        return true;
+    }
+    const uint32_t global = env * p.bodies_per_env + ref.owner;
+    const uint32_t owner_local = model.body_collidable_body ? model.body_collidable_body[global] : ~0u;
+    const uint32_t owner = owner_local == ~0u ? global : env * p.bodies_per_env + owner_local;
+    *node = particles + owner;
+    return data.body_inv_mass[owner] > 0.0f;
+}
+
+// Projection gap of the two sides on a fixed axis, less the margin, at step fraction s.
+__device__ float DatAxisGapAt(const DatTruncateParams& p, const ModelView& model, const DataView& data,
+                              uint32_t env, const DatPointRef* refs_a, uint32_t count_a,
+                              const DatPointRef* refs_b, uint32_t count_b, math::Vec3 normal,
+                              float margin, float s, uint32_t frame) {
+    float lower = FLT_MAX, upper = -FLT_MAX;
+    for (uint32_t i = 0u; i < count_a; ++i)
+        lower = fminf(lower, DatPointAt(p, model, data, env, refs_a[i], s, frame).Dot(normal));
+    for (uint32_t i = 0u; i < count_b; ++i)
+        upper = fmaxf(upper, DatPointAt(p, model, data, env, refs_b[i], s, frame).Dot(normal));
+    return lower - upper - margin;
+}
+
+// True when the projection gap stays above the margin for the whole step, by Lipschitz subdivision.
+__device__ bool DatAxisHolds(const DatTruncateParams& p, const ModelView& model, const DataView& data,
+                             uint32_t env, const DatPointRef* refs_a, uint32_t count_a,
+                             const DatPointRef* refs_b, uint32_t count_b, math::Vec3 normal,
+                             float margin, float speed, uint32_t frame) {
+    if (!(speed < FLT_MAX)) return false;
+    float values[5];
+    for (uint32_t i = 0u; i <= 4u; ++i) {
+        values[i] = DatAxisGapAt(p, model, data, env, refs_a, count_a, refs_b, count_b, normal, margin,
+                                 0.25f * i, frame);
+        if (!(values[i] > 0.0f)) return false;
+    }
+    DatInterval stack[20];
+    uint32_t top = 0u;
+    for (uint32_t i = 4u; i > 0u; --i) stack[top++] = {0.25f * (i - 1u), 0.25f * i, values[i - 1u], values[i], 0u};
+    while (top > 0u) {
+        const auto interval = stack[--top];
+        const float width = interval.end - interval.start;
+        if (fminf(interval.value_start, interval.value_end) > 0.5f * speed * width) continue;
+        if (interval.depth == 12u) return false;
+        const float mid = 0.5f * (interval.start + interval.end);
+        const float value_mid = DatAxisGapAt(p, model, data, env, refs_a, count_a, refs_b, count_b, normal,
+                                             margin, mid, frame);
+        if (!(value_mid > 0.0f)) return false;
+        stack[top++] = {mid, interval.end, value_mid, interval.value_end, interval.depth + 1u};
+        stack[top++] = {interval.start, mid, interval.value_start, value_mid, interval.depth + 1u};
+    }
+    return true;
+}
+
+// Owners moved by one shared fraction keep each point on its start path prefix, so a pair whose
+// projections on the separator normal keep the relaxed gap over the whole step stays apart once its
+// owners are joined. A side that never moves needs no join; one that moves without a fraction cannot.
+__device__ bool DatJoinPair(const DatTruncateParams& p, const ModelView& model, const DataView& data,
+                            uint32_t env, const DatPointRef* refs_a, uint32_t count_a,
+                            const DatPointRef* refs_b, uint32_t count_b, float bound_a, float bound_b,
+                            const collision::DatSeparator& separator, uint32_t frame) {
+    uint32_t nodes[6];
+    uint32_t count = 0u;
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        const DatPointRef* refs = side == 0u ? refs_a : refs_b;
+        const uint32_t points = side == 0u ? count_a : count_b;
+        if ((side == 0u ? bound_a : bound_b) == 0.0f) continue;
+        for (uint32_t i = 0u; i < points; ++i)
+            if (!DatOwnerNode(p, model, data, env, refs[i], &nodes[count++])) return false;
+    }
+    if (!DatAxisHolds(p, model, data, env, refs_a, count_a, refs_b, count_b, separator.normal,
+                      (1.0f - p.relaxation) * separator.gap, bound_a + bound_b, frame)) return false;
+    if (bound_a > 0.0f && bound_b > 0.0f)
+        for (uint32_t i = 1u; i < count; ++i) DatJoin(p, data, nodes[0], nodes[i]);
+    return true;
+}
+
 // Certifies a primitive pair by the separating plane of its start positions: each point keeps to its
-// side's share of the gap, or its owner is truncated to the step fraction where it would cross.
+// side's share of the gap, or its owner is truncated to the step fraction where it would cross,
+// unless the pair holds for joined owners.
 __device__ void DatCertifyPair(const DatTruncateParams& p, const ModelView& model,
                                const DataView& data, uint32_t env,
                                const DatPointRef* refs_a, uint32_t count_a,
@@ -917,6 +1047,8 @@ __device__ void DatCertifyPair(const DatTruncateParams& p, const ModelView& mode
     const float fraction = fminf(fmaxf(share, bound_b > 0.0f ? slack : 0.0f),
                                  bound_a > 0.0f ? 1.0f - slack : 1.0f);
     const float plane_offset = separator.gap * fraction;
+    float roots[2][3];
+    bool truncated = false;
     for (uint32_t side = 0u; side < 2u; ++side) {
         const DatPointRef* refs = side == 0u ? refs_a : refs_b;
         const uint32_t count = side == 0u ? count_a : count_b;
@@ -924,11 +1056,20 @@ __device__ void DatCertifyPair(const DatTruncateParams& p, const ModelView& mode
         for (uint32_t i = 0u; i < count; ++i) {
             const float offset = side == 0u ? plane_offset : -plane_offset;
             const float speed = side == 0u ? speed_a[i] : speed_b[i];
-            const float root = DatPlaneFraction(p, model, data, env, refs[i],
+            roots[side][i] = DatPlaneFraction(p, model, data, env, refs[i],
                 separator.negative_support, normal, offset, speed, frame);
+            truncated |= roots[side][i] < 1.0f;
+        }
+    }
+    if (!truncated || DatJoinPair(p, model, data, env, refs_a, count_a, refs_b, count_b, bound_a, bound_b,
+                                  separator, frame)) return;
+    for (uint32_t side = 0u; side < 2u; ++side) {
+        const DatPointRef* refs = side == 0u ? refs_a : refs_b;
+        const uint32_t count = side == 0u ? count_a : count_b;
+        for (uint32_t i = 0u; i < count; ++i) {
             const DatPointRef& other = side == 0u ? refs_b[0] : refs_a[0];
-            if (root < 1.0f)
-                DatMinOwnerBeta(p, model, data, env, refs[i], p.relaxation * root,
+            if (roots[side][i] < 1.0f)
+                DatMinOwnerBeta(p, model, data, env, refs[i], p.relaxation * roots[side][i],
                     other.particle ? kDatBoundParticlePair : kDatBoundBodyPair,
                     DatCounterpart(p, other));
         }
@@ -1355,6 +1496,21 @@ __global__ void TallyDatKernel(DatTruncateParams p, DataView data) {
     }
 }
 
+// Joined owners take the smallest fraction among them, so every joined pair moves along its prefix.
+__global__ void DatJoinMinKernel(DatTruncateParams p, DataView data, uint32_t first, uint32_t nodes) {
+    const uint32_t node = first + blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= nodes) return;
+    const uint32_t root = DatFind(p, data, node);
+    if (root != node) atomicMin(DatBetaSlot(p, data, root), *DatBetaSlot(p, data, node));
+}
+
+__global__ void DatJoinShareKernel(DatTruncateParams p, DataView data, uint32_t first, uint32_t nodes) {
+    const uint32_t node = first + blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= nodes) return;
+    const uint32_t root = DatFind(p, data, node);
+    if (root != node) *DatBetaSlot(p, data, node) = *DatBetaSlot(p, data, root);
+}
+
 // The accepted fraction scales the physical and pseudo displacement alike; pseudo stays out of velocity.
 __global__ void ApplyDatKernel(DatTruncateParams p, DataView data) {
     const uint32_t item = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1385,7 +1541,7 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
                                     !data.particle_surface_edge_nodes)) ||
           !model.particle_surface_thickness || !data.particle_surface_max_speed ||
           !data.dat_surface_motion ||
-          !data.dat_particle_beta || !data.particle_inv_mass ||
+          !data.dat_particle_beta || !data.dat_particle_parent || !data.particle_inv_mass ||
           !data.particle_prev_pos || !data.particle_pos || !data.particle_vel)) ||
         (p->bodies_per_env > 0u &&
          (!model.mesh_surface_info || !model.mesh_edge_info || !model.mesh_triangles ||
@@ -1394,7 +1550,8 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
           !model.mesh_edges || !model.hull_verts || !model.mesh_vertex_sources ||
           !model.mesh_vertex_triangle_offsets || !model.mesh_vertex_triangles ||
           !data.body_pose || !data.dat_prev_body_pose || !data.dat_body_beta ||
-          !data.dat_body_speed || !data.dat_body_query_radius || !data.dat_body_motion ||
+          !data.dat_body_parent || !data.dat_body_speed || !data.dat_body_query_radius ||
+          !data.dat_body_motion ||
           !data.body_inv_mass || !data.body_linear_velocity ||
           !data.body_angular_velocity || !data.body_inertial_frame ||
           !data.body_inv_inertia || !data.body_world_inv_inertia)) ||
@@ -1406,7 +1563,7 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
           !data.q || !data.qdot || !data.dat_prev_q || !data.base_pose ||
           !data.dat_prev_base_pose || !data.link_velocity ||
           !data.dat_joint_motion || !data.dat_joint_rate ||
-          !data.dat_artic_beta || !data.m || !data.qdot_flat)) ||
+          !data.dat_artic_beta || !data.dat_artic_parent || !data.m || !data.qdot_flat)) ||
         (p->slot_capacity > 0u &&
          (!data.ogc_contact_count || !data.dat_pair_kind ||
           !data.dat_pair_owner_a || !data.dat_pair_owner_b ||
@@ -1426,8 +1583,9 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
     const uint64_t body_vertices = uint64_t{p->env_count} * p->mesh_vertex_sources;
     const uint64_t slots = uint64_t{p->env_count} * p->slot_capacity;
     const uint64_t body_pairs = uint64_t{p->env_count} * p->bodies_per_env * p->bodies_per_env;
+    const uint64_t nodes = particles + uint64_t{p->env_count} * (p->bodies_per_env + p->articulations_per_env);
     if (particles > UINT32_MAX / kTreeShares || edges > UINT32_MAX / kTreeShares ||
-        triangles > UINT32_MAX ||
+        triangles > UINT32_MAX || nodes > UINT32_MAX ||
         body_vertices > UINT32_MAX || slots > UINT32_MAX || body_pairs > UINT32_MAX ||
         uint64_t{p->env_count} * (p->edges_per_env + p->mesh_edge_sources) > UINT32_MAX ||
         p->slot_base > p->slot_stride ||
@@ -1480,6 +1638,15 @@ Status OpDatTruncate(const ModelView& model, const DataView& data,
         LaunchCuda(DatArticPairsKernel,
                    dim3(static_cast<uint32_t>((body_pairs + kBlockSize - 1u) / kBlockSize)),
                    dim3(kBlockSize), 0u, stream, *p, model, data);
+    // Particle parents exist only where surfaces cleared them, and only surfaces join particles.
+    const uint32_t first = p->surfaces_per_env > 0u ? 0u : static_cast<uint32_t>(particles);
+    if (nodes > first) {
+        const dim3 grid((static_cast<uint32_t>(nodes) - first + kBlockSize - 1u) / kBlockSize);
+        LaunchCuda(DatJoinMinKernel, grid, dim3(kBlockSize), 0u, stream, *p, data, first,
+                   static_cast<uint32_t>(nodes));
+        LaunchCuda(DatJoinShareKernel, grid, dim3(kBlockSize), 0u, stream, *p, data, first,
+                   static_cast<uint32_t>(nodes));
+    }
     LaunchCuda(TallyDatKernel, dim3(p->env_count), dim3(kBlockSize), 0u, stream, *p, data);
     if (p->bodies_per_env > 0u || p->articulations_per_env > 0u)
         LaunchCuda(TallyDatOwnersKernel,

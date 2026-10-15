@@ -201,6 +201,9 @@ void BindDataPointer(phi::DataView& v, FieldId id, void* p) {
         case FieldId::DatParticleBeta: v.dat_particle_beta = static_cast<float*>(p); break;
         case FieldId::DatBodyBeta: v.dat_body_beta = static_cast<uint32_t*>(p); break;
         case FieldId::DatArticBeta: v.dat_artic_beta = static_cast<uint32_t*>(p); break;
+        case FieldId::DatParticleParent: v.dat_particle_parent = static_cast<uint32_t*>(p); break;
+        case FieldId::DatBodyParent: v.dat_body_parent = static_cast<uint32_t*>(p); break;
+        case FieldId::DatArticParent: v.dat_artic_parent = static_cast<uint32_t*>(p); break;
         case FieldId::DatArticWitness: v.dat_artic_witness = static_cast<uint64_t*>(p); break;
         case FieldId::DatPrevQ: v.dat_prev_q = static_cast<float*>(p); break;
         case FieldId::DatPrevBasePose: v.dat_prev_base_pose = static_cast<math::Transform*>(p); break;
