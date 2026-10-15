@@ -442,6 +442,14 @@ nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
     return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
 }
 
+void SetParticleSurfaces(WorldRecord& record, std::vector<cook::MediaRenderSurface> surfaces) {
+    for (cook::MediaRenderSurface& s : surfaces)
+        if (s.render_material_id < record.scene->MaterialCount())
+            s.render_material_id =
+                record.scene->Ecs().FindRenderMaterial(record.scene->GetMaterial(s.render_material_id).name);
+    record.particle_surfaces = std::move(surfaces);
+}
+
 }  // namespace nuka::c_abi
 
 extern "C" {
@@ -559,7 +567,7 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             particles->cloth_integrator, desc->ogc_contact_capacity);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr) {
-                record->particle_surfaces = std::move(media_surfaces);
+                nuka::c_abi::SetParticleSurfaces(*record, std::move(media_surfaces));
                 record->scene_dir =
                     std::filesystem::path(desc->scene_path).parent_path().string();
             }

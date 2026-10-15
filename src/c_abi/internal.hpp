@@ -280,4 +280,8 @@ nuka_result_t FinishWorldCreate(
     float solver_contact_margin = 0.0f, uint32_t solver_max_pairs = 0u,
     uint32_t cloth_integrator = 0u, uint32_t ogc_contact_capacity = 0u);
 
+// Retains a created world's media render surfaces, each material id moved from the scene's material
+// table to the registry slot its name projects to, since the registry merges equally named materials.
+void SetParticleSurfaces(WorldRecord& record, std::vector<nuka::scene::cook::MediaRenderSurface> surfaces);
+
 } // namespace nuka::c_abi

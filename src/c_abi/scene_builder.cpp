@@ -575,7 +575,7 @@ nuka_result_t nuka_world_create_from_built_scene(
             options ? options->cloth_integrator : 0u, desc->ogc_contact_capacity);
         if (result == NUKA_RESULT_OK) {
             if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
-                record->particle_surfaces = std::move(media_surfaces);
+                nuka::c_abi::SetParticleSurfaces(*record, std::move(media_surfaces));
         }
         return result;
     } catch (const std::bad_alloc&) {
