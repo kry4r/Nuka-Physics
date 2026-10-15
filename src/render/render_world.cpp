@@ -304,6 +304,9 @@ bool NormalsUnusable(const std::vector<float>& positions, const std::vector<floa
     return true;  // all-zero
 }
 
+// Faces meeting at a position within this angle (40 deg) share a synthesized shading normal.
+constexpr float kCreaseCos = 0.766f;
+
 // Convert a decoded .nka MESH into our backend-agnostic MeshGeometry. Synthesizes
 // smooth normals when the cooked stream is absent or all-zero so downstream
 // shading (raster + path-tracer) never normalizes a zero vector.
@@ -313,7 +316,7 @@ MeshGeometry FromNkaMesh(const scene::NkaMesh& src) {
     m.uvs       = src.uvs;
     m.indices   = src.indices;
     m.normals   = NormalsUnusable(src.positions, src.normals)
-                      ? SmoothNormals(src.positions, src.indices)
+                      ? CreaseNormals(src.positions, src.indices, kCreaseCos)
                       : src.normals;
     return m;
 }
@@ -351,7 +354,7 @@ MeshGeometry FromInlineTriangles(const scene::VisualMeshComponent& vis) {
     m.uvs       = vis.inline_uvs;
     m.indices   = vis.inline_indices;
     m.normals   = NormalsUnusable(vis.inline_positions, vis.inline_normals)
-                      ? SmoothNormals(vis.inline_positions, vis.inline_indices)
+                      ? CreaseNormals(vis.inline_positions, vis.inline_indices, kCreaseCos)
                       : vis.inline_normals;
     return m;
 }
