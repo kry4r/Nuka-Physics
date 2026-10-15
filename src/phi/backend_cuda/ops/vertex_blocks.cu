@@ -63,12 +63,16 @@ __global__ void ClothPredictKernel(DataView data, ClothStepParams p) {
         ? velocity + (velocity - earlier) * (1.0f / 3.0f) + gravity * ht
         : velocity + gravity * h;
     const math::Vec3 u = nk::vbd::DisplacementRate(inertial, offset, h, ht);
+    // The iterate starts with gravity scaled by the last step's acceleration along it, clamped to [0, 1]
+    // (VBD adaptive initialization), so cloth at rest starts at rest while the target keeps full gravity.
+    const float along = fminf(fmaxf((velocity - earlier).Dot(gravity) / (h * gravity.Dot(gravity)), 0.0f), 1.0f);
+    const math::Vec3 guess = nk::vbd::DisplacementRate(inertial - gravity * ((1.0f - along) * ht), offset, h, ht);
     data.vbd_offset[item] = offset;
     data.vbd_free_velocity[item] = inertial;
     data.vbd_free_rate[item] = u;
     data.vbd_inertia[item] = 1.0f / (inv_mass * ht * ht);
-    data.particle_vel[particle] = data.particle_v_pre[particle] = u;
-    data.pbf_predicted_pos[particle] = start + u * h;
+    data.particle_vel[particle] = data.particle_v_pre[particle] = guess;
+    data.pbf_predicted_pos[particle] = start + guess * h;
 }
 
 __global__ void CacheMembraneStartKernel(ModelView model, DataView data, ClothStepParams p) {
