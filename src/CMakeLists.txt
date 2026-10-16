@@ -1344,20 +1344,6 @@ if(CMAKE_CUDA_COMPILER)
         nuka_runtime nuka_import nuka_cooker nuka_contact_wrench nuka_collision_gpu
         nuka_core nuka_phi CUDA::cudart)
 
-    add_executable(nuka_cook_scene
-        ${CMAKE_SOURCE_DIR}/tools/scene/cook_scene.cpp
-    )
-    target_include_directories(nuka_cook_scene
-        PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-    )
-    target_link_libraries(nuka_cook_scene
-        PRIVATE
-            nuka_import
-            nuka_scene
-    )
-    nuka_set_warnings(nuka_cook_scene)
-
     # Compose a robot .nks over a procedural field heightfield (visual-mesh
     # surface + N re-rooted robots on the local surface). HOST-ONLY.
     add_executable(nuka_field_scene
@@ -1422,3 +1408,18 @@ if(CMAKE_CUDA_COMPILER)
     )
     nuka_set_warnings(nuka_gpu_mlp_policy_validate)
 endif()
+
+# Host-only scene conversion is available without a CUDA compiler.
+add_executable(nuka_cook_scene
+    ${CMAKE_SOURCE_DIR}/tools/scene/cook_scene.cpp
+)
+target_include_directories(nuka_cook_scene
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(nuka_cook_scene
+    PRIVATE
+        nuka_import
+        nuka_scene
+)
+nuka_set_warnings(nuka_cook_scene)

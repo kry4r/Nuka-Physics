@@ -46,15 +46,28 @@ nuka::scene::SceneIR Import(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: %s <input.(xml|urdf|usd[a])> <output.nks>\n", argv[0]);
+    const bool strict_urdf = argc == 4 && std::string(argv[1]) == "--strict-urdf";
+    if (argc != 3 && !strict_urdf) {
+        std::fprintf(stderr, "usage: %s [--strict-urdf] <input.(xml|urdf|usd[a])> <output.nks>\n", argv[0]);
         return 2;
     }
-    const std::string in_path = argv[1];
-    const std::string out_path = argv[2];
+    const std::string in_path = argv[strict_urdf ? 2 : 1];
+    const std::string out_path = argv[strict_urdf ? 3 : 2];
 
     try {
-        nuka::scene::SceneIR scene = Import(in_path);
+        nuka::scene::SceneIR scene;
+        if (strict_urdf) {
+            if (LowerExt(in_path) != "urdf")
+                throw std::runtime_error("--strict-urdf requires a URDF input");
+            auto result = nuka::import::ImportUrdf(in_path);
+            for (const auto& diagnostic : result.diagnostics)
+                std::fprintf(stderr, "%s:%d [%s] <%s>: %s\n", diagnostic.source.c_str(),
+                    diagnostic.line, diagnostic.code.c_str(), diagnostic.element.c_str(), diagnostic.message.c_str());
+            if (!result.StrictSuccess()) return 1;
+            scene = std::move(*result.scene);
+        } else {
+            scene = Import(in_path);
+        }
 
         // Count visual-mesh shapes (the ones the cook routes to MESH chunks).
         size_t visual_with_tris = 0, total_tris = 0;
