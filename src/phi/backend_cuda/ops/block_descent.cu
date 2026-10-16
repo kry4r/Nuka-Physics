@@ -1034,7 +1034,8 @@ __global__ void CountIncidenceKernel(DataView data, BlockDescentSolveParams p, B
         const double response = RowInertialResponse(row, data, p, points, slot, &grid, &coupling);
         // Owners a row ties descend against each other's stale velocities at the block Gauss-Seidel factor
         // rho^2 P / (1 + rho W + rho^2 P), P = max w_i (W - w_i); the root below keeps it at most 1/4.
-        const double penalty_scale = grid ? kGridRowPenaltyScale : double(p.penalty_scale);
+        const double penalty_scale = grid ? kGridRowPenaltyScale
+            : double(coupling > 0.0 ? p.pair_penalty_scale : p.penalty_scale);
         const double coupled = coupling > 0.0
             ? (response + sqrt(response * response + 12.0 * coupling)) / (6.0 * coupling) : HUGE_VAL;
         const double penalty = response > 0.0 ? fmin(penalty_scale / response, coupled) : 0.0;

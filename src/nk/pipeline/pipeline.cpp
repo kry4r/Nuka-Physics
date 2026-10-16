@@ -436,6 +436,13 @@ phi::Status Pipeline::BuildInterval(const Model& model, const SolverConfig& cfg,
             return phi::Status::InvalidArgument;
         p_block_descent_.velocity_tolerance = tolerance;
     }
+    const char* pair_penalty = std::getenv("NUKA_BLOCK_DESCENT_PAIR_PENALTY_SCALE");
+    if (pair_penalty != nullptr) {
+        char* end = nullptr;
+        const float scale = std::strtof(pair_penalty, &end);
+        if (end == pair_penalty || *end != '\0' || !(scale > 0.0f)) return phi::Status::InvalidArgument;
+        p_block_descent_.pair_penalty_scale = scale;
+    }
     // Only head rows enter the incidence: one owner per plain side, every term of a point endpoint.
     p_block_descent_.incidence_per_env =
         2u * (uint64_t{cap.rigid_contact_rows_per_env} / (1u + kPairDrivenTangentRowsPerPt) +

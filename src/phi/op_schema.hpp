@@ -594,6 +594,7 @@ struct BlockDescentSolveParams {
     uint64_t incidence_per_env = 0u;
     uint32_t measure_contact_residual = 0u;
     float penalty_scale = 100.0f;
+    float pair_penalty_scale = 100.0f;
     uint64_t workspace_words = 0u;
     VertexBlockLayout vertex_blocks{};
     uint32_t measure_vertex_audit = 0u;
