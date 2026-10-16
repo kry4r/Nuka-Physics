@@ -31,9 +31,13 @@ float LinearToSrgb(float c) {
     return 1.055f * std::pow(std::max(c, 0.0f), 1.0f / 2.4f) - 0.055f;
 }
 
-uint8_t Encode(float linear) {
+float EncodeUnit(float linear) {
     const float v = LinearToSrgb(AcesFilmic(linear));
-    return static_cast<uint8_t>(std::lround(std::min(1.0f, std::max(0.0f, v)) * 255.0f));
+    return std::min(1.0f, std::max(0.0f, v));
+}
+
+uint8_t Encode(float linear) {
+    return static_cast<uint8_t>(std::lround(EncodeUnit(linear) * 255.0f));
 }
 
 struct Rgb { float r, g, b; };
@@ -94,6 +98,38 @@ VulkanOffscreenReport FramebufferToReport(const rt::Framebuffer& frame,
     }
     rep.non_background_pixel_count = non_bg;
     return rep;
+}
+
+std::vector<float> FramebufferToFeatures(const rt::Framebuffer& frame,
+                                         VulkanRgba8 background,
+                                         bool keep_miss_color,
+                                         float exposure_ev,
+                                         float grade) {
+    const size_t pixels = frame.Pixels();
+    std::vector<float> out(pixels * 9u, 0.0f);
+    const float exposure_scale =
+        (exposure_ev == 0.0f) ? 1.0f : std::exp2(exposure_ev);
+    const bool have_prim = frame.prim.size() == pixels;
+    const bool have_color = frame.color.size() == pixels * 3u;
+    const bool have_albedo = frame.albedo.size() == pixels * 3u;
+    const bool have_normal = frame.normal.size() == pixels * 3u;
+    for (size_t p = 0; p < pixels; ++p) {
+        float* o = out.data() + p * 9u;
+        const bool hit = have_prim && frame.prim[p] != kRtNoPrim;
+        if ((hit || keep_miss_color) && have_color) {
+            const Rgb c = GradeColor(
+                Rgb{frame.color[p * 3u + 0u], frame.color[p * 3u + 1u],
+                    frame.color[p * 3u + 2u]}, exposure_scale, grade);
+            o[0] = EncodeUnit(c.r); o[1] = EncodeUnit(c.g); o[2] = EncodeUnit(c.b);
+        } else {
+            o[0] = background.r / 255.0f; o[1] = background.g / 255.0f; o[2] = background.b / 255.0f;
+        }
+        for (uint32_t k = 0; k < 3u; ++k) {
+            o[3u + k] = have_albedo ? frame.albedo[p * 3u + k] : 0.0f;
+            o[6u + k] = have_normal ? frame.normal[p * 3u + k] : 0.0f;
+        }
+    }
+    return out;
 }
 
 }  // namespace nuka::render

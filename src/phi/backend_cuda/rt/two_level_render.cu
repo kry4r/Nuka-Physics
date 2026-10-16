@@ -792,6 +792,27 @@ namespace {
 // throws between create and the elapsed-time read.
 struct ScopedTimingEvents {
     cudaEvent_t e0{}, e1{}, e2{};
+    void Begin(cudaStream_t stream) {
+        if (!g_render_timing_enabled) return;
+        CheckCuda(cudaEventCreate(&e0), "render timing start event");
+        CheckCuda(cudaEventCreate(&e1), "render timing TLAS event");
+        CheckCuda(cudaEventCreate(&e2), "render timing end event");
+        CheckCuda(cudaEventRecord(e0, stream), "render timing start");
+    }
+    void AfterTlas(cudaStream_t stream) {
+        if (e0) CheckCuda(cudaEventRecord(e1, stream), "render timing TLAS");
+    }
+    void Finish(cudaStream_t stream) {
+        if (!e0) return;
+        CheckCuda(cudaEventRecord(e2, stream), "render timing end");
+        CheckCuda(cudaEventSynchronize(e2), "render timing completion");
+        float tlas_ms = 0.0f, kernel_ms = 0.0f;
+        CheckCuda(cudaEventElapsedTime(&tlas_ms, e0, e1), "render timing TLAS elapsed");
+        CheckCuda(cudaEventElapsedTime(&kernel_ms, e1, e2), "render timing kernel elapsed");
+        g_render_timing.tlas_ms += static_cast<double>(tlas_ms);
+        g_render_timing.kernel_ms += static_cast<double>(kernel_ms);
+        ++g_render_timing.calls;
+    }
     ~ScopedTimingEvents() {
         if (e0) cudaEventDestroy(e0);
         if (e1) cudaEventDestroy(e1);
@@ -806,16 +827,11 @@ void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
                        const PinholeCamera& camera,
                        const RtContext& ctx,
                        const AovTarget& dst) {
-    // Default path (probe off): no events, byte-identical to the golden tracer.
-    const bool probe = g_render_timing_enabled;
     ScopedTimingEvents ev;
-    if (probe) {
-        cudaEventCreate(&ev.e0); cudaEventCreate(&ev.e1); cudaEventCreate(&ev.e2);
-        cudaEventRecord(ev.e0, ctx.stream);
-    }
+    ev.Begin(ctx.stream);
 
     const FrameTlasView frame = EnsureFrameTlas(impl, scene, ctx);
-    if (probe) cudaEventRecord(ev.e1, ctx.stream);
+    ev.AfterTlas(ctx.stream);
 
     const dim3 block(kBlockDim, kBlockDim);
     const dim3 grid((camera.width + kBlockDim - 1u) / kBlockDim,
@@ -827,16 +843,7 @@ void LaunchRenderFrame(TwoLevelSceneDevice::Impl* impl,
         dst.color, dst.depth, dst.normal, dst.albedo, dst.uv, dst.prim);
     CheckCuda(cudaGetLastError(), "RenderFrameKernel launch");
 
-    if (probe) {
-        cudaEventRecord(ev.e2, ctx.stream);
-        cudaEventSynchronize(ev.e2);
-        float tlas_ms = 0.0f, kernel_ms = 0.0f;
-        cudaEventElapsedTime(&tlas_ms, ev.e0, ev.e1);
-        cudaEventElapsedTime(&kernel_ms, ev.e1, ev.e2);
-        g_render_timing.tlas_ms += static_cast<double>(tlas_ms);
-        g_render_timing.kernel_ms += static_cast<double>(kernel_ms);
-        ++g_render_timing.calls;
-    }
+    ev.Finish(ctx.stream);
 }
 
 // Map a caller RtDeviceAovs (opaque phi::Buffer*) to raw device pointers.
@@ -923,7 +930,10 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
                         const BeautyOptions& opt,
                         const RtContext& ctx,
                         const AovTarget& dst) {
+    ScopedTimingEvents ev;
+    ev.Begin(ctx.stream);
     const FrameTlasView frame = EnsureFrameTlas(impl, scene, ctx);
+    ev.AfterTlas(ctx.stream);
 
     BeautyParams sky;
     sky.shadow_rays = opt.shadow_rays;
@@ -977,6 +987,7 @@ void LaunchRenderBeauty(TwoLevelSceneDevice::Impl* impl,
                        frame.materials, textures, scene.light, sky, opt.samples,
                        opt.seed, dst, ctx.stream);
     CheckCuda(cudaGetLastError(), "RenderBeautyKernel launch");
+    ev.Finish(ctx.stream);
 }
 
 }  // namespace

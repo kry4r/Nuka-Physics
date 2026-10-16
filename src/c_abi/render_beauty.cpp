@@ -162,17 +162,17 @@ nuka_result_t RenderBeauty(nuka_world_handle world,
                                        void* out_rgb, size_t out_capacity,
                                        size_t* out_pixel_count,
                                        const nuka_scene_camera_t* authored = nullptr) {
-    if (width == 0u || height == 0u) {
+    if (width == 0u || height == 0u || dtype > 2u) {
         return NUKA_RESULT_INVALID_ARG;
     }
-    const size_t need = static_cast<size_t>(width) * height * 3u;
+    const size_t need = static_cast<size_t>(width) * height * (dtype == 2u ? 9u : 3u);
 
     // SIZE QUERY: a null output buffer just reports the scalar count to allocate.
     if (out_rgb == nullptr) {
         if (out_pixel_count != nullptr) *out_pixel_count = need;
         return NUKA_RESULT_OK;
     }
-    if (camera == nullptr || (dtype != 0u && dtype != 1u)) {
+    if (camera == nullptr) {
         return NUKA_RESULT_INVALID_ARG;
     }
     if (out_capacity < need) {
@@ -254,8 +254,15 @@ nuka_result_t RenderBeauty(nuka_world_handle world,
             o.shadow_radius = authored->shadow_radius;
         }
         record->beauty->renderer->SetBeauty(true, spp != 0u ? spp : 16u);
+        std::vector<float> features;
         const nuka::render::VulkanOffscreenReport report =
-            record->beauty->renderer->Render(studio.world, o);
+            record->beauty->renderer->Render(studio.world, o, dtype == 2u ? &features : nullptr);
+        if (dtype == 2u) {
+            if (features.size() != need) return NUKA_RESULT_INTERNAL;
+            std::copy(features.begin(), features.end(), static_cast<float*>(out_rgb));
+            if (out_pixel_count != nullptr) *out_pixel_count = need;
+            return NUKA_RESULT_OK;
+        }
 
         // Pack RGBA8 -> the caller's RGB buffer (top row first, R,G,B per pixel).
         const size_t pixels = static_cast<size_t>(width) * height;

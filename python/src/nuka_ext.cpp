@@ -2250,10 +2250,12 @@ NB_MODULE(_nuka_ext, m) {
                     cam.eye[i] = eye[i]; cam.look[i] = look[i]; cam.up[i] = up[i];
                 }
                 cam.fov_deg = fov_deg;
-                const bool as_float = (dtype == "float" || dtype == "float32" ||
-                                       dtype == "f4" || dtype == "f");
-                const size_t n = static_cast<size_t>(width) * height * 3u;
-                size_t shape[3] = {height, width, 3u};
+                const bool as_features = dtype == "features";
+                const bool as_float = as_features || dtype == "float" || dtype == "float32" ||
+                                      dtype == "f4" || dtype == "f";
+                const size_t channels = as_features ? 9u : 3u;
+                const size_t n = static_cast<size_t>(width) * height * channels;
+                size_t shape[3] = {height, width, channels};
                 const auto render = [&](uint8_t format, void* pixels) {
                     return camera.empty()
                         ? nuka_world_render_beauty(w.raw(), &cam, width, height, spp, format, pixels, n, nullptr)
@@ -2265,7 +2267,7 @@ NB_MODULE(_nuka_ext, m) {
                     nb::capsule owner(buf, [](void* p) noexcept {
                         delete[] static_cast<float*>(p);
                     });
-                    check(render(1u, buf), "nuka_world_render_beauty");
+                    check(render(as_features ? 2u : 1u, buf), "nuka_world_render_beauty");
                     return nb::cast(
                         nb::ndarray<nb::numpy, float>(buf, 3, shape, owner));
                 }
@@ -2289,7 +2291,8 @@ NB_MODULE(_nuka_ext, m) {
             "floor, lit like the go2_cloth_drape demo). eye/look/up are world-space "
             "3-vectors; fov_deg is the vertical FOV; spp the beauty sample count. "
             "dtype 'uint8' -> uint8 [0,255] (default) or 'float'/'float32' -> float32 "
-            "[0,1]. Renders env 0. Raises NOT_SUPPORTED if no offline RT backend or "
+            "[0,1]; 'features' -> float32 (H,W,9): display RGB, albedo, shading normal "
+            "(denoiser inputs). Renders env 0. Raises NOT_SUPPORTED if no offline RT backend or "
             "the world has no renderable geometry. A nonempty camera selects an "
             "authored scene camera and replaces eye/look/up/FOV with its live pose and optics.")
         .def("scene_camera", [](World& w, const std::string& name, uint32_t env_index) {

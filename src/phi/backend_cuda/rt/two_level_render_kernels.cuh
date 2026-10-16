@@ -1217,14 +1217,21 @@ __device__ __forceinline__ Vec3 ShadeBeauty(const LbvhNode* __restrict__ tlas_no
     const float kd = (1.0f - mat.metallic) * (1.0f / RtMathPi());
     Vec3 direct;
     if (weave != nullptr) {
-        // Woven cloth: one meso sample per pixel sample, weighted by its projected area over
-        // the macro normal and its meso visibility (Zhu et al. 2023, effective BSDF).
-        const float proj = weave->n_p.Dot(Ls) * weave->n_p.Dot(V) /
-                           (fmaxf(1.0e-4f, Nf.Dot(weave->n_p)) * fmaxf(1.0e-4f, Nf.Dot(V)));
-        const float f = WeaveFiberBsdf(*weave, mat, Ls, V) * proj * WeaveVisible(*weave, mat, Ls) *
-                        WeaveVisible(*weave, mat, V) * vis;
-        direct = Vec3{light_col.x * mat.albedo.x * f, light_col.y * mat.albedo.y * f,
-                      light_col.z * mat.albedo.z * f};
+        // Evaluate fiber scattering only when its direct-light contribution can be nonzero.
+        direct = Vec3{0.0f, 0.0f, 0.0f};
+        if (vis > 0.0f && weave->n_p.Dot(Ls) > 0.0f && weave->n_p.Dot(V) > 0.0f) {
+            const float light_vis = WeaveVisible(*weave, mat, Ls);
+            if (light_vis > 0.0f) {
+                const float view_vis = WeaveVisible(*weave, mat, V);
+                if (view_vis > 0.0f) {
+                    const float proj = weave->n_p.Dot(Ls) * weave->n_p.Dot(V) /
+                        (fmaxf(1.0e-4f, Nf.Dot(weave->n_p)) * fmaxf(1.0e-4f, Nf.Dot(V)));
+                    const float f = WeaveFiberBsdf(*weave, mat, Ls, V) * proj * light_vis * view_vis * vis;
+                    direct = Vec3{light_col.x * mat.albedo.x * f, light_col.y * mat.albedo.y * f,
+                                  light_col.z * mat.albedo.z * f};
+                }
+            }
+        }
     } else if (sky.specular_env == 0u) {
         // Achromatic D-only highlight -- the sensor/golden byte-identical arm.
         const float spec = (a2 / (RtMathPi() * dterm * dterm)) * (0.04f + mat.metallic);

@@ -16,6 +16,8 @@
 #include "render/vulkan_offscreen_types.hpp"
 #include "rt/framebuffer.hpp"
 
+#include <vector>
+
 namespace nuka::render {
 
 // Convert a linear-float rt::Framebuffer to an RGBA8 VulkanOffscreenReport.
@@ -32,5 +34,13 @@ VulkanOffscreenReport FramebufferToReport(const rt::Framebuffer& frame,
                                           bool keep_miss_color = false,
                                           float exposure_ev = 0.0f,
                                           float grade = 0.0f);
+
+// Denoiser features, 9 floats per pixel: the unquantized display RGB of
+// FramebufferToReport, then the frame's linear albedo and its shading normal.
+std::vector<float> FramebufferToFeatures(const rt::Framebuffer& frame,
+                                         VulkanRgba8 background,
+                                         bool keep_miss_color = false,
+                                         float exposure_ev = 0.0f,
+                                         float grade = 0.0f);
 
 }  // namespace nuka::render

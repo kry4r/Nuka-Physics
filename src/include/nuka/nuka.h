@@ -905,19 +905,17 @@ typedef struct nuka_beauty_camera_t {
     float fov_deg;
 } nuka_beauty_camera_t;
 
-// Render the live world to a HOST RGB image. width*height*3 RGB samples are written
-// to `out_rgb` row-major (top row first; R,G,B per pixel). `dtype` selects the
-// sample type: 0 == uint8 in [0,255], 1 == float32 in [0,1]. `spp` is the beauty
-// sample count (0 => an engine default).
-//
-// SIZE QUERY: out_rgb == NULL returns OK with *out_pixel_count = width*height*3 (the
-// scalar count to allocate); no render runs. Otherwise out_capacity (in SCALARS)
-// must be >= width*height*3 (INVALID_ARG if short), and *out_pixel_count (may be
-// NULL) receives width*height*3.
-//
-// NOT_SUPPORTED if no offline CUDA RT backend is available or the world has no
-// renderable visual geometry. INVALID_ARG on a null camera, an unknown dtype, or
-// zero width/height.
+// Render host pixels, top row first: dtype 0 = uint8 RGB, 1 = float32 RGB in [0,1],
+// 2 = nine float32 channels: unquantized display RGB, linear albedo, shading normal.
+
+// Color and denoiser features share the pixel samples; normals need not be unit length.
+// `spp` selects the beauty sample count (0 uses the engine default).
+
+// A null out_rgb queries the scalar count: width*height*(dtype == 2 ? 9 : 3).
+// Otherwise out_capacity must cover that count; out_pixel_count may be null.
+
+// NOT_SUPPORTED indicates missing offline RT support or renderable geometry.
+// INVALID_ARG indicates insufficient capacity, a null camera, invalid dtype or zero dimensions.
 nuka_result_t nuka_world_render_beauty(nuka_world_handle world,
                                        const nuka_beauty_camera_t* camera,
                                        uint32_t width, uint32_t height,

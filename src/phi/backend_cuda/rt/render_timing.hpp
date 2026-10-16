@@ -10,11 +10,11 @@
 
 namespace nuka::rt {
 
-// Accumulated on-stream GPU milliseconds since the last Reset, split per stage.
-// `calls` counts how many RenderFrame launches contributed.
+// Accumulated GPU milliseconds for sensor and beauty rendering, split per stage.
+// `calls` counts launches since the last TakeRenderTiming.
 struct RenderTiming {
     double tlas_ms = 0.0;    // EnsureFrameTlas: refresh tables + build-or-refit
-    double kernel_ms = 0.0;  // RenderFrameKernel closest-hit trace
+    double kernel_ms = 0.0;  // closest-hit or stochastic beauty trace
     unsigned long long calls = 0u;
 };
 

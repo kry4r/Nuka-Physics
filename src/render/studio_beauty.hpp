@@ -150,7 +150,9 @@ public:
 
     bool ok() const;
     void SetBeauty(bool on, uint32_t samples);  // soft shadows/AO/GI vs flat RT.
-    VulkanOffscreenReport Render(const RenderWorld& world, const RasterOptions& options);
+    // A non-null `features` also receives FramebufferToFeatures (9 floats per pixel).
+    VulkanOffscreenReport Render(const RenderWorld& world, const RasterOptions& options,
+                                 std::vector<float>* features = nullptr);
 
 private:
     struct Impl;

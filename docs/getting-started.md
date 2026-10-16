@@ -122,6 +122,28 @@ with nuka.Device.create(0) as device:
     world.destroy()
 ```
 
+For denoiser inputs, pass `dtype="features"` to `world.render_beauty(...)`.
+The returned `float32` array has shape `(height, width, 9)`: channels `0:3`
+contain unquantized, tonemapped sRGB, `3:6` contain linear albedo, and `6:9`
+contain world-space shading normals including material and weave detail.
+Color, albedo, and normals use the same pixel samples; averaged normals need
+not have unit length. For OIDN's RT filter, use `hdr=False, srgb=True`.
+Prefilter noisy auxiliary images before setting `cleanAux=True`.
+
+Beauty rendering distributes shadow and ambient-occlusion samples across the
+pixel's primary samples. At the default 16 spp, each primary sample traces six
+shadow rays and four AO rays; at 128 spp or more, each traces one of each.
+This reduces render time but changes image variance, so choose spp using both
+material detail and shadow noise, and check consecutive frames for animation.
+
+The CUDA beauty renderer distributes each pixel's samples across up to 32
+threads, then reduces color and auxiliary channels within that group. Sample
+identities determine random streams, so changing the group size preserves the
+sample set apart from floating-point reduction order. For CUDA performance
+comparisons, `NUKA_RT_SAMPLE_LANES` accepts `1`, `2`, `4`, `8`, `16`, or `32`;
+the default is `32`, limited to the largest power of two no greater than spp.
+This setting changes scheduling only and does not change ray counts.
+
 Use `morphs.NKS("path/to/scene.nks")` to start from a cooked robot or world,
 then add rigid or deformable entities through the same `Scene`. Unsupported
 material/geometry combinations fail during `scene.build()` instead of silently

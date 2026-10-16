@@ -367,10 +367,12 @@ struct StudioRtRenderer::Impl {
     rt::BeautyOptions BeautyFromOptions(const RasterOptions& opts) {
         rt::BeautyOptions b;
         b.samples = samples;
-        b.shadow_rays = (opts.shadow_strength > 0.0f) ? 6u : 1u;
+        // Distribute the default pixel's visibility budget across primary samples.
+        const uint32_t split = std::max(samples, 16u);
+        b.shadow_rays = (opts.shadow_strength > 0.0f) ? 1u + (6u * 16u - 1u) / split : 1u;
         b.sun_angular_radius = 0.045f;
         b.gi_bounces = 1u;
-        b.ao_samples = 4u;
+        b.ao_samples = 1u + (4u * 16u - 1u) / split;
         b.ao_radius = 0.7f;
         b.seed = 0x9e3779b9u;
         b.smooth_normals = true;  // fabric wrinkles + shell shade smoothly, not faceted.
@@ -404,7 +406,8 @@ void StudioRtRenderer::SetBeauty(bool on, uint32_t samples) {
 }
 
 VulkanOffscreenReport StudioRtRenderer::Render(const RenderWorld& world,
-                                               const RasterOptions& options) {
+                                               const RasterOptions& options,
+                                               std::vector<float>* features) {
     Impl& im = *impl_;
     im.scene = RenderWorldToTwoLevelScene(world);
     im.ApplyLighting(options, !world.lights.empty());
@@ -412,14 +415,20 @@ VulkanOffscreenReport StudioRtRenderer::Render(const RenderWorld& world,
     else im.handle = im.backend->BuildScene(im.scene);
     const rt::PinholeCamera cam = im.CameraFromOptions(options);
     rt::Framebuffer fb;
-    if (im.beauty)
-        fb = im.backend->TraceBeautyToHost(im.handle, im.scene, cam, im.BeautyFromOptions(options));
-    else
+    if (im.beauty) {
+        rt::BeautyOptions beauty = im.BeautyFromOptions(options);
+        beauty.download.albedo = beauty.download.normal = features != nullptr;
+        fb = im.backend->TraceBeautyToHost(im.handle, im.scene, cam, beauty);
+    } else {
         fb = im.backend->TraceToHost(im.handle, im.scene, cam);
+    }
     // An HDR environment IS the backdrop: keep the traced radiance on miss pixels
     // (no environment => the flat background fill). Exposure/grade post is opt-in.
-    return FramebufferToReport(fb, options.background,
-                               im.beauty && world.environment.Enabled(),
+    const bool keep_miss = im.beauty && world.environment.Enabled();
+    if (features != nullptr)
+        *features = FramebufferToFeatures(fb, options.background, keep_miss,
+                                          options.beauty_exposure_ev, options.beauty_grade);
+    return FramebufferToReport(fb, options.background, keep_miss,
                                options.beauty_exposure_ev, options.beauty_grade);
 }
 
