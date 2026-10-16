@@ -51,7 +51,8 @@
 #include "runtime/app/pose_publisher.hpp"
 #include "runtime/app/simulation.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
-#include "runtime/app/viewer/debug_overlay.hpp"   // read-only collider / contact overlays
+#include "runtime/app/viewer/debug_overlay.hpp"
+#include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"    // the general scene-edit seam
 #include "runtime/app/viewer/editor_scene.hpp"   // EditorScene + LoadEditorScene
 #include "runtime/app/viewer/editor_undo.hpp"     // EditStack + reversible op factories
@@ -441,6 +442,7 @@ int main(int argc, char** argv) {
     // it drives, so it is declared before `loaded` (destroyed after it).
     std::unique_ptr<nuka::runtime::inference::Go2PolicyController> policy_ctrl;
     std::unique_ptr<viewer::EditorScene> loaded;
+    viewer::EntityDrag entity_drag;
     // The general edit machinery: entity->record reverse index (rebuilt per load)
     // and the last entity the inspector was seeded from (re-seed on a new pick).
     viewer::EntityRecordIndex record_index;
@@ -625,6 +627,7 @@ int main(int argc, char** argv) {
             viewer::LoadEditorScene(path, dev, backend, dt);
         if (!next) return;
         policy_ctrl.reset();       // drop any controller bound to the old scene
+        entity_drag.Cancel();
         loaded = std::move(next);  // old scene (if any) destructed here
         debug_overlay.Reset();     // forget materials cached against the prior world
         loaded->sim->SetPlannedStep(want_planned);  // CUDA-graph replay when --planned
@@ -767,7 +770,9 @@ int main(int argc, char** argv) {
     auto apply_unload = [&]() {
         present->WaitIdle();
         policy_ctrl.reset();
+        entity_drag.Cancel();
         loaded.reset();
+        debug_overlay.Reset();
         ClearModelUi(ui_state);
         record_index = viewer::EntityRecordIndex{};
         // Drop the scripting bridge + every registered script to the empty editor
@@ -855,6 +860,7 @@ int main(int argc, char** argv) {
         if (!changed) return;
 
         if (structural) {
+            entity_drag.Cancel();
             present->WaitIdle();
             if (!viewer::RecookEditorScene(*loaded, dev, backend, dt)) {
                 // The old world is still live (transactional re-cook); roll the
@@ -990,6 +996,7 @@ int main(int argc, char** argv) {
     // stale ids never linger). Property reverts queue a MoveEntity the frame's own
     // FramePublish drains; structural reverts re-cooked the sim.
     auto post_edit_resync = [&]() {
+        entity_drag.Cancel();
         if (!loaded) return;
         record_index.Build(loaded->scene);
         sync_scripts();  // an undo/redo may have restored / removed /script nodes
@@ -1032,7 +1039,6 @@ int main(int argc, char** argv) {
     constexpr uint32_t kKeyCtrlL = 0xffe3u;  // XKB_KEY_Control_L / XK_Control_L
     constexpr uint32_t kKeyCtrlR = 0xffe4u;  // XKB_KEY_Control_R / XK_Control_R
     bool     ctrl_down = false;
-    uint32_t drag_inst = ~0u;          // the instance being dragged (~0u == none)
     bool     teleop_hold_prev = false; // PD-hold rising-edge latch (apply gains once)
     bool     teleop_prev_enabled = false;  // teleop-toggle falling edge (send one zero)
     float    last_mouse_x = 0.0f;
@@ -1112,6 +1118,7 @@ int main(int argc, char** argv) {
         const uint32_t vp_w = present->Report().width;
         const uint32_t vp_h = present->Report().height;
         for (const window::WindowEvent& ev : events) {
+            entity_drag.Observe(ev);
             // On Windows the GLFW ImGui backend feeds io mouse/wheel directly, so
             // the manual io feeds are skipped there (else double input); the camera
             // + picker still read the WindowEvents below on both platforms.
@@ -1141,7 +1148,7 @@ int main(int argc, char** argv) {
                     // Releases go to the newly focused window: drop latched state
                     // so Ctrl / a drag can never stick across a focus switch.
                     ctrl_down = false;
-                    drag_inst = ~0u;
+                    entity_drag.Cancel();
 #ifndef _WIN32
                     io.AddFocusEvent(false);  // GLFW backend feeds this on Windows
 #endif
@@ -1153,7 +1160,7 @@ int main(int argc, char** argv) {
             // -- Ctrl+LMB pick + drag (only when a scene is loaded, ImGui
             // isn't capturing the mouse, and Ctrl is held -> never fights orbit). ----
             const bool over_ui = io.WantCaptureMouse;
-            if (loaded && ctrl_down && !over_ui) {
+            if (loaded && ctrl_down && !over_ui && !ui_state.gizmo.active) {
                 app::Simulation& sim = *loaded->sim;
                 if (ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
                     if (ev.pressed) {
@@ -1163,22 +1170,22 @@ int main(int argc, char** argv) {
                         const uint32_t hit = PickInstance(
                             ray, sim.GetRenderWorld(),
                             sim.GetWorld().GetModel().articulation);
-                        drag_inst = hit;
+                        entity_drag.instance = hit;
                         if (hit != ~0u) {
                             ui_state.selected_entity =
                                 sim.GetRenderWorld().instances[hit].entity;
                         }
                     } else {
-                        drag_inst = ~0u;  // release ends the drag
+                        entity_drag.Cancel();  // release ends the drag
                     }
                 } else if (ev.type == window::WindowEvent::Type::MouseMove &&
-                           drag_inst != ~0u &&
-                           drag_inst < sim.GetRenderWorld().InstanceCount()) {
+                           entity_drag.instance != ~0u &&
+                           entity_drag.instance < sim.GetRenderWorld().InstanceCount()) {
                     // Unproject the cursor onto a view-facing plane through
                     // the dragged entity's current position, then push a MoveEntity
                     // (the GENERAL path: command_queue -> ApplyMoveEntity -> Data).
                     const render::RenderInstance& inst =
-                        sim.GetRenderWorld().instances[drag_inst];
+                        sim.GetRenderWorld().instances[entity_drag.instance];
                     const nuka::math::Vec3 anchor = inst.world_xform.position;
                     const viewer::Ray ray = camera.ScreenRay(
                         static_cast<float>(ev.mouse_x),
@@ -1298,6 +1305,8 @@ int main(int argc, char** argv) {
         // -- stats for the UI (zeroed model facts while empty) ------------------
         viewer::ViewerStats stats;
         stats.step_time_ms  = static_cast<float>(step_ms);
+        stats.cpu_timing_available = static_cast<bool>(loaded);
+        stats.frame_timing_available = frame_dt > 0.0;
         stats.fps           = static_cast<float>(fps_ema);
         stats.sub_steps     = steps_taken;  // honest: fixed-dt steps this frame
         if (loaded) {
@@ -1306,7 +1315,13 @@ int main(int argc, char** argv) {
             stats.bodies      = loaded->caps.bodies_per_env;
             stats.contact_cap = loaded->caps.max_contacts_per_env;
         }
-        stats.draw_calls    = render_world.InstanceCount();
+        stats.frame_time_ms = static_cast<float>(frame_dt * 1000.0);
+        stats.debug_colliders = debug_overlay.LastColliderCount();
+        stats.debug_contacts = debug_overlay.LastContactCount();
+        stats.debug_skipped_shapes = debug_overlay.LastSkippedShapes();
+        stats.debug_capacity = viewer::kMaxDebugOverlayInstances;
+        stats.debug_colliders_available = loaded && debug_overlay.CollidersAvailable();
+        stats.debug_contacts_available = loaded && debug_overlay.ContactsAvailable();
         stats.frame_index   = frame_index;
         stats.step_healthy  = last_step_healthy;
         stats.device_name   = present->DeviceName();

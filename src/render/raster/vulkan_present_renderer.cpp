@@ -15,6 +15,7 @@
 // ---------------------------------------------------------------------------
 
 #include "render/raster/vulkan_present_renderer.hpp"
+#include "render/raster/present_surface.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -458,6 +459,7 @@ struct PresentRenderer::Impl {
 
     PresentReport report;
     bool should_close = false;
+    bool recreate_requested = false;
 
     // Optional swapchain readback: when draw_counter_ reaches capture_frame_, the
     // presented image is copied to a host buffer and written to capture_path_ (PPM).
@@ -646,15 +648,7 @@ struct PresentRenderer::Impl {
     }
 
     VkExtent2D ChooseExtent(const VkSurfaceCapabilitiesKHR& caps) {
-        if (caps.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
-            return caps.currentExtent;
-        }
-        VkExtent2D actual{window_surface->Width(), window_surface->Height()};
-        actual.width = std::clamp(actual.width, caps.minImageExtent.width, caps.maxImageExtent.width);
-        actual.height = std::clamp(actual.height, caps.minImageExtent.height, caps.maxImageExtent.height);
-        if (actual.width == 0u) actual.width = std::max(1u, caps.minImageExtent.width);
-        if (actual.height == 0u) actual.height = std::max(1u, caps.minImageExtent.height);
-        return actual;
+        return detail::ChooseSwapchainExtent(caps, window_surface->Width(), window_surface->Height());
     }
 
     void CreateSwapchain() {
@@ -662,6 +656,9 @@ struct PresentRenderer::Impl {
         CheckVk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps),
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
         extent = ChooseExtent(caps);
+        if (extent.width == 0u || extent.height == 0u) {
+            throw std::runtime_error("PresentRenderer: cannot create a zero-sized swapchain");
+        }
 
         uint32_t image_count = caps.minImageCount + 1u;
         if (caps.maxImageCount > 0u && image_count > caps.maxImageCount) {
@@ -678,13 +675,14 @@ struct PresentRenderer::Impl {
         info.imageColorSpace = color_space;
         info.imageExtent = extent;
         info.imageArrayLayers = 1u;
-        info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        info.imageUsage = detail::SwapchainImageUsage(caps.supportedUsageFlags);
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;  // single graphics+present family
         info.preTransform = caps.currentTransform;
-        info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        info.compositeAlpha = detail::ChooseCompositeAlpha(caps.supportedCompositeAlpha);
         info.presentMode = present_mode;
         info.clipped = VK_TRUE;
         info.oldSwapchain = VK_NULL_HANDLE;
+        report.capture_supported = detail::CanCaptureSwapchain(info.imageUsage, surface_format);
         CheckVk(vkCreateSwapchainKHR(device, &info, nullptr, &swapchain), "vkCreateSwapchainKHR");
 
         uint32_t count = 0;
@@ -1420,8 +1418,14 @@ struct PresentRenderer::Impl {
         if (swapchain != VK_NULL_HANDLE) { vkDestroySwapchainKHR(device, swapchain, nullptr); swapchain = VK_NULL_HANDLE; }
     }
 
-    void RecreateSwapchain() {
-        vkDeviceWaitIdle(device);
+    bool RecreateSwapchain() {
+        recreate_requested = true;
+        VkSurfaceCapabilitiesKHR caps{};
+        CheckVk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps),
+                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR(recreate)");
+        const VkExtent2D next_extent = ChooseExtent(caps);
+        if (next_extent.width == 0u || next_extent.height == 0u) return false;
+        CheckVk(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(recreate)");
         DestroySwapchainDependents();
         NegotiateSurface();
         CreateSwapchain();
@@ -1435,8 +1439,12 @@ struct PresentRenderer::Impl {
             CreateInstancedPipeline();
         }
         report.swapchain_image_count = static_cast<uint32_t>(images.size());
+        report.surface_format = static_cast<int32_t>(surface_format);
+        report.present_mode = static_cast<int32_t>(present_mode);
         report.width = extent.width;
         report.height = extent.height;
+        recreate_requested = false;
+        return true;
     }
 
     // -- host-visible buffer (per-frame SceneUbo, readback, staging) -----------
@@ -1623,6 +1631,16 @@ struct PresentRenderer::Impl {
 
     PresentFrameResult DrawFrame(const RenderWorld& world, const RasterOptions& options,
                                  const OverlayRecordFn& overlay) {
+        if (window_surface->Width() == 0u || window_surface->Height() == 0u) {
+            recreate_requested = true;
+            return PresentFrameResult::Suspended;
+        }
+        if (recreate_requested) {
+            return RecreateSwapchain() ? PresentFrameResult::Recreated : PresentFrameResult::Suspended;
+        }
+        if (capture_frame_ >= 0 && !report.capture_supported) {
+            throw std::runtime_error("PresentRenderer: this surface does not support RGBA8 capture");
+        }
         const uint32_t frame = current_frame;
         CheckVk(vkWaitForFences(device, 1u, &in_flight[frame], VK_TRUE,
                                 std::numeric_limits<uint64_t>::max()),
@@ -1633,8 +1651,7 @@ struct PresentRenderer::Impl {
             device, swapchain, std::numeric_limits<uint64_t>::max(),
             image_available[frame], VK_NULL_HANDLE, &image_index);
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
-            RecreateSwapchain();
-            return PresentFrameResult::Recreated;
+            return RecreateSwapchain() ? PresentFrameResult::Recreated : PresentFrameResult::Suspended;
         }
         if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
             return PresentFrameResult::Error;
@@ -1642,8 +1659,9 @@ struct PresentRenderer::Impl {
 
         // If a prior frame is still using this image, wait on its fence.
         if (images_in_flight[image_index] != VK_NULL_HANDLE) {
-            vkWaitForFences(device, 1u, &images_in_flight[image_index], VK_TRUE,
-                            std::numeric_limits<uint64_t>::max());
+            CheckVk(vkWaitForFences(device, 1u, &images_in_flight[image_index], VK_TRUE,
+                                   std::numeric_limits<uint64_t>::max()),
+                    "vkWaitForFences(image)");
         }
         images_in_flight[image_index] = in_flight[frame];
 
@@ -1935,16 +1953,15 @@ struct PresentRenderer::Impl {
         }
 
         current_frame = (current_frame + 1u) % kFramesInFlight;
-        ++report.frames_presented;
         ++draw_counter_;
-
-        if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR) {
-            RecreateSwapchain();
-            return PresentFrameResult::Recreated;
+        if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+            ++report.frames_presented;
         }
-        if (present_result != VK_SUCCESS) {
-            return PresentFrameResult::Error;
+        if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR ||
+            (present_result == VK_SUCCESS && acquire == VK_SUBOPTIMAL_KHR)) {
+            return RecreateSwapchain() ? PresentFrameResult::Recreated : PresentFrameResult::Suspended;
         }
+        if (present_result != VK_SUCCESS) return PresentFrameResult::Error;
         return PresentFrameResult::Presented;
     }
 };
@@ -1983,9 +2000,12 @@ const PresentReport& PresentRenderer::Report() const { return impl_->report; }
 const std::string& PresentRenderer::DeviceName() const { return impl_->report.device_name; }
 
 void PresentRenderer::PollEvents(std::vector<window::WindowEvent>& out) {
+    const size_t begin = out.size();
     impl_->window_surface->PollEvents(out);
-    for (const auto& ev : out) {
+    for (size_t i = begin; i < out.size(); ++i) {
+        const auto& ev = out[i];
         if (ev.type == window::WindowEvent::Type::Close) impl_->should_close = true;
+        if (ev.type == window::WindowEvent::Type::Resize) impl_->recreate_requested = true;
     }
 }
 
