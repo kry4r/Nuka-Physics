@@ -32,8 +32,8 @@ struct EditTxn {
 };
 
 scene::json::Value TxnToJson(const EditTxn& txn);
-// Throws on malformed text.
-EditTxn TxnFromJson(const std::string& text);
+// Throws on a malformed transaction.
+EditTxn TxnFromJson(const scene::json::Value& v);
 scene::json::Value TransformToJson(const math::Transform& t);
 scene::json::Value MaterialToJson(const scene::RenderMaterial& m);
 bool ParsePrimitiveKind(const std::string& s, PrimitiveKind* out);
@@ -101,6 +101,7 @@ private:
         EditTxn inverse;  // property ops undone in reverse order
         bool snapshot = false;
         bool rebuild = false;
+        std::string focus;  // node the forward edit selected
         scene::SceneIR before;
         scene::SceneIR after;
     };

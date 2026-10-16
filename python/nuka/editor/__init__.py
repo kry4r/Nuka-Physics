@@ -26,9 +26,10 @@ import argparse
 import sys
 from typing import Optional, Sequence
 
-from .app import EditorApp, HeadlessApp, ScriptRunner
+from .app import ActionError, Actions, EditorApp, HeadlessApp, ScriptRunner
 
-__all__ = ["EditorApp", "HeadlessApp", "ScriptRunner", "add_launcher_args", "launch", "main"]
+__all__ = ["ActionError", "Actions", "EditorApp", "HeadlessApp", "ScriptRunner", "add_launcher_args", "launch",
+           "main"]
 
 
 def add_launcher_args(parser: argparse.ArgumentParser) -> None:

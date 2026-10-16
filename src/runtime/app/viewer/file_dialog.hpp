@@ -4,8 +4,8 @@
 //
 // A thin platform shim so the editor's Load panel can browse the filesystem for
 // a scene through the OS-native file-open dialog (Windows: GetOpenFileNameW;
-// Linux: zenity when present). The chosen path feeds the existing
-// ViewerUiState::load_request seam the runtime Load already consumes.
+// Linux: zenity when present). The file.open and file.save_as actions ask it
+// when they get no path.
 //
 // Isolated behind this seam so <windows.h> never leaks into imgui_layer.cpp.
 // HOST-ONLY / zero-CUDA-token.

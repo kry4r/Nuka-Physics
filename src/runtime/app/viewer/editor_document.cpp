@@ -76,8 +76,7 @@ json::Value TxnToJson(const EditTxn& txn) {
     return v;
 }
 
-EditTxn TxnFromJson(const std::string& text) {
-    const json::Value v = json::Value::Parse(text);
+EditTxn TxnFromJson(const json::Value& v) {
     EditTxn txn;
     if (const json::Value* label = v.Find("label")) txn.label = label->AsString();
     for (const json::Value& o : v.At("ops").Elements()) {
@@ -358,10 +357,13 @@ ApplyResult EditorDocument::Apply(const EditTxn& txn) {
         entry.forward.ops.push_back(std::move(done));
         entry.inverse.ops.insert(entry.inverse.ops.begin(), std::move(inverse));
     }
+    // Re-project so the tree order is the one a reload of these records gives.
+    if (entry.snapshot) es_->scene = scene::SceneIR(es_->scene);
     records_.Build(es_->scene);
     result.focus = out.focus;
     if (entry.forward.ops.empty()) return result;
     entry.rebuild = out.rebuild;
+    entry.focus = out.focus;
     if (entry.rebuild && !host_->Rebuild(txn.label)) {
         // The world kept its scene: take back the live previews, then the document.
         ReplayProperties(entry.inverse, false);
@@ -430,6 +432,7 @@ ApplyResult EditorDocument::Restore(const Entry& entry, bool forward) {
     ReplayProperties(txn, entry.rebuild);
     records_.Build(es_->scene);
     host_->ScriptsChanged();
+    if (forward) result.focus = entry.focus;
     return result;
 }
 

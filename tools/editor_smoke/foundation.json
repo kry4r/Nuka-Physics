@@ -1,0 +1,54 @@
+{
+  "name": "foundation",
+  "launch": [],
+  "steps": [
+    {"action": "file.open", "args": {"path": "${scenario_dir}/../../examples/assets/nuka_lab/stage.nks"}},
+    {"frames": 20},
+    {"expect": {"loaded": true, "dirty": false, "undo": 0, "playing": false}},
+    {"mark": "loaded"},
+
+    {"action": "scene.spawn", "args": {"kind": "box", "pose": {"pos": [0.0, 0.0, 0.6], "quat": [1.0, 0.0, 0.0, 0.0]}},
+     "bind": "box"},
+    {"expect": {"undo": 1, "dirty": true, "selection": "${box.focus}"}},
+    {"mark": "spawned"},
+
+    {"action": "scene.select", "args": {"path": ""}},
+    {"expect": {"selection": ""}},
+    {"action": "scene.select", "args": {"path": "no/such/node"}, "expect_error": true},
+    {"action": "scene.select", "args": {"path": "${box.focus}"}},
+    {"expect": {"selection": "${box.focus}"}},
+
+    {"action": "edit.apply", "args": {"label": "Move box", "ops": [
+      {"target": "${box.focus}", "field": "transform", "after": {"pos": [0.3, 0.2, 0.9], "quat": [1.0, 0.0, 0.0, 0.0]}}
+    ]}},
+    {"expect": {"undo": 2, "redo": 0}},
+    {"mark": "moved", "differs_from": "spawned"},
+
+    {"undo": 1},
+    {"expect": {"undo": 1, "redo": 1}, "same_as": "spawned"},
+    {"action": "edit.redo"},
+    {"expect": {"undo": 2, "redo": 0}, "same_as": "moved"},
+    {"undo": 2},
+    {"expect": {"undo": 0, "redo": 2}, "same_as": "loaded"},
+    {"action": "edit.undo", "expect_error": true},
+    {"action": "edit.redo"},
+    {"action": "edit.redo"},
+    {"expect": {"undo": 2, "redo": 0, "selection": "${box.focus}"}, "same_as": "moved"},
+
+    {"action": "sim.play"},
+    {"expect": {"playing": true}},
+    {"tick": 120},
+    {"action": "sim.pause"},
+    {"frames": 5},
+    {"expect": {"playing": false}},
+    {"tick": 3},
+
+    {"save_reopen": "${out}/foundation_saved.nks"},
+    {"expect": {"loaded": true, "dirty": false, "undo": 0, "redo": 0}},
+
+    {"action": "view.colliders", "args": {"on": true}},
+    {"action": "view.frame_all"},
+    {"frames": 30},
+    {"screenshot": "foundation"}
+  ]
+}

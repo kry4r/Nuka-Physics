@@ -38,7 +38,6 @@
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/debug_draw.hpp"
-#include "runtime/app/viewer/window_input.hpp"
 #include "scene/asset/asset_ref.hpp"
 #include "scene/asset/nka.hpp"
 
@@ -322,41 +321,6 @@ TEST(ViewerCameraFraming, SelectionUsesTransformedGeometryAndExcludesDebug) {
     EXPECT_FLOAT_EQ(camera.Distance(), 10.0f);
 }
 
-TEST(ViewerInput, CameraShortcutsRespectTextFocusAndViewportOwnership) {
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(960.0f, 600.0f);
-    io.DeltaTime = 1.0f / 60.0f;
-    io.IniFilename = nullptr;
-    unsigned char* pixels = nullptr;
-    int width = 0, height = 0;
-    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
-    auto world = BuildSyntheticWorld();
-    nuka::runtime::app::viewer::CameraController camera;
-    auto press = [&](bool hovered, bool typing, bool gizmo, ImGuiKey key = ImGuiKey_F) {
-        camera.SetView({10, 10, 10}, 20.0f, 0.5f, 0.2f);
-        io.AddKeyEvent(key, true);
-        ImGui::NewFrame();
-        io.WantCaptureKeyboard = typing;
-        io.WantTextInput = typing;
-        nuka::runtime::app::viewer::ApplyCameraShortcuts(world, camera, world.instances[1].entity, hovered, gizmo);
-        ImGui::Render();
-        io.AddKeyEvent(key, false);
-        ImGui::NewFrame(); ImGui::Render();
-    };
-    press(true, true, false);
-    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, 10.0f);
-    press(false, false, false);
-    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, 10.0f);
-    press(true, false, true);
-    EXPECT_FLOAT_EQ(camera.ResolvedTarget().x, 10.0f);
-    press(true, false, false);
-    EXPECT_NEAR(camera.ResolvedTarget().x, 0.5f, 1e-5f);
-    press(true, false, false, ImGuiKey_Home);
-    EXPECT_LT(camera.ResolvedTarget().x, 0.5f);
-    ImGui::DestroyContext();
-}
-
 TEST(ViewerInteraction, TransportTogglesKeepStyleStackBalanced) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -383,21 +347,23 @@ TEST(ViewerInteraction, TransportTogglesKeepStyleStackBalanced) {
     ASSERT_NE(transport, nullptr);
     for (int i = 0; i < 20; ++i) {
         const bool before = state.playing;
-        state.play_toggled = false;
+        state.actions.clear();
         ImGui::ActivateItemByID(transport->GetID(before ? "Pause" : "Play"));
         frame();
-        EXPECT_NE(state.playing, before);
-        EXPECT_TRUE(state.play_toggled);
+        ASSERT_EQ(state.actions.size(), 1u);
+        EXPECT_EQ(state.actions[0].id, "sim.toggle_play");
+        state.playing = !before;
     }
+    state.actions.clear();
     state.playing = true;
-    state.step_requested = false;
     ImGui::ActivateItemByID(transport->GetID("Step"));
     frame();
-    EXPECT_FALSE(state.step_requested);
+    EXPECT_TRUE(state.actions.empty());
     state.playing = false;
     ImGui::ActivateItemByID(transport->GetID("Step"));
     frame();
-    EXPECT_TRUE(state.step_requested);
+    ASSERT_EQ(state.actions.size(), 1u);
+    EXPECT_EQ(state.actions[0].id, "sim.step");
     ImGui::DestroyContext();
 }
 

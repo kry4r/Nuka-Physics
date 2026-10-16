@@ -386,9 +386,9 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     add_library(nuka_viewer STATIC
         runtime/app/viewer/camera_controller.cpp
         runtime/app/viewer/debug_draw.cpp
+        runtime/app/viewer/editor_actions.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
-        runtime/app/viewer/window_input.cpp
     )
     set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_viewer PUBLIC ${CMAKE_SOURCE_DIR}/src)

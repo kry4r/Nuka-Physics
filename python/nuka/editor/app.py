@@ -123,6 +123,32 @@ class ScriptRunner:
         return "".join(out) or None
 
 
+class ActionError(RuntimeError):
+    """An editor action failed; the message carries the editor's reason."""
+
+
+class Actions:
+    """The editor's commands, the same ones its menus, buttons and shortcuts run."""
+
+    def __init__(self, app: "EditorApp"):
+        self._app = weakref.proxy(app)
+
+    def run(self, action_id: str, /, **args):
+        """Run one action now and return its value; raises ActionError when it fails."""
+        reply = self._app._run(action_id, args, "api")
+        if not reply["ok"]:
+            raise ActionError(f"{action_id}: {reply['error']}")
+        return reply["value"]
+
+    def list(self) -> list:
+        """Each action's id, label, category, shortcut, enabled and (for toggles) checked."""
+        return json.loads(self._app._native.actions())
+
+    def log(self, since: int = 0) -> list:
+        """The logged runs after sequence number ``since``: seq, frame, id, source, args, ok, error."""
+        return json.loads(self._app._native.action_log(since))
+
+
 class EditorApp:
     """The editor over a world: a window, or a display-less surface with ``--offscreen``.
 
@@ -144,6 +170,7 @@ class EditorApp:
         self._borrowed = None
         self._runner = ScriptRunner(self)
         self._native = _editor_ext.App(argv, world.handle if world is not None else 0, dt, self._runner)
+        self.actions = Actions(self)
         atexit.register(self.close)
 
     @property
@@ -199,21 +226,24 @@ class EditorApp:
     def console(self, text: str) -> None:
         self._native.console_append(text)
 
+    def _run(self, action_id: str, args: dict, source: str) -> dict:
+        return json.loads(self._native.run_action(action_id, json.dumps(args), source))
+
     def edit(self, *ops: dict, label: str = "Script edit") -> bool:
         """Apply one undoable transaction of ``{"target", "field", "after"}`` ops (an optional
         ``before`` overrides the recorded prior value). False when an op failed; see
         ``document()["last_error"]``. Not from tick callbacks: an edit parks the physics thread."""
-        return self._native.edit(json.dumps({"label": label, "ops": list(ops)}))
+        return self._run("edit.apply", {"label": label, "ops": list(ops)}, "api")["ok"]
 
     def undo(self) -> bool:
-        return self._native.undo()
+        return self._run("edit.undo", {}, "api")["ok"]
 
     def redo(self) -> bool:
-        return self._native.redo()
+        return self._run("edit.redo", {}, "api")["ok"]
 
     def document(self) -> dict:
         """Revision, dirty, hash, undo/redo depths, tick, generation, timeline branches, the
-        last parameter write's pushed and applied ticks, and last_error."""
+        last parameter write's pushed and applied ticks, last_error, selection and playing."""
         return json.loads(self._native.document())
 
     def stop(self) -> None:

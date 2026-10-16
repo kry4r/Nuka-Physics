@@ -90,24 +90,40 @@ math::Transform AuthoredWorldTransform(const scene::SceneIR& scene, scene::Entit
     return world;
 }
 
+namespace {
+
+// A movable instance queues a teleport for the physics thread; a static visual has no
+// physics row and moves in place.
+void MoveInstance(EditorScene& es, render::RenderInstance& inst, const math::Transform& world) {
+    PoseWrite write;
+    if (ResolvePoseWrite(es.sim->GetRenderWorld(), es.Layout(), inst.entity, world, &write)) {
+        es.sim->QueuePoseWrite(write);
+    } else {
+        inst.world_xform = world;
+        es.sim->MarkStaticMoved();
+    }
+}
+
+// The nearest body node at or above `e`, or kInvalidEntity.
+scene::EntityId CarrierOf(const scene::SceneIR& s, scene::EntityId e) {
+    const scene::Registry& ecs = s.Ecs();
+    for (auto n = ecs.NodeOf(e); n; n = n->parent.lock())
+        if (n->entity != scene::kInvalidEntity && ecs.Has<scene::RigidBodyComponent>(n->entity))
+            return n->entity;
+    return scene::kInvalidEntity;
+}
+
+}  // namespace
+
 void ApplyTransformEdit(EditorScene& es, const EntityRecordIndex& idx,
                         scene::EntityId entity, const math::Transform& world, bool commit) {
-    render::RenderWorld& rw = es.sim->GetRenderWorld();
-    render::RenderInstance* inst = nullptr;
-    for (render::RenderInstance& ri : rw.instances) {
-        if (ri.entity == entity) { inst = &ri; break; }
-    }
-
-    // Live: a movable body queues a teleport for the physics thread; a static visual
-    // has no physics row and moves in place.
-    if (inst != nullptr) {
-        PoseWrite write;
-        if (ResolvePoseWrite(rw, es.Layout(), entity, world, &write)) {
-            es.sim->QueuePoseWrite(write);
-        } else {
-            inst->world_xform = world;
-            es.sim->MarkStaticMoved();
-        }
+    // Live: the entity's own instance moves, and each visual a body node carries follows it.
+    const math::Transform to_entity = AuthoredWorldTransform(es.scene, entity).Inverse();
+    for (render::RenderInstance& ri : es.sim->GetRenderWorld().instances) {
+        if (ri.entity == entity)
+            MoveInstance(es, ri, world);
+        else if (idx.IsBody(entity) && CarrierOf(es.scene, ri.entity) == entity)
+            MoveInstance(es, ri, world * to_entity * AuthoredWorldTransform(es.scene, ri.entity));
     }
 
     if (!commit) return;

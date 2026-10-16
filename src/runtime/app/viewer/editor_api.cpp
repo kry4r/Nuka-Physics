@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <cstdio>
-#include <cstring>
 #include <exception>
 #include <new>
 #include <string>
@@ -12,6 +11,7 @@
 
 struct nuka_editor_t : nuka::runtime::app::viewer::EditorHost {
     using EditorHost::EditorHost;
+    std::string reply_;  // the text the last text-returning call handed out
 };
 
 namespace {
@@ -68,40 +68,44 @@ void nuka_editor_console_append(nuka_editor_handle editor, const char* text) {
     if (text != nullptr) editor->ConsoleAppend(text);
 }
 
-nuka_result_t nuka_editor_apply_edit(nuka_editor_handle editor, const char* txn_json) {
+nuka_result_t nuka_editor_run_action(nuka_editor_handle editor, const char* id, const char* args_json,
+                                     const char* source, const char** out_json) {
     if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
-    if (txn_json == nullptr) return NUKA_RESULT_INVALID_ARG;
+    if (id == nullptr || out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
     bool ok = false;
-    const nuka_result_t result = Guard([&] { ok = editor->ApplyEdit(txn_json); });
+    const nuka_result_t result = Guard([&] {
+        editor->reply_ = editor->RunAction(id, args_json != nullptr ? args_json : "", source != nullptr ? source : "api",
+                                           &ok);
+        *out_json = editor->reply_.c_str();
+    });
     return result != NUKA_RESULT_OK ? result : ok ? NUKA_RESULT_OK : NUKA_RESULT_INVALID_ARG;
 }
 
-nuka_result_t nuka_editor_undo(nuka_editor_handle editor) {
+nuka_result_t nuka_editor_actions(nuka_editor_handle editor, const char** out_json) {
     if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
-    bool ok = false;
-    const nuka_result_t result = Guard([&] { ok = editor->Undo(); });
-    return result != NUKA_RESULT_OK ? result : ok ? NUKA_RESULT_OK : NUKA_RESULT_NOT_SUPPORTED;
+    if (out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
+    return Guard([&] {
+        editor->reply_ = editor->Actions();
+        *out_json = editor->reply_.c_str();
+    });
 }
 
-nuka_result_t nuka_editor_redo(nuka_editor_handle editor) {
+nuka_result_t nuka_editor_action_log(nuka_editor_handle editor, uint64_t since, const char** out_json) {
     if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
-    bool ok = false;
-    const nuka_result_t result = Guard([&] { ok = editor->Redo(); });
-    return result != NUKA_RESULT_OK ? result : ok ? NUKA_RESULT_OK : NUKA_RESULT_NOT_SUPPORTED;
+    if (out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
+    return Guard([&] {
+        editor->reply_ = editor->ActionLog(since);
+        *out_json = editor->reply_.c_str();
+    });
 }
 
-nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, char* out, size_t capacity,
-                                         size_t* out_length) {
+nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, const char** out_json) {
     if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
-    if (out_length == nullptr) return NUKA_RESULT_INVALID_ARG;
-    std::string state;
-    const nuka_result_t result = Guard([&] { state = editor->DocumentState(); });
-    if (result != NUKA_RESULT_OK) return result;
-    *out_length = state.size();
-    if (out == nullptr) return NUKA_RESULT_OK;
-    if (capacity <= state.size()) return NUKA_RESULT_INVALID_ARG;
-    std::memcpy(out, state.c_str(), state.size() + 1u);
-    return NUKA_RESULT_OK;
+    if (out_json == nullptr) return NUKA_RESULT_INVALID_ARG;
+    return Guard([&] {
+        editor->reply_ = editor->DocumentState();
+        *out_json = editor->reply_.c_str();
+    });
 }
 
 }  // extern "C"

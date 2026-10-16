@@ -65,36 +65,32 @@ public:
     void close() { nuka_editor_close(Editor()); }
     void console_append(const std::string& text) { nuka_editor_console_append(Editor(), text.c_str()); }
 
-    // Edits park the physics thread, whose script callbacks need the GIL.
-    bool edit(const std::string& txn_json) {
+    // Actions may park the physics thread, whose script callbacks need the GIL. A failed
+    // action still replies; only a broken call raises.
+    std::string run_action(const std::string& id, const std::string& args_json, const std::string& source) {
         nuka_editor_handle editor = Editor();
         nuka_result_t result = NUKA_RESULT_OK;
+        const char* reply = nullptr;
         {
             nb::gil_scoped_release release;
-            result = nuka_editor_apply_edit(editor, txn_json.c_str());
+            result = nuka_editor_run_action(editor, id.c_str(), args_json.c_str(), source.c_str(), &reply);
         }
-        if (result == NUKA_RESULT_INVALID_ARG) return false;
-        Check(result, "nuka_editor_apply_edit");
-        return true;
+        if (result != NUKA_RESULT_INVALID_ARG) Check(result, "nuka_editor_run_action");
+        return reply;
     }
-    bool history(bool redo) {
-        nuka_editor_handle editor = Editor();
-        nuka_result_t result = NUKA_RESULT_OK;
-        {
-            nb::gil_scoped_release release;
-            result = redo ? nuka_editor_redo(editor) : nuka_editor_undo(editor);
-        }
-        if (result == NUKA_RESULT_NOT_SUPPORTED) return false;
-        Check(result, redo ? "nuka_editor_redo" : "nuka_editor_undo");
-        return true;
+    std::string actions() const {
+        const char* text = nullptr;
+        Check(nuka_editor_actions(Editor(), &text), "nuka_editor_actions");
+        return text;
+    }
+    std::string action_log(uint64_t since) const {
+        const char* text = nullptr;
+        Check(nuka_editor_action_log(Editor(), since, &text), "nuka_editor_action_log");
+        return text;
     }
     std::string document() const {
-        nuka_editor_handle editor = Editor();
-        size_t length = 0u;
-        Check(nuka_editor_document_state(editor, nullptr, 0u, &length), "nuka_editor_document_state");
-        std::string text(length + 1u, '\0');
-        Check(nuka_editor_document_state(editor, text.data(), text.size(), &length), "nuka_editor_document_state");
-        text.resize(length);
+        const char* text = nullptr;
+        Check(nuka_editor_document_state(Editor(), &text), "nuka_editor_document_state");
         return text;
     }
 
@@ -168,10 +164,10 @@ NB_MODULE(_editor_ext, m) {
         .def_prop_ro("dt", &App::dt)
         .def("close", &App::close, "Ask the editor to stop; running turns False.")
         .def("console_append", &App::console_append, nb::arg("text"))
-        .def("edit", &App::edit, nb::arg("txn_json"),
-             "Apply a JSON edit transaction through the document; False when an op failed.")
-        .def("undo", [](App& app) { return app.history(false); })
-        .def("redo", [](App& app) { return app.history(true); })
+        .def("run_action", &App::run_action, nb::arg("id"), nb::arg("args_json"), nb::arg("source"),
+             "Run one editor action; the JSON reply holds ok, value and error.")
+        .def("actions", &App::actions, "The registered actions as JSON text.")
+        .def("action_log", &App::action_log, nb::arg("since"), "Action runs after sequence since, as JSON text.")
         .def("document", &App::document, "The document state as JSON text.")
         .def("destroy", &App::destroy, "Close the window and destroy any world the editor created.");
 }

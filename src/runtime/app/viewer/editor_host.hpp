@@ -4,6 +4,7 @@
 
 #include "nuka/nuka_editor.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,10 +29,10 @@ public:
     nuka_world_handle World() const;
     float Dt() const;
     void ConsoleAppend(const std::string& text);
-    // A JSON EditTxn applied now; false with the reason in DocumentState's last_error.
-    bool ApplyEdit(const std::string& txn_json);
-    bool Undo();
-    bool Redo();
+    // Runs one registered action now; replies {"ok","value","error"} as JSON text.
+    std::string RunAction(const std::string& id, const std::string& args_json, const std::string& source, bool* ok);
+    std::string Actions() const;
+    std::string ActionLog(uint64_t since) const;
     std::string DocumentState();
 
 private:

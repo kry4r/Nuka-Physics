@@ -39,7 +39,7 @@
 
 #include "math/transform.hpp"
 #include "render/render_world.hpp"
-#include "runtime/app/viewer/primitive_kind.hpp"
+#include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
 #include "scene/ecs/entity.hpp"
 
@@ -114,10 +114,8 @@ struct GizmoState {
 
 // ---------------------------------------------------------------------------
 // ViewerUiState -- the mutable transport / selection state the toolbar drives and
-// the viewer reads to pace the simulation. RecordUi() mutates this in response to
-// button clicks (play_toggled / step_requested / reset_requested are one-shot
-// edge flags the viewer consumes + clears each frame). Holding it as plain data
-// (no time input) is what makes the recorded composite deterministic.
+// the viewer reads to pace the simulation. RecordUi() queues actions for clicks and
+// edits widget state in place; plain data with no time input keeps it deterministic.
 // ---------------------------------------------------------------------------
 struct ViewerUiState {
     bool     window_focused = true;
@@ -174,30 +172,19 @@ struct ViewerUiState {
     float teleop_kp   = 20.0f;
     float teleop_kd   = 0.5f;
 
-    // One-shot edge flags set by RecordUi(), consumed + cleared by the viewer.
-    bool play_toggled    = false;
-    bool step_requested  = false;
-    bool reset_requested = false;
-    bool camera_reset    = false;
+    // Buttons, menus and drops queue actions here; the viewer runs them at the next frame
+    // top, between frames, so RecordUi never changes the world.
+    std::vector<ActionCall> actions;
 
-    // Undo/redo. can_* are viewer-set hints (the document history) the toolbar reads
-    // to enable/disable its buttons; *_request are one-shot edges the toolbar (and
-    // the Ctrl-Z/Y key path) set and the viewer applies BETWEEN frames (never in
-    // RecordUi) so the deterministic record path is untouched.
-    bool can_undo      = false;
-    bool can_redo      = false;
-    bool undo_request  = false;
-    bool redo_request  = false;
+    // Viewer-set hints from the document history for the Undo/Redo buttons.
+    bool can_undo = false;
+    bool can_redo = false;
 
     // ---- editor Load state (empty-start + runtime load) --------------------
-    // Viewer-set has_scene/loaded_path; the panel's "Open Scene" / load_path set
-    // load_request (consumed via LoadEditorScene); unload_request drops to empty.
     bool        has_scene      = false;   // viewer-set: a world is cooked
     std::string loaded_path;              // viewer-set: shown in the panel
     char        load_path[512] = {0};     // editable path field (dialog fallback)
-    std::string load_request;             // one-shot: path to load
     std::string load_error;               // viewer-set: why the last load failed
-    bool        unload_request = false;   // one-shot: drop to empty
 
     // ---- editing -----------------------------------------------------------
     // The inspector's editable property state for selected_entity (seeded by the
@@ -205,43 +192,16 @@ struct ViewerUiState {
     InspectorState inspector;
     // The in-viewport transform gizmo settings (shares the inspector's edit seam).
     GizmoState     gizmo;
-    // One-shot: a path to Save the edited scene to (Save / Save As). save_dirty is
-    // a viewer-set hint that the in-memory scene has unsaved edits.
-    std::string    save_request;
     char           save_path[512] = {0};
-    bool           save_dirty = false;
-
-    // ---- tree edit ops -----------------------------------------------------
-    // One-shot structural-edit requests keyed on selected_entity (the chosen
-    // parent / target). The viewer applies them through the general SceneIR seam,
-    // re-cooking the world for the structural ones (add / delete).
-    // One-shot spawn: spawn `spawn_kind` as a free body placed near the selection
-    // (the Add picker / context menu / --spawn set it; the viewer applies it BETWEEN
-    // frames through SpawnPrimitive, never in RecordUi).
-    bool          spawn_request = false;
-    PrimitiveKind spawn_kind    = PrimitiveKind::Box;
-    bool        delete_request  = false;   // delete the selection + its subtree
-    char        rename_buf[256] = {0};     // rename field for the selection
-    bool        rename_request  = false;   // commit rename_buf onto the selection
-    // A tree drag-drop fills these (source node path -> new parent path) for one
-    // reparent; the viewer consumes + clears them. Empty dst = scene root.
-    std::string reparent_src;
-    std::string reparent_dst;
-    bool        reparent_request = false;
+    bool           save_dirty = false;    // viewer-set: the scene has unsaved edits
+    char           rename_buf[256] = {0}; // rename field for the selection
 
     // ---- live-world scripting console --------------------------------------
-    // The Script panel edits `script_buf` + latches the run/clear flags; the viewer
-    // execs it and writes the captured output to `console_log` (no interpreter here).
+    // The Script panel edits `script_buf`; the viewer writes captured output to
+    // `console_log` and the scene's /script node count.
     char        script_buf[16384] = {0};
     std::string console_log;
-    bool        script_run_request   = false;
-    bool        script_clear_request = false;
-    // /script node persistence (lifecycle scripts live in the scene): attach the
-    // buffer as a first-class node, load the selected node's source back, and a
-    // viewer-set count for the panel (fixed state records deterministically).
-    bool        script_attach_request = false;
-    bool        script_load_request   = false;
-    int         script_node_count     = 0;
+    int         script_node_count = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -316,9 +276,6 @@ public:
     // when the gizmo is hovered/dragged (the viewer suppresses orbit + picking).
     // Call AFTER RecordUi each frame; a no-op when the gizmo is disabled. Uses the
     // CameraController's resolved basis/fov so it aligns with the rendered image.
-    void HandleCameraShortcuts(const render::RenderWorld& world, CameraController& camera,
-                               const ViewerUiState& ui_state);
-
     void DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h,
                    ViewerUiState& ui_state, math::Transform& world, bool& changed);
 

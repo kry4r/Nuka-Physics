@@ -23,8 +23,6 @@
 #include "ImGuizmo.h"        // in-viewport transform gizmo (vendored, MIT)
 
 #include "runtime/app/viewer/camera_controller.hpp"
-#include "runtime/app/viewer/window_input.hpp"
-#include "runtime/app/viewer/file_dialog.hpp"
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/graph/scene_graph.hpp"
@@ -33,8 +31,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <initializer_list>
 #include <iterator>  // std::size for array-derived loop bounds
 #include <memory>
+#include <utility>
 
 namespace nuka::runtime::app::viewer {
 
@@ -150,18 +150,25 @@ NodeKind ClassifyNode(const nuka::scene::Registry& reg, nuka::scene::EntityId e)
 
 // The spawnable primitives + labels, shared by the Scene-panel Add picker and the
 // tree context-menu Add submenu (one list, no per-site drift).
-struct SpawnChoice { const char* label; PrimitiveKind kind; };
+struct SpawnChoice { const char* label; const char* kind; };
 constexpr SpawnChoice kSpawnChoices[] = {
-    {"Box",     PrimitiveKind::Box},
-    {"Sphere",  PrimitiveKind::Sphere},
-    {"Capsule", PrimitiveKind::Capsule},
-    {"Plane",   PrimitiveKind::Plane},
+    {"Box",     "box"},
+    {"Sphere",  "sphere"},
+    {"Capsule", "capsule"},
+    {"Plane",   "plane"},
 };
 
-// Latch a one-shot spawn request (the viewer applies it between frames, never here).
-void RequestSpawn(ViewerUiState& ui, PrimitiveKind kind) {
-    ui.spawn_request = true;
-    ui.spawn_kind = kind;
+namespace json = nuka::scene::json;
+
+json::Value Args(std::initializer_list<std::pair<const char*, json::Value>> items) {
+    json::Value args = json::Value::Object();
+    for (const auto& [key, value] : items) args.Set(key, value);
+    return args;
+}
+
+// The viewer runs queued actions at the next frame top, never inside RecordUi.
+void Queue(ViewerUiState& ui, const char* id, json::Value args = json::Value::Object()) {
+    ui.actions.push_back(ActionCall{id, std::move(args), "ui"});
 }
 
 // Recursively emit one ImGui TreeNode per SceneGraph node (name + kind badge);
@@ -200,9 +207,8 @@ void RecordSceneNode(const nuka::scene::Registry& reg,
     }
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("NUKA_NODE")) {
-            ui.reparent_src.assign(static_cast<const char*>(pl->Data));
-            ui.reparent_dst = path;  // this node is the new parent
-            ui.reparent_request = true;
+            Queue(ui, "edit.reparent", Args({{"path", json::Value::Str(static_cast<const char*>(pl->Data))},
+                                             {"parent", json::Value::Str(path)}}));
         }
         ImGui::EndDragDropTarget();
     }
@@ -215,13 +221,17 @@ void RecordSceneNode(const nuka::scene::Registry& reg,
         ImGui::SetNextItemWidth(150.0f);
         ImGui::InputTextWithHint("##rn", "new name", ui.rename_buf, sizeof(ui.rename_buf));
         ImGui::SameLine();
-        if (ImGui::SmallButton("Rename")) { ui.rename_request = true; ImGui::CloseCurrentPopup(); }
+        if (ImGui::SmallButton("Rename")) {
+            Queue(ui, "edit.rename", Args({{"path", json::Value::Str(path)},
+                                           {"name", json::Value::Str(ui.rename_buf)}}));
+            ImGui::CloseCurrentPopup();
+        }
         if (ImGui::BeginMenu("Add primitive")) {
             for (const SpawnChoice& c : kSpawnChoices)
-                if (ImGui::MenuItem(c.label)) RequestSpawn(ui, c.kind);
+                if (ImGui::MenuItem(c.label)) Queue(ui, "scene.spawn", Args({{"kind", json::Value::Str(c.kind)}}));
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Delete subtree")) ui.delete_request = true;
+        if (ImGui::MenuItem("Delete subtree")) Queue(ui, "edit.delete", Args({{"path", json::Value::Str(path)}}));
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -380,28 +390,23 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccentDim);
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.06f, 0.07f, 1.0f));
             }
-            if (ImGui::Button(was_playing ? "Pause" : "Play")) {
-                ui_state.playing = !ui_state.playing;
-                ui_state.play_toggled = true;
-            }
+            if (ImGui::Button(was_playing ? "Pause" : "Play")) Queue(ui_state, "sim.toggle_play");
             if (was_playing) ImGui::PopStyleColor(4);
 
             ImGui::SameLine();
             ImGui::BeginDisabled(ui_state.playing);
-            if (ImGui::Button("Step")) ui_state.step_requested = true;
+            if (ImGui::Button("Step")) Queue(ui_state, "sim.step");
             ImGui::EndDisabled();
             ImGui::SameLine();
-            if (ImGui::Button("Reset")) ui_state.reset_requested = true;
+            if (ImGui::Button("Reset")) Queue(ui_state, "sim.reset");
 
-            // Undo / Redo -- one-shot requests the viewer applies between frames;
-            // each disabled when its history is empty (viewer-set can_* hints).
             ImGui::SameLine(0.0f, 12.0f);
             ImGui::BeginDisabled(!ui_state.can_undo);
-            if (ImGui::Button("Undo")) ui_state.undo_request = true;
+            if (ImGui::Button("Undo")) Queue(ui_state, "edit.undo");
             ImGui::EndDisabled();
             ImGui::SameLine();
             ImGui::BeginDisabled(!ui_state.can_redo);
-            if (ImGui::Button("Redo")) ui_state.redo_request = true;
+            if (ImGui::Button("Redo")) Queue(ui_state, "edit.redo");
             ImGui::EndDisabled();
 
             if (!ui_state.has_scene) ImGui::EndDisabled();
@@ -414,9 +419,8 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             if (ImGui::Button(speed_label)) ImGui::OpenPopup("##speed");
             if (ImGui::BeginPopup("##speed")) {
                 for (int i = 0; i < static_cast<int>(std::size(speeds)); ++i) {
-                    if (ImGui::Selectable(labels[i], ui_state.speed == speeds[i])) {
-                        ui_state.speed = speeds[i];
-                    }
+                    if (ImGui::Selectable(labels[i], ui_state.speed == speeds[i]))
+                        Queue(ui_state, "sim.speed", Args({{"value", json::Value::Float(speeds[i])}}));
                 }
                 ImGui::EndPopup();
             }
@@ -436,7 +440,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
 
     // ======================================================================
     // LOAD PANEL -- "Open Scene" runs the native OS file dialog (filtered to .nks);
-    // a manual path field is the fallback. Both set load_request; Unload drops empty.
+    // a manual path field is the fallback.
     // ======================================================================
     if (ImGui::Begin("Load")) {
         SectionHeader("Scene");
@@ -446,7 +450,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::TextColored(kAccent, "%s", ui_state.loaded_path.c_str());
             ImGui::PopTextWrapPos();
             ImGui::Dummy(ImVec2(0.0f, 4.0f));
-            if (ImGui::Button("Unload", ImVec2(-1.0f, 0.0f))) ui_state.unload_request = true;
+            if (ImGui::Button("Unload", ImVec2(-1.0f, 0.0f))) Queue(ui_state, "file.unload");
         } else {
             ImGui::TextColored(kTextDim, "no scene loaded");
             ImGui::TextColored(kTextDim, "open a scene to begin");
@@ -459,24 +463,15 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
 
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
         SectionHeader("Open");
-        // Game-engine-style browse: the native OS Open dialog filtered to .nks
-        // feeds the SAME load_request seam the runtime Load consumes.
-        if (ImGui::Button("Open Scene...", ImVec2(-1.0f, 0.0f))) {
-            const std::string picked = OpenFileDialog("Open Scene", "Nuka scenes", "*.nks");
-            if (!picked.empty()) {
-                std::snprintf(ui_state.load_path, sizeof(ui_state.load_path), "%s",
-                              picked.c_str());
-                ui_state.load_request = picked;
-            }
-        }
+        // Without a path, file.open asks the native OS dialog (filtered to .nks).
+        if (ImGui::Button("Open Scene...", ImVec2(-1.0f, 0.0f))) Queue(ui_state, "file.open");
 
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
         ImGui::TextColored(kTextDim, "or type a path");
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputText("##loadpath", ui_state.load_path, sizeof(ui_state.load_path));
-        if (ImGui::Button("Load", ImVec2(-1.0f, 0.0f)) && ui_state.load_path[0] != '\0') {
-            ui_state.load_request = ui_state.load_path;
-        }
+        if (ImGui::Button("Load", ImVec2(-1.0f, 0.0f)) && ui_state.load_path[0] != '\0')
+            Queue(ui_state, "file.open", Args({{"path", json::Value::Str(ui_state.load_path)}}));
 
         // -- Save: write the edited scene (full fidelity) back to .nks ----------
         if (ui_state.has_scene) {
@@ -489,18 +484,9 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::TextColored(kTextDim, "edits persist to .nks (+ sibling .nka)");
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputText("##savepath", ui_state.save_path, sizeof(ui_state.save_path));
-            if (ImGui::Button("Save", ImVec2(-1.0f, 0.0f)) && ui_state.save_path[0] != '\0') {
-                ui_state.save_request = ui_state.save_path;
-            }
-            if (ImGui::Button("Save As...", ImVec2(-1.0f, 0.0f))) {
-                const std::string picked =
-                    SaveFileDialog("Save Scene", "Nuka scenes", "*.nks", ui_state.save_path);
-                if (!picked.empty()) {
-                    std::snprintf(ui_state.save_path, sizeof(ui_state.save_path), "%s",
-                                  picked.c_str());
-                    ui_state.save_request = picked;
-                }
-            }
+            if (ImGui::Button("Save", ImVec2(-1.0f, 0.0f)) && ui_state.save_path[0] != '\0')
+                Queue(ui_state, "file.save", Args({{"path", json::Value::Str(ui_state.save_path)}}));
+            if (ImGui::Button("Save As...", ImVec2(-1.0f, 0.0f))) Queue(ui_state, "file.save_as");
         }
     }
     ImGui::End();
@@ -587,14 +573,15 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         Badge("READ ONLY", kBgRaised, kAccent);
         ImGui::Spacing();
         ImGui::BeginDisabled(!ui_state.has_scene);
-        ImGui::Checkbox("Collider proxies", &ui_state.show_colliders);
+        bool colliders = ui_state.show_colliders;
+        if (ImGui::Checkbox("Collider proxies", &colliders))
+            Queue(ui_state, "view.colliders", Args({{"on", json::Value::Bool(colliders)}}));
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("See-through wireframe; translucent fill on devices without wireframe support");
-        ImGui::Checkbox("Contact points", &ui_state.show_contacts);
-        if (ImGui::Button("Hide all")) {
-            ui_state.show_colliders = false;
-            ui_state.show_contacts = false;
-        }
+        bool contacts = ui_state.show_contacts;
+        if (ImGui::Checkbox("Contact points", &contacts))
+            Queue(ui_state, "view.contacts", Args({{"on", json::Value::Bool(contacts)}}));
+        if (ImGui::Button("Hide all")) Queue(ui_state, "view.hide_overlays");
         ImGui::EndDisabled();
         if (!ui_state.has_scene) ImGui::TextWrapped("Load a scene to inspect its published state.");
         ImGui::Spacing();
@@ -649,7 +636,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             for (int i = 0; i < static_cast<int>(IM_ARRAYSIZE(kSpawnChoices)); ++i) {
                 if (i) ImGui::SameLine();
                 if (ImGui::SmallButton(kSpawnChoices[i].label))
-                    RequestSpawn(ui_state, kSpawnChoices[i].kind);
+                    Queue(ui_state, "scene.spawn", Args({{"kind", json::Value::Str(kSpawnChoices[i].kind)}}));
             }
             ImGui::Dummy(ImVec2(0.0f, 8.0f));
             SectionHeader("Scene Tree");
@@ -687,10 +674,8 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         ImGui::SliderFloat("##fov", &camera.fov_degrees, 20.0f, 90.0f, "%.0f deg");
 
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
-        const ImVec2 display = ImGui::GetIO().DisplaySize;
-        const float aspect = display.y > 0.0f ? display.x / display.y : 1.0f;
         ImGui::BeginDisabled(world.instances.empty());
-        if (ImGui::Button("Frame All (Home)", ImVec2(-1.0f, 0.0f))) camera.FrameAll(world, aspect);
+        if (ImGui::Button("Frame All (Home)", ImVec2(-1.0f, 0.0f))) Queue(ui_state, "view.frame_all");
         ImGui::EndDisabled();
         const bool can_frame_selected = ui_state.selected_entity != scene::kInvalidEntity &&
             std::any_of(world.instances.begin(), world.instances.end(), [&](const auto& instance) {
@@ -698,10 +683,9 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                        !world.meshes.Geometry(instance.mesh_id).Empty();
             });
         ImGui::BeginDisabled(!can_frame_selected);
-        if (ImGui::Button("Frame Selected (F)", ImVec2(-1.0f, 0.0f)))
-            camera.FrameSelected(world, ui_state.selected_entity, aspect);
+        if (ImGui::Button("Frame Selected (F)", ImVec2(-1.0f, 0.0f))) Queue(ui_state, "view.frame_selected");
         ImGui::EndDisabled();
-        if (ImGui::Button("Reset View", ImVec2(-1.0f, 0.0f))) ui_state.camera_reset = true;
+        if (ImGui::Button("Reset View", ImVec2(-1.0f, 0.0f))) Queue(ui_state, "view.reset_camera");
 
         ImGui::Dummy(ImVec2(0.0f, 10.0f));
         SectionHeader("Controls");
@@ -947,7 +931,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         if (ImGui::Button("Run")) run_now = true;
         ImGui::PopStyleColor(2);
         ImGui::SameLine();
-        if (ImGui::Button("Clear Console")) ui_state.script_clear_request = true;
+        if (ImGui::Button("Clear Console")) Queue(ui_state, "script.clear_console");
         ImGui::SameLine();
         ImGui::TextColored(kTextDim, "Ctrl+Enter");
 
@@ -957,13 +941,13 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
             (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl)) &&
             ImGui::IsKeyPressed(ImGuiKey_Enter, false);
-        if (run_now || ctrl_enter) ui_state.script_run_request = true;
+        if (run_now || ctrl_enter) Queue(ui_state, "script.run");
 
         // Persist the buffer as a first-class /script node (Save writes it inline) or
         // load the selected node's source back -- a scene's scripts live in the scene.
-        if (ImGui::Button("Attach as Node")) ui_state.script_attach_request = true;
+        if (ImGui::Button("Attach as Node")) Queue(ui_state, "script.attach");
         ImGui::SameLine();
-        if (ImGui::Button("Load Node")) ui_state.script_load_request = true;
+        if (ImGui::Button("Load Node")) Queue(ui_state, "script.load");
         ImGui::SameLine();
         ImGui::TextColored(kTextDim, "%d /script node(s)", ui_state.script_node_count);
 
@@ -1000,12 +984,6 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     const ImVec2 mouse = ImGui::GetMousePos();
     viewport_hovered_ = viewport_.Valid() && ui_state.window_focused && !ui_state.layout_modifier_down &&
         !io.WantCaptureMouse && viewport_.Contains(mouse.x, mouse.y);
-}
-
-void ImGuiLayer::HandleCameraShortcuts(const render::RenderWorld& world, CameraController& camera,
-                                      const ViewerUiState& ui_state) {
-    ApplyCameraShortcuts(world, camera, ui_state.selected_entity, viewport_hovered_, ui_state.gizmo.active,
-                         viewport_.Aspect());
 }
 
 // ---------------------------------------------------------------------------
