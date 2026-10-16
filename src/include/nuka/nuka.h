@@ -273,16 +273,56 @@ typedef struct nuka_world_execution_info_t {
 // Reset preserves the graph; changes to the operator sequence invalidate it.
 nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execution_mode_t mode);
 
-// Block-descent iterations of the contact solve, 1..65535; the timestep stays fixed.
-// A changed value invalidates the execution graph.
 // Set one template link's mass in all environments, preserving its COM and rotational inertia.
 nuka_result_t nuka_world_set_link_mass(nuka_world_handle world, uint32_t link_index, float mass);
 
 // Change uniform gravity Z for the next production step, preserving X/Y.
 nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z);
 
+// Block-descent iterations of the contact solve, 1..65535; the timestep stays fixed.
+// A changed value invalidates the execution graph.
 nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32_t iterations);
 nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations);
+
+typedef enum nuka_param_type_t {
+    NUKA_PARAM_F32 = 0,
+    NUKA_PARAM_U32 = 1
+} nuka_param_type_t;
+
+// LIVE values change at the next step; REBUILD values change through nuka_world_rebuild_from_scene.
+typedef enum nuka_param_tier_t {
+    NUKA_PARAM_LIVE = 0,
+    NUKA_PARAM_REBUILD = 1
+} nuka_param_tier_t;
+
+enum { NUKA_PARAM_INFO_VERSION = 1 };
+
+// One tunable parameter. Its count elements are template links (all environments) or one world
+// value; scene_field names the record field it persists to ("joint.damping"), empty for world options.
+typedef struct nuka_param_info_t {
+    uint32_t struct_size;
+    uint32_t schema_version;
+    char key[48];
+    char unit[16];
+    char scene_field[48];
+    nuka_param_type_t type;
+    nuka_param_tier_t tier;
+    uint32_t count;
+    double min_value;
+    double max_value;
+} nuka_param_info_t;
+
+nuka_result_t nuka_world_param_count(nuka_world_handle world, uint32_t* out_count);
+// Every entry must carry struct_size and schema_version; capacity must cover the count.
+nuka_result_t nuka_world_get_param_infos(nuka_world_handle world, nuka_param_info_t* infos,
+                                         uint32_t capacity);
+nuka_result_t nuka_world_get_param(nuka_world_handle world, uint32_t param, uint32_t element,
+                                   double* out_value);
+// A LIVE value applies at the next step and is written to the retained scene. NOT_SUPPORTED for a
+// REBUILD parameter and for an element without a scene record, such as a root link's joint.
+nuka_result_t nuka_world_set_param(nuka_world_handle world, uint32_t param, uint32_t element,
+                                   double value);
+
 // Initialize struct_size and schema_version before querying execution information.
 nuka_result_t nuka_world_get_execution_info(nuka_world_handle world, nuka_world_execution_info_t* out);
 typedef struct nuka_device_resource_info_t {

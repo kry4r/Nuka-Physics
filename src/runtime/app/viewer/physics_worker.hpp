@@ -28,7 +28,7 @@ namespace nuka::runtime::app::viewer {
 using WorkerClock = std::chrono::steady_clock;
 
 enum class CommandKind : uint8_t { EditApply, Teleport, ParamSet, Perturb, Transport, ScriptCall };
-enum class ParamKind : uint8_t { Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay };
+enum class ParamKind : uint8_t { Field, HoldGains, ControllerCommand, DisplayEnv, ScatterRows, Overlay, Registry };
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
 
 // A held load on one link (wrench) or free body (force and torque), rewritten before
@@ -42,11 +42,14 @@ struct Perturbation {
 struct TickCommand {
     CommandKind kind = CommandKind::Transport;
     uint64_t seq = 0u;                    // assigned by Push
+    uint64_t pushed_tick = 0u;            // the worker's tick when Push queued it
     PoseWrite pose;                       // EditApply, Teleport
     ParamKind param = ParamKind::Field;   // ParamSet
     nuka_state_field_t field = NUKA_FIELD_DRIVE_TARGET;
     size_t offset = 0u;                   // bytes into the field
-    std::vector<float> values;            // field values, gains (kp, kd), command, overlay flags
+    uint32_t index = 0u;                  // Registry parameter
+    uint32_t element = 0u;                // Registry element
+    std::vector<float> values;            // field values, gains (kp, kd), command, overlay flags, registry value
     uint32_t env = 0u;                    // DisplayEnv
     std::vector<ScatterRow> rows;         // ScatterRows
     Perturbation perturb;                 // Perturb
@@ -64,6 +67,8 @@ struct TickResult {
     uint64_t seq = 0u;  // the command answered; 0 for callback output
     std::string text;
     bool error = false;
+    uint64_t pushed_tick = 0u;   // registry writes: the tick when queued
+    uint64_t applied_tick = 0u;  // and the tick the write landed after
 };
 
 struct WorkerTelemetry {
@@ -137,6 +142,8 @@ struct WorkerBinding {
     float speed = 1.0f;
     bool colliders = false;
     bool contacts = false;
+    uint64_t tick = 0u;  // where the timeline continues; a migrating rebuild keeps it
+    double sim_time = 0.0;
 };
 
 class PhysicsWorker {
@@ -159,6 +166,9 @@ public:
     // returns its epoch.
     uint64_t Bind(WorkerBinding binding);
     void Unbind();
+    double SimTime() const { return sim_time_; }
+    // The last finished tick; readable from any thread.
+    uint64_t Tick() const { return tick_mirror_.load(std::memory_order_relaxed); }
 
     uint64_t Push(TickCommand cmd);
     // Applies the queued commands, publishes and dispatches the tick callback.
@@ -178,6 +188,8 @@ private:
     void Publish();
     void DispatchTick();
     void Report(uint64_t seq, std::string text, bool error = false);
+    void Report(TickResult result);
+    void SetTick(uint64_t tick);
 
     ScriptHost* scripts_;
     std::mutex mu_;
@@ -188,6 +200,9 @@ private:
     bool stop_ = false;
     bool park_ = false;
     bool parked_ = false;
+    // Set with a queued command or a park request so a running batch yields at its next step.
+    std::atomic<bool> interrupt_{false};
+    std::atomic<uint64_t> tick_mirror_{0u};
     std::thread thread_;
     SnapshotRing ring_;
     PoseSlotPool slots_;

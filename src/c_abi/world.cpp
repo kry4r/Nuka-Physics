@@ -710,23 +710,6 @@ nuka_result_t nuka_world_set_execution_mode(nuka_world_handle world, nuka_execut
     }
 }
 
-nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32_t iterations) {
-    auto* record = nuka::c_abi::WorldTable().Get(world);
-    if (!record) return NUKA_RESULT_NULL_HANDLE;
-    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
-    try {
-        const auto status = record->world->SetVelocityIterations(iterations);
-        if (status == nuka::phi::Status::Ok) record->velocity_iterations_set = true;
-        return nuka::c_abi::MapStatusToResult(status);
-    } catch (const std::bad_alloc&) {
-        return NUKA_RESULT_OUT_OF_MEMORY;
-    } catch (const std::exception& error) {
-        return nuka::c_abi::MapExceptionToResult(error);
-    } catch (...) {
-        return NUKA_RESULT_INTERNAL;
-    }
-}
-
 nuka_result_t nuka_world_get_velocity_iterations(nuka_world_handle world, uint32_t* out_iterations) {
     if (out_iterations == nullptr) return NUKA_RESULT_INVALID_ARG;
     auto* record = nuka::c_abi::WorldTable().Get(world);
@@ -1215,100 +1198,6 @@ nuka_result_t nuka_world_get_colliders(nuka_world_handle world, uint32_t env_ind
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
         return nuka::c_abi::MapExceptionToResult(error);
-    } catch (...) {
-        return NUKA_RESULT_INTERNAL;
-    }
-}
-
-nuka_result_t nuka_world_set_link_mass(nuka_world_handle world,
-                                       uint32_t link_index, float mass) {
-    nuka::c_abi::WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
-    if (world_record == nullptr) {
-        return NUKA_RESULT_NULL_HANDLE;
-    }
-    if (!world_record->world ||
-        world_record->articulation_host.TotalLinkCount() == 0u) {
-        return NUKA_RESULT_NOT_SUPPORTED;  // non-articulated world
-    }
-    auto& host = world_record->articulation_host;
-    const uint32_t total_links = host.TotalLinkCount();
-    if (link_index >= total_links || link_index >= host.link_inertia.size()) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    if (!(mass > 0.0f) || !std::isfinite(mass)) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    try {
-        nuka::math::Vec3 diagonal_inertia{0.0f, 0.0f, 0.0f};
-        nuka::math::Transform inertial_frame =
-            nuka::math::Transform::Identity();
-        float* template_mass = nullptr;
-        {
-            uint32_t global = 0u;
-            bool resolved = false;
-            for (auto& topo : host.articulations) {
-                const uint32_t link_count =
-                    static_cast<uint32_t>(topo.link_bodies.size());
-                if (link_index < global + link_count) {
-                    const uint32_t local = link_index - global;
-                    if (local >= topo.masses.size()) return NUKA_RESULT_INVALID_ARG;
-                    template_mass = &topo.masses[local];
-                    diagonal_inertia = (local < topo.inertias.size())
-                                           ? topo.inertias[local]
-                                           : nuka::math::Vec3{0.0f, 0.0f, 0.0f};
-                    inertial_frame =
-                        (local < topo.inertial_frames.size())
-                            ? topo.inertial_frames[local]
-                            : nuka::math::Transform::Identity();
-                    resolved = true;
-                    break;
-                }
-                global += link_count;
-            }
-            if (!resolved) {
-                return NUKA_RESULT_INVALID_ARG;
-            }
-        }
-
-        // Scalar mass varies with COM and rotational inertia at the COM held fixed.
-        const nuka::runtime::articulation::LinkSpatialInertia new_inertia =
-            nuka::runtime::articulation::MakeSpatialInertia(
-                mass, diagonal_inertia, inertial_frame);
-
-        nuka::nk::Mat36 packed{};
-        static_assert(sizeof(packed) == sizeof(new_inertia));
-        std::memcpy(&packed, &new_inertia, sizeof(packed));
-        const auto status = world_record->world->SetLinkInertia(link_index, packed);
-        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
-        host.link_inertia[link_index] = new_inertia;
-        *template_mass = mass;
-        return NUKA_RESULT_OK;
-    } catch (const std::bad_alloc&) {
-        return NUKA_RESULT_OUT_OF_MEMORY;
-    } catch (const std::exception& e) {
-        return nuka::c_abi::MapExceptionToResult(e);
-    } catch (...) {
-        return NUKA_RESULT_INTERNAL;
-    }
-}
-
-nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z) {
-    nuka::c_abi::WorldRecord* world_record = nuka::c_abi::WorldTable().Get(world);
-    if (world_record == nullptr) {
-        return NUKA_RESULT_NULL_HANDLE;
-    }
-    if (!world_record->world || !std::isfinite(gravity_z)) return NUKA_RESULT_INVALID_ARG;
-    try {
-        auto gravity = world_record->world->Gravity();
-        gravity.z = gravity_z;
-        const auto status = world_record->world->SetGravity(gravity);
-        if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
-        world_record->step_options.gravity = gravity;
-        return NUKA_RESULT_OK;
-    } catch (const std::bad_alloc&) {
-        return NUKA_RESULT_OUT_OF_MEMORY;
-    } catch (const std::exception& e) {
-        return nuka::c_abi::MapExceptionToResult(e);
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }

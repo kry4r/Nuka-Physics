@@ -63,6 +63,17 @@ NUKA_EDITOR_API nuka_world_handle nuka_editor_world(nuka_editor_handle editor);
 NUKA_EDITOR_API float nuka_editor_dt(nuka_editor_handle editor);
 NUKA_EDITOR_API void nuka_editor_console_append(nuka_editor_handle editor, const char* text);
 
+// Applies a JSON EditTxn {"label", "ops": [{"target", "field", "before"?, "after"}]}; live
+// parameters land at the next tick and other edits rebuild the world. INVALID_ARG on failure.
+NUKA_EDITOR_API nuka_result_t nuka_editor_apply_edit(nuka_editor_handle editor, const char* txn_json);
+// NOT_SUPPORTED when the history is empty or the world refused the rebuild.
+NUKA_EDITOR_API nuka_result_t nuka_editor_undo(nuka_editor_handle editor);
+NUKA_EDITOR_API nuka_result_t nuka_editor_redo(nuka_editor_handle editor);
+// The document state as JSON. *out_length gets its length; a NULL out only queries it, and
+// capacity must exceed it.
+NUKA_EDITOR_API nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, char* out,
+                                                         size_t capacity, size_t* out_length);
+
 #ifdef __cplusplus
 }
 #endif

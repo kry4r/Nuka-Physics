@@ -21,6 +21,7 @@ class SceneCache {
 public:
     SceneCache();
     std::string NextFile();
+    std::string File(const std::string& name);  // a fixed name, rewritten on each use
     void Remove();
 
 private:

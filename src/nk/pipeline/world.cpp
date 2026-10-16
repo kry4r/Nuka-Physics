@@ -799,24 +799,44 @@ phi::Status World::SetVelocityIterations(uint32_t iterations) {
     return last_status_ = phi::Status::Ok;
 }
 
-phi::Status World::SetLinkInertia(uint32_t link_index, const Mat36& inertia) {
-    constexpr size_t width = sizeof(inertia.m) / sizeof(float);
+std::vector<float>* World::LinkParamTemplate(FieldId id) {
+    switch (id) {
+        case FieldId::LinkInertia: return &model_.articulation.link_inertia_spatial;
+        case FieldId::JointDamping: return &model_.articulation.joint_damping;
+        case FieldId::JointArmature: return &model_.articulation.joint_armature;
+        case FieldId::JointFrictionloss: return &model_.articulation.joint_frictionloss;
+        case FieldId::DriveStiffness: return &model_.hold_drives.stiffness;
+        case FieldId::DriveDamping: return &model_.hold_drives.damping;
+        case FieldId::DriveForceLimit: return &model_.hold_drives.force_limits;
+        default: return nullptr;
+    }
+}
+
+phi::Status World::SetLinkParam(FieldId id, uint32_t link_index, const float* value, uint32_t width) {
     const uint32_t links = model_.capacities.links_per_env;
-    if (!ready_ || link_index >= links ||
-        (size_t(link_index) + 1u) * width > model_.articulation.link_inertia_spatial.size())
+    std::vector<float>* tpl = LinkParamTemplate(id);
+    if (!ready_ || tpl == nullptr || link_index >= links ||
+        (size_t(link_index) + 1u) * width > tpl->size())
         return last_status_ = phi::Status::InvalidArgument;
-    for (float value : inertia.m)
-        if (!std::isfinite(value)) return last_status_ = phi::Status::InvalidArgument;
-    uint64_t total_bytes = 0u;
-    const auto segments = model_.ComputeModelSegments(&total_bytes);
-    const auto segment = std::find_if(segments.begin(), segments.end(),
-        [](const Model::Segment& value) { return value.field == FieldId::LinkInertia; });
-    if (segment == segments.end()) return last_status_ = phi::Status::Unsupported;
+    for (uint32_t k = 0u; k < width; ++k)
+        if (!std::isfinite(value[k])) return last_status_ = phi::Status::InvalidArgument;
+    const size_t bytes = size_t(width) * sizeof(float);
+    size_t base = 0u;
+    const bool model_owned = LayoutOf(id).owner == FieldOwner::Model;
+    if (model_owned) {
+        uint64_t total_bytes = 0u;
+        const auto segments = model_.ComputeModelSegments(&total_bytes);
+        const auto segment = std::find_if(segments.begin(), segments.end(),
+            [id](const Model::Segment& s) { return s.field == id; });
+        if (segment == segments.end()) return last_status_ = phi::Status::Unsupported;
+        base = segment->offset;
+    }
     last_status_ = Synchronize();
     if (last_status_ != phi::Status::Ok) return last_status_;
     for (uint32_t env = 0u; env < EnvCount(); ++env) {
-        const size_t offset = segment->offset + (size_t(env) * links + link_index) * sizeof(inertia);
-        last_status_ = phi::BufferUpload(model_.DeviceBuffer(), &inertia, offset, sizeof(inertia));
+        const size_t offset = (size_t(env) * links + link_index) * bytes;
+        last_status_ = model_owned ? phi::BufferUpload(model_.DeviceBuffer(), value, base + offset, bytes)
+                                   : data_.UploadFieldStatus(id, value, bytes, offset);
         if (last_status_ != phi::Status::Ok) {
             const auto failure = last_status_;
             Synchronize();
@@ -825,8 +845,7 @@ phi::Status World::SetLinkInertia(uint32_t link_index, const Mat36& inertia) {
     }
     last_status_ = Synchronize();
     if (last_status_ != phi::Status::Ok) return last_status_;
-    std::copy(inertia.m, inertia.m + width,
-              model_.articulation.link_inertia_spatial.begin() + size_t(link_index) * width);
+    std::copy(value, value + width, tpl->begin() + std::ptrdiff_t(size_t(link_index) * width));
     return last_status_ = phi::Status::Ok;
 }
 

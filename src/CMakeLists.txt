@@ -75,6 +75,7 @@ target_link_libraries(nuka_cooker
 add_library(nuka_scene STATIC
     scene/scene_ir.cpp
     scene/scene_compose.cpp
+    scene/scene_fields.cpp
     scene/cooker.cpp
     scene/graph/scene_graph.cpp
     scene/ecs/registry.cpp
@@ -1065,6 +1066,7 @@ if(CMAKE_CUDA_COMPILER)
     add_library(nuka SHARED
         c_abi/device.cpp
         c_abi/world.cpp
+        c_abi/params.cpp
         c_abi/checkpoint.cpp
         c_abi/cuda_interop.cpp
         c_abi/buffer.cpp
@@ -1196,7 +1198,7 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_world.cpp
             runtime/app/viewer/editor_scene.cpp
             runtime/app/viewer/editor_edits.cpp
-            runtime/app/viewer/editor_undo.cpp
+            runtime/app/viewer/editor_document.cpp
             runtime/app/viewer/debug_overlay.cpp
             runtime/app/viewer/physics_worker.cpp
         )

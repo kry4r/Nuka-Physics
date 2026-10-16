@@ -139,6 +139,7 @@ void PhysicsWorker::Exclusive(const std::function<void()>& fn) {
     {
         std::unique_lock<std::mutex> lock(mu_);
         park_ = true;
+        interrupt_.store(true, std::memory_order_relaxed);
         cv_.notify_all();
         cv_.wait(lock, [this] { return parked_; });
     }
@@ -159,8 +160,8 @@ uint64_t PhysicsWorker::Bind(WorkerBinding binding) {
     bind_ = std::move(binding);
     bound_ = true;
     ++epoch_;
-    tick_ = 0u;
-    sim_time_ = 0.0;
+    SetTick(bind_.tick);
+    sim_time_ = bind_.sim_time;
     playing_ = false;
     speed_ = bind_.speed;
     step_budget_ = 0u;
@@ -189,7 +190,9 @@ uint64_t PhysicsWorker::Push(TickCommand cmd) {
     {
         std::lock_guard<std::mutex> lock(mu_);
         seq = cmd.seq = ++next_seq_;
+        cmd.pushed_tick = tick_mirror_.load(std::memory_order_relaxed);
         queue_.push_back(std::move(cmd));
+        interrupt_.store(true, std::memory_order_relaxed);
     }
     cv_.notify_all();
     return seq;
@@ -219,14 +222,28 @@ std::vector<TickResult> PhysicsWorker::TakeResults() {
 
 void PhysicsWorker::Report(uint64_t seq, std::string text, bool error) {
     if (text.empty() && seq == 0u) return;
+    TickResult result;
+    result.seq = seq;
+    result.text = std::move(text);
+    result.error = error;
+    Report(std::move(result));
+}
+
+void PhysicsWorker::Report(TickResult result) {
     std::lock_guard<std::mutex> lock(mu_);
-    results_.push_back(TickResult{seq, std::move(text), error});
+    results_.push_back(std::move(result));
+}
+
+void PhysicsWorker::SetTick(uint64_t tick) {
+    tick_ = tick;
+    tick_mirror_.store(tick, std::memory_order_relaxed);
 }
 
 void PhysicsWorker::Loop() {
     if (bound_) Guarded([&] { BindWorldDevice(bind_.world); });
     std::unique_lock<std::mutex> lock(mu_);
     while (!stop_) {
+        interrupt_.store(false, std::memory_order_relaxed);
         if (park_ && queue_.empty()) {
             parked_ = true;
             cv_.notify_all();
@@ -304,6 +321,20 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     bind_.contacts = cmd.values[1] != 0.0f;
                     last_mirror_ = WorkerClock::time_point{};
                     return true;
+                case ParamKind::Registry: {
+                    // A refused write reports without pausing; the transport keeps running.
+                    TickResult r;
+                    r.seq = cmd.seq;
+                    r.pushed_tick = cmd.pushed_tick;
+                    r.applied_tick = tick_;
+                    const nuka_result_t result =
+                        nuka_world_set_param(bind_.world, cmd.index, cmd.element, cmd.values[0]);
+                    r.error = result != NUKA_RESULT_OK;
+                    if (r.error)
+                        r.text = std::string("[nuka_editor] parameter write refused: ") + nuka_result_message(result) + "\n";
+                    Report(std::move(r));
+                    return false;
+                }
             }
             return false;
         case CommandKind::Perturb: {
@@ -331,7 +362,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     break;
                 case TransportOp::Reset:
                     healthy_ = ResetWorldPhysics(bind_.world, bind_.rest_targets);
-                    tick_ = 0u;
+                    SetTick(0u);
                     sim_time_ = 0.0;
                     playing_ = false;
                     step_budget_ = 0u;
@@ -378,25 +409,36 @@ double PhysicsWorker::Advance() {
             accum_ -= static_cast<double>(due) * dt;
         }
     }
-    due += step_budget_;
+    const uint32_t budget = step_budget_;
+    due += budget;
     step_budget_ = 0u;
     if (due == 0u) return (dt - accum_) / speed;
 
     bool healthy = true;
-    for (uint32_t i = 0; i < due; ++i) {
+    uint32_t done = 0u;
+    while (done < due) {
         WritePerturbations();
         if (bind_.controller != nullptr) bind_.controller->OnStep(bind_.world, bind_.env);
         healthy = nuka_world_step(bind_.world) == NUKA_RESULT_OK && healthy;
-        ++tick_;
+        SetTick(tick_ + 1u);
         sim_time_ += dt;
-        if (i + 1u == due || WorkerClock::now() - last_publish_ >= kBatchPublishPeriod) {
+        ++done;
+        // A queued command or park request ends the batch so it lands at this boundary.
+        const bool yield = done < due && interrupt_.load(std::memory_order_relaxed);
+        if (done == due || yield || WorkerClock::now() - last_publish_ >= kBatchPublishPeriod) {
             healthy_ = healthy;
             telemetry_.step_ms = Ms(WorkerClock::now() - now);
-            telemetry_.batch_steps = i + 1u;
+            telemetry_.batch_steps = done;
             Publish();
         }
         DispatchTick();
+        if (yield) break;
     }
+    // Steps a yield left return: explicit ones to the step budget, the rest to the clock.
+    const uint32_t left = due - done;
+    const uint32_t budget_left = std::min(left, budget);
+    step_budget_ += budget_left;
+    accum_ += static_cast<double>(left - budget_left) * dt;
     return 0.0;
 }
 

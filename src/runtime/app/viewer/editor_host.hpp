@@ -28,6 +28,11 @@ public:
     nuka_world_handle World() const;
     float Dt() const;
     void ConsoleAppend(const std::string& text);
+    // A JSON EditTxn applied now; false with the reason in DocumentState's last_error.
+    bool ApplyEdit(const std::string& txn_json);
+    bool Undo();
+    bool Redo();
+    std::string DocumentState();
 
 private:
     struct State;

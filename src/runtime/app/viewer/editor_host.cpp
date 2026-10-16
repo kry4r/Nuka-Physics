@@ -15,9 +15,9 @@
 #include "render/window/window_surface.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/debug_overlay.hpp"
+#include "runtime/app/viewer/editor_document.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
-#include "runtime/app/viewer/editor_undo.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/app/viewer/physics_worker.hpp"
@@ -25,6 +25,7 @@
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/teleop.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
+#include "scene/format/json.hpp"
 #include "scene/format/nks.hpp"
 #include "scene/scene_ir.hpp"
 
@@ -52,6 +53,7 @@ namespace nuka::runtime::app::viewer {
 namespace {
 
 namespace window = nuka::render::window;
+namespace json = nuka::scene::json;
 using Clock = std::chrono::steady_clock;
 
 constexpr float kDefaultDt = 1.0f / 240.0f;
@@ -114,14 +116,6 @@ struct LaunchOptions {
     bool perturb_on = false;
     float perturb[3] = {0.0f, 0.0f, 0.0f};
 };
-
-bool ParsePrimitiveKind(const std::string& s, PrimitiveKind* out) {
-    if (s == "box")     { *out = PrimitiveKind::Box;     return true; }
-    if (s == "sphere")  { *out = PrimitiveKind::Sphere;  return true; }
-    if (s == "capsule") { *out = PrimitiveKind::Capsule; return true; }
-    if (s == "plane")   { *out = PrimitiveKind::Plane;   return true; }
-    return false;
-}
 
 bool ReadEntireFile(const std::string& path, std::string* out) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -346,6 +340,14 @@ scene::EntityId EntityOfPath(const EditorScene& es, const std::string& path) {
 
 double Ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
+uint64_t Fnv1a(const std::string& bytes, uint64_t hash = 14695981039346656037ull) {
+    for (const char c : bytes) {
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 // The most recent samples of one frame timing.
 struct SampleWindow {
     std::vector<double> values;
@@ -371,9 +373,20 @@ struct SampleWindow {
 
 }  // namespace
 
-struct EditorHost::State {
+struct EditorHost::State : DocumentHost {
     State(const std::vector<std::string>& args, nuka_world_handle world, float dt);
-    ~State();
+    ~State() override;
+
+    void PushParam(const ParamWrite& write) override;
+    bool Rebuild(const std::string& label) override;
+    void ScriptsChanged() override { SyncScripts(); }
+    ApplyResult ApplyTxn(const EditTxn& txn);
+    void Reselect(const std::string& path);
+    void AfterHistory(const ApplyResult& result);
+    bool ApplyEditJson(const std::string& text);
+    bool StepHistory(bool redo);
+    uint64_t DocumentHash();
+    std::string DocumentState();
 
     void Frame(bool step_physics);
     void ConsoleAppend(const std::string& s);
@@ -385,7 +398,7 @@ struct EditorHost::State {
     uint64_t Generation() const;
     void SyncScripts();
     void SeedDriveTargets();
-    void BindWorker();
+    void BindWorker(uint64_t tick = 0u, double sim_time = 0.0);
     void DropPublisher();
     void ApplySnapshot(const Snapshot& snap);
     void TakeWorkerResults();
@@ -398,14 +411,13 @@ struct EditorHost::State {
     void ApplyLoad(const std::string& path);
     void Attach(const std::string& path);
     void OnLoaded(const std::string& path);
-    void OnRebound();
+    void OnRebound(uint64_t tick, double sim_time);
     void AttachController();
     void ApplyUnload();
     bool TreeEditPending() const;
     void ApplyTreeEdits();
     void SeedInspector(scene::EntityId e);
     void ApplyInspectorEdits();
-    void PostEditResync(uint64_t generation_before);
     void ApplyScriptAttach();
 
     LaunchOptions opt_;
@@ -417,11 +429,16 @@ struct EditorHost::State {
     std::unique_ptr<EditorScene> loaded_;
     bool attach_pending_ = false;
     EntityDrag entity_drag_;
-    EntityRecordIndex record_index_;
     scene::EntityId last_seeded_ = scene::kInvalidEntity;
 
-    // A drag records one op: BEFORE at the gesture start, AFTER at its commit.
-    EditStack edit_stack_;
+    // Edits preview live; a gesture's commit becomes one transaction for the next frame top.
+    EditorDocument doc_;
+    std::vector<EditTxn> pending_txns_;
+    uint64_t param_seq_ = 0u;  // the last registry write and the ticks it was queued and applied at
+    uint64_t param_pushed_tick_ = 0u;
+    uint64_t param_applied_tick_ = 0u;
+    bool param_done_ = true;
+    std::string last_error_;
     bool xform_gesture_active_ = false;
     bool xform_dirty_ = false;
     std::string xform_gesture_path_;
@@ -684,9 +701,9 @@ void EditorHost::State::DropPublisher() {
     frame_pins_.clear();
 }
 
-// Binds the worker to the loaded scene. Poses publish zero-copy when the renderer and
-// the world's CUDA device share pose slots, otherwise through host downloads.
-void EditorHost::State::BindWorker() {
+// Binds the worker to the loaded scene from `tick` on. Poses publish zero-copy when the
+// renderer and the world's CUDA device share pose slots, otherwise through host downloads.
+void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
     present_->WaitIdle();
     DropPublisher();
     const render::RenderWorld& rw = loaded_->sim->GetRenderWorld();
@@ -723,6 +740,21 @@ void EditorHost::State::BindWorker() {
     std::printf("[nuka_editor] publish=%s%s%s\n", scatter_ ? "zero-copy" : "host",
                 scatter_ ? "" : " reason=", publish_reason_.c_str());
 
+    // The document classifies edits against this world's parameter registry.
+    uint32_t count = 0u;
+    CheckResult(nuka_world_param_count(world_, &count), "nuka_world_param_count");
+    std::vector<nuka_param_info_t> infos(count);
+    for (nuka_param_info_t& info : infos) {
+        info.struct_size = sizeof(info);
+        info.schema_version = NUKA_PARAM_INFO_VERSION;
+    }
+    CheckResult(nuka_world_get_param_infos(world_, infos.data(), count), "nuka_world_get_param_infos");
+    std::vector<double> values(count, 0.0);
+    for (uint32_t i = 0; i < count; ++i)
+        if (infos[i].scene_field[0] == '\0')
+            CheckResult(nuka_world_get_param(world_, i, 0u, &values[i]), "nuka_world_get_param");
+    doc_.SetParams(std::move(infos), std::move(values));
+
     const WorldLayout& layout = loaded_->Layout();
     WorkerBinding binding;
     binding.world = world_;
@@ -735,6 +767,8 @@ void EditorHost::State::BindWorker() {
     binding.speed = ui_state_.speed;
     binding.colliders = ui_state_.show_colliders;
     binding.contacts = ui_state_.show_contacts;
+    binding.tick = tick;
+    binding.sim_time = sim_time;
     sent_playing_ = false;
     sent_env_ = binding.env;
     sent_speed_ = binding.speed;
@@ -771,6 +805,12 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
 void EditorHost::State::TakeWorkerResults() {
     for (const TickResult& r : worker_.TakeResults()) {
         if (r.error) std::fputs(r.text.c_str(), stderr);
+        if (r.seq != 0u && r.seq == param_seq_) {
+            param_pushed_tick_ = r.pushed_tick;
+            param_applied_tick_ = r.applied_tick;
+            param_done_ = true;
+            if (r.error) last_error_ = r.text;
+        }
         if (r.seq != 0u && r.seq == run_script_seq_) {
             std::fputs(r.text.c_str(), stderr);
             std::fflush(stderr);
@@ -946,20 +986,19 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     frame_pending_ = true;
     entity_drag_.Cancel();
     debug_overlay_.Reset();
+    doc_.Attach(loaded_.get(), this);  // no undo across loads
+    pending_txns_.clear();
     AttachController();
     BindWorker();  // poses before framing
     FrameWorld(loaded_->sim->GetRenderWorld());
     SeedDriveTargets();
-    record_index_.Build(loaded_->scene);
     script_host_.ClearScripts();
     live_scripts_.clear();
     SyncScripts();
     ui_state_.inspector = InspectorState{};
     last_seeded_ = scene::kInvalidEntity;
-    edit_stack_.Clear();  // no undo across loads
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", path.c_str());
-    ui_state_.save_dirty = false;
     ui_state_.selected_entity = scene::kInvalidEntity;
 
     // Headless aids: pre-select a node and apply sample edits through the edit seam.
@@ -969,29 +1008,24 @@ void EditorHost::State::OnLoaded(const std::string& path) {
         else std::fprintf(stderr, "[nuka_editor] --select: no node at '%s'\n", opt_.select_path.c_str());
     }
     if (opt_.edit_color_on && ui_state_.selected_entity != scene::kInvalidEntity) {
-        const MaterialBinding mb = ResolveMaterial(*loaded_, record_index_, ui_state_.selected_entity);
+        const MaterialBinding mb = ResolveMaterial(*loaded_, doc_.Records(), ui_state_.selected_entity);
         if (mb.valid) {
-            const scene::RenderMaterial before = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
-            scene::RenderMaterial m = before;
-            m.base_color[0] = opt_.edit_color[0];
-            m.base_color[1] = opt_.edit_color[1];
-            m.base_color[2] = opt_.edit_color[2];
-            ApplyMaterialEdit(*loaded_, mb, m, /*commit=*/true);
-            edit_stack_.Record(MakeMaterialOp(loaded_.get(), PathOfEntity(ui_state_.selected_entity), before, m));
-            ui_state_.save_dirty = true;
+            scene::RenderMaterial m = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
+            for (int k = 0; k < 3; ++k) m.base_color[k] = opt_.edit_color[k];
+            pending_txns_.push_back(EditTxn{"Color", {EditOp{PathOfEntity(ui_state_.selected_entity), "material",
+                                                              json::Value(), MaterialToJson(m)}}});
         }
     }
     if (opt_.edit_move_on && ui_state_.selected_entity != scene::kInvalidEntity) {
         if (const render::RenderInstance* inst =
                 InstanceOfEntity(loaded_->sim->GetRenderWorld(), ui_state_.selected_entity)) {
-            const math::Transform before = inst->world_xform;
-            math::Transform moved = before;
+            math::Transform moved = inst->world_xform;
             moved.position.x += opt_.edit_move[0];
             moved.position.y += opt_.edit_move[1];
             moved.position.z += opt_.edit_move[2];
-            ApplyTransformEdit(*loaded_, record_index_, ui_state_.selected_entity, moved, /*commit=*/true);
-            edit_stack_.Record(MakeTransformOp(loaded_.get(), PathOfEntity(ui_state_.selected_entity), before, moved));
-            ui_state_.save_dirty = true;
+            pending_txns_.push_back(EditTxn{"Move", {EditOp{PathOfEntity(ui_state_.selected_entity), "transform",
+                                                             TransformToJson(inst->world_xform),
+                                                             TransformToJson(moved)}}});
         }
     }
     if (opt_.gizmo_op == "rotate") ui_state_.gizmo.op = GizmoState::Op::Rotate;
@@ -1068,10 +1102,133 @@ void EditorHost::State::OnLoaded(const std::string& path) {
 }
 
 // A rebuild replaced the simulation binding: re-attach the controller and drive editor.
-void EditorHost::State::OnRebound() {
+void EditorHost::State::OnRebound(uint64_t tick, double sim_time) {
     AttachController();
     SeedDriveTargets();
-    BindWorker();
+    BindWorker(tick, sim_time);
+}
+
+void EditorHost::State::PushParam(const ParamWrite& write) {
+    TickCommand cmd = TickCommand::Param(ParamKind::Registry, {static_cast<float>(write.value)});
+    cmd.index = write.param;
+    cmd.element = write.element;
+    param_seq_ = worker_.Push(std::move(cmd));
+    param_done_ = false;
+}
+
+// Runs with the worker parked. The rebuilt world continues the timeline from this tick, and
+// the transport resumes because the binding starts paused while the UI still plays.
+bool EditorHost::State::Rebuild(const std::string& label) {
+    entity_drag_.Cancel();
+    present_->WaitIdle();
+    const uint64_t tick = worker_.Tick();
+    const double sim_time = worker_.SimTime();
+    // Moves queued this frame land before the state migrates by body name.
+    for (const PoseWrite& write : loaded_->sim->TakePoseWrites())
+        ApplyPoseWrite(world_, loaded_->Layout(), sent_env_, write);
+    if (!RecookEditorScene(*loaded_, cache_)) return false;
+    OnRebound(tick, sim_time);
+    doc_.AddBranch(TimelineBranch{tick, Generation(), label});
+    return true;
+}
+
+// Runs with the worker parked. Selection follows the node the edit created or moved.
+ApplyResult EditorHost::State::ApplyTxn(const EditTxn& txn) {
+    const std::string selected = PathOfEntity(ui_state_.selected_entity);
+    const ApplyResult result = doc_.Apply(txn);
+    if (!result.ok) {
+        last_error_ = result.error;
+        const std::string msg = "[nuka_editor] edit '" + txn.label + "' failed: " + result.error + "\n";
+        std::fputs(msg.c_str(), stderr);
+        ConsoleAppend(msg);
+    }
+    Reselect(result.focus.empty() ? selected : result.focus);
+    return result;
+}
+
+void EditorHost::State::Reselect(const std::string& path) {
+    ui_state_.selected_entity = scene::kInvalidEntity;
+    if (!path.empty())
+        if (const auto n = loaded_->scene.Tree().NodeOf(path)) ui_state_.selected_entity = n->entity;
+    ui_state_.inspector = InspectorState{};
+    last_seeded_ = scene::kInvalidEntity;
+}
+
+void EditorHost::State::AfterHistory(const ApplyResult& result) {
+    entity_drag_.Cancel();
+    xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
+    if (!result.ok) {
+        last_error_ = result.error;
+        const std::string msg = "[nuka_editor] " + result.error + "\n";
+        std::fputs(msg.c_str(), stderr);
+        ConsoleAppend(msg);
+    }
+    Reselect(result.focus);
+}
+
+bool EditorHost::State::ApplyEditJson(const std::string& text) {
+    if (!loaded_) {
+        last_error_ = "no scene is loaded";
+        return false;
+    }
+    EditTxn txn;
+    try {
+        txn = TxnFromJson(text);
+    } catch (const std::exception& e) {
+        last_error_ = std::string("bad edit transaction: ") + e.what();
+        return false;
+    }
+    ApplyResult result;
+    worker_.Exclusive([&] { result = ApplyTxn(txn); });
+    return result.ok;
+}
+
+bool EditorHost::State::StepHistory(bool redo) {
+    if (!loaded_ || !(redo ? doc_.CanRedo() : doc_.CanUndo())) return false;
+    ApplyResult result;
+    worker_.Exclusive([&] { result = redo ? doc_.Redo() : doc_.Undo(); });
+    AfterHistory(result);
+    return result.ok;
+}
+
+// FNV-1a of the document saved as NKS: equal documents hash equal.
+uint64_t EditorHost::State::DocumentHash() {
+    if (!loaded_) return 0u;
+    const std::string file = cache_.File("document.nks");
+    scene::nks::Save(loaded_->scene, file);
+    std::string nks;
+    std::string archive;
+    ReadEntireFile(file, &nks);
+    ReadEntireFile(file.substr(0, file.size() - 4u) + ".nka", &archive);
+    return Fnv1a(archive, Fnv1a(nks));
+}
+
+std::string EditorHost::State::DocumentState() {
+    char hash[17];
+    std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(DocumentHash()));
+    json::Value branches = json::Value::Array();
+    for (const TimelineBranch& b : doc_.Branches()) {
+        json::Value v = json::Value::Object();
+        v.Set("tick", json::Value::Int(static_cast<int64_t>(b.tick)));
+        v.Set("generation", json::Value::Int(static_cast<int64_t>(b.generation)));
+        v.Set("label", json::Value::Str(b.label));
+        branches.PushBack(std::move(v));
+    }
+    json::Value v = json::Value::Object();
+    v.Set("loaded", json::Value::Bool(loaded_ != nullptr));
+    v.Set("revision", json::Value::Int(static_cast<int64_t>(doc_.Revision())));
+    v.Set("dirty", json::Value::Bool(loaded_ != nullptr && doc_.Dirty()));
+    v.Set("hash", json::Value::Str(hash));
+    v.Set("undo", json::Value::Int(static_cast<int64_t>(doc_.UndoDepth())));
+    v.Set("redo", json::Value::Int(static_cast<int64_t>(doc_.RedoDepth())));
+    v.Set("tick", json::Value::Int(static_cast<int64_t>(worker_.Tick())));
+    v.Set("generation", json::Value::Int(static_cast<int64_t>(world_ != nullptr ? Generation() : 0u)));
+    v.Set("branches", std::move(branches));
+    v.Set("param_done", json::Value::Bool(param_done_));
+    v.Set("param_pushed_tick", json::Value::Int(static_cast<int64_t>(param_pushed_tick_)));
+    v.Set("param_applied_tick", json::Value::Int(static_cast<int64_t>(param_applied_tick_)));
+    v.Set("last_error", json::Value::Str(last_error_));
+    return v.Dump(0);
 }
 
 void EditorHost::State::AttachController() {
@@ -1103,15 +1260,14 @@ void EditorHost::State::ApplyUnload() {
     loaded_.reset();
     debug_overlay_.Reset();
     ClearModelUi(ui_state_);
-    record_index_ = EntityRecordIndex{};
+    doc_.Detach();
+    pending_txns_.clear();
     script_host_.ClearScripts();
     live_scripts_.clear();
     ui_state_.script_node_count = 0;
     ui_state_.inspector = InspectorState{};
     last_seeded_ = scene::kInvalidEntity;
-    edit_stack_.Clear();
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
-    ui_state_.save_dirty = false;
     camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
 }
 
@@ -1132,31 +1288,17 @@ void EditorHost::State::ApplyTreeEdits() {
     ui_state_.reparent_request = false;
     if (!(want_rename || want_add || want_delete || want_reparent)) return;
 
-    std::string target_path;
-    if (ui_state_.selected_entity != scene::kInvalidEntity) {
-        if (const auto n = loaded_->scene.Ecs().NodeOf(ui_state_.selected_entity))
-            target_path = loaded_->scene.Tree().PathOf(n);
-    }
-
-    // A structural op reverts by restoring this snapshot of the document.
-    scene::SceneIR before = loaded_->scene;
-    const auto bodies_before  = loaded_->scene.RigidBodyCount();
-    const auto scripts_before = loaded_->scene.ScriptCount();
-
-    std::string focus;        // node to reselect after the edit
-    bool structural = false;  // the cooked model changed
-    bool changed = false;
-    bool renamed = false;
+    const std::string target_path = PathOfEntity(ui_state_.selected_entity);
+    EditOp op;
+    std::string label;
     if (want_reparent) {
-        focus = ReparentNode(*loaded_, ui_state_.reparent_src, ui_state_.reparent_dst);
+        op = EditOp{ui_state_.reparent_src, "reparent", json::Value(), json::Value::Str(ui_state_.reparent_dst)};
+        label = "Reparent";
         ui_state_.reparent_src.clear();
         ui_state_.reparent_dst.clear();
-        changed = !focus.empty();
-        structural = changed;
     } else if (want_rename && !target_path.empty()) {
-        focus = RenameNode(*loaded_, target_path, ui_state_.rename_buf);
-        changed = !focus.empty();
-        renamed = changed;
+        op = EditOp{target_path, "name", json::Value(), json::Value::Str(ui_state_.rename_buf)};
+        label = "Rename";
     } else if (want_add) {
         math::Transform placement;
         placement.position = math::Vec3{0.0f, 0.0f, kSpawnDropHeight};
@@ -1165,55 +1307,18 @@ void EditorHost::State::ApplyTreeEdits() {
             placement.position = w.position;
             placement.position.z += kSpawnDropHeight;
         }
-        focus = SpawnPrimitive(*loaded_, ui_state_.spawn_kind, placement, "");
-        changed = !focus.empty();
-        structural = changed;
+        json::Value spawn = json::Value::Object();
+        spawn.Set("kind", json::Value::Str(PrimitiveKindName(ui_state_.spawn_kind)));
+        spawn.Set("pose", TransformToJson(placement));
+        op = EditOp{"", "spawn", json::Value(), std::move(spawn)};
+        label = std::string("Spawn ") + PrimitiveKindName(ui_state_.spawn_kind);
     } else if (want_delete && !target_path.empty()) {
-        focus = DeleteSubtree(*loaded_, target_path);
-        const bool body_deleted = loaded_->scene.RigidBodyCount() < bodies_before;
-        const bool script_deleted = loaded_->scene.ScriptCount() < scripts_before;
-        changed = body_deleted || script_deleted;
-        structural = body_deleted;  // a /script delete never reaches the cook
-        if (script_deleted) SyncScripts();
-    }
-    if (!changed) return;
-
-    if (structural) {
-        entity_drag_.Cancel();
-        present_->WaitIdle();
-        if (!RecookEditorScene(*loaded_, cache_)) {
-            // The world kept its previous scene; roll the document back to match it.
-            loaded_->scene = std::move(before);
-            record_index_.Build(loaded_->scene);
-            ui_state_.selected_entity = scene::kInvalidEntity;
-            if (!target_path.empty()) {
-                if (const auto n = loaded_->scene.Tree().NodeOf(target_path))
-                    ui_state_.selected_entity = n->entity;
-            }
-            ui_state_.inspector = InspectorState{};
-            last_seeded_ = scene::kInvalidEntity;
-            const char* msg = "[nuka_editor] tree edit rejected: rebuild failed; scene reverted\n";
-            std::fprintf(stderr, "%s", msg);
-            ConsoleAppend(msg);
-            return;
-        }
-        OnRebound();
-    }
-    record_index_.Build(loaded_->scene);
-    ui_state_.selected_entity = scene::kInvalidEntity;
-    if (!focus.empty()) {
-        if (const auto n = loaded_->scene.Tree().NodeOf(focus)) ui_state_.selected_entity = n->entity;
-    }
-    ui_state_.inspector = InspectorState{};
-    last_seeded_ = scene::kInvalidEntity;
-    ui_state_.save_dirty = true;
-    if (renamed) {
-        edit_stack_.Record(MakeRenameOp(loaded_.get(), target_path, focus));
+        op = EditOp{target_path, "delete", json::Value(), json::Value()};
+        label = "Delete";
     } else {
-        scene::SceneIR after = loaded_->scene;
-        edit_stack_.Record(MakeStructuralOp(loaded_.get(), &record_index_, &cache_, std::move(before),
-                                            std::move(after)));
+        return;
     }
+    ApplyTxn(EditTxn{label, {std::move(op)}});
 }
 
 // Seeds the inspector from the selected instance's world pose and material.
@@ -1229,7 +1334,7 @@ void EditorHost::State::SeedInspector(scene::EntityId e) {
     ins.pos[0] = p.x; ins.pos[1] = p.y; ins.pos[2] = p.z;
     const math::Vec3 rd = EulerDegFromQuat(inst->world_xform.rotation);
     ins.rot_deg[0] = rd.x; ins.rot_deg[1] = rd.y; ins.rot_deg[2] = rd.z;
-    const MaterialBinding mb = ResolveMaterial(*loaded_, record_index_, e);
+    const MaterialBinding mb = ResolveMaterial(*loaded_, doc_.Records(), e);
     if (mb.valid) {
         const scene::RenderMaterial& m = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
         ins.has_material = true;
@@ -1241,7 +1346,7 @@ void EditorHost::State::SeedInspector(scene::EntityId e) {
     }
 }
 
-// Inspector edits apply live each changed frame and persist on the commit frame.
+// Inspector edits preview live each changed frame; the commit frame submits one transaction.
 void EditorHost::State::ApplyInspectorEdits() {
     if (!loaded_) return;
     InspectorState& ins = ui_state_.inspector;
@@ -1257,17 +1362,18 @@ void EditorHost::State::ApplyInspectorEdits() {
             if (const render::RenderInstance* gi = InstanceOfEntity(loaded_->sim->GetRenderWorld(), e))
                 xform_before_ = gi->world_xform;
         }
-        ApplyTransformEdit(*loaded_, record_index_, e, edited, ins.transform_commit);
+        ApplyTransformEdit(*loaded_, doc_.Records(), e, edited, /*commit=*/false);
         if (ins.transform_commit) {
-            ui_state_.save_dirty = true;
-            edit_stack_.Record(MakeTransformOp(loaded_.get(), xform_gesture_path_, xform_before_, edited));
+            pending_txns_.push_back(EditTxn{"Transform", {EditOp{xform_gesture_path_, "transform",
+                                                                  TransformToJson(xform_before_),
+                                                                  TransformToJson(edited)}}});
             xform_gesture_active_ = false;
         }
         ins.transform_changed = false;
         ins.transform_commit = false;
     }
     if (ins.has_material && (ins.material_changed || ins.material_commit)) {
-        const MaterialBinding mb = ResolveMaterial(*loaded_, record_index_, e);
+        const MaterialBinding mb = ResolveMaterial(*loaded_, doc_.Records(), e);
         scene::RenderMaterial m;
         if (mb.render_slot != render::kNoId && mb.render_slot < loaded_->sim->GetRenderWorld().MaterialCount())
             m = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
@@ -1282,10 +1388,10 @@ void EditorHost::State::ApplyInspectorEdits() {
         for (int k = 0; k < 3; ++k) m.emissive[k] = ins.emissive[k];
         m.sheen = ins.sheen; m.transmission = ins.transmission; m.ior = ins.ior;
         for (int k = 0; k < 3; ++k) m.absorption[k] = ins.absorption[k];
-        ApplyMaterialEdit(*loaded_, mb, m, ins.material_commit);
+        ApplyMaterialEdit(*loaded_, mb, m, /*commit=*/false);
         if (ins.material_commit) {
-            ui_state_.save_dirty = true;
-            edit_stack_.Record(MakeMaterialOp(loaded_.get(), mat_gesture_path_, mat_before_, m));
+            pending_txns_.push_back(EditTxn{"Material", {EditOp{mat_gesture_path_, "material",
+                                                                 MaterialToJson(mat_before_), MaterialToJson(m)}}});
             mat_gesture_active_ = false;
         }
         ins.material_changed = false;
@@ -1293,52 +1399,14 @@ void EditorHost::State::ApplyInspectorEdits() {
     }
 }
 
-// After an undo/redo: a structural revert rebuilt the world, so rebind its consumers;
-// drop the selection so stale ids never linger.
-void EditorHost::State::PostEditResync(uint64_t generation_before) {
-    entity_drag_.Cancel();
-    if (!loaded_) return;
-    if (Generation() != generation_before) OnRebound();
-    record_index_.Build(loaded_->scene);
-    SyncScripts();
-    ui_state_.selected_entity = scene::kInvalidEntity;
-    ui_state_.inspector = InspectorState{};
-    last_seeded_ = scene::kInvalidEntity;
-    xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
-    ui_state_.save_dirty = true;
-}
-
 // Attach persists the buffer as a /script node; a selected one updates in place.
 void EditorHost::State::ApplyScriptAttach() {
-    scene::ScriptId sel_script = scene::kInvalidScript;
-    if (ui_state_.selected_entity != scene::kInvalidEntity) {
-        for (size_t i = 0; i < loaded_->scene.ScriptCount(); ++i) {
-            const auto sid = static_cast<scene::ScriptId>(i);
-            if (loaded_->scene.EntityOfScript(sid) == ui_state_.selected_entity) {
-                sel_script = sid;
-                break;
-            }
-        }
-    }
-    std::string sel_path;  // survives the re-projection below
-    if (sel_script != scene::kInvalidScript) sel_path = PathOfEntity(ui_state_.selected_entity);
-    if (sel_script != scene::kInvalidScript) {
-        loaded_->scene.GetScriptMut(sel_script).source = ui_state_.script_buf;
-    } else {
-        uint64_t next_id = 1;
-        for (const auto& sr : loaded_->scene.Scripts())
-            if (sr.stable_id >= next_id) next_id = sr.stable_id + 1;
-        scene::ScriptRecord rec;
-        rec.stable_id = next_id;
-        rec.source = ui_state_.script_buf;
-        loaded_->scene.AddScript(rec);
-    }
-    record_index_.Build(loaded_->scene);
-    SyncScripts();
-    if (!sel_path.empty()) {
-        if (const auto n = loaded_->scene.Tree().NodeOf(sel_path)) ui_state_.selected_entity = n->entity;
-    }
-    ui_state_.save_dirty = true;
+    std::string target;
+    for (size_t i = 0; i < loaded_->scene.ScriptCount(); ++i)
+        if (ui_state_.selected_entity != scene::kInvalidEntity &&
+            loaded_->scene.EntityOfScript(static_cast<scene::ScriptId>(i)) == ui_state_.selected_entity)
+            target = PathOfEntity(ui_state_.selected_entity);
+    ApplyTxn(EditTxn{"Attach script", {EditOp{target, "script", json::Value(), json::Value::Str(ui_state_.script_buf)}}});
 }
 
 void EditorHost::State::Frame(bool step_physics) {
@@ -1362,6 +1430,14 @@ void EditorHost::State::Frame(bool step_physics) {
         attach_pending_ = false;
         worker_.Exclusive([&] { Attach(""); });
     }
+    // Committed edits of the last frame apply before this frame takes a render-world reference.
+    if (loaded_ && !pending_txns_.empty()) {
+        std::vector<EditTxn> txns;
+        txns.swap(pending_txns_);
+        worker_.Exclusive([&] {
+            for (const EditTxn& txn : txns) ApplyTxn(txn);
+        });
+    }
     if (TreeEditPending()) worker_.Exclusive([&] { ApplyTreeEdits(); });
 
     // Headless triggers: undo at frame 1, redo at frame 2, reset at frame N.
@@ -1372,25 +1448,11 @@ void EditorHost::State::Frame(bool step_physics) {
 
     if (ui_state_.undo_request) {
         ui_state_.undo_request = false;
-        if (loaded_ && edit_stack_.CanUndo()) {
-            worker_.Exclusive([&] {
-                present_->WaitIdle();
-                const uint64_t generation = Generation();
-                edit_stack_.Undo();
-                PostEditResync(generation);
-            });
-        }
+        StepHistory(/*redo=*/false);
     }
     if (ui_state_.redo_request) {
         ui_state_.redo_request = false;
-        if (loaded_ && edit_stack_.CanRedo()) {
-            worker_.Exclusive([&] {
-                present_->WaitIdle();
-                const uint64_t generation = Generation();
-                edit_stack_.Redo();
-                PostEditResync(generation);
-            });
-        }
+        StepHistory(/*redo=*/true);
     }
 
     // The script runs on the physics side at its next tick boundary.
@@ -1496,8 +1558,9 @@ void EditorHost::State::Frame(bool step_physics) {
 
     ui_state_.has_scene = static_cast<bool>(loaded_);
     ui_state_.loaded_path = loaded_ ? loaded_->path : std::string();
-    ui_state_.can_undo = edit_stack_.CanUndo();
-    ui_state_.can_redo = edit_stack_.CanRedo();
+    ui_state_.can_undo = doc_.CanUndo();
+    ui_state_.can_redo = doc_.CanRedo();
+    ui_state_.save_dirty = loaded_ && doc_.Dirty();
 
     io.DisplaySize = ImVec2(static_cast<float>(present_->Report().width),
                             static_cast<float>(present_->Report().height));
@@ -1559,14 +1622,15 @@ void EditorHost::State::Frame(bool step_physics) {
                 xform_after_ = pre_drag;
             }
             if (gizmo_changed) {
-                ApplyTransformEdit(*loaded_, record_index_, ui_state_.selected_entity, gworld, /*commit=*/true);
-                ui_state_.save_dirty = true;
+                ApplyTransformEdit(*loaded_, doc_.Records(), ui_state_.selected_entity, gworld, /*commit=*/false);
                 xform_after_ = gworld;
                 xform_dirty_ = true;
             }
             if (!using_now && gizmo_using_prev_ && xform_gesture_active_) {
                 if (xform_dirty_)
-                    edit_stack_.Record(MakeTransformOp(loaded_.get(), xform_gesture_path_, xform_before_, xform_after_));
+                    pending_txns_.push_back(EditTxn{"Gizmo", {EditOp{xform_gesture_path_, "transform",
+                                                                      TransformToJson(xform_before_),
+                                                                      TransformToJson(xform_after_)}}});
                 xform_gesture_active_ = false;
             }
             gizmo_using_prev_ = using_now;
@@ -1634,7 +1698,7 @@ void EditorHost::State::Frame(bool step_physics) {
         ui_state_.save_request.clear();
         try {
             scene::nks::Save(loaded_->scene, sp);
-            ui_state_.save_dirty = false;
+            doc_.MarkSaved();
             std::printf("[nuka_editor] saved %s\n", sp.c_str());
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[nuka_editor] save failed: %s: %s\n", sp.c_str(), e.what());
@@ -1811,5 +1875,9 @@ void EditorHost::ConsoleAppend(const std::string& text) {
     std::lock_guard<std::mutex> lock(state_->inbox_mu_);
     state_->console_inbox_ += text;
 }
+bool EditorHost::ApplyEdit(const std::string& txn_json) { return state_->ApplyEditJson(txn_json); }
+bool EditorHost::Undo() { return state_->StepHistory(/*redo=*/false); }
+bool EditorHost::Redo() { return state_->StepHistory(/*redo=*/true); }
+std::string EditorHost::DocumentState() { return state_->DocumentState(); }
 
 }  // namespace nuka::runtime::app::viewer

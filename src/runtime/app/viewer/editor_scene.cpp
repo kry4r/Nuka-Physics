@@ -38,6 +38,11 @@ std::string SceneCache::NextFile() {
     return (dir_ / ("scene_" + std::to_string(next_++) + ".nks")).string();
 }
 
+std::string SceneCache::File(const std::string& name) {
+    std::filesystem::create_directories(dir_);
+    return (dir_ / name).string();
+}
+
 void SceneCache::Remove() {
     std::error_code error;
     std::filesystem::remove_all(dir_, error);

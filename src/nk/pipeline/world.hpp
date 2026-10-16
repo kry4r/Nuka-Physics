@@ -72,8 +72,9 @@ public:
         return pipeline_ ? pipeline_->VelocityIterations() : cfg_.vel_iters;
     }
 
-    // Update one template link's spatial inertia in every environment without reallocating.
-    phi::Status SetLinkInertia(uint32_t link_index, const Mat36& inertia);
+    // Write one template link's value of a per-link parameter field (width floats) in every
+    // environment and in the model template, without reallocating.
+    phi::Status SetLinkParam(FieldId id, uint32_t link_index, const float* value, uint32_t width);
 
     phi::Status AttachStateSensor(const sensor::StateSensorDesc& desc, uint32_t* id);
     phi::Status ConfigureStateSensorError(uint32_t id, uint32_t channel, const sensor::ObservationConfig& config);
@@ -129,6 +130,8 @@ private:
     // Seed environment state from the model and capture the reset snapshot.
     bool SeedInitialState();
     phi::Status RefreshPoses(uint32_t selected_env_count);
+    // The model's host template of a per-link parameter field; null for other fields.
+    std::vector<float>* LinkParamTemplate(FieldId id);
 
     // First external request for a readout output: emit the producing op from
     // now on (rebuild pipeline, drop the plan) + backfill it from the last solve.

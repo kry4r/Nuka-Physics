@@ -180,7 +180,7 @@ struct ViewerUiState {
     bool reset_requested = false;
     bool camera_reset    = false;
 
-    // Undo/redo. can_* are viewer-set hints (the EditStack depth) the toolbar reads
+    // Undo/redo. can_* are viewer-set hints (the document history) the toolbar reads
     // to enable/disable its buttons; *_request are one-shot edges the toolbar (and
     // the Ctrl-Z/Y key path) set and the viewer applies BETWEEN frames (never in
     // RecordUi) so the deterministic record path is untouched.

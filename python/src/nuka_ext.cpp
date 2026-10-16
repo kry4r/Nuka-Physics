@@ -680,6 +680,41 @@ public:
         return iterations;
     }
 
+    nb::list param_infos() const {
+        uint32_t count = 0u;
+        check(nuka_world_param_count(h_, &count), "nuka_world_param_count");
+        std::vector<nuka_param_info_t> infos(count);
+        for (nuka_param_info_t& info : infos) {
+            info.struct_size = sizeof(info);
+            info.schema_version = NUKA_PARAM_INFO_VERSION;
+        }
+        check(nuka_world_get_param_infos(h_, infos.data(), count), "nuka_world_get_param_infos");
+        nb::list out;
+        for (const nuka_param_info_t& info : infos) {
+            nb::dict entry;
+            entry["key"] = std::string(info.key);
+            entry["unit"] = std::string(info.unit);
+            entry["scene_field"] = std::string(info.scene_field);
+            entry["type"] = info.type == NUKA_PARAM_U32 ? "u32" : "f32";
+            entry["tier"] = info.tier == NUKA_PARAM_LIVE ? "live" : "rebuild";
+            entry["count"] = info.count;
+            entry["min"] = info.min_value;
+            entry["max"] = info.max_value;
+            out.append(entry);
+        }
+        return out;
+    }
+
+    double get_param(uint32_t param, uint32_t element) const {
+        double value = 0.0;
+        check(nuka_world_get_param(h_, param, element, &value), "nuka_world_get_param");
+        return value;
+    }
+
+    void set_param(uint32_t param, uint32_t element, double value) {
+        check(nuka_world_set_param(h_, param, element, value), "nuka_world_set_param");
+    }
+
     void set_sensor_noise(nuka_state_field_t field, int kind, float param1,
                           float param2, uint64_t seed) {
         nuka_sensor_noise_desc_t desc{};
@@ -2937,6 +2972,13 @@ NB_MODULE(_nuka_ext, m) {
              "timestep and invalidates the execution graph when the value changes.")
         .def("velocity_iterations", &World::velocity_iterations,
              "Block-descent iteration budget of the contact solve.")
+        .def("param_infos", &World::param_infos,
+             "The tunable parameters in index order: key, unit, scene_field, type, tier "
+             "('live' applies at the next step, 'rebuild' needs rebuild_from_scene), count, min, max.")
+        .def("get_param", &World::get_param, nb::arg("param"), nb::arg("element") = 0u,
+             "Read element `element` (a template link, or 0 for a world option) of parameter `param`.")
+        .def("set_param", &World::set_param, nb::arg("param"), nb::arg("element"), nb::arg("value"),
+             "Apply a live parameter at the next step and write it to the retained scene.")
         .def("set_sensor_noise", &World::set_sensor_noise, nb::arg("field"),
              nb::arg("kind"), nb::arg("param1") = 0.0f, nb::arg("param2") = 0.0f,
              nb::arg("seed") = uint64_t{0},

@@ -2,7 +2,9 @@
 
 #include "runtime/app/viewer/editor_host.hpp"
 
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <new>
 #include <string>
@@ -64,6 +66,42 @@ float nuka_editor_dt(nuka_editor_handle editor) { return editor->Dt(); }
 
 void nuka_editor_console_append(nuka_editor_handle editor, const char* text) {
     if (text != nullptr) editor->ConsoleAppend(text);
+}
+
+nuka_result_t nuka_editor_apply_edit(nuka_editor_handle editor, const char* txn_json) {
+    if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (txn_json == nullptr) return NUKA_RESULT_INVALID_ARG;
+    bool ok = false;
+    const nuka_result_t result = Guard([&] { ok = editor->ApplyEdit(txn_json); });
+    return result != NUKA_RESULT_OK ? result : ok ? NUKA_RESULT_OK : NUKA_RESULT_INVALID_ARG;
+}
+
+nuka_result_t nuka_editor_undo(nuka_editor_handle editor) {
+    if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    bool ok = false;
+    const nuka_result_t result = Guard([&] { ok = editor->Undo(); });
+    return result != NUKA_RESULT_OK ? result : ok ? NUKA_RESULT_OK : NUKA_RESULT_NOT_SUPPORTED;
+}
+
+nuka_result_t nuka_editor_redo(nuka_editor_handle editor) {
+    if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    bool ok = false;
+    const nuka_result_t result = Guard([&] { ok = editor->Redo(); });
+    return result != NUKA_RESULT_OK ? result : ok ? NUKA_RESULT_OK : NUKA_RESULT_NOT_SUPPORTED;
+}
+
+nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, char* out, size_t capacity,
+                                         size_t* out_length) {
+    if (editor == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (out_length == nullptr) return NUKA_RESULT_INVALID_ARG;
+    std::string state;
+    const nuka_result_t result = Guard([&] { state = editor->DocumentState(); });
+    if (result != NUKA_RESULT_OK) return result;
+    *out_length = state.size();
+    if (out == nullptr) return NUKA_RESULT_OK;
+    if (capacity <= state.size()) return NUKA_RESULT_INVALID_ARG;
+    std::memcpy(out, state.c_str(), state.size() + 1u);
+    return NUKA_RESULT_OK;
 }
 
 }  // extern "C"

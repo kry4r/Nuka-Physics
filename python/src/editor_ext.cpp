@@ -65,6 +65,39 @@ public:
     void close() { nuka_editor_close(Editor()); }
     void console_append(const std::string& text) { nuka_editor_console_append(Editor(), text.c_str()); }
 
+    // Edits park the physics thread, whose script callbacks need the GIL.
+    bool edit(const std::string& txn_json) {
+        nuka_editor_handle editor = Editor();
+        nuka_result_t result = NUKA_RESULT_OK;
+        {
+            nb::gil_scoped_release release;
+            result = nuka_editor_apply_edit(editor, txn_json.c_str());
+        }
+        if (result == NUKA_RESULT_INVALID_ARG) return false;
+        Check(result, "nuka_editor_apply_edit");
+        return true;
+    }
+    bool history(bool redo) {
+        nuka_editor_handle editor = Editor();
+        nuka_result_t result = NUKA_RESULT_OK;
+        {
+            nb::gil_scoped_release release;
+            result = redo ? nuka_editor_redo(editor) : nuka_editor_undo(editor);
+        }
+        if (result == NUKA_RESULT_NOT_SUPPORTED) return false;
+        Check(result, redo ? "nuka_editor_redo" : "nuka_editor_undo");
+        return true;
+    }
+    std::string document() const {
+        nuka_editor_handle editor = Editor();
+        size_t length = 0u;
+        Check(nuka_editor_document_state(editor, nullptr, 0u, &length), "nuka_editor_document_state");
+        std::string text(length + 1u, '\0');
+        Check(nuka_editor_document_state(editor, text.data(), text.size(), &length), "nuka_editor_document_state");
+        text.resize(length);
+        return text;
+    }
+
     void destroy() {
         if (editor_ == nullptr) return;
         nuka_editor_handle editor = std::exchange(editor_, nullptr);
@@ -135,5 +168,10 @@ NB_MODULE(_editor_ext, m) {
         .def_prop_ro("dt", &App::dt)
         .def("close", &App::close, "Ask the editor to stop; running turns False.")
         .def("console_append", &App::console_append, nb::arg("text"))
+        .def("edit", &App::edit, nb::arg("txn_json"),
+             "Apply a JSON edit transaction through the document; False when an op failed.")
+        .def("undo", [](App& app) { return app.history(false); })
+        .def("redo", [](App& app) { return app.history(true); })
+        .def("document", &App::document, "The document state as JSON text.")
         .def("destroy", &App::destroy, "Close the window and destroy any world the editor created.");
 }

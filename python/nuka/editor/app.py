@@ -6,6 +6,7 @@ import atexit
 import builtins
 import contextlib
 import io
+import json
 import traceback
 import weakref
 from typing import Callable, List, Optional, Sequence
@@ -197,6 +198,23 @@ class EditorApp:
 
     def console(self, text: str) -> None:
         self._native.console_append(text)
+
+    def edit(self, *ops: dict, label: str = "Script edit") -> bool:
+        """Apply one undoable transaction of ``{"target", "field", "after"}`` ops (an optional
+        ``before`` overrides the recorded prior value). False when an op failed; see
+        ``document()["last_error"]``. Not from tick callbacks: an edit parks the physics thread."""
+        return self._native.edit(json.dumps({"label": label, "ops": list(ops)}))
+
+    def undo(self) -> bool:
+        return self._native.undo()
+
+    def redo(self) -> bool:
+        return self._native.redo()
+
+    def document(self) -> dict:
+        """Revision, dirty, hash, undo/redo depths, tick, generation, timeline branches, the
+        last parameter write's pushed and applied ticks, and last_error."""
+        return json.loads(self._native.document())
 
     def stop(self) -> None:
         """End ``run()`` after the current frame; safe inside scripts."""
