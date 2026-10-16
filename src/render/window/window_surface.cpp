@@ -12,6 +12,7 @@
 // ---------------------------------------------------------------------------
 
 #include "render/window/window_surface.hpp"
+#include "render/window/xcb_keyboard.h"
 
 #define VK_USE_PLATFORM_XCB_KHR
 #include <vulkan/vulkan.h>
@@ -20,6 +21,8 @@
 #include <xcb/xcb.h>
 
 #include <cstdlib>
+#include <cstdio>
+#include <utility>
 #include <cstring>
 
 namespace nuka::render::window {
@@ -124,11 +127,14 @@ public:
 
         xcb_map_window(connection_, window_);
         xcb_flush(connection_);
-        FetchKeyboardMapping();  // keycode->keysym table (core xcb, no xcb-keysyms dep)
+        FetchKeyboardMapping();
+        keyboard_ = NukaXcbKeyboardCreate(connection_);
+        if (!keyboard_) std::fprintf(stderr, "[nuka_window_xcb] XKB text input unavailable\n");
         valid_ = true;
     }
 
     ~XcbWindowSurface() override {
+        NukaXcbKeyboardDestroy(keyboard_);
         std::free(keymap_reply_);
         if (surface_ != VK_NULL_HANDLE && instance_ != VK_NULL_HANDLE) {
             vkDestroySurfaceKHR(instance_, surface_, nullptr);
@@ -160,8 +166,21 @@ public:
 
     void PollEvents(std::vector<WindowEvent>& out) override {
         if (!valid_) return;
-        xcb_generic_event_t* event = nullptr;
-        while ((event = xcb_poll_for_event(connection_)) != nullptr) {
+        xcb_generic_event_t* pending = nullptr;
+        while (true) {
+            xcb_generic_event_t* event = pending ? std::exchange(pending, nullptr) : xcb_poll_for_event(connection_);
+            if (!event) break;
+            if ((event->response_type & 0x7fu) == XCB_KEY_RELEASE) {
+                pending = xcb_poll_for_event(connection_);
+                if (NukaXcbAutoRepeatPair(event, pending)) {
+                    std::free(event);
+                    event = std::exchange(pending, nullptr);
+                }
+            }
+            if (NukaXcbKeyboardHandleEvent(keyboard_, event)) {
+                std::free(event);
+                continue;
+            }
             const uint8_t kind = static_cast<uint8_t>(event->response_type & ~0x80u);
             switch (kind) {
                 case XCB_CONFIGURE_NOTIFY: {
@@ -217,8 +236,24 @@ public:
                     WindowEvent ev;
                     ev.type = WindowEvent::Type::Key;
                     ev.key = kp->detail;  // RAW keycode (kept for any keycode-level consumer)
-                    ev.keysym = ResolveKeysym(kp->detail);  // keymap-independent (XK_*)
+                    ev.keysym = keyboard_ ? NukaXcbKeyboardKeysym(keyboard_, kp->detail)
+                                           : ResolveKeysym(kp->detail);
                     ev.pressed = (kind == XCB_KEY_PRESS);
+                    out.push_back(ev);
+                    if (ev.pressed) {
+                        const char* text = NukaXcbKeyboardText(keyboard_, kp->detail);
+                        if (text[0] != '\0') {
+                            WindowEvent input;
+                            input.type = WindowEvent::Type::TextInput;
+                            input.text = text;
+                            out.push_back(std::move(input));
+                        }
+                    }
+                    break;
+                }
+                case XCB_FOCUS_IN: {
+                    WindowEvent ev;
+                    ev.type = WindowEvent::Type::FocusGained;
                     out.push_back(ev);
                     break;
                 }
@@ -227,6 +262,7 @@ public:
                     // consumers reset latched modifier / drag state on this.
                     WindowEvent ev;
                     ev.type = WindowEvent::Type::FocusLost;
+                    NukaXcbKeyboardResetText(keyboard_);
                     out.push_back(ev);
                     break;
                 }
@@ -295,6 +331,7 @@ private:
         return static_cast<uint32_t>(keymap_keysyms_[index]);
     }
 
+    NukaXcbKeyboard* keyboard_ = nullptr;
     xcb_connection_t* connection_ = nullptr;
     xcb_screen_t*     screen_     = nullptr;
     xcb_window_t      window_     = 0;
