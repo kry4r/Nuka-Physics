@@ -6,8 +6,6 @@
 
 #include "runtime/app/viewer/editor_edits.hpp"
 
-#include "nk/model/model.hpp"
-#include "nk/pipeline/world.hpp"
 #include "runtime/app/command_queue.hpp"
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_ir.hpp"
@@ -20,10 +18,6 @@ namespace nuka::runtime::app::viewer {
 namespace {
 
 namespace render = nuka::render;
-
-// The cooked Model's FloatingBase joint type value (mirror of systems.cpp's
-// constant; the canonical enum header pulls in CUDA, off-limits here).
-constexpr uint8_t kFloatingBaseJointType = 3u;
 
 // The authored local transform on an entity (identity for a group / transform-less
 // node so the chain walk treats it as a passthrough frame).
@@ -77,13 +71,7 @@ MaterialBinding ResolveMaterial(const EditorScene& es, const EntityRecordIndex& 
 }
 
 bool IsMovableInstance(const render::RenderInstance& inst, const EditorScene& es) {
-    using K = render::PoseSource::Kind;
-    if (inst.pose_source.kind == K::Body || inst.pose_source.kind == K::Base) return true;
-    if (inst.pose_source.kind != K::Link) return false;
-    const nk::ModelArticulation& art = es.world->GetModel().articulation;
-    const uint32_t root = (art.root_link != ~uint32_t(0)) ? art.root_link : 0u;
-    return inst.pose_source.row == root && root < art.joint_type.size() &&
-           art.joint_type[root] == kFloatingBaseJointType;
+    return IsMovableSource(inst.pose_source, es.Layout());
 }
 
 math::Transform AuthoredWorldTransform(const scene::SceneIR& scene, scene::EntityId entity) {

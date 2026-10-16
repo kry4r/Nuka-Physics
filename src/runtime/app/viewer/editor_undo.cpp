@@ -105,14 +105,13 @@ EditOp MakeMaterialOp(EditorScene* es, std::string path,
 }
 
 EditOp MakeStructuralOp(EditorScene* es, EntityRecordIndex* idx,
-                        nuka::phi::Device* device, nuka::phi::Backend* backend,
-                        float dt, scene::SceneIR before, scene::SceneIR after) {
-    // Restore a snapshot into the authority + re-cook + rebuild the record index.
-    // A failed re-cook keeps the OLD world, so the authority rolls back with it.
-    auto restore = [es, idx, device, backend, dt](const scene::SceneIR& snap) {
+                        SceneCache* cache, scene::SceneIR before, scene::SceneIR after) {
+    // Restore a snapshot into the authority + rebuild + rebuild the record index.
+    // A refused rebuild keeps the OLD world, so the authority rolls back with it.
+    auto restore = [es, idx, cache](const scene::SceneIR& snap) {
         scene::SceneIR prior = es->scene;
         es->scene = snap;
-        if (!RecookEditorScene(*es, device, backend, dt)) {
+        if (!RecookEditorScene(*es, *cache)) {
             es->scene = std::move(prior);
             std::fprintf(stderr,
                          "[nuka_editor] undo/redo re-cook failed; edit left in place\n");

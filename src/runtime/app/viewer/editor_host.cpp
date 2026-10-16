@@ -1,0 +1,1517 @@
+#include "runtime/app/viewer/editor_host.hpp"
+
+#include <vulkan/vulkan.h>
+
+#include "imgui.h"
+// The SDL3 platform backend feeds ImGui input, IME and cursors; imgui_impl_vulkan draws.
+#include "backends/imgui_impl_sdl3.h"
+
+#include "nuka/nuka_scene.h"
+#include "render/imgui/nuka_imgui.hpp"
+#include "render/raster/vulkan_present_renderer.hpp"
+#include "render/render_world.hpp"
+#include "render/viewer_resources.hpp"
+#include "render/window/window_surface.hpp"
+#include "runtime/app/command_queue.hpp"
+#include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/debug_overlay.hpp"
+#include "runtime/app/viewer/editor_edits.hpp"
+#include "runtime/app/viewer/editor_scene.hpp"
+#include "runtime/app/viewer/editor_undo.hpp"
+#include "runtime/app/viewer/entity_drag.hpp"
+#include "runtime/app/viewer/imgui_layer.hpp"
+#include "runtime/app/viewer/script_host.hpp"
+#include "runtime/app/viewer/teleop.hpp"
+#include "runtime/inference/go2_policy_controller.hpp"
+#include "scene/format/nks.hpp"
+#include "scene/scene_ir.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace nuka::runtime::app::viewer {
+namespace {
+
+namespace window = nuka::render::window;
+using Clock = std::chrono::steady_clock;
+
+constexpr float kDefaultDt = 1.0f / 240.0f;
+// A long frame consumes at most this many fixed-dt steps and drops the backlog.
+constexpr uint32_t kMaxStepsPerFrame = 64u;
+// Frame intervals clamp to this so a hitch (load, resize, debugger) never jumps time.
+constexpr double kMaxFrameDt = 0.25;
+constexpr size_t kConsoleLogCap = 256u * 1024u;
+// A spawned primitive starts this far above its reference so a free body drops in.
+constexpr float kSpawnDropHeight = 0.75f;
+constexpr uint64_t kFpsWarmup = 30u;
+// A pace ceiling against busy-spinning; FIFO present caps at the display refresh.
+constexpr double kFrameBudgetSeconds = 1.0 / 240.0;
+constexpr float kPi = 3.14159265358979323846f;
+
+struct LaunchOptions {
+    std::string scene_path;
+    bool empty_requested = false;
+    bool offscreen = false;
+    int max_frames = 0;  // 0 runs until the window closes
+    float dt = kDefaultDt;
+    bool dt_set = false;
+    int capture_frame = -1;
+    std::string capture_out = "nuka_present_capture.ppm";
+    std::string policy_path;
+    bool want_play = false;
+    bool want_planned = false;
+    bool force_host_policy = false;
+    bool cam_on = false;
+    math::Vec3 cam_target{};
+    float cam_dist = 0.0f, cam_yaw = 0.0f, cam_pitch = 0.0f;
+    std::string select_path;
+    bool edit_color_on = false;
+    float edit_color[3] = {0.0f, 0.0f, 0.0f};
+    bool edit_move_on = false;
+    float edit_move[3] = {0.0f, 0.0f, 0.0f};
+    std::string save_to;
+    std::string gizmo_op;
+    bool gizmo_local = false;
+    std::string run_script_path;
+    std::string rename_to;
+    bool add_box_on = false;
+    std::string spawn_kind;
+    bool delete_on = false;
+    std::string reparent_to;
+    bool undo = false;
+    bool redo = false;
+    int reset_at_frame = -1;
+    bool show_colliders = false;
+    bool show_contacts = false;
+    bool teleop_nudge_on = false;
+    int teleop_nudge_dof = 0;
+    float teleop_nudge_delta = 0.0f;
+    bool teleop_cmd_on = false;
+    float teleop_cmd[3] = {0.0f, 0.0f, 0.0f};
+};
+
+bool ParsePrimitiveKind(const std::string& s, PrimitiveKind* out) {
+    if (s == "box")     { *out = PrimitiveKind::Box;     return true; }
+    if (s == "sphere")  { *out = PrimitiveKind::Sphere;  return true; }
+    if (s == "capsule") { *out = PrimitiveKind::Capsule; return true; }
+    if (s == "plane")   { *out = PrimitiveKind::Plane;   return true; }
+    return false;
+}
+
+bool ReadEntireFile(const std::string& path, std::string* out) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (n < 0) { std::fclose(f); return false; }
+    std::string buf(static_cast<size_t>(n), '\0');
+    const size_t rd = (n > 0) ? std::fread(&buf[0], 1, static_cast<size_t>(n), f) : 0u;
+    std::fclose(f);
+    buf.resize(rd);
+    *out = std::move(buf);
+    return true;
+}
+
+void PrintUsage() {
+    std::printf("usage: nuka-editor [scene.nks] [--policy <bin>] [--play] [--frames N] [--dt SECONDS]\n"
+                "  [--offscreen] [--cam tx,ty,tz,dist,yaw_deg,pitch_deg]\n"
+                "  [--capture-frame N --capture-out FILE.ppm]\n"
+                "  [--run-script FILE.py runs a script once against the loaded scene]\n"
+                "  [--undo / --redo fire one undo/redo after a headless load edit]\n"
+                "  [--spawn box|sphere|capsule|plane spawns a primitive body after load]\n"
+                "  [--reset-at N fires transport Reset (re-seed physics) at frame N]\n"
+                "  [--show-colliders / --show-contacts enable the read-only debug overlays]\n"
+                "  [--teleop-nudge DOF,DELTA PD-holds the robot + nudges one drive target]\n"
+                "  [--teleop-cmd VX,VY,WYAW feeds a command to a command-consuming controller]\n"
+                "  default -> Nuka Dynamics Lab; --empty opens a blank workspace\n"
+                "  --offscreen renders to a display-less surface\n"
+                "  --policy attaches a trained locomotion controller to each load\n"
+                "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
+                "  --cam overrides the auto-frame (default: fit the moving-instance cluster)\n");
+}
+
+// False after printing the usage for --help.
+bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        const bool has_value = i + 1 < args.size();
+        if (a == "--scene" && has_value) opt->scene_path = args[++i];
+        else if (a == "--empty") opt->empty_requested = true;
+        else if (a == "--offscreen") opt->offscreen = true;
+        else if (a == "--frames" && has_value) opt->max_frames = std::atoi(args[++i].c_str());
+        else if (a == "--dt" && has_value) {
+            opt->dt = static_cast<float>(std::atof(args[++i].c_str()));
+            opt->dt_set = true;
+        }
+        else if (a == "--capture-frame" && has_value) opt->capture_frame = std::atoi(args[++i].c_str());
+        else if (a == "--capture-out" && has_value) opt->capture_out = args[++i];
+        else if (a == "--policy" && has_value) opt->policy_path = args[++i];
+        else if (a == "--play") opt->want_play = true;
+        else if (a == "--planned") opt->want_planned = true;
+        else if (a == "--host-policy") opt->force_host_policy = true;
+        else if (a == "--cam" && has_value) {
+            float yaw_deg = 0.0f, pitch_deg = 0.0f;
+            if (std::sscanf(args[++i].c_str(), "%f,%f,%f,%f,%f,%f", &opt->cam_target.x,
+                            &opt->cam_target.y, &opt->cam_target.z, &opt->cam_dist, &yaw_deg,
+                            &pitch_deg) == 6) {
+                opt->cam_yaw = yaw_deg * kPi / 180.0f;
+                opt->cam_pitch = pitch_deg * kPi / 180.0f;
+                opt->cam_on = true;
+            } else {
+                std::fprintf(stderr, "[nuka_editor] --cam wants tx,ty,tz,dist,yaw_deg,pitch_deg\n");
+            }
+        }
+        else if (a == "--select" && has_value) opt->select_path = args[++i];
+        else if (a == "--edit-color" && has_value) {
+            opt->edit_color_on = std::sscanf(args[++i].c_str(), "%f,%f,%f", &opt->edit_color[0],
+                                             &opt->edit_color[1], &opt->edit_color[2]) == 3;
+        }
+        else if (a == "--edit-move" && has_value) {
+            opt->edit_move_on = std::sscanf(args[++i].c_str(), "%f,%f,%f", &opt->edit_move[0],
+                                            &opt->edit_move[1], &opt->edit_move[2]) == 3;
+        }
+        else if (a == "--save-to" && has_value) opt->save_to = args[++i];
+        else if (a == "--gizmo-op" && has_value) opt->gizmo_op = args[++i];
+        else if (a == "--gizmo-local") opt->gizmo_local = true;
+        else if (a == "--run-script" && has_value) opt->run_script_path = args[++i];
+        else if (a == "--rename" && has_value) opt->rename_to = args[++i];
+        else if (a == "--add-box") opt->add_box_on = true;
+        else if (a == "--spawn" && has_value) opt->spawn_kind = args[++i];
+        else if (a == "--delete") opt->delete_on = true;
+        else if (a == "--reparent" && has_value) opt->reparent_to = args[++i];
+        else if (a == "--undo") opt->undo = true;
+        else if (a == "--redo") opt->redo = true;
+        else if (a == "--reset-at" && has_value) opt->reset_at_frame = std::atoi(args[++i].c_str());
+        else if (a == "--show-colliders") opt->show_colliders = true;
+        else if (a == "--show-contacts") opt->show_contacts = true;
+        else if (a == "--teleop-nudge" && has_value) {
+            opt->teleop_nudge_on = std::sscanf(args[++i].c_str(), "%d,%f", &opt->teleop_nudge_dof,
+                                               &opt->teleop_nudge_delta) == 2;
+            if (!opt->teleop_nudge_on) std::fprintf(stderr, "[nuka_editor] --teleop-nudge wants DOF,DELTA\n");
+        }
+        else if (a == "--teleop-cmd" && has_value) {
+            opt->teleop_cmd_on = std::sscanf(args[++i].c_str(), "%f,%f,%f", &opt->teleop_cmd[0],
+                                             &opt->teleop_cmd[1], &opt->teleop_cmd[2]) == 3;
+            if (!opt->teleop_cmd_on) std::fprintf(stderr, "[nuka_editor] --teleop-cmd wants VX,VY,WYAW\n");
+        }
+        else if (a == "--help") {
+            PrintUsage();
+            return false;
+        }
+        else if (a.rfind("--", 0) != 0) opt->scene_path = a;
+    }
+    return true;
+}
+
+void ClearModelUi(ViewerUiState& ui) {
+    ui.drive_targets.clear();
+    ui.drive_dirty.clear();
+    ui.dof_labels.clear();
+    ui.selected_entity = scene::kInvalidEntity;
+    ui.playing = false;
+}
+
+// The world AABB of the rendered instances; with `movable_only`, of the physics-driven
+// cluster when one exists, so robots on a large terrain fill the view.
+void SceneAabb(const render::RenderWorld& world, bool movable_only, math::Vec3* lo, math::Vec3* hi) {
+    bool has_movable = false;
+    if (movable_only) {
+        for (const render::RenderInstance& inst : world.instances) {
+            if (inst.pose_source.kind != render::PoseSource::Kind::Static) {
+                has_movable = true;
+                break;
+            }
+        }
+    }
+    const bool restrict_movable = movable_only && has_movable;
+    const float fmax = std::numeric_limits<float>::max();
+    *lo = {fmax, fmax, fmax};
+    *hi = {-fmax, -fmax, -fmax};
+    bool any = false;
+    for (const render::RenderInstance& inst : world.instances) {
+        if (inst.mesh_id == render::kNoId || inst.mesh_id >= world.meshes.Count()) continue;
+        if (restrict_movable && inst.pose_source.kind == render::PoseSource::Kind::Static) continue;
+        const render::MeshGeometry& geo = world.meshes.Geometry(inst.mesh_id);
+        for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
+            const math::Vec3 local{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]};
+            const math::Vec3 wp = inst.world_xform.TransformPoint(local);
+            lo->x = std::min(lo->x, wp.x); lo->y = std::min(lo->y, wp.y); lo->z = std::min(lo->z, wp.z);
+            hi->x = std::max(hi->x, wp.x); hi->y = std::max(hi->y, wp.y); hi->z = std::max(hi->z, wp.z);
+            any = true;
+        }
+    }
+    if (!any) { *lo = {-1.0f, -1.0f, 0.0f}; *hi = {1.0f, 1.0f, 1.0f}; }
+}
+
+// World AABB of one instance; empty (lo > hi) without geometry.
+void InstanceAabb(const render::RenderInstance& inst, const render::RenderWorld& w,
+                  math::Vec3* lo, math::Vec3* hi) {
+    const float fmax = std::numeric_limits<float>::max();
+    *lo = {fmax, fmax, fmax};
+    *hi = {-fmax, -fmax, -fmax};
+    if (inst.mesh_id == render::kNoId || inst.mesh_id >= w.meshes.Count()) return;
+    const render::MeshGeometry& geo = w.meshes.Geometry(inst.mesh_id);
+    for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
+        const math::Vec3 local{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]};
+        const math::Vec3 p = inst.world_xform.TransformPoint(local);
+        lo->x = std::min(lo->x, p.x); lo->y = std::min(lo->y, p.y); lo->z = std::min(lo->z, p.z);
+        hi->x = std::max(hi->x, p.x); hi->y = std::max(hi->y, p.y); hi->z = std::max(hi->z, p.z);
+    }
+}
+
+// Slab test; the near hit distance t >= 0 lands in *t_out.
+bool RayAabb(const Ray& ray, const math::Vec3& lo, const math::Vec3& hi, float* t_out) {
+    float tmin = 0.0f;
+    float tmax = std::numeric_limits<float>::max();
+    const float o[3] = {ray.origin.x, ray.origin.y, ray.origin.z};
+    const float d[3] = {ray.dir.x, ray.dir.y, ray.dir.z};
+    const float lo3[3] = {lo.x, lo.y, lo.z};
+    const float hi3[3] = {hi.x, hi.y, hi.z};
+    for (int a = 0; a < 3; ++a) {
+        if (std::fabs(d[a]) < 1e-8f) {
+            if (o[a] < lo3[a] || o[a] > hi3[a]) return false;
+        } else {
+            const float inv = 1.0f / d[a];
+            float t1 = (lo3[a] - o[a]) * inv;
+            float t2 = (hi3[a] - o[a]) * inv;
+            if (t1 > t2) std::swap(t1, t2);
+            tmin = std::max(tmin, t1);
+            tmax = std::min(tmax, t2);
+            if (tmin > tmax) return false;
+        }
+    }
+    *t_out = tmin;
+    return true;
+}
+
+// The nearest movable instance (free body or floating root link) the ray hits, or ~0u.
+uint32_t PickInstance(const Ray& ray, const render::RenderWorld& w, const WorldLayout& layout) {
+    uint32_t best = ~0u;
+    float best_t = std::numeric_limits<float>::max();
+    for (uint32_t i = 0; i < w.InstanceCount(); ++i) {
+        const render::RenderInstance& inst = w.instances[i];
+        if (!IsMovableSource(inst.pose_source, layout)) continue;
+        math::Vec3 lo, hi;
+        InstanceAabb(inst, w, &lo, &hi);
+        if (lo.x > hi.x) continue;
+        float t = 0.0f;
+        if (RayAabb(ray, lo, hi, &t) && t < best_t) { best_t = t; best = i; }
+    }
+    return best;
+}
+
+scene::EntityId EntityOfPath(const EditorScene& es, const std::string& path) {
+    scene::EntityId found = scene::kInvalidEntity;
+    const scene::SceneGraph& tree = es.scene.Tree();
+    tree.Traverse(tree.Root(), [&](const std::shared_ptr<scene::SceneNode>& n) {
+        if (found == scene::kInvalidEntity && tree.PathOf(n) == path) found = n->entity;
+    });
+    return found;
+}
+
+}  // namespace
+
+struct EditorHost::State {
+    State(const std::vector<std::string>& args, nuka_world_handle world, float dt);
+    ~State();
+
+    void Frame(bool step_physics);
+    void ConsoleAppend(const std::string& s);
+    void SetHooks(const nuka_editor_script_hooks_t& hooks);
+
+    void FrameWorld(const render::RenderWorld& rw);
+    std::string PathOfEntity(scene::EntityId e) const;
+    uint64_t Generation() const;
+    void SyncScripts();
+    void SeedDriveTargets();
+    void PublishOnly();
+    void SetLoadError(const std::string& path);
+    void CreateWorld(const std::string& path);
+    void ApplyLoad(const std::string& path);
+    void Attach(const std::string& path);
+    void OnLoaded(const std::string& path);
+    void OnRebound();
+    void AttachController();
+    void ApplyUnload();
+    void ApplyTreeEdits();
+    void SeedInspector(scene::EntityId e);
+    void ApplyInspectorEdits();
+    void PostEditResync(uint64_t generation_before);
+
+    LaunchOptions opt_;
+    nuka_world_handle world_ = nullptr;
+    nuka_device_handle device_ = nullptr;  // set when the editor created the world
+    SceneCache cache_;
+    render::RenderWorld empty_world_;
+    std::unique_ptr<inference::Go2PolicyController> policy_ctrl_;
+    std::unique_ptr<EditorScene> loaded_;
+    bool attach_pending_ = false;
+    EntityDrag entity_drag_;
+    EntityRecordIndex record_index_;
+    scene::EntityId last_seeded_ = scene::kInvalidEntity;
+
+    // A drag records one op: BEFORE at the gesture start, AFTER at its commit.
+    EditStack edit_stack_;
+    bool xform_gesture_active_ = false;
+    bool xform_dirty_ = false;
+    std::string xform_gesture_path_;
+    math::Transform xform_before_;
+    math::Transform xform_after_;
+    bool mat_gesture_active_ = false;
+    std::string mat_gesture_path_;
+    scene::RenderMaterial mat_before_{};
+    bool gizmo_using_prev_ = false;
+
+    void* native_window_ = nullptr;
+    std::unique_ptr<render::PresentRenderer> present_;
+    render::imgui::NukaImGuiContext imgui_;
+    ImGuiLayer ui_;
+    CameraController camera_;
+    ViewerUiState ui_state_;
+    DebugOverlay debug_overlay_;
+    ScriptHost script_host_;
+    bool frame_pending_ = false;
+    render::SceneViewport last_framing_rect_;
+    std::map<uint64_t, std::string> live_scripts_;  // id -> source last registered
+
+    Clock::time_point prev_ = Clock::now();
+    double fps_ema_ = 0.0;
+    uint64_t frame_index_ = 0;
+    int presented_ = 0;
+    bool last_step_healthy_ = true;
+    double ft_sum_ = 0.0, ft_min_ = 1e30, ft_max_ = 0.0, st_sum_ = 0.0;
+    uint64_t ft_n_ = 0;
+    bool ctrl_down_ = false;
+    bool surface_suspended_ = false;
+    bool teleop_hold_prev_ = false;
+    bool teleop_prev_enabled_ = false;
+    float last_mouse_x_ = 0.0f;
+    float last_mouse_y_ = 0.0f;
+    double sim_accum_ = 0.0;  // simulated-time debt of the speed transport
+    bool script_ran_ = false;
+    std::vector<window::WindowEvent> events_;
+    bool running_ = true;
+};
+
+EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle world, float dt)
+    : world_(world) {
+    if (dt > 0.0f) {
+        opt_.dt = dt;
+        opt_.dt_set = true;
+    }
+    if (!ParseOptions(args, &opt_)) {
+        running_ = false;
+        return;
+    }
+    if (opt_.scene_path.empty() && !opt_.empty_requested && world_ == nullptr)
+        opt_.scene_path = render::ViewerResource("examples/assets/nuka_lab/gripper.nks", NUKA_VIEWER_DEFAULT_SCENE);
+    if (const char* env = std::getenv("NUKA_VIEWER_FRAMES")) opt_.max_frames = std::atoi(env);
+    // The trained control rate is 0.005 s; an explicit dt always wins.
+    if (!opt_.dt_set && !opt_.policy_path.empty()) opt_.dt = 0.005f;
+    if (!(opt_.dt > 0.0f)) throw std::runtime_error("invalid --dt (must be > 0)");
+
+    window::SurfaceBackendKind kind = window::SurfaceBackendKind::Headless;
+    std::unique_ptr<window::WindowSurface> surface =
+        opt_.offscreen ? window::MakeHeadlessSurface(1280u, 720u)
+                       : window::MakeSurface("Nuka Editor", 1280u, 720u, &kind);
+    if (!surface || kind == window::SurfaceBackendKind::None)
+        throw std::runtime_error("no window surface: no SDL video driver and no VK_EXT_headless_surface");
+
+    // Bind the native window and route its events to ImGui before the renderer takes the surface.
+    native_window_ = surface->NativeWindowHandle();
+    surface->SetNativeEventHook([](const void* event) {
+        if (ImGui::GetCurrentContext() != nullptr) ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event*>(event));
+    });
+    present_ = std::make_unique<render::PresentRenderer>(std::move(surface));
+    if (opt_.capture_frame >= 0) present_->SetCaptureFrame(opt_.capture_frame, opt_.capture_out);
+
+    render::RendererVulkanHandles vk = present_->VulkanHandles();
+    render::imgui::NukaImGuiInitInfo info;
+    info.api_version     = vk.api_version;
+    info.instance        = reinterpret_cast<NukaVkInstance>(vk.instance);
+    info.physical_device = reinterpret_cast<NukaVkPhysicalDevice>(vk.physical_device);
+    info.device          = reinterpret_cast<NukaVkDevice>(vk.device);
+    info.queue_family    = vk.graphics_family;
+    info.queue           = reinterpret_cast<NukaVkQueue>(vk.graphics_queue);
+    info.descriptor_pool = reinterpret_cast<NukaVkDescriptorPool>(vk.imgui_descriptor_pool);
+    info.min_image_count = present_->MinImageCount();
+    info.image_count     = present_->SwapchainImageCount();
+    info.render_pass     = reinterpret_cast<NukaVkRenderPass>(present_->PresentRenderPass());
+    info.subpass         = 0u;
+    if (!imgui_.Init(info)) throw std::runtime_error("ImGui init failed");
+    if (native_window_ != nullptr) ImGui_ImplSDL3_InitForVulkan(static_cast<SDL_Window*>(native_window_));
+
+    ui_.EnableDocking();  // must precede the first NewFrame
+    ui_state_.show_colliders = opt_.show_colliders;
+    ui_state_.show_contacts = opt_.show_contacts;
+    camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
+
+    // Loads run inside a frame, once the shell is up and the host installed its hooks.
+    if (!opt_.scene_path.empty()) ui_state_.load_request = opt_.scene_path;
+    else attach_pending_ = world_ != nullptr;
+    std::printf("[nuka_editor] backend=%s device=%s images=%u\n",
+                present_->Report().backend_name.c_str(), present_->DeviceName().c_str(),
+                present_->SwapchainImageCount());
+}
+
+EditorHost::State::~State() {
+    if (present_) {
+        present_->WaitIdle();
+        if (native_window_ != nullptr) ImGui_ImplSDL3_Shutdown();
+        imgui_.Shutdown();
+        std::printf("[nuka_editor] done: frames=%llu presented=%d last_step_healthy=%s\n",
+                    static_cast<unsigned long long>(frame_index_), presented_,
+                    last_step_healthy_ ? "yes" : "no");
+        if (ft_n_ > 0) {
+            const double mean_fms = ft_sum_ / static_cast<double>(ft_n_);
+            const double mean_sms = st_sum_ / static_cast<double>(ft_n_);
+            std::printf("[fps] SUMMARY measured=%llu mean_fps=%.1f mean_frame_ms=%.2f "
+                        "(min=%.2f max=%.2f) mean_step_ms=%.2f\n",
+                        static_cast<unsigned long long>(ft_n_), 1000.0 / mean_fms, mean_fms,
+                        ft_min_, ft_max_, mean_sms);
+        }
+        std::fflush(stdout);
+    }
+    loaded_.reset();
+    policy_ctrl_.reset();
+    if (device_ != nullptr) {
+        nuka_world_destroy(world_);
+        nuka_device_destroy(device_);
+    }
+    cache_.Remove();
+}
+
+void EditorHost::State::ConsoleAppend(const std::string& s) {
+    if (s.empty()) return;
+    ui_state_.console_log += s;
+    if (ui_state_.console_log.size() > kConsoleLogCap)
+        ui_state_.console_log.erase(0, ui_state_.console_log.size() - kConsoleLogCap);
+}
+
+void EditorHost::State::SetHooks(const nuka_editor_script_hooks_t& hooks) {
+    script_host_.SetHooks(hooks);
+    live_scripts_.clear();
+    SyncScripts();
+}
+
+void EditorHost::State::FrameWorld(const render::RenderWorld& rw) {
+    if (opt_.cam_on) {
+        camera_.SetView(opt_.cam_target, opt_.cam_dist, opt_.cam_yaw, opt_.cam_pitch);
+        return;
+    }
+    const auto& report = present_->Report();
+    const float reference = report.height ? static_cast<float>(report.width) / static_cast<float>(report.height) : 1.0f;
+    if (camera_.UseSceneCamera(rw, ui_.Viewport().Aspect(), reference)) return;
+    math::Vec3 lo, hi;
+    SceneAabb(rw, /*movable_only=*/true, &lo, &hi);
+    camera_.FrameAabb(lo, hi, ui_.Viewport().Aspect());
+}
+
+std::string EditorHost::State::PathOfEntity(scene::EntityId e) const {
+    if (!loaded_ || e == scene::kInvalidEntity) return std::string();
+    if (const auto n = loaded_->scene.Ecs().NodeOf(e)) return loaded_->scene.Tree().PathOf(n);
+    return std::string();
+}
+
+uint64_t EditorHost::State::Generation() const {
+    uint64_t generation = 0u;
+    nuka_world_get_generation(world_, &generation);
+    return generation;
+}
+
+// Diffs the scene's /script records against the registered set, so attach, delete
+// and undo keep the host in step.
+void EditorHost::State::SyncScripts() {
+    std::map<uint64_t, std::string> want;
+    if (loaded_)
+        for (const auto& sr : loaded_->scene.Scripts()) want[sr.stable_id] = sr.source;
+    for (auto it = live_scripts_.begin(); it != live_scripts_.end();) {
+        if (want.count(it->first) == 0u) {
+            script_host_.UnregisterScript(it->first);
+            it = live_scripts_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    bool registered = false;
+    for (const auto& entry : want) {
+        const auto it = live_scripts_.find(entry.first);
+        if (it != live_scripts_.end() && it->second == entry.second) continue;
+        // Re-registering replaces the old namespace, so a replaced on_step stops.
+        ConsoleAppend(script_host_.RegisterScript(entry.first, entry.second));
+        live_scripts_[entry.first] = entry.second;
+        registered = true;
+    }
+    if (registered) ConsoleAppend(script_host_.DispatchReady());
+    ui_state_.script_node_count = loaded_ ? static_cast<int>(loaded_->scene.ScriptCount()) : 0;
+}
+
+// The per-DOF drive editor starts from environment 0's live targets.
+void EditorHost::State::SeedDriveTargets() {
+    ui_state_.drive_targets.clear();
+    ui_state_.drive_dirty.clear();
+    ui_state_.dof_labels.clear();
+    const uint32_t links = loaded_->Layout().links_per_env;
+    if (links == 0u) return;
+    ui_state_.drive_targets.assign(links, 0.0f);
+    ui_state_.drive_dirty.assign(links, 0u);
+    nuka_world_download_field(world_, NUKA_FIELD_DRIVE_TARGET, ui_state_.drive_targets.data(),
+                              links * sizeof(float), 0u);
+}
+
+void EditorHost::State::PublishOnly() {
+    InputIntents intents;
+    loaded_->sim->FramePublish(&intents, 0u);
+}
+
+void EditorHost::State::SetLoadError(const std::string& path) {
+    ui_state_.load_error = "Could not load scene: " + path + ". Check the application log for details.";
+    std::snprintf(ui_state_.load_path, sizeof(ui_state_.load_path), "%s", path.c_str());
+}
+
+void EditorHost::State::CreateWorld(const std::string& path) {
+    if (device_ == nullptr) {
+        nuka_device_desc_t device_desc{};
+        CheckResult(nuka_device_create(&device_desc, &device_), "nuka_device_create");
+    }
+    nuka_scene_handle scene = nullptr;
+    CheckResult(nuka_scene_load(path.c_str(), &scene), "nuka_scene_load");
+    nuka_world_desc_t desc{};
+    desc.env_count = 1u;
+    desc.fixed_dt = opt_.dt;
+    nuka_world_handle created = nullptr;
+    const nuka_result_t result = nuka_world_create_from_built_scene(device_, &desc, scene, nullptr, &created);
+    nuka_scene_destroy(scene);
+    CheckResult(result, "nuka_world_create_from_built_scene");
+    world_ = created;
+    if (opt_.want_planned)
+        CheckResult(nuka_world_set_execution_mode(world_, NUKA_EXECUTION_GRAPH), "nuka_world_set_execution_mode");
+}
+
+// Loads replace the world's scene in place, so the handle a host holds stays valid.
+void EditorHost::State::ApplyLoad(const std::string& path) {
+    present_->WaitIdle();
+    try {
+        if (world_ == nullptr) CreateWorld(path);
+        else CheckResult(nuka_world_rebuild_from_scene(world_, path.c_str(), NUKA_REBUILD_INITIAL_STATE),
+                         "nuka_world_rebuild_from_scene");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[nuka_editor] load failed: %s\n", e.what());
+        SetLoadError(path);
+        return;
+    }
+    ApplyUnload();
+    Attach(path);
+}
+
+void EditorHost::State::Attach(const std::string& path) {
+    try {
+        loaded_ = AttachEditorScene(world_, path, cache_);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[nuka_editor] attach failed: %s\n", e.what());
+        SetLoadError(path);
+        return;
+    }
+    OnLoaded(path);
+}
+
+void EditorHost::State::OnLoaded(const std::string& path) {
+    ui_state_.load_error.clear();
+    frame_pending_ = true;
+    entity_drag_.Cancel();
+    debug_overlay_.Reset();
+    PublishOnly();  // poses before framing
+    FrameWorld(loaded_->sim->GetRenderWorld());
+    SeedDriveTargets();
+    record_index_.Build(loaded_->scene);
+    script_host_.ClearScripts();
+    live_scripts_.clear();
+    SyncScripts();
+    ui_state_.inspector = InspectorState{};
+    last_seeded_ = scene::kInvalidEntity;
+    edit_stack_.Clear();  // no undo across loads
+    xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
+    std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", path.c_str());
+    ui_state_.save_dirty = false;
+    ui_state_.selected_entity = scene::kInvalidEntity;
+
+    // Headless aids: pre-select a node and apply sample edits through the edit seam.
+    if (!opt_.select_path.empty()) {
+        const scene::EntityId e = EntityOfPath(*loaded_, opt_.select_path);
+        if (e != scene::kInvalidEntity) ui_state_.selected_entity = e;
+        else std::fprintf(stderr, "[nuka_editor] --select: no node at '%s'\n", opt_.select_path.c_str());
+    }
+    if (opt_.edit_color_on && ui_state_.selected_entity != scene::kInvalidEntity) {
+        const MaterialBinding mb = ResolveMaterial(*loaded_, record_index_, ui_state_.selected_entity);
+        if (mb.valid) {
+            const scene::RenderMaterial before = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
+            scene::RenderMaterial m = before;
+            m.base_color[0] = opt_.edit_color[0];
+            m.base_color[1] = opt_.edit_color[1];
+            m.base_color[2] = opt_.edit_color[2];
+            ApplyMaterialEdit(*loaded_, mb, m, /*commit=*/true);
+            edit_stack_.Record(MakeMaterialOp(loaded_.get(), PathOfEntity(ui_state_.selected_entity), before, m));
+            ui_state_.save_dirty = true;
+        }
+    }
+    if (opt_.edit_move_on && ui_state_.selected_entity != scene::kInvalidEntity) {
+        if (const render::RenderInstance* inst =
+                InstanceOfEntity(loaded_->sim->GetRenderWorld(), ui_state_.selected_entity)) {
+            const math::Transform before = inst->world_xform;
+            math::Transform moved = before;
+            moved.position.x += opt_.edit_move[0];
+            moved.position.y += opt_.edit_move[1];
+            moved.position.z += opt_.edit_move[2];
+            ApplyTransformEdit(*loaded_, record_index_, ui_state_.selected_entity, moved, /*commit=*/true);
+            edit_stack_.Record(MakeTransformOp(loaded_.get(), PathOfEntity(ui_state_.selected_entity), before, moved));
+            ui_state_.save_dirty = true;
+        }
+    }
+    if (opt_.gizmo_op == "rotate") ui_state_.gizmo.op = GizmoState::Op::Rotate;
+    else if (opt_.gizmo_op == "move") ui_state_.gizmo.op = GizmoState::Op::Translate;
+    ui_state_.gizmo.local = opt_.gizmo_local;
+    // Tree edits queue on the selection; ApplyTreeEdits runs them at the next frame top.
+    if (!opt_.rename_to.empty()) {
+        std::snprintf(ui_state_.rename_buf, sizeof(ui_state_.rename_buf), "%s", opt_.rename_to.c_str());
+        ui_state_.rename_request = true;
+    }
+    if (opt_.add_box_on) {
+        ui_state_.spawn_request = true;
+        ui_state_.spawn_kind = PrimitiveKind::Box;
+    }
+    if (!opt_.spawn_kind.empty()) {
+        PrimitiveKind k;
+        if (ParsePrimitiveKind(opt_.spawn_kind, &k)) {
+            ui_state_.spawn_request = true;
+            ui_state_.spawn_kind = k;
+        } else {
+            std::fprintf(stderr, "[nuka_editor] --spawn: unknown kind '%s' (box|sphere|capsule|plane)\n",
+                         opt_.spawn_kind.c_str());
+        }
+    }
+    if (opt_.delete_on) ui_state_.delete_request = true;
+    if (!opt_.reparent_to.empty() && ui_state_.selected_entity != scene::kInvalidEntity) {
+        if (const auto n = loaded_->scene.Ecs().NodeOf(ui_state_.selected_entity))
+            ui_state_.reparent_src = loaded_->scene.Tree().PathOf(n);
+        ui_state_.reparent_dst = opt_.reparent_to;
+        ui_state_.reparent_request = true;
+    }
+    if (!opt_.save_to.empty()) ui_state_.save_request = opt_.save_to;
+    ui_state_.playing = opt_.want_play;
+    AttachController();
+
+    // Headless teleop: PD-hold and nudge one drive target, or feed a command.
+    const bool cmd_ctrl = policy_ctrl_ && policy_ctrl_->AcceptsCommand();
+    if (opt_.teleop_nudge_on && !cmd_ctrl && opt_.teleop_nudge_dof >= 0 &&
+        static_cast<size_t>(opt_.teleop_nudge_dof) < ui_state_.drive_targets.size()) {
+        ApplyHoldGains(world_, loaded_->Layout(), ui_state_.teleop_kp, ui_state_.teleop_kd);
+        ui_state_.teleop_enabled = true;
+        ui_state_.teleop_hold = true;
+        ui_state_.teleop_dof = opt_.teleop_nudge_dof;
+        const size_t dof = static_cast<size_t>(opt_.teleop_nudge_dof);
+        ui_state_.drive_targets[dof] += opt_.teleop_nudge_delta;
+        ui_state_.drive_dirty[dof] = 1u;
+        std::printf("[nuka_editor] teleop nudge: dof %d += %g (PD-hold kp=%g kd=%g)\n",
+                    opt_.teleop_nudge_dof, opt_.teleop_nudge_delta, ui_state_.teleop_kp,
+                    ui_state_.teleop_kd);
+    }
+    if (opt_.teleop_cmd_on && cmd_ctrl) {
+        // The CLI command is the baseline the every-frame producer re-sends.
+        policy_ctrl_->SetCommandVector(opt_.teleop_cmd, 3);
+        ui_state_.teleop_enabled = true;
+        for (int k = 0; k < 3; ++k) ui_state_.teleop_cmd_base[k] = opt_.teleop_cmd[k];
+        std::printf("[nuka_editor] teleop cmd: vx=%g vy=%g wyaw=%g\n", opt_.teleop_cmd[0],
+                    opt_.teleop_cmd[1], opt_.teleop_cmd[2]);
+    }
+}
+
+// A rebuild replaced the simulation binding: re-attach the controller and drive editor.
+void EditorHost::State::OnRebound() {
+    AttachController();
+    SeedDriveTargets();
+}
+
+void EditorHost::State::AttachController() {
+    policy_ctrl_.reset();
+    const WorldLayout& layout = loaded_->Layout();
+    if (!opt_.policy_path.empty() && terrain::IsValid(loaded_->terrain)) {
+        auto pc = std::make_unique<inference::Go2PolicyController>();
+        if (pc->Init(opt_.policy_path, layout.links_per_env, layout.articulations_per_env, loaded_->terrain)) {
+            if (opt_.force_host_policy) pc->SetUseGpu(false);
+            policy_ctrl_ = std::move(pc);
+            std::printf("[nuka_editor] policy attached: %s  play=%s  path=%s\n", opt_.policy_path.c_str(),
+                        opt_.want_play ? "yes" : "no", policy_ctrl_->UsingGpu() ? "GPU" : "host");
+        } else {
+            std::fprintf(stderr, "[nuka_editor] policy Init failed: %s\n", opt_.policy_path.c_str());
+        }
+    }
+    loaded_->sim->SetController(policy_ctrl_.get());
+    loaded_->sim->SetEnvIndex(ui_state_.env_index);
+}
+
+// Drops the scene binding; the world stays until the editor is destroyed.
+void EditorHost::State::ApplyUnload() {
+    present_->WaitIdle();
+    policy_ctrl_.reset();
+    entity_drag_.Cancel();
+    loaded_.reset();
+    debug_overlay_.Reset();
+    ClearModelUi(ui_state_);
+    record_index_ = EntityRecordIndex{};
+    script_host_.ClearScripts();
+    live_scripts_.clear();
+    ui_state_.script_node_count = 0;
+    ui_state_.inspector = InspectorState{};
+    last_seeded_ = scene::kInvalidEntity;
+    edit_stack_.Clear();
+    xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
+    ui_state_.save_dirty = false;
+    camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
+}
+
+// One queued tree edit on the selection, applied at a frame top so a rebuild never
+// dangles the frame's render-world reference. Selection survives by tree path.
+void EditorHost::State::ApplyTreeEdits() {
+    if (!loaded_) return;
+    const bool want_rename   = ui_state_.rename_request;
+    const bool want_add      = ui_state_.spawn_request;
+    const bool want_delete   = ui_state_.delete_request;
+    const bool want_reparent = ui_state_.reparent_request;
+    ui_state_.rename_request = ui_state_.spawn_request = ui_state_.delete_request = false;
+    ui_state_.reparent_request = false;
+    if (!(want_rename || want_add || want_delete || want_reparent)) return;
+
+    std::string target_path;
+    if (ui_state_.selected_entity != scene::kInvalidEntity) {
+        if (const auto n = loaded_->scene.Ecs().NodeOf(ui_state_.selected_entity))
+            target_path = loaded_->scene.Tree().PathOf(n);
+    }
+
+    // A structural op reverts by restoring this snapshot of the document.
+    scene::SceneIR before = loaded_->scene;
+    const auto bodies_before  = loaded_->scene.RigidBodyCount();
+    const auto scripts_before = loaded_->scene.ScriptCount();
+
+    std::string focus;        // node to reselect after the edit
+    bool structural = false;  // the cooked model changed
+    bool changed = false;
+    bool renamed = false;
+    if (want_reparent) {
+        focus = ReparentNode(*loaded_, ui_state_.reparent_src, ui_state_.reparent_dst);
+        ui_state_.reparent_src.clear();
+        ui_state_.reparent_dst.clear();
+        changed = !focus.empty();
+        structural = changed;
+    } else if (want_rename && !target_path.empty()) {
+        focus = RenameNode(*loaded_, target_path, ui_state_.rename_buf);
+        changed = !focus.empty();
+        renamed = changed;
+    } else if (want_add) {
+        math::Transform placement;
+        placement.position = math::Vec3{0.0f, 0.0f, kSpawnDropHeight};
+        if (ui_state_.selected_entity != scene::kInvalidEntity) {
+            const math::Transform w = AuthoredWorldTransform(loaded_->scene, ui_state_.selected_entity);
+            placement.position = w.position;
+            placement.position.z += kSpawnDropHeight;
+        }
+        focus = SpawnPrimitive(*loaded_, ui_state_.spawn_kind, placement, "");
+        changed = !focus.empty();
+        structural = changed;
+    } else if (want_delete && !target_path.empty()) {
+        focus = DeleteSubtree(*loaded_, target_path);
+        const bool body_deleted = loaded_->scene.RigidBodyCount() < bodies_before;
+        const bool script_deleted = loaded_->scene.ScriptCount() < scripts_before;
+        changed = body_deleted || script_deleted;
+        structural = body_deleted;  // a /script delete never reaches the cook
+        if (script_deleted) SyncScripts();
+    }
+    if (!changed) return;
+
+    if (structural) {
+        entity_drag_.Cancel();
+        present_->WaitIdle();
+        if (!RecookEditorScene(*loaded_, cache_)) {
+            // The world kept its previous scene; roll the document back to match it.
+            loaded_->scene = std::move(before);
+            record_index_.Build(loaded_->scene);
+            ui_state_.selected_entity = scene::kInvalidEntity;
+            if (!target_path.empty()) {
+                if (const auto n = loaded_->scene.Tree().NodeOf(target_path))
+                    ui_state_.selected_entity = n->entity;
+            }
+            ui_state_.inspector = InspectorState{};
+            last_seeded_ = scene::kInvalidEntity;
+            const char* msg = "[nuka_editor] tree edit rejected: rebuild failed; scene reverted\n";
+            std::fprintf(stderr, "%s", msg);
+            ConsoleAppend(msg);
+            return;
+        }
+        OnRebound();
+    }
+    record_index_.Build(loaded_->scene);
+    ui_state_.selected_entity = scene::kInvalidEntity;
+    if (!focus.empty()) {
+        if (const auto n = loaded_->scene.Tree().NodeOf(focus)) ui_state_.selected_entity = n->entity;
+    }
+    ui_state_.inspector = InspectorState{};
+    last_seeded_ = scene::kInvalidEntity;
+    ui_state_.save_dirty = true;
+    if (renamed) {
+        edit_stack_.Record(MakeRenameOp(loaded_.get(), target_path, focus));
+    } else {
+        scene::SceneIR after = loaded_->scene;
+        edit_stack_.Record(MakeStructuralOp(loaded_.get(), &record_index_, &cache_, std::move(before),
+                                            std::move(after)));
+    }
+}
+
+// Seeds the inspector from the selected instance's world pose and material.
+void EditorHost::State::SeedInspector(scene::EntityId e) {
+    InspectorState& ins = ui_state_.inspector;
+    ins = InspectorState{};
+    if (!loaded_ || e == scene::kInvalidEntity) return;
+    const render::RenderInstance* inst = InstanceOfEntity(loaded_->sim->GetRenderWorld(), e);
+    if (inst == nullptr) return;
+    ins.valid   = true;
+    ins.movable = IsMovableInstance(*inst, *loaded_);
+    const math::Vec3 p = inst->world_xform.position;
+    ins.pos[0] = p.x; ins.pos[1] = p.y; ins.pos[2] = p.z;
+    const math::Vec3 rd = EulerDegFromQuat(inst->world_xform.rotation);
+    ins.rot_deg[0] = rd.x; ins.rot_deg[1] = rd.y; ins.rot_deg[2] = rd.z;
+    const MaterialBinding mb = ResolveMaterial(*loaded_, record_index_, e);
+    if (mb.valid) {
+        const scene::RenderMaterial& m = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
+        ins.has_material = true;
+        for (int k = 0; k < 4; ++k) ins.base_color[k] = m.base_color[k];
+        ins.roughness = m.roughness; ins.metallic = m.metallic;
+        for (int k = 0; k < 3; ++k) ins.emissive[k] = m.emissive[k];
+        ins.sheen = m.sheen; ins.transmission = m.transmission; ins.ior = m.ior;
+        for (int k = 0; k < 3; ++k) ins.absorption[k] = m.absorption[k];
+    }
+}
+
+// Inspector edits apply live each changed frame and persist on the commit frame.
+void EditorHost::State::ApplyInspectorEdits() {
+    if (!loaded_) return;
+    InspectorState& ins = ui_state_.inspector;
+    const scene::EntityId e = ui_state_.selected_entity;
+    if (!ins.valid || e == scene::kInvalidEntity) return;
+    if (ins.transform_changed || ins.transform_commit) {
+        math::Transform edited;
+        edited.position = math::Vec3{ins.pos[0], ins.pos[1], ins.pos[2]};
+        edited.rotation = QuatFromEulerDeg(math::Vec3{ins.rot_deg[0], ins.rot_deg[1], ins.rot_deg[2]});
+        if (!xform_gesture_active_) {
+            xform_gesture_active_ = true;
+            xform_gesture_path_ = PathOfEntity(e);
+            if (const render::RenderInstance* gi = InstanceOfEntity(loaded_->sim->GetRenderWorld(), e))
+                xform_before_ = gi->world_xform;
+        }
+        ApplyTransformEdit(*loaded_, record_index_, e, edited, ins.transform_commit);
+        if (ins.transform_commit) {
+            ui_state_.save_dirty = true;
+            edit_stack_.Record(MakeTransformOp(loaded_.get(), xform_gesture_path_, xform_before_, edited));
+            xform_gesture_active_ = false;
+        }
+        ins.transform_changed = false;
+        ins.transform_commit = false;
+    }
+    if (ins.has_material && (ins.material_changed || ins.material_commit)) {
+        const MaterialBinding mb = ResolveMaterial(*loaded_, record_index_, e);
+        scene::RenderMaterial m;
+        if (mb.render_slot != render::kNoId && mb.render_slot < loaded_->sim->GetRenderWorld().MaterialCount())
+            m = loaded_->sim->GetRenderWorld().materials[mb.render_slot];
+        if (!mat_gesture_active_) {
+            mat_gesture_active_ = true;
+            mat_gesture_path_ = PathOfEntity(e);
+            mat_before_ = m;
+        }
+        for (int k = 0; k < 4; ++k) m.base_color[k] = ins.base_color[k];
+        m.opacity = ins.base_color[3];
+        m.roughness = ins.roughness; m.metallic = ins.metallic;
+        for (int k = 0; k < 3; ++k) m.emissive[k] = ins.emissive[k];
+        m.sheen = ins.sheen; m.transmission = ins.transmission; m.ior = ins.ior;
+        for (int k = 0; k < 3; ++k) m.absorption[k] = ins.absorption[k];
+        ApplyMaterialEdit(*loaded_, mb, m, ins.material_commit);
+        if (ins.material_commit) {
+            ui_state_.save_dirty = true;
+            edit_stack_.Record(MakeMaterialOp(loaded_.get(), mat_gesture_path_, mat_before_, m));
+            mat_gesture_active_ = false;
+        }
+        ins.material_changed = false;
+        ins.material_commit = false;
+    }
+}
+
+// After an undo/redo: a structural revert rebuilt the world, so rebind its consumers;
+// drop the selection so stale ids never linger.
+void EditorHost::State::PostEditResync(uint64_t generation_before) {
+    entity_drag_.Cancel();
+    if (!loaded_) return;
+    if (Generation() != generation_before) OnRebound();
+    record_index_.Build(loaded_->scene);
+    SyncScripts();
+    ui_state_.selected_entity = scene::kInvalidEntity;
+    ui_state_.inspector = InspectorState{};
+    last_seeded_ = scene::kInvalidEntity;
+    xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
+    ui_state_.save_dirty = true;
+}
+
+void EditorHost::State::Frame(bool step_physics) {
+    if (!running_) return;
+
+    // Pending unload, load and tree edits land before anything reads the world.
+    if (ui_state_.unload_request) {
+        ApplyUnload();
+        ui_state_.unload_request = false;
+    }
+    if (!ui_state_.load_request.empty()) {
+        const std::string path = ui_state_.load_request;
+        ui_state_.load_request.clear();
+        ApplyLoad(path);
+    }
+    if (attach_pending_) {
+        attach_pending_ = false;
+        Attach("");
+    }
+    ApplyTreeEdits();
+
+    // Headless triggers: undo at frame 1, redo at frame 2, reset at frame N.
+    if (opt_.undo && frame_index_ == 1u) ui_state_.undo_request = true;
+    if (opt_.redo && frame_index_ == 2u) ui_state_.redo_request = true;
+    if (opt_.reset_at_frame >= 0 && static_cast<int>(frame_index_) == opt_.reset_at_frame)
+        ui_state_.reset_requested = true;
+
+    if (ui_state_.undo_request) {
+        ui_state_.undo_request = false;
+        if (loaded_ && edit_stack_.CanUndo()) {
+            present_->WaitIdle();
+            const uint64_t generation = Generation();
+            edit_stack_.Undo();
+            PostEditResync(generation);
+        }
+    }
+    if (ui_state_.redo_request) {
+        ui_state_.redo_request = false;
+        if (loaded_ && edit_stack_.CanRedo()) {
+            present_->WaitIdle();
+            const uint64_t generation = Generation();
+            edit_stack_.Redo();
+            PostEditResync(generation);
+        }
+    }
+
+    if (!opt_.run_script_path.empty() && !script_ran_) {
+        script_ran_ = true;
+        std::string code;
+        if (ReadEntireFile(opt_.run_script_path, &code)) {
+            const std::string out = script_host_.RunString(code);
+            ui_state_.console_log += out;
+            std::fputs(out.c_str(), stderr);
+            std::fflush(stderr);
+            std::printf("[nuka_editor] ran --run-script %s (%zu bytes captured)\n",
+                        opt_.run_script_path.c_str(), out.size());
+            std::fflush(stdout);
+        } else {
+            std::fprintf(stderr, "[nuka_editor] --run-script: cannot read %s\n", opt_.run_script_path.c_str());
+        }
+    }
+
+    events_.clear();
+    present_->PollEvents(events_);
+    ImGuiIO& io = ImGui::GetIO();
+    const uint32_t vp_w = present_->Report().width;
+    const uint32_t vp_h = present_->Report().height;
+    const bool ctrl_before_events = ctrl_down_;
+    for (const window::WindowEvent& ev : events_) {
+        ui_state_.layout_modifier_down = ev.Held(window::modifier::kLayout);
+        switch (ev.type) {
+            case window::WindowEvent::Type::MouseMove:
+                last_mouse_x_ = static_cast<float>(ev.mouse_x);
+                last_mouse_y_ = static_cast<float>(ev.mouse_y);
+                break;
+            case window::WindowEvent::Type::Key:
+                ctrl_down_ = ev.Held(window::modifier::kCtrl);
+                break;
+            case window::WindowEvent::Type::Resize:
+                surface_suspended_ = ev.width == 0u || ev.height == 0u;
+                break;
+            case window::WindowEvent::Type::FocusGained:
+                ui_state_.window_focused = true;
+                break;
+            case window::WindowEvent::Type::FocusLost:
+                // Releases go to the newly focused window: drop latched Ctrl and drags.
+                ui_state_.window_focused = false;
+                ctrl_down_ = false;
+                entity_drag_.Cancel();
+                break;
+            default:
+                break;
+        }
+    }
+
+    const auto now = Clock::now();
+    const double frame_dt = std::chrono::duration<double>(now - prev_).count();
+    prev_ = now;
+    if (frame_dt > 0.0) {
+        const double inst_fps = 1.0 / frame_dt;
+        fps_ema_ = (fps_ema_ == 0.0) ? inst_fps : (fps_ema_ * 0.9 + inst_fps * 0.1);
+    }
+
+    const render::RenderWorld& render_world = loaded_ ? loaded_->sim->GetRenderWorld() : empty_world_;
+    double step_ms = 0.0;
+    InputIntents intents;
+    uint32_t steps_taken = 0u;
+    if (loaded_) {
+        EditorSim& sim = *loaded_->sim;
+        // Speed transport: speed * real frame time accrues and is consumed in fixed-dt
+        // steps; a host that steps the world itself passes step_physics = false.
+        uint32_t steps = 0u;
+        if (step_physics && ui_state_.playing) {
+            sim_accum_ += std::min(frame_dt, kMaxFrameDt) * static_cast<double>(ui_state_.speed);
+            steps = static_cast<uint32_t>(sim_accum_ / static_cast<double>(opt_.dt));
+            if (steps > kMaxStepsPerFrame) {
+                steps = kMaxStepsPerFrame;
+                sim_accum_ = 0.0;
+            } else {
+                sim_accum_ -= static_cast<double>(steps) * static_cast<double>(opt_.dt);
+            }
+        } else {
+            sim_accum_ = 0.0;
+            if (step_physics && ui_state_.step_requested) steps = 1u;
+        }
+        const auto step_t0 = Clock::now();
+        last_step_healthy_ = sim.FramePublish(&intents, steps);
+        step_ms = std::chrono::duration<double, std::milli>(Clock::now() - step_t0).count();
+        steps_taken = steps;
+        if (steps > 0u) ConsoleAppend(script_host_.DispatchStep());
+
+        if (intents.toggle_play) ui_state_.playing = !ui_state_.playing;
+        if (intents.set_play) ui_state_.playing = intents.play_value;
+        if (intents.reset) ui_state_.reset_requested = true;
+        if (intents.camera_reset) ui_state_.camera_reset = true;
+        if (intents.set_env) {
+            const uint32_t env = intents.env_value % loaded_->Layout().env_count;
+            ui_state_.env_index = env;
+            sim.SetEnvIndex(env);
+        }
+    } else {
+        last_step_healthy_ = true;
+    }
+    // A queued StepOnce lands next frame, like the Step button.
+    ui_state_.step_requested = intents.step_once;
+
+    if (ui_state_.reset_requested) {
+        if (loaded_) {
+            present_->WaitIdle();
+            if (!ResetEditorScenePhysics(*loaded_))
+                std::fprintf(stderr, "[nuka_editor] reset: physics re-seed failed\n");
+            PublishOnly();
+            ConsoleAppend(script_host_.DispatchReset());
+            ui_state_.playing = false;
+        }
+        FrameWorld(render_world);
+        ui_state_.reset_requested = false;
+    }
+    if (ui_state_.camera_reset) {
+        FrameWorld(render_world);
+        ui_state_.camera_reset = false;
+        frame_pending_ = true;
+    }
+
+    ViewerStats stats;
+    stats.step_time_ms = static_cast<float>(step_ms);
+    stats.cpu_timing_available = static_cast<bool>(loaded_);
+    stats.frame_timing_available = frame_dt > 0.0;
+    stats.fps = static_cast<float>(fps_ema_);
+    stats.sub_steps = steps_taken;
+    if (loaded_) {
+        const WorldLayout& layout = loaded_->Layout();
+        stats.dof = layout.dofs_per_env;
+        stats.links = layout.links_per_env;
+        stats.bodies = layout.bodies_per_env;
+        stats.contact_cap = layout.contacts_per_env;
+    }
+    stats.frame_time_ms = static_cast<float>(frame_dt * 1000.0);
+    stats.debug_colliders = debug_overlay_.LastColliderCount();
+    stats.debug_contacts = debug_overlay_.LastContactCount();
+    stats.debug_skipped_shapes = debug_overlay_.LastSkippedShapes();
+    stats.debug_capacity = kMaxDebugOverlayInstances;
+    const auto& debug_report = debug_overlay_.DrawReport();
+    stats.debug_invalid_colliders = debug_report.invalid_colliders;
+    stats.debug_invalid_contacts = debug_report.invalid_contacts;
+    stats.debug_omitted_instances = debug_report.omitted_instances;
+    stats.debug_contacts_budget_skipped = loaded_ && debug_report.contacts_budget_skipped;
+    stats.debug_colliders_available = loaded_ && debug_overlay_.CollidersAvailable();
+    stats.debug_contacts_available = loaded_ && debug_overlay_.ContactsAvailable();
+    stats.frame_index = frame_index_;
+    stats.step_healthy = last_step_healthy_;
+    stats.device_name = present_->DeviceName();
+
+    ui_state_.has_scene = static_cast<bool>(loaded_);
+    ui_state_.loaded_path = loaded_ ? loaded_->path : std::string();
+    ui_state_.can_undo = edit_stack_.CanUndo();
+    ui_state_.can_redo = edit_stack_.CanRedo();
+
+    io.DisplaySize = ImVec2(static_cast<float>(present_->Report().width),
+                            static_cast<float>(present_->Report().height));
+    // ImGui runs on wall-clock time, never the physics dt.
+    io.DeltaTime = (frame_dt > 0.0) ? static_cast<float>(std::min(frame_dt, kMaxFrameDt)) : (1.0f / 60.0f);
+    // SDL3 replaces the display size with logical points and sets the framebuffer scale.
+    if (native_window_ != nullptr) ImGui_ImplSDL3_NewFrame();
+    // Re-seed on a new selection; otherwise track a movable body's live pose.
+    if (loaded_) {
+        if (ui_state_.selected_entity != last_seeded_) {
+            SeedInspector(ui_state_.selected_entity);
+            last_seeded_ = ui_state_.selected_entity;
+        } else if (ui_state_.inspector.valid && ui_state_.inspector.movable &&
+                   !ui_state_.inspector.transform_changed) {
+            if (const render::RenderInstance* inst =
+                    InstanceOfEntity(loaded_->sim->GetRenderWorld(), ui_state_.selected_entity)) {
+                const math::Vec3 p = inst->world_xform.position;
+                ui_state_.inspector.pos[0] = p.x;
+                ui_state_.inspector.pos[1] = p.y;
+                ui_state_.inspector.pos[2] = p.z;
+                const math::Vec3 rd = EulerDegFromQuat(inst->world_xform.rotation);
+                ui_state_.inspector.rot_deg[0] = rd.x;
+                ui_state_.inspector.rot_deg[1] = rd.y;
+                ui_state_.inspector.rot_deg[2] = rd.z;
+            }
+        }
+    }
+
+    imgui_.NewFrame();
+    ui_.RecordUi(render_world, stats, camera_, ui_state_, loaded_ ? &loaded_->scene : nullptr,
+                 surface_suspended_ ? 0u : vp_w, surface_suspended_ ? 0u : vp_h);
+    if (frame_pending_ && ui_.Viewport().Valid()) {
+        const auto rect = ui_.Viewport().pixels;
+        if (rect.x == last_framing_rect_.x && rect.y == last_framing_rect_.y &&
+            rect.width == last_framing_rect_.width && rect.height == last_framing_rect_.height) {
+            FrameWorld(render_world);
+            frame_pending_ = false;
+        }
+        last_framing_rect_ = rect;
+    }
+
+    CameraController render_camera = camera_;
+
+    // The gizmo edits the selection's live pose through the inspector's edit seam;
+    // one drag (press to release) records one op.
+    if (loaded_ && ui_state_.selected_entity != scene::kInvalidEntity && ui_state_.inspector.valid) {
+        if (const render::RenderInstance* gi =
+                InstanceOfEntity(loaded_->sim->GetRenderWorld(), ui_state_.selected_entity)) {
+            const math::Transform pre_drag = gi->world_xform;
+            math::Transform gworld = pre_drag;
+            bool gizmo_changed = false;
+            ui_.DrawGizmo(render_camera, vp_w, vp_h, ui_state_, gworld, gizmo_changed);
+            const bool using_now = ui_state_.gizmo.using_now;
+            if (using_now && !gizmo_using_prev_ && !xform_gesture_active_) {
+                xform_gesture_active_ = true;
+                xform_dirty_ = false;
+                xform_gesture_path_ = PathOfEntity(ui_state_.selected_entity);
+                xform_before_ = pre_drag;
+                xform_after_ = pre_drag;
+            }
+            if (gizmo_changed) {
+                ApplyTransformEdit(*loaded_, record_index_, ui_state_.selected_entity, gworld, /*commit=*/true);
+                ui_state_.save_dirty = true;
+                xform_after_ = gworld;
+                xform_dirty_ = true;
+            }
+            if (!using_now && gizmo_using_prev_ && xform_gesture_active_) {
+                if (xform_dirty_)
+                    edit_stack_.Record(MakeTransformOp(loaded_.get(), xform_gesture_path_, xform_before_, xform_after_));
+                xform_gesture_active_ = false;
+            }
+            gizmo_using_prev_ = using_now;
+        }
+    } else {
+        ui_state_.gizmo.active = false;
+        ui_state_.gizmo.using_now = false;
+        gizmo_using_prev_ = false;
+    }
+
+    const auto& scene_rect = ui_.Viewport();
+    if (!scene_rect.Valid()) {
+        entity_drag_.Cancel();
+        camera_.CancelInteraction();
+    }
+    bool scene_ctrl = ctrl_before_events;
+    for (const window::WindowEvent& ev : events_) {
+        entity_drag_.Observe(ev);
+        if (ev.type == window::WindowEvent::Type::Key) scene_ctrl = ev.Held(window::modifier::kCtrl);
+        if (ev.type == window::WindowEvent::Type::FocusLost) scene_ctrl = false;
+        const bool scroll = ev.type == window::WindowEvent::Type::Scroll;
+        const float mouse_x = scroll ? last_mouse_x_ : static_cast<float>(ev.mouse_x);
+        const float mouse_y = scroll ? last_mouse_y_ : static_cast<float>(ev.mouse_y);
+        const bool over_ui = !ui_.OwnsScenePointer() || !scene_rect.Contains(mouse_x, mouse_y) ||
+                             !ui_state_.window_focused || ui_state_.layout_modifier_down || frame_pending_;
+        if (loaded_ && scene_ctrl && !over_ui && !ui_state_.gizmo.active) {
+            EditorSim& sim = *loaded_->sim;
+            if (ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
+                if (ev.pressed) {
+                    const Ray ray = render_camera.ScreenRay(scene_rect.LocalX(mouse_x), scene_rect.LocalY(mouse_y),
+                                                            scene_rect.pixels.width, scene_rect.pixels.height);
+                    const uint32_t hit = PickInstance(ray, sim.GetRenderWorld(), loaded_->Layout());
+                    entity_drag_.instance = hit;
+                    if (hit != ~0u) ui_state_.selected_entity = sim.GetRenderWorld().instances[hit].entity;
+                } else {
+                    entity_drag_.Cancel();
+                }
+            } else if (ev.type == window::WindowEvent::Type::MouseMove && entity_drag_.instance != ~0u &&
+                       entity_drag_.instance < sim.GetRenderWorld().InstanceCount()) {
+                // Drag on a view-facing plane through the entity, as a queued live move.
+                const render::RenderInstance& inst = sim.GetRenderWorld().instances[entity_drag_.instance];
+                const math::Vec3 anchor = inst.world_xform.position;
+                const Ray ray = render_camera.ScreenRay(scene_rect.LocalX(mouse_x), scene_rect.LocalY(mouse_y),
+                                                        scene_rect.pixels.width, scene_rect.pixels.height);
+                const math::Vec3 fwd = (render_camera.ResolvedTarget() - render_camera.ResolvedEye()).Normalized();
+                math::Vec3 hit;
+                if (render_camera.RayPlaneHit(ray, anchor, fwd, &hit)) {
+                    math::Transform xf = inst.world_xform;
+                    xf.position = hit;
+                    sim.Commands().Push(Command::MakeMoveEntity(inst.entity, xf));
+                }
+            }
+        }
+        // The camera never takes input ImGui, a Ctrl-drag or the gizmo owns.
+        const bool cam_allow = !over_ui && !scene_ctrl && !ui_state_.gizmo.active;
+        camera_.HandleEvent(ev, /*allow_drag=*/cam_allow, /*allow_scroll=*/!over_ui && !ui_state_.gizmo.active);
+    }
+
+    ApplyInspectorEdits();
+    if (loaded_ && !ui_state_.save_request.empty()) {
+        const std::string sp = ui_state_.save_request;
+        ui_state_.save_request.clear();
+        try {
+            scene::nks::Save(loaded_->scene, sp);
+            ui_state_.save_dirty = false;
+            std::printf("[nuka_editor] saved %s\n", sp.c_str());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[nuka_editor] save failed: %s: %s\n", sp.c_str(), e.what());
+        }
+    }
+
+    if (ui_state_.script_clear_request) {
+        ui_state_.console_log.clear();
+        ui_state_.script_clear_request = false;
+    }
+    if (ui_state_.script_run_request) {
+        ui_state_.script_run_request = false;
+        ConsoleAppend(script_host_.RunString(ui_state_.script_buf));
+    }
+    // Attach persists the buffer as a /script node; a selected one updates in place.
+    if (ui_state_.script_attach_request) {
+        ui_state_.script_attach_request = false;
+        if (loaded_) {
+            scene::ScriptId sel_script = scene::kInvalidScript;
+            if (ui_state_.selected_entity != scene::kInvalidEntity) {
+                for (size_t i = 0; i < loaded_->scene.ScriptCount(); ++i) {
+                    const auto sid = static_cast<scene::ScriptId>(i);
+                    if (loaded_->scene.EntityOfScript(sid) == ui_state_.selected_entity) {
+                        sel_script = sid;
+                        break;
+                    }
+                }
+            }
+            std::string sel_path;  // survives the re-projection below
+            if (sel_script != scene::kInvalidScript) sel_path = PathOfEntity(ui_state_.selected_entity);
+            if (sel_script != scene::kInvalidScript) {
+                loaded_->scene.GetScriptMut(sel_script).source = ui_state_.script_buf;
+            } else {
+                uint64_t next_id = 1;
+                for (const auto& sr : loaded_->scene.Scripts())
+                    if (sr.stable_id >= next_id) next_id = sr.stable_id + 1;
+                scene::ScriptRecord rec;
+                rec.stable_id = next_id;
+                rec.source = ui_state_.script_buf;
+                loaded_->scene.AddScript(rec);
+            }
+            record_index_.Build(loaded_->scene);
+            SyncScripts();
+            if (!sel_path.empty()) {
+                if (const auto n = loaded_->scene.Tree().NodeOf(sel_path)) ui_state_.selected_entity = n->entity;
+            }
+            ui_state_.save_dirty = true;
+        }
+    }
+    // An oversize source is refused loudly, never truncated into the buffer.
+    if (ui_state_.script_load_request) {
+        ui_state_.script_load_request = false;
+        if (loaded_ && ui_state_.selected_entity != scene::kInvalidEntity) {
+            if (const auto* sc = loaded_->scene.Ecs().Get<scene::ScriptComponent>(ui_state_.selected_entity)) {
+                if (sc->source.size() >= sizeof(ui_state_.script_buf)) {
+                    char msg[160];
+                    std::snprintf(msg, sizeof(msg),
+                                  "[nuka_editor] script source (%zu bytes) exceeds the editor buffer (%zu); "
+                                  "NOT loaded (no truncation)\n",
+                                  sc->source.size(), sizeof(ui_state_.script_buf));
+                    std::fprintf(stderr, "%s", msg);
+                    ConsoleAppend(msg);
+                } else {
+                    std::memcpy(ui_state_.script_buf, sc->source.c_str(), sc->source.size() + 1u);
+                }
+            }
+        }
+    }
+
+    // Teleop sends its command every frame; gating zeroes the keys, so a walking
+    // robot stops instead of latching.
+    bool teleop_owns_wasd = false;
+    {
+        inference::WorldController* ctrl = loaded_ ? loaded_->sim->Controller() : nullptr;
+        const bool cmd_ctrl = ctrl != nullptr && ctrl->AcceptsCommand();
+        const bool active = loaded_ && ui_state_.teleop_enabled && !io.WantCaptureKeyboard &&
+                            !io.WantTextInput && ui_.OwnsScenePointer() && ui_state_.window_focused;
+        TeleopKeys tk;
+        if (active) {
+            tk.dof_minus = ImGui::IsKeyPressed(ImGuiKey_LeftBracket, false) || ImGui::IsKeyPressed(ImGuiKey_Comma, false);
+            tk.dof_plus  = ImGui::IsKeyPressed(ImGuiKey_RightBracket, false) || ImGui::IsKeyPressed(ImGuiKey_Period, false);
+            tk.dof_prev  = ImGui::IsKeyPressed(ImGuiKey_Minus, false);
+            tk.dof_next  = ImGui::IsKeyPressed(ImGuiKey_Equal, false);
+            tk.fwd = ImGui::IsKeyDown(ImGuiKey_W); tk.back = ImGui::IsKeyDown(ImGuiKey_S);
+            tk.strafe_l = ImGui::IsKeyDown(ImGuiKey_A); tk.strafe_r = ImGui::IsKeyDown(ImGuiKey_D);
+            tk.yaw_l = ImGui::IsKeyDown(ImGuiKey_Q); tk.yaw_r = ImGui::IsKeyDown(ImGuiKey_E);
+        }
+        // PD-hold rising edge makes drive targets effective for direct control.
+        const bool hold_now = active && ui_state_.teleop_hold && !cmd_ctrl;
+        if (hold_now && !teleop_hold_prev_)
+            ApplyHoldGains(world_, loaded_->Layout(), ui_state_.teleop_kp, ui_state_.teleop_kd);
+        teleop_hold_prev_ = hold_now;
+
+        const uint32_t dof_count = static_cast<uint32_t>(ui_state_.drive_targets.size());
+        const TeleopResult tr = ApplyTeleop(active, tk, ui_state_, dof_count);
+        if (cmd_ctrl) {
+            if (ui_state_.teleop_enabled) {
+                ctrl->SetCommandVector(tr.command, 3);
+            } else if (teleop_prev_enabled_) {
+                // Toggle-off edge: one zero stops the robot, then scripts may own the command.
+                const float zero[3] = {0.0f, 0.0f, 0.0f};
+                ctrl->SetCommandVector(zero, 3);
+            }
+            teleop_owns_wasd = active;
+        }
+        teleop_prev_enabled_ = ui_state_.teleop_enabled;
+    }
+
+    // Undo/redo keys and the WASD/QE camera fly, unless ImGui owns the keyboard.
+    if (!io.WantCaptureKeyboard) {
+        const bool ctrl_held = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+        const bool shift_held = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
+        if (ctrl_held && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !shift_held) ui_state_.undo_request = true;
+        if (ctrl_held && (ImGui::IsKeyPressed(ImGuiKey_Y, false) || (shift_held && ImGui::IsKeyPressed(ImGuiKey_Z, false))))
+            ui_state_.redo_request = true;
+
+        float cf = 0.0f, cr = 0.0f, cu = 0.0f;
+        if (!teleop_owns_wasd && ui_.OwnsScenePointer() && ui_state_.window_focused &&
+            !ui_state_.layout_modifier_down) {
+            if (ImGui::IsKeyDown(ImGuiKey_W)) cf += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_S)) cf -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_D)) cr += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_A)) cr -= 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_E)) cu += 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_Q)) cu -= 1.0f;
+        }
+        if (cf != 0.0f || cr != 0.0f || cu != 0.0f)
+            camera_.Move(cf, cr, cu, static_cast<float>(frame_dt) * (shift_held ? 4.0f : 1.0f));
+    }
+    ui_.HandleCameraShortcuts(render_world, camera_, ui_state_);
+    ImGui::Render();
+
+    // Moved drive sliders upload only their own rows of the selected environment.
+    if (loaded_ && ui_state_.drive_dirty.size() == ui_state_.drive_targets.size()) {
+        const WorldLayout& layout = loaded_->Layout();
+        const size_t env = ui_state_.env_index % layout.env_count;
+        for (size_t d = 0; d < ui_state_.drive_targets.size(); ++d) {
+            if (!ui_state_.drive_dirty[d]) continue;
+            const size_t at = (env * layout.links_per_env + d) * sizeof(float);
+            nuka_world_upload_field(world_, NUKA_FIELD_DRIVE_TARGET, &ui_state_.drive_targets[d], sizeof(float), at);
+            ui_state_.drive_dirty[d] = 0u;
+        }
+    }
+
+    render::RasterOptions opts;
+    opts.width = present_->Report().width;
+    opts.height = present_->Report().height;
+    render_camera.WriteOptions(opts);
+    opts.scene_viewport = ui_.Viewport().pixels;
+    if (loaded_ && loaded_->scene.Environment().sky.enabled) {
+        const auto background = loaded_->scene.Environment().sky.background;
+        const auto byte = [](float value) {
+            return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+        };
+        if (std::isfinite(background.x) && std::isfinite(background.y) && std::isfinite(background.z))
+            opts.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
+    }
+
+    // Debug overlays rebuild from the live world just before the draw; off leaves the
+    // real instance set untouched.
+    if (loaded_)
+        debug_overlay_.Rebuild(world_, loaded_->Layout(), loaded_->sim->GetRenderWorld(), ui_state_.env_index,
+                               ui_state_.show_colliders, ui_state_.show_contacts);
+
+    const render::PresentFrameResult r = present_->DrawFrame(render_world, opts, [this](void* cmd) {
+        imgui_.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    });
+    if (r == render::PresentFrameResult::Error) {
+        std::fprintf(stderr, "[nuka_editor] present error at frame %llu\n",
+                     static_cast<unsigned long long>(frame_index_));
+        running_ = false;
+        return;
+    }
+    // A recreated swapchain keeps a compatible pass; ImGui only needs the image count.
+    if (r == render::PresentFrameResult::Recreated) imgui_.NotifySwapchainRecreated(present_->MinImageCount());
+    if (r == render::PresentFrameResult::Presented) ++presented_;
+    ++frame_index_;
+
+    if (frame_dt > 0.0 && frame_index_ > kFpsWarmup) {
+        const double fms = frame_dt * 1000.0;
+        ft_sum_ += fms;
+        st_sum_ += step_ms;
+        ++ft_n_;
+        ft_min_ = std::min(ft_min_, fms);
+        ft_max_ = std::max(ft_max_, fms);
+        if (frame_index_ % 120u == 0u) {
+            std::printf("[fps] frame=%llu fps_ema=%.1f frame_ms=%.2f step_ms=%.2f\n",
+                        static_cast<unsigned long long>(frame_index_), fps_ema_, fms, step_ms);
+            std::fflush(stdout);
+        }
+    }
+
+    const auto spent = std::chrono::duration<double>(Clock::now() - now);
+    const auto budget = std::chrono::duration<double>(kFrameBudgetSeconds);
+    if (spent < budget)
+        std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::microseconds>(budget - spent));
+    // A Close() from a script callback during this frame stays in force.
+    running_ = running_ && !present_->ShouldClose() &&
+               !(opt_.max_frames > 0 && frame_index_ >= static_cast<uint64_t>(opt_.max_frames));
+}
+
+EditorHost::EditorHost(const std::vector<std::string>& args, nuka_world_handle world, float dt)
+    : state_(std::make_unique<State>(args, world, dt)) {}
+
+EditorHost::~EditorHost() = default;
+
+void EditorHost::SetScriptHooks(const nuka_editor_script_hooks_t& hooks) { state_->SetHooks(hooks); }
+void EditorHost::Update(bool step_physics) { state_->Frame(step_physics); }
+bool EditorHost::Running() const { return state_->running_; }
+bool EditorHost::Playing() const { return state_->ui_state_.playing; }
+void EditorHost::Close() { state_->running_ = false; }
+nuka_world_handle EditorHost::World() const { return state_->world_; }
+float EditorHost::Dt() const { return state_->opt_.dt; }
+void EditorHost::ConsoleAppend(const std::string& text) { state_->ConsoleAppend(text); }
+
+}  // namespace nuka::runtime::app::viewer

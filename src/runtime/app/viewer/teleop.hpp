@@ -5,7 +5,7 @@
 // A general live-input -> drive-command producer, the interactive sibling of the
 // Drive sliders and the --policy controller. Per-DOF nudges write the SAME
 // drive_targets / drive_dirty seam the Drive panel uses; WASD/QE produce a
-// [vx,vy,wyaw] command for a command-consuming SceneController. Decoupled from ImGui
+// [vx,vy,wyaw] command for a command-consuming WorldController. Decoupled from ImGui
 // (the viewer reads key state into TeleopKeys) so the mapping is unit-testable with
 // synthetic intents. Host-only, no deps beyond ViewerUiState.
 // ---------------------------------------------------------------------------

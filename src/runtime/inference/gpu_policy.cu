@@ -7,7 +7,7 @@
 // normalize + clamp, per-output double-accumulated dot, fp32 ELU) so the device
 // action matches the host oracle to ~1e-5 (the CPU-oracle-validates-GPU pattern).
 // One control step (Go2GpuPolicy::Step) runs obs-assembly -> MLP -> drive-write
-// entirely on the world backend's main stream: the obs kernels read the SAME
+// entirely on the world's stream: the obs kernels read the SAME
 // device fields DownloadField reads, so there is no host round-trip.
 // ---------------------------------------------------------------------------
 
@@ -16,8 +16,6 @@
 #include "runtime/inference/mlp_policy.hpp"
 #include "scene/terrain/heightfield.hpp"
 #include "scene/terrain/heightfield_sample.hpp"
-
-#include "phi/backend_cuda/cuda_internal.cuh"  // CudaBackend, CudaBackendMainStream
 
 #include "math/vec3.hpp"
 
@@ -50,11 +48,6 @@ void FreeDev(void* p) {
 }
 bool UploadDev(void* dst, const void* src, size_t bytes) {
     return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-}
-
-cudaStream_t MainStreamOf(void* backend) {
-    if (backend == nullptr) return nullptr;
-    return phi::CudaBackendMainStream(reinterpret_cast<phi::CudaBackend*>(backend));
 }
 
 __device__ inline float DevClampf(float v, float lo, float hi) {
@@ -509,12 +502,12 @@ void Go2GpuPolicy::SetCommand(float vx, float vy, float wyaw) {
     g_->c.command[2] = wyaw;
 }
 
-void Go2GpuPolicy::ApplyGains(void* backend, float* drive_stiffness,
+void Go2GpuPolicy::ApplyGains(void* stream, float* drive_stiffness,
                               float* drive_damping, float* drive_force_limit,
                               uint32_t env_index) {
     GImpl& g = *g_;
     if (!g.ready) return;
-    cudaStream_t s = MainStreamOf(backend);
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
     const size_t base = static_cast<size_t>(env_index) * g.links_per_env;
     const uint32_t n = g.num_dogs * g.c.njoints;
     Go2GainsKernel<<<Grid(n), kBlock, 0, s>>>(
@@ -523,13 +516,13 @@ void Go2GpuPolicy::ApplyGains(void* backend, float* drive_stiffness,
         g.links_per_dog);
 }
 
-void Go2GpuPolicy::Step(void* backend, const float* link_pose,
+void Go2GpuPolicy::Step(void* stream, const float* link_pose,
                         const float* link_velocity, const float* q,
                         const float* qdot, const float* base_pose,
                         float* drive_target, uint32_t env_index) {
     GImpl& g = *g_;
     if (!g.ready) return;
-    cudaStream_t s = MainStreamOf(backend);
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
 
     Go2DevParams p{};
     const size_t lbase = static_cast<size_t>(env_index) * g.links_per_env;

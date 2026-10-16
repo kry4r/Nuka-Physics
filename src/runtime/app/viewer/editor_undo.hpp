@@ -9,8 +9,8 @@
 // re-apply the prior value through the same mutator (cheap, exact); structural
 // edits restore a SceneIR snapshot + re-cook. ONE general path, no per-type stack.
 //
-// HOST-ONLY / zero-CUDA-token: the only device touch is the re-cook a structural
-// revert delegates to RecookEditorScene (behind the phi vtable).
+// HOST-ONLY: the only world touch is the rebuild a structural revert delegates to
+// RecookEditorScene.
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
@@ -22,11 +22,6 @@
 #include <functional>
 #include <string>
 #include <vector>
-
-namespace nuka::phi {
-struct Device;
-struct Backend;
-}  // namespace nuka::phi
 
 namespace nuka::runtime::app::viewer {
 
@@ -79,11 +74,10 @@ EditOp MakeMaterialOp(EditorScene* es, std::string path,
 
 // A structural edit (add / delete / reparent): the simplest correct general
 // revert is a SceneIR snapshot. revert restores `before`, redo restores `after`,
-// each re-cooking the world (RecookEditorScene) + rebuilding `idx`. The caller
-// WaitIdle's before invoking undo/redo (the re-cook contract).
+// each rebuilding the world (RecookEditorScene) + `idx`. The caller WaitIdle's
+// before invoking undo/redo (the rebuild replaces the render world).
 EditOp MakeStructuralOp(EditorScene* es, EntityRecordIndex* idx,
-                        nuka::phi::Device* device, nuka::phi::Backend* backend,
-                        float dt, nuka::scene::SceneIR before,
+                        SceneCache* cache, nuka::scene::SceneIR before,
                         nuka::scene::SceneIR after);
 
 // A rename between tree paths: revert / redo re-apply the other path's leaf via

@@ -31,7 +31,6 @@
 #include "render/vulkan_offscreen_types.hpp"
 #include "runtime/app/command_queue.hpp"
 #include "runtime/app/pose_publisher.hpp"
-#include "runtime/app/scene_controller.hpp"
 #include "runtime/app/systems.hpp"
 
 #include <cstdint>
@@ -77,12 +76,6 @@ public:
     // (the graceful-fallback path on this lavapipe box). The new publisher is NOT
     // owned (it must outlive the Simulation, exactly like the ctor publisher).
     void SetPublisher(PosePublisher& publisher) { publisher_ = &publisher; }
-
-    // -- controller (per-step control hook) ---------------------------------
-    // Attach/clear the SceneController called before each governed step. NOT owned
-    // (must outlive the Simulation). Null => no control hook (the default).
-    void SetController(SceneController* controller) { controller_ = controller; }
-    SceneController* Controller() const { return controller_; }
 
     // -- selection / step mode ----------------------------------------------
     void     SetEnvIndex(uint32_t env_index) { env_index_ = env_index; }  // D4
@@ -131,9 +124,6 @@ public:
         if (intents->step_once && steps == 0u) steps = 1u;
         bool step_ok = true;
         for (uint32_t s = 0; s < steps; ++s) {
-            // The general per-step control hook runs BEFORE the step it governs
-            // (a controller owns its own decimation, counted in steps).
-            if (controller_ != nullptr) controller_->OnStep(world_, env_index_);
             step_ok = sim_system_.Run(world_, planned_) && step_ok;
         }
         transform_sync_system_.Run(*publisher_, world_, env_index_, render_world_);
@@ -158,7 +148,6 @@ private:
     TransformSyncSystem transform_sync_system_;
     RenderSystem        render_system_;
 
-    SceneController*  controller_ = nullptr;  // not owned; per-step control hook
     render::VulkanRasterRenderer* renderer_ = nullptr;   // not owned
     render::RasterOptions         raster_options_{};
     render::VulkanOffscreenReport latest_report_{};

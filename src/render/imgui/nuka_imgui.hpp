@@ -22,8 +22,8 @@
 //   - DOES NOT create the swapchain/render-pass/descriptor-pool: those arrive in
 //     NukaImGuiInitInfo from the present renderer (T2/T3).
 //
-// GATING: this lib (nuka_imgui) is compiled ONLY when NK_BUILD_VULKAN_VALIDATION
-// is ON (M8.5 D3). The default build-cuda128 config never sees it.
+// GATING: this lib (nuka_imgui) is compiled ONLY when NK_BUILD_EDITOR or
+// NK_BUILD_VULKAN_VALIDATION is ON. The default build-cuda128 config never sees it.
 //
 // HOST-ONLY / zero-CUDA-token: pure C++/Vulkan glue; no CUDA. The vendored ImGui
 // is consumed as SYSTEM includes so it is out of the zero-CUDA lint scope.

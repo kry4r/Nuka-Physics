@@ -9,8 +9,8 @@
 // nks::Save persists. Operates on the general SceneIR / RenderWorld / ECS, with no
 // scene-specific code.
 //
-// HOST-ONLY / zero-CUDA-token: the only device touch is nk::Data via the queued
-// MoveEntity (applied in Simulation::FramePublish behind the phi vtable).
+// HOST-ONLY: the only world touch is the queued MoveEntity the frame loop applies
+// through the C ABI.
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"

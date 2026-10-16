@@ -762,7 +762,11 @@ typedef enum nuka_state_field_t {
     NUKA_FIELD_LINK_WRENCH = 105,
     // READ: per environment and CONTACT_SOLVE_METRICS entry, 20 float32 terms of that worst row: dual[3],
     // velocity[3], projected normal and tangent[2] impulse, penalty, compliance, response xx yy zz xy xz yz, mu[2], slot bits.
-    NUKA_FIELD_CONTACT_SOLVE_WORST_TERMS = 106
+    NUKA_FIELD_CONTACT_SOLVE_WORST_TERMS = 106,
+    // READ: per contact slot, the number of valid UCONTACT_POINT entries, environment-major.
+    NUKA_FIELD_UCONTACT_COUNT = 107,
+    // READ: per contact slot, four world contact points (xyz each), environment-major.
+    NUKA_FIELD_UCONTACT_POINT = 108
 } nuka_state_field_t;
 
 typedef enum nuka_vbd_element_kind_t {
@@ -920,6 +924,32 @@ typedef struct nuka_kinematic_link_t {
 // Root local poses are identity: this calibration query exposes no live state or world placement.
 nuka_result_t nuka_world_get_kinematic_link(nuka_world_handle world,
                                             uint32_t link_index, nuka_kinematic_link_t* out);
+
+// The body row (scene body record order) and articulation owning a per-environment link;
+// a floating root's pose is written through NUKA_FIELD_BASE_POSE at its articulation slot.
+typedef struct nuka_link_binding_t {
+    uint32_t body_index;
+    uint32_t articulation_index;
+    uint32_t is_root;
+    uint32_t is_floating;
+} nuka_link_binding_t;
+
+nuka_result_t nuka_world_get_link_binding(nuka_world_handle world, uint32_t link_index,
+                                          nuka_link_binding_t* out);
+
+// One cooked collision shape with its live world pose (xyz, wxyz) in an environment.
+// params hold the sphere radius, capsule radius and half height, or box half extents.
+typedef struct nuka_collider_t {
+    uint32_t kind;
+    uint32_t is_static;
+    float params[4];
+    float pose[7];
+} nuka_collider_t;
+
+// A null out queries *out_count; otherwise capacity must cover it.
+nuka_result_t nuka_world_get_colliders(nuka_world_handle world, uint32_t env_index,
+                                       nuka_collider_t* out, uint32_t capacity,
+                                       uint32_t* out_count);
 
 // ---------------------------------------------------------------------------
 // Offline beauty render of the LIVE world: a one-off HOST RGB image of the world's
@@ -1315,6 +1345,23 @@ nuka_result_t nuka_world_sample_terrain_height_batch(nuka_world_handle world,
                                                      const float* xs,
                                                      const float* ys,
                                                      float* out_heights);
+
+// The cooked terrain grid: world z of value v at (row, col) is base_z + v * scale_z,
+// with column c at origin.x + c * cell_x and row r at origin.y + r * cell_y.
+typedef struct nuka_terrain_info_t {
+    uint32_t nrow;
+    uint32_t ncol;
+    float cell_x;
+    float cell_y;
+    float origin[3];
+    float base_z;
+    float scale_z;
+} nuka_terrain_info_t;
+
+// NOT_SUPPORTED without a cooked terrain. A null values reads only the info; otherwise
+// capacity must hold nrow * ncol row-major floats.
+nuka_result_t nuka_world_get_terrain(nuka_world_handle world, nuka_terrain_info_t* out_info,
+                                     float* values, size_t capacity);
 
 #ifdef __cplusplus
 }

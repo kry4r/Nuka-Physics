@@ -306,6 +306,8 @@ nuka_result_t CookWorld(const WorldRecipe& recipe, const nuka::scene::SceneIR& s
     if (terrain != NUKA_RESULT_OK) {
         return terrain;
     }
+    // A scene-authored terrain is the record's grid when the desc bakes none.
+    if (!nuka::terrain::IsValid(out->terrain)) out->terrain = std::move(cooked.terrain);
     if (!recipe.media_before_terrain) {
         cook::CookSceneMedia(cooked.model, desc.env_count, scene.Media(), recipe.contact_radius);
     }
@@ -992,6 +994,28 @@ nuka_result_t nuka_world_sample_terrain_height_batch(nuka_world_handle world,
     return NUKA_RESULT_OK;
 }
 
+nuka_result_t nuka_world_get_terrain(nuka_world_handle world, nuka_terrain_info_t* out_info,
+                                     float* values, size_t capacity) {
+    if (out_info == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    const nuka::terrain::HeightField& hf = record->cooked_terrain;
+    if (!nuka::terrain::IsValid(hf)) return NUKA_RESULT_NOT_SUPPORTED;
+    out_info->nrow = hf.nrow;
+    out_info->ncol = hf.ncol;
+    out_info->cell_x = hf.cell_x;
+    out_info->cell_y = hf.cell_y;
+    out_info->origin[0] = hf.origin.x;
+    out_info->origin[1] = hf.origin.y;
+    out_info->origin[2] = hf.origin.z;
+    out_info->base_z = hf.base_z;
+    out_info->scale_z = hf.scale_z;
+    if (values == nullptr) return NUKA_RESULT_OK;
+    if (capacity < hf.values.size()) return NUKA_RESULT_INVALID_ARG;
+    std::copy(hf.values.begin(), hf.values.end(), values);
+    return NUKA_RESULT_OK;
+}
+
 nuka_result_t nuka_world_get_dof_name(nuka_world_handle world,
                                       uint32_t link_index, char* out, size_t cap,
                                       size_t* out_len) {
@@ -1100,6 +1124,95 @@ nuka_result_t nuka_world_get_kinematic_link(nuka_world_handle world,
         }
         *out = result;
         return NUKA_RESULT_OK;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_link_binding(nuka_world_handle world, uint32_t link_index,
+                                          nuka_link_binding_t* out) {
+    if (out == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    const auto& art = record->world->GetModel().articulation;
+    if (link_index >= art.link_body.size()) return NUKA_RESULT_INVALID_ARG;
+    out->body_index = art.link_body[link_index];
+    out->articulation_index =
+        art.link_to_articulation.empty() ? 0u : art.link_to_articulation[link_index];
+    out->is_root = art.parent_link[link_index] == ~uint32_t(0) ? 1u : 0u;
+    out->is_floating = out->is_root != 0u &&
+        art.joint_type[link_index] ==
+            static_cast<uint8_t>(nuka::phi::ArticulationJointType::FloatingBase) ? 1u : 0u;
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_get_colliders(nuka_world_handle world, uint32_t env_index,
+                                       nuka_collider_t* out, uint32_t capacity,
+                                       uint32_t* out_count) {
+    if (out_count == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        using nuka::math::Transform;
+        namespace nk = nuka::nk;
+        nk::World& w = *record->world;
+        const nk::Model& model = w.GetModel();
+        const auto& shapes = model.shape_table_rows;
+        *out_count = static_cast<uint32_t>(shapes.size());
+        if (out == nullptr) return NUKA_RESULT_OK;
+        if (capacity < shapes.size() || env_index >= model.capacities.env_count)
+            return NUKA_RESULT_INVALID_ARG;
+        const uint64_t bodies = model.capacities.bodies_per_env;
+        const uint64_t links = model.capacities.links_per_env;
+        std::vector<Transform> body_pose(bodies), link_pose(links);
+        std::vector<float> inv_mass(bodies);
+        nk::Data& data = w.GetData();
+        const uint64_t tf = sizeof(Transform);
+        // Link rows are re-posed through FK; free bodies read their own pose row.
+        if ((bodies > 0u &&
+             (!data.DownloadField(nk::FieldId::BodyPose, body_pose.data(), bodies * tf,
+                                  env_index * bodies * tf) ||
+              !data.DownloadField(nk::FieldId::BodyInvMass, inv_mass.data(),
+                                  bodies * sizeof(float), env_index * bodies * sizeof(float)))) ||
+            (links > 0u &&
+             !data.DownloadField(nk::FieldId::LinkPose, link_pose.data(), links * tf,
+                                 env_index * links * tf)))
+            return NUKA_RESULT_INTERNAL;
+        static_assert(sizeof(Transform) == sizeof(nuka_collider_t::pose), "pose wire layout");
+        for (size_t i = 0; i < shapes.size(); ++i) {
+            const auto& shape = shapes[i];
+            nuka_collider_t& collider = out[i];
+            collider.kind = shape.kind;
+            std::copy(shape.params, shape.params + 4, collider.params);
+            Transform pose = Transform::Identity();
+            bool is_static = true;
+            if (shape.body_id >= 0) {
+                const auto body = static_cast<uint32_t>(shape.body_id);
+                const uint32_t link = body < model.body_to_link.size() ? model.body_to_link[body]
+                                                                       : ~uint32_t(0);
+                if (link != ~uint32_t(0)) {
+                    pose = link_pose.at(link);
+                    if (body < model.body_collidable_link.size() &&
+                        model.body_collidable_link[body] != ~uint32_t(0))
+                        pose = pose * model.body_collidable_local.at(body);
+                    else if (link < model.articulation.link_geom_local.size())
+                        pose = pose * model.articulation.link_geom_local[link];
+                    is_static = false;
+                } else {
+                    pose = body_pose.at(body);
+                    is_static = inv_mass[body] == 0.0f;
+                }
+            }
+            collider.is_static = is_static ? 1u : 0u;
+            std::memcpy(collider.pose, &pose, sizeof(pose));
+        }
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
         return nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {

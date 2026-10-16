@@ -291,13 +291,14 @@ nuka_set_warnings(nuka_render)
 
 add_subdirectory(rhi)
 
-if(NK_BUILD_VULKAN_VALIDATION)
+if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     include("${CMAKE_SOURCE_DIR}/cmake/ViewerFonts.cmake")
     nuka_resolve_viewer_fonts()
 
     add_library(nuka_imgui STATIC
         render/imgui/nuka_imgui.cpp
     )
+    set_target_properties(nuka_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     target_include_directories(nuka_imgui
         PUBLIC
@@ -350,13 +351,14 @@ if(NK_BUILD_VULKAN_VALIDATION)
     nuka_set_warnings(nuka_imgui)
 endif()
 
-if(NK_BUILD_VULKAN_VALIDATION)
+if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     add_library(nuka_present STATIC
         render/raster/vulkan_present_renderer.cpp
         render/window/window_surface_sdl3.cpp
         render/window/window_surface_headless.cpp
     )
     add_dependencies(nuka_present nuka_render_shaders)
+    set_target_properties(nuka_present PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     target_include_directories(nuka_present
         PUBLIC
@@ -384,7 +386,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
 endif()
 
 # The viewer panels and camera use render snapshots without a physics backend.
-if(NK_BUILD_VULKAN_VALIDATION)
+if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     add_library(nuka_viewer STATIC
         runtime/app/viewer/camera_controller.cpp
         runtime/app/viewer/debug_draw.cpp
@@ -756,28 +758,27 @@ if(CMAKE_CUDA_COMPILER)
     # nuka_inference_gpu — the device-resident policy: general batched MLP kernels
     # + the Go2 obs-assembly / drive-write kernels (runtime/inference/gpu_policy.cu).
     # A control step reads the device fields directly and stays on the world backend
-    # main stream, so it issues NO host round-trip. Links nuka_phi2 for the opaque-
-    # backend main-stream accessor (the interop-scatter precedent).
+    # stream the C ABI hands out (nuka_world_get_stream), so it issues NO host round-trip.
     # -------------------------------------------------------------------------
     add_library(nuka_inference_gpu STATIC
         runtime/inference/gpu_policy.cu
     )
     set_target_properties(nuka_inference_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_inference_gpu PUBLIC ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(nuka_inference_gpu PUBLIC nuka_phi2 CUDA::cudart)
+    target_link_libraries(nuka_inference_gpu PUBLIC CUDA::cudart)
 
     # -------------------------------------------------------------------------
-    # nuka_inference — scene controllers built on the policy runner. Go2Policy-
-    # Controller reads world state via the Data seam, builds the height-scan obs,
-    # runs the MLP, and writes PD drive targets. Production drives the GPU-resident
-    # path (nuka_inference_gpu); the host MLP stays the numeric oracle.
+    # nuka_inference — world controllers built on the policy runner. Go2Policy-
+    # Controller reads world state through the C ABI fields, builds the height-scan
+    # obs, runs the MLP, and writes PD drive targets. Production drives the GPU-
+    # resident path (nuka_inference_gpu); the host MLP stays the numeric oracle.
     # -------------------------------------------------------------------------
     add_library(nuka_inference STATIC
         runtime/inference/go2_policy_controller.cpp
     )
     set_target_properties(nuka_inference PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(nuka_inference PUBLIC ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(nuka_inference PUBLIC nuka_policy_mlp nuka_nk nuka_inference_gpu)
+    target_link_libraries(nuka_inference PUBLIC nuka_policy_mlp nuka_inference_gpu nuka)
     nuka_set_warnings(nuka_inference)
 
     # -------------------------------------------------------------------------
@@ -829,69 +830,6 @@ if(CMAKE_CUDA_COMPILER)
     endif()
 
     nuka_set_warnings(nuka_app)
-
-    if(NK_BUILD_VULKAN_VALIDATION)
-        # nuka_editor -- the windowed scene EDITOR exe (viewer_main + editor_scene,
-        # the runtime .nks load path). Opens EMPTY and loads / swaps scenes at runtime
-        # through ONE LoadEditorScene path the --scene flag also drives. OUTPUT_NAME is
-        # nuka_editor -> build-win-editor/src/nuka_editor.exe.
-        # Embedded CPython for the live-world script console: a built-in `nuka` module
-        # in the exe (NOT the pip package). Development.Embed pins the system libpython.
-        find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed)
-        execute_process(
-            COMMAND "${Python3_EXECUTABLE}" -c "import sys; sys.stdout.write(sys.prefix)"
-            OUTPUT_VARIABLE NUKA_PY_HOME)
-        # Forward slashes keep the Windows prefix a valid C string literal.
-        file(TO_CMAKE_PATH "${NUKA_PY_HOME}" NUKA_PY_HOME)
-        message(STATUS "nuka_editor: embedding python ${Python3_VERSION} (home ${NUKA_PY_HOME})")
-
-        add_executable(nuka_editor_exe
-            runtime/app/viewer/viewer_main.cpp
-            runtime/app/viewer/editor_scene.cpp
-            runtime/app/viewer/editor_edits.cpp
-            runtime/app/viewer/editor_undo.cpp
-            runtime/app/viewer/debug_overlay.cpp
-            runtime/app/viewer/script_host.cpp
-        )
-        add_dependencies(nuka_editor_exe nuka_render_shaders)
-        set_target_properties(nuka_editor_exe PROPERTIES OUTPUT_NAME nuka_editor)
-        nuka_copy_viewer_resources(nuka_editor_exe)
-        target_include_directories(nuka_editor_exe
-            PRIVATE
-                ${CMAKE_SOURCE_DIR}/src
-        )
-        # Python headers as SYSTEM so libpython's macros never trip -Werror.
-        target_include_directories(nuka_editor_exe SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
-        target_compile_definitions(nuka_editor_exe PRIVATE
-            NK_BUILD_VULKAN_VALIDATION
-            NUKA_PY_HOME="${NUKA_PY_HOME}"
-            NUKA_VIEWER_DEFAULT_SCENE="${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab/gripper.nks")
-        target_link_libraries(nuka_editor_exe
-            PRIVATE
-                Python3::Python
-                nuka_viewer
-                nuka_present
-                nuka_imgui
-                nuka_app
-                nuka_inference
-                nuka_policy_mlp
-                nuka_scene_cook
-                nuka_render
-                nuka_nk
-                nuka_phi2
-                nuka_phi2_interop
-                nuka_runtime
-                nuka_import
-                nuka_cooker
-                nuka_contact_wrench
-                nuka_collision_gpu
-                nuka_core
-                nuka_phi
-                imgui
-                Vulkan::Vulkan
-        )
-        nuka_set_warnings(nuka_editor_exe)
-    endif()
 
     add_library(nuka_runtime_gpu STATIC
         core/diagnostics/invariants_gpu.cu
@@ -1254,6 +1192,11 @@ if(CMAKE_CUDA_COMPILER)
         set_source_files_properties(c_abi/recorder.cpp PROPERTIES
             COMPILE_DEFINITIONS NK_BUILD_VULKAN_VALIDATION)
         target_link_libraries(nuka PRIVATE nuka_app nuka_render)
+        if(MSVC)
+            # The recorder loads vulkan-1.dll on first use, so headless runs need no Vulkan loader.
+            target_link_options(nuka PRIVATE /DELAYLOAD:vulkan-1.dll)
+            target_link_libraries(nuka PRIVATE delayimp)
+        endif()
     endif()
 
     set_target_properties(nuka PROPERTIES
@@ -1290,6 +1233,81 @@ if(CMAKE_CUDA_COMPILER)
         NAMESPACE nuka::
         DESTINATION lib/cmake/nuka
     )
+
+    if(NK_BUILD_EDITOR)
+        # The editor reaches physics only through the nuka C ABI; nuka_editor_core is
+        # its world binding, scene cache, edits, undo and debug overlay.
+        add_library(nuka_editor_core STATIC
+            runtime/app/viewer/editor_world.cpp
+            runtime/app/viewer/editor_scene.cpp
+            runtime/app/viewer/editor_edits.cpp
+            runtime/app/viewer/editor_undo.cpp
+            runtime/app/viewer/debug_overlay.cpp
+        )
+        set_target_properties(nuka_editor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(nuka_editor_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(nuka_editor_core PUBLIC nuka nuka_viewer nuka_render nuka_import)
+        nuka_set_warnings(nuka_editor_core)
+
+        # nuka_editor -- the editor shared library behind nuka/nuka_editor.h. Python's
+        # nuka.editor and the nuka-editor launcher load it; it exports only nuka_editor_*.
+        add_library(nuka_editor SHARED
+            runtime/app/viewer/editor_host.cpp
+            runtime/app/viewer/editor_api.cpp
+        )
+        add_dependencies(nuka_editor nuka_render_shaders)
+        set_target_properties(nuka_editor PROPERTIES
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON)
+        target_compile_definitions(nuka_editor PRIVATE
+            NUKA_EDITOR_BUILD
+            NUKA_VIEWER_DEFAULT_SCENE="${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab/gripper.nks")
+        target_link_libraries(nuka_editor
+            PRIVATE
+                nuka
+                nuka_editor_core
+                nuka_inference
+                nuka_viewer
+                nuka_present
+                nuka_imgui
+                nuka_render
+                nuka_import
+                imgui
+                Vulkan::Vulkan
+        )
+        if(NOT WIN32)
+            file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nuka_editor.map" "{ global: nuka_editor_*; local: *; };\n")
+            target_link_options(nuka_editor PRIVATE
+                "LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/nuka_editor.map")
+        endif()
+        nuka_copy_viewer_resources(nuka_editor)
+        nuka_set_warnings(nuka_editor)
+        install(TARGETS nuka_editor LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+
+        # nuka-editor -- the launcher: an embedded interpreter running `python -m nuka.editor`.
+        find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c "import sys; sys.stdout.write(sys.prefix)"
+            OUTPUT_VARIABLE NUKA_PY_HOME)
+        # Forward slashes keep the Windows prefix a valid C string literal.
+        file(TO_CMAKE_PATH "${NUKA_PY_HOME}" NUKA_PY_HOME)
+        add_executable(nuka_editor_exe runtime/app/viewer/editor_exe_main.cpp)
+        # A distinct output name keeps the launcher's PDB apart from nuka_editor.dll's.
+        set_target_properties(nuka_editor_exe PROPERTIES OUTPUT_NAME nuka-editor)
+        # Python headers as SYSTEM so libpython's macros never trip -Werror.
+        target_include_directories(nuka_editor_exe SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
+        target_compile_definitions(nuka_editor_exe PRIVATE NUKA_PY_HOME="${NUKA_PY_HOME}")
+        target_link_libraries(nuka_editor_exe PRIVATE Python3::Python)
+        if(WIN32)
+            # The interpreter DLL sits beside the launcher so no other python3x.dll on PATH wins.
+            add_custom_command(TARGET nuka_editor_exe POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_RUNTIME_DLLS:nuka_editor_exe> $<TARGET_FILE_DIR:nuka_editor_exe>
+                COMMAND_EXPAND_LISTS)
+        endif()
+        nuka_set_warnings(nuka_editor_exe)
+        install(TARGETS nuka_editor_exe RUNTIME DESTINATION bin)
+    endif()
 
     add_executable(nuka_pipeline_benchmark
         ${CMAKE_SOURCE_DIR}/tools/perf/pipeline_benchmark.cpp)

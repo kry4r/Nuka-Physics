@@ -5,8 +5,8 @@
 // GpuMlp is a GENERAL batched MLP forward on the device (RunningMeanStd normalize
 // -> [Linear+ELU] x N -> linear head), weights uploaded once from a host MlpPolicy
 // and the SAME arithmetic (double-accumulated dot, fp32 ELU) so it reproduces the
-// host oracle to ~1e-5. Go2GpuPolicy runs ONE control step entirely on the world
-// backend's main stream: obs-assembly kernels read the device fields directly, the
+// host oracle to ~1e-5. Go2GpuPolicy runs ONE control step entirely on the world's
+// stream: obs-assembly kernels read the device fields directly, the
 // MLP runs, drive targets are written back -- NO host round-trip (no D2H/H2D).
 //
 // The go2 specifics (which field maps to which obs slot, the action scale, the
@@ -73,8 +73,8 @@ private:
 };
 
 // Device-resident Go2 policy core. One control step = obs kernels -> MLP -> drive
-// write, all enqueued on the world backend's main stream (ordered after the prior
-// physics, before the next) -- zero host round-trip.
+// write, all enqueued on the world's stream (ordered after the prior physics,
+// before the next) -- zero host round-trip.
 class Go2GpuPolicy {
 public:
     Go2GpuPolicy();
@@ -92,15 +92,15 @@ public:
     void SetCommand(float vx, float vy, float wyaw);
 
     // Once: write PD gains + per-joint force limits on every dog's leg slots
-    // (device kernel; no host copy). `backend` is the opaque phi::Backend*; the
+    // (device kernel; no host copy). `stream` is the world's cudaStream_t; the
     // three pointers are the env-0 base device pointers of the drive fields.
-    void ApplyGains(void* backend, float* drive_stiffness, float* drive_damping,
+    void ApplyGains(void* stream, float* drive_stiffness, float* drive_damping,
                     float* drive_force_limit, uint32_t env_index);
 
     // One control step. Pointers are the env-0 base device pointers of the fields
-    // (World::FieldPtr); env_index selects the env. Enqueues on the backend main
-    // stream and returns immediately (no sync).
-    void Step(void* backend, const float* link_pose, const float* link_velocity,
+    // (the world's buffer views); env_index selects the env. Enqueues on `stream`
+    // and returns immediately (no sync).
+    void Step(void* stream, const float* link_pose, const float* link_velocity,
               const float* q, const float* qdot, const float* base_pose,
               float* drive_target, uint32_t env_index);
 

@@ -465,11 +465,22 @@ public:
         return new World(h, env_count, dt);
     }
 
+    // Wraps a world another in-process component owns; destroy() only detaches.
+    static World* borrow(uintptr_t raw, float dt) {
+        auto* h = reinterpret_cast<nuka_world_handle>(raw);
+        nuka_world_resource_info_t info{};
+        check(nuka_world_get_resource_info(h, &info), "nuka_world_get_resource_info");
+        auto* world = new World(h, info.env_count, dt);
+        world->owned_ = false;
+        return world;
+    }
+    uintptr_t handle() const { return reinterpret_cast<uintptr_t>(h_); }
+
     void destroy() {
-        if (h_ != nullptr) {
+        if (h_ != nullptr && owned_) {
             nuka_world_destroy(h_);
-            h_ = nullptr;
         }
+        h_ = nullptr;
     }
     ~World() { destroy(); }
 
@@ -964,6 +975,7 @@ private:
     }
 
     nuka_world_handle h_ = nullptr;
+    bool owned_ = true;
     uint32_t env_count_ = 0u;
     uint32_t base_link_count_ = 0u;
     float dt_ = 0.0f;
@@ -1956,6 +1968,8 @@ NB_MODULE(_nuka_ext, m) {
         .value("CONTACT_SOLVE_METRICS", NUKA_FIELD_CONTACT_SOLVE_METRICS)
         .value("CONTACT_SOLVE_COUNTS", NUKA_FIELD_CONTACT_SOLVE_COUNTS)
         .value("CONTACT_SOLVE_WORST_TERMS", NUKA_FIELD_CONTACT_SOLVE_WORST_TERMS)
+        .value("UCONTACT_COUNT", NUKA_FIELD_UCONTACT_COUNT)
+        .value("UCONTACT_POINT", NUKA_FIELD_UCONTACT_POINT)
         .value("BODY_FORCE", NUKA_FIELD_BODY_FORCE)
         .value("BODY_TORQUE", NUKA_FIELD_BODY_TORQUE)
         .value("LINK_WRENCH", NUKA_FIELD_LINK_WRENCH)
@@ -2283,6 +2297,11 @@ NB_MODULE(_nuka_ext, m) {
         .def("record_event", &World::record_event, nb::arg("event"),
              "Record a caller-created cudaEvent_t (an integer) after all submitted world work.")
         .def("destroy", &World::destroy, "Destroy the world.")
+        .def_static("borrow", &World::borrow, nb::arg("handle"), nb::arg("dt"),
+                    nb::rv_policy::take_ownership,
+                    "Wrap a world handle owned elsewhere in this process; destroy() only detaches.")
+        .def_prop_ro("handle", &World::handle,
+                     "The raw nuka_world_handle as an integer, for in-process extensions.")
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)
         .def_prop_ro("particle_count", &World::particle_count,

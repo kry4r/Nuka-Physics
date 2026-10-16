@@ -2,15 +2,12 @@
 
 #include "math/transform.hpp"
 #include "math/vec3.hpp"
-#include "nk/data/data.hpp"
-#include "nk/model/generated/field_ids.hpp"
-#include "nk/model/model.hpp"
-#include "nk/pipeline/world.hpp"
 #include "scene/ecs/components.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace nuka::runtime::app::viewer {
 namespace {
@@ -58,102 +55,42 @@ void DebugOverlay::EnsureMaterials(render::RenderWorld& render_world) {
     materials_ready_ = true;
 }
 
-void DebugOverlay::AppendColliders(nk::World& world, render::RenderWorld& render_world,
+void DebugOverlay::AppendColliders(nuka_world_handle world, render::RenderWorld& render_world,
                                     uint32_t env_index) {
-    const nk::Model& model = world.GetModel();
-    const auto& shapes = model.shape_table_rows;
-    const uint32_t bodies = model.capacities.bodies_per_env;
-    const uint32_t env_count = model.capacities.env_count;
-    if (shapes.empty()) { colliders_available_ = true; return; }
-    const uint32_t env = (env_count > 0u) ? (env_index % env_count) : 0u;
-
-    // A body-attached collider's live frame: an articulation LINK reads
-    // LinkPose[link] o link_geom_local[link] (its BodyPose row is unpopulated until a
-    // step syncs it); a free body reads BodyPose[i]; implicit ground is world origin.
-    // STATIC only if implicit ground or a free body with inv_mass 0 -- a link
-    // (body_to_link != ~0u) is dynamic though its body-row inv_mass is 0.
-    const auto& body_to_link = model.body_to_link;                    // host; empty w/o articulation
-    const auto& link_geom_local = model.articulation.link_geom_local; // host; per template link
-    const uint32_t links = model.capacities.links_per_env;
-    static_assert(sizeof(Transform) == 7u * sizeof(float), "BodyPose wire layout");
-    body_poses_.assign(bodies ? bodies : 1u, Transform::Identity());
-    body_inv_mass_.assign(bodies ? bodies : 1u, 0.0f);
-    link_poses_.assign(links ? links : 1u, Transform::Identity());
-    nk::Data& data = world.GetData();
-    if (bodies > 0u) {
-        const uint64_t base = static_cast<uint64_t>(env) * bodies;
-        if (!data.DownloadField(nk::FieldId::BodyPose, body_poses_.data(),
-                                static_cast<uint64_t>(bodies) * sizeof(Transform),
-                                base * sizeof(Transform)) ||
-            !data.DownloadField(nk::FieldId::BodyInvMass, body_inv_mass_.data(),
-                                static_cast<uint64_t>(bodies) * sizeof(float),
-                                base * sizeof(float))) {
-            return;
-        }
-    }
-    if (links > 0u &&
-        !data.DownloadField(nk::FieldId::LinkPose, link_poses_.data(),
-                            static_cast<uint64_t>(links) * sizeof(Transform),
-                            static_cast<uint64_t>(env) * links * sizeof(Transform))) {
+    // Each cooked collider comes with its live world pose for this environment.
+    uint32_t count = 0u;
+    if (nuka_world_get_colliders(world, env_index, nullptr, 0u, &count) != NUKA_RESULT_OK) return;
+    colliders_.resize(count);
+    if (count > 0u &&
+        nuka_world_get_colliders(world, env_index, colliders_.data(), count, &count) !=
+            NUKA_RESULT_OK)
         return;
-    }
-
     colliders_available_ = true;
-    for (uint32_t i = 0; i < shapes.size(); ++i) {
-        const auto& sh = shapes[i];
-        // Resolve the owning body through the row's own body_id (shape rows are
-        // NOT 1:1 with body rows); body_id < 0 == static (ground / heightfield).
-        const uint32_t bid = (sh.body_id >= 0) ? static_cast<uint32_t>(sh.body_id)
-                                               : ~uint32_t(0);
-        const bool has_body = bid < bodies;
-        if (sh.body_id >= 0 && !has_body) { batch_.RejectCollider(); continue; }
-        const bool is_link =
-            has_body && bid < body_to_link.size() && body_to_link[bid] != ~uint32_t(0);
-        Transform pose = Transform::Identity();
-        if (is_link) {
-            const uint32_t l = body_to_link[bid];
-            if (l >= links || !IsValidDebugPose(link_poses_[l])) { batch_.RejectCollider(); continue; }
-            pose = link_poses_[l];
-            // A proxy collidable carries its own geom offset; the primary uses the link's.
-            const auto& coll_link = model.body_collidable_link;
-            if (bid < coll_link.size() && coll_link[bid] != ~uint32_t(0)) {
-                if (bid >= model.body_collidable_local.size() ||
-                    !IsValidDebugPose(model.body_collidable_local[bid])) { batch_.RejectCollider(); continue; }
-                pose = pose * model.body_collidable_local[bid];
-            } else if (l < link_geom_local.size()) {
-                if (!IsValidDebugPose(link_geom_local[l])) { batch_.RejectCollider(); continue; }
-                pose = pose * link_geom_local[l];
-            }
-        } else if (has_body) {
-            pose = body_poses_[bid];
-        }
-        const bool is_static =
-            has_body ? (!is_link && body_inv_mass_[bid] == 0.0f) : true;
-        const uint32_t mat = is_static ? mat_static_ : mat_dynamic_;
-        batch_.AppendCollider(render_world, sh.kind, sh.params, pose, mat);
+    for (const nuka_collider_t& collider : colliders_) {
+        Transform pose;
+        std::memcpy(&pose, collider.pose, sizeof(pose));
+        if (!IsValidDebugPose(pose)) { batch_.RejectCollider(); continue; }
+        const uint32_t mat = collider.is_static != 0u ? mat_static_ : mat_dynamic_;
+        batch_.AppendCollider(render_world, collider.kind, collider.params, pose, mat);
     }
 }
 
-void DebugOverlay::AppendContacts(nk::World& world, render::RenderWorld& render_world,
-                                   uint32_t env_index) {
-    const nk::Model& model = world.GetModel();
-    const uint32_t max_c = model.capacities.max_contacts_per_env;
-    const uint32_t env_count = model.capacities.env_count;
+void DebugOverlay::AppendContacts(nuka_world_handle world, const WorldLayout& layout,
+                                   render::RenderWorld& render_world, uint32_t env_index) {
+    const uint32_t max_c = layout.contact_slots_per_env;
     if (max_c == 0u) { contacts_available_ = true; return; }
     if (!batch_.ShouldReadContacts(max_c)) return;
-    const uint32_t env = (env_count > 0u) ? (env_index % env_count) : 0u;
 
     ucontact_counts_.assign(max_c, 0u);
     ucontact_points_.assign(static_cast<size_t>(max_c) * 4u, Vec3{0, 0, 0});
     static_assert(sizeof(Vec3) == 3u * sizeof(float), "UcontactPoint wire layout");
-    nk::Data& data = world.GetData();
-    const uint64_t slot_base = static_cast<uint64_t>(env) * max_c;
-    if (!data.DownloadField(nk::FieldId::UcontactCount, ucontact_counts_.data(),
-                            static_cast<uint64_t>(max_c) * sizeof(uint32_t),
-                            slot_base * sizeof(uint32_t)) ||
-        !data.DownloadField(nk::FieldId::UcontactPoint, ucontact_points_.data(),
-                            static_cast<uint64_t>(max_c) * 4u * sizeof(Vec3),
-                            slot_base * 4u * sizeof(Vec3))) {
+    const size_t slot_base = static_cast<size_t>(env_index % layout.env_count) * max_c;
+    if (nuka_world_download_field(world, NUKA_FIELD_UCONTACT_COUNT, ucontact_counts_.data(),
+                                  static_cast<size_t>(max_c) * sizeof(uint32_t),
+                                  slot_base * sizeof(uint32_t)) != NUKA_RESULT_OK ||
+        nuka_world_download_field(world, NUKA_FIELD_UCONTACT_POINT, ucontact_points_.data(),
+                                  static_cast<size_t>(max_c) * 4u * sizeof(Vec3),
+                                  slot_base * 4u * sizeof(Vec3)) != NUKA_RESULT_OK) {
         return;
     }
 
@@ -166,8 +103,9 @@ void DebugOverlay::AppendContacts(nk::World& world, render::RenderWorld& render_
     }
 }
 
-void DebugOverlay::Rebuild(nk::World& world, render::RenderWorld& render_world,
-                           uint32_t env_index, bool show_colliders, bool show_contacts) {
+void DebugOverlay::Rebuild(nuka_world_handle world, const WorldLayout& layout,
+                           render::RenderWorld& render_world, uint32_t env_index,
+                           bool show_colliders, bool show_contacts) {
     // The overlay owns the dedicated debug channel outright: clear it each rebuild.
     // The real `instances` set is never touched, so a non-overlay frame is untouched.
     render_world.debug_instances.clear();
@@ -176,8 +114,8 @@ void DebugOverlay::Rebuild(nk::World& world, render::RenderWorld& render_world,
     if (!show_colliders && !show_contacts) { overflow_logged_ = false; return; }
 
     EnsureMaterials(render_world);
-    if (show_colliders) AppendColliders(world, render_world, env_index);
-    if (show_contacts) AppendContacts(world, render_world, env_index);
+    if (show_colliders) AppendColliders(world, render_world, env_index % layout.env_count);
+    if (show_contacts) AppendContacts(world, layout, render_world, env_index);
 
     const auto& report = batch_.Report();
     const bool omitted = report.omitted_instances != 0u || report.contacts_budget_skipped;

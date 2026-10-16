@@ -33,8 +33,8 @@
 // composited), which the determinism smoke relies on.
 //
 // HOST-ONLY / zero-CUDA-token. This TU includes the vendored ImGui (SYSTEM
-// include) so it is gated behind NK_BUILD_VULKAN_VALIDATION with the rest of the
-// viewer; it pulls no Vulkan headers.
+// include) so it is gated behind NK_BUILD_EDITOR / NK_BUILD_VULKAN_VALIDATION with
+// the rest of the viewer; it pulls no Vulkan headers.
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"

@@ -12,17 +12,14 @@
 // non-movable pose source, so the real instance set, picker, and scene tree are
 // untouched and a both-toggles-off frame is byte-identical to the real set.
 //
-// HOST-ONLY / zero-CUDA-token: device reads go only through Data::DownloadField.
+// HOST-ONLY: device reads go only through the C ABI collider query and field downloads.
 // ---------------------------------------------------------------------------
 
 #include "runtime/app/viewer/debug_draw.hpp"
+#include "runtime/app/viewer/editor_world.hpp"
 
 #include <cstdint>
 #include <vector>
-
-namespace nuka::nk {
-class World;
-}  // namespace nuka::nk
 
 namespace nuka::runtime::app::viewer {
 
@@ -38,10 +35,10 @@ public:
     // prior append, then -- when a toggle is on -- appends collider proxies and/or
     // contact markers. A no-op (beyond removing any prior append) when both
     // toggles are off, so the default path leaves the real instance set untouched.
-    // `world` is read only (cooked shapes + downloaded fields); it is non-const
-    // solely because Data::DownloadField is reached through a non-const accessor.
-    void Rebuild(nk::World& world, render::RenderWorld& render_world,
-                 uint32_t env_index, bool show_colliders, bool show_contacts);
+    // `world` is only read (cooked colliders + downloaded contact fields).
+    void Rebuild(nuka_world_handle world, const WorldLayout& layout,
+                 render::RenderWorld& render_world, uint32_t env_index,
+                 bool show_colliders, bool show_contacts);
 
     // Counts emitted by the most recent Rebuild (the data-path gate reads these).
     uint32_t LastColliderCount() const { return batch_.Report().colliders; }
@@ -57,10 +54,10 @@ private:
     // (the rebuilt RenderWorld dropped the prior materials).
     void EnsureMaterials(render::RenderWorld& render_world);
 
-    void AppendColliders(nk::World& world, render::RenderWorld& render_world,
+    void AppendColliders(nuka_world_handle world, render::RenderWorld& render_world,
                          uint32_t env_index);
-    void AppendContacts(nk::World& world, render::RenderWorld& render_world,
-                        uint32_t env_index);
+    void AppendContacts(nuka_world_handle world, const WorldLayout& layout,
+                        render::RenderWorld& render_world, uint32_t env_index);
 
     // Material ids into RenderWorld::materials; valid only while materials_ready_.
     uint32_t mat_dynamic_ = 0u;
@@ -75,9 +72,7 @@ private:
 
     // Reused host staging for the per-frame field downloads (allocation-free after
     // the first rebuild).
-    std::vector<math::Transform> body_poses_;
-    std::vector<math::Transform> link_poses_;
-    std::vector<float>           body_inv_mass_;
+    std::vector<nuka_collider_t> colliders_;
     std::vector<uint32_t>        ucontact_counts_;
     std::vector<math::Vec3>      ucontact_points_;
 };

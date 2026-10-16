@@ -23,8 +23,11 @@ set(NUKA_INCLUDE_DIR "${NUKA_ROOT}/src/include")
 if(WIN32)
   set(NUKA_LIB "${NUKA_BUILD_DIR}/src/nuka.lib")
   set(NUKA_RUNTIME "${NUKA_BUILD_DIR}/src/nuka.dll")
+  set(NUKA_EDITOR_LIB "${NUKA_BUILD_DIR}/src/nuka_editor.lib")
+  set(NUKA_EDITOR_RUNTIME "${NUKA_BUILD_DIR}/src/nuka_editor.dll")
 else()
   set(NUKA_LIB "${NUKA_BUILD_DIR}/src/libnuka.so")
+  set(NUKA_EDITOR_LIB "${NUKA_BUILD_DIR}/src/libnuka_editor.so")
   set(CUDART_LIB "${CUDA_LIB_DIR}/libcudart.so")
 endif()
 
@@ -81,4 +84,23 @@ if(WIN32)
   file(GLOB NUKA_CUDART_DLLS "${CUDAToolkit_BIN_DIR}/cudart64_*.dll"
                              "${CUDAToolkit_BIN_DIR}/x64/cudart64_*.dll")
   install(FILES ${NUKA_CUDART_DLLS} DESTINATION nuka)
+endif()
+
+# The editor extension exists only when the engine was built with NK_BUILD_EDITOR.
+if(EXISTS "${NUKA_EDITOR_LIB}")
+  nanobind_add_module(_editor_ext STABLE_ABI NB_STATIC src/editor_ext.cpp)
+  target_include_directories(_editor_ext PRIVATE "${NUKA_INCLUDE_DIR}")
+  target_link_libraries(_editor_ext PRIVATE "${NUKA_EDITOR_LIB}")
+  if(NOT WIN32)
+    set_target_properties(_editor_ext PROPERTIES
+      BUILD_WITH_INSTALL_RPATH FALSE
+      INSTALL_RPATH "${NUKA_BUILD_DIR}/src")
+  endif()
+  install(TARGETS _editor_ext LIBRARY DESTINATION nuka RUNTIME DESTINATION nuka)
+  if(WIN32)
+    install(FILES "${NUKA_EDITOR_RUNTIME}" DESTINATION nuka)
+  endif()
+  # Fonts, the logo and the default scene resolve next to the editor library.
+  install(DIRECTORY "${NUKA_BUILD_DIR}/src/assets" "${NUKA_BUILD_DIR}/src/docs"
+                    "${NUKA_BUILD_DIR}/src/examples" DESTINATION nuka)
 endif()

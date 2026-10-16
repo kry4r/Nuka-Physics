@@ -36,6 +36,7 @@ include(CheckCXXSourceCompiles)
 # ---------------------------------------------------------------------------
 option(NK_BUILD_TESTS "Build unit / smoke tests" ON)
 option(NK_BUILD_VULKAN_VALIDATION "Build Vulkan-specific validation and timing tests" OFF)
+option(NK_BUILD_EDITOR "Build the editor DLL and its launcher" OFF)
 option(NK_BUILD_DEMO_TIMING_VALIDATION "Build scene demo render timing tests" OFF)
 option(NK_REQUIRE_CUDA "Require CUDA support for the preferred production physics backend" ON)
 set(NK_PHYSICS_BACKEND "CUDA" CACHE STRING "Preferred production physics backend")
@@ -205,8 +206,8 @@ target_include_directories(nuka_stb SYSTEM INTERFACE
     ${CMAKE_SOURCE_DIR}/external)
 
 # --- Dear ImGui + SDL3: vendored ImGui (external/imgui/NUKA_VENDOR.md) and the SDL3
-# window layer, built only with NK_BUILD_VULKAN_VALIDATION so the core build never fetches them.
-if(NK_BUILD_VULKAN_VALIDATION)
+# window layer, built only for the editor or Vulkan validation so the core build never fetches them.
+if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     # SDL3 is the window, input and Vulkan-surface layer on every platform; it also
     # backs the imgui_impl_sdl3 platform backend (IME, gamepads, Wayland and X11).
     FetchContent_Declare(
@@ -217,6 +218,7 @@ if(NK_BUILD_VULKAN_VALIDATION)
     )
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC_PIC ON CACHE BOOL "" FORCE)
     set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
     set(SDL_TESTS OFF CACHE BOOL "" FORCE)
     set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)

@@ -1,21 +1,21 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// nuka::runtime::inference::Go2PolicyController -- a SceneController that drives K
+// nuka::runtime::inference::Go2PolicyController -- a WorldController that drives K
 // co-resident Go2 closed-loop under a trained locomotion policy. Each control step
 // (decimation) it builds the 235-dim height-scan obs per dog (48 proprio + 187 scan
 // of the retained terrain grid), runs the MLP policy, and writes PD drive targets
-// through the general Data UploadField seam.
+// through the C ABI field seam.
 //
 // The Go2 obs/action contract -- joint slot order, scales, default stance, scan grid,
 // PD gains -- is CONFIG DATA on the Config struct, NOT a branch in world.Step() or
 // the solver: a different quadruped/policy is a different Config + weights file.
 //
-// HOST-ONLY (only Data D2H/H2D copies behind the phi vtable; no CUDA tokens).
+// HOST-ONLY (field copies and device views through the C ABI; no CUDA tokens).
 // ---------------------------------------------------------------------------
 
-#include "runtime/app/scene_controller.hpp"
 #include "runtime/inference/gpu_policy.hpp"
 #include "runtime/inference/mlp_policy.hpp"
+#include "runtime/inference/world_controller.hpp"
 #include "scene/terrain/heightfield.hpp"
 
 #include <array>
@@ -25,7 +25,7 @@
 
 namespace nuka::runtime::inference {
 
-class Go2PolicyController : public app::SceneController {
+class Go2PolicyController : public WorldController {
 public:
     // The Go2 locomotion contract DATA (legged_gym FL/FR/RL/RR x hip/thigh/calf).
     // slot_of_urdf[u] = buffer leg-slot of URDF joint u (identity for go2.nks).
@@ -66,7 +66,7 @@ public:
     }
 
     // General command seam: a locomotion command consumer. Teleop / scripts write a
-    // [vx, vy, wyaw] vector through the base SceneController without knowing the type.
+    // [vx, vy, wyaw] vector through the base WorldController without knowing the type.
     bool AcceptsCommand() const override { return true; }
     void SetCommandVector(const float* cmd, uint32_t count) override {
         SetCommand(count > 0u ? cmd[0] : 0.0f, count > 1u ? cmd[1] : 0.0f,
@@ -79,10 +79,10 @@ public:
     void SetUseGpu(bool on) { use_gpu_ = on && gpu_.Ready(); }
     bool UsingGpu() const { return use_gpu_; }
 
-    void OnStep(nk::World& world, uint32_t env_index) override;
+    void OnStep(nuka_world_handle world, uint32_t env_index) override;
 
 private:
-    void ApplyGains(nk::World& world, uint32_t env_index);
+    void ApplyGains(nuka_world_handle world, uint32_t env_index);
     void BuildObs(uint32_t dog, float* obs) const;
 
     MlpPolicy policy_;

@@ -7,8 +7,6 @@
 #include <cmath>
 #include <cstdio>
 
-#include "nk/model/generated/field_ids.hpp"
-#include "nk/pipeline/world.hpp"
 #include "scene/terrain/heightfield_sample.hpp"
 
 namespace nuka::runtime::inference {
@@ -32,6 +30,12 @@ inline void ProjectedGravity(float w, float x, float y, float z, float* out) {
     out[0] = -2.0f * w * cx + 2.0f * x * qv;
     out[1] = -2.0f * w * cy + 2.0f * y * qv;
     out[2] = a * vz - 2.0f * w * cz + 2.0f * z * qv;
+}
+
+float* FieldPtr(nuka_world_handle world, nuka_state_field_t field) {
+    nuka_buffer_view_t view{};
+    nuka_world_get_buffer_view(world, field, &view);
+    return static_cast<float*>(view.device_ptr);
 }
 }  // namespace
 
@@ -117,19 +121,16 @@ bool Go2PolicyController::Init(const std::string& policy_path, uint32_t links_pe
     return true;
 }
 
-void Go2PolicyController::ApplyGains(nk::World& world, uint32_t env_index) {
+void Go2PolicyController::ApplyGains(nuka_world_handle world, uint32_t env_index) {
     // Write the trained PD gains + per-joint force limits onto every dog's 12 leg
     // slots (the policy's contract); non-leg slots are untouched. Done once.
-    nk::Data& data = world.GetData();
-    const uint64_t link_base = static_cast<uint64_t>(env_index) * links_per_env_;
+    const size_t bytes = static_cast<size_t>(links_per_env_) * 4u;
+    const size_t at = static_cast<size_t>(env_index) * links_per_env_ * 4u;
     std::vector<float> kp(links_per_env_, 0.0f), kd(links_per_env_, 0.0f),
         fl(links_per_env_, 0.0f);
-    data.DownloadField(nk::FieldId::DriveStiffness, kp.data(),
-                       static_cast<uint64_t>(links_per_env_) * 4u, link_base * 4u);
-    data.DownloadField(nk::FieldId::DriveDamping, kd.data(),
-                       static_cast<uint64_t>(links_per_env_) * 4u, link_base * 4u);
-    data.DownloadField(nk::FieldId::DriveForceLimit, fl.data(),
-                       static_cast<uint64_t>(links_per_env_) * 4u, link_base * 4u);
+    nuka_world_download_field(world, NUKA_FIELD_DRIVE_STIFFNESS, kp.data(), bytes, at);
+    nuka_world_download_field(world, NUKA_FIELD_DRIVE_DAMPING, kd.data(), bytes, at);
+    nuka_world_download_field(world, NUKA_FIELD_DRIVE_FORCE_LIMIT, fl.data(), bytes, at);
     for (uint32_t k = 0; k < num_dogs_; ++k) {
         const uint32_t root = k * links_per_dog_;
         for (uint32_t u = 0; u < kJoints; ++u) {
@@ -139,12 +140,9 @@ void Go2PolicyController::ApplyGains(nk::World& world, uint32_t env_index) {
             fl[s] = cfg_.force_limit[u];
         }
     }
-    data.UploadField(nk::FieldId::DriveStiffness, kp.data(),
-                     static_cast<uint64_t>(links_per_env_) * 4u, link_base * 4u);
-    data.UploadField(nk::FieldId::DriveDamping, kd.data(),
-                     static_cast<uint64_t>(links_per_env_) * 4u, link_base * 4u);
-    data.UploadField(nk::FieldId::DriveForceLimit, fl.data(),
-                     static_cast<uint64_t>(links_per_env_) * 4u, link_base * 4u);
+    nuka_world_upload_field(world, NUKA_FIELD_DRIVE_STIFFNESS, kp.data(), bytes, at);
+    nuka_world_upload_field(world, NUKA_FIELD_DRIVE_DAMPING, kd.data(), bytes, at);
+    nuka_world_upload_field(world, NUKA_FIELD_DRIVE_FORCE_LIMIT, fl.data(), bytes, at);
 }
 
 void Go2PolicyController::BuildObs(uint32_t dog, float* obs) const {
@@ -200,29 +198,29 @@ void Go2PolicyController::BuildObs(uint32_t dog, float* obs) const {
     }
 }
 
-void Go2PolicyController::OnStep(nk::World& world, uint32_t env_index) {
+void Go2PolicyController::OnStep(nuka_world_handle world, uint32_t env_index) {
     if (!ready_) return;
 
     // GPU-resident path: obs-assembly -> MLP -> drive-write run entirely on the
-    // world backend's main stream (it reads the device fields directly), so a
-    // control step issues NO device<->host copy. void* keeps this TU CUDA-free.
+    // world's stream (it reads the device fields directly), so a control step
+    // issues NO device<->host copy. void* keeps this TU CUDA-free.
     if (use_gpu_) {
-        void* backend = static_cast<void*>(world.Backend());
+        void* stream = nullptr;
+        nuka_world_get_stream(world, &stream);
         if (!gains_applied_) {
-            gpu_.ApplyGains(backend,
-                            world.FieldPtr<float>(nk::FieldId::DriveStiffness),
-                            world.FieldPtr<float>(nk::FieldId::DriveDamping),
-                            world.FieldPtr<float>(nk::FieldId::DriveForceLimit),
+            gpu_.ApplyGains(stream, FieldPtr(world, NUKA_FIELD_DRIVE_STIFFNESS),
+                            FieldPtr(world, NUKA_FIELD_DRIVE_DAMPING),
+                            FieldPtr(world, NUKA_FIELD_DRIVE_FORCE_LIMIT),
                             env_index);
             gains_applied_ = true;
         }
         if ((step_++ % cfg_.decimation) != 0u) return;
-        gpu_.Step(backend, world.FieldPtr<float>(nk::FieldId::LinkPose),
-                  world.FieldPtr<float>(nk::FieldId::LinkVelocity),
-                  world.FieldPtr<float>(nk::FieldId::Q),
-                  world.FieldPtr<float>(nk::FieldId::Qdot),
-                  world.FieldPtr<float>(nk::FieldId::BasePose),
-                  world.FieldPtr<float>(nk::FieldId::DriveTarget), env_index);
+        gpu_.Step(stream, FieldPtr(world, NUKA_FIELD_ARTICULATION_LINK_POSE),
+                  FieldPtr(world, NUKA_FIELD_LINK_VELOCITY),
+                  FieldPtr(world, NUKA_FIELD_JOINT_POSITION),
+                  FieldPtr(world, NUKA_FIELD_JOINT_VELOCITY),
+                  FieldPtr(world, NUKA_FIELD_BASE_POSE),
+                  FieldPtr(world, NUKA_FIELD_DRIVE_TARGET), env_index);
         return;
     }
 
@@ -233,22 +231,21 @@ void Go2PolicyController::OnStep(nk::World& world, uint32_t env_index) {
     // Decimation: recompute the policy every N steps; the PD holds the target between.
     if ((step_++ % cfg_.decimation) != 0u) return;
 
-    nk::Data& data = world.GetData();
     const uint32_t L = links_per_env_;
-    const uint64_t link_base = static_cast<uint64_t>(env_index) * L;
-    const uint64_t art_base = static_cast<uint64_t>(env_index) * num_dogs_;
-    data.DownloadField(nk::FieldId::LinkPose, pose_.data(),
-                       static_cast<uint64_t>(L) * 7u * 4u, link_base * 7u * 4u);
-    data.DownloadField(nk::FieldId::LinkVelocity, vel_.data(),
-                       static_cast<uint64_t>(L) * 6u * 4u, link_base * 6u * 4u);
-    data.DownloadField(nk::FieldId::Q, q_.data(), static_cast<uint64_t>(L) * 4u,
-                       link_base * 4u);
-    data.DownloadField(nk::FieldId::Qdot, qd_.data(), static_cast<uint64_t>(L) * 4u,
-                       link_base * 4u);
-    data.DownloadField(nk::FieldId::BasePose, bp_.data(),
-                       static_cast<uint64_t>(num_dogs_) * 7u * 4u, art_base * 7u * 4u);
-    data.DownloadField(nk::FieldId::DriveTarget, tgt_.data(),
-                       static_cast<uint64_t>(L) * 4u, link_base * 4u);
+    const size_t link_base = static_cast<size_t>(env_index) * L;
+    const size_t art_base = static_cast<size_t>(env_index) * num_dogs_;
+    nuka_world_download_field(world, NUKA_FIELD_ARTICULATION_LINK_POSE, pose_.data(),
+                              static_cast<size_t>(L) * 7u * 4u, link_base * 7u * 4u);
+    nuka_world_download_field(world, NUKA_FIELD_LINK_VELOCITY, vel_.data(),
+                              static_cast<size_t>(L) * 6u * 4u, link_base * 6u * 4u);
+    nuka_world_download_field(world, NUKA_FIELD_JOINT_POSITION, q_.data(),
+                              static_cast<size_t>(L) * 4u, link_base * 4u);
+    nuka_world_download_field(world, NUKA_FIELD_JOINT_VELOCITY, qd_.data(),
+                              static_cast<size_t>(L) * 4u, link_base * 4u);
+    nuka_world_download_field(world, NUKA_FIELD_BASE_POSE, bp_.data(),
+                              static_cast<size_t>(num_dogs_) * 7u * 4u, art_base * 7u * 4u);
+    nuka_world_download_field(world, NUKA_FIELD_DRIVE_TARGET, tgt_.data(),
+                              static_cast<size_t>(L) * 4u, link_base * 4u);
 
     for (uint32_t k = 0; k < num_dogs_; ++k) {
         BuildObs(k, obs_.data());
@@ -262,8 +259,8 @@ void Go2PolicyController::OnStep(nk::World& world, uint32_t env_index) {
                 cfg_.default_angles[u] + cfg_.action_scale * a;
         }
     }
-    data.UploadField(nk::FieldId::DriveTarget, tgt_.data(),
-                     static_cast<uint64_t>(L) * 4u, link_base * 4u);
+    nuka_world_upload_field(world, NUKA_FIELD_DRIVE_TARGET, tgt_.data(),
+                            static_cast<size_t>(L) * 4u, link_base * 4u);
 }
 
 }  // namespace nuka::runtime::inference

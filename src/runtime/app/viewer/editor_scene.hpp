@@ -1,76 +1,53 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// nuka::runtime::app::viewer::EditorScene -- the scene-bound state the editor
-// cooks at runtime from one .nks: the physics World, the frame-loop Simulation
-// (owns the RenderWorld), and the SceneIR retained for entity->node lookups.
-//
-// ONE LOAD PATH: LoadEditorScene is the SINGLE cook->World->Simulation builder.
-// Both the Load UI and the --scene flag call it -- there is no separate startup
-// cook. The editor starts EMPTY (no EditorScene) and swaps one in on load.
-//
-// HOST-ONLY / zero-CUDA-token: the only device touch is nk::World (built here)
-// stepping behind the phi vtable.
-// ---------------------------------------------------------------------------
+// The editor's scene: the editable SceneIR document mirrored from a world's retained
+// scene, plus the render binding and live frame loop over that world.
 
-#include "nk/model/model.hpp"
-#include "nk/pipeline/world.hpp"
-#include "phi/backend.hpp"
-#include "runtime/app/pose_publisher.hpp"
-#include "runtime/app/simulation.hpp"
-#include "scene/graph/scene_graph.hpp"
+#include "nuka/nuka.h"
+#include "runtime/app/viewer/editor_world.hpp"
 #include "scene/scene_ir.hpp"
 #include "scene/terrain/heightfield.hpp"
 
+#include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace nuka::runtime::app::viewer {
 
-// The cooked product of one .nks. It lives ONLY inside a unique_ptr: the
-// Simulation holds a pointer into `publisher` and a reference into `*world`, so
-// the struct's address must never move after construction (copy + move deleted).
-// Member ORDER matters for teardown: `sim` (declared last of the three) is
-// destroyed before `publisher` and `world` that it references.
-struct EditorScene {
-    nuka::scene::SceneIR                            scene;      // retained for Ecs()
-    std::unique_ptr<nuka::nk::World>                world;
-    nuka::runtime::app::HostDownloadPublisher       publisher;  // outlives `sim`
-    std::unique_ptr<nuka::runtime::app::Simulation> sim;
-    nuka::nk::ModelCapacities                        caps{};
-    nuka::scene::SceneGraph                          editor_graph;
-    std::string                                      path;
-    // The baked terrain grid (valid when the .nks carried a TerrainRecord); a scene
-    // controller samples it for the height-scan obs. Invalid for terrain-free scenes.
-    nuka::terrain::HeightField                       terrain;
+// Scene files written for exports and rebuilds. Files stay for the session because
+// documents and render worlds reference their mesh archives.
+class SceneCache {
+public:
+    SceneCache();
+    std::string NextFile();
+    void Remove();
 
-    EditorScene() = default;
-    EditorScene(const EditorScene&) = delete;
-    EditorScene& operator=(const EditorScene&) = delete;
-    EditorScene(EditorScene&&) = delete;
-    EditorScene& operator=(EditorScene&&) = delete;
+private:
+    std::filesystem::path dir_;
+    uint32_t next_ = 0u;
 };
 
-// Cook `path` -> nk::Model -> World + RenderWorld + Simulation. Returns null (and
-// logs to stderr) on a missing file, a failed cook, or a not-ready World. `dt`
-// seeds the solver timestep. The SINGLE runtime load path for the editor.
-std::unique_ptr<EditorScene> LoadEditorScene(const std::string& path,
-                                             nuka::phi::Device* device,
-                                             nuka::phi::Backend* backend, float dt);
+struct EditorScene {
+    nuka::scene::SceneIR scene;          // the editable document
+    nuka_world_handle world = nullptr;   // not owned
+    std::unique_ptr<EditorSim> sim;
+    nuka::terrain::HeightField terrain;  // invalid without a cooked terrain
+    std::vector<float> rest_targets;     // drive targets at bind time, all environments
+    std::string path;
 
-// Re-cook an existing EditorScene in place from its (mutated) SceneIR authority --
-// the general path a structural tree edit takes to rebuild world + RenderWorld.
-// The caller WaitIdle's first. Returns false (world/sim left reset) on cook failure.
-bool RecookEditorScene(EditorScene& es, nuka::phi::Device* device,
-                       nuka::phi::Backend* backend, float dt);
+    const WorldLayout& Layout() const { return sim->Layout(); }
+};
 
-// Re-seed an existing EditorScene's PHYSICS to its authored initial state for every
-// env: restore the cooked snapshot (authored qpos / root pose / particle state, with
-// zeroed velocities + cleared qddot/tau/lambda) and the authored drive targets a live
-// Drive edit may have overwritten. No re-cook -- the world / sim / record pointers all
-// stay valid -- so the transport Reset button and a script on_reset both call this.
-// The caller WaitIdle's first and re-publishes after. Returns false when the world is
-// unbuilt. ONE general path: the same restore covers articulation, rigid, and particle
-// (soft / cloth / fluid / MPM) media.
+// Mirrors the world's current scene into a new editor scene. Throws on failure.
+std::unique_ptr<EditorScene> AttachEditorScene(nuka_world_handle world, const std::string& path,
+                                               SceneCache& cache);
+
+// Rebuilds the world from the edited document, carrying state over by body name. False
+// (logged) when the world refused it, leaving world and binding unchanged.
+bool RecookEditorScene(EditorScene& es, SceneCache& cache);
+
+// Restores the initial physical state and the drive targets captured at bind time.
 bool ResetEditorScenePhysics(EditorScene& es);
 
 }  // namespace nuka::runtime::app::viewer
