@@ -131,8 +131,8 @@ struct RendererVulkanHandles {
 // created with ZERO extensions, the first graphics queue selected with NO present
 // check. This keeps the G2 determinism oracle pristine.
 //
-// When present_capable is true the renderer additionally enables the surface +
-// xcb-surface INSTANCE extensions and the swapchain DEVICE extension, and -- when
+// When present_capable is true the renderer additionally enables the window surface's
+// INSTANCE extensions and the swapchain DEVICE extension, and -- when
 // a `surface` is supplied -- selects a queue family that supports BOTH graphics
 // AND present on that surface (vkGetPhysicalDeviceSurfaceSupportKHR). The present
 // renderer (vulkan_present_renderer) creates the surface FIRST, then constructs
@@ -142,6 +142,7 @@ struct RendererVulkanHandles {
 struct RendererConfig {
     bool        present_capable = false;     // enable surface/swapchain ext + present queue
     NkVkSurface surface         = nullptr;   // optional probe surface for present-queue selection
+    std::vector<std::string> surface_extensions;  // the window backend's required instance extensions
 };
 
 // ---------------------------------------------------------------------------

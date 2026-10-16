@@ -15,12 +15,6 @@ namespace nuka::runtime::app::viewer {
 
 namespace {
 
-// X11 keysyms (XKB_KEY_*/XK_* protocol values) for the Shift keys. The window
-// backend resolves the raw keycode->keysym, so this match is KEYMAP-INDEPENDENT.
-// Shift is tracked so Shift+LMB acts as pan.
-constexpr uint32_t kKeyShiftL = 0xffe1u;  // XKB_KEY_Shift_L / XK_Shift_L
-constexpr uint32_t kKeyShiftR = 0xffe2u;  // XKB_KEY_Shift_R / XK_Shift_R
-
 bool RenderBounds(const render::RenderWorld& world, const scene::EntityId* selected,
                   math::Vec3& lo, math::Vec3& hi) {
     const float limit = std::numeric_limits<float>::max();
@@ -48,16 +42,8 @@ bool CameraController::HandleEvent(const window::WindowEvent& ev, bool allow_dra
                                    bool allow_scroll) {
     using Type = window::WindowEvent::Type;
     switch (ev.type) {
-        case Type::Key: {
-            if (ev.keysym == kKeyShiftL || ev.keysym == kKeyShiftR) {
-                shift_down_ = ev.pressed;
-                return false;
-            }
-            return false;
-        }
         case Type::FocusLost: {
             // Releases are lost across a focus switch: drop latched state.
-            shift_down_ = false;
             orbiting_ = false;
             panning_ = false;
             return false;
@@ -74,7 +60,7 @@ bool CameraController::HandleEvent(const window::WindowEvent& ev, bool allow_dra
             last_x_ = ev.mouse_x;
             last_y_ = ev.mouse_y;
             if (ev.button == 0u) {            // LMB
-                if (shift_down_) panning_ = true;
+                if (ev.Held(window::modifier::kShift)) panning_ = true;
                 else orbiting_ = true;
             } else if (ev.button == 1u) {     // MMB -> pan
                 panning_ = true;

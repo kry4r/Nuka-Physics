@@ -430,6 +430,7 @@ struct VulkanRasterRenderer::Impl {
     // offscreen renderer bit-for-bit (zero extra ext, graphics-only queue).
     bool             present_capable = false;
     VkSurfaceKHR     probe_surface  = VK_NULL_HANDLE;  // borrowed (NOT owned)
+    std::vector<std::string> surface_extensions;
 
     VkInstance       instance       = VK_NULL_HANDLE;
     VkPhysicalDevice physical       = VK_NULL_HANDLE;
@@ -480,7 +481,8 @@ struct VulkanRasterRenderer::Impl {
 
     explicit Impl(const RendererConfig& config)
         : present_capable(config.present_capable),
-          probe_surface(reinterpret_cast<VkSurfaceKHR>(config.surface)) {
+          probe_surface(reinterpret_cast<VkSurfaceKHR>(config.surface)),
+          surface_extensions(config.surface_extensions) {
         CreateInstance();
         SelectGraphicsDevice();
         device_name = props.deviceName;
@@ -532,30 +534,13 @@ struct VulkanRasterRenderer::Impl {
         create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         create_info.pApplicationInfo = &app_info;
 
-        // OFFSCREEN: zero instance extensions (the G2 oracle, unchanged).
-        // PRESENT:   the surface + xcb-surface instance extensions ONLY when a
-        // present path is requested. We do NOT enable VK_KHR_xlib_surface (the
-        // xcb backend is the chosen D1 windowing path); the headless-surface ext
-        // is enabled OPPORTUNISTICALLY only if the loader advertises it (it does
-        // NOT on the 1.2.131 loader here -- recon 1.3), so the same binary can use
-        // it on a modern CI box. Missing exts are simply not requested.
+        // Offscreen creates the instance with zero extensions; present enables exactly
+        // the extensions the window backend reports that this loader advertises.
         std::vector<const char*> instance_exts;
         if (present_capable) {
-            const bool has_surface     = InstanceExtensionAvailable("VK_KHR_surface");
-            const bool has_headless    = InstanceExtensionAvailable("VK_EXT_headless_surface");
-            if (has_surface)  instance_exts.push_back("VK_KHR_surface");
-            // The platform surface ext for the chosen windowing backend: win32 on
-            // Windows (GLFW), xcb on Linux (the self-written xcb backend).
-#ifdef _WIN32
-            if (InstanceExtensionAvailable("VK_KHR_win32_surface")) {
-                instance_exts.push_back("VK_KHR_win32_surface");
+            for (const std::string& name : surface_extensions) {
+                if (InstanceExtensionAvailable(name.c_str())) instance_exts.push_back(name.c_str());
             }
-#else
-            if (InstanceExtensionAvailable("VK_KHR_xcb_surface")) {
-                instance_exts.push_back("VK_KHR_xcb_surface");
-            }
-#endif
-            if (has_headless) instance_exts.push_back("VK_EXT_headless_surface");
         }
         create_info.enabledExtensionCount = static_cast<uint32_t>(instance_exts.size());
         create_info.ppEnabledExtensionNames =

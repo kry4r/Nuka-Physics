@@ -34,12 +34,8 @@
 #include <vulkan/vulkan.h>
 
 #include "imgui.h"
-#ifdef _WIN32
-// The GLFW platform backend feeds ImGui keyboard/char/mouse on Windows (the xcb
-// build self-feeds io). It draws nothing -- imgui_impl_vulkan stays the renderer.
-// imgui_impl_glfw.h forward-declares GLFWwindow, so no GLFW header is needed here.
-#include "backends/imgui_impl_glfw.h"
-#endif
+// The SDL3 platform backend feeds ImGui input, IME and cursors; imgui_impl_vulkan draws.
+#include "backends/imgui_impl_sdl3.h"
 
 #include "nk/pipeline/world.hpp"
 #include "phi/backend.hpp"
@@ -494,15 +490,16 @@ int main(int argc, char** argv) {
         return 5;
     }
     if (!surface || kind == window::SurfaceBackendKind::None) {
-        std::fprintf(stderr, "[nuka_editor] no window surface (no display / no surface ext). "
-                             "Run under: xvfb-run -a -s '-screen 0 1280x720x24' nuka_editor\n");
+        std::fprintf(stderr, "[nuka_editor] no window surface: no SDL video driver and no "
+                             "VK_EXT_headless_surface\n");
         return 5;
     }
 
-    // Grab the native window handle BEFORE the surface is moved into the present
-    // renderer, so the GLFW ImGui backend can bind it (Windows only; nullptr else).
+    // Bind the native window and route its events to ImGui before the renderer takes the surface.
     void* native_window = surface->NativeWindowHandle();
-    (void)native_window;
+    surface->SetNativeEventHook([](const void* event) {
+        if (ImGui::GetCurrentContext() != nullptr) ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event*>(event));
+    });
 
     std::unique_ptr<render::PresentRenderer> present;
     try {
@@ -536,13 +533,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[nuka_editor] ImGui init failed\n");
         return 7;
     }
-#ifdef _WIN32
-    // Bind the GLFW platform backend (install_callbacks=true chains the window
-    // backend's callbacks) so ImGui receives keyboard/char/mouse from glfw.
-    if (native_window != nullptr) {
-        ImGui_ImplGlfw_InitForVulkan(static_cast<GLFWwindow*>(native_window), true);
-    }
-#endif
+    if (native_window != nullptr) ImGui_ImplSDL3_InitForVulkan(static_cast<SDL_Window*>(native_window));
 
     // ---- 4. UI + camera state (empty editor; nothing cooked yet) --------------
     viewer::ImGuiLayer ui;
@@ -1043,11 +1034,7 @@ int main(int argc, char** argv) {
     // cap at the display refresh, so this sits well above 60.
     const auto frame_budget = std::chrono::duration<double>(1.0 / 240.0);
 
-    // Picker + drag state. Ctrl is tracked by RESOLVED keysym (keymap-
-    // independent), matching camera_controller's Shift handling. The window backend
-    // resolves keycode->keysym; we compare XKB_KEY_*/XK_* protocol values.
-    constexpr uint32_t kKeyCtrlL = 0xffe3u;  // XKB_KEY_Control_L / XK_Control_L
-    constexpr uint32_t kKeyCtrlR = 0xffe4u;  // XKB_KEY_Control_R / XK_Control_R
+    // Picker + drag state: Ctrl comes from the modifier bits each window event carries.
     bool     ctrl_down = false;
     bool     surface_suspended = false;
     bool     teleop_hold_prev = false; // PD-hold rising-edge latch (apply gains once)
@@ -1060,9 +1047,6 @@ int main(int argc, char** argv) {
 
     bool script_ran = false;  // --run-script fires once, after the first load settles
     std::vector<window::WindowEvent> events;
-#ifndef _WIN32
-    viewer::WindowInput window_input;
-#endif
     while (!present->ShouldClose()) {
         if (max_frames > 0 && static_cast<int>(frame_index) >= max_frames) break;
 
@@ -1133,13 +1117,7 @@ int main(int argc, char** argv) {
         const uint32_t vp_h = present->Report().height;
         const bool ctrl_before_events = ctrl_down;
         for (const window::WindowEvent& ev : events) {
-#ifndef _WIN32
-            window_input.Feed(ev);
-            ui_state.layout_modifier_down = window_input.LayoutModifierDown();
-#endif
-            // On Windows the GLFW ImGui backend feeds io mouse/wheel directly, so
-            // the manual io feeds are skipped there (else double input); the camera
-            // + picker still read the WindowEvents below on both platforms.
+            ui_state.layout_modifier_down = ev.Held(window::modifier::kLayout);
             switch (ev.type) {
                 case window::WindowEvent::Type::MouseMove:
                     last_mouse_x = static_cast<float>(ev.mouse_x);
@@ -1150,7 +1128,7 @@ int main(int argc, char** argv) {
                 case window::WindowEvent::Type::Scroll:
                     break;
                 case window::WindowEvent::Type::Key:
-                    if (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR) ctrl_down = ev.pressed;
+                    ctrl_down = ev.Held(window::modifier::kCtrl);
                     break;
                 case window::WindowEvent::Type::Resize:
                     surface_suspended = ev.width == 0u || ev.height == 0u;
@@ -1307,10 +1285,8 @@ int main(int argc, char** argv) {
         io.DeltaTime = (frame_dt > 0.0)
                            ? static_cast<float>(std::min(frame_dt, kMaxFrameDt))
                            : (1.0f / 60.0f);
-#ifdef _WIN32
-        // Pull glfw input into io before ImGui::NewFrame (must precede it).
-        if (native_window != nullptr) ImGui_ImplGlfw_NewFrame();
-#endif
+        // SDL3 replaces the display size with logical points and sets the framebuffer scale.
+        if (native_window != nullptr) ImGui_ImplSDL3_NewFrame();
         // Re-seed the inspector on a new selection; otherwise track a movable body's
         // live pose while the user is not actively editing it.
         if (loaded) {
@@ -1401,8 +1377,7 @@ int main(int argc, char** argv) {
         bool scene_ctrl = ctrl_before_events;
         for (const window::WindowEvent& ev : events) {
             entity_drag.Observe(ev);
-            if (ev.type == window::WindowEvent::Type::Key && (ev.keysym == kKeyCtrlL || ev.keysym == kKeyCtrlR))
-                scene_ctrl = ev.pressed;
+            if (ev.type == window::WindowEvent::Type::Key) scene_ctrl = ev.Held(window::modifier::kCtrl);
             if (ev.type == window::WindowEvent::Type::FocusLost) scene_ctrl = false;
             const float mouse_x = ev.type == window::WindowEvent::Type::Scroll ? last_mouse_x : static_cast<float>(ev.mouse_x);
             const float mouse_y = ev.type == window::WindowEvent::Type::Scroll ? last_mouse_y : static_cast<float>(ev.mouse_y);
@@ -1713,9 +1688,7 @@ int main(int argc, char** argv) {
     }
 
     present->WaitIdle();
-#ifdef _WIN32
-    if (native_window != nullptr) ImGui_ImplGlfw_Shutdown();
-#endif
+    if (native_window != nullptr) ImGui_ImplSDL3_Shutdown();
     imgui.Shutdown();
 
     // Tear the loaded world down while the present renderer + backend are still

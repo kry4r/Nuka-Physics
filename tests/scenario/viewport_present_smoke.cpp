@@ -1,21 +1,5 @@
-// ---------------------------------------------------------------------------
-// viewport_present_smoke -- M8.5 GATE-C: the RUN-VERIFIED headless present-loop
-// smoke for the realtime swapchain path (src/render/raster/vulkan_present_renderer.*
-// + src/render/window/).
-//
-// Builds a SYNTHETIC RenderWorld (two boxes, like render_raster_smoke), creates a
-// surface via MakeSurface (xcb under Xvfb here -- the live path; headless on a
-// modern loader), stands up the swapchain, and runs acquire -> draw -> present for
-// N=3 frames. Asserts: the loop completes with no VkError, swapchain image count
-// >= 2, present succeeds N times. SKIPs cleanly if no surface ext / no Vulkan
-// device (CI without a display, or the renderer ctor throws).
-//
-// RUN (proven by the recon's vkcube exit-0 under the same setup):
-//   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-//   xvfb-run -a -s '-screen 0 1280x720x24' <this binary>
-//
-// HOST-ONLY / zero-CUDA-token: pure C++ / Vulkan / xcb.
-// ---------------------------------------------------------------------------
+// Present-loop smoke: MakeSurface (SDL3, else headless) -> swapchain -> N acquire/draw/present
+// frames over a synthetic two-box world; skips without a display, surface or Vulkan device.
 
 #include <gtest/gtest.h>
 
@@ -149,7 +133,7 @@ TEST(ViewportSurface, NegotiatesOptionalCapabilitiesAndZeroExtent) {
 TEST(ViewportPresentSmoke, AcquireDrawPresentLoopCompletes) {
     RenderWorld world = BuildSyntheticWorld();
 
-    // 1. Create a surface (xcb under Xvfb here, headless on a modern loader).
+    // 1. Create a surface (SDL3 under Xvfb, headless on a modern loader).
     nuka::render::window::SurfaceBackendKind kind =
         nuka::render::window::SurfaceBackendKind::None;
     std::unique_ptr<nuka::render::window::WindowSurface> surface;

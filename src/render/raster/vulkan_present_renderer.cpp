@@ -488,8 +488,8 @@ struct PresentRenderer::Impl {
         // (c) verifying present support on the chosen queue family. lavapipe's
         // single graphics family also supports present, so a re-pick is unneeded;
         // we assert support and throw if (improbably) absent.
-        renderer = std::make_unique<VulkanRasterRenderer>(
-            RendererConfig{/*present_capable=*/true, /*surface=*/nullptr});
+        renderer = std::make_unique<VulkanRasterRenderer>(RendererConfig{
+            /*present_capable=*/true, /*surface=*/nullptr, window_surface->RequiredInstanceExtensions()});
         vk = renderer->VulkanHandles();
         device = reinterpret_cast<VkDevice>(vk.device);
         physical = reinterpret_cast<VkPhysicalDevice>(vk.physical_device);

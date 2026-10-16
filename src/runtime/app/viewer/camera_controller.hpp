@@ -133,7 +133,6 @@ private:
     // Drag bookkeeping.
     bool     orbiting_ = false;
     bool     panning_  = false;
-    bool     shift_down_ = false;
     int32_t  last_x_ = 0;
     int32_t  last_y_ = 0;
 

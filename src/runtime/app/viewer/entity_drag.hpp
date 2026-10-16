@@ -15,8 +15,7 @@ struct EntityDrag {
     void Observe(const render::window::WindowEvent& event) {
         using Type = render::window::WindowEvent::Type;
         const bool release = event.type == Type::MouseButton && event.button == 0u && !event.pressed;
-        const bool ctrl_release = event.type == Type::Key && !event.pressed &&
-                                  (event.keysym == 0xffe3u || event.keysym == 0xffe4u);
+        const bool ctrl_release = event.type == Type::Key && !event.Held(render::window::modifier::kCtrl);
         if (release || ctrl_release || event.type == Type::FocusLost || event.type == Type::Close) {
             Cancel();
         }
