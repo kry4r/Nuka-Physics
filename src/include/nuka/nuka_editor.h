@@ -5,6 +5,7 @@
 // host owns, or one the editor creates from a scene file. Plain C crosses the boundary.
 
 #include "nuka/nuka.h"
+#include "nuka/nuka_nui.h"
 
 #if defined(_WIN32)
 #if defined(NUKA_EDITOR_BUILD)
@@ -74,6 +75,9 @@ NUKA_EDITOR_API nuka_result_t nuka_editor_actions(nuka_editor_handle editor, con
 NUKA_EDITOR_API nuka_result_t nuka_editor_action_log(nuka_editor_handle editor, uint64_t since,
                                                      const char** out_json);
 NUKA_EDITOR_API nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, const char** out_json);
+
+// The UI component table for panels built by Python or extensions; lives as long as the editor.
+NUKA_EDITOR_API const nuka_nui_api_t* nuka_editor_nui(nuka_editor_handle editor);
 
 #ifdef __cplusplus
 }

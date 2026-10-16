@@ -1,201 +1,204 @@
-// Dear ImGui glue: Vulkan backend lifetime, the dark Nuka theme and the font atlas
-// (Inter body/heading, JetBrains Mono, merged Noto Sans CJK).
+// Dear ImGui glue: Vulkan backend and ImPlot lifetime, the token theme and the font atlas
+// (Nerd Font UbuntuSans, MartianMono and GeistMono, each with Phosphor icons and Noto Sans CJK merged in).
 
 #include "render/imgui/nuka_imgui.hpp"
+#include "render/imgui/nuka_theme.hpp"
 #include "render/texture_image.hpp"
 #include "render/viewer_resources.hpp"
-#include "viewer_ui_font.hpp"
 
 #include <vulkan/vulkan.h>
 
 #include "imgui.h"
+#include "implot.h"
 #include "backends/imgui_impl_vulkan.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
-#include <cstring>
-#include <algorithm>
 #include <fstream>
+#include <string>
 #include <vector>
-
-#ifndef NUKA_IMGUI_FONT_UI_TTF
-#define NUKA_IMGUI_FONT_UI_TTF ""
-#endif
-#ifndef NUKA_IMGUI_FONT_HEADING_TTF
-#define NUKA_IMGUI_FONT_HEADING_TTF ""
-#endif
 
 namespace nuka::render::imgui {
 
-namespace {
-
-constexpr ImVec4 kBgVoid    = ImVec4(0.055f, 0.067f, 0.086f, 1.00f);  // #0E1116
-constexpr ImVec4 kBgPanel   = ImVec4(0.082f, 0.102f, 0.129f, 1.00f);  // #151A21
-constexpr ImVec4 kBgRaised  = ImVec4(0.110f, 0.137f, 0.173f, 1.00f);  // #1C232C
-constexpr ImVec4 kBgHover   = ImVec4(0.137f, 0.173f, 0.216f, 1.00f);  // #232C37
-constexpr ImVec4 kBgActive  = ImVec4(0.169f, 0.212f, 0.271f, 1.00f);  // #2B3645
-constexpr ImVec4 kLine      = ImVec4(0.165f, 0.196f, 0.239f, 1.00f);  // #2A323D
-constexpr ImVec4 kText      = ImVec4(0.776f, 0.816f, 0.855f, 1.00f);  // #C6D0DA
-constexpr ImVec4 kTextDim   = ImVec4(0.431f, 0.478f, 0.533f, 1.00f);  // #6E7A88
-constexpr ImVec4 kAccent    = ImVec4(0.176f, 0.831f, 0.749f, 1.00f);  // #2DD4BF
-constexpr ImVec4 kAccentDim = ImVec4(0.118f, 0.612f, 0.549f, 1.00f);  // #1E9C8C
-
-ImVec4 WithAlpha(const ImVec4& c, float a) { return ImVec4(c.x, c.y, c.z, a); }
-
-}  // namespace
-
-void ApplyNukaTheme() {
+void ApplyNukaTheme(float scale) {
+    using namespace theme;
     ImGuiStyle& style = ImGui::GetStyle();
+    style = ImGuiStyle();
 
-    // ---- Geometry: modern rounded panels, generous-but-tidy spacing ----------
-    style.WindowRounding    = 8.0f;   // rounded modern window corners
-    style.ChildRounding     = 6.0f;
-    style.PopupRounding     = 6.0f;
-    style.FrameRounding     = 5.0f;   // inputs/sliders/buttons
-    style.GrabRounding      = 5.0f;   // slider grab pills
-    style.TabRounding       = 5.0f;
-    style.ScrollbarRounding = 8.0f;
+    // Square panels and hairline borders; small radii only on controls and overlays.
+    style.WindowRounding = 0.0f;
+    style.ChildRounding = kRadius;
+    style.PopupRounding = kRadiusOverlay;
+    style.FrameRounding = kRadius;
+    style.GrabRounding = kRadius;
+    style.TabRounding = kRadius;
+    style.ScrollbarRounding = kRadius;
+    style.WindowPadding = ImVec2(2.0f * kSpace, 2.0f * kSpace);
+    style.FramePadding = ImVec2(2.0f * kSpace, kSpace);
+    style.CellPadding = ImVec2(2.0f * kSpace, 0.5f * kSpace);
+    style.ItemSpacing = ImVec2(2.0f * kSpace, kSpace + 2.0f);
+    style.ItemInnerSpacing = ImVec2(kSpace + 2.0f, kSpace);
+    style.IndentSpacing = 4.0f * kSpace;
+    style.ScrollbarSize = 2.0f * kSpace;
+    style.GrabMinSize = 2.0f * kSpace;
+    style.WindowBorderSize = 1.0f;
+    style.ChildBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
+    style.FrameBorderSize = 1.0f;
+    style.TabBorderSize = 0.0f;
+    style.TabBarBorderSize = 1.0f;
+    style.TabBarOverlineSize = 2.0f;
+    style.DockingSeparatorSize = 2.0f;
+    style.SeparatorTextBorderSize = 1.0f;
+    style.WindowTitleAlign = ImVec2(0.0f, 0.5f);
+    style.WindowMenuButtonPosition = ImGuiDir_None;
+    style.FontSizeBase = kFontBody;
 
-    style.WindowPadding     = ImVec2(12.0f, 12.0f);
-    style.FramePadding      = ImVec2(10.0f, 6.0f);
-    style.CellPadding       = ImVec2(8.0f, 5.0f);
-    style.ItemSpacing       = ImVec2(10.0f, 8.0f);
-    style.ItemInnerSpacing  = ImVec2(7.0f, 6.0f);
-    style.IndentSpacing     = 18.0f;
-    style.ScrollbarSize     = 12.0f;
-    style.GrabMinSize       = 11.0f;
-
-    // Subtle 1px borders; a hint of separation, not heavy chrome.
-    style.WindowBorderSize  = 1.0f;
-    style.ChildBorderSize   = 1.0f;
-    style.PopupBorderSize   = 1.0f;
-    style.FrameBorderSize   = 1.0f;
-    style.TabBorderSize     = 0.0f;
-
-    style.WindowTitleAlign  = ImVec2(0.02f, 0.5f);  // title nudged off the corner
-    style.WindowMenuButtonPosition = ImGuiDir_None; // no collapse arrow clutter
-
-    // Anti-aliasing on (curves look intentional, not jagged).
-    style.AntiAliasedLines       = true;
-    style.AntiAliasedLinesUseTex = true;
-    style.AntiAliasedFill        = true;
-
-    // ---- Colors: derive everything from the palette tokens above -------------
     ImVec4* c = style.Colors;
-
-    c[ImGuiCol_Text]                 = kText;
-    c[ImGuiCol_TextDisabled]         = kTextDim;
-
-    // Window is SEMI-TRANSPARENT (0.96) -- a hint of the viewport beneath, the
-    // "instrument glass" feel, without hurting readability.
-    c[ImGuiCol_WindowBg]             = WithAlpha(kBgPanel, 0.96f);
-    c[ImGuiCol_ChildBg]              = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_PopupBg]              = WithAlpha(kBgVoid, 0.98f);
-
-    c[ImGuiCol_Border]               = kLine;
-    c[ImGuiCol_BorderShadow]         = ImVec4(0, 0, 0, 0);
-
-    c[ImGuiCol_FrameBg]              = kBgRaised;
-    c[ImGuiCol_FrameBgHovered]       = kBgHover;
-    c[ImGuiCol_FrameBgActive]        = kBgActive;
-
-    // Title bar: the void color, with the accent reserved for the ACTIVE window.
-    c[ImGuiCol_TitleBg]              = kBgVoid;
-    c[ImGuiCol_TitleBgActive]        = kBgRaised;
-    c[ImGuiCol_TitleBgCollapsed]     = WithAlpha(kBgVoid, 0.80f);
-    c[ImGuiCol_MenuBarBg]            = kBgVoid;
-
-    c[ImGuiCol_ScrollbarBg]          = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_ScrollbarGrab]        = kBgActive;
-    c[ImGuiCol_ScrollbarGrabHovered] = WithAlpha(kAccent, 0.55f);
-    c[ImGuiCol_ScrollbarGrabActive]  = kAccent;
-
-    // The accent shows up exactly where interaction lives.
-    c[ImGuiCol_CheckMark]            = kAccent;
-    c[ImGuiCol_SliderGrab]           = kAccent;
-    c[ImGuiCol_SliderGrabActive]     = WithAlpha(kAccent, 1.00f);
-
-    c[ImGuiCol_Button]               = kBgRaised;
-    c[ImGuiCol_ButtonHovered]        = kBgHover;
-    c[ImGuiCol_ButtonActive]         = WithAlpha(kAccent, 0.85f);
-
-    // Headers (collapsing/selectable/tree): a teal WASH so selection reads clearly.
-    c[ImGuiCol_Header]               = WithAlpha(kAccent, 0.18f);
-    c[ImGuiCol_HeaderHovered]        = WithAlpha(kAccent, 0.30f);
-    c[ImGuiCol_HeaderActive]         = WithAlpha(kAccent, 0.42f);
-
-    c[ImGuiCol_Separator]            = kLine;
-    c[ImGuiCol_SeparatorHovered]     = WithAlpha(kAccent, 0.55f);
-    c[ImGuiCol_SeparatorActive]      = kAccent;
-
-    c[ImGuiCol_ResizeGrip]           = WithAlpha(kAccent, 0.20f);
-    c[ImGuiCol_ResizeGripHovered]    = WithAlpha(kAccent, 0.50f);
-    c[ImGuiCol_ResizeGripActive]     = kAccent;
-
-    c[ImGuiCol_Tab]                  = kBgRaised;
-    c[ImGuiCol_TabHovered]           = WithAlpha(kAccent, 0.45f);
-    c[ImGuiCol_TabSelected]          = kBgActive;
-    c[ImGuiCol_TabSelectedOverline]  = kAccent;             // the accent underline on the active tab
-    c[ImGuiCol_TabDimmed]            = kBgPanel;
-    c[ImGuiCol_TabDimmedSelected]    = kBgRaised;
-
-    c[ImGuiCol_PlotLines]            = kAccent;
-    c[ImGuiCol_PlotLinesHovered]     = WithAlpha(kAccent, 1.00f);
-    c[ImGuiCol_PlotHistogram]        = kAccentDim;
+    const ImVec4 none(0.0f, 0.0f, 0.0f, 0.0f);
+    c[ImGuiCol_Text] = kFg;
+    c[ImGuiCol_TextDisabled] = kFgDim;
+    c[ImGuiCol_WindowBg] = kBg1;
+    c[ImGuiCol_ChildBg] = none;
+    c[ImGuiCol_PopupBg] = Alpha(kBg0, 0.97f);
+    c[ImGuiCol_Border] = kLine;
+    c[ImGuiCol_BorderShadow] = none;
+    c[ImGuiCol_FrameBg] = kBg2;
+    c[ImGuiCol_FrameBgHovered] = kBg3;
+    c[ImGuiCol_FrameBgActive] = Alpha(kAccent, 0.18f);
+    c[ImGuiCol_TitleBg] = kBg0;
+    c[ImGuiCol_TitleBgActive] = kBg0;
+    c[ImGuiCol_TitleBgCollapsed] = kBg0;
+    c[ImGuiCol_MenuBarBg] = kBg0;
+    c[ImGuiCol_ScrollbarBg] = none;
+    c[ImGuiCol_ScrollbarGrab] = kBg3;
+    c[ImGuiCol_ScrollbarGrabHovered] = kLineHi;
+    c[ImGuiCol_ScrollbarGrabActive] = kAccentDim;
+    c[ImGuiCol_CheckMark] = kAccent;
+    c[ImGuiCol_SliderGrab] = kAccentDim;
+    c[ImGuiCol_SliderGrabActive] = kAccent;
+    c[ImGuiCol_Button] = kBg2;
+    c[ImGuiCol_ButtonHovered] = kBg3;
+    c[ImGuiCol_ButtonActive] = Alpha(kAccent, 0.35f);
+    c[ImGuiCol_Header] = Alpha(kAccent, 0.14f);
+    c[ImGuiCol_HeaderHovered] = Alpha(kAccent, 0.22f);
+    c[ImGuiCol_HeaderActive] = Alpha(kAccent, 0.30f);
+    c[ImGuiCol_Separator] = kLine;
+    c[ImGuiCol_SeparatorHovered] = Alpha(kAccent, 0.60f);
+    c[ImGuiCol_SeparatorActive] = kAccent;
+    c[ImGuiCol_ResizeGrip] = none;
+    c[ImGuiCol_ResizeGripHovered] = Alpha(kAccent, 0.50f);
+    c[ImGuiCol_ResizeGripActive] = kAccent;
+    c[ImGuiCol_InputTextCursor] = kAccent;
+    c[ImGuiCol_Tab] = kBg0;
+    c[ImGuiCol_TabHovered] = kBg2;
+    c[ImGuiCol_TabSelected] = kBg1;
+    c[ImGuiCol_TabSelectedOverline] = kAccent;
+    c[ImGuiCol_TabDimmed] = kBg0;
+    c[ImGuiCol_TabDimmedSelected] = kBg1;
+    c[ImGuiCol_TabDimmedSelectedOverline] = Alpha(kAccent, 0.35f);
+    c[ImGuiCol_DockingPreview] = Alpha(kAccent, 0.35f);
+    c[ImGuiCol_DockingEmptyBg] = kBg0;
+    c[ImGuiCol_PlotLines] = kAccent;
+    c[ImGuiCol_PlotLinesHovered] = kFg;
+    c[ImGuiCol_PlotHistogram] = kAccentDim;
     c[ImGuiCol_PlotHistogramHovered] = kAccent;
+    c[ImGuiCol_TableHeaderBg] = kBg0;
+    c[ImGuiCol_TableBorderStrong] = kLine;
+    c[ImGuiCol_TableBorderLight] = Alpha(kLine, 0.6f);
+    c[ImGuiCol_TableRowBg] = none;
+    c[ImGuiCol_TableRowBgAlt] = Alpha(kBg2, 0.5f);
+    c[ImGuiCol_TextLink] = kInfo;
+    c[ImGuiCol_TextSelectedBg] = Alpha(kAccent, 0.28f);
+    c[ImGuiCol_TreeLines] = kLine;
+    c[ImGuiCol_DragDropTarget] = kAccent;
+    c[ImGuiCol_DragDropTargetBg] = Alpha(kAccent, 0.08f);
+    c[ImGuiCol_UnsavedMarker] = kWarn;
+    c[ImGuiCol_NavCursor] = kAccent;
+    c[ImGuiCol_NavWindowingHighlight] = Alpha(kAccent, 0.70f);
+    c[ImGuiCol_NavWindowingDimBg] = Alpha(kBg0, 0.60f);
+    c[ImGuiCol_ModalWindowDimBg] = Alpha(kBg0, 0.60f);
 
-    c[ImGuiCol_TableHeaderBg]        = kBgVoid;
-    c[ImGuiCol_TableBorderStrong]    = kLine;
-    c[ImGuiCol_TableBorderLight]     = WithAlpha(kLine, 0.55f);
-    c[ImGuiCol_TableRowBg]           = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt]        = WithAlpha(kBgRaised, 0.35f);
+    style.ScaleAllSizes(scale);
+    style.FontScaleDpi = scale;
 
-    c[ImGuiCol_TextSelectedBg]       = WithAlpha(kAccent, 0.32f);
-    c[ImGuiCol_DragDropTarget]       = kAccent;
-    c[ImGuiCol_NavCursor]            = kAccent;
-    c[ImGuiCol_NavWindowingHighlight]= WithAlpha(kAccent, 0.70f);
-    c[ImGuiCol_NavWindowingDimBg]    = WithAlpha(kBgVoid, 0.55f);
-    c[ImGuiCol_ModalWindowDimBg]     = WithAlpha(kBgVoid, 0.55f);
-
-    // Docking (docking branch): the empty central node uses the void, the preview
-    // overlay uses the accent so dock targets read clearly.
-    c[ImGuiCol_DockingPreview]       = WithAlpha(kAccent, 0.45f);
-    c[ImGuiCol_DockingEmptyBg]       = kBgVoid;
+    if (ImPlot::GetCurrentContext() == nullptr) return;
+    ImPlotStyle& plot = ImPlot::GetStyle();
+    plot = ImPlotStyle();
+    plot.PlotPadding = ImVec2(2.0f * kSpace * scale, 2.0f * kSpace * scale);
+    plot.LabelPadding = ImVec2(kSpace * scale, kSpace * scale);
+    plot.LegendPadding = ImVec2(2.0f * kSpace * scale, 2.0f * kSpace * scale);
+    plot.MinorAlpha = 0.5f;
+    ImVec4* p = plot.Colors;
+    p[ImPlotCol_FrameBg] = none;
+    p[ImPlotCol_PlotBg] = kBg0;
+    p[ImPlotCol_PlotBorder] = kLine;
+    p[ImPlotCol_LegendBg] = Alpha(kBg0, 0.90f);
+    p[ImPlotCol_LegendBorder] = kLine;
+    p[ImPlotCol_LegendText] = kFgMuted;
+    p[ImPlotCol_TitleText] = kFg;
+    p[ImPlotCol_InlayText] = kFgMuted;
+    p[ImPlotCol_AxisText] = kFgDim;
+    p[ImPlotCol_AxisGrid] = Alpha(kLine, 0.80f);
+    p[ImPlotCol_AxisTick] = kLine;
+    p[ImPlotCol_Selection] = kAccent;
+    p[ImPlotCol_Crosshairs] = kFgMuted;
 }
 
 namespace {
+
+constexpr size_t kFaceCount = 4u;
+constexpr std::array<const char*, kFaceCount> kFaceFiles = {
+    "UbuntuSansNerdFontPropo-Regular.ttf", "UbuntuSansNerdFontPropo-Medium.ttf",
+    "MartianMonoNerdFontPropo-Medium.ttf", "GeistMonoNerdFontPropo-Regular.otf"};
+constexpr std::array<const char*, kFaceCount> kFaceBuildPaths = {
+    NUKA_IMGUI_FONT_BODY, NUKA_IMGUI_FONT_STRONG, NUKA_IMGUI_FONT_DISPLAY, NUKA_IMGUI_FONT_MONO};
+constexpr std::array<float, kFaceCount> kFaceSizes = {theme::kFontBody, theme::kFontBody, theme::kFontLabel,
+                                                      theme::kFontMono};
+// The Nerd faces give up their private-use glyphs so the merged Phosphor icons win.
+constexpr ImWchar kPrivateUse[] = {0xE000, 0xF8FF, 0};
+constexpr float kIconScale = theme::kFontIcon / theme::kFontBody;
+
 struct FontRoles {
     ImFontAtlas* atlas = nullptr;
-    ImFont* body = nullptr;
-    ImFont* heading = nullptr;
-    ImFont* mono = nullptr;
+    std::array<ImFont*, kFaceCount + 1u> faces{};
     ImFontAtlasRectId logo = ImFontAtlasRectId_Invalid;
     bool cjk = false;
     std::vector<unsigned char> cjk_data;
+    std::vector<unsigned char> icon_data;
+    std::vector<unsigned char> icon_fill_data;
 };
 FontRoles fonts;
 
-bool FontExists(const char* path) {
+bool FontExists(const std::string& path) {
     std::error_code error;
-    return path && path[0] && std::filesystem::is_regular_file(path, error);
+    return !path.empty() && std::filesystem::is_regular_file(path, error);
 }
 
-void MergeCjk(float size) {
-    if (fonts.cjk_data.empty()) {
-        const auto path = nuka::render::ViewerResource("assets/viewer/fonts/NotoSansCJKsc-Regular.otf", NUKA_IMGUI_FONT_CJK);
-        std::ifstream input(path, std::ios::binary | std::ios::ate);
-        if (!input) return;
-        const auto bytes = input.tellg();
-        if (bytes <= 0 || bytes > 32 * 1024 * 1024) return;
-        fonts.cjk_data.resize(static_cast<size_t>(bytes));
-        input.seekg(0);
-        if (!input.read(reinterpret_cast<char*>(fonts.cjk_data.data()), bytes)) { fonts.cjk_data.clear(); return; }
-    }
-    ImFontConfig cfg;
-    cfg.MergeMode = true;
+void ReadBlob(const char* relative, const char* build_path, std::vector<unsigned char>& out) {
+    std::ifstream input(nuka::render::ViewerResource(relative, build_path), std::ios::binary | std::ios::ate);
+    if (!input) return;
+    const auto bytes = input.tellg();
+    out.resize(static_cast<size_t>(bytes));
+    input.seekg(0);
+    input.read(reinterpret_cast<char*>(out.data()), bytes);
+}
+
+// Every face shares one copy of each blob; the atlas only borrows it.
+ImFont* AddBlob(std::vector<unsigned char>& data, float size, ImFontConfig cfg) {
+    if (data.empty()) return nullptr;
     cfg.FontDataOwnedByAtlas = false;
-    fonts.cjk = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(fonts.cjk_data.data(),
-                 static_cast<int>(fonts.cjk_data.size()), size, &cfg) != nullptr;
+    return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(data.data(), static_cast<int>(data.size()), size, &cfg);
+}
+
+ImFontConfig IconConfig(float size, bool merge) {
+    ImFontConfig cfg;
+    cfg.MergeMode = merge;
+    cfg.GlyphMinAdvanceX = size;
+    cfg.GlyphOffset = ImVec2(0.0f, merge ? 0.16f * size : 0.0f);
+    return cfg;
 }
 
 }  // namespace
@@ -204,9 +207,7 @@ bool HasNukaCjkFont() { return fonts.atlas == ImGui::GetIO().Fonts && fonts.cjk;
 
 ImFont* GetNukaFont(FontRole role) {
     if (fonts.atlas != ImGui::GetIO().Fonts) return nullptr;
-    if (role == FontRole::Heading) return fonts.heading;
-    if (role == FontRole::Mono) return fonts.mono;
-    return fonts.body;
+    return fonts.faces[static_cast<size_t>(role)];
 }
 
 bool DrawNukaLogo(float size) {
@@ -222,27 +223,28 @@ bool LoadNukaFonts() {
     io.Fonts->Clear();
     fonts = {};
     fonts.atlas = io.Fonts;
-    const auto body_path = nuka::render::ViewerResource("assets/viewer/fonts/Inter-Regular.ttf", NUKA_IMGUI_FONT_UI_TTF);
-    const auto heading_path = nuka::render::ViewerResource("assets/viewer/fonts/Inter-SemiBold.ttf", NUKA_IMGUI_FONT_HEADING_TTF);
-    const auto mono_path = nuka::render::ViewerResource("assets/viewer/fonts/JetBrainsMono-Regular.ttf", NUKA_IMGUI_FONT_MONO);
-    if (FontExists(body_path.c_str()))
-        fonts.body = io.Fonts->AddFontFromFileTTF(body_path.c_str(), 14.0f);
-    if (!fonts.body) {
-        ImFontConfig cfg;
-        cfg.FontDataOwnedByAtlas = false;
-        fonts.body = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kEmbeddedUiFont),
-                                                   static_cast<int>(sizeof(kEmbeddedUiFont)), 14.0f, &cfg);
+    ReadBlob("assets/viewer/fonts/NotoSansCJKsc-Regular.otf", NUKA_IMGUI_FONT_CJK, fonts.cjk_data);
+    ReadBlob("assets/viewer/fonts/Phosphor.ttf", NUKA_IMGUI_FONT_ICON, fonts.icon_data);
+    ReadBlob("assets/viewer/fonts/Phosphor-Fill.ttf", NUKA_IMGUI_FONT_ICON_FILL, fonts.icon_fill_data);
+    for (size_t i = 0; i < kFaceCount; ++i) {
+        const std::string relative = std::string("assets/viewer/fonts/") + kFaceFiles[i];
+        const std::string path = nuka::render::ViewerResource(relative.c_str(), kFaceBuildPaths[i]);
+        if (!FontExists(path)) continue;
+        ImFontConfig text;
+        text.GlyphExcludeRanges = kPrivateUse;
+        fonts.faces[i] = io.Fonts->AddFontFromFileTTF(path.c_str(), kFaceSizes[i], &text);
+        const float icon_size = kFaceSizes[i] * kIconScale;
+        AddBlob(fonts.icon_data, icon_size, IconConfig(icon_size, true));
+        ImFontConfig cjk;
+        cjk.MergeMode = true;
+        fonts.cjk = AddBlob(fonts.cjk_data, kFaceSizes[i], cjk) != nullptr;
     }
-    MergeCjk(14.0f);
-    io.FontDefault = fonts.body;
-    if (FontExists(heading_path.c_str())) {
-        fonts.heading = io.Fonts->AddFontFromFileTTF(heading_path.c_str(), 14.0f);
-        MergeCjk(14.0f);
-    } else fonts.heading = fonts.body;
-    if (FontExists(mono_path.c_str())) {
-        fonts.mono = io.Fonts->AddFontFromFileTTF(mono_path.c_str(), 13.0f);
-        MergeCjk(13.0f);
-    } else fonts.mono = fonts.body;
+    const bool loaded = fonts.faces[0] != nullptr;
+    if (!loaded) fonts.faces[0] = io.Fonts->AddFontDefault();
+    fonts.faces[kFaceCount] = AddBlob(fonts.icon_fill_data, theme::kFontIcon, IconConfig(theme::kFontIcon, false));
+    for (ImFont*& face : fonts.faces)
+        if (face == nullptr) face = fonts.faces[0];
+    io.FontDefault = fonts.faces[0];
     const auto logo = nuka::render::LoadTexture(nuka::render::ViewerResource("docs/media/nuka-logo.png", NUKA_IMGUI_LOGO), false);
     if (logo.width > 0u && logo.height > 0u && logo.channels == 4u) {
         ImFontAtlasRect rect;
@@ -256,8 +258,10 @@ bool LoadNukaFonts() {
             }
         }
     }
+    if (!loaded) std::fprintf(stderr, "[nuka_imgui] UI font missing: package assets/viewer/fonts/%s\n", kFaceFiles[0]);
+    if (fonts.icon_data.empty()) std::fprintf(stderr, "[nuka_imgui] icon font missing: package assets/viewer/fonts/Phosphor.ttf\n");
     if (!fonts.cjk) std::fprintf(stderr, "[nuka_imgui] CJK font missing: package assets/viewer/fonts/NotoSansCJKsc-Regular.otf; Chinese glyphs unavailable\n");
-    return fonts.body != nullptr;
+    return loaded;
 }
 
 NukaImGuiContext::~NukaImGuiContext() { Shutdown(); }
@@ -308,12 +312,14 @@ bool NukaImGuiContext::Init(const NukaImGuiInitInfo& info) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImPlot::CreateContext();
 
     ApplyNukaTheme();
     LoadNukaFonts();
 
     ImGui_ImplVulkan_InitInfo vk = ToVulkanInitInfo(info);
     if (!ImGui_ImplVulkan_Init(&vk)) {
+        ImPlot::DestroyContext();
         ImGui::DestroyContext();
         fonts = {};
         return false;
@@ -347,6 +353,7 @@ void NukaImGuiContext::RenderDrawData(NukaVkCommandBuffer command_buffer) {
 void NukaImGuiContext::Shutdown() {
     if (!initialized_) return;
     ImGui_ImplVulkan_Shutdown();
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
     fonts = {};
     initialized_ = false;

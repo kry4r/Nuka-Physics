@@ -64,7 +64,7 @@ class _Run:
         self.handlers = {
             "action": self.action, "tick": self.tick, "frames": self.frames, "mark": self.mark,
             "expect": self.expect, "undo": self.undo, "save_reopen": self.save_reopen,
-            "screenshot": self.screenshot,
+            "screenshot": self.screenshot, "python": self.python,
         }
 
     def run(self, action_id: str, args: Optional[dict] = None) -> dict:
@@ -157,6 +157,11 @@ class _Run:
         path = _to_png(ppm)
         self.screenshots.append(str(path))
         return reply["ok"], {"path": str(path)}
+
+    def python(self, step: dict):
+        """``{"python": code}`` runs code with ``app`` bound, such as panels built through app.ui."""
+        exec(compile(_resolve(step["python"], self.vars), "<smoke>", "exec"), {"app": self.app})
+        return True, {}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -13,6 +13,8 @@ from typing import Callable, List, Optional, Sequence
 
 import nuka
 
+from .ui import UI
+
 _DEFAULT_DT = 1.0 / 240.0
 _CALLBACKS = ("on_ready", "on_step", "on_reset")
 _TICK = 3
@@ -171,6 +173,7 @@ class EditorApp:
         self._runner = ScriptRunner(self)
         self._native = _editor_ext.App(argv, world.handle if world is not None else 0, dt, self._runner)
         self.actions = Actions(self)
+        self.ui = UI(weakref.proxy(self))
         atexit.register(self.close)
 
     @property
@@ -225,6 +228,11 @@ class EditorApp:
 
     def console(self, text: str) -> None:
         self._native.console_append(text)
+
+    def _ui_call(self, fn: Callable[[], object]) -> None:
+        text = _capture(fn)[1]
+        if text:
+            self._native.console_append(text)
 
     def _run(self, action_id: str, args: dict, source: str) -> dict:
         return json.loads(self._native.run_action(action_id, json.dumps(args), source))

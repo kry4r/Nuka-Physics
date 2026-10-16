@@ -108,4 +108,6 @@ nuka_result_t nuka_editor_document_state(nuka_editor_handle editor, const char**
     });
 }
 
+const nuka_nui_api_t* nuka_editor_nui(nuka_editor_handle editor) { return editor->Nui(); }
+
 }  // extern "C"

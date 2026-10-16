@@ -5,6 +5,7 @@
 #include "imgui.h"
 // The SDL3 platform backend feeds ImGui input, IME and cursors; imgui_impl_vulkan draws.
 #include "backends/imgui_impl_sdl3.h"
+#include <SDL3/SDL_video.h>
 
 #include "nuka/nuka_scene.h"
 #include "render/imgui/nuka_imgui.hpp"
@@ -118,6 +119,8 @@ struct LaunchOptions {
     std::string publish = "auto";
     bool perturb_on = false;
     float perturb[3] = {0.0f, 0.0f, 0.0f};
+    std::string layout;
+    float ui_scale = 1.0f;
 };
 
 bool ReadEntireFile(const std::string& path, std::string* out) {
@@ -135,6 +138,11 @@ bool ReadEntireFile(const std::string& path, std::string* out) {
     return true;
 }
 
+std::string FileName(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1u);
+}
+
 void PrintUsage() {
     std::printf("usage: nuka-editor [scene.nks] [--policy <bin>] [--play] [--frames N] [--dt SECONDS]\n"
                 "  [--offscreen] [--cam tx,ty,tz,dist,yaw_deg,pitch_deg]\n"
@@ -148,6 +156,7 @@ void PrintUsage() {
                 "  [--teleop-cmd VX,VY,WYAW feeds a command to a command-consuming controller]\n"
                 "  [--speed X sets the transport speed; --publish auto|host|zero-copy picks the pose path]\n"
                 "  [--perturb FX,FY,FZ holds a world force [N] on the --select entity's link or body]\n"
+                "  [--layout authoring|debug|robot|data|training picks the panel layout; --ui-scale X]\n"
                 "  default -> Nuka Dynamics Lab; --empty opens a blank workspace\n"
                 "  --offscreen renders to a display-less surface\n"
                 "  --policy attaches a trained locomotion controller to each load\n"
@@ -226,6 +235,8 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
                                           &opt->perturb[2]) == 3;
             if (!opt->perturb_on) std::fprintf(stderr, "[nuka_editor] --perturb wants FX,FY,FZ\n");
         }
+        else if (a == "--layout" && has_value) opt->layout = args[++i];
+        else if (a == "--ui-scale" && has_value) opt->ui_scale = static_cast<float>(std::atof(args[++i].c_str()));
         else if (a == "--help") {
             PrintUsage();
             return false;
@@ -492,6 +503,7 @@ struct EditorHost::State : DocumentHost {
     bool gizmo_using_prev_ = false;
 
     void* native_window_ = nullptr;
+    std::string window_title_;
     std::unique_ptr<render::PresentRenderer> present_;
     render::imgui::NukaImGuiContext imgui_;
     ImGuiLayer ui_;
@@ -596,6 +608,9 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
 
     ui_.EnableDocking();  // must precede the first NewFrame
     RegisterActions();
+    if (!opt_.layout.empty() && !ui_.SetLayout(opt_.layout))
+        std::fprintf(stderr, "[nuka_editor] unknown --layout '%s'\n", opt_.layout.c_str());
+    ui_.SetUiScale(opt_.ui_scale);
     ui_state_.show_colliders = opt_.show_colliders;
     ui_state_.show_contacts = opt_.show_contacts;
     ui_state_.speed = opt_.speed;
@@ -1009,6 +1024,7 @@ void EditorHost::State::Attach(const std::string& path) {
 }
 
 void EditorHost::State::OnLoaded(const std::string& path) {
+    ++ui_state_.scene_version;
     ui_state_.load_error.clear();
     frame_pending_ = true;
     entity_drag_.Cancel();
@@ -1147,6 +1163,7 @@ ApplyResult EditorHost::State::ApplyTxn(const EditTxn& txn) {
 }
 
 void EditorHost::State::Reselect(const std::string& path) {
+    ++ui_state_.scene_version;
     ui_state_.selected_entity = scene::kInvalidEntity;
     if (!path.empty())
         if (const auto n = loaded_->scene.Tree().NodeOf(path)) ui_state_.selected_entity = n->entity;
@@ -1189,6 +1206,7 @@ ActionResult EditorHost::State::RunAction(const std::string& id, const json::Val
         const std::string msg = "[nuka_editor] " + id + " failed: " + result.error + "\n";
         std::fputs(msg.c_str(), stderr);
         ConsoleAppend(msg);
+        ui_.Nui().Toast(nui::Level::Err, id + ": " + result.error);
     }
     return result;
 }
@@ -1198,6 +1216,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     doc_.MarkSaved();
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", path.c_str());
     std::printf("[nuka_editor] saved %s\n", path.c_str());
+    ui_.Nui().Toast(nui::Level::Ok, "Saved " + FileName(path));
     return Ok(Object({{"path", json::Value::Str(path)}}));
 }
 
@@ -1206,6 +1225,7 @@ void EditorHost::State::RegisterActions() {
     RegisterEditActions();
     RegisterSimActions();
     RegisterViewActions();
+    ui_.RegisterActions(actions_);
 }
 
 void EditorHost::State::RegisterFileActions() {
@@ -1218,6 +1238,7 @@ void EditorHost::State::RegisterFileActions() {
                       std::snprintf(ui_state_.load_path, sizeof(ui_state_.load_path), "%s", path.c_str());
                       worker_.Exclusive([&] { ApplyLoad(path); });
                       if (!ui_state_.load_error.empty()) return ActionResult::Fail(ui_state_.load_error);
+                      ui_.Nui().Toast(nui::Level::Ok, "Opened " + FileName(path));
                       return Ok(Object({{"path", json::Value::Str(path)}}));
                   }});
     actions_.Add({"file.unload", "Unload", "file", "", ShortcutScope::Global, has_scene, {},
@@ -1418,6 +1439,8 @@ void EditorHost::State::RegisterViewActions() {
                                         {"fps", json::Value::Float(fps_ema_)},
                                         {"frame_ms_p50", json::Value::Float(frame_ms_.Percentile(0.50))},
                                         {"frame_ms_p95", json::Value::Float(frame_ms_.Percentile(0.95))},
+                                        {"ui_ms_p50", json::Value::Float(ui_ms_.Percentile(0.50))},
+                                        {"ui_ms_p95", json::Value::Float(ui_ms_.Percentile(0.95))},
                                         {"age_ms_p95", json::Value::Float(age_ms_.Percentile(0.95))},
                                         {"tick", json::Value::Int(static_cast<int64_t>(worker_.Tick()))},
                                         {"snapshot_drops", json::Value::Int(static_cast<int64_t>(snapshot_drops_))},
@@ -1497,6 +1520,7 @@ void EditorHost::State::ApplyUnload() {
     loaded_.reset();
     debug_overlay_.Reset();
     ClearModelUi(ui_state_);
+    ++ui_state_.scene_version;
     doc_.Detach();
     script_host_.ClearScripts();
     live_scripts_.clear();
@@ -1603,6 +1627,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (opt_.redo && frame_index_ == 2u) Queue("edit.redo", json::Value::Object(), "cli");
     if (opt_.reset_at_frame >= 0 && static_cast<int>(frame_index_) == opt_.reset_at_frame)
         Queue("sim.reset", json::Value::Object(), "cli");
+    ui_.Nui().DispatchEvents();
     // Queued loads and edits land at a tick boundary, before this frame takes a render-world reference.
     RunQueuedActions();
 
@@ -1707,6 +1732,14 @@ void EditorHost::State::Frame(bool step_physics) {
     ui_state_.can_undo = doc_.CanUndo();
     ui_state_.can_redo = doc_.CanRedo();
     ui_state_.save_dirty = loaded_ && doc_.Dirty();
+    const std::string title =
+        !loaded_ ? std::string("Nuka Editor")
+                 : (loaded_->path.empty() ? std::string("untitled") : FileName(loaded_->path)) +
+                       (ui_state_.save_dirty ? "*" : "") + " \xE2\x80\x94 Nuka Editor";
+    if (native_window_ != nullptr && title != window_title_) {
+        window_title_ = title;
+        SDL_SetWindowTitle(static_cast<SDL_Window*>(native_window_), title.c_str());
+    }
 
     io.DisplaySize = ImVec2(static_cast<float>(present_->Report().width),
                             static_cast<float>(present_->Report().height));
@@ -1735,6 +1768,10 @@ void EditorHost::State::Frame(bool step_physics) {
         }
     }
 
+    // The monitor's content scale; ImGui applies the pixel density itself.
+    SDL_Window* sdl_window = static_cast<SDL_Window*>(native_window_);
+    ui_.PrepareFrame(sdl_window != nullptr ? SDL_GetWindowDisplayScale(sdl_window) / SDL_GetWindowPixelDensity(sdl_window)
+                                           : 1.0f);
     imgui_.NewFrame();
     ui_.RecordUi(render_world, stats, camera_, ui_state_, loaded_ ? &loaded_->scene : nullptr,
                  surface_suspended_ ? 0u : vp_w, surface_suspended_ ? 0u : vp_h);
@@ -1846,7 +1883,8 @@ void EditorHost::State::Frame(bool step_physics) {
     bool teleop_owns_wasd = false;
     {
         const bool cmd_ctrl = loaded_ && policy_ctrl_ && policy_ctrl_->AcceptsCommand();
-        const bool active = loaded_ && ui_state_.teleop_enabled && !io.WantCaptureKeyboard &&
+        // Ctrl chords belong to shortcuts (Ctrl+S, Ctrl+=), so they never drive the robot.
+        const bool active = loaded_ && ui_state_.teleop_enabled && !io.WantCaptureKeyboard && !io.KeyCtrl &&
                             !io.WantTextInput && ui_.OwnsScenePointer() && ui_state_.window_focused;
         TeleopKeys tk;
         if (active) {
@@ -1998,5 +2036,6 @@ std::string EditorHost::RunAction(const std::string& id, const std::string& args
 std::string EditorHost::Actions() const { return state_->actions_.List().Dump(0); }
 std::string EditorHost::ActionLog(uint64_t since) const { return state_->actions_.LogSince(since).Dump(0); }
 std::string EditorHost::DocumentState() { return state_->DocumentState().Dump(0); }
+const nuka_nui_api_t* EditorHost::Nui() { return state_->ui_.Nui().Api(); }
 
 }  // namespace nuka::runtime::app::viewer

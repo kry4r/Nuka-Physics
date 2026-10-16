@@ -85,6 +85,16 @@ bool ActionRegistry::Rebind(std::string_view id, const std::string& shortcut) {
     return false;
 }
 
+bool ActionRegistry::Decorate(std::string_view id, std::string icon, bool hidden) {
+    for (Action& a : actions_) {
+        if (a.id != id) continue;
+        a.icon = std::move(icon);
+        a.hidden = hidden;
+        return true;
+    }
+    return false;
+}
+
 // Arguments come from scripts and remote callers, so a run that throws on them fails instead.
 ActionResult ActionRegistry::Run(std::string_view id, const json::Value& args, const std::string& source,
                                  uint64_t frame) {
@@ -127,6 +137,8 @@ json::Value ActionRegistry::List() const {
         v.Set("label", json::Value::Str(a.label));
         v.Set("category", json::Value::Str(a.category));
         v.Set("shortcut", json::Value::Str(a.shortcut));
+        v.Set("icon", json::Value::Str(a.icon));
+        v.Set("hidden", json::Value::Bool(a.hidden));
         v.Set("enabled", json::Value::Bool(!a.enabled || a.enabled()));
         if (a.checked) v.Set("checked", json::Value::Bool(a.checked()));
         list.PushBack(std::move(v));

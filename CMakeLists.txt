@@ -242,6 +242,9 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         # ImGuizmo (MIT, vendored): the in-viewport transform gizmo. One TU; it
         # links into the same imgui static lib and shares its SYSTEM include scope.
         ${CMAKE_SOURCE_DIR}/external/imguizmo/ImGuizmo.cpp
+        # ImPlot (MIT, vendored): live curves in the editor panels.
+        ${CMAKE_SOURCE_DIR}/external/implot/implot.cpp
+        ${CMAKE_SOURCE_DIR}/external/implot/implot_items.cpp
     )
     add_library(imgui STATIC ${NUKA_IMGUI_SOURCES})
     target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)
@@ -250,7 +253,8 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     target_include_directories(imgui SYSTEM PUBLIC
         ${CMAKE_SOURCE_DIR}/external/imgui
         ${CMAKE_SOURCE_DIR}/external/imgui/backends
-        ${CMAKE_SOURCE_DIR}/external/imguizmo)
+        ${CMAKE_SOURCE_DIR}/external/imguizmo
+        ${CMAKE_SOURCE_DIR}/external/implot)
     target_link_libraries(imgui PUBLIC Vulkan::Vulkan SDL3::SDL3-static)
     set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()

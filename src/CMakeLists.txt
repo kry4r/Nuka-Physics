@@ -311,34 +311,36 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
 
     target_compile_definitions(nuka_imgui
         PRIVATE
-            NUKA_IMGUI_FONT_UI_TTF="${NUKA_VIEWER_INTER_REGULAR_FONT}"
-            NUKA_IMGUI_FONT_HEADING_TTF="${NUKA_VIEWER_INTER_SEMIBOLD_FONT}"
-            NUKA_IMGUI_FONT_CJK="${NUKA_VIEWER_CJK_FONT}"
-            NUKA_IMGUI_FONT_MONO="${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Regular.ttf"
+            NUKA_IMGUI_FONT_BODY="${NUKA_VIEWER_BODY_FONT}"
+            NUKA_IMGUI_FONT_STRONG="${NUKA_VIEWER_STRONG_FONT}"
+            NUKA_IMGUI_FONT_DISPLAY="${NUKA_VIEWER_DISPLAY_FONT}"
+            NUKA_IMGUI_FONT_MONO="${NUKA_VIEWER_MONO_FONT}"
+            NUKA_IMGUI_FONT_ICON="${NUKA_VIEWER_ICON_FONT}"
+            NUKA_IMGUI_FONT_ICON_FILL="${NUKA_VIEWER_ICON_FILL_FONT}"
+            NUKA_IMGUI_FONT_CJK="${NUKA_VIEWER_CJK_FONT_FILE}"
             NUKA_IMGUI_LOGO="${CMAKE_SOURCE_DIR}/docs/media/nuka-logo.png"
     )
-
-    file(READ "${NUKA_VIEWER_INTER_REGULAR_FONT}" NUKA_UI_FONT_HEX HEX)
-    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," NUKA_UI_FONT_BYTES "${NUKA_UI_FONT_HEX}")
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/viewer_ui_font.hpp"
-        "inline constexpr unsigned char kEmbeddedUiFont[] = {${NUKA_UI_FONT_BYTES}};\n")
-    target_include_directories(nuka_imgui PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(nuka_imgui PUBLIC nuka_render)
-    set_property(GLOBAL PROPERTY NUKA_VIEWER_INTER_REGULAR_RESOURCE "${NUKA_VIEWER_INTER_REGULAR_FONT}")
-    set_property(GLOBAL PROPERTY NUKA_VIEWER_INTER_SEMIBOLD_RESOURCE "${NUKA_VIEWER_INTER_SEMIBOLD_FONT}")
-    set_property(GLOBAL PROPERTY NUKA_VIEWER_CJK_RESOURCE "${NUKA_VIEWER_CJK_FONT}")
+    set_property(GLOBAL PROPERTY NUKA_VIEWER_FONT_RESOURCES
+        "${NUKA_VIEWER_BODY_FONT}" "${NUKA_VIEWER_STRONG_FONT}" "${NUKA_VIEWER_DISPLAY_FONT}" "${NUKA_VIEWER_MONO_FONT}"
+        "${NUKA_VIEWER_ICON_FONT}" "${NUKA_VIEWER_ICON_FILL_FONT}")
+    set_property(GLOBAL PROPERTY NUKA_VIEWER_CJK_RESOURCE "${NUKA_VIEWER_CJK_FONT_FILE}")
+    set_property(GLOBAL PROPERTY NUKA_VIEWER_FONT_DIR "${NUKA_VIEWER_FONT_DIR}")
+    set_property(GLOBAL PROPERTY NUKA_VIEWER_ICON_LICENSE "${NUKA_VIEWER_ICON_LICENSE}")
     function(nuka_copy_viewer_resources target)
-        get_property(regular GLOBAL PROPERTY NUKA_VIEWER_INTER_REGULAR_RESOURCE)
-        get_property(semibold GLOBAL PROPERTY NUKA_VIEWER_INTER_SEMIBOLD_RESOURCE)
+        get_property(faces GLOBAL PROPERTY NUKA_VIEWER_FONT_RESOURCES)
         get_property(cjk GLOBAL PROPERTY NUKA_VIEWER_CJK_RESOURCE)
+        get_property(font_dir GLOBAL PROPERTY NUKA_VIEWER_FONT_DIR)
+        get_property(icon_license GLOBAL PROPERTY NUKA_VIEWER_ICON_LICENSE)
+        set(fonts_out "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts")
         add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts"
-            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/viewer/fonts" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${regular}" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/Inter-Regular.ttf"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${semibold}" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/Inter-SemiBold.ttf"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${cjk}" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/NotoSansCJKsc-Regular.otf"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-Regular.ttf" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/JetBrainsMono-Regular.ttf"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/external/imgui/fonts/JetBrainsMono-OFL.txt" "$<TARGET_FILE_DIR:${target}>/assets/viewer/fonts/JetBrainsMono-OFL.txt"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${fonts_out}"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets/viewer/fonts" "${fonts_out}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${faces} "${cjk}" "${fonts_out}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${font_dir}/UbuntuSans/LICENCE.txt" "${fonts_out}/UbuntuSans-LICENCE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${font_dir}/MartianMono/LICENSE" "${fonts_out}/MartianMono-OFL.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${font_dir}/GeistMono/LICENSE" "${fonts_out}/GeistMono-OFL.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${icon_license}" "${fonts_out}/Phosphor-LICENSE.txt"
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/docs/media"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/docs/media/nuka-logo.png" "$<TARGET_FILE_DIR:${target}>/docs/media/nuka-logo.png"
             COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab" "$<TARGET_FILE_DIR:${target}>/examples/assets/nuka_lab"
@@ -389,9 +391,13 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/editor_actions.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
+        runtime/app/viewer/nui/nui_capi.cpp
+        runtime/app/viewer/nui/nui_core.cpp
+        runtime/app/viewer/nui/nui_data.cpp
+        runtime/app/viewer/nui/nui_widgets.cpp
     )
     set_target_properties(nuka_viewer PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(nuka_viewer PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(nuka_viewer PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/include)
     target_compile_definitions(nuka_viewer PUBLIC NK_BUILD_VULKAN_VALIDATION)
     target_link_libraries(nuka_viewer PUBLIC nuka_scene nuka_present nuka_imgui imgui)
     nuka_set_warnings(nuka_viewer)

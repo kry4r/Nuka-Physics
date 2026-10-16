@@ -34,6 +34,8 @@ public:
     std::string Actions() const;
     std::string ActionLog(uint64_t since) const;
     std::string DocumentState();
+    // The shell's nui C API; valid for the editor's lifetime.
+    const nuka_nui_api_t* Nui();
 
 private:
     struct State;

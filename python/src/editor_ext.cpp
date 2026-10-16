@@ -1,5 +1,5 @@
 // _editor_ext: the editor library (nuka/nuka_editor.h) behind nuka.editor. Frames run
-// with the GIL released; script hooks take it back to call the Python runner.
+// with the GIL released; script hooks and UI events take it back to call into Python.
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
@@ -39,6 +39,7 @@ public:
         Check(result, "nuka_editor_create");
         const nuka_editor_script_hooks_t hooks{this, &Run, &Register, &Unregister, &Clear, &Dispatch};
         Check(nuka_editor_set_script_hooks(editor_, &hooks), "nuka_editor_set_script_hooks");
+        api_ = nuka_editor_nui(editor_);
     }
     ~App() { destroy(); }
     App(const App&) = delete;
@@ -94,9 +95,37 @@ public:
         return text;
     }
 
+    // The nui table: node handles in, the editor's reason raised on failure.
+    uint32_t nui_panel(const std::string& id, const std::string& title, const std::string& dock) {
+        return Made(Nui().panel(api_->host, id.c_str(), title.c_str(), dock.c_str()));
+    }
+    uint32_t nui_add(uint32_t parent, const std::string& kind, const std::string& props_json) {
+        return Made(Nui().add(api_->host, parent, kind.c_str(), props_json.c_str()));
+    }
+    void nui_set(uint32_t node, const std::string& props_json) {
+        Done(Nui().set(api_->host, node, props_json.c_str()));
+    }
+    void nui_remove(uint32_t node) { Done(Nui().remove(api_->host, node)); }
+    void nui_clear(uint32_t node) { Done(Nui().clear(api_->host, node)); }
+    std::string nui_get(uint32_t node) {
+        const char* text = Nui().get(api_->host, node);
+        if (text == nullptr) throw std::runtime_error(api_->last_error(api_->host));
+        return text;
+    }
+    void nui_listen(uint32_t node) { Done(Nui().on_event(api_->host, node, &UiEvent, this)); }
+    void set_ui_handler(nb::object handler) { ui_handler_ = std::move(handler); }
+    void toast(int level, const std::string& text) {
+        Nui().toast(api_->host, static_cast<nuka_nui_level_t>(level), text.c_str());
+    }
+    void progress(const std::string& id, const std::string& label, float fraction) {
+        Nui().progress(api_->host, id.c_str(), label.c_str(), fraction);
+    }
+
     void destroy() {
         if (editor_ == nullptr) return;
         nuka_editor_handle editor = std::exchange(editor_, nullptr);
+        api_ = nullptr;
+        ui_handler_ = nb::object();
         nb::gil_scoped_release release;
         nuka_editor_destroy(editor);
     }
@@ -105,6 +134,28 @@ private:
     nuka_editor_handle Editor() const {
         if (editor_ == nullptr) throw std::runtime_error("the editor was destroyed");
         return editor_;
+    }
+    const nuka_nui_api_t& Nui() const {
+        Editor();
+        return *api_;
+    }
+    uint32_t Made(uint32_t node) const {
+        if (node == 0u) throw std::runtime_error(api_->last_error(api_->host));
+        return node;
+    }
+    void Done(int32_t ok) const {
+        if (ok == 0) throw std::runtime_error(api_->last_error(api_->host));
+    }
+
+    // Events arrive at the top of a frame, on the thread running update().
+    static void UiEvent(void* self, uint32_t node, const char* event_json) {
+        App& app = *static_cast<App*>(self);
+        nb::gil_scoped_acquire acquire;
+        try {
+            app.ui_handler_(node, event_json);
+        } catch (nb::python_error& error) {
+            error.discard_as_unraisable("nuka.editor ui handler");
+        }
     }
 
     // Hook text stays valid until the thread's next hook call, as nuka_editor.h requires.
@@ -140,7 +191,9 @@ private:
     }
 
     nb::object runner_;
+    nb::object ui_handler_;
     nuka_editor_handle editor_ = nullptr;
+    const nuka_nui_api_t* api_ = nullptr;
 };
 
 }  // namespace
@@ -169,5 +222,17 @@ NB_MODULE(_editor_ext, m) {
         .def("actions", &App::actions, "The registered actions as JSON text.")
         .def("action_log", &App::action_log, nb::arg("since"), "Action runs after sequence since, as JSON text.")
         .def("document", &App::document, "The document state as JSON text.")
+        .def("nui_panel", &App::nui_panel, nb::arg("id"), nb::arg("title"), nb::arg("dock"),
+             "A dockable panel's root node, reusing the panel when the id exists.")
+        .def("nui_add", &App::nui_add, nb::arg("parent"), nb::arg("kind"), nb::arg("props_json"))
+        .def("nui_set", &App::nui_set, nb::arg("node"), nb::arg("props_json"))
+        .def("nui_remove", &App::nui_remove, nb::arg("node"))
+        .def("nui_clear", &App::nui_clear, nb::arg("node"))
+        .def("nui_get", &App::nui_get, nb::arg("node"), "The node's value as JSON text.")
+        .def("nui_listen", &App::nui_listen, nb::arg("node"),
+             "Route the node's events to the ui handler as (node, event_json).")
+        .def("set_ui_handler", &App::set_ui_handler, nb::arg("handler"))
+        .def("toast", &App::toast, nb::arg("level"), nb::arg("text"))
+        .def("progress", &App::progress, nb::arg("id"), nb::arg("label"), nb::arg("fraction"))
         .def("destroy", &App::destroy, "Close the window and destroy any world the editor created.");
 }

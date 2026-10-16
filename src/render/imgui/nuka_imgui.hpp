@@ -13,9 +13,8 @@
 // WHAT THIS DOES (and does NOT do):
 //   - DOES wrap ImGui::CreateContext + ImGui_ImplVulkan_Init/NewFrame/
 //     RenderDrawData/Shutdown into a single RAII NukaImGuiContext.
-//   - DOES apply the custom-beautified "Nuka" theme (ApplyNukaTheme) + load the
-//     vendored JetBrains Mono fonts -- the OWNER custom-UI requirement (NOT stock
-//     ImGui). The palette/rounding/spacing is documented in nuka_imgui.cpp.
+//   - DOES apply the token theme (ApplyNukaTheme, nuka_theme.hpp) + load the
+//     packaged Nerd Font faces and Phosphor icons (NOT stock ImGui), and owns the ImPlot context.
 //   - DOES NOT own the platform (xcb) backend: feeding io.DisplaySize /
 //     io.DeltaTime / mouse+keyboard is T2's self-written xcb backend (D1). The
 //     seam is documented at NewFrame() below.
@@ -56,7 +55,9 @@ using NukaVkDescriptorPool = VkDescriptorPool_T*;
 
 namespace nuka::render::imgui {
 
-enum class FontRole { Body, Heading, Mono };
+// Body and Strong set the UI text, Display the upper-case labels and HUD, Mono values and code;
+// IconFill draws the filled Phosphor glyphs for active states.
+enum class FontRole { Body, Strong, Display, Mono, IconFill };
 ImFont* GetNukaFont(FontRole role);
 bool DrawNukaLogo(float size = 24.0f);
 bool HasNukaCjkFont();
@@ -163,25 +164,12 @@ private:
     bool initialized_ = false;
 };
 
-// ---------------------------------------------------------------------------
-// ApplyNukaTheme -- the custom-beautified "Nuka" look (the OWNER UI requirement).
-//
-// Applies a cohesive dark palette with a single teal accent, modern rounded
-// panels, and tuned spacing to the CURRENT ImGui context's style (call after
-// ImGui::CreateContext). Distinctive -- explicitly NOT the stock dark/gray theme.
-// The exact palette + rounding/spacing values are documented in nuka_imgui.cpp so
-// T3's panels stay consistent. NukaImGuiContext::Init calls this for you.
-//
-// Standalone (no Vulkan) -- usable by a pure-ImGui compile/theme check.
-// ---------------------------------------------------------------------------
-void ApplyNukaTheme();
+// Resets the current style (and ImPlot's, when it has a context) to the token theme with every
+// size and the fonts multiplied by `scale`. NukaImGuiContext::Init applies it at scale 1.
+void ApplyNukaTheme(float scale = 1.0f);
 
-// Load the vendored JetBrains Mono fonts (UI size + heading size) into the current
-// context's font atlas. Returns true if at least the UI font loaded; falls back to
-// the ImGui default font (AddFontDefault) and returns false if the vendored TTF is
-// unreadable. NukaImGuiContext::Init calls this for you (before the backend init,
-// so the atlas is ready). Standalone-safe (no Vulkan); the atlas is uploaded to the
-// GPU lazily by imgui_impl_vulkan on first NewFrame (>=1.92 texture lifecycle).
+// Loads the Nerd Font faces of each FontRole with Phosphor Regular and Noto Sans CJK merged in;
+// false when the body face is missing and ImGui's default font stands in.
 bool LoadNukaFonts();
 
 }  // namespace nuka::render::imgui

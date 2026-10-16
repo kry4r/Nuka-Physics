@@ -32,6 +32,8 @@ struct Action {
     std::function<bool()> enabled;  // empty: always enabled
     std::function<bool()> checked;  // empty: not a toggle
     std::function<ActionResult(const scene::json::Value& args)> run;
+    std::string icon;     // a UTF-8 icon glyph for menus, toolbars and the palette
+    bool hidden = false;  // takes arguments or backs a widget, so menus and the palette skip it
 };
 
 // A run queued for the next frame top, where the UI's own calls execute.
@@ -56,11 +58,13 @@ public:
     void Add(Action action);
     const Action* Find(std::string_view id) const;
     bool Rebind(std::string_view id, const std::string& shortcut);
+    bool Decorate(std::string_view id, std::string icon, bool hidden);
     // Unknown and disabled actions fail without running; every call lands in the log.
     ActionResult Run(std::string_view id, const scene::json::Value& args, const std::string& source,
                      uint64_t frame);
     // Actions whose shortcut was pressed this ImGui frame, in registration order.
     std::vector<std::string> Pressed(bool global_ok, bool viewport_ok) const;
+    const std::vector<Action>& All() const { return actions_; }
     scene::json::Value List() const;
     scene::json::Value LogSince(uint64_t seq) const;
 
