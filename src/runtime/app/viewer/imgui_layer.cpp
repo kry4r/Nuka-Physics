@@ -343,7 +343,10 @@ void ImGuiLayer::EnableDocking() {
 
 void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& stats,
                           CameraController& camera, ViewerUiState& ui_state,
-                          const nuka::scene::SceneIR* scene) {
+                          const nuka::scene::SceneIR* scene,
+                          uint32_t framebuffer_width, uint32_t framebuffer_height) {
+    viewport_ = {};
+    viewport_hovered_ = false;
 
     // Arm ImGuizmo for this frame (perspective camera). DrawGizmo runs after the
     // panels so its handles overlay the central viewport.
@@ -447,6 +450,11 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         } else {
             ImGui::TextColored(kTextDim, "no scene loaded");
             ImGui::TextColored(kTextDim, "open a scene to begin");
+        }
+        if (!ui_state.load_error.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(kWarn, "%s", ui_state.load_error.c_str());
+            ImGui::PopTextWrapPos();
         }
 
         ImGui::Dummy(ImVec2(0.0f, 8.0f));
@@ -964,16 +972,26 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     }
     ImGui::End();
     const ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(dockspace_id);
+    const ImGuiIO& io = ImGui::GetIO();
+    if (framebuffer_width == ~uint32_t(0))
+        framebuffer_width = static_cast<uint32_t>(std::max(io.DisplaySize.x * io.DisplayFramebufferScale.x, 0.0f));
+    if (framebuffer_height == ~uint32_t(0))
+        framebuffer_height = static_cast<uint32_t>(std::max(io.DisplaySize.y * io.DisplayFramebufferScale.y, 0.0f));
+    if (central) {
+        const ImGuiViewport* main = ImGui::GetMainViewport();
+        viewport_ = SceneViewportRect::FromLogical(central->Pos.x, central->Pos.y, central->Size.x, central->Size.y,
+                                                  main->Pos.x, main->Pos.y, io.DisplayFramebufferScale.x,
+                                                  io.DisplayFramebufferScale.y, framebuffer_width, framebuffer_height);
+    }
     const ImVec2 mouse = ImGui::GetMousePos();
-    viewport_hovered_ = central && ui_state.window_focused && !ui_state.layout_modifier_down &&
-        !ImGui::GetIO().WantCaptureMouse &&
-        mouse.x >= central->Pos.x && mouse.y >= central->Pos.y &&
-        mouse.x < central->Pos.x + central->Size.x && mouse.y < central->Pos.y + central->Size.y;
+    viewport_hovered_ = viewport_.Valid() && ui_state.window_focused && !ui_state.layout_modifier_down &&
+        !io.WantCaptureMouse && viewport_.Contains(mouse.x, mouse.y);
 }
 
 void ImGuiLayer::HandleCameraShortcuts(const render::RenderWorld& world, CameraController& camera,
                                       const ViewerUiState& ui_state) {
-    ApplyCameraShortcuts(world, camera, ui_state.selected_entity, viewport_hovered_, ui_state.gizmo.active);
+    ApplyCameraShortcuts(world, camera, ui_state.selected_entity, viewport_hovered_, ui_state.gizmo.active,
+                         viewport_.Aspect());
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +1009,7 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
     changed = false;
     GizmoState& gz = ui_state.gizmo;
     if (!gz.enabled || ui_state.selected_entity == nuka::scene::kInvalidEntity ||
-        vp_w == 0u || vp_h == 0u) {
+        vp_w == 0u || vp_h == 0u || !viewport_.Valid() || !ui_state.window_focused) {
         gz.active = false;
         gz.using_now = false;
         return;
@@ -1000,13 +1018,17 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
     float view[16], proj[16], model[16];
     ViewMatrix(camera.ResolvedEye(), camera.ResolvedTarget(),
                math::Vec3{0.0f, 0.0f, 1.0f}, view);
-    const float aspect = static_cast<float>(vp_w) / static_cast<float>(vp_h);
+    const float aspect = viewport_.Aspect();
     ProjMatrixGL(camera.fov_degrees * 3.14159265358979323846f / 180.0f, aspect,
                  0.05f, 500.0f, proj);
     ModelMatrix(world, model);
 
-    ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
-    ImGuizmo::SetRect(0.0f, 0.0f, static_cast<float>(vp_w), static_cast<float>(vp_h));
+    ImGuizmo::Enable(viewport_hovered_ || ImGuizmo::IsUsing());
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    draw->PushClipRect(ImVec2(viewport_.x, viewport_.y),
+                       ImVec2(viewport_.x + viewport_.width, viewport_.y + viewport_.height), true);
+    ImGuizmo::SetDrawlist(draw);
+    ImGuizmo::SetRect(viewport_.x, viewport_.y, viewport_.width, viewport_.height);
     const ImGuizmo::OPERATION op =
         (gz.op == GizmoState::Op::Rotate) ? ImGuizmo::ROTATE : ImGuizmo::TRANSLATE;
     const ImGuizmo::MODE mode = gz.local ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
@@ -1016,6 +1038,7 @@ void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_
     const float snap_vec[3] = {snap_step, snap_step, snap_step};
     ImGuizmo::Manipulate(view, proj, op, mode, model, /*deltaMatrix=*/nullptr,
                          gz.snap_on ? snap_vec : nullptr);
+    draw->PopClipRect();
 
     gz.active = ImGuizmo::IsOver() || ImGuizmo::IsUsing();
     gz.using_now = ImGuizmo::IsUsing();

@@ -1723,7 +1723,8 @@ struct PresentRenderer::Impl {
         }
 
         const ResolvedCamera cam = ResolveCamera(world, options, aabb_min, aabb_max, has_geometry);
-        const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        const SceneViewport scene_rect = ResolveSceneViewport(options.scene_viewport, extent.width, extent.height);
+        const float aspect = scene_rect.Aspect();
         const float fov_y = cam.fov_degrees * 3.14159265358979323846f / 180.0f;
         const Mat4 view = LookAt(cam.eye, cam.target, cam.up);
         const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
@@ -1789,15 +1790,16 @@ struct PresentRenderer::Impl {
                                     1u, 1u, &ssbo_set, 0u, nullptr);
         }
         VkViewport viewport{};
-        viewport.x = 0.0f; viewport.y = 0.0f;
-        viewport.width = static_cast<float>(extent.width);
-        viewport.height = static_cast<float>(extent.height);
+        viewport.x = static_cast<float>(scene_rect.x); viewport.y = static_cast<float>(scene_rect.y);
+        viewport.width = static_cast<float>(std::max(scene_rect.width, 1u));
+        viewport.height = static_cast<float>(std::max(scene_rect.height, 1u));
         viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
         vkCmdSetViewport(cmd, 0u, 1u, &viewport);
-        VkRect2D scissor{{0, 0}, extent};
+        VkRect2D scissor{{static_cast<int32_t>(scene_rect.x), static_cast<int32_t>(scene_rect.y)},
+                         {scene_rect.width, scene_rect.height}};
         vkCmdSetScissor(cmd, 0u, 1u, &scissor);
 
-        for (const InstanceDraw& draw : draws) {
+        if (!scene_rect.Empty()) for (const InstanceDraw& draw : draws) {
             PushBlock push{};
             // On the instanced path the model matrix comes from the SSBO (the shader
             // ignores push.model); we still fill it harmlessly. Material always rides
@@ -1826,7 +1828,7 @@ struct PresentRenderer::Impl {
         // wireframes + contact markers) AFTER the opaque scene with the depth-test-off
         // debug pipeline, so they read THROUGH the visual meshes. Model rides the push
         // constant (no interop SSBO); empty + skipped when the toggles are off.
-        if (!world.debug_instances.empty() && debug_pipeline != VK_NULL_HANDLE) {
+        if (!scene_rect.Empty() && !world.debug_instances.empty() && debug_pipeline != VK_NULL_HANDLE) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, debug_pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
                                     0u, 1u, &ubo_slots[frame].set, 0u, nullptr);

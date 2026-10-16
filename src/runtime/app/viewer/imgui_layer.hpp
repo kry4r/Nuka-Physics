@@ -40,6 +40,7 @@
 #include "math/transform.hpp"
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/primitive_kind.hpp"
+#include "runtime/app/viewer/scene_viewport.hpp"
 #include "scene/ecs/entity.hpp"
 
 #include <cstdint>
@@ -195,6 +196,7 @@ struct ViewerUiState {
     std::string loaded_path;              // viewer-set: shown in the panel
     char        load_path[512] = {0};     // editable path field (dialog fallback)
     std::string load_request;             // one-shot: path to load
+    std::string load_error;               // viewer-set: why the last load failed
     bool        unload_request = false;   // one-shot: drop to empty
 
     // ---- editing -----------------------------------------------------------
@@ -298,7 +300,8 @@ public:
     // editor) drives the scene tree; deterministic given identical inputs.
     void RecordUi(const render::RenderWorld& world, const ViewerStats& stats,
                   CameraController& camera, ViewerUiState& ui_state,
-                  const nuka::scene::SceneIR* scene = nullptr);
+                  const nuka::scene::SceneIR* scene = nullptr,
+                  uint32_t framebuffer_width = ~uint32_t(0), uint32_t framebuffer_height = ~uint32_t(0));
 
     // Draw + run the transform gizmo for the selected entity over the viewport.
     // `world` is the entity's current WORLD pose; on a manipulation it is rewritten
@@ -313,7 +316,12 @@ public:
     void DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h,
                    ViewerUiState& ui_state, math::Transform& world, bool& changed);
 
+    // The central dock node in logical and framebuffer pixels; the scene renders only there.
+    const SceneViewportRect& Viewport() const { return viewport_; }
+    bool OwnsScenePointer() const { return viewport_hovered_; }
+
 private:
+    SceneViewportRect viewport_;
     // The docking layout is built ONCE (the first frame the dockspace exists). A
     // latch so we do not re-split every frame (which would fight a user re-dock).
     bool dock_built_ = false;

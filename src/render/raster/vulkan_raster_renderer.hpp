@@ -33,6 +33,7 @@
 // ---------------------------------------------------------------------------
 
 #include "render/render_world.hpp"
+#include "render/raster/scene_viewport.hpp"
 #include "render/vulkan_offscreen_types.hpp"  // VulkanRgba8, VulkanOffscreenReport (shared output)
 
 #include <cstdint>
@@ -153,6 +154,7 @@ struct RendererConfig {
 // the gate from depending on authored cameras).
 // ---------------------------------------------------------------------------
 struct RasterOptions {
+    SceneViewport scene_viewport;
     uint32_t   width      = 1280;
     uint32_t   height     = 720;
     VulkanRgba8 background = {10, 12, 16, 255};

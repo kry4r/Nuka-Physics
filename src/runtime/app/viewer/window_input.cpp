@@ -130,11 +130,10 @@ void WindowInput::Feed(const render::window::WindowEvent& event) {
 }
 
 void ApplyCameraShortcuts(const render::RenderWorld& world, CameraController& camera,
-                          scene::EntityId selected, bool viewport_hovered, bool gizmo_active) {
+                          scene::EntityId selected, bool viewport_hovered, bool gizmo_active, float aspect) {
     const ImGuiIO& io = ImGui::GetIO();
     if (!viewport_hovered || gizmo_active || io.AppFocusLost || io.WantCaptureKeyboard ||
         io.WantTextInput || io.KeyCtrl || io.KeyAlt || io.KeySuper || io.KeyShift) return;
-    const float aspect = io.DisplaySize.y > 0.0f ? io.DisplaySize.x / io.DisplaySize.y : 1.0f;
     if (ImGui::IsKeyPressed(ImGuiKey_F, false)) camera.FrameSelected(world, selected, aspect);
     if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) camera.FrameAll(world, aspect);
 }
