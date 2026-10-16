@@ -161,12 +161,7 @@ add_library(nuka_render STATIC
     render/scene_asset.cpp
     render/vulkan_renderer.cpp
     render/raster/vulkan_raster_renderer.cpp
-    # M11 INT-4 (OD-2): the OPT-IN, default-OFF exportable per-instance transform
-    # SSBO (VK_KHR_external_memory_fd + OPAQUE_FD export) for the CUDA<->Vulkan
-    # zero-copy render path. Pure C++/Vulkan, ZERO CUDA token (src/render red-line);
-    # the CUDA importer reaches the exported fd only through the CUDA-free
-    # phi::ExternalMemoryDesc seam. Inert (Supported()==false) on an ICD without
-    # external-memory-fd (lavapipe) so every D1 offscreen gate stays byte-identical.
+    # Exportable pose slots + timeline semaphore the editor's CUDA scatter writes.
     render/raster/interop_transform_ssbo.cpp
 )
 
@@ -801,15 +796,6 @@ if(CMAKE_CUDA_COMPILER)
         runtime/app/pose_publisher.cpp
         runtime/app/systems.cpp
         runtime/app/simulation.cpp
-        # M11 INT-6 (OD-2): the zero-copy CUDA<->Vulkan interop publisher (app
-        # layer, ZERO CUDA token -- it includes ONLY the CUDA-free
-        # phi::InteropScatterI seam). The device scatter + cudaImportExternalMemory
-        # live in nuka_phi2_interop (linked by the viewer exe).
-        runtime/app/cuda_vulkan_interop.cpp
-        # M11 INT-1: the WEAK fallback for the interop-scatter factory, so nuka_app
-        # links STANDALONE (returns "no interop") when nuka_phi2_interop is not
-        # linked. The strong symbol in the CUDA lib wins when it is.
-        runtime/app/interop_scatter_fallback.cpp
     )
     set_target_properties(nuka_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -1030,44 +1016,6 @@ if(CMAKE_CUDA_COMPILER)
             CUDA::cudart
     )
 
-    # -----------------------------------------------------------------------
-    # nuka_phi2_interop (M11 §3.E INT-2/INT-7) -- the CUDA<->Vulkan interop slice
-    # of the CUDA backend: the device transform-scatter kernel +
-    # cudaImportExternalMemory + external semaphores. The ONLY place the interop
-    # CUDA tokens live. Implements the CUDA-FREE phi::InteropScatterI and provides
-    # the STRONG CreateCudaVkScatter / CudaVkScatterAvailable that win over the
-    # app-layer weak fallback when this lib is linked (the windowed viewer exe).
-    #
-    # --fmad=false: the scatter composes world_xform = fk * cached_visual_local +
-    # lowers it to a column-major mat4 with arithmetic intended to match the host
-    # composition (HostDownloadPublisher + the renderer's TransformToMatrix); FMA
-    # contraction off keeps the device add/mul faithful (R14). NOT in any golden;
-    # this is a build-link deliverable (real zero-copy is owner-verified on a
-    # display+NVIDIA box -- a CUDA-GPU cannot share memory with lavapipe/CPU).
-    #
-    # GATED behind NK_BUILD_VULKAN_VALIDATION: the interop path is a viewer-only
-    # optimization; the default build-cuda128 never builds it (the app/render libs
-    # link standalone via the weak fallback).
-    # -----------------------------------------------------------------------
-    if(NK_BUILD_VULKAN_VALIDATION)
-        add_library(nuka_phi2_interop STATIC
-            phi/backend_cuda/interop/cuda_vk_scatter.cu
-        )
-        set_target_properties(nuka_phi2_interop PROPERTIES POSITION_INDEPENDENT_CODE ON)
-        target_compile_options(nuka_phi2_interop PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
-        )
-        target_include_directories(nuka_phi2_interop
-            PUBLIC
-                ${CMAKE_SOURCE_DIR}/src
-        )
-        target_link_libraries(nuka_phi2_interop
-            PUBLIC
-                nuka_phi2
-                CUDA::cudart
-        )
-    endif()
-
     add_library(nuka_contact_wrench STATIC
         # p14a (v0.7): any-link contact-force readout (per-link wrench + per-slot
         # force). Pure readback of the solved lambda + stage-4/5 contact geometry;
@@ -1235,18 +1183,26 @@ if(CMAKE_CUDA_COMPILER)
     )
 
     if(NK_BUILD_EDITOR)
-        # The editor reaches physics only through the nuka C ABI; nuka_editor_core is
-        # its world binding, scene cache, edits, undo and debug overlay.
+        # The pose scatter composes like the host publish only without FMA contraction.
+        add_library(nuka_editor_scatter STATIC runtime/app/viewer/pose_scatter.cu)
+        set_target_properties(nuka_editor_scatter PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(nuka_editor_scatter PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+        target_include_directories(nuka_editor_scatter PUBLIC ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(nuka_editor_scatter PUBLIC nuka nuka_render CUDA::cudart)
+
+        # The editor reaches physics only through the nuka C ABI; nuka_editor_core is its
+        # world binding, scene cache, edits, undo, overlay, physics thread and pose scatter.
         add_library(nuka_editor_core STATIC
             runtime/app/viewer/editor_world.cpp
             runtime/app/viewer/editor_scene.cpp
             runtime/app/viewer/editor_edits.cpp
             runtime/app/viewer/editor_undo.cpp
             runtime/app/viewer/debug_overlay.cpp
+            runtime/app/viewer/physics_worker.cpp
         )
         set_target_properties(nuka_editor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_include_directories(nuka_editor_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
-        target_link_libraries(nuka_editor_core PUBLIC nuka nuka_viewer nuka_render nuka_import)
+        target_link_libraries(nuka_editor_core PUBLIC nuka nuka_viewer nuka_render nuka_import nuka_editor_scatter)
         nuka_set_warnings(nuka_editor_core)
 
         # nuka_editor -- the editor shared library behind nuka/nuka_editor.h. Python's

@@ -509,8 +509,8 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     // STATS PANEL -- hero step-time + tidy labeled rows + a LIVE/IDLE badge.
     // ======================================================================
     if (ImGui::Begin("Stats", nullptr, ImGuiWindowFlags_NoFocusOnAppearing)) {
-        SectionHeader("CPU update");
-        ImGui::TextColored(kTextDim, "step + state publish");
+        SectionHeader("Physics thread");
+        ImGui::TextColored(kTextDim, "last step batch");
 
         // Hero: big step time in the heading font + a live/idle badge.
         PushHeadingFont();
@@ -533,6 +533,20 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         StatRow("GPU time", "N/A", kTextDim);
         std::snprintf(buf, sizeof(buf), "x%u", stats.sub_steps);
         StatRow("sub-steps", buf, kText);
+        std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(stats.sim_ticks));
+        StatRow("ticks", buf, kText);
+        std::snprintf(buf, sizeof(buf), "%.1f ms", stats.snapshot_age_ms);
+        StatRow("snapshot age", stats.cpu_timing_available ? buf : "N/A", kText);
+        std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(stats.snapshot_drops));
+        StatRow("dropped", buf, kText);
+        std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(stats.capped_batches));
+        StatRow("capped batches", buf, stats.capped_batches != 0u ? kWarn : kText);
+        StatRow("publish", stats.zero_copy ? "ZERO-COPY" : "HOST FALLBACK", stats.zero_copy ? kAccent : kWarn);
+        if (!stats.zero_copy && !stats.publish_reason.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(kTextDim, "%s", stats.publish_reason.c_str());
+            ImGui::PopTextWrapPos();
+        }
         std::snprintf(buf, sizeof(buf), "%llu",
                       static_cast<unsigned long long>(stats.frame_index));
         StatRow("frame index", buf, kTextDim);

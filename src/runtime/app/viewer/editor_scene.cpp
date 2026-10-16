@@ -24,7 +24,7 @@ void BindWorld(EditorScene& es) {
                                               es.rest_targets.data(),
                                               es.rest_targets.size() * sizeof(float), 0u),
                     "download drive targets");
-    es.sim = std::make_unique<EditorSim>(es.world, std::move(layout), std::move(render_world));
+    es.sim = std::make_unique<EditorSim>(std::move(layout), std::move(render_world));
 }
 
 }  // namespace
@@ -72,11 +72,11 @@ bool RecookEditorScene(EditorScene& es, SceneCache& cache) {
     }
 }
 
-bool ResetEditorScenePhysics(EditorScene& es) {
-    if (nuka_world_reset(es.world) != NUKA_RESULT_OK) return false;
-    return es.rest_targets.empty() ||
-           nuka_world_upload_field(es.world, NUKA_FIELD_DRIVE_TARGET, es.rest_targets.data(),
-                                   es.rest_targets.size() * sizeof(float), 0u) == NUKA_RESULT_OK;
+bool ResetWorldPhysics(nuka_world_handle world, const std::vector<float>& rest_targets) {
+    if (nuka_world_reset(world) != NUKA_RESULT_OK) return false;
+    return rest_targets.empty() ||
+           nuka_world_upload_field(world, NUKA_FIELD_DRIVE_TARGET, rest_targets.data(),
+                                   rest_targets.size() * sizeof(float), 0u) == NUKA_RESULT_OK;
 }
 
 }  // namespace nuka::runtime::app::viewer

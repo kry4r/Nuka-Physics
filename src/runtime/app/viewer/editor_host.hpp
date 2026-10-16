@@ -21,6 +21,7 @@ public:
 
     void SetScriptHooks(const nuka_editor_script_hooks_t& hooks);
     void Update(bool step_physics);
+    void StopPhysics();
     bool Running() const;
     bool Playing() const;
     void Close();

@@ -53,6 +53,11 @@ public:
         }
         Check(result, "nuka_editor_update");
     }
+    void stop_physics() {
+        nuka_editor_handle editor = Editor();
+        nb::gil_scoped_release release;
+        nuka_editor_stop_physics(editor);
+    }
     bool running() const { return editor_ != nullptr && nuka_editor_running(editor_) != 0u; }
     bool playing() const { return nuka_editor_playing(Editor()) != 0u; }
     std::uintptr_t world_handle() const { return reinterpret_cast<std::uintptr_t>(nuka_editor_world(Editor())); }
@@ -73,16 +78,17 @@ private:
         return editor_;
     }
 
-    // Hook text stays valid until the next hook call, as nuka_editor.h requires.
+    // Hook text stays valid until the thread's next hook call, as nuka_editor.h requires.
     template <class Fn>
     static const char* Call(void* self, Fn&& fn) {
         App& app = *static_cast<App*>(self);
+        static thread_local std::string text;
         nb::gil_scoped_acquire acquire;
         try {
             nb::object result = fn(app.runner_);
             if (result.is_none()) return nullptr;
-            app.text_ = nb::str(result).c_str();
-            return app.text_.c_str();
+            text = nb::str(result).c_str();
+            return text.c_str();
         } catch (nb::python_error& error) {
             error.discard_as_unraisable("nuka.editor script hook");
             return nullptr;
@@ -106,7 +112,6 @@ private:
 
     nb::object runner_;
     nuka_editor_handle editor_ = nullptr;
-    std::string text_;
 };
 
 }  // namespace
@@ -121,6 +126,8 @@ NB_MODULE(_editor_ext, m) {
              "runner receives run/register/unregister/clear/dispatch calls for scripts.")
         .def("update", &App::update, nb::arg("step"),
              "One frame. Physics advances with the editor transport only when step is True.")
+        .def("stop_physics", &App::stop_physics,
+             "Join the physics thread; the world is the caller's until the next update(True).")
         .def_prop_ro("running", &App::running)
         .def_prop_ro("playing", &App::playing)
         .def_prop_ro("world_handle", &App::world_handle,

@@ -6,7 +6,6 @@
 
 #include "runtime/app/viewer/editor_edits.hpp"
 
-#include "runtime/app/command_queue.hpp"
 #include "scene/graph/scene_graph.hpp"
 #include "scene/scene_ir.hpp"
 
@@ -99,13 +98,15 @@ void ApplyTransformEdit(EditorScene& es, const EntityRecordIndex& idx,
         if (ri.entity == entity) { inst = &ri; break; }
     }
 
-    // Live: teleport a movable body through the general MoveEntity path; otherwise
-    // move the render instance in place (static visuals have no physics row).
+    // Live: a movable body queues a teleport for the physics thread; a static visual
+    // has no physics row and moves in place.
     if (inst != nullptr) {
-        if (IsMovableInstance(*inst, es)) {
-            es.sim->Commands().Push(Command::MakeMoveEntity(entity, world));
+        PoseWrite write;
+        if (ResolvePoseWrite(rw, es.Layout(), entity, world, &write)) {
+            es.sim->QueuePoseWrite(write);
         } else {
             inst->world_xform = world;
+            es.sim->MarkStaticMoved();
         }
     }
 

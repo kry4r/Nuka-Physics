@@ -123,9 +123,9 @@ struct ViewerUiState {
     bool     window_focused = true;
     bool     layout_modifier_down = false;
     bool     playing   = false;   // open PAUSED on the authored pose; Play/Step advances
-    // Simulated-seconds per wall-second target: the frame loop accumulates
-    // speed * real frame time and consumes it in fixed-dt physics steps.
-    float    speed     = 1.0f;    // x0.25 .. x4
+    // Simulated-seconds per wall-second target: the physics thread accumulates
+    // speed * wall time and consumes it in fixed-dt steps.
+    float    speed     = 1.0f;
     uint32_t env_index = 0u;      // selected env
 
     // Read-only physics debug overlays (Show panel). Transient toggles read ONLY by
@@ -276,6 +276,12 @@ struct ViewerStats {
     bool     debug_contacts_budget_skipped = false;
     bool     debug_colliders_available = false;
     bool     debug_contacts_available = false;
+    float    snapshot_age_ms = 0.0f;      // wall time since the shown snapshot was published
+    uint64_t snapshot_drops = 0u;         // snapshots published but never shown
+    uint64_t sim_ticks = 0u;
+    uint64_t capped_batches = 0u;
+    bool     zero_copy = false;           // poses reach the renderer without a host copy
+    std::string publish_reason;           // why the host fallback publishes
     std::string device_name;
 };
 

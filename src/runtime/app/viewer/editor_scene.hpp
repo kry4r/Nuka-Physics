@@ -48,6 +48,6 @@ std::unique_ptr<EditorScene> AttachEditorScene(nuka_world_handle world, const st
 bool RecookEditorScene(EditorScene& es, SceneCache& cache);
 
 // Restores the initial physical state and the drive targets captured at bind time.
-bool ResetEditorScenePhysics(EditorScene& es);
+bool ResetWorldPhysics(nuka_world_handle world, const std::vector<float>& rest_targets);
 
 }  // namespace nuka::runtime::app::viewer

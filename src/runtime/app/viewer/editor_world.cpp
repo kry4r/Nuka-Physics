@@ -25,8 +25,10 @@ bool DownloadPoses(nuka_world_handle world, nuka_state_field_t field, uint32_t r
                    uint32_t env, std::vector<math::Transform>& out) {
     out.resize(rows);
     const size_t bytes = static_cast<size_t>(rows) * sizeof(math::Transform);
-    return rows > 0u &&
-           nuka_world_download_field(world, field, out.data(), bytes, env * bytes) == NUKA_RESULT_OK;
+    const bool ok = rows > 0u &&
+                    nuka_world_download_field(world, field, out.data(), bytes, env * bytes) == NUKA_RESULT_OK;
+    if (!ok) out.clear();
+    return ok;
 }
 
 }  // namespace
@@ -96,20 +98,26 @@ bool IsMovableSource(const render::PoseSource& source, const WorldLayout& layout
            layout.links[source.row].is_floating != 0u;
 }
 
-bool MoveEntityLive(nuka_world_handle world, const WorldLayout& layout,
-                    const render::RenderWorld& render_world, uint32_t env_index,
-                    const MoveEntity& cmd) {
+bool ResolvePoseWrite(const render::RenderWorld& render_world, const WorldLayout& layout,
+                      scene::EntityId entity, const math::Transform& world_xform, PoseWrite* out) {
     const auto it = std::find_if(render_world.instances.begin(), render_world.instances.end(),
                                  [&](const render::RenderInstance& inst) {
-                                     return inst.entity == cmd.entity;
+                                     return inst.entity == entity;
                                  });
     if (it == render_world.instances.end() || !IsMovableSource(it->pose_source, layout))
         return false;
     // Pose fields hold the physics frame; publishing re-applies the visual offset.
-    const math::Transform pose = cmd.world_xform * it->cached_visual_local.Inverse();
+    out->source = it->pose_source;
+    out->pose = world_xform * it->cached_visual_local.Inverse();
+    return true;
+}
+
+bool ApplyPoseWrite(nuka_world_handle world, const WorldLayout& layout, uint32_t env_index,
+                    const PoseWrite& write) {
+    const math::Transform& pose = write.pose;
     const size_t env = env_index % layout.env_count;
-    const uint32_t row = it->pose_source.row;
-    if (it->pose_source.kind == render::PoseSource::Kind::Body) {
+    const uint32_t row = write.source.row;
+    if (write.source.kind == render::PoseSource::Kind::Body) {
         if (row >= layout.bodies_per_env) return false;
         const size_t at = env * layout.bodies_per_env + row;
         const math::Vec3 zero = math::Vec3::Zero();
@@ -148,36 +156,52 @@ void ApplyHoldGains(nuka_world_handle world, const WorldLayout& layout, float kp
                 "upload drive damping");
 }
 
-EditorSim::EditorSim(nuka_world_handle world, WorldLayout layout, render::RenderWorld render_world)
-    : world_(world), layout_(std::move(layout)), render_world_(std::move(render_world)) {}
-
-bool EditorSim::FramePublish(InputIntents* intents, uint32_t steps) {
-    input_.Run(commands_, intents);
-    for (const MoveEntity& move : intents->move_entities)
-        MoveEntityLive(world_, layout_, render_world_, env_index_, move);
-    bool healthy = true;
-    for (uint32_t s = 0; s < steps; ++s) {
-        if (controller_ != nullptr) controller_->OnStep(world_, env_index_);
-        healthy = nuka_world_step(world_) == NUKA_RESULT_OK && healthy;
-    }
-    Publish();
-    return healthy;
+void DownloadEnvPoses(nuka_world_handle world, const WorldLayout& layout, uint32_t env_index,
+                      std::vector<math::Transform>* links, std::vector<math::Transform>* bodies) {
+    const uint32_t env = env_index % layout.env_count;
+    DownloadPoses(world, NUKA_FIELD_ARTICULATION_LINK_POSE, layout.links_per_env, env, *links);
+    DownloadPoses(world, NUKA_FIELD_RIGID_BODY_TRANSFORM, layout.bodies_per_env, env, *bodies);
 }
 
-void EditorSim::Publish() {
-    const bool have_links = DownloadPoses(world_, NUKA_FIELD_ARTICULATION_LINK_POSE,
-                                          layout_.links_per_env, env_index_, link_poses_);
-    const bool have_bodies = DownloadPoses(world_, NUKA_FIELD_RIGID_BODY_TRANSFORM,
-                                           layout_.bodies_per_env, env_index_, body_poses_);
+std::vector<ScatterRow> BuildScatterRows(const render::RenderWorld& render_world) {
+    std::vector<ScatterRow> rows(render_world.instances.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const render::RenderInstance& inst = render_world.instances[i];
+        ScatterRow& r = rows[i];
+        const bool link = inst.pose_source.kind == render::PoseSource::Kind::Link;
+        const bool body = inst.pose_source.kind == render::PoseSource::Kind::Body;
+        r.kind = link ? 1u : (body ? 2u : 0u);
+        r.row = r.kind != 0u ? inst.pose_source.row : 0u;
+        const math::Transform& local = r.kind != 0u ? inst.cached_visual_local : inst.world_xform;
+        r.local[0] = local.position.x;
+        r.local[1] = local.position.y;
+        r.local[2] = local.position.z;
+        r.local[3] = local.rotation.w;
+        r.local[4] = local.rotation.x;
+        r.local[5] = local.rotation.y;
+        r.local[6] = local.rotation.z;
+    }
+    return rows;
+}
+
+EditorSim::EditorSim(WorldLayout layout, render::RenderWorld render_world)
+    : layout_(std::move(layout)), render_world_(std::move(render_world)) {}
+
+std::vector<PoseWrite> EditorSim::TakePoseWrites() {
+    std::vector<PoseWrite> out;
+    out.swap(pose_writes_);
+    return out;
+}
+
+void EditorSim::ApplyPoses(const std::vector<math::Transform>& links,
+                           const std::vector<math::Transform>& bodies) {
     const auto resolve = [&](const render::PoseSource& source, math::Transform* out) {
-        if (source.kind == render::PoseSource::Kind::Link && have_links &&
-            source.row < link_poses_.size()) {
-            *out = link_poses_[source.row];
+        if (source.kind == render::PoseSource::Kind::Link && source.row < links.size()) {
+            *out = links[source.row];
             return true;
         }
-        if (source.kind == render::PoseSource::Kind::Body && have_bodies &&
-            source.row < body_poses_.size()) {
-            *out = body_poses_[source.row];
+        if (source.kind == render::PoseSource::Kind::Body && source.row < bodies.size()) {
+            *out = bodies[source.row];
             return true;
         }
         return false;

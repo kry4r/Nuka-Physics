@@ -4,13 +4,10 @@
 //
 // Every property edit (inspector, gizmo, tree op) routes through here so there is
 // a single mutation path, never a per-type poke. An edit updates BOTH the live
-// runtime (the CommandQueue/MoveEntity physics seam for movable bodies, the
-// RenderWorld for render state) AND, on commit, the authoritative SceneIR record
-// nks::Save persists. Operates on the general SceneIR / RenderWorld / ECS, with no
-// scene-specific code.
+// runtime (a queued teleport for movable bodies, the RenderWorld for render state)
+// AND, on commit, the authoritative SceneIR record nks::Save persists.
 //
-// HOST-ONLY: the only world touch is the queued MoveEntity the frame loop applies
-// through the C ABI.
+// HOST-ONLY: the only world touch is the queued teleport the physics thread applies.
 // ---------------------------------------------------------------------------
 
 #include "math/transform.hpp"
@@ -59,8 +56,8 @@ const render::RenderInstance* InstanceOfEntity(const render::RenderWorld& world,
 MaterialBinding ResolveMaterial(const EditorScene& es, const EntityRecordIndex& idx,
                                 scene::EntityId entity);
 
-// True iff the instance's pose is a live, teleportable physics row (free Body,
-// articulation Base, or the floating root Link) -- i.e. a MoveEntity reaches it.
+// True iff the instance's pose is a live, teleportable physics row (free Body or
+// the floating root Link).
 bool IsMovableInstance(const render::RenderInstance& inst, const EditorScene& es);
 
 // The authored WORLD transform of an entity, composing the TransformComponent
@@ -70,10 +67,8 @@ math::Transform AuthoredWorldTransform(const scene::SceneIR& scene,
                                        scene::EntityId entity);
 
 // Apply a transform edit. `world` is the new WORLD pose of the selected instance.
-// Live: a movable body teleports via the CommandQueue (MoveEntity -> ApplyMoveEntity);
-// a static instance updates its RenderInstance in place. When `commit`, the
-// authoring record's local transform is rewritten (world re-expressed in the
-// parent frame) so Save persists it.
+// Live: a movable body queues a teleport; a static instance updates its RenderInstance
+// in place. When `commit`, the authoring record's local transform is rewritten.
 void ApplyTransformEdit(EditorScene& es, const EntityRecordIndex& idx,
                         scene::EntityId entity, const math::Transform& world,
                         bool commit);

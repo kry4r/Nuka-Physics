@@ -75,6 +75,14 @@ struct PresentReport {
 // it to VkCommandBuffer for ImGui_ImplVulkan_RenderDrawData). May be empty.
 using OverlayRecordFn = std::function<void(void* command_buffer)>;
 
+// One frame's pose slot from the CUDA pose path: a set-1 descriptor set of per-instance
+// mat4 rows, readable once `timeline` reaches `ready_value`.
+struct PresentInterop {
+    NkVkDescriptorSet set = nullptr;
+    NkVkSemaphore timeline = nullptr;
+    uint64_t ready_value = 0u;
+};
+
 class PresentRenderer {
 public:
     // Construct from a window surface (ownership transferred). Stands up the
@@ -91,29 +99,16 @@ public:
 
     // Acquire -> record (draw `world` via the shared pipeline + optional overlay)
     // -> submit (per-frame semaphores + in-flight fence) -> present. Handles
-    // OUT_OF_DATE/SUBOPTIMAL by recreating the swapchain (returns Recreated).
+    // OUT_OF_DATE/SUBOPTIMAL by recreating the swapchain (returns Recreated). With
+    // `interop`, instance transforms come from its pose slot instead of `world`.
     PresentFrameResult DrawFrame(const RenderWorld& world,
                                  const RasterOptions& options = {},
-                                 const OverlayRecordFn& overlay = {});
+                                 const OverlayRecordFn& overlay = {},
+                                 const PresentInterop* interop = nullptr);
 
-    // M11 INT-F1 (CUDA<->Vulkan zero-copy consumer): enable the OPT-IN instanced
-    // draw path. When the interop publisher has stood up an exportable transform
-    // SSBO (InteropTransformSsbo), the viewer passes its descriptor-set layout
-    // (set 1, STORAGE_BUFFER) + the bound descriptor set here. DrawFrame then binds
-    // the 2nd graphics pipeline (mesh_instanced.vert) + that SSBO at set 1 and draws
-    // each instance by gl_InstanceIndex reading the SCATTERED device transforms,
-    // INSTEAD of the per-draw push-constant world_xform. The DEFAULT per-draw
-    // pipeline (the D1 oracle path) stays in place and is used whenever interop is
-    // NOT enabled, so the default offscreen/present render is byte-unchanged.
-    // Pass VK_NULL_HANDLE handles to disable (revert to the per-draw path).
-    // Opaque NkVk* handles keep this header CUDA-free and Vulkan-light at the seam.
-    void SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout,
-                              NkVkDescriptorSet ssbo_set);
-
-    // True iff SetInteropTransforms installed a usable instanced pipeline (the
-    // viewer logs an HONEST "interop ACTIVE" only when this AND the publisher's
-    // device scatter are both live).
-    bool InteropDrawActive() const;
+    // Builds the instanced pipeline against the pose slots' set layout (set 1); null
+    // drops it. The caller keeps the layout alive while it is installed.
+    void SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout);
 
     // The narrow Vulkan handle seam (for the viewer's ImGui InitInfo): device /
     // queue / render pass / descriptor pool / image counts. Mirrors what
@@ -127,6 +122,10 @@ public:
 
     uint32_t SwapchainImageCount() const;
     uint32_t MinImageCount() const;
+    // A submitted frame's resources are free again once FramesInFlight() later frames
+    // were submitted; SubmittedFrames() counts submissions.
+    uint32_t FramesInFlight() const;
+    uint64_t SubmittedFrames() const;
 
     const PresentReport& Report() const;
     const std::string&   DeviceName() const;

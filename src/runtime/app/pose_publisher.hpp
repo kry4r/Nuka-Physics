@@ -19,10 +19,7 @@
 // PosePublisher is an ABSTRACT interface so the publish SOURCE can swap without
 // any caller change. M8 ships HostDownloadPublisher (host-download path via
 // nk::World::GetData().DownloadField -- the only host-readback seam, data.hpp:58).
-// M11's CudaVulkanInteropPublisher (device-scatter, zero D2H copy) implements the
-// SAME interface and drops in behind this same abstraction with no edit to
-// TransformSyncSystem / Simulation (recon Risk R5). Callers therefore depend on
-// PosePublisher&, never on the concrete type.
+// Callers depend on PosePublisher&, never on the concrete type.
 //
 // HOST-ONLY / zero-CUDA-token (this dir is under the src/runtime/app/** lint
 // red-line): device pose access goes ONLY through Data::DownloadField (host).

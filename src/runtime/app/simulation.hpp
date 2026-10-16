@@ -68,13 +68,7 @@ public:
     void DisableRendering() { render_enabled_ = false; }
     bool RenderEnabled() const { return render_enabled_; }
 
-    // -- publisher swap (M11 INT-8) -----------------------------------------
-    // Re-point the PosePublisher behind the abstraction. The viewer uses this to
-    // swap from the bootstrap HostDownloadPublisher to the zero-copy
-    // CudaVulkanInteropPublisher ONCE the present renderer's exportable SSBO is
-    // imported -- or to keep HostDownloadPublisher when interop is unavailable
-    // (the graceful-fallback path on this lavapipe box). The new publisher is NOT
-    // owned (it must outlive the Simulation, exactly like the ctor publisher).
+    // Re-points the PosePublisher; it is not owned and must outlive the Simulation.
     void SetPublisher(PosePublisher& publisher) { publisher_ = &publisher; }
 
     // -- selection / step mode ----------------------------------------------

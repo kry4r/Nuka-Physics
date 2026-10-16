@@ -31,6 +31,7 @@ public:
     std::string DispatchReady() { return Dispatch(NUKA_EDITOR_CALLBACK_READY); }
     std::string DispatchStep() { return Dispatch(NUKA_EDITOR_CALLBACK_STEP); }
     std::string DispatchReset() { return Dispatch(NUKA_EDITOR_CALLBACK_RESET); }
+    std::string DispatchTick() { return Dispatch(NUKA_EDITOR_CALLBACK_TICK); }
 
 private:
     static std::string Text(const char* text) { return text != nullptr ? text : ""; }

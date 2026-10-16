@@ -16,6 +16,7 @@ using nuka::math::Transform;
 using nuka::math::Vec3;
 constexpr float kContactSig[3] = {1.0f, 0.45f, 0.05f};
 constexpr float kDebugOverlayAlpha = 0.5f;
+static_assert(sizeof(Vec3) == 3u * sizeof(float), "UcontactPoint wire layout");
 
 void SetColor(scene::RenderMaterial& mat, float r, float g, float b, float e) {
     mat.base_color[0] = r; mat.base_color[1] = g; mat.base_color[2] = b; mat.base_color[3] = 1.0f;
@@ -27,6 +28,33 @@ void SetColor(scene::RenderMaterial& mat, float r, float g, float b, float e) {
 
 }  // namespace
 
+void ReadOverlayData(nuka_world_handle world, const WorldLayout& layout, uint32_t env_index,
+                     bool colliders, bool contacts, OverlayData* out) {
+    out->colliders_valid = false;
+    out->contacts_valid = false;
+    const uint32_t env = env_index % layout.env_count;
+    uint32_t count = 0u;
+    if (colliders && nuka_world_get_colliders(world, env, nullptr, 0u, &count) == NUKA_RESULT_OK) {
+        out->colliders.resize(count);
+        out->colliders_valid =
+            count == 0u ||
+            nuka_world_get_colliders(world, env, out->colliders.data(), count, &count) == NUKA_RESULT_OK;
+    }
+    if (!contacts) return;
+    const uint32_t slots = layout.contact_slots_per_env;
+    out->contact_counts.assign(slots, 0u);
+    out->contact_points.assign(static_cast<size_t>(slots) * 4u, Vec3{0, 0, 0});
+    const size_t base = static_cast<size_t>(env) * slots;
+    out->contacts_valid =
+        slots == 0u ||
+        (nuka_world_download_field(world, NUKA_FIELD_UCONTACT_COUNT, out->contact_counts.data(),
+                                   static_cast<size_t>(slots) * sizeof(uint32_t),
+                                   base * sizeof(uint32_t)) == NUKA_RESULT_OK &&
+         nuka_world_download_field(world, NUKA_FIELD_UCONTACT_POINT, out->contact_points.data(),
+                                   static_cast<size_t>(slots) * 4u * sizeof(Vec3),
+                                   base * 4u * sizeof(Vec3)) == NUKA_RESULT_OK);
+}
+
 void DebugOverlay::Reset() {
     materials_ready_ = false;
     overflow_logged_ = false;
@@ -35,8 +63,6 @@ void DebugOverlay::Reset() {
 }
 
 void DebugOverlay::EnsureMaterials(render::RenderWorld& render_world) {
-    // Reuse the cached materials only while they are still the ones we appended; a
-    // re-cook rebuilds RenderWorld::materials and drops them (stale id / signature).
     const bool intact =
         materials_ready_ && mat_contact_ < render_world.materials.size() &&
         render_world.materials[mat_contact_].base_color[0] == kContactSig[0] &&
@@ -55,67 +81,38 @@ void DebugOverlay::EnsureMaterials(render::RenderWorld& render_world) {
     materials_ready_ = true;
 }
 
-void DebugOverlay::AppendColliders(nuka_world_handle world, render::RenderWorld& render_world,
-                                    uint32_t env_index) {
-    // Each cooked collider comes with its live world pose for this environment.
-    uint32_t count = 0u;
-    if (nuka_world_get_colliders(world, env_index, nullptr, 0u, &count) != NUKA_RESULT_OK) return;
-    colliders_.resize(count);
-    if (count > 0u &&
-        nuka_world_get_colliders(world, env_index, colliders_.data(), count, &count) !=
-            NUKA_RESULT_OK)
-        return;
-    colliders_available_ = true;
-    for (const nuka_collider_t& collider : colliders_) {
-        Transform pose;
-        std::memcpy(&pose, collider.pose, sizeof(pose));
-        if (!IsValidDebugPose(pose)) { batch_.RejectCollider(); continue; }
-        const uint32_t mat = collider.is_static != 0u ? mat_static_ : mat_dynamic_;
-        batch_.AppendCollider(render_world, collider.kind, collider.params, pose, mat);
-    }
-}
-
-void DebugOverlay::AppendContacts(nuka_world_handle world, const WorldLayout& layout,
-                                   render::RenderWorld& render_world, uint32_t env_index) {
-    const uint32_t max_c = layout.contact_slots_per_env;
-    if (max_c == 0u) { contacts_available_ = true; return; }
-    if (!batch_.ShouldReadContacts(max_c)) return;
-
-    ucontact_counts_.assign(max_c, 0u);
-    ucontact_points_.assign(static_cast<size_t>(max_c) * 4u, Vec3{0, 0, 0});
-    static_assert(sizeof(Vec3) == 3u * sizeof(float), "UcontactPoint wire layout");
-    const size_t slot_base = static_cast<size_t>(env_index % layout.env_count) * max_c;
-    if (nuka_world_download_field(world, NUKA_FIELD_UCONTACT_COUNT, ucontact_counts_.data(),
-                                  static_cast<size_t>(max_c) * sizeof(uint32_t),
-                                  slot_base * sizeof(uint32_t)) != NUKA_RESULT_OK ||
-        nuka_world_download_field(world, NUKA_FIELD_UCONTACT_POINT, ucontact_points_.data(),
-                                  static_cast<size_t>(max_c) * 4u * sizeof(Vec3),
-                                  slot_base * 4u * sizeof(Vec3)) != NUKA_RESULT_OK) {
-        return;
-    }
-
-    contacts_available_ = true;
-    for (uint32_t s = 0; s < max_c; ++s) {
-        const uint32_t count = std::min(ucontact_counts_[s], 4u);
-        for (uint32_t p = 0; p < count; ++p)
-            batch_.AppendContact(render_world, ucontact_points_[static_cast<size_t>(s) * 4u + p],
-                                 mat_contact_);
-    }
-}
-
-void DebugOverlay::Rebuild(nuka_world_handle world, const WorldLayout& layout,
-                           render::RenderWorld& render_world, uint32_t env_index,
+void DebugOverlay::Rebuild(const OverlayData& data, render::RenderWorld& render_world,
                            bool show_colliders, bool show_contacts) {
-    // The overlay owns the dedicated debug channel outright: clear it each rebuild.
-    // The real `instances` set is never touched, so a non-overlay frame is untouched.
     render_world.debug_instances.clear();
     batch_.Reset();
     colliders_available_ = contacts_available_ = false;
     if (!show_colliders && !show_contacts) { overflow_logged_ = false; return; }
 
     EnsureMaterials(render_world);
-    if (show_colliders) AppendColliders(world, render_world, env_index % layout.env_count);
-    if (show_contacts) AppendContacts(world, layout, render_world, env_index);
+    if (show_colliders && data.colliders_valid) {
+        colliders_available_ = true;
+        for (const nuka_collider_t& collider : data.colliders) {
+            Transform pose;
+            std::memcpy(&pose, collider.pose, sizeof(pose));
+            if (!IsValidDebugPose(pose)) { batch_.RejectCollider(); continue; }
+            const uint32_t mat = collider.is_static != 0u ? mat_static_ : mat_dynamic_;
+            batch_.AppendCollider(render_world, collider.kind, collider.params, pose, mat);
+        }
+    }
+    const auto slots = static_cast<uint32_t>(data.contact_counts.size());
+    if (show_contacts && data.contacts_valid) {
+        if (slots == 0u) {
+            contacts_available_ = true;
+        } else if (batch_.ShouldReadContacts(slots)) {
+            contacts_available_ = true;
+            for (uint32_t s = 0; s < slots; ++s) {
+                const uint32_t count = std::min(data.contact_counts[s], 4u);
+                for (uint32_t p = 0; p < count; ++p)
+                    batch_.AppendContact(render_world, data.contact_points[static_cast<size_t>(s) * 4u + p],
+                                         mat_contact_);
+            }
+        }
+    }
 
     const auto& report = batch_.Report();
     const bool omitted = report.omitted_instances != 0u || report.contacts_budget_skipped;

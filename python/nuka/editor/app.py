@@ -14,6 +14,7 @@ import nuka
 
 _DEFAULT_DT = 1.0 / 240.0
 _CALLBACKS = ("on_ready", "on_step", "on_reset")
+_TICK = 3
 # A lifecycle callback that fails this many times in a row is disabled.
 _MAX_FAILURES = 3
 
@@ -46,13 +47,15 @@ class ScriptRunner:
     """Runs the editor console and the scene's /script nodes in this interpreter.
 
     Each script gets its own namespace holding ``app``, ``world`` and ``nuka`` and
-    may define ``on_ready``, ``on_step`` and ``on_reset``.
+    may define ``on_ready``, ``on_step`` and ``on_reset``. Callbacks run on the
+    editor's physics thread while one runs.
     """
 
     def __init__(self, app):
         self._app = weakref.proxy(app)
         self._console = self._namespace("__console__")
         self._scripts = {}
+        self._ticks: List[list] = []
 
     def _namespace(self, name: str) -> dict:
         return {"__builtins__": builtins, "__name__": name, "app": self._app, "nuka": nuka}
@@ -76,7 +79,24 @@ class ScriptRunner:
     def clear(self) -> None:
         self._scripts.clear()
 
+    def add_tick(self, fn: Callable) -> None:
+        self._ticks.append([fn, 0])
+
+    def _dispatch_ticks(self) -> Optional[str]:
+        out = []
+        for entry in list(self._ticks):
+            fn = entry[0]
+            ok, text = _capture(lambda: fn(self._app))
+            out.append(text)
+            entry[1] = 0 if ok else entry[1] + 1
+            if entry[1] >= _MAX_FAILURES:
+                self._ticks.remove(entry)
+                out.append(f"[nuka_editor] tick callback '{getattr(fn, '__name__', fn)}' disabled after repeated failures\n")
+        return "".join(out) or None
+
     def dispatch(self, callback: int) -> Optional[str]:
+        if callback == _TICK:
+            return self._dispatch_ticks()
         name = _CALLBACKS[callback]
         out = []
         for script in list(self._scripts.values()):
@@ -121,7 +141,6 @@ class EditorApp:
             dt = world.dt if world is not None else 0.0
         self._world = world
         self._borrowed = None
-        self._ticks: List[Callable] = []
         self._runner = ScriptRunner(self)
         self._native = _editor_ext.App(argv, world.handle if world is not None else 0, dt, self._runner)
         atexit.register(self.close)
@@ -151,23 +170,30 @@ class EditorApp:
         return self._borrowed
 
     def on_tick(self, fn: Callable) -> Callable:
-        """Call fn(app) after every update; usable as a decorator."""
-        self._ticks.append(fn)
+        """Call fn(app) at every tick boundary: each transport step, or each update when
+        the caller steps the world. Usable as a decorator."""
+        self._runner.add_tick(fn)
         return fn
 
     def update(self, step: bool = False) -> None:
         """One frame. With step=True the editor transport advances physics; otherwise
-        the caller steps the world."""
+        no physics thread runs and the caller steps the world between updates."""
         self._native.update(step)
-        for fn in self._ticks:
-            fn(self)
+
+    def stop_physics(self) -> None:
+        """Join the physics thread; the world is the caller's until the next update(True)."""
+        self._native.stop_physics()
 
     def run(self, steps: Optional[int] = None) -> None:
         """Update with the transport until the window closes, or for ``steps`` frames."""
         count = 0
-        while self.running and (steps is None or count < steps):
-            self.update(True)
-            count += 1
+        try:
+            while self.running and (steps is None or count < steps):
+                self.update(True)
+                count += 1
+        finally:
+            if self._native is not None:
+                self._native.stop_physics()
 
     def console(self, text: str) -> None:
         self._native.console_append(text)

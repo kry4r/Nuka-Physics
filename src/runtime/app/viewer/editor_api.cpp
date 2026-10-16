@@ -50,6 +50,8 @@ nuka_result_t nuka_editor_update(nuka_editor_handle editor, uint32_t step_physic
     return Guard([&] { editor->Update(step_physics != 0u); });
 }
 
+void nuka_editor_stop_physics(nuka_editor_handle editor) { editor->StopPhysics(); }
+
 uint32_t nuka_editor_running(nuka_editor_handle editor) { return editor->Running() ? 1u : 0u; }
 
 uint32_t nuka_editor_playing(nuka_editor_handle editor) { return editor->Playing() ? 1u : 0u; }

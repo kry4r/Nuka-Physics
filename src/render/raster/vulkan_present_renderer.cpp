@@ -414,17 +414,12 @@ struct PresentRenderer::Impl {
     VkShaderModule   frag_module = VK_NULL_HANDLE;
     VkCommandPool    command_pool = VK_NULL_HANDLE;
 
-    // M11 INT-F1: the OPT-IN instanced pipeline (mesh_instanced.vert) reading the
-    // per-instance model matrix from the interop SSBO at set 1. Built lazily by
-    // SetInteropTransforms (and rebuilt on swapchain recreate) ONLY when the viewer
-    // installs a live SSBO descriptor set. The SSBO layout + set are BORROWED from
-    // the InteropTransformSsbo (the viewer owns them); we never destroy them.
+    // Instanced pipeline reading model matrices from a pose slot at set 1; built by
+    // SetInteropTransforms and rebuilt on swapchain recreate.
     VkShaderModule        instanced_vert_module = VK_NULL_HANDLE;  // freed in ~Impl
     VkPipelineLayout      instanced_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline            instanced_pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssbo_set_layout = VK_NULL_HANDLE;  // borrowed (not owned)
-    VkDescriptorSet       ssbo_set = VK_NULL_HANDLE;         // borrowed (not owned)
-    bool                  interop_draw = false;  // bind the instanced pipeline this frame
 
     // Per-frame-in-flight SceneUbo buffer + descriptor set (one per frame so the
     // in-flight frame's uniform is not overwritten by the next).
@@ -1433,11 +1428,8 @@ struct PresentRenderer::Impl {
         CreateDepthResources();
         CreateFramebuffers();
         CreatePipeline();
-        // INT-F1: rebuild the instanced pipeline against the NEW present pass when
-        // interop is active (DestroySwapchainDependents tore the old one down).
-        if (interop_draw && ssbo_set_layout != VK_NULL_HANDLE) {
-            CreateInstancedPipeline();
-        }
+        // DestroySwapchainDependents tore the instanced pipeline down with the old pass.
+        if (ssbo_set_layout != VK_NULL_HANDLE) CreateInstancedPipeline();
         report.swapchain_image_count = static_cast<uint32_t>(images.size());
         report.surface_format = static_cast<int32_t>(surface_format);
         report.present_mode = static_cast<int32_t>(present_mode);
@@ -1630,7 +1622,7 @@ struct PresentRenderer::Impl {
     };
 
     PresentFrameResult DrawFrame(const RenderWorld& world, const RasterOptions& options,
-                                 const OverlayRecordFn& overlay) {
+                                 const OverlayRecordFn& overlay, const PresentInterop* interop) {
         if (window_surface->Width() == 0u || window_surface->Height() == 0u) {
             recreate_requested = true;
             return PresentFrameResult::Suspended;
@@ -1772,12 +1764,9 @@ struct PresentRenderer::Impl {
         rp.pClearValues = clears.data();
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
-        // INT-F1: pick the pipeline + layout for this frame. The instanced path is
-        // used ONLY when interop was installed AND the instanced pipeline built
-        // successfully -- otherwise the DEFAULT per-draw push-constant pipeline (the
-        // unchanged D1 path) draws, so a non-interop present is byte-identical.
-        const bool use_instanced = interop_draw && instanced_pipeline != VK_NULL_HANDLE &&
-                                   ssbo_set != VK_NULL_HANDLE;
+        // A frame with a pose slot draws instanced from it; otherwise the per-draw
+        // push-constant pipeline draws the host transforms.
+        const bool use_instanced = interop != nullptr && instanced_pipeline != VK_NULL_HANDLE;
         const VkPipeline       active_pipeline = use_instanced ? instanced_pipeline : pipeline;
         const VkPipelineLayout active_layout =
             use_instanced ? instanced_pipeline_layout : pipeline_layout;
@@ -1785,9 +1774,9 @@ struct PresentRenderer::Impl {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, active_layout,
                                 0u, 1u, &ubo_slots[frame].set, 0u, nullptr);
         if (use_instanced) {
-            // set 1: the device-local interop transform SSBO (the scatter's output).
+            const VkDescriptorSet slot_set = reinterpret_cast<VkDescriptorSet>(interop->set);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, active_layout,
-                                    1u, 1u, &ssbo_set, 0u, nullptr);
+                                    1u, 1u, &slot_set, 0u, nullptr);
         }
         VkViewport viewport{};
         viewport.x = static_cast<float>(scene_rect.x); viewport.y = static_cast<float>(scene_rect.y);
@@ -1904,12 +1893,24 @@ struct PresentRenderer::Impl {
         CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present)");
 
         // -- submit ----------------------------------------------------------
+        // An instanced frame also waits, before vertex shading, for the CUDA writer's
+        // timeline value that completed its pose slot.
+        const std::array<VkSemaphore, 2> wait_semaphores{
+            image_available[frame],
+            use_instanced ? reinterpret_cast<VkSemaphore>(interop->timeline) : VK_NULL_HANDLE};
+        const std::array<VkPipelineStageFlags, 2> wait_stages{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT};
+        const std::array<uint64_t, 2> wait_values{0u, use_instanced ? interop->ready_value : 0u};
+        VkTimelineSemaphoreSubmitInfo timeline_info{};
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.waitSemaphoreValueCount = 2u;
+        timeline_info.pWaitSemaphoreValues = wait_values.data();
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        submit.waitSemaphoreCount = 1u;
-        submit.pWaitSemaphores = &image_available[frame];
-        submit.pWaitDstStageMask = &wait_stage;
+        submit.pNext = use_instanced ? &timeline_info : nullptr;
+        submit.waitSemaphoreCount = use_instanced ? 2u : 1u;
+        submit.pWaitSemaphores = wait_semaphores.data();
+        submit.pWaitDstStageMask = wait_stages.data();
         submit.commandBufferCount = 1u;
         submit.pCommandBuffers = &cmd;
         submit.signalSemaphoreCount = 1u;
@@ -1977,8 +1978,9 @@ PresentRenderer& PresentRenderer::operator=(PresentRenderer&&) noexcept = defaul
 
 PresentFrameResult PresentRenderer::DrawFrame(const RenderWorld& world,
                                               const RasterOptions& options,
-                                              const OverlayRecordFn& overlay) {
-    return impl_->DrawFrame(world, options, overlay);
+                                              const OverlayRecordFn& overlay,
+                                              const PresentInterop* interop) {
+    return impl_->DrawFrame(world, options, overlay, interop);
 }
 
 RendererVulkanHandles PresentRenderer::VulkanHandles() {
@@ -1997,6 +1999,8 @@ uint32_t PresentRenderer::SwapchainImageCount() const {
     return static_cast<uint32_t>(impl_->images.size());
 }
 uint32_t PresentRenderer::MinImageCount() const { return impl_->min_image_count; }
+uint32_t PresentRenderer::FramesInFlight() const { return kFramesInFlight; }
+uint64_t PresentRenderer::SubmittedFrames() const { return impl_->draw_counter_; }
 
 const PresentReport& PresentRenderer::Report() const { return impl_->report; }
 const std::string& PresentRenderer::DeviceName() const { return impl_->report.device_name; }
@@ -2022,27 +2026,18 @@ void PresentRenderer::SetCaptureFrame(int frame_index, std::string ppm_path) {
     impl_->capture_path_ = std::move(ppm_path);
 }
 
-void PresentRenderer::SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout,
-                                           NkVkDescriptorSet ssbo_set) {
-    // Disable when either handle is null -> revert to the default per-draw pipeline.
-    if (ssbo_set_layout == nullptr || ssbo_set == nullptr) {
-        impl_->interop_draw = false;
-        impl_->ssbo_set_layout = VK_NULL_HANDLE;
-        impl_->ssbo_set = VK_NULL_HANDLE;
-        return;
+void PresentRenderer::SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout) {
+    Impl& d = *impl_;
+    if (d.instanced_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(d.device, d.instanced_pipeline, nullptr);
+        d.instanced_pipeline = VK_NULL_HANDLE;
     }
-    impl_->ssbo_set_layout = reinterpret_cast<VkDescriptorSetLayout>(ssbo_set_layout);
-    impl_->ssbo_set = reinterpret_cast<VkDescriptorSet>(ssbo_set);
-    // Build the instanced pipeline against the current present pass. If it fails to
-    // build for any reason, CheckVk throws; we let it propagate (the caller knows
-    // interop is unsupported and can fall back). On success the next DrawFrame draws
-    // the instanced path.
-    impl_->CreateInstancedPipeline();
-    impl_->interop_draw = (impl_->instanced_pipeline != VK_NULL_HANDLE);
-}
-
-bool PresentRenderer::InteropDrawActive() const {
-    return impl_->interop_draw && impl_->instanced_pipeline != VK_NULL_HANDLE;
+    if (d.instanced_pipeline_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(d.device, d.instanced_pipeline_layout, nullptr);
+        d.instanced_pipeline_layout = VK_NULL_HANDLE;
+    }
+    d.ssbo_set_layout = reinterpret_cast<VkDescriptorSetLayout>(ssbo_set_layout);
+    if (d.ssbo_set_layout != VK_NULL_HANDLE) d.CreateInstancedPipeline();
 }
 
 }  // namespace nuka::render

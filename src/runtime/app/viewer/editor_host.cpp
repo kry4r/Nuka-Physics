@@ -8,11 +8,11 @@
 
 #include "nuka/nuka_scene.h"
 #include "render/imgui/nuka_imgui.hpp"
+#include "render/raster/interop_transform_ssbo.hpp"
 #include "render/raster/vulkan_present_renderer.hpp"
 #include "render/render_world.hpp"
 #include "render/viewer_resources.hpp"
 #include "render/window/window_surface.hpp"
-#include "runtime/app/command_queue.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/debug_overlay.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"
@@ -20,6 +20,8 @@
 #include "runtime/app/viewer/editor_undo.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/imgui_layer.hpp"
+#include "runtime/app/viewer/physics_worker.hpp"
+#include "runtime/app/viewer/pose_scatter.hpp"
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/teleop.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
@@ -27,18 +29,23 @@
 #include "scene/scene_ir.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace nuka::runtime::app::viewer {
@@ -48,14 +55,16 @@ namespace window = nuka::render::window;
 using Clock = std::chrono::steady_clock;
 
 constexpr float kDefaultDt = 1.0f / 240.0f;
-// A long frame consumes at most this many fixed-dt steps and drops the backlog.
-constexpr uint32_t kMaxStepsPerFrame = 64u;
-// Frame intervals clamp to this so a hitch (load, resize, debugger) never jumps time.
+// ImGui's frame interval clamps to this so a hitch (load, resize, debugger) never jumps time.
 constexpr double kMaxFrameDt = 0.25;
 constexpr size_t kConsoleLogCap = 256u * 1024u;
 // A spawned primitive starts this far above its reference so a free body drops in.
 constexpr float kSpawnDropHeight = 0.75f;
 constexpr uint64_t kFpsWarmup = 30u;
+// Frame timings keep this many recent samples for the exit percentiles.
+constexpr size_t kSampleCap = 65536u;
+// Pose slots beyond the frames in flight: the latest, the one being written, the one pinned.
+constexpr uint32_t kPoseSlotsBeyondFrames = 3u;
 // A pace ceiling against busy-spinning; FIFO present caps at the display refresh.
 constexpr double kFrameBudgetSeconds = 1.0 / 240.0;
 constexpr float kPi = 3.14159265358979323846f;
@@ -100,6 +109,10 @@ struct LaunchOptions {
     float teleop_nudge_delta = 0.0f;
     bool teleop_cmd_on = false;
     float teleop_cmd[3] = {0.0f, 0.0f, 0.0f};
+    float speed = 1.0f;
+    std::string publish = "auto";
+    bool perturb_on = false;
+    float perturb[3] = {0.0f, 0.0f, 0.0f};
 };
 
 bool ParsePrimitiveKind(const std::string& s, PrimitiveKind* out) {
@@ -136,6 +149,8 @@ void PrintUsage() {
                 "  [--show-colliders / --show-contacts enable the read-only debug overlays]\n"
                 "  [--teleop-nudge DOF,DELTA PD-holds the robot + nudges one drive target]\n"
                 "  [--teleop-cmd VX,VY,WYAW feeds a command to a command-consuming controller]\n"
+                "  [--speed X sets the transport speed; --publish auto|host|zero-copy picks the pose path]\n"
+                "  [--perturb FX,FY,FZ holds a world force [N] on the --select entity's link or body]\n"
                 "  default -> Nuka Dynamics Lab; --empty opens a blank workspace\n"
                 "  --offscreen renders to a display-less surface\n"
                 "  --policy attaches a trained locomotion controller to each load\n"
@@ -206,6 +221,13 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
             opt->teleop_cmd_on = std::sscanf(args[++i].c_str(), "%f,%f,%f", &opt->teleop_cmd[0],
                                              &opt->teleop_cmd[1], &opt->teleop_cmd[2]) == 3;
             if (!opt->teleop_cmd_on) std::fprintf(stderr, "[nuka_editor] --teleop-cmd wants VX,VY,WYAW\n");
+        }
+        else if (a == "--speed" && has_value) opt->speed = static_cast<float>(std::atof(args[++i].c_str()));
+        else if (a == "--publish" && has_value) opt->publish = args[++i];
+        else if (a == "--perturb" && has_value) {
+            opt->perturb_on = std::sscanf(args[++i].c_str(), "%f,%f,%f", &opt->perturb[0], &opt->perturb[1],
+                                          &opt->perturb[2]) == 3;
+            if (!opt->perturb_on) std::fprintf(stderr, "[nuka_editor] --perturb wants FX,FY,FZ\n");
         }
         else if (a == "--help") {
             PrintUsage();
@@ -322,6 +344,31 @@ scene::EntityId EntityOfPath(const EditorScene& es, const std::string& path) {
     return found;
 }
 
+double Ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
+
+// The most recent samples of one frame timing.
+struct SampleWindow {
+    std::vector<double> values;
+    size_t added = 0u;
+    void Add(double x) {
+        if (values.size() < kSampleCap) values.push_back(x);
+        else values[added % kSampleCap] = x;
+        ++added;
+    }
+    double Mean() const {
+        double sum = 0.0;
+        for (double v : values) sum += v;
+        return values.empty() ? 0.0 : sum / static_cast<double>(values.size());
+    }
+    double Percentile(double q) const {
+        if (values.empty()) return 0.0;
+        std::vector<double> sorted = values;
+        const size_t k = static_cast<size_t>(q * static_cast<double>(sorted.size() - 1u));
+        std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(k), sorted.end());
+        return sorted[k];
+    }
+};
+
 }  // namespace
 
 struct EditorHost::State {
@@ -330,6 +377,7 @@ struct EditorHost::State {
 
     void Frame(bool step_physics);
     void ConsoleAppend(const std::string& s);
+    void DrainConsoleInbox();
     void SetHooks(const nuka_editor_script_hooks_t& hooks);
 
     void FrameWorld(const render::RenderWorld& rw);
@@ -337,7 +385,14 @@ struct EditorHost::State {
     uint64_t Generation() const;
     void SyncScripts();
     void SeedDriveTargets();
-    void PublishOnly();
+    void BindWorker();
+    void DropPublisher();
+    void ApplySnapshot(const Snapshot& snap);
+    void TakeWorkerResults();
+    void PushTransport();
+    void PushEdits();
+    void DrawWorld(const render::RenderWorld& rw, const render::RasterOptions& opts);
+    void PrintSummary();
     void SetLoadError(const std::string& path);
     void CreateWorld(const std::string& path);
     void ApplyLoad(const std::string& path);
@@ -346,10 +401,12 @@ struct EditorHost::State {
     void OnRebound();
     void AttachController();
     void ApplyUnload();
+    bool TreeEditPending() const;
     void ApplyTreeEdits();
     void SeedInspector(scene::EntityId e);
     void ApplyInspectorEdits();
     void PostEditResync(uint64_t generation_before);
+    void ApplyScriptAttach();
 
     LaunchOptions opt_;
     nuka_world_handle world_ = nullptr;
@@ -383,6 +440,29 @@ struct EditorHost::State {
     ViewerUiState ui_state_;
     DebugOverlay debug_overlay_;
     ScriptHost script_host_;
+    PhysicsWorker worker_{&script_host_};
+    std::unique_ptr<render::InteropTransformSsbo> interop_;
+    std::unique_ptr<PoseScatter> scatter_;
+    std::string publish_reason_;          // why poses publish through host downloads
+    std::deque<uint32_t> frame_pins_;     // pose slots of submitted frames still in flight
+    uint64_t bound_epoch_ = 0u;
+    const Snapshot* shown_ = nullptr;     // the front snapshot, valid until the next acquire
+    uint64_t last_sequence_ = 0u;
+    uint64_t snapshot_drops_ = 0u;
+    WorkerTelemetry last_telemetry_;
+    uint64_t last_tick_ = 0u;
+    bool last_step_healthy_ = true;
+    // What the worker was last told, so changes become commands.
+    bool sent_playing_ = false;
+    uint32_t sent_env_ = 0u;
+    bool sent_colliders_ = false;
+    bool sent_contacts_ = false;
+    float sent_speed_ = 1.0f;
+    uint64_t sent_static_revision_ = 0u;
+    uint64_t transport_seq_ = 0u;
+    uint64_t reset_seq_ = 0u;
+    bool reset_framing_ = false;
+    uint64_t run_script_seq_ = 0u;
     bool frame_pending_ = false;
     render::SceneViewport last_framing_rect_;
     std::map<uint64_t, std::string> live_scripts_;  // id -> source last registered
@@ -391,19 +471,20 @@ struct EditorHost::State {
     double fps_ema_ = 0.0;
     uint64_t frame_index_ = 0;
     int presented_ = 0;
-    bool last_step_healthy_ = true;
-    double ft_sum_ = 0.0, ft_min_ = 1e30, ft_max_ = 0.0, st_sum_ = 0.0;
-    uint64_t ft_n_ = 0;
+    uint64_t measured_ = 0u;
+    SampleWindow frame_ms_, ui_ms_, apply_ms_, draw_ms_, sleep_ms_, age_ms_, step_ms_;
     bool ctrl_down_ = false;
     bool surface_suspended_ = false;
     bool teleop_hold_prev_ = false;
     bool teleop_prev_enabled_ = false;
     float last_mouse_x_ = 0.0f;
     float last_mouse_y_ = 0.0f;
-    double sim_accum_ = 0.0;  // simulated-time debt of the speed transport
     bool script_ran_ = false;
     std::vector<window::WindowEvent> events_;
-    bool running_ = true;
+    std::atomic<bool> running_{true};
+    std::atomic<bool> playing_mirror_{false};  // read by script callbacks off the UI thread
+    std::mutex inbox_mu_;
+    std::string console_inbox_;                // host console text, appended from any thread
 };
 
 EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle world, float dt)
@@ -457,6 +538,7 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
     ui_.EnableDocking();  // must precede the first NewFrame
     ui_state_.show_colliders = opt_.show_colliders;
     ui_state_.show_contacts = opt_.show_contacts;
+    ui_state_.speed = opt_.speed;
     camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
 
     // Loads run inside a frame, once the shell is up and the host installed its hooks.
@@ -468,6 +550,7 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
 }
 
 EditorHost::State::~State() {
+    worker_.StopThread();
     if (present_) {
         present_->WaitIdle();
         if (native_window_ != nullptr) ImGui_ImplSDL3_Shutdown();
@@ -475,15 +558,9 @@ EditorHost::State::~State() {
         std::printf("[nuka_editor] done: frames=%llu presented=%d last_step_healthy=%s\n",
                     static_cast<unsigned long long>(frame_index_), presented_,
                     last_step_healthy_ ? "yes" : "no");
-        if (ft_n_ > 0) {
-            const double mean_fms = ft_sum_ / static_cast<double>(ft_n_);
-            const double mean_sms = st_sum_ / static_cast<double>(ft_n_);
-            std::printf("[fps] SUMMARY measured=%llu mean_fps=%.1f mean_frame_ms=%.2f "
-                        "(min=%.2f max=%.2f) mean_step_ms=%.2f\n",
-                        static_cast<unsigned long long>(ft_n_), 1000.0 / mean_fms, mean_fms,
-                        ft_min_, ft_max_, mean_sms);
-        }
+        PrintSummary();
         std::fflush(stdout);
+        DropPublisher();
     }
     loaded_.reset();
     policy_ctrl_.reset();
@@ -499,6 +576,33 @@ void EditorHost::State::ConsoleAppend(const std::string& s) {
     ui_state_.console_log += s;
     if (ui_state_.console_log.size() > kConsoleLogCap)
         ui_state_.console_log.erase(0, ui_state_.console_log.size() - kConsoleLogCap);
+}
+
+void EditorHost::State::DrainConsoleInbox() {
+    std::string text;
+    {
+        std::lock_guard<std::mutex> lock(inbox_mu_);
+        text.swap(console_inbox_);
+    }
+    ConsoleAppend(text);
+}
+
+void EditorHost::State::PrintSummary() {
+    if (frame_ms_.values.empty()) return;
+    const std::vector<double>& f = frame_ms_.values;
+    const double mean = frame_ms_.Mean();
+    std::printf("[fps] SUMMARY measured=%llu mean_fps=%.1f mean_frame_ms=%.2f (min=%.2f max=%.2f) "
+                "mean_step_ms=%.2f p50=%.2f p95=%.2f p99=%.2f ui=%.2f apply=%.2f draw=%.2f sleep=%.2f "
+                "age_p95=%.2f drops=%llu publishes=%llu ticks=%llu capped=%llu dropped_sim_s=%.3f "
+                "mode=%s reason=\"%s\"\n",
+                static_cast<unsigned long long>(measured_), 1000.0 / mean, mean,
+                *std::min_element(f.begin(), f.end()), *std::max_element(f.begin(), f.end()),
+                step_ms_.Mean(), frame_ms_.Percentile(0.50), frame_ms_.Percentile(0.95),
+                frame_ms_.Percentile(0.99), ui_ms_.Mean(), apply_ms_.Mean(), draw_ms_.Mean(),
+                sleep_ms_.Mean(), age_ms_.Percentile(0.95), static_cast<unsigned long long>(snapshot_drops_),
+                static_cast<unsigned long long>(last_sequence_), static_cast<unsigned long long>(last_tick_),
+                static_cast<unsigned long long>(last_telemetry_.capped_batches), last_telemetry_.dropped_sim_s,
+                scatter_ ? "zero-copy" : "host", publish_reason_.c_str());
 }
 
 void EditorHost::State::SetHooks(const nuka_editor_script_hooks_t& hooks) {
@@ -572,9 +676,218 @@ void EditorHost::State::SeedDriveTargets() {
                               links * sizeof(float), 0u);
 }
 
-void EditorHost::State::PublishOnly() {
-    InputIntents intents;
-    loaded_->sim->FramePublish(&intents, 0u);
+// Drops the zero-copy pose path; the GPU must be idle.
+void EditorHost::State::DropPublisher() {
+    present_->SetInteropTransforms(nullptr);
+    scatter_.reset();  // frees CUDA's imports, synchronizing the device
+    interop_.reset();
+    frame_pins_.clear();
+}
+
+// Binds the worker to the loaded scene. Poses publish zero-copy when the renderer and
+// the world's CUDA device share pose slots, otherwise through host downloads.
+void EditorHost::State::BindWorker() {
+    present_->WaitIdle();
+    DropPublisher();
+    const render::RenderWorld& rw = loaded_->sim->GetRenderWorld();
+    const render::RendererVulkanHandles vk = present_->VulkanHandles();
+    publish_reason_.clear();
+    if (opt_.publish == "host") {
+        publish_reason_ = "--publish host";
+    } else if (!vk.interop_supported) {
+        publish_reason_ = "the Vulkan device cannot export memory or timeline semaphores";
+    } else {
+        try {
+            auto interop = std::make_unique<render::InteropTransformSsbo>();
+            interop->Create(reinterpret_cast<VkDevice>(vk.device), reinterpret_cast<VkPhysicalDevice>(vk.physical_device),
+                            std::max(rw.InstanceCount(), 1u), present_->FramesInFlight() + kPoseSlotsBeyondFrames);
+            const render::InteropExport exported = interop->TakeExport();
+            PoseSlotImport slots;
+            slots.memory_handle = exported.memory_handle;
+            slots.memory_fd = exported.memory_fd;
+            slots.memory_bytes = exported.memory_bytes;
+            slots.semaphore_handle = exported.semaphore_handle;
+            slots.semaphore_fd = exported.semaphore_fd;
+            slots.slot_bytes = exported.slot_bytes;
+            std::memcpy(slots.device_uuid, vk.device_uuid, sizeof(slots.device_uuid));
+            auto scatter = std::make_unique<PoseScatter>(world_, slots);
+            scatter->SetRows(world_, BuildScatterRows(rw));
+            present_->SetInteropTransforms(reinterpret_cast<render::NkVkDescriptorSetLayout>(interop->SetLayout()));
+            worker_.Slots().Reset(interop->SlotCount());
+            interop_ = std::move(interop);
+            scatter_ = std::move(scatter);
+        } catch (const std::exception& e) {
+            publish_reason_ = e.what();
+        }
+    }
+    std::printf("[nuka_editor] publish=%s%s%s\n", scatter_ ? "zero-copy" : "host",
+                scatter_ ? "" : " reason=", publish_reason_.c_str());
+
+    const WorldLayout& layout = loaded_->Layout();
+    WorkerBinding binding;
+    binding.world = world_;
+    binding.layout = layout;
+    binding.rest_targets = loaded_->rest_targets;
+    binding.controller = policy_ctrl_.get();
+    binding.scatter = scatter_.get();
+    binding.env = ui_state_.env_index % layout.env_count;
+    binding.dt = opt_.dt;
+    binding.speed = ui_state_.speed;
+    binding.colliders = ui_state_.show_colliders;
+    binding.contacts = ui_state_.show_contacts;
+    sent_playing_ = false;
+    sent_env_ = binding.env;
+    sent_speed_ = binding.speed;
+    sent_colliders_ = binding.colliders;
+    sent_contacts_ = binding.contacts;
+    sent_static_revision_ = loaded_->sim->StaticRevision();
+    bound_epoch_ = worker_.Bind(std::move(binding));
+    shown_ = nullptr;
+    // A new binding starts paused; the transport re-sends the UI's play state.
+    if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
+}
+
+// Shows a snapshot of the current binding; one the UI already superseded only counts.
+void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
+    if (last_sequence_ != 0u && snap.sequence > last_sequence_ + 1u)
+        snapshot_drops_ += snap.sequence - last_sequence_ - 1u;
+    last_sequence_ = snap.sequence;
+    shown_ = loaded_ && snap.epoch == bound_epoch_ ? &snap : nullptr;
+    if (shown_ == nullptr) return;
+    loaded_->sim->ApplyPoses(snap.link_poses, snap.body_poses);
+    last_telemetry_ = snap.telemetry;
+    last_tick_ = snap.tick;
+    last_step_healthy_ = snap.healthy;
+    // Once the worker saw the last transport command and none is pending, its state is the
+    // truth (it pauses itself on a failed tick).
+    if (snap.acked >= transport_seq_ && ui_state_.playing == sent_playing_)
+        ui_state_.playing = sent_playing_ = snap.playing;
+    if (reset_framing_ && snap.acked >= reset_seq_) {
+        reset_framing_ = false;
+        FrameWorld(loaded_->sim->GetRenderWorld());
+    }
+}
+
+void EditorHost::State::TakeWorkerResults() {
+    for (const TickResult& r : worker_.TakeResults()) {
+        if (r.error) std::fputs(r.text.c_str(), stderr);
+        if (r.seq != 0u && r.seq == run_script_seq_) {
+            std::fputs(r.text.c_str(), stderr);
+            std::fflush(stderr);
+            std::printf("[nuka_editor] ran --run-script %s (%zu bytes captured)\n", opt_.run_script_path.c_str(),
+                        r.text.size());
+            std::fflush(stdout);
+        }
+        ConsoleAppend(r.text);
+    }
+}
+
+// Transport and display changes become worker commands.
+void EditorHost::State::PushTransport() {
+    if (!loaded_) {
+        if (ui_state_.reset_requested) FrameWorld(empty_world_);
+        ui_state_.reset_requested = ui_state_.step_requested = false;
+        return;
+    }
+    if (ui_state_.speed != sent_speed_) {
+        TickCommand cmd = TickCommand::Transport(TransportOp::Speed);
+        cmd.speed = ui_state_.speed;
+        worker_.Push(std::move(cmd));
+        sent_speed_ = ui_state_.speed;
+    }
+    if (ui_state_.reset_requested) {
+        ui_state_.reset_requested = false;
+        reset_seq_ = transport_seq_ = worker_.Push(TickCommand::Transport(TransportOp::Reset));
+        reset_framing_ = true;
+        ui_state_.playing = sent_playing_ = false;
+    }
+    if (ui_state_.playing != sent_playing_) {
+        transport_seq_ = worker_.Push(TickCommand::Transport(ui_state_.playing ? TransportOp::Play : TransportOp::Pause));
+        sent_playing_ = ui_state_.playing;
+    }
+    if (ui_state_.step_requested) {
+        ui_state_.step_requested = false;
+        TickCommand cmd = TickCommand::Transport(TransportOp::Step);
+        cmd.steps = 1u;
+        worker_.Push(std::move(cmd));
+    }
+    const uint32_t env = ui_state_.env_index % loaded_->Layout().env_count;
+    if (env != sent_env_) {
+        TickCommand cmd = TickCommand::Param(ParamKind::DisplayEnv, {});
+        cmd.env = env;
+        worker_.Push(std::move(cmd));
+        sent_env_ = env;
+    }
+    if (ui_state_.show_colliders != sent_colliders_ || ui_state_.show_contacts != sent_contacts_) {
+        worker_.Push(TickCommand::Param(ParamKind::Overlay, {ui_state_.show_colliders ? 1.0f : 0.0f,
+                                                             ui_state_.show_contacts ? 1.0f : 0.0f}));
+        sent_colliders_ = ui_state_.show_colliders;
+        sent_contacts_ = ui_state_.show_contacts;
+    }
+}
+
+// Live edits of this frame become worker commands: teleports, static rows, drive targets.
+void EditorHost::State::PushEdits() {
+    if (!loaded_) return;
+    for (const PoseWrite& write : loaded_->sim->TakePoseWrites()) {
+        TickCommand cmd;
+        cmd.kind = CommandKind::EditApply;
+        cmd.pose = write;
+        worker_.Push(std::move(cmd));
+    }
+    if (scatter_ && loaded_->sim->StaticRevision() != sent_static_revision_) {
+        TickCommand cmd = TickCommand::Param(ParamKind::ScatterRows, {});
+        cmd.rows = BuildScatterRows(loaded_->sim->GetRenderWorld());
+        worker_.Push(std::move(cmd));
+        sent_static_revision_ = loaded_->sim->StaticRevision();
+    }
+    // Moved drive sliders write only their own rows of the selected environment.
+    if (ui_state_.drive_dirty.size() == ui_state_.drive_targets.size()) {
+        const WorldLayout& layout = loaded_->Layout();
+        const size_t env = ui_state_.env_index % layout.env_count;
+        for (size_t d = 0; d < ui_state_.drive_targets.size(); ++d) {
+            if (!ui_state_.drive_dirty[d]) continue;
+            TickCommand cmd = TickCommand::Param(ParamKind::Field, {ui_state_.drive_targets[d]});
+            cmd.field = NUKA_FIELD_DRIVE_TARGET;
+            cmd.offset = (env * layout.links_per_env + d) * sizeof(float);
+            worker_.Push(std::move(cmd));
+            ui_state_.drive_dirty[d] = 0u;
+        }
+    }
+}
+
+// Draws with the latest zero-copy pose slot when there is one; a slot stays pinned until
+// the frames in flight after its frame were submitted.
+void EditorHost::State::DrawWorld(const render::RenderWorld& rw, const render::RasterOptions& opts) {
+    render::PresentInterop interop;
+    uint32_t slot = 0u;
+    const bool pinned = scatter_ != nullptr && worker_.Slots().AcquireRead(&slot, &interop.ready_value);
+    if (pinned) {
+        interop.set = reinterpret_cast<render::NkVkDescriptorSet>(interop_->Slot(slot));
+        interop.timeline = reinterpret_cast<render::NkVkSemaphore>(interop_->Timeline());
+    }
+    const uint64_t submitted = present_->SubmittedFrames();
+    const render::PresentFrameResult r = present_->DrawFrame(rw, opts, [this](void* cmd) {
+        imgui_.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
+    }, pinned ? &interop : nullptr);
+    if (present_->SubmittedFrames() != submitted) {
+        frame_pins_.push_back(pinned ? slot : ~0u);
+        while (frame_pins_.size() > present_->FramesInFlight()) {
+            if (frame_pins_.front() != ~0u) worker_.Slots().Release(frame_pins_.front());
+            frame_pins_.pop_front();
+        }
+    } else if (pinned) {
+        worker_.Slots().Release(slot);
+    }
+    if (r == render::PresentFrameResult::Error) {
+        std::fprintf(stderr, "[nuka_editor] present error at frame %llu\n",
+                     static_cast<unsigned long long>(frame_index_));
+        running_ = false;
+        return;
+    }
+    // A recreated swapchain keeps a compatible pass; ImGui only needs the image count.
+    if (r == render::PresentFrameResult::Recreated) imgui_.NotifySwapchainRecreated(present_->MinImageCount());
+    if (r == render::PresentFrameResult::Presented) ++presented_;
 }
 
 void EditorHost::State::SetLoadError(const std::string& path) {
@@ -633,7 +946,8 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     frame_pending_ = true;
     entity_drag_.Cancel();
     debug_overlay_.Reset();
-    PublishOnly();  // poses before framing
+    AttachController();
+    BindWorker();  // poses before framing
     FrameWorld(loaded_->sim->GetRenderWorld());
     SeedDriveTargets();
     record_index_.Build(loaded_->scene);
@@ -711,7 +1025,22 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     }
     if (!opt_.save_to.empty()) ui_state_.save_request = opt_.save_to;
     ui_state_.playing = opt_.want_play;
-    AttachController();
+    if (opt_.perturb_on && ui_state_.selected_entity != scene::kInvalidEntity) {
+        const render::RenderInstance* inst =
+            InstanceOfEntity(loaded_->sim->GetRenderWorld(), ui_state_.selected_entity);
+        const render::PoseSource::Kind kind = inst != nullptr ? inst->pose_source.kind : render::PoseSource::Kind::Static;
+        if (kind == render::PoseSource::Kind::Link || kind == render::PoseSource::Kind::Body) {
+            TickCommand cmd;
+            cmd.kind = CommandKind::Perturb;
+            cmd.perturb.source = inst->pose_source;
+            for (int k = 0; k < 3; ++k) cmd.perturb.force[k] = opt_.perturb[k];
+            worker_.Push(std::move(cmd));
+            std::printf("[nuka_editor] perturb: %s holds (%g, %g, %g) N\n", opt_.select_path.c_str(),
+                        opt_.perturb[0], opt_.perturb[1], opt_.perturb[2]);
+        } else {
+            std::fprintf(stderr, "[nuka_editor] --perturb: '%s' has no link or body\n", opt_.select_path.c_str());
+        }
+    }
 
     // Headless teleop: PD-hold and nudge one drive target, or feed a command.
     const bool cmd_ctrl = policy_ctrl_ && policy_ctrl_->AcceptsCommand();
@@ -742,6 +1071,7 @@ void EditorHost::State::OnLoaded(const std::string& path) {
 void EditorHost::State::OnRebound() {
     AttachController();
     SeedDriveTargets();
+    BindWorker();
 }
 
 void EditorHost::State::AttachController() {
@@ -758,13 +1088,16 @@ void EditorHost::State::AttachController() {
             std::fprintf(stderr, "[nuka_editor] policy Init failed: %s\n", opt_.policy_path.c_str());
         }
     }
-    loaded_->sim->SetController(policy_ctrl_.get());
-    loaded_->sim->SetEnvIndex(ui_state_.env_index);
 }
 
 // Drops the scene binding; the world stays until the editor is destroyed.
 void EditorHost::State::ApplyUnload() {
     present_->WaitIdle();
+    worker_.Unbind();
+    DropPublisher();
+    shown_ = nullptr;
+    bound_epoch_ = 0u;
+    reset_framing_ = false;
     policy_ctrl_.reset();
     entity_drag_.Cancel();
     loaded_.reset();
@@ -780,6 +1113,11 @@ void EditorHost::State::ApplyUnload() {
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
     ui_state_.save_dirty = false;
     camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
+}
+
+bool EditorHost::State::TreeEditPending() const {
+    return loaded_ && (ui_state_.rename_request || ui_state_.spawn_request || ui_state_.delete_request ||
+                       ui_state_.reparent_request);
 }
 
 // One queued tree edit on the selection, applied at a frame top so a rebuild never
@@ -970,24 +1308,61 @@ void EditorHost::State::PostEditResync(uint64_t generation_before) {
     ui_state_.save_dirty = true;
 }
 
+// Attach persists the buffer as a /script node; a selected one updates in place.
+void EditorHost::State::ApplyScriptAttach() {
+    scene::ScriptId sel_script = scene::kInvalidScript;
+    if (ui_state_.selected_entity != scene::kInvalidEntity) {
+        for (size_t i = 0; i < loaded_->scene.ScriptCount(); ++i) {
+            const auto sid = static_cast<scene::ScriptId>(i);
+            if (loaded_->scene.EntityOfScript(sid) == ui_state_.selected_entity) {
+                sel_script = sid;
+                break;
+            }
+        }
+    }
+    std::string sel_path;  // survives the re-projection below
+    if (sel_script != scene::kInvalidScript) sel_path = PathOfEntity(ui_state_.selected_entity);
+    if (sel_script != scene::kInvalidScript) {
+        loaded_->scene.GetScriptMut(sel_script).source = ui_state_.script_buf;
+    } else {
+        uint64_t next_id = 1;
+        for (const auto& sr : loaded_->scene.Scripts())
+            if (sr.stable_id >= next_id) next_id = sr.stable_id + 1;
+        scene::ScriptRecord rec;
+        rec.stable_id = next_id;
+        rec.source = ui_state_.script_buf;
+        loaded_->scene.AddScript(rec);
+    }
+    record_index_.Build(loaded_->scene);
+    SyncScripts();
+    if (!sel_path.empty()) {
+        if (const auto n = loaded_->scene.Tree().NodeOf(sel_path)) ui_state_.selected_entity = n->entity;
+    }
+    ui_state_.save_dirty = true;
+}
+
 void EditorHost::State::Frame(bool step_physics) {
     if (!running_) return;
+    const auto now = Clock::now();
+    if (step_physics) worker_.StartThread();
+    else worker_.StopThread();
+    DrainConsoleInbox();
 
-    // Pending unload, load and tree edits land before anything reads the world.
+    // Pending unload, load and tree edits land at a tick boundary, before the frame reads poses.
     if (ui_state_.unload_request) {
-        ApplyUnload();
         ui_state_.unload_request = false;
+        worker_.Exclusive([&] { ApplyUnload(); });
     }
     if (!ui_state_.load_request.empty()) {
         const std::string path = ui_state_.load_request;
         ui_state_.load_request.clear();
-        ApplyLoad(path);
+        worker_.Exclusive([&] { ApplyLoad(path); });
     }
     if (attach_pending_) {
         attach_pending_ = false;
-        Attach("");
+        worker_.Exclusive([&] { Attach(""); });
     }
-    ApplyTreeEdits();
+    if (TreeEditPending()) worker_.Exclusive([&] { ApplyTreeEdits(); });
 
     // Headless triggers: undo at frame 1, redo at frame 2, reset at frame N.
     if (opt_.undo && frame_index_ == 1u) ui_state_.undo_request = true;
@@ -998,36 +1373,32 @@ void EditorHost::State::Frame(bool step_physics) {
     if (ui_state_.undo_request) {
         ui_state_.undo_request = false;
         if (loaded_ && edit_stack_.CanUndo()) {
-            present_->WaitIdle();
-            const uint64_t generation = Generation();
-            edit_stack_.Undo();
-            PostEditResync(generation);
+            worker_.Exclusive([&] {
+                present_->WaitIdle();
+                const uint64_t generation = Generation();
+                edit_stack_.Undo();
+                PostEditResync(generation);
+            });
         }
     }
     if (ui_state_.redo_request) {
         ui_state_.redo_request = false;
         if (loaded_ && edit_stack_.CanRedo()) {
-            present_->WaitIdle();
-            const uint64_t generation = Generation();
-            edit_stack_.Redo();
-            PostEditResync(generation);
+            worker_.Exclusive([&] {
+                present_->WaitIdle();
+                const uint64_t generation = Generation();
+                edit_stack_.Redo();
+                PostEditResync(generation);
+            });
         }
     }
 
+    // The script runs on the physics side at its next tick boundary.
     if (!opt_.run_script_path.empty() && !script_ran_) {
         script_ran_ = true;
         std::string code;
-        if (ReadEntireFile(opt_.run_script_path, &code)) {
-            const std::string out = script_host_.RunString(code);
-            ui_state_.console_log += out;
-            std::fputs(out.c_str(), stderr);
-            std::fflush(stderr);
-            std::printf("[nuka_editor] ran --run-script %s (%zu bytes captured)\n",
-                        opt_.run_script_path.c_str(), out.size());
-            std::fflush(stdout);
-        } else {
-            std::fprintf(stderr, "[nuka_editor] --run-script: cannot read %s\n", opt_.run_script_path.c_str());
-        }
+        if (ReadEntireFile(opt_.run_script_path, &code)) run_script_seq_ = worker_.Push(TickCommand::Script(code));
+        else std::fprintf(stderr, "[nuka_editor] --run-script: cannot read %s\n", opt_.run_script_path.c_str());
     }
 
     events_.clear();
@@ -1063,7 +1434,6 @@ void EditorHost::State::Frame(bool step_physics) {
         }
     }
 
-    const auto now = Clock::now();
     const double frame_dt = std::chrono::duration<double>(now - prev_).count();
     prev_ = now;
     if (frame_dt > 0.0) {
@@ -1071,61 +1441,15 @@ void EditorHost::State::Frame(bool step_physics) {
         fps_ema_ = (fps_ema_ == 0.0) ? inst_fps : (fps_ema_ * 0.9 + inst_fps * 0.1);
     }
 
+    // Without a physics thread this update is the tick boundary; then the newest snapshot
+    // re-poses the render world.
+    if (!worker_.Threaded()) worker_.Pump();
+    TakeWorkerResults();
+    const auto apply_t0 = Clock::now();
+    if (const Snapshot* snap = worker_.AcquireSnapshot()) ApplySnapshot(*snap);
+    double apply_ms = Ms(Clock::now() - apply_t0);
+
     const render::RenderWorld& render_world = loaded_ ? loaded_->sim->GetRenderWorld() : empty_world_;
-    double step_ms = 0.0;
-    InputIntents intents;
-    uint32_t steps_taken = 0u;
-    if (loaded_) {
-        EditorSim& sim = *loaded_->sim;
-        // Speed transport: speed * real frame time accrues and is consumed in fixed-dt
-        // steps; a host that steps the world itself passes step_physics = false.
-        uint32_t steps = 0u;
-        if (step_physics && ui_state_.playing) {
-            sim_accum_ += std::min(frame_dt, kMaxFrameDt) * static_cast<double>(ui_state_.speed);
-            steps = static_cast<uint32_t>(sim_accum_ / static_cast<double>(opt_.dt));
-            if (steps > kMaxStepsPerFrame) {
-                steps = kMaxStepsPerFrame;
-                sim_accum_ = 0.0;
-            } else {
-                sim_accum_ -= static_cast<double>(steps) * static_cast<double>(opt_.dt);
-            }
-        } else {
-            sim_accum_ = 0.0;
-            if (step_physics && ui_state_.step_requested) steps = 1u;
-        }
-        const auto step_t0 = Clock::now();
-        last_step_healthy_ = sim.FramePublish(&intents, steps);
-        step_ms = std::chrono::duration<double, std::milli>(Clock::now() - step_t0).count();
-        steps_taken = steps;
-        if (steps > 0u) ConsoleAppend(script_host_.DispatchStep());
-
-        if (intents.toggle_play) ui_state_.playing = !ui_state_.playing;
-        if (intents.set_play) ui_state_.playing = intents.play_value;
-        if (intents.reset) ui_state_.reset_requested = true;
-        if (intents.camera_reset) ui_state_.camera_reset = true;
-        if (intents.set_env) {
-            const uint32_t env = intents.env_value % loaded_->Layout().env_count;
-            ui_state_.env_index = env;
-            sim.SetEnvIndex(env);
-        }
-    } else {
-        last_step_healthy_ = true;
-    }
-    // A queued StepOnce lands next frame, like the Step button.
-    ui_state_.step_requested = intents.step_once;
-
-    if (ui_state_.reset_requested) {
-        if (loaded_) {
-            present_->WaitIdle();
-            if (!ResetEditorScenePhysics(*loaded_))
-                std::fprintf(stderr, "[nuka_editor] reset: physics re-seed failed\n");
-            PublishOnly();
-            ConsoleAppend(script_host_.DispatchReset());
-            ui_state_.playing = false;
-        }
-        FrameWorld(render_world);
-        ui_state_.reset_requested = false;
-    }
     if (ui_state_.camera_reset) {
         FrameWorld(render_world);
         ui_state_.camera_reset = false;
@@ -1133,11 +1457,20 @@ void EditorHost::State::Frame(bool step_physics) {
     }
 
     ViewerStats stats;
-    stats.step_time_ms = static_cast<float>(step_ms);
-    stats.cpu_timing_available = static_cast<bool>(loaded_);
+    const bool live = loaded_ && shown_ != nullptr;
+    stats.cpu_timing_available = live;
+    if (live) {
+        stats.step_time_ms = static_cast<float>(shown_->telemetry.step_ms);
+        stats.sub_steps = shown_->telemetry.batch_steps;
+        stats.sim_ticks = shown_->tick;
+        stats.capped_batches = shown_->telemetry.capped_batches;
+        stats.snapshot_age_ms = static_cast<float>(Ms(Clock::now() - shown_->published));
+    }
+    stats.snapshot_drops = snapshot_drops_;
+    stats.zero_copy = scatter_ != nullptr;
+    stats.publish_reason = publish_reason_;
     stats.frame_timing_available = frame_dt > 0.0;
     stats.fps = static_cast<float>(fps_ema_);
-    stats.sub_steps = steps_taken;
     if (loaded_) {
         const WorldLayout& layout = loaded_->Layout();
         stats.dof = layout.dofs_per_env;
@@ -1273,7 +1606,7 @@ void EditorHost::State::Frame(bool step_physics) {
                 }
             } else if (ev.type == window::WindowEvent::Type::MouseMove && entity_drag_.instance != ~0u &&
                        entity_drag_.instance < sim.GetRenderWorld().InstanceCount()) {
-                // Drag on a view-facing plane through the entity, as a queued live move.
+                // Drag on a view-facing plane through the entity, as a queued teleport.
                 const render::RenderInstance& inst = sim.GetRenderWorld().instances[entity_drag_.instance];
                 const math::Vec3 anchor = inst.world_xform.position;
                 const Ray ray = render_camera.ScreenRay(scene_rect.LocalX(mouse_x), scene_rect.LocalY(mouse_y),
@@ -1283,7 +1616,10 @@ void EditorHost::State::Frame(bool step_physics) {
                 if (render_camera.RayPlaneHit(ray, anchor, fwd, &hit)) {
                     math::Transform xf = inst.world_xform;
                     xf.position = hit;
-                    sim.Commands().Push(Command::MakeMoveEntity(inst.entity, xf));
+                    TickCommand cmd;
+                    cmd.kind = CommandKind::Teleport;
+                    if (ResolvePoseWrite(sim.GetRenderWorld(), loaded_->Layout(), inst.entity, xf, &cmd.pose))
+                        worker_.Push(std::move(cmd));
                 }
             }
         }
@@ -1311,42 +1647,11 @@ void EditorHost::State::Frame(bool step_physics) {
     }
     if (ui_state_.script_run_request) {
         ui_state_.script_run_request = false;
-        ConsoleAppend(script_host_.RunString(ui_state_.script_buf));
+        worker_.Push(TickCommand::Script(ui_state_.script_buf));
     }
-    // Attach persists the buffer as a /script node; a selected one updates in place.
     if (ui_state_.script_attach_request) {
         ui_state_.script_attach_request = false;
-        if (loaded_) {
-            scene::ScriptId sel_script = scene::kInvalidScript;
-            if (ui_state_.selected_entity != scene::kInvalidEntity) {
-                for (size_t i = 0; i < loaded_->scene.ScriptCount(); ++i) {
-                    const auto sid = static_cast<scene::ScriptId>(i);
-                    if (loaded_->scene.EntityOfScript(sid) == ui_state_.selected_entity) {
-                        sel_script = sid;
-                        break;
-                    }
-                }
-            }
-            std::string sel_path;  // survives the re-projection below
-            if (sel_script != scene::kInvalidScript) sel_path = PathOfEntity(ui_state_.selected_entity);
-            if (sel_script != scene::kInvalidScript) {
-                loaded_->scene.GetScriptMut(sel_script).source = ui_state_.script_buf;
-            } else {
-                uint64_t next_id = 1;
-                for (const auto& sr : loaded_->scene.Scripts())
-                    if (sr.stable_id >= next_id) next_id = sr.stable_id + 1;
-                scene::ScriptRecord rec;
-                rec.stable_id = next_id;
-                rec.source = ui_state_.script_buf;
-                loaded_->scene.AddScript(rec);
-            }
-            record_index_.Build(loaded_->scene);
-            SyncScripts();
-            if (!sel_path.empty()) {
-                if (const auto n = loaded_->scene.Tree().NodeOf(sel_path)) ui_state_.selected_entity = n->entity;
-            }
-            ui_state_.save_dirty = true;
-        }
+        if (loaded_) worker_.Exclusive([&] { ApplyScriptAttach(); });
     }
     // An oversize source is refused loudly, never truncated into the buffer.
     if (ui_state_.script_load_request) {
@@ -1372,8 +1677,7 @@ void EditorHost::State::Frame(bool step_physics) {
     // robot stops instead of latching.
     bool teleop_owns_wasd = false;
     {
-        inference::WorldController* ctrl = loaded_ ? loaded_->sim->Controller() : nullptr;
-        const bool cmd_ctrl = ctrl != nullptr && ctrl->AcceptsCommand();
+        const bool cmd_ctrl = loaded_ && policy_ctrl_ && policy_ctrl_->AcceptsCommand();
         const bool active = loaded_ && ui_state_.teleop_enabled && !io.WantCaptureKeyboard &&
                             !io.WantTextInput && ui_.OwnsScenePointer() && ui_state_.window_focused;
         TeleopKeys tk;
@@ -1389,18 +1693,18 @@ void EditorHost::State::Frame(bool step_physics) {
         // PD-hold rising edge makes drive targets effective for direct control.
         const bool hold_now = active && ui_state_.teleop_hold && !cmd_ctrl;
         if (hold_now && !teleop_hold_prev_)
-            ApplyHoldGains(world_, loaded_->Layout(), ui_state_.teleop_kp, ui_state_.teleop_kd);
+            worker_.Push(TickCommand::Param(ParamKind::HoldGains, {ui_state_.teleop_kp, ui_state_.teleop_kd}));
         teleop_hold_prev_ = hold_now;
 
         const uint32_t dof_count = static_cast<uint32_t>(ui_state_.drive_targets.size());
         const TeleopResult tr = ApplyTeleop(active, tk, ui_state_, dof_count);
         if (cmd_ctrl) {
             if (ui_state_.teleop_enabled) {
-                ctrl->SetCommandVector(tr.command, 3);
+                worker_.Push(TickCommand::Param(ParamKind::ControllerCommand,
+                                                {tr.command[0], tr.command[1], tr.command[2]}));
             } else if (teleop_prev_enabled_) {
                 // Toggle-off edge: one zero stops the robot, then scripts may own the command.
-                const float zero[3] = {0.0f, 0.0f, 0.0f};
-                ctrl->SetCommandVector(zero, 3);
+                worker_.Push(TickCommand::Param(ParamKind::ControllerCommand, {0.0f, 0.0f, 0.0f}));
             }
             teleop_owns_wasd = active;
         }
@@ -1430,18 +1734,8 @@ void EditorHost::State::Frame(bool step_physics) {
     }
     ui_.HandleCameraShortcuts(render_world, camera_, ui_state_);
     ImGui::Render();
-
-    // Moved drive sliders upload only their own rows of the selected environment.
-    if (loaded_ && ui_state_.drive_dirty.size() == ui_state_.drive_targets.size()) {
-        const WorldLayout& layout = loaded_->Layout();
-        const size_t env = ui_state_.env_index % layout.env_count;
-        for (size_t d = 0; d < ui_state_.drive_targets.size(); ++d) {
-            if (!ui_state_.drive_dirty[d]) continue;
-            const size_t at = (env * layout.links_per_env + d) * sizeof(float);
-            nuka_world_upload_field(world_, NUKA_FIELD_DRIVE_TARGET, &ui_state_.drive_targets[d], sizeof(float), at);
-            ui_state_.drive_dirty[d] = 0u;
-        }
-    }
+    PushTransport();
+    PushEdits();
 
     render::RasterOptions opts;
     opts.width = present_->Report().width;
@@ -1457,44 +1751,44 @@ void EditorHost::State::Frame(bool step_physics) {
             opts.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
     }
 
-    // Debug overlays rebuild from the live world just before the draw; off leaves the
-    // real instance set untouched.
-    if (loaded_)
-        debug_overlay_.Rebuild(world_, loaded_->Layout(), loaded_->sim->GetRenderWorld(), ui_state_.env_index,
-                               ui_state_.show_colliders, ui_state_.show_contacts);
+    // Debug overlays rebuild from the shown snapshot; off leaves the real instance set untouched.
+    const auto overlay_t0 = Clock::now();
+    if (loaded_ && shown_ != nullptr)
+        debug_overlay_.Rebuild(shown_->overlay, loaded_->sim->GetRenderWorld(), ui_state_.show_colliders,
+                               ui_state_.show_contacts);
+    apply_ms += Ms(Clock::now() - overlay_t0);
 
-    const render::PresentFrameResult r = present_->DrawFrame(render_world, opts, [this](void* cmd) {
-        imgui_.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
-    });
-    if (r == render::PresentFrameResult::Error) {
-        std::fprintf(stderr, "[nuka_editor] present error at frame %llu\n",
-                     static_cast<unsigned long long>(frame_index_));
-        running_ = false;
-        return;
-    }
-    // A recreated swapchain keeps a compatible pass; ImGui only needs the image count.
-    if (r == render::PresentFrameResult::Recreated) imgui_.NotifySwapchainRecreated(present_->MinImageCount());
-    if (r == render::PresentFrameResult::Presented) ++presented_;
+    const auto draw_t0 = Clock::now();
+    DrawWorld(render_world, opts);
+    const double draw_ms = Ms(Clock::now() - draw_t0);
+    if (!running_) return;
     ++frame_index_;
+    playing_mirror_ = ui_state_.playing;
 
-    if (frame_dt > 0.0 && frame_index_ > kFpsWarmup) {
-        const double fms = frame_dt * 1000.0;
-        ft_sum_ += fms;
-        st_sum_ += step_ms;
-        ++ft_n_;
-        ft_min_ = std::min(ft_min_, fms);
-        ft_max_ = std::max(ft_max_, fms);
-        if (frame_index_ % 120u == 0u) {
-            std::printf("[fps] frame=%llu fps_ema=%.1f frame_ms=%.2f step_ms=%.2f\n",
-                        static_cast<unsigned long long>(frame_index_), fps_ema_, fms, step_ms);
-            std::fflush(stdout);
-        }
-    }
-
-    const auto spent = std::chrono::duration<double>(Clock::now() - now);
+    const auto work_end = Clock::now();
+    const auto spent = std::chrono::duration<double>(work_end - now);
     const auto budget = std::chrono::duration<double>(kFrameBudgetSeconds);
     if (spent < budget)
         std::this_thread::sleep_for(std::chrono::duration_cast<std::chrono::microseconds>(budget - spent));
+    if (frame_dt > 0.0 && frame_index_ > kFpsWarmup) {
+        const double fms = frame_dt * 1000.0;
+        ++measured_;
+        frame_ms_.Add(fms);
+        apply_ms_.Add(apply_ms);
+        draw_ms_.Add(draw_ms);
+        ui_ms_.Add(Ms(work_end - now) - apply_ms - draw_ms);
+        sleep_ms_.Add(Ms(Clock::now() - work_end));
+        if (live) {
+            age_ms_.Add(stats.snapshot_age_ms);
+            step_ms_.Add(stats.step_time_ms);
+        }
+        if (frame_index_ % 120u == 0u) {
+            std::printf("[fps] frame=%llu fps_ema=%.1f frame_ms=%.2f step_ms=%.2f age_ms=%.1f ticks=%llu\n",
+                        static_cast<unsigned long long>(frame_index_), fps_ema_, fms, stats.step_time_ms,
+                        stats.snapshot_age_ms, static_cast<unsigned long long>(stats.sim_ticks));
+            std::fflush(stdout);
+        }
+    }
     // A Close() from a script callback during this frame stays in force.
     running_ = running_ && !present_->ShouldClose() &&
                !(opt_.max_frames > 0 && frame_index_ >= static_cast<uint64_t>(opt_.max_frames));
@@ -1507,11 +1801,15 @@ EditorHost::~EditorHost() = default;
 
 void EditorHost::SetScriptHooks(const nuka_editor_script_hooks_t& hooks) { state_->SetHooks(hooks); }
 void EditorHost::Update(bool step_physics) { state_->Frame(step_physics); }
+void EditorHost::StopPhysics() { state_->worker_.StopThread(); }
 bool EditorHost::Running() const { return state_->running_; }
-bool EditorHost::Playing() const { return state_->ui_state_.playing; }
+bool EditorHost::Playing() const { return state_->playing_mirror_; }
 void EditorHost::Close() { state_->running_ = false; }
 nuka_world_handle EditorHost::World() const { return state_->world_; }
 float EditorHost::Dt() const { return state_->opt_.dt; }
-void EditorHost::ConsoleAppend(const std::string& text) { state_->ConsoleAppend(text); }
+void EditorHost::ConsoleAppend(const std::string& text) {
+    std::lock_guard<std::mutex> lock(state_->inbox_mu_);
+    state_->console_inbox_ += text;
+}
 
 }  // namespace nuka::runtime::app::viewer

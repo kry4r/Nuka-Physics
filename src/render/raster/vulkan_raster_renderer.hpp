@@ -80,6 +80,7 @@ using NkVkSurface        = void*;
 // NkVkSurface; the present renderer reinterpret_casts them back in its .cpp.
 using NkVkDescriptorSetLayout = void*;
 using NkVkDescriptorSet       = void*;
+using NkVkSemaphore           = void*;
 
 // ---------------------------------------------------------------------------
 // OffscreenOverlayFn (M8.5 T3) -- an OPTIONAL per-render ImGui (or any extra)
@@ -121,6 +122,10 @@ struct RendererVulkanHandles {
     NkVkRenderPass     offscreen_render_pass = nullptr;
     NkVkDescriptorPool imgui_descriptor_pool = nullptr;  // FREE_DESCRIPTOR_SET_BIT
     uint32_t           api_version      = 0;   // the instance apiVersion (1.1)
+    // Present devices: exportable memory and timeline semaphores for the CUDA pose
+    // path, and the device UUID a CUDA device must match to import them.
+    bool               interop_supported = false;
+    uint8_t            device_uuid[16]   = {};
 };
 
 // ---------------------------------------------------------------------------

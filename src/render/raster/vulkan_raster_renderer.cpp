@@ -440,6 +440,8 @@ struct VulkanRasterRenderer::Impl {
     VkDevice         device         = VK_NULL_HANDLE;
     VkQueue          queue          = VK_NULL_HANDLE;
     VkQueue          present_queue  = VK_NULL_HANDLE;  // == queue (shared family)
+    bool             interop_supported = false;      // present: CUDA pose path extensions on
+    uint8_t          device_uuid[VK_UUID_SIZE] = {};
     VkCommandPool    command_pool   = VK_NULL_HANDLE;
     VkRenderPass     render_pass    = VK_NULL_HANDLE;
     VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;  // set 0: per-frame SceneUbo
@@ -667,10 +669,38 @@ struct VulkanRasterRenderer::Impl {
         create_info.pEnabledFeatures = &features;
 
         // OFFSCREEN: zero device extensions (unchanged). PRESENT: the swapchain
-        // device extension (verified available in SelectGraphicsDevice).
+        // device extension (verified available in SelectGraphicsDevice), plus the
+        // exportable memory and timeline semaphores of the CUDA pose path when offered.
         std::vector<const char*> device_exts;
+        VkPhysicalDeviceTimelineSemaphoreFeatures timeline{};
+        timeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
         if (present_capable) {
             device_exts.push_back("VK_KHR_swapchain");
+#ifdef _WIN32
+            const std::array<const char*, 3> interop_exts{
+                "VK_KHR_external_memory_win32", "VK_KHR_external_semaphore_win32", "VK_KHR_timeline_semaphore"};
+#else
+            const std::array<const char*, 3> interop_exts{
+                "VK_KHR_external_memory_fd", "VK_KHR_external_semaphore_fd", "VK_KHR_timeline_semaphore"};
+#endif
+            VkPhysicalDeviceFeatures2 query{};
+            query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            query.pNext = &timeline;
+            vkGetPhysicalDeviceFeatures2(physical, &query);
+            interop_supported = timeline.timelineSemaphore == VK_TRUE;
+            for (const char* ext : interop_exts)
+                interop_supported = interop_supported && DeviceExtensionAvailable(physical, ext);
+            if (interop_supported) {
+                device_exts.insert(device_exts.end(), interop_exts.begin(), interop_exts.end());
+                create_info.pNext = &timeline;
+            }
+            VkPhysicalDeviceIDProperties id{};
+            id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 props2{};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props2.pNext = &id;
+            vkGetPhysicalDeviceProperties2(physical, &props2);
+            std::memcpy(device_uuid, id.deviceUUID, VK_UUID_SIZE);
         }
         create_info.enabledExtensionCount = static_cast<uint32_t>(device_exts.size());
         create_info.ppEnabledExtensionNames =
@@ -1498,6 +1528,8 @@ RendererVulkanHandles VulkanRasterRenderer::VulkanHandles() {
     handles.offscreen_render_pass = reinterpret_cast<NkVkRenderPass>(d.render_pass);
     handles.imgui_descriptor_pool = reinterpret_cast<NkVkDescriptorPool>(d.EnsureImGuiPool());
     handles.api_version     = VK_API_VERSION_1_1;
+    handles.interop_supported = d.interop_supported;
+    std::memcpy(handles.device_uuid, d.device_uuid, sizeof(handles.device_uuid));
     return handles;
 }
 

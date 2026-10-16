@@ -22,14 +22,17 @@ extern "C" {
 
 typedef struct nuka_editor_t* nuka_editor_handle;
 
+// READY, STEP and RESET reach the scene's scripts; TICK reaches the host's tick handlers at
+// every tick boundary (each transport step, or each update when the host steps the world).
 typedef enum nuka_editor_callback_t {
     NUKA_EDITOR_CALLBACK_READY = 0,
     NUKA_EDITOR_CALLBACK_STEP = 1,
-    NUKA_EDITOR_CALLBACK_RESET = 2
+    NUKA_EDITOR_CALLBACK_RESET = 2,
+    NUKA_EDITOR_CALLBACK_TICK = 3
 } nuka_editor_callback_t;
 
-// Scripts run in the host process; the editor links no interpreter. Returned text is
-// console output that stays valid until the next hook call, and NULL means none.
+// Hooks run in the host on the physics thread, else the updating thread. Returned text is
+// console output valid until that thread's next hook call; NULL means none.
 typedef struct nuka_editor_script_hooks_t {
     void* user_data;
     const char* (*run)(void* user_data, const char* code);
@@ -47,9 +50,11 @@ NUKA_EDITOR_API nuka_result_t nuka_editor_create(int argc, const char* const* ar
 NUKA_EDITOR_API void nuka_editor_destroy(nuka_editor_handle editor);
 NUKA_EDITOR_API nuka_result_t nuka_editor_set_script_hooks(nuka_editor_handle editor,
                                                            const nuka_editor_script_hooks_t* hooks);
-// One frame of input, edits, pose publishing and presentation. Physics advances with the
-// transport only when step_physics is nonzero; otherwise the host steps the world.
+// One frame of input, edits and presentation. With step_physics nonzero a physics thread
+// advances the transport; with zero none runs and the host steps the world between updates.
 NUKA_EDITOR_API nuka_result_t nuka_editor_update(nuka_editor_handle editor, uint32_t step_physics);
+// Joins the physics thread, so the host may call the world until the next update with step_physics.
+NUKA_EDITOR_API void nuka_editor_stop_physics(nuka_editor_handle editor);
 NUKA_EDITOR_API uint32_t nuka_editor_running(nuka_editor_handle editor);
 NUKA_EDITOR_API uint32_t nuka_editor_playing(nuka_editor_handle editor);
 NUKA_EDITOR_API void nuka_editor_close(nuka_editor_handle editor);
