@@ -16,6 +16,7 @@ namespace nuka::c_abi {
 
 struct WorldCheckpointRecord {
     nuka_world_handle owner = nullptr;
+    uint64_t generation = 0u;
     std::vector<uint8_t> persistent;
     uint64_t layout_hash = 0u;
     std::vector<runtime::articulation::LinkSpatialInertia> link_inertia;
@@ -358,6 +359,7 @@ nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
     try {
         auto checkpoint = std::make_unique<nuka::c_abi::WorldCheckpointRecord>();
         checkpoint->owner = world;
+        checkpoint->generation = record->generation;
         if (!record->world->GetData().DownloadPersistent(&checkpoint->persistent)) {
             return NUKA_RESULT_INTERNAL;
         }
@@ -382,7 +384,7 @@ nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
     if (record == nullptr || saved == nullptr) {
         return NUKA_RESULT_NULL_HANDLE;
     }
-    if (saved->owner != world) {
+    if (saved->owner != world || saved->generation != record->generation) {
         return NUKA_RESULT_INVALID_ARG;
     }
     if (!record->world) {
@@ -457,6 +459,7 @@ nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* pa
             return NUKA_RESULT_INVALID_ARG;
         auto checkpoint = std::make_unique<nuka::c_abi::WorldCheckpointRecord>();
         checkpoint->owner = world;
+        checkpoint->generation = record->generation;
         checkpoint->layout_hash = header[1];
         checkpoint->persistent.resize(header[3]);
         file.read(reinterpret_cast<char*>(checkpoint->persistent.data()),

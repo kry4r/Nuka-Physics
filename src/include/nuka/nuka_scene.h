@@ -468,7 +468,7 @@ nuka_result_t nuka_scene_set_mpm_contact_capacity(nuka_scene_handle scene,
                                                   uint32_t media_id, uint32_t capacity);
 
 // Optional nk::Pipeline::SolverConfig overrides for the built-scene world (1:1 with
-// the coupled desc's solver_* block, applied through the SAME FinishWorldCreate). A
+// the coupled desc's solver_* block, applied through the SAME CreateWorld). A
 // soft body authors a tighter contact solve here (more position-correction sweeps, a
 // speculative contact margin) without touching nuka_world_desc_t (the file-scene
 // golden path). Each 0 keeps the engine default, so a NULL pointer OR a

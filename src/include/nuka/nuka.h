@@ -328,7 +328,7 @@ nuka_result_t nuka_world_reset_envs(nuka_world_handle world,
                                     uint32_t count);
 
 // Checkpoints capture persistent physics, observation output/history, and host configuration.
-// Restores validate world ownership and preserve existing view addresses.
+// Restores validate world ownership and generation and preserve existing view addresses.
 nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
                                             nuka_checkpoint_handle* out);
 nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
@@ -341,6 +341,43 @@ nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* pa
                                          nuka_checkpoint_handle* out);
 // Hashes persistent physics, observation output/history, and host state in fixed order.
 nuka_result_t nuka_world_state_hash(nuka_world_handle world, uint64_t* out_hash);
+
+// Writes the world's retained scene as NKS (meshes go to the sibling .nka file).
+nuka_result_t nuka_world_export_scene(nuka_world_handle world, const char* nks_path);
+// Directory the scene's relative render assets resolve against; empty for built scenes.
+// NULL out queries *out_len (length without NUL); cap must hold the NUL.
+nuka_result_t nuka_world_get_asset_root(nuka_world_handle world, char* out, size_t cap,
+                                        size_t* out_len);
+
+enum { NUKA_REBUILD_INITIAL_STATE = 1 };
+// Recooks the world in place from a scene file with its creation options and increments the generation.
+// Body and joint state carry over by unique body name unless INITIAL_STATE; attached sensors refuse it.
+nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char* scene_path,
+                                            uint32_t flags);
+nuka_result_t nuka_world_get_generation(nuka_world_handle world, uint64_t* out_generation);
+// A lease keeps the current generation's view storage alive across rebuilds until released.
+nuka_result_t nuka_world_retain_storage(nuka_world_handle world, uint64_t* out_generation);
+nuka_result_t nuka_world_release_storage(nuka_world_handle world, uint64_t generation);
+// Recomputes link and body poses from joint state and base poses without advancing time.
+nuka_result_t nuka_world_forward_kinematics(nuka_world_handle world);
+
+// The CUDA stream the world executes on, as a cudaStream_t.
+nuka_result_t nuka_world_get_stream(nuka_world_handle world, void** out_stream);
+// Records a caller-created cudaEvent_t on the world's stream after all submitted work.
+nuka_result_t nuka_world_record_event(nuka_world_handle world, void* cuda_event);
+
+enum { NUKA_RUNTIME_INFO_VERSION = 1 };
+
+typedef struct nuka_runtime_info_t {
+    uint32_t struct_size;
+    uint32_t schema_version;
+    int32_t cuda_runtime_version;
+    int32_t cuda_driver_version;
+} nuka_runtime_info_t;
+
+// Initialize struct_size and schema_version before querying. Extensions built against
+// this library compare the runtime version with their own CUDA runtime at load.
+nuka_result_t nuka_get_runtime_info(nuka_runtime_info_t* out);
 
 typedef enum nuka_state_field_t {
     NUKA_FIELD_RIGID_BODY_TRANSFORM = 0,

@@ -23,6 +23,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <regex>
 #include <stdexcept>
@@ -43,6 +44,7 @@ namespace nb = nanobind;
 extern "C" {
 int cudaMemcpy(void* dst, const void* src, size_t count, int kind);
 int cudaDeviceSynchronize(void);
+int cudaRuntimeGetVersion(int* version);
 }
 namespace {
 constexpr int kCudaMemcpyHostToDevice = 1;
@@ -62,6 +64,18 @@ void check(nuka_result_t r, const char* what) {
                                  (msg ? msg : "?") + " (" + std::to_string((int)r) + ")");
     }
 }
+
+// Runs a blocking engine call with the GIL released so other Python threads keep running.
+template <typename Call>
+nuka_result_t unlocked(Call&& call) {
+    nb::gil_scoped_release release;
+    return call();
+}
+
+// Raised when a field view outlives the world generation it aliases.
+struct StaleViewError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // The writable float ndarray type we hand back for zero-copy views.
 //
@@ -140,7 +154,7 @@ class StateCheckpoint {
 public:
     static StateCheckpoint* capture(nuka_world_handle world) {
         nuka_checkpoint_handle checkpoint = nullptr;
-        check(nuka_world_checkpoint_capture(world, &checkpoint),
+        check(unlocked([&] { return nuka_world_checkpoint_capture(world, &checkpoint); }),
               "nuka_world_checkpoint_capture");
         return new StateCheckpoint(checkpoint);
     }
@@ -155,11 +169,12 @@ public:
 
     nuka_checkpoint_handle raw() const { return h_; }
     void write(const std::string& path) const {
-        check(nuka_checkpoint_write(h_, path.c_str()), "nuka_checkpoint_write");
+        check(unlocked([&] { return nuka_checkpoint_write(h_, path.c_str()); }), "nuka_checkpoint_write");
     }
     static StateCheckpoint* read(nuka_world_handle world, const std::string& path) {
         nuka_checkpoint_handle checkpoint = nullptr;
-        check(nuka_world_checkpoint_read(world, path.c_str(), &checkpoint), "nuka_world_checkpoint_read");
+        check(unlocked([&] { return nuka_world_checkpoint_read(world, path.c_str(), &checkpoint); }),
+              "nuka_world_checkpoint_read");
         return new StateCheckpoint(checkpoint);
     }
 
@@ -288,18 +303,9 @@ public:
         desc.solver_baumgarte_max_velocity = baumgarte_max_velocity;
         desc.solver_overlap_recovery_velocity = overlap_recovery_velocity;
         nuka_world_handle h = nullptr;
-        check(nuka_world_create_from_scene(device->raw(), &desc, &h),
+        check(unlocked([&] { return nuka_world_create_from_scene(device->raw(), &desc, &h); }),
               "nuka_world_create_from_scene");
-
-        // Derive base_link_count = total_link_count / env_count from the
-        // JOINT_POSITION view (the C ABI exposes no explicit accessor; this is
-        // the generic, correct derivation -- see README known-gap).
-        nuka_buffer_view_t qv{};
-        check(nuka_world_get_buffer_view(h, NUKA_FIELD_JOINT_POSITION, &qv),
-              "nuka_world_get_buffer_view(JOINT_POSITION)");
-        uint32_t base_link_count =
-            (env_count > 0u) ? (uint32_t)(qv.element_count / env_count) : 0u;
-        return new World(h, env_count, base_link_count, dt);
+        return new World(h, env_count, dt);
     }
 
     // Create a COUPLED world: a robot cooked from `scene_path` PLUS VBD cloth
@@ -375,24 +381,11 @@ public:
         parts.overlap_recovery_velocity = overlap_recovery_velocity;
 
         nuka_world_handle h = nullptr;
-        check(nuka_world_create_coupled_from_scene(device->raw(), &desc, &parts, &h),
+        check(unlocked([&] {
+                  return nuka_world_create_coupled_from_scene(device->raw(), &desc, &parts, &h);
+              }),
               "nuka_world_create_coupled_from_scene");
-
-        nuka_buffer_view_t qv{};
-        check(nuka_world_get_buffer_view(h, NUKA_FIELD_JOINT_POSITION, &qv),
-              "nuka_world_get_buffer_view(JOINT_POSITION)");
-        const uint32_t base_link_count =
-            (env_count > 0u) ? (uint32_t)(qv.element_count / env_count) : 0u;
-        World* w = new World(h, env_count, base_link_count, dt);
-        // Cache the per-env particle count from the PARTICLE_POSITION view (env-major,
-        // element_count == env_count * particles_per_env).
-        nuka_buffer_view_t pv{};
-        if (nuka_world_get_buffer_view(h, NUKA_FIELD_PARTICLE_POSITION, &pv) ==
-                NUKA_RESULT_OK &&
-            env_count > 0u) {
-            w->particle_count_ = static_cast<uint32_t>(pv.element_count / env_count);
-        }
-        return w;
+        return new World(h, env_count, dt);
     }
 
     // Create a world from a BUILT scene handle (nuka.SceneBuilder): a SceneIR of
@@ -465,28 +458,11 @@ public:
         opts.bake_link_sdf = bake_link_sdf ? 1u : 0u;
 
         nuka_world_handle h = nullptr;
-        check(nuka_world_create_from_built_scene(device->raw(), &desc, scene_h,
-                                                 &opts, &h),
+        check(unlocked([&] {
+                  return nuka_world_create_from_built_scene(device->raw(), &desc, scene_h, &opts, &h);
+              }),
               "nuka_world_create_from_built_scene");
-
-        // Derive base_link_count from the JOINT_POSITION view (0 for a robot-free
-        // soft/fluid scene with no articulation -- a tolerant query, not a hard fail).
-        nuka_buffer_view_t qv{};
-        uint32_t base_link_count = 0u;
-        if (nuka_world_get_buffer_view(h, NUKA_FIELD_JOINT_POSITION, &qv) ==
-                NUKA_RESULT_OK &&
-            env_count > 0u) {
-            base_link_count = static_cast<uint32_t>(qv.element_count / env_count);
-        }
-        World* w = new World(h, env_count, base_link_count, dt);
-        // Cache the per-env particle count from the PARTICLE_POSITION view.
-        nuka_buffer_view_t pv{};
-        if (nuka_world_get_buffer_view(h, NUKA_FIELD_PARTICLE_POSITION, &pv) ==
-                NUKA_RESULT_OK &&
-            env_count > 0u) {
-            w->particle_count_ = static_cast<uint32_t>(pv.element_count / env_count);
-        }
-        return w;
+        return new World(h, env_count, dt);
     }
 
     void destroy() {
@@ -497,15 +473,22 @@ public:
     }
     ~World() { destroy(); }
 
-    void step() { check(nuka_world_step(h_), "nuka_world_step"); }
-    void step_n(uint32_t n) { check(nuka_world_step_n(h_, n), "nuka_world_step_n"); }
+    void step() { check(unlocked([this] { return nuka_world_step(h_); }), "nuka_world_step"); }
+    void step_n(uint32_t n) {
+        check(unlocked([&] { return nuka_world_step_n(h_, n); }), "nuka_world_step_n");
+    }
     void set_execution_mode(const std::string& mode) {
         if (mode != "eager" && mode != "graph")
             throw nb::value_error("execution mode must be eager or graph");
-        check(nuka_world_set_execution_mode(h_, mode == "graph" ? NUKA_EXECUTION_GRAPH : NUKA_EXECUTION_EAGER),
+        check(unlocked([&] {
+                  return nuka_world_set_execution_mode(
+                      h_, mode == "graph" ? NUKA_EXECUTION_GRAPH : NUKA_EXECUTION_EAGER);
+              }),
               "nuka_world_set_execution_mode");
     }
-    void synchronize() { check(nuka_world_synchronize(h_), "nuka_world_synchronize"); }
+    void synchronize() {
+        check(unlocked([this] { return nuka_world_synchronize(h_); }), "nuka_world_synchronize");
+    }
     nb::dict execution_info() const {
         nuka_world_execution_info_t info{};
         info.struct_size = sizeof(info);
@@ -578,9 +561,9 @@ public:
 
     // Restore initial physical state for all or selected environments.
     // Unselected state and control targets are preserved.
-    void reset() { check(nuka_world_reset(h_), "nuka_world_reset"); }
+    void reset() { check(unlocked([this] { return nuka_world_reset(h_); }), "nuka_world_reset"); }
     void reset_envs(const uint32_t* ids, uint32_t count) {
-        check(nuka_world_reset_envs(h_, ids, count), "nuka_world_reset_envs");
+        check(unlocked([&] { return nuka_world_reset_envs(h_, ids, count); }), "nuka_world_reset_envs");
     }
 
     StateCheckpoint* capture_checkpoint() {
@@ -593,13 +576,76 @@ public:
         if (checkpoint == nullptr || checkpoint->raw() == nullptr) {
             throw std::runtime_error("restore_checkpoint: invalid checkpoint");
         }
-        check(nuka_world_checkpoint_restore(h_, checkpoint->raw()),
+        check(unlocked([&] { return nuka_world_checkpoint_restore(h_, checkpoint->raw()); }),
               "nuka_world_checkpoint_restore");
     }
     uint64_t state_hash() const {
         uint64_t hash = 0u;
-        check(nuka_world_state_hash(h_, &hash), "nuka_world_state_hash");
+        check(unlocked([&] { return nuka_world_state_hash(h_, &hash); }), "nuka_world_state_hash");
         return hash;
+    }
+
+    // Zero after destroy, so every view of a destroyed world reads as stale.
+    uint64_t generation() const {
+        uint64_t current = 0u;
+        if (h_ != nullptr) check(nuka_world_get_generation(h_, &current), "nuka_world_get_generation");
+        return current;
+    }
+
+    void export_scene(const std::string& path) {
+        check(unlocked([&] { return nuka_world_export_scene(h_, path.c_str()); }),
+              "nuka_world_export_scene");
+    }
+
+    std::string asset_root() const {
+        size_t need = 0u;
+        check(nuka_world_get_asset_root(h_, nullptr, 0u, &need), "nuka_world_get_asset_root(size)");
+        std::string root(need + 1u, '\0');
+        check(nuka_world_get_asset_root(h_, root.data(), root.size(), &need), "nuka_world_get_asset_root");
+        root.resize(need);
+        return root;
+    }
+
+    // Views taken before the rebuild keep their storage but go stale.
+    void rebuild_from_scene(const std::string& path, bool migrate_state) {
+        const uint64_t previous = generation();
+        const uint32_t flags = migrate_state ? 0u : static_cast<uint32_t>(NUKA_REBUILD_INITIAL_STATE);
+        check(unlocked([&] { return nuka_world_rebuild_from_scene(h_, path.c_str(), flags); }),
+              "nuka_world_rebuild_from_scene");
+        refresh_counts();
+        if (leases_.count(previous) != 0u &&
+            PyErr_WarnEx(PyExc_RuntimeWarning,
+                         "views taken before rebuild_from_scene are stale; take new ones with view(field)",
+                         1) != 0)
+            throw nb::python_error();
+    }
+
+    void forward_kinematics() {
+        check(nuka_world_forward_kinematics(h_), "nuka_world_forward_kinematics");
+    }
+
+    uintptr_t cuda_stream() const {
+        void* stream = nullptr;
+        check(nuka_world_get_stream(h_, &stream), "nuka_world_get_stream");
+        return reinterpret_cast<uintptr_t>(stream);
+    }
+
+    void record_event(uintptr_t event) {
+        check(nuka_world_record_event(h_, reinterpret_cast<void*>(event)), "nuka_world_record_event");
+    }
+
+    // A lease pins the current generation's storage for the arrays that alias it.
+    uint64_t retain_storage() {
+        uint64_t leased = 0u;
+        check(nuka_world_retain_storage(h_, &leased), "nuka_world_retain_storage");
+        ++leases_[leased];
+        return leased;
+    }
+
+    void release_storage(uint64_t leased) noexcept {
+        if (h_ != nullptr) nuka_world_release_storage(h_, leased);
+        const auto lease = leases_.find(leased);
+        if (--lease->second == 0u) leases_.erase(lease);
     }
 
     // Template link masses apply to every environment, with COM and rotational inertia fixed.
@@ -810,7 +856,7 @@ public:
     }
 
     void render_sensors() {
-        check(nuka_world_render_sensors(h_), "nuka_world_render_sensors");
+        check(unlocked([this] { return nuka_world_render_sensors(h_); }), "nuka_world_render_sensors");
     }
 
     void set_sensor_aov_mask(uint32_t mask) {
@@ -899,15 +945,32 @@ public:
     }
 
 private:
-    World(nuka_world_handle h, uint32_t ec, uint32_t blc, float dt)
-        : h_(h), env_count_(ec), base_link_count_(blc), dt_(dt) {}
+    World(nuka_world_handle h, uint32_t ec, float dt) : h_(h), env_count_(ec), dt_(dt) {
+        refresh_counts();
+    }
+
+    // Per-env link and particle counts, read from the JOINT_POSITION and PARTICLE_POSITION
+    // views; a world without articulations or particles reads 0.
+    void refresh_counts() {
+        nuka_buffer_view_t view{};
+        base_link_count_ = env_count_ > 0u && nuka_world_get_buffer_view(
+                                                  h_, NUKA_FIELD_JOINT_POSITION, &view) == NUKA_RESULT_OK
+                               ? static_cast<uint32_t>(view.element_count / env_count_)
+                               : 0u;
+        particle_count_ = env_count_ > 0u && nuka_world_get_buffer_view(
+                                                 h_, NUKA_FIELD_PARTICLE_POSITION, &view) == NUKA_RESULT_OK
+                              ? static_cast<uint32_t>(view.element_count / env_count_)
+                              : 0u;
+    }
+
     nuka_world_handle h_ = nullptr;
     uint32_t env_count_ = 0u;
     uint32_t base_link_count_ = 0u;
     float dt_ = 0.0f;
-    // Per-env particle count of a coupled world (0 for a particle-free world); cached
-    // from the PARTICLE_POSITION view at create so a caller can reshape the field.
+    // Per-env particle count (0 for a particle-free world), so a caller can reshape the field.
     uint32_t particle_count_ = 0u;
+    // Live view leases per generation.
+    std::map<uint64_t, uint32_t> leases_;
     // Last attached camera image size + cameras per env (the (E,S,H,W,ch) shaping).
     uint32_t sensor_width_ = 0u;
     uint32_t sensor_height_ = 0u;
@@ -1090,6 +1153,51 @@ Uint32Array make_sensor_uint32_view(const nuka_buffer_view_t& view, uint32_t n,
     return Uint32Array(view.device_ptr, 1, shape, owner, nullptr,
                        nb::dtype<uint32_t>(), nb::device::cuda::value, dev_id);
 }
+
+// Owner of a field array: holds the world and a storage lease on the aliased generation.
+struct ViewLease {
+    nb::object world;
+    uint64_t generation;
+};
+
+// Zero-copy array over a field's live device buffer, typed by the view's dtype
+// (uint32/uint64/uint8 index fields, float32 otherwise) and shaped by its layout.
+nb::object leased_view(nb::handle self, nuka_state_field_t field, uint64_t* generation) {
+    World* w = nb::inst_ptr<World>(self);
+    auto* lease = new ViewLease{nb::borrow(self), w->retain_storage()};
+    nb::capsule owner(lease, [](void* p) noexcept {
+        auto* held = static_cast<ViewLease*>(p);
+        nb::inst_ptr<World>(held->world)->release_storage(held->generation);
+        delete held;
+    });
+    *generation = lease->generation;
+    const nuka_buffer_view_t view = w->get_view(field);
+    if (view.dtype == 1u) return nb::cast(make_unsigned_view<uint32_t>(view, w->env_count(), owner));
+    if (view.dtype == 2u) return nb::cast(make_unsigned_view<uint64_t>(view, w->env_count(), owner));
+    if (view.dtype == 3u) return nb::cast(make_unsigned_view<uint8_t>(view, w->env_count(), owner));
+    return nb::cast(make_array_from_view(view, w->env_count(), w->base_link_count(), owner));
+}
+
+// A field alias bound to the world generation it was taken from.
+class FieldView {
+public:
+    FieldView(nb::handle world, nuka_state_field_t field) : world_(nb::borrow(world)), field_(field) {
+        tensor_ = leased_view(world, field, &generation_);
+    }
+    bool valid() const { return nb::inst_ptr<World>(world_)->generation() == generation_; }
+    nb::object tensor() const {
+        if (!valid()) throw StaleViewError("field view predates a world rebuild; take a new view(field)");
+        return tensor_;
+    }
+    nuka_state_field_t field() const { return field_; }
+    uint64_t generation() const { return generation_; }
+
+private:
+    nb::object world_;
+    nuka_state_field_t field_;
+    uint64_t generation_ = 0u;
+    nb::object tensor_;
+};
 
 }  // namespace
 
@@ -1670,6 +1778,24 @@ nuka_sensor_error_desc_t sensor_error_description(const nb::kwargs& options) {
 NB_MODULE(_nuka_ext, m) {
     m.doc() = "Nuka physics engine -- nanobind binding (zero-copy DLPack interop)";
 
+    // Streams and events cross between the engine and this extension, so both need one CUDA runtime.
+    nuka_runtime_info_t runtime{};
+    runtime.struct_size = sizeof(runtime);
+    runtime.schema_version = NUKA_RUNTIME_INFO_VERSION;
+    check(nuka_get_runtime_info(&runtime), "nuka_get_runtime_info");
+    int extension_runtime = 0;
+    cudaRuntimeGetVersion(&extension_runtime);
+    if (extension_runtime != runtime.cuda_runtime_version)
+        throw nb::import_error(("nuka engine CUDA runtime " + std::to_string(runtime.cuda_runtime_version) +
+                                " differs from the extension's " + std::to_string(extension_runtime))
+                                   .c_str());
+    m.def("runtime_info", [runtime] {
+        nb::dict info;
+        info["cuda_runtime_version"] = runtime.cuda_runtime_version;
+        info["cuda_driver_version"] = runtime.cuda_driver_version;
+        return info;
+    }, "CUDA runtime and driver versions the engine runs on.");
+
     nuka_version_t v = nuka_get_version();
     m.attr("__engine_version__") =
         std::to_string(v.major) + "." + std::to_string(v.minor) + "." + std::to_string(v.patch);
@@ -1953,6 +2079,21 @@ NB_MODULE(_nuka_ext, m) {
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none());
 
+    nb::exception<StaleViewError>(m, "StaleViewError", PyExc_RuntimeError);
+
+    nb::class_<FieldView>(m, "FieldView")
+        .def_prop_ro("tensor", &FieldView::tensor,
+                     "The aliased CUDA tensor; raises StaleViewError once the world was rebuilt.")
+        .def_prop_ro("valid", &FieldView::valid)
+        .def_prop_ro("field", &FieldView::field)
+        .def_prop_ro("generation", &FieldView::generation)
+        .def("__dlpack__", [](const FieldView& view, nb::args args, nb::kwargs kwargs) {
+            return view.tensor().attr("__dlpack__")(*args, **kwargs);
+        })
+        .def("__dlpack_device__", [](const FieldView& view) {
+            return view.tensor().attr("__dlpack_device__")();
+        });
+
     nb::class_<World>(m, "World")
         .def_static("create_from_scene", &World::create_from_scene,
                     nb::arg("device"), nb::arg("scene_path"),
@@ -2124,6 +2265,23 @@ NB_MODULE(_nuka_ext, m) {
         .def("state_hash", &World::state_hash,
              "Return the deterministic 64-bit hash of the world: persistent "
              "simulation bytes plus host step/config/noise/DR state.")
+        .def_prop_ro("generation", &World::generation,
+                     "Starts at 1 and increments on every rebuild_from_scene.")
+        .def("export_scene", &World::export_scene, nb::arg("path"),
+             "Write the world's current scene as NKS; meshes go to the sibling .nka file.")
+        .def_prop_ro("asset_root", &World::asset_root,
+                     "Directory relative scene assets resolve against; empty for built scenes.")
+        .def("rebuild_from_scene", &World::rebuild_from_scene, nb::arg("path"),
+             nb::arg("migrate_state") = true,
+             "Recook the world in place from a scene file with its creation options. Body and "
+             "joint state carry over by unique body name unless migrate_state is False. Earlier "
+             "views keep valid storage but are stale; worlds with sensors or observations refuse it.")
+        .def("forward_kinematics", &World::forward_kinematics,
+             "Recompute link and body poses from joint state and base poses without stepping.")
+        .def_prop_ro("cuda_stream", &World::cuda_stream,
+                     "The cudaStream_t the world executes on, as an integer.")
+        .def("record_event", &World::record_event, nb::arg("event"),
+             "Record a caller-created cudaEvent_t (an integer) after all submitted world work.")
         .def("destroy", &World::destroy, "Destroy the world.")
         .def_prop_ro("env_count", &World::env_count)
         .def_prop_ro("base_link_count", &World::base_link_count)
@@ -2257,6 +2415,7 @@ NB_MODULE(_nuka_ext, m) {
                 const size_t n = static_cast<size_t>(width) * height * channels;
                 size_t shape[3] = {height, width, channels};
                 const auto render = [&](uint8_t format, void* pixels) {
+                    nb::gil_scoped_release release;
                     return camera.empty()
                         ? nuka_world_render_beauty(w.raw(), &cam, width, height, spp, format, pixels, n, nullptr)
                         : nuka_world_render_scene_camera(w.raw(), camera.c_str(), width, height, spp,
@@ -2431,27 +2590,18 @@ NB_MODULE(_nuka_ext, m) {
              [](World& w, nb::object, nb::object, nb::object) { w.destroy(); },
              nb::arg("exc_type").none(), nb::arg("exc_value").none(),
              nb::arg("traceback").none())
-        // Zero-copy DLPack view. `self` (the Python World) is the owner -> the
-        // engine buffer stays alive for as long as the returned array does.
+        .def("view", [](nb::handle self, nuka_state_field_t field) { return FieldView(self, field); },
+             nb::arg("field"),
+             "Return a FieldView over `field`: the buffer_view tensor tied to the current world "
+             "generation. It passes through torch.from_dlpack and raises StaleViewError once the "
+             "world was rebuilt.")
+        // Zero-copy DLPack view, owned by a storage lease that keeps the world and the
+        // aliased generation's buffers alive for as long as the returned array.
         .def(
             "buffer_view",
             [](nb::handle self, nuka_state_field_t field) -> nb::object {
-                World* w = nb::cast<World*>(self);
-                // p14a: CONTACT_LINK is the ONE uint32 field (dtype==1); every other
-                // field is float32 (dtype==0). Inspect the engine view's dtype and
-                // build the matching-typed zero-copy ndarray. Both share the
-                // nb::pytorch tag -> torch.from_dlpack(...) yields a CUDA tensor
-                // aliasing the engine buffer (float32 or uint32 respectively).
-                nuka_buffer_view_t view = w->get_view(field);
-                if (view.dtype == 1u) {
-                    return nb::cast(make_unsigned_view<uint32_t>(view, w->env_count(), self));
-                }
-                if (view.dtype == 2u)
-                    return nb::cast(make_unsigned_view<uint64_t>(view, w->env_count(), self));
-                if (view.dtype == 3u)
-                    return nb::cast(make_unsigned_view<uint8_t>(view, w->env_count(), self));
-                return nb::cast(make_array_from_view(
-                    view, w->env_count(), w->base_link_count(), self));
+                uint64_t generation = 0u;
+                return leased_view(self, field, &generation);
             },
             nb::arg("field"), nb::rv_policy::reference,
             "Return a zero-copy DLPack-capable CUDA ndarray aliasing the engine's "

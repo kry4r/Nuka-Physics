@@ -1180,6 +1180,7 @@ if(CMAKE_CUDA_COMPILER)
         c_abi/device.cpp
         c_abi/world.cpp
         c_abi/checkpoint.cpp
+        c_abi/cuda_interop.cpp
         c_abi/buffer.cpp
         c_abi/error.cpp
         c_abi/noise.cpp

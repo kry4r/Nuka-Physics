@@ -120,6 +120,23 @@ struct BeautyRender {
     BeautyRender& operator=(const BeautyRender&) = delete;
 };
 
+// The creation options a world was cooked and built with, kept so a rebuild cooks an edited
+// scene the same way. String pointers in `desc` are cleared; the image path is owned here.
+struct WorldRecipe {
+    nuka_world_desc_t desc{};
+    std::string image_path;
+    bool media_before_terrain = false;
+    bool bake_link_sdf = false;
+    float contact_radius = 0.0f;
+    float baumgarte_max_velocity = 0.0f;
+    float overlap_recovery_velocity = 0.0f;
+    uint32_t solver_vel_iters = 0u;
+    uint32_t solver_pos_iters = 0u;
+    float solver_contact_margin = 0.0f;
+    uint32_t solver_max_pairs = 0u;
+    uint32_t cloth_integrator = 0u;
+};
+
 struct WorldRecord {
     // M9 T5/T6: the ONE generic live sim — Scene->CookToModel->nk::World. Owns
     // the device-resident Model+Data+Pipeline. BORROWS the DeviceRecord's phi v2
@@ -130,6 +147,14 @@ struct WorldRecord {
     // declaration; the ctor/dtor are out-of-line in world.cpp (where nk::World is
     // complete) so the other C-ABI TUs that touch WorldTable need not see it.
     std::unique_ptr<nuka::nk::World> world;
+
+    // Worlds replaced by a rebuild while views still lease their storage, keyed by
+    // generation; each is freed when its last lease is released.
+    std::map<uint64_t, std::unique_ptr<nuka::nk::World>> retired_worlds;
+    std::map<uint64_t, uint32_t> storage_leases;
+    uint64_t generation = 1u;
+    WorldRecipe recipe;
+    bool velocity_iterations_set = false;
 
     // The FINAL composed scene this world cooked (co-residence replicas included),
     // RETAINED so the sensor attach builds the per-env visual binding from one cook.
@@ -255,33 +280,12 @@ nuka_result_t ValidateWorldDescAndDevice(
     bool require_scene_path, DeviceRecord** out_device,
     runtime::articulation::ControlMode* out_mode);
 
-// Route the control mode onto the cooked Model's drive_mode, bake the optional
-// heightfield collidable (desc->contact_family == 1) and resolve world gravity.
-// Mutates `model`; writes the baked terrain + gravity. Returns INVALID_ARG on a
-// malformed terrain source (else OK). The post-cook step both create paths share.
-nuka_result_t ApplyControlTerrainGravity(
-    const nuka_world_desc_t* desc,
-    runtime::articulation::ControlMode control_mode, nuka::nk::Model& model,
-    nuka::terrain::HeightField* out_terrain, nuka::math::Vec3* out_gravity);
+// A recipe holding a validated desc with its string pointers dropped; entries set the rest.
+WorldRecipe MakeWorldRecipe(const nuka_world_desc_t& desc);
 
-// Build the live nk::World from a cooked Model + scene and insert it into the
-// WorldTable (the ONE record-assembly path). The solver_* override the world
-// SolverConfig (each 0 keeps the engine default). On success writes *out and
-// returns OK; on a failed build returns INTERNAL and leaves *out null.
-nuka_result_t FinishWorldCreate(
-    nuka::nk::Model&& cooked_model, std::shared_ptr<const nuka::scene::CookedBlob> blob,
-    nuka::scene::SceneIR&& scene,
-    nuka::terrain::HeightField&& cooked_terrain, DeviceRecord* device_record,
-    float fixed_dt, uint32_t env_count,
-    runtime::articulation::ControlMode control_mode,
-    const nuka::math::Vec3& gravity, uint32_t osc_task_link,
-    nuka_world_handle* out,
-    uint32_t solver_vel_iters = 0u, uint32_t solver_pos_iters = 0u,
-    float solver_contact_margin = 0.0f, uint32_t solver_max_pairs = 0u,
-    uint32_t cloth_integrator = 0u, uint32_t ogc_contact_capacity = 0u);
-
-// Retains a created world's media render surfaces, each material id moved from the scene's material
-// table to the registry slot its name projects to, since the registry merges equally named materials.
-void SetParticleSurfaces(WorldRecord& record, std::vector<nuka::scene::cook::MediaRenderSurface> surfaces);
+// Cook `scene` with the recipe, build the live world and insert its record (the ONE
+// create path). On failure returns the cook or build error and leaves *out null.
+nuka_result_t CreateWorld(DeviceRecord* device, WorldRecipe recipe, nuka::scene::SceneIR&& scene,
+                          std::string scene_dir, nuka_world_handle* out);
 
 } // namespace nuka::c_abi

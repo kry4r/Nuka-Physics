@@ -28,7 +28,10 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nuka::c_abi {
@@ -74,6 +77,25 @@ bool LoadSceneByExtension(const char* scene_path, scene::SceneIR* out_scene) {
         return true;
     }
     return false;
+}
+
+// Load the desc's scene file and compose it with itself instance_count times at
+// distinct XY so the cook emits K separate articulations co-resident in one env.
+nuka_result_t LoadComposedScene(const nuka_world_desc_t& desc, nuka::scene::SceneIR* out) {
+    if (!LoadSceneByExtension(desc.scene_path, out)) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+    const float spacing = (desc.instance_spacing > 0.0f) ? desc.instance_spacing : 1.5f;
+    for (uint32_t i = 1u; i < desc.instance_count; ++i) {
+        nuka::scene::SceneIR replica;
+        if (!LoadSceneByExtension(desc.scene_path, &replica)) {
+            return NUKA_RESULT_NOT_SUPPORTED;
+        }
+        nuka::math::Transform place = nuka::math::Transform::Identity();
+        place.position.x = spacing * static_cast<float>(i);
+        *out = nuka::scene::Compose(*out, replica, place, "dog" + std::to_string(i) + "_");
+    }
+    return NUKA_RESULT_OK;
 }
 
 void CaptureArticulationHostMirror(const scene::CookedBlob& blob, WorldRecord* record) {
@@ -127,131 +149,8 @@ nuka::scene::MediaRecord ClothMediaFromDesc(const nuka_coupled_particles_desc_t&
     return m;
 }
 
-// The cooked products a world-create entry assembles before building the live world:
-// the robot Model, the composed scene, the baked terrain grid, the resolved gravity,
-// the control mode + the validated device. Shared by the scene-only and coupled
-// entries; the coupled entry cooks particles onto `model` before FinishWorldCreate.
-struct PreparedWorld {
-    nuka::nk::Model model;
-    std::shared_ptr<const nuka::scene::CookedBlob> blob;
-    nuka::scene::SceneIR scene;
-    nuka::terrain::HeightField terrain;
-    nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
-    articulation::ControlMode control_mode = articulation::ControlMode::PDPosition;
-    DeviceRecord* device_record = nullptr;
-};
-
-// Validate `desc`, load + compose the scene, cook it to an nk::Model, bake the
-// optional heightfield + recompute its budget, and resolve gravity. Returns OK with
-// `out` filled, or the specific error the create contract reports. This is the ONE
-// scene->Model cook path; both create entries call it (the coupled entry then cooks
-// particles onto out->model). MUST be called inside a try (CookToModel may throw).
-nuka_result_t PrepareWorldFromDesc(nuka_device_handle device,
-                                   const nuka_world_desc_t* desc,
-                                   PreparedWorld* out) {
-    // Validate the desc + resolve the device/backend + control mode (the shared gate;
-    // the file-load path REQUIRES a scene_path -- the built-scene path passes false).
-    DeviceRecord* device_record = nullptr;
-    articulation::ControlMode control_mode = articulation::ControlMode::PDPosition;
-    const nuka_result_t valid = ValidateWorldDescAndDevice(
-        device, desc, /*require_scene_path=*/true, &device_record, &control_mode);
-    if (valid != NUKA_RESULT_OK) {
-        return valid;
-    }
-
-    nuka::scene::SceneIR scene;
-    if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &scene)) {
-        return NUKA_RESULT_NOT_SUPPORTED;
-    }
-
-    // CO-RESIDENCE: compose the authored scene with itself instance_count times at
-    // distinct XY so the cook emits K SEPARATE articulations co-resident in one env.
-    // 0/1 == single instance -> the loop never runs -> BYTE-IDENTICAL single-artic.
-    if (desc->instance_count > 1u) {
-        const float spacing =
-            (desc->instance_spacing > 0.0f) ? desc->instance_spacing : 1.5f;
-        for (uint32_t i = 1u; i < desc->instance_count; ++i) {
-            nuka::scene::SceneIR replica;
-            if (!nuka::c_abi::LoadSceneByExtension(desc->scene_path, &replica)) {
-                return NUKA_RESULT_NOT_SUPPORTED;
-            }
-            nuka::math::Transform place = nuka::math::Transform::Identity();
-            place.position.x = spacing * static_cast<float>(i);
-            scene = nuka::scene::Compose(scene, replica, place,
-                                         "dog" + std::to_string(i) + "_");
-        }
-    }
-
-    // Cook the authored scene to an nk::Model (the GENERAL LBVH+cvx narrowphase +
-    // mixed-island solve; CookToModel always returns a PairDriven model). The world
-    // runs EXACTLY the cooked scene physics -- it does NOT inject a synthetic ground.
-    nuka::scene::cook::CookToModelResult cooked =
-        nuka::scene::cook::CookToModel(scene, static_cast<int>(desc->env_count));
-
-    // Route control mode -> drive_mode, bake the optional heightfield collidable,
-    // and resolve gravity (the post-cook step both create paths share).
-    nuka::terrain::HeightField cooked_terrain;
-    nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
-    const nuka_result_t terrain = ApplyControlTerrainGravity(
-        desc, control_mode, cooked.model, &cooked_terrain, &gravity);
-    if (terrain != NUKA_RESULT_OK) {
-        return terrain;
-    }
-
-    out->model = std::move(cooked.model);
-    out->blob = std::move(cooked.blob);
-    out->scene = std::move(scene);
-    out->terrain = std::move(cooked_terrain);
-    out->gravity = gravity;
-    out->control_mode = control_mode;
-    out->device_record = device_record;
-    return NUKA_RESULT_OK;
-}
-
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// Shared world-create helpers (declared in c_abi/internal.hpp): the validation /
-// post-cook / record-assembly steps the built-scene create reuses (no 2nd path).
-// ---------------------------------------------------------------------------
-
-nuka_result_t ValidateWorldDescAndDevice(
-    nuka_device_handle device, const nuka_world_desc_t* desc,
-    bool require_scene_path, DeviceRecord** out_device,
-    articulation::ControlMode* out_mode) {
-    if (desc == nullptr ||
-        (require_scene_path && desc->scene_path == nullptr) ||
-        desc->fixed_dt <= 0.0f) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    if (desc->env_count == 0u) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    // Determinism level: 0 = D1/Strong (default), 1 = D2/Weak. Reject other values.
-    // The nk pipeline runs the D1 schedule only; D2 currently selects the same
-    // kernels and is behaviorally identical (NOT a separate path).
-    if (desc->determinism > 1u) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    if (!articulation::IsControlModeImplemented(desc->control_mode)) {
-        return NUKA_RESULT_INVALID_ARG;
-    }
-    const auto control_mode =
-        static_cast<articulation::ControlMode>(desc->control_mode);
-
-    auto* device_record = nuka::c_abi::DeviceTable().Get(device);
-    if (device_record == nullptr) {
-        return NUKA_RESULT_NULL_HANDLE;
-    }
-    // The nk::World ctor REQUIRES the phi v2 device/backend acquired at create.
-    if (device_record->phi_device == nullptr || device_record->backend == nullptr) {
-        return NUKA_RESULT_NOT_SUPPORTED;
-    }
-    *out_device = device_record;
-    *out_mode = control_mode;
-    return NUKA_RESULT_OK;
-}
-
+// Route the control mode onto the cooked Model's drive_mode, bake the optional
+// heightfield collidable (desc->contact_family == 1) and resolve world gravity.
 nuka_result_t ApplyControlTerrainGravity(
     const nuka_world_desc_t* desc, articulation::ControlMode control_mode,
     nuka::nk::Model& model, nuka::terrain::HeightField* out_terrain,
@@ -369,85 +268,282 @@ nuka_result_t ApplyControlTerrainGravity(
     return NUKA_RESULT_OK;
 }
 
-// Build the live WorldRecord from a cooked Model + the composed scene and insert it
-// into the WorldTable. Shared by the scene-only, coupled (scene + particles), and
-// built-scene create entries so the record assembly is ONE path -- they differ only
-// in cooking particles onto `cooked_model` before this runs. On success writes `out`
-// and returns OK; on a failed World build returns INTERNAL and leaves `out` null.
-// `solver_*` override the world SolverConfig (each 0 keeps the engine default, so the
-// scene-only entry never passes them and stays byte-identical). The coupled entry
-// forwards the desc's solver knobs here.
-nuka_result_t FinishWorldCreate(nuka::nk::Model&& cooked_model,
-                                std::shared_ptr<const nuka::scene::CookedBlob> blob,
-                                nuka::scene::SceneIR&& scene,
-                                nuka::terrain::HeightField&& cooked_terrain,
-                                DeviceRecord* device_record, float fixed_dt,
-                                uint32_t env_count,
-                                articulation::ControlMode control_mode,
-                                const nuka::math::Vec3& gravity,
-                                uint32_t osc_task_link,
-                                nuka_world_handle* out,
-                                uint32_t solver_vel_iters,
-                                uint32_t solver_pos_iters,
-                                float solver_contact_margin,
-                                uint32_t solver_max_pairs,
-                                uint32_t cloth_integrator,
-                                uint32_t ogc_contact_capacity) {
-    if (cloth_integrator > 1u || solver_vel_iters > UINT16_MAX) return NUKA_RESULT_INVALID_ARG;
-    if (!blob) return NUKA_RESULT_INTERNAL;
-    if (ogc_contact_capacity > 0u)
-        nuka::scene::cook::SetOgcContactCapacity(cooked_model, ogc_contact_capacity);
-    // ApplyControlTerrainGravity ran before the Model move, but keep the public
-    // task-link option explicit on the shared world-assembly path.
-    cooked_model.osc_task_link = osc_task_link;
-    auto record = std::make_unique<WorldRecord>();
-    record->device = device_record;
-    record->env_count = env_count;
-    record->control_mode = control_mode;
-    record->cooked_terrain = std::move(cooked_terrain);  // obs/spawn read this.
-    record->step_options.dt = fixed_dt;
-    record->step_options.gravity = gravity;
-
-    nuka::nk::Pipeline::SolverConfig cfg;
-    cfg.dt = fixed_dt;
-    cfg.gravity[0] = gravity.x;
-    cfg.gravity[1] = gravity.y;
-    cfg.gravity[2] = gravity.z;
-    // Each non-zero override replaces a default; all-zero leaves cfg exactly as built
-    // above (dt + gravity only), so an unset caller is byte-identical to today.
-    if (solver_vel_iters != 0u) {
-        cfg.vel_iters = static_cast<uint16_t>(solver_vel_iters);
-        cfg.velocity_iterations_override = true;
-    }
-    if (solver_pos_iters != 0u) cfg.pos_iters = static_cast<uint16_t>(solver_pos_iters);
-    if (solver_contact_margin > 0.0f) cfg.contact_margin = solver_contact_margin;
-    if (solver_max_pairs != 0u) cfg.max_pairs = solver_max_pairs;
-    cfg.cloth_integrator = cloth_integrator;
-
-    record->world = std::make_unique<nuka::nk::World>(
-        std::move(cooked_model), env_count, device_record->phi_device,
-        device_record->backend, cfg);
-    if (!record->world->Ready()) {
-        std::fprintf(stderr, "[World] %s\n", record->world->CreationError().c_str());
-        return MapStatusToResult(record->world->CreationStatus());
-    }
-
-    CaptureArticulationHostMirror(*blob, record.get());
-
-    // Retain the FINAL composed scene so a camera-sensor attach builds the per-env
-    // visual binding from the SAME ECS the cook saw (host data only).
-    record->scene = std::make_unique<nuka::scene::SceneIR>(std::move(scene));
-
-    *out = WorldTable().Insert(std::move(record));
-    return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
-}
-
+// Retains a world's media render surfaces, each material id moved from the scene's material
+// table to the registry slot its name projects to, since the registry merges equally named materials.
 void SetParticleSurfaces(WorldRecord& record, std::vector<cook::MediaRenderSurface> surfaces) {
     for (cook::MediaRenderSurface& s : surfaces)
         if (s.render_material_id < record.scene->MaterialCount())
             s.render_material_id =
                 record.scene->Ecs().FindRenderMaterial(record.scene->GetMaterial(s.render_material_id).name);
     record.particle_surfaces = std::move(surfaces);
+}
+
+// The cooked products a world build consumes.
+struct CookedWorld {
+    nuka::nk::Model model;
+    std::shared_ptr<const nuka::scene::CookedBlob> blob;
+    nuka::terrain::HeightField terrain;
+    nuka::math::Vec3 gravity = nuka::runtime::kDefaultGravity;
+    std::vector<cook::MediaRenderSurface> surfaces;
+};
+
+// Cook a scene with a world's creation recipe: the rigid cook, then media and terrain in the
+// order the creating entry used, then the model overrides. MUST be called inside a try.
+nuka_result_t CookWorld(const WorldRecipe& recipe, const nuka::scene::SceneIR& scene,
+                        CookedWorld* out) {
+    nuka_world_desc_t desc = recipe.desc;
+    desc.heightfield_image_path = recipe.image_path.empty() ? nullptr : recipe.image_path.c_str();
+    cook::CookToModelOptions options;
+    options.bake_link_sdf = recipe.bake_link_sdf;
+    cook::CookToModelResult cooked =
+        cook::CookToModel(scene, static_cast<int>(desc.env_count), options);
+    if (recipe.media_before_terrain) {
+        cook::CookSceneMedia(cooked.model, desc.env_count, scene.Media(), recipe.contact_radius);
+    }
+    const nuka_result_t terrain = ApplyControlTerrainGravity(
+        &desc, static_cast<articulation::ControlMode>(desc.control_mode), cooked.model,
+        &out->terrain, &out->gravity);
+    if (terrain != NUKA_RESULT_OK) {
+        return terrain;
+    }
+    if (!recipe.media_before_terrain) {
+        cook::CookSceneMedia(cooked.model, desc.env_count, scene.Media(), recipe.contact_radius);
+    }
+    // Positive values bound the contact recovery push-out; 0 keeps the cooked default.
+    if (recipe.baumgarte_max_velocity > 0.0f) {
+        cooked.model.baumgarte_max_velocity = recipe.baumgarte_max_velocity;
+    }
+    if (recipe.overlap_recovery_velocity > 0.0f) {
+        cooked.model.overlap_recovery_velocity = recipe.overlap_recovery_velocity;
+    }
+    out->surfaces = cook::BuildSceneMediaRenderSurfaces(scene.Media());
+    out->model = std::move(cooked.model);
+    out->blob = std::move(cooked.blob);
+    return NUKA_RESULT_OK;
+}
+
+// Build the live nk::World for a cooked scene. Each zero solver knob keeps the engine
+// default, so an unset caller gets the plain dt + gravity configuration.
+nuka_result_t BuildWorld(CookedWorld& cooked, const WorldRecipe& recipe, DeviceRecord* device,
+                         const nuka::math::Vec3& gravity, uint32_t vel_iters,
+                         std::unique_ptr<nuka::nk::World>* out) {
+    if (recipe.cloth_integrator > 1u || vel_iters > UINT16_MAX) return NUKA_RESULT_INVALID_ARG;
+    if (!cooked.blob) return NUKA_RESULT_INTERNAL;
+    if (recipe.desc.ogc_contact_capacity > 0u)
+        cook::SetOgcContactCapacity(cooked.model, recipe.desc.ogc_contact_capacity);
+    cooked.model.osc_task_link = recipe.desc.osc_task_link;
+
+    nuka::nk::Pipeline::SolverConfig cfg;
+    cfg.dt = recipe.desc.fixed_dt;
+    cfg.gravity[0] = gravity.x;
+    cfg.gravity[1] = gravity.y;
+    cfg.gravity[2] = gravity.z;
+    if (vel_iters != 0u) {
+        cfg.vel_iters = static_cast<uint16_t>(vel_iters);
+        cfg.velocity_iterations_override = true;
+    }
+    if (recipe.solver_pos_iters != 0u) cfg.pos_iters = static_cast<uint16_t>(recipe.solver_pos_iters);
+    if (recipe.solver_contact_margin > 0.0f) cfg.contact_margin = recipe.solver_contact_margin;
+    if (recipe.solver_max_pairs != 0u) cfg.max_pairs = recipe.solver_max_pairs;
+    cfg.cloth_integrator = recipe.cloth_integrator;
+
+    auto world = std::make_unique<nuka::nk::World>(std::move(cooked.model), recipe.desc.env_count,
+                                                   device->phi_device, device->backend, cfg);
+    if (!world->Ready()) {
+        std::fprintf(stderr, "[World] %s\n", world->CreationError().c_str());
+        return MapStatusToResult(world->CreationStatus());
+    }
+    *out = std::move(world);
+    return NUKA_RESULT_OK;
+}
+
+// Point the record at a built world and the scene it was cooked from. The scene is
+// retained so sensors, export and rebuild read the same ECS the cook saw.
+void InstallScene(WorldRecord& record, std::unique_ptr<nuka::nk::World> world,
+                  CookedWorld&& cooked, nuka::scene::SceneIR&& scene) {
+    record.world = std::move(world);
+    record.cooked_terrain = std::move(cooked.terrain);
+    CaptureArticulationHostMirror(*cooked.blob, &record);
+    record.scene = std::make_unique<nuka::scene::SceneIR>(std::move(scene));
+    SetParticleSurfaces(record, std::move(cooked.surfaces));
+}
+
+// Guards generations, storage leases and retired worlds, which view owners touch from any thread.
+std::mutex& LeaseMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+constexpr uint32_t kNoRow = ~uint32_t(0);
+
+// Maps each name that labels exactly one entry to its index.
+std::unordered_map<std::string, uint32_t> UniqueNames(const std::vector<std::string>& names) {
+    std::unordered_map<std::string, uint32_t> index;
+    for (uint32_t i = 0u; i < names.size(); ++i) {
+        const auto [it, inserted] = index.emplace(names[i], i);
+        if (!inserted) it->second = kNoRow;
+    }
+    return index;
+}
+
+// The scene name of each cooked link's body (empty when the row is not a scene body).
+std::vector<std::string> LinkNames(const nuka::nk::Model& model, const nuka::scene::SceneIR& scene) {
+    const auto& link_body = model.articulation.link_body;
+    std::vector<std::string> names(link_body.size());
+    for (size_t l = 0u; l < link_body.size(); ++l)
+        if (link_body[l] < scene.Bodies().size()) names[l] = scene.Bodies()[link_body[l]].name;
+    return names;
+}
+
+// Copy the paired per-env elements of one persistent field from one world to another.
+nuka::phi::Status MigrateField(nuka::nk::World& from, nuka::nk::World& to, nuka::nk::FieldId id,
+                               uint64_t element_bytes,
+                               const std::vector<std::pair<uint32_t, uint32_t>>& rows) {
+    const uint64_t envs = to.EnvCount();
+    const uint64_t from_count = from.GetModel().capacities.ElementCount(id) / envs;
+    const uint64_t to_count = to.GetModel().capacities.ElementCount(id) / envs;
+    if (rows.empty() || from_count == 0u || to_count == 0u) return nuka::phi::Status::Ok;
+    std::vector<uint8_t> source(envs * from_count * element_bytes);
+    std::vector<uint8_t> target(envs * to_count * element_bytes);
+    auto status = from.GetData().DownloadFieldStatus(id, source.data(), source.size());
+    if (status == nuka::phi::Status::Ok)
+        status = to.GetData().DownloadFieldStatus(id, target.data(), target.size());
+    if (status != nuka::phi::Status::Ok) return status;
+    for (uint64_t e = 0u; e < envs; ++e)
+        for (const auto& [a, b] : rows)
+            if (a < from_count && b < to_count)
+                std::memcpy(target.data() + (e * to_count + b) * element_bytes,
+                            source.data() + (e * from_count + a) * element_bytes, element_bytes);
+    return to.GetData().UploadFieldStatus(id, target.data(), target.size());
+}
+
+// Carry body and articulation state across a rebuild by unique body name: movable body
+// pose and velocity, per-link joint state and targets, and each articulation's root pose.
+nuka::phi::Status MigrateState(nuka::nk::World& from, const nuka::scene::SceneIR& from_scene,
+                               nuka::nk::World& to, const nuka::scene::SceneIR& to_scene) {
+    using nuka::nk::FieldId;
+    std::vector<std::string> to_body_names;
+    for (const auto& body : to_scene.Bodies()) to_body_names.push_back(body.name);
+    const auto to_bodies = UniqueNames(to_body_names);
+    std::vector<std::string> from_body_names;
+    for (const auto& body : from_scene.Bodies()) from_body_names.push_back(body.name);
+    const auto from_bodies = UniqueNames(from_body_names);
+    std::vector<std::pair<uint32_t, uint32_t>> bodies;
+    for (const auto& [name, a] : from_bodies) {
+        const auto found = to_bodies.find(name);
+        if (a == kNoRow || found == to_bodies.end() || found->second == kNoRow) continue;
+        if (!from_scene.Bodies()[a].is_static && !to_scene.Bodies()[found->second].is_static)
+            bodies.emplace_back(a, found->second);
+    }
+
+    const auto& from_art = from.GetModel().articulation;
+    const auto& to_art = to.GetModel().articulation;
+    const auto to_links = UniqueNames(LinkNames(to.GetModel(), to_scene));
+    const std::vector<std::string> from_link_names = LinkNames(from.GetModel(), from_scene);
+    std::vector<std::pair<uint32_t, uint32_t>> links, roots;
+    for (uint32_t a = 0u; a < from_link_names.size(); ++a) {
+        const auto found = to_links.find(from_link_names[a]);
+        if (from_link_names[a].empty() || found == to_links.end() || found->second == kNoRow) continue;
+        const uint32_t b = found->second;
+        links.emplace_back(a, b);
+        if (from_art.parent_link.at(a) == kNoRow && to_art.parent_link.at(b) == kNoRow)
+            roots.emplace_back(from_art.link_to_articulation.empty() ? 0u : from_art.link_to_articulation[a],
+                               to_art.link_to_articulation.empty() ? 0u : to_art.link_to_articulation[b]);
+    }
+
+    constexpr uint64_t kPose = 7u * sizeof(float);
+    constexpr uint64_t kVec3 = 3u * sizeof(float);
+    constexpr uint64_t kSpatial = 6u * sizeof(float);
+    const struct { FieldId id; uint64_t bytes; const std::vector<std::pair<uint32_t, uint32_t>>* rows; }
+        fields[] = {{FieldId::BodyPose, kPose, &bodies},
+                    {FieldId::BodyLinearVelocity, kVec3, &bodies},
+                    {FieldId::BodyAngularVelocity, kVec3, &bodies},
+                    {FieldId::Q, sizeof(float), &links},
+                    {FieldId::Qdot, sizeof(float), &links},
+                    {FieldId::DriveTarget, sizeof(float), &links},
+                    {FieldId::LinkVelocity, kSpatial, &links},
+                    {FieldId::BasePose, kPose, &roots}};
+    for (const auto& field : fields) {
+        const auto status = MigrateField(from, to, field.id, field.bytes, *field.rows);
+        if (status != nuka::phi::Status::Ok) return status;
+    }
+    return to.ForwardKinematics();
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Shared world-create helpers (declared in c_abi/internal.hpp): the validation and
+// the ONE cook + build + record-assembly path every create entry and rebuild share.
+// ---------------------------------------------------------------------------
+
+nuka_result_t ValidateWorldDescAndDevice(
+    nuka_device_handle device, const nuka_world_desc_t* desc,
+    bool require_scene_path, DeviceRecord** out_device,
+    articulation::ControlMode* out_mode) {
+    if (desc == nullptr ||
+        (require_scene_path && desc->scene_path == nullptr) ||
+        desc->fixed_dt <= 0.0f) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    if (desc->env_count == 0u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    // Determinism level: 0 = D1/Strong (default), 1 = D2/Weak. Reject other values.
+    // The nk pipeline runs the D1 schedule only; D2 currently selects the same
+    // kernels and is behaviorally identical (NOT a separate path).
+    if (desc->determinism > 1u) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    if (!articulation::IsControlModeImplemented(desc->control_mode)) {
+        return NUKA_RESULT_INVALID_ARG;
+    }
+    const auto control_mode =
+        static_cast<articulation::ControlMode>(desc->control_mode);
+
+    auto* device_record = nuka::c_abi::DeviceTable().Get(device);
+    if (device_record == nullptr) {
+        return NUKA_RESULT_NULL_HANDLE;
+    }
+    // The nk::World ctor REQUIRES the phi v2 device/backend acquired at create.
+    if (device_record->phi_device == nullptr || device_record->backend == nullptr) {
+        return NUKA_RESULT_NOT_SUPPORTED;
+    }
+    *out_device = device_record;
+    *out_mode = control_mode;
+    return NUKA_RESULT_OK;
+}
+
+WorldRecipe MakeWorldRecipe(const nuka_world_desc_t& desc) {
+    WorldRecipe recipe;
+    recipe.desc = desc;
+    recipe.desc.scene_path = nullptr;
+    recipe.desc.heightfield_image_path = nullptr;
+    if (desc.heightfield_image_path != nullptr) recipe.image_path = desc.heightfield_image_path;
+    return recipe;
+}
+
+nuka_result_t CreateWorld(DeviceRecord* device, WorldRecipe recipe, nuka::scene::SceneIR&& scene,
+                          std::string scene_dir, nuka_world_handle* out) {
+    CookedWorld cooked;
+    const nuka_result_t cook_result = CookWorld(recipe, scene, &cooked);
+    if (cook_result != NUKA_RESULT_OK) return cook_result;
+    std::unique_ptr<nuka::nk::World> world;
+    const nuka_result_t built =
+        BuildWorld(cooked, recipe, device, cooked.gravity, recipe.solver_vel_iters, &world);
+    if (built != NUKA_RESULT_OK) return built;
+
+    auto record = std::make_unique<WorldRecord>();
+    record->device = device;
+    record->env_count = recipe.desc.env_count;
+    record->control_mode = static_cast<articulation::ControlMode>(recipe.desc.control_mode);
+    record->step_options.dt = recipe.desc.fixed_dt;
+    record->step_options.gravity = cooked.gravity;
+    record->scene_dir = std::move(scene_dir);
+    record->recipe = std::move(recipe);
+    InstallScene(*record, std::move(world), std::move(cooked), std::move(scene));
+    *out = WorldTable().Insert(std::move(record));
+    return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;
 }
 
 }  // namespace nuka::c_abi
@@ -462,42 +558,35 @@ nuka_result_t nuka_world_create_from_scene(nuka_device_handle device,
     }
     *out = nullptr;
     try {
-        nuka::c_abi::PreparedWorld prepared;
-        const nuka_result_t prep =
-            nuka::c_abi::PrepareWorldFromDesc(device, desc, &prepared);
-        if (prep != NUKA_RESULT_OK) {
-            return prep;
+        nuka::c_abi::DeviceRecord* device_record = nullptr;
+        nuka::runtime::articulation::ControlMode control_mode{};
+        const nuka_result_t valid = nuka::c_abi::ValidateWorldDescAndDevice(
+            device, desc, /*require_scene_path=*/true, &device_record, &control_mode);
+        if (valid != NUKA_RESULT_OK) {
+            return valid;
+        }
+        nuka::scene::SceneIR scene;
+        const nuka_result_t loaded = nuka::c_abi::LoadComposedScene(*desc, &scene);
+        if (loaded != NUKA_RESULT_OK) {
+            return loaded;
         }
         // The file-load entry cooks the robot + an optional heightfield only; a scene
         // that declares media must use nuka_world_create_from_built_scene (LOUD, never
         // a silent drop of the declared particles).
-        if (!prepared.scene.Media().empty()) {
+        if (!scene.Media().empty()) {
             return NUKA_RESULT_NOT_SUPPORTED;
         }
-        // A positive baumgarte_max_velocity bounds the contact recovery push-out; 0
-        // keeps the cooked model default.
-        if (desc->solver_baumgarte_max_velocity > 0.0f) {
-            prepared.model.baumgarte_max_velocity =
-                desc->solver_baumgarte_max_velocity;
-        }
-        if (desc->solver_overlap_recovery_velocity > 0.0f) {
-            prepared.model.overlap_recovery_velocity = desc->solver_overlap_recovery_velocity;
-        }
-        // Build + insert the live world (the shared record-assembly path).
-        const nuka_result_t made = nuka::c_abi::FinishWorldCreate(
-            std::move(prepared.model), std::move(prepared.blob), std::move(prepared.scene),
-            std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
-            desc->env_count, prepared.control_mode, prepared.gravity,
-            desc->osc_task_link, out, desc->solver_vel_iters,
-            desc->solver_pos_iters, desc->solver_contact_margin,
-            desc->solver_max_pairs, desc->cloth_integrator, desc->ogc_contact_capacity);
-        if (made == NUKA_RESULT_OK) {
-            if (auto* rec = nuka::c_abi::WorldTable().Get(*out)) {
-                rec->scene_dir =
-                    std::filesystem::path(desc->scene_path).parent_path().string();
-            }
-        }
-        return made;
+        nuka::c_abi::WorldRecipe recipe = nuka::c_abi::MakeWorldRecipe(*desc);
+        recipe.baumgarte_max_velocity = desc->solver_baumgarte_max_velocity;
+        recipe.overlap_recovery_velocity = desc->solver_overlap_recovery_velocity;
+        recipe.solver_vel_iters = desc->solver_vel_iters;
+        recipe.solver_pos_iters = desc->solver_pos_iters;
+        recipe.solver_contact_margin = desc->solver_contact_margin;
+        recipe.solver_max_pairs = desc->solver_max_pairs;
+        recipe.cloth_integrator = desc->cloth_integrator;
+        return nuka::c_abi::CreateWorld(
+            device_record, std::move(recipe), std::move(scene),
+            std::filesystem::path(desc->scene_path).parent_path().string(), out);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
@@ -519,16 +608,18 @@ nuka_result_t nuka_world_create_coupled_from_scene(
         return NUKA_RESULT_INVALID_ARG;
     }
     try {
-        // Cook the robot + scene through the SAME path the scene-only entry uses.
-        nuka::c_abi::PreparedWorld prepared;
-        const nuka_result_t prep =
-            nuka::c_abi::PrepareWorldFromDesc(device, desc, &prepared);
-        if (prep != NUKA_RESULT_OK) {
-            return prep;
+        nuka::c_abi::DeviceRecord* device_record = nullptr;
+        nuka::runtime::articulation::ControlMode control_mode{};
+        const nuka_result_t valid = nuka::c_abi::ValidateWorldDescAndDevice(
+            device, desc, /*require_scene_path=*/true, &device_record, &control_mode);
+        if (valid != NUKA_RESULT_OK) {
+            return valid;
         }
-
-        // Translate the compact descriptor's media slots into first-class scene
-        // MediaRecords and append them to the robot scene; the cook reads the list.
+        nuka::scene::SceneIR scene;
+        const nuka_result_t loaded = nuka::c_abi::LoadComposedScene(*desc, &scene);
+        if (loaded != NUKA_RESULT_OK) {
+            return loaded;
+        }
         const bool has_cloth = particles->cloth_nx >= 2u &&
                                particles->cloth_ny >= 2u &&
                                particles->cloth_spacing > 0.0f;
@@ -536,49 +627,21 @@ nuka_result_t nuka_world_create_coupled_from_scene(
             // A particle-free world must use nuka_world_create_from_scene.
             return NUKA_RESULT_INVALID_ARG;
         }
-        nuka::scene::MediaRecord cloth_media = nuka::c_abi::ClothMediaFromDesc(*particles);
-        prepared.scene.AddMedia(cloth_media);
-
-        // Cook the media onto the robot Model via the ONE general media dispatch
-        // (cloth VBD; soft_sim_method == mlsmpm throws LOUDLY here). The disjoint
-        // body<->particle slot reserve sits above the rigid budget the prepare step
-        // set; the contact diameter rides the descriptor radius.
-        nuka::scene::cook::CookSceneMedia(prepared.model, desc->env_count,
-                                          prepared.scene.Media(),
-                                          particles->contact_radius);
-
-        // A positive baumgarte_max_velocity bounds the contact recovery push-out; 0
-        // leaves the cooked model default (so a zero-init desc is byte-identical).
-        if (particles->baumgarte_max_velocity > 0.0f) {
-            prepared.model.baumgarte_max_velocity = particles->baumgarte_max_velocity;
-        }
-        if (particles->overlap_recovery_velocity > 0.0f) {
-            prepared.model.overlap_recovery_velocity = particles->overlap_recovery_velocity;
-        }
-
-        // Every cooked medium's render surface (built from the SAME media list before
-        // the scene moves into the record), so a beauty render rebuilds each surface.
-        std::vector<nuka::scene::cook::MediaRenderSurface> media_surfaces =
-            nuka::scene::cook::BuildSceneMediaRenderSurfaces(prepared.scene.Media());
-
-        // Build + insert the live coupled world (the SAME record-assembly path). The
-        // SolverConfig overrides ride the coupled desc; all-zero keeps today's cfg.
-        const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
-            std::move(prepared.model), std::move(prepared.blob), std::move(prepared.scene),
-            std::move(prepared.terrain), prepared.device_record, desc->fixed_dt,
-            desc->env_count, prepared.control_mode, prepared.gravity,
-            desc->osc_task_link, out,
-            particles->solver_vel_iters, particles->solver_pos_iters,
-            particles->solver_contact_margin, particles->solver_max_pairs,
-            particles->cloth_integrator, desc->ogc_contact_capacity);
-        if (result == NUKA_RESULT_OK) {
-            if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr) {
-                nuka::c_abi::SetParticleSurfaces(*record, std::move(media_surfaces));
-                record->scene_dir =
-                    std::filesystem::path(desc->scene_path).parent_path().string();
-            }
-        }
-        return result;
+        // The descriptor's cloth becomes a first-class scene medium, cooked after the
+        // terrain with the descriptor's contact radius and solver knobs.
+        scene.AddMedia(nuka::c_abi::ClothMediaFromDesc(*particles));
+        nuka::c_abi::WorldRecipe recipe = nuka::c_abi::MakeWorldRecipe(*desc);
+        recipe.contact_radius = particles->contact_radius;
+        recipe.baumgarte_max_velocity = particles->baumgarte_max_velocity;
+        recipe.overlap_recovery_velocity = particles->overlap_recovery_velocity;
+        recipe.solver_vel_iters = particles->solver_vel_iters;
+        recipe.solver_pos_iters = particles->solver_pos_iters;
+        recipe.solver_contact_margin = particles->solver_contact_margin;
+        recipe.solver_max_pairs = particles->solver_max_pairs;
+        recipe.cloth_integrator = particles->cloth_integrator;
+        return nuka::c_abi::CreateWorld(
+            device_record, std::move(recipe), std::move(scene),
+            std::filesystem::path(desc->scene_path).parent_path().string(), out);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
@@ -650,7 +713,9 @@ nuka_result_t nuka_world_set_velocity_iterations(nuka_world_handle world, uint32
     if (!record) return NUKA_RESULT_NULL_HANDLE;
     if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
     try {
-        return nuka::c_abi::MapStatusToResult(record->world->SetVelocityIterations(iterations));
+        const auto status = record->world->SetVelocityIterations(iterations);
+        if (status == nuka::phi::Status::Ok) record->velocity_iterations_set = true;
+        return nuka::c_abi::MapStatusToResult(status);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {
@@ -1131,6 +1196,148 @@ nuka_result_t nuka_world_set_gravity_z(nuka_world_handle world, float gravity_z)
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& e) {
         return nuka::c_abi::MapExceptionToResult(e);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_export_scene(nuka_world_handle world, const char* nks_path) {
+    if (nks_path == nullptr || nks_path[0] == '\0') return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->scene) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        nuka::scene::nks::Save(*record->scene, nks_path);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_asset_root(nuka_world_handle world, char* out, size_t cap,
+                                        size_t* out_len) {
+    if (out_len != nullptr) *out_len = 0u;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    const std::string& root = record->scene_dir;
+    if (out_len != nullptr) *out_len = root.size();
+    if (out == nullptr) return NUKA_RESULT_OK;
+    if (root.size() + 1u > cap) return NUKA_RESULT_INVALID_ARG;
+    std::memcpy(out, root.c_str(), root.size() + 1u);
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_rebuild_from_scene(nuka_world_handle world, const char* scene_path,
+                                            uint32_t flags) {
+    if (scene_path == nullptr || (flags & ~static_cast<uint32_t>(NUKA_REBUILD_INITIAL_STATE)) != 0u)
+        return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    // Sensors and observations bind to the cooked layout and are not carried across.
+    if (record->sensor || !record->field_observations.empty() ||
+        record->world->StateSensors().Count() != 0u)
+        return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        using nuka::phi::Status;
+        nuka::scene::SceneIR scene;
+        if (!nuka::c_abi::LoadSceneByExtension(scene_path, &scene)) return NUKA_RESULT_NOT_SUPPORTED;
+        nuka::c_abi::CookedWorld cooked;
+        nuka_result_t result = nuka::c_abi::CookWorld(record->recipe, scene, &cooked);
+        if (result != NUKA_RESULT_OK) return result;
+        nuka::nk::World& current = *record->world;
+        const uint32_t vel_iters = record->velocity_iterations_set
+                                       ? current.VelocityIterations()
+                                       : record->recipe.solver_vel_iters;
+        std::unique_ptr<nuka::nk::World> rebuilt;
+        result = nuka::c_abi::BuildWorld(cooked, record->recipe, record->device,
+                                         record->step_options.gravity, vel_iters, &rebuilt);
+        if (result != NUKA_RESULT_OK) return result;
+
+        const bool initial = (flags & NUKA_REBUILD_INITIAL_STATE) != 0u;
+        Status status = current.Synchronize();
+        if (status == Status::Ok && !initial)
+            status = nuka::c_abi::MigrateState(current, *record->scene, *rebuilt, scene);
+        if (status == Status::Ok && current.GetExecutionMode() == nuka::nk::World::ExecutionMode::Graph)
+            status = rebuilt->SetExecutionMode(nuka::nk::World::ExecutionMode::Graph);
+        if (status != Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+
+        // Leased storage stays alive until its last view releases it.
+        {
+            std::lock_guard<std::mutex> lock(nuka::c_abi::LeaseMutex());
+            if (record->storage_leases.count(record->generation) != 0u)
+                record->retired_worlds.emplace(record->generation, std::move(record->world));
+            ++record->generation;
+        }
+        record->beauty.reset();
+        nuka::c_abi::InstallScene(*record, std::move(rebuilt), std::move(cooked), std::move(scene));
+        record->dr_baseline_captured = false;
+        record->dr_nominal_link_mass.clear();
+        record->dr_nominal_joint_armature.clear();
+        record->invariant_sampler.Reset();
+        record->last_invariant_violations.clear();
+        if (initial) record->simulated_step_count = 0u;
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[World] rebuild: %s\n", error.what());
+        return nuka::c_abi::MapExceptionToResult(error);
+    } catch (...) {
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+nuka_result_t nuka_world_get_generation(nuka_world_handle world, uint64_t* out_generation) {
+    if (out_generation == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    std::lock_guard<std::mutex> lock(nuka::c_abi::LeaseMutex());
+    *out_generation = record->generation;
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_retain_storage(nuka_world_handle world, uint64_t* out_generation) {
+    if (out_generation == nullptr) return NUKA_RESULT_INVALID_ARG;
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    std::lock_guard<std::mutex> lock(nuka::c_abi::LeaseMutex());
+    ++record->storage_leases[record->generation];
+    *out_generation = record->generation;
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_release_storage(nuka_world_handle world, uint64_t generation) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    std::unique_ptr<nuka::nk::World> retired;
+    {
+        std::lock_guard<std::mutex> lock(nuka::c_abi::LeaseMutex());
+        const auto lease = record->storage_leases.find(generation);
+        if (lease == record->storage_leases.end()) return NUKA_RESULT_INVALID_ARG;
+        if (--lease->second != 0u) return NUKA_RESULT_OK;
+        record->storage_leases.erase(lease);
+        const auto found = record->retired_worlds.find(generation);
+        if (found != record->retired_worlds.end()) {
+            retired = std::move(found->second);
+            record->retired_worlds.erase(found);
+        }
+    }
+    return NUKA_RESULT_OK;
+}
+
+nuka_result_t nuka_world_forward_kinematics(nuka_world_handle world) {
+    auto* record = nuka::c_abi::WorldTable().Get(world);
+    if (record == nullptr) return NUKA_RESULT_NULL_HANDLE;
+    if (!record->world) return NUKA_RESULT_NOT_SUPPORTED;
+    try {
+        return nuka::c_abi::MapStatusToResult(record->world->ForwardKinematics());
+    } catch (const std::exception& error) {
+        return nuka::c_abi::MapExceptionToResult(error);
     } catch (...) {
         return NUKA_RESULT_INTERNAL;
     }

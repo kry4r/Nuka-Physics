@@ -7,7 +7,7 @@
 //
 // It REUSES the existing scene handle (SceneRecord / SceneTable, shared with the
 // load/edit surface in scene.cpp) and the shared world-create helpers
-// (ValidateWorldDescAndDevice / ApplyControlTerrainGravity / FinishWorldCreate in
+// (ValidateWorldDescAndDevice / MakeWorldRecipe / CreateWorld in
 // world.cpp) -- so the built-scene world is ONE nk::World on the ONE cook path,
 // not a second world type. Host-only (zero CUDA tokens); only the world create
 // touches a device (via the shared helpers).
@@ -530,57 +530,23 @@ nuka_result_t nuka_world_create_from_built_scene(
             &control_mode);
         if (valid != NUKA_RESULT_OK) return valid;
 
-        // ONE cook: rigid + media through the SAME orchestrator a file scene uses. A
-        // media-free / primitive-free built scene cooks byte-identically to
-        // CookToModel (CookSceneMedia is a no-op on empty media). The handle keeps
-        // ownership; the cook consumes a copy.
+        // The handle keeps ownership; the world cooks a copy, its media before the terrain.
         nscene::SceneIR built = *sr->scene;
-        // Opt-in per-link visual-mesh SDF bake (a foot then engages the MPM grid BC);
-        // default off keeps every existing built-scene cook byte-identical.
-        cook::CookToModelOptions cook_opts;
-        if (options != nullptr && options->bake_link_sdf != 0u) {
-            cook_opts.bake_link_sdf = true;
+        nuka::c_abi::WorldRecipe recipe = nuka::c_abi::MakeWorldRecipe(*desc);
+        recipe.media_before_terrain = true;
+        if (options != nullptr) {
+            // Opt-in per-link visual-mesh SDF bake (a foot then engages the MPM grid BC).
+            recipe.bake_link_sdf = options->bake_link_sdf != 0u;
+            recipe.baumgarte_max_velocity = options->baumgarte_max_velocity;
+            recipe.overlap_recovery_velocity = options->overlap_recovery_velocity;
+            recipe.solver_vel_iters = options->solver_vel_iters;
+            recipe.solver_pos_iters = options->solver_pos_iters;
+            recipe.solver_contact_margin = options->solver_contact_margin;
+            recipe.solver_max_pairs = options->solver_max_pairs;
+            recipe.cloth_integrator = options->cloth_integrator;
         }
-        cook::CookToModelResult cooked = cook::CookSceneToModel(
-            built, static_cast<int>(desc->env_count), cook_opts);
-
-        // The SHARED post-cook step (drive_mode + optional heightfield + gravity).
-        nuka::terrain::HeightField cooked_terrain;
-        nmath::Vec3 gravity{0.0f, 0.0f, 0.0f};
-        const nuka_result_t terrain = nuka::c_abi::ApplyControlTerrainGravity(
-            desc, control_mode, cooked.model, &cooked_terrain, &gravity);
-        if (terrain != NUKA_RESULT_OK) return terrain;
-
-        // A positive baumgarte_max_velocity bounds the contact recovery push-out (the
-        // SAME model override the coupled entry applies); 0 keeps the cooked default.
-        if (options != nullptr && options->baumgarte_max_velocity > 0.0f) {
-            cooked.model.baumgarte_max_velocity = options->baumgarte_max_velocity;
-        }
-        if (options != nullptr && options->overlap_recovery_velocity > 0.0f) {
-            cooked.model.overlap_recovery_velocity = options->overlap_recovery_velocity;
-        }
-
-        // Every cooked medium's render surface (built from the SAME media list before
-        // the scene moves into the record), so a beauty render rebuilds each surface.
-        std::vector<cook::MediaRenderSurface> media_surfaces =
-            cook::BuildSceneMediaRenderSurfaces(built.Media());
-
-        // Build + insert the live world through the SAME record-assembly path. The
-        // SolverConfig overrides ride `options`; all-zero/NULL keeps today's cfg.
-        const nuka_result_t result = nuka::c_abi::FinishWorldCreate(
-            std::move(cooked.model), std::move(cooked.blob), std::move(built),
-            std::move(cooked_terrain),
-            device_record, desc->fixed_dt, desc->env_count, control_mode, gravity,
-            desc->osc_task_link, out, options ? options->solver_vel_iters : 0u,
-            options ? options->solver_pos_iters : 0u,
-            options ? options->solver_contact_margin : 0.0f,
-            options ? options->solver_max_pairs : 0u,
-            options ? options->cloth_integrator : 0u, desc->ogc_contact_capacity);
-        if (result == NUKA_RESULT_OK) {
-            if (auto* record = nuka::c_abi::WorldTable().Get(*out); record != nullptr)
-                nuka::c_abi::SetParticleSurfaces(*record, std::move(media_surfaces));
-        }
-        return result;
+        return nuka::c_abi::CreateWorld(device_record, std::move(recipe), std::move(built),
+                                        std::string(), out);
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
     } catch (const std::exception& error) {

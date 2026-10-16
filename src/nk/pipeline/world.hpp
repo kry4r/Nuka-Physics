@@ -103,6 +103,9 @@ public:
     // Invalid IDs fail without mutation. Control targets and unselected environments stay intact.
     phi::Status Reset(const std::vector<uint32_t>& env_ids = {});
 
+    // Recompute every environment's link and body poses from joint state without stepping.
+    phi::Status ForwardKinematics() { return RefreshPoses(0u); }
+
     // Dispatch a single op outside the per-step pipeline (oracle harness +
     // snapshot/restore/obs plumbing). params must match the op's POD.
     phi::Status DispatchOp(phi::NkOp op, const void* params);

@@ -42,6 +42,9 @@ from ._nuka_ext import (  # noqa: F401
     ENV_STATUS_SENSOR_QUEUE_OVERFLOW,
     World,
     StateCheckpoint,
+    FieldView,
+    StaleViewError,
+    runtime_info,
     # Built-scene authoring: program rigid primitives + TAGGED media records, then
     # build() cooks them through the SAME CookSceneToModel a file scene uses (the
     # general media authoring substrate -- tet-soft / fluid / a second cloth).
@@ -328,6 +331,9 @@ __all__ = [
     "CABLE_PIN_BOTH",
     "CABLE_PIN_NONE",
     "StateCheckpoint",
+    "FieldView",
+    "StaleViewError",
+    "runtime_info",
     "StateSensorKind",
     "ContactRegionShape",
     "SensorMount",

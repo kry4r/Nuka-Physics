@@ -70,6 +70,8 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    # One shared CUDA runtime, so streams and events cross module boundaries.
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
     if(NK_CUDA_ARCHITECTURES STREQUAL "native"
        AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 11.8)
         set(NK_CUDA_ARCHITECTURES "86" CACHE STRING "CUDA architectures for production physics kernels" FORCE)
@@ -280,6 +282,16 @@ endif()
 # Subdirectories
 # ---------------------------------------------------------------------------
 add_subdirectory(src)
+
+if(WIN32 AND CMAKE_CUDA_COMPILER)
+    # Executables load the shared CUDA runtime from their own directory.
+    file(GLOB NUKA_CUDART_DLLS "${CUDAToolkit_BIN_DIR}/cudart64_*.dll"
+                               "${CUDAToolkit_BIN_DIR}/x64/cudart64_*.dll")
+    file(COPY ${NUKA_CUDART_DLLS} DESTINATION "${CMAKE_BINARY_DIR}/src")
+    if(NK_BUILD_TESTS)
+        file(COPY ${NUKA_CUDART_DLLS} DESTINATION "${CMAKE_BINARY_DIR}/tests")
+    endif()
+endif()
 
 configure_package_config_file(
     "${CMAKE_SOURCE_DIR}/cmake/nukaConfig.cmake.in"

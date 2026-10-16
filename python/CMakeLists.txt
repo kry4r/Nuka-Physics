@@ -78,5 +78,7 @@ endif()
 install(TARGETS _nuka_ext LIBRARY DESTINATION nuka RUNTIME DESTINATION nuka)
 if(WIN32)
   install(FILES "${NUKA_RUNTIME}" DESTINATION nuka)
-  install(FILES "$<TARGET_FILE:CUDA::cudart>" DESTINATION nuka)
+  file(GLOB NUKA_CUDART_DLLS "${CUDAToolkit_BIN_DIR}/cudart64_*.dll"
+                             "${CUDAToolkit_BIN_DIR}/x64/cudart64_*.dll")
+  install(FILES ${NUKA_CUDART_DLLS} DESTINATION nuka)
 endif()
