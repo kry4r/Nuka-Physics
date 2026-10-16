@@ -851,6 +851,8 @@ if(CMAKE_CUDA_COMPILER)
         execute_process(
             COMMAND "${Python3_EXECUTABLE}" -c "import sys; sys.stdout.write(sys.prefix)"
             OUTPUT_VARIABLE NUKA_PY_HOME)
+        # Forward slashes keep the Windows prefix a valid C string literal.
+        file(TO_CMAKE_PATH "${NUKA_PY_HOME}" NUKA_PY_HOME)
         message(STATUS "nuka_editor: embedding python ${Python3_VERSION} (home ${NUKA_PY_HOME})")
 
         add_executable(nuka_editor_exe

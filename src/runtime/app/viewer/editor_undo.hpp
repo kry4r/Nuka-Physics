@@ -24,8 +24,8 @@
 #include <vector>
 
 namespace nuka::phi {
-class Device;
-class Backend;
+struct Device;
+struct Backend;
 }  // namespace nuka::phi
 
 namespace nuka::runtime::app::viewer {

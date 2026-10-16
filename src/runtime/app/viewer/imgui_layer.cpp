@@ -301,7 +301,7 @@ void ProjMatrixGL(float fov_y_rad, float aspect, float znear, float zfar, float*
 // ---------------------------------------------------------------------------
 static void BuildDefaultDockLayout(ImGuiID dockspace_id) {
     ImGui::DockBuilderRemoveNode(dockspace_id);
-    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace |
+    ImGui::DockBuilderAddNode(dockspace_id, static_cast<ImGuiDockNodeFlags>(ImGuiDockNodeFlags_DockSpace) |
                                                 ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::DockBuilderSetNodeSize(dockspace_id, ImGui::GetMainViewport()->Size);
 

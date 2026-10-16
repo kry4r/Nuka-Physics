@@ -229,14 +229,14 @@ __device__ bool AssembleDenseBlock(const Block& b, DataView data, BlockDescentSo
         finite &= isfinite(static_cast<float>(force));
     }
     __syncthreads();
-    bool small = true;
+    bool settled = true;
     if (threadIdx.x < n) {
         // A float velocity is off its optimum by up to a rounding, which moves g by H times it.
         for (uint32_t k = 0u; k < n; ++k)
             scale += fabsf(b.matrix[size_t{max(threadIdx.x, k)} * b.stride + min(threadIdx.x, k)]) * fabsf(u[k]);
-        small = fabs(force) <= static_cast<double>(kDenseRoundings * FLT_EPSILON) * scale;
+        settled = fabs(force) <= static_cast<double>(kDenseRoundings * FLT_EPSILON) * scale;
     }
-    *converged = __syncthreads_and(small) != 0;
+    *converged = __syncthreads_and(settled) != 0;
     return __syncthreads_or(!finite) == 0;
 }
 
@@ -327,13 +327,13 @@ __device__ bool AssembleSmallDenseBlock(const Block& b, DataView data, BlockDesc
         finite &= isfinite(static_cast<float>(force));
     }
     __syncthreads();
-    bool small = true;
+    bool settled = true;
     if (threadIdx.x < n) {
         for (uint32_t k = 0u; k < n; ++k)
             scale += fabsf(b.matrix[size_t{max(threadIdx.x, k)} * b.stride + min(threadIdx.x, k)]) * fabsf(u[k]);
-        small = fabs(force) <= static_cast<double>(kDenseRoundings * FLT_EPSILON) * scale;
+        settled = fabs(force) <= static_cast<double>(kDenseRoundings * FLT_EPSILON) * scale;
     }
-    *converged = __syncthreads_and(small) != 0;
+    *converged = __syncthreads_and(settled) != 0;
     return __syncthreads_or(!finite) == 0;
 }
 
