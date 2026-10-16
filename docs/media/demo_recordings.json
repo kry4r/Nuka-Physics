@@ -52,6 +52,40 @@
       "contract": "SAT minimum translation distance of authored collision boxes"
     }
   },
+  "g1_shirt_fold": {
+    "video": "docs/media/g1_shirt_fold.mp4",
+    "gif": "docs/media/g1_shirt_fold.gif",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "frames": 774,
+    "seconds": 25.8,
+    "sha256": "c25f31ad6f9e57e46b8638f114a2b5de44784801e445fd5c6c6c63c3ef872748",
+    "gif_sha256": "7a7cd914bc837289105fcb1699826e68df9c7768d3cd7d2b9cc711c651889602",
+    "gif_width": 640,
+    "gif_height": 360,
+    "gif_fps": 12,
+    "gif_frames": 310,
+    "gif_seconds": 25.83,
+    "capture": "Replay of recorded Nuka articulation and cloth states",
+    "environment": "examples/assets/nuka_lab/stage.nks",
+    "render_samples": 256,
+    "camera": {
+      "eye": [
+        1.725,
+        -0.36,
+        1.525
+      ],
+      "look": [
+        0.275,
+        0.06,
+        0.94
+      ],
+      "vfov": 24
+    },
+    "denoised": false,
+    "upscaled": false
+  },
   "g1_dance": {
     "video": "docs/media/g1_dance.mp4",
     "gif": "docs/media/g1_dance.gif",

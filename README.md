@@ -34,10 +34,24 @@
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/pi05_libero.mp4">Full video</a> · <a href="examples/demo/README.md#pi05-inference">Run demo</a>
 </td>
 <td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_shirt_fold.mp4"><img src="docs/media/g1_shirt_fold.gif" width="100%" alt="Unitree G1 folding a pale blue cotton shirt with articulated hands"></a>
+  <br><b>G1 Shirt Folding</b>
+  <br>Robot–cloth coupling · Shirt folding
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_shirt_fold.mp4">1080p video</a>
+</td>
+</tr>
+<tr>
+<td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4"><img src="docs/media/g1_dance.gif" width="100%" alt="Unitree G1 performing the Shuffle dance with a pretrained ONNX policy"></a>
   <br><b>G1 Dance</b>
   <br>29-DoF humanoid · Shuffle policy inference
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/g1_dance.mp4">Full video</a> · <a href="examples/demo/README.md#g1-dance">Run demo</a>
+</td>
+<td width="50%" align="center" valign="top">
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4"><img src="docs/media/microduck_ball_dynamic_lab.gif" width="100%" alt="Microduck taking alternating steps while balancing on a freely rolling ball in Nuka Dynamics Lab"></a>
+  <br><b>Microduck Ball Balance</b>
+  <br>Pure Nuka Physics RL
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4">1080p video</a>
 </td>
 </tr>
 <tr>
@@ -56,44 +70,16 @@
 </tr>
 <tr>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4"><img src="docs/media/elastoplastic_compression.gif" width="100%" alt="MLS-MPM material recovering from light compression and retaining plastic deformation after strong compression"></a>
-  <br><b>Elastoplastic Compression</b>
-  <br>Elastic recovery · Permanent deformation
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_compression.mp4">Full video</a> · <a href="examples/demo/README.md#elastoplastic-compression">Run demo</a>
-</td>
-<td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4"><img src="docs/media/elastoplastic_bunny.gif" width="100%" alt="A freely falling Stanford bunny indenting an MLS-MPM elastoplastic block"></a>
-  <br><b>Bunny × Elastoplastic</b>
-  <br>Free fall · Plastic indentation · Real time
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4">1080p video</a> · <a href="examples/demo/README.md#bunny-elastoplastic-impact">Run demo</a>
-</td>
-</tr>
-<tr>
-<td width="50%" align="center" valign="top">
   <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4"><img src="docs/media/bunny_water_drop.gif" width="100%" alt="A freely falling Stanford bunny splashing into MLS-MPM water in a glass tank"></a>
   <br><b>Bunny × Water</b>
   <br>Two-way MLS-MPM coupling · 2× slow motion
   <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/bunny_water_drop.mp4">1080p video</a> · <a href="examples/demo/README.md#bunny-water-drop">Run demo</a>
 </td>
 <td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4"><img src="docs/media/jelly_ball_drop.gif" width="100%" alt="MLS-MPM elastic jelly ball dropping and rebounding"></a>
-  <br><b>Elastic Jelly</b>
-  <br>MLS-MPM elasticity
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/jelly_ball_drop.mp4">Full video</a>
-</td>
-</tr>
-<tr>
-<td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4"><img src="docs/media/microduck_ball_dynamic_lab.gif" width="100%" alt="Microduck taking alternating steps while balancing on a freely rolling ball in Nuka Dynamics Lab"></a>
-  <br><b>Microduck Ball Balance</b>
-  <br>Pure Nuka Physics RL
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/microduck_ball_dynamic_lab.mp4">1080p video</a>
-</td>
-<td width="50%" align="center" valign="top">
-  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4"><img src="docs/media/robot_elastoplastic.gif" width="100%" alt="A dynamically driven Panda gripper loading and releasing an MLS-MPM elastoplastic specimen"></a>
-  <br><b>Panda × Elastoplastic</b>
-  <br>Dynamic gripper · Visual preview
-  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic.mp4">Full video</a> · <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/robot_elastoplastic_close.mp4">Close-up</a> · <a href="examples/demo/README.md#dynamic-elastoplastic-gripper">Run demo</a>
+  <a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4"><img src="docs/media/elastoplastic_bunny.gif" width="100%" alt="A freely falling Stanford bunny indenting an MLS-MPM elastoplastic block"></a>
+  <br><b>Bunny × Elastoplastic</b>
+  <br>Free fall · Plastic indentation · Real time
+  <br><a href="https://github.com/kry4r/Nuka-Physics/raw/master/docs/media/elastoplastic_bunny.mp4">1080p video</a> · <a href="examples/demo/README.md#bunny-elastoplastic-impact">Run demo</a>
 </td>
 </tr>
 </table>
