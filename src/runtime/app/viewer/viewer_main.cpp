@@ -1312,6 +1312,11 @@ int main(int argc, char** argv) {
         stats.debug_contacts = debug_overlay.LastContactCount();
         stats.debug_skipped_shapes = debug_overlay.LastSkippedShapes();
         stats.debug_capacity = viewer::kMaxDebugOverlayInstances;
+        const auto& debug_report = debug_overlay.DrawReport();
+        stats.debug_invalid_colliders = debug_report.invalid_colliders;
+        stats.debug_invalid_contacts = debug_report.invalid_contacts;
+        stats.debug_omitted_instances = debug_report.omitted_instances;
+        stats.debug_contacts_budget_skipped = loaded && debug_report.contacts_budget_skipped;
         stats.debug_colliders_available = loaded && debug_overlay.CollidersAvailable();
         stats.debug_contacts_available = loaded && debug_overlay.ContactsAvailable();
         stats.frame_index   = frame_index;
