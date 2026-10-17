@@ -187,5 +187,6 @@ inline constexpr const char kCaretLeft[] = "\xEE\x84\xB8";
 inline constexpr const char kKeyframe[] = "\xEE\x87\xAC";   // diamond
 inline constexpr const char kGrab[] = "\xEE\x95\xBC";       // hand-grabbing
 inline constexpr const char kPin[] = "\xEE\x8F\xA2";        // push-pin
+inline constexpr const char kFilm[] = "\xEE\x9E\x92";       // film-strip
 
 }  // namespace nuka::render::imgui::icon

@@ -1,16 +1,26 @@
 // The physics thread's history: a keyframe every few ticks, the inputs between them, and the
 // shown environment's poses for the ghost. A seek restores the nearest keyframe and replays.
+// A recording writes one line of it to a file and reads it back.
 
 #include "runtime/app/viewer/physics_worker.hpp"
 
+#include "runtime/app/viewer/editor_profile.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
 namespace nuka::runtime::app::viewer {
 namespace {
+
+namespace json = nuka::scene::json;
 
 // Thinning stops before a gap between keyframes would span more intervals than this.
 constexpr uint64_t kMaxGapIntervals = 64u;
@@ -18,6 +28,125 @@ constexpr uint64_t kMaxGapIntervals = 64u;
 constexpr size_t kTrackSamples = size_t{1} << 16u;
 
 using KeyRef = std::shared_ptr<Keyframe>;
+
+// A recording is a magic and a format number, then chunks of a 4-byte tag, a byte count and the
+// bytes: the JSON manifest, each keyframe, the inputs, the pose samples and the solver records.
+constexpr char kRecordingMagic[8] = {'N', 'K', 'R', 'E', 'C', '\0', '\0', '\0'};
+constexpr uint32_t kRecordingFormat = 1u;
+static_assert(sizeof(math::Transform) == 7u * sizeof(float), "a recorded pose is 7 floats");
+
+template <class T>
+void Put(std::string& out, const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    out.append(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <class T>
+void PutRange(std::string& out, const std::vector<T>& values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    out.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(T));
+}
+
+// Reads back what Put wrote, in order.
+class Cursor {
+public:
+    explicit Cursor(const std::string& bytes) : bytes_(bytes) {}
+    bool Done() const { return at_ == bytes_.size(); }
+    template <class T>
+    T Get() {
+        T value{};
+        std::memcpy(&value, Take(sizeof(T)), sizeof(T));
+        return value;
+    }
+    template <class T>
+    void GetRange(std::vector<T>* out, size_t count) {
+        out->resize(count);
+        const char* from = Take(count * sizeof(T));
+        std::copy_n(from, count * sizeof(T), reinterpret_cast<char*>(out->data()));
+    }
+    std::string Rest() { return std::string(Take(bytes_.size() - at_), bytes_.data() + bytes_.size()); }
+
+private:
+    const char* Take(size_t n) {
+        if (n > bytes_.size() - at_) throw std::runtime_error("the recording is cut short");
+        at_ += n;
+        return bytes_.data() + at_ - n;
+    }
+    const std::string& bytes_;
+    size_t at_ = 0u;
+};
+
+void PutChunk(std::ofstream& out, const char* tag, const std::string& bytes) {
+    const uint64_t size = bytes.size();
+    out.write(tag, 4);
+    out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+// The next chunk; false past the last.
+bool NextChunk(std::ifstream& in, std::string* tag, std::string* bytes) {
+    char name[4];
+    if (!in.read(name, 4)) return false;
+    uint64_t size = 0u;
+    in.read(reinterpret_cast<char*>(&size), sizeof(size));
+    bytes->resize(static_cast<size_t>(size));
+    if (!in.read(bytes->data(), static_cast<std::streamsize>(size))) throw std::runtime_error("the recording is cut short");
+    tag->assign(name, 4);
+    return true;
+}
+
+// The recording at `path`, read up to its first chunk.
+std::ifstream OpenRecording(const std::string& path) {
+    std::ifstream in(Utf8Path(path), std::ios::binary);
+    char magic[8] = {};
+    uint32_t format = 0u;
+    in.read(magic, sizeof(magic));
+    in.read(reinterpret_cast<char*>(&format), sizeof(format));
+    if (!in || std::memcmp(magic, kRecordingMagic, sizeof(magic)) != 0)
+        throw std::runtime_error("'" + path + "' is no Nuka recording");
+    if (format != kRecordingFormat)
+        throw std::runtime_error("'" + path + "' is recording format " + std::to_string(format) + "; this editor reads " +
+                                 std::to_string(kRecordingFormat));
+    return in;
+}
+
+std::string ReadBytes(const std::string& path) {
+    std::ifstream in(Utf8Path(path), std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+void PutInput(std::string& out, const LoggedInput& input) {
+    const TickCommand& c = input.cmd;
+    Put(out, input.tick);
+    Put(out, static_cast<uint8_t>(c.kind));
+    Put(out, static_cast<uint8_t>(c.param));
+    Put(out, static_cast<uint32_t>(c.field));
+    Put(out, static_cast<uint64_t>(c.offset));
+    Put(out, c.index);
+    Put(out, c.element);
+    Put(out, c.env);
+    Put(out, static_cast<uint32_t>(c.values.size()));
+    PutRange(out, c.values);
+    Put(out, c.pose);
+    Put(out, c.perturb);
+}
+
+LoggedInput GetInput(Cursor& in) {
+    LoggedInput input;
+    input.tick = in.Get<uint64_t>();
+    TickCommand& c = input.cmd;
+    c.kind = static_cast<CommandKind>(in.Get<uint8_t>());
+    c.param = static_cast<ParamKind>(in.Get<uint8_t>());
+    c.field = static_cast<nuka_state_field_t>(in.Get<uint32_t>());
+    c.offset = static_cast<size_t>(in.Get<uint64_t>());
+    c.index = in.Get<uint32_t>();
+    c.element = in.Get<uint32_t>();
+    c.env = in.Get<uint32_t>();
+    in.GetRange(&c.values, in.Get<uint32_t>());
+    c.pose = in.Get<PoseWrite>();
+    c.perturb = in.Get<Perturbation>();
+    return input;
+}
 
 }  // namespace
 
@@ -356,6 +485,141 @@ void PhysicsWorker::PublishTimeline(Snapshot& s) {
 void PhysicsWorker::ReadTimeline(TimelineInfo* info) {
     std::lock_guard<std::mutex> lock(timeline_mu_);
     *info = timeline_;
+}
+
+json::Value ReadRecordingManifest(const std::string& path) {
+    std::ifstream in = OpenRecording(path);
+    std::string tag, bytes;
+    NextChunk(in, &tag, &bytes);
+    json::Value manifest = json::Value::Parse(bytes);
+    return manifest;
+}
+
+json::Value PhysicsWorker::SaveHistory(const std::string& path, json::Value manifest, const std::string& scratch) {
+    KeyHead();
+    const HistoryBranch& b = Current();
+    // The line of history runs from the root down, each branch up to where the next one left it.
+    std::vector<const HistoryBranch*> line;
+    for (uint32_t id = branch_; id != kNoBranch; id = branches_.at(id).parent) line.insert(line.begin(), &branches_.at(id));
+    std::string track;
+    uint64_t samples = 0u, last = 0u;
+    for (size_t i = 0u; i < line.size(); ++i) {
+        const uint64_t until = i + 1u < line.size() ? line[i + 1u]->fork_tick : ~uint64_t(0);
+        for (const PoseSample& s : line[i]->track) {
+            if ((samples != 0u && s.tick <= last) || s.tick > until) continue;
+            Put(track, s.tick);
+            Put(track, s.env);
+            Put(track, static_cast<uint32_t>(s.links.size()));
+            Put(track, static_cast<uint32_t>(s.bodies.size()));
+            PutRange(track, s.links);
+            PutRange(track, s.bodies);
+            last = s.tick;
+            ++samples;
+        }
+    }
+    std::string inputs;
+    Put(inputs, static_cast<uint64_t>(b.log.size()));
+    for (const LoggedInput& input : b.log) PutInput(inputs, input);
+    std::string records;
+    uint32_t record_count = 0u;
+    {
+        std::lock_guard<std::mutex> lock(solver_mu_);
+        record_count = static_cast<uint32_t>(solver_log_.size());
+        Put(records, record_count);
+        Put(records, static_cast<uint32_t>(sizeof(nuka_telemetry_record_t)));
+        for (const nuka_telemetry_record_t& r : solver_log_) Put(records, r);
+    }
+    manifest.Set("format", json::Value::Int(kRecordingFormat));
+    manifest.Set("label", json::Value::Str(b.label));
+    manifest.Set("exact", json::Value::Bool(b.exact));
+    manifest.Set("start", json::Value::Int(static_cast<int64_t>(b.keys.front()->tick)));
+    manifest.Set("head", json::Value::Int(static_cast<int64_t>(b.head)));
+    manifest.Set("tick", json::Value::Int(static_cast<int64_t>(tick_)));
+    manifest.Set("dt", json::Value::Float(bind_.dt));
+    manifest.Set("env", json::Value::Int(bind_.env));
+    manifest.Set("envs", json::Value::Int(bind_.layout.env_count));
+    manifest.Set("interval", json::Value::Int(key_interval_));
+    manifest.Set("keyframes", json::Value::Int(static_cast<int64_t>(b.keys.size())));
+    manifest.Set("inputs", json::Value::Int(static_cast<int64_t>(b.log.size())));
+    manifest.Set("samples", json::Value::Int(static_cast<int64_t>(samples)));
+    manifest.Set("records", json::Value::Int(record_count));
+    std::ofstream out(Utf8Path(path), std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot write '" + path + "'");
+    out.write(kRecordingMagic, sizeof(kRecordingMagic));
+    out.write(reinterpret_cast<const char*>(&kRecordingFormat), sizeof(kRecordingFormat));
+    PutChunk(out, "MANI", manifest.Dump());
+    for (const KeyRef& k : b.keys) {
+        CheckResult(nuka_checkpoint_write(k->state, scratch.c_str()), "nuka_checkpoint_write");
+        std::string key;
+        Put(key, k->tick);
+        Put(key, k->sim_time);
+        Put(key, static_cast<uint64_t>(k->log_pos));
+        Put(key, static_cast<uint32_t>(k->pinned));
+        Put(key, static_cast<uint32_t>(k->perturbs.size()));
+        PutRange(key, k->perturbs);
+        PutChunk(out, "KEYF", key + ReadBytes(scratch));
+    }
+    std::filesystem::remove(Utf8Path(scratch));
+    PutChunk(out, "LOGS", inputs);
+    std::string counted;
+    Put(counted, samples);
+    PutChunk(out, "TRAK", counted + track);
+    PutChunk(out, "TELE", records);
+    if (!out.flush()) throw std::runtime_error("cannot write '" + path + "'");
+    return manifest;
+}
+
+void PhysicsWorker::LoadHistory(const std::string& path, const std::string& scratch) {
+    std::ifstream in = OpenRecording(path);
+    std::string tag, bytes;
+    NextChunk(in, &tag, &bytes);
+    const json::Value manifest = json::Value::Parse(bytes);
+    HistoryBranch line;
+    line.label = manifest.At("label").AsString();
+    line.exact = manifest.At("exact").AsBool();
+    line.head = static_cast<uint64_t>(manifest.At("head").AsInt());
+    while (NextChunk(in, &tag, &bytes)) {
+        Cursor at(bytes);
+        if (tag == "KEYF") {
+            auto key = std::make_shared<Keyframe>();
+            key->tick = at.Get<uint64_t>();
+            key->sim_time = at.Get<double>();
+            key->log_pos = static_cast<size_t>(at.Get<uint64_t>());
+            key->pinned = at.Get<uint32_t>() != 0u;
+            at.GetRange(&key->perturbs, at.Get<uint32_t>());
+            std::ofstream(Utf8Path(scratch), std::ios::binary | std::ios::trunc) << at.Rest();
+            CheckResult(nuka_world_checkpoint_read(bind_.world, scratch.c_str(), &key->state), "nuka_world_checkpoint_read");
+            CheckResult(nuka_checkpoint_byte_size(key->state, &key->bytes), "nuka_checkpoint_byte_size");
+            line.keys.push_back(std::move(key));
+        } else if (tag == "LOGS") {
+            for (uint64_t n = at.Get<uint64_t>(); n != 0u; --n) line.log.push_back(GetInput(at));
+        } else if (tag == "TRAK") {
+            for (uint64_t n = at.Get<uint64_t>(); n != 0u; --n) {
+                PoseSample s;
+                s.tick = at.Get<uint64_t>();
+                s.env = at.Get<uint32_t>();
+                const uint32_t links = at.Get<uint32_t>(), bodies = at.Get<uint32_t>();
+                at.GetRange(&s.links, links);
+                at.GetRange(&s.bodies, bodies);
+                line.track.push_back(std::move(s));
+            }
+        }
+    }
+    std::filesystem::remove(Utf8Path(scratch));
+    line.fork_tick = line.keys.front()->tick;
+    branches_.clear();
+    branches_.emplace(0u, std::move(line));
+    branch_ = 0u;
+    next_branch_ = 1u;
+    ghost_ = kNoBranch;
+    key_due_ = false;
+    playing_ = false;
+    step_budget_ = 0u;
+    Current().used = ++switches_;
+    ++history_revision_;
+    Evict();
+    SeekTo(static_cast<uint64_t>(manifest.At("tick").AsInt()));
+    Publish();
 }
 
 }  // namespace nuka::runtime::app::viewer

@@ -285,6 +285,8 @@ struct ViewerUiState {
     std::vector<StagedEdit> staged;
     SolverView solver;
     TimelineInfo timeline;  // the physics thread's history, refreshed every frame
+    bool exporting = false;    // an mp4 export runs
+    float export_done = 0.0f;  // its captured share, negative while ffmpeg encodes
 };
 
 // Per-frame physics and render facts the panels show.

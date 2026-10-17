@@ -1,5 +1,6 @@
 // The Timeline panel: the scrubber over the current branch's recorded ticks with its keyframes
-// and forks, the transport of the history, the branch list with the ghost, and keyframe memory.
+// and forks, the transport of the history, the branch list with the ghost, keyframe memory, and
+// saving, loading and exporting the history.
 
 #include "runtime/app/viewer/imgui_layer.hpp"
 
@@ -81,7 +82,13 @@ void ImGuiLayer::BuildTimeline(nui::VStack& root) {
     transport.Add<nui::IconButton>(icon::kStep, "To the head").Action("timeline.seek", Args({{"to", json::Value::Str("head")}}));
     transport.Add<nui::Button>("Fork", icon::kFork).Action("timeline.fork");
     transport.Add<nui::ToggleButton>("Ghost").Action("timeline.ghost");
+    transport.Add<nui::IconButton>(icon::kSave, "Save the recording").Action("timeline.save");
+    transport.Add<nui::IconButton>(icon::kOpen, "Load a recording").Action("timeline.load");
+    transport.Add<nui::IconButton>(icon::kFilm, "Export an MP4 video").Action("timeline.export");
     transport.visible_if = has_scene;
+    auto& progress = root.Add<nui::ProgressBar>(nui::Bind<float>([this] { return frame_.ui->export_done; }));
+    progress.label = "Exporting video";
+    progress.visible_if = [this] { return frame_.ui->exporting; };
 
     // The scrubber: dragging seeks, so the world replays to the tick under the pointer.
     root.Add<nui::Custom>([this, view] {

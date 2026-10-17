@@ -374,9 +374,9 @@ nuka_result_t nuka_world_checkpoint_capture(nuka_world_handle world,
 nuka_result_t nuka_world_checkpoint_restore(nuka_world_handle world,
                                             nuka_checkpoint_handle checkpoint);
 void nuka_checkpoint_destroy(nuka_checkpoint_handle checkpoint);
-// Writes a checkpoint's persistent physics bytes and step count with the layout hash to a file.
+// Writes a checkpoint to a file with the layout hash: everything it holds but the render sensors' state.
 nuka_result_t nuka_checkpoint_write(nuka_checkpoint_handle checkpoint, const char* path);
-// Reads a written checkpoint into a world of the same layout; host configuration comes from that world.
+// Reads a written checkpoint into a world of the same layout; render sensor state comes from that world.
 nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* path,
                                          nuka_checkpoint_handle* out);
 // The persistent physics bytes a checkpoint holds on the host.

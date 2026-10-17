@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace nuka::c_abi {
@@ -45,7 +46,7 @@ namespace {
 
 constexpr uint64_t kFnvOffset = 14695981039346656037ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
-constexpr uint64_t kCheckpointFileMagic = 0x3130504B43414B4Eull;
+constexpr uint64_t kCheckpointFileMagic = 0x3230504B43414B4Eull;
 
 void HashBytes(uint64_t* hash, const void* bytes, size_t count) {
     const auto* data = static_cast<const uint8_t*>(bytes);
@@ -337,6 +338,101 @@ phi::Status HashHostState(uint64_t* hash, const WorldRecord& record) {
     return phi::Status::Ok;
 }
 
+// A written checkpoint is a header and the persistent bytes, then the host state but the render
+// sensors': step options, articulation host data, state sensors, observations, domain randomization.
+template <typename T>
+void Write(std::ofstream& file, const T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    file.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <typename T>
+void Write(std::ofstream& file, const std::vector<T>& values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    Write(file, uint64_t{values.size()});
+    file.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(T)));
+}
+
+template <typename T>
+void Read(std::ifstream& file, T* value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    file.read(reinterpret_cast<char*>(value), sizeof(T));
+}
+
+template <typename T>
+void Read(std::ifstream& file, std::vector<T>* values) {
+    uint64_t count = 0u;
+    Read(file, &count);
+    values->resize(count);
+    file.read(reinterpret_cast<char*>(values->data()), static_cast<std::streamsize>(values->size() * sizeof(T)));
+}
+
+void WriteHostState(std::ofstream& file, const WorldCheckpointRecord& saved) {
+    Write(file, saved.step_options);
+    Write(file, saved.link_inertia);
+    Write(file, saved.joint_armature);
+    const auto& bank = saved.state_sensors;
+    Write(file, bank.step);
+    Write(file, bank.reset_steps);
+    Write(file, bank.times);
+    Write(file, uint64_t{bank.sensors.size()});
+    for (const auto& sensor : bank.sensors) {
+        Write(file, sensor.desc);
+        Write(file, sensor.active);
+        Write(file, sensor.bytes);
+    }
+    Write(file, uint64_t{saved.observations.size()});
+    for (const auto& [field, observation] : saved.observations) {
+        Write(file, field);
+        Write(file, observation.config);
+        Write(file, observation.env_count);
+        Write(file, observation.values_per_env);
+        Write(file, observation.bytes);
+    }
+    Write(file, saved.dr_config);
+    Write(file, saved.dr_baseline_captured);
+    Write(file, saved.dr_nominal_link_mass);
+    Write(file, saved.dr_nominal_joint_armature);
+    Write(file, saved.dr_nominal_gravity_z);
+    Write(file, saved.dr_nominal_friction);
+}
+
+void ReadHostState(std::ifstream& file, WorldCheckpointRecord* saved) {
+    Read(file, &saved->step_options);
+    Read(file, &saved->link_inertia);
+    Read(file, &saved->joint_armature);
+    auto& bank = saved->state_sensors;
+    Read(file, &bank.step);
+    Read(file, &bank.reset_steps);
+    Read(file, &bank.times);
+    uint64_t count = 0u;
+    Read(file, &count);
+    bank.sensors.resize(count);
+    for (auto& sensor : bank.sensors) {
+        Read(file, &sensor.desc);
+        Read(file, &sensor.active);
+        Read(file, &sensor.bytes);
+    }
+    count = 0u;
+    Read(file, &count);
+    saved->observations.clear();
+    for (; count != 0u && file; --count) {
+        nuka_state_field_t field{};
+        Read(file, &field);
+        auto& observation = saved->observations[field];
+        Read(file, &observation.config);
+        Read(file, &observation.env_count);
+        Read(file, &observation.values_per_env);
+        Read(file, &observation.bytes);
+    }
+    Read(file, &saved->dr_config);
+    Read(file, &saved->dr_baseline_captured);
+    Read(file, &saved->dr_nominal_link_mass);
+    Read(file, &saved->dr_nominal_joint_armature);
+    Read(file, &saved->dr_nominal_gravity_z);
+    Read(file, &saved->dr_nominal_friction);
+}
+
 }  // namespace
 
 }  // namespace nuka::c_abi
@@ -434,6 +530,7 @@ nuka_result_t nuka_checkpoint_write(nuka_checkpoint_handle checkpoint, const cha
         file.write(reinterpret_cast<const char*>(header), sizeof(header));
         file.write(reinterpret_cast<const char*>(saved->persistent.data()),
                    static_cast<std::streamsize>(saved->persistent.size()));
+        nuka::c_abi::WriteHostState(file, *saved);
         return file.good() ? NUKA_RESULT_OK : NUKA_RESULT_INTERNAL;
     } catch (const std::bad_alloc&) {
         return NUKA_RESULT_OUT_OF_MEMORY;
@@ -464,9 +561,10 @@ nuka_result_t nuka_world_checkpoint_read(nuka_world_handle world, const char* pa
         checkpoint->persistent.resize(header[3]);
         file.read(reinterpret_cast<char*>(checkpoint->persistent.data()),
                   static_cast<std::streamsize>(header[3]));
-        if (!file.good()) return NUKA_RESULT_INVALID_ARG;
         const auto status = nuka::c_abi::CopyHostState(*record, checkpoint.get());
         if (status != nuka::phi::Status::Ok) return nuka::c_abi::MapStatusToResult(status);
+        nuka::c_abi::ReadHostState(file, checkpoint.get());
+        if (!file.good()) return NUKA_RESULT_INVALID_ARG;
         checkpoint->simulated_step_count = static_cast<uint32_t>(header[2]);
         *out = nuka::c_abi::CheckpointTable().Insert(std::move(checkpoint));
         return *out == nullptr ? NUKA_RESULT_INTERNAL : NUKA_RESULT_OK;

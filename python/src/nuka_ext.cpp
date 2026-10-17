@@ -2183,7 +2183,7 @@ NB_MODULE(_nuka_ext, m) {
     nb::class_<StateCheckpoint>(m, "StateCheckpoint")
         .def("close", &StateCheckpoint::close, "Destroy the checkpoint handle.")
         .def("write", &StateCheckpoint::write, nb::arg("path"),
-             "Write the persistent physics bytes and step count to a file.")
+             "Write the checkpoint to a file; everything but the render sensors' state.")
         .def("__enter__", [](StateCheckpoint& checkpoint) -> StateCheckpoint& {
             return checkpoint;
         }, nb::rv_policy::reference)
@@ -2375,7 +2375,7 @@ NB_MODULE(_nuka_ext, m) {
              "link-inertia/armature mirror.")
         .def("read_checkpoint", &World::read_checkpoint, nb::arg("path"),
              nb::rv_policy::take_ownership,
-             "Read a written checkpoint for this world's layout; host configuration "
+             "Read a written checkpoint for this world's layout; render sensor state "
              "comes from this world. Apply it with restore_checkpoint.")
         .def("state_hash", &World::state_hash,
              "Return the deterministic 64-bit hash of the world: persistent "

@@ -12,6 +12,7 @@
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/timeline_view.hpp"
 #include "runtime/inference/world_controller.hpp"
+#include "scene/format/json.hpp"
 
 #include <array>
 #include <atomic>
@@ -246,6 +247,9 @@ struct WorkerBinding {
     double sim_time = 0.0;
 };
 
+// The JSON manifest a recording starts with; throws when `path` holds no recording.
+scene::json::Value ReadRecordingManifest(const std::string& path);
+
 class PhysicsWorker {
 public:
     explicit PhysicsWorker(ScriptHost* scripts) : scripts_(scripts) {}
@@ -271,6 +275,12 @@ public:
     // returns its epoch.
     uint64_t Bind(WorkerBinding binding);
     void Unbind();
+    // Exclusive sections only. Writes the current branch's line of history to `path` after
+    // `manifest`, which comes back with the history's own fields; keyframes pass through `scratch`.
+    scene::json::Value SaveHistory(const std::string& path, scene::json::Value manifest, const std::string& scratch);
+    // Exclusive sections only. The recording at `path` becomes the whole history, one branch,
+    // and the playhead returns to where it was saved.
+    void LoadHistory(const std::string& path, const std::string& scratch);
     double SimTime() const { return sim_time_; }
     // The last finished tick; readable from any thread.
     uint64_t Tick() const { return tick_mirror_.load(std::memory_order_relaxed); }

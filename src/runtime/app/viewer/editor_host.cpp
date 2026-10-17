@@ -691,6 +691,12 @@ uint64_t Fnv1a(const std::string& bytes, uint64_t hash = 14695981039346656037ull
     return hash;
 }
 
+std::string Hex(uint64_t value) {
+    char text[17];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
 // The most recent samples of one frame timing.
 struct SampleWindow {
     std::vector<double> values;
@@ -744,6 +750,10 @@ struct EditorHost::State : DocumentHost {
     void RegisterSolverActions();
     void RegisterTimelineActions();
     json::Value TimelineStatus();
+    // What a recording must match to load: the document, the world's counts and step, and the
+    // names of the link and body rows its poses fill.
+    json::Value RecordingIdentity();
+    void StepVideo();
     void ConfigureExtensions();
     void Queue(const std::string& id, json::Value args, const std::string& source);
     void RunQueuedActions();
@@ -873,6 +883,21 @@ struct EditorHost::State : DocumentHost {
         uint64_t frame = 0u;
     };
     std::optional<ThumbRequest> thumb_;
+    // An mp4 export: each frame seeks the playhead to its tick and captures the viewport once the
+    // seek shows; ffmpeg then encodes the frames.
+    struct VideoExport {
+        std::string path;
+        std::string frames;  // the folder of captured frames
+        std::vector<uint64_t> ticks;
+        double fps = 30.0;
+        uint64_t back = 0u;         // the playhead to return to
+        size_t next = 0u;           // the frame in progress
+        uint64_t seek = 0u;         // its seek, 0 until sent
+        uint64_t capture = ~0ull;   // the drawn frame capturing it
+        uint64_t encoder = 0u;      // ffmpeg's process
+    };
+    std::optional<VideoExport> video_;
+    json::Value exported_;  // the last export's path and frames, with an error when it failed
     std::unique_ptr<ThumbnailCache> thumbnails_;  // asset and example pictures
     uint64_t start_thumb_version_ = 0u;
     std::vector<AssetFile> asset_files_;
@@ -1834,6 +1859,7 @@ void EditorHost::State::OnRebound(uint64_t tick, double sim_time) {
     SeedDriveTargets();
     BindWorker(tick, sim_time);
     grab_.reset();
+    video_.reset();
     hidden_meshes_.clear();
     hidden_stale_ = true;
 }
@@ -3288,7 +3314,87 @@ json::Value EditorHost::State::TimelineStatus() {
                    {"keyframes", json::Value::Int(t.keyframes)},
                    {"bytes", json::Value::Int(static_cast<int64_t>(t.bytes))},
                    {"budget_mb", json::Value::Float(static_cast<double>(t.budget) / 1048576.0)},
-                   {"applied", json::Value::Bool(shown_ != nullptr && shown_->acked >= timeline_seq_)}});
+                   {"applied", json::Value::Bool(shown_ != nullptr && shown_->acked >= timeline_seq_)},
+                   {"export", !video_ ? json::Value::Null()
+                                      : Object({{"path", json::Value::Str(video_->path)},
+                                                {"frame", json::Value::Int(static_cast<int64_t>(video_->next))},
+                                                {"frames", json::Value::Int(static_cast<int64_t>(video_->ticks.size()))},
+                                                {"encoding", json::Value::Bool(video_->encoder != 0u)}})},
+                   {"exported", exported_}});
+}
+
+json::Value EditorHost::State::RecordingIdentity() {
+    const WorldLayout& l = loaded_->Layout();
+    const std::string counts = Format("%u %u %u %u %u %u %.9g", l.env_count, l.links_per_env, l.bodies_per_env,
+                                      l.articulations_per_env, l.dofs_per_env, l.particles_per_env,
+                                      static_cast<double>(opt_.dt));
+    std::vector<std::string> links(l.links_per_env), bodies(l.bodies_per_env);
+    for (const render::RenderInstance& inst : loaded_->sim->GetRenderWorld().instances) {
+        const bool link = inst.pose_source.kind == render::PoseSource::Kind::Link;
+        std::vector<std::string>& rows = link ? links : bodies;
+        if ((link || inst.pose_source.kind == render::PoseSource::Kind::Body) && inst.pose_source.row < rows.size())
+            rows[inst.pose_source.row] = PathOfEntity(CarrierOf(loaded_->scene, inst.entity));
+    }
+    const auto names = [](const std::vector<std::string>& rows) {
+        json::Value list = json::Value::Array();
+        for (const std::string& name : rows) list.PushBack(json::Value::Str(name));
+        return list;
+    };
+    return Object({{"scene", json::Value::Str(Hex(DocumentHash()))},
+                   {"layout", json::Value::Str(Hex(Fnv1a(counts)))},
+                   {"links", names(links)},
+                   {"bodies", names(bodies)}});
+}
+
+// One step of an mp4 export a frame: seek the next frame's tick, capture the viewport once the
+// seek shows, then hand the frames to ffmpeg and wait for it to finish.
+void EditorHost::State::StepVideo() {
+    VideoExport& v = *video_;
+    const auto frame = [&v](size_t i) { return Format("%s/f%05zu.ppm", v.frames.c_str(), i); };
+    const auto finish = [this, &v](const std::string& error) {
+        exported_ = Object({{"path", json::Value::Str(v.path)},
+                            {"frames", json::Value::Int(static_cast<int64_t>(v.ticks.size()))},
+                            {"error", json::Value::Str(error)}});
+        if (error.empty()) {
+            fs::remove_all(Utf8Path(v.frames));
+            ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Video exported")) + " " + FileName(v.path));
+        } else {
+            Emit(stderr, "[nuka_editor] video export failed: " + error + "\n");
+            ui_.Nui().Toast(nui::Level::Err, std::string(nui::Tr("Video export failed")) + ": " + error);
+        }
+        video_.reset();
+    };
+    if (v.encoder != 0u) {
+        if (ProcessAlive(static_cast<uint32_t>(v.encoder))) return;
+        std::error_code ec;
+        const uintmax_t size = fs::file_size(Utf8Path(v.path), ec);
+        finish(!ec && size > 0u ? std::string() : "ffmpeg made no video of the frames in " + v.frames);
+        return;
+    }
+    if (v.capture != ~0ull) {
+        if (present_->SubmittedFrames() <= v.capture) return;
+        if (!fs::exists(Utf8Path(frame(v.next)))) return finish("the viewport was hidden");
+        v.capture = ~0ull;
+        if (++v.next == v.ticks.size()) {
+            RunAction("timeline.seek", Object({{"tick", json::Value::Int(static_cast<int64_t>(v.back))}}), "export");
+            std::string error;
+            v.encoder = SpawnDetached({"ffmpeg", "-y", "-loglevel", "error", "-framerate", Format("%g", v.fps), "-i",
+                                       v.frames + "/f%05d.ppm", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-c:v",
+                                       "libx264", "-pix_fmt", "yuv420p", v.path},
+                                      &error);
+            if (v.encoder == 0u) finish(error + "; mp4 export runs ffmpeg from the PATH");
+            return;
+        }
+    }
+    if (v.seek == 0u) {
+        RunAction("timeline.seek", Object({{"tick", json::Value::Int(static_cast<int64_t>(v.ticks[v.next]))}}), "export");
+        v.seek = timeline_seq_;
+        return;
+    }
+    if (shown_ == nullptr || shown_->acked < v.seek) return;
+    v.seek = 0u;
+    v.capture = present_->SubmittedFrames();
+    present_->SetSceneCaptureFrame(static_cast<int>(v.capture), frame(v.next));
 }
 
 void EditorHost::State::RegisterTimelineActions() {
@@ -3378,6 +3484,75 @@ void EditorHost::State::RegisterTimelineActions() {
                       return Ok(Object({{"hash", json::Value::Str(text)},
                                         {"tick", json::Value::Int(static_cast<int64_t>(worker_.Tick()))}}));
                   }});
+    // The current branch's line of history with what it plays in; the dialog asks without `path`.
+    actions_.Add({"timeline.save", "Save Recording...", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = SaveFileDialog(nui::Tr("Save Recording"), nui::Tr("Nuka recordings"), "*.nkrec",
+                                                "recording.nkrec");
+                      if (path.empty()) return ActionResult::Fail("no recording path chosen");
+                      json::Value manifest = RecordingIdentity();
+                      worker_.Exclusive([&] {
+                          manifest = worker_.SaveHistory(path, std::move(manifest), cache_.File("keyframe.ckpt"));
+                      });
+                      ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Recording saved")) + " " + FileName(path));
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"start", manifest.At("start")},
+                                        {"head", manifest.At("head")},
+                                        {"keyframes", manifest.At("keyframes")},
+                                        {"inputs", manifest.At("inputs")}}));
+                  }});
+    // A recording of this document and world layout becomes the history, back where it was saved.
+    actions_.Add({"timeline.load", "Load Recording...", "timeline", "", ShortcutScope::Global, has_scene, {},
+                  [this, pause](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = OpenFileDialog(nui::Tr("Load Recording"), nui::Tr("Nuka recordings"), "*.nkrec");
+                      if (path.empty()) return ActionResult::Fail("no recording chosen");
+                      const json::Value manifest = ReadRecordingManifest(path);
+                      const json::Value here = RecordingIdentity();
+                      if (manifest.At("scene").AsString() != here.At("scene").AsString())
+                          return ActionResult::Fail("'" + FileName(path) + "' records another scene");
+                      if (manifest.At("layout").AsString() != here.At("layout").AsString())
+                          return ActionResult::Fail("'" + FileName(path) + "' records another world layout");
+                      pause();
+                      worker_.Exclusive([&] { worker_.LoadHistory(path, cache_.File("keyframe.ckpt")); });
+                      ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Recording loaded")) + " " + FileName(path));
+                      return Ok(Object({{"path", json::Value::Str(path)},
+                                        {"start", manifest.At("start")},
+                                        {"head", manifest.At("head")},
+                                        {"tick", manifest.At("tick")}}));
+                  }});
+    // An mp4 of ticks `from` to `to` (the start and head) at `fps` frames a simulated second, drawn
+    // by the viewport and encoded by ffmpeg from the PATH; timeline.status reports its progress.
+    actions_.Add({"timeline.export", "Export Video...", "timeline", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr && !video_; }, {},
+                  [this](const json::Value& args) {
+                      const TimelineInfo& t = ui_state_.timeline;
+                      const double fps = NumArg(args, "fps", 30.0);
+                      const double from = NumArg(args, "from", static_cast<double>(t.start));
+                      const double to = NumArg(args, "to", static_cast<double>(t.head));
+                      if (!(fps > 0.0) || from < static_cast<double>(t.start) || to > static_cast<double>(t.head) || from > to)
+                          return ActionResult::Fail("fps: positive; from, to: ticks between the start and the head");
+                      if (!ui_.Viewport().Valid()) return ActionResult::Fail("the viewport is hidden");
+                      std::string path = StrArg(args, "path");
+                      if (path.empty()) path = SaveFileDialog(nui::Tr("Export Video"), nui::Tr("Videos"), "*.mp4", "recording.mp4");
+                      if (path.empty()) return ActionResult::Fail("no video path chosen");
+                      VideoExport v;
+                      v.path = path;
+                      v.fps = fps;
+                      v.back = t.tick;
+                      v.frames = cache_.File("video");
+                      fs::remove_all(Utf8Path(v.frames));
+                      fs::create_directories(Utf8Path(v.frames));
+                      const double stride = std::max(1.0, 1.0 / (fps * static_cast<double>(opt_.dt)));
+                      for (double at = from; at <= to; at += stride) v.ticks.push_back(static_cast<uint64_t>(std::llround(at)));
+                      const size_t frames = v.ticks.size();
+                      video_ = std::move(v);
+                      exported_ = json::Value::Null();
+                      return Ok(Object({{"path", json::Value::Str(path)}, {"frames", json::Value::Int(static_cast<int64_t>(frames))}}));
+                  }});
 }
 
 // FNV-1a of the document saved as NKS: equal documents hash equal.
@@ -3462,6 +3637,7 @@ void EditorHost::State::ApplyUnload() {
     loaded_.reset();
     hidden_meshes_.clear();
     grab_.reset();
+    video_.reset();
     ui_state_.held.clear();
     ui_state_.solver.marked = false;
     debug_overlay_.Reset();
@@ -4017,6 +4193,12 @@ void EditorHost::State::Frame(bool step_physics) {
                                ui_state_.show_contacts);
     apply_ms += Ms(Clock::now() - overlay_t0);
 
+    if (video_) StepVideo();
+    ui_state_.exporting = video_.has_value();
+    ui_state_.export_done = !video_ ? 0.0f
+                            : video_->encoder != 0u
+                                ? -1.0f
+                                : static_cast<float>(video_->next) / static_cast<float>(video_->ticks.size());
     const auto draw_t0 = Clock::now();
     DrawWorld(render_world, opts);
     const double draw_ms = Ms(Clock::now() - draw_t0);
