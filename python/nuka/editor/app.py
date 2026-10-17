@@ -5,6 +5,8 @@ from __future__ import annotations
 import atexit
 import builtins
 import json
+import os
+import sys
 import weakref
 from typing import Callable, List, Optional, Sequence
 
@@ -111,6 +113,31 @@ class ActionError(RuntimeError):
     """An editor action failed; the message carries the editor's reason."""
 
 
+class EditorStartupError(RuntimeError):
+    """The editor could not start; the message names the reason and the session log."""
+
+
+def _ext():
+    try:
+        from nuka import _editor_ext
+    except ImportError as error:
+        raise ImportError("this nuka build has no editor (NK_BUILD_EDITOR=OFF); "
+                          "use --headless or launch(..., headless=True)") from error
+    return _editor_ext
+
+
+def relaunch_command() -> List[str]:
+    """The command that starts another editor like this one: the app, or this interpreter."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "nuka.editor"]
+
+
+def forward(args: Sequence[str]) -> bool:
+    """Hand the scene in args to the editor already open on the same profile; False when none is."""
+    return _ext().forward(list(args))
+
+
 class Actions:
     """The editor's commands, the same ones its menus, buttons and shortcuts run."""
 
@@ -142,20 +169,22 @@ class EditorApp:
 
     def __init__(self, args: Sequence[str] = (), world=None, scene: Optional[str] = None,
                  dt: Optional[float] = None):
-        try:
-            from nuka import _editor_ext
-        except ImportError as error:
-            raise ImportError("this nuka build has no editor (NK_BUILD_EDITOR=OFF); "
-                              "use --headless or launch(..., headless=True)") from error
-        argv = ([scene] if scene else []) + list(args)
+        _editor_ext = _ext()
+        argv = ([scene] if scene else []) + list(args) + ["--relaunch", json.dumps(relaunch_command())]
+        # A script's world: New and Open start editors of their own, the title names the script.
+        if world is not None:
+            argv += ["--script-name", os.path.basename(sys.argv[0]) or "python"]
         if dt is None:
             dt = world.dt if world is not None else 0.0
         self._world = world
         self._borrowed = None
         self._runner = ScriptRunner(self)
         self._extensions = ExtensionLoader(weakref.proxy(self))
-        self._native = _editor_ext.App(argv, world.handle if world is not None else 0, dt, self._runner,
-                                       self._extensions)
+        try:
+            self._native = _editor_ext.App(argv, world.handle if world is not None else 0, dt, self._runner,
+                                           self._extensions)
+        except RuntimeError as error:
+            raise EditorStartupError(str(error)) from None
         self.actions = Actions(self)
         self.ui = UI(weakref.proxy(self))
         atexit.register(self.close)

@@ -5,6 +5,7 @@
 #include "imgui.h"
 // The SDL3 platform backend feeds ImGui input, IME and cursors; imgui_impl_vulkan draws.
 #include "backends/imgui_impl_sdl3.h"
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_video.h>
 
 #include "nuka/nuka_scene.h"
@@ -20,6 +21,8 @@
 #include "runtime/app/viewer/editor_document.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"
 #include "runtime/app/viewer/editor_extensions.hpp"
+#include "runtime/app/viewer/editor_instance.hpp"
+#include "runtime/app/viewer/editor_profile.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
 #include "runtime/app/viewer/entity_drag.hpp"
 #include "runtime/app/viewer/file_dialog.hpp"
@@ -35,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -44,11 +48,13 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -60,6 +66,7 @@ namespace {
 
 namespace window = nuka::render::window;
 namespace json = nuka::scene::json;
+namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
 constexpr float kDefaultDt = 1.0f / 240.0f;
@@ -76,6 +83,9 @@ constexpr uint32_t kPoseSlotsBeyondFrames = 3u;
 // A pace ceiling against busy-spinning; FIFO present caps at the display refresh.
 constexpr double kFrameBudgetSeconds = 1.0 / 240.0;
 constexpr float kPi = 3.14159265358979323846f;
+constexpr double kAutosaveSeconds = 60.0;
+// Logs beyond this many, oldest first, are deleted at startup.
+constexpr size_t kLogKeep = 20u;
 
 struct LaunchOptions {
     std::string scene_path;
@@ -126,7 +136,29 @@ struct LaunchOptions {
     std::string locale;
     std::vector<std::string> ext_ids;
     std::vector<std::string> ext_folders;
+    std::string profile;
+    std::string log_path;
+    std::vector<std::string> relaunch;  // the command that starts another editor of this kind
+    std::string new_template;
+    std::string script_name;
+    bool primary = false;  // listen for the files later launches hand over
 };
+
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+std::string Format(const char* format, ...) {
+    va_list args;
+    va_list sizing;
+    va_start(args, format);
+    va_copy(sizing, args);
+    const int n = std::vsnprintf(nullptr, 0, format, sizing);
+    va_end(sizing);
+    std::string out(static_cast<size_t>(n), '\0');
+    std::vsnprintf(out.data(), out.size() + 1u, format, args);
+    va_end(args);
+    return out;
+}
 
 bool ReadEntireFile(const std::string& path, std::string* out) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -148,6 +180,54 @@ std::string FileName(const std::string& path) {
     return slash == std::string::npos ? path : path.substr(slash + 1u);
 }
 
+// A file of the editor's resources beside the library, else in the source tree.
+std::string Resource(const std::string& relative) {
+    return render::ViewerResource(relative.c_str(), (std::string(NUKA_EDITOR_SOURCE_DIR) + "/" + relative).c_str());
+}
+
+// The note beside an autosave: the document's own path, the writing process and the time.
+fs::path SidecarOf(const std::string& autosave) { return Utf8Path(autosave).replace_extension(".json"); }
+
+constexpr int kThumbWidth = 320;
+constexpr int kThumbHeight = 180;
+
+// Crops the largest centered 16:9 window out of a captured viewport and box-filters it to
+// kThumbWidth x kThumbHeight.
+void WriteThumbnail(const std::string& capture, const fs::path& out) {
+    std::ifstream in(Utf8Path(capture), std::ios::binary);
+    std::string magic;
+    int width = 0, height = 0, depth = 0;
+    in >> magic >> width >> height >> depth;
+    in.get();
+    std::vector<unsigned char> rgb(static_cast<size_t>(width) * static_cast<size_t>(height) * 3u);
+    in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+    int cw = width, ch = width * kThumbHeight / kThumbWidth;
+    if (ch > height) {
+        ch = height;
+        cw = height * kThumbWidth / kThumbHeight;
+    }
+    const int x0 = (width - cw) / 2;
+    const int y0 = (height - ch) / 2;
+    std::string pixels(static_cast<size_t>(kThumbWidth * kThumbHeight * 3), '\0');
+    for (int ty = 0; ty < kThumbHeight; ++ty) {
+        const int sy0 = y0 + ty * ch / kThumbHeight, sy1 = std::max(sy0 + 1, y0 + (ty + 1) * ch / kThumbHeight);
+        for (int tx = 0; tx < kThumbWidth; ++tx) {
+            const int sx0 = x0 + tx * cw / kThumbWidth, sx1 = std::max(sx0 + 1, x0 + (tx + 1) * cw / kThumbWidth);
+            unsigned sum[3] = {0u, 0u, 0u};
+            for (int sy = sy0; sy < sy1; ++sy)
+                for (int sx = sx0; sx < sx1; ++sx)
+                    for (int c = 0; c < 3; ++c)
+                        sum[c] += rgb[(static_cast<size_t>(sy) * static_cast<size_t>(width) + static_cast<size_t>(sx)) * 3u +
+                                      static_cast<size_t>(c)];
+            const unsigned n = static_cast<unsigned>((sy1 - sy0) * (sx1 - sx0));
+            for (int c = 0; c < 3; ++c)
+                pixels[static_cast<size_t>((ty * kThumbWidth + tx) * 3 + c)] = static_cast<char>(sum[c] / n);
+        }
+    }
+    std::ofstream file(out, std::ios::binary | std::ios::trunc);
+    file << "P6\n" << kThumbWidth << " " << kThumbHeight << "\n255\n" << pixels;
+}
+
 void PrintUsage() {
     std::printf("usage: nuka-editor [scene.nks] [--policy <bin>] [--play] [--frames N] [--dt SECONDS]\n"
                 "  [--offscreen] [--cam tx,ty,tz,dist,yaw_deg,pitch_deg]\n"
@@ -164,7 +244,10 @@ void PrintUsage() {
                 "  [--layout authoring|debug|robot|data|training picks the panel layout; --ui-scale X]\n"
                 "  [--locale en|zh-CN picks the UI language]\n"
                 "  [--ext ID enables an installed extension; --ext-folder DIR adds a search folder]\n"
-                "  default -> Nuka Dynamics Lab; --empty opens a blank workspace\n"
+                "  [--profile DIR holds settings, recent scenes, logs and autosaves; --log FILE]\n"
+                "  [--template empty|ground starts a new scene; --new-window skips the open editor]\n"
+                "  [--console shows a console window for the application's output]\n"
+                "  no scene -> the start page; --empty opens a blank workspace\n"
                 "  --offscreen renders to a display-less surface\n"
                 "  --policy attaches a trained locomotion controller to each load\n"
                 "  --host-policy runs the host MLP round-trip instead of the GPU path (A/B)\n"
@@ -247,6 +330,15 @@ bool ParseOptions(const std::vector<std::string>& args, LaunchOptions* opt) {
         else if (a == "--locale" && has_value) opt->locale = args[++i];
         else if (a == "--ext" && has_value) opt->ext_ids.push_back(args[++i]);
         else if (a == "--ext-folder" && has_value) opt->ext_folders.push_back(args[++i]);
+        else if (a == "--profile" && has_value) opt->profile = args[++i];
+        else if (a == "--log" && has_value) opt->log_path = args[++i];
+        else if (a == "--template" && has_value) opt->new_template = args[++i];
+        else if (a == "--script-name" && has_value) opt->script_name = args[++i];
+        else if (a == "--primary") opt->primary = true;
+        else if (a == "--relaunch" && has_value) {
+            const json::Value command = json::Value::Parse(args[++i]);
+            for (const json::Value& part : command.Elements()) opt->relaunch.push_back(part.AsString());
+        }
         else if (a == "--help") {
             PrintUsage();
             return false;
@@ -432,6 +524,9 @@ struct EditorHost::State : DocumentHost {
     State(const std::vector<std::string>& args, nuka_world_handle world, float dt);
     ~State() override;
 
+    void OpenLog();
+    void StartShell();
+    void StartChecks();
     void PushParam(const ParamWrite& write) override;
     bool Rebuild(const std::string& label) override;
     void ScriptsChanged() override { SyncScripts(); }
@@ -444,6 +539,7 @@ struct EditorHost::State : DocumentHost {
 
     void RegisterActions();
     void RegisterFileActions();
+    void RegisterAppActions();
     void RegisterEditActions();
     void RegisterSimActions();
     void RegisterViewActions();
@@ -452,10 +548,26 @@ struct EditorHost::State : DocumentHost {
     void RunQueuedActions();
     ActionResult RunAction(const std::string& id, const json::Value& args, const std::string& source);
     ActionResult SaveScene(const std::string& path);
+    ActionResult OpenDocument(const std::string& file, const std::string& doc_path);
+    bool Confirmed(const std::string& id, const json::Value& args, ActionResult* asked);
+    ActionResult Spawn(const std::vector<std::string>& args);
+    std::string DocTitle() const { return doc_path_.empty() ? std::string("untitled") : FileName(doc_path_); }
+    // A script session is named after its script; the start page shows while the editor's own
+    // session has no scene.
+    std::string SessionTitle() const {
+        return !borrowed_ ? DocTitle() : opt_.script_name.empty() ? std::string("script") : FileName(opt_.script_name);
+    }
+    bool StartShown() const { return !loaded_ && !borrowed_ && !opt_.empty_requested; }
+    void Autosave();
+    void DropAutosave();
+    void RefreshStartPage();
     std::string SelectedPath() const { return PathOfEntity(ui_state_.selected_entity); }
     const render::RenderWorld& ShownWorld() const { return loaded_ ? loaded_->sim->GetRenderWorld() : empty_world_; }
 
     void Frame(bool step_physics);
+    // Editor output goes to `stream` and the session log, and with `console` to the Console panel.
+    void Emit(std::FILE* stream, const std::string& text, bool console = false);
+    void WriteLog(const std::string& text);
     void ConsoleAppend(const std::string& s);
     void DrainConsoleInbox();
     void SetHooks(const nuka_editor_script_hooks_t& hooks);
@@ -487,6 +599,11 @@ struct EditorHost::State : DocumentHost {
     LaunchOptions opt_;
     nuka_world_handle world_ = nullptr;
     nuka_device_handle device_ = nullptr;  // set when the editor created the world
+    const bool borrowed_;                  // the host's script owns the world
+    std::optional<EditorProfile> profile_;
+    std::ofstream log_;
+    std::string log_path_;
+    std::unique_ptr<InstanceServer> instance_;
     SceneCache cache_;
     render::RenderWorld empty_world_;
     std::unique_ptr<inference::Go2PolicyController> policy_ctrl_;
@@ -497,6 +614,30 @@ struct EditorHost::State : DocumentHost {
 
     // Edits preview live; a gesture's commit queues one edit.apply for the next frame top.
     EditorDocument doc_;
+    std::string doc_path_;  // the file the document saves to; empty while untitled
+    // An action that would drop unsaved changes waits here for the answer.
+    struct Prompt {
+        std::string action;
+        json::Value args;
+    };
+    std::optional<Prompt> prompt_;
+    // A Save answer resumes its action once the frame showing the saved scene is captured.
+    std::optional<Prompt> resume_;
+    std::string autosave_file_;
+    Clock::time_point autosave_due_{};
+    uint64_t autosaved_revision_ = 0u;
+    double autosave_seconds_ = kAutosaveSeconds;
+    std::vector<StartEntry> checks_;     // startup checks reported through app.check
+    std::vector<std::string> dropped_;  // files dropped on the window since the last frame
+    std::string start_locale_;          // persisted on exit once the user switched languages
+    bool start_stale_ = true;           // the start page lists need a refresh
+    // A save's viewport picture, captured without the UI from the next drawn frame.
+    struct ThumbRequest {
+        std::string scene;
+        std::string capture;
+        uint64_t frame = 0u;
+    };
+    std::optional<ThumbRequest> thumb_;
     ActionRegistry actions_;
     uint64_t param_seq_ = 0u;  // the last registry write and the ticks it was queued and applied at
     uint64_t param_pushed_tick_ = 0u;
@@ -572,7 +713,7 @@ struct EditorHost::State : DocumentHost {
 };
 
 EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle world, float dt)
-    : world_(world) {
+    : world_(world), borrowed_(world != nullptr) {
     if (dt > 0.0f) {
         opt_.dt = dt;
         opt_.dt_set = true;
@@ -581,13 +722,55 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
         running_ = false;
         return;
     }
-    if (opt_.scene_path.empty() && !opt_.empty_requested && world_ == nullptr)
-        opt_.scene_path = render::ViewerResource("examples/assets/nuka_lab/gripper.nks", NUKA_VIEWER_DEFAULT_SCENE);
+    profile_.emplace(opt_.profile);
+    OpenLog();
+    if (opt_.locale.empty()) opt_.locale = profile_->Setting("ui", "locale", "");
+    autosave_seconds_ = profile_->SettingNumber("editor", "autosave_seconds", kAutosaveSeconds);
+    autosave_file_ = PathText(profile_->Dir() / "autosave" /
+                              (std::to_string(UnixNow()) + "-" + std::to_string(ProcessId()) + ".nks"));
     if (const char* env = std::getenv("NUKA_VIEWER_FRAMES")) opt_.max_frames = std::atoi(env);
     // The trained control rate is 0.005 s; an explicit dt always wins.
     if (!opt_.dt_set && !opt_.policy_path.empty()) opt_.dt = 0.005f;
     if (!(opt_.dt > 0.0f)) throw std::runtime_error("invalid --dt (must be > 0)");
+    // The failure reaches the user as a dialog or EditorStartupError, so it names the log.
+    try {
+        StartShell();
+    } catch (const std::exception& e) {
+        Emit(stderr, std::string("[nuka_editor] startup failed: ") + e.what() + "\n");
+        throw std::runtime_error(std::string(e.what()) + "\nlog: " + log_path_);
+    }
+    if (opt_.primary && !borrowed_) instance_ = std::make_unique<InstanceServer>(profile_->InstanceName());
+    ui_state_.script_session = borrowed_;
+    ui_state_.script_name = opt_.script_name;
 
+    // Loads run inside a frame, once the shell is up and the host installed its hooks.
+    if (!opt_.scene_path.empty()) Queue("file.open", Object({{"path", json::Value::Str(opt_.scene_path)}}), "cli");
+    else if (!opt_.new_template.empty())
+        Queue("file.new", Object({{"template", json::Value::Str(opt_.new_template)}}), "cli");
+    else attach_pending_ = borrowed_;
+    Emit(stdout, Format("[nuka_editor] backend=%s device=%s images=%u\n", present_->Report().backend_name.c_str(),
+                        present_->DeviceName().c_str(), present_->SwapchainImageCount()));
+}
+
+// One log per session in the profile; the oldest beyond kLogKeep are deleted.
+void EditorHost::State::OpenLog() {
+    const fs::path logs = profile_->Dir() / "logs";
+    std::vector<fs::path> old;
+    for (const fs::directory_entry& entry : fs::directory_iterator(logs))
+        if (entry.path().extension() == ".log") old.push_back(entry.path());
+    std::sort(old.begin(), old.end());
+    for (size_t i = 0; i + kLogKeep <= old.size(); ++i) fs::remove(old[i]);
+    log_path_ = opt_.log_path.empty()
+                    ? PathText(logs / ("editor-" + LocalTimeText(UnixNow(), "%Y%m%d-%H%M%S") + "-" +
+                                       std::to_string(ProcessId()) + ".log"))
+                    : NormalPath(opt_.log_path);
+    log_.open(Utf8Path(log_path_), std::ios::binary | std::ios::app);
+    nuka_version_t version = nuka_get_version();
+    WriteLog(Format("[nuka_editor] nuka %u.%u.%u, profile %s\n", version.major, version.minor, version.patch,
+                    PathText(profile_->Dir()).c_str()));
+}
+
+void EditorHost::State::StartShell() {
     window::SurfaceBackendKind kind = window::SurfaceBackendKind::Headless;
     std::unique_ptr<window::WindowSurface> surface =
         opt_.offscreen ? window::MakeHeadlessSurface(1280u, 720u)
@@ -595,10 +778,13 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
     if (!surface || kind == window::SurfaceBackendKind::None)
         throw std::runtime_error("no window surface: no SDL video driver and no VK_EXT_headless_surface");
 
-    // Bind the native window and route its events to ImGui before the renderer takes the surface.
+    // Bind the native window and route its events to ImGui before the renderer takes the surface;
+    // dropped files open at the next frame.
     native_window_ = surface->NativeWindowHandle();
-    surface->SetNativeEventHook([](const void* event) {
-        if (ImGui::GetCurrentContext() != nullptr) ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event*>(event));
+    surface->SetNativeEventHook([this](const void* event) {
+        const SDL_Event* e = static_cast<const SDL_Event*>(event);
+        if (e->type == SDL_EVENT_DROP_FILE && e->drop.data != nullptr) dropped_.emplace_back(e->drop.data);
+        if (ImGui::GetCurrentContext() != nullptr) ImGui_ImplSDL3_ProcessEvent(e);
     });
     present_ = std::make_unique<render::PresentRenderer>(std::move(surface));
     if (opt_.capture_frame >= 0) present_->SetCaptureFrame(opt_.capture_frame, opt_.capture_out);
@@ -623,32 +809,53 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
     RegisterActions();
     ConfigureExtensions();
     if (!opt_.layout.empty() && !ui_.SetLayout(opt_.layout))
-        std::fprintf(stderr, "[nuka_editor] unknown --layout '%s'\n", opt_.layout.c_str());
+        Emit(stderr, "[nuka_editor] unknown --layout '" + opt_.layout + "'\n");
     ui_.SetUiScale(opt_.ui_scale);
     if (!opt_.locale.empty()) nui::SetLocale(opt_.locale);
+    start_locale_ = nui::Locale();
     ui_state_.show_colliders = opt_.show_colliders;
     ui_state_.show_contacts = opt_.show_contacts;
     ui_state_.speed = opt_.speed;
     camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
+    StartChecks();
+}
 
-    // Loads run inside a frame, once the shell is up and the host installed its hooks.
-    if (!opt_.scene_path.empty()) Queue("file.open", Object({{"path", json::Value::Str(opt_.scene_path)}}), "cli");
-    else attach_pending_ = world_ != nullptr;
-    std::printf("[nuka_editor] backend=%s device=%s images=%u\n",
-                present_->Report().backend_name.c_str(), present_->DeviceName().c_str(),
-                present_->SwapchainImageCount());
+// Facts the start page shows; Python adds its own through app.check.
+void EditorHost::State::StartChecks() {
+    const nuka_version_t version = nuka_get_version();
+    nuka_runtime_info_t info{};
+    info.struct_size = sizeof(info);
+    info.schema_version = NUKA_RUNTIME_INFO_VERSION;
+    const bool cuda = nuka_get_runtime_info(&info) == NUKA_RESULT_OK && info.cuda_driver_version > 0;
+    const auto cuda_text = [](int32_t v) { return std::to_string(v / 1000) + "." + std::to_string(v % 1000 / 10); };
+    checks_.push_back(StartEntry{"Nuka", Format("%u.%u.%u", version.major, version.minor, version.patch), "", "", true});
+    checks_.push_back(StartEntry{"GPU", present_->DeviceName(), "", "", true});
+    checks_.push_back(StartEntry{"Vulkan", present_->Report().backend_name, "", "", true});
+    checks_.push_back(StartEntry{"CUDA",
+                                 cuda ? "runtime " + cuda_text(info.cuda_runtime_version) + ", driver " +
+                                            cuda_text(info.cuda_driver_version)
+                                      : std::string("no CUDA driver"),
+                                 "", "", cuda});
+    const bool interop = present_->VulkanHandles().interop_supported;
+    checks_.push_back(StartEntry{"Publish", interop ? "zero-copy" : "host copies", "", "", interop});
+    for (const StartEntry& c : checks_)
+        WriteLog("[nuka_editor] check " + c.title + ": " + c.detail + (c.available ? "\n" : " (failed)\n"));
 }
 
 EditorHost::State::~State() {
+    if (profile_ && present_) {
+        DropAutosave();
+        if (nui::Locale() != start_locale_) profile_->SetSetting("ui", "locale", nui::Locale());
+    }
     extensions_.Shutdown();
     worker_.StopThread();
     if (present_) {
         present_->WaitIdle();
         if (native_window_ != nullptr) ImGui_ImplSDL3_Shutdown();
         imgui_.Shutdown();
-        std::printf("[nuka_editor] done: frames=%llu presented=%d last_step_healthy=%s\n",
-                    static_cast<unsigned long long>(frame_index_), presented_,
-                    last_step_healthy_ ? "yes" : "no");
+        Emit(stdout, Format("[nuka_editor] done: frames=%llu presented=%d last_step_healthy=%s\n",
+                            static_cast<unsigned long long>(frame_index_), presented_,
+                            last_step_healthy_ ? "yes" : "no"));
         PrintSummary();
         std::fflush(stdout);
         DropPublisher();
@@ -662,8 +869,21 @@ EditorHost::State::~State() {
     cache_.Remove();
 }
 
+void EditorHost::State::Emit(std::FILE* stream, const std::string& text, bool console) {
+    std::fputs(text.c_str(), stream);
+    if (console) ConsoleAppend(text);
+    else WriteLog(text);
+}
+
+void EditorHost::State::WriteLog(const std::string& text) {
+    log_ << text;
+    log_.flush();
+}
+
+// The Console panel's text also lands in the session log.
 void EditorHost::State::ConsoleAppend(const std::string& s) {
     if (s.empty()) return;
+    WriteLog(s);
     ui_state_.console_log += s;
     if (ui_state_.console_log.size() > kConsoleLogCap)
         ui_state_.console_log.erase(0, ui_state_.console_log.size() - kConsoleLogCap);
@@ -679,29 +899,22 @@ void EditorHost::State::DrainConsoleInbox() {
 }
 
 // Search order: --ext-folder, so a working copy wins over an installed one, then next to the
-// module, the Python package's folder and the user's.
+// module, the Python package's folder and the profile's.
 void EditorHost::State::ConfigureExtensions() {
     std::vector<std::filesystem::path> folders;
-    for (const std::string& folder : opt_.ext_folders) folders.emplace_back(std::u8string(folder.begin(), folder.end()));
+    for (const std::string& folder : opt_.ext_folders) folders.push_back(Utf8Path(folder));
     const std::filesystem::path module = render::ViewerModuleDirectory();
     folders.push_back(module / "extensions");
     folders.push_back(module / "editor" / "extensions");
-#if defined(_WIN32)
-    const char* home = std::getenv("USERPROFILE");
-#else
-    const char* home = std::getenv("HOME");
-#endif
-    if (home != nullptr) folders.push_back(std::filesystem::path(home) / ".nuka" / "extensions");
+    folders.push_back(profile_->Dir() / "extensions");
     ExtensionServices services;
     services.actions = &actions_;
     services.ui = &ui_;
     services.run = [this](const std::string& id, const json::Value& args, const std::string& source) {
         return RunAction(id, args, source);
     };
-    services.console = [this](const std::string& text) {
-        std::fputs(text.c_str(), stdout);
-        ConsoleAppend(text);
-    };
+    services.console = [this](const std::string& text) { Emit(stdout, text, /*console=*/true); };
+    services.state_file = profile_->Dir() / "extensions.toml";
     extensions_.Configure(std::move(services), std::move(folders), opt_.ext_ids);
 }
 
@@ -709,18 +922,18 @@ void EditorHost::State::PrintSummary() {
     if (frame_ms_.values.empty()) return;
     const std::vector<double>& f = frame_ms_.values;
     const double mean = frame_ms_.Mean();
-    std::printf("[fps] SUMMARY measured=%llu mean_fps=%.1f mean_frame_ms=%.2f (min=%.2f max=%.2f) "
-                "mean_step_ms=%.2f p50=%.2f p95=%.2f p99=%.2f ui=%.2f apply=%.2f draw=%.2f sleep=%.2f "
-                "age_p95=%.2f drops=%llu publishes=%llu ticks=%llu capped=%llu dropped_sim_s=%.3f "
-                "mode=%s reason=\"%s\"\n",
-                static_cast<unsigned long long>(measured_), 1000.0 / mean, mean,
-                *std::min_element(f.begin(), f.end()), *std::max_element(f.begin(), f.end()),
-                step_ms_.Mean(), frame_ms_.Percentile(0.50), frame_ms_.Percentile(0.95),
-                frame_ms_.Percentile(0.99), ui_ms_.Mean(), apply_ms_.Mean(), draw_ms_.Mean(),
-                sleep_ms_.Mean(), age_ms_.Percentile(0.95), static_cast<unsigned long long>(snapshot_drops_),
-                static_cast<unsigned long long>(last_sequence_), static_cast<unsigned long long>(last_tick_),
-                static_cast<unsigned long long>(last_telemetry_.capped_batches), last_telemetry_.dropped_sim_s,
-                scatter_ ? "zero-copy" : "host", publish_reason_.c_str());
+    Emit(stdout, Format("[fps] SUMMARY measured=%llu mean_fps=%.1f mean_frame_ms=%.2f (min=%.2f max=%.2f) "
+                        "mean_step_ms=%.2f p50=%.2f p95=%.2f p99=%.2f ui=%.2f apply=%.2f draw=%.2f sleep=%.2f "
+                        "age_p95=%.2f drops=%llu publishes=%llu ticks=%llu capped=%llu dropped_sim_s=%.3f "
+                        "mode=%s reason=\"%s\"\n",
+                        static_cast<unsigned long long>(measured_), 1000.0 / mean, mean,
+                        *std::min_element(f.begin(), f.end()), *std::max_element(f.begin(), f.end()),
+                        step_ms_.Mean(), frame_ms_.Percentile(0.50), frame_ms_.Percentile(0.95),
+                        frame_ms_.Percentile(0.99), ui_ms_.Mean(), apply_ms_.Mean(), draw_ms_.Mean(),
+                        sleep_ms_.Mean(), age_ms_.Percentile(0.95), static_cast<unsigned long long>(snapshot_drops_),
+                        static_cast<unsigned long long>(last_sequence_), static_cast<unsigned long long>(last_tick_),
+                        static_cast<unsigned long long>(last_telemetry_.capped_batches), last_telemetry_.dropped_sim_s,
+                        scatter_ ? "zero-copy" : "host", publish_reason_.c_str()));
 }
 
 void EditorHost::State::SetHooks(const nuka_editor_script_hooks_t& hooks) {
@@ -838,8 +1051,8 @@ void EditorHost::State::BindWorker(uint64_t tick, double sim_time) {
             publish_reason_ = e.what();
         }
     }
-    std::printf("[nuka_editor] publish=%s%s%s\n", scatter_ ? "zero-copy" : "host",
-                scatter_ ? "" : " reason=", publish_reason_.c_str());
+    Emit(stdout, Format("[nuka_editor] publish=%s%s%s\n", scatter_ ? "zero-copy" : "host", scatter_ ? "" : " reason=",
+                        publish_reason_.c_str()));
 
     // The document classifies edits against this world's parameter registry.
     uint32_t count = 0u;
@@ -915,8 +1128,8 @@ void EditorHost::State::TakeWorkerResults() {
         if (r.seq != 0u && r.seq == run_script_seq_) {
             std::fputs(r.text.c_str(), stderr);
             std::fflush(stderr);
-            std::printf("[nuka_editor] ran --run-script %s (%zu bytes captured)\n", opt_.run_script_path.c_str(),
-                        r.text.size());
+            Emit(stdout, Format("[nuka_editor] ran --run-script %s (%zu bytes captured)\n", opt_.run_script_path.c_str(),
+                                r.text.size()));
             std::fflush(stdout);
         }
         ConsoleAppend(r.text);
@@ -1005,8 +1218,7 @@ void EditorHost::State::DrawWorld(const render::RenderWorld& rw, const render::R
         worker_.Slots().Release(slot);
     }
     if (r == render::PresentFrameResult::Error) {
-        std::fprintf(stderr, "[nuka_editor] present error at frame %llu\n",
-                     static_cast<unsigned long long>(frame_index_));
+        Emit(stderr, Format("[nuka_editor] present error at frame %llu\n", static_cast<unsigned long long>(frame_index_)));
         running_ = false;
         return;
     }
@@ -1047,7 +1259,7 @@ void EditorHost::State::ApplyLoad(const std::string& path) {
         else CheckResult(nuka_world_rebuild_from_scene(world_, path.c_str(), NUKA_REBUILD_INITIAL_STATE),
                          "nuka_world_rebuild_from_scene");
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[nuka_editor] load failed: %s\n", e.what());
+        Emit(stderr, std::string("[nuka_editor] load failed: ") + e.what() + "\n");
         SetLoadError(path);
         return;
     }
@@ -1059,7 +1271,7 @@ void EditorHost::State::Attach(const std::string& path) {
     try {
         loaded_ = AttachEditorScene(world_, path, cache_);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[nuka_editor] attach failed: %s\n", e.what());
+        Emit(stderr, std::string("[nuka_editor] attach failed: ") + e.what() + "\n");
         SetLoadError(path);
         return;
     }
@@ -1073,6 +1285,9 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     entity_drag_.Cancel();
     debug_overlay_.Reset();
     doc_.Attach(loaded_.get(), this);  // no undo across loads
+    DropAutosave();                    // the previous document's
+    autosaved_revision_ = doc_.Revision();
+    autosave_due_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(autosave_seconds_));
     AttachController();
     BindWorker();  // poses before framing
     FrameWorld(loaded_->sim->GetRenderWorld());
@@ -1134,10 +1349,11 @@ void EditorHost::State::OnLoaded(const std::string& path) {
             cmd.perturb.source = inst->pose_source;
             for (int k = 0; k < 3; ++k) cmd.perturb.force[k] = opt_.perturb[k];
             worker_.Push(std::move(cmd));
-            std::printf("[nuka_editor] perturb: %s holds (%g, %g, %g) N\n", opt_.select_path.c_str(),
-                        opt_.perturb[0], opt_.perturb[1], opt_.perturb[2]);
+            Emit(stdout, Format("[nuka_editor] perturb: %s holds (%g, %g, %g) N\n", opt_.select_path.c_str(),
+                                static_cast<double>(opt_.perturb[0]), static_cast<double>(opt_.perturb[1]),
+                                static_cast<double>(opt_.perturb[2])));
         } else {
-            std::fprintf(stderr, "[nuka_editor] --perturb: '%s' has no link or body\n", opt_.select_path.c_str());
+            Emit(stderr, "[nuka_editor] --perturb: '" + opt_.select_path + "' has no link or body\n");
         }
     }
 
@@ -1152,17 +1368,17 @@ void EditorHost::State::OnLoaded(const std::string& path) {
         const size_t dof = static_cast<size_t>(opt_.teleop_nudge_dof);
         ui_state_.drive_targets[dof] += opt_.teleop_nudge_delta;
         ui_state_.drive_dirty[dof] = 1u;
-        std::printf("[nuka_editor] teleop nudge: dof %d += %g (PD-hold kp=%g kd=%g)\n",
-                    opt_.teleop_nudge_dof, opt_.teleop_nudge_delta, ui_state_.teleop_kp,
-                    ui_state_.teleop_kd);
+        Emit(stdout, Format("[nuka_editor] teleop nudge: dof %d += %g (PD-hold kp=%g kd=%g)\n", opt_.teleop_nudge_dof,
+                            static_cast<double>(opt_.teleop_nudge_delta), static_cast<double>(ui_state_.teleop_kp),
+                            static_cast<double>(ui_state_.teleop_kd)));
     }
     if (opt_.teleop_cmd_on && cmd_ctrl) {
         // The CLI command is the baseline the every-frame producer re-sends.
         policy_ctrl_->SetCommandVector(opt_.teleop_cmd, 3);
         ui_state_.teleop_enabled = true;
         for (int k = 0; k < 3; ++k) ui_state_.teleop_cmd_base[k] = opt_.teleop_cmd[k];
-        std::printf("[nuka_editor] teleop cmd: vx=%g vy=%g wyaw=%g\n", opt_.teleop_cmd[0],
-                    opt_.teleop_cmd[1], opt_.teleop_cmd[2]);
+        Emit(stdout, Format("[nuka_editor] teleop cmd: vx=%g vy=%g wyaw=%g\n", static_cast<double>(opt_.teleop_cmd[0]),
+                            static_cast<double>(opt_.teleop_cmd[1]), static_cast<double>(opt_.teleop_cmd[2])));
     }
 }
 
@@ -1260,14 +1476,117 @@ ActionResult EditorHost::State::RunAction(const std::string& id, const json::Val
 ActionResult EditorHost::State::SaveScene(const std::string& path) {
     scene::nks::Save(loaded_->scene, path);
     doc_.MarkSaved();
-    std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", path.c_str());
-    std::printf("[nuka_editor] saved %s\n", path.c_str());
+    DropAutosave();
+    doc_path_ = NormalPath(path);
+    std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", doc_path_.c_str());
+    profile_->TouchRecent(doc_path_);
+    start_stale_ = true;
+    // The recent list shows the viewport as it was saved.
+    const uint64_t next = present_->SubmittedFrames();
+    if (ui_.Viewport().Valid()) {
+        thumb_ = ThumbRequest{doc_path_, cache_.File("thumbnail.ppm"), next};
+        present_->SetSceneCaptureFrame(static_cast<int>(next), thumb_->capture);
+    }
+    Emit(stdout, "[nuka_editor] saved " + path + "\n");
     ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Saved")) + " " + FileName(path));
     return Ok(Object({{"path", json::Value::Str(path)}}));
 }
 
+// Loads `file` as the document that saves to `doc_path`; an empty one stays untitled.
+ActionResult EditorHost::State::OpenDocument(const std::string& file, const std::string& doc_path) {
+    std::snprintf(ui_state_.load_path, sizeof(ui_state_.load_path), "%s", file.c_str());
+    worker_.Exclusive([&] { ApplyLoad(file); });
+    if (!ui_state_.load_error.empty()) return ActionResult::Fail(ui_state_.load_error);
+    doc_path_ = doc_path.empty() ? std::string() : NormalPath(doc_path);
+    std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", doc_path_.c_str());
+    if (!doc_path_.empty()) profile_->TouchRecent(doc_path_);
+    start_stale_ = true;
+    Emit(stdout, "[nuka_editor] opened " + file + "\n");
+    ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Opened")) + " " + DocTitle());
+    return Ok(Object({{"path", json::Value::Str(doc_path_)}, {"title", json::Value::Str(DocTitle())}}));
+}
+
+// True when `id` may drop the document: it is clean or `discard` says so. Otherwise the
+// question opens and `asked` reports it; app.answer_prompt re-runs `id` with the answer.
+bool EditorHost::State::Confirmed(const std::string& id, const json::Value& args, ActionResult* asked) {
+    if (!loaded_ || !doc_.Dirty() || BoolArg(args, "discard", false)) return true;
+    prompt_ = Prompt{id, args};
+    ui_state_.prompt = id;
+    *asked = Ok(Object({{"prompt", json::Value::Str(id)}}));
+    return false;
+}
+
+// Starts another editor that owns its own world, with this one's profile.
+ActionResult EditorHost::State::Spawn(const std::vector<std::string>& args) {
+    if (opt_.relaunch.empty()) return ActionResult::Fail("this session has no command to start another editor");
+    std::vector<std::string> argv = opt_.relaunch;
+    argv.insert(argv.end(), args.begin(), args.end());
+    argv.insert(argv.end(), {"--new-window", "--profile", PathText(profile_->Dir())});
+    std::string error;
+    const uint64_t pid = SpawnDetached(argv, &error);
+    if (pid == 0u) return ActionResult::Fail(error);
+    Emit(stdout, Format("[nuka_editor] started editor process %llu\n", static_cast<unsigned long long>(pid)));
+    ui_.Nui().Toast(nui::Level::Ok, nui::Tr("Opened in a new window"));
+    return Ok(Object({{"spawned", json::Value::Int(static_cast<int64_t>(pid))}}));
+}
+
+// Writes the dirty document beside a note of where it belongs, so the next start can recover it.
+void EditorHost::State::Autosave() {
+    scene::nks::Save(loaded_->scene, autosave_file_);
+    const json::Value note = Object({{"path", json::Value::Str(doc_path_)},
+                                     {"pid", json::Value::Int(static_cast<int64_t>(ProcessId()))},
+                                     {"time", json::Value::Int(UnixNow())}});
+    std::ofstream(SidecarOf(autosave_file_), std::ios::binary | std::ios::trunc) << note.Dump(2);
+    autosaved_revision_ = doc_.Revision();
+    autosave_due_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(autosave_seconds_));
+    WriteLog("[nuka_editor] autosaved " + autosave_file_ + "\n");
+}
+
+void EditorHost::State::DropAutosave() {
+    const fs::path file = Utf8Path(autosave_file_);
+    for (const char* ext : {".nks", ".nka", ".json"}) fs::remove(fs::path(file).replace_extension(ext));
+}
+
+// Templates and examples from start.json, the recent list, autosaves of editors that are gone,
+// and the startup checks.
+void EditorHost::State::RefreshStartPage() {
+    StartPage& page = ui_state_.start;
+    page.templates.clear();
+    page.recent.clear();
+    page.recovered.clear();
+    page.examples.clear();
+    std::string text;
+    ReadEntireFile(Resource("assets/editor/start.json"), &text);
+    const json::Value start = json::Value::Parse(text);
+    for (const json::Value& t : start.At("templates").Elements())
+        page.templates.push_back(StartEntry{t.At("title").AsString(), t.At("detail").AsString(), t.At("id").AsString(), "", true});
+    for (const json::Value& e : start.At("examples").Elements()) {
+        const std::string path = Resource(e.At("path").AsString());
+        page.examples.push_back(StartEntry{e.At("title").AsString(), e.At("detail").AsString(), path, "",
+                                           fs::exists(Utf8Path(path))});
+    }
+    for (const RecentScene& r : profile_->Recent()) {
+        const fs::path thumb = profile_->Thumbnail(r.path);
+        page.recent.push_back(StartEntry{FileName(r.path), LocalTimeText(r.time), r.path,
+                                         fs::exists(thumb) ? PathText(thumb) : std::string(), fs::exists(Utf8Path(r.path))});
+    }
+    for (const fs::directory_entry& entry : fs::directory_iterator(profile_->Dir() / "autosave")) {
+        if (entry.path().extension() != ".json") continue;
+        std::string note_text;
+        ReadEntireFile(PathText(entry.path()), &note_text);
+        const json::Value note = json::Value::Parse(note_text);
+        if (ProcessAlive(static_cast<uint32_t>(note.At("pid").AsInt()))) continue;
+        const std::string doc = note.At("path").AsString();
+        page.recovered.push_back(StartEntry{doc.empty() ? std::string("untitled") : FileName(doc),
+                                            LocalTimeText(note.At("time").AsInt()),
+                                            PathText(fs::path(entry.path()).replace_extension(".nks")), "", true});
+    }
+    page.checks = checks_;
+}
+
 void EditorHost::State::RegisterActions() {
     RegisterFileActions();
+    RegisterAppActions();
     RegisterEditActions();
     RegisterSimActions();
     RegisterViewActions();
@@ -1276,33 +1595,153 @@ void EditorHost::State::RegisterActions() {
 
 void EditorHost::State::RegisterFileActions() {
     const auto has_scene = [this] { return loaded_ != nullptr; };
+    const auto owns_world = [this] { return !borrowed_; };
+    // Opening replaces the editor's own world; a script's world stays and a new editor opens.
+    const auto open = [this](const std::string& id, const json::Value& args) {
+        std::string path = StrArg(args, "path");
+        if (path.empty())
+            path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Scenes"), "*.nks;*.urdf;*.xml;*.usd;*.usda");
+        if (path.empty()) return ActionResult::Fail("no scene chosen");
+        if (!fs::exists(Utf8Path(path))) return ActionResult::Fail("no file at " + path);
+        if (borrowed_) return Spawn({path});
+        json::Value resolved = args;
+        resolved.Set("path", json::Value::Str(path));
+        ActionResult asked;
+        if (!Confirmed(id, resolved, &asked)) return asked;
+        // Formats other than NKS import into an untitled document.
+        return OpenDocument(path, Utf8Path(path).extension() == ".nks" ? path : std::string());
+    };
+    actions_.Add({"file.new", "New Scene", "file", "Ctrl+N", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string name = StrArg(args, "template", "empty");
+                      if (borrowed_) return Spawn({"--template", name});
+                      const std::string file = Resource("assets/editor/templates/" + name + ".nks");
+                      if (!fs::exists(Utf8Path(file))) return ActionResult::Fail("no scene template '" + name + "'");
+                      ActionResult asked;
+                      if (!Confirmed("file.new", args, &asked)) return asked;
+                      return OpenDocument(file, std::string());
+                  }});
     actions_.Add({"file.open", "Open Scene...", "file", "", ShortcutScope::Global, {}, {},
+                  [open](const json::Value& args) { return open("file.open", args); }});
+    actions_.Add({"file.open_recent", "Open Recent", "file", "", ShortcutScope::Global, {}, {},
+                  [open](const json::Value& args) { return open("file.open_recent", args); }});
+    actions_.Add({"file.forget_recent", "Remove from Recent", "file", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      profile_->ForgetRecent(StrArg(args, "path"));
+                      start_stale_ = true;
+                      return Ok();
+                  }});
+    actions_.Add({"file.open_window", "Open in New Window...", "file", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value& args) {
                       std::string path = StrArg(args, "path");
-                      if (path.empty()) path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Nuka scenes"), "*.nks");
-                      if (path.empty()) return ActionResult::Fail("no scene chosen");
-                      std::snprintf(ui_state_.load_path, sizeof(ui_state_.load_path), "%s", path.c_str());
-                      worker_.Exclusive([&] { ApplyLoad(path); });
-                      if (!ui_state_.load_error.empty()) return ActionResult::Fail(ui_state_.load_error);
-                      ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Opened")) + " " + FileName(path));
-                      return Ok(Object({{"path", json::Value::Str(path)}}));
+                      if (path.empty() && !BoolArg(args, "empty", false))
+                          path = OpenFileDialog(nui::Tr("Open Scene"), nui::Tr("Scenes"), "*.nks;*.urdf;*.xml;*.usd;*.usda");
+                      return Spawn(path.empty() ? std::vector<std::string>{} : std::vector<std::string>{path});
                   }});
+    actions_.Add({"file.revert", "Revert", "file", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr && !borrowed_ && !doc_path_.empty() && doc_.Dirty(); }, {},
+                  [this](const json::Value&) {
+                      const std::string path = doc_path_;
+                      return OpenDocument(path, path);
+                  }});
+    actions_.Add({"file.close", "Close Scene", "file", "", ShortcutScope::Global,
+                  [this] { return loaded_ != nullptr && !borrowed_; }, {},
+                  [this](const json::Value& args) {
+                      ActionResult asked;
+                      if (!Confirmed("file.close", args, &asked)) return asked;
+                      worker_.Exclusive([&] { ApplyUnload(); });
+                      DropAutosave();
+                      doc_path_.clear();
+                      ui_state_.save_path[0] = '\0';
+                      return Ok();
+                  }});
+    actions_.Add({"file.recover", "Recover Autosave", "file", "", ShortcutScope::Global, owns_world, {},
+                  [this](const json::Value& args) {
+                      const std::string file = StrArg(args, "path");
+                      std::string note_text;
+                      if (!ReadEntireFile(PathText(SidecarOf(file)), &note_text)) return ActionResult::Fail("no autosave at " + file);
+                      ActionResult asked;
+                      if (!Confirmed("file.recover", args, &asked)) return asked;
+                      const std::string doc = json::Value::Parse(note_text).At("path").AsString();
+                      ActionResult result = OpenDocument(file, doc);
+                      if (!result.ok) return result;
+                      // The recovered file becomes this session's autosave until the document is saved.
+                      autosave_file_ = file;
+                      doc_.MarkUnsaved();
+                      Autosave();
+                      start_stale_ = true;
+                      return result;
+                  }});
+    actions_.Add({"file.autosave", "Autosave", "file", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      Autosave();
+                      return Ok(Object({{"path", json::Value::Str(autosave_file_)}}));
+                  },
+                  "", true});
     actions_.Add({"file.unload", "Unload", "file", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value&) {
                       worker_.Exclusive([&] { ApplyUnload(); });
                       return Ok();
-                  }});
+                  },
+                  "", true});
+    // An untitled document asks where to save.
     actions_.Add({"file.save", "Save", "file", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
-                      const std::string path = StrArg(args, "path", ui_state_.save_path);
-                      return path.empty() ? ActionResult::Fail("no save path") : SaveScene(path);
+                      std::string path = StrArg(args, "path", doc_path_);
+                      if (path.empty()) path = SaveFileDialog(nui::Tr("Save Scene"), nui::Tr("Nuka scenes"), "*.nks", "untitled.nks");
+                      return path.empty() ? ActionResult::Fail("no save path chosen") : SaveScene(path);
                   }});
     actions_.Add({"file.save_as", "Save As...", "file", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
                       std::string path = StrArg(args, "path");
-                      if (path.empty()) path = SaveFileDialog(nui::Tr("Save Scene"), nui::Tr("Nuka scenes"), "*.nks", ui_state_.save_path);
+                      if (path.empty())
+                          path = SaveFileDialog(nui::Tr("Save Scene"), nui::Tr("Nuka scenes"), "*.nks",
+                                                (doc_path_.empty() ? std::string("untitled.nks") : doc_path_).c_str());
                       return path.empty() ? ActionResult::Fail("no save path chosen") : SaveScene(path);
                   }});
+}
+
+void EditorHost::State::RegisterAppActions() {
+    // A script's world outlives the window: closing only hides it and ends app.run().
+    actions_.Add({"app.exit", "Exit", "file", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      ActionResult asked;
+                      if (!Confirmed("app.exit", args, &asked)) return asked;
+                      running_ = false;
+                      if (native_window_ != nullptr) SDL_HideWindow(static_cast<SDL_Window*>(native_window_));
+                      return Ok();
+                  }});
+    actions_.Add({"app.answer_prompt", "Answer", "app", "", ShortcutScope::Global, [this] { return prompt_.has_value(); }, {},
+                  [this](const json::Value& args) {
+                      const Prompt asked = *prompt_;
+                      const std::string choice = StrArg(args, "choice");
+                      if (choice != "save" && choice != "discard" && choice != "cancel")
+                          return ActionResult::Fail("the choice is save, discard or cancel");
+                      prompt_.reset();
+                      ui_state_.prompt.clear();
+                      if (choice == "cancel") return Ok(Object({{"choice", json::Value::Str(choice)}}));
+                      json::Value again = asked.args;
+                      again.Set("discard", json::Value::Bool(true));
+                      if (choice == "save") {
+                          json::Value save = json::Value::Object();
+                          if (const json::Value* path = args.Find("path")) save.Set("path", *path);
+                          const ActionResult saved = RunAction("file.save", save, "prompt");
+                          if (!saved.ok) return saved;
+                          resume_ = Prompt{asked.action, std::move(again)};
+                          return Ok(Object({{"choice", json::Value::Str(choice)}}));
+                      }
+                      return RunAction(asked.action, again, "prompt");
+                  },
+                  "", true});
+    actions_.Add({"app.check", "Report Check", "app", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      StartEntry check{StrArg(args, "name"), StrArg(args, "value"), "", "", BoolArg(args, "ok", true)};
+                      WriteLog("[nuka_editor] check " + check.title + ": " + check.detail + (check.available ? "\n" : " (failed)\n"));
+                      checks_.push_back(std::move(check));
+                      start_stale_ = true;
+                      return Ok();
+                  },
+                  "", true});
 }
 
 void EditorHost::State::RegisterEditActions() {
@@ -1534,6 +1973,15 @@ json::Value EditorHost::State::DocumentState() {
     v.Set("last_error", json::Value::Str(last_error_));
     v.Set("selection", json::Value::Str(SelectedPath()));
     v.Set("playing", json::Value::Bool(ui_state_.playing));
+    v.Set("path", json::Value::Str(doc_path_));
+    v.Set("title", json::Value::Str(SessionTitle()));
+    v.Set("prompt", json::Value::Str(ui_state_.prompt));
+    v.Set("session", json::Value::Str(borrowed_ ? "script" : "editor"));
+    v.Set("start_page", json::Value::Bool(StartShown()));
+    v.Set("primary", json::Value::Bool(instance_ != nullptr && instance_->Listening()));
+    v.Set("autosave", json::Value::Str(autosave_file_));
+    v.Set("log", json::Value::Str(log_path_));
+    v.Set("profile", json::Value::Str(PathText(profile_->Dir())));
     return v;
 }
 
@@ -1545,10 +1993,10 @@ void EditorHost::State::AttachController() {
         if (pc->Init(opt_.policy_path, layout.links_per_env, layout.articulations_per_env, loaded_->terrain)) {
             if (opt_.force_host_policy) pc->SetUseGpu(false);
             policy_ctrl_ = std::move(pc);
-            std::printf("[nuka_editor] policy attached: %s  play=%s  path=%s\n", opt_.policy_path.c_str(),
-                        opt_.want_play ? "yes" : "no", policy_ctrl_->UsingGpu() ? "GPU" : "host");
+            Emit(stdout, Format("[nuka_editor] policy attached: %s  play=%s  path=%s\n", opt_.policy_path.c_str(),
+                                opt_.want_play ? "yes" : "no", policy_ctrl_->UsingGpu() ? "GPU" : "host"));
         } else {
-            std::fprintf(stderr, "[nuka_editor] policy Init failed: %s\n", opt_.policy_path.c_str());
+            Emit(stderr, "[nuka_editor] policy Init failed: " + opt_.policy_path + "\n");
         }
     }
 }
@@ -1575,6 +2023,7 @@ void EditorHost::State::ApplyUnload() {
     last_seeded_ = scene::kInvalidEntity;
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
     camera_.FrameAabb(math::Vec3{-1.0f, -1.0f, 0.0f}, math::Vec3{1.0f, 1.0f, 1.0f});
+    start_stale_ = true;
 }
 
 // Seeds the inspector from the selected instance's world pose and material.
@@ -1663,6 +2112,21 @@ void EditorHost::State::Frame(bool step_physics) {
     if (step_physics) worker_.StartThread();
     else worker_.StopThread();
     DrainConsoleInbox();
+    ui_state_.script_driven = borrowed_ && !step_physics;
+
+    // Files that later launches hand over or that land on the window open like File > Open.
+    if (instance_) {
+        for (const std::string& request : instance_->Take()) {
+            const json::Value message = json::Value::Parse(request);
+            if (const json::Value* path = message.Find("open"))
+                Queue("file.open", Object({{"path", *path}}), "instance");
+            SDL_Window* window = static_cast<SDL_Window*>(native_window_);
+            SDL_RestoreWindow(window);
+            SDL_RaiseWindow(window);
+        }
+    }
+    for (const std::string& path : dropped_) Queue("file.open", Object({{"path", json::Value::Str(path)}}), "drop");
+    dropped_.clear();
 
     if (attach_pending_) {
         attach_pending_ = false;
@@ -1688,7 +2152,7 @@ void EditorHost::State::Frame(bool step_physics) {
         script_ran_ = true;
         std::string code;
         if (ReadEntireFile(opt_.run_script_path, &code)) run_script_seq_ = worker_.Push(TickCommand::Script(code));
-        else std::fprintf(stderr, "[nuka_editor] --run-script: cannot read %s\n", opt_.run_script_path.c_str());
+        else Emit(stderr, "[nuka_editor] --run-script: cannot read " + opt_.run_script_path + "\n");
     }
 
     events_.clear();
@@ -1697,9 +2161,15 @@ void EditorHost::State::Frame(bool step_physics) {
     const uint32_t vp_w = present_->Report().width;
     const uint32_t vp_h = present_->Report().height;
     const bool ctrl_before_events = ctrl_down_;
+    bool close_asked = false;
     for (const window::WindowEvent& ev : events_) {
         ui_state_.layout_modifier_down = ev.Held(window::modifier::kLayout);
         switch (ev.type) {
+            case window::WindowEvent::Type::Close:
+                // Closing asks about unsaved changes like File > Exit.
+                if (!close_asked) Queue("app.exit", json::Value::Object(), "window");
+                close_asked = true;
+                break;
             case window::WindowEvent::Type::MouseMove:
                 last_mouse_x_ = static_cast<float>(ev.mouse_x);
                 last_mouse_y_ = static_cast<float>(ev.mouse_y);
@@ -1780,17 +2250,23 @@ void EditorHost::State::Frame(bool step_physics) {
     stats.device_name = present_->DeviceName();
 
     ui_state_.has_scene = static_cast<bool>(loaded_);
-    ui_state_.loaded_path = loaded_ ? loaded_->path : std::string();
+    ui_state_.loaded_path = loaded_ ? (doc_path_.empty() ? DocTitle() : doc_path_) : std::string();
     ui_state_.can_undo = doc_.CanUndo();
     ui_state_.can_redo = doc_.CanRedo();
     ui_state_.save_dirty = loaded_ && doc_.Dirty();
-    const std::string title =
-        !loaded_ ? std::string("Nuka Editor")
-                 : (loaded_->path.empty() ? std::string("untitled") : FileName(loaded_->path)) +
-                       (ui_state_.save_dirty ? "*" : "") + " \xE2\x80\x94 Nuka Editor";
+    ui_state_.doc_title = SessionTitle();
+    const std::string title = !loaded_ ? std::string("Nuka Editor")
+                                       : ui_state_.doc_title + (ui_state_.save_dirty ? "*" : "") + " \xE2\x80\x94 Nuka Editor";
     if (native_window_ != nullptr && title != window_title_) {
         window_title_ = title;
         SDL_SetWindowTitle(static_cast<SDL_Window*>(native_window_), title.c_str());
+    }
+    if (ui_state_.save_dirty && doc_.Revision() != autosaved_revision_ && Clock::now() >= autosave_due_) Autosave();
+    // The lists also feed File > Open Recent, so they stay current while a scene is open.
+    ui_state_.start.shown = StartShown();
+    if (start_stale_) {
+        RefreshStartPage();
+        start_stale_ = false;
     }
 
     io.DisplaySize = ImVec2(static_cast<float>(present_->Report().width),
@@ -2021,6 +2497,22 @@ void EditorHost::State::Frame(bool step_physics) {
     DrawWorld(render_world, opts);
     const double draw_ms = Ms(Clock::now() - draw_t0);
     if (!running_) return;
+    if (thumb_ && present_->SubmittedFrames() > thumb_->frame) {
+        // A scene closed since the save, or a hidden viewport, leaves no picture for it.
+        if (fs::exists(Utf8Path(thumb_->capture))) {
+            if (doc_path_ == thumb_->scene) {
+                WriteThumbnail(thumb_->capture, profile_->Thumbnail(thumb_->scene));
+                start_stale_ = true;
+            }
+            fs::remove(Utf8Path(thumb_->capture));
+        }
+        thumb_.reset();
+    }
+    if (resume_ && !thumb_) {
+        const Prompt resume = *resume_;
+        resume_.reset();
+        RunAction(resume.action, resume.args, "prompt");
+    }
     ++frame_index_;
     playing_mirror_ = ui_state_.playing;
 
@@ -2042,21 +2534,29 @@ void EditorHost::State::Frame(bool step_physics) {
             step_ms_.Add(stats.step_time_ms);
         }
         if (frame_index_ % 120u == 0u) {
-            std::printf("[fps] frame=%llu fps_ema=%.1f frame_ms=%.2f step_ms=%.2f age_ms=%.1f ticks=%llu\n",
-                        static_cast<unsigned long long>(frame_index_), fps_ema_, fms, stats.step_time_ms,
-                        stats.snapshot_age_ms, static_cast<unsigned long long>(stats.sim_ticks));
+            Emit(stdout, Format("[fps] frame=%llu fps_ema=%.1f frame_ms=%.2f step_ms=%.2f age_ms=%.1f ticks=%llu\n",
+                                static_cast<unsigned long long>(frame_index_), fps_ema_, fms,
+                                static_cast<double>(stats.step_time_ms), static_cast<double>(stats.snapshot_age_ms),
+                                static_cast<unsigned long long>(stats.sim_ticks)));
             std::fflush(stdout);
         }
     }
-    // A Close() from a script callback during this frame stays in force.
-    running_ = running_ && !present_->ShouldClose() &&
-               !(opt_.max_frames > 0 && frame_index_ >= static_cast<uint64_t>(opt_.max_frames));
+    // A Close() from a script callback during this frame stays in force; the window's close
+    // button runs app.exit.
+    running_ = running_ && !(opt_.max_frames > 0 && frame_index_ >= static_cast<uint64_t>(opt_.max_frames));
 }
 
 EditorHost::EditorHost(const std::vector<std::string>& args, nuka_world_handle world, float dt)
     : state_(std::make_unique<State>(args, world, dt)) {}
 
 EditorHost::~EditorHost() = default;
+
+bool EditorHost::Forward(const std::vector<std::string>& args) {
+    LaunchOptions opt;
+    if (!ParseOptions(args, &opt) || opt.scene_path.empty()) return false;
+    const EditorProfile profile(opt.profile);
+    return SendToPrimary(profile.InstanceName(), Object({{"open", json::Value::Str(NormalPath(opt.scene_path))}}).Dump(0));
+}
 
 void EditorHost::SetScriptHooks(const nuka_editor_script_hooks_t& hooks) { state_->SetHooks(hooks); }
 void EditorHost::SetPythonHooks(const nuka_editor_python_hooks_t& hooks) { state_->extensions_.SetPythonHooks(hooks); }

@@ -27,6 +27,13 @@ void Check(nuka_result_t result, const char* what) {
 
 using Point = std::array<float, 3>;
 
+std::vector<const char*> Argv(const std::vector<std::string>& args) {
+    std::vector<const char*> argv;
+    argv.reserve(args.size());
+    for (const std::string& arg : args) argv.push_back(arg.c_str());
+    return argv;
+}
+
 // One overlay draw call's frame; it stops working when the call returns.
 class OverlayFrame {
 public:
@@ -193,16 +200,14 @@ class App {
 public:
     App(const std::vector<std::string>& args, std::uintptr_t world, float dt, nb::object runner, nb::object extensions)
         : runner_(std::move(runner)), extensions_(std::move(extensions)) {
-        std::vector<const char*> argv;
-        argv.reserve(args.size());
-        for (const std::string& arg : args) argv.push_back(arg.c_str());
+        const std::vector<const char*> argv = Argv(args);
         nuka_result_t result = NUKA_RESULT_OK;
         {
             nb::gil_scoped_release release;
             result = nuka_editor_create(static_cast<int>(argv.size()), argv.data(),
                                         reinterpret_cast<nuka_world_handle>(world), dt, &editor_);
         }
-        Check(result, "nuka_editor_create");
+        if (result != NUKA_RESULT_OK) throw std::runtime_error(nuka_editor_create_error());
         const nuka_editor_script_hooks_t hooks{this, &Run, &Register, &Unregister, &Clear, &Dispatch};
         Check(nuka_editor_set_script_hooks(editor_, &hooks), "nuka_editor_set_script_hooks");
         const nuka_editor_python_hooks_t python{this, &LoadExtension, &UnloadExtension};
@@ -406,6 +411,15 @@ private:
 
 NB_MODULE(_editor_ext, m) {
     m.doc() = "The Nuka editor library; use nuka.editor.";
+
+    m.def(
+        "forward",
+        [](const std::vector<std::string>& args) {
+            const std::vector<const char*> argv = Argv(args);
+            return nuka_editor_forward(static_cast<int>(argv.size()), argv.data()) != 0u;
+        },
+        nb::arg("args"),
+        "Hand the scene in args to the editor already running on the same profile; False when none runs.");
 
     nb::class_<OverlayFrame>(m, "OverlayFrame", "One overlay draw over the scene viewport; rgba is 0xRRGGBBAA.")
         .def_prop_ro("view", &OverlayFrame::view, "The column-major view matrix.")

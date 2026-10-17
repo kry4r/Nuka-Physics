@@ -16,6 +16,8 @@ struct nuka_editor_t : nuka::runtime::app::viewer::EditorHost {
 
 namespace {
 
+thread_local std::string create_error;  // why this thread's last nuka_editor_create failed
+
 template <class Fn>
 nuka_result_t Guard(Fn&& fn) {
     try {
@@ -37,7 +39,23 @@ nuka_result_t nuka_editor_create(int argc, const char* const* argv, nuka_world_h
                                  nuka_editor_handle* out) {
     if (out == nullptr || argc < 0 || (argc > 0 && argv == nullptr)) return NUKA_RESULT_INVALID_ARG;
     *out = nullptr;
-    return Guard([&] { *out = new nuka_editor_t(std::vector<std::string>(argv, argv + argc), world, dt); });
+    create_error.clear();
+    try {
+        *out = new nuka_editor_t(std::vector<std::string>(argv, argv + argc), world, dt);
+        return NUKA_RESULT_OK;
+    } catch (const std::bad_alloc&) {
+        create_error = "out of memory";
+        return NUKA_RESULT_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        create_error = e.what();
+        return NUKA_RESULT_INTERNAL;
+    }
+}
+
+const char* nuka_editor_create_error(void) { return create_error.c_str(); }
+
+uint32_t nuka_editor_forward(int argc, const char* const* argv) {
+    return nuka::runtime::app::viewer::EditorHost::Forward(std::vector<std::string>(argv, argv + argc)) ? 1u : 0u;
 }
 
 void nuka_editor_destroy(nuka_editor_handle editor) { delete editor; }

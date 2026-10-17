@@ -677,8 +677,8 @@ void Host::Progress(const std::string& progress_id, const std::string& label, fl
     }
 }
 
-// Toasts stack up from the viewport's bottom-right corner, newest at the bottom.
-void Host::DrawNotifications(const ImVec2& min, const ImVec2& max) {
+// Newest at the bottom.
+void Host::DrawNotifications(ImDrawList* list, const ImVec2& min, const ImVec2& max) {
     std::lock_guard<std::recursive_mutex> lock(mu_);
     const double now = Now();
     while (!toasts_.empty()) {
@@ -687,8 +687,6 @@ void Host::DrawNotifications(const ImVec2& min, const ImVec2& max) {
         toasts_.pop_front();
     }
     const float s = Scale();
-    // Under every window, so popups, the palette and modals stay on top.
-    ImDrawList* list = ImGui::GetBackgroundDrawList();
     ImFont* font = GetNukaFont(FontRole::Body);
     const float px = theme::kFontBody * s;
     const float width = 340.0f * s, pad = 10.0f * s;

@@ -23,6 +23,7 @@ struct ExtensionServices {
     ImGuiLayer* ui = nullptr;
     std::function<ActionResult(const std::string& id, const scene::json::Value& args, const std::string& source)> run;
     std::function<void(const std::string& text)> console;
+    std::filesystem::path state_file;  // extensions.toml: the user's enable and disable choices
 };
 
 class ExtensionManager {

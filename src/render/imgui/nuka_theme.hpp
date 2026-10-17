@@ -148,5 +148,14 @@ inline constexpr const char kPackage[] = "\xEE\x8E\x90";
 inline constexpr const char kCode[] = "\xEE\x86\xBC";
 inline constexpr const char kFilePy[] = "\xEE\xAC\xAC";
 inline constexpr const char kFileCpp[] = "\xEE\xAC\xAE";
+inline constexpr const char kRecent[] = "\xEE\x86\xA0";
+inline constexpr const char kExit[] = "\xEE\x90\xAA";
+inline constexpr const char kNewWindow[] = "\xEE\x97\x9E";
+inline constexpr const char kImport[] = "\xEE\x88\x8C";
+inline constexpr const char kRecover[] = "\xEE\x98\xBA";
+inline constexpr const char kTemplate[] = "\xEE\x91\xA4";
+inline constexpr const char kExample[] = "\xEE\x9E\x9E";
+inline constexpr const char kDocs[] = "\xEE\x83\xA6";
+inline constexpr const char kSparkle[] = "\xEE\x9A\xA2";
 
 }  // namespace nuka::render::imgui::icon

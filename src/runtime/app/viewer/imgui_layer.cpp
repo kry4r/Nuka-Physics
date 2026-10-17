@@ -10,6 +10,7 @@
 #include "render/imgui/nuka_imgui.hpp"
 #include "render/imgui/nuka_theme.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
+#include "runtime/app/viewer/editor_profile.hpp"
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/graph/scene_graph.hpp"
@@ -20,6 +21,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <iterator>
@@ -28,6 +30,7 @@
 
 namespace nuka::runtime::app::viewer {
 
+namespace fs = std::filesystem;
 namespace json = nuka::scene::json;
 namespace theme = nuka::render::imgui::theme;
 namespace icon = nuka::render::imgui::icon;
@@ -159,7 +162,10 @@ const std::vector<MenuSpec>& Menus() {
         window.push_back("-");
         window.push_back("window.reset_layout");
         return std::vector<MenuSpec>{
-            {"File", {"file"}, {"file.open", "-", "file.save", "file.save_as", "-", "file.unload"}},
+            {"File",
+             {"file"},
+             {"file.new", "file.open", "file.open_recent", "file.open_window", "-", "file.import", "-", "file.save",
+              "file.save_as", "file.revert", "-", "file.close", "app.exit"}},
             {"Edit", {"edit"}, {"edit.undo", "edit.redo", "-", "edit.delete"}},
             {"Create", {"scene"}, {"scene.add_box", "scene.add_sphere", "scene.add_capsule", "scene.add_plane"}},
             {"View",
@@ -535,7 +541,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
     };
 
     const std::pair<const char*, const char*> icons[] = {
-        {"file.open", icon::kOpen},         {"file.unload", icon::kUnload},           {"file.save", icon::kSave},
+        {"file.new", icon::kNew},           {"file.open", icon::kOpen},               {"file.save", icon::kSave},
+        {"file.open_window", icon::kNewWindow}, {"file.revert", icon::kReset},        {"file.close", icon::kClose},
+        {"app.exit", icon::kExit},
         {"file.save_as", icon::kSaveAs},    {"edit.undo", icon::kUndo},               {"edit.redo", icon::kRedo},
         {"edit.delete", icon::kTrash},      {"script.run", icon::kRun},               {"script.clear_console", icon::kClear},
         {"script.attach", icon::kScriptNode}, {"script.load", icon::kFile},           {"sim.toggle_play", icon::kPlay},
@@ -544,11 +552,13 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"view.contacts", icon::kAtom},     {"view.hide_overlays", icon::kVisual},    {"view.screenshot", icon::kCamera}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
     for (const char* id : {"edit.apply", "edit.rename", "edit.reparent", "scene.spawn", "scene.select", "sim.play",
-                           "sim.pause", "sim.speed", "view.stats"})
+                           "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",
+                           "file.recover", "file.autosave", "app.answer_prompt", "app.check"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
     registry.Rebind("file.save_as", "Ctrl+Shift+S");
+    registry.Rebind("app.exit", "Ctrl+Q");
     registry.Rebind("edit.delete", "Delete");
     registry.Rebind("sim.toggle_play", "Space");
 
@@ -1188,7 +1198,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                 {Tr("PERSPECTIVE"), Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
                                  Tr(ui_state.playing ? "LIVE" : "PAUSED"),
                                  Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))});
-        } else {
+        } else if (!ui_state.start.shown) {
             const float s = nui::Scale();
             ImFont* font = GetNukaFont(FontRole::Display);
             const float px = theme::kFontLabel * s * 1.3f;
@@ -1198,10 +1208,13 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                                     ImVec2((vmin.x + vmax.x - size.x) * 0.5f, (vmin.y + vmax.y - size.y) * 0.5f),
                                                     U32(theme::kFgDim), text);
         }
-        host_.DrawNotifications(vmin, vmax);
+        // Under every window, so popups, the palette and modals stay on top.
+        if (!ui_state.start.shown) host_.DrawNotifications(ImGui::GetBackgroundDrawList(), vmin, vmax);
     }
+    DrawStartPage();
     DrawPalette();
     DrawAbout();
+    DrawPrompt();
 }
 
 void ImGuiLayer::DockLayout(ImGuiID dockspace) {
@@ -1273,6 +1286,22 @@ void ImGuiLayer::DrawMenuBar() {
         for (const std::string& id : menu.items) {
             if (id == "-") {
                 separator = any;
+                continue;
+            }
+            // Open Recent lists the recent scenes; Import arrives with the importers.
+            if (id == "file.open_recent" || id == "file.import") {
+                if (separator) ImGui::Separator();
+                separator = false;
+                const std::vector<StartEntry>& recent = frame_.ui->start.recent;
+                const bool recent_menu = id == "file.open_recent";
+                if (ImGui::BeginMenuEx(Tr(recent_menu ? "Open Recent" : "Import"), recent_menu ? icon::kRecent : icon::kImport,
+                                       recent_menu && !recent.empty())) {
+                    for (const StartEntry& r : recent)
+                        if (ImGui::MenuItemEx(r.title.c_str(), nullptr, nullptr, false, r.available))
+                            Queue("file.open_recent", Args({{"path", json::Value::Str(r.arg)}}));
+                    ImGui::EndMenu();
+                }
+                any = true;
                 continue;
             }
             const Action* a = registry_->Find(id);
@@ -1446,6 +1475,10 @@ void ImGuiLayer::DrawToolbar() {
             list->AddText(label_font, label_px, ImVec2(c0.x + 8.0f * s + lead, cy - ts.y * 0.5f), U32(color), text.c_str());
             x = c0.x - 6.0f * s;
         };
+        // A script session names its script; a script that steps the world drives the transport.
+        if (ui.script_session)
+            chip(std::string(Tr(ui.script_driven ? "SCRIPT DRIVEN" : "SCRIPT")) + "  " + Upper(ui.doc_title), theme::kInfo,
+                 icon::kConsole, false, ui.script_driven);
         chip(Tr(!ui.has_scene ? "NO SCENE" : ui.playing ? "LIVE" : "PAUSED"),
              !ui.has_scene ? theme::kFgDim : ui.playing ? theme::kOk : theme::kFgMuted, nullptr, true, ui.playing);
         if (ui.has_scene) {
@@ -1630,6 +1663,336 @@ void ImGuiLayer::DrawAbout() {
     ImGui::Dummy(ImVec2(0.0f, 8.0f * s));
     if (ImGui::Button(Tr("Close"), ImVec2(-FLT_MIN, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
+}
+
+// ---- start page ---------------------------------------------------------------------------
+
+namespace {
+
+// `text`, or as much of it as fits in `width` behind or ahead of an ellipsis.
+std::string Elide(ImFont* font, float px, const std::string& text, float width, bool keep_tail) {
+    const auto fits = [&](const std::string& t) { return font->CalcTextSizeA(px, FLT_MAX, 0.0f, t.c_str()).x <= width; };
+    if (fits(text)) return text;
+    for (size_t n = 1; n < text.size(); ++n) {
+        const size_t i = keep_tail ? n : text.size() - n;
+        if ((static_cast<unsigned char>(text[i]) & 0xC0u) == 0x80u) continue;
+        const std::string t = keep_tail ? "\xE2\x80\xA6" + text.substr(i) : text.substr(0, i) + "\xE2\x80\xA6";
+        if (fits(t)) return t;
+    }
+    return "\xE2\x80\xA6";
+}
+
+// One line of the start page: an icon, a title, an optional dim second line and a trailing
+// note. True when clicked.
+bool StartRow(const char* id, const char* glyph, const std::string& title, const std::string& detail, const std::string& note,
+              bool enabled, const ImVec4& tint = theme::kFgMuted) {
+    const float s = nui::Scale();
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    ImFont* body = ImGui::GetFont();
+    const float body_px = ImGui::GetFontSize();
+    ImFont* mono = GetNukaFont(FontRole::Mono);
+    const float mono_px = theme::kFontMono * s;
+    const float line = ImGui::GetTextLineHeight();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = line + (detail.empty() ? 0.0f : mono_px + 4.0f * s) + 14.0f * s;
+    ImGui::PushID(id);
+    const bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, h)) && enabled;
+    ImGui::PopID();
+    const bool hot = enabled && ImGui::IsItemHovered();
+    if (hot) {
+        list->AddRectFilled(p, ImVec2(p.x + w, p.y + h), U32(theme::Alpha(theme::kAccent, 0.10f)), theme::kRadius * s);
+        list->AddRectFilled(p, ImVec2(p.x + 2.0f * s, p.y + h), U32(theme::kAccent));
+    }
+    const float top = p.y + 7.0f * s;
+    draw::Glyph(list, ImVec2(p.x + 16.0f * s, top + line * 0.5f), glyph, U32(!enabled ? theme::kFgDim : hot ? theme::kAccent : tint),
+                hot, 16.0f);
+    const float x = p.x + 34.0f * s, right = p.x + w - 10.0f * s;
+    float note_w = 0.0f;
+    if (!note.empty()) {
+        const ImVec2 size = mono->CalcTextSizeA(mono_px, FLT_MAX, 0.0f, note.c_str());
+        note_w = size.x + 12.0f * s;
+        list->AddText(mono, mono_px, ImVec2(right - size.x, top + (line - size.y) * 0.5f), U32(theme::kFgDim), note.c_str());
+    }
+    list->AddText(body, body_px, ImVec2(x, top), U32(enabled ? theme::kFg : theme::kFgDim),
+                  Elide(body, body_px, title, right - note_w - x, false).c_str());
+    if (!detail.empty())
+        list->AddText(mono, mono_px, ImVec2(x, top + line + 4.0f * s), U32(theme::kFgDim),
+                      Elide(mono, mono_px, detail, right - x, false).c_str());
+    return clicked;
+}
+
+}  // namespace
+
+// The editor's own document, a full-window page between the toolbar and the status bar while
+// no scene is open: templates, recent scenes with their last viewport, examples and checks.
+void ImGuiLayer::DrawStartPage() {
+    const StartPage& page = frame_.ui->start;
+    if (!page.shown) return;
+    const float s = nui::Scale();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::kBg0);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(36.0f * s, 26.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoScrollWithMouse;
+    const bool open = ImGui::Begin("##start", nullptr, flags);
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    const ImVec2 origin = ImGui::GetWindowPos(), size = ImGui::GetWindowSize();
+    const ImVec2 corner(origin.x + size.x, origin.y + size.y);
+    if (open) {
+        ImDrawList* list = ImGui::GetWindowDrawList();
+        // A faint blueprint grid under an accent glow from the top-left.
+        const float cell = 32.0f * s;
+        const ImU32 grid = U32(theme::Alpha(theme::kLine, 0.35f));
+        for (float gx = origin.x + cell; gx < corner.x; gx += cell) list->AddLine(ImVec2(gx, origin.y), ImVec2(gx, corner.y), grid);
+        for (float gy = origin.y + cell; gy < corner.y; gy += cell) list->AddLine(ImVec2(origin.x, gy), ImVec2(corner.x, gy), grid);
+        list->AddRectFilledMultiColor(origin, corner, U32(theme::Alpha(theme::kAccent, 0.10f)), U32(theme::Alpha(theme::kAccent, 0.0f)),
+                                      U32(theme::Alpha(theme::kBg0, 0.0f)), U32(theme::Alpha(theme::kAccent, 0.03f)));
+
+        render::imgui::DrawNukaLogo(44.0f * s);
+        ImGui::SameLine(0.0f, 14.0f * s);
+        ImGui::BeginGroup();
+        nui::PushTextStyle(TextStyle::Hero);
+        ImGui::TextUnformatted("NUKA EDITOR");
+        nui::PopTextStyle();
+        ImGui::TextColored(theme::kFgMuted, "%s", Tr("Physics-first scene editor"));
+        ImGui::EndGroup();
+        const auto keys = [this](const char* id) { return ShortcutText(registry_->Find(id)->shortcut); };
+        {
+            ImFont* label_font = GetNukaFont(FontRole::Display);
+            const float label_px = theme::kFontLabel * s;
+            const std::string hint = Upper(keys("file.new") + "  " + Tr("New") + "     " + keys("file.open") + "  " + Tr("Open") +
+                                           "     " + keys("app.command_palette") + "  " + Tr("Actions"));
+            const ImVec2 hs = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, hint.c_str());
+            const ImVec2 at(corner.x - 36.0f * s - hs.x, ImGui::GetItemRectMin().y + (ImGui::GetItemRectSize().y - hs.y) * 0.5f);
+            list->AddText(label_font, label_px, at, U32(theme::kFgDim), hint.c_str());
+        }
+        const ImVec2 rule = ImGui::GetCursorScreenPos();
+        const float full = ImGui::GetContentRegionAvail().x;
+        list->AddRectFilled(ImVec2(rule.x, rule.y + 10.0f * s), ImVec2(rule.x + full, rule.y + 11.0f * s), U32(theme::kLine));
+        list->AddRectFilled(ImVec2(rule.x, rule.y + 9.5f * s), ImVec2(rule.x + 96.0f * s, rule.y + 11.5f * s), U32(theme::kAccent));
+        ImGui::Dummy(ImVec2(full, 26.0f * s));
+
+        const float gap = 28.0f * s;
+        const float line = ImGui::GetTextLineHeight();
+        const float footer = line + 14.0f * s;
+        const float column_h = ImGui::GetContentRegionAvail().y - footer;
+        const float side = std::clamp(full * 0.24f, 220.0f * s, 300.0f * s);
+        const float middle = full - side * 2.0f - gap * 2.0f;
+        const auto path_args = [](const std::string& path) { return Args({{"path", json::Value::Str(path)}}); };
+
+        ImGui::BeginChild("##start_new", ImVec2(side, column_h));
+        draw::SectionHeader(Tr("New"));
+        for (size_t i = 0; i < page.templates.size(); ++i) {
+            const StartEntry& t = page.templates[i];
+            if (StartRow(t.arg.c_str(), icon::kTemplate, Tr(t.title), Tr(t.detail), i == 0 ? keys("file.new") : "", true))
+                Queue("file.new", Args({{"template", json::Value::Str(t.arg)}}));
+        }
+        ImGui::Dummy(ImVec2(0.0f, 6.0f * s));
+        draw::SectionHeader(Tr("Open"));
+        if (StartRow("open", icon::kOpen, Tr("Open Scene..."), "", keys("file.open"), true)) Queue("file.open");
+        if (StartRow("window", icon::kNewWindow, Tr("Open in New Window..."), "", "", true)) Queue("file.open_window");
+        StartRow("import", icon::kImport, Tr("Import"), Tr("URDF, MJCF and USD open as untitled scenes"), Tr("SOON"), false);
+        ImGui::EndChild();
+
+        ImGui::SameLine(0.0f, gap);
+        ImGui::BeginChild("##start_recent", ImVec2(middle, column_h));
+        // Work left by an editor that ended without saving comes first.
+        if (!page.recovered.empty()) {
+            draw::SectionHeader(Tr("Recover"));
+            for (const StartEntry& r : page.recovered)
+                if (StartRow(r.arg.c_str(), icon::kRecover, Fmt(Tr("%s (autosave)"), Tr(r.title).c_str()), r.detail, "", true,
+                             theme::kWarn))
+                    Queue("file.recover", path_args(r.arg));
+            ImGui::Dummy(ImVec2(0.0f, 6.0f * s));
+        }
+        draw::SectionHeader(Tr("Recent"), Fmt("%zu", page.recent.size()).c_str());
+        if (page.recent.empty()) ImGui::TextColored(theme::kFgDim, "%s", Tr("Scenes you open or save show up here."));
+        {
+            ImDrawList* cards = ImGui::GetWindowDrawList();
+            ImFont* body = ImGui::GetFont();
+            const float body_px = ImGui::GetFontSize();
+            ImFont* mono = GetNukaFont(FontRole::Mono);
+            const float mono_px = theme::kFontMono * s;
+            const float card_gap = 14.0f * s, inset = 4.0f * s;
+            const float avail = ImGui::GetContentRegionAvail().x;
+            const size_t per_row = static_cast<size_t>(std::max(1.0f, std::floor((avail + card_gap) / (180.0f * s + card_gap))));
+            const float card_w = (avail - card_gap * static_cast<float>(per_row - 1u)) / static_cast<float>(per_row);
+            const float thumb_h = (card_w - inset * 2.0f) * 9.0f / 16.0f;
+            const float card_h = inset + thumb_h + line + mono_px + 18.0f * s;
+            for (size_t i = 0; i < page.recent.size(); ++i) {
+                const StartEntry& r = page.recent[i];
+                if (i % per_row != 0u) ImGui::SameLine(0.0f, card_gap);
+                else if (i != 0u) ImGui::Dummy(ImVec2(0.0f, card_gap - ImGui::GetStyle().ItemSpacing.y));
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::BeginGroup();
+                const ImVec2 p = ImGui::GetCursorScreenPos(), q(p.x + card_w, p.y + card_h);
+                ImGui::SetNextItemAllowOverlap();
+                const bool clicked = ImGui::InvisibleButton("##card", ImVec2(card_w, card_h));
+                const bool hot = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(p, q);
+                draw::Chamfer(cards, p, q, theme::kChamfer * s, U32(hot ? theme::kBg2 : theme::kBg1),
+                              U32(hot && r.available ? theme::kAccent : theme::kLine));
+                const ImVec2 t0(p.x + inset, p.y + inset), t1(q.x - inset, p.y + inset + thumb_h);
+                if (ImTextureData* tex = r.thumbnail.empty() ? nullptr : Thumbnail(r.thumbnail)) {
+                    cards->AddImage(tex->GetTexRef(), t0, t1);
+                } else {
+                    cards->AddRectFilled(t0, t1, U32(theme::kBg0));
+                    draw::Glyph(cards, ImVec2((t0.x + t1.x) * 0.5f, (t0.y + t1.y) * 0.5f), icon::kScene, U32(theme::kLineHi), false, 28.0f);
+                }
+                if (!r.available) {
+                    cards->AddRectFilled(t0, t1, U32(theme::Alpha(theme::kBg0, 0.65f)));
+                    const char* missing = Tr("MISSING");
+                    const ImVec2 ms = mono->CalcTextSizeA(mono_px, FLT_MAX, 0.0f, missing);
+                    cards->AddText(mono, mono_px, ImVec2((t0.x + t1.x - ms.x) * 0.5f, (t0.y + t1.y - ms.y) * 0.5f), U32(theme::kWarn),
+                                   missing);
+                }
+                const float text_x = p.x + inset + 4.0f * s, text_w = card_w - inset * 2.0f - 8.0f * s;
+                const float title_y = t1.y + 7.0f * s;
+                const ImVec2 ts = mono->CalcTextSizeA(mono_px, FLT_MAX, 0.0f, r.detail.c_str());
+                cards->AddText(mono, mono_px, ImVec2(text_x + text_w - ts.x, title_y + (line - ts.y) * 0.5f), U32(theme::kFgDim),
+                               r.detail.c_str());
+                cards->AddText(body, body_px, ImVec2(text_x, title_y), U32(r.available ? theme::kFg : theme::kFgDim),
+                               Elide(body, body_px, r.title, text_w - ts.x - 10.0f * s, false).c_str());
+                cards->AddText(mono, mono_px, ImVec2(text_x, title_y + line + 3.0f * s), U32(theme::kFgDim),
+                               Elide(mono, mono_px, r.arg, text_w, true).c_str());
+                // Remove from the list, over the picture's top-right corner while the card is hovered.
+                const float b = 22.0f * s;
+                const ImVec2 x0(t1.x - b - 4.0f * s, t0.y + 4.0f * s), x1(x0.x + b, x0.y + b);
+                ImGui::SetCursorScreenPos(x0);
+                const bool forget = ImGui::InvisibleButton("##forget", ImVec2(b, b));
+                if (hot) {
+                    const bool close_hot = ImGui::IsItemHovered();
+                    cards->AddRectFilled(x0, x1, U32(theme::Alpha(theme::kBg0, 0.85f)), theme::kRadius * s);
+                    draw::Glyph(cards, ImVec2((x0.x + x1.x) * 0.5f, (x0.y + x1.y) * 0.5f), icon::kClose,
+                                U32(close_hot ? theme::kErr : theme::kFgMuted), false, 13.0f);
+                    if (close_hot) ImGui::SetTooltip("%s", Tr("Remove from Recent"));
+                }
+                ImGui::EndGroup();
+                ImGui::PopID();
+                if (forget) Queue("file.forget_recent", path_args(r.arg));
+                else if (clicked && r.available) Queue("file.open_recent", path_args(r.arg));
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::SameLine(0.0f, gap);
+        ImGui::BeginChild("##start_more", ImVec2(side, column_h));
+        draw::SectionHeader(Tr("Examples"));
+        for (const StartEntry& e : page.examples)
+            if (StartRow(e.arg.c_str(), icon::kExample, Tr(e.title), "", e.detail, e.available))
+                Queue("file.open", path_args(e.arg));
+        ImGui::EndChild();
+
+        const std::string drop = Iconed(icon::kImport, Tr("Drop a .nks, .urdf, .xml or .usd file anywhere to open it"));
+        const float foot_y = corner.y - 26.0f * s - line, foot_mid = foot_y + line * 0.5f;
+        ImGui::SetCursorScreenPos(ImVec2(rule.x, foot_y));
+        ImGui::TextColored(theme::kFgDim, "%s", drop.c_str());
+        // The startup checks line up from the right of the footer; a hovered one shows its value.
+        ImFont* label_font = GetNukaFont(FontRole::Display);
+        const float label_px = theme::kFontLabel * s, dot = 3.0f * s;
+        float right = rule.x + full;
+        for (auto c = page.checks.rbegin(); c != page.checks.rend(); ++c) {
+            const std::string name = Upper(Tr(c->title));
+            const ImVec2 ns = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, name.c_str());
+            const ImVec2 a(right - ns.x - 8.0f * s - dot * 2.0f, foot_y), b(right, foot_y + line);
+            list->AddCircleFilled(ImVec2(a.x + dot, foot_mid), dot, U32(c->available ? theme::kOk : theme::kErr));
+            list->AddText(label_font, label_px, ImVec2(right - ns.x, foot_mid - ns.y * 0.5f),
+                          U32(c->available ? theme::kFgDim : theme::kErr), name.c_str());
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(a, b)) ImGui::SetTooltip("%s  %s", name.c_str(), c->detail.c_str());
+            right = a.x - 18.0f * s;
+        }
+    }
+    ImGui::End();
+    // Toasts go over the page's columns, which leave no room under the windows.
+    host_.DrawNotifications(ImGui::GetForegroundDrawList(ImGui::GetMainViewport()), origin, corner);
+}
+
+// The question a document-dropping action asks while there are unsaved changes.
+void ImGuiLayer::DrawPrompt() {
+    std::string& asked = frame_.ui->prompt;
+    const std::string title = std::string(Tr("Unsaved Changes")) + "###prompt";
+    if (!asked.empty() && !ImGui::IsPopupOpen(title.c_str())) ImGui::OpenPopup(title.c_str());
+    const float s = nui::Scale();
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(440.0f * s, 0.0f), ImVec2(440.0f * s, FLT_MAX));
+    if (!ImGui::BeginPopupModal(title.c_str(), nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if (asked.empty()) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    draw::Glyph(list, ImVec2(at.x + 14.0f * s, at.y + 14.0f * s), icon::kWarn, U32(theme::kWarn), true, 22.0f);
+    ImGui::SetCursorScreenPos(ImVec2(at.x + 38.0f * s, at.y));
+    ImGui::BeginGroup();
+    nui::PushTextStyle(TextStyle::Strong);
+    ImGui::TextWrapped("%s", Fmt(Tr("Save changes to %s?"), frame_.ui->doc_title.c_str()).c_str());
+    nui::PopTextStyle();
+    ImGui::TextColored(theme::kFgMuted, "%s", Tr("Your changes are lost if you don't save them."));
+    ImGui::EndGroup();
+    ImGui::Dummy(ImVec2(0.0f, 10.0f * s));
+
+    const float bw = 112.0f * s, spacing = ImGui::GetStyle().ItemSpacing.x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - bw * 3.0f - spacing * 2.0f);
+    std::string choice;
+    ImGui::PushStyleColor(ImGuiCol_Button, theme::kAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::Alpha(theme::kAccent, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::kAccentDim);
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccentInk);
+    if (ImGui::Button(Tr("Save"), ImVec2(bw, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))
+        choice = "save";
+    ImGui::PopStyleColor(4);
+    ImGui::SameLine();
+    if (ImGui::Button(Tr("Don't Save"), ImVec2(bw, 0.0f))) choice = "discard";
+    ImGui::SameLine();
+    if (ImGui::Button(Tr("Cancel"), ImVec2(bw, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) choice = "cancel";
+    if (!choice.empty()) {
+        Queue("app.answer_prompt", Args({{"choice", json::Value::Str(choice)}}));
+        asked.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+// Thumbnails share one size, so a newer file re-uploads into the texture it already has.
+ImTextureData* ImGuiLayer::Thumbnail(const std::string& file) {
+    const fs::path path = Utf8Path(file);
+    std::error_code error;
+    const fs::file_time_type stamp = fs::last_write_time(path, error);
+    if (error) return nullptr;
+    auto it = std::find_if(thumbs_.begin(), thumbs_.end(), [&](const Thumb& t) { return t.file == file; });
+    if (it != thumbs_.end() && it->stamp == stamp) return it->texture.get();
+    std::ifstream in(path, std::ios::binary);
+    std::string magic;
+    int w = 0, h = 0, max_value = 0;
+    in >> magic >> w >> h >> max_value;
+    in.get();
+    const size_t count = static_cast<size_t>(w) * static_cast<size_t>(h);
+    std::vector<unsigned char> rgb(count * 3u);
+    in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+    if (it == thumbs_.end()) {
+        thumbs_.push_back(Thumb{file, stamp, std::make_unique<ImTextureData>()});
+        it = std::prev(thumbs_.end());
+        it->texture->Create(ImTextureFormat_RGBA32, w, h);
+        ImGui::RegisterUserTexture(it->texture.get());
+    } else {
+        it->stamp = stamp;
+        it->texture->UpdateRect = ImTextureRect{0, 0, static_cast<unsigned short>(w), static_cast<unsigned short>(h)};
+        if (it->texture->Status == ImTextureStatus_OK) it->texture->SetStatus(ImTextureStatus_WantUpdates);
+    }
+    unsigned char* pixels = static_cast<unsigned char*>(it->texture->GetPixels());
+    for (size_t i = 0; i < count; ++i) {
+        pixels[i * 4u + 0u] = rgb[i * 3u + 0u];
+        pixels[i * 4u + 1u] = rgb[i * 3u + 1u];
+        pixels[i * 4u + 2u] = rgb[i * 3u + 2u];
+        pixels[i * 4u + 3u] = 255u;
+    }
+    return it->texture.get();
 }
 
 void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h, ViewerUiState& ui_state,

@@ -1222,6 +1222,8 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_host.cpp
             runtime/app/viewer/editor_api.cpp
             runtime/app/viewer/editor_extensions.cpp
+            runtime/app/viewer/editor_profile.cpp
+            runtime/app/viewer/editor_instance.cpp
         )
         add_dependencies(nuka_editor nuka_render_shaders)
         set_target_properties(nuka_editor PROPERTIES
@@ -1229,7 +1231,7 @@ if(CMAKE_CUDA_COMPILER)
             VISIBILITY_INLINES_HIDDEN ON)
         target_compile_definitions(nuka_editor PRIVATE
             NUKA_EDITOR_BUILD
-            NUKA_VIEWER_DEFAULT_SCENE="${CMAKE_SOURCE_DIR}/examples/assets/nuka_lab/gripper.nks")
+            NUKA_EDITOR_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
         target_link_libraries(nuka_editor
             PRIVATE
                 nuka
@@ -1253,20 +1255,26 @@ if(CMAKE_CUDA_COMPILER)
         nuka_set_warnings(nuka_editor)
         install(TARGETS nuka_editor LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 
-        # nuka-editor -- the launcher: an embedded interpreter running `python -m nuka.editor`.
+        # nuka-editor -- the app: an embedded interpreter running `python -m nuka.editor`. It is
+        # a GUI program; a terminal or --console gives it a console.
         find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed)
         execute_process(
             COMMAND "${Python3_EXECUTABLE}" -c "import sys; sys.stdout.write(sys.prefix)"
             OUTPUT_VARIABLE NUKA_PY_HOME)
         # Forward slashes keep the Windows prefix a valid C string literal.
         file(TO_CMAKE_PATH "${NUKA_PY_HOME}" NUKA_PY_HOME)
-        add_executable(nuka_editor_exe runtime/app/viewer/editor_exe_main.cpp)
+        add_executable(nuka_editor_exe WIN32 runtime/app/viewer/editor_exe_main.cpp)
         # A distinct output name keeps the launcher's PDB apart from nuka_editor.dll's.
         set_target_properties(nuka_editor_exe PROPERTIES OUTPUT_NAME nuka-editor)
         # Python headers as SYSTEM so libpython's macros never trip -Werror.
         target_include_directories(nuka_editor_exe SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
-        target_compile_definitions(nuka_editor_exe PRIVATE NUKA_PY_HOME="${NUKA_PY_HOME}")
+        # The app's private CPython keeps its standard library in this zip under python/.
+        target_compile_definitions(nuka_editor_exe PRIVATE NUKA_PY_HOME="${NUKA_PY_HOME}"
+            NUKA_PY_ZIP="python${Python3_VERSION_MAJOR}${Python3_VERSION_MINOR}.zip")
         target_link_libraries(nuka_editor_exe PRIVATE Python3::Python)
+        if(MSVC)
+            target_link_options(nuka_editor_exe PRIVATE /ENTRY:wmainCRTStartup)
+        endif()
         if(WIN32)
             # The interpreter DLL sits beside the launcher so no other python3x.dll on PATH wins.
             add_custom_command(TARGET nuka_editor_exe POST_BUILD

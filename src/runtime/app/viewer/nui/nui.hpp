@@ -925,7 +925,8 @@ public:
 
     void Toast(Level level, std::string text);
     void Progress(const std::string& id, const std::string& label, float fraction);
-    void DrawNotifications(const ImVec2& min, const ImVec2& max);
+    // Toasts stack up from the bottom-right corner of min..max on `list`.
+    void DrawNotifications(ImDrawList* list, const ImVec2& min, const ImVec2& max);
     // Applies string table changes, then runs the C-API event callbacks queued since the
     // last call, outside any draw.
     void DispatchEvents();

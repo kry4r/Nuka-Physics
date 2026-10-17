@@ -20,6 +20,9 @@ public:
     EditorHost(const EditorHost&) = delete;
     EditorHost& operator=(const EditorHost&) = delete;
 
+    // Hands the scene `args` names to the editor already running on their profile; false when
+    // they name no scene or no such editor runs.
+    static bool Forward(const std::vector<std::string>& args);
     void SetScriptHooks(const nuka_editor_script_hooks_t& hooks);
     void SetPythonHooks(const nuka_editor_python_hooks_t& hooks);
     void Update(bool step_physics);

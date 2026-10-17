@@ -400,6 +400,7 @@ struct PresentRenderer::Impl {
     VkSampler      shadow_sampler = VK_NULL_HANDLE;
 
     VkRenderPass     present_pass = VK_NULL_HANDLE;
+    VkRenderPass     overlay_pass = VK_NULL_HANDLE;  // present_pass loading the drawn scene back
     VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;  // set 0: per-frame SceneUbo
     VkDescriptorPool scene_pool = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
@@ -460,6 +461,9 @@ struct PresentRenderer::Impl {
     // presented image is copied to a host buffer and written to capture_path_ (PPM).
     int         capture_frame_ = -1;
     std::string capture_path_;
+    // The same for the scene viewport alone, read before the overlay draws over it.
+    int         scene_capture_frame_ = -1;
+    std::string scene_capture_path_;
     uint64_t    draw_counter_ = 0;
 
     VkDevice         device = VK_NULL_HANDLE;
@@ -770,6 +774,11 @@ struct PresentRenderer::Impl {
         info.pDependencies = deps.data();
         CheckVk(vkCreateRenderPass(device, &info, nullptr, &present_pass),
                 "vkCreateRenderPass(present)");
+        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        CheckVk(vkCreateRenderPass(device, &info, nullptr, &overlay_pass),
+                "vkCreateRenderPass(overlay)");
     }
 
     void CreateDepthResources() {
@@ -1405,6 +1414,7 @@ struct PresentRenderer::Impl {
         // sets stay valid (a byte-identical re-created layout remains bind-compatible).
         if (scene_set_layout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device, scene_set_layout, nullptr); scene_set_layout = VK_NULL_HANDLE; }
         if (present_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(device, present_pass, nullptr); present_pass = VK_NULL_HANDLE; }
+        if (overlay_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(device, overlay_pass, nullptr); overlay_pass = VK_NULL_HANDLE; }
         for (VkImageView v : image_views) {
             if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
         }
@@ -1621,6 +1631,57 @@ struct PresentRenderer::Impl {
         uint32_t  instance_row = 0;
     };
 
+    // Copies `area` of a presentable swapchain image into `out`, then moves the image to `after`.
+    static void RecordReadback(VkCommandBuffer cmd, VkImage image, const VkRect2D& area, VkBuffer out,
+                               VkImageLayout after) {
+        VkImageMemoryBarrier to_src{};
+        to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.image = image;
+        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+        to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &to_src);
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1u;
+        region.imageOffset = {area.offset.x, area.offset.y, 0};
+        region.imageExtent = {area.extent.width, area.extent.height, 1u};
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out, 1u, &region);
+        VkImageMemoryBarrier back = to_src;
+        back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        back.newLayout = after;
+        back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        back.dstAccessMask = 0u;
+        VkPipelineStageFlags next_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        if (after == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+            back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            next_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, next_stage, 0, 0, nullptr, 0, nullptr,
+                             1, &back);
+    }
+
+    // Writes a finished readback as a PPM and frees its buffer.
+    void FinishReadback(GpuBuffer& buf, uint32_t width, uint32_t height, const std::string& path) {
+        void* mapped = nullptr;
+        if (vkMapMemory(device, buf.memory, 0, static_cast<VkDeviceSize>(width) * height * 4u, 0,
+                        &mapped) == VK_SUCCESS) {
+            const bool bgr_swap = (surface_format == VK_FORMAT_B8G8R8A8_UNORM ||
+                                   surface_format == VK_FORMAT_B8G8R8A8_SRGB);
+            WritePpm(path, static_cast<const uint8_t*>(mapped), width, height, bgr_swap);
+            vkUnmapMemory(device, buf.memory);
+            std::fprintf(stderr, "[present] captured frame %llu -> %s (%ux%u)\n",
+                         static_cast<unsigned long long>(draw_counter_), path.c_str(), width, height);
+        }
+        Destroy(buf);
+    }
+
     PresentFrameResult DrawFrame(const RenderWorld& world, const RasterOptions& options,
                                  const OverlayRecordFn& overlay, const PresentInterop* interop) {
         if (window_surface->Width() == 0u || window_surface->Height() == 0u) {
@@ -1740,6 +1801,14 @@ struct PresentRenderer::Impl {
                 static_cast<VkDeviceSize>(extent.width) * extent.height * 4u,
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         }
+        const bool do_scene_capture = scene_capture_frame_ >= 0 && !scene_rect.Empty() &&
+                                      draw_counter_ == static_cast<uint64_t>(scene_capture_frame_);
+        GpuBuffer scene_capture_buf{};
+        if (do_scene_capture) {
+            scene_capture_buf = CreateHostBuffer(
+                static_cast<VkDeviceSize>(scene_rect.width) * scene_rect.height * 4u,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
 
         // -- record ----------------------------------------------------------
         VkCommandBuffer cmd = command_buffers[frame];
@@ -1851,6 +1920,15 @@ struct PresentRenderer::Impl {
             }
         }
 
+        // The scene alone is read between two passes; the second loads it back for the overlay.
+        if (do_scene_capture) {
+            vkCmdEndRenderPass(cmd);
+            RecordReadback(cmd, images[image_index], scissor, scene_capture_buf.buffer,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            rp.renderPass = overlay_pass;
+            vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        }
+
         // Overlay (ImGui) records INSIDE the pass, after the scene.
         if (overlay) {
             overlay(reinterpret_cast<void*>(cmd));
@@ -1861,34 +1939,8 @@ struct PresentRenderer::Impl {
         // Reliable capture: copy the just-presented image (now PRESENT_SRC) into a
         // host buffer, then restore PRESENT_SRC so the present still succeeds.
         if (do_capture) {
-            VkImageMemoryBarrier to_src{};
-            to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            to_src.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            to_src.image = images[image_index];
-            to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
-            to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                                 1, &to_src);
-            VkBufferImageCopy region{};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.layerCount = 1u;
-            region.imageExtent = {extent.width, extent.height, 1u};
-            vkCmdCopyImageToBuffer(cmd, images[image_index],
-                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buf.buffer,
-                                   1u, &region);
-            VkImageMemoryBarrier to_present = to_src;
-            to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            to_present.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            to_present.dstAccessMask = 0u;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
-                                 1, &to_present);
+            RecordReadback(cmd, images[image_index], VkRect2D{{0, 0}, extent}, capture_buf.buffer,
+                           VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         }
         CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present)");
 
@@ -1935,25 +1987,14 @@ struct PresentRenderer::Impl {
         // the frame pipelines (the top-of-frame fence wait bounds frames-in-flight).
         // The readback path is the one exception: the copy lives in THIS command
         // buffer, so wait its fence before mapping the host-visible capture buffer.
-        if (do_capture) {
+        if (do_capture || do_scene_capture) {
             CheckVk(vkWaitForFences(device, 1u, &in_flight[frame], VK_TRUE,
                                     std::numeric_limits<uint64_t>::max()),
                     "vkWaitForFences(capture)");
-            void* mapped = nullptr;
-            if (vkMapMemory(device, capture_buf.memory, 0,
-                            static_cast<VkDeviceSize>(extent.width) * extent.height * 4u, 0,
-                            &mapped) == VK_SUCCESS) {
-                const bool bgr_swap = (surface_format == VK_FORMAT_B8G8R8A8_UNORM ||
-                                       surface_format == VK_FORMAT_B8G8R8A8_SRGB);
-                WritePpm(capture_path_, static_cast<const uint8_t*>(mapped), extent.width,
-                         extent.height, bgr_swap);
-                vkUnmapMemory(device, capture_buf.memory);
-                std::fprintf(stderr, "[present] captured frame %llu -> %s (%ux%u)\n",
-                             static_cast<unsigned long long>(draw_counter_),
-                             capture_path_.c_str(), extent.width, extent.height);
-            }
-            Destroy(capture_buf);
         }
+        if (do_capture) FinishReadback(capture_buf, extent.width, extent.height, capture_path_);
+        if (do_scene_capture)
+            FinishReadback(scene_capture_buf, scene_rect.width, scene_rect.height, scene_capture_path_);
 
         current_frame = (current_frame + 1u) % kFramesInFlight;
         ++draw_counter_;
@@ -2024,6 +2065,11 @@ void PresentRenderer::WaitIdle() {
 void PresentRenderer::SetCaptureFrame(int frame_index, std::string ppm_path) {
     impl_->capture_frame_ = frame_index;
     impl_->capture_path_ = std::move(ppm_path);
+}
+
+void PresentRenderer::SetSceneCaptureFrame(int frame_index, std::string ppm_path) {
+    impl_->scene_capture_frame_ = frame_index;
+    impl_->scene_capture_path_ = std::move(ppm_path);
 }
 
 void PresentRenderer::SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout) {

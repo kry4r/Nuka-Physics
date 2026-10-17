@@ -1,0 +1,39 @@
+{
+  "nks_version": 1,
+  "environment": {
+    "grade": 0.08,
+    "specular_env": true,
+    "shadow": {"map_size": 2048, "strength": 0.9, "bias": 0.0002, "filter_radius": 1.0},
+    "sky": {
+      "top": [0.18, 0.24, 0.27],
+      "bottom": [0.39, 0.44, 0.43],
+      "ground": [0.115, 0.13, 0.13],
+      "ambient_sky": [0.12, 0.17, 0.18],
+      "ambient_ground": [0.075, 0.09, 0.09],
+      "background": [0.098, 0.133, 0.141],
+      "fill": 0.6
+    }
+  },
+  "tree": [
+    {
+      "name": "camera",
+      "camera": {
+        "local": {"pos": [2.5894, -4.1439, 2.1285], "quat": [0.787419, 0.551357, 0.158099, 0.225789]},
+        "vertical_fov_degrees": 40,
+        "near_clip": 0.05,
+        "far_clip": 100,
+        "focus_distance": 5.2,
+        "shadow_radius": 0
+      }
+    },
+    {
+      "name": "key_light",
+      "light": {
+        "type": "directional",
+        "local": {"quat": [0.8885638, 0.3425216, -0.1097662, -0.2847537]},
+        "color": [3.4, 3.2, 2.9],
+        "intensity": 1
+      }
+    }
+  ]
+}

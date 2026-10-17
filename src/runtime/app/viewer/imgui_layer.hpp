@@ -10,6 +10,7 @@
 #include "scene/ecs/entity.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -58,6 +59,21 @@ struct GizmoState {
     float snap_rotate = 15.0f;     // degrees
     bool active = false;     // host-set: hovered or dragged this frame
     bool using_now = false;  // host-set: dragged this frame; the release ends one edit
+};
+
+// One card of the start page.
+struct StartEntry {
+    std::string title;
+    std::string detail;     // a path, a time or a check's finding
+    std::string arg;        // the template or file the card's action takes
+    std::string thumbnail;  // a PPM of the scene's viewport at its last save, or empty
+    bool available = true;  // false: the file is gone or the check failed
+};
+
+// What the start page lists; the host refreshes it while the page shows.
+struct StartPage {
+    bool shown = false;
+    std::vector<StartEntry> templates, recent, recovered, examples, checks;
 };
 
 // Transport, selection and panel state. The UI queues actions for anything that changes the
@@ -113,6 +129,14 @@ struct ViewerUiState {
     char script_buf[16384] = {0};
     std::string console_log;
     int script_node_count = 0;
+
+    // A script owns the world: New and Open start another editor, closing keeps the world.
+    bool script_session = false;
+    bool script_driven = false;  // the script steps the world, not the editor
+    std::string script_name;
+    std::string doc_title = "untitled";
+    std::string prompt;  // the action waiting on save, don't save or cancel
+    StartPage start;
 };
 
 // Per-frame physics and render facts the panels show.
@@ -229,6 +253,10 @@ private:
     void DrawStatusBar();
     void DrawPalette();
     void DrawAbout();
+    void DrawStartPage();
+    void DrawPrompt();
+    // The texture of a PPM file, reloaded when the file changes; null without the file.
+    ImTextureData* Thumbnail(const std::string& file);
     void DockLayout(unsigned int dockspace);
     bool MenuAction(const std::string& id);
 
@@ -261,6 +289,12 @@ private:
     int palette_index_ = 0;
     std::vector<std::string> palette_recent_;
     bool about_open_ = false;
+    struct Thumb {
+        std::string file;
+        std::filesystem::file_time_type stamp;
+        std::unique_ptr<ImTextureData> texture;
+    };
+    std::vector<Thumb> thumbs_;  // kept for the editor's lifetime; ImGui's shutdown frees them
 };
 
 }  // namespace nuka::runtime::app::viewer

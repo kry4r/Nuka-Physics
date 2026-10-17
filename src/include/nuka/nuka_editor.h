@@ -60,6 +60,11 @@ typedef struct nuka_editor_python_hooks_t {
 NUKA_EDITOR_API nuka_result_t nuka_editor_create(int argc, const char* const* argv,
                                                  nuka_world_handle world, float dt,
                                                  nuka_editor_handle* out);
+// Why this thread's last nuka_editor_create failed, naming the session log; "" after a success.
+NUKA_EDITOR_API const char* nuka_editor_create_error(void);
+// Hands the scene argv names to the editor already running on the same profile, which opens it
+// and comes to the front. 0 when argv names no scene or no such editor runs.
+NUKA_EDITOR_API uint32_t nuka_editor_forward(int argc, const char* const* argv);
 NUKA_EDITOR_API void nuka_editor_destroy(nuka_editor_handle editor);
 NUKA_EDITOR_API nuka_result_t nuka_editor_set_script_hooks(nuka_editor_handle editor,
                                                            const nuka_editor_script_hooks_t* hooks);

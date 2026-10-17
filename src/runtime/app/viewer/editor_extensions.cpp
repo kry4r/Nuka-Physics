@@ -337,6 +337,7 @@ struct ExtensionManager::Impl {
     uint64_t shadows = 0u;
     std::mutex log_mu;
     std::vector<std::pair<std::string, std::string>> pending_logs;  // extension id, line
+    std::map<std::string, bool> choices;  // id -> enabled, as the user last switched it
 
     Record* Find(std::string_view id) {
         for (const auto& r : records)
@@ -370,6 +371,15 @@ struct ExtensionManager::Impl {
         json::Value args = json::Value::Object();
         args.Set("id", json::Value::Str(extension_id));
         services.ui->Nui().actions.run(id, args);
+    }
+
+    void Choose(const Record& r, bool on) {
+        choices[r.id] = on;
+        toml::array enabled;
+        toml::array disabled;
+        for (const auto& [id, chosen] : choices) (chosen ? enabled : disabled).push_back(id);
+        std::ofstream out(services.state_file, std::ios::binary | std::ios::trunc);
+        out << toml::table{{"enabled", enabled}, {"disabled", disabled}} << "\n";
     }
 
     void Discover();
@@ -874,6 +884,7 @@ void Impl::RegisterActions() {
                   [this, record](const json::Value& args) {
                       Record& r = record(args);
                       r.wanted = true;
+                      Choose(r, true);
                       std::vector<std::string> chain;
                       if (!Enable(r, chain)) return ActionResult::Fail(r.error);
                       return ActionResult{true, Describe(r), {}};
@@ -883,6 +894,7 @@ void Impl::RegisterActions() {
                   [this, record](const json::Value& args) {
                       Record& r = record(args);
                       r.wanted = false;
+                      Choose(r, false);
                       Disable(r);
                       return ActionResult{true, Describe(r), {}};
                   },
@@ -1011,6 +1023,12 @@ void ExtensionManager::Configure(ExtensionServices services, std::vector<fs::pat
     m.services = std::move(services);
     m.folders = std::move(folders);
     m.startup = std::move(startup);
+    if (fs::exists(m.services.state_file)) {
+        const toml::table state = ParseToml(m.services.state_file);
+        for (const char* key : {"enabled", "disabled"})
+            if (const toml::array* ids = state[key].as_array())
+                for (const toml::node& id : *ids) m.choices[id.value_or(std::string())] = key[0] == 'e';
+    }
     for (const ImGuiLayer::BuiltinExtension& builtin : ImGuiLayer::Builtins()) {
         auto record = std::make_unique<Record>();
         record->id = builtin.id;
@@ -1018,15 +1036,18 @@ void ExtensionManager::Configure(ExtensionServices services, std::vector<fs::pat
         record->description = builtin.description;
         record->version = "1.0.0";
         record->builtin = &builtin;
-        record->wanted = true;
+        const auto chosen = m.choices.find(builtin.id);
+        record->wanted = chosen == m.choices.end() || chosen->second;
         m.records.push_back(std::move(record));
     }
     m.Discover();
+    for (const auto& [id, on] : m.choices)
+        if (Record* r = m.Find(id); r != nullptr && r->builtin == nullptr) r->wanted = on;
     m.RegisterActions();
     // Built-ins start now, so their panels and actions exist before the first frame.
     for (const auto& r : m.records) {
         std::vector<std::string> chain;
-        if (r->builtin != nullptr) m.Enable(*r, chain);
+        if (r->builtin != nullptr && r->wanted) m.Enable(*r, chain);
     }
     nui::Host& host = m.services.ui->Nui();
     std::lock_guard<std::recursive_mutex> lock(host.Mutex());

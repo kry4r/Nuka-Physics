@@ -1,0 +1,13 @@
+{
+  "templates": [
+    {"id": "empty", "title": "Empty Scene", "detail": "Start from nothing"},
+    {"id": "ground", "title": "Ground Plane", "detail": "A static ground to build on"}
+  ],
+  "examples": [
+    {"path": "examples/assets/nuka_lab/gripper.nks", "title": "Gripper", "detail": "gripper.nks"},
+    {"path": "examples/assets/nuka_lab/arena.nks", "title": "Arena", "detail": "arena.nks"},
+    {"path": "examples/assets/nuka_lab/compression.nks", "title": "Compression", "detail": "compression.nks"},
+    {"path": "examples/assets/nuka_lab/bunny.nks", "title": "Bunny", "detail": "bunny.nks"},
+    {"path": "examples/assets/nuka_lab/stage.nks", "title": "Lab Stage", "detail": "stage.nks"}
+  ]
+}

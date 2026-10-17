@@ -1,6 +1,8 @@
-"""Editor scenarios ``{"name", "launch", "steps"}``: ``python -m nuka.editor.smoke s.json --out DIR``.
+"""Editor scenarios ``{"name", "launch", "start_page", "steps"}``: ``python -m nuka.editor.smoke s.json --out DIR``.
 
-Strings take ``${out}``, ``${scenario_dir}`` and bound values; exit 0 only when every step passed."""
+Each run gets a fresh profile in ``<out>/profile``; the editor opens on its start page only when
+``start_page`` is true. Strings take ``${out}``, ``${profile}``, ``${scenario_dir}`` and bound
+values; exit 0 only when every step passed."""
 
 from __future__ import annotations
 
@@ -8,6 +10,7 @@ import argparse
 import json
 import pathlib
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -89,11 +92,14 @@ class _Run:
         return {"state": world.state_hash() if world is not None else None, "doc": self.app.document()["hash"]}
 
     def action(self, step: dict):
-        """``{"action": id, "args", "bind": name, "expect_error"}``; bind keeps the reply value."""
+        """``{"action": id, "args", "bind": name, "expect_error", "expect_value": {key: value}}``;
+        bind keeps the reply value."""
         reply = self.run(step["action"], _resolve(step.get("args", {}), self.vars))
         if "bind" in step:
             self.vars[step["bind"]] = reply["value"]
-        return reply["ok"] != step.get("expect_error", False), {"reply": reply}
+        want = _resolve(step.get("expect_value", {}), self.vars)
+        diffs = {k: {"want": v, "got": reply["value"].get(k)} for k, v in want.items() if reply["value"].get(k) != v}
+        return reply["ok"] != step.get("expect_error", False) and not diffs, {"reply": reply, "diffs": diffs}
 
     def tick(self, step: dict):
         """``{"tick": n}``: sim.step when paused, the transport when playing."""
@@ -174,8 +180,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
     out = pathlib.Path(opts.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    variables = {"out": out.as_posix(), "scenario_dir": scenario_path.parent.as_posix()}
-    launch = ["--empty"] + (["--offscreen"] if opts.offscreen else []) + _resolve(scenario.get("launch", []), variables)
+    profile = out / "profile"
+    shutil.rmtree(profile, ignore_errors=True)
+    variables = {"out": out.as_posix(), "profile": profile.as_posix(), "scenario_dir": scenario_path.parent.as_posix()}
+    launch = ([] if scenario.get("start_page") else ["--empty"]) + (["--offscreen"] if opts.offscreen else [])
+    launch += ["--profile", profile.as_posix()] + _resolve(scenario.get("launch", []), variables)
 
     app = EditorApp(launch)
     run = _Run(app, out, variables)

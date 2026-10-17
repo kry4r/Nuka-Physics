@@ -89,6 +89,8 @@ public:
     size_t RedoDepth() const { return redo_.size(); }
     const EntityRecordIndex& Records() const { return records_; }
     void MarkSaved() { saved_ = StateId(); }
+    // A recovered document differs from its file until it is saved.
+    void MarkUnsaved() { saved_ = ~0ull; }
     bool Dirty() const { return StateId() != saved_; }
     uint64_t Revision() const { return revision_; }
     void AddBranch(TimelineBranch branch) { branches_.push_back(std::move(branch)); }
