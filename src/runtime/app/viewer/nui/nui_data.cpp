@@ -467,9 +467,15 @@ void PropertyGrid::BuildFromSchema(const json::Value& schema) {
 }
 
 void PropertyGrid::DrawSelf() {
+    // The label column fits the longest label, between a quarter and 55% of the row.
+    float widest = 0.0f;
+    for (const auto& child : children_)
+        if (child->Shown()) widest = std::max(widest, child->LabelWidth());
+    const float avail = ImGui::GetContentRegionAvail().x;
     if (!ImGui::BeginTable("##properties", 2, ImGuiTableFlags_SizingStretchProp)) return;
-    ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, theme::kLabelColumn);
-    ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 1.0f - theme::kLabelColumn);
+    ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
+                            std::min(std::max(widest, avail * 0.25f), avail * 0.55f));
+    ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
     for (const auto& child : children_) {
         if (!child->Shown()) continue;
         if (!child->IsField()) {

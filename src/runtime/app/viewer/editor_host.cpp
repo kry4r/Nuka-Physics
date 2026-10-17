@@ -565,6 +565,27 @@ ActionResult Outcome(const ApplyResult& r) {
     return r.ok ? Ok(Object({{"focus", json::Value::Str(r.focus)}})) : ActionResult::Fail(r.error);
 }
 
+// The frameless window's hit test: a restored window's edges resize it and the title bar's empty
+// spans move it; Windows then gives the bar double-click maximize and snapping.
+SDL_HitTestResult SDLCALL TitleBarHitTest(SDL_Window* window, const SDL_Point* point, void* data) {
+    const TitleBar& bar = *static_cast<const TitleBar*>(data);
+    const float x = static_cast<float>(point->x), y = static_cast<float>(point->y);
+    if (!bar.maximized) {
+        int w = 0, h = 0;
+        SDL_GetWindowSize(window, &w, &h);
+        const bool left = x < bar.edge, right = x >= static_cast<float>(w) - bar.edge;
+        if (y < bar.edge) return left ? SDL_HITTEST_RESIZE_TOPLEFT : right ? SDL_HITTEST_RESIZE_TOPRIGHT : SDL_HITTEST_RESIZE_TOP;
+        if (y >= static_cast<float>(h) - bar.edge)
+            return left ? SDL_HITTEST_RESIZE_BOTTOMLEFT : right ? SDL_HITTEST_RESIZE_BOTTOMRIGHT : SDL_HITTEST_RESIZE_BOTTOM;
+        if (left) return SDL_HITTEST_RESIZE_LEFT;
+        if (right) return SDL_HITTEST_RESIZE_RIGHT;
+    }
+    if (y < bar.height)
+        for (const auto& [x0, x1] : bar.drag)
+            if (x >= x0 && x < x1) return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
 // The Solver view keeps this many of the newest telemetry records.
 constexpr size_t kSolverHistory = 2048u;
 
@@ -990,7 +1011,20 @@ void EditorHost::State::StartShell() {
     info.render_pass     = reinterpret_cast<NukaVkRenderPass>(present_->PresentRenderPass());
     info.subpass         = 0u;
     if (!imgui_.Init(info)) throw std::runtime_error("ImGui init failed");
-    if (native_window_ != nullptr) ImGui_ImplSDL3_InitForVulkan(static_cast<SDL_Window*>(native_window_));
+    if (native_window_ != nullptr) {
+        SDL_Window* window = static_cast<SDL_Window*>(native_window_);
+        ImGui_ImplSDL3_InitForVulkan(window);
+        // The window has no system frame: the UI draws the title bar and the hit test moves and sizes it.
+        SDL_SetWindowHitTest(window, TitleBarHitTest, &ui_state_.title_bar);
+        uint32_t w = 0u, h = 0u;
+        std::vector<unsigned char> logo = render::imgui::NukaLogoPixels(&w, &h);
+        if (!logo.empty()) {
+            SDL_Surface* icon = SDL_CreateSurfaceFrom(static_cast<int>(w), static_cast<int>(h), SDL_PIXELFORMAT_RGBA32,
+                                                      logo.data(), static_cast<int>(w * 4u));
+            SDL_SetWindowIcon(window, icon);
+            SDL_DestroySurface(icon);
+        }
+    }
 
     ui_.EnableDocking();  // must precede the first NewFrame
     RegisterActions();
@@ -1042,7 +1076,10 @@ EditorHost::State::~State() {
     StopWorker();
     if (present_) {
         present_->WaitIdle();
-        if (native_window_ != nullptr) ImGui_ImplSDL3_Shutdown();
+        if (native_window_ != nullptr) {
+            SDL_SetWindowHitTest(static_cast<SDL_Window*>(native_window_), nullptr, nullptr);
+            ImGui_ImplSDL3_Shutdown();
+        }
         imgui_.Shutdown();
         Emit(stdout, Format("[nuka_editor] done: frames=%llu presented=%d last_step_healthy=%s\n",
                             static_cast<unsigned long long>(frame_index_), presented_,
@@ -2050,6 +2087,48 @@ void EditorHost::State::RegisterAppActions() {
                       running_ = false;
                       if (native_window_ != nullptr) SDL_HideWindow(static_cast<SDL_Window*>(native_window_));
                       return Ok();
+                  }});
+    // The title bar's window buttons, its close button being app.exit, and the window's state.
+    const auto windowed = [this] { return native_window_ != nullptr; };
+    actions_.Add({"window.minimize", "Minimize", "window", "", ShortcutScope::Global, windowed, {},
+                  [this](const json::Value&) {
+                      SDL_MinimizeWindow(static_cast<SDL_Window*>(native_window_));
+                      return Ok();
+                  }});
+    actions_.Add({"window.maximize", "Maximize", "window", "", ShortcutScope::Global, windowed,
+                  [this] { return ui_state_.title_bar.maximized; },
+                  [this](const json::Value&) {
+                      SDL_Window* window = static_cast<SDL_Window*>(native_window_);
+                      if (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(window);
+                      else SDL_MaximizeWindow(window);
+                      return Ok();
+                  }});
+    actions_.Add({"window.restore", "Restore", "window", "", ShortcutScope::Global, windowed, {},
+                  [this](const json::Value&) {
+                      SDL_RestoreWindow(static_cast<SDL_Window*>(native_window_));
+                      return Ok();
+                  }});
+    actions_.Add({"window.state", "Window State", "window", "", ShortcutScope::Global, windowed, {},
+                  [this](const json::Value&) {
+                      SDL_Window* window = static_cast<SDL_Window*>(native_window_);
+                      const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+                      int x = 0, y = 0, w = 0, h = 0;
+                      SDL_GetWindowPosition(window, &x, &y);
+                      SDL_GetWindowSize(window, &w, &h);
+                      json::Value drag = json::Value::Array();
+                      for (const auto& [x0, x1] : ui_state_.title_bar.drag) {
+                          json::Value span = json::Value::Array();
+                          span.PushBack(json::Value::Float(x0));
+                          span.PushBack(json::Value::Float(x1));
+                          drag.PushBack(std::move(span));
+                      }
+                      return Ok(Object({{"maximized", json::Value::Bool((flags & SDL_WINDOW_MAXIMIZED) != 0)},
+                                        {"minimized", json::Value::Bool((flags & SDL_WINDOW_MINIMIZED) != 0)},
+                                        {"focused", json::Value::Bool((flags & SDL_WINDOW_INPUT_FOCUS) != 0)},
+                                        {"x", json::Value::Int(x)}, {"y", json::Value::Int(y)},
+                                        {"width", json::Value::Int(w)}, {"height", json::Value::Int(h)},
+                                        {"title_bar", Object({{"height", json::Value::Float(ui_state_.title_bar.height)},
+                                                              {"drag", std::move(drag)}})}}));
                   }});
     actions_.Add({"app.answer_prompt", "Answer", "app", "", ShortcutScope::Global, [this] { return prompt_.has_value(); }, {},
                   [this](const json::Value& args) {
@@ -3221,6 +3300,8 @@ void EditorHost::State::Frame(bool step_physics) {
         window_title_ = title;
         SDL_SetWindowTitle(static_cast<SDL_Window*>(native_window_), title.c_str());
     }
+    if (native_window_ != nullptr)
+        ui_state_.title_bar.maximized = (SDL_GetWindowFlags(static_cast<SDL_Window*>(native_window_)) & SDL_WINDOW_MAXIMIZED) != 0;
     if (ui_state_.save_dirty && doc_.Revision() != autosaved_revision_ && Clock::now() >= autosave_due_) Autosave();
     // The lists also feed File > Open Recent, so they stay current while a scene is open.
     ui_state_.start.shown = StartShown();

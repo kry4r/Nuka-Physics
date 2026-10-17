@@ -53,6 +53,7 @@ std::string ActionTip(const std::string& action);
 void RunAction(const std::string& action, const json::Value& args);
 // The 40% label cell of a field row; inside a PropertyGrid it is the first table column.
 void FieldLabel(const std::string& label, Tier tier, bool in_grid);
+float FieldLabelWidth(const std::string& label, Tier tier);
 bool InGrid(const Node* parent);
 // The C function table over `host`.
 void FillApi(nuka_nui_api_t& api, Host* host);

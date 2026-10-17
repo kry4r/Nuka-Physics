@@ -168,6 +168,8 @@ public:
     void Draw();
     bool Shown() const { return visible && (!visible_if || visible_if()); }
     virtual bool IsField() const { return false; }
+    // The width a field's label needs, for its PropertyGrid to fit the label column.
+    virtual float LabelWidth() const { return 0.0f; }
     template <class T, class... Args>
     T& Add(Args&&... args) {
         auto node = std::make_unique<T>(std::forward<Args>(args)...);
@@ -449,13 +451,14 @@ protected:
 
 // ---- fields -------------------------------------------------------------------------------
 
-// A labelled editor row: the label takes the left 40% (a table column inside a PropertyGrid).
+// A labelled editor row: the label takes the left 40%, or a PropertyGrid column fitted to its labels.
 // on_change fires every edited frame; on_commit(before, after) once the gesture ends.
 template <class T>
 class Field : public Node {
 public:
     Field(std::string caption, ModelPtr<T> value) : label(std::move(caption)), model(std::move(value)) {}
     bool IsField() const override { return true; }
+    float LabelWidth() const override;
     void SetProps(const json::Value& props) override;
     json::Value GetValue() const override;
     std::string label;
@@ -580,6 +583,7 @@ public:
         : label(std::move(caption)), hint(std::move(placeholder)), buffer_(buffer), capacity_(capacity) {}
     const char* Kind() const override { return "text_buffer"; }
     bool IsField() const override { return true; }
+    float LabelWidth() const override;
     std::string label;
     std::string hint;
     std::function<void()> on_enter;

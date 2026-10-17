@@ -54,6 +54,7 @@ void ApplyNukaTheme(float scale) {
     style.SeparatorTextBorderSize = 1.0f;
     style.WindowTitleAlign = ImVec2(0.0f, 0.5f);
     style.WindowMenuButtonPosition = ImGuiDir_None;
+    style.DockingNodeHasCloseButton = false;  // each tab closes its own panel
     style.FontSizeBase = kFontBody;
 
     ImVec4* c = style.Colors;
@@ -157,8 +158,11 @@ constexpr std::array<const char*, kFaceCount> kFaceBuildPaths = {
     NUKA_IMGUI_FONT_BODY, NUKA_IMGUI_FONT_STRONG, NUKA_IMGUI_FONT_DISPLAY, NUKA_IMGUI_FONT_MONO};
 constexpr std::array<float, kFaceCount> kFaceSizes = {theme::kFontBody, theme::kFontBody, theme::kFontLabel,
                                                       theme::kFontMono};
-// The display face's caps stand tall for their size, so its CJK is merged a size up to match.
+// The display face's caps stand tall for their size, so its CJK is merged a size up to match; on
+// the shared baseline the larger ideographs then centre on the caps by themselves.
 constexpr std::array<float, kFaceCount> kCjkScale = {1.0f, 1.0f, 1.25f, 1.0f};
+// The text faces' ideographs sit a pixel below their capitals' centre; this lifts them onto it.
+constexpr std::array<float, kFaceCount> kCjkLift = {1.0f, 1.0f, 0.0f, 0.0f};
 // The Nerd faces give up their private-use glyphs so the merged Phosphor icons win.
 constexpr ImWchar kPrivateUse[] = {0xE000, 0xF8FF, 0};
 constexpr float kIconScale = theme::kFontIcon / theme::kFontBody;
@@ -167,6 +171,8 @@ struct FontRoles {
     ImFontAtlas* atlas = nullptr;
     std::array<ImFont*, kFaceCount + 1u> faces{};
     ImFontAtlasRectId logo = ImFontAtlasRectId_Invalid;
+    std::vector<unsigned char> logo_rgba;
+    uint32_t logo_width = 0u, logo_height = 0u;
     bool cjk = false;
     std::vector<unsigned char> cjk_data;
     std::vector<unsigned char> icon_data;
@@ -220,6 +226,20 @@ bool DrawNukaLogo(float size) {
     return true;
 }
 
+bool DrawNukaLogo(ImDrawList* list, const ImVec2& min, float size) {
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    ImFontAtlasRect rect;
+    if (fonts.atlas != atlas || fonts.logo == ImFontAtlasRectId_Invalid || !atlas->GetCustomRect(fonts.logo, &rect)) return false;
+    list->AddImage(atlas->TexRef, min, ImVec2(min.x + size, min.y + size), rect.uv0, rect.uv1);
+    return true;
+}
+
+const std::vector<unsigned char>& NukaLogoPixels(uint32_t* width, uint32_t* height) {
+    *width = fonts.logo_width;
+    *height = fonts.logo_height;
+    return fonts.logo_rgba;
+}
+
 bool LoadNukaFonts() {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
@@ -239,7 +259,7 @@ bool LoadNukaFonts() {
         AddBlob(fonts.icon_data, icon_size, IconConfig(icon_size, true));
         ImFontConfig cjk;
         cjk.MergeMode = true;
-        cjk.GlyphOffset = ImVec2(0.0f, (kCjkScale[i] - 1.0f) * 0.5f * kFaceSizes[i]);
+        cjk.GlyphOffset = ImVec2(0.0f, -kCjkLift[i]);
         fonts.cjk = AddBlob(fonts.cjk_data, kFaceSizes[i] * kCjkScale[i], cjk) != nullptr;
     }
     const bool loaded = fonts.faces[0] != nullptr;
@@ -250,14 +270,18 @@ bool LoadNukaFonts() {
     io.FontDefault = fonts.faces[0];
     const auto logo = nuka::render::LoadTexture(nuka::render::ViewerResource("docs/media/nuka-logo.png", NUKA_IMGUI_LOGO), false);
     if (logo.width > 0u && logo.height > 0u && logo.channels == 4u) {
+        fonts.logo_width = logo.width;
+        fonts.logo_height = logo.height;
+        fonts.logo_rgba.resize(static_cast<size_t>(logo.width) * logo.height * 4u);
+        for (size_t i = 0; i < fonts.logo_rgba.size(); ++i)
+            fonts.logo_rgba[i] = static_cast<unsigned char>(std::clamp(logo.texels[i] * 255.0f + 0.5f, 0.0f, 255.0f));
         ImFontAtlasRect rect;
         io.Fonts->TexPixelsUseColors = true;
         fonts.logo = io.Fonts->AddCustomRect(static_cast<int>(logo.width), static_cast<int>(logo.height), &rect);
         if (fonts.logo != ImFontAtlasRectId_Invalid) {
             for (uint32_t y = 0u; y < logo.height; ++y) {
                 auto* dst = static_cast<unsigned char*>(io.Fonts->TexData->GetPixelsAt(rect.x, rect.y + static_cast<int>(y)));
-                for (uint32_t x = 0u; x < logo.width * 4u; ++x)
-                    dst[x] = static_cast<unsigned char>(std::clamp(logo.texels[static_cast<size_t>(y) * logo.width * 4u + x] * 255.0f + 0.5f, 0.0f, 255.0f));
+                std::copy_n(fonts.logo_rgba.data() + static_cast<size_t>(y) * logo.width * 4u, logo.width * 4u, dst);
             }
         }
     }

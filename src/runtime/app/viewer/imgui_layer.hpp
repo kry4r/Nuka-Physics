@@ -177,10 +177,20 @@ void HeatColor(float residual, float alert, float rgb[3]);
 // The marked element, such as "contact row 12 / particle 147", in the UI language or in English.
 std::string MarkLabel(const SolverView& v, bool translate);
 
+// The drawn title bar: the host reports the window state, the UI where the bar may drag the
+// window, in window coordinates, for the host's hit test.
+struct TitleBar {
+    bool maximized = false;
+    float height = 0.0f;
+    float edge = 0.0f;  // the resize band along a restored window's edges
+    std::vector<std::pair<float, float>> drag;  // x spans of the bar that move the window
+};
+
 // Transport, selection and panel state. The UI queues actions for anything that changes the
 // world and edits only this plain state in place.
 struct ViewerUiState {
     bool window_focused = true;
+    TitleBar title_bar;
     bool layout_modifier_down = false;
     bool playing = false;
     float speed = 1.0f;  // simulated seconds per wall second

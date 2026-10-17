@@ -6,6 +6,7 @@
 
 #include <cctype>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <initializer_list>
 #include <string>
@@ -42,6 +43,12 @@ inline std::string Upper(std::string_view text) {
 }
 
 inline std::string Iconed(const char* glyph, const char* text) { return std::string(glyph) + "  " + text; }
+
+// The whole-pixel text top that centres `font`'s capitals at `px` on the height `mid`.
+inline float CapTop(ImFont* font, float px, float mid) {
+    const ImFontGlyph* cap = font->GetFontBaked(px)->FindGlyph('N');
+    return std::round(mid - (cap->Y0 + cap->Y1) * 0.5f);
+}
 
 // `text`, or as much of it as fits in `width` behind or ahead of an ellipsis.
 inline std::string Elide(ImFont* font, float px, const std::string& text, float width, bool keep_tail) {

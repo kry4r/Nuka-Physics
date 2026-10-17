@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 
@@ -63,12 +64,33 @@ bool InputString(const char* id, const char* hint, std::string& text, ImGuiInput
                                     ResizeString, &text);
 }
 
-// Three drags in a row, each marked with its axis color; `unit` follows them once.
+// Three drags in a row, each marked with its axis color; `unit` follows them once in a slot at
+// least one em wide, so rows with different units keep their columns.
 bool AxisDrags(float* v, float speed, const char* format, const std::string& unit) {
     const float s = Scale();
     const float gap = theme::kSpace * s;
-    const float unit_w = unit.empty() ? 0.0f : ImGui::CalcTextSize(unit.c_str()).x + gap;
+    const float unit_w = unit.empty() ? 0.0f : std::max(ImGui::CalcTextSize(unit.c_str()).x, ImGui::GetFontSize()) + gap;
     const float w = (ImGui::GetContentRegionAvail().x - 2.0f * gap - unit_w) / 3.0f;
+    // A drag too narrow for its values drops decimals, down to one, rather than clip them; edits keep
+    // full precision.
+    const float room = w - 2.0f * ImGui::GetStyle().FramePadding.x;
+    int digits = ImParseFormatPrecision(format, 3);
+    const int least = std::min(digits, 1);
+    char shown[16];
+    const auto fits = [&] {
+        char text[64];
+        for (int i = 0; i < 3; ++i) {
+            std::snprintf(text, sizeof(text), "%.*f", digits, static_cast<double>(v[i]));
+            if (ImGui::CalcTextSize(text).x > room) return false;
+        }
+        return true;
+    };
+    while (digits > least && !fits()) --digits;
+    std::snprintf(shown, sizeof(shown), "%%.%df", digits);
+    // A value that rounds to zero reads 0, not -0.
+    const float tiny = 0.5f * std::pow(10.0f, -static_cast<float>(digits));
+    for (int i = 0; i < 3; ++i)
+        if (std::fabs(v[i]) < tiny) v[i] = 0.0f;
     const ImVec4 axes[3] = {theme::kAxisX, theme::kAxisY, theme::kAxisZ};
     ImDrawList* list = ImGui::GetWindowDrawList();
     bool changed = false;
@@ -76,7 +98,7 @@ bool AxisDrags(float* v, float speed, const char* format, const std::string& uni
         if (i > 0) ImGui::SameLine(0.0f, gap);
         ImGui::PushID(i);
         ImGui::SetNextItemWidth(w);
-        if (ImGui::DragFloat("##axis", &v[i], speed, 0.0f, 0.0f, format)) changed = true;
+        if (ImGui::DragFloat("##axis", &v[i], speed, 0.0f, 0.0f, shown, ImGuiSliderFlags_NoRoundToFormat)) changed = true;
         const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
         list->AddRectFilled(a, ImVec2(a.x + 2.0f * s, b.y), U32(axes[i]), theme::kRadius * s, ImDrawFlags_RoundCornersLeft);
         ImGui::PopID();
@@ -188,6 +210,12 @@ void Stat::SetProps(const json::Value& props) {
 void Stat::DrawSelf() {
     const std::string shown = value_fn ? value_fn() : Tr(value);
     const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+    // The label and value faces differ in ascent, so the value's capitals centre on the label's.
+    const auto cap_mid = [] {
+        const ImFontGlyph* cap = ImGui::GetFontBaked()->FindGlyph('N');
+        return (cap->Y0 + cap->Y1) * 0.5f;
+    };
+    const float mid = ImGui::GetCursorScreenPos().y + cap_mid();
     ImGui::PushStyleColor(ImGuiCol_Text, theme::kFgMuted);
     ImGui::TextUnformatted(Tr(label).c_str());
     ImGui::PopStyleColor();
@@ -196,7 +224,7 @@ void Stat::DrawSelf() {
     // Screen space: SameLine offsets would count a surrounding group's indent twice.
     ImGui::SameLine(0.0f, theme::kSpace * Scale());
     const ImVec2 at = ImGui::GetCursorScreenPos();
-    ImGui::SetCursorScreenPos(ImVec2(std::max(right - w, at.x), at.y));
+    ImGui::SetCursorScreenPos(ImVec2(std::max(right - w, at.x), std::round(mid - cap_mid())));
     ImGui::PushStyleColor(ImGuiCol_Text, ToneColor(tone_fn ? tone_fn() : tone));
     ImGui::TextUnformatted(shown.c_str());
     ImGui::PopStyleColor();
@@ -432,6 +460,11 @@ json::Value Field<T>::GetValue() const {
     return ToJson(model->Get());
 }
 
+template <class T>
+float Field<T>::LabelWidth() const {
+    return FieldLabelWidth(label, tier);
+}
+
 // The editor group reports activation and the end of the gesture as one item.
 template <class T>
 void Field<T>::DrawSelf() {
@@ -555,6 +588,8 @@ bool PathField::Edit(std::string& value) {
     }
     return changed;
 }
+
+float TextBufferField::LabelWidth() const { return FieldLabelWidth(label, Tier::None); }
 
 void TextBufferField::DrawSelf() {
     FieldLabel(label, Tier::None, InGrid(parent_));
@@ -843,7 +878,7 @@ void LogView::DrawSelf() {
                           ImGuiWindowFlags_HorizontalScrollbar)) {
         const bool pinned = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
         PushTextStyle(TextStyle::Mono);
-        if (count == 0u) ImGui::TextColored(theme::kFgDim, "%s", Tr(all ? "(no output yet)" : "(no match)"));
+        if (count == 0u && !all) ImGui::TextColored(theme::kFgDim, "%s", Tr("(no match)"));
         std::string file;
         int number = 0;
         ImGuiListClipper clipper;

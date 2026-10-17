@@ -29,6 +29,7 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <vector>
 
 // We name a handful of Vulkan handle types at the API boundary but do NOT want to
 // force <vulkan/vulkan.h> on every includer of this header. Vulkan dispatchable
@@ -37,6 +38,8 @@
 // compatible (these are the same underlying types), and a caller that does not
 // can still see the struct layout. The .cpp includes the real <vulkan/vulkan.h>.
 struct ImFont;
+struct ImDrawList;
+struct ImVec2;
 struct VkInstance_T;
 struct VkPhysicalDevice_T;
 struct VkDevice_T;
@@ -60,6 +63,10 @@ namespace nuka::render::imgui {
 enum class FontRole { Body, Strong, Display, Mono, IconFill };
 ImFont* GetNukaFont(FontRole role);
 bool DrawNukaLogo(float size = 24.0f);
+// Draws the logo square at `min` through `list`, outside the layout.
+bool DrawNukaLogo(ImDrawList* list, const ImVec2& min, float size);
+// The logo's RGBA8 texels, row-major, for the window icon; empty until the fonts load.
+const std::vector<unsigned char>& NukaLogoPixels(uint32_t* width, uint32_t* height);
 bool HasNukaCjkFont();
 
 

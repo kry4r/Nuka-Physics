@@ -224,15 +224,6 @@ std::string SelectionPath(const ImGuiLayer::Frame& f) {
     return path.empty() ? node->name : path;
 }
 
-std::string MeshText(const ImGuiLayer::Frame& f) {
-    for (const render::RenderInstance& ri : f.world->instances) {
-        if (ri.entity != f.ui->selected_entity) continue;
-        if (ri.mesh_id == render::kNoId || ri.mesh_id >= f.world->meshes.Count()) return Tr("none");
-        return Tr(f.world->meshes.Source(ri.mesh_id) == render::MeshSource::NkaMesh ? "mesh" : "primitive");
-    }
-    return Tr("none");
-}
-
 nui::ModelPtr<nui::Vec3> Floats3(float* v) {
     return nui::Bind<nui::Vec3>([v] { return nui::Vec3{v[0], v[1], v[2]}; },
                                 [v](const nui::Vec3& x) { std::copy(x.begin(), x.end(), v); });
@@ -558,7 +549,7 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
     for (const char* id : {"edit.apply", "edit.rename", "edit.reparent", "scene.spawn", "scene.select", "sim.play",
                            "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",
                            "file.recover", "file.autosave", "app.answer_prompt", "app.check", "solver.status",
-                           "solver.records", "solver.set_iterations"})
+                           "solver.records", "solver.set_iterations", "window.restore", "window.state"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -713,15 +704,6 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
         ImGui::SameLine();
         if (draw::IconButton("##collapse", icon::kChevronRight, false, Tr("Collapse all"))) stage_tree_->CollapseAll();
     });
-    auto& counts = root.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
-    counts.text_fn = [this] {
-        const render::RenderWorld& w = *frame_.world;
-        return Fmt(Tr("%u inst   %u mesh   %u mat"), w.InstanceCount(), w.meshes.Count(), w.MaterialCount());
-    };
-    counts.visible_if = [this] { return frame_.ui->has_scene; };
-    auto& empty = root.Add<nui::Label>("No scene loaded. Open one with Ctrl+O.", Tone::Dim);
-    empty.wrap = true;
-    empty.visible_if = [this] { return !frame_.ui->has_scene; };
 
     auto& tree = root.Add<nui::TreeView>(stage_items_);
     stage_tree_ = &tree;
@@ -810,11 +792,6 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     const auto selected = [this] { return frame_.ui->selected_entity != nuka::scene::kInvalidEntity; };
     const auto editable = [this, selected] { return selected() && frame_.ui->inspector.valid; };
     InspectorState& ins = frame_.ui->inspector;
-    GizmoState* gz = &frame_.ui->gizmo;
-
-    auto& none = root.Add<nui::Label>("Nothing selected. Click a node in the Stage or a body in the viewport.", Tone::Dim);
-    none.wrap = true;
-    none.visible_if = [selected] { return !selected(); };
 
     auto& head = root.Add<nui::HStack>();
     head.visible_if = selected;
@@ -827,11 +804,6 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     mobility.text_fn = [this] { return std::string(Tr(frame_.ui->inspector.movable ? "movable" : "fixed")); };
     mobility.tone_fn = [this] { return frame_.ui->inspector.movable ? Tone::Accent : Tone::Dim; };
     mobility.visible_if = editable;
-    root.Add<nui::Stat>("Entity", [this] { return Fmt("%u", frame_.ui->selected_entity.index); }).visible_if = selected;
-    root.Add<nui::Stat>("Path", [this] { return SelectionPath(frame_); }, Tone::Muted).visible_if = selected;
-    root.Add<nui::Stat>("Mesh", [this] { return MeshText(frame_); }, Tone::Muted).visible_if = selected;
-    auto& bare = root.Add<nui::Label>("No editable geometry", Tone::Dim);
-    bare.visible_if = [this, selected] { return selected() && !frame_.ui->inspector.valid; };
 
     auto& transform = Fold(root.Add<nui::Collapsible>("Transform", true, icon::kMove), "transform");
     transform.visible_if = editable;
@@ -845,27 +817,6 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
         f->on_change = [this](const nui::Vec3&) { frame_.ui->inspector.transform_changed = true; };
         f->on_commit = [this](const nui::Vec3&, const nui::Vec3&) { frame_.ui->inspector.transform_commit = true; };
     }
-
-    auto& gizmo = Fold(root.Add<nui::Collapsible>("Gizmo", false, icon::kGizmo), "gizmo");
-    gizmo.visible_if = editable;
-    auto& modes = gizmo.Add<nui::HStack>();
-    auto& op = modes.Add<nui::Segmented>(std::vector<std::string>{"Move", "Rotate"},
-                                         nui::Bind<int>([gz] { return gz->op == GizmoState::Op::Rotate ? 1 : 0; },
-                                                        [gz](const int& v) {
-                                                            gz->op = v == 1 ? GizmoState::Op::Rotate : GizmoState::Op::Translate;
-                                                        }));
-    op.icons = {icon::kMove, icon::kRotate};
-    modes.Add<nui::ToggleButton>("Local", nui::Ref(&gz->local));
-    modes.Add<nui::ToggleButton>("Snap", nui::Ref(&gz->snap_on));
-    auto& ggrid = gizmo.Add<nui::PropertyGrid>();
-    ggrid.Add<nui::BoolField>("Enabled", nui::Ref(&gz->enabled));
-    ggrid.Add<nui::FloatField>("Snap step",
-                               nui::Bind<float>(
-                                   [gz] { return gz->op == GizmoState::Op::Rotate ? gz->snap_rotate : gz->snap_translate; },
-                                   [gz](const float& v) {
-                                       (gz->op == GizmoState::Op::Rotate ? gz->snap_rotate : gz->snap_translate) = v;
-                                   }),
-                               0.01f);
 
     auto& material = Fold(root.Add<nui::Collapsible>("Material", true, icon::kPalette), "material");
     material.visible_if = [this, editable] { return editable() && frame_.ui->inspector.has_material; };
@@ -917,7 +868,6 @@ void ImGuiLayer::BuildFile(nui::VStack& root) {
 
     auto& save_box = root.Add<nui::Collapsible>("Save", true, icon::kSave);
     save_box.visible_if = [this] { return frame_.ui->has_scene; };
-    save_box.Add<nui::Badge>("unsaved", Tone::Warn, icon::kEdit).visible_if = [this] { return frame_.ui->save_dirty; };
     auto& target = save_box.Add<nui::PropertyGrid>().Add<nui::TextBufferField>("Path", ui.save_path, sizeof(ui.save_path),
                                                                               "scene.nks");
     const auto save_now = [this] { Queue("file.save", Args({{"path", json::Value::Str(frame_.ui->save_path)}})); };
@@ -967,9 +917,10 @@ void ImGuiLayer::BuildStats(nui::VStack& root) {
     stat("dropped", [this] { return Fmt("%llu", static_cast<unsigned long long>(frame_.stats->snapshot_drops)); });
     stat("capped batches", [this] { return Fmt("%llu", static_cast<unsigned long long>(frame_.stats->capped_batches)); })
         .tone_fn = [this] { return frame_.stats->capped_batches != 0u ? Tone::Warn : Tone::Normal; };
-    stat("publish", [this] { return std::string(Tr(frame_.stats->zero_copy ? "ZERO-COPY" : "HOST")); }).tone_fn = [this] {
-        return frame_.stats->zero_copy ? Tone::Accent : Tone::Warn;
-    };
+    // Publishing is zero-copy; only a fallback to host copies is shown, with its reason.
+    auto& publish = stat("publish", [] { return std::string(Tr("HOST COPY")); });
+    publish.tone = Tone::Warn;
+    publish.visible_if = [this] { return !frame_.stats->zero_copy; };
     auto& reason = root.Add<nui::Label>(std::string(), Tone::Dim);
     reason.wrap = true;
     reason.text_fn = [this] { return frame_.stats->publish_reason; };
@@ -991,8 +942,7 @@ void ImGuiLayer::BuildStats(nui::VStack& root) {
         return frame_.stats->pixel_count_available ? Fmt("%llu", static_cast<unsigned long long>(frame_.stats->non_bg_pixels))
                                                    : std::string(Tr("N/A"));
     });
-    auto& device = root.Add<nui::Label>(std::string(), Tone::Dim, TextStyle::Label);
-    device.text_fn = [this] { return frame_.stats->device_name; };
+    stat("device", [this] { return frame_.stats->device_name; });
 }
 
 void ImGuiLayer::BuildDebug(nui::VStack& root) {
@@ -1476,8 +1426,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         const ImVec2 vmin(viewport_.x, viewport_.y), vmax(viewport_.x + viewport_.width, viewport_.y + viewport_.height);
         if (ui_state.has_scene) {
             draw::ViewportFrame(vmin, vmax,
-                                {Tr("PERSPECTIVE"), Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
-                                 Tr(ui_state.playing ? "LIVE" : "PAUSED"),
+                                {Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees), Tr(ui_state.playing ? "LIVE" : "PAUSED"),
                                  Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))});
             DrawSolverHud(vmin, vmax);
         } else if (!ui_state.start.shown) {
@@ -1563,14 +1512,34 @@ bool ImGuiLayer::MenuAction(const std::string& id) {
 }
 
 void ImGuiLayer::DrawMenuBar() {
-    if (!ImGui::BeginMainMenuBar()) return;
     const float s = nui::Scale();
-    render::imgui::DrawNukaLogo(ImGui::GetFrameHeight() - 8.0f * s);
-    ImGui::SameLine(0.0f, 6.0f * s);
-    nui::PushTextStyle(TextStyle::Label);
-    ImGui::TextColored(theme::kAccent, "NUKA");
-    nui::PopTextStyle();
+    const float bar_h = std::round(theme::kTitleBarHeight * s);
+    // The menu bar is the window's title bar; a taller frame padding gives it the height and
+    // centres the menu titles.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(ImGui::GetStyle().FramePadding.x, (bar_h - ImGui::GetFontSize()) * 0.5f));
+    const bool open = ImGui::BeginMainMenuBar();
+    ImGui::PopStyleVar();
+    if (!open) return;
+    TitleBar& bar = frame_.ui->title_bar;
+    const bool focused = frame_.ui->window_focused;
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetWindowPos();
+    const float width = ImGui::GetWindowWidth(), mid = origin.y + bar_h * 0.5f;
+    ImFont* label_font = GetNukaFont(FontRole::Display);
+    const float label_px = theme::kFontLabel * s;
+
+    // The logo centres on the bar and the wordmark's capitals on the logo.
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    const float logo = std::round(20.0f * s);
+    render::imgui::DrawNukaLogo(list, ImVec2(at.x, std::round(mid - logo * 0.5f)), logo);
+    const float word_x = std::round(at.x + logo + 7.0f * s);
+    list->AddText(label_font, label_px, ImVec2(word_x, CapTop(label_font, label_px, mid)),
+                  U32(focused ? theme::kAccent : theme::kFgDim), "NUKA");
+    const float brand_end = word_x + label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, "NUKA").x;
+    ImGui::Dummy(ImVec2(brand_end - at.x, ImGui::GetFontSize()));
     ImGui::SameLine(0.0f, 14.0f * s);
+    const float menus_x = ImGui::GetCursorScreenPos().x;
 
     for (const MenuSpec& menu : Menus()) {
         const std::string title = Tr(menu.title) + "###" + menu.title;
@@ -1624,31 +1593,76 @@ void ImGuiLayer::DrawMenuBar() {
         if (!any) ImGui::MenuItem(Tr("Nothing here yet"), nullptr, false, false);
         ImGui::EndMenu();
     }
+    const float menus_end = ImGui::GetCursorScreenPos().x;
+
+    // Minimize, maximize or restore, and close fill the bar's right end at its full height.
+    const float bw = std::round(theme::kWindowButton * s);
+    const float buttons_x = origin.x + width - 3.0f * bw;
+    const float glyph = std::round(5.0f * s), thick = std::max(1.0f, std::round(s));
+    const ImU32 ink = U32(focused ? theme::kFgMuted : theme::kFgDim);
+    const auto window_button = [&](int i, const char* id, const char* tip, bool danger, auto&& draw) {
+        const ImVec2 a(buttons_x + static_cast<float>(i) * bw, origin.y), b(a.x + bw, origin.y + bar_h);
+        ImGui::SetCursorScreenPos(a);
+        const bool pressed = ImGui::InvisibleButton(id, ImVec2(bw, bar_h));
+        const bool hovered = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+        if (hovered || held)
+            list->AddRectFilled(a, b, U32(danger ? theme::Alpha(theme::kErr, held ? 0.7f : 0.9f) : held ? theme::kBg3 : theme::kBg2));
+        ImGui::SetItemTooltip("%s", Tr(tip));
+        draw(ImVec2(std::round((a.x + b.x) * 0.5f), std::round(mid)), danger && hovered ? U32(theme::kFg) : ink);
+        return pressed;
+    };
+    if (window_button(0, "##minimize", "Minimize", false, [&](ImVec2 c, ImU32 col) {
+            list->AddLine(ImVec2(c.x - glyph, c.y), ImVec2(c.x + glyph, c.y), col, thick);
+        }))
+        Queue("window.minimize");
+    const float step = std::round(2.0f * s);
+    if (window_button(1, "##maximize", bar.maximized ? "Restore" : "Maximize", false, [&](ImVec2 c, ImU32 col) {
+            if (!bar.maximized) {
+                list->AddRect(ImVec2(c.x - glyph, c.y - glyph), ImVec2(c.x + glyph, c.y + glyph), col, 0.0f, 0, thick);
+                return;
+            }
+            list->AddRect(ImVec2(c.x - glyph, c.y - glyph + step), ImVec2(c.x + glyph - step, c.y + glyph), col, 0.0f, 0, thick);
+            // AddLine and AddRect stroke on pixel centres themselves; the polyline is given them.
+            const float l = c.x - glyph + step + 0.5f, r = c.x + glyph + 0.5f, t = c.y - glyph + 0.5f, d = c.y + glyph - step + 0.5f;
+            const ImVec2 back[] = {ImVec2(l, t + step), ImVec2(l, t), ImVec2(r, t), ImVec2(r, d), ImVec2(r - step, d)};
+            list->AddPolyline(back, 5, col, ImDrawFlags_None, thick);
+        }))
+        Queue("window.maximize");
+    if (window_button(2, "##close", "Close", true, [&](ImVec2 c, ImU32 col) {
+            list->AddLine(ImVec2(c.x - glyph, c.y - glyph), ImVec2(c.x + glyph, c.y + glyph), col, thick);
+            list->AddLine(ImVec2(c.x + glyph, c.y - glyph), ImVec2(c.x - glyph, c.y + glyph), col, thick);
+        }))
+        Queue("app.exit");
 
     // The search chip shrinks to its icon when the menus leave no room for the text.
     const char* keys = "CTRL+P";
-    ImFont* label_font = GetNukaFont(FontRole::Display);
-    const float label_px = theme::kFontLabel * s;
     const ImVec2 ksize = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, keys);
     const std::string full = Iconed(icon::kSearch, Tr("Search actions"));
-    const float room = ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - 18.0f * s;
+    const float room = buttons_x - menus_end - 18.0f * s;
     const bool compact = ImGui::CalcTextSize(full.c_str()).x + ksize.x + 40.0f * s > room;
     const std::string text = compact ? std::string(icon::kSearch) : full;
     const ImVec2 tsize = ImGui::CalcTextSize(text.c_str());
     const float w = compact ? tsize.x + 20.0f * s : tsize.x + ksize.x + 40.0f * s, h = ImGui::GetFrameHeight() - 6.0f * s;
-    ImGui::SameLine(ImGui::GetWindowWidth() - w - 10.0f * s);
-    const ImVec2 at = ImGui::GetCursorScreenPos();
-    const ImVec2 a(at.x, at.y + (ImGui::GetFrameHeight() - h) * 0.5f), b(a.x + w, a.y + h);
+    const ImVec2 a(std::round(buttons_x - w - 10.0f * s), std::round(mid - h * 0.5f)), b(a.x + w, a.y + h);
     ImGui::SetCursorScreenPos(a);
     if (ImGui::InvisibleButton("##search", ImVec2(w, h))) Queue("app.command_palette");
     const bool hovered = ImGui::IsItemHovered();
-    ImDrawList* list = ImGui::GetWindowDrawList();
     draw::Chamfer(list, a, b, 4.0f * s, U32(hovered ? theme::kBg2 : theme::kBg1), U32(hovered ? theme::kLineHi : theme::kLine));
     list->AddText(ImVec2(a.x + 10.0f * s, (a.y + b.y - tsize.y) * 0.5f), U32(theme::kFgDim), text.c_str());
     if (!compact)
         list->AddText(label_font, label_px, ImVec2(b.x - ksize.x - 10.0f * s, (a.y + b.y - ksize.y) * 0.5f), U32(theme::kFgDim),
                       keys);
+
+    bar.height = bar_h;
+    bar.edge = theme::kResizeEdge * s;
+    bar.drag = {{origin.x, menus_x}, {menus_end, a.x}, {b.x, buttons_x}};
     ImGui::EndMainMenuBar();
+    // A restored window has no system frame, so a hairline marks its edge.
+    if (!bar.maximized) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::GetForegroundDrawList()->AddRect(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y),
+                                                U32(focused ? theme::kLineHi : theme::kLine));
+    }
 }
 
 void ImGuiLayer::DrawToolbar() {
@@ -1720,7 +1734,14 @@ void ImGuiLayer::DrawToolbar() {
         if (toggle("##rotate", icon::kRotate, gz.op == GizmoState::Op::Rotate, Tr("Rotate"))) gz.op = GizmoState::Op::Rotate;
         if (toggle("##space", gz.local ? icon::kLocalSpace : icon::kWorldSpace, gz.local, Tr(gz.local ? "Local space" : "World space")))
             gz.local = !gz.local;
-        if (toggle("##snap", icon::kSnap, gz.snap_on, Tr("Snap"))) gz.snap_on = !gz.snap_on;
+        if (toggle("##snap", icon::kSnap, gz.snap_on, Tr("Snap (right-click for the step)"))) gz.snap_on = !gz.snap_on;
+        if (ImGui::BeginPopupContextItem("##snap_step")) {
+            const bool rotate = gz.op == GizmoState::Op::Rotate;
+            ImGui::SetNextItemWidth(110.0f * s);
+            ImGui::DragFloat(Tr("Snap step"), rotate ? &gz.snap_rotate : &gz.snap_translate, rotate ? 0.5f : 0.01f, 0.0f, FLT_MAX,
+                             rotate ? "%.1f\xC2\xB0" : "%.3f m", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::EndPopup();
+        }
         ImGui::EndDisabled();
         const float limit = ImGui::GetCursorScreenPos().x + 12.0f * s;
 
@@ -1750,10 +1771,9 @@ void ImGuiLayer::DrawToolbar() {
             x = b0.x - 6.0f * s;
         }
         // A chip with a tip is a button; it reports the click.
-        const auto chip = [&](const std::string& text, const ImVec4& color, const char* glyph, bool dot, bool pulse,
-                              const char* tip) {
+        const auto chip = [&](const std::string& text, const ImVec4& color, const char* glyph, bool pulse, const char* tip) {
             const ImVec2 ts = label_font->CalcTextSizeA(label_px, FLT_MAX, 0.0f, text.c_str());
-            const float lead = glyph != nullptr || dot ? 16.0f * s : 0.0f;
+            const float lead = glyph != nullptr ? 16.0f * s : 0.0f;
             const float cw = ts.x + lead + 16.0f * s, ch = 22.0f * s;
             if (x - cw < limit) return false;
             const ImVec2 c0(x - cw, cy - ch * 0.5f), c1(x, cy + ch * 0.5f);
@@ -1772,7 +1792,6 @@ void ImGuiLayer::DrawToolbar() {
                 const float t = static_cast<float>(std::fmod(ImGui::GetTime(), 1.6) / 1.6);
                 list->AddCircleFilled(mark, (3.0f + 4.0f * t) * s, U32(theme::Alpha(color, 0.35f * (1.0f - t))));
             }
-            if (dot) list->AddCircleFilled(mark, 3.0f * s, U32(color));
             list->AddText(label_font, label_px, ImVec2(c0.x + 8.0f * s + lead, cy - ts.y * 0.5f), U32(color), text.c_str());
             x = c0.x - 6.0f * s;
             return clicked;
@@ -1780,22 +1799,16 @@ void ImGuiLayer::DrawToolbar() {
         // A script session names its script; a script that steps the world drives the transport.
         if (ui.script_session)
             chip(std::string(Tr(ui.script_driven ? "SCRIPT DRIVEN" : "SCRIPT")) + "  " + Upper(ui.doc_title), theme::kInfo,
-                 icon::kConsole, false, ui.script_driven, nullptr);
-        chip(Tr(!ui.has_scene ? "NO SCENE" : ui.playing ? "LIVE" : "PAUSED"),
-             !ui.has_scene ? theme::kFgDim : ui.playing ? theme::kOk : theme::kFgMuted, nullptr, true, ui.playing, nullptr);
+                 icon::kConsole, ui.script_driven, nullptr);
         if (ui.has_scene) {
-            chip(Fmt(Tr("T %llu"), static_cast<unsigned long long>(stats.sim_ticks)), theme::kFgMuted, icon::kTimer, false, false,
-                 nullptr);
-            chip(Tr(stats.zero_copy ? "ZERO-COPY" : "HOST COPY"), stats.zero_copy ? theme::kAccent : theme::kWarn,
-                 stats.zero_copy ? icon::kZeroCopy : icon::kHostCopy, false, false, nullptr);
             if (stats.capped_batches != 0u)
-                chip(Fmt(Tr("CAP \xC3\x97%llu"), static_cast<unsigned long long>(stats.capped_batches)), theme::kWarn, icon::kWarn,
-                     false, false, nullptr);
+                chip(Fmt(Tr("CAP \xC3\x97%llu"), static_cast<unsigned long long>(stats.capped_batches)), theme::kWarn, icon::kWarn, false,
+                     nullptr);
             if (ui.solver.recent_caps != 0u &&
-                chip(Fmt(Tr("SOLVER CAP \xC3\x97%u"), ui.solver.recent_caps), theme::kErr, icon::kTarget, false, true,
+                chip(Fmt(Tr("SOLVER CAP \xC3\x97%u"), ui.solver.recent_caps), theme::kErr, icon::kTarget, true,
                      Tr("Sweep budget spent above the alert residual; click to locate the worst element")))
                 Queue("solver.locate");
-            if (ui.save_dirty) chip(Tr("UNSAVED"), theme::kWarn, icon::kEdit, false, false, nullptr);
+            if (ui.save_dirty) chip(Tr("UNSAVED"), theme::kWarn, icon::kEdit, false, nullptr);
         }
     }
     ImGui::End();
@@ -1818,13 +1831,13 @@ void ImGuiLayer::DrawStatusBar() {
         ImFont* font = GetNukaFont(FontRole::Display);
         const float px = theme::kFontLabel * s;
         const float cy = wpos.y + wsize.y * 0.5f;
+        // The scene's file and the selection on the left, frame timing on the right.
+        std::string left = frame_.ui->has_scene ? Iconed(icon::kFile, Upper(frame_.ui->doc_title).c_str()) : std::string();
         const std::string path = SelectionPath(frame_);
-        const std::string left = Iconed(icon::kTarget, path.empty() ? Tr("NO SELECTION") : Upper(path).c_str()) + "      " +
-                                 Iconed(icon::kLayout, Upper(Tr(FindLayout(layout_)->label)).c_str()) + "      " +
-                                 Fmt(Tr("UI %.0f%%"), static_cast<double>(ui_scale_) * 100.0);
+        if (!path.empty()) left += (left.empty() ? "" : "      ") + Iconed(icon::kTarget, Upper(path).c_str());
         const ImVec2 lsize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, left.c_str());
         list->AddText(font, px, ImVec2(wpos.x + 10.0f * s, cy - lsize.y * 0.5f), U32(theme::kFgDim), left.c_str());
-        const std::string right = Fmt("%.0f FPS   %.2f MS   ", stats.fps, stats.frame_time_ms) + Upper(stats.device_name);
+        const std::string right = Fmt("%.0f FPS   %.2f MS", stats.fps, stats.frame_time_ms);
         const ImVec2 rsize = font->CalcTextSizeA(px, FLT_MAX, 0.0f, right.c_str());
         list->AddText(font, px, ImVec2(wpos.x + wsize.x - rsize.x - 10.0f * s, cy - rsize.y * 0.5f), U32(theme::kFgDim),
                       right.c_str());

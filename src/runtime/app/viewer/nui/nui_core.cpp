@@ -134,6 +134,12 @@ void RunAction(const std::string& action, const json::Value& args) { Host::Curre
 
 bool InGrid(const Node* parent) { return parent != nullptr && std::string_view(parent->Kind()) == "property_grid"; }
 
+// The tier glyph, the text and the gap before the editor.
+float FieldLabelWidth(const std::string& caption, Tier tier) {
+    const float s = Scale();
+    return std::ceil(ImGui::CalcTextSize(Tr(caption).c_str()).x + ((tier != Tier::None ? 14.0f : 0.0f) + theme::kSpace) * s);
+}
+
 void FieldLabel(const std::string& caption, Tier tier, bool in_grid) {
     const float s = Scale();
     const std::string& label = Tr(caption);
@@ -154,9 +160,11 @@ void FieldLabel(const std::string& caption, Tier tier, bool in_grid) {
                     U32(live ? theme::kAccentDim : theme::kWarn), live, 12.0f);
         x += 14.0f * s;
     }
-    list->PushClipRect(ImVec2(x, pos.y), ImVec2(pos.x + w - theme::kSpace * s, pos.y + h), true);
-    list->AddText(ImVec2(x, pos.y + ImGui::GetStyle().FramePadding.y), U32(theme::kFgMuted), label.c_str());
-    list->PopClipRect();
+    const float right = pos.x + w - theme::kSpace * s;
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kFgMuted);
+    ImGui::RenderTextEllipsis(list, ImVec2(x, pos.y + ImGui::GetStyle().FramePadding.y), ImVec2(right, pos.y + h), right, label.c_str(),
+                              nullptr, nullptr);
+    ImGui::PopStyleColor();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip) && ImGui::CalcTextSize(label.c_str()).x > w - (x - pos.x))
         ImGui::SetTooltip("%s", label.c_str());
     if (in_grid) ImGui::TableSetColumnIndex(1);

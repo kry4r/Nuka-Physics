@@ -1,5 +1,5 @@
-// SDL3 window backend: one resizable high-density Vulkan window whose native events go
-// to the hook (imgui_impl_sdl3) and, translated, to the WindowEvent stream.
+// SDL3 window backend: one borderless, resizable high-density Vulkan window (the app draws its
+// title bar) whose native events go to the hook (imgui_impl_sdl3) and, translated, to the WindowEvent stream.
 
 #include "render/window/window_surface.hpp"
 
@@ -38,7 +38,8 @@ public:
             return;
         }
         sdl_owned_ = true;
-        const SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+        const SDL_WindowFlags flags =
+            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS;
         window_ = SDL_CreateWindow(title.c_str(), static_cast<int>(width), static_cast<int>(height), flags);
         if (window_ == nullptr) {
             std::fprintf(stderr, "[nuka_window] SDL_CreateWindow failed: %s\n", SDL_GetError());

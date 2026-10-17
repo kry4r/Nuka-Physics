@@ -45,6 +45,9 @@ inline constexpr float kGroupGap = 12.0f;
 inline constexpr float kRadius = 3.0f;
 inline constexpr float kRadiusOverlay = 6.0f;
 inline constexpr float kChamfer = 6.0f;
+inline constexpr float kTitleBarHeight = 32.0f;  // the menu bar, which is also the window's title bar
+inline constexpr float kWindowButton = 46.0f;    // width of the minimize, maximize and close buttons
+inline constexpr float kResizeEdge = 5.0f;       // the band along a restored window's edges that resizes it
 inline constexpr float kToolbarHeight = 36.0f;
 inline constexpr float kLabelColumn = 0.40f;  // share of a field row taken by its label
 
