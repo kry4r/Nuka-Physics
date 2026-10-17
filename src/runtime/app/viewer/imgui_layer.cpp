@@ -157,7 +157,7 @@ const std::vector<MenuSpec>& Menus() {
             {"Simulation",
              {"sim", "solver", "timeline"},
              {"sim.toggle_play", "sim.step", "sim.reset", "-", "timeline.fork", "timeline.ghost", "timeline.clear", "-",
-              "solver.telemetry", "solver.heatmap", "solver.locate"}},
+              "tool.perturb", "tool.pin", "-", "solver.telemetry", "solver.heatmap", "solver.locate"}},
             {"Tools",
              {"script", "tools"},
              {"script.new", "script.open", "script.save", "-", "script.run", "script.stop", "script.toggle_rerun", "-",
@@ -545,6 +545,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                                     std::pair{"solver.locate", icon::kTarget}, std::pair{"timeline.fork", icon::kFork},
                                     std::pair{"timeline.ghost", icon::kGhost}, std::pair{"timeline.clear", icon::kTrash}})
         registry.Decorate(id, glyph, false);
+    registry.Decorate("tool.perturb", icon::kGrab, false);
+    registry.Decorate("tool.pin", icon::kPin, false);
     const std::pair<const char*, const char*> script_icons[] = {
         {"script.new", icon::kNew},   {"script.open", icon::kOpen},     {"script.save", icon::kSave},
         {"script.stop", icon::kStop}, {"script.toggle_rerun", icon::kRepeat}, {"script.eval", icon::kTerminal}};
@@ -556,7 +558,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",
                            "file.recover", "file.autosave", "app.answer_prompt", "app.check", "solver.status",
                            "solver.records", "solver.set_iterations", "window.restore", "window.state", "timeline.status",
-                           "timeline.seek", "timeline.branch", "timeline.rename", "timeline.configure", "timeline.hash"})
+                           "timeline.seek", "timeline.branch", "timeline.rename", "timeline.configure", "timeline.hash",
+                           "sim.perturb", "sim.grab_particle", "sim.release", "sim.loads"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -808,8 +811,13 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
         return !node ? std::string() : node->name.empty() ? std::string(Tr("(unnamed)")) : node->name;
     };
     auto& mobility = head.Add<nui::Badge>();
-    mobility.text_fn = [this] { return std::string(Tr(frame_.ui->inspector.movable ? "movable" : "fixed")); };
-    mobility.tone_fn = [this] { return frame_.ui->inspector.movable ? Tone::Accent : Tone::Dim; };
+    mobility.text_fn = [this] {
+        const InspectorState& ins = frame_.ui->inspector;
+        return std::string(Tr(ins.deformable ? "deformable" : ins.movable ? "movable" : "fixed"));
+    };
+    mobility.tone_fn = [this] {
+        return frame_.ui->inspector.movable || frame_.ui->inspector.deformable ? Tone::Accent : Tone::Dim;
+    };
     mobility.visible_if = editable;
 
     auto& transform = Fold(root.Add<nui::Collapsible>("Transform", true, icon::kMove), "transform");
@@ -1436,6 +1444,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                 {Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees), Tr(ui_state.playing ? "LIVE" : "PAUSED"),
                                  Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))});
             DrawSolverHud(vmin, vmax);
+            DrawPerturbHud(vmin, vmax);
         } else if (!ui_state.start.shown) {
             const float s = nui::Scale();
             ImFont* font = GetNukaFont(FontRole::Display);
@@ -1750,6 +1759,16 @@ void ImGuiLayer::DrawToolbar() {
             ImGui::EndPopup();
         }
         ImGui::EndDisabled();
+        divider();
+        if (toggle("##perturb", icon::kGrab, ui.tool == ViewportTool::Perturb, Tr("Perturb (right-click for the stiffness)")))
+            Queue("tool.perturb");
+        if (ImGui::BeginPopupContextItem("##perturb_gain")) {
+            ImGui::SetNextItemWidth(110.0f * s);
+            ImGui::DragFloat(Tr("Stiffness"), &ui.perturb_gain, 0.02f, 0.05f, 20.0f, "%.2f\xC3\x97",
+                             ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+            ImGui::EndPopup();
+        }
+        action("tool.pin", icon::kPin, ui.tool == ViewportTool::Pin);
         const float limit = ImGui::GetCursorScreenPos().x + 12.0f * s;
 
         // The language switch holds the right edge and the status chips line up to its left;
@@ -2319,12 +2338,53 @@ ImTextureData* ImGuiLayer::Thumbnail(const std::string& file) {
     return it->texture.get();
 }
 
+void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {
+    const ViewerUiState& ui = *frame_.ui;
+    if (ui.held.empty()) return;
+    float view_m[16], proj[16];
+    CameraMatrices(*frame_.camera, view_m, proj);
+    const auto project = [&](const float p[3], ImVec2* out) {
+        float e[4], c[4];
+        for (int r = 0; r < 4; ++r) e[r] = view_m[r] * p[0] + view_m[4 + r] * p[1] + view_m[8 + r] * p[2] + view_m[12 + r];
+        for (int r = 0; r < 4; ++r) c[r] = proj[r] * e[0] + proj[4 + r] * e[1] + proj[8 + r] * e[2] + proj[12 + r] * e[3];
+        if (c[3] <= 1.0e-6f) return false;
+        *out = ImVec2(vmin.x + (c[0] / c[3] * 0.5f + 0.5f) * (vmax.x - vmin.x),
+                      vmin.y + (0.5f - c[1] / c[3] * 0.5f) * (vmax.y - vmin.y));
+        return true;
+    };
+    ImDrawList* list = ImGui::GetBackgroundDrawList();
+    list->PushClipRect(vmin, vmax, true);
+    const float s = nui::Scale();
+    ImFont* font = GetNukaFont(FontRole::Display);
+    const float px = theme::kFontLabel * s;
+    const ImU32 accent = U32(theme::kAccent);
+    for (const HeldLoad& h : ui.held) {
+        ImVec2 a, t;
+        if (!project(h.at, &a) || !project(h.target, &t)) continue;
+        // A taut band from the grab point to the target, its diamond and the pull it makes.
+        list->AddLine(a, t, U32(theme::Alpha(theme::kAccent, 0.35f)), 5.0f * s);
+        list->AddLine(a, t, accent, 1.5f * s);
+        list->AddCircle(a, 6.0f * s, accent, 20, 1.5f * s);
+        list->AddCircleFilled(a, 2.5f * s, accent);
+        const float d = 5.0f * s;
+        list->AddQuadFilled(ImVec2(t.x, t.y - d), ImVec2(t.x + d, t.y), ImVec2(t.x, t.y + d), ImVec2(t.x - d, t.y), accent);
+        if (!h.body) continue;
+        const std::string label = Fmt("%.1f N", static_cast<double>(h.force));
+        const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0.0f, label.c_str());
+        const ImVec2 l0(t.x + 10.0f * s, t.y - ts.y * 0.5f - 3.0f * s);
+        draw::Chamfer(list, l0, ImVec2(l0.x + ts.x + 12.0f * s, l0.y + ts.y + 6.0f * s), 3.0f * s,
+                      U32(theme::Alpha(theme::kBg0, 0.85f)), U32(theme::Alpha(theme::kAccent, 0.7f)));
+        list->AddText(font, px, ImVec2(l0.x + 6.0f * s, l0.y + 3.0f * s), accent, label.c_str());
+    }
+    list->PopClipRect();
+}
+
 void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h, ViewerUiState& ui_state,
                            math::Transform& world, bool& changed) {
     changed = false;
     GizmoState& gz = ui_state.gizmo;
-    if (!gz.enabled || ui_state.selected_entity == nuka::scene::kInvalidEntity || vp_w == 0u || vp_h == 0u ||
-        !viewport_.Valid() || !ui_state.window_focused) {
+    if (!gz.enabled || ui_state.tool != ViewportTool::Select || ui_state.selected_entity == nuka::scene::kInvalidEntity ||
+        vp_w == 0u || vp_h == 0u || !viewport_.Valid() || !ui_state.window_focused) {
         gz.active = false;
         gz.using_now = false;
         return;

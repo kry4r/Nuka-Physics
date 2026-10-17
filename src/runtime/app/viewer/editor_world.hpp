@@ -38,6 +38,14 @@ struct WorldLayout {
 // Throws std::runtime_error when a query fails; `what` names the call.
 void CheckResult(nuka_result_t result, const char* what);
 
+// One element of a field, `row` elements in.
+template <class T>
+T DownloadRow(nuka_world_handle world, nuka_state_field_t field, size_t row) {
+    T value{};
+    CheckResult(nuka_world_download_field(world, field, &value, sizeof(T), row * sizeof(T)), "nuka_world_download_field");
+    return value;
+}
+
 WorldLayout QueryLayout(nuka_world_handle world);
 
 // The cooked terrain grid; invalid when the world has none.
@@ -49,6 +57,10 @@ scene::SceneMap BindScene(const scene::SceneIR& scene, const WorldLayout& layout
 
 // A free body or a floating articulation root: the pose sources a live move reaches.
 bool IsMovableSource(const render::PoseSource& source, const WorldLayout& layout);
+
+// The link or body pose a source names; false for static sources and rows the poses lack.
+bool ResolvePose(const render::PoseSource& source, const std::vector<math::Transform>& links,
+                 const std::vector<math::Transform>& bodies, math::Transform* out);
 
 // A live teleport of one movable instance, as a physics-frame pose of its source row.
 struct PoseWrite {

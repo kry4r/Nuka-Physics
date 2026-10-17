@@ -40,14 +40,13 @@ const ParticleSurfaceBinding* SurfaceOf(const WorldLayout& layout, uint32_t part
     return nullptr;
 }
 
-template <class T>
-T DownloadRow(nuka_world_handle world, nuka_state_field_t field, size_t row) {
-    T value{};
-    CheckResult(nuka_world_download_field(world, field, &value, sizeof(T), row * sizeof(T)), "nuka_world_download_field");
-    return value;
+}  // namespace
+
+void CheckResult(nuka_result_t result, const char* what) {
+    if (result != NUKA_RESULT_OK)
+        throw std::runtime_error(std::string(what) + ": " + nuka_result_message(result));
 }
 
-// The link or body pose a source names; false for static sources and rows the poses lack.
 bool ResolvePose(const render::PoseSource& source, const std::vector<math::Transform>& links,
                  const std::vector<math::Transform>& bodies, math::Transform* out) {
     if (source.kind == render::PoseSource::Kind::Link && source.row < links.size()) {
@@ -59,13 +58,6 @@ bool ResolvePose(const render::PoseSource& source, const std::vector<math::Trans
         return true;
     }
     return false;
-}
-
-}  // namespace
-
-void CheckResult(nuka_result_t result, const char* what) {
-    if (result != NUKA_RESULT_OK)
-        throw std::runtime_error(std::string(what) + ": " + nuka_result_message(result));
 }
 
 WorldLayout QueryLayout(nuka_world_handle world) {

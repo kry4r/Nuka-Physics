@@ -97,6 +97,10 @@ constexpr double kAutosaveSeconds = 60.0;
 constexpr size_t kLogKeep = 20u;
 // A press and release closer than this many pixels is a click, not a drag.
 constexpr float kClickSlop = 4.0f;
+// A grab spring at unit gain rings at this rate on what it holds, critically damped.
+constexpr float kGrabHz = 3.0f;
+// The viewport draws a plain held force as an arrow this long [m].
+constexpr float kForceArrow = 0.3f;
 
 struct LaunchOptions {
     std::string scene_path;
@@ -437,6 +441,25 @@ bool RayAabb(const Ray& ray, const math::Vec3& lo, const math::Vec3& hi, float* 
     return true;
 }
 
+// Where the ray from `o` along `d` crosses triangle abc from either face: its distance and the
+// barycentric weights of b and c.
+bool RayTriangle(const math::Vec3& o, const math::Vec3& d, const math::Vec3& a, const math::Vec3& b,
+                 const math::Vec3& c, float* t, float* u, float* v) {
+    const math::Vec3 e1 = b - a;
+    const math::Vec3 e2 = c - a;
+    const math::Vec3 p = d.Cross(e2);
+    const float det = e1.Dot(p);
+    if (std::fabs(det) < 1e-12f) return false;
+    const math::Vec3 s = o - a;
+    *u = s.Dot(p) / det;
+    if (*u < 0.0f || *u > 1.0f) return false;
+    const math::Vec3 q = s.Cross(e1);
+    *v = d.Dot(q) / det;
+    if (*v < 0.0f || *u + *v > 1.0f) return false;
+    *t = e2.Dot(q) / det;
+    return *t >= 0.0f;
+}
+
 // The nearest triangle of the instance's mesh along the ray, both faces; t lands in *t_out.
 bool RayMesh(const Ray& ray, const render::RenderInstance& inst, const render::RenderWorld& w, float* t_out) {
     const render::MeshGeometry& geo = w.meshes.Geometry(inst.mesh_id);
@@ -448,20 +471,9 @@ bool RayMesh(const Ray& ray, const render::RenderInstance& inst, const render::R
     };
     bool hit = false;
     for (size_t k = 0; k + 2u < geo.indices.size(); k += 3u) {
-        const math::Vec3 a = at(geo.indices[k]);
-        const math::Vec3 e1 = at(geo.indices[k + 1u]) - a;
-        const math::Vec3 e2 = at(geo.indices[k + 2u]) - a;
-        const math::Vec3 p = d.Cross(e2);
-        const float det = e1.Dot(p);
-        if (std::fabs(det) < 1e-12f) continue;
-        const math::Vec3 s = o - a;
-        const float u = s.Dot(p) / det;
-        if (u < 0.0f || u > 1.0f) continue;
-        const math::Vec3 q = s.Cross(e1);
-        const float v = d.Dot(q) / det;
-        if (v < 0.0f || u + v > 1.0f) continue;
-        const float t = e2.Dot(q) / det;
-        if (t >= 0.0f && (!hit || t < *t_out)) {
+        float t = 0.0f, u = 0.0f, v = 0.0f;
+        if (RayTriangle(o, d, at(geo.indices[k]), at(geo.indices[k + 1u]), at(geo.indices[k + 2u]), &t, &u, &v) &&
+            (!hit || t < *t_out)) {
             *t_out = t;
             hit = true;
         }
@@ -469,9 +481,10 @@ bool RayMesh(const Ray& ray, const render::RenderInstance& inst, const render::R
     return hit;
 }
 
-// The nearest instance among those `pickable` accepts whose triangles the ray hits, or ~0u.
+// The nearest instance among those `pickable` accepts whose triangles the ray hits, or ~0u;
+// `t_out` gets its distance.
 uint32_t PickInstance(const Ray& ray, const render::RenderWorld& w,
-                      const std::function<bool(const render::RenderInstance&)>& pickable) {
+                      const std::function<bool(const render::RenderInstance&)>& pickable, float* t_out = nullptr) {
     uint32_t best = ~0u;
     float best_t = std::numeric_limits<float>::max();
     for (uint32_t i = 0; i < w.InstanceCount(); ++i) {
@@ -484,6 +497,25 @@ uint32_t PickInstance(const Ray& ray, const render::RenderWorld& w,
         if (RayMesh(ray, inst, w, &t) && t < best_t) {
             best_t = t;
             best = i;
+        }
+    }
+    if (t_out != nullptr) *t_out = best_t;
+    return best;
+}
+
+// The corner nearest the ray's first hit on a particle surface, as one environment's particle,
+// or kNoParticle; `t_out` gets the hit's distance.
+uint32_t PickParticle(const Ray& ray, const WorldLayout& layout, const std::vector<math::Vec3>& x, float* t_out) {
+    uint32_t best = kNoParticle;
+    *t_out = std::numeric_limits<float>::max();
+    for (const ParticleSurfaceBinding& s : layout.surfaces) {
+        for (size_t k = 0; k + 2u < s.triangles.size(); k += 3u) {
+            const uint32_t i[3] = {s.triangles[k], s.triangles[k + 1u], s.triangles[k + 2u]};
+            float t = 0.0f, u = 0.0f, v = 0.0f;
+            if (!RayTriangle(ray.origin, ray.dir, x[i[0]], x[i[1]], x[i[2]], &t, &u, &v) || t >= *t_out) continue;
+            *t_out = t;
+            const float w0 = 1.0f - u - v;
+            best = u >= w0 && u >= v ? i[1] : v >= w0 ? i[2] : i[0];
         }
     }
     return best;
@@ -535,6 +567,30 @@ double NumArg(const json::Value& args, const char* key, double fallback) {
 bool BoolArg(const json::Value& args, const char* key, bool fallback) {
     const json::Value* v = args.Find(key);
     return v != nullptr && !v->IsNull() ? v->AsBool() : fallback;
+}
+
+// A three-number argument; false when `key` is absent.
+bool Vec3Arg(const json::Value& args, const char* key, math::Vec3* out) {
+    const json::Value* v = args.Find(key);
+    if (v == nullptr || v->IsNull()) return false;
+    if (v->Size() != 3u) throw std::runtime_error(std::string(key) + " wants three numbers");
+    *out = math::Vec3{v->Elements()[0].AsFloat(), v->Elements()[1].AsFloat(), v->Elements()[2].AsFloat()};
+    return true;
+}
+
+json::Value Vec3Json(const math::Vec3& p) {
+    json::Value a = json::Value::Array();
+    for (const float c : {p.x, p.y, p.z}) a.PushBack(json::Value::Float(c));
+    return a;
+}
+
+// Where a held load acts in the snapshot's world; false when its row is missing.
+bool LoadPoint(const Snapshot& snap, const Perturbation& p, math::Vec3* out) {
+    math::Transform pose;
+    if (p.particle != kNoParticle) *out = snap.particles[p.particle];
+    else if (ResolvePose(p.source, snap.link_poses, snap.body_poses, &pose)) *out = pose.TransformPoint(p.point);
+    else return false;
+    return true;
 }
 
 std::optional<bool> OptBoolArg(const json::Value& args, const char* key) {
@@ -714,6 +770,14 @@ struct EditorHost::State : DocumentHost {
     void RefreshAssets();
     void RefreshProperties();
     void PickSelect(const CameraController& camera, float x, float y);
+    // A load on the link or free body `inst` draws, acting at the world point `at` with a spring of
+    // `gain` times the default toward it; false for an instance no dynamics move.
+    bool BodyLoad(const render::RenderInstance& inst, const math::Vec3& at, float gain, Perturbation* out) const;
+    void PushPerturb(const Perturbation& p);
+    void GrabAt(const CameraController& camera, float x, float y);
+    void DragGrab(const CameraController& camera, float x, float y);
+    void ReleaseGrab();
+    void PinAt(const CameraController& camera, float x, float y);
     const render::RenderWorld& ShownWorld() const { return loaded_ ? loaded_->sim->GetRenderWorld() : empty_world_; }
 
     void Frame(bool step_physics);
@@ -839,6 +903,9 @@ struct EditorHost::State : DocumentHost {
     std::string mat_gesture_path_;
     scene::RenderMaterial mat_before_{};
     bool gizmo_using_prev_ = false;
+    // The Perturb tool's load while its drag lasts; the target slides on the view plane through the anchor.
+    std::optional<Perturbation> grab_;
+    math::Vec3 grab_anchor_ = math::Vec3::Zero();
 
     void* native_window_ = nullptr;
     std::string window_title_;
@@ -1393,10 +1460,27 @@ void EditorHost::State::ApplySnapshot(const Snapshot& snap) {
         snapshot_drops_ += snap.sequence - last_sequence_ - 1u;
     last_sequence_ = snap.sequence;
     shown_ = loaded_ && snap.epoch == bound_epoch_ ? &snap : nullptr;
+    ui_state_.held.clear();
     if (shown_ == nullptr) return;
     loaded_->sim->ApplyPoses(snap.link_poses, snap.body_poses);
     loaded_->sim->ApplyGhost(snap.ghost_links, snap.ghost_bodies);
     if (!snap.particles.empty()) loaded_->sim->ApplyParticles(snap.particles, snap.heat, ui_state_.solver.alert);
+    // A spring draws as a band to its target, a plain force as an arrow along it.
+    for (const Perturbation& p : snap.perturbs) {
+        math::Vec3 at = p.target, target = p.target;
+        if (!LoadPoint(snap, p, &at)) continue;
+        HeldLoad h;
+        if (p.particle == kNoParticle) {
+            const math::Vec3 f = math::Vec3{p.force[0], p.force[1], p.force[2]} + (p.target - at) * p.stiffness;
+            h.body = true;
+            h.force = f.Length();
+            if (p.stiffness == 0.0f) target = at + f * (kForceArrow / std::max(h.force, 1e-6f));
+        }
+        const float a[3] = {at.x, at.y, at.z}, t[3] = {target.x, target.y, target.z};
+        std::copy(a, a + 3, h.at);
+        std::copy(t, t + 3, h.target);
+        ui_state_.held.push_back(h);
+    }
     last_telemetry_ = snap.telemetry;
     last_tick_ = snap.tick;
     last_step_healthy_ = snap.healthy;
@@ -1749,6 +1833,7 @@ void EditorHost::State::OnRebound(uint64_t tick, double sim_time) {
     AttachController();
     SeedDriveTargets();
     BindWorker(tick, sim_time);
+    grab_.reset();
     hidden_meshes_.clear();
     hidden_stale_ = true;
 }
@@ -2714,6 +2799,125 @@ void EditorHost::State::PickSelect(const CameraController& camera, float x, floa
           "viewport");
 }
 
+bool EditorHost::State::BodyLoad(const render::RenderInstance& inst, const math::Vec3& at, float gain,
+                                 Perturbation* out) const {
+    math::Transform pose;
+    if (shown_ == nullptr || !ResolvePose(inst.pose_source, shown_->link_poses, shown_->body_poses, &pose)) return false;
+    const std::vector<nuka_link_binding_t>& links = loaded_->Layout().links;
+    const bool link = inst.pose_source.kind == render::PoseSource::Kind::Link;
+    const uint32_t body = link ? links[inst.pose_source.row].body_index : inst.pose_source.row;
+    // A link drags its whole articulation, so its spring is sized for the articulation's mass.
+    float mass = loaded_->scene.GetBody(body).mass;
+    if (link) {
+        mass = 0.0f;
+        for (const nuka_link_binding_t& l : links)
+            if (l.articulation_index == links[inst.pose_source.row].articulation_index)
+                mass += loaded_->scene.GetBody(l.body_index).mass;
+    }
+    const float w = 2.0f * kPi * kGrabHz;
+    Perturbation p;
+    p.source = inst.pose_source;
+    p.point = pose.Inverse().TransformPoint(at);
+    p.com = loaded_->scene.GetBody(body).inertial_transform.position;
+    p.target = at;
+    p.stiffness = gain * mass * w * w;
+    p.damping = 2.0f * mass * w * std::sqrt(gain);
+    *out = p;
+    return true;
+}
+
+void EditorHost::State::PushPerturb(const Perturbation& p) {
+    TickCommand cmd;
+    cmd.kind = CommandKind::Perturb;
+    cmd.perturb = p;
+    worker_.Push(std::move(cmd));
+}
+
+// The Perturb tool's press: the nearest moving body or particle under the pointer starts an
+// unstretched pull.
+void EditorHost::State::GrabAt(const CameraController& camera, float x, float y) {
+    if (shown_ == nullptr) return;
+    const SceneViewportRect& rect = ui_.Viewport();
+    const Ray ray = camera.ScreenRay(rect.LocalX(x), rect.LocalY(y), rect.pixels.width, rect.pixels.height);
+    const render::RenderWorld& w = loaded_->sim->GetRenderWorld();
+    float body_t = 0.0f, particle_t = 0.0f;
+    const uint32_t hit = PickInstance(
+        ray, w,
+        [&](const render::RenderInstance& inst) {
+            return (inst.pose_source.kind == render::PoseSource::Kind::Link ||
+                    inst.pose_source.kind == render::PoseSource::Kind::Body) &&
+                   (ui_state_.locked.empty() || !UnderAny(PathOfEntity(inst.entity), ui_state_.locked));
+        },
+        &body_t);
+    const uint32_t particle = PickParticle(ray, loaded_->Layout(), shown_->particles, &particle_t);
+    Perturbation p;
+    if (particle != kNoParticle && particle_t < body_t) {
+        p.particle = particle;
+        p.target = shown_->particles[particle];
+    } else if (hit == ~0u || !BodyLoad(w.instances[hit], ray.origin + ray.dir * body_t, ui_state_.perturb_gain, &p)) {
+        return;
+    }
+    grab_ = p;
+    grab_anchor_ = p.target;
+    PushPerturb(p);
+}
+
+void EditorHost::State::DragGrab(const CameraController& camera, float x, float y) {
+    const SceneViewportRect& rect = ui_.Viewport();
+    const Ray ray = camera.ScreenRay(rect.LocalX(x), rect.LocalY(y), rect.pixels.width, rect.pixels.height);
+    const math::Vec3 fwd = (camera.ResolvedTarget() - camera.ResolvedEye()).Normalized();
+    if (camera.RayPlaneHit(ray, grab_anchor_, fwd, &grab_->target)) PushPerturb(*grab_);
+}
+
+void EditorHost::State::ReleaseGrab() {
+    grab_->hold = false;
+    PushPerturb(*grab_);
+    grab_.reset();
+}
+
+// The Pin tool's click: a cloth vertex toggles its pin and a free body turns static where it
+// stands, or moves again; each is one undoable edit that rebuilds the world.
+void EditorHost::State::PinAt(const CameraController& camera, float x, float y) {
+    if (shown_ == nullptr) return;
+    const SceneViewportRect& rect = ui_.Viewport();
+    const Ray ray = camera.ScreenRay(rect.LocalX(x), rect.LocalY(y), rect.pixels.width, rect.pixels.height);
+    const render::RenderWorld& w = loaded_->sim->GetRenderWorld();
+    float body_t = 0.0f, particle_t = 0.0f;
+    const uint32_t hit = PickInstance(
+        ray, w,
+        [&](const render::RenderInstance& inst) {
+            return doc_.Records().IsBody(CarrierOf(loaded_->scene, inst.entity)) &&
+                   (ui_state_.locked.empty() || !UnderAny(PathOfEntity(inst.entity), ui_state_.locked));
+        },
+        &body_t);
+    const uint32_t particle = PickParticle(ray, loaded_->Layout(), shown_->particles, &particle_t);
+    if (particle != kNoParticle && particle_t < body_t) {
+        for (const ParticleSurfaceBinding& s : loaded_->Layout().surfaces) {
+            if (particle < s.info.particle_first || particle - s.info.particle_first >= s.info.particle_count) continue;
+            const uint32_t vertex = particle - s.info.particle_first;
+            const std::vector<uint32_t>& pins = loaded_->scene.GetMedia(s.info.medium).cloth_mesh.pinned_vertices;
+            const bool on = std::find(pins.begin(), pins.end(), vertex) == pins.end();
+            const json::Value after = Object({{"vertex", json::Value::Int(vertex)}, {"on", json::Value::Bool(on)}});
+            Queue("edit.apply",
+                  TxnToJson(EditTxn{on ? "Pin" : "Unpin",
+                                    {EditOp{PathOfEntity(loaded_->scene.EntityOfMedia(s.info.medium)), "pin",
+                                            json::Value::Null(), after}}}),
+                  "viewport");
+        }
+        return;
+    }
+    if (hit == ~0u) return;
+    const scene::EntityId e = CarrierOf(loaded_->scene, w.instances[hit].entity);
+    const std::string path = PathOfEntity(e);
+    const bool pinned = loaded_->scene.GetBody(doc_.Records().body.at(e)).is_static;
+    EditTxn txn{pinned ? "Unpin" : "Pin", {}};
+    if (const render::RenderInstance* inst = PoseInstance(*loaded_, doc_.Records(), e); inst != nullptr && !pinned)
+        txn.ops.push_back(EditOp{path, "transform", json::Value::Null(),
+                                 TransformToJson(LiveWorldTransform(loaded_->scene, e, *inst))});
+    txn.ops.push_back(EditOp{path, "static", json::Value::Null(), json::Value::Bool(!pinned)});
+    Queue("edit.apply", TxnToJson(txn), "viewport");
+}
+
 void EditorHost::State::RegisterSimActions() {
     const auto has_scene = [this] { return loaded_ != nullptr; };
     const auto set_playing = [this](bool playing) {
@@ -2753,6 +2957,103 @@ void EditorHost::State::RegisterSimActions() {
                       ui_state_.speed = static_cast<float>(NumArg(args, "value", 1.0));
                       PushTransport();
                       return Ok(Object({{"speed", json::Value::Float(ui_state_.speed)}}));
+                  }});
+    // A viewport tool toggles against Select; `on` sets it.
+    const auto set_tool = [this](ViewportTool tool, const json::Value& args) {
+        ui_state_.tool = BoolArg(args, "on", ui_state_.tool != tool) ? tool : ViewportTool::Select;
+        if (grab_) ReleaseGrab();
+        const char* names[] = {"select", "perturb", "pin"};
+        return Ok(Object({{"tool", json::Value::Str(names[static_cast<int>(ui_state_.tool)])}}));
+    };
+    actions_.Add({"tool.perturb", "Perturb", "sim", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.tool == ViewportTool::Perturb; },
+                  [set_tool](const json::Value& args) { return set_tool(ViewportTool::Perturb, args); }});
+    actions_.Add({"tool.pin", "Pin", "sim", "", ShortcutScope::Global, {},
+                  [this] { return ui_state_.tool == ViewportTool::Pin; },
+                  [set_tool](const json::Value& args) { return set_tool(ViewportTool::Pin, args); }});
+    // A world force and torque at a world point (the COM by default), plus a spring toward `target`;
+    // no load and no target releases the body.
+    actions_.Add({"sim.perturb", "Perturb Body", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const std::string path = StrArg(args, "path");
+                      const scene::EntityId e = EntityOfPath(*loaded_, path);
+                      const render::RenderInstance* inst =
+                          e != scene::kInvalidEntity ? PoseInstance(*loaded_, doc_.Records(), e) : nullptr;
+                      const float gain = static_cast<float>(NumArg(args, "gain", 1.0));
+                      if (!(gain > 0.0f)) return ActionResult::Fail("gain must be positive");
+                      math::Vec3 point = math::Vec3::Zero();
+                      const bool at_point = Vec3Arg(args, "point", &point);
+                      Perturbation p;
+                      if (inst == nullptr || !BodyLoad(*inst, point, gain, &p))
+                          return ActionResult::Fail("'" + path + "' is not a moving link or body");
+                      if (!at_point) p.point = p.com;
+                      if (!Vec3Arg(args, "target", &p.target)) p.stiffness = p.damping = 0.0f;
+                      math::Vec3 force = math::Vec3::Zero(), torque = math::Vec3::Zero();
+                      Vec3Arg(args, "force", &force);
+                      Vec3Arg(args, "torque", &torque);
+                      const float f[3] = {force.x, force.y, force.z}, t[3] = {torque.x, torque.y, torque.z};
+                      std::copy(f, f + 3, p.force);
+                      std::copy(t, t + 3, p.torque);
+                      p.hold = p.stiffness > 0.0f || force.LengthSq() > 0.0f || torque.LengthSq() > 0.0f;
+                      PushPerturb(p);
+                      return Ok(Object({{"held", json::Value::Bool(p.hold)},
+                                        {"stiffness", json::Value::Float(p.stiffness)},
+                                        {"damping", json::Value::Float(p.damping)}}));
+                  }});
+    // Holds one environment particle kinematic at `target`, where it is by default.
+    actions_.Add({"sim.grab_particle", "Grab Particle", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const double index = NumArg(args, "particle", -1.0);
+                      if (shown_ == nullptr || index < 0.0 || index >= static_cast<double>(shown_->particles.size()))
+                          return ActionResult::Fail("no particle " + Format("%g", index));
+                      Perturbation p;
+                      p.particle = static_cast<uint32_t>(index);
+                      p.target = shown_->particles[p.particle];
+                      Vec3Arg(args, "target", &p.target);
+                      PushPerturb(p);
+                      return Ok(Object({{"particle", json::Value::Int(p.particle)}, {"target", Vec3Json(p.target)}}));
+                  }});
+    // Lets go of the load on `path`, the held `particle`, or with neither every load.
+    actions_.Add({"sim.release", "Release", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      Perturbation p;
+                      p.hold = false;
+                      p.particle = static_cast<uint32_t>(NumArg(args, "particle", kNoParticle));
+                      if (const std::string path = StrArg(args, "path"); !path.empty()) {
+                          const scene::EntityId e = EntityOfPath(*loaded_, path);
+                          const render::RenderInstance* inst =
+                              e != scene::kInvalidEntity ? PoseInstance(*loaded_, doc_.Records(), e) : nullptr;
+                          if (inst == nullptr || inst->pose_source.kind == render::PoseSource::Kind::Static)
+                              return ActionResult::Fail("'" + path + "' is not a moving link or body");
+                          p.source = inst->pose_source;
+                      }
+                      grab_.reset();
+                      PushPerturb(p);
+                      return Ok();
+                  }});
+    // The loads held on the shown environment as its last frame has them.
+    actions_.Add({"sim.loads", "Held Loads", "sim", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      json::Value out = json::Value::Array();
+                      if (shown_ == nullptr) return Ok(std::move(out));
+                      for (const Perturbation& p : shown_->perturbs) {
+                          math::Vec3 at = p.target;
+                          LoadPoint(*shown_, p, &at);
+                          json::Value v = Object({{"at", Vec3Json(at)}, {"target", Vec3Json(p.target)}});
+                          if (p.particle != kNoParticle) {
+                              v.Set("particle", json::Value::Int(p.particle));
+                          } else {
+                              const bool link = p.source.kind == render::PoseSource::Kind::Link;
+                              const uint32_t body = link ? loaded_->Layout().links[p.source.row].body_index : p.source.row;
+                              v.Set("path", json::Value::Str(PathOfEntity(loaded_->scene.EntityOfBody(body))));
+                              v.Set("force", Vec3Json(math::Vec3{p.force[0], p.force[1], p.force[2]}));
+                              v.Set("torque", Vec3Json(math::Vec3{p.torque[0], p.torque[1], p.torque[2]}));
+                              v.Set("stiffness", json::Value::Float(p.stiffness));
+                              v.Set("damping", json::Value::Float(p.damping));
+                          }
+                          out.PushBack(std::move(v));
+                      }
+                      return Ok(std::move(out));
                   }});
 }
 
@@ -3160,6 +3461,8 @@ void EditorHost::State::ApplyUnload() {
     entity_drag_.Cancel();
     loaded_.reset();
     hidden_meshes_.clear();
+    grab_.reset();
+    ui_state_.held.clear();
     ui_state_.solver.marked = false;
     debug_overlay_.Reset();
     ClearModelUi(ui_state_);
@@ -3184,6 +3487,7 @@ void EditorHost::State::SeedInspector(scene::EntityId e) {
     if (inst == nullptr) return;
     ins.valid   = true;
     ins.movable = IsMovableInstance(*inst, *loaded_);
+    ins.deformable = doc_.Records().media.count(e) != 0u;
     const math::Transform world = LiveWorldTransform(loaded_->scene, e, *inst);
     const math::Vec3 p = world.position;
     ins.pos[0] = p.x; ins.pos[1] = p.y; ins.pos[2] = p.z;
@@ -3550,6 +3854,7 @@ void EditorHost::State::Frame(bool step_physics) {
     if (!scene_rect.Valid()) {
         entity_drag_.Cancel();
         camera_.CancelInteraction();
+        if (grab_) ReleaseGrab();
     }
     bool scene_ctrl = ctrl_before_events;
     for (const window::WindowEvent& ev : events_) {
@@ -3596,17 +3901,26 @@ void EditorHost::State::Frame(bool step_physics) {
                 }
             }
         }
-        // The camera never takes input ImGui, a Ctrl-drag or the gizmo owns.
-        const bool cam_allow = !over_ui && !scene_ctrl && !ui_state_.gizmo.active;
-        // A left press and release without a drag in between picks.
+        // The Perturb tool's press grabs and its release lets go; between them the pointer pulls.
+        if (loaded_ && ui_state_.tool == ViewportTool::Perturb && ev.type == window::WindowEvent::Type::MouseButton &&
+            ev.button == 0u) {
+            if (ev.pressed && !over_ui && !scene_ctrl) GrabAt(render_camera, mouse_x, mouse_y);
+            else if (!ev.pressed && grab_) ReleaseGrab();
+        } else if (grab_ && ev.type == window::WindowEvent::Type::MouseMove) {
+            DragGrab(render_camera, mouse_x, mouse_y);
+        }
+        // The camera never takes input ImGui, a Ctrl-drag, the gizmo or a grab owns.
+        const bool cam_allow = !over_ui && !scene_ctrl && !ui_state_.gizmo.active && !grab_;
+        // A left press and release without a drag in between picks, or pins with the Pin tool.
         if (loaded_ && ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
             if (ev.pressed) {
-                click_armed_ = !over_ui && !scene_ctrl && !ui_state_.gizmo.active;
+                click_armed_ = !over_ui && !scene_ctrl && !ui_state_.gizmo.active && ui_state_.tool != ViewportTool::Perturb;
                 click_x_ = mouse_x;
                 click_y_ = mouse_y;
             } else if (click_armed_) {
                 click_armed_ = false;
-                PickSelect(render_camera, mouse_x, mouse_y);
+                if (ui_state_.tool == ViewportTool::Pin) PinAt(render_camera, mouse_x, mouse_y);
+                else PickSelect(render_camera, mouse_x, mouse_y);
             }
         } else if (click_armed_ && ev.type == window::WindowEvent::Type::MouseMove &&
                    std::fabs(mouse_x - click_x_) + std::fabs(mouse_y - click_y_) > kClickSlop) {

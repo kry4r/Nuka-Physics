@@ -39,6 +39,7 @@ std::string NodeKind(const nuka::scene::Registry& reg, nuka::scene::EntityId e);
 struct InspectorState {
     bool valid = false;    // a selectable, editable entity is bound
     bool movable = false;  // physics-driven (teleports) vs static placement
+    bool deformable = false;  // a medium the solver deforms
 
     float pos[3] = {0.0f, 0.0f, 0.0f};      // world position
     float rot_deg[3] = {0.0f, 0.0f, 0.0f};  // intrinsic XYZ degrees
@@ -187,6 +188,17 @@ struct TitleBar {
     std::vector<std::pair<float, float>> drag;  // x spans of the bar that move the window
 };
 
+// The viewport pointer: select and move, pull on bodies and cloth, or pin them in place.
+enum class ViewportTool : uint8_t { Select, Perturb, Pin };
+
+// A held load as the viewport draws it, in world space; the host fills it every frame.
+struct HeldLoad {
+    float at[3] = {0.0f, 0.0f, 0.0f};      // the grab point
+    float target[3] = {0.0f, 0.0f, 0.0f};  // where it is pulled
+    float force = 0.0f;                    // [N]
+    bool body = false;                     // a link or body load, labelled with its force
+};
+
 // Transport, selection and panel state. The UI queues actions for anything that changes the
 // world and edits only this plain state in place.
 struct ViewerUiState {
@@ -238,6 +250,9 @@ struct ViewerUiState {
 
     InspectorState inspector;
     GizmoState gizmo;
+    ViewportTool tool = ViewportTool::Select;
+    float perturb_gain = 1.0f;   // the grab spring's stiffness over its default
+    std::vector<HeldLoad> held;
     char save_path[512] = {0};
     bool save_dirty = false;
     char rename_buf[256] = {0};
@@ -406,6 +421,8 @@ private:
     void DrawCollisionDialog();
     // The heatmap's scale and the located element's marker over the scene viewport.
     void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
+    // Each held load's pull from its grab point toward its target.
+    void DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax);
     // While an asset card is dragged, the viewport takes the drop at the ground under the pointer.
     void DrawAssetDrop();
     // The texture of a PPM file, reloaded when the file changes; null without the file.

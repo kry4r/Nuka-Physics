@@ -39,13 +39,26 @@ enum class ParamKind : uint8_t {
 enum class TransportOp : uint8_t { Play, Pause, Step, Speed, Reset };
 enum class TimelineOp : uint8_t { Seek, Fork, Branch, Rename, Ghost, Configure, Clear };
 
-// A held load on one link (wrench) or free body (force and torque), rewritten before
-// every step until a zero load replaces it.
+inline constexpr uint32_t kNoParticle = ~0u;
+
+// A load on a link or free body, rewritten before every step, or a particle held kinematic at a target;
+// a later command for the same target replaces or releases it, a release naming none releases them all.
 struct Perturbation {
     render::PoseSource source;
-    uint32_t env = 0u;  // the worker stamps the shown environment
-    float force[3] = {0.0f, 0.0f, 0.0f};
-    float torque[3] = {0.0f, 0.0f, 0.0f};
+    uint32_t particle = kNoParticle;  // per-environment index of a held particle
+    uint32_t env = 0u;                // the worker stamps the shown environment
+    bool hold = true;
+    float force[3] = {0.0f, 0.0f, 0.0f};   // world [N], acting at `point`
+    float torque[3] = {0.0f, 0.0f, 0.0f};  // world [N m]
+    math::Vec3 point = math::Vec3::Zero();   // body frame
+    math::Vec3 com = math::Vec3::Zero();     // body frame
+    math::Vec3 target = math::Vec3::Zero();  // world: where the spring pulls `point`, or the particle
+    float stiffness = 0.0f;  // [N/m]; zero holds the plain load
+    float damping = 0.0f;    // [N s/m]
+    // The worker's: the point a step ago for the damping, and the particle's own inverse mass.
+    math::Vec3 last = math::Vec3::Zero();
+    bool primed = false;
+    float inv_mass = 0.0f;
 };
 
 struct TickCommand {
@@ -172,6 +185,7 @@ struct Snapshot {
     std::vector<math::Transform> body_poses;
     std::vector<math::Vec3> particles;  // the shown environment's
     std::vector<float> heat;            // its per-particle residuals while the heatmap reads them
+    std::vector<Perturbation> perturbs;  // the loads held on it
     OverlayData overlay;
     WorkerTelemetry telemetry;
     uint32_t branch = 0u;  // the history branch the playhead is on
@@ -279,6 +293,7 @@ private:
     void Guarded(Fn&& fn);
     bool ApplyCommands(std::vector<TickCommand>& cmds);
     bool Apply(const TickCommand& cmd);
+    void Perturb(Perturbation p);
     double Advance();
     bool StepOnce();
     void WritePerturbations();
@@ -344,7 +359,6 @@ private:
     bool clock_reset_ = true;
     WorkerClock::time_point last_{};
     std::vector<Perturbation> perturbs_;
-    std::vector<float> perturb_scratch_;
     uint64_t timeline_value_ = 0u;
     uint64_t sequence_ = 0u;
     WorkerClock::time_point last_publish_{};

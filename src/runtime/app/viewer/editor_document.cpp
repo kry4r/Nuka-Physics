@@ -5,6 +5,7 @@
 #include "runtime/app/viewer/editor_import.hpp"
 #include "scene/scene_fields.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -18,7 +19,7 @@ constexpr uint32_t kNoParam = ~0u;
 
 bool IsStructural(const std::string& field) {
     return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
-           field == "collision";
+           field == "collision" || field == "static" || field == "pin";
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -218,7 +219,8 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
     *done = op;
     const scene::EntityId e = EntityAt(op.target);
     const bool needs_node = !op.target.empty() || op.field == "transform" || op.field == "material" ||
-                            op.field == "name" || op.field == "delete" || op.field == "reparent";
+                            op.field == "name" || op.field == "delete" || op.field == "reparent" ||
+                            op.field == "static" || op.field == "pin";
     if (needs_node && e == scene::kInvalidEntity) {
         *error = "no node at '" + op.target + "'";
         return false;
@@ -285,6 +287,45 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
             *error = "no selected body has a visual mesh to build a collider from";
             return false;
         }
+        out->rebuild = true;
+    } else if (op.field == "static") {
+        const auto it = records_.body.find(e);
+        if (it == records_.body.end()) {
+            *error = "'" + op.target + "' is not a body";
+            return false;
+        }
+        for (const nuka_link_binding_t& link : es_->Layout().links) {
+            if (link.body_index == it->second) {
+                *error = "articulation links cannot be pinned";
+                return false;
+            }
+        }
+        scene::RigidBodyRecord& body = es_->scene.GetBodyMut(it->second);
+        done->before = json::Value::Bool(body.is_static);
+        body.is_static = op.after.AsBool();
+        out->rebuild = true;
+    } else if (op.field == "pin") {
+        const auto it = records_.media.find(e);
+        if (it == records_.media.end() || es_->scene.GetMedia(it->second).kind != scene::MediaRecord::Kind::Cloth) {
+            *error = "'" + op.target + "' is not a cloth";
+            return false;
+        }
+        const uint32_t vertex = static_cast<uint32_t>(op.after.At("vertex").AsInt());
+        uint32_t count = 0u;
+        for (const ParticleSurfaceBinding& s : es_->Layout().surfaces)
+            if (s.info.medium == it->second) count = s.info.particle_count;
+        if (vertex >= count) {
+            *error = "'" + op.target + "' has no vertex " + std::to_string(vertex);
+            return false;
+        }
+        std::vector<uint32_t>& pins = es_->scene.GetMediaMut(it->second).cloth_mesh.pinned_vertices;
+        const auto at = std::find(pins.begin(), pins.end(), vertex);
+        json::Value before = json::Value::Object();
+        before.Set("vertex", json::Value::Int(vertex));
+        before.Set("on", json::Value::Bool(at != pins.end()));
+        done->before = std::move(before);
+        if (at != pins.end()) pins.erase(at);
+        if (op.after.At("on").AsBool()) pins.push_back(vertex);
         out->rebuild = true;
     } else if (op.field == "delete") {
         const size_t bodies = es_->scene.RigidBodyCount();

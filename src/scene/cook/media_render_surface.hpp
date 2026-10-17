@@ -29,7 +29,7 @@ struct MediaRenderSurface {
     // The scene medium (MediaRecord id) the surface draws.
     uint32_t medium = 0u;
 
-    // Particle media retain a range and sampling radius; zero count means the whole field.
+    // Each surface covers a particle range, zero count meaning the whole field; particle media add a radius.
     // Without density reconstruction, the range renders as individual grains.
     float    particle_radius = 0.0f;
     uint32_t particle_first = 0u;

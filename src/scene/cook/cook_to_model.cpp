@@ -2257,13 +2257,7 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
             throw std::invalid_argument("Cloth vertex mass must be finite and positive");
         in.inv_mass.push_back(1.0f / mass);
     }
-    if (!media.baked.Empty()) {
-        for (uint32_t vertex : media.cloth_mesh.pinned_vertices) {
-            if (vertex >= in.inv_mass.size())
-                throw std::invalid_argument("Cloth pinned vertex is out of range");
-            in.inv_mass[vertex] = 0.0f;
-        }
-    } else {
+    if (media.baked.Empty()) {
         const auto& g = media.cloth_grid;
         const uint32_t nx = g.nx, ny = g.ny;
         const auto idx = [nx](uint32_t i, uint32_t j) { return j*nx + i; };
@@ -2289,6 +2283,12 @@ VbdCookInput BuildClothVertexBlockInput(const MediaRecord& media) {
             const uint32_t j = pin == Pin::EdgeY0 ? 0u : last_j;
             for (uint32_t k = 0u; k < nx; ++k) in.inv_mass[idx(k, j)] = 0.0f;
         }
+    }
+    // Pinned vertices add to a grid's pin set.
+    for (uint32_t vertex : media.cloth_mesh.pinned_vertices) {
+        if (vertex >= in.inv_mass.size())
+            throw std::invalid_argument("Cloth pinned vertex is out of range");
+        in.inv_mass[vertex] = 0.0f;
     }
     // Anisotropic aero drag: pass the coeffs through; seed the op with the cloth
     // triangles only when active (all-zero coeffs => no op => byte-identical cook).
@@ -2429,6 +2429,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             if (cl.slab == 8u) {
                 MediaRenderSurface box;
                 box.triangles = CableSlabBoxTriangles(base + cl.chain);
+                box.particle_first = base + cl.chain;
+                box.particle_count = cl.slab;
                 box.render_material_id =
                     m.cable_line.slab.render_material_id != kInvalidMaterial
                         ? m.cable_line.slab.render_material_id
@@ -2447,6 +2449,8 @@ std::vector<MediaRenderSurface> BuildSceneMediaRenderSurfaces(
             for (uint32_t& t : tris) t += base;
             MediaRenderSurface s;
             s.triangles = std::move(tris);
+            s.particle_first = base;
+            s.particle_count = verts;
             for (const auto& face : geometry.material_faces)
                 for (const auto& corner : face) s.corner_uvs.insert(s.corner_uvs.end(), {corner.x, corner.y});
             s.normal_offset = m.render_skin.normal_offset;

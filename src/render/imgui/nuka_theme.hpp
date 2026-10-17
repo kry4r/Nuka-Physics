@@ -185,5 +185,7 @@ inline constexpr const char kGhost[] = "\xEE\x98\xAA";
 inline constexpr const char kSkipBack[] = "\xEE\x96\xA4";
 inline constexpr const char kCaretLeft[] = "\xEE\x84\xB8";
 inline constexpr const char kKeyframe[] = "\xEE\x87\xAC";   // diamond
+inline constexpr const char kGrab[] = "\xEE\x95\xBC";       // hand-grabbing
+inline constexpr const char kPin[] = "\xEE\x8F\xA2";        // push-pin
 
 }  // namespace nuka::render::imgui::icon

@@ -25,10 +25,12 @@ bool Capped(const nuka_telemetry_record_t& r) { return (r.flags & NUKA_TELEMETRY
 
 double Ms(WorkerClock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
-bool Nonzero(const float v[3]) { return v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f; }
+math::Vec3 Vec(const float v[3]) { return math::Vec3{v[0], v[1], v[2]}; }
 
-bool SameSource(const render::PoseSource& a, const render::PoseSource& b) {
-    return a.kind == b.kind && a.row == b.row;
+// Whether two perturbations hold the same particle, link or body.
+bool SameTarget(const Perturbation& a, const Perturbation& b) {
+    return a.env == b.env && a.particle == b.particle &&
+           (a.particle != kNoParticle || (a.source.kind == b.source.kind && a.source.row == b.source.row));
 }
 
 // A seek right before an absolute one lands nowhere the later one keeps.
@@ -417,14 +419,20 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     return true;
             }
             return false;
-        case CommandKind::Perturb: {
-            const auto it = std::find_if(perturbs_.begin(), perturbs_.end(), [&](const Perturbation& p) {
-                return p.env == cmd.perturb.env && SameSource(p.source, cmd.perturb.source);
-            });
-            if (it != perturbs_.end()) perturbs_.erase(it);
-            if (Nonzero(cmd.perturb.force) || Nonzero(cmd.perturb.torque)) perturbs_.push_back(cmd.perturb);
-            return false;
-        }
+        case CommandKind::Perturb:
+            if (cmd.perturb.hold || cmd.perturb.particle != kNoParticle ||
+                cmd.perturb.source.kind != render::PoseSource::Kind::Static) {
+                Perturb(cmd.perturb);
+            } else {
+                std::vector<Perturbation> held;
+                for (const Perturbation& p : perturbs_)
+                    if (p.env == cmd.perturb.env) held.push_back(p);
+                for (Perturbation& p : held) {
+                    p.hold = false;
+                    Perturb(p);
+                }
+            }
+            return true;
         case CommandKind::Transport:
             switch (cmd.op) {
                 case TransportOp::Play:
@@ -446,6 +454,7 @@ bool PhysicsWorker::Apply(const TickCommand& cmd) {
                     sim_time_ = 0.0;
                     playing_ = false;
                     step_budget_ = 0u;
+                    perturbs_.clear();
                     last_mirror_ = WorkerClock::time_point{};
                     Report(cmd.seq, scripts_->DispatchReset());
                     ResetHistory();
@@ -567,21 +576,61 @@ bool PhysicsWorker::StepOnce() {
     return healthy;
 }
 
+void PhysicsWorker::Perturb(Perturbation p) {
+    const auto it = std::find_if(perturbs_.begin(), perturbs_.end(), [&](const Perturbation& q) { return SameTarget(q, p); });
+    const bool held = it != perturbs_.end();
+    if (held) {
+        p.last = it->last;
+        p.primed = it->primed;
+        p.inv_mass = it->inv_mass;
+        perturbs_.erase(it);
+    }
+    // A held particle is kinematic at its target; the release gives back its inverse mass.
+    if (p.particle != kNoParticle) {
+        const size_t row = static_cast<size_t>(p.env) * bind_.layout.particles_per_env + p.particle;
+        if (!held) p.inv_mass = DownloadRow<float>(bind_.world, NUKA_FIELD_PARTICLE_INV_MASS, row);
+        const float inv_mass = p.hold ? 0.0f : p.inv_mass;
+        CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_PARTICLE_INV_MASS, &inv_mass, sizeof(float),
+                                            row * sizeof(float)),
+                    "upload particle inverse mass");
+        if (p.hold)
+            CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_PARTICLE_KINEMATIC_TARGET, &p.target,
+                                                sizeof(math::Vec3), row * sizeof(math::Vec3)),
+                        "upload particle target");
+    }
+    if (p.hold) perturbs_.push_back(p);
+}
+
+// Each held load acts at its point; a spring adds k (target - point) - c v, v differenced over a step.
 void PhysicsWorker::WritePerturbations() {
     const WorldLayout& layout = bind_.layout;
-    for (const Perturbation& p : perturbs_) {
-        const size_t env = p.env;
-        if (p.source.kind == render::PoseSource::Kind::Link) {
-            perturb_scratch_.assign({p.force[0], p.force[1], p.force[2], p.torque[0], p.torque[1], p.torque[2]});
-            const size_t at = (env * layout.links_per_env + p.source.row) * 6u * sizeof(float);
-            CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_LINK_WRENCH, perturb_scratch_.data(),
-                                                6u * sizeof(float), at),
+    for (Perturbation& p : perturbs_) {
+        if (p.particle != kNoParticle) continue;
+        const bool link = p.source.kind == render::PoseSource::Kind::Link;
+        const size_t row =
+            static_cast<size_t>(p.env) * (link ? layout.links_per_env : layout.bodies_per_env) + p.source.row;
+        const math::Transform pose = DownloadRow<math::Transform>(
+            bind_.world, link ? NUKA_FIELD_ARTICULATION_LINK_POSE : NUKA_FIELD_RIGID_BODY_TRANSFORM, row);
+        const math::Vec3 at = pose.TransformPoint(p.point);
+        math::Vec3 f = Vec(p.force);
+        if (p.stiffness > 0.0f) {
+            const math::Vec3 v = p.primed ? (at - p.last) * (1.0f / bind_.dt) : math::Vec3::Zero();
+            f = f + (p.target - at) * p.stiffness - v * p.damping;
+            p.last = at;
+            p.primed = true;
+        }
+        const math::Vec3 t = Vec(p.torque) + (at - pose.TransformPoint(p.com)).Cross(f);
+        const float wrench[6] = {f.x, f.y, f.z, t.x, t.y, t.z};
+        if (link) {
+            CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_LINK_WRENCH, wrench, sizeof(wrench),
+                                                row * sizeof(wrench)),
                         "upload link wrench");
         } else {
-            const size_t at = (env * layout.bodies_per_env + p.source.row) * 3u * sizeof(float);
-            CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_BODY_FORCE, p.force, 3u * sizeof(float), at),
+            CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_BODY_FORCE, wrench, 3u * sizeof(float),
+                                                row * 3u * sizeof(float)),
                         "upload body force");
-            CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_BODY_TORQUE, p.torque, 3u * sizeof(float), at),
+            CheckResult(nuka_world_upload_field(bind_.world, NUKA_FIELD_BODY_TORQUE, wrench + 3, 3u * sizeof(float),
+                                                row * 3u * sizeof(float)),
                         "upload body torque");
         }
     }
@@ -653,6 +702,9 @@ void PhysicsWorker::Publish() {
     s.body_poses = mirror_bodies_;
     s.particles = mirror_particles_;
     s.heat = mirror_heat_;
+    s.perturbs.clear();
+    for (const Perturbation& p : perturbs_)
+        if (p.env == bind_.env) s.perturbs.push_back(p);
     s.overlay = overlay_;
     s.published = WorkerClock::now();
     last_publish_ = s.published;
