@@ -225,6 +225,31 @@ add_custom_command(
     VERBATIM
 )
 
+# The present path's mesh_pbr.frag variant that also shades the viewport's view modes.
+set(NUKA_RASTER_MESH_VIEW_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders/mesh_view.frag.spv")
+add_custom_command(
+    OUTPUT "${NUKA_RASTER_MESH_VIEW_FRAG_SPV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders"
+    COMMAND "${GLSLC_EXECUTABLE}" -DNUKA_VIEW_MODES "${NUKA_RASTER_MESH_FRAG}" -o "${NUKA_RASTER_MESH_VIEW_FRAG_SPV}"
+    DEPENDS "${NUKA_RASTER_MESH_FRAG}"
+    VERBATIM
+)
+
+# The viewport's instance-id pass and selection outline (present path only).
+set(NUKA_PRESENT_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/render/raster/shaders")
+set(NUKA_PRESENT_EXTRA_SPV "")
+foreach(name mesh_id.frag fullscreen.vert outline.frag)
+    set(source "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/${name}")
+    add_custom_command(
+        OUTPUT "${NUKA_PRESENT_SHADER_DIR}/${name}.spv"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${NUKA_PRESENT_SHADER_DIR}"
+        COMMAND "${GLSLC_EXECUTABLE}" "${source}" -o "${NUKA_PRESENT_SHADER_DIR}/${name}.spv"
+        DEPENDS "${source}"
+        VERBATIM
+    )
+    list(APPEND NUKA_PRESENT_EXTRA_SPV "${NUKA_PRESENT_SHADER_DIR}/${name}.spv")
+endforeach()
+
 # Go2-terrain demo: the DIRECTIONAL SHADOW-MAP depth-only vertex shader (the hero
 # Isaac-Lab feature). Same glslc custom_command pattern. Depth-only, no fragment.
 set(NUKA_RASTER_SHADOW_VERT "${CMAKE_CURRENT_SOURCE_DIR}/render/raster/shaders/shadow_depth.vert")
@@ -263,6 +288,8 @@ add_custom_target(nuka_render_shaders DEPENDS
     "${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
     "${NUKA_RASTER_MESH_FRAG_SPV}"
     "${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"
+    "${NUKA_RASTER_MESH_VIEW_FRAG_SPV}"
+    ${NUKA_PRESENT_EXTRA_SPV}
     "${NUKA_RASTER_SHADOW_VERT_SPV}"
     "${NUKA_RASTER_SKY_VERT_SPV}"
     "${NUKA_RASTER_SKY_FRAG_SPV}"
@@ -379,7 +406,8 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
     target_compile_definitions(nuka_present
         PRIVATE
             NUKA_RASTER_MESH_VERT_SPV="${NUKA_RASTER_MESH_COLOR_VERT_SPV}"
-            NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_FRAG_SPV}"
+            NUKA_RASTER_MESH_FRAG_SPV="${NUKA_RASTER_MESH_VIEW_FRAG_SPV}"
+            NUKA_PRESENT_SHADER_DIR="${NUKA_PRESENT_SHADER_DIR}"
             # M11 INT-F1: the present path's opt-in instanced pipeline reads the
             # per-instance model matrix from the interop SSBO by gl_InstanceIndex.
             NUKA_RASTER_MESH_INSTANCED_VERT_SPV="${NUKA_RASTER_MESH_INSTANCED_VERT_SPV}"

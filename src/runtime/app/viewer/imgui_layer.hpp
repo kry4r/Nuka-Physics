@@ -191,6 +191,22 @@ struct TitleBar {
 // The viewport pointer: select and move, pull on bodies and cloth, or pin them in place.
 enum class ViewportTool : uint8_t { Select, Perturb, Pin };
 
+// The viewport's shadings in render::ViewMode order, as view.mode and the mode menu name them.
+struct ViewModeInfo {
+    nuka::render::ViewMode mode;
+    const char* name;
+    const char* label;
+};
+inline constexpr ViewModeInfo kViewModes[] = {
+    {nuka::render::ViewMode::Lit, "lit", "Lit"},
+    {nuka::render::ViewMode::Unlit, "unlit", "Unlit"},
+    {nuka::render::ViewMode::Normals, "normals", "Normals"},
+    {nuka::render::ViewMode::Material, "material", "Material ID"},
+    {nuka::render::ViewMode::Residual, "residual", "Residual"},
+    {nuka::render::ViewMode::Contact, "contact", "Contact"},
+    {nuka::render::ViewMode::Wireframe, "wireframe", "Wireframe"},
+};
+
 // A held load as the viewport draws it, in world space; the host fills it every frame.
 struct HeldLoad {
     float at[3] = {0.0f, 0.0f, 0.0f};      // the grab point
@@ -211,6 +227,7 @@ struct ViewerUiState {
 
     bool show_colliders = false;
     bool show_contacts = false;
+    nuka::render::ViewMode view_mode = nuka::render::ViewMode::Lit;
 
     nuka::scene::EntityId selected_entity = nuka::scene::kInvalidEntity;
     // Every selected node, the primary `selected_entity` among them.
@@ -253,6 +270,10 @@ struct ViewerUiState {
     ViewportTool tool = ViewportTool::Select;
     float perturb_gain = 1.0f;   // the grab spring's stiffness over its default
     std::vector<HeldLoad> held;
+    // An Alt-drag box selection between two window points while the button is down.
+    bool select_box = false;
+    float select_box_from[2] = {0.0f, 0.0f};
+    float select_box_to[2] = {0.0f, 0.0f};
     char save_path[512] = {0};
     bool save_dirty = false;
     char rename_buf[256] = {0};
@@ -425,6 +446,8 @@ private:
     void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
     // Each held load's pull from its grab point toward its target.
     void DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax);
+    // The shading menu at the viewport's top right and the box of a box selection.
+    void DrawViewModeMenu(const ImVec2& vmin, const ImVec2& vmax);
     // While an asset card is dragged, the viewport takes the drop at the ground under the pointer.
     void DrawAssetDrop();
     // The texture of a PPM file, reloaded when the file changes; null without the file.

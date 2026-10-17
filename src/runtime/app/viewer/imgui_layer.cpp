@@ -1445,6 +1445,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                  Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))});
             DrawSolverHud(vmin, vmax);
             DrawPerturbHud(vmin, vmax);
+            DrawViewModeMenu(vmin, vmax);
         } else if (!ui_state.start.shown) {
             const float s = nui::Scale();
             ImFont* font = GetNukaFont(FontRole::Display);
@@ -2376,6 +2377,35 @@ void ImGuiLayer::DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax) {
                       U32(theme::Alpha(theme::kBg0, 0.85f)), U32(theme::Alpha(theme::kAccent, 0.7f)));
         list->AddText(font, px, ImVec2(l0.x + 6.0f * s, l0.y + 3.0f * s), accent, label.c_str());
     }
+    list->PopClipRect();
+}
+
+void ImGuiLayer::DrawViewModeMenu(const ImVec2& vmin, const ImVec2& vmax) {
+    const ViewerUiState& ui = *frame_.ui;
+    const float s = nui::Scale();
+    ImGui::SetNextWindowPos(ImVec2(vmax.x - 16.0f * s, vmin.y + 14.0f * s), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                                        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                        ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::Begin("##view_mode", nullptr, kFlags)) {
+        ImGui::SetNextItemWidth(130.0f * s);
+        const ViewModeInfo& shown = kViewModes[static_cast<size_t>(ui.view_mode)];
+        if (ImGui::BeginCombo("##mode", Tr(shown.label))) {
+            for (const ViewModeInfo& m : kViewModes)
+                if (ImGui::Selectable(Tr(m.label), m.mode == ui.view_mode))
+                    Queue("view.mode", Args({{"mode", json::Value::Str(m.name)}}));
+            ImGui::EndCombo();
+        }
+    }
+    ImGui::End();
+    if (!ui.select_box) return;
+    const ImVec2 a(std::min(ui.select_box_from[0], ui.select_box_to[0]), std::min(ui.select_box_from[1], ui.select_box_to[1]));
+    const ImVec2 b(std::max(ui.select_box_from[0], ui.select_box_to[0]), std::max(ui.select_box_from[1], ui.select_box_to[1]));
+    ImDrawList* list = ImGui::GetBackgroundDrawList();
+    list->PushClipRect(vmin, vmax, true);
+    list->AddRectFilled(a, b, U32(theme::Alpha(theme::kAccent, 0.10f)));
+    list->AddRect(a, b, U32(theme::Alpha(theme::kAccent, 0.8f)), 0.0f, 0, 1.0f * s);
     list->PopClipRect();
 }
 

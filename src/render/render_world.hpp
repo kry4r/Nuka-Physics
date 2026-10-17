@@ -55,6 +55,10 @@ namespace nuka::render {
 // Sentinel "no row / no id" matching SceneMap::kNoRow / Registry::kNoSlot.
 inline constexpr uint32_t kNoId = ~uint32_t(0);
 
+// How the realtime viewport shades its view: as authored, flat colours, world normals, a colour
+// per material, clay under the residual heatmap or the contact markers, or edges only.
+enum class ViewMode : uint8_t { Lit, Unlit, Normals, Material, Residual, Contact, Wireframe };
+
 // How a mesh in the library was produced (informational; lets a consumer or
 // the D3 report distinguish asset-backed fidelity from primitive fallback).
 enum class MeshSource : uint8_t {

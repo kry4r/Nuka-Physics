@@ -42,6 +42,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace nuka::render {
 
@@ -83,6 +84,12 @@ struct PresentInterop {
     uint64_t ready_value = 0u;
 };
 
+// The world instances an id pass saw in a framebuffer region of the scene viewport.
+struct PickResult {
+    uint32_t center = ~0u;               // the instance under the region's centre, or ~0u
+    std::vector<uint32_t> instances;     // every instance in the region, ascending
+};
+
 class PresentRenderer {
 public:
     // Construct from a window surface (ownership transferred). Stands up the
@@ -109,6 +116,11 @@ public:
     // Builds the instanced pipeline against the pose slots' set layout (set 1); null
     // drops it. The caller keeps the layout alive while it is installed.
     void SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout);
+
+    // Renders `world` into the id pass as DrawFrame would and reads back `region` (framebuffer
+    // pixels); kInstanceUnpickable instances are seen through. Waits for the GPU.
+    PickResult Pick(const RenderWorld& world, const RasterOptions& options, const SceneViewport& region,
+                    const PresentInterop* interop = nullptr);
 
     // The narrow Vulkan handle seam (for the viewer's ImGui InitInfo): device /
     // queue / render pass / descriptor pool / image counts. Mirrors what

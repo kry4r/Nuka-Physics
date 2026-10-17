@@ -150,6 +150,10 @@ struct RendererConfig {
     std::vector<std::string> surface_extensions;  // the window backend's required instance extensions
 };
 
+// RasterOptions::instance_flags bits: outlined as selected or hovered, or seen through by
+// picking (locked instances).
+inline constexpr uint8_t kInstanceSelected = 1u, kInstanceHovered = 2u, kInstanceUnpickable = 4u;
+
 // ---------------------------------------------------------------------------
 // RasterOptions -- per-render configuration for the raster path.
 //
@@ -161,6 +165,12 @@ struct RendererConfig {
 // ---------------------------------------------------------------------------
 struct RasterOptions {
     SceneViewport scene_viewport;
+    // The realtime viewport's view mode and per-instance kInstance* flags; the offscreen
+    // renderer ignores them. Instances past the end of the flags have none.
+    ViewMode    view_mode = ViewMode::Lit;
+    std::vector<uint8_t> instance_flags;
+    float       outline_color[4] = {1.0f, 0.62f, 0.2f, 1.0f};  // straight alpha
+    float       hover_color[4] = {1.0f, 0.62f, 0.2f, 0.45f};
     uint32_t   width      = 1280;
     uint32_t   height     = 720;
     VulkanRgba8 background = {10, 12, 16, 255};

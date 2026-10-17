@@ -42,9 +42,17 @@ namespace {
 #ifndef NUKA_RASTER_MESH_INSTANCED_VERT_SPV
 #define NUKA_RASTER_MESH_INSTANCED_VERT_SPV "mesh_instanced.vert.spv"
 #endif
+#ifndef NUKA_PRESENT_SHADER_DIR
+#define NUKA_PRESENT_SHADER_DIR "."
+#endif
 
 constexpr VkFormat   kDepthFormat = VK_FORMAT_D32_SFLOAT;
+constexpr VkFormat   kIdFormat = VK_FORMAT_R32_UINT;
 constexpr uint32_t   kFramesInFlight = 2u;
+// An id-pass texel: the instance row + 1 (0 is empty space) under the selected and hovered bits.
+constexpr uint32_t   kIdSelected = 0x80000000u, kIdHovered = 0x40000000u, kIdMask = 0x3FFFFFFFu;
+// The Residual and Contact views' clay albedo.
+constexpr float      kClay = 0.72f;
 
 void CheckVk(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
@@ -159,6 +167,22 @@ struct PushBlock {
 };
 static_assert(sizeof(PushBlock) == 128, "PushBlock must match the shared push range");
 
+// outline.frag's push block.
+struct OutlinePush {
+    float   selected[4];
+    float   hovered[4];
+    int32_t rect[4];
+};
+static_assert(sizeof(OutlinePush) == 48, "OutlinePush must match outline.frag");
+
+// A stable mid-bright colour per material id for the Material view.
+void MaterialColor(uint32_t material_id, float out[4]) {
+    uint32_t h = (material_id + 1u) * 0x9E3779B1u;
+    h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13;
+    for (int c = 0; c < 3; ++c) out[c] = 0.25f + 0.7f * static_cast<float>((h >> (8 * c)) & 0xFFu) / 255.0f;
+    out[3] = 1.0f;
+}
+
 // Sizes SceneUbo.lights[]; MUST equal the GLSL NUKA_MAX_LIGHTS in
 // render/raster/shaders/light_limits.glsl (the single shader-side source).
 constexpr int kMaxUboLights = 8;
@@ -268,6 +292,12 @@ std::vector<float> SynthesizeFlatNormals(const std::vector<float>& positions,
 struct GpuBuffer {
     VkBuffer       buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+};
+
+struct Image {
+    VkImage        image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView    view = VK_NULL_HANDLE;
 };
 
 // A cheap O(1) content signature for a mesh: stream sizes + storage addresses + a
@@ -393,18 +423,25 @@ struct PresentRenderer::Impl {
     std::vector<VkImageView>   image_views;
     std::vector<VkFramebuffer> framebuffers;
 
-    VkImage        depth_image = VK_NULL_HANDLE;
-    VkDeviceMemory depth_memory = VK_NULL_HANDLE;
-    VkImageView    depth_view = VK_NULL_HANDLE;
+    Image          depth;
 
     // set 0, binding 1 (the shared mesh_pbr.frag's uShadowMap): a persistent 1x1
     // dummy depth texture. Shadows are OFF in the present path (shadow_params.x==0)
     // so it is never sampled; it exists only to COMPLETE the descriptor set the
     // shared fragment shader statically declares. Extent-independent -> created once.
-    VkImage        shadow_dummy_image = VK_NULL_HANDLE;
-    VkDeviceMemory shadow_dummy_memory = VK_NULL_HANDLE;
-    VkImageView    shadow_dummy_view = VK_NULL_HANDLE;
+    Image          shadow_dummy;
     VkSampler      shadow_sampler = VK_NULL_HANDLE;
+
+    // The id pass renders kId* texels at swapchain size with its own depth, for the selection
+    // outline and Pick; outline.frag samples it through outline_set.
+    Image            id_image, id_depth;
+    VkRenderPass     id_pass = VK_NULL_HANDLE;
+    VkFramebuffer    id_framebuffer = VK_NULL_HANDLE;
+    VkSampler        id_sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout outline_set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool outline_pool = VK_NULL_HANDLE;
+    VkDescriptorSet  outline_set = VK_NULL_HANDLE;
+    VkPipelineLayout outline_layout = VK_NULL_HANDLE;
 
     VkRenderPass     present_pass = VK_NULL_HANDLE;
     VkRenderPass     overlay_pass = VK_NULL_HANDLE;  // present_pass loading the drawn scene back
@@ -420,9 +457,16 @@ struct PresentRenderer::Impl {
     // RenderWorld::ghost_instances: a translucent fill tested against the scene's depth
     // without writing it, built and destroyed with debug_pipeline.
     VkPipeline       ghost_pipeline = VK_NULL_HANDLE;
+    // The Wireframe view's edges, the id pass and the outline, rebuilt with `pipeline`.
+    VkPipeline       wire_pipeline = VK_NULL_HANDLE;
+    VkPipeline       id_pipeline = VK_NULL_HANDLE;
+    VkPipeline       outline_pipeline = VK_NULL_HANDLE;
     bool             wireframe_capable_ = false;
     VkShaderModule   vert_module = VK_NULL_HANDLE;
     VkShaderModule   frag_module = VK_NULL_HANDLE;
+    VkShaderModule   id_frag_module = VK_NULL_HANDLE;
+    VkShaderModule   fullscreen_vert_module = VK_NULL_HANDLE;
+    VkShaderModule   outline_frag_module = VK_NULL_HANDLE;
     VkCommandPool    command_pool = VK_NULL_HANDLE;
 
     // Instanced pipeline reading model matrices from a pose slot at set 1; built by
@@ -430,13 +474,15 @@ struct PresentRenderer::Impl {
     VkShaderModule        instanced_vert_module = VK_NULL_HANDLE;  // freed in ~Impl
     VkPipelineLayout      instanced_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline            instanced_pipeline = VK_NULL_HANDLE;
+    VkPipeline            wire_instanced_pipeline = VK_NULL_HANDLE;
+    VkPipeline            id_instanced_pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssbo_set_layout = VK_NULL_HANDLE;  // borrowed (not owned)
 
     // Per-frame-in-flight SceneUbo buffer + descriptor set (one per frame so the
-    // in-flight frame's uniform is not overwritten by the next).
+    // in-flight frame's uniform is not overwritten by the next); the last one serves Pick.
     struct UboSlot { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
                      VkDescriptorSet set = VK_NULL_HANDLE; };
-    std::array<UboSlot, kFramesInFlight> ubo_slots{};
+    std::array<UboSlot, kFramesInFlight + 1u> ubo_slots{};
 
     // Per-frame-in-flight sync + command buffers. render_finished is PER SWAPCHAIN
     // IMAGE (indexed by image_index), not per frame-in-flight: acquire returns an
@@ -539,10 +585,12 @@ struct PresentRenderer::Impl {
         // while DestroySwapchainDependents never freed them).
         CreateShaderModules();
         CreateShadowDummy();
+        CreateOutlineLayout();
         NegotiateSurface();
         CreateSwapchain();
         CreatePresentRenderPass();
         CreateDepthResources();
+        CreateIdResources();
         CreateFramebuffers();
         CreatePipeline();
         CreateSceneDescriptors();
@@ -573,10 +621,14 @@ struct PresentRenderer::Impl {
         if (vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, vert_module, nullptr);
         if (frag_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, frag_module, nullptr);
         if (instanced_vert_module != VK_NULL_HANDLE) vkDestroyShaderModule(device, instanced_vert_module, nullptr);
+        for (VkShaderModule m : {id_frag_module, fullscreen_vert_module, outline_frag_module})
+            vkDestroyShaderModule(device, m, nullptr);
+        vkDestroyPipelineLayout(device, outline_layout, nullptr);
+        vkDestroyDescriptorPool(device, outline_pool, nullptr);
+        vkDestroyDescriptorSetLayout(device, outline_set_layout, nullptr);
+        vkDestroySampler(device, id_sampler, nullptr);
         if (shadow_sampler != VK_NULL_HANDLE) vkDestroySampler(device, shadow_sampler, nullptr);
-        if (shadow_dummy_view != VK_NULL_HANDLE) vkDestroyImageView(device, shadow_dummy_view, nullptr);
-        if (shadow_dummy_image != VK_NULL_HANDLE) vkDestroyImage(device, shadow_dummy_image, nullptr);
-        if (shadow_dummy_memory != VK_NULL_HANDLE) vkFreeMemory(device, shadow_dummy_memory, nullptr);
+        DestroyImage(shadow_dummy);
         if (command_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, command_pool, nullptr);
         // ORDERED teardown (the VkSurfaceKHR is owned by window_surface but was
         // created against the renderer's VkInstance): the surface MUST be destroyed
@@ -792,45 +844,190 @@ struct PresentRenderer::Impl {
     }
 
     void CreateDepthResources() {
+        depth = MakeImage(kDepthFormat, extent, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                          VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    // A device-local single-mip 2D image with a view over `aspect`.
+    Image MakeImage(VkFormat format, VkExtent2D size, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+        Image out;
         VkImageCreateInfo image_info{};
         image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         image_info.imageType = VK_IMAGE_TYPE_2D;
-        image_info.format = kDepthFormat;
-        image_info.extent = {extent.width, extent.height, 1u};
+        image_info.format = format;
+        image_info.extent = {size.width, size.height, 1u};
         image_info.mipLevels = 1u;
         image_info.arrayLayers = 1u;
         image_info.samples = VK_SAMPLE_COUNT_1_BIT;
         image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        image_info.usage = usage;
         image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        CheckVk(vkCreateImage(device, &image_info, nullptr, &depth_image), "vkCreateImage(depth)");
+        CheckVk(vkCreateImage(device, &image_info, nullptr, &out.image), "vkCreateImage(present)");
 
         VkMemoryRequirements req{};
-        vkGetImageMemoryRequirements(device, depth_image, &req);
+        vkGetImageMemoryRequirements(device, out.image, &req);
         VkMemoryAllocateInfo alloc{};
         alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         alloc.allocationSize = req.size;
         alloc.memoryTypeIndex = FindMemoryType(physical, req.memoryTypeBits,
                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        CheckVk(vkAllocateMemory(device, &alloc, nullptr, &depth_memory), "vkAllocateMemory(depth)");
-        CheckVk(vkBindImageMemory(device, depth_image, depth_memory, 0), "vkBindImageMemory(depth)");
+        CheckVk(vkAllocateMemory(device, &alloc, nullptr, &out.memory), "vkAllocateMemory(present image)");
+        CheckVk(vkBindImageMemory(device, out.image, out.memory, 0), "vkBindImageMemory(present)");
 
         VkImageViewCreateInfo view_info{};
         view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view_info.image = depth_image;
+        view_info.image = out.image;
         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = kDepthFormat;
-        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        view_info.format = format;
+        view_info.subresourceRange.aspectMask = aspect;
         view_info.subresourceRange.levelCount = 1u;
         view_info.subresourceRange.layerCount = 1u;
-        CheckVk(vkCreateImageView(device, &view_info, nullptr, &depth_view), "vkCreateImageView(depth)");
+        CheckVk(vkCreateImageView(device, &view_info, nullptr, &out.view), "vkCreateImageView(present)");
+        return out;
+    }
+
+    void DestroyImage(Image& img) {
+        vkDestroyImageView(device, img.view, nullptr);
+        vkDestroyImage(device, img.image, nullptr);
+        vkFreeMemory(device, img.memory, nullptr);
+        img = {};
+    }
+
+    // The id pass's targets at swapchain size, its pass and framebuffer, and outline_set
+    // pointed at the new id image.
+    void CreateIdResources() {
+        id_image = MakeImage(kIdFormat, extent,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT);
+        id_depth = MakeImage(kDepthFormat, extent, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                             VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        std::array<VkAttachmentDescription, 2> attachments{};
+        attachments[0].format = kIdFormat;
+        attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        attachments[1] = attachments[0];
+        attachments[1].format = kDepthFormat;
+        attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference color_ref{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference depth_ref{1u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1u;
+        subpass.pColorAttachments = &color_ref;
+        subpass.pDepthStencilAttachment = &depth_ref;
+        // The previous frame's outline sampling, Pick's copy and depth writes finish before this
+        // pass writes; its ids are visible to the outline and the copy after it.
+        std::array<VkSubpassDependency, 2> deps{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0u;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0u;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        VkRenderPassCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        info.attachmentCount = static_cast<uint32_t>(attachments.size());
+        info.pAttachments = attachments.data();
+        info.subpassCount = 1u;
+        info.pSubpasses = &subpass;
+        info.dependencyCount = static_cast<uint32_t>(deps.size());
+        info.pDependencies = deps.data();
+        CheckVk(vkCreateRenderPass(device, &info, nullptr, &id_pass), "vkCreateRenderPass(id)");
+
+        const std::array<VkImageView, 2> views{id_image.view, id_depth.view};
+        VkFramebufferCreateInfo fb{};
+        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb.renderPass = id_pass;
+        fb.attachmentCount = static_cast<uint32_t>(views.size());
+        fb.pAttachments = views.data();
+        fb.width = extent.width;
+        fb.height = extent.height;
+        fb.layers = 1u;
+        CheckVk(vkCreateFramebuffer(device, &fb, nullptr, &id_framebuffer), "vkCreateFramebuffer(id)");
+
+        VkDescriptorImageInfo image_info{id_sampler, id_image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = outline_set;
+        write.dstBinding = 0u;
+        write.descriptorCount = 1u;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &image_info;
+        vkUpdateDescriptorSets(device, 1u, &write, 0u, nullptr);
+    }
+
+    // The outline pass's id sampler, its one descriptor set and its pipeline layout.
+    void CreateOutlineLayout() {
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_NEAREST;
+        si.minFilter = VK_FILTER_NEAREST;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        CheckVk(vkCreateSampler(device, &si, nullptr, &id_sampler), "vkCreateSampler(id)");
+
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = 0u;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1u;
+        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo set_info{};
+        set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set_info.bindingCount = 1u;
+        set_info.pBindings = &binding;
+        CheckVk(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &outline_set_layout),
+                "vkCreateDescriptorSetLayout(outline)");
+
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u};
+        VkDescriptorPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.maxSets = 1u;
+        pool_info.poolSizeCount = 1u;
+        pool_info.pPoolSizes = &size;
+        CheckVk(vkCreateDescriptorPool(device, &pool_info, nullptr, &outline_pool),
+                "vkCreateDescriptorPool(outline)");
+        VkDescriptorSetAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = outline_pool;
+        alloc.descriptorSetCount = 1u;
+        alloc.pSetLayouts = &outline_set_layout;
+        CheckVk(vkAllocateDescriptorSets(device, &alloc, &outline_set), "vkAllocateDescriptorSets(outline)");
+
+        VkPushConstantRange push_range{VK_SHADER_STAGE_FRAGMENT_BIT, 0u, sizeof(OutlinePush)};
+        VkPipelineLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout_info.setLayoutCount = 1u;
+        layout_info.pSetLayouts = &outline_set_layout;
+        layout_info.pushConstantRangeCount = 1u;
+        layout_info.pPushConstantRanges = &push_range;
+        CheckVk(vkCreatePipelineLayout(device, &layout_info, nullptr, &outline_layout),
+                "vkCreatePipelineLayout(outline)");
     }
 
     void CreateFramebuffers() {
         framebuffers.resize(image_views.size());
         for (size_t i = 0; i < image_views.size(); ++i) {
-            std::array<VkImageView, 2> views{image_views[i], depth_view};
+            std::array<VkImageView, 2> views{image_views[i], depth.view};
             VkFramebufferCreateInfo info{};
             info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             info.renderPass = present_pass;
@@ -867,6 +1064,10 @@ struct PresentRenderer::Impl {
         if (frag_module == VK_NULL_HANDLE) {
             frag_module = CreateShaderModule(NUKA_RASTER_MESH_FRAG_SPV);
         }
+        const std::string dir = NUKA_PRESENT_SHADER_DIR;
+        id_frag_module = CreateShaderModule(dir + "/mesh_id.frag.spv");
+        fullscreen_vert_module = CreateShaderModule(dir + "/fullscreen.vert.spv");
+        outline_frag_module = CreateShaderModule(dir + "/outline.frag.spv");
     }
 
     // 1x1 dummy depth texture + sampler bound at set 0 binding 1 so the shared
@@ -874,43 +1075,9 @@ struct PresentRenderer::Impl {
     // so it is never read). Created once; the layout transition uses a one-shot
     // command buffer. Mirrors the offscreen renderer's EnsureShadowSampler.
     void CreateShadowDummy() {
-        VkImageCreateInfo image_info{};
-        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        image_info.imageType = VK_IMAGE_TYPE_2D;
-        image_info.format = kDepthFormat;
-        image_info.extent = {1u, 1u, 1u};
-        image_info.mipLevels = 1u;
-        image_info.arrayLayers = 1u;
-        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
-        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-        image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        CheckVk(vkCreateImage(device, &image_info, nullptr, &shadow_dummy_image),
-                "vkCreateImage(present-shadow)");
-
-        VkMemoryRequirements req{};
-        vkGetImageMemoryRequirements(device, shadow_dummy_image, &req);
-        VkMemoryAllocateInfo alloc{};
-        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc.allocationSize = req.size;
-        alloc.memoryTypeIndex = FindMemoryType(physical, req.memoryTypeBits,
-                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        CheckVk(vkAllocateMemory(device, &alloc, nullptr, &shadow_dummy_memory),
-                "vkAllocateMemory(present-shadow)");
-        CheckVk(vkBindImageMemory(device, shadow_dummy_image, shadow_dummy_memory, 0),
-                "vkBindImageMemory(present-shadow)");
-
-        VkImageViewCreateInfo view_info{};
-        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view_info.image = shadow_dummy_image;
-        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = kDepthFormat;
-        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        view_info.subresourceRange.levelCount = 1u;
-        view_info.subresourceRange.layerCount = 1u;
-        CheckVk(vkCreateImageView(device, &view_info, nullptr, &shadow_dummy_view),
-                "vkCreateImageView(present-shadow)");
+        shadow_dummy = MakeImage(kDepthFormat, {1u, 1u},
+                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                 VK_IMAGE_ASPECT_DEPTH_BIT);
 
         VkSamplerCreateInfo si{};
         si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -926,25 +1093,14 @@ struct PresentRenderer::Impl {
                 "vkCreateSampler(present-shadow)");
 
         // One-shot UNDEFINED -> DEPTH_STENCIL_READ_ONLY transition so sampling is legal.
-        VkCommandBufferAllocateInfo cmd_alloc{};
-        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmd_alloc.commandPool = command_pool;
-        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmd_alloc.commandBufferCount = 1u;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        CheckVk(vkAllocateCommandBuffers(device, &cmd_alloc, &cmd),
-                "vkAllocateCommandBuffers(present-shadow)");
-        VkCommandBufferBeginInfo begin{};
-        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        CheckVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(present-shadow)");
+        VkCommandBuffer cmd = BeginOneShot();
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = shadow_dummy_image;
+        barrier.image = shadow_dummy.image;
         barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         barrier.subresourceRange.levelCount = 1u;
         barrier.subresourceRange.layerCount = 1u;
@@ -953,16 +1109,22 @@ struct PresentRenderer::Impl {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                              1, &barrier);
-        CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present-shadow)");
-        VkSubmitInfo submit{};
-        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.commandBufferCount = 1u;
-        submit.pCommandBuffers = &cmd;
-        CheckVk(vkQueueSubmit(graphics_queue, 1u, &submit, VK_NULL_HANDLE),
-                "vkQueueSubmit(present-shadow)");
-        CheckVk(vkQueueWaitIdle(graphics_queue), "vkQueueWaitIdle(present-shadow)");
-        vkFreeCommandBuffers(device, command_pool, 1u, &cmd);
+        EndOneShotAndWait(cmd);
     }
+
+    // The fixed-function state the present pipelines differ in.
+    struct PipelineSpec {
+        VkShaderModule   vert = VK_NULL_HANDLE;
+        VkShaderModule   frag = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkRenderPass     pass = VK_NULL_HANDLE;
+        bool             mesh = true;  // the three float3 vertex streams; false draws a bare triangle
+        VkPolygonMode    polygon = VK_POLYGON_MODE_FILL;
+        VkCullModeFlags  cull = VK_CULL_MODE_NONE;
+        bool             depth_test = true;
+        bool             depth_write = true;
+        bool             blend = false;  // straight-alpha over
+    };
 
     void CreatePipeline() {
         // Same shaders + push-block layout as the offscreen pipeline, but built
@@ -1004,35 +1166,64 @@ struct PresentRenderer::Impl {
         CheckVk(vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout),
                 "vkCreatePipelineLayout(present)");
 
+        const PipelineSpec scene{vert_module, frag_module, pipeline_layout, present_pass};
+        pipeline = MakePipeline(scene, "vkCreateGraphicsPipelines(present)");
+        PipelineSpec wire = scene;
+        wire.polygon = WirePolygon();
+        wire_pipeline = MakePipeline(wire, "vkCreateGraphicsPipelines(present-wire)");
+        PipelineSpec id = scene;
+        id.frag = id_frag_module;
+        id.pass = id_pass;
+        id_pipeline = MakePipeline(id, "vkCreateGraphicsPipelines(present-id)");
+
+        // The debug overlay never tests depth, so collider proxies read THROUGH the visual
+        // meshes, and draws wireframe, with a translucent fill where fillModeNonSolid is
+        // absent. The ghost overlay is a blended fill hidden behind the scene.
+        PipelineSpec debug = wire;
+        debug.depth_test = debug.depth_write = false;
+        debug.blend = !wireframe_capable_;
+        debug_pipeline = MakePipeline(debug, "vkCreateGraphicsPipelines(present-debug)");
+        PipelineSpec ghost = scene;
+        ghost.cull = VK_CULL_MODE_BACK_BIT;
+        ghost.depth_write = false;
+        ghost.blend = true;
+        ghost_pipeline = MakePipeline(ghost, "vkCreateGraphicsPipelines(present-ghost)");
+
+        PipelineSpec outline{fullscreen_vert_module, outline_frag_module, outline_layout, present_pass};
+        outline.mesh = false;
+        outline.depth_test = outline.depth_write = false;
+        outline.blend = true;
+        outline_pipeline = MakePipeline(outline, "vkCreateGraphicsPipelines(present-outline)");
+    }
+
+    // POLYGON_MODE_LINE where the device enables fillModeNonSolid, else a fill.
+    VkPolygonMode WirePolygon() const {
+        return wireframe_capable_ ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+    }
+
+    VkPipeline MakePipeline(const PipelineSpec& spec, const char* what) {
         std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = vert_module;
+        stages[0].module = spec.vert;
         stages[0].pName = "main";
         stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = frag_module;
+        stages[1].module = spec.frag;
         stages[1].pName = "main";
 
+        // Position, normal and colour, one float3 stream each.
         std::array<VkVertexInputBindingDescription, 3> bindings{};
-        bindings[0].binding = 0u; bindings[0].stride = sizeof(float) * 3u;
-        bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        bindings[1].binding = 1u; bindings[1].stride = sizeof(float) * 3u;
-        bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        bindings[2].binding = 2u; bindings[2].stride = sizeof(float) * 3u;
-        bindings[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         std::array<VkVertexInputAttributeDescription, 3> attrs{};
-        attrs[0].location = 0u; attrs[0].binding = 0u;
-        attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0u;
-        attrs[1].location = 1u; attrs[1].binding = 1u;
-        attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset = 0u;
-        attrs[2].location = 2u; attrs[2].binding = 2u;
-        attrs[2].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[2].offset = 0u;
+        for (uint32_t i = 0; i < 3u; ++i) {
+            bindings[i] = {i, sizeof(float) * 3u, VK_VERTEX_INPUT_RATE_VERTEX};
+            attrs[i] = {i, i, VK_FORMAT_R32G32B32_SFLOAT, 0u};
+        }
         VkPipelineVertexInputStateCreateInfo vertex_input{};
         vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertex_input.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
+        vertex_input.vertexBindingDescriptionCount = spec.mesh ? 3u : 0u;
         vertex_input.pVertexBindingDescriptions = bindings.data();
-        vertex_input.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
+        vertex_input.vertexAttributeDescriptionCount = spec.mesh ? 3u : 0u;
         vertex_input.pVertexAttributeDescriptions = attrs.data();
 
         VkPipelineInputAssemblyStateCreateInfo input_assembly{};
@@ -1046,123 +1237,8 @@ struct PresentRenderer::Impl {
 
         VkPipelineRasterizationStateCreateInfo rasterization{};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterization.polygonMode = VK_POLYGON_MODE_FILL;
-        rasterization.cullMode = VK_CULL_MODE_NONE;
-        rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rasterization.lineWidth = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo multisample{};
-        multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo depth_stencil{};
-        depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depth_stencil.depthTestEnable = VK_TRUE;
-        depth_stencil.depthWriteEnable = VK_TRUE;
-        depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState blend_attachment{};
-        blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        blend_attachment.blendEnable = VK_FALSE;
-        VkPipelineColorBlendStateCreateInfo color_blend{};
-        color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        color_blend.attachmentCount = 1u;
-        color_blend.pAttachments = &blend_attachment;
-
-        std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
-                                                     VK_DYNAMIC_STATE_SCISSOR};
-        VkPipelineDynamicStateCreateInfo dynamic_state{};
-        dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
-        dynamic_state.pDynamicStates = dynamic_states.data();
-
-        VkGraphicsPipelineCreateInfo info{};
-        info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        info.stageCount = static_cast<uint32_t>(stages.size());
-        info.pStages = stages.data();
-        info.pVertexInputState = &vertex_input;
-        info.pInputAssemblyState = &input_assembly;
-        info.pViewportState = &viewport_state;
-        info.pRasterizationState = &rasterization;
-        info.pMultisampleState = &multisample;
-        info.pDepthStencilState = &depth_stencil;
-        info.pColorBlendState = &color_blend;
-        info.pDynamicState = &dynamic_state;
-        info.layout = pipeline_layout;
-        info.renderPass = present_pass;
-        info.subpass = 0u;
-        CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &info, nullptr, &pipeline),
-                "vkCreateGraphicsPipelines(present)");
-
-        CreateOverlayPipelines();
-    }
-
-    // The overlay pipelines share pipeline_layout (set 0 + the PushBlock) and the mesh
-    // shaders. The debug one never tests depth, so collider proxies read THROUGH the visual
-    // meshes, and draws wireframe (POLYGON_MODE_LINE), with a translucent alpha-blended fill
-    // as the fallback where fillModeNonSolid is absent. The ghost one is a blended fill
-    // hidden behind the scene.
-    void CreateOverlayPipelines() {
-        if (pipeline_layout == VK_NULL_HANDLE) return;
-        DestroyOverlayPipelines();
-        debug_pipeline = OverlayPipeline(wireframe_capable_ ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL,
-                                         VK_CULL_MODE_NONE, false, !wireframe_capable_,
-                                         "vkCreateGraphicsPipelines(present-debug)");
-        ghost_pipeline = OverlayPipeline(VK_POLYGON_MODE_FILL, VK_CULL_MODE_BACK_BIT, true, true,
-                                         "vkCreateGraphicsPipelines(present-ghost)");
-    }
-
-    void DestroyOverlayPipelines() {
-        if (debug_pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, debug_pipeline, nullptr); debug_pipeline = VK_NULL_HANDLE; }
-        if (ghost_pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, ghost_pipeline, nullptr); ghost_pipeline = VK_NULL_HANDLE; }
-    }
-
-    VkPipeline OverlayPipeline(VkPolygonMode mode, VkCullModeFlags cull, bool depth_test, bool blend, const char* what) {
-        std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = vert_module;
-        stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = frag_module;
-        stages[1].pName = "main";
-
-        std::array<VkVertexInputBindingDescription, 3> bindings{};
-        bindings[0].binding = 0u; bindings[0].stride = sizeof(float) * 3u;
-        bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        bindings[1].binding = 1u; bindings[1].stride = sizeof(float) * 3u;
-        bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        bindings[2].binding = 2u; bindings[2].stride = sizeof(float) * 3u;
-        bindings[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        std::array<VkVertexInputAttributeDescription, 3> attrs{};
-        attrs[0].location = 0u; attrs[0].binding = 0u;
-        attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0u;
-        attrs[1].location = 1u; attrs[1].binding = 1u;
-        attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset = 0u;
-        attrs[2].location = 2u; attrs[2].binding = 2u;
-        attrs[2].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[2].offset = 0u;
-        VkPipelineVertexInputStateCreateInfo vertex_input{};
-        vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertex_input.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
-        vertex_input.pVertexBindingDescriptions = bindings.data();
-        vertex_input.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
-        vertex_input.pVertexAttributeDescriptions = attrs.data();
-
-        VkPipelineInputAssemblyStateCreateInfo input_assembly{};
-        input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo viewport_state{};
-        viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewport_state.viewportCount = 1u;
-        viewport_state.scissorCount = 1u;
-
-        VkPipelineRasterizationStateCreateInfo rasterization{};
-        rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterization.polygonMode = mode;
-        rasterization.cullMode = cull;
+        rasterization.polygonMode = spec.polygon;
+        rasterization.cullMode = spec.cull;
         rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rasterization.lineWidth = 1.0f;  // 1.0 needs no wideLines feature
 
@@ -1170,17 +1246,16 @@ struct PresentRenderer::Impl {
         multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-        // Neither writes depth, so an overlay never occludes the opaque scene drawn before it.
         VkPipelineDepthStencilStateCreateInfo depth_stencil{};
         depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depth_stencil.depthTestEnable = depth_test ? VK_TRUE : VK_FALSE;
-        depth_stencil.depthWriteEnable = VK_FALSE;
-        depth_stencil.depthCompareOp = depth_test ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_ALWAYS;
+        depth_stencil.depthTestEnable = spec.depth_test ? VK_TRUE : VK_FALSE;
+        depth_stencil.depthWriteEnable = spec.depth_write ? VK_TRUE : VK_FALSE;
+        depth_stencil.depthCompareOp = spec.depth_test ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_ALWAYS;
 
         VkPipelineColorBlendAttachmentState blend_attachment{};
         blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        blend_attachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
+        blend_attachment.blendEnable = spec.blend ? VK_TRUE : VK_FALSE;
         blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
         blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
@@ -1211,34 +1286,33 @@ struct PresentRenderer::Impl {
         info.pDepthStencilState = &depth_stencil;
         info.pColorBlendState = &color_blend;
         info.pDynamicState = &dynamic_state;
-        info.layout = pipeline_layout;
-        info.renderPass = present_pass;
+        info.layout = spec.layout;
+        info.renderPass = spec.pass;
         info.subpass = 0u;
         VkPipeline out = VK_NULL_HANDLE;
         CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &info, nullptr, &out), what);
         return out;
     }
 
-    // INT-F1: build the OPT-IN instanced pipeline (mesh_instanced.vert reads the
+    void DestroyPipelines(std::initializer_list<VkPipeline*> pipelines) {
+        for (VkPipeline* p : pipelines) {
+            vkDestroyPipeline(device, *p, nullptr);
+            *p = VK_NULL_HANDLE;
+        }
+    }
+
+    // INT-F1: build the OPT-IN instanced pipelines (mesh_instanced.vert reads the
     // per-instance model matrix from the interop SSBO at set 1 by gl_InstanceIndex).
     // Requires scene_set_layout (set 0) + the borrowed ssbo_set_layout (set 1) to be
     // valid -> called by SetInteropTransforms after CreatePipeline, and by
-    // RecreateSwapchain when interop is active. Idempotent-safe: destroys any prior
-    // instanced pipeline/layout first. Shares the offscreen frag (mesh_pbr.frag) +
-    // the same PushBlock + the same fixed-function state as the default pipeline, so
-    // the ONLY difference is the model-matrix source (SSBO vs push constant).
+    // RecreateSwapchain when interop is active. They mirror the scene, wire and id
+    // pipelines; the ONLY difference is the model-matrix source (SSBO vs push constant).
     void CreateInstancedPipeline() {
         if (ssbo_set_layout == VK_NULL_HANDLE || scene_set_layout == VK_NULL_HANDLE) return;
         if (instanced_vert_module == VK_NULL_HANDLE) {
             instanced_vert_module = CreateShaderModule(NUKA_RASTER_MESH_INSTANCED_VERT_SPV);
         }
-        if (instanced_pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device, instanced_pipeline, nullptr); instanced_pipeline = VK_NULL_HANDLE;
-        }
-        if (instanced_pipeline_layout != VK_NULL_HANDLE) {
-            vkDestroyPipelineLayout(device, instanced_pipeline_layout, nullptr);
-            instanced_pipeline_layout = VK_NULL_HANDLE;
-        }
+        DestroyInstancedPipelines();
 
         // Pipeline layout: set 0 = SceneUbo, set 1 = the interop transform SSBO.
         const std::array<VkDescriptorSetLayout, 2> set_layouts{scene_set_layout, ssbo_set_layout};
@@ -1255,112 +1329,36 @@ struct PresentRenderer::Impl {
         CheckVk(vkCreatePipelineLayout(device, &layout_info, nullptr, &instanced_pipeline_layout),
                 "vkCreatePipelineLayout(present-instanced)");
 
-        std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = instanced_vert_module;
-        stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = frag_module;
-        stages[1].pName = "main";
+        PipelineSpec spec{instanced_vert_module, frag_module, instanced_pipeline_layout, present_pass};
+        instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced)");
+        spec.polygon = WirePolygon();
+        wire_instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced-wire)");
+        spec.polygon = VK_POLYGON_MODE_FILL;
+        spec.frag = id_frag_module;
+        spec.pass = id_pass;
+        id_instanced_pipeline = MakePipeline(spec, "vkCreateGraphicsPipelines(present-instanced-id)");
+    }
 
-        std::array<VkVertexInputBindingDescription, 3> bindings{};
-        bindings[0].binding = 0u; bindings[0].stride = sizeof(float) * 3u;
-        bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        bindings[1].binding = 1u; bindings[1].stride = sizeof(float) * 3u;
-        bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        bindings[2].binding = 2u; bindings[2].stride = sizeof(float) * 3u;
-        bindings[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-        std::array<VkVertexInputAttributeDescription, 3> attrs{};
-        attrs[0].location = 0u; attrs[0].binding = 0u;
-        attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0u;
-        attrs[1].location = 1u; attrs[1].binding = 1u;
-        attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset = 0u;
-        attrs[2].location = 2u; attrs[2].binding = 2u;
-        attrs[2].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[2].offset = 0u;
-        VkPipelineVertexInputStateCreateInfo vertex_input{};
-        vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertex_input.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings.size());
-        vertex_input.pVertexBindingDescriptions = bindings.data();
-        vertex_input.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
-        vertex_input.pVertexAttributeDescriptions = attrs.data();
-
-        VkPipelineInputAssemblyStateCreateInfo input_assembly{};
-        input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo viewport_state{};
-        viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        viewport_state.viewportCount = 1u;
-        viewport_state.scissorCount = 1u;
-
-        VkPipelineRasterizationStateCreateInfo rasterization{};
-        rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterization.polygonMode = VK_POLYGON_MODE_FILL;
-        rasterization.cullMode = VK_CULL_MODE_NONE;
-        rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rasterization.lineWidth = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo multisample{};
-        multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo depth_stencil{};
-        depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        depth_stencil.depthTestEnable = VK_TRUE;
-        depth_stencil.depthWriteEnable = VK_TRUE;
-        depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState blend_attachment{};
-        blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        blend_attachment.blendEnable = VK_FALSE;
-        VkPipelineColorBlendStateCreateInfo color_blend{};
-        color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        color_blend.attachmentCount = 1u;
-        color_blend.pAttachments = &blend_attachment;
-
-        std::array<VkDynamicState, 2> dynamic_states{VK_DYNAMIC_STATE_VIEWPORT,
-                                                     VK_DYNAMIC_STATE_SCISSOR};
-        VkPipelineDynamicStateCreateInfo dynamic_state{};
-        dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
-        dynamic_state.pDynamicStates = dynamic_states.data();
-
-        VkGraphicsPipelineCreateInfo info{};
-        info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        info.stageCount = static_cast<uint32_t>(stages.size());
-        info.pStages = stages.data();
-        info.pVertexInputState = &vertex_input;
-        info.pInputAssemblyState = &input_assembly;
-        info.pViewportState = &viewport_state;
-        info.pRasterizationState = &rasterization;
-        info.pMultisampleState = &multisample;
-        info.pDepthStencilState = &depth_stencil;
-        info.pColorBlendState = &color_blend;
-        info.pDynamicState = &dynamic_state;
-        info.layout = instanced_pipeline_layout;
-        info.renderPass = present_pass;
-        info.subpass = 0u;
-        CheckVk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1u, &info, nullptr, &instanced_pipeline),
-                "vkCreateGraphicsPipelines(present-instanced)");
+    void DestroyInstancedPipelines() {
+        DestroyPipelines({&instanced_pipeline, &wire_instanced_pipeline, &id_instanced_pipeline});
+        vkDestroyPipelineLayout(device, instanced_pipeline_layout, nullptr);
+        instanced_pipeline_layout = VK_NULL_HANDLE;
     }
 
     // Persistent per-frame-in-flight SceneUbo buffers + descriptor sets.
     void CreateSceneDescriptors() {
+        const uint32_t slot_count = static_cast<uint32_t>(ubo_slots.size());
         const std::array<VkDescriptorPoolSize, 2> sizes{{
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kFramesInFlight},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kFramesInFlight}}};
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, slot_count},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, slot_count}}};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool_info.maxSets = kFramesInFlight;
+        pool_info.maxSets = slot_count;
         pool_info.poolSizeCount = static_cast<uint32_t>(sizes.size());
         pool_info.pPoolSizes = sizes.data();
         CheckVk(vkCreateDescriptorPool(device, &pool_info, nullptr, &scene_pool),
                 "vkCreateDescriptorPool(present-scene)");
-        for (uint32_t i = 0; i < kFramesInFlight; ++i) {
-            UboSlot& slot = ubo_slots[i];
+        for (UboSlot& slot : ubo_slots) {
             const GpuBuffer b = CreateHostBuffer(sizeof(SceneUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
             slot.buffer = b.buffer;
             slot.memory = b.memory;
@@ -1374,7 +1372,7 @@ struct PresentRenderer::Impl {
             VkDescriptorBufferInfo buffer_info{slot.buffer, 0u, sizeof(SceneUbo)};
             VkDescriptorImageInfo shadow_info{};
             shadow_info.sampler = shadow_sampler;
-            shadow_info.imageView = shadow_dummy_view;
+            shadow_info.imageView = shadow_dummy.view;
             shadow_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
             std::array<VkWriteDescriptorSet, 2> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1427,25 +1425,27 @@ struct PresentRenderer::Impl {
             if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(device, fb, nullptr);
         }
         framebuffers.clear();
-        if (depth_view != VK_NULL_HANDLE) { vkDestroyImageView(device, depth_view, nullptr); depth_view = VK_NULL_HANDLE; }
-        if (depth_image != VK_NULL_HANDLE) { vkDestroyImage(device, depth_image, nullptr); depth_image = VK_NULL_HANDLE; }
-        if (depth_memory != VK_NULL_HANDLE) { vkFreeMemory(device, depth_memory, nullptr); depth_memory = VK_NULL_HANDLE; }
-        if (pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, pipeline, nullptr); pipeline = VK_NULL_HANDLE; }
-        // The overlay pipelines are built against present_pass + share pipeline_layout;
-        // destroy them before the layout so a swapchain recreate rebuilds them all.
-        DestroyOverlayPipelines();
+        DestroyImage(depth);
+        vkDestroyFramebuffer(device, id_framebuffer, nullptr);
+        id_framebuffer = VK_NULL_HANDLE;
+        DestroyImage(id_image);
+        DestroyImage(id_depth);
+        // Every pipeline is built against present_pass or id_pass; destroy them before their
+        // layouts so a swapchain recreate rebuilds them all.
+        DestroyPipelines({&pipeline, &wire_pipeline, &id_pipeline, &outline_pipeline, &debug_pipeline,
+                          &ghost_pipeline});
         if (pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device, pipeline_layout, nullptr); pipeline_layout = VK_NULL_HANDLE; }
-        // INT-F1: the instanced pipeline + its layout are render-pass-dependent too
-        // (built against present_pass) -> destroy here so a swapchain recreate rebuilds
-        // them. The instanced_vert_module + the BORROWED ssbo_set/layout survive.
-        if (instanced_pipeline != VK_NULL_HANDLE) { vkDestroyPipeline(device, instanced_pipeline, nullptr); instanced_pipeline = VK_NULL_HANDLE; }
-        if (instanced_pipeline_layout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(device, instanced_pipeline_layout, nullptr); instanced_pipeline_layout = VK_NULL_HANDLE; }
+        // INT-F1: the instanced pipelines + their layout go too; the instanced_vert_module
+        // + the BORROWED ssbo_set/layout survive.
+        DestroyInstancedPipelines();
         // scene_set_layout is (re)created by CreatePipeline; destroy it here so a
         // swapchain recreate does not leak it. The persistent scene_pool + ubo_slots
         // sets stay valid (a byte-identical re-created layout remains bind-compatible).
         if (scene_set_layout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(device, scene_set_layout, nullptr); scene_set_layout = VK_NULL_HANDLE; }
         if (present_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(device, present_pass, nullptr); present_pass = VK_NULL_HANDLE; }
         if (overlay_pass != VK_NULL_HANDLE) { vkDestroyRenderPass(device, overlay_pass, nullptr); overlay_pass = VK_NULL_HANDLE; }
+        vkDestroyRenderPass(device, id_pass, nullptr);
+        id_pass = VK_NULL_HANDLE;
         for (VkImageView v : image_views) {
             if (v != VK_NULL_HANDLE) vkDestroyImageView(device, v, nullptr);
         }
@@ -1467,6 +1467,7 @@ struct PresentRenderer::Impl {
         CreateSwapchain();
         CreatePresentRenderPass();
         CreateDepthResources();
+        CreateIdResources();
         CreateFramebuffers();
         CreatePipeline();
         // DestroySwapchainDependents tore the instanced pipeline down with the old pass.
@@ -1555,10 +1556,22 @@ struct PresentRenderer::Impl {
         return cmd;
     }
 
-    void EndOneShotAndWait(VkCommandBuffer cmd) {
+    // Submits a one-shot buffer and waits for the queue; with `pose` its vertex shading
+    // first waits for the pose slot's timeline value.
+    void EndOneShotAndWait(VkCommandBuffer cmd, const PresentInterop* pose = nullptr) {
         CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(present-oneshot)");
+        const VkSemaphore timeline = pose != nullptr ? reinterpret_cast<VkSemaphore>(pose->timeline) : VK_NULL_HANDLE;
+        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+        VkTimelineSemaphoreSubmitInfo timeline_info{};
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.waitSemaphoreValueCount = 1u;
+        timeline_info.pWaitSemaphoreValues = pose != nullptr ? &pose->ready_value : nullptr;
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.pNext = pose != nullptr ? &timeline_info : nullptr;
+        submit.waitSemaphoreCount = pose != nullptr ? 1u : 0u;
+        submit.pWaitSemaphores = &timeline;
+        submit.pWaitDstStageMask = &wait_stage;
         submit.commandBufferCount = 1u;
         submit.pCommandBuffers = &cmd;
         CheckVk(vkQueueSubmit(graphics_queue, 1u, &submit, VK_NULL_HANDLE), "vkQueueSubmit(present-oneshot)");
@@ -1664,6 +1677,7 @@ struct PresentRenderer::Impl {
         float     roughness = 0.5f;
         float     opacity = 1.0f;
         float     emissive[3] = {0.0f, 0.0f, 0.0f};
+        float     shade = 0.0f;  // the view mode mesh_view.frag reads from emissive.a
         // INT-F1: the ORIGINAL index into world.instances (== the scatter SSBO row).
         // Used as firstInstance so gl_InstanceIndex selects the right SSBO mat4 on
         // the instanced path (the draw loop skips geometry-less instances, so the
@@ -1722,6 +1736,216 @@ struct PresentRenderer::Impl {
         Destroy(buf);
     }
 
+    // Rewrites a draw's material for the view mode; mesh_view.frag reads the mode from emissive.a.
+    static void ApplyViewMode(ViewMode mode, uint32_t material_id, InstanceDraw& draw) {
+        switch (mode) {
+        case ViewMode::Lit:
+            break;
+        case ViewMode::Unlit:
+        case ViewMode::Wireframe:
+            draw.shade = 1.0f;
+            break;
+        case ViewMode::Normals:
+            draw.shade = 2.0f;
+            break;
+        case ViewMode::Material:
+            draw.shade = 3.0f;
+            if (material_id == kNoId) std::fill(draw.base_color, draw.base_color + 3, 0.5f);
+            else MaterialColor(material_id, draw.base_color);
+            break;
+        case ViewMode::Residual:
+        case ViewMode::Contact:
+            std::fill(draw.base_color, draw.base_color + 3, kClay);
+            draw.base_color[3] = 1.0f;
+            draw.metallic = 0.0f;
+            draw.roughness = 0.8f;
+            draw.opacity = 1.0f;
+            std::fill(draw.emissive, draw.emissive + 3, 0.0f);
+            break;
+        }
+    }
+
+    // One view's draws, framebuffer rect and SceneUbo.
+    struct PreparedView {
+        std::vector<InstanceDraw> draws;
+        SceneViewport rect;
+        SceneUbo ubo{};
+    };
+
+    PreparedView Prepare(const RenderWorld& world, const RasterOptions& options) {
+        // Bring the device-local geometry cache up to date (uploads only on a
+        // geometry-set change). Per-frame work below is just transforms + materials.
+        SyncMeshCache(world);
+
+        // -- build per-instance draws from the cached geometry + scene AABB.
+        PreparedView view;
+        view.draws.reserve(world.instances.size());
+        math::Vec3 aabb_min{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                            std::numeric_limits<float>::max()};
+        math::Vec3 aabb_max{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
+                            -std::numeric_limits<float>::max()};
+        bool has_geometry = false;
+        // The world AABB is consumed ONLY by the auto-frame camera (no override, no
+        // scene camera); skip the per-vertex sweep when a camera is supplied.
+        const bool needs_aabb = !options.use_camera_override && world.CameraCount() == 0u;
+        const uint32_t instance_total = static_cast<uint32_t>(world.instances.size());
+        for (uint32_t inst_idx = 0; inst_idx < instance_total; ++inst_idx) {
+            const RenderInstance& inst = world.instances[inst_idx];
+            if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
+            const MeshGeometry& geo = world.meshes.Geometry(inst.mesh_id);
+            if (geo.Empty()) continue;
+            const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
+            if (cached.index_count == 0u) continue;  // not cached (defensive)
+            InstanceDraw draw;
+            draw.instance_row = inst_idx;
+            draw.model = TransformToMatrix(inst.world_xform);
+            draw.pos = cached.pos.buffer;
+            draw.nrm = cached.nrm.buffer;
+            draw.col = cached.col.buffer;
+            draw.idx = cached.idx.buffer;
+            draw.index_count = cached.index_count;
+            const bool has_material = inst.render_material_id != kNoId &&
+                                      inst.render_material_id < world.materials.size();
+            if (has_material) {
+                const scene::RenderMaterial& mat = world.materials[inst.render_material_id];
+                draw.base_color[0] = mat.base_color[0];
+                draw.base_color[1] = mat.base_color[1];
+                draw.base_color[2] = mat.base_color[2];
+                draw.base_color[3] = mat.base_color[3];
+                draw.metallic = mat.metallic;
+                draw.roughness = mat.roughness;
+                draw.opacity = mat.opacity;
+                draw.emissive[0] = mat.emissive[0];
+                draw.emissive[1] = mat.emissive[1];
+                draw.emissive[2] = mat.emissive[2];
+            }
+            ApplyViewMode(options.view_mode, has_material ? inst.render_material_id : kNoId, draw);
+            if (needs_aabb) {
+                for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
+                    const math::Vec3 local{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]};
+                    const math::Vec3 wp = inst.world_xform.TransformPoint(local);
+                    aabb_min.x = std::min(aabb_min.x, wp.x); aabb_min.y = std::min(aabb_min.y, wp.y);
+                    aabb_min.z = std::min(aabb_min.z, wp.z); aabb_max.x = std::max(aabb_max.x, wp.x);
+                    aabb_max.y = std::max(aabb_max.y, wp.y); aabb_max.z = std::max(aabb_max.z, wp.z);
+                    has_geometry = true;
+                }
+            }
+            view.draws.push_back(std::move(draw));
+        }
+
+        const ResolvedCamera cam = ResolveCamera(world, options, aabb_min, aabb_max, has_geometry);
+        view.rect = ResolveSceneViewport(options.scene_viewport, extent.width, extent.height);
+        const float aspect = view.rect.Aspect();
+        const float fov_y = cam.fov_degrees * 3.14159265358979323846f / 180.0f;
+        const Mat4 view_matrix = LookAt(cam.eye, cam.target, cam.up);
+        const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
+        view.ubo = BuildSceneUbo(world, Multiply(proj, view_matrix), cam.eye);
+        return view;
+    }
+
+    void UploadUbo(const UboSlot& slot, const SceneUbo& ubo) {
+        Upload(GpuBuffer{slot.buffer, slot.memory}, &ubo, sizeof(SceneUbo));
+    }
+
+    static VkRect2D ScissorOf(const SceneViewport& rect) {
+        return {{static_cast<int32_t>(rect.x), static_cast<int32_t>(rect.y)}, {rect.width, rect.height}};
+    }
+
+    static void SetViewport(VkCommandBuffer cmd, const SceneViewport& rect) {
+        VkViewport viewport{};
+        viewport.x = static_cast<float>(rect.x); viewport.y = static_cast<float>(rect.y);
+        viewport.width = static_cast<float>(std::max(rect.width, 1u));
+        viewport.height = static_cast<float>(std::max(rect.height, 1u));
+        viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0u, 1u, &viewport);
+        const VkRect2D scissor = ScissorOf(rect);
+        vkCmdSetScissor(cmd, 0u, 1u, &scissor);
+    }
+
+    // Records a view's draws with `pipe`; with `flags` it is the id pass, which writes each
+    // instance's kId* texel into the push block's last vec4 and skips unpickable ones.
+    void RecordDraws(VkCommandBuffer cmd, const PreparedView& view, VkPipeline pipe, VkPipelineLayout layout,
+                     VkDescriptorSet ubo_set, const PresentInterop* pose, const std::vector<uint8_t>* flags) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0u, 1u, &ubo_set, 0u, nullptr);
+        if (pose != nullptr) {
+            const VkDescriptorSet slot_set = reinterpret_cast<VkDescriptorSet>(pose->set);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1u, 1u, &slot_set, 0u, nullptr);
+        }
+        SetViewport(cmd, view.rect);
+        for (const InstanceDraw& draw : view.draws) {
+            PushBlock push{};
+            // On the instanced path the model matrix comes from the SSBO (the shader
+            // ignores push.model); we still fill it harmlessly. Material always rides
+            // the push constant on BOTH paths (materials are not device physics state).
+            std::memcpy(push.model, draw.model.m.data(), sizeof(push.model));
+            std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));
+            push.mr[0] = draw.metallic; push.mr[1] = draw.roughness;
+            push.mr[2] = draw.opacity;  push.mr[3] = 0.0f;
+            push.emissive[0] = draw.emissive[0]; push.emissive[1] = draw.emissive[1];
+            push.emissive[2] = draw.emissive[2]; push.emissive[3] = draw.shade;
+            if (flags != nullptr) {
+                const uint8_t f = draw.instance_row < flags->size() ? (*flags)[draw.instance_row] : uint8_t{0};
+                if ((f & kInstanceUnpickable) != 0) continue;
+                const uint32_t id = (draw.instance_row + 1u) | ((f & kInstanceSelected) != 0 ? kIdSelected : 0u) |
+                                    ((f & kInstanceHovered) != 0 ? kIdHovered : 0u);
+                std::memcpy(push.ground_shadow, &id, sizeof(id));
+            }
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
+                               sizeof(PushBlock), &push);
+            std::array<VkBuffer, 3> vbuffers{draw.pos, draw.nrm, draw.col};
+            std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
+            vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
+            vkCmdBindIndexBuffer(cmd, draw.idx, 0u, VK_INDEX_TYPE_UINT32);
+            // INT-F1: on the instanced path, firstInstance == the SSBO row so
+            // gl_InstanceIndex picks the right scattered transform (the draw loop
+            // skipped geometry-less instances, so the SSBO row != compacted index).
+            vkCmdDrawIndexed(cmd, draw.index_count, 1u, 0u, 0, pose != nullptr ? draw.instance_row : 0u);
+        }
+    }
+
+    // The id pass over `view`; it leaves id_image in SHADER_READ_ONLY_OPTIMAL.
+    void RecordIdPass(VkCommandBuffer cmd, const PreparedView& view, const std::vector<uint8_t>& flags,
+                      VkDescriptorSet ubo_set, const PresentInterop* pose) {
+        std::array<VkClearValue, 2> clears{};
+        clears[1].depthStencil = {1.0f, 0u};
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = id_pass;
+        rp.framebuffer = id_framebuffer;
+        rp.renderArea = {{0, 0}, extent};
+        rp.clearValueCount = static_cast<uint32_t>(clears.size());
+        rp.pClearValues = clears.data();
+        vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        if (pose != nullptr) {
+            RecordDraws(cmd, view, id_instanced_pipeline, instanced_pipeline_layout, ubo_set, pose, &flags);
+        } else {
+            RecordDraws(cmd, view, id_pipeline, pipeline_layout, ubo_set, nullptr, &flags);
+        }
+        vkCmdEndRenderPass(cmd);
+    }
+
+    void RecordOutline(VkCommandBuffer cmd, const SceneViewport& rect, const RasterOptions& options) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, outline_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, outline_layout, 0u, 1u, &outline_set,
+                                0u, nullptr);
+        SetViewport(cmd, rect);
+        OutlinePush push{};
+        std::memcpy(push.selected, options.outline_color, sizeof(push.selected));
+        std::memcpy(push.hovered, options.hover_color, sizeof(push.hovered));
+        push.rect[0] = static_cast<int32_t>(rect.x);
+        push.rect[1] = static_cast<int32_t>(rect.y);
+        push.rect[2] = static_cast<int32_t>(rect.width);
+        push.rect[3] = static_cast<int32_t>(rect.height);
+        vkCmdPushConstants(cmd, outline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0u, sizeof(push), &push);
+        vkCmdDraw(cmd, 3u, 1u, 0u, 0u);
+    }
+
+    static bool Marked(const std::vector<uint8_t>& flags) {
+        return std::any_of(flags.begin(), flags.end(),
+                           [](uint8_t f) { return (f & (kInstanceSelected | kInstanceHovered)) != 0; });
+    }
+
     PresentFrameResult DrawFrame(const RenderWorld& world, const RasterOptions& options,
                                  const OverlayRecordFn& overlay, const PresentInterop* interop) {
         if (window_surface->Width() == 0u || window_surface->Height() == 0u) {
@@ -1758,81 +1982,8 @@ struct PresentRenderer::Impl {
         }
         images_in_flight[image_index] = in_flight[frame];
 
-        // Bring the device-local geometry cache up to date (uploads only on a
-        // geometry-set change). Per-frame work below is just transforms + materials.
-        SyncMeshCache(world);
-
-        // -- build per-instance draws from the cached geometry + scene AABB.
-        std::vector<InstanceDraw> draws;
-        draws.reserve(world.instances.size());
-        math::Vec3 aabb_min{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
-                            std::numeric_limits<float>::max()};
-        math::Vec3 aabb_max{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
-                            -std::numeric_limits<float>::max()};
-        bool has_geometry = false;
-        // The world AABB is consumed ONLY by the auto-frame camera (no override, no
-        // scene camera); skip the per-vertex sweep when a camera is supplied.
-        const bool needs_aabb = !options.use_camera_override && world.CameraCount() == 0u;
-        const uint32_t instance_total = static_cast<uint32_t>(world.instances.size());
-        for (uint32_t inst_idx = 0; inst_idx < instance_total; ++inst_idx) {
-            const RenderInstance& inst = world.instances[inst_idx];
-            if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
-            const MeshGeometry& geo = world.meshes.Geometry(inst.mesh_id);
-            if (geo.Empty()) continue;
-            const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
-            if (cached.index_count == 0u) continue;  // not cached (defensive)
-            InstanceDraw draw;
-            draw.instance_row = inst_idx;
-            draw.model = TransformToMatrix(inst.world_xform);
-            draw.pos = cached.pos.buffer;
-            draw.nrm = cached.nrm.buffer;
-            draw.col = cached.col.buffer;
-            draw.idx = cached.idx.buffer;
-            draw.index_count = cached.index_count;
-            if (inst.render_material_id != kNoId &&
-                inst.render_material_id < world.materials.size()) {
-                const scene::RenderMaterial& mat = world.materials[inst.render_material_id];
-                draw.base_color[0] = mat.base_color[0];
-                draw.base_color[1] = mat.base_color[1];
-                draw.base_color[2] = mat.base_color[2];
-                draw.base_color[3] = mat.base_color[3];
-                draw.metallic = mat.metallic;
-                draw.roughness = mat.roughness;
-                draw.opacity = mat.opacity;
-                draw.emissive[0] = mat.emissive[0];
-                draw.emissive[1] = mat.emissive[1];
-                draw.emissive[2] = mat.emissive[2];
-            }
-            if (needs_aabb) {
-                for (size_t v = 0; v + 2 < geo.positions.size(); v += 3) {
-                    const math::Vec3 local{geo.positions[v], geo.positions[v + 1], geo.positions[v + 2]};
-                    const math::Vec3 wp = inst.world_xform.TransformPoint(local);
-                    aabb_min.x = std::min(aabb_min.x, wp.x); aabb_min.y = std::min(aabb_min.y, wp.y);
-                    aabb_min.z = std::min(aabb_min.z, wp.z); aabb_max.x = std::max(aabb_max.x, wp.x);
-                    aabb_max.y = std::max(aabb_max.y, wp.y); aabb_max.z = std::max(aabb_max.z, wp.z);
-                    has_geometry = true;
-                }
-            }
-            draws.push_back(std::move(draw));
-        }
-
-        const ResolvedCamera cam = ResolveCamera(world, options, aabb_min, aabb_max, has_geometry);
-        const SceneViewport scene_rect = ResolveSceneViewport(options.scene_viewport, extent.width, extent.height);
-        const float aspect = scene_rect.Aspect();
-        const float fov_y = cam.fov_degrees * 3.14159265358979323846f / 180.0f;
-        const Mat4 view = LookAt(cam.eye, cam.target, cam.up);
-        const Mat4 proj = Perspective(fov_y, aspect, cam.near_clip, cam.far_clip);
-        const Mat4 view_proj = Multiply(proj, view);
-
-        // Upload this frame's SceneUbo (camera + light rig) into the frame slot.
-        const SceneUbo scene_ubo = BuildSceneUbo(world, view_proj, cam.eye);
-        {
-            void* mapped = nullptr;
-            CheckVk(vkMapMemory(device, ubo_slots[frame].memory, 0, sizeof(SceneUbo), 0, &mapped),
-                    "vkMapMemory(present-scene-ubo)");
-            std::memcpy(mapped, &scene_ubo, sizeof(SceneUbo));
-            vkUnmapMemory(device, ubo_slots[frame].memory);
-        }
+        const PreparedView view = Prepare(world, options);
+        UploadUbo(ubo_slots[frame], view.ubo);
 
         const bool do_capture =
             (capture_frame_ >= 0 && draw_counter_ == static_cast<uint64_t>(capture_frame_));
@@ -1842,12 +1993,12 @@ struct PresentRenderer::Impl {
                 static_cast<VkDeviceSize>(extent.width) * extent.height * 4u,
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         }
-        const bool do_scene_capture = scene_capture_frame_ >= 0 && !scene_rect.Empty() &&
+        const bool do_scene_capture = scene_capture_frame_ >= 0 && !view.rect.Empty() &&
                                       draw_counter_ == static_cast<uint64_t>(scene_capture_frame_);
         GpuBuffer scene_capture_buf{};
         if (do_scene_capture) {
             scene_capture_buf = CreateHostBuffer(
-                static_cast<VkDeviceSize>(scene_rect.width) * scene_rect.height * 4u,
+                static_cast<VkDeviceSize>(view.rect.width) * view.rect.height * 4u,
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         }
 
@@ -1858,6 +2009,14 @@ struct PresentRenderer::Impl {
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         CheckVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(present)");
+
+        // A frame with a pose slot draws instanced from it; otherwise the per-draw
+        // push-constant pipelines draw the host transforms.
+        const PresentInterop* pose =
+            interop != nullptr && instanced_pipeline != VK_NULL_HANDLE ? interop : nullptr;
+        // The id pass feeds the selection outline and runs only while something is marked.
+        const bool outline = !view.rect.Empty() && Marked(options.instance_flags);
+        if (outline) RecordIdPass(cmd, view, options.instance_flags, ubo_slots[frame].set, pose);
 
         std::array<VkClearValue, 2> clears{};
         clears[0].color = {{static_cast<float>(options.background.r) / 255.0f,
@@ -1874,64 +2033,26 @@ struct PresentRenderer::Impl {
         rp.pClearValues = clears.data();
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
-        // A frame with a pose slot draws instanced from it; otherwise the per-draw
-        // push-constant pipeline draws the host transforms.
-        const bool use_instanced = interop != nullptr && instanced_pipeline != VK_NULL_HANDLE;
-        const VkPipeline       active_pipeline = use_instanced ? instanced_pipeline : pipeline;
-        const VkPipelineLayout active_layout =
-            use_instanced ? instanced_pipeline_layout : pipeline_layout;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, active_pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, active_layout,
-                                0u, 1u, &ubo_slots[frame].set, 0u, nullptr);
-        if (use_instanced) {
-            const VkDescriptorSet slot_set = reinterpret_cast<VkDescriptorSet>(interop->set);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, active_layout,
-                                    1u, 1u, &slot_set, 0u, nullptr);
-        }
-        VkViewport viewport{};
-        viewport.x = static_cast<float>(scene_rect.x); viewport.y = static_cast<float>(scene_rect.y);
-        viewport.width = static_cast<float>(std::max(scene_rect.width, 1u));
-        viewport.height = static_cast<float>(std::max(scene_rect.height, 1u));
-        viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0u, 1u, &viewport);
-        VkRect2D scissor{{static_cast<int32_t>(scene_rect.x), static_cast<int32_t>(scene_rect.y)},
-                         {scene_rect.width, scene_rect.height}};
-        vkCmdSetScissor(cmd, 0u, 1u, &scissor);
-
-        if (!scene_rect.Empty()) for (const InstanceDraw& draw : draws) {
-            PushBlock push{};
-            // On the instanced path the model matrix comes from the SSBO (the shader
-            // ignores push.model); we still fill it harmlessly. Material always rides
-            // the push constant on BOTH paths (materials are not device physics state).
-            std::memcpy(push.model, draw.model.m.data(), sizeof(push.model));
-            std::memcpy(push.base_color, draw.base_color, sizeof(push.base_color));
-            push.mr[0] = draw.metallic; push.mr[1] = draw.roughness;
-            push.mr[2] = draw.opacity;  push.mr[3] = 0.0f;
-            push.emissive[0] = draw.emissive[0]; push.emissive[1] = draw.emissive[1];
-            push.emissive[2] = draw.emissive[2]; push.emissive[3] = 0.0f;
-            vkCmdPushConstants(cmd, active_layout,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0u,
-                               sizeof(PushBlock), &push);
-            std::array<VkBuffer, 3> vbuffers{draw.pos, draw.nrm, draw.col};
-            std::array<VkDeviceSize, 3> offsets{0u, 0u, 0u};
-            vkCmdBindVertexBuffers(cmd, 0u, 3u, vbuffers.data(), offsets.data());
-            vkCmdBindIndexBuffer(cmd, draw.idx, 0u, VK_INDEX_TYPE_UINT32);
-            // INT-F1: on the instanced path, firstInstance == the SSBO row so
-            // gl_InstanceIndex picks the right scattered transform (the draw loop
-            // skipped geometry-less instances, so the SSBO row != compacted index).
-            const uint32_t first_instance = use_instanced ? draw.instance_row : 0u;
-            vkCmdDrawIndexed(cmd, draw.index_count, 1u, 0u, 0, first_instance);
+        if (!view.rect.Empty()) {
+            const bool wire = options.view_mode == ViewMode::Wireframe;
+            if (pose != nullptr) {
+                RecordDraws(cmd, view, wire ? wire_instanced_pipeline : instanced_pipeline,
+                            instanced_pipeline_layout, ubo_slots[frame].set, pose, nullptr);
+            } else {
+                RecordDraws(cmd, view, wire ? wire_pipeline : pipeline, pipeline_layout,
+                            ubo_slots[frame].set, nullptr, nullptr);
+            }
         }
 
         // The overlays draw AFTER the opaque scene: the ghost behind it, then the debug
         // overlay (collider wireframes + contact markers) THROUGH it. Model rides the push
         // constant (no interop SSBO); an empty list is skipped.
-        const auto draw_overlay = [&](const std::vector<RenderInstance>& overlay, VkPipeline overlay_pipeline) {
-            if (scene_rect.Empty() || overlay.empty() || overlay_pipeline == VK_NULL_HANDLE) return;
+        const auto draw_overlay = [&](const std::vector<RenderInstance>& overlay_list, VkPipeline overlay_pipeline) {
+            if (view.rect.Empty() || overlay_list.empty() || overlay_pipeline == VK_NULL_HANDLE) return;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
                                     0u, 1u, &ubo_slots[frame].set, 0u, nullptr);
-            for (const RenderInstance& inst : overlay) {
+            for (const RenderInstance& inst : overlay_list) {
                 if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
                 if (inst.mesh_id >= mesh_cache.size()) continue;
                 const MeshCacheEntry& cached = mesh_cache[inst.mesh_id];
@@ -1966,11 +2087,14 @@ struct PresentRenderer::Impl {
         // The scene alone is read between two passes; the second loads it back for the overlay.
         if (do_scene_capture) {
             vkCmdEndRenderPass(cmd);
-            RecordReadback(cmd, images[image_index], scissor, scene_capture_buf.buffer,
+            RecordReadback(cmd, images[image_index], ScissorOf(view.rect), scene_capture_buf.buffer,
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             rp.renderPass = overlay_pass;
             vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
         }
+
+        // The outline goes after the scene capture, so recorded frames stay clean.
+        if (outline) RecordOutline(cmd, view.rect, options);
 
         // Overlay (ImGui) records INSIDE the pass, after the scene.
         if (overlay) {
@@ -1992,18 +2116,18 @@ struct PresentRenderer::Impl {
         // timeline value that completed its pose slot.
         const std::array<VkSemaphore, 2> wait_semaphores{
             image_available[frame],
-            use_instanced ? reinterpret_cast<VkSemaphore>(interop->timeline) : VK_NULL_HANDLE};
+            pose != nullptr ? reinterpret_cast<VkSemaphore>(pose->timeline) : VK_NULL_HANDLE};
         const std::array<VkPipelineStageFlags, 2> wait_stages{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT};
-        const std::array<uint64_t, 2> wait_values{0u, use_instanced ? interop->ready_value : 0u};
+        const std::array<uint64_t, 2> wait_values{0u, pose != nullptr ? pose->ready_value : 0u};
         VkTimelineSemaphoreSubmitInfo timeline_info{};
         timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
         timeline_info.waitSemaphoreValueCount = 2u;
         timeline_info.pWaitSemaphoreValues = wait_values.data();
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.pNext = use_instanced ? &timeline_info : nullptr;
-        submit.waitSemaphoreCount = use_instanced ? 2u : 1u;
+        submit.pNext = pose != nullptr ? &timeline_info : nullptr;
+        submit.waitSemaphoreCount = pose != nullptr ? 2u : 1u;
         submit.pWaitSemaphores = wait_semaphores.data();
         submit.pWaitDstStageMask = wait_stages.data();
         submit.commandBufferCount = 1u;
@@ -2037,7 +2161,7 @@ struct PresentRenderer::Impl {
         }
         if (do_capture) FinishReadback(capture_buf, extent.width, extent.height, capture_path_);
         if (do_scene_capture)
-            FinishReadback(scene_capture_buf, scene_rect.width, scene_rect.height, scene_capture_path_);
+            FinishReadback(scene_capture_buf, view.rect.width, view.rect.height, scene_capture_path_);
 
         current_frame = (current_frame + 1u) % kFramesInFlight;
         ++draw_counter_;
@@ -2050,6 +2174,61 @@ struct PresentRenderer::Impl {
         }
         if (present_result != VK_SUCCESS) return PresentFrameResult::Error;
         return PresentFrameResult::Presented;
+    }
+
+    PickResult Pick(const RenderWorld& world, const RasterOptions& options, const SceneViewport& region,
+                    const PresentInterop* interop) {
+        PickResult result;
+        const PreparedView view = Prepare(world, options);
+        const uint32_t x0 = std::max(region.x, view.rect.x), y0 = std::max(region.y, view.rect.y);
+        const uint32_t x1 = std::min(region.x + region.width, view.rect.x + view.rect.width);
+        const uint32_t y1 = std::min(region.y + region.height, view.rect.y + view.rect.height);
+        if (x1 <= x0 || y1 <= y0) return result;
+        const uint32_t w = x1 - x0, h = y1 - y0;
+        const UboSlot& slot = ubo_slots[kFramesInFlight];
+        UploadUbo(slot, view.ubo);
+        GpuBuffer out = CreateHostBuffer(static_cast<VkDeviceSize>(w) * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const PresentInterop* pose =
+            interop != nullptr && id_instanced_pipeline != VK_NULL_HANDLE ? interop : nullptr;
+
+        VkCommandBuffer cmd = BeginOneShot();
+        RecordIdPass(cmd, view, options.instance_flags, slot.set, pose);
+        VkImageMemoryBarrier to_src{};
+        to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_src.image = id_image.image;
+        to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+        to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &to_src);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1u;
+        copy.imageOffset = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), 0};
+        copy.imageExtent = {w, h, 1u};
+        vkCmdCopyImageToBuffer(cmd, id_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1u, &copy);
+        EndOneShotAndWait(cmd, pose);
+
+        void* mapped = nullptr;
+        CheckVk(vkMapMemory(device, out.memory, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(pick)");
+        const uint32_t* ids = static_cast<const uint32_t*>(mapped);
+        const uint32_t center = ids[(h / 2u) * w + w / 2u] & kIdMask;
+        if (center != 0u) result.center = center - 1u;
+        std::vector<char> seen(world.instances.size(), 0);
+        for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+            const uint32_t id = ids[i] & kIdMask;
+            if (id == 0u || seen[id - 1u] != 0) continue;
+            seen[id - 1u] = 1;
+            result.instances.push_back(id - 1u);
+        }
+        vkUnmapMemory(device, out.memory);
+        Destroy(out);
+        std::sort(result.instances.begin(), result.instances.end());
+        return result;
     }
 };
 
@@ -2065,6 +2244,11 @@ PresentFrameResult PresentRenderer::DrawFrame(const RenderWorld& world,
                                               const OverlayRecordFn& overlay,
                                               const PresentInterop* interop) {
     return impl_->DrawFrame(world, options, overlay, interop);
+}
+
+PickResult PresentRenderer::Pick(const RenderWorld& world, const RasterOptions& options,
+                                 const SceneViewport& region, const PresentInterop* interop) {
+    return impl_->Pick(world, options, region, interop);
 }
 
 RendererVulkanHandles PresentRenderer::VulkanHandles() {
@@ -2117,14 +2301,7 @@ void PresentRenderer::SetSceneCaptureFrame(int frame_index, std::string ppm_path
 
 void PresentRenderer::SetInteropTransforms(NkVkDescriptorSetLayout ssbo_set_layout) {
     Impl& d = *impl_;
-    if (d.instanced_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(d.device, d.instanced_pipeline, nullptr);
-        d.instanced_pipeline = VK_NULL_HANDLE;
-    }
-    if (d.instanced_pipeline_layout != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(d.device, d.instanced_pipeline_layout, nullptr);
-        d.instanced_pipeline_layout = VK_NULL_HANDLE;
-    }
+    d.DestroyInstancedPipelines();
     d.ssbo_set_layout = reinterpret_cast<VkDescriptorSetLayout>(ssbo_set_layout);
     if (d.ssbo_set_layout != VK_NULL_HANDLE) d.CreateInstancedPipeline();
 }

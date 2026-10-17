@@ -328,9 +328,9 @@ void ImGuiLayer::DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax) {
         return ImGui::GetColorU32(ImVec4(rgb[0], rgb[1], rgb[2], alpha));
     };
     if (v.heatmap) {
-        // Four decades of log scale up the right edge, the alert marked at three quarters.
+        // Four decades of log scale up the right edge under the mode menu, the alert at three quarters.
         const float h = std::min(200.0f * s, (vmax.y - vmin.y) * 0.45f), w = 9.0f * s;
-        const ImVec2 bar1(vmax.x - 70.0f * s, vmin.y + 64.0f * s + h), bar0(bar1.x - w, bar1.y - h);
+        const ImVec2 bar1(vmax.x - 70.0f * s, vmin.y + 74.0f * s + h), bar0(bar1.x - w, bar1.y - h);
         draw::Chamfer(list, ImVec2(bar0.x - 12.0f * s, bar0.y - 30.0f * s), ImVec2(vmax.x - 14.0f * s, bar1.y + 14.0f * s),
                       6.0f * s, U32(theme::Alpha(theme::kBg0, 0.78f)), U32(theme::kLineHi));
         list->AddText(font, px, ImVec2(bar0.x - 4.0f * s, bar0.y - 22.0f * s), U32(theme::kFgMuted), Tr("NEWTON  M/S"));

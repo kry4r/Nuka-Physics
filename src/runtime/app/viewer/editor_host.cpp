@@ -780,6 +780,19 @@ struct EditorHost::State : DocumentHost {
     void RefreshAssets();
     void RefreshProperties();
     void PickSelect(const CameraController& camera, float x, float y);
+    // The present options for the scene viewport through `camera`: view mode and instance flags.
+    render::RasterOptions ViewOptions(const CameraController& camera);
+    // Each shown instance's node path, and its selected, hovered and locked flags.
+    const std::vector<std::string>& InstancePaths();
+    std::vector<uint8_t> InstanceFlags();
+    // Pins the latest zero-copy pose slot into `interop`; false without one.
+    bool PinPose(uint32_t* slot, render::PresentInterop* interop);
+    // What the id pass shows between two window points of the viewport, through `camera`.
+    render::PickResult PickBox(const CameraController& camera, float x0, float y0, float x1, float y1);
+    std::string CarrierPath(uint32_t instance) const;
+    // scene.select's arguments for the bodies a box pick saw, after the selection when `add`.
+    json::Value BoxSelectArgs(const render::PickResult& pick, bool add);
+    void SetViewMode(render::ViewMode mode);
     // A load on the link or free body `inst` draws, acting at the world point `at` with a spring of
     // `gain` times the default toward it; false for an instance no dynamics move.
     bool BodyLoad(const render::RenderInstance& inst, const math::Vec3& at, float gain, Perturbation* out) const;
@@ -913,6 +926,13 @@ struct EditorHost::State : DocumentHost {
     uint64_t props_revision_ = ~0ull;
     bool click_armed_ = false;
     float click_x_ = 0.0f, click_y_ = 0.0f;
+    std::vector<std::string> instance_paths_;  // by shown instance; cleared when instances change
+    uint64_t instance_paths_version_ = ~0ull;
+    std::string hovered_path_;  // the body under the pointer, outlined as hovered
+    bool hover_due_ = false;    // the pointer moved over the viewport since the last hover pick
+    float hover_x_ = 0.0f, hover_y_ = 0.0f;
+    bool mode_heatmap_ = false;   // the Residual view turned the heatmap on
+    bool mode_contacts_ = false;  // the Contact view turned the contact markers on
     ActionRegistry actions_;
     uint64_t param_seq_ = 0u;  // the last registry write and the ticks it was queued and applied at
     uint64_t param_pushed_tick_ = 0u;
@@ -1662,11 +1682,7 @@ void EditorHost::State::PushEdits() {
 void EditorHost::State::DrawWorld(const render::RenderWorld& rw, const render::RasterOptions& opts) {
     render::PresentInterop interop;
     uint32_t slot = 0u;
-    const bool pinned = scatter_ != nullptr && worker_.Slots().AcquireRead(&slot, &interop.ready_value);
-    if (pinned) {
-        interop.set = reinterpret_cast<render::NkVkDescriptorSet>(interop_->Slot(slot));
-        interop.timeline = reinterpret_cast<render::NkVkSemaphore>(interop_->Timeline());
-    }
+    const bool pinned = PinPose(&slot, &interop);
     const uint64_t submitted = present_->SubmittedFrames();
     const render::PresentFrameResult r = present_->DrawFrame(rw, opts, [this](void* cmd) {
         imgui_.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
@@ -1688,6 +1704,106 @@ void EditorHost::State::DrawWorld(const render::RenderWorld& rw, const render::R
     // A recreated swapchain keeps a compatible pass; ImGui only needs the image count.
     if (r == render::PresentFrameResult::Recreated) imgui_.NotifySwapchainRecreated(present_->MinImageCount());
     if (r == render::PresentFrameResult::Presented) ++presented_;
+}
+
+bool EditorHost::State::PinPose(uint32_t* slot, render::PresentInterop* interop) {
+    if (scatter_ == nullptr || !worker_.Slots().AcquireRead(slot, &interop->ready_value)) return false;
+    interop->set = reinterpret_cast<render::NkVkDescriptorSet>(interop_->Slot(*slot));
+    interop->timeline = reinterpret_cast<render::NkVkSemaphore>(interop_->Timeline());
+    return true;
+}
+
+render::RasterOptions EditorHost::State::ViewOptions(const CameraController& camera) {
+    render::RasterOptions opts;
+    opts.width = present_->Report().width;
+    opts.height = present_->Report().height;
+    camera.WriteOptions(opts);
+    opts.scene_viewport = ui_.Viewport().pixels;
+    if (loaded_ && loaded_->scene.Environment().sky.enabled) {
+        const auto background = loaded_->scene.Environment().sky.background;
+        const auto byte = [](float value) {
+            return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+        };
+        if (std::isfinite(background.x) && std::isfinite(background.y) && std::isfinite(background.z))
+            opts.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
+    }
+    opts.view_mode = ui_state_.view_mode;
+    opts.instance_flags = InstanceFlags();
+    return opts;
+}
+
+const std::vector<std::string>& EditorHost::State::InstancePaths() {
+    const render::RenderWorld& w = ShownWorld();
+    if (instance_paths_.size() != w.InstanceCount() || instance_paths_version_ != ui_state_.scene_version) {
+        instance_paths_.clear();
+        for (const render::RenderInstance& inst : w.instances) instance_paths_.push_back(PathOfEntity(inst.entity));
+        instance_paths_version_ = ui_state_.scene_version;
+    }
+    return instance_paths_;
+}
+
+std::vector<uint8_t> EditorHost::State::InstanceFlags() {
+    const std::vector<std::string>& paths = InstancePaths();
+    const std::vector<std::string> selected = SelectionPaths();
+    const std::vector<std::string> hovered =
+        hovered_path_.empty() ? std::vector<std::string>{} : std::vector<std::string>{hovered_path_};
+    std::vector<uint8_t> flags(paths.size(), 0u);
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (UnderAny(paths[i], selected)) flags[i] |= render::kInstanceSelected;
+        if (UnderAny(paths[i], hovered)) flags[i] |= render::kInstanceHovered;
+        if (UnderAny(paths[i], ui_state_.locked)) flags[i] |= render::kInstanceUnpickable;
+    }
+    return flags;
+}
+
+render::PickResult EditorHost::State::PickBox(const CameraController& camera, float x0, float y0, float x1, float y1) {
+    const SceneViewportRect& rect = ui_.Viewport();
+    const auto edge = [](float local, uint32_t size) {
+        return static_cast<uint32_t>(std::clamp(local, 0.0f, static_cast<float>(size - 1u)));
+    };
+    const uint32_t l = edge(rect.LocalX(std::min(x0, x1)), rect.pixels.width);
+    const uint32_t r = edge(rect.LocalX(std::max(x0, x1)), rect.pixels.width);
+    const uint32_t t = edge(rect.LocalY(std::min(y0, y1)), rect.pixels.height);
+    const uint32_t b = edge(rect.LocalY(std::max(y0, y1)), rect.pixels.height);
+    const render::SceneViewport region{true, rect.pixels.x + l, rect.pixels.y + t, r - l + 1u, b - t + 1u};
+    render::PresentInterop interop;
+    uint32_t slot = 0u;
+    const bool pinned = PinPose(&slot, &interop);
+    render::PickResult pick = present_->Pick(ShownWorld(), ViewOptions(camera), region, pinned ? &interop : nullptr);
+    if (pinned) worker_.Slots().Release(slot);
+    return pick;
+}
+
+std::string EditorHost::State::CarrierPath(uint32_t instance) const {
+    return PathOfEntity(CarrierOf(loaded_->scene, ShownWorld().instances[instance].entity));
+}
+
+json::Value EditorHost::State::BoxSelectArgs(const render::PickResult& pick, bool add) {
+    std::vector<std::string> paths = add ? SelectionPaths() : std::vector<std::string>{};
+    for (const uint32_t instance : pick.instances) {
+        const std::string path = CarrierPath(instance);
+        if (std::find(paths.begin(), paths.end(), path) == paths.end()) paths.push_back(path);
+    }
+    // The primary stays when adding; otherwise the body at the box's centre leads.
+    const std::string lead = add && !SelectedPath().empty() ? SelectedPath()
+                             : pick.center != ~0u           ? CarrierPath(pick.center)
+                             : paths.empty()                ? std::string()
+                                                            : paths.front();
+    return Object({{"path", json::Value::Str(lead)}, {"paths", StrList(paths)}, {"mode", json::Value::Str("range")}});
+}
+
+// Residual and Contact turn on what they show and turn it off again on leaving.
+void EditorHost::State::SetViewMode(render::ViewMode mode) {
+    const render::ViewMode was = ui_state_.view_mode;
+    ui_state_.view_mode = mode;
+    if (was == mode) return;
+    if (was == render::ViewMode::Residual && mode_heatmap_ && loaded_)
+        RunAction("solver.heatmap", Object({{"on", json::Value::Bool(false)}}), "view");
+    if (was == render::ViewMode::Contact && mode_contacts_) ui_state_.show_contacts = false;
+    mode_heatmap_ = mode == render::ViewMode::Residual && loaded_ && !ui_state_.solver.heatmap;
+    mode_contacts_ = mode == render::ViewMode::Contact && !ui_state_.show_contacts;
+    if (mode_heatmap_) RunAction("solver.heatmap", Object({{"on", json::Value::Bool(true)}}), "view");
+    if (mode_contacts_) ui_state_.show_contacts = true;
 }
 
 void EditorHost::State::SetLoadError(const std::string& path) {
@@ -2747,6 +2863,8 @@ ActionResult EditorHost::State::ShowImport(const ImportAnalysis& a, const json::
 // Hidden nodes' instances lose their mesh until shown again or the world rebinds.
 void EditorHost::State::ApplyHidden() {
     render::RenderWorld& rw = loaded_->sim->GetRenderWorld();
+    instance_paths_.clear();
+    hovered_path_.clear();
     for (const auto& [index, mesh] : hidden_meshes_) rw.instances[index].mesh_id = mesh;
     hidden_meshes_.clear();
     if (!ui_state_.hidden.empty()) {
@@ -2807,21 +2925,17 @@ void EditorHost::State::RefreshProperties() {
     props_revision_ = doc_.Revision();
 }
 
-// A click picks the body under the pointer, skipping locked nodes; Shift adds or drops it.
+// A click picks the body the id pass shows under the pointer, seeing through locked nodes;
+// Shift adds or drops it.
 void EditorHost::State::PickSelect(const CameraController& camera, float x, float y) {
-    const SceneViewportRect& rect = ui_.Viewport();
-    const Ray ray = camera.ScreenRay(rect.LocalX(x), rect.LocalY(y), rect.pixels.width, rect.pixels.height);
-    const render::RenderWorld& w = loaded_->sim->GetRenderWorld();
-    const uint32_t hit = PickInstance(ray, w, [&](const render::RenderInstance& inst) {
-        return ui_state_.locked.empty() || !UnderAny(PathOfEntity(inst.entity), ui_state_.locked);
-    });
+    const render::PickResult pick = PickBox(camera, x, y, x, y);
     const bool shift = ImGui::GetIO().KeyShift;
-    if (hit == ~0u) {
+    if (pick.center == ~0u) {
         if (!shift) Queue("scene.select", json::Value::Object(), "viewport");
         return;
     }
-    const std::string path = PathOfEntity(CarrierOf(loaded_->scene, w.instances[hit].entity));
-    Queue("scene.select", Object({{"path", json::Value::Str(path)}, {"mode", json::Value::Str(shift ? "toggle" : "replace")}}),
+    Queue("scene.select",
+          Object({{"path", json::Value::Str(CarrierPath(pick.center))}, {"mode", json::Value::Str(shift ? "toggle" : "replace")}}),
           "viewport");
 }
 
@@ -3084,6 +3198,7 @@ void EditorHost::State::RegisterSimActions() {
 }
 
 void EditorHost::State::RegisterViewActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
     actions_.Add({"view.frame_all", "Frame All", "view", "Home", ShortcutScope::Viewport, {}, {},
                   [this](const json::Value&) {
                       return camera_.FrameAll(ShownWorld(), ui_.Viewport().Aspect()) ? Ok()
@@ -3143,7 +3258,54 @@ void EditorHost::State::RegisterViewActions() {
                                         {"tick", json::Value::Int(static_cast<int64_t>(worker_.Tick()))},
                                         {"snapshot_drops", json::Value::Int(static_cast<int64_t>(snapshot_drops_))},
                                         {"publish", json::Value::Str(scatter_ ? "zero-copy" : "host")},
-                                        {"playing", json::Value::Bool(ui_state_.playing)}}));
+                                        {"playing", json::Value::Bool(ui_state_.playing)},
+                                        {"view_mode", json::Value::Str(kViewModes[static_cast<size_t>(ui_state_.view_mode)].name)},
+                                        {"viewport", Object({{"x", json::Value::Int(ui_.Viewport().pixels.x)},
+                                                             {"y", json::Value::Int(ui_.Viewport().pixels.y)},
+                                                             {"width", json::Value::Int(ui_.Viewport().pixels.width)},
+                                                             {"height", json::Value::Int(ui_.Viewport().pixels.height)}})}}));
+                  }});
+    // The shading the viewport draws with; without a mode it reports the current one.
+    actions_.Add({"view.mode", "View Mode", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string name =
+                          StrArg(args, "mode", kViewModes[static_cast<size_t>(ui_state_.view_mode)].name);
+                      const auto it = std::find_if(std::begin(kViewModes), std::end(kViewModes),
+                                                   [&](const ViewModeInfo& m) { return name == m.name; });
+                      if (it == std::end(kViewModes))
+                          return ActionResult::Fail("the mode is lit, unlit, normals, material, residual, contact or wireframe");
+                      SetViewMode(it->mode);
+                      return Ok(Object({{"mode", json::Value::Str(it->name)}}));
+                  }});
+    // What the viewport shows at x, y: fractions of its width and height from the top left.
+    actions_.Add({"view.pick", "Pick", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const SceneViewportRect& rect = ui_.Viewport();
+                      if (!rect.Valid()) return ActionResult::Fail("the viewport is hidden");
+                      const float x = rect.x + static_cast<float>(NumArg(args, "x", 0.5)) * rect.width;
+                      const float y = rect.y + static_cast<float>(NumArg(args, "y", 0.5)) * rect.height;
+                      const uint32_t hit = PickBox(camera_, x, y, x, y).center;
+                      if (hit == ~0u)
+                          return Ok(Object({{"path", json::Value::Null()}, {"node", json::Value::Null()},
+                                            {"instance", json::Value::Int(-1)}}));
+                      return Ok(Object({{"path", json::Value::Str(CarrierPath(hit))},
+                                        {"node", json::Value::Str(PathOfEntity(ShownWorld().instances[hit].entity))},
+                                        {"instance", json::Value::Int(hit)}}));
+                  }});
+    // Selects what the viewport shows inside x0, y0 to x1, y1 in the same fractions; add keeps the selection.
+    actions_.Add({"view.select_rect", "Box Select", "view", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value& args) {
+                      const SceneViewportRect& rect = ui_.Viewport();
+                      if (!rect.Valid()) return ActionResult::Fail("the viewport is hidden");
+                      const std::string mode = StrArg(args, "mode", "replace");
+                      if (mode != "replace" && mode != "add") return ActionResult::Fail("the mode is replace or add");
+                      const auto at = [&](const char* key, float origin, float size, double fallback) {
+                          return origin + static_cast<float>(NumArg(args, key, fallback)) * size;
+                      };
+                      const render::PickResult pick =
+                          PickBox(camera_, at("x0", rect.x, rect.width, 0.0), at("y0", rect.y, rect.height, 0.0),
+                                  at("x1", rect.x, rect.width, 1.0), at("y1", rect.y, rect.height, 1.0));
+                      return RunAction("scene.select", BoxSelectArgs(pick, mode == "add"), "view");
                   }});
 }
 
@@ -4036,7 +4198,7 @@ void EditorHost::State::Frame(bool step_physics) {
     for (const window::WindowEvent& ev : events_) {
         entity_drag_.Observe(ev);
         if (ev.type == window::WindowEvent::Type::Key) scene_ctrl = ev.Held(window::modifier::kCtrl);
-        if (ev.type == window::WindowEvent::Type::FocusLost) scene_ctrl = false;
+        if (ev.type == window::WindowEvent::Type::FocusLost) scene_ctrl = ui_state_.select_box = false;
         const bool scroll = ev.type == window::WindowEvent::Type::Scroll;
         const float mouse_x = scroll ? last_mouse_x_ : static_cast<float>(ev.mouse_x);
         const float mouse_y = scroll ? last_mouse_y_ : static_cast<float>(ev.mouse_y);
@@ -4085,12 +4247,38 @@ void EditorHost::State::Frame(bool step_physics) {
         } else if (grab_ && ev.type == window::WindowEvent::Type::MouseMove) {
             DragGrab(render_camera, mouse_x, mouse_y);
         }
-        // The camera never takes input ImGui, a Ctrl-drag, the gizmo or a grab owns.
-        const bool cam_allow = !over_ui && !scene_ctrl && !ui_state_.gizmo.active && !grab_;
+        // An Alt-drag with the Select tool boxes; its release selects what the box shows, Shift adding.
+        if (loaded_ && ui_state_.tool == ViewportTool::Select && ev.type == window::WindowEvent::Type::MouseButton &&
+            ev.button == 0u) {
+            if (ev.pressed && ev.Held(window::modifier::kAlt) && !over_ui && !scene_ctrl && !ui_state_.gizmo.active) {
+                ui_state_.select_box = true;
+                ui_state_.select_box_from[0] = ui_state_.select_box_to[0] = mouse_x;
+                ui_state_.select_box_from[1] = ui_state_.select_box_to[1] = mouse_y;
+            } else if (!ev.pressed && ui_state_.select_box) {
+                ui_state_.select_box = false;
+                const render::PickResult pick = PickBox(render_camera, ui_state_.select_box_from[0],
+                                                        ui_state_.select_box_from[1], mouse_x, mouse_y);
+                Queue("scene.select", BoxSelectArgs(pick, ev.Held(window::modifier::kShift)), "viewport");
+            }
+        } else if (ui_state_.select_box && ev.type == window::WindowEvent::Type::MouseMove) {
+            ui_state_.select_box_to[0] = mouse_x;
+            ui_state_.select_box_to[1] = mouse_y;
+        }
+        // A free pointer over the viewport hovers the body under it with the Select tool.
+        if (ev.type == window::WindowEvent::Type::MouseMove) {
+            hover_due_ = loaded_ && ui_state_.tool == ViewportTool::Select && !over_ui && !scene_ctrl &&
+                         !ui_state_.select_box && !ImGui::IsAnyMouseDown();
+            hover_x_ = mouse_x;
+            hover_y_ = mouse_y;
+            if (!hover_due_) hovered_path_.clear();
+        }
+        // The camera never takes input ImGui, a Ctrl-drag, the gizmo, a grab or a box owns.
+        const bool cam_allow = !over_ui && !scene_ctrl && !ui_state_.gizmo.active && !grab_ && !ui_state_.select_box;
         // A left press and release without a drag in between picks, or pins with the Pin tool.
         if (loaded_ && ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
             if (ev.pressed) {
-                click_armed_ = !over_ui && !scene_ctrl && !ui_state_.gizmo.active && ui_state_.tool != ViewportTool::Perturb;
+                click_armed_ = !over_ui && !scene_ctrl && !ui_state_.gizmo.active && !ui_state_.select_box &&
+                               ui_state_.tool != ViewportTool::Perturb;
                 click_x_ = mouse_x;
                 click_y_ = mouse_y;
             } else if (click_armed_) {
@@ -4103,6 +4291,11 @@ void EditorHost::State::Frame(bool step_physics) {
             click_armed_ = false;
         }
         camera_.HandleEvent(ev, /*allow_drag=*/cam_allow, /*allow_scroll=*/!over_ui && !ui_state_.gizmo.active);
+    }
+    if (hover_due_) {
+        hover_due_ = false;
+        const uint32_t hit = PickBox(render_camera, hover_x_, hover_y_, hover_x_, hover_y_).center;
+        hovered_path_ = hit == ~0u ? std::string() : CarrierPath(hit);
     }
 
     ApplyInspectorEdits();
@@ -4172,19 +4365,7 @@ void EditorHost::State::Frame(bool step_physics) {
     PushTransport();
     PushEdits();
 
-    render::RasterOptions opts;
-    opts.width = present_->Report().width;
-    opts.height = present_->Report().height;
-    render_camera.WriteOptions(opts);
-    opts.scene_viewport = ui_.Viewport().pixels;
-    if (loaded_ && loaded_->scene.Environment().sky.enabled) {
-        const auto background = loaded_->scene.Environment().sky.background;
-        const auto byte = [](float value) {
-            return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
-        };
-        if (std::isfinite(background.x) && std::isfinite(background.y) && std::isfinite(background.z))
-            opts.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
-    }
+    const render::RasterOptions opts = ViewOptions(render_camera);
 
     // Debug overlays rebuild from the shown snapshot; off leaves the real instance set untouched.
     const auto overlay_t0 = Clock::now();

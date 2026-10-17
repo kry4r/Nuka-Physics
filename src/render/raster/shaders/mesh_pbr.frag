@@ -136,6 +136,20 @@ float SunShadow(float n_dot_l) {
 }
 
 void main() {
+#ifdef NUKA_VIEW_MODES
+    // The realtime viewport's shading mode rides emissive.a: 1 unlit, 2 world normals, 3 the
+    // draw's flat colour under a view-facing ramp.
+    const int view_mode = int(vEmissive.a + 0.5);
+    if (view_mode != 0) {
+        vec3 vn = normalize(vWorldNormal);
+        const vec3 vv = normalize(scene.camera_pos.xyz - vWorldPos);
+        if (dot(vn, vv) < 0.0) vn = -vn;
+        if (view_mode == 1) oColor = vec4(LinearToSrgb(clamp(vBaseColor.rgb + vEmissive.rgb, 0.0, 1.0)), 1.0);
+        else if (view_mode == 2) oColor = vec4(vn * 0.5 + 0.5, 1.0);
+        else oColor = vec4(pc.base_color.rgb * (0.35 + 0.65 * max(dot(vn, vv), 0.0)), 1.0);
+        return;
+    }
+#endif
     vec3  albedo    = vBaseColor.rgb;
     float metallic  = clamp(vMr.x, 0.0, 1.0);
     float roughness = clamp(vMr.y, 0.04, 1.0);  // floor to avoid a singular highlight
