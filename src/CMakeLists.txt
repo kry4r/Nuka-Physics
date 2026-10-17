@@ -392,6 +392,7 @@ if(NK_BUILD_EDITOR OR NK_BUILD_VULKAN_VALIDATION)
         runtime/app/viewer/editor_actions.cpp
         runtime/app/viewer/file_dialog.cpp
         runtime/app/viewer/imgui_layer.cpp
+        runtime/app/viewer/scene_panels.cpp
         runtime/app/viewer/nui/nui_capi.cpp
         runtime/app/viewer/nui/nui_core.cpp
         runtime/app/viewer/nui/nui_data.cpp
@@ -1208,6 +1209,10 @@ if(CMAKE_CUDA_COMPILER)
             runtime/app/viewer/editor_scene.cpp
             runtime/app/viewer/editor_edits.cpp
             runtime/app/viewer/editor_document.cpp
+            runtime/app/viewer/editor_import.cpp
+            runtime/app/viewer/editor_collision.cpp
+            runtime/app/viewer/editor_assets.cpp
+            runtime/app/viewer/property_schema.cpp
             runtime/app/viewer/debug_overlay.cpp
             runtime/app/viewer/physics_worker.cpp
         )

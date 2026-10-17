@@ -14,10 +14,12 @@
 #include "VHACD.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -355,6 +357,42 @@ ConvexDecompositionResult DecomposeMeshCached(const float* vertices, uint32_t ve
 void ClearDecompositionMemo() {
     std::lock_guard<std::mutex> lock(MemoMutex());
     Memo().clear();
+}
+
+ConvexPiece ComputeConvexHull(const float* vertices, uint32_t vertex_count, uint32_t max_vertices) {
+    std::vector<VHACD::Vertex> points;
+    points.reserve(vertex_count);
+    for (uint32_t i = 0; i < vertex_count; ++i)
+        points.emplace_back(vertices[i * 3 + 0], vertices[i * 3 + 1], vertices[i * 3 + 2]);
+    VHACD::QuickHull quick_hull;
+    quick_hull.ComputeConvexHull(points, max_vertices);
+    ConvexPiece piece;
+    for (int k = 0; k < 3; ++k) {
+        piece.aabb_min[k] = std::numeric_limits<float>::max();
+        piece.aabb_max[k] = std::numeric_limits<float>::lowest();
+    }
+    for (const VHACD::Vertex& v : quick_hull.GetVertices()) {
+        const float p[3] = {static_cast<float>(v.mX), static_cast<float>(v.mY), static_cast<float>(v.mZ)};
+        for (int k = 0; k < 3; ++k) {
+            piece.vertices.push_back(p[k]);
+            piece.aabb_min[k] = std::min(piece.aabb_min[k], p[k]);
+            piece.aabb_max[k] = std::max(piece.aabb_max[k], p[k]);
+        }
+    }
+    double volume = 0.0;
+    const std::vector<float>& h = piece.vertices;
+    for (const VHACD::Triangle& t : quick_hull.GetIndices()) {
+        piece.indices.insert(piece.indices.end(), {t.mI0, t.mI1, t.mI2});
+        const float* a = &h[t.mI0 * 3u];
+        const float* b = &h[t.mI1 * 3u];
+        const float* c = &h[t.mI2 * 3u];
+        volume += (double(a[0]) * (double(b[1]) * c[2] - double(b[2]) * c[1]) -
+                   double(a[1]) * (double(b[0]) * c[2] - double(b[2]) * c[0]) +
+                   double(a[2]) * (double(b[0]) * c[1] - double(b[1]) * c[0])) / 6.0;
+    }
+    piece.volume = static_cast<float>(std::abs(volume));
+    CanonicalizePiece(piece);
+    return piece;
 }
 
 } // namespace nuka::import::cooker

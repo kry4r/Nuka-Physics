@@ -50,6 +50,14 @@ struct MaterialBinding {
 const render::RenderInstance* InstanceOfEntity(const render::RenderWorld& world,
                                                scene::EntityId entity);
 
+// The instance whose pose stands for `entity`: its own, else one its body node carries.
+const render::RenderInstance* PoseInstance(const EditorScene& es, const EntityRecordIndex& idx,
+                                           scene::EntityId entity);
+
+// The live WORLD pose of `entity`, read through its PoseInstance `inst`.
+math::Transform LiveWorldTransform(const scene::SceneIR& scene, scene::EntityId entity,
+                                   const render::RenderInstance& inst);
+
 // Resolve which render-material slot + authoring MaterialRecord a selected entity
 // edits (via its shape's material). Falls back to the shared default render slot
 // when the shape carries no material id.

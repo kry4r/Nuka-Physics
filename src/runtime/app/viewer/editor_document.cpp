@@ -1,6 +1,8 @@
 #include "runtime/app/viewer/editor_document.hpp"
 
 #include "render/render_world.hpp"
+#include "runtime/app/viewer/editor_collision.hpp"
+#include "runtime/app/viewer/editor_import.hpp"
 #include "scene/scene_fields.hpp"
 
 #include <cmath>
@@ -15,7 +17,8 @@ namespace json = scene::json;
 constexpr uint32_t kNoParam = ~0u;
 
 bool IsStructural(const std::string& field) {
-    return field == "spawn" || field == "delete" || field == "reparent" || field == "script";
+    return field == "spawn" || field == "delete" || field == "reparent" || field == "script" || field == "import" ||
+           field == "collision";
 }
 
 json::Value Floats(const float* v, size_t n) {
@@ -142,6 +145,7 @@ void EditorDocument::Attach(EditorScene* es, DocumentHost* host) {
     redo_.clear();
     branches_.clear();
     saved_ = 0u;
+    saved_scene_ = es_->scene;
     ++revision_;
 }
 
@@ -152,7 +156,13 @@ void EditorDocument::Detach() {
     redo_.clear();
     branches_.clear();
     saved_ = 0u;
+    saved_scene_ = scene::SceneIR{};
     ++revision_;
+}
+
+void EditorDocument::MarkSaved() {
+    saved_ = StateId();
+    saved_scene_ = es_->scene;
 }
 
 void EditorDocument::SetParams(std::vector<nuka_param_info_t> infos, std::vector<double> world_values) {
@@ -195,6 +205,13 @@ bool EditorDocument::NeedsSnapshot(const EditOp& op) const {
     if (p != kNoParam && infos_[p].scene_field[0] == '\0') return false;
     uint32_t element = 0u;
     return !LiveElement(op.target, p, &element);
+}
+
+bool EditorDocument::LiveField(const std::string& target, const std::string& field) const {
+    const uint32_t p = ParamOf(field);
+    if (p != kNoParam && infos_[p].scene_field[0] == '\0') return infos_[p].tier == NUKA_PARAM_LIVE;
+    uint32_t element = 0u;
+    return LiveElement(target, p, &element);
 }
 
 bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, OpOutcome* out, std::string* error) {
@@ -244,6 +261,28 @@ bool EditorDocument::ApplyOp(const EditOp& op, EditOp* done, EditOp* inverse, Op
         out->focus = SpawnPrimitive(*es_, kind, placement, op.target);
         if (out->focus.empty()) {
             *error = "cannot spawn under '" + op.target + "'";
+            return false;
+        }
+        out->rebuild = true;
+    } else if (op.field == "import") {
+        const json::Value* profile = op.after.Find("profile");
+        const ImportAnalysis a =
+            AnalyzeImport(op.after.At("path").AsString(), profile != nullptr ? profile->AsString() : std::string());
+        if (!Importable(a)) {
+            *error = ImportError(a);
+            return false;
+        }
+        math::Transform placement;
+        if (const json::Value* pose = op.after.Find("pose")) placement = TransformFromJson(*pose);
+        const json::Value* ground = op.after.Find("ground");
+        out->focus = ComposeAsset(es_->scene, *a.scene, a.kind, op.after.At("name").AsString(), placement,
+                                  ground == nullptr || ground->AsBool());
+        out->rebuild = true;
+    } else if (op.field == "collision") {
+        std::vector<std::string> paths;
+        for (const json::Value& p : op.after.At("paths").Elements()) paths.push_back(p.AsString());
+        if (GenerateCollision(es_->scene, paths, CollisionOptionsFromJson(op.after)) == 0u) {
+            *error = "no selected body has a visual mesh to build a collider from";
             return false;
         }
         out->rebuild = true;

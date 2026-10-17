@@ -17,10 +17,12 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <shobjidl.h>
 
 #include <vector>
 
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace nuka::runtime::app::viewer {
 namespace {
@@ -120,6 +122,32 @@ std::string SaveFileDialog(const char* title, const char* filter_label,
     return std::string();
 }
 
+// Each successful CoInitializeEx is balanced; a thread already in another COM mode keeps it.
+std::string OpenFolderDialog(const char* title) {
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    std::string out;
+    IFileOpenDialog* dialog = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+        DWORD options = 0;
+        dialog->GetOptions(&options);
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
+        const std::wstring wtitle = Widen(title);
+        if (!wtitle.empty()) dialog->SetTitle(wtitle.c_str());
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->Show(nullptr)) && SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR chosen = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &chosen))) {
+                out = Narrow(chosen);
+                CoTaskMemFree(chosen);
+            }
+            item->Release();
+        }
+        dialog->Release();
+    }
+    if (SUCCEEDED(init)) CoUninitialize();
+    return out;
+}
+
 }  // namespace nuka::runtime::app::viewer
 
 #else  // !_WIN32
@@ -166,6 +194,23 @@ std::string SaveFileDialog(const char* title, const char* filter_label,
         cmd += filter_glob;
         cmd += "\"";
     }
+    cmd += " 2>/dev/null";
+
+    std::FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return std::string();
+    std::string out;
+    std::array<char, 1024> chunk{};
+    while (std::fgets(chunk.data(), static_cast<int>(chunk.size()), pipe) != nullptr) {
+        out += chunk.data();
+    }
+    pclose(pipe);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
+}
+
+std::string OpenFolderDialog(const char* title) {
+    std::string cmd = "zenity --file-selection --directory";
+    if (title && *title) cmd += std::string(" --title=\"") + title + "\"";
     cmd += " 2>/dev/null";
 
     std::FILE* pipe = popen(cmd.c_str(), "r");

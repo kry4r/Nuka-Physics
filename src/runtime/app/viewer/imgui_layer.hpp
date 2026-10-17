@@ -6,6 +6,7 @@
 #include "render/render_world.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
 #include "runtime/app/viewer/nui/nui.hpp"
+#include "runtime/app/viewer/property_schema.hpp"
 #include "runtime/app/viewer/scene_viewport.hpp"
 #include "scene/ecs/entity.hpp"
 
@@ -14,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace nuka::scene {
@@ -76,6 +78,70 @@ struct StartPage {
     std::vector<StartEntry> templates, recent, recovered, examples, checks;
 };
 
+// One importable file of the Assets panel.
+struct AssetCard {
+    std::string path;
+    std::string name;
+    std::string root;
+    std::string kind;       // "scene", "urdf", "mjcf", "usd" or "mesh"
+    std::string thumbnail;  // a PPM, or empty while it is drawn
+};
+
+// The Assets panel: its folders (examples, the document's own, then the user's) and their files.
+struct AssetBrowser {
+    std::vector<std::string> roots;
+    std::vector<std::string> user_roots;  // the ones assets.remove_folder can drop
+    std::vector<AssetCard> cards;
+    uint64_t version = 0u;  // bumped when the cards change
+    std::string root;       // the folder shown; empty shows every folder
+    std::string kind;       // the kind shown; empty shows every kind
+    char filter[128] = {0};
+    bool shown = false;     // UI-set: the panel drew this frame, so pictures are wanted
+};
+
+// The import wizard over one file's analysis; an empty `path` keeps it closed.
+struct ImportWizard {
+    std::string path;
+    nui::json::Value analysis;  // AnalysisToJson
+    nui::json::Value pose;      // where a drop placed it; null keeps the origin
+    char name[128] = {0};
+    bool ground = true;
+    bool open_as_new = false;  // otherwise the asset joins the open document
+    bool add_allowed = false;  // a document is open to add to
+    bool appear = false;       // host-set: open the modal at the next frame
+};
+
+// The collision dialog: what to build for the selection, and the last preview of it.
+struct CollisionDialog {
+    bool appear = false;
+    bool dismiss = false;  // a generate or a load closes the open dialog
+    std::string method = "hull";  // hull, vhacd, sdf or mesh
+    int max_pieces = 16;
+    bool replace = true;
+    bool only_missing = false;
+    bool subtree = true;
+    nui::json::Value preview;  // PreviewToJson
+};
+
+// The dialog's options as scene.collision_preview and scene.generate_collision args.
+inline nui::json::Value CollisionArgs(const CollisionDialog& d) {
+    nui::json::Value args = nui::json::Value::Object();
+    args.Set("method", nui::json::Value::Str(d.method));
+    args.Set("max_pieces", nui::json::Value::Int(d.max_pieces));
+    args.Set("replace", nui::json::Value::Bool(d.replace));
+    args.Set("only_missing", nui::json::Value::Bool(d.only_missing));
+    args.Set("subtree", nui::json::Value::Bool(d.subtree));
+    return args;
+}
+
+// A field edit that rebuilds the world, held until Apply & Rebuild.
+struct StagedEdit {
+    std::string target;
+    std::string field;
+    std::string label;
+    float after = 0.0f;
+};
+
 // Transport, selection and panel state. The UI queues actions for anything that changes the
 // world and edits only this plain state in place.
 struct ViewerUiState {
@@ -89,6 +155,10 @@ struct ViewerUiState {
     bool show_contacts = false;
 
     nuka::scene::EntityId selected_entity = nuka::scene::kInvalidEntity;
+    // Every selected node, the primary `selected_entity` among them.
+    std::vector<nuka::scene::EntityId> selection;
+    std::vector<std::string> hidden;  // node paths drawn without their visuals
+    std::vector<std::string> locked;  // node paths viewport picking skips
     // Bumped by the host whenever the scene tree may have changed.
     uint64_t scene_version = 0u;
 
@@ -137,6 +207,14 @@ struct ViewerUiState {
     std::string doc_title = "untitled";
     std::string prompt;  // the action waiting on save, don't save or cancel
     StartPage start;
+
+    AssetBrowser assets;
+    ImportWizard import;
+    CollisionDialog collision;
+    // The selection's fields, host-built whenever the selection or the document changes.
+    std::vector<PropertyGroup> properties;
+    uint64_t properties_version = 0u;  // bumped with every rebuild of `properties`
+    std::vector<StagedEdit> staged;
 };
 
 // Per-frame physics and render facts the panels show.
@@ -248,6 +326,13 @@ private:
     void BuildScript(nui::VStack& root);
     void BuildConsole(nui::VStack& root);
     void BuildInspector(nui::VStack& root);
+    void BuildAssets(nui::VStack& root);
+    // The schema groups of the selection's fields, after the transform and material.
+    void BuildFieldGroups(nui::VStack& root);
+    // Keeps a Properties group open or closed as the user left it across the panel's rebuilds.
+    nui::Collapsible& Fold(nui::Collapsible& group, const std::string& key);
+    // A field edit reaches the world now when live, else it waits in the staged edits.
+    void CommitField(const PropertyGroup& group, const PropertyField& field, float value);
     void DrawMenuBar();
     void DrawToolbar();
     void DrawStatusBar();
@@ -255,6 +340,10 @@ private:
     void DrawAbout();
     void DrawStartPage();
     void DrawPrompt();
+    void DrawImportWizard();
+    void DrawCollisionDialog();
+    // While an asset card is dragged, the viewport takes the drop at the ground under the pointer.
+    void DrawAssetDrop();
     // The texture of a PPM file, reloaded when the file changes; null without the file.
     ImTextureData* Thumbnail(const std::string& file);
     void DockLayout(unsigned int dockspace);
@@ -282,6 +371,8 @@ private:
     char console_filter_[128] = {0};
     nui::Plot* frame_plot_ = nullptr;
     nui::Plot* step_plot_ = nullptr;
+    uint64_t staged_version_ = 0u;               // bumped whenever the UI changes the staged edits
+    std::unordered_map<std::string, bool> folds_;  // Properties groups the user opened or closed
 
     bool palette_open_ = false;
     bool palette_focus_ = false;

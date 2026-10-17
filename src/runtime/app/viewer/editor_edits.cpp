@@ -149,6 +149,25 @@ void ApplyTransformEdit(EditorScene& es, const EntityRecordIndex& idx,
     }
 }
 
+const render::RenderInstance* PoseInstance(const EditorScene& es, const EntityRecordIndex& idx,
+                                           scene::EntityId entity) {
+    const bool body = idx.IsBody(entity);
+    const render::RenderInstance* carried = nullptr;
+    for (const render::RenderInstance& ri : es.sim->GetRenderWorld().instances) {
+        if (ri.entity == entity) return &ri;
+        if (body && carried == nullptr && CarrierOf(es.scene, ri.entity) == entity) carried = &ri;
+    }
+    return carried;
+}
+
+math::Transform LiveWorldTransform(const scene::SceneIR& scene, scene::EntityId entity,
+                                   const render::RenderInstance& inst) {
+    if (inst.entity == entity) return inst.world_xform;
+    // A carried visual keeps its authored offset from the body, as ApplyTransformEdit moves it.
+    return inst.world_xform * AuthoredWorldTransform(scene, inst.entity).Inverse() *
+           AuthoredWorldTransform(scene, entity);
+}
+
 void ApplyMaterialEdit(EditorScene& es, const MaterialBinding& bind,
                        const scene::RenderMaterial& mat, bool commit) {
     render::RenderWorld& rw = es.sim->GetRenderWorld();

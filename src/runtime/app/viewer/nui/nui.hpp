@@ -538,7 +538,14 @@ public:
     bool alpha, hdr;
 
 protected:
+    void DrawSelf() override;
     bool Edit(Color& value) override;
+
+private:
+    // The picker popup edits outside the row's item, so its gesture ends when it closes.
+    bool picking_ = false;
+    bool picked_ = false;
+    Color pick_before_{};
 };
 
 class StringField : public Field<std::string> {
@@ -626,6 +633,15 @@ protected:
 // filter changes, and only the visible rows draw.
 class TreeView : public Node {
 public:
+    // A toggle at a row's right end, shown while it is on or the row is hovered.
+    struct RowTool {
+        const char* icon_on = "";
+        const char* icon_off = "";
+        std::string tooltip;
+        std::function<bool(uint64_t)> on;
+        std::function<void(uint64_t)> on_click;
+    };
+
     explicit TreeView(std::shared_ptr<ItemModel> items = nullptr) : model(std::move(items)) {}
     const char* Kind() const override { return "tree"; }
     void SetProps(const json::Value& props) override;
@@ -637,7 +653,15 @@ public:
 
     std::shared_ptr<ItemModel> model;
     std::function<bool(uint64_t)> is_selected;
+    std::function<bool(uint64_t)> is_dimmed;  // drawn muted, e.g. a hidden node
     std::function<void(uint64_t)> on_select;
+    // Ctrl+click; without it, a Ctrl+click selects.
+    std::function<void(uint64_t)> on_toggle;
+    // Shift+click: the rows from the last clicked one through this one, this one last.
+    std::function<void(const std::vector<uint64_t>&)> on_range;
+    // F2 on the selected row edits its label in place; Enter commits.
+    std::function<void(uint64_t, const std::string&)> on_rename;
+    std::vector<RowTool> row_tools;
     std::function<void(uint64_t)> on_activate;
     std::function<void(uint64_t)> context_menu;  // draws the popup body
     std::function<void(uint64_t dragged, uint64_t onto)> on_drop;
@@ -668,6 +692,10 @@ private:
     bool seeded_ = false;
     uint64_t selected_ = 0u;
     uint64_t reveal_ = 0u;
+    uint64_t anchor_ = 0u;  // the last row clicked without Shift
+    uint64_t renaming_ = 0u;
+    bool rename_focus_ = false;
+    char rename_buf_[256] = {0};
 };
 
 class Table : public Node {

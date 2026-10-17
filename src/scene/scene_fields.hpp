@@ -1,6 +1,6 @@
 #pragma once
-// Float fields "<record>.<field>" reached from a body or shape: body.*, joint.* (the joint whose
-// child is the body), actuator.* (its actuators), shape.* and material.* (the shape's material).
+// Float fields "<record>.<field>" (a vector part is "<record>.<vector>.<x|y|z>") from a body or shape: body.*,
+// joint.* (the joint whose child is the body), actuator.* (its actuators), shape.*, material.* (the shape's material).
 
 #include "scene/scene_ir.hpp"
 

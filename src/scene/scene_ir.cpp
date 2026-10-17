@@ -477,6 +477,44 @@ bool SceneIR::RemoveScript(ScriptId id) {
     return true;
 }
 
+bool SceneIR::RemoveShape(ShapeId id) {
+    if (id >= shapes_.size()) {
+        return false;
+    }
+    shapes_.erase(shapes_.begin() + static_cast<std::ptrdiff_t>(id));
+    for (size_t i = 0; i < shapes_.size(); ++i) {
+        shapes_[i].id = static_cast<ShapeId>(i);
+    }
+    std::vector<ContactPairOverride> kept;
+    for (ContactPairOverride p : contact_pairs_) {
+        if (p.geom1 == id || p.geom2 == id) continue;
+        if (p.geom1 != kInvalidShape && p.geom1 > id) --p.geom1;
+        if (p.geom2 != kInvalidShape && p.geom2 > id) --p.geom2;
+        kept.push_back(p);
+    }
+    contact_pairs_ = std::move(kept);
+    RebuildFacade();
+    return true;
+}
+
+ShapeId SceneIR::InsertCollisionShape(CollisionShapeRecord record) {
+    // A reload adds the orphan shapes first, then each body's in body-id order.
+    const auto rank = [](BodyId b) { return b == kInvalidBody ? 0ull : static_cast<unsigned long long>(b) + 1ull; };
+    size_t pos = shapes_.size();
+    while (pos > 0u && rank(shapes_[pos - 1u].body_id) > rank(record.body_id)) --pos;
+    const auto id = static_cast<ShapeId>(pos);
+    shapes_.insert(shapes_.begin() + static_cast<std::ptrdiff_t>(pos), std::move(record));
+    for (size_t i = 0; i < shapes_.size(); ++i) {
+        shapes_[i].id = static_cast<ShapeId>(i);
+    }
+    for (ContactPairOverride& p : contact_pairs_) {
+        if (p.geom1 != kInvalidShape && p.geom1 >= id) ++p.geom1;
+        if (p.geom2 != kInvalidShape && p.geom2 >= id) ++p.geom2;
+    }
+    RebuildFacade();
+    return id;
+}
+
 size_t SceneIR::RigidBodyCount() const { return bodies_.size(); }
 size_t SceneIR::JointCount() const { return joints_.size(); }
 size_t SceneIR::ShapeCount() const { return shapes_.size(); }

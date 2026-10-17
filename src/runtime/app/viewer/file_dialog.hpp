@@ -25,4 +25,8 @@ std::string OpenFileDialog(const char* title, const char* filter_label,
 std::string SaveFileDialog(const char* title, const char* filter_label,
                            const char* filter_glob, const char* suggested);
 
+// The OS folder picker (Windows IFileOpenDialog with FOS_PICKFOLDERS; Linux zenity
+// --directory). Returns the chosen folder, or "" on cancel.
+std::string OpenFolderDialog(const char* title);
+
 }  // namespace nuka::runtime::app::viewer

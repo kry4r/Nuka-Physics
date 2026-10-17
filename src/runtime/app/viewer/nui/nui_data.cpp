@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstring>
 
 namespace nuka::nui {
@@ -106,6 +107,7 @@ void TreeView::Reveal(uint64_t item) { reveal_ = item; }
 
 void TreeView::Select(uint64_t item) {
     selected_ = item;
+    anchor_ = item;
     if (on_select) on_select(item);
     Emit("select", json::Value::Int(static_cast<int64_t>(item)));
 }
@@ -168,7 +170,7 @@ void TreeView::DrawSelf() {
         flattened_filter_ = needle;
     }
 
-    const float row_h = ImGui::GetTextLineHeight() + 10.0f * s;
+    const float row_h = std::floor(ImGui::GetTextLineHeight() + 10.0f * s);
     const float indent = 14.0f * s;
     if (ImGui::BeginChild("##tree", ImVec2(0.0f, height > 0.0f ? height * s : 0.0f))) {
         auto scroll_to = [&](size_t index) {
@@ -198,6 +200,13 @@ void TreeView::DrawSelf() {
                 scroll_to(current - 1u);
             } else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && row.has_children && open_.count(row.item) == 0u) {
                 toggle = row.item;
+            } else if (on_rename && ImGui::IsKeyPressed(ImGuiKey_F2)) {
+                const std::string_view label = model->Label(row.item);
+                const size_t n = std::min(label.size(), sizeof(rename_buf_) - 1u);
+                std::memcpy(rename_buf_, label.data(), n);
+                rename_buf_[n] = '\0';
+                renaming_ = row.item;
+                rename_focus_ = true;
             } else if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
                 if (row.has_children && open_.count(row.item) != 0u) {
                     toggle = row.item;
@@ -216,6 +225,8 @@ void TreeView::DrawSelf() {
         ImDrawList* list = ImGui::GetWindowDrawList();
         ImFont* badge_font = GetNukaFont(FontRole::Display);
         const float badge_px = theme::kFontLabel * s;
+        const float tool_w = 20.0f * s;
+        const float tools_w = static_cast<float>(row_tools.size()) * tool_w;
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(rows_.size()), row_h);
         while (clipper.Step()) {
@@ -226,6 +237,7 @@ void TreeView::DrawSelf() {
                 const float w = std::max(ImGui::GetContentRegionAvail().x, 1.0f);
                 // Rows advance by exactly row_h, which the clipper, keyboard scroll and reveal all assume.
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+                if (!row_tools.empty()) ImGui::SetNextItemAllowOverlap();
                 const bool clicked = ImGui::InvisibleButton("##row", ImVec2(w, row_h));
                 ImGui::PopStyleVar();
                 const bool hovered = ImGui::IsItemHovered();
@@ -233,8 +245,23 @@ void TreeView::DrawSelf() {
                 const bool open = !needle.empty() || open_.count(row.item) != 0u;
                 const float x = pos.x + static_cast<float>(row.depth) * indent;
                 if (clicked) {
+                    const ImGuiIO& io = ImGui::GetIO();
+                    const auto anchor = std::find_if(rows_.begin(), rows_.end(), [&](const Row& r) { return r.item == anchor_; });
                     if (row.has_children && ImGui::GetIO().MouseClickedPos[0].x < x + 16.0f * s) toggle = row.item;
-                    else Select(row.item);
+                    else if (io.KeyShift && on_range && anchor != rows_.end()) {
+                        const std::ptrdiff_t a = anchor - rows_.begin(), b = static_cast<std::ptrdiff_t>(i);
+                        std::vector<uint64_t> items;
+                        for (std::ptrdiff_t k = a;; k += a <= b ? 1 : -1) {
+                            items.push_back(rows_[static_cast<size_t>(k)].item);
+                            if (k == b) break;
+                        }
+                        on_range(items);
+                    } else if (io.KeyCtrl && on_toggle) {
+                        anchor_ = row.item;
+                        on_toggle(row.item);
+                    } else {
+                        Select(row.item);
+                    }
                 }
                 if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                     if (row.has_children) toggle = row.item;
@@ -264,10 +291,12 @@ void TreeView::DrawSelf() {
                 }
 
                 const ImVec2 end(pos.x + w, pos.y + row_h);
+                const ImVec2 after = ImGui::GetCursorScreenPos();
+                const bool row_hovered = ImGui::IsMouseHoveringRect(pos, end) && ImGui::IsWindowHovered();
                 if (selected) {
                     list->AddRectFilled(pos, end, U32(theme::Alpha(theme::kAccent, 0.14f)));
                     list->AddRectFilled(pos, ImVec2(pos.x + 2.0f * s, end.y), U32(theme::kAccent));
-                } else if (hovered) {
+                } else if (row_hovered) {
                     list->AddRectFilled(pos, end, U32(theme::kBg2));
                 }
                 for (int d = 0; d < row.depth; ++d) {
@@ -285,27 +314,66 @@ void TreeView::DrawSelf() {
                                 U32(selected ? theme::kAccent : model->IconColor(row.item)), false, 14.0f);
                     tx += 20.0f * s;
                 }
-                float text_end = end.x - 6.0f * s;
+                const float tools_x = end.x - tools_w;
+                float text_end = tools_x - 6.0f * s;
                 const std::string_view label = model->Label(row.item);
                 const float label_w = ImGui::CalcTextSize(label.data(), label.data() + label.size()).x;
                 const std::string badge = Tr(std::string(model->Badge(row.item)));
                 if (!badge.empty()) {
                     const ImVec2 bsize = badge_font->CalcTextSizeA(badge_px, FLT_MAX, 0.0f, badge.data(), badge.data() + badge.size());
                     // The kind badge yields to the name when the row is too narrow for both.
-                    if (tx + label_w + bsize.x + 18.0f * s <= end.x) {
-                        list->AddText(badge_font, badge_px, ImVec2(end.x - bsize.x - 8.0f * s, mid - bsize.y * 0.5f),
+                    if (tx + label_w + bsize.x + 18.0f * s <= tools_x) {
+                        list->AddText(badge_font, badge_px, ImVec2(tools_x - bsize.x - 8.0f * s, mid - bsize.y * 0.5f),
                                       U32(theme::kFgDim), badge.data(), badge.data() + badge.size());
                         text_end -= bsize.x + 10.0f * s;
                     }
                 }
                 const float clip = std::max(tx, text_end);
-                ImGui::PushStyleColor(ImGuiCol_Text, selected ? theme::kFg : theme::Alpha(theme::kFg, 0.92f));
-                ImGui::RenderTextEllipsis(list, ImVec2(tx, mid - ImGui::GetTextLineHeight() * 0.5f), ImVec2(clip, end.y), clip,
-                                          label.data(), label.data() + label.size(), nullptr);
-                ImGui::PopStyleColor();
+                if (row.item == renaming_) {
+                    ImGui::SetCursorScreenPos(ImVec2(tx - 4.0f * s, mid - ImGui::GetFrameHeight() * 0.5f));
+                    ImGui::SetNextItemWidth(std::max(tools_x - tx, 60.0f * s));
+                    if (rename_focus_) ImGui::SetKeyboardFocusHere();
+                    const bool done = ImGui::InputText("##rename", rename_buf_, sizeof(rename_buf_),
+                                                       ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                    // The field takes focus a frame late; losing it after that cancels.
+                    if (done) {
+                        renaming_ = 0u;
+                        if (on_rename && model->Label(row.item) != rename_buf_) on_rename(row.item, rename_buf_);
+                    } else if (ImGui::IsItemActive()) {
+                        rename_focus_ = false;
+                    } else if (!rename_focus_) {
+                        renaming_ = 0u;
+                    }
+                } else {
+                    const bool dimmed = is_dimmed && is_dimmed(row.item);
+                    ImGui::PushStyleColor(ImGuiCol_Text, dimmed     ? theme::kFgDim
+                                                         : selected ? theme::kFg
+                                                                    : theme::Alpha(theme::kFg, 0.92f));
+                    ImGui::RenderTextEllipsis(list, ImVec2(tx, mid - ImGui::GetTextLineHeight() * 0.5f), ImVec2(clip, end.y),
+                                              clip, label.data(), label.data() + label.size(), nullptr);
+                    ImGui::PopStyleColor();
+                }
+                for (size_t k = 0; k < row_tools.size(); ++k) {
+                    const RowTool& tool = row_tools[k];
+                    const bool on = tool.on && tool.on(row.item);
+                    const ImVec2 at(tools_x + static_cast<float>(k) * tool_w, pos.y);
+                    ImGui::SetCursorScreenPos(at);
+                    ImGui::PushID(static_cast<int>(k));
+                    const bool pressed = ImGui::InvisibleButton("##tool", ImVec2(tool_w, row_h));
+                    const bool tool_hovered = ImGui::IsItemHovered();
+                    ImGui::PopID();
+                    if (tool_hovered && !tool.tooltip.empty()) ImGui::SetTooltip("%s", Tr(tool.tooltip.c_str()));
+                    if (pressed && tool.on_click) tool.on_click(row.item);
+                    if (on || row_hovered)
+                        draw::Glyph(list, ImVec2(at.x + tool_w * 0.5f, mid), on ? tool.icon_on : tool.icon_off,
+                                    U32(on ? theme::kAccent : tool_hovered ? theme::kFg : theme::kFgDim), false, 13.0f);
+                }
+                ImGui::SetCursorScreenPos(after);
                 ImGui::PopID();
             }
         }
+        // The row tools leave the cursor set by hand; an item validates the clipper's final extent.
+        ImGui::Dummy(ImVec2(0.0f, 0.0f));
         if (toggle != 0u) {
             if (open_.erase(toggle) == 0u) open_.insert(toggle);
             ++layout_;

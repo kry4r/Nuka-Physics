@@ -27,6 +27,9 @@ public:
     std::string Setting(const std::string& table, const std::string& key, const std::string& fallback) const;
     double SettingNumber(const std::string& table, const std::string& key, double fallback) const;
     void SetSetting(const std::string& table, const std::string& key, const std::string& value);
+    // A list of strings in settings.toml; empty when the key is not set.
+    std::vector<std::string> SettingList(const std::string& table, const std::string& key) const;
+    void SetSettingList(const std::string& table, const std::string& key, const std::vector<std::string>& values);
 
     std::vector<RecentScene> Recent() const;
     // Moves `path` to the front of the list, which keeps the last kRecentCap scenes.

@@ -61,11 +61,12 @@ bool InputString(const char* id, const char* hint, std::string& text, ImGuiInput
                                     ResizeString, &text);
 }
 
-// Three drags in a row, each marked with its axis color.
-bool AxisDrags(float* v, float speed, const char* format) {
+// Three drags in a row, each marked with its axis color; `unit` follows them once.
+bool AxisDrags(float* v, float speed, const char* format, const std::string& unit) {
     const float s = Scale();
     const float gap = theme::kSpace * s;
-    const float w = (ImGui::GetContentRegionAvail().x - 2.0f * gap) / 3.0f;
+    const float unit_w = unit.empty() ? 0.0f : ImGui::CalcTextSize(unit.c_str()).x + gap;
+    const float w = (ImGui::GetContentRegionAvail().x - 2.0f * gap - unit_w) / 3.0f;
     const ImVec4 axes[3] = {theme::kAxisX, theme::kAxisY, theme::kAxisZ};
     ImDrawList* list = ImGui::GetWindowDrawList();
     bool changed = false;
@@ -77,6 +78,11 @@ bool AxisDrags(float* v, float speed, const char* format) {
         const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
         list->AddRectFilled(a, ImVec2(a.x + 2.0f * s, b.y), U32(axes[i]), theme::kRadius * s, ImDrawFlags_RoundCornersLeft);
         ImGui::PopID();
+    }
+    if (!unit.empty()) {
+        ImGui::SameLine(0.0f, gap);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(theme::kFgDim, "%s", unit.c_str());
     }
     return changed;
 }
@@ -477,12 +483,12 @@ void Vec3Field::SetProps(const json::Value& props) {
     Read(props, "format", format);
 }
 
-bool Vec3Field::Edit(Vec3& value) { return AxisDrags(value.data(), speed, WithUnit(format, unit).c_str()); }
+bool Vec3Field::Edit(Vec3& value) { return AxisDrags(value.data(), speed, format.c_str(), unit); }
 
 bool QuatField::Edit(Quat& value) {
     float euler[3];
     QuatToEuler(value, euler);
-    if (!AxisDrags(euler, 0.5f, "%.1f\xC2\xB0")) return false;
+    if (!AxisDrags(euler, 0.5f, "%.1f", "\xC2\xB0")) return false;
     value = EulerToQuat(euler);
     return true;
 }
@@ -497,6 +503,23 @@ bool ColorField::Edit(Color& value) {
     ImGuiColorEditFlags flags = alpha ? ImGuiColorEditFlags_AlphaBar : ImGuiColorEditFlags_NoAlpha;
     if (hdr) flags |= ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float;
     return alpha ? ImGui::ColorEdit4("##value", value.data(), flags) : ImGui::ColorEdit3("##value", value.data(), flags);
+}
+
+void ColorField::DrawSelf() {
+    const Color prior = model->Get();
+    Field<Color>::DrawSelf();
+    ImGui::PushID("##value");
+    const bool open = ImGui::IsPopupOpen("picker");
+    ImGui::PopID();
+    if (open && !picking_) pick_before_ = prior;
+    if (open && model->Get() != prior) picked_ = true;
+    if (!open && picking_ && picked_) {
+        const Color after = model->Get();
+        if (on_commit) on_commit(pick_before_, after);
+        Emit("commit", ToJson(after));
+    }
+    if (!open) picked_ = false;
+    picking_ = open;
 }
 
 void StringField::SetProps(const json::Value& props) {

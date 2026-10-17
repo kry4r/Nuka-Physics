@@ -137,6 +137,25 @@ void EditorProfile::SetSetting(const std::string& table, const std::string& key,
     WriteText(dir_ / "settings.toml", text.str());
 }
 
+std::vector<std::string> EditorProfile::SettingList(const std::string& table, const std::string& key) const {
+    std::vector<std::string> values;
+    const toml::table settings = Settings(dir_);
+    if (const toml::array* list = settings[table][key].as_array())
+        for (const toml::node& v : *list) values.push_back(v.value_or(std::string()));
+    return values;
+}
+
+void EditorProfile::SetSettingList(const std::string& table, const std::string& key, const std::vector<std::string>& values) {
+    toml::table settings = Settings(dir_);
+    if (settings[table].as_table() == nullptr) settings.insert_or_assign(table, toml::table{});
+    toml::array list;
+    for (const std::string& v : values) list.push_back(v);
+    settings[table].as_table()->insert_or_assign(key, std::move(list));
+    std::ostringstream text;
+    text << settings << "\n";
+    WriteText(dir_ / "settings.toml", text.str());
+}
+
 std::vector<RecentScene> EditorProfile::Recent() const {
     std::vector<RecentScene> list;
     const std::string text = ReadText(dir_ / "recent.json");

@@ -18,9 +18,12 @@
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/debug_overlay.hpp"
 #include "runtime/app/viewer/editor_actions.hpp"
+#include "runtime/app/viewer/editor_assets.hpp"
+#include "runtime/app/viewer/editor_collision.hpp"
 #include "runtime/app/viewer/editor_document.hpp"
 #include "runtime/app/viewer/editor_edits.hpp"
 #include "runtime/app/viewer/editor_extensions.hpp"
+#include "runtime/app/viewer/editor_import.hpp"
 #include "runtime/app/viewer/editor_instance.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
 #include "runtime/app/viewer/editor_scene.hpp"
@@ -29,6 +32,7 @@
 #include "runtime/app/viewer/imgui_layer.hpp"
 #include "runtime/app/viewer/physics_worker.hpp"
 #include "runtime/app/viewer/pose_scatter.hpp"
+#include "runtime/app/viewer/property_schema.hpp"
 #include "runtime/app/viewer/script_host.hpp"
 #include "runtime/app/viewer/teleop.hpp"
 #include "runtime/inference/go2_policy_controller.hpp"
@@ -49,6 +53,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -86,6 +91,8 @@ constexpr float kPi = 3.14159265358979323846f;
 constexpr double kAutosaveSeconds = 60.0;
 // Logs beyond this many, oldest first, are deleted at startup.
 constexpr size_t kLogKeep = 20u;
+// A press and release closer than this many pixels is a click, not a drag.
+constexpr float kClickSlop = 4.0f;
 
 struct LaunchOptions {
     std::string scene_path;
@@ -187,9 +194,6 @@ std::string Resource(const std::string& relative) {
 
 // The note beside an autosave: the document's own path, the writing process and the time.
 fs::path SidecarOf(const std::string& autosave) { return Utf8Path(autosave).replace_extension(".json"); }
-
-constexpr int kThumbWidth = 320;
-constexpr int kThumbHeight = 180;
 
 // Crops the largest centered 16:9 window out of a captured viewport and box-filters it to
 // kThumbWidth x kThumbHeight.
@@ -429,20 +433,74 @@ bool RayAabb(const Ray& ray, const math::Vec3& lo, const math::Vec3& hi, float* 
     return true;
 }
 
-// The nearest movable instance (free body or floating root link) the ray hits, or ~0u.
-uint32_t PickInstance(const Ray& ray, const render::RenderWorld& w, const WorldLayout& layout) {
+// The nearest triangle of the instance's mesh along the ray, both faces; t lands in *t_out.
+bool RayMesh(const Ray& ray, const render::RenderInstance& inst, const render::RenderWorld& w, float* t_out) {
+    const render::MeshGeometry& geo = w.meshes.Geometry(inst.mesh_id);
+    const math::Transform inv = inst.world_xform.Inverse();
+    const math::Vec3 o = inv.TransformPoint(ray.origin);
+    const math::Vec3 d = inv.TransformDirection(ray.dir);
+    const auto at = [&](uint32_t i) {
+        return math::Vec3{geo.positions[3u * i], geo.positions[3u * i + 1u], geo.positions[3u * i + 2u]};
+    };
+    bool hit = false;
+    for (size_t k = 0; k + 2u < geo.indices.size(); k += 3u) {
+        const math::Vec3 a = at(geo.indices[k]);
+        const math::Vec3 e1 = at(geo.indices[k + 1u]) - a;
+        const math::Vec3 e2 = at(geo.indices[k + 2u]) - a;
+        const math::Vec3 p = d.Cross(e2);
+        const float det = e1.Dot(p);
+        if (std::fabs(det) < 1e-12f) continue;
+        const math::Vec3 s = o - a;
+        const float u = s.Dot(p) / det;
+        if (u < 0.0f || u > 1.0f) continue;
+        const math::Vec3 q = s.Cross(e1);
+        const float v = d.Dot(q) / det;
+        if (v < 0.0f || u + v > 1.0f) continue;
+        const float t = e2.Dot(q) / det;
+        if (t >= 0.0f && (!hit || t < *t_out)) {
+            *t_out = t;
+            hit = true;
+        }
+    }
+    return hit;
+}
+
+// The nearest instance among those `pickable` accepts whose triangles the ray hits, or ~0u.
+uint32_t PickInstance(const Ray& ray, const render::RenderWorld& w,
+                      const std::function<bool(const render::RenderInstance&)>& pickable) {
     uint32_t best = ~0u;
     float best_t = std::numeric_limits<float>::max();
     for (uint32_t i = 0; i < w.InstanceCount(); ++i) {
         const render::RenderInstance& inst = w.instances[i];
-        if (!IsMovableSource(inst.pose_source, layout)) continue;
+        if (!pickable(inst)) continue;
         math::Vec3 lo, hi;
         InstanceAabb(inst, w, &lo, &hi);
-        if (lo.x > hi.x) continue;
         float t = 0.0f;
-        if (RayAabb(ray, lo, hi, &t) && t < best_t) { best_t = t; best = i; }
+        if (lo.x > hi.x || !RayAabb(ray, lo, hi, &t) || t >= best_t) continue;
+        if (RayMesh(ray, inst, w, &t) && t < best_t) {
+            best_t = t;
+            best = i;
+        }
     }
     return best;
+}
+
+// True when `path` lies strictly under `root`.
+bool Under(const std::string& path, const std::string& root) {
+    return path.size() > root.size() && path.compare(0, root.size(), root) == 0 && path[root.size()] == '/';
+}
+
+bool UnderAny(const std::string& path, const std::vector<std::string>& roots) {
+    return std::any_of(roots.begin(), roots.end(), [&](const std::string& r) { return path == r || Under(path, r); });
+}
+
+// The body node carrying `e`, `e` itself when it is one or lies outside every body.
+scene::EntityId CarrierOf(const scene::SceneIR& s, scene::EntityId e) {
+    std::vector<scene::EntityId> bodies;
+    for (scene::BodyId b = 0; b < s.RigidBodyCount(); ++b) bodies.push_back(s.EntityOfBody(b));
+    for (auto n = s.Ecs().NodeOf(e); n; n = n->parent.lock())
+        if (std::find(bodies.begin(), bodies.end(), n->entity) != bodies.end()) return n->entity;
+    return e;
 }
 
 scene::EntityId EntityOfPath(const EditorScene& es, const std::string& path) {
@@ -473,6 +531,24 @@ double NumArg(const json::Value& args, const char* key, double fallback) {
 bool BoolArg(const json::Value& args, const char* key, bool fallback) {
     const json::Value* v = args.Find(key);
     return v != nullptr && !v->IsNull() ? v->AsBool() : fallback;
+}
+
+std::optional<bool> OptBoolArg(const json::Value& args, const char* key) {
+    const json::Value* v = args.Find(key);
+    return v != nullptr && !v->IsNull() ? std::optional<bool>(v->AsBool()) : std::nullopt;
+}
+
+std::vector<std::string> StrListArg(const json::Value& args, const char* key) {
+    std::vector<std::string> out;
+    if (const json::Value* v = args.Find(key); v != nullptr && !v->IsNull())
+        for (const json::Value& s : v->Elements()) out.push_back(s.AsString());
+    return out;
+}
+
+json::Value StrList(const std::vector<std::string>& values) {
+    json::Value list = json::Value::Array();
+    for (const std::string& s : values) list.PushBack(json::Value::Str(s));
+    return list;
 }
 
 ActionResult Ok(json::Value value = json::Value()) {
@@ -531,7 +607,7 @@ struct EditorHost::State : DocumentHost {
     bool Rebuild(const std::string& label) override;
     void ScriptsChanged() override { SyncScripts(); }
     ApplyResult ApplyTxn(const EditTxn& txn);
-    void Reselect(const std::string& path);
+    void Reselect(const std::vector<std::string>& paths);
     ActionResult SubmitTxn(const EditTxn& txn);
     ActionResult StepHistory(bool redo);
     uint64_t DocumentHash();
@@ -541,6 +617,8 @@ struct EditorHost::State : DocumentHost {
     void RegisterFileActions();
     void RegisterAppActions();
     void RegisterEditActions();
+    void RegisterSceneActions();
+    void RegisterAssetActions();
     void RegisterSimActions();
     void RegisterViewActions();
     void ConfigureExtensions();
@@ -562,6 +640,13 @@ struct EditorHost::State : DocumentHost {
     void DropAutosave();
     void RefreshStartPage();
     std::string SelectedPath() const { return PathOfEntity(ui_state_.selected_entity); }
+    std::vector<std::string> SelectionPaths() const;
+    std::vector<std::string> TargetPaths(const json::Value& args) const;
+    ActionResult ShowImport(const ImportAnalysis& analysis, const json::Value& pose);
+    void ApplyHidden();
+    void RefreshAssets();
+    void RefreshProperties();
+    void PickSelect(const CameraController& camera, float x, float y);
     const render::RenderWorld& ShownWorld() const { return loaded_ ? loaded_->sim->GetRenderWorld() : empty_world_; }
 
     void Frame(bool step_physics);
@@ -628,7 +713,11 @@ struct EditorHost::State : DocumentHost {
     uint64_t autosaved_revision_ = 0u;
     double autosave_seconds_ = kAutosaveSeconds;
     std::vector<StartEntry> checks_;     // startup checks reported through app.check
-    std::vector<std::string> dropped_;  // files dropped on the window since the last frame
+    struct Dropped {
+        std::string path;
+        float x, y;  // where it landed, in window points
+    };
+    std::vector<Dropped> dropped_;  // files dropped on the window since the last frame
     std::string start_locale_;          // persisted on exit once the user switched languages
     bool start_stale_ = true;           // the start page lists need a refresh
     // A save's viewport picture, captured without the UI from the next drawn frame.
@@ -638,6 +727,21 @@ struct EditorHost::State : DocumentHost {
         uint64_t frame = 0u;
     };
     std::optional<ThumbRequest> thumb_;
+    std::unique_ptr<ThumbnailCache> thumbnails_;  // asset and example pictures
+    uint64_t start_thumb_version_ = 0u;
+    std::vector<AssetFile> asset_files_;
+    bool assets_stale_ = true;
+    uint64_t cards_version_ = ~0ull;  // the picture version the asset cards show
+    bool cards_pictures_ = false;     // the cards ask for pictures once the panel showed
+    // Hidden nodes' instances draw without a mesh; each held-aside mesh by instance index.
+    std::vector<std::pair<uint32_t, uint32_t>> hidden_meshes_;
+    std::vector<std::string> applied_hidden_;
+    bool hidden_stale_ = false;  // a rebind made new instances
+    std::vector<std::string> props_paths_;  // what the Properties schema was built for
+    uint64_t props_scene_version_ = ~0ull;
+    uint64_t props_revision_ = ~0ull;
+    bool click_armed_ = false;
+    float click_x_ = 0.0f, click_y_ = 0.0f;
     ActionRegistry actions_;
     uint64_t param_seq_ = 0u;  // the last registry write and the ticks it was queued and applied at
     uint64_t param_pushed_tick_ = 0u;
@@ -724,6 +828,7 @@ EditorHost::State::State(const std::vector<std::string>& args, nuka_world_handle
     }
     profile_.emplace(opt_.profile);
     OpenLog();
+    thumbnails_ = std::make_unique<ThumbnailCache>(profile_->Dir() / "thumbnails" / "assets");
     if (opt_.locale.empty()) opt_.locale = profile_->Setting("ui", "locale", "");
     autosave_seconds_ = profile_->SettingNumber("editor", "autosave_seconds", kAutosaveSeconds);
     autosave_file_ = PathText(profile_->Dir() / "autosave" /
@@ -783,7 +888,7 @@ void EditorHost::State::StartShell() {
     native_window_ = surface->NativeWindowHandle();
     surface->SetNativeEventHook([this](const void* event) {
         const SDL_Event* e = static_cast<const SDL_Event*>(event);
-        if (e->type == SDL_EVENT_DROP_FILE && e->drop.data != nullptr) dropped_.emplace_back(e->drop.data);
+        if (e->type == SDL_EVENT_DROP_FILE && e->drop.data != nullptr) dropped_.push_back({e->drop.data, e->drop.x, e->drop.y});
         if (ImGui::GetCurrentContext() != nullptr) ImGui_ImplSDL3_ProcessEvent(e);
     });
     present_ = std::make_unique<render::PresentRenderer>(std::move(surface));
@@ -1300,6 +1405,14 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", path.c_str());
     ui_state_.selected_entity = scene::kInvalidEntity;
+    ui_state_.selection.clear();
+    ui_state_.hidden.clear();
+    ui_state_.locked.clear();
+    ui_state_.staged.clear();
+    ui_state_.collision.preview = json::Value();
+    ui_state_.collision.dismiss = true;
+    hidden_meshes_.clear();
+    hidden_stale_ = true;
 
     // Headless aids queue the same actions the UI runs, on the node --select names.
     const std::string sel_path = opt_.select_path;
@@ -1387,6 +1500,8 @@ void EditorHost::State::OnRebound(uint64_t tick, double sim_time) {
     AttachController();
     SeedDriveTargets();
     BindWorker(tick, sim_time);
+    hidden_meshes_.clear();
+    hidden_stale_ = true;
 }
 
 void EditorHost::State::PushParam(const ParamWrite& write) {
@@ -1413,21 +1528,37 @@ bool EditorHost::State::Rebuild(const std::string& label) {
     return true;
 }
 
-// Runs with the worker parked. Selection follows the node the edit created or moved.
+// Runs with the worker parked. Selection follows the node the edit created or moved, else
+// keeps the nodes that are still there.
 ApplyResult EditorHost::State::ApplyTxn(const EditTxn& txn) {
-    const std::string selected = SelectedPath();
+    const std::vector<std::string> selected = SelectionPaths();
     const ApplyResult result = doc_.Apply(txn);
-    Reselect(result.focus.empty() ? selected : result.focus);
+    Reselect(result.focus.empty() ? selected : std::vector<std::string>{result.focus});
     return result;
 }
 
-void EditorHost::State::Reselect(const std::string& path) {
+// The first of `paths` that exists becomes the primary selection.
+void EditorHost::State::Reselect(const std::vector<std::string>& paths) {
     ++ui_state_.scene_version;
     ui_state_.selected_entity = scene::kInvalidEntity;
-    if (!path.empty())
-        if (const auto n = loaded_->scene.Tree().NodeOf(path)) ui_state_.selected_entity = n->entity;
+    ui_state_.selection.clear();
+    for (const std::string& path : paths)
+        if (const auto n = loaded_->scene.Tree().NodeOf(path)) ui_state_.selection.push_back(n->entity);
+    if (!ui_state_.selection.empty()) ui_state_.selected_entity = ui_state_.selection.front();
     ui_state_.inspector = InspectorState{};
     last_seeded_ = scene::kInvalidEntity;
+}
+
+// The selected nodes' paths, the primary first.
+std::vector<std::string> EditorHost::State::SelectionPaths() const {
+    std::vector<std::string> paths;
+    const auto add = [&](scene::EntityId e) {
+        std::string path = PathOfEntity(e);
+        if (!path.empty() && std::find(paths.begin(), paths.end(), path) == paths.end()) paths.push_back(std::move(path));
+    };
+    add(ui_state_.selected_entity);
+    for (const scene::EntityId e : ui_state_.selection) add(e);
+    return paths;
 }
 
 ActionResult EditorHost::State::SubmitTxn(const EditTxn& txn) {
@@ -1438,12 +1569,12 @@ ActionResult EditorHost::State::SubmitTxn(const EditTxn& txn) {
 
 // Selection stays put unless the restored step names a node to follow.
 ActionResult EditorHost::State::StepHistory(bool redo) {
-    const std::string selected = SelectedPath();
+    const std::vector<std::string> selected = SelectionPaths();
     ApplyResult result;
     worker_.Exclusive([&] { result = redo ? doc_.Redo() : doc_.Undo(); });
     entity_drag_.Cancel();
     xform_gesture_active_ = mat_gesture_active_ = gizmo_using_prev_ = false;
-    Reselect(result.focus.empty() ? selected : result.focus);
+    Reselect(result.focus.empty() ? selected : std::vector<std::string>{result.focus});
     return Outcome(result);
 }
 
@@ -1481,6 +1612,7 @@ ActionResult EditorHost::State::SaveScene(const std::string& path) {
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", doc_path_.c_str());
     profile_->TouchRecent(doc_path_);
     start_stale_ = true;
+    assets_stale_ = true;
     // The recent list shows the viewport as it was saved.
     const uint64_t next = present_->SubmittedFrames();
     if (ui_.Viewport().Valid()) {
@@ -1501,6 +1633,7 @@ ActionResult EditorHost::State::OpenDocument(const std::string& file, const std:
     std::snprintf(ui_state_.save_path, sizeof(ui_state_.save_path), "%s", doc_path_.c_str());
     if (!doc_path_.empty()) profile_->TouchRecent(doc_path_);
     start_stale_ = true;
+    assets_stale_ = true;
     Emit(stdout, "[nuka_editor] opened " + file + "\n");
     ui_.Nui().Toast(nui::Level::Ok, std::string(nui::Tr("Opened")) + " " + DocTitle());
     return Ok(Object({{"path", json::Value::Str(doc_path_)}, {"title", json::Value::Str(DocTitle())}}));
@@ -1562,8 +1695,9 @@ void EditorHost::State::RefreshStartPage() {
         page.templates.push_back(StartEntry{t.At("title").AsString(), t.At("detail").AsString(), t.At("id").AsString(), "", true});
     for (const json::Value& e : start.At("examples").Elements()) {
         const std::string path = Resource(e.At("path").AsString());
-        page.examples.push_back(StartEntry{e.At("title").AsString(), e.At("detail").AsString(), path, "",
-                                           fs::exists(Utf8Path(path))});
+        const bool present = fs::exists(Utf8Path(path));
+        page.examples.push_back(StartEntry{e.At("title").AsString(), e.At("detail").AsString(), path,
+                                           present ? thumbnails_->Thumbnail(AssetAt(path, "")) : std::string(), present});
     }
     for (const RecentScene& r : profile_->Recent()) {
         const fs::path thumb = profile_->Thumbnail(r.path);
@@ -1588,6 +1722,8 @@ void EditorHost::State::RegisterActions() {
     RegisterFileActions();
     RegisterAppActions();
     RegisterEditActions();
+    RegisterSceneActions();
+    RegisterAssetActions();
     RegisterSimActions();
     RegisterViewActions();
     ui_.RegisterActions(actions_);
@@ -1764,8 +1900,17 @@ void EditorHost::State::RegisterEditActions() {
                   [node_edit](const json::Value& args) {
                       return node_edit("Rename", "name", args, json::Value::Str(StrArg(args, "name")));
                   }});
+    // Deletes `paths`, `path` or the selection in one step; a node under another goes with it.
     actions_.Add({"edit.delete", "Delete Subtree", "edit", "", ShortcutScope::Global, has_scene, {},
-                  [node_edit](const json::Value& args) { return node_edit("Delete", "delete", args, json::Value()); }});
+                  [this](const json::Value& args) {
+                      const std::vector<std::string> paths = TargetPaths(args);
+                      if (paths.empty()) return ActionResult::Fail("no node selected");
+                      EditTxn txn{"Delete", {}};
+                      for (const std::string& p : paths)
+                          if (std::none_of(paths.begin(), paths.end(), [&](const std::string& q) { return Under(p, q); }))
+                              txn.ops.push_back(EditOp{p, "delete", json::Value(), json::Value()});
+                      return SubmitTxn(txn);
+                  }});
     actions_.Add({"edit.reparent", "Reparent", "edit", "", ShortcutScope::Global, has_scene, {},
                   [node_edit](const json::Value& args) {
                       return node_edit("Reparent", "reparent", args, json::Value::Str(StrArg(args, "parent")));
@@ -1789,13 +1934,34 @@ void EditorHost::State::RegisterEditActions() {
                       const json::Value spawn = Object({{"kind", json::Value::Str(kind)}, {"pose", pose}});
                       return SubmitTxn(EditTxn{"Spawn " + kind, {EditOp{"", "spawn", json::Value(), spawn}}});
                   }});
+    // `mode` add and toggle grow or shrink the selection; range takes `paths`, `path` leading.
     actions_.Add({"scene.select", "Select", "scene", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
                       const std::string path = StrArg(args, "path");
+                      const std::string mode = StrArg(args, "mode", "replace");
                       const scene::EntityId e = path.empty() ? scene::kInvalidEntity : EntityOfPath(*loaded_, path);
                       if (!path.empty() && e == scene::kInvalidEntity) return ActionResult::Fail("no node at '" + path + "'");
-                      ui_state_.selected_entity = e;
-                      return Ok(Object({{"path", json::Value::Str(path)}}));
+                      std::vector<scene::EntityId>& sel = ui_state_.selection;
+                      const auto at = std::find(sel.begin(), sel.end(), e);
+                      if (mode == "replace") {
+                          sel.clear();
+                          if (e != scene::kInvalidEntity) sel.push_back(e);
+                      } else if (mode == "add") {
+                          if (at == sel.end() && e != scene::kInvalidEntity) sel.push_back(e);
+                      } else if (mode == "toggle") {
+                          if (at != sel.end()) sel.erase(at);
+                          else if (e != scene::kInvalidEntity) sel.push_back(e);
+                      } else if (mode == "range") {
+                          sel.clear();
+                          for (const std::string& p : StrListArg(args, "paths"))
+                              if (const auto n = loaded_->scene.Tree().NodeOf(p)) sel.push_back(n->entity);
+                      } else {
+                          return ActionResult::Fail("the mode is replace, add, toggle or range");
+                      }
+                      // The named node leads unless a toggle just dropped it.
+                      const bool kept = std::find(sel.begin(), sel.end(), e) != sel.end();
+                      ui_state_.selected_entity = kept ? e : sel.empty() ? scene::kInvalidEntity : sel.back();
+                      return Ok(Object({{"path", json::Value::Str(SelectedPath())}, {"selection", StrList(SelectionPaths())}}));
                   }});
     actions_.Add({"script.run", "Run Script", "script", "", ShortcutScope::Global, {}, {},
                   [this](const json::Value& args) {
@@ -1832,6 +1998,269 @@ void EditorHost::State::RegisterEditActions() {
                       std::memcpy(ui_state_.script_buf, sc->source.c_str(), sc->source.size() + 1u);
                       return Ok();
                   }});
+}
+
+void EditorHost::State::RegisterSceneActions() {
+    const auto has_scene = [this] { return loaded_ != nullptr; };
+    // Puts the nodes into `list` or takes them out; unset, the first one's state flips.
+    const auto flag = [](std::vector<std::string>& list, const std::vector<std::string>& paths, std::optional<bool> in) {
+        const bool put = in.value_or(std::find(list.begin(), list.end(), paths.front()) == list.end());
+        for (const std::string& p : paths) {
+            const auto at = std::find(list.begin(), list.end(), p);
+            if (put && at == list.end()) list.push_back(p);
+            if (!put && at != list.end()) list.erase(at);
+        }
+        return put;
+    };
+    actions_.Add({"scene.set_visible", "Show/Hide", "edit", "H", ShortcutScope::Viewport, has_scene, {},
+                  [this, flag](const json::Value& args) {
+                      const std::vector<std::string> paths = TargetPaths(args);
+                      if (paths.empty()) return ActionResult::Fail("no node selected");
+                      const std::optional<bool> visible = OptBoolArg(args, "value");
+                      const bool hidden = flag(ui_state_.hidden, paths, visible ? std::optional<bool>(!*visible) : std::nullopt);
+                      return Ok(Object({{"paths", StrList(paths)}, {"visible", json::Value::Bool(!hidden)}}));
+                  }});
+    actions_.Add({"scene.set_locked", "Lock/Unlock", "edit", "", ShortcutScope::Global, has_scene, {},
+                  [this, flag](const json::Value& args) {
+                      const std::vector<std::string> paths = TargetPaths(args);
+                      if (paths.empty()) return ActionResult::Fail("no node selected");
+                      const bool locked = flag(ui_state_.locked, paths, OptBoolArg(args, "value"));
+                      return Ok(Object({{"paths", StrList(paths)}, {"locked", json::Value::Bool(locked)}}));
+                  }});
+    // The collider options of `args` and the nodes they apply to, as one edit op's value.
+    const auto collision_op = [this](const json::Value& args) {
+        json::Value op = CollisionOptionsToJson(CollisionOptionsFromJson(args));
+        op.Set("paths", StrList(TargetPaths(args)));
+        return op;
+    };
+    actions_.Add({"scene.collision_preview", "Preview Collision", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this, collision_op](const json::Value& args) {
+                      const json::Value op = collision_op(args);
+                      ui_state_.collision.preview =
+                          PreviewToJson(PreviewCollision(loaded_->scene, StrListArg(op, "paths"), CollisionOptionsFromJson(op)));
+                      return Ok(ui_state_.collision.preview);
+                  },
+                  "", true});
+    actions_.Add({"scene.generate_collision", "Generate Collision", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this, collision_op](const json::Value& args) {
+                      const json::Value op = collision_op(args);
+                      if (StrListArg(op, "paths").empty()) return ActionResult::Fail("no node selected");
+                      const ActionResult r = SubmitTxn(EditTxn{"Generate Collision", {EditOp{"", "collision", json::Value(), op}}});
+                      if (r.ok) {
+                          ui_state_.collision.preview = json::Value();
+                          ui_state_.collision.dismiss = true;
+                      }
+                      return r;
+                  },
+                  "", true});
+    actions_.Add({"scene.collision_dialog", "Generate Collision...", "scene", "", ShortcutScope::Global, has_scene, {},
+                  [this](const json::Value&) {
+                      ui_state_.collision.appear = true;
+                      return RunAction("scene.collision_preview", CollisionArgs(ui_state_.collision), "ui");
+                  }});
+}
+
+void EditorHost::State::RegisterAssetActions() {
+    actions_.Add({"file.import_analyze", "Analyze Asset", "file", "", ShortcutScope::Global, {}, {},
+                  [](const json::Value& args) {
+                      return Ok(AnalysisToJson(AnalyzeImport(StrArg(args, "path"), StrArg(args, "profile", "strict"))));
+                  },
+                  "", true});
+    // Without `mode` the wizard opens on the asset; "auto" adds a clean asset to the open
+    // document at once, "add" adds it, "open" opens it as a new document.
+    actions_.Add({"file.import", "Import Asset...", "file", "Ctrl+I", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      std::string path = StrArg(args, "path");
+                      if (path.empty())
+                          path = OpenFileDialog(nui::Tr("Import Asset"), nui::Tr("Assets"),
+                                                "*.urdf;*.xml;*.usd;*.usda;*.stl;*.obj;*.nks");
+                      if (path.empty()) return ActionResult::Fail("no asset chosen");
+                      if (!fs::exists(Utf8Path(path))) return ActionResult::Fail("no file at " + path);
+                      const std::string mode = StrArg(args, "mode");
+                      if (mode != "" && mode != "auto" && mode != "add" && mode != "open")
+                          return ActionResult::Fail("the mode is auto, add or open");
+                      const std::string profile = StrArg(args, "profile", "strict");
+                      const json::Value* pose = args.Find("pose");
+                      if (mode.empty() || mode == "auto") {
+                          const ImportAnalysis a = AnalyzeImport(path, profile);
+                          if (mode.empty() || !loaded_ || !Importable(a) || !a.diagnostics.empty())
+                              return ShowImport(a, pose != nullptr ? *pose : json::Value());
+                      }
+                      if (mode == "open") {
+                          if (borrowed_) return Spawn({path});
+                          const json::Value resolved = Object({{"path", json::Value::Str(path)}, {"mode", json::Value::Str(mode)},
+                                                               {"profile", json::Value::Str(profile)},
+                                                               {"discard", json::Value::Bool(BoolArg(args, "discard", false))}});
+                          ActionResult asked;
+                          if (!Confirmed("file.import", resolved, &asked)) return asked;
+                          ui_state_.import.path.clear();
+                          if (AssetKindOf(path) == AssetKind::Scene) return OpenDocument(path, path);
+                          const ImportAnalysis a = AnalyzeImport(path, profile);
+                          if (!Importable(a)) return ActionResult::Fail(ImportError(a));
+                          const std::string file = cache_.File("import.nks");
+                          scene::nks::Save(*a.scene, file);
+                          return OpenDocument(file, std::string());
+                      }
+                      if (!loaded_) return ActionResult::Fail("no document is open to add to");
+                      const std::string name = StrArg(args, "name", PathText(Utf8Path(path).stem()));
+                      json::Value after = Object({{"path", json::Value::Str(path)}, {"profile", json::Value::Str(profile)},
+                                                  {"name", json::Value::Str(name)},
+                                                  {"ground", json::Value::Bool(BoolArg(args, "ground", true))}});
+                      if (pose != nullptr && !pose->IsNull()) after.Set("pose", *pose);
+                      const ActionResult r = SubmitTxn(EditTxn{"Import " + name, {EditOp{"", "import", json::Value(), after}}});
+                      if (r.ok) ui_state_.import.path.clear();
+                      return r;
+                  }});
+    actions_.Add({"assets.add_folder", "Add Asset Folder...", "assets", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      std::string folder = StrArg(args, "path");
+                      if (folder.empty()) folder = OpenFolderDialog(nui::Tr("Add Asset Folder"));
+                      if (folder.empty()) return ActionResult::Fail("no folder chosen");
+                      if (!fs::is_directory(Utf8Path(folder))) return ActionResult::Fail("no folder at " + folder);
+                      folder = NormalPath(folder);
+                      std::vector<std::string> folders = profile_->SettingList("assets", "folders");
+                      if (std::find(folders.begin(), folders.end(), folder) == folders.end()) folders.push_back(folder);
+                      profile_->SetSettingList("assets", "folders", folders);
+                      ui_state_.assets.root = folder;
+                      assets_stale_ = true;
+                      return Ok(Object({{"path", json::Value::Str(folder)}}));
+                  }});
+    actions_.Add({"assets.remove_folder", "Remove Asset Folder", "assets", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string folder = NormalPath(StrArg(args, "path"));
+                      std::vector<std::string> folders = profile_->SettingList("assets", "folders");
+                      folders.erase(std::remove(folders.begin(), folders.end(), folder), folders.end());
+                      profile_->SetSettingList("assets", "folders", folders);
+                      if (ui_state_.assets.root == folder) ui_state_.assets.root.clear();
+                      assets_stale_ = true;
+                      return Ok();
+                  },
+                  "", true});
+    actions_.Add({"assets.rescan", "Rescan Assets", "assets", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      assets_stale_ = true;
+                      return Ok();
+                  }});
+    // The cards as the panel lists them; `pictures` asks for their pictures as the panel does.
+    actions_.Add({"assets.list", "List Assets", "assets", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      if (BoolArg(args, "pictures", false) && !cards_pictures_) {
+                          cards_pictures_ = true;
+                          cards_version_ = ~0ull;
+                      }
+                      RefreshAssets();
+                      json::Value cards = json::Value::Array();
+                      for (const AssetCard& c : ui_state_.assets.cards)
+                          cards.PushBack(Object({{"path", json::Value::Str(c.path)}, {"name", json::Value::Str(c.name)},
+                                                 {"root", json::Value::Str(c.root)}, {"kind", json::Value::Str(c.kind)},
+                                                 {"thumbnail", json::Value::Str(c.thumbnail)}}));
+                      return Ok(Object({{"roots", StrList(ui_state_.assets.roots)}, {"cards", std::move(cards)}}));
+                  },
+                  "", true});
+}
+
+// `paths`, else `path`, else the selection.
+std::vector<std::string> EditorHost::State::TargetPaths(const json::Value& args) const {
+    std::vector<std::string> paths = StrListArg(args, "paths");
+    if (paths.empty() && !StrArg(args, "path").empty()) paths.push_back(StrArg(args, "path"));
+    return paths.empty() ? SelectionPaths() : paths;
+}
+
+// Opens the import wizard on `a`; a file new to it starts from the file's own name.
+ActionResult EditorHost::State::ShowImport(const ImportAnalysis& a, const json::Value& pose) {
+    ImportWizard& w = ui_state_.import;
+    json::Value analysis = AnalysisToJson(a);
+    if (w.path != a.path) {
+        std::snprintf(w.name, sizeof(w.name), "%s", analysis.At("name").AsString().c_str());
+        w.open_as_new = !loaded_;
+    }
+    w.path = a.path;
+    w.analysis = analysis;
+    w.pose = pose;
+    w.add_allowed = loaded_ != nullptr;
+    w.appear = true;
+    return Ok(std::move(analysis));
+}
+
+// Hidden nodes' instances lose their mesh until shown again or the world rebinds.
+void EditorHost::State::ApplyHidden() {
+    render::RenderWorld& rw = loaded_->sim->GetRenderWorld();
+    for (const auto& [index, mesh] : hidden_meshes_) rw.instances[index].mesh_id = mesh;
+    hidden_meshes_.clear();
+    if (!ui_state_.hidden.empty()) {
+        for (uint32_t i = 0; i < rw.InstanceCount(); ++i) {
+            render::RenderInstance& inst = rw.instances[i];
+            if (inst.mesh_id == render::kNoId || !UnderAny(PathOfEntity(inst.entity), ui_state_.hidden)) continue;
+            hidden_meshes_.emplace_back(i, inst.mesh_id);
+            inst.mesh_id = render::kNoId;
+        }
+    }
+    applied_hidden_ = ui_state_.hidden;
+    hidden_stale_ = false;
+}
+
+// The Assets panel's folders: the bundled examples, the document's own, then the user's.
+void EditorHost::State::RefreshAssets() {
+    AssetBrowser& b = ui_state_.assets;
+    if (assets_stale_) {
+        assets_stale_ = false;
+        b.roots.clear();
+        const std::string examples = Resource("examples");
+        if (fs::is_directory(Utf8Path(examples))) b.roots.push_back(NormalPath(examples));
+        if (!doc_path_.empty()) b.roots.push_back(PathText(Utf8Path(doc_path_).parent_path()));
+        b.user_roots = profile_->SettingList("assets", "folders");
+        for (const std::string& r : b.user_roots)
+            if (std::find(b.roots.begin(), b.roots.end(), r) == b.roots.end()) b.roots.push_back(r);
+        asset_files_ = ScanAssets(b.roots);
+        cards_version_ = ~0ull;
+    }
+    // Pictures are drawn on demand, so the cards ask for them once the panel has shown.
+    const bool pictures = cards_pictures_ || b.shown;
+    const uint64_t version = thumbnails_->Version();
+    if (version == cards_version_ && pictures == cards_pictures_) return;
+    cards_version_ = version;
+    cards_pictures_ = pictures;
+    b.cards.clear();
+    for (const AssetFile& f : asset_files_)
+        b.cards.push_back(AssetCard{f.path, f.name, f.root, AssetKindName(f.kind),
+                                    pictures ? thumbnails_->Thumbnail(f) : std::string()});
+    ++b.version;
+}
+
+// The Properties schema follows the selection and every document change.
+void EditorHost::State::RefreshProperties() {
+    if (!loaded_) {
+        if (!ui_state_.properties.empty()) ++ui_state_.properties_version;
+        ui_state_.properties.clear();
+        props_scene_version_ = ~0ull;
+        return;
+    }
+    std::vector<std::string> paths = SelectionPaths();
+    if (paths == props_paths_ && ui_state_.scene_version == props_scene_version_ && doc_.Revision() == props_revision_)
+        return;
+    ui_state_.properties = PropertySchema(loaded_->scene, doc_, paths);
+    ++ui_state_.properties_version;
+    props_paths_ = std::move(paths);
+    props_scene_version_ = ui_state_.scene_version;
+    props_revision_ = doc_.Revision();
+}
+
+// A click picks the body under the pointer, skipping locked nodes; Shift adds or drops it.
+void EditorHost::State::PickSelect(const CameraController& camera, float x, float y) {
+    const SceneViewportRect& rect = ui_.Viewport();
+    const Ray ray = camera.ScreenRay(rect.LocalX(x), rect.LocalY(y), rect.pixels.width, rect.pixels.height);
+    const render::RenderWorld& w = loaded_->sim->GetRenderWorld();
+    const uint32_t hit = PickInstance(ray, w, [&](const render::RenderInstance& inst) {
+        return ui_state_.locked.empty() || !UnderAny(PathOfEntity(inst.entity), ui_state_.locked);
+    });
+    const bool shift = ImGui::GetIO().KeyShift;
+    if (hit == ~0u) {
+        if (!shift) Queue("scene.select", json::Value::Object(), "viewport");
+        return;
+    }
+    const std::string path = PathOfEntity(CarrierOf(loaded_->scene, w.instances[hit].entity));
+    Queue("scene.select", Object({{"path", json::Value::Str(path)}, {"mode", json::Value::Str(shift ? "toggle" : "replace")}}),
+          "viewport");
 }
 
 void EditorHost::State::RegisterSimActions() {
@@ -1883,7 +2312,12 @@ void EditorHost::State::RegisterViewActions() {
                   }});
     actions_.Add({"view.frame_selected", "Frame Selected", "view", "F", ShortcutScope::Viewport, {}, {},
                   [this](const json::Value&) {
-                      return camera_.FrameSelected(ShownWorld(), ui_state_.selected_entity, ui_.Viewport().Aspect())
+                      // A selected node frames with everything under it, as a robot's root holds no geometry.
+                      const std::vector<std::string> roots = SelectionPaths();
+                      std::vector<scene::EntityId> framed;
+                      for (const render::RenderInstance& inst : ShownWorld().instances)
+                          if (UnderAny(PathOfEntity(inst.entity), roots)) framed.push_back(inst.entity);
+                      return camera_.FrameEntities(ShownWorld(), framed, ui_.Viewport().Aspect())
                                  ? Ok()
                                  : ActionResult::Fail("the selection has no geometry to frame");
                   }});
@@ -2012,6 +2446,7 @@ void EditorHost::State::ApplyUnload() {
     policy_ctrl_.reset();
     entity_drag_.Cancel();
     loaded_.reset();
+    hidden_meshes_.clear();
     debug_overlay_.Reset();
     ClearModelUi(ui_state_);
     ++ui_state_.scene_version;
@@ -2026,18 +2461,19 @@ void EditorHost::State::ApplyUnload() {
     start_stale_ = true;
 }
 
-// Seeds the inspector from the selected instance's world pose and material.
+// Seeds the inspector from the selection's live world pose and material.
 void EditorHost::State::SeedInspector(scene::EntityId e) {
     InspectorState& ins = ui_state_.inspector;
     ins = InspectorState{};
     if (!loaded_ || e == scene::kInvalidEntity) return;
-    const render::RenderInstance* inst = InstanceOfEntity(loaded_->sim->GetRenderWorld(), e);
+    const render::RenderInstance* inst = PoseInstance(*loaded_, doc_.Records(), e);
     if (inst == nullptr) return;
     ins.valid   = true;
     ins.movable = IsMovableInstance(*inst, *loaded_);
-    const math::Vec3 p = inst->world_xform.position;
+    const math::Transform world = LiveWorldTransform(loaded_->scene, e, *inst);
+    const math::Vec3 p = world.position;
     ins.pos[0] = p.x; ins.pos[1] = p.y; ins.pos[2] = p.z;
-    const math::Vec3 rd = EulerDegFromQuat(inst->world_xform.rotation);
+    const math::Vec3 rd = EulerDegFromQuat(world.rotation);
     ins.rot_deg[0] = rd.x; ins.rot_deg[1] = rd.y; ins.rot_deg[2] = rd.z;
     const MaterialBinding mb = ResolveMaterial(*loaded_, doc_.Records(), e);
     if (mb.valid) {
@@ -2064,8 +2500,8 @@ void EditorHost::State::ApplyInspectorEdits() {
         if (!xform_gesture_active_) {
             xform_gesture_active_ = true;
             xform_gesture_path_ = PathOfEntity(e);
-            if (const render::RenderInstance* gi = InstanceOfEntity(loaded_->sim->GetRenderWorld(), e))
-                xform_before_ = gi->world_xform;
+            if (const render::RenderInstance* gi = PoseInstance(*loaded_, doc_.Records(), e))
+                xform_before_ = LiveWorldTransform(loaded_->scene, e, *gi);
         }
         ApplyTransformEdit(*loaded_, doc_.Records(), e, edited, /*commit=*/false);
         if (ins.transform_commit) {
@@ -2125,7 +2561,21 @@ void EditorHost::State::Frame(bool step_physics) {
             SDL_RaiseWindow(window);
         }
     }
-    for (const std::string& path : dropped_) Queue("file.open", Object({{"path", json::Value::Str(path)}}), "drop");
+    // A dropped scene opens; any other asset joins the document on the ground where it landed.
+    for (const Dropped& d : dropped_) {
+        if (AssetKindOf(d.path) == AssetKind::Scene) {
+            Queue("file.open", Object({{"path", json::Value::Str(d.path)}}), "drop");
+            continue;
+        }
+        json::Value args = Object({{"path", json::Value::Str(d.path)}, {"mode", json::Value::Str("auto")}});
+        const SceneViewportRect& rect = ui_.Viewport();
+        math::Transform at;
+        if (rect.Contains(d.x, d.y) &&
+            camera_.RayPlaneHit(camera_.ScreenRay(rect.LocalX(d.x), rect.LocalY(d.y), rect.pixels.width, rect.pixels.height),
+                                math::Vec3{0.0f, 0.0f, 0.0f}, math::Vec3{0.0f, 0.0f, 1.0f}, &at.position))
+            args.Set("pose", TransformToJson(at));
+        Queue("file.import", std::move(args), "drop");
+    }
     dropped_.clear();
 
     if (attach_pending_) {
@@ -2264,10 +2714,22 @@ void EditorHost::State::Frame(bool step_physics) {
     if (ui_state_.save_dirty && doc_.Revision() != autosaved_revision_ && Clock::now() >= autosave_due_) Autosave();
     // The lists also feed File > Open Recent, so they stay current while a scene is open.
     ui_state_.start.shown = StartShown();
+    if (ui_state_.start.shown && thumbnails_->Version() != start_thumb_version_) {
+        start_thumb_version_ = thumbnails_->Version();
+        start_stale_ = true;
+    }
     if (start_stale_) {
         RefreshStartPage();
         start_stale_ = false;
     }
+    // The primary selection always leads a selection that holds it.
+    std::vector<scene::EntityId>& selection = ui_state_.selection;
+    if (ui_state_.selected_entity == scene::kInvalidEntity) selection.clear();
+    else if (std::find(selection.begin(), selection.end(), ui_state_.selected_entity) == selection.end())
+        selection = {ui_state_.selected_entity};
+    if (loaded_ && (hidden_stale_ || ui_state_.hidden != applied_hidden_)) ApplyHidden();
+    RefreshAssets();
+    RefreshProperties();
 
     io.DisplaySize = ImVec2(static_cast<float>(present_->Report().width),
                             static_cast<float>(present_->Report().height));
@@ -2283,12 +2745,13 @@ void EditorHost::State::Frame(bool step_physics) {
         } else if (ui_state_.inspector.valid && ui_state_.inspector.movable &&
                    !ui_state_.inspector.transform_changed) {
             if (const render::RenderInstance* inst =
-                    InstanceOfEntity(loaded_->sim->GetRenderWorld(), ui_state_.selected_entity)) {
-                const math::Vec3 p = inst->world_xform.position;
+                    PoseInstance(*loaded_, doc_.Records(), ui_state_.selected_entity)) {
+                const math::Transform world = LiveWorldTransform(loaded_->scene, ui_state_.selected_entity, *inst);
+                const math::Vec3 p = world.position;
                 ui_state_.inspector.pos[0] = p.x;
                 ui_state_.inspector.pos[1] = p.y;
                 ui_state_.inspector.pos[2] = p.z;
-                const math::Vec3 rd = EulerDegFromQuat(inst->world_xform.rotation);
+                const math::Vec3 rd = EulerDegFromQuat(world.rotation);
                 ui_state_.inspector.rot_deg[0] = rd.x;
                 ui_state_.inspector.rot_deg[1] = rd.y;
                 ui_state_.inspector.rot_deg[2] = rd.z;
@@ -2319,9 +2782,8 @@ void EditorHost::State::Frame(bool step_physics) {
     // The gizmo edits the selection's live pose through the inspector's edit seam;
     // one drag (press to release) records one op.
     if (loaded_ && ui_state_.selected_entity != scene::kInvalidEntity && ui_state_.inspector.valid) {
-        if (const render::RenderInstance* gi =
-                InstanceOfEntity(loaded_->sim->GetRenderWorld(), ui_state_.selected_entity)) {
-            const math::Transform pre_drag = gi->world_xform;
+        if (const render::RenderInstance* gi = PoseInstance(*loaded_, doc_.Records(), ui_state_.selected_entity)) {
+            const math::Transform pre_drag = LiveWorldTransform(loaded_->scene, ui_state_.selected_entity, *gi);
             math::Transform gworld = pre_drag;
             bool gizmo_changed = false;
             ui_.DrawGizmo(render_camera, vp_w, vp_h, ui_state_, gworld, gizmo_changed);
@@ -2375,7 +2837,11 @@ void EditorHost::State::Frame(bool step_physics) {
                 if (ev.pressed) {
                     const Ray ray = render_camera.ScreenRay(scene_rect.LocalX(mouse_x), scene_rect.LocalY(mouse_y),
                                                             scene_rect.pixels.width, scene_rect.pixels.height);
-                    const uint32_t hit = PickInstance(ray, sim.GetRenderWorld(), loaded_->Layout());
+                    const WorldLayout& layout = loaded_->Layout();
+                    const uint32_t hit = PickInstance(ray, sim.GetRenderWorld(), [&](const render::RenderInstance& inst) {
+                        return IsMovableSource(inst.pose_source, layout) &&
+                               (ui_state_.locked.empty() || !UnderAny(PathOfEntity(inst.entity), ui_state_.locked));
+                    });
                     entity_drag_.instance = hit;
                     if (hit != ~0u) ui_state_.selected_entity = sim.GetRenderWorld().instances[hit].entity;
                 } else {
@@ -2402,6 +2868,20 @@ void EditorHost::State::Frame(bool step_physics) {
         }
         // The camera never takes input ImGui, a Ctrl-drag or the gizmo owns.
         const bool cam_allow = !over_ui && !scene_ctrl && !ui_state_.gizmo.active;
+        // A left press and release without a drag in between picks.
+        if (loaded_ && ev.type == window::WindowEvent::Type::MouseButton && ev.button == 0u) {
+            if (ev.pressed) {
+                click_armed_ = !over_ui && !scene_ctrl && !ui_state_.gizmo.active;
+                click_x_ = mouse_x;
+                click_y_ = mouse_y;
+            } else if (click_armed_) {
+                click_armed_ = false;
+                PickSelect(render_camera, mouse_x, mouse_y);
+            }
+        } else if (click_armed_ && ev.type == window::WindowEvent::Type::MouseMove &&
+                   std::fabs(mouse_x - click_x_) + std::fabs(mouse_y - click_y_) > kClickSlop) {
+            click_armed_ = false;
+        }
         camera_.HandleEvent(ev, /*allow_drag=*/cam_allow, /*allow_scroll=*/!over_ui && !ui_state_.gizmo.active);
     }
 

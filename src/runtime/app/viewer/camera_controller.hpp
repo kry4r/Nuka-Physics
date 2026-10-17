@@ -28,6 +28,7 @@
 #include "render/window/window_surface.hpp"          // WindowEvent
 
 #include <cstdint>
+#include <vector>
 
 namespace nuka::runtime::app::viewer {
 
@@ -85,6 +86,7 @@ public:
     // Frame actual render geometry, including baked scale, without changing world data.
     bool FrameAll(const render::RenderWorld& world, float aspect = 1.0f);
     bool FrameSelected(const render::RenderWorld& world, scene::EntityId selected, float aspect = 1.0f);
+    bool FrameEntities(const render::RenderWorld& world, const std::vector<scene::EntityId>& entities, float aspect = 1.0f);
 
     // Set the orbit state directly (the --cam override): focus `target`, dolly
     // `distance`, `yaw`/`pitch` in radians. Clamped to the same sane bounds.

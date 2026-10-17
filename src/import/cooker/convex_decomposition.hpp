@@ -61,4 +61,8 @@ ConvexDecompositionResult DecomposeMeshCached(const float* vertices, uint32_t ve
 /// Clear the in-process decomposition memo (test hook).
 void ClearDecompositionMemo();
 
+/// The convex hull of a point cloud with at most `max_vertices` corners, in canonical
+/// vertex order; no triangles when the points span no volume.
+ConvexPiece ComputeConvexHull(const float* vertices, uint32_t vertex_count, uint32_t max_vertices);
+
 } // namespace nuka::import::cooker

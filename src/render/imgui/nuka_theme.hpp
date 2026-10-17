@@ -157,5 +157,17 @@ inline constexpr const char kTemplate[] = "\xEE\x91\xA4";
 inline constexpr const char kExample[] = "\xEE\x9E\x9E";
 inline constexpr const char kDocs[] = "\xEE\x83\xA6";
 inline constexpr const char kSparkle[] = "\xEE\x9A\xA2";
+inline constexpr const char kEyeSlash[] = "\xEE\x88\xA4";
+inline constexpr const char kLockOpen[] = "\xEE\x8C\x8A";
+inline constexpr const char kFolder[] = "\xEE\x89\x8A";
+inline constexpr const char kFolderPlus[] = "\xEE\x89\x98";
+inline constexpr const char kFolderMinus[] = "\xEE\x89\x94";
+inline constexpr const char kShapes[] = "\xEE\xB1\x9E";
+inline constexpr const char kMagicWand[] = "\xEE\x9A\xB6";
+inline constexpr const char kCopy[] = "\xEE\x87\x8A";
+inline constexpr const char kPaste[] = "\xEE\x86\x98";
+inline constexpr const char kGrid[] = "\xEE\x91\xA4";
+inline constexpr const char kHull[] = "\xEE\x9B\x90";
+inline constexpr const char kMeshShape[] = "\xEE\xB1\xBC";
 
 }  // namespace nuka::render::imgui::icon

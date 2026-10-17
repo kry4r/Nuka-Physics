@@ -587,6 +587,13 @@ public:
     // `id` is invalid.
     bool RemoveScript(ScriptId id);
 
+    // Remove one collision shape; later shapes re-densify and <pair> overrides naming it
+    // drop. False when `id` is invalid.
+    bool RemoveShape(ShapeId id);
+    // Add a shape after its body's last one, the id a reload gives it; later shapes and
+    // the <pair> overrides naming them shift up by one.
+    ShapeId InsertCollisionShape(CollisionShapeRecord record);
+
     // -- counts -------------------------------------------------------------
     size_t RigidBodyCount() const;
     size_t JointCount()     const;

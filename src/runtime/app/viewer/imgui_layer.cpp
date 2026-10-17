@@ -11,6 +11,7 @@
 #include "render/imgui/nuka_theme.hpp"
 #include "runtime/app/viewer/camera_controller.hpp"
 #include "runtime/app/viewer/editor_profile.hpp"
+#include "runtime/app/viewer/shell_util.hpp"
 #include "scene/ecs/components.hpp"
 #include "scene/ecs/registry.hpp"
 #include "scene/graph/scene_graph.hpp"
@@ -40,6 +41,7 @@ using nuka::nui::Tone;
 using nuka::nui::Tr;
 using nuka::render::imgui::FontRole;
 using nuka::render::imgui::GetNukaFont;
+using namespace shell;
 
 struct StageKind {
     const char* glyph;
@@ -48,35 +50,6 @@ struct StageKind {
 };
 
 namespace {
-
-ImU32 U32(const ImVec4& c) { return ImGui::GetColorU32(c); }
-
-template <class... T>
-std::string Fmt(const char* format, T... values) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), format, values...);
-    return buf;
-}
-
-json::Value Args(std::initializer_list<std::pair<const char*, json::Value>> items) {
-    json::Value args = json::Value::Object();
-    for (const auto& [key, value] : items) args.Set(key, value);
-    return args;
-}
-
-std::string Lower(std::string_view text) {
-    std::string out(text);
-    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return out;
-}
-
-std::string Upper(std::string_view text) {
-    std::string out(text);
-    for (char& c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    return out;
-}
-
-std::string Iconed(const char* glyph, const char* text) { return std::string(glyph) + "  " + text; }
 
 constexpr std::pair<std::string_view, std::string_view> kKeyNames[] = {{"Equal", "="}, {"Minus", "-"}};
 
@@ -109,10 +82,11 @@ struct PanelSpec {
     const char* glyph;
 };
 const PanelSpec kPanels[] = {{"stage", "Stage", icon::kStage},       {"property", "Properties", icon::kProperty},
-                             {"file", "File", icon::kFile},          {"stats", "Stats", icon::kStats},
-                             {"debug", "Debug", icon::kDebug},       {"camera", "Camera", icon::kCamera},
-                             {"drive", "Drive", icon::kDrive},       {"script", "Script", icon::kScript},
-                             {"console", "Console", icon::kConsole}, {"nui", "UI Inspector", icon::kInspector}};
+                             {"file", "File", icon::kFile},          {"assets", "Assets", icon::kFolder},
+                             {"stats", "Stats", icon::kStats},       {"debug", "Debug", icon::kDebug},
+                             {"camera", "Camera", icon::kCamera},    {"drive", "Drive", icon::kDrive},
+                             {"script", "Script", icon::kScript},    {"console", "Console", icon::kConsole},
+                             {"nui", "UI Inspector", icon::kInspector}};
 
 // Panels per dock column; the first of each column is its selected tab.
 struct LayoutPreset {
@@ -121,11 +95,11 @@ struct LayoutPreset {
     std::vector<const char*> left, right, bottom;
 };
 const LayoutPreset kLayouts[] = {
-    {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"}, {"console", "script", "stats"}},
-    {"debug", "Debug", {"stage"}, {"debug", "stats", "property"}, {"console", "script"}},
-    {"robot", "Robot", {"stage"}, {"drive", "property"}, {"console", "stats"}},
-    {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"console", "script"}},
-    {"training", "Training", {"stats", "stage"}, {"drive", "camera"}, {"console", "script"}},
+    {"authoring", "Authoring", {"stage", "file"}, {"property", "camera"}, {"assets", "console", "script", "stats"}},
+    {"debug", "Debug", {"stage"}, {"debug", "stats", "property"}, {"console", "script", "assets"}},
+    {"robot", "Robot", {"stage"}, {"drive", "property"}, {"console", "stats", "assets"}},
+    {"data", "Data", {"file", "stage"}, {"stats", "camera", "property"}, {"assets", "console", "script"}},
+    {"training", "Training", {"stats", "stage"}, {"drive", "camera"}, {"console", "script", "assets"}},
 };
 
 const LayoutPreset* FindLayout(std::string_view name) {
@@ -166,8 +140,11 @@ const std::vector<MenuSpec>& Menus() {
              {"file"},
              {"file.new", "file.open", "file.open_recent", "file.open_window", "-", "file.import", "-", "file.save",
               "file.save_as", "file.revert", "-", "file.close", "app.exit"}},
-            {"Edit", {"edit"}, {"edit.undo", "edit.redo", "-", "edit.delete"}},
-            {"Create", {"scene"}, {"scene.add_box", "scene.add_sphere", "scene.add_capsule", "scene.add_plane"}},
+            {"Edit", {"edit"}, {"edit.undo", "edit.redo", "-", "edit.delete", "-", "scene.set_visible", "scene.set_locked"}},
+            {"Create",
+             {"scene"},
+             {"scene.add_box", "scene.add_sphere", "scene.add_capsule", "scene.add_plane", "-", "file.import",
+              "scene.collision_dialog"}},
             {"View",
              {"view"},
              {"app.command_palette", "-", "view.frame_all", "view.frame_selected", "view.reset_camera", "-",
@@ -428,8 +405,9 @@ void ImGuiLayer::EnableDocking() {
 const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
     static const std::vector<BuiltinExtension> builtins = {
         {"nuka.stage", "Stage", "The scene tree: select, rename, reparent and spawn.", {"stage"}},
-        {"nuka.properties", "Properties", "Transform and material of the selection.", {"property"}},
+        {"nuka.properties", "Properties", "Transform, material and physics fields of the selection.", {"property"}},
         {"nuka.file", "File", "Open, save and load scenes.", {"file"}},
+        {"nuka.assets", "Assets", "Importable files to drop into the scene or open.", {"assets"}},
         {"nuka.stats", "Stats", "Frame and physics timings.", {"stats"}},
         {"nuka.debug", "Debug Draw", "Collider and contact overlays.", {"debug"}},
         {"nuka.camera", "Camera", "Camera pose, framing and controls.", {"camera"}},
@@ -443,9 +421,9 @@ const std::vector<ImGuiLayer::BuiltinExtension>& ImGuiLayer::Builtins() {
 void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
     using Builder = void (ImGuiLayer::*)(nui::VStack&);
     const Builder builders[] = {&ImGuiLayer::BuildStage,  &ImGuiLayer::BuildProperties, &ImGuiLayer::BuildFile,
-                                &ImGuiLayer::BuildStats,  &ImGuiLayer::BuildDebug,      &ImGuiLayer::BuildCamera,
-                                &ImGuiLayer::BuildDrive,  &ImGuiLayer::BuildScript,     &ImGuiLayer::BuildConsole,
-                                &ImGuiLayer::BuildInspector};
+                                &ImGuiLayer::BuildAssets, &ImGuiLayer::BuildStats,      &ImGuiLayer::BuildDebug,
+                                &ImGuiLayer::BuildCamera, &ImGuiLayer::BuildDrive,      &ImGuiLayer::BuildScript,
+                                &ImGuiLayer::BuildConsole, &ImGuiLayer::BuildInspector};
     const size_t i = static_cast<size_t>(
         std::find_if(std::begin(kPanels), std::end(kPanels), [&](const PanelSpec& p) { return panel_id == p.id; }) -
         std::begin(kPanels));
@@ -459,6 +437,7 @@ void ImGuiLayer::AddBuiltinPanel(const std::string& panel_id) {
         panel.key = [this] {
             return static_cast<uint64_t>(frame_.ui->drive_targets.size()) * 7919u + frame_.ui->dof_labels.size();
         };
+    if (panel_id == "property") panel.key = [this] { return frame_.ui->properties_version * 1000003u + staged_version_; };
 }
 
 void ImGuiLayer::RemoveBuiltinPanel(const std::string& panel_id) {
@@ -549,7 +528,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"script.attach", icon::kScriptNode}, {"script.load", icon::kFile},           {"sim.toggle_play", icon::kPlay},
         {"sim.step", icon::kStep},          {"sim.reset", icon::kReset},              {"view.frame_all", icon::kFrame},
         {"view.frame_selected", icon::kTarget}, {"view.reset_camera", icon::kHome},   {"view.colliders", icon::kCollider},
-        {"view.contacts", icon::kAtom},     {"view.hide_overlays", icon::kVisual},    {"view.screenshot", icon::kCamera}};
+        {"view.contacts", icon::kAtom},     {"view.hide_overlays", icon::kVisual},    {"view.screenshot", icon::kCamera},
+        {"file.import", icon::kImport},     {"scene.collision_dialog", icon::kHull},  {"scene.set_visible", icon::kEyeSlash},
+        {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
     for (const char* id : {"edit.apply", "edit.rename", "edit.reparent", "scene.spawn", "scene.select", "sim.play",
                            "sim.pause", "sim.speed", "view.stats", "file.unload", "file.open_recent", "file.forget_recent",
@@ -720,13 +701,43 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
     stage_tree_ = &tree;
     tree.filter = nui::Bind<std::string>([this] { return std::string(stage_filter_); });
     tree.is_selected = [this](uint64_t item) {
+        const std::vector<nuka::scene::EntityId>& sel = frame_.ui->selection;
         const nuka::scene::EntityId e = stage_items_->Entity(item);
-        return e != nuka::scene::kInvalidEntity && e == frame_.ui->selected_entity;
+        return e != nuka::scene::kInvalidEntity && std::find(sel.begin(), sel.end(), e) != sel.end();
     };
-    tree.on_select = [this](uint64_t item) {
-        frame_.ui->selected_entity = stage_items_->Entity(item);
-        revealed_ = frame_.ui->selected_entity;
+    // A row clicked here is already in view, so the selection it makes needs no reveal.
+    const auto select = [this](uint64_t item, const char* mode) {
+        revealed_ = stage_items_->Entity(item);
+        Queue("scene.select", Args({{"path", json::Value::Str(stage_items_->Path(item))}, {"mode", json::Value::Str(mode)}}));
     };
+    tree.on_select = [select](uint64_t item) { select(item, "replace"); };
+    tree.on_toggle = [select](uint64_t item) { select(item, "toggle"); };
+    tree.on_range = [this](const std::vector<uint64_t>& items) {
+        json::Value paths = json::Value::Array();
+        for (const uint64_t item : items) paths.PushBack(json::Value::Str(stage_items_->Path(item)));
+        revealed_ = stage_items_->Entity(items.back());
+        Queue("scene.select", Args({{"path", json::Value::Str(stage_items_->Path(items.back()))},
+                                    {"mode", json::Value::Str("range")},
+                                    {"paths", std::move(paths)}}));
+    };
+    tree.on_rename = [this](uint64_t item, const std::string& name) {
+        Queue("edit.rename", Args({{"path", json::Value::Str(stage_items_->Path(item))}, {"name", json::Value::Str(name)}}));
+    };
+    const auto listed = [this](const std::vector<std::string>& list, uint64_t item) {
+        return std::find(list.begin(), list.end(), stage_items_->Path(item)) != list.end();
+    };
+    tree.is_dimmed = [this, listed](uint64_t item) { return listed(frame_.ui->hidden, item); };
+    tree.row_tools = {
+        {icon::kEyeSlash, icon::kVisual, "Show/Hide", [this, listed](uint64_t item) { return listed(frame_.ui->hidden, item); },
+         [this, listed](uint64_t item) {
+             Queue("scene.set_visible", Args({{"path", json::Value::Str(stage_items_->Path(item))},
+                                              {"value", json::Value::Bool(listed(frame_.ui->hidden, item))}}));
+         }},
+        {icon::kLock, icon::kLockOpen, "Lock/Unlock", [this, listed](uint64_t item) { return listed(frame_.ui->locked, item); },
+         [this, listed](uint64_t item) {
+             Queue("scene.set_locked", Args({{"path", json::Value::Str(stage_items_->Path(item))},
+                                             {"value", json::Value::Bool(!listed(frame_.ui->locked, item))}}));
+         }}};
     tree.on_activate = [this](uint64_t) { Queue("view.frame_selected"); };
     tree.on_drop = [this](uint64_t dragged, uint64_t onto) {
         Queue("edit.reparent", Args({{"path", json::Value::Str(stage_items_->Path(dragged))},
@@ -757,6 +768,13 @@ void ImGuiLayer::BuildStage(nui::VStack& root) {
             ImGui::EndMenu();
         }
         if (ImGui::MenuItemEx(Tr("Frame"), icon::kTarget, "F")) Queue("view.frame_selected");
+        if (ImGui::MenuItemEx(Tr("Generate Collision..."), icon::kHull)) {
+            const std::vector<nuka::scene::EntityId>& sel = ui.selection;
+            if (std::find(sel.begin(), sel.end(), stage_items_->Entity(item)) == sel.end())
+                Queue("scene.select", Args({{"path", json::Value::Str(path)}}));
+            Queue("scene.collision_dialog");
+        }
+        if (ImGui::MenuItemEx(Tr("Import Asset..."), icon::kImport)) Queue("file.import");
         if (ImGui::MenuItemEx(Tr("Delete subtree"), icon::kTrash, "Delete"))
             Queue("edit.delete", Args({{"path", json::Value::Str(path)}}));
     };
@@ -768,8 +786,7 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     InspectorState& ins = frame_.ui->inspector;
     GizmoState* gz = &frame_.ui->gizmo;
 
-    auto& none = root.Add<nui::Label>("Nothing selected. Click a node in the Stage, or Ctrl+click a body in the viewport.",
-                                      Tone::Dim);
+    auto& none = root.Add<nui::Label>("Nothing selected. Click a node in the Stage or a body in the viewport.", Tone::Dim);
     none.wrap = true;
     none.visible_if = [selected] { return !selected(); };
 
@@ -790,7 +807,7 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
     auto& bare = root.Add<nui::Label>("No editable geometry", Tone::Dim);
     bare.visible_if = [this, selected] { return selected() && !frame_.ui->inspector.valid; };
 
-    auto& transform = root.Add<nui::Collapsible>("Transform", true, icon::kMove);
+    auto& transform = Fold(root.Add<nui::Collapsible>("Transform", true, icon::kMove), "transform");
     transform.visible_if = editable;
     auto& tgrid = transform.Add<nui::PropertyGrid>();
     auto& position = tgrid.Add<nui::Vec3Field>("Position", Floats3(ins.pos), 0.01f);
@@ -803,7 +820,7 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
         f->on_commit = [this](const nui::Vec3&, const nui::Vec3&) { frame_.ui->inspector.transform_commit = true; };
     }
 
-    auto& gizmo = root.Add<nui::Collapsible>("Gizmo", false, icon::kGizmo);
+    auto& gizmo = Fold(root.Add<nui::Collapsible>("Gizmo", false, icon::kGizmo), "gizmo");
     gizmo.visible_if = editable;
     auto& modes = gizmo.Add<nui::HStack>();
     auto& op = modes.Add<nui::Segmented>(std::vector<std::string>{"Move", "Rotate"},
@@ -824,7 +841,7 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
                                    }),
                                0.01f);
 
-    auto& material = root.Add<nui::Collapsible>("Material", true, icon::kPalette);
+    auto& material = Fold(root.Add<nui::Collapsible>("Material", true, icon::kPalette), "material");
     material.visible_if = [this, editable] { return editable() && frame_.ui->inspector.has_material; };
     auto& mgrid = material.Add<nui::PropertyGrid>();
     auto& base = mgrid.Add<nui::ColorField>("Base color", Floats4(ins.base_color), true, false);
@@ -845,6 +862,7 @@ void ImGuiLayer::BuildProperties(nui::VStack& root) {
         f->on_change = [this](const nui::Color&) { frame_.ui->inspector.material_changed = true; };
         f->on_commit = [this](const nui::Color&, const nui::Color&) { frame_.ui->inspector.material_commit = true; };
     }
+    BuildFieldGroups(root);
 }
 
 void ImGuiLayer::BuildFile(nui::VStack& root) {
@@ -1130,6 +1148,7 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
     frame_ = Frame{&world, &stats, &camera, &ui_state, scene};
     viewport_ = {};
     viewport_hovered_ = false;
+    ui_state.assets.shown = false;
     InspectorState& ins = ui_state.inspector;
     ins.transform_changed = ins.transform_commit = ins.material_changed = ins.material_commit = false;
     if (ui_state.drive_dirty.size() != ui_state.drive_targets.size())
@@ -1211,9 +1230,12 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         // Under every window, so popups, the palette and modals stay on top.
         if (!ui_state.start.shown) host_.DrawNotifications(ImGui::GetBackgroundDrawList(), vmin, vmax);
     }
+    if (!ui_state.start.shown) DrawAssetDrop();
     DrawStartPage();
     DrawPalette();
     DrawAbout();
+    DrawImportWizard();
+    DrawCollisionDialog();
     DrawPrompt();
 }
 
@@ -1288,14 +1310,12 @@ void ImGuiLayer::DrawMenuBar() {
                 separator = any;
                 continue;
             }
-            // Open Recent lists the recent scenes; Import arrives with the importers.
-            if (id == "file.open_recent" || id == "file.import") {
+            // Open Recent lists the recent scenes.
+            if (id == "file.open_recent") {
                 if (separator) ImGui::Separator();
                 separator = false;
                 const std::vector<StartEntry>& recent = frame_.ui->start.recent;
-                const bool recent_menu = id == "file.open_recent";
-                if (ImGui::BeginMenuEx(Tr(recent_menu ? "Open Recent" : "Import"), recent_menu ? icon::kRecent : icon::kImport,
-                                       recent_menu && !recent.empty())) {
+                if (ImGui::BeginMenuEx(Tr("Open Recent"), icon::kRecent, !recent.empty())) {
                     for (const StartEntry& r : recent)
                         if (ImGui::MenuItemEx(r.title.c_str(), nullptr, nullptr, false, r.available))
                             Queue("file.open_recent", Args({{"path", json::Value::Str(r.arg)}}));
@@ -1669,23 +1689,10 @@ void ImGuiLayer::DrawAbout() {
 
 namespace {
 
-// `text`, or as much of it as fits in `width` behind or ahead of an ellipsis.
-std::string Elide(ImFont* font, float px, const std::string& text, float width, bool keep_tail) {
-    const auto fits = [&](const std::string& t) { return font->CalcTextSizeA(px, FLT_MAX, 0.0f, t.c_str()).x <= width; };
-    if (fits(text)) return text;
-    for (size_t n = 1; n < text.size(); ++n) {
-        const size_t i = keep_tail ? n : text.size() - n;
-        if ((static_cast<unsigned char>(text[i]) & 0xC0u) == 0x80u) continue;
-        const std::string t = keep_tail ? "\xE2\x80\xA6" + text.substr(i) : text.substr(0, i) + "\xE2\x80\xA6";
-        if (fits(t)) return t;
-    }
-    return "\xE2\x80\xA6";
-}
-
-// One line of the start page: an icon, a title, an optional dim second line and a trailing
-// note. True when clicked.
+// One line of the start page: an icon or a picture, a title, an optional dim second line and a
+// trailing note. True when clicked.
 bool StartRow(const char* id, const char* glyph, const std::string& title, const std::string& detail, const std::string& note,
-              bool enabled, const ImVec4& tint = theme::kFgMuted) {
+              bool enabled, const ImVec4& tint = theme::kFgMuted, ImTextureData* picture = nullptr) {
     const float s = nui::Scale();
     ImDrawList* list = ImGui::GetWindowDrawList();
     ImFont* body = ImGui::GetFont();
@@ -1705,9 +1712,17 @@ bool StartRow(const char* id, const char* glyph, const std::string& title, const
         list->AddRectFilled(p, ImVec2(p.x + 2.0f * s, p.y + h), U32(theme::kAccent));
     }
     const float top = p.y + 7.0f * s;
-    draw::Glyph(list, ImVec2(p.x + 16.0f * s, top + line * 0.5f), glyph, U32(!enabled ? theme::kFgDim : hot ? theme::kAccent : tint),
-                hot, 16.0f);
-    const float x = p.x + 34.0f * s, right = p.x + w - 10.0f * s;
+    float x = p.x + 34.0f * s;
+    if (picture != nullptr) {
+        const ImVec2 a(p.x + 8.0f * s, p.y + 5.0f * s), b(a.x + (h - 10.0f * s) * 16.0f / 9.0f, p.y + h - 5.0f * s);
+        list->AddImage(picture->GetTexRef(), a, b);
+        list->AddRect(a, b, U32(hot ? theme::kAccent : theme::kLine));
+        x = b.x + 10.0f * s;
+    } else {
+        draw::Glyph(list, ImVec2(p.x + 16.0f * s, top + line * 0.5f), glyph,
+                    U32(!enabled ? theme::kFgDim : hot ? theme::kAccent : tint), hot, 16.0f);
+    }
+    const float right = p.x + w - 10.0f * s;
     float note_w = 0.0f;
     if (!note.empty()) {
         const ImVec2 size = mono->CalcTextSizeA(mono_px, FLT_MAX, 0.0f, note.c_str());
@@ -1796,7 +1811,8 @@ void ImGuiLayer::DrawStartPage() {
         draw::SectionHeader(Tr("Open"));
         if (StartRow("open", icon::kOpen, Tr("Open Scene..."), "", keys("file.open"), true)) Queue("file.open");
         if (StartRow("window", icon::kNewWindow, Tr("Open in New Window..."), "", "", true)) Queue("file.open_window");
-        StartRow("import", icon::kImport, Tr("Import"), Tr("URDF, MJCF and USD open as untitled scenes"), Tr("SOON"), false);
+        if (StartRow("import", icon::kImport, Tr("Import Asset..."), Tr("URDF, MJCF, USD and mesh files"), keys("file.import"), true))
+            Queue("file.import");
         ImGui::EndChild();
 
         ImGui::SameLine(0.0f, gap);
@@ -1883,11 +1899,12 @@ void ImGuiLayer::DrawStartPage() {
         ImGui::BeginChild("##start_more", ImVec2(side, column_h));
         draw::SectionHeader(Tr("Examples"));
         for (const StartEntry& e : page.examples)
-            if (StartRow(e.arg.c_str(), icon::kExample, Tr(e.title), "", e.detail, e.available))
+            if (StartRow(e.arg.c_str(), icon::kExample, Tr(e.title), "", e.detail, e.available, theme::kFgMuted,
+                         e.thumbnail.empty() ? nullptr : Thumbnail(e.thumbnail)))
                 Queue("file.open", path_args(e.arg));
         ImGui::EndChild();
 
-        const std::string drop = Iconed(icon::kImport, Tr("Drop a .nks, .urdf, .xml or .usd file anywhere to open it"));
+        const std::string drop = Iconed(icon::kImport, Tr("Drop a scene to open it, or an asset to add it"));
         const float foot_y = corner.y - 26.0f * s - line, foot_mid = foot_y + line * 0.5f;
         ImGui::SetCursorScreenPos(ImVec2(rule.x, foot_y));
         ImGui::TextColored(theme::kFgDim, "%s", drop.c_str());

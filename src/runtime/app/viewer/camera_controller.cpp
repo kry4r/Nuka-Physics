@@ -15,14 +15,14 @@ namespace nuka::runtime::app::viewer {
 
 namespace {
 
-bool RenderBounds(const render::RenderWorld& world, const scene::EntityId* selected,
+bool RenderBounds(const render::RenderWorld& world, const std::vector<scene::EntityId>* entities,
                   math::Vec3& lo, math::Vec3& hi) {
     const float limit = std::numeric_limits<float>::max();
     lo = {limit, limit, limit};
     hi = {-limit, -limit, -limit};
     bool found = false;
     for (const auto& instance : world.instances) {
-        if (selected && instance.entity != *selected) continue;
+        if (entities && std::find(entities->begin(), entities->end(), instance.entity) == entities->end()) continue;
         if (instance.mesh_id >= world.meshes.Count()) continue;
         const auto& positions = world.meshes.Geometry(instance.mesh_id).positions;
         for (size_t i = 0; i + 2u < positions.size(); i += 3u) {
@@ -243,8 +243,12 @@ bool CameraController::FrameAll(const render::RenderWorld& world, float aspect) 
 
 bool CameraController::FrameSelected(const render::RenderWorld& world, scene::EntityId selected, float aspect) {
     if (selected == scene::kInvalidEntity) return false;
+    return FrameEntities(world, {selected}, aspect);
+}
+
+bool CameraController::FrameEntities(const render::RenderWorld& world, const std::vector<scene::EntityId>& entities, float aspect) {
     math::Vec3 lo, hi;
-    return RenderBounds(world, &selected, lo, hi) && FramePreservingView(lo, hi, aspect);
+    return RenderBounds(world, &entities, lo, hi) && FramePreservingView(lo, hi, aspect);
 }
 
 bool CameraController::UseSceneCamera(const render::RenderWorld& world, float viewport_aspect, float reference_aspect) {

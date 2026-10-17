@@ -11,10 +11,17 @@ namespace {
 template <class Record>
 struct Field {
     const char* name;
-    float Record::*member;
+    float Record::*member = nullptr;
+    // A vector component: (record.*vec).*axis, named "<vector>.<x|y|z>".
+    math::Vec3 Record::*vec = nullptr;
+    float math::Vec3::*axis = nullptr;
 };
 
-constexpr Field<RigidBodyRecord> kBodyFields[] = {{"mass", &RigidBodyRecord::mass}};
+constexpr Field<RigidBodyRecord> kBodyFields[] = {
+    {"mass", &RigidBodyRecord::mass},
+    {"inertia.x", nullptr, &RigidBodyRecord::inertia, &math::Vec3::x},
+    {"inertia.y", nullptr, &RigidBodyRecord::inertia, &math::Vec3::y},
+    {"inertia.z", nullptr, &RigidBodyRecord::inertia, &math::Vec3::z}};
 constexpr Field<JointRecord> kJointFields[] = {
     {"damping", &JointRecord::damping},         {"armature", &JointRecord::armature},
     {"stiffness", &JointRecord::stiffness},     {"frictionloss", &JointRecord::frictionloss},
@@ -24,14 +31,23 @@ constexpr Field<ActuatorRecord> kActuatorFields[] = {
 constexpr Field<CollisionShapeRecord> kShapeFields[] = {
     {"friction_mu", &CollisionShapeRecord::friction_mu}, {"radius", &CollisionShapeRecord::radius},
     {"half_height", &CollisionShapeRecord::half_height}, {"margin", &CollisionShapeRecord::margin},
-    {"gap", &CollisionShapeRecord::gap}};
+    {"gap", &CollisionShapeRecord::gap},
+    {"half_extents.x", nullptr, &CollisionShapeRecord::half_extents, &math::Vec3::x},
+    {"half_extents.y", nullptr, &CollisionShapeRecord::half_extents, &math::Vec3::y},
+    {"half_extents.z", nullptr, &CollisionShapeRecord::half_extents, &math::Vec3::z}};
 constexpr Field<MaterialRecord> kMaterialFields[] = {{"friction_mu", &MaterialRecord::friction_mu}};
 
 template <class Record, size_t N>
-float Record::*Member(const Field<Record> (&fields)[N], std::string_view name) {
+const Field<Record>* Member(const Field<Record> (&fields)[N], std::string_view name) {
     for (const Field<Record>& f : fields)
-        if (name == f.name) return f.member;
+        if (name == f.name) return &f;
     return nullptr;
+}
+
+// The float a field names in `rec`, const when the record is.
+template <class R, class Record>
+auto& Slot(R& rec, const Field<Record>* f) {
+    return f->member != nullptr ? rec.*(f->member) : (rec.*(f->vec)).*(f->axis);
 }
 
 enum class Kind : uint8_t { Body, Joint, Actuator, Shape, Material };
@@ -109,11 +125,11 @@ bool GetSceneField(const SceneIR& scene, const SceneTarget& target, std::string_
     const std::vector<uint32_t> ids = Reach(scene, target, s);
     if (ids.empty()) return false;
     switch (s.kind) {
-        case Kind::Body: *value = scene.GetBody(ids[0]).*Member(kBodyFields, s.name); break;
-        case Kind::Joint: *value = scene.GetJoint(ids[0]).*Member(kJointFields, s.name); break;
-        case Kind::Actuator: *value = scene.GetActuator(ids[0]).*Member(kActuatorFields, s.name); break;
-        case Kind::Shape: *value = scene.GetShape(ids[0]).*Member(kShapeFields, s.name); break;
-        case Kind::Material: *value = scene.GetMaterial(ids[0]).*Member(kMaterialFields, s.name); break;
+        case Kind::Body: *value = Slot(scene.GetBody(ids[0]), Member(kBodyFields, s.name)); break;
+        case Kind::Joint: *value = Slot(scene.GetJoint(ids[0]), Member(kJointFields, s.name)); break;
+        case Kind::Actuator: *value = Slot(scene.GetActuator(ids[0]), Member(kActuatorFields, s.name)); break;
+        case Kind::Shape: *value = Slot(scene.GetShape(ids[0]), Member(kShapeFields, s.name)); break;
+        case Kind::Material: *value = Slot(scene.GetMaterial(ids[0]), Member(kMaterialFields, s.name)); break;
     }
     return true;
 }
@@ -124,11 +140,11 @@ bool SetSceneField(SceneIR& scene, const SceneTarget& target, std::string_view f
     const std::vector<uint32_t> ids = Reach(scene, target, s);
     for (const uint32_t id : ids) {
         switch (s.kind) {
-            case Kind::Body: scene.GetBodyMut(id).*Member(kBodyFields, s.name) = value; break;
-            case Kind::Joint: scene.GetJointMut(id).*Member(kJointFields, s.name) = value; break;
-            case Kind::Actuator: scene.GetActuatorMut(id).*Member(kActuatorFields, s.name) = value; break;
-            case Kind::Shape: scene.GetShapeMut(id).*Member(kShapeFields, s.name) = value; break;
-            case Kind::Material: scene.GetMaterialMut(id).*Member(kMaterialFields, s.name) = value; break;
+            case Kind::Body: Slot(scene.GetBodyMut(id), Member(kBodyFields, s.name)) = value; break;
+            case Kind::Joint: Slot(scene.GetJointMut(id), Member(kJointFields, s.name)) = value; break;
+            case Kind::Actuator: Slot(scene.GetActuatorMut(id), Member(kActuatorFields, s.name)) = value; break;
+            case Kind::Shape: Slot(scene.GetShapeMut(id), Member(kShapeFields, s.name)) = value; break;
+            case Kind::Material: Slot(scene.GetMaterialMut(id), Member(kMaterialFields, s.name)) = value; break;
         }
     }
     return !ids.empty();

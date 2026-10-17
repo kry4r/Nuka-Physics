@@ -88,10 +88,16 @@ public:
     size_t UndoDepth() const { return undo_.size(); }
     size_t RedoDepth() const { return redo_.size(); }
     const EntityRecordIndex& Records() const { return records_; }
-    void MarkSaved() { saved_ = StateId(); }
+    void MarkSaved();
     // A recovered document differs from its file until it is saved.
     void MarkUnsaved() { saved_ = ~0ull; }
     bool Dirty() const { return StateId() != saved_; }
+    // The scene as last saved or opened, for per-field changed marks and reverts.
+    const scene::SceneIR& Saved() const { return saved_scene_; }
+    // True when editing `field` on `target` reaches the running world without a rebuild.
+    bool LiveField(const std::string& target, const std::string& field) const;
+    const std::vector<nuka_param_info_t>& Params() const { return infos_; }
+    const std::vector<double>& WorldValues() const { return world_values_; }
     uint64_t Revision() const { return revision_; }
     void AddBranch(TimelineBranch branch) { branches_.push_back(std::move(branch)); }
     const std::vector<TimelineBranch>& Branches() const { return branches_; }
@@ -132,6 +138,7 @@ private:
     std::vector<TimelineBranch> branches_;
     std::vector<nuka_param_info_t> infos_;
     std::vector<double> world_values_;
+    scene::SceneIR saved_scene_;
     uint64_t next_id_ = 0u;
     uint64_t saved_ = 0u;
     uint64_t revision_ = 0u;
