@@ -152,8 +152,8 @@ void StatusDot(Tone tone, bool pulse = false);
 bool IconButton(const char* id, const char* glyph, bool checked = false, const char* tooltip = nullptr,
                 Tone tone = Tone::Normal);
 void ThinProgress(float fraction, float width, Tone tone = Tone::Accent);
-// Corner brackets and a HUD chip over the scene viewport.
-void ViewportFrame(const ImVec2& min, const ImVec2& max, const std::vector<std::string>& hud);
+// Corner brackets and HUD chips over the scene viewport, the chips `hud_top` lower.
+void ViewportFrame(const ImVec2& min, const ImVec2& max, const std::vector<std::string>& hud, float hud_top = 0.0f);
 // A small toggle chip; true when clicked.
 bool Chip(const char* id, const std::string& text, bool on);
 }  // namespace draw

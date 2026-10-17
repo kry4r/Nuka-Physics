@@ -251,9 +251,10 @@ bool CameraController::FrameEntities(const render::RenderWorld& world, const std
     return RenderBounds(world, &entities, lo, hi) && FramePreservingView(lo, hi, aspect);
 }
 
-bool CameraController::UseSceneCamera(const render::RenderWorld& world, float viewport_aspect, float reference_aspect) {
-    if (world.cameras.empty()) return false;
-    const auto& authored = world.cameras.front();
+bool CameraController::UseSceneCamera(const render::RenderWorld& world, float viewport_aspect, float reference_aspect,
+                                      size_t index) {
+    if (index >= world.cameras.size()) return false;
+    const auto& authored = world.cameras[index];
     const float distance = authored.focus_distance;
     const auto offset = authored.world_xform.TransformDirection({0.0f, 0.0f, 1.0f});
     const auto target = authored.world_xform.position - offset * distance;

@@ -298,7 +298,7 @@ void ThinProgress(float fraction, float width, Tone tone) {
     ImGui::Dummy(ImVec2(width, h));
 }
 
-void ViewportFrame(const ImVec2& min, const ImVec2& max, const std::vector<std::string>& hud) {
+void ViewportFrame(const ImVec2& min, const ImVec2& max, const std::vector<std::string>& hud, float hud_top) {
     const float s = Scale();
     ImDrawList* list = ImGui::GetBackgroundDrawList();
     const float inset = 8.0f * s, arm = 14.0f * s, t = 1.5f * s;
@@ -315,7 +315,7 @@ void ViewportFrame(const ImVec2& min, const ImVec2& max, const std::vector<std::
     ImFont* font = GetNukaFont(FontRole::Display);
     const float px = theme::kFontLabel * s;
     float x = a.x + 10.0f * s;
-    const float y = a.y + 8.0f * s;
+    const float y = a.y + 8.0f * s + hud_top;
     for (const std::string& chip : hud) {
         const ImVec2 size = font->CalcTextSizeA(px, FLT_MAX, 0.0f, chip.c_str());
         const ImVec2 c0(x, y), c1(x + size.x + 12.0f * s, y + size.y + 8.0f * s);

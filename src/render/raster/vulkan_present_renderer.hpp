@@ -90,6 +90,9 @@ struct PickResult {
     std::vector<uint32_t> instances;     // every instance in the region, ascending
 };
 
+// The most scene views one DrawViews frame draws.
+inline constexpr uint32_t kMaxSceneViews = 4u;
+
 class PresentRenderer {
 public:
     // Construct from a window surface (ownership transferred). Stands up the
@@ -112,6 +115,11 @@ public:
                                  const RasterOptions& options = {},
                                  const OverlayRecordFn& overlay = {},
                                  const PresentInterop* interop = nullptr);
+
+    // DrawFrame over up to kMaxSceneViews views, each into its own scene_viewport; the
+    // first view's background, instance flags and outline colours apply to the frame.
+    PresentFrameResult DrawViews(const RenderWorld& world, const std::vector<RasterOptions>& views,
+                                 const OverlayRecordFn& overlay, const PresentInterop* interop = nullptr);
 
     // Builds the instanced pipeline against the pose slots' set layout (set 1); null
     // drops it. The caller keeps the layout alive while it is installed.

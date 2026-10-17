@@ -152,6 +152,7 @@ const std::vector<MenuSpec>& Menus() {
             {"View",
              {"view"},
              {"app.command_palette", "-", "view.frame_all", "view.frame_selected", "view.reset_camera", "-",
+              "view.layout_single", "view.layout_split", "view.layout_quad", "view.maximize", "-",
               "view.colliders", "view.contacts", "view.hide_overlays", "-", "scene.expand_all", "scene.collapse_all", "-",
               "view.ui_scale_up", "view.ui_scale_down", "view.ui_scale_reset", "view.toggle_language", "-", "view.screenshot"}},
             {"Simulation",
@@ -541,6 +542,9 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
         {"file.import", icon::kImport},     {"scene.collision_dialog", icon::kHull},  {"scene.set_visible", icon::kEyeSlash},
         {"scene.set_locked", icon::kLock},  {"assets.add_folder", icon::kFolderPlus}, {"assets.rescan", icon::kReset}};
     for (const auto& [id, glyph] : icons) registry.Decorate(id, glyph, false);
+    for (const auto& [id, glyph] : {std::pair{"view.layout_single", icon::kViewSingle}, std::pair{"view.layout_split", icon::kViewSplit},
+                                    std::pair{"view.layout_quad", icon::kViewQuad}, std::pair{"view.maximize", icon::kMaximize}})
+        registry.Decorate(id, glyph, false);
     for (const auto& [id, glyph] : {std::pair{"solver.telemetry", icon::kPlot}, std::pair{"solver.heatmap", icon::kPalette},
                                     std::pair{"solver.locate", icon::kTarget}, std::pair{"timeline.fork", icon::kFork},
                                     std::pair{"timeline.ghost", icon::kGhost}, std::pair{"timeline.clear", icon::kTrash}})
@@ -559,7 +563,8 @@ void ImGuiLayer::RegisterActions(ActionRegistry& registry) {
                            "file.recover", "file.autosave", "app.answer_prompt", "app.check", "solver.status",
                            "solver.records", "solver.set_iterations", "window.restore", "window.state", "timeline.status",
                            "timeline.seek", "timeline.branch", "timeline.rename", "timeline.configure", "timeline.hash",
-                           "sim.perturb", "sim.grab_particle", "sim.release", "sim.loads"})
+                           "sim.perturb", "sim.grab_particle", "sim.release", "sim.loads", "view.layout", "view.view",
+                           "view.views"})
         registry.Decorate(id, "", true);
     registry.Rebind("file.open", "Ctrl+O");
     registry.Rebind("file.save", "Ctrl+S");
@@ -1427,20 +1432,37 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
         framebuffer_width = static_cast<uint32_t>(std::max(io.DisplaySize.x * io.DisplayFramebufferScale.x, 0.0f));
     if (framebuffer_height == ~uint32_t(0))
         framebuffer_height = static_cast<uint32_t>(std::max(io.DisplaySize.y * io.DisplayFramebufferScale.y, 0.0f));
+    // The shown panes split the central node a divider apart, in rows; the active one is the viewport.
+    pane_rects_ = {};
+    const size_t pane_count = ui_state.panes.size();
+    const size_t cols = pane_count > 1u ? 2u : 1u, rows = pane_count > 2u ? 2u : 1u;
+    const float gap = pane_count > 1u ? 2.0f * nui::Scale() : 0.0f;
+    ImVec2 cmin, cmax, pane;
     if (central != nullptr) {
         const ImGuiViewport* main = ImGui::GetMainViewport();
-        viewport_ = SceneViewportRect::FromLogical(central->Pos.x, central->Pos.y, central->Size.x, central->Size.y,
-                                                  main->Pos.x, main->Pos.y, io.DisplayFramebufferScale.x,
-                                                  io.DisplayFramebufferScale.y, framebuffer_width, framebuffer_height);
+        cmin = central->Pos;
+        cmax = ImVec2(central->Pos.x + central->Size.x, central->Pos.y + central->Size.y);
+        pane = ImVec2((central->Size.x - gap * static_cast<float>(cols - 1u)) / static_cast<float>(cols),
+                      (central->Size.y - gap * static_cast<float>(rows - 1u)) / static_cast<float>(rows));
+        for (size_t k = 0; k < pane_count; ++k)
+            pane_rects_[ui_state.panes[k].index] = SceneViewportRect::FromLogical(
+                cmin.x + static_cast<float>(k % cols) * (pane.x + gap), cmin.y + static_cast<float>(k / cols) * (pane.y + gap),
+                pane.x, pane.y, main->Pos.x, main->Pos.y, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y,
+                framebuffer_width, framebuffer_height);
+        viewport_ = pane_rects_[ui_state.active_view];
     }
     const ImVec2 mouse = ImGui::GetMousePos();
-    viewport_hovered_ = viewport_.Valid() && ui_state.window_focused && !ui_state.layout_modifier_down &&
-                        !io.WantCaptureMouse && viewport_.Contains(mouse.x, mouse.y);
+    pointer_free_ = ui_state.window_focused && !ui_state.layout_modifier_down && !io.WantCaptureMouse;
+    viewport_hovered_ = pointer_free_ && viewport_.Contains(mouse.x, mouse.y);
+    hovered_pane_ = -1;
+    for (uint32_t i = 0; i < kViewPanes; ++i)
+        if (pointer_free_ && pane_rects_[i].Contains(mouse.x, mouse.y)) hovered_pane_ = static_cast<int>(i);
 
     if (viewport_.Valid()) {
         const ImVec2 vmin(viewport_.x, viewport_.y), vmax(viewport_.x + viewport_.width, viewport_.y + viewport_.height);
         if (ui_state.has_scene) {
             DrawRtImage(vmin, vmax);
+            if (pane_count > 1u) DrawPaneHeaders(cmin, cmax, pane, gap);
             std::vector<std::string> hud = {Fmt(Tr("FOV %.0f\xC2\xB0"), camera.fov_degrees),
                                             Tr(ui_state.playing ? "LIVE" : "PAUSED"),
                                             Fmt(Tr("TICK %llu"), static_cast<unsigned long long>(stats.sim_ticks))};
@@ -1448,7 +1470,11 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
             if (rt.on)
                 hud.push_back(rt.converged ? Fmt(Tr("RT %u SPP"), rt.spp) + " " + icon::kOk
                                            : Fmt(Tr("RT %u/%u SPP"), rt.spp, rt.max_spp));
-            draw::ViewportFrame(vmin, vmax, hud);
+            for (const ViewPane& p : ui_state.panes)
+                if (p.index == ui_state.active_view && !p.camera.empty())
+                    hud.insert(hud.begin(), Iconed(icon::kCameraNode, p.camera.substr(p.camera.rfind('/') + 1u).c_str()));
+            // Below the pane header when there is one.
+            draw::ViewportFrame(vmin, vmax, hud, pane_count > 1u ? ImGui::GetFrameHeight() + 8.0f * nui::Scale() : 0.0f);
             DrawSolverHud(vmin, vmax);
             DrawPerturbHud(vmin, vmax);
             DrawViewTools(vmin, vmax);
@@ -1463,8 +1489,8 @@ void ImGuiLayer::RecordUi(const render::RenderWorld& world, const ViewerStats& s
                                                     ImVec2((vmin.x + vmax.x - size.x) * 0.5f, (vmin.y + vmax.y - size.y) * 0.5f),
                                                     U32(theme::kFgDim), text);
         }
-        // Under every window, so popups, the palette and modals stay on top.
-        if (!ui_state.start.shown) host_.DrawNotifications(ImGui::GetBackgroundDrawList(), vmin, vmax);
+        // Under every window, so popups, the palette and modals stay on top; across all panes, not the active one.
+        if (!ui_state.start.shown) host_.DrawNotifications(ImGui::GetBackgroundDrawList(), cmin, cmax);
     }
     if (!ui_state.start.shown) DrawAssetDrop();
     DrawStartPage();
@@ -2393,44 +2419,62 @@ constexpr ImGuiWindowFlags kOverlayFlags = ImGuiWindowFlags_NoDecoration | ImGui
                                            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
                                            ImGuiWindowFlags_AlwaysAutoResize;
 
+void ImGuiLayer::DrawViewButtons() {
+    const ViewerUiState& ui = *frame_.ui;
+    const float s = nui::Scale();
+    if (draw::IconButton("##rt", icon::kSparkle, ui.rt.on, Tr("RT Preview"))) Queue("view.rt_preview");
+    ImGui::SameLine(0.0f, 4.0f * s);
+    if (draw::IconButton("##render", icon::kCamera, ui.rendering, Tr("Render This View..."))) ImGui::OpenPopup("##render_view");
+    if (ImGui::BeginPopup("##render_view")) {
+        ImGui::TextUnformatted(Tr("Render This View"));
+        ImGui::SetNextItemWidth(280.0f * s);
+        ImGui::InputTextWithHint("##path", Tr("Output PNG (empty asks)"), render_path_, sizeof(render_path_));
+        ImGui::SetNextItemWidth(180.0f * s);
+        ImGui::InputInt2(Tr("Size"), render_size_);
+        ImGui::SetNextItemWidth(180.0f * s);
+        ImGui::InputInt(Tr("Samples"), &render_spp_);
+        ImGui::BeginDisabled(ui.rendering);
+        if (ImGui::Button(Tr("Render"))) {
+            Queue("view.render", Args({{"path", json::Value::Str(render_path_)},
+                                       {"width", json::Value::Int(std::max(render_size_[0], 16))},
+                                       {"height", json::Value::Int(std::max(render_size_[1], 16))},
+                                       {"spp", json::Value::Int(std::max(render_spp_, 1))}}));
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine(0.0f, 4.0f * s);
+    const char* layout_icon = ui.view_layout == ViewLayout::Quad    ? icon::kViewQuad
+                              : ui.view_layout == ViewLayout::Split ? icon::kViewSplit
+                                                                    : icon::kViewSingle;
+    if (draw::IconButton("##layout", layout_icon, false, Tr("View Layout"))) ImGui::OpenPopup("##view_layout");
+    if (ImGui::BeginPopup("##view_layout")) {
+        for (const char* id : {"view.layout_single", "view.layout_split", "view.layout_quad", "view.maximize"}) MenuAction(id);
+        ImGui::EndPopup();
+    }
+}
+
 void ImGuiLayer::DrawViewTools(const ImVec2& vmin, const ImVec2& vmax) {
     const ViewerUiState& ui = *frame_.ui;
     const float s = nui::Scale();
-    ImGui::SetNextWindowPos(ImVec2(vmax.x - 16.0f * s, vmin.y + 14.0f * s), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    if (ImGui::Begin("##view_tools", nullptr, kOverlayFlags)) {
-        if (draw::IconButton("##rt", icon::kSparkle, ui.rt.on, Tr("RT Preview"))) Queue("view.rt_preview");
-        ImGui::SameLine(0.0f, 4.0f * s);
-        if (draw::IconButton("##render", icon::kCamera, ui.rendering, Tr("Render This View..."))) ImGui::OpenPopup("##render_view");
-        if (ImGui::BeginPopup("##render_view")) {
-            ImGui::TextUnformatted(Tr("Render This View"));
-            ImGui::SetNextItemWidth(280.0f * s);
-            ImGui::InputTextWithHint("##path", Tr("Output PNG (empty asks)"), render_path_, sizeof(render_path_));
-            ImGui::SetNextItemWidth(180.0f * s);
-            ImGui::InputInt2(Tr("Size"), render_size_);
-            ImGui::SetNextItemWidth(180.0f * s);
-            ImGui::InputInt(Tr("Samples"), &render_spp_);
-            ImGui::BeginDisabled(ui.rendering);
-            if (ImGui::Button(Tr("Render"))) {
-                Queue("view.render", Args({{"path", json::Value::Str(render_path_)},
-                                           {"width", json::Value::Int(std::max(render_size_[0], 16))},
-                                           {"height", json::Value::Int(std::max(render_size_[1], 16))},
-                                           {"spp", json::Value::Int(std::max(render_spp_, 1))}}));
-                ImGui::CloseCurrentPopup();
+    // With several panes these sit in the active pane's header.
+    if (ui.panes.size() == 1u) {
+        ImGui::SetNextWindowPos(ImVec2(vmax.x - 16.0f * s, vmin.y + 14.0f * s), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        if (ImGui::Begin("##view_tools", nullptr, kOverlayFlags)) {
+            DrawViewButtons();
+            ImGui::SameLine(0.0f, 4.0f * s);
+            ImGui::SetNextItemWidth(130.0f * s);
+            const ViewModeInfo& shown = kViewModes[static_cast<size_t>(ui.view_mode)];
+            if (ImGui::BeginCombo("##mode", Tr(shown.label))) {
+                for (const ViewModeInfo& m : kViewModes)
+                    if (ImGui::Selectable(Tr(m.label), m.mode == ui.view_mode))
+                        Queue("view.mode", Args({{"mode", json::Value::Str(m.name)}}));
+                ImGui::EndCombo();
             }
-            ImGui::EndDisabled();
-            ImGui::EndPopup();
         }
-        ImGui::SameLine(0.0f, 4.0f * s);
-        ImGui::SetNextItemWidth(130.0f * s);
-        const ViewModeInfo& shown = kViewModes[static_cast<size_t>(ui.view_mode)];
-        if (ImGui::BeginCombo("##mode", Tr(shown.label))) {
-            for (const ViewModeInfo& m : kViewModes)
-                if (ImGui::Selectable(Tr(m.label), m.mode == ui.view_mode))
-                    Queue("view.mode", Args({{"mode", json::Value::Str(m.name)}}));
-            ImGui::EndCombo();
-        }
+        ImGui::End();
     }
-    ImGui::End();
     if (!ui.select_box) return;
     const ImVec2 a(std::min(ui.select_box_from[0], ui.select_box_to[0]), std::min(ui.select_box_from[1], ui.select_box_to[1]));
     const ImVec2 b(std::max(ui.select_box_from[0], ui.select_box_to[0]), std::max(ui.select_box_from[1], ui.select_box_to[1]));
@@ -2509,6 +2553,67 @@ void ImGuiLayer::DrawBookmarkBar(const ImVec2& vmin, const ImVec2& vmax) {
         if (draw::IconButton("##add_bookmark", icon::kAdd, false, Tr("Add Camera Bookmark"))) Queue("view.bookmark_add");
     }
     ImGui::End();
+}
+
+void ImGuiLayer::DrawPaneHeaders(const ImVec2& cmin, const ImVec2& cmax, const ImVec2& pane, float gap) {
+    const ViewerUiState& ui = *frame_.ui;
+    const float s = nui::Scale();
+    ImDrawList* list = ImGui::GetBackgroundDrawList();
+    list->AddRectFilled(ImVec2(cmin.x + pane.x, cmin.y), ImVec2(cmin.x + pane.x + gap, cmax.y), U32(theme::kBg0));
+    if (ui.panes.size() > 2u)
+        list->AddRectFilled(ImVec2(cmin.x, cmin.y + pane.y), ImVec2(cmax.x, cmin.y + pane.y + gap), U32(theme::kBg0));
+    for (const ViewPane& p : ui.panes) {
+        const SceneViewportRect& r = pane_rects_[p.index];
+        if (!r.Valid()) continue;
+        const ImVec2 pmin(r.x, r.y), pmax(r.x + r.width, r.y + r.height);
+        const bool active = p.index == ui.active_view;
+        const std::string camera = p.camera.substr(p.camera.rfind('/') + 1u);
+        if (active) list->AddRect(pmin, pmax, U32(theme::kAccent), 0.0f, 0, 1.5f * s);
+        else draw::ViewportFrame(pmin, pmax, camera.empty() ? std::vector<std::string>{}
+                                                             : std::vector<std::string>{Iconed(icon::kCameraNode, camera.c_str())},
+                                 ImGui::GetFrameHeight() + 8.0f * s);
+        const json::Value index = json::Value::Int(p.index);
+        ImGui::SetNextWindowPos(ImVec2(pmin.x + 18.0f * s, pmin.y + 14.0f * s), ImGuiCond_Always);
+        if (ImGui::Begin(("##pane" + std::to_string(p.index)).c_str(), nullptr, kOverlayFlags)) {
+            // The camera the pane looks through: lit while bound to a scene camera, which the HUD names.
+            if (draw::IconButton("##camera", icon::kCameraNode, !camera.empty(), camera.empty() ? Tr("Free Camera") : camera.c_str()))
+                ImGui::OpenPopup("##cameras");
+            if (ImGui::BeginPopup("##cameras")) {
+                if (ImGui::Selectable(Tr("Free Camera"), p.camera.empty()))
+                    Queue("view.view", Args({{"index", index}, {"camera", json::Value::Str("")}}));
+                for (const std::string& c : ui.scene_cameras)
+                    if (ImGui::Selectable(c.c_str(), c == p.camera))
+                        Queue("view.view", Args({{"index", index}, {"camera", json::Value::Str(c)}}));
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine(0.0f, 4.0f * s);
+            ImGui::SetNextItemWidth(104.0f * s);
+            if (ImGui::BeginCombo("##mode", Tr(kViewModes[static_cast<size_t>(p.mode)].label))) {
+                for (const ViewModeInfo& m : kViewModes)
+                    if (ImGui::Selectable(Tr(m.label), m.mode == p.mode))
+                        Queue("view.view", Args({{"index", index}, {"mode", json::Value::Str(m.name)}}));
+                ImGui::EndCombo();
+            }
+        }
+        ImGui::End();
+        // The active pane's view tools and every pane's maximize sit at its top right.
+        ImGui::SetNextWindowPos(ImVec2(pmax.x - 16.0f * s, pmin.y + 14.0f * s), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        if (ImGui::Begin(("##pane_tools" + std::to_string(p.index)).c_str(), nullptr, kOverlayFlags)) {
+            if (active) {
+                DrawViewButtons();
+                ImGui::SameLine(0.0f, 4.0f * s);
+            }
+            if (draw::IconButton("##maximize", icon::kMaximize, false, Tr("Maximize View")))
+                Queue("view.maximize", Args({{"index", index}}));
+        }
+        ImGui::End();
+    }
+}
+
+void ImGuiLayer::SetActiveView(uint32_t index) {
+    viewport_ = pane_rects_[index];
+    const ImVec2 mouse = ImGui::GetMousePos();
+    viewport_hovered_ = pointer_free_ && viewport_.Contains(mouse.x, mouse.y);
 }
 
 void ImGuiLayer::DrawGizmo(CameraController& camera, uint32_t vp_w, uint32_t vp_h, ViewerUiState& ui_state,

@@ -482,7 +482,8 @@ struct PresentRenderer::Impl {
     // in-flight frame's uniform is not overwritten by the next); the last one serves Pick.
     struct UboSlot { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
                      VkDescriptorSet set = VK_NULL_HANDLE; };
-    std::array<UboSlot, kFramesInFlight + 1u> ubo_slots{};
+    // One slot per frame in flight and view, then Pick's.
+    std::array<UboSlot, kFramesInFlight * kMaxSceneViews + 1u> ubo_slots{};
 
     // Per-frame-in-flight sync + command buffers. render_finished is PER SWAPCHAIN
     // IMAGE (indexed by image_index), not per frame-in-flight: acquire returns an
@@ -1851,6 +1852,14 @@ struct PresentRenderer::Impl {
         return {{static_cast<int32_t>(rect.x), static_cast<int32_t>(rect.y)}, {rect.width, rect.height}};
     }
 
+    // The smallest rect holding both; an empty one adds nothing.
+    static SceneViewport Bounds(const SceneViewport& a, const SceneViewport& b) {
+        if (a.Empty()) return b;
+        if (b.Empty()) return a;
+        const uint32_t x = std::min(a.x, b.x), y = std::min(a.y, b.y);
+        return {true, x, y, std::max(a.x + a.width, b.x + b.width) - x, std::max(a.y + a.height, b.y + b.height) - y};
+    }
+
     static void SetViewport(VkCommandBuffer cmd, const SceneViewport& rect) {
         VkViewport viewport{};
         viewport.x = static_cast<float>(rect.x); viewport.y = static_cast<float>(rect.y);
@@ -1904,9 +1913,10 @@ struct PresentRenderer::Impl {
         }
     }
 
-    // The id pass over `view`; it leaves id_image in SHADER_READ_ONLY_OPTIMAL.
-    void RecordIdPass(VkCommandBuffer cmd, const PreparedView& view, const std::vector<uint8_t>& flags,
-                      VkDescriptorSet ubo_set, const PresentInterop* pose) {
+    // The id pass over every view, each with its own set; it leaves id_image in SHADER_READ_ONLY_OPTIMAL.
+    void RecordIdPass(VkCommandBuffer cmd, const std::vector<PreparedView>& views,
+                      const std::vector<VkDescriptorSet>& sets, const std::vector<uint8_t>& flags,
+                      const PresentInterop* pose) {
         std::array<VkClearValue, 2> clears{};
         clears[1].depthStencil = {1.0f, 0u};
         VkRenderPassBeginInfo rp{};
@@ -1917,10 +1927,13 @@ struct PresentRenderer::Impl {
         rp.clearValueCount = static_cast<uint32_t>(clears.size());
         rp.pClearValues = clears.data();
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-        if (pose != nullptr) {
-            RecordDraws(cmd, view, id_instanced_pipeline, instanced_pipeline_layout, ubo_set, pose, &flags);
-        } else {
-            RecordDraws(cmd, view, id_pipeline, pipeline_layout, ubo_set, nullptr, &flags);
+        for (size_t i = 0; i < views.size(); ++i) {
+            if (views[i].rect.Empty()) continue;
+            if (pose != nullptr) {
+                RecordDraws(cmd, views[i], id_instanced_pipeline, instanced_pipeline_layout, sets[i], pose, &flags);
+            } else {
+                RecordDraws(cmd, views[i], id_pipeline, pipeline_layout, sets[i], nullptr, &flags);
+            }
         }
         vkCmdEndRenderPass(cmd);
     }
@@ -1946,7 +1959,7 @@ struct PresentRenderer::Impl {
                            [](uint8_t f) { return (f & (kInstanceSelected | kInstanceHovered)) != 0; });
     }
 
-    PresentFrameResult DrawFrame(const RenderWorld& world, const RasterOptions& options,
+    PresentFrameResult DrawFrame(const RenderWorld& world, const std::vector<RasterOptions>& views,
                                  const OverlayRecordFn& overlay, const PresentInterop* interop) {
         if (window_surface->Width() == 0u || window_surface->Height() == 0u) {
             recreate_requested = true;
@@ -1982,8 +1995,19 @@ struct PresentRenderer::Impl {
         }
         images_in_flight[image_index] = in_flight[frame];
 
-        const PreparedView view = Prepare(world, options);
-        UploadUbo(ubo_slots[frame], view.ubo);
+        // The first view's background, flags and outline colours apply to the frame.
+        const RasterOptions& options = views.front();
+        const size_t view_count = std::min<size_t>(views.size(), kMaxSceneViews);
+        std::vector<PreparedView> prepared;
+        std::vector<VkDescriptorSet> sets;
+        SceneViewport shot{};
+        for (size_t i = 0; i < view_count; ++i) {
+            prepared.push_back(Prepare(world, views[i]));
+            const UboSlot& slot = ubo_slots[frame * kMaxSceneViews + i];
+            UploadUbo(slot, prepared.back().ubo);
+            sets.push_back(slot.set);
+            shot = Bounds(shot, prepared.back().rect);
+        }
 
         const bool do_capture =
             (capture_frame_ >= 0 && draw_counter_ == static_cast<uint64_t>(capture_frame_));
@@ -1993,12 +2017,12 @@ struct PresentRenderer::Impl {
                 static_cast<VkDeviceSize>(extent.width) * extent.height * 4u,
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         }
-        const bool do_scene_capture = scene_capture_frame_ >= 0 && !view.rect.Empty() &&
+        const bool do_scene_capture = scene_capture_frame_ >= 0 && !shot.Empty() &&
                                       draw_counter_ == static_cast<uint64_t>(scene_capture_frame_);
         GpuBuffer scene_capture_buf{};
         if (do_scene_capture) {
             scene_capture_buf = CreateHostBuffer(
-                static_cast<VkDeviceSize>(view.rect.width) * view.rect.height * 4u,
+                static_cast<VkDeviceSize>(shot.width) * shot.height * 4u,
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         }
 
@@ -2015,8 +2039,8 @@ struct PresentRenderer::Impl {
         const PresentInterop* pose =
             interop != nullptr && instanced_pipeline != VK_NULL_HANDLE ? interop : nullptr;
         // The id pass feeds the selection outline and runs only while something is marked.
-        const bool outline = !view.rect.Empty() && Marked(options.instance_flags);
-        if (outline) RecordIdPass(cmd, view, options.instance_flags, ubo_slots[frame].set, pose);
+        const bool outline = !shot.Empty() && Marked(options.instance_flags);
+        if (outline) RecordIdPass(cmd, prepared, sets, options.instance_flags, pose);
 
         std::array<VkClearValue, 2> clears{};
         clears[0].color = {{static_cast<float>(options.background.r) / 255.0f,
@@ -2033,25 +2057,15 @@ struct PresentRenderer::Impl {
         rp.pClearValues = clears.data();
         vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
-        if (!view.rect.Empty()) {
-            const bool wire = options.view_mode == ViewMode::Wireframe;
-            if (pose != nullptr) {
-                RecordDraws(cmd, view, wire ? wire_instanced_pipeline : instanced_pipeline,
-                            instanced_pipeline_layout, ubo_slots[frame].set, pose, nullptr);
-            } else {
-                RecordDraws(cmd, view, wire ? wire_pipeline : pipeline, pipeline_layout,
-                            ubo_slots[frame].set, nullptr, nullptr);
-            }
-        }
-
         // The overlays draw AFTER the opaque scene: the ghost behind it, then the debug
         // overlay (collider wireframes + contact markers) THROUGH it. Model rides the push
-        // constant (no interop SSBO); an empty list is skipped.
-        const auto draw_overlay = [&](const std::vector<RenderInstance>& overlay_list, VkPipeline overlay_pipeline) {
-            if (view.rect.Empty() || overlay_list.empty() || overlay_pipeline == VK_NULL_HANDLE) return;
+        // constant (no interop SSBO) and the view's viewport stays bound; an empty list is skipped.
+        const auto draw_overlay = [&](const std::vector<RenderInstance>& overlay_list, VkPipeline overlay_pipeline,
+                                      VkDescriptorSet ubo_set) {
+            if (overlay_list.empty() || overlay_pipeline == VK_NULL_HANDLE) return;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-                                    0u, 1u, &ubo_slots[frame].set, 0u, nullptr);
+                                    0u, 1u, &ubo_set, 0u, nullptr);
             for (const RenderInstance& inst : overlay_list) {
                 if (inst.mesh_id == kNoId || inst.mesh_id >= world.meshes.Count()) continue;
                 if (inst.mesh_id >= mesh_cache.size()) continue;
@@ -2081,20 +2095,35 @@ struct PresentRenderer::Impl {
                 vkCmdDrawIndexed(cmd, cached.index_count, 1u, 0u, 0, 0u);
             }
         };
-        draw_overlay(world.ghost_instances, ghost_pipeline);
-        draw_overlay(world.debug_instances, debug_pipeline);
+        for (size_t i = 0; i < prepared.size(); ++i) {
+            const PreparedView& view = prepared[i];
+            if (view.rect.Empty()) continue;
+            const bool wire = views[i].view_mode == ViewMode::Wireframe;
+            if (pose != nullptr) {
+                RecordDraws(cmd, view, wire ? wire_instanced_pipeline : instanced_pipeline,
+                            instanced_pipeline_layout, sets[i], pose, nullptr);
+            } else {
+                RecordDraws(cmd, view, wire ? wire_pipeline : pipeline, pipeline_layout, sets[i], nullptr, nullptr);
+            }
+            draw_overlay(world.ghost_instances, ghost_pipeline, sets[i]);
+            draw_overlay(world.debug_instances, debug_pipeline, sets[i]);
+        }
 
         // The scene alone is read between two passes; the second loads it back for the overlay.
         if (do_scene_capture) {
             vkCmdEndRenderPass(cmd);
-            RecordReadback(cmd, images[image_index], ScissorOf(view.rect), scene_capture_buf.buffer,
+            RecordReadback(cmd, images[image_index], ScissorOf(shot), scene_capture_buf.buffer,
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             rp.renderPass = overlay_pass;
             vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
         }
 
         // The outline goes after the scene capture, so recorded frames stay clean.
-        if (outline) RecordOutline(cmd, view.rect, options);
+        if (outline) {
+            for (const PreparedView& view : prepared) {
+                if (!view.rect.Empty()) RecordOutline(cmd, view.rect, options);
+            }
+        }
 
         // Overlay (ImGui) records INSIDE the pass, after the scene.
         if (overlay) {
@@ -2161,7 +2190,7 @@ struct PresentRenderer::Impl {
         }
         if (do_capture) FinishReadback(capture_buf, extent.width, extent.height, capture_path_);
         if (do_scene_capture)
-            FinishReadback(scene_capture_buf, view.rect.width, view.rect.height, scene_capture_path_);
+            FinishReadback(scene_capture_buf, shot.width, shot.height, scene_capture_path_);
 
         current_frame = (current_frame + 1u) % kFramesInFlight;
         ++draw_counter_;
@@ -2185,14 +2214,14 @@ struct PresentRenderer::Impl {
         const uint32_t y1 = std::min(region.y + region.height, view.rect.y + view.rect.height);
         if (x1 <= x0 || y1 <= y0) return result;
         const uint32_t w = x1 - x0, h = y1 - y0;
-        const UboSlot& slot = ubo_slots[kFramesInFlight];
+        const UboSlot& slot = ubo_slots.back();
         UploadUbo(slot, view.ubo);
         GpuBuffer out = CreateHostBuffer(static_cast<VkDeviceSize>(w) * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const PresentInterop* pose =
             interop != nullptr && id_instanced_pipeline != VK_NULL_HANDLE ? interop : nullptr;
 
         VkCommandBuffer cmd = BeginOneShot();
-        RecordIdPass(cmd, view, options.instance_flags, slot.set, pose);
+        RecordIdPass(cmd, {view}, {slot.set}, options.instance_flags, pose);
         VkImageMemoryBarrier to_src{};
         to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         to_src.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -2243,7 +2272,12 @@ PresentFrameResult PresentRenderer::DrawFrame(const RenderWorld& world,
                                               const RasterOptions& options,
                                               const OverlayRecordFn& overlay,
                                               const PresentInterop* interop) {
-    return impl_->DrawFrame(world, options, overlay, interop);
+    return impl_->DrawFrame(world, std::vector<RasterOptions>{options}, overlay, interop);
+}
+
+PresentFrameResult PresentRenderer::DrawViews(const RenderWorld& world, const std::vector<RasterOptions>& views,
+                                              const OverlayRecordFn& overlay, const PresentInterop* interop) {
+    return impl_->DrawFrame(world, views, overlay, interop);
 }
 
 PickResult PresentRenderer::Pick(const RenderWorld& world, const RasterOptions& options,

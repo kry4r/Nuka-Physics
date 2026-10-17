@@ -46,6 +46,7 @@
 #include "stb/stb_image_write.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdarg>
 #include <chrono>
@@ -728,6 +729,18 @@ struct CameraBookmark {
     float fov = 45.0f;
 };
 
+// A pane's view; the active pane's camera and mode live in the host's camera and view mode instead.
+struct PaneView {
+    CameraController camera;
+    render::ViewMode mode = render::ViewMode::Lit;
+    std::string camera_path;  // the scene camera it looks through; empty is the free camera
+};
+
+// The pane layouts in ViewLayout order: view.layout's name and the menu label.
+constexpr std::pair<const char*, const char*> kViewLayouts[] = {
+    {"single", "Single View"}, {"split", "Split View"}, {"quad", "Quad View"}};
+static_assert(kViewPanes == render::kMaxSceneViews);
+
 // {"cameras": [{name, target, distance, yaw, pitch, fov}]}, the file --cams reads.
 json::Value BookmarksJson(const std::vector<CameraBookmark>& marks) {
     json::Value list = json::Value::Array();
@@ -846,6 +859,8 @@ struct EditorHost::State : DocumentHost {
     void PickSelect(const CameraController& camera, float x, float y);
     // The present options for the scene viewport through `camera`: view mode and instance flags.
     render::RasterOptions ViewOptions(const CameraController& camera);
+    // The present options for pane `rect` through `camera` in `mode`, without instance flags.
+    render::RasterOptions ViewOptions(const CameraController& camera, const SceneViewportRect& rect, render::ViewMode mode);
     // Each shown instance's node path, and its selected, hovered and locked flags.
     const std::vector<std::string>& InstancePaths();
     std::vector<uint8_t> InstanceFlags();
@@ -857,6 +872,20 @@ struct EditorHost::State : DocumentHost {
     // scene.select's arguments for the bodies a box pick saw, after the selection when `add`.
     json::Value BoxSelectArgs(const render::PickResult& pick, bool add);
     void SetViewMode(render::ViewMode mode);
+    // The panes the layout shows in layout order: the active one alone, the first two or all four.
+    std::vector<uint32_t> ShownViews() const;
+    CameraController& ViewCamera(uint32_t index) { return index == ui_state_.active_view ? camera_ : views_[index].camera; }
+    render::ViewMode PaneMode(uint32_t index) const {
+        return index == ui_state_.active_view ? ui_state_.view_mode : views_[index].mode;
+    }
+    // Moves input, the gizmo and the HUD to pane `index`.
+    void ActivateView(uint32_t index);
+    void SetViewLayout(ViewLayout layout);
+    // Lists the scene cameras and the shown panes for the UI; a pane bound to a camera looks through it.
+    void SyncViews(const render::RenderWorld& rw);
+    // Residual and Contact turn on what they show while a shown pane uses them, and off after.
+    void SyncModeOverlays();
+    json::Value ViewJson(uint32_t index);
     // Shows the worker's RT images of the view through `camera` and asks for the next one, each
     // with twice the samples; a changed view or snapshot starts again at one.
     void StepRt(const CameraController& camera);
@@ -911,7 +940,7 @@ struct EditorHost::State : DocumentHost {
     void PushTransport();
     void PushPoseWrites();
     void PushEdits();
-    void DrawWorld(const render::RenderWorld& rw, const render::RasterOptions& opts);
+    void DrawWorld(const render::RenderWorld& rw, const std::vector<render::RasterOptions>& views);
     void PrintSummary();
     void SetLoadError(const std::string& path);
     void CreateWorld(const std::string& path);
@@ -1030,6 +1059,9 @@ struct EditorHost::State : DocumentHost {
     float hover_x_ = 0.0f, hover_y_ = 0.0f;
     bool mode_heatmap_ = false;   // the Residual view turned the heatmap on
     bool mode_contacts_ = false;  // the Contact view turned the contact markers on
+    std::array<PaneView, kViewPanes> views_{};
+    std::optional<ViewLayout> restore_layout_;  // the layout view.maximize goes back to
+    bool views_stale_ = false;  // a new document: the other panes start at its framing
     ActionRegistry actions_;
     uint64_t param_seq_ = 0u;  // the last registry write and the ticks it was queued and applied at
     uint64_t param_pushed_tick_ = 0u;
@@ -1776,12 +1808,12 @@ void EditorHost::State::PushEdits() {
 
 // Draws with the latest zero-copy pose slot when there is one; a slot stays pinned until
 // the frames in flight after its frame were submitted.
-void EditorHost::State::DrawWorld(const render::RenderWorld& rw, const render::RasterOptions& opts) {
+void EditorHost::State::DrawWorld(const render::RenderWorld& rw, const std::vector<render::RasterOptions>& views) {
     render::PresentInterop interop;
     uint32_t slot = 0u;
     const bool pinned = PinPose(&slot, &interop);
     const uint64_t submitted = present_->SubmittedFrames();
-    const render::PresentFrameResult r = present_->DrawFrame(rw, opts, [this](void* cmd) {
+    const render::PresentFrameResult r = present_->DrawViews(rw, views, [this](void* cmd) {
         imgui_.RenderDrawData(reinterpret_cast<NukaVkCommandBuffer>(cmd));
     }, pinned ? &interop : nullptr);
     if (present_->SubmittedFrames() != submitted) {
@@ -1811,11 +1843,18 @@ bool EditorHost::State::PinPose(uint32_t* slot, render::PresentInterop* interop)
 }
 
 render::RasterOptions EditorHost::State::ViewOptions(const CameraController& camera) {
+    render::RasterOptions opts = ViewOptions(camera, ui_.Viewport(), ui_state_.view_mode);
+    opts.instance_flags = InstanceFlags();
+    return opts;
+}
+
+render::RasterOptions EditorHost::State::ViewOptions(const CameraController& camera, const SceneViewportRect& rect,
+                                                     render::ViewMode mode) {
     render::RasterOptions opts;
     opts.width = present_->Report().width;
     opts.height = present_->Report().height;
     camera.WriteOptions(opts);
-    opts.scene_viewport = ui_.Viewport().pixels;
+    opts.scene_viewport = rect.pixels;
     if (loaded_ && loaded_->scene.Environment().sky.enabled) {
         const auto background = loaded_->scene.Environment().sky.background;
         const auto byte = [](float value) {
@@ -1824,8 +1863,7 @@ render::RasterOptions EditorHost::State::ViewOptions(const CameraController& cam
         if (std::isfinite(background.x) && std::isfinite(background.y) && std::isfinite(background.z))
             opts.background = {byte(background.x), byte(background.y), byte(background.z), 255u};
     }
-    opts.view_mode = ui_state_.view_mode;
-    opts.instance_flags = InstanceFlags();
+    opts.view_mode = mode;
     return opts;
 }
 
@@ -1988,18 +2026,87 @@ json::Value EditorHost::State::BoxSelectArgs(const render::PickResult& pick, boo
     return Object({{"path", json::Value::Str(lead)}, {"paths", StrList(paths)}, {"mode", json::Value::Str("range")}});
 }
 
-// Residual and Contact turn on what they show and turn it off again on leaving.
 void EditorHost::State::SetViewMode(render::ViewMode mode) {
-    const render::ViewMode was = ui_state_.view_mode;
     ui_state_.view_mode = mode;
-    if (was == mode) return;
-    if (was == render::ViewMode::Residual && mode_heatmap_ && loaded_)
-        RunAction("solver.heatmap", Object({{"on", json::Value::Bool(false)}}), "view");
-    if (was == render::ViewMode::Contact && mode_contacts_) ui_state_.show_contacts = false;
-    mode_heatmap_ = mode == render::ViewMode::Residual && loaded_ && !ui_state_.solver.heatmap;
-    mode_contacts_ = mode == render::ViewMode::Contact && !ui_state_.show_contacts;
-    if (mode_heatmap_) RunAction("solver.heatmap", Object({{"on", json::Value::Bool(true)}}), "view");
-    if (mode_contacts_) ui_state_.show_contacts = true;
+    SyncModeOverlays();
+}
+
+// What the user turned on themselves stays on.
+void EditorHost::State::SyncModeOverlays() {
+    bool residual = false, contact = false;
+    for (const uint32_t i : ShownViews()) {
+        residual = residual || PaneMode(i) == render::ViewMode::Residual;
+        contact = contact || PaneMode(i) == render::ViewMode::Contact;
+    }
+    if (loaded_ && residual != mode_heatmap_ && (mode_heatmap_ || !ui_state_.solver.heatmap)) {
+        mode_heatmap_ = residual;
+        RunAction("solver.heatmap", Object({{"on", json::Value::Bool(residual)}}), "view");
+    }
+    if (contact != mode_contacts_ && (mode_contacts_ || !ui_state_.show_contacts)) {
+        mode_contacts_ = contact;
+        ui_state_.show_contacts = contact;
+    }
+}
+
+std::vector<uint32_t> EditorHost::State::ShownViews() const {
+    if (ui_state_.view_layout == ViewLayout::Quad) return {0u, 1u, 2u, 3u};
+    if (ui_state_.view_layout == ViewLayout::Split) return {0u, 1u};
+    return {ui_state_.active_view};
+}
+
+void EditorHost::State::ActivateView(uint32_t index) {
+    const uint32_t was = ui_state_.active_view;
+    if (index == was) return;
+    camera_.CancelInteraction();
+    views_[was].camera = camera_;
+    views_[was].mode = ui_state_.view_mode;
+    camera_ = views_[index].camera;
+    ui_state_.view_mode = views_[index].mode;
+    ui_state_.active_view = index;
+    ui_.SetActiveView(index);
+}
+
+// A layout without the active pane hands input to its first pane.
+void EditorHost::State::SetViewLayout(ViewLayout layout) {
+    ui_state_.view_layout = layout;
+    const std::vector<uint32_t> shown = ShownViews();
+    if (std::find(shown.begin(), shown.end(), ui_state_.active_view) == shown.end()) ActivateView(shown.front());
+    SyncModeOverlays();
+}
+
+void EditorHost::State::SyncViews(const render::RenderWorld& rw) {
+    std::vector<std::string>& cameras = ui_state_.scene_cameras;
+    cameras.clear();
+    for (const render::RenderCamera& c : rw.cameras) cameras.push_back(PathOfEntity(c.entity));
+    ui_state_.panes.clear();
+    for (const uint32_t i : ShownViews()) {
+        std::string& path = views_[i].camera_path;
+        const auto it = std::find(cameras.begin(), cameras.end(), path);
+        if (it == cameras.end()) path.clear();
+        const SceneViewportRect& rect = ui_.PaneRect(i);
+        if (!path.empty() && rect.Valid())
+            ViewCamera(i).UseSceneCamera(rw, rect.Aspect(), rect.Aspect(), static_cast<size_t>(it - cameras.begin()));
+        ui_state_.panes.push_back(ViewPane{i, PaneMode(i), path});
+    }
+}
+
+json::Value EditorHost::State::ViewJson(uint32_t index) {
+    const CameraController& camera = ViewCamera(index);
+    const SceneViewportRect& rect = ui_.PaneRect(index);
+    const std::vector<uint32_t> shown = ShownViews();
+    return Object({{"index", json::Value::Int(index)},
+                   {"mode", json::Value::Str(kViewModes[static_cast<size_t>(PaneMode(index))].name)},
+                   {"camera", json::Value::Str(views_[index].camera_path)},
+                   {"active", json::Value::Bool(index == ui_state_.active_view)},
+                   {"shown", json::Value::Bool(std::find(shown.begin(), shown.end(), index) != shown.end())},
+                   {"rect", rect.Valid() ? Object({{"x", json::Value::Int(rect.pixels.x)},
+                                                   {"y", json::Value::Int(rect.pixels.y)},
+                                                   {"width", json::Value::Int(rect.pixels.width)},
+                                                   {"height", json::Value::Int(rect.pixels.height)}})
+                                         : json::Value::Null()},
+                   {"eye", Vec3Json(camera.ResolvedEye())},
+                   {"target", Vec3Json(camera.ResolvedTarget())},
+                   {"fov", json::Value::Float(camera.fov_degrees)}});
 }
 
 void EditorHost::State::SetLoadError(const std::string& path) {
@@ -2057,6 +2164,8 @@ void EditorHost::State::OnLoaded(const std::string& path) {
     ++ui_state_.scene_version;
     ui_state_.load_error.clear();
     frame_pending_ = true;
+    views_stale_ = true;
+    for (PaneView& v : views_) v.camera_path.clear();
     entity_drag_.Cancel();
     debug_overlay_.Reset();
     doc_.Attach(loaded_.get(), this);  // no undo across loads
@@ -3481,6 +3590,85 @@ void EditorHost::State::RegisterViewActions() {
                       SetViewMode(it->mode);
                       return Ok(Object({{"mode", json::Value::Str(it->name)}}));
                   }});
+    // The panes: one, two side by side or four; without a layout it reports the current one.
+    actions_.Add({"view.layout", "View Layout", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const std::string name = StrArg(args, "layout", kViewLayouts[static_cast<size_t>(ui_state_.view_layout)].first);
+                      const auto it = std::find_if(std::begin(kViewLayouts), std::end(kViewLayouts),
+                                                   [&](const auto& l) { return name == l.first; });
+                      if (it == std::end(kViewLayouts)) return ActionResult::Fail("the layout is single, split or quad");
+                      const auto layout = static_cast<ViewLayout>(it - std::begin(kViewLayouts));
+                      if (layout != ui_state_.view_layout) restore_layout_.reset();
+                      SetViewLayout(layout);
+                      return Ok(Object({{"layout", json::Value::Str(name)}, {"active", json::Value::Int(ui_state_.active_view)}}));
+                  }});
+    for (const ViewLayout layout : {ViewLayout::Single, ViewLayout::Split, ViewLayout::Quad}) {
+        const auto& [name, label] = kViewLayouts[static_cast<size_t>(layout)];
+        const std::string id = name;
+        actions_.Add({"view.layout_" + id, label, "view", "", ShortcutScope::Global, {},
+                      [this, layout] { return ui_state_.view_layout == layout; },
+                      [this, id](const json::Value&) {
+                          return RunAction("view.layout", Object({{"layout", json::Value::Str(id)}}), "view");
+                      }});
+    }
+    // Shows one pane alone, the active one without an index, and goes back to the layout it left.
+    actions_.Add({"view.maximize", "Maximize View", "view", "Shift+Space", ShortcutScope::Viewport,
+                  [this] { return ui_state_.view_layout != ViewLayout::Single || restore_layout_.has_value(); },
+                  [this] { return restore_layout_.has_value(); },
+                  [this](const json::Value& args) {
+                      if (ui_state_.view_layout == ViewLayout::Single) {
+                          if (!restore_layout_) return ActionResult::Fail("no layout to go back to");
+                          const ViewLayout back = *restore_layout_;
+                          restore_layout_.reset();
+                          SetViewLayout(back);
+                      } else {
+                          const double index = NumArg(args, "index", ui_state_.active_view);
+                          const std::vector<uint32_t> shown = ShownViews();
+                          if (std::find(shown.begin(), shown.end(), index) == shown.end())
+                              return ActionResult::Fail("index: a pane the layout shows");
+                          restore_layout_ = ui_state_.view_layout;
+                          ActivateView(static_cast<uint32_t>(index));
+                          SetViewLayout(ViewLayout::Single);
+                      }
+                      return Ok(Object({{"layout", json::Value::Str(kViewLayouts[static_cast<size_t>(ui_state_.view_layout)].first)},
+                                        {"active", json::Value::Int(ui_state_.active_view)}}));
+                  }});
+    // A pane's mode and scene camera ("" is free), each kept when left out; activate makes it the active pane.
+    actions_.Add({"view.view", "View Pane", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value& args) {
+                      const double at = NumArg(args, "index", ui_state_.active_view);
+                      if (!(at >= 0.0 && at < kViewPanes) || at != std::floor(at)) return ActionResult::Fail("index: a pane from 0 to 3");
+                      const auto index = static_cast<uint32_t>(at);
+                      const std::string mode = StrArg(args, "mode", kViewModes[static_cast<size_t>(PaneMode(index))].name);
+                      const auto it = std::find_if(std::begin(kViewModes), std::end(kViewModes),
+                                                   [&](const ViewModeInfo& m) { return mode == m.name; });
+                      if (it == std::end(kViewModes))
+                          return ActionResult::Fail("the mode is lit, unlit, normals, material, residual, contact or wireframe");
+                      const std::string camera = StrArg(args, "camera", views_[index].camera_path);
+                      const std::vector<std::string>& cameras = ui_state_.scene_cameras;
+                      if (!camera.empty() && std::find(cameras.begin(), cameras.end(), camera) == cameras.end())
+                          return ActionResult::Fail("no scene camera '" + camera + "'");
+                      const std::vector<uint32_t> shown = ShownViews();
+                      const bool activate = BoolArg(args, "activate", false);
+                      if (activate && std::find(shown.begin(), shown.end(), index) == shown.end())
+                          return ActionResult::Fail("the layout hides pane " + std::to_string(index));
+                      if (index == ui_state_.active_view) ui_state_.view_mode = it->mode;
+                      else views_[index].mode = it->mode;
+                      views_[index].camera_path = camera;
+                      if (activate) ActivateView(index);
+                      SyncModeOverlays();
+                      return Ok(ViewJson(index));
+                  }});
+    actions_.Add({"view.views", "View Panes", "view", "", ShortcutScope::Global, {}, {},
+                  [this](const json::Value&) {
+                      json::Value panes = json::Value::Array();
+                      for (uint32_t i = 0; i < kViewPanes; ++i) panes.PushBack(ViewJson(i));
+                      return Ok(Object({{"layout", json::Value::Str(kViewLayouts[static_cast<size_t>(ui_state_.view_layout)].first)},
+                                        {"active", json::Value::Int(ui_state_.active_view)},
+                                        {"maximized", json::Value::Bool(restore_layout_.has_value())},
+                                        {"cameras", StrList(ui_state_.scene_cameras)},
+                                        {"panes", std::move(panes)}}));
+                  }});
     // What the viewport shows at x, y: fractions of its width and height from the top left.
     actions_.Add({"view.pick", "Pick", "view", "", ShortcutScope::Global, has_scene, {},
                   [this](const json::Value& args) {
@@ -4511,14 +4699,26 @@ void EditorHost::State::Frame(bool step_physics) {
     ui_.PrepareFrame(sdl_window != nullptr ? SDL_GetWindowDisplayScale(sdl_window) / SDL_GetWindowPixelDensity(sdl_window)
                                            : 1.0f);
     imgui_.NewFrame();
+    SyncViews(render_world);
     ui_.RecordUi(render_world, stats, camera_, ui_state_, loaded_ ? &loaded_->scene : nullptr,
                  surface_suspended_ ? 0u : vp_w, surface_suspended_ ? 0u : vp_h);
+    // A press in another pane makes it the active one before anything takes the press.
+    for (const window::WindowEvent& ev : events_)
+        if (ev.type == window::WindowEvent::Type::MouseButton && ev.pressed && ui_.HoveredPane() >= 0) {
+            ActivateView(static_cast<uint32_t>(ui_.HoveredPane()));
+            break;
+        }
     if (frame_pending_ && ui_.Viewport().Valid()) {
         const auto rect = ui_.Viewport().pixels;
         if (rect.x == last_framing_rect_.x && rect.y == last_framing_rect_.y &&
             rect.width == last_framing_rect_.width && rect.height == last_framing_rect_.height) {
             FrameWorld(render_world);
             frame_pending_ = false;
+            if (views_stale_) {
+                for (uint32_t i = 0; i < kViewPanes; ++i)
+                    if (i != ui_state_.active_view) views_[i].camera = camera_;
+                views_stale_ = false;
+            }
         }
         last_framing_rect_ = rect;
     }
@@ -4577,6 +4777,11 @@ void EditorHost::State::Frame(bool step_physics) {
         const bool scroll = ev.type == window::WindowEvent::Type::Scroll;
         const float mouse_x = scroll ? last_mouse_x_ : static_cast<float>(ev.mouse_x);
         const float mouse_y = scroll ? last_mouse_y_ : static_cast<float>(ev.mouse_y);
+        // The wheel over another pane zooms that pane where it is.
+        if (scroll && ui_.HoveredPane() >= 0 && static_cast<uint32_t>(ui_.HoveredPane()) != ui_state_.active_view) {
+            views_[static_cast<size_t>(ui_.HoveredPane())].camera.HandleEvent(ev, false, true);
+            continue;
+        }
         const bool over_ui = !ui_.OwnsScenePointer() || !scene_rect.Contains(mouse_x, mouse_y) ||
                              !ui_state_.window_focused || ui_state_.layout_modifier_down || frame_pending_;
         if (loaded_ && scene_ctrl && !over_ui && !ui_state_.gizmo.active) {
@@ -4741,7 +4946,10 @@ void EditorHost::State::Frame(bool step_physics) {
     PushEdits();
 
     StepRt(render_camera);
-    const render::RasterOptions opts = ViewOptions(render_camera);
+    // The active pane leads: its instance flags outline the selection in every pane.
+    std::vector<render::RasterOptions> pane_views{ViewOptions(render_camera)};
+    for (const uint32_t i : ShownViews())
+        if (i != ui_state_.active_view) pane_views.push_back(ViewOptions(views_[i].camera, ui_.PaneRect(i), views_[i].mode));
 
     // Debug overlays rebuild from the shown snapshot; off leaves the real instance set untouched.
     const auto overlay_t0 = Clock::now();
@@ -4758,7 +4966,7 @@ void EditorHost::State::Frame(bool step_physics) {
                                 ? -1.0f
                                 : static_cast<float>(video_->next) / static_cast<float>(video_->ticks.size());
     const auto draw_t0 = Clock::now();
-    DrawWorld(render_world, opts);
+    DrawWorld(render_world, pane_views);
     const double draw_ms = Ms(Clock::now() - draw_t0);
     if (!running_) return;
     if (thumb_ && present_->SubmittedFrames() > thumb_->frame) {

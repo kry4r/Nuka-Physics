@@ -188,5 +188,9 @@ inline constexpr const char kKeyframe[] = "\xEE\x87\xAC";   // diamond
 inline constexpr const char kGrab[] = "\xEE\x95\xBC";       // hand-grabbing
 inline constexpr const char kPin[] = "\xEE\x8F\xA2";        // push-pin
 inline constexpr const char kFilm[] = "\xEE\x9E\x92";       // film-strip
+inline constexpr const char kViewSingle[] = "\xEE\x91\x9E";  // square
+inline constexpr const char kViewSplit[] = "\xEE\xA1\xB0";   // square-split-horizontal
+inline constexpr const char kViewQuad[] = "\xEE\x91\xA4";    // squares-four
+inline constexpr const char kMaximize[] = "\xEE\x87\x90";    // corners-out
 
 }  // namespace nuka::render::imgui::icon

@@ -70,7 +70,9 @@ public:
     // world +Z (Q/E); inputs in [-1,1], speed scales with dolly distance.
     void Move(float forward, float right, float up, float dt);
     void CancelInteraction() { orbiting_ = panning_ = false; }
-    bool UseSceneCamera(const render::RenderWorld& world, float viewport_aspect = 1.0f, float reference_aspect = 1.0f);
+    // Looks through scene camera `index`, backed off to keep the reference aspect's framing; false when it cannot.
+    bool UseSceneCamera(const render::RenderWorld& world, float viewport_aspect = 1.0f, float reference_aspect = 1.0f,
+                        size_t index = 0u);
 
     // ---- per-frame ---------------------------------------------------------
     // Recompute eye/up from yaw/pitch/distance/target and write the override into

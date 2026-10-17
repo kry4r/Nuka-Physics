@@ -13,6 +13,7 @@
 #include "runtime/app/viewer/timeline_view.hpp"
 #include "scene/ecs/entity.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -228,6 +229,17 @@ struct RtView {
     std::vector<uint8_t> rgb;
 };
 
+// The scene viewport's panes: one view, two side by side, or four in a grid.
+enum class ViewLayout : uint8_t { Single, Split, Quad };
+inline constexpr uint32_t kViewPanes = 4u;
+
+// A pane the layout shows, as its header names it; the host lists them in layout order.
+struct ViewPane {
+    uint32_t index = 0u;  // which of the kViewPanes views it draws
+    nuka::render::ViewMode mode = nuka::render::ViewMode::Lit;
+    std::string camera;  // the scene camera node it looks through; empty is the free camera
+};
+
 // Transport, selection and panel state. The UI queues actions for anything that changes the
 // world and edits only this plain state in place.
 struct ViewerUiState {
@@ -240,7 +252,11 @@ struct ViewerUiState {
 
     bool show_colliders = false;
     bool show_contacts = false;
-    nuka::render::ViewMode view_mode = nuka::render::ViewMode::Lit;
+    nuka::render::ViewMode view_mode = nuka::render::ViewMode::Lit;  // the active pane's
+    ViewLayout view_layout = ViewLayout::Single;
+    uint32_t active_view = 0u;  // the pane input, the gizmo and the HUD go to
+    std::vector<ViewPane> panes{ViewPane{}};
+    std::vector<std::string> scene_cameras;  // the camera nodes a pane can look through
     RtView rt;
     std::vector<std::string> bookmarks;  // camera bookmark names, in bar order
     bool rendering = false;              // an offline render is running
@@ -413,6 +429,12 @@ public:
     // The central dock node in logical and framebuffer pixels; the scene renders only there.
     const SceneViewportRect& Viewport() const { return viewport_; }
     bool OwnsScenePointer() const { return viewport_hovered_; }
+    // A pane's rect this frame, invalid while the layout hides it; the active one is Viewport().
+    const SceneViewportRect& PaneRect(uint32_t index) const { return pane_rects_[index]; }
+    // The pane under a free pointer, or -1.
+    int HoveredPane() const { return hovered_pane_; }
+    // Points the viewport, its pointer and the gizmo at pane `index` for the rest of the frame.
+    void SetActiveView(uint32_t index);
 
     // The data the panels read this frame.
     struct Frame {
@@ -462,12 +484,16 @@ private:
     void DrawSolverHud(const ImVec2& vmin, const ImVec2& vmax);
     // Each held load's pull from its grab point toward its target.
     void DrawPerturbHud(const ImVec2& vmin, const ImVec2& vmax);
-    // The viewport's top-right tools (RT preview, Render, shading) and the box of a box selection.
+    // The viewport's top-right tools (RT preview, Render, layout, shading) and the box of a box selection.
     void DrawViewTools(const ImVec2& vmin, const ImVec2& vmax);
+    // The RT preview, Render and layout buttons on one line.
+    void DrawViewButtons();
     // The RT preview image over the viewport, under its HUD.
     void DrawRtImage(const ImVec2& vmin, const ImVec2& vmax);
     // Camera bookmark chips along the viewport's bottom edge.
     void DrawBookmarkBar(const ImVec2& vmin, const ImVec2& vmax);
+    // The panes' dividers, the active one's border and each pane's camera, mode and maximize header.
+    void DrawPaneHeaders(const ImVec2& cmin, const ImVec2& cmax, const ImVec2& pane, float gap);
     // While an asset card is dragged, the viewport takes the drop at the ground under the pointer.
     void DrawAssetDrop();
     // The texture of a PPM file, reloaded when the file changes; null without the file.
@@ -480,6 +506,9 @@ private:
     Frame frame_;
     SceneViewportRect viewport_;
     bool viewport_hovered_ = false;
+    std::array<SceneViewportRect, kViewPanes> pane_rects_{};
+    int hovered_pane_ = -1;
+    bool pointer_free_ = false;  // focused, no layout modifier and no ImGui window under the pointer
 
     std::string layout_ = "authoring";
     bool layout_pending_ = true;
